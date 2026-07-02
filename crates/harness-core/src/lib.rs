@@ -1,0 +1,15 @@
+//! harness-core: 共有語彙（IR）とtrait定義。プロバイダ非依存・フロントエンド非依存。
+//! `plans/DESIGN.md` §全体アーキテクチャ 参照。
+
+pub mod event;
+pub mod message;
+pub mod provider;
+pub mod tool;
+
+pub use event::AgentEvent;
+pub use message::{ContentBlock, Message, Role};
+pub use provider::{
+    BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities,
+    ProviderError, Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
+};
+pub use tool::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput, ToolResult, ToolSpec, ToolUse};

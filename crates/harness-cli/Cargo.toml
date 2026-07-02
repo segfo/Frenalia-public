@@ -1,0 +1,10 @@
+[package]
+name = "harness-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]

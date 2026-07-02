@@ -1,0 +1,6 @@
+[package]
+name = "harness-providers"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
