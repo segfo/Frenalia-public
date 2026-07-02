@@ -4,3 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+futures = "0.3.32"
+harness-core = { version = "0.1.0", path = "../harness-core" }

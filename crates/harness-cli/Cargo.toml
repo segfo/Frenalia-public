@@ -8,3 +8,8 @@ name = "harness"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+harness-core = { version = "0.1.0", path = "../harness-core" }
+harness-engine = { version = "0.1.0", path = "../harness-engine" }
+harness-providers = { version = "0.1.0", path = "../harness-providers" }
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "io-std"] }
