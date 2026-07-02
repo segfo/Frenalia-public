@@ -1,18 +1,21 @@
 //! OpenAI Chat Completions API を `LlmProvider` へ正規化するアダプタ。
 //! `plans/DESIGN.md` §プロバイダ抽象「OpenAI Chat Completions / LMStudio」参照。
 //!
-//! **設計書との差分（M1時点でのスコープ拡張）**: `plans/DESIGN.md` の実装マイルストーンでは
+//! **設計書との差分（M1時点でのスコープ拡張、M2で継続）**: `plans/DESIGN.md` の実装マイルストーンでは
 //! OpenAIファミリは本来M6（`async-openai` 経由、tool_call文字列引数正規化・LMStudio互換・
 //! Responses variant込み）のスコープである。本ファイルはユーザの指示により、M1の時点で
-//! Anthropicと並行して**非ストリーム・ツール無し・自前reqwest実装**の最小疎通のみを先行実装した
-//! もの。`async-openai` 採用可否（§プロバイダ抽象 L134のA/B）・tool_call引数正規化・LMStudio
-//! base_url差し替え・Responses variantはM6で改めて設計通りに実装する。
+//! Anthropicと並行して**ツール無し・自前reqwest実装**の最小疎通のみを先行実装したもの。M2では
+//! `stream:true`+`data:`フレーム逐次パース（末尾`data:[DONE]`）へ拡張した。`async-openai`
+//! 採用可否（§プロバイダ抽象 L134のA/B）・tool_call引数正規化・LMStudio base_url差し替え・
+//! Responses variantはM6で改めて設計通りに実装する。
 
 use std::time::Duration;
 
+use async_stream::try_stream;
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream, StreamExt};
-use serde::{Deserialize, Serialize};
+use eventsource_stream::Eventsource;
+use futures::stream::{BoxStream, StreamExt};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use harness_core::{
     BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderCapabilities,
@@ -77,12 +80,52 @@ impl LlmProvider for OpenAiProvider {
             return Err(map_error_response(status.as_u16(), &text, retry_after));
         }
 
-        let parsed: WireResponse = resp.json().await.map_err(|_| ProviderError::Transport {
-            retriable: false,
-        })?;
+        let mut events = resp.bytes_stream().eventsource();
 
-        let events = to_stream_events(parsed)?;
-        Ok(stream::iter(events.into_iter().map(Ok)).boxed())
+        let s = try_stream! {
+            let mut block_open = false;
+            let mut stop_reason = StopReason::EndTurn;
+            let mut usage = Usage::default();
+
+            while let Some(ev) = events.next().await {
+                let ev = ev.map_err(|_| ProviderError::Transport { retriable: true })?;
+                if ev.data.is_empty() {
+                    continue;
+                }
+                if ev.data == "[DONE]" {
+                    break;
+                }
+
+                let chunk: WireChunk = parse_wire(&ev.data)?;
+
+                if let Some(u) = chunk.usage {
+                    usage.input = u.prompt_tokens;
+                    usage.output = u.completion_tokens;
+                }
+
+                if let Some(choice) = chunk.choices.into_iter().next() {
+                    if !block_open {
+                        yield StreamEvent::BlockStart { index: 0, kind: BlockKind::Text };
+                        block_open = true;
+                    }
+                    if let Some(text) = choice.delta.content {
+                        if !text.is_empty() {
+                            yield StreamEvent::TextDelta { index: 0, text };
+                        }
+                    }
+                    if let Some(fr) = choice.finish_reason {
+                        stop_reason = map_stop_reason(Some(&fr));
+                    }
+                }
+            }
+
+            if block_open {
+                yield StreamEvent::BlockStop { index: 0 };
+            }
+            yield StreamEvent::Done { stop_reason, usage };
+        };
+
+        Ok(Box::pin(s))
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -97,6 +140,10 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+fn parse_wire<T: DeserializeOwned>(data: &str) -> Result<T, ProviderError> {
+    serde_json::from_str(data).map_err(|_| ProviderError::Transport { retriable: false })
+}
+
 // --- ワイヤ形式（リクエスト） ---
 
 #[derive(Serialize)]
@@ -104,11 +151,17 @@ struct WireRequest {
     model: String,
     messages: Vec<WireMessage>,
     stream: bool,
+    stream_options: WireStreamOptions,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct WireStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -140,7 +193,8 @@ fn to_wire_request(req: &CompletionRequest) -> WireRequest {
     WireRequest {
         model: req.model.clone(),
         messages,
-        stream: false,
+        stream: true,
+        stream_options: WireStreamOptions { include_usage: true },
         max_tokens: req.max_tokens,
         temperature: req.sampling.temperature,
         top_p: req.sampling.top_p,
@@ -148,7 +202,7 @@ fn to_wire_request(req: &CompletionRequest) -> WireRequest {
 }
 
 fn to_wire_message(msg: &Message) -> WireMessage {
-    // M1時点はテキストのみを送信する単発ターン専用。tool_use/tool_result/thinking等の
+    // M1/M2時点はテキストのみを送信する単発ターン専用。tool_use/tool_result/thinking等の
     // OpenAI固有ワイヤ形式（tool_calls配列・role:tool分離）への正規化はM3/M6で追加する。
     let text = msg
         .content
@@ -169,23 +223,26 @@ fn to_wire_message(msg: &Message) -> WireMessage {
     }
 }
 
-// --- ワイヤ形式（レスポンス） ---
+// --- ワイヤ形式（SSEチャンク） ---
 
 #[derive(Deserialize)]
-struct WireResponse {
-    choices: Vec<WireChoice>,
+struct WireChunk {
     #[serde(default)]
-    usage: WireUsage,
+    choices: Vec<WireChunkChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
 }
 
 #[derive(Deserialize)]
-struct WireChoice {
-    message: WireResponseMessage,
+struct WireChunkChoice {
+    #[serde(default)]
+    delta: WireChunkDelta,
     finish_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct WireResponseMessage {
+#[derive(Deserialize, Default)]
+struct WireChunkDelta {
+    #[serde(default)]
     content: Option<String>,
 }
 
@@ -195,38 +252,6 @@ struct WireUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
-}
-
-fn to_stream_events(resp: WireResponse) -> Result<Vec<StreamEvent>, ProviderError> {
-    let choice = resp
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| ProviderError::InvalidRequest {
-            msg: "response contained no choices".to_string(),
-        })?;
-
-    let mut events = Vec::new();
-    let text = choice.message.content.unwrap_or_default();
-
-    events.push(StreamEvent::BlockStart {
-        index: 0,
-        kind: BlockKind::Text,
-    });
-    events.push(StreamEvent::TextDelta { index: 0, text });
-    events.push(StreamEvent::BlockStop { index: 0 });
-
-    events.push(StreamEvent::Done {
-        stop_reason: map_stop_reason(choice.finish_reason.as_deref()),
-        usage: Usage {
-            input: resp.usage.prompt_tokens,
-            output: resp.usage.completion_tokens,
-            cache_read: 0,
-            cache_creation: 0,
-        },
-    });
-
-    Ok(events)
 }
 
 fn map_stop_reason(reason: Option<&str>) -> StopReason {
@@ -267,9 +292,6 @@ fn map_error_response(status: u16, body: &str, retry_after: Option<Duration>) ->
         (429, _) => ProviderError::RateLimited { retry_after },
         (400, Some("context_length_exceeded")) => ProviderError::ContextTooLong,
         (400, _) => ProviderError::InvalidRequest { msg: message },
-        _ => ProviderError::Api {
-            status,
-            code,
-        },
+        _ => ProviderError::Api { status, code },
     }
 }

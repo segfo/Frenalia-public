@@ -1,7 +1,9 @@
 //! harness-engine: 中核ループの入口。`plans/DESIGN.md` §エージェントループ参照。
 //!
-//! M1時点ではツール呼び出し・パーミッション・継続ループを持たない単発ターンのみ。
+//! M2時点ではツール呼び出し・パーミッション・継続ループを持たない単発ターンのみ。
 //! `ConversationState` は以降のフェーズ（M3〜）で蓄積・継続に使うためここに置く。
+//! `run_single_turn` は `StreamEvent::TextDelta` を受信の都度 `on_text_delta` へ通知し、
+//! ヘッドレスフロントエンドがトークン単位で逐次表示できるようにする（§実装マイルストーン M2）。
 
 use futures::StreamExt;
 
@@ -40,12 +42,17 @@ pub struct TurnOutcome {
 
 /// 1プロバイダターンを実行する。ツール呼び出しへのディスパッチ・継続ループはM3以降で追加する
 /// （§エージェントループの「1回のステップ」のうち、ここではステップ1〜3のみを担う）。
-pub async fn run_single_turn(
+/// `on_text_delta` は `StreamEvent::TextDelta` 受信の都度呼ばれる（トークン逐次表示用）。
+pub async fn run_single_turn<F>(
     provider: &dyn LlmProvider,
     state: &ConversationState,
     model: String,
     max_tokens: u32,
-) -> Result<TurnOutcome, ProviderError> {
+    mut on_text_delta: F,
+) -> Result<TurnOutcome, ProviderError>
+where
+    F: FnMut(&str),
+{
     let req = CompletionRequest {
         system: state.system.clone(),
         messages: state.messages.clone(),
@@ -65,7 +72,10 @@ pub async fn run_single_turn(
 
     while let Some(event) = stream.next().await {
         match event? {
-            StreamEvent::TextDelta { text: delta, .. } => text.push_str(&delta),
+            StreamEvent::TextDelta { text: delta, .. } => {
+                on_text_delta(&delta);
+                text.push_str(&delta);
+            }
             StreamEvent::Done {
                 stop_reason: sr,
                 usage: u,

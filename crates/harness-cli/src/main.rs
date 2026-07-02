@@ -1,9 +1,10 @@
 //! harness-cli: clapエントリ。`plans/DESIGN.md` §非対話（ヘッドレス）モード参照。
 //!
-//! M1時点では `--print` によるAnthropic/OpenAIへの単発非ストリーム呼び出しのみをサポートする。
+//! M2時点では `--print` によるAnthropic/OpenAIへのストリーミング呼び出しをサポートする。
+//! 受信したテキストデルタをその場でstdoutへ書き出す（トークン逐次表示、§実装マイルストーン M2）。
 //! 対話TUI・ツールループ・LMStudio/Responses variantはM3以降・M6で追加する。
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
@@ -68,13 +69,9 @@ async fn main() -> ExitCode {
             }
         }
         ProviderKind::Openai => {
-            let api_key = match std::env::var("OPENAI_API_KEY") {
-                Ok(key) => key,
-                Err(_) => {
-                    eprintln!("OPENAI_API_KEY is not set");
-                    return ExitCode::FAILURE;
-                }
-            };
+            // LMStudioは空キー可（§プロバイダ抽象「LMStudioは空キー可」）なので、
+            // 実OpenAIと異なり未設定でもfail-fastしない。
+            let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
             match std::env::var("OPENAI_BASE_URL") {
                 Ok(base_url) => Box::new(OpenAiProvider::with_base_url(api_key, base_url)),
                 Err(_) => Box::new(OpenAiProvider::new(api_key)),
@@ -94,9 +91,22 @@ async fn main() -> ExitCode {
     let mut state = ConversationState::new();
     state.push_user_text(prompt);
 
-    match run_single_turn(provider.as_ref(), &state, model, DEFAULT_MAX_TOKENS).await {
-        Ok(outcome) => {
-            println!("{}", outcome.text);
+    let mut stdout = std::io::stdout();
+    let result = run_single_turn(
+        provider.as_ref(),
+        &state,
+        model,
+        DEFAULT_MAX_TOKENS,
+        |delta| {
+            let _ = stdout.write_all(delta.as_bytes());
+            let _ = stdout.flush();
+        },
+    )
+    .await;
+
+    match result {
+        Ok(_) => {
+            println!();
             ExitCode::SUCCESS
         }
         Err(e) => {

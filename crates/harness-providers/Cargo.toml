@@ -4,10 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-stream = "0.3"
 async-trait = "0.1.89"
+eventsource-stream = "0.2"
 futures = "0.3.32"
 harness-core = { version = "0.1.0", path = "../harness-core" }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "1"

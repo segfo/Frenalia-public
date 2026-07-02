@@ -1,14 +1,19 @@
 //! Anthropic Messages API を `LlmProvider` へ正規化するアダプタ。
 //! `plans/DESIGN.md` §プロバイダ抽象「Anthropic（自前）」参照。
 //!
-//! M1時点では非ストリーム実装（`stream:false` で1回POSTし、全文を受け取ってから
-//! `StreamEvent` 列へ変換する）。名前付きSSEの逐次パースはM2で追加する。
+//! M2時点では `stream:true` で名前付きSSE（`message_start`/`content_block_start`/
+//! `content_block_delta`/`content_block_stop`/`message_delta`/`message_stop`、`ping`無視）を
+//! `eventsource-stream` で逐次パースし、`StreamEvent` へ変換する。ストリーム途中の `error`
+//! イベントは `Done` を送らずに `ProviderError` へ写像してストリームを終端する
+//! （§ストリーミングのエラー処理・リトライの不変条件）。
 
 use std::time::Duration;
 
+use async_stream::try_stream;
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream, StreamExt};
-use serde::{Deserialize, Serialize};
+use eventsource_stream::Eventsource;
+use futures::stream::{BoxStream, StreamExt};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use harness_core::{
     BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderCapabilities,
@@ -75,12 +80,77 @@ impl LlmProvider for AnthropicProvider {
             return Err(map_error_response(status.as_u16(), &text, retry_after));
         }
 
-        let parsed: WireResponse = resp.json().await.map_err(|_| ProviderError::Transport {
-            retriable: false,
-        })?;
+        let mut events = resp.bytes_stream().eventsource();
 
-        let events = to_stream_events(parsed);
-        Ok(stream::iter(events.into_iter().map(Ok)).boxed())
+        let s = try_stream! {
+            let mut stop_reason = StopReason::Other("missing".to_string());
+            let mut usage = Usage::default();
+
+            while let Some(ev) = events.next().await {
+                let ev = ev.map_err(|_| ProviderError::Transport { retriable: true })?;
+                if ev.data.is_empty() {
+                    continue;
+                }
+
+                match ev.event.as_str() {
+                    "message_start" => {
+                        let msg: WireMessageStart = parse_wire(&ev.data)?;
+                        usage.input = msg.message.usage.input_tokens;
+                        usage.cache_read = msg.message.usage.cache_read_input_tokens;
+                        usage.cache_creation = msg.message.usage.cache_creation_input_tokens;
+                    }
+                    "content_block_start" => {
+                        let e: WireContentBlockStart = parse_wire(&ev.data)?;
+                        yield StreamEvent::BlockStart {
+                            index: e.index,
+                            kind: to_block_kind(&e.content_block),
+                        };
+                    }
+                    "content_block_delta" => {
+                        let e: WireContentBlockDelta = parse_wire(&ev.data)?;
+                        match e.delta {
+                            WireDelta::TextDelta { text } => {
+                                yield StreamEvent::TextDelta { index: e.index, text };
+                            }
+                            WireDelta::InputJsonDelta { partial_json } => {
+                                yield StreamEvent::ToolInputDelta {
+                                    index: e.index,
+                                    json_fragment: partial_json,
+                                };
+                            }
+                            WireDelta::ThinkingDelta { thinking } => {
+                                yield StreamEvent::ThinkingDelta { index: e.index, text: thinking };
+                            }
+                            WireDelta::SignatureDelta { signature } => {
+                                yield StreamEvent::SignatureDelta { index: e.index, sig: signature };
+                            }
+                        }
+                    }
+                    "content_block_stop" => {
+                        let e: WireIndexOnly = parse_wire(&ev.data)?;
+                        yield StreamEvent::BlockStop { index: e.index };
+                    }
+                    "message_delta" => {
+                        let e: WireMessageDelta = parse_wire(&ev.data)?;
+                        stop_reason = map_stop_reason(e.delta.stop_reason.as_deref());
+                        usage.output = e.usage.output_tokens;
+                    }
+                    "message_stop" => {
+                        yield StreamEvent::Done { stop_reason: stop_reason.clone(), usage };
+                    }
+                    "ping" => {}
+                    "error" => {
+                        let e: WireErrorEvent = parse_wire(&ev.data)?;
+                        Err(map_stream_error(&e.error))?;
+                    }
+                    _ => {
+                        // 未知のイベント種別は将来のAPI拡張に備えて無視する。
+                    }
+                }
+            }
+        };
+
+        Ok(Box::pin(s))
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -93,6 +163,10 @@ impl LlmProvider for AnthropicProvider {
             context_window: 200_000,
         }
     }
+}
+
+fn parse_wire<T: DeserializeOwned>(data: &str) -> Result<T, ProviderError> {
+    serde_json::from_str(data).map_err(|_| ProviderError::Transport { retriable: false })
 }
 
 // --- ワイヤ形式（リクエスト） ---
@@ -185,7 +259,7 @@ fn to_wire_request(req: &CompletionRequest) -> WireRequest {
             })
             .collect(),
         messages: req.messages.iter().map(to_wire_message).collect(),
-        stream: false,
+        stream: true,
         temperature: req.sampling.temperature,
         top_p: req.sampling.top_p,
         top_k: req.sampling.top_k,
@@ -236,26 +310,7 @@ fn to_wire_content_block(block: &ContentBlock) -> WireContentBlock {
     }
 }
 
-// --- ワイヤ形式（レスポンス） ---
-
-#[derive(Deserialize)]
-struct WireResponse {
-    content: Vec<WireResponseBlock>,
-    stop_reason: Option<String>,
-    #[serde(default)]
-    usage: WireUsage,
-}
-
-#[derive(Deserialize)]
-struct WireResponseBlock {
-    #[serde(rename = "type")]
-    kind: String,
-    text: Option<String>,
-    id: Option<String>,
-    name: Option<String>,
-    thinking: Option<String>,
-    signature: Option<String>,
-}
+// --- ワイヤ形式（SSEイベント） ---
 
 #[derive(Deserialize, Default)]
 struct WireUsage {
@@ -269,62 +324,81 @@ struct WireUsage {
     cache_creation_input_tokens: u32,
 }
 
-fn to_stream_events(resp: WireResponse) -> Vec<StreamEvent> {
-    let mut events = Vec::new();
+#[derive(Deserialize)]
+struct WireMessageStart {
+    message: WireMessageStartInner,
+}
 
-    for (index, block) in resp.content.into_iter().enumerate() {
-        match block.kind.as_str() {
-            "text" => {
-                let text = block.text.unwrap_or_default();
-                events.push(StreamEvent::BlockStart {
-                    index,
-                    kind: BlockKind::Text,
-                });
-                events.push(StreamEvent::TextDelta { index, text });
-                events.push(StreamEvent::BlockStop { index });
-            }
-            "thinking" => {
-                events.push(StreamEvent::BlockStart {
-                    index,
-                    kind: BlockKind::Thinking,
-                });
-                events.push(StreamEvent::ThinkingDelta {
-                    index,
-                    text: block.thinking.unwrap_or_default(),
-                });
-                if let Some(sig) = block.signature {
-                    events.push(StreamEvent::SignatureDelta { index, sig });
-                }
-                events.push(StreamEvent::BlockStop { index });
-            }
-            "tool_use" => {
-                // ツール呼び出しの実処理はM3以降。ここではブロックの往復のみ成立させる。
-                events.push(StreamEvent::BlockStart {
-                    index,
-                    kind: BlockKind::ToolUse {
-                        id: block.id.unwrap_or_default(),
-                        name: block.name.unwrap_or_default(),
-                    },
-                });
-                events.push(StreamEvent::BlockStop { index });
-            }
-            _ => {
-                // redacted_thinking等、M1で未使用のブロック種別はスキップする。
-            }
-        }
-    }
+#[derive(Deserialize)]
+struct WireMessageStartInner {
+    #[serde(default)]
+    usage: WireUsage,
+}
 
-    events.push(StreamEvent::Done {
-        stop_reason: map_stop_reason(resp.stop_reason.as_deref()),
-        usage: Usage {
-            input: resp.usage.input_tokens,
-            output: resp.usage.output_tokens,
-            cache_read: resp.usage.cache_read_input_tokens,
-            cache_creation: resp.usage.cache_creation_input_tokens,
+#[derive(Deserialize)]
+struct WireContentBlockStart {
+    index: usize,
+    content_block: WireBlockStartInner,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireBlockStartInner {
+    Text {},
+    Thinking {},
+    RedactedThinking {},
+    ToolUse { id: String, name: String },
+}
+
+fn to_block_kind(inner: &WireBlockStartInner) -> BlockKind {
+    match inner {
+        WireBlockStartInner::Text {} => BlockKind::Text,
+        WireBlockStartInner::Thinking {} => BlockKind::Thinking,
+        WireBlockStartInner::RedactedThinking {} => BlockKind::RedactedThinking,
+        WireBlockStartInner::ToolUse { id, name } => BlockKind::ToolUse {
+            id: id.clone(),
+            name: name.clone(),
         },
-    });
+    }
+}
 
-    events
+#[derive(Deserialize)]
+struct WireContentBlockDelta {
+    index: usize,
+    delta: WireDelta,
+}
+
+// バリアント名はAnthropic API上の `delta.type` 値（`text_delta`等）にそのまま対応させている。
+#[allow(clippy::enum_variant_names)]
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireDelta {
+    TextDelta { text: String },
+    InputJsonDelta { partial_json: String },
+    ThinkingDelta { thinking: String },
+    SignatureDelta { signature: String },
+}
+
+#[derive(Deserialize)]
+struct WireIndexOnly {
+    index: usize,
+}
+
+#[derive(Deserialize)]
+struct WireMessageDelta {
+    delta: WireMessageDeltaInner,
+    #[serde(default)]
+    usage: WireUsage,
+}
+
+#[derive(Deserialize)]
+struct WireMessageDeltaInner {
+    stop_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireErrorEvent {
+    error: WireErrorDetail,
 }
 
 fn map_stop_reason(reason: Option<&str>) -> StopReason {
@@ -352,6 +426,7 @@ struct WireErrorDetail {
     message: String,
 }
 
+/// HTTPレベル（ストリーム開始前）のエラー写像。
 fn map_error_response(status: u16, body: &str, retry_after: Option<Duration>) -> ProviderError {
     let detail: Option<WireErrorBody> = serde_json::from_str(body).ok();
     let (kind, message) = match detail {
@@ -372,6 +447,22 @@ fn map_error_response(status: u16, body: &str, retry_after: Option<Duration>) ->
         _ => ProviderError::Api {
             status,
             code: Some(kind),
+        },
+    }
+}
+
+/// mid-stream の SSE `error` イベント写像。HTTPステータス/Retry-Afterヘッダは無い。
+fn map_stream_error(detail: &WireErrorDetail) -> ProviderError {
+    match detail.kind.as_str() {
+        "overloaded_error" => ProviderError::Overloaded,
+        "rate_limit_error" => ProviderError::RateLimited { retry_after: None },
+        "authentication_error" | "permission_error" => ProviderError::Auth,
+        "invalid_request_error" => ProviderError::InvalidRequest {
+            msg: detail.message.clone(),
+        },
+        other => ProviderError::Api {
+            status: 0,
+            code: Some(other.to_string()),
         },
     }
 }
