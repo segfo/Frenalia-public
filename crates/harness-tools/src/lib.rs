@@ -1,15 +1,17 @@
 //! harness-tools: `Tool` trait実装 + `ToolRegistry`。`plans/DESIGN.md` §ツールシステム参照。
 //!
-//! M3時点では `read_file`/`run_shell` の2つのみを実装する（§実装マイルストーン M3
-//! 「ToolRegistryにread_file+run_shell、蓄積→ディスパッチ→tool_result投入→継続ループ。
-//! 一旦allow-allで動作確認」）。write_file/edit_file/grep/glob/web_fetchはM5、
-//! パーミッション（`PermissionArbiter`によるRiskClass判定）・fsジェイル（cap-std主ゲート・
-//! 予約デバイス名/ADS拒否等）はM4/M11のスコープのため、read_file/run_shellは
-//! workspace_root配下への素朴な相対パス解決に留める。Windowsのシェル選択
-//! （pwsh7優先→5.1フォールバック・起動シェルの記録・危険構文denylist）もM5のスコープ。
+//! M4で`read_file`のfsジェイルを`harness-sandbox::WorkspaceJail`（cap-std主ゲート）へ
+//! 置き換えた（§実装マイルストーン M4「RiskClass・モード・allowlist・ワークスペースジェイル」）。
+//! `run_shell`の`cwd`は子プロセスへ渡すだけの値でcap-std経由のopenが起きないため
+//! （設計書「これらはrun_shell子プロセスには効かない」§ツールシステム fsジェイル）、
+//! 引き続き`harness_sandbox::check_relative_path`による文字列としての形チェックに留める
+//! （子プロセスの実FSアクセスを止めるのはM12のOS隔離Tierのスコープ）。
+//! write_file/edit_file/grep/glob/web_fetch、Windowsのシェル選択
+//! （pwsh7優先→5.1フォールバック・起動シェルの記録・危険構文denylist）はM5のスコープ。
+//! 実行前の許可判定（`PermissionArbiter`）はM4で`harness-engine`に実装したが、
+//! ツール本体はそれを意識しない（呼ばれた時点で既に許可済み）。
 
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -21,6 +23,7 @@ use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 use harness_core::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput, ToolSpec};
+use harness_sandbox::{check_relative_path, JailError, WorkspaceJail};
 
 /// 登録済みツールの集合。`ToolSpec` へ一括展開してプロバイダへ渡す。
 pub struct ToolRegistry {
@@ -68,17 +71,13 @@ impl ToolRegistry {
     }
 }
 
-/// `path` を `root` 配下の相対パスとして解決する。絶対パス・`..` を含むものは拒否する。
-/// これは cap-std によるTOCTOU封じ（§ツールシステム fsジェイル）の代替ではなく、
-/// M4/M11実装までの暫定的な素朴チェックに過ぎない点に注意。
-fn resolve_in_workspace(root: &Path, path: &str) -> Result<PathBuf, ToolError> {
-    let rel = Path::new(path);
-    if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(ToolError::InvalidInput(format!(
-            "path must be relative and within the workspace: {path}"
-        )));
+fn jail_error_to_tool_error(path: &str, err: JailError) -> ToolError {
+    match err {
+        JailError::Escape(_) | JailError::UnsafePath(_) => ToolError::InvalidInput(format!(
+            "path must be relative and within the workspace: {path} ({err})"
+        )),
+        JailError::Io(e) => ToolError::ExecutionFailed(format!("{path}: {e}")),
     }
-    Ok(root.join(rel))
 }
 
 // --- read_file ---
@@ -122,11 +121,19 @@ impl Tool for ReadFileTool {
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let input: ReadFileInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        let path = resolve_in_workspace(&ctx.workspace_root, &input.path)?;
 
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("{}: {e}", input.path)))?;
+        // cap-std の Dir ハンドル経由の同期I/Oはtokioワーカースレッドをブロックしうるため、
+        // spawn_blocking へ逃がす（§ツールシステム fsジェイル、cap-stdは非同期非対応）。
+        let workspace_root = ctx.workspace_root.clone();
+        let path_for_err = input.path.clone();
+        let content = tokio::task::spawn_blocking(move || -> Result<String, ToolError> {
+            let jail = WorkspaceJail::open(&workspace_root)
+                .map_err(|e| jail_error_to_tool_error(&path_for_err, e))?;
+            jail.read_to_string(&path_for_err)
+                .map_err(|e| jail_error_to_tool_error(&path_for_err, e))
+        })
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("join error: {e}")))??;
 
         let offset = input.offset.unwrap_or(1).max(1);
         let numbered: Vec<String> = content
@@ -189,7 +196,10 @@ impl Tool for RunShellTool {
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
         let cwd = match &input.cwd {
-            Some(c) => resolve_in_workspace(&ctx.workspace_root, c)?,
+            Some(c) => {
+                let rel = check_relative_path(c).map_err(|e| jail_error_to_tool_error(c, e))?;
+                ctx.workspace_root.join(rel)
+            }
             None => ctx.workspace_root.clone(),
         };
 
@@ -275,6 +285,7 @@ fn platform_shell_command(command: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn ctx(root: PathBuf) -> ToolCtx {
         ToolCtx {

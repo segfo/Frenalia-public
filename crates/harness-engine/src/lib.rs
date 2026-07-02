@@ -1,11 +1,15 @@
 //! harness-engine: 中核ループの入口。`plans/DESIGN.md` §エージェントループ参照。
 //!
-//! M3では `run_single_turn`（単発ターン、M2まで）に加え、`run_agent_loop` を追加した。
-//! `ToolRegistry` に登録済みのツールを `stop_reason==ToolUse` の間ディスパッチし、
-//! `tool_result` を履歴へ投入して次ターンへ継続する（§実装マイルストーン M3）。
-//! **M3時点のスコープ外**: `PermissionArbiter`（M4）・cap-stdジェイル（M4/M11）・
-//! キャンセル整合（M9）・コンテキスト圧縮（M9）。ツールは登録されていれば無条件で
-//! 実行する「一旦allow-all」（§実装マイルストーン M3）で、承認フローはまだ無い。
+//! M3で `run_single_turn`（単発ターン、M2まで）に加え `run_agent_loop` を追加した。
+//! M4で `PermissionArbiter`（§パーミッション（承認）システム）を実装し、`run_agent_loop`が
+//! 各`ToolUse`の実行前に必ず問い合わせるようにした（§エージェントループ「唯一の強制点」）。
+//! 拒否されたツール呼び出しは実行されず、エラーの`ToolResult`を合成して履歴へ積み戻す
+//! （§エージェントループ 手順4「拒否→エラーToolResultを合成」）。
+//! **M4時点のスコープ外**: cap-stdによる読取スコープ反転モード（whitelist/blacklist、M11）・
+//! 対話TUIの承認モーダル（M7、そのため`decide`は常にヘッドレス相当で決定的に判定する）・
+//! キャンセル整合（M9）・コンテキスト圧縮（M9）。
+
+pub mod permission;
 
 use futures::StreamExt;
 
@@ -14,6 +18,10 @@ use harness_core::{
     Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, ToolCtx, ToolOutput, Usage,
 };
 use harness_tools::ToolRegistry;
+
+pub use permission::{
+    arg_repr, parse_allowlist_rule, AllowlistRule, Decision, PermissionArbiter, PermissionMode,
+};
 
 /// 会話のIR履歴。
 #[derive(Debug, Clone, Default)]
@@ -157,13 +165,15 @@ pub struct AgentLoopConfig {
 }
 
 /// 1回のステップ = 1プロバイダターン + 承認済みツール実行（§エージェントループ）を
-/// `stop_reason != ToolUse` になるまで繰り返す。M3時点は `PermissionArbiter` が無いため、
-/// `tools` に登録済みのツールは無条件で実行する（§実装マイルストーン M3「一旦allow-all」）。
+/// `stop_reason != ToolUse` になるまで繰り返す。`arbiter`が全ツール呼び出しの実行前に
+/// 必ず参照される唯一の強制点で（§パーミッション（承認）システム）、`Decision::Deny`の場合は
+/// ツールを実行せずエラーの`ToolResult`を合成する（§エージェントループ 手順4）。
 pub async fn run_agent_loop<F>(
     provider: &dyn LlmProvider,
     state: &mut ConversationState,
     tools: &ToolRegistry,
     ctx: &ToolCtx,
+    arbiter: &PermissionArbiter,
     config: AgentLoopConfig,
     mut on_text_delta: F,
 ) -> Result<AgentLoopOutcome, ProviderError>
@@ -268,12 +278,23 @@ where
         for block in &content {
             if let ContentBlock::ToolUse { id, name, input } = block {
                 let output = match tools.get(name) {
-                    Some(tool) => tool.call(input.clone(), ctx).await.unwrap_or_else(|e| {
-                        ToolOutput {
-                            content: e.to_string(),
-                            is_error: true,
+                    Some(tool) => {
+                        let risk = tool.risk(input);
+                        let decision = arbiter.decide(name, risk, &arg_repr(input));
+                        if decision.is_allow() {
+                            tool.call(input.clone(), ctx).await.unwrap_or_else(|e| ToolOutput {
+                                content: e.to_string(),
+                                is_error: true,
+                            })
+                        } else {
+                            ToolOutput {
+                                content: format!(
+                                    "permission denied by policy: {name} ({risk:?})"
+                                ),
+                                is_error: true,
+                            }
                         }
-                    }),
+                    }
                     None => ToolOutput {
                         content: format!("unknown tool: {name}"),
                         is_error: true,
@@ -296,4 +317,230 @@ where
     Err(ProviderError::InvalidRequest {
         msg: format!("agent loop exceeded max_turns ({})", config.max_turns),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use futures::stream;
+
+    /// あらかじめ用意したターンごとの`StreamEvent`列を順番に返すテスト用プロバイダ。
+    /// §実装マイルストーン M6で導入予定の本物のmockプロバイダ（golden-transcript向け）とは別に、
+    /// M4はこの最小限のローカルmockでパーミッション判定の統合テストのみを行う。
+    struct MockProvider {
+        turns: Mutex<Vec<Vec<StreamEvent>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
+        {
+            let mut turns = self.turns.lock().unwrap();
+            let events = turns.remove(0);
+            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    fn tool_use_turn(id: &str, name: &str, input: serde_json::Value) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::BlockStart {
+                index: 0,
+                kind: BlockKind::ToolUse {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                },
+            },
+            StreamEvent::ToolInputDelta {
+                index: 0,
+                json_fragment: input.to_string(),
+            },
+            StreamEvent::BlockStop { index: 0 },
+            StreamEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ]
+    }
+
+    fn end_turn(text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::BlockStart {
+                index: 0,
+                kind: BlockKind::Text,
+            },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: text.to_string(),
+            },
+            StreamEvent::BlockStop { index: 0 },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        ]
+    }
+
+    fn find_tool_result(state: &ConversationState) -> (String, bool) {
+        state
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| {
+                m.content.iter().find_map(|b| match b {
+                    ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } => Some((content.clone(), *is_error)),
+                    _ => None,
+                })
+            })
+            .expect("tool_result should be present")
+    }
+
+    /// §実装マイルストーン M4 検証条件「未許可shellが拒否されるユニットテスト」。
+    /// allowlist未登録の`run_shell`（RiskClass=Exec）がDefaultモード・ヘッドレス相当の判定で
+    /// 拒否され、`RunShellTool::call`が一度も呼ばれない（=実際にコマンドが実行されない）ことを、
+    /// 拒否理由を含むエラーtool_resultが積まれ`EndTurn`まで正常にループが継続することで確認する。
+    #[tokio::test]
+    async fn denies_unauthorized_run_shell_without_executing() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            turns: Mutex::new(vec![
+                tool_use_turn(
+                    "call_1",
+                    "run_shell",
+                    serde_json::json!({ "command": "echo should-not-run" }),
+                ),
+                end_turn("done"),
+            ]),
+        };
+        let mut state = ConversationState::new();
+        state.push_user_text("run a shell command");
+        let tools = harness_tools::ToolRegistry::with_builtin_tools();
+        let ctx = ToolCtx {
+            workspace_root: dir.path().to_path_buf(),
+        };
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+
+        let outcome = run_agent_loop(
+            &provider,
+            &mut state,
+            &tools,
+            &ctx,
+            &arbiter,
+            AgentLoopConfig {
+                model: "mock".into(),
+                max_tokens: 100,
+                max_turns: 5,
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        let (content, is_error) = find_tool_result(&state);
+        assert!(is_error, "denied tool call should be recorded as an error");
+        assert!(content.contains("permission denied"));
+    }
+
+    /// §実装マイルストーン M4 検証条件のもう一方「ジェイル脱出が拒否される」に対する、
+    /// パーミッション層側の対照テスト: allowlist未登録でもread-onlyの`read_file`は
+    /// Defaultモードで自動許可され、実際にファイル内容が読めることを確認する
+    /// （fsジェイル自体のユニットテストは`harness-sandbox`側に別途ある）。
+    #[tokio::test]
+    async fn allows_read_only_tool_without_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let provider = MockProvider {
+            turns: Mutex::new(vec![
+                tool_use_turn("call_1", "read_file", serde_json::json!({ "path": "a.txt" })),
+                end_turn("summarized"),
+            ]),
+        };
+        let mut state = ConversationState::new();
+        state.push_user_text("read a.txt");
+        let tools = harness_tools::ToolRegistry::with_builtin_tools();
+        let ctx = ToolCtx {
+            workspace_root: dir.path().to_path_buf(),
+        };
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+
+        let outcome = run_agent_loop(
+            &provider,
+            &mut state,
+            &tools,
+            &ctx,
+            &arbiter,
+            AgentLoopConfig {
+                model: "mock".into(),
+                max_tokens: 100,
+                max_turns: 5,
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.text, "summarized");
+        let (content, is_error) = find_tool_result(&state);
+        assert!(!is_error);
+        assert!(content.contains("hello"));
+    }
+
+    /// allowlistで`run_shell:echo*`を明示した場合は、Defaultモードのヘッドレス既定拒否を
+    /// 上書きして許可される（§パーミッション「allowlist: closed-by-default」）。
+    #[tokio::test]
+    async fn allowlisted_run_shell_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            turns: Mutex::new(vec![
+                tool_use_turn(
+                    "call_1",
+                    "run_shell",
+                    serde_json::json!({ "command": "echo allowed" }),
+                ),
+                end_turn("done"),
+            ]),
+        };
+        let mut state = ConversationState::new();
+        state.push_user_text("run an allowed shell command");
+        let tools = harness_tools::ToolRegistry::with_builtin_tools();
+        let ctx = ToolCtx {
+            workspace_root: dir.path().to_path_buf(),
+        };
+        let arbiter = PermissionArbiter::new(
+            PermissionMode::Default,
+            vec![AllowlistRule::new("run_shell", "echo*")],
+        );
+
+        run_agent_loop(
+            &provider,
+            &mut state,
+            &tools,
+            &ctx,
+            &arbiter,
+            AgentLoopConfig {
+                model: "mock".into(),
+                max_tokens: 100,
+                max_turns: 5,
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let (content, is_error) = find_tool_result(&state);
+        assert!(!is_error);
+        assert!(content.contains("allowed"));
+    }
 }

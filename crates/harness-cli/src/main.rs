@@ -3,9 +3,12 @@
 //! M2時点では `--print` によるAnthropic/OpenAIへのストリーミング呼び出しをサポートする。
 //! 受信したテキストデルタをその場でstdoutへ書き出す（トークン逐次表示、§実装マイルストーン M2）。
 //! M3で `read_file`/`run_shell` を登録した `ToolRegistry` を使い `run_agent_loop` へ
-//! 切り替えた（§実装マイルストーン M3「一旦allow-allで動作確認」）。`PermissionArbiter`・
-//! fsジェイル（M4/M11）が無いため、ツールは無条件でカレントディレクトリを
-//! ワークスペースルートとして実行される。対話TUI・LMStudio/Responses variantはM6/M7で追加する。
+//! 切り替えた。M4で `PermissionArbiter` を配線し、`--permission-mode`/`--allow` を追加した。
+//! 既定モードは `Default`（read-only自動許可、Write/Exec/Networkはヘッドレスにつき自動拒否、
+//! §パーミッション「ヘッドレス時」）で、M3までの「一旦allow-all」から「allowlist-or-deny」へ
+//! 切り替わる（§実装マイルストーン M4）。対話TUI・LMStudio/Responses variantはM6/M7で追加する。
+//! `--allow`/`--dangerously-allow`のフラグ体系全体（危険パターンの明示要求等）はM8のスコープの
+//! ため、本フェーズは`--allow <tool>:<pattern>`の素朴な繰り返し指定のみをサポートする。
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
@@ -13,7 +16,10 @@ use std::process::ExitCode;
 use clap::{Parser, ValueEnum};
 
 use harness_core::{LlmProvider, ToolCtx};
-use harness_engine::{run_agent_loop, AgentLoopConfig, ConversationState};
+use harness_engine::{
+    parse_allowlist_rule, run_agent_loop, AgentLoopConfig, ConversationState, PermissionArbiter,
+    PermissionMode,
+};
 use harness_providers::{AnthropicProvider, OpenAiProvider};
 use harness_tools::ToolRegistry;
 
@@ -25,6 +31,28 @@ const DEFAULT_MAX_TURNS: usize = 25;
 enum ProviderKind {
     Anthropic,
     Openai,
+}
+
+#[derive(Clone, Copy, ValueEnum, Default)]
+enum PermissionModeArg {
+    Plan,
+    #[default]
+    Default,
+    AcceptEdits,
+    AcceptAll,
+    Deny,
+}
+
+impl From<PermissionModeArg> for PermissionMode {
+    fn from(v: PermissionModeArg) -> Self {
+        match v {
+            PermissionModeArg::Plan => PermissionMode::Plan,
+            PermissionModeArg::Default => PermissionMode::Default,
+            PermissionModeArg::AcceptEdits => PermissionMode::AcceptEdits,
+            PermissionModeArg::AcceptAll => PermissionMode::AcceptAll,
+            PermissionModeArg::Deny => PermissionMode::Deny,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -41,6 +69,14 @@ struct Cli {
     /// 使用するプロバイダ。
     #[arg(long, value_enum, default_value_t = ProviderKind::Anthropic)]
     provider: ProviderKind,
+
+    /// パーミッションモード（§パーミッション（承認）システム「モード」）。
+    #[arg(long = "permission-mode", value_enum, default_value_t = PermissionModeArg::default())]
+    permission_mode: PermissionModeArg,
+
+    /// allowlistルール（`tool:pattern`形式、繰り返し指定可）。例: `run_shell:git status*`
+    #[arg(long = "allow")]
+    allow: Vec<String>,
 }
 
 #[tokio::main]
@@ -106,12 +142,26 @@ async fn main() -> ExitCode {
     let tools = ToolRegistry::with_builtin_tools();
     let tool_ctx = ToolCtx { workspace_root };
 
+    let allowlist: Vec<_> = cli
+        .allow
+        .iter()
+        .filter_map(|rule| {
+            let parsed = parse_allowlist_rule(rule);
+            if parsed.is_none() {
+                eprintln!("ignoring malformed --allow rule (expected tool:pattern): {rule}");
+            }
+            parsed
+        })
+        .collect();
+    let arbiter = PermissionArbiter::new(cli.permission_mode.into(), allowlist);
+
     let mut stdout = std::io::stdout();
     let result = run_agent_loop(
         provider.as_ref(),
         &mut state,
         &tools,
         &tool_ctx,
+        &arbiter,
         AgentLoopConfig {
             model,
             max_tokens: DEFAULT_MAX_TOKENS,
