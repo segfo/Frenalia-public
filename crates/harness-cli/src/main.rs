@@ -2,19 +2,24 @@
 //!
 //! M2時点では `--print` によるAnthropic/OpenAIへのストリーミング呼び出しをサポートする。
 //! 受信したテキストデルタをその場でstdoutへ書き出す（トークン逐次表示、§実装マイルストーン M2）。
-//! 対話TUI・ツールループ・LMStudio/Responses variantはM3以降・M6で追加する。
+//! M3で `read_file`/`run_shell` を登録した `ToolRegistry` を使い `run_agent_loop` へ
+//! 切り替えた（§実装マイルストーン M3「一旦allow-allで動作確認」）。`PermissionArbiter`・
+//! fsジェイル（M4/M11）が無いため、ツールは無条件でカレントディレクトリを
+//! ワークスペースルートとして実行される。対話TUI・LMStudio/Responses variantはM6/M7で追加する。
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
-use harness_core::LlmProvider;
-use harness_engine::{run_single_turn, ConversationState};
+use harness_core::{LlmProvider, ToolCtx};
+use harness_engine::{run_agent_loop, AgentLoopConfig, ConversationState};
 use harness_providers::{AnthropicProvider, OpenAiProvider};
+use harness_tools::ToolRegistry;
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-8";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const DEFAULT_MAX_TURNS: usize = 25;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum ProviderKind {
@@ -91,12 +96,27 @@ async fn main() -> ExitCode {
     let mut state = ConversationState::new();
     state.push_user_text(prompt);
 
+    let workspace_root = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tools = ToolRegistry::with_builtin_tools();
+    let tool_ctx = ToolCtx { workspace_root };
+
     let mut stdout = std::io::stdout();
-    let result = run_single_turn(
+    let result = run_agent_loop(
         provider.as_ref(),
-        &state,
-        model,
-        DEFAULT_MAX_TOKENS,
+        &mut state,
+        &tools,
+        &tool_ctx,
+        AgentLoopConfig {
+            model,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            max_turns: DEFAULT_MAX_TURNS,
+        },
         |delta| {
             let _ = stdout.write_all(delta.as_bytes());
             let _ = stdout.flush();

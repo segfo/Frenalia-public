@@ -17,7 +17,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use harness_core::{
     BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderCapabilities,
-    ProviderError, Role, StopReason, StreamEvent, Usage,
+    ProviderError, Role, StopReason, StreamEvent, ToolChoice, Usage,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -185,6 +185,25 @@ struct WireRequest {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<WireToolSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<WireToolChoice>,
+}
+
+#[derive(Serialize)]
+struct WireToolSpec {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireToolChoice {
+    Auto,
+    Any,
+    Tool { name: String },
 }
 
 #[derive(Serialize)]
@@ -246,6 +265,29 @@ struct WireImageSource {
 }
 
 fn to_wire_request(req: &CompletionRequest) -> WireRequest {
+    let tools: Vec<WireToolSpec> = req
+        .tools
+        .iter()
+        .map(|t| WireToolSpec {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            input_schema: t.input_schema.clone(),
+        })
+        .collect();
+
+    // tool_choice は tools が空だと Anthropic 側が 400 を返すため、tools がある時のみ載せる。
+    // Anthropicに "none" 相当は無いため ToolChoice::None はそのまま省略する。
+    let tool_choice = if tools.is_empty() {
+        None
+    } else {
+        match &req.tool_choice {
+            ToolChoice::Auto => Some(WireToolChoice::Auto),
+            ToolChoice::Required => Some(WireToolChoice::Any),
+            ToolChoice::Tool(name) => Some(WireToolChoice::Tool { name: name.clone() }),
+            ToolChoice::None => None,
+        }
+    };
+
     WireRequest {
         model: req.model.clone(),
         max_tokens: req.max_tokens,
@@ -263,6 +305,8 @@ fn to_wire_request(req: &CompletionRequest) -> WireRequest {
         temperature: req.sampling.temperature,
         top_p: req.sampling.top_p,
         top_k: req.sampling.top_k,
+        tools,
+        tool_choice,
     }
 }
 
