@@ -14,7 +14,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use cap_std::fs::Dir;
+use cap_std::fs::{Dir, File};
+use cap_std::time::SystemTime;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JailError {
@@ -43,6 +44,67 @@ impl WorkspaceJail {
     pub fn read_to_string(&self, rel_path: &str) -> Result<String, JailError> {
         let rel = check_relative_path(rel_path)?;
         Ok(self.dir.read_to_string(&rel)?)
+    }
+
+    /// ジェイル内へ書き込む（`write_file`/`edit_file`用）。親ディレクトリは
+    /// jailを開いた`Dir`ハンドルからの相対`create_dir_all`（openat相当）で作る
+    /// （§ツールシステム`write_file`「親ディレクトリ作成」）。
+    pub fn write_string(&self, rel_path: &str, content: &str) -> Result<(), JailError> {
+        use std::io::Write as _;
+
+        let rel = check_relative_path(rel_path)?;
+        if let Some(parent) = rel.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.dir.create_dir_all(parent)?;
+            }
+        }
+        let mut file = self.dir.create(&rel)?;
+        file.write_all(content.as_bytes())?;
+        Ok(())
+    }
+
+    /// jailルート配下の全ファイルを相対パスで列挙する（`grep`/`glob`用）。
+    /// **【T3】`ignore::WalkBuilder`はstdのパスベースopenで自走査しcap-stdの`Dir`ハンドルを
+    /// 経由できないため、走査本体はここで組む自前walker（`Dir::entries`＝openat相当）に統一し、
+    /// `ignore`/`globset`はgitignore・globのマッチング判定にのみ使う**
+    /// （§ツールシステム fsジェイル）。シンボリックリンクは辿らない（jail脱出防止）。
+    pub fn walk_files(&self) -> Result<Vec<PathBuf>, JailError> {
+        let mut out = Vec::new();
+        Self::walk_dir(&self.dir, PathBuf::new(), &mut out)?;
+        Ok(out)
+    }
+
+    /// ジェイル内のファイルを読取専用で開く（`grep`用、cap-stdの相対open＝openat相当）。
+    pub fn open_file(&self, rel_path: &str) -> Result<File, JailError> {
+        let rel = check_relative_path(rel_path)?;
+        Ok(self.dir.open(&rel)?)
+    }
+
+    /// ジェイル内ファイルの最終更新時刻（`glob`のmtime順ソート用）。
+    pub fn modified(&self, rel_path: &str) -> Result<SystemTime, JailError> {
+        let rel = check_relative_path(rel_path)?;
+        Ok(self.dir.metadata(&rel)?.modified()?)
+    }
+
+    fn walk_dir(dir: &Dir, prefix: PathBuf, out: &mut Vec<PathBuf>) -> Result<(), JailError> {
+        for entry in dir.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let rel = prefix.join(&name);
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            } else if file_type.is_dir() {
+                let sub = entry.open_dir()?;
+                Self::walk_dir(&sub, rel, out)?;
+            } else if file_type.is_file() {
+                out.push(rel);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -135,6 +197,45 @@ mod tests {
         let jail = WorkspaceJail::open(dir.path()).unwrap();
         let err = jail.read_to_string("../outside.txt").unwrap_err();
         assert!(matches!(err, JailError::Escape(_)));
+    }
+
+    #[test]
+    fn write_string_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let jail = WorkspaceJail::open(dir.path()).unwrap();
+        jail.write_string("sub/dir/a.txt", "hello").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sub/dir/a.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn write_string_rejects_path_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let jail = WorkspaceJail::open(dir.path()).unwrap();
+        let err = jail.write_string("../outside.txt", "x").unwrap_err();
+        assert!(matches!(err, JailError::Escape(_)));
+    }
+
+    #[test]
+    fn walk_files_lists_nested_files_and_skips_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "1").unwrap();
+        std::fs::write(dir.path().join("sub/b.txt"), "2").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+
+        let jail = WorkspaceJail::open(dir.path()).unwrap();
+        let mut files: Vec<String> = jail
+            .walk_files()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        files.sort();
+        assert_eq!(files, vec!["a.txt".to_string(), "sub/b.txt".to_string()]);
     }
 
     #[test]

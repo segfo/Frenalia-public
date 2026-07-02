@@ -5,11 +5,19 @@ edition.workspace = true
 
 [dependencies]
 async-trait = "0.1"
+cap-std = "4.0.2"
+futures-util = "0.3"
+globset = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.42", features = ["process", "time", "io-util", "rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1.42", features = ["process", "time", "io-util", "rt-multi-thread", "macros", "fs", "net"] }
+which = "7"
 
 [dev-dependencies]
 tempfile = "3"
