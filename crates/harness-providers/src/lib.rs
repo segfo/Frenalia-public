@@ -1,9 +1,12 @@
-//! harness-providers: `LlmProvider` の実装群。
-//! M1時点ではAnthropic・OpenAIの2種（いずれも自前reqwest・非ストリーム）。
-//! §プロバイダ抽象参照。OpenAIの `async-openai` 経由への移行はM6で行う（`openai.rs` 冒頭コメント参照）。
+//! harness-providers: `LlmProvider` の実装群。§プロバイダ抽象参照。
+//! M6時点でAnthropic・OpenAI（tool_calls対応、LMStudioは`OpenAiProvider::lmstudio()`で同一コードパス）・
+//! mock（テスト用スクリプトプロバイダ）の3種。OpenAI Responses variantは後続マイルストーンで追加する
+//! （`openai.rs`冒頭コメント参照）。
 
 pub mod anthropic;
+pub mod mock;
 pub mod openai;
 
 pub use anthropic::AnthropicProvider;
+pub use mock::MockProvider;
 pub use openai::OpenAiProvider;

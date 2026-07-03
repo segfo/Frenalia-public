@@ -1,13 +1,15 @@
 //! OpenAI Chat Completions API を `LlmProvider` へ正規化するアダプタ。
 //! `plans/DESIGN.md` §プロバイダ抽象「OpenAI Chat Completions / LMStudio」参照。
 //!
-//! **設計書との差分（M1時点でのスコープ拡張、M2で継続）**: `plans/DESIGN.md` の実装マイルストーンでは
-//! OpenAIファミリは本来M6（`async-openai` 経由、tool_call文字列引数正規化・LMStudio互換・
-//! Responses variant込み）のスコープである。本ファイルはユーザの指示により、M1の時点で
-//! Anthropicと並行して**ツール無し・自前reqwest実装**の最小疎通のみを先行実装したもの。M2では
-//! `stream:true`+`data:`フレーム逐次パース（末尾`data:[DONE]`）へ拡張した。`async-openai`
-//! 採用可否（§プロバイダ抽象 L134のA/B）・tool_call引数正規化・LMStudio base_url差し替え・
-//! Responses variantはM6で改めて設計通りに実装する。
+//! **M6でツール呼び出しに対応**: `tools`/`tool_choice`のリクエスト側正規化、`delta.tool_calls[]`
+//! （indexごとに分割された`function.arguments`のJSON文字列断片）のレスポンス側正規化を実装した。
+//! LMStudioは`base_url`を`http://localhost:1234/v1`へ差し替えるだけの同一ワイヤ形式（openai-family、
+//! §設定「ProviderProfile」）だが、実機の応答には`usage:null`・`tool_calls`チャンクでの`index`省略
+//! といった揺れがあるため、該当フィールドは`#[serde(default)]`で欠落を許容している
+//! （§実装マイルストーン M6 受入条件【E10】）。
+//!
+//! OpenAI Responses API（stateless variant、`encrypted_content`往復）はDESIGN.md §プロバイダ抽象が
+//! 明示的に「M6とは別の後続マイルストーンへ切り出す」と定めているため、本ファイルのスコープ外。
 
 use std::time::Duration;
 
@@ -19,10 +21,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use harness_core::{
     BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderCapabilities,
-    ProviderError, Role, StopReason, StreamEvent, Usage,
+    ProviderError, Role, StopReason, StreamEvent, ToolChoice, ToolSpec, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234/v1";
 
 pub struct OpenAiProvider {
     http: reqwest::Client,
@@ -42,6 +45,12 @@ impl OpenAiProvider {
             base_url,
         }
     }
+
+    /// §設定「LMStudio は単に `base_url=http://localhost:1234/v1` の openai-family プロファイル」。
+    /// LMStudioは認証不要のため空キーで構わない（§プロバイダ抽象「LMStudioは空キー可」）。
+    pub fn lmstudio() -> Self {
+        Self::with_base_url(String::new(), DEFAULT_LMSTUDIO_BASE_URL.to_string())
+    }
 }
 
 #[async_trait]
@@ -57,16 +66,14 @@ impl LlmProvider for OpenAiProvider {
         let body = to_wire_request(&req);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
-        let resp = self
-            .http
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport {
-                retriable: e.is_timeout() || e.is_connect(),
-            })?;
+        let mut request = self.http.post(url).json(&body);
+        if !self.api_key.is_empty() {
+            request = request.bearer_auth(&self.api_key);
+        }
+
+        let resp = request.send().await.map_err(|e| ProviderError::Transport {
+            retriable: e.is_timeout() || e.is_connect(),
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -83,9 +90,7 @@ impl LlmProvider for OpenAiProvider {
         let mut events = resp.bytes_stream().eventsource();
 
         let s = try_stream! {
-            let mut block_open = false;
-            let mut stop_reason = StopReason::EndTurn;
-            let mut usage = Usage::default();
+            let mut st = StreamAccumState::new();
 
             while let Some(ev) = events.next().await {
                 let ev = ev.map_err(|_| ProviderError::Transport { retriable: true })?;
@@ -97,32 +102,14 @@ impl LlmProvider for OpenAiProvider {
                 }
 
                 let chunk: WireChunk = parse_wire(&ev.data)?;
-
-                if let Some(u) = chunk.usage {
-                    usage.input = u.prompt_tokens;
-                    usage.output = u.completion_tokens;
-                }
-
-                if let Some(choice) = chunk.choices.into_iter().next() {
-                    if !block_open {
-                        yield StreamEvent::BlockStart { index: 0, kind: BlockKind::Text };
-                        block_open = true;
-                    }
-                    if let Some(text) = choice.delta.content {
-                        if !text.is_empty() {
-                            yield StreamEvent::TextDelta { index: 0, text };
-                        }
-                    }
-                    if let Some(fr) = choice.finish_reason {
-                        stop_reason = map_stop_reason(Some(&fr));
-                    }
+                for event in st.handle_chunk(chunk) {
+                    yield event;
                 }
             }
 
-            if block_open {
-                yield StreamEvent::BlockStop { index: 0 };
+            for event in st.finish() {
+                yield event;
             }
-            yield StreamEvent::Done { stop_reason, usage };
         };
 
         Ok(Box::pin(s))
@@ -157,6 +144,12 @@ struct WireRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<WireTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -167,7 +160,40 @@ struct WireStreamOptions {
 #[derive(Serialize)]
 struct WireMessage {
     role: &'static str,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<WireToolCallOut>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WireToolCallOut {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: WireFunctionCallOut,
+}
+
+#[derive(Serialize)]
+struct WireFunctionCallOut {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Serialize)]
+struct WireTool {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: WireFunctionDef,
+}
+
+#[derive(Serialize)]
+struct WireFunctionDef {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
 }
 
 fn to_wire_request(req: &CompletionRequest) -> WireRequest {
@@ -182,13 +208,24 @@ fn to_wire_request(req: &CompletionRequest) -> WireRequest {
             .join("\n\n");
         messages.push(WireMessage {
             role: "system",
-            content: text,
+            content: Some(text),
+            tool_calls: None,
+            tool_call_id: None,
         });
     }
 
     for m in &req.messages {
-        messages.push(to_wire_message(m));
+        append_wire_messages(m, &mut messages);
     }
+
+    let tools: Vec<WireTool> = req.tools.iter().map(to_wire_tool).collect();
+    // tool_choice はAnthropicアダプタと同様、toolsが無いのに送るとプロバイダによっては
+    // 400になりうるため、toolsがある時のみ載せる（§プロバイダ抽象 Anthropicアダプタと対称）。
+    let tool_choice = if tools.is_empty() {
+        None
+    } else {
+        Some(tool_choice_to_wire(&req.tool_choice))
+    };
 
     WireRequest {
         model: req.model.clone(),
@@ -198,28 +235,102 @@ fn to_wire_request(req: &CompletionRequest) -> WireRequest {
         max_tokens: req.max_tokens,
         temperature: req.sampling.temperature,
         top_p: req.sampling.top_p,
+        tools,
+        tool_choice,
+        parallel_tool_calls: req.parallel_tool_calls,
     }
 }
 
-fn to_wire_message(msg: &Message) -> WireMessage {
-    // M1/M2時点はテキストのみを送信する単発ターン専用。tool_use/tool_result/thinking等の
-    // OpenAI固有ワイヤ形式（tool_calls配列・role:tool分離）への正規化はM3/M6で追加する。
-    let text = msg
-        .content
-        .iter()
-        .filter_map(|c| match c {
-            ContentBlock::Text(t) => Some(t.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    WireMessage {
-        role: match msg.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
+fn to_wire_tool(spec: &ToolSpec) -> WireTool {
+    WireTool {
+        kind: "function",
+        function: WireFunctionDef {
+            name: spec.name.clone(),
+            description: spec.description.clone(),
+            parameters: spec.input_schema.clone(),
         },
-        content: text,
+    }
+}
+
+fn tool_choice_to_wire(tc: &ToolChoice) -> serde_json::Value {
+    match tc {
+        ToolChoice::Auto => serde_json::json!("auto"),
+        ToolChoice::None => serde_json::json!("none"),
+        ToolChoice::Required => serde_json::json!("required"),
+        ToolChoice::Tool(name) => serde_json::json!({ "type": "function", "function": { "name": name } }),
+    }
+}
+
+/// 1つのIRメッセージを0〜複数のOpenAIワイヤメッセージへ展開する。
+/// `ToolResult`ブロックはAnthropicと異なり`role:"tool"`+`tool_call_id`の**別メッセージ**になる
+/// （§プロバイダ抽象 OpenAI「結果はrole:tool+tool_call_id」）ため、1:1写像にならない。
+fn append_wire_messages(msg: &Message, out: &mut Vec<WireMessage>) {
+    match msg.role {
+        Role::User => {
+            let mut text_parts = Vec::new();
+            for block in &msg.content {
+                match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
+                        out.push(WireMessage {
+                            role: "tool",
+                            content: Some(content.clone()),
+                            tool_calls: None,
+                            tool_call_id: Some(tool_use_id.clone()),
+                        });
+                    }
+                    ContentBlock::Text(t) => text_parts.push(t.clone()),
+                    // Image/Thinking/RedactedThinkingはOpenAI Chat Completionsのuser側には
+                    // 未対応（Imageは将来対応、ThinkingはAnthropic固有概念のためM6スコープ外）。
+                    _ => {}
+                }
+            }
+            if !text_parts.is_empty() {
+                out.push(WireMessage {
+                    role: "user",
+                    content: Some(text_parts.join("\n")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+        Role::Assistant => {
+            let mut text_parts = Vec::new();
+            let mut tool_calls = Vec::new();
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text(t) => text_parts.push(t.clone()),
+                    ContentBlock::ToolUse { id, name, input } => {
+                        tool_calls.push(WireToolCallOut {
+                            id: id.clone(),
+                            kind: "function",
+                            function: WireFunctionCallOut {
+                                name: name.clone(),
+                                arguments: input.to_string(),
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            out.push(WireMessage {
+                role: "assistant",
+                content: if text_parts.is_empty() {
+                    None
+                } else {
+                    Some(text_parts.join("\n"))
+                },
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
+                tool_call_id: None,
+            });
+        }
     }
 }
 
@@ -237,6 +348,7 @@ struct WireChunk {
 struct WireChunkChoice {
     #[serde(default)]
     delta: WireChunkDelta,
+    #[serde(default)]
     finish_reason: Option<String>,
 }
 
@@ -244,6 +356,29 @@ struct WireChunkChoice {
 struct WireChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<WireToolCallDelta>>,
+}
+
+/// `index`はOpenAI本家では常に付与されるが、LMStudioの実応答では継続チャンク
+/// （2個目以降の`arguments`断片）で省略されることがある（§実装マイルストーン M6【E10】）。
+/// `#[serde(default)]`で0へフォールバックする（単一tool_call前提のLMStudio運用ではこれで実害がない）。
+#[derive(Deserialize, Default)]
+struct WireToolCallDelta {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<WireFunctionDelta>,
+}
+
+#[derive(Deserialize, Default)]
+struct WireFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -252,6 +387,100 @@ struct WireUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+}
+
+/// SSEチャンク列から`StreamEvent`列を組み立てる作業用状態。
+/// テキストブロックはローカルindex 0固定、各tool_callはOpenAI側`index`+1をローカルindexとして
+/// 割り当てる（0はテキスト用に予約）。`stream()`本体から切り出してあるのは、実HTTPを起こさず
+/// 録画済み/合成JSONチャンクだけで単体テストできるようにするため（下記tests参照）。
+struct StreamAccumState {
+    text_open: bool,
+    tool_open: Vec<usize>,
+    stop_reason: StopReason,
+    usage: Usage,
+}
+
+impl StreamAccumState {
+    fn new() -> Self {
+        Self {
+            text_open: false,
+            tool_open: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        }
+    }
+
+    fn handle_chunk(&mut self, chunk: WireChunk) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+
+        if let Some(u) = chunk.usage {
+            self.usage.input = u.prompt_tokens;
+            self.usage.output = u.completion_tokens;
+        }
+
+        if let Some(choice) = chunk.choices.into_iter().next() {
+            if let Some(text) = choice.delta.content {
+                if !text.is_empty() {
+                    if !self.text_open {
+                        out.push(StreamEvent::BlockStart {
+                            index: 0,
+                            kind: BlockKind::Text,
+                        });
+                        self.text_open = true;
+                    }
+                    out.push(StreamEvent::TextDelta { index: 0, text });
+                }
+            }
+
+            if let Some(tool_calls) = choice.delta.tool_calls {
+                for tc in tool_calls {
+                    let local_index = tc.index + 1;
+                    if !self.tool_open.contains(&local_index) {
+                        let id = tc.id.clone().unwrap_or_default();
+                        let name = tc
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.name.clone())
+                            .unwrap_or_default();
+                        out.push(StreamEvent::BlockStart {
+                            index: local_index,
+                            kind: BlockKind::ToolUse { id, name },
+                        });
+                        self.tool_open.push(local_index);
+                    }
+                    if let Some(args) = tc.function.and_then(|f| f.arguments) {
+                        if !args.is_empty() {
+                            out.push(StreamEvent::ToolInputDelta {
+                                index: local_index,
+                                json_fragment: args,
+                            });
+                        }
+                    }
+                }
+            }
+
+            if let Some(fr) = choice.finish_reason {
+                self.stop_reason = map_stop_reason(Some(&fr));
+            }
+        }
+
+        out
+    }
+
+    fn finish(self) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        if self.text_open {
+            out.push(StreamEvent::BlockStop { index: 0 });
+        }
+        for idx in self.tool_open {
+            out.push(StreamEvent::BlockStop { index: idx });
+        }
+        out.push(StreamEvent::Done {
+            stop_reason: self.stop_reason,
+            usage: self.usage,
+        });
+        out
+    }
 }
 
 fn map_stop_reason(reason: Option<&str>) -> StopReason {
@@ -293,5 +522,257 @@ fn map_error_response(status: u16, body: &str, retry_after: Option<Duration>) ->
         (400, Some("context_length_exceeded")) => ProviderError::ContextTooLong,
         (400, _) => ProviderError::InvalidRequest { msg: message },
         _ => ProviderError::Api { status, code },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 標準的なOpenAI Chat Completionsのtool_callチャンク（`index`が毎回明示される）。
+    /// §実装マイルストーン M6検証条件「同一プロンプトが3プロバイダで動く」のワイヤ層に相当する
+    /// 部分を、実HTTP無しで確認する。
+    #[test]
+    fn openai_style_tool_call_chunks_produce_matching_block_events() {
+        let mut st = StreamAccumState::new();
+        let mut events = Vec::new();
+
+        let chunk1: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+                {"index":0,"id":"call_abc","type":"function","function":{"name":"read_file","arguments":""}}
+            ]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk1));
+
+        let chunk2: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"{\"path\":"}}
+            ]},"finish_reason":null}],"usage":null}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk2));
+
+        let chunk3: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"\"a.txt\"}"}}
+            ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk3));
+
+        events.extend(st.finish());
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::BlockStart {
+                    index: 1,
+                    kind: BlockKind::ToolUse {
+                        id: "call_abc".to_string(),
+                        name: "read_file".to_string(),
+                    },
+                },
+                StreamEvent::ToolInputDelta {
+                    index: 1,
+                    json_fragment: "{\"path\":".to_string(),
+                },
+                StreamEvent::ToolInputDelta {
+                    index: 1,
+                    json_fragment: "\"a.txt\"}".to_string(),
+                },
+                StreamEvent::BlockStop { index: 1 },
+                StreamEvent::Done {
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage {
+                        input: 10,
+                        output: 5,
+                        cache_read: 0,
+                        cache_creation: 0,
+                    },
+                },
+            ]
+        );
+    }
+
+    /// §実装マイルストーン M6受入条件【E10】: LMStudio実応答フィクスチャ（`usage:null`・
+    /// tool_callチャンクの`index`省略込み）のデシリアライズテスト。継続チャンクが`index`を
+    /// 省略しても（単一tool_call運用では）0へフォールバックし同じブロックへ集約されることを確認する。
+    #[test]
+    fn lmstudio_quirk_fixture_with_null_usage_and_missing_index_deserializes() {
+        let mut st = StreamAccumState::new();
+        let mut events = Vec::new();
+
+        // 1個目のチャンクはid/nameを伴い明示indexあり（LMStudioでもここは省略されない）。
+        let chunk1: WireChunk = parse_wire(
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,
+                "model":"qwen3.6-35b-a3b-uncensored-genesis-v2-apex-mtp",
+                "choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+                    {"index":0,"id":"call_1","type":"function","function":{"name":"glob","arguments":""}}
+                ]},"finish_reason":null}],"usage":null}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk1));
+
+        // 継続チャンクは実機で"index"キー自体が省略されることがある（【E10】が明記する揺れ）。
+        let chunk2: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"function":{"arguments":"{\"pattern\":"}}
+            ]},"finish_reason":null}],"usage":null}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk2));
+
+        let chunk3: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"function":{"arguments":"\"*.rs\"}"}}
+            ]},"finish_reason":"tool_calls"}],"usage":null}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk3));
+
+        events.extend(st.finish());
+
+        let fragments: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolInputDelta { json_fragment, .. } => Some(json_fragment.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fragments.join(""), r#"{"pattern":"*.rs"}"#);
+
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::BlockStart { index: 1, kind: BlockKind::ToolUse { id, name } } if id == "call_1" && name == "glob")));
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn text_only_chunks_still_work_without_tool_calls() {
+        let mut st = StreamAccumState::new();
+        let mut events = Vec::new();
+
+        let chunk1: WireChunk =
+            parse_wire(r#"{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#)
+                .unwrap();
+        events.extend(st.handle_chunk(chunk1));
+
+        let chunk2: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk2));
+
+        events.extend(st.finish());
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::BlockStart {
+                    index: 0,
+                    kind: BlockKind::Text,
+                },
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "hello".to_string(),
+                },
+                StreamEvent::BlockStop { index: 0 },
+                StreamEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage {
+                        input: 3,
+                        output: 1,
+                        cache_read: 0,
+                        cache_creation: 0,
+                    },
+                },
+            ]
+        );
+    }
+
+    /// 1つのToolSpecがOpenAIの外部タグ形式（`{type:function,function:{...}}`）へ正しく展開されること。
+    #[test]
+    fn tool_spec_expands_to_external_function_tag() {
+        let req = CompletionRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![ToolSpec {
+                name: "read_file".to_string(),
+                description: "read a file".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            tool_choice: ToolChoice::Auto,
+            output: None,
+            parallel_tool_calls: None,
+            max_tokens: 100,
+            sampling: Default::default(),
+            model: "gpt-test".to_string(),
+        };
+        let wire = to_wire_request(&req);
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(value["tools"][0]["type"], "function");
+        assert_eq!(value["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(value["tool_choice"], "auto");
+    }
+
+    /// assistantのtool_use + 後続userのtool_resultが、OpenAIの
+    /// `role:assistant,tool_calls` / `role:tool,tool_call_id` へ正しく分解されること
+    /// （§プロバイダ抽象「結果はrole:tool+tool_call_id」）。
+    #[test]
+    fn tool_use_and_tool_result_expand_to_separate_wire_messages() {
+        let req = CompletionRequest {
+            system: vec![],
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "a.txt"}),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: "file contents".to_string(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![ToolSpec {
+                name: "read_file".to_string(),
+                description: "read a file".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            tool_choice: ToolChoice::Auto,
+            output: None,
+            parallel_tool_calls: None,
+            max_tokens: 100,
+            sampling: Default::default(),
+            model: "gpt-test".to_string(),
+        };
+        let wire = to_wire_request(&req);
+        let value = serde_json::to_value(&wire).unwrap();
+        let messages = value["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"a.txt"}"#
+        );
+
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[1]["content"], "file contents");
     }
 }

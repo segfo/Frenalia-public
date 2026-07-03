@@ -11,5 +11,6 @@ serde_json = "1"
 
 [dev-dependencies]
 async-trait = "0.1.89"
+harness-providers = { version = "0.1.0", path = "../harness-providers" }
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }

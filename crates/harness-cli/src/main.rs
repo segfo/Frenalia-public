@@ -6,7 +6,9 @@
 //! 切り替えた。M4で `PermissionArbiter` を配線し、`--permission-mode`/`--allow` を追加した。
 //! 既定モードは `Default`（read-only自動許可、Write/Exec/Networkはヘッドレスにつき自動拒否、
 //! §パーミッション「ヘッドレス時」）で、M3までの「一旦allow-all」から「allowlist-or-deny」へ
-//! 切り替わる（§実装マイルストーン M4）。対話TUI・LMStudio/Responses variantはM6/M7で追加する。
+//! 切り替わる（§実装マイルストーン M4）。M6で`--provider lmstudio`を追加した（実体は
+//! `OpenAiProvider::lmstudio()`、`base_url=http://localhost:1234/v1`のopenai-familyプロファイル）。
+//! 対話TUI・OpenAI Responses variantはM7/後続マイルストーンで追加する。
 //! `--allow`/`--dangerously-allow`のフラグ体系全体（危険パターンの明示要求等）はM8のスコープの
 //! ため、本フェーズは`--allow <tool>:<pattern>`の素朴な繰り返し指定のみをサポートする。
 
@@ -31,6 +33,7 @@ const DEFAULT_MAX_TURNS: usize = 25;
 enum ProviderKind {
     Anthropic,
     Openai,
+    Lmstudio,
 }
 
 #[derive(Clone, Copy, ValueEnum, Default)]
@@ -118,6 +121,15 @@ async fn main() -> ExitCode {
                 Err(_) => Box::new(OpenAiProvider::new(api_key)),
             }
         }
+        // §設定「LMStudio は単に base_url=http://localhost:1234/v1 の openai-family
+        // プロファイル」。OPENAI_API_KEY/OPENAI_BASE_URLでの上書きも許す。
+        ProviderKind::Lmstudio => {
+            let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            match std::env::var("OPENAI_BASE_URL") {
+                Ok(base_url) => Box::new(OpenAiProvider::with_base_url(api_key, base_url)),
+                Err(_) => Box::new(OpenAiProvider::lmstudio()),
+            }
+        }
     };
 
     let model = match (cli.model, cli.provider) {
@@ -125,6 +137,10 @@ async fn main() -> ExitCode {
         (None, ProviderKind::Anthropic) => DEFAULT_ANTHROPIC_MODEL.to_string(),
         (None, ProviderKind::Openai) => {
             eprintln!("--model is required when --provider openai is used");
+            return ExitCode::FAILURE;
+        }
+        (None, ProviderKind::Lmstudio) => {
+            eprintln!("--model is required when --provider lmstudio is used");
             return ExitCode::FAILURE;
         }
     };
