@@ -14,14 +14,25 @@ pub mod permission;
 use futures::StreamExt;
 
 use harness_core::{
-    BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError, Role,
-    Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, ToolCtx, ToolOutput, Usage,
+    AgentEvent, BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError,
+    Role, Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, ToolCtx, ToolOutput, Usage,
 };
 use harness_tools::ToolRegistry;
 
 pub use permission::{
-    arg_repr, parse_allowlist_rule, AllowlistRule, Decision, PermissionArbiter, PermissionMode,
+    arg_repr, parse_allowlist_rule, AllowlistRule, Classification, Decision, PermissionArbiter,
+    PermissionGate, PermissionMode,
 };
+
+/// TUI等のフロントエンドへ`AgentEvent`を流すための送信口。ヘッドレスCLIは`None`を渡し
+/// 従来通り`on_text_delta`コールバックのみでstdout出力する（§非対話モード、既存挙動を維持）。
+pub type EventSink = tokio::sync::mpsc::UnboundedSender<AgentEvent>;
+
+fn emit(events: Option<&EventSink>, ev: AgentEvent) {
+    if let Some(tx) = events {
+        let _ = tx.send(ev);
+    }
+}
 
 /// 会話のIR履歴。
 #[derive(Debug, Clone, Default)]
@@ -165,16 +176,20 @@ pub struct AgentLoopConfig {
 }
 
 /// 1回のステップ = 1プロバイダターン + 承認済みツール実行（§エージェントループ）を
-/// `stop_reason != ToolUse` になるまで繰り返す。`arbiter`が全ツール呼び出しの実行前に
+/// `stop_reason != ToolUse` になるまで繰り返す。`gate`が全ツール呼び出しの実行前に
 /// 必ず参照される唯一の強制点で（§パーミッション（承認）システム）、`Decision::Deny`の場合は
 /// ツールを実行せずエラーの`ToolResult`を合成する（§エージェントループ 手順4）。
+/// `events`が`Some`なら`AgentEvent`をその都度発行する（M7、`harness-tui`の`AppState`が
+/// これを畳み込んで描画する。§リッチTUI「`AppState`は`AgentEvent`を畳み込んで更新」）。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_loop<F>(
     provider: &dyn LlmProvider,
     state: &mut ConversationState,
     tools: &ToolRegistry,
     ctx: &ToolCtx,
-    arbiter: &PermissionArbiter,
+    gate: &dyn PermissionGate,
     config: AgentLoopConfig,
+    events: Option<&EventSink>,
     mut on_text_delta: F,
 ) -> Result<AgentLoopOutcome, ProviderError>
 where
@@ -183,6 +198,7 @@ where
     let tool_specs = tools.to_specs();
 
     for _ in 0..config.max_turns {
+        emit(events, AgentEvent::TurnStarted);
         let req = CompletionRequest {
             system: state.system.clone(),
             messages: state.messages.clone(),
@@ -199,13 +215,27 @@ where
             model: config.model.clone(),
         };
 
-        let mut stream = provider.stream(req).await?;
+        let stream = match provider.stream(req).await {
+            Ok(s) => s,
+            Err(e) => {
+                emit(events, AgentEvent::Error { message: e.to_string() });
+                return Err(e);
+            }
+        };
+        let mut stream = stream;
         let mut blocks: Vec<BlockAccum> = Vec::new();
         let mut stop_reason = StopReason::EndTurn;
         let mut usage = Usage::default();
 
         while let Some(event) = stream.next().await {
-            match event? {
+            let event = match event {
+                Ok(e) => e,
+                Err(e) => {
+                    emit(events, AgentEvent::Error { message: e.to_string() });
+                    return Err(e);
+                }
+            };
+            match event {
                 StreamEvent::BlockStart { index, kind } => blocks.push(BlockAccum {
                     index,
                     kind,
@@ -215,11 +245,13 @@ where
                 }),
                 StreamEvent::TextDelta { index, text } => {
                     on_text_delta(&text);
+                    emit(events, AgentEvent::TextDelta { text: text.clone() });
                     if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
                         b.text.push_str(&text);
                     }
                 }
                 StreamEvent::ThinkingDelta { index, text } => {
+                    emit(events, AgentEvent::ThinkingDelta { text: text.clone() });
                     if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
                         b.text.push_str(&text);
                     }
@@ -259,6 +291,13 @@ where
         });
 
         if stop_reason != StopReason::ToolUse {
+            emit(
+                events,
+                AgentEvent::TurnCompleted {
+                    stop_reason: stop_reason.clone(),
+                    usage,
+                },
+            );
             let text = content
                 .into_iter()
                 .filter_map(|b| match b {
@@ -277,11 +316,26 @@ where
         let mut results = Vec::new();
         for block in &content {
             if let ContentBlock::ToolUse { id, name, input } = block {
+                emit(
+                    events,
+                    AgentEvent::ToolCallProposed {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    },
+                );
                 let output = match tools.get(name) {
                     Some(tool) => {
                         let risk = tool.risk(input);
-                        let decision = arbiter.decide(name, risk, &arg_repr(input));
+                        let decision = gate.resolve(name, risk, &arg_repr(input), input).await;
                         if decision.is_allow() {
+                            emit(
+                                events,
+                                AgentEvent::ToolStarted {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                },
+                            );
                             tool.call(input.clone(), ctx).await.unwrap_or_else(|e| ToolOutput {
                                 content: e.to_string(),
                                 is_error: true,
@@ -300,6 +354,13 @@ where
                         is_error: true,
                     },
                 };
+                emit(
+                    events,
+                    AgentEvent::ToolFinished {
+                        id: id.clone(),
+                        output: output.clone(),
+                    },
+                );
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content: output.content,
@@ -442,6 +503,7 @@ mod tests {
                 max_tokens: 100,
                 max_turns: 5,
             },
+            None,
             |_| {},
         )
         .await
@@ -486,6 +548,7 @@ mod tests {
                 max_tokens: 100,
                 max_turns: 5,
             },
+            None,
             |_| {},
         )
         .await
@@ -534,6 +597,7 @@ mod tests {
                 max_tokens: 100,
                 max_turns: 5,
             },
+            None,
             |_| {},
         )
         .await

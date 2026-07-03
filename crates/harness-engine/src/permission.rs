@@ -4,10 +4,16 @@
 //! 実行前に必ずここへ問い合わせる。M4時点はTUI（M7）が無いため対話経路
 //! （未マッチをモーダル表示→oneshotで応答）は実装しておらず、`decide`は常に
 //! 設計書「ヘッドレス時: モード+allowlistのみで判定、プロンプトになるものは既定で自動拒否」
-//! と同じ規則で決定的に`Allow`/`Deny`を返す。`AllowAndRemember`/`DenyAndRemember`は
-//! 対話UIがユーザ選択をallowlistへ追記する経路（M7以降）のためのバリアントで、
-//! 本フェーズの`decide`からは返らない。
+//! と同じ規則で決定的に`Allow`/`Deny`を返す。
+//!
+//! M7で`PermissionGate` traitを追加した。`decide`が畳み込んでいた「モード+allowlistで
+//! 自動判定できないケース（プロンプトすべきケース）」を`Classification::Prompt`として
+//! 区別できるようにし（`classify`）、`PermissionGate`実装ごとにその扱いを変えられるようにした:
+//! `PermissionArbiter`自身の実装（ヘッドレス）はPromptを自動`Deny`に畳み込み既存の`decide`と
+//! バイト等価に振る舞う。`harness-tui`の対話ゲートはPromptで`AgentEvent::PermissionRequired`を
+//! 発行しoneshot応答を待つ（§リッチTUI「承認ダイアログ」）。
 
+use async_trait::async_trait;
 use harness_core::RiskClass;
 
 /// §パーミッション（承認）システム「モード」。
@@ -83,6 +89,16 @@ pub fn parse_allowlist_rule(rule: &str) -> Option<AllowlistRule> {
     Some(AllowlistRule::new(tool, pattern))
 }
 
+/// `classify`の判定内訳。ヘッドレス既定の自動拒否（例: `Plan`/`Deny`モード）と、
+/// 「対話ならユーザに尋ねるべきケース」（M4までは両方とも`Decision::Deny`に潰していた）を
+/// 区別するために持つ（M7、§パーミッション「ヘッドレス時」対「対話時」の分岐）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Classification {
+    Allow,
+    Deny,
+    Prompt,
+}
+
 /// 全ツール呼び出しの実行前に必ず参照する唯一の強制点（§パーミッション）。
 pub struct PermissionArbiter {
     mode: PermissionMode,
@@ -97,30 +113,75 @@ impl PermissionArbiter {
     /// `arg_repr`は許可判定に使う具体入力の文字列表現（`run_shell`ならコマンド行、
     /// `read_file`/`write_file`ならパス、他は入力全体のcompact JSON。§パーミッション
     /// 「allowlist: (tool, RiskClass, input)に対する順序付きルール」）。
-    pub fn decide(&self, tool: &str, risk: RiskClass, arg_repr: &str) -> Decision {
+    pub fn classify(&self, tool: &str, risk: RiskClass, arg_repr: &str) -> Classification {
         if self.mode == PermissionMode::Deny {
-            return Decision::Deny;
+            return Classification::Deny;
         }
         if risk == RiskClass::ReadOnly {
-            return Decision::Allow;
+            return Classification::Allow;
         }
         // Plan（ドライラン）はallowlistより優先して非read-onlyを常に拒否する
         // （「未信頼入力はread-onlyのwould-doを返しmutationゼロ」§多層防御 層9）。
         if self.mode == PermissionMode::Plan {
-            return Decision::Deny;
+            return Classification::Deny;
         }
         if self.mode == PermissionMode::AcceptAll {
-            return Decision::Allow;
+            return Classification::Allow;
         }
         if self.allowlist.iter().any(|r| r.matches(tool, arg_repr)) {
-            return Decision::Allow;
+            return Classification::Allow;
         }
         if self.mode == PermissionMode::AcceptEdits && risk == RiskClass::Write {
-            return Decision::Allow;
+            return Classification::Allow;
         }
-        // 対話時ならここでTUIモーダル→oneshot応答を待つ（M7）。M4時点はTTY無し前提の
-        // ヘッドレス既定と同じ規則で自動拒否する（§パーミッション「ヘッドレス時」）。
-        Decision::Deny
+        // ヘッドレスは既定でここを自動拒否に畳み込む（`decide`）。対話ゲートは
+        // ここでTUIモーダル→oneshot応答を待つ（`harness-tui`側の`PermissionGate`実装）。
+        Classification::Prompt
+    }
+
+    /// ヘッドレス（TTY無し前提）向けの決定的判定。`Classification::Prompt`を自動`Deny`に
+    /// 畳み込む（§パーミッション「ヘッドレス時: モード+allowlistのみで判定」）。
+    pub fn decide(&self, tool: &str, risk: RiskClass, arg_repr: &str) -> Decision {
+        match self.classify(tool, risk, arg_repr) {
+            Classification::Allow => Decision::Allow,
+            Classification::Deny | Classification::Prompt => Decision::Deny,
+        }
+    }
+
+    /// 対話ゲートの`AllowAndRemember`応答をallowlistへ追記する（以降の同一`arg_repr`を
+    /// 自動許可にする）。§パーミッション「allowlistへの追記」。
+    pub fn remember_allow(&mut self, tool: impl Into<String>, arg_repr: impl Into<String>) {
+        self.allowlist.push(AllowlistRule::new(tool, arg_repr));
+    }
+}
+
+/// ツール実行前ゲートの抽象。`run_agent_loop`はこのtrait経由でのみ許可判定を行うため、
+/// ヘッドレス（`PermissionArbiter`自身、常に決定的）と対話TUI（`harness-tui`の
+/// interactiveゲート、`Classification::Prompt`でモーダル表示→oneshot応答待ち）を
+/// 差し替えられる（§エージェントループ「唯一の強制点」、M7）。
+#[async_trait]
+pub trait PermissionGate: Send + Sync {
+    async fn resolve(
+        &self,
+        tool: &str,
+        risk: RiskClass,
+        arg_repr: &str,
+        input: &serde_json::Value,
+    ) -> Decision;
+}
+
+/// ヘッドレス実装。`Classification::Prompt`を自動`Deny`に畳み込む`decide`をそのまま使う
+/// ため、M4までの挙動とバイト等価。
+#[async_trait]
+impl PermissionGate for PermissionArbiter {
+    async fn resolve(
+        &self,
+        tool: &str,
+        risk: RiskClass,
+        arg_repr: &str,
+        _input: &serde_json::Value,
+    ) -> Decision {
+        self.decide(tool, risk, arg_repr)
     }
 }
 
