@@ -10,18 +10,21 @@
 //! `OpenAiProvider::lmstudio()`、`base_url=http://localhost:1234/v1`のopenai-familyプロファイル）。
 //! M7で`-p/--print`を省略可にし、省略時は`harness-tui`の対話ループへ切り替える
 //! （§実装マイルストーン M7「対話でストリーミング描画 + 承認ダイアログ操作」）。
-//! `--allow`/`--dangerously-allow`のフラグ体系全体（危険パターンの明示要求等）はM8のスコープの
-//! ため、本フェーズは`--allow <tool>:<pattern>`の素朴な繰り返し指定のみをサポートする。
+//! M8で`--output-format text|json|jsonl`（安定json/jsonl出力、実体は`harness_cli::run_headless`）と
+//! `--dangerously-allow`（`--permission-mode accept-all`の明示必須化・ワイルドカード
+//! `--allow`ルールの明示必須化、§非対話モード「危険/ワイルドカードは`--dangerously-allow`」）を
+//! 追加した。オーバーレイFS（M10）が未実装のため`--staged`は未導入のまま
+//! （既存の「write系はallowlist未登録なら自動拒否」で§実装マイルストーン M8の要求を満たす）。
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
+use harness_cli::{run_headless, OutputFormat};
 use harness_core::{LlmProvider, ToolCtx};
 use harness_engine::{
-    parse_allowlist_rule, run_agent_loop, AgentLoopConfig, ConversationState, PermissionArbiter,
-    PermissionMode,
+    parse_allowlist_rule, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode,
 };
 use harness_providers::{AnthropicProvider, OpenAiProvider};
 use harness_tools::ToolRegistry;
@@ -90,8 +93,20 @@ struct Cli {
     permission_mode: PermissionModeArg,
 
     /// allowlistルール（`tool:pattern`形式、繰り返し指定可）。例: `run_shell:git status*`
+    /// パターンが完全ワイルドカード（`*`単体）の場合は`--dangerously-allow`が無いと無視される
+    /// （§非対話モード「危険/ワイルドカードは`--dangerously-allow`」）。
     #[arg(long = "allow")]
     allow: Vec<String>,
+
+    /// `--permission-mode accept-all`の使用、および`--allow`の完全ワイルドカード
+    /// （`tool:*`）パターンを許可する明示フラグ。無いとどちらも起動時に拒否/無視される
+    /// （§非対話モード「危険/ワイルドカードは`--dangerously-allow`」）。
+    #[arg(long = "dangerously-allow", default_value_t = false)]
+    dangerously_allow: bool,
+
+    /// 非対話モードの出力形式（§非対話モード「出力」）。`-p`省略時（対話TUI）は無視される。
+    #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
+    output_format: OutputFormat,
 
     /// プロバイダのbase_urlを明示指定する（`--provider`に応じて`ANTHROPIC_BASE_URL`/
     /// `OPENAI_BASE_URL`環境変数より優先される。§設定とシークレット「CLIフラグ（最優先）」）。
@@ -179,15 +194,28 @@ async fn main() -> ExitCode {
         workspace_root: workspace_root.clone(),
     };
 
+    // §非対話モード「危険/ワイルドカードは`--dangerously-allow`」: accept-allモードは
+    // fail-fastで拒否する（`--dangerously-allow`が無いままの誤起動を防ぐ）。
+    if matches!(cli.permission_mode, PermissionModeArg::AcceptAll) && !cli.dangerously_allow {
+        eprintln!(
+            "--permission-mode accept-all requires --dangerously-allow (see plans/DESIGN.md §非対話モード)"
+        );
+        return ExitCode::FAILURE;
+    }
+
     let allowlist: Vec<_> = cli
         .allow
         .iter()
-        .filter_map(|rule| {
-            let parsed = parse_allowlist_rule(rule);
-            if parsed.is_none() {
+        .filter_map(|rule| match parse_allowlist_rule(rule) {
+            None => {
                 eprintln!("ignoring malformed --allow rule (expected tool:pattern): {rule}");
+                None
             }
-            parsed
+            Some(r) if harness_cli::is_dangerous_wildcard(&r.pattern) && !cli.dangerously_allow => {
+                eprintln!("ignoring wildcard --allow rule without --dangerously-allow: {rule}");
+                None
+            }
+            Some(r) => Some(r),
         })
         .collect();
     let arbiter = PermissionArbiter::new(cli.permission_mode.into(), allowlist);
@@ -209,7 +237,7 @@ async fn main() -> ExitCode {
             state.push_user_text(prompt);
 
             let mut stdout = std::io::stdout();
-            let result = run_agent_loop(
+            run_headless(
                 provider.as_ref(),
                 &mut state,
                 &tools,
@@ -220,24 +248,10 @@ async fn main() -> ExitCode {
                     max_tokens: DEFAULT_MAX_TOKENS,
                     max_turns: DEFAULT_MAX_TURNS,
                 },
-                None,
-                |delta| {
-                    let _ = stdout.write_all(delta.as_bytes());
-                    let _ = stdout.flush();
-                },
+                cli.output_format,
+                &mut stdout,
             )
-            .await;
-
-            match result {
-                Ok(_) => {
-                    println!();
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("provider error: {e}");
-                    ExitCode::FAILURE
-                }
-            }
+            .await
         }
         None => {
             let log_dir = workspace_root.join(".harness").join("logs");

@@ -955,6 +955,9 @@ dependencies = [
  "harness-providers",
  "harness-tools",
  "harness-tui",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
