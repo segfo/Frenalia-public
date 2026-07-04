@@ -2,16 +2,38 @@
 //! （§リッチTUI「端末復帰」）。
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
+
+/// レガシー端末プロトコルでは素のEnterとShift+Enterがどちらも修飾キー無しの
+/// Enterとして届き区別できない。Kitty Keyboard Protocol対応端末（kitty/WezTerm/
+/// 新しめのWindows Terminal等）でのみ拡張フラグを有効化し、Shift+Enterを
+/// 区別可能にする。非対応端末では`app.rs`側が従来通りShift無しEnterとして扱う。
+static KEYBOARD_ENHANCEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub struct TerminalGuard;
 
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        // マウスホイールでのtranscriptスクロール用（`AppState::on_mouse`参照）。
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        if supports_keyboard_enhancement().unwrap_or(false) {
+            execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            KEYBOARD_ENHANCEMENT_ENABLED.store(true, Ordering::SeqCst);
+        }
         install_panic_hook();
         Ok(Self)
     }
@@ -24,8 +46,11 @@ impl Drop for TerminalGuard {
 }
 
 fn restore() {
+    if KEYBOARD_ENHANCEMENT_ENABLED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
 /// panicで`TerminalGuard::drop`が走らない経路（unwind前にprintされる等）に備え、

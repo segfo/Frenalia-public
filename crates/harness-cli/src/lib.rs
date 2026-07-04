@@ -62,7 +62,7 @@ fn record_event(
     tool_calls: &mut Vec<JsonToolCall>,
 ) {
     match ev {
-        AgentEvent::TurnStarted => *turns += 1,
+        AgentEvent::TurnStarted { .. } => *turns += 1,
         AgentEvent::TurnCompleted { usage: u, .. } => *usage = *u,
         AgentEvent::ToolCallProposed { id, name, input } => {
             pending.insert(id.clone(), (name.clone(), input.clone()));
@@ -125,7 +125,7 @@ pub async fn run_headless<W: Write>(
 ) -> ExitCode {
     match output_format {
         OutputFormat::Text => {
-            let result = run_agent_loop(provider, state, tools, ctx, gate, config, None, |delta| {
+            let result = run_agent_loop(provider, state, tools, ctx, gate, config, None, None, |delta| {
                 let _ = writer.write_all(delta.as_bytes());
                 let _ = writer.flush();
             })
@@ -142,7 +142,8 @@ pub async fn run_headless<W: Write>(
         }
         OutputFormat::Json | OutputFormat::Jsonl => {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let loop_fut = run_agent_loop(provider, state, tools, ctx, gate, config, Some(&tx), |_delta| {});
+            let loop_fut =
+                run_agent_loop(provider, state, tools, ctx, gate, config, Some(&tx), None, |_delta| {});
             tokio::pin!(loop_fut);
 
             let mut turns = 0usize;

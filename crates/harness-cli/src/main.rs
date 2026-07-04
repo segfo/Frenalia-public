@@ -113,6 +113,42 @@ struct Cli {
     /// 例: `--base-url http://localhost:1234/v1`
     #[arg(long = "base-url")]
     base_url: Option<String>,
+
+    /// 暴走ループの保険（1ターン=1プロバイダターン+ツール実行、§実装マイルストーン M9で
+    /// 正式な設定項目化）。省略時は`settings.json`階層→既定値の順にフォールバックする。
+    #[arg(long = "max-turns")]
+    max_turns: Option<usize>,
+
+    /// ワークスペースルートを明示指定する（省略時はカレントディレクトリ、§非対話モード）。
+    #[arg(long = "cwd")]
+    cwd: Option<std::path::PathBuf>,
+
+    /// `.harness/sessions/session-<id>.jsonl`を復元して会話を継続する（M9、JSONL追記型
+    /// セッション永続化）。`<id>`は`--continue`無しで起動した際にセッションファイル名から
+    /// 拾える（`session-{id}.jsonl`）。値を省略した場合（`--resume`のみ）、対話TUI起動時に
+    /// セッション選択ピッカーを開く。ヘッドレス（`-p`指定時）で値省略は非対話原則によりエラー。
+    #[arg(long = "resume", num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+
+    /// `.harness/sessions/`内の最も新しいセッションを復元して継続する。`--resume`と併用不可。
+    #[arg(long = "continue", conflicts_with = "resume")]
+    continue_session: bool,
+
+    /// `--resume <id>`/`--continue`が指し示す既存セッションをForkして開始する（Claude Codeの
+    /// `--fork-session`相当）。元のセッションファイルは変更せず、新規セッションへ全履歴を
+    /// コピーしてから継続する。`--resume`/`--continue`のいずれかと併用必須。
+    #[arg(long = "fork-session", default_value_t = false)]
+    fork_session: bool,
+
+    /// `.harness/sessions/`配下の保存済みセッションを一覧表示して終了する。プロンプトは送らない。
+    #[arg(long = "list-sessions", default_value_t = false)]
+    list_sessions: bool,
+
+    /// TUI入力欄でEnterを送信キーにする（既定はShift+Enterが送信、素のEnterは改行を挿入）。
+    /// 省略時は`settings.json`階層→既定値(false)の順にフォールバックする
+    /// （`-p/--print`省略時＝対話TUI起動時のみ意味を持つ）。
+    #[arg(long = "enter-submits")]
+    enter_submits: Option<bool>,
 }
 
 fn build_provider(kind: ProviderKind, base_url_override: Option<String>) -> Result<Box<dyn LlmProvider>, String> {
@@ -148,6 +184,84 @@ fn build_provider(kind: ProviderKind, base_url_override: Option<String>) -> Resu
     }
 }
 
+/// `--resume <id>`/`--continue`/新規のいずれかで`SessionStore`を用意する
+/// （M9、§非対話モード「JSONL 追記型セッション永続化」）。`resume`は値省略（空文字列、
+/// ピッカー要求）を渡さない前提（呼び出し側で分岐済み）。
+fn resolve_session(
+    sessions_dir: &std::path::Path,
+    resume: Option<&str>,
+    continue_session: bool,
+) -> Result<harness_engine::SessionStore, String> {
+    if let Some(id) = resume {
+        let path = harness_engine::SessionStore::resolve_path(sessions_dir, id);
+        if !path.exists() {
+            return Err(format!("no session found for --resume {id} ({})", path.display()));
+        }
+        return Ok(harness_engine::SessionStore::open(path));
+    }
+    if continue_session {
+        return harness_engine::SessionStore::resume_latest(sessions_dir)
+            .map_err(|e| format!("failed to find latest session: {e}"))?
+            .ok_or_else(|| "no existing session to --continue".to_string());
+    }
+    harness_engine::SessionStore::create_new(sessions_dir)
+        .map_err(|e| format!("failed to create session file: {e}"))
+}
+
+/// `--list-sessions`の出力レコード（`SessionSummary`はシリアライズ非対応のため、
+/// `--output-format json/jsonl`用にここでJSON化可能な形へ写す）。
+#[derive(serde::Serialize)]
+struct SessionListEntry {
+    id: String,
+    modified_unix_millis: u128,
+    message_count: usize,
+    first_prompt: String,
+}
+
+impl From<&harness_engine::SessionSummary> for SessionListEntry {
+    fn from(s: &harness_engine::SessionSummary) -> Self {
+        Self {
+            id: s.id.clone(),
+            modified_unix_millis: s
+                .modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            message_count: s.message_count,
+            first_prompt: s.first_prompt.clone(),
+        }
+    }
+}
+
+fn print_session_list(summaries: &[harness_engine::SessionSummary], format: OutputFormat) {
+    let entries: Vec<SessionListEntry> = summaries.iter().map(SessionListEntry::from).collect();
+    match format {
+        OutputFormat::Json => {
+            if let Ok(s) = serde_json::to_string(&entries) {
+                println!("{s}");
+            }
+        }
+        OutputFormat::Jsonl => {
+            for entry in &entries {
+                if let Ok(s) = serde_json::to_string(entry) {
+                    println!("{s}");
+                }
+            }
+        }
+        OutputFormat::Text => {
+            if entries.is_empty() {
+                println!("(no saved sessions)");
+            }
+            for entry in &entries {
+                println!(
+                    "{:<16} {:>4} msgs  {}",
+                    entry.id, entry.message_count, entry.first_prompt
+                );
+            }
+        }
+    }
+}
+
 fn resolve_model(model: Option<String>, kind: ProviderKind) -> Result<String, String> {
     match (model, kind) {
         (Some(m), _) => Ok(m),
@@ -167,6 +281,58 @@ async fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
+    let workspace_root = match cli.cwd.clone() {
+        Some(dir) => dir,
+        None => match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("failed to resolve current directory: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    // `--list-sessions`はプロバイダ資格情報を一切必要としないため、他のあらゆる検証より前に
+    // 処理して即終了する（§非対話モード、プロンプトは一切送らない）。
+    if cli.list_sessions {
+        let sessions_dir = workspace_root.join(".harness").join("sessions");
+        return match harness_engine::SessionStore::list(&sessions_dir) {
+            Ok(summaries) => {
+                print_session_list(&summaries, cli.output_format);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("failed to list sessions in {}: {e}", sessions_dir.display());
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // 引数なし`--resume`（値省略、空文字列扱い）はヘッドレスでは非対話原則により拒否する。
+    // ピッカーはTTYが要る対話TUIでのみ意味を持つ（§非対話モード「ヘッドレスモードは対話
+    // プロンプトを一切出さない」）。
+    let resume_wants_picker = cli.resume.as_deref() == Some("");
+    if resume_wants_picker && cli.print.is_some() {
+        eprintln!("--resume without a value opens an interactive picker and is not supported with -p/--print; pass --resume <id> explicitly");
+        return ExitCode::FAILURE;
+    }
+    let resume_id = cli.resume.clone().filter(|s| !s.is_empty());
+
+    if cli.fork_session && resume_id.is_none() && !cli.continue_session {
+        eprintln!("--fork-session requires --resume <id> or --continue");
+        return ExitCode::FAILURE;
+    }
+    if cli.fork_session && resume_wants_picker {
+        eprintln!("--fork-session cannot be combined with a bare --resume (use the picker's 'f' key instead)");
+        return ExitCode::FAILURE;
+    }
+
+    // §設定とシークレット「既定 → ユーザ → プロジェクト → CLIフラグ（最優先）」。CLIフラグが
+    // 明示されていればそちらを使い、無ければ`settings.json`階層へフォールバックする
+    // （`permission_mode`/`output_format`はclapの`default_value_t`で常に値を持つため
+    // このフォールバックの対象外、CLI値をそのまま使う）。
+    let settings = harness_config::Settings::load(&workspace_root);
+
     let provider = match build_provider(cli.provider, cli.base_url) {
         Ok(p) => p,
         Err(e) => {
@@ -174,21 +340,16 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let model = match resolve_model(cli.model, cli.provider) {
+    let model = match resolve_model(cli.model.or(settings.model.clone()), cli.provider) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
+    let max_turns = cli.max_turns.or(settings.max_turns).unwrap_or(DEFAULT_MAX_TURNS);
+    let enter_submits = cli.enter_submits.or(settings.enter_submits).unwrap_or(false);
 
-    let workspace_root = match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("failed to resolve current directory: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     let tools = ToolRegistry::with_builtin_tools();
     let tool_ctx = ToolCtx {
         workspace_root: workspace_root.clone(),
@@ -203,9 +364,12 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let allowlist: Vec<_> = cli
+    let allowlist: Vec<_> = settings
         .allow
+        .clone()
+        .unwrap_or_default()
         .iter()
+        .chain(cli.allow.iter())
         .filter_map(|rule| match parse_allowlist_rule(rule) {
             None => {
                 eprintln!("ignoring malformed --allow rule (expected tool:pattern): {rule}");
@@ -220,6 +384,46 @@ async fn main() -> ExitCode {
         .collect();
     let arbiter = PermissionArbiter::new(cli.permission_mode.into(), allowlist);
 
+    // JSONL追記型セッション永続化（M9、§非対話モード「JSONL 追記型セッション永続化
+    // （`--resume`/`--continue`）」）。`.harness/sessions/`直下に1ファイル1セッション。
+    let sessions_dir = workspace_root.join(".harness").join("sessions");
+    if let Err(e) = std::fs::create_dir_all(&sessions_dir) {
+        eprintln!("failed to create sessions directory {}: {e}", sessions_dir.display());
+        return ExitCode::FAILURE;
+    }
+    let mut session = match resolve_session(&sessions_dir, resume_id.as_deref(), cli.continue_session) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // `--fork-session`: 解決済みの元セッションを不変のまま、全履歴を新規セッションへコピーして
+    // 以降の追記先を切り替える（Claude Codeの`--fork-session`/`/branch`相当）。
+    if cli.fork_session {
+        let source_id = session.id();
+        match harness_engine::SessionStore::fork_from(&sessions_dir, session.path()) {
+            Ok(forked) => {
+                eprintln!("forked session {source_id} -> {}", forked.id());
+                session = forked;
+            }
+            Err(e) => {
+                eprintln!("failed to fork session {source_id}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let mut state = ConversationState::new();
+    match session.load_messages() {
+        Ok(msgs) => state.messages = msgs,
+        Err(e) => {
+            eprintln!("failed to load session {}: {e}", session.path().display());
+            return ExitCode::FAILURE;
+        }
+    }
+
     match cli.print {
         Some(print) => {
             let prompt = if print == "-" {
@@ -233,11 +437,15 @@ async fn main() -> ExitCode {
                 print
             };
 
-            let mut state = ConversationState::new();
             state.push_user_text(prompt);
+            if let Err(e) = session.append_messages(&state.messages[state.messages.len() - 1..]) {
+                eprintln!("failed to persist session {}: {e}", session.path().display());
+                return ExitCode::FAILURE;
+            }
+            let before_run = state.messages.len();
 
             let mut stdout = std::io::stdout();
-            run_headless(
+            let exit = run_headless(
                 provider.as_ref(),
                 &mut state,
                 &tools,
@@ -246,12 +454,14 @@ async fn main() -> ExitCode {
                 AgentLoopConfig {
                     model,
                     max_tokens: DEFAULT_MAX_TOKENS,
-                    max_turns: DEFAULT_MAX_TURNS,
+                    max_turns,
                 },
                 cli.output_format,
                 &mut stdout,
             )
-            .await
+            .await;
+            let _ = session.append_messages(&state.messages[before_run..]);
+            exit
         }
         None => {
             let log_dir = workspace_root.join(".harness").join("logs");
@@ -270,8 +480,13 @@ async fn main() -> ExitCode {
                 arbiter,
                 model,
                 DEFAULT_MAX_TOKENS,
-                DEFAULT_MAX_TURNS,
+                max_turns,
                 cli.provider.label().to_string(),
+                state,
+                session,
+                sessions_dir,
+                enter_submits,
+                resume_wants_picker,
             )
             .await;
 

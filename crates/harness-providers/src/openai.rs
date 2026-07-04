@@ -356,6 +356,14 @@ struct WireChunkChoice {
 struct WireChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// reasoning（thinking）内容。OpenAI本家の`content`とは別フィールドで送られる
+    /// （DeepSeek API由来で広く模倣されている`reasoning_content`。LM Studio等の実装違いで
+    /// `reasoning`という別名で送られることもあるため`alias`で同じフィールドへ吸収する）。
+    /// 未宣言のままだと`deny_unknown_fields`が無いserdeはこのキーを黙って無視するため、
+    /// reasoning対応モデルの thinking トークンが一切`StreamEvent`化されずTUIのライブ
+    /// トークン表示（`AgentEvent::ThinkingDelta`）に反映されないバグになっていた。
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<WireToolCallDelta>>,
 }
@@ -395,15 +403,21 @@ struct WireUsage {
 /// 録画済み/合成JSONチャンクだけで単体テストできるようにするため（下記tests参照）。
 struct StreamAccumState {
     text_open: bool,
+    thinking_open: bool,
     tool_open: Vec<usize>,
     stop_reason: StopReason,
     usage: Usage,
 }
 
+/// reasoning（thinking）ブロック用の予約index。テキスト=0固定・tool_call=`OpenAI側index+1`
+/// という既存の割当規約と衝突しない値として、tool_callが現実的に到達し得ない大きな値を使う。
+const THINKING_INDEX: usize = usize::MAX;
+
 impl StreamAccumState {
     fn new() -> Self {
         Self {
             text_open: false,
+            thinking_open: false,
             tool_open: Vec::new(),
             stop_reason: StopReason::EndTurn,
             usage: Usage::default(),
@@ -419,6 +433,19 @@ impl StreamAccumState {
         }
 
         if let Some(choice) = chunk.choices.into_iter().next() {
+            if let Some(text) = choice.delta.reasoning_content {
+                if !text.is_empty() {
+                    if !self.thinking_open {
+                        out.push(StreamEvent::BlockStart {
+                            index: THINKING_INDEX,
+                            kind: BlockKind::Thinking,
+                        });
+                        self.thinking_open = true;
+                    }
+                    out.push(StreamEvent::ThinkingDelta { index: THINKING_INDEX, text });
+                }
+            }
+
             if let Some(text) = choice.delta.content {
                 if !text.is_empty() {
                     if !self.text_open {
@@ -469,6 +496,9 @@ impl StreamAccumState {
 
     fn finish(self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
+        if self.thinking_open {
+            out.push(StreamEvent::BlockStop { index: THINKING_INDEX });
+        }
         if self.text_open {
             out.push(StreamEvent::BlockStop { index: 0 });
         }
@@ -695,6 +725,85 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// `reasoning_content`（DeepSeek API由来で広く模倣されているreasoning用フィールド）が
+    /// `BlockStart{Thinking}`→`ThinkingDelta`→（本文へ切り替わったら）`BlockStop`という
+    /// 正しい順序で`StreamEvent`化されることを確認する（LMStudio等reasoning対応モデルの
+    /// thinkingトークンがTUIのライブ表示に反映されないバグの回帰防止）。
+    #[test]
+    fn reasoning_content_becomes_thinking_delta_events() {
+        let mut st = StreamAccumState::new();
+        let mut events = Vec::new();
+
+        let chunk1: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"Let me "},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk1));
+
+        let chunk2: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"think..."},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk2));
+
+        let chunk3: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk3));
+        events.extend(st.finish());
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::BlockStart { index: THINKING_INDEX, kind: BlockKind::Thinking },
+                StreamEvent::ThinkingDelta { index: THINKING_INDEX, text: "Let me ".to_string() },
+                StreamEvent::ThinkingDelta { index: THINKING_INDEX, text: "think...".to_string() },
+                StreamEvent::BlockStart { index: 0, kind: BlockKind::Text },
+                StreamEvent::TextDelta { index: 0, text: "answer".to_string() },
+                StreamEvent::BlockStop { index: THINKING_INDEX },
+                StreamEvent::BlockStop { index: 0 },
+                StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: Usage::default() },
+            ]
+        );
+    }
+
+    /// LM Studio等で観測される別名`reasoning`フィールドでも同じく`ThinkingDelta`になること。
+    #[test]
+    fn reasoning_alias_field_also_becomes_thinking_delta() {
+        let mut st = StreamAccumState::new();
+        let chunk: WireChunk =
+            parse_wire(r#"{"choices":[{"index":0,"delta":{"reasoning":"hmm"},"finish_reason":null}]}"#)
+                .unwrap();
+        let events = st.handle_chunk(chunk);
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::BlockStart { index: THINKING_INDEX, kind: BlockKind::Thinking },
+                StreamEvent::ThinkingDelta { index: THINKING_INDEX, text: "hmm".to_string() },
+            ]
+        );
+    }
+
+    /// reasoningフィールドを含まない既存の応答は、引き続き`ThinkingDelta`を一切生成しない
+    /// （回帰防止）。
+    #[test]
+    fn no_reasoning_field_produces_no_thinking_delta() {
+        let mut st = StreamAccumState::new();
+        let mut events = Vec::new();
+        let chunk1: WireChunk =
+            parse_wire(r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#)
+                .unwrap();
+        events.extend(st.handle_chunk(chunk1));
+        events.extend(st.finish());
+
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::ThinkingDelta { .. })));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::BlockStart { kind: BlockKind::Thinking, .. })));
     }
 
     /// 1つのToolSpecがOpenAIの外部タグ形式（`{type:function,function:{...}}`）へ正しく展開されること。

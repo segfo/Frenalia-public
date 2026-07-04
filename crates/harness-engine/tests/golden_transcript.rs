@@ -84,6 +84,7 @@ async fn read_file_tool_loop_produces_expected_transcript() {
             max_turns: 5,
         },
         None,
+        None,
         |_| {},
     )
     .await

@@ -193,7 +193,7 @@ async fn jsonl_output_emits_one_agent_event_per_line() {
         .map(|line| serde_json::from_str(line).expect("each jsonl line must be a valid AgentEvent"))
         .collect();
     assert!(!events.is_empty());
-    assert!(matches!(events[0], harness_core::AgentEvent::TurnStarted));
+    assert!(matches!(events[0], harness_core::AgentEvent::TurnStarted { .. }));
     assert!(events
         .iter()
         .any(|e| matches!(e, harness_core::AgentEvent::TurnCompleted { .. })));

@@ -52,7 +52,7 @@ impl Decision {
 /// M4時点は`*`終端の前方一致・完全一致のみをサポートする素朴な実装。
 /// `run_shell`の実コマンド行を安全に分解するトークナイザ・`write_file`の`src/**`のような
 /// globパターンはM5/M9のスコープ（設計書「危険パターン・ヒューリスティック」節）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowlistRule {
     pub tool: String,
     pub pattern: String,
@@ -152,6 +152,39 @@ impl PermissionArbiter {
     /// 自動許可にする）。§パーミッション「allowlistへの追記」。
     pub fn remember_allow(&mut self, tool: impl Into<String>, arg_repr: impl Into<String>) {
         self.allowlist.push(AllowlistRule::new(tool, arg_repr));
+    }
+
+    /// 実行時にモードを切り替える（M9スラッシュコマンド`/mode`）。
+    pub fn set_mode(&mut self, mode: PermissionMode) {
+        self.mode = mode;
+    }
+
+    pub fn mode(&self) -> PermissionMode {
+        self.mode
+    }
+
+    /// allowlistへ任意のルールを追記する（M9スラッシュコマンド`/allow`。`remember_allow`と
+    /// 異なりTUIの承認応答経由でなく、ユーザが明示コマンドで追加する経路）。
+    pub fn add_rule(&mut self, rule: AllowlistRule) {
+        self.allowlist.push(rule);
+    }
+}
+
+/// `/mode`スラッシュコマンド・`settings.json`/CLIの`--permission-mode`と共通の文字列表現。
+impl std::str::FromStr for PermissionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "plan" => Ok(PermissionMode::Plan),
+            "default" => Ok(PermissionMode::Default),
+            "accept-edits" => Ok(PermissionMode::AcceptEdits),
+            "accept-all" => Ok(PermissionMode::AcceptAll),
+            "deny" => Ok(PermissionMode::Deny),
+            other => Err(format!(
+                "unknown permission mode: {other} (expected plan|default|accept-edits|accept-all|deny)"
+            )),
+        }
     }
 }
 

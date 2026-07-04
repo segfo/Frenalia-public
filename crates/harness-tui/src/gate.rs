@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 use harness_core::{AgentEvent, RiskClass};
-use harness_engine::{Classification, Decision, PermissionArbiter, PermissionGate};
+use harness_engine::{AllowlistRule, Classification, Decision, PermissionArbiter, PermissionGate, PermissionMode};
 
 pub struct InteractiveGate {
     arbiter: Mutex<PermissionArbiter>,
@@ -38,6 +38,21 @@ impl InteractiveGate {
         if let Some(tx) = self.pending.lock().unwrap().remove(id) {
             let _ = tx.send(decision);
         }
+    }
+
+    /// `/mode`スラッシュコマンド（M9）。engineタスクを介さず直接`arbiter`を書き換える
+    /// （`arbiter`は`Mutex`越しに参照されるだけなので、進行中のツール判定と競合しない）。
+    pub fn set_mode(&self, mode: PermissionMode) {
+        self.arbiter.lock().unwrap().set_mode(mode);
+    }
+
+    pub fn mode(&self) -> PermissionMode {
+        self.arbiter.lock().unwrap().mode()
+    }
+
+    /// `/allow`スラッシュコマンド（M9）。
+    pub fn add_allow(&self, rule: AllowlistRule) {
+        self.arbiter.lock().unwrap().add_rule(rule);
     }
 }
 

@@ -13,6 +13,7 @@ harness-tools = { version = "0.1.0", path = "../harness-tools" }
 ratatui = "0.30.2"
 serde_json = "1"
 tokio = { version = "1.52.3", features = ["sync", "time", "rt-multi-thread", "macros"] }
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"

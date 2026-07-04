@@ -6,12 +6,18 @@
 //! 拒否されたツール呼び出しは実行されず、エラーの`ToolResult`を合成して履歴へ積み戻す
 //! （§エージェントループ 手順4「拒否→エラーToolResultを合成」）。
 //! **M4時点のスコープ外**: cap-stdによる読取スコープ反転モード（whitelist/blacklist、M11）・
-//! 対話TUIの承認モーダル（M7、そのため`decide`は常にヘッドレス相当で決定的に判定する）・
-//! キャンセル整合（M9）・コンテキスト圧縮（M9）。
+//! 対話TUIの承認モーダル（M7、そのため`decide`は常にヘッドレス相当で決定的に判定する）。
+//! M9で キャンセル整合・コンテキスト圧縮（`compaction`モジュール）・大出力切詰め・
+//! リトライ/リアクティブ圧縮・JSONLセッション永続化（`session`モジュール）を追加した。
 
+pub mod compaction;
 pub mod permission;
+pub mod session;
+
+use std::time::Duration;
 
 use futures::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 use harness_core::{
     AgentEvent, BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError,
@@ -23,6 +29,7 @@ pub use permission::{
     arg_repr, parse_allowlist_rule, AllowlistRule, Classification, Decision, PermissionArbiter,
     PermissionGate, PermissionMode,
 };
+pub use session::{SessionStore, SessionSummary};
 
 /// TUI等のフロントエンドへ`AgentEvent`を流すための送信口。ヘッドレスCLIは`None`を渡し
 /// 従来通り`on_text_delta`コールバックのみでstdout出力する（§非対話モード、既存挙動を維持）。
@@ -31,6 +38,75 @@ pub type EventSink = tokio::sync::mpsc::UnboundedSender<AgentEvent>;
 fn emit(events: Option<&EventSink>, ev: AgentEvent) {
     if let Some(tx) = events {
         let _ = tx.send(ev);
+    }
+}
+
+/// ツール出力がこれを超える文字数なら頭尾切詰めする（M9、DESIGN.md L349「大出力 head+tail
+/// 切詰め」）。会話履歴に積む前に適用するため、モデルへ送るコンテキスト自体を圧迫しない。
+const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
+
+/// `content`が`max_chars`文字を超える場合、先頭/末尾を残し中間を省略記号に置き換える。
+fn truncate_head_tail(content: &str, max_chars: usize) -> String {
+    let total = content.chars().count();
+    if total <= max_chars {
+        return content.to_string();
+    }
+    let half = max_chars / 2;
+    let head: String = content.chars().take(half).collect();
+    let tail: String = content.chars().skip(total - half).collect();
+    let omitted = total - 2 * half;
+    format!("{head}\n... [{omitted} chars truncated] ...\n{tail}")
+}
+
+/// リクエスト全体（system+messages+tools）をJSONシリアライズした文字数からの粗い近似
+/// （chars/4）。`AgentEvent::TurnStarted.estimated_input_tokens`用（TUIのリアルタイム表示、
+/// §リッチTUI「ライブ表示」）。プロバイダの正確なinputトークン数は`TurnCompleted`の
+/// `usage.input`でしか分からないため、送信直後にひとまず出す概算値に過ぎない。
+fn estimate_tokens(req: &CompletionRequest) -> u64 {
+    serde_json::to_string(req)
+        .map(|s| (s.chars().count() as u64) / 4)
+        .unwrap_or(0)
+}
+
+/// リトライ可能な`ProviderError`（`RateLimited`/`Overloaded`/`Transport{retriable:true}`）かどうか。
+/// `ContextTooLong`はここに含めない（呼び出し側でコンテキスト圧縮を挟んでから明示的に再試行する、
+/// §主なリスクと対策「分類を確定。外周の共通リトライラッパがこれを見てリトライ可否・待機を決める」）。
+fn is_retriable(e: &ProviderError) -> bool {
+    matches!(
+        e,
+        ProviderError::RateLimited { .. }
+            | ProviderError::Overloaded
+            | ProviderError::Transport { retriable: true }
+    )
+}
+
+fn retry_delay(e: &ProviderError, attempt: u32) -> Duration {
+    if let ProviderError::RateLimited { retry_after: Some(d) } = e {
+        return *d;
+    }
+    Duration::from_millis(200 * 2u64.saturating_pow(attempt))
+}
+
+const MAX_RETRIES: u32 = 3;
+
+/// `provider.stream`をリトライ可能なエラーに対して指数バックオフで最大`MAX_RETRIES`回まで
+/// 再試行する。`ContextTooLong`はここでは扱わず、そのまま呼び出し側へ伝播する
+/// （`run_agent_loop`側でコンテキスト圧縮を挟んだ1回限りの再試行を行う）。
+async fn stream_with_retry(
+    provider: &dyn LlmProvider,
+    req: &CompletionRequest,
+) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
+{
+    let mut attempt = 0;
+    loop {
+        match provider.stream(req.clone()).await {
+            Ok(s) => return Ok(s),
+            Err(e) if attempt < MAX_RETRIES && is_retriable(&e) => {
+                tokio::time::sleep(retry_delay(&e, attempt)).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -124,6 +200,10 @@ pub struct AgentLoopOutcome {
     pub text: String,
     pub stop_reason: StopReason,
     pub usage: Usage,
+    /// キャンセルされて終了した場合`true`（M9）。この場合`text`は空、`stop_reason`は
+    /// `StopReason::Other("cancelled")`になる。`state`自体は次の`run_agent_loop`呼び出しが
+    /// 400にならない形（tool_use/tool_resultの対応が崩れていない状態）に保たれている。
+    pub cancelled: bool,
 }
 
 /// ストリーム受信中のブロックを蓄積する作業用構造体。
@@ -190,6 +270,7 @@ pub async fn run_agent_loop<F>(
     gate: &dyn PermissionGate,
     config: AgentLoopConfig,
     events: Option<&EventSink>,
+    cancel: Option<&CancellationToken>,
     mut on_text_delta: F,
 ) -> Result<AgentLoopOutcome, ProviderError>
 where
@@ -197,8 +278,24 @@ where
 {
     let tool_specs = tools.to_specs();
 
+    /// キャンセルによる早期returnの共通形。§エージェントループ「ストリーム途中は部分assistant
+    /// 破棄／ツール実行中は全tool_useへcancelled合成」のいずれの経路も、この形の
+    /// `AgentLoopOutcome`を返す（`state`は呼び出し側で既に整合が取れる形に調整済み）。
+    fn cancelled_outcome() -> AgentLoopOutcome {
+        AgentLoopOutcome {
+            text: String::new(),
+            stop_reason: StopReason::Other("cancelled".to_string()),
+            usage: Usage::default(),
+            cancelled: true,
+        }
+    }
+
     for _ in 0..config.max_turns {
-        emit(events, AgentEvent::TurnStarted);
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            emit(events, AgentEvent::Cancelled);
+            return Ok(cancelled_outcome());
+        }
+
         let req = CompletionRequest {
             system: state.system.clone(),
             messages: state.messages.clone(),
@@ -214,20 +311,63 @@ where
             sampling: Sampling::default(),
             model: config.model.clone(),
         };
+        emit(
+            events,
+            AgentEvent::TurnStarted {
+                estimated_input_tokens: estimate_tokens(&req),
+            },
+        );
 
-        let stream = match provider.stream(req).await {
+        let mut stream = match stream_with_retry(provider, &req).await {
             Ok(s) => s,
+            Err(ProviderError::ContextTooLong) => {
+                let removed =
+                    compaction::compact(provider, state, &config.model, compaction::DEFAULT_KEEP_RECENT_TURNS)
+                        .await?;
+                if removed == 0 {
+                    let e = ProviderError::ContextTooLong;
+                    emit(events, AgentEvent::Error { message: e.to_string() });
+                    return Err(e);
+                }
+                emit(events, AgentEvent::ContextCompacted { removed_messages: removed });
+                let retry_req = CompletionRequest {
+                    messages: state.messages.clone(),
+                    ..req
+                };
+                match stream_with_retry(provider, &retry_req).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        emit(events, AgentEvent::Error { message: e.to_string() });
+                        return Err(e);
+                    }
+                }
+            }
             Err(e) => {
                 emit(events, AgentEvent::Error { message: e.to_string() });
                 return Err(e);
             }
         };
-        let mut stream = stream;
         let mut blocks: Vec<BlockAccum> = Vec::new();
         let mut stop_reason = StopReason::EndTurn;
         let mut usage = Usage::default();
 
-        while let Some(event) = stream.next().await {
+        loop {
+            let next = match cancel {
+                Some(c) => tokio::select! {
+                    _ = c.cancelled() => None,
+                    ev = stream.next() => Some(ev),
+                },
+                None => Some(stream.next().await),
+            };
+            let Some(event) = next else {
+                // ストリーム途中でキャンセルされた: 蓄積中のblocksはstateへ一切pushせず破棄する
+                // （§エージェントループ キャンセル整合「ストリーム途中は部分assistant破棄」）。
+                emit(events, AgentEvent::Cancelled);
+                return Ok(cancelled_outcome());
+            };
+            let Some(event) = event else {
+                break;
+            };
             let event = match event {
                 Ok(e) => e,
                 Err(e) => {
@@ -310,12 +450,28 @@ where
                 text,
                 stop_reason,
                 usage,
+                cancelled: false,
             });
         }
 
         let mut results = Vec::new();
+        let mut cancelled_mid_tool = false;
         for block in &content {
             if let ContentBlock::ToolUse { id, name, input } = block {
+                if !cancelled_mid_tool && cancel.is_some_and(|c| c.is_cancelled()) {
+                    cancelled_mid_tool = true;
+                }
+                if cancelled_mid_tool {
+                    // 残り全てのtool_useへcancelledなtool_resultを合成する
+                    // （§エージェントループ キャンセル整合「ツール実行中は全tool_useへ
+                    // cancelled合成 → 続行で400にならない」、実際にツールは呼ばない）。
+                    results.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: "cancelled by user".to_string(),
+                        is_error: true,
+                    });
+                    continue;
+                }
                 emit(
                     events,
                     AgentEvent::ToolCallProposed {
@@ -354,16 +510,20 @@ where
                         is_error: true,
                     },
                 };
+                let truncated_content = truncate_head_tail(&output.content, MAX_TOOL_OUTPUT_CHARS);
                 emit(
                     events,
                     AgentEvent::ToolFinished {
                         id: id.clone(),
-                        output: output.clone(),
+                        output: ToolOutput {
+                            content: truncated_content.clone(),
+                            is_error: output.is_error,
+                        },
                     },
                 );
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content: output.content,
+                    content: truncated_content,
                     is_error: output.is_error,
                 });
             }
@@ -373,6 +533,11 @@ where
             role: Role::User,
             content: results,
         });
+
+        if cancelled_mid_tool {
+            emit(events, AgentEvent::Cancelled);
+            return Ok(cancelled_outcome());
+        }
     }
 
     Err(ProviderError::InvalidRequest {
@@ -387,6 +552,28 @@ mod tests {
 
     use async_trait::async_trait;
     use futures::stream;
+
+    #[test]
+    fn estimate_tokens_grows_with_request_size() {
+        let small = CompletionRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            output: None,
+            parallel_tool_calls: None,
+            max_tokens: 100,
+            sampling: Sampling::default(),
+            model: "mock".into(),
+        };
+        let mut large = small.clone();
+        large.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text("x".repeat(4000))],
+        });
+
+        assert!(estimate_tokens(&large) > estimate_tokens(&small));
+    }
 
     /// あらかじめ用意したターンごとの`StreamEvent`列を順番に返すテスト用プロバイダ。
     /// §実装マイルストーン M6で導入予定の本物のmockプロバイダ（golden-transcript向け）とは別に、
@@ -504,6 +691,7 @@ mod tests {
                 max_turns: 5,
             },
             None,
+            None,
             |_| {},
         )
         .await
@@ -548,6 +736,7 @@ mod tests {
                 max_tokens: 100,
                 max_turns: 5,
             },
+            None,
             None,
             |_| {},
         )
@@ -598,6 +787,7 @@ mod tests {
                 max_turns: 5,
             },
             None,
+            None,
             |_| {},
         )
         .await
@@ -606,5 +796,198 @@ mod tests {
         let (content, is_error) = find_tool_result(&state);
         assert!(!is_error);
         assert!(content.contains("allowed"));
+    }
+
+    /// ストリーム開始後、応答が完了する前に応答が返らないプロバイダ
+    /// （キャンセルによる中断を`tokio::select!`で確実に踏ませるためのテスト専用実装）。
+    struct HangingProvider;
+
+    #[async_trait]
+    impl LlmProvider for HangingProvider {
+        fn id(&self) -> &str {
+            "hanging"
+        }
+        async fn stream(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
+        {
+            let partial = vec![
+                Ok(StreamEvent::BlockStart { index: 0, kind: BlockKind::Text }),
+                Ok(StreamEvent::TextDelta { index: 0, text: "partial".to_string() }),
+            ];
+            Ok(Box::pin(stream::iter(partial).chain(stream::pending())))
+        }
+    }
+
+    /// §エージェントループ キャンセル整合「ストリーム途中は部分assistant破棄」。
+    /// ストリーム受信中にキャンセルすると、蓄積中だったテキストは`state.messages`へ一切
+    /// pushされず（呼び出し前と後でメッセージ数が変わらない）、`AgentLoopOutcome.cancelled`が
+    /// `true`になることを確認する。
+    #[tokio::test]
+    async fn cancel_mid_stream_discards_partial_assistant() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = HangingProvider;
+        let mut state = ConversationState::new();
+        state.push_user_text("hi");
+        let messages_before = state.messages.len();
+        let tools = harness_tools::ToolRegistry::with_builtin_tools();
+        let ctx = ToolCtx { workspace_root: dir.path().to_path_buf() };
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let cancel = CancellationToken::new();
+
+        let outcome = {
+            let run_fut = run_agent_loop(
+                &provider,
+                &mut state,
+                &tools,
+                &ctx,
+                &arbiter,
+                AgentLoopConfig { model: "mock".into(), max_tokens: 100, max_turns: 5 },
+                None,
+                Some(&cancel),
+                |_| {},
+            );
+            tokio::pin!(run_fut);
+            let cancel_after_delay = async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                cancel.cancel();
+            };
+            let (outcome, ()) = tokio::join!(run_fut, cancel_after_delay);
+            outcome.unwrap()
+        };
+
+        assert!(outcome.cancelled);
+        assert_eq!(state.messages.len(), messages_before);
+    }
+
+    /// キャンセルされるまで`call()`内で意図的にsleepするテスト専用ツール。
+    struct SlowTool;
+
+    #[async_trait]
+    impl harness_core::Tool for SlowTool {
+        fn name(&self) -> &str {
+            "slow_tool"
+        }
+        fn description(&self) -> &str {
+            "test-only slow tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn risk(&self, _input: &serde_json::Value) -> harness_core::RiskClass {
+            harness_core::RiskClass::ReadOnly
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, harness_core::ToolError> {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(ToolOutput { content: "slow-done".to_string(), is_error: false })
+        }
+    }
+
+    fn multi_tool_use_turn(calls: &[(&str, &str, serde_json::Value)]) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        for (index, (id, name, input)) in calls.iter().enumerate() {
+            events.push(StreamEvent::BlockStart {
+                index,
+                kind: BlockKind::ToolUse { id: id.to_string(), name: name.to_string() },
+            });
+            events.push(StreamEvent::ToolInputDelta { index, json_fragment: input.to_string() });
+            events.push(StreamEvent::BlockStop { index });
+        }
+        events.push(StreamEvent::Done { stop_reason: StopReason::ToolUse, usage: Usage::default() });
+        events
+    }
+
+    /// §エージェントループ キャンセル整合「ツール実行中は全tool_useへcancelled合成 →
+    /// 続行で400にならない」の契約テスト。1回目のツール呼び出し中にキャンセルすると、
+    /// (a) 既に実行が始まっていた1件目は正常完了扱いのまま、(b) まだ手を付けていない2件目は
+    /// 実行されず`cancelled by user`なtool_resultが合成され、(c) assistantのtool_use 2件と
+    /// tool_result 2件が過不足なく対応した状態で会話が終わるため、(d) 続けて次のプロンプトを
+    /// 送っても（=もう一度`run_agent_loop`を呼んでも）プロバイダ層のエラーにならないことを
+    /// 確認する。
+    #[tokio::test]
+    async fn cancel_mid_tool_execution_synthesizes_cancelled_results_and_continuation_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            turns: Mutex::new(vec![
+                multi_tool_use_turn(&[
+                    ("call_1", "slow_tool", serde_json::json!({})),
+                    ("call_2", "slow_tool", serde_json::json!({})),
+                ]),
+                end_turn("continued fine"),
+            ]),
+        };
+        let mut state = ConversationState::new();
+        state.push_user_text("run two slow tools");
+        let mut tools = harness_tools::ToolRegistry::new();
+        tools.register(std::sync::Arc::new(SlowTool));
+        let ctx = ToolCtx { workspace_root: dir.path().to_path_buf() };
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let cancel = CancellationToken::new();
+
+        let outcome = {
+            let run_fut = run_agent_loop(
+                &provider,
+                &mut state,
+                &tools,
+                &ctx,
+                &arbiter,
+                AgentLoopConfig { model: "mock".into(), max_tokens: 100, max_turns: 5 },
+                None,
+                Some(&cancel),
+                |_| {},
+            );
+            tokio::pin!(run_fut);
+            // 1件目の`SlowTool::call`（30ms sleep）が始まった後、2件目に手を付ける前にキャンセルする。
+            let cancel_after_delay = async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                cancel.cancel();
+            };
+            let (outcome, ()) = tokio::join!(run_fut, cancel_after_delay);
+            outcome.unwrap()
+        };
+        assert!(outcome.cancelled);
+
+        let tool_results: Vec<(String, String, bool)> = state
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                    Some((tool_use_id.clone(), content.clone(), *is_error))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 2, "both tool_use blocks must have a matching tool_result");
+        let call1 = tool_results.iter().find(|(id, ..)| id == "call_1").unwrap();
+        assert_eq!(call1.1, "slow-done");
+        assert!(!call1.2);
+        let call2 = tool_results.iter().find(|(id, ..)| id == "call_2").unwrap();
+        assert_eq!(call2.1, "cancelled by user");
+        assert!(call2.2);
+
+        // 続行: 新しいCancellationTokenでもう一度呼んでも、tool_use/tool_resultの対応が
+        // 崩れていないため`ProviderError`にならず正常終了する（M9受入条件そのもの）。
+        let outcome2 = run_agent_loop(
+            &provider,
+            &mut state,
+            &tools,
+            &ctx,
+            &arbiter,
+            AgentLoopConfig { model: "mock".into(), max_tokens: 100, max_turns: 5 },
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome2.text, "continued fine");
     }
 }

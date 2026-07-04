@@ -17,8 +17,14 @@ pub struct Message {
 
 /// assistant応答を受信順のブロック列として忠実に再構成するための語彙。
 /// 各アダプタの `stream()` はこの型へ正規化する（`plans/DESIGN.md` §プロバイダ抽象）。
+///
+/// `content`タグは`adjacent`（`content = "data"`）を使う。内部タグ（`tag`のみ）だと
+/// `Text(String)`のような非構造体（マップ表現できない）newtypeバリアントを持つenumを
+/// シリアライズできないserdeの制約があるため（M9でセッション永続化のJSONL化を実装した際に
+/// 判明、`crates/harness-engine/src/session.rs`参照）。この型を直接JSON化する消費者は
+/// セッション永続化のみで既存のワイヤ形式に依存箇所は無いため、この属性変更に破壊的影響はない。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text(String),
     /// 署名を保持し tool_result 返送時に無改変で返す（Anthropic extended thinking）。
