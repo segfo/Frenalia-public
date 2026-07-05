@@ -103,5 +103,8 @@ pub(crate) fn sandbox_error_to_tool_error(path: &str, err: harness_sandbox::Sand
             ToolError::InvalidInput(format!("not found: {path}"))
         }
         harness_sandbox::SandboxError::Io(e) => ToolError::ExecutionFailed(format!("{path}: {e}")),
+        harness_sandbox::SandboxError::ReadScope(e) => {
+            ToolError::InvalidInput(format!("read denied by read scope config: {path} ({e})"))
+        }
     }
 }

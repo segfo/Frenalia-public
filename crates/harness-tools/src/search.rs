@@ -90,9 +90,10 @@ impl Tool for GrepTool {
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
+        let read_scope = ctx.read_scope.clone();
 
         tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
-            let fs = SandboxFs::open(&workspace_root, &staging)
+            let fs = SandboxFs::open_with_read_scope(&workspace_root, &staging, &read_scope)
                 .map_err(|e| sandbox_error_to_tool_error("", e))?;
 
             let matcher = RegexMatcherBuilder::new()
@@ -295,9 +296,10 @@ impl Tool for GlobTool {
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
+        let read_scope = ctx.read_scope.clone();
 
         tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
-            let fs = SandboxFs::open(&workspace_root, &staging)
+            let fs = SandboxFs::open_with_read_scope(&workspace_root, &staging, &read_scope)
                 .map_err(|e| sandbox_error_to_tool_error("", e))?;
 
             let matcher = globset::Glob::new(&input.pattern)

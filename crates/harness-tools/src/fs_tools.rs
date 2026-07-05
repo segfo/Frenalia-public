@@ -60,9 +60,10 @@ impl Tool for ReadFileTool {
         // spawn_blocking へ逃がす（§ツールシステム fsジェイル、cap-stdは非同期非対応）。
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
+        let read_scope = ctx.read_scope.clone();
         let path_for_err = input.path.clone();
         let content = tokio::task::spawn_blocking(move || -> Result<String, ToolError> {
-            let fs = SandboxFs::open(&workspace_root, &staging)
+            let fs = SandboxFs::open_with_read_scope(&workspace_root, &staging, &read_scope)
                 .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
             fs.read_to_string(&path_for_err)
                 .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))
@@ -128,11 +129,12 @@ impl Tool for WriteFileTool {
 
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
+        let read_scope = ctx.read_scope.clone();
         let path_for_err = input.path.clone();
         let path_for_output = input.path.clone();
         let bytes_written = input.content.len();
         tokio::task::spawn_blocking(move || -> Result<(), ToolError> {
-            let fs = SandboxFs::open(&workspace_root, &staging)
+            let fs = SandboxFs::open_with_read_scope(&workspace_root, &staging, &read_scope)
                 .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
             fs.write_string(&path_for_err, &input.content)
                 .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))
@@ -195,9 +197,10 @@ impl Tool for EditFileTool {
 
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
+        let read_scope = ctx.read_scope.clone();
         let path_for_err = input.path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), ToolError> {
-            let fs = SandboxFs::open(&workspace_root, &staging)
+            let fs = SandboxFs::open_with_read_scope(&workspace_root, &staging, &read_scope)
                 .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
             let content = fs
                 .read_to_string(&path_for_err)
@@ -387,6 +390,7 @@ mod tests {
                 explicit: true,
                 sandbox_dir: Some(PathBuf::from(".harness/sandbox/test-session")),
             },
+            read_scope: Default::default(),
         };
 
         let tool = WriteFileTool;

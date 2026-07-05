@@ -22,9 +22,11 @@
 pub mod git;
 pub mod manifest;
 pub mod overlay;
+pub mod read_scope;
 
 pub use manifest::{ManifestOp, ManifestTarget};
 pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};
+pub use read_scope::{ReadScope, ReadScopeError};
 
 use std::path::{Component, Path, PathBuf};
 
@@ -83,8 +85,15 @@ impl WorkspaceJail {
     /// `ignore`/`globset`はgitignore・globのマッチング判定にのみ使う**
     /// （§ツールシステム fsジェイル）。シンボリックリンクは辿らない（jail脱出防止）。
     pub fn walk_files(&self) -> Result<Vec<PathBuf>, JailError> {
+        self.walk_files_filtered(&[])
+    }
+
+    /// `walk_files`の拡張版（M11）。`skip_dirs`に名前が一致するディレクトリは掘り下げない
+    /// （`read.deny_descend`、`plans/DESIGN-SANDBOX.md` §5）。`.git`/`.harness`は常に
+    /// 掘り下げ対象外（既存の不変条件、設定に関わらず適用）。
+    pub fn walk_files_filtered(&self, skip_dirs: &[String]) -> Result<Vec<PathBuf>, JailError> {
         let mut out = Vec::new();
-        Self::walk_dir(&self.dir, PathBuf::new(), &mut out)?;
+        Self::walk_dir(&self.dir, PathBuf::new(), &mut out, skip_dirs)?;
         Ok(out)
     }
 
@@ -141,11 +150,20 @@ impl WorkspaceJail {
         Ok(())
     }
 
-    fn walk_dir(dir: &Dir, prefix: PathBuf, out: &mut Vec<PathBuf>) -> Result<(), JailError> {
+    fn walk_dir(
+        dir: &Dir,
+        prefix: PathBuf,
+        out: &mut Vec<PathBuf>,
+        skip_dirs: &[String],
+    ) -> Result<(), JailError> {
         for entry in dir.entries()? {
             let entry = entry?;
             let name = entry.file_name();
             if name == ".git" || name == ".harness" {
+                continue;
+            }
+            let name_str = name.to_string_lossy();
+            if skip_dirs.iter().any(|d| d == name_str.as_ref()) {
                 continue;
             }
             let rel = prefix.join(&name);
@@ -154,7 +172,7 @@ impl WorkspaceJail {
                 continue;
             } else if file_type.is_dir() {
                 let sub = entry.open_dir()?;
-                Self::walk_dir(&sub, rel, out)?;
+                Self::walk_dir(&sub, rel, out, skip_dirs)?;
             } else if file_type.is_file() {
                 out.push(rel);
             }

@@ -989,6 +989,7 @@ name = "harness-config"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "harness-core",
  "serde",
  "serde_json",
  "tempfile",

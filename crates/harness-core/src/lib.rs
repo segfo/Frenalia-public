@@ -13,6 +13,6 @@ pub use provider::{
     ProviderError, Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
 };
 pub use tool::{
-    RiskClass, StagingConfig, StagingMode, Tool, ToolCtx, ToolError, ToolOutput, ToolResult,
-    ToolSpec, ToolUse,
+    ReadMode, ReadScopeConfig, RiskClass, StagingConfig, StagingMode, Tool, ToolCtx, ToolError,
+    ToolOutput, ToolResult, ToolSpec, ToolUse,
 };

@@ -25,6 +25,50 @@ pub struct Settings {
     /// `true`ならTUI入力欄でEnterが送信（後方互換モード）。既定（`None`/`false`）では
     /// Shift+Enterが送信、素のEnterは改行を挿入する（§リッチTUI「入力ボックス」）。
     pub enter_submits: Option<bool>,
+    /// 読取スコープ設定（M11、`plans/DESIGN-SANDBOX.md` §5）。省略時は
+    /// `ReadSettings::default()`（whitelist・外部ルート無し＝M10までと等価）。
+    pub read: Option<ReadSettings>,
+}
+
+/// `.harness/settings.json`の`read`キー（M11）。`harness_core::ReadScopeConfig`へ変換する前の
+/// 生の設定値（パス文字列のまま、`~`展開等は行わない）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReadSettings {
+    /// `"whitelist"`（既定）/`"blacklist"`。未知の値・省略時はwhitelist扱い。
+    pub mode: Option<String>,
+    pub allow: Option<Vec<String>>,
+    pub allow_descend: Option<Vec<String>>,
+    pub deny: Option<Vec<String>>,
+    pub deny_descend: Option<Vec<String>>,
+}
+
+impl ReadSettings {
+    /// `harness_core::ReadScopeConfig`へ変換する（`allow`/`allow_descend`はパスとして解釈）。
+    pub fn to_read_scope_config(&self) -> harness_core::ReadScopeConfig {
+        let mode = match self.mode.as_deref() {
+            Some("blacklist") => harness_core::ReadMode::Blacklist,
+            _ => harness_core::ReadMode::Whitelist,
+        };
+        harness_core::ReadScopeConfig {
+            mode,
+            allow: self
+                .allow
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            allow_descend: self
+                .allow_descend
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            deny: self.deny.clone().unwrap_or_default(),
+            deny_descend: self.deny_descend.clone().unwrap_or_default(),
+        }
+    }
 }
 
 /// `<project_root>/.harness/settings.json`（呼び出し側は`project_root`に作業ディレクトリを渡す）。
@@ -140,5 +184,31 @@ mod tests {
         let settings = Settings::load(dir.path());
         assert_eq!(settings.model.as_deref(), Some("from-project"));
         assert_eq!(settings.allow, Some(vec!["read_file:*".to_string()]));
+    }
+
+    /// M11: `.harness/settings.json`の`read`キーが`ReadScopeConfig`へ正しく変換される
+    /// （`plans/DESIGN-SANDBOX.md` §5.1の設定キー）。
+    #[test]
+    fn read_settings_parse_and_convert_to_read_scope_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("settings.json"),
+            r#"{"read": {"mode": "blacklist", "deny": [".ssh"], "deny_descend": ["node_modules", ".git"]}}"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(dir.path());
+        let read = settings.read.expect("read settings present");
+        assert_eq!(read.mode.as_deref(), Some("blacklist"));
+
+        let config = read.to_read_scope_config();
+        assert_eq!(config.mode, harness_core::ReadMode::Blacklist);
+        assert_eq!(config.deny, vec![".ssh".to_string()]);
+        assert_eq!(
+            config.deny_descend,
+            vec!["node_modules".to_string(), ".git".to_string()]
+        );
     }
 }

@@ -61,6 +61,34 @@ impl Default for StagingConfig {
     }
 }
 
+/// 読取スコープの反転モード（`plans/DESIGN-SANDBOX.md` §5、M11）。既定は`Whitelist`
+/// （安全既定＝列挙した外部ルートのみ読取可）。`Blacklist`は列挙した禁止パスのみを拒否し、
+/// それ以外の外部絶対パスは読取可とする（オプトインの緩和モード）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadMode {
+    #[default]
+    Whitelist,
+    Blacklist,
+}
+
+/// 読取スコープ設定（M11）。`harness-sandbox::read_scope::ReadScope`が判定の実体を持つ
+/// （`harness-core`は値を運ぶだけ、`StagingConfig`と同じ役割分担）。
+#[derive(Debug, Clone, Default)]
+pub struct ReadScopeConfig {
+    pub mode: ReadMode,
+    /// 読取を許可する外部ルート（workspaceは暗黙に含むためここには含めない）。
+    /// 既定で直下のみ読取可（掘り下げ不可）。
+    pub allow: Vec<std::path::PathBuf>,
+    /// 再帰読取を許可する外部ルート。
+    pub allow_descend: Vec<std::path::PathBuf>,
+    /// 読取禁止（blacklistモードで使用）。絶対パス、またはworkspace内の任意の階層に現れる
+    /// 名前（例 `.git`）のいずれかとして解釈する。
+    pub deny: Vec<String>,
+    /// 掘り下げ禁止（配下をwalkしない）。whitelist/blacklist両モードで使う
+    /// （例 `node_modules`・`.git`）。
+    pub deny_descend: Vec<String>,
+}
+
 /// 実行前ゲート（`PermissionArbiter`）が参照するリスク分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,15 +124,19 @@ pub struct ToolCtx {
     /// 書込ステージング設定（M10）。既定（`StagingConfig::default()`）は純live＝
     /// M9までと等価な直接実FSアクセス。
     pub staging: StagingConfig,
+    /// 読取スコープ設定（M11）。既定（`ReadScopeConfig::default()`）はwhitelistかつ
+    /// 外部ルート未設定＝M10までと等価（workspace外の絶対パス読取は一切不可）。
+    pub read_scope: ReadScopeConfig,
 }
 
 impl ToolCtx {
-    /// live既定（オーバーレイ無し）で`ToolCtx`を作る。既存の`ToolCtx { workspace_root }`
-    /// 呼び出し箇所（主にテスト）の置き換え先。
+    /// live既定（オーバーレイ無し）・読取スコープ既定（外部ルート無し）で`ToolCtx`を作る。
+    /// 既存の`ToolCtx { workspace_root }`呼び出し箇所（主にテスト）の置き換え先。
     pub fn new(workspace_root: std::path::PathBuf) -> Self {
         Self {
             workspace_root,
             staging: StagingConfig::default(),
+            read_scope: ReadScopeConfig::default(),
         }
     }
 }

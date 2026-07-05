@@ -18,9 +18,10 @@ use std::path::{Path, PathBuf};
 
 use cap_std::fs::File;
 use cap_std::time::SystemTime;
-use harness_core::{StagingConfig, StagingMode};
+use harness_core::{ReadScopeConfig, StagingConfig, StagingMode};
 
 use crate::manifest::{self, ManifestEntry, ManifestOp, ManifestTarget};
+use crate::read_scope::ReadScope;
 use crate::{check_relative_path, git, JailError, WorkspaceJail};
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +32,8 @@ pub enum SandboxError {
     NotFound(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    ReadScope(#[from] crate::read_scope::ReadScopeError),
 }
 
 fn hash_content(content: &str) -> String {
@@ -150,10 +153,21 @@ pub struct SandboxFs {
     sandbox_dir: Option<PathBuf>,
     mode: StagingMode,
     explicit: bool,
+    read_scope: ReadScope,
 }
 
 impl SandboxFs {
     pub fn open(workspace_root: &Path, staging: &StagingConfig) -> Result<Self, SandboxError> {
+        Self::open_with_read_scope(workspace_root, staging, &ReadScopeConfig::default())
+    }
+
+    /// `read.allow`/`read.allow_descend`/`read.deny`/`read.deny_descend`（M11）を
+    /// 反映した`SandboxFs`を開く。
+    pub fn open_with_read_scope(
+        workspace_root: &Path,
+        staging: &StagingConfig,
+        read_scope_config: &ReadScopeConfig,
+    ) -> Result<Self, SandboxError> {
         let jail = WorkspaceJail::open(workspace_root)?;
         Ok(Self {
             jail,
@@ -161,6 +175,7 @@ impl SandboxFs {
             sandbox_dir: staging.sandbox_dir.clone(),
             mode: staging.mode,
             explicit: staging.explicit,
+            read_scope: ReadScope::open(read_scope_config),
         })
     }
 
@@ -362,13 +377,17 @@ impl SandboxFs {
     }
 
     /// read-through: オーバーレイに版があればそれ、無ければ実FS。tombstone済みは`NotFound`。
-    /// 絶対パスの読取はM10のスコープ外（`_ext`対応は書込のみ、既存の`read_file`ツールと同じく
-    /// 相対パスのみを受け付ける）。
+    /// 絶対パスは`read.allow`/`read.allow_descend`（whitelist）または`read.deny`未該当
+    /// （blacklist）の場合のみ`ReadScope`経由で読める（M11、`plans/DESIGN-SANDBOX.md` §5）。
+    /// オーバーレイ（`_ext`）は書込のみが対象（読取は常に実FSを直接見る）。
     pub fn read_to_string(&self, path: &str) -> Result<String, SandboxError> {
         if Path::new(path).is_absolute() {
-            return Err(SandboxError::Jail(JailError::Escape(path.to_string())));
+            return Ok(self.read_scope.read_external_to_string(Path::new(path))?);
         }
         let rel = check_relative_path(path)?;
+        if self.read_scope.is_denied_rel(&rel) {
+            return Err(SandboxError::NotFound(path.to_string()));
+        }
         if self.sandbox_dir.is_none() {
             return Ok(self.jail.read_to_string(path)?);
         }
@@ -403,11 +422,13 @@ impl SandboxFs {
     }
 
     /// grep/glob用: 実FSファイルとオーバーレイ(tree)ファイルの和集合（tombstone除外）を、
-    /// workspace_rootからの相対パスで返す。
+    /// workspace_rootからの相対パスで返す。`read.deny_descend`配下は掘り下げず、
+    /// `read.deny`/`read.deny_descend`に一致するパスは結果からも除外する（M11）。
     pub fn walk_files(&self) -> Result<Vec<PathBuf>, SandboxError> {
+        let skip_dirs = self.read_scope.deny_descend_names();
         let mut set: BTreeSet<String> = self
             .jail
-            .walk_files()?
+            .walk_files_filtered(&skip_dirs)?
             .into_iter()
             .map(|p| normalize_str(&p))
             .collect();
@@ -423,6 +444,7 @@ impl SandboxFs {
                 }
             }
         }
+        set.retain(|p| !self.read_scope.is_denied_rel(Path::new(p)));
         Ok(set.into_iter().map(PathBuf::from).collect())
     }
 
@@ -762,5 +784,62 @@ mod tests {
         files.sort();
 
         assert_eq!(files, vec!["staged_new.txt".to_string()]);
+    }
+
+    /// M11受入テスト: `read.deny_descend`配下はwalkできない（grep/globが中身を返さない）。
+    #[test]
+    fn walk_files_skips_deny_descend_directories() {
+        use harness_core::ReadScopeConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/index.js"), "x").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let fs = SandboxFs::open_with_read_scope(
+            dir.path(),
+            &StagingConfig::default(),
+            &ReadScopeConfig {
+                deny_descend: vec!["node_modules".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let files: Vec<String> = fs
+            .walk_files()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(files, vec!["main.rs".to_string()]);
+    }
+
+    /// M11受入テスト: `..`による外部脱出はread/writeいずれの経路でも不可（回帰確認）。
+    #[test]
+    fn read_and_write_reject_parent_dir_escape_regardless_of_read_scope() {
+        use harness_core::{ReadMode, ReadScopeConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().parent().unwrap().join("m11_outside.txt"),
+            "secret",
+        )
+        .unwrap();
+
+        let fs = SandboxFs::open_with_read_scope(
+            dir.path(),
+            &StagingConfig::default(),
+            &ReadScopeConfig {
+                mode: ReadMode::Blacklist,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = fs.read_to_string("../m11_outside.txt").unwrap_err();
+        assert!(matches!(err, SandboxError::Jail(JailError::Escape(_))));
+        let err = fs.write_string("../m11_outside.txt", "x").unwrap_err();
+        assert!(matches!(err, SandboxError::Jail(JailError::Escape(_))));
     }
 }

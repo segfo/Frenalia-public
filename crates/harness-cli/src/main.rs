@@ -661,6 +661,11 @@ async fn main() -> ExitCode {
     } else {
         Some(sandbox_dir_for_session(&session.id()))
     };
+    let read_scope = settings
+        .read
+        .clone()
+        .unwrap_or_default()
+        .to_read_scope_config();
     let tool_ctx = ToolCtx {
         workspace_root: workspace_root.clone(),
         staging: StagingConfig {
@@ -668,6 +673,7 @@ async fn main() -> ExitCode {
             explicit,
             sandbox_dir,
         },
+        read_scope,
     };
 
     match cli.print {
