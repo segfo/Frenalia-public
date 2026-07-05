@@ -674,9 +674,7 @@ mod tests {
         let mut state = ConversationState::new();
         state.push_user_text("run a shell command");
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
-        let ctx = ToolCtx {
-            workspace_root: dir.path().to_path_buf(),
-        };
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
 
         let outcome = run_agent_loop(
@@ -720,9 +718,7 @@ mod tests {
         let mut state = ConversationState::new();
         state.push_user_text("read a.txt");
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
-        let ctx = ToolCtx {
-            workspace_root: dir.path().to_path_buf(),
-        };
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
 
         let outcome = run_agent_loop(
@@ -767,9 +763,7 @@ mod tests {
         let mut state = ConversationState::new();
         state.push_user_text("run an allowed shell command");
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
-        let ctx = ToolCtx {
-            workspace_root: dir.path().to_path_buf(),
-        };
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
         let arbiter = PermissionArbiter::new(
             PermissionMode::Default,
             vec![AllowlistRule::new("run_shell", "echo*")],
@@ -832,7 +826,7 @@ mod tests {
         state.push_user_text("hi");
         let messages_before = state.messages.len();
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
-        let ctx = ToolCtx { workspace_root: dir.path().to_path_buf() };
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
         let cancel = CancellationToken::new();
 
@@ -925,7 +919,7 @@ mod tests {
         state.push_user_text("run two slow tools");
         let mut tools = harness_tools::ToolRegistry::new();
         tools.register(std::sync::Arc::new(SlowTool));
-        let ctx = ToolCtx { workspace_root: dir.path().to_path_buf() };
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
         let cancel = CancellationToken::new();
 

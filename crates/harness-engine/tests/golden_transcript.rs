@@ -65,9 +65,7 @@ async fn read_file_tool_loop_produces_expected_transcript() {
     state.push_user_text("read greeting.txt and tell me what it says");
 
     let tools = ToolRegistry::with_builtin_tools();
-    let ctx = ToolCtx {
-        workspace_root: dir.path().to_path_buf(),
-    };
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
     // read_file はReadOnlyなのでヘッドレス既定（allowlist未登録）でも自動許可される
     // （§パーミッション「Default」モード）。
     let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);

@@ -73,9 +73,7 @@ async fn json_output_has_stable_schema_and_allowed_tool_call() {
     let mut state = ConversationState::new();
     state.push_user_text("read a.txt");
     let tools = ToolRegistry::with_builtin_tools();
-    let ctx = ToolCtx {
-        workspace_root: dir.path().to_path_buf(),
-    };
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
     let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
 
     let mut out = Vec::new();
@@ -127,9 +125,7 @@ async fn json_output_records_denied_tool_call() {
     let mut state = ConversationState::new();
     state.push_user_text("run a shell command");
     let tools = ToolRegistry::with_builtin_tools();
-    let ctx = ToolCtx {
-        workspace_root: dir.path().to_path_buf(),
-    };
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
     let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
 
     let mut out = Vec::new();
@@ -164,9 +160,7 @@ async fn jsonl_output_emits_one_agent_event_per_line() {
     state.push_user_text("say hi");
     let tools = ToolRegistry::with_builtin_tools();
     let dir = tempfile::tempdir().unwrap();
-    let ctx = ToolCtx {
-        workspace_root: dir.path().to_path_buf(),
-    };
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
     let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
 
     let mut out = Vec::new();
@@ -214,9 +208,7 @@ async fn json_output_surfaces_provider_error_with_nonzero_exit() {
     state.push_user_text("read missing.txt");
     let tools = ToolRegistry::with_builtin_tools();
     let dir = tempfile::tempdir().unwrap();
-    let ctx = ToolCtx {
-        workspace_root: dir.path().to_path_buf(),
-    };
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
     let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
 
     let mut out = Vec::new();

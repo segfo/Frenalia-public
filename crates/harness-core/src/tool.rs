@@ -23,6 +23,44 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+/// 書込ステージング3モード（`plans/DESIGN.md` §書込ステージング3モード、M10）。
+/// パーミッション層（`RiskClass`/`PermissionArbiter`）とは直交する軸で、
+/// 「許可された書込の実FS効果をどこへ落とすか」だけを決める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagingMode {
+    /// 即実FS（オーバーレイ無し）。
+    Live,
+    /// 全書込staging、実FSは手動`apply`まで不変（headless/未信頼の既定）。
+    Staged,
+    /// workspace内はstaging→レビュー&コミット、workspace外は常にsandbox隔離。
+    WorkspaceCommit,
+}
+
+/// ツールのステージング設定。`explicit`が`true`なら`mode`をそのまま使い、`false`なら
+/// パス毎のgit認識型判定（追跡済み・変更ゼロ→live、それ以外→`mode`）に委ねる
+/// （`harness-sandbox::SandboxFs`が判定の実体を持つ。`harness-core`は値を運ぶだけ）。
+#[derive(Debug, Clone)]
+pub struct StagingConfig {
+    pub mode: StagingMode,
+    pub explicit: bool,
+    /// オーバーレイ・マニフェストの置き場所。**`workspace_root`からの相対パス**
+    /// （例 `.harness/sandbox/<session-id>`）で持つ。オーバーレイの実体を常にworkspace内に
+    /// 置くことで、`WorkspaceJail`（cap-std主ゲート）1つだけで実FS・オーバーレイの両方を
+    /// 仲介できる（`harness-sandbox::SandboxFs`参照）。`None`なら純live（オーバーレイを
+    /// 一切使わない、既存コードとの後方互換用）。
+    pub sandbox_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for StagingConfig {
+    fn default() -> Self {
+        Self {
+            mode: StagingMode::Live,
+            explicit: false,
+            sandbox_dir: None,
+        }
+    }
+}
+
 /// 実行前ゲート（`PermissionArbiter`）が参照するリスク分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +93,20 @@ pub enum ToolError {
 #[derive(Debug, Clone)]
 pub struct ToolCtx {
     pub workspace_root: std::path::PathBuf,
+    /// 書込ステージング設定（M10）。既定（`StagingConfig::default()`）は純live＝
+    /// M9までと等価な直接実FSアクセス。
+    pub staging: StagingConfig,
+}
+
+impl ToolCtx {
+    /// live既定（オーバーレイ無し）で`ToolCtx`を作る。既存の`ToolCtx { workspace_root }`
+    /// 呼び出し箇所（主にテスト）の置き換え先。
+    pub fn new(workspace_root: std::path::PathBuf) -> Self {
+        Self {
+            workspace_root,
+            staging: StagingConfig::default(),
+        }
+    }
 }
 
 /// 変動点（ツール実装）を隠す唯一のtrait境界。開いた集合なので trait object で拡張可能。

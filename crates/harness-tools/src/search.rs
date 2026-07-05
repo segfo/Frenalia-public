@@ -2,8 +2,8 @@
 //!
 //! **【T3】走査は cap-std `Dir` 上の自前 walker で行う**: `ignore::WalkBuilder`/`grep::Walk`
 //! はstdのパスベースopenで自走査しcap-stdのハンドルを経由できないため、走査本体は
-//! `WorkspaceJail::walk_files`（`Dir::entries`＝openat相当）に統一し、`globset`は
-//! glob判定にのみ使う（§ツールシステム fsジェイル）。
+//! `SandboxFs::walk_files`（`Dir::entries`＝openat相当、M10でオーバーレイ分も合流するよう
+//! 拡張済み）に統一し、`globset`はglob判定にのみ使う（§ツールシステム fsジェイル）。
 
 use async_trait::async_trait;
 use grep_regex::RegexMatcherBuilder;
@@ -12,9 +12,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use harness_core::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
-use harness_sandbox::WorkspaceJail;
+use harness_sandbox::SandboxFs;
 
-use crate::jail_error_to_tool_error;
+use crate::sandbox_error_to_tool_error;
 
 /// 走査対象ファイル数・出力行数の上限。無制限走査による暴走/巨大出力を防ぐ実務上の安全弁。
 const MAX_FILES_SCANNED: usize = 2000;
@@ -89,10 +89,11 @@ impl Tool for GrepTool {
         let input: GrepInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let workspace_root = ctx.workspace_root.clone();
+        let staging = ctx.staging.clone();
 
         tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
-            let jail = WorkspaceJail::open(&workspace_root)
-                .map_err(|e| jail_error_to_tool_error("", e))?;
+            let fs = SandboxFs::open(&workspace_root, &staging)
+                .map_err(|e| sandbox_error_to_tool_error("", e))?;
 
             let matcher = RegexMatcherBuilder::new()
                 .case_insensitive(input.ignore_case.unwrap_or(false))
@@ -113,9 +114,9 @@ impl Tool for GrepTool {
             let show_line_numbers = input.line_numbers.unwrap_or(true);
             let context = input.context.unwrap_or(0);
 
-            let mut candidates = jail
+            let mut candidates = fs
                 .walk_files()
-                .map_err(|e| jail_error_to_tool_error("", e))?;
+                .map_err(|e| sandbox_error_to_tool_error("", e))?;
             candidates.retain(|p| {
                 let s = p.to_string_lossy().replace('\\', "/");
                 if !base_prefix.is_empty() && !s.starts_with(&base_prefix) {
@@ -145,7 +146,7 @@ impl Tool for GrepTool {
                     break;
                 }
                 let rel_str = rel_path.to_string_lossy().replace('\\', "/");
-                let file = match jail.open_file(&rel_str) {
+                let file = match fs.open_file_for_read(&rel_str) {
                     Ok(f) => f,
                     Err(_) => continue,
                 };
@@ -293,19 +294,20 @@ impl Tool for GlobTool {
         let input: GlobInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let workspace_root = ctx.workspace_root.clone();
+        let staging = ctx.staging.clone();
 
         tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
-            let jail = WorkspaceJail::open(&workspace_root)
-                .map_err(|e| jail_error_to_tool_error("", e))?;
+            let fs = SandboxFs::open(&workspace_root, &staging)
+                .map_err(|e| sandbox_error_to_tool_error("", e))?;
 
             let matcher = globset::Glob::new(&input.pattern)
                 .map_err(|e| ToolError::InvalidInput(format!("invalid glob: {e}")))?
                 .compile_matcher();
 
             let base_prefix = input.path.clone().unwrap_or_default();
-            let files = jail
+            let files = fs
                 .walk_files()
-                .map_err(|e| jail_error_to_tool_error("", e))?;
+                .map_err(|e| sandbox_error_to_tool_error("", e))?;
 
             let epoch = cap_std::time::SystemTime::from_std(std::time::UNIX_EPOCH);
             let mut matched: Vec<(String, cap_std::time::SystemTime)> = Vec::new();
@@ -317,7 +319,7 @@ impl Tool for GlobTool {
                 if !matcher.is_match(&s) {
                     continue;
                 }
-                let mtime = jail.modified(&s).unwrap_or(epoch);
+                let mtime = fs.modified(&s).unwrap_or(epoch);
                 matched.push((s, mtime));
             }
             matched.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
@@ -343,9 +345,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx(root: PathBuf) -> ToolCtx {
-        ToolCtx {
-            workspace_root: root,
-        }
+        ToolCtx::new(root)
     }
 
     #[tokio::test]

@@ -91,6 +91,32 @@ pub enum Action {
     /// 現在進行中のターンをキャンセルする（M9、Escキー）。
     Cancel,
     Quit,
+    /// 変更（changes）パネルの開閉トグル（M10、Ctrl+G）。開く際は呼び出し側
+    /// （`harness-tui::run`）が`SandboxFs::change_set()`を読んで`AppState::open_changes_panel`
+    /// を呼ぶ（`AppState`自体はサンドボックスへアクセスしない）。
+    ToggleChangesPanel,
+    /// 変更パネルで`c`（コミット）を押した結果。reject印の付いたエントリを除いた
+    /// パス集合（`SandboxFs::apply`の`only_paths`にそのまま渡す）。
+    CommitChanges(Vec<String>),
+    /// 変更パネルで`x`（破棄）を押した結果。
+    DiscardChanges,
+}
+
+/// 変更（changes）パネルの表示用1行。`ChangeEntry`本体に加え、差分プレビュー
+/// （パネルを開いた時点で一度だけ計算、`diff.rs::line_diff`）を持つ。
+#[derive(Debug, Clone)]
+pub struct ChangeRow {
+    pub entry: harness_sandbox::ChangeEntry,
+    pub diff: Vec<DiffLine>,
+}
+
+/// 変更パネルの状態。`rejected`に含まれるインデックスは`c`（コミット）から除外される
+/// （既定は全件accept、reject印を付けたものだけ除外するgit-add -p同様のUX）。
+#[derive(Debug, Clone)]
+pub struct ChangesPanelState {
+    pub rows: Vec<ChangeRow>,
+    pub selected: usize,
+    pub rejected: std::collections::HashSet<usize>,
 }
 
 pub struct AppState {
@@ -158,6 +184,9 @@ pub struct AppState {
     /// echoし、VS Code等の端末が実際にどんな`code`/`modifiers`を届けているかを画面で観測する
     /// （Enter系キー化けの検証用。`harness-cli`が`AppState::new`後にこのpubフィールドへ設定）。
     pub key_debug: bool,
+    /// 変更（changes）パネル（M10）。`Some`の間は他の全キー入力をパネル操作専用に奪う
+    /// （`pending_permission`と同じ排他パターン）。
+    pub changes_panel: Option<ChangesPanelState>,
 }
 
 /// `PageUp`/`PageDown`1回あたりのスクロール行数。端末の実際の高さは`AppState`が知らないため
@@ -194,7 +223,21 @@ impl AppState {
             spinner_frame: 0,
             enter_submits: false,
             key_debug: false,
+            changes_panel: None,
         }
+    }
+
+    /// 変更パネルを開く（既定で全件accept、`rejected`は空）。
+    pub fn open_changes_panel(&mut self, rows: Vec<ChangeRow>) {
+        self.changes_panel = Some(ChangesPanelState {
+            rows,
+            selected: 0,
+            rejected: Default::default(),
+        });
+    }
+
+    pub fn close_changes_panel(&mut self) {
+        self.changes_panel = None;
     }
 
     /// キーイベントecho（`note_key_event`）を有効化し、有効である旨のバナーをtranscriptへ出す。
@@ -542,6 +585,39 @@ impl AppState {
             return None;
         }
 
+        if let Some(panel) = &mut self.changes_panel {
+            match key.code {
+                KeyCode::Esc => self.changes_panel = None,
+                KeyCode::Up => panel.selected = panel.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    panel.selected = (panel.selected + 1).min(panel.rows.len().saturating_sub(1))
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let idx = panel.selected;
+                    if !panel.rejected.remove(&idx) {
+                        panel.rejected.insert(idx);
+                    }
+                }
+                KeyCode::Char('c') => {
+                    let accepted: Vec<String> = panel
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !panel.rejected.contains(i))
+                        .map(|(_, row)| row.entry.path.clone())
+                        .collect();
+                    self.changes_panel = None;
+                    return Some(Action::CommitChanges(accepted));
+                }
+                KeyCode::Char('x') => {
+                    self.changes_panel = None;
+                    return Some(Action::DiscardChanges);
+                }
+                _ => {}
+            }
+            return None;
+        }
+
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
@@ -551,6 +627,12 @@ impl AppState {
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_fold();
                 None
+            }
+            // 変更（changes）パネルの開閉トグル（M10）。パネル自体を開く処理
+            // （`SandboxFs::change_set()`の読み込み）は`harness-tui::run`側が担う
+            // （`AppState`はサンドボックスへアクセスしないため）。
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Action::ToggleChangesPanel)
             }
             // 入力欄の全選択（アンカー=先頭、カーソル=末尾という選択の特殊ケース）。
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1577,5 +1659,96 @@ mod tests {
 
         assert_eq!(app.transcript.len(), 1);
         assert!(matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s == "Hello"));
+    }
+
+    fn change_row(path: &str) -> ChangeRow {
+        ChangeRow {
+            entry: harness_sandbox::ChangeEntry {
+                op: harness_sandbox::ManifestOp::Create,
+                target: harness_sandbox::ManifestTarget::Tree,
+                path: path.to_string(),
+                overlay_path: format!("overlay/{path}"),
+                baseline_hash: None,
+                new_hash: Some("h".to_string()),
+            },
+            diff: Vec::new(),
+        }
+    }
+
+    /// 変更パネル表示中はCtrl+G/Ctrl+C等を含む通常のキー処理を一切通さず、パネル専用の
+    /// キーだけを処理する（承認モーダルと同じ排他パターン、§リッチTUI「変更パネル」）。
+    #[test]
+    fn changes_panel_consumes_keys_and_ignores_normal_input() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.open_changes_panel(vec![change_row("a.txt"), change_row("b.txt")]);
+
+        // 通常なら文字入力になるはずのキーもパネル表示中は`input`へ反映されない。
+        assert!(app.on_key(key('z')).is_none());
+        assert_eq!(app.input, "");
+    }
+
+    /// ↑↓でパネルの選択行が動き、末尾/先頭でクランプされる。
+    #[test]
+    fn changes_panel_up_down_moves_selection_and_clamps() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.open_changes_panel(vec![change_row("a.txt"), change_row("b.txt"), change_row("c.txt")]);
+
+        app.on_key(code(KeyCode::Up)); // 先頭でのUpは0のまま
+        assert_eq!(app.changes_panel.as_ref().unwrap().selected, 0);
+
+        app.on_key(code(KeyCode::Down));
+        app.on_key(code(KeyCode::Down));
+        assert_eq!(app.changes_panel.as_ref().unwrap().selected, 2);
+
+        app.on_key(code(KeyCode::Down)); // 末尾でのDownは2のまま
+        assert_eq!(app.changes_panel.as_ref().unwrap().selected, 2);
+    }
+
+    /// Enter/Spaceで選択中のエントリのaccept/reject（`rejected`集合への出し入れ）がトグルする。
+    #[test]
+    fn changes_panel_enter_toggles_reject_for_selected_entry() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.open_changes_panel(vec![change_row("a.txt"), change_row("b.txt")]);
+
+        app.on_key(code(KeyCode::Enter));
+        assert!(app.changes_panel.as_ref().unwrap().rejected.contains(&0));
+
+        app.on_key(code(KeyCode::Enter));
+        assert!(!app.changes_panel.as_ref().unwrap().rejected.contains(&0));
+    }
+
+    /// `c`でコミット: reject印を付けたエントリを除いたパス集合が`Action::CommitChanges`として
+    /// 返り、パネルは閉じる。
+    #[test]
+    fn changes_panel_commit_excludes_rejected_entries_and_closes_panel() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.open_changes_panel(vec![change_row("a.txt"), change_row("b.txt")]);
+        app.on_key(code(KeyCode::Enter)); // a.txtをreject
+
+        let action = app.on_key(key('c'));
+        assert!(matches!(action, Some(Action::CommitChanges(paths)) if paths == vec!["b.txt".to_string()]));
+        assert!(app.changes_panel.is_none());
+    }
+
+    /// `x`で全破棄: `Action::DiscardChanges`が返り、パネルは閉じる。
+    #[test]
+    fn changes_panel_discard_returns_action_and_closes_panel() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.open_changes_panel(vec![change_row("a.txt")]);
+
+        let action = app.on_key(key('x'));
+        assert!(matches!(action, Some(Action::DiscardChanges)));
+        assert!(app.changes_panel.is_none());
+    }
+
+    /// Escでパネルを閉じる（何もコミット/破棄しない）。
+    #[test]
+    fn changes_panel_esc_closes_without_action() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.open_changes_panel(vec![change_row("a.txt")]);
+
+        let action = app.on_key(code(KeyCode::Esc));
+        assert!(action.is_none());
+        assert!(app.changes_panel.is_none());
     }
 }

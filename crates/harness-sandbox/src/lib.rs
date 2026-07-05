@@ -1,9 +1,12 @@
-//! harness-sandbox: ワークスペースjail。`plans/DESIGN.md` §ファイルサンドボックス・
-//! ステージング・シェル隔離、および §ツールシステム「fsジェイル（cap-std を主ゲート）」参照。
+//! harness-sandbox: ワークスペースjail + オーバーレイFS。`plans/DESIGN.md`
+//! §ファイルサンドボックス・ステージング・シェル隔離、および §ツールシステム
+//! 「fsジェイル（cap-std を主ゲート）」参照。
 //!
-//! M4時点のスコープは「層1: ワークスペースjail＝モード非依存の不変条件」のみである。
-//! オーバーレイFS・書込ステージング3モード・シェル隔離Tier・読取スコープ（whitelist/blacklist
-//! 反転モード）はいずれもM10/M11/M12のスコープで、本クレートには未実装。
+//! M4時点のスコープは「層1: ワークスペースjail＝モード非依存の不変条件」のみだった。
+//! M10で `overlay`（`SandboxFs`: 書込リダイレクト・read-through・変更マニフェスト・
+//! 論理削除tombstone・`--live`/`--staged`/`--workspace_commit`3モード・apply/discard）を
+//! 追加した。読取スコープ（whitelist/blacklist反転モード）・シェル隔離Tierは引き続き
+//! M11/M12のスコープで本クレートには未実装。
 //!
 //! **主ゲートはcap-std**: 起動時（実際にはツール呼び出しごと。§実装ノート参照）に開いた
 //! `cap_std::fs::Dir` ハンドルからの相対openに統一し、絶対パス再解決を経由したTOCTOU
@@ -11,6 +14,17 @@
 //! Windows予約デバイス名/ADS/UNC前置の拒否は、cap-stdによる主ゲートを補強する**早期リジェクト**
 //! （設計書「path-clean+dunce::canonicalize+starts_withは補助ログに降格」と同じ位置付け）であり、
 //! これ単体を安全性の根拠にはしない。
+//!
+//! `SandboxFs`のオーバーレイ実体（`tree/`・`_ext/`・`manifest.jsonl`）は常にworkspace内
+//! （`StagingConfig.sandbox_dir`はworkspace_rootからの相対パス）に置くため、この`WorkspaceJail`
+//! 1つだけで実FS・オーバーレイの両方を仲介できる（新たなambient authorityを増やさない）。
+
+pub mod git;
+pub mod manifest;
+pub mod overlay;
+
+pub use manifest::{ManifestOp, ManifestTarget};
+pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};
 
 use std::path::{Component, Path, PathBuf};
 
@@ -86,11 +100,52 @@ impl WorkspaceJail {
         Ok(self.dir.metadata(&rel)?.modified()?)
     }
 
+    /// ジェイル内のファイルを物理削除する（`SandboxFs::apply`のtombstone適用用）。
+    pub fn remove_file(&self, rel_path: &str) -> Result<(), JailError> {
+        let rel = check_relative_path(rel_path)?;
+        Ok(self.dir.remove_file(&rel)?)
+    }
+
+    /// ジェイル内のディレクトリを再帰的に削除する（`SandboxFs::discard`用）。
+    /// 存在しない場合は無視する（`discard`の冪等性のため）。
+    pub fn remove_dir_all(&self, rel_path: &str) -> Result<(), JailError> {
+        let rel = check_relative_path(rel_path)?;
+        match self.dir.open_dir(&rel) {
+            Ok(sub) => {
+                Self::remove_dir_contents(&sub)?;
+                // Windowsは開いたままのディレクトリハンドルを削除できないため、
+                // `remove_dir`の前に明示的にドロップする（NLLは値のDropタイミングまでは
+                // 早めない。値のスコープ終端まで開いたままになる）。
+                drop(sub);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        Ok(self.dir.remove_dir(&rel)?)
+    }
+
+    fn remove_dir_contents(dir: &Dir) -> Result<(), JailError> {
+        for entry in dir.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                let sub = entry.open_dir()?;
+                Self::remove_dir_contents(&sub)?;
+                drop(sub);
+                dir.remove_dir(&name)?;
+            } else {
+                dir.remove_file(&name)?;
+            }
+        }
+        Ok(())
+    }
+
     fn walk_dir(dir: &Dir, prefix: PathBuf, out: &mut Vec<PathBuf>) -> Result<(), JailError> {
         for entry in dir.entries()? {
             let entry = entry?;
             let name = entry.file_name();
-            if name == ".git" {
+            if name == ".git" || name == ".harness" {
                 continue;
             }
             let rel = prefix.join(&name);

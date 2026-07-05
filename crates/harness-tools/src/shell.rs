@@ -203,9 +203,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx(root: PathBuf) -> ToolCtx {
-        ToolCtx {
-            workspace_root: root,
-        }
+        ToolCtx::new(root)
     }
 
     #[tokio::test]

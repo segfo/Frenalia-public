@@ -1,13 +1,18 @@
 //! `read_file`/`write_file`/`edit_file`。`plans/DESIGN.md` §ツールシステム「組み込みツール」参照。
+//!
+//! M10で実FSへの直接アクセスを`harness_sandbox::SandboxFs`（オーバーレイFS）経由へ差し替えた。
+//! `ctx.staging.sandbox_dir`が`None`（`StagingConfig::default()`）なら`SandboxFs`は内部の
+//! `WorkspaceJail`をそのまま素通しする純live実装として振る舞うため、M9までの挙動と等価
+//! （このファイルの既存ユニットテストは無改変で通る）。
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
 use harness_core::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
-use harness_sandbox::WorkspaceJail;
+use harness_sandbox::SandboxFs;
 
-use crate::jail_error_to_tool_error;
+use crate::sandbox_error_to_tool_error;
 
 // --- read_file ---
 
@@ -48,18 +53,19 @@ impl Tool for ReadFileTool {
     }
 
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: ReadFileInput =
+        let input: ReadFileInput = 
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
         // cap-std の Dir ハンドル経由の同期I/Oはtokioワーカースレッドをブロックしうるため、
         // spawn_blocking へ逃がす（§ツールシステム fsジェイル、cap-stdは非同期非対応）。
         let workspace_root = ctx.workspace_root.clone();
+        let staging = ctx.staging.clone();
         let path_for_err = input.path.clone();
         let content = tokio::task::spawn_blocking(move || -> Result<String, ToolError> {
-            let jail = WorkspaceJail::open(&workspace_root)
-                .map_err(|e| jail_error_to_tool_error(&path_for_err, e))?;
-            jail.read_to_string(&path_for_err)
-                .map_err(|e| jail_error_to_tool_error(&path_for_err, e))
+            let fs = SandboxFs::open(&workspace_root, &staging)
+                .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
+            fs.read_to_string(&path_for_err)
+                .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))
         })
         .await
         .map_err(|e| ToolError::ExecutionFailed(format!("join error: {e}")))??;
@@ -97,7 +103,7 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "ワークスペース内へファイルを書き込む（既存内容は上書き）。親ディレクトリが無ければ作成する。"
+        "ワークスペース内へファイルを書き込む(既存内容は上書き)。親ディレクトリが無ければ作成する。"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -121,14 +127,15 @@ impl Tool for WriteFileTool {
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
         let workspace_root = ctx.workspace_root.clone();
+        let staging = ctx.staging.clone();
         let path_for_err = input.path.clone();
         let path_for_output = input.path.clone();
         let bytes_written = input.content.len();
         tokio::task::spawn_blocking(move || -> Result<(), ToolError> {
-            let jail = WorkspaceJail::open(&workspace_root)
-                .map_err(|e| jail_error_to_tool_error(&path_for_err, e))?;
-            jail.write_string(&path_for_err, &input.content)
-                .map_err(|e| jail_error_to_tool_error(&path_for_err, e))
+            let fs = SandboxFs::open(&workspace_root, &staging)
+                .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
+            fs.write_string(&path_for_err, &input.content)
+                .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))
         })
         .await
         .map_err(|e| ToolError::ExecutionFailed(format!("join error: {e}")))??;
@@ -187,13 +194,14 @@ impl Tool for EditFileTool {
         let replace_all = input.replace_all.unwrap_or(false);
 
         let workspace_root = ctx.workspace_root.clone();
+        let staging = ctx.staging.clone();
         let path_for_err = input.path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), ToolError> {
-            let jail = WorkspaceJail::open(&workspace_root)
-                .map_err(|e| jail_error_to_tool_error(&path_for_err, e))?;
-            let content = jail
+            let fs = SandboxFs::open(&workspace_root, &staging)
+                .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
+            let content = fs
                 .read_to_string(&path_for_err)
-                .map_err(|e| jail_error_to_tool_error(&path_for_err, e))?;
+                .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
 
             let occurrences = content.matches(input.old_string.as_str()).count();
             if occurrences == 0 {
@@ -214,8 +222,8 @@ impl Tool for EditFileTool {
                 content.replacen(input.old_string.as_str(), input.new_string.as_str(), 1)
             };
 
-            jail.write_string(&path_for_err, &new_content)
-                .map_err(|e| jail_error_to_tool_error(&path_for_err, e))
+            fs.write_string(&path_for_err, &new_content)
+                .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))
         })
         .await
         .map_err(|e| ToolError::ExecutionFailed(format!("join error: {e}")))??;
@@ -233,9 +241,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx(root: PathBuf) -> ToolCtx {
-        ToolCtx {
-            workspace_root: root,
-        }
+        ToolCtx::new(root)
     }
 
     #[tokio::test]
@@ -365,5 +371,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    /// M10検証条件の核心: `--staged`相当（`StagingConfig`明示・`sandbox_dir`あり）では
+    /// `write_file`が実FSへ一切触れず、read-throughで自分の書込を一貫して読める。
+    #[tokio::test]
+    async fn write_file_stages_without_touching_real_fs_when_staged() {
+        use harness_core::{StagingConfig, StagingMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            workspace_root: dir.path().to_path_buf(),
+            staging: StagingConfig {
+                mode: StagingMode::Staged,
+                explicit: true,
+                sandbox_dir: Some(PathBuf::from(".harness/sandbox/test-session")),
+            },
+        };
+
+        let tool = WriteFileTool;
+        let out = tool
+            .call(json!({ "path": "staged.txt", "content": "hi" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(!dir.path().join("staged.txt").exists(), "real FS must stay untouched");
+
+        let read_tool = ReadFileTool;
+        let read_out = read_tool
+            .call(json!({ "path": "staged.txt" }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(read_out.content, "     1\thi");
     }
 }

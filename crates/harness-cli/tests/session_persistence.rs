@@ -27,7 +27,7 @@ async fn run_one_turn(session: &SessionStore, state: &mut ConversationState, pro
     let provider = MockProvider::new(vec![end_turn(reply)]);
     let tools = ToolRegistry::with_builtin_tools();
     let dir = tempfile::tempdir().unwrap();
-    let ctx = ToolCtx { workspace_root: dir.path().to_path_buf() };
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
     let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
 
     let mut out = Vec::new();

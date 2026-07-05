@@ -18,11 +18,12 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use harness_core::{LlmProvider, ToolCtx};
+use harness_core::{LlmProvider, StagingConfig, ToolCtx};
 use harness_engine::{ConversationState, PermissionArbiter, SessionStore};
+use harness_sandbox::{ApplyOptions, ManifestOp, ManifestTarget, SandboxFs};
 use harness_tools::ToolRegistry;
 
-pub use app::{Action, AppState, SlashCommand};
+pub use app::{Action, AppState, ChangeRow, ChangesPanelState, SlashCommand};
 pub use engine::{spawn_engine, EngineHandle};
 pub use gate::InteractiveGate;
 
@@ -36,6 +37,31 @@ pub fn init_file_logging(log_dir: &std::path::Path) -> tracing_appender::non_blo
     let (writer, guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::fmt().with_writer(writer).with_ansi(false).init();
     guard
+}
+
+/// 変更パネル（M10）を開く際、`SandboxFs::change_set()`の各エントリに差分プレビューを
+/// 添えて`ChangeRow`へ変換する。baseline（変更前）の内容は実FSから直接読む
+/// （`Tree`はworkspace内の相対パス、`Ext`は絶対パスそのもの）。表示専用のbest-effort読取
+/// のため、読めない場合は空文字列扱いにする（§リッチTUI「変更パネル」）。
+fn build_change_rows(workspace_root: &std::path::Path, fs: &SandboxFs, entries: Vec<harness_sandbox::ChangeEntry>) -> Vec<ChangeRow> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let baseline = match entry.target {
+                ManifestTarget::Tree => std::fs::read_to_string(workspace_root.join(&entry.path)),
+                ManifestTarget::Ext => std::fs::read_to_string(&entry.path),
+                ManifestTarget::Live => Ok(String::new()),
+            }
+            .unwrap_or_default();
+            let current = if entry.op == ManifestOp::Delete {
+                String::new()
+            } else {
+                fs.read_to_string(&entry.overlay_path).unwrap_or_default()
+            };
+            let diff = diff::line_diff(&baseline, &current);
+            ChangeRow { entry, diff }
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -82,6 +108,12 @@ pub async fn run(
 
     let resumed_messages = state.messages.len();
     let new_session_id = session.id();
+    // `ctx`は`spawn_engine`へ移動するため、変更パネル（M10）用に先に複製しておく
+    // （パネルの開閉・apply/discardはengineタスクを介さず、`ConversationState`と無関係に
+    // `SandboxFs`を直接この描画ループから同期的に叩く。ピッカーが`session`を直接触るのと
+    // 同じアーキテクチャ上の位置付け）。
+    let workspace_root_for_panel = ctx.workspace_root.clone();
+    let staging_for_panel: StagingConfig = ctx.staging.clone();
     let mut engine = spawn_engine(
         provider,
         tools,
@@ -168,6 +200,76 @@ pub async fn run(
                                     }
                                 },
                                 Action::Quit => {}
+                                Action::ToggleChangesPanel => {
+                                    if app.changes_panel.is_some() {
+                                        app.close_changes_panel();
+                                    } else {
+                                        match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
+                                            Ok(fs) => match fs.change_set() {
+                                                Ok(entries) => {
+                                                    let rows = build_change_rows(&workspace_root_for_panel, &fs, entries);
+                                                    app.open_changes_panel(rows);
+                                                }
+                                                Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                                    message: format!("failed to read staged changes: {e}"),
+                                                }),
+                                            },
+                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                                message: format!("failed to open sandbox: {e}"),
+                                            }),
+                                        }
+                                    }
+                                }
+                                Action::CommitChanges(only_paths) => {
+                                    match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
+                                        Ok(fs) => match fs.apply(&ApplyOptions {
+                                            only_glob: None,
+                                            only_paths: Some(&only_paths),
+                                            allow_ext: false,
+                                        }) {
+                                            Ok(report) => {
+                                                app.transcript.push(app::TranscriptItem::Info(format!(
+                                                    "applied {} change(s){}{}",
+                                                    report.applied.len(),
+                                                    if report.conflicts.is_empty() {
+                                                        String::new()
+                                                    } else {
+                                                        format!(", {} conflict(s) skipped", report.conflicts.len())
+                                                    },
+                                                    if report.ext_blocked.is_empty() {
+                                                        String::new()
+                                                    } else {
+                                                        format!(
+                                                            ", {} out-of-workspace change(s) need --dangerously-allow via `harness apply`",
+                                                            report.ext_blocked.len()
+                                                        )
+                                                    }
+                                                )));
+                                            }
+                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                                message: format!("apply failed: {e}"),
+                                            }),
+                                        },
+                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("failed to open sandbox: {e}"),
+                                        }),
+                                    }
+                                }
+                                Action::DiscardChanges => {
+                                    match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
+                                        Ok(fs) => match fs.discard() {
+                                            Ok(()) => app.transcript.push(app::TranscriptItem::Info(
+                                                "discarded staged changes".to_string(),
+                                            )),
+                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                                message: format!("discard failed: {e}"),
+                                            }),
+                                        },
+                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("failed to open sandbox: {e}"),
+                                        }),
+                                    }
+                                }
                             }
                         }
                     }

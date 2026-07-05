@@ -975,6 +975,7 @@ dependencies = [
  "harness-core",
  "harness-engine",
  "harness-providers",
+ "harness-sandbox",
  "harness-tools",
  "harness-tui",
  "serde",
@@ -1040,6 +1041,9 @@ name = "harness-sandbox"
 version = "0.1.0"
 dependencies = [
  "cap-std",
+ "harness-core",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -1074,6 +1078,7 @@ dependencies = [
  "futures",
  "harness-core",
  "harness-engine",
+ "harness-sandbox",
  "harness-tools",
  "ratatui",
  "serde_json",

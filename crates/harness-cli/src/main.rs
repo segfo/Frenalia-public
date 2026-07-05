@@ -13,20 +13,24 @@
 //! M8で`--output-format text|json|jsonl`（安定json/jsonl出力、実体は`harness_cli::run_headless`）と
 //! `--dangerously-allow`（`--permission-mode accept-all`の明示必須化・ワイルドカード
 //! `--allow`ルールの明示必須化、§非対話モード「危険/ワイルドカードは`--dangerously-allow`」）を
-//! 追加した。オーバーレイFS（M10）が未実装のため`--staged`は未導入のまま
-//! （既存の「write系はallowlist未登録なら自動拒否」で§実装マイルストーン M8の要求を満たす）。
+//! 追加した。M10で`harness_sandbox::SandboxFs`（オーバーレイFS）を配線し、`--live`/`--staged`/
+//! `--workspace-commit`（明示時はそのまま採用、省略時はパス毎のgit認識型判定：追跡済み・
+//! 変更ゼロ→live、それ以外→headless既定staged/TUI既定workspace_commit）、および
+//! `apply`/`changes`/`discard`サブコマンドを追加した。
 
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use harness_cli::{run_headless, OutputFormat};
-use harness_core::{LlmProvider, ToolCtx};
+use harness_core::{LlmProvider, StagingConfig, StagingMode, ToolCtx};
 use harness_engine::{
     parse_allowlist_rule, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode,
 };
 use harness_providers::{AnthropicProvider, OpenAiProvider};
+use harness_sandbox::{ApplyOptions, SandboxFs};
 use harness_tools::ToolRegistry;
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-8";
@@ -72,9 +76,44 @@ impl From<PermissionModeArg> for PermissionMode {
     }
 }
 
+/// ステージ済み変更（`harness_sandbox::SandboxFs`のオーバーレイ）を操作するサブコマンド
+/// （§オーバーレイFS「レビュー＆コミット」、M10）。
+#[derive(Subcommand)]
+enum Commands {
+    /// ステージ済み変更を一覧表示する。
+    Changes {
+        /// 対象セッションID（省略時は`.harness/sandbox/`内で最も新しいもの）。
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
+    },
+    /// ステージ済み変更を実FSへ選択適用する。
+    Apply {
+        #[arg(long)]
+        session: Option<String>,
+        /// 選択適用フィルタ（`*`ワイルドカード対応、例 `src/*`）。省略時は全件対象。
+        #[arg(long)]
+        only: Option<String>,
+        /// `_ext/`（workspace外ターゲット、例 `C:\Windows\x`）の適用を許可する。
+        #[arg(long = "dangerously-allow", default_value_t = false)]
+        dangerously_allow: bool,
+        #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
+    },
+    /// ステージ済み変更を全て破棄する。
+    Discard {
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
 #[derive(Parser)]
 #[command(name = "harness")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// 非対話モードでプロンプトを送信し、応答をstdoutへ出力する。値が "-" ならstdinから読む。
     /// 省略時は対話TUI（`harness-tui`）を起動する（§リッチTUI、M7）。
     #[arg(short = 'p', long = "print")]
@@ -149,6 +188,69 @@ struct Cli {
     /// （`-p/--print`省略時＝対話TUI起動時のみ意味を持つ）。
     #[arg(long = "enter-submits")]
     enter_submits: Option<bool>,
+
+    /// 即実FS（オーバーレイ無し）。`--staged`/`--workspace-commit`と併用不可
+    /// （§書込ステージング3モード、M10）。
+    #[arg(long = "live", conflicts_with_all = ["staged", "workspace_commit"])]
+    live: bool,
+
+    /// 全書込をステージングし、実FSは`harness apply`まで不変にする
+    /// （headless既定、§書込ステージング3モード）。
+    #[arg(long = "staged", conflicts_with_all = ["live", "workspace_commit"])]
+    staged: bool,
+
+    /// workspace内はステージング→レビュー＆コミット、workspace外は常にsandbox隔離
+    /// （対話TUI既定、§書込ステージング3モード）。
+    #[arg(long = "workspace-commit", conflicts_with_all = ["live", "staged"])]
+    workspace_commit: bool,
+}
+
+/// `--live`/`--staged`/`--workspace-commit`から`(explicit, fallback_mode)`を決める。
+/// 明示指定が無い場合、`fallback_mode`はgit認識型判定（追跡済み・変更ゼロ→live）で
+/// liveと判定されなかったパスにだけ適用される既定モード（headless=Staged/TUI=WorkspaceCommit）。
+fn resolve_staging_mode(live: bool, staged: bool, workspace_commit: bool, is_headless: bool) -> (bool, StagingMode) {
+    if live {
+        (true, StagingMode::Live)
+    } else if staged {
+        (true, StagingMode::Staged)
+    } else if workspace_commit {
+        (true, StagingMode::WorkspaceCommit)
+    } else if is_headless {
+        (false, StagingMode::Staged)
+    } else {
+        (false, StagingMode::WorkspaceCommit)
+    }
+}
+
+/// `session_id`（`session-<id>`形式）に対応する`.harness/sandbox/<id>/`を
+/// `workspace_root`からの相対パスで返す。
+fn sandbox_dir_for_session(session_id: &str) -> PathBuf {
+    PathBuf::from(".harness").join("sandbox").join(session_id)
+}
+
+/// `--session <id>`指定が無い場合に`.harness/sandbox/`直下で最も更新日時の新しいものを選ぶ
+/// （`apply`/`changes`/`discard`の既定対象）。
+fn resolve_sandbox_dir(workspace_root: &Path, session: Option<&str>) -> Option<PathBuf> {
+    if let Some(id) = session {
+        let stem = id.strip_prefix("session-").unwrap_or(id);
+        return Some(sandbox_dir_for_session(&format!("session-{stem}")));
+    }
+    let base = workspace_root.join(".harness").join("sandbox");
+    let mut newest: Option<(String, std::time::SystemTime)> = None;
+    let entries = std::fs::read_dir(&base).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        let Ok(modified) = metadata.modified() else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if newest.as_ref().is_none_or(|(_, t)| modified > *t) {
+            newest = Some((name.to_string(), modified));
+        }
+    }
+    newest.map(|(name, _)| sandbox_dir_for_session(&name))
 }
 
 fn build_provider(kind: ProviderKind, base_url_override: Option<String>) -> Result<Box<dyn LlmProvider>, String> {
@@ -273,6 +375,128 @@ fn resolve_model(model: Option<String>, kind: ProviderKind) -> Result<String, St
     }
 }
 
+/// `harness apply`のJSON出力（`--output-format json`）。
+#[derive(serde::Serialize)]
+struct ApplyReportJson {
+    applied: Vec<String>,
+    conflicts: Vec<String>,
+    ext_blocked: Vec<String>,
+}
+
+/// `apply`/`changes`/`discard`サブコマンドを処理する。プロバイダ資格情報を一切必要としない
+/// （§非対話モード、プロンプトは一切送らない）。
+fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
+    let (session, output_format_and_kind) = match &cmd {
+        Commands::Changes { session, output_format } => (session.clone(), Some(*output_format)),
+        Commands::Apply { session, output_format, .. } => (session.clone(), Some(*output_format)),
+        Commands::Discard { session } => (session.clone(), None),
+    };
+
+    let Some(sandbox_dir) = resolve_sandbox_dir(workspace_root, session.as_deref()) else {
+        eprintln!("no staged sandbox found under .harness/sandbox/ (nothing to show)");
+        return ExitCode::FAILURE;
+    };
+    let staging = StagingConfig {
+        mode: StagingMode::Staged,
+        explicit: true,
+        sandbox_dir: Some(sandbox_dir),
+    };
+    let fs = match SandboxFs::open(workspace_root, &staging) {
+        Ok(fs) => fs,
+        Err(e) => {
+            eprintln!("failed to open sandbox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match cmd {
+        Commands::Changes { .. } => {
+            let changes = match fs.change_set() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("failed to read changes: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match output_format_and_kind.unwrap_or_default() {
+                OutputFormat::Json => {
+                    if let Ok(s) = serde_json::to_string(&changes) {
+                        println!("{s}");
+                    }
+                }
+                OutputFormat::Jsonl => {
+                    for c in &changes {
+                        if let Ok(s) = serde_json::to_string(c) {
+                            println!("{s}");
+                        }
+                    }
+                }
+                OutputFormat::Text => {
+                    if changes.is_empty() {
+                        println!("(no staged changes)");
+                    }
+                    for c in &changes {
+                        println!("{:?}\t{:?}\t{}", c.op, c.target, c.path);
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Apply { only, dangerously_allow, .. } => {
+            let report = match fs.apply(&ApplyOptions {
+                only_glob: only.as_deref(),
+                only_paths: None,
+                allow_ext: dangerously_allow,
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("apply failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let has_conflicts_or_blocked = !report.conflicts.is_empty() || !report.ext_blocked.is_empty();
+            match output_format_and_kind.unwrap_or_default() {
+                OutputFormat::Json => {
+                    let json = ApplyReportJson {
+                        applied: report.applied,
+                        conflicts: report.conflicts,
+                        ext_blocked: report.ext_blocked,
+                    };
+                    if let Ok(s) = serde_json::to_string(&json) {
+                        println!("{s}");
+                    }
+                }
+                OutputFormat::Jsonl | OutputFormat::Text => {
+                    for p in &report.applied {
+                        println!("applied: {p}");
+                    }
+                    for p in &report.conflicts {
+                        println!("conflict (baseline mismatch, not applied): {p}");
+                    }
+                    for p in &report.ext_blocked {
+                        println!("blocked (out-of-workspace, needs --dangerously-allow): {p}");
+                    }
+                }
+            }
+            if has_conflicts_or_blocked {
+                ExitCode::from(4)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Commands::Discard { .. } => match fs.discard() {
+            Ok(()) => {
+                println!("discarded staged changes");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("discard failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // カレントディレクトリの`.env`があれば読み込み、プロセスのenvへ反映する（既存の環境変数は
@@ -291,6 +515,12 @@ async fn main() -> ExitCode {
             }
         },
     };
+
+    // `apply`/`changes`/`discard`サブコマンドはプロバイダ資格情報を一切必要としないため、
+    // 他のあらゆる検証より前に処理して即終了する（§非対話モード、プロンプトは一切送らない）。
+    if let Some(cmd) = cli.command {
+        return run_sandbox_subcommand(cmd, &workspace_root);
+    }
 
     // `--list-sessions`はプロバイダ資格情報を一切必要としないため、他のあらゆる検証より前に
     // 処理して即終了する（§非対話モード、プロンプトは一切送らない）。
@@ -351,9 +581,6 @@ async fn main() -> ExitCode {
     let enter_submits = cli.enter_submits.or(settings.enter_submits).unwrap_or(false);
 
     let tools = ToolRegistry::with_builtin_tools();
-    let tool_ctx = ToolCtx {
-        workspace_root: workspace_root.clone(),
-    };
 
     // §非対話モード「危険/ワイルドカードは`--dangerously-allow`」: accept-allモードは
     // fail-fastで拒否する（`--dangerously-allow`が無いままの誤起動を防ぐ）。
@@ -423,6 +650,25 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+
+    // 書込ステージング設定（M10）。`sandbox_dir`は`session.id()`確定後でなければ組めないため
+    // ここで`ToolCtx`を構築する。明示`--live`時はオーバーレイ自体を使わない
+    // （`sandbox_dir: None`、M9までの直接実FSアクセスとバイト等価・監査ログも作らない）。
+    let (explicit, staging_mode) =
+        resolve_staging_mode(cli.live, cli.staged, cli.workspace_commit, cli.print.is_some());
+    let sandbox_dir = if explicit && staging_mode == StagingMode::Live {
+        None
+    } else {
+        Some(sandbox_dir_for_session(&session.id()))
+    };
+    let tool_ctx = ToolCtx {
+        workspace_root: workspace_root.clone(),
+        staging: StagingConfig {
+            mode: staging_mode,
+            explicit,
+            sandbox_dir,
+        },
+    };
 
     match cli.print {
         Some(print) => {

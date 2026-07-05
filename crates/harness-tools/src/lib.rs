@@ -94,3 +94,14 @@ pub(crate) fn jail_error_to_tool_error(path: &str, err: JailError) -> ToolError 
         JailError::Io(e) => ToolError::ExecutionFailed(format!("{path}: {e}")),
     }
 }
+
+/// `SandboxFs`（M10、書込ステージング）のエラーを`ToolError`へ写像する共通ヘルパー。
+pub(crate) fn sandbox_error_to_tool_error(path: &str, err: harness_sandbox::SandboxError) -> ToolError {
+    match err {
+        harness_sandbox::SandboxError::Jail(e) => jail_error_to_tool_error(path, e),
+        harness_sandbox::SandboxError::NotFound(_) => {
+            ToolError::InvalidInput(format!("not found: {path}"))
+        }
+        harness_sandbox::SandboxError::Io(e) => ToolError::ExecutionFailed(format!("{path}: {e}")),
+    }
+}

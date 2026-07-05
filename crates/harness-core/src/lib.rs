@@ -12,4 +12,7 @@ pub use provider::{
     BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities,
     ProviderError, Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
 };
-pub use tool::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput, ToolResult, ToolSpec, ToolUse};
+pub use tool::{
+    RiskClass, StagingConfig, StagingMode, Tool, ToolCtx, ToolError, ToolOutput, ToolResult,
+    ToolSpec, ToolUse,
+};

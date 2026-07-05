@@ -18,6 +18,7 @@ harness-config = { version = "0.1.0", path = "../harness-config" }
 harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-engine = { version = "0.1.0", path = "../harness-engine" }
 harness-providers = { version = "0.1.0", path = "../harness-providers" }
+harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
 harness-tools = { version = "0.1.0", path = "../harness-tools" }
 harness-tui = { version = "0.1.0", path = "../harness-tui" }
 serde = { version = "1", features = ["derive"] }
