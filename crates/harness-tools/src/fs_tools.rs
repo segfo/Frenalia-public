@@ -391,6 +391,7 @@ mod tests {
                 sandbox_dir: Some(PathBuf::from(".harness/sandbox/test-session")),
             },
             read_scope: Default::default(),
+            shell_tier: Default::default(),
         };
 
         let tool = WriteFileTool;

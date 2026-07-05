@@ -89,6 +89,80 @@ pub struct ReadScopeConfig {
     pub deny_descend: Vec<String>,
 }
 
+/// シェル隔離Tier（M12、`plans/DESIGN-SANDBOX.md` §6）。Tier1a（AppContainer）・
+/// Tier1'（VHDX）は本フェーズの対象外（設計書がexperimental/オプトイン枠と位置付ける既定外Tier）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellTier {
+    /// Linux: bubblewrap（user+mount+network namespace + OverlayFS）。
+    Tier2,
+    /// Windows: Restricted Token + 低Integrity Level + Job Object。
+    Tier1b,
+    /// 保険（cwd拘束のみ・secret env strip・timeout/出力上限、best-effort）。
+    Tier0,
+}
+
+impl ShellTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            ShellTier::Tier2 => "tier2",
+            ShellTier::Tier1b => "tier1b",
+            ShellTier::Tier0 => "tier0",
+        }
+    }
+}
+
+/// `--require-sandbox[=confidential]`（`plans/DESIGN-SANDBOX.md` §7 D-03）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequireSandbox {
+    #[default]
+    None,
+    /// 書込拘束以上（Tier1b/Tier1a/Tier2でpass、Tier0で拒否）。
+    WriteContainment,
+    /// 機密性も要求（Tier1a/Tier2のみpass、Tier1b/Tier0で拒否）。
+    Confidential,
+}
+
+/// `harness-sandbox::shell_tier::select_tier`の結果。`ToolCtx`が運ぶ「値」であり、
+/// 判定ロジックの実体（OS能力プローブ）は`harness-sandbox`側にある
+/// （`StagingConfig`/`ReadScopeConfig`と同じ役割分担）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellTierSelection {
+    pub tier: ShellTier,
+    pub downgraded_from: Option<ShellTier>,
+    pub reason: Option<String>,
+}
+
+impl ShellTierSelection {
+    pub fn direct(tier: ShellTier) -> Self {
+        Self {
+            tier,
+            downgraded_from: None,
+            reason: None,
+        }
+    }
+
+    pub fn downgraded(from: ShellTier, to: ShellTier, reason: impl Into<String>) -> Self {
+        Self {
+            tier: to,
+            downgraded_from: Some(from),
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// 非隔離（Tier0）かどうか。`run_shell`出力への警告付与判定に使う
+    /// （M12受入条件「非隔離時警告」）。
+    pub fn is_unisolated(&self) -> bool {
+        self.tier == ShellTier::Tier0
+    }
+}
+
+impl Default for ShellTierSelection {
+    /// `ToolCtx::new`（テスト等）向けの既定値。実際の選択は`harness-sandbox::select_tier`が行う。
+    fn default() -> Self {
+        Self::direct(ShellTier::Tier0)
+    }
+}
+
 /// 実行前ゲート（`PermissionArbiter`）が参照するリスク分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,6 +201,10 @@ pub struct ToolCtx {
     /// 読取スコープ設定（M11）。既定（`ReadScopeConfig::default()`）はwhitelistかつ
     /// 外部ルート未設定＝M10までと等価（workspace外の絶対パス読取は一切不可）。
     pub read_scope: ReadScopeConfig,
+    /// シェル隔離Tier選択結果（M12）。既定（`ShellTierSelection::default()`＝Tier0）は
+    /// `harness-sandbox::select_tier`を呼ばないテスト経路向けのプレースホルダで、
+    /// 実行時は`harness-cli`が起動時に1回選択した値を積む。
+    pub shell_tier: ShellTierSelection,
 }
 
 impl ToolCtx {
@@ -137,6 +215,7 @@ impl ToolCtx {
             workspace_root,
             staging: StagingConfig::default(),
             read_scope: ReadScopeConfig::default(),
+            shell_tier: ShellTierSelection::default(),
         }
     }
 }

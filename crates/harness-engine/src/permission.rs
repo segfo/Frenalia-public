@@ -125,6 +125,14 @@ impl PermissionArbiter {
         if self.mode == PermissionMode::Plan {
             return Classification::Deny;
         }
+        // T-09（`plans/DESIGN-SANDBOX.md` §6.4）: allowlistのコマンド分解を無効化する構文
+        // （`-EncodedCommand`・`iex`・`Start-Process`・`cmd /c`・入れ子インタプリタ等）を検出したら
+        // allowlist一致・`AcceptAll`より前に強制的にPromptへ落とす（ヘッドレスは自動拒否）。
+        // これは追加ブロックであり安全の根拠にはしない（本命はallowlistのコマンド分解+隔離Tier、
+        // `base64`/`$IFS`等で自明に回避可能。§9残存リスク3）。
+        if tool == "run_shell" && looks_like_allowlist_bypass(arg_repr) {
+            return Classification::Prompt;
+        }
         if self.mode == PermissionMode::AcceptAll {
             return Classification::Allow;
         }
@@ -216,6 +224,31 @@ impl PermissionGate for PermissionArbiter {
     ) -> Decision {
         self.decide(tool, risk, arg_repr)
     }
+}
+
+/// T-09（`plans/DESIGN-SANDBOX.md` §6.4）: `run_shell`のコマンド行がallowlistの
+/// コマンド分解を無効化しようとする構文を含むかを大小無視・部分一致で検出する。
+/// 検出は追加ブロックにすぎず、安全の根拠は隔離Tier（M12）側にある。
+fn looks_like_allowlist_bypass(command: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "-encodedcommand",
+        "invoke-expression",
+        "iex ",
+        "iex(",
+        "start-process",
+        "cmd /c",
+        "cmd.exe /c",
+        "eval ",
+        "bash -c",
+        "sh -c",
+        "| sh",
+        "| bash",
+        "base64 -d",
+        "base64 --decode",
+        "certutil -decode",
+    ];
+    let lower = command.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// ツール入力から許可判定用の文字列表現を抜き出す。`command`/`path`フィールドがあれば
@@ -312,6 +345,37 @@ mod tests {
         assert_eq!(
             arbiter.decide("read_file", RiskClass::ReadOnly, "Cargo.toml"),
             Decision::Deny
+        );
+    }
+
+    #[test]
+    fn allowlist_bypass_syntax_forces_prompt_even_under_accept_all() {
+        let arbiter = PermissionArbiter::new(
+            PermissionMode::AcceptAll,
+            vec![AllowlistRule::new("run_shell", "*")],
+        );
+        // ヘッドレスの`decide`はPromptを自動Denyへ畳み込む（§パーミッション「ヘッドレス時」）。
+        assert_eq!(
+            arbiter.classify("run_shell", RiskClass::Exec, "powershell -EncodedCommand abc"),
+            Classification::Prompt
+        );
+        assert_eq!(
+            arbiter.classify("run_shell", RiskClass::Exec, "git status | Invoke-Expression"),
+            Classification::Prompt
+        );
+        assert_eq!(
+            arbiter.classify("run_shell", RiskClass::Exec, "echo hi | sh"),
+            Classification::Prompt
+        );
+    }
+
+    #[test]
+    fn allowlist_bypass_syntax_does_not_affect_other_tools() {
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![]);
+        // 検出は`run_shell`限定。他ツールの引数にたまたま同じ文字列が現れても無関係。
+        assert_eq!(
+            arbiter.classify("write_file", RiskClass::Write, "notes/-EncodedCommand.md"),
+            Classification::Allow
         );
     }
 

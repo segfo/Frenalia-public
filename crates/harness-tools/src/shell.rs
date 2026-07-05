@@ -1,5 +1,5 @@
 //! `run_shell`。`plans/DESIGN.md` §ツールシステム「run_shell」・§主なリスクと対策
-//! 「Windowsのシェルとパス」参照。
+//! 「Windowsのシェルとパス」、および`plans/DESIGN-SANDBOX.md` §6（M12）参照。
 //!
 //! **Windowsのシェル選択**（§実装マイルストーン M5）: pwsh7が`PATH`上に見つかればそれを、
 //! 無ければ Windows PowerShell 5.1（`powershell.exe`）へフォールバックする。両者は演算子が
@@ -8,11 +8,19 @@
 //! `-Command`への文字列補間はargvクォートバグを踏むため避け、コマンド文字列は**stdin経由**
 //! （`-Command -`）で渡す。`-NoProfile -NonInteractive`を付与する。
 //!
+//! **M12（シェル隔離Tier）**: 子プロセスのenvは常にallowlist方式のクリーンenv
+//! （`harness_sandbox::build_child_env`、D-07）。`ctx.shell_tier`（`harness-cli`が起動時に
+//! 1回選択）に応じて実際の隔離機構を切り替える:
+//! - Windows Tier1b: Restricted Token + 低IL + Job Object（`harness_sandbox::win_restricted`）。
+//! - Linux Tier2: `bwrap`でラップ（`harness_sandbox::linux_bwrap`）。本セッションでは実機未検証
+//!   （Windows専用環境、WSL2で別途再検証が必要）。
+//! - Tier0（保険・全OS）: 通常spawn + Job Object(Win)/rlimit(unix) + 出力バイト上限。
+//!
 //! 危険構文（`-EncodedCommand`・`iex`/`Invoke-Expression`・`Start-Process`・`cmd /c`・
 //! 入れ子インタプリタ）を検出したら`AcceptEdits`下でも強制的にプロンプトへ落とす
-//! denylistヒューリスティックは`PermissionArbiter`側の拡張を要するため**M5のスコープ外**
-//! （milestone表のM5検証条件は「Windows 11で`run_shell`がpowershell経由で動く」のみ）。
+//! （T-09、`harness-engine::permission::looks_like_allowlist_bypass`）。
 
+use std::path::Path;
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -22,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
-use harness_core::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
+use harness_core::{RiskClass, ShellTier, StagingMode, Tool, ToolCtx, ToolError, ToolOutput};
 use harness_sandbox::check_relative_path;
 
 use crate::jail_error_to_tool_error;
@@ -37,6 +45,8 @@ struct RunShellInput {
 pub struct RunShellTool;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+/// 出力バイト上限（層5・T-13、Tier0/Tier1b/Tier2いずれでも適用する保険）。
+const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
 #[async_trait]
 impl Tool for RunShellTool {
@@ -77,85 +87,277 @@ impl Tool for RunShellTool {
             None => ctx.workspace_root.clone(),
         };
 
-        let invocation = platform_shell_command(&input.command);
-        let mut cmd = invocation.cmd;
-        cmd.current_dir(&cwd);
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        if invocation.stdin_payload.is_some() {
-            cmd.stdin(Stdio::piped());
-        } else {
-            cmd.stdin(Stdio::null());
-        }
-        // タイムアウト到達時にfutureをdropしただけでは子プロセスは残るため、
-        // dropと同時にkillされるようにする（設計書「暴走kill」の要件）。
-        cmd.kill_on_drop(true);
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-
-        if let Some(payload) = invocation.stdin_payload {
-            let mut stdin = child.stdin.take().expect("stdin is piped");
-            stdin
-                .write_all(payload.as_bytes())
-                .await
-                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-            // dropしてEOFを送る。書き込み後すぐ子プロセス側のstdin読み取りが完了できるようにする。
-            drop(stdin);
-        }
-
-        let mut stdout = child.stdout.take().expect("stdout is piped");
-        let mut stderr = child.stderr.take().expect("stderr is piped");
-
         let dur = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+        let env = harness_sandbox::build_child_env();
 
-        let run = async {
-            // stdout/stderrを並行して読む。逐次読みだと、先に読んだ方のパイプが空になるのを
-            // 待っている間にもう片方のパイプがバッファ満杯になり子プロセスがブロックし得る。
-            let stdout_fut = async {
-                let mut s = String::new();
-                let _ = stdout.read_to_string(&mut s).await;
-                s
-            };
-            let stderr_fut = async {
-                let mut s = String::new();
-                let _ = stderr.read_to_string(&mut s).await;
-                s
-            };
-            let (out, err) = tokio::join!(stdout_fut, stderr_fut);
-            let status = child
-                .wait()
-                .await
-                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-            Ok::<_, ToolError>((out, err, status))
-        };
+        let (out, err, code, shell_label) =
+            run_isolated(&input.command, &cwd, &env, dur, ctx.shell_tier.tier).await?;
 
-        match timeout(dur, run).await {
-            Ok(Ok((out, err, status))) => {
-                let code = status.code().unwrap_or(-1);
-                let mut content = out;
-                if !err.is_empty() {
-                    if !content.is_empty() {
-                        content.push('\n');
-                    }
-                    content.push_str(&err);
-                }
-                content.push_str(&format!(
-                    "\n[exit code: {code}]\n[shell: {}]",
-                    invocation.shell_label
-                ));
-                Ok(ToolOutput {
-                    content,
-                    is_error: code != 0,
-                })
+        let code = code.unwrap_or(-1);
+        let mut content = truncate_to_limit(out);
+        let err = truncate_to_limit(err);
+        if !err.is_empty() {
+            if !content.is_empty() {
+                content.push('\n');
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(ToolError::ExecutionFailed(format!(
+            content.push_str(&err);
+        }
+        content.push_str(&format!("\n[exit code: {code}]\n[shell: {shell_label}]"));
+        content.push_str(&format!("\n[tier: {}]", ctx.shell_tier.tier.label()));
+        if let Some(reason) = &ctx.shell_tier.reason {
+            content.push_str(&format!(
+                " (downgraded from {}: {reason})",
+                ctx.shell_tier.downgraded_from.map(|t| t.label()).unwrap_or("?")
+            ));
+        }
+        if ctx.shell_tier.is_unisolated() {
+            content.push_str(
+                "\n[warning: shell isolation tier is tier0 (best-effort only); \
+                 out-of-workspace writes/network egress are not blocked, see plans/DESIGN-SANDBOX.md §9]",
+            );
+        }
+        if !matches!(ctx.staging.mode, StagingMode::Live) {
+            content.push_str(
+                "\n[warning: staged writes made earlier in this turn may not be visible to this \
+                 shell process yet (D-08 simplification, see plans/DESIGN-SANDBOX.md §8-3)]",
+            );
+        }
+
+        Ok(ToolOutput {
+            content,
+            is_error: code != 0,
+        })
+    }
+}
+
+fn truncate_to_limit(mut s: String) -> String {
+    if s.len() > MAX_OUTPUT_BYTES {
+        s.truncate(MAX_OUTPUT_BYTES);
+        s.push_str("\n[output truncated at 10MiB]");
+    }
+    s
+}
+
+/// Tierに応じて実行経路を切り替える。戻り値は`(stdout, stderr, exit_code, shell_label)`。
+/// `exit_code`は`None`ならkill済み（timeout）を表す呼び出し元エラーへ畳み込む。
+async fn run_isolated(
+    command: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    dur: Duration,
+    tier: ShellTier,
+) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+    #[cfg(windows)]
+    {
+        if tier == ShellTier::Tier1b {
+            return run_windows_tier1b(command, cwd, env, dur).await;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if tier == ShellTier::Tier2 {
+            return run_linux_tier2(command, cwd, env, dur).await;
+        }
+    }
+    // Tier0（保険）。上記いずれにも該当しない場合のフォールバックでもある。
+    run_tier0(command, cwd, env, dur).await
+}
+
+/// 通常のtokio Commandでspawnし、非同期I/O（stdout/stderr並行読み+timeout）を行う共通経路。
+/// Windowsは追加でJob Objectへ後付け（kill-on-close）、Unixは`setrlimit`をpre_execで適用する
+/// （Tier0の保険機構、`plans/DESIGN-SANDBOX.md` §6.5）。
+async fn run_tier0(
+    command: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    dur: Duration,
+) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+    let invocation = platform_shell_command(command);
+    let mut cmd = invocation.cmd;
+    apply_common_command_settings(&mut cmd, cwd, env, invocation.stdin_payload.is_some());
+
+    #[cfg(unix)]
+    apply_unix_rlimits(&mut cmd);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+    #[cfg(windows)]
+    {
+        if let Some(handle) = child.raw_handle() {
+            let _ = harness_sandbox::win_restricted::attach_job_object(handle as isize);
+        }
+    }
+
+    run_with_pipes(&mut child, invocation.stdin_payload, dur)
+        .await
+        .map(|(out, err, code)| (out, err, code, invocation.shell_label))
+}
+
+#[cfg(target_os = "linux")]
+async fn run_linux_tier2(
+    command: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    dur: Duration,
+) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+    let session_dir = cwd.join(".harness").join("sandbox").join("tier2");
+    let config = harness_sandbox::linux_bwrap::BwrapConfig {
+        workspace_root: cwd.to_path_buf(),
+        upper_dir: session_dir.join("upper"),
+        work_dir: session_dir.join("work"),
+    };
+    let _ = std::fs::create_dir_all(&config.upper_dir);
+    let _ = std::fs::create_dir_all(&config.work_dir);
+    let bwrap_args = harness_sandbox::linux_bwrap::build_args(&config);
+
+    let mut cmd = Command::new("bwrap");
+    cmd.args(&bwrap_args);
+    cmd.arg("--").arg("sh").arg("-c").arg(command);
+    apply_common_command_settings(&mut cmd, cwd, env, false);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+    run_with_pipes(&mut child, None, dur)
+        .await
+        .map(|(out, err, code)| (out, err, code, "bwrap(sh)"))
+}
+
+#[cfg(windows)]
+async fn run_windows_tier1b(
+    command: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    dur: Duration,
+) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+    let _ = std::fs::create_dir_all(cwd);
+    // cwd1つだけに継承可能な低ILラベルを付与する（非再帰・冪等、モジュールdocの既知の限界参照）。
+    let _ = harness_sandbox::win_restricted::set_low_integrity_label(cwd);
+
+    let (bin, shell_label) = if which::which("pwsh").is_ok() {
+        ("pwsh", "pwsh(tier1b)")
+    } else {
+        ("powershell", "powershell5.1(tier1b)")
+    };
+    let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
+    let cwd_owned = cwd.to_path_buf();
+    let env_owned = env.to_vec();
+
+    let child = harness_sandbox::win_restricted::spawn(bin, &args, &cwd_owned, &env_owned, true)
+        .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+    let kill_token = child.kill_token();
+    let command_owned = command.to_string();
+
+    let handle = tokio::task::spawn_blocking(move || {
+        child.write_stdin_read_output_and_wait(Some(&command_owned))
+    });
+
+    match timeout(dur, handle).await {
+        Ok(Ok(Ok((out, err, code)))) => Ok((out, err, Some(code), shell_label)),
+        Ok(Ok(Err(e))) => Err(ToolError::ExecutionFailed(e.to_string())),
+        Ok(Err(join_err)) => Err(ToolError::ExecutionFailed(join_err.to_string())),
+        Err(_) => {
+            kill_token.kill();
+            Err(ToolError::ExecutionFailed(format!(
                 "command timed out after {}ms",
                 dur.as_millis()
-            ))),
+            )))
         }
+    }
+}
+
+fn apply_common_command_settings(
+    cmd: &mut Command,
+    cwd: &Path,
+    env: &[(String, String)],
+    want_stdin: bool,
+) {
+    cmd.current_dir(cwd);
+    cmd.env_clear();
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    if want_stdin {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    // タイムアウト到達時にfutureをdropしただけでは子プロセスは残るため、
+    // dropと同時にkillされるようにする（設計書「暴走kill」の要件）。
+    cmd.kill_on_drop(true);
+}
+
+#[cfg(unix)]
+fn apply_unix_rlimits(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // T-13対策（層5・Tier0の保険）: アドレス空間とプロセス数に上限を設ける。
+    // fork爆弾やメモリ暴走を完全には防がないが、既定を持たない状態からの改善。
+    unsafe {
+        cmd.pre_exec(|| {
+            let as_limit = libc::rlimit {
+                rlim_cur: 2 * 1024 * 1024 * 1024,
+                rlim_max: 2 * 1024 * 1024 * 1024,
+            };
+            libc::setrlimit(libc::RLIMIT_AS, &as_limit);
+            let nproc_limit = libc::rlimit {
+                rlim_cur: 256,
+                rlim_max: 256,
+            };
+            libc::setrlimit(libc::RLIMIT_NPROC, &nproc_limit);
+            Ok(())
+        });
+    }
+}
+
+/// stdin書込+stdout/stderr並行読み+timeoutの共通ロジック（`tokio::process::Child`向け）。
+async fn run_with_pipes(
+    child: &mut tokio::process::Child,
+    stdin_payload: Option<String>,
+    dur: Duration,
+) -> Result<(String, String, Option<i32>), ToolError> {
+    if let Some(payload) = stdin_payload {
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        drop(stdin);
+    }
+
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+
+    let run = async {
+        let stdout_fut = async {
+            let mut s = String::new();
+            let _ = stdout.read_to_string(&mut s).await;
+            s
+        };
+        let stderr_fut = async {
+            let mut s = String::new();
+            let _ = stderr.read_to_string(&mut s).await;
+            s
+        };
+        let (out, err) = tokio::join!(stdout_fut, stderr_fut);
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        Ok::<_, ToolError>((out, err, status.code()))
+    };
+
+    match timeout(dur, run).await {
+        Ok(Ok((out, err, code))) => Ok((out, err, code)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(ToolError::ExecutionFailed(format!(
+            "command timed out after {}ms",
+            dur.as_millis()
+        ))),
     }
 }
 
@@ -203,7 +405,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx(root: PathBuf) -> ToolCtx {
-        ToolCtx::new(root)
+        let mut ctx = ToolCtx::new(root);
+        // `ToolCtx::new`はテスト既定でTier0（プレースホルダ）を積む。実行時は
+        // `harness-cli`が起動時に`select_tier`で解決した値を積むため、ここでも
+        // 実際のOS隔離Tier選択を再現する（さもないとTier1b経路が単体テストで一切通らない）。
+        ctx.shell_tier = harness_sandbox::select_tier(harness_core::RequireSandbox::None)
+            .expect("tier selection without --require-sandbox never fails");
+        ctx
     }
 
     #[tokio::test]
@@ -223,6 +431,7 @@ mod tests {
         assert!(!out.is_error);
         assert!(out.content.contains("hello"));
         assert!(out.content.contains("[exit code: 0]"));
+        assert!(out.content.contains("[tier:"));
     }
 
     #[cfg(windows)]
@@ -240,8 +449,10 @@ mod tests {
         assert!(!out.is_error);
         assert!(out.content.contains("hello"));
         assert!(
-            out.content.contains("[shell: pwsh]") || out.content.contains("[shell: powershell5.1]")
+            out.content.contains("[shell: pwsh(tier1b)]")
+                || out.content.contains("[shell: powershell5.1(tier1b)]")
         );
+        assert!(out.content.contains("[tier: tier1b]"));
     }
 
     #[tokio::test]
@@ -262,5 +473,24 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_tier1b_rejects_write_outside_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = std::env::temp_dir().join("harness-m12-outside-test.txt");
+        let _ = std::fs::remove_file(&outside);
+        let tool = RunShellTool;
+        let command = format!(
+            "Set-Content -Path '{}' -Value 'blocked' -ErrorAction Stop",
+            outside.display()
+        );
+        let out = tool
+            .call(json!({ "command": command }), &ctx(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(out.is_error, "write outside the low-IL cwd should fail: {}", out.content);
+        assert!(!outside.exists());
     }
 }

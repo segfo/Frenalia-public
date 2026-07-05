@@ -23,10 +23,20 @@ pub mod git;
 pub mod manifest;
 pub mod overlay;
 pub mod read_scope;
+pub mod secret_env;
+pub mod shell_tier;
+
+#[cfg(windows)]
+pub mod win_restricted;
+
+#[cfg(target_os = "linux")]
+pub mod linux_bwrap;
 
 pub use manifest::{ManifestOp, ManifestTarget};
 pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};
 pub use read_scope::{ReadScope, ReadScopeError};
+pub use secret_env::build_child_env;
+pub use shell_tier::{select_tier, TierError};
 
 use std::path::{Component, Path, PathBuf};
 

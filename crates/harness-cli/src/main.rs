@@ -25,12 +25,12 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use harness_cli::{run_headless, OutputFormat};
-use harness_core::{LlmProvider, StagingConfig, StagingMode, ToolCtx};
+use harness_core::{LlmProvider, RequireSandbox, StagingConfig, StagingMode, ToolCtx};
 use harness_engine::{
     parse_allowlist_rule, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode,
 };
 use harness_providers::{AnthropicProvider, OpenAiProvider};
-use harness_sandbox::{ApplyOptions, SandboxFs};
+use harness_sandbox::{select_tier, ApplyOptions, SandboxFs};
 use harness_tools::ToolRegistry;
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-8";
@@ -203,6 +203,24 @@ struct Cli {
     /// （対話TUI既定、§書込ステージング3モード）。
     #[arg(long = "workspace-commit", conflicts_with_all = ["live", "staged"])]
     workspace_commit: bool,
+
+    /// シェル隔離Tierの最低要求（M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。指定時は
+    /// 自動降格せず、要求を満たせない場合に起動を拒否する。値省略（`--require-sandbox`単体）は
+    /// 「書込拘束以上」（Tier1b/Tier2でpass、Tier0で拒否）、`=confidential`は「機密性も要求」
+    /// （Tier2のみpass）。省略時は制約無し（Tier0への自動降格も許容）。
+    #[arg(long = "require-sandbox", num_args = 0..=1, default_missing_value = "write-containment")]
+    require_sandbox: Option<String>,
+}
+
+/// `--require-sandbox[=confidential]`の文字列表現を`RequireSandbox`へ変換する
+/// （M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。未知の値は`write-containment`扱いにする
+/// （clapの`default_missing_value`と揃える安全側フォールバック）。
+fn parse_require_sandbox(value: Option<&str>) -> RequireSandbox {
+    match value {
+        None => RequireSandbox::None,
+        Some("confidential") => RequireSandbox::Confidential,
+        Some(_) => RequireSandbox::WriteContainment,
+    }
 }
 
 /// `--live`/`--staged`/`--workspace-commit`から`(explicit, fallback_mode)`を決める。
@@ -666,6 +684,28 @@ async fn main() -> ExitCode {
         .clone()
         .unwrap_or_default()
         .to_read_scope_config();
+
+    // シェル隔離Tier選択（M12、`plans/DESIGN-SANDBOX.md` §6/§7 D-03）。`--require-sandbox`指定時は
+    // 自動降格せず起動を拒否する（既存の`--dangerously-allow`と同じfail-fastパターン）。
+    let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
+    let shell_tier = match select_tier(require_sandbox) {
+        Ok(selection) => selection,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(reason) = &shell_tier.reason {
+        eprintln!(
+            "warning: shell isolation downgraded to {} (from {}): {reason}",
+            shell_tier.tier.label(),
+            shell_tier
+                .downgraded_from
+                .map(|t| t.label())
+                .unwrap_or("?")
+        );
+    }
+
     let tool_ctx = ToolCtx {
         workspace_root: workspace_root.clone(),
         staging: StagingConfig {
@@ -674,6 +714,7 @@ async fn main() -> ExitCode {
             sandbox_dir,
         },
         read_scope,
+        shell_tier,
     };
 
     match cli.print {

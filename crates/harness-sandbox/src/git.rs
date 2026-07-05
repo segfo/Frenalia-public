@@ -15,9 +15,7 @@ pub fn is_clean_tracked(workspace_root: &Path, rel: &Path) -> bool {
         return false;
     }
 
-    let tracked = Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
+    let tracked = hardened_git_command(workspace_root)
         .arg("ls-files")
         .arg("--error-unmatch")
         .arg("--")
@@ -30,9 +28,7 @@ pub fn is_clean_tracked(workspace_root: &Path, rel: &Path) -> bool {
         return false;
     }
 
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
+    let status = hardened_git_command(workspace_root)
         .arg("status")
         .arg("--porcelain")
         .arg("--")
@@ -42,6 +38,45 @@ pub fn is_clean_tracked(workspace_root: &Path, rel: &Path) -> bool {
         return false;
     };
     status.status.success() && status.stdout.is_empty()
+}
+
+/// harnessが内部的に起動する全`git`が経由するハードニング済みコマンドビルダ（D-06、
+/// `plans/DESIGN-SANDBOX.md` §7）。TB5（悪意ある`.git/config`/hooks/`.gitattributes`を
+/// 含むリポジトリ）に対し、注入されたhooks/alias/pagerを無効化する:
+/// `GIT_CONFIG_NOSYSTEM=1`+空のglobal/systemconfig+`-c core.hooksPath=<空dir>`+
+/// `-c core.fsmonitor=false`+`--no-pager`。envはallowlist方式のクリーンenv
+/// （`secret_env::build_child_env`、D-07）に統一する。
+fn hardened_git_command(workspace_root: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env_clear();
+    for (k, v) in crate::secret_env::build_child_env() {
+        cmd.env(k, v);
+    }
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env("GIT_CONFIG_GLOBAL", empty_config_path());
+    cmd.env("GIT_CONFIG_SYSTEM", empty_config_path());
+    cmd.arg("--no-pager")
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", empty_hooks_dir().display()))
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-C")
+        .arg(workspace_root);
+    cmd
+}
+
+/// 空の（存在しない）configファイルパス。`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`へ向けることで
+/// ユーザ/システムconfigの読み込みを無効化する（gitは存在しないconfigパスを黙って無視する）。
+fn empty_config_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("harness-empty-git-config")
+}
+
+/// 空のhooksディレクトリ。存在しなければ作成する（作成失敗時もgitがhooksPath不在を無視して
+/// 続行するため致命的ではない）。
+fn empty_hooks_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("harness-empty-git-hooks");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 #[cfg(test)]
