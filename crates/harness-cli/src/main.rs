@@ -210,6 +210,13 @@ struct Cli {
     /// （Tier2のみpass）。省略時は制約無し（Tier0への自動降格も許容）。
     #[arg(long = "require-sandbox", num_args = 0..=1, default_missing_value = "write-containment")]
     require_sandbox: Option<String>,
+
+    /// Windows専用の実験的Tier1a（AppContainer）を試す（`plans/DESIGN-SANDBOX.md` §6.3/§7 D-02、
+    /// 既定はfalse=Tier1bのまま）。プロファイル作成/ACL付与のいずれかが失敗した場合は自動的に
+    /// Tier1bへ降格し警告する（他OSでは無視される）。Windows非管理者環境で機密性まで守りたい場合
+    /// （T-04/T-10対策）、または`--require-sandbox=confidential`を通したい場合に指定する。
+    #[arg(long = "experimental-tier1a", default_value_t = false)]
+    experimental_tier1a: bool,
 }
 
 /// `--require-sandbox[=confidential]`の文字列表現を`RequireSandbox`へ変換する
@@ -688,7 +695,7 @@ async fn main() -> ExitCode {
     // シェル隔離Tier選択（M12、`plans/DESIGN-SANDBOX.md` §6/§7 D-03）。`--require-sandbox`指定時は
     // 自動降格せず起動を拒否する（既存の`--dangerously-allow`と同じfail-fastパターン）。
     let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
-    let shell_tier = match select_tier(require_sandbox) {
+    let shell_tier = match select_tier(require_sandbox, &workspace_root, cli.experimental_tier1a) {
         Ok(selection) => selection,
         Err(e) => {
             eprintln!("{e}");

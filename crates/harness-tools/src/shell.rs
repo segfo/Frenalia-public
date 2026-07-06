@@ -149,6 +149,9 @@ async fn run_isolated(
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     #[cfg(windows)]
     {
+        if tier == ShellTier::Tier1a {
+            return run_windows_tier1a(command, cwd, env, dur).await;
+        }
         if tier == ShellTier::Tier1b {
             return run_windows_tier1b(command, cwd, env, dur).await;
         }
@@ -223,6 +226,50 @@ async fn run_linux_tier2(
     run_with_pipes(&mut child, None, dur)
         .await
         .map(|(out, err, code)| (out, err, code, "bwrap(sh)"))
+}
+
+#[cfg(windows)]
+async fn run_windows_tier1a(
+    command: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    dur: Duration,
+) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+    let _ = std::fs::create_dir_all(cwd);
+    let sid = harness_sandbox::win_appcontainer::ensure_profile(
+        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    )
+    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+    // preflightのsmoke testと同一のシェル解決を使う（pwshのストアアプリ実行エイリアスは
+    // AppContainerで起動不可＝`resolve_shell`が実在のpowershell.exeへフォールバックする）。
+    let (bin, shell_label) = harness_sandbox::win_appcontainer::resolve_shell();
+    let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
+    let cwd_owned = cwd.to_path_buf();
+    let env_owned = env.to_vec();
+
+    let child =
+        harness_sandbox::win_appcontainer::spawn(&bin, &args, &cwd_owned, &env_owned, true, sid.as_psid())
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+    let kill_token = child.kill_token();
+    let command_owned = command.to_string();
+
+    let handle = tokio::task::spawn_blocking(move || {
+        child.write_stdin_read_output_and_wait(Some(&command_owned))
+    });
+
+    match timeout(dur, handle).await {
+        Ok(Ok(Ok((out, err, code)))) => Ok((out, err, Some(code), shell_label)),
+        Ok(Ok(Err(e))) => Err(ToolError::ExecutionFailed(e.to_string())),
+        Ok(Err(join_err)) => Err(ToolError::ExecutionFailed(join_err.to_string())),
+        Err(_) => {
+            kill_token.kill();
+            Err(ToolError::ExecutionFailed(format!(
+                "command timed out after {}ms",
+                dur.as_millis()
+            )))
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -405,12 +452,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx(root: PathBuf) -> ToolCtx {
-        let mut ctx = ToolCtx::new(root);
+        let mut ctx = ToolCtx::new(root.clone());
         // `ToolCtx::new`はテスト既定でTier0（プレースホルダ）を積む。実行時は
         // `harness-cli`が起動時に`select_tier`で解決した値を積むため、ここでも
         // 実際のOS隔離Tier選択を再現する（さもないとTier1b経路が単体テストで一切通らない）。
-        ctx.shell_tier = harness_sandbox::select_tier(harness_core::RequireSandbox::None)
-            .expect("tier selection without --require-sandbox never fails");
+        // `opt_in_tier1a=false`固定（既存Tier1bテストの挙動を変えないため）。
+        ctx.shell_tier =
+            harness_sandbox::select_tier(harness_core::RequireSandbox::None, &root, false)
+                .expect("tier selection without --require-sandbox never fails");
         ctx
     }
 
@@ -492,5 +541,101 @@ mod tests {
             .unwrap();
         assert!(out.is_error, "write outside the low-IL cwd should fail: {}", out.content);
         assert!(!outside.exists());
+    }
+
+    /// Tier1a（AppContainer）の隔離セマンティクスを決定論的に検証する（LLM非依存、絶対パスを
+    /// 使いモデルのCWD混乱を排除する）。実際にpreflight（プロファイル作成＋再帰ACL付与＋
+    /// smoke-test起動）を走らせ、Tier1aが選択できなかった環境（AppContainer不可）ではskipする。
+    /// 実行にはWindows実機＋（この開発機では）管理者権限が要る（`sudo cargo test`）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_tier1a_contains_writes_and_reads() {
+        use harness_core::{RequireSandbox, ShellTier};
+
+        let dir = tempfile::tempdir().unwrap();
+        // 実Tier1a preflightを走らせる（`opt_in_tier1a=true`）。AppContainer不可の環境では
+        // Tier1bへ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
+        let selection =
+            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true).unwrap();
+        if selection.tier != ShellTier::Tier1a {
+            eprintln!(
+                "skipping tier1a test: preflight downgraded to {} ({:?})",
+                selection.tier.label(),
+                selection.reason
+            );
+            return;
+        }
+
+        let mut ctx = ToolCtx::new(dir.path().to_path_buf());
+        ctx.shell_tier = selection;
+        let tool = RunShellTool;
+
+        // (a) ワークスペース内への書込（絶対パス）→ 成功する（再帰ACL付与でパッケージSIDが
+        //     workspace配下に書込可になっている証拠）。
+        let inside = dir.path().join("inside.txt");
+        let out = tool
+            .call(
+                json!({
+                    "command": format!(
+                        "Set-Content -Path '{}' -Value hi -ErrorAction Stop",
+                        inside.display()
+                    )
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out.is_error,
+            "in-workspace write should succeed under tier1a: {}",
+            out.content
+        );
+        assert!(inside.exists(), "in-workspace file was not created: {}", out.content);
+        assert!(out.content.contains("[tier: tier1a]"), "{}", out.content);
+
+        // (b) ワークスペース外への書込 → 拒否され、ファイルは作られない（範囲外書込の物理拒否）。
+        let outside = std::env::temp_dir().join("harness-tier1a-outside.txt");
+        let _ = std::fs::remove_file(&outside);
+        let out = tool
+            .call(
+                json!({
+                    "command": format!(
+                        "Set-Content -Path '{}' -Value blocked -ErrorAction Stop",
+                        outside.display()
+                    )
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.is_error,
+            "out-of-workspace write should fail under tier1a: {}",
+            out.content
+        );
+        assert!(!outside.exists());
+
+        // (c) T-04: ワークスペース外の機密ファイルのread → 拒否される（Tier1bなら読めてしまう
+        //     既知の欠陥がTier1aでは直る、という差分。実`~/.ssh`は使わずダミーで同じ性質を再現）。
+        let secret = std::env::temp_dir().join("harness-tier1a-secret.txt");
+        std::fs::write(&secret, "topsecret").unwrap();
+        let out = tool
+            .call(
+                json!({
+                    "command": format!(
+                        "Get-Content -Path '{}' -ErrorAction Stop",
+                        secret.display()
+                    )
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&secret);
+        assert!(
+            !out.content.contains("topsecret"),
+            "tier1a must not read outside-workspace secrets (T-04): {}",
+            out.content
+        );
     }
 }

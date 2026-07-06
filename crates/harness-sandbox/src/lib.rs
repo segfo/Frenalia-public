@@ -27,6 +27,12 @@ pub mod secret_env;
 pub mod shell_tier;
 
 #[cfg(windows)]
+pub mod win_appcontainer;
+
+#[cfg(windows)]
+mod win_common;
+
+#[cfg(windows)]
 pub mod win_restricted;
 
 #[cfg(target_os = "linux")]

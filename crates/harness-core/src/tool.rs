@@ -89,12 +89,17 @@ pub struct ReadScopeConfig {
     pub deny_descend: Vec<String>,
 }
 
-/// シェル隔離Tier（M12、`plans/DESIGN-SANDBOX.md` §6）。Tier1a（AppContainer）・
-/// Tier1'（VHDX）は本フェーズの対象外（設計書がexperimental/オプトイン枠と位置付ける既定外Tier）。
+/// シェル隔離Tier（M12、`plans/DESIGN-SANDBOX.md` §6）。Tier1'（VHDX）は本フェーズの
+/// 対象外（設計書がexperimental/オプトイン枠と位置付ける既定外Tier）。Tier1a（AppContainer）は
+/// D-02が定める「既定にせずフラグでオプトイン」の実験的Tierとして実装済み。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellTier {
     /// Linux: bubblewrap（user+mount+network namespace + OverlayFS）。
     Tier2,
+    /// Windows: AppContainer（package SID + capability SID）。実験的/フラグ付き
+    /// （`--experimental-tier1a`、D-02）。範囲外書込の物理拒否に加え、network を
+    /// capabilityゲートでdefault-denyにする（T-04/T-10対策の核）。
+    Tier1a,
     /// Windows: Restricted Token + 低Integrity Level + Job Object。
     Tier1b,
     /// 保険（cwd拘束のみ・secret env strip・timeout/出力上限、best-effort）。
@@ -105,6 +110,7 @@ impl ShellTier {
     pub fn label(self) -> &'static str {
         match self {
             ShellTier::Tier2 => "tier2",
+            ShellTier::Tier1a => "tier1a",
             ShellTier::Tier1b => "tier1b",
             ShellTier::Tier0 => "tier0",
         }
@@ -118,7 +124,8 @@ pub enum RequireSandbox {
     None,
     /// 書込拘束以上（Tier1b/Tier1a/Tier2でpass、Tier0で拒否）。
     WriteContainment,
-    /// 機密性も要求（Tier1a/Tier2のみpass、Tier1b/Tier0で拒否）。
+    /// 機密性も要求（Tier1a/Tier2のみpass、Tier1b/Tier0で拒否）。判定の実体は
+    /// `harness-sandbox::shell_tier::satisfies`（§8-2の判定表）。
     Confidential,
 }
 

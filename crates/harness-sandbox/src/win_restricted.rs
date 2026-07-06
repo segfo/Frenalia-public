@@ -15,31 +15,35 @@
 //! （既存ファイルへ遡ってラベルを再帰付与するのは、ユーザの実リポジトリのACLを広範囲に変更する
 //! 破壊的操作になるため意図的に行わない）。cwd外への書込は既定Mediumラベルのため一貫して拒否
 //! される（範囲外書込拒否＝Tier1bの本来の保証、T-05）。
+//!
+//! この機密性・network遮断の欠落を埋める実験的Tier1a（AppContainer）は`win_appcontainer`参照。
+//! 低レベルのパイプ/HANDLE/env補助関数は`win_common`に共通化されている。
 
 use std::path::Path;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
-    SetNamedSecurityInfoW, SE_FILE_OBJECT, SDDL_REVISION_1,
+    SE_FILE_OBJECT, SDDL_REVISION_1, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::{
-    CreateRestrictedToken, GetSecurityDescriptorSacl, SetTokenInformation, TokenIntegrityLevel,
-    DISABLE_MAX_PRIVILEGE, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT,
-    TOKEN_ADJUST_GROUPS, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY,
-    TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, GetSecurityDescriptorSacl,
+    LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SID_AND_ATTRIBUTES,
+    SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_GROUPS,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel,
 };
-use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
-use windows::Win32::System::Pipes::CreatePipe;
+use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, INFINITE,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
+    GetExitCodeProcess, INFINITE, OpenProcessToken, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+};
+
+use crate::win_common::{
+    build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, read_to_string,
+    wide, write_all,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -52,10 +56,6 @@ impl From<windows::core::Error> for RestrictedError {
     fn from(e: windows::core::Error) -> Self {
         RestrictedError::Win32(e.to_string())
     }
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// 低Integrity LevelのSDDL文字列（`S-1-16-4096`、Windowsの既定Low IL SID）。
@@ -199,98 +199,11 @@ impl Drop for RestrictedChild {
     }
 }
 
-fn write_all(handle: HANDLE, mut buf: &[u8]) {
-    unsafe {
-        while !buf.is_empty() {
-            let mut written = 0u32;
-            let ok = windows::Win32::Storage::FileSystem::WriteFile(
-                handle,
-                Some(buf),
-                Some(&mut written),
-                None,
-            );
-            if ok.is_err() || written == 0 {
-                break;
-            }
-            buf = &buf[written as usize..];
-        }
-    }
-}
-
-fn read_to_string(handle: HANDLE) -> String {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    unsafe {
-        loop {
-            let mut read = 0u32;
-            let ok = windows::Win32::Storage::FileSystem::ReadFile(
-                handle,
-                Some(&mut buf),
-                Some(&mut read),
-                None,
-            );
-            if ok.is_err() || read == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..read as usize]);
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// パイプを作る。既定のDACLで作った匿名パイプは明示ラベルを持たずMedium IL扱いになり、
 /// 低ILの子は**読めるが書けない**（No-Write-Up）。子がstdout/stderrへ書けなくなり
 /// 出力が消える実害があるため、パイプの二次記述子へ明示的にLow ILのSACLラベルを付与する。
 fn inheritable_pipe() -> Result<(HANDLE, HANDLE), RestrictedError> {
-    let mut read = HANDLE::default();
-    let mut write = HANDLE::default();
-    unsafe {
-        let sddl = wide("S:(ML;;NW;;;LW)");
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &mut sd,
-            None,
-        )?;
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd.0,
-            bInheritHandle: true.into(),
-        };
-        let result = CreatePipe(&mut read, &mut write, Some(&sa), 0);
-        let _ = LocalFree(HLOCAL(sd.0));
-        result?;
-    }
-    Ok((read, write))
-}
-
-/// `CreatePipe`の`bInheritHandle=TRUE`は両端を継承可能にする。子へ渡さない側（親が保持し続ける側）
-/// を継承不可へ戻さないと、子が「自分のstdin書込端」等の余分な複製を継承してしまい、
-/// 親が自分側のハンドルを閉じてもパイプがEOFにならず子が永久にブロックする
-/// （MSDN「Creating a Child Process with Redirected Input and Output」記載の既知の落とし穴。
-/// 実機でこれによる子プロセスのハングを確認した）。
-fn clear_inherit(handle: HANDLE) {
-    unsafe {
-        let _ = windows::Win32::Foundation::SetHandleInformation(
-            handle,
-            windows::Win32::Foundation::HANDLE_FLAG_INHERIT.0,
-            windows::Win32::Foundation::HANDLE_FLAGS(0),
-        );
-    }
-}
-
-/// 環境変数をCreateProcessAsUserW用のnull区切り環境ブロック（UTF-16、末尾ダブルNUL）へ変換する。
-fn build_env_block(env: &[(String, String)]) -> Vec<u16> {
-    let mut entries: Vec<&(String, String)> = env.iter().collect();
-    entries.sort_by_key(|a| a.0.to_ascii_uppercase());
-    let mut block: Vec<u16> = Vec::new();
-    for (k, v) in entries {
-        block.extend(format!("{k}={v}").encode_utf16());
-        block.push(0);
-    }
-    block.push(0);
-    block
+    Ok(create_pipe_with_sddl("S:(ML;;NW;;;LW)")?)
 }
 
 fn build_restricted_token() -> Result<HANDLE, RestrictedError> {
@@ -316,7 +229,7 @@ fn build_restricted_token() -> Result<HANDLE, RestrictedError> {
         // 要求しない「自トークン由来の制限トークン」特例は、`OpenProcessToken`で得たプライマリ
         // トークンへ直接`CreateRestrictedToken`を適用した場合にのみ成立する。間に
         // `DuplicateTokenEx`を挟むとこの由来が切れ、通常の特権チェックが働いて
-        // `ERROR_PRIVILEGE_NOT_HELD`になる（実機で確認済み）。
+        // `ERROR_PRIVILEGE_NOT_HELD`になる（実機で確認済み、BUG-003参照）。
         let mut restricted_token = HANDLE::default();
         CreateRestrictedToken(
             process_token,
@@ -350,22 +263,6 @@ fn build_restricted_token() -> Result<HANDLE, RestrictedError> {
         result?;
 
         Ok(restricted_token)
-    }
-}
-
-/// Job Objectを作る（kill-on-close、breakawayは許可フラグを立てないため既定拒否）。
-fn create_job_object() -> Result<HANDLE, RestrictedError> {
-    unsafe {
-        let job = CreateJobObjectW(None, PCWSTR::null())?;
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        windows::Win32::System::JobObjects::SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const _,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )?;
-        Ok(job)
     }
 }
 
