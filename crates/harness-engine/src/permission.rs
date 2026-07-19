@@ -133,6 +133,17 @@ impl PermissionArbiter {
         if tool == "run_shell" && looks_like_allowlist_bypass(arg_repr) {
             return Classification::Prompt;
         }
+        // D-05（`plans/DESIGN-SANDBOX.md` §7）: 設定注入パス（`.git/config`・
+        // `.harness/**`等）へのwrite_file/edit_fileはmode/allowlistに関わらず常に拒否する
+        // （層3 hard-deny、Tier1/Tier2内でも解除しない。T-07/T-08対策）。allowlist一致・
+        // AcceptAllより前に評価する（T-09と同じ「強制」パターン）。run_shellは対象外
+        // （arg_reprがコマンド行のため誤爆する。D-06のgitハードニング+overlay apply時の
+        // 再チェックが担当）。
+        if (tool == "write_file" || tool == "edit_file")
+            && harness_core::is_config_injection_path(arg_repr)
+        {
+            return Classification::Deny;
+        }
         if self.mode == PermissionMode::AcceptAll {
             return Classification::Allow;
         }
@@ -375,6 +386,93 @@ mod tests {
         // 検出は`run_shell`限定。他ツールの引数にたまたま同じ文字列が現れても無関係。
         assert_eq!(
             arbiter.classify("write_file", RiskClass::Write, "notes/-EncodedCommand.md"),
+            Classification::Allow
+        );
+    }
+
+    #[test]
+    fn config_injection_path_denied_even_under_accept_all() {
+        let arbiter = PermissionArbiter::new(
+            PermissionMode::AcceptAll,
+            vec![AllowlistRule::new("write_file", "*")],
+        );
+        assert_eq!(
+            arbiter.classify("write_file", RiskClass::Write, ".git/config"),
+            Classification::Deny
+        );
+    }
+
+    #[test]
+    fn config_injection_path_denied_even_if_allowlisted() {
+        let arbiter = PermissionArbiter::new(
+            PermissionMode::Default,
+            vec![
+                AllowlistRule::new("write_file", "*"),
+                AllowlistRule::new("edit_file", "*"),
+            ],
+        );
+        assert_eq!(
+            arbiter.classify("write_file", RiskClass::Write, ".harness/settings.json"),
+            Classification::Deny
+        );
+        assert_eq!(
+            arbiter.classify("edit_file", RiskClass::Write, ".gitattributes"),
+            Classification::Deny
+        );
+    }
+
+    #[test]
+    fn config_injection_check_covers_all_d05_paths() {
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![]);
+        for p in [
+            ".git/config",
+            ".git/hooks/pre-commit",
+            ".git/info/exclude",
+            ".gitattributes",
+            ".harness/settings.json",
+            ".github/workflows/ci.yml",
+            ".gitlab-ci.yml",
+            ".circleci/config.yml",
+            ".vscode/settings.json",
+            ".devcontainer/devcontainer.json",
+        ] {
+            assert_eq!(
+                arbiter.classify("write_file", RiskClass::Write, p),
+                Classification::Deny,
+                "expected deny for {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_workspace_file_unaffected_by_config_injection_check() {
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![]);
+        assert_eq!(
+            arbiter.classify("write_file", RiskClass::Write, "src/main.rs"),
+            Classification::Allow
+        );
+        // 似た名前だが対象外のパス（誤検知しないことの確認）。
+        assert_eq!(
+            arbiter.classify(
+                "write_file",
+                RiskClass::Write,
+                ".gitattributes-backup.txt"
+            ),
+            Classification::Allow
+        );
+    }
+
+    #[test]
+    fn config_injection_check_does_not_affect_run_shell() {
+        // run_shell経由の設定書換（T-07）は本チェックの対象外。D-06（gitハードニング）+
+        // D-09（overlay apply時の再チェック）が担当する。ここではrun_shellの引数
+        // （コマンド文字列）が誤検知でDenyにならないことだけ確認する。
+        let arbiter = PermissionArbiter::new(
+            PermissionMode::AcceptAll,
+            vec![AllowlistRule::new("run_shell", "*")],
+        );
+        assert_eq!(
+            arbiter.classify("run_shell", RiskClass::Exec, "cat .git/config"),
             Classification::Allow
         );
     }

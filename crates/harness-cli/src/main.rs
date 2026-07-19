@@ -406,6 +406,7 @@ struct ApplyReportJson {
     applied: Vec<String>,
     conflicts: Vec<String>,
     ext_blocked: Vec<String>,
+    hard_denied: Vec<String>,
 }
 
 /// `apply`/`changes`/`discard`サブコマンドを処理する。プロバイダ資格情報を一切必要としない
@@ -479,13 +480,18 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let has_conflicts_or_blocked = !report.conflicts.is_empty() || !report.ext_blocked.is_empty();
+            // hard_deniedもconflicts/ext_blocked同様「apply未完了、要注意」の一種として
+            // 非ゼロ終了コードに含める（D-05: 設定注入パスは絶対に解除しない）。
+            let has_conflicts_or_blocked = !report.conflicts.is_empty()
+                || !report.ext_blocked.is_empty()
+                || !report.hard_denied.is_empty();
             match output_format_and_kind.unwrap_or_default() {
                 OutputFormat::Json => {
                     let json = ApplyReportJson {
                         applied: report.applied,
                         conflicts: report.conflicts,
                         ext_blocked: report.ext_blocked,
+                        hard_denied: report.hard_denied,
                     };
                     if let Ok(s) = serde_json::to_string(&json) {
                         println!("{s}");
@@ -500,6 +506,9 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                     }
                     for p in &report.ext_blocked {
                         println!("blocked (out-of-workspace, needs --dangerously-allow): {p}");
+                    }
+                    for p in &report.hard_denied {
+                        println!("hard-denied (config-injection path, D-05): {p}");
                     }
                 }
             }
@@ -710,6 +719,14 @@ async fn main() -> ExitCode {
                 .downgraded_from
                 .map(|t| t.label())
                 .unwrap_or("?")
+        );
+    }
+    if shell_tier.tier == harness_core::ShellTier::Tier1b {
+        eprintln!(
+            "note: shell isolation tier is tier1b (Windows default); this does not protect \
+             against reading confidential files outside the workspace or outbound network \
+             exfiltration from run_shell child processes (plans/DESIGN-SANDBOX.md §9-1). \
+             Use --require-sandbox=confidential (with --experimental-tier1a) if this matters."
         );
     }
 

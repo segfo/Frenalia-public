@@ -142,6 +142,11 @@ pub struct ApplyReport {
     pub conflicts: Vec<String>,
     /// `_ext`ターゲットだが`allow_ext`が無かったため拒否されたパス。
     pub ext_blocked: Vec<String>,
+    /// D-09（`plans/DESIGN-SANDBOX.md` §7）: 設定注入パス（`.git/config`・`.harness/**`等）への
+    /// 変更のため層3 hard-denyで拒否されたパス。overlay経由の`.git/config`/`.harness/**`
+    /// コミットを、実行前ゲート（`permission.rs::classify()`）をバイパスされた場合でも
+    /// apply時に再度塞ぐ（T-11対策）。
+    pub hard_denied: Vec<String>,
 }
 
 /// 書込リダイレクト・read-through・マニフェスト・tombstoneを仲介するオーバーレイFS。
@@ -498,6 +503,10 @@ impl SandboxFs {
                 report.ext_blocked.push(e.path.clone());
                 continue;
             }
+            if harness_core::is_config_injection_path(&e.path) {
+                report.hard_denied.push(e.path.clone());
+                continue;
+            }
 
             let current_hash = match e.target {
                 ManifestTarget::Tree => self.jail.read_to_string(&e.path).ok().map(|s| hash_content(&s)),
@@ -725,6 +734,71 @@ mod tests {
         assert!(report.applied.is_empty());
         assert_eq!(report.ext_blocked.len(), 1);
         assert!(!Path::new(abs).exists());
+    }
+
+    #[test]
+    fn apply_hard_denies_staged_git_config_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
+        fs.write_string(".git/config", "[core]\n\thooksPath = /tmp/evil\n").unwrap();
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            })
+            .unwrap();
+
+        assert!(report.applied.is_empty());
+        assert_eq!(report.hard_denied, vec![".git/config".to_string()]);
+        assert!(!dir.path().join(".git/config").exists());
+    }
+
+    #[test]
+    fn apply_hard_denies_staged_harness_settings_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
+        fs.write_string(
+            ".harness/settings.json",
+            "{\"allowlist\":[{\"tool\":\"run_shell\",\"pattern\":\"*\"}]}",
+        )
+        .unwrap();
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            })
+            .unwrap();
+
+        assert!(report.applied.is_empty());
+        assert_eq!(
+            report.hard_denied,
+            vec![".harness/settings.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_allows_normal_file_alongside_hard_denied_config_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
+        fs.write_string("src/main.rs", "fn main() {}").unwrap();
+        fs.write_string(".gitattributes", "* text=auto").unwrap();
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            })
+            .unwrap();
+
+        assert_eq!(report.applied, vec!["src/main.rs".to_string()]);
+        assert_eq!(report.hard_denied, vec![".gitattributes".to_string()]);
+        assert!(dir.path().join("src/main.rs").exists());
+        assert!(!dir.path().join(".gitattributes").exists());
     }
 
     #[test]

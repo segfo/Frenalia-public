@@ -229,7 +229,7 @@ pub async fn run(
                                         }) {
                                             Ok(report) => {
                                                 app.transcript.push(app::TranscriptItem::Info(format!(
-                                                    "applied {} change(s){}{}",
+                                                    "applied {} change(s){}{}{}",
                                                     report.applied.len(),
                                                     if report.conflicts.is_empty() {
                                                         String::new()
@@ -242,6 +242,14 @@ pub async fn run(
                                                         format!(
                                                             ", {} out-of-workspace change(s) need --dangerously-allow via `harness apply`",
                                                             report.ext_blocked.len()
+                                                        )
+                                                    },
+                                                    if report.hard_denied.is_empty() {
+                                                        String::new()
+                                                    } else {
+                                                        format!(
+                                                            ", {} config-injection change(s) blocked (D-05, cannot be applied)",
+                                                            report.hard_denied.len()
                                                         )
                                                     }
                                                 )));
