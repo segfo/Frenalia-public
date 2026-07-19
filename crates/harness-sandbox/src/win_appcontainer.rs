@@ -523,9 +523,6 @@ pub fn spawn(
     })
 }
 
-/// smokeテスト: 軽量コマンドを実際にAppContainerから起動できるかだけを確認する
-/// （workspaceへの実書込は行わず、失敗ノイズを最小限にする）。システム外シェルバイナリが
-/// `ALL APPLICATION PACKAGES`へのRX権を持たない場合の既知の落とし穴がここで発覚し得る。
 /// Tier1a（AppContainer）で使うシェルの実行ファイルパスとラベルを解決する。
 /// **ストアアプリの実行エイリアス（`WindowsApps`配下の0バイトreparse point）は
 /// AppContainerから解決できず`CreateProcessW`が`ERROR_INVALID_PARAMETER`で失敗する**ため、
@@ -546,25 +543,60 @@ pub fn resolve_shell() -> (String, &'static str) {
     )
 }
 
-fn smoke_test_spawn(sid: PSID, workspace_root: &Path) -> Result<(), AppContainerError> {
+/// FS I/Oプローブ失敗を表す固有の終了コード（`spawn`自体の失敗や、シェル解決の失敗と
+/// 区別するためのマーカー。`smoke_test_spawn`と`preflight`の理由文字列組立の両方で使う）。
+const FS_PROBE_DENIED_EXIT_CODE: i32 = 3;
+
+/// `probe_dir`（preflightが事前に作成・ACL付与済みのワークスペース内一時ディレクトリ）へ
+/// 実際に一時ファイルを作成・読取・削除するPowerShellコマンド。`exit 0`だけを試す旧実装は
+/// FileSystemプロバイダの初期化失敗があってもプロセス自体は正常終了してしまい偽陽性となる
+/// （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3参照）ため、実FS I/Oまで
+/// 一括で試し、成否を終了コードに反映させる。
+const FS_IO_PROBE_COMMAND: &str = "\
+    $ErrorActionPreference = 'Stop'; \
+    try { \
+        $p = Join-Path $env:HARNESS_PROBE_DIR ([Guid]::NewGuid().ToString() + '.tmp'); \
+        New-Item -ItemType File -Path $p -Force | Out-Null; \
+        Get-Content -LiteralPath $p | Out-Null; \
+        Remove-Item -LiteralPath $p -Force; \
+        exit 0 \
+    } catch { \
+        exit 3 \
+    }";
+
+fn smoke_test_spawn(sid: PSID, workspace_root: &Path, probe_dir: &Path) -> Result<(), AppContainerError> {
     // 本番run_shellと同じシェル解決を使い、そのシェルがゼロcapabilityのAppContainer内で
-    // 実際に起動・終了できることを確認する（エイリアス回避は`resolve_shell`の責務）。
+    // 実際に起動でき、かつワークスペース内のファイルI/Oまで通ることを確認する
+    // （エイリアス回避は`resolve_shell`の責務）。
     let (shell, _) = resolve_shell();
-    let env = crate::secret_env::build_child_env();
+    let mut env = crate::secret_env::build_child_env();
+    env.push((
+        "HARNESS_PROBE_DIR".to_string(),
+        probe_dir.to_string_lossy().into_owned(),
+    ));
     let child = spawn(
         &shell,
-        &["-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+        &["-NoProfile", "-NonInteractive", "-Command", FS_IO_PROBE_COMMAND],
         workspace_root,
         &env,
         false,
         sid,
-    )?;
+    )
+    .map_err(|e| AppContainerError::Preflight(format!("shell could not start: {e}")))?;
     let (_, _, code) = child
         .write_stdin_read_output_and_wait(None)
-        .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
+        .map_err(|e| AppContainerError::Preflight(format!("shell could not start: {e}")))?;
+    if code == FS_PROBE_DENIED_EXIT_CODE {
+        return Err(AppContainerError::Preflight(
+            "workspace FS I/O denied inside AppContainer (likely missing traverse ACE on \
+             drive root; non-admin cannot grant; see \
+             docs/phases/foundation/M12-shell-isolation-tiers.md 追記2/3)"
+                .to_string(),
+        ));
+    }
     if code != 0 {
         return Err(AppContainerError::Preflight(format!(
-            "smoke test command exited with code {code}"
+            "smoke test command exited with unexpected code {code}"
         )));
     }
     Ok(())
@@ -582,6 +614,228 @@ pub fn preflight(workspace_root: &Path) -> Result<(), AppContainerError> {
         .join("sandbox")
         .join("tier1a-tmp");
     std::fs::create_dir_all(&tmp_dir).map_err(|e| AppContainerError::Preflight(e.to_string()))?;
-    smoke_test_spawn(sid.as_psid(), workspace_root)?;
+    smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir)?;
     Ok(())
+}
+
+/// `path`のDACLから、`sid`（trustee）に対する既存ACEを全て取り除く（`REVOKE_ACCESS`）。
+/// `TIER1A-OPEN-ISSUES.md`課題1のプロファイルtraverse実験（Experiment B）で、実プロファイルへ
+/// 付与した一時ACEを実験後に必ず原状復帰させるための後始末専用ヘルパ。`grant_ace_mask`と対に
+/// なるが、恒久機能（`preflight`/`spawn`等）からは呼ばれない診断専用コード。
+#[cfg(all(windows, test))]
+fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    use windows::Win32::Security::Authorization::REVOKE_ACCESS;
+
+    let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    };
+    unsafe {
+        let path_w = wide(&path.to_string_lossy());
+        let mut existing_dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing_dacl),
+            None,
+            &mut sd,
+        )
+        .ok()
+        .map_err(to_err)?;
+
+        let mut trustee = TRUSTEE_W::default();
+        BuildTrusteeWithSidW(&mut trustee, sid);
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: 0,
+            grfAccessMode: REVOKE_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: trustee,
+        };
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let entries_result =
+            SetEntriesInAclW(Some(&[ea]), Some(existing_dacl as *const _), &mut new_dacl).ok();
+        if let Err(e) = entries_result {
+            let _ = LocalFree(HLOCAL(sd.0));
+            return Err(to_err(e));
+        }
+
+        let set_result = SetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_dacl as *const _),
+            None,
+        )
+        .ok();
+
+        let _ = LocalFree(HLOCAL(new_dacl as *mut _));
+        let _ = LocalFree(HLOCAL(sd.0));
+        set_result.map_err(to_err)?;
+    }
+    Ok(())
+}
+
+/// `TIER1A-OPEN-ISSUES.md`課題1（traverse問題の検証プラン）の診断テスト群。
+///
+/// いずれも`#[ignore]`（実Win32・実AppContainer・実FS ACL変更を伴う重い/副作用ありの処理のため
+/// 通常の`cargo test`では走らない）。`cargo test -p harness-sandbox -- --ignored <test名>`で
+/// 個別に実行する。エージェントループ全体を起動せず数秒でイテレーションできる、
+/// `docs/phases/foundation/M12-shell-isolation-tiers.md`「追記2 Phase 1」の高速反復ループ本体。
+///
+/// 実FS I/Oを試みるPowerShellコマンド。本番の`smoke_test_spawn`（`FS_IO_PROBE_COMMAND`、
+/// 単一ファイルの作成→読取→削除を終了コードでのみ判定する軽量版）より詳しい観測用で、
+/// FileSystemプロバイダ初期化の成否・`Get-ChildItem`/`New-Item`の成否・ドライブ可視性まで
+/// stdout全文で一括観測する（`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3の
+/// 「本番プローブと診断プローブの判定一致確認」で、この2つが同じ機種で同じ合否になることを
+/// `parity_production_probe_matches_diagnostic_probe`で突き合わせる）。
+#[cfg(all(windows, test))]
+mod traverse_diagnostics {
+    use super::*;
+
+    const PROBE_COMMAND: &str = "\
+        Set-Location -LiteralPath $env:HARNESS_PROBE_DIR; \
+        Write-Output ('CWD=' + (Get-Location).Path); \
+        Get-ChildItem | Out-String -Width 200 | Write-Output; \
+        New-Item -ItemType File -Path 'probe.txt' -Force | Out-String -Width 200 | Write-Output; \
+        Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | Out-String -Width 200 | Write-Output; \
+        Get-Volume -ErrorAction SilentlyContinue | Out-String -Width 200 | Write-Output";
+
+    /// `dir`をcwdにしてPROBE_COMMANDを実行し、stdout/stderr全文とexit codeをそのまま
+    /// 標準出力へ焼き付ける（procmon/AccessChkでの裏取りと突き合わせられるよう、テスト自身は
+    /// 成否をアサートしない。観測が目的であり合否判定はここでは行わない）。
+    fn run_probe(sid: PSID, dir: &Path) {
+        let (shell, label) = resolve_shell();
+        println!("=== probe: shell={shell} ({label}), dir={} ===", dir.display());
+        let mut env = crate::secret_env::build_child_env();
+        env.push((
+            "HARNESS_PROBE_DIR".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ));
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", PROBE_COMMAND],
+            dir,
+            &env,
+            false,
+            sid,
+        )
+        .expect("spawn should succeed even if the shell command itself fails inside");
+        let (out, err, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("pipe I/O should not fail");
+        println!("--- exit code: {code} ---");
+        println!("--- stdout ---\n{out}");
+        println!("--- stderr ---\n{err}");
+    }
+
+    /// PowerShellのFileSystemプロバイダ固有の挙動（`InitializeDefaultDrives`が全ドライブ列挙を
+    /// 試みる）と、NTFSのtraverse-checking自体（シェルに依存しない、`CreateFileW`レベルの
+    /// ACCESS_DENIED）を切り分けるための、cmd.exe版プローブ。`resolve_shell`はTier1a本番と
+    /// 同じPowerShell解決を返すためここでは使わず、cmd.exeを直接指定する。
+    fn run_probe_cmd(sid: PSID, dir: &Path) {
+        let system_root =
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let cmd_exe = format!("{system_root}\\System32\\cmd.exe");
+        println!("=== probe(cmd.exe): dir={} ===", dir.display());
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(&cmd_exe, &["/d", "/c", "dir"], dir, &env, false, sid)
+        .expect("spawn should succeed even if the shell command itself fails inside");
+        let (out, err, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("pipe I/O should not fail");
+        println!("--- exit code: {code} ---");
+        println!("--- stdout ---\n{out}");
+        println!("--- stderr ---\n{err}");
+    }
+
+    /// Experiment A: 中立ロケーション対照実験（非侵襲）。
+    /// `C:\ProgramData\harness-sandbox-diag\<pid>`（プロファイル外）へpackage SIDのACEを付与し、
+    /// そこでのみプローブを走らせる。ユーザープロファイルのACLには一切触れない。
+    #[test]
+    #[ignore]
+    fn experiment_a_neutral_location() {
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let dir = std::path::PathBuf::from(format!(
+            "C:\\ProgramData\\harness-sandbox-diag\\{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create neutral dir");
+        grant_ace_recursive(&dir, sid.as_psid()).expect("grant_ace_recursive on neutral dir");
+        run_probe(sid.as_psid(), &dir);
+        run_probe_cmd(sid.as_psid(), &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Experiment B: プロファイルtraverse実験（Aで原因が割れなかった場合のみ手動で
+    /// `--ignored`指定して実行する。既定のワークスペースの祖先である`C:\Users\<user>`へ
+    /// 単一・非継承`FILE_TRAVERSE`を付与し、プローブ後に必ず`revoke_ace`で原状復帰する）。
+    /// `HARNESS_PROBE_WORKSPACE`環境変数で実ワークスペースパスを渡す運用とし、既定では
+    /// 何もしないダミーガードのみ置く（誤って自動実行されないようにする安全弁）。
+    #[test]
+    #[ignore]
+    fn experiment_b_profile_traverse() {
+        let Ok(workspace) = std::env::var("HARNESS_PROBE_WORKSPACE") else {
+            eprintln!(
+                "skipped: set HARNESS_PROBE_WORKSPACE to the real workspace path to run this experiment"
+            );
+            return;
+        };
+        let workspace = std::path::PathBuf::from(workspace);
+        let ancestor = dirs_home().expect("resolve profile home (%USERPROFILE%)");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        grant_ace_mask(
+            &ancestor,
+            sid.as_psid(),
+            windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0,
+            NO_INHERITANCE,
+        )
+        .expect("grant single-ACE FILE_TRAVERSE on profile ancestor");
+
+        run_probe(sid.as_psid(), &workspace);
+
+        revoke_ace(&ancestor, sid.as_psid()).expect("revert: revoke_ace on profile ancestor must not fail silently");
+    }
+
+    fn dirs_home() -> Option<std::path::PathBuf> {
+        std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from)
+    }
+
+    /// 未解決事項2: 本番`smoke_test_spawn`（軽量・終了コードのみ判定）と、この診断モジュールの
+    /// `run_probe`（詳細・stdout全文を観測するリッチ版）が、この機種で**同じ合否判定**になる
+    /// ことを突き合わせる。両者が食い違う場合、本番プローブの判定精度に疑いが生じるため、
+    /// `preflight`をこのままTier1b自動降格の唯一の判断根拠として使ってよいかを再検討する必要が
+    /// ある（`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3参照）。
+    #[test]
+    #[ignore]
+    fn parity_production_probe_matches_diagnostic_probe() {
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let dir = std::path::PathBuf::from(format!(
+            "C:\\ProgramData\\harness-sandbox-diag\\{}-parity",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create neutral dir");
+        grant_ace_recursive(&dir, sid.as_psid()).expect("grant_ace_recursive on neutral dir");
+
+        let production_result = smoke_test_spawn(sid.as_psid(), &dir, &dir);
+        println!("=== production probe (smoke_test_spawn) result: {production_result:?} ===");
+
+        run_probe(sid.as_psid(), &dir);
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            production_result.is_err(),
+            "on this machine (no traverse ACE on drive root, non-admin), the production FS I/O \
+             probe is expected to fail just like the diagnostic probe above; if it now succeeds \
+             the drive-root traverse constraint may have changed and this assertion (and the \
+             M12 追記3 findings) should be revisited"
+        );
+    }
 }

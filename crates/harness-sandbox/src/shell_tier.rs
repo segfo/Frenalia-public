@@ -251,6 +251,24 @@ mod tests {
         assert_eq!(selection.tier, ShellTier::Tier1a);
     }
 
+    /// 未解決事項2 決定5の回帰テスト: FSプローブ失敗（この機種のtraverse ACE欠如を模す）で
+    /// Tier1aがTier1bへ丸ごと降格すると、`confidential`はTier1bを満たさないため、黙って
+    /// Tier1bで起動するのではなく`TierError`で起動前に拒否されなければならない
+    /// （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3参照）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_opt_in_tier1a_with_failed_preflight_rejects_confidential() {
+        let probes = Probes {
+            tier1a_preflight_override: Some(Err(
+                "workspace FS I/O denied inside AppContainer".to_string(),
+            )),
+            ..Default::default()
+        };
+        let err = select_tier_with_probes(RequireSandbox::Confidential, &empty_root(), true, &probes)
+            .unwrap_err();
+        assert!(matches!(err, TierError::Insufficient { .. }));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_selects_tier2_when_bwrap_present_and_userns_enabled() {
