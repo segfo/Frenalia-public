@@ -6,6 +6,7 @@ members = [
     "crates/harness-providers",
     "crates/harness-tools",
     "crates/harness-sandbox",
+    "crates/harness-privhelper",
     "crates/harness-engine",
     "crates/harness-tui",
     "crates/harness-cli",

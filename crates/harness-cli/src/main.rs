@@ -106,6 +106,35 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
     },
+    /// fs passthrough allowlist（軸2・D-13）の台帳保守サブコマンド。
+    /// `--fs-allow`実行時フラグとは独立の、ユーザグローバル台帳を操作する副コマンド
+    /// （`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺、`TIER1A-OPEN-ISSUES.md`項目4）。
+    Fs {
+        #[command(subcommand)]
+        action: FsAction,
+    },
+}
+
+/// `harness fs`サブコマンドの各操作。Windows Tier1a固有機能のため、Windows以外では
+/// `List`以外はエラーで終了する（台帳自体はクロスプラットフォームのJSONだが、実際のACE
+/// 付与・撤収はWin32のSID/ACLに依存するため）。
+#[derive(Subcommand)]
+enum FsAction {
+    /// fs passthrough台帳（ユーザグローバル、D5）を一覧表示する。
+    List,
+    /// 指定ルートのfs passthroughを撤収する（再walk revoke + 検証パス + 台帳から除去、D3/D4）。
+    Revoke { path: PathBuf },
+    /// 台帳の全エントリを撤収する。
+    RevokeAll,
+    /// ドライブルート（例`C:\`）へ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を付与する（D10）。
+    /// `WRITE_DAC`が要るため管理者実行時のみ成功する（非管理者は失敗し再実行を促す）。
+    /// 付与に成功すると、撤収用の別台帳（traverse台帳）に記録される。
+    GrantTraverse { drive: PathBuf },
+    /// `grant-traverse`で付与したtraverse ACEを1件撤収する（非再帰・単一ノード、D10の巻き戻し）。
+    RevokeTraverse { path: PathBuf },
+    /// traverse台帳の全エントリを撤収する。`grant-traverse`で付与した箇所を手打ちで覚える
+    /// 必要がなく、記録済みの箇所だけを自動で対象にする。
+    RevokeTraverseAll,
 }
 
 #[derive(Parser)]
@@ -234,6 +263,16 @@ struct Cli {
     /// 全体が継承）。`--require-sandbox=confidential`と同時指定はできない（意味的に矛盾、起動拒否）。
     #[arg(long = "net-allow-app")]
     net_allow_app: Vec<String>,
+
+    /// fs passthrough allowlist（軸2・D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺）の
+    /// 追加ルートを指定する（繰り返し指定可、`<path>[:rw]`形式）。省略時（末尾`:rw`無し）は
+    /// read-only、`:rw`指定時は書込も許可する（D-13「read-onlyを既定とする」）。
+    /// `.harness/settings.json`の`fs.allow`と合算する（和集合）。Tier1a（AppContainer）でのみ
+    /// 効く: 指定ルートへpackage SIDの許可ACEを付与し、到達性をプローブする（D8）。
+    /// `--require-sandbox`との組合せはD7参照（write-containmentは`:rw`のみ拒否、confidentialは
+    /// `:ro`/`:rw`いずれも拒否）。
+    #[arg(long = "fs-allow")]
+    fs_allow: Vec<String>,
 }
 
 /// `--require-sandbox[=confidential]`の文字列表現を`RequireSandbox`へ変換する
@@ -433,6 +472,10 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
         Commands::Changes { session, output_format } => (session.clone(), Some(*output_format)),
         Commands::Apply { session, output_format, .. } => (session.clone(), Some(*output_format)),
         Commands::Discard { session } => (session.clone(), None),
+        // `Fs`はmain()側で`run_fs_subcommand`へ振り分け済みで、ここには到達しない
+        // （workspace sandboxのstaging設定を一切必要としないため、`SandboxFs`を開く
+        // このパスとは責務が別）。
+        Commands::Fs { .. } => unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand"),
     };
 
     let Some(sandbox_dir) = resolve_sandbox_dir(workspace_root, session.as_deref()) else {
@@ -545,11 +588,461 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Commands::Fs { .. } => unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand"),
     }
+}
+
+/// fs passthrough台帳（D5、ユーザグローバル、`directories`設定ディレクトリ配下）の1エントリ。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FsLedgerEntry {
+    path: String,
+    writable: bool,
+    granted_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct FsLedger {
+    entries: Vec<FsLedgerEntry>,
+}
+
+/// traverse台帳（D10の巻き戻し用、`fs-passthrough-ledger.json`とは別ファイル）の1エントリ。
+/// `grant-traverse`は`writable`という概念を持たない（付与するアクセス権は常に
+/// `FILE_TRAVERSE | FILE_READ_ATTRIBUTES`固定）ため、`FsLedgerEntry`とは別の小さな型にする。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TraverseLedgerEntry {
+    path: String,
+    granted_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct TraverseLedger {
+    entries: Vec<TraverseLedgerEntry>,
+}
+
+/// 台帳ファイルのパス（`%APPDATA%\harness\fs-passthrough-ledger.json`相当、`harness-config`の
+/// `user_settings_path`と同じ土台）。横断的な穴を1台帳に集約し、どのプロジェクトからでも
+/// 全撤収できるようにする（D5）。
+fn fs_ledger_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "harness")
+        .map(|d| d.config_dir().join("fs-passthrough-ledger.json"))
+}
+
+/// traverse台帳ファイルのパス。`fs-passthrough-ledger.json`と意味が異なる記録
+/// （ドライブルート/祖先ディレクトリへのtraverse付与）を混在させないため、別ファイルにする。
+fn traverse_ledger_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "harness")
+        .map(|d| d.config_dir().join("traverse-grant-ledger.json"))
+}
+
+/// 台帳が存在しない/読めない/パースできない場合は空扱い（`harness-config`の設定読み込みと
+/// 同じfail-open方針、起動を止めない）。
+fn load_fs_ledger() -> FsLedger {
+    let Some(path) = fs_ledger_path() else {
+        return FsLedger::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => FsLedger::default(),
+    }
+}
+
+fn load_traverse_ledger() -> TraverseLedger {
+    let Some(path) = traverse_ledger_path() else {
+        return TraverseLedger::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => TraverseLedger::default(),
+    }
+}
+
+/// 台帳ファイルへの書込を、誤削除防止の2層（read-only属性＋`.bak`バックアップ）を通して行う
+/// 共通ヘルパ。エージェント（コーディングツール）による無関係な一括クリーンアップの巻き込みで
+/// 台帳が消えると、実際に付与済みのACE（`C:\`等の実システム変更）を追跡する手段が失われ、
+/// 「付けたはずだが記録が無い」孤立した穴が残ってしまうため、次の2つを行う。
+/// 1. 上書き前に既存ファイルのread-onlyを解除し、`.bak`へコピーしておく（万一の復元用）。
+/// 2. 書込後にread-only属性を付与する（`-Force`無しの素の`rm`/`Remove-Item`による削除を防ぐ。
+///    確信犯的な`-Force`削除までは防げない、という限界を持つ多層防御の1枚）。
+fn write_ledger_file(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if path.exists() {
+        set_file_readonly(path, false);
+        let backup_path = path.with_extension("json.bak");
+        let _ = std::fs::copy(path, &backup_path);
+    }
+    if std::fs::write(path, contents).is_ok() {
+        set_file_readonly(path, true);
+    }
+}
+
+/// `path`のread-only属性を切り替える（Windowsの`attrib +R`/`-R`相当）。誤削除防止の一環
+/// （`write_ledger_file`参照）。非Windowsでは`set_readonly`の意味論が異なり
+/// （chmodのworld-writable相当になり得る）有効な防御にならないため何もしない
+/// （`readonly`がリテラル`false`でないためclippyの`permissions_set_readonly_false`は
+/// 誤検知しないが、cfg分岐でも意図を明確にする）。
+#[cfg(windows)]
+fn set_file_readonly(path: &Path, readonly: bool) {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut perms = metadata.permissions();
+        perms.set_readonly(readonly);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_file_readonly(_path: &Path, _readonly: bool) {}
+
+fn save_fs_ledger(ledger: &FsLedger) {
+    let Some(path) = fs_ledger_path() else {
+        return;
+    };
+    if let Ok(s) = serde_json::to_string_pretty(ledger) {
+        write_ledger_file(&path, &s);
+    }
+}
+
+fn save_traverse_ledger(ledger: &TraverseLedger) {
+    let Some(path) = traverse_ledger_path() else {
+        return;
+    };
+    if let Ok(s) = serde_json::to_string_pretty(ledger) {
+        write_ledger_file(&path, &s);
+    }
+}
+
+/// `--fs-allow`でTier1a preflightが実際にACE付与を試みたルートを台帳へ記録する（D2/D3）。
+/// 同一パスは上書き（冪等）。ACE自体は「付けっぱなし」（D2）だが、台帳があるので後から
+/// `harness fs revoke`/`revoke-all`で一括撤収できる。
+fn record_fs_passthrough_grant(path: &Path, writable: bool) {
+    let mut ledger = load_fs_ledger();
+    let path_str = path.to_string_lossy().into_owned();
+    let granted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(entry) = ledger.entries.iter_mut().find(|e| e.path == path_str) {
+        entry.writable = writable;
+        entry.granted_at_unix_secs = granted_at;
+    } else {
+        ledger.entries.push(FsLedgerEntry {
+            path: path_str,
+            writable,
+            granted_at_unix_secs: granted_at,
+        });
+    }
+    save_fs_ledger(&ledger);
+}
+
+fn remove_fs_passthrough_grant(path: &Path) {
+    let mut ledger = load_fs_ledger();
+    let path_str = path.to_string_lossy().into_owned();
+    ledger.entries.retain(|e| e.path != path_str);
+    save_fs_ledger(&ledger);
+}
+
+/// `grant-traverse`が実際にACE付与を試みたパスをtraverse台帳へ記録する（D10の巻き戻し用）。
+/// `record_fs_passthrough_grant`と同じ冪等upsert。
+fn record_traverse_grant(path: &Path) {
+    let mut ledger = load_traverse_ledger();
+    let path_str = path.to_string_lossy().into_owned();
+    let granted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(entry) = ledger.entries.iter_mut().find(|e| e.path == path_str) {
+        entry.granted_at_unix_secs = granted_at;
+    } else {
+        ledger.entries.push(TraverseLedgerEntry {
+            path: path_str,
+            granted_at_unix_secs: granted_at,
+        });
+    }
+    save_traverse_ledger(&ledger);
+}
+
+fn remove_traverse_grant(path: &Path) {
+    let mut ledger = load_traverse_ledger();
+    let path_str = path.to_string_lossy().into_owned();
+    ledger.entries.retain(|e| e.path != path_str);
+    save_traverse_ledger(&ledger);
+}
+
+/// `harness fs`サブコマンドのディスパッチ（プロバイダ資格情報・workspace sandboxのいずれも
+/// 必要としない、`run_sandbox_subcommand`とは独立のパス）。
+fn run_fs_subcommand(action: FsAction) -> ExitCode {
+    match action {
+        FsAction::List => {
+            let ledger = load_fs_ledger();
+            println!("=== fs passthrough (--fs-allow) ===");
+            if ledger.entries.is_empty() {
+                println!("(none)");
+            }
+            for e in &ledger.entries {
+                println!(
+                    "{}\t{}\tgranted_at_unix={}",
+                    e.path,
+                    if e.writable { "rw" } else { "ro" },
+                    e.granted_at_unix_secs
+                );
+            }
+            let traverse_ledger = load_traverse_ledger();
+            println!("=== traverse grants (grant-traverse) ===");
+            if traverse_ledger.entries.is_empty() {
+                println!("(none)");
+            }
+            for e in &traverse_ledger.entries {
+                println!("{}\tgranted_at_unix={}", e.path, e.granted_at_unix_secs);
+            }
+            ExitCode::SUCCESS
+        }
+        FsAction::Revoke { path } => fs_revoke_one(&path),
+        FsAction::RevokeAll => {
+            let ledger = load_fs_ledger();
+            if ledger.entries.is_empty() {
+                println!("(no fs passthrough entries)");
+                return ExitCode::SUCCESS;
+            }
+            let mut any_failed = false;
+            for entry in ledger.entries.clone() {
+                if fs_revoke_one(&PathBuf::from(&entry.path)) != ExitCode::SUCCESS {
+                    any_failed = true;
+                }
+            }
+            if any_failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        FsAction::GrantTraverse { drive } => fs_grant_traverse(&drive),
+        FsAction::RevokeTraverse { path } => fs_revoke_traverse_one(&path),
+        FsAction::RevokeTraverseAll => {
+            let ledger = load_traverse_ledger();
+            if ledger.entries.is_empty() {
+                println!("(no traverse grants recorded)");
+                return ExitCode::SUCCESS;
+            }
+            let mut any_failed = false;
+            for entry in ledger.entries.clone() {
+                if fs_revoke_traverse_one(&PathBuf::from(&entry.path)) != ExitCode::SUCCESS {
+                    any_failed = true;
+                }
+            }
+            if any_failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+    }
+}
+
+/// 指定パスのfs passthrough ACEを撤収する（D3: 再walk revoke、D4: 剥離後検証パス）。
+/// 成功時のみ台帳から除去する（検証パスが残件を見つけた場合は台帳に残し、次回再試行できる
+/// ようにする）。
+#[cfg(windows)]
+fn fs_revoke_one(path: &Path) -> ExitCode {
+    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
+        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    ) {
+        Ok(sid) => sid,
+        Err(e) => {
+            eprintln!("failed to resolve sandbox SID: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = harness_sandbox::win_appcontainer::revoke_ace_recursive(path, sid.as_psid()) {
+        eprintln!("revoke failed for {}: {e}", path.display());
+        return ExitCode::FAILURE;
+    }
+    match harness_sandbox::win_appcontainer::assert_no_sid_ace_recursive(path, sid.as_psid()) {
+        Ok(()) => {
+            remove_fs_passthrough_grant(path);
+            println!("revoked: {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(remaining) => {
+            eprintln!(
+                "revoke incomplete for {}: {} node(s) still carry the sandbox ACE:",
+                path.display(),
+                remaining.len()
+            );
+            for p in &remaining {
+                eprintln!("  {}", p.display());
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn fs_revoke_one(_path: &Path) -> ExitCode {
+    eprintln!("error: fs passthrough revoke is Windows-only (Tier1a specific)");
+    ExitCode::FAILURE
+}
+
+/// ドライブルートへtraverse ACEを付与する（D10）。`WRITE_DAC`が要るため管理者権限で実行する
+/// 必要がある。本体プロセス自身が既に昇格済み（`is_elevated()`）ならACL操作を直接行うが、
+/// 通常の非管理者起動時は特権分離ヘルパー（D-16、`plans/DESIGN-SANDBOX-PRIVSEP.md` §5）を
+/// `runas`経由で呼び出す（本体プロセス自身は非管理者のまま維持する）。
+#[cfg(windows)]
+fn fs_grant_traverse(drive: &Path) -> ExitCode {
+    if harness_sandbox::privhelper::is_elevated() {
+        return fs_grant_traverse_direct(drive);
+    }
+    match harness_sandbox::privhelper::run_privileged(
+        &harness_sandbox::privhelper::PrivilegedRequest::GrantTraverse {
+            drive: drive.to_path_buf(),
+        },
+    ) {
+        Ok(()) => {
+            record_traverse_grant(drive);
+            println!(
+                "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES on {} via privilege-separation \
+                 helper (UAC, one-time; see docs/phases/foundation/M12-shell-isolation-tiers.md \
+                 追記8, plans/DESIGN-SANDBOX-PRIVSEP.md §5). Recorded in the traverse ledger; \
+                 use `harness fs revoke-traverse {}` or `revoke-traverse-all` to undo",
+                drive.display(),
+                drive.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("grant-traverse failed on {}: {e}", drive.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `fs_grant_traverse`の直接実行部分（本体が既に管理者トークンで動作している場合のみ呼ぶ、
+/// §5.3「本体が管理者ならヘルパー機構を経由しない直接呼び出しを許すが、そもそも本体が
+/// 管理者で起動されたこと自体を警告する」に対応）。
+#[cfg(windows)]
+fn fs_grant_traverse_direct(drive: &Path) -> ExitCode {
+    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
+        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    ) {
+        Ok(sid) => sid,
+        Err(e) => {
+            eprintln!("failed to resolve sandbox SID: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match harness_sandbox::win_appcontainer::grant_traverse_drive_root(drive, sid.as_psid()) {
+        Ok(()) => {
+            record_traverse_grant(drive);
+            println!(
+                "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES on {} (admin, one-time; see \
+                 docs/phases/foundation/M12-shell-isolation-tiers.md 追記8). Recorded in the \
+                 traverse ledger; use `harness fs revoke-traverse {}` or `revoke-traverse-all` \
+                 to undo",
+                drive.display(),
+                drive.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "grant-traverse failed on {}: {e} (this requires WRITE_DAC on the drive root; \
+                 re-run as administrator)",
+                drive.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn fs_grant_traverse(_drive: &Path) -> ExitCode {
+    eprintln!("error: fs grant-traverse is Windows-only (Tier1a specific)");
+    ExitCode::FAILURE
+}
+
+/// 指定パスのtraverse ACEを撤収する（非再帰・単一ノード、D10の巻き戻し）。
+/// `grant_traverse_drive_root`（`grant_ace_mask`による非継承・単一ACE付与）の逆操作なので、
+/// `revoke_ace`（単一ノード）+ `assert_no_sid_ace`（単一ノード検証）を使う。
+/// `revoke_ace_recursive`/`assert_no_sid_ace_recursive`（ツリー全体を再walk）は、`path`が
+/// ドライブルートの場合に不要な全走査を招くため使わない。`fs_grant_traverse`と同じく、
+/// 本体が既に昇格済みなら直接、それ以外は特権分離ヘルパー（D-16）経由で実行する。
+#[cfg(windows)]
+fn fs_revoke_traverse_one(path: &Path) -> ExitCode {
+    if harness_sandbox::privhelper::is_elevated() {
+        return fs_revoke_traverse_one_direct(path);
+    }
+    match harness_sandbox::privhelper::run_privileged(
+        &harness_sandbox::privhelper::PrivilegedRequest::RevokeTraverse {
+            path: path.to_path_buf(),
+        },
+    ) {
+        Ok(()) => {
+            remove_traverse_grant(path);
+            println!(
+                "revoked traverse ACE via privilege-separation helper: {}",
+                path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("revoke-traverse failed for {}: {e}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(windows)]
+fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
+    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
+        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    ) {
+        Ok(sid) => sid,
+        Err(e) => {
+            eprintln!("failed to resolve sandbox SID: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = harness_sandbox::win_appcontainer::revoke_ace(path, sid.as_psid()) {
+        eprintln!("revoke-traverse failed for {}: {e}", path.display());
+        return ExitCode::FAILURE;
+    }
+    match harness_sandbox::win_appcontainer::assert_no_sid_ace(path, sid.as_psid()) {
+        Ok(()) => {
+            remove_traverse_grant(path);
+            println!("revoked traverse ACE: {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("revoke-traverse verification failed for {}: {e}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn fs_revoke_traverse_one(_path: &Path) -> ExitCode {
+    eprintln!("error: fs revoke-traverse is Windows-only (Tier1a specific)");
+    ExitCode::FAILURE
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // 本体プロセスが管理者権限で起動されていないかを確認する（D-16、
+    // `plans/DESIGN-SANDBOX-PRIVSEP.md` §5.3）。harness本体は常に非管理者トークンで動作する
+    // 設計であり、ヘルパー機構が無い間は実害が無いが（WFP/VHDX自体を使わないため）、
+    // 「本体が管理者ならヘルパー経由でない直接呼び出しに倒れていないか」を明示的に確認する
+    // 材料として警告ログを残す。拒否はしない。
+    #[cfg(windows)]
+    if harness_sandbox::privhelper::is_elevated() {
+        eprintln!(
+            "warning: harness is running with an elevated (administrator) token. harness is \
+             designed to always run as a non-administrator process; privileged operations \
+             (e.g. `harness fs grant-traverse`) should go through the privilege-separation \
+             helper (D-16, plans/DESIGN-SANDBOX-PRIVSEP.md §5.3), not this elevated \
+             process directly."
+        );
+    }
+
     // カレントディレクトリの`.env`があれば読み込み、プロセスのenvへ反映する（既存の環境変数は
     // 上書きしない、§設定とシークレット「ユーザ/プロジェクト設定」相当の簡易版）。無ければ無視する。
     let _ = dotenvy::dotenv();
@@ -570,7 +1063,10 @@ async fn main() -> ExitCode {
     // `apply`/`changes`/`discard`サブコマンドはプロバイダ資格情報を一切必要としないため、
     // 他のあらゆる検証より前に処理して即終了する（§非対話モード、プロンプトは一切送らない）。
     if let Some(cmd) = cli.command {
-        return run_sandbox_subcommand(cmd, &workspace_root);
+        return match cmd {
+            Commands::Fs { action } => run_fs_subcommand(action),
+            other => run_sandbox_subcommand(other, &workspace_root),
+        };
     }
 
     // `--list-sessions`はプロバイダ資格情報を一切必要としないため、他のあらゆる検証より前に
@@ -752,7 +1248,67 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let shell_tier = match select_tier(require_sandbox, &workspace_root, cli.experimental_tier1a) {
+    // fs passthrough allowlist（軸2・D-13）。CLI `--fs-allow`（繰り返し）と
+    // `.harness/settings.json`の`fs.allow`を和集合でマージする（重複除去、net_appと同形）。
+    // 各要素は`<path>[:rw]`（末尾`:rw`が無ければread-only既定、D-13）。パスは`workspace_root`
+    // 基準で絶対化する（既に絶対パスなら`Path::join`はそのまま採用する）。
+    let mut fs_allow_raw: Vec<(String, bool)> =
+        settings.fs.clone().unwrap_or_default().to_fs_passthrough();
+    for entry in &cli.fs_allow {
+        let (path, writable) = match entry.strip_suffix(":rw") {
+            Some(p) => (p.to_string(), true),
+            None => (entry.clone(), false),
+        };
+        if !fs_allow_raw.iter().any(|(p, _)| p == &path) {
+            fs_allow_raw.push((path, writable));
+        }
+    }
+    let fs_passthrough: Vec<harness_sandbox::FsPassthrough> = fs_allow_raw
+        .into_iter()
+        .map(|(path, writable)| harness_sandbox::FsPassthrough {
+            path: workspace_root.join(&path),
+            writable,
+        })
+        .collect();
+    if !fs_passthrough.is_empty() && !cfg!(windows) {
+        eprintln!(
+            "warning: --fs-allow / fs.allow is only supported on Windows (Tier1a); ignored on \
+             this OS"
+        );
+    }
+
+    // D7: --require-sandboxとの矛盾チェック。write-containmentは範囲外書込を禁じるため:rwのみ
+    // 拒否（:roは書込に無関係で許可）。confidentialは範囲外を読めない保証のため:ro/:rwいずれも
+    // 拒否する（外部読取穴がconfidentialの機密性保証と正面から矛盾するため、
+    // `--net-allow-app`×confidentialと同じfail-fast思想）。
+    let fs_has_write = fs_passthrough.iter().any(|fp| fp.writable);
+    match require_sandbox {
+        RequireSandbox::WriteContainment if fs_has_write => {
+            eprintln!(
+                "error: --fs-allow with :rw conflicts with --require-sandbox (write-containment \
+                 forbids writes outside the workspace; use read-only --fs-allow entries instead, \
+                 or drop --require-sandbox)"
+            );
+            return ExitCode::FAILURE;
+        }
+        RequireSandbox::Confidential if !fs_passthrough.is_empty() => {
+            eprintln!(
+                "error: --fs-allow conflicts with --require-sandbox=confidential (confidential \
+                 mode denies reading outside the workspace unconditionally; even read-only \
+                 --fs-allow breaks this guarantee; refusing to start rather than silently \
+                 weakening it)"
+            );
+            return ExitCode::FAILURE;
+        }
+        _ => {}
+    }
+
+    let shell_tier = match select_tier(
+        require_sandbox,
+        &workspace_root,
+        cli.experimental_tier1a,
+        &fs_passthrough,
+    ) {
         Ok(selection) => selection,
         Err(e) => {
             eprintln!("{e}");
@@ -776,6 +1332,24 @@ async fn main() -> ExitCode {
              exfiltration from run_shell child processes (plans/DESIGN-SANDBOX.md §9-1). \
              Use --require-sandbox=confidential (with --experimental-tier1a) if this matters."
         );
+    }
+    // fs passthrough（D2/D-13）: ACE付与自体は「付けっぱなし」（撤収はユーザ操作
+    // `harness fs revoke`に委ねる）。Tier1aが実際に選択された場合のみpreflightがACE付与を
+    // 試みたので、そのときだけ台帳に記録する。到達不能だった穴の診断（D8/D9）はここで表示する。
+    if shell_tier.tier == harness_core::ShellTier::Tier1a {
+        for fp in &fs_passthrough {
+            record_fs_passthrough_grant(&fp.path, fp.writable);
+            eprintln!(
+                "note: fs-allow granted: {} [{}] (this ACE persists after harness exits; use \
+                 `harness fs revoke {}` to undo)",
+                fp.path.display(),
+                if fp.writable { "rw" } else { "ro" },
+                fp.path.display()
+            );
+        }
+    }
+    for warning in &shell_tier.passthrough_warnings {
+        eprintln!("warning: {warning}");
     }
 
     let tool_ctx = ToolCtx {

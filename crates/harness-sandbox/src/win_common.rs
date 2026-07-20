@@ -24,6 +24,12 @@ pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// NUL終端のUTF-16文字列（`PWSTR`）をRustの`String`へ変換する（`ConvertSidToStringSidW`等、
+/// Win32が呼び出し側に所有権を渡す出力バッファを読み取る用途、`privhelper`から使う）。
+pub(crate) fn pwstr_to_string(p: windows::core::PWSTR) -> String {
+    unsafe { p.to_string().unwrap_or_default() }
+}
+
 /// `CreatePipe`の`bInheritHandle=TRUE`は両端を継承可能にする。子へ渡さない側（親が保持し続ける側）
 /// を継承不可へ戻さないと、子が余分な複製ハンドルを継承してしまい、親が閉じてもEOFにならず
 /// 子が永久にハングする（BUG-004、MSDN「Creating a Child Process with Redirected Input and

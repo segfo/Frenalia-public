@@ -1,0 +1,11 @@
+[package]
+name = "harness-privhelper"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "harness-privhelper"
+path = "src/main.rs"
+
+[dependencies]
+harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }

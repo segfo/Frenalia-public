@@ -137,6 +137,10 @@ pub struct ShellTierSelection {
     pub tier: ShellTier,
     pub downgraded_from: Option<ShellTier>,
     pub reason: Option<String>,
+    /// D8（`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺・fs passthrough）: 到達不能だった
+    /// `--fs-allow`穴の診断メッセージ一覧。空なら全穴到達可、または該当なし。Tier選択自体
+    /// （`tier`/`downgraded_from`）には影響しない（壊れた穴があってもTier1a・workspaceは継続）。
+    pub passthrough_warnings: Vec<String>,
 }
 
 impl ShellTierSelection {
@@ -145,6 +149,7 @@ impl ShellTierSelection {
             tier,
             downgraded_from: None,
             reason: None,
+            passthrough_warnings: Vec::new(),
         }
     }
 
@@ -153,7 +158,14 @@ impl ShellTierSelection {
             tier: to,
             downgraded_from: Some(from),
             reason: Some(reason.into()),
+            passthrough_warnings: Vec::new(),
         }
+    }
+
+    /// D8: fs passthroughの到達不能診断を積む（`direct`/`downgraded`と組み合わせて使う）。
+    pub fn with_passthrough_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.passthrough_warnings = warnings;
+        self
     }
 
     /// 非隔離（Tier0）かどうか。`run_shell`出力への警告付与判定に使う

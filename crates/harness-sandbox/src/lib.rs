@@ -27,6 +27,9 @@ pub mod secret_env;
 pub mod shell_tier;
 
 #[cfg(windows)]
+pub mod privhelper;
+
+#[cfg(windows)]
 pub mod win_appcontainer;
 
 #[cfg(windows)]
@@ -42,7 +45,7 @@ pub use manifest::{ManifestOp, ManifestTarget};
 pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};
 pub use read_scope::{ReadScope, ReadScopeError};
 pub use secret_env::build_child_env;
-pub use shell_tier::{select_tier, TierError};
+pub use shell_tier::{select_tier, FsPassthrough, TierError};
 
 use std::path::{Component, Path, PathBuf};
 

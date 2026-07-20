@@ -593,7 +593,7 @@ mod tests {
         // 実際のOS隔離Tier選択を再現する（さもないとTier1b経路が単体テストで一切通らない）。
         // `opt_in_tier1a=false`固定（既存Tier1bテストの挙動を変えないため）。
         ctx.shell_tier =
-            harness_sandbox::select_tier(harness_core::RequireSandbox::None, &root, false)
+            harness_sandbox::select_tier(harness_core::RequireSandbox::None, &root, false, &[])
                 .expect("tier selection without --require-sandbox never fails");
         ctx
     }
@@ -755,7 +755,7 @@ mod tests {
         // 実Tier1a preflightを走らせる（`opt_in_tier1a=true`）。AppContainer不可の環境では
         // Tier1bへ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
         let selection =
-            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true).unwrap();
+            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true, &[]).unwrap();
         if selection.tier != ShellTier::Tier1a {
             eprintln!(
                 "skipping tier1a test: preflight downgraded to {} ({:?})",
@@ -849,7 +849,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let selection =
-            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true).unwrap();
+            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true, &[]).unwrap();
         if selection.tier != ShellTier::Tier1a {
             eprintln!(
                 "skipping tier1a net-allow-app test: preflight downgraded to {} ({:?})",

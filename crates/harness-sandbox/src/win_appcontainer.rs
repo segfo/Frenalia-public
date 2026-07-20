@@ -33,18 +33,20 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    GetNamedSecurityInfoW, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
-    SetSecurityInfo, TRUSTEE_W,
+    GetExplicitEntriesFromAclW, GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT,
+    SE_KERNEL_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID,
+    TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, FreeSid, NO_INHERITANCE,
+    ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, FreeSid, NO_INHERITANCE,
     OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
 };
 use windows::Win32::Storage::FileSystem::{
-    DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+    FILE_TRAVERSE,
 };
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::System::Threading::{
@@ -55,6 +57,7 @@ use windows::Win32::System::Threading::{
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
+use crate::shell_tier::FsPassthrough;
 use crate::win_common::{
     build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, read_to_string,
     wide, write_all,
@@ -255,6 +258,36 @@ pub fn grant_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerErr
     }
     for file in &files {
         grant_ace(file, sid, false)?;
+    }
+    Ok(())
+}
+
+/// workspace配下のノードへ read/execute のみを付与する（`grant_ace`のread-only版、D-13）。
+/// `FILE_GENERIC_WRITE`・`DELETE`を含めないため、package SIDはこのルート配下を読取・実行
+/// できるが書込・削除はできない（D-13「read-onlyを既定とする」）。
+fn grant_ace_ro(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainerError> {
+    let access = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
+    let inheritance = if is_dir {
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+    } else {
+        NO_INHERITANCE
+    };
+    grant_ace_mask(path, sid, access, inheritance)
+}
+
+/// `grant_ace_recursive`のread-only版（D-13、fs passthroughの既定）。
+pub fn grant_ace_recursive_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclGrant {
+        path: root.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    for dir in &dirs {
+        grant_ace_ro(dir, sid, true)?;
+    }
+    for file in &files {
+        grant_ace_ro(file, sid, false)?;
     }
     Ok(())
 }
@@ -677,11 +710,132 @@ fn smoke_test_spawn(sid: PSID, workspace_root: &Path, probe_dir: &Path) -> Resul
     Ok(())
 }
 
+/// fs passthrough（D-13）の到達性プローブ用コマンド。`FS_IO_PROBE_COMMAND`と同じ
+/// 「実I/Oを試し終了コードで判定する」設計だが、catchブロックで例外メッセージをstdoutへ
+/// 出す点が異なる（D9: 到達不能時に生エラーを呼び出し元へ返すため）。
+const FS_PASSTHROUGH_RO_PROBE_COMMAND: &str = "\
+    $ErrorActionPreference = 'Stop'; \
+    try { \
+        Get-ChildItem -LiteralPath $env:HARNESS_PASSTHROUGH_DIR -ErrorAction Stop | Out-Null; \
+        exit 0 \
+    } catch { \
+        Write-Output $_.Exception.Message; \
+        exit 3 \
+    }";
+
+/// ro版と同じ設計のrw版（一時ファイルの作成→読取→削除まで試す）。
+const FS_PASSTHROUGH_RW_PROBE_COMMAND: &str = "\
+    $ErrorActionPreference = 'Stop'; \
+    try { \
+        $p = Join-Path $env:HARNESS_PASSTHROUGH_DIR ([Guid]::NewGuid().ToString() + '.harness-probe.tmp'); \
+        New-Item -ItemType File -Path $p -Force | Out-Null; \
+        Get-Content -LiteralPath $p | Out-Null; \
+        Remove-Item -LiteralPath $p -Force; \
+        exit 0 \
+    } catch { \
+        Write-Output $_.Exception.Message; \
+        exit 3 \
+    }";
+
+/// `path`の最上位祖先（ドライブルート、例`C:\`）を返す。
+fn drive_root_of(path: &Path) -> std::path::PathBuf {
+    path.ancestors()
+        .last()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// D9: passthroughルートが到達不能だったときの原因診断。生エラーメッセージに加え、
+/// 祖先ドライブルートのtraverse ACE有無を実地チェックし、既知原因
+/// （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記8）なら名指しし、
+/// 修復手順（`harness fs grant-traverse`、管理者一回）を提示する。
+fn diagnose_unreachable_passthrough(sid: PSID, path: &Path, raw_message: &str) -> String {
+    let drive_root = drive_root_of(path);
+    let known_cause = match sid_ace_mask(&drive_root, sid) {
+        Ok(Some(mask))
+            if mask & FILE_TRAVERSE.0 != 0 && mask & FILE_READ_ATTRIBUTES.0 != 0 =>
+        {
+            None
+        }
+        Ok(Some(_)) => Some(format!(
+            "drive root {} has a sandbox SID ACE but is missing \
+             FILE_TRAVERSE|FILE_READ_ATTRIBUTES",
+            drive_root.display()
+        )),
+        Ok(None) | Err(_) => Some(format!(
+            "drive root {} has no traverse ACE for the sandbox SID",
+            drive_root.display()
+        )),
+    };
+    match known_cause {
+        Some(cause) => format!(
+            "fs-allow {} : unreachable inside AppContainer (probe error: {raw_message}) -- \
+             diagnosis: {cause} (see docs/phases/foundation/M12-shell-isolation-tiers.md 追記8). \
+             fix (admin, one-time): harness fs grant-traverse {}",
+            path.display(),
+            drive_root.display()
+        ),
+        None => format!(
+            "fs-allow {} : unreachable inside AppContainer (probe error: {raw_message}); \
+             drive root traverse ACE looks fine, cause unknown (path may not exist, or a \
+             read-only file attribute is blocking a :rw request)",
+            path.display()
+        ),
+    }
+}
+
+/// D8: passthroughルート1件へコンテナ内から実I/Oプローブ（疎通テスト）を行う。到達可なら
+/// `None`、到達不能なら診断メッセージ（D9）を返す。全体のTier選択には影響しない
+/// （`preflight`が結果を警告一覧として集約するだけで、壊れた穴以外は継続する）。
+fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Option<String> {
+    let (shell, _) = resolve_shell();
+    let mut env = crate::secret_env::build_child_env();
+    env.push((
+        "HARNESS_PASSTHROUGH_DIR".to_string(),
+        fp.path.to_string_lossy().into_owned(),
+    ));
+    let command = if fp.writable {
+        FS_PASSTHROUGH_RW_PROBE_COMMAND
+    } else {
+        FS_PASSTHROUGH_RO_PROBE_COMMAND
+    };
+    let child = match spawn(
+        &shell,
+        &["-NoProfile", "-NonInteractive", "-Command", command],
+        workspace_root,
+        &env,
+        false,
+        sid,
+        NetworkCapability::Deny,
+    ) {
+        Ok(child) => child,
+        Err(e) => {
+            return Some(format!("fs-allow {} : probe could not start: {e}", fp.path.display()));
+        }
+    };
+    match child.write_stdin_read_output_and_wait(None) {
+        Ok((_, _, 0)) => None,
+        Ok((stdout, _, _code)) => Some(diagnose_unreachable_passthrough(
+            sid,
+            &fp.path,
+            stdout.trim(),
+        )),
+        Err(e) => Some(format!("fs-allow {} : probe failed: {e}", fp.path.display())),
+    }
+}
+
 /// harness起動時に1回だけ呼ぶ。プロファイル作成→ACL付与→起動smokeテストの一連を行い、
 /// いずれか失敗したら理由文字列を返す（`shell_tier::best_effort_tier`がTier1bへの降格理由
 /// としてそのまま使う）。判断は実行前に完結させ、`run_shell`個々の呼び出し中には降格ロジックを
 /// 一切持たせない（非冪等コマンドの二重実行を避けるための意図的判断）。
-pub fn preflight(workspace_root: &Path) -> Result<(), AppContainerError> {
+///
+/// `passthrough`（D-13、fs passthrough allowlist）は各ルートへACEを付与したうえで到達性を
+/// プローブする（D8）。到達不能な穴は`preflight`全体を失敗させず、戻り値の警告一覧に
+/// 診断メッセージ（D9）を積むだけに留める（壊れた穴があってもworkspaceと他の穴は動き続ける）。
+pub fn preflight(
+    workspace_root: &Path,
+    passthrough: &[FsPassthrough],
+) -> Result<Vec<String>, AppContainerError> {
     let sid = ensure_profile(CONTAINER_NAME)?;
     grant_ace_recursive(workspace_root, sid.as_psid())?;
     let tmp_dir = workspace_root
@@ -690,17 +844,39 @@ pub fn preflight(workspace_root: &Path) -> Result<(), AppContainerError> {
         .join("tier1a-tmp");
     std::fs::create_dir_all(&tmp_dir).map_err(|e| AppContainerError::Preflight(e.to_string()))?;
     smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir)?;
-    Ok(())
+
+    let mut warnings = Vec::new();
+    for fp in passthrough {
+        if !fp.path.exists() {
+            warnings.push(format!(
+                "fs-allow {} : path does not exist, skipped",
+                fp.path.display()
+            ));
+            continue;
+        }
+        let grant_result = if fp.writable {
+            grant_ace_recursive(&fp.path, sid.as_psid())
+        } else {
+            grant_ace_recursive_ro(&fp.path, sid.as_psid())
+        };
+        if let Err(e) = grant_result {
+            warnings.push(format!("fs-allow {} : ACE grant failed: {e}", fp.path.display()));
+            continue;
+        }
+        if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
+            warnings.push(diagnosis);
+        }
+    }
+    Ok(warnings)
 }
 
 /// `path`のDACLから、`sid`（trustee）に対する既存ACEを全て取り除く（`REVOKE_ACCESS`）。
-/// `TIER1A-OPEN-ISSUES.md`課題1のプロファイルtraverse実験（Experiment B）で、実プロファイルへ
-/// 付与した一時ACEを実験後に必ず原状復帰させるための後始末専用ヘルパ。`grant_ace_mask`と対に
-/// なるが、恒久機能（`preflight`/`spawn`等）からは呼ばれない診断専用コード。
-#[cfg(all(windows, test))]
-fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    use windows::Win32::Security::Authorization::REVOKE_ACCESS;
-
+/// 元は`TIER1A-OPEN-ISSUES.md`課題1のプロファイルtraverse実験（Experiment B）専用の
+/// 後始末ヘルパだったが、D-13のfs passthrough撤収機構（`fs revoke`）向けに本番昇格した
+/// （`revoke_ace_recursive`から使う）。`grant_ace_mask`と対になる。単一ノードのみを対象とする
+/// 非再帰の操作であり、`grant_traverse_drive_root`（同じく非再帰・単一ACE）の巻き戻し
+/// （`harness fs revoke-traverse`）にもそのまま使う。
+pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -754,6 +930,133 @@ fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
         set_result.map_err(to_err)?;
     }
     Ok(())
+}
+
+/// `root`配下（`root`自身含む）から`sid`のACEを再帰的に取り除く（`grant_ace_recursive`の逆）。
+/// D-13のfs passthrough撤収（`harness fs revoke`）本体。`grant_ace_recursive`と同じ
+/// `collect_dirs_and_files`（symlinkスキップ済み）を使い再walkするため、付与後に増えた
+/// ファイルも含めて現在のツリー全体から取り除く（決定D3: 台帳はルートのみ記録、撤収は再walk）。
+pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclGrant {
+        path: root.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    for file in &files {
+        revoke_ace(file, sid)?;
+    }
+    for dir in &dirs {
+        revoke_ace(dir, sid)?;
+    }
+    Ok(())
+}
+
+/// `path`のDACLに`sid`（trustee）への明示ACEが残っていれば、その許可アクセスマスクの
+/// 論理和を返す（複数エントリがあり得るため合算）。無ければ`None`。
+/// `GetExplicitEntriesFromAclW`は`BuildTrusteeWithSidW`で組み立てるのと同じ`TRUSTEE_W`を
+/// 返すため、`grant_ace_mask`/`revoke_ace`が使うAPIと対称な形で読み取れる
+/// （`GetAce`によるACEヘッダ直接パースより低リスク）。
+fn sid_ace_mask(path: &Path, sid: PSID) -> Result<Option<u32>, AppContainerError> {
+    let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    };
+    unsafe {
+        let path_w = wide(&path.to_string_lossy());
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+        .ok()
+        .map_err(to_err)?;
+
+        let mut count: u32 = 0;
+        let mut entries: *mut EXPLICIT_ACCESS_W = std::ptr::null_mut();
+        let err = GetExplicitEntriesFromAclW(dacl as *const _, &mut count, &mut entries);
+        if let Err(e) = err.ok() {
+            let _ = LocalFree(HLOCAL(sd.0));
+            return Err(to_err(e));
+        }
+
+        let mut mask: Option<u32> = None;
+        if !entries.is_null() {
+            let slice = std::slice::from_raw_parts(entries, count as usize);
+            for entry in slice {
+                if entry.Trustee.TrusteeForm == TRUSTEE_IS_SID {
+                    let entry_sid = PSID(entry.Trustee.ptstrName.0 as *mut c_void);
+                    if EqualSid(entry_sid, sid).is_ok() {
+                        mask = Some(mask.unwrap_or(0) | entry.grfAccessPermissions);
+                    }
+                }
+            }
+            let _ = LocalFree(HLOCAL(entries as *mut _));
+        }
+        let _ = LocalFree(HLOCAL(sd.0));
+        Ok(mask)
+    }
+}
+
+/// D4（revoke完全性の検証パス）: `root`配下を再walkし、`sid`のACEがまだ残っている全ノードを
+/// 列挙する。空なら完全に撤収できたことの機械的な証拠になる（`fs revoke`が呼ぶ）。
+/// ツリー外へ移動されたオブジェクトは検出できない（T-16残余、`TIER1A-OPEN-ISSUES.md`参照）。
+pub fn assert_no_sid_ace_recursive(root: &Path, sid: PSID) -> Result<(), Vec<std::path::PathBuf>> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    if collect_dirs_and_files(root, &mut dirs, &mut files).is_err() {
+        // rootが既に存在しない（revoke後にユーザが削除した等）場合は「残存無し」として扱う。
+        return Ok(());
+    }
+    let mut remaining = Vec::new();
+    for node in dirs.iter().chain(files.iter()) {
+        match sid_ace_mask(node, sid) {
+            Ok(Some(_)) => remaining.push(node.clone()),
+            Ok(None) => {}
+            Err(_) => remaining.push(node.clone()),
+        }
+    }
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(remaining)
+    }
+}
+
+/// `assert_no_sid_ace_recursive`の非再帰版。単一ノード（`path`自身）のみを検証する。
+/// `grant_traverse_drive_root`のような非再帰・単一ACEの付与（`revoke_ace`で撤収する対象）は
+/// ツリー全体を再walkする必要が無く、むしろ`path`がドライブルートの場合に不要な全走査を
+/// 招くため、`assert_no_sid_ace_recursive`を流用せずこちらを使う（`harness fs revoke-traverse`）。
+pub fn assert_no_sid_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    match sid_ace_mask(path, sid)? {
+        None => Ok(()),
+        Some(_) => Err(AppContainerError::AclGrant {
+            path: path.to_path_buf(),
+            reason: "sandbox SID ACE still present after revoke".to_string(),
+        }),
+    }
+}
+
+/// ドライブルート（例`C:\`）へ、`sid`の`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を単一・非継承で
+/// 付与する（D10、`harness fs grant-traverse`本体）。`docs/phases/foundation/
+/// M12-shell-isolation-tiers.md`追記8で判明した根本原因（ドライブルートのtraverse ACE欠如、
+/// `FILE_TRAVERSE`単独では`Read Attributes`アクセス拒否が残り不十分）の修復そのもの。
+/// ドライブルートのDACL変更には`WRITE_DAC`が要るため、非管理者では
+/// `AppContainerError::AclGrant`（access denied）を返す（呼び出し側が「管理者で再実行」を促す）。
+pub fn grant_traverse_drive_root(drive: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    grant_ace_mask(
+        drive,
+        sid,
+        FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
+        NO_INHERITANCE,
+    )
 }
 
 /// `TIER1A-OPEN-ISSUES.md`課題1（traverse問題の検証プラン）の診断テスト群。
@@ -1793,6 +2096,126 @@ mod traverse_diagnostics {
              probe is expected to fail just like the diagnostic probe above; if it now succeeds \
              the drive-root traverse constraint may have changed and this assertion (and the \
              M12 追記3 findings) should be revisited"
+        );
+    }
+
+    /// D-13（fs passthrough allowlist）実機E2E: 中立な外部ディレクトリ（workspace外、`grant_ace_recursive`
+    /// 済みのworkspaceとは別ルート）へ、まずread-only ACEを付与して子プロセスから読取成功・書込拒否を
+    /// 確認し、次にread-write ACEへ差し替えて書込成功を確認、最後に`revoke_ace_recursive`で
+    /// 全ノードから撤収して`assert_no_sid_ace_recursive`が0件（`Ok(())`）を返すことを確認する
+    /// （D3/D4、`TIER1A-OPEN-ISSUES.md`項目4/6の実証）。`experiment_k`/`parity_production_probe_
+    /// matches_diagnostic_probe`と同じく、workspace/外部ルートとも`C:\`直下の浅いパスを使う
+    /// （`%TEMP%`のような深いパスは`C:\`祖先1本のtraverse ACE付与だけでは足りず、中間の各祖先
+    /// ディレクトリにも個別のtraverse ACEが要るため、M12追記8の検証条件と揃えるのが目的）。
+    /// ドライブルートのtraverse ACEが無い機種ではskipする。
+    #[test]
+    #[ignore]
+    fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+
+        // workspace（FS I/Oのgate）とpassthrough対象（中立な外部ルート）は別ディレクトリにする。
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-passthrough-ws-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on workspace");
+        let probe_dir = workspace.join(".harness").join("sandbox").join("tier1a-tmp");
+        std::fs::create_dir_all(&probe_dir).expect("create probe dir");
+        if let Err(e) = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir) {
+            eprintln!(
+                "skipping fs_passthrough_ro_then_rw_then_revoke_cycle: workspace FS I/O gate \
+                 failed on this machine ({e:?}); run `harness fs grant-traverse C:\\` as \
+                 administrator first (D10)"
+            );
+            let _ = std::fs::remove_dir_all(&workspace);
+            return;
+        }
+
+        // 外部ルートも`C:\`直下（1階層）にする。`C:\ProgramData\...`のような多階層ネストは
+        // 中間の祖先ディレクトリ（`ProgramData`等）にsandbox SID向けtraverse ACEが無く、
+        // 別種の未解決問題になり得ることが実機検証で判明した（読取は成功するがrw書込がAccess
+        // Deniedになる、`diagnose_unreachable_passthrough`のD9 fallback「cause unknown」経路が
+        // 正しく効いた）。M12追記8が検証した「ドライブルート直下1階層」の条件に揃える。
+        let external = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-passthrough-ext-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&external).expect("create neutral external dir");
+        std::fs::write(external.join("existing.txt"), "pre-existing").expect("seed existing file");
+
+        // 1. read-only付与 -> 読取成功・書込拒否。
+        grant_ace_recursive_ro(&external, sid.as_psid()).expect("grant_ace_recursive_ro");
+        let ro_probe = FsPassthrough {
+            path: external.clone(),
+            writable: false,
+        };
+        let ro_diagnosis = probe_passthrough(sid.as_psid(), &workspace, &ro_probe);
+        assert!(
+            ro_diagnosis.is_none(),
+            "read probe on read-only passthrough should succeed: {ro_diagnosis:?}"
+        );
+        let rw_probe_against_ro_grant = FsPassthrough {
+            path: external.clone(),
+            writable: true,
+        };
+        let write_should_fail =
+            probe_passthrough(sid.as_psid(), &workspace, &rw_probe_against_ro_grant);
+        assert!(
+            write_should_fail.is_some(),
+            "write probe must fail while only read-only ACE is granted"
+        );
+
+        // 2. read-write付与 -> 書込成功。
+        grant_ace_recursive(&external, sid.as_psid()).expect("grant_ace_recursive (rw)");
+        let rw_probe = FsPassthrough {
+            path: external.clone(),
+            writable: true,
+        };
+        let rw_diagnosis = probe_passthrough(sid.as_psid(), &workspace, &rw_probe);
+        assert!(
+            rw_diagnosis.is_none(),
+            "write probe on read-write passthrough should succeed: {rw_diagnosis:?}"
+        );
+
+        // 3. 撤収 -> 再walkで0件（D4検証パス）。
+        revoke_ace_recursive(&external, sid.as_psid()).expect("revoke_ace_recursive");
+        let remaining = assert_no_sid_ace_recursive(&external, sid.as_psid());
+        assert!(
+            remaining.is_ok(),
+            "sandbox SID ACE must be fully removed after revoke_ace_recursive: {remaining:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&external);
+    }
+
+    /// `grant_traverse_drive_root`/`revoke_ace`/`assert_no_sid_ace`（いずれも非再帰・単一ノード）の
+    /// 往復を確認する（D10の巻き戻し、`harness fs revoke-traverse`本体）。実際のドライブルートは
+    /// 対象にせず、テスト実行ユーザー自身が所有者である`tempfile::tempdir()`を対象にする
+    /// （所有者は自分のオブジェクトのDACLを自由に変更できるため、`WRITE_DAC`が無い管理者専用の
+    /// ドライブルートと違い管理者権限が不要。`docs/explanations/tier1a-non-admin-limitation.md`
+    /// 「なぜ非管理者ユーザーは自分で直せないのか」の所有者の話と対応する）。
+    #[test]
+    #[ignore]
+    fn grant_traverse_then_revoke_traverse_on_neutral_dir() {
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let dir = tempfile::tempdir().expect("create neutral tempdir (test-user owned)");
+        let path = dir.path().to_path_buf();
+
+        grant_traverse_drive_root(&path, sid.as_psid()).expect("grant_traverse_drive_root");
+        let mask = sid_ace_mask(&path, sid.as_psid()).expect("sid_ace_mask after grant");
+        assert_eq!(
+            mask,
+            Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0),
+            "granted ACE mask must be exactly FILE_TRAVERSE | FILE_READ_ATTRIBUTES"
+        );
+
+        revoke_ace(&path, sid.as_psid()).expect("revoke_ace");
+        let verified = assert_no_sid_ace(&path, sid.as_psid());
+        assert!(
+            verified.is_ok(),
+            "sandbox SID ACE must be fully removed after revoke_ace: {verified:?}"
         );
     }
 }

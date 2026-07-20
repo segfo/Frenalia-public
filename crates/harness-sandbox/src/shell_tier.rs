@@ -42,6 +42,18 @@ fn require_label(require: RequireSandbox) -> &'static str {
     }
 }
 
+/// Tier1a向けfs passthrough記述子（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md` §5.1）。
+/// package SIDへ追加ルート（`workspace_root`外）の許可ACEを付与する対象を表す。
+/// `writable=false`が既定（read-only、書込は明示`:rw`指定時のみ`true`）。
+/// Windows以外では値を運ぶだけで`best_effort_tier`のLinux/other分岐からは無視される
+/// （`harness-core`へは出さずこのクレート内に閉じる、network側の`NetAppPolicy`とは
+/// 役割分担が異なる: FSアクセス制御は実FSのACLで完結するため`ToolCtx`を経由しない）。
+#[derive(Debug, Clone)]
+pub struct FsPassthrough {
+    pub path: PathBuf,
+    pub writable: bool,
+}
+
 /// OS能力プローブ結果。テストから注入できるようにフィールドを公開する。
 #[derive(Debug, Clone, Default)]
 pub struct Probes {
@@ -89,8 +101,15 @@ pub fn select_tier(
     require: RequireSandbox,
     workspace_root: &Path,
     opt_in_tier1a: bool,
+    passthrough: &[FsPassthrough],
 ) -> Result<ShellTierSelection, TierError> {
-    select_tier_with_probes(require, workspace_root, opt_in_tier1a, &Probes::detect())
+    select_tier_with_probes(
+        require,
+        workspace_root,
+        opt_in_tier1a,
+        passthrough,
+        &Probes::detect(),
+    )
 }
 
 /// テスト用: プローブ結果を注入して選択ロジックのみを検証する。
@@ -98,9 +117,10 @@ pub fn select_tier_with_probes(
     require: RequireSandbox,
     workspace_root: &Path,
     opt_in_tier1a: bool,
+    passthrough: &[FsPassthrough],
     probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
-    let selection = best_effort_tier(workspace_root, opt_in_tier1a, probes);
+    let selection = best_effort_tier(workspace_root, opt_in_tier1a, passthrough, probes);
     if satisfies(selection.tier, require) {
         Ok(selection)
     } else {
@@ -112,24 +132,42 @@ pub fn select_tier_with_probes(
 }
 
 #[cfg(target_os = "windows")]
-fn best_effort_tier(workspace_root: &Path, opt_in_tier1a: bool, probes: &Probes) -> ShellTierSelection {
+fn best_effort_tier(
+    workspace_root: &Path,
+    opt_in_tier1a: bool,
+    passthrough: &[FsPassthrough],
+    probes: &Probes,
+) -> ShellTierSelection {
     // Restricted Token構築はほぼ全ての非管理者環境で可能と仮定する（§6.3）。
     // 実際の構築失敗はrun_shell呼び出し時にTier0へ実行時降格させる
     // （harness-tools::shell側の責務、`plans/DESIGN-SANDBOX.md` §6.1「不可なら自動降格+警告」）。
     if !opt_in_tier1a {
         return ShellTierSelection::direct(ShellTier::Tier1b);
     }
-    let result = probes.tier1a_preflight_override.clone().unwrap_or_else(|| {
-        crate::win_appcontainer::preflight(workspace_root).map_err(|e| e.to_string())
-    });
-    match result {
-        Ok(()) => ShellTierSelection::direct(ShellTier::Tier1a),
-        Err(reason) => ShellTierSelection::downgraded(ShellTier::Tier1a, ShellTier::Tier1b, reason),
+    match &probes.tier1a_preflight_override {
+        Some(Ok(())) => ShellTierSelection::direct(ShellTier::Tier1a),
+        Some(Err(reason)) => {
+            ShellTierSelection::downgraded(ShellTier::Tier1a, ShellTier::Tier1b, reason.clone())
+        }
+        // テスト注入が無い場合のみ実際のWin32 preflightを呼ぶ（副作用ありの重い処理を
+        // 単体テストでは避ける、既存の分岐と同じ考え方）。D8: passthroughの到達不能は
+        // Tier選択自体を左右せず`passthrough_warnings`として運ぶだけ。
+        None => match crate::win_appcontainer::preflight(workspace_root, passthrough) {
+            Ok(warnings) => {
+                ShellTierSelection::direct(ShellTier::Tier1a).with_passthrough_warnings(warnings)
+            }
+            Err(e) => ShellTierSelection::downgraded(ShellTier::Tier1a, ShellTier::Tier1b, e.to_string()),
+        },
     }
 }
 
 #[cfg(target_os = "linux")]
-fn best_effort_tier(_workspace_root: &Path, _opt_in_tier1a: bool, probes: &Probes) -> ShellTierSelection {
+fn best_effort_tier(
+    _workspace_root: &Path,
+    _opt_in_tier1a: bool,
+    _passthrough: &[FsPassthrough],
+    probes: &Probes,
+) -> ShellTierSelection {
     if probes.linux_tier2_available() {
         ShellTierSelection::direct(ShellTier::Tier2)
     } else {
@@ -144,7 +182,12 @@ fn best_effort_tier(_workspace_root: &Path, _opt_in_tier1a: bool, probes: &Probe
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-fn best_effort_tier(_workspace_root: &Path, _opt_in_tier1a: bool, _probes: &Probes) -> ShellTierSelection {
+fn best_effort_tier(
+    _workspace_root: &Path,
+    _opt_in_tier1a: bool,
+    _passthrough: &[FsPassthrough],
+    _probes: &Probes,
+) -> ShellTierSelection {
     ShellTierSelection::downgraded(
         ShellTier::Tier2,
         ShellTier::Tier0,
@@ -163,9 +206,14 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_defaults_to_tier1b() {
-        let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &Probes::default())
-                .unwrap();
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            false,
+            &[],
+            &Probes::default(),
+        )
+        .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier1b);
         assert!(selection.downgraded_from.is_none());
         assert!(!selection.is_unisolated());
@@ -178,6 +226,7 @@ mod tests {
             RequireSandbox::Confidential,
             &empty_root(),
             false,
+            &[],
             &Probes::default(),
         )
         .unwrap_err();
@@ -191,6 +240,7 @@ mod tests {
             RequireSandbox::WriteContainment,
             &empty_root(),
             false,
+            &[],
             &Probes::default(),
         )
         .unwrap();
@@ -207,7 +257,8 @@ mod tests {
             ..Default::default()
         };
         let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &probes).unwrap();
+            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &[], &probes)
+                .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier1b);
     }
 
@@ -219,7 +270,8 @@ mod tests {
             ..Default::default()
         };
         let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), true, &probes).unwrap();
+            select_tier_with_probes(RequireSandbox::None, &empty_root(), true, &[], &probes)
+                .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier1a);
         assert!(selection.downgraded_from.is_none());
     }
@@ -232,7 +284,8 @@ mod tests {
             ..Default::default()
         };
         let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), true, &probes).unwrap();
+            select_tier_with_probes(RequireSandbox::None, &empty_root(), true, &[], &probes)
+                .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier1b);
         assert_eq!(selection.downgraded_from, Some(ShellTier::Tier1a));
         assert!(selection.reason.is_some());
@@ -245,10 +298,36 @@ mod tests {
             tier1a_preflight_override: Some(Ok(())),
             ..Default::default()
         };
-        let selection =
-            select_tier_with_probes(RequireSandbox::Confidential, &empty_root(), true, &probes)
-                .unwrap();
+        let selection = select_tier_with_probes(
+            RequireSandbox::Confidential,
+            &empty_root(),
+            true,
+            &[],
+            &probes,
+        )
+        .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier1a);
+    }
+
+    /// B1-B3の回帰: passthrough引数追加後もTier1a preflightの既存分岐（成功/失敗）は不変。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_passthrough_argument_does_not_affect_override_branches() {
+        let probes = Probes {
+            tier1a_preflight_override: Some(Ok(())),
+            ..Default::default()
+        };
+        let passthrough = vec![FsPassthrough {
+            path: PathBuf::from("C:\\dummy"),
+            writable: false,
+        }];
+        let selection =
+            select_tier_with_probes(RequireSandbox::None, &empty_root(), true, &passthrough, &probes)
+                .unwrap();
+        // オーバーライドが刺さっている限り、実際のpreflightは呼ばれず
+        // passthrough_warningsも実プローブ由来では埋まらない（空のまま）。
+        assert_eq!(selection.tier, ShellTier::Tier1a);
+        assert!(selection.passthrough_warnings.is_empty());
     }
 
     /// 未解決事項2 決定5の回帰テスト: FSプローブ失敗（この機種のtraverse ACE欠如を模す）で
@@ -264,8 +343,14 @@ mod tests {
             )),
             ..Default::default()
         };
-        let err = select_tier_with_probes(RequireSandbox::Confidential, &empty_root(), true, &probes)
-            .unwrap_err();
+        let err = select_tier_with_probes(
+            RequireSandbox::Confidential,
+            &empty_root(),
+            true,
+            &[],
+            &probes,
+        )
+        .unwrap_err();
         assert!(matches!(err, TierError::Insufficient { .. }));
     }
 
@@ -278,7 +363,8 @@ mod tests {
             ..Default::default()
         };
         let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &probes).unwrap();
+            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &[], &probes)
+                .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier2);
         assert!(selection.downgraded_from.is_none());
     }
@@ -292,7 +378,8 @@ mod tests {
             ..Default::default()
         };
         let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &probes).unwrap();
+            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &[], &probes)
+                .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier0);
         assert_eq!(selection.downgraded_from, Some(ShellTier::Tier2));
         assert!(selection.is_unisolated());
@@ -307,7 +394,8 @@ mod tests {
             ..Default::default()
         };
         let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &probes).unwrap();
+            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &[], &probes)
+                .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier0);
     }
 
@@ -323,6 +411,7 @@ mod tests {
             RequireSandbox::WriteContainment,
             &empty_root(),
             false,
+            &[],
             &probes,
         )
         .unwrap_err();

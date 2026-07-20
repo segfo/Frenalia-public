@@ -31,6 +31,35 @@ pub struct Settings {
     /// 協調プロキシ設定（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）。省略時は
     /// `NetSettings::default()`（`allow_domains`空＝プロキシ自体を起動しない）。
     pub net: Option<NetSettings>,
+    /// Tier1a fs passthrough設定（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺）。省略時は
+    /// `FsSettings::default()`（`allow`空＝追加ルート無し＝M12までと等価）。
+    pub fs: Option<FsSettings>,
+}
+
+/// `.harness/settings.json`の`fs`キー（D-13、Tier1a fs passthrough allowlist）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FsSettings {
+    /// 追加で許可するルート。各要素は`"<path>"`（read-only既定）または`"<path>:rw"`
+    /// （書込も許可、明示opt-in）。CLIの`--fs-allow`と和集合でマージされる
+    /// （`net.allow_apps`と同じ役割分担、絶対パス化は`harness-cli`側）。
+    pub allow: Option<Vec<String>>,
+}
+
+impl FsSettings {
+    /// `fs.allow`の各要素を`(パス文字列, writable)`へ変換する。末尾`:rw`があれば書込可、
+    /// 無ければread-only（D-13の既定）。パスの絶対化・`FsPassthrough`化は呼び出し側
+    /// （`harness-cli`）の責務（`harness-sandbox`へ出す型はこのクレートに依存させない）。
+    pub fn to_fs_passthrough(&self) -> Vec<(String, bool)> {
+        self.allow
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| match entry.strip_suffix(":rw") {
+                Some(path) => (path.to_string(), true),
+                None => (entry, false),
+            })
+            .collect()
+    }
 }
 
 /// `.harness/settings.json`の`net`キー（M12補遺、D-15/D-10）。
@@ -238,6 +267,31 @@ mod tests {
         assert_eq!(
             config.deny_descend,
             vec!["node_modules".to_string(), ".git".to_string()]
+        );
+    }
+
+    /// D-13: `.harness/settings.json`の`fs.allow`が`(パス, writable)`へ正しく変換される。
+    /// 末尾`:rw`があれば書込可、無ければread-only（既定、`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺）。
+    #[test]
+    fn fs_settings_parses_ro_and_rw_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("settings.json"),
+            r#"{"fs": {"allow": ["C:\\Users\\me\\.cargo:rw", "C:\\Users\\me\\readonly-cache"]}}"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(dir.path());
+        let fs = settings.fs.expect("fs settings present");
+        let passthrough = fs.to_fs_passthrough();
+        assert_eq!(
+            passthrough,
+            vec![
+                ("C:\\Users\\me\\.cargo".to_string(), true),
+                ("C:\\Users\\me\\readonly-cache".to_string(), false),
+            ]
         );
     }
 }
