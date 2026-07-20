@@ -48,6 +48,71 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// 出力バイト上限（層5・T-13、Tier0/Tier1b/Tier2いずれでも適用する保険）。
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
+/// アプリ単位network制御（軸1、D-10/D-11）の判定結果。`classify_net_app`が返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetDecision {
+    /// 許可リスト非空だが先頭execが不一致（既定）。
+    Deny,
+    /// 先頭execは一致したが、連鎖メタ文字（`|`/`&&`/`;`等）を含むため他exe混入の恐れがあり
+    /// 安全側で拒否した（D-11の最小許可原則。連鎖内の全execを安全に列挙するのは困難なため）。
+    DeniedByChaining,
+    /// 先頭execが一致し、連鎖も無い単一コマンド。`internetClient`を付与してよい。
+    Allow,
+}
+
+/// コマンド文字列の先頭トークンを取り出す（引用符付きなら中身、無ければ空白区切りの最初の語）。
+fn first_command_token(command: &str) -> &str {
+    let s = command.trim_start();
+    if let Some(rest) = s.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or("");
+    }
+    if let Some(rest) = s.strip_prefix('\'') {
+        return rest.split('\'').next().unwrap_or("");
+    }
+    s.split_whitespace().next().unwrap_or("")
+}
+
+/// 実行ファイルトークンから比較用のbasename（パス除去・拡張子除去・小文字化）を作る。
+fn exe_basename(token: &str) -> String {
+    let name = token.rsplit(['\\', '/']).next().unwrap_or(token);
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    stem.to_ascii_lowercase()
+}
+
+/// コマンド文字列が連鎖メタ文字（`|`/`&`/`;`/バッククォート/`$(`/改行）を含むかを判定する。
+/// 単一`&`（PowerShellの呼び出し演算子等）も安全側で連鎖扱いにする（D-11の最小許可原則）。
+fn contains_chaining_metachar(command: &str) -> bool {
+    command.contains(['|', '&', ';', '`', '\n']) || command.contains("$(")
+}
+
+/// `command`の先頭execが`allow_apps`（basename一致）に含まれるかを判定し、連鎖の有無も
+/// 併せて評価する（軸1、D-10/D-11）。`allow_apps`が空なら常に`Deny`（既定・現状維持）。
+///
+/// **限界（残存リスク、T-15の具体化）**: 判定は外側のコマンド文字列にしか及ばない。
+/// `pwsh ./x.ps1`のようにインタプリタ/スクリプトを許可リストへ入れると、中身が呼ぶ通信も
+/// 全て通ってしまう（capabilityは子孫プロセスへ全継承）。許可リストには`git`/`npm`等の
+/// 具体的で狭い実行ファイル名のみを入れることを前提とする。
+fn classify_net_app(command: &str, allow_apps: &[String]) -> NetDecision {
+    if allow_apps.is_empty() {
+        return NetDecision::Deny;
+    }
+    let token = first_command_token(command);
+    if token.is_empty() {
+        return NetDecision::Deny;
+    }
+    let basename = exe_basename(token);
+    let matched = allow_apps
+        .iter()
+        .any(|allowed| exe_basename(allowed) == basename);
+    if !matched {
+        return NetDecision::Deny;
+    }
+    if contains_chaining_metachar(command) {
+        return NetDecision::DeniedByChaining;
+    }
+    NetDecision::Allow
+}
+
 #[async_trait]
 impl Tool for RunShellTool {
     fn name(&self) -> &str {
@@ -55,7 +120,9 @@ impl Tool for RunShellTool {
     }
 
     fn description(&self) -> &str {
-        "ワークスペース内でシェルコマンドを実行し、stdout+stderr+終了コードを返す。"
+        "ワークスペース内でシェルコマンドを実行し、stdout+stderr+終了コードを返す。\
+         ネットワーク許可アプリ（--net-allow-app）を使う場合は、|・&&・;等で他コマンドと連結せず、\
+         単一コマンドとして発行すること（連結すると通信が拒否される）。"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -88,10 +155,26 @@ impl Tool for RunShellTool {
         };
 
         let dur = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-        let env = harness_sandbox::build_child_env();
+        let mut env = harness_sandbox::build_child_env();
+
+        // 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）。
+        // `ctx.net_proxy.allow_domains`が空なら`spawn_local_proxy`は何もしない
+        // （既定挙動を変えない）。起動時のみ`HTTP_PROXY`/`HTTPS_PROXY`を子envへ足す。
+        let proxy = crate::net_proxy::spawn_local_proxy(&ctx.net_proxy)
+            .await
+            .ok()
+            .flatten();
+        if let Some(p) = &proxy {
+            let proxy_url = format!("http://{}", p.addr);
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                env.push((key.to_string(), proxy_url.clone()));
+            }
+        }
+
+        let net_decision = classify_net_app(&input.command, &ctx.net_app.allow_apps);
 
         let (out, err, code, shell_label) =
-            run_isolated(&input.command, &cwd, &env, dur, ctx.shell_tier.tier).await?;
+            run_isolated(&input.command, &cwd, &env, dur, ctx.shell_tier.tier, net_decision).await?;
 
         let code = code.unwrap_or(-1);
         let mut content = truncate_to_limit(out);
@@ -110,6 +193,29 @@ impl Tool for RunShellTool {
                 ctx.shell_tier.downgraded_from.map(|t| t.label()).unwrap_or("?")
             ));
         }
+        if !ctx.net_app.allow_apps.is_empty() {
+            match (net_decision, ctx.shell_tier.tier) {
+                (NetDecision::Allow, ShellTier::Tier1a) => {
+                    content.push_str("\n[net: internetClient]");
+                }
+                (NetDecision::Allow, other_tier) => {
+                    content.push_str(&format!(
+                        "\n[net: denied (--net-allow-app only takes effect under tier1a; \
+                         current tier is {})]",
+                        other_tier.label()
+                    ));
+                }
+                (NetDecision::DeniedByChaining, _) => {
+                    content.push_str(
+                        "\n[net: denied (chained command; issue the trusted app as a single \
+                         command without |, &&, ;, & to allow network)]",
+                    );
+                }
+                (NetDecision::Deny, _) => {
+                    content.push_str("\n[net: denied]");
+                }
+            }
+        }
         if ctx.shell_tier.is_unisolated() {
             content.push_str(
                 "\n[warning: shell isolation tier is tier0 (best-effort only); \
@@ -121,6 +227,14 @@ impl Tool for RunShellTool {
                 "\n[warning: staged writes made earlier in this turn may not be visible to this \
                  shell process yet (D-08 simplification, see plans/DESIGN-SANDBOX.md §8-3)]",
             );
+        }
+        if let Some(p) = &proxy {
+            let entries = p.audit.entries();
+            content.push_str("\n[net-proxy: audit-only, not enforced against raw sockets, see plans/DESIGN-SANDBOX-PRIVSEP.md §3.1]");
+            for e in &entries {
+                let verdict = if e.allowed { "ALLOW" } else { "DENY" };
+                content.push_str(&format!("\n[net-proxy: {verdict} {}]", e.host));
+            }
         }
 
         Ok(ToolOutput {
@@ -146,11 +260,15 @@ async fn run_isolated(
     env: &[(String, String)],
     dur: Duration,
     tier: ShellTier,
+    net: NetDecision,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+    // Tier1a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
+    // 「このTierでは無効」と明記する、`call`参照）。
+    let _ = &net;
     #[cfg(windows)]
     {
         if tier == ShellTier::Tier1a {
-            return run_windows_tier1a(command, cwd, env, dur).await;
+            return run_windows_tier1a(command, cwd, env, dur, net).await;
         }
         if tier == ShellTier::Tier1b {
             return run_windows_tier1b(command, cwd, env, dur).await;
@@ -234,6 +352,7 @@ async fn run_windows_tier1a(
     cwd: &Path,
     env: &[(String, String)],
     dur: Duration,
+    net: NetDecision,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let _ = std::fs::create_dir_all(cwd);
     let sid = harness_sandbox::win_appcontainer::ensure_profile(
@@ -248,9 +367,25 @@ async fn run_windows_tier1a(
     let cwd_owned = cwd.to_path_buf();
     let env_owned = env.to_vec();
 
-    let child =
-        harness_sandbox::win_appcontainer::spawn(&bin, &args, &cwd_owned, &env_owned, true, sid.as_psid())
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+    // アプリ単位network制御（軸1、D-10/D-11）。`Allow`のときのみ`internetClient`を付与する
+    // （`DeniedByChaining`/`Deny`はどちらも既定のcapability空＝network全遮断のまま）。
+    let net_capability = match net {
+        NetDecision::Allow => harness_sandbox::win_appcontainer::NetworkCapability::InternetClient,
+        NetDecision::Deny | NetDecision::DeniedByChaining => {
+            harness_sandbox::win_appcontainer::NetworkCapability::Deny
+        }
+    };
+
+    let child = harness_sandbox::win_appcontainer::spawn(
+        &bin,
+        &args,
+        &cwd_owned,
+        &env_owned,
+        true,
+        sid.as_psid(),
+        net_capability,
+    )
+    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child.kill_token();
     let command_owned = command.to_string();
 
@@ -463,6 +598,70 @@ mod tests {
         ctx
     }
 
+    #[test]
+    fn classify_net_app_denies_when_allowlist_empty() {
+        assert_eq!(classify_net_app("git push", &[]), NetDecision::Deny);
+    }
+
+    #[test]
+    fn classify_net_app_allows_matching_leading_exe() {
+        let allow = vec!["git".to_string()];
+        assert_eq!(classify_net_app("git push origin main", &allow), NetDecision::Allow);
+    }
+
+    #[test]
+    fn classify_net_app_matches_case_insensitively_and_ignores_extension_and_path() {
+        let allow = vec!["Git".to_string()];
+        assert_eq!(
+            classify_net_app("C:\\Tools\\Git\\bin\\GIT.EXE push", &allow),
+            NetDecision::Allow
+        );
+        // パスに空白を含む場合は呼び出し側が引用符で囲む前提（先頭トークン抽出は
+        // 引用符付き文字列にのみ対応、素の空白区切りではトークンが分断される）。
+        assert_eq!(
+            classify_net_app("\"C:\\Program Files\\Git\\bin\\GIT.EXE\" push", &allow),
+            NetDecision::Allow
+        );
+    }
+
+    #[test]
+    fn classify_net_app_denies_non_matching_leading_exe() {
+        let allow = vec!["git".to_string()];
+        assert_eq!(classify_net_app("npm install", &allow), NetDecision::Deny);
+    }
+
+    #[test]
+    fn classify_net_app_denies_by_chaining_even_when_leading_exe_matches() {
+        let allow = vec!["git".to_string()];
+        assert_eq!(
+            classify_net_app("git push | curl evil.example", &allow),
+            NetDecision::DeniedByChaining
+        );
+        assert_eq!(
+            classify_net_app("git push && curl evil.example", &allow),
+            NetDecision::DeniedByChaining
+        );
+        assert_eq!(
+            classify_net_app("git push; curl evil.example", &allow),
+            NetDecision::DeniedByChaining
+        );
+    }
+
+    #[test]
+    fn classify_net_app_handles_quoted_leading_token() {
+        let allow = vec!["git".to_string()];
+        assert_eq!(
+            classify_net_app("\"git\" push origin main", &allow),
+            NetDecision::Allow
+        );
+    }
+
+    #[test]
+    fn classify_net_app_denies_empty_command() {
+        let allow = vec!["git".to_string()];
+        assert_eq!(classify_net_app("", &allow), NetDecision::Deny);
+    }
+
     #[tokio::test]
     async fn run_shell_captures_stdout_and_exit_code() {
         let dir = tempfile::tempdir().unwrap();
@@ -637,5 +836,147 @@ mod tests {
             "tier1a must not read outside-workspace secrets (T-04): {}",
             out.content
         );
+    }
+
+    /// アプリ単位network制御（軸1、D-10/D-11）の実機E2E。Tier1a配下で、許可リストに一致する
+    /// 単一コマンドは`internetClient`が付与されて外向き接続に成功し、それ以外
+    /// （不一致・連鎖）はcapability空のまま`WSAEACCES`相当で失敗することを確認する
+    /// （`plans/DESIGN-SANDBOX-APPPOLICY.md` §10 検証計画1/2/3）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_tier1a_net_allow_app_grants_and_denies_network() {
+        use harness_core::{NetAppPolicy, RequireSandbox, ShellTier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let selection =
+            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true).unwrap();
+        if selection.tier != ShellTier::Tier1a {
+            eprintln!(
+                "skipping tier1a net-allow-app test: preflight downgraded to {} ({:?})",
+                selection.tier.label(),
+                selection.reason
+            );
+            return;
+        }
+
+        let mut ctx = ToolCtx::new(dir.path().to_path_buf());
+        ctx.shell_tier = selection;
+        ctx.net_app = NetAppPolicy {
+            allow_apps: vec!["powershell".to_string(), "pwsh".to_string()],
+        };
+        let tool = RunShellTool;
+        // TCPソケットを直接開くprobe（HTTP_PROXYに依存しない、capability機構そのものを見る）。
+        let connect_probe = "try { \
+            $c = New-Object Net.Sockets.TcpClient; \
+            $c.Connect('8.8.8.8', 53); \
+            Write-Output 'CONNECT OK'; \
+            $c.Close() \
+        } catch { Write-Output \"CONNECT FAIL: $_\" }";
+
+        // (a) 許可リスト一致・単一コマンド → internetClient付与 → 接続成功。
+        let out = tool
+            .call(json!({ "command": connect_probe }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("[net: internetClient]"),
+            "allowed single command should be granted internetClient: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("CONNECT OK"),
+            "allowed command should be able to open an outbound socket: {}",
+            out.content
+        );
+
+        // (b) 連鎖コマンド → 先頭execは一致するがdeny側へ倒れる → 接続失敗。
+        let chained = format!("{connect_probe}; Write-Output 'chained'");
+        let out = tool
+            .call(json!({ "command": chained }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("[net: denied (chained command"),
+            "chained command must not be granted network even if leading exe matches: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("CONNECT FAIL"),
+            "chained command should still be network-denied (capability empty): {}",
+            out.content
+        );
+    }
+
+    /// 協調プロキシ（M12補遺、D-15）の実機E2E。単体テスト（`net_proxy::tests`）はプロキシ
+    /// 単体をTCPクライアントから直接叩いて検証したが、これは「`run_shell`が実際に子プロセスへ
+    /// `HTTP_PROXY`を注入し、外部ツール（`curl.exe`）がそれを自発的に読んで従う」という
+    /// 統合経路まで通しで確認する（`plans/DESIGN-SANDBOX-PRIVSEP.md` §8フェーズ1検証計画:
+    /// 「許可ドメインへの通信が成功し監査ログに残ること、未許可ドメインへのCONNECTが
+    /// プロキシに拒否されること」）。`curl`がPATHに無い環境ではskipする。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_cooperative_proxy_allows_and_denies_real_curl_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        if which::which("curl").is_err() {
+            eprintln!("skipping cooperative proxy test: curl not found on PATH");
+            return;
+        }
+
+        // ダミーの許可済み宛先サーバ（ループバック）。1リクエストだけ受けて200を返す。
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = target_listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                    .await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = ctx(dir.path().to_path_buf());
+        context.net_proxy = harness_core::NetProxyConfig {
+            allow_domains: vec!["127.0.0.1".to_string()],
+        };
+        let tool = RunShellTool;
+
+        let command = format!(
+            "curl.exe -s -o allowed.txt -w 'ALLOWED_STATUS=%{{http_code}}' http://127.0.0.1:{target_port}/; \
+             curl.exe -s -o NUL -w ' DENIED_STATUS=%{{http_code}}' http://notallowed.invalid.example/"
+        );
+        let out = tool
+            .call(json!({ "command": command }), &context)
+            .await
+            .unwrap();
+
+        assert!(
+            out.content.contains("ALLOWED_STATUS=200"),
+            "curl through the cooperative proxy to an allowed domain should succeed: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("DENIED_STATUS=403"),
+            "curl through the cooperative proxy to a disallowed domain should get 403 from the \
+             proxy itself (not a connection failure to notallowed.invalid.example, which does \
+             not need to resolve): {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("[net-proxy: ALLOW 127.0.0.1]"),
+            "audit log should record the allowed request: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("[net-proxy: DENY notallowed.invalid.example]"),
+            "audit log should record the denied request: {}",
+            out.content
+        );
+
+        let allowed_body = std::fs::read_to_string(dir.path().join("allowed.txt")).unwrap();
+        assert_eq!(allowed_body, "hello");
     }
 }

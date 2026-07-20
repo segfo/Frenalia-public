@@ -19,6 +19,11 @@ const ALLOWLIST: &[&str] = &[
     "COMSPEC",
     "CARGO_HOME",
     "RUSTUP_HOME",
+    // `PATHEXT`が無いとWindows PowerShell/pwshは外部ネイティブexeの起動に**サイレントに
+    // 失敗する**（出力無し・終了コード未設定・エラーも出ない）。既存テストがPowerShell
+    // 組み込みコマンドレット（Write-Output等）のみを使っていたため長らく露呈しなかった
+    // （協調プロキシE2Eテストでcurl.exeを初めて外部起動して発覚、bug-catalog参照）。
+    "PATHEXT",
 ];
 
 /// allowlistに載っていても除去する秘密っぽい名前パターン（大小無視の部分一致）。

@@ -170,6 +170,35 @@ impl Default for ShellTierSelection {
     }
 }
 
+/// 協調プロキシ設定（`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）。`run_shell`子へ
+/// `HTTP_PROXY`/`HTTPS_PROXY`として注入するローカルプロキシの許可ドメインを運ぶ。
+/// **強制ではない**: 環境変数を読まず生ソケットを直接開く子はこの制御を素通りできる
+/// （既知の限界として明示、`harness-tools::net_proxy`参照）。`harness-core`は値を運ぶだけ、
+/// 判定・プロキシ実体は`harness-tools::net_proxy`（`StagingConfig`/`ReadScopeConfig`と同じ
+/// 役割分担）。
+#[derive(Debug, Clone, Default)]
+pub struct NetProxyConfig {
+    /// 許可ドメイン（`*.example.com`形式のサフィックスワイルドカードに対応）。空なら
+    /// プロキシ自体を起動しない（既定は何もしない＝現状維持、`run_shell`出力は変わらない）。
+    pub allow_domains: Vec<String>,
+}
+
+/// アプリ単位network制御設定（軸1、`plans/DESIGN-SANDBOX-APPPOLICY.md` D-10/D-11）。
+/// Tier1a（AppContainer）で、先頭exe名が`allow_apps`に一致する信頼コマンドにのみ
+/// `internetClient` capabilityを付与するための許可リストを運ぶ。空なら常にdeny（既定・
+/// 現状維持＝network全遮断）。判定（`classify_net_app`）とcapability適用は`harness-tools`/
+/// `harness-sandbox`側で行い、`harness-core`は値を運ぶだけ（`NetProxyConfig`と同じ役割分担）。
+///
+/// **Tier1a限定**: Tier1b/0/2はcapability機構を持たないため、これらのTierでは`allow_apps`は
+/// 効かない（`run_shell`がその旨をフッタに明記する）。
+#[derive(Debug, Clone, Default)]
+pub struct NetAppPolicy {
+    /// 信頼アプリの実行ファイル名リスト（basename・拡張子除去・小文字で照合。例`git`/`npm`）。
+    /// インタプリタ/スクリプト名を入れると中身が呼ぶ全通信が通る（T-15、子孫全継承）ため、
+    /// 具体的で狭い実行ファイル名のみを推奨する（D-11）。
+    pub allow_apps: Vec<String>,
+}
+
 /// 実行前ゲート（`PermissionArbiter`）が参照するリスク分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -212,6 +241,12 @@ pub struct ToolCtx {
     /// `harness-sandbox::select_tier`を呼ばないテスト経路向けのプレースホルダで、
     /// 実行時は`harness-cli`が起動時に1回選択した値を積む。
     pub shell_tier: ShellTierSelection,
+    /// 協調プロキシ設定（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）。既定
+    /// （`NetProxyConfig::default()`＝`allow_domains`空）はプロキシを起動しない。
+    pub net_proxy: NetProxyConfig,
+    /// アプリ単位network制御（軸1、D-10/D-11）。既定（`NetAppPolicy::default()`＝`allow_apps`空）は
+    /// 常にdeny（Tier1a子はcapability空でnetwork全遮断＝現状維持）。
+    pub net_app: NetAppPolicy,
 }
 
 impl ToolCtx {
@@ -223,6 +258,8 @@ impl ToolCtx {
             staging: StagingConfig::default(),
             read_scope: ReadScopeConfig::default(),
             shell_tier: ShellTierSelection::default(),
+            net_proxy: NetProxyConfig::default(),
+            net_app: NetAppPolicy::default(),
         }
     }
 }

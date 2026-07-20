@@ -18,6 +18,7 @@
 //! ツール本体はそれを意識しない（呼ばれた時点で既に許可済み）。
 
 mod fs_tools;
+mod net_proxy;
 mod search;
 mod shell;
 mod web;

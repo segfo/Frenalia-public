@@ -217,6 +217,23 @@ struct Cli {
     /// （T-04/T-10対策）、または`--require-sandbox=confidential`を通したい場合に指定する。
     #[arg(long = "experimental-tier1a", default_value_t = false)]
     experimental_tier1a: bool,
+
+    /// 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）の許可ドメインを
+    /// 追加する（繰り返し指定可、`*.example.com`形式のサフィックスワイルドカード対応）。
+    /// `.harness/settings.json`の`net.allow_domains`と合算する（和集合）。1つでも指定される
+    /// と`run_shell`子へ`HTTP_PROXY`/`HTTPS_PROXY`を注入するローカルプロキシが起動する
+    /// （**強制ではない**、環境変数を無視する生ソケット呼び出しはバイパスできる）。
+    #[arg(long = "net-allow-domain")]
+    net_allow_domain: Vec<String>,
+
+    /// アプリ単位network制御（軸1、`plans/DESIGN-SANDBOX-APPPOLICY.md` D-10/D-11）の信頼アプリ名を
+    /// 追加する（繰り返し指定可、実行ファイルのbasename・拡張子除去・小文字で照合。例`git`）。
+    /// `.harness/settings.json`の`net.allow_apps`と合算する（和集合）。Tier1a（AppContainer）でのみ
+    /// 効く: 先頭execが一致した単一コマンド（`|`/`&&`/`;`等で連結されていない）にのみ
+    /// `internetClient` capabilityを付与し外向き通信を許可する（宛先無差別、T-15でプロセスツリー
+    /// 全体が継承）。`--require-sandbox=confidential`と同時指定はできない（意味的に矛盾、起動拒否）。
+    #[arg(long = "net-allow-app")]
+    net_allow_app: Vec<String>,
 }
 
 /// `--require-sandbox[=confidential]`の文字列表現を`RequireSandbox`へ変換する
@@ -701,9 +718,40 @@ async fn main() -> ExitCode {
         .unwrap_or_default()
         .to_read_scope_config();
 
+    // 協調プロキシ設定（M12補遺、D-15）。CLI `--net-allow-domain`（繰り返し）と
+    // `.harness/settings.json`の`net.allow_domains`を和集合でマージする（重複除去）。
+    let mut net_proxy = settings.net.clone().unwrap_or_default().to_net_proxy_config();
+    for domain in &cli.net_allow_domain {
+        if !net_proxy.allow_domains.contains(domain) {
+            net_proxy.allow_domains.push(domain.clone());
+        }
+    }
+
+    // アプリ単位network制御（軸1、D-10/D-11）。CLI `--net-allow-app`（繰り返し）と
+    // `.harness/settings.json`の`net.allow_apps`を和集合でマージする（重複除去、net_proxyと同形）。
+    let mut net_app = settings.net.clone().unwrap_or_default().to_net_app_policy();
+    for app in &cli.net_allow_app {
+        if !net_app.allow_apps.contains(app) {
+            net_app.allow_apps.push(app.clone());
+        }
+    }
+
     // シェル隔離Tier選択（M12、`plans/DESIGN-SANDBOX.md` §6/§7 D-03）。`--require-sandbox`指定時は
     // 自動降格せず起動を拒否する（既存の`--dangerously-allow`と同じfail-fastパターン）。
     let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
+
+    // confidential（外部持出し経路を作らない明示拒否モード＝通信許可リストを無効化する上位モード）
+    // と net-allow-app（通信を開く）は意味的に矛盾するため、黙って無視/弱めず起動を拒否する
+    // （`--require-sandbox`のsatisfiesと同じfail-fast思想、`plans/DESIGN-SANDBOX-APPPOLICY.md` §7）。
+    if require_sandbox == RequireSandbox::Confidential && !net_app.allow_apps.is_empty() {
+        eprintln!(
+            "error: --net-allow-app conflicts with --require-sandbox=confidential (confidential \
+             mode denies all outbound network unconditionally; refusing to start rather than \
+             silently ignoring --net-allow-app or weakening the confidentiality guarantee)"
+        );
+        return ExitCode::FAILURE;
+    }
+
     let shell_tier = match select_tier(require_sandbox, &workspace_root, cli.experimental_tier1a) {
         Ok(selection) => selection,
         Err(e) => {
@@ -739,6 +787,8 @@ async fn main() -> ExitCode {
         },
         read_scope,
         shell_tier,
+        net_proxy,
+        net_app,
     };
 
     match cli.print {

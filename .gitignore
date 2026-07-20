@@ -1,3 +1,5 @@
 /target
 /.harness
 /.env
+tools/procmon/*.PML
+*.exe

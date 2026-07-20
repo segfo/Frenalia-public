@@ -392,6 +392,8 @@ mod tests {
             },
             read_scope: Default::default(),
             shell_tier: Default::default(),
+            net_proxy: Default::default(),
+            net_app: Default::default(),
         };
 
         let tool = WriteFileTool;

@@ -17,9 +17,12 @@
 //! Tier1a下でaccess-deniedになり得る（`docs/phases/foundation/M12-shell-isolation-tiers.md`
 //! 追記セクション参照）。
 //!
-//! **将来の拡張余地（未実装）**: `internetClient`（`S-1-15-3-1`）等のcapability SIDを
-//! 許可リストとして足す口は、必要になった時点で`ensure_profile`/`spawn`のcapability引数を
-//! 空でなくする形で足せる。現時点では使われない拡張ポイントを先回りで作らない。
+//! **アプリ単位network制御（軸1・D-10/D-11、`plans/DESIGN-SANDBOX-APPPOLICY.md`）**:
+//! `spawn`は`NetworkCapability`引数を取り、既定`Deny`（capability空）に対し、信頼クラス
+//! （`--net-allow-app`一致）のコマンドにのみ`InternetClient`（`internetClient`=`S-1-15-3-1`）を
+//! 1個積んで外向きソケットを開ける。付与はプロセスツリー全体が継承する（T-15）ため、実効境界は
+//! 「1 `run_shell`呼び出し=1 networkポリシー」であり、信頼付与は最小コマンド集合に限定するのが前提
+//! （D-11）。宛先無差別（宛先単位の細粒度はWFP=管理者、本実装のスコープ外）。
 
 use std::ffi::c_void;
 use std::path::Path;
@@ -29,15 +32,16 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
-    BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    SE_KERNEL_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_W,
+    BuildTrusteeWithSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+    GetNamedSecurityInfoW, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
+    SetSecurityInfo, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
     ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, FreeSid, NO_INHERITANCE,
-    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
+    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
 };
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -370,11 +374,26 @@ impl Drop for AppContainerChild {
     }
 }
 
-/// AppContainer属性（`SECURITY_CAPABILITIES`、capability無し=既定deny）を付けて
-/// `CreateProcessW`で子を起動する。Tier1bの`CreateProcessAsUserW`+制限トークンとは別方式:
-/// トークンは差し替えず、呼び出しスレッド自身のトークンのまま拡張属性リストで
-/// AppContainerへ閉じ込める。そのため`SeAssignPrimaryTokenPrivilege`系の罠（BUG-003）は
-/// Tier1aには存在しない。
+/// Tier1a子プロセスへ与えるnetwork capability（D-10、`plans/DESIGN-SANDBOX-APPPOLICY.md` §3）。
+/// 既定は`Deny`（capability空=`CapabilityCount 0`、T-10外部持出し全遮断の核）。`InternetClient`は
+/// `--net-allow-app`一致の信頼クラスにのみ与えられ、`internetClient`（`S-1-15-3-1`）1個を積んで
+/// 外向きソケットを開ける（宛先無差別、T-15でツリー全体が継承）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkCapability {
+    /// capability空。networkを含む全capability-gatedリソースがdefault-deny（既定・安全側）。
+    Deny,
+    /// `internetClient`（S-1-15-3-1）を1個だけ積む。外向きソケットのみ許可（宛先無差別）。
+    InternetClient,
+}
+
+/// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する。
+/// Tier1bの`CreateProcessAsUserW`+制限トークンとは別方式: トークンは差し替えず、呼び出し
+/// スレッド自身のトークンのまま拡張属性リストでAppContainerへ閉じ込める。そのため
+/// `SeAssignPrimaryTokenPrivilege`系の罠（BUG-003）はTier1aには存在しない。
+///
+/// `net`が`InternetClient`のときのみcapability配列に`internetClient` SIDを1個積む。SIDの
+/// 生成（`ConvertStringSidToSidW`）と解放（`LocalFree`）はこの関数内に閉じ込め、呼び出し側へ
+/// unsafeなSID寿命管理を漏らさない（`spawn_with_capabilities`は診断専用のまま温存）。
 pub fn spawn(
     exe: &str,
     args: &[&str],
@@ -382,6 +401,56 @@ pub fn spawn(
     env: &[(String, String)],
     want_stdin: bool,
     container_sid: PSID,
+    net: NetworkCapability,
+) -> Result<AppContainerChild, AppContainerError> {
+    match net {
+        NetworkCapability::Deny => {
+            spawn_impl(exe, args, cwd, env, want_stdin, container_sid, &[])
+        }
+        NetworkCapability::InternetClient => unsafe {
+            let mut cap_sid = PSID::default();
+            let sid_str = wide("S-1-15-3-1");
+            ConvertStringSidToSidW(PCWSTR(sid_str.as_ptr()), &mut cap_sid).map_err(|e| {
+                AppContainerError::Win32(format!("ConvertStringSidToSidW(internetClient): {e}"))
+            })?;
+            let capabilities = [SID_AND_ATTRIBUTES {
+                Sid: cap_sid,
+                Attributes: 0x0000_0004, // SE_GROUP_ENABLED
+            }];
+            let result = spawn_impl(exe, args, cwd, env, want_stdin, container_sid, &capabilities);
+            let _ = LocalFree(HLOCAL(cap_sid.0));
+            result
+        },
+    }
+}
+
+/// 診断専用（`experiment_f`、削除拒否問題がゼロcapability固有かを切り分けるため）。
+/// 本番の`spawn`は常に`&[]`（capability空、D-02の既定挙動）を渡すため、この関数の存在は
+/// 本番のnetwork default-denyという中核の安全保証に一切影響しない。
+#[cfg(test)]
+pub(crate) fn spawn_with_capabilities(
+    exe: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(String, String)],
+    want_stdin: bool,
+    container_sid: PSID,
+    capabilities: &[SID_AND_ATTRIBUTES],
+) -> Result<AppContainerChild, AppContainerError> {
+    spawn_impl(exe, args, cwd, env, want_stdin, container_sid, capabilities)
+}
+
+/// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する実体。
+/// `capabilities`が空なら`CapabilityCount=0`（本番`spawn`の既定=D-02）、空でなければ
+/// 診断専用`spawn_with_capabilities`経由でのみ呼ばれる。
+fn spawn_impl(
+    exe: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(String, String)],
+    want_stdin: bool,
+    container_sid: PSID,
+    capabilities: &[SID_AND_ATTRIBUTES],
 ) -> Result<AppContainerChild, AppContainerError> {
     // どのWin32呼び出しが失敗したかをエラー文字列に残す（AppContainerの起動は失敗モードが
     // 多く、0x57 ERROR_INVALID_PARAMETER等がどの段で出たかを区別できないと切り分けられない）。
@@ -415,10 +484,15 @@ pub fn spawn(
     let cwd_w = wide(&cwd.to_string_lossy());
     let mut env_block = build_env_block(env);
 
+    let mut capabilities_buf = capabilities.to_vec();
     let mut security_capabilities = SECURITY_CAPABILITIES {
         AppContainerSid: container_sid,
-        Capabilities: std::ptr::null_mut(),
-        CapabilityCount: 0,
+        Capabilities: if capabilities_buf.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            capabilities_buf.as_mut_ptr()
+        },
+        CapabilityCount: capabilities_buf.len() as u32,
         Reserved: 0,
     };
 
@@ -581,6 +655,7 @@ fn smoke_test_spawn(sid: PSID, workspace_root: &Path, probe_dir: &Path) -> Resul
         &env,
         false,
         sid,
+        NetworkCapability::Deny,
     )
     .map_err(|e| AppContainerError::Preflight(format!("shell could not start: {e}")))?;
     let (_, _, code) = child
@@ -724,6 +799,7 @@ mod traverse_diagnostics {
             &env,
             false,
             sid,
+            NetworkCapability::Deny,
         )
         .expect("spawn should succeed even if the shell command itself fails inside");
         let (out, err, code) = child
@@ -744,7 +820,7 @@ mod traverse_diagnostics {
         let cmd_exe = format!("{system_root}\\System32\\cmd.exe");
         println!("=== probe(cmd.exe): dir={} ===", dir.display());
         let env = crate::secret_env::build_child_env();
-        let child = spawn(&cmd_exe, &["/d", "/c", "dir"], dir, &env, false, sid)
+        let child = spawn(&cmd_exe, &["/d", "/c", "dir"], dir, &env, false, sid, NetworkCapability::Deny)
         .expect("spawn should succeed even if the shell command itself fails inside");
         let (out, err, code) = child
             .write_stdin_read_output_and_wait(None)
@@ -769,6 +845,119 @@ mod traverse_diagnostics {
         grant_ace_recursive(&dir, sid.as_psid()).expect("grant_ace_recursive on neutral dir");
         run_probe(sid.as_psid(), &dir);
         run_probe_cmd(sid.as_psid(), &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 診断: AppContainer子プロセス自身の実効整合性レベルを観測する（`C:\`のtraverse不要、
+    /// `C:\ProgramData`配下の非侵襲実験）。`experiment_d`で発見した`Mandatory Label\Low
+    /// Mandatory Level:(NW)`が、削除拒否の真因（DACLではなくMIC）かどうかを切り分ける。
+    #[test]
+    #[ignore]
+    fn experiment_e_integrity_level_probe() {
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let dir = std::path::PathBuf::from(format!(
+            "C:\\ProgramData\\harness-sandbox-diag-e\\{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create neutral dir");
+        grant_ace_recursive(&dir, sid.as_psid()).expect("grant_ace_recursive on neutral dir");
+
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        // whoami/Get-ChildItem等FileSystemプロバイダに触れるコマンドはtraverse無しでは
+        // 失敗する（M12追記2の既知症状）ため、純粋な.NETトークン列挙のみでMandatory Label
+        // SID（S-1-16-*）を取得する。
+        let command = "$id = [System.Security.Principal.WindowsIdentity]::GetCurrent(); \
+             Write-Output ('User=' + $id.User.Value); \
+             $id.Groups | Where-Object { $_.Value -like 'S-1-16-*' } | ForEach-Object { Write-Output ('IntegritySid=' + $_.Value) }";
+        let child = spawn(&shell, &["-NoProfile", "-NonInteractive", "-Command", command], &dir, &env, false, sid.as_psid(), NetworkCapability::Deny)
+            .expect("spawn should succeed");
+        let (out, err, code) = child.write_stdin_read_output_and_wait(None).expect("pipe I/O should not fail");
+        println!("=== AppContainer child integrity level probe: exit={code} ===\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Experiment F: ゼロcapability（`CapabilityCount=0`）自体が削除拒否の原因かを切り分ける
+    /// 診断実験。`internetClient`相当のcapabilityを1つだけ付けた場合に`Remove-Item`が通るかを
+    /// 確認する。**これはTier1aのnetwork default-deny（T-10対策の核）を一時的に崩す診断専用の
+    /// 実験であり、恒久的な挙動変更ではない**（`spawn_with_capabilities`は`#[cfg(test)]`限定）。
+    ///
+    /// `experiment_c`/`d`と同じく`C:\`ルートへの単一traverse ACEが前提として要る
+    /// （`C:\ProgramData`配下であってもtraverse無しではFS I/O自体ができないため、
+    /// capability変数だけを切り分けて観測できない。当初`experiment_a`/`e`が非侵襲で動いて
+    /// 見えたのは、それらがFileSystemプロバイダに触れないコマンドのみを使っていたためだと
+    /// 判明した）。grant〜revoke間はResultのみで構成し必ず原状復帰する。
+    #[test]
+    #[ignore]
+    fn experiment_f_nonempty_capability_delete_probe() {
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+
+        let drive_root = std::path::PathBuf::from("C:\\");
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let dir = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-f-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create verify workspace under C:\\ (needs admin)");
+        grant_ace_recursive(&dir, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+
+        let traverse_grant = grant_ace_mask(
+            &drive_root,
+            sid.as_psid(),
+            windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0,
+            NO_INHERITANCE,
+        );
+        println!("=== C:\\ traverse ACE grant result: {traverse_grant:?} ===");
+
+        // internetClient capability (S-1-15-3-1) を1つだけ持つcapability配列を組み立てる。
+        let cap_result: windows::core::Result<()> = (|| unsafe {
+            if traverse_grant.is_err() {
+                println!("=== Experiment F skipped: C:\\ traverse grant failed ===");
+                return Ok(());
+            }
+            let mut cap_sid = PSID::default();
+            let sid_str = wide("S-1-15-3-1");
+            ConvertStringSidToSidW(windows::core::PCWSTR(sid_str.as_ptr()), &mut cap_sid)?;
+            let capabilities = [SID_AND_ATTRIBUTES {
+                Sid: cap_sid,
+                Attributes: 0x0000_0004, // SE_GROUP_ENABLED
+            }];
+
+            let (shell, _) = resolve_shell();
+            let env = crate::secret_env::build_child_env();
+            let command = "Remove-Item -LiteralPath 'f-probe.tmp' -Force -ErrorAction SilentlyContinue; \
+                 New-Item -ItemType File -Path 'f-probe.tmp' -Force | Out-Null; \
+                 try { Remove-Item -LiteralPath 'f-probe.tmp' -Force; Write-Output 'DELETE OK' } \
+                 catch { Write-Output \"DELETE FAIL: $_\" }";
+            let child = spawn_with_capabilities(
+                &shell,
+                &["-NoProfile", "-NonInteractive", "-Command", command],
+                &dir,
+                &env,
+                false,
+                sid.as_psid(),
+                &capabilities,
+            )
+            .expect("spawn_with_capabilities should succeed");
+            let (out, err, code) = child
+                .write_stdin_read_output_and_wait(None)
+                .expect("pipe I/O should not fail");
+            println!(
+                "=== Experiment F (internetClient capability, non-empty): exit={code} ===\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+            );
+
+            let _ = LocalFree(HLOCAL(cap_sid.0));
+            Ok(())
+        })();
+        if let Err(e) = cap_result {
+            println!("=== Experiment F setup failed: {e:?} ===");
+        }
+
+        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
+        println!("=== C:\\ traverse ACE revoke result: {revoke_result:?} ===");
+        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -805,6 +994,774 @@ mod traverse_diagnostics {
 
     fn dirs_home() -> Option<std::path::PathBuf> {
         std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from)
+    }
+
+    /// Experiment C: 「traverse-only仮説」の実証実験（`plans/TIER1A-OPEN-ISSUES.md`
+    /// フェーズ2）。**結論（`docs/phases/foundation/M12-shell-isolation-tiers.md`追記5参照）**:
+    /// 仮説は部分的にのみ成立する。`C:\`ルートへのtraverse ACE 1本で`cd`/`Get-ChildItem`/
+    /// `New-Item`/`Get-Content`は全て回復するが、**`Remove-Item`だけが独立した理由で
+    /// アクセス拒否のまま**残り、本番`smoke_test_spawn`（New-Item→Get-Content→Remove-Item→
+    /// exit 0、失敗でexit 3）は失敗し続ける。traverse欠如とは別種の、AppContainerにおける
+    /// 削除操作固有の権限問題が残っている。
+    ///
+    /// Experiment Bは`%USERPROFILE%`（`C:\Users\<user>`）1段だけにtraverseを付与して失敗した
+    /// （上流の`C:\`・`C:\Users`が塞がったまま）。今回は**祖先チェーンを1段に最小化**するため、
+    /// ドライブルート直下の浅いワークスペース`C:\harness-tier1a-verify-<pid>`を使う。これにより
+    /// 唯一のシステムACL変更を「**`C:\`ルートへの単一・非継承`FILE_TRAVERSE`ACE 1本のみ**」に
+    /// 絞れる（`C:\Users`以下には一切触れない）。
+    ///
+    /// grant〜revoke間は`Result`を返す処理のみで構成し（`panic!`する`expect`を挟まない）、
+    /// テストが途中失敗しても`C:\`のACEが必ず消えるようにする。プローブ結果自体は
+    /// **アサートせず観測に留める**（結論は上記の通り既に確定しているが、この機種固有の
+    /// 挙動が将来変化していないかを`--nocapture`で目視確認する診断テストとして残す）。
+    #[test]
+    #[ignore]
+    fn experiment_c_full_chain_traverse_recovers_fs_io() {
+        let drive_root = std::path::PathBuf::from("C:\\");
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-{}",
+            std::process::id()
+        ));
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+
+        // ワークスペース作成+フルアクセス付与（既存`preflight`と同じ手順）。
+        std::fs::create_dir_all(&workspace).expect("create verify workspace under C:\\ (needs admin write on drive root)");
+        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+        let probe_dir = workspace.join(".harness").join("sandbox").join("tier1a-tmp");
+        std::fs::create_dir_all(&probe_dir).expect("create probe dir (inherits ACE from workspace)");
+
+        // 唯一のシステムACL変更: C:\ ルートへの単一ACE。
+        let grant_result = grant_ace_mask(
+            &drive_root,
+            sid.as_psid(),
+            windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0,
+            NO_INHERITANCE,
+        );
+        println!("=== C:\\ traverse ACE grant result: {grant_result:?} ===");
+
+        if grant_result.is_ok() {
+            // 本番プローブ（軽量・終了コードのみ判定、probe_dirはworkspace直下から3階層深い
+            // `.harness/sandbox/tier1a-tmp`）。panicさせずResultで受ける。
+            let production_result = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir);
+            println!("=== production probe (smoke_test_spawn, deep probe_dir) result: {production_result:?} ===");
+
+            // 追加確認: probe_dirをworkspace自身（1階層のみ）にした場合に成否が変わるかを見る
+            // （run_probeがworkspace直下でのI/Oに成功している観測との整合性を取るため）。
+            let shallow_result = smoke_test_spawn(sid.as_psid(), &workspace, &workspace);
+            println!("=== production probe (smoke_test_spawn, shallow probe_dir=workspace) result: {shallow_result:?} ===");
+
+            // 詳細観測（stdout全文）。
+            run_probe(sid.as_psid(), &workspace);
+            run_probe_cmd(sid.as_psid(), &workspace);
+
+            // smoke_test_spawnがなぜ失敗するか（New-Item/Get-Content/Remove-Itemのどの段か）
+            // をtry/catchの詳細出力付きで観測する。
+            let verbose_probe = "\
+                $p = Join-Path $env:HARNESS_PROBE_DIR ([Guid]::NewGuid().ToString() + '.tmp'); \
+                Write-Output \"p=$p\"; \
+                try { New-Item -ItemType File -Path $p -Force | Out-Null; Write-Output 'NEW-ITEM OK' } catch { Write-Output \"NEW-ITEM FAIL: $_\" }; \
+                try { Get-Content -LiteralPath $p | Out-Null; Write-Output 'GET-CONTENT OK' } catch { Write-Output \"GET-CONTENT FAIL: $_\" }; \
+                try { Remove-Item -LiteralPath $p -Force; Write-Output 'REMOVE-ITEM OK' } catch { Write-Output \"REMOVE-ITEM FAIL: $_\" }";
+            let (shell, _) = resolve_shell();
+            let mut env = crate::secret_env::build_child_env();
+            env.push(("HARNESS_PROBE_DIR".to_string(), workspace.to_string_lossy().into_owned()));
+            let child = spawn(&shell, &["-NoProfile", "-NonInteractive", "-Command", verbose_probe], &workspace, &env, false, sid.as_psid(), NetworkCapability::Deny)
+                .expect("spawn should succeed");
+            let (out, err, code) = child.write_stdin_read_output_and_wait(None).expect("pipe I/O should not fail");
+            println!("=== verbose New-Item/Get-Content/Remove-Item probe: exit={code} ===\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+
+            println!(
+                "=== HYPOTHESIS RESULT: traverse-only recovers FS I/O (deep)={} (shallow)={} ===",
+                production_result.is_ok(),
+                shallow_result.is_ok()
+            );
+        }
+
+        // 必ず原状復帰: grant成否に関わらずrevokeを試みる（冪等、既存ACE無しでも安全）。
+        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
+        println!("=== C:\\ traverse ACE revoke result: {revoke_result:?} ===");
+        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// PowerShellコマンドをtry/catchで包み、成否を終了コードのみで判定するヘルパー
+    /// （`$LASTEXITCODE`の文字列パースに頼らない、`smoke_test_spawn`と同じ設計原則）。
+    /// 失敗時は詳細を`println!`で焼き付ける（観測目的、アサートしない）。
+    fn run_probe_bool(sid: PSID, dir: &Path, command: &str) -> bool {
+        let wrapped = format!(
+            "try {{ {command} }} catch {{ Write-Output \"CAUGHT: $_\"; exit 1 }}"
+        );
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", &wrapped],
+            dir,
+            &env,
+            false,
+            sid,
+            NetworkCapability::Deny,
+        )
+        .expect("spawn should succeed even if the shell command itself fails inside");
+        let (out, err, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("pipe I/O should not fail");
+        if code != 0 {
+            println!("--- probe failed (exit={code}) ---\nstdout: {out}\nstderr: {err}");
+        }
+        code == 0
+    }
+
+    /// `CreateWellKnownSid`でよく知られたSID（例`WinBuiltinAnyPackageSid`=ALL APPLICATION
+    /// PACKAGES、S-1-15-2-1相当）を取得する。呼び出し側バッファ確保方式のため、
+    /// `OwnedContainerSid`の`FreeSid`とも`ConvertStringSidToSidW`の`LocalFree`とも異なり
+    /// **解放不要**（`Vec<u8>`がスコープを抜ければ自動で片付く、3系統目の解放パターン）。
+    fn well_known_sid(
+        sid_type: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
+    ) -> windows::core::Result<Vec<u8>> {
+        use windows::Win32::Security::CreateWellKnownSid;
+        // SECURITY_MAX_SID_SIZEは68バイト（MSDN定義）。
+        let mut buf = vec![0u8; 68];
+        let mut size = buf.len() as u32;
+        unsafe {
+            CreateWellKnownSid(sid_type, PSID::default(), PSID(buf.as_mut_ptr() as *mut _), &mut size)?;
+        }
+        buf.truncate(size as usize);
+        Ok(buf)
+    }
+
+    /// Experiment D: `Remove-Item`アクセス拒否（experiment_cで発見）の追加ACE特定。
+    /// `plans/TIER1A-OPEN-ISSUES.md`フェーズ3のブロッカーを解消するため、4つの仮説を
+    /// 安価な順に試す。experiment_cと同じく`C:\`への単一traverse ACEを前提とし、
+    /// grant〜revoke間はResultのみで構成する（panicしない、必ず原状復帰）。
+    ///
+    /// - H1: 継承ACEの伝播バグ説 — New-Item後のファイルへ直接・非継承でDELETEを再付与
+    /// - H2: 親ディレクトリの`FILE_DELETE_CHILD`が要る説（教科書的なORが実際はAND）
+    /// - H3: ALL APPLICATION PACKAGES（S-1-15-2-1）へのACEが要る説
+    /// - H4: ALL RESTRICTED APPLICATION PACKAGES（S-1-15-2-2、ゼロcapability=LowBox
+    ///   restricted判定に伴う二重チェック）が要る説
+    #[test]
+    #[ignore]
+    fn experiment_d_delete_permission_probes() {
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows::Win32::Security::WinBuiltinAnyPackageSid;
+
+        let drive_root = std::path::PathBuf::from("C:\\");
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-d-{}",
+            std::process::id()
+        ));
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        std::fs::create_dir_all(&workspace)
+            .expect("create verify workspace under C:\\ (needs admin write on drive root)");
+        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+
+        let grant_result = grant_ace_mask(
+            &drive_root,
+            sid.as_psid(),
+            windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0,
+            NO_INHERITANCE,
+        );
+        println!("=== C:\\ traverse ACE grant result: {grant_result:?} ===");
+
+        if grant_result.is_ok() {
+            // baseline: 何も追加せず、素朴なcreate+deleteが失敗することを確認する
+            // （experiment_cの結果と一致するはずの対照）。
+            let baseline_ok = run_probe_bool(
+                sid.as_psid(),
+                &workspace,
+                "Remove-Item -LiteralPath 'baseline-probe.tmp' -Force -ErrorAction SilentlyContinue; \
+                 New-Item -ItemType File -Path 'baseline-probe.tmp' -Force | Out-Null; \
+                 Remove-Item -LiteralPath 'baseline-probe.tmp' -Force",
+            );
+            println!("=== BASELINE (no extra ACE) create+delete succeeded = {baseline_ok} ===");
+
+            // H1: 新規ファイルへ直接・非継承でDELETEを再付与してから削除を試みる。
+            let h1_file = workspace.join("h1-probe.tmp");
+            let h1_create_ok = run_probe_bool(
+                sid.as_psid(),
+                &workspace,
+                "New-Item -ItemType File -Path 'h1-probe.tmp' -Force | Out-Null",
+            );
+            // 診断: 作成直後のファイルの実DACLを、管理者権限のRustテストプロセス自身から
+            // icacls経由で観測する（継承ACEが本当に付いているかの直接証拠）。
+            if h1_create_ok {
+                let icacls_out = std::process::Command::new("icacls")
+                    .arg(&h1_file)
+                    .output();
+                match icacls_out {
+                    Ok(o) => println!(
+                        "=== icacls on freshly-created h1-probe.tmp ===\n{}",
+                        String::from_utf8_lossy(&o.stdout)
+                    ),
+                    Err(e) => println!("=== icacls failed to run: {e} ==="),
+                }
+            }
+            let h1_ok = if h1_create_ok {
+                let direct_grant = grant_ace_mask(&h1_file, sid.as_psid(), DELETE.0, NO_INHERITANCE);
+                println!("=== H1 direct-grant DELETE on file result: {direct_grant:?} ===");
+                direct_grant.is_ok()
+                    && run_probe_bool(sid.as_psid(), &workspace, "Remove-Item -LiteralPath 'h1-probe.tmp' -Force")
+            } else {
+                println!("=== H1 skipped: could not even create the probe file ===");
+                false
+            };
+            println!("=== H1 (direct non-inherited DELETE on file) succeeded = {h1_ok} ===");
+
+            // H5: icacls出力で観測した`Mandatory Label\Low Mandatory Level:(NW)`が真因か
+            // どうかを直接検証する。h1_fileがまだ存在する場合、管理者権限のRustプロセス
+            // 自身から`icacls /setintegritylevel Medium`でMandatory LabelをMediumへ
+            // 引き上げてから削除を試みる（DACLではなくMICが原因という仮説）。
+            let h5_ok = if h1_create_ok && !h1_ok {
+                let relabel = std::process::Command::new("icacls")
+                    .arg(&h1_file)
+                    .arg("/setintegritylevel")
+                    .arg("Medium")
+                    .output();
+                match relabel {
+                    Ok(o) if o.status.success() => {
+                        println!(
+                            "=== H5 icacls /setintegritylevel Medium succeeded: {} ===",
+                            String::from_utf8_lossy(&o.stdout)
+                        );
+                        run_probe_bool(sid.as_psid(), &workspace, "Remove-Item -LiteralPath 'h1-probe.tmp' -Force")
+                    }
+                    Ok(o) => {
+                        println!(
+                            "=== H5 icacls /setintegritylevel failed: stdout={} stderr={} ===",
+                            String::from_utf8_lossy(&o.stdout),
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        println!("=== H5 icacls could not run: {e} ===");
+                        false
+                    }
+                }
+            } else {
+                println!("=== H5 skipped (H1 already succeeded or file missing) ===");
+                false
+            };
+            println!("=== H5 (Mandatory Label raised to Medium) succeeded = {h5_ok} ===");
+
+            // H2: 親ディレクトリへFILE_DELETE_CHILDを付与してからcreate+delete。
+            let h2_grant = grant_ace_mask(
+                &workspace,
+                sid.as_psid(),
+                windows::Win32::Storage::FileSystem::FILE_DELETE_CHILD.0,
+                CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+            );
+            println!("=== H2 grant FILE_DELETE_CHILD on workspace result: {h2_grant:?} ===");
+            let h2_ok = h2_grant.is_ok()
+                && run_probe_bool(
+                    sid.as_psid(),
+                    &workspace,
+                    "Remove-Item -LiteralPath 'h2-probe.tmp' -Force -ErrorAction SilentlyContinue; \
+                     New-Item -ItemType File -Path 'h2-probe.tmp' -Force | Out-Null; \
+                     Remove-Item -LiteralPath 'h2-probe.tmp' -Force",
+                );
+            println!("=== H2 (FILE_DELETE_CHILD on parent) succeeded = {h2_ok} ===");
+            // H3以降の判定を汚染しないよう、H2で付与したACEを取り消す。
+            let _ = revoke_ace(&workspace, sid.as_psid());
+            let _ = grant_ace_recursive(&workspace, sid.as_psid());
+
+            // H3: ALL APPLICATION PACKAGES (S-1-15-2-1) へ同マスクを付与。
+            let h3_access =
+                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0 | DELETE.0
+                    | windows::Win32::Storage::FileSystem::FILE_DELETE_CHILD.0;
+            let h3_ok = match well_known_sid(WinBuiltinAnyPackageSid) {
+                Ok(buf) => {
+                    let all_app_packages_sid = PSID(buf.as_ptr() as *mut _);
+                    let h3_grant = grant_ace_mask(
+                        &workspace,
+                        all_app_packages_sid,
+                        h3_access,
+                        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                    );
+                    println!("=== H3 grant on ALL APPLICATION PACKAGES result: {h3_grant:?} ===");
+                    let ok = h3_grant.is_ok()
+                        && run_probe_bool(
+                            sid.as_psid(),
+                            &workspace,
+                            "Remove-Item -LiteralPath 'h3-probe.tmp' -Force -ErrorAction SilentlyContinue; \
+                             New-Item -ItemType File -Path 'h3-probe.tmp' -Force | Out-Null; \
+                             Remove-Item -LiteralPath 'h3-probe.tmp' -Force",
+                        );
+                    let _ = revoke_ace(&workspace, all_app_packages_sid);
+                    ok
+                }
+                Err(e) => {
+                    println!("=== H3 skipped: CreateWellKnownSid(WinBuiltinAnyPackageSid) failed: {e:?} ===");
+                    false
+                }
+            };
+            let _ = grant_ace_recursive(&workspace, sid.as_psid());
+            println!("=== H3 (ALL APPLICATION PACKAGES) succeeded = {h3_ok} ===");
+
+            // H4: ALL RESTRICTED APPLICATION PACKAGES (S-1-15-2-2) へ同マスクを付与。
+            let h4_ok = unsafe {
+                let mut restricted_sid = PSID::default();
+                let sid_str = wide("S-1-15-2-2");
+                match ConvertStringSidToSidW(windows::core::PCWSTR(sid_str.as_ptr()), &mut restricted_sid) {
+                    Ok(()) => {
+                        let h4_grant = grant_ace_mask(
+                            &workspace,
+                            restricted_sid,
+                            h3_access,
+                            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                        );
+                        println!("=== H4 grant on ALL RESTRICTED APPLICATION PACKAGES result: {h4_grant:?} ===");
+                        let ok = h4_grant.is_ok()
+                            && run_probe_bool(
+                                sid.as_psid(),
+                                &workspace,
+                                "Remove-Item -LiteralPath 'h4-probe.tmp' -Force -ErrorAction SilentlyContinue; \
+                                 New-Item -ItemType File -Path 'h4-probe.tmp' -Force | Out-Null; \
+                                 Remove-Item -LiteralPath 'h4-probe.tmp' -Force",
+                            );
+                        let _ = revoke_ace(&workspace, restricted_sid);
+                        let _ = LocalFree(HLOCAL(restricted_sid.0));
+                        ok
+                    }
+                    Err(e) => {
+                        println!("=== H4 skipped: ConvertStringSidToSidW(S-1-15-2-2) failed: {e:?} ===");
+                        false
+                    }
+                }
+            };
+            println!("=== H4 (ALL RESTRICTED APPLICATION PACKAGES) succeeded = {h4_ok} ===");
+
+            println!(
+                "=== SUMMARY: baseline={baseline_ok} H1={h1_ok} H5={h5_ok} H2={h2_ok} H3={h3_ok} H4={h4_ok} ==="
+            );
+        }
+
+        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
+        println!("=== C:\\ traverse ACE revoke result: {revoke_result:?} ===");
+        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// Experiment G: traverse ACE付与済み環境での網羅的なファイル操作マトリクス。
+    /// `experiment_c`/`d`で判明したのは「preflightが使う4操作＋削除」という狭い範囲のみ
+    /// だったため、`run_shell`の実運用で呼ばれうる操作（上書き・追記・コピー・リネーム・
+    /// 移動・ディレクトリ作成/削除等）を一通り試し、削除以外にも失敗する操作が無いかを
+    /// 確認する。新たな仮説検証ではなく、既知の状態（traverse ACE付与済み・削除拒否あり）
+    /// を前提にした網羅的な現状把握。各操作は独立に試し、1つの失敗が他の判定を妨げないよう
+    /// 前提ファイル/ディレクトリを都度作り直す。結果は
+    /// `docs/phases/foundation/M12-shell-isolation-tiers.md`追記7に記録する。
+    /// `experiment_g`/`experiment_j`が共有する(操作名, 準備コマンド, 試す操作)一覧。
+    /// 準備コマンドは`-ErrorAction SilentlyContinue`で失敗を無視し、常にクリーンな前提から
+    /// 試す。
+    fn operation_matrix_cases() -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![
+            (
+                "1. New-Item（ファイル作成）",
+                "Remove-Item -LiteralPath 'f1.txt' -Force -ErrorAction SilentlyContinue",
+                "New-Item -ItemType File -Path 'f1.txt' -Force | Out-Null",
+            ),
+            (
+                "2. Get-Content（読取）",
+                "Remove-Item -LiteralPath 'f2.txt' -Force -ErrorAction SilentlyContinue; \
+                 Set-Content -LiteralPath 'f2.txt' -Value 'seed'",
+                "Get-Content -LiteralPath 'f2.txt' | Out-Null",
+            ),
+            (
+                "3. Set-Content（上書き）",
+                "Remove-Item -LiteralPath 'f3.txt' -Force -ErrorAction SilentlyContinue; \
+                 Set-Content -LiteralPath 'f3.txt' -Value 'seed'",
+                "Set-Content -LiteralPath 'f3.txt' -Value 'overwritten'",
+            ),
+            (
+                "4. Add-Content（追記）",
+                "Remove-Item -LiteralPath 'f4.txt' -Force -ErrorAction SilentlyContinue; \
+                 Set-Content -LiteralPath 'f4.txt' -Value 'seed'",
+                "Add-Content -LiteralPath 'f4.txt' -Value 'appended'",
+            ),
+            (
+                "5. Copy-Item（コピー）",
+                "Remove-Item -LiteralPath 'f5-src.txt','f5-dst.txt' -Force -ErrorAction SilentlyContinue; \
+                 Set-Content -LiteralPath 'f5-src.txt' -Value 'seed'",
+                "Copy-Item -LiteralPath 'f5-src.txt' -Destination 'f5-dst.txt'",
+            ),
+            (
+                "6. Rename-Item（ファイルリネーム）",
+                "Remove-Item -LiteralPath 'f6-old.txt','f6-new.txt' -Force -ErrorAction SilentlyContinue; \
+                 Set-Content -LiteralPath 'f6-old.txt' -Value 'seed'",
+                "Rename-Item -LiteralPath 'f6-old.txt' -NewName 'f6-new.txt'",
+            ),
+            (
+                "7. Move-Item（サブディレクトリへ移動）",
+                "Remove-Item -LiteralPath 'f7.txt' -Force -ErrorAction SilentlyContinue; \
+                 Remove-Item -LiteralPath 'f7-dir' -Recurse -Force -ErrorAction SilentlyContinue; \
+                 Set-Content -LiteralPath 'f7.txt' -Value 'seed'; \
+                 New-Item -ItemType Directory -Path 'f7-dir' -Force | Out-Null",
+                "Move-Item -LiteralPath 'f7.txt' -Destination 'f7-dir\\f7.txt'",
+            ),
+            (
+                "8. Remove-Item（ファイル削除）",
+                "Remove-Item -LiteralPath 'f8.txt' -Force -ErrorAction SilentlyContinue; \
+                 Set-Content -LiteralPath 'f8.txt' -Value 'seed'",
+                "Remove-Item -LiteralPath 'f8.txt' -Force",
+            ),
+            (
+                "9. 読取専用属性を付けてから削除",
+                "Remove-Item -LiteralPath 'f9.txt' -Force -ErrorAction SilentlyContinue; \
+                 Set-Content -LiteralPath 'f9.txt' -Value 'seed'; \
+                 Set-ItemProperty -LiteralPath 'f9.txt' -Name IsReadOnly -Value $true",
+                "Set-ItemProperty -LiteralPath 'f9.txt' -Name IsReadOnly -Value $false; \
+                 Remove-Item -LiteralPath 'f9.txt' -Force",
+            ),
+            (
+                "10. New-Item（ディレクトリ作成）",
+                "Remove-Item -LiteralPath 'd10' -Recurse -Force -ErrorAction SilentlyContinue",
+                "New-Item -ItemType Directory -Path 'd10' -Force | Out-Null",
+            ),
+            (
+                "11. Get-ChildItem -Recurse（再帰列挙）",
+                "Remove-Item -LiteralPath 'd11' -Recurse -Force -ErrorAction SilentlyContinue; \
+                 New-Item -ItemType Directory -Path 'd11\\nested' -Force | Out-Null; \
+                 Set-Content -LiteralPath 'd11\\nested\\f.txt' -Value 'seed'",
+                "Get-ChildItem -LiteralPath 'd11' -Recurse | Out-Null",
+            ),
+            (
+                "12. Rename-Item（ディレクトリリネーム）",
+                "Remove-Item -LiteralPath 'd12-old','d12-new' -Recurse -Force -ErrorAction SilentlyContinue; \
+                 New-Item -ItemType Directory -Path 'd12-old' -Force | Out-Null",
+                "Rename-Item -LiteralPath 'd12-old' -NewName 'd12-new'",
+            ),
+            (
+                "13. Remove-Item（空ディレクトリ削除）",
+                "Remove-Item -LiteralPath 'd13' -Recurse -Force -ErrorAction SilentlyContinue; \
+                 New-Item -ItemType Directory -Path 'd13' -Force | Out-Null",
+                "Remove-Item -LiteralPath 'd13' -Force",
+            ),
+            (
+                "14. Remove-Item -Recurse（非空ディレクトリ削除）",
+                "Remove-Item -LiteralPath 'd14' -Recurse -Force -ErrorAction SilentlyContinue; \
+                 New-Item -ItemType Directory -Path 'd14' -Force | Out-Null; \
+                 Set-Content -LiteralPath 'd14\\f.txt' -Value 'seed'",
+                "Remove-Item -LiteralPath 'd14' -Recurse -Force",
+            ),
+            (
+                "15. New-Item -ItemType SymbolicLink（対照、AppContainer外要因で失敗しうる）",
+                "Remove-Item -LiteralPath 'f15-link','f15-target.txt' -Force -ErrorAction SilentlyContinue; \
+                 Set-Content -LiteralPath 'f15-target.txt' -Value 'seed'",
+                "New-Item -ItemType SymbolicLink -Path 'f15-link' -Target 'f15-target.txt' | Out-Null",
+            ),
+            (
+                "16. Test-Path（対照、失敗しないはず）",
+                "Remove-Item -LiteralPath 'f16.txt' -Force -ErrorAction SilentlyContinue; \
+                 Set-Content -LiteralPath 'f16.txt' -Value 'seed'",
+                "if (-not (Test-Path -LiteralPath 'f16.txt')) { throw 'Test-Path returned false' }",
+            ),
+        ]
+    }
+
+    #[test]
+    #[ignore]
+    fn experiment_g_full_operation_matrix() {
+        let drive_root = std::path::PathBuf::from("C:\\");
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-g-{}",
+            std::process::id()
+        ));
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        std::fs::create_dir_all(&workspace)
+            .expect("create verify workspace under C:\\ (needs admin write on drive root)");
+        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+
+        let grant_result = grant_ace_mask(
+            &drive_root,
+            sid.as_psid(),
+            windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0,
+            NO_INHERITANCE,
+        );
+        println!("=== C:\\ traverse ACE grant result: {grant_result:?} ===");
+
+        if grant_result.is_ok() {
+            let cases = operation_matrix_cases();
+            let mut results = Vec::new();
+            for (name, setup, action) in &cases {
+                // 準備は成否を問わない（SilentlyContinueで無視、前提が整わなくても実験は続行）。
+                let _ = run_probe_bool(sid.as_psid(), &workspace, setup);
+                let ok = run_probe_bool(sid.as_psid(), &workspace, action);
+                println!("--- {name}: {} ---", if ok { "OK" } else { "FAIL" });
+                results.push((*name, ok));
+            }
+
+            println!("=== EXPERIMENT G SUMMARY (traverse ACE granted) ===");
+            println!("| # | 操作 | 結果 |");
+            println!("|---|---|---|");
+            for (name, ok) in &results {
+                println!("| {name} | {} |", if *ok { "✅ OK" } else { "❌ FAIL" });
+            }
+        }
+
+        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
+        println!("=== C:\\ traverse ACE revoke result: {revoke_result:?} ===");
+        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// Experiment J: `experiment_g`の全16操作マトリクスを、H7（`experiment_i`）で判明した
+    /// 修正マスク（`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`）で再検証する。`experiment_g`の
+    /// 結果（削除/リネーム/移動系7件が失敗）が、修正後は全件成功に変わるかを確認する。
+    #[test]
+    #[ignore]
+    fn experiment_j_full_operation_matrix_with_read_attributes() {
+        let drive_root = std::path::PathBuf::from("C:\\");
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-j-{}",
+            std::process::id()
+        ));
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        std::fs::create_dir_all(&workspace)
+            .expect("create verify workspace under C:\\ (needs admin write on drive root)");
+        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+
+        let access = windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0
+            | windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0;
+        let grant_result = grant_ace_mask(&drive_root, sid.as_psid(), access, NO_INHERITANCE);
+        println!("=== C:\\ traverse+read-attributes ACE grant result: {grant_result:?} ===");
+
+        if grant_result.is_ok() {
+            let cases = operation_matrix_cases();
+            let mut results = Vec::new();
+            for (name, setup, action) in &cases {
+                let _ = run_probe_bool(sid.as_psid(), &workspace, setup);
+                let ok = run_probe_bool(sid.as_psid(), &workspace, action);
+                println!("--- {name}: {} ---", if ok { "OK" } else { "FAIL" });
+                results.push((*name, ok));
+            }
+
+            println!("=== EXPERIMENT J SUMMARY (traverse+read-attributes ACE granted) ===");
+            println!("| # | 操作 | 結果 |");
+            println!("|---|---|---|");
+            for (name, ok) in &results {
+                println!("| {name} | {} |", if *ok { "✅ OK" } else { "❌ FAIL" });
+            }
+        }
+
+        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
+        println!("=== C:\\ ACE revoke result: {revoke_result:?} ===");
+        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// Experiment K: 本番`smoke_test_spawn`（`preflight`が使う実際のプローブ、New-Item→
+    /// Get-Content→Remove-Item→exit 0）を、H7の修正マスク（`FILE_TRAVERSE |
+    /// FILE_READ_ATTRIBUTES`）で再検証する。`Ok(())`を返せば、フェーズ3（capability機構の
+    /// 実機E2E）のブロッカーが解消したことの最終確認になる。
+    #[test]
+    #[ignore]
+    fn experiment_k_smoke_test_spawn_with_read_attributes() {
+        let drive_root = std::path::PathBuf::from("C:\\");
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-k-{}",
+            std::process::id()
+        ));
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        std::fs::create_dir_all(&workspace)
+            .expect("create verify workspace under C:\\ (needs admin write on drive root)");
+        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+        let probe_dir = workspace.join(".harness").join("sandbox").join("tier1a-tmp");
+        std::fs::create_dir_all(&probe_dir).expect("create probe dir (inherits ACE from workspace)");
+
+        let access = windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0
+            | windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0;
+        let grant_result = grant_ace_mask(&drive_root, sid.as_psid(), access, NO_INHERITANCE);
+        println!("=== C:\\ traverse+read-attributes ACE grant result: {grant_result:?} ===");
+
+        if grant_result.is_ok() {
+            let production_result = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir);
+            println!("=== production probe (smoke_test_spawn) result: {production_result:?} ===");
+            println!(
+                "=== H7 FINAL CHECK: smoke_test_spawn succeeded = {} ===",
+                production_result.is_ok()
+            );
+        }
+
+        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
+        println!("=== C:\\ ACE revoke result: {revoke_result:?} ===");
+        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// procmon実測調査（Tier1a廃止の根拠固め）で共有するプローブスクリプト。
+    /// New-Item（対照・成功するはず）→Remove-Item→Rename-Item→Move-Itemを`Write-Output`
+    /// マーカー付きで連続実行する。AppContainer内（`experiment_h_procmon_target`）と
+    /// AppContainer外の対照（`experiment_h_procmon_control`）の両方から同一文字列を使う。
+    const PROCMON_PROBE_SCRIPT: &str = "\
+        Write-Output 'MARKER: before-create'; \
+        New-Item -ItemType File -Path 'h.txt' -Force | Out-Null; \
+        Write-Output 'MARKER: before-remove'; \
+        try { Remove-Item -LiteralPath 'h.txt' -Force; Write-Output 'REMOVE OK' } catch { Write-Output \"REMOVE FAIL: $_\" }; \
+        Write-Output 'MARKER: before-rename'; \
+        New-Item -ItemType File -Path 'h2.txt' -Force | Out-Null; \
+        try { Rename-Item -LiteralPath 'h2.txt' -NewName 'h2-renamed.txt'; Write-Output 'RENAME OK' } catch { Write-Output \"RENAME FAIL: $_\" }; \
+        Write-Output 'MARKER: before-move'; \
+        New-Item -ItemType Directory -Path 'hdir' -Force | Out-Null; \
+        New-Item -ItemType File -Path 'h3.txt' -Force | Out-Null; \
+        try { Move-Item -LiteralPath 'h3.txt' -Destination 'hdir\\h3.txt'; Write-Output 'MOVE OK' } catch { Write-Output \"MOVE FAIL: $_\" }; \
+        Write-Output 'MARKER: done'";
+
+    /// procmon実測対象（AppContainer内）。`C:\`へtraverse ACEを付与し、AppContainer子の
+    /// 実PID（`GetProcessId`）を出力してからプローブスクリプトを実行する。procmonは
+    /// このテストの実行前に別プロセスとして起動しておき（Bashツール側の手順）、このテストは
+    /// 記録対象のイベントを発生させるだけで、procmonの制御そのものには関与しない。
+    #[test]
+    #[ignore]
+    fn experiment_h_procmon_target() {
+        use windows::Win32::System::Threading::GetProcessId;
+
+        let drive_root = std::path::PathBuf::from("C:\\");
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-h-{}",
+            std::process::id()
+        ));
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        std::fs::create_dir_all(&workspace)
+            .expect("create verify workspace under C:\\ (needs admin write on drive root)");
+        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+
+        let grant_result = grant_ace_mask(
+            &drive_root,
+            sid.as_psid(),
+            windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0,
+            NO_INHERITANCE,
+        );
+        println!("=== C:\\ traverse ACE grant result: {grant_result:?} ===");
+
+        if grant_result.is_ok() {
+            let (shell, _) = resolve_shell();
+            let env = crate::secret_env::build_child_env();
+            let child = spawn(
+                &shell,
+                &["-NoProfile", "-NonInteractive", "-Command", PROCMON_PROBE_SCRIPT],
+                &workspace,
+                &env,
+                false,
+                sid.as_psid(),
+                NetworkCapability::Deny,
+            )
+            .expect("spawn should succeed");
+            let pid = unsafe { GetProcessId(child.process) };
+            println!("=== APPCONTAINER_CHILD_PID={pid} ===");
+            let (out, err, code) = child
+                .write_stdin_read_output_and_wait(None)
+                .expect("pipe I/O should not fail");
+            println!("=== experiment_h_procmon_target: exit={code} ===\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        }
+
+        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
+        println!("=== C:\\ traverse ACE revoke result: {revoke_result:?} ===");
+        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// procmon対照（AppContainer無し）。同一のプローブスクリプトを、AppContainerを経由せず
+    /// 管理者Rustプロセス自身の子として`std::process::Command`で直接実行する。
+    /// `C:\`のtraverse ACEは不要（AppContainer外なので既定のNTFS権限で普通に動く）。
+    #[test]
+    #[ignore]
+    fn experiment_h_procmon_control() {
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-h-control-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create control workspace under C:\\ (needs admin)");
+
+        let (shell, _) = resolve_shell();
+        let child = std::process::Command::new(&shell)
+            .args(["-NoProfile", "-NonInteractive", "-Command", PROCMON_PROBE_SCRIPT])
+            .current_dir(&workspace)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("control spawn should succeed");
+        println!("=== CONTROL_CHILD_PID={} ===", child.id());
+        let output = child.wait_with_output().expect("control child should exit");
+        println!(
+            "=== experiment_h_procmon_control: exit={:?} ===\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// Experiment I: procmon実測（`experiment_h_procmon_target`）で判明した新仮説H7の検証。
+    /// 削除/リネーム/移動の直前に`CreateFile "C:\" ACCESS DENIED`（`Desired Access: Read
+    /// Attributes, Options: Open Reparse Point`）が観測されており、`grant_ace_mask`で
+    /// `C:\`へ付与していたのが`FILE_TRAVERSE`のみ（`FILE_READ_ATTRIBUTES`を含まない）
+    /// だったことが原因と推測される。`C:\`への付与マスクに`FILE_READ_ATTRIBUTES`を足すだけで
+    /// 削除/リネーム/移動が回復するかを確認する。
+    #[test]
+    #[ignore]
+    fn experiment_i_c_root_read_attributes() {
+        let drive_root = std::path::PathBuf::from("C:\\");
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-i-{}",
+            std::process::id()
+        ));
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        std::fs::create_dir_all(&workspace)
+            .expect("create verify workspace under C:\\ (needs admin write on drive root)");
+        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+
+        // H7: FILE_TRAVERSE単独ではなく、FILE_READ_ATTRIBUTESも合わせて付与する。
+        let access = windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0
+            | windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0;
+        let grant_result = grant_ace_mask(&drive_root, sid.as_psid(), access, NO_INHERITANCE);
+        println!("=== C:\\ traverse+read-attributes ACE grant result: {grant_result:?} ===");
+
+        if grant_result.is_ok() {
+            let (shell, _) = resolve_shell();
+            let env = crate::secret_env::build_child_env();
+            let child = spawn(
+                &shell,
+                &["-NoProfile", "-NonInteractive", "-Command", PROCMON_PROBE_SCRIPT],
+                &workspace,
+                &env,
+                false,
+                sid.as_psid(),
+                NetworkCapability::Deny,
+            )
+            .expect("spawn should succeed");
+            let (out, err, code) = child
+                .write_stdin_read_output_and_wait(None)
+                .expect("pipe I/O should not fail");
+            println!("=== experiment_i_c_root_read_attributes: exit={code} ===\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+
+            println!(
+                "=== H7 RESULT: REMOVE={} RENAME={} MOVE={} ===",
+                out.contains("REMOVE OK"),
+                out.contains("RENAME OK"),
+                out.contains("MOVE OK"),
+            );
+        }
+
+        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
+        println!("=== C:\\ ACE revoke result: {revoke_result:?} ===");
+        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     /// 未解決事項2: 本番`smoke_test_spawn`（軽量・終了コードのみ判定）と、この診断モジュールの

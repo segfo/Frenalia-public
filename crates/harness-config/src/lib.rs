@@ -28,6 +28,35 @@ pub struct Settings {
     /// 読取スコープ設定（M11、`plans/DESIGN-SANDBOX.md` §5）。省略時は
     /// `ReadSettings::default()`（whitelist・外部ルート無し＝M10までと等価）。
     pub read: Option<ReadSettings>,
+    /// 協調プロキシ設定（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）。省略時は
+    /// `NetSettings::default()`（`allow_domains`空＝プロキシ自体を起動しない）。
+    pub net: Option<NetSettings>,
+}
+
+/// `.harness/settings.json`の`net`キー（M12補遺、D-15/D-10）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetSettings {
+    /// 協調プロキシの許可ドメイン（`*.example.com`形式のサフィックスワイルドカード対応）。
+    pub allow_domains: Option<Vec<String>>,
+    /// アプリ単位network制御（軸1、D-10/D-11）の信頼アプリ名リスト（Tier1aで`internetClient`を
+    /// 付与する先頭exe名。basename・拡張子除去・小文字で照合）。
+    pub allow_apps: Option<Vec<String>>,
+}
+
+impl NetSettings {
+    /// `harness_core::NetProxyConfig`へ変換する。
+    pub fn to_net_proxy_config(&self) -> harness_core::NetProxyConfig {
+        harness_core::NetProxyConfig {
+            allow_domains: self.allow_domains.clone().unwrap_or_default(),
+        }
+    }
+
+    /// `harness_core::NetAppPolicy`へ変換する（軸1、D-10/D-11）。
+    pub fn to_net_app_policy(&self) -> harness_core::NetAppPolicy {
+        harness_core::NetAppPolicy {
+            allow_apps: self.allow_apps.clone().unwrap_or_default(),
+        }
+    }
 }
 
 /// `.harness/settings.json`の`read`キー（M11）。`harness_core::ReadScopeConfig`へ変換する前の
