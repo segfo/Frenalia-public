@@ -292,6 +292,42 @@ pub fn grant_ace_recursive_ro(root: &Path, sid: PSID) -> Result<(), AppContainer
     Ok(())
 }
 
+/// `grant_ace_recursive_ro`の高速化版（Phase B-2、`TIER1A-OPEN-ISSUES.md`項目6・制約2）。
+/// `experiment_l_inheritable_ace_on_root_vs_recursive_walk`の実機検証で、`root`へ継承あり
+/// read-only ACEを1件付与するだけで、**付与時点で既に存在する**子孫にもOS側（NTFS）が
+/// DACL変更時に伝播させることを確認した（`grant_ace_recursive_ro`直前の旧コメント「既存子孫
+/// には遡及しない」という主張は誤りだった）。
+///
+/// ただし継承をブロックする保護DACL（`PROTECTED_DACL_SECURITY_INFORMATION`が立った子。
+/// エクスプローラの「継承を無効にする」操作等で作られうる）が混在するツリーでは、その配下に
+/// 伝播が届かない。そのため付与後に全ノードを再walkし、`sid`のACEが実際に届いているか
+/// （`sid_ace_mask`で検出、継承経由・明示ACE経由を問わない）を確認し、**届いていないノードだけ**
+/// `grant_ace_ro`で個別に明示付与するフォールバックを行う（届いたノードはSetNamedSecurityInfoW
+/// を呼ばずに済むため、数GB規模のツリーで大半が継承境界に阻まれず伝播する場合ほど
+/// `grant_ace_recursive_ro`の全ノード明示付与より高速になる）。
+pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    grant_ace_ro(root, sid, true)?;
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclGrant {
+        path: root.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+
+    for dir in &dirs {
+        if !matches!(sid_ace_mask(dir, sid), Ok(Some(_))) {
+            grant_ace_ro(dir, sid, true)?;
+        }
+    }
+    for file in &files {
+        if !matches!(sid_ace_mask(file, sid), Ok(Some(_))) {
+            grant_ace_ro(file, sid, false)?;
+        }
+    }
+    Ok(())
+}
+
 /// AppContainer固有のセキュリティ記述子をパイプへ適用する。AppContainerのアクセス制御は
 /// 「オブジェクトのDACLにpackage SID（または`ALL APPLICATION PACKAGES`）へのACEが無ければ
 /// アクセス不可」という広範なdefault-denyがファイル・レジストリだけでなく名前無しパイプ等の
@@ -737,51 +773,52 @@ const FS_PASSTHROUGH_RW_PROBE_COMMAND: &str = "\
         exit 3 \
     }";
 
-/// `path`の最上位祖先（ドライブルート、例`C:\`）を返す。
-fn drive_root_of(path: &Path) -> std::path::PathBuf {
-    path.ancestors()
-        .last()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| path.to_path_buf())
-}
-
 /// D9: passthroughルートが到達不能だったときの原因診断。生エラーメッセージに加え、
-/// 祖先ドライブルートのtraverse ACE有無を実地チェックし、既知原因
-/// （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記8）なら名指しし、
-/// 修復手順（`harness fs grant-traverse`、管理者一回）を提示する。
+/// **`path`自身からドライブルートまでの全祖先**（`grant_traverse_chain`と同じ列挙順）の
+/// traverse ACE有無を実地チェックし、欠けているノードを名指しする。従来はドライブルート
+/// 1箇所しか見ていなかったが、`C:\Users\<user>\.cargo`のように中間の祖先（`C:\Users`・
+/// `C:\Users\<user>`）が欠けているケースを診断できなかった
+/// （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記10で判明）。
+/// 修復手順は`harness fs grant-traverse <path>`（連鎖化済み、追記13）を1回提示するだけでよい。
 fn diagnose_unreachable_passthrough(sid: PSID, path: &Path, raw_message: &str) -> String {
-    let drive_root = drive_root_of(path);
-    let known_cause = match sid_ace_mask(&drive_root, sid) {
-        Ok(Some(mask))
-            if mask & FILE_TRAVERSE.0 != 0 && mask & FILE_READ_ATTRIBUTES.0 != 0 =>
-        {
-            None
+    let mut chain: Vec<std::path::PathBuf> = path.ancestors().map(|p| p.to_path_buf()).collect();
+    chain.reverse();
+
+    let mut missing = Vec::new();
+    for node in &chain {
+        match sid_ace_mask(node, sid) {
+            Ok(Some(mask))
+                if mask & FILE_TRAVERSE.0 != 0 && mask & FILE_READ_ATTRIBUTES.0 != 0 => {}
+            Ok(Some(_)) => missing.push(format!(
+                "{} (has a sandbox SID ACE but missing FILE_TRAVERSE|FILE_READ_ATTRIBUTES)",
+                node.display()
+            )),
+            Ok(None) | Err(_) => missing.push(format!(
+                "{} (no traverse ACE for the sandbox SID)",
+                node.display()
+            )),
         }
-        Ok(Some(_)) => Some(format!(
-            "drive root {} has a sandbox SID ACE but is missing \
-             FILE_TRAVERSE|FILE_READ_ATTRIBUTES",
-            drive_root.display()
-        )),
-        Ok(None) | Err(_) => Some(format!(
-            "drive root {} has no traverse ACE for the sandbox SID",
-            drive_root.display()
-        )),
-    };
-    match known_cause {
-        Some(cause) => format!(
-            "fs-allow {} : unreachable inside AppContainer (probe error: {raw_message}) -- \
-             diagnosis: {cause} (see docs/phases/foundation/M12-shell-isolation-tiers.md 追記8). \
-             fix (admin, one-time): harness fs grant-traverse {}",
-            path.display(),
-            drive_root.display()
-        ),
-        None => format!(
-            "fs-allow {} : unreachable inside AppContainer (probe error: {raw_message}); \
-             drive root traverse ACE looks fine, cause unknown (path may not exist, or a \
-             read-only file attribute is blocking a :rw request)",
-            path.display()
-        ),
     }
+
+    if missing.is_empty() {
+        return format!(
+            "fs-allow {} : unreachable inside AppContainer (probe error: {raw_message}); \
+             all ancestor traverse ACEs (up to the drive root) look fine, cause unknown \
+             (path may not exist, or a read-only file attribute is blocking a :rw request)",
+            path.display()
+        );
+    }
+    format!(
+        "fs-allow {} : unreachable inside AppContainer (probe error: {raw_message}) -- \
+         diagnosis: missing traverse ACE on {} ancestor node(s): {} (see \
+         docs/phases/foundation/M12-shell-isolation-tiers.md 追記10・追記13). \
+         fix (admin, one-time, grants the whole chain in one UAC prompt): \
+         harness fs grant-traverse {}",
+        path.display(),
+        missing.len(),
+        missing.join(", "),
+        path.display()
+    )
 }
 
 /// D8: passthroughルート1件へコンテナ内から実I/Oプローブ（疎通テスト）を行う。到達可なら
@@ -857,7 +894,7 @@ pub fn preflight(
         let grant_result = if fp.writable {
             grant_ace_recursive(&fp.path, sid.as_psid())
         } else {
-            grant_ace_recursive_ro(&fp.path, sid.as_psid())
+            grant_ace_inheritable_ro(&fp.path, sid.as_psid())
         };
         if let Err(e) = grant_result {
             warnings.push(format!("fs-allow {} : ACE grant failed: {e}", fp.path.display()));
@@ -1057,6 +1094,46 @@ pub fn grant_traverse_drive_root(drive: &Path, sid: PSID) -> Result<(), AppConta
         FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
         NO_INHERITANCE,
     )
+}
+
+/// `target`とその全祖先（ドライブルートまで）へ、`sid`の`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を
+/// 単一・非継承で付与する（D10連鎖化、`TIER1A-OPEN-ISSUES.md`項目6「多階層祖先traverse ACE不足」の
+/// 解消）。`C:\Users\<user>\.cargo`のようにドライブルート直下でないパスをpassthroughする場合、
+/// `grant_traverse_drive_root`によるドライブルート単体への付与だけでは足りず、`C:\Users`・
+/// `C:\Users\<user>`という中間の祖先にも個別にtraverse ACEが要ることが実機検証で判明した
+/// （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記10）。
+///
+/// `Path::ancestors()`はtarget自身→直近の親→…→ドライブルートの順で返すため、ここでは
+/// ドライブルートから`target`へ向かう順（浅い方から深い方）に反転してから1ノードずつ付与する。
+/// 祖先を先に開通させてから深いノードへ進む順序にしておけば、途中で失敗しても「到達不能な
+/// 深いノードだけ付与済みで、そこへ辿り着くための浅い祖先が未付与」という手戻りしにくい
+/// 半端な状態を避けられる。
+///
+/// 途中のノードで付与に失敗した場合は、そこで打ち切って`Err`を返す。**ただし戻り値の`Vec`には
+/// 失敗した時点までに実際に付与が成功したノードを常に含める**（`Result`の成否に関わらず、
+/// 呼び出し側は返ってきた`Vec`の全ノードをtraverse台帳へ記録しなければならない。台帳に載らない
+/// まま実FS上にACEだけが残る「孤立ACE」を防ぐため。`CLAUDE.md`の台帳誤削除防止の思想と同根）。
+pub fn grant_traverse_chain(
+    target: &Path,
+    sid: PSID,
+) -> (Vec<std::path::PathBuf>, Result<(), AppContainerError>) {
+    let mut chain: Vec<std::path::PathBuf> =
+        target.ancestors().map(|p| p.to_path_buf()).collect();
+    chain.reverse();
+
+    let mut granted = Vec::with_capacity(chain.len());
+    for node in &chain {
+        if let Err(e) = grant_ace_mask(
+            node,
+            sid,
+            FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
+            NO_INHERITANCE,
+        ) {
+            return (granted, Err(e));
+        }
+        granted.push(node.clone());
+    }
+    (granted, Ok(()))
 }
 
 /// `TIER1A-OPEN-ISSUES.md`課題1（traverse問題の検証プラン）の診断テスト群。
@@ -2217,5 +2294,207 @@ mod traverse_diagnostics {
             verified.is_ok(),
             "sandbox SID ACE must be fully removed after revoke_ace: {verified:?}"
         );
+    }
+
+    /// `grant_traverse_chain`が祖先を浅い方(ドライブルート)から深い方(target自身)へ、
+    /// 重複なく列挙することを確認する（Win32呼び出しを伴わない純粋なパス演算のみ、
+    /// クロスプラットフォームで実行可能）。実際のACE付与成否は
+    /// `grant_traverse_chain_then_revoke_each_node_on_neutral_tree`（ignore-gated）で確認する。
+    #[test]
+    fn grant_traverse_chain_orders_ancestors_shallow_to_deep() {
+        let target = Path::new(r"C:\Users\example\.cargo");
+        let mut chain: Vec<std::path::PathBuf> =
+            target.ancestors().map(|p| p.to_path_buf()).collect();
+        chain.reverse();
+        assert_eq!(
+            chain,
+            vec![
+                std::path::PathBuf::from(r"C:\"),
+                std::path::PathBuf::from(r"C:\Users"),
+                std::path::PathBuf::from(r"C:\Users\example"),
+                std::path::PathBuf::from(r"C:\Users\example\.cargo"),
+            ]
+        );
+    }
+
+    /// `grant_traverse_chain`が多階層のネストしたディレクトリ全てへ個別にACEを付与し、
+    /// `revoke_ace`で1件ずつ巻き戻せることを確認する（`TIER1A-OPEN-ISSUES.md`項目6
+    /// 「多階層祖先traverse ACE不足」の解消の中核）。
+    ///
+    /// **[BUG-011の教訓、事故から得た設計]** 当初このテストは`tempfile::tempdir()`
+    /// （`%TEMP%`配下）にネストを作っていたが、`%TEMP%`は実際には
+    /// `C:\Users\<user>\AppData\Local\Temp\...`という**本物のユーザープロファイルの奥深く**に
+    /// あるため、`grant_traverse_chain`が`Path::ancestors()`で祖先を辿ると、`C:\Users`・
+    /// `C:\Users\<user>`（ユーザープロファイル本体）にまで実際のDACL変更が及んでしまい、
+    /// 実機E2Eで「`C:\Users\<user>`へのDACL変更が数分単位で止まる」という重大インシデントを
+    /// 起こした（実行中のプロファイルルートへのSetNamedSecurityInfoWは、ローミングプロファイル・
+    /// インデクサ・AV等の割込みで極端に遅くなりうる。強制終了2回により孤立ACEが
+    /// `C:\Users`・`C:\Users\<user>`に残置し、`icacls /remove:g`での手動復旧を要した）。
+    ///
+    /// 修正: 他のignore-gated実験（`experiment_c`等）と同じ`C:\harness-tier1a-verify-*-<pid>`
+    /// パターンを踏襲し、**このテスト専用に新規作成した`C:\`直下のディレクトリ**をネストの
+    /// 起点にする。これなら`grant_traverse_chain`の祖先チェーンは`C:\`（既存の永続ACE、
+    /// D10の恒久的な修復として意図的に維持されているためrevokeしない）とこのテスト専用ツリー
+    /// のみで完結し、実プロファイルツリーには一切触れない。
+    ///
+    /// `C:\`自体への`WRITE_DAC`が要るため、このテストは`#[ignore]`に加えて**管理者シェルから
+    /// の実行が必須**（`sudo cargo test -p harness-sandbox -- --ignored
+    /// grant_traverse_chain_then_revoke_each_node_on_neutral_tree`）。
+    #[test]
+    #[ignore]
+    fn grant_traverse_chain_then_revoke_each_node_on_neutral_tree() {
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let test_root = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-chain-{}",
+            std::process::id()
+        ));
+        let nested = test_root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested)
+            .expect("create test-owned nested dirs directly under C:\\ (needs admin write on drive root)");
+
+        let (granted, result) = grant_traverse_chain(&nested, sid.as_psid());
+        // 掃除は成否に関わらず必ず行う(孤立ACE防止、BUG-011の再発防止そのもの)。
+        let cleanup = || {
+            // granted[0]はドライブルート(C:\)自身。D10の恒久的な修復として意図的に維持されて
+            // いる既存ACEなので、このテストの後始末では**絶対に触らない**。
+            for node in granted.iter().skip(1) {
+                let _ = revoke_ace(node, sid.as_psid());
+            }
+            let _ = std::fs::remove_dir_all(&test_root);
+        };
+
+        if let Err(e) = &result {
+            cleanup();
+            panic!("grant_traverse_chain should succeed on a test-owned tree under C:\\: {e:?}");
+        }
+
+        // test_root + a + b + c の4ノード(C:\自身は別途、既に前提として存在する)。
+        if granted.len() != 5 {
+            cleanup();
+            panic!("expected 5 granted nodes (C:\\ + test_root + a + b + c), got {granted:?}");
+        }
+        if granted.last() != Some(&nested) {
+            cleanup();
+            panic!("last granted node must be the target itself: {granted:?}");
+        }
+
+        for node in &granted {
+            match sid_ace_mask(node, sid.as_psid()) {
+                Ok(mask) if mask == Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0) => {}
+                other => {
+                    cleanup();
+                    panic!(
+                        "node {node:?} must have exactly FILE_TRAVERSE | FILE_READ_ATTRIBUTES, got {other:?}"
+                    );
+                }
+            }
+        }
+
+        // ドライブルートを除く各ノードでrevoke -> 検証の往復を確認する。
+        for node in granted.iter().skip(1) {
+            if let Err(e) = revoke_ace(node, sid.as_psid()) {
+                cleanup();
+                panic!("revoke_ace for {node:?}: {e}");
+            }
+            if let Err(e) = assert_no_sid_ace(node, sid.as_psid()) {
+                cleanup();
+                panic!("sandbox SID ACE must be fully removed from {node:?} after revoke_ace: {e:?}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    /// Experiment L（Phase B、`TIER1A-OPEN-ISSUES.md`項目6のMSVCツールチェーン対応の前段検証）:
+    /// `grant_ace_recursive`直前のコメントは「継承フラグ（`CONTAINER_INHERIT_ACE |
+    /// OBJECT_INHERIT_ACE`）はルートへのACE付与だけで新規作成される子孫には自動継承されるが、
+    /// **付与時点で既に存在する子孫には遡って効かない**」と主張している。しかしWin32のACL継承は
+    /// `SetNamedSecurityInfoW`によるDACL変更時にOS側で既存の子孫へも伝播しうるため、この主張が
+    /// 実際に正しいかは実測で確かめる必要がある。もしルート1件への継承ありACEだけで既存の深い
+    /// ファイルまで読めるなら、`grant_ace_recursive_ro`が行っている全ノード明示付与（MSVC
+    /// ツールチェーンのような数GB規模のツリーでは非現実的な所要時間になりうる）を回避できる
+    /// 可能性がある。
+    ///
+    /// 手順: (1) ACE付与より**前**に深いネスト＋既存ファイルを作る（「既存」子孫であることを
+    /// 保証するため）。(2) ルート1件だけへ継承ありread-only ACEを付与し、AppContainer子から
+    /// 深い既存ファイルの読取を試す。(3) 比較のため、同じ木を`grant_ace_recursive_ro`（全走査）
+    /// で付与した場合の所要時間・成否も計測する。結果は`docs/phases/foundation/
+    /// M12-shell-isolation-tiers.md`追記13へ数値付きで記録する。
+    #[test]
+    #[ignore]
+    fn experiment_l_inheritable_ace_on_root_vs_recursive_walk() {
+        let drive_root = std::path::PathBuf::from("C:\\");
+        let root = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-l-{}",
+            std::process::id()
+        ));
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-l-ws-{}",
+            std::process::id()
+        ));
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+
+        // workspace: spawn実行のための通常のフルアクセス（既存preflightと同じ手順）。
+        std::fs::create_dir_all(&workspace)
+            .expect("create verify workspace under C:\\ (needs admin write on drive root)");
+        grant_ace_recursive(&workspace, sid.as_psid())
+            .expect("grant_ace_recursive on verify workspace");
+
+        // C:\ 自体へのtraverse ACE（この開発機では既に恒久的に付与済みの可能性が高いが、
+        // 実験の独立性のため明示的に確認・付与する。既に付与済みならErrにならず上書きで成功する）。
+        let drive_grant = grant_ace_mask(
+            &drive_root,
+            sid.as_psid(),
+            FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
+            NO_INHERITANCE,
+        );
+        println!("=== C:\\ traverse ACE grant result (may already exist): {drive_grant:?} ===");
+
+        // 深いネスト+既存ファイルを、どちらのACE付与よりも前に作る（「既存」子孫であることの保証）。
+        let nested = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).expect("create nested dirs under passthrough root");
+        let deep_file = nested.join("preexisting.txt");
+        std::fs::write(&deep_file, b"hello from before any ACE grant")
+            .expect("create pre-existing deep file");
+        let read_command = format!(
+            "Get-Content -LiteralPath '{}' | Out-Null",
+            deep_file.display()
+        );
+
+        // --- ケース1: ルート1件のみ、継承ありread-only ACE（全走査を回避できるか） ---
+        let t0 = std::time::Instant::now();
+        let inheritable_grant = grant_ace_ro(&root, sid.as_psid(), true);
+        let inheritable_grant_elapsed = t0.elapsed();
+        println!("=== EXPERIMENT L case 1 grant result: {inheritable_grant:?} (took {inheritable_grant_elapsed:?}) ===");
+        let inheritable_read_ok = inheritable_grant.is_ok()
+            && run_probe_bool(sid.as_psid(), &workspace, &read_command);
+        println!(
+            "=== EXPERIMENT L case 1: root-only inheritable ACE -> deep pre-existing file read: {} ===",
+            if inheritable_read_ok { "OK" } else { "FAIL" }
+        );
+        // 後始末（ケース2へ進む前にルート1件分を剥がす。全走査していないので単一ノードrevokeでよい）。
+        let _ = revoke_ace(&root, sid.as_psid());
+
+        // --- ケース2（比較用）: 全ノード明示付与 ---
+        let t1 = std::time::Instant::now();
+        let recursive_grant = grant_ace_recursive_ro(&root, sid.as_psid());
+        let recursive_grant_elapsed = t1.elapsed();
+        println!("=== EXPERIMENT L case 2 grant result: {recursive_grant:?} (took {recursive_grant_elapsed:?}) ===");
+        let recursive_read_ok = recursive_grant.is_ok()
+            && run_probe_bool(sid.as_psid(), &workspace, &read_command);
+        println!(
+            "=== EXPERIMENT L case 2: full recursive walk -> deep pre-existing file read: {} ===",
+            if recursive_read_ok { "OK" } else { "FAIL" }
+        );
+
+        println!(
+            "=== EXPERIMENT L SUMMARY: inheritable-only read={inheritable_read_ok} (grant {inheritable_grant_elapsed:?}), \
+             recursive-walk read={recursive_read_ok} (grant {recursive_grant_elapsed:?}) ==="
+        );
+
+        let _ = revoke_ace_recursive(&root, sid.as_psid());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

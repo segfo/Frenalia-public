@@ -53,15 +53,28 @@ use crate::win_common::wide;
 /// ここへvariantを追加する形で拡張する。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrivilegedRequest {
-    /// ドライブルートへ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を付与する（`harness fs grant-traverse`）。
-    GrantTraverse { drive: PathBuf },
+    /// `target`とその全祖先（ドライブルートまで）へ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を
+    /// 連鎖付与する（`harness fs grant-traverse`、`win_appcontainer::grant_traverse_chain`、
+    /// `TIER1A-OPEN-ISSUES.md`項目6の連鎖化。旧`drive`フィールドから`target`へ改称——
+    /// ドライブルート単体に限らない任意パスを受け付けるようになったため）。
+    GrantTraverse { target: PathBuf },
     /// `GrantTraverse`で付与したACEを1件撤収する（`harness fs revoke-traverse`）。
     RevokeTraverse { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrivilegedResponse {
+    /// データを返す必要がない操作の単純成功（`RevokeTraverse`）。
     Ok,
+    /// `GrantTraverse`の結果。祖先チェーンのうち実際にACE付与が成功したノードの一覧を、
+    /// 成否に関わらず必ず返す。`error`が`Some`なら途中のノードで付与が失敗し、それ以降は
+    /// 未処理。`granted`に含まれるノードは実際にディスク上でACEが変更済みなので、呼び出し側は
+    /// `error`の有無に関わらず`granted`の全ノードを台帳へ記録しなければならない（孤立ACE防止）。
+    GrantChain {
+        granted: Vec<PathBuf>,
+        error: Option<String>,
+    },
+    /// 要求全体を拒否した場合の単純な失敗（スキーマ不一致等、部分適用の概念が無い操作）。
     Err(String),
 }
 
@@ -75,6 +88,14 @@ pub enum PrivHelperError {
     Rejected(String),
     #[error("win32 call failed: {0}")]
     Win32(String),
+    /// `GrantTraverse`（連鎖付与）が途中のノードで失敗した場合。`granted`には失敗するまでに
+    /// 実際にACEが付与された（=ディスク上で変更済みの）ノードが入る。呼び出し側は、この
+    /// エラーを受け取っても`granted`を台帳へ記録しなければならない（孤立ACE防止）。
+    #[error("grant-traverse chain partially failed after granting {granted:?}: {reason}")]
+    PartialGrantChain {
+        granted: Vec<PathBuf>,
+        reason: String,
+    },
 }
 
 impl From<windows::core::Error> for PrivHelperError {
@@ -245,7 +266,12 @@ fn helper_exe_path() -> Result<PathBuf, PrivHelperError> {
 /// 1. 現在ユーザSID限定DACLでnamed pipe serverを作る。
 /// 2. `runas`でヘルパーをパイプ名引数付きで昇格起動する（UACが表示される）。
 /// 3. ヘルパーの接続を待ち、要求を送信し、応答を受け取る。
-pub fn run_privileged(req: &PrivilegedRequest) -> Result<(), PrivHelperError> {
+///
+/// 返り値は「実際にACEが付与されたノードの一覧」（`GrantTraverse`のみ意味を持つ。
+/// `RevokeTraverse`成功時は常に空`Vec`）。`Err(PrivHelperError::PartialGrantChain { granted, .. })`
+/// の場合も`granted`に途中まで成功したノードが入るため、呼び出し側は`Err`だからと無視せず
+/// 中身を確認して台帳へ反映する必要がある（孤立ACE防止）。
+pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelperError> {
     let pipe_name = unique_pipe_name();
     let sid = current_user_sid_string()?;
     let mut sa = user_only_security_attributes(&sid)?;
@@ -304,7 +330,7 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<(), PrivHelperError> {
 
 /// パイプ接続・要求送信・応答受信の本体（ヘルパープロセスの生死待ちとは独立させる、
 /// デッドロック回避のため`run_privileged`から分離）。
-fn run_ipc_exchange(pipe: HANDLE, req: &PrivilegedRequest) -> Result<(), PrivHelperError> {
+fn run_ipc_exchange(pipe: HANDLE, req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelperError> {
     let connect_result = unsafe { ConnectNamedPipe(pipe, None) };
     if let Err(e) = connect_result {
         // ERROR_PIPE_CONNECTED: ヘルパーが`ConnectNamedPipe`呼び出し前に既に接続していた
@@ -322,7 +348,15 @@ fn run_ipc_exchange(pipe: HANDLE, req: &PrivilegedRequest) -> Result<(), PrivHel
     let response: PrivilegedResponse = serde_json::from_slice(&response_bytes)
         .map_err(|e| PrivHelperError::Ipc(format!("failed to parse helper response: {e}")))?;
     match response {
-        PrivilegedResponse::Ok => Ok(()),
+        PrivilegedResponse::Ok => Ok(Vec::new()),
+        PrivilegedResponse::GrantChain {
+            granted,
+            error: None,
+        } => Ok(granted),
+        PrivilegedResponse::GrantChain {
+            granted,
+            error: Some(reason),
+        } => Err(PrivHelperError::PartialGrantChain { granted, reason }),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }
 }
@@ -404,18 +438,23 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
         Ok(sid) => sid,
         Err(e) => return PrivilegedResponse::Err(format!("failed to resolve sandbox SID: {e}")),
     };
-    let result: Result<(), AppContainerError> = match req {
-        PrivilegedRequest::GrantTraverse { drive } => {
-            win_appcontainer::grant_traverse_drive_root(&drive, sid.as_psid())
+    match req {
+        PrivilegedRequest::GrantTraverse { target } => {
+            let (granted, result) = win_appcontainer::grant_traverse_chain(&target, sid.as_psid());
+            PrivilegedResponse::GrantChain {
+                granted,
+                error: result.err().map(|e| e.to_string()),
+            }
         }
         PrivilegedRequest::RevokeTraverse { path } => {
-            win_appcontainer::revoke_ace(&path, sid.as_psid())
-                .and_then(|()| win_appcontainer::assert_no_sid_ace(&path, sid.as_psid()))
+            let result: Result<(), AppContainerError> =
+                win_appcontainer::revoke_ace(&path, sid.as_psid())
+                    .and_then(|()| win_appcontainer::assert_no_sid_ace(&path, sid.as_psid()));
+            match result {
+                Ok(()) => PrivilegedResponse::Ok,
+                Err(e) => PrivilegedResponse::Err(e.to_string()),
+            }
         }
-    };
-    match result {
-        Ok(()) => PrivilegedResponse::Ok,
-        Err(e) => PrivilegedResponse::Err(e.to_string()),
     }
 }
 
@@ -426,12 +465,14 @@ mod tests {
     #[test]
     fn request_roundtrips_through_json() {
         let req = PrivilegedRequest::GrantTraverse {
-            drive: PathBuf::from(r"C:\"),
+            target: PathBuf::from(r"C:\Users\example\.cargo"),
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: PrivilegedRequest = serde_json::from_slice(&bytes).unwrap();
         match decoded {
-            PrivilegedRequest::GrantTraverse { drive } => assert_eq!(drive, PathBuf::from(r"C:\")),
+            PrivilegedRequest::GrantTraverse { target } => {
+                assert_eq!(target, PathBuf::from(r"C:\Users\example\.cargo"))
+            }
             other => panic!("unexpected variant: {other:?}"),
         }
 
@@ -460,6 +501,25 @@ mod tests {
         let unknown = br#"{"NukeSystem":{}}"#;
         let result = serde_json::from_slice::<PrivilegedRequest>(unknown);
         assert!(result.is_err());
+    }
+
+    /// `GrantChain`応答が、成功（`error: None`）・部分失敗（`error: Some`）のどちらでも
+    /// `granted`一覧を失わずラウンドトリップできることを確認する（孤立ACE防止の前提）。
+    #[test]
+    fn grant_chain_response_roundtrips_with_partial_failure() {
+        let resp = PrivilegedResponse::GrantChain {
+            granted: vec![PathBuf::from(r"C:\"), PathBuf::from(r"C:\Users")],
+            error: Some("access denied on C:\\Users\\example".to_string()),
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let decoded: PrivilegedResponse = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            PrivilegedResponse::GrantChain { granted, error } => {
+                assert_eq!(granted, vec![PathBuf::from(r"C:\"), PathBuf::from(r"C:\Users")]);
+                assert!(error.is_some());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

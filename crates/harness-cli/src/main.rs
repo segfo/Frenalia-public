@@ -126,11 +126,18 @@ enum FsAction {
     Revoke { path: PathBuf },
     /// 台帳の全エントリを撤収する。
     RevokeAll,
-    /// ドライブルート（例`C:\`）へ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を付与する（D10）。
-    /// `WRITE_DAC`が要るため管理者実行時のみ成功する（非管理者は失敗し再実行を促す）。
-    /// 付与に成功すると、撤収用の別台帳（traverse台帳）に記録される。
-    GrantTraverse { drive: PathBuf },
+    /// `target`とその全祖先（ドライブルートまで）へ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を
+    /// 連鎖付与する（D10連鎖化、`TIER1A-OPEN-ISSUES.md`項目6）。例えば
+    /// `C:\Users\<user>\.cargo`を指定すると、`C:\`・`C:\Users`・`C:\Users\<user>`・
+    /// `C:\Users\<user>\.cargo`の4ノード全てへ、UAC 1回で付与する。`WRITE_DAC`が要るため
+    /// 非管理者では特権分離ヘルパー(D-16)経由でUACを表示する。付与に成功した各ノードは、
+    /// 撤収用の別台帳(traverse台帳)へ個別に記録される。
+    GrantTraverse { target: PathBuf },
     /// `grant-traverse`で付与したtraverse ACEを1件撤収する（非再帰・単一ノード、D10の巻き戻し）。
+    /// 注意: `grant-traverse`が連鎖付与した祖先ノード（`C:\Users`等）は、他のpassthroughルートと
+    /// **共有されている可能性がある**。この`revoke-traverse`は指定した1ノードだけを撤収するため、
+    /// 他の到達性がまだその祖先ノードに依存している場合は、それを壊してしまう。祖先ノードの
+    /// 要否を意識せず一括で戻したい場合は`revoke-traverse-all`を使うこと。
     RevokeTraverse { path: PathBuf },
     /// traverse台帳の全エントリを撤収する。`grant-traverse`で付与した箇所を手打ちで覚える
     /// 必要がなく、記録済みの箇所だけを自動で対象にする。
@@ -816,7 +823,7 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
-        FsAction::GrantTraverse { drive } => fs_grant_traverse(&drive),
+        FsAction::GrantTraverse { target } => fs_grant_traverse(&target),
         FsAction::RevokeTraverse { path } => fs_revoke_traverse_one(&path),
         FsAction::RevokeTraverseAll => {
             let ledger = load_traverse_ledger();
@@ -888,39 +895,65 @@ fn fs_revoke_one(_path: &Path) -> ExitCode {
 /// 通常の非管理者起動時は特権分離ヘルパー（D-16、`plans/DESIGN-SANDBOX-PRIVSEP.md` §5）を
 /// `runas`経由で呼び出す（本体プロセス自身は非管理者のまま維持する）。
 #[cfg(windows)]
-fn fs_grant_traverse(drive: &Path) -> ExitCode {
+fn fs_grant_traverse(target: &Path) -> ExitCode {
     if harness_sandbox::privhelper::is_elevated() {
-        return fs_grant_traverse_direct(drive);
+        return fs_grant_traverse_direct(target);
     }
     match harness_sandbox::privhelper::run_privileged(
         &harness_sandbox::privhelper::PrivilegedRequest::GrantTraverse {
-            drive: drive.to_path_buf(),
+            target: target.to_path_buf(),
         },
     ) {
-        Ok(()) => {
-            record_traverse_grant(drive);
+        Ok(granted) => {
+            for node in &granted {
+                record_traverse_grant(node);
+            }
             println!(
-                "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES on {} via privilege-separation \
-                 helper (UAC, one-time; see docs/phases/foundation/M12-shell-isolation-tiers.md \
-                 追記8, plans/DESIGN-SANDBOX-PRIVSEP.md §5). Recorded in the traverse ledger; \
-                 use `harness fs revoke-traverse {}` or `revoke-traverse-all` to undo",
-                drive.display(),
-                drive.display()
+                "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES via privilege-separation helper \
+                 (UAC, one-time) on the full ancestor chain up to the drive root: {} (see \
+                 docs/phases/foundation/M12-shell-isolation-tiers.md 追記8・追記13, \
+                 plans/DESIGN-SANDBOX-PRIVSEP.md §5). All {} node(s) recorded in the traverse \
+                 ledger; use `harness fs revoke-traverse <path>` per-node or `revoke-traverse-all` \
+                 to undo",
+                granted
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> "),
+                granted.len()
             );
             ExitCode::SUCCESS
         }
+        Err(harness_sandbox::privhelper::PrivHelperError::PartialGrantChain { granted, reason }) => {
+            for node in &granted {
+                record_traverse_grant(node);
+            }
+            eprintln!(
+                "grant-traverse chain partially failed for {}: {reason}. {} node(s) that DID \
+                 succeed before the failure were still recorded in the traverse ledger (no \
+                 orphaned ACEs): {}",
+                target.display(),
+                granted.len(),
+                granted
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            );
+            ExitCode::FAILURE
+        }
         Err(e) => {
-            eprintln!("grant-traverse failed on {}: {e}", drive.display());
+            eprintln!("grant-traverse failed on {}: {e}", target.display());
             ExitCode::FAILURE
         }
     }
 }
 
-/// `fs_grant_traverse`の直接実行部分（本体が既に管理者トークンで動作している場合のみ呼ぶ、
+/// `fs_grant_traverse`の直接実行部分(本体が既に管理者トークンで動作している場合のみ呼ぶ、
 /// §5.3「本体が管理者ならヘルパー機構を経由しない直接呼び出しを許すが、そもそも本体が
-/// 管理者で起動されたこと自体を警告する」に対応）。
+/// 管理者で起動されたこと自体を警告する」に対応)。
 #[cfg(windows)]
-fn fs_grant_traverse_direct(drive: &Path) -> ExitCode {
+fn fs_grant_traverse_direct(target: &Path) -> ExitCode {
     let sid = match harness_sandbox::win_appcontainer::ensure_profile(
         harness_sandbox::win_appcontainer::CONTAINER_NAME,
     ) {
@@ -930,24 +963,40 @@ fn fs_grant_traverse_direct(drive: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match harness_sandbox::win_appcontainer::grant_traverse_drive_root(drive, sid.as_psid()) {
+    let (granted, result) =
+        harness_sandbox::win_appcontainer::grant_traverse_chain(target, sid.as_psid());
+    for node in &granted {
+        record_traverse_grant(node);
+    }
+    match result {
         Ok(()) => {
-            record_traverse_grant(drive);
             println!(
-                "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES on {} (admin, one-time; see \
-                 docs/phases/foundation/M12-shell-isolation-tiers.md 追記8). Recorded in the \
-                 traverse ledger; use `harness fs revoke-traverse {}` or `revoke-traverse-all` \
-                 to undo",
-                drive.display(),
-                drive.display()
+                "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES (admin, one-time; see \
+                 docs/phases/foundation/M12-shell-isolation-tiers.md 追記8・追記13) on the full \
+                 ancestor chain up to the drive root: {}. All {} node(s) recorded in the \
+                 traverse ledger; use `harness fs revoke-traverse <path>` per-node or \
+                 `revoke-traverse-all` to undo",
+                granted
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> "),
+                granted.len()
             );
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!(
-                "grant-traverse failed on {}: {e} (this requires WRITE_DAC on the drive root; \
-                 re-run as administrator)",
-                drive.display()
+                "grant-traverse chain failed on {}: {e} (this requires WRITE_DAC on each \
+                 ancestor node; re-run as administrator). {} node(s) that DID succeed before \
+                 the failure were still recorded in the traverse ledger: {}",
+                target.display(),
+                granted.len(),
+                granted
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
             );
             ExitCode::FAILURE
         }
@@ -955,7 +1004,7 @@ fn fs_grant_traverse_direct(drive: &Path) -> ExitCode {
 }
 
 #[cfg(not(windows))]
-fn fs_grant_traverse(_drive: &Path) -> ExitCode {
+fn fs_grant_traverse(_target: &Path) -> ExitCode {
     eprintln!("error: fs grant-traverse is Windows-only (Tier1a specific)");
     ExitCode::FAILURE
 }
@@ -976,7 +1025,7 @@ fn fs_revoke_traverse_one(path: &Path) -> ExitCode {
             path: path.to_path_buf(),
         },
     ) {
-        Ok(()) => {
+        Ok(_) => {
             remove_traverse_grant(path);
             println!(
                 "revoked traverse ACE via privilege-separation helper: {}",
