@@ -2497,4 +2497,156 @@ mod traverse_diagnostics {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&workspace);
     }
+
+    /// `path`のDACLに`PROTECTED_DACL_SECURITY_INFORMATION`を立て、祖先からの継承ACEが
+    /// このノード配下へ伝播するのを遮断する。**このとき`path`が現在実効的に持つ全ACE
+    /// （継承由来含む）を`GetExplicitEntriesFromAclW`で吸い出し、明示ACEとして保持し直す**
+    /// ため、Administrators/自分自身等の既存アクセスは失われない（0 ACEにはしない）。
+    ///
+    /// 当初の実装は`GetExplicitEntriesFromAclW`で現在のACEを吸い出してから`SetEntriesInAclW`で
+    /// 組み直す方式だったが、`GetExplicitEntriesFromAclW`は**継承フラグ（`INHERITED_ACE`）が
+    /// 立ったACEを一切拾わない**（名前どおり「明示」ACEのみが対象）ため、対象ディレクトリの
+    /// ACEが全て継承由来（新規作成した子ディレクトリの典型）の場合は`count=0`になり、
+    /// `SetEntriesInAclW(&[], None, ...)`が`new_dacl=NULL`を返してしまう。`SetNamedSecurityInfoW`
+    /// に`pDacl=NULL`を渡すと「DACLそのものが無い＝誰でもフルコントロール」という最も危険な
+    /// 状態になり、`grant_ace_ro(root)`自体は成功するのに対象ディレクトリのアクセス制御が
+    /// 消え去るという事故を招いた（実機の`icacls`出力`"アクセスが設定されていません。すべての
+    /// ユーザーがフル コントロールを保持しています。"`で発覚）。
+    ///
+    /// 修正: ACEを個別に吸い出して再構築する必要は無い。`GetNamedSecurityInfoW`が返す
+    /// `existing_dacl`は、継承由来かどうかを問わず**今この瞬間に有効な全ACEが物理的に
+    /// 格納された実体**（NTFSは継承ACEを都度計算せず子オブジェクトへ都度複製して保持する）
+    /// なので、そのポインタをそのまま`PROTECTED_DACL_SECURITY_INFORMATION`付きで書き戻すだけで
+    /// 「今の実効アクセスを凍結しつつ、以後の祖先からの継承だけを遮断する」が実現できる
+    /// （`.NET`の`SetAccessRuleProtection(true, true)`が内部で行うのと同じ操作）。
+    fn protect_dacl_preserve_inherited(path: &Path) -> windows::core::Result<()> {
+        use windows::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
+        unsafe {
+            let path_w = wide(&path.to_string_lossy());
+            let mut existing_dacl: *mut ACL = std::ptr::null_mut();
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            GetNamedSecurityInfoW(
+                PCWSTR(path_w.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut existing_dacl),
+                None,
+                &mut sd,
+            )
+            .ok()?;
+
+            let result = SetNamedSecurityInfoW(
+                PCWSTR(path_w.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(existing_dacl as *const _),
+                None,
+            )
+            .ok();
+
+            let _ = LocalFree(HLOCAL(sd.0));
+            result
+        }
+    }
+
+    /// Phase B-2の本実装（`grant_ace_inheritable_ro`）の実機検証。experiment_lは継承ONの
+    /// 単純ツリー1本しか検証しておらず、「保護DACL（継承を無効にした）子が混在するツリーでも
+    /// 全ノードへ読取が届くか」は未確認だった。このテストは(1)通常の子孫（継承伝播で届く）と
+    /// (2)`protect_dacl_preserve_inherited`で継承のみ意図的に遮断した子孫（既存の実効アクセスは
+    /// 保持したまま、フォールバックの明示付与が要る）を同じツリーに混在させ、
+    /// `grant_ace_inheritable_ro`が両方を読めるようにし、かつ`revoke_ace_recursive`で完全に
+    /// 撤収できることを確認する。
+    #[test]
+    #[ignore]
+    fn grant_ace_inheritable_ro_falls_back_for_protected_descendant() {
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+
+        let workspace = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-m-ws-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on workspace");
+        let probe_dir = workspace.join(".harness").join("sandbox").join("tier1a-tmp");
+        std::fs::create_dir_all(&probe_dir).expect("create probe dir");
+        if let Err(e) = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir) {
+            eprintln!(
+                "skipping grant_ace_inheritable_ro_falls_back_for_protected_descendant: \
+                 workspace FS I/O gate failed on this machine ({e:?}); run `harness fs \
+                 grant-traverse C:\\` as administrator first (D10)"
+            );
+            let _ = std::fs::remove_dir_all(&workspace);
+            return;
+        }
+
+        let root = std::path::PathBuf::from(format!(
+            "C:\\harness-tier1a-verify-m-{}",
+            std::process::id()
+        ));
+
+        // 通常branch: root -> normal -> deep -> preexisting.txt（継承伝播で届く想定）。
+        let normal_deep = root.join("normal").join("deep");
+        std::fs::create_dir_all(&normal_deep).expect("create normal branch");
+        let normal_file = normal_deep.join("preexisting.txt");
+        std::fs::write(&normal_file, b"reachable via inheritance").expect("seed normal file");
+
+        // 保護branch: root -> protected（既存アクセスは保持したまま継承のみ遮断）-> deep -> blocked.txt。
+        let protected_dir = root.join("protected");
+        let protected_deep = protected_dir.join("deep");
+        std::fs::create_dir_all(&protected_deep).expect("create protected branch");
+        let protected_file = protected_deep.join("blocked.txt");
+        std::fs::write(&protected_file, b"needs fallback explicit grant")
+            .expect("seed protected file");
+        protect_dacl_preserve_inherited(&protected_dir)
+            .expect("protect_dacl_preserve_inherited on protected dir");
+
+        let grant_result = grant_ace_inheritable_ro(&root, sid.as_psid());
+        assert!(
+            grant_result.is_ok(),
+            "grant_ace_inheritable_ro should succeed on a tree with a protected-DACL child: \
+             {grant_result:?}"
+        );
+
+        let normal_read_ok = run_probe_bool(
+            sid.as_psid(),
+            &workspace,
+            &format!(
+                "Get-Content -LiteralPath '{}' | Out-Null",
+                normal_file.display()
+            ),
+        );
+        assert!(
+            normal_read_ok,
+            "normal branch (reached via inheritance propagation) must be readable"
+        );
+
+        let protected_read_ok = run_probe_bool(
+            sid.as_psid(),
+            &workspace,
+            &format!(
+                "Get-Content -LiteralPath '{}' | Out-Null",
+                protected_file.display()
+            ),
+        );
+        assert!(
+            protected_read_ok,
+            "protected-DACL branch must be readable via the fallback explicit grant"
+        );
+
+        // 完全撤収の確認（D4）。保護フラグ自体は残るが、sid ACEは全ノードから消えるべき。
+        revoke_ace_recursive(&root, sid.as_psid()).expect("revoke_ace_recursive");
+        let leftover = assert_no_sid_ace_recursive(&root, sid.as_psid());
+        assert!(
+            leftover.is_ok(),
+            "sandbox SID ACE must be fully removed from every node, including the protected \
+             branch, after revoke_ace_recursive: {leftover:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
 }
