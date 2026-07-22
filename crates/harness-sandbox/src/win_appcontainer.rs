@@ -141,6 +141,17 @@ pub fn ensure_profile(name: &str) -> Result<OwnedContainerSid, AppContainerError
 /// 悪意あるsymlinkを辿ってworkspace外へpackage SIDの書込許可を誤って付与するスコープ逸脱を
 /// 防ぐため、`WorkspaceJail::walk_dir`の`is_symlink()`スキップと同じガードを独立に実装する
 /// （cap-stdの型保証が及ばない素の`std::fs`再帰のため、明示チェックが必須）。
+///
+/// **既知の診断精度の限界（安全性には影響しない）**: この関数が返す`io::Result`はどのノードで
+/// 失敗したかを含まない（`?`で素通しするだけ）。呼び出し側（`grant_ace_recursive`・
+/// `grant_ace_recursive_ro`・`grant_ace_inheritable_ro`）はこのエラーを`root`のパスに紐付けて
+/// `AppContainerError::AclGrant`へ包むため、`preflight`の`.exists()`チェック後から実際の
+/// walk開始までの間に対象配下のサブディレクトリが削除される（TOCTOU、Time-Of-Check to
+/// Time-Of-Use、確認と使用の間に対象が変化する競合）ようなごく稀なケースでは、ユーザーに
+/// 表示されるエラーメッセージが「どのノードで`read_dir`が失敗したか」ではなく`root`止まりに
+/// なる。スコープが意図せず広がる・誤ったパスへ書き込む等の安全性の問題は無く、純粋に
+/// エラーメッセージの特定精度の話に留まる。直す場合は本関数の戻り値を
+/// `Result<(), (std::path::PathBuf, std::io::Error)>`のように失敗ノードを含む形へ変更する。
 fn collect_dirs_and_files(
     root: &Path,
     dirs: &mut Vec<std::path::PathBuf>,
