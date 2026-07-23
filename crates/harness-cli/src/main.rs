@@ -288,6 +288,15 @@ struct Cli {
     /// `:ro`/`:rw`いずれも拒否）。
     #[arg(long = "fs-allow")]
     fs_allow: Vec<String>,
+
+    /// `--fs-allow`のシステム保護パス（`NT SERVICE\TrustedInstaller`所有等でAdministrator昇格でも
+    /// `WRITE_DAC`不可）へ、特権分離ヘルパーが`SeRestorePrivilege`を有効化して**強制付与**する
+    /// （D-19、既定オフ）。所有権は変えない（非破壊）。危険な拡張のためread-only専用
+    /// （`:rw`との併用は拒否）で、`%SystemRoot%`配下やドライブルート等の中核パスは
+    /// `is_force_grant_forbidden`ゲートで拒否する。付与したACEはharness終了後も残るため
+    /// `harness fs revoke`で撤収すること。
+    #[arg(long = "force-system-acl")]
+    force_system_acl: bool,
 }
 
 /// `--require-sandbox[=confidential]`の文字列表現を`RequireSandbox`へ変換する
@@ -613,6 +622,10 @@ struct FsLedgerEntry {
     path: String,
     writable: bool,
     granted_at_unix_secs: u64,
+    /// `--force-system-acl`（D-19）で`SeRestorePrivilege`を使って強制付与したか。
+    /// 撤収時も同じ特権が要るため記録する。旧台帳（このフィールド欠落）は`false`扱い（後方互換）。
+    #[serde(default)]
+    forced: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -730,7 +743,7 @@ fn save_traverse_ledger(ledger: &TraverseLedger) {
 /// `--fs-allow`でTier1a preflightが実際にACE付与を試みたルートを台帳へ記録する（D2/D3）。
 /// 同一パスは上書き（冪等）。ACE自体は「付けっぱなし」（D2）だが、台帳があるので後から
 /// `harness fs revoke`/`revoke-all`で一括撤収できる。
-fn record_fs_passthrough_grant(path: &Path, writable: bool) {
+fn record_fs_passthrough_grant(path: &Path, writable: bool, forced: bool) {
     let mut ledger = load_fs_ledger();
     let path_str = path.to_string_lossy().into_owned();
     let granted_at = std::time::SystemTime::now()
@@ -740,11 +753,13 @@ fn record_fs_passthrough_grant(path: &Path, writable: bool) {
     if let Some(entry) = ledger.entries.iter_mut().find(|e| e.path == path_str) {
         entry.writable = writable;
         entry.granted_at_unix_secs = granted_at;
+        entry.forced = forced;
     } else {
         ledger.entries.push(FsLedgerEntry {
             path: path_str,
             writable,
             granted_at_unix_secs: granted_at,
+            forced,
         });
     }
     save_fs_ledger(&ledger);
@@ -796,9 +811,10 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
             }
             for e in &ledger.entries {
                 println!(
-                    "{}\t{}\tgranted_at_unix={}",
+                    "{}\t{}{}\tgranted_at_unix={}",
                     e.path,
                     if e.writable { "rw" } else { "ro" },
+                    if e.forced { " [forced]" } else { "" },
                     e.granted_at_unix_secs
                 );
             }
@@ -843,18 +859,39 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
     }
 }
 
-/// `path`のfs passthrough ACEを、本体プロセス内（非管理者）で撤収を試みる（D3: 再walk revoke、
-/// D4: 剥離後検証パス）。ユーザー所有パス（workspace・`%USERPROFILE%`配下等）はここで完結する。
-/// システム保護パス（`BUG-015`でヘルパー経由により付与できるようになったパス）は
-/// `ACCESS_DENIED`で失敗し`false`を返す（呼び出し側がヘルパーへエスカレーションする）。
+/// `path`のfs passthrough ACEを、本体プロセス内（非管理者）で撤収を試み、3値で結果を返す
+/// （D3: 再walk revoke、D4: 剥離後検証パス）。ユーザー所有パス（workspace・`%USERPROFILE%`配下等）は
+/// ここで完結する。システム保護パス（`BUG-015`でヘルパー経由により付与できるようになったパス）は
+/// root自体を撤収できず`Failed`になる（呼び出し側がヘルパーへエスカレーションする）。
+/// `RootClearedDescendantsBlocked`は「rootは撤収できたが一部の子孫（TrustedInstaller所有等）に
+/// ACEが残る」ケースで、孤立ACEにはならないため台帳から除去してよい（BUG-016のrevoke非対称の解消）。
+/// `forced`（`--force-system-acl`で付与したエントリ）なら`SeRestorePrivilege`を有効化した状態で
+/// 撤収する。非管理者プロセスでは特権を有効化できず`revoke_passthrough`が特権無しで走る
+/// （システム保護パスならroot撤収に失敗し`Failed`→ヘルパーへエスカレーション）。管理者プロセス
+/// （`is_elevated`）なら特権が有効化され、TrustedInstaller所有ノードも含めて撤収できる。
 #[cfg(windows)]
-fn revoke_passthrough_in_process(
+fn revoke_passthrough_outcome(
     path: &Path,
     sid: &harness_sandbox::win_appcontainer::OwnedContainerSid,
-) -> bool {
-    harness_sandbox::win_appcontainer::revoke_ace_recursive(path, sid.as_psid()).is_ok()
-        && harness_sandbox::win_appcontainer::assert_no_sid_ace_recursive(path, sid.as_psid())
-            .is_ok()
+    forced: bool,
+) -> harness_sandbox::win_appcontainer::RevokeOutcome {
+    if forced {
+        harness_sandbox::win_appcontainer::with_restore_privilege(|| {
+            harness_sandbox::win_appcontainer::revoke_passthrough(path, sid.as_psid())
+        })
+    } else {
+        harness_sandbox::win_appcontainer::revoke_passthrough(path, sid.as_psid())
+    }
+}
+
+/// 撤収対象パスが台帳で`forced`（`--force-system-acl`）記録かを引く（無ければ`false`）。
+#[cfg(windows)]
+fn ledger_forced_flag(path: &Path) -> bool {
+    let target = path.to_string_lossy();
+    load_fs_ledger()
+        .entries
+        .iter()
+        .any(|e| e.path == target && e.forced)
 }
 
 /// 指定パスのfs passthrough ACEを撤収する（`BUG-015`の裏対称: grant側と同じく
@@ -871,35 +908,62 @@ fn fs_revoke_one(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if revoke_passthrough_in_process(path, &sid) {
-        remove_fs_passthrough_grant(path);
-        println!("revoked: {}", path.display());
-        return ExitCode::SUCCESS;
+    let forced = ledger_forced_flag(path);
+    use harness_sandbox::win_appcontainer::RevokeOutcome;
+    match revoke_passthrough_outcome(path, &sid, forced) {
+        RevokeOutcome::FullyRevoked => {
+            remove_fs_passthrough_grant(path);
+            println!("revoked: {}", path.display());
+            return ExitCode::SUCCESS;
+        }
+        RevokeOutcome::RootClearedDescendantsBlocked => {
+            remove_fs_passthrough_grant(path);
+            println!(
+                "revoked: {} (root and all writable nodes cleared; some TrustedInstaller-owned \
+                 descendants keep ACEs beyond our control -- not orphaned, entry removed from ledger)",
+                path.display()
+            );
+            return ExitCode::SUCCESS;
+        }
+        RevokeOutcome::Failed => {}
     }
 
     // 本体内で完結しなかった（システム保護パスの可能性）→特権分離ヘルパーへ委譲する。
     if harness_sandbox::privhelper::is_elevated() {
         // 本体が既に管理者（§5.3、fs_grant_traverse_directと同じ考え方）: 直接再試行する。
-        if revoke_passthrough_in_process(path, &sid) {
-            remove_fs_passthrough_grant(path);
-            println!("revoked: {}", path.display());
-            return ExitCode::SUCCESS;
-        }
-        eprintln!("revoke failed for {} (already running elevated)", path.display());
-        return ExitCode::FAILURE;
-    }
-    match harness_sandbox::privhelper::run_privileged_revoke_fs_allow(vec![path.to_path_buf()]) {
-        Ok((revoked, failures)) if failures.is_empty() && revoked.iter().any(|p| p == path) => {
-            remove_fs_passthrough_grant(path);
-            println!("revoked via privilege-separation helper (UAC, one-time): {}", path.display());
-            ExitCode::SUCCESS
-        }
-        Ok((_, failures)) => {
-            eprintln!("revoke incomplete for {} via privilege-separation helper:", path.display());
-            for (p, reason) in &failures {
-                eprintln!("  {} : {reason}", p.display());
+        match revoke_passthrough_outcome(path, &sid, forced) {
+            RevokeOutcome::FullyRevoked | RevokeOutcome::RootClearedDescendantsBlocked => {
+                remove_fs_passthrough_grant(path);
+                println!("revoked: {}", path.display());
+                return ExitCode::SUCCESS;
             }
-            ExitCode::FAILURE
+            RevokeOutcome::Failed => {
+                eprintln!("revoke failed for {} (already running elevated)", path.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let revoke_entry = harness_sandbox::privhelper::FsAllowRevoke {
+        path: path.to_path_buf(),
+        forced,
+    };
+    match harness_sandbox::privhelper::run_privileged_revoke_fs_allow(vec![revoke_entry]) {
+        Ok((revoked, root_cleared, failures)) => {
+            let cleared = revoked.iter().chain(root_cleared.iter()).any(|p| p == path);
+            // 撤収できたパス（root_cleared含む）は台帳から除去する。
+            for p in revoked.iter().chain(root_cleared.iter()) {
+                remove_fs_passthrough_grant(p);
+            }
+            if failures.is_empty() && cleared {
+                println!("revoked via privilege-separation helper (UAC, one-time): {}", path.display());
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("revoke incomplete for {} via privilege-separation helper:", path.display());
+                for (p, reason) in &failures {
+                    eprintln!("  {} : {reason}", p.display());
+                }
+                ExitCode::FAILURE
+            }
         }
         Err(e) => {
             eprintln!("revoke failed for {}: {e}", path.display());
@@ -935,14 +999,29 @@ fn fs_revoke_all() -> ExitCode {
         }
     };
 
-    let mut remaining: Vec<PathBuf> = Vec::new();
+    use harness_sandbox::win_appcontainer::RevokeOutcome;
+    // 本体内で撤収しきれなかったパスを`forced`情報付きで集める（ヘルパーで撤収時、forcedなら
+    // `SeRestorePrivilege`を有効化して撤収するため）。
+    let mut remaining: Vec<harness_sandbox::privhelper::FsAllowRevoke> = Vec::new();
     for entry in &ledger.entries {
         let path = PathBuf::from(&entry.path);
-        if revoke_passthrough_in_process(&path, &sid) {
-            remove_fs_passthrough_grant(&path);
-            println!("revoked: {}", path.display());
-        } else {
-            remaining.push(path);
+        match revoke_passthrough_outcome(&path, &sid, entry.forced) {
+            RevokeOutcome::FullyRevoked => {
+                remove_fs_passthrough_grant(&path);
+                println!("revoked: {}", path.display());
+            }
+            RevokeOutcome::RootClearedDescendantsBlocked => {
+                remove_fs_passthrough_grant(&path);
+                println!(
+                    "revoked: {} (root cleared; TrustedInstaller-owned descendants beyond our \
+                     control -- not orphaned)",
+                    path.display()
+                );
+            }
+            RevokeOutcome::Failed => remaining.push(harness_sandbox::privhelper::FsAllowRevoke {
+                path,
+                forced: entry.forced,
+            }),
         }
     }
 
@@ -950,26 +1029,33 @@ fn fs_revoke_all() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let escalated = if harness_sandbox::privhelper::is_elevated() {
-        // 本体が既に管理者: 直接再試行する（ヘルパーもUACも不要）。
-        let mut revoked = Vec::new();
-        let mut failures = Vec::new();
-        for path in &remaining {
-            if revoke_passthrough_in_process(path, &sid) {
-                revoked.push(path.clone());
-            } else {
-                failures.push((path.clone(), "revoke failed (already running elevated)".to_string()));
+    let escalated: Result<harness_sandbox::privhelper::FsAllowRevokeOutcome, String> =
+        if harness_sandbox::privhelper::is_elevated() {
+            // 本体が既に管理者: 直接再試行する（ヘルパーもUACも不要）。
+            let mut revoked = Vec::new();
+            let mut root_cleared = Vec::new();
+            let mut failures = Vec::new();
+            for entry in &remaining {
+                match revoke_passthrough_outcome(&entry.path, &sid, entry.forced) {
+                    RevokeOutcome::FullyRevoked => revoked.push(entry.path.clone()),
+                    RevokeOutcome::RootClearedDescendantsBlocked => {
+                        root_cleared.push(entry.path.clone())
+                    }
+                    RevokeOutcome::Failed => failures.push((
+                        entry.path.clone(),
+                        "revoke failed (already running elevated)".to_string(),
+                    )),
+                }
             }
-        }
-        Ok((revoked, failures))
-    } else {
-        harness_sandbox::privhelper::run_privileged_revoke_fs_allow(remaining.clone())
-            .map_err(|e| e.to_string())
-    };
+            Ok((revoked, root_cleared, failures))
+        } else {
+            harness_sandbox::privhelper::run_privileged_revoke_fs_allow(remaining.clone())
+                .map_err(|e| e.to_string())
+        };
 
     match escalated {
-        Ok((revoked, failures)) => {
-            for path in &revoked {
+        Ok((revoked, root_cleared, failures)) => {
+            for path in revoked.iter().chain(root_cleared.iter()) {
                 remove_fs_passthrough_grant(path);
                 println!(
                     "revoked via privilege-separation helper (UAC, one-time): {}",
@@ -986,8 +1072,8 @@ fn fs_revoke_all() -> ExitCode {
             }
         }
         Err(reason) => {
-            for path in &remaining {
-                eprintln!("revoke failed for {}: {reason}", path.display());
+            for entry in &remaining {
+                eprintln!("revoke failed for {}: {reason}", entry.path.display());
             }
             ExitCode::FAILURE
         }
@@ -1494,11 +1580,22 @@ async fn main() -> ExitCode {
             fs_allow_raw.push((path, writable));
         }
     }
+    // --force-system-acl（D-19）はread-only専用（システムディレクトリへの書込強制は危険すぎる）。
+    // `:rw`エントリが1つでもあれば起動を拒否する（fail-fast、--require-sandboxのD7と同じ思想）。
+    if cli.force_system_acl && fs_allow_raw.iter().any(|(_, writable)| *writable) {
+        eprintln!(
+            "error: --force-system-acl requires read-only --fs-allow entries (a :rw entry is \
+             present); forcing writable ACEs into system-protected paths is refused. Drop :rw or \
+             drop --force-system-acl."
+        );
+        return ExitCode::FAILURE;
+    }
     let fs_passthrough: Vec<harness_sandbox::FsPassthrough> = fs_allow_raw
         .into_iter()
         .map(|(path, writable)| harness_sandbox::FsPassthrough {
             path: workspace_root.join(&path),
             writable,
+            forced: cli.force_system_acl,
         })
         .collect();
     if !fs_passthrough.is_empty() && !cfg!(windows) {
@@ -1573,14 +1670,33 @@ async fn main() -> ExitCode {
     // （D8/D9）は`passthrough_warnings`としてこの下で表示する。
     if shell_tier.tier == harness_core::ShellTier::Tier1a {
         for (path, writable) in &shell_tier.granted_passthrough {
-            record_fs_passthrough_grant(path, *writable);
-            eprintln!(
-                "note: fs-allow granted: {} [{}] (this ACE persists after harness exits; use \
-                 `harness fs revoke {}` to undo)",
-                path.display(),
-                if *writable { "rw" } else { "ro" },
-                path.display()
-            );
+            // このエントリが`--force-system-acl`対象だったか（元のfs_passthroughから引く）。
+            // forcedなら撤収時も`SeRestorePrivilege`が要るため台帳へ記録しておく。
+            let forced = fs_passthrough
+                .iter()
+                .find(|fp| &fp.path == path)
+                .map(|fp| fp.forced)
+                .unwrap_or(false);
+            record_fs_passthrough_grant(path, *writable, forced);
+            if forced {
+                eprintln!(
+                    "WARNING: forced system ACL grant (--force-system-acl, SeRestorePrivilege): {} \
+                     [{}] -- a sandbox read ACE was written into a system-protected path by \
+                     bypassing its DACL (ownership unchanged). This ACE persists after harness \
+                     exits; run `harness fs revoke {}` to undo.",
+                    path.display(),
+                    if *writable { "rw" } else { "ro" },
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "note: fs-allow granted: {} [{}] (this ACE persists after harness exits; use \
+                     `harness fs revoke {}` to undo)",
+                    path.display(),
+                    if *writable { "rw" } else { "ro" },
+                    path.display()
+                );
+            }
         }
     }
     for warning in &shell_tier.passthrough_warnings {
@@ -1674,5 +1790,42 @@ async fn main() -> ExitCode {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fs_ledger_tests {
+    use super::{FsLedger, FsLedgerEntry};
+
+    /// D-19以前に書かれた台帳（`forced`フィールドが無いJSON）が、`#[serde(default)]`で
+    /// `forced=false`として読めることを確認する（後方互換）。台帳が読めないと既存のACEを
+    /// 追跡できなくなり「付与した記憶はあるが記録が無い」孤立ACEに直結するため重要。
+    #[test]
+    fn legacy_ledger_without_forced_field_deserializes_as_not_forced() {
+        let legacy = r#"{"entries":[
+            {"path":"C:\\ProgramData\\Microsoft\\Windows\\Start Menu","writable":false,"granted_at_unix_secs":1700000000}
+        ]}"#;
+        let ledger: FsLedger = serde_json::from_str(legacy).expect("legacy ledger must parse");
+        assert_eq!(ledger.entries.len(), 1);
+        assert!(
+            !ledger.entries[0].forced,
+            "missing forced field must default to false"
+        );
+    }
+
+    /// `forced=true`の台帳が正しくラウンドトリップすることを確認する。
+    #[test]
+    fn forced_entry_roundtrips() {
+        let ledger = FsLedger {
+            entries: vec![FsLedgerEntry {
+                path: r"C:\ProgramData\Microsoft\Windows\Start Menu".to_string(),
+                writable: false,
+                granted_at_unix_secs: 1_700_000_000,
+                forced: true,
+            }],
+        };
+        let json = serde_json::to_string(&ledger).unwrap();
+        let back: FsLedger = serde_json::from_str(&json).unwrap();
+        assert!(back.entries[0].forced);
     }
 }

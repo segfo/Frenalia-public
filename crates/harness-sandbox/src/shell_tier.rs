@@ -52,6 +52,10 @@ fn require_label(require: RequireSandbox) -> &'static str {
 pub struct FsPassthrough {
     pub path: PathBuf,
     pub writable: bool,
+    /// `--force-system-acl`（D-19）: `NT SERVICE\TrustedInstaller`所有等で`WRITE_DAC`不可の
+    /// システム保護パスへ、特権分離ヘルパーが`SeRestorePrivilege`を有効化して強制付与する。
+    /// 既定false。`is_force_grant_forbidden`のゲートを通過したもののみ実際に強制付与される。
+    pub forced: bool,
 }
 
 /// OS能力プローブ結果。テストから注入できるようにフィールドを公開する。
@@ -320,6 +324,7 @@ mod tests {
         let passthrough = vec![FsPassthrough {
             path: PathBuf::from("C:\\dummy"),
             writable: false,
+            forced: false,
         }];
         let selection =
             select_tier_with_probes(RequireSandbox::None, &empty_root(), true, &passthrough, &probes)

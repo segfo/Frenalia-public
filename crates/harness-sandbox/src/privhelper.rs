@@ -60,6 +60,20 @@ use crate::win_common::wide;
 pub struct FsAllowGrant {
     pub path: PathBuf,
     pub writable: bool,
+    /// `--force-system-acl`（D-19）: システム保護パス（`WRITE_DAC`不可）へ
+    /// `SeRestorePrivilege`を有効化して強制付与する。dispatch側で`is_force_grant_forbidden`の
+    /// ゲートを通過したもののみ`with_restore_privilege`下で付与する。既定false。
+    #[serde(default)]
+    pub forced: bool,
+}
+
+/// `RevokeFsAllow`要求の1エントリ。`forced`なパス（`--force-system-acl`で付与したもの）は
+/// 撤収時も`SeRestorePrivilege`が要るため、grantと対称に`forced`を運ぶ（新たな非対称を作らない）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsAllowRevoke {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub forced: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,9 +93,10 @@ pub enum PrivilegedRequest {
     GrantFsAllow { entries: Vec<FsAllowGrant> },
     /// `harness fs revoke`/`revoke-all`が本体プロセス内（非管理者）で撤収しきれなかった
     /// パス（`GrantFsAllow`でシステム保護パスへ付与したACE等）をまとめて1回のUACで撤収する
-    /// （`GrantFsAllow`の裏対称、`BUG-015`参照）。`writable`概念が無いためプレーンな
-    /// `Vec<PathBuf>`で足りる。各パスは`revoke_ace_recursive`（ツリー全体を再walk）で撤収する。
-    RevokeFsAllow { paths: Vec<PathBuf> },
+    /// （`GrantFsAllow`の裏対称、`BUG-015`参照）。各エントリは`revoke_passthrough`
+    /// （ツリー全体を再walk＋root再プローブ）で撤収する。`forced`なパスは`SeRestorePrivilege`下で
+    /// 撤収する（grantと対称に`forced`を運び新たな非対称を作らない、`FsAllowRevoke`参照）。
+    RevokeFsAllow { entries: Vec<FsAllowRevoke> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,8 +121,12 @@ pub enum PrivilegedResponse {
     },
     /// `RevokeFsAllow`の結果。`FsAllowResult`と同形だが、フィールド名を`granted`ではなく
     /// `revoked`にして意味を明確にする。エントリごとに成否が独立する点も`FsAllowResult`と同じ。
+    /// `root_cleared`は「rootのACEは消えたが一部の子孫（TrustedInstaller所有等）にACEが残る」
+    /// パス（BUG-016のrevoke非対称の解消、`RevokeOutcome::RootClearedDescendantsBlocked`）。
+    /// 呼び出し側は`revoked`と`root_cleared`の両方を台帳から除去する（後者は孤立ACEにならない）。
     RevokeFsAllowResult {
         revoked: Vec<PathBuf>,
+        root_cleared: Vec<PathBuf>,
         failures: Vec<(PathBuf, String)>,
     },
     /// 要求全体を拒否した場合の単純な失敗（スキーマ不一致等、部分適用の概念が無い操作）。
@@ -434,6 +453,11 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
 /// `run_privileged_fs_allow`の成功値（`granted`パス一覧、`(path, reason)`失敗一覧）。
 pub type FsAllowGrantOutcome = (Vec<PathBuf>, Vec<(PathBuf, String)>);
 
+/// `run_privileged_revoke_fs_allow`の成功値（`revoked`完全撤収一覧、`root_cleared`
+/// root撤収済み・子孫ブロック一覧、`(path, reason)`失敗一覧）。`revoked`と`root_cleared`は
+/// どちらも台帳から除去してよい（`root_cleared`は孤立ACEにならない、`RevokeOutcome`参照）。
+pub type FsAllowRevokeOutcome = (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>);
+
 /// `GrantFsAllow`専用の委譲関数。`run_privileged`と異なりエントリごとの成否（`granted`/
 /// `failures`）を両方とも呼び出し側へそのまま返す（1エントリの失敗が「エラー」ではなく
 /// 正常な部分結果であるため、`run_privileged`の`Result<Vec<PathBuf>, _>`という単一成功値の
@@ -461,19 +485,27 @@ pub fn run_privileged_fs_allow(
 }
 
 /// `RevokeFsAllow`専用の委譲関数（`run_privileged_fs_allow`の裏対称、`BUG-015`参照）。
-/// `paths`は`harness fs revoke`/`revoke-all`が本体プロセス内で撤収しきれなかったパスの一覧。
+/// `entries`は`harness fs revoke`/`revoke-all`が本体プロセス内で撤収しきれなかったパス
+/// （`forced`情報付き）の一覧。
 pub fn run_privileged_revoke_fs_allow(
-    paths: Vec<PathBuf>,
-) -> Result<FsAllowGrantOutcome, PrivHelperError> {
-    let req = PrivilegedRequest::RevokeFsAllow { paths };
+    entries: Vec<FsAllowRevoke>,
+) -> Result<FsAllowRevokeOutcome, PrivHelperError> {
+    let req = PrivilegedRequest::RevokeFsAllow { entries };
     match run_privileged_raw(&req)? {
-        PrivilegedResponse::RevokeFsAllowResult { revoked, failures } => Ok((revoked, failures)),
-        PrivilegedResponse::Ok => Ok((Vec::new(), Vec::new())),
+        PrivilegedResponse::RevokeFsAllowResult {
+            revoked,
+            root_cleared,
+            failures,
+        } => Ok((revoked, root_cleared, failures)),
+        PrivilegedResponse::Ok => Ok((Vec::new(), Vec::new(), Vec::new())),
         PrivilegedResponse::GrantChain { granted, error } => Ok((
             granted,
+            Vec::new(),
             error.map(|e| vec![(PathBuf::new(), e)]).unwrap_or_default(),
         )),
-        PrivilegedResponse::FsAllowResult { granted, failures } => Ok((granted, failures)),
+        PrivilegedResponse::FsAllowResult { granted, failures } => {
+            Ok((granted, Vec::new(), failures))
+        }
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }
 }
@@ -773,26 +805,49 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
             let mut failures = Vec::new();
             for entry in entries {
                 let started = std::time::Instant::now();
-                let result = if entry.writable {
-                    win_appcontainer::grant_ace_recursive(&entry.path, sid.as_psid())
+                // forced（--force-system-acl, D-19）は`SeRestorePrivilege`で全DACLをバイパスして
+                // 書くため、書込前に必ず host パスの絶対拒否ゲートを通す（唯一の防壁）。
+                if entry.forced {
+                    if let Some(reason) = win_appcontainer::is_force_grant_forbidden(&entry.path) {
+                        log::line(&format!(
+                            "  entry {} : forced grant REFUSED by deny-gate: {reason}",
+                            entry.path.display()
+                        ));
+                        failures.push((entry.path, reason));
+                        continue;
+                    }
+                }
+                let do_grant = || {
+                    if entry.writable {
+                        win_appcontainer::grant_ace_recursive(&entry.path, sid.as_psid())
+                    } else {
+                        win_appcontainer::grant_ace_inheritable_ro(&entry.path, sid.as_psid())
+                    }
+                };
+                // forcedのみ`SeRestorePrivilege`を有効化して実行する（TrustedInstaller所有ノードへも
+                // 所有権を変えずにACEを書ける）。非forcedは従来どおり特権無しで実行する。
+                let result = if entry.forced {
+                    win_appcontainer::with_restore_privilege(do_grant)
                 } else {
-                    win_appcontainer::grant_ace_inheritable_ro(&entry.path, sid.as_psid())
+                    do_grant()
                 };
                 match result {
                     Ok(()) => {
                         log::line(&format!(
-                            "  entry {} [{}] : granted in {}ms",
+                            "  entry {} [{}{}] : granted in {}ms",
                             entry.path.display(),
                             if entry.writable { "rw" } else { "ro" },
+                            if entry.forced { ",forced" } else { "" },
                             started.elapsed().as_millis()
                         ));
                         granted.push(entry.path);
                     }
                     Err(e) => {
                         log::line(&format!(
-                            "  entry {} [{}] : FAILED after {}ms: {e}",
+                            "  entry {} [{}{}] : FAILED after {}ms: {e}",
                             entry.path.display(),
                             if entry.writable { "rw" } else { "ro" },
+                            if entry.forced { ",forced" } else { "" },
                             started.elapsed().as_millis()
                         ));
                         failures.push((entry.path, e.to_string()));
@@ -806,26 +861,23 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
             ));
             PrivilegedResponse::FsAllowResult { granted, failures }
         }
-        PrivilegedRequest::RevokeFsAllow { paths } => {
-            log::line(&format!("dispatch: RevokeFsAllow {} path(s)", paths.len()));
+        PrivilegedRequest::RevokeFsAllow { entries } => {
+            log::line(&format!("dispatch: RevokeFsAllow {} path(s)", entries.len()));
             let mut revoked = Vec::new();
+            let mut root_cleared = Vec::new();
             let mut failures = Vec::new();
-            for path in paths {
+            for entry in entries {
+                let path = entry.path;
                 let started = std::time::Instant::now();
-                let result: Result<(), String> = win_appcontainer::revoke_ace_recursive(&path, sid.as_psid())
-                    .map_err(|e| e.to_string())
-                    .and_then(|()| {
-                        win_appcontainer::assert_no_sid_ace_recursive(&path, sid.as_psid()).map_err(
-                            |remaining| {
-                                format!(
-                                    "{} node(s) still carry the sandbox ACE after revoke",
-                                    remaining.len()
-                                )
-                            },
-                        )
-                    });
-                match result {
-                    Ok(()) => {
+                // forcedなパス（--force-system-aclで付与したACE）は撤収時も`SeRestorePrivilege`が要る。
+                let do_revoke = || win_appcontainer::revoke_passthrough(&path, sid.as_psid());
+                let outcome = if entry.forced {
+                    win_appcontainer::with_restore_privilege(do_revoke)
+                } else {
+                    do_revoke()
+                };
+                match outcome {
+                    win_appcontainer::RevokeOutcome::FullyRevoked => {
                         log::line(&format!(
                             "  path {} : revoked in {}ms",
                             path.display(),
@@ -833,22 +885,38 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                         ));
                         revoked.push(path);
                     }
-                    Err(e) => {
+                    win_appcontainer::RevokeOutcome::RootClearedDescendantsBlocked => {
                         log::line(&format!(
-                            "  path {} : FAILED after {}ms: {e}",
+                            "  path {} : root cleared (descendants blocked) in {}ms",
                             path.display(),
                             started.elapsed().as_millis()
                         ));
-                        failures.push((path, e));
+                        root_cleared.push(path);
+                    }
+                    win_appcontainer::RevokeOutcome::Failed => {
+                        log::line(&format!(
+                            "  path {} : FAILED after {}ms (root ACE still present)",
+                            path.display(),
+                            started.elapsed().as_millis()
+                        ));
+                        failures.push((
+                            path,
+                            "root ACE still present after revoke attempt".to_string(),
+                        ));
                     }
                 }
             }
             log::line(&format!(
-                "dispatch: RevokeFsAllow done, {} revoked, {} failed",
+                "dispatch: RevokeFsAllow done, {} revoked, {} root-cleared, {} failed",
                 revoked.len(),
+                root_cleared.len(),
                 failures.len()
             ));
-            PrivilegedResponse::RevokeFsAllowResult { revoked, failures }
+            PrivilegedResponse::RevokeFsAllowResult {
+                revoked,
+                root_cleared,
+                failures,
+            }
         }
     }
 }
@@ -891,10 +959,12 @@ mod tests {
                 FsAllowGrant {
                     path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
                     writable: false,
+                    forced: false,
                 },
                 FsAllowGrant {
                     path: PathBuf::from(r"C:\Program Files\SomeTool"),
                     writable: true,
+                    forced: true,
                 },
             ],
         };
@@ -908,10 +978,23 @@ mod tests {
                     PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")
                 );
                 assert!(!entries[0].writable);
+                assert!(!entries[0].forced);
                 assert!(entries[1].writable);
+                assert!(entries[1].forced);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// `FsAllowGrant`/`FsAllowRevoke`の`forced`は`#[serde(default)]`なので、フィールドが
+    /// 欠けたJSON（この機能導入前のスキーマ）でも`false`として読める（前方/後方互換）。
+    #[test]
+    fn forced_field_defaults_to_false_when_absent() {
+        let grant: FsAllowGrant =
+            serde_json::from_str(r#"{"path":"C:\\x","writable":false}"#).unwrap();
+        assert!(!grant.forced);
+        let revoke: FsAllowRevoke = serde_json::from_str(r#"{"path":"C:\\x"}"#).unwrap();
+        assert!(!revoke.forced);
     }
 
     /// `FsAllowResult`応答が、成功エントリと失敗エントリが混在する状態でも両方を失わずに
@@ -944,20 +1027,28 @@ mod tests {
     #[test]
     fn revoke_fs_allow_request_roundtrips_through_json() {
         let req = PrivilegedRequest::RevokeFsAllow {
-            paths: vec![
-                PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
-                PathBuf::from(r"C:\Program Files\SomeTool"),
+            entries: vec![
+                FsAllowRevoke {
+                    path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
+                    forced: false,
+                },
+                FsAllowRevoke {
+                    path: PathBuf::from(r"C:\Program Files\SomeTool"),
+                    forced: true,
+                },
             ],
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: PrivilegedRequest = serde_json::from_slice(&bytes).unwrap();
         match decoded {
-            PrivilegedRequest::RevokeFsAllow { paths } => {
-                assert_eq!(paths.len(), 2);
+            PrivilegedRequest::RevokeFsAllow { entries } => {
+                assert_eq!(entries.len(), 2);
                 assert_eq!(
-                    paths[0],
+                    entries[0].path,
                     PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")
                 );
+                assert!(!entries[0].forced);
+                assert!(entries[1].forced);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -969,6 +1060,7 @@ mod tests {
     fn revoke_fs_allow_result_response_roundtrips_with_mixed_outcomes() {
         let resp = PrivilegedResponse::RevokeFsAllowResult {
             revoked: vec![PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")],
+            root_cleared: vec![PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu")],
             failures: vec![(
                 PathBuf::from(r"C:\Windows\System32\config"),
                 "access denied".to_string(),
@@ -977,10 +1069,18 @@ mod tests {
         let bytes = serde_json::to_vec(&resp).unwrap();
         let decoded: PrivilegedResponse = serde_json::from_slice(&bytes).unwrap();
         match decoded {
-            PrivilegedResponse::RevokeFsAllowResult { revoked, failures } => {
+            PrivilegedResponse::RevokeFsAllowResult {
+                revoked,
+                root_cleared,
+                failures,
+            } => {
                 assert_eq!(
                     revoked,
                     vec![PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")]
+                );
+                assert_eq!(
+                    root_cleared,
+                    vec![PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu")]
                 );
                 assert_eq!(failures.len(), 1);
                 assert_eq!(failures[0].0, PathBuf::from(r"C:\Windows\System32\config"));

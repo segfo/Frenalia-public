@@ -29,7 +29,8 @@ use std::path::Path;
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, HLOCAL,
+    INVALID_HANDLE_VALUE, LUID, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
@@ -40,10 +41,12 @@ use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, FreeSid,
-    InitializeSecurityDescriptor, NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
+    ACL, AdjustTokenPrivileges, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, FreeSid,
+    InitializeSecurityDescriptor, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, NO_INHERITANCE,
+    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME,
     SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SetKernelObjectSecurity,
-    SetSecurityDescriptorDacl,
+    SetSecurityDescriptorDacl, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_PRIVILEGES_ATTRIBUTES, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
@@ -54,10 +57,10 @@ use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use crate::shell_tier::FsPassthrough;
@@ -219,6 +222,155 @@ unsafe fn set_dacl_single_object(path: &Path, new_dacl: *mut ACL) -> windows::co
 
     let _ = CloseHandle(handle);
     result
+}
+
+/// 指定トークンの1特権を有効/無効化する（`AdjustTokenPrivileges`）。`AdjustTokenPrivileges`は
+/// 特権がトークンに割り当てられていなくても関数自体は成功（`S_OK`）を返し、
+/// `GetLastError`で`ERROR_NOT_ALL_ASSIGNED`を返す仕様のため、有効化時はそれを失敗として扱う。
+unsafe fn set_privilege(
+    token: HANDLE,
+    name: PCWSTR,
+    enable: bool,
+) -> windows::core::Result<()> {
+    let mut luid = LUID::default();
+    LookupPrivilegeValueW(PCWSTR::null(), name, &mut luid)?;
+    let tp = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: if enable {
+                SE_PRIVILEGE_ENABLED
+            } else {
+                TOKEN_PRIVILEGES_ATTRIBUTES(0)
+            },
+        }],
+    };
+    AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None)?;
+    if enable && GetLastError() == ERROR_NOT_ALL_ASSIGNED {
+        // トークンが`SeRestorePrivilege`を保持していない（非管理者等）。
+        return Err(windows::core::Error::from_win32());
+    }
+    Ok(())
+}
+
+/// `SeRestorePrivilege`を有効化した状態で`f`を実行し、終了後に必ず元へ戻すRAIIガード
+/// （D-19、`--force-system-acl`のオプトイン強制付与）。`SeRestorePrivilege`はバックアップ/リストア
+/// 用特権で、DACLに関係なく`WRITE_DAC`/`WRITE_OWNER`でオブジェクトを開けるため、
+/// `NT SERVICE\TrustedInstaller`所有ノード（Administratorでも`WRITE_DAC`不可）へも
+/// **所有権を変えずに**（非破壊で）ACEを書ける。
+///
+/// **セキュリティ注意（D-19）**: 有効化中はこのプロセスがシステム上の任意オブジェクトの
+/// セキュリティ記述子を書き換えられる。呼び出しは特権分離ヘルパー（昇格済み）内の、かつ
+/// `--force-system-acl`が明示され`is_force_grant_forbidden`ゲートを通過したforced操作に限る。
+/// 特権が有効化できない場合（非管理者等）は`f`をそのまま特権無しで実行する（呼び出し側の
+/// grant/revokeが通常どおり`ACCESS_DENIED`で失敗するだけ。ここではpanicも早期returnもしない）。
+pub fn with_restore_privilege<T>(f: impl FnOnce() -> T) -> T {
+    struct PrivGuard {
+        token: HANDLE,
+        enabled: bool,
+    }
+    impl Drop for PrivGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if self.enabled {
+                    let _ = set_privilege(self.token, SE_RESTORE_NAME, false);
+                }
+                if !self.token.is_invalid() {
+                    let _ = CloseHandle(self.token);
+                }
+            }
+        }
+    }
+
+    let _guard = unsafe {
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ACCESS_MASK(TOKEN_ADJUST_PRIVILEGES.0 | TOKEN_QUERY.0),
+            &mut token,
+        )
+        .is_ok();
+        if !opened {
+            PrivGuard {
+                token: HANDLE::default(),
+                enabled: false,
+            }
+        } else {
+            let enabled = set_privilege(token, SE_RESTORE_NAME, true).is_ok();
+            PrivGuard { token, enabled }
+        }
+    };
+    f()
+    // `_guard`のDropでSeRestorePrivilegeを無効化しトークンを閉じる（fがpanicしても戻る）。
+}
+
+/// `a`（対象パス）が`base`配下（`base`自身を含む）かを大文字小文字無視で判定する。
+/// 双方canonicalize済みを前提とし、パス成分単位で比較する（文字列の`starts_with`だと
+/// `C:\Windows`が`C:\WindowsApps`に誤マッチするため成分比較にする）。
+fn path_is_within(a: &Path, base: &Path) -> bool {
+    let comps = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    let a = comps(a);
+    let b = comps(base);
+    b.len() <= a.len() && b.iter().zip(a.iter()).all(|(x, y)| x == y)
+}
+
+/// `--force-system-acl`（D-19、`SeRestorePrivilege`による強制付与）で触れてはいけない
+/// host パスを保守的に拒否する。`SeRestorePrivilege`は全DACLをバイパスするため、既存の
+/// jail相対 hard-deny（`overlay`/`permission`/`git`）ではカバーできない host パスに対する
+/// **書込前の唯一の防壁**になる（`Some(reason)`なら禁止、`None`なら許可）。
+///
+/// 保守的な拒否対象:
+/// - ドライブルート自体（例 `C:\`）——継承ACEを撒くと影響範囲が全ドライブに及ぶ。
+/// - `%SystemRoot%`（通常`C:\Windows`）配下全体——`System32\config`のレジストリハイブ
+///   （SAM/SYSTEM/SECURITY/SOFTWARE）等、OSの中核が含まれる。
+///
+/// 動機となった`...\Start Menu`（`%ProgramData%`配下）や`Program Files`配下の
+/// TrustedInstaller所有フォルダはいずれも上記の外なので許可される。
+/// canonicalizeに失敗するパスは安全側に倒して拒否する。
+pub fn is_force_grant_forbidden(path: &Path) -> Option<String> {
+    let canon = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) => {
+            return Some(format!(
+                "cannot canonicalize {} ({e}); refusing forced system-ACL grant",
+                path.display()
+            ));
+        }
+    };
+
+    // ドライブルート（Prefix + RootDirのみで、通常成分が無い）を拒否する。
+    let has_normal = canon
+        .components()
+        .any(|c| matches!(c, std::path::Component::Normal(_)));
+    if !has_normal {
+        return Some(format!(
+            "{} is a drive root; refusing forced system-ACL grant (blast radius too large)",
+            canon.display()
+        ));
+    }
+
+    // `%SystemRoot%`（Windowsディレクトリ）配下全体を拒否する。
+    if let Some(windir) = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(std::path::PathBuf::from)
+    {
+        // windir自体をcanonicalizeして比較する（8.3名やcase差を吸収）。
+        let windir_canon = std::fs::canonicalize(&windir).unwrap_or(windir);
+        if path_is_within(&canon, &windir_canon) {
+            return Some(format!(
+                "{} is inside the Windows system directory ({}); refusing forced system-ACL grant \
+                 (contains registry hives and OS-critical objects)",
+                canon.display(),
+                windir_canon.display()
+            ));
+        }
+    }
+
+    None
 }
 
 fn grant_ace_mask(
@@ -1001,12 +1153,24 @@ pub fn preflight(
                 }
             }
             Err(_) => {
+                // forced（--force-system-acl, D-19）は host パスの絶対拒否ゲートを**UACの前に**
+                // 通す（禁止パスなら昇格させずここで警告に落とす。無駄なUACを出さない二重化）。
+                if fp.forced {
+                    if let Some(reason) = is_force_grant_forbidden(&fp.path) {
+                        warnings.push(format!(
+                            "fs-allow {} : forced system-ACL grant refused: {reason}",
+                            fp.path.display()
+                        ));
+                        continue;
+                    }
+                }
                 // 本体（非管理者）内では書けなかった。システム保護パス（所有者がSYSTEM/
                 // TrustedInstaller等）の可能性があるため、即座に警告へ落とさず後段の
                 // 特権分離ヘルパー経路へ回す。
                 needs_elevation.push(crate::privhelper::FsAllowGrant {
                     path: fp.path.clone(),
                     writable: fp.writable,
+                    forced: fp.forced,
                 });
             }
         }
@@ -1019,10 +1183,25 @@ pub fn preflight(
             let mut granted = Vec::new();
             let mut failures = Vec::new();
             for entry in &needs_elevation {
-                let result = if entry.writable {
-                    grant_ace_recursive(&entry.path, sid.as_psid())
+                // forcedは書込前に絶対拒否ゲートを通し、通過分のみ`SeRestorePrivilege`下で付与する
+                // （dispatch側と同じ防壁。本体が既に管理者の経路でも同一の不変条件を保つ）。
+                if entry.forced {
+                    if let Some(reason) = is_force_grant_forbidden(&entry.path) {
+                        failures.push((entry.path.clone(), reason));
+                        continue;
+                    }
+                }
+                let do_grant = || {
+                    if entry.writable {
+                        grant_ace_recursive(&entry.path, sid.as_psid())
+                    } else {
+                        grant_ace_inheritable_ro(&entry.path, sid.as_psid())
+                    }
+                };
+                let result = if entry.forced {
+                    with_restore_privilege(do_grant)
                 } else {
-                    grant_ace_inheritable_ro(&entry.path, sid.as_psid())
+                    do_grant()
                 };
                 match result {
                     Ok(()) => granted.push(entry.path.clone()),
@@ -1258,6 +1437,46 @@ pub fn assert_no_sid_ace_recursive(root: &Path, sid: PSID) -> Result<(), Vec<std
         Ok(())
     } else {
         Err(remaining)
+    }
+}
+
+/// `revoke_passthrough`の3値結果（BUG-016で記録した「revoke側の台帳残留」非対称の解消、
+/// BUG-017のroot再プローブの鏡像）。台帳除去の判定を「ツリー全体成功」ではなく「rootのACEが
+/// 消えたか」基準にするために導入する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    /// `root`配下から完全に`sid`のACEを撤収できた。
+    FullyRevoked,
+    /// `root`自身のACEは撤収できたが、一部の子孫（`NT SERVICE\TrustedInstaller`所有等で
+    /// `WRITE_DAC`不可）にACEが残る。**孤立ACEではない**——grantとrevokeは同じ`WRITE_DAC`を
+    /// 要するため、rootが消えたのにACEが残る子孫は「こちらが書けない＝元々付与もできていない
+    /// ノード」であり、除去残しにはならない。台帳からは除去してよい。
+    RootClearedDescendantsBlocked,
+    /// `root`自身のACEがまだ残っている（真の失敗、または一過性で再試行の余地あり）。
+    /// 台帳には残す。
+    Failed,
+}
+
+/// `root`配下から`sid`のfs passthrough ACEを撤収し、**rootのACEが消えたか**を権威的に
+/// 再プローブして3値で返す（BUG-016で記録した「部分適用エントリのrevoke時、rootのACEは
+/// 実際に消えるのに子孫の`Err`で台帳エントリが残る」非対称の解消）。`revoke_ace_recursive`が
+/// 途中の子孫で`Err`を返しても、それを最終判定に使わず`sid_ace_mask(root)`で判定する点が要。
+/// forced撤収（`SeRestorePrivilege`下）で呼ぶ場合は呼び出し側が`with_restore_privilege`で囲う。
+pub fn revoke_passthrough(root: &Path, sid: PSID) -> RevokeOutcome {
+    // rootが既に存在しない（revoke後にユーザが削除した等）場合は、実FS上にACEを載せる
+    // オブジェクトが無いので完全撤収扱いとし、台帳エントリを掃除できるようにする。
+    if !root.exists() {
+        return RevokeOutcome::FullyRevoked;
+    }
+    // 途中の子孫（TrustedInstaller所有等）で失敗しても、後段のroot再プローブで最終判定する。
+    let _ = revoke_ace_recursive(root, sid);
+    match sid_ace_mask(root, sid) {
+        Ok(None) => match assert_no_sid_ace_recursive(root, sid) {
+            Ok(()) => RevokeOutcome::FullyRevoked,
+            Err(_) => RevokeOutcome::RootClearedDescendantsBlocked,
+        },
+        // ACEが残っている、またはrootをプローブできない（存在しない等）→台帳に残す。
+        _ => RevokeOutcome::Failed,
     }
 }
 
@@ -2471,6 +2690,7 @@ mod traverse_diagnostics {
         let ro_probe = FsPassthrough {
             path: external.clone(),
             writable: false,
+            forced: false,
         };
         let ro_diagnosis = probe_passthrough(sid.as_psid(), &workspace, &ro_probe);
         assert!(
@@ -2480,6 +2700,7 @@ mod traverse_diagnostics {
         let rw_probe_against_ro_grant = FsPassthrough {
             path: external.clone(),
             writable: true,
+            forced: false,
         };
         let write_should_fail =
             probe_passthrough(sid.as_psid(), &workspace, &rw_probe_against_ro_grant);
@@ -2493,6 +2714,7 @@ mod traverse_diagnostics {
         let rw_probe = FsPassthrough {
             path: external.clone(),
             writable: true,
+            forced: false,
         };
         let rw_diagnosis = probe_passthrough(sid.as_psid(), &workspace, &rw_probe);
         assert!(
@@ -3073,5 +3295,74 @@ mod traverse_diagnostics {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+}
+
+/// `--force-system-acl`（D-19）の絶対拒否ゲート`is_force_grant_forbidden`の単体テスト。
+/// 実FS書込やAdministrator権限を要さない（`canonicalize`と環境変数のみ）ため`#[ignore]`しない。
+#[cfg(all(windows, test))]
+mod force_grant_gate_tests {
+    use super::is_force_grant_forbidden;
+    use std::path::{Path, PathBuf};
+
+    fn windir() -> PathBuf {
+        std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("windir"))
+            .map(PathBuf::from)
+            .expect("SystemRoot/windir must be set on Windows")
+    }
+
+    #[test]
+    fn drive_root_is_forbidden() {
+        // canonicalize(C:\)は`\\?\C:\`になり通常成分を持たない=ドライブルート判定。
+        let reason = is_force_grant_forbidden(Path::new("C:\\"));
+        assert!(reason.is_some(), "drive root must be forbidden: {reason:?}");
+    }
+
+    #[test]
+    fn windows_system_directory_is_forbidden() {
+        let reason = is_force_grant_forbidden(&windir());
+        assert!(
+            reason.is_some(),
+            "the Windows directory itself must be forbidden: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn registry_hive_directory_is_forbidden() {
+        let config = windir().join("System32").join("config");
+        if !config.exists() {
+            return; // 通常存在するが、無い機種ではスキップ（誤検知を避ける）。
+        }
+        let reason = is_force_grant_forbidden(&config);
+        assert!(
+            reason.is_some(),
+            "System32\\config (registry hives) must be forbidden: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_temp_directory_is_allowed() {
+        // %TEMP%配下の実在ディレクトリは`%SystemRoot%`外・非ドライブルートなので許可される。
+        let dir = std::env::temp_dir();
+        if !dir.exists() {
+            return;
+        }
+        let reason = is_force_grant_forbidden(&dir);
+        assert!(
+            reason.is_none(),
+            "an ordinary temp directory must be allowed, got: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn nonexistent_path_is_forbidden_fail_safe() {
+        // canonicalizeできないパスは安全側（拒否）に倒す。
+        let bogus = windir().join("this-path-should-not-exist-harness-d19-test");
+        let reason = is_force_grant_forbidden(&bogus);
+        assert!(
+            reason.is_some(),
+            "a non-canonicalizable path must be refused (fail-safe): {reason:?}"
+        );
     }
 }
