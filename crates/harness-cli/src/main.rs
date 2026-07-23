@@ -813,24 +813,7 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
             ExitCode::SUCCESS
         }
         FsAction::Revoke { path } => fs_revoke_one(&path),
-        FsAction::RevokeAll => {
-            let ledger = load_fs_ledger();
-            if ledger.entries.is_empty() {
-                println!("(no fs passthrough entries)");
-                return ExitCode::SUCCESS;
-            }
-            let mut any_failed = false;
-            for entry in ledger.entries.clone() {
-                if fs_revoke_one(&PathBuf::from(&entry.path)) != ExitCode::SUCCESS {
-                    any_failed = true;
-                }
-            }
-            if any_failed {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            }
-        }
+        FsAction::RevokeAll => fs_revoke_all(),
         FsAction::GrantTraverse { target, dry_run } => {
             if dry_run {
                 fs_grant_traverse_preview(&target)
@@ -860,9 +843,23 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
     }
 }
 
-/// 指定パスのfs passthrough ACEを撤収する（D3: 再walk revoke、D4: 剥離後検証パス）。
-/// 成功時のみ台帳から除去する（検証パスが残件を見つけた場合は台帳に残し、次回再試行できる
-/// ようにする）。
+/// `path`のfs passthrough ACEを、本体プロセス内（非管理者）で撤収を試みる（D3: 再walk revoke、
+/// D4: 剥離後検証パス）。ユーザー所有パス（workspace・`%USERPROFILE%`配下等）はここで完結する。
+/// システム保護パス（`BUG-015`でヘルパー経由により付与できるようになったパス）は
+/// `ACCESS_DENIED`で失敗し`false`を返す（呼び出し側がヘルパーへエスカレーションする）。
+#[cfg(windows)]
+fn revoke_passthrough_in_process(
+    path: &Path,
+    sid: &harness_sandbox::win_appcontainer::OwnedContainerSid,
+) -> bool {
+    harness_sandbox::win_appcontainer::revoke_ace_recursive(path, sid.as_psid()).is_ok()
+        && harness_sandbox::win_appcontainer::assert_no_sid_ace_recursive(path, sid.as_psid())
+            .is_ok()
+}
+
+/// 指定パスのfs passthrough ACEを撤収する（`BUG-015`の裏対称: grant側と同じく
+/// 「本体内試行→ヘルパーへエスカレーション」の2段構え）。成功時のみ台帳から除去する
+/// （検証パスが残件を見つけた場合は台帳に残し、次回再試行できるようにする）。
 #[cfg(windows)]
 fn fs_revoke_one(path: &Path) -> ExitCode {
     let sid = match harness_sandbox::win_appcontainer::ensure_profile(
@@ -874,25 +871,38 @@ fn fs_revoke_one(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = harness_sandbox::win_appcontainer::revoke_ace_recursive(path, sid.as_psid()) {
-        eprintln!("revoke failed for {}: {e}", path.display());
-        return ExitCode::FAILURE;
+    if revoke_passthrough_in_process(path, &sid) {
+        remove_fs_passthrough_grant(path);
+        println!("revoked: {}", path.display());
+        return ExitCode::SUCCESS;
     }
-    match harness_sandbox::win_appcontainer::assert_no_sid_ace_recursive(path, sid.as_psid()) {
-        Ok(()) => {
+
+    // 本体内で完結しなかった（システム保護パスの可能性）→特権分離ヘルパーへ委譲する。
+    if harness_sandbox::privhelper::is_elevated() {
+        // 本体が既に管理者（§5.3、fs_grant_traverse_directと同じ考え方）: 直接再試行する。
+        if revoke_passthrough_in_process(path, &sid) {
             remove_fs_passthrough_grant(path);
             println!("revoked: {}", path.display());
+            return ExitCode::SUCCESS;
+        }
+        eprintln!("revoke failed for {} (already running elevated)", path.display());
+        return ExitCode::FAILURE;
+    }
+    match harness_sandbox::privhelper::run_privileged_revoke_fs_allow(vec![path.to_path_buf()]) {
+        Ok((revoked, failures)) if failures.is_empty() && revoked.iter().any(|p| p == path) => {
+            remove_fs_passthrough_grant(path);
+            println!("revoked via privilege-separation helper (UAC, one-time): {}", path.display());
             ExitCode::SUCCESS
         }
-        Err(remaining) => {
-            eprintln!(
-                "revoke incomplete for {}: {} node(s) still carry the sandbox ACE:",
-                path.display(),
-                remaining.len()
-            );
-            for p in &remaining {
-                eprintln!("  {}", p.display());
+        Ok((_, failures)) => {
+            eprintln!("revoke incomplete for {} via privilege-separation helper:", path.display());
+            for (p, reason) in &failures {
+                eprintln!("  {} : {reason}", p.display());
             }
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("revoke failed for {}: {e}", path.display());
             ExitCode::FAILURE
         }
     }
@@ -900,6 +910,92 @@ fn fs_revoke_one(path: &Path) -> ExitCode {
 
 #[cfg(not(windows))]
 fn fs_revoke_one(_path: &Path) -> ExitCode {
+    eprintln!("error: fs passthrough revoke is Windows-only (Tier1a specific)");
+    ExitCode::FAILURE
+}
+
+/// 台帳の全fs passthroughエントリを撤収する。`fs_revoke_one`をループで呼ぶと
+/// システム保護パスの数だけUACが出かねないため、まず全エントリを本体内で試行し（UAC無し）、
+/// 残ったパスだけを**1回のヘルパー要求へまとめて**エスカレーションする（`BUG-015`決定：
+/// 起動あたりUAC最小化、grant側`preflight`と同じ考え方）。
+#[cfg(windows)]
+fn fs_revoke_all() -> ExitCode {
+    let ledger = load_fs_ledger();
+    if ledger.entries.is_empty() {
+        println!("(no fs passthrough entries)");
+        return ExitCode::SUCCESS;
+    }
+    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
+        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    ) {
+        Ok(sid) => sid,
+        Err(e) => {
+            eprintln!("failed to resolve sandbox SID: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut remaining: Vec<PathBuf> = Vec::new();
+    for entry in &ledger.entries {
+        let path = PathBuf::from(&entry.path);
+        if revoke_passthrough_in_process(&path, &sid) {
+            remove_fs_passthrough_grant(&path);
+            println!("revoked: {}", path.display());
+        } else {
+            remaining.push(path);
+        }
+    }
+
+    if remaining.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+
+    let escalated = if harness_sandbox::privhelper::is_elevated() {
+        // 本体が既に管理者: 直接再試行する（ヘルパーもUACも不要）。
+        let mut revoked = Vec::new();
+        let mut failures = Vec::new();
+        for path in &remaining {
+            if revoke_passthrough_in_process(path, &sid) {
+                revoked.push(path.clone());
+            } else {
+                failures.push((path.clone(), "revoke failed (already running elevated)".to_string()));
+            }
+        }
+        Ok((revoked, failures))
+    } else {
+        harness_sandbox::privhelper::run_privileged_revoke_fs_allow(remaining.clone())
+            .map_err(|e| e.to_string())
+    };
+
+    match escalated {
+        Ok((revoked, failures)) => {
+            for path in &revoked {
+                remove_fs_passthrough_grant(path);
+                println!(
+                    "revoked via privilege-separation helper (UAC, one-time): {}",
+                    path.display()
+                );
+            }
+            if failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                for (path, reason) in &failures {
+                    eprintln!("revoke incomplete for {} : {reason}", path.display());
+                }
+                ExitCode::FAILURE
+            }
+        }
+        Err(reason) => {
+            for path in &remaining {
+                eprintln!("revoke failed for {}: {reason}", path.display());
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn fs_revoke_all() -> ExitCode {
     eprintln!("error: fs passthrough revoke is Windows-only (Tier1a specific)");
     ExitCode::FAILURE
 }
