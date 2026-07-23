@@ -915,10 +915,30 @@ fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Op
 /// `passthrough`（D-13、fs passthrough allowlist）は各ルートへACEを付与したうえで到達性を
 /// プローブする（D8）。到達不能な穴は`preflight`全体を失敗させず、戻り値の警告一覧に
 /// 診断メッセージ（D9）を積むだけに留める（壊れた穴があってもworkspaceと他の穴は動き続ける）。
+/// `preflight`の戻り値。`warnings`はD8の到達不能診断（従来どおり）、`granted_passthrough`は
+/// **実際にACEが付与された（既存で十分だった場合を含む）**passthroughルートの一覧
+/// （`(path, writable)`）。呼び出し側（`harness-cli`の台帳記録）はこの一覧だけを台帳へ書く
+/// ことで、「幻の台帳エントリ」（実際には`ACCESS_DENIED`で失敗したのに記録だけ残る）を防ぐ。
+pub struct PreflightOutcome {
+    pub warnings: Vec<String>,
+    pub granted_passthrough: Vec<(std::path::PathBuf, bool)>,
+}
+
+/// `fp`が要求するアクセスのうち、`preflight`が「既に十分」と判定するために必要な最小マスク
+/// （`grant_ace`/`grant_ace_ro`が実際に付与するマスクと同じ論理和。継承フラグの相違までは
+/// 見ない、`grant_ace_mask`の冪等スキップと同じ考え方）。
+fn required_passthrough_mask(writable: bool) -> u32 {
+    if writable {
+        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0 | DELETE.0
+    } else {
+        FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0
+    }
+}
+
 pub fn preflight(
     workspace_root: &Path,
     passthrough: &[FsPassthrough],
-) -> Result<Vec<String>, AppContainerError> {
+) -> Result<PreflightOutcome, AppContainerError> {
     let sid = ensure_profile(CONTAINER_NAME)?;
     grant_ace_recursive(workspace_root, sid.as_psid())?;
     let tmp_dir = workspace_root
@@ -929,6 +949,12 @@ pub fn preflight(
     smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir)?;
 
     let mut warnings = Vec::new();
+    let mut granted_passthrough: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    // 本体プロセス内（非管理者）でACCESS_DENIEDになったエントリ（システム保護パス等）だけを
+    // ここへ集め、後段で1回の特権分離ヘルパー要求へまとめる（起動あたりUAC最大1回、
+    // `TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」の決定）。
+    let mut needs_elevation: Vec<crate::privhelper::FsAllowGrant> = Vec::new();
+
     for fp in passthrough {
         if !fp.path.exists() {
             warnings.push(format!(
@@ -937,20 +963,105 @@ pub fn preflight(
             ));
             continue;
         }
+
+        // 事前チェック（決定1）: 既にsid宛のACEが要求マスクの上位集合を持っていれば、
+        // 本体内のwalkもprivhelperのUACも一切スキップする（ユーザ所有パスの再実行はUAC無し）。
+        let required = required_passthrough_mask(fp.writable);
+        let already_sufficient = matches!(sid_ace_mask(&fp.path, sid.as_psid()), Ok(Some(existing)) if existing & required == required);
+        if already_sufficient {
+            granted_passthrough.push((fp.path.clone(), fp.writable));
+            if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
+                warnings.push(diagnosis);
+            }
+            continue;
+        }
+
         let grant_result = if fp.writable {
             grant_ace_recursive(&fp.path, sid.as_psid())
         } else {
             grant_ace_inheritable_ro(&fp.path, sid.as_psid())
         };
-        if let Err(e) = grant_result {
-            warnings.push(format!("fs-allow {} : ACE grant failed: {e}", fp.path.display()));
-            continue;
-        }
-        if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
-            warnings.push(diagnosis);
+        match grant_result {
+            Ok(()) => {
+                granted_passthrough.push((fp.path.clone(), fp.writable));
+                if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
+                    warnings.push(diagnosis);
+                }
+            }
+            Err(_) => {
+                // 本体（非管理者）内では書けなかった。システム保護パス（所有者がSYSTEM/
+                // TrustedInstaller等）の可能性があるため、即座に警告へ落とさず後段の
+                // 特権分離ヘルパー経路へ回す。
+                needs_elevation.push(crate::privhelper::FsAllowGrant {
+                    path: fp.path.clone(),
+                    writable: fp.writable,
+                });
+            }
         }
     }
-    Ok(warnings)
+
+    if !needs_elevation.is_empty() {
+        let elevated = if crate::privhelper::is_elevated() {
+            // 本体が既に管理者（§5.3、grant-traverseの`*_direct`と同じ考え方）:
+            // ヘルパーを経由せずその場で直接付与する。
+            let mut granted = Vec::new();
+            let mut failures = Vec::new();
+            for entry in &needs_elevation {
+                let result = if entry.writable {
+                    grant_ace_recursive(&entry.path, sid.as_psid())
+                } else {
+                    grant_ace_inheritable_ro(&entry.path, sid.as_psid())
+                };
+                match result {
+                    Ok(()) => granted.push(entry.path.clone()),
+                    Err(e) => failures.push((entry.path.clone(), e.to_string())),
+                }
+            }
+            Ok((granted, failures))
+        } else {
+            crate::privhelper::run_privileged_fs_allow(needs_elevation.clone())
+                .map_err(|e| e.to_string())
+        };
+
+        match elevated {
+            Ok((granted, failures)) => {
+                for path in &granted {
+                    let writable = needs_elevation
+                        .iter()
+                        .find(|e| &e.path == path)
+                        .map(|e| e.writable)
+                        .unwrap_or(false);
+                    granted_passthrough.push((path.clone(), writable));
+                    if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
+                        if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
+                            warnings.push(diagnosis);
+                        }
+                    }
+                }
+                for (path, reason) in &failures {
+                    warnings.push(format!(
+                        "fs-allow {} : ACE grant failed (via privilege-separation helper, D-16): \
+                         {reason}",
+                        path.display()
+                    ));
+                }
+            }
+            Err(reason) => {
+                for entry in &needs_elevation {
+                    warnings.push(format!(
+                        "fs-allow {} : ACE grant failed: access denied in-process, and the \
+                         privilege-separation helper (D-16) could not complete either: {reason}",
+                        entry.path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(PreflightOutcome {
+        warnings,
+        granted_passthrough,
+    })
 }
 
 /// `path`のDACLから、`sid`（trustee）に対する既存ACEを全て取り除く（`REVOKE_ACCESS`）。

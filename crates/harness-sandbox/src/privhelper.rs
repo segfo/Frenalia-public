@@ -53,6 +53,15 @@ use crate::win_common::wide;
 /// ヘルパーへ委譲する操作。自由形式のコマンド文字列ではなく固定スキーマに限定する（D-16）。
 /// 将来の特権操作（WFPフィルタ設置・VHDXマウント等、`DESIGN-SANDBOX-PRIVSEP.md` §5.2）は
 /// ここへvariantを追加する形で拡張する。
+/// `--fs-allow`の1エントリ（`GrantFsAllow`要求のペイロード）。`shell_tier::FsPassthrough`と
+/// 同形だが、IPCでシリアライズする要求スキーマとして独立させる（`shell_tier::FsPassthrough`は
+/// IPCを経由しない本体内部の値であり、両者の変更を意図せず連動させないため）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsAllowGrant {
+    pub path: PathBuf,
+    pub writable: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrivilegedRequest {
     /// `target`とその全祖先（ドライブルートまで）へ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を
@@ -62,6 +71,12 @@ pub enum PrivilegedRequest {
     GrantTraverse { target: PathBuf },
     /// `GrantTraverse`で付与したACEを1件撤収する（`harness fs revoke-traverse`）。
     RevokeTraverse { path: PathBuf },
+    /// `--fs-allow`/`fs.allow`が本体プロセス内（非管理者）で`ACCESS_DENIED`になったエントリを
+    /// まとめて1回のUACで昇格付与する（システム保護パス、例`C:\ProgramData\...\VisualStudio\Setup`
+    /// への読取専用付与。`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」参照）。呼び出し側
+    /// （`win_appcontainer::preflight`）が事前にユーザ所有パスを本体内で処理済みなので、
+    /// ここに載るのは昇格が要ると判明したエントリのみ＝起動あたりUAC最大1回に抑えられる。
+    GrantFsAllow { entries: Vec<FsAllowGrant> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +90,14 @@ pub enum PrivilegedResponse {
     GrantChain {
         granted: Vec<PathBuf>,
         error: Option<String>,
+    },
+    /// `GrantFsAllow`の結果。エントリごとに成否が独立（`GrantChain`と違い連鎖ではないため、
+    /// 1エントリの失敗が他エントリの処理を止めない）。`granted`は実際にACEが付与された
+    /// パスの一覧、`failures`は`(path, reason)`の一覧。呼び出し側は`granted`を台帳へ記録し、
+    /// `failures`は警告として表示する（D8の既存の扱いに合わせる）。
+    FsAllowResult {
+        granted: Vec<PathBuf>,
+        failures: Vec<(PathBuf, String)>,
     },
     /// 要求全体を拒否した場合の単純な失敗（スキーマ不一致等、部分適用の概念が無い操作）。
     Err(String),
@@ -374,8 +397,53 @@ fn helper_exe_path() -> Result<PathBuf, PrivHelperError> {
 /// 返り値は「実際にACEが付与されたノードの一覧」（`GrantTraverse`のみ意味を持つ。
 /// `RevokeTraverse`成功時は常に空`Vec`）。`Err(PrivHelperError::PartialGrantChain { granted, .. })`
 /// の場合も`granted`に途中まで成功したノードが入るため、呼び出し側は`Err`だからと無視せず
-/// 中身を確認して台帳へ反映する必要がある（孤立ACE防止）。
+/// 中身を確認して台帳へ反映する必要がある（孤立ACE防止）。`GrantFsAllow`はエントリごとに
+/// 成否が独立するため、この関数ではなく[`run_privileged_fs_allow`]を使う。
 pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelperError> {
+    match run_privileged_raw(req)? {
+        PrivilegedResponse::Ok => Ok(Vec::new()),
+        PrivilegedResponse::GrantChain {
+            granted,
+            error: None,
+        } => Ok(granted),
+        PrivilegedResponse::GrantChain {
+            granted,
+            error: Some(reason),
+        } => Err(PrivHelperError::PartialGrantChain { granted, reason }),
+        PrivilegedResponse::FsAllowResult { .. } => Err(PrivHelperError::Ipc(
+            "unexpected FsAllowResult response for a non-GrantFsAllow request".to_string(),
+        )),
+        PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
+    }
+}
+
+/// `run_privileged_fs_allow`の成功値（`granted`パス一覧、`(path, reason)`失敗一覧）。
+pub type FsAllowGrantOutcome = (Vec<PathBuf>, Vec<(PathBuf, String)>);
+
+/// `GrantFsAllow`専用の委譲関数。`run_privileged`と異なりエントリごとの成否（`granted`/
+/// `failures`）を両方とも呼び出し側へそのまま返す（1エントリの失敗が「エラー」ではなく
+/// 正常な部分結果であるため、`run_privileged`の`Result<Vec<PathBuf>, _>`という単一成功値の
+/// 形には馴染まない）。
+pub fn run_privileged_fs_allow(
+    entries: Vec<FsAllowGrant>,
+) -> Result<FsAllowGrantOutcome, PrivHelperError> {
+    let req = PrivilegedRequest::GrantFsAllow { entries };
+    match run_privileged_raw(&req)? {
+        PrivilegedResponse::FsAllowResult { granted, failures } => Ok((granted, failures)),
+        PrivilegedResponse::Ok => Ok((Vec::new(), Vec::new())),
+        PrivilegedResponse::GrantChain { granted, error } => {
+            // スキーマ上あり得ないはずの応答だが、fail-safeとして「全て失敗」扱いにはせず
+            // grantedをそのまま伝える（孤立ACE防止の原則を維持）。
+            Ok((
+                granted,
+                error.map(|e| vec![(PathBuf::new(), e)]).unwrap_or_default(),
+            ))
+        }
+        PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
+    }
+}
+
+fn run_privileged_raw(req: &PrivilegedRequest) -> Result<PrivilegedResponse, PrivHelperError> {
     let pipe_name = unique_pipe_name();
     let sid = current_user_sid_string()?;
     let mut sa = user_only_security_attributes(&sid)?;
@@ -443,8 +511,13 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
 }
 
 /// パイプ接続・要求送信・応答受信の本体（ヘルパープロセスの生死待ちとは独立させる、
-/// デッドロック回避のため`run_privileged`から分離）。
-fn run_ipc_exchange(pipe: HANDLE, req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelperError> {
+/// デッドロック回避のため`run_privileged_raw`から分離）。応答の解釈は行わず、パースした
+/// `PrivilegedResponse`をそのまま返す（要求variantごとの解釈は呼び出し元
+/// `run_privileged`/`run_privileged_fs_allow`の責務）。
+fn run_ipc_exchange(
+    pipe: HANDLE,
+    req: &PrivilegedRequest,
+) -> Result<PrivilegedResponse, PrivHelperError> {
     connect_with_timeout(pipe, CONNECT_TIMEOUT).map_err(|e| {
         PrivHelperError::Ipc(format!(
             "waiting for helper to connect: {e} (helper may not have launched, or UAC is still \
@@ -464,20 +537,8 @@ fn run_ipc_exchange(pipe: HANDLE, req: &PrivilegedRequest) -> Result<Vec<PathBuf
              for per-node timing)"
         ))
     })?;
-    let response: PrivilegedResponse = serde_json::from_slice(&response_bytes)
-        .map_err(|e| PrivHelperError::Ipc(format!("failed to parse helper response: {e}")))?;
-    match response {
-        PrivilegedResponse::Ok => Ok(Vec::new()),
-        PrivilegedResponse::GrantChain {
-            granted,
-            error: None,
-        } => Ok(granted),
-        PrivilegedResponse::GrantChain {
-            granted,
-            error: Some(reason),
-        } => Err(PrivHelperError::PartialGrantChain { granted, reason }),
-        PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
-    }
+    serde_json::from_slice(&response_bytes)
+        .map_err(|e| PrivHelperError::Ipc(format!("failed to parse helper response: {e}")))
 }
 
 /// `runas`でヘルパーを昇格起動する。ユーザがUACを拒否した場合は`ERROR_CANCELLED`が返るため
@@ -671,6 +732,45 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 Err(e) => PrivilegedResponse::Err(e.to_string()),
             }
         }
+        PrivilegedRequest::GrantFsAllow { entries } => {
+            log::line(&format!("dispatch: GrantFsAllow {} entrie(s)", entries.len()));
+            let mut granted = Vec::new();
+            let mut failures = Vec::new();
+            for entry in entries {
+                let started = std::time::Instant::now();
+                let result = if entry.writable {
+                    win_appcontainer::grant_ace_recursive(&entry.path, sid.as_psid())
+                } else {
+                    win_appcontainer::grant_ace_inheritable_ro(&entry.path, sid.as_psid())
+                };
+                match result {
+                    Ok(()) => {
+                        log::line(&format!(
+                            "  entry {} [{}] : granted in {}ms",
+                            entry.path.display(),
+                            if entry.writable { "rw" } else { "ro" },
+                            started.elapsed().as_millis()
+                        ));
+                        granted.push(entry.path);
+                    }
+                    Err(e) => {
+                        log::line(&format!(
+                            "  entry {} [{}] : FAILED after {}ms: {e}",
+                            entry.path.display(),
+                            if entry.writable { "rw" } else { "ro" },
+                            started.elapsed().as_millis()
+                        ));
+                        failures.push((entry.path, e.to_string()));
+                    }
+                }
+            }
+            log::line(&format!(
+                "dispatch: GrantFsAllow done, {} granted, {} failed",
+                granted.len(),
+                failures.len()
+            ));
+            PrivilegedResponse::FsAllowResult { granted, failures }
+        }
     }
 }
 
@@ -700,6 +800,63 @@ mod tests {
         match decoded {
             PrivilegedRequest::RevokeTraverse { path } => {
                 assert_eq!(path, PathBuf::from(r"C:\Users"))
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grant_fs_allow_request_roundtrips_through_json() {
+        let req = PrivilegedRequest::GrantFsAllow {
+            entries: vec![
+                FsAllowGrant {
+                    path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
+                    writable: false,
+                },
+                FsAllowGrant {
+                    path: PathBuf::from(r"C:\Program Files\SomeTool"),
+                    writable: true,
+                },
+            ],
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let decoded: PrivilegedRequest = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            PrivilegedRequest::GrantFsAllow { entries } => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(
+                    entries[0].path,
+                    PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")
+                );
+                assert!(!entries[0].writable);
+                assert!(entries[1].writable);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// `FsAllowResult`応答が、成功エントリと失敗エントリが混在する状態でも両方を失わずに
+    /// ラウンドトリップできることを確認する（`GrantChain`と違い連鎖ではないので、1件の失敗が
+    /// 他の成功エントリを消してはならない）。
+    #[test]
+    fn fs_allow_result_response_roundtrips_with_mixed_outcomes() {
+        let resp = PrivilegedResponse::FsAllowResult {
+            granted: vec![PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")],
+            failures: vec![(
+                PathBuf::from(r"C:\Windows\System32\config"),
+                "access denied".to_string(),
+            )],
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let decoded: PrivilegedResponse = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            PrivilegedResponse::FsAllowResult { granted, failures } => {
+                assert_eq!(
+                    granted,
+                    vec![PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")]
+                );
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].0, PathBuf::from(r"C:\Windows\System32\config"));
             }
             other => panic!("unexpected variant: {other:?}"),
         }

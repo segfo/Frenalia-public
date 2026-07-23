@@ -955,6 +955,33 @@ fn fs_grant_traverse_preview(_target: &Path) -> ExitCode {
 /// `runas`経由で呼び出す（本体プロセス自身は非管理者のまま維持する）。
 #[cfg(windows)]
 fn fs_grant_traverse(target: &Path) -> ExitCode {
+    // 事前チェック（決定2、`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」）: 祖先チェーン全ノードが
+    // 既にFILE_TRAVERSE|FILE_READ_ATTRIBUTESを持っているなら、privhelperもUACも一切呼ばず
+    // 即座に成功する。`preview_traverse_chain`は`--dry-run`が使うのと同じ読み取り専用ヘルパで、
+    // `WRITE_DAC`もUACも要らない。
+    if let Ok(sid) = harness_sandbox::win_appcontainer::ensure_profile(
+        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    ) {
+        let preview =
+            harness_sandbox::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
+        if !preview.is_empty() && preview.iter().all(|node| node.already_sufficient) {
+            for node in &preview {
+                record_traverse_grant(&node.path);
+            }
+            println!(
+                "grant-traverse: all {} ancestor node(s) already have \
+                 FILE_TRAVERSE|FILE_READ_ATTRIBUTES -- skipped the privilege-separation helper \
+                 entirely (no UAC prompt): {}",
+                preview.len(),
+                preview
+                    .iter()
+                    .map(|n| n.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            );
+            return ExitCode::SUCCESS;
+        }
+    }
     if harness_sandbox::privhelper::is_elevated() {
         return fs_grant_traverse_direct(target);
     }
@@ -1443,16 +1470,20 @@ async fn main() -> ExitCode {
     }
     // fs passthrough（D2/D-13）: ACE付与自体は「付けっぱなし」（撤収はユーザ操作
     // `harness fs revoke`に委ねる）。Tier1aが実際に選択された場合のみpreflightがACE付与を
-    // 試みたので、そのときだけ台帳に記録する。到達不能だった穴の診断（D8/D9）はここで表示する。
+    // 試みたので、そのときだけ台帳に記録する。`granted_passthrough`（実際にACEが確認できた
+    // ルートのみ）を基準にする——`fs_passthrough`全件を無条件に記録すると、システム保護パス等で
+    // `ACCESS_DENIED`になり実際には付与されなかったエントリまで台帳に載る「幻の台帳エントリ」を
+    // 生んでしまうため（`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」）。到達不能だった穴の診断
+    // （D8/D9）は`passthrough_warnings`としてこの下で表示する。
     if shell_tier.tier == harness_core::ShellTier::Tier1a {
-        for fp in &fs_passthrough {
-            record_fs_passthrough_grant(&fp.path, fp.writable);
+        for (path, writable) in &shell_tier.granted_passthrough {
+            record_fs_passthrough_grant(path, *writable);
             eprintln!(
                 "note: fs-allow granted: {} [{}] (this ACE persists after harness exits; use \
                  `harness fs revoke {}` to undo)",
-                fp.path.display(),
-                if fp.writable { "rw" } else { "ro" },
-                fp.path.display()
+                path.display(),
+                if *writable { "rw" } else { "ro" },
+                path.display()
             );
         }
     }

@@ -153,9 +153,9 @@ fn best_effort_tier(
         // 単体テストでは避ける、既存の分岐と同じ考え方）。D8: passthroughの到達不能は
         // Tier選択自体を左右せず`passthrough_warnings`として運ぶだけ。
         None => match crate::win_appcontainer::preflight(workspace_root, passthrough) {
-            Ok(warnings) => {
-                ShellTierSelection::direct(ShellTier::Tier1a).with_passthrough_warnings(warnings)
-            }
+            Ok(outcome) => ShellTierSelection::direct(ShellTier::Tier1a)
+                .with_passthrough_warnings(outcome.warnings)
+                .with_granted_passthrough(outcome.granted_passthrough),
             Err(e) => ShellTierSelection::downgraded(ShellTier::Tier1a, ShellTier::Tier1b, e.to_string()),
         },
     }

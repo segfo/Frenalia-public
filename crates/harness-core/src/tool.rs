@@ -141,6 +141,11 @@ pub struct ShellTierSelection {
     /// `--fs-allow`穴の診断メッセージ一覧。空なら全穴到達可、または該当なし。Tier選択自体
     /// （`tier`/`downgraded_from`）には影響しない（壊れた穴があってもTier1a・workspaceは継続）。
     pub passthrough_warnings: Vec<String>,
+    /// `--fs-allow`/`fs.allow`のうち、実際にACE付与が確認できた（既存で十分だった場合を含む）
+    /// ルートの一覧（`(path, writable)`）。`harness-cli`側の台帳記録はこれだけを書くことで、
+    /// `ACCESS_DENIED`で失敗したのに記録だけ残る「幻の台帳エントリ」を防ぐ
+    /// （`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO: --fs-allowの特権分離ヘルパー化」）。
+    pub granted_passthrough: Vec<(std::path::PathBuf, bool)>,
 }
 
 impl ShellTierSelection {
@@ -150,6 +155,7 @@ impl ShellTierSelection {
             downgraded_from: None,
             reason: None,
             passthrough_warnings: Vec::new(),
+            granted_passthrough: Vec::new(),
         }
     }
 
@@ -159,12 +165,20 @@ impl ShellTierSelection {
             downgraded_from: Some(from),
             reason: Some(reason.into()),
             passthrough_warnings: Vec::new(),
+            granted_passthrough: Vec::new(),
         }
     }
 
     /// D8: fs passthroughの到達不能診断を積む（`direct`/`downgraded`と組み合わせて使う）。
     pub fn with_passthrough_warnings(mut self, warnings: Vec<String>) -> Self {
         self.passthrough_warnings = warnings;
+        self
+    }
+
+    /// 実際にACE付与が確認できたpassthroughルートの一覧を積む（`direct`と組み合わせて使う。
+    /// `preflight`が失敗した`downgraded`経路では常に空のまま）。
+    pub fn with_granted_passthrough(mut self, granted: Vec<(std::path::PathBuf, bool)>) -> Self {
+        self.granted_passthrough = granted;
         self
     }
 
