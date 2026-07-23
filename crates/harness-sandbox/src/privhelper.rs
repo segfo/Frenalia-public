@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, HLOCAL, LocalFree,
+    CloseHandle, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
+    HLOCAL, LocalFree, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -32,15 +33,16 @@ use windows::Win32::Security::{
     TOKEN_USER, TokenElevation, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcessToken, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -201,53 +203,155 @@ fn unique_pipe_name() -> String {
     )
 }
 
-/// `len(u32 LE) || payload`形式でメッセージを1件書き込む。
-fn write_framed(handle: HANDLE, payload: &[u8]) -> windows::core::Result<()> {
-    let len = (payload.len() as u32).to_le_bytes();
-    write_all_bytes(handle, &len)?;
-    write_all_bytes(handle, payload)?;
+
+/// 親がヘルパーの接続を待つ上限（`ShellExecuteExW`のUACダイアログ操作自体はここに含まれない。
+/// `ConnectNamedPipe`は「ヘルパーが起動してパイプへ接続してくる」のを待つ処理であり、
+/// UACダイアログの表示中はまだこの待ちに入っていない）。
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 要求送信のタイムアウト。接続済みの相手が即座に読み取り待ちに入っている前提の
+/// ローカル通信なので短くてよい。
+const REQUEST_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 応答受信のタイムアウト。プロファイルルート近傍への`SetNamedSecurityInfoW`が
+/// この実機で病的に遅くなりうること（BUG-011で実測済み、`icacls`単体でも30秒超）を
+/// 踏まえ、余裕を持たせた値。Phase 2の実測結果次第で調整する。
+const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// オーバーラップドI/O 1回分（`ConnectNamedPipe`/`ReadFile`/`WriteFile`のいずれか）を
+/// `timeout`以内に完了させる。`start`は対応するWin32 I/O開始APIを呼び出すクロージャで、
+/// `ERROR_IO_PENDING`（正常系、非同期処理が始まった）と`ERROR_PIPE_CONNECTED`
+/// （`ConnectNamedPipe`固有の「相手が呼び出し前に既に繋がっていた」正常系）はここで吸収する。
+/// タイムアウト時は`CancelIoEx`で取り消してから返るため、staleな非同期I/Oをハンドルに
+/// 残さない（呼び出し側がすぐハンドルを閉じても問題ない状態にする）。
+fn run_overlapped<F>(
+    handle: HANDLE,
+    timeout: std::time::Duration,
+    op_name: &str,
+    start: F,
+) -> Result<u32, PrivHelperError>
+where
+    F: FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
+{
+    unsafe {
+        let event = CreateEventW(None, true, false, PCWSTR::null())
+            .map_err(|e| PrivHelperError::Ipc(format!("{op_name}: CreateEventW failed: {e}")))?;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
+
+        let pending = match start(&mut overlapped as *mut _) {
+            Ok(()) => false,
+            Err(e) => {
+                let code = e.code();
+                if code == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) {
+                    true
+                } else if code == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) {
+                    false
+                } else {
+                    let _ = CloseHandle(event);
+                    return Err(PrivHelperError::Ipc(format!("{op_name} failed to start: {e}")));
+                }
+            }
+        };
+
+        if pending {
+            let wait = WaitForSingleObject(event, timeout.as_millis() as u32);
+            if wait != WAIT_OBJECT_0 {
+                // タイムアウトまたは待機自体の失敗。取り消して、取り消し完了(bWait=true)まで
+                // 待ってから返る — ハンドルをこの後すぐ閉じても`OVERLAPPED`がstaleに
+                // ならないようにするため。
+                let _ = CancelIoEx(handle, Some(&overlapped as *const _));
+                let mut transferred = 0u32;
+                let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, true);
+                let _ = CloseHandle(event);
+                return Err(PrivHelperError::Ipc(format!(
+                    "{op_name} timed out after {timeout:?}"
+                )));
+            }
+        }
+
+        let mut transferred = 0u32;
+        let result = GetOverlappedResult(handle, &overlapped, &mut transferred, false);
+        let _ = CloseHandle(event);
+        result.map_err(|e| {
+            PrivHelperError::Ipc(format!("{op_name}: GetOverlappedResult failed: {e}"))
+        })?;
+        Ok(transferred)
+    }
+}
+
+fn connect_with_timeout(pipe: HANDLE, timeout: std::time::Duration) -> Result<(), PrivHelperError> {
+    run_overlapped(pipe, timeout, "ConnectNamedPipe", |ov| unsafe {
+        ConnectNamedPipe(pipe, Some(ov))
+    })?;
     Ok(())
 }
 
-fn write_all_bytes(handle: HANDLE, mut buf: &[u8]) -> windows::core::Result<()> {
-    unsafe {
-        while !buf.is_empty() {
-            let mut written = 0u32;
-            WriteFile(handle, Some(buf), Some(&mut written), None)?;
-            if written == 0 {
-                return Err(windows::core::Error::from_win32());
-            }
-            buf = &buf[written as usize..];
+fn write_all_timeout(
+    handle: HANDLE,
+    buf: &[u8],
+    timeout: std::time::Duration,
+) -> Result<(), PrivHelperError> {
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        let slice = &buf[offset..];
+        let written = run_overlapped(handle, timeout, "WriteFile", |ov| unsafe {
+            WriteFile(handle, Some(slice), None, Some(ov))
+        })?;
+        if written == 0 {
+            return Err(PrivHelperError::Ipc("WriteFile wrote 0 bytes".to_string()));
         }
+        offset += written as usize;
     }
     Ok(())
 }
 
-/// `write_framed`で書かれたメッセージを1件読み取る。
-fn read_framed(handle: HANDLE) -> windows::core::Result<Vec<u8>> {
+fn read_exact_timeout(
+    handle: HANDLE,
+    buf: &mut [u8],
+    timeout: std::time::Duration,
+) -> Result<(), PrivHelperError> {
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        let slice = &mut buf[offset..];
+        let read = run_overlapped(handle, timeout, "ReadFile", |ov| unsafe {
+            ReadFile(handle, Some(slice), None, Some(ov))
+        })?;
+        if read == 0 {
+            return Err(PrivHelperError::Ipc(
+                "ReadFile read 0 bytes (pipe closed?)".to_string(),
+            ));
+        }
+        offset += read as usize;
+    }
+    Ok(())
+}
+
+/// `write_framed`のオーバーラップド・タイムアウト付き版。
+fn write_framed_timeout(
+    handle: HANDLE,
+    payload: &[u8],
+    timeout: std::time::Duration,
+) -> Result<(), PrivHelperError> {
+    let len = (payload.len() as u32).to_le_bytes();
+    write_all_timeout(handle, &len, timeout)?;
+    write_all_timeout(handle, payload, timeout)?;
+    Ok(())
+}
+
+/// `read_framed`のオーバーラップド・タイムアウト付き版。
+fn read_framed_timeout(
+    handle: HANDLE,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, PrivHelperError> {
     let mut len_buf = [0u8; 4];
-    read_exact_bytes(handle, &mut len_buf)?;
+    read_exact_timeout(handle, &mut len_buf, timeout)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     let mut payload = vec![0u8; len];
     if len > 0 {
-        read_exact_bytes(handle, &mut payload)?;
+        read_exact_timeout(handle, &mut payload, timeout)?;
     }
     Ok(payload)
-}
-
-fn read_exact_bytes(handle: HANDLE, mut buf: &mut [u8]) -> windows::core::Result<()> {
-    unsafe {
-        while !buf.is_empty() {
-            let mut read = 0u32;
-            ReadFile(handle, Some(buf), Some(&mut read), None)?;
-            if read == 0 {
-                return Err(windows::core::Error::from_win32());
-            }
-            let (_, rest) = std::mem::take(&mut buf).split_at_mut(read as usize);
-            buf = rest;
-        }
-    }
-    Ok(())
 }
 
 /// ヘルパー実行ファイル（`harness-privhelper.exe`）のパスを、本体exeと同じディレクトリから
@@ -280,7 +384,7 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
         let pipe_name_w = wide(&pipe_name);
         let handle = CreateNamedPipeW(
             PCWSTR(pipe_name_w.as_ptr()),
-            PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             1,
             4096,
@@ -318,9 +422,19 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
         let _ = DisconnectNamedPipe(pipe);
         let _ = CloseHandle(pipe);
         if !helper_process.is_invalid() {
-            // ヘルパーは応答送信直後に終了するはずなので、短いタイムアウトで待つ
-            // （既にIPCが完了した後の後始末であり、ここでの待機はデッドロックを起こさない）。
-            let _ = WaitForSingleObject(helper_process, 5000);
+            // ヘルパーは応答送信直後（またはIPCタイムアウト後の異常系）に終了するはずなので、
+            // 短いタイムアウトで待つ（既にIPCが完了/断念した後の後始末であり、ここでの待機は
+            // デッドロックを起こさない）。
+            let wait = WaitForSingleObject(helper_process, 5000);
+            if wait != WAIT_OBJECT_0 {
+                // 5秒経っても終了しない = staleの疑い。前回セッションで「非昇格からkillできない
+                // stale privhelper.exeが残留する」不具合が起きたため、ここで強制終了する。
+                // `ShellExecuteExW`(SEE_MASK_NOCLOSEPROCESS)で取得したこのハンドルは、
+                // 起動時点で既に十分なアクセス権を保持しているため、非昇格プロセスからでも
+                // `TerminateProcess`が成功する（`OpenProcess`を後から呼ぶ経路ではない）。
+                let _ = TerminateProcess(helper_process, 1);
+                let _ = WaitForSingleObject(helper_process, 2000);
+            }
             let _ = CloseHandle(helper_process);
         }
     }
@@ -331,20 +445,25 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
 /// パイプ接続・要求送信・応答受信の本体（ヘルパープロセスの生死待ちとは独立させる、
 /// デッドロック回避のため`run_privileged`から分離）。
 fn run_ipc_exchange(pipe: HANDLE, req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelperError> {
-    let connect_result = unsafe { ConnectNamedPipe(pipe, None) };
-    if let Err(e) = connect_result {
-        // ERROR_PIPE_CONNECTED: ヘルパーが`ConnectNamedPipe`呼び出し前に既に接続していた
-        // という正常系（Win32の既知の競合、MSDN記載）。
-        if e.code() != windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) {
-            return Err(PrivHelperError::from(e));
-        }
-    }
+    connect_with_timeout(pipe, CONNECT_TIMEOUT).map_err(|e| {
+        PrivHelperError::Ipc(format!(
+            "waiting for helper to connect: {e} (helper may not have launched, or UAC is still \
+             pending user interaction)"
+        ))
+    })?;
 
     let request_bytes = serde_json::to_vec(req)
         .map_err(|e| PrivHelperError::Ipc(format!("failed to serialize request: {e}")))?;
-    write_framed(pipe, &request_bytes).map_err(PrivHelperError::from)?;
+    write_framed_timeout(pipe, &request_bytes, REQUEST_WRITE_TIMEOUT)?;
 
-    let response_bytes = read_framed(pipe).map_err(PrivHelperError::from)?;
+    let response_bytes = read_framed_timeout(pipe, RESPONSE_READ_TIMEOUT).map_err(|e| {
+        PrivHelperError::Ipc(format!(
+            "{e} (the privileged operation may still be in progress on a slow node — this \
+             machine has previously shown pathologically slow DACL writes near the user \
+             profile root, see docs/bugs/BUG-011.md; check %APPDATA%\\harness\\privhelper.log \
+             for per-node timing)"
+        ))
+    })?;
     let response: PrivilegedResponse = serde_json::from_slice(&response_bytes)
         .map_err(|e| PrivHelperError::Ipc(format!("failed to parse helper response: {e}")))?;
     match response {
@@ -397,10 +516,53 @@ unsafe fn launch_helper_elevated(
     Ok(info.hProcess)
 }
 
+/// ヘルパー側のファイルログ（`%APPDATA%\harness\privhelper.log`、台帳と同じ`config_dir`）。
+/// ヘルパーは`runas`+`SW_HIDE`（[`launch_helper_elevated`]参照）で起動されるため
+/// `eprintln!`の出力先が無く、UAC/IPCが無応答になった際に「どのノードで何秒かかって
+/// いたか」を事後に一切確認できない（前回セッションでUAC不表示/`ERROR_BROKEN_PIPE`が
+/// 起きた際、原因の切り分けができなかった実体験に基づく）。台帳ファイル
+/// （`fs-passthrough-ledger.json`/`traverse-grant-ledger.json`）には一切触れず、完全に
+/// 別ファイルへ追記のみ行う（`CLAUDE.md`の台帳誤削除防止ルールと同じ理由で、既存台帳の
+/// 読み書きコードパスとは独立させる）。
+mod log {
+    use std::io::Write;
+
+    fn log_path() -> Option<std::path::PathBuf> {
+        directories::ProjectDirs::from("", "", "harness")
+            .map(|d| d.config_dir().join("privhelper.log"))
+    }
+
+    /// ログ書込み自体の失敗はヘルパーの処理を止めない（診断用の副次経路であり、ログ書込み
+    /// 失敗が特権操作そのものの失敗理由になってはならない）。
+    pub fn line(msg: &str) {
+        let Some(path) = log_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "[{now_ms}] pid={} {msg}", std::process::id());
+        }
+    }
+}
+
 /// ヘルパー側エントリポイント（`harness-privhelper.exe`のmainから呼ぶ、昇格トークンで実行される）。
 /// 親が開いたパイプへclientとして接続し、1件の要求を処理して応答を返し終了する
 /// （1起動=1操作、常駐しない）。
 pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
+    log::line(&format!("serve: starting, pipe={pipe_name}"));
+    // FILE_FLAG_OVERLAPPED: 親と同じくオーバーラップドI/Oで受信・送信を有限時間化する
+    // （§1c、親が既に諦めて`CloseHandle`した後もこちら側が無期限に`ReadFile`し続けて
+    // stale化する事故を防ぐ、常駐しない原則の徹底）。
     let pipe = unsafe {
         let pipe_name_w = wide(pipe_name);
         CreateFileW(
@@ -409,21 +571,49 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
             windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
             None,
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
             None,
-        )?
+        )
+    };
+    let pipe = match pipe {
+        Ok(h) => {
+            log::line("serve: connected to parent pipe");
+            h
+        }
+        Err(e) => {
+            log::line(&format!("serve: CreateFileW failed: {e}"));
+            return Err(PrivHelperError::from(e));
+        }
     };
 
-    let request_bytes = read_framed(pipe).map_err(PrivHelperError::from)?;
+    let request_bytes = match read_framed_timeout(pipe, REQUEST_WRITE_TIMEOUT) {
+        Ok(b) => {
+            log::line(&format!("serve: received request ({} bytes)", b.len()));
+            b
+        }
+        Err(e) => {
+            log::line(&format!("serve: read request failed/timed out: {e}"));
+            unsafe {
+                let _ = CloseHandle(pipe);
+            }
+            return Err(e);
+        }
+    };
     let response = match serde_json::from_slice::<PrivilegedRequest>(&request_bytes) {
         Ok(req) => dispatch(req),
-        Err(e) => PrivilegedResponse::Err(format!(
-            "malformed or unknown request (schema mismatch): {e}"
-        )),
+        Err(e) => {
+            log::line(&format!("serve: malformed request: {e}"));
+            PrivilegedResponse::Err(format!("malformed or unknown request (schema mismatch): {e}"))
+        }
     };
     let response_bytes = serde_json::to_vec(&response)
         .map_err(|e| PrivHelperError::Ipc(format!("failed to serialize response: {e}")))?;
-    let write_result = write_framed(pipe, &response_bytes).map_err(PrivHelperError::from);
+    log::line("serve: writing response");
+    let write_result = write_framed_timeout(pipe, &response_bytes, RESPONSE_READ_TIMEOUT);
+    match &write_result {
+        Ok(()) => log::line("serve: response written, exiting"),
+        Err(e) => log::line(&format!("serve: write response failed/timed out: {e}")),
+    }
     unsafe {
         let _ = CloseHandle(pipe);
     }
@@ -436,20 +626,46 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
 fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
     let sid = match win_appcontainer::ensure_profile(CONTAINER_NAME) {
         Ok(sid) => sid,
-        Err(e) => return PrivilegedResponse::Err(format!("failed to resolve sandbox SID: {e}")),
+        Err(e) => {
+            log::line(&format!("dispatch: ensure_profile failed: {e}"));
+            return PrivilegedResponse::Err(format!("failed to resolve sandbox SID: {e}"));
+        }
     };
     match req {
         PrivilegedRequest::GrantTraverse { target } => {
-            let (granted, result) = win_appcontainer::grant_traverse_chain(&target, sid.as_psid());
+            log::line(&format!("dispatch: GrantTraverse target={}", target.display()));
+            let (granted, result) = win_appcontainer::grant_traverse_chain_with_progress(
+                &target,
+                sid.as_psid(),
+                |node, node_result, elapsed| match node_result {
+                    Ok(()) => log::line(&format!(
+                        "  node {} : granted in {}ms",
+                        node.display(),
+                        elapsed.as_millis()
+                    )),
+                    Err(e) => log::line(&format!(
+                        "  node {} : FAILED after {}ms: {e}",
+                        node.display(),
+                        elapsed.as_millis()
+                    )),
+                },
+            );
+            log::line(&format!(
+                "dispatch: GrantTraverse done, {} node(s) granted, error={:?}",
+                granted.len(),
+                result.as_ref().err()
+            ));
             PrivilegedResponse::GrantChain {
                 granted,
                 error: result.err().map(|e| e.to_string()),
             }
         }
         PrivilegedRequest::RevokeTraverse { path } => {
+            log::line(&format!("dispatch: RevokeTraverse path={}", path.display()));
             let result: Result<(), AppContainerError> =
                 win_appcontainer::revoke_ace(&path, sid.as_psid())
                     .and_then(|()| win_appcontainer::assert_no_sid_ace(&path, sid.as_psid()));
+            log::line(&format!("dispatch: RevokeTraverse done, error={:?}", result.as_ref().err()));
             match result {
                 Ok(()) => PrivilegedResponse::Ok,
                 Err(e) => PrivilegedResponse::Err(e.to_string()),
@@ -527,12 +743,17 @@ mod tests {
         let _: bool = is_elevated();
     }
 
-    /// パイプの配線（DACL作成・`CreateNamedPipeW`・`ConnectNamedPipe`・`write_framed`/
-    /// `read_framed`のフレーミング）を、昇格・別プロセス起動なしで検証する。同一プロセス内で
-    /// server端（`CreateNamedPipeW`）とclient端（`CreateFileW`）の両方を開き、実際に
-    /// `run_privileged`/`serve`が使うのと同じ`write_framed`/`read_framed`でメッセージを
-    /// 1往復させる。特権操作（`WRITE_DAC`）自体はテストしない（`dispatch`の中身は別途、
-    /// 実機の手動E2Eで検証する。`docs/phases/foundation/M12-shell-isolation-tiers.md`参照）。
+    fn short_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(5)
+    }
+
+    /// パイプの配線（DACL作成・`CreateNamedPipeW`・オーバーラップド`ConnectNamedPipe`・
+    /// `write_framed_timeout`/`read_framed_timeout`のフレーミング）を、昇格・別プロセス起動
+    /// なしで検証する。同一プロセス内でserver端（`CreateNamedPipeW`）とclient端
+    /// （`CreateFileW`）の両方を開き、実際に`run_privileged`/`serve`が使うのと同じ
+    /// タイムアウト付き関数でメッセージを1往復させる。特権操作（`WRITE_DAC`）自体は
+    /// テストしない（`dispatch`の中身は別途、実機の手動E2Eで検証する。
+    /// `docs/phases/foundation/M12-shell-isolation-tiers.md`参照）。
     #[test]
     fn framed_message_roundtrips_over_a_real_named_pipe() {
         let pipe_name = unique_pipe_name();
@@ -543,7 +764,7 @@ mod tests {
             let pipe_name_w = wide(&pipe_name);
             let handle = CreateNamedPipeW(
                 PCWSTR(pipe_name_w.as_ptr()),
-                PIPE_ACCESS_DUPLEX,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 1,
                 4096,
@@ -565,31 +786,74 @@ mod tests {
                 windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
                 None,
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                 None,
             )
             .expect("client CreateFileW")
             .0 as usize
         });
 
-        let connect_result = unsafe { ConnectNamedPipe(server, None) };
-        if let Err(e) = connect_result {
-            assert_eq!(e.code(), windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0));
-        }
+        connect_with_timeout(server, short_timeout()).expect("connect_with_timeout");
         let client = HANDLE(client_thread.join().unwrap() as *mut _);
 
-        write_framed(client, b"hello from client").expect("write_framed");
-        let received = read_framed(server).expect("read_framed");
+        write_framed_timeout(client, b"hello from client", short_timeout())
+            .expect("write_framed_timeout");
+        let received = read_framed_timeout(server, short_timeout()).expect("read_framed_timeout");
         assert_eq!(received, b"hello from client");
 
-        write_framed(server, b"hello from server").expect("write_framed");
-        let received = read_framed(client).expect("read_framed");
+        write_framed_timeout(server, b"hello from server", short_timeout())
+            .expect("write_framed_timeout");
+        let received = read_framed_timeout(client, short_timeout()).expect("read_framed_timeout");
         assert_eq!(received, b"hello from server");
 
         unsafe {
             let _ = DisconnectNamedPipe(server);
             let _ = CloseHandle(server);
             let _ = CloseHandle(client);
+        }
+    }
+
+    /// タイムアウト経路そのものを検証する: serverを立てるがclientを一切接続させないまま
+    /// 短いタイムアウトで`connect_with_timeout`を呼び、有限時間で明示エラーを返すこと
+    /// （無期限ハングしないこと）を確認する。前回セッションで実際に起きた「UAC/IPCが
+    /// 無言でハングし、staleなヘルパープロセスが残留する」不具合の再発防止（本ファイル
+    /// 冒頭のコンテキスト、`docs/bugs/BUG-010.md`/`BUG-011.md`参照）。
+    #[test]
+    fn connect_with_timeout_returns_an_error_instead_of_hanging_when_nobody_connects() {
+        let pipe_name = unique_pipe_name();
+        let sid = current_user_sid_string().expect("current_user_sid_string");
+        let mut sa = user_only_security_attributes(&sid).expect("user_only_security_attributes");
+
+        let server = unsafe {
+            let pipe_name_w = wide(&pipe_name);
+            let handle = CreateNamedPipeW(
+                PCWSTR(pipe_name_w.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                Some(&mut sa as *mut _),
+            );
+            let _ = LocalFree(HLOCAL(sa.lpSecurityDescriptor));
+            assert!(!handle.is_invalid());
+            handle
+        };
+
+        let started = std::time::Instant::now();
+        let result = connect_with_timeout(server, std::time::Duration::from_millis(500));
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "expected a timeout error, got Ok(())");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "connect_with_timeout took {elapsed:?}, expected it to return promptly after its \
+             own 500ms timeout instead of hanging"
+        );
+
+        unsafe {
+            let _ = CloseHandle(server);
         }
     }
 }

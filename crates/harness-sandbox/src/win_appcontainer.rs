@@ -34,20 +34,23 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
     GetExplicitEntriesFromAclW, GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT,
-    SE_KERNEL_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID,
-    TRUSTEE_W,
+    SE_KERNEL_OBJECT, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, FreeSid, NO_INHERITANCE,
-    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, FreeSid,
+    InitializeSecurityDescriptor, NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SetKernelObjectSecurity,
+    SetSecurityDescriptorDacl,
 };
 use windows::Win32::Storage::FileSystem::{
-    DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
-    FILE_TRAVERSE,
+    CreateFileW, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
+use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
@@ -178,12 +181,53 @@ fn collect_dirs_and_files(
 /// マージする。`SetEntriesInAclW`は同一trusteeの既存ACEを置換する仕様のため冪等
 /// （再実行しても重複ACEが増えない、`win_restricted::set_low_integrity_label`の冪等性と
 /// 同じ性質をDACL版でも担保する）。
+/// `new_dacl`を`path`（ファイル/ディレクトリいずれも可）へ、**そのオブジェクト単体にのみ**設定する。
+/// `SetNamedSecurityInfoW`（aclapi）は、コンテナのDACLを設定すると子孫全体へauto-inherit再伝播を
+/// 走らせる（procmon実測で`SetSecurityFile`が子孫の数だけ発生、実行中プロファイルルート近傍では
+/// 365,903件・93秒経っても未完 = 事実上ハング。`plans/TIER1A-PRIVHELPER-HANG.md`参照）。
+/// `CreateFileW`でハンドルを取り`SetKernelObjectSecurity`（`NtSetSecurityObject`の薄いラッパ）を
+/// 使うと、aclapiのツリー走査・パッケージSID解決RPCを一切経由せず、このオブジェクトのDACLだけを
+/// 直接差し替えられる。`grant_ace_recursive_ro`等の**意図的にツリー全体へ伝播/全走査したい既存
+/// 経路はこの関数を使わない**（そちらは`SetNamedSecurityInfoW`のままでよい、伝播が目的のため）。
+unsafe fn set_dacl_single_object(path: &Path, new_dacl: *mut ACL) -> windows::core::Result<()> {
+    let path_w = wide(&path.to_string_lossy());
+    let handle = CreateFileW(
+        PCWSTR(path_w.as_ptr()),
+        (WRITE_DAC | READ_CONTROL).0,
+        FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
+        None,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+    )?;
+
+    let mut sd = SECURITY_DESCRIPTOR::default();
+    let sd_ptr = PSECURITY_DESCRIPTOR(&mut sd as *mut _ as *mut _);
+    let result = (|| -> windows::core::Result<()> {
+        InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION)?;
+        SetSecurityDescriptorDacl(sd_ptr, true, Some(new_dacl as *const _), false)?;
+        SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, sd_ptr)
+    })();
+
+    let _ = CloseHandle(handle);
+    result
+}
+
 fn grant_ace_mask(
     path: &Path,
     sid: PSID,
     access: u32,
     inheritance: windows::Win32::Security::ACE_FLAGS,
 ) -> Result<(), AppContainerError> {
+    // 冪等スキップ: 既にsid宛の明示ACEが要求マスクの上位集合を持っていれば
+    // `SetNamedSecurityInfoW`（プロファイルルート近傍で病的に遅くなりうる、BUG-011）を
+    // 呼ばずに済ませる。継承フラグの相違までは見ない（`inheritance`は`grant_ace_mask`の
+    // 呼び出しパターン上、同一pathへ複数の異なる継承指定で呼ばれることが無いため）。
+    if let Ok(Some(existing)) = sid_ace_mask(path, sid) {
+        if existing & access == access {
+            return Ok(());
+        }
+    }
     let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -221,16 +265,7 @@ fn grant_ace_mask(
             return Err(to_err(e));
         }
 
-        let set_result = SetNamedSecurityInfoW(
-            PCWSTR(path_w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(new_dacl as *const _),
-            None,
-        )
-        .ok();
+        let set_result = set_dacl_single_object(path, new_dacl);
 
         let _ = LocalFree(HLOCAL(new_dacl as *mut _));
         let _ = LocalFree(HLOCAL(sd.0));
@@ -962,16 +997,7 @@ pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
             return Err(to_err(e));
         }
 
-        let set_result = SetNamedSecurityInfoW(
-            PCWSTR(path_w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(new_dacl as *const _),
-            None,
-        )
-        .ok();
+        let set_result = set_dacl_single_object(path, new_dacl);
 
         let _ = LocalFree(HLOCAL(new_dacl as *mut _));
         let _ = LocalFree(HLOCAL(sd.0));
@@ -1128,23 +1154,74 @@ pub fn grant_traverse_chain(
     target: &Path,
     sid: PSID,
 ) -> (Vec<std::path::PathBuf>, Result<(), AppContainerError>) {
+    grant_traverse_chain_with_progress(target, sid, |_node, _result, _elapsed| {})
+}
+
+/// `grant_traverse_chain`と同じ処理を行うが、各ノードへの付与試行が完了するたびに
+/// `on_node(node, result, elapsed)`を呼ぶ。特権分離ヘルパー（D-16、`privhelper.rs`）が
+/// ノード別の所要時間をログへ残せるようにするためのフック（BUG-011の遅いプロファイル
+/// ルート近傍書込みを、無言のブラックボックスにせず観測可能にする）。既存の
+/// `grant_traverse_chain`はこの関数を空クロージャで包んだだけの薄いラッパであり、
+/// 呼び出し側（CLI直接実行等）の挙動・シグネチャは変わらない。
+pub fn grant_traverse_chain_with_progress(
+    target: &Path,
+    sid: PSID,
+    mut on_node: impl FnMut(&Path, &Result<(), AppContainerError>, std::time::Duration),
+) -> (Vec<std::path::PathBuf>, Result<(), AppContainerError>) {
     let mut chain: Vec<std::path::PathBuf> =
         target.ancestors().map(|p| p.to_path_buf()).collect();
     chain.reverse();
 
     let mut granted = Vec::with_capacity(chain.len());
     for node in &chain {
-        if let Err(e) = grant_ace_mask(
+        let started = std::time::Instant::now();
+        let result = grant_ace_mask(
             node,
             sid,
             FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
             NO_INHERITANCE,
-        ) {
+        );
+        on_node(node, &result, started.elapsed());
+        if let Err(e) = result {
             return (granted, Err(e));
         }
         granted.push(node.clone());
     }
     (granted, Ok(()))
+}
+
+/// `grant_traverse_chain`の付与予定チェーンを、一切書込まずに読み取り専用で列挙する
+/// （`harness fs grant-traverse --dry-run`、ユーザーが実書込前に対象ノードと既存ACE有無を
+/// 確認できるようにする要件）。各ノードについて、現在`sid`宛の明示ACEがどのマスクを
+/// 持っているか（`None`なら無し）を`sid_ace_mask`で読み取るだけで、`SetNamedSecurityInfoW`は
+/// 一切呼ばない。`already_sufficient`が`true`のノードは、実行時に`grant_ace_mask`の
+/// 冪等スキップ（本ファイル`grant_ace_mask`参照）によって書込みがスキップされる見込み。
+pub struct TraversePreviewNode {
+    pub path: std::path::PathBuf,
+    pub existing_mask: Option<u32>,
+    pub already_sufficient: bool,
+}
+
+pub fn preview_traverse_chain(target: &Path, sid: PSID) -> Vec<TraversePreviewNode> {
+    const REQUIRED: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;
+    let mut chain: Vec<std::path::PathBuf> =
+        target.ancestors().map(|p| p.to_path_buf()).collect();
+    chain.reverse();
+
+    chain
+        .into_iter()
+        .map(|node| {
+            let existing_mask = sid_ace_mask(&node, sid).unwrap_or(None);
+            let already_sufficient = existing_mask
+                .map(|m| m & REQUIRED == REQUIRED)
+                .unwrap_or(false);
+            TraversePreviewNode {
+                path: node,
+                existing_mask,
+                already_sufficient,
+            }
+        })
+        .collect()
 }
 
 /// `TIER1A-OPEN-ISSUES.md`課題1（traverse問題の検証プラン）の診断テスト群。
@@ -2509,6 +2586,186 @@ mod traverse_diagnostics {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
+    /// `TIER1A-OPEN-ISSUES.md`項目6の残課題（MSVCリンク工程`link.exe`の
+    /// `STATUS_DLL_INIT_FAILED`）の最小切り分け実験。この開発機のACL調査（`Get-Acl`実測）で、
+    /// `C:\Program Files (x86)\Microsoft Visual Studio\...\bin\Hostx64\x64`（`link.exe`本体と
+    /// その依存DLLが全て同居するディレクトリ）まで、経路上の全ノードに元々
+    /// `APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES`への`ReadAndExecute`が
+    /// Windows既定で付いていることが判明した。AppContainerトークンは常にこのウェルノウンSIDを
+    /// 暗黙にグループとして持つため、harness自身の狭いコンテナSIDへ個別ACEを追加しなくても
+    /// このパスは`--fs-allow`無しで既に読み取り+実行可能なはずである（`grant-traverse`は
+    /// `C:\`自体にはこのACEが無いため、`C:\`のみ狭いSIDでの付与が別途必要——これは
+    /// `harness fs grant-traverse`で事前に付与済みという前提）。この実験は`--fs-allow`を
+    /// 一切使わず、`link.exe`を直接起動して`STATUS_DLL_INIT_FAILED`が再現するかどうかだけを見る。
+    #[test]
+    #[ignore]
+    fn experiment_m_link_exe_dll_load_via_all_app_packages_default() {
+        let link_dir = std::path::PathBuf::from(
+            "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64",
+        );
+        let link_exe = link_dir.join("link.exe");
+        assert!(link_exe.is_file(), "link.exe not found at {}", link_exe.display());
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let env = crate::secret_env::build_child_env();
+
+        let child = spawn(
+            &link_exe.to_string_lossy(),
+            &[],
+            &link_dir,
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+        )
+        .expect("spawn(link.exe) call itself should succeed (CreateProcessW returning a handle is separate from the loader later failing DLL init)");
+        let (out, err, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("pipe I/O should not fail");
+        println!("=== EXPERIMENT M: link.exe exit code = {code} (0x{:08X}) ===", code as u32);
+        println!("--- stdout ---\n{out}");
+        println!("--- stderr ---\n{err}");
+        println!(
+            "=== EXPERIMENT M RESULT: STATUS_DLL_INIT_FAILED (0xC0000142) reproduced = {} ===",
+            code as u32 == 0xC000_0142
+        );
+    }
+
+    /// `TIER1A-PRIVHELPER-HANG.md` Phase 2 の直接計測（procmon裏取り用）。privhelperの
+    /// `grant_traverse_chain`が実際に呼ぶのと**同じ**`grant_ace_mask`を、**同じマスク**
+    /// （`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`）・**同じ`NO_INHERITANCE`**で、ハングが起きる
+    /// ことが分かっている `%USERPROFILE%`（=実行中プロファイルルート、この開発機では
+    /// `C:\Users\segfo`）の**単一ノード**へ直接1回だけ呼び、`Instant`で所要時間を計測する。
+    /// IPC/UAC/privhelperを一切挟まないため、ハングの原因がOS側の`SetNamedSecurityInfoW`
+    /// そのものにあるのか、それ以外（IPC機構）にあるのかを切り分けられる。
+    ///
+    /// **手順**: 管理者シェル（`WRITE_DAC`が要る）で
+    /// `sudo cargo test -p harness-sandbox -- --ignored --exact --nocapture \
+    ///  win_appcontainer::traverse_diagnostics::experiment_n_profile_root_direct_write_timing`
+    /// を実行する。テストは最初に**自分のPIDを表示して標準入力待ちで一時停止**するので、その間に
+    /// procmon（`tools/procmon/Procmon64.exe`）のフィルタをそのPIDに設定してから、Enterを押して
+    /// 計測を開始する。**途中でkillしないこと**（有限で遅いだけなのか本当に返らないのかを、
+    /// procmonの流れとともに観測するのが目的。`TIER1A-PRIVHELPER-HANG.md`の
+    /// 「手動killを裏取りにしない」教訓）。
+    ///
+    /// **NO_INHERITANCEの含意**: 継承なしACEなので、本来この書込みは子孫へ伝播せず、対象1ノードの
+    /// DACL差し替えだけで完了するはず。それでも遅い/返らない場合、procmonで「実際には
+    /// プロファイル配下を舐めている」「特定のファイル/レジストリで停滞している」「AV・検索
+    /// インデクサ・プロファイルサービスの割込み」等のどれなのかが見える。
+    ///
+    /// 計測後は同じ単一ノードを`revoke_ace`で戻し、`sid_ace_mask`で消えたことを確認する
+    /// （新規に書けてしまった場合の後始末。`/T`のような再帰は一切使わない）。
+    #[test]
+    #[ignore]
+    fn experiment_n_profile_root_direct_write_timing() {
+        use std::io::Write;
+
+        let profile = std::env::var("USERPROFILE")
+            .expect("USERPROFILE must be set (this experiment targets the running profile root)");
+        let target = std::path::PathBuf::from(&profile);
+        assert!(
+            target.is_dir(),
+            "profile root {} is not a directory",
+            target.display()
+        );
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+
+        // 事前状態: 対象に当該SIDのACEが無いこと（あると冪等スキップされ計測にならない）を確認。
+        let before = sid_ace_mask(&target, sid.as_psid());
+        println!("=== EXPERIMENT N: target = {} ===", target.display());
+        println!("=== EXPERIMENT N: pre-existing sandbox-SID ACE mask = {before:?} (None が理想) ===");
+        println!("=== EXPERIMENT N: THIS PROCESS PID = {} ===", std::process::id());
+        println!(
+            "=== EXPERIMENT N: set the procmon filter to PID {} now, then press Enter to start the \
+             timed SetNamedSecurityInfoW write (DO NOT kill this process partway) ===",
+            std::process::id()
+        );
+        let _ = std::io::stdout().flush();
+        let mut _line = String::new();
+        let _ = std::io::stdin().read_line(&mut _line);
+
+        println!("=== EXPERIMENT N: starting grant_ace_mask(NO_INHERITANCE) now ===");
+        let _ = std::io::stdout().flush();
+        let t0 = std::time::Instant::now();
+        let result = grant_ace_mask(
+            &target,
+            sid.as_psid(),
+            FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
+            NO_INHERITANCE,
+        );
+        let elapsed = t0.elapsed();
+        println!("=== EXPERIMENT N: grant_ace_mask returned in {elapsed:?}, result = {result:?} ===");
+
+        // 後始末: 新規に書けたぶんの単一ノードだけを戻す（既に他経路が依存している祖先ではなく
+        // プロファイルルート単体なので単一ノードrevokeでよい。`/T`は使わない）。
+        if result.is_ok() {
+            let revoke = revoke_ace(&target, sid.as_psid());
+            let after = sid_ace_mask(&target, sid.as_psid());
+            println!(
+                "=== EXPERIMENT N: cleanup revoke_ace result = {revoke:?}, post-revoke ACE mask = {after:?} (None が理想) ==="
+            );
+        } else {
+            println!("=== EXPERIMENT N: grant failed, nothing to clean up ===");
+        }
+    }
+
+    /// `TIER1A-PRIVHELPER-HANG.md` Phase 2-6 の**中立パス対照実験**。`experiment_n`と全く同じ
+    /// AppContainer-SID・同じマスク（`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`）・同じ`NO_INHERITANCE`で、
+    /// ただし対象を**プロファイルツリーの外**（`C:\`直下の新規test所有ディレクトリ
+    /// `C:\harness-acltest-<pid>`）にした版。`experiment_n`（プロファイルルート`C:\Users\segfo`）が
+    /// 30秒周期でハングした（`SetSecurityFile`書込みIRP未発行、`userenv`/`profext`/`profapi`/
+    /// `FirewallAPI`ロード）のに対し、こちらが**速く完走すれば**ハングは**プロファイルルート固有**
+    /// （User Profile Service関与）と切り分けられ、Phase 3の「プロファイルルート回避」策が有効になる。
+    /// 逆に**同様にハングすれば**AppContainer-SID解決一般（ファイアウォール/LSA関与、パス非依存）
+    /// であり、回避では済まない。
+    ///
+    /// `%TEMP%`/`tempfile`は使わない（BUG-011: それらは実プロファイル奥深くに作られ、対照にならない）。
+    /// `C:\`直下の専用ディレクトリを直接作る（管理者権限が要る、他のignore-gated実験と同じパターン）。
+    ///
+    /// 手順・procmon連携は`experiment_n`と同じ（PID表示→stdin待ち→Enterで計測開始、途中killしない）。
+    #[test]
+    #[ignore]
+    fn experiment_o_neutral_path_direct_write_timing() {
+        use std::io::Write;
+
+        let target = std::path::PathBuf::from(format!("C:\\harness-acltest-{}", std::process::id()));
+        std::fs::create_dir_all(&target)
+            .expect("create test-owned dir directly under C:\\ (needs admin write on drive root)");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+
+        let before = sid_ace_mask(&target, sid.as_psid());
+        println!("=== EXPERIMENT O (neutral control): target = {} ===", target.display());
+        println!("=== EXPERIMENT O: pre-existing sandbox-SID ACE mask = {before:?} (None が理想) ===");
+        println!("=== EXPERIMENT O: THIS PROCESS PID = {} ===", std::process::id());
+        println!(
+            "=== EXPERIMENT O: set the procmon filter to PID {} now, then press Enter to start the \
+             timed SetNamedSecurityInfoW write (DO NOT kill this process partway) ===",
+            std::process::id()
+        );
+        let _ = std::io::stdout().flush();
+        let mut _line = String::new();
+        let _ = std::io::stdin().read_line(&mut _line);
+
+        println!("=== EXPERIMENT O: starting grant_ace_mask(NO_INHERITANCE) now ===");
+        let _ = std::io::stdout().flush();
+        let t0 = std::time::Instant::now();
+        let result = grant_ace_mask(
+            &target,
+            sid.as_psid(),
+            FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
+            NO_INHERITANCE,
+        );
+        let elapsed = t0.elapsed();
+        println!("=== EXPERIMENT O: grant_ace_mask returned in {elapsed:?}, result = {result:?} ===");
+
+        // 後始末: ACEを剥がし、test所有ディレクトリごと削除する。
+        let _ = revoke_ace(&target, sid.as_psid());
+        let _ = std::fs::remove_dir_all(&target);
+        println!("=== EXPERIMENT O: cleaned up {} ===", target.display());
+    }
+
     /// `path`のDACLに`PROTECTED_DACL_SECURITY_INFORMATION`を立て、祖先からの継承ACEが
     /// このノード配下へ伝播するのを遮断する。**このとき`path`が現在実効的に持つ全ACE
     /// （継承由来含む）を`GetExplicitEntriesFromAclW`で吸い出し、明示ACEとして保持し直す**
@@ -2548,7 +2805,7 @@ mod traverse_diagnostics {
             )
             .ok()?;
 
-            let result = SetNamedSecurityInfoW(
+            let result = windows::Win32::Security::Authorization::SetNamedSecurityInfoW(
                 PCWSTR(path_w.as_ptr()),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,

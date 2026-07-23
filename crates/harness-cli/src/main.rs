@@ -132,7 +132,15 @@ enum FsAction {
     /// `C:\Users\<user>\.cargo`の4ノード全てへ、UAC 1回で付与する。`WRITE_DAC`が要るため
     /// 非管理者では特権分離ヘルパー(D-16)経由でUACを表示する。付与に成功した各ノードは、
     /// 撤収用の別台帳(traverse台帳)へ個別に記録される。
-    GrantTraverse { target: PathBuf },
+    GrantTraverse {
+        target: PathBuf,
+        /// 実際には何も書き込まず、付与予定の祖先チェーンと各ノードの既存ACE有無だけを
+        /// 表示する（`GetNamedSecurityInfoW`のみ、`SetNamedSecurityInfoW`は一切呼ばない）。
+        /// UACも表示されない。プロファイルルート近傍への書込みは実機で病的に遅くなりうる
+        /// ため（BUG-011）、本実行の前に対象ノードを確認したい場合に使う。
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+    },
     /// `grant-traverse`で付与したtraverse ACEを1件撤収する（非再帰・単一ノード、D10の巻き戻し）。
     /// 注意: `grant-traverse`が連鎖付与した祖先ノード（`C:\Users`等）は、他のpassthroughルートと
     /// **共有されている可能性がある**。この`revoke-traverse`は指定した1ノードだけを撤収するため、
@@ -823,7 +831,13 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
-        FsAction::GrantTraverse { target } => fs_grant_traverse(&target),
+        FsAction::GrantTraverse { target, dry_run } => {
+            if dry_run {
+                fs_grant_traverse_preview(&target)
+            } else {
+                fs_grant_traverse(&target)
+            }
+        }
         FsAction::RevokeTraverse { path } => fs_revoke_traverse_one(&path),
         FsAction::RevokeTraverseAll => {
             let ledger = load_traverse_ledger();
@@ -887,6 +901,51 @@ fn fs_revoke_one(path: &Path) -> ExitCode {
 #[cfg(not(windows))]
 fn fs_revoke_one(_path: &Path) -> ExitCode {
     eprintln!("error: fs passthrough revoke is Windows-only (Tier1a specific)");
+    ExitCode::FAILURE
+}
+
+/// `grant-traverse --dry-run`本体。`target`の祖先チェーン（ドライブルートまで）を、一切書込まず
+/// 読み取り専用（`GetNamedSecurityInfoW`のみ）で列挙する。`WRITE_DAC`もUACも不要
+/// （`win_appcontainer::ensure_profile`はAppContainerプロファイルの作成/導出のみでACL変更を
+/// 伴わない）。ユーザーが本実行の前にどのノードへ書込みが起きるか確認できるようにする
+/// （プロファイルルート近傍への`SetNamedSecurityInfoW`はこの種の実機で病的に遅くなりうる、
+/// BUG-011）。
+#[cfg(windows)]
+fn fs_grant_traverse_preview(target: &Path) -> ExitCode {
+    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
+        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    ) {
+        Ok(sid) => sid,
+        Err(e) => {
+            eprintln!("dry-run: failed to resolve sandbox SID: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let preview = harness_sandbox::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
+    println!("=== grant-traverse --dry-run: {} ===", target.display());
+    println!("(read-only: no ACE has been written, no UAC prompt was shown)");
+    for node in &preview {
+        let status = if node.already_sufficient {
+            "already has FILE_TRAVERSE|FILE_READ_ATTRIBUTES -- write will be SKIPPED"
+        } else {
+            match node.existing_mask {
+                Some(_) => "has some sandbox-SID ACE, but not sufficient -- WILL WRITE",
+                None => "no sandbox-SID ACE yet -- WILL WRITE",
+            }
+        };
+        println!("  {} : {status}", node.path.display());
+    }
+    println!(
+        "run without --dry-run to actually grant (requires WRITE_DAC on each node still \
+         needing a write; non-administrators will see a UAC prompt via the privilege-separation \
+         helper, D-16)"
+    );
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(windows))]
+fn fs_grant_traverse_preview(_target: &Path) -> ExitCode {
+    eprintln!("error: fs grant-traverse --dry-run is Windows-only (Tier1a specific)");
     ExitCode::FAILURE
 }
 
