@@ -80,6 +80,14 @@ pub enum AppContainerError {
         path: std::path::PathBuf,
         reason: String,
     },
+    /// `revoke_ace`/`revoke_ace_recursive`専用のエラー（`AclGrant`の裏対称）。以前は撤収失敗でも
+    /// `AclGrant`（Display文言が"failed to **grant**..."固定）を流用していたため、`harness fs
+    /// revoke`の失敗メッセージに「grant」という紛らわしい語が出ていた（BUG-017の副次修正）。
+    #[error("failed to revoke AppContainer access to {path}: {reason}")]
+    AclRevoke {
+        path: std::path::PathBuf,
+        reason: String,
+    },
     #[error("appcontainer preflight failed: {0}")]
     Preflight(String),
 }
@@ -916,9 +924,13 @@ fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Op
 /// プローブする（D8）。到達不能な穴は`preflight`全体を失敗させず、戻り値の警告一覧に
 /// 診断メッセージ（D9）を積むだけに留める（壊れた穴があってもworkspaceと他の穴は動き続ける）。
 /// `preflight`の戻り値。`warnings`はD8の到達不能診断（従来どおり）、`granted_passthrough`は
-/// **実際にACEが付与された（既存で十分だった場合を含む）**passthroughルートの一覧
-/// （`(path, writable)`）。呼び出し側（`harness-cli`の台帳記録）はこの一覧だけを台帳へ書く
-/// ことで、「幻の台帳エントリ」（実際には`ACCESS_DENIED`で失敗したのに記録だけ残る）を防ぐ。
+/// **実際にACEが付与された（既存で十分だった場合・部分的にしか適用できなかった場合を含む）**
+/// passthroughルートの一覧（`(path, writable)`）。呼び出し側（`harness-cli`の台帳記録）は
+/// この一覧だけを台帳へ書くことで、「幻の台帳エントリ」（実際には`ACCESS_DENIED`で失敗した
+/// のに記録だけ残る）を防ぐ。逆に、rootへのACE付与自体は成功したが子孫の一部
+/// （TrustedInstaller所有等）で失敗した「部分適用」ケースは、`sid_ace_mask`でrootを権威的に
+/// プローブして`Ok`/`Err`によらず記録する（BUG-017: 記録漏れが「撤収経路の無い孤立ACE」を
+/// 生むため、幻の台帳エントリより孤立ACEの方を重く見て記録側に倒す）。
 pub struct PreflightOutcome {
     pub warnings: Vec<String>,
     pub granted_passthrough: Vec<(std::path::PathBuf, bool)>,
@@ -1039,20 +1051,54 @@ pub fn preflight(
                     }
                 }
                 for (path, reason) in &failures {
-                    warnings.push(format!(
-                        "fs-allow {} : ACE grant failed (via privilege-separation helper, D-16): \
-                         {reason}",
-                        path.display()
-                    ));
+                    let writable = needs_elevation
+                        .iter()
+                        .find(|e| &e.path == path)
+                        .map(|e| e.writable)
+                        .unwrap_or(false);
+                    // BUG-017: grant_ace_recursive/grant_ace_inheritable_roはroot(先頭ノード)から
+                    // 順に付与するため、途中の子孫(TrustedInstaller所有等)で失敗しても、rootには
+                    // 既にACEが載っている場合がある。「失敗」扱いで台帳へ記録しないと、実FS上には
+                    // ACEが残るのに撤収経路が無い孤立ACEになる。rootを権威的にプローブし、ACEが
+                    // 実在すれば台帳へ記録して`fs revoke`で後から掃除できるようにする。
+                    if matches!(sid_ace_mask(path, sid.as_psid()), Ok(Some(_))) {
+                        granted_passthrough.push((path.clone(), writable));
+                        warnings.push(format!(
+                            "fs-allow {} : partially applied via privilege-separation helper \
+                             (D-16) -- some descendant failed ({reason}), but the root itself now \
+                             carries the sandbox ACE; recorded in the ledger so `harness fs revoke \
+                             {}` can clean it up",
+                            path.display(),
+                            path.display()
+                        ));
+                    } else {
+                        warnings.push(format!(
+                            "fs-allow {} : ACE grant failed (via privilege-separation helper, \
+                             D-16): {reason}",
+                            path.display()
+                        ));
+                    }
                 }
             }
             Err(reason) => {
                 for entry in &needs_elevation {
-                    warnings.push(format!(
-                        "fs-allow {} : ACE grant failed: access denied in-process, and the \
-                         privilege-separation helper (D-16) could not complete either: {reason}",
-                        entry.path.display()
-                    ));
+                    if matches!(sid_ace_mask(&entry.path, sid.as_psid()), Ok(Some(_))) {
+                        granted_passthrough.push((entry.path.clone(), entry.writable));
+                        warnings.push(format!(
+                            "fs-allow {} : partially applied -- the privilege-separation helper \
+                             (D-16) could not fully complete ({reason}), but the root itself now \
+                             carries the sandbox ACE; recorded in the ledger so `harness fs revoke \
+                             {}` can clean it up",
+                            entry.path.display(),
+                            entry.path.display()
+                        ));
+                    } else {
+                        warnings.push(format!(
+                            "fs-allow {} : ACE grant failed: access denied in-process, and the \
+                             privilege-separation helper (D-16) could not complete either: {reason}",
+                            entry.path.display()
+                        ));
+                    }
                 }
             }
         }
@@ -1071,7 +1117,7 @@ pub fn preflight(
 /// 非再帰の操作であり、`grant_traverse_drive_root`（同じく非再帰・単一ACE）の巻き戻し
 /// （`harness fs revoke-traverse`）にもそのまま使う。
 pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
+    let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
         path: path.to_path_buf(),
         reason: e.to_string(),
     };
@@ -1124,7 +1170,7 @@ pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
 pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclGrant {
+    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclRevoke {
         path: root.to_path_buf(),
         reason: e.to_string(),
     })?;
@@ -1222,7 +1268,7 @@ pub fn assert_no_sid_ace_recursive(root: &Path, sid: PSID) -> Result<(), Vec<std
 pub fn assert_no_sid_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
     match sid_ace_mask(path, sid)? {
         None => Ok(()),
-        Some(_) => Err(AppContainerError::AclGrant {
+        Some(_) => Err(AppContainerError::AclRevoke {
             path: path.to_path_buf(),
             reason: "sandbox SID ACE still present after revoke".to_string(),
         }),
