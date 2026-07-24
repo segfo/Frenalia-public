@@ -64,9 +64,11 @@ const LOW_IL_SDDL: &str = "S-1-16-4096";
 /// `dir`1つだけに、配下へ継承する低ILの必須ラベルACEを設定する（非再帰・冪等）。
 /// 既存の子孫には遡って効かない（モジュールdocコメントの既知の限界を参照）。
 pub fn set_low_integrity_label(dir: &Path) -> Result<(), RestrictedError> {
-    // SDDL: "S:(ML;CIOI;NW;;;LW)" = SACL(mandatory label)、container+object inherit、
+    // SDDL: "S:(ML;NI;NW;;;LW)" = SACL(mandatory label)、no-inherit（子孫へ伝播させない）、
     // no-write-up、対象SIDはLow mandatory level。
-    const SDDL_LOW_LABEL: &str = "S:(ML;CIOI;NW;;;LW)";
+    // CIOI（container+object inherit）だと .harness/sandbox/tier1a-tmp にもラベルが継承され、
+    // Low IL 相当の AppContainer プロセスからの書込みが PRIVILEGE NOT HELD で拒否される（BUG-018）。
+    const SDDL_LOW_LABEL: &str = "S:(ML;NI;NW;;;LW)";
     unsafe {
         let sddl = wide(SDDL_LOW_LABEL);
         let mut sd = PSECURITY_DESCRIPTOR::default();
