@@ -9,3 +9,4 @@ tools/procmon/*.PML
 
 # Incus spike用のmTLSクライアント秘密鍵（plans/vm-spike/、コミットしない）
 plans/vm-spike/.incus-client-cert/
+__pycache__/
