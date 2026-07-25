@@ -94,6 +94,11 @@ pub struct ReadScopeConfig {
 /// D-02が定める「既定にせずフラグでオプトイン」の実験的Tierとして実装済み。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellTier {
+    /// Windows: Hyper-V外層VM（AlmaLinux）+ Incus内層コンテナ（`plans/DESIGN-SANDBOX-VMISOLATION.md`）。
+    /// vNIC単位でegressを強制できる唯一のTier。実験的/フラグ付き（`--experimental-tier3`、D-02と
+    /// 同じ「既定にせずオプトイン」思想）。`run_shell`は`ToolCtx.vm_sandbox`経由でコンテナ内実行に
+    /// 委譲する（他Tierと異なり実プロセスをホスト側にspawnしない）。
+    Tier3,
     /// Linux: bubblewrap（user+mount+network namespace + OverlayFS）。
     Tier2,
     /// Windows: AppContainer（package SID + capability SID）。実験的/フラグ付き
@@ -109,6 +114,7 @@ pub enum ShellTier {
 impl ShellTier {
     pub fn label(self) -> &'static str {
         match self {
+            ShellTier::Tier3 => "tier3",
             ShellTier::Tier2 => "tier2",
             ShellTier::Tier1a => "tier1a",
             ShellTier::Tier1b => "tier1b",
@@ -239,6 +245,26 @@ pub struct NetAppPolicy {
     pub allow_apps: Vec<String>,
 }
 
+/// Tier3（`ShellTier::Tier3`）の`run_shell`実行チャネル。開いた集合（実装は`harness-sandbox`が
+/// 持つ、Hyper-V VM + Incusコンテナへの生きたIPCハンドル）を`harness-core`の「重い依存ゼロ」
+/// 原則を保ったまま`ToolCtx`へ運ぶためのtrait境界（`LlmProvider`/`Tool`と同じ設計原則、
+/// `CLAUDE.md`「変動点を2つのtrait境界に押し込む」参照）。同期メソッドなのは、実体が
+/// `harness-sandbox::vmsandboxd::VmSandboxHandle`のブロッキングWin32名前付きパイプIPC
+/// （`crate::netfilterd`と同型）であるため。呼び出し元（`harness-tools::shell`）は
+/// `tokio::task::spawn_blocking`越しに呼ぶ。
+pub trait VmShellExecutor: Send + Sync + std::fmt::Debug {
+    /// コンテナ内で`cmd`を実行し、標準出力・標準エラー・終了コードを返す。`cwd`は
+    /// ワークスペースルートからの相対パスとしてコンテナ内`/workspace`配下へマッピングされる
+    /// （実際のマッピングは`harness-sandbox::vmsandbox`側の責務）。
+    fn exec(
+        &self,
+        cmd: &str,
+        cwd: &std::path::Path,
+        env: &[(String, String)],
+        timeout: std::time::Duration,
+    ) -> Result<(String, String, Option<i32>), String>;
+}
+
 /// 実行前ゲート（`PermissionArbiter`）が参照するリスク分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -287,6 +313,12 @@ pub struct ToolCtx {
     /// アプリ単位network制御（軸1、D-10/D-11）。既定（`NetAppPolicy::default()`＝`allow_apps`空）は
     /// 常にdeny（Tier1a子はcapability空でnetwork全遮断＝現状維持）。
     pub net_app: NetAppPolicy,
+    /// Tier3実行チャネル（`ShellTier::Tier3`選択時のみ`Some`）。`net_wfp`（`harness-cli`の
+    /// `main()`ローカル変数、`ToolCtx`を経由しない設計）とは異なり、こちらは`run_shell`の
+    /// 呼び出しのたびに実際に使われる（VM/コンテナへコマンドを都度送る必要があるため）ので
+    /// `ToolCtx`を経由させる。`Arc`は`ToolCtx`が`Clone`である前提（既存フィールドと同様、
+    /// 生ハンドルではなく共有可能な参照を運ぶ）。
+    pub vm_sandbox: Option<std::sync::Arc<dyn VmShellExecutor>>,
 }
 
 impl ToolCtx {
@@ -300,6 +332,7 @@ impl ToolCtx {
             shell_tier: ShellTierSelection::default(),
             net_proxy: NetProxyConfig::default(),
             net_app: NetAppPolicy::default(),
+            vm_sandbox: None,
         }
     }
 }

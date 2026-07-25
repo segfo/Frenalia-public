@@ -44,6 +44,12 @@ pub mod wfp;
 #[cfg(windows)]
 pub mod netfilterd;
 
+#[cfg(windows)]
+pub mod vmsandbox;
+
+#[cfg(windows)]
+pub mod vmsandboxd;
+
 #[cfg(target_os = "linux")]
 pub mod linux_bwrap;
 

@@ -173,8 +173,16 @@ impl Tool for RunShellTool {
 
         let net_decision = classify_net_app(&input.command, &ctx.net_app.allow_apps);
 
-        let (out, err, code, shell_label) =
-            run_isolated(&input.command, &cwd, &env, dur, ctx.shell_tier.tier, net_decision).await?;
+        let (out, err, code, shell_label) = run_isolated(
+            &input.command,
+            &cwd,
+            &env,
+            dur,
+            ctx.shell_tier.tier,
+            net_decision,
+            ctx.vm_sandbox.as_ref(),
+        )
+        .await?;
 
         let code = code.unwrap_or(-1);
         let mut content = truncate_to_limit(out);
@@ -254,6 +262,7 @@ fn truncate_to_limit(mut s: String) -> String {
 
 /// Tierに応じて実行経路を切り替える。戻り値は`(stdout, stderr, exit_code, shell_label)`。
 /// `exit_code`は`None`ならkill済み（timeout）を表す呼び出し元エラーへ畳み込む。
+#[allow(clippy::too_many_arguments)]
 async fn run_isolated(
     command: &str,
     cwd: &Path,
@@ -261,10 +270,14 @@ async fn run_isolated(
     dur: Duration,
     tier: ShellTier,
     net: NetDecision,
+    vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     // Tier1a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
     // 「このTierでは無効」と明記する、`call`参照）。
     let _ = &net;
+    if tier == ShellTier::Tier3 {
+        return run_tier3(command, cwd, env, dur, vm_sandbox).await;
+    }
     #[cfg(windows)]
     {
         if tier == ShellTier::Tier1a {
@@ -282,6 +295,38 @@ async fn run_isolated(
     }
     // Tier0（保険）。上記いずれにも該当しない場合のフォールバックでもある。
     run_tier0(command, cwd, env, dur).await
+}
+
+/// Tier3（Hyper-V外層VM + Incusコンテナ）実行経路。他Tierと異なり実プロセスをホスト側に
+/// spawnせず、`ctx.vm_sandbox`（`VmSandboxHandle`、`plans/DESIGN-SANDBOX-VMISOLATION.md`）経由で
+/// コンテナ内実行に委譲する。同期IPC呼び出しのため`spawn_blocking`で包む
+/// （`harness_core::VmShellExecutor`のdocコメント参照）。
+async fn run_tier3(
+    command: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    dur: Duration,
+    vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
+) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+    let executor = vm_sandbox
+        .cloned()
+        .ok_or_else(|| {
+            ToolError::ExecutionFailed(
+                "tier3 selected but ToolCtx.vm_sandbox is not set (internal error, harness-cli \
+                 should have started a VmSandboxHandle before constructing ToolCtx)"
+                    .to_string(),
+            )
+        })?;
+    let command = command.to_string();
+    let cwd = cwd.to_path_buf();
+    let env = env.to_vec();
+    let (stdout, stderr, exit_code) = tokio::task::spawn_blocking(move || {
+        executor.exec(&command, &cwd, &env, dur)
+    })
+    .await
+    .map_err(|e| ToolError::ExecutionFailed(format!("tier3 exec task panicked: {e}")))?
+    .map_err(ToolError::ExecutionFailed)?;
+    Ok((stdout, stderr, exit_code, "incus-exec"))
 }
 
 /// 通常のtokio Commandでspawnし、非同期I/O（stdout/stderr並行読み+timeout）を行う共通経路。
@@ -591,10 +636,16 @@ mod tests {
         // `ToolCtx::new`はテスト既定でTier0（プレースホルダ）を積む。実行時は
         // `harness-cli`が起動時に`select_tier`で解決した値を積むため、ここでも
         // 実際のOS隔離Tier選択を再現する（さもないとTier1b経路が単体テストで一切通らない）。
-        // `opt_in_tier1a=false`固定（既存Tier1bテストの挙動を変えないため）。
-        ctx.shell_tier =
-            harness_sandbox::select_tier(harness_core::RequireSandbox::None, &root, false, &[], None)
-                .expect("tier selection without --require-sandbox never fails");
+        // `opt_in_tier1a=false`・`opt_in_tier3=false`固定（既存Tier1bテストの挙動を変えないため）。
+        ctx.shell_tier = harness_sandbox::select_tier(
+            harness_core::RequireSandbox::None,
+            &root,
+            false,
+            false,
+            &[],
+            None,
+        )
+        .expect("tier selection without --require-sandbox never fails");
         ctx
     }
 
@@ -755,7 +806,8 @@ mod tests {
         // 実Tier1a preflightを走らせる（`opt_in_tier1a=true`）。AppContainer不可の環境では
         // Tier1bへ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
         let selection =
-            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true, &[], None).unwrap();
+            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true, false, &[], None)
+                .unwrap();
         if selection.tier != ShellTier::Tier1a {
             eprintln!(
                 "skipping tier1a test: preflight downgraded to {} ({:?})",
@@ -849,7 +901,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let selection =
-            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true, &[], None).unwrap();
+            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true, false, &[], None)
+                .unwrap();
         if selection.tier != ShellTier::Tier1a {
             eprintln!(
                 "skipping tier1a net-allow-app test: preflight downgraded to {} ({:?})",

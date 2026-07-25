@@ -1059,6 +1059,7 @@ dependencies = [
  "cap-std",
  "directories",
  "harness-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1108,6 +1109,13 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "unicode-width",
+]
+
+[[package]]
+name = "harness-vmsandboxd"
+version = "0.1.0"
+dependencies = [
+ "harness-sandbox",
 ]
 
 [[package]]
@@ -2254,6 +2262,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",

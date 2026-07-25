@@ -17,5 +17,5 @@ pub use provider::{
 pub use tool::{
     NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, RequireSandbox, RiskClass, ShellTier,
     ShellTierSelection, StagingConfig, StagingMode, Tool, ToolCtx, ToolError, ToolOutput,
-    ToolResult, ToolSpec, ToolUse,
+    ToolResult, ToolSpec, ToolUse, VmShellExecutor,
 };

@@ -8,6 +8,7 @@ members = [
     "crates/harness-sandbox",
     "crates/harness-privhelper",
     "crates/harness-netfilterd",
+    "crates/harness-vmsandboxd",
     "crates/harness-engine",
     "crates/harness-tui",
     "crates/harness-cli",

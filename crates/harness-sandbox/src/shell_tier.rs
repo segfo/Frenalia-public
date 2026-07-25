@@ -27,10 +27,13 @@ pub enum TierError {
 fn satisfies(tier: ShellTier, require: RequireSandbox) -> bool {
     match require {
         RequireSandbox::None => true,
-        RequireSandbox::WriteContainment => {
-            matches!(tier, ShellTier::Tier2 | ShellTier::Tier1a | ShellTier::Tier1b)
+        RequireSandbox::WriteContainment => matches!(
+            tier,
+            ShellTier::Tier3 | ShellTier::Tier2 | ShellTier::Tier1a | ShellTier::Tier1b
+        ),
+        RequireSandbox::Confidential => {
+            matches!(tier, ShellTier::Tier3 | ShellTier::Tier2 | ShellTier::Tier1a)
         }
-        RequireSandbox::Confidential => matches!(tier, ShellTier::Tier2 | ShellTier::Tier1a),
     }
 }
 
@@ -71,6 +74,11 @@ pub struct Probes {
     /// テストが結果を固定する）。プロファイル作成+実FS再帰ACL書込という副作用ありの重い
     /// 処理なので、単体テストで実Win32を呼ばずに分岐ロジックだけを検証するために使う。
     pub tier1a_preflight_override: Option<Result<(), String>>,
+    /// Windows Tier3（Hyper-V外層VM + Incusコンテナ）の可否をテストから注入する
+    /// （`None`なら本番同様にゴールデン像VHDXの存在チェックのみ行う——VM起動自体は`run_shell`
+    /// 呼び出し時に`harness-cli`が`VmSandboxHandle::start`で行うため、Tier選択時点では
+    /// 「試す価値があるか」の軽量チェックに留める、Phase 1のスコープ）。
+    pub tier3_available_override: Option<Result<(), String>>,
 }
 
 impl Probes {
@@ -101,10 +109,12 @@ impl Probes {
 /// 現在のOSでの最上位Tierを選択する（`require`違反時は降格せず`TierError`）。
 /// `opt_in_tier1a`はD-02「既定にせずフラグでオプトイン」の実装（`--experimental-tier1a`）。
 /// 無効時はWindows上でも常にTier1bを選択し、既存コストは増分ゼロ。
+#[allow(clippy::too_many_arguments)]
 pub fn select_tier(
     require: RequireSandbox,
     workspace_root: &Path,
     opt_in_tier1a: bool,
+    opt_in_tier3: bool,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
 ) -> Result<ShellTierSelection, TierError> {
@@ -112,6 +122,7 @@ pub fn select_tier(
         require,
         workspace_root,
         opt_in_tier1a,
+        opt_in_tier3,
         passthrough,
         wfp_chain_pipe,
         &Probes::detect(),
@@ -119,15 +130,24 @@ pub fn select_tier(
 }
 
 /// テスト用: プローブ結果を注入して選択ロジックのみを検証する。
+#[allow(clippy::too_many_arguments)]
 pub fn select_tier_with_probes(
     require: RequireSandbox,
     workspace_root: &Path,
     opt_in_tier1a: bool,
+    opt_in_tier3: bool,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
     probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
-    let selection = best_effort_tier(workspace_root, opt_in_tier1a, passthrough, wfp_chain_pipe, probes);
+    let selection = best_effort_tier(
+        workspace_root,
+        opt_in_tier1a,
+        opt_in_tier3,
+        passthrough,
+        wfp_chain_pipe,
+        probes,
+    );
     if satisfies(selection.tier, require) {
         Ok(selection)
     } else {
@@ -138,14 +158,50 @@ pub fn select_tier_with_probes(
     }
 }
 
+/// Tier3の軽量可用性チェック（ゴールデン像VHDXの存在のみ確認、実際のVM起動はしない）。
+/// `plans/DESIGN-SANDBOX-VMISOLATION.md`の固定運用規約と同じパスを見る
+/// （`harness_sandbox::vmsandbox::VmSandboxConfig::default().golden_vhdx`と同一値、
+/// 循環依存を避けるためここでは値を直接埋め込む——両者が乖離したら単体テストで検知できないが、
+/// Phase 1では許容する）。
+#[cfg(windows)]
+fn probe_tier3_available() -> Result<(), String> {
+    let golden = Path::new(r"C:\ProgramData\harness\golden-images\almalinux-golden.vhdx");
+    if !golden.exists() {
+        return Err(format!(
+            "golden image not found at {} (Tier3 requires a pre-built AlmaLinux golden VHDX, \
+             see plans/vm-spike/RESULTS.md)",
+            golden.display()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 fn best_effort_tier(
     workspace_root: &Path,
     opt_in_tier1a: bool,
+    opt_in_tier3: bool,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
     probes: &Probes,
 ) -> ShellTierSelection {
+    // Tier3はTier1a/Tier1bとは独立のオプトイン（`--experimental-tier3`）。指定時は最優先で
+    // 試す（Tier3が唯一vNIC単位でegressを強制できるTierのため、成立するなら常に最良）。
+    // 不成立ならTier1b（`opt_in_tier1a`の有無に関わらず）へ直接降格する——Tier1aのpreflightは
+    // 副作用（プロファイル作成+ACL書込）を伴う重い処理であり、Tier3が明示指定された文脈で
+    // それをフォールバックとして走らせる必然性は薄いため、既存Tierの1段階降格パターン
+    // （Tier1a→Tier1bも直接）に合わせてシンプルに保つ。
+    if opt_in_tier3 {
+        let probe_result = match &probes.tier3_available_override {
+            Some(r) => r.clone(),
+            None => probe_tier3_available(),
+        };
+        return match probe_result {
+            Ok(()) => ShellTierSelection::direct(ShellTier::Tier3),
+            Err(reason) => ShellTierSelection::downgraded(ShellTier::Tier3, ShellTier::Tier1b, reason),
+        };
+    }
+
     // Restricted Token構築はほぼ全ての非管理者環境で可能と仮定する（§6.3）。
     // 実際の構築失敗はrun_shell呼び出し時にTier0へ実行時降格させる
     // （harness-tools::shell側の責務、`plans/DESIGN-SANDBOX.md` §6.1「不可なら自動降格+警告」）。
@@ -174,6 +230,7 @@ fn best_effort_tier(
 fn best_effort_tier(
     _workspace_root: &Path,
     _opt_in_tier1a: bool,
+    _opt_in_tier3: bool,
     _passthrough: &[FsPassthrough],
     _wfp_chain_pipe: Option<String>,
     probes: &Probes,
@@ -195,6 +252,7 @@ fn best_effort_tier(
 fn best_effort_tier(
     _workspace_root: &Path,
     _opt_in_tier1a: bool,
+    _opt_in_tier3: bool,
     _passthrough: &[FsPassthrough],
     _wfp_chain_pipe: Option<String>,
     _probes: &Probes,
@@ -221,6 +279,7 @@ mod tests {
             RequireSandbox::None,
             &empty_root(),
             false,
+            false,
             &[],
             None,
             &Probes::default(),
@@ -238,6 +297,7 @@ mod tests {
             RequireSandbox::Confidential,
             &empty_root(),
             false,
+            false,
             &[],
             None,
             &Probes::default(),
@@ -252,6 +312,7 @@ mod tests {
         let selection = select_tier_with_probes(
             RequireSandbox::WriteContainment,
             &empty_root(),
+            false,
             false,
             &[],
             None,
@@ -270,9 +331,16 @@ mod tests {
             tier1a_preflight_override: Some(Ok(())),
             ..Default::default()
         };
-        let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &[], None, &probes)
-                .unwrap();
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            false,
+            false,
+            &[],
+            None,
+            &probes,
+        )
+        .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier1b);
     }
 
@@ -283,9 +351,16 @@ mod tests {
             tier1a_preflight_override: Some(Ok(())),
             ..Default::default()
         };
-        let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), true, &[], None, &probes)
-                .unwrap();
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            true,
+            false,
+            &[],
+            None,
+            &probes,
+        )
+        .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier1a);
         assert!(selection.downgraded_from.is_none());
     }
@@ -297,9 +372,16 @@ mod tests {
             tier1a_preflight_override: Some(Err("acl grant failed".to_string())),
             ..Default::default()
         };
-        let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), true, &[], None, &probes)
-                .unwrap();
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            true,
+            false,
+            &[],
+            None,
+            &probes,
+        )
+        .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier1b);
         assert_eq!(selection.downgraded_from, Some(ShellTier::Tier1a));
         assert!(selection.reason.is_some());
@@ -316,6 +398,7 @@ mod tests {
             RequireSandbox::Confidential,
             &empty_root(),
             true,
+            false,
             &[],
             None,
             &probes,
@@ -341,6 +424,7 @@ mod tests {
             RequireSandbox::None,
             &empty_root(),
             true,
+            false,
             &passthrough,
             None,
             &probes,
@@ -369,12 +453,98 @@ mod tests {
             RequireSandbox::Confidential,
             &empty_root(),
             true,
+            false,
             &[],
             None,
             &probes,
         )
         .unwrap_err();
         assert!(matches!(err, TierError::Insufficient { .. }));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_opt_in_tier3_with_available_golden_image_selects_tier3() {
+        let probes = Probes {
+            tier3_available_override: Some(Ok(())),
+            ..Default::default()
+        };
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            false,
+            true,
+            &[],
+            None,
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(selection.tier, ShellTier::Tier3);
+        assert!(selection.downgraded_from.is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_opt_in_tier3_satisfies_confidential() {
+        let probes = Probes {
+            tier3_available_override: Some(Ok(())),
+            ..Default::default()
+        };
+        let selection = select_tier_with_probes(
+            RequireSandbox::Confidential,
+            &empty_root(),
+            false,
+            true,
+            &[],
+            None,
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(selection.tier, ShellTier::Tier3);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_opt_in_tier3_with_missing_golden_image_downgrades_to_tier1b() {
+        let probes = Probes {
+            tier3_available_override: Some(Err("golden image not found".to_string())),
+            ..Default::default()
+        };
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            false,
+            true,
+            &[],
+            None,
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(selection.tier, ShellTier::Tier1b);
+        assert_eq!(selection.downgraded_from, Some(ShellTier::Tier3));
+        assert!(selection.reason.is_some());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_without_opt_in_never_selects_tier3() {
+        // D-02と同じ型レベルの保証をTier3にも適用する: `opt_in_tier3=false`なら、たとえ
+        // 可用性チェックが成功する状況を注入しても絶対にTier3へ行かない。
+        let probes = Probes {
+            tier3_available_override: Some(Ok(())),
+            ..Default::default()
+        };
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            false,
+            false,
+            &[],
+            None,
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(selection.tier, ShellTier::Tier1b);
     }
 
     #[cfg(target_os = "linux")]
@@ -385,9 +555,16 @@ mod tests {
             unprivileged_userns_enabled: Some(true),
             ..Default::default()
         };
-        let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &[], None, &probes)
-                .unwrap();
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            false,
+            false,
+            &[],
+            None,
+            &probes,
+        )
+        .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier2);
         assert!(selection.downgraded_from.is_none());
     }
@@ -400,9 +577,16 @@ mod tests {
             unprivileged_userns_enabled: Some(true),
             ..Default::default()
         };
-        let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &[], None, &probes)
-                .unwrap();
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            false,
+            false,
+            &[],
+            None,
+            &probes,
+        )
+        .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier0);
         assert_eq!(selection.downgraded_from, Some(ShellTier::Tier2));
         assert!(selection.is_unisolated());
@@ -416,9 +600,16 @@ mod tests {
             unprivileged_userns_enabled: Some(false),
             ..Default::default()
         };
-        let selection =
-            select_tier_with_probes(RequireSandbox::None, &empty_root(), false, &[], None, &probes)
-                .unwrap();
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            false,
+            false,
+            &[],
+            None,
+            &probes,
+        )
+        .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier0);
     }
 
@@ -433,6 +624,7 @@ mod tests {
         let err = select_tier_with_probes(
             RequireSandbox::WriteContainment,
             &empty_root(),
+            false,
             false,
             &[],
             None,

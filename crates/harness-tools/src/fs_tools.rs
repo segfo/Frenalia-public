@@ -394,6 +394,7 @@ mod tests {
             shell_tier: Default::default(),
             net_proxy: Default::default(),
             net_app: Default::default(),
+            vm_sandbox: None,
         };
 
         let tool = WriteFileTool;

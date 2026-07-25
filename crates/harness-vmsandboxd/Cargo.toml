@@ -1,0 +1,11 @@
+[package]
+name = "harness-vmsandboxd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "harness-vmsandboxd"
+path = "src/main.rs"
+
+[dependencies]
+harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }

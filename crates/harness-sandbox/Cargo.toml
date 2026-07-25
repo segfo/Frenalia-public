@@ -16,6 +16,9 @@ which = "7"
 
 [target.'cfg(windows)'.dependencies]
 which = "7"
+# Tier3（`vmsandbox`）のIncus mTLSクライアント用。デーモンプロセス内で同期IPC呼び出しの
+# 一部として使うため`blocking`を使う（`vmsandboxd`自体が非async、`netfilterd`と同じ設計）。
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",

@@ -262,6 +262,15 @@ struct Cli {
     #[arg(long = "experimental-tier1a", default_value_t = false)]
     experimental_tier1a: bool,
 
+    /// Windows専用の実験的Tier3（Hyper-V外層AlmaLinux VM + Incus内層コンテナ）を試す
+    /// （`plans/DESIGN-SANDBOX-VMISOLATION.md`、既定はfalse）。`run_shell`はコンテナ内実行に
+    /// 委譲される。ゴールデン像VHDX（`C:\ProgramData\harness\golden-images\almalinux-golden.vhdx`）
+    /// が無い等で起動できない場合は自動的にTier1bへ降格し警告する。管理者昇格（Hyper-V操作用の
+    /// 常駐デーモン`harness-vmsandboxd`、D-21）を1回要する。`--experimental-tier1a`とは独立
+    /// （同時指定時はTier3を優先して試す）。
+    #[arg(long = "experimental-tier3", default_value_t = false)]
+    experimental_tier3: bool,
+
     /// 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）の許可ドメインを
     /// 追加する（繰り返し指定可、`*.example.com`形式のサフィックスワイルドカード対応）。
     /// `.harness/settings.json`の`net.allow_domains`と合算する（和集合）。1つでも指定される
@@ -1667,6 +1676,7 @@ async fn main() -> ExitCode {
         require_sandbox,
         &workspace_root,
         cli.experimental_tier1a,
+        cli.experimental_tier3,
         &fs_passthrough,
         wfp_chain_pipe,
     ) {
@@ -1795,6 +1805,46 @@ async fn main() -> ExitCode {
         eprintln!("warning: {warning}");
     }
 
+    // Tier3（`plans/DESIGN-SANDBOX-VMISOLATION.md`）: `shell_tier`が実際にTier3へ着地した場合
+    // のみ、VM+コンテナ起動デーモン（`harness-vmsandboxd`、D-21）を昇格起動する（UAC1回）。
+    // `vm_sandbox_handle`は具象型`Arc`（`harness-cli`側のteardown用、`Arc<dyn Trait>`は
+    // `Arc::try_unwrap`できず所有権を取り戻せないため）、`vm_sandbox`はそこから型消去した
+    // `ToolCtx`格納用（`VmSandboxHandle::stop`が`&self`を取るため、両方から同じインスタンスへ
+    // 安全にアクセスできる、`vmsandboxd.rs`のdocコメント参照）。VM起動失敗時はTier3のまま
+    // 起動する（`run_shell`は`ctx.vm_sandbox`が`None`だと明示エラーを返す。preflight相当の
+    // 事前チェックはTier選択時点の軽量チェックのみのためVM起動自体は失敗し得る、Phase 1の
+    // 既知の限界）。
+    #[cfg(windows)]
+    let vm_sandbox_handle: Option<std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>> =
+        if shell_tier.tier == harness_core::ShellTier::Tier3 {
+            match harness_sandbox::vmsandboxd::VmSandboxHandle::start(&workspace_root) {
+                Ok(handle) => Some(std::sync::Arc::new(handle)),
+                Err(e) => {
+                    eprintln!(
+                        "error: tier3 was selected but the VM sandbox failed to start: {e}\n\
+                         run_shell will fail until this is resolved (see \
+                         plans/TIER1A-OPEN-ISSUES.md item 9)."
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    #[cfg(not(windows))]
+    let vm_sandbox_handle: Option<std::sync::Arc<()>> = None;
+
+    let vm_sandbox: Option<std::sync::Arc<dyn harness_core::VmShellExecutor>> = {
+        #[cfg(windows)]
+        {
+            vm_sandbox_handle.clone().map(|h| h as std::sync::Arc<dyn harness_core::VmShellExecutor>)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    };
+
     let tool_ctx = ToolCtx {
         workspace_root: workspace_root.clone(),
         staging: StagingConfig {
@@ -1806,6 +1856,7 @@ async fn main() -> ExitCode {
         shell_tier,
         net_proxy,
         net_app,
+        vm_sandbox,
     };
 
     let exit_code = match cli.print {
@@ -1890,6 +1941,16 @@ async fn main() -> ExitCode {
     // `netfilterd.rs`のモジュールdoc参照）に委ねる。Ctrl+C等のシグナル割り込みも同様に
     // フェイルセーフへ委ねる（本ラウンドではシグナルハンドラを追加しない、
     // `~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D手順5参照）。
+    // Tier3 VMサンドボックスのteardown（ワークスペースcopy-out・コンテナ削除・VM/差分VHDX撤収）。
+    // `net_wfp`と同じ理由でここに置く（早期returnパスは`VmSandboxHandle`のDropフェイルセーフ
+    // ——パイプ切断検知でdaemon側が自発的にteardownする——に委ねる、`vmsandboxd.rs`参照）。
+    #[cfg(windows)]
+    if let Some(handle) = vm_sandbox_handle {
+        if let Err(e) = handle.stop() {
+            eprintln!("warning: failed to cleanly tear down Tier3 VM sandbox session: {e}");
+        }
+    }
+
     #[cfg(windows)]
     if let Some(handle) = net_wfp {
         if let Err(e) = handle.stop() {
