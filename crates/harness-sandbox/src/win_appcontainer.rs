@@ -1086,6 +1086,16 @@ fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Op
 pub struct PreflightOutcome {
     pub warnings: Vec<String>,
     pub granted_passthrough: Vec<(std::path::PathBuf, bool)>,
+    /// `preflight`が特権分離ヘルパーへ`GrantFsAllow`を委譲する経路を実際に通り、その際
+    /// `wfp_chain_pipe`が`Some`だったため「処理完了後に`harness-netfilterd`を連鎖起動してほしい」
+    /// という指示を実際に添えたかどうか（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D
+    /// シナリオ(A)）。連鎖起動の**成否**までは追跡しない（ヘルパー側はベストエフォートでログのみ、
+    /// `privhelper.rs`の`serve()`参照）——呼び出し元は、この値が`true`ならnetfilterdとの
+    /// ハンドシェイクを試み、タイムアウトすれば「今回は使えなかった」として扱えばよい。
+    /// `false`の場合（`needs_elevation`が空だった、または本体が既に管理者で直接付与した等）は
+    /// 連鎖起動を試みていないため、呼び出し元はシナリオ(B)（`NetfilterHandle::start`直接起動）へ
+    /// フォールバックする必要がある。
+    pub netfilterd_chain_attempted: bool,
 }
 
 /// `fp`が要求するアクセスのうち、`preflight`が「既に十分」と判定するために必要な最小マスク
@@ -1102,6 +1112,7 @@ fn required_passthrough_mask(writable: bool) -> u32 {
 pub fn preflight(
     workspace_root: &Path,
     passthrough: &[FsPassthrough],
+    wfp_chain_pipe: Option<String>,
 ) -> Result<PreflightOutcome, AppContainerError> {
     let sid = ensure_profile(CONTAINER_NAME)?;
     grant_ace_recursive(workspace_root, sid.as_psid())?;
@@ -1118,6 +1129,7 @@ pub fn preflight(
     // ここへ集め、後段で1回の特権分離ヘルパー要求へまとめる（起動あたりUAC最大1回、
     // `TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」の決定）。
     let mut needs_elevation: Vec<crate::privhelper::FsAllowGrant> = Vec::new();
+    let mut netfilterd_chain_attempted = false;
 
     for fp in passthrough {
         if !fp.path.exists() {
@@ -1210,8 +1222,12 @@ pub fn preflight(
             }
             Ok((granted, failures))
         } else {
-            crate::privhelper::run_privileged_fs_allow(needs_elevation.clone())
-                .map_err(|e| e.to_string())
+            netfilterd_chain_attempted = wfp_chain_pipe.is_some();
+            crate::privhelper::run_privileged_fs_allow_with_netfilterd_chain(
+                needs_elevation.clone(),
+                wfp_chain_pipe.clone(),
+            )
+            .map_err(|e| e.to_string())
         };
 
         match elevated {
@@ -1286,6 +1302,7 @@ pub fn preflight(
     Ok(PreflightOutcome {
         warnings,
         granted_passthrough,
+        netfilterd_chain_attempted,
     })
 }
 

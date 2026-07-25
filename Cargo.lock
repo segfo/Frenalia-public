@@ -1024,6 +1024,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-netfilterd"
+version = "0.1.0"
+dependencies = [
+ "harness-sandbox",
+]
+
+[[package]]
 name = "harness-privhelper"
 version = "0.1.0"
 dependencies = [

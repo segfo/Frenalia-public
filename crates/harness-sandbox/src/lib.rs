@@ -38,6 +38,12 @@ mod win_common;
 #[cfg(windows)]
 pub mod win_restricted;
 
+#[cfg(windows)]
+pub mod wfp;
+
+#[cfg(windows)]
+pub mod netfilterd;
+
 #[cfg(target_os = "linux")]
 pub mod linux_bwrap;
 

@@ -1,0 +1,11 @@
+[package]
+name = "harness-netfilterd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "harness-netfilterd"
+path = "src/main.rs"
+
+[dependencies]
+harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }

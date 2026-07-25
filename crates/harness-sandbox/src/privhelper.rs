@@ -15,6 +15,15 @@
 //! **SIDは受け渡さない**: 要求スキーマにPSIDを含めない。ヘルパー自身が`ensure_profile`で
 //! `CONTAINER_NAME`（安定定数）からSIDを導出する。生ポインタをプロセス境界・特権境界を越えて
 //! IPCで渡す必要自体を無くす設計判断。
+//!
+//! **例外: WFP連鎖起動**（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）。UAC起動回数を
+//! 最小化するため、`GrantFsAllow`要求が同時に「処理完了後、指定named pipeで`harness-netfilterd`を
+//! 起動してほしい」という指示（[`PrivilegedRequestEnvelope::chain_netfilterd_pipe`]）を伴うことが
+//! ある。この場合だけ、ヘルパーはACL操作の応答を送った**後**に`CreateProcessW`（`runas`は使わない、
+//! 自分の昇格済みトークンをそのまま子へ継承させる）で`harness-netfilterd.exe`を追加起動してから
+//! 終了する。「1起動=1操作で常駐しない」という原則は、「ACL操作1件＋（指示があれば）子プロセスを
+//! 1つ起動する」までを1操作とみなす形で維持する（ヘルパー自身は常駐しない。常駐するのはあくまで
+//! 子として起動された`harness-netfilterd`側）。
 
 use std::path::PathBuf;
 
@@ -97,6 +106,31 @@ pub enum PrivilegedRequest {
     /// （ツリー全体を再walk＋root再プローブ）で撤収する。`forced`なパスは`SeRestorePrivilege`下で
     /// 撤収する（grantと対称に`forced`を運び新たな非対称を作らない、`FsAllowRevoke`参照）。
     RevokeFsAllow { entries: Vec<FsAllowRevoke> },
+}
+
+/// IPCワイヤ上のトップレベル型。`PrivilegedRequest`本体を薄く包み、WFP連鎖起動の指示
+/// （モジュールdoc「例外: WFP連鎖起動」参照）を運ぶ。`PrivilegedRequest`自体のvariant・
+/// 処理ロジック（`dispatch()`）は無変更のまま、この封筒だけを新設する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivilegedRequestEnvelope {
+    pub request: PrivilegedRequest,
+    /// `Some(pipe_name)`なら、ヘルパーは`request`の処理・応答送信を終えた後、
+    /// `CreateProcessW`（`runas`は使わない）で`harness-netfilterd.exe <pipe_name>`を追加起動
+    /// してから終了する。`pipe_name`は呼び出し元（`harness`本体）が事前に開いておいた
+    /// named pipeの名前で、`harness-netfilterd`はこれへclientとして接続する
+    /// （`netfilterd::NetfilterHandle`が直接`runas`起動する経路と同じハンドシェイクを、
+    /// 起動者だけがヘルパー経由に変わる形で流用する）。
+    #[serde(default)]
+    pub chain_netfilterd_pipe: Option<String>,
+}
+
+impl From<PrivilegedRequest> for PrivilegedRequestEnvelope {
+    fn from(request: PrivilegedRequest) -> Self {
+        PrivilegedRequestEnvelope {
+            request,
+            chain_netfilterd_pipe: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,7 +333,17 @@ where
                 if code == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) {
                     true
                 } else if code == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) {
-                    false
+                    // クライアントが`ConnectNamedPipe`呼び出し前に既に接続済みだった（synchronous
+                    // completion）。MSDNの既知の注意点: このケースではOVERLAPPEDのイベントは
+                    // シグナルされないため、後続の`GetOverlappedResult`を呼んではいけない
+                    // （呼ぶと`ERROR_IO_INCOMPLETE`で失敗する）。ここで即座に成功として返す。
+                    // 【2026-07-25実機E2Eで発見・修正】従来この関数は昇格の`runas`起動（低速、
+                    // クライアントが繋がるまで数秒かかる）でしか使われておらず、この競合が
+                    // 顕在化しなかった。WFP連鎖起動（`netfilterd`が特権分離ヘルパー経由で即座に
+                    // 接続してくる、UAC待ちが無い経路）を追加した際、この機種で実際に
+                    // `ERROR_IO_INCOMPLETE`が発生し発覚した（`netfilterd.rs`の同名関数と同じ修正）。
+                    let _ = CloseHandle(event);
+                    return Ok(0);
                 } else {
                     let _ = CloseHandle(event);
                     return Err(PrivHelperError::Ipc(format!("{op_name} failed to start: {e}")));
@@ -430,7 +474,8 @@ fn helper_exe_path() -> Result<PathBuf, PrivHelperError> {
 /// 中身を確認して台帳へ反映する必要がある（孤立ACE防止）。`GrantFsAllow`はエントリごとに
 /// 成否が独立するため、この関数ではなく[`run_privileged_fs_allow`]を使う。
 pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelperError> {
-    match run_privileged_raw(req)? {
+    let envelope = PrivilegedRequestEnvelope::from(req.clone());
+    match run_privileged_raw(&envelope)? {
         PrivilegedResponse::Ok => Ok(Vec::new()),
         PrivilegedResponse::GrantChain {
             granted,
@@ -461,12 +506,27 @@ pub type FsAllowRevokeOutcome = (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, Strin
 /// `GrantFsAllow`専用の委譲関数。`run_privileged`と異なりエントリごとの成否（`granted`/
 /// `failures`）を両方とも呼び出し側へそのまま返す（1エントリの失敗が「エラー」ではなく
 /// 正常な部分結果であるため、`run_privileged`の`Result<Vec<PathBuf>, _>`という単一成功値の
-/// 形には馴染まない）。
+/// 形には馴染まない）。WFP連鎖起動が不要な既存呼び出し元向けの薄いラッパー
+/// （[`run_privileged_fs_allow_with_netfilterd_chain`]を`chain_pipe: None`で呼ぶだけ）。
 pub fn run_privileged_fs_allow(
     entries: Vec<FsAllowGrant>,
 ) -> Result<FsAllowGrantOutcome, PrivHelperError> {
-    let req = PrivilegedRequest::GrantFsAllow { entries };
-    match run_privileged_raw(&req)? {
+    run_privileged_fs_allow_with_netfilterd_chain(entries, None)
+}
+
+/// `run_privileged_fs_allow`のWFP連鎖起動対応版（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`
+/// 付録D シナリオ(A)）。`chain_pipe`が`Some`なら、ヘルパーはこのACL操作の応答を送った後、
+/// 指定named pipeで`harness-netfilterd`を追加起動してから終了する
+/// （モジュールdoc「例外: WFP連鎖起動」参照）。
+pub fn run_privileged_fs_allow_with_netfilterd_chain(
+    entries: Vec<FsAllowGrant>,
+    chain_pipe: Option<String>,
+) -> Result<FsAllowGrantOutcome, PrivHelperError> {
+    let envelope = PrivilegedRequestEnvelope {
+        request: PrivilegedRequest::GrantFsAllow { entries },
+        chain_netfilterd_pipe: chain_pipe,
+    };
+    match run_privileged_raw(&envelope)? {
         PrivilegedResponse::FsAllowResult { granted, failures } => Ok((granted, failures)),
         PrivilegedResponse::Ok => Ok((Vec::new(), Vec::new())),
         PrivilegedResponse::GrantChain { granted, error } => {
@@ -490,8 +550,8 @@ pub fn run_privileged_fs_allow(
 pub fn run_privileged_revoke_fs_allow(
     entries: Vec<FsAllowRevoke>,
 ) -> Result<FsAllowRevokeOutcome, PrivHelperError> {
-    let req = PrivilegedRequest::RevokeFsAllow { entries };
-    match run_privileged_raw(&req)? {
+    let envelope = PrivilegedRequestEnvelope::from(PrivilegedRequest::RevokeFsAllow { entries });
+    match run_privileged_raw(&envelope)? {
         PrivilegedResponse::RevokeFsAllowResult {
             revoked,
             root_cleared,
@@ -510,7 +570,9 @@ pub fn run_privileged_revoke_fs_allow(
     }
 }
 
-fn run_privileged_raw(req: &PrivilegedRequest) -> Result<PrivilegedResponse, PrivHelperError> {
+fn run_privileged_raw(
+    envelope: &PrivilegedRequestEnvelope,
+) -> Result<PrivilegedResponse, PrivHelperError> {
     let pipe_name = unique_pipe_name();
     let sid = current_user_sid_string()?;
     let mut sa = user_only_security_attributes(&sid)?;
@@ -551,7 +613,7 @@ fn run_privileged_raw(req: &PrivilegedRequest) -> Result<PrivilegedResponse, Pri
         }
     };
 
-    let result = run_ipc_exchange(pipe, req);
+    let result = run_ipc_exchange(pipe, envelope);
 
     unsafe {
         let _ = DisconnectNamedPipe(pipe);
@@ -583,7 +645,7 @@ fn run_privileged_raw(req: &PrivilegedRequest) -> Result<PrivilegedResponse, Pri
 /// `run_privileged`/`run_privileged_fs_allow`の責務）。
 fn run_ipc_exchange(
     pipe: HANDLE,
-    req: &PrivilegedRequest,
+    envelope: &PrivilegedRequestEnvelope,
 ) -> Result<PrivilegedResponse, PrivHelperError> {
     connect_with_timeout(pipe, CONNECT_TIMEOUT).map_err(|e| {
         PrivHelperError::Ipc(format!(
@@ -592,7 +654,7 @@ fn run_ipc_exchange(
         ))
     })?;
 
-    let request_bytes = serde_json::to_vec(req)
+    let request_bytes = serde_json::to_vec(envelope)
         .map_err(|e| PrivHelperError::Ipc(format!("failed to serialize request: {e}")))?;
     write_framed_timeout(pipe, &request_bytes, REQUEST_WRITE_TIMEOUT)?;
 
@@ -727,13 +789,19 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
             return Err(e);
         }
     };
-    let response = match serde_json::from_slice::<PrivilegedRequest>(&request_bytes) {
-        Ok(req) => dispatch(req),
-        Err(e) => {
-            log::line(&format!("serve: malformed request: {e}"));
-            PrivilegedResponse::Err(format!("malformed or unknown request (schema mismatch): {e}"))
-        }
-    };
+    let (response, chain_netfilterd_pipe) =
+        match serde_json::from_slice::<PrivilegedRequestEnvelope>(&request_bytes) {
+            Ok(envelope) => (dispatch(envelope.request), envelope.chain_netfilterd_pipe),
+            Err(e) => {
+                log::line(&format!("serve: malformed request: {e}"));
+                (
+                    PrivilegedResponse::Err(format!(
+                        "malformed or unknown request (schema mismatch): {e}"
+                    )),
+                    None,
+                )
+            }
+        };
     let response_bytes = serde_json::to_vec(&response)
         .map_err(|e| PrivHelperError::Ipc(format!("failed to serialize response: {e}")))?;
     log::line("serve: writing response");
@@ -745,7 +813,68 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
     unsafe {
         let _ = CloseHandle(pipe);
     }
+
+    // 応答を送り終えた**後**にのみ連鎖起動する（モジュールdoc「例外: WFP連鎖起動」参照）。
+    // ACL操作の成否に関わらず試みる — WFP起動の可否とACL操作の成否は独立した関心事であり、
+    // ACL側が失敗したからといって呼び出し元が期待しているWFP起動まで巻き添えで諦める理由はない。
+    if let Some(chain_pipe) = chain_netfilterd_pipe {
+        log::line(&format!("serve: chain-launching netfilterd, pipe={chain_pipe}"));
+        match unsafe { launch_netfilterd_chained(&chain_pipe) } {
+            Ok(()) => log::line("serve: netfilterd chain-launch succeeded"),
+            Err(e) => log::line(&format!("serve: netfilterd chain-launch failed: {e}")),
+        }
+    }
+
     write_result
+}
+
+/// ヘルパー実行ファイルと同じディレクトリから`harness-netfilterd.exe`を解決する
+/// （[`helper_exe_path`]と同じロジック、対象exe名だけが異なる）。
+fn netfilterd_exe_path() -> Result<PathBuf, PrivHelperError> {
+    let current = std::env::current_exe()
+        .map_err(|e| PrivHelperError::Ipc(format!("failed to resolve current exe: {e}")))?;
+    let dir = current.parent().ok_or_else(|| {
+        PrivHelperError::Ipc("current exe has no parent directory".to_string())
+    })?;
+    Ok(dir.join("harness-netfilterd.exe"))
+}
+
+/// 昇格済みトークンのまま`harness-netfilterd.exe`を子として起動する（`ShellExecuteExW`の
+/// `runas`は使わない——既に管理者トークンを持つプロセスからの通常の`CreateProcessW`は、
+/// そのトークンをそのまま子へ継承させるため、2回目のUACダイアログは出ない）。起動した
+/// プロセスのハンドルは待たない（netfilterdはharnessセッション全体の生存期間中、独立して
+/// 常駐し続けるデーモンであり、ヘルパー自身はこの直後に終了する）。
+unsafe fn launch_netfilterd_chained(pipe_name: &str) -> Result<(), PrivHelperError> {
+    let netfilterd_path = netfilterd_exe_path()?;
+    // コマンドラインの第0引数（実行ファイルパス）はCreateProcessWの規約上quoteが要る。
+    let cmdline = format!("\"{}\" {}", netfilterd_path.display(), pipe_name);
+    let mut cmdline_w = wide(&cmdline);
+
+    let startup_info = windows::Win32::System::Threading::STARTUPINFOW {
+        cb: std::mem::size_of::<windows::Win32::System::Threading::STARTUPINFOW>() as u32,
+        dwFlags: windows::Win32::System::Threading::STARTF_USESHOWWINDOW,
+        wShowWindow: SW_HIDE.0 as u16,
+        ..Default::default()
+    };
+    let mut process_info = windows::Win32::System::Threading::PROCESS_INFORMATION::default();
+
+    windows::Win32::System::Threading::CreateProcessW(
+        PCWSTR::null(),
+        windows::core::PWSTR(cmdline_w.as_mut_ptr()),
+        None,
+        None,
+        false,
+        windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0),
+        None,
+        PCWSTR::null(),
+        &startup_info as *const _,
+        &mut process_info,
+    )
+    .map_err(PrivHelperError::from)?;
+
+    let _ = CloseHandle(process_info.hProcess);
+    let _ = CloseHandle(process_info.hThread);
+    Ok(())
 }
 
 /// 固定スキーマの要求だけを実行する（D-16の核: ここに到達する時点でスキーマ検証済み、
@@ -924,6 +1053,48 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PrivilegedRequestEnvelope`（WFP連鎖起動、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`
+    /// 付録D）が`chain_netfilterd_pipe`の有無どちらでもラウンドトリップすることを確認する。
+    #[test]
+    fn envelope_roundtrips_with_and_without_netfilterd_chain() {
+        let envelope = PrivilegedRequestEnvelope {
+            request: PrivilegedRequest::GrantFsAllow {
+                entries: vec![FsAllowGrant {
+                    path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
+                    writable: false,
+                    forced: false,
+                }],
+            },
+            chain_netfilterd_pipe: Some(r"\\.\pipe\harness-netfilterd-1234-0".to_string()),
+        };
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let decoded: PrivilegedRequestEnvelope = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            decoded.chain_netfilterd_pipe,
+            Some(r"\\.\pipe\harness-netfilterd-1234-0".to_string())
+        );
+        match decoded.request {
+            PrivilegedRequest::GrantFsAllow { entries } => assert_eq!(entries.len(), 1),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let envelope = PrivilegedRequestEnvelope::from(PrivilegedRequest::RevokeTraverse {
+            path: PathBuf::from(r"C:\Users"),
+        });
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let decoded: PrivilegedRequestEnvelope = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.chain_netfilterd_pipe, None);
+    }
+
+    /// この機能導入前のスキーマ（`chain_netfilterd_pipe`フィールドが無いJSON）でも
+    /// `#[serde(default)]`により`None`として読める（前方/後方互換、`forced`フィールドと同じ理由）。
+    #[test]
+    fn envelope_defaults_chain_netfilterd_pipe_to_none_when_absent() {
+        let json = r#"{"request":{"RevokeTraverse":{"path":"C:\\Users"}}}"#;
+        let decoded: PrivilegedRequestEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.chain_netfilterd_pipe, None);
+    }
 
     #[test]
     fn request_roundtrips_through_json() {

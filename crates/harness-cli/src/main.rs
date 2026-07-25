@@ -1631,11 +1631,44 @@ async fn main() -> ExitCode {
         _ => {}
     }
 
+    // WFP egress強制（Layer2、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）の
+    // named pipeを、`select_tier`（内部で`preflight`を呼ぶ）より前に用意しておく。
+    // Tier1aへのopt-inかつ許可ドメインが設定されている場合のみ試みる（そうでなければ
+    // WFPは不要＝シナリオ(C)、パイプすら作らずUACゼロを保つ）。ここで作ったパイプ名は、
+    // `preflight`経由で特権分離ヘルパーへ「処理完了後この名前でnetfilterdを連鎖起動して
+    // ほしい」という指示として渡す（シナリオ(A)）。実際にTier1aへ降格せずに終わる、または
+    // privhelperへの委譲が発生しなかった場合（シナリオ(B)/(C)）は、このパイプは未使用のまま
+    // 閉じるか、`NetfilterHandle::start`の直接起動へ切り替える（下記`net_wfp`解決を参照）。
+    #[cfg(windows)]
+    let wfp_prelude: Option<harness_sandbox::netfilterd::PreparedPipe> =
+        if cli.experimental_tier1a && !net_proxy.allow_domains.is_empty() {
+            match harness_sandbox::netfilterd::prepare_pipe() {
+                Ok(prepared) => Some(prepared),
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to prepare WFP netfilterd pipe (Layer2 network \
+                         enforcement will be unavailable this session, falling back to the \
+                         cooperative proxy only): {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    #[cfg(not(windows))]
+    let wfp_prelude: Option<String> = None;
+    #[cfg(windows)]
+    let wfp_chain_pipe = wfp_prelude.as_ref().map(|p| p.name().to_string());
+    #[cfg(not(windows))]
+    let wfp_chain_pipe: Option<String> = None;
+
     let shell_tier = match select_tier(
         require_sandbox,
         &workspace_root,
         cli.experimental_tier1a,
         &fs_passthrough,
+        wfp_chain_pipe,
     ) {
         Ok(selection) => selection,
         Err(e) => {
@@ -1643,6 +1676,65 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // WFPシナリオ(A)/(B)/(C)の最終確定。`shell_tier`が実際にTier1aへ着地し、かつ許可ドメインが
+    // あるときだけ有効化する（`experimental_tier1a`はオプトインの意図であって、preflight失敗で
+    // Tier1bへ降格した場合はWFPも当然無効）。
+    #[cfg(windows)]
+    let net_wfp: Option<harness_sandbox::netfilterd::NetfilterHandle> = {
+        let wfp_needed =
+            shell_tier.tier == harness_core::ShellTier::Tier1a && !net_proxy.allow_domains.is_empty();
+        if !wfp_needed {
+            // シナリオ(C)、または投機的に作ったパイプが結局不要だった場合。`wfp_prelude`を
+            // dropするだけで`PreparedPipe`が自動的にパイプを閉じる（後始末コード不要）。
+            drop(wfp_prelude);
+            None
+        } else if shell_tier.netfilterd_chain_attempted {
+            // シナリオ(A): privhelperが既に連鎖起動を試みている。同じパイプでハンドシェイクする。
+            match wfp_prelude {
+                Some(prepared) => {
+                    match harness_sandbox::netfilterd::NetfilterHandle::connect_after_chain_launch(
+                        prepared.into_handle(),
+                        net_proxy.allow_domains.clone(),
+                        false,
+                        false,
+                    ) {
+                        Ok(handle) => Some(handle),
+                        Err(e) => {
+                            eprintln!(
+                                "warning: WFP netfilterd chain-launch handshake failed (network \
+                                 egress will only be enforced by the cooperative proxy, Layer1, \
+                                 this session): {e}"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            // シナリオ(B): privhelperの連鎖起動は発生しなかった（fs-allowの昇格が不要だった等）。
+            // 投機的パイプは使わない（`NetfilterHandle::start`が自前で新規パイプを作るため）、
+            // dropして自動的に閉じる。
+            drop(wfp_prelude);
+            match harness_sandbox::netfilterd::NetfilterHandle::start(
+                net_proxy.allow_domains.clone(),
+                false,
+                false,
+            ) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to start WFP netfilterd (network egress will only be \
+                         enforced by the cooperative proxy, Layer1, this session): {e}"
+                    );
+                    None
+                }
+            }
+        }
+    };
+    #[cfg(not(windows))]
+    let _net_wfp: Option<()> = None;
     if let Some(reason) = &shell_tier.reason {
         eprintln!(
             "warning: shell isolation downgraded to {} (from {}): {reason}",
@@ -1716,7 +1808,7 @@ async fn main() -> ExitCode {
         net_app,
     };
 
-    match cli.print {
+    let exit_code = match cli.print {
         Some(print) => {
             let prompt = if print == "-" {
                 let mut buf = String::new();
@@ -1790,7 +1882,22 @@ async fn main() -> ExitCode {
                 }
             }
         }
+    };
+
+    // セッション終了時のWFP netfilterdのteardown（headless・対話モード共通の末尾）。
+    // ここに到達せずにmainが早期returnした場合（このブロックより前のエラーパス）は、
+    // `net_wfp`のDropフェイルセーフ（パイプ断検知でdaemon側が自発的にteardownする、
+    // `netfilterd.rs`のモジュールdoc参照）に委ねる。Ctrl+C等のシグナル割り込みも同様に
+    // フェイルセーフへ委ねる（本ラウンドではシグナルハンドラを追加しない、
+    // `~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D手順5参照）。
+    #[cfg(windows)]
+    if let Some(handle) = net_wfp {
+        if let Err(e) = handle.stop() {
+            eprintln!("warning: failed to cleanly tear down WFP netfilterd session: {e}");
+        }
     }
+
+    exit_code
 }
 
 #[cfg(test)]

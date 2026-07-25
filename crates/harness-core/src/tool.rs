@@ -146,6 +146,12 @@ pub struct ShellTierSelection {
     /// `ACCESS_DENIED`で失敗したのに記録だけ残る「幻の台帳エントリ」を防ぐ
     /// （`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO: --fs-allowの特権分離ヘルパー化」）。
     pub granted_passthrough: Vec<(std::path::PathBuf, bool)>,
+    /// WFP連鎖起動（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D シナリオ(A)）を
+    /// `preflight`が実際に試みたか。`true`なら呼び出し元（`harness-cli`）は特権分離ヘルパー
+    /// 経由で`harness-netfilterd`が起動済み（またはベストエフォートで失敗済み）と見なし、
+    /// シナリオ(B)（直接`runas`起動）を重ねて行わない。`false`なら連鎖起動を試みていないため、
+    /// `net.allow_domains`が非空ならシナリオ(B)へフォールバックする必要がある。
+    pub netfilterd_chain_attempted: bool,
 }
 
 impl ShellTierSelection {
@@ -156,6 +162,7 @@ impl ShellTierSelection {
             reason: None,
             passthrough_warnings: Vec::new(),
             granted_passthrough: Vec::new(),
+            netfilterd_chain_attempted: false,
         }
     }
 
@@ -166,6 +173,7 @@ impl ShellTierSelection {
             reason: Some(reason.into()),
             passthrough_warnings: Vec::new(),
             granted_passthrough: Vec::new(),
+            netfilterd_chain_attempted: false,
         }
     }
 
@@ -179,6 +187,12 @@ impl ShellTierSelection {
     /// `preflight`が失敗した`downgraded`経路では常に空のまま）。
     pub fn with_granted_passthrough(mut self, granted: Vec<(std::path::PathBuf, bool)>) -> Self {
         self.granted_passthrough = granted;
+        self
+    }
+
+    /// WFP連鎖起動を`preflight`が試みたかを積む（`direct`と組み合わせて使う）。
+    pub fn with_netfilterd_chain_attempted(mut self, attempted: bool) -> Self {
+        self.netfilterd_chain_attempted = attempted;
         self
     }
 
