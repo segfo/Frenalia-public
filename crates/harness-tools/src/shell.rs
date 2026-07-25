@@ -317,9 +317,16 @@ async fn run_tier3(
                     .to_string(),
             )
         })?;
+    // `env`（`harness_sandbox::build_child_env`）はWindows向けのallowlist（`PATH`が
+    // `C:\Windows\system32;...`等）であり、Linuxコンテナへそのまま転送すると`sh`自体の
+    // 解決に使われるPATHがWindows形式で上書きされ、あらゆるコマンドが
+    // 「Command not found」（Incus execのargv[0]解決失敗）になる（実機E2Eで発見）。
+    // コンテナ側の既定PATHをそのまま使わせるため、Tier3ではホストenvを一切転送しない
+    // （TODO: Linux向けのenv許可リストが必要になった場合はPhase 2で再検討する）。
+    let _ = env;
+    let env: Vec<(String, String)> = Vec::new();
     let command = command.to_string();
     let cwd = cwd.to_path_buf();
-    let env = env.to_vec();
     let (stdout, stderr, exit_code) = tokio::task::spawn_blocking(move || {
         executor.exec(&command, &cwd, &env, dur)
     })

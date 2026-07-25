@@ -349,31 +349,37 @@ impl IncusClient {
             .ok_or_else(|| VmError::Incus("exec response has no operation id".to_string()))?;
 
         let metadata = self.wait_operation(&format!("/1.0/operations/{op_id}"), timeout)?;
-        let exit_code = metadata
-            .get("metadata")
+        let exec_metadata = metadata.get("metadata");
+        let exit_code = exec_metadata
             .and_then(|m| m.get("return"))
             .and_then(|r| r.as_i64())
             .map(|n| n as i32);
 
-        // record-outputの標準出力/標準エラーは`/1.0/operations/<id>/log/<stdout|stderr>`から
-        // 別途取得する（execのwait結果自体にはメタデータのみ載る）。
-        let stdout = self.fetch_exec_log(&op_id, "1")?;
-        let stderr = self.fetch_exec_log(&op_id, "2")?;
+        // record-outputの標準出力/標準エラーは、operationのmetadata.outputが持つ実際のhref
+        // （例: `/1.0/operations/<id>/logs/1`）から取得する。**実機で判明した罠**: このhrefは
+        // `/logs/`（複数形）であり、当初`/log/`（単数形）と誤って決め打ちしていたため常に404に
+        // なり、`fetch_exec_log`が「ログ無し=空文字列」としてこれを静かに握りつぶしていた
+        // （exit codeは正しく取れるため一見成功したように見え、発見が遅れた）。
+        let output = exec_metadata.and_then(|m| m.get("output"));
+        let stdout_href = output.and_then(|o| o.get("1")).and_then(|h| h.as_str());
+        let stderr_href = output.and_then(|o| o.get("2")).and_then(|h| h.as_str());
+        let stdout = self.fetch_exec_log(stdout_href, &op_id, "1")?;
+        let stderr = self.fetch_exec_log(stderr_href, &op_id, "2")?;
         Ok((stdout, stderr, exit_code))
     }
 
-    fn fetch_exec_log(&self, op_id: &str, fd: &str) -> Result<String, VmError> {
-        let url = format!(
-            "{}/1.0/operations/{op_id}/log/{fd}",
-            self.base_url
-        );
+    fn fetch_exec_log(&self, href: Option<&str>, op_id: &str, fd: &str) -> Result<String, VmError> {
+        let url = match href {
+            Some(h) => format!("{}{h}", self.base_url),
+            None => format!("{}/1.0/operations/{op_id}/logs/{fd}", self.base_url),
+        };
         let resp = self
             .http
             .get(&url)
             .send()
             .map_err(|e| VmError::Incus(format!("fetch_exec_log failed: {e}")))?;
         if !resp.status().is_success() {
-            // ログが空/存在しない場合は空文字列扱いにする（コマンドが何も出力しなかった場合）。
+            // ログが本当に存在しない場合（コマンドが何も出力しなかった等）は空文字列扱いにする。
             return Ok(String::new());
         }
         resp.text()
@@ -479,6 +485,33 @@ Start-VM -Name '{name}'
         );
         run_powershell(&script)?;
 
+        // ここから先のいかなる失敗も、既に起動済みのVM（+差分VHDX）を孤児として残さないよう
+        // teardown_vmを呼んでから返す（実機E2Eで発見: この保証が無いと、cert未検出等の
+        // 一時的な失敗でVMだけが残り続け、固定静的IP（172.20.100.10）を使う設計上、次回
+        // セッションが新しいVMを起動した際にIP重複が発生し、どちらのVMが応答するか不定に
+        // なるという深刻な症状につながる。`plans/TIER1A-OPEN-ISSUES.md`項目9参照）。
+        let result = Self::start_after_vm_boot(
+            workspace_root,
+            config,
+            session_id,
+            vm_name.clone(),
+            diff_vhdx.clone(),
+        );
+        if result.is_err() {
+            let _ = teardown_vm(&vm_name, &diff_vhdx);
+        }
+        result
+    }
+
+    /// [`Self::start`]の続き（VM起動成功後）。失敗時のVM後始末を[`Self::start`]側の
+    /// 単一箇所（`teardown_vm`呼び出し）に一本化するため分離した。
+    fn start_after_vm_boot(
+        workspace_root: &Path,
+        config: &VmSandboxConfig,
+        session_id: String,
+        vm_name: String,
+        diff_vhdx: PathBuf,
+    ) -> Result<Self, VmError> {
         // ゲストが静的IPで応答するまでポーリング（`RESULTS.md`§3.7実測: 初回pingから即応答）。
         wait_tcp_reachable(config.guest_ip, config.incus_port, Duration::from_secs(180))
             .map_err(|_| VmError::Timeout(format!("guest {} did not come up", config.guest_ip)))?;
@@ -486,43 +519,46 @@ Start-VM -Name '{name}'
         let (client_crt, client_key) = ensure_client_cert()?;
         let incus = IncusClient::new(config.guest_ip, config.incus_port, &client_crt, &client_key)?;
 
-        // Phase 1: 初回のみ信頼登録が必要な場合がある（ゴールデン像への証明書焼き込みが
-        // 完了するまでの暫定経路）。既に信頼済みなら`is_trusted`がtrueを返しスキップされる。
-        // TODO(Phase 1後続): ゴールデン像へクライアント証明書を焼き込み済みにすれば、この
-        // ペアリング分岐は不要になる（`plans/TIER1A-OPEN-ISSUES.md`項目9参照）。
-        if !incus.is_trusted().unwrap_or(false) {
-            return Err(VmError::Incus(
-                "Incus does not trust this client certificate yet. \
-                 ゴールデン像へのクライアント証明書焼き込み（Phase 1後続作業）が未完了です。"
-                    .to_string(),
-            ));
+        // ゴールデン像へのクライアント証明書焼き込み（`plans/TIER1A-OPEN-ISSUES.md`項目9）に
+        // より、通常はここで既に信頼済み。ただし`wait_tcp_reachable`はTCPポートの疎通
+        // （systemdのsocket activationにより、実際のincusdがfirstbootの証明書自動信頼
+        // ステップ（harness-firstboot.sh 3.5）を終える前でも即座に受理してしまう）しか見て
+        // いないため、起動直後は「ポートは開いているが信頼登録はまだ」という一時的な
+        // レースが実機で発生し得る（実機E2Eで発見）。単発チェックにはせず、猶予を持って
+        // リトライする。
+        let trust_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if incus.is_trusted().unwrap_or(false) {
+                break;
+            }
+            if Instant::now() >= trust_deadline {
+                return Err(VmError::Incus(
+                    "Incus does not trust this client certificate after waiting 60s. \
+                     ゴールデン像へのクライアント証明書焼き込みが未完了か、firstbootの \
+                     信頼登録ステップが失敗している可能性があります。"
+                        .to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_secs(2));
         }
 
         let container_name = format!("harness-{session_id}");
-        let result = (|| -> Result<(), VmError> {
-            incus.create_container(&container_name, CONTAINER_IMAGE_ALIAS)?;
-            incus.start_container(&container_name)?;
-            // DHCP不通の既知制約（`RESULTS.md`§段階3）への回避策: 静的IPを直接設定する。
-            incus.exec(
-                &container_name,
-                &[
-                    "sh",
-                    "-c",
-                    &format!(
-                        "ip addr add {CONTAINER_STATIC_IP} dev eth0; ip route add default via {CONTAINER_GATEWAY}; mkdir -p {WORKSPACE_MOUNT}"
-                    ),
-                ],
-                "/",
-                &[],
-                Duration::from_secs(15),
-            )?;
-            Ok(())
-        })();
-        if let Err(e) = result {
-            let _ = incus.delete_container(&container_name);
-            let _ = teardown_vm(&vm_name, &diff_vhdx);
-            return Err(e);
-        }
+        incus.create_container(&container_name, CONTAINER_IMAGE_ALIAS)?;
+        incus.start_container(&container_name)?;
+        // DHCP不通の既知制約（`RESULTS.md`§段階3）への回避策: 静的IPを直接設定する。
+        incus.exec(
+            &container_name,
+            &[
+                "sh",
+                "-c",
+                &format!(
+                    "ip addr add {CONTAINER_STATIC_IP} dev eth0; ip route add default via {CONTAINER_GATEWAY}; mkdir -p {WORKSPACE_MOUNT}"
+                ),
+            ],
+            "/",
+            &[],
+            Duration::from_secs(15),
+        )?;
 
         let session = Self {
             session_id,
