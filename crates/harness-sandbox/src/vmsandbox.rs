@@ -6,11 +6,14 @@
 //! ネットワーク呼び出しであり管理者権限を要しないが、デーモンプロセス内に閉じて構わないため
 //! ここへ同居させる。
 //!
-//! **Phase 1（本ラウンド）の意図的な範囲縮小**（`plans/TIER1A-OPEN-ISSUES.md`項目9で
-//! フォローアップする）:
-//! - egress許可リスト（Incus ACL + nftables DNAT + SNI prereadプロキシ + 監査ログ、
-//!   `RESULTS.md`§3.8で実証済みの機構）は未実装。コンテナはIncusの既定ネットワークで
-//!   自由にegressできる（Tier1aのcapability空default-denyとは異なる）。
+//! **Phase 1（`run_shell`統合）+ Phase 2（egress許可リスト統合）は完了・実機E2E確認済み**
+//! （`RESULTS.md`§3.9/§3.10）。egress許可リスト（Incus ACL + nftables DNAT + SNI preread
+//! プロキシ + 監査ログ）は`allow_domains`が非空の場合のみ構成し、空なら無制限egressのまま
+//! （`--net-allow-domain`未指定時の後方互換）。ゴールデン像へのIncusクライアント証明書焼き込み
+//! も完了しており、ランタイムはSSH・ペアリング不要でmTLS直結できる。
+//!
+//! **依然として未実装のまま残っている範囲**（`plans/TIER1A-OPEN-ISSUES.md`項目9でフォロー
+//! アップする、Phase 3）:
 //! - 台帳+次回起動GC（D-24）は未実装。異常終了時の孤児VM/差分VHDXは残り得る
 //!   （`VmSession::start`が失敗した場合のbest-effort後始末のみ行う）。
 //! - ワークスペース共有はセッション境界でのcopy-in/copy-outのみ（D-22のライブマウントは未実装）。
@@ -21,10 +24,13 @@
 //! - 内部vSwitch: `harness-tier3-outer-internal`（`172.20.100.0/24`、ホスト側ゲートウェイ
 //!   `172.20.100.1`、`New-NetNat`によるegress）
 //! - ゲスト静的IP: `172.20.100.10`（ゴールデン像へ焼き込み済み、DHCP不要）
-//! - Incus API: `172.20.100.10:8443`（mTLS、クライアント証明書は像へ焼き込み予定—Phase 1 では
-//!   `ensure_client_cert`が生成する証明書をホスト側に保持し、初回のみ`incus config
-//!   trust add-certificate`相当のペアリングをこのモジュールが行う。ゴールデン像への
-//!   焼き込み自体は実機作業のため別ラウンドで行う、`plans/TIER1A-OPEN-ISSUES.md`項目9参照）。
+//! - Incus API: `172.20.100.10:8443`（mTLS、クライアント証明書はゴールデン像へ焼き込み済み。
+//!   `harness-firstboot.sh`のステップ3.5が起動直後に`incus config trust add-certificate`で
+//!   自動信頼登録する）
+//! - SSHホスト制御チャネル（Phase 2で追加）: `root`鍵認証限定、harness専用ed25519鍵ペアを
+//!   `%APPDATA%\harness\config\tier3-ssh\`に保持しゴールデン像へ焼き込み済み。AlmaLinux VM
+//!   自体（ホストOS）へnginx/nftables設定を配置・起動するために使う（Incus REST APIはコンテナ
+//!   管理のみでVM自体のOS操作はできないため）。
 
 use std::io::Write;
 use std::net::{IpAddr, TcpStream};
