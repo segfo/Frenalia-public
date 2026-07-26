@@ -12,11 +12,19 @@ fn main() -> std::process::ExitCode {
     let pipe_name = match std::env::args().nth(1) {
         Some(p) => p,
         None => {
-            eprintln!("usage: harness-vmsandboxd.exe <named-pipe-name>");
+            eprintln!("usage: harness-vmsandboxd.exe <named-pipe-name> [--gc-only]");
             return std::process::ExitCode::FAILURE;
         }
     };
-    match harness_sandbox::vmsandboxd::serve(&pipe_name) {
+    // `--gc-only`（`harness tier3 gc`、A9）: 通常のセッション常駐ループ（`serve`）ではなく、
+    // 1件の`Gc`リクエストだけを処理して即終了する（`vmsandboxd::serve_gc`参照）。
+    let gc_only = std::env::args().nth(2).as_deref() == Some("--gc-only");
+    let result = if gc_only {
+        harness_sandbox::vmsandboxd::serve_gc(&pipe_name)
+    } else {
+        harness_sandbox::vmsandboxd::serve(&pipe_name)
+    };
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("harness-vmsandboxd: {e}");

@@ -50,6 +50,9 @@ pub mod vmsandbox;
 #[cfg(windows)]
 pub mod vmsandboxd;
 
+#[cfg(windows)]
+pub mod vm_ledger;
+
 #[cfg(target_os = "linux")]
 pub mod linux_bwrap;
 

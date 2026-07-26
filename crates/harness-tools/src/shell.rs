@@ -643,14 +643,21 @@ mod tests {
         // `ToolCtx::new`はテスト既定でTier0（プレースホルダ）を積む。実行時は
         // `harness-cli`が起動時に`select_tier`で解決した値を積むため、ここでも
         // 実際のOS隔離Tier選択を再現する（さもないとTier1b経路が単体テストで一切通らない）。
-        // `opt_in_tier1a=false`・`opt_in_tier3=false`固定（既存Tier1bテストの挙動を変えないため）。
-        ctx.shell_tier = harness_sandbox::select_tier(
+        // WindowsではTier1aがフラグ無しで既定プローブされるようになったため（`--sandbox`
+        // 自動カスケード実装ラウンド）、`tier1a_preflight_override`でTier1bへ強制降格させ
+        // 決定論的にする（実Win32 preflightを単体テストで走らせない、既存Tier1bテストの
+        // 挙動を変えないため）。`opt_in_tier3=false`固定。
+        let probes = harness_sandbox::shell_tier::Probes {
+            tier1a_preflight_override: Some(Err("test fixture: force tier1b".to_string())),
+            ..Default::default()
+        };
+        ctx.shell_tier = harness_sandbox::shell_tier::select_tier_with_probes(
             harness_core::RequireSandbox::None,
             &root,
             false,
-            false,
             &[],
             None,
+            &probes,
         )
         .expect("tier selection without --require-sandbox never fails");
         ctx
@@ -813,7 +820,7 @@ mod tests {
         // 実Tier1a preflightを走らせる（`opt_in_tier1a=true`）。AppContainer不可の環境では
         // Tier1bへ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
         let selection =
-            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true, false, &[], None)
+            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), false, &[], None)
                 .unwrap();
         if selection.tier != ShellTier::Tier1a {
             eprintln!(
@@ -908,7 +915,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let selection =
-            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), true, false, &[], None)
+            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), false, &[], None)
                 .unwrap();
         if selection.tier != ShellTier::Tier1a {
             eprintln!(

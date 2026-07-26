@@ -534,6 +534,42 @@ pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContain
     Ok(())
 }
 
+/// `grant_ace_inheritable_ro`のRW版（Tier1aが既定でプローブされるようになったことに伴う
+/// `preflight`の高速化、`--sandbox`自動カスケード実装ラウンド）。`grant_ace_recursive`は
+/// workspace_root配下の全ノードへ毎回個別に`SetNamedSecurityInfoW`書込を試みる（`grant_ace_mask`
+/// 内部の冪等スキップにより実際のWin32書込呼び出し自体は2回目以降省略されるが、読取確認は
+/// 変わらず全ノード分発生する）。root へ継承ACEを1件付与するだけで、付与時点で既に存在する
+/// 子孫にもNTFSがDACL変更時に伝播させることを`grant_ace_inheritable_ro`側で実機確認済み
+/// （このコメント参照）であるため、RW版でも同じ「root 1件書込 + 全ノード読取確認（大半は
+/// 継承経由で既に充足）」パターンが使える。書込系Win32呼び出しの回数を大幅に削減できる
+/// （BUG-011「プロファイルルート近傍の書込みは病的に遅くなりうる」を踏まえると効果が大きい）。
+///
+/// **明記するスコープ外**: 大規模ツリーでの全体walk自体のコスト（`collect_dirs_and_files`の
+/// readdir + 各ノードの`sid_ace_mask`読取確認）は依然としてO(n)で残る。恒久的な解決
+/// （付与済みキャッシュの永続化等）は本ラウンドのスコープ外とし、既知の制約として記録する。
+pub fn grant_ace_inheritable_rw(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    grant_ace(root, sid, true)?;
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclGrant {
+        path: root.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+
+    for dir in &dirs {
+        if !matches!(sid_ace_mask(dir, sid), Ok(Some(_))) {
+            grant_ace(dir, sid, true)?;
+        }
+    }
+    for file in &files {
+        if !matches!(sid_ace_mask(file, sid), Ok(Some(_))) {
+            grant_ace(file, sid, false)?;
+        }
+    }
+    Ok(())
+}
+
 /// AppContainer固有のセキュリティ記述子をパイプへ適用する。AppContainerのアクセス制御は
 /// 「オブジェクトのDACLにpackage SID（または`ALL APPLICATION PACKAGES`）へのACEが無ければ
 /// アクセス不可」という広範なdefault-denyがファイル・レジストリだけでなく名前無しパイプ等の
@@ -1115,7 +1151,11 @@ pub fn preflight(
     wfp_chain_pipe: Option<String>,
 ) -> Result<PreflightOutcome, AppContainerError> {
     let sid = ensure_profile(CONTAINER_NAME)?;
-    grant_ace_recursive(workspace_root, sid.as_psid())?;
+    // `--sandbox`自動カスケードによりTier1aが既定でプローブされるようになったため、
+    // 起動のたびにワークスペース全体へ個別書込を試みる`grant_ace_recursive`ではなく、
+    // 高速化版（root継承ACE1件+フォールバック確認walk、`grant_ace_inheritable_rw`のdoc参照）
+    // を使う。
+    grant_ace_inheritable_rw(workspace_root, sid.as_psid())?;
     let tmp_dir = workspace_root
         .join(".harness")
         .join("sandbox")

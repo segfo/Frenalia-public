@@ -113,6 +113,22 @@ enum Commands {
         #[command(subcommand)]
         action: FsAction,
     },
+    /// Tier3（Hyper-V外層VM + Incusコンテナ）の運用保守サブコマンド
+    /// （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.6 D-24）。
+    Tier3 {
+        #[command(subcommand)]
+        action: Tier3Action,
+    },
+}
+
+/// `harness tier3`サブコマンドの各操作。Windows専用機能のため、Windows以外では
+/// エラーで終了する（`harness fs`の非Windows時挙動と同じ、Tier3自体がWindows専用）。
+#[derive(Subcommand)]
+enum Tier3Action {
+    /// 前回セッションの孤児VM・差分VHDXを台帳(D-24)+実機照会に基づき撤収する。
+    /// 通常は新規Tier3セッション開始直前にdaemonが自動実行するが（`serve_inner`）、
+    /// daemonクラッシュ直後の障害調査・手動運用のための明示コマンド。
+    Gc,
 }
 
 /// `harness fs`サブコマンドの各操作。Windows Tier1a固有機能のため、Windows以外では
@@ -255,21 +271,39 @@ struct Cli {
     #[arg(long = "require-sandbox", num_args = 0..=1, default_missing_value = "write-containment")]
     require_sandbox: Option<String>,
 
-    /// Windows専用の実験的Tier1a（AppContainer）を試す（`plans/DESIGN-SANDBOX.md` §6.3/§7 D-02、
-    /// 既定はfalse=Tier1bのまま）。プロファイル作成/ACL付与のいずれかが失敗した場合は自動的に
-    /// Tier1bへ降格し警告する（他OSでは無視される）。Windows非管理者環境で機密性まで守りたい場合
-    /// （T-04/T-10対策）、または`--require-sandbox=confidential`を通したい場合に指定する。
+    /// 【非推奨・no-op】Windowsでは`--sandbox`自動カスケード実装ラウンドよりTier1a
+    /// （AppContainer）がフラグ無しで既定プローブされるようになったため、このフラグは
+    /// 効果を持たない（`plans/DESIGN-SANDBOX.md` §6.3/§7 D-02改訂版参照）。指定した場合は
+    /// 起動時に非推奨noteを表示するのみ。Tier3も含めて試したい場合は`--sandbox`を使うこと。
     #[arg(long = "experimental-tier1a", default_value_t = false)]
     experimental_tier1a: bool,
 
     /// Windows専用の実験的Tier3（Hyper-V外層AlmaLinux VM + Incus内層コンテナ）を試す
     /// （`plans/DESIGN-SANDBOX-VMISOLATION.md`、既定はfalse）。`run_shell`はコンテナ内実行に
     /// 委譲される。ゴールデン像VHDX（`C:\ProgramData\harness\golden-images\almalinux-golden.vhdx`）
-    /// が無い等で起動できない場合は自動的にTier1bへ降格し警告する。管理者昇格（Hyper-V操作用の
-    /// 常駐デーモン`harness-vmsandboxd`、D-21）を1回要する。`--experimental-tier1a`とは独立
-    /// （同時指定時はTier3を優先して試す）。
+    /// が無い等で起動できない場合はTier1aへカスケードし（Tier1aも失敗すればTier1bへ）警告する。
+    /// 管理者昇格（Hyper-V操作用の常駐デーモン`harness-vmsandboxd`、D-21）を1回要する。
+    /// `--sandbox`と同じ効果（便利エイリアス、どちらを指定してもTier3が有効化される）。
     #[arg(long = "experimental-tier3", default_value_t = false)]
     experimental_tier3: bool,
+
+    /// シェル隔離の完全カスケードを有効化する（Windowsのみ意味を持つ: Tier3→Tier1a→Tier1bを
+    /// 順に試す）。既定はfalse。`--experimental-tier3`と同じ効果を持つ便利エイリアスであり、
+    /// どちらか一方を指定すればよい。Tier1a単体は`--sandbox`/`--experimental-tier3`を指定
+    /// しなくてもフラグ無しで既定プローブされるため、本フラグが追加で有効化するのは
+    /// Tier3（VM）の試行のみ（`plans/DESIGN-SANDBOX.md` §6.3/§7 D-02改訂版）。Linuxでは
+    /// Tier2が既に既定の上限のため事実上ノーオプ。
+    #[arg(long = "sandbox", default_value_t = false)]
+    sandbox: bool,
+
+    /// Tier3起動をウォームスタート（production checkpointからの`Restore-VMSnapshot`）で行う
+    /// （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.1、既定はfalse=毎回コールドブート）。
+    /// `--experimental-tier3`と併用が前提（Tier3自体が無効なら無視される）。初回はテンプレート
+    /// provisioningのため通常のコールドブート並みの時間がかかるが、2回目以降のセッションは
+    /// 起動レイテンシが大幅に短縮される。固定静的IPの制約上Tier3は元々同時1セッションのみが
+    /// 前提のため、ウォームVMはマシン全体で1つに固定され、直列化ロックで排他される。
+    #[arg(long = "tier3-warm", default_value_t = false)]
+    tier3_warm: bool,
 
     /// 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）の許可ドメインを
     /// 追加する（繰り返し指定可、`*.example.com`形式のサフィックスワイルドカード対応）。
@@ -505,10 +539,13 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
         Commands::Changes { session, output_format } => (session.clone(), Some(*output_format)),
         Commands::Apply { session, output_format, .. } => (session.clone(), Some(*output_format)),
         Commands::Discard { session } => (session.clone(), None),
-        // `Fs`はmain()側で`run_fs_subcommand`へ振り分け済みで、ここには到達しない
+        // `Fs`/`Tier3`はmain()側でそれぞれ専用の振り分け先へ処理済みで、ここには到達しない
         // （workspace sandboxのstaging設定を一切必要としないため、`SandboxFs`を開く
         // このパスとは責務が別）。
         Commands::Fs { .. } => unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand"),
+        Commands::Tier3 { .. } => {
+            unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
+        }
     };
 
     let Some(sandbox_dir) = resolve_sandbox_dir(workspace_root, session.as_deref()) else {
@@ -622,6 +659,9 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
             }
         },
         Commands::Fs { .. } => unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand"),
+        Commands::Tier3 { .. } => {
+            unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
+        }
     }
 }
 
@@ -810,6 +850,36 @@ fn remove_traverse_grant(path: &Path) {
 
 /// `harness fs`サブコマンドのディスパッチ（プロバイダ資格情報・workspace sandboxのいずれも
 /// 必要としない、`run_sandbox_subcommand`とは独立のパス）。
+/// `harness tier3`サブコマンドの処理本体（A9、D-24）。
+#[cfg(windows)]
+fn run_tier3_subcommand(action: Tier3Action) -> ExitCode {
+    match action {
+        Tier3Action::Gc => match harness_sandbox::vmsandboxd::run_gc_only() {
+            Ok(reaped) => {
+                if reaped.is_empty() {
+                    println!("(no orphaned Tier3 VMs found)");
+                } else {
+                    println!("reaped orphaned Tier3 VMs:");
+                    for vm_name in &reaped {
+                        println!("  {vm_name}");
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("tier3 gc failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn run_tier3_subcommand(_action: Tier3Action) -> ExitCode {
+    eprintln!("error: Tier3 (Hyper-V VM isolation) is Windows-only");
+    ExitCode::FAILURE
+}
+
 fn run_fs_subcommand(action: FsAction) -> ExitCode {
     match action {
         FsAction::List => {
@@ -1391,6 +1461,7 @@ async fn main() -> ExitCode {
     if let Some(cmd) = cli.command {
         return match cmd {
             Commands::Fs { action } => run_fs_subcommand(action),
+            Commands::Tier3 { action } => run_tier3_subcommand(action),
             other => run_sandbox_subcommand(other, &workspace_root),
         };
     }
@@ -1640,17 +1711,29 @@ async fn main() -> ExitCode {
         _ => {}
     }
 
+    // `--experimental-tier1a`は非推奨・no-op化した（`--sandbox`自動カスケード実装ラウンドより
+    // Tier1aはフラグ無しで既定プローブされるため）。指定された場合は一度だけ情報表示する。
+    if cli.experimental_tier1a {
+        eprintln!(
+            "note: --experimental-tier1a is deprecated and has no effect; Tier1a (AppContainer) \
+             is now attempted automatically on Windows. Use --sandbox (or --experimental-tier3) \
+             to also attempt Tier3."
+        );
+    }
+
     // WFP egress強制（Layer2、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）の
     // named pipeを、`select_tier`（内部で`preflight`を呼ぶ）より前に用意しておく。
-    // Tier1aへのopt-inかつ許可ドメインが設定されている場合のみ試みる（そうでなければ
-    // WFPは不要＝シナリオ(C)、パイプすら作らずUACゼロを保つ）。ここで作ったパイプ名は、
-    // `preflight`経由で特権分離ヘルパーへ「処理完了後この名前でnetfilterdを連鎖起動して
-    // ほしい」という指示として渡す（シナリオ(A)）。実際にTier1aへ降格せずに終わる、または
-    // privhelperへの委譲が発生しなかった場合（シナリオ(B)/(C)）は、このパイプは未使用のまま
-    // 閉じるか、`NetfilterHandle::start`の直接起動へ切り替える（下記`net_wfp`解決を参照）。
+    // Tier1aはフラグ無しで既定プローブされるため（`--sandbox`カスケードの中間フォールバック
+    // としても到達し得る）、許可ドメインが設定されている場合は常に投機的に用意しておく
+    // （そうでなければWFPは不要＝シナリオ(C)、パイプすら作らずUACゼロを保つ）。ここで作った
+    // パイプ名は、`preflight`経由で特権分離ヘルパーへ「処理完了後この名前でnetfilterdを
+    // 連鎖起動してほしい」という指示として渡す（シナリオ(A)）。実際にTier1aへ降格せずに
+    // 終わる、またはprivhelperへの委譲が発生しなかった場合（シナリオ(B)/(C)）は、この
+    // パイプは未使用のまま閉じるか、`NetfilterHandle::start`の直接起動へ切り替える
+    // （下記`net_wfp`解決を参照）。
     #[cfg(windows)]
     let wfp_prelude: Option<harness_sandbox::netfilterd::PreparedPipe> =
-        if cli.experimental_tier1a && !net_proxy.allow_domains.is_empty() {
+        if !net_proxy.allow_domains.is_empty() {
             match harness_sandbox::netfilterd::prepare_pipe() {
                 Ok(prepared) => Some(prepared),
                 Err(e) => {
@@ -1675,8 +1758,7 @@ async fn main() -> ExitCode {
     let shell_tier = match select_tier(
         require_sandbox,
         &workspace_root,
-        cli.experimental_tier1a,
-        cli.experimental_tier3,
+        cli.experimental_tier3 || cli.sandbox,
         &fs_passthrough,
         wfp_chain_pipe,
     ) {
@@ -1757,10 +1839,12 @@ async fn main() -> ExitCode {
     }
     if shell_tier.tier == harness_core::ShellTier::Tier1b {
         eprintln!(
-            "note: shell isolation tier is tier1b (Windows default); this does not protect \
-             against reading confidential files outside the workspace or outbound network \
-             exfiltration from run_shell child processes (plans/DESIGN-SANDBOX.md §9-1). \
-             Use --require-sandbox=confidential (with --experimental-tier1a) if this matters."
+            "note: shell isolation tier is tier1b; Tier1a (AppContainer) was attempted \
+             automatically but unavailable this session (see the warning above for the reason). \
+             Tier1b does not protect against reading confidential files outside the workspace \
+             or outbound network exfiltration from run_shell child processes \
+             (plans/DESIGN-SANDBOX.md §9-1). --require-sandbox=confidential refuses to start \
+             at tier1b rather than silently weakening this guarantee."
         );
     }
     // fs passthrough（D2/D-13）: ACE付与自体は「付けっぱなし」（撤収はユーザ操作
@@ -1820,6 +1904,7 @@ async fn main() -> ExitCode {
             match harness_sandbox::vmsandboxd::VmSandboxHandle::start(
                 &workspace_root,
                 &net_proxy.allow_domains,
+                cli.tier3_warm,
             ) {
                 Ok(handle) => Some(std::sync::Arc::new(handle)),
                 Err(e) => {

@@ -67,6 +67,10 @@ pub enum VmRequest {
         /// Phase 1と同じ無制限egressのまま（`--net-allow-domain`未指定時の既定挙動、
         /// `plans/vm-spike/RESULTS.md`§3.8）。
         allow_domains: Vec<String>,
+        /// ウォームスタート（`--tier3-warm`、フェーズB）を使うか。既定はfalse（旧クライアント
+        /// との後方互換、コールドブートのまま）。
+        #[serde(default)]
+        warm: bool,
     },
     Exec {
         cmd: String,
@@ -75,6 +79,10 @@ pub enum VmRequest {
         timeout_secs: u64,
     },
     Teardown,
+    /// GC専用モード（`harness tier3 gc`、A9）でのみ送られる1回きりのリクエスト。
+    /// `StartSession`を経由せず、`crate::vmsandbox::gc_orphan_sessions`を実行して
+    /// 即座に終了する（D-24、`serve_gc_only`参照）。
+    Gc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +94,8 @@ pub enum VmResponse {
         exit_code: Option<i32>,
     },
     TornDown,
+    /// `VmRequest::Gc`への応答。撤収を試みたVM名（=session_id）の一覧。
+    GcReport { reaped_vm_names: Vec<String> },
     Err(String),
 }
 
@@ -323,11 +333,11 @@ fn daemon_exe_path() -> Result<PathBuf, VmSandboxIpcError> {
 
 unsafe fn launch_daemon_elevated(
     daemon_path: &std::path::Path,
-    pipe_name: &str,
+    params: &str,
 ) -> Result<HANDLE, VmSandboxIpcError> {
     let verb_w = wide("runas");
     let file_w = wide(&daemon_path.to_string_lossy());
-    let params_w = wide(pipe_name);
+    let params_w = wide(params);
 
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -440,6 +450,7 @@ fn connect_and_start_session(
     daemon_process: Option<HANDLE>,
     workspace_root_str: String,
     allow_domains: Vec<String>,
+    warm: bool,
 ) -> Result<VmSandboxHandle, VmSandboxIpcError> {
     let workspace_root = PathBuf::from(&workspace_root_str);
     let connect_result = connect_with_timeout(pipe, CONNECT_TIMEOUT).map_err(|e| {
@@ -461,6 +472,7 @@ fn connect_and_start_session(
     let req = VmRequest::StartSession {
         workspace_root: workspace_root_str,
         allow_domains,
+        warm,
     };
     let start_result = (|| -> Result<(), VmSandboxIpcError> {
         let bytes = serde_json::to_vec(&req)
@@ -502,9 +514,11 @@ impl VmSandboxHandle {
     /// daemonを昇格起動し、`StartSession`を送って応答を待つ（親側、非管理者本体から呼ぶ）。
     /// `allow_domains`は既存の`net_proxy.allow_domains`（`--net-allow-domain`+
     /// `.harness/settings.json`統合済み、WFPが既に使っているのと同じ値）をそのまま渡す。
+    /// `warm`は`--tier3-warm`（フェーズB）の値をそのまま渡す。
     pub fn start(
         workspace_root: &std::path::Path,
         allow_domains: &[String],
+        warm: bool,
     ) -> Result<Self, VmSandboxIpcError> {
         let prepared = prepare_pipe()?;
         let pipe_name = prepared.name().to_string();
@@ -526,6 +540,7 @@ impl VmSandboxHandle {
             Some(daemon_process),
             workspace_root.to_string_lossy().to_string(),
             allow_domains.to_vec(),
+            warm,
         )
     }
 
@@ -536,12 +551,14 @@ impl VmSandboxHandle {
         pipe: HANDLE,
         workspace_root: &std::path::Path,
         allow_domains: &[String],
+        warm: bool,
     ) -> Result<Self, VmSandboxIpcError> {
         connect_and_start_session(
             pipe,
             None,
             workspace_root.to_string_lossy().to_string(),
             allow_domains.to_vec(),
+            warm,
         )
     }
 
@@ -661,6 +678,67 @@ impl Drop for VmSandboxHandle {
     }
 }
 
+/// `harness tier3 gc`（A9、`harness-cli`）が呼ぶGC専用のワンショットdaemon起動。
+/// `VmSandboxHandle::start`とは異なりセッションを開始せず、`--gc-only`引数付きで起動した
+/// daemon（`serve_gc`）が[`VmRequest::Gc`]を1件処理して即座に終了するのを待つだけの
+/// 軽量な経路。ウォームVM・現在セッション（gc-only起動時は存在しない）は台帳側の
+/// 選定ロジック（`crate::vm_ledger::select_orphans`）でGC対象から除外される。
+pub fn run_gc_only() -> Result<Vec<String>, VmSandboxIpcError> {
+    let prepared = prepare_pipe()?;
+    let pipe_name = prepared.name().to_string();
+    let pipe = prepared.into_handle();
+
+    let daemon_path = daemon_exe_path()?;
+    let params = format!("{pipe_name} --gc-only");
+    let daemon_process = match unsafe { launch_daemon_elevated(&daemon_path, &params) } {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe {
+                let _ = CloseHandle(pipe);
+            }
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = connect_with_timeout(pipe, CONNECT_TIMEOUT) {
+        unsafe {
+            let _ = CloseHandle(pipe);
+            let _ = CloseHandle(daemon_process);
+        }
+        return Err(VmSandboxIpcError::Ipc(format!(
+            "waiting for vmsandboxd (gc-only mode) to connect: {e} (daemon may not have \
+             launched, or UAC is still pending user interaction)"
+        )));
+    }
+
+    let result = (|| -> Result<Vec<String>, VmSandboxIpcError> {
+        let bytes = serde_json::to_vec(&VmRequest::Gc)
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to serialize gc request: {e}")))?;
+        write_framed_timeout(pipe, &bytes, REQUEST_WRITE_TIMEOUT)?;
+        let response_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
+        let response: VmResponse = serde_json::from_slice(&response_bytes)
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to parse gc response: {e}")))?;
+        match response {
+            VmResponse::GcReport { reaped_vm_names } => Ok(reaped_vm_names),
+            VmResponse::Err(msg) => Err(VmSandboxIpcError::Rejected(msg)),
+            other => Err(VmSandboxIpcError::Ipc(format!("unexpected response for Gc: {other:?}"))),
+        }
+    })();
+
+    unsafe {
+        let _ = DisconnectNamedPipe(pipe);
+        let _ = CloseHandle(pipe);
+        let wait = WaitForSingleObject(daemon_process, 30_000);
+        if wait != WAIT_OBJECT_0 {
+            let _ = windows::Win32::System::Threading::TerminateProcess(daemon_process, 1);
+            let _ = WaitForSingleObject(daemon_process, 5000);
+        }
+        let _ = CloseHandle(daemon_process);
+    }
+
+    result
+}
+
 /// `ToolCtx.vm_sandbox`（`harness-core`の「重い依存ゼロ」原則を保ったtrait境界、
 /// `harness_core::VmShellExecutor`参照）の実体。`harness-tools::shell::run_windows_tier3`は
 /// `Arc<dyn VmShellExecutor>`越しにこれを呼ぶ（同期メソッドのため`tokio::task::spawn_blocking`
@@ -703,8 +781,10 @@ pub fn serve(pipe_name: &str) -> Result<(), VmSandboxIpcError> {
 fn serve_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
     // 1件目: StartSession を待つ。
     let request_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
-    let (workspace_root, allow_domains) = match serde_json::from_slice::<VmRequest>(&request_bytes) {
-        Ok(VmRequest::StartSession { workspace_root, allow_domains }) => (workspace_root, allow_domains),
+    let (workspace_root, allow_domains, warm) = match serde_json::from_slice::<VmRequest>(&request_bytes) {
+        Ok(VmRequest::StartSession { workspace_root, allow_domains, warm }) => {
+            (workspace_root, allow_domains, warm)
+        }
         Ok(_) => {
             let resp = VmResponse::Err(
                 "expected StartSession as the first message".to_string(),
@@ -721,7 +801,25 @@ fn serve_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
     let workspace_root = PathBuf::from(workspace_root);
 
     let config = VmSandboxConfig::default();
-    let session = match VmSession::start(&workspace_root, &config, &allow_domains) {
+
+    // D-24: 新規VMが固定静的IP（`config.guest_ip`）を要求する前に、前回セッションの
+    // 孤児VM/差分VHDXを撤収する（`crate::vmsandbox::gc_orphan_sessions`のdoc参照）。
+    // この時点では新規セッションのIDはまだ発行されていない（`VmSession::start`内部で
+    // 生成される）ため、台帳上「除外すべき現在のセッション」は存在しない
+    // （空文字列はどのVM名にも一致しないため、事実上「全ての既存孤児が対象」になる）。
+    // GC自体の失敗は`StartSession`を失敗させない（GC内部で個々の失敗をstderrへログして
+    // 続行する設計、`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.6）。
+    let _ = crate::vmsandbox::gc_orphan_sessions(&config, "");
+
+    // `warm`（`--tier3-warm`）時は、ウォームVMのproduction checkpointを用意した上で
+    // Restoreから起動する（B5〜B8）。破損時は内部で自動的にコールドブートへフォールバック
+    // するため、ここでの分岐はどちらの入口を呼ぶかだけでよい。
+    let start_result = if warm {
+        VmSession::start_warm_or_fallback(&workspace_root, &config, &allow_domains)
+    } else {
+        VmSession::start(&workspace_root, &config, &allow_domains)
+    };
+    let session = match start_result {
         Ok(s) => s,
         Err(e) => {
             let resp = VmResponse::Err(format!("VM session start failed: {e}"));
@@ -789,6 +887,16 @@ fn serve_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
                     &VmResponse::Err("StartSession already handled for this session".to_string()),
                 );
             }
+            VmRequest::Gc => {
+                // `Gc`はgc-onlyモード（`serve_gc`）専用のリクエストであり、通常のセッション
+                // ループ（本関数）では受理しない。
+                let _ = send_response(
+                    pipe,
+                    &VmResponse::Err(
+                        "Gc is only valid in gc-only mode (harness tier3 gc)".to_string(),
+                    ),
+                );
+            }
         }
     }
 }
@@ -797,6 +905,54 @@ fn send_response(pipe: HANDLE, resp: &VmResponse) -> Result<(), VmSandboxIpcErro
     let bytes = serde_json::to_vec(resp)
         .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to serialize response: {e}")))?;
     write_framed_timeout(pipe, &bytes, TEARDOWN_RESPONSE_TIMEOUT)
+}
+
+/// daemon側のGC専用エントリポイント（`harness-vmsandboxd.exe <pipe> --gc-only`から呼ぶ）。
+/// `serve`（`StartSession`起点の長期常駐ループ）とは別経路: [`VmRequest::Gc`]を1件受けて
+/// `crate::vmsandbox::gc_orphan_sessions`を実行し、結果を返してすぐ終了する（`run_gc_only`
+/// のdoc参照）。
+pub fn serve_gc(pipe_name: &str) -> Result<(), VmSandboxIpcError> {
+    let pipe = unsafe {
+        let pipe_name_w = wide(pipe_name);
+        CreateFileW(
+            PCWSTR(pipe_name_w.as_ptr()),
+            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+            windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+            None,
+        )
+        .map_err(VmSandboxIpcError::from)?
+    };
+
+    let result = serve_gc_inner(pipe);
+    unsafe {
+        let _ = CloseHandle(pipe);
+    }
+    result
+}
+
+fn serve_gc_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
+    let request_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
+    match serde_json::from_slice::<VmRequest>(&request_bytes) {
+        Ok(VmRequest::Gc) => {
+            let config = VmSandboxConfig::default();
+            let reaped = crate::vmsandbox::gc_orphan_sessions(&config, "");
+            send_response(pipe, &VmResponse::GcReport { reaped_vm_names: reaped })
+        }
+        Ok(_) => {
+            let resp =
+                VmResponse::Err("expected Gc as the only message in gc-only mode".to_string());
+            send_response(pipe, &resp)?;
+            Err(VmSandboxIpcError::Ipc("protocol violation (gc-only mode)".to_string()))
+        }
+        Err(e) => {
+            let resp = VmResponse::Err(format!("malformed Gc request: {e}"));
+            send_response(pipe, &resp)?;
+            Err(VmSandboxIpcError::Ipc(format!("malformed request: {e}")))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -808,13 +964,15 @@ mod tests {
         let req = VmRequest::StartSession {
             workspace_root: r"C:\work\project".to_string(),
             allow_domains: vec!["example.com".to_string()],
+            warm: false,
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: VmRequest = serde_json::from_slice(&bytes).unwrap();
         match decoded {
-            VmRequest::StartSession { workspace_root, allow_domains } => {
+            VmRequest::StartSession { workspace_root, allow_domains, warm } => {
                 assert_eq!(workspace_root, r"C:\work\project");
                 assert_eq!(allow_domains, vec!["example.com".to_string()]);
+                assert!(!warm);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -825,6 +983,7 @@ mod tests {
         let req = VmRequest::StartSession {
             workspace_root: r"C:\work\project".to_string(),
             allow_domains: vec![],
+            warm: false,
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: VmRequest = serde_json::from_slice(&bytes).unwrap();
@@ -832,6 +991,33 @@ mod tests {
             VmRequest::StartSession { allow_domains, .. } => {
                 assert!(allow_domains.is_empty());
             }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_session_request_without_warm_field_deserializes_as_not_warm() {
+        // 旧クライアント（`warm`未対応）との後方互換: フィールド自体が無いJSONでも
+        // `#[serde(default)]`によりfalse扱いでパースできる。
+        let legacy = r#"{"StartSession":{"workspace_root":"C:\\work\\project","allow_domains":[]}}"#;
+        let decoded: VmRequest = serde_json::from_str(legacy).expect("legacy request must parse");
+        match decoded {
+            VmRequest::StartSession { warm, .. } => assert!(!warm),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_session_request_with_warm_true_roundtrips() {
+        let req = VmRequest::StartSession {
+            workspace_root: r"C:\work\project".to_string(),
+            allow_domains: vec![],
+            warm: true,
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let decoded: VmRequest = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            VmRequest::StartSession { warm, .. } => assert!(warm),
             other => panic!("unexpected variant: {other:?}"),
         }
     }

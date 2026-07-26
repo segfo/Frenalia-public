@@ -12,12 +12,23 @@
 //! （`--net-allow-domain`未指定時の後方互換）。ゴールデン像へのIncusクライアント証明書焼き込み
 //! も完了しており、ランタイムはSSH・ペアリング不要でmTLS直結できる。
 //!
+//! **Phase 3も実装済み（台帳+GC・ウォームスタート）**:
+//! - **台帳+次回起動GC（D-24）**: `crate::vm_ledger`が`%APPDATA%\harness\tier3-vm-ledger.json`
+//!   へVM生成を記録し、`gc_orphan_sessions`が新規VM起動前（`vmsandboxd::serve_inner`）に
+//!   前回セッションの孤児VM・差分VHDXを撤収する。手動運用・障害調査用の明示コマンド
+//!   `harness tier3 gc`も用意した（`vmsandboxd::run_gc_only`/`serve_gc`）。
+//! - **ウォームスタート**（`--tier3-warm`、既定off）: `ensure_warm_template`が「起動済み・
+//!   IP疎通済み・Incus trusted」状態のproduction checkpoint（`WARM_CHECKPOINT_NAME`）を
+//!   持つ永続VM（`WARM_VM_NAME`）を一度だけ用意する。`VmSession::start_warm_or_fallback`が
+//!   `Restore-VMSnapshot`で毎回このcheckpointへ巻き戻してから起動することで、コールド
+//!   ブート（起動+firstboot）のコストを省く。固定静的IPの制約上Tier3は元々同時1セッションが
+//!   前提のため、ウォームVMは`WarmLock`（ファイルロック、`vm_work_dir/tier3-warm.lock`）で
+//!   直列化する。破損（Restore失敗・疎通タイムアウト等）を検出した場合はテンプレートを
+//!   1回だけ破棄して再provisioning、それも失敗すればコールドブートへ自動フォールバックする。
+//!
 //! **依然として未実装のまま残っている範囲**（`plans/TIER1A-OPEN-ISSUES.md`項目9でフォロー
-//! アップする、Phase 3）:
-//! - 台帳+次回起動GC（D-24）は未実装。異常終了時の孤児VM/差分VHDXは残り得る
-//!   （`VmSession::start`が失敗した場合のbest-effort後始末のみ行う）。
+//! アップする、Phase 3の残り）:
 //! - ワークスペース共有はセッション境界でのcopy-in/copy-outのみ（D-22のライブマウントは未実装）。
-//! - ウォームスタート（saved state）は未実装。毎回コールドブートする。
 //!
 //! 固定の運用規約（`plans/vm-spike/RESULTS.md`§3.6/§3.7で確立、実機E2E確認済み）:
 //! - ゴールデン親VHDX: `C:\ProgramData\harness\golden-images\almalinux-golden.vhdx`
@@ -65,7 +76,18 @@ pub struct VmSandboxConfig {
     pub guest_ip: IpAddr,
     pub incus_port: u16,
     pub vm_work_dir: PathBuf,
+    /// ウォームスタート（`--tier3-warm`、フェーズB）を使うか。既定はfalse（毎回コールドブート）。
+    pub warm: bool,
 }
+
+/// ウォームスタート（production checkpoint + Restore方式、`plans/DESIGN-SANDBOX-VMISOLATION.md`
+/// §2.1）で使う固定名。固定静的IPの制約上Tier3は元々同時1セッションのみが成立条件のため、
+/// ウォームVMはマシン全体で1つに固定する（`crate::vm_ledger::WARM_VM_NAME`と同じ値を指す
+/// 定数だが、循環依存を避けるためここにも定義する）。
+pub const WARM_VM_NAME: &str = crate::vm_ledger::WARM_VM_NAME;
+/// ウォームVMの「起動済み・IP疎通済み・Incus trusted」状態を捕捉するproduction checkpoint名
+/// （`Checkpoint-VM -SnapshotName`）。
+pub const WARM_CHECKPOINT_NAME: &str = "harness-warm-base";
 
 impl Default for VmSandboxConfig {
     fn default() -> Self {
@@ -77,6 +99,7 @@ impl Default for VmSandboxConfig {
             guest_ip: "172.20.100.10".parse().unwrap(),
             incus_port: 8443,
             vm_work_dir: PathBuf::from(r"C:\ProgramData\harness\vm-sessions"),
+            warm: false,
         }
     }
 }
@@ -94,6 +117,92 @@ fn run_powershell(script: &str) -> Result<String, VmError> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// ウォームVM専用の直列化ロック（`vm_work_dir/tier3-warm.lock`）。固定静的IPの制約上、
+/// Tier3は元々同時1セッションのみが成立条件（2 VMが同じIPを主張すると破綻する、
+/// `VmSession::start`のdoc参照）だが、ウォームVMは複数daemonプロセスから同時に
+/// Restore/execされると壊れるため、明示的なファイルロックで直列化する。
+///
+/// ロックファイルには取得元プロセスのPIDを書き込む。daemonクラッシュでロックファイルだけ
+/// 残った場合の回収のため、取得を試みて失敗した際はPIDの生存確認でstaleness判定し
+/// （`select_orphans`と同じbelt-and-suspenders思想）、stale であれば削除して再試行する。
+pub struct WarmLock {
+    path: PathBuf,
+}
+
+impl WarmLock {
+    /// ロック取得を試みる。取得できるまで一定間隔でリトライし、`timeout`超過でエラーにする。
+    pub fn acquire(config: &VmSandboxConfig, timeout: Duration) -> Result<Self, VmError> {
+        let path = config.vm_work_dir.join("tier3-warm.lock");
+        std::fs::create_dir_all(&config.vm_work_dir)?;
+        let deadline = Instant::now() + timeout;
+        let poll_interval = Duration::from_millis(500);
+        loop {
+            if try_create_lock_file(&path).is_ok() {
+                return Ok(Self { path });
+            }
+            if lock_is_stale(&path) {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            if Instant::now() >= deadline {
+                return Err(VmError::Timeout(format!(
+                    "timed out waiting for tier3 warm VM lock: {}",
+                    path.display()
+                )));
+            }
+            std::thread::sleep(poll_interval);
+        }
+    }
+}
+
+impl Drop for WarmLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn try_create_lock_file(path: &Path) -> Result<(), VmError> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    write!(file, "{}", std::process::id())?;
+    Ok(())
+}
+
+/// ロックファイルの所有者PIDが既に終了しているかを確認する。読めない/PIDが不正な形式の
+/// 場合は安全側（stale扱いしない=false、他プロセスが書き込み中の可能性を尊重する）に倒す。
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        return false;
+    };
+    !process_is_alive(pid)
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// ウォームVM専用の差分VHDXパス（`vm_work_dir/warm.diff.vhdx`、セッションごとの
+/// `<session_id>.diff.vhdx`とは別枠。ウォームVMはセッションをまたいで生存し続けるため
+/// 使い捨てにならない、B3/B5参照）。
+pub fn warm_diff_vhdx_path(config: &VmSandboxConfig) -> PathBuf {
+    config.vm_work_dir.join("warm.diff.vhdx")
 }
 
 fn unique_session_id() -> String {
@@ -887,12 +996,150 @@ pub struct VmSession {
     /// egress許可リスト（SNIプロキシ+nftables DNAT）を構成した場合のみ`Some`（`allow_domains`
     /// が非空だった場合）。teardown時にこれを見て監査ログ取得の要否を判定する。
     ssh_key: Option<PathBuf>,
+    /// ウォームVM（フェーズB、`Self::start_warm`経由）かどうか。`teardown`で撤収経路を
+    /// 分岐させる（コールド: VM削除+差分VHDX破棄、ウォーム: checkpointへRestoreして
+    /// 次回セッションのために温存する）。
+    warm: bool,
+    /// ウォームセッションが保持する直列化ロック（B2）。`teardown`（または`Drop`）まで
+    /// 保持し続けることでマシン全体で1セッションに排他する。コールドセッションでは`None`。
+    warm_lock: Option<WarmLock>,
 }
 
 const CONTAINER_IMAGE_ALIAS: &str = "alpine/3.21";
 const CONTAINER_STATIC_IP: &str = "10.76.180.60/24";
 const CONTAINER_GATEWAY: &str = "10.76.180.1";
 const WORKSPACE_MOUNT: &str = "/workspace";
+
+/// ゲストが静的IPで応答し、Incus mTLSクライアント証明書が信頼されるまで待つ（コールドブート
+/// ・ウォームRestoreの両方から共有、B4/B5参照）。`guest_wait_timeout`は呼び出し側が
+/// コールド/ウォームに応じて使い分ける（コールドは起動+firstbootを見込み長め、ウォームは
+/// 既に起動済みのはずなので短め、B8参照）。
+fn wait_for_guest_ready(
+    config: &VmSandboxConfig,
+    guest_wait_timeout: Duration,
+) -> Result<IncusClient, VmError> {
+    // ゲストが静的IPで応答するまでポーリング（`RESULTS.md`§3.7実測: 初回pingから即応答）。
+    wait_tcp_reachable(config.guest_ip, config.incus_port, guest_wait_timeout)
+        .map_err(|_| VmError::Timeout(format!("guest {} did not come up", config.guest_ip)))?;
+
+    let (client_crt, client_key) = ensure_client_cert()?;
+    let incus = IncusClient::new(config.guest_ip, config.incus_port, &client_crt, &client_key)?;
+
+    // ゴールデン像へのクライアント証明書焼き込み（`plans/TIER1A-OPEN-ISSUES.md`項目9）に
+    // より、通常はここで既に信頼済み。ただし`wait_tcp_reachable`はTCPポートの疎通
+    // （systemdのsocket activationにより、実際のincusdがfirstbootの証明書自動信頼
+    // ステップ（harness-firstboot.sh 3.5）を終える前でも即座に受理してしまう）しか見て
+    // いないため、起動直後は「ポートは開いているが信頼登録はまだ」という一時的な
+    // レースが実機で発生し得る（実機E2Eで発見）。単発チェックにはせず、猶予を持って
+    // リトライする。
+    let trust_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if incus.is_trusted().unwrap_or(false) {
+            break;
+        }
+        if Instant::now() >= trust_deadline {
+            return Err(VmError::Incus(
+                "Incus does not trust this client certificate after waiting 60s. \
+                 ゴールデン像へのクライアント証明書焼き込みが未完了か、firstbootの \
+                 信頼登録ステップが失敗している可能性があります。"
+                    .to_string(),
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    Ok(incus)
+}
+
+/// ウォームVM専用のproduction checkpoint（`WARM_CHECKPOINT_NAME`）が既に存在するかを確認する。
+fn warm_checkpoint_exists() -> Result<bool, VmError> {
+    let script = format!(
+        "$ErrorActionPreference = 'SilentlyContinue'; \
+         (Get-VMSnapshot -VMName '{name}' -Name '{checkpoint}' -ErrorAction SilentlyContinue).Name",
+        name = WARM_VM_NAME,
+        checkpoint = WARM_CHECKPOINT_NAME,
+    );
+    let stdout = run_powershell(&script)?;
+    Ok(!stdout.trim().is_empty())
+}
+
+/// ウォームVMのproduction checkpoint（`WARM_CHECKPOINT_NAME`）を用意する（B3、低速パス・
+/// 一度きり）。既に存在すればスキップする。無ければ: ウォーム専用の差分VHDXを作成
+/// → `New-VM`+`Start-VM` → コールドブート後処理と同じ疎通確認（`wait_for_guest_ready`、
+/// firstbootの完了を含む長めのタイムアウト） → `Checkpoint-VM`で「完全起動済み・IP疎通済み・
+/// Incus trusted」状態を捕捉する。途中で失敗した場合はウォームVM自体を撤収し、次回呼び出しで
+/// 最初からやり直せるようにする（中途半端なVMが`WARM_VM_NAME`として残らないようにする）。
+pub fn ensure_warm_template(config: &VmSandboxConfig) -> Result<(), VmError> {
+    if warm_checkpoint_exists()? {
+        return Ok(());
+    }
+
+    let diff_vhdx = warm_diff_vhdx_path(config);
+    std::fs::create_dir_all(&config.vm_work_dir)?;
+
+    // 前回の途中失敗（checkpoint作成前にVMだけ残った等）の後始末。存在しなければ無害に失敗する。
+    let _ = teardown_vm(WARM_VM_NAME, &diff_vhdx);
+    crate::vm_ledger::remove_session(WARM_VM_NAME);
+
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+New-VHD -Path '{diff}' -ParentPath '{golden}' -Differencing | Out-Null
+New-VM -Name '{name}' -MemoryStartupBytes 2048MB -VHDPath '{diff}' -SwitchName '{switch}' -Generation 2 | Out-Null
+Set-VMProcessor -VMName '{name}' -Count 2
+Set-VM -Name '{name}' -AutomaticStopAction TurnOff -AutomaticStartAction Nothing
+Set-VMFirmware -VMName '{name}' -SecureBootTemplate MicrosoftUEFICertificateAuthority
+Start-VM -Name '{name}'
+"#,
+        diff = diff_vhdx.display(),
+        golden = config.golden_vhdx.display(),
+        name = WARM_VM_NAME,
+        switch = config.switch_name,
+    );
+    run_powershell(&script)?;
+
+    // ウォームVMも台帳へ記録する（`warm: true`、`select_orphans`のGC対象から除外される、B7）。
+    crate::vm_ledger::record_session(WARM_VM_NAME, WARM_VM_NAME, &diff_vhdx, true);
+
+    // firstboot（SSHホスト鍵/machine-id/Incus証明書再生成）を見込み、コールドブートと
+    // 同じ長さのタイムアウトで待つ（これは一度きりのprovisioningであり、以降のセッションは
+    // このコストを払わない）。
+    if let Err(e) = wait_for_guest_ready(config, Duration::from_secs(180)) {
+        let _ = teardown_vm(WARM_VM_NAME, &diff_vhdx);
+        crate::vm_ledger::remove_session(WARM_VM_NAME);
+        return Err(e);
+    }
+
+    if let Err(e) = run_powershell(&format!(
+        "Checkpoint-VM -Name '{name}' -SnapshotName '{checkpoint}'",
+        name = WARM_VM_NAME,
+        checkpoint = WARM_CHECKPOINT_NAME,
+    )) {
+        let _ = teardown_vm(WARM_VM_NAME, &diff_vhdx);
+        crate::vm_ledger::remove_session(WARM_VM_NAME);
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// `VmSession::attach_to_guest`が構築対象とするVMの識別子一式。コールド/ウォームの両パスで
+/// 値の出どころが異なる（コールド: 新規生成したsession_id、ウォーム: 固定の`WARM_VM_NAME`）
+/// ため、呼び出し側で組み立ててから渡す（引数過多を避けるための単純な束ね、`clippy::
+/// too_many_arguments`対策）。
+struct GuestIdentity {
+    session_id: String,
+    vm_name: String,
+    diff_vhdx: PathBuf,
+}
+
+/// ウォームテンプレート自体を破棄する（B8、破損検出時）。次回`ensure_warm_template`呼び出しで
+/// 最初からやり直す（VM再作成→firstboot→checkpoint再取得）。
+fn discard_warm_template(config: &VmSandboxConfig) {
+    let diff_vhdx = warm_diff_vhdx_path(config);
+    let _ = teardown_vm(WARM_VM_NAME, &diff_vhdx);
+    crate::vm_ledger::remove_session(WARM_VM_NAME);
+}
 
 impl VmSession {
     /// VM起動→静的IP疎通待ち→Incus mTLS疎通確認→コンテナ作成/起動→ワークスペースcopy-in、
@@ -925,64 +1172,51 @@ Start-VM -Name '{name}'
         );
         run_powershell(&script)?;
 
+        // VM作成成功直後、セッション設定完了前の台帳記録（D-24、`crate::vm_ledger`）。
+        // これ以降のいかなる失敗（Incus疎通待ちタイムアウト等）でVMが孤児として残っても、
+        // 次回起動時のGC（`gc_orphan_sessions`）が本エントリを見つけて撤収できる。
+        crate::vm_ledger::record_session(&session_id, &vm_name, &diff_vhdx, false);
+
         // ここから先のいかなる失敗も、既に起動済みのVM（+差分VHDX）を孤児として残さないよう
         // teardown_vmを呼んでから返す（実機E2Eで発見: この保証が無いと、cert未検出等の
         // 一時的な失敗でVMだけが残り続け、固定静的IP（172.20.100.10）を使う設計上、次回
         // セッションが新しいVMを起動した際にIP重複が発生し、どちらのVMが応答するか不定に
         // なるという深刻な症状につながる。`plans/TIER1A-OPEN-ISSUES.md`項目9参照）。
-        let result = Self::start_after_vm_boot(
+        let result = Self::attach_to_guest(
             workspace_root,
             config,
-            session_id,
-            vm_name.clone(),
-            diff_vhdx.clone(),
+            GuestIdentity { session_id, vm_name: vm_name.clone(), diff_vhdx: diff_vhdx.clone() },
             allow_domains,
+            Duration::from_secs(180),
+            false,
         );
         if result.is_err() {
             let _ = teardown_vm(&vm_name, &diff_vhdx);
+            // `vm_name == session_id`（本関数冒頭の`let vm_name = session_id.clone();`）。
+            crate::vm_ledger::remove_session(&vm_name);
         }
         result
     }
 
-    /// [`Self::start`]の続き（VM起動成功後）。失敗時のVM後始末を[`Self::start`]側の
-    /// 単一箇所（`teardown_vm`呼び出し）に一本化するため分離した。
-    fn start_after_vm_boot(
+    /// [`Self::start`]（コールドブート）と[`Self::start_warm`]（B5、ウォームRestore後）の
+    /// 共有パス: ゲストへの疎通確認からコンテナ作成・ワークスペースcopy-inまでを行う。
+    /// VM自体の起動（`New-VM`+`Start-VM`、コールド専用）や`Restore-VMSnapshot`（ウォーム専用）
+    /// は呼び出し側の責務であり、ここでは扱わない（B4のリファクタリング分離）。
+    ///
+    /// `guest_wait_timeout`は静的IP疎通待ちのタイムアウトで、コールドブート
+    /// （`Self::start`、数十秒〜分オーダーの起動を見込む）とウォーム（`Self::start_warm`、
+    /// 既に起動済みのはずなので短い上限で足りる）で異なる値を渡す。失敗時のVM後始末は
+    /// 呼び出し側の責務（コールド: [`Self::start`]、ウォーム: [`Self::start_warm`]）。
+    fn attach_to_guest(
         workspace_root: &Path,
         config: &VmSandboxConfig,
-        session_id: String,
-        vm_name: String,
-        diff_vhdx: PathBuf,
+        identity: GuestIdentity,
         allow_domains: &[String],
+        guest_wait_timeout: Duration,
+        warm: bool,
     ) -> Result<Self, VmError> {
-        // ゲストが静的IPで応答するまでポーリング（`RESULTS.md`§3.7実測: 初回pingから即応答）。
-        wait_tcp_reachable(config.guest_ip, config.incus_port, Duration::from_secs(180))
-            .map_err(|_| VmError::Timeout(format!("guest {} did not come up", config.guest_ip)))?;
-
-        let (client_crt, client_key) = ensure_client_cert()?;
-        let incus = IncusClient::new(config.guest_ip, config.incus_port, &client_crt, &client_key)?;
-
-        // ゴールデン像へのクライアント証明書焼き込み（`plans/TIER1A-OPEN-ISSUES.md`項目9）に
-        // より、通常はここで既に信頼済み。ただし`wait_tcp_reachable`はTCPポートの疎通
-        // （systemdのsocket activationにより、実際のincusdがfirstbootの証明書自動信頼
-        // ステップ（harness-firstboot.sh 3.5）を終える前でも即座に受理してしまう）しか見て
-        // いないため、起動直後は「ポートは開いているが信頼登録はまだ」という一時的な
-        // レースが実機で発生し得る（実機E2Eで発見）。単発チェックにはせず、猶予を持って
-        // リトライする。
-        let trust_deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if incus.is_trusted().unwrap_or(false) {
-                break;
-            }
-            if Instant::now() >= trust_deadline {
-                return Err(VmError::Incus(
-                    "Incus does not trust this client certificate after waiting 60s. \
-                     ゴールデン像へのクライアント証明書焼き込みが未完了か、firstbootの \
-                     信頼登録ステップが失敗している可能性があります。"
-                        .to_string(),
-                ));
-            }
-            std::thread::sleep(Duration::from_secs(2));
-        }
+        let GuestIdentity { session_id, vm_name, diff_vhdx } = identity;
+        let incus = wait_for_guest_ready(config, guest_wait_timeout)?;
 
         let container_name = format!("harness-{session_id}");
         incus.create_container(&container_name, CONTAINER_IMAGE_ALIAS)?;
@@ -1081,9 +1315,110 @@ Start-VM -Name '{name}'
             container_name,
             incus,
             ssh_key,
+            warm,
+            warm_lock: None,
         };
         session.copy_in_workspace(workspace_root)?;
         Ok(session)
+    }
+
+    /// ウォームRestoreによる高速セッション開始（B5）。`ensure_warm_template`（B3）が
+    /// checkpointを用意済みであることが前提（呼び出し側=daemon`serve_inner`がその順序を
+    /// 保証する、B9）。`Self::start`（コールドブート）とは異なり、既存のウォームVMを
+    /// 直列化ロック（`WarmLock`）で排他しつつcheckpointへ`Restore-VMSnapshot`してから
+    /// 起動する。失敗時、コールドブートとは異なり**ウォームVM自体は削除しない**
+    /// （破損時のテンプレート再構築・コールドフォールバックは呼び出し側、B8の責務）。
+    pub fn start_warm(
+        workspace_root: &Path,
+        config: &VmSandboxConfig,
+        allow_domains: &[String],
+        guest_wait_timeout: Duration,
+    ) -> Result<Self, VmError> {
+        let lock = WarmLock::acquire(config, Duration::from_secs(300))?;
+
+        let diff_vhdx = warm_diff_vhdx_path(config);
+        // `Stop-VM`を先に置くことで、直前の`teardown`（`Stop-VM`で明示停止）・想定外の
+        // 状態（実行中のまま残った等）のどちらからでも冪等にRestoreできる。checkpointは
+        // Running状態で捕捉した（`ensure_warm_template`）ため、`Restore-VMSnapshot`自体が
+        // 実行状態への復帰を伴う。後続の`Start-VM`は「既に起動済み」を許容するため
+        // `-ErrorAction SilentlyContinue`を付ける（冪等化、状態次第でのエラーを避ける）。
+        let script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+Stop-VM -Name '{name}' -TurnOff -Force -ErrorAction SilentlyContinue
+Restore-VMSnapshot -VMName '{name}' -Name '{checkpoint}' -Confirm:$false
+Start-VM -Name '{name}' -ErrorAction SilentlyContinue
+"#,
+            name = WARM_VM_NAME,
+            checkpoint = WARM_CHECKPOINT_NAME,
+        );
+        run_powershell(&script)?;
+
+        let session_id = unique_session_id();
+        let mut session = Self::attach_to_guest(
+            workspace_root,
+            config,
+            GuestIdentity { session_id, vm_name: WARM_VM_NAME.to_string(), diff_vhdx },
+            allow_domains,
+            guest_wait_timeout,
+            true,
+        )?;
+        session.warm_lock = Some(lock);
+        Ok(session)
+    }
+
+    /// ウォームスタートの安全な入口（B8）。`ensure_warm_template`→`start_warm`を試み、
+    /// 破損（Restore失敗・疎通タイムアウト・Incus未信頼等）を検出した場合はテンプレートを
+    /// 1回だけ破棄して再provisioning→再試行し、それでも失敗すればコールドブート
+    /// （`Self::start`）へフォールバックする（`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.1）。
+    /// daemon側（`vmsandboxd::serve_inner`）はTier3+`--tier3-warm`指定時、`Self::start`の
+    /// 代わりにこちらを呼ぶ（B9）。
+    pub fn start_warm_or_fallback(
+        workspace_root: &Path,
+        config: &VmSandboxConfig,
+        allow_domains: &[String],
+    ) -> Result<Self, VmError> {
+        // ウォームRestore後は既に起動済みのはずなので、コールドブート（`Self::start`の
+        // 180秒、firstbootを見込む）より大幅に短いタイムアウトで足りる。
+        const WARM_GUEST_WAIT: Duration = Duration::from_secs(30);
+
+        if let Err(e) = ensure_warm_template(config) {
+            eprintln!(
+                "start_warm_or_fallback: failed to provision warm template, falling back to \
+                 cold boot: {e}"
+            );
+            return Self::start(workspace_root, config, allow_domains);
+        }
+
+        match Self::start_warm(workspace_root, config, allow_domains, WARM_GUEST_WAIT) {
+            Ok(session) => return Ok(session),
+            Err(e) => {
+                eprintln!(
+                    "start_warm_or_fallback: warm start failed ({e}), discarding warm template \
+                     and retrying once"
+                );
+            }
+        }
+
+        discard_warm_template(config);
+        if let Err(e) = ensure_warm_template(config) {
+            eprintln!(
+                "start_warm_or_fallback: re-provisioning warm template failed, falling back to \
+                 cold boot: {e}"
+            );
+            return Self::start(workspace_root, config, allow_domains);
+        }
+
+        match Self::start_warm(workspace_root, config, allow_domains, WARM_GUEST_WAIT) {
+            Ok(session) => Ok(session),
+            Err(e) => {
+                eprintln!(
+                    "start_warm_or_fallback: warm start failed again after re-provisioning \
+                     ({e}), falling back to cold boot"
+                );
+                Self::start(workspace_root, config, allow_domains)
+            }
+        }
     }
 
     /// ワークスペース全体をコンテナの`/workspace`へpushする（Phase 1: 素朴な全ファイル
@@ -1171,13 +1506,103 @@ Start-VM -Name '{name}'
         }
         let _ = self.incus.stop_container(&self.container_name);
         let _ = self.incus.delete_container(&self.container_name);
+
+        if self.warm {
+            // ウォームセッション: VM自体は削除せず、checkpointへRestoreして次回セッションの
+            // ために温存する（差分VHDX破棄の代わりに巻き戻すことで、当セッション中の書込みを
+            // 破棄する＝D-20「毎回捨てる」不変条件を満たす、§2.1参照）。checkpointは
+            // Running状態で捕捉した（`ensure_warm_template`）ため、Restore後は自動的に
+            // 実行状態へ戻る。次回`start_warm`の起動を軽くするため、その後`Stop-VM`で
+            // 明示的に停止しておく（次回のRestoreがどのみち実行状態へ戻すため、ここでの
+            // 停止と次回起動のタイミングは競合しない）。`self.warm_lock`は本関数を抜けて
+            // `self`がdropされる際に解放される（`WarmLock::Drop`）。
+            let script = format!(
+                r#"
+$ErrorActionPreference = 'Stop'
+Restore-VMSnapshot -VMName '{name}' -Name '{checkpoint}' -Confirm:$false
+Stop-VM -Name '{name}' -TurnOff -Force -ErrorAction SilentlyContinue
+"#,
+                name = WARM_VM_NAME,
+                checkpoint = WARM_CHECKPOINT_NAME,
+            );
+            run_powershell(&script)?;
+            return copy_out_result;
+        }
+
         teardown_vm(&self.vm_name, &self.diff_vhdx)?;
+        // VM+差分VHDXの撤収が完了した後にのみ台帳から除去する（D-24）。撤収失敗時
+        // （`?`で早期returnした場合）は台帳に残したままにし、次回起動時のGCへ委ねる。
+        crate::vm_ledger::remove_session(&self.session_id);
         copy_out_result
     }
 
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
+}
+
+/// D-24: 台帳+実機照会の両方を突き合わせ、前回セッションの孤児VM・差分VHDXを撤収する
+/// （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.6・§4）。`VmSession::start`が新規VMを
+/// 起動し固定静的IP（`config.guest_ip`）を要求する**前**にdaemon側（`serve_inner`）から
+/// 呼ぶことで、孤児VMとのIP重複を未然に防ぐ（`VmSession::start`のコメント参照）。
+///
+/// 個々の撤収に失敗しても処理は止めない（best-effort、`plans/TIER1A-OPEN-ISSUES.md`
+/// 項目9）。GC自体の失敗で`StartSession`を失敗させないよう、呼び出し側は戻り値を無視して
+/// 構わない設計（stderrへログするのみ）。
+pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) -> Vec<String> {
+    let ledger = crate::vm_ledger::load();
+
+    let existing_vm_names = match run_powershell(
+        "Get-VM -Name 'harness-tier3-*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name",
+    ) {
+        Ok(stdout) => stdout
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            eprintln!("gc_orphan_sessions: failed to list Hyper-V VMs, skipping GC this round: {e}");
+            return Vec::new();
+        }
+    };
+
+    let orphans = crate::vm_ledger::select_orphans(&ledger, current_session_id, &existing_vm_names);
+    for vm_name in &orphans {
+        let diff_vhdx = ledger
+            .entries
+            .iter()
+            .find(|e| &e.vm_name == vm_name)
+            .map(|e| PathBuf::from(&e.diff_vhdx))
+            .unwrap_or_else(|| config.vm_work_dir.join(format!("{vm_name}.diff.vhdx")));
+        if let Err(e) = teardown_vm(vm_name, &diff_vhdx) {
+            eprintln!("gc_orphan_sessions: failed to tear down orphan VM {vm_name}: {e}");
+        }
+        crate::vm_ledger::remove_session(vm_name);
+    }
+
+    // 台帳・生存VMのどちらからも参照されなくなった差分VHDXの取りこぼしを一掃する
+    // （teardown_vm自体が消し忘れた場合の保険、`vm_work_dir`直下のみを対象にする）。
+    let Ok(read_dir) = std::fs::read_dir(&config.vm_work_dir) else {
+        return orphans;
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(session_part) = file_name.strip_suffix(".diff.vhdx") else {
+            continue;
+        };
+        if session_part == current_session_id
+            || session_part == crate::vm_ledger::WARM_VM_NAME
+            || existing_vm_names.iter().any(|n| n == session_part)
+        {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    orphans
 }
 
 fn teardown_vm(vm_name: &str, diff_vhdx: &Path) -> Result<(), VmError> {
