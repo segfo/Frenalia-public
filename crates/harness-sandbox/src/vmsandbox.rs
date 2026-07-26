@@ -26,8 +26,10 @@
 //!   trust add-certificate`相当のペアリングをこのモジュールが行う。ゴールデン像への
 //!   焼き込み自体は実機作業のため別ラウンドで行う、`plans/TIER1A-OPEN-ISSUES.md`項目9参照）。
 
+use std::io::Write;
 use std::net::{IpAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -143,9 +145,191 @@ pub fn ensure_client_cert() -> Result<(PathBuf, PathBuf), VmError> {
     Ok((crt, key))
 }
 
+/// harness専用のSSH鍵ペアのホスト側保存先（`%APPDATA%\harness\config\tier3-ssh\`、
+/// `client_cert_dir`と同じ`ProjectDirs::config_dir()`配下）。
+fn ssh_keypair_dir() -> Result<PathBuf, VmError> {
+    directories::ProjectDirs::from("", "", "harness")
+        .map(|d| d.config_dir().join("tier3-ssh"))
+        .ok_or_else(|| VmError::Io("could not resolve config dir".to_string()))
+}
+
+/// Phase 2: AlmaLinux VM自体（外層ホストOS）へSNIプロキシ・nftablesを設定するための
+/// ホスト制御チャネル（`plans/DESIGN-SANDBOX-VMISOLATION.md`が将来像として挙げる
+/// hvsocketゲストエージェントの代わりに、SSH鍵認証で代替する。ユーザー承認済みの設計、
+/// `plans/TIER1A-OPEN-ISSUES.md`項目9参照）。無ければ`ssh-keygen`で生成し、あれば再利用する。
+/// 公開鍵はゴールデン像の`/root/.ssh/authorized_keys`へ焼き込み済み（実機作業）。
+pub fn ensure_ssh_keypair() -> Result<PathBuf, VmError> {
+    let dir = ssh_keypair_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let private_key = dir.join("id_ed25519");
+    let public_key = dir.join("id_ed25519.pub");
+    if private_key.exists() && public_key.exists() {
+        // 既存鍵でも毎回ACLを締め直す（後述の罠を踏んだ既存鍵が残っている場合の救済）。
+        harden_private_key_acl(&private_key)?;
+        return Ok(private_key);
+    }
+    let status = std::process::Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "harness-tier3",
+            "-f",
+        ])
+        .arg(&private_key)
+        .status()
+        .map_err(|e| VmError::Io(format!("failed to spawn ssh-keygen: {e}")))?;
+    if !status.success() {
+        return Err(VmError::Io(format!(
+            "ssh-keygen failed with status {status:?}"
+        )));
+    }
+    harden_private_key_acl(&private_key)?;
+    Ok(private_key)
+}
+
+/// 秘密鍵ファイルのWindows ACLを本人のみへ締める（Unixの`chmod 600`相当）。
+/// **実機で判明した罠**: `ssh-keygen`が作るファイルは既定で親ディレクトリのACLを継承する。
+/// このマシンでは`%APPDATA%\harness\config\`の継承ACLに他ユーザー/グループ（例:
+/// `CodexSandboxUsers`）への読み取り権限が含まれており、Windows版OpenSSHクライアント
+/// （`C:\Windows\System32\OpenSSH\ssh.exe`）はこれを検知すると
+/// `UNPROTECTED PRIVATE KEY FILE`警告を出して鍵の使用自体を拒否する（`Permission denied`）。
+/// Git BashのMSYS版`ssh.exe`はこのACLチェックをしない/緩いため、bashから手動で`ssh -i`を
+/// 叩いた検証では再現せず、原因特定に時間を要した。`icacls`で継承を切り本人のみに絞る。
+fn harden_private_key_acl(path: &Path) -> Result<(), VmError> {
+    let username = std::env::var("USERNAME")
+        .map_err(|_| VmError::Io("USERNAME environment variable not set".to_string()))?;
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r"])
+        .status()
+        .map_err(|e| VmError::Io(format!("failed to spawn icacls (inheritance): {e}")))?;
+    if !status.success() {
+        return Err(VmError::Io(format!(
+            "icacls /inheritance:r failed with status {status:?}"
+        )));
+    }
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/grant:r", &format!("{username}:F")])
+        .status()
+        .map_err(|e| VmError::Io(format!("failed to spawn icacls (grant): {e}")))?;
+    if !status.success() {
+        return Err(VmError::Io(format!(
+            "icacls /grant:r failed with status {status:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// SSHの`known_hosts`書き込み先（実ファイル）。`plans/vm-spike`のホスト鍵はセッションごとに
+/// 再生成される（firstboot）ため検証はしない（`StrictHostKeyChecking=no`）が、その書き込み先
+/// **実機で判明した罠**: 当初Unix流に`UserKnownHostsFile=NUL`（Windowsのnullデバイス）を
+/// 指定していたところ、Rustの`std::process::Command::new("ssh")`経由（＝`C:\Windows\System32\
+/// OpenSSH\ssh.exe`、ネイティブWindows版OpenSSHクライアント）では書き込みに失敗し非ゼロ終了
+/// していた（stderrには害の無い"Permanently added..."警告しか出ないため原因特定に時間を要した）。
+/// Git BashのMSYS版`ssh.exe`（bashから直接叩いた場合に解決される別バイナリ）ではこの問題が
+/// 再現しなかった——ビルドの違いにより`NUL`の扱いが異なる。実在する書き込み可能ファイルへの
+/// 実パスを指定することで解消する（`tier3-ssh`ディレクトリ配下、セッションをまたいで蓄積
+/// しても実害は無い——検証自体をスキップしているため単なるスクラッチファイル）。
+fn known_hosts_file() -> Result<PathBuf, VmError> {
+    let dir = ssh_keypair_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join("known_hosts"))
+}
+
+/// AlmaLinux VM自体（`root`）へSSH鍵認証でコマンドを実行する（`ssh.exe`、Windows 10 1809+
+/// 標準搭載のOpenSSHクライアントをshell-out。`run_powershell`と同じ既存パターン、`russh`等の
+/// 新規重量依存は追加しない）。ホスト鍵はセッションごとに再生成される（firstboot）ため
+/// `StrictHostKeyChecking=no`で検証をスキップする（このVMはharnessが固定管理下ロケーションに
+/// 用意し毎セッション使い捨てる前提、D-20/D-21）。
+fn ssh_exec(
+    host: IpAddr,
+    key_path: &Path,
+    cmd: &str,
+    timeout: Duration,
+) -> Result<(String, String, i32), VmError> {
+    let known_hosts = known_hosts_file()?;
+    let output = std::process::Command::new("ssh")
+        .args([
+            "-i",
+            &key_path.to_string_lossy(),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+        ])
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .args([
+            "-o",
+            &format!("ConnectTimeout={}", timeout.as_secs().max(1)),
+            &format!("root@{host}"),
+            cmd,
+        ])
+        .output()
+        .map_err(|e| VmError::Io(format!("failed to spawn ssh: {e}")))?;
+    Ok((
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    ))
+}
+
+/// `ssh_exec`の非ゼロ終了を`VmError`へ畳み込む版（設定投入等、成功必須の呼び出し向け）。
+fn ssh_exec_checked(host: IpAddr, key_path: &Path, cmd: &str, timeout: Duration) -> Result<String, VmError> {
+    let (stdout, stderr, code) = ssh_exec(host, key_path, cmd, timeout)?;
+    if code != 0 {
+        return Err(VmError::Io(format!(
+            "ssh command failed (exit={code}): {cmd}\nstdout={stdout}\nstderr={stderr}"
+        )));
+    }
+    Ok(stdout)
+}
+
+/// AlmaLinux VM自体（`root`）へファイルを配置する（`ssh ... 'cat > path'`にstdin経由で
+/// 内容を流し込む。Incus内のコンテナではなくVMのホストOS側へ書く点が`IncusClient::push_file`
+/// との違い）。
+fn ssh_push_file(host: IpAddr, key_path: &Path, contents: &[u8], remote_path: &str) -> Result<(), VmError> {
+    let known_hosts = known_hosts_file()?;
+    let mut child = std::process::Command::new("ssh")
+        .args([
+            "-i",
+            &key_path.to_string_lossy(),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+        ])
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .args([&format!("root@{host}"), &format!("cat > {remote_path}")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| VmError::Io(format!("failed to spawn ssh: {e}")))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| VmError::Io("ssh stdin unavailable".to_string()))?
+        .write_all(contents)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(VmError::Io(format!(
+            "ssh_push_file to {remote_path} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
 /// Incus REST APIのmTLSクライアント（`plans/vm-spike/incus_common.py`のRust移植）。
 pub struct IncusClient {
     base_url: String,
+    host_ip: IpAddr,
     http: reqwest::blocking::Client,
 }
 
@@ -171,8 +355,13 @@ impl IncusClient {
             .map_err(|e| VmError::Incus(format!("failed to build http client: {e}")))?;
         Ok(Self {
             base_url: format!("https://{host}:{port}"),
+            host_ip: host,
             http,
         })
+    }
+
+    pub fn host_ip(&self) -> IpAddr {
+        self.host_ip
     }
 
     fn request(
@@ -410,6 +599,96 @@ impl IncusClient {
         Ok(())
     }
 
+    /// `POST /1.0/network-acls`: 「tcp/443への直接egressを宛先指定なしで許可、それ以外は
+    /// コンテナのdevice側でdrop」という許可リストを1本作る（`plans/vm-spike/RESULTS.md`
+    /// §3.8で実機実証済みの構成。既存の同名ACLがあれば削除してから作り直す）。
+    /// **実機で判明した罠**（`RESULTS.md`§3.8で既知の限界として記録済みだったもの）: tcp/443
+    /// のみ許可すると、コンテナ内のDNS解決（UDP/TCP 53）自体がACLでブロックされ、
+    /// `wget https://example.com/`のような普通の呼び出しが名前解決の時点で失敗する
+    /// （`bad address`）。SNIベースの許可/拒否は実際の443接続でのみ強制されるため、DNS問い合わせ
+    /// 自体は宛先を問わず許可しても実害は小さい（漏れる情報は問い合わせたドメイン名のみで、
+    /// 実際のデータ疎通は引き続きSNIプロキシが強制する）。
+    pub fn create_network_acl(&self, name: &str) -> Result<(), VmError> {
+        let _ = self.request(
+            reqwest::Method::DELETE,
+            &format!("/1.0/network-acls/{name}"),
+            None,
+        )?;
+        let body = serde_json::json!({
+            "name": name,
+            "description": "harness Tier3 egress allowlist (SNI proxy transparent redirect)",
+            "egress": [
+                {"action": "allow", "protocol": "tcp", "destination_port": "443", "state": "enabled"},
+                {"action": "allow", "protocol": "udp", "destination_port": "53", "state": "enabled"},
+                {"action": "allow", "protocol": "tcp", "destination_port": "53", "state": "enabled"},
+            ],
+            "ingress": [],
+        });
+        let (status, value) =
+            self.request(reqwest::Method::POST, "/1.0/network-acls", Some(body))?;
+        if status >= 400 {
+            return Err(VmError::Incus(format!(
+                "create_network_acl failed: status={status} body={value}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// コンテナの`eth0`デバイスへACLを適用し、既定egressをdropにする
+    /// （`security.acls.default.egress.action=drop`、`RESULTS.md`§3.8）。
+    pub fn attach_acl_to_container(&self, container_name: &str, acl_name: &str) -> Result<(), VmError> {
+        let (status, value) = self.request(
+            reqwest::Method::GET,
+            &format!("/1.0/instances/{container_name}"),
+            None,
+        )?;
+        if status >= 400 {
+            return Err(VmError::Incus(format!(
+                "attach_acl_to_container: failed to fetch instance: status={status} body={value}"
+            )));
+        }
+        let inst = value
+            .get("metadata")
+            .ok_or_else(|| VmError::Incus("instance response has no metadata".to_string()))?;
+        let mut devices = inst
+            .get("expanded_devices")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        devices["eth0"] = serde_json::json!({
+            "name": "eth0",
+            "network": "incusbr0",
+            "type": "nic",
+            "security.acls": acl_name,
+            "security.acls.default.egress.action": "drop",
+            "security.acls.default.ingress.action": "allow",
+        });
+        let config = inst.get("config").cloned().unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let body = serde_json::json!({ "devices": devices, "config": config });
+        let (status, value) = self.request(
+            reqwest::Method::PUT,
+            &format!("/1.0/instances/{container_name}"),
+            Some(body),
+        )?;
+        if status == 202 {
+            self.wait_operation(
+                &format!(
+                    "/1.0/operations/{}",
+                    value
+                        .get("metadata")
+                        .and_then(|m| m.get("id"))
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                ),
+                Duration::from_secs(30),
+            )?;
+        } else if status >= 400 {
+            return Err(VmError::Incus(format!(
+                "attach_acl_to_container failed: status={status} body={value}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn pull_file(&self, name: &str, remote_path: &str) -> Result<Vec<u8>, VmError> {
         let url = format!(
             "{}/1.0/instances/{name}/files?path={}",
@@ -443,6 +722,154 @@ fn urlencoding_path(path: &str) -> String {
         .collect()
 }
 
+/// Incusブリッジ`incusbr0`自身のIP（SNI prereadプロキシのlisten先、`plans/vm-spike/
+/// RESULTS.md`§3.2/§3.8で確立した値。AlmaLinux golden像のIncusネットワーク既定設定に依存する
+/// ため固定値として扱う）。
+const INCUS_BRIDGE_IP: &str = "10.76.180.1";
+/// SNI prereadプロキシのlistenポート（Incus自身のリモートAPI`8443`と衝突しない値、
+/// `RESULTS.md`§3.2の踏んだ落とし穴参照）。
+const SNI_PROXY_PORT: u16 = 8444;
+const SNI_PROXY_CONF_PATH: &str = "/root/harness-sni-proxy.conf";
+const SNI_PROXY_PID_PATH: &str = "/run/harness-sni-proxy.pid";
+const SNI_AUDIT_LOG_PATH: &str = "/var/log/nginx/harness-sni-audit.log";
+const NFTABLES_TABLE: &str = "harness_tier3";
+
+/// SNI prereadプロキシのnginx設定を、許可ドメインごとに動的生成する
+/// （`plans/vm-spike/RESULTS.md`§3.8で実機実証済みの構成をそのまま踏襲、監査ログ付き）。
+fn build_sni_proxy_conf(allow_domains: &[String]) -> String {
+    let map_lines: String = allow_domains
+        .iter()
+        .map(|d| format!("        {d}     \"{d}:443\";\n"))
+        .collect();
+    let decision_lines: String = allow_domains
+        .iter()
+        .map(|d| format!("        {d}     \"ALLOW\";\n"))
+        .collect();
+    format!(
+        r#"load_module /usr/lib64/nginx/modules/ngx_stream_module.so;
+worker_processes auto;
+error_log /var/log/nginx/harness-sni-proxy-error.log warn;
+events {{ worker_connections 1024; }}
+stream {{
+    resolver 1.1.1.1 valid=60s;
+
+    log_format sniaudit '$time_iso8601 client=$remote_addr sni="$ssl_preread_server_name" '
+                         'decision=$sni_decision upstream=$upstream_addr '
+                         'bytes_sent=$bytes_sent bytes_received=$bytes_received '
+                         'duration=$session_time status=$status';
+    access_log {SNI_AUDIT_LOG_PATH} sniaudit;
+
+    map $ssl_preread_server_name $sni_upstream {{
+{map_lines}        default              "";
+    }}
+    map $ssl_preread_server_name $sni_decision {{
+{decision_lines}        default              "DENY";
+    }}
+
+    server {{
+        listen {INCUS_BRIDGE_IP}:{SNI_PROXY_PORT};
+        ssl_preread on;
+        proxy_pass $sni_upstream;
+        proxy_connect_timeout 5s;
+        proxy_timeout 30s;
+    }}
+}}
+"#
+    )
+}
+
+/// SNI prereadプロキシ + nftables DNAT（透過リダイレクト）+ コンテナ側Incus ACLを、
+/// AlmaLinux VM自体へSSH経由で構成する（`allow_domains`が非空の場合のみ呼ぶ、
+/// `plans/vm-spike/RESULTS.md`§3.2/§3.8で実機実証済みの構成のRust化）。
+fn setup_egress_allowlist(
+    guest_ip: IpAddr,
+    ssh_key: &Path,
+    incus: &IncusClient,
+    container_name: &str,
+    allow_domains: &[String],
+) -> Result<(), VmError> {
+    // 1. nginx SNI prereadプロキシを配置・起動。
+    let conf = build_sni_proxy_conf(allow_domains);
+    ssh_push_file(guest_ip, ssh_key, conf.as_bytes(), SNI_PROXY_CONF_PATH)?;
+    ssh_exec_checked(
+        guest_ip,
+        ssh_key,
+        "mkdir -p /var/log/nginx",
+        Duration::from_secs(10),
+    )?;
+    ssh_exec_checked(
+        guest_ip,
+        ssh_key,
+        &format!("nginx -c {SNI_PROXY_CONF_PATH} -g 'pid {SNI_PROXY_PID_PATH};'"),
+        Duration::from_secs(10),
+    )?;
+
+    // 2. nftables DNAT（コンテナ発の443宛先を透過的にプロキシへリダイレクト）。
+    //    既存テーブルがあれば削除してから作り直す（同一VM内での再構成に備える、Phase 2では
+    //    セッションごとに新しいVMなので通常は不要だが、べき等性のため）。
+    let _ = ssh_exec(
+        guest_ip,
+        ssh_key,
+        &format!("nft delete table ip {NFTABLES_TABLE}"),
+        Duration::from_secs(10),
+    );
+    ssh_exec_checked(
+        guest_ip,
+        ssh_key,
+        &format!("nft add table ip {NFTABLES_TABLE}"),
+        Duration::from_secs(10),
+    )?;
+    ssh_exec_checked(
+        guest_ip,
+        ssh_key,
+        &format!(
+            "nft 'add chain ip {NFTABLES_TABLE} prerouting {{ type nat hook prerouting priority dstnat ; }}'"
+        ),
+        Duration::from_secs(10),
+    )?;
+    ssh_exec_checked(
+        guest_ip,
+        ssh_key,
+        &format!(
+            "nft add rule ip {NFTABLES_TABLE} prerouting iifname \"incusbr0\" tcp dport 443 redirect to :{SNI_PROXY_PORT}"
+        ),
+        Duration::from_secs(10),
+    )?;
+
+    // 3. コンテナ側Incus ACL: tcp/443への直接egressを宛先指定なしで許可するだけでよい
+    //    （プロキシの存在をコンテナに一切意識させない、`RESULTS.md`§3.8）。
+    let acl_name = format!("{container_name}-egress");
+    incus.create_network_acl(&acl_name)?;
+    incus.attach_acl_to_container(container_name, &acl_name)?;
+
+    Ok(())
+}
+
+/// セッション終了時、SNIプロキシの監査ログをホスト側ワークスペースへ書き出す
+/// （VMはteardownで消えるため、これが唯一のフォレンジック記録になる。ユーザー要望
+/// 「通信の監査」への対応、`plans/vm-spike/RESULTS.md`§3.8参照）。
+fn fetch_and_persist_audit_log(
+    guest_ip: IpAddr,
+    ssh_key: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+) -> Result<(), VmError> {
+    let (stdout, _stderr, code) = ssh_exec(
+        guest_ip,
+        ssh_key,
+        &format!("cat {SNI_AUDIT_LOG_PATH} 2>/dev/null"),
+        Duration::from_secs(15),
+    )?;
+    if code != 0 || stdout.is_empty() {
+        return Ok(()); // ログが無い（一度も通信が発生しなかった等）場合は何もしない。
+    }
+    let audit_dir = workspace_root.join(".harness").join("sandbox");
+    std::fs::create_dir_all(&audit_dir)?;
+    let audit_path = audit_dir.join(format!("tier3-net-audit-{session_id}.log"));
+    std::fs::write(audit_path, stdout)?;
+    Ok(())
+}
+
 /// 稼働中のTier3セッション（VM + コンテナ）を表す。`VmSandboxHandle`（`crate::vmsandboxd`）が
 /// デーモンプロセス内で保持し続ける。
 pub struct VmSession {
@@ -451,6 +878,9 @@ pub struct VmSession {
     diff_vhdx: PathBuf,
     container_name: String,
     incus: IncusClient,
+    /// egress許可リスト（SNIプロキシ+nftables DNAT）を構成した場合のみ`Some`（`allow_domains`
+    /// が非空だった場合）。teardown時にこれを見て監査ログ取得の要否を判定する。
+    ssh_key: Option<PathBuf>,
 }
 
 const CONTAINER_IMAGE_ALIAS: &str = "alpine/3.21";
@@ -462,7 +892,11 @@ impl VmSession {
     /// VM起動→静的IP疎通待ち→Incus mTLS疎通確認→コンテナ作成/起動→ワークスペースcopy-in、
     /// までを一気に行う（`plans/vm-spike/RESULTS.md`§3.7で確立した「Default Switch中継不要」
     /// 経路を前提とする）。
-    pub fn start(workspace_root: &Path, config: &VmSandboxConfig) -> Result<Self, VmError> {
+    pub fn start(
+        workspace_root: &Path,
+        config: &VmSandboxConfig,
+        allow_domains: &[String],
+    ) -> Result<Self, VmError> {
         let session_id = unique_session_id();
         let vm_name = session_id.clone();
         std::fs::create_dir_all(&config.vm_work_dir)?;
@@ -496,6 +930,7 @@ Start-VM -Name '{name}'
             session_id,
             vm_name.clone(),
             diff_vhdx.clone(),
+            allow_domains,
         );
         if result.is_err() {
             let _ = teardown_vm(&vm_name, &diff_vhdx);
@@ -511,6 +946,7 @@ Start-VM -Name '{name}'
         session_id: String,
         vm_name: String,
         diff_vhdx: PathBuf,
+        allow_domains: &[String],
     ) -> Result<Self, VmError> {
         // ゲストが静的IPで応答するまでポーリング（`RESULTS.md`§3.7実測: 初回pingから即応答）。
         wait_tcp_reachable(config.guest_ip, config.incus_port, Duration::from_secs(180))
@@ -545,20 +981,92 @@ Start-VM -Name '{name}'
         let container_name = format!("harness-{session_id}");
         incus.create_container(&container_name, CONTAINER_IMAGE_ALIAS)?;
         incus.start_container(&container_name)?;
+
+        // **実機で判明した罠**: `start_container`はIncus APIへstart操作を投げた後
+        // 固定500msスリープするだけで、コンテナ内のeth0（veth）が実際に出現するのを待たない。
+        // 直後に`ip addr add ... dev eth0`を撃つと稀に"Cannot find device"で失敗するが、
+        // 後続コマンドを`;`区切りにしていたため`exec`全体のexit codeは最後の`mkdir -p`の
+        // 結果になってしまい、失敗が一切表面化しないまま`/etc/resolv.conf`だけは書かれる
+        // （＝DNSサーバは設定されるがIPv4アドレス自体が無く、`wget`が"bad address"で
+        // 静かに失敗する）という形で発覚した。eth0の出現をポーリングで待ってから設定する。
+        let mut eth0_ready = false;
+        for _ in 0..30 {
+            let (stdout, _stderr, code) = incus.exec(
+                &container_name,
+                &["sh", "-c", "ip link show eth0"],
+                "/",
+                &[],
+                Duration::from_secs(5),
+            )?;
+            if code == Some(0) && stdout.contains("eth0") {
+                eth0_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if !eth0_ready {
+            return Err(VmError::Incus(format!(
+                "container {container_name}: eth0 did not appear within timeout"
+            )));
+        }
+
         // DHCP不通の既知制約（`RESULTS.md`§段階3）への回避策: 静的IPを直接設定する。
-        incus.exec(
+        // **実機で判明した罠(1)**: `ip addr add`で後乗せするだけでは不十分。Alpineの
+        // `/etc/network/interfaces`は既定で`iface eth0 inet dhcp`のままであり、ifupdown-ngが
+        // 起動したバックグラウンドの`udhcpc -b`がDHCPサーバ不在のまま再試行ループを続けている。
+        // このリトライサイクルが手動追加したアドレスをフラッシュしてしまうため、数秒〜十数秒後
+        // （LLMのターン往復程度の時間）に静的IPが消え、`wget: bad address`として現れていた
+        // （`ip addr add`直後の短時間チェックでは再現しなかったため発見が遅れた）。
+        // `ifdown`/`ifup`でifupdown-ng自体にstatic管理させることで、udhcpcのプロセスごと
+        // 止めて再発を防ぐ。**実機で判明した罠(1b)**: `ifdown eth0`直後に間を置かず`ifup eth0`を
+        // 実行すると、`ifdown`が止めたはずの旧`udhcpc`プロセスがロックファイルをまだ解放しきって
+        // おらず`ifup: could not acquire exclusive lock for eth0: Resource temporarily unavailable`
+        // で失敗することがある（プロセス終了が非同期のため）。`pkill`で明示的に刈り取ってから
+        // 短いリトライループで`ifup`する。
+        // **実機で判明した罠(2)**: 静的IP割当はNetworkManager/dhclientを経由しないため
+        // `/etc/resolv.conf`が空のままになり、コンテナ内のDNS解決自体が失敗する
+        // （`nslookup`が既定の`127.0.0.1`へ問い合わせて`Connection refused`になる）。
+        // ACL（`create_network_acl`）でUDP/TCP 53のegressを許可しても、そもそも問い合わせ先の
+        // リゾルバが設定されていなければ無意味なため、ここで明示的に設定する
+        // （nginx SNIプロキシの`resolver`ディレクティブと同じ`1.1.1.1`に揃える）。
+        // 最終判定は`ifup`自身の終了コードではなく`ip -4 addr show eth0`にinetが実在するかで
+        // 行う（`&&`連結の最後の条件が全体のexit codeを決めるため、確実に反映される）。
+        let interfaces_conf = format!(
+            "auto eth0\niface eth0 inet static\n    address {CONTAINER_STATIC_IP}\n    gateway {CONTAINER_GATEWAY}\n"
+        );
+        let (_stdout, stderr, code) = incus.exec(
             &container_name,
             &[
                 "sh",
                 "-c",
                 &format!(
-                    "ip addr add {CONTAINER_STATIC_IP} dev eth0; ip route add default via {CONTAINER_GATEWAY}; mkdir -p {WORKSPACE_MOUNT}"
+                    "printf '%s' '{interfaces_conf}' > /etc/network/interfaces && \
+                     ifdown eth0 >/dev/null 2>&1; pkill -x udhcpc >/dev/null 2>&1; sleep 1; \
+                     ok=0; i=0; while [ $i -lt 10 ]; do ifup eth0 >/dev/null 2>&1 && {{ ok=1; break; }}; i=$((i+1)); sleep 1; done; \
+                     ip -4 addr show eth0 | grep -q 'inet ' && \
+                     echo 'nameserver 1.1.1.1' > /etc/resolv.conf && mkdir -p {WORKSPACE_MOUNT}"
                 ),
             ],
             "/",
             &[],
-            Duration::from_secs(15),
+            Duration::from_secs(30),
         )?;
+        if code != Some(0) {
+            return Err(VmError::Incus(format!(
+                "container {container_name}: static IP/DNS setup failed (exit={code:?}): {stderr}"
+            )));
+        }
+
+        // egress許可リスト（SNIプロキシ+nftables DNAT+コンテナACL）は`allow_domains`が
+        // 非空の場合のみ構成する。既定（省略時）はPhase 1と同じ無制限egressのまま
+        // （既存の`--net-allow-domain`未指定時の挙動を変えない、D-02と同じ「オプトイン」思想）。
+        let ssh_key = if allow_domains.is_empty() {
+            None
+        } else {
+            let key = ensure_ssh_keypair()?;
+            setup_egress_allowlist(config.guest_ip, &key, &incus, &container_name, allow_domains)?;
+            Some(key)
+        };
 
         let session = Self {
             session_id,
@@ -566,6 +1074,7 @@ Start-VM -Name '{name}'
             diff_vhdx,
             container_name,
             incus,
+            ssh_key,
         };
         session.copy_in_workspace(workspace_root)?;
         Ok(session)
@@ -644,6 +1153,16 @@ Start-VM -Name '{name}'
 
     pub fn teardown(self, workspace_root: &Path) -> Result<(), VmError> {
         let copy_out_result = self.copy_out_workspace(workspace_root);
+        // egress許可リストを構成していた場合のみ、VMが消える前に監査ログを回収する
+        // （ユーザー要望「通信の監査」対応、失敗してもteardown自体は止めない）。
+        if let Some(ssh_key) = &self.ssh_key {
+            let _ = fetch_and_persist_audit_log(
+                self.incus.host_ip(),
+                ssh_key,
+                workspace_root,
+                &self.session_id,
+            );
+        }
         let _ = self.incus.stop_container(&self.container_name);
         let _ = self.incus.delete_container(&self.container_name);
         teardown_vm(&self.vm_name, &self.diff_vhdx)?;
@@ -719,5 +1238,25 @@ mod tests {
     #[test]
     fn urlencoding_path_escapes_space() {
         assert_eq!(urlencoding_path("/workspace/a b.txt"), "/workspace/a%20b.txt");
+    }
+
+    #[test]
+    fn build_sni_proxy_conf_maps_allowed_domains_to_allow() {
+        let conf = build_sni_proxy_conf(&["example.com".to_string(), "api.example.org".to_string()]);
+        assert!(conf.contains("example.com     \"example.com:443\";"));
+        assert!(conf.contains("api.example.org     \"api.example.org:443\";"));
+        assert!(conf.contains("example.com     \"ALLOW\";"));
+        assert!(conf.contains("default              \"\";"));
+        assert!(conf.contains("default              \"DENY\";"));
+        assert!(conf.contains(&format!("listen {INCUS_BRIDGE_IP}:{SNI_PROXY_PORT};")));
+        assert!(conf.contains(&format!("access_log {SNI_AUDIT_LOG_PATH} sniaudit;")));
+    }
+
+    #[test]
+    fn build_sni_proxy_conf_with_no_domains_only_has_defaults() {
+        let conf = build_sni_proxy_conf(&[]);
+        assert!(conf.contains("default              \"\";"));
+        assert!(conf.contains("default              \"DENY\";"));
+        assert!(!conf.contains("ALLOW"));
     }
 }

@@ -1817,7 +1817,10 @@ async fn main() -> ExitCode {
     #[cfg(windows)]
     let vm_sandbox_handle: Option<std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>> =
         if shell_tier.tier == harness_core::ShellTier::Tier3 {
-            match harness_sandbox::vmsandboxd::VmSandboxHandle::start(&workspace_root) {
+            match harness_sandbox::vmsandboxd::VmSandboxHandle::start(
+                &workspace_root,
+                &net_proxy.allow_domains,
+            ) {
                 Ok(handle) => Some(std::sync::Arc::new(handle)),
                 Err(e) => {
                     eprintln!(

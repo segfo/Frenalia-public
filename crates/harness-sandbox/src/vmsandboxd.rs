@@ -63,6 +63,10 @@ use crate::vmsandbox::{VmSandboxConfig, VmSession};
 pub enum VmRequest {
     StartSession {
         workspace_root: String,
+        /// egress許可リスト（SNIプロキシ+nftables DNAT、Phase 2）の対象ドメイン。空なら
+        /// Phase 1と同じ無制限egressのまま（`--net-allow-domain`未指定時の既定挙動、
+        /// `plans/vm-spike/RESULTS.md`§3.8）。
+        allow_domains: Vec<String>,
     },
     Exec {
         cmd: String,
@@ -435,6 +439,7 @@ fn connect_and_start_session(
     pipe: HANDLE,
     daemon_process: Option<HANDLE>,
     workspace_root_str: String,
+    allow_domains: Vec<String>,
 ) -> Result<VmSandboxHandle, VmSandboxIpcError> {
     let workspace_root = PathBuf::from(&workspace_root_str);
     let connect_result = connect_with_timeout(pipe, CONNECT_TIMEOUT).map_err(|e| {
@@ -455,6 +460,7 @@ fn connect_and_start_session(
 
     let req = VmRequest::StartSession {
         workspace_root: workspace_root_str,
+        allow_domains,
     };
     let start_result = (|| -> Result<(), VmSandboxIpcError> {
         let bytes = serde_json::to_vec(&req)
@@ -494,7 +500,12 @@ fn connect_and_start_session(
 
 impl VmSandboxHandle {
     /// daemonを昇格起動し、`StartSession`を送って応答を待つ（親側、非管理者本体から呼ぶ）。
-    pub fn start(workspace_root: &std::path::Path) -> Result<Self, VmSandboxIpcError> {
+    /// `allow_domains`は既存の`net_proxy.allow_domains`（`--net-allow-domain`+
+    /// `.harness/settings.json`統合済み、WFPが既に使っているのと同じ値）をそのまま渡す。
+    pub fn start(
+        workspace_root: &std::path::Path,
+        allow_domains: &[String],
+    ) -> Result<Self, VmSandboxIpcError> {
         let prepared = prepare_pipe()?;
         let pipe_name = prepared.name().to_string();
         let pipe = prepared.into_handle();
@@ -514,6 +525,7 @@ impl VmSandboxHandle {
             pipe,
             Some(daemon_process),
             workspace_root.to_string_lossy().to_string(),
+            allow_domains.to_vec(),
         )
     }
 
@@ -523,8 +535,14 @@ impl VmSandboxHandle {
     pub fn connect_after_chain_launch(
         pipe: HANDLE,
         workspace_root: &std::path::Path,
+        allow_domains: &[String],
     ) -> Result<Self, VmSandboxIpcError> {
-        connect_and_start_session(pipe, None, workspace_root.to_string_lossy().to_string())
+        connect_and_start_session(
+            pipe,
+            None,
+            workspace_root.to_string_lossy().to_string(),
+            allow_domains.to_vec(),
+        )
     }
 
     /// `harness_core::VmShellExecutor::exec`（`ToolCtx.vm_sandbox`経由の呼び出し）専用の内部関数。
@@ -685,8 +703,8 @@ pub fn serve(pipe_name: &str) -> Result<(), VmSandboxIpcError> {
 fn serve_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
     // 1件目: StartSession を待つ。
     let request_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
-    let workspace_root = match serde_json::from_slice::<VmRequest>(&request_bytes) {
-        Ok(VmRequest::StartSession { workspace_root }) => workspace_root,
+    let (workspace_root, allow_domains) = match serde_json::from_slice::<VmRequest>(&request_bytes) {
+        Ok(VmRequest::StartSession { workspace_root, allow_domains }) => (workspace_root, allow_domains),
         Ok(_) => {
             let resp = VmResponse::Err(
                 "expected StartSession as the first message".to_string(),
@@ -703,7 +721,7 @@ fn serve_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
     let workspace_root = PathBuf::from(workspace_root);
 
     let config = VmSandboxConfig::default();
-    let session = match VmSession::start(&workspace_root, &config) {
+    let session = match VmSession::start(&workspace_root, &config, &allow_domains) {
         Ok(s) => s,
         Err(e) => {
             let resp = VmResponse::Err(format!("VM session start failed: {e}"));
@@ -789,12 +807,30 @@ mod tests {
     fn start_session_request_roundtrips_through_json() {
         let req = VmRequest::StartSession {
             workspace_root: r"C:\work\project".to_string(),
+            allow_domains: vec!["example.com".to_string()],
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: VmRequest = serde_json::from_slice(&bytes).unwrap();
         match decoded {
-            VmRequest::StartSession { workspace_root } => {
+            VmRequest::StartSession { workspace_root, allow_domains } => {
                 assert_eq!(workspace_root, r"C:\work\project");
+                assert_eq!(allow_domains, vec!["example.com".to_string()]);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_session_request_with_empty_allow_domains_roundtrips() {
+        let req = VmRequest::StartSession {
+            workspace_root: r"C:\work\project".to_string(),
+            allow_domains: vec![],
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let decoded: VmRequest = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            VmRequest::StartSession { allow_domains, .. } => {
+                assert!(allow_domains.is_empty());
             }
             other => panic!("unexpected variant: {other:?}"),
         }
