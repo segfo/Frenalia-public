@@ -19,6 +19,10 @@ which = "7"
 # Tier3（`vmsandbox`）のIncus mTLSクライアント用。デーモンプロセス内で同期IPC呼び出しの
 # 一部として使うため`blocking`を使う（`vmsandboxd`自体が非async、`netfilterd`と同じ設計）。
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
+# Tier3（`smb_share`）のセッション使い捨てSMBアカウントのパスワード生成用（OSの
+# CSPRNGを使う`rand::rngs::OsRng`経由、`unique_session_id`のPID+タイムスタンプとは
+# 異なり実際に秘密として使うため暗号論的乱数が必要）。
+rand = "0.9"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",

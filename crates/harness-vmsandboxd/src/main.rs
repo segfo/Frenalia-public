@@ -1,29 +1,76 @@
 //! harness-vmsandboxd: Tier3（Hyper-V外層VM + Incusコンテナ）用の常駐デーモン
 //! （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.2参照）。
 //!
-//! `harness.exe`が`runas`で昇格起動する別バイナリ。引数に受け取った named pipe名へclientとして
-//! 接続し、`StartSession`でVM+コンテナを起動したら**常駐を続け**、`run_shell`呼び出しのたびに
-//! 送られる`Exec`を反復処理する。`Teardown`（または親のクラッシュによるパイプ切断）を受けて
-//! VM+コンテナ+差分VHDXを撤収してから終了する。`harness-netfilterd`と同じ理由で常駐する
-//! （Hyper-V VMは起動元プロセスと独立に生存し続けるため、能動的な撤収が唯一の後始末経路）。
+//! `harness.exe`が`runas`で昇格起動する別バイナリ。S-2でパイプの向きが反転したため、この
+//! daemon自身が固定named pipe名（[`harness_sandbox::vmsandboxd::serve_resident`]内で定義）の
+//! サーバとなり、`StartSession`でVM+コンテナを起動したら**常駐を続け**、`run_shell`呼び出しの
+//! たびに送られる`Exec`を反復処理する。`Teardown`（または親のクラッシュによるパイプ切断）を
+//! 受けても、daemonプロセス自体は終了せず次のセッションの接続を待ち続ける
+//! （`serve_resident`のdoc参照）。`harness-netfilterd`と同じ理由で常駐する（Hyper-V VMは
+//! 起動元プロセスと独立に生存し続けるため、能動的な撤収が唯一の後始末経路）。
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
-    let pipe_name = match std::env::args().nth(1) {
+    let mut args = std::env::args().skip(1);
+    let pipe_name = match args.next() {
         Some(p) => p,
         None => {
-            eprintln!("usage: harness-vmsandboxd.exe <named-pipe-name> [--gc-only]");
+            eprintln!(
+                "usage: harness-vmsandboxd.exe <named-pipe-name> --owner-sid <SID> --owner-exe \
+                 <path>\n       harness-vmsandboxd.exe <named-pipe-name> --gc-only"
+            );
             return std::process::ExitCode::FAILURE;
         }
     };
-    // `--gc-only`（`harness tier3 gc`、A9）: 通常のセッション常駐ループ（`serve`）ではなく、
-    // 1件の`Gc`リクエストだけを処理して即終了する（`vmsandboxd::serve_gc`参照）。
-    let gc_only = std::env::args().nth(2).as_deref() == Some("--gc-only");
-    let result = if gc_only {
-        harness_sandbox::vmsandboxd::serve_gc(&pipe_name)
-    } else {
-        harness_sandbox::vmsandboxd::serve(&pipe_name)
+    let rest: Vec<String> = args.collect();
+
+    // `--gc-only`（`harness tier3 gc`、A9）: 通常のセッション常駐ループ（`serve_resident`）
+    // ではなく、1件の`Gc`リクエストだけを処理して即終了する（`vmsandboxd::serve_gc`参照）。
+    // この経路は使い捨てパイプ名のままなのでS-2の対象外（`--owner-sid`/`--owner-exe`は不要）。
+    if rest.first().map(String::as_str) == Some("--gc-only") {
+        return run_result(harness_sandbox::vmsandboxd::serve_gc(&pipe_name));
+    }
+
+    let (owner_sid, owner_exe) = match parse_owner_args(&rest) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("harness-vmsandboxd: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
+    run_result(harness_sandbox::vmsandboxd::serve_resident(&owner_sid, &owner_exe))
+}
+
+/// `--owner-sid <SID> --owner-exe <path>`をコマンドライン残余引数から取り出す（S-2）。
+/// 起動元（親、非昇格harness本体）を明示的に伝えるための引数で、daemon自身のトークンSIDや
+/// `current_exe()`は使わない（`serve_resident`のdoc参照）。
+#[cfg(windows)]
+fn parse_owner_args(rest: &[String]) -> Result<(String, std::path::PathBuf), String> {
+    let mut owner_sid = None;
+    let mut owner_exe = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--owner-sid" => {
+                owner_sid = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--owner-exe" => {
+                owner_exe = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    let owner_sid = owner_sid.ok_or_else(|| "missing --owner-sid".to_string())?;
+    let owner_exe = owner_exe.ok_or_else(|| "missing --owner-exe".to_string())?;
+    Ok((owner_sid, std::path::PathBuf::from(owner_exe)))
+}
+
+#[cfg(windows)]
+fn run_result(
+    result: Result<(), harness_sandbox::vmsandboxd::VmSandboxIpcError>,
+) -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {

@@ -25,32 +25,39 @@
 //! 独立に生存し続けるため、この能動的クリーンアップが唯一の後始末経路——netfilterdの
 //! BFE自動削除に相当する保険が無い、`DESIGN-SANDBOX-VMISOLATION.md` §2.2参照）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
-    HLOCAL, LocalFree, WAIT_OBJECT_0,
+    CloseHandle, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, GetLastError, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_USER, TokenUser,
+    AccessCheck, DACL_SECURITY_INFORMATION, DuplicateToken, GENERIC_MAPPING,
+    GROUP_SECURITY_INFORMATION, GetTokenInformation, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SecurityImpersonation, TOKEN_DUPLICATE,
+    TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
+    FILE_FLAG_OVERLAPPED, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-    PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+    PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -130,23 +137,20 @@ const TEARDOWN_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from
 const DAEMON_WAIT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(u32::MAX as u64);
 
-fn current_user_sid_string() -> windows::core::Result<String> {
+/// トークンハンドルからSDDL文字列表現のSIDを取り出す共通ロジック（`current_user_sid_string`・
+/// `query_process_token_sid`（S-2、クライアント身元検証）の両方が使う）。
+fn sid_string_from_token(token: HANDLE) -> windows::core::Result<String> {
     unsafe {
-        let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), windows::Win32::Security::TOKEN_QUERY, &mut token)?;
-
         let mut ret_len = 0u32;
         let _ = GetTokenInformation(token, TokenUser, None, 0, &mut ret_len);
         let mut buf = vec![0u8; ret_len as usize];
-        let get_result = GetTokenInformation(
+        GetTokenInformation(
             token,
             TokenUser,
             Some(buf.as_mut_ptr() as *mut _),
             ret_len,
             &mut ret_len,
-        );
-        let _ = CloseHandle(token);
-        get_result?;
+        )?;
 
         let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
         let sid = token_user.User.Sid;
@@ -156,6 +160,289 @@ fn current_user_sid_string() -> windows::core::Result<String> {
         let _ = LocalFree(HLOCAL(sid_str_ptr.0 as *mut _));
         Ok(sid_str)
     }
+}
+
+fn current_user_sid_string() -> windows::core::Result<String> {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), windows::Win32::Security::TOKEN_QUERY, &mut token)?;
+        let result = sid_string_from_token(token);
+        let _ = CloseHandle(token);
+        result
+    }
+}
+
+/// 指定PIDのプロセスのトークンSIDを取得する（S-2、`verify_pipe_client_identity`専用）。
+/// `process_is_alive`（`vmsandbox.rs`）と同じ`PROCESS_QUERY_LIMITED_INFORMATION`で
+/// `OpenProcess`する（daemonは昇格済みトークンで動作しており、同一ユーザーの他プロセスを
+/// 開くのに十分な権限を持つ）。
+fn query_process_token_sid(pid: u32) -> Result<String, VmSandboxIpcError> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("OpenProcess({pid}) failed: {e}")))?;
+        let mut token = HANDLE::default();
+        let open_result =
+            OpenProcessToken(process, windows::Win32::Security::TOKEN_QUERY, &mut token);
+        let _ = CloseHandle(process);
+        open_result
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("OpenProcessToken({pid}) failed: {e}")))?;
+        let result = sid_string_from_token(token)
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("sid_string_from_token({pid}) failed: {e}")));
+        let _ = CloseHandle(token);
+        result
+    }
+}
+
+/// 指定PIDのプロセスの実行イメージの絶対パスを取得する（S-2、`verify_pipe_client_identity`・
+/// `verify_pipe_server_identity`共用）。
+fn query_process_image_path(pid: u32) -> Result<PathBuf, VmSandboxIpcError> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("OpenProcess({pid}) failed: {e}")))?;
+        let mut buf = vec![0u16; 32768];
+        let mut len = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(process);
+        result.map_err(|e| {
+            VmSandboxIpcError::Ipc(format!("QueryFullProcessImageNameW({pid}) failed: {e}"))
+        })?;
+        buf.truncate(len as usize);
+        Ok(PathBuf::from(String::from_utf16_lossy(&buf)))
+    }
+}
+
+/// `\\?\`プレフィックスの有無・大文字小文字ゆれを無視してパスを比較する（S-2、
+/// `QueryFullProcessImageNameW`は`PROCESS_NAME_WIN32`指定時プレフィックス無しの
+/// パスを返すが、`std::env::current_exe()`側が付ける可能性もあるため両対応する）。
+fn paths_equal_ci(a: &Path, b: &Path) -> bool {
+    fn normalize(p: &Path) -> String {
+        let s = p.to_string_lossy();
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_lowercase()
+    }
+    normalize(a) == normalize(b)
+}
+
+/// daemon側(サーバ)が、`ConnectNamedPipe`成功後に接続してきたクライアントの身元を検証する
+/// （S-2）。固定パイプ名化により「パイプ名を知っている」こと自体は認可根拠として機能しなく
+/// なるため、(a)対向プロセスの実行イメージパスが起動元harness.exeと一致すること、
+/// (b)対向プロセスのトークンSIDが起動元ユーザーのSID(`owner_sid`)と一致すること、の両方を
+/// 確認する。(b)はパイプのSDDLと独立した二重チェック（defense-in-depth）。
+/// `ImpersonateNamedPipeClient`は意図的に使わない: daemonは既に昇格済みトークンで動作して
+/// おり、クライアント側権限へ降格する理由も必要もない。
+fn verify_pipe_client_identity(
+    pipe: HANDLE,
+    owner_sid: &str,
+    expected_owner_exe: &Path,
+) -> Result<u32, VmSandboxIpcError> {
+    let mut client_pid = 0u32;
+    unsafe { GetNamedPipeClientProcessId(pipe, &mut client_pid) }
+        .map_err(|e| VmSandboxIpcError::Ipc(format!("GetNamedPipeClientProcessId failed: {e}")))?;
+
+    let image_path = query_process_image_path(client_pid)?;
+    if !paths_equal_ci(&image_path, expected_owner_exe) {
+        return Err(VmSandboxIpcError::Rejected(format!(
+            "client pid {client_pid} image path mismatch: got {image_path:?}, expected \
+             {expected_owner_exe:?}"
+        )));
+    }
+
+    let client_sid = query_process_token_sid(client_pid)?;
+    if client_sid != owner_sid {
+        return Err(VmSandboxIpcError::Rejected(format!(
+            "client pid {client_pid} sid mismatch: got {client_sid}, expected {owner_sid}"
+        )));
+    }
+
+    Ok(client_pid)
+}
+
+/// 親側(クライアント)が、固定パイプへの接続先が本当に正規daemonかをbest-effortで確認する
+/// （S-2、パイプスクワッティングへの第一関門）。named pipeにはクライアントがサーバの正当性を
+/// 検証する標準APIが無いため、これは診断的な早期拒否に留まる——真の防御は
+/// [`verify_pipe_client_identity`]側（daemonが接続してきたクライアントを検証する）にある。
+fn verify_pipe_server_identity(
+    pipe: HANDLE,
+    expected_daemon_exe: &Path,
+) -> Result<(), VmSandboxIpcError> {
+    let mut server_pid = 0u32;
+    unsafe { GetNamedPipeServerProcessId(pipe, &mut server_pid) }
+        .map_err(|e| VmSandboxIpcError::Ipc(format!("GetNamedPipeServerProcessId failed: {e}")))?;
+    let image_path = query_process_image_path(server_pid)?;
+    if !paths_equal_ci(&image_path, expected_daemon_exe) {
+        return Err(VmSandboxIpcError::Rejected(format!(
+            "pipe server pid {server_pid} image path mismatch (possible squatting): got \
+             {image_path:?}, expected {expected_daemon_exe:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// `%SystemRoot%`（通常`C:\Windows`）を正規化して返す（S-2段階4、
+/// [`reject_dangerous_workspace_root`]専用）。環境変数が読めない場合は`None`を返し、
+/// この一件だけで拒否判定をスキップする（`AccessCheck`側が最終防衛線であるため）。
+fn system_root_canonical() -> Option<PathBuf> {
+    let root = std::env::var_os("SystemRoot")?;
+    std::fs::canonicalize(root).ok()
+}
+
+/// `\\?\`プレフィックスを剥がした文字列表現（[`paths_equal_ci`]のnormalizeと同じ考え方、
+/// 拒否リストの判定・エラーメッセージ用）。
+fn strip_verbatim_prefix(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+}
+
+/// `workspace_root`がドライブルート・システムディレクトリ・UNC/ネットワークパスでないことを
+/// 確認する（S-2段階4、拒否リスト。`DESIGN-SANDBOX-VMISOLATION.md`7-a参照）。
+/// 認可の本体は[`authorize_workspace_root`]の`AccessCheck`側であり、この関数は
+/// 「`AccessCheck`が通ってしまう病的なDACLのマシン」に備えた belt-and-braces に過ぎない。
+fn reject_dangerous_workspace_root(canonical: &Path) -> Result<(), VmSandboxIpcError> {
+    let stripped = strip_verbatim_prefix(canonical);
+
+    // `canonicalize`はUNCパスを`\\?\UNC\server\share`へ正規化する。
+    if stripped.starts_with(r"UNC\") || stripped.starts_with(r"\\") {
+        return Err(VmSandboxIpcError::Rejected(format!(
+            "workspace_root must not be a UNC/network path: {stripped}"
+        )));
+    }
+
+    // ドライブルート（`C:\`等）は`parent()`が`None`になる（プレフィックス+ルート以外の
+    // 構成要素を持たないパス）。
+    if canonical.parent().is_none() {
+        return Err(VmSandboxIpcError::Rejected(format!(
+            "workspace_root must not be a drive root: {stripped}"
+        )));
+    }
+
+    if let Some(system_root) = system_root_canonical() {
+        if canonical.starts_with(&system_root) {
+            return Err(VmSandboxIpcError::Rejected(format!(
+                "workspace_root must not be inside the Windows system directory: {stripped}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// クライアントプロセスのトークンを複製し、`AccessCheck`専用のimpersonationレベルトークンを
+/// 得る（S-2段階4）。**`ImpersonateNamedPipeClient`は使わない**——ここで作るトークンは
+/// [`access_check_write`]（`AccessCheck`Win32 APIの入力）としてのみ渡し、daemon自身の
+/// スレッドをクライアント権限へ実際に偽装することはしない。段階3で明記した方針
+/// （`verify_pipe_client_identity`のdoc参照）と同じ理由。
+fn duplicate_client_token_for_access_check(pid: u32) -> Result<HANDLE, VmSandboxIpcError> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("OpenProcess({pid}) failed: {e}")))?;
+        let mut token = HANDLE::default();
+        let open_result =
+            OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut token);
+        let _ = CloseHandle(process);
+        open_result
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("OpenProcessToken({pid}) failed: {e}")))?;
+
+        let mut imp_token = HANDLE::default();
+        let dup_result = DuplicateToken(token, SecurityImpersonation, &mut imp_token);
+        let _ = CloseHandle(token);
+        dup_result
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("DuplicateToken({pid}) failed: {e}")))?;
+        Ok(imp_token)
+    }
+}
+
+/// `path`（ファイルオブジェクト）に対して、`token`（impersonationレベル）が書き込みアクセス
+/// （`FILE_GENERIC_WRITE`）を持つかを`AccessCheck`で判定する（S-2段階4本体）。
+fn access_check_write(path: &Path, token: HANDLE) -> Result<bool, VmSandboxIpcError> {
+    unsafe {
+        let path_w = wide(&path.to_string_lossy());
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut sd,
+        )
+        .ok()
+        .map_err(|e| {
+            VmSandboxIpcError::Ipc(format!("GetNamedSecurityInfoW({path:?}) failed: {e}"))
+        })?;
+
+        let mapping = GENERIC_MAPPING {
+            GenericRead: FILE_GENERIC_READ.0,
+            GenericWrite: FILE_GENERIC_WRITE.0,
+            GenericExecute: FILE_GENERIC_EXECUTE.0,
+            GenericAll: FILE_ALL_ACCESS.0,
+        };
+
+        let mut privilege_set_buf = [0u8; 1024];
+        let mut privilege_set_len = privilege_set_buf.len() as u32;
+        let mut granted_access = 0u32;
+        let mut access_status = windows::Win32::Foundation::BOOL(0);
+
+        let result = AccessCheck(
+            sd,
+            token,
+            FILE_GENERIC_WRITE.0,
+            &mapping,
+            Some(privilege_set_buf.as_mut_ptr() as *mut PRIVILEGE_SET),
+            &mut privilege_set_len,
+            &mut granted_access,
+            &mut access_status,
+        );
+        let _ = LocalFree(HLOCAL(sd.0));
+        result
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("AccessCheck({path:?}) failed: {e}")))?;
+        Ok(access_status.as_bool())
+    }
+}
+
+/// `workspace_root`が (a) 実在するディレクトリで、(b) ドライブルート・システムディレクトリ・
+/// UNC/ネットワークパスでなく、(c) 接続元クライアントのトークンが既に書き込み権を持つ、
+/// の3点を満たすことを確認する（S-2段階4、`DESIGN-SANDBOX-VMISOLATION.md`7-a）。
+///
+/// [`verify_pipe_client_identity`]が「接続してきたのが正規`harness.exe`である」ことを
+/// 検証するのに対し、本関数は「その`harness.exe`が要求している`workspace_root`へ既に
+/// アクセス権を持っているか」を検証する——別の不変条件であり、互いを代替しない。固定パイプ名化
+/// により同一ユーザーの任意の`harness.exe`起動から`StartSession`が送られ得るようになった以上、
+/// 「呼び出し元が既に持つ権限を超えさせない」という不変条件がここでの唯一の実質的な認可点になる
+/// （nonceハンドシェイクを不採用とした根拠、同文書7-b参照）。
+fn authorize_workspace_root(
+    client_pid: u32,
+    workspace_root: &Path,
+) -> Result<(), VmSandboxIpcError> {
+    let canonical = std::fs::canonicalize(workspace_root).map_err(|e| {
+        VmSandboxIpcError::Rejected(format!(
+            "workspace_root does not exist or is not accessible: {workspace_root:?}: {e}"
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(VmSandboxIpcError::Rejected(format!(
+            "workspace_root is not a directory: {canonical:?}"
+        )));
+    }
+
+    reject_dangerous_workspace_root(&canonical)?;
+
+    let imp_token = duplicate_client_token_for_access_check(client_pid)?;
+    let allowed = access_check_write(&canonical, imp_token);
+    unsafe {
+        let _ = CloseHandle(imp_token);
+    }
+    if !allowed? {
+        return Err(VmSandboxIpcError::Rejected(format!(
+            "client pid {client_pid} does not have write access to workspace_root: {canonical:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn user_only_security_attributes(sid: &str) -> windows::core::Result<SECURITY_ATTRIBUTES> {
@@ -175,6 +462,15 @@ fn user_only_security_attributes(sid: &str) -> windows::core::Result<SECURITY_AT
             bInheritHandle: false.into(),
         })
     }
+}
+
+/// 常駐セッションdaemonの固定named pipe名（S-2）。パイプの向きを反転させ常駐daemonが
+/// サーバになるため、GC専用の使い捨て名（[`unique_pipe_name`]、GC経路は変更なし）とは別に
+/// 固定名を用意する。同一ユーザーの誰でも名前を知り得る前提で、
+/// [`user_only_security_attributes`]のSDDL・[`verify_pipe_client_identity`]の身元検証と
+/// あわせて認可を成立させる。
+fn session_daemon_pipe_name() -> &'static str {
+    r"\\.\pipe\harness-vmsandboxd-session"
 }
 
 fn unique_pipe_name() -> String {
@@ -445,6 +741,107 @@ pub fn prepare_pipe() -> Result<PreparedPipe, VmSandboxIpcError> {
     })
 }
 
+/// 常駐セッションdaemon用の固定パイプの最初のインスタンスを作る（S-2）。
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE`により、既に同名パイプが存在する場合（正規daemonが
+/// 既に生存中、または同一ユーザーの別プロセスによるスクワッティング）は`ERROR_ACCESS_DENIED`
+/// で確実に失敗する——`CreateNamedPipeW`単体では名前の衝突があっても新規インスタンスとして
+/// 静かに成功してしまう場合があるため、このフラグが「自分が最初の所有者である」ことを
+/// OSに強制させる唯一の手段。
+fn create_first_pipe_instance(
+    pipe_name: &str,
+    sa: &mut SECURITY_ATTRIBUTES,
+) -> windows::core::Result<HANDLE> {
+    unsafe {
+        let pipe_name_w = wide(pipe_name);
+        let handle = CreateNamedPipeW(
+            PCWSTR(pipe_name_w.as_ptr()),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            4096,
+            4096,
+            0,
+            Some(sa as *mut _),
+        );
+        if handle.is_invalid() {
+            Err(windows::core::Error::from_win32())
+        } else {
+            Ok(handle)
+        }
+    }
+}
+
+/// 最初のインスタンス確立後、後続セッションを受け付けるための追加インスタンスを作る（S-2）。
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE`は付けない（最初の1回で一意性は既に確定済みのため）。
+fn create_additional_pipe_instance(
+    pipe_name: &str,
+    sa: &mut SECURITY_ATTRIBUTES,
+) -> windows::core::Result<HANDLE> {
+    unsafe {
+        let pipe_name_w = wide(pipe_name);
+        let handle = CreateNamedPipeW(
+            PCWSTR(pipe_name_w.as_ptr()),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            4096,
+            4096,
+            0,
+            Some(sa as *mut _),
+        );
+        if handle.is_invalid() {
+            Err(windows::core::Error::from_win32())
+        } else {
+            Ok(handle)
+        }
+    }
+}
+
+/// 親側(クライアント)が固定パイプへ接続する（S-2、パイプの向き反転後の接続方向）。
+/// `ERROR_PIPE_BUSY`（daemonは生存しているが全インスタンスが埋まっている、複数クライアントの
+/// レース）は`WaitNamedPipeW`で空きを待って自動リトライする。`ERROR_FILE_NOT_FOUND`
+/// （daemon未起動）はそのまま呼び出し元へ返し、daemon起動のフォールバックへ委ねる。
+fn connect_to_pipe_as_client(
+    pipe_name: &str,
+    timeout: std::time::Duration,
+) -> Result<HANDLE, VmSandboxIpcError> {
+    let pipe_name_w = wide(pipe_name);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let attempt = unsafe {
+            CreateFileW(
+                PCWSTR(pipe_name_w.as_ptr()),
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+                windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                None,
+            )
+        };
+        match attempt {
+            Ok(h) => return Ok(h),
+            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_BUSY.0) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(VmSandboxIpcError::from(e));
+                }
+                let remaining = deadline - now;
+                unsafe {
+                    let _ = WaitNamedPipeW(
+                        PCWSTR(pipe_name_w.as_ptr()),
+                        remaining.as_millis().min(u32::MAX as u128) as u32,
+                    );
+                }
+            }
+            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
+                return Err(VmSandboxIpcError::from(e));
+            }
+            Err(e) => return Err(VmSandboxIpcError::from(e)),
+        }
+    }
+}
+
 fn connect_and_start_session(
     pipe: HANDLE,
     daemon_process: Option<HANDLE>,
@@ -452,22 +849,9 @@ fn connect_and_start_session(
     allow_domains: Vec<String>,
     warm: bool,
 ) -> Result<VmSandboxHandle, VmSandboxIpcError> {
+    // S-2でパイプの向きが反転して以降、親側は`CreateFileW`（クライアント）で既に接続済みの
+    // 状態でここへ来る。旧モデル（親=サーバ）の`ConnectNamedPipe`待ちはもう不要。
     let workspace_root = PathBuf::from(&workspace_root_str);
-    let connect_result = connect_with_timeout(pipe, CONNECT_TIMEOUT).map_err(|e| {
-        VmSandboxIpcError::Ipc(format!(
-            "waiting for vmsandboxd to connect: {e} (daemon may not have launched, or UAC \
-             is still pending user interaction)"
-        ))
-    });
-    if let Err(e) = connect_result {
-        unsafe {
-            let _ = CloseHandle(pipe);
-            if let Some(h) = daemon_process {
-                let _ = CloseHandle(h);
-            }
-        }
-        return Err(e);
-    }
 
     let req = VmRequest::StartSession {
         workspace_root: workspace_root_str,
@@ -511,42 +895,79 @@ fn connect_and_start_session(
 }
 
 impl VmSandboxHandle {
-    /// daemonを昇格起動し、`StartSession`を送って応答を待つ（親側、非管理者本体から呼ぶ）。
-    /// `allow_domains`は既存の`net_proxy.allow_domains`（`--net-allow-domain`+
-    /// `.harness/settings.json`統合済み、WFPが既に使っているのと同じ値）をそのまま渡す。
-    /// `warm`は`--tier3-warm`（フェーズB）の値をそのまま渡す。
+    /// 常駐daemonの固定パイプへ接続し、（未起動なら昇格起動してから）`StartSession`を送って
+    /// 応答を待つ（親側、非管理者本体から呼ぶ、S-2でパイプの向きが反転）。`allow_domains`は
+    /// 既存の`net_proxy.allow_domains`（`--net-allow-domain`+`.harness/settings.json`
+    /// 統合済み、WFPが既に使っているのと同じ値）をそのまま渡す。`warm`は`--tier3-warm`
+    /// （フェーズB）の値をそのまま渡す。
     pub fn start(
         workspace_root: &std::path::Path,
         allow_domains: &[String],
         warm: bool,
     ) -> Result<Self, VmSandboxIpcError> {
-        let prepared = prepare_pipe()?;
-        let pipe_name = prepared.name().to_string();
-        let pipe = prepared.into_handle();
-
+        let owner_sid = current_user_sid_string().map_err(|e| {
+            VmSandboxIpcError::Ipc(format!("failed to resolve current user SID: {e}"))
+        })?;
+        let owner_exe = std::env::current_exe()
+            .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to resolve current exe: {e}")))?;
         let daemon_path = daemon_exe_path()?;
-        let daemon_process = match unsafe { launch_daemon_elevated(&daemon_path, &pipe_name) } {
-            Ok(h) => h,
-            Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(pipe);
+        let pipe_name = session_daemon_pipe_name();
+
+        // まず既に常駐daemonが生きているか、短いタイムアウトで試す（複数セッション目は
+        // これで即座に繋がる想定）。`ERROR_FILE_NOT_FOUND`ならdaemon未起動とみなし、
+        // 昇格起動してから改めて接続を待つ。
+        let (pipe, daemon_process) =
+            match connect_to_pipe_as_client(pipe_name, std::time::Duration::from_millis(200)) {
+                Ok(pipe) => (pipe, None),
+                Err(_) => {
+                    let params = format!(
+                        "{pipe_name} --owner-sid {owner_sid} --owner-exe \"{}\"",
+                        owner_exe.display()
+                    );
+                    let daemon_process = unsafe { launch_daemon_elevated(&daemon_path, &params) }?;
+                    match connect_to_pipe_as_client(pipe_name, CONNECT_TIMEOUT) {
+                        Ok(pipe) => (pipe, Some(daemon_process)),
+                        Err(e) => {
+                            unsafe {
+                                let _ = CloseHandle(daemon_process);
+                            }
+                            return Err(VmSandboxIpcError::Ipc(format!(
+                                "waiting for vmsandboxd to accept the connection: {e} (daemon \
+                                 may not have launched, or UAC is still pending user \
+                                 interaction)"
+                            )));
+                        }
+                    }
                 }
-                return Err(e);
+            };
+
+        // パイプスクワッティング対策の第一関門（S-2）: 接続先が本当に正規daemonかを
+        // best-effortで確認する。失敗時はフォールバック再接続をしない（攻撃者にリトライの
+        // 余地を与えるだけなので、ここで明示エラーを返して止める）。
+        if let Err(e) = verify_pipe_server_identity(pipe, &daemon_path) {
+            unsafe {
+                let _ = CloseHandle(pipe);
+                if let Some(h) = daemon_process {
+                    let _ = CloseHandle(h);
+                }
             }
-        };
+            return Err(e);
+        }
 
         connect_and_start_session(
             pipe,
-            Some(daemon_process),
+            daemon_process,
             workspace_root.to_string_lossy().to_string(),
             allow_domains.to_vec(),
             warm,
         )
     }
 
-    /// 既に（特権分離ヘルパー経由で）daemonの起動を依頼済みのパイプへ接続する
+    /// 既に（特権分離ヘルパー経由で）daemonへの接続が確立済みのパイプで`StartSession`を送る
     /// （`netfilterd::NetfilterHandle::connect_after_chain_launch`と同型。Phase 1では
     /// `harness-cli`から未使用だが、`privhelper`連鎖起動シナリオへ将来組み込む余地を残す）。
+    /// S-2でパイプの向きが反転したため、渡す`pipe`は呼び出し側が`connect_to_pipe_as_client`
+    /// 相当で既に接続済みであることが前提（本関数はもう`ConnectNamedPipe`を待たない）。
     pub fn connect_after_chain_launch(
         pipe: HANDLE,
         workspace_root: &std::path::Path,
@@ -646,13 +1067,13 @@ impl VmSandboxHandle {
 
         unsafe {
             let _ = DisconnectNamedPipe(self.pipe);
+            // S-2でdaemonが常駐化して以降、`Teardown`後もdaemonプロセス自体は終了せず
+            // 次のセッションの接続を待ち続ける（`serve_resident`参照）。旧モデル（1セッション=
+            // 1回きりのdaemon起動）ではTeardown後にプロセスが自然終了する前提で
+            // `TerminateProcess`フォールバックが要ったが、常駐化後はこの待機/強制終了が
+            // 他セッションを誤って巻き添えにするリスクの方が大きいため撤去する。
             if let Some(daemon_process) = self.daemon_process {
-                let wait = WaitForSingleObject(daemon_process, 30_000);
-                if wait != WAIT_OBJECT_0 {
-                    let _ =
-                        windows::Win32::System::Threading::TerminateProcess(daemon_process, 1);
-                    let _ = WaitForSingleObject(daemon_process, 5000);
-                }
+                let _ = CloseHandle(daemon_process);
             }
         }
 
@@ -755,30 +1176,79 @@ impl harness_core::VmShellExecutor for VmSandboxHandle {
     }
 }
 
-/// daemon側エントリポイント（`harness-vmsandboxd.exe`のmainから呼ぶ、昇格トークンで実行）。
-pub fn serve(pipe_name: &str) -> Result<(), VmSandboxIpcError> {
-    let pipe = unsafe {
-        let pipe_name_w = wide(pipe_name);
-        CreateFileW(
-            PCWSTR(pipe_name_w.as_ptr()),
-            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
-            windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
-            None,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-            None,
-        )
-        .map_err(VmSandboxIpcError::from)?
-    };
-
-    let result = serve_inner(pipe);
+/// daemon側エントリポイント（`harness-vmsandboxd.exe`のmainから呼ぶ、昇格トークンで実行、
+/// S-2でパイプの向きが反転したため常駐daemon自身がサーバになる）。`owner_sid`/`owner_exe`は
+/// 親（非昇格harness本体）が起動時にコマンドラインで明示的に渡した値（`--owner-sid`/
+/// `--owner-exe`、[`VmSandboxHandle::start`]参照）。daemon自身のトークンSIDは使わない
+/// （over-the-shoulder elevationでは起動元ユーザーと異なり得るため、
+/// [`user_only_security_attributes`]のdoc参照）。
+///
+/// `StartSession`→`Exec`(N回)→`Teardown`の1セッションを処理したら、パイプを切断してから
+/// 次の接続を待ち続ける（＝daemonプロセス自体は`Teardown`後も終了しない。複数セッションを
+/// 同時ではなく順番に処理する最小構成——並行処理・セッション数上限は将来の拡張、
+/// `plans/DESIGN-SANDBOX-VMISOLATION.md`「実装確定サマリー」項目6参照）。
+pub fn serve_resident(owner_sid: &str, owner_exe: &Path) -> Result<(), VmSandboxIpcError> {
+    let pipe_name = session_daemon_pipe_name();
+    let mut sa = user_only_security_attributes(owner_sid)?;
+    let first = create_first_pipe_instance(pipe_name, &mut sa);
     unsafe {
-        let _ = CloseHandle(pipe);
+        let _ = LocalFree(HLOCAL(sa.lpSecurityDescriptor));
     }
-    result
+    let mut pipe = first.map_err(|e| {
+        VmSandboxIpcError::Ipc(format!(
+            "failed to create the fixed session pipe as its first instance (already in use? \
+             possible squatting, or another resident daemon is already running): {e}"
+        ))
+    })?;
+
+    loop {
+        if let Err(e) = connect_with_timeout(pipe, DAEMON_WAIT_TIMEOUT) {
+            unsafe {
+                let _ = CloseHandle(pipe);
+            }
+            return Err(e);
+        }
+
+        let client_pid = match verify_pipe_client_identity(pipe, owner_sid, owner_exe) {
+            Ok(pid) => pid,
+            Err(e) => {
+                eprintln!("harness-vmsandboxd: rejecting connection: {e}");
+                unsafe {
+                    let _ = DisconnectNamedPipe(pipe);
+                }
+                // このパイプインスタンスは拒否した相手との接続を切断するだけで使い回し、次の
+                // 接続を待つ（インスタンス自体を作り直す必要はない——`FIRST_PIPE_INSTANCE`は
+                // 最初の`CreateNamedPipeW`にしか関係しない）。
+                continue;
+            }
+        };
+
+        // 後続クライアント（次のセッション）を待たせないよう、この接続の処理に入る前に
+        // 追加インスタンスを用意しておく。
+        let mut extra_sa = user_only_security_attributes(owner_sid)?;
+        let next_instance = create_additional_pipe_instance(pipe_name, &mut extra_sa);
+        unsafe {
+            let _ = LocalFree(HLOCAL(extra_sa.lpSecurityDescriptor));
+        }
+
+        let result = serve_inner(pipe, client_pid);
+        unsafe {
+            let _ = DisconnectNamedPipe(pipe);
+            let _ = CloseHandle(pipe);
+        }
+        if let Err(e) = result {
+            eprintln!("harness-vmsandboxd: session ended with an error: {e}");
+        }
+
+        pipe = next_instance.map_err(|e| {
+            VmSandboxIpcError::Ipc(format!(
+                "failed to create the next session pipe instance: {e}"
+            ))
+        })?;
+    }
 }
 
-fn serve_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
+fn serve_inner(pipe: HANDLE, client_pid: u32) -> Result<(), VmSandboxIpcError> {
     // 1件目: StartSession を待つ。
     let request_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
     let (workspace_root, allow_domains, warm) = match serde_json::from_slice::<VmRequest>(&request_bytes) {
@@ -799,6 +1269,17 @@ fn serve_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
         }
     };
     let workspace_root = PathBuf::from(workspace_root);
+
+    // S-2段階4（`DESIGN-SANDBOX-VMISOLATION.md`7-a）: `verify_pipe_client_identity`は
+    // 「正規harness.exeである」ことしか検証しない。固定パイプ名化で同一ユーザーの任意の
+    // harness.exe起動から`StartSession`が送られ得るようになった以上、「そのharness.exeが
+    // 要求しているworkspace_rootへ既にアクセス権を持っているか」を別途検証しないと、
+    // `C:\`等を渡すだけの実質UAC越えLPEが成立する。
+    if let Err(e) = authorize_workspace_root(client_pid, &workspace_root) {
+        let resp = VmResponse::Err(format!("workspace_root rejected: {e}"));
+        send_response(pipe, &resp)?;
+        return Err(e);
+    }
 
     let config = VmSandboxConfig::default();
 
@@ -1151,5 +1632,324 @@ mod tests {
             let _ = CloseHandle(server);
             let _ = CloseHandle(client);
         }
+    }
+
+    /// (server, client)ともにこのテストプロセス自身が両端を持つ、SID制限付きの接続済み
+    /// named pipeを作る（`framed_message_roundtrips_over_a_real_named_pipe`と同じ手法、
+    /// S-2の`verify_pipe_client_identity`テスト用）。
+    fn make_connected_test_pipe(sid: &str) -> (HANDLE, HANDLE) {
+        let pipe_name = unique_pipe_name();
+        let mut sa = user_only_security_attributes(sid).expect("user_only_security_attributes");
+        let server = unsafe {
+            let pipe_name_w = wide(&pipe_name);
+            let handle = CreateNamedPipeW(
+                PCWSTR(pipe_name_w.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                Some(&mut sa as *mut _),
+            );
+            let _ = LocalFree(HLOCAL(sa.lpSecurityDescriptor));
+            assert!(!handle.is_invalid());
+            handle
+        };
+
+        let pipe_name_for_client = pipe_name.clone();
+        let client_thread = std::thread::spawn(move || unsafe {
+            let pipe_name_w = wide(&pipe_name_for_client);
+            CreateFileW(
+                PCWSTR(pipe_name_w.as_ptr()),
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+                windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                None,
+            )
+            .expect("client CreateFileW")
+            .0 as usize
+        });
+
+        connect_with_timeout(server, short_timeout()).expect("connect_with_timeout");
+        let client = HANDLE(client_thread.join().unwrap() as *mut _);
+        (server, client)
+    }
+
+    /// S2スパイク成功条件1: 「daemonより先にパイプを作った偽サーバがいる場合にクライアントが
+    /// 接続を拒否すること」に対応する下位レベルの検証。`create_first_pipe_instance`
+    /// （`FILE_FLAG_FIRST_PIPE_INSTANCE`付き）は、同名パイプが既に存在する場合
+    /// （＝スクワッティング済み、または正規daemonが既に生存中）は必ず失敗することを確認する。
+    #[test]
+    fn create_first_pipe_instance_fails_when_name_already_taken() {
+        let pipe_name = format!(r"\\.\pipe\harness-vmsandboxd-test-squat-{}", std::process::id());
+        let sid = current_user_sid_string().expect("current_user_sid_string");
+
+        // 「先に同名パイプを作った偽サーバ」を、通常の（FIRST_PIPE_INSTANCEなしの）
+        // CreateNamedPipeWで再現する。
+        let mut squatter_sa =
+            user_only_security_attributes(&sid).expect("user_only_security_attributes");
+        let squatter = unsafe {
+            let pipe_name_w = wide(&pipe_name);
+            let handle = CreateNamedPipeW(
+                PCWSTR(pipe_name_w.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                Some(&mut squatter_sa as *mut _),
+            );
+            let _ = LocalFree(HLOCAL(squatter_sa.lpSecurityDescriptor));
+            assert!(!handle.is_invalid());
+            handle
+        };
+
+        let mut sa = user_only_security_attributes(&sid).expect("user_only_security_attributes");
+        let result = create_first_pipe_instance(&pipe_name, &mut sa);
+        unsafe {
+            let _ = LocalFree(HLOCAL(sa.lpSecurityDescriptor));
+        }
+        assert!(
+            result.is_err(),
+            "expected FIRST_PIPE_INSTANCE creation to fail because the name is already taken"
+        );
+
+        unsafe {
+            let _ = CloseHandle(squatter);
+        }
+    }
+
+    /// S2スパイク成功条件3の下位レベル検証の一部: SDDLで許可されていないSIDに対しては
+    /// 固定パイプへの接続自体がACLレベルで拒否されることを確認する（`user_only_security_attributes`
+    /// が組むSDDLが実際に機能していることの回帰テスト）。
+    #[test]
+    fn connecting_client_is_denied_when_pipe_sddl_grants_a_different_sid() {
+        let pipe_name = unique_pipe_name();
+        // LocalSystemのwell-known SID。テスト実行ユーザー（管理者で実行していても、
+        // トークンのUser SIDは人間のユーザーアカウントのままでLocalSystemとは異なる）とは
+        // 常に別物になる。
+        let foreign_sid = "S-1-5-18";
+        let mut sa =
+            user_only_security_attributes(foreign_sid).expect("user_only_security_attributes");
+        let server = unsafe {
+            let pipe_name_w = wide(&pipe_name);
+            let handle = CreateNamedPipeW(
+                PCWSTR(pipe_name_w.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                Some(&mut sa as *mut _),
+            );
+            let _ = LocalFree(HLOCAL(sa.lpSecurityDescriptor));
+            assert!(!handle.is_invalid());
+            handle
+        };
+
+        let result = connect_to_pipe_as_client(&pipe_name, std::time::Duration::from_millis(200));
+        assert!(
+            result.is_err(),
+            "expected the current process (different SID) to be denied access by the pipe ACL"
+        );
+
+        unsafe {
+            let _ = CloseHandle(server);
+        }
+    }
+
+    #[test]
+    fn paths_equal_ci_normalizes_case_and_prefix() {
+        assert!(paths_equal_ci(
+            std::path::Path::new(r"C:\Foo\Bar.exe"),
+            std::path::Path::new(r"c:\foo\bar.exe")
+        ));
+        assert!(paths_equal_ci(
+            std::path::Path::new(r"\\?\C:\Foo\Bar.exe"),
+            std::path::Path::new(r"C:\Foo\Bar.exe")
+        ));
+        assert!(!paths_equal_ci(
+            std::path::Path::new(r"C:\Foo\Bar.exe"),
+            std::path::Path::new(r"C:\Foo\Baz.exe")
+        ));
+    }
+
+    #[test]
+    fn query_process_image_path_and_token_sid_resolve_for_current_process() {
+        let pid = std::process::id();
+        let image = query_process_image_path(pid).expect("query_process_image_path");
+        let expected = std::env::current_exe().expect("current_exe");
+        assert!(paths_equal_ci(&image, &expected));
+
+        let sid = query_process_token_sid(pid).expect("query_process_token_sid");
+        let own_sid = current_user_sid_string().expect("current_user_sid_string");
+        assert_eq!(sid, own_sid);
+    }
+
+    /// S2スパイク成功条件2の下位レベル検証: 正しいSID・正しいイメージパスの相手からの
+    /// 接続は`verify_pipe_client_identity`を通過する（このテストプロセス自身がクライアント・
+    /// サーバ両方を演じるため、イメージパス・SIDともに一致する）。
+    #[test]
+    fn verify_pipe_client_identity_accepts_matching_sid_and_image_path() {
+        let sid = current_user_sid_string().expect("current_user_sid_string");
+        let (server, client) = make_connected_test_pipe(&sid);
+        let own_exe = std::env::current_exe().expect("current_exe");
+
+        let result = verify_pipe_client_identity(server, &sid, &own_exe);
+        assert!(result.is_ok(), "expected verification to succeed: {result:?}");
+        assert_eq!(result.unwrap(), std::process::id());
+
+        unsafe {
+            let _ = DisconnectNamedPipe(server);
+            let _ = CloseHandle(server);
+            let _ = CloseHandle(client);
+        }
+    }
+
+    /// S2スパイク成功条件2: 「非harnessプロセスからのStartSessionが拒否されること」の
+    /// 下位レベル検証。接続元プロセスのイメージパスが期待値（`--owner-exe`で渡された
+    /// harness.exeのパス）と一致しない場合は拒否する。
+    #[test]
+    fn verify_pipe_client_identity_rejects_image_path_mismatch() {
+        let sid = current_user_sid_string().expect("current_user_sid_string");
+        let (server, client) = make_connected_test_pipe(&sid);
+        let unrelated_exe = std::path::Path::new(r"C:\nonexistent\not-harness.exe");
+
+        let result = verify_pipe_client_identity(server, &sid, unrelated_exe);
+        assert!(result.is_err(), "expected rejection on image path mismatch");
+
+        unsafe {
+            let _ = DisconnectNamedPipe(server);
+            let _ = CloseHandle(server);
+            let _ = CloseHandle(client);
+        }
+    }
+
+    /// S2スパイク成功条件2の下位レベル検証（SID側）: イメージパスが一致していても、
+    /// 期待するowner_sidと接続元のトークンSIDが食い違えば拒否する。
+    #[test]
+    fn verify_pipe_client_identity_rejects_sid_mismatch() {
+        let sid = current_user_sid_string().expect("current_user_sid_string");
+        let (server, client) = make_connected_test_pipe(&sid);
+        let own_exe = std::env::current_exe().expect("current_exe");
+
+        let result = verify_pipe_client_identity(server, "S-1-5-18", &own_exe);
+        assert!(result.is_err(), "expected rejection on SID mismatch");
+
+        unsafe {
+            let _ = DisconnectNamedPipe(server);
+            let _ = CloseHandle(server);
+            let _ = CloseHandle(client);
+        }
+    }
+
+    /// S-2段階4の拒否リスト: ドライブルートは`parent()`が`None`になるため拒否される。
+    #[test]
+    fn reject_dangerous_workspace_root_rejects_drive_root() {
+        let canonical = std::fs::canonicalize(r"C:\").expect("canonicalize C:\\");
+        let result = reject_dangerous_workspace_root(&canonical);
+        assert!(result.is_err(), "expected drive root to be rejected: {result:?}");
+    }
+
+    /// S-2段階4の拒否リスト: `%SystemRoot%`配下（`C:\Windows`）は拒否される。
+    #[test]
+    fn reject_dangerous_workspace_root_rejects_system_root() {
+        let system_root = system_root_canonical().expect("SystemRoot must resolve on Windows CI");
+        let result = reject_dangerous_workspace_root(&system_root);
+        assert!(result.is_err(), "expected system root to be rejected: {result:?}");
+
+        let system32 = system_root.join("System32");
+        if system32.exists() {
+            let canonical = std::fs::canonicalize(&system32).expect("canonicalize System32");
+            let result = reject_dangerous_workspace_root(&canonical);
+            assert!(
+                result.is_err(),
+                "expected a path under the system root to be rejected: {result:?}"
+            );
+        }
+    }
+
+    /// S-2段階4の拒否リスト: 通常の一時ディレクトリ配下は拒否リストを通過する
+    /// （`AccessCheck`側の判定はこのテストの対象外）。
+    #[test]
+    fn reject_dangerous_workspace_root_allows_ordinary_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+        let result = reject_dangerous_workspace_root(&canonical);
+        assert!(result.is_ok(), "expected an ordinary directory to be allowed: {result:?}");
+    }
+
+    /// S-2段階4の拒否リスト: UNCパス（`canonicalize`後は`\\?\UNC\...`）は拒否される。
+    #[test]
+    fn reject_dangerous_workspace_root_rejects_unc_path() {
+        let unc = std::path::PathBuf::from(r"\\?\UNC\server\share\workspace");
+        let result = reject_dangerous_workspace_root(&unc);
+        assert!(result.is_err(), "expected a UNC path to be rejected: {result:?}");
+    }
+
+    /// S-2段階4の`AccessCheck`本体: 自プロセス自身のトークン（複製）は、自分が書き込める
+    /// 一時ディレクトリへの書き込みアクセスを持つと判定されるべき。
+    #[test]
+    fn access_check_write_allows_own_process_for_own_temp_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+
+        let imp_token = duplicate_client_token_for_access_check(std::process::id())
+            .expect("duplicate_client_token_for_access_check");
+        let allowed = access_check_write(&canonical, imp_token).expect("access_check_write");
+        unsafe {
+            let _ = CloseHandle(imp_token);
+        }
+        assert!(allowed, "expected own process to have write access to its own temp dir");
+    }
+
+    /// S-2段階4の`AccessCheck`本体: 自プロセス自身のトークンは、書き込み権を持たない
+    /// `%SystemRoot%`への書き込みアクセスを持たないと判定されるべき（非管理者実行を想定。
+    /// 管理者権限でテストを実行している場合はこのテストをスキップする）。
+    #[test]
+    fn access_check_write_denies_system_root_for_non_admin() {
+        if crate::privhelper::is_elevated() {
+            eprintln!("skipping: test process is elevated, System32 write would be allowed");
+            return;
+        }
+        let system_root = system_root_canonical().expect("SystemRoot must resolve on Windows CI");
+
+        let imp_token = duplicate_client_token_for_access_check(std::process::id())
+            .expect("duplicate_client_token_for_access_check");
+        let allowed = access_check_write(&system_root, imp_token).expect("access_check_write");
+        unsafe {
+            let _ = CloseHandle(imp_token);
+        }
+        assert!(!allowed, "expected a non-admin process to lack write access to SystemRoot");
+    }
+
+    /// S-2段階4の統合テスト: 実在する一時ディレクトリは認可を通過する。
+    #[test]
+    fn authorize_workspace_root_allows_own_temp_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = authorize_workspace_root(std::process::id(), dir.path());
+        assert!(result.is_ok(), "expected own temp dir to be authorized: {result:?}");
+    }
+
+    /// S-2段階4の統合テスト: ドライブルートは拒否リストで即座に落ちる。
+    #[test]
+    fn authorize_workspace_root_rejects_drive_root() {
+        let result = authorize_workspace_root(std::process::id(), std::path::Path::new(r"C:\"));
+        assert!(result.is_err(), "expected drive root to be rejected: {result:?}");
+    }
+
+    /// S-2段階4の統合テスト: 存在しないパスは`canonicalize`の時点で拒否される。
+    #[test]
+    fn authorize_workspace_root_rejects_nonexistent_path() {
+        let result = authorize_workspace_root(
+            std::process::id(),
+            std::path::Path::new(r"C:\this-path-should-not-exist-harness-test-12345"),
+        );
+        assert!(result.is_err(), "expected a nonexistent path to be rejected: {result:?}");
     }
 }

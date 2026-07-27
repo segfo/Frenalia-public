@@ -33,6 +33,14 @@ pub struct VmLedgerEntry {
     /// 通常のコールドセッション扱いで後方互換を保つ）。
     #[serde(default)]
     pub warm: bool,
+    /// ワークスペースCIFSライブ共有（`plans/DESIGN-SANDBOX-VMISOLATION.md`§2.4）で
+    /// このセッションが作成したWindows側の使い捨てSMB共有名・ローカルアカウント名。
+    /// `None`は「まだSMB共有ステップに到達していない」または「旧方式（copy-in/copy-out）
+    /// のセッション」を表す（`#[serde(default)]`で旧台帳との後方互換を保つ）。
+    #[serde(default)]
+    pub smb_share_name: Option<String>,
+    #[serde(default)]
+    pub smb_user: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -121,9 +129,23 @@ pub fn record_session(session_id: &str, vm_name: &str, diff_vhdx: &Path, warm: b
             diff_vhdx: diff_vhdx_str,
             created_at_unix_secs: created_at,
             warm,
+            smb_share_name: None,
+            smb_user: None,
         });
     }
     save(&ledger);
+}
+
+/// `VmSession::attach_to_guest`がWindows側の使い捨てSMB共有・ローカルアカウントを作成した
+/// 直後に呼ぶ（`record_session`が既に作った台帳エントリへの追記、B10）。この時点より前に
+/// daemonがクラッシュした場合はSMB共有自体が未作成なので、GC側で回収すべきリソースも無い。
+pub fn record_smb_share(session_id: &str, share_name: &str, user: &str) {
+    let mut ledger = load();
+    if let Some(entry) = ledger.entries.iter_mut().find(|e| e.session_id == session_id) {
+        entry.smb_share_name = Some(share_name.to_string());
+        entry.smb_user = Some(user.to_string());
+        save(&ledger);
+    }
 }
 
 /// `VmSession::teardown`成功後、または`start`失敗パスでのbest-effort後始末後に呼ぶ。
@@ -176,6 +198,20 @@ pub fn select_orphans(
     out
 }
 
+/// GCで撤収すべきSMB共有名・ローカルアカウント名のペアを副作用なしに選定する
+/// （`select_orphans`のSMB版、B10）。台帳上の孤児VMエントリ（`entry.vm_name`が
+/// `vm_orphans`に含まれる）が持つ`smb_share_name`/`smb_user`を回収対象にする。
+/// VM自体は孤児でなくてもSMB共有だけが取り残されるケースは想定していない
+/// （このプロジェクトのSMB共有はVMセッションの一部としてのみ作成されるため）。
+pub fn select_smb_orphans(ledger: &VmLedger, vm_orphans: &[String]) -> Vec<(String, String)> {
+    ledger
+        .entries
+        .iter()
+        .filter(|e| vm_orphans.contains(&e.vm_name))
+        .filter_map(|e| Some((e.smb_share_name.clone()?, e.smb_user.clone()?)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +234,8 @@ mod tests {
                     .to_string(),
                 created_at_unix_secs: 12345,
                 warm: false,
+                smb_share_name: None,
+                smb_user: None,
             }],
         };
         let json = serde_json::to_string_pretty(&ledger).unwrap();
@@ -220,6 +258,8 @@ mod tests {
             diff_vhdx: "a.vhdx".to_string(),
             created_at_unix_secs: 1,
             warm: false,
+            smb_share_name: None,
+            smb_user: None,
         };
         ledger.entries.push(entry.clone());
         // 同一session_idの再挿入は上書き（`record_session`と同じ`find`+更新パターン）。
@@ -242,6 +282,8 @@ mod tests {
             diff_vhdx: format!("{session_id}.diff.vhdx"),
             created_at_unix_secs: 1,
             warm,
+            smb_share_name: None,
+            smb_user: None,
         }
     }
 
@@ -288,5 +330,40 @@ mod tests {
         let existing = vec!["harness-tier3-old".to_string()];
         let orphans = select_orphans(&ledger, "harness-tier3-current", &existing);
         assert_eq!(orphans, vec!["harness-tier3-old".to_string()]);
+    }
+
+    #[test]
+    fn select_smb_orphans_returns_share_and_user_for_orphaned_vms() {
+        let mut e = entry("harness-tier3-old", false);
+        e.smb_share_name = Some("harness-ws-old".to_string());
+        e.smb_user = Some("hns3-old".to_string());
+        let ledger = VmLedger { entries: vec![e] };
+        let orphans = select_smb_orphans(&ledger, &["harness-tier3-old".to_string()]);
+        assert_eq!(
+            orphans,
+            vec![("harness-ws-old".to_string(), "hns3-old".to_string())]
+        );
+    }
+
+    #[test]
+    fn select_smb_orphans_skips_entries_without_smb_share() {
+        let ledger = VmLedger {
+            entries: vec![entry("harness-tier3-old", false)],
+        };
+        let orphans = select_smb_orphans(&ledger, &["harness-tier3-old".to_string()]);
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn record_smb_share_updates_existing_entry_only() {
+        let mut ledger = VmLedger {
+            entries: vec![entry("s1", false)],
+        };
+        if let Some(e) = ledger.entries.iter_mut().find(|e| e.session_id == "s1") {
+            e.smb_share_name = Some("harness-ws-s1".to_string());
+            e.smb_user = Some("hns3-s1".to_string());
+        }
+        assert_eq!(ledger.entries[0].smb_share_name.as_deref(), Some("harness-ws-s1"));
+        assert_eq!(ledger.entries[0].smb_user.as_deref(), Some("hns3-s1"));
     }
 }

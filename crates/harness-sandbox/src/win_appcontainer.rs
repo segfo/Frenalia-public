@@ -34,19 +34,22 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    GetExplicitEntriesFromAclW, GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT,
-    SE_KERNEL_OBJECT, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_W,
+    GetExplicitEntriesFromAclW, GetNamedSecurityInfoW, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    ACL, AdjustTokenPrivileges, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, FreeSid,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
+    AddAce, AdjustTokenPrivileges, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid,
+    FreeSid, GetAce, GetAclInformation, GetSecurityDescriptorControl, InitializeAcl,
     InitializeSecurityDescriptor, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, NO_INHERITANCE,
-    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME,
-    SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SetKernelObjectSecurity,
-    SetSecurityDescriptorDacl, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
-    TOKEN_PRIVILEGES_ATTRIBUTES, TOKEN_QUERY,
+    OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME, SECURITY_CAPABILITIES,
+    SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SetKernelObjectSecurity, SetSecurityDescriptorDacl,
+    TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_PRIVILEGES_ATTRIBUTES,
+    TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
@@ -1346,12 +1349,126 @@ pub fn preflight(
     })
 }
 
-/// `path`のDACLから、`sid`（trustee）に対する既存ACEを全て取り除く（`REVOKE_ACCESS`）。
-/// 元は`TIER1A-OPEN-ISSUES.md`課題1のプロファイルtraverse実験（Experiment B）専用の
-/// 後始末ヘルパだったが、D-13のfs passthrough撤収機構（`fs revoke`）向けに本番昇格した
+/// `ACCESS_ALLOWED_ACE_TYPE`（WinNT.h）。`windows`クレートはこの値を定数として公開して
+/// いないため、既知の固定値としてここに置く。
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+/// [BUG-020の修正] `dacl`から`sid`宛の`ACCESS_ALLOWED_ACE`だけを取り除いた新しいDACLを、
+/// 対象外のACEは`GetAce`で読んだ生バイト列のまま`AddAce`でコピーして構築する（trustee・
+/// access mask・`AceFlags`——`INHERITED_ACE`を含め——を一切変更しない）。
+///
+/// **なぜ`SetEntriesInAclW`の`REVOKE_ACCESS`を使わないか**: `REVOKE_ACCESS`は`INHERITED_ACE`
+/// フラグ付きのACEを取り除かない（Win32の仕様——継承ACEは継承元でしか正しく取り消せないという
+/// 設計）。旧実装はこれを回避するため、`PROTECTED_DACL_SECURITY_INFORMATION`でノード全体を
+/// 「凍結」（全ACEを明示化し継承を遮断）してから`REVOKE_ACCESS`をかけていた。しかしこの凍結は
+/// 対象`sid`と無関係な他trusteeのACEも含めてノードを継承から永久に切り離す副作用があり、
+/// `revoke_ace_recursive`が対象ツリー全体の継承を破壊するバグ（BUG-020、docs/bugs/BUG-020.md）
+/// を引き起こした。ここではACEを1件ずつ生のまま読み対象`sid`以外はそのままコピーするため、
+/// `INHERITED_ACE`フラグの有無に関わらず対象`sid`だけを正確に取り除ける。DACLの保護状態
+/// （`SE_DACL_PROTECTED`）はこの関数の外で呼び出し側が読み取り・維持する（`revoke_ace`参照）。
+///
+/// `ACCESS_ALLOWED_ACE_TYPE`以外のACE種別（このコードベースが自ら書き込むことはない）は
+/// trusteeを解釈せず常に保持する（未知の種別を誤って消さない安全側の判断）。
+unsafe fn copy_dacl_excluding_sid(
+    dacl: *const ACL,
+    sid: PSID,
+    buf: &mut Vec<u8>,
+) -> windows::core::Result<*mut ACL> {
+    unsafe {
+        let mut size_info = ACL_SIZE_INFORMATION::default();
+        GetAclInformation(
+            dacl,
+            &mut size_info as *mut _ as *mut c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )?;
+
+        // 除外は縮む方向にしか働かないため、既存ACLと同じ容量を確保すれば必ず収まる。
+        let buf_size = (size_info.AclBytesInUse + size_info.AclBytesFree)
+            .max(std::mem::size_of::<ACL>() as u32 + 64);
+        buf.resize(buf_size as usize, 0u8);
+        let new_dacl = buf.as_mut_ptr() as *mut ACL;
+        InitializeAcl(new_dacl, buf_size, ACL_REVISION)?;
+
+        for i in 0..size_info.AceCount {
+            let mut ace_ptr: *mut c_void = std::ptr::null_mut();
+            GetAce(dacl, i, &mut ace_ptr)?;
+            let header = &*(ace_ptr as *const ACE_HEADER);
+
+            let is_target = if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
+                let allowed = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
+                let entry_sid = PSID((&allowed.SidStart) as *const u32 as *mut c_void);
+                EqualSid(entry_sid, sid).is_ok()
+            } else {
+                false
+            };
+
+            if !is_target {
+                AddAce(
+                    new_dacl,
+                    ACL_REVISION,
+                    u32::MAX, // MAXDWORD相当: 末尾へ追加し既存の並び順を保つ。
+                    ace_ptr as *const c_void,
+                    header.AceSize as u32,
+                )?;
+            }
+        }
+
+        Ok(new_dacl)
+    }
+}
+
+/// `set_dacl_single_object`の亜種。DACLの内容に加え、`SE_DACL_PROTECTED`（継承を受け付ける
+/// かどうか）も明示的に指定する。`grant_ace_mask`用の`set_dacl_single_object`は意図的に
+/// この状態へ触れない（呼び出し元が継承の有無を問わないため）が、`revoke_ace`は「対象sidを
+/// 取り除いた後、ノードの継承状態を呼び出し前と同じに保つ」ために必要とする。
+unsafe fn set_dacl_single_object_with_protection(
+    path: &Path,
+    new_dacl: *mut ACL,
+    protected: bool,
+) -> windows::core::Result<()> {
+    unsafe {
+        let path_w = wide(&path.to_string_lossy());
+        let handle = CreateFileW(
+            PCWSTR(path_w.as_ptr()),
+            (WRITE_DAC | READ_CONTROL).0,
+            FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )?;
+
+        let mut sd = SECURITY_DESCRIPTOR::default();
+        let sd_ptr = PSECURITY_DESCRIPTOR(&mut sd as *mut _ as *mut _);
+        let result = (|| -> windows::core::Result<()> {
+            InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION)?;
+            SetSecurityDescriptorDacl(sd_ptr, true, Some(new_dacl as *const _), false)?;
+            let protection_flag = if protected {
+                PROTECTED_DACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_DACL_SECURITY_INFORMATION
+            };
+            SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION | protection_flag, sd_ptr)
+        })();
+
+        let _ = CloseHandle(handle);
+        result
+    }
+}
+
+/// `path`のDACLから、`sid`（trustee）に対する既存ACEを全て取り除く。元は
+/// `TIER1A-OPEN-ISSUES.md`課題1のプロファイルtraverse実験（Experiment B）専用の後始末
+/// ヘルパだったが、D-13のfs passthrough撤収機構（`fs revoke`）向けに本番昇格した
 /// （`revoke_ace_recursive`から使う）。`grant_ace_mask`と対になる。単一ノードのみを対象とする
 /// 非再帰の操作であり、`grant_traverse_drive_root`（同じく非再帰・単一ACE）の巻き戻し
 /// （`harness fs revoke-traverse`）にもそのまま使う。
+///
+/// [BUG-020修正] `copy_dacl_excluding_sid`でACEを生のまま読み対象sidだけを除去するため、
+/// 継承由来（`INHERITED_ACE`）かどうかを問わず正確に取り除ける。ノードの継承状態
+/// （`SE_DACL_PROTECTED`）は呼び出し前後で変更しない（このノードが元々継承を受けていなければ
+/// 書き戻し後も受けない、元々継承を受けていれば書き戻し後も受け続ける——ユーザーが独自に
+/// 設定した保護状態を巻き込んで変更しない）。
 pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
         path: path.to_path_buf(),
@@ -1374,27 +1491,23 @@ pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
         .ok()
         .map_err(to_err)?;
 
-        let mut trustee = TRUSTEE_W::default();
-        BuildTrusteeWithSidW(&mut trustee, sid);
-        let ea = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: 0,
-            grfAccessMode: REVOKE_ACCESS,
-            grfInheritance: NO_INHERITANCE,
-            Trustee: trustee,
+        let mut new_buf: Vec<u8> = Vec::new();
+        let new_dacl = match copy_dacl_excluding_sid(existing_dacl as *const _, sid, &mut new_buf) {
+            Ok(dacl) => dacl,
+            Err(e) => {
+                let _ = LocalFree(HLOCAL(sd.0));
+                return Err(to_err(e));
+            }
         };
-        let mut new_dacl: *mut ACL = std::ptr::null_mut();
-        let entries_result =
-            SetEntriesInAclW(Some(&[ea]), Some(existing_dacl as *const _), &mut new_dacl).ok();
-        if let Err(e) = entries_result {
-            let _ = LocalFree(HLOCAL(sd.0));
-            return Err(to_err(e));
-        }
 
-        let set_result = set_dacl_single_object(path, new_dacl);
-
-        let _ = LocalFree(HLOCAL(new_dacl as *mut _));
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        let control_result = GetSecurityDescriptorControl(sd, &mut control, &mut revision);
         let _ = LocalFree(HLOCAL(sd.0));
-        set_result.map_err(to_err)?;
+        control_result.map_err(to_err)?;
+        let was_protected = control & SE_DACL_PROTECTED.0 != 0;
+
+        set_dacl_single_object_with_protection(path, new_dacl, was_protected).map_err(to_err)?;
     }
     Ok(())
 }
@@ -3352,6 +3465,305 @@ mod traverse_diagnostics {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// [S1スパイク] Tier3のSMB使い捨てワークスペース共有（`crates/harness-sandbox/src/
+    /// smb_share.rs`、未コミット作業中）が使い捨てローカルアカウントへNTFSアクセス権を
+    /// 付与する手段として`grant_ace_inheritable_rw`/`revoke_ace`を再利用できるかを検証する。
+    /// AppContainer SID（`ensure_profile`）ではなく、実際に`New-LocalUser`で作る**通常の
+    /// ローカルアカウント**のSIDに対して同じ関数が機能すること、および往復が体感1秒未満で
+    /// 終わること（BUG-011の365,903件SetSecurityFile・93秒超という病的な遅さの再発防止、
+    /// `grant_ace_mask`が単一オブジェクトAPI経由であることの実機確認）を確かめる。
+    ///
+    /// `grant_ace_inheritable_rw`自体はルートへの書込みは1回だが、既存子孫への読取確認
+    /// walk（`sid_ace_mask`）はO(n)で残ることがdocに明記されている。ここでは(a)小さいツリー
+    /// （数ファイル）と(b)実際のワークスペース規模に近いツリー（数百ファイル）の両方を計測し、
+    /// どちらも実用的な時間で終わることを確認する。
+    #[test]
+    #[ignore]
+    fn grant_and_revoke_inheritable_rw_for_a_real_local_user_account_is_fast() {
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+
+        let unique = std::process::id();
+        let user = format!("hns3spike{unique}");
+        let password = "Sp1ke!Test-Pw-Do-Not-Reuse";
+
+        // 使い捨てローカルアカウントを作成し、SID文字列を取得する
+        // （`smb_share.rs::create_ephemeral_share`が実運用でやるのと同じ形、stdin経由で
+        // パスワードを渡しコマンドライン上に露出させない）。
+        let create_script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+$securePassword = ConvertTo-SecureString '{password}' -AsPlainText -Force
+New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword | Out-Null
+(Get-LocalUser -Name '{user}').SID.Value
+"#
+        );
+        let sid_string = run_powershell_stdin_for_test(&create_script)
+            .expect("New-LocalUser + SID lookup must succeed (run under sudo cargo test)");
+        assert!(
+            !sid_string.is_empty(),
+            "expected a non-empty SID string from Get-LocalUser"
+        );
+
+        let cleanup_user = || {
+            let _ = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!("Remove-LocalUser -Name '{user}' -ErrorAction SilentlyContinue"),
+                ])
+                .output();
+        };
+
+        let sid_owned = unsafe {
+            let sid_w = crate::win_common::wide(&sid_string);
+            let mut psid = PSID::default();
+            ConvertStringSidToSidW(PCWSTR(sid_w.as_ptr()), &mut psid)
+                .expect("ConvertStringSidToSidW must parse Get-LocalUser's SID string");
+            psid
+        };
+
+        // `C:\`直下は既定でBUILTIN\Usersに読み取りが継承付与されていることが多く（使い捨て
+        // ローカルアカウントもUsersグループのメンバー）、そこにツリーを置くと「読めた/読めなく
+        // なった」がこちらの明示的な付与/取り消しではなく既定のUsers権限に起因するのか区別
+        // できない（`/inheritance:r`で継承ACEを剥がす案も試したが、DACLが空になり自分自身の
+        // 書込みまで拒否されて壊れた）。ユーザープロファイル配下（`%TEMP%`）はNTFS既定で
+        // 所有者+SYSTEM+Administratorsのみに絞られておりBUILTIN\Usersへの既定付与が無いため、
+        // ここにツリーを置くことで「読めるかどうかは完全にこちらの明示的な付与/取り消しに
+        // 依存する」検証環境になる。
+        let spike_base = std::env::temp_dir().join(format!("harness-tier3-spike-s1-{unique}"));
+
+        // (a) 小さいツリー: ルート + 数階層のネストした既存ファイル数個。
+        let small_root = spike_base.join("small");
+        std::fs::create_dir_all(small_root.join("a").join("b")).expect("create small tree");
+        std::fs::write(small_root.join("a").join("b").join("f.txt"), b"hi").expect("seed file");
+
+        // (b) ワークスペース規模に近いツリー: 数百ファイル。
+        let big_root = spike_base.join("big");
+        for i in 0..20u32 {
+            let dir = big_root.join(format!("dir{i}"));
+            std::fs::create_dir_all(&dir).expect("create big tree dir");
+            for j in 0..20u32 {
+                std::fs::write(dir.join(format!("file{j}.txt")), b"payload")
+                    .expect("seed big tree file");
+            }
+        }
+
+        let cleanup_trees = || {
+            let _ = std::fs::remove_dir_all(&spike_base);
+        };
+
+        // [BUG-020回帰テスト] `small_root/a/b`（ネストしたディレクトリ、必ずしも継承ACEの
+        // 直接付与先=rootではない方）のDACLを、grant/revokeサイクルの前後で比較する。
+        // 旧実装は`revoke_ace_recursive`が全ノードを`PROTECTED_DACL_SECURITY_INFORMATION`で
+        // 恒久的に凍結してしまい、%TEMP%祖先から継承していたSYSTEM/Administrators/所有者の
+        // `(I)`フラグが失われた状態のまま戻らなかった（BUG-020）。ここでは`icacls`の生出力
+        // （`(I)`フラグの有無を含む）をgrant前とrevoke後で完全一致させることで、この副作用が
+        // 再発しないことを機械的に検証する。
+        let nested_dir = small_root.join("a").join("b");
+        let icacls_output = |path: &Path| -> String {
+            std::process::Command::new("icacls")
+                .arg(path)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        let baseline_icacls = icacls_output(&nested_dir);
+
+        let result = (|| -> Result<(), String> {
+            // ベースライン確認: 付与前は読めないこと（プロファイル配下の既定ACLで隔離されて
+            // いることの確認、これが崩れていると以降のgrant/revoke確認が無意味になる）。
+            let probe_target_pre = small_root.join("a").join("b").join("f.txt");
+            let can_read_before_grant = run_as_local_user(
+                &user,
+                password,
+                &format!(
+                    "try {{ Get-Content -LiteralPath '{}' -ErrorAction Stop | Out-Null; exit 0 }} catch {{ exit 1 }}",
+                    probe_target_pre.display()
+                ),
+            );
+            if can_read_before_grant {
+                return Err(
+                    "baseline check failed: the ephemeral local user could already read the \
+                     file before any grant — %TEMP% is not isolated from BUILTIN\\Users on \
+                     this machine, the rest of this test's conclusions would be meaningless"
+                        .to_string(),
+                );
+            }
+
+            let t0 = std::time::Instant::now();
+            grant_ace_inheritable_rw(&small_root, sid_owned)
+                .map_err(|e| format!("grant on small tree failed: {e:?}"))?;
+            let small_grant_elapsed = t0.elapsed();
+            println!("=== S1: small tree grant_ace_inheritable_rw took {small_grant_elapsed:?} ===");
+            assert!(
+                small_grant_elapsed < std::time::Duration::from_secs(2),
+                "small-tree grant must finish well under 1-2s, took {small_grant_elapsed:?}"
+            );
+
+            let t1 = std::time::Instant::now();
+            grant_ace_inheritable_rw(&big_root, sid_owned)
+                .map_err(|e| format!("grant on big tree (400 files) failed: {e:?}"))?;
+            let big_grant_elapsed = t1.elapsed();
+            println!("=== S1: 400-file tree grant_ace_inheritable_rw took {big_grant_elapsed:?} ===");
+            assert!(
+                big_grant_elapsed < std::time::Duration::from_secs(5),
+                "400-file tree grant must not regress toward BUG-011-style pathological slowness, \
+                 took {big_grant_elapsed:?}"
+            );
+
+            // revokeもO(n)（物理コピーされたACEを個別に消す、上記コメント参照）であるため、
+            // 400ファイル規模での実測値も取っておく（grant/revoke双方のO(n)係数を見るため）。
+            let t_big_revoke = std::time::Instant::now();
+            revoke_ace_recursive(&big_root, sid_owned)
+                .map_err(|e| format!("revoke_ace_recursive on big tree failed: {e:?}"))?;
+            let big_revoke_elapsed = t_big_revoke.elapsed();
+            println!("=== S1: 400-file tree revoke_ace_recursive took {big_revoke_elapsed:?} ===");
+
+            // 実際にそのローカルアカウントとしてファイルを読める/書けることを確認する
+            // （ACEが付いているというだけでなく、実効アクセスとして機能することの確認）。
+            let probe_target = small_root.join("a").join("b").join("f.txt");
+            let can_read_after_grant =
+                run_as_local_user(&user, password, &format!(
+                    "try {{ Get-Content -LiteralPath '{}' -ErrorAction Stop | Out-Null; exit 0 }} catch {{ exit 1 }}",
+                    probe_target.display()
+                ));
+            assert!(
+                can_read_after_grant,
+                "the ephemeral local user must be able to read a pre-existing nested file \
+                 after grant_ace_inheritable_rw (this is the actual SMB-share access scenario, \
+                 not just ACE presence)"
+            );
+
+            let write_target = small_root.join("a").join("b").join("new-from-user.txt");
+            let can_write_after_grant =
+                run_as_local_user(&user, password, &format!(
+                    "try {{ 'written' | Set-Content -LiteralPath '{}' -ErrorAction Stop; exit 0 }} catch {{ exit 1 }}",
+                    write_target.display()
+                ));
+            assert!(
+                can_write_after_grant,
+                "the ephemeral local user must be able to write a new file under the \
+                 inheritable-ACE root after grant_ace_inheritable_rw"
+            );
+
+            // [S1発見] `revoke_ace(root)`だけでは不十分だった: NTFSの継承ACEは親への参照
+            // ではなく子オブジェクト作成時点で物理的に複製される実体（Phase B-2の知見どおり）
+            // であるため、`grant_ace_inheritable_rw`のルート付与は実質的に全既存子孫へ物理コピー
+            // を作る（だからこそgrant側はO(1)で済む）。revoke側はこの物理コピーを個別に消す
+            // 必要があり、構造的にO(n)にならざるを得ない。`revoke_ace`（非再帰・単一ノード）を
+            // 使った初回の実装は、rootのACEは消えても子孫の物理コピーが残るため`f.txt`が読める
+            // ままという実機不具合を引き起こした（本テストで実際に検出・修正）。正しくは
+            // `revoke_ace_recursive`（既存の再walk版）を使う。
+            let t2 = std::time::Instant::now();
+            revoke_ace_recursive(&small_root, sid_owned)
+                .map_err(|e| format!("revoke_ace_recursive on small tree failed: {e:?}"))?;
+            let revoke_elapsed = t2.elapsed();
+            println!("=== S1: revoke_ace_recursive (small tree, O(n) walk) took {revoke_elapsed:?} ===");
+            assert!(
+                revoke_elapsed < std::time::Duration::from_secs(2),
+                "revoke_ace_recursive on a small tree must still be fast, took {revoke_elapsed:?}"
+            );
+
+            if let Ok(out) = std::process::Command::new("icacls").arg(&probe_target).output() {
+                println!(
+                    "=== S1 DEBUG: icacls on {} after revoke_ace_recursive ===\n{}",
+                    probe_target.display(),
+                    String::from_utf8_lossy(&out.stdout)
+                );
+            }
+
+            // [BUG-020回帰assert] grant前後でのDACL完全一致確認（`(I)`フラグの有無を含む）。
+            // 一致しなければ、grant/revokeサイクルがこのノードの継承状態を恒久的に変えて
+            // しまったことを意味する（`nested_dir`は`grant_ace_inheritable_rw`のroot自身では
+            // なく、rootへの付与がNTFSの物理複製で遡及した既存の子孫ノード——BUG-020が
+            // 実際に壊していたのはこちら側）。
+            let post_revoke_icacls = icacls_output(&nested_dir);
+            if post_revoke_icacls != baseline_icacls {
+                return Err(format!(
+                    "BUG-020 regression: DACL of {} does not match its pre-grant baseline after \
+                     grant_ace_inheritable_rw + revoke_ace_recursive (inheritance was not fully \
+                     restored)\n--- baseline ---\n{baseline_icacls}\n--- after revoke ---\n{post_revoke_icacls}",
+                    nested_dir.display()
+                ));
+            }
+
+            let can_read_after_revoke =
+                run_as_local_user(&user, password, &format!(
+                    "try {{ Get-Content -LiteralPath '{}' -ErrorAction Stop | Out-Null; exit 0 }} catch {{ exit 1 }}",
+                    probe_target.display()
+                ));
+            assert!(
+                !can_read_after_revoke,
+                "after revoke_ace, the ephemeral local user must no longer be able to read \
+                 the file (proves the ACE was actually removed, not just the account deleted)"
+            );
+
+            Ok(())
+        })();
+
+        cleanup_trees();
+        cleanup_user();
+        result.expect("S1 spike must succeed end-to-end");
+    }
+
+    /// パスワードをコマンドライン上に晒さずstdin経由でPowerShellへ渡す
+    /// （`smb_share.rs::run_powershell_stdin`と同じ規律をこのテストモジュールでも守る）。
+    fn run_powershell_stdin_for_test(script: &str) -> Result<String, String> {
+        use std::io::Write;
+        let mut child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
+            // `vmsandbox::run_powershell`と同じ罠: 常駐管理者pwsh(7)から起動すると継承した
+            // `PSModulePath`のせいで`Microsoft.PowerShell.Security`のオートロードが壊れ、
+            // `ConvertTo-SecureString`が非終端エラーで静かに失敗する。
+            .env_remove("PSModulePath")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to spawn powershell.exe: {e}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or("powershell stdin unavailable")?
+            .write_all(script.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "exit={:?} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// `Start-Process -Credential`でSMBの実効アクセスに近い形（実際のログオンセッション、
+    /// AppContainerのspawnヘルパーとは別経路）で1コマンドを実行し、成功/失敗をbool化する。
+    /// パスワードはstdin経由ではなく`-Credential`引数化のためこの関数内で組み立てるが、
+    /// テスト専用の使い捨てパスワードのみを扱う（本番コード`smb_share.rs`はstdin経由を守る）。
+    fn run_as_local_user(user: &str, password: &str, inner_command: &str) -> bool {
+        let script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+$securePassword = ConvertTo-SecureString '{password}' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential('{user}', $securePassword)
+$p = Start-Process powershell.exe -Credential $cred -ArgumentList '-NoProfile','-NonInteractive','-Command','{inner}' -WindowStyle Hidden -PassThru -Wait -WorkingDirectory "$env:SystemRoot\Temp"
+exit $p.ExitCode
+"#,
+            inner = inner_command.replace('\'', "''")
+        );
+        match std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .env_remove("PSModulePath")
+            .output()
+        {
+            Ok(output) => output.status.success(),
+            Err(_) => false,
+        }
     }
 }
 

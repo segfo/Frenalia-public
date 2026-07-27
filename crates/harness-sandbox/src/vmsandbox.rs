@@ -69,6 +69,20 @@ impl From<std::io::Error> for VmError {
     }
 }
 
+/// ワークスペース共有方式（`plans/DESIGN-SANDBOX-VMISOLATION.md`§2.4）。移行期間中の
+/// 切り替えフラグ（実機E2Eで問題が出た場合に即座に`CopyInOut`へフォールバックできるように
+/// する、プラン記載の移行手順）。既定は`CopyInOut`（既存の実装済み・実績のある経路）のまま。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceShareMode {
+    /// 従来方式: セッション境界での`copy_in_workspace`/`copy_out_workspace`（Incus file
+    /// push/pull、1ファイル1リクエスト）。大規模ワークスペース（`target/`等）で300秒IPC
+    /// タイムアウトを起こす既知の欠陥がある（`plans/TIER1A-OPEN-ISSUES.md`項目9）。
+    CopyInOut,
+    /// 新方式: WindowsホストでSMB共有を切り、ゲスト内から`mount -t cifs`、Incusの
+    /// disk deviceでコンテナへbind-mountするライブ共有。
+    Cifs,
+}
+
 /// 固定の運用規約（モジュールdoc参照）。
 pub struct VmSandboxConfig {
     pub golden_vhdx: PathBuf,
@@ -78,6 +92,11 @@ pub struct VmSandboxConfig {
     pub vm_work_dir: PathBuf,
     /// ウォームスタート（`--tier3-warm`、フェーズB）を使うか。既定はfalse（毎回コールドブート）。
     pub warm: bool,
+    pub workspace_share_mode: WorkspaceShareMode,
+    /// 内部vSwitchのホスト側ゲートウェイIP（`WorkspaceShareMode::Cifs`でSMB共有先として
+    /// ゲストから参照する。`plans/vm-spike/RESULTS.md`§3.6で確立した固定値、モジュールdoc
+    /// 参照）。`guest_ip`と同じ`/24`の`.1`。
+    pub smb_host_ip: IpAddr,
 }
 
 /// ウォームスタート（production checkpoint + Restore方式、`plans/DESIGN-SANDBOX-VMISOLATION.md`
@@ -100,13 +119,36 @@ impl Default for VmSandboxConfig {
             incus_port: 8443,
             vm_work_dir: PathBuf::from(r"C:\ProgramData\harness\vm-sessions"),
             warm: false,
+            // 実機E2E確認（CIFS共有作成・双方向マウント・disk device bind-mount・
+            // ファイアウォールスコープ限定、いずれも実機で確認済み）を経て、`Cifs`を既定に
+            // 昇格した。`copy_in_workspace`（旧方式）は`target/`等の大規模ワークスペースで
+            // 300秒IPCタイムアウトを起こす既知の欠陥があり（本来の問題）、これが解消される
+            // のが今回の目的そのもの。何か問題が出た場合の逃げ道として
+            // `HARNESS_TIER3_CIFS_WORKSPACE=0`で旧方式へ明示的に戻せるようにしておく。
+            workspace_share_mode: if std::env::var("HARNESS_TIER3_CIFS_WORKSPACE").as_deref() == Ok("0") {
+                WorkspaceShareMode::CopyInOut
+            } else {
+                WorkspaceShareMode::Cifs
+            },
+            smb_host_ip: "172.20.100.1".parse().unwrap(),
         }
     }
 }
 
-fn run_powershell(script: &str) -> Result<String, VmError> {
+pub(crate) fn run_powershell(script: &str) -> Result<String, VmError> {
     let output = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        // **実機で判明した罠**: harnessの管理者権限操作を「常駐管理者PowerShell(pwsh、
+        // PowerShell 7)セッションから都度呼ぶ」運用（グローバルCLAUDE.md記載の定石）だと、
+        // 起動する`powershell.exe`(Windows PowerShell 5.1)がpwsh7側の`PSModulePath`を
+        // そのまま継承し、5.1組み込みの`Microsoft.PowerShell.Security`モジュールがpwsh7の
+        // 非互換な同名モジュールに覆い隠される。この状態で`ConvertTo-SecureString`等の
+        // 同モジュール由来コマンドレットを叩くと、型データの重複登録エラーを経て
+        // 非終端の`CommandNotFoundException`（オートロード失敗）を静かに返し、後続の
+        // `New-LocalUser`等が空/nullな入力のまま実行され続けるという壊れ方をする
+        // （実機で`ConvertTo-SecureString`のみ再現・特定。`PSModulePath`を子プロセスの
+        // 環境から除去すると5.1が自前の既定パスで正しく解決し直ちに解消することを確認済み）。
+        .env_remove("PSModulePath")
         .output()
         .map_err(|e| VmError::PowerShell(format!("failed to spawn powershell.exe: {e}")))?;
     if !output.status.success() {
@@ -353,6 +395,23 @@ fn known_hosts_file() -> Result<PathBuf, VmError> {
     let dir = ssh_keypair_dir()?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join("known_hosts"))
+}
+
+/// **実機で判明した罠**: `guest_ip`はセッションをまたいで常に同一の固定IP
+/// （`VmSandboxConfig::default`参照）だが、SSHホスト鍵はfirstbootのたびに個体ごと
+/// 再生成される。`known_hosts_file()`が返す実ファイルへセッションをまたいで書き込みが
+/// 蓄積されると、2セッション目以降は同一IPに対し「既知だが鍵が変わった」状態になり、
+/// `StrictHostKeyChecking=no`は素通りしない（OpenSSHは「未知のホストへの初回接続」だけを
+/// 許容し、MITM疑いのある「鍵が変わった」状態は無条件に拒否するため）。検証自体を最初から
+/// 行わない設計（D-20/D-21）である以上、このファイルを残す理由が無いため、セッション開始の
+/// たびに空へ戻す。
+fn reset_known_hosts_file() -> Result<(), VmError> {
+    let path = known_hosts_file()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(VmError::Io(e.to_string())),
+    }
 }
 
 /// AlmaLinux VM自体（`root`）へSSH鍵認証でコマンドを実行する（`ssh.exe`、Windows 10 1809+
@@ -804,6 +863,113 @@ impl IncusClient {
         Ok(())
     }
 
+    /// ワークスペースのCIFSライブ共有をコンテナへbind-mountするdisk deviceを追加する
+    /// （`plans/DESIGN-SANDBOX-VMISOLATION.md`§2.4のライブ共有方式）。`attach_acl_to_container`
+    /// と同じ「GETで`expanded_devices`取得→Rust側でマージ→PUTで丸ごと書き戻す」手順を踏む
+    /// （単純な`PATCH`だとdevicesのネストしたマージが期待通り効かない可能性があるため、
+    /// 既存のACL付与ロジックが確立した手順に合わせて安全側に倒す）。
+    ///
+    /// `source`はコンテナが動くAlmaLinux VM自身の中のパス（`mount -t cifs`した先、
+    /// 例`/mnt/harness-workspace`）であり、Windowsホスト側のパスではない点に注意。
+    pub fn add_disk_device(
+        &self,
+        container_name: &str,
+        device_name: &str,
+        source: &str,
+        path: &str,
+    ) -> Result<(), VmError> {
+        let (status, value) = self.request(
+            reqwest::Method::GET,
+            &format!("/1.0/instances/{container_name}"),
+            None,
+        )?;
+        if status >= 400 {
+            return Err(VmError::Incus(format!(
+                "add_disk_device: failed to fetch instance: status={status} body={value}"
+            )));
+        }
+        let inst = value
+            .get("metadata")
+            .ok_or_else(|| VmError::Incus("instance response has no metadata".to_string()))?;
+        let mut devices = inst
+            .get("expanded_devices")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        devices[device_name] = serde_json::json!({
+            "type": "disk",
+            "source": source,
+            "path": path,
+        });
+        let config = inst.get("config").cloned().unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let body = serde_json::json!({ "devices": devices, "config": config });
+        let (status, value) = self.request(
+            reqwest::Method::PUT,
+            &format!("/1.0/instances/{container_name}"),
+            Some(body),
+        )?;
+        if status == 202 {
+            self.wait_operation(
+                &format!(
+                    "/1.0/operations/{}",
+                    value
+                        .get("metadata")
+                        .and_then(|m| m.get("id"))
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                ),
+                Duration::from_secs(30),
+            )?;
+        } else if status >= 400 {
+            return Err(VmError::Incus(format!(
+                "add_disk_device failed: status={status} body={value}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// unprivilegedコンテナのroot（namespace内uid 0）がホスト側（このAlmaLinux VM自身の
+    /// ファイルシステム上）で実際に何uid/gidへマップされるかを返す。**実機で判明した罠**:
+    /// `incus config get <name> volatile.idmap.base`は常に`0`を返す（無関係な旧フィールド
+    /// らしく、実際のマッピングは`volatile.idmap.current`というJSON配列にある）。この値を
+    /// CIFSマウントの`uid=/gid=`（`forceuid,forcegid`込み）へ渡さないと、コンテナ内から見た
+    /// ホスト実uid 0所有のファイルが`nobody`扱いになり書込みが`Permission denied`になる
+    /// （spike検証で発見。`shift=true`によるidmap shiftはCIFSが対応しておらず
+    /// `Required idmapping abilities not available`で失敗するため、この静的uid合わせが
+    /// 唯一の非特権コンテナ向け解決策）。
+    pub fn container_root_host_id(&self, name: &str) -> Result<(u32, u32), VmError> {
+        let (status, value) = self.request(
+            reqwest::Method::GET,
+            &format!("/1.0/instances/{name}"),
+            None,
+        )?;
+        if status >= 400 {
+            return Err(VmError::Incus(format!(
+                "container_root_host_id: failed to fetch instance: status={status} body={value}"
+            )));
+        }
+        let idmap_str = value
+            .get("metadata")
+            .and_then(|m| m.get("config"))
+            .and_then(|c| c.get("volatile.idmap.current"))
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| VmError::Incus(format!("container {name} has no volatile.idmap.current")))?;
+        let idmap: Vec<serde_json::Value> = serde_json::from_str(idmap_str)
+            .map_err(|e| VmError::Incus(format!("failed to parse volatile.idmap.current: {e}")))?;
+        let uid = idmap
+            .iter()
+            .find(|e| e.get("Isuid").and_then(|v| v.as_bool()) == Some(true) && e.get("Nsid").and_then(|v| v.as_i64()) == Some(0))
+            .and_then(|e| e.get("Hostid"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| VmError::Incus(format!("container {name}: no uid mapping for nsid 0")))?;
+        let gid = idmap
+            .iter()
+            .find(|e| e.get("Isgid").and_then(|v| v.as_bool()) == Some(true) && e.get("Nsid").and_then(|v| v.as_i64()) == Some(0))
+            .and_then(|e| e.get("Hostid"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| VmError::Incus(format!("container {name}: no gid mapping for nsid 0")))?;
+        Ok((uid as u32, gid as u32))
+    }
+
     pub fn pull_file(&self, name: &str, remote_path: &str) -> Result<Vec<u8>, VmError> {
         let url = format!(
             "{}/1.0/instances/{name}/files?path={}",
@@ -1003,6 +1169,11 @@ pub struct VmSession {
     /// ウォームセッションが保持する直列化ロック（B2）。`teardown`（または`Drop`）まで
     /// 保持し続けることでマシン全体で1セッションに排他する。コールドセッションでは`None`。
     warm_lock: Option<WarmLock>,
+    /// `WorkspaceShareMode::Cifs`のセッションでのみ`Some`（`smb_share::create_ephemeral_share`
+    /// が作った使い捨て共有名・アカウント名）。teardown時にこれを見て`destroy_ephemeral_share`
+    /// を呼ぶかどうかを判定する（`CopyInOut`セッションでは`None`のまま）。
+    smb_share_name: Option<String>,
+    smb_user: Option<String>,
 }
 
 const CONTAINER_IMAGE_ALIAS: &str = "alpine/3.21";
@@ -1216,6 +1387,10 @@ Start-VM -Name '{name}'
         warm: bool,
     ) -> Result<Self, VmError> {
         let GuestIdentity { session_id, vm_name, diff_vhdx } = identity;
+        // 前回セッションの残留ホスト鍵によるSSH拒否を防ぐ（`reset_known_hosts_file`のdoc参照）。
+        // このセッションで最初にSSHを使う箇所（egress allowlist設定・CIFS認証情報配布/マウント、
+        // いずれも本関数の呼び出し範囲内）より前に1回だけ行う。
+        reset_known_hosts_file()?;
         let incus = wait_for_guest_ready(config, guest_wait_timeout)?;
 
         let container_name = format!("harness-{session_id}");
@@ -1274,26 +1449,99 @@ Start-VM -Name '{name}'
         let interfaces_conf = format!(
             "auto eth0\niface eth0 inet static\n    address {CONTAINER_STATIC_IP}\n    gateway {CONTAINER_GATEWAY}\n"
         );
-        let (_stdout, stderr, code) = incus.exec(
+        // **実機で判明した罠(3)**: コンテナ起動直後、Alpineのopenrc `networking`サービスは
+        // eth0の自動DHCPブリングアップをまだ実行中のことがあり（`rc-status`で`networking
+        // [starting]`のまま長時間止まる、Incusブリッジ側のIPv4 DHCP応答が遅い/来ない場合に
+        // 発生）、この間ifupdown-ngの排他ロックを握ったままになる。**この状態で
+        // `rc-service networking stop`を叩くと、openrcのサービスマネージャ自身が
+        // 「start処理が終わるまでstopを受け付けない」ため一緒にハングする**（実機で確認：
+        // stopコマンド自体が返ってこず、後続の`ifdown`/`pkill`にすら到達しない。openrc経由の
+        // 「お行儀の良い」停止要求では、まさにこの詰まった状態を解消できない）。openrcを
+        // 経由せず、ロックを握っている実プロセス（自動`ifup`本体・その子の`dhcp`ヘルパー・
+        // `udhcpc`）を`pkill -9`で直接強制終了することで、openrc側の「starting」状態が
+        // 詰まっていても確実に解放できる（`pkill -9 -x udhcpc`だけでは、まだ`ifup`本体や
+        // `dhcp`ヘルパーが生き残ってロックを取り直す可能性があるため、3つとも対象にする）。
+        // **実機で判明した罠(3b)**: 当初`pkill -9 -f 'ifup -i'`（コマンドライン全体一致）を
+        // 使ったところ、この`pkill`コマンド自身の引数文字列に"ifup -i"という部分文字列が
+        // 含まれるため`-f`が**自分自身にもマッチして自殺**した（exit=137=SIGKILL、実機で
+        // 再現・特定）。プロセス名の完全一致のつもりで`-x ifup`/`-x dhcp`/`-x udhcpc`
+        // （`/proc/<pid>/comm`は確かに"ifup"/"dhcp"/"udhcpc"と一致することを実機確認済み）に
+        // 切り替えたが、**それでも対象を1つも殺せず無言で失敗し続けた**（`>/dev/null 2>&1`で
+        // 抑制していたため気付くのに時間を要した）。原因はAlpineのbusybox版`pkill`の`-x`が
+        // GNU版と異なり`/proc/comm`（basenameのみ）ではなく**フルパス込みの起動名**
+        // （`/sbin/udhcpc`等）との完全一致を要求すること（実機で`pkill -9 udhcpc`
+        // （`-x`無し、部分一致）なら確実に殺せることを確認して特定）。`-x`を外した部分一致に
+        // 変更する（自プロセス自身の`comm`は`sh`のため、`-f`を使わない限りこのパターンで
+        // 自己マッチする心配は無い）。
+        // **診断強化（原因未特定の実機障害切り分け用）**: 従来は各ステップを`>/dev/null 2>&1`で
+        // 抑制していたため、失敗時にstdout/stderrが両方空のままexit codeだけが返り、どのステップで
+        // 落ちたか一切判別できなかった（`docs/bugs/`記録予定の障害）。`set -x`で実行トレースを残し、
+        // 各ステップ後に`STEP=`マーカーをstdoutへ出す。最終判定も単一の`&&`鎖からifブランチへ
+        // 分離し、`FAIL=no-inet`かどうかで「ifupは成功扱いだがIPが付かない」ケースを識別できるように
+        // する。失敗が確定した場合のみ、追加の往復を要さず同一execの中で診断ダンプ
+        // （アドレス・ルート・interfaces内容・ifupdown-ng状態・`ifup -v`生出力・rc-status・
+        // プロセス残存）を出す。**罠(3b)の教訓によりpkillのパターン自体は一切変更しない**
+        // （`-f`を足すと自分自身にマッチして自殺する）。
+        //
+        // **実機診断で判明した罠(4)**: 上記の診断強化により、当初原因不明だった本エクスポート
+        // の失敗が次のように特定できた（`docs/bugs/`記録予定）。冒頭の`pkill -9 udhcpc`実行時点
+        // では、コンテナ起動直後のopenrc自動DHCPブリングアップがまだudhcpcを起動し切っておらず
+        // （`rc-status`が`networking [started]`を返す時点でも、実プロセスの生成は追いついて
+        // いないことがある）、直後の`sleep 1`より後にudhcpcが新規生成されて`ifdown`/`ifup`の
+        // 排他ロックを握ってしまう。結果、リトライループの大半が
+        // `could not acquire exclusive lock for eth0: Resource temporarily unavailable`で
+        // 空振りし、ロックがようやく空いた回では今度はifupdown-ng側が「(旧DHCP設定のまま)既に
+        // 設定済み」とみなし`ifup: skipping auto interface eth0 (already configured), use
+        // --force to force configuration`で**無言のexit 0スキップ**をする。どちらも冒頭1回の
+        // `pkill`＋`ifup`（force無し）では防げないため、リトライの**毎周**で
+        // `pkill -9 udhcpc`を撃ち直しつつ`ifup --force`で明示的に強制再設定する形へ変える。
+        let (stdout, stderr, code) = incus.exec(
             &container_name,
             &[
                 "sh",
                 "-c",
                 &format!(
-                    "printf '%s' '{interfaces_conf}' > /etc/network/interfaces && \
-                     ifdown eth0 >/dev/null 2>&1; pkill -x udhcpc >/dev/null 2>&1; sleep 1; \
-                     ok=0; i=0; while [ $i -lt 10 ]; do ifup eth0 >/dev/null 2>&1 && {{ ok=1; break; }}; i=$((i+1)); sleep 1; done; \
-                     ip -4 addr show eth0 | grep -q 'inet ' && \
-                     echo 'nameserver 1.1.1.1' > /etc/resolv.conf && mkdir -p {WORKSPACE_MOUNT}"
+                    "set -x; \
+                     pkill -9 ifup; \
+                     pkill -9 dhcp; \
+                     pkill -9 udhcpc; \
+                     echo 'STEP=pkill-done'; \
+                     sleep 1; \
+                     printf '%s' '{interfaces_conf}' > /etc/network/interfaces; \
+                     echo 'STEP=interfaces-written'; \
+                     ifdown eth0; \
+                     echo 'STEP=ifdown-done'; \
+                     ok=0; i=0; while [ $i -lt 20 ]; do \
+                       pkill -9 udhcpc; pkill -9 dhcp; \
+                       ifup --force eth0 && {{ ok=1; break; }}; \
+                       i=$((i+1)); sleep 1; \
+                     done; \
+                     echo \"STEP=ifup-loop-done ok=$ok tries=$i\"; \
+                     if ip -4 addr show eth0 | grep -q 'inet '; then \
+                       echo 'STEP=inet-ok'; \
+                       echo 'nameserver 1.1.1.1' > /etc/resolv.conf; \
+                       mkdir -p {WORKSPACE_MOUNT}; \
+                       echo 'STEP=resolv-and-mkdir-done'; \
+                     else \
+                       echo 'FAIL=no-inet'; \
+                       echo '---diag: ip -4 addr show eth0---'; ip -4 addr show eth0; \
+                       echo '---diag: ip -4 route---'; ip -4 route; \
+                       echo '---diag: /etc/network/interfaces---'; cat /etc/network/interfaces; \
+                       echo '---diag: /run/ifstate/eth0---'; cat /run/ifstate/eth0 2>&1; \
+                       echo '---diag: ifup -v eth0---'; ifup -v eth0 2>&1; \
+                       echo '---diag: rc-status -a---'; rc-status -a 2>&1; \
+                       echo '---diag: ps w---'; ps w; \
+                       exit 1; \
+                     fi"
                 ),
             ],
             "/",
             &[],
-            Duration::from_secs(30),
+            Duration::from_secs(60),
         )?;
         if code != Some(0) {
             return Err(VmError::Incus(format!(
-                "container {container_name}: static IP/DNS setup failed (exit={code:?}): {stderr}"
+                "container {container_name}: static IP/DNS setup failed (exit={code:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
             )));
         }
 
@@ -1308,6 +1556,56 @@ Start-VM -Name '{name}'
             Some(key)
         };
 
+        // ワークスペース共有（`WorkspaceShareMode`、移行期間の切り替えフラグ）。
+        // `Cifs`: Windows側でSMB共有→SSH経由でゲストへ認証情報配布→ゲスト内`mount -t cifs`
+        // →Incus disk deviceでコンテナへbind-mount、のライブ共有シーケンス。ウォーム
+        // セッションでもcheckpoint Restore後の`attach_to_guest`呼び出しのたびに毎回
+        // やり直す（使い捨て認証情報をセッションをまたいで使い回さない、D-22のセッション
+        // 使い捨て原則を優先、ユーザー確認済み）。
+        let (smb_share_name, smb_user) = if config.workspace_share_mode == WorkspaceShareMode::Cifs {
+            let (share, user, password) = crate::smb_share::create_ephemeral_share(&session_id, workspace_root)?;
+            // `record_session`は`vm_name`をキーに台帳エントリを作る（ウォームセッションでは
+            // `vm_name == WARM_VM_NAME`固定、コールドでは`vm_name == session_id`）ため、
+            // ここでも`vm_name`をキーに揃える（`session_id`ではない点に注意、B10）。
+            crate::vm_ledger::record_smb_share(&vm_name, &share, &user);
+
+            let ssh_key = ensure_ssh_keypair()?;
+            let cred_remote = format!("/etc/harness-smb-{session_id}.cred");
+            let cred_contents = format!("username={user}\npassword={password}\n");
+            ssh_push_file(config.guest_ip, &ssh_key, cred_contents.as_bytes(), &cred_remote)?;
+            ssh_exec_checked(
+                config.guest_ip,
+                &ssh_key,
+                &format!("chmod 600 {cred_remote}"),
+                Duration::from_secs(10),
+            )?;
+
+            // unprivilegedコンテナのroot（namespace uid 0）が実際にホスト側でどのuid/gidへ
+            // マップされるかを問い合わせ、CIFSマウントの`uid=/gid=`をそれに合わせる
+            // （`container_root_host_id`のdoc参照。`shift=true`によるidmap shiftはCIFSが
+            // 対応しておらず使えないため、この静的合わせが唯一の非特権コンテナ向け解決策、
+            // spike検証で確認済み）。
+            let (host_uid, host_gid) = incus.container_root_host_id(&container_name)?;
+            ssh_exec_checked(
+                config.guest_ip,
+                &ssh_key,
+                &format!(
+                    "mkdir -p /mnt/harness-workspace && \
+                     mount -t cifs //{smb_host}/{share} /mnt/harness-workspace \
+                     -o credentials={cred_remote},uid={host_uid},gid={host_gid},forceuid,forcegid,\
+                     file_mode=0644,dir_mode=0755,cache=strict,vers=3.1.1",
+                    smb_host = config.smb_host_ip,
+                ),
+                Duration::from_secs(30),
+            )?;
+
+            incus.add_disk_device(&container_name, "workspace", "/mnt/harness-workspace", WORKSPACE_MOUNT)?;
+
+            (Some(share), Some(user))
+        } else {
+            (None, None)
+        };
+
         let session = Self {
             session_id,
             vm_name,
@@ -1317,8 +1615,12 @@ Start-VM -Name '{name}'
             ssh_key,
             warm,
             warm_lock: None,
+            smb_share_name,
+            smb_user,
         };
-        session.copy_in_workspace(workspace_root)?;
+        if config.workspace_share_mode == WorkspaceShareMode::CopyInOut {
+            session.copy_in_workspace(workspace_root)?;
+        }
         Ok(session)
     }
 
@@ -1493,7 +1795,15 @@ Start-VM -Name '{name}' -ErrorAction SilentlyContinue
     }
 
     pub fn teardown(self, workspace_root: &Path) -> Result<(), VmError> {
-        let copy_out_result = self.copy_out_workspace(workspace_root);
+        // `WorkspaceShareMode::Cifs`セッションはライブ共有のためワークスペースの中身は
+        // 常にホストの実ファイルシステムそのもの（bind-mountを外すだけ）で、明示的な
+        // copy-outは不要（`copy_in_workspace`と同じくPhase 1の全ファイルpull往復を避ける、
+        // このライブ共有方式を導入した本来の目的）。
+        let copy_out_result = if self.smb_share_name.is_some() {
+            Ok(())
+        } else {
+            self.copy_out_workspace(workspace_root)
+        };
         // egress許可リストを構成していた場合のみ、VMが消える前に監査ログを回収する
         // （ユーザー要望「通信の監査」対応、失敗してもteardown自体は止めない）。
         if let Some(ssh_key) = &self.ssh_key {
@@ -1506,6 +1816,14 @@ Start-VM -Name '{name}' -ErrorAction SilentlyContinue
         }
         let _ = self.incus.stop_container(&self.container_name);
         let _ = self.incus.delete_container(&self.container_name);
+
+        // Windows側の使い捨てSMB共有・ローカルアカウントを破棄する（共有→アカウントの順、
+        // `smb_share::destroy_ephemeral_share`のdoc参照）。コンテナ撤収後・VM撤収前に行う
+        // （どちらの順でも実害は無いが、共有の実体はWindows側でありVM状態と独立なため
+        // ここで先に片付ける）。
+        if let (Some(share), Some(user)) = (&self.smb_share_name, &self.smb_user) {
+            crate::smb_share::destroy_ephemeral_share(share, user, Some(workspace_root));
+        }
 
         if self.warm {
             // ウォームセッション: VM自体は削除せず、checkpointへRestoreして次回セッションの
@@ -1567,6 +1885,16 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
     };
 
     let orphans = crate::vm_ledger::select_orphans(&ledger, current_session_id, &existing_vm_names);
+
+    // SMBライブ共有（`plans/DESIGN-SANDBOX-VMISOLATION.md`§2.4）のセッション使い捨て共有・
+    // アカウントも、孤児VMと一緒に回収する（VM自体が孤児になった時点で、そのVMが使っていた
+    // 共有・アカウントも用済みのため）。
+    for (share_name, user_name) in crate::vm_ledger::select_smb_orphans(&ledger, &orphans) {
+        // 台帳が`workspace_root`自体を記録していないため、孤児回収経路ではNTFS ACEの取り消しは
+        // スキップされる（`destroy_ephemeral_share`のdoc参照、既知の限界）。
+        crate::smb_share::destroy_ephemeral_share(&share_name, &user_name, None);
+    }
+
     for vm_name in &orphans {
         let diff_vhdx = ledger
             .entries

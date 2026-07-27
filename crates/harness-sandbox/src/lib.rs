@@ -53,6 +53,9 @@ pub mod vmsandboxd;
 #[cfg(windows)]
 pub mod vm_ledger;
 
+#[cfg(windows)]
+pub mod smb_share;
+
 #[cfg(target_os = "linux")]
 pub mod linux_bwrap;
 
