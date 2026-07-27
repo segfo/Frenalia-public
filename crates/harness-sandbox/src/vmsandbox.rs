@@ -12,23 +12,33 @@
 //! （`--net-allow-domain`未指定時の後方互換）。ゴールデン像へのIncusクライアント証明書焼き込み
 //! も完了しており、ランタイムはSSH・ペアリング不要でmTLS直結できる。
 //!
-//! **Phase 3も実装済み（台帳+GC・ウォームスタート）**:
-//! - **台帳+次回起動GC（D-24）**: `crate::vm_ledger`が`%APPDATA%\harness\tier3-vm-ledger.json`
-//!   へVM生成を記録し、`gc_orphan_sessions`が新規VM起動前（`vmsandboxd::serve_inner`）に
-//!   前回セッションの孤児VM・差分VHDXを撤収する。手動運用・障害調査用の明示コマンド
-//!   `harness tier3 gc`も用意した（`vmsandboxd::run_gc_only`/`serve_gc`）。
-//! - **ウォームスタート**（`--tier3-warm`、既定off）: `ensure_warm_template`が「起動済み・
-//!   IP疎通済み・Incus trusted」状態のproduction checkpoint（`WARM_CHECKPOINT_NAME`）を
-//!   持つ永続VM（`WARM_VM_NAME`）を一度だけ用意する。`VmSession::start_warm_or_fallback`が
-//!   `Restore-VMSnapshot`で毎回このcheckpointへ巻き戻してから起動することで、コールド
-//!   ブート（起動+firstboot）のコストを省く。固定静的IPの制約上Tier3は元々同時1セッションが
-//!   前提のため、ウォームVMは`WarmLock`（ファイルロック、`vm_work_dir/tier3-warm.lock`）で
-//!   直列化する。破損（Restore失敗・疎通タイムアウト等）を検出した場合はテンプレートを
-//!   1回だけ破棄して再provisioning、それも失敗すればコールドブートへ自動フォールバックする。
+//! **Phase 3実装済み（台帳+GC・ウォームスタート）**、**Phase B実装済み（VM共有化・
+//! マルチセッション並行化、`DESIGN-SANDBOX-VMISOLATION.md`項目8）**:
+//! - **VM共有化（`crate::vm_host::VmHost`）**: 外層VMはもうセッションごとに新規作成される
+//!   専有物ではなく、参照カウントされる共有resident資源になった。`VmSession::start`は
+//!   `VmHost::attach`（未起動なら起動、起動済みなら`refcount`を増やして即座にアタッチ）を
+//!   呼ぶだけで、VM作成コード自体は`vm_host`モジュールへ移動した。ウォームスタート
+//!   （`--tier3-warm`）もこの`attach`の内部実装（checkpointからの`Restore-VMSnapshot`）に
+//!   統合され、`WarmLock`によるファイルロック直列化は不要になった（daemonプロセス内の
+//!   `Mutex`一本で足りる、daemon自体がS-2の固定パイプ名で単一プロセスに保証されているため）。
+//! - **台帳+GC（D-24）**: `crate::vm_ledger`のスキーマをVM共有化に合わせて分離した
+//!   （単一の`VmHostEntry`＋`workspace_id`単位の`WorkspaceResourceEntry`群）。
+//!   `gc_orphan_sessions`は`VmHost::attach`のStopped→Running遷移直前にのみ呼ばれる
+//!   （セッション途中で誤って現在生存中のVMを孤児扱いしないため）。
+//! - **マルチセッション並行化**: `vmsandboxd::serve_resident`はthread-per-session化され、
+//!   `SessionRegistry`が同時実行数上限（既定4・`--tier3-max-sessions`）を管理する。各セッションに
+//!   割り当てられる`slot`番号がコンテナの静的IP・SNIプロキシポートの衝突回避に使われる。
+//! - **ワークスペース単位資源の参照カウント共有**（`DESIGN-SANDBOX-VMISOLATION.md`項目6-a）:
+//!   SMB共有・使い捨てアカウント・NTFS ACE・CIFSマウントは`workspace_id`
+//!   （`smb_share::compute_workspace_id`）単位で参照カウント共有する。Incusコンテナと
+//!   egress許可リストはセッション単位のまま（同一ワークスペースでもコンテナは分ける）。
 //!
 //! **依然として未実装のまま残っている範囲**（`plans/TIER1A-OPEN-ISSUES.md`項目9でフォロー
-//! アップする、Phase 3の残り）:
-//! - ワークスペース共有はセッション境界でのcopy-in/copy-outのみ（D-22のライブマウントは未実装）。
+//! アップする）:
+//! - ワークスペース共有はセッション境界でのcopy-in/copy-outのみ（`WorkspaceShareMode::Cifs`が
+//!   既定だがCopyInOutも残っている。D-22のライブマウント自体はCifsモードで実現済み）。
+//! - VM refcountが0になった際のアイドル猶予つきwarm維持は未実装（今回は即時停止のみ、
+//!   Phase C以降）。
 //!
 //! 固定の運用規約（`plans/vm-spike/RESULTS.md`§3.6/§3.7で確立、実機E2E確認済み）:
 //! - ゴールデン親VHDX: `C:\ProgramData\harness\golden-images\almalinux-golden.vhdx`
@@ -99,15 +109,6 @@ pub struct VmSandboxConfig {
     pub smb_host_ip: IpAddr,
 }
 
-/// ウォームスタート（production checkpoint + Restore方式、`plans/DESIGN-SANDBOX-VMISOLATION.md`
-/// §2.1）で使う固定名。固定静的IPの制約上Tier3は元々同時1セッションのみが成立条件のため、
-/// ウォームVMはマシン全体で1つに固定する（`crate::vm_ledger::WARM_VM_NAME`と同じ値を指す
-/// 定数だが、循環依存を避けるためここにも定義する）。
-pub const WARM_VM_NAME: &str = crate::vm_ledger::WARM_VM_NAME;
-/// ウォームVMの「起動済み・IP疎通済み・Incus trusted」状態を捕捉するproduction checkpoint名
-/// （`Checkpoint-VM -SnapshotName`）。
-pub const WARM_CHECKPOINT_NAME: &str = "harness-warm-base";
-
 impl Default for VmSandboxConfig {
     fn default() -> Self {
         Self {
@@ -161,100 +162,27 @@ pub(crate) fn run_powershell(script: &str) -> Result<String, VmError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// ウォームVM専用の直列化ロック（`vm_work_dir/tier3-warm.lock`）。固定静的IPの制約上、
-/// Tier3は元々同時1セッションのみが成立条件（2 VMが同じIPを主張すると破綻する、
-/// `VmSession::start`のdoc参照）だが、ウォームVMは複数daemonプロセスから同時に
-/// Restore/execされると壊れるため、明示的なファイルロックで直列化する。
-///
-/// ロックファイルには取得元プロセスのPIDを書き込む。daemonクラッシュでロックファイルだけ
-/// 残った場合の回収のため、取得を試みて失敗した際はPIDの生存確認でstaleness判定し
-/// （`select_orphans`と同じbelt-and-suspenders思想）、stale であれば削除して再試行する。
-pub struct WarmLock {
-    path: PathBuf,
-}
-
-impl WarmLock {
-    /// ロック取得を試みる。取得できるまで一定間隔でリトライし、`timeout`超過でエラーにする。
-    pub fn acquire(config: &VmSandboxConfig, timeout: Duration) -> Result<Self, VmError> {
-        let path = config.vm_work_dir.join("tier3-warm.lock");
-        std::fs::create_dir_all(&config.vm_work_dir)?;
-        let deadline = Instant::now() + timeout;
-        let poll_interval = Duration::from_millis(500);
-        loop {
-            if try_create_lock_file(&path).is_ok() {
-                return Ok(Self { path });
-            }
-            if lock_is_stale(&path) {
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-            if Instant::now() >= deadline {
-                return Err(VmError::Timeout(format!(
-                    "timed out waiting for tier3 warm VM lock: {}",
-                    path.display()
-                )));
-            }
-            std::thread::sleep(poll_interval);
-        }
-    }
-}
-
-impl Drop for WarmLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn try_create_lock_file(path: &Path) -> Result<(), VmError> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    write!(file, "{}", std::process::id())?;
-    Ok(())
-}
-
-/// ロックファイルの所有者PIDが既に終了しているかを確認する。読めない/PIDが不正な形式の
-/// 場合は安全側（stale扱いしない=false、他プロセスが書き込み中の可能性を尊重する）に倒す。
-fn lock_is_stale(path: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(pid) = contents.trim().parse::<u32>() else {
-        return false;
-    };
-    !process_is_alive(pid)
-}
-
-fn process_is_alive(pid: u32) -> bool {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    unsafe {
-        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-            Ok(handle) => {
-                let _ = CloseHandle(handle);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-}
-
-/// ウォームVM専用の差分VHDXパス（`vm_work_dir/warm.diff.vhdx`、セッションごとの
-/// `<session_id>.diff.vhdx`とは別枠。ウォームVMはセッションをまたいで生存し続けるため
-/// 使い捨てにならない、B3/B5参照）。
-pub fn warm_diff_vhdx_path(config: &VmSandboxConfig) -> PathBuf {
-    config.vm_work_dir.join("warm.diff.vhdx")
-}
-
+/// **Phase B実機E2Eで発見したバグ**: `std::process::id()`+ミリ秒タイムスタンプという
+/// 旧来の一意性根拠は、「1セッション=1回きりのdaemon起動」だった旧モデルでは
+/// （毎回別のPIDになるため）十分だったが、常駐daemonが複数セッションを同一プロセス内の
+/// 複数スレッドから処理するようになった今、`std::process::id()`は全セッションで**同じ値**に
+/// なる。2セッションがほぼ同時に本関数を呼ぶと同じミリ秒のタイムスタンプになり得るため、
+/// 実機E2Eで実際に`session_id`（延いてはコンテナ名）の衝突が発生した
+/// （`Instance "harness-harness-tier3-<pid>-<millis>" already exists`）。プロセス内の
+/// アトミックカウンタを追加し、同一プロセス・同一ミリ秒でも重複しないようにする
+/// （`vmsandboxd::unique_pipe_name`と同じパターン）。
 fn unique_session_id() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
-        "harness-tier3-{}-{}",
+        "harness-tier3-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        n
     )
 }
 
@@ -405,7 +333,7 @@ fn known_hosts_file() -> Result<PathBuf, VmError> {
 /// 許容し、MITM疑いのある「鍵が変わった」状態は無条件に拒否するため）。検証自体を最初から
 /// 行わない設計（D-20/D-21）である以上、このファイルを残す理由が無いため、セッション開始の
 /// たびに空へ戻す。
-fn reset_known_hosts_file() -> Result<(), VmError> {
+pub(crate) fn reset_known_hosts_file() -> Result<(), VmError> {
     let path = known_hosts_file()?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -463,6 +391,25 @@ fn ssh_exec_checked(host: IpAddr, key_path: &Path, cmd: &str, timeout: Duration)
     Ok(stdout)
 }
 
+/// L2（ゲスト側CIFSマウント）の存在と健全性をゲスト自身に問い合わせる（BUG-026の根本修正）。
+/// 台帳（L1の正本）はこの判定に使えない——VMは使い捨てだが台帳は`%APPDATA%`に永続するため、
+/// 両者がズレると台帳のエントリだけを根拠に「マウント済み」とみなす再利用分岐が
+/// `add_disk_device`で"Missing source path"に恒久的に失敗する（`docs/bugs/BUG-026.md`参照）。
+/// `mountpoint -q`だけでなく実I/O（`ls`）まで確認するのは、SMBアカウント削除後のstale mount
+/// （マウントエントリ自体は残るが認証が通らない状態、状態S5）を「マウント有り」と誤判定
+/// しないため。
+fn guest_workspace_mount_is_healthy(host: IpAddr, key: &Path, mount_point: &str) -> bool {
+    match ssh_exec(
+        host,
+        key,
+        &format!("mountpoint -q {mount_point} && ls {mount_point} >/dev/null 2>&1"),
+        Duration::from_secs(15),
+    ) {
+        Ok((_, _, code)) => code == 0,
+        Err(_) => false,
+    }
+}
+
 /// AlmaLinux VM自体（`root`）へファイルを配置する（`ssh ... 'cat > path'`にstdin経由で
 /// 内容を流し込む。Incus内のコンテナではなくVMのホストOS側へ書く点が`IncusClient::push_file`
 /// との違い）。
@@ -501,6 +448,11 @@ fn ssh_push_file(host: IpAddr, key_path: &Path, contents: &[u8], remote_path: &s
 }
 
 /// Incus REST APIのmTLSクライアント（`plans/vm-spike/incus_common.py`のRust移植）。
+/// **`Clone`（Phase B、`crate::vm_host::VmHost`）**: 内部は`String`（base_url）・`IpAddr`
+/// （Copy）・`reqwest::blocking::Client`（内部Arc、実接続を保持しない設定オブジェクト）のみ
+/// なので複製は安全。常駐VMへ複数セッションが同時にアタッチする際、各セッションが同じ
+/// resident VMへの接続設定を独立に保持できるようにするために必要。
+#[derive(Clone)]
 pub struct IncusClient {
     base_url: String,
     host_ip: IpAddr,
@@ -598,7 +550,36 @@ impl IncusClient {
         Ok(metadata)
     }
 
+    /// **Phase B実機E2Eで発見**: Incus自体が`POST /1.0/instances`（作成）操作を1件ずつしか
+    /// 受け付けず、常駐VM上で複数セッションがほぼ同時に`create_container`を呼ぶと
+    /// `Failed creating instance record: Instance is busy running a "create" operation`で
+    /// 一方が失敗する（旧「1VM=1セッション」前提では同時に1コンテナしか作られないため
+    /// 顕在化しなかった）。コンテナ名自体は`session_id`でユニークなので衝突ではなく、
+    /// Incus側の直列化待ちにすぎないため、この特定のエラーメッセージに対してのみ短い
+    /// バックオフ付きリトライを行う（作成自体は実測0.3秒程度と高速、`RESULTS.md`参照）。
     pub fn create_container(&self, name: &str, image_alias: &str) -> Result<(), VmError> {
+        const MAX_ATTEMPTS: u32 = 20;
+        let mut last_err = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.try_create_container(name, image_alias) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("busy running a") {
+                        std::thread::sleep(Duration::from_millis(300 + 100 * attempt as u64));
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            VmError::Incus("create_container: exhausted retries".to_string())
+        }))
+    }
+
+    fn try_create_container(&self, name: &str, image_alias: &str) -> Result<(), VmError> {
         let body = serde_json::json!({
             "name": name,
             "type": "container",
@@ -871,7 +852,43 @@ impl IncusClient {
     ///
     /// `source`はコンテナが動くAlmaLinux VM自身の中のパス（`mount -t cifs`した先、
     /// 例`/mnt/harness-workspace`）であり、Windowsホスト側のパスではない点に注意。
+    /// **BUG-026で根本原因を確定**: `Missing source path ... for disk`は「Incus側の
+    /// ファイルシステム状態確認の遅延」ではなく、呼び出し側（`attach_to_guest`）が
+    /// **台帳の再利用分岐で実際にゲスト側マウントを検証せずここへ来た場合に決定論的に
+    /// 発生する**（台帳はWindows側で永続、マウントはVM寿命限りのため両者がズレ得る）。
+    /// 根本修正は呼び出し側（`guest_workspace_mount_is_healthy`によるゲスト直接問い合わせ、
+    /// `docs/bugs/BUG-026.md`参照）で行うため、ここでのリトライは真にIncus側の短い
+    /// ファイルシステム反映遅延（実在するマウントに対する一時的な取りこぼし）だけを
+    /// 吸収する短めの回数に留める。
     pub fn add_disk_device(
+        &self,
+        container_name: &str,
+        device_name: &str,
+        source: &str,
+        path: &str,
+    ) -> Result<(), VmError> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.try_add_disk_device(container_name, device_name, source, path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("Missing source path") {
+                        std::thread::sleep(Duration::from_millis(300 + 200 * attempt as u64));
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            VmError::Incus("add_disk_device: exhausted retries".to_string())
+        }))
+    }
+
+    fn try_add_disk_device(
         &self,
         container_name: &str,
         device_name: &str,
@@ -1006,26 +1023,93 @@ fn urlencoding_path(path: &str) -> String {
 /// Incusブリッジ`incusbr0`自身のIP（SNI prereadプロキシのlisten先、`plans/vm-spike/
 /// RESULTS.md`§3.2/§3.8で確立した値。AlmaLinux golden像のIncusネットワーク既定設定に依存する
 /// ため固定値として扱う）。
-const INCUS_BRIDGE_IP: &str = "10.76.180.1";
-/// SNI prereadプロキシのlistenポート（Incus自身のリモートAPI`8443`と衝突しない値、
-/// `RESULTS.md`§3.2の踏んだ落とし穴参照）。
-const SNI_PROXY_PORT: u16 = 8444;
+pub(crate) const INCUS_BRIDGE_IP: &str = "10.76.180.1";
+/// SNI prereadプロキシのlistenポートの基準値。**Phase B**: 常駐VM上に複数セッションが同居する
+/// ため、セッションごとに`SNI_PROXY_PORT_BASE + slot`でポートを分ける（`slot`は
+/// `vmsandboxd::SessionRegistry`が同時実行数上限の枠として払い出す番号、
+/// `crate::vmsandbox::container_static_ip_cidr`と同じ`slot`を共有する）。単一ポートのままだと、
+/// 全セッションの許可ドメインが1つの`map`に混ざり、会話単位でegressを絞るというTier3の目的が
+/// 崩れる（S-5、DNATは認可ではない）。
+pub(crate) const SNI_PROXY_PORT_BASE: u16 = 8444;
 const SNI_PROXY_CONF_PATH: &str = "/root/harness-sni-proxy.conf";
 const SNI_PROXY_PID_PATH: &str = "/run/harness-sni-proxy.pid";
 const SNI_AUDIT_LOG_PATH: &str = "/var/log/nginx/harness-sni-audit.log";
 const NFTABLES_TABLE: &str = "harness_tier3";
 
-/// SNI prereadプロキシのnginx設定を、許可ドメインごとに動的生成する
-/// （`plans/vm-spike/RESULTS.md`§3.8で実機実証済みの構成をそのまま踏襲、監査ログ付き）。
-fn build_sni_proxy_conf(allow_domains: &[String]) -> String {
-    let map_lines: String = allow_domains
-        .iter()
-        .map(|d| format!("        {d}     \"{d}:443\";\n"))
-        .collect();
-    let decision_lines: String = allow_domains
-        .iter()
-        .map(|d| format!("        {d}     \"ALLOW\";\n"))
-        .collect();
+fn sni_proxy_port_for_slot(slot: u8) -> u16 {
+    SNI_PROXY_PORT_BASE + slot as u16
+}
+
+/// 常駐VM上で現在egress許可リストを構成中の1セッション分の情報
+/// （`crate::vm_host::VmHost`が全アクティブセッション分をまとめて保持する）。
+#[derive(Debug, Clone)]
+pub(crate) struct EgressSession {
+    pub slot: u8,
+    pub container_ip: String,
+    pub allow_domains: Vec<String>,
+}
+
+/// `allow_domains`の入力検証（B-1）。S-2で固定パイプ名IPCが同一ユーザーの任意プロセスへ
+/// 開かれた以上、`allow_domains`はもう信頼できる内部値ではなく外部入力として扱う必要がある。
+/// nginx設定・nftables/shellコマンドへ生文字列のまま補間されるため、ドメイン名として
+/// 妥当な文字集合（英数字・`.`・`-`）と長さ上限のみを許可する。
+pub(crate) fn validate_allow_domain(domain: &str) -> Result<(), VmError> {
+    const MAX_DOMAIN_LEN: usize = 253; // RFC 1035の全体長上限。
+    if domain.is_empty() || domain.len() > MAX_DOMAIN_LEN {
+        return Err(VmError::Incus(format!(
+            "invalid allow_domain (empty or too long, max {MAX_DOMAIN_LEN}): {domain:?}"
+        )));
+    }
+    if !domain
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err(VmError::Incus(format!(
+            "invalid allow_domain (only [a-zA-Z0-9.-] allowed): {domain:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// SNI prereadプロキシのnginx設定を、**現在アクティブな全セッション分**まとめて動的生成する
+/// （`plans/vm-spike/RESULTS.md`§3.8の単一セッション版から、Phase Bでセッションごとに
+/// 独立した`map`+`server`ブロックへ拡張。2セッション目の設定生成が1セッション目のものを
+/// 消してしまう問題（A-8）への是正）。ブロック間で`map`のターゲット変数名が衝突しないよう
+/// `slot`をsuffixにする。
+fn build_sni_proxy_conf_multi(sessions: &[EgressSession]) -> String {
+    let mut server_blocks = String::new();
+    for s in sessions {
+        let map_lines: String = s
+            .allow_domains
+            .iter()
+            .map(|d| format!("        {d}     \"{d}:443\";\n"))
+            .collect();
+        let decision_lines: String = s
+            .allow_domains
+            .iter()
+            .map(|d| format!("        {d}     \"ALLOW\";\n"))
+            .collect();
+        let port = sni_proxy_port_for_slot(s.slot);
+        server_blocks.push_str(&format!(
+            r#"
+    map $ssl_preread_server_name $sni_upstream_{slot} {{
+{map_lines}        default              "";
+    }}
+    map $ssl_preread_server_name $sni_decision_{slot} {{
+{decision_lines}        default              "DENY";
+    }}
+
+    server {{
+        listen {INCUS_BRIDGE_IP}:{port};
+        ssl_preread on;
+        proxy_pass $sni_upstream_{slot};
+        proxy_connect_timeout 5s;
+        proxy_timeout 30s;
+    }}
+"#,
+            slot = s.slot,
+        ));
+    }
     format!(
         r#"load_module /usr/lib64/nginx/modules/ngx_stream_module.so;
 worker_processes auto;
@@ -1039,38 +1123,61 @@ stream {{
                          'bytes_sent=$bytes_sent bytes_received=$bytes_received '
                          'duration=$session_time status=$status';
     access_log {SNI_AUDIT_LOG_PATH} sniaudit;
-
-    map $ssl_preread_server_name $sni_upstream {{
-{map_lines}        default              "";
-    }}
-    map $ssl_preread_server_name $sni_decision {{
-{decision_lines}        default              "DENY";
-    }}
-
-    server {{
-        listen {INCUS_BRIDGE_IP}:{SNI_PROXY_PORT};
-        ssl_preread on;
-        proxy_pass $sni_upstream;
-        proxy_connect_timeout 5s;
-        proxy_timeout 30s;
-    }}
-}}
+{server_blocks}}}
 "#
     )
 }
 
-/// SNI prereadプロキシ + nftables DNAT（透過リダイレクト）+ コンテナ側Incus ACLを、
-/// AlmaLinux VM自体へSSH経由で構成する（`allow_domains`が非空の場合のみ呼ぶ、
-/// `plans/vm-spike/RESULTS.md`§3.2/§3.8で実機実証済みの構成のRust化）。
-fn setup_egress_allowlist(
+/// nftables: 全アクティブセッション分のDNAT（コンテナ発の443宛先を各自のSNIプロキシポートへ
+/// 透過リダイレクト）+ S-5 filterチェーン（「送信元IPが当該セッションのコンテナIPでない限り、
+/// そのセッションのproxyポートへの到達をdrop」）をまとめて再構成する。DNATは認可ではない
+/// （コンテナBが直接`10.76.180.1:<Aのポート>`へ繋げばAの許可リストを使えてしまう、または
+/// 同一L2での送信元IP詐称でAのDNATに乗れてしまう）ため、filterチェーンが実質的な認可点になる。
+fn build_nftables_script(sessions: &[EgressSession]) -> String {
+    let mut lines = String::new();
+    lines.push_str(&format!("nft add table ip {NFTABLES_TABLE}\n"));
+    lines.push_str(&format!(
+        "nft 'add chain ip {NFTABLES_TABLE} prerouting {{ type nat hook prerouting priority dstnat ; }}'\n"
+    ));
+    lines.push_str(&format!(
+        "nft 'add chain ip {NFTABLES_TABLE} input {{ type filter hook input priority filter ; policy accept ; }}'\n"
+    ));
+    for s in sessions {
+        let port = sni_proxy_port_for_slot(s.slot);
+        lines.push_str(&format!(
+            "nft add rule ip {NFTABLES_TABLE} prerouting iifname \"incusbr0\" ip saddr {ip} tcp dport 443 redirect to :{port}\n",
+            ip = s.container_ip,
+        ));
+        // S-5: このセッション専用のproxyポートへは、そのセッションのコンテナIP以外からの
+        // 到達をdropする（DNAT経路以外での直接アクセス・送信元IP詐称の両方を塞ぐ）。
+        lines.push_str(&format!(
+            "nft add rule ip {NFTABLES_TABLE} input ip daddr {INCUS_BRIDGE_IP} tcp dport {port} ip saddr != {ip} drop\n",
+            ip = s.container_ip,
+        ));
+    }
+    lines
+}
+
+/// SNI prereadプロキシ + nftables DNAT/filter + コンテナ側Incus ACLを、AlmaLinux VM自体へ
+/// SSH経由で構成する。**Phase B**: `active_sessions`は呼び出し時点でegressを構成している
+/// 全セッション（このセッション自身を含む）——1本の呼び出しが常にVM全体の設定を丸ごと
+/// 再生成するため、呼び出し側（`crate::vm_host::VmHost`）が単一ロックの下で
+/// 「集合を更新→この関数を呼ぶ」を一体で行う必要がある（さもないと2セッション目の呼び出しが
+/// 1セッション目の設定を消す、A-8）。
+pub(crate) fn apply_egress_ruleset(
     guest_ip: IpAddr,
     ssh_key: &Path,
-    incus: &IncusClient,
-    container_name: &str,
-    allow_domains: &[String],
+    active_sessions: &[EgressSession],
 ) -> Result<(), VmError> {
-    // 1. nginx SNI prereadプロキシを配置・起動。
-    let conf = build_sni_proxy_conf(allow_domains);
+    for s in active_sessions {
+        for d in &s.allow_domains {
+            validate_allow_domain(d)?;
+        }
+    }
+
+    // 1. nginx SNI prereadプロキシを配置・(再)起動。既存プロセスがいればkillしてから
+    //    起動し直す（設定が丸ごと変わるため、reloadではなく再起動で確実に反映する）。
+    let conf = build_sni_proxy_conf_multi(active_sessions);
     ssh_push_file(guest_ip, ssh_key, conf.as_bytes(), SNI_PROXY_CONF_PATH)?;
     ssh_exec_checked(
         guest_ip,
@@ -1078,6 +1185,12 @@ fn setup_egress_allowlist(
         "mkdir -p /var/log/nginx",
         Duration::from_secs(10),
     )?;
+    let _ = ssh_exec(
+        guest_ip,
+        ssh_key,
+        &format!("test -f {SNI_PROXY_PID_PATH} && kill $(cat {SNI_PROXY_PID_PATH}) 2>/dev/null; sleep 1"),
+        Duration::from_secs(10),
+    );
     ssh_exec_checked(
         guest_ip,
         ssh_key,
@@ -1085,44 +1198,28 @@ fn setup_egress_allowlist(
         Duration::from_secs(10),
     )?;
 
-    // 2. nftables DNAT（コンテナ発の443宛先を透過的にプロキシへリダイレクト）。
-    //    既存テーブルがあれば削除してから作り直す（同一VM内での再構成に備える、Phase 2では
-    //    セッションごとに新しいVMなので通常は不要だが、べき等性のため）。
+    // 2. nftables: 既存テーブルを削除してから全セッション分を作り直す（べき等性、A-8是正）。
     let _ = ssh_exec(
         guest_ip,
         ssh_key,
         &format!("nft delete table ip {NFTABLES_TABLE}"),
         Duration::from_secs(10),
     );
-    ssh_exec_checked(
-        guest_ip,
-        ssh_key,
-        &format!("nft add table ip {NFTABLES_TABLE}"),
-        Duration::from_secs(10),
-    )?;
-    ssh_exec_checked(
-        guest_ip,
-        ssh_key,
-        &format!(
-            "nft 'add chain ip {NFTABLES_TABLE} prerouting {{ type nat hook prerouting priority dstnat ; }}'"
-        ),
-        Duration::from_secs(10),
-    )?;
-    ssh_exec_checked(
-        guest_ip,
-        ssh_key,
-        &format!(
-            "nft add rule ip {NFTABLES_TABLE} prerouting iifname \"incusbr0\" tcp dport 443 redirect to :{SNI_PROXY_PORT}"
-        ),
-        Duration::from_secs(10),
-    )?;
+    if !active_sessions.is_empty() {
+        let script = build_nftables_script(active_sessions);
+        ssh_exec_checked(guest_ip, ssh_key, &script, Duration::from_secs(15))?;
+    }
 
-    // 3. コンテナ側Incus ACL: tcp/443への直接egressを宛先指定なしで許可するだけでよい
-    //    （プロキシの存在をコンテナに一切意識させない、`RESULTS.md`§3.8）。
+    Ok(())
+}
+
+/// コンテナ側Incus ACL: tcp/443への直接egressを宛先指定なしで許可するだけでよい
+/// （プロキシの存在をコンテナに一切意識させない、`RESULTS.md`§3.8）。セッション単位で
+/// 一度だけ呼べばよく、VM全体の再生成とは独立（コンテナ削除で自動的に消える）。
+pub(crate) fn attach_egress_acl(incus: &IncusClient, container_name: &str) -> Result<(), VmError> {
     let acl_name = format!("{container_name}-egress");
     incus.create_network_acl(&acl_name)?;
     incus.attach_acl_to_container(container_name, &acl_name)?;
-
     Ok(())
 }
 
@@ -1151,41 +1248,63 @@ fn fetch_and_persist_audit_log(
     Ok(())
 }
 
-/// 稼働中のTier3セッション（VM + コンテナ）を表す。`VmSandboxHandle`（`crate::vmsandboxd`）が
-/// デーモンプロセス内で保持し続ける。
+/// 稼働中のTier3セッション（常駐VM上の1コンテナ）を表す。`VmSandboxHandle`
+/// （`crate::vmsandboxd`）がデーモンプロセス内で保持し続ける。**Phase B**: VM自体は
+/// `crate::vm_host::VmHost`が参照カウントで管理する共有resident資源になったため、本構造体は
+/// もはやVMの識別子（旧`vm_name`/`diff_vhdx`）を保持しない——teardown時にVMを操作するのは
+/// `VmHost::release`の責務であり、本構造体が知る必要があるのは自分のコンテナと
+/// ワークスペース単位資源（`workspace_id`）だけである。
 pub struct VmSession {
     session_id: String,
-    vm_name: String,
-    diff_vhdx: PathBuf,
+    /// このセッションが同時実行数上限の枠として払い出された番号（`vmsandboxd::SessionRegistry`
+    /// 参照）。コンテナの静的IP・SNIプロキシポートの衝突回避に使う。
+    slot: u8,
+    /// `short_id(canonicalized workspace_root)`（`DESIGN-SANDBOX-VMISOLATION.md`項目6-a）。
+    /// SMB共有・使い捨てアカウント・NTFS ACE・CIFSマウントはこのIDで参照カウント共有する。
+    workspace_id: String,
     container_name: String,
     incus: IncusClient,
     /// egress許可リスト（SNIプロキシ+nftables DNAT）を構成した場合のみ`Some`（`allow_domains`
-    /// が非空だった場合）。teardown時にこれを見て監査ログ取得の要否を判定する。
+    /// が非空だった場合）。teardown時にこれを見て監査ログ取得・egress設定解除の要否を判定する。
     ssh_key: Option<PathBuf>,
-    /// ウォームVM（フェーズB、`Self::start_warm`経由）かどうか。`teardown`で撤収経路を
-    /// 分岐させる（コールド: VM削除+差分VHDX破棄、ウォーム: checkpointへRestoreして
-    /// 次回セッションのために温存する）。
-    warm: bool,
-    /// ウォームセッションが保持する直列化ロック（B2）。`teardown`（または`Drop`）まで
-    /// 保持し続けることでマシン全体で1セッションに排他する。コールドセッションでは`None`。
-    warm_lock: Option<WarmLock>,
-    /// `WorkspaceShareMode::Cifs`のセッションでのみ`Some`（`smb_share::create_ephemeral_share`
-    /// が作った使い捨て共有名・アカウント名）。teardown時にこれを見て`destroy_ephemeral_share`
-    /// を呼ぶかどうかを判定する（`CopyInOut`セッションでは`None`のまま）。
+    /// `WorkspaceShareMode::Cifs`のセッションかどうかのフラグを兼ねる（`Some`なら
+    /// teardownで`copy_out_workspace`をスキップし、ワークスペース単位資源の参照カウント
+    /// 解放を行う）。実際の共有名・アカウント名は台帳の`WorkspaceResourceEntry`が正であり
+    /// （`workspace_id`単位で複数セッションが共有し得るため）、本フィールドはteardown時の
+    /// 分岐判定にのみ使う。
     smb_share_name: Option<String>,
-    smb_user: Option<String>,
 }
 
+/// ワークスペース単位資源（SMB共有・使い捨てアカウント・NTFS ACE・CIFSマウント）の
+/// 「台帳を見て無ければ作成/参照カウント0なら破棄する」判定〜実行を全セッション横断で
+/// 直列化するロック（Phase B実機E2Eで発見したTOCTOUバグの是正、`attach_to_guest`/
+/// `teardown`のdoc参照）。`workspace_id`単位ではなくプロセス全体で単一にしている理由は、
+/// 作成・破棄そのものが高速（数百ms、`RESULTS.md`参照）でありワークスペースをまたいだ
+/// 競合が実運用上ほぼ無いため、実装を単純に保つトレードオフを取ったもの。
+static WORKSPACE_RESOURCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const CONTAINER_IMAGE_ALIAS: &str = "alpine/3.21";
-const CONTAINER_STATIC_IP: &str = "10.76.180.60/24";
+/// コンテナの静的IPのベースオクテット。実際のIPは`10.76.180.{CONTAINER_IP_BASE + slot}/24`
+/// （`slot`: 0..同時実行数上限）。**Phase Bで新規発見**: 旧実装は全コンテナに固定
+/// `10.76.180.60/24`を割り当てていた（旧「1VM=1セッション」前提では同時に1コンテナしか
+/// 存在しないため無害だったが、常駐VM上に複数コンテナが同居する今回の設計ではIP衝突になる）。
+const CONTAINER_IP_BASE: u8 = 61;
 const CONTAINER_GATEWAY: &str = "10.76.180.1";
 const WORKSPACE_MOUNT: &str = "/workspace";
+
+pub(crate) fn container_static_ip_cidr(slot: u8) -> String {
+    format!("10.76.180.{}/24", CONTAINER_IP_BASE.saturating_add(slot))
+}
+
+pub(crate) fn container_ip(slot: u8) -> String {
+    format!("10.76.180.{}", CONTAINER_IP_BASE.saturating_add(slot))
+}
 
 /// ゲストが静的IPで応答し、Incus mTLSクライアント証明書が信頼されるまで待つ（コールドブート
 /// ・ウォームRestoreの両方から共有、B4/B5参照）。`guest_wait_timeout`は呼び出し側が
 /// コールド/ウォームに応じて使い分ける（コールドは起動+firstbootを見込み長め、ウォームは
 /// 既に起動済みのはずなので短め、B8参照）。
-fn wait_for_guest_ready(
+pub(crate) fn wait_for_guest_ready(
     config: &VmSandboxConfig,
     guest_wait_timeout: Duration,
 ) -> Result<IncusClient, VmError> {
@@ -1222,177 +1341,277 @@ fn wait_for_guest_ready(
     Ok(incus)
 }
 
-/// ウォームVM専用のproduction checkpoint（`WARM_CHECKPOINT_NAME`）が既に存在するかを確認する。
-fn warm_checkpoint_exists() -> Result<bool, VmError> {
-    let script = format!(
-        "$ErrorActionPreference = 'SilentlyContinue'; \
-         (Get-VMSnapshot -VMName '{name}' -Name '{checkpoint}' -ErrorAction SilentlyContinue).Name",
-        name = WARM_VM_NAME,
-        checkpoint = WARM_CHECKPOINT_NAME,
-    );
-    let stdout = run_powershell(&script)?;
-    Ok(!stdout.trim().is_empty())
+/// BUG-026の状態表（`docs/bugs/BUG-026.md`参照）に沿って、ワークスペース単位資源
+/// （SMB共有・使い捨てアカウント・NTFS ACE・ゲスト側CIFSマウント）を確保する。
+/// 台帳エントリの有無とゲスト側マウントの健全性の組み合わせ（8状態）を
+/// Reuse/Repair/CreateFreshの3アクションへ振り分ける。呼び出し側（`attach_to_guest`）が
+/// `WORKSPACE_RESOURCE_LOCK`を保持した状態で呼ぶこと。
+/// 台帳エントリの有無とゲスト側マウントの健全性の組み合わせ（BUG-026の状態表S0〜S7、
+/// `docs/bugs/BUG-026.md`参照）が導くアクション。実SSH/PowerShellに依存しない純関数
+/// （[`decide_workspace_action`]）へ切り出し、8状態を表駆動で単体テストできるようにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceAction {
+    /// S7: 台帳にあり、ゲスト側マウントも健全。そのまま再利用する。
+    Reuse,
+    /// S4/S5/S6: 台帳にはあるがゲスト側マウントが不健全。修復（パスワードローテーション、
+    /// 失敗すれば作り直し）を試みる。
+    Repair,
+    /// S0〜S3: 台帳に無い。新規作成する（S1/S3で残存マウントがあれば先に外す）。
+    CreateFresh,
 }
 
-/// ウォームVMのproduction checkpoint（`WARM_CHECKPOINT_NAME`）を用意する（B3、低速パス・
-/// 一度きり）。既に存在すればスキップする。無ければ: ウォーム専用の差分VHDXを作成
-/// → `New-VM`+`Start-VM` → コールドブート後処理と同じ疎通確認（`wait_for_guest_ready`、
-/// firstbootの完了を含む長めのタイムアウト） → `Checkpoint-VM`で「完全起動済み・IP疎通済み・
-/// Incus trusted」状態を捕捉する。途中で失敗した場合はウォームVM自体を撤収し、次回呼び出しで
-/// 最初からやり直せるようにする（中途半端なVMが`WARM_VM_NAME`として残らないようにする）。
-pub fn ensure_warm_template(config: &VmSandboxConfig) -> Result<(), VmError> {
-    if warm_checkpoint_exists()? {
-        return Ok(());
+fn decide_workspace_action(existing_present: bool, mount_healthy: bool) -> WorkspaceAction {
+    match (existing_present, mount_healthy) {
+        (true, true) => WorkspaceAction::Reuse,
+        (true, false) => WorkspaceAction::Repair,
+        (false, _) => WorkspaceAction::CreateFresh,
     }
+}
 
-    let diff_vhdx = warm_diff_vhdx_path(config);
-    std::fs::create_dir_all(&config.vm_work_dir)?;
+fn acquire_or_repair_workspace_share(
+    workspace_root: &Path,
+    workspace_id: &str,
+    config: &VmSandboxConfig,
+    host_ssh_key: &Path,
+    mount_point: &str,
+    incus: &IncusClient,
+    container_name: &str,
+) -> Result<(String, String), VmError> {
+    let existing = crate::vm_ledger::load()
+        .workspace_resources
+        .into_iter()
+        .find(|e| e.workspace_id == workspace_id);
+    let mount_healthy = guest_workspace_mount_is_healthy(config.guest_ip, host_ssh_key, mount_point);
+    let action = decide_workspace_action(existing.is_some(), mount_healthy);
 
-    // 前回の途中失敗（checkpoint作成前にVMだけ残った等）の後始末。存在しなければ無害に失敗する。
-    let _ = teardown_vm(WARM_VM_NAME, &diff_vhdx);
-    crate::vm_ledger::remove_session(WARM_VM_NAME);
-
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-New-VHD -Path '{diff}' -ParentPath '{golden}' -Differencing | Out-Null
-New-VM -Name '{name}' -MemoryStartupBytes 2048MB -VHDPath '{diff}' -SwitchName '{switch}' -Generation 2 | Out-Null
-Set-VMProcessor -VMName '{name}' -Count 2
-Set-VM -Name '{name}' -AutomaticStopAction TurnOff -AutomaticStartAction Nothing
-Set-VMFirmware -VMName '{name}' -SecureBootTemplate MicrosoftUEFICertificateAuthority
-Start-VM -Name '{name}'
-"#,
-        diff = diff_vhdx.display(),
-        golden = config.golden_vhdx.display(),
-        name = WARM_VM_NAME,
-        switch = config.switch_name,
-    );
-    run_powershell(&script)?;
-
-    // ウォームVMも台帳へ記録する（`warm: true`、`select_orphans`のGC対象から除外される、B7）。
-    crate::vm_ledger::record_session(WARM_VM_NAME, WARM_VM_NAME, &diff_vhdx, true);
-
-    // firstboot（SSHホスト鍵/machine-id/Incus証明書再生成）を見込み、コールドブートと
-    // 同じ長さのタイムアウトで待つ（これは一度きりのprovisioningであり、以降のセッションは
-    // このコストを払わない）。
-    if let Err(e) = wait_for_guest_ready(config, Duration::from_secs(180)) {
-        let _ = teardown_vm(WARM_VM_NAME, &diff_vhdx);
-        crate::vm_ledger::remove_session(WARM_VM_NAME);
-        return Err(e);
+    match (action, existing) {
+        (WorkspaceAction::Reuse, Some(existing)) => {
+            crate::vm_ledger::record_workspace_resource(
+                workspace_id,
+                workspace_root,
+                &existing.smb_share_name,
+                &existing.smb_user,
+                &existing.smb_user_sid,
+            );
+            Ok((existing.smb_share_name, existing.smb_user))
+        }
+        (WorkspaceAction::Repair, Some(existing)) => repair_workspace_share(
+            workspace_root,
+            workspace_id,
+            config,
+            host_ssh_key,
+            mount_point,
+            &existing,
+            incus,
+            container_name,
+        ),
+        (WorkspaceAction::CreateFresh, _) | (WorkspaceAction::Reuse | WorkspaceAction::Repair, None) => {
+            // 後段の`(_, None)`は`decide_workspace_action`の契約上到達し得ない
+            // （Reuse/Repairは`existing_present == true`のときにしか返らない）が、
+            // 型レベルでは`Option`と`WorkspaceAction`が独立のため網羅性のために置く。
+            // 台帳に無いのにマウントだけ残っている（S1/S3、前世代の孤児マウント）場合は、
+            // 先に外してから作る。
+            if mount_healthy {
+                let _ = ssh_exec(
+                    config.guest_ip,
+                    host_ssh_key,
+                    &format!("umount -l {mount_point} 2>/dev/null"),
+                    Duration::from_secs(10),
+                );
+            }
+            create_fresh_workspace_share(
+                workspace_root,
+                workspace_id,
+                config,
+                host_ssh_key,
+                mount_point,
+                incus,
+                container_name,
+            )
+        }
     }
+}
 
-    if let Err(e) = run_powershell(&format!(
-        "Checkpoint-VM -Name '{name}' -SnapshotName '{checkpoint}'",
-        name = WARM_VM_NAME,
-        checkpoint = WARM_CHECKPOINT_NAME,
-    )) {
-        let _ = teardown_vm(WARM_VM_NAME, &diff_vhdx);
-        crate::vm_ledger::remove_session(WARM_VM_NAME);
-        return Err(e);
+/// 状態S4/S5/S6の修復。既存のSMB共有・NTFS ACEを流用し、使い捨てアカウントのパスワードだけ
+/// ローテーションして再mountする（実リポジトリ規模でも高速、`smb_share::rotate_share_password`
+/// のdoc参照）。アカウント自体が既に消えている場合（状態S4/S5、ローテーションが失敗する）は
+/// 共有・アカウントを作り直す。
+#[allow(clippy::too_many_arguments)]
+fn repair_workspace_share(
+    workspace_root: &Path,
+    workspace_id: &str,
+    config: &VmSandboxConfig,
+    host_ssh_key: &Path,
+    mount_point: &str,
+    existing: &crate::vm_ledger::WorkspaceResourceEntry,
+    incus: &IncusClient,
+    container_name: &str,
+) -> Result<(String, String), VmError> {
+    match crate::smb_share::rotate_share_password(&existing.smb_user) {
+        Ok(password) => {
+            remount_workspace_share(
+                config,
+                host_ssh_key,
+                mount_point,
+                &existing.smb_share_name,
+                &existing.smb_user,
+                &password,
+                workspace_id,
+                incus,
+                container_name,
+            )?;
+            crate::vm_ledger::record_workspace_resource(
+                workspace_id,
+                workspace_root,
+                &existing.smb_share_name,
+                &existing.smb_user,
+                &existing.smb_user_sid,
+            );
+            Ok((existing.smb_share_name.clone(), existing.smb_user.clone()))
+        }
+        Err(_) => {
+            // アカウント自体が既に存在しない（状態S4/S5）。共有・アカウントを作り直す
+            // （`destroy_ephemeral_share`はbest-effort、無くても無害）。
+            crate::smb_share::destroy_ephemeral_share(
+                &existing.smb_share_name,
+                &existing.smb_user,
+                Some(workspace_root),
+            );
+            create_fresh_workspace_share(
+                workspace_root,
+                workspace_id,
+                config,
+                host_ssh_key,
+                mount_point,
+                incus,
+                container_name,
+            )
+        }
     }
+}
 
+/// 状態S0〜S3の新規作成。共有・アカウント・NTFS ACEを新規作成し、マウント成功を確認して
+/// から台帳へ記録する（BUG-024層2の教訓: マウント成功前に記録すると、失敗時に
+/// 「実体はあるがゲスト側マウントは無い」不整合が台帳に残る）。
+fn create_fresh_workspace_share(
+    workspace_root: &Path,
+    workspace_id: &str,
+    config: &VmSandboxConfig,
+    host_ssh_key: &Path,
+    mount_point: &str,
+    incus: &IncusClient,
+    container_name: &str,
+) -> Result<(String, String), VmError> {
+    let (share, user, password, sid) =
+        crate::smb_share::create_ephemeral_share(workspace_id, workspace_root)?;
+    remount_workspace_share(
+        config,
+        host_ssh_key,
+        mount_point,
+        &share,
+        &user,
+        &password,
+        workspace_id,
+        incus,
+        container_name,
+    )?;
+    crate::vm_ledger::record_workspace_resource(workspace_id, workspace_root, &share, &user, &sid);
+    Ok((share, user))
+}
+
+/// cred fileの配布・`mount -t cifs`・`mountpoint -q`での成立確認を行う（Repair/CreateFresh
+/// 共通、旧`attach_to_guest`のインライン処理を切り出したもの）。診断強化（`mount`/`dmesg`/
+/// `ls`ダンプ）は実機E2Eで`add_disk_device`の"Missing source path"原因調査のために追加した
+/// もので、根本原因確定後もマウント失敗時の一次切り分けとして有用なため残す。
+#[allow(clippy::too_many_arguments)]
+fn remount_workspace_share(
+    config: &VmSandboxConfig,
+    host_ssh_key: &Path,
+    mount_point: &str,
+    share: &str,
+    user: &str,
+    password: &str,
+    workspace_id: &str,
+    incus: &IncusClient,
+    container_name: &str,
+) -> Result<(), VmError> {
+    let cred_remote = format!("/etc/harness-smb-{workspace_id}.cred");
+    let cred_contents = format!("username={user}\npassword={password}\n");
+    ssh_push_file(config.guest_ip, host_ssh_key, cred_contents.as_bytes(), &cred_remote)?;
+    ssh_exec_checked(
+        config.guest_ip,
+        host_ssh_key,
+        &format!("chmod 600 {cred_remote}"),
+        Duration::from_secs(10),
+    )?;
+
+    // unprivilegedコンテナのroot（namespace uid 0）が実際にホスト側でどのuid/gidへ
+    // マップされるかを問い合わせ、CIFSマウントの`uid=/gid=`をそれに合わせる
+    // （`container_root_host_id`のdoc参照。`shift=true`によるidmap shiftはCIFSが
+    // 対応しておらず使えないため、この静的合わせが唯一の非特権コンテナ向け解決策、
+    // spike検証で確認済み）。
+    let (host_uid, host_gid) = incus.container_root_host_id(container_name)?;
+    ssh_exec_checked(
+        config.guest_ip,
+        host_ssh_key,
+        &format!(
+            "set -x; \
+             mkdir -p {mount_point} && \
+             mount -t cifs //{smb_host}/{share} {mount_point} \
+             -o credentials={cred_remote},uid={host_uid},gid={host_gid},forceuid,forcegid,\
+             file_mode=0644,dir_mode=0755,cache=strict,vers=3.1.1; \
+             if mountpoint -q {mount_point}; then \
+               echo STEP=mount-ok; \
+             else \
+               echo STEP=mount-verify-failed; \
+               echo '---diag: mount | grep cifs---'; mount | grep cifs; \
+               echo '---diag: dmesg tail---'; dmesg 2>/dev/null | tail -n 20; \
+               echo '---diag: ls mount_point---'; ls -la {mount_point}; \
+               exit 1; \
+             fi",
+            smb_host = config.smb_host_ip,
+        ),
+        Duration::from_secs(30),
+    )?;
     Ok(())
 }
 
-/// `VmSession::attach_to_guest`が構築対象とするVMの識別子一式。コールド/ウォームの両パスで
-/// 値の出どころが異なる（コールド: 新規生成したsession_id、ウォーム: 固定の`WARM_VM_NAME`）
-/// ため、呼び出し側で組み立ててから渡す（引数過多を避けるための単純な束ね、`clippy::
-/// too_many_arguments`対策）。
-struct GuestIdentity {
-    session_id: String,
-    vm_name: String,
-    diff_vhdx: PathBuf,
-}
-
-/// ウォームテンプレート自体を破棄する（B8、破損検出時）。次回`ensure_warm_template`呼び出しで
-/// 最初からやり直す（VM再作成→firstboot→checkpoint再取得）。
-fn discard_warm_template(config: &VmSandboxConfig) {
-    let diff_vhdx = warm_diff_vhdx_path(config);
-    let _ = teardown_vm(WARM_VM_NAME, &diff_vhdx);
-    crate::vm_ledger::remove_session(WARM_VM_NAME);
-}
-
 impl VmSession {
-    /// VM起動→静的IP疎通待ち→Incus mTLS疎通確認→コンテナ作成/起動→ワークスペースcopy-in、
-    /// までを一気に行う（`plans/vm-spike/RESULTS.md`§3.7で確立した「Default Switch中継不要」
-    /// 経路を前提とする）。
+    /// 常駐VM（`crate::vm_host::VmHost`が参照カウントで管理）へアタッチ→コンテナ作成/起動→
+    /// ワークスペース資源の確保、までを一気に行う。**Phase B**: VM自体の起動は
+    /// `VmHost::attach`が担う。2セッション目以降は既に起動済みのVMへ即座にアタッチするだけで、
+    /// 新規VM作成は発生しない。`slot`は`vmsandboxd::SessionRegistry`が同時実行数上限の枠として
+    /// 払い出す番号で、コンテナの静的IP・SNIプロキシポートの衝突回避に使う。
     pub fn start(
         workspace_root: &Path,
         config: &VmSandboxConfig,
         allow_domains: &[String],
+        warm: bool,
+        slot: u8,
     ) -> Result<Self, VmError> {
         let session_id = unique_session_id();
-        let vm_name = session_id.clone();
-        std::fs::create_dir_all(&config.vm_work_dir)?;
-        let diff_vhdx = config.vm_work_dir.join(format!("{session_id}.diff.vhdx"));
-
-        let script = format!(
-            r#"
-$ErrorActionPreference = 'Stop'
-New-VHD -Path '{diff}' -ParentPath '{golden}' -Differencing | Out-Null
-New-VM -Name '{name}' -MemoryStartupBytes 2048MB -VHDPath '{diff}' -SwitchName '{switch}' -Generation 2 | Out-Null
-Set-VMProcessor -VMName '{name}' -Count 2
-Set-VM -Name '{name}' -AutomaticStopAction TurnOff -AutomaticStartAction Nothing
-Set-VMFirmware -VMName '{name}' -SecureBootTemplate MicrosoftUEFICertificateAuthority
-Start-VM -Name '{name}'
-"#,
-            diff = diff_vhdx.display(),
-            golden = config.golden_vhdx.display(),
-            name = vm_name,
-            switch = config.switch_name,
-        );
-        run_powershell(&script)?;
-
-        // VM作成成功直後、セッション設定完了前の台帳記録（D-24、`crate::vm_ledger`）。
-        // これ以降のいかなる失敗（Incus疎通待ちタイムアウト等）でVMが孤児として残っても、
-        // 次回起動時のGC（`gc_orphan_sessions`）が本エントリを見つけて撤収できる。
-        crate::vm_ledger::record_session(&session_id, &vm_name, &diff_vhdx, false);
-
-        // ここから先のいかなる失敗も、既に起動済みのVM（+差分VHDX）を孤児として残さないよう
-        // teardown_vmを呼んでから返す（実機E2Eで発見: この保証が無いと、cert未検出等の
-        // 一時的な失敗でVMだけが残り続け、固定静的IP（172.20.100.10）を使う設計上、次回
-        // セッションが新しいVMを起動した際にIP重複が発生し、どちらのVMが応答するか不定に
-        // なるという深刻な症状につながる。`plans/TIER1A-OPEN-ISSUES.md`項目9参照）。
-        let result = Self::attach_to_guest(
-            workspace_root,
-            config,
-            GuestIdentity { session_id, vm_name: vm_name.clone(), diff_vhdx: diff_vhdx.clone() },
-            allow_domains,
-            Duration::from_secs(180),
-            false,
-        );
+        let incus = crate::vm_host::VmHost::global().attach(config, warm)?;
+        let result =
+            Self::attach_to_guest(workspace_root, config, session_id, incus, allow_domains, slot);
         if result.is_err() {
-            let _ = teardown_vm(&vm_name, &diff_vhdx);
-            // `vm_name == session_id`（本関数冒頭の`let vm_name = session_id.clone();`）。
-            crate::vm_ledger::remove_session(&vm_name);
+            // VM自体は他セッションが使用中の可能性があるため、ここでは「このセッションの
+            // 取り分」を返上するだけでよい（refcountが0になれば`VmHost::release`が実際に
+            // VMを停止する）。
+            crate::vm_host::VmHost::global().release(config);
         }
         result
     }
 
-    /// [`Self::start`]（コールドブート）と[`Self::start_warm`]（B5、ウォームRestore後）の
-    /// 共有パス: ゲストへの疎通確認からコンテナ作成・ワークスペースcopy-inまでを行う。
-    /// VM自体の起動（`New-VM`+`Start-VM`、コールド専用）や`Restore-VMSnapshot`（ウォーム専用）
-    /// は呼び出し側の責務であり、ここでは扱わない（B4のリファクタリング分離）。
-    ///
-    /// `guest_wait_timeout`は静的IP疎通待ちのタイムアウトで、コールドブート
-    /// （`Self::start`、数十秒〜分オーダーの起動を見込む）とウォーム（`Self::start_warm`、
-    /// 既に起動済みのはずなので短い上限で足りる）で異なる値を渡す。失敗時のVM後始末は
-    /// 呼び出し側の責務（コールド: [`Self::start`]、ウォーム: [`Self::start_warm`]）。
+    /// ゲストへの疎通確認済み`incus`クライアント（`Self::start`＝`VmHost::attach`が既に
+    /// 用意したもの）を受け取り、コンテナ作成からワークスペース資源の確保までを行う。
     fn attach_to_guest(
         workspace_root: &Path,
         config: &VmSandboxConfig,
-        identity: GuestIdentity,
+        session_id: String,
+        incus: IncusClient,
         allow_domains: &[String],
-        guest_wait_timeout: Duration,
-        warm: bool,
+        slot: u8,
     ) -> Result<Self, VmError> {
-        let GuestIdentity { session_id, vm_name, diff_vhdx } = identity;
-        // 前回セッションの残留ホスト鍵によるSSH拒否を防ぐ（`reset_known_hosts_file`のdoc参照）。
-        // このセッションで最初にSSHを使う箇所（egress allowlist設定・CIFS認証情報配布/マウント、
-        // いずれも本関数の呼び出し範囲内）より前に1回だけ行う。
-        reset_known_hosts_file()?;
-        let incus = wait_for_guest_ready(config, guest_wait_timeout)?;
-
         let container_name = format!("harness-{session_id}");
         incus.create_container(&container_name, CONTAINER_IMAGE_ALIAS)?;
         incus.start_container(&container_name)?;
@@ -1447,7 +1666,8 @@ Start-VM -Name '{name}'
         // 最終判定は`ifup`自身の終了コードではなく`ip -4 addr show eth0`にinetが実在するかで
         // 行う（`&&`連結の最後の条件が全体のexit codeを決めるため、確実に反映される）。
         let interfaces_conf = format!(
-            "auto eth0\niface eth0 inet static\n    address {CONTAINER_STATIC_IP}\n    gateway {CONTAINER_GATEWAY}\n"
+            "auto eth0\niface eth0 inet static\n    address {}\n    gateway {CONTAINER_GATEWAY}\n",
+            container_static_ip_cidr(slot)
         );
         // **実機で判明した罠(3)**: コンテナ起動直後、Alpineのopenrc `networking`サービスは
         // eth0の自動DHCPブリングアップをまだ実行中のことがあり（`rc-status`で`networking
@@ -1548,179 +1768,113 @@ Start-VM -Name '{name}'
         // egress許可リスト（SNIプロキシ+nftables DNAT+コンテナACL）は`allow_domains`が
         // 非空の場合のみ構成する。既定（省略時）はPhase 1と同じ無制限egressのまま
         // （既存の`--net-allow-domain`未指定時の挙動を変えない、D-02と同じ「オプトイン」思想）。
+        // **Phase B（B-1）**: IPCが同一ユーザーの任意プロセスへ開かれた以上`allow_domains`は
+        // 外部入力として扱い、`validate_allow_domain`で妥当性を確認してから使う。
         let ssh_key = if allow_domains.is_empty() {
             None
         } else {
+            for d in allow_domains {
+                validate_allow_domain(d)?;
+            }
             let key = ensure_ssh_keypair()?;
-            setup_egress_allowlist(config.guest_ip, &key, &incus, &container_name, allow_domains)?;
+            attach_egress_acl(&incus, &container_name)?;
+            crate::vm_host::VmHost::global().configure_egress(
+                config,
+                &key,
+                slot,
+                container_ip(slot),
+                allow_domains.to_vec(),
+            )?;
             Some(key)
         };
 
+        let workspace_id = crate::smb_share::compute_workspace_id(workspace_root);
+
         // ワークスペース共有（`WorkspaceShareMode`、移行期間の切り替えフラグ）。
         // `Cifs`: Windows側でSMB共有→SSH経由でゲストへ認証情報配布→ゲスト内`mount -t cifs`
-        // →Incus disk deviceでコンテナへbind-mount、のライブ共有シーケンス。ウォーム
-        // セッションでもcheckpoint Restore後の`attach_to_guest`呼び出しのたびに毎回
-        // やり直す（使い捨て認証情報をセッションをまたいで使い回さない、D-22のセッション
-        // 使い捨て原則を優先、ユーザー確認済み）。
-        let (smb_share_name, smb_user) = if config.workspace_share_mode == WorkspaceShareMode::Cifs {
-            let (share, user, password) = crate::smb_share::create_ephemeral_share(&session_id, workspace_root)?;
-            // `record_session`は`vm_name`をキーに台帳エントリを作る（ウォームセッションでは
-            // `vm_name == WARM_VM_NAME`固定、コールドでは`vm_name == session_id`）ため、
-            // ここでも`vm_name`をキーに揃える（`session_id`ではない点に注意、B10）。
-            crate::vm_ledger::record_smb_share(&vm_name, &share, &user);
+        // →Incus disk deviceでコンテナへbind-mount、のライブ共有シーケンス。**Phase B**:
+        // `workspace_id`単位で参照カウント共有する（`DESIGN-SANDBOX-VMISOLATION.md`項目6-a）。
+        // 既に他セッションが同じワークスペースの共有・アカウント・CIFSマウントを用意済みなら
+        // 新規作成せず参照カウントだけ増やして再利用する。
+        //
+        // **TOCTOU**: 「台帳を見て既存資源が無ければ作成する」という判定と作成は、
+        // `WORKSPACE_RESOURCE_LOCK`で直列化しないと2セッションが同時に「無い」と判定して
+        // 同じ`workspace_id`の共有・アカウントを二重作成してしまう（BUG-024）。判定〜
+        // 作成/修復〜台帳記録〜`add_disk_device`までを1つのクリティカルセクションにする。
+        //
+        // **BUG-026**: 台帳（L1、Windows側で永続）だけを根拠に「ゲスト側マウント（L2、
+        // VM寿命限り）済み」とみなしてはならない。両者の整合は`decide_workspace_action`が
+        // ゲストへ直接問い合わせて判定し（`guest_workspace_mount_is_healthy`）、ズレていれば
+        // Repair（パスワードローテーション+再mount）で修復する。さらに`add_disk_device`が
+        // 失敗した場合は、直前に増やした/作った台帳エントリを必ず巻き戻す（経路B＝
+        // refcount単調増加による自己増殖の遮断）。
+        let workspace_lock = WORKSPACE_RESOURCE_LOCK.lock().unwrap();
+        let smb_share_name = if config.workspace_share_mode == WorkspaceShareMode::Cifs {
+            let mount_point = format!("/mnt/harness-workspace-{workspace_id}");
+            let host_ssh_key = ensure_ssh_keypair()?;
 
-            let ssh_key = ensure_ssh_keypair()?;
-            let cred_remote = format!("/etc/harness-smb-{session_id}.cred");
-            let cred_contents = format!("username={user}\npassword={password}\n");
-            ssh_push_file(config.guest_ip, &ssh_key, cred_contents.as_bytes(), &cred_remote)?;
-            ssh_exec_checked(
-                config.guest_ip,
-                &ssh_key,
-                &format!("chmod 600 {cred_remote}"),
-                Duration::from_secs(10),
-            )?;
+            let acquire_result = acquire_or_repair_workspace_share(
+                workspace_root,
+                &workspace_id,
+                config,
+                &host_ssh_key,
+                &mount_point,
+                &incus,
+                &container_name,
+            );
+            let (share, user) = match acquire_result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    drop(workspace_lock);
+                    return Err(e);
+                }
+            };
 
-            // unprivilegedコンテナのroot（namespace uid 0）が実際にホスト側でどのuid/gidへ
-            // マップされるかを問い合わせ、CIFSマウントの`uid=/gid=`をそれに合わせる
-            // （`container_root_host_id`のdoc参照。`shift=true`によるidmap shiftはCIFSが
-            // 対応しておらず使えないため、この静的合わせが唯一の非特権コンテナ向け解決策、
-            // spike検証で確認済み）。
-            let (host_uid, host_gid) = incus.container_root_host_id(&container_name)?;
-            ssh_exec_checked(
-                config.guest_ip,
-                &ssh_key,
-                &format!(
-                    "mkdir -p /mnt/harness-workspace && \
-                     mount -t cifs //{smb_host}/{share} /mnt/harness-workspace \
-                     -o credentials={cred_remote},uid={host_uid},gid={host_gid},forceuid,forcegid,\
-                     file_mode=0644,dir_mode=0755,cache=strict,vers=3.1.1",
-                    smb_host = config.smb_host_ip,
-                ),
-                Duration::from_secs(30),
-            )?;
+            if let Err(e) =
+                incus.add_disk_device(&container_name, "workspace", &mount_point, WORKSPACE_MOUNT)
+            {
+                // F3: `add_disk_device`失敗時は、直前に増やした/作ったワークスペース資源の
+                // refcountを必ず巻き戻す。ロックはこの巻き戻しの間保持したまま
+                // （再取得するとデッドロックする）。
+                if let Some(removed) = crate::vm_ledger::release_workspace_resource(&workspace_id) {
+                    let _ = ssh_exec(
+                        config.guest_ip,
+                        &host_ssh_key,
+                        &format!(
+                            "umount -l {mount_point} 2>/dev/null; rm -f /etc/harness-smb-{workspace_id}.cred"
+                        ),
+                        Duration::from_secs(15),
+                    );
+                    crate::smb_share::destroy_ephemeral_share(
+                        &removed.smb_share_name,
+                        &removed.smb_user,
+                        Some(Path::new(&removed.workspace_root)),
+                    );
+                }
+                drop(workspace_lock);
+                return Err(e);
+            }
 
-            incus.add_disk_device(&container_name, "workspace", "/mnt/harness-workspace", WORKSPACE_MOUNT)?;
-
-            (Some(share), Some(user))
+            let _ = user; // 台帳（`WorkspaceResourceEntry`）が正であり、ここでは使わない。
+            Some(share)
         } else {
-            (None, None)
+            None
         };
+        drop(workspace_lock);
 
         let session = Self {
             session_id,
-            vm_name,
-            diff_vhdx,
+            slot,
+            workspace_id,
             container_name,
             incus,
             ssh_key,
-            warm,
-            warm_lock: None,
             smb_share_name,
-            smb_user,
         };
         if config.workspace_share_mode == WorkspaceShareMode::CopyInOut {
             session.copy_in_workspace(workspace_root)?;
         }
         Ok(session)
-    }
-
-    /// ウォームRestoreによる高速セッション開始（B5）。`ensure_warm_template`（B3）が
-    /// checkpointを用意済みであることが前提（呼び出し側=daemon`serve_inner`がその順序を
-    /// 保証する、B9）。`Self::start`（コールドブート）とは異なり、既存のウォームVMを
-    /// 直列化ロック（`WarmLock`）で排他しつつcheckpointへ`Restore-VMSnapshot`してから
-    /// 起動する。失敗時、コールドブートとは異なり**ウォームVM自体は削除しない**
-    /// （破損時のテンプレート再構築・コールドフォールバックは呼び出し側、B8の責務）。
-    pub fn start_warm(
-        workspace_root: &Path,
-        config: &VmSandboxConfig,
-        allow_domains: &[String],
-        guest_wait_timeout: Duration,
-    ) -> Result<Self, VmError> {
-        let lock = WarmLock::acquire(config, Duration::from_secs(300))?;
-
-        let diff_vhdx = warm_diff_vhdx_path(config);
-        // `Stop-VM`を先に置くことで、直前の`teardown`（`Stop-VM`で明示停止）・想定外の
-        // 状態（実行中のまま残った等）のどちらからでも冪等にRestoreできる。checkpointは
-        // Running状態で捕捉した（`ensure_warm_template`）ため、`Restore-VMSnapshot`自体が
-        // 実行状態への復帰を伴う。後続の`Start-VM`は「既に起動済み」を許容するため
-        // `-ErrorAction SilentlyContinue`を付ける（冪等化、状態次第でのエラーを避ける）。
-        let script = format!(
-            r#"
-$ErrorActionPreference = 'Stop'
-Stop-VM -Name '{name}' -TurnOff -Force -ErrorAction SilentlyContinue
-Restore-VMSnapshot -VMName '{name}' -Name '{checkpoint}' -Confirm:$false
-Start-VM -Name '{name}' -ErrorAction SilentlyContinue
-"#,
-            name = WARM_VM_NAME,
-            checkpoint = WARM_CHECKPOINT_NAME,
-        );
-        run_powershell(&script)?;
-
-        let session_id = unique_session_id();
-        let mut session = Self::attach_to_guest(
-            workspace_root,
-            config,
-            GuestIdentity { session_id, vm_name: WARM_VM_NAME.to_string(), diff_vhdx },
-            allow_domains,
-            guest_wait_timeout,
-            true,
-        )?;
-        session.warm_lock = Some(lock);
-        Ok(session)
-    }
-
-    /// ウォームスタートの安全な入口（B8）。`ensure_warm_template`→`start_warm`を試み、
-    /// 破損（Restore失敗・疎通タイムアウト・Incus未信頼等）を検出した場合はテンプレートを
-    /// 1回だけ破棄して再provisioning→再試行し、それでも失敗すればコールドブート
-    /// （`Self::start`）へフォールバックする（`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.1）。
-    /// daemon側（`vmsandboxd::serve_inner`）はTier3+`--tier3-warm`指定時、`Self::start`の
-    /// 代わりにこちらを呼ぶ（B9）。
-    pub fn start_warm_or_fallback(
-        workspace_root: &Path,
-        config: &VmSandboxConfig,
-        allow_domains: &[String],
-    ) -> Result<Self, VmError> {
-        // ウォームRestore後は既に起動済みのはずなので、コールドブート（`Self::start`の
-        // 180秒、firstbootを見込む）より大幅に短いタイムアウトで足りる。
-        const WARM_GUEST_WAIT: Duration = Duration::from_secs(30);
-
-        if let Err(e) = ensure_warm_template(config) {
-            eprintln!(
-                "start_warm_or_fallback: failed to provision warm template, falling back to \
-                 cold boot: {e}"
-            );
-            return Self::start(workspace_root, config, allow_domains);
-        }
-
-        match Self::start_warm(workspace_root, config, allow_domains, WARM_GUEST_WAIT) {
-            Ok(session) => return Ok(session),
-            Err(e) => {
-                eprintln!(
-                    "start_warm_or_fallback: warm start failed ({e}), discarding warm template \
-                     and retrying once"
-                );
-            }
-        }
-
-        discard_warm_template(config);
-        if let Err(e) = ensure_warm_template(config) {
-            eprintln!(
-                "start_warm_or_fallback: re-provisioning warm template failed, falling back to \
-                 cold boot: {e}"
-            );
-            return Self::start(workspace_root, config, allow_domains);
-        }
-
-        match Self::start_warm(workspace_root, config, allow_domains, WARM_GUEST_WAIT) {
-            Ok(session) => Ok(session),
-            Err(e) => {
-                eprintln!(
-                    "start_warm_or_fallback: warm start failed again after re-provisioning \
-                     ({e}), falling back to cold boot"
-                );
-                Self::start(workspace_root, config, allow_domains)
-            }
-        }
     }
 
     /// ワークスペース全体をコンテナの`/workspace`へpushする（Phase 1: 素朴な全ファイル
@@ -1794,7 +1948,9 @@ Start-VM -Name '{name}' -ErrorAction SilentlyContinue
             .exec(&self.container_name, &["sh", "-c", cmd], &remote_cwd, env, timeout)
     }
 
-    pub fn teardown(self, workspace_root: &Path) -> Result<(), VmError> {
+    /// **Phase B**: VM自体はもう`self`が所有していない（`crate::vm_host::VmHost`が参照カウント
+    /// で管理する共有resident資源）ため、`config`を受け取って最後に`VmHost::release`を呼ぶ。
+    pub fn teardown(self, workspace_root: &Path, config: &VmSandboxConfig) -> Result<(), VmError> {
         // `WorkspaceShareMode::Cifs`セッションはライブ共有のためワークスペースの中身は
         // 常にホストの実ファイルシステムそのもの（bind-mountを外すだけ）で、明示的な
         // copy-outは不要（`copy_in_workspace`と同じくPhase 1の全ファイルpull往復を避ける、
@@ -1804,8 +1960,8 @@ Start-VM -Name '{name}' -ErrorAction SilentlyContinue
         } else {
             self.copy_out_workspace(workspace_root)
         };
-        // egress許可リストを構成していた場合のみ、VMが消える前に監査ログを回収する
-        // （ユーザー要望「通信の監査」対応、失敗してもteardown自体は止めない）。
+        // egress許可リストを構成していた場合のみ、VMが消える前に監査ログを回収し、
+        // このセッション分のegress設定をVM全体の集合から取り除く（A-8、`VmHost::release_egress`）。
         if let Some(ssh_key) = &self.ssh_key {
             let _ = fetch_and_persist_audit_log(
                 self.incus.host_ip(),
@@ -1813,44 +1969,40 @@ Start-VM -Name '{name}' -ErrorAction SilentlyContinue
                 workspace_root,
                 &self.session_id,
             );
+            let _ = crate::vm_host::VmHost::global().release_egress(config, ssh_key, self.slot);
         }
         let _ = self.incus.stop_container(&self.container_name);
         let _ = self.incus.delete_container(&self.container_name);
 
-        // Windows側の使い捨てSMB共有・ローカルアカウントを破棄する（共有→アカウントの順、
-        // `smb_share::destroy_ephemeral_share`のdoc参照）。コンテナ撤収後・VM撤収前に行う
-        // （どちらの順でも実害は無いが、共有の実体はWindows側でありVM状態と独立なため
-        // ここで先に片付ける）。
-        if let (Some(share), Some(user)) = (&self.smb_share_name, &self.smb_user) {
-            crate::smb_share::destroy_ephemeral_share(share, user, Some(workspace_root));
+        // ワークスペース単位資源（SMB共有・ローカルアカウント・CIFSマウント・NTFS ACE）の
+        // 参照カウントをデクリメントする。0になった最後の1セッションだけが実際に破棄する
+        // （`DESIGN-SANDBOX-VMISOLATION.md`項目6-a、A-4の構造的解消）。
+        if self.smb_share_name.is_some() {
+            // `attach_to_guest`の作成判定と同じロックで直列化する（TOCTOU是正、
+            // `WORKSPACE_RESOURCE_LOCK`のdoc参照）。
+            let _workspace_lock = WORKSPACE_RESOURCE_LOCK.lock().unwrap();
+            if let Some(removed) = crate::vm_ledger::release_workspace_resource(&self.workspace_id) {
+                if let Ok(host_ssh_key) = ensure_ssh_keypair() {
+                    let mount_point = format!("/mnt/harness-workspace-{}", self.workspace_id);
+                    let cred_remote = format!("/etc/harness-smb-{}.cred", self.workspace_id);
+                    // umount+cred削除はbest-effort（VM自体がこの後停止する可能性もあるため、
+                    // 失敗してもteardown全体は止めない、`teardown_vm`と同じ方針）。
+                    let _ = ssh_exec(
+                        config.guest_ip,
+                        &host_ssh_key,
+                        &format!("umount {mount_point} 2>/dev/null; rm -f {cred_remote}"),
+                        Duration::from_secs(15),
+                    );
+                }
+                crate::smb_share::destroy_ephemeral_share(
+                    &removed.smb_share_name,
+                    &removed.smb_user,
+                    Some(Path::new(&removed.workspace_root)),
+                );
+            }
         }
 
-        if self.warm {
-            // ウォームセッション: VM自体は削除せず、checkpointへRestoreして次回セッションの
-            // ために温存する（差分VHDX破棄の代わりに巻き戻すことで、当セッション中の書込みを
-            // 破棄する＝D-20「毎回捨てる」不変条件を満たす、§2.1参照）。checkpointは
-            // Running状態で捕捉した（`ensure_warm_template`）ため、Restore後は自動的に
-            // 実行状態へ戻る。次回`start_warm`の起動を軽くするため、その後`Stop-VM`で
-            // 明示的に停止しておく（次回のRestoreがどのみち実行状態へ戻すため、ここでの
-            // 停止と次回起動のタイミングは競合しない）。`self.warm_lock`は本関数を抜けて
-            // `self`がdropされる際に解放される（`WarmLock::Drop`）。
-            let script = format!(
-                r#"
-$ErrorActionPreference = 'Stop'
-Restore-VMSnapshot -VMName '{name}' -Name '{checkpoint}' -Confirm:$false
-Stop-VM -Name '{name}' -TurnOff -Force -ErrorAction SilentlyContinue
-"#,
-                name = WARM_VM_NAME,
-                checkpoint = WARM_CHECKPOINT_NAME,
-            );
-            run_powershell(&script)?;
-            return copy_out_result;
-        }
-
-        teardown_vm(&self.vm_name, &self.diff_vhdx)?;
-        // VM+差分VHDXの撤収が完了した後にのみ台帳から除去する（D-24）。撤収失敗時
-        // （`?`で早期returnした場合）は台帳に残したままにし、次回起動時のGCへ委ねる。
-        crate::vm_ledger::remove_session(&self.session_id);
+        crate::vm_host::VmHost::global().release(config);
         copy_out_result
     }
 
@@ -1859,16 +2011,46 @@ Stop-VM -Name '{name}' -TurnOff -Force -ErrorAction SilentlyContinue
     }
 }
 
-/// D-24: 台帳+実機照会の両方を突き合わせ、前回セッションの孤児VM・差分VHDXを撤収する
-/// （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.6・§4）。`VmSession::start`が新規VMを
-/// 起動し固定静的IP（`config.guest_ip`）を要求する**前**にdaemon側（`serve_inner`）から
-/// 呼ぶことで、孤児VMとのIP重複を未然に防ぐ（`VmSession::start`のコメント参照）。
+/// D-24: 台帳+実機照会の両方を突き合わせ、前回の孤児resident VM・差分VHDX・ワークスペース
+/// 単位資源を撤収する（`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.6・§4・項目8）。
+/// **Phase B**: `crate::vm_host::VmHost::attach`のStopped→Running遷移直前、または
+/// `harness tier3 gc`（別プロセス）から呼ばれる。VMが1台の共有resident資源になったため、
+/// 孤児判定の単位も「複数の`session_id`エントリ」から「単一のVMホストエントリ」へ変わった——
+/// 孤児と判定された場合、そのVMの生存期間中に参照カウントを管理していたdaemonプロセスの
+/// `SessionRegistry`ごと消失しているとみなし、台帳上の全`workspace_resources`エントリも
+/// 合わせて撤収する。
+///
+/// **BUG-027対策**: 台帳に記録された`daemon_pid`（このVMを起動した常駐daemon自身のPID）が
+/// 生存している間は、そのVM・全`workspace_resources`をGC対象から一切除外する。これが無いと、
+/// セッション実行中に別プロセスから`harness tier3 gc`を叩いただけで、稼働中のVM・コンテナ・
+/// SMB共有・NTFS ACEを無条件で撤収してしまう（`docs/bugs/BUG-027.md`）。
+///
+/// **BUG-026対策（F4）**: `workspace_resources`は孤児VMの有無に関わらず無条件で整合させる。
+/// 本関数が実際に呼ばれる時点（daemonがVMをこれから起こす瞬間、またはgc専用プロセス）では
+/// アクティブセッションは存在しない前提のため、台帳上の全エントリは定義上stale。また、
+/// 台帳に記録されていないWindows側実体（`New-LocalUser`名前衝突後の作り直し漏れ等、状態S2/S3）
+/// も`smb_share::enumerate_windows_workspace_shares`で直接走査して回収する（旧実装は
+/// `orphans.is_empty()`で早期returnし、孤児VMが無い場合`workspace_resources`を一切見ないため、
+/// これらを永久に回収できなかった）。
 ///
 /// 個々の撤収に失敗しても処理は止めない（best-effort、`plans/TIER1A-OPEN-ISSUES.md`
 /// 項目9）。GC自体の失敗で`StartSession`を失敗させないよう、呼び出し側は戻り値を無視して
 /// 構わない設計（stderrへログするのみ）。
 pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) -> Vec<String> {
     let ledger = crate::vm_ledger::load();
+
+    let resident_daemon_alive = ledger
+        .vm_host
+        .as_ref()
+        .map(|h| crate::vm_ledger::is_pid_alive(h.daemon_pid))
+        .unwrap_or(false);
+    if resident_daemon_alive {
+        eprintln!(
+            "gc_orphan_sessions: resident daemon (pid still alive) owns the VM; skipping GC \
+             this round to avoid tearing down an active session (BUG-027)"
+        );
+        return Vec::new();
+    }
 
     let existing_vm_names = match run_powershell(
         "Get-VM -Name 'harness-tier3-*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name",
@@ -1884,29 +2066,55 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
         }
     };
 
-    let orphans = crate::vm_ledger::select_orphans(&ledger, current_session_id, &existing_vm_names);
+    let orphans = crate::vm_ledger::select_orphan_vm_names(&ledger, &existing_vm_names);
 
-    // SMBライブ共有（`plans/DESIGN-SANDBOX-VMISOLATION.md`§2.4）のセッション使い捨て共有・
-    // アカウントも、孤児VMと一緒に回収する（VM自体が孤児になった時点で、そのVMが使っていた
-    // 共有・アカウントも用済みのため）。
-    for (share_name, user_name) in crate::vm_ledger::select_smb_orphans(&ledger, &orphans) {
-        // 台帳が`workspace_root`自体を記録していないため、孤児回収経路ではNTFS ACEの取り消しは
-        // スキップされる（`destroy_ephemeral_share`のdoc参照、既知の限界）。
-        crate::smb_share::destroy_ephemeral_share(&share_name, &user_name, None);
+    // F4: 孤児VMの有無に関わらず、台帳上のworkspace_resourcesは無条件で整合させる
+    // （resident_daemon_aliveでないと確定した以上、アクティブセッションは存在しないため
+    // 台帳上の全エントリは定義上stale）。
+    for resource in crate::vm_ledger::select_all_workspace_resources(&ledger) {
+        crate::smb_share::destroy_ephemeral_share(
+            &resource.smb_share_name,
+            &resource.smb_user,
+            Some(Path::new(&resource.workspace_root)),
+        );
+    }
+    let mut cleared = ledger;
+    cleared.workspace_resources.clear();
+    crate::vm_ledger::save(&cleared);
+
+    // F4: 台帳に載っていないWindows側実体（状態S2/S3）も実体側から直接走査して回収する。
+    // 直前のループで台帳追跡分は既に破棄済みのため、ここで見つかるのは真に台帳から
+    // 不可視だった孤児のみ。
+    for (share, user, path) in crate::smb_share::enumerate_windows_workspace_shares() {
+        crate::smb_share::destroy_ephemeral_share(&share, &user, Some(&path));
+    }
+
+    if orphans.is_empty() {
+        return orphans;
     }
 
     for vm_name in &orphans {
-        let diff_vhdx = ledger
-            .entries
-            .iter()
-            .find(|e| &e.vm_name == vm_name)
-            .map(|e| PathBuf::from(&e.diff_vhdx))
-            .unwrap_or_else(|| config.vm_work_dir.join(format!("{vm_name}.diff.vhdx")));
+        // **実機で発見**: `vm_name`から`{vm_name}.diff.vhdx`という命名規則を推測すると、
+        // 実際の常駐VMの差分VHDXファイル名（`crate::vm_host::resident_diff_vhdx_path`が
+        // 決める固定名`resident.diff.vhdx`）と一致しない。台帳に記録が無い場合
+        // （`vm_host`が`None`になった後の再実行等）は、常駐VM名である前提で正しいパスを導く。
+        let diff_vhdx = cleared
+            .vm_host
+            .as_ref()
+            .filter(|h| &h.vm_name == vm_name)
+            .map(|h| PathBuf::from(&h.diff_vhdx))
+            .unwrap_or_else(|| {
+                if vm_name == crate::vm_host::RESIDENT_VM_NAME {
+                    crate::vm_host::resident_diff_vhdx_path(config)
+                } else {
+                    config.vm_work_dir.join(format!("{vm_name}.diff.vhdx"))
+                }
+            });
         if let Err(e) = teardown_vm(vm_name, &diff_vhdx) {
             eprintln!("gc_orphan_sessions: failed to tear down orphan VM {vm_name}: {e}");
         }
-        crate::vm_ledger::remove_session(vm_name);
     }
+    crate::vm_ledger::remove_vm_host();
 
     // 台帳・生存VMのどちらからも参照されなくなった差分VHDXの取りこぼしを一掃する
     // （teardown_vm自体が消し忘れた場合の保険、`vm_work_dir`直下のみを対象にする）。
@@ -1921,10 +2129,7 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
         let Some(session_part) = file_name.strip_suffix(".diff.vhdx") else {
             continue;
         };
-        if session_part == current_session_id
-            || session_part == crate::vm_ledger::WARM_VM_NAME
-            || existing_vm_names.iter().any(|n| n == session_part)
-        {
+        if session_part == current_session_id || existing_vm_names.iter().any(|n| n == session_part) {
             continue;
         }
         let _ = std::fs::remove_file(&path);
@@ -1933,7 +2138,7 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
     orphans
 }
 
-fn teardown_vm(vm_name: &str, diff_vhdx: &Path) -> Result<(), VmError> {
+pub(crate) fn teardown_vm(vm_name: &str, diff_vhdx: &Path) -> Result<(), VmError> {
     let script = format!(
         r#"
 Stop-VM -Name '{name}' -TurnOff -Force -ErrorAction SilentlyContinue
@@ -2000,22 +2205,146 @@ mod tests {
     }
 
     #[test]
-    fn build_sni_proxy_conf_maps_allowed_domains_to_allow() {
-        let conf = build_sni_proxy_conf(&["example.com".to_string(), "api.example.org".to_string()]);
+    fn build_sni_proxy_conf_multi_maps_allowed_domains_to_allow() {
+        let sessions = vec![EgressSession {
+            slot: 0,
+            container_ip: "10.76.180.61".to_string(),
+            allow_domains: vec!["example.com".to_string(), "api.example.org".to_string()],
+        }];
+        let conf = build_sni_proxy_conf_multi(&sessions);
         assert!(conf.contains("example.com     \"example.com:443\";"));
         assert!(conf.contains("api.example.org     \"api.example.org:443\";"));
         assert!(conf.contains("example.com     \"ALLOW\";"));
         assert!(conf.contains("default              \"\";"));
         assert!(conf.contains("default              \"DENY\";"));
-        assert!(conf.contains(&format!("listen {INCUS_BRIDGE_IP}:{SNI_PROXY_PORT};")));
+        assert!(conf.contains(&format!("listen {INCUS_BRIDGE_IP}:{};", sni_proxy_port_for_slot(0))));
         assert!(conf.contains(&format!("access_log {SNI_AUDIT_LOG_PATH} sniaudit;")));
     }
 
     #[test]
-    fn build_sni_proxy_conf_with_no_domains_only_has_defaults() {
-        let conf = build_sni_proxy_conf(&[]);
-        assert!(conf.contains("default              \"\";"));
-        assert!(conf.contains("default              \"DENY\";"));
+    fn build_sni_proxy_conf_multi_with_no_sessions_has_no_server_blocks() {
+        let conf = build_sni_proxy_conf_multi(&[]);
         assert!(!conf.contains("ALLOW"));
+        assert!(!conf.contains("listen"));
+    }
+
+    #[test]
+    fn build_sni_proxy_conf_multi_isolates_ports_and_domains_per_slot() {
+        let sessions = vec![
+            EgressSession {
+                slot: 0,
+                container_ip: "10.76.180.61".to_string(),
+                allow_domains: vec!["a.example.com".to_string()],
+            },
+            EgressSession {
+                slot: 1,
+                container_ip: "10.76.180.62".to_string(),
+                allow_domains: vec!["b.example.com".to_string()],
+            },
+        ];
+        let conf = build_sni_proxy_conf_multi(&sessions);
+        assert!(conf.contains(&format!("listen {INCUS_BRIDGE_IP}:{};", sni_proxy_port_for_slot(0))));
+        assert!(conf.contains(&format!("listen {INCUS_BRIDGE_IP}:{};", sni_proxy_port_for_slot(1))));
+        // 各セッションのmapに、他セッションのドメインが混ざっていないこと（A-8是正の回帰）。
+        let slot0_map_start = conf.find("$sni_upstream_0").unwrap();
+        let slot0_map_end = conf.find("$sni_upstream_1").unwrap();
+        assert!(conf[slot0_map_start..slot0_map_end].contains("a.example.com"));
+        assert!(!conf[slot0_map_start..slot0_map_end].contains("b.example.com"));
+    }
+
+    #[test]
+    fn validate_allow_domain_accepts_normal_domains() {
+        assert!(validate_allow_domain("example.com").is_ok());
+        assert!(validate_allow_domain("api.example-1.co.jp").is_ok());
+    }
+
+    #[test]
+    fn validate_allow_domain_rejects_injection_characters() {
+        assert!(validate_allow_domain("example.com\";}\nserver{{").is_err());
+        assert!(validate_allow_domain("").is_err());
+        assert!(validate_allow_domain(&"a".repeat(300)).is_err());
+    }
+
+    #[test]
+    fn build_nftables_script_adds_dnat_and_s5_filter_drop_per_session() {
+        let sessions = vec![EgressSession {
+            slot: 2,
+            container_ip: "10.76.180.63".to_string(),
+            allow_domains: vec!["example.com".to_string()],
+        }];
+        let script = build_nftables_script(&sessions);
+        let port = sni_proxy_port_for_slot(2);
+        assert!(script.contains(&format!("ip saddr 10.76.180.63 tcp dport 443 redirect to :{port}")));
+        assert!(script.contains(&format!(
+            "ip daddr {INCUS_BRIDGE_IP} tcp dport {port} ip saddr != 10.76.180.63 drop"
+        )));
+    }
+
+    /// BUG-026: 状態表S0〜S7（`docs/bugs/BUG-026.md`参照）の8状態すべてで
+    /// `decide_workspace_action`が期待どおりのアクションを返すことを表駆動で検証する。
+    /// 台帳の有無×ゲスト側マウントの健全性の2×2の組み合わせ自体は4通りしかない
+    /// （S0〜S3はいずれも「台帳無し」に潰れる、S4〜S6はいずれも「台帳有り・不健全」に潰れる）
+    /// ため、実際の分岐点は`(existing_present, mount_healthy)`の4通りで尽くされる。
+    #[test]
+    fn decide_workspace_action_covers_all_four_ledger_mount_combinations() {
+        // S7: 台帳有り・マウント健全 → Reuse。
+        assert_eq!(decide_workspace_action(true, true), WorkspaceAction::Reuse);
+        // S4/S5/S6: 台帳有り・マウント不健全 → Repair。
+        assert_eq!(decide_workspace_action(true, false), WorkspaceAction::Repair);
+        // S0〜S3: 台帳無し（マウントの有無に関わらず）→ CreateFresh。
+        assert_eq!(decide_workspace_action(false, true), WorkspaceAction::CreateFresh);
+        assert_eq!(decide_workspace_action(false, false), WorkspaceAction::CreateFresh);
+    }
+
+    /// [BUG-026回帰テスト・実機E2E] `%APPDATA%`の台帳へ「workspace_id一致・ゲスト側マウント
+    /// 無し」のstale `WorkspaceResourceEntry`（状態S6、`docs/bugs/BUG-026.md`の状態表参照）を
+    /// 自己完結で注入し、実際にVM/コンテナを起動して`VmSession::start`の挙動を確認する。
+    /// 2026-07-27の実機検証で、修正前はここが初回試行（`add_disk_device`の10回リトライを
+    /// 待つまでもなく、VM冷起動・コンテナ作成を経た約44秒後）で"Missing source path"に
+    /// 確実に失敗することを確定させた（根本原因: 再利用分岐が台帳の存在だけでゲスト側マウント
+    /// 済みとみなし、実際のマウントを検証しない）。修正後はF2のRepair分岐が発火し、
+    /// パスワードローテーション+再mountを経て`Ready`相当（`Ok`）まで到達することを確認する。
+    #[test]
+    #[ignore]
+    fn bug026_stale_ledger_entry_without_guest_mount_is_repaired_not_missing_source_path() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root must resolve");
+        let config = VmSandboxConfig::default();
+        let workspace_id = crate::smb_share::compute_workspace_id(&workspace_root);
+
+        // 状態S6を自己完結で構成する: 台帳にだけ（ゲスト側マウント無しで）エントリを作る。
+        // `smb_share_name`/`smb_user`/`smb_user_sid`はダミー（実際のWindows資源は作らない）。
+        crate::vm_ledger::record_workspace_resource(
+            &workspace_id,
+            &workspace_root,
+            "harness-ws-bug026-repro",
+            "hns3-bug026-repro",
+            "S-1-5-21-0-0-0-9999",
+        );
+
+        let result = VmSession::start(&workspace_root, &config, &[], false, 0);
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                println!("=== BUG-026 repro: VmSession::start failed: {msg} ===");
+                panic!(
+                    "expected the Repair branch (F2) to recover from a stale ledger entry \
+                     without a guest mount, but VmSession::start still failed: {msg}"
+                );
+            }
+            Ok(session) => {
+                println!(
+                    "=== BUG-026 repro: VmSession::start recovered via Repair as expected \
+                     (session_id={}) ===",
+                    session.session_id()
+                );
+                let _ = session.teardown(&workspace_root, &config);
+            }
+        }
+
+        // 後始末: 万一パニックした場合も含め、注入した台帳エントリと実資源をGCへ寄せる。
+        let _ = crate::vmsandbox::gc_orphan_sessions(&config, "");
     }
 }

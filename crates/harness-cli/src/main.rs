@@ -305,6 +305,15 @@ struct Cli {
     #[arg(long = "tier3-warm", default_value_t = false)]
     tier3_warm: bool,
 
+    /// Tier3常駐daemonが同時に受け付けるセッション数の上限（`DESIGN-SANDBOX-VMISOLATION.md`
+    /// 「実装確定サマリー」項目6-a）。既定4。**daemon起動時にのみ渡す値**——後から接続する
+    /// 2本目以降のセッションがこの上限を書き換えられると意味が無いため、`StartSession`の
+    /// ペイロードではなくdaemonプロセスの起動引数として渡す（daemonが既に起動済みの場合、
+    /// この値は無視される）。カウント対象はTier3セッション（daemon内の登録簿）のみで、
+    /// Tier0/Tier1a/Tier1b/Tier2はこのdaemonへ接続しないため対象外。
+    #[arg(long = "tier3-max-sessions", default_value_t = 4)]
+    tier3_max_sessions: u8,
+
     /// 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）の許可ドメインを
     /// 追加する（繰り返し指定可、`*.example.com`形式のサフィックスワイルドカード対応）。
     /// `.harness/settings.json`の`net.allow_domains`と合算する（和集合）。1つでも指定される
@@ -1905,6 +1914,7 @@ async fn main() -> ExitCode {
                 &workspace_root,
                 &net_proxy.allow_domains,
                 cli.tier3_warm,
+                cli.tier3_max_sessions.max(1),
             ) {
                 Ok(handle) => Some(std::sync::Arc::new(handle)),
                 Err(e) => {

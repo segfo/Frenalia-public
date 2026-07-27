@@ -48,6 +48,9 @@ pub mod netfilterd;
 pub mod vmsandbox;
 
 #[cfg(windows)]
+pub mod vm_host;
+
+#[cfg(windows)]
 pub mod vmsandboxd;
 
 #[cfg(windows)]

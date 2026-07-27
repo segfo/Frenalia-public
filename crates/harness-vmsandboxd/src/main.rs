@@ -31,23 +31,29 @@ fn main() -> std::process::ExitCode {
         return run_result(harness_sandbox::vmsandboxd::serve_gc(&pipe_name));
     }
 
-    let (owner_sid, owner_exe) = match parse_owner_args(&rest) {
+    let (owner_sid, owner_exe, max_sessions) = match parse_owner_args(&rest) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("harness-vmsandboxd: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    run_result(harness_sandbox::vmsandboxd::serve_resident(&owner_sid, &owner_exe))
+    run_result(harness_sandbox::vmsandboxd::serve_resident(
+        &owner_sid,
+        &owner_exe,
+        max_sessions,
+    ))
 }
 
-/// `--owner-sid <SID> --owner-exe <path>`をコマンドライン残余引数から取り出す（S-2）。
-/// 起動元（親、非昇格harness本体）を明示的に伝えるための引数で、daemon自身のトークンSIDや
-/// `current_exe()`は使わない（`serve_resident`のdoc参照）。
+/// `--owner-sid <SID> --owner-exe <path> [--max-sessions <n>]`をコマンドライン残余引数から
+/// 取り出す（S-2・Phase B）。起動元（親、非昇格harness本体）を明示的に伝えるための引数で、
+/// daemon自身のトークンSIDや`current_exe()`は使わない（`serve_resident`のdoc参照）。
+/// `--max-sessions`省略時は既定4（`DESIGN-SANDBOX-VMISOLATION.md`項目6-a）。
 #[cfg(windows)]
-fn parse_owner_args(rest: &[String]) -> Result<(String, std::path::PathBuf), String> {
+fn parse_owner_args(rest: &[String]) -> Result<(String, std::path::PathBuf, u8), String> {
     let mut owner_sid = None;
     let mut owner_exe = None;
+    let mut max_sessions: u8 = 4;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -59,12 +65,20 @@ fn parse_owner_args(rest: &[String]) -> Result<(String, std::path::PathBuf), Str
                 owner_exe = rest.get(i + 1).cloned();
                 i += 2;
             }
+            "--max-sessions" => {
+                max_sessions = rest
+                    .get(i + 1)
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .filter(|n| *n >= 1)
+                    .unwrap_or(4);
+                i += 2;
+            }
             _ => i += 1,
         }
     }
     let owner_sid = owner_sid.ok_or_else(|| "missing --owner-sid".to_string())?;
     let owner_exe = owner_exe.ok_or_else(|| "missing --owner-exe".to_string())?;
-    Ok((owner_sid, std::path::PathBuf::from(owner_exe)))
+    Ok((owner_sid, std::path::PathBuf::from(owner_exe), max_sessions))
 }
 
 #[cfg(windows)]

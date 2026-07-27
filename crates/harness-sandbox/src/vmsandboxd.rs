@@ -47,7 +47,7 @@ use windows::Win32::Security::{
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
     FILE_FLAG_OVERLAPPED, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
@@ -799,11 +799,23 @@ fn create_additional_pipe_instance(
 
 /// 親側(クライアント)が固定パイプへ接続する（S-2、パイプの向き反転後の接続方向）。
 /// `ERROR_PIPE_BUSY`（daemonは生存しているが全インスタンスが埋まっている、複数クライアントの
-/// レース）は`WaitNamedPipeW`で空きを待って自動リトライする。`ERROR_FILE_NOT_FOUND`
-/// （daemon未起動）はそのまま呼び出し元へ返し、daemon起動のフォールバックへ委ねる。
+/// レース）は`WaitNamedPipeW`で空きを待って自動リトライする。
+///
+/// `ERROR_FILE_NOT_FOUND`（パイプ自体が存在しない）の扱いは`retry_on_not_found`で分岐する。
+/// **Phase B実機E2Eで発見したバグ**: 従来は`ERROR_FILE_NOT_FOUND`を即座に呼び出し元へ返して
+/// いたが、これは「daemon起動待ちの30秒（`CONNECT_TIMEOUT`）」呼び出しでは誤りだった——
+/// `launch_daemon_elevated`直後、昇格daemonが実際に`create_first_pipe_instance`へ到達する
+/// までの間（UAC操作・プロセス起動・アンチウイルススキャン等）はパイプ自体がまだ存在しない
+/// ため`ERROR_FILE_NOT_FOUND`になり、`CONNECT_TIMEOUT`が謳う「30秒待つ」を実質1回の即時失敗に
+/// 縮退させていた。2つの`harness.exe`をほぼ同時に起動するE2Eで実際に踏んだ（一方の昇格daemon
+/// が`FILE_FLAG_FIRST_PIPE_INSTANCE`で敗れて即終了する一方、勝った側のdaemonがまだパイプを
+/// 作り切っていないタイミングで負けた側のクライアントがこの関数を呼ぶと、即座に諦めてしまう）。
+/// `retry_on_not_found: true`ならポーリング（200ms間隔）で`timeout`まで待つ。`false`
+/// （daemon未起動かどうかを即座に判定したい200msのクイックチェック用）は従来通り即座に返す。
 fn connect_to_pipe_as_client(
     pipe_name: &str,
     timeout: std::time::Duration,
+    retry_on_not_found: bool,
 ) -> Result<HANDLE, VmSandboxIpcError> {
     let pipe_name_w = wide(pipe_name);
     let deadline = std::time::Instant::now() + timeout;
@@ -835,7 +847,14 @@ fn connect_to_pipe_as_client(
                 }
             }
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
-                return Err(VmSandboxIpcError::from(e));
+                if !retry_on_not_found {
+                    return Err(VmSandboxIpcError::from(e));
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(VmSandboxIpcError::from(e));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200).min(deadline - now));
             }
             Err(e) => return Err(VmSandboxIpcError::from(e)),
         }
@@ -899,11 +918,15 @@ impl VmSandboxHandle {
     /// 応答を待つ（親側、非管理者本体から呼ぶ、S-2でパイプの向きが反転）。`allow_domains`は
     /// 既存の`net_proxy.allow_domains`（`--net-allow-domain`+`.harness/settings.json`
     /// 統合済み、WFPが既に使っているのと同じ値）をそのまま渡す。`warm`は`--tier3-warm`
-    /// （フェーズB）の値をそのまま渡す。
+    /// （フェーズB）の値をそのまま渡す。`max_sessions`は**daemon未起動時の昇格起動にのみ
+    /// 使われる**（`DESIGN-SANDBOX-VMISOLATION.md`項目6-a）——既に常駐daemonが生きている
+    /// 場合、この値は無視される（後から接続する2本目以降が上限を書き換えられては意味が
+    /// 無いため、daemon起動時の引数としてのみ受け付ける設計）。
     pub fn start(
         workspace_root: &std::path::Path,
         allow_domains: &[String],
         warm: bool,
+        max_sessions: u8,
     ) -> Result<Self, VmSandboxIpcError> {
         let owner_sid = current_user_sid_string().map_err(|e| {
             VmSandboxIpcError::Ipc(format!("failed to resolve current user SID: {e}"))
@@ -917,15 +940,19 @@ impl VmSandboxHandle {
         // これで即座に繋がる想定）。`ERROR_FILE_NOT_FOUND`ならdaemon未起動とみなし、
         // 昇格起動してから改めて接続を待つ。
         let (pipe, daemon_process) =
-            match connect_to_pipe_as_client(pipe_name, std::time::Duration::from_millis(200)) {
+            match connect_to_pipe_as_client(pipe_name, std::time::Duration::from_millis(200), false) {
                 Ok(pipe) => (pipe, None),
                 Err(_) => {
                     let params = format!(
-                        "{pipe_name} --owner-sid {owner_sid} --owner-exe \"{}\"",
+                        "{pipe_name} --owner-sid {owner_sid} --owner-exe \"{}\" --max-sessions {max_sessions}",
                         owner_exe.display()
                     );
                     let daemon_process = unsafe { launch_daemon_elevated(&daemon_path, &params) }?;
-                    match connect_to_pipe_as_client(pipe_name, CONNECT_TIMEOUT) {
+                    // `retry_on_not_found: true`——ここは昇格daemonの起動を待つ経路であり、
+                    // パイプがまだ存在しない（`ERROR_FILE_NOT_FOUND`）ことも起動途中の正常な
+                    // 状態として`CONNECT_TIMEOUT`いっぱいまでポーリングする（バグ修正、
+                    // モジュール内`connect_to_pipe_as_client`のdoc参照）。
+                    match connect_to_pipe_as_client(pipe_name, CONNECT_TIMEOUT, true) {
                         Ok(pipe) => (pipe, Some(daemon_process)),
                         Err(e) => {
                             unsafe {
@@ -1103,8 +1130,30 @@ impl Drop for VmSandboxHandle {
 /// `VmSandboxHandle::start`とは異なりセッションを開始せず、`--gc-only`引数付きで起動した
 /// daemon（`serve_gc`）が[`VmRequest::Gc`]を1件処理して即座に終了するのを待つだけの
 /// 軽量な経路。ウォームVM・現在セッション（gc-only起動時は存在しない）は台帳側の
-/// 選定ロジック（`crate::vm_ledger::select_orphans`）でGC対象から除外される。
+/// 選定ロジック（`crate::vm_ledger::select_orphan_vm_names`・`daemon_pid`生存判定）で
+/// GC対象から除外される。
+///
+/// **BUG-027対策（2層防御の1層目）**: `gc_orphan_sessions`側の`daemon_pid`生存判定
+/// （2層目、こちらが最終防御線）とは別に、ここでは固定の常駐セッションdaemonパイプへ
+/// 接続を試みることで「セッション実行中かどうか」を早期に、UAC昇格すら発生させずに
+/// 判定する。接続できた＝常駐daemonが稼働中ということなので、ユーザーに分かるエラーで
+/// 即座に中止する（そもそも新規daemonを昇格起動しない）。
 pub fn run_gc_only() -> Result<Vec<String>, VmSandboxIpcError> {
+    if connect_to_pipe_as_client(
+        session_daemon_pipe_name(),
+        std::time::Duration::from_millis(200),
+        false,
+    )
+    .is_ok()
+    {
+        return Err(VmSandboxIpcError::Rejected(
+            "a Tier3 session daemon is currently running (an active session may be in \
+             progress); refusing to run GC to avoid tearing down its VM/containers/SMB shares. \
+             Wait for the session to finish, or stop it first."
+                .to_string(),
+        ));
+    }
+
     let prepared = prepare_pipe()?;
     let pipe_name = prepared.name().to_string();
     let pipe = prepared.into_handle();
@@ -1187,7 +1236,62 @@ impl harness_core::VmShellExecutor for VmSandboxHandle {
 /// 次の接続を待ち続ける（＝daemonプロセス自体は`Teardown`後も終了しない。複数セッションを
 /// 同時ではなく順番に処理する最小構成——並行処理・セッション数上限は将来の拡張、
 /// `plans/DESIGN-SANDBOX-VMISOLATION.md`「実装確定サマリー」項目6参照）。
-pub fn serve_resident(owner_sid: &str, owner_exe: &Path) -> Result<(), VmSandboxIpcError> {
+/// `HANDLE`（`windows`クレート、実体はポインタサイズの不透明値）を`std::thread::spawn`の
+/// クロージャへ移すためのラッパー。`PreparedPipe`と同じ理由で`unsafe impl Send`を明示する
+/// （named pipeハンドルはスレッド間で受け渡して使う分には安全、Win32 API自体の契約）。
+struct SendableHandle(HANDLE);
+unsafe impl Send for SendableHandle {}
+
+/// 同時実行中のTier3セッションの登録簿（daemonプロセス内メモリのみ）。S-2段階5
+/// （thread-per-session化）の要——接続受理ループはこれのエントリ数で同時実行数上限
+/// （既定4・設定可能、`--max-sessions`）を判定し、超過時は新規スレッドを立てずその場で
+/// 明示的に拒否する（現行の「2本目が300秒沈黙する」バグの直接の修正、
+/// `DESIGN-SANDBOX-VMISOLATION.md`項目6-a参照）。**カウント対象はTier3セッション（本registry
+/// のエントリ）だけ**——Tier0/Tier1a/Tier1b/Tier2はこのdaemonへ一切接続しないため対象外。
+struct SessionRegistry {
+    max_sessions: u8,
+    active_slots: std::sync::Mutex<std::collections::HashSet<u8>>,
+}
+
+impl SessionRegistry {
+    fn new(max_sessions: u8) -> Self {
+        Self {
+            max_sessions,
+            active_slots: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// 空いているslot番号（`0..max_sessions`）を確保する。上限に達していれば`None`。
+    /// `slot`はコンテナの静的IP・SNIプロキシポートの衝突回避に使われる
+    /// （`crate::vmsandbox::container_static_ip_cidr`/`sni_proxy_port_for_slot`）。
+    fn try_acquire_slot(&self) -> Option<u8> {
+        let mut slots = self.active_slots.lock().unwrap();
+        for slot in 0..self.max_sessions {
+            if !slots.contains(&slot) {
+                slots.insert(slot);
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    fn release_slot(&self, slot: u8) {
+        self.active_slots.lock().unwrap().remove(&slot);
+    }
+}
+
+/// daemon側エントリポイント（`harness-vmsandboxd.exe`のmainから呼ぶ、昇格トークンで実行）。
+/// **Phase B（S-2段階5）**: 接続受理ループとセッション処理（`serve_inner`）を分離し、受理した
+/// 接続を`std::thread::spawn`へ渡して即座に次の`ConnectNamedPipe`へ戻る——旧実装は
+/// `serve_inner`（1セッション丸ごと）をループ内で直接呼んでいたため、2本目の接続は
+/// `ERROR_PIPE_BUSY`にならず`CreateFileW`は成功するのに誰も`ConnectNamedPipe`を呼ばず、
+/// 1本目の`Teardown`まで無応答になる既知のバグがあった（`DESIGN-SANDBOX-VMISOLATION.md`
+/// 項目6-a）。`max_sessions`（既定4）は`SessionRegistry`のエントリ数だけで判定する。
+pub fn serve_resident(
+    owner_sid: &str,
+    owner_exe: &Path,
+    max_sessions: u8,
+) -> Result<(), VmSandboxIpcError> {
     let pipe_name = session_daemon_pipe_name();
     let mut sa = user_only_security_attributes(owner_sid)?;
     let first = create_first_pipe_instance(pipe_name, &mut sa);
@@ -1201,6 +1305,10 @@ pub fn serve_resident(owner_sid: &str, owner_exe: &Path) -> Result<(), VmSandbox
         ))
     })?;
 
+    let registry = std::sync::Arc::new(SessionRegistry::new(max_sessions.max(1)));
+    let owner_sid_owned = owner_sid.to_string();
+    let owner_exe_owned = owner_exe.to_path_buf();
+
     loop {
         if let Err(e) = connect_with_timeout(pipe, DAEMON_WAIT_TIMEOUT) {
             unsafe {
@@ -1209,7 +1317,7 @@ pub fn serve_resident(owner_sid: &str, owner_exe: &Path) -> Result<(), VmSandbox
             return Err(e);
         }
 
-        let client_pid = match verify_pipe_client_identity(pipe, owner_sid, owner_exe) {
+        let client_pid = match verify_pipe_client_identity(pipe, &owner_sid_owned, &owner_exe_owned) {
             Ok(pid) => pid,
             Err(e) => {
                 eprintln!("harness-vmsandboxd: rejecting connection: {e}");
@@ -1225,19 +1333,58 @@ pub fn serve_resident(owner_sid: &str, owner_exe: &Path) -> Result<(), VmSandbox
 
         // 後続クライアント（次のセッション）を待たせないよう、この接続の処理に入る前に
         // 追加インスタンスを用意しておく。
-        let mut extra_sa = user_only_security_attributes(owner_sid)?;
+        let mut extra_sa = user_only_security_attributes(&owner_sid_owned)?;
         let next_instance = create_additional_pipe_instance(pipe_name, &mut extra_sa);
         unsafe {
             let _ = LocalFree(HLOCAL(extra_sa.lpSecurityDescriptor));
         }
 
-        let result = serve_inner(pipe, client_pid);
-        unsafe {
-            let _ = DisconnectNamedPipe(pipe);
-            let _ = CloseHandle(pipe);
-        }
-        if let Err(e) = result {
-            eprintln!("harness-vmsandboxd: session ended with an error: {e}");
+        match registry.try_acquire_slot() {
+            Some(slot) => {
+                let registry = std::sync::Arc::clone(&registry);
+                let sendable_pipe = SendableHandle(pipe);
+                std::thread::spawn(move || {
+                    // Rust 2021のdisjoint closure captureは`sendable_pipe.0`という直接の
+                    // フィールドアクセスがあると`SendableHandle`全体ではなく`HANDLE`
+                    // フィールド単体をキャプチャしてしまい、ラッパーの`unsafe impl Send`を
+                    // 素通りしてコンパイルエラーになる。値全体を先に束縛し直すことで
+                    // `SendableHandle`まるごとがムーブされるよう強制する（定石の回避策）。
+                    let sendable_pipe = sendable_pipe;
+                    let pipe = sendable_pipe.0;
+                    let result = serve_inner(pipe, client_pid, slot);
+                    unsafe {
+                        // **実機E2Eで発見したバグ**: `WriteFile`の完了はOSのパイプバッファへ
+                        // 書き込みが受理されたことしか意味せず、クライアントが実際に読み終えた
+                        // ことは保証しない。直後に`DisconnectNamedPipe`するとクライアントの
+                        // 読み取りが完了する前にバッファが破棄され、クライアント側で
+                        // 「ReadFile failed: パイプの他端にプロセスがありません」という
+                        // 断線エラーになる（`Teardown`応答直後に実際に発生した）。
+                        // `FlushFileBuffers`はクライアントが読み切るまでブロックするため、
+                        // これを`Disconnect`の前に挟むことで確実に応答を届けてから切断する。
+                        let _ = FlushFileBuffers(pipe);
+                        let _ = DisconnectNamedPipe(pipe);
+                        let _ = CloseHandle(pipe);
+                    }
+                    registry.release_slot(slot);
+                    if let Err(e) = result {
+                        eprintln!("harness-vmsandboxd: session ended with an error: {e}");
+                    }
+                });
+            }
+            None => {
+                eprintln!(
+                    "harness-vmsandboxd: rejecting connection: max_sessions ({max_sessions}) \
+                     already reached"
+                );
+                let resp = VmResponse::Err(format!(
+                    "too many concurrent Tier3 sessions (limit: {max_sessions})"
+                ));
+                let _ = send_response(pipe, &resp);
+                unsafe {
+                    let _ = DisconnectNamedPipe(pipe);
+                    let _ = CloseHandle(pipe);
+                }
+            }
         }
 
         pipe = next_instance.map_err(|e| {
@@ -1248,7 +1395,7 @@ pub fn serve_resident(owner_sid: &str, owner_exe: &Path) -> Result<(), VmSandbox
     }
 }
 
-fn serve_inner(pipe: HANDLE, client_pid: u32) -> Result<(), VmSandboxIpcError> {
+fn serve_inner(pipe: HANDLE, client_pid: u32, slot: u8) -> Result<(), VmSandboxIpcError> {
     // 1件目: StartSession を待つ。
     let request_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
     let (workspace_root, allow_domains, warm) = match serde_json::from_slice::<VmRequest>(&request_bytes) {
@@ -1283,23 +1430,12 @@ fn serve_inner(pipe: HANDLE, client_pid: u32) -> Result<(), VmSandboxIpcError> {
 
     let config = VmSandboxConfig::default();
 
-    // D-24: 新規VMが固定静的IP（`config.guest_ip`）を要求する前に、前回セッションの
-    // 孤児VM/差分VHDXを撤収する（`crate::vmsandbox::gc_orphan_sessions`のdoc参照）。
-    // この時点では新規セッションのIDはまだ発行されていない（`VmSession::start`内部で
-    // 生成される）ため、台帳上「除外すべき現在のセッション」は存在しない
-    // （空文字列はどのVM名にも一致しないため、事実上「全ての既存孤児が対象」になる）。
-    // GC自体の失敗は`StartSession`を失敗させない（GC内部で個々の失敗をstderrへログして
-    // 続行する設計、`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.6）。
-    let _ = crate::vmsandbox::gc_orphan_sessions(&config, "");
-
-    // `warm`（`--tier3-warm`）時は、ウォームVMのproduction checkpointを用意した上で
-    // Restoreから起動する（B5〜B8）。破損時は内部で自動的にコールドブートへフォールバック
-    // するため、ここでの分岐はどちらの入口を呼ぶかだけでよい。
-    let start_result = if warm {
-        VmSession::start_warm_or_fallback(&workspace_root, &config, &allow_domains)
-    } else {
-        VmSession::start(&workspace_root, &config, &allow_domains)
-    };
+    // **Phase B**: 孤児VM/差分VHDXの撤収（旧D-24、`gc_orphan_sessions`）はもう本関数の
+    // 呼び出しごとには行わない。VM自体が`crate::vm_host::VmHost`の参照カウントで管理される
+    // 共有resident資源になったため、GCは「daemonが今から初めてVMを起動しようとする瞬間
+    // （`VmHost::attach`のStopped→Running遷移）」にのみ実行される——セッション途中で
+    // 誤って現在生存中のVMを孤児扱いしてしまう事故を構造的に防ぐため。
+    let start_result = VmSession::start(&workspace_root, &config, &allow_domains, warm, slot);
     let session = match start_result {
         Ok(s) => s,
         Err(e) => {
@@ -1323,7 +1459,7 @@ fn serve_inner(pipe: HANDLE, client_pid: u32) -> Result<(), VmSandboxIpcError> {
             },
             Err(_) => {
                 // フェイルセーフ経路（パイプ切断・タイムアウト）。応答は送らず撤収する。
-                let _ = session.teardown(&workspace_root);
+                let _ = session.teardown(&workspace_root, &config);
                 return Ok(());
             }
         };
@@ -1354,7 +1490,7 @@ fn serve_inner(pipe: HANDLE, client_pid: u32) -> Result<(), VmSandboxIpcError> {
                 send_response(pipe, &resp)?;
             }
             VmRequest::Teardown => {
-                let teardown_result = session.teardown(&workspace_root);
+                let teardown_result = session.teardown(&workspace_root, &config);
                 let resp = match &teardown_result {
                     Ok(()) => VmResponse::TornDown,
                     Err(e) => VmResponse::Err(format!("teardown failed: {e}")),
@@ -1723,6 +1859,52 @@ mod tests {
         }
     }
 
+    /// BUG-027対策（層2）の回帰テスト: 固定の常駐セッションdaemonパイプ
+    /// （`session_daemon_pipe_name()`）へ実際に接続できるリスナーを立てた状態で
+    /// `run_gc_only()`を呼ぶと、UAC昇格すら発生させずに早期拒否されることを確認する
+    /// （`docs/bugs/BUG-027.md`参照）。実VM/Incus/PowerShell呼び出しは一切発生しない
+    /// 純粋なIPCテストのため、`#[ignore]`にしない。
+    #[test]
+    fn run_gc_only_is_rejected_when_a_session_daemon_pipe_is_listening() {
+        let sid = current_user_sid_string().expect("current_user_sid_string");
+        let mut sa = user_only_security_attributes(&sid).expect("user_only_security_attributes");
+        let listener = unsafe {
+            let pipe_name_w = wide(session_daemon_pipe_name());
+            let handle = CreateNamedPipeW(
+                PCWSTR(pipe_name_w.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                4096,
+                4096,
+                0,
+                Some(&mut sa as *mut _),
+            );
+            let _ = LocalFree(HLOCAL(sa.lpSecurityDescriptor));
+            assert!(!handle.is_invalid(), "CreateNamedPipeW for the fixed session pipe name");
+            handle
+        };
+
+        let result = run_gc_only();
+
+        unsafe {
+            let _ = CloseHandle(listener);
+        }
+
+        match result {
+            Err(VmSandboxIpcError::Rejected(msg)) => {
+                assert!(
+                    msg.contains("session daemon is currently running"),
+                    "unexpected rejection message: {msg}"
+                );
+            }
+            other => panic!(
+                "expected run_gc_only() to reject with VmSandboxIpcError::Rejected while a \
+                 session daemon pipe is listening, got: {other:?}"
+            ),
+        }
+    }
+
     /// S2スパイク成功条件3の下位レベル検証の一部: SDDLで許可されていないSIDに対しては
     /// 固定パイプへの接続自体がACLレベルで拒否されることを確認する（`user_only_security_attributes`
     /// が組むSDDLが実際に機能していることの回帰テスト）。
@@ -1752,7 +1934,7 @@ mod tests {
             handle
         };
 
-        let result = connect_to_pipe_as_client(&pipe_name, std::time::Duration::from_millis(200));
+        let result = connect_to_pipe_as_client(&pipe_name, std::time::Duration::from_millis(200), false);
         assert!(
             result.is_err(),
             "expected the current process (different SID) to be denied access by the pipe ACL"

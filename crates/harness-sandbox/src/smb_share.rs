@@ -11,10 +11,11 @@
 //! （`New-SmbShare`はACLパラメータを省略すると既定で`Everyone: Read`を付与してしまうため、
 //! 必ず明示する）。
 //!
-//! **未実装（このモジュール単体ではまだ実機検証していない）**: `plans/vm-spike/`配下に
-//! spikeスクリプトでの手動検証を追加してから`vmsandbox::VmSession::attach_to_guest`へ
-//! 統合する予定（プラン参照）。このモジュール単体はコンパイルできる状態に留め、実機での
-//! 呼び出し経路への配線は次のステップで行う。
+//! **実機検証済み（S1スパイク、2026-07-27）**: `grant_ace_inheritable_rw`によるNTFS付与・
+//! `revoke_ace_recursive`による取り消し・実際のSMBマウント経由read/write許可/拒否の一連は
+//! `smb_mount_access_is_granted_then_actually_revoked`（本ファイル末尾、`#[ignore]`）で
+//! 実機確認済み。`vmsandbox::VmSession::attach_to_guest`への統合（CIFSライブ共有の
+//! 作成・再利用・修復判定）も完了している（`docs/bugs/BUG-026.md`参照）。
 
 use std::path::Path;
 use std::process::Stdio;
@@ -25,27 +26,42 @@ use crate::vmsandbox::VmError;
 use crate::win_appcontainer::{grant_ace_inheritable_rw, revoke_ace_recursive};
 
 /// `New-LocalUser`のアカウント名。Windowsローカルアカウント名の20文字制限に収まるよう、
-/// `session_id`（`harness-tier3-<pid>-<millis>`形式、`vmsandbox::unique_session_id`）から
-/// 先頭8文字のハッシュ相当の短縮識別子だけを使う。
-pub fn ephemeral_user_name(session_id: &str) -> String {
-    format!("hns3-{}", short_id(session_id))
+/// `workspace_id`（`short_id(canonicalized workspace_root)`、`vmsandbox::compute_workspace_id`
+/// 参照）から短縮識別子だけを使う。**【2026-07-27・Phase B】キーを`session_id`から
+/// `workspace_id`へ変更した**（`DESIGN-SANDBOX-VMISOLATION.md`項目6-a資源仕分け表: SMB共有・
+/// 使い捨てアカウント・NTFS ACEは「ワークスペース単位・参照カウント共有」であり、
+/// 「セッション単位」ではない。同一ワークスペースを複数セッションが共有する場合、2セッション目
+/// 以降はこの名前を新規作成せず既存のものを再利用する——呼び出し側（`vmsandbox.rs`の
+/// `VmSession::start`）が`vm_ledger::record_workspace_resource`の参照カウントを見て
+/// 判断する）。
+pub fn ephemeral_user_name(workspace_id: &str) -> String {
+    format!("hns3-{}", short_id(workspace_id))
 }
 
-/// `New-SmbShare`の共有名。
-pub fn ephemeral_share_name(session_id: &str) -> String {
-    format!("harness-ws-{}", short_id(session_id))
+/// `New-SmbShare`の共有名。[`ephemeral_user_name`]と同じく`workspace_id`キー。
+pub fn ephemeral_share_name(workspace_id: &str) -> String {
+    format!("harness-ws-{}", short_id(workspace_id))
 }
 
-/// `session_id`から衝突しにくい短い識別子を作る（アカウント名/共有名の文字数制限のため、
-/// `session_id`全体ではなくこれを使う）。暗号論的な一意性は不要だが、念のためFNV-1aハッシュの
-/// 16進8桁を使う。**【2026-07-27訂正】この関数のdocが以前「同時1セッションが前提」としていたのは
-/// 誤りだった**（`DESIGN-SANDBOX-VMISOLATION.md`項目6-a参照。複数`harness.exe`の同時起動が
-/// 前提であり、Tier3は元々複数セッション対応を志向していた）。本モジュールは現状まだ
-/// `session_id`キーのままで、同一ワークスペースを複数セッションが共有するケース（A-1・A-4）
-/// への対応（`workspace_id`キー＋参照カウント化）は未実装のPhase B項目。
-fn short_id(session_id: &str) -> String {
+/// `workspace_root`から`workspace_id`（`short_id(canonicalized workspace_root)`、
+/// `DESIGN-SANDBOX-VMISOLATION.md`項目6-a）を計算する。呼び出し側は`workspace_root`を
+/// 正規化済みであることを前提としない（`std::fs::canonicalize`をここで行う）——ただし
+/// `vmsandboxd.rs`の`authorize_workspace_root`が`StartSession`受理時に既に一度
+/// canonicalizeしているため、実運用上は二重canonicalizeになる（副作用はなく、単なる
+/// 冪等な再計算）。
+pub fn compute_workspace_id(workspace_root: &Path) -> String {
+    let canonical = std::fs::canonicalize(workspace_root)
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    short_id(&canonical.to_string_lossy())
+}
+
+/// 任意の文字列キーから衝突しにくい短い識別子を作る（アカウント名/共有名の文字数制限のため、
+/// キー全体ではなくこれを使う）。暗号論的な一意性は不要だが、念のためFNV-1aハッシュの
+/// 16進8桁を使う。**B-4**: 衝突自体は稀だが起き得るため、`create_ephemeral_share`側で
+/// `New-LocalUser`の失敗を衝突として検知し別suffixでリトライする（同関数のdoc参照）。
+fn short_id(key: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for b in session_id.bytes() {
+    for b in key.bytes() {
         hash ^= b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -149,45 +165,80 @@ New-SmbShare -Name '{share}' -Path '{path}' -FullAccess '{computer}\{user}' -Cac
     )
 }
 
-pub fn create_ephemeral_share(session_id: &str, workspace_root: &Path) -> Result<(String, String, String), VmError> {
-    let user = ephemeral_user_name(session_id);
-    let share = ephemeral_share_name(session_id);
+/// ワークスペース単位（`workspace_id`キー、`DESIGN-SANDBOX-VMISOLATION.md`項目6-a）の
+/// 使い捨てSMB共有＋ローカルアカウントを新規作成する。**呼び出し側（`vmsandbox.rs`の
+/// `VmSession::start`）は、同一`workspace_id`の資源が既に存在する（参照カウント>0、
+/// `vm_ledger::record_workspace_resource`）場合はこの関数を呼ばず既存の共有・アカウントを
+/// 再利用する**——本関数は「新規作成」の一択のみを扱う。
+///
+/// 戻り値は`(share_name, user_name, password, user_sid)`。`user_sid`は`vm_ledger`へ記録して
+/// おくことで、daemon死亡後のGCでアカウント名からSIDを解決できなくなっていても
+/// （`Remove-LocalUser`済み等）NTFS ACEを取り消せるようにする（A-5）。
+///
+/// **B-4**: `New-LocalUser`は同名アカウントが既に存在すると失敗する。`workspace_id`の
+/// `short_id`（FNV-1a 32bit）衝突は稀だが、衝突時にセッション開始自体が失敗するのは
+/// 避けたいため、失敗時は別suffixを付けて最大4回までリトライする。
+pub fn create_ephemeral_share(workspace_id: &str, workspace_root: &Path) -> Result<(String, String, String, String), VmError> {
     let password = generate_password();
     let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".to_string());
 
-    // パスワードを含むためstdin経由（argv上に露出させない）。SIDは直後のNTFS付与に使うため
-    // 最後の行で出力する（`run_powershell_stdin`はstdoutをtrimして1文字列として返す）。
-    let script = build_create_share_script(&user, &share, &password, workspace_root, &computer);
-    let sid_string = run_powershell_stdin(&script)?;
+    let mut last_err = None;
+    for attempt in 0..4u8 {
+        let suffixed_key = if attempt == 0 {
+            workspace_id.to_string()
+        } else {
+            format!("{workspace_id}-{attempt}")
+        };
+        let user = ephemeral_user_name(&suffixed_key);
+        let share = ephemeral_share_name(&suffixed_key);
 
-    let sid_owned = unsafe {
-        let sid_w = crate::win_common::wide(&sid_string);
-        let mut psid = windows::Win32::Security::PSID::default();
-        windows::Win32::Security::Authorization::ConvertStringSidToSidW(
-            windows::core::PCWSTR(sid_w.as_ptr()),
-            &mut psid,
-        )
-        .map_err(|e| VmError::PowerShell(format!("failed to parse SID '{sid_string}': {e}")))?;
-        psid
-    };
-    grant_ace_inheritable_rw(workspace_root, sid_owned)
-        .map_err(|e| VmError::PowerShell(format!("failed to grant NTFS access to {user}: {e:?}")))?;
-
-    Ok((share, user, password))
+        // パスワードを含むためstdin経由（argv上に露出させない）。SIDは直後のNTFS付与に使うため
+        // 最後の行で出力する（`run_powershell_stdin`はstdoutをtrimして1文字列として返す）。
+        let script = build_create_share_script(&user, &share, &password, workspace_root, &computer);
+        match run_powershell_stdin(&script) {
+            Ok(sid_string) => {
+                let sid_owned = unsafe {
+                    let sid_w = crate::win_common::wide(&sid_string);
+                    let mut psid = windows::Win32::Security::PSID::default();
+                    windows::Win32::Security::Authorization::ConvertStringSidToSidW(
+                        windows::core::PCWSTR(sid_w.as_ptr()),
+                        &mut psid,
+                    )
+                    .map_err(|e| VmError::PowerShell(format!("failed to parse SID '{sid_string}': {e}")))?;
+                    psid
+                };
+                grant_ace_inheritable_rw(workspace_root, sid_owned).map_err(|e| {
+                    VmError::PowerShell(format!("failed to grant NTFS access to {user}: {e:?}"))
+                })?;
+                return Ok((share, user, password, sid_string));
+            }
+            Err(e) => {
+                // `New-LocalUser`の名前衝突かどうかを区別せず、単純に次のsuffixへ進む
+                // （衝突以外の失敗——PowerShellそのものの不調等——でも同じ扱いで問題ない。
+                // 4回とも失敗すれば最後のエラーをそのまま返す）。
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        VmError::PowerShell("create_ephemeral_share: exhausted retries".to_string())
+    }))
 }
 
-/// `create_ephemeral_share`が作った共有・アカウント・NTFS付与を破棄する。共有を先に外して
-/// からアカウントを削除する（逆順だと一瞬孤児共有が残る）。NTFS ACEの取り消し（`revoke_ace_recursive`、
-/// S1スパイクで継承ACEの取り消し漏れを修正済み）は、アカウントを消す**前**に行う必要がある
-/// （消した後だとSIDはもう解決できないが、ACE自体はDACLに解決不能なSIDとして残り続けるため）。
-/// 個別の失敗はbest-effortで無視し可能な範囲を試みる（`gc_orphan_sessions`からの再試行に任せる、
-/// `teardown_vm`と同じ方針）。
+/// `create_ephemeral_share`が作った共有・アカウント・NTFS付与を破棄する。**呼び出し側は
+/// `workspace_id`の参照カウントが0になった最後の1セッションのteardownでのみこの関数を
+/// 呼ぶこと**（`vm_ledger::release_workspace_resource`が`Some`を返した場合のみ）。共有を
+/// 先に外してからアカウントを削除する（逆順だと一瞬孤児共有が残る）。NTFS ACEの取り消し
+/// （`revoke_ace_recursive`、S1スパイクで継承ACEの取り消し漏れを修正済み）は、アカウントを
+/// 消す**前**に行う必要がある（消した後だとSIDはもう解決できないが、ACE自体はDACLに
+/// 解決不能なSIDとして残り続けるため）。個別の失敗はbest-effortで無視し可能な範囲を試みる
+/// （`gc_orphan_sessions`からの再試行に任せる、`teardown_vm`と同じ方針）。
 ///
-/// `workspace_root`が`None`の場合（`gc_orphan_sessions`からの孤児回収経路、台帳が
-/// `workspace_root`自体を記録していないため元のパスが分からない）はNTFS revokeをスキップし、
-/// 共有・アカウントの削除のみ行う。この場合、使い捨てアカウントに付与したNTFS ACEは
-/// 解決不能なSIDとしてワークスペース側に残り続ける既知の限界であり、`workspace_root`を
-/// 台帳へ記録して補うことを将来のTODOとする。
+/// `workspace_root`が`None`の場合（呼び出し側が`workspace_root`を保持していない経路専用）は
+/// NTFS revokeをスキップし、共有・アカウントの削除のみ行う。**Phase B以降、GC経路
+/// （`gc_orphan_sessions`）は`vm_ledger::WorkspaceResourceEntry::workspace_root`を記録済み
+/// なので`Some`を渡せるようになった（A-5解消）**——`None`はこの構造上もう到達し得ないはずだが、
+/// 呼び出し側の実装ミスに対する防御的なフォールバックとして残す。
 pub fn destroy_ephemeral_share(share_name: &str, user_name: &str, workspace_root: Option<&Path>) {
     if let Some(workspace_root) = workspace_root {
         if let Ok(sid_string) = crate::vmsandbox::run_powershell(&format!(
@@ -214,6 +265,75 @@ pub fn destroy_ephemeral_share(share_name: &str, user_name: &str, workspace_root
     let _ = crate::vmsandbox::run_powershell(&format!(
         "Remove-LocalUser -Name '{user_name}' -ErrorAction SilentlyContinue"
     ));
+}
+
+/// BUG-026の修復（状態S4/S6、`docs/bugs/BUG-026.md`）向け: 台帳エントリはあるがゲスト側
+/// マウントが不健全な場合に、既存のSMB共有・NTFS ACEはそのまま流用し、使い捨てアカウントの
+/// パスワードだけをローテーションする。共有・NTFS付与を作り直すコストを避けるため
+/// （実リポジトリ規模では revoke 約11秒+grant 約4秒かかる、`RESULTS.md`参照）。
+///
+/// アカウント自体が既に存在しない場合（状態S4/S5、`Set-LocalUser`が対象無しで失敗する）は
+/// `Err`を返す。呼び出し側はこれを「作り直しが必要」の合図として扱い、
+/// `destroy_ephemeral_share`→`create_ephemeral_share`のフルリカバリへフォールバックする。
+pub fn rotate_share_password(user: &str) -> Result<String, VmError> {
+    let password = generate_password();
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$securePassword = ConvertTo-SecureString '{password}' -AsPlainText -Force
+Set-LocalUser -Name '{user}' -Password $securePassword -ErrorAction Stop
+"#,
+        password = ps_quote(&password),
+        user = ps_quote(user),
+    );
+    run_powershell_stdin(&script)?;
+    Ok(password)
+}
+
+/// BUG-026 F4（GCの回収）向け: 台帳に載っていないWindows側実体（状態S2/S3、
+/// `docs/bugs/BUG-026.md`の状態表参照）を実際に列挙する。`record_workspace_resource`の
+/// 呼び出し前に失敗した場合（`New-LocalUser`名前衝突後の別suffixでの作り直し等）、
+/// 台帳からは不可視のまま共有・アカウント・NTFS ACEが残り続けるため、
+/// `Get-SmbShare`/`Get-LocalUser`で命名規則（`harness-ws-*`/`hns3-*`）に基づき実体側から
+/// 直接走査する。共有の`Path`プロパティから`workspace_root`が取れるため、
+/// `destroy_ephemeral_share`によるNTFS ACE取り消しまで行える。
+///
+/// 戻り値は`(share_name, user_name, workspace_root)`のリスト。台帳との突合（どれが本当に
+/// 孤児か）は呼び出し側（`gc_orphan_sessions`）が行う。
+pub fn enumerate_windows_workspace_shares() -> Vec<(String, String, std::path::PathBuf)> {
+    let script = r#"
+Get-SmbShare -Name 'harness-ws-*' -ErrorAction SilentlyContinue |
+    ForEach-Object { "$($_.Name)`t$($_.Path)" }
+"#;
+    let Ok(stdout) = crate::vmsandbox::run_powershell(script) else {
+        return Vec::new();
+    };
+    parse_workspace_share_listing(&stdout)
+}
+
+/// [`enumerate_windows_workspace_shares`]のPowerShell出力パース部分だけを切り出したもの
+/// （単体テストで実際に`Get-SmbShare`を実行せずに検証するため、`build_create_share_script`と
+/// 同じ分離の方針）。
+fn parse_workspace_share_listing(stdout: &str) -> Vec<(String, String, std::path::PathBuf)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let share = parts.next()?.trim();
+            let path = parts.next()?.trim();
+            if share.is_empty() || path.is_empty() {
+                return None;
+            }
+            // 共有名からアカウント名を導出する（`ephemeral_user_name`/`ephemeral_share_name`は
+            // 同じ`short_id`サフィックスを共有する命名規則、本ファイル冒頭参照）。
+            let suffix = share.strip_prefix("harness-ws-")?;
+            Some((
+                share.to_string(),
+                format!("hns3-{suffix}"),
+                std::path::PathBuf::from(path),
+            ))
+        })
+        .collect()
 }
 
 /// 内部vSwitch（`switch_name`）に対応するホストのvEthernetアダプタだけへSMB(445)の受信を
@@ -294,6 +414,31 @@ mod tests {
         assert_eq!(ps_quote("it's"), "it''s");
     }
 
+    /// BUG-026 F4回帰: `Get-SmbShare`の出力パースが共有名からアカウント名を正しく導出し、
+    /// タブ区切り・空行・命名規則に合わない行を適切に無視することを検証する。
+    #[test]
+    fn parse_workspace_share_listing_extracts_share_user_and_path() {
+        let stdout = "harness-ws-62d45a6b\tC:\\work\\project\nharness-ws-abcd1234\tC:\\other\\repo\n";
+        let parsed = parse_workspace_share_listing(stdout);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "harness-ws-62d45a6b");
+        assert_eq!(parsed[0].1, "hns3-62d45a6b");
+        assert_eq!(parsed[0].2, std::path::PathBuf::from("C:\\work\\project"));
+        assert_eq!(parsed[1].0, "harness-ws-abcd1234");
+        assert_eq!(parsed[1].1, "hns3-abcd1234");
+    }
+
+    #[test]
+    fn parse_workspace_share_listing_ignores_malformed_or_empty_lines() {
+        let stdout = "\nnot-a-harness-share\tC:\\x\n\tC:\\missing-name\nharness-ws-only-name\n";
+        assert!(parse_workspace_share_listing(stdout).is_empty());
+    }
+
+    #[test]
+    fn parse_workspace_share_listing_handles_empty_input() {
+        assert!(parse_workspace_share_listing("").is_empty());
+    }
+
     /// [SMBマウント検証スパイク] `create_ephemeral_share`/`destroy_ephemeral_share`が実際に
     /// SMB経由（`\\localhost\<share>`、実際のネットワーク認証・共有権限・NTFS権限を全て通る
     /// 経路）でread/writeを許可/拒否できることを実機検証する。対象はharnessリポジトリ全体では
@@ -325,7 +470,7 @@ mod tests {
         };
 
         let result = (|| -> Result<(), String> {
-            let (share, user, password) = create_ephemeral_share(&session_id, &scratch)
+            let (share, user, password, _sid) = create_ephemeral_share(&session_id, &scratch)
                 .map_err(|e| format!("create_ephemeral_share failed: {e:?}"))?;
 
             let unc = format!(r"\\localhost\{share}");
@@ -477,7 +622,7 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
 
         let result = (|| -> Result<(), String> {
             let t_grant = std::time::Instant::now();
-            let (share, user, password) = create_ephemeral_share(&session_id, &repo_root)
+            let (share, user, password, _sid) = create_ephemeral_share(&session_id, &repo_root)
                 .map_err(|e| format!("create_ephemeral_share (grant included) failed: {e:?}"))?;
             let grant_elapsed = t_grant.elapsed();
             println!("=== real repo root (~57k files incl. target/) create_ephemeral_share (incl. grant_ace_inheritable_rw) took {grant_elapsed:?} ===");
