@@ -26,7 +26,7 @@ mod web;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use harness_core::{Tool, ToolError, ToolSpec};
+use harness_core::{Tool, ToolCtx, ToolError, ToolSpec};
 use harness_sandbox::JailError;
 
 pub use fs_tools::{EditFileTool, ReadFileTool, WriteFileTool};
@@ -83,6 +83,10 @@ impl ToolRegistry {
                 input_schema: t.input_schema(),
             })
             .collect()
+    }
+
+    pub fn to_specs_for_ctx(&self, ctx: &ToolCtx) -> Vec<ToolSpec> {
+        self.tools.values().map(|t| t.spec_for_ctx(ctx)).collect()
     }
 }
 

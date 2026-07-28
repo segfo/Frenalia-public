@@ -70,6 +70,7 @@ pub struct EnvironmentFacts {
     pub shell_tier: ShellTierSelection,
     pub net_proxy: NetProxyConfig,
     pub net_app: NetAppPolicy,
+    pub shell_sees_staged_writes: bool,
 }
 
 impl EnvironmentFacts {
@@ -82,6 +83,7 @@ impl EnvironmentFacts {
             shell_tier,
             net_proxy,
             net_app,
+            shell_sees_staged_writes,
             vm_sandbox,
         } = ctx;
         // vm_sandbox: Tier3実行チャネルの生ハンドル自体はモデルへ伝える事実を持たない
@@ -95,6 +97,7 @@ impl EnvironmentFacts {
             shell_tier: shell_tier.clone(),
             net_proxy: net_proxy.clone(),
             net_app: net_app.clone(),
+            shell_sees_staged_writes: *shell_sees_staged_writes,
         }
     }
 }
@@ -109,6 +112,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
         shell_tier,
         net_proxy,
         net_app,
+        shell_sees_staged_writes,
     } = facts;
 
     let mut lines = Vec::new();
@@ -118,13 +122,13 @@ pub fn render(facts: &EnvironmentFacts) -> String {
             .to_string(),
     );
 
-    lines.push(render_os_and_shell(os));
+    lines.push(render_os_and_shell(os, shell_tier.tier));
     lines.push(format!(
         "ワークスペースルート: {}。run_shellのcwdは省略時このルートになり、相対パスもここから\
          解決されます。",
         workspace_root.display()
     ));
-    lines.push(render_staging(staging));
+    lines.push(render_staging(staging, *shell_sees_staged_writes));
     lines.push(render_read_scope(read_scope));
     lines.extend(render_shell_tier(shell_tier));
     if let Some(line) = render_net_proxy(net_proxy) {
@@ -137,7 +141,15 @@ pub fn render(facts: &EnvironmentFacts) -> String {
     lines.join("\n")
 }
 
-fn render_os_and_shell(os: &OsKind) -> String {
+fn render_os_and_shell(os: &OsKind, tier: ShellTier) -> String {
+    if tier == ShellTier::Tier3 {
+        return "OS: Windowsホスト上のTier3。run_shellはホスト側シェルではなく、\
+                AlmaLinux VM内のIncusコンテナで`sh -c`として実行されます。Windows専用構文\
+                （`Get-ChildItem`・`Set-Content`・`$env:...`等）は使わず、POSIX sh互換の構文\
+                とLinuxパスを使ってください。"
+            .to_string();
+    }
+
     match os {
         OsKind::Windows => {
             "OS: Windows。run_shellはPowerShell（pwshがあればpwsh、無ければWindows PowerShell \
@@ -148,13 +160,11 @@ fn render_os_and_shell(os: &OsKind) -> String {
         OsKind::Linux | OsKind::MacOs => {
             "OS: Linux/macOS。run_shellは`sh -c`で実行されます。".to_string()
         }
-        OsKind::Other => {
-            "OS: 不明。run_shellの実行シェルは環境依存です。".to_string()
-        }
+        OsKind::Other => "OS: 不明。run_shellの実行シェルは環境依存です。".to_string(),
     }
 }
 
-fn render_staging(staging: &StagingConfig) -> String {
+fn render_staging(staging: &StagingConfig, shell_sees_staged_writes: bool) -> String {
     let StagingConfig {
         mode,
         explicit: _,
@@ -166,15 +176,28 @@ fn render_staging(staging: &StagingConfig) -> String {
                 .to_string()
         }
         StagingMode::Staged => {
-            "書込モード: staged。write_file/edit_fileの結果は一時オーバーレイへ積まれるだけで、\
-             ユーザーが明示的にapplyするまで実ファイルシステムは変化しません。run_shellが起動する\
-             プロセスはオーバーレイを認識しないため、直前の書込結果を読めない場合があります。"
-                .to_string()
+            if shell_sees_staged_writes {
+                "書込モード: staged。write_file/edit_fileの結果は一時オーバーレイへ積まれますが、\
+                 現在のrun_shell経路からは直前の書込結果を読めます。"
+                    .to_string()
+            } else {
+                "書込モード: staged。write_file/edit_fileの結果は一時オーバーレイへ積まれるだけで、\
+                 ユーザーが明示的にapplyするまで実ファイルシステムは変化しません。run_shellが起動する\
+                 プロセスはオーバーレイを認識しないため、直前の書込結果を読めない場合があります。"
+                    .to_string()
+            }
         }
         StagingMode::WorkspaceCommit => {
-            "書込モード: workspace-commit。ワークスペース内の書込はレビュー&コミット待ちの\
-             ステージング、ワークスペース外への書込は常にサンドボックス隔離されます。"
-                .to_string()
+            if shell_sees_staged_writes {
+                "書込モード: workspace-commit。ワークスペース内の書込はレビュー&コミット待ちの\
+                 ステージング、ワークスペース外への書込は常にサンドボックス隔離されます。現在の\
+                 run_shell経路からは、ワークスペース内の直前の書込結果を読めます。"
+                    .to_string()
+            } else {
+                "書込モード: workspace-commit。ワークスペース内の書込はレビュー&コミット待ちの\
+                 ステージング、ワークスペース外への書込は常にサンドボックス隔離されます。"
+                    .to_string()
+            }
         }
     }
 }
@@ -362,6 +385,29 @@ mod tests {
         assert!(rendered.contains("tier1a"));
         assert!(rendered.contains("tier1b"));
         assert!(rendered.contains("test reason"));
+    }
+
+    #[test]
+    fn tier3_prompt_uses_linux_container_shell_even_on_windows_host() {
+        let mut facts = facts_for(ShellTier::Tier3, StagingMode::Live);
+        facts.os = OsKind::Windows;
+
+        let rendered = render(&facts);
+
+        assert!(rendered.contains("Incusコンテナで`sh -c`"));
+        assert!(rendered.contains("POSIX sh互換"));
+        assert!(!rendered.contains("run_shellはPowerShell"), "{rendered}");
+    }
+
+    #[test]
+    fn windows_non_tier3_prompt_keeps_powershell_shell_guidance() {
+        let mut facts = facts_for(ShellTier::Tier1b, StagingMode::Live);
+        facts.os = OsKind::Windows;
+
+        let rendered = render(&facts);
+
+        assert!(rendered.contains("run_shellはPowerShell"), "{rendered}");
+        assert!(rendered.contains("Windows PowerShell 5.1"));
     }
 
     #[test]

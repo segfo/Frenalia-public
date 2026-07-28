@@ -53,7 +53,7 @@ impl Tool for ReadFileTool {
     }
 
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: ReadFileInput = 
+        let input: ReadFileInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
         // cap-std の Dir ハンドル経由の同期I/Oはtokioワーカースレッドをブロックしうるため、
@@ -394,6 +394,7 @@ mod tests {
             shell_tier: Default::default(),
             net_proxy: Default::default(),
             net_app: Default::default(),
+            shell_sees_staged_writes: false,
             vm_sandbox: None,
         };
 
@@ -403,7 +404,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error);
-        assert!(!dir.path().join("staged.txt").exists(), "real FS must stay untouched");
+        assert!(
+            !dir.path().join("staged.txt").exists(),
+            "real FS must stay untouched"
+        );
 
         let read_tool = ReadFileTool;
         let read_out = read_tool

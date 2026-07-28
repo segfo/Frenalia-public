@@ -31,39 +31,39 @@ use serde::{Deserialize, Serialize};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, GetLastError, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING,
+    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    AccessCheck, DACL_SECURITY_INFORMATION, DuplicateToken, GENERIC_MAPPING,
-    GROUP_SECURITY_INFORMATION, GetTokenInformation, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SecurityImpersonation, TOKEN_DUPLICATE,
-    TOKEN_QUERY, TOKEN_USER, TokenUser,
+    AccessCheck, DuplicateToken, GetTokenInformation, SecurityImpersonation, TokenUser,
+    DACL_SECURITY_INFORMATION, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
-    FILE_FLAG_OVERLAPPED, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT, WaitNamedPipeW,
+    GetNamedPipeServerProcessId, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-use crate::win_common::wide;
 use crate::vmsandbox::{VmSandboxConfig, VmSession};
+use crate::win_common::wide;
 
 /// 親→daemonへ送るメッセージ。`StartSession`→`Exec`(N回)→`Teardown`の順に送る。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +98,8 @@ pub enum VmRequest {
     /// （`docs/bugs/BUG-029.md`）。`StartSession`を経由せず、現在の`SessionRegistry`の
     /// アクティブスロット数を`VmResponse::ActiveSessions`で返すだけの1回きりのリクエスト。
     QueryActiveSessions,
+    /// アクティブセッションが無い場合だけ常駐daemonを終了する保守リクエスト。
+    ShutdownIfIdle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,10 +112,15 @@ pub enum VmResponse {
     },
     TornDown,
     /// `VmRequest::Gc`への応答。撤収を試みたVM名（=session_id）の一覧。
-    GcReport { reaped_vm_names: Vec<String> },
+    GcReport {
+        reaped_vm_names: Vec<String>,
+    },
     /// [BUG-029] `VmRequest::QueryActiveSessions`への応答。このクエリ自身の接続を除いた、
     /// 現在アクティブな`StartSession`セッション数。
-    ActiveSessions { count: usize },
+    ActiveSessions {
+        count: usize,
+    },
+    ShuttingDown,
     Err(String),
 }
 
@@ -151,8 +158,10 @@ const TEARDOWN_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from
 const QUERY_ACTIVE_SESSIONS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// daemon側が次のメッセージ（`Exec`/`Teardown`、または親のクラッシュによるパイプ切断）を
 /// 待つ時間。harnessセッションの生存期間そのものに依存するため実質無期限に近い値にする。
-const DAEMON_WAIT_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(u32::MAX as u64);
+const DAEMON_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(u32::MAX as u64);
+/// resident daemonがアクティブセッション0件のまま次の接続を待つ時間。期限に達したら
+/// 昇格済みdaemonプロセスを終了し、次回Tier3利用時に必要なら再起動する。
+const DAEMON_IDLE_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// トークンハンドルからSDDL文字列表現のSIDを取り出す共通ロジック（`current_user_sid_string`・
 /// `query_process_token_sid`（S-2、クライアント身元検証）の両方が使う）。
@@ -182,7 +191,11 @@ fn sid_string_from_token(token: HANDLE) -> windows::core::Result<String> {
 fn current_user_sid_string() -> windows::core::Result<String> {
     unsafe {
         let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), windows::Win32::Security::TOKEN_QUERY, &mut token)?;
+        OpenProcessToken(
+            GetCurrentProcess(),
+            windows::Win32::Security::TOKEN_QUERY,
+            &mut token,
+        )?;
         let result = sid_string_from_token(token);
         let _ = CloseHandle(token);
         result
@@ -203,8 +216,9 @@ fn query_process_token_sid(pid: u32) -> Result<String, VmSandboxIpcError> {
         let _ = CloseHandle(process);
         open_result
             .map_err(|e| VmSandboxIpcError::Ipc(format!("OpenProcessToken({pid}) failed: {e}")))?;
-        let result = sid_string_from_token(token)
-            .map_err(|e| VmSandboxIpcError::Ipc(format!("sid_string_from_token({pid}) failed: {e}")));
+        let result = sid_string_from_token(token).map_err(|e| {
+            VmSandboxIpcError::Ipc(format!("sid_string_from_token({pid}) failed: {e}"))
+        });
         let _ = CloseHandle(token);
         result
     }
@@ -357,8 +371,7 @@ fn duplicate_client_token_for_access_check(pid: u32) -> Result<HANDLE, VmSandbox
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
             .map_err(|e| VmSandboxIpcError::Ipc(format!("OpenProcess({pid}) failed: {e}")))?;
         let mut token = HANDLE::default();
-        let open_result =
-            OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut token);
+        let open_result = OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut token);
         let _ = CloseHandle(process);
         open_result
             .map_err(|e| VmSandboxIpcError::Ipc(format!("OpenProcessToken({pid}) failed: {e}")))?;
@@ -416,8 +429,7 @@ fn access_check_write(path: &Path, token: HANDLE) -> Result<bool, VmSandboxIpcEr
             &mut access_status,
         );
         let _ = LocalFree(HLOCAL(sd.0));
-        result
-            .map_err(|e| VmSandboxIpcError::Ipc(format!("AccessCheck({path:?}) failed: {e}")))?;
+        result.map_err(|e| VmSandboxIpcError::Ipc(format!("AccessCheck({path:?}) failed: {e}")))?;
         Ok(access_status.as_bool())
     }
 }
@@ -535,7 +547,9 @@ where
                     return Ok(0);
                 } else {
                     let _ = CloseHandle(event);
-                    return Err(VmSandboxIpcError::Ipc(format!("{op_name} failed to start: {e}")));
+                    return Err(VmSandboxIpcError::Ipc(format!(
+                        "{op_name} failed to start: {e}"
+                    )));
                 }
             }
         };
@@ -563,7 +577,10 @@ where
     }
 }
 
-fn connect_with_timeout(pipe: HANDLE, timeout: std::time::Duration) -> Result<(), VmSandboxIpcError> {
+fn connect_with_timeout(
+    pipe: HANDLE,
+    timeout: std::time::Duration,
+) -> Result<(), VmSandboxIpcError> {
     run_overlapped(pipe, timeout, "ConnectNamedPipe", |ov| unsafe {
         ConnectNamedPipe(pipe, Some(ov))
     })?;
@@ -582,7 +599,9 @@ fn write_all_timeout(
             WriteFile(handle, Some(slice), None, Some(ov))
         })?;
         if written == 0 {
-            return Err(VmSandboxIpcError::Ipc("WriteFile wrote 0 bytes".to_string()));
+            return Err(VmSandboxIpcError::Ipc(
+                "WriteFile wrote 0 bytes".to_string(),
+            ));
         }
         offset += written as usize;
     }
@@ -670,7 +689,9 @@ unsafe fn launch_daemon_elevated(
                 "UAC prompt was canceled by the user".to_string(),
             ));
         }
-        return Err(VmSandboxIpcError::Win32(format!("ShellExecuteExW failed: {err:?}")));
+        return Err(VmSandboxIpcError::Win32(format!(
+            "ShellExecuteExW failed: {err:?}"
+        )));
     }
 
     Ok(info.hProcess)
@@ -956,34 +977,37 @@ impl VmSandboxHandle {
         // まず既に常駐daemonが生きているか、短いタイムアウトで試す（複数セッション目は
         // これで即座に繋がる想定）。`ERROR_FILE_NOT_FOUND`ならdaemon未起動とみなし、
         // 昇格起動してから改めて接続を待つ。
-        let (pipe, daemon_process) =
-            match connect_to_pipe_as_client(pipe_name, std::time::Duration::from_millis(200), false) {
-                Ok(pipe) => (pipe, None),
-                Err(_) => {
-                    let params = format!(
+        let (pipe, daemon_process) = match connect_to_pipe_as_client(
+            pipe_name,
+            std::time::Duration::from_millis(200),
+            false,
+        ) {
+            Ok(pipe) => (pipe, None),
+            Err(_) => {
+                let params = format!(
                         "{pipe_name} --owner-sid {owner_sid} --owner-exe \"{}\" --max-sessions {max_sessions}",
                         owner_exe.display()
                     );
-                    let daemon_process = unsafe { launch_daemon_elevated(&daemon_path, &params) }?;
-                    // `retry_on_not_found: true`——ここは昇格daemonの起動を待つ経路であり、
-                    // パイプがまだ存在しない（`ERROR_FILE_NOT_FOUND`）ことも起動途中の正常な
-                    // 状態として`CONNECT_TIMEOUT`いっぱいまでポーリングする（バグ修正、
-                    // モジュール内`connect_to_pipe_as_client`のdoc参照）。
-                    match connect_to_pipe_as_client(pipe_name, CONNECT_TIMEOUT, true) {
-                        Ok(pipe) => (pipe, Some(daemon_process)),
-                        Err(e) => {
-                            unsafe {
-                                let _ = CloseHandle(daemon_process);
-                            }
-                            return Err(VmSandboxIpcError::Ipc(format!(
-                                "waiting for vmsandboxd to accept the connection: {e} (daemon \
+                let daemon_process = unsafe { launch_daemon_elevated(&daemon_path, &params) }?;
+                // `retry_on_not_found: true`——ここは昇格daemonの起動を待つ経路であり、
+                // パイプがまだ存在しない（`ERROR_FILE_NOT_FOUND`）ことも起動途中の正常な
+                // 状態として`CONNECT_TIMEOUT`いっぱいまでポーリングする（バグ修正、
+                // モジュール内`connect_to_pipe_as_client`のdoc参照）。
+                match connect_to_pipe_as_client(pipe_name, CONNECT_TIMEOUT, true) {
+                    Ok(pipe) => (pipe, Some(daemon_process)),
+                    Err(e) => {
+                        unsafe {
+                            let _ = CloseHandle(daemon_process);
+                        }
+                        return Err(VmSandboxIpcError::Ipc(format!(
+                            "waiting for vmsandboxd to accept the connection: {e} (daemon \
                                  may not have launched, or UAC is still pending user \
                                  interaction)"
-                            )));
-                        }
+                        )));
                     }
                 }
-            };
+            }
+        };
 
         // パイプスクワッティング対策の第一関門（S-2）: 接続先が本当に正規daemonかを
         // best-effortで確認する。失敗時はフォールバック再接続をしない（攻撃者にリトライの
@@ -1037,7 +1061,9 @@ impl VmSandboxHandle {
         env: &[(String, String)],
         timeout: std::time::Duration,
     ) -> Result<(String, String, Option<i32>), String> {
-        let rel = cwd.strip_prefix(&self.workspace_root).unwrap_or(std::path::Path::new(""));
+        let rel = cwd
+            .strip_prefix(&self.workspace_root)
+            .unwrap_or(std::path::Path::new(""));
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         self.exec_ipc(cmd, &rel_str, env.to_vec(), timeout)
             .map_err(|e| e.to_string())
@@ -1060,8 +1086,9 @@ impl VmSandboxHandle {
             env,
             timeout_secs: timeout.as_secs(),
         };
-        let bytes = serde_json::to_vec(&req)
-            .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to serialize exec request: {e}")))?;
+        let bytes = serde_json::to_vec(&req).map_err(|e| {
+            VmSandboxIpcError::Ipc(format!("failed to serialize exec request: {e}"))
+        })?;
         write_framed_timeout(self.pipe, &bytes, REQUEST_WRITE_TIMEOUT)?;
         // execのタイムアウト自体はdaemon側（`vmsandbox::VmSession::exec`）が守る。IPC応答待ちは
         // それより少し長めに取り、daemon側タイムアウト超過を先に検知できるようにする。
@@ -1094,8 +1121,9 @@ impl VmSandboxHandle {
         }
 
         let result = (|| -> Result<(), VmSandboxIpcError> {
-            let bytes = serde_json::to_vec(&VmRequest::Teardown)
-                .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to serialize teardown: {e}")))?;
+            let bytes = serde_json::to_vec(&VmRequest::Teardown).map_err(|e| {
+                VmSandboxIpcError::Ipc(format!("failed to serialize teardown: {e}"))
+            })?;
             write_framed_timeout(self.pipe, &bytes, REQUEST_WRITE_TIMEOUT)?;
             let response_bytes = read_framed_timeout(self.pipe, TEARDOWN_RESPONSE_TIMEOUT)?;
             let response: VmResponse = serde_json::from_slice(&response_bytes)
@@ -1146,9 +1174,8 @@ impl Drop for VmSandboxHandle {
 /// [BUG-029] 常駐セッションdaemonへ接続済みのパイプ経由で`VmRequest::QueryActiveSessions`を
 /// 送り、応答のアクティブセッション数を返す。
 fn query_active_sessions(pipe: HANDLE) -> Result<usize, VmSandboxIpcError> {
-    let bytes = serde_json::to_vec(&VmRequest::QueryActiveSessions).map_err(|e| {
-        VmSandboxIpcError::Ipc(format!("failed to serialize query request: {e}"))
-    })?;
+    let bytes = serde_json::to_vec(&VmRequest::QueryActiveSessions)
+        .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to serialize query request: {e}")))?;
     write_framed_timeout(pipe, &bytes, QUERY_ACTIVE_SESSIONS_TIMEOUT)?;
     let response_bytes = read_framed_timeout(pipe, QUERY_ACTIVE_SESSIONS_TIMEOUT)?;
     let response: VmResponse = serde_json::from_slice(&response_bytes)
@@ -1175,7 +1202,7 @@ fn query_active_sessions(pipe: HANDLE) -> Result<usize, VmSandboxIpcError> {
 ///
 /// [BUG-029修正] 当初は「接続できた＝常駐daemonが稼働中」を「セッション実行中」の代理
 /// 指標として使い、接続できただけで即座に拒否していた。Phase Bでdaemonがセッション0件でも
-/// 無期限に常駐するようになった（`docs/STATUS.md`残課題#6）ため、この代理指標は常駐daemon
+/// セッション0件でも常駐するようになったため、この代理指標は常駐daemon
 /// 運用下で常に真になり、GCが恒久的に拒否される欠陥になっていた（`docs/bugs/BUG-029.md`）。
 /// 接続できた場合は`VmRequest::QueryActiveSessions`を送り、実際のアクティブセッション数を
 /// 問い合わせてから判定する（0件なら続行、1件以上なら拒否）。
@@ -1242,7 +1269,9 @@ pub fn run_gc_only() -> Result<Vec<String>, VmSandboxIpcError> {
         match response {
             VmResponse::GcReport { reaped_vm_names } => Ok(reaped_vm_names),
             VmResponse::Err(msg) => Err(VmSandboxIpcError::Rejected(msg)),
-            other => Err(VmSandboxIpcError::Ipc(format!("unexpected response for Gc: {other:?}"))),
+            other => Err(VmSandboxIpcError::Ipc(format!(
+                "unexpected response for Gc: {other:?}"
+            ))),
         }
     })();
 
@@ -1257,6 +1286,39 @@ pub fn run_gc_only() -> Result<Vec<String>, VmSandboxIpcError> {
         let _ = CloseHandle(daemon_process);
     }
 
+    result
+}
+
+/// アクティブセッションが無い場合だけ常駐Tier3 daemonを終了する。
+pub fn stop_resident_daemon_if_idle() -> Result<bool, VmSandboxIpcError> {
+    let pipe = match connect_to_pipe_as_client(
+        session_daemon_pipe_name(),
+        std::time::Duration::from_millis(500),
+        false,
+    ) {
+        Ok(pipe) => pipe,
+        Err(_) => return Ok(false),
+    };
+    let result = (|| {
+        let bytes = serde_json::to_vec(&VmRequest::ShutdownIfIdle).map_err(|e| {
+            VmSandboxIpcError::Ipc(format!("failed to serialize shutdown request: {e}"))
+        })?;
+        write_framed_timeout(pipe, &bytes, REQUEST_WRITE_TIMEOUT)?;
+        let response_bytes = read_framed_timeout(pipe, QUERY_ACTIVE_SESSIONS_TIMEOUT)?;
+        let response: VmResponse = serde_json::from_slice(&response_bytes).map_err(|e| {
+            VmSandboxIpcError::Ipc(format!("failed to parse shutdown response: {e}"))
+        })?;
+        match response {
+            VmResponse::ShuttingDown => Ok(true),
+            VmResponse::Err(msg) => Err(VmSandboxIpcError::Rejected(msg)),
+            other => Err(VmSandboxIpcError::Ipc(format!(
+                "unexpected response to ShutdownIfIdle: {other:?}"
+            ))),
+        }
+    })();
+    unsafe {
+        let _ = CloseHandle(pipe);
+    }
     result
 }
 
@@ -1367,14 +1429,15 @@ pub fn serve_resident(
     let owner_exe_owned = owner_exe.to_path_buf();
 
     loop {
-        if let Err(e) = connect_with_timeout(pipe, DAEMON_WAIT_TIMEOUT) {
+        if let Err(e) = connect_with_timeout(pipe, DAEMON_IDLE_ACCEPT_TIMEOUT) {
             unsafe {
                 let _ = CloseHandle(pipe);
             }
             return Err(e);
         }
 
-        let client_pid = match verify_pipe_client_identity(pipe, &owner_sid_owned, &owner_exe_owned) {
+        let client_pid = match verify_pipe_client_identity(pipe, &owner_sid_owned, &owner_exe_owned)
+        {
             Ok(pid) => pid,
             Err(e) => {
                 eprintln!("harness-vmsandboxd: rejecting connection: {e}");
@@ -1461,31 +1524,51 @@ fn serve_inner(
     // 1件目: StartSession を待つ。ただし[BUG-029] `QueryActiveSessions`（`harness tier3 gc`が
     // 「本当にセッションが実行中か」を確認するための軽量リクエスト）も1件目として受理する。
     let request_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
-    let (workspace_root, allow_domains, warm) = match serde_json::from_slice::<VmRequest>(&request_bytes) {
-        Ok(VmRequest::StartSession { workspace_root, allow_domains, warm }) => {
-            (workspace_root, allow_domains, warm)
-        }
-        Ok(VmRequest::QueryActiveSessions) => {
-            // このクエリ自身が`try_acquire_slot`で1スロット消費している（呼び出し元の
-            // `serve_resident`参照）ため、自分自身を除いた数を返す。
-            let count = registry.active_count().saturating_sub(1);
-            let resp = VmResponse::ActiveSessions { count };
-            send_response(pipe, &resp)?;
-            return Ok(());
-        }
-        Ok(_) => {
-            let resp = VmResponse::Err(
-                "expected StartSession as the first message".to_string(),
-            );
-            send_response(pipe, &resp)?;
-            return Err(VmSandboxIpcError::Ipc("protocol violation".to_string()));
-        }
-        Err(e) => {
-            let resp = VmResponse::Err(format!("malformed StartSession request: {e}"));
-            send_response(pipe, &resp)?;
-            return Err(VmSandboxIpcError::Ipc(format!("malformed request: {e}")));
-        }
-    };
+    let (workspace_root, allow_domains, warm) =
+        match serde_json::from_slice::<VmRequest>(&request_bytes) {
+            Ok(VmRequest::StartSession {
+                workspace_root,
+                allow_domains,
+                warm,
+            }) => (workspace_root, allow_domains, warm),
+            Ok(VmRequest::QueryActiveSessions) => {
+                // このクエリ自身が`try_acquire_slot`で1スロット消費している（呼び出し元の
+                // `serve_resident`参照）ため、自分自身を除いた数を返す。
+                let count = registry.active_count().saturating_sub(1);
+                let resp = VmResponse::ActiveSessions { count };
+                send_response(pipe, &resp)?;
+                return Ok(());
+            }
+            Ok(VmRequest::ShutdownIfIdle) => {
+                let count = registry.active_count().saturating_sub(1);
+                if count == 0 {
+                    send_response(pipe, &VmResponse::ShuttingDown)?;
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        std::process::exit(0);
+                    });
+                    return Ok(());
+                }
+                let resp = VmResponse::Err(format!(
+                    "refusing to stop Tier3 daemon because {count} active session(s) are running"
+                ));
+                send_response(pipe, &resp)?;
+                return Err(VmSandboxIpcError::Rejected(
+                    "active Tier3 sessions are running".to_string(),
+                ));
+            }
+            Ok(_) => {
+                let resp =
+                    VmResponse::Err("expected StartSession as the first message".to_string());
+                send_response(pipe, &resp)?;
+                return Err(VmSandboxIpcError::Ipc("protocol violation".to_string()));
+            }
+            Err(e) => {
+                let resp = VmResponse::Err(format!("malformed StartSession request: {e}"));
+                send_response(pipe, &resp)?;
+                return Err(VmSandboxIpcError::Ipc(format!("malformed request: {e}")));
+            }
+        };
     let workspace_root = PathBuf::from(workspace_root);
 
     // S-2段階4（`DESIGN-SANDBOX-VMISOLATION.md`7-a）: `verify_pipe_client_identity`は
@@ -1524,7 +1607,8 @@ fn serve_inner(
             Ok(bytes) => match serde_json::from_slice::<VmRequest>(&bytes) {
                 Ok(req) => req,
                 Err(e) => {
-                    let _ = send_response(pipe, &VmResponse::Err(format!("malformed request: {e}")));
+                    let _ =
+                        send_response(pipe, &VmResponse::Err(format!("malformed request: {e}")));
                     continue;
                 }
             },
@@ -1595,6 +1679,14 @@ fn serve_inner(
                     ),
                 );
             }
+            VmRequest::ShutdownIfIdle => {
+                let _ = send_response(
+                    pipe,
+                    &VmResponse::Err(
+                        "ShutdownIfIdle is only valid before StartSession".to_string(),
+                    ),
+                );
+            }
         }
     }
 }
@@ -1637,13 +1729,20 @@ fn serve_gc_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
         Ok(VmRequest::Gc) => {
             let config = VmSandboxConfig::default();
             let reaped = crate::vmsandbox::gc_orphan_sessions(&config, "");
-            send_response(pipe, &VmResponse::GcReport { reaped_vm_names: reaped })
+            send_response(
+                pipe,
+                &VmResponse::GcReport {
+                    reaped_vm_names: reaped,
+                },
+            )
         }
         Ok(_) => {
             let resp =
                 VmResponse::Err("expected Gc as the only message in gc-only mode".to_string());
             send_response(pipe, &resp)?;
-            Err(VmSandboxIpcError::Ipc("protocol violation (gc-only mode)".to_string()))
+            Err(VmSandboxIpcError::Ipc(
+                "protocol violation (gc-only mode)".to_string(),
+            ))
         }
         Err(e) => {
             let resp = VmResponse::Err(format!("malformed Gc request: {e}"));
@@ -1667,7 +1766,11 @@ mod tests {
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: VmRequest = serde_json::from_slice(&bytes).unwrap();
         match decoded {
-            VmRequest::StartSession { workspace_root, allow_domains, warm } => {
+            VmRequest::StartSession {
+                workspace_root,
+                allow_domains,
+                warm,
+            } => {
                 assert_eq!(workspace_root, r"C:\work\project");
                 assert_eq!(allow_domains, vec!["example.com".to_string()]);
                 assert!(!warm);
@@ -1697,7 +1800,8 @@ mod tests {
     fn start_session_request_without_warm_field_deserializes_as_not_warm() {
         // 旧クライアント（`warm`未対応）との後方互換: フィールド自体が無いJSONでも
         // `#[serde(default)]`によりfalse扱いでパースできる。
-        let legacy = r#"{"StartSession":{"workspace_root":"C:\\work\\project","allow_domains":[]}}"#;
+        let legacy =
+            r#"{"StartSession":{"workspace_root":"C:\\work\\project","allow_domains":[]}}"#;
         let decoded: VmRequest = serde_json::from_str(legacy).expect("legacy request must parse");
         match decoded {
             VmRequest::StartSession { warm, .. } => assert!(!warm),
@@ -1770,8 +1874,16 @@ mod tests {
             match (&resp, &decoded) {
                 (VmResponse::Ready, VmResponse::Ready) => {}
                 (
-                    VmResponse::ExecResult { stdout: a, stderr: b, exit_code: c },
-                    VmResponse::ExecResult { stdout: x, stderr: y, exit_code: z },
+                    VmResponse::ExecResult {
+                        stdout: a,
+                        stderr: b,
+                        exit_code: c,
+                    },
+                    VmResponse::ExecResult {
+                        stdout: x,
+                        stderr: y,
+                        exit_code: z,
+                    },
                 ) => {
                     assert_eq!(a, x);
                     assert_eq!(b, y);
@@ -1901,7 +2013,10 @@ mod tests {
     /// （＝スクワッティング済み、または正規daemonが既に生存中）は必ず失敗することを確認する。
     #[test]
     fn create_first_pipe_instance_fails_when_name_already_taken() {
-        let pipe_name = format!(r"\\.\pipe\harness-vmsandboxd-test-squat-{}", std::process::id());
+        let pipe_name = format!(
+            r"\\.\pipe\harness-vmsandboxd-test-squat-{}",
+            std::process::id()
+        );
         let sid = current_user_sid_string().expect("current_user_sid_string");
 
         // 「先に同名パイプを作った偽サーバ」を、通常の（FIRST_PIPE_INSTANCEなしの）
@@ -1962,7 +2077,10 @@ mod tests {
                 Some(&mut sa as *mut _),
             );
             let _ = LocalFree(HLOCAL(sa.lpSecurityDescriptor));
-            assert!(!handle.is_invalid(), "CreateNamedPipeW for the fixed session pipe name");
+            assert!(
+                !handle.is_invalid(),
+                "CreateNamedPipeW for the fixed session pipe name"
+            );
             handle
         };
 
@@ -2015,7 +2133,8 @@ mod tests {
             handle
         };
 
-        let result = connect_to_pipe_as_client(&pipe_name, std::time::Duration::from_millis(200), false);
+        let result =
+            connect_to_pipe_as_client(&pipe_name, std::time::Duration::from_millis(200), false);
         assert!(
             result.is_err(),
             "expected the current process (different SID) to be denied access by the pipe ACL"
@@ -2064,7 +2183,10 @@ mod tests {
         let own_exe = std::env::current_exe().expect("current_exe");
 
         let result = verify_pipe_client_identity(server, &sid, &own_exe);
-        assert!(result.is_ok(), "expected verification to succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected verification to succeed: {result:?}"
+        );
         assert_eq!(result.unwrap(), std::process::id());
 
         unsafe {
@@ -2116,7 +2238,10 @@ mod tests {
     fn reject_dangerous_workspace_root_rejects_drive_root() {
         let canonical = std::fs::canonicalize(r"C:\").expect("canonicalize C:\\");
         let result = reject_dangerous_workspace_root(&canonical);
-        assert!(result.is_err(), "expected drive root to be rejected: {result:?}");
+        assert!(
+            result.is_err(),
+            "expected drive root to be rejected: {result:?}"
+        );
     }
 
     /// S-2段階4の拒否リスト: `%SystemRoot%`配下（`C:\Windows`）は拒否される。
@@ -2124,7 +2249,10 @@ mod tests {
     fn reject_dangerous_workspace_root_rejects_system_root() {
         let system_root = system_root_canonical().expect("SystemRoot must resolve on Windows CI");
         let result = reject_dangerous_workspace_root(&system_root);
-        assert!(result.is_err(), "expected system root to be rejected: {result:?}");
+        assert!(
+            result.is_err(),
+            "expected system root to be rejected: {result:?}"
+        );
 
         let system32 = system_root.join("System32");
         if system32.exists() {
@@ -2144,7 +2272,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
         let result = reject_dangerous_workspace_root(&canonical);
-        assert!(result.is_ok(), "expected an ordinary directory to be allowed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected an ordinary directory to be allowed: {result:?}"
+        );
     }
 
     /// S-2段階4の拒否リスト: UNCパス（`canonicalize`後は`\\?\UNC\...`）は拒否される。
@@ -2152,7 +2283,10 @@ mod tests {
     fn reject_dangerous_workspace_root_rejects_unc_path() {
         let unc = std::path::PathBuf::from(r"\\?\UNC\server\share\workspace");
         let result = reject_dangerous_workspace_root(&unc);
-        assert!(result.is_err(), "expected a UNC path to be rejected: {result:?}");
+        assert!(
+            result.is_err(),
+            "expected a UNC path to be rejected: {result:?}"
+        );
     }
 
     /// S-2段階4の`AccessCheck`本体: 自プロセス自身のトークン（複製）は、自分が書き込める
@@ -2168,7 +2302,10 @@ mod tests {
         unsafe {
             let _ = CloseHandle(imp_token);
         }
-        assert!(allowed, "expected own process to have write access to its own temp dir");
+        assert!(
+            allowed,
+            "expected own process to have write access to its own temp dir"
+        );
     }
 
     /// S-2段階4の`AccessCheck`本体: 自プロセス自身のトークンは、書き込み権を持たない
@@ -2188,7 +2325,10 @@ mod tests {
         unsafe {
             let _ = CloseHandle(imp_token);
         }
-        assert!(!allowed, "expected a non-admin process to lack write access to SystemRoot");
+        assert!(
+            !allowed,
+            "expected a non-admin process to lack write access to SystemRoot"
+        );
     }
 
     /// S-2段階4の統合テスト: 実在する一時ディレクトリは認可を通過する。
@@ -2196,14 +2336,20 @@ mod tests {
     fn authorize_workspace_root_allows_own_temp_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         let result = authorize_workspace_root(std::process::id(), dir.path());
-        assert!(result.is_ok(), "expected own temp dir to be authorized: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected own temp dir to be authorized: {result:?}"
+        );
     }
 
     /// S-2段階4の統合テスト: ドライブルートは拒否リストで即座に落ちる。
     #[test]
     fn authorize_workspace_root_rejects_drive_root() {
         let result = authorize_workspace_root(std::process::id(), std::path::Path::new(r"C:\"));
-        assert!(result.is_err(), "expected drive root to be rejected: {result:?}");
+        assert!(
+            result.is_err(),
+            "expected drive root to be rejected: {result:?}"
+        );
     }
 
     /// S-2段階4の統合テスト: 存在しないパスは`canonicalize`の時点で拒否される。
@@ -2213,6 +2359,9 @@ mod tests {
             std::process::id(),
             std::path::Path::new(r"C:\this-path-should-not-exist-harness-test-12345"),
         );
-        assert!(result.is_err(), "expected a nonexistent path to be rejected: {result:?}");
+        assert!(
+            result.is_err(),
+            "expected a nonexistent path to be rejected: {result:?}"
+        );
     }
 }

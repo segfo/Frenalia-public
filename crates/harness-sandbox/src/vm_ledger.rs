@@ -102,6 +102,38 @@ fn ledger_path() -> Option<PathBuf> {
         .map(|d| d.config_dir().join("tier3-vm-ledger.json"))
 }
 
+#[cfg(windows)]
+fn with_ledger_lock<R>(f: impl FnOnce() -> R) -> R {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
+    };
+
+    let name = crate::win_common::wide("Local\\harness-tier3-vm-ledger");
+    let handle = unsafe { CreateMutexW(None, false, windows::core::PCWSTR(name.as_ptr())) };
+    let Ok(handle) = handle else {
+        return f();
+    };
+    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    if wait != WAIT_OBJECT_0 {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return f();
+    }
+    let result = f();
+    unsafe {
+        let _ = ReleaseMutex(handle);
+        let _ = CloseHandle(handle);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn with_ledger_lock<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// 台帳が存在しない/読めない/パースできない場合は空扱い（`harness-cli`の
 /// `load_fs_ledger`と同じfail-open方針、daemonの起動を止めない）。**Phase Bでスキーマを
 /// 破壊的に変更したため、旧スキーマ（`entries: [...]`）のファイルは黙って空扱いになる**
@@ -109,6 +141,10 @@ fn ledger_path() -> Option<PathBuf> {
 /// 移行コードは書かない。実際にVMが孤児として起動中だった場合は、後段の
 /// `existing_vm_names`（Hyper-V実機照会）が belt-and-suspenders として拾う）。
 pub fn load() -> VmLedger {
+    with_ledger_lock(load_unlocked)
+}
+
+fn load_unlocked() -> VmLedger {
     let Some(path) = ledger_path() else {
         return VmLedger::default();
     };
@@ -119,6 +155,10 @@ pub fn load() -> VmLedger {
 }
 
 pub fn save(ledger: &VmLedger) {
+    with_ledger_lock(|| save_unlocked(ledger));
+}
+
+fn save_unlocked(ledger: &VmLedger) {
     let Some(path) = ledger_path() else {
         return;
     };
@@ -167,21 +207,25 @@ fn now_unix_secs() -> u64 {
 /// `daemon_pid`はこのVMを起動した常駐daemonプロセス自身のPID（`std::process::id()`）。
 /// BUG-027対策の生存判定に使う（`is_pid_alive`のdoc参照）。
 pub fn record_vm_host(vm_name: &str, diff_vhdx: &Path, daemon_pid: u32) {
-    let mut ledger = load();
-    ledger.vm_host = Some(VmHostEntry {
-        vm_name: vm_name.to_string(),
-        diff_vhdx: diff_vhdx.to_string_lossy().into_owned(),
-        daemon_pid,
-        created_at_unix_secs: now_unix_secs(),
+    with_ledger_lock(|| {
+        let mut ledger = load_unlocked();
+        ledger.vm_host = Some(VmHostEntry {
+            vm_name: vm_name.to_string(),
+            diff_vhdx: diff_vhdx.to_string_lossy().into_owned(),
+            daemon_pid,
+            created_at_unix_secs: now_unix_secs(),
+        });
+        save_unlocked(&ledger);
     });
-    save(&ledger);
 }
 
 /// `VmHost::release`がVM撤収（refcountが0になった）に成功した後に呼ぶ。
 pub fn remove_vm_host() {
-    let mut ledger = load();
-    ledger.vm_host = None;
-    save(&ledger);
+    with_ledger_lock(|| {
+        let mut ledger = load_unlocked();
+        ledger.vm_host = None;
+        save_unlocked(&ledger);
+    });
 }
 
 /// `workspace_id`単位資源の参照カウントをインクリメントする（新規作成時は`refcount=1`で
@@ -198,9 +242,18 @@ pub fn record_workspace_resource(
     user: &str,
     user_sid: &str,
 ) {
-    let mut ledger = load();
-    upsert_workspace_resource_in_ledger(&mut ledger, workspace_id, workspace_root, share_name, user, user_sid);
-    save(&ledger);
+    with_ledger_lock(|| {
+        let mut ledger = load_unlocked();
+        upsert_workspace_resource_in_ledger(
+            &mut ledger,
+            workspace_id,
+            workspace_root,
+            share_name,
+            user,
+            user_sid,
+        );
+        save_unlocked(&ledger);
+    });
 }
 
 /// [`record_workspace_resource`]の純粋ロジック部分（`%APPDATA%`台帳ファイルへのI/Oを伴わない）。
@@ -239,10 +292,21 @@ fn upsert_workspace_resource_in_ledger(
 /// （まだ他セッションが使用中＝`refcount > 0`のままなら`None`を返し、共有・アカウントは
 /// 破棄しない）。
 pub fn release_workspace_resource(workspace_id: &str) -> Option<WorkspaceResourceEntry> {
-    let mut ledger = load();
-    let result = release_workspace_resource_in_ledger(&mut ledger, workspace_id);
-    save(&ledger);
-    result
+    with_ledger_lock(|| {
+        let mut ledger = load_unlocked();
+        let result = release_workspace_resource_in_ledger(&mut ledger, workspace_id);
+        save_unlocked(&ledger);
+        result
+    })
+}
+
+pub fn update<R>(f: impl FnOnce(&mut VmLedger) -> R) -> R {
+    with_ledger_lock(|| {
+        let mut ledger = load_unlocked();
+        let result = f(&mut ledger);
+        save_unlocked(&ledger);
+        result
+    })
 }
 
 /// [`release_workspace_resource`]の純粋ロジック部分（テストはこちらを直接呼ぶ、
@@ -383,12 +447,10 @@ mod tests {
         let removed = release_workspace_resource_in_ledger(&mut ledger, workspace_id);
         assert!(removed.is_some());
         assert_eq!(removed.unwrap().smb_share_name, "harness-ws-test");
-        assert!(
-            ledger
-                .workspace_resources
-                .iter()
-                .all(|e| e.workspace_id != workspace_id)
-        );
+        assert!(ledger
+            .workspace_resources
+            .iter()
+            .all(|e| e.workspace_id != workspace_id));
     }
 
     /// `record_vm_host`/`remove_vm_host`の純粋ロジック（`Option`の設定/クリア）を
@@ -405,7 +467,10 @@ mod tests {
             daemon_pid: 4242,
             created_at_unix_secs: now_unix_secs(),
         });
-        assert_eq!(ledger.vm_host.as_ref().unwrap().vm_name, "harness-tier3-resident");
+        assert_eq!(
+            ledger.vm_host.as_ref().unwrap().vm_name,
+            "harness-tier3-resident"
+        );
 
         ledger.vm_host = None;
         assert!(ledger.vm_host.is_none());

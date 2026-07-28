@@ -33,14 +33,11 @@
 //!   （`smb_share::compute_workspace_id`）単位で参照カウント共有する。Incusコンテナと
 //!   egress許可リストはセッション単位のまま（同一ワークスペースでもコンテナは分ける）。
 //!
-//! **依然として未実装のまま残っている範囲**（`plans/TIER1A-OPEN-ISSUES.md`項目9でフォロー
-//! アップする）:
-//! - VM refcountが0になった際のアイドル猶予つきwarm維持は未実装（今回は即時停止のみ、
-//!   Phase C以降）。
-//! - SNI監査ログ（`SNI_AUDIT_LOG_PATH`）がまだVM単位のシングルトンで、複数セッション同時稼働時に
-//!   通信記録が混在・重複する（S-7、未解消）。
-//! - nginx設定の反映が`nginx -s reload`ではなくプロセス再起動のため、他セッションのTLS接続が
-//!   瞬断し得る（未解消）。
+//! **Tier3残課題の解消済み範囲**:
+//! - VM refcountが0になった際、warm運用なら`WarmIdle`へparkして次回warm復帰できる。
+//! - SNI監査ログはslot別のVM内ファイルへ分離し、teardown時にセッション別ログとして
+//!   `.harness/sandbox/tier3-net-audit-<session_id>.log`へ回収する。
+//! - nginx設定の反映は既存プロセスへの`nginx -s reload`を優先し、未起動時だけ新規起動する。
 //!
 //! ワークスペース共有は`WorkspaceShareMode::Cifs`（SMBライブ共有、Incus disk deviceでのbind-mount）
 //! が既定であり、D-22のライブマウントはこの経路で実現済み。`HARNESS_TIER3_CIFS_WORKSPACE=0`で
@@ -133,7 +130,9 @@ impl Default for VmSandboxConfig {
             // 300秒IPCタイムアウトを起こす既知の欠陥があり（本来の問題）、これが解消される
             // のが今回の目的そのもの。何か問題が出た場合の逃げ道として
             // `HARNESS_TIER3_CIFS_WORKSPACE=0`で旧方式へ明示的に戻せるようにしておく。
-            workspace_share_mode: if std::env::var("HARNESS_TIER3_CIFS_WORKSPACE").as_deref() == Ok("0") {
+            workspace_share_mode: if std::env::var("HARNESS_TIER3_CIFS_WORKSPACE").as_deref()
+                == Ok("0")
+            {
                 WorkspaceShareMode::CopyInOut
             } else {
                 WorkspaceShareMode::Cifs
@@ -261,15 +260,7 @@ pub fn ensure_ssh_keypair() -> Result<PathBuf, VmError> {
         return Ok(private_key);
     }
     let status = std::process::Command::new("ssh-keygen")
-        .args([
-            "-t",
-            "ed25519",
-            "-N",
-            "",
-            "-C",
-            "harness-tier3",
-            "-f",
-        ])
+        .args(["-t", "ed25519", "-N", "", "-C", "harness-tier3", "-f"])
         .arg(&private_key)
         .status()
         .map_err(|e| VmError::Io(format!("failed to spawn ssh-keygen: {e}")))?;
@@ -388,7 +379,12 @@ fn ssh_exec(
 }
 
 /// `ssh_exec`の非ゼロ終了を`VmError`へ畳み込む版（設定投入等、成功必須の呼び出し向け）。
-fn ssh_exec_checked(host: IpAddr, key_path: &Path, cmd: &str, timeout: Duration) -> Result<String, VmError> {
+fn ssh_exec_checked(
+    host: IpAddr,
+    key_path: &Path,
+    cmd: &str,
+    timeout: Duration,
+) -> Result<String, VmError> {
     let (stdout, stderr, code) = ssh_exec(host, key_path, cmd, timeout)?;
     if code != 0 {
         return Err(VmError::Io(format!(
@@ -420,7 +416,12 @@ fn guest_workspace_mount_is_healthy(host: IpAddr, key: &Path, mount_point: &str)
 /// AlmaLinux VM自体（`root`）へファイルを配置する（`ssh ... 'cat > path'`にstdin経由で
 /// 内容を流し込む。Incus内のコンテナではなくVMのホストOS側へ書く点が`IncusClient::push_file`
 /// との違い）。
-fn ssh_push_file(host: IpAddr, key_path: &Path, contents: &[u8], remote_path: &str) -> Result<(), VmError> {
+fn ssh_push_file(
+    host: IpAddr,
+    key_path: &Path,
+    contents: &[u8],
+    remote_path: &str,
+) -> Result<(), VmError> {
     let known_hosts = known_hosts_file()?;
     let mut child = std::process::Command::new("ssh")
         .args([
@@ -472,7 +473,12 @@ struct IncusOperation {
 }
 
 impl IncusClient {
-    pub fn new(host: IpAddr, port: u16, client_crt: &Path, client_key: &Path) -> Result<Self, VmError> {
+    pub fn new(
+        host: IpAddr,
+        port: u16,
+        client_crt: &Path,
+        client_key: &Path,
+    ) -> Result<Self, VmError> {
         let crt_pem = std::fs::read(client_crt)?;
         let key_pem = std::fs::read(client_key)?;
         let mut pem = crt_pem;
@@ -534,7 +540,11 @@ impl IncusClient {
             == Some("trusted"))
     }
 
-    fn wait_operation(&self, op_path: &str, timeout: Duration) -> Result<serde_json::Value, VmError> {
+    fn wait_operation(
+        &self,
+        op_path: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, VmError> {
         let wait_path = format!("{op_path}/wait?timeout={}", timeout.as_secs());
         let (status, value) = self.request(reqwest::Method::GET, &wait_path, None)?;
         if status >= 400 {
@@ -542,7 +552,10 @@ impl IncusClient {
                 "operation wait failed: status={status} body={value}"
             )));
         }
-        let metadata = value.get("metadata").cloned().unwrap_or(serde_json::Value::Null);
+        let metadata = value
+            .get("metadata")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let op_status = metadata
             .get("status")
             .and_then(|s| s.as_str())
@@ -581,9 +594,8 @@ impl IncusClient {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            VmError::Incus("create_container: exhausted retries".to_string())
-        }))
+        Err(last_err
+            .unwrap_or_else(|| VmError::Incus("create_container: exhausted retries".to_string())))
     }
 
     fn try_create_container(&self, name: &str, image_alias: &str) -> Result<(), VmError> {
@@ -598,24 +610,32 @@ impl IncusClient {
                 "alias": image_alias,
             },
         });
-        let (status, value) =
-            self.request(reqwest::Method::POST, "/1.0/instances", Some(body))?;
+        let (status, value) = self.request(reqwest::Method::POST, "/1.0/instances", Some(body))?;
         if status >= 400 {
             return Err(VmError::Incus(format!(
                 "create_container failed: status={status} body={value}"
             )));
         }
         let op: IncusOperation = serde_json::from_value(
-            value.get("operation").cloned().unwrap_or(serde_json::Value::Null),
+            value
+                .get("operation")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         )
         .or_else(|_| {
             // 一部のIncusバージョンは`metadata.id`にoperation idを積む。
             serde_json::from_value::<IncusOperation>(
-                value.get("metadata").cloned().unwrap_or(serde_json::Value::Null),
+                value
+                    .get("metadata")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
             )
         })
         .map_err(|e| VmError::Incus(format!("failed to parse operation id: {e}")))?;
-        self.wait_operation(&format!("/1.0/operations/{}", op.id), Duration::from_secs(180))?;
+        self.wait_operation(
+            &format!("/1.0/operations/{}", op.id),
+            Duration::from_secs(180),
+        )?;
         Ok(())
     }
 
@@ -798,7 +818,11 @@ impl IncusClient {
 
     /// コンテナの`eth0`デバイスへACLを適用し、既定egressをdropにする
     /// （`security.acls.default.egress.action=drop`、`RESULTS.md`§3.8）。
-    pub fn attach_acl_to_container(&self, container_name: &str, acl_name: &str) -> Result<(), VmError> {
+    pub fn attach_acl_to_container(
+        &self,
+        container_name: &str,
+        acl_name: &str,
+    ) -> Result<(), VmError> {
         let (status, value) = self.request(
             reqwest::Method::GET,
             &format!("/1.0/instances/{container_name}"),
@@ -824,7 +848,10 @@ impl IncusClient {
             "security.acls.default.egress.action": "drop",
             "security.acls.default.ingress.action": "allow",
         });
-        let config = inst.get("config").cloned().unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let config = inst
+            .get("config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
         let body = serde_json::json!({ "devices": devices, "config": config });
         let (status, value) = self.request(
             reqwest::Method::PUT,
@@ -890,9 +917,8 @@ impl IncusClient {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            VmError::Incus("add_disk_device: exhausted retries".to_string())
-        }))
+        Err(last_err
+            .unwrap_or_else(|| VmError::Incus("add_disk_device: exhausted retries".to_string())))
     }
 
     fn try_add_disk_device(
@@ -924,7 +950,10 @@ impl IncusClient {
             "source": source,
             "path": path,
         });
-        let config = inst.get("config").cloned().unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let config = inst
+            .get("config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
         let body = serde_json::json!({ "devices": devices, "config": config });
         let (status, value) = self.request(
             reqwest::Method::PUT,
@@ -976,21 +1005,33 @@ impl IncusClient {
             .and_then(|m| m.get("config"))
             .and_then(|c| c.get("volatile.idmap.current"))
             .and_then(|s| s.as_str())
-            .ok_or_else(|| VmError::Incus(format!("container {name} has no volatile.idmap.current")))?;
+            .ok_or_else(|| {
+                VmError::Incus(format!("container {name} has no volatile.idmap.current"))
+            })?;
         let idmap: Vec<serde_json::Value> = serde_json::from_str(idmap_str)
             .map_err(|e| VmError::Incus(format!("failed to parse volatile.idmap.current: {e}")))?;
         let uid = idmap
             .iter()
-            .find(|e| e.get("Isuid").and_then(|v| v.as_bool()) == Some(true) && e.get("Nsid").and_then(|v| v.as_i64()) == Some(0))
+            .find(|e| {
+                e.get("Isuid").and_then(|v| v.as_bool()) == Some(true)
+                    && e.get("Nsid").and_then(|v| v.as_i64()) == Some(0)
+            })
             .and_then(|e| e.get("Hostid"))
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| VmError::Incus(format!("container {name}: no uid mapping for nsid 0")))?;
+            .ok_or_else(|| {
+                VmError::Incus(format!("container {name}: no uid mapping for nsid 0"))
+            })?;
         let gid = idmap
             .iter()
-            .find(|e| e.get("Isgid").and_then(|v| v.as_bool()) == Some(true) && e.get("Nsid").and_then(|v| v.as_i64()) == Some(0))
+            .find(|e| {
+                e.get("Isgid").and_then(|v| v.as_bool()) == Some(true)
+                    && e.get("Nsid").and_then(|v| v.as_i64()) == Some(0)
+            })
             .and_then(|e| e.get("Hostid"))
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| VmError::Incus(format!("container {name}: no gid mapping for nsid 0")))?;
+            .ok_or_else(|| {
+                VmError::Incus(format!("container {name}: no gid mapping for nsid 0"))
+            })?;
         Ok((uid as u32, gid as u32))
     }
 
@@ -1040,14 +1081,15 @@ pub(crate) const INCUS_BRIDGE_IP: &str = "10.76.180.1";
 pub(crate) const SNI_PROXY_PORT_BASE: u16 = 8444;
 const SNI_PROXY_CONF_PATH: &str = "/root/harness-sni-proxy.conf";
 const SNI_PROXY_PID_PATH: &str = "/run/harness-sni-proxy.pid";
-/// **既知の限界（S-7、未解消）**: このパスはVM単位のシングルトンで、`slot`によるセッション分離を
-/// していない。複数セッションが同時に稼働すると全セッションの通信記録が1ファイルに混在し、
-/// 先にteardownしたセッションの記録が後からteardownするセッションの監査ログにも重複して現れる。
-const SNI_AUDIT_LOG_PATH: &str = "/var/log/nginx/harness-sni-audit.log";
+const SNI_AUDIT_LOG_DIR: &str = "/var/log/nginx/harness-sni-audit";
 const NFTABLES_TABLE: &str = "harness_tier3";
 
 fn sni_proxy_port_for_slot(slot: u8) -> u16 {
     SNI_PROXY_PORT_BASE + slot as u16
+}
+
+fn sni_audit_log_path_for_slot(slot: u8) -> String {
+    format!("{SNI_AUDIT_LOG_DIR}/slot-{slot}.log")
 }
 
 /// 常駐VM上で現在egress許可リストを構成中の1セッション分の情報
@@ -1100,6 +1142,7 @@ fn build_sni_proxy_conf_multi(sessions: &[EgressSession]) -> String {
             .map(|d| format!("        {d}     \"ALLOW\";\n"))
             .collect();
         let port = sni_proxy_port_for_slot(s.slot);
+        let audit_log = sni_audit_log_path_for_slot(s.slot);
         server_blocks.push_str(&format!(
             r#"
     map $ssl_preread_server_name $sni_upstream_{slot} {{
@@ -1115,9 +1158,11 @@ fn build_sni_proxy_conf_multi(sessions: &[EgressSession]) -> String {
         proxy_pass $sni_upstream_{slot};
         proxy_connect_timeout 5s;
         proxy_timeout 30s;
+        access_log {audit_log} sniaudit;
     }}
 "#,
             slot = s.slot,
+            audit_log = audit_log,
         ));
     }
     format!(
@@ -1129,10 +1174,9 @@ stream {{
     resolver 1.1.1.1 valid=60s;
 
     log_format sniaudit '$time_iso8601 client=$remote_addr sni="$ssl_preread_server_name" '
-                         'decision=$sni_decision upstream=$upstream_addr '
+                         'upstream=$upstream_addr '
                          'bytes_sent=$bytes_sent bytes_received=$bytes_received '
                          'duration=$session_time status=$status';
-    access_log {SNI_AUDIT_LOG_PATH} sniaudit;
 {server_blocks}}}
 "#
     )
@@ -1185,26 +1229,24 @@ pub(crate) fn apply_egress_ruleset(
         }
     }
 
-    // 1. nginx SNI prereadプロキシを配置・(再)起動。既存プロセスがいればkillしてから
-    //    起動し直す（設定が丸ごと変わるため、reloadではなく再起動で確実に反映する）。
+    // 1. nginx SNI prereadプロキシを配置・反映。既に起動中ならreloadし、未起動またはreload
+    //    失敗時のみ新規起動する。セッション追加/削除のたびに既存TLS接続を切らないため。
     let conf = build_sni_proxy_conf_multi(active_sessions);
     ssh_push_file(guest_ip, ssh_key, conf.as_bytes(), SNI_PROXY_CONF_PATH)?;
     ssh_exec_checked(
         guest_ip,
         ssh_key,
-        "mkdir -p /var/log/nginx",
+        &format!("mkdir -p {SNI_AUDIT_LOG_DIR}"),
         Duration::from_secs(10),
     )?;
-    let _ = ssh_exec(
-        guest_ip,
-        ssh_key,
-        &format!("test -f {SNI_PROXY_PID_PATH} && kill $(cat {SNI_PROXY_PID_PATH}) 2>/dev/null; sleep 1"),
-        Duration::from_secs(10),
-    );
     ssh_exec_checked(
         guest_ip,
         ssh_key,
-        &format!("nginx -c {SNI_PROXY_CONF_PATH} -g 'pid {SNI_PROXY_PID_PATH};'"),
+        &format!(
+            "if test -f {SNI_PROXY_PID_PATH} && kill -0 $(cat {SNI_PROXY_PID_PATH}) 2>/dev/null; then \
+             nginx -c {SNI_PROXY_CONF_PATH} -g 'pid {SNI_PROXY_PID_PATH};' -s reload; \
+             else nginx -c {SNI_PROXY_CONF_PATH} -g 'pid {SNI_PROXY_PID_PATH};'; fi"
+        ),
         Duration::from_secs(10),
     )?;
 
@@ -1241,11 +1283,13 @@ fn fetch_and_persist_audit_log(
     ssh_key: &Path,
     workspace_root: &Path,
     session_id: &str,
+    slot: u8,
 ) -> Result<(), VmError> {
+    let remote_log = sni_audit_log_path_for_slot(slot);
     let (stdout, _stderr, code) = ssh_exec(
         guest_ip,
         ssh_key,
-        &format!("cat {SNI_AUDIT_LOG_PATH} 2>/dev/null"),
+        &format!("cat {remote_log} 2>/dev/null"),
         Duration::from_secs(15),
     )?;
     if code != 0 || stdout.is_empty() {
@@ -1391,7 +1435,8 @@ fn acquire_or_repair_workspace_share(
         .workspace_resources
         .into_iter()
         .find(|e| e.workspace_id == workspace_id);
-    let mount_healthy = guest_workspace_mount_is_healthy(config.guest_ip, host_ssh_key, mount_point);
+    let mount_healthy =
+        guest_workspace_mount_is_healthy(config.guest_ip, host_ssh_key, mount_point);
     let action = decide_workspace_action(existing.is_some(), mount_healthy);
 
     match (action, existing) {
@@ -1415,7 +1460,8 @@ fn acquire_or_repair_workspace_share(
             incus,
             container_name,
         ),
-        (WorkspaceAction::CreateFresh, _) | (WorkspaceAction::Reuse | WorkspaceAction::Repair, None) => {
+        (WorkspaceAction::CreateFresh, _)
+        | (WorkspaceAction::Reuse | WorkspaceAction::Repair, None) => {
             // 後段の`(_, None)`は`decide_workspace_action`の契約上到達し得ない
             // （Reuse/Repairは`existing_present == true`のときにしか返らない）が、
             // 型レベルでは`Option`と`WorkspaceAction`が独立のため網羅性のために置く。
@@ -1547,7 +1593,12 @@ fn remount_workspace_share(
 ) -> Result<(), VmError> {
     let cred_remote = format!("/etc/harness-smb-{workspace_id}.cred");
     let cred_contents = format!("username={user}\npassword={password}\n");
-    ssh_push_file(config.guest_ip, host_ssh_key, cred_contents.as_bytes(), &cred_remote)?;
+    ssh_push_file(
+        config.guest_ip,
+        host_ssh_key,
+        cred_contents.as_bytes(),
+        &cred_remote,
+    )?;
     ssh_exec_checked(
         config.guest_ip,
         host_ssh_key,
@@ -1601,8 +1652,14 @@ impl VmSession {
     ) -> Result<Self, VmError> {
         let session_id = unique_session_id();
         let incus = crate::vm_host::VmHost::global().attach(config, warm)?;
-        let result =
-            Self::attach_to_guest(workspace_root, config, session_id, incus, allow_domains, slot);
+        let result = Self::attach_to_guest(
+            workspace_root,
+            config,
+            session_id,
+            incus,
+            allow_domains,
+            slot,
+        );
         if result.is_err() {
             // VM自体は他セッションが使用中の可能性があるため、ここでは「このセッションの
             // 取り分」を返上するだけでよい（refcountが0になれば`VmHost::release`が実際に
@@ -1842,7 +1899,9 @@ impl VmSession {
                     // `record_workspace_resource`前（例: `create_ephemeral_share`自体の失敗）の場合は
                     // `release_workspace_resource`が`None`を返すため何もしない
                     // （そちらは`create_ephemeral_share`自身がbest-effortで後始末済み）。
-                    if let Some(removed) = crate::vm_ledger::release_workspace_resource(&workspace_id) {
+                    if let Some(removed) =
+                        crate::vm_ledger::release_workspace_resource(&workspace_id)
+                    {
                         let _ = ssh_exec(
                             config.guest_ip,
                             &host_ssh_key,
@@ -1916,7 +1975,10 @@ impl VmSession {
             let rel = entry
                 .strip_prefix(workspace_root)
                 .map_err(|e| VmError::Io(e.to_string()))?;
-            let remote = format!("{WORKSPACE_MOUNT}/{}", rel.to_string_lossy().replace('\\', "/"));
+            let remote = format!(
+                "{WORKSPACE_MOUNT}/{}",
+                rel.to_string_lossy().replace('\\', "/")
+            );
             if let Some(parent) = std::path::Path::new(&remote).parent() {
                 let _ = self.incus.exec(
                     &self.container_name,
@@ -1927,7 +1989,8 @@ impl VmSession {
                 );
             }
             let contents = std::fs::read(&entry)?;
-            self.incus.push_file(&self.container_name, &contents, &remote)?;
+            self.incus
+                .push_file(&self.container_name, &contents, &remote)?;
         }
         Ok(())
     }
@@ -1947,7 +2010,9 @@ impl VmSession {
             if remote.is_empty() {
                 continue;
             }
-            let rel = remote.trim_start_matches(WORKSPACE_MOUNT).trim_start_matches('/');
+            let rel = remote
+                .trim_start_matches(WORKSPACE_MOUNT)
+                .trim_start_matches('/');
             let local = workspace_root.join(rel);
             if let Some(parent) = local.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -1974,10 +2039,18 @@ impl VmSession {
         let remote_cwd = if rel_cwd.as_os_str().is_empty() || rel_cwd == Path::new(".") {
             WORKSPACE_MOUNT.to_string()
         } else {
-            format!("{WORKSPACE_MOUNT}/{}", rel_cwd.to_string_lossy().replace('\\', "/"))
+            format!(
+                "{WORKSPACE_MOUNT}/{}",
+                rel_cwd.to_string_lossy().replace('\\', "/")
+            )
         };
-        self.incus
-            .exec(&self.container_name, &["sh", "-c", cmd], &remote_cwd, env, timeout)
+        self.incus.exec(
+            &self.container_name,
+            &["sh", "-c", cmd],
+            &remote_cwd,
+            env,
+            timeout,
+        )
     }
 
     /// **Phase B**: VM自体はもう`self`が所有していない（`crate::vm_host::VmHost`が参照カウント
@@ -2000,6 +2073,7 @@ impl VmSession {
                 ssh_key,
                 workspace_root,
                 &self.session_id,
+                self.slot,
             );
             let _ = crate::vm_host::VmHost::global().release_egress(config, ssh_key, self.slot);
         }
@@ -2013,7 +2087,8 @@ impl VmSession {
             // `attach_to_guest`の作成判定と同じロックで直列化する（TOCTOU是正、
             // `WORKSPACE_RESOURCE_LOCK`のdoc参照）。
             let _workspace_lock = WORKSPACE_RESOURCE_LOCK.lock().unwrap();
-            if let Some(removed) = crate::vm_ledger::release_workspace_resource(&self.workspace_id) {
+            if let Some(removed) = crate::vm_ledger::release_workspace_resource(&self.workspace_id)
+            {
                 if let Ok(host_ssh_key) = ensure_ssh_keypair() {
                     let mount_point = format!("/mnt/harness-workspace-{}", self.workspace_id);
                     let cred_remote = format!("/etc/harness-smb-{}.cred", self.workspace_id);
@@ -2110,9 +2185,10 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
             Some(Path::new(&resource.workspace_root)),
         );
     }
-    let mut cleared = ledger;
-    cleared.workspace_resources.clear();
-    crate::vm_ledger::save(&cleared);
+    let cleared = crate::vm_ledger::update(|current| {
+        current.workspace_resources.clear();
+        current.clone()
+    });
 
     // F4: 台帳に載っていないWindows側実体（状態S2/S3）も実体側から直接走査して回収する。
     // 直前のループで台帳追跡分は既に破棄済みのため、ここで見つかるのは真に台帳から
@@ -2161,7 +2237,8 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
         let Some(session_part) = file_name.strip_suffix(".diff.vhdx") else {
             continue;
         };
-        if session_part == current_session_id || existing_vm_names.iter().any(|n| n == session_part) {
+        if session_part == current_session_id || existing_vm_names.iter().any(|n| n == session_part)
+        {
             continue;
         }
         let _ = std::fs::remove_file(&path);
@@ -2233,7 +2310,10 @@ mod tests {
 
     #[test]
     fn urlencoding_path_escapes_space() {
-        assert_eq!(urlencoding_path("/workspace/a b.txt"), "/workspace/a%20b.txt");
+        assert_eq!(
+            urlencoding_path("/workspace/a b.txt"),
+            "/workspace/a%20b.txt"
+        );
     }
 
     #[test]
@@ -2249,8 +2329,14 @@ mod tests {
         assert!(conf.contains("example.com     \"ALLOW\";"));
         assert!(conf.contains("default              \"\";"));
         assert!(conf.contains("default              \"DENY\";"));
-        assert!(conf.contains(&format!("listen {INCUS_BRIDGE_IP}:{};", sni_proxy_port_for_slot(0))));
-        assert!(conf.contains(&format!("access_log {SNI_AUDIT_LOG_PATH} sniaudit;")));
+        assert!(conf.contains(&format!(
+            "listen {INCUS_BRIDGE_IP}:{};",
+            sni_proxy_port_for_slot(0)
+        )));
+        assert!(conf.contains(&format!(
+            "access_log {} sniaudit;",
+            sni_audit_log_path_for_slot(0)
+        )));
     }
 
     #[test]
@@ -2275,13 +2361,27 @@ mod tests {
             },
         ];
         let conf = build_sni_proxy_conf_multi(&sessions);
-        assert!(conf.contains(&format!("listen {INCUS_BRIDGE_IP}:{};", sni_proxy_port_for_slot(0))));
-        assert!(conf.contains(&format!("listen {INCUS_BRIDGE_IP}:{};", sni_proxy_port_for_slot(1))));
+        assert!(conf.contains(&format!(
+            "listen {INCUS_BRIDGE_IP}:{};",
+            sni_proxy_port_for_slot(0)
+        )));
+        assert!(conf.contains(&format!(
+            "listen {INCUS_BRIDGE_IP}:{};",
+            sni_proxy_port_for_slot(1)
+        )));
         // 各セッションのmapに、他セッションのドメインが混ざっていないこと（A-8是正の回帰）。
         let slot0_map_start = conf.find("$sni_upstream_0").unwrap();
         let slot0_map_end = conf.find("$sni_upstream_1").unwrap();
         assert!(conf[slot0_map_start..slot0_map_end].contains("a.example.com"));
         assert!(!conf[slot0_map_start..slot0_map_end].contains("b.example.com"));
+        assert!(conf.contains(&format!(
+            "access_log {} sniaudit;",
+            sni_audit_log_path_for_slot(0)
+        )));
+        assert!(conf.contains(&format!(
+            "access_log {} sniaudit;",
+            sni_audit_log_path_for_slot(1)
+        )));
     }
 
     #[test]
@@ -2306,7 +2406,9 @@ mod tests {
         }];
         let script = build_nftables_script(&sessions);
         let port = sni_proxy_port_for_slot(2);
-        assert!(script.contains(&format!("ip saddr 10.76.180.63 tcp dport 443 redirect to :{port}")));
+        assert!(script.contains(&format!(
+            "ip saddr 10.76.180.63 tcp dport 443 redirect to :{port}"
+        )));
         assert!(script.contains(&format!(
             "ip daddr {INCUS_BRIDGE_IP} tcp dport {port} ip saddr != 10.76.180.63 drop"
         )));
@@ -2322,10 +2424,19 @@ mod tests {
         // S7: 台帳有り・マウント健全 → Reuse。
         assert_eq!(decide_workspace_action(true, true), WorkspaceAction::Reuse);
         // S4/S5/S6: 台帳有り・マウント不健全 → Repair。
-        assert_eq!(decide_workspace_action(true, false), WorkspaceAction::Repair);
+        assert_eq!(
+            decide_workspace_action(true, false),
+            WorkspaceAction::Repair
+        );
         // S0〜S3: 台帳無し（マウントの有無に関わらず）→ CreateFresh。
-        assert_eq!(decide_workspace_action(false, true), WorkspaceAction::CreateFresh);
-        assert_eq!(decide_workspace_action(false, false), WorkspaceAction::CreateFresh);
+        assert_eq!(
+            decide_workspace_action(false, true),
+            WorkspaceAction::CreateFresh
+        );
+        assert_eq!(
+            decide_workspace_action(false, false),
+            WorkspaceAction::CreateFresh
+        );
     }
 
     /// [BUG-026回帰テスト・実機E2E] `%APPDATA%`の台帳へ「workspace_id一致・ゲスト側マウント

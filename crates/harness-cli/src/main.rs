@@ -137,6 +137,8 @@ enum Tier3Action {
     /// 通常は新規Tier3セッション開始直前にdaemonが自動実行するが（`serve_inner`）、
     /// daemonクラッシュ直後の障害調査・手動運用のための明示コマンド。
     Gc,
+    /// アクティブセッションが無い場合だけ常駐Tier3 daemonを終了する。
+    StopDaemon,
 }
 
 /// `harness fs`サブコマンドの各操作。Windows Tier1a固有機能のため、Windows以外では
@@ -373,7 +375,12 @@ fn parse_require_sandbox(value: Option<&str>) -> RequireSandbox {
 /// `--live`/`--staged`/`--workspace-commit`から`(explicit, fallback_mode)`を決める。
 /// 明示指定が無い場合、`fallback_mode`はgit認識型判定（追跡済み・変更ゼロ→live）で
 /// liveと判定されなかったパスにだけ適用される既定モード（headless=Staged/TUI=WorkspaceCommit）。
-fn resolve_staging_mode(live: bool, staged: bool, workspace_commit: bool, is_headless: bool) -> (bool, StagingMode) {
+fn resolve_staging_mode(
+    live: bool,
+    staged: bool,
+    workspace_commit: bool,
+    is_headless: bool,
+) -> (bool, StagingMode) {
     if live {
         (true, StagingMode::Live)
     } else if staged {
@@ -408,9 +415,15 @@ fn resolve_sandbox_dir(workspace_root: &Path, session: Option<&str>) -> Option<P
         if !path.is_dir() {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else { continue };
-        let Ok(modified) = metadata.modified() else { continue };
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if newest.as_ref().is_none_or(|(_, t)| modified > *t) {
             newest = Some((name.to_string(), modified));
         }
@@ -418,15 +431,20 @@ fn resolve_sandbox_dir(workspace_root: &Path, session: Option<&str>) -> Option<P
     newest.map(|(name, _)| sandbox_dir_for_session(&name))
 }
 
-fn build_provider(kind: ProviderKind, base_url_override: Option<String>) -> Result<Box<dyn LlmProvider>, String> {
+fn build_provider(
+    kind: ProviderKind,
+    base_url_override: Option<String>,
+) -> Result<Box<dyn LlmProvider>, String> {
     // §設定とシークレット: CLIフラグ > env優先、プロジェクト設定に永続化しない・ログに出さない・
     // 起動時fail-fast。
     match kind {
         ProviderKind::Anthropic => {
-            let api_key =
-                std::env::var("ANTHROPIC_API_KEY").map_err(|_| "ANTHROPIC_API_KEY is not set".to_string())?;
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| "ANTHROPIC_API_KEY is not set".to_string())?;
             match base_url_override.or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok()) {
-                Some(base_url) => Ok(Box::new(AnthropicProvider::with_base_url(api_key, base_url))),
+                Some(base_url) => Ok(Box::new(AnthropicProvider::with_base_url(
+                    api_key, base_url,
+                ))),
                 None => Ok(Box::new(AnthropicProvider::new(api_key))),
             }
         }
@@ -462,7 +480,10 @@ fn resolve_session(
     if let Some(id) = resume {
         let path = harness_engine::SessionStore::resolve_path(sessions_dir, id);
         if !path.exists() {
-            return Err(format!("no session found for --resume {id} ({})", path.display()));
+            return Err(format!(
+                "no session found for --resume {id} ({})",
+                path.display()
+            ));
         }
         return Ok(harness_engine::SessionStore::open(path));
     }
@@ -533,7 +554,9 @@ fn resolve_model(model: Option<String>, kind: ProviderKind) -> Result<String, St
     match (model, kind) {
         (Some(m), _) => Ok(m),
         (None, ProviderKind::Anthropic) => Ok(DEFAULT_ANTHROPIC_MODEL.to_string()),
-        (None, ProviderKind::Openai) => Err("--model is required when --provider openai is used".into()),
+        (None, ProviderKind::Openai) => {
+            Err("--model is required when --provider openai is used".into())
+        }
         (None, ProviderKind::Lmstudio) => {
             Err("--model is required when --provider lmstudio is used".into())
         }
@@ -562,11 +585,23 @@ struct ApplyReportJson {
 fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
     let settings = harness_config::Settings::load(workspace_root);
 
-    let (explicit, staging_mode) =
-        resolve_staging_mode(cli.live, cli.staged, cli.workspace_commit, cli.print.is_some());
-    let read_scope = settings.read.clone().unwrap_or_default().to_read_scope_config();
+    let (explicit, staging_mode) = resolve_staging_mode(
+        cli.live,
+        cli.staged,
+        cli.workspace_commit,
+        cli.print.is_some(),
+    );
+    let read_scope = settings
+        .read
+        .clone()
+        .unwrap_or_default()
+        .to_read_scope_config();
 
-    let mut net_proxy = settings.net.clone().unwrap_or_default().to_net_proxy_config();
+    let mut net_proxy = settings
+        .net
+        .clone()
+        .unwrap_or_default()
+        .to_net_proxy_config();
     for domain in &cli.net_allow_domain {
         if !net_proxy.allow_domains.contains(domain) {
             net_proxy.allow_domains.push(domain.clone());
@@ -589,14 +624,13 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
 
     let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
     let opt_in_tier3 = cli.sandbox || cli.experimental_tier3;
-    let shell_tier =
-        match select_tier(require_sandbox, workspace_root, opt_in_tier3, &[], None) {
-            Ok(sel) => sel,
-            Err(e) => {
-                eprintln!("error: shell tier selection failed: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let shell_tier = match select_tier(require_sandbox, workspace_root, opt_in_tier3, &[], None) {
+        Ok(sel) => sel,
+        Err(e) => {
+            eprintln!("error: shell tier selection failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let ctx = ToolCtx {
         workspace_root: workspace_root.to_path_buf(),
@@ -606,6 +640,7 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
             sandbox_dir: None,
         },
         read_scope,
+        shell_sees_staged_writes: shell_sees_staged_writes(&shell_tier),
         shell_tier,
         net_proxy,
         net_app,
@@ -617,17 +652,41 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn shell_sees_staged_writes(shell_tier: &harness_core::ShellTierSelection) -> bool {
+    #[cfg(windows)]
+    {
+        use harness_sandbox::vmsandbox::{VmSandboxConfig, WorkspaceShareMode};
+
+        shell_tier.tier == harness_core::ShellTier::Tier3
+            && VmSandboxConfig::default().workspace_share_mode == WorkspaceShareMode::Cifs
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = shell_tier;
+        false
+    }
+}
+
 /// `apply`/`changes`/`discard`サブコマンドを処理する。プロバイダ資格情報を一切必要としない
 /// （§非対話モード、プロンプトは一切送らない）。
 fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
     let (session, output_format_and_kind) = match &cmd {
-        Commands::Changes { session, output_format } => (session.clone(), Some(*output_format)),
-        Commands::Apply { session, output_format, .. } => (session.clone(), Some(*output_format)),
+        Commands::Changes {
+            session,
+            output_format,
+        } => (session.clone(), Some(*output_format)),
+        Commands::Apply {
+            session,
+            output_format,
+            ..
+        } => (session.clone(), Some(*output_format)),
         Commands::Discard { session } => (session.clone(), None),
         // `Fs`/`Tier3`/`Prompt`はmain()側でそれぞれ専用の振り分け先へ処理済みで、ここには
         // 到達しない（workspace sandboxのstaging設定を一切必要としないため、`SandboxFs`を開く
         // このパスとは責務が別）。
-        Commands::Fs { .. } => unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand"),
+        Commands::Fs { .. } => {
+            unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand")
+        }
         Commands::Tier3 { .. } => {
             unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
         }
@@ -686,7 +745,11 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Commands::Apply { only, dangerously_allow, .. } => {
+        Commands::Apply {
+            only,
+            dangerously_allow,
+            ..
+        } => {
             let report = match fs.apply(&ApplyOptions {
                 only_glob: only.as_deref(),
                 only_paths: None,
@@ -746,7 +809,9 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Commands::Fs { .. } => unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand"),
+        Commands::Fs { .. } => {
+            unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand")
+        }
         Commands::Tier3 { .. } => {
             unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
         }
@@ -962,6 +1027,22 @@ fn run_tier3_subcommand(action: Tier3Action) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Tier3Action::StopDaemon => {
+            match harness_sandbox::vmsandboxd::stop_resident_daemon_if_idle() {
+                Ok(true) => {
+                    println!("Tier3 daemon is stopping");
+                    ExitCode::SUCCESS
+                }
+                Ok(false) => {
+                    println!("(Tier3 daemon is not running)");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("tier3 stop-daemon failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 
@@ -1108,7 +1189,10 @@ fn fs_revoke_one(path: &Path) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             RevokeOutcome::Failed => {
-                eprintln!("revoke failed for {} (already running elevated)", path.display());
+                eprintln!(
+                    "revoke failed for {} (already running elevated)",
+                    path.display()
+                );
                 return ExitCode::FAILURE;
             }
         }
@@ -1125,10 +1209,16 @@ fn fs_revoke_one(path: &Path) -> ExitCode {
                 remove_fs_passthrough_grant(p);
             }
             if failures.is_empty() && cleared {
-                println!("revoked via privilege-separation helper (UAC, one-time): {}", path.display());
+                println!(
+                    "revoked via privilege-separation helper (UAC, one-time): {}",
+                    path.display()
+                );
                 ExitCode::SUCCESS
             } else {
-                eprintln!("revoke incomplete for {} via privilege-separation helper:", path.display());
+                eprintln!(
+                    "revoke incomplete for {} via privilege-separation helper:",
+                    path.display()
+                );
                 for (p, reason) in &failures {
                     eprintln!("  {} : {reason}", p.display());
                 }
@@ -1362,7 +1452,10 @@ fn fs_grant_traverse(target: &Path) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Err(harness_sandbox::privhelper::PrivHelperError::PartialGrantChain { granted, reason }) => {
+        Err(harness_sandbox::privhelper::PrivHelperError::PartialGrantChain {
+            granted,
+            reason,
+        }) => {
             for node in &granted {
                 record_traverse_grant(node);
             }
@@ -1500,7 +1593,10 @@ fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("revoke-traverse verification failed for {}: {e}", path.display());
+            eprintln!(
+                "revoke-traverse verification failed for {}: {e}",
+                path.display()
+            );
             ExitCode::FAILURE
         }
     }
@@ -1616,8 +1712,14 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let max_turns = cli.max_turns.or(settings.max_turns).unwrap_or(DEFAULT_MAX_TURNS);
-    let enter_submits = cli.enter_submits.or(settings.enter_submits).unwrap_or(false);
+    let max_turns = cli
+        .max_turns
+        .or(settings.max_turns)
+        .unwrap_or(DEFAULT_MAX_TURNS);
+    let enter_submits = cli
+        .enter_submits
+        .or(settings.enter_submits)
+        .unwrap_or(false);
 
     let tools = ToolRegistry::with_builtin_tools();
 
@@ -1654,16 +1756,20 @@ async fn main() -> ExitCode {
     // （`--resume`/`--continue`）」）。`.harness/sessions/`直下に1ファイル1セッション。
     let sessions_dir = workspace_root.join(".harness").join("sessions");
     if let Err(e) = std::fs::create_dir_all(&sessions_dir) {
-        eprintln!("failed to create sessions directory {}: {e}", sessions_dir.display());
+        eprintln!(
+            "failed to create sessions directory {}: {e}",
+            sessions_dir.display()
+        );
         return ExitCode::FAILURE;
     }
-    let mut session = match resolve_session(&sessions_dir, resume_id.as_deref(), cli.continue_session) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let mut session =
+        match resolve_session(&sessions_dir, resume_id.as_deref(), cli.continue_session) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     // `--fork-session`: 解決済みの元セッションを不変のまま、全履歴を新規セッションへコピーして
     // 以降の追記先を切り替える（Claude Codeの`--fork-session`/`/branch`相当）。
@@ -1696,8 +1802,12 @@ async fn main() -> ExitCode {
     // 書込ステージング設定（M10）。`sandbox_dir`は`session.id()`確定後でなければ組めないため
     // ここで`ToolCtx`を構築する。明示`--live`時はオーバーレイ自体を使わない
     // （`sandbox_dir: None`、M9までの直接実FSアクセスとバイト等価・監査ログも作らない）。
-    let (explicit, staging_mode) =
-        resolve_staging_mode(cli.live, cli.staged, cli.workspace_commit, cli.print.is_some());
+    let (explicit, staging_mode) = resolve_staging_mode(
+        cli.live,
+        cli.staged,
+        cli.workspace_commit,
+        cli.print.is_some(),
+    );
     let sandbox_dir = if explicit && staging_mode == StagingMode::Live {
         None
     } else {
@@ -1711,7 +1821,11 @@ async fn main() -> ExitCode {
 
     // 協調プロキシ設定（M12補遺、D-15）。CLI `--net-allow-domain`（繰り返し）と
     // `.harness/settings.json`の`net.allow_domains`を和集合でマージする（重複除去）。
-    let mut net_proxy = settings.net.clone().unwrap_or_default().to_net_proxy_config();
+    let mut net_proxy = settings
+        .net
+        .clone()
+        .unwrap_or_default()
+        .to_net_proxy_config();
     for domain in &cli.net_allow_domain {
         if !net_proxy.allow_domains.contains(domain) {
             net_proxy.allow_domains.push(domain.clone());
@@ -1872,8 +1986,8 @@ async fn main() -> ExitCode {
     // Tier1bへ降格した場合はWFPも当然無効）。
     #[cfg(windows)]
     let net_wfp: Option<harness_sandbox::netfilterd::NetfilterHandle> = {
-        let wfp_needed =
-            shell_tier.tier == harness_core::ShellTier::Tier1a && !net_proxy.allow_domains.is_empty();
+        let wfp_needed = shell_tier.tier == harness_core::ShellTier::Tier1a
+            && !net_proxy.allow_domains.is_empty();
         if !wfp_needed {
             // シナリオ(C)、または投機的に作ったパイプが結局不要だった場合。`wfp_prelude`を
             // dropするだけで`PreparedPipe`が自動的にパイプを閉じる（後始末コード不要）。
@@ -1929,10 +2043,7 @@ async fn main() -> ExitCode {
         eprintln!(
             "warning: shell isolation downgraded to {} (from {}): {reason}",
             shell_tier.tier.label(),
-            shell_tier
-                .downgraded_from
-                .map(|t| t.label())
-                .unwrap_or("?")
+            shell_tier.downgraded_from.map(|t| t.label()).unwrap_or("?")
         );
     }
     if shell_tier.tier == harness_core::ShellTier::Tier1b {
@@ -2001,6 +2112,7 @@ async fn main() -> ExitCode {
             sandbox_dir,
         },
         read_scope,
+        shell_sees_staged_writes: shell_sees_staged_writes(&shell_tier),
         shell_tier,
         net_proxy,
         net_app,
@@ -2025,7 +2137,10 @@ async fn main() -> ExitCode {
 
             state.push_user_text(prompt);
             if let Err(e) = session.append_messages(&state.messages[state.messages.len() - 1..]) {
-                eprintln!("failed to persist session {}: {e}", session.path().display());
+                eprintln!(
+                    "failed to persist session {}: {e}",
+                    session.path().display()
+                );
                 return ExitCode::FAILURE;
             }
             let before_run = state.messages.len();
@@ -2034,18 +2149,19 @@ async fn main() -> ExitCode {
             // ここで行い、待機中はstderrへ進捗行を出す（TUI分岐は`harness_tui::run`内で
             // 同様の役割を果たす、`crates/harness-tui/src/lib.rs`参照）。
             #[cfg(windows)]
-            let vm_sandbox_handle: Option<std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>> =
-                if tool_ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
-                    start_tier3_with_progress(
-                        &tool_ctx.workspace_root,
-                        &tool_ctx.net_proxy.allow_domains,
-                        cli.tier3_warm,
-                        cli.tier3_max_sessions.max(1),
-                    )
-                    .await
-                } else {
-                    None
-                };
+            let vm_sandbox_handle: Option<
+                std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>,
+            > = if tool_ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+                start_tier3_with_progress(
+                    &tool_ctx.workspace_root,
+                    &tool_ctx.net_proxy.allow_domains,
+                    cli.tier3_warm,
+                    cli.tier3_max_sessions.max(1),
+                )
+                .await
+            } else {
+                None
+            };
             #[cfg(not(windows))]
             let vm_sandbox_handle: Option<std::sync::Arc<()>> = None;
 
@@ -2077,9 +2193,7 @@ async fn main() -> ExitCode {
             #[cfg(windows)]
             if let Some(handle) = vm_sandbox_handle {
                 if let Err(e) = handle.stop() {
-                    eprintln!(
-                        "warning: failed to cleanly tear down Tier3 VM sandbox session: {e}"
-                    );
+                    eprintln!("warning: failed to cleanly tear down Tier3 VM sandbox session: {e}");
                 }
             }
 
@@ -2167,7 +2281,12 @@ async fn start_tier3_with_progress(
     let workspace_root = workspace_root.to_path_buf();
     let allow_domains = allow_domains.to_vec();
     let start_task = tokio::task::spawn_blocking(move || {
-        VmSandboxHandle::start(&workspace_root, &allow_domains, tier3_warm, tier3_max_sessions)
+        VmSandboxHandle::start(
+            &workspace_root,
+            &allow_domains,
+            tier3_warm,
+            tier3_max_sessions,
+        )
     });
     tokio::pin!(start_task);
 

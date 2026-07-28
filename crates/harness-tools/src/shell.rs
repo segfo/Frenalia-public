@@ -48,6 +48,30 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// 出力バイト上限（層5・T-13、Tier0/Tier1b/Tier2いずれでも適用する保険）。
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
+const RUN_SHELL_DEFAULT_DESCRIPTION: &str =
+    "ワークスペース内でシェルコマンドを実行し、stdout+stderr+終了コードを返す。\
+         ネットワーク許可アプリ（--net-allow-app）を使う場合は、|・&&・;等で他コマンドと連結せず、\
+         単一コマンドとして発行すること（連結すると通信が拒否される）。";
+
+const RUN_SHELL_TIER3_DESCRIPTION: &str =
+    "Tier3のLinuxコンテナ内ワークスペースでシェルコマンドを実行し、\
+         stdout+stderr+終了コードを返す。コマンドはAlmaLinux VM内のIncusコンテナで`sh -c`として\
+         実行されるため、POSIX sh互換の構文とLinuxパスを使うこと。Windows専用コマンドレットや\
+         `$env:...`構文は使わない。";
+
+fn run_shell_input_schema(command_description: &str) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "command": { "type": "string", "description": command_description },
+            "timeout_ms": { "type": "integer", "description": "タイムアウト（ミリ秒、省略時120000）" },
+            "cwd": { "type": "string", "description": "ワークスペースルートからの相対作業ディレクトリ" }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+    })
+}
+
 /// アプリ単位network制御（軸1、D-10/D-11）の判定結果。`classify_net_app`が返す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetDecision {
@@ -120,22 +144,29 @@ impl Tool for RunShellTool {
     }
 
     fn description(&self) -> &str {
-        "ワークスペース内でシェルコマンドを実行し、stdout+stderr+終了コードを返す。\
-         ネットワーク許可アプリ（--net-allow-app）を使う場合は、|・&&・;等で他コマンドと連結せず、\
-         単一コマンドとして発行すること（連結すると通信が拒否される）。"
+        RUN_SHELL_DEFAULT_DESCRIPTION
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": { "type": "string", "description": "実行するシェルコマンド" },
-                "timeout_ms": { "type": "integer", "description": "タイムアウト（ミリ秒、省略時120000）" },
-                "cwd": { "type": "string", "description": "ワークスペースルートからの相対作業ディレクトリ" }
-            },
-            "required": ["command"],
-            "additionalProperties": false
-        })
+        run_shell_input_schema("実行するシェルコマンド")
+    }
+
+    fn spec_for_ctx(&self, ctx: &ToolCtx) -> harness_core::ToolSpec {
+        if ctx.shell_tier.tier == ShellTier::Tier3 {
+            harness_core::ToolSpec {
+                name: self.name().to_string(),
+                description: RUN_SHELL_TIER3_DESCRIPTION.to_string(),
+                input_schema: run_shell_input_schema(
+                    "AlmaLinux VM内のIncusコンテナで`sh -c`へ渡すコマンド。POSIX sh互換の構文とLinuxパスを使う",
+                ),
+            }
+        } else {
+            harness_core::ToolSpec {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                input_schema: self.input_schema(),
+            }
+        }
     }
 
     fn risk(&self, _input: &serde_json::Value) -> RiskClass {
@@ -198,7 +229,10 @@ impl Tool for RunShellTool {
         if let Some(reason) = &ctx.shell_tier.reason {
             content.push_str(&format!(
                 " (downgraded from {}: {reason})",
-                ctx.shell_tier.downgraded_from.map(|t| t.label()).unwrap_or("?")
+                ctx.shell_tier
+                    .downgraded_from
+                    .map(|t| t.label())
+                    .unwrap_or("?")
             ));
         }
         if !ctx.net_app.allow_apps.is_empty() {
@@ -230,7 +264,7 @@ impl Tool for RunShellTool {
                  out-of-workspace writes/network egress are not blocked, see plans/DESIGN-SANDBOX.md §9]",
             );
         }
-        if !matches!(ctx.staging.mode, StagingMode::Live) {
+        if !matches!(ctx.staging.mode, StagingMode::Live) && !ctx.shell_sees_staged_writes {
             content.push_str(
                 "\n[warning: staged writes made earlier in this turn may not be visible to this \
                  shell process yet (D-08 simplification, see plans/DESIGN-SANDBOX.md §8-3)]",
@@ -308,15 +342,13 @@ async fn run_tier3(
     dur: Duration,
     vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
-    let executor = vm_sandbox
-        .cloned()
-        .ok_or_else(|| {
-            ToolError::ExecutionFailed(
-                "tier3 selected but ToolCtx.vm_sandbox is not set (internal error, harness-cli \
+    let executor = vm_sandbox.cloned().ok_or_else(|| {
+        ToolError::ExecutionFailed(
+            "tier3 selected but ToolCtx.vm_sandbox is not set (internal error, harness-cli \
                  should have started a VmSandboxHandle before constructing ToolCtx)"
-                    .to_string(),
-            )
-        })?;
+                .to_string(),
+        )
+    })?;
     // `env`（`harness_sandbox::build_child_env`）はWindows向けのallowlist（`PATH`が
     // `C:\Windows\system32;...`等）であり、Linuxコンテナへそのまま転送すると`sh`自体の
     // 解決に使われるPATHがWindows形式で上書きされ、あらゆるコマンドが
@@ -327,12 +359,11 @@ async fn run_tier3(
     let env: Vec<(String, String)> = Vec::new();
     let command = command.to_string();
     let cwd = cwd.to_path_buf();
-    let (stdout, stderr, exit_code) = tokio::task::spawn_blocking(move || {
-        executor.exec(&command, &cwd, &env, dur)
-    })
-    .await
-    .map_err(|e| ToolError::ExecutionFailed(format!("tier3 exec task panicked: {e}")))?
-    .map_err(ToolError::ExecutionFailed)?;
+    let (stdout, stderr, exit_code) =
+        tokio::task::spawn_blocking(move || executor.exec(&command, &cwd, &env, dur))
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("tier3 exec task panicked: {e}")))?
+            .map_err(ToolError::ExecutionFailed)?;
     Ok((stdout, stderr, exit_code, "incus-exec"))
 }
 
@@ -672,6 +703,7 @@ fn with_utf8_output_encoding_preamble(command: &str) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn ctx(root: PathBuf) -> ToolCtx {
         let mut ctx = ToolCtx::new(root.clone());
@@ -706,7 +738,10 @@ mod tests {
     #[test]
     fn classify_net_app_allows_matching_leading_exe() {
         let allow = vec!["git".to_string()];
-        assert_eq!(classify_net_app("git push origin main", &allow), NetDecision::Allow);
+        assert_eq!(
+            classify_net_app("git push origin main", &allow),
+            NetDecision::Allow
+        );
     }
 
     #[test]
@@ -780,6 +815,112 @@ mod tests {
         assert!(out.content.contains("hello"));
         assert!(out.content.contains("[exit code: 0]"));
         assert!(out.content.contains("[tier:"));
+    }
+
+    #[test]
+    fn run_shell_tool_spec_mentions_sh_c_for_tier3() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = ToolCtx::new(dir.path().to_path_buf());
+        context.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier3);
+
+        let spec = RunShellTool.spec_for_ctx(&context);
+
+        assert!(spec.description.contains("`sh -c`"), "{}", spec.description);
+        assert!(
+            spec.description.contains("POSIX sh互換"),
+            "{}",
+            spec.description
+        );
+        assert!(
+            !spec.description.contains("PowerShell"),
+            "{}",
+            spec.description
+        );
+        let command_description = spec
+            .input_schema
+            .pointer("/properties/command/description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            command_description.contains("`sh -c`"),
+            "{}",
+            command_description
+        );
+    }
+
+    #[test]
+    fn run_shell_tool_spec_keeps_default_description_for_non_tier3() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = ToolCtx::new(dir.path().to_path_buf());
+        context.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier1b);
+
+        let spec = RunShellTool.spec_for_ctx(&context);
+
+        assert!(spec.description.contains("--net-allow-app"));
+        assert!(!spec.description.contains("Incusコンテナ"));
+        let command_description = spec
+            .input_schema
+            .pointer("/properties/command/description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(command_description, "実行するシェルコマンド");
+    }
+
+    #[tokio::test]
+    async fn run_shell_warns_about_staged_writes_when_child_may_be_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = ctx(dir.path().to_path_buf());
+        context.staging.mode = StagingMode::Staged;
+        context.shell_sees_staged_writes = false;
+
+        let out = RunShellTool
+            .call(json!({ "command": "echo hello" }), &context)
+            .await
+            .unwrap();
+
+        assert!(
+            out.content.contains("D-08 simplification"),
+            "stale child views should keep the D-08 warning: {}",
+            out.content
+        );
+    }
+
+    #[derive(Debug)]
+    struct MockVmShellExecutor;
+
+    impl harness_core::VmShellExecutor for MockVmShellExecutor {
+        fn exec(
+            &self,
+            _cmd: &str,
+            _cwd: &std::path::Path,
+            _env: &[(String, String)],
+            _timeout: std::time::Duration,
+        ) -> Result<(String, String, Option<i32>), String> {
+            Ok(("hello from tier3".to_string(), String::new(), Some(0)))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_shell_suppresses_staged_warning_when_tier3_cifs_sees_staged_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = ToolCtx::new(dir.path().to_path_buf());
+        context.staging.mode = StagingMode::WorkspaceCommit;
+        context.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier3);
+        context.shell_sees_staged_writes = true;
+        context.vm_sandbox = Some(Arc::new(MockVmShellExecutor));
+
+        let out = RunShellTool
+            .call(json!({ "command": "echo hello" }), &context)
+            .await
+            .unwrap();
+
+        assert!(out.content.contains("hello from tier3"));
+        assert!(out.content.contains("[tier: tier3]"));
+        assert!(
+            !out.content.contains("D-08 simplification"),
+            "Tier3+CIFS live-sharing should not emit the stale-write warning: {}",
+            out.content
+        );
     }
 
     #[cfg(windows)]
@@ -863,7 +1004,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error);
-        assert!(out.content.contains("こんにちは日本語テスト"), "{}", out.content);
+        assert!(
+            out.content.contains("こんにちは日本語テスト"),
+            "{}",
+            out.content
+        );
         assert!(!out.content.contains('\u{FFFD}'), "{}", out.content);
     }
 
@@ -909,10 +1054,17 @@ mod tests {
             outside.display()
         );
         let out = tool
-            .call(json!({ "command": command }), &ctx(dir.path().to_path_buf()))
+            .call(
+                json!({ "command": command }),
+                &ctx(dir.path().to_path_buf()),
+            )
             .await
             .unwrap();
-        assert!(out.is_error, "write outside the low-IL cwd should fail: {}", out.content);
+        assert!(
+            out.is_error,
+            "write outside the low-IL cwd should fail: {}",
+            out.content
+        );
         assert!(!outside.exists());
     }
 
@@ -964,7 +1116,11 @@ mod tests {
             "in-workspace write should succeed under tier1a: {}",
             out.content
         );
-        assert!(inside.exists(), "in-workspace file was not created: {}", out.content);
+        assert!(
+            inside.exists(),
+            "in-workspace file was not created: {}",
+            out.content
+        );
         assert!(out.content.contains("[tier: tier1a]"), "{}", out.content);
 
         // (b) ワークスペース外への書込 → 拒否され、ファイルは作られない（範囲外書込の物理拒否）。
@@ -1147,7 +1303,8 @@ mod tests {
             out.content
         );
         assert!(
-            out.content.contains("[net-proxy: DENY notallowed.invalid.example]"),
+            out.content
+                .contains("[net-proxy: DENY notallowed.invalid.example]"),
             "audit log should record the denied request: {}",
             out.content
         );

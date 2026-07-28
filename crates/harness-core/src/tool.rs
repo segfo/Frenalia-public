@@ -313,6 +313,10 @@ pub struct ToolCtx {
     /// アプリ単位network制御（軸1、D-10/D-11）。既定（`NetAppPolicy::default()`＝`allow_apps`空）は
     /// 常にdeny（Tier1a子はcapability空でnetwork全遮断＝現状維持）。
     pub net_app: NetAppPolicy,
+    /// `run_shell`で起動される子が、直前の`write_file`/`edit_file`によるstaging上の変更を
+    /// 読めるかどうか。既定はfalse（多くのTierは実FSだけを見る）で、Tier3+CIFSライブ共有の
+    /// ようにstaging変更が子から見える経路だけ呼び出し側がtrueへ上書きする。
+    pub shell_sees_staged_writes: bool,
     /// Tier3実行チャネル（`ShellTier::Tier3`選択時のみ`Some`）。`net_wfp`（`harness-cli`の
     /// `main()`ローカル変数、`ToolCtx`を経由しない設計）とは異なり、こちらは`run_shell`の
     /// 呼び出しのたびに実際に使われる（VM/コンテナへコマンドを都度送る必要があるため）ので
@@ -332,6 +336,7 @@ impl ToolCtx {
             shell_tier: ShellTierSelection::default(),
             net_proxy: NetProxyConfig::default(),
             net_app: NetAppPolicy::default(),
+            shell_sees_staged_writes: false,
             vm_sandbox: None,
         }
     }
@@ -344,6 +349,16 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     /// schemars + strict変換で生成する入力スキーマ。
     fn input_schema(&self) -> serde_json::Value;
+    /// モデルへ渡すツール仕様。既定では静的な説明・スキーマを返すが、`run_shell`のように
+    /// 実行環境（Tier等）でモデルに見える意味が変わるツールはここを上書きする。
+    fn spec_for_ctx(&self, ctx: &ToolCtx) -> ToolSpec {
+        let _ = ctx;
+        ToolSpec {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            input_schema: self.input_schema(),
+        }
+    }
     /// 実行前ゲート。具体入力（実際のコマンド行/書込先）に基づき申告する。
     fn risk(&self, input: &serde_json::Value) -> RiskClass;
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;

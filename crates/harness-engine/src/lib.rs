@@ -336,7 +336,7 @@ pub async fn run_agent_loop<F>(
 where
     F: FnMut(&str),
 {
-    let tool_specs = tools.to_specs();
+    let tool_specs = tools.to_specs_for_ctx(ctx);
 
     /// キャンセルによる早期returnの共通形。§エージェントループ「ストリーム途中は部分assistant
     /// 破棄／ツール実行中は全tool_useへcancelled合成」のいずれの経路も、この形の
@@ -744,6 +744,72 @@ mod tests {
                 usage: Usage::default(),
             },
         ]
+    }
+
+    struct RecordingProvider {
+        seen_requests: std::sync::Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingProvider {
+        fn id(&self) -> &str {
+            "recording"
+        }
+
+        async fn stream(
+            &self,
+            req: CompletionRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
+        {
+            self.seen_requests.lock().unwrap().push(req);
+            Ok(Box::pin(stream::iter(end_turn("done").into_iter().map(Ok))))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_agent_loop_sends_tier3_specific_run_shell_tool_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen_requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            seen_requests: std::sync::Arc::clone(&seen_requests),
+        };
+        let mut state = ConversationState::new(Vec::new());
+        state.push_user_text("list files");
+        let tools = harness_tools::ToolRegistry::with_builtin_tools();
+        let mut ctx = ToolCtx::new(dir.path().to_path_buf());
+        ctx.shell_tier = harness_core::ShellTierSelection::direct(harness_core::ShellTier::Tier3);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+
+        run_agent_loop(
+            &provider,
+            &mut state,
+            &tools,
+            &ctx,
+            &arbiter,
+            AgentLoopConfig {
+                model: "mock".into(),
+                max_tokens: 100,
+                max_turns: 5,
+            },
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let requests = seen_requests.lock().unwrap();
+        let run_shell = requests[0]
+            .tools
+            .iter()
+            .find(|spec| spec.name == "run_shell")
+            .expect("run_shell spec should be sent");
+        assert!(
+            run_shell.description.contains("`sh -c`"),
+            "{}",
+            run_shell.description
+        );
+        assert!(!run_shell.description.contains("PowerShell"));
     }
 
     fn find_tool_result(state: &ConversationState) -> (String, bool) {

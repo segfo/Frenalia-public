@@ -24,9 +24,8 @@
 //! `Restore-VMSnapshot`+`Start-VM`のみで復帰でき、`ensure_warm_template`のフル
 //! provisioning（`Checkpoint-VM`再作成）をやり直さずに済む。ただし「複数セッション間の
 //! アイドル猶予付きVM維持」自体を積極的な設計目標とはしていない——daemonプロセスが
-//! 生存している間だけの副次効果であり、複数セッション間の長時間アイドル維持や自動停止
-//! タイマーはスコープ外のまま（`docs/STATUS.md`Tier3残課題#4「常駐daemonにアイドル
-//! タイムアウトが無い」と表裏一体の別課題）。
+//! 生存している間だけの副次効果である。常駐daemon自体はアクティブセッション0件の待受けが
+//! 15分続くと終了し、`harness tier3 stop-daemon`でも明示停止できる。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -98,7 +97,9 @@ impl VmHost {
     pub fn attach(&self, config: &VmSandboxConfig, warm: bool) -> Result<IncusClient, VmError> {
         let mut guard = self.state.lock().unwrap();
         match &mut *guard {
-            VmHostState::Running { incus, refcount, .. } => {
+            VmHostState::Running {
+                incus, refcount, ..
+            } => {
                 *refcount += 1;
                 Ok(incus.clone())
             }
@@ -161,7 +162,12 @@ impl VmHost {
     pub fn release(&self, _config: &VmSandboxConfig) {
         let mut guard = self.state.lock().unwrap();
         let action = match &mut *guard {
-            VmHostState::Running { refcount, warm, diff_vhdx, .. } => {
+            VmHostState::Running {
+                refcount,
+                warm,
+                diff_vhdx,
+                ..
+            } => {
                 *refcount = refcount.saturating_sub(1);
                 if *refcount == 0 {
                     Some((*warm, diff_vhdx.clone()))
@@ -210,7 +216,10 @@ impl VmHost {
         allow_domains: Vec<String>,
     ) -> Result<(), VmError> {
         let mut guard = self.state.lock().unwrap();
-        let VmHostState::Running { egress_sessions, .. } = &mut *guard else {
+        let VmHostState::Running {
+            egress_sessions, ..
+        } = &mut *guard
+        else {
             return Err(VmError::Incus(
                 "configure_egress called while the resident VM is not running".to_string(),
             ));
@@ -223,9 +232,17 @@ impl VmHost {
     /// セッション終了時、このセッション（`slot`）分のegress設定を集合から取り除き、残った
     /// アクティブセッション分だけでnginx/nftables設定を再生成する。VMが既に停止済み
     /// （teardownの後半でVM自体もrefcount 0になった場合）なら何もしない。
-    pub fn release_egress(&self, config: &VmSandboxConfig, ssh_key: &Path, slot: u8) -> Result<(), VmError> {
+    pub fn release_egress(
+        &self,
+        config: &VmSandboxConfig,
+        ssh_key: &Path,
+        slot: u8,
+    ) -> Result<(), VmError> {
         let mut guard = self.state.lock().unwrap();
-        let VmHostState::Running { egress_sessions, .. } = &mut *guard else {
+        let VmHostState::Running {
+            egress_sessions, ..
+        } = &mut *guard
+        else {
             return Ok(());
         };
         egress_sessions.remove(&slot);
@@ -262,9 +279,7 @@ fn boot_resident_vm(
 ) -> Result<(IncusClient, PathBuf, bool), VmError> {
     if warm {
         if let Err(e) = ensure_warm_template(config) {
-            eprintln!(
-                "vm_host: failed to provision warm template, falling back to cold boot: {e}"
-            );
+            eprintln!("vm_host: failed to provision warm template, falling back to cold boot: {e}");
             return cold_boot(config).map(|(incus, diff_vhdx)| (incus, diff_vhdx, false));
         }
         match restore_and_wait(config) {
@@ -306,6 +321,7 @@ fn cold_boot(config: &VmSandboxConfig) -> Result<(IncusClient, PathBuf), VmError
 $ErrorActionPreference = 'Stop'
 New-VHD -Path '{diff}' -ParentPath '{golden}' -Differencing | Out-Null
 New-VM -Name '{name}' -MemoryStartupBytes 2048MB -VHDPath '{diff}' -SwitchName '{switch}' -Generation 2 | Out-Null
+Set-VMMemory -VMName '{name}' -DynamicMemoryEnabled $true -MinimumBytes 1024MB -MaximumBytes 8192MB
 Set-VMProcessor -VMName '{name}' -Count 2
 Set-VM -Name '{name}' -AutomaticStopAction TurnOff -AutomaticStartAction Nothing
 Set-VMFirmware -VMName '{name}' -SecureBootTemplate MicrosoftUEFICertificateAuthority
@@ -407,6 +423,7 @@ fn ensure_warm_template(config: &VmSandboxConfig) -> Result<(), VmError> {
 $ErrorActionPreference = 'Stop'
 New-VHD -Path '{diff}' -ParentPath '{golden}' -Differencing | Out-Null
 New-VM -Name '{name}' -MemoryStartupBytes 2048MB -VHDPath '{diff}' -SwitchName '{switch}' -Generation 2 | Out-Null
+Set-VMMemory -VMName '{name}' -DynamicMemoryEnabled $true -MinimumBytes 1024MB -MaximumBytes 8192MB
 Set-VMProcessor -VMName '{name}' -Count 2
 Set-VM -Name '{name}' -AutomaticStopAction TurnOff -AutomaticStartAction Nothing
 Set-VMFirmware -VMName '{name}' -SecureBootTemplate MicrosoftUEFICertificateAuthority

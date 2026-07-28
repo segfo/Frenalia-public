@@ -50,8 +50,8 @@ pub fn ephemeral_share_name(workspace_id: &str) -> String {
 /// canonicalizeしているため、実運用上は二重canonicalizeになる（副作用はなく、単なる
 /// 冪等な再計算）。
 pub fn compute_workspace_id(workspace_root: &Path) -> String {
-    let canonical = std::fs::canonicalize(workspace_root)
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     short_id(&canonical.to_string_lossy())
 }
 
@@ -71,8 +71,7 @@ fn short_id(key: &str) -> String {
 /// セッション使い捨てのSMBアカウントパスワードを生成する（OSのCSPRNG経由、
 /// `unique_session_id`のPID+タイムスタンプとは異なり実際に秘密として使うため）。
 fn generate_password() -> String {
-    const CHARSET: &[u8] =
-        b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#%^&*-_=+";
+    const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#%^&*-_=+";
     let mut rng = rand::rng();
     (0..32)
         .map(|_| {
@@ -178,7 +177,10 @@ New-SmbShare -Name '{share}' -Path '{path}' -FullAccess '{computer}\{user}' -Cac
 /// **B-4**: `New-LocalUser`は同名アカウントが既に存在すると失敗する。`workspace_id`の
 /// `short_id`（FNV-1a 32bit）衝突は稀だが、衝突時にセッション開始自体が失敗するのは
 /// 避けたいため、失敗時は別suffixを付けて最大4回までリトライする。
-pub fn create_ephemeral_share(workspace_id: &str, workspace_root: &Path) -> Result<(String, String, String, String), VmError> {
+pub fn create_ephemeral_share(
+    workspace_id: &str,
+    workspace_root: &Path,
+) -> Result<(String, String, String, String), VmError> {
     let password = generate_password();
     let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".to_string());
 
@@ -204,7 +206,9 @@ pub fn create_ephemeral_share(workspace_id: &str, workspace_root: &Path) -> Resu
                         windows::core::PCWSTR(sid_w.as_ptr()),
                         &mut psid,
                     )
-                    .map_err(|e| VmError::PowerShell(format!("failed to parse SID '{sid_string}': {e}")))?;
+                    .map_err(|e| {
+                        VmError::PowerShell(format!("failed to parse SID '{sid_string}': {e}"))
+                    })?;
                     psid
                 };
                 if let Err(e) = grant_ace_inheritable_rw(workspace_root, sid_owned) {
@@ -407,7 +411,8 @@ mod tests {
     #[test]
     fn build_create_share_script_escapes_single_quote_in_workspace_root() {
         let path = Path::new(r"C:\work\it's a repo");
-        let script = build_create_share_script("hns3-aaaaaaaa", "harness-ws-aaaaaaaa", "pw", path, "HOST");
+        let script =
+            build_create_share_script("hns3-aaaaaaaa", "harness-ws-aaaaaaaa", "pw", path, "HOST");
         assert!(
             script.contains(r"-Path 'C:\work\it''s a repo'"),
             "expected the path to be escaped in the generated script, got: {script}"
@@ -425,7 +430,8 @@ mod tests {
     /// タブ区切り・空行・命名規則に合わない行を適切に無視することを検証する。
     #[test]
     fn parse_workspace_share_listing_extracts_share_user_and_path() {
-        let stdout = "harness-ws-62d45a6b\tC:\\work\\project\nharness-ws-abcd1234\tC:\\other\\repo\n";
+        let stdout =
+            "harness-ws-62d45a6b\tC:\\work\\project\nharness-ws-abcd1234\tC:\\other\\repo\n";
         let parsed = parse_workspace_share_listing(stdout);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].0, "harness-ws-62d45a6b");
@@ -503,17 +509,19 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
             let _ = run_ps(&format!("net use '{unc}' /delete /y"));
 
             if !read_ok {
-                return Err("expected to be able to read preexisting.txt over SMB after grant".to_string());
+                return Err(
+                    "expected to be able to read preexisting.txt over SMB after grant".to_string(),
+                );
             }
             if !write_ok {
-                return Err("expected to be able to write a new file over SMB after grant".to_string());
+                return Err(
+                    "expected to be able to write a new file over SMB after grant".to_string(),
+                );
             }
 
             // (2) NTFS ACE取り消しだけを単独実行する（共有・アカウントはまだ生かしたまま）。
-            let sid_string = run_ps_capture(&format!(
-                "(Get-LocalUser -Name '{user}').SID.Value"
-            ))
-            .map_err(|e| format!("failed to look up SID before revoke: {e}"))?;
+            let sid_string = run_ps_capture(&format!("(Get-LocalUser -Name '{user}').SID.Value"))
+                .map_err(|e| format!("failed to look up SID before revoke: {e}"))?;
             let sid_owned = unsafe {
                 let sid_w = crate::win_common::wide(&sid_string);
                 let mut psid = windows::Win32::Security::PSID::default();
@@ -617,11 +625,8 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
             .expect("repo root must resolve");
         println!("=== repo root under test: {} ===", repo_root.display());
 
-        let baseline_acl = run_ps_capture(&format!(
-            "icacls '{}'",
-            repo_root.display()
-        ))
-        .unwrap_or_else(|e| format!("<failed to capture baseline: {e}>"));
+        let baseline_acl = run_ps_capture(&format!("icacls '{}'", repo_root.display()))
+            .unwrap_or_else(|e| format!("<failed to capture baseline: {e}>"));
         println!("=== baseline ACL (before grant) ===\n{baseline_acl}");
 
         let unique = std::process::id();
@@ -649,7 +654,9 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
             ));
             let _ = run_ps(&format!("net use '{unc}' /delete /y"));
             if !read_ok {
-                return Err("expected to read CLAUDE.md over SMB after grant on real repo root".to_string());
+                return Err(
+                    "expected to read CLAUDE.md over SMB after grant on real repo root".to_string(),
+                );
             }
 
             let sid_string = run_ps_capture(&format!("(Get-LocalUser -Name '{user}').SID.Value"))
@@ -670,6 +677,21 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
                 .map_err(|e| format!("revoke_ace_recursive on real repo root failed: {e:?}"))?;
             let revoke_elapsed = t_revoke.elapsed();
             println!("=== real repo root (~57k files incl. target/) revoke_ace_recursive took {revoke_elapsed:?} ===");
+
+            let lingering_sid_check = format!(
+                r#"
+$ErrorActionPreference = 'Stop'
+$out = icacls '{}' /findsid '{}' /T /C 2>&1 | Out-String
+if ($out -match [regex]::Escape('{}')) {{
+    throw "SID still appears in ACL tree after revoke: $out"
+}}
+"#,
+                repo_root.display(),
+                sid_string,
+                sid_string,
+            );
+            run_ps(&lingering_sid_check)
+                .map_err(|e| format!("post-revoke ACL SID scan failed: {e}"))?;
 
             run_ps(&connect_script)
                 .map_err(|e| format!("net use (post-revoke reconnect) failed: {e}"))?;
