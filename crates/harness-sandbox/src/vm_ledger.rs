@@ -95,7 +95,7 @@ pub struct VmLedger {
     pub workspace_resources: Vec<WorkspaceResourceEntry>,
 }
 
-/// 台帳ファイルのパス（`%APPDATA%\harness\tier3-vm-ledger.json`、既存台帳群と同じ
+/// 台帳ファイルのパス（`%APPDATA%\harness\config\tier3-vm-ledger.json`、既存台帳群と同じ
 /// `ProjectDirs::config_dir()`配下）。
 fn ledger_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "harness")

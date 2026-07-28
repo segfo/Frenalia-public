@@ -35,10 +35,17 @@
 //!
 //! **依然として未実装のまま残っている範囲**（`plans/TIER1A-OPEN-ISSUES.md`項目9でフォロー
 //! アップする）:
-//! - ワークスペース共有はセッション境界でのcopy-in/copy-outのみ（`WorkspaceShareMode::Cifs`が
-//!   既定だがCopyInOutも残っている。D-22のライブマウント自体はCifsモードで実現済み）。
 //! - VM refcountが0になった際のアイドル猶予つきwarm維持は未実装（今回は即時停止のみ、
 //!   Phase C以降）。
+//! - SNI監査ログ（`SNI_AUDIT_LOG_PATH`）がまだVM単位のシングルトンで、複数セッション同時稼働時に
+//!   通信記録が混在・重複する（S-7、未解消）。
+//! - nginx設定の反映が`nginx -s reload`ではなくプロセス再起動のため、他セッションのTLS接続が
+//!   瞬断し得る（未解消）。
+//!
+//! ワークスペース共有は`WorkspaceShareMode::Cifs`（SMBライブ共有、Incus disk deviceでのbind-mount）
+//! が既定であり、D-22のライブマウントはこの経路で実現済み。`HARNESS_TIER3_CIFS_WORKSPACE=0`で
+//! 選べる`WorkspaceShareMode::CopyInOut`（セッション境界でのcopy-in/copy-out）は非既定の
+//! フォールバック経路として残っている。
 //!
 //! 固定の運用規約（`plans/vm-spike/RESULTS.md`§3.6/§3.7で確立、実機E2E確認済み）:
 //! - ゴールデン親VHDX: `C:\ProgramData\harness\golden-images\almalinux-golden.vhdx`
@@ -186,7 +193,7 @@ fn unique_session_id() -> String {
     )
 }
 
-/// クライアント証明書のホスト側保存先（`%APPDATA%\harness\tier3-incus-client\`）。
+/// クライアント証明書のホスト側保存先（`%APPDATA%\harness\config\tier3-incus-client\`）。
 fn client_cert_dir() -> Result<PathBuf, VmError> {
     directories::ProjectDirs::from("", "", "harness")
         .map(|d| d.config_dir().join("tier3-incus-client"))
@@ -1033,6 +1040,9 @@ pub(crate) const INCUS_BRIDGE_IP: &str = "10.76.180.1";
 pub(crate) const SNI_PROXY_PORT_BASE: u16 = 8444;
 const SNI_PROXY_CONF_PATH: &str = "/root/harness-sni-proxy.conf";
 const SNI_PROXY_PID_PATH: &str = "/run/harness-sni-proxy.pid";
+/// **既知の限界（S-7、未解消）**: このパスはVM単位のシングルトンで、`slot`によるセッション分離を
+/// していない。複数セッションが同時に稼働すると全セッションの通信記録が1ファイルに混在し、
+/// 先にteardownしたセッションの記録が後からteardownするセッションの監査ログにも重複して現れる。
 const SNI_AUDIT_LOG_PATH: &str = "/var/log/nginx/harness-sni-audit.log";
 const NFTABLES_TABLE: &str = "harness_tier3";
 

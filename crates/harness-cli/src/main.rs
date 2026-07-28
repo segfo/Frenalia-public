@@ -705,7 +705,7 @@ struct TraverseLedger {
     entries: Vec<TraverseLedgerEntry>,
 }
 
-/// 台帳ファイルのパス（`%APPDATA%\harness\fs-passthrough-ledger.json`相当、`harness-config`の
+/// 台帳ファイルのパス（`%APPDATA%\harness\config\fs-passthrough-ledger.json`相当、`harness-config`の
 /// `user_settings_path`と同じ土台）。横断的な穴を1台帳に集約し、どのプロジェクトからでも
 /// 全撤収できるようにする（D5）。
 fn fs_ledger_path() -> Option<PathBuf> {

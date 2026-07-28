@@ -1233,9 +1233,10 @@ impl harness_core::VmShellExecutor for VmSandboxHandle {
 /// [`user_only_security_attributes`]のdoc参照）。
 ///
 /// `StartSession`→`Exec`(N回)→`Teardown`の1セッションを処理したら、パイプを切断してから
-/// 次の接続を待ち続ける（＝daemonプロセス自体は`Teardown`後も終了しない。複数セッションを
-/// 同時ではなく順番に処理する最小構成——並行処理・セッション数上限は将来の拡張、
-/// `plans/DESIGN-SANDBOX-VMISOLATION.md`「実装確定サマリー」項目6参照）。
+/// 次の接続を待ち続ける（＝daemonプロセス自体は`Teardown`後も終了しない）。**Phase Bで
+/// thread-per-session化済み**: `serve_resident`は各接続を`std::thread::spawn`で並行処理し、
+/// `SessionRegistry`が同時セッション数上限（既定4・`--max-sessions`）を管理する
+/// （`plans/DESIGN-SANDBOX-VMISOLATION.md`「実装確定サマリー」項目6・8参照）。
 /// `HANDLE`（`windows`クレート、実体はポインタサイズの不透明値）を`std::thread::spawn`の
 /// クロージャへ移すためのラッパー。`PreparedPipe`と同じ理由で`unsafe impl Send`を明示する
 /// （named pipeハンドルはスレッド間で受け渡して使う分には安全、Win32 API自体の契約）。

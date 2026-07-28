@@ -706,7 +706,7 @@ unsafe fn launch_helper_elevated(
     Ok(info.hProcess)
 }
 
-/// ヘルパー側のファイルログ（`%APPDATA%\harness\privhelper.log`、台帳と同じ`config_dir`）。
+/// ヘルパー側のファイルログ（`%APPDATA%\harness\config\privhelper.log`、台帳と同じ`config_dir`）。
 /// ヘルパーは`runas`+`SW_HIDE`（[`launch_helper_elevated`]参照）で起動されるため
 /// `eprintln!`の出力先が無く、UAC/IPCが無応答になった際に「どのノードで何秒かかって
 /// いたか」を事後に一切確認できない（前回セッションでUAC不表示/`ERROR_BROKEN_PIPE`が
