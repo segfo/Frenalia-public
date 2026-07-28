@@ -70,7 +70,7 @@ async fn json_output_has_stable_schema_and_allowed_tool_call() {
         tool_use_turn("call_1", "read_file", serde_json::json!({ "path": "a.txt" })),
         end_turn("the file says hello"),
     ]);
-    let mut state = ConversationState::new();
+    let mut state = ConversationState::new(Vec::new());
     state.push_user_text("read a.txt");
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
@@ -122,7 +122,7 @@ async fn json_output_records_denied_tool_call() {
         tool_use_turn("call_1", "run_shell", serde_json::json!({ "command": "echo hi" })),
         end_turn("done"),
     ]);
-    let mut state = ConversationState::new();
+    let mut state = ConversationState::new(Vec::new());
     state.push_user_text("run a shell command");
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
@@ -156,7 +156,7 @@ async fn json_output_records_denied_tool_call() {
 #[tokio::test]
 async fn jsonl_output_emits_one_agent_event_per_line() {
     let provider = MockProvider::new(vec![end_turn("hi there")]);
-    let mut state = ConversationState::new();
+    let mut state = ConversationState::new(Vec::new());
     state.push_user_text("say hi");
     let tools = ToolRegistry::with_builtin_tools();
     let dir = tempfile::tempdir().unwrap();
@@ -204,7 +204,7 @@ async fn json_output_surfaces_provider_error_with_nonzero_exit() {
         "read_file",
         serde_json::json!({ "path": "missing.txt" }),
     )]);
-    let mut state = ConversationState::new();
+    let mut state = ConversationState::new(Vec::new());
     state.push_user_text("read missing.txt");
     let tools = ToolRegistry::with_builtin_tools();
     let dir = tempfile::tempdir().unwrap();

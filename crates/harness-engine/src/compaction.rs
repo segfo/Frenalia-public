@@ -151,7 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn compacts_old_turns_and_keeps_recent_verbatim() {
-        let mut state = ConversationState::new();
+        let mut state = ConversationState::new(Vec::new());
         state.messages.push(user_turn("turn1"));
         state.messages.push(assistant_text("reply1"));
         state.messages.push(user_turn("turn2"));
@@ -176,7 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_op_when_not_enough_turns_to_compact() {
-        let mut state = ConversationState::new();
+        let mut state = ConversationState::new(Vec::new());
         state.messages.push(user_turn("turn1"));
         state.messages.push(assistant_text("reply1"));
 

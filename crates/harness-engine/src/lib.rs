@@ -111,15 +111,26 @@ async fn stream_with_retry(
 }
 
 /// 会話のIR履歴。
-#[derive(Debug, Clone, Default)]
+///
+/// `system`は`ConversationState::new`で必ず渡す（`Default`は導出しない）。かつては
+/// 引数無しの`ConversationState::new()`が空`system`を暗黙に作れてしまい、`harness-cli`/
+/// `harness-tui`のどこからも実際にsystemを埋めていなかった（`run_shell`不安定性調査で
+/// 発覚。モデルがOS・シェル種別・workspace root・シェル隔離Tierの制約を一切知らされて
+/// いなかった）。`new`にシグネチャ変更したのは、今後この抜けを黙って再発させないため
+/// （`harness_core::prompt`のゲート1/2と同じ「フィールド追加/呼び出し追加を強制コンパイル
+/// エラーで検出する」設計方針）。
+#[derive(Debug, Clone)]
 pub struct ConversationState {
     pub system: Vec<SystemBlock>,
     pub messages: Vec<Message>,
 }
 
 impl ConversationState {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(system: Vec<SystemBlock>) -> Self {
+        Self {
+            system,
+            messages: Vec::new(),
+        }
     }
 
     pub fn push_user_text(&mut self, text: impl Into<String>) {
@@ -128,6 +139,17 @@ impl ConversationState {
             content: vec![ContentBlock::Text(text.into())],
         });
     }
+}
+
+/// `ToolCtx`が運ぶ環境事実（`harness_core::EnvironmentFacts`）から`SystemBlock`列を組み立てる。
+/// `ConversationState::new`へ渡すsystemの、`harness-cli`/`harness-tui`共通の唯一の組み立て元
+/// （個々のフロントエンドが独自にプロンプト文字列を書かないようにするため）。
+pub fn system_blocks_for(ctx: &ToolCtx) -> Vec<SystemBlock> {
+    let facts = harness_core::EnvironmentFacts::from_tool_ctx(ctx);
+    vec![SystemBlock {
+        text: harness_core::render_environment_prompt(&facts),
+        cache: true,
+    }]
 }
 
 /// 1ターン分の結果。テキスト・停止理由・使用トークン量を蓄積したもの。
@@ -218,8 +240,17 @@ struct BlockAccum {
     tool_input_raw: String,
 }
 
+/// 引数JSONの連結・パースに失敗した`tool_use`（Phase5-B）。ターン全体を落とさず、
+/// `content`へは空入力の`ToolUse`を積んだ上でこの理由を控え、実行はスキップして
+/// `is_error`な`tool_result`を合成する（`run_agent_loop`「unknown tool」と同じ扱い）。
+struct MalformedToolInput {
+    id: String,
+    name: String,
+    raw: String,
+}
+
 impl BlockAccum {
-    fn into_content_block(self) -> Result<ContentBlock, ProviderError> {
+    fn into_content_block(self) -> Result<ContentBlock, MalformedToolInput> {
         match self.kind {
             BlockKind::Text => Ok(ContentBlock::Text(self.text)),
             BlockKind::Thinking => Ok(ContentBlock::Thinking {
@@ -234,15 +265,44 @@ impl BlockAccum {
                 let input = if self.tool_input_raw.trim().is_empty() {
                     serde_json::Value::Object(Default::default())
                 } else {
-                    serde_json::from_str(&self.tool_input_raw).map_err(|_| {
-                        ProviderError::InvalidRequest {
-                            msg: format!("malformed tool_use input for {name}"),
+                    match serde_json::from_str(&self.tool_input_raw) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return Err(MalformedToolInput {
+                                id,
+                                name,
+                                raw: self.tool_input_raw,
+                            })
                         }
-                    })?
+                    }
                 };
                 Ok(ContentBlock::ToolUse { id, name, input })
             }
         }
+    }
+}
+
+/// `HARNESS_WIRE_LOG=<path>`設定時のみ、ブロック組み立て結果（`tool_input_raw`の連結後文字列と
+/// パース成否）をJSONL追記する（`harness-providers::openai`の同名フックと対をなす、
+/// `run_shell`不安定性調査のPhase2観測基盤）。未設定時はゼロコスト。
+fn wire_log_block_assembly(kind: &str, id: &str, name: &str, raw: &str, ok: bool) {
+    let Some(path) = std::env::var_os("HARNESS_WIRE_LOG") else {
+        return;
+    };
+    use std::io::Write as _;
+    let value = serde_json::json!({
+        "kind": kind,
+        "tool_use_id": id,
+        "name": name,
+        "tool_input_raw": raw,
+        "parse_ok": ok,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::PathBuf::from(path))
+    {
+        let _ = writeln!(f, "{value}");
     }
 }
 
@@ -306,7 +366,14 @@ where
                 ToolChoice::Auto
             },
             output: None,
-            parallel_tool_calls: None,
+            // Phase5-D（run_shell不安定性調査）: 並列tool_callを明示的に抑止する。LMStudio実機
+            // 観測で、2件目以降の`arguments`断片チャンクが`index`を省略することがあり
+            // （`harness-providers::openai::WireToolCallDelta`のコメント参照）、複数tool_callが
+            // 同時に開いていると引数JSONの取り違えが起きる。`parallel_tool_calls:false`は
+            // プロバイダに1回のターンで最大1個のtool_callしか出させないための一次防御であり、
+            // 二次防御としてopenai.rs側も`index`省略時は「直近に開いたブロック」へ倒す
+            // （0固定より安全）。
+            parallel_tool_calls: Some(false),
             max_tokens: config.max_tokens,
             sampling: Sampling::default(),
             model: config.model.clone(),
@@ -420,9 +487,30 @@ where
             }
         }
 
+        // Phase5-B: 引数JSONパース失敗は`?`でターン全体を落とさない。空入力の`ToolUse`として
+        // contentへは積んだ上で、当該idを`malformed`へ控え、後段の実行ループでスキップして
+        // is_errorなtool_resultを合成する（tool_use/tool_result対応を崩さないため）。
         let mut content = Vec::with_capacity(blocks.len());
+        let mut malformed: std::collections::HashMap<String, MalformedToolInput> =
+            std::collections::HashMap::new();
         for b in blocks {
-            content.push(b.into_content_block()?);
+            match b.into_content_block() {
+                Ok(block) => {
+                    if let ContentBlock::ToolUse { id, name, .. } = &block {
+                        wire_log_block_assembly("tool_input_assembled", id, name, "", true);
+                    }
+                    content.push(block);
+                }
+                Err(m) => {
+                    wire_log_block_assembly("tool_input_assembled", &m.id, &m.name, &m.raw, false);
+                    content.push(ContentBlock::ToolUse {
+                        id: m.id.clone(),
+                        name: m.name.clone(),
+                        input: serde_json::Value::Object(Default::default()),
+                    });
+                    malformed.insert(m.id.clone(), m);
+                }
+            }
         }
 
         state.messages.push(Message {
@@ -430,7 +518,13 @@ where
             content: content.clone(),
         });
 
-        if stop_reason != StopReason::ToolUse {
+        // Phase5-C: `stop_reason`（プロバイダの`finish_reason`）ではなく、実際に`content`へ
+        // `ToolUse`ブロックが積まれたかどうかで分岐する。LMStudio実機観測で、tool_callが
+        // 積まれているのに`finish_reason:"stop"`が返る揺れがあったため（Phase1候補C）。
+        let has_tool_use = content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        if !has_tool_use {
             emit(
                 events,
                 AgentEvent::TurnCompleted {
@@ -480,7 +574,20 @@ where
                         input: input.clone(),
                     },
                 );
-                let output = match tools.get(name) {
+                let output = if let Some(m) = malformed.get(id) {
+                    // Phase5-B: 引数JSONが壊れていたtool_use。ツールは呼ばず、モデルへ
+                    // 差し戻して自己修正させる（`unknown tool`と同じ「エラーの説明を
+                    // tool_resultとして返す」パターン）。
+                    ToolOutput {
+                        content: format!(
+                            "malformed tool_use input for {name}: arguments did not parse as \
+                             JSON (raw: {})",
+                            truncate_head_tail(&m.raw, 500)
+                        ),
+                        is_error: true,
+                    }
+                } else {
+                    match tools.get(name) {
                     Some(tool) => {
                         let risk = tool.risk(input);
                         let decision = gate.resolve(name, risk, &arg_repr(input), input).await;
@@ -509,6 +616,7 @@ where
                         content: format!("unknown tool: {name}"),
                         is_error: true,
                     },
+                    }
                 };
                 let truncated_content = truncate_head_tail(&output.content, MAX_TOOL_OUTPUT_CHARS);
                 emit(
@@ -671,7 +779,7 @@ mod tests {
                 end_turn("done"),
             ]),
         };
-        let mut state = ConversationState::new();
+        let mut state = ConversationState::new(Vec::new());
         state.push_user_text("run a shell command");
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
         let ctx = ToolCtx::new(dir.path().to_path_buf());
@@ -715,7 +823,7 @@ mod tests {
                 end_turn("summarized"),
             ]),
         };
-        let mut state = ConversationState::new();
+        let mut state = ConversationState::new(Vec::new());
         state.push_user_text("read a.txt");
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
         let ctx = ToolCtx::new(dir.path().to_path_buf());
@@ -760,7 +868,7 @@ mod tests {
                 end_turn("done"),
             ]),
         };
-        let mut state = ConversationState::new();
+        let mut state = ConversationState::new(Vec::new());
         state.push_user_text("run an allowed shell command");
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
         let ctx = ToolCtx::new(dir.path().to_path_buf());
@@ -822,7 +930,7 @@ mod tests {
     async fn cancel_mid_stream_discards_partial_assistant() {
         let dir = tempfile::tempdir().unwrap();
         let provider = HangingProvider;
-        let mut state = ConversationState::new();
+        let mut state = ConversationState::new(Vec::new());
         state.push_user_text("hi");
         let messages_before = state.messages.len();
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
@@ -915,7 +1023,7 @@ mod tests {
                 end_turn("continued fine"),
             ]),
         };
-        let mut state = ConversationState::new();
+        let mut state = ConversationState::new(Vec::new());
         state.push_user_text("run two slow tools");
         let mut tools = harness_tools::ToolRegistry::new();
         tools.register(std::sync::Arc::new(SlowTool));

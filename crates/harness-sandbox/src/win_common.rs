@@ -98,6 +98,31 @@ pub(crate) fn read_to_string(handle: HANDLE) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// `HANDLE`は`windows`クレートで`Send`を実装しない（生ポインタ相当のため）。
+/// `read_two_pipes_to_strings`がスレッド間で1回だけ受け渡すための最小限のラッパ
+/// （`win_appcontainer::KillToken`と同じ「単純な数値ハンドルなので実際には安全」という判断）。
+struct SendHandle(HANDLE);
+unsafe impl Send for SendHandle {}
+
+/// stdout/stderrを2スレッドで並行に読み切る（Phase5-E、`run_shell`不安定性調査）。
+///
+/// 従来は`read_to_string(stdout)`→`read_to_string(stderr)`の逐次読みだった。子プロセスが
+/// stderrへパイプバッファ（既定64KB、匿名パイプの既定サイズ）を超えて書き込むと、読み手が
+/// 現れないstderr側のパイプが満杯になり子プロセスの書込みがブロックする。逐次読みは
+/// stdoutを読み切るまでstderrに手を付けないため、子はstdoutも吐けないままデッドロックし、
+/// `run_shell`のタイムアウトまで応答が返らない（Tier1a/Tier1bの`write_stdin_read_output_and_wait`
+/// が踏んでいた欠陥。ビルドログ等stderr出力の多いコマンドで再現する）。
+pub(crate) fn read_two_pipes_to_strings(stdout: HANDLE, stderr: HANDLE) -> (String, String) {
+    let stdout_handle = SendHandle(stdout);
+    let stdout_thread = std::thread::spawn(move || {
+        let h = stdout_handle;
+        read_to_string(h.0)
+    });
+    let err = read_to_string(stderr);
+    let out = stdout_thread.join().unwrap_or_default();
+    (out, err)
+}
+
 /// 指定したSDDL文字列のセキュリティ記述子を持つ匿名パイプを作る（両端とも継承可能で返る）。
 /// 呼び出し側が用途に応じて`clear_inherit`で片端を継承不可へ戻す（`win_restricted`の
 /// 低ILラベル付きパイプ・`win_appcontainer`のpackage SID付きパイプ、いずれもこの関数を土台にする）。

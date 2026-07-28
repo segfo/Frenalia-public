@@ -4,12 +4,14 @@
 pub mod config_injection;
 pub mod event;
 pub mod message;
+pub mod prompt;
 pub mod provider;
 pub mod tool;
 
 pub use config_injection::is_config_injection_path;
 pub use event::AgentEvent;
 pub use message::{ContentBlock, Message, Role};
+pub use prompt::{render as render_environment_prompt, EnvironmentFacts, OsKind};
 pub use provider::{
     BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities,
     ProviderError, Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,

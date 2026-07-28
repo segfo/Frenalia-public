@@ -11,6 +11,7 @@
 //! OpenAI Responses API（stateless variant、`encrypted_content`往復）はDESIGN.md §プロバイダ抽象が
 //! 明示的に「M6とは別の後続マイルストーンへ切り出す」と定めているため、本ファイルのスコープ外。
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_stream::try_stream;
@@ -26,6 +27,20 @@ use harness_core::{
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234/v1";
+
+/// `HARNESS_WIRE_LOG=<path>`が設定されているときだけ、送信リクエストボディと受信SSEチャンクを
+/// そのままJSONL追記する（`run_shell`不安定性調査、Phase 2観測基盤）。未設定時はゼロコスト
+/// （`std::env::var_os`1回のみ）。1行1JSONオブジェクト、`kind`フィールドで種別を区別する。
+fn wire_log_path() -> Option<PathBuf> {
+    std::env::var_os("HARNESS_WIRE_LOG").map(PathBuf::from)
+}
+
+fn wire_log_append(path: &std::path::Path, value: &serde_json::Value) {
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{value}");
+    }
+}
 
 pub struct OpenAiProvider {
     http: reqwest::Client,
@@ -66,6 +81,14 @@ impl LlmProvider for OpenAiProvider {
         let body = to_wire_request(&req);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
+        let wire_log = wire_log_path();
+        if let Some(path) = &wire_log {
+            wire_log_append(
+                path,
+                &serde_json::json!({ "kind": "request", "body": &body }),
+            );
+        }
+
         let mut request = self.http.post(url).json(&body);
         if !self.api_key.is_empty() {
             request = request.bearer_auth(&self.api_key);
@@ -84,6 +107,12 @@ impl LlmProvider for OpenAiProvider {
                 .and_then(|s| s.parse::<u64>().ok())
                 .map(Duration::from_secs);
             let text = resp.text().await.unwrap_or_default();
+            if let Some(path) = &wire_log {
+                wire_log_append(
+                    path,
+                    &serde_json::json!({ "kind": "error_response", "status": status.as_u16(), "body": &text }),
+                );
+            }
             return Err(map_error_response(status.as_u16(), &text, retry_after));
         }
 
@@ -96,6 +125,9 @@ impl LlmProvider for OpenAiProvider {
                 let ev = ev.map_err(|_| ProviderError::Transport { retriable: true })?;
                 if ev.data.is_empty() {
                     continue;
+                }
+                if let Some(path) = &wire_log {
+                    wire_log_append(path, &serde_json::json!({ "kind": "sse_chunk", "data": &ev.data }));
                 }
                 if ev.data == "[DONE]" {
                     break;
@@ -370,11 +402,15 @@ struct WireChunkDelta {
 
 /// `index`はOpenAI本家では常に付与されるが、LMStudioの実応答では継続チャンク
 /// （2個目以降の`arguments`断片）で省略されることがある（§実装マイルストーン M6【E10】）。
-/// `#[serde(default)]`で0へフォールバックする（単一tool_call前提のLMStudio運用ではこれで実害がない）。
+/// **`0`へフォールバックしない**（Phase5-D、`run_shell`不安定性調査）: 複数tool_callが
+/// 同時に開いている状態で`index`省略チャンクを常に先頭ブロック（index 0）へ結合すると、
+/// 2件目以降のtool_callの引数JSONが1件目へ混入し確実に壊れる。`Option<usize>`のまま保持し、
+/// 呼び出し側（`StreamAccumState::handle_chunk`）で「直近に開いたブロックへ倒す」フォールバックを
+/// 行う（当時1件のtool_callしか無い運用ではこれで従来と同じ挙動になる）。
 #[derive(Deserialize, Default)]
 struct WireToolCallDelta {
     #[serde(default)]
-    index: usize,
+    index: Option<usize>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -461,7 +497,14 @@ impl StreamAccumState {
 
             if let Some(tool_calls) = choice.delta.tool_calls {
                 for tc in tool_calls {
-                    let local_index = tc.index + 1;
+                    // Phase5-D: `index`が省略された継続チャンクは、先頭固定（旧: 0）ではなく
+                    // 「直近に開いたtool_useブロック」へ倒す（`WireToolCallDelta`のdocコメント
+                    // 参照）。単一tool_call運用では従来と同じ挙動、複数tool_call運用でも
+                    // 最後に開いたブロックへ結合されるため誤結合のリスクを最小化できる。
+                    let local_index = match tc.index {
+                        Some(idx) => idx + 1,
+                        None => self.tool_open.last().copied().unwrap_or(1),
+                    };
                     if !self.tool_open.contains(&local_index) {
                         let id = tc.id.clone().unwrap_or_default();
                         let name = tc
@@ -682,6 +725,61 @@ mod tests {
                 usage: Usage::default(),
             })
         );
+    }
+
+    /// Phase5-D回帰テスト: 2件の並列tool_callが開いている状態で、2件目の継続チャンクが
+    /// `index`を省略した場合に「直近に開いたブロック（2件目）」へ結合されること
+    /// （0固定にすると2件目の引数が1件目のブロックへ混入し、両方のJSONが壊れる）。
+    #[test]
+    fn missing_index_on_second_of_two_concurrent_tool_calls_attaches_to_last_opened() {
+        let mut st = StreamAccumState::new();
+        let mut events = Vec::new();
+
+        // 1件目・2件目とも最初のチャンクは明示indexありでオープンする。
+        let chunk1: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}
+            ]},"finish_reason":null}],"usage":null}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk1));
+
+        let chunk2: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":1,"id":"call_2","type":"function","function":{"name":"read_file","arguments":""}}
+            ]},"finish_reason":null}],"usage":null}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk2));
+
+        // 2件目の継続チャンクが`index`を省略。最後に開いたのは2件目（local_index=2）なので
+        // そちらへ結合されるべきで、1件目（local_index=1）へ混入してはならない。
+        let chunk3: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"function":{"arguments":"{\"path\":\"b.txt\"}"}}
+            ]},"finish_reason":"tool_calls"}],"usage":null}"#,
+        )
+        .unwrap();
+        events.extend(st.handle_chunk(chunk3));
+        events.extend(st.finish());
+
+        let call1_fragments: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolInputDelta { index: 1, json_fragment } => Some(json_fragment.as_str()),
+                _ => None,
+            })
+            .collect();
+        let call2_fragments: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolInputDelta { index: 2, json_fragment } => Some(json_fragment.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(call1_fragments, r#"{"path":"a.txt"}"#);
+        assert_eq!(call2_fragments, r#"{"path":"b.txt"}"#);
     }
 
     #[test]

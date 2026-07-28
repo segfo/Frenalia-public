@@ -69,7 +69,7 @@ use windows::Win32::System::Threading::{
 use crate::shell_tier::FsPassthrough;
 use crate::win_common::{
     build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, long_path_wide,
-    read_to_string, wide, write_all,
+    read_two_pipes_to_strings, wide, write_all,
 };
 
 /// harness専用のAppContainer名。`%LOCALAPPDATA%\Packages\<container-folder>`と
@@ -649,8 +649,7 @@ impl AppContainerChild {
             }
         }
 
-        let out = read_to_string(self.stdout_read);
-        let err = read_to_string(self.stderr_read);
+        let (out, err) = read_two_pipes_to_strings(self.stdout_read, self.stderr_read);
 
         unsafe {
             WaitForSingleObject(self.process, INFINITE);

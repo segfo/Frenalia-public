@@ -61,7 +61,7 @@ async fn read_file_tool_loop_produces_expected_transcript() {
         end_turn("The file says: hello world"),
     ]);
 
-    let mut state = ConversationState::new();
+    let mut state = ConversationState::new(Vec::new());
     state.push_user_text("read greeting.txt and tell me what it says");
 
     let tools = ToolRegistry::with_builtin_tools();

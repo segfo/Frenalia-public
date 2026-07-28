@@ -119,6 +119,14 @@ enum Commands {
         #[command(subcommand)]
         action: Tier3Action,
     },
+    /// 現在のフラグ・`.harness/settings.json`構成から実際に組み立てられるシステムプロンプト
+    /// （`harness_core::EnvironmentFacts`のレンダリング結果）をそのまま標準出力へ出して終了する。
+    /// 「今モデルは何を知らされているのか」を確認するための読み取り専用診断コマンド
+    /// （`run_shell`不安定性調査、Phase4-4）。プロンプトは送らない。
+    ///
+    /// シェル隔離Tierの選択は通常起動と同じ実プローブを伴う（AppContainerプロファイル作成等の
+    /// 副作用がある）。`--fs-allow`/`--force-system-acl`はこのコマンドではサポートしない。
+    Prompt,
 }
 
 /// `harness tier3`サブコマンドの各操作。Windows専用機能のため、Windows以外では
@@ -541,6 +549,74 @@ struct ApplyReportJson {
     hard_denied: Vec<String>,
 }
 
+/// `harness prompt`: 現在のフラグ・`.harness/settings.json`構成から実際に組み立てられる
+/// システムプロンプト（`harness_core::EnvironmentFacts`のレンダリング結果）をそのまま
+/// 標準出力へ出す（Phase4-4、`run_shell`不安定性調査）。プロバイダ資格情報を一切必要としない
+/// （プロンプトは送らない、`run_sandbox_subcommand`と同じ非対話原則）。
+///
+/// シェル隔離Tierの選択（`select_tier`）は通常起動と同じ実プローブ（Windows AppContainer
+/// プロファイル作成等）を伴う点に注意する。これは意図的な設計判断: プローブを省略した
+/// 推測値ではなく「実際に送られる」プロンプトを見せるため。`--fs-allow`/`--force-system-acl`
+/// （fs passthrough allowlist）はUAC連鎖・台帳記録を伴う複雑な経路のため、この診断コマンドでは
+/// サポートしない（指定されていれば無視する旨を1行警告する）。
+fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
+    let settings = harness_config::Settings::load(workspace_root);
+
+    let (explicit, staging_mode) =
+        resolve_staging_mode(cli.live, cli.staged, cli.workspace_commit, cli.print.is_some());
+    let read_scope = settings.read.clone().unwrap_or_default().to_read_scope_config();
+
+    let mut net_proxy = settings.net.clone().unwrap_or_default().to_net_proxy_config();
+    for domain in &cli.net_allow_domain {
+        if !net_proxy.allow_domains.contains(domain) {
+            net_proxy.allow_domains.push(domain.clone());
+        }
+    }
+    let mut net_app = settings.net.clone().unwrap_or_default().to_net_app_policy();
+    for app in &cli.net_allow_app {
+        if !net_app.allow_apps.contains(app) {
+            net_app.allow_apps.push(app.clone());
+        }
+    }
+
+    if !cli.fs_allow.is_empty() || cli.force_system_acl {
+        eprintln!(
+            "note: --fs-allow/--force-system-acl are ignored by `harness prompt` (fs passthrough \
+             is not probed by this diagnostic command); the printed prompt reflects read-scope/\
+             net settings only."
+        );
+    }
+
+    let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
+    let opt_in_tier3 = cli.sandbox || cli.experimental_tier3;
+    let shell_tier =
+        match select_tier(require_sandbox, workspace_root, opt_in_tier3, &[], None) {
+            Ok(sel) => sel,
+            Err(e) => {
+                eprintln!("error: shell tier selection failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    let ctx = ToolCtx {
+        workspace_root: workspace_root.to_path_buf(),
+        staging: StagingConfig {
+            mode: staging_mode,
+            explicit,
+            sandbox_dir: None,
+        },
+        read_scope,
+        shell_tier,
+        net_proxy,
+        net_app,
+        vm_sandbox: None,
+    };
+    for block in harness_engine::system_blocks_for(&ctx) {
+        println!("{}", block.text);
+    }
+    ExitCode::SUCCESS
+}
+
 /// `apply`/`changes`/`discard`サブコマンドを処理する。プロバイダ資格情報を一切必要としない
 /// （§非対話モード、プロンプトは一切送らない）。
 fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
@@ -548,12 +624,15 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
         Commands::Changes { session, output_format } => (session.clone(), Some(*output_format)),
         Commands::Apply { session, output_format, .. } => (session.clone(), Some(*output_format)),
         Commands::Discard { session } => (session.clone(), None),
-        // `Fs`/`Tier3`はmain()側でそれぞれ専用の振り分け先へ処理済みで、ここには到達しない
-        // （workspace sandboxのstaging設定を一切必要としないため、`SandboxFs`を開く
+        // `Fs`/`Tier3`/`Prompt`はmain()側でそれぞれ専用の振り分け先へ処理済みで、ここには
+        // 到達しない（workspace sandboxのstaging設定を一切必要としないため、`SandboxFs`を開く
         // このパスとは責務が別）。
         Commands::Fs { .. } => unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand"),
         Commands::Tier3 { .. } => {
             unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Prompt => {
+            unreachable!("Commands::Prompt is dispatched before run_sandbox_subcommand")
         }
     };
 
@@ -670,6 +749,9 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
         Commands::Fs { .. } => unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand"),
         Commands::Tier3 { .. } => {
             unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Prompt => {
+            unreachable!("Commands::Prompt is dispatched before run_sandbox_subcommand")
         }
     }
 }
@@ -1452,7 +1534,7 @@ async fn main() -> ExitCode {
     // 上書きしない、§設定とシークレット「ユーザ/プロジェクト設定」相当の簡易版）。無ければ無視する。
     let _ = dotenvy::dotenv();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     let workspace_root = match cli.cwd.clone() {
         Some(dir) => dir,
@@ -1467,10 +1549,14 @@ async fn main() -> ExitCode {
 
     // `apply`/`changes`/`discard`サブコマンドはプロバイダ資格情報を一切必要としないため、
     // 他のあらゆる検証より前に処理して即終了する（§非対話モード、プロンプトは一切送らない）。
-    if let Some(cmd) = cli.command {
+    // `.take()`（`mem::replace`でNoneに戻す）を使うのは、`Commands::Prompt`分岐で`&cli`を
+    // 丸ごと借用したいため。単純な`cli.command`のムーブだと`cli.command`フィールドだけが
+    // 部分ムーブされ、以降`&cli`が取れなくなる。
+    if let Some(cmd) = cli.command.take() {
         return match cmd {
             Commands::Fs { action } => run_fs_subcommand(action),
             Commands::Tier3 { action } => run_tier3_subcommand(action),
+            Commands::Prompt => run_prompt_subcommand(&cli, &workspace_root),
             other => run_sandbox_subcommand(other, &workspace_root),
         };
     }
@@ -1595,14 +1681,17 @@ async fn main() -> ExitCode {
         }
     }
 
-    let mut state = ConversationState::new();
-    match session.load_messages() {
-        Ok(msgs) => state.messages = msgs,
+    // `ConversationState`自体は`tool_ctx`確定後（下記）に組み立てる。systemは`tool_ctx`が運ぶ
+    // 環境事実（`harness_engine::system_blocks_for`）から作るため、先に`tool_ctx`が要る
+    // （`run_shell`不安定性調査で見つかった「systemが一切送られていない」欠陥への対処、
+    // `plans/DESIGN.md` §システムプロンプト参照）。
+    let session_messages = match session.load_messages() {
+        Ok(msgs) => msgs,
         Err(e) => {
             eprintln!("failed to load session {}: {e}", session.path().display());
             return ExitCode::FAILURE;
         }
-    }
+    };
 
     // 書込ステージング設定（M10）。`sandbox_dir`は`session.id()`確定後でなければ組めないため
     // ここで`ToolCtx`を構築する。明示`--live`時はオーバーレイ自体を使わない
@@ -1956,6 +2045,9 @@ async fn main() -> ExitCode {
         net_app,
         vm_sandbox,
     };
+
+    let mut state = ConversationState::new(harness_engine::system_blocks_for(&tool_ctx));
+    state.messages = session_messages;
 
     let exit_code = match cli.print {
         Some(print) => {

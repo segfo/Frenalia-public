@@ -165,7 +165,7 @@ pub fn spawn_engine(
                             }
                         }
                         EngineCommand::Clear => {
-                            state = ConversationState::new();
+                            state = ConversationState::new(harness_engine::system_blocks_for(&ctx));
                             if let Ok(fresh) = SessionStore::create_new(&sessions_dir) {
                                 session = fresh;
                             }
@@ -193,7 +193,8 @@ pub fn spawn_engine(
                         EngineCommand::SwitchSession { session: new_session, messages } => {
                             let new_id = new_session.id();
                             let message_count = messages.len();
-                            state = ConversationState { messages, ..ConversationState::new() };
+                            state = ConversationState::new(harness_engine::system_blocks_for(&ctx));
+                            state.messages = messages;
                             session = new_session;
                             let _ = events_tx.send(AgentEvent::SessionSwitched {
                                 source_id: None,

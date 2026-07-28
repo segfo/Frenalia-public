@@ -42,8 +42,8 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::win_common::{
-    build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, read_to_string,
-    wide, write_all,
+    build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl,
+    read_two_pipes_to_strings, wide, write_all,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -161,8 +161,7 @@ impl RestrictedChild {
             }
         }
 
-        let out = read_to_string(self.stdout_read);
-        let err = read_to_string(self.stderr_read);
+        let (out, err) = read_two_pipes_to_strings(self.stdout_read, self.stderr_read);
 
         unsafe {
             WaitForSingleObject(self.process, INFINITE);

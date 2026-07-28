@@ -439,7 +439,7 @@ async fn run_windows_tier1a(
     )
     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child.kill_token();
-    let command_owned = command.to_string();
+    let command_owned = with_utf8_output_encoding_preamble(command);
 
     let handle = tokio::task::spawn_blocking(move || {
         child.write_stdin_read_output_and_wait(Some(&command_owned))
@@ -482,7 +482,7 @@ async fn run_windows_tier1b(
     let child = harness_sandbox::win_restricted::spawn(bin, &args, &cwd_owned, &env_owned, true)
         .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child.kill_token();
-    let command_owned = command.to_string();
+    let command_owned = with_utf8_output_encoding_preamble(command);
 
     let handle = tokio::task::spawn_blocking(move || {
         child.write_stdin_read_output_and_wait(Some(&command_owned))
@@ -567,15 +567,21 @@ async fn run_with_pipes(
     let mut stderr = child.stderr.take().expect("stderr is piped");
 
     let run = async {
+        // Phase5-F（`run_shell`不安定性調査）: `AsyncReadExt::read_to_string`は非UTF-8
+        // バイト列に遭遇すると`Err`を返し、`let _ =`で握り潰していたため出力が無言で空文字列
+        // （exit code 0・出力なし）になっていた。CP932（Shift-JIS）等、UTF-8でない既定コード
+        // ページのコンソール出力（日本語ファイル名を含む`dir`等）で確実に踏む。生バイトを
+        // 読み切ってから`from_utf8_lossy`する（Tier1a/1bの`win_common::read_to_string`と同じ
+        // 方針）。
         let stdout_fut = async {
-            let mut s = String::new();
-            let _ = stdout.read_to_string(&mut s).await;
-            s
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).into_owned()
         };
         let stderr_fut = async {
-            let mut s = String::new();
-            let _ = stderr.read_to_string(&mut s).await;
-            s
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).into_owned()
         };
         let (out, err) = tokio::join!(stdout_fut, stderr_fut);
         let status = child
@@ -628,9 +634,38 @@ fn platform_shell_command(command: &str) -> ShellInvocation {
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", "-"]);
     ShellInvocation {
         cmd,
-        stdin_payload: Some(command.to_string()),
+        stdin_payload: Some(with_utf8_output_encoding_preamble(command)),
         shell_label,
     }
+}
+
+/// Windows PowerShell（pwsh/5.1いずれも）は既定の出力エンコーディングがシステムのANSI
+/// コードページ（日本語Windowsなら通常CP932/Shift-JIS）であり、われわれの実装は
+/// 子プロセス出力を常に`from_utf8_lossy`で読む（`win_common::read_to_string`・Tier0の
+/// `run_with_pipes`）。この不一致により、日本語等の非ASCII出力を含むコマンド（例:
+/// 日本語ファイル名の`dir`）が文字化けする（Phase5-G、`run_shell`不安定性調査）。
+///
+/// また、`-Command -`（stdin経由）実行の終了コードはPowerShellプロセス自身の終了コードで
+/// あり、スクリプトが明示的に`exit`しない限り**最後の文（statement）の成否からブール化
+/// （0/1）されるだけ**で、ネイティブコマンドの実際の終了コード（例: `7`）は失われる
+/// （Phase5-H実測: `cmd /c exit 7`だけを実行すると`0`でも`7`でもなく`1`が返る）。
+/// スクリプト末尾へ`$LASTEXITCODE`/`$?`を明示的に`exit`する1行を追加し、最後の文の
+/// 終了コードを正確に伝播させる（bashの`sh -c`と同じ「最後のコマンドの終了状態」意味論。
+/// 途中の文の失敗を検知したい場合は、bashの`set -e`と同様モデル側が`$ErrorActionPreference
+/// = 'Stop'`等を明示する前提で、harness側では強制しない）。
+///
+/// stdin経由で渡すコマンド文字列の先頭に出力エンコーディング固定を、末尾に終了コード伝播を
+/// 付与する。Tier0（本関数）・Tier1a（`run_windows_tier1a`）・Tier1b（`run_windows_tier1b`）の
+/// 3経路全てがこの関数を通す（Tier横断で1箇所に集約し、個別に実装して食い違うことを防ぐ）。
+/// **判定用の`command`自体は変更しない**: `classify_net_app`等のallowlist判定は呼び出し元で
+/// 元の`command`に対して行い、この関数が返す文字列は実行直前のstdinペイロードとしてのみ使う。
+#[cfg(windows)]
+fn with_utf8_output_encoding_preamble(command: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+         $OutputEncoding = [System.Text.Encoding]::UTF8; {command}\n\
+         if ($LASTEXITCODE) {{ exit $LASTEXITCODE }} elseif (-not $?) {{ exit 1 }}"
+    )
 }
 
 #[cfg(test)]
@@ -767,6 +802,80 @@ mod tests {
         );
         assert!(out.content.contains("[tier: tier1b]"));
     }
+
+    /// Phase5-H回帰テスト: `cmd /c exit 7`単体（ネイティブコマンドの終了コード）が、
+    /// PowerShellプロセス自身の終了コードへ正しく伝播すること。修正前は`0`でも`7`でもなく
+    /// 常に`1`へブール化されていた（実機確認済み、モジュールdoc「Phase5-H実測」参照）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_propagates_native_exit_code_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = RunShellTool;
+        let out = tool
+            .call(
+                json!({ "command": "cmd /c exit 7" }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("[exit code: 7]"), "{}", out.content);
+    }
+
+    /// Phase5-H回帰テスト: 成功時（exit 0）が壊れないこと。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_native_success_exit_code_stays_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = RunShellTool;
+        let out = tool
+            .call(
+                json!({ "command": "cmd /c exit 0" }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("[exit code: 0]"), "{}", out.content);
+    }
+
+    /// Phase5-G回帰テスト: 日本語（非ASCII）を含む既存ファイルの内容を読み出す出力が文字化け
+    /// （U+FFFD等）せずそのまま返ること。修正前はコンソール既定コードページ（CP932想定）と
+    /// われわれの`from_utf8_lossy`読取りが食い違い、非ASCII出力が破壊されていた。
+    ///
+    /// **既知の残存限界**: この回帰テストはASCIIのみのコマンド文字列（`Get-Content`）が
+    /// 非ASCIIファイル内容を読み出すケースに限定している。モデルが日本語literalを
+    /// `run_shell`の`command`文字列自体に直接埋め込むケース（例:
+    /// `Write-Output 'こんにちは'`）は別の問題（`-Command -`のstdin経由スクリプト読取り側の
+    /// コードページ）で、実機確認では出力側の修正だけでは直らなかった（`docs/bugs/`参照）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_returns_japanese_file_content_without_mojibake() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("japanese.txt");
+        std::fs::write(&file_path, "こんにちは日本語テスト").unwrap();
+        let tool = RunShellTool;
+        let out = tool
+            .call(
+                json!({ "command": format!("Get-Content -Raw '{}'", file_path.display()) }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("こんにちは日本語テスト"), "{}", out.content);
+        assert!(!out.content.contains('\u{FFFD}'), "{}", out.content);
+    }
+
+    // **調査メモ（Phase5-G、`command`文字列自体への日本語literal直接埋め込み）**:
+    // `Write-Output 'こんにちは世界'`のようにモデルが日本語literalを`command`へ直接書く
+    // ケースは、実LMStudio E2E（`huihui-qwen3.6-35b-a3b-claude-4.7-opus-abliterated-mtp`、
+    // tier1b、`docs/bugs/BUG-030.md`参照）で正しく`こんにちは世界`が返ることを確認した。
+    // 一方、同じ入力を`cargo test`経由のユニットテストとして実行すると、`cargo run`で
+    // ビルドした`harness.exe`を直接起動した場合とは異なり毎回確実に文字化けする
+    // （`cargo test`のプロセス起動コンテキスト固有の再現しない挙動、原因未特定）。
+    // 実挙動（E2E）と食い違う不安定なユニットテストを残すよりはbugドキュメントへの記録に
+    // 留める方が誠実と判断し、ここには追加しない。
 
     #[tokio::test]
     async fn run_shell_times_out() {
