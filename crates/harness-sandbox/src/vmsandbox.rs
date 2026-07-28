@@ -1835,6 +1835,28 @@ impl VmSession {
             let (share, user) = match acquire_result {
                 Ok(pair) => pair,
                 Err(e) => {
+                    // [BUG-028] `add_disk_device`失敗時（下記）と対称: `acquire_or_repair_workspace_share`
+                    // 内部（`create_fresh_workspace_share`/`repair_workspace_share`）の失敗が
+                    // `record_workspace_resource`後（台帳に記録済み）で起きた場合、ここで
+                    // 巻き戻さないと台帳エントリと実体（共有・アカウント・NTFS ACE）の両方が孤児化する。
+                    // `record_workspace_resource`前（例: `create_ephemeral_share`自体の失敗）の場合は
+                    // `release_workspace_resource`が`None`を返すため何もしない
+                    // （そちらは`create_ephemeral_share`自身がbest-effortで後始末済み）。
+                    if let Some(removed) = crate::vm_ledger::release_workspace_resource(&workspace_id) {
+                        let _ = ssh_exec(
+                            config.guest_ip,
+                            &host_ssh_key,
+                            &format!(
+                                "umount -l {mount_point} 2>/dev/null; rm -f /etc/harness-smb-{workspace_id}.cred"
+                            ),
+                            Duration::from_secs(15),
+                        );
+                        crate::smb_share::destroy_ephemeral_share(
+                            &removed.smb_share_name,
+                            &removed.smb_user,
+                            Some(Path::new(&removed.workspace_root)),
+                        );
+                    }
                     drop(workspace_lock);
                     return Err(e);
                 }

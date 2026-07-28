@@ -24,6 +24,22 @@ pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// パスをそのまま`wide`へ渡すと、Win32 ACL API（`GetNamedSecurityInfoW`/`SetNamedSecurityInfoW`
+/// 等）は`MAX_PATH`（260文字）を超えるパスを`ERROR_INVALID_NAME`（0x8007007B）で拒否する
+/// （BUG-028）。`\\?\`ロングパス接頭辞（既に付いている場合・UNCパスの場合は付け直さない）を
+/// 付与し、この制約を回避する。ACLを扱う全経路（`win_appcontainer.rs`のgrant/revoke系）は
+/// パスの文字列化に必ずこれを使うこと（生の`wide(&path.to_string_lossy())`を直接呼ばない）。
+pub(crate) fn long_path_wide(path: &std::path::Path) -> Vec<u16> {
+    let s = path.to_string_lossy();
+    if s.starts_with(r"\\?\") {
+        return wide(&s);
+    }
+    if let Some(unc) = s.strip_prefix(r"\\") {
+        return wide(&format!(r"\\?\UNC\{unc}"));
+    }
+    wide(&format!(r"\\?\{s}"))
+}
+
 /// NUL終端のUTF-16文字列（`PWSTR`）をRustの`String`へ変換する（`ConvertSidToStringSidW`等、
 /// Win32が呼び出し側に所有権を渡す出力バッファを読み取る用途、`privhelper`から使う）。
 pub(crate) fn pwstr_to_string(p: windows::core::PWSTR) -> String {

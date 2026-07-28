@@ -68,8 +68,8 @@ use windows::Win32::System::Threading::{
 
 use crate::shell_tier::FsPassthrough;
 use crate::win_common::{
-    build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, read_to_string,
-    wide, write_all,
+    build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, long_path_wide,
+    read_to_string, wide, write_all,
 };
 
 /// harness専用のAppContainer名。`%LOCALAPPDATA%\Packages\<container-folder>`と
@@ -204,7 +204,7 @@ fn collect_dirs_and_files(
 /// 直接差し替えられる。`grant_ace_recursive_ro`等の**意図的にツリー全体へ伝播/全走査したい既存
 /// 経路はこの関数を使わない**（そちらは`SetNamedSecurityInfoW`のままでよい、伝播が目的のため）。
 unsafe fn set_dacl_single_object(path: &Path, new_dacl: *mut ACL) -> windows::core::Result<()> {
-    let path_w = wide(&path.to_string_lossy());
+    let path_w = long_path_wide(path);
     let handle = CreateFileW(
         PCWSTR(path_w.as_ptr()),
         (WRITE_DAC | READ_CONTROL).0,
@@ -396,7 +396,7 @@ fn grant_ace_mask(
         reason: e.to_string(),
     };
     unsafe {
-        let path_w = wide(&path.to_string_lossy());
+        let path_w = long_path_wide(path);
         let mut existing_dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = PSECURITY_DESCRIPTOR::default();
         GetNamedSecurityInfoW(
@@ -1428,7 +1428,7 @@ unsafe fn set_dacl_single_object_with_protection(
     protected: bool,
 ) -> windows::core::Result<()> {
     unsafe {
-        let path_w = wide(&path.to_string_lossy());
+        let path_w = long_path_wide(path);
         let handle = CreateFileW(
             PCWSTR(path_w.as_ptr()),
             (WRITE_DAC | READ_CONTROL).0,
@@ -1475,7 +1475,7 @@ pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
         reason: e.to_string(),
     };
     unsafe {
-        let path_w = wide(&path.to_string_lossy());
+        let path_w = long_path_wide(path);
         let mut existing_dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = PSECURITY_DESCRIPTOR::default();
         GetNamedSecurityInfoW(
@@ -1543,7 +1543,7 @@ fn sid_ace_mask(path: &Path, sid: PSID) -> Result<Option<u32>, AppContainerError
         reason: e.to_string(),
     };
     unsafe {
-        let path_w = wide(&path.to_string_lossy());
+        let path_w = long_path_wide(path);
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = PSECURITY_DESCRIPTOR::default();
         GetNamedSecurityInfoW(

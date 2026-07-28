@@ -90,6 +90,14 @@ pub enum VmRequest {
     /// `StartSession`を経由せず、`crate::vmsandbox::gc_orphan_sessions`を実行して
     /// 即座に終了する（D-24、`serve_gc_only`参照）。
     Gc,
+    /// [BUG-029] `harness tier3 gc`が常駐daemon（`serve_resident`）へ「本当にセッションが
+    /// 実行中か」を問い合わせるための軽量リクエスト。BUG-027対策として`run_gc_only`が
+    /// 元々使っていた「固定パイプへ接続できるか」だけの判定は、Phase Bでdaemonが
+    /// セッション0件でも無期限に常駐するようになったことで「daemon生存」と「セッション
+    /// 実行中」が別の状態になり、常駐daemon運用下でGCが恒久的に拒否される欠陥になっていた
+    /// （`docs/bugs/BUG-029.md`）。`StartSession`を経由せず、現在の`SessionRegistry`の
+    /// アクティブスロット数を`VmResponse::ActiveSessions`で返すだけの1回きりのリクエスト。
+    QueryActiveSessions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +111,9 @@ pub enum VmResponse {
     TornDown,
     /// `VmRequest::Gc`への応答。撤収を試みたVM名（=session_id）の一覧。
     GcReport { reaped_vm_names: Vec<String> },
+    /// [BUG-029] `VmRequest::QueryActiveSessions`への応答。このクエリ自身の接続を除いた、
+    /// 現在アクティブな`StartSession`セッション数。
+    ActiveSessions { count: usize },
     Err(String),
 }
 
@@ -132,6 +143,12 @@ const REQUEST_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const START_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// `Teardown`応答（copy-out+VM/コンテナ撤収）を待つタイムアウト。
 const TEARDOWN_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// [BUG-029] `QueryActiveSessions`は「本当にセッションが動いているか」を素早く確認するための
+/// 軽量な往復専用。`START_SESSION_TIMEOUT`（300秒）をそのまま使うと、daemonが応答しない
+/// 異常系（プロトコル不一致・ハング等）で`harness tier3 gc`が最大5分ブロックしてしまうため、
+/// 短いタイムアウトを別に用意し、タイムアウト時は安全側（セッション実行中の可能性あり＝拒否）
+/// に倒す。
+const QUERY_ACTIVE_SESSIONS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// daemon側が次のメッセージ（`Exec`/`Teardown`、または親のクラッシュによるパイプ切断）を
 /// 待つ時間。harnessセッションの生存期間そのものに依存するため実質無期限に近い値にする。
 const DAEMON_WAIT_TIMEOUT: std::time::Duration =
@@ -1126,6 +1143,24 @@ impl Drop for VmSandboxHandle {
     }
 }
 
+/// [BUG-029] 常駐セッションdaemonへ接続済みのパイプ経由で`VmRequest::QueryActiveSessions`を
+/// 送り、応答のアクティブセッション数を返す。
+fn query_active_sessions(pipe: HANDLE) -> Result<usize, VmSandboxIpcError> {
+    let bytes = serde_json::to_vec(&VmRequest::QueryActiveSessions).map_err(|e| {
+        VmSandboxIpcError::Ipc(format!("failed to serialize query request: {e}"))
+    })?;
+    write_framed_timeout(pipe, &bytes, QUERY_ACTIVE_SESSIONS_TIMEOUT)?;
+    let response_bytes = read_framed_timeout(pipe, QUERY_ACTIVE_SESSIONS_TIMEOUT)?;
+    let response: VmResponse = serde_json::from_slice(&response_bytes)
+        .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to parse query response: {e}")))?;
+    match response {
+        VmResponse::ActiveSessions { count } => Ok(count),
+        other => Err(VmSandboxIpcError::Ipc(format!(
+            "unexpected response to QueryActiveSessions: {other:?}"
+        ))),
+    }
+}
+
 /// `harness tier3 gc`（A9、`harness-cli`）が呼ぶGC専用のワンショットdaemon起動。
 /// `VmSandboxHandle::start`とは異なりセッションを開始せず、`--gc-only`引数付きで起動した
 /// daemon（`serve_gc`）が[`VmRequest::Gc`]を1件処理して即座に終了するのを待つだけの
@@ -1136,22 +1171,38 @@ impl Drop for VmSandboxHandle {
 /// **BUG-027対策（2層防御の1層目）**: `gc_orphan_sessions`側の`daemon_pid`生存判定
 /// （2層目、こちらが最終防御線）とは別に、ここでは固定の常駐セッションdaemonパイプへ
 /// 接続を試みることで「セッション実行中かどうか」を早期に、UAC昇格すら発生させずに
-/// 判定する。接続できた＝常駐daemonが稼働中ということなので、ユーザーに分かるエラーで
-/// 即座に中止する（そもそも新規daemonを昇格起動しない）。
+/// 判定する。
+///
+/// [BUG-029修正] 当初は「接続できた＝常駐daemonが稼働中」を「セッション実行中」の代理
+/// 指標として使い、接続できただけで即座に拒否していた。Phase Bでdaemonがセッション0件でも
+/// 無期限に常駐するようになった（`docs/STATUS.md`残課題#6）ため、この代理指標は常駐daemon
+/// 運用下で常に真になり、GCが恒久的に拒否される欠陥になっていた（`docs/bugs/BUG-029.md`）。
+/// 接続できた場合は`VmRequest::QueryActiveSessions`を送り、実際のアクティブセッション数を
+/// 問い合わせてから判定する（0件なら続行、1件以上なら拒否）。
 pub fn run_gc_only() -> Result<Vec<String>, VmSandboxIpcError> {
-    if connect_to_pipe_as_client(
+    if let Ok(query_pipe) = connect_to_pipe_as_client(
         session_daemon_pipe_name(),
         std::time::Duration::from_millis(200),
         false,
-    )
-    .is_ok()
-    {
-        return Err(VmSandboxIpcError::Rejected(
-            "a Tier3 session daemon is currently running (an active session may be in \
-             progress); refusing to run GC to avoid tearing down its VM/containers/SMB shares. \
-             Wait for the session to finish, or stop it first."
-                .to_string(),
-        ));
+    ) {
+        let active = query_active_sessions(query_pipe);
+        unsafe {
+            let _ = CloseHandle(query_pipe);
+        }
+        match active {
+            Ok(0) => {}
+            Ok(_) | Err(_) => {
+                // クエリ自体が失敗した場合（プロトコル不一致・タイムアウト等）も、
+                // 安全側に倒して「セッション実行中の可能性あり」として拒否する
+                // （BUG-027の防御を弱めない）。
+                return Err(VmSandboxIpcError::Rejected(
+                    "a Tier3 session daemon is currently running with at least one active \
+                     session; refusing to run GC to avoid tearing down its VM/containers/SMB \
+                     shares. Wait for the session to finish, or stop it first."
+                        .to_string(),
+                ));
+            }
+        }
     }
 
     let prepared = prepare_pipe()?;
@@ -1279,6 +1330,11 @@ impl SessionRegistry {
     fn release_slot(&self, slot: u8) {
         self.active_slots.lock().unwrap().remove(&slot);
     }
+
+    /// [BUG-029] 現在アクティブなスロット数。`QueryActiveSessions`の応答生成に使う。
+    fn active_count(&self) -> usize {
+        self.active_slots.lock().unwrap().len()
+    }
 }
 
 /// daemon側エントリポイント（`harness-vmsandboxd.exe`のmainから呼ぶ、昇格トークンで実行）。
@@ -1352,7 +1408,7 @@ pub fn serve_resident(
                     // `SendableHandle`まるごとがムーブされるよう強制する（定石の回避策）。
                     let sendable_pipe = sendable_pipe;
                     let pipe = sendable_pipe.0;
-                    let result = serve_inner(pipe, client_pid, slot);
+                    let result = serve_inner(pipe, client_pid, slot, &registry);
                     unsafe {
                         // **実機E2Eで発見したバグ**: `WriteFile`の完了はOSのパイプバッファへ
                         // 書き込みが受理されたことしか意味せず、クライアントが実際に読み終えた
@@ -1396,12 +1452,26 @@ pub fn serve_resident(
     }
 }
 
-fn serve_inner(pipe: HANDLE, client_pid: u32, slot: u8) -> Result<(), VmSandboxIpcError> {
-    // 1件目: StartSession を待つ。
+fn serve_inner(
+    pipe: HANDLE,
+    client_pid: u32,
+    slot: u8,
+    registry: &SessionRegistry,
+) -> Result<(), VmSandboxIpcError> {
+    // 1件目: StartSession を待つ。ただし[BUG-029] `QueryActiveSessions`（`harness tier3 gc`が
+    // 「本当にセッションが実行中か」を確認するための軽量リクエスト）も1件目として受理する。
     let request_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
     let (workspace_root, allow_domains, warm) = match serde_json::from_slice::<VmRequest>(&request_bytes) {
         Ok(VmRequest::StartSession { workspace_root, allow_domains, warm }) => {
             (workspace_root, allow_domains, warm)
+        }
+        Ok(VmRequest::QueryActiveSessions) => {
+            // このクエリ自身が`try_acquire_slot`で1スロット消費している（呼び出し元の
+            // `serve_resident`参照）ため、自分自身を除いた数を返す。
+            let count = registry.active_count().saturating_sub(1);
+            let resp = VmResponse::ActiveSessions { count };
+            send_response(pipe, &resp)?;
+            return Ok(());
         }
         Ok(_) => {
             let resp = VmResponse::Err(
@@ -1512,6 +1582,16 @@ fn serve_inner(pipe: HANDLE, client_pid: u32, slot: u8) -> Result<(), VmSandboxI
                     pipe,
                     &VmResponse::Err(
                         "Gc is only valid in gc-only mode (harness tier3 gc)".to_string(),
+                    ),
+                );
+            }
+            VmRequest::QueryActiveSessions => {
+                // `QueryActiveSessions`はStartSession前（`serve_inner`冒頭）にのみ受理する
+                // 軽量リクエストであり、既にセッションが開始済みのこのループでは想定しない。
+                let _ = send_response(
+                    pipe,
+                    &VmResponse::Err(
+                        "QueryActiveSessions is only valid before StartSession".to_string(),
                     ),
                 );
             }

@@ -207,9 +207,16 @@ pub fn create_ephemeral_share(workspace_id: &str, workspace_root: &Path) -> Resu
                     .map_err(|e| VmError::PowerShell(format!("failed to parse SID '{sid_string}': {e}")))?;
                     psid
                 };
-                grant_ace_inheritable_rw(workspace_root, sid_owned).map_err(|e| {
-                    VmError::PowerShell(format!("failed to grant NTFS access to {user}: {e:?}"))
-                })?;
+                if let Err(e) = grant_ace_inheritable_rw(workspace_root, sid_owned) {
+                    // [BUG-028] `run_powershell_stdin`は既に共有・使い捨てアカウントを実際に
+                    // 作成済みの状態でしか`Ok`を返さない。ここでNTFS付与が失敗した場合、
+                    // それらを孤児化させないその場でbest-effortに削除する
+                    // （`destroy_ephemeral_share`はNTFS取消も含めbest-effort、失敗しても無視）。
+                    destroy_ephemeral_share(&share, &user, Some(workspace_root));
+                    return Err(VmError::PowerShell(format!(
+                        "failed to grant NTFS access to {user}: {e:?}"
+                    )));
+                }
                 return Ok((share, user, password, sid_string));
             }
             Err(e) => {
