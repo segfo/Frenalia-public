@@ -53,6 +53,49 @@ pub fn render(f: &mut Frame, app: &AppState) {
     }
 }
 
+/// Tier3サンドボックス準備中の待機画面（`sandbox_prep::run_prep_screen`から呼ばれる）。
+/// `latest`は合成進捗ticker（`harness_sandbox::vmsandboxd_progress`、経過時間からの推測——
+/// daemonの実測値ではない、モジュールdoc参照）からの最新イベント。初回tick到達前（`None`）
+/// でも画面を空白にせず、スピナーと接続中の文言を出す。
+#[cfg(windows)]
+pub fn render_prep_screen(
+    f: &mut Frame,
+    latest: Option<&harness_sandbox::vmsandboxd_progress::SandboxPrepEvent>,
+    warm_requested: bool,
+) {
+    let rect = centered_rect(60, 30, f.area());
+    f.render_widget(Clear, rect);
+
+    let (elapsed, label) = match latest {
+        Some(ev) => (ev.elapsed, ev.label.as_str()),
+        None => (std::time::Duration::ZERO, "接続しています…"),
+    };
+    let spinner = SPINNER_FRAMES[(elapsed.as_millis() / 100) as usize % SPINNER_FRAMES.len()];
+    let total_secs = elapsed.as_secs();
+    let (mm, ss) = (total_secs / 60, total_secs % 60);
+
+    let caveat = if warm_requested {
+        "（通常20秒程度で完了しますが、状態によっては数分かかる場合があります）"
+    } else {
+        "（初回起動は3分程度かかる場合があります）"
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("{spinner} Tier3 サンドボックスを準備しています…"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("経過 {mm:02}:{ss:02}")),
+        Line::from(label.to_string()),
+        Line::from(""),
+        Line::from(Span::styled(caveat, Style::default().fg(Color::DarkGray))),
+    ];
+    let block = Block::default().borders(Borders::ALL).title("sandbox preparing");
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(paragraph, rect);
+}
+
 /// `input_cursor`（先頭からの文字数）が何行目（0始まり、`\n`の数）にあるか。
 fn input_cursor_line(input: &str, cursor: usize) -> usize {
     input.chars().take(cursor).filter(|&c| c == '\n').count()

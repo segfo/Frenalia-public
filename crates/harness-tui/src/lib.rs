@@ -6,6 +6,8 @@ mod diff;
 mod engine;
 mod gate;
 mod picker;
+#[cfg(windows)]
+mod sandbox_prep;
 mod terminal;
 mod ui;
 
@@ -68,7 +70,7 @@ fn build_change_rows(workspace_root: &std::path::Path, fs: &SandboxFs, entries: 
 pub async fn run(
     provider: Box<dyn LlmProvider>,
     tools: ToolRegistry,
-    ctx: ToolCtx,
+    mut ctx: ToolCtx,
     arbiter: PermissionArbiter,
     model: String,
     max_tokens: u32,
@@ -79,11 +81,44 @@ pub async fn run(
     sessions_dir: PathBuf,
     enter_submits: bool,
     start_with_picker: bool,
+    tier3_warm: bool,
+    tier3_max_sessions: u8,
 ) -> io::Result<()> {
-    let _guard = terminal::TerminalGuard::enter()?;
+    let guard = terminal::TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
     let mut term_events = EventStream::new();
+
+    // Tier3が選択されている場合、VM+コンテナ起動デーモンの準備が終わるまで（コールドブート
+    // 約212秒/ウォーム再利用約20秒、`docs/STATUS.md`Tier3残課題#3）このオルタネートスクリーン内で
+    // 進捗画面を表示する（`TerminalGuard::enter()`は再入不可のため、`main.rs`側で別途端末を
+    // 握るのではなくここで行う）。表示する進捗は経過時間ベースの合成データであり、daemonの
+    // 実測値ではない（`harness_sandbox::vmsandboxd_progress`のモジュールdoc、
+    // `plans/DESIGN-SANDBOX-VMISOLATION.md`参照）。
+    #[cfg(windows)]
+    let vm_sandbox_handle: Option<std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>> =
+        if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+            sandbox_prep::run_prep_screen(
+                &mut term,
+                &mut term_events,
+                &ctx.workspace_root,
+                &ctx.net_proxy.allow_domains,
+                tier3_warm,
+                tier3_max_sessions,
+            )
+            .await?
+        } else {
+            None
+        };
+    #[cfg(not(windows))]
+    let vm_sandbox_handle: Option<std::sync::Arc<()>> = None;
+
+    #[cfg(windows)]
+    {
+        ctx.vm_sandbox = vm_sandbox_handle
+            .clone()
+            .map(|h| h as std::sync::Arc<dyn harness_core::VmShellExecutor>);
+    }
 
     // 引数なし`--resume`で起動された場合、通常のresume/continue解決（`harness-cli::resolve_session`）
     // ではなく対話的にセッションを選ばせる（§非対話モードの原則により、ヘッドレスでは
@@ -293,6 +328,19 @@ pub async fn run(
 
         if app.should_quit {
             break;
+        }
+    }
+
+    // 端末復帰を先に済ませてから、Tier3 VMサンドボックスのteardown（ワークスペース
+    // copy-out・コンテナ削除・VM/差分VHDX撤収）を行う。失敗時の警告`eprintln!`が
+    // raw mode/alt screen中に出て見えなくなる/表示崩れするのを避けるため
+    // （元は`main.rs`末尾にあった処理をTUI側で完結させる、`sandbox_prep`で開始した
+    // ため対称的にここで終える）。
+    drop(guard);
+    #[cfg(windows)]
+    if let Some(handle) = vm_sandbox_handle {
+        if let Err(e) = handle.stop() {
+            eprintln!("warning: failed to cleanly tear down Tier3 VM sandbox session: {e}");
         }
     }
 

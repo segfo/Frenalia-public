@@ -1987,52 +1987,13 @@ async fn main() -> ExitCode {
         eprintln!("warning: {warning}");
     }
 
-    // Tier3（`plans/DESIGN-SANDBOX-VMISOLATION.md`）: `shell_tier`が実際にTier3へ着地した場合
-    // のみ、VM+コンテナ起動デーモン（`harness-vmsandboxd`、D-21）を昇格起動する（UAC1回）。
-    // `vm_sandbox_handle`は具象型`Arc`（`harness-cli`側のteardown用、`Arc<dyn Trait>`は
-    // `Arc::try_unwrap`できず所有権を取り戻せないため）、`vm_sandbox`はそこから型消去した
-    // `ToolCtx`格納用（`VmSandboxHandle::stop`が`&self`を取るため、両方から同じインスタンスへ
-    // 安全にアクセスできる、`vmsandboxd.rs`のdocコメント参照）。VM起動失敗時はTier3のまま
-    // 起動する（`run_shell`は`ctx.vm_sandbox`が`None`だと明示エラーを返す。preflight相当の
-    // 事前チェックはTier選択時点の軽量チェックのみのためVM起動自体は失敗し得る、Phase 1の
-    // 既知の限界）。
-    #[cfg(windows)]
-    let vm_sandbox_handle: Option<std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>> =
-        if shell_tier.tier == harness_core::ShellTier::Tier3 {
-            match harness_sandbox::vmsandboxd::VmSandboxHandle::start(
-                &workspace_root,
-                &net_proxy.allow_domains,
-                cli.tier3_warm,
-                cli.tier3_max_sessions.max(1),
-            ) {
-                Ok(handle) => Some(std::sync::Arc::new(handle)),
-                Err(e) => {
-                    eprintln!(
-                        "error: tier3 was selected but the VM sandbox failed to start: {e}\n\
-                         run_shell will fail until this is resolved (see \
-                         plans/TIER1A-OPEN-ISSUES.md item 9)."
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-    #[cfg(not(windows))]
-    let vm_sandbox_handle: Option<std::sync::Arc<()>> = None;
-
-    let vm_sandbox: Option<std::sync::Arc<dyn harness_core::VmShellExecutor>> = {
-        #[cfg(windows)]
-        {
-            vm_sandbox_handle.clone().map(|h| h as std::sync::Arc<dyn harness_core::VmShellExecutor>)
-        }
-        #[cfg(not(windows))]
-        {
-            None
-        }
-    };
-
-    let tool_ctx = ToolCtx {
+    // Tier3（`plans/DESIGN-SANDBOX-VMISOLATION.md`）: VM+コンテナ起動デーモン
+    // （`harness-vmsandboxd`、D-21）の昇格起動・起動待ちはコールドブートで数分かかり得る
+    // （`docs/STATUS.md`Tier3残課題#3）ため、無進捗のままここでブロッキングせず、`cli.print`の
+    // 分岐後（TUIならターミナル準備画面の中、非対話ならstderr進捗行と共に）まで遅延させる。
+    // ここでは`vm_sandbox: None`のまま`ToolCtx`を構築し、各分岐が準備完了後に書き戻す
+    // （`system_blocks_for`は`vm_sandbox`を参照しないため後書きで安全、`prompt.rs`参照）。
+    let mut tool_ctx = ToolCtx {
         workspace_root: workspace_root.clone(),
         staging: StagingConfig {
             mode: staging_mode,
@@ -2043,7 +2004,7 @@ async fn main() -> ExitCode {
         shell_tier,
         net_proxy,
         net_app,
-        vm_sandbox,
+        vm_sandbox: None,
     };
 
     let mut state = ConversationState::new(harness_engine::system_blocks_for(&tool_ctx));
@@ -2069,6 +2030,32 @@ async fn main() -> ExitCode {
             }
             let before_run = state.messages.len();
 
+            // Tier3準備（VM+コンテナ起動、コールドブート数分/ウォーム再利用約20秒）を
+            // ここで行い、待機中はstderrへ進捗行を出す（TUI分岐は`harness_tui::run`内で
+            // 同様の役割を果たす、`crates/harness-tui/src/lib.rs`参照）。
+            #[cfg(windows)]
+            let vm_sandbox_handle: Option<std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>> =
+                if tool_ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+                    start_tier3_with_progress(
+                        &tool_ctx.workspace_root,
+                        &tool_ctx.net_proxy.allow_domains,
+                        cli.tier3_warm,
+                        cli.tier3_max_sessions.max(1),
+                    )
+                    .await
+                } else {
+                    None
+                };
+            #[cfg(not(windows))]
+            let vm_sandbox_handle: Option<std::sync::Arc<()>> = None;
+
+            #[cfg(windows)]
+            {
+                tool_ctx.vm_sandbox = vm_sandbox_handle
+                    .clone()
+                    .map(|h| h as std::sync::Arc<dyn harness_core::VmShellExecutor>);
+            }
+
             let mut stdout = std::io::stdout();
             let exit = run_headless(
                 provider.as_ref(),
@@ -2086,6 +2073,16 @@ async fn main() -> ExitCode {
             )
             .await;
             let _ = session.append_messages(&state.messages[before_run..]);
+
+            #[cfg(windows)]
+            if let Some(handle) = vm_sandbox_handle {
+                if let Err(e) = handle.stop() {
+                    eprintln!(
+                        "warning: failed to cleanly tear down Tier3 VM sandbox session: {e}"
+                    );
+                }
+            }
+
             exit
         }
         None => {
@@ -2112,6 +2109,8 @@ async fn main() -> ExitCode {
                 sessions_dir,
                 enter_submits,
                 resume_wants_picker,
+                cli.tier3_warm,
+                cli.tier3_max_sessions.max(1),
             )
             .await;
 
@@ -2131,15 +2130,11 @@ async fn main() -> ExitCode {
     // `netfilterd.rs`のモジュールdoc参照）に委ねる。Ctrl+C等のシグナル割り込みも同様に
     // フェイルセーフへ委ねる（本ラウンドではシグナルハンドラを追加しない、
     // `~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D手順5参照）。
-    // Tier3 VMサンドボックスのteardown（ワークスペースcopy-out・コンテナ削除・VM/差分VHDX撤収）。
-    // `net_wfp`と同じ理由でここに置く（早期returnパスは`VmSandboxHandle`のDropフェイルセーフ
-    // ——パイプ切断検知でdaemon側が自発的にteardownする——に委ねる、`vmsandboxd.rs`参照）。
-    #[cfg(windows)]
-    if let Some(handle) = vm_sandbox_handle {
-        if let Err(e) = handle.stop() {
-            eprintln!("warning: failed to cleanly tear down Tier3 VM sandbox session: {e}");
-        }
-    }
+    // Tier3 VMサンドボックスのteardownは、準備開始をTier3の実際の使用側（TUIは
+    // `harness_tui::run`内部、非対話は上の`Some(print)`アーム）へ遅延させたのに合わせて
+    // それぞれの分岐内で完結させている（進捗表示のため、`plans/DESIGN-SANDBOX-VMISOLATION.md`
+    // 追記・本コミット参照）。早期returnパスは従来通り`VmSandboxHandle`のDropフェイルセーフ
+    // （パイプ切断検知でdaemon側が自発的にteardownする）に委ねる。
 
     #[cfg(windows)]
     if let Some(handle) = net_wfp {
@@ -2149,6 +2144,71 @@ async fn main() -> ExitCode {
     }
 
     exit_code
+}
+
+/// 非対話モード（`--print`）専用: Tier3 VMサンドボックスの起動をブロッキングのまま
+/// （`tokio::task::spawn_blocking`越しに）待ちつつ、`vmsandboxd_progress`の合成進捗
+/// （経過時間ベースの推測、daemonの実測値ではない——`harness_sandbox::vmsandboxd_progress`の
+/// モジュールdoc・`plans/DESIGN-SANDBOX-VMISOLATION.md`参照）をstderrへ間引いて出力する。
+/// TUI分岐（`harness_tui::run`内の`sandbox_prep::run_prep_screen`）と対になる非対話側の実装。
+#[cfg(windows)]
+async fn start_tier3_with_progress(
+    workspace_root: &std::path::Path,
+    allow_domains: &[String],
+    tier3_warm: bool,
+    tier3_max_sessions: u8,
+) -> Option<std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>> {
+    use harness_sandbox::vmsandboxd::VmSandboxHandle;
+    use harness_sandbox::vmsandboxd_progress::{run_synthetic_ticker, SandboxPrepEvent};
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SandboxPrepEvent>();
+    let ticker = tokio::spawn(run_synthetic_ticker(tx, tier3_warm));
+
+    let workspace_root = workspace_root.to_path_buf();
+    let allow_domains = allow_domains.to_vec();
+    let start_task = tokio::task::spawn_blocking(move || {
+        VmSandboxHandle::start(&workspace_root, &allow_domains, tier3_warm, tier3_max_sessions)
+    });
+    tokio::pin!(start_task);
+
+    // ラベルが変わった時か、同一フェーズ内でも約5秒おきにのみ1行stderrへ出す
+    // （250ms間隔のtickerをそのまま出力すると流れすぎる — cadenceはticker側で
+    // 一定に保ち、間引きはこの呼び出し側の責務とする）。
+    let mut last_label: Option<String> = None;
+    let mut last_printed_secs: u64 = 0;
+
+    let result = loop {
+        tokio::select! {
+            biased;
+            res = &mut start_task => break res,
+            Some(ev) = rx.recv() => {
+                let secs = ev.elapsed.as_secs();
+                let label_changed = last_label.as_deref() != Some(ev.label.as_str());
+                if label_changed || secs.saturating_sub(last_printed_secs) >= 5 {
+                    eprintln!("[sandbox] {} (経過 {secs}秒)", ev.label);
+                    last_label = Some(ev.label.clone());
+                    last_printed_secs = secs;
+                }
+            }
+        }
+    };
+    ticker.abort();
+
+    match result {
+        Ok(Ok(handle)) => Some(std::sync::Arc::new(handle)),
+        Ok(Err(e)) => {
+            eprintln!(
+                "error: tier3 was selected but the VM sandbox failed to start: {e}\n\
+                 run_shell will fail until this is resolved (see \
+                 plans/TIER1A-OPEN-ISSUES.md item 9)."
+            );
+            None
+        }
+        Err(join_err) => {
+            eprintln!("error: tier3 sandbox prep task panicked: {join_err}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

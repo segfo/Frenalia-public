@@ -54,6 +54,9 @@ pub mod vm_host;
 pub mod vmsandboxd;
 
 #[cfg(windows)]
+pub mod vmsandboxd_progress;
+
+#[cfg(windows)]
 pub mod vm_ledger;
 
 #[cfg(windows)]

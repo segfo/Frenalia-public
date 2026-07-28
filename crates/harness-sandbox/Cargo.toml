@@ -23,6 +23,9 @@ reqwest = { version = "0.13.4", default-features = false, features = ["blocking"
 # CSPRNGを使う`rand::rngs::OsRng`経由、`unique_session_id`のPID+タイムスタンプとは
 # 異なり実際に秘密として使うため暗号論的乱数が必要）。
 rand = "0.9"
+# Tier3準備画面の合成進捗ticker（`vmsandboxd_progress`）用。`vmsandboxd`自体は非asyncのまま
+# （`spawn_blocking`越しに呼ばれる）で、tokioはこのtickerと呼び出し側の`select!`にのみ使う。
+tokio = { version = "1.52.3", features = ["sync", "time"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
