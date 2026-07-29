@@ -55,16 +55,41 @@ fn require_label(require: RequireSandbox) -> &'static str {
     }
 }
 
+/// Tier2a向けfs passthroughアクセス権。設定上は`fs.read`/`fs.read_write`/`fs.read_exec`に対応する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsAccess {
+    /// 読取のみ。
+    Read,
+    /// 読取・書込。
+    ReadWrite,
+    /// 読取・実行。
+    ReadExec,
+}
+
+impl FsAccess {
+    pub fn is_read_write(self) -> bool {
+        self == FsAccess::ReadWrite
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FsAccess::Read => "read",
+            FsAccess::ReadWrite => "read_write",
+            FsAccess::ReadExec => "read_exec",
+        }
+    }
+}
+
 /// Tier2a向けfs passthrough記述子（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md` §5.1）。
 /// package SIDへ追加ルート（`workspace_root`外）の許可ACEを付与する対象を表す。
-/// `writable=false`が既定（read-only、書込は明示`:rw`指定時のみ`true`）。
 /// Windows以外では値を運ぶだけで`best_effort_tier`のLinux/other分岐からは無視される
 /// （`harness-core`へは出さずこのクレート内に閉じる、network側の`NetAppPolicy`とは
 /// 役割分担が異なる: FSアクセス制御は実FSのACLで完結するため`ToolCtx`を経由しない）。
 #[derive(Debug, Clone)]
 pub struct FsPassthrough {
     pub path: PathBuf,
-    pub writable: bool,
+    pub access: FsAccess,
     /// `--force-system-acl`（D-19）: `NT SERVICE\TrustedInstaller`所有等で`WRITE_DAC`不可の
     /// システム保護パスへ、特権分離ヘルパーが`SeRestorePrivilege`を有効化して強制付与する。
     /// 既定false。`is_force_grant_forbidden`のゲートを通過したもののみ実際に強制付与される。
@@ -204,6 +229,7 @@ fn try_tier2a(
             match crate::win_appcontainer::preflight(workspace_root, passthrough, wfp_chain_pipe) {
                 Ok(outcome) => Ok(ShellTierSelection::direct(ShellTier::Tier2a)
                     .with_passthrough_warnings(outcome.warnings)
+                    .with_denied_passthrough(outcome.denied_passthrough)
                     .with_granted_passthrough(outcome.granted_passthrough)
                     .with_netfilterd_chain_attempted(outcome.netfilterd_chain_attempted)),
                 Err(e) => Err(e.to_string()),
@@ -453,7 +479,7 @@ mod tests {
         };
         let passthrough = vec![FsPassthrough {
             path: PathBuf::from("C:\\dummy"),
-            writable: false,
+            access: FsAccess::ReadExec,
             forced: false,
         }];
         let selection = select_tier_with_probes(

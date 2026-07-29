@@ -219,6 +219,7 @@ impl Tool for RunShellTool {
 
         let dur = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
         let mut env = harness_sandbox::build_child_env();
+        append_path_extra(&mut env, &ctx.run_shell_path_extra);
 
         // 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15、
         // `plans/AppContainerを用いたドメインベース通信制御アーキテクチャ設計書.md` §5）。
@@ -426,6 +427,56 @@ fn truncate_to_limit(mut s: String) -> String {
         s.push_str("\n[output truncated at 10MiB]");
     }
     s
+}
+
+fn append_path_extra(env: &mut Vec<(String, String)>, path_extra: &[String]) {
+    if path_extra.is_empty() {
+        return;
+    }
+    let Some((_, path)) = env
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+    else {
+        return;
+    };
+    for entry in path_extra {
+        append_path_entry(path, entry);
+    }
+}
+
+fn append_path_entry(path: &mut String, entry: &str) {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return;
+    }
+    if path
+        .split(path_separator())
+        .any(|existing| path_entries_equal(existing, entry))
+    {
+        return;
+    }
+    if !path.is_empty() && !path.ends_with(path_separator()) {
+        path.push(path_separator());
+    }
+    path.push_str(entry);
+}
+
+fn path_separator() -> char {
+    if cfg!(windows) {
+        ';'
+    } else {
+        ':'
+    }
+}
+
+fn path_entries_equal(a: &str, b: &str) -> bool {
+    let a = a.trim().trim_end_matches(['\\', '/']);
+    let b = b.trim().trim_end_matches(['\\', '/']);
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
 }
 
 /// Tierに応じて実行経路を切り替える。戻り値は`(stdout, stderr, exit_code, shell_label)`。
@@ -946,6 +997,40 @@ mod tests {
     fn classify_net_app_denies_empty_command() {
         let allow = vec!["git".to_string()];
         assert_eq!(classify_net_app("", &allow), NetDecision::Deny);
+    }
+
+    #[test]
+    fn append_path_extra_adds_entries_without_duplicates() {
+        let mut env = vec![("PATH".to_string(), "C:\\Windows\\System32".to_string())];
+        append_path_extra(
+            &mut env,
+            &[
+                "C:\\Users\\me\\.local\\bin".to_string(),
+                "C:\\Users\\me\\.local\\bin\\".to_string(),
+            ],
+        );
+        let path = env
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+        assert!(path.contains("C:\\Windows\\System32"));
+        assert!(path.contains("C:\\Users\\me\\.local\\bin"));
+        assert_eq!(
+            path.split(path_separator())
+                .filter(|entry| path_entries_equal(entry, "C:\\Users\\me\\.local\\bin"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn append_path_extra_does_not_create_missing_path() {
+        let mut env = vec![("HOME".to_string(), "/home/me".to_string())];
+        append_path_extra(&mut env, &["/home/me/.local/bin".to_string()]);
+        assert!(env
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("PATH")));
     }
 
     #[test]

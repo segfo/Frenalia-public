@@ -85,9 +85,11 @@ impl EnvironmentFacts {
             shell_tier,
             net_proxy,
             net_app,
+            run_shell_path_extra,
             shell_sees_staged_writes,
             vm_sandbox,
         } = ctx;
+        let _ = run_shell_path_extra;
         // vm_sandbox: Tier3実行チャネルの生ハンドル自体はモデルへ伝える事実を持たない
         // （「現在Tier3である」という事実は`shell_tier.tier`側から既に伝わる）。
         let _ = vm_sandbox;
@@ -254,22 +256,35 @@ fn render_shell_tier(shell_tier: &ShellTierSelection) -> Vec<String> {
         downgraded_from,
         reason,
         passthrough_warnings: _,
+        denied_passthrough: _,
         granted_passthrough: _,
         netfilterd_chain_attempted: _,
     } = shell_tier;
 
     let mut out = vec![tier_line(*tier)];
     if let Some(from) = downgraded_from {
+        let from_label = tier_display_label(*from);
+        let tier_label = tier_display_label(*tier);
         out.push(format!(
             "注意: 本来{}での実行を試みましたが{}へ降格されました（理由: {}）。上記{}の説明が\
              現在有効な制約です。",
-            from.label(),
-            tier.label(),
+            from_label,
+            tier_label,
             reason.clone().unwrap_or_default(),
-            tier.label(),
+            tier_label,
         ));
     }
     out
+}
+
+fn tier_display_label(tier: ShellTier) -> &'static str {
+    match tier {
+        ShellTier::Tier3 => "Tier3",
+        ShellTier::Tier2b => "Tier2b",
+        ShellTier::Tier2a => "Tier2a",
+        ShellTier::Tier1 => "Tier1",
+        ShellTier::Tier0 => "Tier0",
+    }
 }
 
 /// `ShellTier`の各バリアントが実際に物理的に何を強制するかの1文。`ShellTier`はここで

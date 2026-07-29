@@ -34,6 +34,22 @@ pub struct Settings {
     /// Tier2a fs passthrough設定（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺）。省略時は
     /// `FsSettings::default()`（`allow`空＝追加ルート無し＝M12までと等価）。
     pub fs: Option<FsSettings>,
+    /// `run_shell`子プロセス向けの非シークレット設定。省略時は
+    /// `RunShellSettings::default()`（追加PATH無し＝従来通り）。
+    pub run_shell: Option<RunShellSettings>,
+}
+
+/// `.harness/settings.json`の`run_shell`キー。シークレットenvの転送は禁止し、PATH追加だけを扱う。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunShellSettings {
+    /// clean envで継承したPATHへ追記するディレクトリ。例: `C:\\Users\\me\\.local\\bin`。
+    pub path_extra: Option<Vec<String>>,
+}
+
+impl RunShellSettings {
+    pub fn path_extra(&self) -> Vec<String> {
+        self.path_extra.clone().unwrap_or_default()
+    }
 }
 
 /// `.harness/settings.json`の`fs`キー（D-13、Tier2a fs passthrough allowlist）。
@@ -43,22 +59,61 @@ pub struct FsSettings {
     /// （書込も許可、明示opt-in）。CLIの`--fs-allow`と和集合でマージされる
     /// （`net.allow_apps`と同じ役割分担、絶対パス化は`harness-cli`側）。
     pub allow: Option<Vec<String>>,
+    /// 読取だけを許可するルート。
+    pub read: Option<Vec<String>>,
+    /// 読取・書込を許可するルート。
+    pub read_write: Option<Vec<String>>,
+    /// 読取・実行を許可するルート。
+    pub read_exec: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsAccess {
+    Read,
+    ReadWrite,
+    ReadExec,
 }
 
 impl FsSettings {
-    /// `fs.allow`の各要素を`(パス文字列, writable)`へ変換する。末尾`:rw`があれば書込可、
-    /// 無ければread-only（D-13の既定）。パスの絶対化・`FsPassthrough`化は呼び出し側
-    /// （`harness-cli`）の責務（`harness-sandbox`へ出す型はこのクレートに依存させない）。
-    pub fn to_fs_passthrough(&self) -> Vec<(String, bool)> {
-        self.allow
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|entry| match entry.strip_suffix(":rw") {
-                Some(path) => (path.to_string(), true),
-                None => (entry, false),
-            })
-            .collect()
+    /// `fs.{read,read_write,read_exec}`と旧`fs.allow`を`(パス文字列, access)`へ変換する。
+    /// 旧`fs.allow`は互換のため、`:rw`ならread_write、サフィックス無しなら従来の
+    /// read+execute相当（read_exec）として扱う。
+    pub fn to_fs_passthrough(&self) -> Vec<(String, FsAccess)> {
+        let mut out = Vec::new();
+        for path in self.read.clone().unwrap_or_default() {
+            push_fs_entry(&mut out, path, FsAccess::Read);
+        }
+        for path in self.read_write.clone().unwrap_or_default() {
+            push_fs_entry(&mut out, path, FsAccess::ReadWrite);
+        }
+        for path in self.read_exec.clone().unwrap_or_default() {
+            push_fs_entry(&mut out, path, FsAccess::ReadExec);
+        }
+        for entry in self.allow.clone().unwrap_or_default() {
+            match entry.strip_suffix(":rw") {
+                Some(path) => push_fs_entry(&mut out, path.to_string(), FsAccess::ReadWrite),
+                None => push_fs_entry(&mut out, entry, FsAccess::ReadExec),
+            }
+        }
+        out
+    }
+}
+
+fn push_fs_entry(out: &mut Vec<(String, FsAccess)>, path: String, access: FsAccess) {
+    if let Some((_, existing)) = out.iter_mut().find(|(p, _)| p == &path) {
+        *existing = merge_fs_access(*existing, access);
+    } else {
+        out.push((path, access));
+    }
+}
+
+fn merge_fs_access(a: FsAccess, b: FsAccess) -> FsAccess {
+    if a == FsAccess::ReadWrite || b == FsAccess::ReadWrite {
+        FsAccess::ReadWrite
+    } else if a == FsAccess::ReadExec || b == FsAccess::ReadExec {
+        FsAccess::ReadExec
+    } else {
+        FsAccess::Read
     }
 }
 
@@ -139,6 +194,22 @@ fn project_settings_path(project_root: &Path) -> std::path::PathBuf {
     project_root.join(".harness").join("settings.json")
 }
 
+const DEFAULT_PROJECT_SETTINGS: &str = r#"{
+  "run_shell": {
+    "path_extra": []
+  },
+  "net": {
+    "allow_domains": [],
+    "allow_apps": []
+  },
+  "fs": {
+    "read": [],
+    "read_write": [],
+    "read_exec": []
+  }
+}
+"#;
+
 /// `directories::ProjectDirs`の設定ディレクトリ配下`settings.json`（Windowsは`%APPDATA%`、
 /// mac/LinuxはXDG準拠、§設定とシークレット「ユーザ（`directories`: Windows `%APPDATA%`／
 /// mac/Linux XDG）」）。
@@ -174,6 +245,28 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
     }
 }
 
+pub fn ensure_project_settings_file(project_root: &Path) {
+    let path = project_settings_path(project_root);
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "warning: could not create settings directory {}: {e}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&path, DEFAULT_PROJECT_SETTINGS) {
+        eprintln!(
+            "warning: could not create default settings file {}: {e}",
+            path.display()
+        );
+    }
+}
+
 /// `overlay`のキーで`base`を上書きするディープマージ。オブジェクト同士は再帰的にマージし、
 /// それ以外（スカラー/配列）は`overlay`の値で丸ごと置き換える。
 fn deep_merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
@@ -199,6 +292,7 @@ impl Settings {
     /// （`--cwd`解決後のディレクトリ）を渡す。
     pub fn load(project_root: &Path) -> Settings {
         let mut merged = serde_json::Value::Object(Default::default());
+        ensure_project_settings_file(project_root);
 
         if let Some(user_path) = user_settings_path() {
             if let Some(user_json) = read_json(&user_path) {
@@ -233,10 +327,22 @@ mod tests {
     }
 
     #[test]
-    fn load_falls_back_to_default_when_no_settings_files_exist() {
+    fn load_creates_default_project_settings_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let settings = Settings::load(dir.path());
-        assert_eq!(settings, Settings::default());
+        assert!(project_settings_path(dir.path()).exists());
+        assert_eq!(
+            settings.run_shell.unwrap_or_default().path_extra(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            settings.net.unwrap_or_default().allow_domains,
+            Some(Vec::<String>::new())
+        );
+        assert_eq!(
+            settings.fs.unwrap_or_default().read_exec,
+            Some(Vec::<String>::new())
+        );
     }
 
     #[test]
@@ -281,16 +387,23 @@ mod tests {
         );
     }
 
-    /// D-13: `.harness/settings.json`の`fs.allow`が`(パス, writable)`へ正しく変換される。
-    /// 末尾`:rw`があれば書込可、無ければread-only（既定、`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺）。
+    /// D-13: 新しい`fs.{read,read_write,read_exec}`と旧`fs.allow`互換が
+    /// `(パス, access)`へ正しく変換される。
     #[test]
-    fn fs_settings_parses_ro_and_rw_entries() {
+    fn fs_settings_parses_grouped_access_and_legacy_allow_entries() {
         let dir = tempfile::tempdir().unwrap();
         let harness_dir = dir.path().join(".harness");
         std::fs::create_dir_all(&harness_dir).unwrap();
         std::fs::write(
             harness_dir.join("settings.json"),
-            r#"{"fs": {"allow": ["C:\\Users\\me\\.cargo:rw", "C:\\Users\\me\\readonly-cache"]}}"#,
+            r#"{
+                "fs": {
+                    "read": ["C:\\Users\\me\\notes"],
+                    "read_write": ["C:\\Users\\me\\.cargo"],
+                    "read_exec": ["C:\\Users\\me\\.local\\bin"],
+                    "allow": ["C:\\Users\\me\\.cargo:rw", "C:\\Users\\me\\legacy-bin"]
+                }
+            }"#,
         )
         .unwrap();
 
@@ -300,9 +413,36 @@ mod tests {
         assert_eq!(
             passthrough,
             vec![
-                ("C:\\Users\\me\\.cargo".to_string(), true),
-                ("C:\\Users\\me\\readonly-cache".to_string(), false),
+                ("C:\\Users\\me\\notes".to_string(), FsAccess::Read),
+                ("C:\\Users\\me\\.cargo".to_string(), FsAccess::ReadWrite),
+                ("C:\\Users\\me\\.local\\bin".to_string(), FsAccess::ReadExec,),
+                ("C:\\Users\\me\\legacy-bin".to_string(), FsAccess::ReadExec),
             ]
+        );
+    }
+
+    #[test]
+    fn run_shell_settings_parse_path_extra_alongside_net_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("settings.json"),
+            r#"{
+                "run_shell": { "path_extra": ["C:\\Users\\me\\.local\\bin"] },
+                "net": { "allow_domains": ["example.com"] }
+            }"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(dir.path());
+        assert_eq!(
+            settings.run_shell.unwrap_or_default().path_extra(),
+            vec!["C:\\Users\\me\\.local\\bin".to_string()]
+        );
+        assert_eq!(
+            settings.net.unwrap_or_default().allow_domains,
+            Some(vec!["example.com".to_string()])
         );
     }
 }

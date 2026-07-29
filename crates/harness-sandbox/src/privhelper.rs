@@ -56,6 +56,7 @@ use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
+use crate::shell_tier::FsAccess;
 use crate::win_appcontainer::{self, AppContainerError, CONTAINER_NAME};
 use crate::win_common::wide;
 
@@ -65,15 +66,45 @@ use crate::win_common::wide;
 /// `--fs-allow`の1エントリ（`GrantFsAllow`要求のペイロード）。`shell_tier::FsPassthrough`と
 /// 同形だが、IPCでシリアライズする要求スキーマとして独立させる（`shell_tier::FsPassthrough`は
 /// IPCを経由しない本体内部の値であり、両者の変更を意図せず連動させないため）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FsAllowGrant {
     pub path: PathBuf,
-    pub writable: bool,
+    pub access: FsAccess,
     /// `--force-system-acl`（D-19）: システム保護パス（`WRITE_DAC`不可）へ
     /// `SeRestorePrivilege`を有効化して強制付与する。dispatch側で`is_force_grant_forbidden`の
     /// ゲートを通過したもののみ`with_restore_privilege`下で付与する。既定false。
     #[serde(default)]
     pub forced: bool,
+}
+
+impl<'de> Deserialize<'de> for FsAllowGrant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            path: PathBuf,
+            access: Option<FsAccess>,
+            writable: Option<bool>,
+            #[serde(default)]
+            forced: bool,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let access = raw.access.unwrap_or_else(|| {
+            if raw.writable.unwrap_or(false) {
+                FsAccess::ReadWrite
+            } else {
+                FsAccess::ReadExec
+            }
+        });
+        Ok(Self {
+            path: raw.path,
+            access,
+            forced: raw.forced,
+        })
+    }
 }
 
 /// `RevokeFsAllow`要求の1エントリ。`forced`なパス（`--force-system-acl`で付与したもの）は
@@ -961,11 +992,11 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                     }
                 }
                 let do_grant = || {
-                    if entry.writable {
-                        win_appcontainer::grant_ace_recursive(&entry.path, sid.as_psid())
-                    } else {
-                        win_appcontainer::grant_ace_inheritable_ro(&entry.path, sid.as_psid())
-                    }
+                    win_appcontainer::grant_ace_inheritable_access(
+                        &entry.path,
+                        sid.as_psid(),
+                        entry.access,
+                    )
                 };
                 // forcedのみ`SeRestorePrivilege`を有効化して実行する（TrustedInstaller所有ノードへも
                 // 所有権を変えずにACEを書ける）。非forcedは従来どおり特権無しで実行する。
@@ -979,7 +1010,11 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                         log::line(&format!(
                             "  entry {} [{}{}] : granted in {}ms",
                             entry.path.display(),
-                            if entry.writable { "rw" } else { "ro" },
+                            if entry.access.is_read_write() {
+                                "rw"
+                            } else {
+                                "ro"
+                            },
                             if entry.forced { ",forced" } else { "" },
                             started.elapsed().as_millis()
                         ));
@@ -989,7 +1024,11 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                         log::line(&format!(
                             "  entry {} [{}{}] : FAILED after {}ms: {e}",
                             entry.path.display(),
-                            if entry.writable { "rw" } else { "ro" },
+                            if entry.access.is_read_write() {
+                                "rw"
+                            } else {
+                                "ro"
+                            },
                             if entry.forced { ",forced" } else { "" },
                             started.elapsed().as_millis()
                         ));
@@ -1079,7 +1118,7 @@ mod tests {
             request: PrivilegedRequest::GrantFsAllow {
                 entries: vec![FsAllowGrant {
                     path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
-                    writable: false,
+                    access: FsAccess::ReadExec,
                     forced: false,
                 }],
             },
@@ -1146,12 +1185,12 @@ mod tests {
             entries: vec![
                 FsAllowGrant {
                     path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
-                    writable: false,
+                    access: FsAccess::ReadExec,
                     forced: false,
                 },
                 FsAllowGrant {
                     path: PathBuf::from(r"C:\Program Files\SomeTool"),
-                    writable: true,
+                    access: FsAccess::ReadWrite,
                     forced: true,
                 },
             ],
@@ -1165,9 +1204,9 @@ mod tests {
                     entries[0].path,
                     PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")
                 );
-                assert!(!entries[0].writable);
+                assert_eq!(entries[0].access, FsAccess::ReadExec);
                 assert!(!entries[0].forced);
-                assert!(entries[1].writable);
+                assert_eq!(entries[1].access, FsAccess::ReadWrite);
                 assert!(entries[1].forced);
             }
             other => panic!("unexpected variant: {other:?}"),
@@ -1180,7 +1219,11 @@ mod tests {
     fn forced_field_defaults_to_false_when_absent() {
         let grant: FsAllowGrant =
             serde_json::from_str(r#"{"path":"C:\\x","writable":false}"#).unwrap();
+        assert_eq!(grant.access, FsAccess::ReadExec);
         assert!(!grant.forced);
+        let grant: FsAllowGrant =
+            serde_json::from_str(r#"{"path":"C:\\x","writable":true}"#).unwrap();
+        assert_eq!(grant.access, FsAccess::ReadWrite);
         let revoke: FsAllowRevoke = serde_json::from_str(r#"{"path":"C:\\x"}"#).unwrap();
         assert!(!revoke.forced);
     }

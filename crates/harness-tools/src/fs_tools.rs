@@ -394,6 +394,7 @@ mod tests {
             shell_tier: Default::default(),
             net_proxy: Default::default(),
             net_app: Default::default(),
+            run_shell_path_extra: Vec::new(),
             shell_sees_staged_writes: false,
             vm_sandbox: None,
         };

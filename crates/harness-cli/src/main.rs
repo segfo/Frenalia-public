@@ -179,6 +179,8 @@ enum NetAction {
 enum FsAction {
     /// fs passthrough台帳（ユーザグローバル、D5）を一覧表示する。
     List,
+    /// 到達不能/付与失敗だったfs passthrough候補だけを一覧表示する。
+    Denied,
     /// 指定ルートのfs passthroughを撤収する（再walk revoke + 検証パス + 台帳から除去、D3/D4）。
     Revoke { path: PathBuf },
     /// 台帳の全エントリを撤収する。
@@ -821,6 +823,7 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
             net_app.allow_apps.push(app.clone());
         }
     }
+    let run_shell_path_extra = settings.run_shell.clone().unwrap_or_default().path_extra();
 
     if !cli.fs_allow.is_empty() || cli.force_system_acl {
         eprintln!(
@@ -863,6 +866,7 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
         shell_tier,
         net_proxy,
         net_app,
+        run_shell_path_extra,
         vm_sandbox: None,
     };
     for block in harness_engine::system_blocks_for(&ctx) {
@@ -883,6 +887,14 @@ fn shell_sees_staged_writes(shell_tier: &harness_core::ShellTierSelection) -> bo
     {
         let _ = shell_tier;
         false
+    }
+}
+
+fn to_sandbox_fs_access(access: harness_config::FsAccess) -> harness_sandbox::FsAccess {
+    match access {
+        harness_config::FsAccess::Read => harness_sandbox::FsAccess::Read,
+        harness_config::FsAccess::ReadWrite => harness_sandbox::FsAccess::ReadWrite,
+        harness_config::FsAccess::ReadExec => harness_sandbox::FsAccess::ReadExec,
     }
 }
 
@@ -1058,9 +1070,23 @@ struct FsLedgerEntry {
     forced: bool,
 }
 
+/// 到達不能/付与失敗だったfs passthrough候補。`harness fs list`/`harness fs denied`で表示し、
+/// `.harness/settings.json`の`fs.read`/`fs.read_write`/`fs.read_exec`へ後から足すための材料にする。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FsDeniedLedgerEntry {
+    path: String,
+    access: String,
+    reason: String,
+    last_denied_at_unix_secs: u64,
+    count: u64,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct FsLedger {
+    #[serde(default)]
     entries: Vec<FsLedgerEntry>,
+    #[serde(default)]
+    denied_entries: Vec<FsDeniedLedgerEntry>,
 }
 
 /// traverse台帳（D10の巻き戻し用、`fs-passthrough-ledger.json`とは別ファイル）の1エントリ。
@@ -1186,10 +1212,38 @@ fn record_fs_passthrough_grant(path: &Path, writable: bool, forced: bool) {
         entry.forced = forced;
     } else {
         ledger.entries.push(FsLedgerEntry {
-            path: path_str,
+            path: path_str.clone(),
             writable,
             granted_at_unix_secs: granted_at,
             forced,
+        });
+    }
+    ledger.denied_entries.retain(|e| e.path != path_str);
+    save_fs_ledger(&ledger);
+}
+
+fn record_fs_passthrough_denied(path: &Path, access: &str, reason: &str) {
+    let mut ledger = load_fs_ledger();
+    let path_str = path.to_string_lossy().into_owned();
+    let denied_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(entry) = ledger
+        .denied_entries
+        .iter_mut()
+        .find(|e| e.path == path_str && e.access == access)
+    {
+        entry.reason = reason.to_string();
+        entry.last_denied_at_unix_secs = denied_at;
+        entry.count = entry.count.saturating_add(1);
+    } else {
+        ledger.denied_entries.push(FsDeniedLedgerEntry {
+            path: path_str,
+            access: access.to_string(),
+            reason: reason.to_string(),
+            last_denied_at_unix_secs: denied_at,
+            count: 1,
         });
     }
     save_fs_ledger(&ledger);
@@ -1199,6 +1253,7 @@ fn remove_fs_passthrough_grant(path: &Path) {
     let mut ledger = load_fs_ledger();
     let path_str = path.to_string_lossy().into_owned();
     ledger.entries.retain(|e| e.path != path_str);
+    ledger.denied_entries.retain(|e| e.path != path_str);
     save_fs_ledger(&ledger);
 }
 
@@ -1301,6 +1356,29 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
             }
             for e in &traverse_ledger.entries {
                 println!("{}\tgranted_at_unix={}", e.path, e.granted_at_unix_secs);
+            }
+            println!("=== denied fs passthrough candidates ===");
+            if ledger.denied_entries.is_empty() {
+                println!("(none)");
+            }
+            for e in &ledger.denied_entries {
+                println!(
+                    "{}\t{}\tcount={}\tlast_denied_at_unix={}\t{}",
+                    e.path, e.access, e.count, e.last_denied_at_unix_secs, e.reason
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        FsAction::Denied => {
+            let ledger = load_fs_ledger();
+            if ledger.denied_entries.is_empty() {
+                println!("(no denied fs passthrough candidates recorded)");
+            }
+            for e in &ledger.denied_entries {
+                println!(
+                    "{}\t{}\tcount={}\tlast_denied_at_unix={}\t{}",
+                    e.path, e.access, e.count, e.last_denied_at_unix_secs, e.reason
+                );
             }
             ExitCode::SUCCESS
         }
@@ -1867,6 +1945,7 @@ async fn main() -> ExitCode {
             }
         },
     };
+    harness_config::ensure_project_settings_file(&workspace_root);
 
     // `apply`/`changes`/`discard`サブコマンドはプロバイダ資格情報を一切必要としないため、
     // 他のあらゆる検証より前に処理して即終了する（§非対話モード、プロンプトは一切送らない）。
@@ -2100,6 +2179,7 @@ async fn main() -> ExitCode {
             net_app.allow_apps.push(app.clone());
         }
     }
+    let run_shell_path_extra = settings.run_shell.clone().unwrap_or_default().path_extra();
 
     // シェル隔離Tier選択（M12、`plans/DESIGN-SANDBOX.md` §6/§7 D-03）。`--require-sandbox`指定時は
     // 自動降格せず起動を拒否する（既存の`--dangerously-allow`と同じfail-fastパターン）。
@@ -2124,20 +2204,24 @@ async fn main() -> ExitCode {
     // `.harness/settings.json`の`fs.allow`を和集合でマージする（重複除去、net_appと同形）。
     // 各要素は`<path>[:rw]`（末尾`:rw`が無ければread-only既定、D-13）。パスは`workspace_root`
     // 基準で絶対化する（既に絶対パスなら`Path::join`はそのまま採用する）。
-    let mut fs_allow_raw: Vec<(String, bool)> =
+    let mut fs_allow_raw: Vec<(String, harness_config::FsAccess)> =
         settings.fs.clone().unwrap_or_default().to_fs_passthrough();
     for entry in &cli.fs_allow {
-        let (path, writable) = match entry.strip_suffix(":rw") {
-            Some(p) => (p.to_string(), true),
-            None => (entry.clone(), false),
+        let (path, access) = match entry.strip_suffix(":rw") {
+            Some(p) => (p.to_string(), harness_config::FsAccess::ReadWrite),
+            None => (entry.clone(), harness_config::FsAccess::ReadExec),
         };
         if !fs_allow_raw.iter().any(|(p, _)| p == &path) {
-            fs_allow_raw.push((path, writable));
+            fs_allow_raw.push((path, access));
         }
     }
     // --force-system-acl（D-19）はread-only専用（システムディレクトリへの書込強制は危険すぎる）。
     // `:rw`エントリが1つでもあれば起動を拒否する（fail-fast、--require-sandboxのD7と同じ思想）。
-    if cli.force_system_acl && fs_allow_raw.iter().any(|(_, writable)| *writable) {
+    if cli.force_system_acl
+        && fs_allow_raw
+            .iter()
+            .any(|(_, access)| *access == harness_config::FsAccess::ReadWrite)
+    {
         eprintln!(
             "error: --force-system-acl requires read-only --fs-allow entries (a :rw entry is \
              present); forcing writable ACEs into system-protected paths is refused. Drop :rw or \
@@ -2147,9 +2231,9 @@ async fn main() -> ExitCode {
     }
     let fs_passthrough: Vec<harness_sandbox::FsPassthrough> = fs_allow_raw
         .into_iter()
-        .map(|(path, writable)| harness_sandbox::FsPassthrough {
+        .map(|(path, access)| harness_sandbox::FsPassthrough {
             path: workspace_root.join(&path),
-            writable,
+            access: to_sandbox_fs_access(access),
             forced: cli.force_system_acl,
         })
         .collect();
@@ -2164,7 +2248,7 @@ async fn main() -> ExitCode {
     // 拒否（:roは書込に無関係で許可）。confidentialは範囲外を読めない保証のため:ro/:rwいずれも
     // 拒否する（外部読取穴がconfidentialの機密性保証と正面から矛盾するため、
     // `--net-allow-app`×confidentialと同じfail-fast思想）。
-    let fs_has_write = fs_passthrough.iter().any(|fp| fp.writable);
+    let fs_has_write = fs_passthrough.iter().any(|fp| fp.access.is_read_write());
     match require_sandbox {
         RequireSandbox::WriteContainment if fs_has_write => {
             eprintln!(
@@ -2420,6 +2504,9 @@ async fn main() -> ExitCode {
                 );
             }
         }
+        for (path, access, reason) in &shell_tier.denied_passthrough {
+            record_fs_passthrough_denied(path, access, reason);
+        }
     }
     for warning in &shell_tier.passthrough_warnings {
         eprintln!("warning: {warning}");
@@ -2447,6 +2534,7 @@ async fn main() -> ExitCode {
         shell_tier,
         net_proxy,
         net_app,
+        run_shell_path_extra,
         vm_sandbox: None,
     };
 
@@ -2675,6 +2763,7 @@ mod fs_ledger_tests {
         ]}"#;
         let ledger: FsLedger = serde_json::from_str(legacy).expect("legacy ledger must parse");
         assert_eq!(ledger.entries.len(), 1);
+        assert!(ledger.denied_entries.is_empty());
         assert!(
             !ledger.entries[0].forced,
             "missing forced field must default to false"
@@ -2691,10 +2780,29 @@ mod fs_ledger_tests {
                 granted_at_unix_secs: 1_700_000_000,
                 forced: true,
             }],
+            denied_entries: Vec::new(),
         };
         let json = serde_json::to_string(&ledger).unwrap();
         let back: FsLedger = serde_json::from_str(&json).unwrap();
         assert!(back.entries[0].forced);
+    }
+
+    #[test]
+    fn denied_entries_roundtrip() {
+        let ledger = FsLedger {
+            entries: Vec::new(),
+            denied_entries: vec![super::FsDeniedLedgerEntry {
+                path: r"C:\Users\segfo\.local\bin".to_string(),
+                access: "read_exec".to_string(),
+                reason: "ACE grant failed".to_string(),
+                last_denied_at_unix_secs: 1_700_000_001,
+                count: 2,
+            }],
+        };
+        let json = serde_json::to_string(&ledger).unwrap();
+        let back: FsLedger = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.denied_entries[0].access, "read_exec");
+        assert_eq!(back.denied_entries[0].count, 2);
     }
 }
 

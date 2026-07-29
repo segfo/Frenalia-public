@@ -145,6 +145,10 @@ pub struct ShellTierSelection {
     /// `--fs-allow`穴の診断メッセージ一覧。空なら全穴到達可、または該当なし。Tier選択自体
     /// （`tier`/`downgraded_from`）には影響しない（壊れた穴があってもTier2a・workspaceは継続）。
     pub passthrough_warnings: Vec<String>,
+    /// D8: 到達不能/付与失敗だったfs passthroughの構造化リスト。
+    /// `harness-cli`はこれをユーザグローバル台帳へ記録し、後から`.harness/settings.json`の
+    /// `fs.read`/`fs.read_write`/`fs.read_exec`へ追加するための材料として表示する。
+    pub denied_passthrough: Vec<(std::path::PathBuf, String, String)>,
     /// `--fs-allow`/`fs.allow`のうち、実際にACE付与が確認できた（既存で十分だった場合を含む）
     /// ルートの一覧（`(path, writable)`）。`harness-cli`側の台帳記録はこれだけを書くことで、
     /// `ACCESS_DENIED`で失敗したのに記録だけ残る「幻の台帳エントリ」を防ぐ
@@ -165,6 +169,7 @@ impl ShellTierSelection {
             downgraded_from: None,
             reason: None,
             passthrough_warnings: Vec::new(),
+            denied_passthrough: Vec::new(),
             granted_passthrough: Vec::new(),
             netfilterd_chain_attempted: false,
         }
@@ -176,6 +181,7 @@ impl ShellTierSelection {
             downgraded_from: Some(from),
             reason: Some(reason.into()),
             passthrough_warnings: Vec::new(),
+            denied_passthrough: Vec::new(),
             granted_passthrough: Vec::new(),
             netfilterd_chain_attempted: false,
         }
@@ -184,6 +190,15 @@ impl ShellTierSelection {
     /// D8: fs passthroughの到達不能診断を積む（`direct`/`downgraded`と組み合わせて使う）。
     pub fn with_passthrough_warnings(mut self, warnings: Vec<String>) -> Self {
         self.passthrough_warnings = warnings;
+        self
+    }
+
+    /// 到達不能/付与失敗だったpassthroughルートの一覧を積む。
+    pub fn with_denied_passthrough(
+        mut self,
+        denied: Vec<(std::path::PathBuf, String, String)>,
+    ) -> Self {
+        self.denied_passthrough = denied;
         self
     }
 
@@ -340,6 +355,9 @@ pub struct ToolCtx {
     /// アプリ単位network制御（軸1、D-10/D-11）。既定（`NetAppPolicy::default()`＝`allow_apps`空）は
     /// 常にdeny（Tier2a子はcapability空でnetwork全遮断＝現状維持）。
     pub net_app: NetAppPolicy,
+    /// `run_shell`子プロセスのclean envにあるPATHへ追記するディレクトリ一覧。設定ファイル由来の
+    /// 非シークレット値だけを運び、任意env転送は行わない。
+    pub run_shell_path_extra: Vec<String>,
     /// `run_shell`で起動される子が、直前の`write_file`/`edit_file`によるstaging上の変更を
     /// 読めるかどうか。既定はfalse（多くのTierは実FSだけを見る）で、Tier3+CIFSライブ共有の
     /// ようにstaging変更が子から見える経路だけ呼び出し側がtrueへ上書きする。
@@ -363,6 +381,7 @@ impl ToolCtx {
             shell_tier: ShellTierSelection::default(),
             net_proxy: NetProxyConfig::default(),
             net_app: NetAppPolicy::default(),
+            run_shell_path_extra: Vec::new(),
             shell_sees_staged_writes: false,
             vm_sandbox: None,
         }

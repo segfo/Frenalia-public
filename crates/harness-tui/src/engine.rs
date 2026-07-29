@@ -256,11 +256,13 @@ mod tests {
                 reason: None,
                 downgraded_from: None,
                 granted_passthrough: Vec::new(),
+                denied_passthrough: Vec::new(),
                 passthrough_warnings: Vec::new(),
                 netfilterd_chain_attempted: false,
             },
             net_proxy: NetProxyConfig::default(),
             net_app: NetAppPolicy::default(),
+            run_shell_path_extra: Vec::new(),
             vm_sandbox: None,
         };
         let mut state = ConversationState::new(harness_engine::system_blocks_for(&stale_ctx));

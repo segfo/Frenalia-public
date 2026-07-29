@@ -69,7 +69,7 @@ pub use manifest::{ManifestOp, ManifestTarget};
 pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};
 pub use read_scope::{ReadScope, ReadScopeError};
 pub use secret_env::build_child_env;
-pub use shell_tier::{select_tier, FsPassthrough, TierError};
+pub use shell_tier::{select_tier, FsAccess, FsPassthrough, TierError};
 
 use std::path::{Component, Path, PathBuf};
 

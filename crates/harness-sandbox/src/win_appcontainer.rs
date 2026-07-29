@@ -67,7 +67,7 @@ use windows::Win32::System::Threading::{
     STARTUPINFOW,
 };
 
-use crate::shell_tier::FsPassthrough;
+use crate::shell_tier::{FsAccess, FsPassthrough};
 use crate::win_common::{
     build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, long_path_wide,
     read_two_pipes_to_strings, wide, write_all,
@@ -469,17 +469,33 @@ pub fn grant_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerErr
     Ok(())
 }
 
-/// workspace配下のノードへ read/execute のみを付与する（`grant_ace`のread-only版、D-13）。
-/// `FILE_GENERIC_WRITE`・`DELETE`を含めないため、package SIDはこのルート配下を読取・実行
-/// できるが書込・削除はできない（D-13「read-onlyを既定とする」）。
-fn grant_ace_ro(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainerError> {
-    let access = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
+fn fs_access_mask(access: FsAccess) -> u32 {
+    match access {
+        FsAccess::Read => FILE_GENERIC_READ.0,
+        FsAccess::ReadWrite => FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | DELETE.0,
+        FsAccess::ReadExec => FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0,
+    }
+}
+
+fn grant_ace_access(
+    path: &Path,
+    sid: PSID,
+    is_dir: bool,
+    access: FsAccess,
+) -> Result<(), AppContainerError> {
     let inheritance = if is_dir {
         CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
     } else {
         NO_INHERITANCE
     };
-    grant_ace_mask(path, sid, access, inheritance)
+    grant_ace_mask(path, sid, fs_access_mask(access), inheritance)
+}
+
+/// workspace配下のノードへ read/execute のみを付与する（`grant_ace`のread-only版、D-13）。
+/// `FILE_GENERIC_WRITE`・`DELETE`を含めないため、package SIDはこのルート配下を読取・実行
+/// できるが書込・削除はできない（D-13「read-onlyを既定とする」）。
+fn grant_ace_ro(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainerError> {
+    grant_ace_access(path, sid, is_dir, FsAccess::ReadExec)
 }
 
 /// `grant_ace_recursive`のread-only版（D-13、fs passthroughの既定）。
@@ -515,7 +531,15 @@ pub fn grant_ace_recursive_ro(root: &Path, sid: PSID) -> Result<(), AppContainer
 /// を呼ばずに済むため、数GB規模のツリーで大半が継承境界に阻まれず伝播する場合ほど
 /// `grant_ace_recursive_ro`の全ノード明示付与より高速になる）。
 pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    grant_ace_ro(root, sid, true)?;
+    grant_ace_inheritable_access(root, sid, FsAccess::ReadExec)
+}
+
+pub fn grant_ace_inheritable_access(
+    root: &Path,
+    sid: PSID,
+    access: FsAccess,
+) -> Result<(), AppContainerError> {
+    grant_ace_access(root, sid, true, access)?;
 
     let mut dirs = Vec::new();
     let mut files = Vec::new();
@@ -528,12 +552,12 @@ pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContain
 
     for dir in &dirs {
         if !matches!(sid_ace_mask(dir, sid), Ok(Some(_))) {
-            grant_ace_ro(dir, sid, true)?;
+            grant_ace_access(dir, sid, true, access)?;
         }
     }
     for file in &files {
         if !matches!(sid_ace_mask(file, sid), Ok(Some(_))) {
-            grant_ace_ro(file, sid, false)?;
+            grant_ace_access(file, sid, false, access)?;
         }
     }
     Ok(())
@@ -1096,7 +1120,7 @@ fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Op
         "HARNESS_PASSTHROUGH_DIR".to_string(),
         fp.path.to_string_lossy().into_owned(),
     ));
-    let command = if fp.writable {
+    let command = if fp.access.is_read_write() {
         FS_PASSTHROUGH_RW_PROBE_COMMAND
     } else {
         FS_PASSTHROUGH_RO_PROBE_COMMAND
@@ -1150,6 +1174,7 @@ fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Op
 /// 生むため、幻の台帳エントリより孤立ACEの方を重く見て記録側に倒す）。
 pub struct PreflightOutcome {
     pub warnings: Vec<String>,
+    pub denied_passthrough: Vec<(std::path::PathBuf, String, String)>,
     pub granted_passthrough: Vec<(std::path::PathBuf, bool)>,
     /// `preflight`が特権分離ヘルパーへ`GrantFsAllow`を委譲する経路を実際に通り、その際
     /// `wfp_chain_pipe`が`Some`だったため「処理完了後に`harness-netfilterd`を連鎖起動してほしい」
@@ -1166,12 +1191,8 @@ pub struct PreflightOutcome {
 /// `fp`が要求するアクセスのうち、`preflight`が「既に十分」と判定するために必要な最小マスク
 /// （`grant_ace`/`grant_ace_ro`が実際に付与するマスクと同じ論理和。継承フラグの相違までは
 /// 見ない、`grant_ace_mask`の冪等スキップと同じ考え方）。
-fn required_passthrough_mask(writable: bool) -> u32 {
-    if writable {
-        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0 | DELETE.0
-    } else {
-        FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0
-    }
+fn required_passthrough_mask(access: FsAccess) -> u32 {
+    fs_access_mask(access)
 }
 
 pub fn preflight(
@@ -1193,6 +1214,7 @@ pub fn preflight(
     smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir)?;
 
     let mut warnings = Vec::new();
+    let mut denied_passthrough: Vec<(std::path::PathBuf, String, String)> = Vec::new();
     let mut granted_passthrough: Vec<(std::path::PathBuf, bool)> = Vec::new();
     // 本体プロセス内（非管理者）でACCESS_DENIEDになったエントリ（システム保護パス等）だけを
     // ここへ集め、後段で1回の特権分離ヘルパー要求へまとめる（起動あたりUAC最大1回、
@@ -1202,34 +1224,39 @@ pub fn preflight(
 
     for fp in passthrough {
         if !fp.path.exists() {
-            warnings.push(format!(
-                "fs-allow {} : path does not exist, skipped",
-                fp.path.display()
-            ));
+            let reason = "path does not exist, skipped".to_string();
+            warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
+            denied_passthrough.push((fp.path.clone(), fp.access.label().to_string(), reason));
             continue;
         }
 
         // 事前チェック（決定1）: 既にsid宛のACEが要求マスクの上位集合を持っていれば、
         // 本体内のwalkもprivhelperのUACも一切スキップする（ユーザ所有パスの再実行はUAC無し）。
-        let required = required_passthrough_mask(fp.writable);
+        let required = required_passthrough_mask(fp.access);
         let already_sufficient = matches!(sid_ace_mask(&fp.path, sid.as_psid()), Ok(Some(existing)) if existing & required == required);
         if already_sufficient {
-            granted_passthrough.push((fp.path.clone(), fp.writable));
+            granted_passthrough.push((fp.path.clone(), fp.access.is_read_write()));
             if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
+                denied_passthrough.push((
+                    fp.path.clone(),
+                    fp.access.label().to_string(),
+                    diagnosis.clone(),
+                ));
                 warnings.push(diagnosis);
             }
             continue;
         }
 
-        let grant_result = if fp.writable {
-            grant_ace_recursive(&fp.path, sid.as_psid())
-        } else {
-            grant_ace_inheritable_ro(&fp.path, sid.as_psid())
-        };
+        let grant_result = grant_ace_inheritable_access(&fp.path, sid.as_psid(), fp.access);
         match grant_result {
             Ok(()) => {
-                granted_passthrough.push((fp.path.clone(), fp.writable));
+                granted_passthrough.push((fp.path.clone(), fp.access.is_read_write()));
                 if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
+                    denied_passthrough.push((
+                        fp.path.clone(),
+                        fp.access.label().to_string(),
+                        diagnosis.clone(),
+                    ));
                     warnings.push(diagnosis);
                 }
             }
@@ -1238,6 +1265,11 @@ pub fn preflight(
                 // 通す（禁止パスなら昇格させずここで警告に落とす。無駄なUACを出さない二重化）。
                 if fp.forced {
                     if let Some(reason) = is_force_grant_forbidden(&fp.path) {
+                        denied_passthrough.push((
+                            fp.path.clone(),
+                            fp.access.label().to_string(),
+                            format!("forced system-ACL grant refused: {reason}"),
+                        ));
                         warnings.push(format!(
                             "fs-allow {} : forced system-ACL grant refused: {reason}",
                             fp.path.display()
@@ -1250,7 +1282,7 @@ pub fn preflight(
                 // 特権分離ヘルパー経路へ回す。
                 needs_elevation.push(crate::privhelper::FsAllowGrant {
                     path: fp.path.clone(),
-                    writable: fp.writable,
+                    access: fp.access,
                     forced: fp.forced,
                 });
             }
@@ -1272,13 +1304,8 @@ pub fn preflight(
                         continue;
                     }
                 }
-                let do_grant = || {
-                    if entry.writable {
-                        grant_ace_recursive(&entry.path, sid.as_psid())
-                    } else {
-                        grant_ace_inheritable_ro(&entry.path, sid.as_psid())
-                    }
-                };
+                let do_grant =
+                    || grant_ace_inheritable_access(&entry.path, sid.as_psid(), entry.access);
                 let result = if entry.forced {
                     with_restore_privilege(do_grant)
                 } else {
@@ -1305,23 +1332,29 @@ pub fn preflight(
                     let writable = needs_elevation
                         .iter()
                         .find(|e| &e.path == path)
-                        .map(|e| e.writable)
+                        .map(|e| e.access.is_read_write())
                         .unwrap_or(false);
                     granted_passthrough.push((path.clone(), writable));
                     if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
                         if let Some(diagnosis) =
                             probe_passthrough(sid.as_psid(), workspace_root, fp)
                         {
+                            denied_passthrough.push((
+                                fp.path.clone(),
+                                fp.access.label().to_string(),
+                                diagnosis.clone(),
+                            ));
                             warnings.push(diagnosis);
                         }
                     }
                 }
                 for (path, reason) in &failures {
-                    let writable = needs_elevation
+                    let access = needs_elevation
                         .iter()
                         .find(|e| &e.path == path)
-                        .map(|e| e.writable)
-                        .unwrap_or(false);
+                        .map(|e| e.access)
+                        .unwrap_or(FsAccess::ReadExec);
+                    let writable = access.is_read_write();
                     // BUG-017: grant_ace_recursive/grant_ace_inheritable_roはroot(先頭ノード)から
                     // 順に付与するため、途中の子孫(TrustedInstaller所有等)で失敗しても、rootには
                     // 既にACEが載っている場合がある。「失敗」扱いで台帳へ記録しないと、実FS上には
@@ -1338,6 +1371,11 @@ pub fn preflight(
                             path.display()
                         ));
                     } else {
+                        denied_passthrough.push((
+                            path.clone(),
+                            access.label().to_string(),
+                            format!("ACE grant failed (via privilege-separation helper, D-16): {reason}"),
+                        ));
                         warnings.push(format!(
                             "fs-allow {} : ACE grant failed (via privilege-separation helper, \
                              D-16): {reason}",
@@ -1349,7 +1387,8 @@ pub fn preflight(
             Err(reason) => {
                 for entry in &needs_elevation {
                     if matches!(sid_ace_mask(&entry.path, sid.as_psid()), Ok(Some(_))) {
-                        granted_passthrough.push((entry.path.clone(), entry.writable));
+                        granted_passthrough
+                            .push((entry.path.clone(), entry.access.is_read_write()));
                         warnings.push(format!(
                             "fs-allow {} : partially applied -- the privilege-separation helper \
                              (D-16) could not fully complete ({reason}), but the root itself now \
@@ -1359,6 +1398,13 @@ pub fn preflight(
                             entry.path.display()
                         ));
                     } else {
+                        denied_passthrough.push((
+                            entry.path.clone(),
+                            entry.access.label().to_string(),
+                            format!(
+                                "ACE grant failed: access denied in-process, and the privilege-separation helper (D-16) could not complete either: {reason}"
+                            ),
+                        ));
                         warnings.push(format!(
                             "fs-allow {} : ACE grant failed: access denied in-process, and the \
                              privilege-separation helper (D-16) could not complete either: {reason}",
@@ -1372,6 +1418,7 @@ pub fn preflight(
 
     Ok(PreflightOutcome {
         warnings,
+        denied_passthrough,
         granted_passthrough,
         netfilterd_chain_attempted,
     })
@@ -2975,7 +3022,7 @@ mod traverse_diagnostics {
         grant_ace_recursive_ro(&external, sid.as_psid()).expect("grant_ace_recursive_ro");
         let ro_probe = FsPassthrough {
             path: external.clone(),
-            writable: false,
+            access: FsAccess::ReadExec,
             forced: false,
         };
         let ro_diagnosis = probe_passthrough(sid.as_psid(), &workspace, &ro_probe);
@@ -2985,7 +3032,7 @@ mod traverse_diagnostics {
         );
         let rw_probe_against_ro_grant = FsPassthrough {
             path: external.clone(),
-            writable: true,
+            access: FsAccess::ReadWrite,
             forced: false,
         };
         let write_should_fail =
@@ -2999,7 +3046,7 @@ mod traverse_diagnostics {
         grant_ace_recursive(&external, sid.as_psid()).expect("grant_ace_recursive (rw)");
         let rw_probe = FsPassthrough {
             path: external.clone(),
-            writable: true,
+            access: FsAccess::ReadWrite,
             forced: false,
         };
         let rw_diagnosis = probe_passthrough(sid.as_psid(), &workspace, &rw_probe);
