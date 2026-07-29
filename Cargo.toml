@@ -12,6 +12,7 @@ members = [
     "crates/harness-engine",
     "crates/harness-tui",
     "crates/harness-cli",
+    "crates/tier1a-net-e2e",
 ]
 
 [workspace.package]
