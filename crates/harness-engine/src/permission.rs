@@ -135,7 +135,7 @@ impl PermissionArbiter {
         }
         // D-05（`plans/DESIGN-SANDBOX.md` §7）: 設定注入パス（`.git/config`・
         // `.harness/**`等）へのwrite_file/edit_fileはmode/allowlistに関わらず常に拒否する
-        // （層3 hard-deny、Tier1/Tier2内でも解除しない。T-07/T-08対策）。allowlist一致・
+        // （層3 hard-deny、Tier1/Tier2b内でも解除しない。T-07/T-08対策）。allowlist一致・
         // AcceptAllより前に評価する（T-09と同じ「強制」パターン）。run_shellは対象外
         // （arg_reprがコマンド行のため誤爆する。D-06のgitハードニング+overlay apply時の
         // 再チェックが担当）。

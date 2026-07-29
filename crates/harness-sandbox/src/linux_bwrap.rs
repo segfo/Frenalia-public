@@ -1,4 +1,4 @@
-//! Linux Tier2: bubblewrap（user+mount+network namespace + OverlayFS）。
+//! Linux Tier2b: bubblewrap（user+mount+network namespace + OverlayFS）。
 //! `plans/DESIGN-SANDBOX.md` §6.2参照。
 //!
 //! **本セッションでは実機未検証**（この作業環境はWindows専用でLinux実機が無い）。
@@ -6,7 +6,7 @@
 //!
 //! bwrap自体が特権プリミティブ（user/mount/network namespace + OverlayFS）を握るため、
 //! harness側は`bwrap`を通常の子プロセスとして起動するだけでよく（`tokio::process::Command`を
-//! そのまま流用できる、Windows Tier1bのような独自FFIが不要）、既存の非同期I/O構造を変えずに
+//! そのまま流用できる、Windows Tier1のような独自FFIが不要）、既存の非同期I/O構造を変えずに
 //! 済む。
 //!
 //! 【T1】lowerを実FS全体にしない: workspace + ツールチェーン必須パスのみ`--ro-bind`し、
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// （呼び出し側=`harness-tools::shell`が`sh -c`分を付与する）。
 pub struct BwrapConfig {
     pub workspace_root: PathBuf,
-    /// COW upperの置き場所（`.harness/sandbox/<session>/tier2-upper`等、workspace内相対推奨）。
+    /// COW upperの置き場所（`.harness/sandbox/<session>/Tier2b-upper`等、workspace内相対推奨）。
     pub upper_dir: PathBuf,
     /// bwrapの作業用ディレクトリ（overlay workdir、upperと同階層に置く）。
     pub work_dir: PathBuf,
@@ -90,8 +90,8 @@ mod tests {
     fn build_args_includes_overlay_and_namespace_flags() {
         let config = BwrapConfig {
             workspace_root: PathBuf::from("/home/u/project"),
-            upper_dir: PathBuf::from("/home/u/project/.harness/sandbox/s1/tier2-upper"),
-            work_dir: PathBuf::from("/home/u/project/.harness/sandbox/s1/tier2-work"),
+            upper_dir: PathBuf::from("/home/u/project/.harness/sandbox/s1/Tier2b-upper"),
+            work_dir: PathBuf::from("/home/u/project/.harness/sandbox/s1/Tier2b-work"),
         };
         let args = build_args(&config);
         assert!(args.contains(&"--unshare-net".to_string()));

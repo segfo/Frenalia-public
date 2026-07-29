@@ -170,7 +170,7 @@ fn render_os_and_shell(os: &OsKind, tier: ShellTier) -> String {
 fn render_workspace_root(workspace_root: &std::path::Path, tier: ShellTier) -> String {
     match tier {
         ShellTier::Tier3 => TIER3_WORKSPACE_ROOT.to_string(),
-        ShellTier::Tier2 | ShellTier::Tier1a | ShellTier::Tier1b | ShellTier::Tier0 => {
+        ShellTier::Tier2b | ShellTier::Tier2a | ShellTier::Tier1 | ShellTier::Tier0 => {
             workspace_root.display().to_string()
         }
     }
@@ -281,20 +281,20 @@ fn tier_line(tier: ShellTier) -> String {
              network egressはVM境界で物理的に拒否されます。"
                 .to_string()
         }
-        ShellTier::Tier2 => {
-            "シェル隔離: Tier2（Linux bubblewrap）。ワークスペース外への書込・network egressは\
+        ShellTier::Tier2b => {
+            "シェル隔離: Tier2b（Linux bubblewrap）。ワークスペース外への書込・network egressは\
              namespace境界で物理的に拒否されます。"
                 .to_string()
         }
-        ShellTier::Tier1a => {
-            "シェル隔離: Tier1a（Windows AppContainer）。ワークスペース外への書込・読取・\
+        ShellTier::Tier2a => {
+            "シェル隔離: Tier2a（Windows AppContainer）。ワークスペース外への書込・読取・\
              network egressはOSのcapability機構により既定で物理的に拒否されます\
              （--net-allow-appで許可した単一コマンドを除く。|・&&・;等で連結すると許可は\
              外れます）。"
                 .to_string()
         }
-        ShellTier::Tier1b => {
-            "シェル隔離: Tier1b（Windows制限トークン+低IL）。cwd配下への書込は拘束されますが、\
+        ShellTier::Tier1 => {
+            "シェル隔離: Tier1（Windows制限トークン+低IL）。cwd配下への書込は拘束されますが、\
              ワークスペース外の読取は拒否されません。networkは遮断されません。"
                 .to_string()
         }
@@ -382,9 +382,9 @@ mod tests {
     fn render_is_stable_across_all_tier_and_staging_combinations() {
         let tiers = [
             ShellTier::Tier0,
-            ShellTier::Tier1a,
-            ShellTier::Tier1b,
-            ShellTier::Tier2,
+            ShellTier::Tier2a,
+            ShellTier::Tier1,
+            ShellTier::Tier2b,
             ShellTier::Tier3,
         ];
         let modes = [
@@ -409,7 +409,7 @@ mod tests {
     /// 各制約の代表文がレンダリング結果に2回以上現れないこと（重複検出、モジュールdoc）。
     #[test]
     fn render_does_not_duplicate_facts() {
-        let facts = facts_for(ShellTier::Tier1a, StagingMode::Staged);
+        let facts = facts_for(ShellTier::Tier2a, StagingMode::Staged);
         let rendered = render(&facts);
         let workspace_root_mentions = rendered.matches("ワークスペースルート:").count();
         assert_eq!(workspace_root_mentions, 1, "{rendered}");
@@ -423,11 +423,11 @@ mod tests {
     fn downgraded_tier_mentions_both_tiers_and_reason() {
         let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
         ctx.shell_tier =
-            ShellTierSelection::downgraded(ShellTier::Tier1a, ShellTier::Tier1b, "test reason");
+            ShellTierSelection::downgraded(ShellTier::Tier2a, ShellTier::Tier1, "test reason");
         let facts = EnvironmentFacts::from_tool_ctx(&ctx);
         let rendered = render(&facts);
-        assert!(rendered.contains("tier1a"));
-        assert!(rendered.contains("tier1b"));
+        assert!(rendered.contains("Tier2a"));
+        assert!(rendered.contains("Tier1"));
         assert!(rendered.contains("test reason"));
     }
 
@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn windows_non_tier3_prompt_keeps_powershell_shell_guidance() {
-        let mut facts = facts_for(ShellTier::Tier1b, StagingMode::Live);
+        let mut facts = facts_for(ShellTier::Tier1, StagingMode::Live);
         facts.os = OsKind::Windows;
         facts.workspace_root = PathBuf::from(r"C:\Users\me\project");
 

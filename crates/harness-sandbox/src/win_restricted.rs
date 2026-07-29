@@ -1,4 +1,4 @@
-//! Windows Tier1b: Restricted Token + 低Integrity Level + Job Object。
+//! Windows Tier1: Restricted Token + 低Integrity Level + Job Object。
 //! `plans/DESIGN-SANDBOX.md` §6.3/§4.3参照。
 //!
 //! 自プロセスのトークンを複製し`CreateRestrictedToken`で全特権を無効化した上、
@@ -14,9 +14,9 @@
 //! 既にMedium ILで存在する既存ファイル（過去の非隔離buildの成果物等）への上書きは失敗し得る
 //! （既存ファイルへ遡ってラベルを再帰付与するのは、ユーザの実リポジトリのACLを広範囲に変更する
 //! 破壊的操作になるため意図的に行わない）。cwd外への書込は既定Mediumラベルのため一貫して拒否
-//! される（範囲外書込拒否＝Tier1bの本来の保証、T-05）。
+//! される（範囲外書込拒否＝Tier1の本来の保証、T-05）。
 //!
-//! この機密性・network遮断の欠落を埋める実験的Tier1a（AppContainer）は`win_appcontainer`参照。
+//! この機密性・network遮断の欠落を埋める実験的Tier2a（AppContainer）は`win_appcontainer`参照。
 //! 低レベルのパイプ/HANDLE/env補助関数は`win_common`に共通化されている。
 
 use std::path::Path;
@@ -66,7 +66,7 @@ const LOW_IL_SDDL: &str = "S-1-16-4096";
 pub fn set_low_integrity_label(dir: &Path) -> Result<(), RestrictedError> {
     // SDDL: "S:(ML;NI;NW;;;LW)" = SACL(mandatory label)、no-inherit（子孫へ伝播させない）、
     // no-write-up、対象SIDはLow mandatory level。
-    // CIOI（container+object inherit）だと .harness/sandbox/tier1a-tmp にもラベルが継承され、
+    // CIOI（container+object inherit）だと .harness/sandbox/Tier2a-tmp にもラベルが継承され、
     // Low IL 相当の AppContainer プロセスからの書込みが PRIVILEGE NOT HELD で拒否される（BUG-018）。
     const SDDL_LOW_LABEL: &str = "S:(ML;NI;NW;;;LW)";
     unsafe {

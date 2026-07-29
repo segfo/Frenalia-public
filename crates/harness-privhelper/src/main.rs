@@ -25,6 +25,6 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(not(windows))]
 fn main() -> std::process::ExitCode {
-    eprintln!("harness-privhelper is Windows-only (Tier1a D-16 privilege-separation helper)");
+    eprintln!("harness-privhelper is Windows-only (Tier2a D-16 privilege-separation helper)");
     std::process::ExitCode::FAILURE
 }

@@ -18,7 +18,7 @@
 //! **プロトコル**: 1回のセッションで2往復のメッセージをやり取りする。
 //! 1. 親→daemon: [`NetfilterRequest::ApplyRules`] → daemon: [`NetfilterResponse::Applied`]
 //!    （ここでdaemonはパイプを閉じずに待機を続ける。以降harnessセッションが終わるまで、
-//!    Tier1aの`run_shell`は何度呼ばれてもこの1つのdaemonが引き続き宛先を強制する）
+//!    Tier2aの`run_shell`は何度呼ばれてもこの1つのdaemonが引き続き宛先を強制する）
 //! 2. 親→daemon: [`NetfilterRequest::Teardown`] → daemon: [`NetfilterResponse::TornDown`] → daemon終了
 //!    （`harness`本体プロセスの終了時に1回だけ送る、`crates/harness-cli/src/main.rs`参照）
 //!
@@ -371,7 +371,7 @@ unsafe fn launch_daemon_elevated(
 }
 
 /// 常駐daemonへの接続を表す。`stop`を呼ぶまでパイプ・プロセスハンドルを保持し続ける
-/// （＝WFPフィルタが有効であり続ける）。呼び出し側（`run_shell`のTier1a起動経路）は
+/// （＝WFPフィルタが有効であり続ける）。呼び出し側（`run_shell`のTier2a起動経路）は
 /// harnessセッション全体（複数の`run_shell`呼び出しにまたがる）の生存期間中これを保持し、
 /// セッション終了時に`stop`を呼ぶ（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）。
 ///

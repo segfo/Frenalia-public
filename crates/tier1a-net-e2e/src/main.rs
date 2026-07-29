@@ -11,11 +11,11 @@ use serde_json::{json, Map, Value};
 
 const EXAMPLE_IP: [u8; 4] = [172, 66, 147, 243];
 const EXAMPLE_VIRTUAL_HOST: &str = "example.jp";
-const USER_AGENT_VALUE: &str = "harness-tier1a-e2e/1.0";
+const USER_AGENT_VALUE: &str = "harness-Tier2a-e2e/1.0";
 
 #[derive(Parser)]
-#[command(name = "tier1a-net-e2e")]
-#[command(about = "Tier1a network E2E probes as a single Rust binary")]
+#[command(name = "tier2a-net-e2e")]
+#[command(about = "Tier2a network E2E probes as a single Rust binary")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -220,7 +220,7 @@ fn probes_for_case(case: CaseKind) -> Vec<(String, Vec<String>, Probe, bool)> {
             vec![(
                 "example.com raw IPv4".to_string(),
                 vec![
-                    "tier1a-net-e2e".to_string(),
+                    "tier2a-net-e2e".to_string(),
                     "raw-connect".to_string(),
                     args.host.clone(),
                     args.port.to_string(),
@@ -244,7 +244,7 @@ fn probes_for_case(case: CaseKind) -> Vec<(String, Vec<String>, Probe, bool)> {
                     max_body: 160,
                 };
                 let cmd = vec![
-                    "tier1a-net-e2e".to_string(),
+                    "tier2a-net-e2e".to_string(),
                     "fetch-url".to_string(),
                     args.url.clone(),
                     "--label".to_string(),
@@ -273,7 +273,7 @@ fn fetch_probe(
     (
         name.to_string(),
         vec![
-            "tier1a-net-e2e".to_string(),
+            "tier2a-net-e2e".to_string(),
             "fetch-url".to_string(),
             url.to_string(),
             "--label".to_string(),

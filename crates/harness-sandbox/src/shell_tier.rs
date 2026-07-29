@@ -29,12 +29,12 @@ fn satisfies(tier: ShellTier, require: RequireSandbox) -> bool {
         RequireSandbox::None => true,
         RequireSandbox::WriteContainment => matches!(
             tier,
-            ShellTier::Tier3 | ShellTier::Tier2 | ShellTier::Tier1a | ShellTier::Tier1b
+            ShellTier::Tier3 | ShellTier::Tier2b | ShellTier::Tier2a | ShellTier::Tier1
         ),
         RequireSandbox::Confidential => {
             matches!(
                 tier,
-                ShellTier::Tier3 | ShellTier::Tier2 | ShellTier::Tier1a
+                ShellTier::Tier3 | ShellTier::Tier2b | ShellTier::Tier2a
             )
         }
     }
@@ -48,7 +48,7 @@ fn require_label(require: RequireSandbox) -> &'static str {
     }
 }
 
-/// Tier1a向けfs passthrough記述子（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md` §5.1）。
+/// Tier2a向けfs passthrough記述子（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md` §5.1）。
 /// package SIDへ追加ルート（`workspace_root`外）の許可ACEを付与する対象を表す。
 /// `writable=false`が既定（read-only、書込は明示`:rw`指定時のみ`true`）。
 /// Windows以外では値を運ぶだけで`best_effort_tier`のLinux/other分岐からは無視される
@@ -67,16 +67,16 @@ pub struct FsPassthrough {
 /// OS能力プローブ結果。テストから注入できるようにフィールドを公開する。
 #[derive(Debug, Clone, Default)]
 pub struct Probes {
-    /// LinuxでのみTier2候補にする。`bwrap`バイナリのパスが見つかったか。
+    /// LinuxでのみTier2b候補にする。`bwrap`バイナリのパスが見つかったか。
     pub bwrap_path: Option<PathBuf>,
     /// `/proc/sys/kernel/unprivileged_userns_clone`の値（`Some(false)`なら明示的に無効）。
     /// 読めない/存在しない場合は`None`（多くのディストロは既定で有効なので許可側に倒す）。
     pub unprivileged_userns_enabled: Option<bool>,
-    /// Windows Tier1a（AppContainer）のプリフライト結果をテストから注入する
+    /// Windows Tier2a（AppContainer）のプリフライト結果をテストから注入する
     /// （`None`なら本番同様に実際の`win_appcontainer::preflight`を呼ぶ、`Some(..)`なら
     /// テストが結果を固定する）。プロファイル作成+実FS再帰ACL書込という副作用ありの重い
     /// 処理なので、単体テストで実Win32を呼ばずに分岐ロジックだけを検証するために使う。
-    pub tier1a_preflight_override: Option<Result<(), String>>,
+    pub tier2a_preflight_override: Option<Result<(), String>>,
     /// Windows Tier3（Hyper-V外層VM + Incusコンテナ）の可否をテストから注入する
     /// （`None`なら本番同様にゴールデン像VHDXの存在チェックのみ行う——VM起動自体は`run_shell`
     /// 呼び出し時に`harness-cli`が`VmSandboxHandle::start`で行うため、Tier選択時点では
@@ -104,13 +104,13 @@ impl Probes {
     }
 
     #[cfg(target_os = "linux")]
-    fn linux_tier2_available(&self) -> bool {
+    fn linux_tier2b_available(&self) -> bool {
         self.bwrap_path.is_some() && self.unprivileged_userns_enabled.unwrap_or(true)
     }
 }
 
 /// 現在のOSでの最上位Tierを選択する（`require`違反時は降格せず`TierError`）。
-/// Windowsではフラグ無しでもTier1aを常時プローブする（Linuxのbwrapプローブと同じ
+/// Windowsではフラグ無しでもTier2aを常時プローブする（Linuxのbwrapプローブと同じ
 /// 「フラグなし常時プローブ」構造、`--sandbox`自動カスケード実装ラウンドでD-02を見直した）。
 /// `opt_in_tier3`は`--sandbox`/`--experimental-tier3`の実装。
 pub fn select_tier(
@@ -174,24 +174,24 @@ fn probe_tier3_available() -> Result<(), String> {
     Ok(())
 }
 
-/// Tier1aのプローブ本体（成功ならTier1a直接選択のための`ShellTierSelection`、失敗なら理由文字列）。
+/// Tier2aのプローブ本体（成功ならTier2a直接選択のための`ShellTierSelection`、失敗なら理由文字列）。
 /// `best_effort_tier`の2箇所（フラグなしの既定パス、Tier3失敗時のカスケード先）から共有する。
 #[cfg(target_os = "windows")]
-fn try_tier1a(
+fn try_tier2a(
     workspace_root: &Path,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
     probes: &Probes,
 ) -> Result<ShellTierSelection, String> {
-    match &probes.tier1a_preflight_override {
-        Some(Ok(())) => Ok(ShellTierSelection::direct(ShellTier::Tier1a)),
+    match &probes.tier2a_preflight_override {
+        Some(Ok(())) => Ok(ShellTierSelection::direct(ShellTier::Tier2a)),
         Some(Err(reason)) => Err(reason.clone()),
         // テスト注入が無い場合のみ実際のWin32 preflightを呼ぶ（副作用ありの重い処理を
         // 単体テストでは避ける、既存の分岐と同じ考え方）。D8: passthroughの到達不能は
         // Tier選択自体を左右せず`passthrough_warnings`として運ぶだけ。
         None => {
             match crate::win_appcontainer::preflight(workspace_root, passthrough, wfp_chain_pipe) {
-                Ok(outcome) => Ok(ShellTierSelection::direct(ShellTier::Tier1a)
+                Ok(outcome) => Ok(ShellTierSelection::direct(ShellTier::Tier2a)
                     .with_passthrough_warnings(outcome.warnings)
                     .with_granted_passthrough(outcome.granted_passthrough)
                     .with_netfilterd_chain_attempted(outcome.netfilterd_chain_attempted)),
@@ -209,10 +209,10 @@ fn best_effort_tier(
     wfp_chain_pipe: Option<String>,
     probes: &Probes,
 ) -> ShellTierSelection {
-    // Tier3はTier1a/Tier1bとは独立のオプトイン（`--sandbox`/`--experimental-tier3`）。指定時は
+    // Tier3はTier2a/Tier1とは独立のオプトイン（`--sandbox`/`--experimental-tier3`）。指定時は
     // 最優先で試す（Tier3が唯一vNIC単位で出口を強制できるTierのため、成立するなら常に最良）。
-    // 不成立の場合はTier1aへカスケードする（`--sandbox`実装ラウンドでの変更点: 従来は
-    // Tier1bへ直接降格していたが、Tier1aが既定プローブ対象になったため中間段階として試す）。
+    // 不成立の場合はTier2aへカスケードする（`--sandbox`実装ラウンドでの変更点: 従来は
+    // Tier1へ直接降格していたが、Tier2aが既定プローブ対象になったため中間段階として試す）。
     if opt_in_tier3 {
         let probe_result = match &probes.tier3_available_override {
             Some(r) => r.clone(),
@@ -220,33 +220,33 @@ fn best_effort_tier(
         };
         return match probe_result {
             Ok(()) => ShellTierSelection::direct(ShellTier::Tier3),
-            Err(tier3_reason) => match try_tier1a(workspace_root, passthrough, wfp_chain_pipe, probes) {
-                Ok(tier1a_selection) => {
-                    // Tier1aへ実際に着地するので、「なぜTier3ではないか」を理由として持たせる
-                    // （既存の単発降格の形をそのまま踏襲、Tier1a到達自体は成功のため
-                    // `tier1a_selection`が運ぶpassthrough_warnings等のビルダ値は保持する）。
+            Err(tier3_reason) => match try_tier2a(workspace_root, passthrough, wfp_chain_pipe, probes) {
+                Ok(tier2a_selection) => {
+                    // Tier2aへ実際に着地するので、「なぜTier3ではないか」を理由として持たせる
+                    // （既存の単発降格の形をそのまま踏襲、Tier2a到達自体は成功のため
+                    // `tier2a_selection`が運ぶpassthrough_warnings等のビルダ値は保持する）。
                     ShellTierSelection {
                         downgraded_from: Some(ShellTier::Tier3),
                         reason: Some(tier3_reason),
-                        ..tier1a_selection
+                        ..tier2a_selection
                     }
                 }
-                Err(tier1a_reason) => ShellTierSelection::downgraded(
+                Err(tier2a_reason) => ShellTierSelection::downgraded(
                     ShellTier::Tier3,
-                    ShellTier::Tier1b,
+                    ShellTier::Tier1,
                     format!(
-                        "Tier3 unavailable ({tier3_reason}); Tier1a preflight also failed ({tier1a_reason})"
+                        "Tier3 unavailable ({tier3_reason}); Tier2a preflight also failed ({tier2a_reason})"
                     ),
                 ),
             },
         };
     }
 
-    // フラグなしの既定パス: Tier1aを無条件にプローブする（Linuxのbwrapプローブと同じ
+    // フラグなしの既定パス: Tier2aを無条件にプローブする（Linuxのbwrapプローブと同じ
     // 「フラグなし常時プローブ」構造、D-02見直し後の既定）。
-    match try_tier1a(workspace_root, passthrough, wfp_chain_pipe, probes) {
+    match try_tier2a(workspace_root, passthrough, wfp_chain_pipe, probes) {
         Ok(selection) => selection,
-        Err(reason) => ShellTierSelection::downgraded(ShellTier::Tier1a, ShellTier::Tier1b, reason),
+        Err(reason) => ShellTierSelection::downgraded(ShellTier::Tier2a, ShellTier::Tier1, reason),
     }
 }
 
@@ -258,8 +258,8 @@ fn best_effort_tier(
     _wfp_chain_pipe: Option<String>,
     probes: &Probes,
 ) -> ShellTierSelection {
-    if probes.linux_tier2_available() {
-        ShellTierSelection::direct(ShellTier::Tier2)
+    if probes.linux_tier2b_available() {
+        ShellTierSelection::direct(ShellTier::Tier2b)
     } else {
         let reason = if probes.bwrap_path.is_none() {
             "bwrap not found on PATH".to_string()
@@ -267,7 +267,7 @@ fn best_effort_tier(
             "unprivileged user namespaces are disabled (/proc/sys/kernel/unprivileged_userns_clone=0)"
                 .to_string()
         };
-        ShellTierSelection::downgraded(ShellTier::Tier2, ShellTier::Tier0, reason)
+        ShellTierSelection::downgraded(ShellTier::Tier2b, ShellTier::Tier0, reason)
     }
 }
 
@@ -280,7 +280,7 @@ fn best_effort_tier(
     _probes: &Probes,
 ) -> ShellTierSelection {
     ShellTierSelection::downgraded(
-        ShellTier::Tier2,
+        ShellTier::Tier2b,
         ShellTier::Tier0,
         "no native shell isolation tier implemented for this OS (macOS Seatbelt is future work, see plans/DESIGN-SANDBOX.md §6.6)",
     )
@@ -295,13 +295,13 @@ mod tests {
     }
 
     /// `--sandbox`自動カスケード実装ラウンドでD-02を見直した: Windowsはフラグ無しでも
-    /// Tier1aを常時プローブする（Linuxのbwrapプローブと対称的な構造）。preflight成功時は
-    /// Tier1aへ直接着地する。
+    /// Tier2aを常時プローブする（Linuxのbwrapプローブと対称的な構造）。preflight成功時は
+    /// Tier2aへ直接着地する。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_default_selects_tier1a_when_preflight_succeeds() {
+    fn windows_default_selects_tier2a_when_preflight_succeeds() {
         let probes = Probes {
-            tier1a_preflight_override: Some(Ok(())),
+            tier2a_preflight_override: Some(Ok(())),
             ..Default::default()
         };
         let selection = select_tier_with_probes(
@@ -313,19 +313,19 @@ mod tests {
             &probes,
         )
         .unwrap();
-        assert_eq!(selection.tier, ShellTier::Tier1a);
+        assert_eq!(selection.tier, ShellTier::Tier2a);
         assert!(selection.downgraded_from.is_none());
         assert!(!selection.is_unisolated());
     }
 
-    /// 同じくD-02見直し後の既定パス: Tier1a preflightが失敗すればTier1bへ降格する
-    /// （旧`windows_defaults_to_tier1b`/`windows_opt_in_with_failed_preflight_downgrades_to_tier1b`
+    /// 同じくD-02見直し後の既定パス: Tier2a preflightが失敗すればTier1へ降格する
+    /// （旧`windows_defaults_to_Tier1`/`windows_opt_in_with_failed_preflight_downgrades_to_Tier1`
     /// を統合）。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_default_downgrades_to_tier1b_when_preflight_fails() {
+    fn windows_default_downgrades_to_tier1_when_preflight_fails() {
         let probes = Probes {
-            tier1a_preflight_override: Some(Err("acl grant failed".to_string())),
+            tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
             ..Default::default()
         };
         let selection = select_tier_with_probes(
@@ -337,16 +337,16 @@ mod tests {
             &probes,
         )
         .unwrap();
-        assert_eq!(selection.tier, ShellTier::Tier1b);
-        assert_eq!(selection.downgraded_from, Some(ShellTier::Tier1a));
+        assert_eq!(selection.tier, ShellTier::Tier1);
+        assert_eq!(selection.downgraded_from, Some(ShellTier::Tier2a));
         assert!(selection.reason.is_some());
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_require_confidential_rejects_tier1b() {
+    fn windows_require_confidential_rejects_tier1() {
         let probes = Probes {
-            tier1a_preflight_override: Some(Err("not available on this test host".to_string())),
+            tier2a_preflight_override: Some(Err("not available on this test host".to_string())),
             ..Default::default()
         };
         let err = select_tier_with_probes(
@@ -363,9 +363,9 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_require_write_containment_passes_tier1b() {
+    fn windows_require_write_containment_passes_tier1() {
         let probes = Probes {
-            tier1a_preflight_override: Some(Err("not available on this test host".to_string())),
+            tier2a_preflight_override: Some(Err("not available on this test host".to_string())),
             ..Default::default()
         };
         let selection = select_tier_with_probes(
@@ -377,14 +377,14 @@ mod tests {
             &probes,
         )
         .unwrap();
-        assert_eq!(selection.tier, ShellTier::Tier1b);
+        assert_eq!(selection.tier, ShellTier::Tier1);
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_default_tier1a_satisfies_confidential() {
+    fn windows_default_tier2a_satisfies_confidential() {
         let probes = Probes {
-            tier1a_preflight_override: Some(Ok(())),
+            tier2a_preflight_override: Some(Ok(())),
             ..Default::default()
         };
         let selection = select_tier_with_probes(
@@ -396,15 +396,15 @@ mod tests {
             &probes,
         )
         .unwrap();
-        assert_eq!(selection.tier, ShellTier::Tier1a);
+        assert_eq!(selection.tier, ShellTier::Tier2a);
     }
 
-    /// B1-B3の回帰: passthrough引数追加後もTier1a preflightの既存分岐（成功/失敗）は不変。
+    /// B1-B3の回帰: passthrough引数追加後もTier2a preflightの既存分岐（成功/失敗）は不変。
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_passthrough_argument_does_not_affect_override_branches() {
         let probes = Probes {
-            tier1a_preflight_override: Some(Ok(())),
+            tier2a_preflight_override: Some(Ok(())),
             ..Default::default()
         };
         let passthrough = vec![FsPassthrough {
@@ -423,19 +423,19 @@ mod tests {
         .unwrap();
         // オーバーライドが刺さっている限り、実際のpreflightは呼ばれず
         // passthrough_warningsも実プローブ由来では埋まらない（空のまま）。
-        assert_eq!(selection.tier, ShellTier::Tier1a);
+        assert_eq!(selection.tier, ShellTier::Tier2a);
         assert!(selection.passthrough_warnings.is_empty());
     }
 
     /// 未解決事項2 決定5の回帰テスト: FSプローブ失敗（この機種のtraverse ACE欠如を模す）で
-    /// Tier1aがTier1bへ丸ごと降格すると、`confidential`はTier1bを満たさないため、黙って
-    /// Tier1bで起動するのではなく`TierError`で起動前に拒否されなければならない
+    /// Tier2aがTier1へ丸ごと降格すると、`confidential`はTier1を満たさないため、黙って
+    /// Tier1で起動するのではなく`TierError`で起動前に拒否されなければならない
     /// （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3参照）。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_tier1a_failure_rejects_confidential() {
+    fn windows_tier2a_failure_rejects_confidential() {
         let probes = Probes {
-            tier1a_preflight_override: Some(Err(
+            tier2a_preflight_override: Some(Err(
                 "workspace FS I/O denied inside AppContainer".to_string()
             )),
             ..Default::default()
@@ -491,15 +491,15 @@ mod tests {
         assert_eq!(selection.tier, ShellTier::Tier3);
     }
 
-    /// `--sandbox`実装ラウンドでの変更点: Tier3が不成立でもTier1aへカスケードするようになった
-    /// （旧版は直接Tier1bへ降格していた）。Tier1a preflightが成功する状況を注入し、
-    /// Tier1aへ着地すること・`downgraded_from`がTier3のままであることを確認する。
+    /// `--sandbox`実装ラウンドでの変更点: Tier3が不成立でもTier2aへカスケードするようになった
+    /// （旧版は直接Tier1へ降格していた）。Tier2a preflightが成功する状況を注入し、
+    /// Tier2aへ着地すること・`downgraded_from`がTier3のままであることを確認する。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_opt_in_tier3_unavailable_cascades_to_tier1a() {
+    fn windows_opt_in_tier3_unavailable_cascades_to_tier2a() {
         let probes = Probes {
             tier3_available_override: Some(Err("golden image not found".to_string())),
-            tier1a_preflight_override: Some(Ok(())),
+            tier2a_preflight_override: Some(Ok(())),
             ..Default::default()
         };
         let selection = select_tier_with_probes(
@@ -511,19 +511,19 @@ mod tests {
             &probes,
         )
         .unwrap();
-        assert_eq!(selection.tier, ShellTier::Tier1a);
+        assert_eq!(selection.tier, ShellTier::Tier2a);
         assert_eq!(selection.downgraded_from, Some(ShellTier::Tier3));
         assert!(selection.reason.is_some());
     }
 
-    /// Tier3・Tier1aの両方が不成立の場合は最終的にTier1bへ降格し、`downgraded_from`は
+    /// Tier3・Tier2aの両方が不成立の場合は最終的にTier1へ降格し、`downgraded_from`は
     /// （カスケードの起点である）Tier3のまま、`reason`は両方の失敗理由を含む。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_opt_in_tier3_and_tier1a_both_unavailable_downgrades_to_tier1b() {
+    fn windows_opt_in_tier3_and_tier2a_both_unavailable_downgrades_to_tier1() {
         let probes = Probes {
             tier3_available_override: Some(Err("golden image not found".to_string())),
-            tier1a_preflight_override: Some(Err("acl grant failed".to_string())),
+            tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
             ..Default::default()
         };
         let selection = select_tier_with_probes(
@@ -535,7 +535,7 @@ mod tests {
             &probes,
         )
         .unwrap();
-        assert_eq!(selection.tier, ShellTier::Tier1b);
+        assert_eq!(selection.tier, ShellTier::Tier1);
         assert_eq!(selection.downgraded_from, Some(ShellTier::Tier3));
         let reason = selection.reason.unwrap();
         assert!(reason.contains("golden image not found"));
@@ -546,11 +546,11 @@ mod tests {
     #[test]
     fn windows_without_opt_in_never_selects_tier3() {
         // `opt_in_tier3=false`なら、たとえTier3の可用性チェックが成功する状況を注入しても
-        // 絶対にTier3へ行かない（既定パスはTier1aプローブへ入る、`tier1a_preflight_override`を
-        // Errにして本テストの既存アサーション=Tier1bを保つ）。
+        // 絶対にTier3へ行かない（既定パスはTier2aプローブへ入る、`tier2a_preflight_override`を
+        // Errにして本テストの既存アサーション=Tier1を保つ）。
         let probes = Probes {
             tier3_available_override: Some(Ok(())),
-            tier1a_preflight_override: Some(Err("not tested here".to_string())),
+            tier2a_preflight_override: Some(Err("not tested here".to_string())),
             ..Default::default()
         };
         let selection = select_tier_with_probes(
@@ -562,12 +562,12 @@ mod tests {
             &probes,
         )
         .unwrap();
-        assert_eq!(selection.tier, ShellTier::Tier1b);
+        assert_eq!(selection.tier, ShellTier::Tier1);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_selects_tier2_when_bwrap_present_and_userns_enabled() {
+    fn linux_selects_Tier2b_when_bwrap_present_and_userns_enabled() {
         let probes = Probes {
             bwrap_path: Some(PathBuf::from("/usr/bin/bwrap")),
             unprivileged_userns_enabled: Some(true),
@@ -582,7 +582,7 @@ mod tests {
             &probes,
         )
         .unwrap();
-        assert_eq!(selection.tier, ShellTier::Tier2);
+        assert_eq!(selection.tier, ShellTier::Tier2b);
         assert!(selection.downgraded_from.is_none());
     }
 
@@ -604,7 +604,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier0);
-        assert_eq!(selection.downgraded_from, Some(ShellTier::Tier2));
+        assert_eq!(selection.downgraded_from, Some(ShellTier::Tier2b));
         assert!(selection.is_unisolated());
     }
 

@@ -606,8 +606,8 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
     /// [実リポジトリ本体での検証] ユーザー指示による5段階検証のうち、最終段（このharness
     /// リポジトリのルート自体、`target/`込みの実規模＝約57,000ファイル、14GB）への実適用。
     /// スクラッチディレクトリでの検証（`smb_mount_access_is_granted_then_actually_revoked`）は
-    /// 数百ファイル規模だったが、Tier1aの`grant_ace_inheritable_ro`/`_rw`が実運用で処理する
-    /// のはこの規模（MSVCツールチェーン等）であり、「Tier1aと同等」を主張するならこの規模で
+    /// 数百ファイル規模だったが、Tier2aの`grant_ace_inheritable_ro`/`_rw`が実運用で処理する
+    /// のはこの規模（MSVCツールチェーン等）であり、「Tier2aと同等」を主張するならこの規模で
     /// 実際に速いことを示す必要がある、というのがこのテストの動機。
     ///
     /// **安全策**: `assert!`ではなくすべて`Err`返却にして、途中で条件を満たさなくても

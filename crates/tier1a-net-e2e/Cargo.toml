@@ -1,5 +1,5 @@
 [package]
-name = "tier1a-net-e2e"
+name = "tier2a-net-e2e"
 version.workspace = true
 edition.workspace = true
 

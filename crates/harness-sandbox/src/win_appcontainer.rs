@@ -1,7 +1,7 @@
-//! Windows Tier1a: AppContainer（package SID + capability SID）。
+//! Windows Tier2a: AppContainer（package SID + capability SID）。
 //! `plans/DESIGN-SANDBOX.md` §6.3/§7 D-02参照。実験的・オプトイン（`--experimental-tier1a`）。
 //!
-//! Tier1b（`win_restricted`、制限トークン + 低IL）と異なり、Tier1aは**トークンを差し替えず**
+//! Tier1（`win_restricted`、制限トークン + 低IL）と異なり、Tier2aは**トークンを差し替えず**
 //! `CreateProcessW`の拡張属性リストに`SECURITY_CAPABILITIES`を積むことで、呼び出しスレッド
 //! 自身のトークンのまま子をAppContainerへ閉じ込める（別メカニズム）。
 //!
@@ -9,12 +9,12 @@
 //! 起動時の`SECURITY_CAPABILITIES.CapabilityCount=0`）。これによりnetworkを含む全
 //! capability-gatedリソースがdefault-denyになり、T-10（子の直接ソケット送出）対策の核が成立する。
 //! 範囲外書込・範囲外読取もpackage SIDへの明示ACE無しには許可されないため、T-04（`~/.ssh`等の
-//! read→exfil）も併せて防ぐ（Tier1bが守れない2つの脅威、`plans/DESIGN-SANDBOX.md` §8-1）。
+//! read→exfil）も併せて防ぐ（Tier1が守れない2つの脅威、`plans/DESIGN-SANDBOX.md` §8-1）。
 //!
 //! **最小スコープ（意図的な割り切り）**: ACL付与対象は`workspace_root`とその配下の
 //! セッション専用一時ディレクトリのみ。`.cargo`/`%APPDATA%`/rustup等のツールチェーン
 //! グローバルパスへは付与しないため、cargo/rustc/git等の複雑なツールチェーンコマンドは
-//! Tier1a下でaccess-deniedになり得る（`docs/phases/foundation/M12-shell-isolation-tiers.md`
+//! Tier2a下でaccess-deniedになり得る（`docs/phases/foundation/M12-shell-isolation-tiers.md`
 //! 追記セクション参照）。
 //!
 //! **アプリ単位network制御（軸1・D-10/D-11、`plans/DESIGN-SANDBOX-APPPOLICY.md`）**:
@@ -136,7 +136,7 @@ pub fn ensure_profile(name: &str) -> Result<OwnedContainerSid, AppContainerError
         let name_w = wide(name);
         let display_w = wide("Harness Shell Sandbox");
         let desc_w = wide(
-            "AppContainer for harness run_shell Tier1a (experimental, see plans/DESIGN-SANDBOX.md SS6.3)",
+            "AppContainer for harness run_shell Tier2a (experimental, see plans/DESIGN-SANDBOX.md SS6.3)",
         );
 
         match CreateAppContainerProfile(
@@ -451,7 +451,7 @@ fn grant_ace(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainerErr
 /// （`CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE`）を使うため、`root`自身へのACE付与だけで
 /// 新規作成される子孫にも自動継承されるが、**既存の子孫ファイル/ディレクトリ**には遡って
 /// 効かないため、`root`付与時点で存在する全ノードへも明示的に付与する（`.git`を除外しない、
-/// Tier1bの`cwd`全体ラベル付与と整合させる設計判断。理由は`docs/phases/foundation/`参照）。
+/// Tier1の`cwd`全体ラベル付与と整合させる設計判断。理由は`docs/phases/foundation/`参照）。
 pub fn grant_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
@@ -540,7 +540,7 @@ pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContain
     Ok(())
 }
 
-/// `grant_ace_inheritable_ro`のRW版（Tier1aが既定でプローブされるようになったことに伴う
+/// `grant_ace_inheritable_ro`のRW版（Tier2aが既定でプローブされるようになったことに伴う
 /// `preflight`の高速化、`--sandbox`自動カスケード実装ラウンド）。`grant_ace_recursive`は
 /// workspace_root配下の全ノードへ毎回個別に`SetNamedSecurityInfoW`書込を試みる（`grant_ace_mask`
 /// 内部の冪等スキップにより実際のWin32書込呼び出し自体は2回目以降省略されるが、読取確認は
@@ -581,7 +581,7 @@ pub fn grant_ace_inheritable_rw(root: &Path, sid: PSID) -> Result<(), AppContain
 /// AppContainer固有のセキュリティ記述子をパイプへ適用する。AppContainerのアクセス制御は
 /// 「オブジェクトのDACLにpackage SID（または`ALL APPLICATION PACKAGES`）へのACEが無ければ
 /// アクセス不可」という広範なdefault-denyがファイル・レジストリだけでなく名前無しパイプ等の
-/// カーネルオブジェクトにも及ぶ可能性が高い（Tier1bで実機発見した「既定DACLの匿名パイプは
+/// カーネルオブジェクトにも及ぶ可能性が高い（Tier1で実機発見した「既定DACLの匿名パイプは
 /// 低ILの子から書けない」現象と同種、`win_restricted.rs`参照）。**これは設計上の予測であり
 /// 実機未検証**——最初の実機テストで子のstdout/stderrが空になる/ハングする場合、
 /// 真っ先にここを疑う。
@@ -692,7 +692,7 @@ impl Drop for AppContainerChild {
     }
 }
 
-/// Tier1a子プロセスへ与えるnetwork capability（D-10、`plans/DESIGN-SANDBOX-APPPOLICY.md` §3）。
+/// Tier2a子プロセスへ与えるnetwork capability（D-10、`plans/DESIGN-SANDBOX-APPPOLICY.md` §3）。
 /// 既定は`Deny`（capability空=`CapabilityCount 0`、T-10外部持出し全遮断の核）。`InternetClient`は
 /// `--net-allow-app`一致の信頼クラスにのみ与えられ、`internetClient`（`S-1-15-3-1`）1個を積んで
 /// 外向きソケットを開ける（宛先無差別、T-15でツリー全体が継承）。
@@ -705,9 +705,9 @@ pub enum NetworkCapability {
 }
 
 /// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する。
-/// Tier1bの`CreateProcessAsUserW`+制限トークンとは別方式: トークンは差し替えず、呼び出し
+/// Tier1の`CreateProcessAsUserW`+制限トークンとは別方式: トークンは差し替えず、呼び出し
 /// スレッド自身のトークンのまま拡張属性リストでAppContainerへ閉じ込める。そのため
-/// `SeAssignPrimaryTokenPrivilege`系の罠（BUG-003）はTier1aには存在しない。
+/// `SeAssignPrimaryTokenPrivilege`系の罠（BUG-003）はTier2aには存在しない。
 ///
 /// `net`が`InternetClient`のときのみcapability配列に`internetClient` SIDを1個積む。SIDの
 /// 生成（`ConvertStringSidToSidW`）と解放（`LocalFree`）はこの関数内に閉じ込め、呼び出し側へ
@@ -923,7 +923,7 @@ fn spawn_impl(
     })
 }
 
-/// Tier1a（AppContainer）で使うシェルの実行ファイルパスとラベルを解決する。
+/// Tier2a（AppContainer）で使うシェルの実行ファイルパスとラベルを解決する。
 /// **ストアアプリの実行エイリアス（`WindowsApps`配下の0バイトreparse point）は
 /// AppContainerから解決できず`CreateProcessW`が`ERROR_INVALID_PARAMETER`で失敗する**ため、
 /// pwshの実体がそこにある場合は使わず、実在の Windows PowerShell 5.1（System32の本物のexe、
@@ -933,13 +933,13 @@ pub fn resolve_shell() -> (String, &'static str) {
     if let Ok(p) = which::which("pwsh") {
         let s = p.to_string_lossy();
         if !s.to_ascii_lowercase().contains("windowsapps") {
-            return (s.into_owned(), "pwsh(tier1a)");
+            return (s.into_owned(), "pwsh(Tier2a)");
         }
     }
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     (
         format!("{system_root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
-        "powershell5.1(tier1a)",
+        "powershell5.1(Tier2a)",
     )
 }
 
@@ -1134,7 +1134,7 @@ fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Op
 }
 
 /// harness起動時に1回だけ呼ぶ。プロファイル作成→ACL付与→起動smokeテストの一連を行い、
-/// いずれか失敗したら理由文字列を返す（`shell_tier::best_effort_tier`がTier1bへの降格理由
+/// いずれか失敗したら理由文字列を返す（`shell_tier::best_effort_tier`がTier1への降格理由
 /// としてそのまま使う）。判断は実行前に完結させ、`run_shell`個々の呼び出し中には降格ロジックを
 /// 一切持たせない（非冪等コマンドの二重実行を避けるための意図的判断）。
 ///
@@ -1181,7 +1181,7 @@ pub fn preflight(
     wfp_chain_pipe: Option<String>,
 ) -> Result<PreflightOutcome, AppContainerError> {
     let sid = ensure_profile(CONTAINER_NAME)?;
-    // `--sandbox`自動カスケードによりTier1aが既定でプローブされるようになったため、
+    // `--sandbox`自動カスケードによりTier2aが既定でプローブされるようになったため、
     // 起動のたびにワークスペース全体へ個別書込を試みる`grant_ace_recursive`ではなく、
     // 高速化版（root継承ACE1件+フォールバック確認walk、`grant_ace_inheritable_rw`のdoc参照）
     // を使う。
@@ -1189,7 +1189,7 @@ pub fn preflight(
     let tmp_dir = workspace_root
         .join(".harness")
         .join("sandbox")
-        .join("tier1a-tmp");
+        .join("Tier2a-tmp");
     std::fs::create_dir_all(&tmp_dir).map_err(|e| AppContainerError::Preflight(e.to_string()))?;
     smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir)?;
 
@@ -1858,7 +1858,7 @@ mod traverse_diagnostics {
 
     /// PowerShellのFileSystemプロバイダ固有の挙動（`InitializeDefaultDrives`が全ドライブ列挙を
     /// 試みる）と、NTFSのtraverse-checking自体（シェルに依存しない、`CreateFileW`レベルの
-    /// ACCESS_DENIED）を切り分けるための、cmd.exe版プローブ。`resolve_shell`はTier1a本番と
+    /// ACCESS_DENIED）を切り分けるための、cmd.exe版プローブ。`resolve_shell`はTier2a本番と
     /// 同じPowerShell解決を返すためここでは使わず、cmd.exeを直接指定する。
     fn run_probe_cmd(sid: PSID, dir: &Path) {
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
@@ -1943,7 +1943,7 @@ mod traverse_diagnostics {
 
     /// Experiment F: ゼロcapability（`CapabilityCount=0`）自体が削除拒否の原因かを切り分ける
     /// 診断実験。`internetClient`相当のcapabilityを1つだけ付けた場合に`Remove-Item`が通るかを
-    /// 確認する。**これはTier1aのnetwork default-deny（T-10対策の核）を一時的に崩す診断専用の
+    /// 確認する。**これはTier2aのnetwork default-deny（T-10対策の核）を一時的に崩す診断専用の
     /// 実験であり、恒久的な挙動変更ではない**（`spawn_with_capabilities`は`#[cfg(test)]`限定）。
     ///
     /// `experiment_c`/`d`と同じく`C:\`ルートへの単一traverse ACEが前提として要る
@@ -1959,7 +1959,7 @@ mod traverse_diagnostics {
         let drive_root = std::path::PathBuf::from("C:\\");
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
         let dir = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-f-{}",
+            "C:\\harness-Tier2a-verify-f-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("create verify workspace under C:\\ (needs admin)");
@@ -2073,7 +2073,7 @@ mod traverse_diagnostics {
     ///
     /// Experiment Bは`%USERPROFILE%`（`C:\Users\<user>`）1段だけにtraverseを付与して失敗した
     /// （上流の`C:\`・`C:\Users`が塞がったまま）。今回は**祖先チェーンを1段に最小化**するため、
-    /// ドライブルート直下の浅いワークスペース`C:\harness-tier1a-verify-<pid>`を使う。これにより
+    /// ドライブルート直下の浅いワークスペース`C:\harness-Tier2a-verify-<pid>`を使う。これにより
     /// 唯一のシステムACL変更を「**`C:\`ルートへの単一・非継承`FILE_TRAVERSE`ACE 1本のみ**」に
     /// 絞れる（`C:\Users`以下には一切触れない）。
     ///
@@ -2086,7 +2086,7 @@ mod traverse_diagnostics {
     fn experiment_c_full_chain_traverse_recovers_fs_io() {
         let drive_root = std::path::PathBuf::from("C:\\");
         let workspace =
-            std::path::PathBuf::from(format!("C:\\harness-tier1a-verify-{}", std::process::id()));
+            std::path::PathBuf::from(format!("C:\\harness-Tier2a-verify-{}", std::process::id()));
 
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
 
@@ -2098,7 +2098,7 @@ mod traverse_diagnostics {
         let probe_dir = workspace
             .join(".harness")
             .join("sandbox")
-            .join("tier1a-tmp");
+            .join("Tier2a-tmp");
         std::fs::create_dir_all(&probe_dir)
             .expect("create probe dir (inherits ACE from workspace)");
 
@@ -2113,7 +2113,7 @@ mod traverse_diagnostics {
 
         if grant_result.is_ok() {
             // 本番プローブ（軽量・終了コードのみ判定、probe_dirはworkspace直下から3階層深い
-            // `.harness/sandbox/tier1a-tmp`）。panicさせずResultで受ける。
+            // `.harness/sandbox/Tier2a-tmp`）。panicさせずResultで受ける。
             let production_result = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir);
             println!("=== production probe (smoke_test_spawn, deep probe_dir) result: {production_result:?} ===");
 
@@ -2238,7 +2238,7 @@ mod traverse_diagnostics {
 
         let drive_root = std::path::PathBuf::from("C:\\");
         let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-d-{}",
+            "C:\\harness-Tier2a-verify-d-{}",
             std::process::id()
         ));
 
@@ -2571,7 +2571,7 @@ mod traverse_diagnostics {
     fn experiment_g_full_operation_matrix() {
         let drive_root = std::path::PathBuf::from("C:\\");
         let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-g-{}",
+            "C:\\harness-Tier2a-verify-g-{}",
             std::process::id()
         ));
 
@@ -2623,7 +2623,7 @@ mod traverse_diagnostics {
     fn experiment_j_full_operation_matrix_with_read_attributes() {
         let drive_root = std::path::PathBuf::from("C:\\");
         let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-j-{}",
+            "C:\\harness-Tier2a-verify-j-{}",
             std::process::id()
         ));
 
@@ -2672,7 +2672,7 @@ mod traverse_diagnostics {
     fn experiment_k_smoke_test_spawn_with_read_attributes() {
         let drive_root = std::path::PathBuf::from("C:\\");
         let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-k-{}",
+            "C:\\harness-Tier2a-verify-k-{}",
             std::process::id()
         ));
 
@@ -2684,7 +2684,7 @@ mod traverse_diagnostics {
         let probe_dir = workspace
             .join(".harness")
             .join("sandbox")
-            .join("tier1a-tmp");
+            .join("Tier2a-tmp");
         std::fs::create_dir_all(&probe_dir)
             .expect("create probe dir (inherits ACE from workspace)");
 
@@ -2709,7 +2709,7 @@ mod traverse_diagnostics {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
-    /// procmon実測調査（Tier1a廃止の根拠固め）で共有するプローブスクリプト。
+    /// procmon実測調査（Tier2a廃止の根拠固め）で共有するプローブスクリプト。
     /// New-Item（対照・成功するはず）→Remove-Item→Rename-Item→Move-Itemを`Write-Output`
     /// マーカー付きで連続実行する。AppContainer内（`experiment_h_procmon_target`）と
     /// AppContainer外の対照（`experiment_h_procmon_control`）の両方から同一文字列を使う。
@@ -2738,7 +2738,7 @@ mod traverse_diagnostics {
 
         let drive_root = std::path::PathBuf::from("C:\\");
         let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-h-{}",
+            "C:\\harness-Tier2a-verify-h-{}",
             std::process::id()
         ));
 
@@ -2796,7 +2796,7 @@ mod traverse_diagnostics {
     #[ignore]
     fn experiment_h_procmon_control() {
         let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-h-control-{}",
+            "C:\\harness-Tier2a-verify-h-control-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&workspace)
@@ -2838,7 +2838,7 @@ mod traverse_diagnostics {
     fn experiment_i_c_root_read_attributes() {
         let drive_root = std::path::PathBuf::from("C:\\");
         let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-i-{}",
+            "C:\\harness-Tier2a-verify-i-{}",
             std::process::id()
         ));
 
@@ -2895,7 +2895,7 @@ mod traverse_diagnostics {
     /// 未解決事項2: 本番`smoke_test_spawn`（軽量・終了コードのみ判定）と、この診断モジュールの
     /// `run_probe`（詳細・stdout全文を観測するリッチ版）が、この機種で**同じ合否判定**になる
     /// ことを突き合わせる。両者が食い違う場合、本番プローブの判定精度に疑いが生じるため、
-    /// `preflight`をこのままTier1b自動降格の唯一の判断根拠として使ってよいかを再検討する必要が
+    /// `preflight`をこのままTier1自動降格の唯一の判断根拠として使ってよいかを再検討する必要が
     /// ある（`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3参照）。
     #[test]
     #[ignore]
@@ -2940,7 +2940,7 @@ mod traverse_diagnostics {
 
         // workspace（FS I/Oのgate）とpassthrough対象（中立な外部ルート）は別ディレクトリにする。
         let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-passthrough-ws-{}",
+            "C:\\harness-Tier2a-verify-passthrough-ws-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&workspace).expect("create workspace");
@@ -2948,7 +2948,7 @@ mod traverse_diagnostics {
         let probe_dir = workspace
             .join(".harness")
             .join("sandbox")
-            .join("tier1a-tmp");
+            .join("Tier2a-tmp");
         std::fs::create_dir_all(&probe_dir).expect("create probe dir");
         if let Err(e) = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir) {
             eprintln!(
@@ -2966,7 +2966,7 @@ mod traverse_diagnostics {
         // Deniedになる、`diagnose_unreachable_passthrough`のD9 fallback「cause unknown」経路が
         // 正しく効いた）。M12追記8が検証した「ドライブルート直下1階層」の条件に揃える。
         let external = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-passthrough-ext-{}",
+            "C:\\harness-Tier2a-verify-passthrough-ext-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&external).expect("create neutral external dir");
@@ -3025,7 +3025,7 @@ mod traverse_diagnostics {
     /// 往復を確認する（D10の巻き戻し、`harness fs revoke-traverse`本体）。実際のドライブルートは
     /// 対象にせず、テスト実行ユーザー自身が所有者である`tempfile::tempdir()`を対象にする
     /// （所有者は自分のオブジェクトのDACLを自由に変更できるため、`WRITE_DAC`が無い管理者専用の
-    /// ドライブルートと違い管理者権限が不要。`docs/explanations/tier1a-non-admin-limitation.md`
+    /// ドライブルートと違い管理者権限が不要。`docs/explanations/Tier2a-non-admin-limitation.md`
     /// 「なぜ非管理者ユーザーは自分で直せないのか」の所有者の話と対応する）。
     #[test]
     #[ignore]
@@ -3085,7 +3085,7 @@ mod traverse_diagnostics {
     /// インデクサ・AV等の割込みで極端に遅くなりうる。強制終了2回により孤立ACEが
     /// `C:\Users`・`C:\Users\<user>`に残置し、`icacls /remove:g`での手動復旧を要した）。
     ///
-    /// 修正: 他のignore-gated実験（`experiment_c`等）と同じ`C:\harness-tier1a-verify-*-<pid>`
+    /// 修正: 他のignore-gated実験（`experiment_c`等）と同じ`C:\harness-Tier2a-verify-*-<pid>`
     /// パターンを踏襲し、**このテスト専用に新規作成した`C:\`直下のディレクトリ**をネストの
     /// 起点にする。これなら`grant_traverse_chain`の祖先チェーンは`C:\`（既存の永続ACE、
     /// D10の恒久的な修復として意図的に維持されているためrevokeしない）とこのテスト専用ツリー
@@ -3099,7 +3099,7 @@ mod traverse_diagnostics {
     fn grant_traverse_chain_then_revoke_each_node_on_neutral_tree() {
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
         let test_root = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-chain-{}",
+            "C:\\harness-Tier2a-verify-chain-{}",
             std::process::id()
         ));
         let nested = test_root.join("a").join("b").join("c");
@@ -3182,11 +3182,11 @@ mod traverse_diagnostics {
     fn experiment_l_inheritable_ace_on_root_vs_recursive_walk() {
         let drive_root = std::path::PathBuf::from("C:\\");
         let root = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-l-{}",
+            "C:\\harness-Tier2a-verify-l-{}",
             std::process::id()
         ));
         let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-l-ws-{}",
+            "C:\\harness-Tier2a-verify-l-ws-{}",
             std::process::id()
         ));
 
@@ -3528,7 +3528,7 @@ mod traverse_diagnostics {
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
 
         let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-m-ws-{}",
+            "C:\\harness-Tier2a-verify-m-ws-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&workspace).expect("create workspace");
@@ -3536,7 +3536,7 @@ mod traverse_diagnostics {
         let probe_dir = workspace
             .join(".harness")
             .join("sandbox")
-            .join("tier1a-tmp");
+            .join("Tier2a-tmp");
         std::fs::create_dir_all(&probe_dir).expect("create probe dir");
         if let Err(e) = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir) {
             eprintln!(
@@ -3549,7 +3549,7 @@ mod traverse_diagnostics {
         }
 
         let root = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-m-{}",
+            "C:\\harness-Tier2a-verify-m-{}",
             std::process::id()
         ));
 

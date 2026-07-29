@@ -172,7 +172,7 @@ enum NetAction {
     },
 }
 
-/// `harness fs`サブコマンドの各操作。Windows Tier1a固有機能のため、Windows以外では
+/// `harness fs`サブコマンドの各操作。Windows Tier2a固有機能のため、Windows以外では
 /// `List`以外はエラーで終了する（台帳自体はクロスプラットフォームのJSONだが、実際のACE
 /// 付与・撤収はWin32のSID/ACLに依存するため）。
 #[derive(Subcommand)]
@@ -307,33 +307,34 @@ struct Cli {
 
     /// シェル隔離Tierの最低要求（M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。指定時は
     /// 自動降格せず、要求を満たせない場合に起動を拒否する。値省略（`--require-sandbox`単体）は
-    /// 「書込拘束以上」（Tier1b/Tier2でpass、Tier0で拒否）、`=confidential`は「機密性も要求」
-    /// （Tier2のみpass）。省略時は制約無し（Tier0への自動降格も許容）。
+    /// 「書込拘束以上」（Tier3/Tier2a/Tier1/Tier2bでpass、Tier0で拒否）、
+    /// `=confidential`は「機密性も要求」（Tier3/Tier2a/Tier2bのみpass）。省略時は
+    /// 制約無し（Tier0への自動降格も許容）。
     #[arg(long = "require-sandbox", num_args = 0..=1, default_missing_value = "write-containment")]
     require_sandbox: Option<String>,
 
-    /// 【非推奨・no-op】Windowsでは`--sandbox`自動カスケード実装ラウンドよりTier1a
+    /// 【非推奨・no-op】Windowsでは`--sandbox`自動カスケード実装ラウンドよりTier2a
     /// （AppContainer）がフラグ無しで既定プローブされるようになったため、このフラグは
     /// 効果を持たない（`plans/DESIGN-SANDBOX.md` §6.3/§7 D-02改訂版参照）。指定した場合は
     /// 起動時に非推奨noteを表示するのみ。Tier3も含めて試したい場合は`--sandbox`を使うこと。
     #[arg(long = "experimental-tier1a", default_value_t = false)]
-    experimental_tier1a: bool,
+    experimental_tier2a: bool,
 
     /// Windows専用の実験的Tier3（Hyper-V外層AlmaLinux VM + Incus内層コンテナ）を試す
     /// （`plans/DESIGN-SANDBOX-VMISOLATION.md`、既定はfalse）。`run_shell`はコンテナ内実行に
     /// 委譲される。ゴールデン像VHDX（`C:\ProgramData\harness\golden-images\almalinux-golden.vhdx`）
-    /// が無い等で起動できない場合はTier1aへカスケードし（Tier1aも失敗すればTier1bへ）警告する。
+    /// が無い等で起動できない場合はTier2aへカスケードし（Tier2aも失敗すればTier1へ）警告する。
     /// 管理者昇格（Hyper-V操作用の常駐デーモン`harness-vmsandboxd`、D-21）を1回要する。
     /// `--sandbox`と同じ効果（便利エイリアス、どちらを指定してもTier3が有効化される）。
     #[arg(long = "experimental-tier3", default_value_t = false)]
     experimental_tier3: bool,
 
-    /// シェル隔離の完全カスケードを有効化する（Windowsのみ意味を持つ: Tier3→Tier1a→Tier1bを
+    /// シェル隔離の完全カスケードを有効化する（Windowsのみ意味を持つ: Tier3→Tier2a→Tier1を
     /// 順に試す）。既定はfalse。`--experimental-tier3`と同じ効果を持つ便利エイリアスであり、
-    /// どちらか一方を指定すればよい。Tier1a単体は`--sandbox`/`--experimental-tier3`を指定
+    /// どちらか一方を指定すればよい。Tier2a単体は`--sandbox`/`--experimental-tier3`を指定
     /// しなくてもフラグ無しで既定プローブされるため、本フラグが追加で有効化するのは
     /// Tier3（VM）の試行のみ（`plans/DESIGN-SANDBOX.md` §6.3/§7 D-02改訂版）。Linuxでは
-    /// Tier2が既に既定の上限のため事実上ノーオプ。
+    /// Tier2bが既に既定の上限のため事実上ノーオプ。
     #[arg(long = "sandbox", default_value_t = false)]
     sandbox: bool,
 
@@ -351,7 +352,7 @@ struct Cli {
     /// 2本目以降のセッションがこの上限を書き換えられると意味が無いため、`StartSession`の
     /// ペイロードではなくdaemonプロセスの起動引数として渡す（daemonが既に起動済みの場合、
     /// この値は無視される）。カウント対象はTier3セッション（daemon内の登録簿）のみで、
-    /// Tier0/Tier1a/Tier1b/Tier2はこのdaemonへ接続しないため対象外。
+    /// Tier0/Tier2a/Tier1/Tier2bはこのdaemonへ接続しないため対象外。
     #[arg(long = "tier3-max-sessions", default_value_t = 4)]
     tier3_max_sessions: u8,
 
@@ -359,7 +360,7 @@ struct Cli {
     /// `*.example.com`形式のサフィックスワイルドカード対応）。
     /// `.harness/settings.json`の`net.allow_domains`と合算する（和集合）。`run_shell`子には既定で
     /// `ALL_PROXY=socks5h://...`と`HTTP_PROXY`/`HTTPS_PROXY`を注入するLocal Proxy Agentが起動し、
-    /// 許可ドメイン未指定なら全拒否として監査ログに残す。Tier1aでWFPが使える場合は外部直通を
+    /// 許可ドメイン未指定なら全拒否として監査ログに残す。Tier2aでWFPが使える場合は外部直通を
     /// default-denyし、Proxy/Fake DNSのloopback実ポートだけを許可する。WFPが使えない場合は
     /// 協調Proxyとして動作し、外部直通を強制遮断できないことを出力へ明記する。
     #[arg(long = "net-allow-domain")]
@@ -367,7 +368,7 @@ struct Cli {
 
     /// アプリ単位network制御（軸1、`plans/DESIGN-SANDBOX-APPPOLICY.md` D-10/D-11）の信頼アプリ名を
     /// 追加する（繰り返し指定可、実行ファイルのbasename・拡張子除去・小文字で照合。例`git`）。
-    /// `.harness/settings.json`の`net.allow_apps`と合算する（和集合）。Tier1a（AppContainer）でのみ
+    /// `.harness/settings.json`の`net.allow_apps`と合算する（和集合）。Tier2a（AppContainer）でのみ
     /// 効く: 先頭execが一致した単一コマンド（`|`/`&&`/`;`等で連結されていない）にのみ
     /// `internetClient` capabilityを付与し外向き通信を許可する（宛先無差別、T-15でプロセスツリー
     /// 全体が継承）。`--require-sandbox=confidential`と同時指定はできない（意味的に矛盾、起動拒否）。
@@ -377,7 +378,7 @@ struct Cli {
     /// fs passthrough allowlist（軸2・D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺）の
     /// 追加ルートを指定する（繰り返し指定可、`<path>[:rw]`形式）。省略時（末尾`:rw`無し）は
     /// read-only、`:rw`指定時は書込も許可する（D-13「read-onlyを既定とする」）。
-    /// `.harness/settings.json`の`fs.allow`と合算する（和集合）。Tier1a（AppContainer）でのみ
+    /// `.harness/settings.json`の`fs.allow`と合算する（和集合）。Tier2a（AppContainer）でのみ
     /// 効く: 指定ルートへpackage SIDの許可ACEを付与し、到達性をプローブする（D8）。
     /// `--require-sandbox`との組合せはD7参照（write-containmentは`:rw`のみ拒否、confidentialは
     /// `:ro`/`:rw`いずれも拒否）。
@@ -1171,7 +1172,7 @@ fn save_traverse_ledger(ledger: &TraverseLedger) {
     }
 }
 
-/// `--fs-allow`でTier1a preflightが実際にACE付与を試みたルートを台帳へ記録する（D2/D3）。
+/// `--fs-allow`でTier2a preflightが実際にACE付与を試みたルートを台帳へ記録する（D2/D3）。
 /// 同一パスは上書き（冪等）。ACE自体は「付けっぱなし」（D2）だが、台帳があるので後から
 /// `harness fs revoke`/`revoke-all`で一括撤収できる。
 fn record_fs_passthrough_grant(path: &Path, writable: bool, forced: bool) {
@@ -1460,7 +1461,7 @@ fn fs_revoke_one(path: &Path) -> ExitCode {
 
 #[cfg(not(windows))]
 fn fs_revoke_one(_path: &Path) -> ExitCode {
-    eprintln!("error: fs passthrough revoke is Windows-only (Tier1a specific)");
+    eprintln!("error: fs passthrough revoke is Windows-only (Tier2a specific)");
     ExitCode::FAILURE
 }
 
@@ -1568,7 +1569,7 @@ fn fs_revoke_all() -> ExitCode {
 
 #[cfg(not(windows))]
 fn fs_revoke_all() -> ExitCode {
-    eprintln!("error: fs passthrough revoke is Windows-only (Tier1a specific)");
+    eprintln!("error: fs passthrough revoke is Windows-only (Tier2a specific)");
     ExitCode::FAILURE
 }
 
@@ -1613,7 +1614,7 @@ fn fs_grant_traverse_preview(target: &Path) -> ExitCode {
 
 #[cfg(not(windows))]
 fn fs_grant_traverse_preview(_target: &Path) -> ExitCode {
-    eprintln!("error: fs grant-traverse --dry-run is Windows-only (Tier1a specific)");
+    eprintln!("error: fs grant-traverse --dry-run is Windows-only (Tier2a specific)");
     ExitCode::FAILURE
 }
 
@@ -1762,7 +1763,7 @@ fn fs_grant_traverse_direct(target: &Path) -> ExitCode {
 
 #[cfg(not(windows))]
 fn fs_grant_traverse(_target: &Path) -> ExitCode {
-    eprintln!("error: fs grant-traverse is Windows-only (Tier1a specific)");
+    eprintln!("error: fs grant-traverse is Windows-only (Tier2a specific)");
     ExitCode::FAILURE
 }
 
@@ -1830,7 +1831,7 @@ fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
 
 #[cfg(not(windows))]
 fn fs_revoke_traverse_one(_path: &Path) -> ExitCode {
-    eprintln!("error: fs revoke-traverse is Windows-only (Tier1a specific)");
+    eprintln!("error: fs revoke-traverse is Windows-only (Tier2a specific)");
     ExitCode::FAILURE
 }
 
@@ -2156,7 +2157,7 @@ async fn main() -> ExitCode {
         .collect();
     if !fs_passthrough.is_empty() && !cfg!(windows) {
         eprintln!(
-            "warning: --fs-allow / fs.allow is only supported on Windows (Tier1a); ignored on \
+            "warning: --fs-allow / fs.allow is only supported on Windows (Tier2a); ignored on \
              this OS"
         );
     }
@@ -2188,10 +2189,10 @@ async fn main() -> ExitCode {
     }
 
     // `--experimental-tier1a`は非推奨・no-op化した（`--sandbox`自動カスケード実装ラウンドより
-    // Tier1aはフラグ無しで既定プローブされるため）。指定された場合は一度だけ情報表示する。
-    if cli.experimental_tier1a {
+    // Tier2aはフラグ無しで既定プローブされるため）。指定された場合は一度だけ情報表示する。
+    if cli.experimental_tier2a {
         eprintln!(
-            "note: --experimental-tier1a is deprecated and has no effect; Tier1a (AppContainer) \
+            "note: --experimental-tier1a is deprecated and has no effect; Tier2a (AppContainer) \
              is now attempted automatically on Windows. Use --sandbox (or --experimental-tier3) \
              to also attempt Tier3."
         );
@@ -2199,11 +2200,11 @@ async fn main() -> ExitCode {
 
     // WFP 出口強制（Layer2、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）の
     // named pipeを、`select_tier`（内部で`preflight`を呼ぶ）より前に用意しておく。
-    // Tier1aはフラグ無しで既定プローブされるため（`--sandbox`カスケードの中間フォールバック
+    // Tier2aはフラグ無しで既定プローブされるため（`--sandbox`カスケードの中間フォールバック
     // としても到達し得る）、ドメインポリシー監査が有効な場合は常に投機的に用意しておく
     // （そうでなければWFPは不要＝シナリオ(C)、パイプすら作らずUACゼロを保つ）。ここで作った
     // パイプ名は、`preflight`経由で特権分離ヘルパーへ「処理完了後この名前でnetfilterdを
-    // 連鎖起動してほしい」という指示として渡す（シナリオ(A)）。実際にTier1aへ降格せずに
+    // 連鎖起動してほしい」という指示として渡す（シナリオ(A)）。実際にTier2aへ降格せずに
     // 終わる、またはprivhelperへの委譲が発生しなかった場合（シナリオ(B)/(C)）は、この
     // パイプは未使用のまま閉じるか、`NetfilterHandle::start`の直接起動へ切り替える
     // （下記`net_wfp`解決を参照）。
@@ -2253,9 +2254,9 @@ async fn main() -> ExitCode {
             }
             Ok(None) => None,
             Err(e) => {
-                if shell_tier.tier == harness_core::ShellTier::Tier1a {
+                if shell_tier.tier == harness_core::ShellTier::Tier2a {
                     eprintln!(
-                        "warning: failed to start session-scoped local proxy; Tier1a domain \
+                        "warning: failed to start session-scoped local proxy; Tier2a domain \
                          enforcement will remain fail-closed instead of opening network: {e}"
                     );
                 } else {
@@ -2297,21 +2298,21 @@ async fn main() -> ExitCode {
     let net_loopback_ports =
         net_loopback_ports_for_agents(net_proxy.proxy_addr, net_proxy.fake_dns_addr);
 
-    // WFPシナリオ(A)/(B)/(C)の最終確定。`shell_tier`が実際にTier1aへ着地し、かつ許可ドメインが
-    // あるときだけ有効化する（`experimental_tier1a`はオプトインの意図であって、preflight失敗で
-    // Tier1bへ降格した場合はWFPも当然無効）。
+    // WFPシナリオ(A)/(B)/(C)の最終確定。`shell_tier`が実際にTier2aへ着地し、かつ許可ドメインが
+    // あるときだけ有効化する（`experimental_tier2a`はオプトインの意図であって、preflight失敗で
+    // Tier1へ降格した場合はWFPも当然無効）。
     #[cfg(windows)]
     let net_wfp: Option<harness_sandbox::netfilterd::NetfilterHandle> = {
         let domain_policy_requested = net_proxy.domain_policy_enabled;
-        let tier1a_domain_policy =
-            shell_tier.tier == harness_core::ShellTier::Tier1a && domain_policy_requested;
+        let tier2a_domain_policy =
+            shell_tier.tier == harness_core::ShellTier::Tier2a && domain_policy_requested;
         let session_proxy_ready = net_proxy.proxy_addr.is_some();
-        let wfp_needed = tier1a_domain_policy && session_proxy_ready;
+        let wfp_needed = tier2a_domain_policy && session_proxy_ready;
         if !wfp_needed {
-            if tier1a_domain_policy && !session_proxy_ready {
+            if tier2a_domain_policy && !session_proxy_ready {
                 eprintln!(
                     "warning: session-scoped local proxy did not start; WFP domain enforcement \
-                     will not be enabled and Tier1a run_shell network capability will remain \
+                     will not be enabled and Tier2a run_shell network capability will remain \
                      denied (fail-closed)"
                 );
             }
@@ -2380,24 +2381,24 @@ async fn main() -> ExitCode {
             shell_tier.downgraded_from.map(|t| t.label()).unwrap_or("?")
         );
     }
-    if shell_tier.tier == harness_core::ShellTier::Tier1b {
+    if shell_tier.tier == harness_core::ShellTier::Tier1 {
         eprintln!(
-            "note: shell isolation tier is tier1b; Tier1a (AppContainer) was attempted \
+            "note: shell isolation tier is Tier1; Tier2a (AppContainer) was attempted \
              automatically but unavailable this session (see the warning above for the reason). \
-             Tier1b does not protect against reading confidential files outside the workspace \
+             Tier1 does not protect against reading confidential files outside the workspace \
              or outbound network exfiltration from run_shell child processes \
              (plans/DESIGN-SANDBOX.md §9-1). --require-sandbox=confidential refuses to start \
-             at tier1b rather than silently weakening this guarantee."
+             at Tier1 rather than silently weakening this guarantee."
         );
     }
     // fs passthrough（D2/D-13）: ACE付与自体は「付けっぱなし」（撤収はユーザ操作
-    // `harness fs revoke`に委ねる）。Tier1aが実際に選択された場合のみpreflightがACE付与を
+    // `harness fs revoke`に委ねる）。Tier2aが実際に選択された場合のみpreflightがACE付与を
     // 試みたので、そのときだけ台帳に記録する。`granted_passthrough`（実際にACEが確認できた
     // ルートのみ）を基準にする——`fs_passthrough`全件を無条件に記録すると、システム保護パス等で
     // `ACCESS_DENIED`になり実際には付与されなかったエントリまで台帳に載る「幻の台帳エントリ」を
     // 生んでしまうため（`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」）。到達不能だった穴の診断
     // （D8/D9）は`passthrough_warnings`としてこの下で表示する。
-    if shell_tier.tier == harness_core::ShellTier::Tier1a {
+    if shell_tier.tier == harness_core::ShellTier::Tier2a {
         for (path, writable) in &shell_tier.granted_passthrough {
             // このエントリが`--force-system-acl`対象だったか（元のfs_passthroughから引く）。
             // forcedなら撤収時も`SeRestorePrivilege`が要るため台帳へ記録しておく。

@@ -2901,7 +2901,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tier1a-net-e2e"
+name = "tier2a-net-e2e"
 version = "0.1.0"
 dependencies = [
  "clap",

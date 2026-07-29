@@ -1,5 +1,5 @@
 //! D-05（`plans/DESIGN-SANDBOX.md` §7）: 設定注入系hard-deny対象パス。
-//! Tier1/Tier2内でも解除しない。`harness-engine::permission::classify()`と
+//! Tier1/Tier2b内でも解除しない。`harness-engine::permission::classify()`と
 //! `harness-sandbox::overlay::apply()`の両方から参照する単一の情報源
 //! （二重防御の両ゲートが同じ判定基準を持つことを保証するため、ここに集約する）。
 

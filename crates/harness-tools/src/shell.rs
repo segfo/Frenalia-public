@@ -11,8 +11,8 @@
 //! **M12（シェル隔離Tier）**: 子プロセスのenvは常にallowlist方式のクリーンenv
 //! （`harness_sandbox::build_child_env`、D-07）。`ctx.shell_tier`（`harness-cli`が起動時に
 //! 1回選択）に応じて実際の隔離機構を切り替える:
-//! - Windows Tier1b: Restricted Token + 低IL + Job Object（`harness_sandbox::win_restricted`）。
-//! - Linux Tier2: `bwrap`でラップ（`harness_sandbox::linux_bwrap`）。本セッションでは実機未検証
+//! - Windows Tier1: Restricted Token + 低IL + Job Object（`harness_sandbox::win_restricted`）。
+//! - Linux Tier2b: `bwrap`でラップ（`harness_sandbox::linux_bwrap`）。本セッションでは実機未検証
 //!   （Windows専用環境、WSL2で別途再検証が必要）。
 //! - Tier0（保険・全OS）: 通常spawn + Job Object(Win)/rlimit(unix) + 出力バイト上限。
 //!
@@ -45,7 +45,7 @@ struct RunShellInput {
 pub struct RunShellTool;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-/// 出力バイト上限（層5・T-13、Tier0/Tier1b/Tier2いずれでも適用する保険）。
+/// 出力バイト上限（層5・T-13、Tier0/Tier1/Tier2bいずれでも適用する保険）。
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
 const RUN_SHELL_DEFAULT_DESCRIPTION: &str =
@@ -154,7 +154,7 @@ fn classify_net_app(command: &str, allow_apps: &[String]) -> NetDecision {
     NetDecision::Allow
 }
 
-fn should_grant_tier1a_network_capability(
+fn should_grant_tier2a_network_capability(
     net: NetDecision,
     net_proxy_enforced: bool,
     net_domain_policy_requested: bool,
@@ -316,10 +316,10 @@ impl Tool for RunShellTool {
                 net_decision,
                 ctx.shell_tier.tier,
             ) {
-                (true, _, ShellTier::Tier1a) if ctx.net_proxy.enforced_by_wfp => {
+                (true, _, ShellTier::Tier2a) if ctx.net_proxy.enforced_by_wfp => {
                     content.push_str("\n[net: domain policy enforced; --net-allow-app ignored]");
                 }
-                (true, _, ShellTier::Tier1a) => {
+                (true, _, ShellTier::Tier2a) => {
                     content.push_str(
                         "\n[net: denied (domain policy requested but WFP enforcement is unavailable; \
                          --net-allow-app ignored)]",
@@ -332,12 +332,12 @@ impl Tool for RunShellTool {
                         other_tier.label()
                     ));
                 }
-                (false, NetDecision::Allow, ShellTier::Tier1a) => {
+                (false, NetDecision::Allow, ShellTier::Tier2a) => {
                     content.push_str("\n[net: internetClient]");
                 }
                 (false, NetDecision::Allow, other_tier) => {
                     content.push_str(&format!(
-                        "\n[net: denied (--net-allow-app only takes effect under tier1a; \
+                        "\n[net: denied (--net-allow-app only takes effect under Tier2a; \
                          current tier is {})]",
                         other_tier.label()
                     ));
@@ -366,7 +366,7 @@ impl Tool for RunShellTool {
             );
         }
         if proxy_addr.is_some() {
-            if ctx.net_proxy.enforced_by_wfp && ctx.shell_tier.tier == ShellTier::Tier1a {
+            if ctx.net_proxy.enforced_by_wfp && ctx.shell_tier.tier == ShellTier::Tier2a {
                 content.push_str("\n[net-proxy: enforced-by-wfp]");
             } else {
                 content.push_str("\n[net-proxy: audit-only, not enforced against raw sockets, see plans/DESIGN-SANDBOX-PRIVSEP.md §3.1]");
@@ -442,7 +442,7 @@ async fn run_isolated(
     net_domain_policy_requested: bool,
     vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
-    // Tier1a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
+    // Tier2a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
     // 「このTierでは無効」と明記する、`call`参照）。
     let _ = &net;
     if tier == ShellTier::Tier3 {
@@ -450,8 +450,8 @@ async fn run_isolated(
     }
     #[cfg(windows)]
     {
-        if tier == ShellTier::Tier1a {
-            return run_windows_tier1a(
+        if tier == ShellTier::Tier2a {
+            return run_windows_tier2a(
                 command,
                 cwd,
                 env,
@@ -462,14 +462,14 @@ async fn run_isolated(
             )
             .await;
         }
-        if tier == ShellTier::Tier1b {
-            return run_windows_tier1b(command, cwd, env, dur).await;
+        if tier == ShellTier::Tier1 {
+            return run_windows_tier1(command, cwd, env, dur).await;
         }
     }
     #[cfg(target_os = "linux")]
     {
-        if tier == ShellTier::Tier2 {
-            return run_linux_tier2(command, cwd, env, dur).await;
+        if tier == ShellTier::Tier2b {
+            return run_linux_tier2b(command, cwd, env, dur).await;
         }
     }
     // Tier0（保険）。上記いずれにも該当しない場合のフォールバックでもある。
@@ -545,13 +545,13 @@ async fn run_tier0(
 }
 
 #[cfg(target_os = "linux")]
-async fn run_linux_tier2(
+async fn run_linux_tier2b(
     command: &str,
     cwd: &Path,
     env: &[(String, String)],
     dur: Duration,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
-    let session_dir = cwd.join(".harness").join("sandbox").join("tier2");
+    let session_dir = cwd.join(".harness").join("sandbox").join("tier2b");
     let config = harness_sandbox::linux_bwrap::BwrapConfig {
         workspace_root: cwd.to_path_buf(),
         upper_dir: session_dir.join("upper"),
@@ -575,7 +575,7 @@ async fn run_linux_tier2(
 }
 
 #[cfg(windows)]
-async fn run_windows_tier1a(
+async fn run_windows_tier2a(
     command: &str,
     cwd: &Path,
     env: &[(String, String)],
@@ -599,7 +599,7 @@ async fn run_windows_tier1a(
 
     // アプリ単位network制御（軸1、D-10/D-11）。`Allow`のときのみ`internetClient`を付与する
     // （`DeniedByChaining`/`Deny`はどちらも既定のcapability空＝network全遮断のまま）。
-    let net_capability = if should_grant_tier1a_network_capability(
+    let net_capability = if should_grant_tier2a_network_capability(
         net,
         net_proxy_enforced,
         net_domain_policy_requested,
@@ -641,7 +641,7 @@ async fn run_windows_tier1a(
 }
 
 #[cfg(windows)]
-async fn run_windows_tier1b(
+async fn run_windows_tier1(
     command: &str,
     cwd: &Path,
     env: &[(String, String)],
@@ -652,9 +652,9 @@ async fn run_windows_tier1b(
     let _ = harness_sandbox::win_restricted::set_low_integrity_label(cwd);
 
     let (bin, shell_label) = if which::which("pwsh").is_ok() {
-        ("pwsh", "pwsh(tier1b)")
+        ("pwsh", "pwsh(tier1)")
     } else {
-        ("powershell", "powershell5.1(tier1b)")
+        ("powershell", "powershell5.1(tier1)")
     };
     let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
     let cwd_owned = cwd.to_path_buf();
@@ -752,7 +752,7 @@ async fn run_with_pipes(
         // バイト列に遭遇すると`Err`を返し、`let _ =`で握り潰していたため出力が無言で空文字列
         // （exit code 0・出力なし）になっていた。CP932（Shift-JIS）等、UTF-8でない既定コード
         // ページのコンソール出力（日本語ファイル名を含む`dir`等）で確実に踏む。生バイトを
-        // 読み切ってから`from_utf8_lossy`する（Tier1a/1bの`win_common::read_to_string`と同じ
+        // 読み切ってから`from_utf8_lossy`する（Tier2a/1bの`win_common::read_to_string`と同じ
         // 方針）。
         let stdout_fut = async {
             let mut buf = Vec::new();
@@ -836,7 +836,7 @@ fn platform_shell_command(command: &str) -> ShellInvocation {
 /// = 'Stop'`等を明示する前提で、harness側では強制しない）。
 ///
 /// stdin経由で渡すコマンド文字列の先頭に出力エンコーディング固定を、末尾に終了コード伝播を
-/// 付与する。Tier0（本関数）・Tier1a（`run_windows_tier1a`）・Tier1b（`run_windows_tier1b`）の
+/// 付与する。Tier0（本関数）・Tier2a（`run_windows_tier2a`）・Tier1（`run_windows_tier1`）の
 /// 3経路全てがこの関数を通す（Tier横断で1箇所に集約し、個別に実装して食い違うことを防ぐ）。
 /// **判定用の`command`自体は変更しない**: `classify_net_app`等のallowlist判定は呼び出し元で
 /// 元の`command`に対して行い、この関数が返す文字列は実行直前のstdinペイロードとしてのみ使う。
@@ -859,13 +859,13 @@ mod tests {
         let mut ctx = ToolCtx::new(root.clone());
         // `ToolCtx::new`はテスト既定でTier0（プレースホルダ）を積む。実行時は
         // `harness-cli`が起動時に`select_tier`で解決した値を積むため、ここでも
-        // 実際のOS隔離Tier選択を再現する（さもないとTier1b経路が単体テストで一切通らない）。
-        // WindowsではTier1aがフラグ無しで既定プローブされるようになったため（`--sandbox`
-        // 自動カスケード実装ラウンド）、`tier1a_preflight_override`でTier1bへ強制降格させ
-        // 決定論的にする（実Win32 preflightを単体テストで走らせない、既存Tier1bテストの
+        // 実際のOS隔離Tier選択を再現する（さもないとTier1経路が単体テストで一切通らない）。
+        // WindowsではTier2aがフラグ無しで既定プローブされるようになったため（`--sandbox`
+        // 自動カスケード実装ラウンド）、`tier2a_preflight_override`でTier1へ強制降格させ
+        // 決定論的にする（実Win32 preflightを単体テストで走らせない、既存Tier1テストの
         // 挙動を変えないため）。`opt_in_tier3=false`固定。
         let probes = harness_sandbox::shell_tier::Probes {
-            tier1a_preflight_override: Some(Err("test fixture: force tier1b".to_string())),
+            tier2a_preflight_override: Some(Err("test fixture: force Tier1".to_string())),
             ..Default::default()
         };
         ctx.shell_tier = harness_sandbox::shell_tier::select_tier_with_probes(
@@ -948,23 +948,23 @@ mod tests {
     }
 
     #[test]
-    fn domain_policy_takes_precedence_over_net_allow_app_for_tier1a_capability() {
-        assert!(should_grant_tier1a_network_capability(
+    fn domain_policy_takes_precedence_over_net_allow_app_for_tier2a_capability() {
+        assert!(should_grant_tier2a_network_capability(
             NetDecision::Allow,
             false,
             false
         ));
-        assert!(!should_grant_tier1a_network_capability(
+        assert!(!should_grant_tier2a_network_capability(
             NetDecision::Allow,
             false,
             true
         ));
-        assert!(should_grant_tier1a_network_capability(
+        assert!(should_grant_tier2a_network_capability(
             NetDecision::Deny,
             true,
             true
         ));
-        assert!(!should_grant_tier1a_network_capability(
+        assert!(!should_grant_tier2a_network_capability(
             NetDecision::Deny,
             false,
             true
@@ -1042,7 +1042,7 @@ mod tests {
     fn run_shell_tool_spec_keeps_default_description_for_non_tier3() {
         let dir = tempfile::tempdir().unwrap();
         let mut context = ToolCtx::new(dir.path().to_path_buf());
-        context.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier1b);
+        context.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier1);
 
         let spec = RunShellTool.spec_for_ctx(&context);
 
@@ -1137,10 +1137,10 @@ mod tests {
         assert!(!out.is_error);
         assert!(out.content.contains("hello"));
         assert!(
-            out.content.contains("[shell: pwsh(tier1b)]")
-                || out.content.contains("[shell: powershell5.1(tier1b)]")
+            out.content.contains("[shell: pwsh(tier1)]")
+                || out.content.contains("[shell: powershell5.1(tier1)]")
         );
-        assert!(out.content.contains("[tier: tier1b]"));
+        assert!(out.content.contains("[tier: tier1]"));
     }
 
     /// Phase5-H回帰テスト: `cmd /c exit 7`単体（ネイティブコマンドの終了コード）が、
@@ -1214,7 +1214,7 @@ mod tests {
     // **調査メモ（Phase5-G、`command`文字列自体への日本語literal直接埋め込み）**:
     // `Write-Output 'こんにちは世界'`のようにモデルが日本語literalを`command`へ直接書く
     // ケースは、実LMStudio E2E（`huihui-qwen3.6-35b-a3b-claude-4.7-opus-abliterated-mtp`、
-    // tier1b、`docs/bugs/BUG-030.md`参照）で正しく`こんにちは世界`が返ることを確認した。
+    // Tier1、`docs/bugs/BUG-030.md`参照）で正しく`こんにちは世界`が返ることを確認した。
     // 一方、同じ入力を`cargo test`経由のユニットテストとして実行すると、`cargo run`で
     // ビルドした`harness.exe`を直接起動した場合とは異なり毎回確実に文字化けする
     // （`cargo test`のプロセス起動コンテキスト固有の再現しない挙動、原因未特定）。
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn run_shell_tier1b_rejects_write_outside_cwd() {
+    async fn run_shell_tier1_rejects_write_outside_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let outside = std::env::temp_dir().join("harness-m12-outside-test.txt");
         let _ = std::fs::remove_file(&outside);
@@ -1267,24 +1267,24 @@ mod tests {
         assert!(!outside.exists());
     }
 
-    /// Tier1a（AppContainer）の隔離セマンティクスを決定論的に検証する（LLM非依存、絶対パスを
+    /// Tier2a（AppContainer）の隔離セマンティクスを決定論的に検証する（LLM非依存、絶対パスを
     /// 使いモデルのCWD混乱を排除する）。実際にpreflight（プロファイル作成＋再帰ACL付与＋
-    /// smoke-test起動）を走らせ、Tier1aが選択できなかった環境（AppContainer不可）ではskipする。
+    /// smoke-test起動）を走らせ、Tier2aが選択できなかった環境（AppContainer不可）ではskipする。
     /// 実行にはWindows実機＋（この開発機では）管理者権限が要る（`sudo cargo test`）。
     #[cfg(windows)]
     #[tokio::test]
-    async fn run_shell_tier1a_contains_writes_and_reads() {
+    async fn run_shell_tier2a_contains_writes_and_reads() {
         use harness_core::{RequireSandbox, ShellTier};
 
         let dir = tempfile::tempdir().unwrap();
-        // 実Tier1a preflightを走らせる（`opt_in_tier1a=true`）。AppContainer不可の環境では
-        // Tier1bへ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
+        // 実Tier2a preflightを走らせる（`opt_in_Tier2a=true`）。AppContainer不可の環境では
+        // Tier1へ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
         let selection =
             harness_sandbox::select_tier(RequireSandbox::None, dir.path(), false, &[], None)
                 .unwrap();
-        if selection.tier != ShellTier::Tier1a {
+        if selection.tier != ShellTier::Tier2a {
             eprintln!(
-                "skipping tier1a test: preflight downgraded to {} ({:?})",
+                "skipping Tier2a test: preflight downgraded to {} ({:?})",
                 selection.tier.label(),
                 selection.reason
             );
@@ -1312,7 +1312,7 @@ mod tests {
             .unwrap();
         assert!(
             !out.is_error,
-            "in-workspace write should succeed under tier1a: {}",
+            "in-workspace write should succeed under Tier2a: {}",
             out.content
         );
         assert!(
@@ -1320,10 +1320,10 @@ mod tests {
             "in-workspace file was not created: {}",
             out.content
         );
-        assert!(out.content.contains("[tier: tier1a]"), "{}", out.content);
+        assert!(out.content.contains("[tier: tier2a]"), "{}", out.content);
 
         // (b) ワークスペース外への書込 → 拒否され、ファイルは作られない（範囲外書込の物理拒否）。
-        let outside = std::env::temp_dir().join("harness-tier1a-outside.txt");
+        let outside = std::env::temp_dir().join("harness-Tier2a-outside.txt");
         let _ = std::fs::remove_file(&outside);
         let out = tool
             .call(
@@ -1339,14 +1339,14 @@ mod tests {
             .unwrap();
         assert!(
             out.is_error,
-            "out-of-workspace write should fail under tier1a: {}",
+            "out-of-workspace write should fail under Tier2a: {}",
             out.content
         );
         assert!(!outside.exists());
 
-        // (c) T-04: ワークスペース外の機密ファイルのread → 拒否される（Tier1bなら読めてしまう
-        //     既知の欠陥がTier1aでは直る、という差分。実`~/.ssh`は使わずダミーで同じ性質を再現）。
-        let secret = std::env::temp_dir().join("harness-tier1a-secret.txt");
+        // (c) T-04: ワークスペース外の機密ファイルのread → 拒否される（Tier1なら読めてしまう
+        //     既知の欠陥がTier2aでは直る、という差分。実`~/.ssh`は使わずダミーで同じ性質を再現）。
+        let secret = std::env::temp_dir().join("harness-Tier2a-secret.txt");
         std::fs::write(&secret, "topsecret").unwrap();
         let out = tool
             .call(
@@ -1363,27 +1363,27 @@ mod tests {
         let _ = std::fs::remove_file(&secret);
         assert!(
             !out.content.contains("topsecret"),
-            "tier1a must not read outside-workspace secrets (T-04): {}",
+            "Tier2a must not read outside-workspace secrets (T-04): {}",
             out.content
         );
     }
 
-    /// アプリ単位network制御（軸1、D-10/D-11）の実機E2E。Tier1a配下で、許可リストに一致する
+    /// アプリ単位network制御（軸1、D-10/D-11）の実機E2E。Tier2a配下で、許可リストに一致する
     /// 単一コマンドは`internetClient`が付与されて外向き接続に成功し、それ以外
     /// （不一致・連鎖）はcapability空のまま`WSAEACCES`相当で失敗することを確認する
     /// （`plans/DESIGN-SANDBOX-APPPOLICY.md` §10 検証計画1/2/3）。
     #[cfg(windows)]
     #[tokio::test]
-    async fn run_shell_tier1a_net_allow_app_grants_and_denies_network() {
+    async fn run_shell_tier2a_net_allow_app_grants_and_denies_network() {
         use harness_core::{NetAppPolicy, RequireSandbox, ShellTier};
 
         let dir = tempfile::tempdir().unwrap();
         let selection =
             harness_sandbox::select_tier(RequireSandbox::None, dir.path(), false, &[], None)
                 .unwrap();
-        if selection.tier != ShellTier::Tier1a {
+        if selection.tier != ShellTier::Tier2a {
             eprintln!(
-                "skipping tier1a net-allow-app test: preflight downgraded to {} ({:?})",
+                "skipping Tier2a net-allow-app test: preflight downgraded to {} ({:?})",
                 selection.tier.label(),
                 selection.reason
             );

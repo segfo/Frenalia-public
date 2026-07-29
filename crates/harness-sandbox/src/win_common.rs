@@ -1,4 +1,4 @@
-//! Windows Tier1b（`win_restricted`）とTier1a（`win_appcontainer`）が共有する低レベル
+//! Windows Tier1（`win_restricted`）とTier2a（`win_appcontainer`）が共有する低レベル
 //! 補助関数（ワイド文字列変換・パイプ・env変換・HANDLE読み書き・Job Object）。
 //!
 //! いずれもWin32のパイプ継承・HANDLE操作というOSレベル挙動そのものに起因するロジックで、
@@ -110,7 +110,7 @@ unsafe impl Send for SendHandle {}
 /// stderrへパイプバッファ（既定64KB、匿名パイプの既定サイズ）を超えて書き込むと、読み手が
 /// 現れないstderr側のパイプが満杯になり子プロセスの書込みがブロックする。逐次読みは
 /// stdoutを読み切るまでstderrに手を付けないため、子はstdoutも吐けないままデッドロックし、
-/// `run_shell`のタイムアウトまで応答が返らない（Tier1a/Tier1bの`write_stdin_read_output_and_wait`
+/// `run_shell`のタイムアウトまで応答が返らない（Tier2a/Tier1の`write_stdin_read_output_and_wait`
 /// が踏んでいた欠陥。ビルドログ等stderr出力の多いコマンドで再現する）。
 pub(crate) fn read_two_pipes_to_strings(stdout: HANDLE, stderr: HANDLE) -> (String, String) {
     let stdout_handle = SendHandle(stdout);
@@ -151,7 +151,7 @@ pub(crate) fn create_pipe_with_sddl(sddl: &str) -> windows::core::Result<(HANDLE
 }
 
 /// kill-on-close付きJob Objectを作る（breakaway許可フラグは立てないため既定拒否）。
-/// Tier1b/Tier1aどちらの起動シーケンスでも同一ロジックを使う（T-13対策）。
+/// Tier1/Tier2aどちらの起動シーケンスでも同一ロジックを使う（T-13対策）。
 pub(crate) fn create_job_object() -> windows::core::Result<HANDLE> {
     unsafe {
         let job = CreateJobObjectW(None, PCWSTR::null())?;

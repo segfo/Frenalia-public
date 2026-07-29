@@ -2,7 +2,7 @@
 //! `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`として注入するローカルフォワードプロキシ。
 //!
 //! 単体では強制ではない: 環境変数を読まず生ソケットを直接開く子（静的リンクされたツール等）は
-//! この制御を素通りできる。Tier1aで`harness-netfilterd`のWFP default-denyと併用できた場合だけ、
+//! この制御を素通りできる。Tier2aで`harness-netfilterd`のWFP default-denyと併用できた場合だけ、
 //! raw socketはWFP側で拒否され、このプロキシ経由の通信だけが通る。
 //!
 //! SOCKS5も同じポートで受け付ける。SOCKS5 `ATYP=0x03`（ドメイン名指定）はProxy側で

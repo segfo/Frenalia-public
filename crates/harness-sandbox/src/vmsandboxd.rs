@@ -1361,7 +1361,7 @@ unsafe impl Send for SendableHandle {}
 /// （既定4・設定可能、`--max-sessions`）を判定し、超過時は新規スレッドを立てずその場で
 /// 明示的に拒否する（現行の「2本目が300秒沈黙する」バグの直接の修正、
 /// `DESIGN-SANDBOX-VMISOLATION.md`項目6-a参照）。**カウント対象はTier3セッション（本registry
-/// のエントリ）だけ**——Tier0/Tier1a/Tier1b/Tier2はこのdaemonへ一切接続しないため対象外。
+/// のエントリ）だけ**——Tier0/Tier2a/Tier1/Tier2bはこのdaemonへ一切接続しないため対象外。
 struct SessionRegistry {
     max_sessions: u8,
     active_slots: std::sync::Mutex<std::collections::HashSet<u8>>,

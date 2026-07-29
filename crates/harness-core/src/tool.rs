@@ -90,7 +90,7 @@ pub struct ReadScopeConfig {
 }
 
 /// シェル隔離Tier（M12、`plans/DESIGN-SANDBOX.md` §6）。Tier1'（VHDX）は本フェーズの
-/// 対象外（設計書がexperimental/オプトイン枠と位置付ける既定外Tier）。Tier1a（AppContainer）は
+/// 対象外（設計書がexperimental/オプトイン枠と位置付ける既定外Tier）。Tier2a（AppContainer）は
 /// D-02が定める「既定にせずフラグでオプトイン」の実験的Tierとして実装済み。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellTier {
@@ -100,13 +100,13 @@ pub enum ShellTier {
     /// 委譲する（他Tierと異なり実プロセスをホスト側にspawnしない）。
     Tier3,
     /// Linux: bubblewrap（user+mount+network namespace + OverlayFS）。
-    Tier2,
+    Tier2b,
     /// Windows: AppContainer（package SID + capability SID）。実験的/フラグ付き
     /// （`--experimental-tier1a`、D-02）。範囲外書込の物理拒否に加え、network を
     /// capabilityゲートでdefault-denyにする（T-04/T-10対策の核）。
-    Tier1a,
+    Tier2a,
     /// Windows: Restricted Token + 低Integrity Level + Job Object。
-    Tier1b,
+    Tier1,
     /// 保険（cwd拘束のみ・secret env strip・timeout/出力上限、best-effort）。
     Tier0,
 }
@@ -115,9 +115,9 @@ impl ShellTier {
     pub fn label(self) -> &'static str {
         match self {
             ShellTier::Tier3 => "tier3",
-            ShellTier::Tier2 => "tier2",
-            ShellTier::Tier1a => "tier1a",
-            ShellTier::Tier1b => "tier1b",
+            ShellTier::Tier2b => "tier2b",
+            ShellTier::Tier2a => "tier2a",
+            ShellTier::Tier1 => "tier1",
             ShellTier::Tier0 => "tier0",
         }
     }
@@ -128,9 +128,9 @@ impl ShellTier {
 pub enum RequireSandbox {
     #[default]
     None,
-    /// 書込拘束以上（Tier1b/Tier1a/Tier2でpass、Tier0で拒否）。
+    /// 書込拘束以上（Tier3/Tier2a/Tier1/Tier2bでpass、Tier0で拒否）。
     WriteContainment,
-    /// 機密性も要求（Tier1a/Tier2のみpass、Tier1b/Tier0で拒否）。判定の実体は
+    /// 機密性も要求（Tier3/Tier2a/Tier2bのみpass、Tier1/Tier0で拒否）。判定の実体は
     /// `harness-sandbox::shell_tier::satisfies`（§8-2の判定表）。
     Confidential,
 }
@@ -145,7 +145,7 @@ pub struct ShellTierSelection {
     pub reason: Option<String>,
     /// D8（`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺・fs passthrough）: 到達不能だった
     /// `--fs-allow`穴の診断メッセージ一覧。空なら全穴到達可、または該当なし。Tier選択自体
-    /// （`tier`/`downgraded_from`）には影響しない（壊れた穴があってもTier1a・workspaceは継続）。
+    /// （`tier`/`downgraded_from`）には影響しない（壊れた穴があってもTier2a・workspaceは継続）。
     pub passthrough_warnings: Vec<String>,
     /// `--fs-allow`/`fs.allow`のうち、実際にACE付与が確認できた（既存で十分だった場合を含む）
     /// ルートの一覧（`(path, writable)`）。`harness-cli`側の台帳記録はこれだけを書くことで、
@@ -218,7 +218,7 @@ impl Default for ShellTierSelection {
 
 /// ドメイン単位network制御設定（`plans/AppContainerを用いたドメインベース通信制御アーキテクチャ設計書.md`）。
 /// `run_shell`子へ`ALL_PROXY=socks5h://...`と`HTTP_PROXY`/`HTTPS_PROXY`を注入するLocal Proxy
-/// Agentの許可ドメインを運ぶ。Tier1aでWFP default-deny + loopback実ポート限定allowを併用できる
+/// Agentの許可ドメインを運ぶ。Tier2aでWFP default-deny + loopback実ポート限定allowを併用できる
 /// 場合のみ、Proxy非対応の直接connect/raw socketも強制的に遮断できる。WFPが無いTierや
 /// `enforced_by_wfp=false`では協調Proxyに留まり、その限界は`run_shell`出力へ明記する。
 /// `harness-core`は値を運ぶだけ、判定・Proxy/Fake DNS実体は`harness-tools`、WFP強制は
@@ -231,9 +231,9 @@ pub struct NetProxyConfig {
     /// ドメイン単位network制御を起動するか。既定true: 許可ドメインが空でもProxy/Fake DNS/WFP
     /// 監査経路を起動し、全拒否を`net-audit.jsonl`へ残す。falseはテスト・内部互換用。
     pub domain_policy_enabled: bool,
-    /// Tier1aでWFP default-deny + loopback allowが有効化されており、Proxy経由通信に必要な
+    /// Tier2aでWFP default-deny + loopback allowが有効化されており、Proxy経由通信に必要な
     /// AppContainer network capabilityを安全に付与できるか。falseならfail-closedのため、
-    /// `--net-allow-domain`だけではTier1a子へ`internetClient`を付けない。
+    /// `--net-allow-domain`だけではTier2a子へ`internetClient`を付けない。
     pub enforced_by_wfp: bool,
     /// 詳細監査ログのJSONL出力先。`None`なら従来通りプロセス内メモリの短いサマリだけを保持する。
     pub audit_log_path: Option<std::path::PathBuf>,
@@ -259,12 +259,12 @@ impl Default for NetProxyConfig {
 }
 
 /// アプリ単位network制御設定（軸1、`plans/DESIGN-SANDBOX-APPPOLICY.md` D-10/D-11）。
-/// Tier1a（AppContainer）で、先頭exe名が`allow_apps`に一致する信頼コマンドにのみ
+/// Tier2a（AppContainer）で、先頭exe名が`allow_apps`に一致する信頼コマンドにのみ
 /// `internetClient` capabilityを付与するための許可リストを運ぶ。空なら常にdeny（既定・
 /// 現状維持＝network全遮断）。判定（`classify_net_app`）とcapability適用は`harness-tools`/
 /// `harness-sandbox`側で行い、`harness-core`は値を運ぶだけ（`NetProxyConfig`と同じ役割分担）。
 ///
-/// **Tier1a限定**: Tier1b/0/2はcapability機構を持たないため、これらのTierでは`allow_apps`は
+/// **Tier2a限定**: Tier3/Tier2b/Tier1/Tier0はAppContainer capability機構を持たないため、これらのTierでは`allow_apps`は
 /// 効かない（`run_shell`がその旨をフッタに明記する）。
 #[derive(Debug, Clone, Default)]
 pub struct NetAppPolicy {
@@ -340,7 +340,7 @@ pub struct ToolCtx {
     /// （`NetProxyConfig::default()`＝空allowlistの全拒否監査）はプロキシを起動する。
     pub net_proxy: NetProxyConfig,
     /// アプリ単位network制御（軸1、D-10/D-11）。既定（`NetAppPolicy::default()`＝`allow_apps`空）は
-    /// 常にdeny（Tier1a子はcapability空でnetwork全遮断＝現状維持）。
+    /// 常にdeny（Tier2a子はcapability空でnetwork全遮断＝現状維持）。
     pub net_app: NetAppPolicy,
     /// `run_shell`で起動される子が、直前の`write_file`/`edit_file`によるstaging上の変更を
     /// 読めるかどうか。既定はfalse（多くのTierは実FSだけを見る）で、Tier3+CIFSライブ共有の

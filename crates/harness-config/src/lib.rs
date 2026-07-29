@@ -31,12 +31,12 @@ pub struct Settings {
     /// 協調プロキシ設定（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）。省略時は
     /// `NetSettings::default()`（`allow_domains`空＝全拒否ポリシーを監査付きで起動）。
     pub net: Option<NetSettings>,
-    /// Tier1a fs passthrough設定（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺）。省略時は
+    /// Tier2a fs passthrough設定（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺）。省略時は
     /// `FsSettings::default()`（`allow`空＝追加ルート無し＝M12までと等価）。
     pub fs: Option<FsSettings>,
 }
 
-/// `.harness/settings.json`の`fs`キー（D-13、Tier1a fs passthrough allowlist）。
+/// `.harness/settings.json`の`fs`キー（D-13、Tier2a fs passthrough allowlist）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FsSettings {
     /// 追加で許可するルート。各要素は`"<path>"`（read-only既定）または`"<path>:rw"`
@@ -67,7 +67,7 @@ impl FsSettings {
 pub struct NetSettings {
     /// 協調プロキシの許可ドメイン（`*.example.com`形式のサフィックスワイルドカード対応）。
     pub allow_domains: Option<Vec<String>>,
-    /// アプリ単位network制御（軸1、D-10/D-11）の信頼アプリ名リスト（Tier1aで`internetClient`を
+    /// アプリ単位network制御（軸1、D-10/D-11）の信頼アプリ名リスト（Tier2aで`internetClient`を
     /// 付与する先頭exe名。basename・拡張子除去・小文字で照合）。
     pub allow_apps: Option<Vec<String>>,
 }

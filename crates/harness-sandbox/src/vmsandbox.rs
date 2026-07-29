@@ -2293,7 +2293,7 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>, VmError> {
             let entry = entry?;
             let path = entry.path();
             // `.harness/`・`.git/`はワークスペース同期の対象外（サンドボックス制御用の
-            // メタデータ・VCS内部構造をコンテナへ持ち込まない、Tier1a/Tier2の既存慣習と同じ）。
+            // メタデータ・VCS内部構造をコンテナへ持ち込まない、Tier2a/Tier2bの既存慣習と同じ）。
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name == ".harness" || name == ".git" {
                     continue;
