@@ -37,7 +37,10 @@ const TICK: Duration = Duration::from_millis(33);
 pub fn init_file_logging(log_dir: &std::path::Path) -> tracing_appender::non_blocking::WorkerGuard {
     let file_appender = tracing_appender::rolling::never(log_dir, "harness-tui.log");
     let (writer, guard) = tracing_appender::non_blocking(file_appender);
-    tracing_subscriber::fmt().with_writer(writer).with_ansi(false).init();
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_ansi(false)
+        .init();
     guard
 }
 
@@ -45,7 +48,11 @@ pub fn init_file_logging(log_dir: &std::path::Path) -> tracing_appender::non_blo
 /// 添えて`ChangeRow`へ変換する。baseline（変更前）の内容は実FSから直接読む
 /// （`Tree`はworkspace内の相対パス、`Ext`は絶対パスそのもの）。表示専用のbest-effort読取
 /// のため、読めない場合は空文字列扱いにする（§リッチTUI「変更パネル」）。
-fn build_change_rows(workspace_root: &std::path::Path, fs: &SandboxFs, entries: Vec<harness_sandbox::ChangeEntry>) -> Vec<ChangeRow> {
+fn build_change_rows(
+    workspace_root: &std::path::Path,
+    fs: &SandboxFs,
+    entries: Vec<harness_sandbox::ChangeEntry>,
+) -> Vec<ChangeRow> {
     entries
         .into_iter()
         .map(|entry| {
@@ -96,20 +103,21 @@ pub async fn run(
     // 実測値ではない（`harness_sandbox::vmsandboxd_progress`のモジュールdoc、
     // `plans/DESIGN-SANDBOX-VMISOLATION.md`参照）。
     #[cfg(windows)]
-    let vm_sandbox_handle: Option<std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>> =
-        if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
-            sandbox_prep::run_prep_screen(
-                &mut term,
-                &mut term_events,
-                &ctx.workspace_root,
-                &ctx.net_proxy.allow_domains,
-                tier3_warm,
-                tier3_max_sessions,
-            )
-            .await?
-        } else {
-            None
-        };
+    let vm_sandbox_handle: Option<
+        std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>,
+    > = if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+        sandbox_prep::run_prep_screen(
+            &mut term,
+            &mut term_events,
+            &ctx.workspace_root,
+            &ctx.net_proxy.allow_domains,
+            tier3_warm,
+            tier3_max_sessions,
+        )
+        .await?
+    } else {
+        None
+    };
     #[cfg(not(windows))]
     let vm_sandbox_handle: Option<std::sync::Arc<()>> = None;
 
@@ -130,7 +138,11 @@ pub async fn run(
                 session = s;
                 state.messages = msgs;
             }
-            picker::PickerOutcome::Forked { source_id, session: s, messages } => {
+            picker::PickerOutcome::Forked {
+                source_id,
+                session: s,
+                messages,
+            } => {
                 session = s;
                 state.messages = messages;
                 forked_from = Some(source_id);
@@ -164,7 +176,10 @@ pub async fn run(
     let mut app = AppState::new(provider_label, model);
     app.enter_submits = enter_submits;
     // Enter系キー化けの検証用: `HARNESS_KEY_DEBUG`（`0`/空以外）で受信キーイベントを画面へecho。
-    if std::env::var("HARNESS_KEY_DEBUG").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
+    if std::env::var("HARNESS_KEY_DEBUG")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
         app.enable_key_debug();
     }
     if let Some(source_id) = forked_from {

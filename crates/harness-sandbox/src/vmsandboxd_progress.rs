@@ -44,9 +44,7 @@ enum Phase {
 impl Phase {
     fn label_ja(self) -> &'static str {
         match self {
-            Phase::ConnectingDaemon => {
-                "デーモンに接続中…（初回はUAC許可が必要な場合があります）"
-            }
+            Phase::ConnectingDaemon => "デーモンに接続中…（初回はUAC許可が必要な場合があります）",
             Phase::BootingVm => "VMを起動中…",
             Phase::WaitingGuestOs => "ゲストOSの起動を待っています…",
             Phase::EstablishingTrust => "コンテナ基盤(Incus)の信頼確立を待っています…",
@@ -118,13 +116,22 @@ mod tests {
             );
             last = phase;
         }
-        assert_eq!(Phase::from_elapsed(Duration::from_secs(400), false), Phase::ConfiguringWorkspace);
+        assert_eq!(
+            Phase::from_elapsed(Duration::from_secs(400), false),
+            Phase::ConfiguringWorkspace
+        );
     }
 
     #[test]
     fn warm_hint_falls_back_to_cold_table_past_warm_window() {
-        assert_eq!(Phase::from_elapsed(Duration::from_secs(1), true), Phase::ConnectingDaemon);
-        assert_eq!(Phase::from_elapsed(Duration::from_secs(10), true), Phase::WaitingGuestOs);
+        assert_eq!(
+            Phase::from_elapsed(Duration::from_secs(1), true),
+            Phase::ConnectingDaemon
+        );
+        assert_eq!(
+            Phase::from_elapsed(Duration::from_secs(10), true),
+            Phase::WaitingGuestOs
+        );
         // warm想定(25秒)を超えたら、同じ経過秒をコールド表で評価し直す。
         assert_eq!(
             Phase::from_elapsed(Duration::from_secs(30), true),

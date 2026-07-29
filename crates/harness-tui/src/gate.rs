@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 use harness_core::{AgentEvent, RiskClass};
-use harness_engine::{AllowlistRule, Classification, Decision, PermissionArbiter, PermissionGate, PermissionMode};
+use harness_engine::{
+    AllowlistRule, Classification, Decision, PermissionArbiter, PermissionGate, PermissionMode,
+};
 
 pub struct InteractiveGate {
     arbiter: Mutex<PermissionArbiter>,
@@ -101,14 +103,23 @@ mod tests {
     #[tokio::test]
     async fn allows_read_only_without_prompting() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let gate = InteractiveGate::new(PermissionArbiter::new(PermissionMode::Default, vec![]), tx);
+        let gate =
+            InteractiveGate::new(PermissionArbiter::new(PermissionMode::Default, vec![]), tx);
 
         let decision = gate
-            .resolve("read_file", RiskClass::ReadOnly, "a.txt", &serde_json::json!({}))
+            .resolve(
+                "read_file",
+                RiskClass::ReadOnly,
+                "a.txt",
+                &serde_json::json!({}),
+            )
             .await;
 
         assert_eq!(decision, Decision::Allow);
-        assert!(rx.try_recv().is_err(), "no event should be emitted for auto-allow");
+        assert!(
+            rx.try_recv().is_err(),
+            "no event should be emitted for auto-allow"
+        );
     }
 
     /// allowlist未登録のExecは`Classification::Prompt`となり、`PermissionRequired`を発行して
@@ -134,7 +145,10 @@ mod tests {
                 .await
         });
 
-        let ev = rx.recv().await.expect("PermissionRequired should be emitted");
+        let ev = rx
+            .recv()
+            .await
+            .expect("PermissionRequired should be emitted");
         let id = match ev {
             AgentEvent::PermissionRequired { id, tool, .. } => {
                 assert_eq!(tool, "run_shell");

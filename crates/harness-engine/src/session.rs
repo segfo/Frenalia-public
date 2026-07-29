@@ -127,7 +127,10 @@ impl SessionStore {
         if msgs.is_empty() {
             return Ok(());
         }
-        let mut file = OpenOptions::new().append(true).create(true).open(&self.path)?;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path)?;
         for m in msgs {
             let line = serde_json::to_string(m)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -184,7 +187,10 @@ mod tests {
     use harness_core::{ContentBlock, Role};
 
     fn msg(text: &str) -> Message {
-        Message { role: Role::User, content: vec![ContentBlock::Text(text.to_string())] }
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text(text.to_string())],
+        }
     }
 
     #[test]
@@ -233,14 +239,22 @@ mod tests {
     fn fork_from_copies_messages_and_leaves_source_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let source = SessionStore::create_new(dir.path()).unwrap();
-        source.append_messages(&[msg("hello"), msg("world")]).unwrap();
+        source
+            .append_messages(&[msg("hello"), msg("world")])
+            .unwrap();
 
         let forked = SessionStore::fork_from(dir.path(), source.path()).unwrap();
         assert_ne!(forked.path(), source.path());
-        assert_eq!(forked.load_messages().unwrap(), vec![msg("hello"), msg("world")]);
+        assert_eq!(
+            forked.load_messages().unwrap(),
+            vec![msg("hello"), msg("world")]
+        );
 
         forked.append_messages(&[msg("only in fork")]).unwrap();
-        assert_eq!(source.load_messages().unwrap(), vec![msg("hello"), msg("world")]);
+        assert_eq!(
+            source.load_messages().unwrap(),
+            vec![msg("hello"), msg("world")]
+        );
         assert_eq!(forked.load_messages().unwrap().len(), 3);
     }
 
@@ -251,9 +265,7 @@ mod tests {
         older.append_messages(&[msg("older prompt")]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         let newer = SessionStore::create_new(dir.path()).unwrap();
-        newer
-            .append_messages(&[msg(&"x".repeat(100))])
-            .unwrap();
+        newer.append_messages(&[msg(&"x".repeat(100))]).unwrap();
 
         let summaries = SessionStore::list(dir.path()).unwrap();
         assert_eq!(summaries.len(), 2);

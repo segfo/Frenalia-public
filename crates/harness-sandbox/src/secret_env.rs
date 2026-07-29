@@ -45,7 +45,9 @@ pub fn build_child_env() -> Vec<(String, String)> {
 }
 
 /// テスト用: 任意の環境イテレータからクリーンなenvを構築する。
-pub fn build_child_env_from(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
+pub fn build_child_env_from(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
     vars.into_iter()
         .filter(|(name, _)| is_allowlisted(name) && !looks_secret(name))
         .collect()

@@ -91,9 +91,7 @@ fn record_event(
 /// `run_agent_loop`が`Err`で返すため一律1、正常終了した`AgentLoopOutcome`は`stop_reason`ごとに
 /// 割り振る。ツール呼び出し個々の失敗・パーミッション拒否は`tool_result`としてモデルへ
 /// 返され通常ループが継続する設計（§エージェントループ 手順4）のため、ここでは扱わない。
-fn exit_code_for(
-    result: &Result<harness_engine::AgentLoopOutcome, ProviderError>,
-) -> ExitCode {
+fn exit_code_for(result: &Result<harness_engine::AgentLoopOutcome, ProviderError>) -> ExitCode {
     match result {
         Err(_) => ExitCode::FAILURE,
         Ok(outcome) => match outcome.stop_reason {
@@ -125,10 +123,20 @@ pub async fn run_headless<W: Write>(
 ) -> ExitCode {
     match output_format {
         OutputFormat::Text => {
-            let result = run_agent_loop(provider, state, tools, ctx, gate, config, None, None, |delta| {
-                let _ = writer.write_all(delta.as_bytes());
-                let _ = writer.flush();
-            })
+            let result = run_agent_loop(
+                provider,
+                state,
+                tools,
+                ctx,
+                gate,
+                config,
+                None,
+                None,
+                |delta| {
+                    let _ = writer.write_all(delta.as_bytes());
+                    let _ = writer.flush();
+                },
+            )
             .await;
             match &result {
                 Ok(_) => {
@@ -142,8 +150,17 @@ pub async fn run_headless<W: Write>(
         }
         OutputFormat::Json | OutputFormat::Jsonl => {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let loop_fut =
-                run_agent_loop(provider, state, tools, ctx, gate, config, Some(&tx), None, |_delta| {});
+            let loop_fut = run_agent_loop(
+                provider,
+                state,
+                tools,
+                ctx,
+                gate,
+                config,
+                Some(&tx),
+                None,
+                |_delta| {},
+            );
             tokio::pin!(loop_fut);
 
             let mut turns = 0usize;

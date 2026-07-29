@@ -37,7 +37,14 @@ pub fn build_args(config: &BwrapConfig) -> Vec<String> {
 
     // ツールチェーン必須パスはread-onlyでbindする（存在しないパスはbwrapが起動時に失敗する
     // ため、実在するもののみ追加する）。
-    for ro in ["/usr", "/bin", "/lib", "/lib64", "/etc/alternatives", "/tmp"] {
+    for ro in [
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/etc/alternatives",
+        "/tmp",
+    ] {
         if Path::new(ro).exists() {
             args.push("--ro-bind".to_string());
             args.push(ro.to_string());

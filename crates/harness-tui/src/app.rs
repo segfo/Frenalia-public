@@ -333,7 +333,8 @@ impl AppState {
         if text.trim_start().starts_with('/') {
             return match parse_slash_command(&text) {
                 Ok(cmd) => {
-                    self.transcript.push(TranscriptItem::Info(format!("> {text}")));
+                    self.transcript
+                        .push(TranscriptItem::Info(format!("> {text}")));
                     Some(Action::Slash(cmd))
                 }
                 Err(reason) => {
@@ -350,13 +351,16 @@ impl AppState {
     /// 復元した`ContentBlock`列をツールカード等へ完全再構成するのはコストに見合わないため、
     /// 件数のみを知らせるに留める。
     pub fn note_resumed_session(&mut self, message_count: usize) {
-        self.transcript
-            .push(TranscriptItem::Info(format!("resumed session ({message_count} messages)")));
+        self.transcript.push(TranscriptItem::Info(format!(
+            "resumed session ({message_count} messages)"
+        )));
     }
 
     pub fn apply(&mut self, ev: AgentEvent) {
         match ev {
-            AgentEvent::TurnStarted { estimated_input_tokens } => {
+            AgentEvent::TurnStarted {
+                estimated_input_tokens,
+            } => {
                 self.turn_open = false;
                 self.turn_in_flight = true;
                 self.current_turn_upstream_estimate = estimated_input_tokens;
@@ -381,7 +385,8 @@ impl AppState {
                         return;
                     }
                     self.end_thinking_progress(true);
-                    self.transcript.push(TranscriptItem::Assistant(visible.to_string()));
+                    self.transcript
+                        .push(TranscriptItem::Assistant(visible.to_string()));
                     self.turn_open = true;
                     return;
                 }
@@ -456,10 +461,14 @@ impl AppState {
                 self.last_usage = usage;
                 self.session_usage.input = self.session_usage.input.saturating_add(usage.input);
                 self.session_usage.output = self.session_usage.output.saturating_add(usage.output);
-                self.session_usage.cache_read =
-                    self.session_usage.cache_read.saturating_add(usage.cache_read);
-                self.session_usage.cache_creation =
-                    self.session_usage.cache_creation.saturating_add(usage.cache_creation);
+                self.session_usage.cache_read = self
+                    .session_usage
+                    .cache_read
+                    .saturating_add(usage.cache_read);
+                self.session_usage.cache_creation = self
+                    .session_usage
+                    .cache_creation
+                    .saturating_add(usage.cache_creation);
                 self.turn_open = false;
                 self.turn_in_flight = false;
                 // 本文もツール呼び出しも一切無いまま終わるターン（安全網）。記録行は残さず黙って消す。
@@ -472,7 +481,8 @@ impl AppState {
                 self.end_thinking_progress(false);
             }
             AgentEvent::Cancelled => {
-                self.transcript.push(TranscriptItem::Info("cancelled".to_string()));
+                self.transcript
+                    .push(TranscriptItem::Info("cancelled".to_string()));
                 self.turn_open = false;
                 self.turn_in_flight = false;
                 self.end_thinking_progress(false);
@@ -482,9 +492,15 @@ impl AppState {
                     "context compacted ({removed_messages} messages summarized)"
                 )));
             }
-            AgentEvent::SessionSwitched { source_id, new_id, message_count } => {
+            AgentEvent::SessionSwitched {
+                source_id,
+                new_id,
+                message_count,
+            } => {
                 let msg = match source_id {
-                    Some(src) => format!("forked session {src} -> {new_id} ({message_count} messages)"),
+                    Some(src) => {
+                        format!("forked session {src} -> {new_id} ({message_count} messages)")
+                    }
                     None => format!("switched to session {new_id} ({message_count} messages)"),
                 };
                 self.transcript.push(TranscriptItem::Info(msg));
@@ -532,7 +548,10 @@ impl AppState {
     fn current_line_bounds(&self) -> (usize, usize) {
         let char_count = self.input.chars().count();
         let starts = self.line_start_indices();
-        let line_idx = starts.iter().rposition(|&s| s <= self.input_cursor).unwrap_or(0);
+        let line_idx = starts
+            .iter()
+            .rposition(|&s| s <= self.input_cursor)
+            .unwrap_or(0);
         let start = starts[line_idx];
         let end = starts
             .get(line_idx + 1)
@@ -547,14 +566,16 @@ impl AppState {
         if coalesce_insert && self.input_last_edit_was_insert {
             return;
         }
-        self.input_undo_stack.push((self.input.clone(), self.input_cursor));
+        self.input_undo_stack
+            .push((self.input.clone(), self.input_cursor));
         self.input_redo_stack.clear();
         self.input_last_edit_was_insert = coalesce_insert;
     }
 
     fn undo(&mut self) {
         if let Some((prev_input, prev_cursor)) = self.input_undo_stack.pop() {
-            self.input_redo_stack.push((self.input.clone(), self.input_cursor));
+            self.input_redo_stack
+                .push((self.input.clone(), self.input_cursor));
             self.input = prev_input;
             self.input_cursor = prev_cursor;
             self.input_selection_anchor = None;
@@ -564,7 +585,8 @@ impl AppState {
 
     fn redo(&mut self) {
         if let Some((next_input, next_cursor)) = self.input_redo_stack.pop() {
-            self.input_undo_stack.push((self.input.clone(), self.input_cursor));
+            self.input_undo_stack
+                .push((self.input.clone(), self.input_cursor));
             self.input = next_input;
             self.input_cursor = next_cursor;
             self.input_selection_anchor = None;
@@ -647,7 +669,9 @@ impl AppState {
             }
             // Ctrl+Z=Undo、Ctrl+Shift+Z=Redo。端末によってはShift+文字が`Char('Z')`
             // （大文字、SHIFTフラグ無し）として届く実装もあるため、両方の届き方を吸収する。
-            KeyCode::Char(c) if (c == 'z' || c == 'Z') && key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if (c == 'z' || c == 'Z') && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 if c == 'Z' || key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.redo();
                 } else {
@@ -671,7 +695,8 @@ impl AppState {
             // Shift+Enterは無効化（何もしない）。SHIFT修飾を届けられる端末でのみこのアームが
             // 効き、送信キーはAlt+Enterに一本化する（下記）。
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => None,
-            KeyCode::Enter if !(key.modifiers.contains(KeyModifiers::ALT) || self.enter_submits) =>
+            KeyCode::Enter
+                if !(key.modifiers.contains(KeyModifiers::ALT) || self.enter_submits) =>
             {
                 if self.selection_range().is_some() {
                     self.push_undo_snapshot(false);
@@ -802,8 +827,14 @@ impl AppState {
                     let column = self.input_cursor - line_start;
                     let next_start = line_end + 1; // `\n`の直後
                     let starts = self.line_start_indices();
-                    let line_idx = starts.iter().rposition(|&s| s == next_start).unwrap_or(starts.len() - 1);
-                    let next_end = starts.get(line_idx + 1).map(|&s| s - 1).unwrap_or(char_count);
+                    let line_idx = starts
+                        .iter()
+                        .rposition(|&s| s == next_start)
+                        .unwrap_or(starts.len() - 1);
+                    let next_end = starts
+                        .get(line_idx + 1)
+                        .map(|&s| s - 1)
+                        .unwrap_or(char_count);
                     let next_len = next_end - next_start;
                     self.input_cursor = next_start + column.min(next_len);
                 }
@@ -831,7 +862,10 @@ impl AppState {
 /// `input`中の文字インデックス（`char_indices`基準）に対応するバイトオフセットを返す。
 /// 末尾を指す場合は`s.len()`（マルチバイト文字境界での`insert`/`remove`パニックを防ぐ）。
 fn char_byte_index(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 fn pretty(v: &serde_json::Value) -> String {
@@ -1161,7 +1195,10 @@ mod tests {
     }
 
     fn ctrl_shift(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )
     }
 
     /// ユーザー報告の再現: 「ああああ消したいところあああ」でカーソルを`ろ`（インデックス10）
@@ -1325,7 +1362,9 @@ mod tests {
     #[test]
     fn text_deltas_within_a_turn_accumulate_into_one_item() {
         let mut app = AppState::new("mock".into(), "mock-model".into());
-        app.apply(AgentEvent::TurnStarted { estimated_input_tokens: 0 });
+        app.apply(AgentEvent::TurnStarted {
+            estimated_input_tokens: 0,
+        });
         app.apply(AgentEvent::TextDelta { text: "hel".into() });
         app.apply(AgentEvent::TextDelta { text: "lo".into() });
 
@@ -1339,7 +1378,9 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             usage: Usage::default(),
         });
-        app.apply(AgentEvent::TurnStarted { estimated_input_tokens: 0 });
+        app.apply(AgentEvent::TurnStarted {
+            estimated_input_tokens: 0,
+        });
         app.apply(AgentEvent::TextDelta {
             text: "next turn".into(),
         });
@@ -1582,30 +1623,64 @@ mod tests {
     #[test]
     fn tracks_live_token_estimates_and_accumulates_session_usage() {
         let mut app = AppState::new("mock".into(), "mock-model".into());
-        app.apply(AgentEvent::TurnStarted { estimated_input_tokens: 42 });
+        app.apply(AgentEvent::TurnStarted {
+            estimated_input_tokens: 42,
+        });
         assert!(app.turn_in_flight);
         assert_eq!(app.current_turn_upstream_estimate, 42);
         assert_eq!(app.current_turn_downstream_chars, 0);
 
-        app.apply(AgentEvent::ThinkingDelta { text: "abcd".into() });
+        app.apply(AgentEvent::ThinkingDelta {
+            text: "abcd".into(),
+        });
         assert_eq!(app.current_turn_downstream_chars, 4);
-        app.apply(AgentEvent::TextDelta { text: "hello".into() });
+        app.apply(AgentEvent::TextDelta {
+            text: "hello".into(),
+        });
         assert_eq!(app.current_turn_downstream_chars, 9);
 
         app.apply(AgentEvent::TurnCompleted {
             stop_reason: StopReason::EndTurn,
-            usage: Usage { input: 10, output: 5, cache_read: 1, cache_creation: 2 },
+            usage: Usage {
+                input: 10,
+                output: 5,
+                cache_read: 1,
+                cache_creation: 2,
+            },
         });
         assert!(!app.turn_in_flight);
-        assert_eq!(app.session_usage, Usage { input: 10, output: 5, cache_read: 1, cache_creation: 2 });
+        assert_eq!(
+            app.session_usage,
+            Usage {
+                input: 10,
+                output: 5,
+                cache_read: 1,
+                cache_creation: 2
+            }
+        );
 
         // 2ターン目は既存の累計へ加算される。
-        app.apply(AgentEvent::TurnStarted { estimated_input_tokens: 7 });
+        app.apply(AgentEvent::TurnStarted {
+            estimated_input_tokens: 7,
+        });
         app.apply(AgentEvent::TurnCompleted {
             stop_reason: StopReason::EndTurn,
-            usage: Usage { input: 3, output: 2, cache_read: 0, cache_creation: 0 },
+            usage: Usage {
+                input: 3,
+                output: 2,
+                cache_read: 0,
+                cache_creation: 0,
+            },
         });
-        assert_eq!(app.session_usage, Usage { input: 13, output: 7, cache_read: 1, cache_creation: 2 });
+        assert_eq!(
+            app.session_usage,
+            Usage {
+                input: 13,
+                output: 7,
+                cache_read: 1,
+                cache_creation: 2
+            }
+        );
     }
 
     /// thinkingを使ったターンでは、本文が届いた時点で「考え中」インジケータが消え、
@@ -1613,14 +1688,24 @@ mod tests {
     #[test]
     fn thinking_progress_leaves_a_record_when_thinking_was_used() {
         let mut app = AppState::new("mock".into(), "mock-model".into());
-        app.apply(AgentEvent::TurnStarted { estimated_input_tokens: 0 });
+        app.apply(AgentEvent::TurnStarted {
+            estimated_input_tokens: 0,
+        });
         assert!(app.thinking_progress.is_some());
 
         app.apply(AgentEvent::ThinkingDelta { text: "hmm".into() });
-        assert!(app.thinking_progress.is_some(), "still thinking, indicator stays");
+        assert!(
+            app.thinking_progress.is_some(),
+            "still thinking, indicator stays"
+        );
 
-        app.apply(AgentEvent::TextDelta { text: "answer".into() });
-        assert!(app.thinking_progress.is_none(), "indicator clears once real content starts");
+        app.apply(AgentEvent::TextDelta {
+            text: "answer".into(),
+        });
+        assert!(
+            app.thinking_progress.is_none(),
+            "indicator clears once real content starts"
+        );
 
         let thought_notes = app
             .transcript
@@ -1635,8 +1720,12 @@ mod tests {
     #[test]
     fn no_thought_record_when_thinking_was_not_used() {
         let mut app = AppState::new("mock".into(), "mock-model".into());
-        app.apply(AgentEvent::TurnStarted { estimated_input_tokens: 0 });
-        app.apply(AgentEvent::TextDelta { text: "immediate answer".into() });
+        app.apply(AgentEvent::TurnStarted {
+            estimated_input_tokens: 0,
+        });
+        app.apply(AgentEvent::TextDelta {
+            text: "immediate answer".into(),
+        });
         assert!(app.thinking_progress.is_none());
 
         let thought_notes = app
@@ -1652,7 +1741,9 @@ mod tests {
     #[test]
     fn tool_call_without_text_still_clears_thinking_progress() {
         let mut app = AppState::new("mock".into(), "mock-model".into());
-        app.apply(AgentEvent::TurnStarted { estimated_input_tokens: 0 });
+        app.apply(AgentEvent::TurnStarted {
+            estimated_input_tokens: 0,
+        });
         app.apply(AgentEvent::ToolCallProposed {
             id: "call_1".into(),
             name: "read_file".into(),
@@ -1667,14 +1758,29 @@ mod tests {
     #[test]
     fn leading_whitespace_only_deltas_are_dropped_and_indicator_stays() {
         let mut app = AppState::new("mock".into(), "mock-model".into());
-        app.apply(AgentEvent::TurnStarted { estimated_input_tokens: 0 });
+        app.apply(AgentEvent::TurnStarted {
+            estimated_input_tokens: 0,
+        });
 
-        app.apply(AgentEvent::TextDelta { text: "\n\n".into() });
-        assert!(app.thinking_progress.is_some(), "still waiting for real content");
-        assert!(app.transcript.is_empty(), "whitespace-only delta must not create an item");
+        app.apply(AgentEvent::TextDelta {
+            text: "\n\n".into(),
+        });
+        assert!(
+            app.thinking_progress.is_some(),
+            "still waiting for real content"
+        );
+        assert!(
+            app.transcript.is_empty(),
+            "whitespace-only delta must not create an item"
+        );
 
-        app.apply(AgentEvent::TextDelta { text: "Hello".into() });
-        assert!(app.thinking_progress.is_none(), "indicator clears once real content arrives");
+        app.apply(AgentEvent::TextDelta {
+            text: "Hello".into(),
+        });
+        assert!(
+            app.thinking_progress.is_none(),
+            "indicator clears once real content arrives"
+        );
         assert_eq!(app.transcript.len(), 1);
         assert!(matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s == "Hello"));
     }
@@ -1684,7 +1790,9 @@ mod tests {
     #[test]
     fn subsequent_text_deltas_still_append_to_the_same_assistant_item() {
         let mut app = AppState::new("mock".into(), "mock-model".into());
-        app.apply(AgentEvent::TurnStarted { estimated_input_tokens: 0 });
+        app.apply(AgentEvent::TurnStarted {
+            estimated_input_tokens: 0,
+        });
         app.apply(AgentEvent::TextDelta { text: "Hel".into() });
         app.apply(AgentEvent::TextDelta { text: "lo".into() });
 
@@ -1722,7 +1830,11 @@ mod tests {
     #[test]
     fn changes_panel_up_down_moves_selection_and_clamps() {
         let mut app = AppState::new("mock".into(), "mock-model".into());
-        app.open_changes_panel(vec![change_row("a.txt"), change_row("b.txt"), change_row("c.txt")]);
+        app.open_changes_panel(vec![
+            change_row("a.txt"),
+            change_row("b.txt"),
+            change_row("c.txt"),
+        ]);
 
         app.on_key(code(KeyCode::Up)); // 先頭でのUpは0のまま
         assert_eq!(app.changes_panel.as_ref().unwrap().selected, 0);
@@ -1757,7 +1869,9 @@ mod tests {
         app.on_key(code(KeyCode::Enter)); // a.txtをreject
 
         let action = app.on_key(key('c'));
-        assert!(matches!(action, Some(Action::CommitChanges(paths)) if paths == vec!["b.txt".to_string()]));
+        assert!(
+            matches!(action, Some(Action::CommitChanges(paths)) if paths == vec!["b.txt".to_string()])
+        );
         assert!(app.changes_panel.is_none());
     }
 

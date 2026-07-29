@@ -91,8 +91,12 @@ pub fn render_prep_screen(
         Line::from(""),
         Line::from(Span::styled(caveat, Style::default().fg(Color::DarkGray))),
     ];
-    let block = Block::default().borders(Borders::ALL).title("sandbox preparing");
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("sandbox preparing");
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, rect);
 }
 
@@ -213,7 +217,10 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
             TranscriptItem::Thinking(text) => {
                 if collapsed {
                     lines.push(Line::from(Span::styled(
-                        format!("  (thinking, {} chars, Ctrl+O to expand)", text.chars().count()),
+                        format!(
+                            "  (thinking, {} chars, Ctrl+O to expand)",
+                            text.chars().count()
+                        ),
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
@@ -237,7 +244,9 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
             } => {
                 if collapsed {
                     let (glyph, color, summary) = match status {
-                        ToolCardStatus::Running => ("⚙".to_string(), Color::Yellow, "running".to_string()),
+                        ToolCardStatus::Running => {
+                            ("⚙".to_string(), Color::Yellow, "running".to_string())
+                        }
                         ToolCardStatus::Done { is_error, output } => {
                             let lines = output.lines().count().max(1);
                             if *is_error {
@@ -304,7 +313,9 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
         let elapsed = started.elapsed().as_secs_f32();
         lines.push(Line::from(Span::styled(
             format!("{glyph} Thinking… (~{tokens} tokens, {elapsed:.1}s)"),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
     }
 
@@ -359,11 +370,7 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
     };
     let text = format!(
         " {} | model={} | stop={} | tokens turn({turn_tokens}) session(in={} out={})",
-        app.provider_label,
-        app.model,
-        stop,
-        app.session_usage.input,
-        app.session_usage.output,
+        app.provider_label, app.model, stop, app.session_usage.input, app.session_usage.output,
     );
     let paragraph = Paragraph::new(Line::from(Span::styled(
         text,
@@ -433,7 +440,9 @@ fn render_permission_modal(f: &mut Frame, area: Rect, pending: &crate::app::Perm
         .borders(Borders::ALL)
         .title("permission required")
         .style(Style::default().fg(Color::White).bg(Color::Black));
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, rect);
 }
 
@@ -465,7 +474,11 @@ fn render_changes_panel(f: &mut Frame, area: Rect, panel: &ChangesPanelState) {
                     ManifestTarget::Ext => " (ext)",
                     _ => "",
                 };
-                let mark = if panel.rejected.contains(&i) { "[ ]" } else { "[x]" };
+                let mark = if panel.rejected.contains(&i) {
+                    "[ ]"
+                } else {
+                    "[x]"
+                };
                 let cursor = if i == panel.selected { ">" } else { " " };
                 let color = if panel.rejected.contains(&i) {
                     Color::DarkGray
@@ -506,7 +519,9 @@ fn render_changes_panel(f: &mut Frame, area: Rect, panel: &ChangesPanelState) {
         .unwrap_or_default();
     let diff_block = Block::default().borders(Borders::ALL).title("diff");
     f.render_widget(
-        Paragraph::new(diff_lines).block(diff_block).wrap(Wrap { trim: false }),
+        Paragraph::new(diff_lines)
+            .block(diff_block)
+            .wrap(Wrap { trim: false }),
         cols[1],
     );
 }
@@ -537,7 +552,12 @@ mod tests {
     fn line_texts(lines: &[Line]) -> Vec<String> {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -546,7 +566,10 @@ mod tests {
         let input = "hello\nworld";
         // グローバル文字インデックス(1, 4) = "hello"内の"ell"。
         let lines = build_input_lines(input, Some((1, 4)));
-        assert_eq!(line_texts(&lines), vec!["hello".to_string(), "world".to_string()]);
+        assert_eq!(
+            line_texts(&lines),
+            vec!["hello".to_string(), "world".to_string()]
+        );
 
         assert_eq!(lines[0].spans.len(), 3);
         assert_eq!(lines[0].spans[0].content, "h");

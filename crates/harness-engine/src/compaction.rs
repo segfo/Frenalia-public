@@ -131,8 +131,10 @@ mod tests {
         async fn stream(
             &self,
             _req: CompletionRequest,
-        ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
-        {
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>,
+            ProviderError,
+        > {
             let mut turns = self.turns.lock().unwrap();
             let events = turns.remove(0);
             Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
@@ -141,19 +143,34 @@ mod tests {
 
     fn summary_turn(text: &str) -> Vec<StreamEvent> {
         vec![
-            StreamEvent::BlockStart { index: 0, kind: BlockKind::Text },
-            StreamEvent::TextDelta { index: 0, text: text.to_string() },
+            StreamEvent::BlockStart {
+                index: 0,
+                kind: BlockKind::Text,
+            },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: text.to_string(),
+            },
             StreamEvent::BlockStop { index: 0 },
-            StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: Usage::default() },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
         ]
     }
 
     fn user_turn(text: &str) -> Message {
-        Message { role: Role::User, content: vec![ContentBlock::Text(text.to_string())] }
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text(text.to_string())],
+        }
     }
 
     fn assistant_text(text: &str) -> Message {
-        Message { role: Role::Assistant, content: vec![ContentBlock::Text(text.to_string())] }
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text(text.to_string())],
+        }
     }
 
     #[tokio::test]
@@ -166,9 +183,13 @@ mod tests {
         state.messages.push(user_turn("turn3"));
         state.messages.push(assistant_text("reply3"));
 
-        let provider = MockProvider { turns: Mutex::new(vec![summary_turn("summary of turn1/turn2")]) };
+        let provider = MockProvider {
+            turns: Mutex::new(vec![summary_turn("summary of turn1/turn2")]),
+        };
 
-        let removed = compact(&provider, &mut state, "mock-model", 1).await.unwrap();
+        let removed = compact(&provider, &mut state, "mock-model", 1)
+            .await
+            .unwrap();
 
         assert_eq!(removed, 4);
         assert_eq!(state.messages.len(), 3);
@@ -187,8 +208,12 @@ mod tests {
         state.messages.push(user_turn("turn1"));
         state.messages.push(assistant_text("reply1"));
 
-        let provider = MockProvider { turns: Mutex::new(vec![]) };
-        let removed = compact(&provider, &mut state, "mock-model", 2).await.unwrap();
+        let provider = MockProvider {
+            turns: Mutex::new(vec![]),
+        };
+        let removed = compact(&provider, &mut state, "mock-model", 2)
+            .await
+            .unwrap();
 
         assert_eq!(removed, 0);
         assert_eq!(state.messages.len(), 2);

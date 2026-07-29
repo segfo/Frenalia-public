@@ -257,7 +257,8 @@ impl SandboxFs {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
         );
         updated.push('\n');
-        self.jail.write_string(&normalize_str(&manifest_rel), &updated)?;
+        self.jail
+            .write_string(&normalize_str(&manifest_rel), &updated)?;
         Ok(())
     }
 
@@ -293,8 +294,9 @@ impl SandboxFs {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: ManifestEntry = serde_json::from_str(line)
-                .map_err(|e| SandboxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+            let entry: ManifestEntry = serde_json::from_str(line).map_err(|e| {
+                SandboxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
             latest.insert((entry.target, entry.path.clone()), entry);
         }
         Ok(latest.into_values().collect())
@@ -341,7 +343,8 @@ impl SandboxFs {
                     .read_to_string(&normalize_str(&rel))
                     .ok()
                     .map(|s| hash_content(&s));
-                self.jail.write_string(&normalize_str(&overlay_rel), content)?;
+                self.jail
+                    .write_string(&normalize_str(&overlay_rel), content)?;
                 let op = if baseline_hash.is_none() {
                     ManifestOp::Create
                 } else {
@@ -362,7 +365,8 @@ impl SandboxFs {
                 let baseline_hash = std::fs::read_to_string(Path::new(&original))
                     .ok()
                     .map(|s| hash_content(&s));
-                self.jail.write_string(&normalize_str(&overlay_rel), content)?;
+                self.jail
+                    .write_string(&normalize_str(&overlay_rel), content)?;
                 let op = if baseline_hash.is_none() {
                     ManifestOp::Create
                 } else {
@@ -509,7 +513,11 @@ impl SandboxFs {
             }
 
             let current_hash = match e.target {
-                ManifestTarget::Tree => self.jail.read_to_string(&e.path).ok().map(|s| hash_content(&s)),
+                ManifestTarget::Tree => self
+                    .jail
+                    .read_to_string(&e.path)
+                    .ok()
+                    .map(|s| hash_content(&s)),
                 ManifestTarget::Ext => std::fs::read_to_string(Path::new(&e.path))
                     .ok()
                     .map(|s| hash_content(&s)),
@@ -528,7 +536,9 @@ impl SandboxFs {
                 }
                 (ManifestTarget::Tree, _) => {
                     let content = self.jail.read_to_string(&e.overlay_path)?;
-                    self.jail.write_string(&e.path, &content).map_err(Into::into)
+                    self.jail
+                        .write_string(&e.path, &content)
+                        .map_err(Into::into)
                 }
                 (ManifestTarget::Ext, ManifestOp::Delete) => {
                     std::fs::remove_file(Path::new(&e.path)).map_err(Into::into)
@@ -568,8 +578,9 @@ impl SandboxFs {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: ManifestEntry = serde_json::from_str(line)
-                .map_err(|e| SandboxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+            let entry: ManifestEntry = serde_json::from_str(line).map_err(|e| {
+                SandboxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
             if applied
                 .iter()
                 .any(|(t, p)| *t == entry.target && p == &entry.path)
@@ -579,7 +590,8 @@ impl SandboxFs {
             out.push_str(&serde_json::to_string(&entry).expect("ManifestEntry serializes"));
             out.push('\n');
         }
-        self.jail.write_string(&normalize_str(&manifest_rel), &out)?;
+        self.jail
+            .write_string(&normalize_str(&manifest_rel), &out)?;
         Ok(())
     }
 
@@ -610,7 +622,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = SandboxFs::open(dir.path(), &StagingConfig::default()).unwrap();
         fs.write_string("a.txt", "hello").unwrap();
-        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "hello"
+        );
         assert_eq!(fs.read_to_string("a.txt").unwrap(), "hello");
         assert!(fs.change_set().unwrap().is_empty());
     }
@@ -622,7 +637,10 @@ mod tests {
 
         fs.write_string("newfile.txt", "staged content").unwrap();
 
-        assert!(!dir.path().join("newfile.txt").exists(), "real FS must stay untouched");
+        assert!(
+            !dir.path().join("newfile.txt").exists(),
+            "real FS must stay untouched"
+        );
         assert_eq!(fs.read_to_string("newfile.txt").unwrap(), "staged content");
         let changes = fs.change_set().unwrap();
         assert_eq!(changes.len(), 1);
@@ -640,7 +658,10 @@ mod tests {
 
         fs.write_string(target, "probe").unwrap();
 
-        assert!(!Path::new(target).exists(), "real C:\\Windows must stay untouched");
+        assert!(
+            !Path::new(target).exists(),
+            "real C:\\Windows must stay untouched"
+        );
         let changes = fs.change_set().unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].target, ManifestTarget::Ext);
@@ -678,7 +699,10 @@ mod tests {
 
         fs.remove("existing.txt").unwrap();
 
-        assert!(dir.path().join("existing.txt").exists(), "tombstone must not physically delete");
+        assert!(
+            dir.path().join("existing.txt").exists(),
+            "tombstone must not physically delete"
+        );
         let err = fs.read_to_string("existing.txt").unwrap_err();
         assert!(matches!(err, SandboxError::NotFound(_)));
         let changes = fs.change_set().unwrap();
@@ -740,7 +764,8 @@ mod tests {
     fn apply_hard_denies_staged_git_config_write() {
         let dir = tempfile::tempdir().unwrap();
         let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
-        fs.write_string(".git/config", "[core]\n\thooksPath = /tmp/evil\n").unwrap();
+        fs.write_string(".git/config", "[core]\n\thooksPath = /tmp/evil\n")
+            .unwrap();
 
         let report = fs
             .apply(&ApplyOptions {

@@ -29,41 +29,42 @@ use std::path::Path;
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, HLOCAL,
-    INVALID_HANDLE_VALUE, LUID, LocalFree,
+    CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_NOT_ALL_ASSIGNED, HANDLE,
+    HLOCAL, INVALID_HANDLE_VALUE, LUID,
 };
 use windows::Win32::Security::Authorization::{
-    BuildTrusteeWithSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    GetExplicitEntriesFromAclW, GetNamedSecurityInfoW, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
-    SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_W,
+    BuildTrusteeWithSidW, ConvertStringSidToSidW, GetExplicitEntriesFromAclW,
+    GetNamedSecurityInfoW, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+    SE_FILE_OBJECT, SE_KERNEL_OBJECT, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
-    AddAce, AdjustTokenPrivileges, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid,
-    FreeSid, GetAce, GetAclInformation, GetSecurityDescriptorControl, InitializeAcl,
-    InitializeSecurityDescriptor, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, NO_INHERITANCE,
-    OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME, SECURITY_CAPABILITIES,
-    SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SetKernelObjectSecurity, SetSecurityDescriptorDacl,
-    TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_PRIVILEGES_ATTRIBUTES,
-    TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    AclSizeInformation, AddAce, AdjustTokenPrivileges, EqualSid, FreeSid, GetAce,
+    GetAclInformation, GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor,
+    LookupPrivilegeValueW, SetKernelObjectSecurity, SetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE,
+    ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+    DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, NO_INHERITANCE, OBJECT_INHERIT_ACE,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
+    SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME,
+    SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_PRIVILEGES_ATTRIBUTES, TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
     FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
-use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, OpenProcessToken, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
 use crate::shell_tier::FsPassthrough;
@@ -230,11 +231,7 @@ unsafe fn set_dacl_single_object(path: &Path, new_dacl: *mut ACL) -> windows::co
 /// 指定トークンの1特権を有効/無効化する（`AdjustTokenPrivileges`）。`AdjustTokenPrivileges`は
 /// 特権がトークンに割り当てられていなくても関数自体は成功（`S_OK`）を返し、
 /// `GetLastError`で`ERROR_NOT_ALL_ASSIGNED`を返す仕様のため、有効化時はそれを失敗として扱う。
-unsafe fn set_privilege(
-    token: HANDLE,
-    name: PCWSTR,
-    enable: bool,
-) -> windows::core::Result<()> {
+unsafe fn set_privilege(token: HANDLE, name: PCWSTR, enable: bool) -> windows::core::Result<()> {
     let mut luid = LUID::default();
     LookupPrivilegeValueW(PCWSTR::null(), name, &mut luid)?;
     let tp = TOKEN_PRIVILEGES {
@@ -458,9 +455,11 @@ fn grant_ace(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainerErr
 pub fn grant_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclGrant {
-        path: root.to_path_buf(),
-        reason: e.to_string(),
+    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
+        AppContainerError::AclGrant {
+            path: root.to_path_buf(),
+            reason: e.to_string(),
+        }
     })?;
     for dir in &dirs {
         grant_ace(dir, sid, true)?;
@@ -488,9 +487,11 @@ fn grant_ace_ro(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainer
 pub fn grant_ace_recursive_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclGrant {
-        path: root.to_path_buf(),
-        reason: e.to_string(),
+    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
+        AppContainerError::AclGrant {
+            path: root.to_path_buf(),
+            reason: e.to_string(),
+        }
     })?;
     for dir in &dirs {
         grant_ace_ro(dir, sid, true)?;
@@ -519,9 +520,11 @@ pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContain
 
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclGrant {
-        path: root.to_path_buf(),
-        reason: e.to_string(),
+    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
+        AppContainerError::AclGrant {
+            path: root.to_path_buf(),
+            reason: e.to_string(),
+        }
     })?;
 
     for dir in &dirs {
@@ -555,9 +558,11 @@ pub fn grant_ace_inheritable_rw(root: &Path, sid: PSID) -> Result<(), AppContain
 
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclGrant {
-        path: root.to_path_buf(),
-        reason: e.to_string(),
+    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
+        AppContainerError::AclGrant {
+            path: root.to_path_buf(),
+            reason: e.to_string(),
+        }
     })?;
 
     for dir in &dirs {
@@ -717,9 +722,7 @@ pub fn spawn(
     net: NetworkCapability,
 ) -> Result<AppContainerChild, AppContainerError> {
     match net {
-        NetworkCapability::Deny => {
-            spawn_impl(exe, args, cwd, env, want_stdin, container_sid, &[])
-        }
+        NetworkCapability::Deny => spawn_impl(exe, args, cwd, env, want_stdin, container_sid, &[]),
         NetworkCapability::InternetClient => unsafe {
             let mut cap_sid = PSID::default();
             let sid_str = wide("S-1-15-3-1");
@@ -730,7 +733,15 @@ pub fn spawn(
                 Sid: cap_sid,
                 Attributes: 0x0000_0004, // SE_GROUP_ENABLED
             }];
-            let result = spawn_impl(exe, args, cwd, env, want_stdin, container_sid, &capabilities);
+            let result = spawn_impl(
+                exe,
+                args,
+                cwd,
+                env,
+                want_stdin,
+                container_sid,
+                &capabilities,
+            );
             let _ = LocalFree(HLOCAL(cap_sid.0));
             result
         },
@@ -767,7 +778,9 @@ fn spawn_impl(
 ) -> Result<AppContainerChild, AppContainerError> {
     // どのWin32呼び出しが失敗したかをエラー文字列に残す（AppContainerの起動は失敗モードが
     // 多く、0x57 ERROR_INVALID_PARAMETER等がどの段で出たかを区別できないと切り分けられない）。
-    let step = |label: &'static str, e: windows::core::Error| AppContainerError::Win32(format!("{label}: {e}"));
+    let step = |label: &'static str, e: windows::core::Error| {
+        AppContainerError::Win32(format!("{label}: {e}"))
+    };
 
     let job = create_job_object().map_err(|e| step("create_job_object", e))?;
 
@@ -951,7 +964,11 @@ const FS_IO_PROBE_COMMAND: &str = "\
         exit 3 \
     }";
 
-fn smoke_test_spawn(sid: PSID, workspace_root: &Path, probe_dir: &Path) -> Result<(), AppContainerError> {
+fn smoke_test_spawn(
+    sid: PSID,
+    workspace_root: &Path,
+    probe_dir: &Path,
+) -> Result<(), AppContainerError> {
     // 本番run_shellと同じシェル解決を使い、そのシェルがゼロcapabilityのAppContainer内で
     // 実際に起動でき、かつワークスペース内のファイルI/Oまで通ることを確認する
     // （エイリアス回避は`resolve_shell`の責務）。
@@ -963,7 +980,12 @@ fn smoke_test_spawn(sid: PSID, workspace_root: &Path, probe_dir: &Path) -> Resul
     ));
     let child = spawn(
         &shell,
-        &["-NoProfile", "-NonInteractive", "-Command", FS_IO_PROBE_COMMAND],
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            FS_IO_PROBE_COMMAND,
+        ],
         workspace_root,
         &env,
         false,
@@ -1031,8 +1053,8 @@ fn diagnose_unreachable_passthrough(sid: PSID, path: &Path, raw_message: &str) -
     let mut missing = Vec::new();
     for node in &chain {
         match sid_ace_mask(node, sid) {
-            Ok(Some(mask))
-                if mask & FILE_TRAVERSE.0 != 0 && mask & FILE_READ_ATTRIBUTES.0 != 0 => {}
+            Ok(Some(mask)) if mask & FILE_TRAVERSE.0 != 0 && mask & FILE_READ_ATTRIBUTES.0 != 0 => {
+            }
             Ok(Some(_)) => missing.push(format!(
                 "{} (has a sandbox SID ACE but missing FILE_TRAVERSE|FILE_READ_ATTRIBUTES)",
                 node.display()
@@ -1091,7 +1113,10 @@ fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Op
     ) {
         Ok(child) => child,
         Err(e) => {
-            return Some(format!("fs-allow {} : probe could not start: {e}", fp.path.display()));
+            return Some(format!(
+                "fs-allow {} : probe could not start: {e}",
+                fp.path.display()
+            ));
         }
     };
     match child.write_stdin_read_output_and_wait(None) {
@@ -1101,7 +1126,10 @@ fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Op
             &fp.path,
             stdout.trim(),
         )),
-        Err(e) => Some(format!("fs-allow {} : probe failed: {e}", fp.path.display())),
+        Err(e) => Some(format!(
+            "fs-allow {} : probe failed: {e}",
+            fp.path.display()
+        )),
     }
 }
 
@@ -1282,7 +1310,9 @@ pub fn preflight(
                         .unwrap_or(false);
                     granted_passthrough.push((path.clone(), writable));
                     if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
-                        if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
+                        if let Some(diagnosis) =
+                            probe_passthrough(sid.as_psid(), workspace_root, fp)
+                        {
                             warnings.push(diagnosis);
                         }
                     }
@@ -1518,9 +1548,11 @@ pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
 pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| AppContainerError::AclRevoke {
-        path: root.to_path_buf(),
-        reason: e.to_string(),
+    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
+        AppContainerError::AclRevoke {
+            path: root.to_path_buf(),
+            reason: e.to_string(),
+        }
     })?;
     for file in &files {
         revoke_ace(file, sid)?;
@@ -1713,8 +1745,7 @@ pub fn grant_traverse_chain_with_progress(
     sid: PSID,
     mut on_node: impl FnMut(&Path, &Result<(), AppContainerError>, std::time::Duration),
 ) -> (Vec<std::path::PathBuf>, Result<(), AppContainerError>) {
-    let mut chain: Vec<std::path::PathBuf> =
-        target.ancestors().map(|p| p.to_path_buf()).collect();
+    let mut chain: Vec<std::path::PathBuf> = target.ancestors().map(|p| p.to_path_buf()).collect();
     chain.reverse();
 
     let mut granted = Vec::with_capacity(chain.len());
@@ -1749,8 +1780,7 @@ pub struct TraversePreviewNode {
 
 pub fn preview_traverse_chain(target: &Path, sid: PSID) -> Vec<TraversePreviewNode> {
     const REQUIRED: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;
-    let mut chain: Vec<std::path::PathBuf> =
-        target.ancestors().map(|p| p.to_path_buf()).collect();
+    let mut chain: Vec<std::path::PathBuf> = target.ancestors().map(|p| p.to_path_buf()).collect();
     chain.reverse();
 
     chain
@@ -1799,7 +1829,10 @@ mod traverse_diagnostics {
     /// 成否をアサートしない。観測が目的であり合否判定はここでは行わない）。
     fn run_probe(sid: PSID, dir: &Path) {
         let (shell, label) = resolve_shell();
-        println!("=== probe: shell={shell} ({label}), dir={} ===", dir.display());
+        println!(
+            "=== probe: shell={shell} ({label}), dir={} ===",
+            dir.display()
+        );
         let mut env = crate::secret_env::build_child_env();
         env.push((
             "HARNESS_PROBE_DIR".to_string(),
@@ -1828,12 +1861,19 @@ mod traverse_diagnostics {
     /// ACCESS_DENIED）を切り分けるための、cmd.exe版プローブ。`resolve_shell`はTier1a本番と
     /// 同じPowerShell解決を返すためここでは使わず、cmd.exeを直接指定する。
     fn run_probe_cmd(sid: PSID, dir: &Path) {
-        let system_root =
-            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
         let cmd_exe = format!("{system_root}\\System32\\cmd.exe");
         println!("=== probe(cmd.exe): dir={} ===", dir.display());
         let env = crate::secret_env::build_child_env();
-        let child = spawn(&cmd_exe, &["/d", "/c", "dir"], dir, &env, false, sid, NetworkCapability::Deny)
+        let child = spawn(
+            &cmd_exe,
+            &["/d", "/c", "dir"],
+            dir,
+            &env,
+            false,
+            sid,
+            NetworkCapability::Deny,
+        )
         .expect("spawn should succeed even if the shell command itself fails inside");
         let (out, err, code) = child
             .write_stdin_read_output_and_wait(None)
@@ -1883,9 +1923,19 @@ mod traverse_diagnostics {
         let command = "$id = [System.Security.Principal.WindowsIdentity]::GetCurrent(); \
              Write-Output ('User=' + $id.User.Value); \
              $id.Groups | Where-Object { $_.Value -like 'S-1-16-*' } | ForEach-Object { Write-Output ('IntegritySid=' + $_.Value) }";
-        let child = spawn(&shell, &["-NoProfile", "-NonInteractive", "-Command", command], &dir, &env, false, sid.as_psid(), NetworkCapability::Deny)
-            .expect("spawn should succeed");
-        let (out, err, code) = child.write_stdin_read_output_and_wait(None).expect("pipe I/O should not fail");
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", command],
+            &dir,
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+        )
+        .expect("spawn should succeed");
+        let (out, err, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("pipe I/O should not fail");
         println!("=== AppContainer child integrity level probe: exit={code} ===\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1939,7 +1989,8 @@ mod traverse_diagnostics {
 
             let (shell, _) = resolve_shell();
             let env = crate::secret_env::build_child_env();
-            let command = "Remove-Item -LiteralPath 'f-probe.tmp' -Force -ErrorAction SilentlyContinue; \
+            let command =
+                "Remove-Item -LiteralPath 'f-probe.tmp' -Force -ErrorAction SilentlyContinue; \
                  New-Item -ItemType File -Path 'f-probe.tmp' -Force | Out-Null; \
                  try { Remove-Item -LiteralPath 'f-probe.tmp' -Force; Write-Output 'DELETE OK' } \
                  catch { Write-Output \"DELETE FAIL: $_\" }";
@@ -2002,11 +2053,14 @@ mod traverse_diagnostics {
 
         run_probe(sid.as_psid(), &workspace);
 
-        revoke_ace(&ancestor, sid.as_psid()).expect("revert: revoke_ace on profile ancestor must not fail silently");
+        revoke_ace(&ancestor, sid.as_psid())
+            .expect("revert: revoke_ace on profile ancestor must not fail silently");
     }
 
     fn dirs_home() -> Option<std::path::PathBuf> {
-        std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from)
+        std::env::var("USERPROFILE")
+            .ok()
+            .map(std::path::PathBuf::from)
     }
 
     /// Experiment C: 「traverse-only仮説」の実証実験（`plans/TIER1A-OPEN-ISSUES.md`
@@ -2031,18 +2085,22 @@ mod traverse_diagnostics {
     #[ignore]
     fn experiment_c_full_chain_traverse_recovers_fs_io() {
         let drive_root = std::path::PathBuf::from("C:\\");
-        let workspace = std::path::PathBuf::from(format!(
-            "C:\\harness-tier1a-verify-{}",
-            std::process::id()
-        ));
+        let workspace =
+            std::path::PathBuf::from(format!("C:\\harness-tier1a-verify-{}", std::process::id()));
 
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
 
         // ワークスペース作成+フルアクセス付与（既存`preflight`と同じ手順）。
-        std::fs::create_dir_all(&workspace).expect("create verify workspace under C:\\ (needs admin write on drive root)");
-        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
-        let probe_dir = workspace.join(".harness").join("sandbox").join("tier1a-tmp");
-        std::fs::create_dir_all(&probe_dir).expect("create probe dir (inherits ACE from workspace)");
+        std::fs::create_dir_all(&workspace)
+            .expect("create verify workspace under C:\\ (needs admin write on drive root)");
+        grant_ace_recursive(&workspace, sid.as_psid())
+            .expect("grant_ace_recursive on verify workspace");
+        let probe_dir = workspace
+            .join(".harness")
+            .join("sandbox")
+            .join("tier1a-tmp");
+        std::fs::create_dir_all(&probe_dir)
+            .expect("create probe dir (inherits ACE from workspace)");
 
         // 唯一のシステムACL変更: C:\ ルートへの単一ACE。
         let grant_result = grant_ace_mask(
@@ -2078,10 +2136,23 @@ mod traverse_diagnostics {
                 try { Remove-Item -LiteralPath $p -Force; Write-Output 'REMOVE-ITEM OK' } catch { Write-Output \"REMOVE-ITEM FAIL: $_\" }";
             let (shell, _) = resolve_shell();
             let mut env = crate::secret_env::build_child_env();
-            env.push(("HARNESS_PROBE_DIR".to_string(), workspace.to_string_lossy().into_owned()));
-            let child = spawn(&shell, &["-NoProfile", "-NonInteractive", "-Command", verbose_probe], &workspace, &env, false, sid.as_psid(), NetworkCapability::Deny)
-                .expect("spawn should succeed");
-            let (out, err, code) = child.write_stdin_read_output_and_wait(None).expect("pipe I/O should not fail");
+            env.push((
+                "HARNESS_PROBE_DIR".to_string(),
+                workspace.to_string_lossy().into_owned(),
+            ));
+            let child = spawn(
+                &shell,
+                &["-NoProfile", "-NonInteractive", "-Command", verbose_probe],
+                &workspace,
+                &env,
+                false,
+                sid.as_psid(),
+                NetworkCapability::Deny,
+            )
+            .expect("spawn should succeed");
+            let (out, err, code) = child
+                .write_stdin_read_output_and_wait(None)
+                .expect("pipe I/O should not fail");
             println!("=== verbose New-Item/Get-Content/Remove-Item probe: exit={code} ===\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
 
             println!(
@@ -2103,9 +2174,8 @@ mod traverse_diagnostics {
     /// （`$LASTEXITCODE`の文字列パースに頼らない、`smoke_test_spawn`と同じ設計原則）。
     /// 失敗時は詳細を`println!`で焼き付ける（観測目的、アサートしない）。
     fn run_probe_bool(sid: PSID, dir: &Path, command: &str) -> bool {
-        let wrapped = format!(
-            "try {{ {command} }} catch {{ Write-Output \"CAUGHT: $_\"; exit 1 }}"
-        );
+        let wrapped =
+            format!("try {{ {command} }} catch {{ Write-Output \"CAUGHT: $_\"; exit 1 }}");
         let (shell, _) = resolve_shell();
         let env = crate::secret_env::build_child_env();
         let child = spawn(
@@ -2139,7 +2209,12 @@ mod traverse_diagnostics {
         let mut buf = vec![0u8; 68];
         let mut size = buf.len() as u32;
         unsafe {
-            CreateWellKnownSid(sid_type, PSID::default(), PSID(buf.as_mut_ptr() as *mut _), &mut size)?;
+            CreateWellKnownSid(
+                sid_type,
+                PSID::default(),
+                PSID(buf.as_mut_ptr() as *mut _),
+                &mut size,
+            )?;
         }
         buf.truncate(size as usize);
         Ok(buf)
@@ -2170,7 +2245,8 @@ mod traverse_diagnostics {
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
         std::fs::create_dir_all(&workspace)
             .expect("create verify workspace under C:\\ (needs admin write on drive root)");
-        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+        grant_ace_recursive(&workspace, sid.as_psid())
+            .expect("grant_ace_recursive on verify workspace");
 
         let grant_result = grant_ace_mask(
             &drive_root,
@@ -2202,9 +2278,7 @@ mod traverse_diagnostics {
             // 診断: 作成直後のファイルの実DACLを、管理者権限のRustテストプロセス自身から
             // icacls経由で観測する（継承ACEが本当に付いているかの直接証拠）。
             if h1_create_ok {
-                let icacls_out = std::process::Command::new("icacls")
-                    .arg(&h1_file)
-                    .output();
+                let icacls_out = std::process::Command::new("icacls").arg(&h1_file).output();
                 match icacls_out {
                     Ok(o) => println!(
                         "=== icacls on freshly-created h1-probe.tmp ===\n{}",
@@ -2214,10 +2288,15 @@ mod traverse_diagnostics {
                 }
             }
             let h1_ok = if h1_create_ok {
-                let direct_grant = grant_ace_mask(&h1_file, sid.as_psid(), DELETE.0, NO_INHERITANCE);
+                let direct_grant =
+                    grant_ace_mask(&h1_file, sid.as_psid(), DELETE.0, NO_INHERITANCE);
                 println!("=== H1 direct-grant DELETE on file result: {direct_grant:?} ===");
                 direct_grant.is_ok()
-                    && run_probe_bool(sid.as_psid(), &workspace, "Remove-Item -LiteralPath 'h1-probe.tmp' -Force")
+                    && run_probe_bool(
+                        sid.as_psid(),
+                        &workspace,
+                        "Remove-Item -LiteralPath 'h1-probe.tmp' -Force",
+                    )
             } else {
                 println!("=== H1 skipped: could not even create the probe file ===");
                 false
@@ -2240,7 +2319,11 @@ mod traverse_diagnostics {
                             "=== H5 icacls /setintegritylevel Medium succeeded: {} ===",
                             String::from_utf8_lossy(&o.stdout)
                         );
-                        run_probe_bool(sid.as_psid(), &workspace, "Remove-Item -LiteralPath 'h1-probe.tmp' -Force")
+                        run_probe_bool(
+                            sid.as_psid(),
+                            &workspace,
+                            "Remove-Item -LiteralPath 'h1-probe.tmp' -Force",
+                        )
                     }
                     Ok(o) => {
                         println!(
@@ -2283,9 +2366,11 @@ mod traverse_diagnostics {
             let _ = grant_ace_recursive(&workspace, sid.as_psid());
 
             // H3: ALL APPLICATION PACKAGES (S-1-15-2-1) へ同マスクを付与。
-            let h3_access =
-                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0 | DELETE.0
-                    | windows::Win32::Storage::FileSystem::FILE_DELETE_CHILD.0;
+            let h3_access = FILE_GENERIC_READ.0
+                | FILE_GENERIC_WRITE.0
+                | FILE_GENERIC_EXECUTE.0
+                | DELETE.0
+                | windows::Win32::Storage::FileSystem::FILE_DELETE_CHILD.0;
             let h3_ok = match well_known_sid(WinBuiltinAnyPackageSid) {
                 Ok(buf) => {
                     let all_app_packages_sid = PSID(buf.as_ptr() as *mut _);
@@ -2319,7 +2404,10 @@ mod traverse_diagnostics {
             let h4_ok = unsafe {
                 let mut restricted_sid = PSID::default();
                 let sid_str = wide("S-1-15-2-2");
-                match ConvertStringSidToSidW(windows::core::PCWSTR(sid_str.as_ptr()), &mut restricted_sid) {
+                match ConvertStringSidToSidW(
+                    windows::core::PCWSTR(sid_str.as_ptr()),
+                    &mut restricted_sid,
+                ) {
                     Ok(()) => {
                         let h4_grant = grant_ace_mask(
                             &workspace,
@@ -2341,7 +2429,9 @@ mod traverse_diagnostics {
                         ok
                     }
                     Err(e) => {
-                        println!("=== H4 skipped: ConvertStringSidToSidW(S-1-15-2-2) failed: {e:?} ===");
+                        println!(
+                            "=== H4 skipped: ConvertStringSidToSidW(S-1-15-2-2) failed: {e:?} ==="
+                        );
                         false
                     }
                 }
@@ -2488,7 +2578,8 @@ mod traverse_diagnostics {
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
         std::fs::create_dir_all(&workspace)
             .expect("create verify workspace under C:\\ (needs admin write on drive root)");
-        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+        grant_ace_recursive(&workspace, sid.as_psid())
+            .expect("grant_ace_recursive on verify workspace");
 
         let grant_result = grant_ace_mask(
             &drive_root,
@@ -2539,7 +2630,8 @@ mod traverse_diagnostics {
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
         std::fs::create_dir_all(&workspace)
             .expect("create verify workspace under C:\\ (needs admin write on drive root)");
-        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+        grant_ace_recursive(&workspace, sid.as_psid())
+            .expect("grant_ace_recursive on verify workspace");
 
         let access = windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0
             | windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0;
@@ -2587,9 +2679,14 @@ mod traverse_diagnostics {
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
         std::fs::create_dir_all(&workspace)
             .expect("create verify workspace under C:\\ (needs admin write on drive root)");
-        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
-        let probe_dir = workspace.join(".harness").join("sandbox").join("tier1a-tmp");
-        std::fs::create_dir_all(&probe_dir).expect("create probe dir (inherits ACE from workspace)");
+        grant_ace_recursive(&workspace, sid.as_psid())
+            .expect("grant_ace_recursive on verify workspace");
+        let probe_dir = workspace
+            .join(".harness")
+            .join("sandbox")
+            .join("tier1a-tmp");
+        std::fs::create_dir_all(&probe_dir)
+            .expect("create probe dir (inherits ACE from workspace)");
 
         let access = windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0
             | windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0;
@@ -2648,7 +2745,8 @@ mod traverse_diagnostics {
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
         std::fs::create_dir_all(&workspace)
             .expect("create verify workspace under C:\\ (needs admin write on drive root)");
-        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+        grant_ace_recursive(&workspace, sid.as_psid())
+            .expect("grant_ace_recursive on verify workspace");
 
         let grant_result = grant_ace_mask(
             &drive_root,
@@ -2663,7 +2761,12 @@ mod traverse_diagnostics {
             let env = crate::secret_env::build_child_env();
             let child = spawn(
                 &shell,
-                &["-NoProfile", "-NonInteractive", "-Command", PROCMON_PROBE_SCRIPT],
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    PROCMON_PROBE_SCRIPT,
+                ],
                 &workspace,
                 &env,
                 false,
@@ -2696,11 +2799,17 @@ mod traverse_diagnostics {
             "C:\\harness-tier1a-verify-h-control-{}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&workspace).expect("create control workspace under C:\\ (needs admin)");
+        std::fs::create_dir_all(&workspace)
+            .expect("create control workspace under C:\\ (needs admin)");
 
         let (shell, _) = resolve_shell();
         let child = std::process::Command::new(&shell)
-            .args(["-NoProfile", "-NonInteractive", "-Command", PROCMON_PROBE_SCRIPT])
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                PROCMON_PROBE_SCRIPT,
+            ])
             .current_dir(&workspace)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -2736,7 +2845,8 @@ mod traverse_diagnostics {
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
         std::fs::create_dir_all(&workspace)
             .expect("create verify workspace under C:\\ (needs admin write on drive root)");
-        grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on verify workspace");
+        grant_ace_recursive(&workspace, sid.as_psid())
+            .expect("grant_ace_recursive on verify workspace");
 
         // H7: FILE_TRAVERSE単独ではなく、FILE_READ_ATTRIBUTESも合わせて付与する。
         let access = windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0
@@ -2749,7 +2859,12 @@ mod traverse_diagnostics {
             let env = crate::secret_env::build_child_env();
             let child = spawn(
                 &shell,
-                &["-NoProfile", "-NonInteractive", "-Command", PROCMON_PROBE_SCRIPT],
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    PROCMON_PROBE_SCRIPT,
+                ],
                 &workspace,
                 &env,
                 false,
@@ -2830,7 +2945,10 @@ mod traverse_diagnostics {
         ));
         std::fs::create_dir_all(&workspace).expect("create workspace");
         grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on workspace");
-        let probe_dir = workspace.join(".harness").join("sandbox").join("tier1a-tmp");
+        let probe_dir = workspace
+            .join(".harness")
+            .join("sandbox")
+            .join("tier1a-tmp");
         std::fs::create_dir_all(&probe_dir).expect("create probe dir");
         if let Err(e) = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir) {
             eprintln!(
@@ -2985,8 +3103,9 @@ mod traverse_diagnostics {
             std::process::id()
         ));
         let nested = test_root.join("a").join("b").join("c");
-        std::fs::create_dir_all(&nested)
-            .expect("create test-owned nested dirs directly under C:\\ (needs admin write on drive root)");
+        std::fs::create_dir_all(&nested).expect(
+            "create test-owned nested dirs directly under C:\\ (needs admin write on drive root)",
+        );
 
         let (granted, result) = grant_traverse_chain(&nested, sid.as_psid());
         // 掃除は成否に関わらず必ず行う(孤立ACE防止、BUG-011の再発防止そのもの)。
@@ -3034,7 +3153,9 @@ mod traverse_diagnostics {
             }
             if let Err(e) = assert_no_sid_ace(node, sid.as_psid()) {
                 cleanup();
-                panic!("sandbox SID ACE must be fully removed from {node:?} after revoke_ace: {e:?}");
+                panic!(
+                    "sandbox SID ACE must be fully removed from {node:?} after revoke_ace: {e:?}"
+                );
             }
         }
 
@@ -3103,8 +3224,8 @@ mod traverse_diagnostics {
         let inheritable_grant = grant_ace_ro(&root, sid.as_psid(), true);
         let inheritable_grant_elapsed = t0.elapsed();
         println!("=== EXPERIMENT L case 1 grant result: {inheritable_grant:?} (took {inheritable_grant_elapsed:?}) ===");
-        let inheritable_read_ok = inheritable_grant.is_ok()
-            && run_probe_bool(sid.as_psid(), &workspace, &read_command);
+        let inheritable_read_ok =
+            inheritable_grant.is_ok() && run_probe_bool(sid.as_psid(), &workspace, &read_command);
         println!(
             "=== EXPERIMENT L case 1: root-only inheritable ACE -> deep pre-existing file read: {} ===",
             if inheritable_read_ok { "OK" } else { "FAIL" }
@@ -3117,8 +3238,8 @@ mod traverse_diagnostics {
         let recursive_grant = grant_ace_recursive_ro(&root, sid.as_psid());
         let recursive_grant_elapsed = t1.elapsed();
         println!("=== EXPERIMENT L case 2 grant result: {recursive_grant:?} (took {recursive_grant_elapsed:?}) ===");
-        let recursive_read_ok = recursive_grant.is_ok()
-            && run_probe_bool(sid.as_psid(), &workspace, &read_command);
+        let recursive_read_ok =
+            recursive_grant.is_ok() && run_probe_bool(sid.as_psid(), &workspace, &read_command);
         println!(
             "=== EXPERIMENT L case 2: full recursive walk -> deep pre-existing file read: {} ===",
             if recursive_read_ok { "OK" } else { "FAIL" }
@@ -3152,7 +3273,11 @@ mod traverse_diagnostics {
             "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64",
         );
         let link_exe = link_dir.join("link.exe");
-        assert!(link_exe.is_file(), "link.exe not found at {}", link_exe.display());
+        assert!(
+            link_exe.is_file(),
+            "link.exe not found at {}",
+            link_exe.display()
+        );
 
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
         let env = crate::secret_env::build_child_env();
@@ -3170,7 +3295,10 @@ mod traverse_diagnostics {
         let (out, err, code) = child
             .write_stdin_read_output_and_wait(None)
             .expect("pipe I/O should not fail");
-        println!("=== EXPERIMENT M: link.exe exit code = {code} (0x{:08X}) ===", code as u32);
+        println!(
+            "=== EXPERIMENT M: link.exe exit code = {code} (0x{:08X}) ===",
+            code as u32
+        );
         println!("--- stdout ---\n{out}");
         println!("--- stderr ---\n{err}");
         println!(
@@ -3222,8 +3350,13 @@ mod traverse_diagnostics {
         // 事前状態: 対象に当該SIDのACEが無いこと（あると冪等スキップされ計測にならない）を確認。
         let before = sid_ace_mask(&target, sid.as_psid());
         println!("=== EXPERIMENT N: target = {} ===", target.display());
-        println!("=== EXPERIMENT N: pre-existing sandbox-SID ACE mask = {before:?} (None が理想) ===");
-        println!("=== EXPERIMENT N: THIS PROCESS PID = {} ===", std::process::id());
+        println!(
+            "=== EXPERIMENT N: pre-existing sandbox-SID ACE mask = {before:?} (None が理想) ==="
+        );
+        println!(
+            "=== EXPERIMENT N: THIS PROCESS PID = {} ===",
+            std::process::id()
+        );
         println!(
             "=== EXPERIMENT N: set the procmon filter to PID {} now, then press Enter to start the \
              timed SetNamedSecurityInfoW write (DO NOT kill this process partway) ===",
@@ -3243,7 +3376,9 @@ mod traverse_diagnostics {
             NO_INHERITANCE,
         );
         let elapsed = t0.elapsed();
-        println!("=== EXPERIMENT N: grant_ace_mask returned in {elapsed:?}, result = {result:?} ===");
+        println!(
+            "=== EXPERIMENT N: grant_ace_mask returned in {elapsed:?}, result = {result:?} ==="
+        );
 
         // 後始末: 新規に書けたぶんの単一ノードだけを戻す（既に他経路が依存している祖先ではなく
         // プロファイルルート単体なので単一ノードrevokeでよい。`/T`は使わない）。
@@ -3277,16 +3412,25 @@ mod traverse_diagnostics {
     fn experiment_o_neutral_path_direct_write_timing() {
         use std::io::Write;
 
-        let target = std::path::PathBuf::from(format!("C:\\harness-acltest-{}", std::process::id()));
+        let target =
+            std::path::PathBuf::from(format!("C:\\harness-acltest-{}", std::process::id()));
         std::fs::create_dir_all(&target)
             .expect("create test-owned dir directly under C:\\ (needs admin write on drive root)");
 
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
 
         let before = sid_ace_mask(&target, sid.as_psid());
-        println!("=== EXPERIMENT O (neutral control): target = {} ===", target.display());
-        println!("=== EXPERIMENT O: pre-existing sandbox-SID ACE mask = {before:?} (None が理想) ===");
-        println!("=== EXPERIMENT O: THIS PROCESS PID = {} ===", std::process::id());
+        println!(
+            "=== EXPERIMENT O (neutral control): target = {} ===",
+            target.display()
+        );
+        println!(
+            "=== EXPERIMENT O: pre-existing sandbox-SID ACE mask = {before:?} (None が理想) ==="
+        );
+        println!(
+            "=== EXPERIMENT O: THIS PROCESS PID = {} ===",
+            std::process::id()
+        );
         println!(
             "=== EXPERIMENT O: set the procmon filter to PID {} now, then press Enter to start the \
              timed SetNamedSecurityInfoW write (DO NOT kill this process partway) ===",
@@ -3306,7 +3450,9 @@ mod traverse_diagnostics {
             NO_INHERITANCE,
         );
         let elapsed = t0.elapsed();
-        println!("=== EXPERIMENT O: grant_ace_mask returned in {elapsed:?}, result = {result:?} ===");
+        println!(
+            "=== EXPERIMENT O: grant_ace_mask returned in {elapsed:?}, result = {result:?} ==="
+        );
 
         // 後始末: ACEを剥がし、test所有ディレクトリごと削除する。
         let _ = revoke_ace(&target, sid.as_psid());
@@ -3387,7 +3533,10 @@ mod traverse_diagnostics {
         ));
         std::fs::create_dir_all(&workspace).expect("create workspace");
         grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on workspace");
-        let probe_dir = workspace.join(".harness").join("sandbox").join("tier1a-tmp");
+        let probe_dir = workspace
+            .join(".harness")
+            .join("sandbox")
+            .join("tier1a-tmp");
         std::fs::create_dir_all(&probe_dir).expect("create probe dir");
         if let Err(e) = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir) {
             eprintln!(
@@ -3596,7 +3745,9 @@ New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -Pas
             grant_ace_inheritable_rw(&small_root, sid_owned)
                 .map_err(|e| format!("grant on small tree failed: {e:?}"))?;
             let small_grant_elapsed = t0.elapsed();
-            println!("=== S1: small tree grant_ace_inheritable_rw took {small_grant_elapsed:?} ===");
+            println!(
+                "=== S1: small tree grant_ace_inheritable_rw took {small_grant_elapsed:?} ==="
+            );
             assert!(
                 small_grant_elapsed < std::time::Duration::from_secs(2),
                 "small-tree grant must finish well under 1-2s, took {small_grant_elapsed:?}"
@@ -3606,7 +3757,9 @@ New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -Pas
             grant_ace_inheritable_rw(&big_root, sid_owned)
                 .map_err(|e| format!("grant on big tree (400 files) failed: {e:?}"))?;
             let big_grant_elapsed = t1.elapsed();
-            println!("=== S1: 400-file tree grant_ace_inheritable_rw took {big_grant_elapsed:?} ===");
+            println!(
+                "=== S1: 400-file tree grant_ace_inheritable_rw took {big_grant_elapsed:?} ==="
+            );
             assert!(
                 big_grant_elapsed < std::time::Duration::from_secs(5),
                 "400-file tree grant must not regress toward BUG-011-style pathological slowness, \
@@ -3660,13 +3813,18 @@ New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -Pas
             revoke_ace_recursive(&small_root, sid_owned)
                 .map_err(|e| format!("revoke_ace_recursive on small tree failed: {e:?}"))?;
             let revoke_elapsed = t2.elapsed();
-            println!("=== S1: revoke_ace_recursive (small tree, O(n) walk) took {revoke_elapsed:?} ===");
+            println!(
+                "=== S1: revoke_ace_recursive (small tree, O(n) walk) took {revoke_elapsed:?} ==="
+            );
             assert!(
                 revoke_elapsed < std::time::Duration::from_secs(2),
                 "revoke_ace_recursive on a small tree must still be fast, took {revoke_elapsed:?}"
             );
 
-            if let Ok(out) = std::process::Command::new("icacls").arg(&probe_target).output() {
+            if let Ok(out) = std::process::Command::new("icacls")
+                .arg(&probe_target)
+                .output()
+            {
                 println!(
                     "=== S1 DEBUG: icacls on {} after revoke_ace_recursive ===\n{}",
                     probe_target.display(),

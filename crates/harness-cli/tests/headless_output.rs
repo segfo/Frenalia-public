@@ -67,7 +67,11 @@ async fn json_output_has_stable_schema_and_allowed_tool_call() {
     std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
 
     let provider = MockProvider::new(vec![
-        tool_use_turn("call_1", "read_file", serde_json::json!({ "path": "a.txt" })),
+        tool_use_turn(
+            "call_1",
+            "read_file",
+            serde_json::json!({ "path": "a.txt" }),
+        ),
         end_turn("the file says hello"),
     ]);
     let mut state = ConversationState::new(Vec::new());
@@ -97,7 +101,11 @@ async fn json_output_has_stable_schema_and_allowed_tool_call() {
 
     let stdout = String::from_utf8(out).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 1, "json output must be exactly one line: {stdout:?}");
+    assert_eq!(
+        lines.len(),
+        1,
+        "json output must be exactly one line: {stdout:?}"
+    );
 
     let parsed: JsonOutcome = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(parsed.result, "the file says hello");
@@ -119,7 +127,11 @@ async fn json_output_has_stable_schema_and_allowed_tool_call() {
 async fn json_output_records_denied_tool_call() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(vec![
-        tool_use_turn("call_1", "run_shell", serde_json::json!({ "command": "echo hi" })),
+        tool_use_turn(
+            "call_1",
+            "run_shell",
+            serde_json::json!({ "command": "echo hi" }),
+        ),
         end_turn("done"),
     ]);
     let mut state = ConversationState::new(Vec::new());
@@ -187,7 +199,10 @@ async fn jsonl_output_emits_one_agent_event_per_line() {
         .map(|line| serde_json::from_str(line).expect("each jsonl line must be a valid AgentEvent"))
         .collect();
     assert!(!events.is_empty());
-    assert!(matches!(events[0], harness_core::AgentEvent::TurnStarted { .. }));
+    assert!(matches!(
+        events[0],
+        harness_core::AgentEvent::TurnStarted { .. }
+    ));
     assert!(events
         .iter()
         .any(|e| matches!(e, harness_core::AgentEvent::TurnCompleted { .. })));

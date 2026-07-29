@@ -4,7 +4,9 @@
 //! （§ワークスペース構成の慣例、`headless_output.rs`と同じ方針）。
 
 use harness_core::{BlockKind, StopReason, StreamEvent, ToolCtx, Usage};
-use harness_engine::{AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode, SessionStore};
+use harness_engine::{
+    AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode, SessionStore,
+};
 use harness_providers::MockProvider;
 use harness_tools::ToolRegistry;
 
@@ -12,16 +14,32 @@ use harness_cli::{run_headless, OutputFormat};
 
 fn end_turn(text: &str) -> Vec<StreamEvent> {
     vec![
-        StreamEvent::BlockStart { index: 0, kind: BlockKind::Text },
-        StreamEvent::TextDelta { index: 0, text: text.to_string() },
+        StreamEvent::BlockStart {
+            index: 0,
+            kind: BlockKind::Text,
+        },
+        StreamEvent::TextDelta {
+            index: 0,
+            text: text.to_string(),
+        },
         StreamEvent::BlockStop { index: 0 },
-        StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: Usage::default() },
+        StreamEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        },
     ]
 }
 
-async fn run_one_turn(session: &SessionStore, state: &mut ConversationState, prompt: &str, reply: &str) {
+async fn run_one_turn(
+    session: &SessionStore,
+    state: &mut ConversationState,
+    prompt: &str,
+    reply: &str,
+) {
     state.push_user_text(prompt);
-    session.append_messages(&state.messages[state.messages.len() - 1..]).unwrap();
+    session
+        .append_messages(&state.messages[state.messages.len() - 1..])
+        .unwrap();
     let before = state.messages.len();
 
     let provider = MockProvider::new(vec![end_turn(reply)]);
@@ -37,7 +55,11 @@ async fn run_one_turn(session: &SessionStore, state: &mut ConversationState, pro
         &tools,
         &ctx,
         &arbiter,
-        AgentLoopConfig { model: "mock".into(), max_tokens: 100, max_turns: 5 },
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+        },
         OutputFormat::Text,
         &mut out,
     )
@@ -64,9 +86,17 @@ async fn resume_restores_prior_messages_and_appends_continuation() {
     assert_eq!(resumed_state.messages.len(), state.messages.len());
     assert_eq!(resumed_state.messages, state.messages);
 
-    run_one_turn(&resumed_session, &mut resumed_state, "second question", "second answer").await;
+    run_one_turn(
+        &resumed_session,
+        &mut resumed_state,
+        "second question",
+        "second answer",
+    )
+    .await;
 
-    let all_messages = SessionStore::open(session.path().to_path_buf()).load_messages().unwrap();
+    let all_messages = SessionStore::open(session.path().to_path_buf())
+        .load_messages()
+        .unwrap();
     // 1ターン目のuser+assistant、2ターン目のuser+assistantの計4件が1ファイルに追記されている。
     assert_eq!(all_messages.len(), 4);
 }
@@ -77,15 +107,29 @@ async fn continue_picks_the_most_recently_modified_session() {
     let sessions_dir = tempfile::tempdir().unwrap();
     let older = SessionStore::create_new(sessions_dir.path()).unwrap();
     let mut older_state = ConversationState::new(Vec::new());
-    run_one_turn(&older, &mut older_state, "older session prompt", "older reply").await;
+    run_one_turn(
+        &older,
+        &mut older_state,
+        "older session prompt",
+        "older reply",
+    )
+    .await;
 
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     let newer = SessionStore::create_new(sessions_dir.path()).unwrap();
     let mut newer_state = ConversationState::new(Vec::new());
-    run_one_turn(&newer, &mut newer_state, "newer session prompt", "newer reply").await;
+    run_one_turn(
+        &newer,
+        &mut newer_state,
+        "newer session prompt",
+        "newer reply",
+    )
+    .await;
 
-    let latest = SessionStore::resume_latest(sessions_dir.path()).unwrap().unwrap();
+    let latest = SessionStore::resume_latest(sessions_dir.path())
+        .unwrap()
+        .unwrap();
     assert_eq!(latest.path(), newer.path());
     let restored = latest.load_messages().unwrap();
     assert_eq!(restored, newer_state.messages);
@@ -98,7 +142,13 @@ async fn fork_session_leaves_source_untouched_and_continues_on_fork() {
     let sessions_dir = tempfile::tempdir().unwrap();
     let source = SessionStore::create_new(sessions_dir.path()).unwrap();
     let mut source_state = ConversationState::new(Vec::new());
-    run_one_turn(&source, &mut source_state, "original prompt", "original reply").await;
+    run_one_turn(
+        &source,
+        &mut source_state,
+        "original prompt",
+        "original reply",
+    )
+    .await;
 
     // main.rsの`--fork-session`経路と同じ`SessionStore::fork_from`。
     let forked = SessionStore::fork_from(sessions_dir.path(), source.path()).unwrap();
@@ -110,9 +160,13 @@ async fn fork_session_leaves_source_untouched_and_continues_on_fork() {
     run_one_turn(&forked, &mut forked_state, "forked prompt", "forked reply").await;
 
     // 元セッションは2件（user+assistant）のまま、Fork先だけ4件に増える。
-    let source_messages = SessionStore::open(source.path().to_path_buf()).load_messages().unwrap();
+    let source_messages = SessionStore::open(source.path().to_path_buf())
+        .load_messages()
+        .unwrap();
     assert_eq!(source_messages.len(), 2);
-    let forked_messages = SessionStore::open(forked.path().to_path_buf()).load_messages().unwrap();
+    let forked_messages = SessionStore::open(forked.path().to_path_buf())
+        .load_messages()
+        .unwrap();
     assert_eq!(forked_messages.len(), 4);
 }
 
@@ -125,6 +179,12 @@ fn resolve_path_normalizes_both_id_forms() {
     let prefixed = store.id();
     let bare = prefixed.strip_prefix("session-").unwrap();
 
-    assert_eq!(SessionStore::resolve_path(sessions_dir.path(), &prefixed), *store.path());
-    assert_eq!(SessionStore::resolve_path(sessions_dir.path(), bare), *store.path());
+    assert_eq!(
+        SessionStore::resolve_path(sessions_dir.path(), &prefixed),
+        *store.path()
+    );
+    assert_eq!(
+        SessionStore::resolve_path(sessions_dir.path(), bare),
+        *store.path()
+    );
 }

@@ -86,30 +86,25 @@ fn sanitize_messages_for_tier3(messages: &mut [Message]) {
 }
 
 fn sanitize_content_blocks_for_tier3(blocks: &mut Vec<ContentBlock>) {
-    blocks.retain_mut(|block| {
-        match block {
-            ContentBlock::Text(text) => {
-                sanitize_string(text);
-                true
-            }
-            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => false,
-            ContentBlock::ToolUse {
-                id: _,
-                name: _,
-                input,
-            } => {
-                sanitize_json_value(input);
-                true
-            }
-            ContentBlock::ToolResult {
-                content,
-                ..
-            } => {
-                sanitize_string(content);
-                true
-            }
-            ContentBlock::Image { .. } => true,
+    blocks.retain_mut(|block| match block {
+        ContentBlock::Text(text) => {
+            sanitize_string(text);
+            true
         }
+        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => false,
+        ContentBlock::ToolUse {
+            id: _,
+            name: _,
+            input,
+        } => {
+            sanitize_json_value(input);
+            true
+        }
+        ContentBlock::ToolResult { content, .. } => {
+            sanitize_string(content);
+            true
+        }
+        ContentBlock::Image { .. } => true,
     });
 }
 
@@ -138,9 +133,7 @@ fn sanitize_json_value(value: &mut serde_json::Value) {
                 sanitize_json_value(value);
             }
         }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_) => {}
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -199,7 +192,10 @@ fn is_retriable(e: &ProviderError) -> bool {
 }
 
 fn retry_delay(e: &ProviderError, attempt: u32) -> Duration {
-    if let ProviderError::RateLimited { retry_after: Some(d) } = e {
+    if let ProviderError::RateLimited {
+        retry_after: Some(d),
+    } = e
+    {
         return *d;
     }
     Duration::from_millis(200 * 2u64.saturating_pow(attempt))
@@ -509,15 +505,29 @@ where
         let mut stream = match stream_with_retry(provider, &req).await {
             Ok(s) => s,
             Err(ProviderError::ContextTooLong) => {
-                let removed =
-                    compaction::compact(provider, state, &config.model, compaction::DEFAULT_KEEP_RECENT_TURNS)
-                        .await?;
+                let removed = compaction::compact(
+                    provider,
+                    state,
+                    &config.model,
+                    compaction::DEFAULT_KEEP_RECENT_TURNS,
+                )
+                .await?;
                 if removed == 0 {
                     let e = ProviderError::ContextTooLong;
-                    emit(events, AgentEvent::Error { message: e.to_string() });
+                    emit(
+                        events,
+                        AgentEvent::Error {
+                            message: e.to_string(),
+                        },
+                    );
                     return Err(e);
                 }
-                emit(events, AgentEvent::ContextCompacted { removed_messages: removed });
+                emit(
+                    events,
+                    AgentEvent::ContextCompacted {
+                        removed_messages: removed,
+                    },
+                );
                 let retry_req = CompletionRequest {
                     messages: state.messages.clone(),
                     ..req
@@ -529,13 +539,23 @@ where
                 match stream_with_retry(provider, &retry_req).await {
                     Ok(s) => s,
                     Err(e) => {
-                        emit(events, AgentEvent::Error { message: e.to_string() });
+                        emit(
+                            events,
+                            AgentEvent::Error {
+                                message: e.to_string(),
+                            },
+                        );
                         return Err(e);
                     }
                 }
             }
             Err(e) => {
-                emit(events, AgentEvent::Error { message: e.to_string() });
+                emit(
+                    events,
+                    AgentEvent::Error {
+                        message: e.to_string(),
+                    },
+                );
                 return Err(e);
             }
         };
@@ -563,7 +583,12 @@ where
             let event = match event {
                 Ok(e) => e,
                 Err(e) => {
-                    emit(events, AgentEvent::Error { message: e.to_string() });
+                    emit(
+                        events,
+                        AgentEvent::Error {
+                            message: e.to_string(),
+                        },
+                    );
                     return Err(e);
                 }
             };
@@ -718,34 +743,36 @@ where
                     }
                 } else {
                     match tools.get(name) {
-                    Some(tool) => {
-                        let risk = tool.risk(input);
-                        let decision = gate.resolve(name, risk, &arg_repr(input), input).await;
-                        if decision.is_allow() {
-                            emit(
-                                events,
-                                AgentEvent::ToolStarted {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                },
-                            );
-                            tool.call(input.clone(), ctx).await.unwrap_or_else(|e| ToolOutput {
-                                content: e.to_string(),
-                                is_error: true,
-                            })
-                        } else {
-                            ToolOutput {
-                                content: format!(
-                                    "permission denied by policy: {name} ({risk:?})"
-                                ),
-                                is_error: true,
+                        Some(tool) => {
+                            let risk = tool.risk(input);
+                            let decision = gate.resolve(name, risk, &arg_repr(input), input).await;
+                            if decision.is_allow() {
+                                emit(
+                                    events,
+                                    AgentEvent::ToolStarted {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                    },
+                                );
+                                tool.call(input.clone(), ctx)
+                                    .await
+                                    .unwrap_or_else(|e| ToolOutput {
+                                        content: e.to_string(),
+                                        is_error: true,
+                                    })
+                            } else {
+                                ToolOutput {
+                                    content: format!(
+                                        "permission denied by policy: {name} ({risk:?})"
+                                    ),
+                                    is_error: true,
+                                }
                             }
                         }
-                    }
-                    None => ToolOutput {
-                        content: format!("unknown tool: {name}"),
-                        is_error: true,
-                    },
+                        None => ToolOutput {
+                            content: format!("unknown tool: {name}"),
+                            is_error: true,
+                        },
                     }
                 };
                 let mut output = output;
@@ -833,8 +860,10 @@ mod tests {
         async fn stream(
             &self,
             _req: CompletionRequest,
-        ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
-        {
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>,
+            ProviderError,
+        > {
             let mut turns = self.turns.lock().unwrap();
             let events = turns.remove(0);
             Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
@@ -893,8 +922,10 @@ mod tests {
         async fn stream(
             &self,
             req: CompletionRequest,
-        ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
-        {
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>,
+            ProviderError,
+        > {
             self.seen_requests.lock().unwrap().push(req);
             Ok(Box::pin(stream::iter(end_turn("done").into_iter().map(Ok))))
         }
@@ -975,7 +1006,10 @@ mod tests {
         assert!(!run_shell.description.contains("PowerShell"));
         assert_eq!(requests[0].system.len(), 1);
         let system = &requests[0].system[0].text;
-        assert!(system.contains("ワークスペースルート: /workspace"), "{system}");
+        assert!(
+            system.contains("ワークスペースルート: /workspace"),
+            "{system}"
+        );
         assert!(!system.contains(r"C:\Users"), "{system}");
         let request_json = serde_json::to_string(&requests[0]).unwrap();
         assert!(!request_json.contains(r"C:\Users"), "{request_json}");
@@ -1110,7 +1144,11 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
         let provider = MockProvider {
             turns: Mutex::new(vec![
-                tool_use_turn("call_1", "read_file", serde_json::json!({ "path": "a.txt" })),
+                tool_use_turn(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
                 end_turn("summarized"),
             ]),
         };
@@ -1203,11 +1241,19 @@ mod tests {
         async fn stream(
             &self,
             _req: CompletionRequest,
-        ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
-        {
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>,
+            ProviderError,
+        > {
             let partial = vec![
-                Ok(StreamEvent::BlockStart { index: 0, kind: BlockKind::Text }),
-                Ok(StreamEvent::TextDelta { index: 0, text: "partial".to_string() }),
+                Ok(StreamEvent::BlockStart {
+                    index: 0,
+                    kind: BlockKind::Text,
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "partial".to_string(),
+                }),
             ];
             Ok(Box::pin(stream::iter(partial).chain(stream::pending())))
         }
@@ -1236,7 +1282,11 @@ mod tests {
                 &tools,
                 &ctx,
                 &arbiter,
-                AgentLoopConfig { model: "mock".into(), max_tokens: 100, max_turns: 5 },
+                AgentLoopConfig {
+                    model: "mock".into(),
+                    max_tokens: 100,
+                    max_turns: 5,
+                },
                 None,
                 Some(&cancel),
                 |_| {},
@@ -1277,7 +1327,10 @@ mod tests {
             _ctx: &ToolCtx,
         ) -> Result<ToolOutput, harness_core::ToolError> {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            Ok(ToolOutput { content: "slow-done".to_string(), is_error: false })
+            Ok(ToolOutput {
+                content: "slow-done".to_string(),
+                is_error: false,
+            })
         }
     }
 
@@ -1286,12 +1339,21 @@ mod tests {
         for (index, (id, name, input)) in calls.iter().enumerate() {
             events.push(StreamEvent::BlockStart {
                 index,
-                kind: BlockKind::ToolUse { id: id.to_string(), name: name.to_string() },
+                kind: BlockKind::ToolUse {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                },
             });
-            events.push(StreamEvent::ToolInputDelta { index, json_fragment: input.to_string() });
+            events.push(StreamEvent::ToolInputDelta {
+                index,
+                json_fragment: input.to_string(),
+            });
             events.push(StreamEvent::BlockStop { index });
         }
-        events.push(StreamEvent::Done { stop_reason: StopReason::ToolUse, usage: Usage::default() });
+        events.push(StreamEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        });
         events
     }
 
@@ -1329,7 +1391,11 @@ mod tests {
                 &tools,
                 &ctx,
                 &arbiter,
-                AgentLoopConfig { model: "mock".into(), max_tokens: 100, max_turns: 5 },
+                AgentLoopConfig {
+                    model: "mock".into(),
+                    max_tokens: 100,
+                    max_turns: 5,
+                },
                 None,
                 Some(&cancel),
                 |_| {},
@@ -1352,13 +1418,19 @@ mod tests {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                    Some((tool_use_id.clone(), content.clone(), *is_error))
-                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => Some((tool_use_id.clone(), content.clone(), *is_error)),
                 _ => None,
             })
             .collect();
-        assert_eq!(tool_results.len(), 2, "both tool_use blocks must have a matching tool_result");
+        assert_eq!(
+            tool_results.len(),
+            2,
+            "both tool_use blocks must have a matching tool_result"
+        );
         let call1 = tool_results.iter().find(|(id, ..)| id == "call_1").unwrap();
         assert_eq!(call1.1, "slow-done");
         assert!(!call1.2);
@@ -1374,7 +1446,11 @@ mod tests {
             &tools,
             &ctx,
             &arbiter,
-            AgentLoopConfig { model: "mock".into(), max_tokens: 100, max_turns: 5 },
+            AgentLoopConfig {
+                model: "mock".into(),
+                max_tokens: 100,
+                max_turns: 5,
+            },
             None,
             None,
             |_| {},

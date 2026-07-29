@@ -234,7 +234,9 @@ pub fn check_relative_path(path: &str) -> Result<PathBuf, JailError> {
         return Err(JailError::Escape(path.to_string()));
     }
     if path.starts_with("\\\\") || path.starts_with("//") {
-        return Err(JailError::UnsafePath(format!("UNC path is not allowed: {path}")));
+        return Err(JailError::UnsafePath(format!(
+            "UNC path is not allowed: {path}"
+        )));
     }
     for c in rel.components() {
         match c {
@@ -266,7 +268,8 @@ fn is_reserved_windows_name(name: &str) -> bool {
     let base = name.split('.').next().unwrap_or(name);
     matches!(
         base.to_ascii_uppercase().as_str(),
-        "CON" | "PRN"
+        "CON"
+            | "PRN"
             | "AUX"
             | "NUL"
             | "COM1"

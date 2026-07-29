@@ -22,23 +22,23 @@
 use std::path::Path;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree, HLOCAL};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
-    SE_FILE_OBJECT, SDDL_REVISION_1, SetNamedSecurityInfoW,
+    SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, GetSecurityDescriptorSacl,
-    LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SID_AND_ATTRIBUTES,
-    SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_GROUPS,
+    CreateRestrictedToken, GetSecurityDescriptorSacl, SetTokenInformation, TokenIntegrityLevel,
+    DISABLE_MAX_PRIVILEGE, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_GROUPS,
     TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
-    GetExitCodeProcess, INFINITE, OpenProcessToken, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-    STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, INFINITE,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 use crate::win_common::{
@@ -82,12 +82,8 @@ pub fn set_low_integrity_label(dir: &Path) -> Result<(), RestrictedError> {
         let mut sacl_present = windows::Win32::Foundation::BOOL(0);
         let mut sacl_ptr: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
         let mut sacl_defaulted = windows::Win32::Foundation::BOOL(0);
-        let sacl_result = GetSecurityDescriptorSacl(
-            sd,
-            &mut sacl_present,
-            &mut sacl_ptr,
-            &mut sacl_defaulted,
-        );
+        let sacl_result =
+            GetSecurityDescriptorSacl(sd, &mut sacl_present, &mut sacl_ptr, &mut sacl_defaulted);
         if let Err(e) = sacl_result {
             let _ = LocalFree(HLOCAL(sd.0));
             return Err(RestrictedError::from(e));

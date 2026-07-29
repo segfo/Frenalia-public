@@ -103,7 +103,11 @@ fn render_picker(f: &mut ratatui::Frame, summaries: &[SessionSummary], selected:
     };
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Resume session (Enter=open, f=fork, Esc=new)"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Resume session (Enter=open, f=fork, Esc=new)"),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     let mut state = ListState::default();

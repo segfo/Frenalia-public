@@ -31,21 +31,20 @@ use serde::{Deserialize, Serialize};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
-    HLOCAL, LocalFree, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED,
+    HANDLE, HLOCAL, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY,
-    TOKEN_USER, TokenElevation, TokenUser,
+    GetTokenInformation, TokenElevation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_WAIT,
@@ -53,7 +52,8 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
 };
-use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use crate::win_appcontainer::{self, AppContainerError, CONTAINER_NAME};
@@ -290,7 +290,6 @@ fn unique_pipe_name() -> String {
     )
 }
 
-
 /// 親がヘルパーの接続を待つ上限（`ShellExecuteExW`のUACダイアログ操作自体はここに含まれない。
 /// `ConnectNamedPipe`は「ヘルパーが起動してパイプへ接続してくる」のを待つ処理であり、
 /// UACダイアログの表示中はまだこの待ちに入っていない）。
@@ -346,7 +345,9 @@ where
                     return Ok(0);
                 } else {
                     let _ = CloseHandle(event);
-                    return Err(PrivHelperError::Ipc(format!("{op_name} failed to start: {e}")));
+                    return Err(PrivHelperError::Ipc(format!(
+                        "{op_name} failed to start: {e}"
+                    )));
                 }
             }
         };
@@ -457,9 +458,9 @@ fn read_framed_timeout(
 fn helper_exe_path() -> Result<PathBuf, PrivHelperError> {
     let current = std::env::current_exe()
         .map_err(|e| PrivHelperError::Ipc(format!("failed to resolve current exe: {e}")))?;
-    let dir = current.parent().ok_or_else(|| {
-        PrivHelperError::Ipc("current exe has no parent directory".to_string())
-    })?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| PrivHelperError::Ipc("current exe has no parent directory".to_string()))?;
     Ok(dir.join("harness-privhelper.exe"))
 }
 
@@ -700,7 +701,9 @@ unsafe fn launch_helper_elevated(
                 "UAC prompt was canceled by the user".to_string(),
             ));
         }
-        return Err(PrivHelperError::Win32(format!("ShellExecuteExW failed: {err:?}")));
+        return Err(PrivHelperError::Win32(format!(
+            "ShellExecuteExW failed: {err:?}"
+        )));
     }
 
     Ok(info.hProcess)
@@ -818,7 +821,9 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
     // ACL操作の成否に関わらず試みる — WFP起動の可否とACL操作の成否は独立した関心事であり、
     // ACL側が失敗したからといって呼び出し元が期待しているWFP起動まで巻き添えで諦める理由はない。
     if let Some(chain_pipe) = chain_netfilterd_pipe {
-        log::line(&format!("serve: chain-launching netfilterd, pipe={chain_pipe}"));
+        log::line(&format!(
+            "serve: chain-launching netfilterd, pipe={chain_pipe}"
+        ));
         match unsafe { launch_netfilterd_chained(&chain_pipe) } {
             Ok(()) => log::line("serve: netfilterd chain-launch succeeded"),
             Err(e) => log::line(&format!("serve: netfilterd chain-launch failed: {e}")),
@@ -833,9 +838,9 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
 fn netfilterd_exe_path() -> Result<PathBuf, PrivHelperError> {
     let current = std::env::current_exe()
         .map_err(|e| PrivHelperError::Ipc(format!("failed to resolve current exe: {e}")))?;
-    let dir = current.parent().ok_or_else(|| {
-        PrivHelperError::Ipc("current exe has no parent directory".to_string())
-    })?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| PrivHelperError::Ipc("current exe has no parent directory".to_string()))?;
     Ok(dir.join("harness-netfilterd.exe"))
 }
 
@@ -890,7 +895,10 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
     };
     match req {
         PrivilegedRequest::GrantTraverse { target } => {
-            log::line(&format!("dispatch: GrantTraverse target={}", target.display()));
+            log::line(&format!(
+                "dispatch: GrantTraverse target={}",
+                target.display()
+            ));
             let (granted, result) = win_appcontainer::grant_traverse_chain_with_progress(
                 &target,
                 sid.as_psid(),
@@ -922,14 +930,20 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
             let result: Result<(), AppContainerError> =
                 win_appcontainer::revoke_ace(&path, sid.as_psid())
                     .and_then(|()| win_appcontainer::assert_no_sid_ace(&path, sid.as_psid()));
-            log::line(&format!("dispatch: RevokeTraverse done, error={:?}", result.as_ref().err()));
+            log::line(&format!(
+                "dispatch: RevokeTraverse done, error={:?}",
+                result.as_ref().err()
+            ));
             match result {
                 Ok(()) => PrivilegedResponse::Ok,
                 Err(e) => PrivilegedResponse::Err(e.to_string()),
             }
         }
         PrivilegedRequest::GrantFsAllow { entries } => {
-            log::line(&format!("dispatch: GrantFsAllow {} entrie(s)", entries.len()));
+            log::line(&format!(
+                "dispatch: GrantFsAllow {} entrie(s)",
+                entries.len()
+            ));
             let mut granted = Vec::new();
             let mut failures = Vec::new();
             for entry in entries {
@@ -991,7 +1005,10 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
             PrivilegedResponse::FsAllowResult { granted, failures }
         }
         PrivilegedRequest::RevokeFsAllow { entries } => {
-            log::line(&format!("dispatch: RevokeFsAllow {} path(s)", entries.len()));
+            log::line(&format!(
+                "dispatch: RevokeFsAllow {} path(s)",
+                entries.len()
+            ));
             let mut revoked = Vec::new();
             let mut root_cleared = Vec::new();
             let mut failures = Vec::new();
@@ -1174,7 +1191,9 @@ mod tests {
     #[test]
     fn fs_allow_result_response_roundtrips_with_mixed_outcomes() {
         let resp = PrivilegedResponse::FsAllowResult {
-            granted: vec![PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")],
+            granted: vec![PathBuf::from(
+                r"C:\ProgramData\Microsoft\VisualStudio\Setup",
+            )],
             failures: vec![(
                 PathBuf::from(r"C:\Windows\System32\config"),
                 "access denied".to_string(),
@@ -1186,7 +1205,9 @@ mod tests {
             PrivilegedResponse::FsAllowResult { granted, failures } => {
                 assert_eq!(
                     granted,
-                    vec![PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")]
+                    vec![PathBuf::from(
+                        r"C:\ProgramData\Microsoft\VisualStudio\Setup"
+                    )]
                 );
                 assert_eq!(failures.len(), 1);
                 assert_eq!(failures[0].0, PathBuf::from(r"C:\Windows\System32\config"));
@@ -1230,8 +1251,12 @@ mod tests {
     #[test]
     fn revoke_fs_allow_result_response_roundtrips_with_mixed_outcomes() {
         let resp = PrivilegedResponse::RevokeFsAllowResult {
-            revoked: vec![PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")],
-            root_cleared: vec![PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu")],
+            revoked: vec![PathBuf::from(
+                r"C:\ProgramData\Microsoft\VisualStudio\Setup",
+            )],
+            root_cleared: vec![PathBuf::from(
+                r"C:\ProgramData\Microsoft\Windows\Start Menu",
+            )],
             failures: vec![(
                 PathBuf::from(r"C:\Windows\System32\config"),
                 "access denied".to_string(),
@@ -1247,11 +1272,15 @@ mod tests {
             } => {
                 assert_eq!(
                     revoked,
-                    vec![PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")]
+                    vec![PathBuf::from(
+                        r"C:\ProgramData\Microsoft\VisualStudio\Setup"
+                    )]
                 );
                 assert_eq!(
                     root_cleared,
-                    vec![PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu")]
+                    vec![PathBuf::from(
+                        r"C:\ProgramData\Microsoft\Windows\Start Menu"
+                    )]
                 );
                 assert_eq!(failures.len(), 1);
                 assert_eq!(failures[0].0, PathBuf::from(r"C:\Windows\System32\config"));
@@ -1286,7 +1315,10 @@ mod tests {
         let decoded: PrivilegedResponse = serde_json::from_slice(&bytes).unwrap();
         match decoded {
             PrivilegedResponse::GrantChain { granted, error } => {
-                assert_eq!(granted, vec![PathBuf::from(r"C:\"), PathBuf::from(r"C:\Users")]);
+                assert_eq!(
+                    granted,
+                    vec![PathBuf::from(r"C:\"), PathBuf::from(r"C:\Users")]
+                );
                 assert!(error.is_some());
             }
             other => panic!("unexpected variant: {other:?}"),

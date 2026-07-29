@@ -367,11 +367,19 @@ mod tests {
         );
         // ヘッドレスの`decide`はPromptを自動Denyへ畳み込む（§パーミッション「ヘッドレス時」）。
         assert_eq!(
-            arbiter.classify("run_shell", RiskClass::Exec, "powershell -EncodedCommand abc"),
+            arbiter.classify(
+                "run_shell",
+                RiskClass::Exec,
+                "powershell -EncodedCommand abc"
+            ),
             Classification::Prompt
         );
         assert_eq!(
-            arbiter.classify("run_shell", RiskClass::Exec, "git status | Invoke-Expression"),
+            arbiter.classify(
+                "run_shell",
+                RiskClass::Exec,
+                "git status | Invoke-Expression"
+            ),
             Classification::Prompt
         );
         assert_eq!(
@@ -453,11 +461,7 @@ mod tests {
         );
         // 似た名前だが対象外のパス（誤検知しないことの確認）。
         assert_eq!(
-            arbiter.classify(
-                "write_file",
-                RiskClass::Write,
-                ".gitattributes-backup.txt"
-            ),
+            arbiter.classify("write_file", RiskClass::Write, ".gitattributes-backup.txt"),
             Classification::Allow
         );
     }

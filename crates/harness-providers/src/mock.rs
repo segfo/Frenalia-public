@@ -10,7 +10,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 
-use harness_core::{CompletionRequest, LlmProvider, ProviderCapabilities, ProviderError, StreamEvent};
+use harness_core::{
+    CompletionRequest, LlmProvider, ProviderCapabilities, ProviderError, StreamEvent,
+};
 
 pub struct MockProvider {
     turns: Mutex<Vec<Vec<StreamEvent>>>,

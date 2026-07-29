@@ -41,16 +41,28 @@ pub fn line_diff(old: &str, new: &str) -> Vec<DiffLine> {
 
     let mut out = Vec::new();
     for line in &old_lines[..prefix] {
-        out.push(DiffLine { kind: DiffKind::Context, text: line.to_string() });
+        out.push(DiffLine {
+            kind: DiffKind::Context,
+            text: line.to_string(),
+        });
     }
     for line in &old_lines[prefix..old_lines.len() - suffix] {
-        out.push(DiffLine { kind: DiffKind::Removed, text: line.to_string() });
+        out.push(DiffLine {
+            kind: DiffKind::Removed,
+            text: line.to_string(),
+        });
     }
     for line in &new_lines[prefix..new_lines.len() - suffix] {
-        out.push(DiffLine { kind: DiffKind::Added, text: line.to_string() });
+        out.push(DiffLine {
+            kind: DiffKind::Added,
+            text: line.to_string(),
+        });
     }
     for line in &old_lines[old_lines.len() - suffix..] {
-        out.push(DiffLine { kind: DiffKind::Context, text: line.to_string() });
+        out.push(DiffLine {
+            kind: DiffKind::Context,
+            text: line.to_string(),
+        });
     }
     out
 }
@@ -67,11 +79,26 @@ mod tests {
         assert_eq!(
             diff,
             vec![
-                DiffLine { kind: DiffKind::Context, text: "a".into() },
-                DiffLine { kind: DiffKind::Removed, text: "b".into() },
-                DiffLine { kind: DiffKind::Added, text: "X".into() },
-                DiffLine { kind: DiffKind::Context, text: "c".into() },
-                DiffLine { kind: DiffKind::Context, text: "d".into() },
+                DiffLine {
+                    kind: DiffKind::Context,
+                    text: "a".into()
+                },
+                DiffLine {
+                    kind: DiffKind::Removed,
+                    text: "b".into()
+                },
+                DiffLine {
+                    kind: DiffKind::Added,
+                    text: "X".into()
+                },
+                DiffLine {
+                    kind: DiffKind::Context,
+                    text: "c".into()
+                },
+                DiffLine {
+                    kind: DiffKind::Context,
+                    text: "d".into()
+                },
             ]
         );
     }
@@ -82,9 +109,18 @@ mod tests {
         assert_eq!(
             diff,
             vec![
-                DiffLine { kind: DiffKind::Context, text: "a".into() },
-                DiffLine { kind: DiffKind::Context, text: "b".into() },
-                DiffLine { kind: DiffKind::Added, text: "c".into() },
+                DiffLine {
+                    kind: DiffKind::Context,
+                    text: "a".into()
+                },
+                DiffLine {
+                    kind: DiffKind::Context,
+                    text: "b".into()
+                },
+                DiffLine {
+                    kind: DiffKind::Added,
+                    text: "c".into()
+                },
             ]
         );
     }
@@ -95,8 +131,14 @@ mod tests {
         assert_eq!(
             diff,
             vec![
-                DiffLine { kind: DiffKind::Removed, text: "one".into() },
-                DiffLine { kind: DiffKind::Added, text: "two".into() },
+                DiffLine {
+                    kind: DiffKind::Removed,
+                    text: "one".into()
+                },
+                DiffLine {
+                    kind: DiffKind::Added,
+                    text: "two".into()
+                },
             ]
         );
     }

@@ -32,7 +32,10 @@ fn satisfies(tier: ShellTier, require: RequireSandbox) -> bool {
             ShellTier::Tier3 | ShellTier::Tier2 | ShellTier::Tier1a | ShellTier::Tier1b
         ),
         RequireSandbox::Confidential => {
-            matches!(tier, ShellTier::Tier3 | ShellTier::Tier2 | ShellTier::Tier1a)
+            matches!(
+                tier,
+                ShellTier::Tier3 | ShellTier::Tier2 | ShellTier::Tier1a
+            )
         }
     }
 }
@@ -136,7 +139,13 @@ pub fn select_tier_with_probes(
     wfp_chain_pipe: Option<String>,
     probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
-    let selection = best_effort_tier(workspace_root, opt_in_tier3, passthrough, wfp_chain_pipe, probes);
+    let selection = best_effort_tier(
+        workspace_root,
+        opt_in_tier3,
+        passthrough,
+        wfp_chain_pipe,
+        probes,
+    );
     if satisfies(selection.tier, require) {
         Ok(selection)
     } else {
@@ -180,13 +189,15 @@ fn try_tier1a(
         // テスト注入が無い場合のみ実際のWin32 preflightを呼ぶ（副作用ありの重い処理を
         // 単体テストでは避ける、既存の分岐と同じ考え方）。D8: passthroughの到達不能は
         // Tier選択自体を左右せず`passthrough_warnings`として運ぶだけ。
-        None => match crate::win_appcontainer::preflight(workspace_root, passthrough, wfp_chain_pipe) {
-            Ok(outcome) => Ok(ShellTierSelection::direct(ShellTier::Tier1a)
-                .with_passthrough_warnings(outcome.warnings)
-                .with_granted_passthrough(outcome.granted_passthrough)
-                .with_netfilterd_chain_attempted(outcome.netfilterd_chain_attempted)),
-            Err(e) => Err(e.to_string()),
-        },
+        None => {
+            match crate::win_appcontainer::preflight(workspace_root, passthrough, wfp_chain_pipe) {
+                Ok(outcome) => Ok(ShellTierSelection::direct(ShellTier::Tier1a)
+                    .with_passthrough_warnings(outcome.warnings)
+                    .with_granted_passthrough(outcome.granted_passthrough)
+                    .with_netfilterd_chain_attempted(outcome.netfilterd_chain_attempted)),
+                Err(e) => Err(e.to_string()),
+            }
+        }
     }
 }
 
@@ -425,7 +436,7 @@ mod tests {
     fn windows_tier1a_failure_rejects_confidential() {
         let probes = Probes {
             tier1a_preflight_override: Some(Err(
-                "workspace FS I/O denied inside AppContainer".to_string(),
+                "workspace FS I/O denied inside AppContainer".to_string()
             )),
             ..Default::default()
         };

@@ -7,8 +7,12 @@
 //! `StreamEvent`を直接スクリプトするため、`run_agent_loop`自体のブロック蓄積・ツールディスパッチ・
 //! `tool_result`往復ロジックのみを対象にした回帰テストになる。
 
-use harness_core::{BlockKind, ContentBlock, Message, Role, StopReason, StreamEvent, ToolCtx, Usage};
-use harness_engine::{run_agent_loop, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode};
+use harness_core::{
+    BlockKind, ContentBlock, Message, Role, StopReason, StreamEvent, ToolCtx, Usage,
+};
+use harness_engine::{
+    run_agent_loop, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode,
+};
 use harness_providers::MockProvider;
 use harness_tools::ToolRegistry;
 
@@ -57,7 +61,11 @@ async fn read_file_tool_loop_produces_expected_transcript() {
     std::fs::write(dir.path().join("greeting.txt"), "hello world").unwrap();
 
     let provider = MockProvider::new(vec![
-        tool_use_turn("call_1", "read_file", serde_json::json!({ "path": "greeting.txt" })),
+        tool_use_turn(
+            "call_1",
+            "read_file",
+            serde_json::json!({ "path": "greeting.txt" }),
+        ),
         end_turn("The file says: hello world"),
     ]);
 

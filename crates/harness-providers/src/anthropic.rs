@@ -327,9 +327,9 @@ fn to_wire_content_block(block: &ContentBlock) -> WireContentBlock {
             thinking: text.clone(),
             signature: signature.clone(),
         },
-        ContentBlock::RedactedThinking { data } => WireContentBlock::RedactedThinking {
-            data: data.clone(),
-        },
+        ContentBlock::RedactedThinking { data } => {
+            WireContentBlock::RedactedThinking { data: data.clone() }
+        }
         ContentBlock::ToolUse { id, name, input } => WireContentBlock::ToolUse {
             id: id.clone(),
             name: name.clone(),

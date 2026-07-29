@@ -118,7 +118,10 @@ mod tests {
         run(dir.path(), &["commit", "-q", "-m", "init"]);
 
         assert!(is_clean_tracked(dir.path(), &PathBuf::from("tracked.txt")));
-        assert!(!is_clean_tracked(dir.path(), &PathBuf::from("untracked.txt")));
+        assert!(!is_clean_tracked(
+            dir.path(),
+            &PathBuf::from("untracked.txt")
+        ));
 
         std::fs::write(dir.path().join("tracked.txt"), "changed").unwrap();
         assert!(!is_clean_tracked(dir.path(), &PathBuf::from("tracked.txt")));

@@ -33,7 +33,12 @@ pub async fn run_prep_screen(
     let workspace_root = workspace_root.to_path_buf();
     let allow_domains = allow_domains.to_vec();
     let start_task = tokio::task::spawn_blocking(move || {
-        VmSandboxHandle::start(&workspace_root, &allow_domains, tier3_warm, tier3_max_sessions)
+        VmSandboxHandle::start(
+            &workspace_root,
+            &allow_domains,
+            tier3_warm,
+            tier3_max_sessions,
+        )
     });
     tokio::pin!(start_task);
 

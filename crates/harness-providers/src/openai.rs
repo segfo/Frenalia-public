@@ -37,7 +37,11 @@ fn wire_log_path() -> Option<PathBuf> {
 
 fn wire_log_append(path: &std::path::Path, value: &serde_json::Value) {
     use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{value}");
     }
 }
@@ -263,7 +267,9 @@ fn to_wire_request(req: &CompletionRequest) -> WireRequest {
         model: req.model.clone(),
         messages,
         stream: true,
-        stream_options: WireStreamOptions { include_usage: true },
+        stream_options: WireStreamOptions {
+            include_usage: true,
+        },
         max_tokens: req.max_tokens,
         temperature: req.sampling.temperature,
         top_p: req.sampling.top_p,
@@ -289,7 +295,9 @@ fn tool_choice_to_wire(tc: &ToolChoice) -> serde_json::Value {
         ToolChoice::Auto => serde_json::json!("auto"),
         ToolChoice::None => serde_json::json!("none"),
         ToolChoice::Required => serde_json::json!("required"),
-        ToolChoice::Tool(name) => serde_json::json!({ "type": "function", "function": { "name": name } }),
+        ToolChoice::Tool(name) => {
+            serde_json::json!({ "type": "function", "function": { "name": name } })
+        }
     }
 }
 
@@ -478,7 +486,10 @@ impl StreamAccumState {
                         });
                         self.thinking_open = true;
                     }
-                    out.push(StreamEvent::ThinkingDelta { index: THINKING_INDEX, text });
+                    out.push(StreamEvent::ThinkingDelta {
+                        index: THINKING_INDEX,
+                        text,
+                    });
                 }
             }
 
@@ -540,7 +551,9 @@ impl StreamAccumState {
     fn finish(self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if self.thinking_open {
-            out.push(StreamEvent::BlockStop { index: THINKING_INDEX });
+            out.push(StreamEvent::BlockStop {
+                index: THINKING_INDEX,
+            });
         }
         if self.text_open {
             out.push(StreamEvent::BlockStop { index: 0 });
@@ -802,14 +815,20 @@ mod tests {
         let call1_fragments: String = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::ToolInputDelta { index: 1, json_fragment } => Some(json_fragment.as_str()),
+                StreamEvent::ToolInputDelta {
+                    index: 1,
+                    json_fragment,
+                } => Some(json_fragment.as_str()),
                 _ => None,
             })
             .collect();
         let call2_fragments: String = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::ToolInputDelta { index: 2, json_fragment } => Some(json_fragment.as_str()),
+                StreamEvent::ToolInputDelta {
+                    index: 2,
+                    json_fragment,
+                } => Some(json_fragment.as_str()),
                 _ => None,
             })
             .collect();
@@ -823,9 +842,10 @@ mod tests {
         let mut st = StreamAccumState::new();
         let mut events = Vec::new();
 
-        let chunk1: WireChunk =
-            parse_wire(r#"{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#)
-                .unwrap();
+        let chunk1: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
         events.extend(st.handle_chunk(chunk1));
 
         let chunk2: WireChunk = parse_wire(
@@ -892,14 +912,34 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                StreamEvent::BlockStart { index: THINKING_INDEX, kind: BlockKind::Thinking },
-                StreamEvent::ThinkingDelta { index: THINKING_INDEX, text: "Let me ".to_string() },
-                StreamEvent::ThinkingDelta { index: THINKING_INDEX, text: "think...".to_string() },
-                StreamEvent::BlockStart { index: 0, kind: BlockKind::Text },
-                StreamEvent::TextDelta { index: 0, text: "answer".to_string() },
-                StreamEvent::BlockStop { index: THINKING_INDEX },
+                StreamEvent::BlockStart {
+                    index: THINKING_INDEX,
+                    kind: BlockKind::Thinking
+                },
+                StreamEvent::ThinkingDelta {
+                    index: THINKING_INDEX,
+                    text: "Let me ".to_string()
+                },
+                StreamEvent::ThinkingDelta {
+                    index: THINKING_INDEX,
+                    text: "think...".to_string()
+                },
+                StreamEvent::BlockStart {
+                    index: 0,
+                    kind: BlockKind::Text
+                },
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "answer".to_string()
+                },
+                StreamEvent::BlockStop {
+                    index: THINKING_INDEX
+                },
                 StreamEvent::BlockStop { index: 0 },
-                StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: Usage::default() },
+                StreamEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default()
+                },
             ]
         );
     }
@@ -908,16 +948,23 @@ mod tests {
     #[test]
     fn reasoning_alias_field_also_becomes_thinking_delta() {
         let mut st = StreamAccumState::new();
-        let chunk: WireChunk =
-            parse_wire(r#"{"choices":[{"index":0,"delta":{"reasoning":"hmm"},"finish_reason":null}]}"#)
-                .unwrap();
+        let chunk: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"reasoning":"hmm"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
         let events = st.handle_chunk(chunk);
 
         assert_eq!(
             events,
             vec![
-                StreamEvent::BlockStart { index: THINKING_INDEX, kind: BlockKind::Thinking },
-                StreamEvent::ThinkingDelta { index: THINKING_INDEX, text: "hmm".to_string() },
+                StreamEvent::BlockStart {
+                    index: THINKING_INDEX,
+                    kind: BlockKind::Thinking
+                },
+                StreamEvent::ThinkingDelta {
+                    index: THINKING_INDEX,
+                    text: "hmm".to_string()
+                },
             ]
         );
     }
@@ -928,16 +975,23 @@ mod tests {
     fn no_reasoning_field_produces_no_thinking_delta() {
         let mut st = StreamAccumState::new();
         let mut events = Vec::new();
-        let chunk1: WireChunk =
-            parse_wire(r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#)
-                .unwrap();
+        let chunk1: WireChunk = parse_wire(
+            r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
         events.extend(st.handle_chunk(chunk1));
         events.extend(st.finish());
 
-        assert!(!events.iter().any(|e| matches!(e, StreamEvent::ThinkingDelta { .. })));
         assert!(!events
             .iter()
-            .any(|e| matches!(e, StreamEvent::BlockStart { kind: BlockKind::Thinking, .. })));
+            .any(|e| matches!(e, StreamEvent::ThinkingDelta { .. })));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            StreamEvent::BlockStart {
+                kind: BlockKind::Thinking,
+                ..
+            }
+        )));
     }
 
     /// 1つのToolSpecがOpenAIの外部タグ形式（`{type:function,function:{...}}`）へ正しく展開されること。
@@ -1008,7 +1062,10 @@ mod tests {
 
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
         assert_eq!(
             messages[0]["tool_calls"][0]["function"]["arguments"],
             r#"{"path":"a.txt"}"#
