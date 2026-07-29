@@ -199,7 +199,7 @@ fn best_effort_tier(
     probes: &Probes,
 ) -> ShellTierSelection {
     // Tier3はTier1a/Tier1bとは独立のオプトイン（`--sandbox`/`--experimental-tier3`）。指定時は
-    // 最優先で試す（Tier3が唯一vNIC単位でegressを強制できるTierのため、成立するなら常に最良）。
+    // 最優先で試す（Tier3が唯一vNIC単位で出口を強制できるTierのため、成立するなら常に最良）。
     // 不成立の場合はTier1aへカスケードする（`--sandbox`実装ラウンドでの変更点: 従来は
     // Tier1bへ直接降格していたが、Tier1aが既定プローブ対象になったため中間段階として試す）。
     if opt_in_tier3 {

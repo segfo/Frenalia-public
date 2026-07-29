@@ -70,8 +70,8 @@ use crate::win_common::wide;
 pub enum VmRequest {
     StartSession {
         workspace_root: String,
-        /// egress許可リスト（SNIプロキシ+nftables DNAT、Phase 2）の対象ドメイン。空なら
-        /// Phase 1と同じ無制限egressのまま（`--net-allow-domain`未指定時の既定挙動、
+        /// 出口許可リスト（SNIプロキシ+nftables DNAT、Phase 2）の対象ドメイン。空なら
+        /// Phase 1と同じ無制限出口のまま（`--net-allow-domain`未指定時の既定挙動、
         /// `plans/vm-spike/RESULTS.md`§3.8）。
         allow_domains: Vec<String>,
         /// ウォームスタート（`--tier3-warm`、フェーズB）を使うか。既定はfalse（旧クライアント

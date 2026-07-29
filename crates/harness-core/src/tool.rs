@@ -95,7 +95,7 @@ pub struct ReadScopeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellTier {
     /// Windows: Hyper-V外層VM（AlmaLinux）+ Incus内層コンテナ（`plans/DESIGN-SANDBOX-VMISOLATION.md`）。
-    /// vNIC単位でegressを強制できる唯一のTier。実験的/フラグ付き（`--experimental-tier3`、D-02と
+    /// vNIC単位で出口を強制できる唯一のTier。実験的/フラグ付き（`--experimental-tier3`、D-02と
     /// 同じ「既定にせずオプトイン」思想）。`run_shell`は`ToolCtx.vm_sandbox`経由でコンテナ内実行に
     /// 委譲する（他Tierと異なり実プロセスをホスト側にspawnしない）。
     Tier3,

@@ -6,9 +6,9 @@
 //! ネットワーク呼び出しであり管理者権限を要しないが、デーモンプロセス内に閉じて構わないため
 //! ここへ同居させる。
 //!
-//! **Phase 1（`run_shell`統合）+ Phase 2（egress許可リスト統合）は完了・実機E2E確認済み**
-//! （`RESULTS.md`§3.9/§3.10）。egress許可リスト（Incus ACL + nftables DNAT + SNI preread
-//! プロキシ + 監査ログ）は`allow_domains`が非空の場合のみ構成し、空なら無制限egressのまま
+//! **Phase 1（`run_shell`統合）+ Phase 2（出口許可リスト統合）は完了・実機E2E確認済み**
+//! （`RESULTS.md`§3.9/§3.10）。出口許可リスト（Incus ACL + nftables DNAT + SNI preread
+//! プロキシ + 監査ログ）は`allow_domains`が非空の場合のみ構成し、空なら無制限出口のまま
 //! （`--net-allow-domain`未指定時の後方互換）。ゴールデン像へのIncusクライアント証明書焼き込み
 //! も完了しており、ランタイムはSSH・ペアリング不要でmTLS直結できる。
 //!
@@ -31,7 +31,7 @@
 //! - **ワークスペース単位資源の参照カウント共有**（`DESIGN-SANDBOX-VMISOLATION.md`項目6-a）:
 //!   SMB共有・使い捨てアカウント・NTFS ACE・CIFSマウントは`workspace_id`
 //!   （`smb_share::compute_workspace_id`）単位で参照カウント共有する。Incusコンテナと
-//!   egress許可リストはセッション単位のまま（同一ワークスペースでもコンテナは分ける）。
+//!   出口許可リストはセッション単位のまま（同一ワークスペースでもコンテナは分ける）。
 //!
 //! **Tier3残課題の解消済み範囲**:
 //! - VM refcountが0になった際、warm運用なら`WarmIdle`へparkして次回warm復帰できる。
@@ -47,7 +47,7 @@
 //! 固定の運用規約（`plans/vm-spike/RESULTS.md`§3.6/§3.7で確立、実機E2E確認済み）:
 //! - ゴールデン親VHDX: `C:\ProgramData\harness\golden-images\almalinux-golden.vhdx`
 //! - 内部vSwitch: `harness-tier3-outer-internal`（`172.20.100.0/24`、ホスト側ゲートウェイ
-//!   `172.20.100.1`、`New-NetNat`によるegress）
+//!   `172.20.100.1`、`New-NetNat`による出口）
 //! - ゲスト静的IP: `172.20.100.10`（ゴールデン像へ焼き込み済み、DHCP不要）
 //! - Incus API: `172.20.100.10:8443`（mTLS、クライアント証明書はゴールデン像へ焼き込み済み。
 //!   `harness-firstboot.sh`のステップ3.5が起動直後に`incus config trust add-certificate`で
@@ -781,7 +781,7 @@ impl IncusClient {
         Ok(())
     }
 
-    /// `POST /1.0/network-acls`: 「tcp/443への直接egressを宛先指定なしで許可、それ以外は
+    /// `POST /1.0/network-acls`: 「tcp/443への直接出口を宛先指定なしで許可、それ以外は
     /// コンテナのdevice側でdrop」という許可リストを1本作る（`plans/vm-spike/RESULTS.md`
     /// §3.8で実機実証済みの構成。既存の同名ACLがあれば削除してから作り直す）。
     /// **実機で判明した罠**（`RESULTS.md`§3.8で既知の限界として記録済みだったもの）: tcp/443
@@ -816,8 +816,8 @@ impl IncusClient {
         Ok(())
     }
 
-    /// コンテナの`eth0`デバイスへACLを適用し、既定egressをdropにする
-    /// （`security.acls.default.egress.action=drop`、`RESULTS.md`§3.8）。
+    /// コンテナの`eth0`デバイスへACLを適用し、既定出口をdropにする
+    /// （`security.acls.default.出口.action=drop`、`RESULTS.md`§3.8）。
     pub fn attach_acl_to_container(
         &self,
         container_name: &str,
@@ -1076,7 +1076,7 @@ pub(crate) const INCUS_BRIDGE_IP: &str = "10.76.180.1";
 /// ため、セッションごとに`SNI_PROXY_PORT_BASE + slot`でポートを分ける（`slot`は
 /// `vmsandboxd::SessionRegistry`が同時実行数上限の枠として払い出す番号、
 /// `crate::vmsandbox::container_static_ip_cidr`と同じ`slot`を共有する）。単一ポートのままだと、
-/// 全セッションの許可ドメインが1つの`map`に混ざり、会話単位でegressを絞るというTier3の目的が
+/// 全セッションの許可ドメインが1つの`map`に混ざり、会話単位で出口を絞るというTier3の目的が
 /// 崩れる（S-5、DNATは認可ではない）。
 pub(crate) const SNI_PROXY_PORT_BASE: u16 = 8444;
 const SNI_PROXY_CONF_PATH: &str = "/root/harness-sni-proxy.conf";
@@ -1092,7 +1092,7 @@ fn sni_audit_log_path_for_slot(slot: u8) -> String {
     format!("{SNI_AUDIT_LOG_DIR}/slot-{slot}.log")
 }
 
-/// 常駐VM上で現在egress許可リストを構成中の1セッション分の情報
+/// 常駐VM上で現在出口許可リストを構成中の1セッション分の情報
 /// （`crate::vm_host::VmHost`が全アクティブセッション分をまとめて保持する）。
 #[derive(Debug, Clone)]
 pub(crate) struct EgressSession {
@@ -1213,7 +1213,7 @@ fn build_nftables_script(sessions: &[EgressSession]) -> String {
 }
 
 /// SNI prereadプロキシ + nftables DNAT/filter + コンテナ側Incus ACLを、AlmaLinux VM自体へ
-/// SSH経由で構成する。**Phase B**: `active_sessions`は呼び出し時点でegressを構成している
+/// SSH経由で構成する。**Phase B**: `active_sessions`は呼び出し時点で出口を構成している
 /// 全セッション（このセッション自身を含む）——1本の呼び出しが常にVM全体の設定を丸ごと
 /// 再生成するため、呼び出し側（`crate::vm_host::VmHost`）が単一ロックの下で
 /// 「集合を更新→この関数を呼ぶ」を一体で行う必要がある（さもないと2セッション目の呼び出しが
@@ -1265,7 +1265,7 @@ pub(crate) fn apply_egress_ruleset(
     Ok(())
 }
 
-/// コンテナ側Incus ACL: tcp/443への直接egressを宛先指定なしで許可するだけでよい
+/// コンテナ側Incus ACL: tcp/443への直接出口を宛先指定なしで許可するだけでよい
 /// （プロキシの存在をコンテナに一切意識させない、`RESULTS.md`§3.8）。セッション単位で
 /// 一度だけ呼べばよく、VM全体の再生成とは独立（コンテナ削除で自動的に消える）。
 pub(crate) fn attach_egress_acl(incus: &IncusClient, container_name: &str) -> Result<(), VmError> {
@@ -1318,8 +1318,8 @@ pub struct VmSession {
     workspace_id: String,
     container_name: String,
     incus: IncusClient,
-    /// egress許可リスト（SNIプロキシ+nftables DNAT）を構成した場合のみ`Some`（`allow_domains`
-    /// が非空だった場合）。teardown時にこれを見て監査ログ取得・egress設定解除の要否を判定する。
+    /// 出口許可リスト（SNIプロキシ+nftables DNAT）を構成した場合のみ`Some`（`allow_domains`
+    /// が非空だった場合）。teardown時にこれを見て監査ログ取得・出口設定解除の要否を判定する。
     ssh_key: Option<PathBuf>,
     /// `WorkspaceShareMode::Cifs`のセッションかどうかのフラグを兼ねる（`Some`なら
     /// teardownで`copy_out_workspace`をスキップし、ワークスペース単位資源の参照カウント
@@ -1727,7 +1727,7 @@ impl VmSession {
         // **実機で判明した罠(2)**: 静的IP割当はNetworkManager/dhclientを経由しないため
         // `/etc/resolv.conf`が空のままになり、コンテナ内のDNS解決自体が失敗する
         // （`nslookup`が既定の`127.0.0.1`へ問い合わせて`Connection refused`になる）。
-        // ACL（`create_network_acl`）でUDP/TCP 53のegressを許可しても、そもそも問い合わせ先の
+        // ACL（`create_network_acl`）でUDP/TCP 53の出口を許可しても、そもそも問い合わせ先の
         // リゾルバが設定されていなければ無意味なため、ここで明示的に設定する
         // （nginx SNIプロキシの`resolver`ディレクティブと同じ`1.1.1.1`に揃える）。
         // 最終判定は`ifup`自身の終了コードではなく`ip -4 addr show eth0`にinetが実在するかで
@@ -1832,8 +1832,8 @@ impl VmSession {
             )));
         }
 
-        // egress許可リスト（SNIプロキシ+nftables DNAT+コンテナACL）は`allow_domains`が
-        // 非空の場合のみ構成する。既定（省略時）はPhase 1と同じ無制限egressのまま
+        // 出口許可リスト（SNIプロキシ+nftables DNAT+コンテナACL）は`allow_domains`が
+        // 非空の場合のみ構成する。既定（省略時）はPhase 1と同じ無制限出口のまま
         // （既存の`--net-allow-domain`未指定時の挙動を変えない、D-02と同じ「オプトイン」思想）。
         // **Phase B（B-1）**: IPCが同一ユーザーの任意プロセスへ開かれた以上`allow_domains`は
         // 外部入力として扱い、`validate_allow_domain`で妥当性を確認してから使う。
@@ -2065,8 +2065,8 @@ impl VmSession {
         } else {
             self.copy_out_workspace(workspace_root)
         };
-        // egress許可リストを構成していた場合のみ、VMが消える前に監査ログを回収し、
-        // このセッション分のegress設定をVM全体の集合から取り除く（A-8、`VmHost::release_egress`）。
+        // 出口許可リストを構成していた場合のみ、VMが消える前に監査ログを回収し、
+        // このセッション分の出口設定をVM全体の集合から取り除く（A-8、`VmHost::release_出口`）。
         if let Some(ssh_key) = &self.ssh_key {
             let _ = fetch_and_persist_audit_log(
                 self.incus.host_ip(),

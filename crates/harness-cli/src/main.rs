@@ -1933,7 +1933,7 @@ async fn main() -> ExitCode {
         );
     }
 
-    // WFP egress強制（Layer2、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）の
+    // WFP 出口強制（Layer2、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）の
     // named pipeを、`select_tier`（内部で`preflight`を呼ぶ）より前に用意しておく。
     // Tier1aはフラグ無しで既定プローブされるため（`--sandbox`カスケードの中間フォールバック
     // としても到達し得る）、許可ドメインが設定されている場合は常に投機的に用意しておく

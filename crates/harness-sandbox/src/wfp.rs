@@ -1,4 +1,4 @@
-//! Windows Filtering Platform (WFP) egress強制フィルタ（Layer2、`plans/DESIGN-SANDBOX-PRIVSEP.md`
+//! Windows Filtering Platform (WFP) 出口強制フィルタ（Layer2、`plans/DESIGN-SANDBOX-PRIVSEP.md`
 //! §3・`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`）。
 //!
 //! `harness-netfilterd`（常駐デーモン、`crate::netfilterd`）の中でのみ呼ばれる。本体プロセス

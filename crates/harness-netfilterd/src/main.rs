@@ -1,4 +1,4 @@
-//! harness-netfilterd: WFP egress強制フィルタ用の常駐デーモン（Layer2、
+//! harness-netfilterd: WFP 出口強制フィルタ用の常駐デーモン（Layer2、
 //! `~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録C参照）。
 //!
 //! `harness.exe`が`runas`で昇格起動する別バイナリ。引数に受け取った named pipe名へclientとして

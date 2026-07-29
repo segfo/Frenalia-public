@@ -68,7 +68,7 @@ enum VmHostState {
         /// なく「VM実体が今どう起動されているか」を1箇所で管理し、`release`が
         /// refcount 0時にparkかteardownかを判断する材料にする。
         warm: bool,
-        /// 現在egressを構成している全アクティブセッション（`slot` -> (コンテナIP,
+        /// 現在出口を構成している全アクティブセッション（`slot` -> (コンテナIP,
         /// 許可ドメイン一覧)）。`configure_egress`/`release_egress`がこの集合全体から
         /// nginx/nftables設定を毎回再生成する（A-8是正、`crate::vmsandbox::apply_egress_ruleset`
         /// のdoc参照）。
@@ -204,7 +204,7 @@ impl VmHost {
         *guard = VmHostState::Stopped;
     }
 
-    /// このセッション（`slot`）分のegress許可リストを構成/更新し、**現在アクティブな全
+    /// このセッション（`slot`）分の出口許可リストを構成/更新し、**現在アクティブな全
     /// セッション分をまとめて**nginx/nftables設定へ反映する（A-8是正: 1回の呼び出しがVM全体の
     /// 設定を丸ごと再生成するため、単一ロックの下で「集合を更新→再生成」を一体で行う）。
     pub fn configure_egress(
@@ -229,7 +229,7 @@ impl VmHost {
         crate::vmsandbox::apply_egress_ruleset(config.guest_ip, ssh_key, &active)
     }
 
-    /// セッション終了時、このセッション（`slot`）分のegress設定を集合から取り除き、残った
+    /// セッション終了時、このセッション（`slot`）分の出口設定を集合から取り除き、残った
     /// アクティブセッション分だけでnginx/nftables設定を再生成する。VMが既に停止済み
     /// （teardownの後半でVM自体もrefcount 0になった場合）なら何もしない。
     pub fn release_egress(
