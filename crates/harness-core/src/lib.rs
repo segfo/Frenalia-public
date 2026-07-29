@@ -4,6 +4,7 @@
 pub mod config_injection;
 pub mod event;
 pub mod message;
+pub mod net_policy;
 pub mod prompt;
 pub mod provider;
 pub mod tool;
@@ -11,10 +12,14 @@ pub mod tool;
 pub use config_injection::is_config_injection_path;
 pub use event::AgentEvent;
 pub use message::{ContentBlock, Message, Role};
+pub use net_policy::{
+    domain_match, is_ip_literal, normalize_domain_pattern, validate_domain_pattern, DomainPolicy,
+    DomainPolicyDecision,
+};
 pub use prompt::{render as render_environment_prompt, EnvironmentFacts, OsKind};
 pub use provider::{
-    BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities,
-    ProviderError, Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
+    BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities, ProviderError,
+    Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
 };
 pub use tool::{
     NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, RequireSandbox, RiskClass, ShellTier,

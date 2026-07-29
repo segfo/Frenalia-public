@@ -29,7 +29,7 @@ pub struct Settings {
     /// `ReadSettings::default()`（whitelist・外部ルート無し＝M10までと等価）。
     pub read: Option<ReadSettings>,
     /// 協調プロキシ設定（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）。省略時は
-    /// `NetSettings::default()`（`allow_domains`空＝プロキシ自体を起動しない）。
+    /// `NetSettings::default()`（`allow_domains`空＝全拒否ポリシーを監査付きで起動）。
     pub net: Option<NetSettings>,
     /// Tier1a fs passthrough設定（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺）。省略時は
     /// `FsSettings::default()`（`allow`空＝追加ルート無し＝M12までと等価）。
@@ -77,6 +77,11 @@ impl NetSettings {
     pub fn to_net_proxy_config(&self) -> harness_core::NetProxyConfig {
         harness_core::NetProxyConfig {
             allow_domains: self.allow_domains.clone().unwrap_or_default(),
+            domain_policy_enabled: true,
+            enforced_by_wfp: false,
+            audit_log_path: None,
+            proxy_addr: None,
+            fake_dns_addr: None,
         }
     }
 
@@ -152,12 +157,18 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
         Ok(text) => match serde_json::from_str(&text) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("warning: ignoring malformed settings file {}: {e}", path.display());
+                eprintln!(
+                    "warning: ignoring malformed settings file {}: {e}",
+                    path.display()
+                );
                 None
             }
         },
         Err(e) => {
-            eprintln!("warning: could not read settings file {}: {e}", path.display());
+            eprintln!(
+                "warning: could not read settings file {}: {e}",
+                path.display()
+            );
             None
         }
     }

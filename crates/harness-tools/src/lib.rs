@@ -17,8 +17,9 @@
 //! 実行前の許可判定（`PermissionArbiter`）はM4で`harness-engine`に実装したが、
 //! ツール本体はそれを意識しない（呼ばれた時点で既に許可済み）。
 
+pub mod fake_dns;
 mod fs_tools;
-mod net_proxy;
+pub mod net_proxy;
 mod search;
 mod shell;
 mod web;
@@ -101,7 +102,10 @@ pub(crate) fn jail_error_to_tool_error(path: &str, err: JailError) -> ToolError 
 }
 
 /// `SandboxFs`（M10、書込ステージング）のエラーを`ToolError`へ写像する共通ヘルパー。
-pub(crate) fn sandbox_error_to_tool_error(path: &str, err: harness_sandbox::SandboxError) -> ToolError {
+pub(crate) fn sandbox_error_to_tool_error(
+    path: &str,
+    err: harness_sandbox::SandboxError,
+) -> ToolError {
     match err {
         harness_sandbox::SandboxError::Jail(e) => jail_error_to_tool_error(path, e),
         harness_sandbox::SandboxError::NotFound(_) => {

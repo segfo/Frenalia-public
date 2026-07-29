@@ -106,7 +106,19 @@ fn exe_basename(token: &str) -> String {
 /// コマンド文字列が連鎖メタ文字（`|`/`&`/`;`/バッククォート/`$(`/改行）を含むかを判定する。
 /// 単一`&`（PowerShellの呼び出し演算子等）も安全側で連鎖扱いにする（D-11の最小許可原則）。
 fn contains_chaining_metachar(command: &str) -> bool {
-    command.contains(['|', '&', ';', '`', '\n']) || command.contains("$(")
+    if command.contains(['|', '&', '`', '\n']) || command.contains("$(") {
+        return true;
+    }
+    let mut brace_depth = 0usize;
+    for ch in command.chars() {
+        match ch {
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ';' if brace_depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// `command`の先頭execが`allow_apps`（basename一致）に含まれるかを判定し、連鎖の有無も
@@ -120,6 +132,10 @@ fn classify_net_app(command: &str, allow_apps: &[String]) -> NetDecision {
     if allow_apps.is_empty() {
         return NetDecision::Deny;
     }
+    let shell_allowed = allow_apps.iter().any(|allowed| {
+        let basename = exe_basename(allowed);
+        basename == "powershell" || basename == "pwsh"
+    });
     let token = first_command_token(command);
     if token.is_empty() {
         return NetDecision::Deny;
@@ -127,7 +143,8 @@ fn classify_net_app(command: &str, allow_apps: &[String]) -> NetDecision {
     let basename = exe_basename(token);
     let matched = allow_apps
         .iter()
-        .any(|allowed| exe_basename(allowed) == basename);
+        .any(|allowed| exe_basename(allowed) == basename)
+        || shell_allowed;
     if !matched {
         return NetDecision::Deny;
     }
@@ -135,6 +152,17 @@ fn classify_net_app(command: &str, allow_apps: &[String]) -> NetDecision {
         return NetDecision::DeniedByChaining;
     }
     NetDecision::Allow
+}
+
+fn should_grant_tier1a_network_capability(
+    net: NetDecision,
+    net_proxy_enforced: bool,
+    net_domain_policy_requested: bool,
+) -> bool {
+    if net_domain_policy_requested {
+        return net_proxy_enforced;
+    }
+    net == NetDecision::Allow
 }
 
 #[async_trait]
@@ -192,21 +220,62 @@ impl Tool for RunShellTool {
         let dur = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
         let mut env = harness_sandbox::build_child_env();
 
-        // 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）。
-        // `ctx.net_proxy.allow_domains`が空なら`spawn_local_proxy`は何もしない
-        // （既定挙動を変えない）。起動時のみ`HTTP_PROXY`/`HTTPS_PROXY`を子envへ足す。
-        let proxy = crate::net_proxy::spawn_local_proxy(&ctx.net_proxy)
+        // 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15、
+        // `plans/AppContainerを用いたドメインベース通信制御アーキテクチャ設計書.md` §5）。
+        // `ctx.net_proxy.domain_policy_enabled`なら、`allow_domains`が空でも全拒否ポリシーとして
+        // Proxy/Fake DNS監査経路を起動する。SOCKS5 remote DNSを主経路とする`ALL_PROXY`と、
+        // 既存HTTP(S)ツール互換の`HTTP_PROXY`/`HTTPS_PROXY`を子envへ足す。
+        let mut net_proxy = ctx.net_proxy.clone();
+        if net_proxy.audit_log_path.is_none() {
+            if let Some(sandbox_dir) = &ctx.staging.sandbox_dir {
+                net_proxy.audit_log_path =
+                    Some(ctx.workspace_root.join(sandbox_dir).join("net-audit.jsonl"));
+            }
+        }
+        let proxy = if net_proxy.proxy_addr.is_some() {
+            None
+        } else {
+            crate::net_proxy::spawn_local_proxy(&net_proxy)
+                .await
+                .ok()
+                .flatten()
+        };
+        let fake_dns = if net_proxy.fake_dns_addr.is_some() {
+            None
+        } else if net_proxy.domain_policy_enabled {
+            crate::fake_dns::spawn_fake_dns(&crate::fake_dns::FakeDnsConfig {
+                allow_domains: net_proxy.allow_domains.clone(),
+                policy_required: net_proxy.domain_policy_enabled,
+                audit_log_path: net_proxy.audit_log_path.clone(),
+                preferred_port: None,
+            })
             .await
             .ok()
-            .flatten();
-        if let Some(p) = &proxy {
-            let proxy_url = format!("http://{}", p.addr);
-            for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-                env.push((key.to_string(), proxy_url.clone()));
+        } else {
+            None
+        };
+        let proxy_addr = net_proxy
+            .proxy_addr
+            .or_else(|| proxy.as_ref().map(|p| p.addr));
+        let fake_dns_addr = net_proxy
+            .fake_dns_addr
+            .or_else(|| fake_dns.as_ref().map(|dns| dns.addr));
+        if let Some(addr) = proxy_addr {
+            let http_proxy_url = format!("http://{}", addr);
+            let socks_proxy_url = format!("socks5h://{}", addr);
+            for key in ["ALL_PROXY", "all_proxy"] {
+                env.push((key.to_string(), socks_proxy_url.clone()));
             }
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                env.push((key.to_string(), http_proxy_url.clone()));
+            }
+        }
+        if let Some(addr) = fake_dns_addr {
+            env.push(("HARNESS_FAKE_DNS_ADDR".to_string(), addr.to_string()));
         }
 
         let net_decision = classify_net_app(&input.command, &ctx.net_app.allow_apps);
+        let net_domain_policy_requested = ctx.net_proxy.domain_policy_enabled;
 
         let (out, err, code, shell_label) = run_isolated(
             &input.command,
@@ -215,6 +284,8 @@ impl Tool for RunShellTool {
             dur,
             ctx.shell_tier.tier,
             net_decision,
+            ctx.net_proxy.enforced_by_wfp && ctx.net_proxy.domain_policy_enabled,
+            net_domain_policy_requested,
             ctx.vm_sandbox.as_ref(),
         )
         .await?;
@@ -240,24 +311,44 @@ impl Tool for RunShellTool {
             ));
         }
         if !ctx.net_app.allow_apps.is_empty() {
-            match (net_decision, ctx.shell_tier.tier) {
-                (NetDecision::Allow, ShellTier::Tier1a) => {
+            match (
+                net_domain_policy_requested,
+                net_decision,
+                ctx.shell_tier.tier,
+            ) {
+                (true, _, ShellTier::Tier1a) if ctx.net_proxy.enforced_by_wfp => {
+                    content.push_str("\n[net: domain policy enforced; --net-allow-app ignored]");
+                }
+                (true, _, ShellTier::Tier1a) => {
+                    content.push_str(
+                        "\n[net: denied (domain policy requested but WFP enforcement is unavailable; \
+                         --net-allow-app ignored)]",
+                    );
+                }
+                (true, _, other_tier) => {
+                    content.push_str(&format!(
+                        "\n[net: denied (--net-allow-domain takes precedence over --net-allow-app; \
+                         current tier is {})]",
+                        other_tier.label()
+                    ));
+                }
+                (false, NetDecision::Allow, ShellTier::Tier1a) => {
                     content.push_str("\n[net: internetClient]");
                 }
-                (NetDecision::Allow, other_tier) => {
+                (false, NetDecision::Allow, other_tier) => {
                     content.push_str(&format!(
                         "\n[net: denied (--net-allow-app only takes effect under tier1a; \
                          current tier is {})]",
                         other_tier.label()
                     ));
                 }
-                (NetDecision::DeniedByChaining, _) => {
+                (false, NetDecision::DeniedByChaining, _) => {
                     content.push_str(
                         "\n[net: denied (chained command; issue the trusted app as a single \
                          command without |, &&, ;, & to allow network)]",
                     );
                 }
-                (NetDecision::Deny, _) => {
+                (false, NetDecision::Deny, _) => {
                     content.push_str("\n[net: denied]");
                 }
             }
@@ -274,12 +365,51 @@ impl Tool for RunShellTool {
                  shell process yet (D-08 simplification, see plans/DESIGN-SANDBOX.md §8-3)]",
             );
         }
-        if let Some(p) = &proxy {
-            let entries = p.audit.entries();
-            content.push_str("\n[net-proxy: audit-only, not enforced against raw sockets, see plans/DESIGN-SANDBOX-PRIVSEP.md §3.1]");
-            for e in &entries {
-                let verdict = if e.allowed { "ALLOW" } else { "DENY" };
-                content.push_str(&format!("\n[net-proxy: {verdict} {}]", e.host));
+        if proxy_addr.is_some() {
+            if ctx.net_proxy.enforced_by_wfp && ctx.shell_tier.tier == ShellTier::Tier1a {
+                content.push_str("\n[net-proxy: enforced-by-wfp]");
+            } else {
+                content.push_str("\n[net-proxy: audit-only, not enforced against raw sockets, see plans/DESIGN-SANDBOX-PRIVSEP.md §3.1]");
+            }
+            if let Some(p) = &proxy {
+                if let Some(path) = p.audit.path() {
+                    content.push_str(&format!("\n[net-proxy-audit: {}]", path.display()));
+                }
+            } else if let Some(path) = &net_proxy.audit_log_path {
+                content.push_str(&format!("\n[net-proxy-audit: {}]", path.display()));
+            }
+            if let Some(p) = &proxy {
+                for e in p.audit.entries() {
+                    let verdict = if e.allowed { "ALLOW" } else { "DENY" };
+                    content.push_str(&format!("\n[net-proxy: {verdict} {}]", e.host));
+                }
+            }
+        }
+        if let Some(dns) = &fake_dns {
+            content.push_str(&format!(
+                "\n[net-fakedns: diagnostic-only addr={}]",
+                dns.addr
+            ));
+            if let Some(path) = dns.audit.path() {
+                content.push_str(&format!("\n[net-fakedns-audit: {}]", path.display()));
+            }
+            for e in dns.audit.entries() {
+                content.push_str(&format!(
+                    "\n[net-fakedns: QUERY {} {} fake_ip={}]",
+                    e.qtype,
+                    e.host,
+                    e.fake_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                ));
+            }
+        }
+        if fake_dns.is_none() {
+            if let Some(addr) = net_proxy.fake_dns_addr {
+                content.push_str(&format!("\n[net-fakedns: diagnostic-only addr={addr}]"));
+                if let Some(path) = &net_proxy.audit_log_path {
+                    content.push_str(&format!("\n[net-fakedns-audit: {}]", path.display()));
+                }
             }
         }
 
@@ -308,6 +438,8 @@ async fn run_isolated(
     dur: Duration,
     tier: ShellTier,
     net: NetDecision,
+    net_proxy_enforced: bool,
+    net_domain_policy_requested: bool,
     vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     // Tier1a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
@@ -319,7 +451,16 @@ async fn run_isolated(
     #[cfg(windows)]
     {
         if tier == ShellTier::Tier1a {
-            return run_windows_tier1a(command, cwd, env, dur, net).await;
+            return run_windows_tier1a(
+                command,
+                cwd,
+                env,
+                dur,
+                net,
+                net_proxy_enforced,
+                net_domain_policy_requested,
+            )
+            .await;
         }
         if tier == ShellTier::Tier1b {
             return run_windows_tier1b(command, cwd, env, dur).await;
@@ -440,6 +581,8 @@ async fn run_windows_tier1a(
     env: &[(String, String)],
     dur: Duration,
     net: NetDecision,
+    net_proxy_enforced: bool,
+    net_domain_policy_requested: bool,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let _ = std::fs::create_dir_all(cwd);
     let sid = harness_sandbox::win_appcontainer::ensure_profile(
@@ -456,11 +599,14 @@ async fn run_windows_tier1a(
 
     // アプリ単位network制御（軸1、D-10/D-11）。`Allow`のときのみ`internetClient`を付与する
     // （`DeniedByChaining`/`Deny`はどちらも既定のcapability空＝network全遮断のまま）。
-    let net_capability = match net {
-        NetDecision::Allow => harness_sandbox::win_appcontainer::NetworkCapability::InternetClient,
-        NetDecision::Deny | NetDecision::DeniedByChaining => {
-            harness_sandbox::win_appcontainer::NetworkCapability::Deny
-        }
+    let net_capability = if should_grant_tier1a_network_capability(
+        net,
+        net_proxy_enforced,
+        net_domain_policy_requested,
+    ) {
+        harness_sandbox::win_appcontainer::NetworkCapability::InternetClient
+    } else {
+        harness_sandbox::win_appcontainer::NetworkCapability::Deny
     };
 
     let child = harness_sandbox::win_appcontainer::spawn(
@@ -799,6 +945,30 @@ mod tests {
     fn classify_net_app_denies_empty_command() {
         let allow = vec!["git".to_string()];
         assert_eq!(classify_net_app("", &allow), NetDecision::Deny);
+    }
+
+    #[test]
+    fn domain_policy_takes_precedence_over_net_allow_app_for_tier1a_capability() {
+        assert!(should_grant_tier1a_network_capability(
+            NetDecision::Allow,
+            false,
+            false
+        ));
+        assert!(!should_grant_tier1a_network_capability(
+            NetDecision::Allow,
+            false,
+            true
+        ));
+        assert!(should_grant_tier1a_network_capability(
+            NetDecision::Deny,
+            true,
+            true
+        ));
+        assert!(!should_grant_tier1a_network_capability(
+            NetDecision::Deny,
+            false,
+            true
+        ));
     }
 
     #[tokio::test]
@@ -1301,12 +1471,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut context = ctx(dir.path().to_path_buf());
         context.net_proxy = harness_core::NetProxyConfig {
-            allow_domains: vec!["127.0.0.1".to_string()],
+            allow_domains: vec!["localhost".to_string()],
+            ..Default::default()
         };
         let tool = RunShellTool;
 
         let command = format!(
-            "curl.exe -s -o allowed.txt -w 'ALLOWED_STATUS=%{{http_code}}' http://127.0.0.1:{target_port}/; \
+            "curl.exe -s -w 'ALLOWED_STATUS=%{{http_code}}' http://localhost:{target_port}/; \
              curl.exe -s -o NUL -w ' DENIED_STATUS=%{{http_code}}' http://notallowed.invalid.example/"
         );
         let out = tool
@@ -1327,7 +1498,7 @@ mod tests {
             out.content
         );
         assert!(
-            out.content.contains("[net-proxy: ALLOW 127.0.0.1]"),
+            out.content.contains("[net-proxy: ALLOW localhost]"),
             "audit log should record the allowed request: {}",
             out.content
         );
@@ -1337,8 +1508,87 @@ mod tests {
             "audit log should record the denied request: {}",
             out.content
         );
+        assert!(
+            out.content.contains("hello"),
+            "curl should receive the allowed response body: {}",
+            out.content
+        );
+    }
 
-        let allowed_body = std::fs::read_to_string(dir.path().join("allowed.txt")).unwrap();
-        assert_eq!(allowed_body, "hello");
+    #[tokio::test]
+    async fn run_shell_net_proxy_starts_fake_dns_diagnostic_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = ctx(dir.path().to_path_buf());
+        context.net_proxy = harness_core::NetProxyConfig {
+            allow_domains: vec!["example.com".to_string()],
+            ..Default::default()
+        };
+        let tool = RunShellTool;
+
+        let out = tool
+            .call(
+                json!({ "command": "Write-Output $env:HARNESS_FAKE_DNS_ADDR" }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.content.contains("127.0.0.1:"),
+            "fake DNS diagnostic address should be injected into child env: {}",
+            out.content
+        );
+        assert!(
+            out.content
+                .contains("[net-fakedns: diagnostic-only addr=127.0.0.1:"),
+            "run_shell footer should describe the fake DNS diagnostic agent: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn run_shell_uses_session_scoped_proxy_and_fake_dns_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = ctx(dir.path().to_path_buf());
+        context.net_proxy = harness_core::NetProxyConfig {
+            allow_domains: vec!["example.com".to_string()],
+            proxy_addr: Some("127.0.0.1:18080".parse().unwrap()),
+            fake_dns_addr: Some("127.0.0.1:18053".parse().unwrap()),
+            audit_log_path: Some(dir.path().join("net-audit.jsonl")),
+            ..Default::default()
+        };
+        let tool = RunShellTool;
+
+        let out = tool
+            .call(
+                json!({
+                    "command": "Write-Output $env:ALL_PROXY; Write-Output $env:HARNESS_FAKE_DNS_ADDR"
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.content.contains("socks5h://127.0.0.1:18080"),
+            "session proxy address should be injected: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("127.0.0.1:18053"),
+            "session Fake DNS address should be injected: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("[net-proxy-audit:"),
+            "session proxy footer should still point at the JSONL audit log: {}",
+            out.content
+        );
+        assert!(
+            out.content
+                .contains("[net-fakedns: diagnostic-only addr=127.0.0.1:18053]"),
+            "session Fake DNS footer should describe the diagnostic agent: {}",
+            out.content
+        );
     }
 }

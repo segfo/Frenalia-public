@@ -308,15 +308,47 @@ fn tier_line(tier: ShellTier) -> String {
 }
 
 fn render_net_proxy(net_proxy: &NetProxyConfig) -> Option<String> {
-    let NetProxyConfig { allow_domains } = net_proxy;
-    if allow_domains.is_empty() {
+    let NetProxyConfig {
+        allow_domains,
+        domain_policy_enabled,
+        enforced_by_wfp,
+        audit_log_path: _,
+        proxy_addr: _,
+        fake_dns_addr: _,
+    } = net_proxy;
+    if !*domain_policy_enabled {
         return None;
     }
-    Some(format!(
-        "協調プロキシ（HTTP_PROXY/HTTPS_PROXY）経由で次のドメインのみ許可されています: {}。\
-         これは強制ではなく、環境変数を読まず生ソケットを開く子プロセスは素通りできます。",
-        allow_domains.join("、")
-    ))
+    if allow_domains.is_empty() {
+        if *enforced_by_wfp {
+            return Some(
+                "強制ネットワークプロキシ（ALL_PROXY=socks5h、HTTP_PROXY/HTTPS_PROXY）経由の\
+                 ドメイン制御が有効です。許可ドメインは未指定のため、外向き通信は全て拒否され、\
+                 Proxyを使わない外部直通もWFPで拒否されます。"
+                    .to_string(),
+            );
+        }
+        return Some(
+            "協調プロキシ（ALL_PROXY=socks5h、HTTP_PROXY/HTTPS_PROXY）経由のドメイン制御が\
+             有効です。許可ドメインは未指定のため、Proxy経由の外向き通信は全て拒否されます。\
+             これは強制ではなく、環境変数を読まず生ソケットを開く子プロセスは素通りできます。"
+                .to_string(),
+        );
+    }
+    if *enforced_by_wfp {
+        Some(format!(
+            "強制ネットワークプロキシ（ALL_PROXY=socks5h、HTTP_PROXY/HTTPS_PROXY）経由で次の\
+             ドメインのみ許可されています: {}。Proxyを使わない外部直通はWFPで拒否されます。",
+            allow_domains.join("、")
+        ))
+    } else {
+        Some(format!(
+            "協調プロキシ（ALL_PROXY=socks5h、HTTP_PROXY/HTTPS_PROXY）経由で次のドメインのみ\
+             許可されています: {}。これは強制ではなく、環境変数を読まず生ソケットを開く\
+             子プロセスは素通りできます。",
+            allow_domains.join("、")
+        ))
+    }
 }
 
 fn render_net_app(net_app: &NetAppPolicy) -> Option<String> {
@@ -409,7 +441,10 @@ mod tests {
         assert!(rendered.contains("Incusコンテナで`sh -c`"));
         assert!(rendered.contains("POSIX sh互換"));
         assert!(rendered.contains("OS: Tier3のLinuxコンテナ実行環境"));
-        assert!(!rendered.contains("OS: Windowsホスト上のTier3"), "{rendered}");
+        assert!(
+            !rendered.contains("OS: Windowsホスト上のTier3"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("run_shellはPowerShell"), "{rendered}");
     }
 

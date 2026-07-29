@@ -156,7 +156,7 @@ pub struct ShellTierSelection {
     /// `preflight`が実際に試みたか。`true`なら呼び出し元（`harness-cli`）は特権分離ヘルパー
     /// 経由で`harness-netfilterd`が起動済み（またはベストエフォートで失敗済み）と見なし、
     /// シナリオ(B)（直接`runas`起動）を重ねて行わない。`false`なら連鎖起動を試みていないため、
-    /// `net.allow_domains`が非空ならシナリオ(B)へフォールバックする必要がある。
+    /// ドメインポリシー監査が有効ならシナリオ(B)へフォールバックする必要がある。
     pub netfilterd_chain_attempted: bool,
 }
 
@@ -216,17 +216,46 @@ impl Default for ShellTierSelection {
     }
 }
 
-/// 協調プロキシ設定（`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）。`run_shell`子へ
-/// `HTTP_PROXY`/`HTTPS_PROXY`として注入するローカルプロキシの許可ドメインを運ぶ。
-/// **強制ではない**: 環境変数を読まず生ソケットを直接開く子はこの制御を素通りできる
-/// （既知の限界として明示、`harness-tools::net_proxy`参照）。`harness-core`は値を運ぶだけ、
-/// 判定・プロキシ実体は`harness-tools::net_proxy`（`StagingConfig`/`ReadScopeConfig`と同じ
-/// 役割分担）。
-#[derive(Debug, Clone, Default)]
+/// ドメイン単位network制御設定（`plans/AppContainerを用いたドメインベース通信制御アーキテクチャ設計書.md`）。
+/// `run_shell`子へ`ALL_PROXY=socks5h://...`と`HTTP_PROXY`/`HTTPS_PROXY`を注入するLocal Proxy
+/// Agentの許可ドメインを運ぶ。Tier1aでWFP default-deny + loopback実ポート限定allowを併用できる
+/// 場合のみ、Proxy非対応の直接connect/raw socketも強制的に遮断できる。WFPが無いTierや
+/// `enforced_by_wfp=false`では協調Proxyに留まり、その限界は`run_shell`出力へ明記する。
+/// `harness-core`は値を運ぶだけ、判定・Proxy/Fake DNS実体は`harness-tools`、WFP強制は
+/// `harness-sandbox`が担う（`StagingConfig`/`ReadScopeConfig`と同じ役割分担）。
+#[derive(Debug, Clone)]
 pub struct NetProxyConfig {
     /// 許可ドメイン（`*.example.com`形式のサフィックスワイルドカードに対応）。空なら
-    /// プロキシ自体を起動しない（既定は何もしない＝現状維持、`run_shell`出力は変わらない）。
+    /// `domain_policy_enabled=true`のもとで全拒否ポリシーとして扱う。
     pub allow_domains: Vec<String>,
+    /// ドメイン単位network制御を起動するか。既定true: 許可ドメインが空でもProxy/Fake DNS/WFP
+    /// 監査経路を起動し、全拒否を`net-audit.jsonl`へ残す。falseはテスト・内部互換用。
+    pub domain_policy_enabled: bool,
+    /// Tier1aでWFP default-deny + loopback allowが有効化されており、Proxy経由通信に必要な
+    /// AppContainer network capabilityを安全に付与できるか。falseならfail-closedのため、
+    /// `--net-allow-domain`だけではTier1a子へ`internetClient`を付けない。
+    pub enforced_by_wfp: bool,
+    /// 詳細監査ログのJSONL出力先。`None`なら従来通りプロセス内メモリの短いサマリだけを保持する。
+    pub audit_log_path: Option<std::path::PathBuf>,
+    /// CLIがセッションスコープで先に起動したLocal Proxy Agentの待受アドレス。`Some`なら
+    /// `run_shell`は新規Proxyを起動せず、このアドレスを子プロセスenvへ注入する。
+    pub proxy_addr: Option<std::net::SocketAddr>,
+    /// CLIがセッションスコープで先に起動したFake DNS Agentの待受アドレス。`Some`なら
+    /// `run_shell`は新規Fake DNSを起動せず、このアドレスを診断envへ注入する。
+    pub fake_dns_addr: Option<std::net::SocketAddr>,
+}
+
+impl Default for NetProxyConfig {
+    fn default() -> Self {
+        Self {
+            allow_domains: Vec::new(),
+            domain_policy_enabled: true,
+            enforced_by_wfp: false,
+            audit_log_path: None,
+            proxy_addr: None,
+            fake_dns_addr: None,
+        }
+    }
 }
 
 /// アプリ単位network制御設定（軸1、`plans/DESIGN-SANDBOX-APPPOLICY.md` D-10/D-11）。
@@ -308,7 +337,7 @@ pub struct ToolCtx {
     /// 実行時は`harness-cli`が起動時に1回選択した値を積む。
     pub shell_tier: ShellTierSelection,
     /// 協調プロキシ設定（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）。既定
-    /// （`NetProxyConfig::default()`＝`allow_domains`空）はプロキシを起動しない。
+    /// （`NetProxyConfig::default()`＝空allowlistの全拒否監査）はプロキシを起動する。
     pub net_proxy: NetProxyConfig,
     /// アプリ単位network制御（軸1、D-10/D-11）。既定（`NetAppPolicy::default()`＝`allow_apps`空）は
     /// 常にdeny（Tier1a子はcapability空でnetwork全遮断＝現状維持）。

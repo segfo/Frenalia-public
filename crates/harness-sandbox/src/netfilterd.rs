@@ -39,20 +39,19 @@ use serde::{Deserialize, Serialize};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
-    HLOCAL, LocalFree, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED,
+    HANDLE, HLOCAL, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_USER, TokenUser,
+    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_WAIT,
@@ -60,12 +59,13 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject,
 };
-use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
+use crate::wfp::{WfpOptions, WfpSession};
 use crate::win_appcontainer::{self, CONTAINER_NAME};
 use crate::win_common::wide;
-use crate::wfp::{WfpOptions, WfpSession};
 
 /// 親→daemonへ送るメッセージ。1セッションで`ApplyRules`→`Teardown`の順に2回送る。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +73,15 @@ pub enum NetfilterRequest {
     ApplyRules {
         allow_domains: Vec<String>,
         allow_loopback: bool,
+        #[serde(default)]
+        allow_loopback_ports: Vec<u16>,
+        #[serde(default)]
+        allow_loopback_tcp_ports: Vec<u16>,
+        #[serde(default)]
+        allow_loopback_udp_ports: Vec<u16>,
         allow_direct_dns: bool,
+        #[serde(default)]
+        audit_log_path: Option<PathBuf>,
     },
     Teardown,
 }
@@ -119,7 +127,11 @@ const DAEMON_WAIT_FOR_TEARDOWN_TIMEOUT: std::time::Duration =
 fn current_user_sid_string() -> windows::core::Result<String> {
     unsafe {
         let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), windows::Win32::Security::TOKEN_QUERY, &mut token)?;
+        OpenProcessToken(
+            GetCurrentProcess(),
+            windows::Win32::Security::TOKEN_QUERY,
+            &mut token,
+        )?;
 
         let mut ret_len = 0u32;
         let _ = GetTokenInformation(token, TokenUser, None, 0, &mut ret_len);
@@ -213,7 +225,9 @@ where
                     return Ok(0);
                 } else {
                     let _ = CloseHandle(event);
-                    return Err(NetfilterError::Ipc(format!("{op_name} failed to start: {e}")));
+                    return Err(NetfilterError::Ipc(format!(
+                        "{op_name} failed to start: {e}"
+                    )));
                 }
             }
         };
@@ -348,7 +362,9 @@ unsafe fn launch_daemon_elevated(
                 "UAC prompt was canceled by the user".to_string(),
             ));
         }
-        return Err(NetfilterError::Win32(format!("ShellExecuteExW failed: {err:?}")));
+        return Err(NetfilterError::Win32(format!(
+            "ShellExecuteExW failed: {err:?}"
+        )));
     }
 
     Ok(info.hProcess)
@@ -445,7 +461,11 @@ fn connect_and_apply(
     daemon_process: Option<HANDLE>,
     allow_domains: Vec<String>,
     allow_loopback: bool,
+    allow_loopback_ports: Vec<u16>,
+    allow_loopback_tcp_ports: Vec<u16>,
+    allow_loopback_udp_ports: Vec<u16>,
     allow_direct_dns: bool,
+    audit_log_path: Option<PathBuf>,
 ) -> Result<NetfilterHandle, NetfilterError> {
     let connect_result = connect_with_timeout(pipe, CONNECT_TIMEOUT).map_err(|e| {
         NetfilterError::Ipc(format!(
@@ -466,7 +486,11 @@ fn connect_and_apply(
     let req = NetfilterRequest::ApplyRules {
         allow_domains,
         allow_loopback,
+        allow_loopback_ports,
+        allow_loopback_tcp_ports,
+        allow_loopback_udp_ports,
         allow_direct_dns,
+        audit_log_path,
     };
     let apply_result = (|| -> Result<(), NetfilterError> {
         let bytes = serde_json::to_vec(&req)
@@ -485,7 +509,10 @@ fn connect_and_apply(
     })();
 
     match apply_result {
-        Ok(()) => Ok(NetfilterHandle { pipe, daemon_process }),
+        Ok(()) => Ok(NetfilterHandle {
+            pipe,
+            daemon_process,
+        }),
         Err(e) => {
             unsafe {
                 let _ = DisconnectNamedPipe(pipe);
@@ -505,7 +532,11 @@ impl NetfilterHandle {
     pub fn start(
         allow_domains: Vec<String>,
         allow_loopback: bool,
+        allow_loopback_ports: Vec<u16>,
+        allow_loopback_tcp_ports: Vec<u16>,
+        allow_loopback_udp_ports: Vec<u16>,
         allow_direct_dns: bool,
+        audit_log_path: Option<PathBuf>,
     ) -> Result<Self, NetfilterError> {
         let prepared = prepare_pipe()?;
         let pipe_name = prepared.name().to_string();
@@ -522,7 +553,17 @@ impl NetfilterHandle {
             }
         };
 
-        connect_and_apply(pipe, Some(daemon_process), allow_domains, allow_loopback, allow_direct_dns)
+        connect_and_apply(
+            pipe,
+            Some(daemon_process),
+            allow_domains,
+            allow_loopback,
+            allow_loopback_ports,
+            allow_loopback_tcp_ports,
+            allow_loopback_udp_ports,
+            allow_direct_dns,
+            audit_log_path,
+        )
     }
 
     /// 既に（特権分離ヘルパー経由で）daemonの起動を依頼済みのパイプへ接続し、`ApplyRules`を
@@ -533,9 +574,23 @@ impl NetfilterHandle {
         pipe: HANDLE,
         allow_domains: Vec<String>,
         allow_loopback: bool,
+        allow_loopback_ports: Vec<u16>,
+        allow_loopback_tcp_ports: Vec<u16>,
+        allow_loopback_udp_ports: Vec<u16>,
         allow_direct_dns: bool,
+        audit_log_path: Option<PathBuf>,
     ) -> Result<Self, NetfilterError> {
-        connect_and_apply(pipe, None, allow_domains, allow_loopback, allow_direct_dns)
+        connect_and_apply(
+            pipe,
+            None,
+            allow_domains,
+            allow_loopback,
+            allow_loopback_ports,
+            allow_loopback_tcp_ports,
+            allow_loopback_udp_ports,
+            allow_direct_dns,
+            audit_log_path,
+        )
     }
 
     /// `Teardown`を送ってdaemonの終了を待つ（対象アプリ終了を検知した親から呼ぶ、正常系）。
@@ -570,8 +625,7 @@ impl NetfilterHandle {
             if let Some(daemon_process) = daemon_process {
                 let wait = WaitForSingleObject(daemon_process, 5000);
                 if wait != WAIT_OBJECT_0 {
-                    let _ =
-                        windows::Win32::System::Threading::TerminateProcess(daemon_process, 1);
+                    let _ = windows::Win32::System::Threading::TerminateProcess(daemon_process, 1);
                     let _ = WaitForSingleObject(daemon_process, 2000);
                 }
                 let _ = CloseHandle(daemon_process);
@@ -623,27 +677,45 @@ pub fn serve(pipe_name: &str) -> Result<(), NetfilterError> {
 fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
     // 1回目: ApplyRules を待つ。
     let request_bytes = read_framed_timeout(pipe, APPLY_RESPONSE_TIMEOUT)?;
-    let (allow_domains, allow_loopback, allow_direct_dns) =
-        match serde_json::from_slice::<NetfilterRequest>(&request_bytes) {
-            Ok(NetfilterRequest::ApplyRules {
-                allow_domains,
-                allow_loopback,
-                allow_direct_dns,
-            }) => (allow_domains, allow_loopback, allow_direct_dns),
-            Ok(NetfilterRequest::Teardown) => {
-                let resp = NetfilterResponse::Err(
-                    "expected ApplyRules as the first message, got Teardown".to_string(),
-                );
-                send_response(pipe, &resp)?;
-                return Err(NetfilterError::Ipc("protocol violation".to_string()));
-            }
-            Err(e) => {
-                let resp =
-                    NetfilterResponse::Err(format!("malformed ApplyRules request: {e}"));
-                send_response(pipe, &resp)?;
-                return Err(NetfilterError::Ipc(format!("malformed request: {e}")));
-            }
-        };
+    let (
+        allow_domains,
+        allow_loopback,
+        allow_loopback_ports,
+        allow_loopback_tcp_ports,
+        allow_loopback_udp_ports,
+        allow_direct_dns,
+        audit_log_path,
+    ) = match serde_json::from_slice::<NetfilterRequest>(&request_bytes) {
+        Ok(NetfilterRequest::ApplyRules {
+            allow_domains,
+            allow_loopback,
+            allow_loopback_ports,
+            allow_loopback_tcp_ports,
+            allow_loopback_udp_ports,
+            allow_direct_dns,
+            audit_log_path,
+        }) => (
+            allow_domains,
+            allow_loopback,
+            allow_loopback_ports,
+            allow_loopback_tcp_ports,
+            allow_loopback_udp_ports,
+            allow_direct_dns,
+            audit_log_path,
+        ),
+        Ok(NetfilterRequest::Teardown) => {
+            let resp = NetfilterResponse::Err(
+                "expected ApplyRules as the first message, got Teardown".to_string(),
+            );
+            send_response(pipe, &resp)?;
+            return Err(NetfilterError::Ipc("protocol violation".to_string()));
+        }
+        Err(e) => {
+            let resp = NetfilterResponse::Err(format!("malformed ApplyRules request: {e}"));
+            send_response(pipe, &resp)?;
+            return Err(NetfilterError::Ipc(format!("malformed request: {e}")));
+        }
+    };
 
     let sid = match win_appcontainer::ensure_profile(CONTAINER_NAME) {
         Ok(sid) => sid,
@@ -657,7 +729,11 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
     let opts = WfpOptions {
         allow_domains,
         allow_loopback,
+        allow_loopback_ports,
+        allow_loopback_tcp_ports,
+        allow_loopback_udp_ports,
         allow_direct_dns,
+        audit_log_path,
     };
     let session = match WfpSession::apply(sid.as_psid(), &opts) {
         Ok(s) => s,
@@ -710,7 +786,11 @@ mod tests {
         let req = NetfilterRequest::ApplyRules {
             allow_domains: vec!["github.com".to_string(), "api.anthropic.com".to_string()],
             allow_loopback: true,
+            allow_loopback_ports: vec![18080, 18053],
+            allow_loopback_tcp_ports: vec![18080, 18053],
+            allow_loopback_udp_ports: vec![18053],
             allow_direct_dns: false,
+            audit_log_path: Some(PathBuf::from(".harness/sandbox/session-x/net-audit.jsonl")),
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: NetfilterRequest = serde_json::from_slice(&bytes).unwrap();
@@ -718,14 +798,25 @@ mod tests {
             NetfilterRequest::ApplyRules {
                 allow_domains,
                 allow_loopback,
+                allow_loopback_ports,
+                allow_loopback_tcp_ports,
+                allow_loopback_udp_ports,
                 allow_direct_dns,
+                audit_log_path,
             } => {
                 assert_eq!(
                     allow_domains,
                     vec!["github.com".to_string(), "api.anthropic.com".to_string()]
                 );
                 assert!(allow_loopback);
+                assert_eq!(allow_loopback_ports, vec![18080, 18053]);
+                assert_eq!(allow_loopback_tcp_ports, vec![18080, 18053]);
+                assert_eq!(allow_loopback_udp_ports, vec![18053]);
                 assert!(!allow_direct_dns);
+                assert_eq!(
+                    audit_log_path,
+                    Some(PathBuf::from(".harness/sandbox/session-x/net-audit.jsonl"))
+                );
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -761,6 +852,26 @@ mod tests {
         let garbage = b"{\"not\":\"a valid NetfilterRequest\"}";
         let result = serde_json::from_slice::<NetfilterRequest>(garbage);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn apply_rules_request_accepts_legacy_json_without_loopback_ports() {
+        let legacy =
+            r#"{"ApplyRules":{"allow_domains":[],"allow_loopback":true,"allow_direct_dns":false}}"#;
+        let decoded: NetfilterRequest = serde_json::from_str(legacy).unwrap();
+        match decoded {
+            NetfilterRequest::ApplyRules {
+                allow_loopback_ports,
+                allow_loopback_tcp_ports,
+                allow_loopback_udp_ports,
+                ..
+            } => {
+                assert!(allow_loopback_ports.is_empty());
+                assert!(allow_loopback_tcp_ports.is_empty());
+                assert!(allow_loopback_udp_ports.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     fn short_timeout() -> std::time::Duration {

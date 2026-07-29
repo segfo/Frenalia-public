@@ -53,7 +53,11 @@ impl Tool for WebFetchTool {
         RiskClass::Network
     }
 
-    async fn call(&self, input: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn call(
+        &self,
+        input: serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         let input: WebFetchInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let max_bytes = input.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
@@ -99,9 +103,9 @@ impl Tool for WebFetchTool {
                     .ok_or_else(|| {
                         ToolError::ExecutionFailed("redirect without Location header".to_string())
                     })?;
-                current_url = current_url
-                    .join(location)
-                    .map_err(|e| ToolError::ExecutionFailed(format!("invalid redirect target: {e}")))?;
+                current_url = current_url.join(location).map_err(|e| {
+                    ToolError::ExecutionFailed(format!("invalid redirect target: {e}"))
+                })?;
                 continue;
             }
 
@@ -120,14 +124,18 @@ impl Tool for WebFetchTool {
     }
 }
 
-async fn read_body_limited(resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, ToolError> {
+async fn read_body_limited(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ToolError> {
     use futures_util::StreamExt;
 
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
     let mut truncated = false;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ToolError::ExecutionFailed(format!("body read failed: {e}")))?;
+        let chunk =
+            chunk.map_err(|e| ToolError::ExecutionFailed(format!("body read failed: {e}")))?;
         if buf.len() + chunk.len() > max_bytes {
             let remaining = max_bytes.saturating_sub(buf.len());
             buf.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
@@ -146,9 +154,7 @@ async fn read_body_limited(resp: reqwest::Response, max_bytes: usize) -> Result<
 /// （resolve-and-pin、§ツールシステム web_fetch）。
 async fn resolve_pinned(host: &str, port: u16) -> Result<IpAddr, ToolError> {
     if is_blocked_hostname(host) {
-        return Err(ToolError::InvalidInput(format!(
-            "blocked hostname: {host}"
-        )));
+        return Err(ToolError::InvalidInput(format!("blocked hostname: {host}")));
     }
 
     if let Ok(ip) = host.parse::<IpAddr>() {

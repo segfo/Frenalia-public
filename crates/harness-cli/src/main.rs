@@ -19,13 +19,17 @@
 //! `apply`/`changes`/`discard`サブコマンドを追加した。
 
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
 use harness_cli::{run_headless, OutputFormat};
-use harness_core::{LlmProvider, RequireSandbox, StagingConfig, StagingMode, ToolCtx};
+use harness_core::{
+    normalize_domain_pattern, LlmProvider, NetProxyConfig, RequireSandbox, StagingConfig,
+    StagingMode, ToolCtx,
+};
 use harness_engine::{
     parse_allowlist_rule, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode,
 };
@@ -119,6 +123,11 @@ enum Commands {
         #[command(subcommand)]
         action: Tier3Action,
     },
+    /// ネットワーク監査ログ（`net-audit.jsonl`）を表示する。
+    Net {
+        #[command(subcommand)]
+        action: NetAction,
+    },
     /// 現在のフラグ・`.harness/settings.json`構成から実際に組み立てられるシステムプロンプト
     /// （`harness_core::EnvironmentFacts`のレンダリング結果）をそのまま標準出力へ出して終了する。
     /// 「今モデルは何を知らされているのか」を確認するための読み取り専用診断コマンド
@@ -139,6 +148,28 @@ enum Tier3Action {
     Gc,
     /// アクティブセッションが無い場合だけ常駐Tier3 daemonを終了する。
     StopDaemon,
+}
+
+/// `harness net`サブコマンドの各操作。
+#[derive(Subcommand)]
+enum NetAction {
+    /// セッション単位の`net-audit.jsonl`を表示する。
+    Audit {
+        /// 対象セッションID（省略時は`.harness/sandbox/`内で最も新しいもの）。
+        #[arg(long)]
+        session: Option<String>,
+        /// 監査ログJSONLへの直接パス。指定時は`--session`より優先する。
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// `proxy` / `fake_dns` / `wfp` など、kindで絞り込む。
+        #[arg(long)]
+        kind: Option<String>,
+        /// 拒否イベントだけを表示する。
+        #[arg(long = "deny-only", default_value_t = false)]
+        deny_only: bool,
+        #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
+    },
 }
 
 /// `harness fs`サブコマンドの各操作。Windows Tier1a固有機能のため、Windows以外では
@@ -324,11 +355,13 @@ struct Cli {
     #[arg(long = "tier3-max-sessions", default_value_t = 4)]
     tier3_max_sessions: u8,
 
-    /// 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15）の許可ドメインを
-    /// 追加する（繰り返し指定可、`*.example.com`形式のサフィックスワイルドカード対応）。
-    /// `.harness/settings.json`の`net.allow_domains`と合算する（和集合）。1つでも指定される
-    /// と`run_shell`子へ`HTTP_PROXY`/`HTTPS_PROXY`を注入するローカルプロキシが起動する
-    /// （**強制ではない**、環境変数を無視する生ソケット呼び出しはバイパスできる）。
+    /// ドメイン単位network制御の許可ドメインを追加する（繰り返し指定可、
+    /// `*.example.com`形式のサフィックスワイルドカード対応）。
+    /// `.harness/settings.json`の`net.allow_domains`と合算する（和集合）。`run_shell`子には既定で
+    /// `ALL_PROXY=socks5h://...`と`HTTP_PROXY`/`HTTPS_PROXY`を注入するLocal Proxy Agentが起動し、
+    /// 許可ドメイン未指定なら全拒否として監査ログに残す。Tier1aでWFPが使える場合は外部直通を
+    /// default-denyし、Proxy/Fake DNSのloopback実ポートだけを許可する。WFPが使えない場合は
+    /// 協調Proxyとして動作し、外部直通を強制遮断できないことを出力へ明記する。
     #[arg(long = "net-allow-domain")]
     net_allow_domain: Vec<String>,
 
@@ -550,6 +583,194 @@ fn print_session_list(summaries: &[harness_engine::SessionSummary], format: Outp
     }
 }
 
+fn net_audit_path(
+    workspace_root: &Path,
+    session: Option<&str>,
+    explicit_path: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(path) = explicit_path {
+        return Some(path.to_path_buf());
+    }
+    resolve_sandbox_dir(workspace_root, session)
+        .map(|dir| workspace_root.join(dir).join("net-audit.jsonl"))
+}
+
+fn validate_and_merge_net_allow_domains(
+    net_proxy: &mut NetProxyConfig,
+    cli_domains: &[String],
+) -> Result<(), String> {
+    let mut normalized = Vec::new();
+    for domain in &net_proxy.allow_domains {
+        let domain = normalize_domain_pattern(domain)?;
+        if !normalized.contains(&domain) {
+            normalized.push(domain);
+        }
+    }
+    for domain in cli_domains {
+        let domain = normalize_domain_pattern(domain)?;
+        if !normalized.contains(&domain) {
+            normalized.push(domain);
+        }
+    }
+    net_proxy.allow_domains = normalized;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetLoopbackPorts {
+    tcp: Vec<u16>,
+    udp: Vec<u16>,
+}
+
+fn sorted_unique_ports(mut ports: Vec<u16>) -> Vec<u16> {
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn net_loopback_ports_for_agents(
+    proxy_addr: Option<SocketAddr>,
+    fake_dns_addr: Option<SocketAddr>,
+) -> NetLoopbackPorts {
+    let mut tcp = Vec::new();
+    let mut udp = Vec::new();
+    if let Some(addr) = proxy_addr {
+        tcp.push(addr.port());
+    }
+    if let Some(addr) = fake_dns_addr {
+        tcp.push(addr.port());
+        udp.push(addr.port());
+    }
+    NetLoopbackPorts {
+        tcp: sorted_unique_ports(tcp),
+        udp: sorted_unique_ports(udp),
+    }
+}
+
+fn event_string<'a>(event: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    event.get(key).and_then(|v| v.as_str())
+}
+
+fn event_bool(event: &serde_json::Value, key: &str) -> Option<bool> {
+    event.get(key).and_then(|v| v.as_bool())
+}
+
+fn event_u64(event: &serde_json::Value, key: &str) -> Option<u64> {
+    event.get(key).and_then(|v| v.as_u64())
+}
+
+fn filter_net_audit_events(
+    events: Vec<serde_json::Value>,
+    kind: Option<&str>,
+    deny_only: bool,
+) -> Vec<serde_json::Value> {
+    events
+        .into_iter()
+        .filter(|event| {
+            if let Some(kind) = kind {
+                if event_string(event, "kind") != Some(kind) {
+                    return false;
+                }
+            }
+            if deny_only && event_bool(event, "allowed") != Some(false) {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+fn format_net_audit_text(events: &[serde_json::Value]) -> String {
+    if events.is_empty() {
+        return "(no matching net audit events)\n".to_string();
+    }
+    let mut output = String::new();
+    for event in events {
+        let kind = event_string(event, "kind").unwrap_or("unknown");
+        let protocol = event_string(event, "protocol").unwrap_or("-");
+        let allowed = event_bool(event, "allowed")
+            .map(|v| if v { "ALLOW" } else { "DENY" })
+            .unwrap_or("-");
+        let reason = event_string(event, "reason").unwrap_or("-");
+        let host = event_string(event, "host")
+            .or_else(|| event_string(event, "remote_host"))
+            .unwrap_or("-");
+        let port = event_u64(event, "port")
+            .or_else(|| event_u64(event, "remote_port"))
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let remote = event_string(event, "remote_addr").unwrap_or("-");
+        output.push_str(&format!(
+            "{kind:<8} {protocol:<8} {allowed:<5} {host:<40} {port:<5} {remote:<39} {reason}\n"
+        ));
+    }
+    output
+}
+
+fn format_net_audit_output(events: &[serde_json::Value], output_format: OutputFormat) -> String {
+    match output_format {
+        OutputFormat::Json => serde_json::to_string(events).unwrap_or_else(|_| "[]".to_string()),
+        OutputFormat::Jsonl => {
+            let mut output = String::new();
+            for event in events {
+                if let Ok(s) = serde_json::to_string(event) {
+                    output.push_str(&s);
+                    output.push('\n');
+                }
+            }
+            output
+        }
+        OutputFormat::Text => format_net_audit_text(events),
+    }
+}
+
+fn run_net_subcommand(action: NetAction, workspace_root: &Path) -> ExitCode {
+    match action {
+        NetAction::Audit {
+            session,
+            path,
+            kind,
+            deny_only,
+            output_format,
+        } => {
+            let Some(path) = net_audit_path(workspace_root, session.as_deref(), path.as_deref())
+            else {
+                eprintln!("no sandbox session found under .harness/sandbox/ (no net audit log)");
+                return ExitCode::FAILURE;
+            };
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) => {
+                    eprintln!("failed to read net audit log {}: {e}", path.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut events = Vec::new();
+            for (idx, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event = match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(event) => event,
+                    Err(e) => {
+                        eprintln!(
+                            "failed to parse net audit log {} line {}: {e}",
+                            path.display(),
+                            idx + 1
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                };
+                events.push(event);
+            }
+            let events = filter_net_audit_events(events, kind.as_deref(), deny_only);
+
+            print!("{}", format_net_audit_output(&events, output_format));
+            ExitCode::SUCCESS
+        }
+    }
+}
+
 fn resolve_model(model: Option<String>, kind: ProviderKind) -> Result<String, String> {
     match (model, kind) {
         (Some(m), _) => Ok(m),
@@ -602,10 +823,9 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
         .clone()
         .unwrap_or_default()
         .to_net_proxy_config();
-    for domain in &cli.net_allow_domain {
-        if !net_proxy.allow_domains.contains(domain) {
-            net_proxy.allow_domains.push(domain.clone());
-        }
+    if let Err(e) = validate_and_merge_net_allow_domains(&mut net_proxy, &cli.net_allow_domain) {
+        eprintln!("error: invalid network domain policy: {e}");
+        return ExitCode::FAILURE;
     }
     let mut net_app = settings.net.clone().unwrap_or_default().to_net_app_policy();
     for app in &cli.net_allow_app {
@@ -689,6 +909,9 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
         }
         Commands::Tier3 { .. } => {
             unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Net { .. } => {
+            unreachable!("Commands::Net is dispatched before run_sandbox_subcommand")
         }
         Commands::Prompt => {
             unreachable!("Commands::Prompt is dispatched before run_sandbox_subcommand")
@@ -814,6 +1037,9 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
         }
         Commands::Tier3 { .. } => {
             unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Net { .. } => {
+            unreachable!("Commands::Net is dispatched before run_sandbox_subcommand")
         }
         Commands::Prompt => {
             unreachable!("Commands::Prompt is dispatched before run_sandbox_subcommand")
@@ -1652,6 +1878,7 @@ async fn main() -> ExitCode {
         return match cmd {
             Commands::Fs { action } => run_fs_subcommand(action),
             Commands::Tier3 { action } => run_tier3_subcommand(action),
+            Commands::Net { action } => run_net_subcommand(action, &workspace_root),
             Commands::Prompt => run_prompt_subcommand(&cli, &workspace_root),
             other => run_sandbox_subcommand(other, &workspace_root),
         };
@@ -1697,6 +1924,36 @@ async fn main() -> ExitCode {
     // （`permission_mode`/`output_format`はclapの`default_value_t`で常に値を持つため
     // このフォールバックの対象外、CLI値をそのまま使う）。
     let settings = harness_config::Settings::load(&workspace_root);
+
+    let early_require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
+    if early_require_sandbox == RequireSandbox::Confidential {
+        let mut early_net_proxy = settings
+            .net
+            .clone()
+            .unwrap_or_default()
+            .to_net_proxy_config();
+        if let Err(e) =
+            validate_and_merge_net_allow_domains(&mut early_net_proxy, &cli.net_allow_domain)
+        {
+            eprintln!("error: invalid network domain policy: {e}");
+            return ExitCode::FAILURE;
+        }
+        let mut early_net_app = settings.net.clone().unwrap_or_default().to_net_app_policy();
+        for app in &cli.net_allow_app {
+            if !early_net_app.allow_apps.contains(app) {
+                early_net_app.allow_apps.push(app.clone());
+            }
+        }
+        if !early_net_proxy.allow_domains.is_empty() || !early_net_app.allow_apps.is_empty() {
+            eprintln!(
+                "error: network allow rules (--net-allow-domain / --net-allow-app / settings \
+                 net.*) conflict with --require-sandbox=confidential (confidential mode denies \
+                 all outbound network unconditionally; refusing to start rather than silently \
+                 ignoring network allow rules or weakening the confidentiality guarantee)"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
 
     let provider = match build_provider(cli.provider, cli.base_url) {
         Ok(p) => p,
@@ -1826,9 +2083,13 @@ async fn main() -> ExitCode {
         .clone()
         .unwrap_or_default()
         .to_net_proxy_config();
-    for domain in &cli.net_allow_domain {
-        if !net_proxy.allow_domains.contains(domain) {
-            net_proxy.allow_domains.push(domain.clone());
+    if let Err(e) = validate_and_merge_net_allow_domains(&mut net_proxy, &cli.net_allow_domain) {
+        eprintln!("error: invalid network domain policy: {e}");
+        return ExitCode::FAILURE;
+    }
+    if net_proxy.audit_log_path.is_none() {
+        if let Some(dir) = &sandbox_dir {
+            net_proxy.audit_log_path = Some(workspace_root.join(dir).join("net-audit.jsonl"));
         }
     }
 
@@ -1846,13 +2107,16 @@ async fn main() -> ExitCode {
     let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
 
     // confidential（外部持出し経路を作らない明示拒否モード＝通信許可リストを無効化する上位モード）
-    // と net-allow-app（通信を開く）は意味的に矛盾するため、黙って無視/弱めず起動を拒否する
+    // と net-allow-domain/net-allow-app（通信を開く）は意味的に矛盾するため、黙って無視/弱めず起動を拒否する
     // （`--require-sandbox`のsatisfiesと同じfail-fast思想、`plans/DESIGN-SANDBOX-APPPOLICY.md` §7）。
-    if require_sandbox == RequireSandbox::Confidential && !net_app.allow_apps.is_empty() {
+    if require_sandbox == RequireSandbox::Confidential
+        && (!net_proxy.allow_domains.is_empty() || !net_app.allow_apps.is_empty())
+    {
         eprintln!(
-            "error: --net-allow-app conflicts with --require-sandbox=confidential (confidential \
+            "error: network allow rules (--net-allow-domain / --net-allow-app / settings net.*) \
+             conflict with --require-sandbox=confidential (confidential \
              mode denies all outbound network unconditionally; refusing to start rather than \
-             silently ignoring --net-allow-app or weakening the confidentiality guarantee)"
+             silently ignoring network allow rules or weakening the confidentiality guarantee)"
         );
         return ExitCode::FAILURE;
     }
@@ -1936,7 +2200,7 @@ async fn main() -> ExitCode {
     // WFP 出口強制（Layer2、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）の
     // named pipeを、`select_tier`（内部で`preflight`を呼ぶ）より前に用意しておく。
     // Tier1aはフラグ無しで既定プローブされるため（`--sandbox`カスケードの中間フォールバック
-    // としても到達し得る）、許可ドメインが設定されている場合は常に投機的に用意しておく
+    // としても到達し得る）、ドメインポリシー監査が有効な場合は常に投機的に用意しておく
     // （そうでなければWFPは不要＝シナリオ(C)、パイプすら作らずUACゼロを保つ）。ここで作った
     // パイプ名は、`preflight`経由で特権分離ヘルパーへ「処理完了後この名前でnetfilterdを
     // 連鎖起動してほしい」という指示として渡す（シナリオ(A)）。実際にTier1aへ降格せずに
@@ -1945,7 +2209,7 @@ async fn main() -> ExitCode {
     // （下記`net_wfp`解決を参照）。
     #[cfg(windows)]
     let wfp_prelude: Option<harness_sandbox::netfilterd::PreparedPipe> =
-        if !net_proxy.allow_domains.is_empty() {
+        if net_proxy.domain_policy_enabled {
             match harness_sandbox::netfilterd::prepare_pipe() {
                 Ok(prepared) => Some(prepared),
                 Err(e) => {
@@ -1981,14 +2245,76 @@ async fn main() -> ExitCode {
         }
     };
 
+    let _session_proxy = if net_proxy.domain_policy_enabled {
+        match harness_tools::net_proxy::spawn_local_proxy(&net_proxy).await {
+            Ok(Some(proxy)) => {
+                net_proxy.proxy_addr = Some(proxy.addr);
+                Some(proxy)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                if shell_tier.tier == harness_core::ShellTier::Tier1a {
+                    eprintln!(
+                        "warning: failed to start session-scoped local proxy; Tier1a domain \
+                         enforcement will remain fail-closed instead of opening network: {e}"
+                    );
+                } else {
+                    eprintln!(
+                        "warning: failed to start session-scoped local proxy; run_shell will try \
+                         a per-command proxy instead: {e}"
+                    );
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _session_fake_dns = if net_proxy.domain_policy_enabled {
+        match harness_tools::fake_dns::spawn_fake_dns(&harness_tools::fake_dns::FakeDnsConfig {
+            allow_domains: net_proxy.allow_domains.clone(),
+            policy_required: net_proxy.domain_policy_enabled,
+            audit_log_path: net_proxy.audit_log_path.clone(),
+            preferred_port: Some(53),
+        })
+        .await
+        {
+            Ok(agent) => {
+                net_proxy.fake_dns_addr = Some(agent.addr);
+                Some(agent)
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to start session-scoped Fake DNS diagnostic agent; run_shell \
+                     will try a per-command Fake DNS agent instead: {e}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let net_loopback_ports =
+        net_loopback_ports_for_agents(net_proxy.proxy_addr, net_proxy.fake_dns_addr);
+
     // WFPシナリオ(A)/(B)/(C)の最終確定。`shell_tier`が実際にTier1aへ着地し、かつ許可ドメインが
     // あるときだけ有効化する（`experimental_tier1a`はオプトインの意図であって、preflight失敗で
     // Tier1bへ降格した場合はWFPも当然無効）。
     #[cfg(windows)]
     let net_wfp: Option<harness_sandbox::netfilterd::NetfilterHandle> = {
-        let wfp_needed = shell_tier.tier == harness_core::ShellTier::Tier1a
-            && !net_proxy.allow_domains.is_empty();
+        let domain_policy_requested = net_proxy.domain_policy_enabled;
+        let tier1a_domain_policy =
+            shell_tier.tier == harness_core::ShellTier::Tier1a && domain_policy_requested;
+        let session_proxy_ready = net_proxy.proxy_addr.is_some();
+        let wfp_needed = tier1a_domain_policy && session_proxy_ready;
         if !wfp_needed {
+            if tier1a_domain_policy && !session_proxy_ready {
+                eprintln!(
+                    "warning: session-scoped local proxy did not start; WFP domain enforcement \
+                     will not be enabled and Tier1a run_shell network capability will remain \
+                     denied (fail-closed)"
+                );
+            }
             // シナリオ(C)、または投機的に作ったパイプが結局不要だった場合。`wfp_prelude`を
             // dropするだけで`PreparedPipe`が自動的にパイプを閉じる（後始末コード不要）。
             drop(wfp_prelude);
@@ -1999,9 +2325,13 @@ async fn main() -> ExitCode {
                 Some(prepared) => {
                     match harness_sandbox::netfilterd::NetfilterHandle::connect_after_chain_launch(
                         prepared.into_handle(),
-                        net_proxy.allow_domains.clone(),
+                        Vec::new(),
                         false,
+                        Vec::new(),
+                        net_loopback_ports.tcp.clone(),
+                        net_loopback_ports.udp.clone(),
                         false,
+                        net_proxy.audit_log_path.clone(),
                     ) {
                         Ok(handle) => Some(handle),
                         Err(e) => {
@@ -2022,9 +2352,13 @@ async fn main() -> ExitCode {
             // dropして自動的に閉じる。
             drop(wfp_prelude);
             match harness_sandbox::netfilterd::NetfilterHandle::start(
-                net_proxy.allow_domains.clone(),
+                Vec::new(),
                 false,
+                Vec::new(),
+                net_loopback_ports.tcp.clone(),
+                net_loopback_ports.udp.clone(),
                 false,
+                net_proxy.audit_log_path.clone(),
             ) {
                 Ok(handle) => Some(handle),
                 Err(e) => {
@@ -2104,6 +2438,10 @@ async fn main() -> ExitCode {
     // 分岐後（TUIならターミナル準備画面の中、非対話ならstderr進捗行と共に）まで遅延させる。
     // ここでは`vm_sandbox: None`のまま`ToolCtx`を構築し、各分岐が準備完了後に書き戻す
     // （`system_blocks_for`は`vm_sandbox`を参照しないため後書きで安全、`prompt.rs`参照）。
+    if net_wfp.is_some() {
+        net_proxy.enforced_by_wfp = true;
+    }
+
     let mut tool_ctx = ToolCtx {
         workspace_root: workspace_root.clone(),
         staging: StagingConfig {
@@ -2364,5 +2702,173 @@ mod fs_ledger_tests {
         let json = serde_json::to_string(&ledger).unwrap();
         let back: FsLedger = serde_json::from_str(&json).unwrap();
         assert!(back.entries[0].forced);
+    }
+}
+
+#[cfg(test)]
+mod net_audit_tests {
+    use super::{
+        filter_net_audit_events, format_net_audit_output, net_audit_path,
+        net_loopback_ports_for_agents, validate_and_merge_net_allow_domains, NetLoopbackPorts,
+        OutputFormat,
+    };
+    use harness_core::NetProxyConfig;
+    use serde_json::json;
+    use std::path::Path;
+
+    #[test]
+    fn explicit_net_audit_path_takes_precedence() {
+        let workspace = Path::new(r"C:\workspace");
+        let explicit = Path::new(r"C:\logs\net-audit.jsonl");
+
+        assert_eq!(
+            net_audit_path(workspace, Some("ignored"), Some(explicit)),
+            Some(explicit.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn session_net_audit_path_resolves_under_sandbox_dir() {
+        let workspace = Path::new(r"C:\workspace");
+
+        assert_eq!(
+            net_audit_path(workspace, Some("abc123"), None),
+            Some(
+                workspace
+                    .join(".harness")
+                    .join("sandbox")
+                    .join("session-abc123")
+                    .join("net-audit.jsonl")
+            )
+        );
+        assert_eq!(
+            net_audit_path(workspace, Some("session-abc123"), None),
+            Some(
+                workspace
+                    .join(".harness")
+                    .join("sandbox")
+                    .join("session-abc123")
+                    .join("net-audit.jsonl")
+            )
+        );
+    }
+
+    #[test]
+    fn loopback_ports_are_protocol_scoped_for_proxy_and_fake_dns() {
+        let ports = net_loopback_ports_for_agents(
+            Some("127.0.0.1:18080".parse().unwrap()),
+            Some("127.0.0.1:18053".parse().unwrap()),
+        );
+
+        assert_eq!(
+            ports,
+            NetLoopbackPorts {
+                tcp: vec![18053, 18080],
+                udp: vec![18053],
+            }
+        );
+    }
+
+    #[test]
+    fn loopback_ports_are_deduplicated_without_widening_protocols() {
+        let ports = net_loopback_ports_for_agents(
+            Some("127.0.0.1:18053".parse().unwrap()),
+            Some("127.0.0.1:18053".parse().unwrap()),
+        );
+
+        assert_eq!(ports.tcp, vec![18053]);
+        assert_eq!(ports.udp, vec![18053]);
+    }
+
+    #[test]
+    fn net_allow_domains_are_validated_and_deduplicated() {
+        let mut config = NetProxyConfig {
+            allow_domains: vec!["Example.COM.".to_string()],
+            ..Default::default()
+        };
+
+        validate_and_merge_net_allow_domains(
+            &mut config,
+            &["example.com".to_string(), "*.Trusted.Example.".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.allow_domains,
+            vec!["example.com".to_string(), "*.trusted.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn net_allow_domains_reject_ip_literals_at_cli_merge_boundary() {
+        let mut config = NetProxyConfig::default();
+
+        let err = validate_and_merge_net_allow_domains(&mut config, &["127.0.0.1".to_string()])
+            .unwrap_err();
+
+        assert!(err.contains("IP literals"));
+    }
+
+    #[test]
+    fn net_audit_filter_selects_kind_and_deny_only() {
+        let events = vec![
+            json!({
+                "kind": "proxy",
+                "protocol": "socks5",
+                "host": "example.com",
+                "allowed": true,
+                "reason": "domain_allowed"
+            }),
+            json!({
+                "kind": "fake_dns",
+                "protocol": "dns_udp",
+                "host": "blocked.example",
+                "allowed": false,
+                "reason": "domain_denied"
+            }),
+            json!({
+                "kind": "wfp",
+                "protocol": "tcp",
+                "remote_addr": "198.18.0.1",
+                "remote_host": "blocked.example",
+                "allowed": false,
+                "reason": "classify_drop"
+            }),
+        ];
+
+        let filtered = filter_net_audit_events(events, Some("wfp"), true);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["kind"], "wfp");
+        assert_eq!(filtered[0]["allowed"], false);
+        assert_eq!(filtered[0]["remote_host"], "blocked.example");
+    }
+
+    #[test]
+    fn net_audit_output_formats_json_jsonl_and_text() {
+        let events = vec![json!({
+            "kind": "wfp",
+            "protocol": "tcp",
+            "allowed": false,
+            "remote_addr": "198.18.0.1",
+            "remote_port": 443,
+            "remote_host": "blocked.example",
+            "reason": "classify_drop"
+        })];
+
+        let json_output = format_net_audit_output(&events, OutputFormat::Json);
+        let parsed: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+        assert_eq!(parsed[0]["kind"], "wfp");
+
+        let jsonl_output = format_net_audit_output(&events, OutputFormat::Jsonl);
+        assert_eq!(jsonl_output.lines().count(), 1);
+        let parsed_line: serde_json::Value = serde_json::from_str(jsonl_output.trim()).unwrap();
+        assert_eq!(parsed_line["remote_host"], "blocked.example");
+
+        let text_output = format_net_audit_output(&events, OutputFormat::Text);
+        assert!(text_output.contains("wfp"));
+        assert!(text_output.contains("DENY"));
+        assert!(text_output.contains("blocked.example"));
+        assert!(text_output.contains("classify_drop"));
     }
 }

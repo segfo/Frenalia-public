@@ -27,9 +27,9 @@ const CONFIG_INJECTION_PREFIXES: &[&str] = &[
 pub fn is_config_injection_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
-    CONFIG_INJECTION_PREFIXES.iter().any(|prefix| {
-        normalized == *prefix || normalized.starts_with(&format!("{prefix}/"))
-    })
+    CONFIG_INJECTION_PREFIXES
+        .iter()
+        .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix}/")))
 }
 
 #[cfg(test)]

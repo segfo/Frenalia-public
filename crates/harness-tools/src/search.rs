@@ -246,7 +246,12 @@ impl Sink for CollectSink {
     }
 }
 
-fn format_sink_bytes(bytes: &[u8], line_number: Option<u64>, show_line_numbers: bool, sep: char) -> String {
+fn format_sink_bytes(
+    bytes: &[u8],
+    line_number: Option<u64>,
+    show_line_numbers: bool,
+    sep: char,
+) -> String {
     let text = String::from_utf8_lossy(bytes);
     let text = text.strip_suffix('\n').unwrap_or(&text);
     match (show_line_numbers, line_number) {
@@ -357,10 +362,7 @@ mod tests {
 
         let tool = GrepTool;
         let out = tool
-            .call(
-                json!({ "pattern": "wor" }),
-                &ctx(dir.path().to_path_buf()),
-            )
+            .call(json!({ "pattern": "wor" }), &ctx(dir.path().to_path_buf()))
             .await
             .unwrap();
 

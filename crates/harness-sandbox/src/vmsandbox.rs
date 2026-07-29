@@ -63,6 +63,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use harness_core::validate_domain_pattern;
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -1103,24 +1104,11 @@ pub(crate) struct EgressSession {
 
 /// `allow_domains`の入力検証（B-1）。S-2で固定パイプ名IPCが同一ユーザーの任意プロセスへ
 /// 開かれた以上、`allow_domains`はもう信頼できる内部値ではなく外部入力として扱う必要がある。
-/// nginx設定・nftables/shellコマンドへ生文字列のまま補間されるため、ドメイン名として
-/// 妥当な文字集合（英数字・`.`・`-`）と長さ上限のみを許可する。
+/// パターンの意味は`harness_core::DomainPolicy`と共通化し、ここではTier3固有の`VmError`
+/// へ包み直す。
 pub(crate) fn validate_allow_domain(domain: &str) -> Result<(), VmError> {
-    const MAX_DOMAIN_LEN: usize = 253; // RFC 1035の全体長上限。
-    if domain.is_empty() || domain.len() > MAX_DOMAIN_LEN {
-        return Err(VmError::Incus(format!(
-            "invalid allow_domain (empty or too long, max {MAX_DOMAIN_LEN}): {domain:?}"
-        )));
-    }
-    if !domain
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    {
-        return Err(VmError::Incus(format!(
-            "invalid allow_domain (only [a-zA-Z0-9.-] allowed): {domain:?}"
-        )));
-    }
-    Ok(())
+    validate_domain_pattern(domain)
+        .map_err(|e| VmError::Incus(format!("invalid allow_domain: {e}")))
 }
 
 /// SNI prereadプロキシのnginx設定を、**現在アクティブな全セッション分**まとめて動的生成する
@@ -1134,12 +1122,12 @@ fn build_sni_proxy_conf_multi(sessions: &[EgressSession]) -> String {
         let map_lines: String = s
             .allow_domains
             .iter()
-            .map(|d| format!("        {d}     \"{d}:443\";\n"))
+            .map(|d| sni_upstream_map_entry(d))
             .collect();
         let decision_lines: String = s
             .allow_domains
             .iter()
-            .map(|d| format!("        {d}     \"ALLOW\";\n"))
+            .map(|d| sni_decision_map_entry(d))
             .collect();
         let port = sni_proxy_port_for_slot(s.slot);
         let audit_log = sni_audit_log_path_for_slot(s.slot);
@@ -1180,6 +1168,28 @@ stream {{
 {server_blocks}}}
 "#
     )
+}
+
+fn sni_upstream_map_entry(pattern: &str) -> String {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        let suffix = nginx_regex_escape_domain(suffix);
+        format!("        ~^(.+\\.)?{suffix}$     \"$ssl_preread_server_name:443\";\n")
+    } else {
+        format!("        {pattern}     \"{pattern}:443\";\n")
+    }
+}
+
+fn sni_decision_map_entry(pattern: &str) -> String {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        let suffix = nginx_regex_escape_domain(suffix);
+        format!("        ~^(.+\\.)?{suffix}$     \"ALLOW\";\n")
+    } else {
+        format!("        {pattern}     \"ALLOW\";\n")
+    }
+}
+
+fn nginx_regex_escape_domain(domain: &str) -> String {
+    domain.replace('.', "\\.")
 }
 
 /// nftables: 全アクティブセッション分のDNAT（コンテナ発の443宛先を各自のSNIプロキシポートへ
@@ -2385,9 +2395,23 @@ mod tests {
     }
 
     #[test]
+    fn build_sni_proxy_conf_multi_maps_wildcard_domains_to_original_sni() {
+        let sessions = vec![EgressSession {
+            slot: 0,
+            container_ip: "10.76.180.61".to_string(),
+            allow_domains: vec!["*.example.com".to_string()],
+        }];
+        let conf = build_sni_proxy_conf_multi(&sessions);
+
+        assert!(conf.contains(r#"~^(.+\.)?example\.com$     "$ssl_preread_server_name:443";"#));
+        assert!(conf.contains(r#"~^(.+\.)?example\.com$     "ALLOW";"#));
+    }
+
+    #[test]
     fn validate_allow_domain_accepts_normal_domains() {
         assert!(validate_allow_domain("example.com").is_ok());
         assert!(validate_allow_domain("api.example-1.co.jp").is_ok());
+        assert!(validate_allow_domain("*.example.com").is_ok());
     }
 
     #[test]
@@ -2395,6 +2419,7 @@ mod tests {
         assert!(validate_allow_domain("example.com\";}\nserver{{").is_err());
         assert!(validate_allow_domain("").is_err());
         assert!(validate_allow_domain(&"a".repeat(300)).is_err());
+        assert!(validate_allow_domain("127.0.0.1").is_err());
     }
 
     #[test]

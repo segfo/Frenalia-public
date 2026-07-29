@@ -12,27 +12,40 @@
 //! `plans/TIER1A-OPEN-ISSUES.md`項目3.5への追記でフォローアップする）:
 //! - ドメイン解決は起動時に一度だけ行う（§5.4のTTL準拠バックグラウンド再解決・
 //!   Make-before-break・削除猶予は未実装）。
-//! - `FwpmNetEventSubscribe`によるDROPイベントログ（§5.3）は未実装。
-//! - 名前解決は`std::net::ToSocketAddrs`（内部的に`GetAddrInfoW`、OS標準リゾルバ経由で
-//!   dnscacheキャッシュを共有する）を使う簡易版。`DnsQueryEx`によるTTL取得は未実装。
+//! - `FwpmNetEventSubscribe`によるDROPイベントログはベストエフォートでJSONLへ追記する。
+//! - 許可ドメインのIP解決済みアドレスをWFPで直接allowする旧経路は使わない。v1では
+//!   Local Proxy/Fake DNSのloopback実ポートだけを許可する。
 
-use std::net::{IpAddr, ToSocketAddrs};
+use std::ffi::c_void;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use windows::core::GUID;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmProviderAdd0, FwpmProviderDeleteByKey0,
-    FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
-    FwpmTransactionCommit0, FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_PACKAGE_ID,
-    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_DISPLAY_DATA0,
-    FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_NONE,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_PROVIDER0,
-    FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT,
-    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SID,
-    FWP_UINT64, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK,
-    FWP_VALUE0, FWP_VALUE0_0,
+    FwpmEngineClose0, FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0,
+    FwpmFilterCreateEnumHandle0, FwpmFilterDeleteById0, FwpmFilterDestroyEnumHandle0,
+    FwpmFilterEnum0, FwpmFreeMemory0, FwpmNetEventSubscribe0, FwpmNetEventUnsubscribe0,
+    FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
+    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0,
+    FWPM_ACTION0_0, FWPM_CONDITION_ALE_PACKAGE_ID, FWPM_CONDITION_IP_PROTOCOL,
+    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0,
+    FWPM_ENGINE_COLLECT_NET_EVENTS, FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_NONE,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_NET_EVENT1,
+    FWPM_NET_EVENT_SUBSCRIPTION0, FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWPM_PROVIDER0, FWPM_SESSION0,
+    FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT,
+    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_IP_VERSION_V4, FWP_IP_VERSION_V6,
+    FWP_MATCH_EQUAL, FWP_SID, FWP_UINT16, FWP_UINT32, FWP_UINT64, FWP_UINT8, FWP_V4_ADDR_AND_MASK,
+    FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
 };
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, PSID, SID};
+use windows::Win32::NetworkManagement::WindowsFirewall::{
+    NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
+};
+use windows::Win32::Security::{
+    CopySid, EqualSid, GetLengthSid, PSECURITY_DESCRIPTOR, PSID, SID, SID_AND_ATTRIBUTES,
+};
 
 /// harness専用のWFPプロバイダ・サブレイヤーGUID（固定、仕様書§4.2）。他プロバイダとの
 /// 名前衝突を避けるため、この2値は将来も変更しない（変更するとteardown時に旧オブジェクトが
@@ -48,6 +61,8 @@ const WEIGHT_DENY: u64 = 0x10;
 pub enum WfpError {
     #[error("win32 call failed: {0}")]
     Win32(String),
+    #[error("failed to configure AppContainer loopback exemption: {0}")]
+    LoopbackExemption(String),
     #[error("domain resolution failed for {domain}: {reason}")]
     DnsResolve { domain: String, reason: String },
     #[error("no IP addresses resolved for any allowed domain")]
@@ -73,30 +88,262 @@ fn check(status: u32, op: &str) -> Result<(), WfpError> {
 /// `WfpApplyRules`要求のオプション（仕様書§6のCLIオプションに対応）。
 #[derive(Debug, Clone, Default)]
 pub struct WfpOptions {
+    /// 旧IPC/旧設計との後方互換フィールド。v1の理想形ではWFP層で許可ドメインをIP解決して
+    /// 外部宛先を直接allowしないため、この値はWFPフィルタ生成では使用しない。
     pub allow_domains: Vec<String>,
+    /// 旧IPC互換フィールド。v1の強制ドメイン制御では広いlocalhost許可を作らないため、
+    /// WFPフィルタ生成では無視する。loopbackを開く場合は下のポート指定を使う。
     pub allow_loopback: bool,
+    /// 旧IPC互換のloopback許可ポート。新規呼び出しではTCP/UDP別フィールドを使う。
+    /// この値は旧クライアント互換のためTCP/UDP両方を許可する。
+    pub allow_loopback_ports: Vec<u16>,
+    /// TCPで許可するloopback宛先ポート。Local Proxy AgentとFake DNS TCPをここへ入れる。
+    pub allow_loopback_tcp_ports: Vec<u16>,
+    /// UDPで許可するloopback宛先ポート。Fake DNS UDPをここへ入れる。
+    pub allow_loopback_udp_ports: Vec<u16>,
     /// 現状未使用（システム設定DNSサーバの動的取得は未実装、§4.3の`--allow-direct-dns`）。
     /// フィールドとしては仕様書との対応を保つために残す。
     pub allow_direct_dns: bool,
+    /// WFP block/drop監査イベントを追記するJSONLパス。`None`ならWFP監査購読を起動しない。
+    pub audit_log_path: Option<PathBuf>,
 }
 
 /// 適用済みWFPセッション。`teardown`を呼ぶまでエンジンハンドルを保持し続ける
 /// （＝フィルタが有効であり続ける、DYNAMICセッションの性質そのもの）。
 pub struct WfpSession {
     engine: HANDLE,
+    event_subscription: Option<HANDLE>,
+    audit_context: Option<*mut WfpAuditSink>,
+    loopback_exemption: Option<LoopbackExemption>,
 }
 
 // HANDLEは値として複数スレッド間で運んでよい（他の`win_*`モジュールと同じ扱い）。
 unsafe impl Send for WfpSession {}
 
+#[derive(Debug)]
+struct WfpAuditSink {
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct OwnedSid {
+    bytes: Vec<u8>,
+}
+
+impl OwnedSid {
+    unsafe fn copy_from(sid: PSID) -> Result<Self, WfpError> {
+        let len = GetLengthSid(sid);
+        if len == 0 {
+            return Err(WfpError::LoopbackExemption(
+                "GetLengthSid returned zero".to_string(),
+            ));
+        }
+        let mut bytes = vec![0u8; len as usize];
+        CopySid(len, PSID(bytes.as_mut_ptr() as *mut _), sid).map_err(|e| {
+            WfpError::LoopbackExemption(format!("CopySid failed while copying SID: {e}"))
+        })?;
+        Ok(Self { bytes })
+    }
+
+    fn as_psid(&self) -> PSID {
+        PSID(self.bytes.as_ptr() as *mut _)
+    }
+}
+
+#[derive(Debug)]
+struct LoopbackExemption {
+    sid: OwnedSid,
+}
+
+#[derive(Debug, Serialize)]
+struct WfpAuditEntry {
+    timestamp_unix_ms: u128,
+    kind: &'static str,
+    protocol: &'static str,
+    allowed: bool,
+    reason: &'static str,
+    local_addr: Option<String>,
+    local_port: u16,
+    remote_addr: Option<String>,
+    remote_host: Option<String>,
+    remote_port: u16,
+    filter_id: Option<u64>,
+    layer_id: Option<u16>,
+}
+
+impl WfpAuditSink {
+    fn record(&self, entry: &WfpAuditEntry) {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            if let Ok(line) = serde_json::to_string(entry) {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+    }
+
+    fn lookup_fake_dns_host(&self, remote_addr: &str) -> Option<String> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        text.lines().rev().find_map(|line| {
+            let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+            if value.get("kind")?.as_str()? != "fake_dns" {
+                return None;
+            }
+            if value.get("fake_ip")?.as_str()? != remote_addr {
+                return None;
+            }
+            value.get("host")?.as_str().map(ToOwned::to_owned)
+        })
+    }
+}
+
+unsafe extern "system" fn wfp_net_event_callback(
+    context: *mut core::ffi::c_void,
+    event: *const FWPM_NET_EVENT1,
+) {
+    if context.is_null() || event.is_null() {
+        return;
+    }
+    let sink = &*(context as *const WfpAuditSink);
+    let event = &*event;
+    if event.r#type != FWPM_NET_EVENT_TYPE_CLASSIFY_DROP {
+        return;
+    }
+
+    let header = event.header;
+    let (local_addr, remote_addr) = match header.ipVersion {
+        FWP_IP_VERSION_V4 => (
+            Some(std::net::Ipv4Addr::from(header.Anonymous1.localAddrV4).to_string()),
+            Some(std::net::Ipv4Addr::from(header.Anonymous2.remoteAddrV4).to_string()),
+        ),
+        FWP_IP_VERSION_V6 => (
+            Some(std::net::Ipv6Addr::from(header.Anonymous1.localAddrV6.byteArray16).to_string()),
+            Some(std::net::Ipv6Addr::from(header.Anonymous2.remoteAddrV6.byteArray16).to_string()),
+        ),
+        _ => (None, None),
+    };
+
+    let drop = event.Anonymous.classifyDrop.as_ref();
+    let remote_host = remote_addr
+        .as_deref()
+        .and_then(|addr| sink.lookup_fake_dns_host(addr));
+    let entry = WfpAuditEntry {
+        timestamp_unix_ms: now_unix_ms(),
+        kind: "wfp",
+        protocol: protocol_name(header.ipProtocol),
+        allowed: false,
+        reason: "classify_drop",
+        local_addr,
+        local_port: header.localPort,
+        remote_addr,
+        remote_host,
+        remote_port: header.remotePort,
+        filter_id: drop.map(|d| d.filterId),
+        layer_id: drop.map(|d| d.layerId),
+    };
+    sink.record(&entry);
+}
+
+fn protocol_name(protocol: u8) -> &'static str {
+    match protocol {
+        6 => "tcp",
+        17 => "udp",
+        1 => "icmp",
+        58 => "icmpv6",
+        _ => "ip",
+    }
+}
+
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+unsafe fn sid_equals(left: PSID, right: PSID) -> bool {
+    EqualSid(left, right).is_ok()
+}
+
+unsafe fn current_loopback_exemptions() -> Result<Vec<OwnedSid>, WfpError> {
+    let mut count = 0u32;
+    let mut raw: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
+    let status = NetworkIsolationGetAppContainerConfig(&mut count, &mut raw);
+    if status != 0 {
+        return Err(WfpError::LoopbackExemption(format!(
+            "NetworkIsolationGetAppContainerConfig failed with Win32 status {status}"
+        )));
+    }
+
+    let mut sids = Vec::new();
+    if !raw.is_null() {
+        let slice = std::slice::from_raw_parts(raw, count as usize);
+        for entry in slice {
+            sids.push(OwnedSid::copy_from(entry.Sid)?);
+        }
+        let _ = LocalFree(HLOCAL(raw as *mut c_void));
+    }
+    Ok(sids)
+}
+
+unsafe fn set_loopback_exemptions(sids: &[OwnedSid]) -> Result<(), WfpError> {
+    let entries: Vec<SID_AND_ATTRIBUTES> = sids
+        .iter()
+        .map(|sid| SID_AND_ATTRIBUTES {
+            Sid: sid.as_psid(),
+            Attributes: 0,
+        })
+        .collect();
+    let status = NetworkIsolationSetAppContainerConfig(&entries);
+    if status != 0 {
+        return Err(WfpError::LoopbackExemption(format!(
+            "NetworkIsolationSetAppContainerConfig failed with Win32 status {status}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_loopback_exemption(container_sid: PSID) -> Result<Option<LoopbackExemption>, WfpError> {
+    unsafe {
+        let mut current = current_loopback_exemptions()?;
+        if current
+            .iter()
+            .any(|existing| sid_equals(existing.as_psid(), container_sid))
+        {
+            return Ok(None);
+        }
+
+        let sid = OwnedSid::copy_from(container_sid)?;
+        current.push(OwnedSid::copy_from(container_sid)?);
+        set_loopback_exemptions(&current)?;
+        Ok(Some(LoopbackExemption { sid }))
+    }
+}
+
+fn remove_loopback_exemption(exemption: LoopbackExemption) -> Result<(), WfpError> {
+    unsafe {
+        let mut current = current_loopback_exemptions()?;
+        current.retain(|existing| !sid_equals(existing.as_psid(), exemption.sid.as_psid()));
+        set_loopback_exemptions(&current)
+    }
+}
+
 impl WfpSession {
     /// `container_sid`宛のALLOW/DENYルールを投入する（仕様書§5.1・§5.2）。
     pub fn apply(container_sid: PSID, opts: &WfpOptions) -> Result<Self, WfpError> {
-        let (v4_ips, v6_ips) = resolve_allow_domains(&opts.allow_domains)?;
-        if v4_ips.is_empty() && v6_ips.is_empty() && !opts.allow_loopback {
+        if opts.allow_loopback_ports.is_empty()
+            && opts.allow_loopback_tcp_ports.is_empty()
+            && opts.allow_loopback_udp_ports.is_empty()
+        {
             return Err(WfpError::NoAddressesResolved);
         }
 
+        cleanup_stale_objects();
         let engine = open_dynamic_engine()?;
 
         let result = (|| -> Result<(), WfpError> {
@@ -104,7 +351,7 @@ impl WfpSession {
                 check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             }
 
-            let txn_result = apply_within_transaction(engine, container_sid, opts, &v4_ips, &v6_ips);
+            let txn_result = apply_within_transaction(engine, container_sid, opts);
 
             unsafe {
                 match &txn_result {
@@ -119,7 +366,25 @@ impl WfpSession {
         })();
 
         match result {
-            Ok(()) => Ok(WfpSession { engine }),
+            Ok(()) => {
+                let loopback_exemption = match ensure_loopback_exemption(container_sid) {
+                    Ok(exemption) => exemption,
+                    Err(e) => {
+                        unsafe {
+                            let _ = FwpmEngineClose0(engine);
+                        }
+                        return Err(e);
+                    }
+                };
+                let (event_subscription, audit_context) =
+                    start_wfp_drop_audit(engine, opts.audit_log_path.clone());
+                Ok(WfpSession {
+                    engine,
+                    event_subscription,
+                    audit_context,
+                    loopback_exemption,
+                })
+            }
             Err(e) => {
                 unsafe {
                     let _ = FwpmEngineClose0(engine);
@@ -131,13 +396,22 @@ impl WfpSession {
 
     /// 投入したフィルタ・サブレイヤー・プロバイダを撤収し、エンジンハンドルを閉じる
     /// （仕様書§5.5正常系）。呼び出し後、`self`は消費される。
-    pub fn teardown(self) -> Result<(), WfpError> {
+    pub fn teardown(mut self) -> Result<(), WfpError> {
         let engine = self.engine;
+        let event_subscription = self.event_subscription;
+        let audit_context = self.audit_context;
+        let loopback_exemption = self.loopback_exemption.take();
         std::mem::forget(self); // Dropで二重close/二重teardownしないよう所有権をここで断つ。
 
         let result = (|| -> Result<(), WfpError> {
             unsafe {
-                check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0 (teardown)")?;
+                if let Some(subscription) = event_subscription {
+                    let _ = FwpmNetEventUnsubscribe0(engine, subscription);
+                }
+                check(
+                    FwpmTransactionBegin0(engine, 0),
+                    "FwpmTransactionBegin0 (teardown)",
+                )?;
                 // フィルタはサブレイヤー削除では自動的に消えないため、サブレイヤー/プロバイダより
                 // 前に個別削除するのが本来だが、本ラウンドはフィルタIDを保持していないため、
                 // サブレイヤー・プロバイダの削除のみ行う。DYNAMICセッションではエンジンクローズ時に
@@ -146,15 +420,26 @@ impl WfpSession {
                 let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_KEY as *const GUID);
             }
             unsafe {
-                check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0 (teardown)")?;
+                check(
+                    FwpmTransactionCommit0(engine),
+                    "FwpmTransactionCommit0 (teardown)",
+                )?;
             }
             Ok(())
         })();
 
+        let loopback_result = if let Some(exemption) = loopback_exemption {
+            remove_loopback_exemption(exemption)
+        } else {
+            Ok(())
+        };
         unsafe {
+            if let Some(context) = audit_context {
+                drop(Box::from_raw(context));
+            }
             let _ = FwpmEngineClose0(engine);
         }
-        result
+        result.and(loopback_result)
     }
 }
 
@@ -164,7 +449,82 @@ impl Drop for WfpSession {
     /// プロバイダ・サブレイヤー・フィルタもBFE側で自動削除される（仕様書§5.5異常系と同じ経路）。
     fn drop(&mut self) {
         unsafe {
+            if let Some(subscription) = self.event_subscription.take() {
+                let _ = FwpmNetEventUnsubscribe0(self.engine, subscription);
+            }
+            if let Some(context) = self.audit_context.take() {
+                drop(Box::from_raw(context));
+            }
+            if let Some(exemption) = self.loopback_exemption.take() {
+                let _ = remove_loopback_exemption(exemption);
+            }
             let _ = FwpmEngineClose0(self.engine);
+        }
+    }
+}
+
+fn start_wfp_drop_audit(
+    engine: HANDLE,
+    audit_log_path: Option<PathBuf>,
+) -> (Option<HANDLE>, Option<*mut WfpAuditSink>) {
+    let Some(path) = audit_log_path else {
+        return (None, None);
+    };
+    unsafe {
+        let value = FWP_VALUE0 {
+            r#type: FWP_UINT32,
+            Anonymous: FWP_VALUE0_0 { uint32: 1 },
+        };
+        let set_status = FwpmEngineSetOption0(engine, FWPM_ENGINE_COLLECT_NET_EVENTS, &value);
+        let sink = Box::new(WfpAuditSink { path });
+        let sink_ptr = Box::into_raw(sink);
+        if set_status != 0 {
+            let sink = Box::from_raw(sink_ptr);
+            sink.record(&WfpAuditEntry {
+                timestamp_unix_ms: now_unix_ms(),
+                kind: "wfp",
+                protocol: "control",
+                allowed: false,
+                reason: "net_event_collection_enable_failed",
+                local_addr: None,
+                local_port: 0,
+                remote_addr: None,
+                remote_host: None,
+                remote_port: 0,
+                filter_id: None,
+                layer_id: None,
+            });
+            return (None, None);
+        }
+
+        let subscription = FWPM_NET_EVENT_SUBSCRIPTION0::default();
+        let mut handle = HANDLE::default();
+        let status = FwpmNetEventSubscribe0(
+            engine,
+            &subscription,
+            Some(wfp_net_event_callback),
+            Some(sink_ptr as *const core::ffi::c_void),
+            &mut handle,
+        );
+        if status == 0 {
+            (Some(handle), Some(sink_ptr))
+        } else {
+            let sink = Box::from_raw(sink_ptr);
+            sink.record(&WfpAuditEntry {
+                timestamp_unix_ms: now_unix_ms(),
+                kind: "wfp",
+                protocol: "control",
+                allowed: false,
+                reason: "net_event_subscribe_failed",
+                local_addr: None,
+                local_port: 0,
+                remote_addr: None,
+                remote_host: None,
+                remote_port: 0,
+                filter_id: None,
+                layer_id: None,
+            });
+            (None, None)
         }
     }
 }
@@ -190,12 +550,67 @@ fn open_dynamic_engine() -> Result<HANDLE, WfpError> {
     }
 }
 
+fn cleanup_stale_objects() {
+    unsafe {
+        let mut engine = HANDLE::default();
+        let status = FwpmEngineOpen0(
+            windows::core::PCWSTR::null(),
+            windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT,
+            None,
+            None,
+            &mut engine as *mut HANDLE,
+        );
+        if status != 0 {
+            return;
+        }
+
+        delete_filters_in_own_sublayer(engine);
+        let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_KEY as *const GUID);
+        let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_KEY as *const GUID);
+        let _ = FwpmEngineClose0(engine);
+    }
+}
+
+unsafe fn delete_filters_in_own_sublayer(engine: HANDLE) {
+    let mut enum_handle = HANDLE::default();
+    if FwpmFilterCreateEnumHandle0(engine, None, &mut enum_handle) != 0 {
+        return;
+    }
+
+    loop {
+        let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
+        let mut returned = 0u32;
+        let status = FwpmFilterEnum0(engine, enum_handle, 64, &mut entries, &mut returned);
+        if status != 0 || returned == 0 {
+            if !entries.is_null() {
+                let mut memory = entries as *mut c_void;
+                FwpmFreeMemory0(&mut memory);
+            }
+            break;
+        }
+
+        let slice = std::slice::from_raw_parts(entries, returned as usize);
+        for filter_ptr in slice {
+            if filter_ptr.is_null() {
+                continue;
+            }
+            let filter = &**filter_ptr;
+            if filter.subLayerKey == SUBLAYER_KEY {
+                let _ = FwpmFilterDeleteById0(engine, filter.filterId);
+            }
+        }
+
+        let mut memory = entries as *mut c_void;
+        FwpmFreeMemory0(&mut memory);
+    }
+
+    let _ = FwpmFilterDestroyEnumHandle0(engine, enum_handle);
+}
+
 fn apply_within_transaction(
     engine: HANDLE,
     container_sid: PSID,
     opts: &WfpOptions,
-    v4_ips: &[std::net::Ipv4Addr],
-    v6_ips: &[std::net::Ipv6Addr],
 ) -> Result<(), WfpError> {
     unsafe {
         // 1. プロバイダ登録。
@@ -205,7 +620,11 @@ fn apply_within_transaction(
             ..Default::default()
         };
         check(
-            FwpmProviderAdd0(engine, &provider as *const FWPM_PROVIDER0, PSECURITY_DESCRIPTOR::default()),
+            FwpmProviderAdd0(
+                engine,
+                &provider as *const FWPM_PROVIDER0,
+                PSECURITY_DESCRIPTOR::default(),
+            ),
             "FwpmProviderAdd0",
         )?;
 
@@ -219,7 +638,11 @@ fn apply_within_transaction(
             ..Default::default()
         };
         check(
-            FwpmSubLayerAdd0(engine, &sublayer as *const FWPM_SUBLAYER0, PSECURITY_DESCRIPTOR::default()),
+            FwpmSubLayerAdd0(
+                engine,
+                &sublayer as *const FWPM_SUBLAYER0,
+                PSECURITY_DESCRIPTOR::default(),
+            ),
             "FwpmSubLayerAdd0",
         )?;
 
@@ -227,18 +650,24 @@ fn apply_within_transaction(
         add_default_deny_filter(engine, container_sid, FWPM_LAYER_ALE_AUTH_CONNECT_V4)?;
         add_default_deny_filter(engine, container_sid, FWPM_LAYER_ALE_AUTH_CONNECT_V6)?;
 
-        // 4. 許可ドメインの解決済みIP群。
-        if !v4_ips.is_empty() {
-            add_allow_v4_filter(engine, container_sid, v4_ips)?;
+        // 4. ループバック許可（任意）。Proxy/Fake DNSの待受だけを開けるため、
+        // v1ではポート指定の限定allowだけを張る。旧IPC互換の`allow_loopback`
+        // はフィールドとして受けるが、広いlocalhost許可には使わない。
+        let mut tcp_ports = opts.allow_loopback_ports.clone();
+        tcp_ports.extend(opts.allow_loopback_tcp_ports.iter().copied());
+        tcp_ports.sort_unstable();
+        tcp_ports.dedup();
+        let mut udp_ports = opts.allow_loopback_ports.clone();
+        udp_ports.extend(opts.allow_loopback_udp_ports.iter().copied());
+        udp_ports.sort_unstable();
+        udp_ports.dedup();
+        if !tcp_ports.is_empty() {
+            add_allow_v4_loopback_ports_filter(engine, container_sid, &tcp_ports, 6)?;
+            add_allow_v6_loopback_ports_filter(engine, container_sid, &tcp_ports, 6)?;
         }
-        if !v6_ips.is_empty() {
-            add_allow_v6_filter(engine, container_sid, v6_ips)?;
-        }
-
-        // 5. ループバック許可（任意）。
-        if opts.allow_loopback {
-            add_allow_v4_filter(engine, container_sid, &[std::net::Ipv4Addr::LOCALHOST])?;
-            add_allow_v6_filter(engine, container_sid, &[std::net::Ipv6Addr::LOCALHOST])?;
+        if !udp_ports.is_empty() {
+            add_allow_v4_loopback_ports_filter(engine, container_sid, &udp_ports, 17)?;
+            add_allow_v6_loopback_ports_filter(engine, container_sid, &udp_ports, 17)?;
         }
     }
     Ok(())
@@ -250,7 +679,10 @@ fn display_data(name: &str, description: &str) -> FWPM_DISPLAY_DATA0 {
     // ここではリークさせて`'static`扱いにする — このプロセス(netfilterd)は1回のアプリ実行に
     // つき1回しかこの経路を通らず、常駐時間も対象アプリの生存期間程度に限られるため実害はない。
     let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    let desc_w: Vec<u16> = description.encode_utf16().chain(std::iter::once(0)).collect();
+    let desc_w: Vec<u16> = description
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     FWPM_DISPLAY_DATA0 {
         name: windows::core::PWSTR(Box::leak(name_w.into_boxed_slice()).as_mut_ptr()),
         description: windows::core::PWSTR(Box::leak(desc_w.into_boxed_slice()).as_mut_ptr()),
@@ -280,7 +712,10 @@ unsafe fn add_default_deny_filter(
     let mut provider_key = PROVIDER_KEY;
     let filter = FWPM_FILTER0 {
         filterKey: GUID::new().map_err(WfpError::from)?,
-        displayData: display_data("harness default-deny", "AppContainer SID scoped default deny"),
+        displayData: display_data(
+            "harness default-deny",
+            "AppContainer SID scoped default deny",
+        ),
         flags: FWPM_FILTER_FLAG_NONE,
         providerKey: &mut provider_key as *mut GUID,
         layerKey: layer,
@@ -295,73 +730,120 @@ unsafe fn add_default_deny_filter(
         filterCondition: &condition as *const FWPM_FILTER_CONDITION0 as *mut FWPM_FILTER_CONDITION0,
         action: FWPM_ACTION0 {
             r#type: FWP_ACTION_BLOCK,
-            Anonymous: FWPM_ACTION0_0 { filterType: GUID::zeroed() },
+            Anonymous: FWPM_ACTION0_0 {
+                filterType: GUID::zeroed(),
+            },
         },
         ..Default::default()
     };
     check(
-        FwpmFilterAdd0(engine, &filter as *const FWPM_FILTER0, PSECURITY_DESCRIPTOR::default(), None),
+        FwpmFilterAdd0(
+            engine,
+            &filter as *const FWPM_FILTER0,
+            PSECURITY_DESCRIPTOR::default(),
+            None,
+        ),
         "FwpmFilterAdd0 (default deny)",
     )
 }
 
-unsafe fn add_allow_v4_filter(
+unsafe fn add_allow_v4_loopback_ports_filter(
     engine: HANDLE,
     container_sid: PSID,
-    ips: &[std::net::Ipv4Addr],
+    ports: &[u16],
+    protocol: u8,
 ) -> Result<(), WfpError> {
-    let addr_masks: Vec<FWP_V4_ADDR_AND_MASK> = ips
-        .iter()
-        .map(|ip| FWP_V4_ADDR_AND_MASK {
-            addr: u32::from(*ip),
-            mask: u32::MAX,
-        })
-        .collect();
-    // 同一fieldKey(IP_REMOTE_ADDRESS)の複数条件はOR結合される（仕様書§4.5「フィルタ本数の最適化」）。
-    let mut conditions: Vec<FWPM_FILTER_CONDITION0> = addr_masks
-        .iter()
-        .map(|m| FWPM_FILTER_CONDITION0 {
-            fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
-            matchType: FWP_MATCH_EQUAL,
-            conditionValue: FWP_CONDITION_VALUE0 {
-                r#type: FWP_V4_ADDR_MASK,
-                Anonymous: FWP_CONDITION_VALUE0_0 {
-                    v4AddrMask: m as *const FWP_V4_ADDR_AND_MASK as *mut FWP_V4_ADDR_AND_MASK,
-                },
-            },
-        })
-        .collect();
-    conditions.push(package_id_condition(container_sid));
+    let loopback = FWP_V4_ADDR_AND_MASK {
+        addr: u32::from(std::net::Ipv4Addr::LOCALHOST),
+        mask: u32::MAX,
+    };
+    let mut conditions = loopback_port_conditions_v4(container_sid, &loopback, ports, protocol);
     add_allow_filter(engine, FWPM_LAYER_ALE_AUTH_CONNECT_V4, &mut conditions)
 }
 
-unsafe fn add_allow_v6_filter(
+unsafe fn add_allow_v6_loopback_ports_filter(
     engine: HANDLE,
     container_sid: PSID,
-    ips: &[std::net::Ipv6Addr],
+    ports: &[u16],
+    protocol: u8,
 ) -> Result<(), WfpError> {
-    let addr_masks: Vec<FWP_V6_ADDR_AND_MASK> = ips
+    let loopback = FWP_V6_ADDR_AND_MASK {
+        addr: std::net::Ipv6Addr::LOCALHOST.octets(),
+        prefixLength: 128,
+    };
+    let mut conditions = loopback_port_conditions_v6(container_sid, &loopback, ports, protocol);
+    add_allow_filter(engine, FWPM_LAYER_ALE_AUTH_CONNECT_V6, &mut conditions)
+}
+
+unsafe fn loopback_port_conditions_v4(
+    container_sid: PSID,
+    loopback: &FWP_V4_ADDR_AND_MASK,
+    ports: &[u16],
+    protocol: u8,
+) -> Vec<FWPM_FILTER_CONDITION0> {
+    let mut conditions = Vec::with_capacity(ports.len() + 3);
+    conditions.push(FWPM_FILTER_CONDITION0 {
+        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+        matchType: FWP_MATCH_EQUAL,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_V4_ADDR_MASK,
+            Anonymous: FWP_CONDITION_VALUE0_0 {
+                v4AddrMask: loopback as *const FWP_V4_ADDR_AND_MASK as *mut FWP_V4_ADDR_AND_MASK,
+            },
+        },
+    });
+    conditions.push(protocol_condition(protocol));
+    conditions.extend(remote_port_conditions(ports));
+    conditions.push(package_id_condition(container_sid));
+    conditions
+}
+
+unsafe fn loopback_port_conditions_v6(
+    container_sid: PSID,
+    loopback: &FWP_V6_ADDR_AND_MASK,
+    ports: &[u16],
+    protocol: u8,
+) -> Vec<FWPM_FILTER_CONDITION0> {
+    let mut conditions = Vec::with_capacity(ports.len() + 3);
+    conditions.push(FWPM_FILTER_CONDITION0 {
+        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+        matchType: FWP_MATCH_EQUAL,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_V6_ADDR_MASK,
+            Anonymous: FWP_CONDITION_VALUE0_0 {
+                v6AddrMask: loopback as *const FWP_V6_ADDR_AND_MASK as *mut FWP_V6_ADDR_AND_MASK,
+            },
+        },
+    });
+    conditions.push(protocol_condition(protocol));
+    conditions.extend(remote_port_conditions(ports));
+    conditions.push(package_id_condition(container_sid));
+    conditions
+}
+
+fn protocol_condition(protocol: u8) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: FWPM_CONDITION_IP_PROTOCOL,
+        matchType: FWP_MATCH_EQUAL,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_UINT8,
+            Anonymous: FWP_CONDITION_VALUE0_0 { uint8: protocol },
+        },
+    }
+}
+
+fn remote_port_conditions(ports: &[u16]) -> Vec<FWPM_FILTER_CONDITION0> {
+    ports
         .iter()
-        .map(|ip| FWP_V6_ADDR_AND_MASK {
-            addr: ip.octets(),
-            prefixLength: 128,
-        })
-        .collect();
-    let mut conditions: Vec<FWPM_FILTER_CONDITION0> = addr_masks
-        .iter()
-        .map(|m| FWPM_FILTER_CONDITION0 {
-            fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+        .map(|port| FWPM_FILTER_CONDITION0 {
+            fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
             matchType: FWP_MATCH_EQUAL,
             conditionValue: FWP_CONDITION_VALUE0 {
-                r#type: FWP_V6_ADDR_MASK,
-                Anonymous: FWP_CONDITION_VALUE0_0 {
-                    v6AddrMask: m as *const FWP_V6_ADDR_AND_MASK as *mut FWP_V6_ADDR_AND_MASK,
-                },
+                r#type: FWP_UINT16,
+                Anonymous: FWP_CONDITION_VALUE0_0 { uint16: *port },
             },
         })
-        .collect();
-    conditions.push(package_id_condition(container_sid));
-    add_allow_filter(engine, FWPM_LAYER_ALE_AUTH_CONNECT_V6, &mut conditions)
+        .collect()
 }
 
 unsafe fn add_allow_filter(
@@ -388,50 +870,21 @@ unsafe fn add_allow_filter(
         filterCondition: conditions.as_mut_ptr(),
         action: FWPM_ACTION0 {
             r#type: FWP_ACTION_PERMIT,
-            Anonymous: FWPM_ACTION0_0 { filterType: GUID::zeroed() },
+            Anonymous: FWPM_ACTION0_0 {
+                filterType: GUID::zeroed(),
+            },
         },
         ..Default::default()
     };
     check(
-        FwpmFilterAdd0(engine, &filter as *const FWPM_FILTER0, PSECURITY_DESCRIPTOR::default(), None),
+        FwpmFilterAdd0(
+            engine,
+            &filter as *const FWPM_FILTER0,
+            PSECURITY_DESCRIPTOR::default(),
+            None,
+        ),
         "FwpmFilterAdd0 (allow)",
     )
-}
-
-/// `allow_domains`をOS標準リゾルバ経由（`std::net::ToSocketAddrs`＝`GetAddrInfoW`）で解決し、
-/// v4/v6アドレスのリストへ分ける。1件でも解決できたドメインがあれば全体は成功として扱う
-/// （一部のドメインだけDNS失敗しても、他の許可ドメインへの通信は妨げたくない）。
-fn resolve_allow_domains(
-    domains: &[String],
-) -> Result<(Vec<std::net::Ipv4Addr>, Vec<std::net::Ipv6Addr>), WfpError> {
-    let mut v4 = Vec::new();
-    let mut v6 = Vec::new();
-    for domain in domains {
-        let query = format!("{domain}:443");
-        match query.to_socket_addrs() {
-            Ok(addrs) => {
-                for addr in addrs {
-                    match addr.ip() {
-                        IpAddr::V4(ip) => v4.push(ip),
-                        IpAddr::V6(ip) => v6.push(ip),
-                    }
-                }
-            }
-            Err(e) => {
-                // 1ドメインのDNS失敗で全体を止めない(ログのみ、呼び出し元がまとめて診断できるよう
-                // netfilterd側のログへ記録する)。ここでは呼び出し元に伝播させず継続する。
-                let _ = WfpError::DnsResolve {
-                    domain: domain.clone(),
-                    reason: e.to_string(),
-                };
-            }
-        }
-    }
-    v4.sort();
-    v4.dedup();
-    v6.sort();
-    v6.dedup();
-    Ok((v4, v6))
 }
 
 #[cfg(test)]
@@ -443,8 +896,14 @@ mod tests {
     #[test]
     fn provider_and_sublayer_keys_are_distinct_and_stable() {
         assert_ne!(PROVIDER_KEY, SUBLAYER_KEY);
-        assert_eq!(PROVIDER_KEY, GUID::from_u128(0x8f2c1a90_5e4b_4b8a_9c3d_1a2b3c4d5e6f));
-        assert_eq!(SUBLAYER_KEY, GUID::from_u128(0x8f2c1a91_5e4b_4b8a_9c3d_1a2b3c4d5e6f));
+        assert_eq!(
+            PROVIDER_KEY,
+            GUID::from_u128(0x8f2c1a90_5e4b_4b8a_9c3d_1a2b3c4d5e6f)
+        );
+        assert_eq!(
+            SUBLAYER_KEY,
+            GUID::from_u128(0x8f2c1a91_5e4b_4b8a_9c3d_1a2b3c4d5e6f)
+        );
     }
 
     #[test]
@@ -453,9 +912,263 @@ mod tests {
     }
 
     #[test]
-    fn resolve_allow_domains_handles_empty_list() {
-        let (v4, v6) = resolve_allow_domains(&[]).unwrap();
-        assert!(v4.is_empty());
-        assert!(v6.is_empty());
+    fn options_with_only_legacy_allow_domains_are_fail_closed() {
+        let opts = WfpOptions {
+            allow_domains: vec!["example.com".to_string()],
+            allow_loopback: false,
+            allow_loopback_ports: Vec::new(),
+            allow_loopback_tcp_ports: Vec::new(),
+            allow_loopback_udp_ports: Vec::new(),
+            allow_direct_dns: false,
+            audit_log_path: None,
+        };
+        match WfpSession::apply(PSID::default(), &opts) {
+            Err(WfpError::NoAddressesResolved) => {}
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("domain-only WFP options must not open an external allow path"),
+        }
+    }
+
+    #[test]
+    fn legacy_broad_allow_loopback_without_ports_is_fail_closed() {
+        let opts = WfpOptions {
+            allow_domains: Vec::new(),
+            allow_loopback: true,
+            allow_loopback_ports: Vec::new(),
+            allow_loopback_tcp_ports: Vec::new(),
+            allow_loopback_udp_ports: Vec::new(),
+            allow_direct_dns: false,
+            audit_log_path: None,
+        };
+        match WfpSession::apply(PSID::default(), &opts) {
+            Err(WfpError::NoAddressesResolved) => {}
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("broad loopback allow must not be treated as a v1 permit path"),
+        }
+    }
+
+    #[test]
+    fn remote_port_conditions_use_ip_remote_port_field() {
+        let conditions = remote_port_conditions(&[18080, 18053]);
+        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions[0].fieldKey, FWPM_CONDITION_IP_REMOTE_PORT);
+        assert_eq!(conditions[1].fieldKey, FWPM_CONDITION_IP_REMOTE_PORT);
+        assert_eq!(conditions[0].conditionValue.r#type, FWP_UINT16);
+        assert_eq!(conditions[1].conditionValue.r#type, FWP_UINT16);
+        unsafe {
+            assert_eq!(conditions[0].conditionValue.Anonymous.uint16, 18080);
+            assert_eq!(conditions[1].conditionValue.Anonymous.uint16, 18053);
+        }
+    }
+
+    #[test]
+    fn loopback_port_conditions_include_ip_protocol_field() {
+        let loopback = FWP_V4_ADDR_AND_MASK {
+            addr: u32::from(std::net::Ipv4Addr::LOCALHOST),
+            mask: u32::MAX,
+        };
+        let conditions =
+            unsafe { loopback_port_conditions_v4(PSID::default(), &loopback, &[18080], 6) };
+        assert!(
+            conditions
+                .iter()
+                .any(|condition| condition.fieldKey == FWPM_CONDITION_IP_PROTOCOL
+                    && condition.conditionValue.r#type == FWP_UINT8
+                    && unsafe { condition.conditionValue.Anonymous.uint8 } == 6),
+            "loopback permit filters must be protocol-scoped"
+        );
+    }
+
+    #[test]
+    fn protocol_name_maps_common_ip_protocol_numbers() {
+        assert_eq!(protocol_name(6), "tcp");
+        assert_eq!(protocol_name(17), "udp");
+        assert_eq!(protocol_name(1), "icmp");
+        assert_eq!(protocol_name(58), "icmpv6");
+        assert_eq!(protocol_name(132), "ip");
+    }
+
+    #[test]
+    fn wfp_audit_sink_appends_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("net-audit.jsonl");
+        let sink = WfpAuditSink { path: path.clone() };
+        sink.record(&WfpAuditEntry {
+            timestamp_unix_ms: 123,
+            kind: "wfp",
+            protocol: "tcp",
+            allowed: false,
+            reason: "classify_drop",
+            local_addr: Some("127.0.0.1".to_string()),
+            local_port: 50000,
+            remote_addr: Some("127.0.0.1".to_string()),
+            remote_host: None,
+            remote_port: 18080,
+            filter_id: Some(42),
+            layer_id: Some(44),
+        });
+
+        let text = std::fs::read_to_string(path).unwrap();
+        let line = text.lines().next().unwrap();
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["kind"], "wfp");
+        assert_eq!(value["protocol"], "tcp");
+        assert_eq!(value["allowed"], false);
+        assert_eq!(value["reason"], "classify_drop");
+        assert_eq!(value["remote_port"], 18080);
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    #[test]
+    fn wfp_audit_sink_resolves_fake_dns_mapping_from_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net-audit.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"kind":"fake_dns","host":"old.example","fake_ip":"198.18.0.1"}"#,
+                "\n",
+                r#"{"kind":"proxy","host":"ignored.example"}"#,
+                "\n",
+                r#"{"kind":"fake_dns","host":"latest.example","fake_ip":"198.18.0.1"}"#,
+                "\n",
+                r#"{"kind":"fake_dns","host":"other.example","fake_ip":"198.18.0.2"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let sink = WfpAuditSink { path };
+        assert_eq!(
+            sink.lookup_fake_dns_host("198.18.0.1"),
+            Some("latest.example".to_string())
+        );
+        assert_eq!(sink.lookup_fake_dns_host("198.18.0.99"), None);
+    }
+
+    #[test]
+    fn wfp_audit_entry_can_include_fake_dns_remote_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net-audit.jsonl");
+        let sink = WfpAuditSink { path: path.clone() };
+        sink.record(&WfpAuditEntry {
+            timestamp_unix_ms: 124,
+            kind: "wfp",
+            protocol: "tcp",
+            allowed: false,
+            reason: "classify_drop",
+            local_addr: Some("127.0.0.1".to_string()),
+            local_port: 50001,
+            remote_addr: Some("198.18.0.1".to_string()),
+            remote_host: Some("example.com".to_string()),
+            remote_port: 443,
+            filter_id: Some(43),
+            layer_id: Some(44),
+        });
+
+        let text = std::fs::read_to_string(path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["remote_addr"], "198.18.0.1");
+        assert_eq!(value["remote_host"], "example.com");
+    }
+
+    /// 管理者権限+BFE有効なWindows実機でのみ手動実行するE2E。
+    ///
+    /// 実行例:
+    /// `cargo test -p harness-sandbox wfp::tests::e2e_wfp_blocks_direct_external_connect_and_logs_drop -- --ignored --nocapture`
+    ///
+    /// このテストは、対象AppContainerに`internetClient`を付与したうえで、WFPを
+    /// default-deny + loopbackポート限定allowとして適用する。loopback許可ポートへの接続は成功し、
+    /// 外部IPへの直接connectは失敗し、可能ならWFP dropイベントがJSONLへ記録されることを確認する。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires administrator token, BFE, and real Windows AppContainer/WFP state"]
+    fn e2e_wfp_blocks_direct_external_connect_and_logs_drop() {
+        if !crate::privhelper::is_elevated() {
+            panic!("WFP E2E requires an elevated administrator token");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("net-audit.jsonl");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let allowed_port = listener.local_addr().unwrap().port();
+        let accept_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => return,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let sid = crate::win_appcontainer::ensure_profile(crate::win_appcontainer::CONTAINER_NAME)
+            .expect("ensure AppContainer profile");
+        crate::win_appcontainer::grant_ace_recursive(dir.path(), sid.as_psid())
+            .expect("grant temp dir ACE to AppContainer");
+        let opts = WfpOptions {
+            allow_domains: Vec::new(),
+            allow_loopback: false,
+            allow_loopback_ports: vec![allowed_port],
+            allow_loopback_tcp_ports: Vec::new(),
+            allow_loopback_udp_ports: Vec::new(),
+            allow_direct_dns: false,
+            audit_log_path: Some(audit_path.clone()),
+        };
+        let session = WfpSession::apply(sid.as_psid(), &opts).expect("apply WFP rules");
+        let (shell, _) = crate::win_appcontainer::resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let command = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             $ok = $false; \
+             try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('127.0.0.1', {allowed_port}); $c.Close(); $ok = $true }} catch {{ }}; \
+             $blocked = $false; \
+             try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('8.8.8.8', 53); $c.Close() }} catch {{ $blocked = $true }}; \
+             if ($ok -and $blocked) {{ Write-Output 'HARNESS_WFP_E2E_OK'; exit 0 }} else {{ Write-Output \"ok=$ok blocked=$blocked\"; exit 7 }}"
+        );
+        let child = crate::win_appcontainer::spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", &command],
+            dir.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            crate::win_appcontainer::NetworkCapability::InternetClient,
+        )
+        .expect("spawn AppContainer child");
+        let (stdout, stderr, code) = child.write_stdin_read_output_and_wait(None).unwrap();
+        let _ = accept_thread.join();
+        assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+        assert!(
+            stdout.contains("HARNESS_WFP_E2E_OK"),
+            "stdout={stdout}\nstderr={stderr}"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut saw_drop = false;
+        while std::time::Instant::now() < deadline {
+            let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
+            saw_drop = text.lines().any(|line| {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    return false;
+                };
+                value.get("kind").and_then(|v| v.as_str()) == Some("wfp")
+                    && value.get("allowed").and_then(|v| v.as_bool()) == Some(false)
+            });
+            if saw_drop {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        session.teardown().expect("teardown WFP rules");
+        assert!(
+            saw_drop,
+            "expected WFP drop event in {}",
+            audit_path.display()
+        );
     }
 }
