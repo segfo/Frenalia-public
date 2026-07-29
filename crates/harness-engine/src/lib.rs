@@ -68,6 +68,124 @@ fn estimate_tokens(req: &CompletionRequest) -> u64 {
         .unwrap_or(0)
 }
 
+pub(crate) fn sanitize_completion_request_for_tier3(req: &mut CompletionRequest) {
+    for block in &mut req.system {
+        sanitize_string(&mut block.text);
+    }
+    sanitize_messages_for_tier3(&mut req.messages);
+    for tool in &mut req.tools {
+        sanitize_string(&mut tool.description);
+        sanitize_json_value(&mut tool.input_schema);
+    }
+}
+
+fn sanitize_messages_for_tier3(messages: &mut [Message]) {
+    for msg in messages {
+        sanitize_content_blocks_for_tier3(&mut msg.content);
+    }
+}
+
+fn sanitize_content_blocks_for_tier3(blocks: &mut Vec<ContentBlock>) {
+    blocks.retain_mut(|block| {
+        match block {
+            ContentBlock::Text(text) => {
+                sanitize_string(text);
+                true
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => false,
+            ContentBlock::ToolUse {
+                id: _,
+                name: _,
+                input,
+            } => {
+                sanitize_json_value(input);
+                true
+            }
+            ContentBlock::ToolResult {
+                content,
+                ..
+            } => {
+                sanitize_string(content);
+                true
+            }
+            ContentBlock::Image { .. } => true,
+        }
+    });
+}
+
+fn sanitize_tool_output_for_tier3(output: &mut ToolOutput) {
+    sanitize_string(&mut output.content);
+}
+
+fn sanitize_visible_delta_for_tier3(text: &str, ctx: &ToolCtx) -> String {
+    if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+        redact_windows_absolute_paths(text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn sanitize_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => sanitize_string(s),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_json_value(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_key, value) in map {
+                sanitize_json_value(value);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn sanitize_string(s: &mut String) {
+    *s = redact_windows_absolute_paths(s);
+}
+
+fn redact_windows_absolute_paths(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if is_windows_drive_path_at(&chars, i) {
+            out.push_str("/workspace");
+            i += 3;
+            while i < chars.len() && is_windows_path_char(chars[i]) {
+                i += 1;
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn is_windows_drive_path_at(chars: &[char], i: usize) -> bool {
+    i + 2 < chars.len()
+        && chars[i].is_ascii_alphabetic()
+        && chars[i + 1] == ':'
+        && is_windows_separator(chars[i + 2])
+}
+
+fn is_windows_separator(c: char) -> bool {
+    c == '\\' || c == '/' || c == '¥'
+}
+
+fn is_windows_path_char(c: char) -> bool {
+    !c.is_whitespace()
+        && !matches!(
+            c,
+            '"' | '\'' | '`' | ')' | '）' | ']' | '】' | '}' | '。' | '、' | ',' | ';' | '|'
+        )
+}
+
 /// リトライ可能な`ProviderError`（`RateLimited`/`Overloaded`/`Transport{retriable:true}`）かどうか。
 /// `ContextTooLong`はここに含めない（呼び出し側でコンテキスト圧縮を挟んでから明示的に再試行する、
 /// §主なリスクと対策「分類を確定。外周の共通リトライラッパがこれを見てリトライ可否・待機を決める」）。
@@ -356,7 +474,7 @@ where
             return Ok(cancelled_outcome());
         }
 
-        let req = CompletionRequest {
+        let mut req = CompletionRequest {
             system: state.system.clone(),
             messages: state.messages.clone(),
             tools: tool_specs.clone(),
@@ -378,6 +496,9 @@ where
             sampling: Sampling::default(),
             model: config.model.clone(),
         };
+        if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+            sanitize_completion_request_for_tier3(&mut req);
+        }
         emit(
             events,
             AgentEvent::TurnStarted {
@@ -401,6 +522,10 @@ where
                     messages: state.messages.clone(),
                     ..req
                 };
+                let mut retry_req = retry_req;
+                if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+                    sanitize_completion_request_for_tier3(&mut retry_req);
+                }
                 match stream_with_retry(provider, &retry_req).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -451,14 +576,16 @@ where
                     tool_input_raw: String::new(),
                 }),
                 StreamEvent::TextDelta { index, text } => {
-                    on_text_delta(&text);
-                    emit(events, AgentEvent::TextDelta { text: text.clone() });
+                    let visible_text = sanitize_visible_delta_for_tier3(&text, ctx);
+                    on_text_delta(&visible_text);
+                    emit(events, AgentEvent::TextDelta { text: visible_text });
                     if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
                         b.text.push_str(&text);
                     }
                 }
                 StreamEvent::ThinkingDelta { index, text } => {
-                    emit(events, AgentEvent::ThinkingDelta { text: text.clone() });
+                    let visible_text = sanitize_visible_delta_for_tier3(&text, ctx);
+                    emit(events, AgentEvent::ThinkingDelta { text: visible_text });
                     if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
                         b.text.push_str(&text);
                     }
@@ -511,6 +638,9 @@ where
                     malformed.insert(m.id.clone(), m);
                 }
             }
+        }
+        if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+            sanitize_content_blocks_for_tier3(&mut content);
         }
 
         state.messages.push(Message {
@@ -618,6 +748,10 @@ where
                     },
                     }
                 };
+                let mut output = output;
+                if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+                    sanitize_tool_output_for_tier3(&mut output);
+                }
                 let truncated_content = truncate_head_tail(&output.content, MAX_TOOL_OUTPUT_CHARS);
                 emit(
                     events,
@@ -773,11 +907,40 @@ mod tests {
         let provider = RecordingProvider {
             seen_requests: std::sync::Arc::clone(&seen_requests),
         };
-        let mut state = ConversationState::new(Vec::new());
-        state.push_user_text("list files");
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
         let mut ctx = ToolCtx::new(dir.path().to_path_buf());
+        ctx.workspace_root = std::path::PathBuf::from(r"C:\Users\me\project");
         ctx.shell_tier = harness_core::ShellTierSelection::direct(harness_core::ShellTier::Tier3);
+        let mut state = ConversationState::new(system_blocks_for(&ctx));
+        state.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text(r"old thought mentioned C:\Users\me\project".to_string()),
+                ContentBlock::Thinking {
+                    text: r"signed thought mentioned C:\Users\me\project".to_string(),
+                    signature: Some("signed".to_string()),
+                },
+                ContentBlock::RedactedThinking {
+                    data: r"redacted thought mentioned C:\Users\me\project".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "old_call".to_string(),
+                    name: "run_shell".to_string(),
+                    input: serde_json::json!({
+                        "command": r#"Get-ChildItem "C:\Users\me\project""#,
+                    }),
+                },
+            ],
+        });
+        state.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "old_call".to_string(),
+                content: r"old result mentioned C:\Users\me\project".to_string(),
+                is_error: true,
+            }],
+        });
+        state.push_user_text("list files");
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
 
         run_agent_loop(
@@ -810,6 +973,68 @@ mod tests {
             run_shell.description
         );
         assert!(!run_shell.description.contains("PowerShell"));
+        assert_eq!(requests[0].system.len(), 1);
+        let system = &requests[0].system[0].text;
+        assert!(system.contains("ワークスペースルート: /workspace"), "{system}");
+        assert!(!system.contains(r"C:\Users"), "{system}");
+        let request_json = serde_json::to_string(&requests[0]).unwrap();
+        assert!(!request_json.contains(r"C:\Users"), "{request_json}");
+        assert!(!request_json.contains("Windowsホスト"), "{request_json}");
+        assert!(!request_json.contains("ホスト側"), "{request_json}");
+        assert!(!request_json.contains("ホストOS"), "{request_json}");
+        assert!(!request_json.contains("signed thought"), "{request_json}");
+        assert!(!request_json.contains("redacted thought"), "{request_json}");
+        assert!(request_json.contains("/workspace"), "{request_json}");
+    }
+
+    #[tokio::test]
+    async fn tier3_text_deltas_are_sanitized_before_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            turns: Mutex::new(vec![end_turn(r"checking C:\Users\me\project")]),
+        };
+        let tools = harness_tools::ToolRegistry::with_builtin_tools();
+        let mut ctx = ToolCtx::new(dir.path().to_path_buf());
+        ctx.shell_tier = harness_core::ShellTierSelection::direct(harness_core::ShellTier::Tier3);
+        let mut state = ConversationState::new(system_blocks_for(&ctx));
+        state.push_user_text("hi");
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let visible = std::sync::Arc::new(Mutex::new(String::new()));
+        let visible_for_callback = std::sync::Arc::clone(&visible);
+
+        let outcome = run_agent_loop(
+            &provider,
+            &mut state,
+            &tools,
+            &ctx,
+            &arbiter,
+            AgentLoopConfig {
+                model: "mock".into(),
+                max_tokens: 100,
+                max_turns: 5,
+            },
+            Some(&events_tx),
+            None,
+            |delta| visible_for_callback.lock().unwrap().push_str(delta),
+        )
+        .await
+        .unwrap();
+
+        let callback_text = visible.lock().unwrap().clone();
+        let mut event_text = String::new();
+        while let Ok(event) = events_rx.try_recv() {
+            if let AgentEvent::TextDelta { text } = event {
+                event_text.push_str(&text);
+            }
+        }
+
+        assert!(!outcome.text.contains(r"C:\Users"), "{}", outcome.text);
+        assert!(!callback_text.contains(r"C:\Users"), "{callback_text}");
+        assert!(!event_text.contains(r"C:\Users"), "{event_text}");
+        assert!(outcome.text.contains("/workspace"), "{}", outcome.text);
+        assert!(callback_text.contains("/workspace"), "{callback_text}");
+        assert!(event_text.contains("/workspace"), "{event_text}");
     }
 
     fn find_tool_result(state: &ConversationState) -> (String, bool) {

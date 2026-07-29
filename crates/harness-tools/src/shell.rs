@@ -59,13 +59,13 @@ const RUN_SHELL_TIER3_DESCRIPTION: &str =
          実行されるため、POSIX sh互換の構文とLinuxパスを使うこと。Windows専用コマンドレットや\
          `$env:...`構文は使わない。";
 
-fn run_shell_input_schema(command_description: &str) -> serde_json::Value {
+fn run_shell_input_schema(command_description: &str, cwd_description: &str) -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
             "command": { "type": "string", "description": command_description },
             "timeout_ms": { "type": "integer", "description": "タイムアウト（ミリ秒、省略時120000）" },
-            "cwd": { "type": "string", "description": "ワークスペースルートからの相対作業ディレクトリ" }
+            "cwd": { "type": "string", "description": cwd_description }
         },
         "required": ["command"],
         "additionalProperties": false
@@ -148,7 +148,10 @@ impl Tool for RunShellTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        run_shell_input_schema("実行するシェルコマンド")
+        run_shell_input_schema(
+            "実行するシェルコマンド",
+            "ワークスペースルートからの相対作業ディレクトリ",
+        )
     }
 
     fn spec_for_ctx(&self, ctx: &ToolCtx) -> harness_core::ToolSpec {
@@ -158,6 +161,7 @@ impl Tool for RunShellTool {
                 description: RUN_SHELL_TIER3_DESCRIPTION.to_string(),
                 input_schema: run_shell_input_schema(
                     "AlmaLinux VM内のIncusコンテナで`sh -c`へ渡すコマンド。POSIX sh互換の構文とLinuxパスを使う",
+                    "`/workspace`からの相対作業ディレクトリ",
                 ),
             }
         } else {
@@ -846,6 +850,22 @@ mod tests {
             "{}",
             command_description
         );
+        let cwd_description = spec
+            .input_schema
+            .pointer("/properties/cwd/description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            cwd_description.contains("/workspace"),
+            "{}",
+            cwd_description
+        );
+        assert!(
+            cwd_description.contains("相対作業ディレクトリ"),
+            "{}",
+            cwd_description
+        );
+        assert!(!cwd_description.contains("ホスト"), "{}", cwd_description);
     }
 
     #[test]
@@ -864,6 +884,15 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(command_description, "実行するシェルコマンド");
+        let cwd_description = spec
+            .input_schema
+            .pointer("/properties/cwd/description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            cwd_description,
+            "ワークスペースルートからの相対作業ディレクトリ"
+        );
     }
 
     #[tokio::test]

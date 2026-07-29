@@ -602,6 +602,42 @@ fn map_error_response(status: u16, body: &str, retry_after: Option<Duration>) ->
 mod tests {
     use super::*;
 
+    #[test]
+    fn system_blocks_are_sent_as_first_openai_system_message() {
+        let req = CompletionRequest {
+            system: vec![
+                harness_core::SystemBlock {
+                    text: "system facts".to_string(),
+                    cache: true,
+                },
+                harness_core::SystemBlock {
+                    text: "more facts".to_string(),
+                    cache: false,
+                },
+            ],
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text("hello".to_string())],
+            }],
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            output: None,
+            parallel_tool_calls: None,
+            max_tokens: 100,
+            sampling: Default::default(),
+            model: "gpt-test".to_string(),
+        };
+
+        let wire = to_wire_request(&req);
+        let value = serde_json::to_value(&wire).unwrap();
+        let messages = value["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "system facts\n\nmore facts");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "hello");
+    }
+
     /// 標準的なOpenAI Chat Completionsのtool_callチャンク（`index`が毎回明示される）。
     /// §実装マイルストーン M6検証条件「同一プロンプトが3プロバイダで動く」のワイヤ層に相当する
     /// 部分を、実HTTP無しで確認する。

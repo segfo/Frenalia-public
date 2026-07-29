@@ -36,6 +36,8 @@ use crate::tool::{
     StagingConfig, StagingMode, ToolCtx,
 };
 
+const TIER3_WORKSPACE_ROOT: &str = "/workspace";
+
 /// 実行ホストのOS種別。コンパイル時の`cfg`で決まり、実行中は変化しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OsKind {
@@ -123,10 +125,11 @@ pub fn render(facts: &EnvironmentFacts) -> String {
     );
 
     lines.push(render_os_and_shell(os, shell_tier.tier));
+    let visible_workspace_root = render_workspace_root(workspace_root, shell_tier.tier);
     lines.push(format!(
         "ワークスペースルート: {}。run_shellのcwdは省略時このルートになり、相対パスもここから\
          解決されます。",
-        workspace_root.display()
+        visible_workspace_root
     ));
     lines.push(render_staging(staging, *shell_sees_staged_writes));
     lines.push(render_read_scope(read_scope));
@@ -143,10 +146,10 @@ pub fn render(facts: &EnvironmentFacts) -> String {
 
 fn render_os_and_shell(os: &OsKind, tier: ShellTier) -> String {
     if tier == ShellTier::Tier3 {
-        return "OS: Windowsホスト上のTier3。run_shellはホスト側シェルではなく、\
-                AlmaLinux VM内のIncusコンテナで`sh -c`として実行されます。Windows専用構文\
-                （`Get-ChildItem`・`Set-Content`・`$env:...`等）は使わず、POSIX sh互換の構文\
-                とLinuxパスを使ってください。"
+        return "OS: Tier3のLinuxコンテナ実行環境。run_shellはAlmaLinux VM内のIncusコンテナで\
+                `sh -c`として実行されます。POSIX sh互換の構文とLinuxパスを使ってください。\
+                Windows専用構文（`Get-ChildItem`・`Set-Content`・`$env:...`等）は使わないで\
+                ください。"
             .to_string();
     }
 
@@ -161,6 +164,15 @@ fn render_os_and_shell(os: &OsKind, tier: ShellTier) -> String {
             "OS: Linux/macOS。run_shellは`sh -c`で実行されます。".to_string()
         }
         OsKind::Other => "OS: 不明。run_shellの実行シェルは環境依存です。".to_string(),
+    }
+}
+
+fn render_workspace_root(workspace_root: &std::path::Path, tier: ShellTier) -> String {
+    match tier {
+        ShellTier::Tier3 => TIER3_WORKSPACE_ROOT.to_string(),
+        ShellTier::Tier2 | ShellTier::Tier1a | ShellTier::Tier1b | ShellTier::Tier0 => {
+            workspace_root.display().to_string()
+        }
     }
 }
 
@@ -396,18 +408,38 @@ mod tests {
 
         assert!(rendered.contains("Incusコンテナで`sh -c`"));
         assert!(rendered.contains("POSIX sh互換"));
+        assert!(rendered.contains("OS: Tier3のLinuxコンテナ実行環境"));
+        assert!(!rendered.contains("OS: Windowsホスト上のTier3"), "{rendered}");
         assert!(!rendered.contains("run_shellはPowerShell"), "{rendered}");
+    }
+
+    #[test]
+    fn tier3_prompt_uses_container_workspace_root_even_on_windows_host() {
+        let mut facts = facts_for(ShellTier::Tier3, StagingMode::Live);
+        facts.os = OsKind::Windows;
+        facts.workspace_root = PathBuf::from(r"C:\Users\me\project");
+
+        let rendered = render(&facts);
+
+        assert!(
+            rendered.contains("ワークスペースルート: /workspace"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(r"C:\Users"), "{rendered}");
+        assert!(!rendered.contains("ホスト側"), "{rendered}");
     }
 
     #[test]
     fn windows_non_tier3_prompt_keeps_powershell_shell_guidance() {
         let mut facts = facts_for(ShellTier::Tier1b, StagingMode::Live);
         facts.os = OsKind::Windows;
+        facts.workspace_root = PathBuf::from(r"C:\Users\me\project");
 
         let rendered = render(&facts);
 
         assert!(rendered.contains("run_shellはPowerShell"), "{rendered}");
         assert!(rendered.contains("Windows PowerShell 5.1"));
+        assert!(rendered.contains(r"C:\Users\me\project"), "{rendered}");
     }
 
     #[test]

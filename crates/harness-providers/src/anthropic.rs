@@ -510,3 +510,33 @@ fn map_stream_error(detail: &WireErrorDetail) -> ProviderError {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_blocks_are_sent_as_anthropic_system_array() {
+        let req = CompletionRequest {
+            system: vec![harness_core::SystemBlock {
+                text: "system facts".to_string(),
+                cache: true,
+            }],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            output: None,
+            parallel_tool_calls: None,
+            max_tokens: 100,
+            sampling: Default::default(),
+            model: "claude-test".to_string(),
+        };
+
+        let wire = to_wire_request(&req);
+        let value = serde_json::to_value(&wire).unwrap();
+
+        assert_eq!(value["system"][0]["type"], "text");
+        assert_eq!(value["system"][0]["text"], "system facts");
+        assert_eq!(value["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+}

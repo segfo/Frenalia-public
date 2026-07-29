@@ -95,6 +95,8 @@ pub fn spawn_engine(
     mut session: SessionStore,
     sessions_dir: PathBuf,
 ) -> EngineHandle {
+    refresh_system_for_ctx(&mut state, &ctx);
+
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<String>();
     let (command_tx, mut command_rx) = mpsc::unbounded_channel::<EngineCommand>();
     let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -214,5 +216,74 @@ pub fn spawn_engine(
         events_rx,
         gate,
         cancel_slot,
+    }
+}
+
+fn refresh_system_for_ctx(state: &mut ConversationState, ctx: &ToolCtx) {
+    state.system = harness_engine::system_blocks_for(ctx);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use harness_core::{
+        NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, ShellTier, ShellTierSelection,
+        StagingConfig, StagingMode, ToolCtx,
+    };
+
+    use super::*;
+
+    #[test]
+    fn refresh_system_for_tier3_uses_container_workspace_not_windows_host_path() {
+        let stale_ctx = ToolCtx {
+            workspace_root: PathBuf::from(r"C:\Users\segfo\Documents\AI\harness"),
+            staging: StagingConfig {
+                mode: StagingMode::WorkspaceCommit,
+                explicit: false,
+                sandbox_dir: None,
+            },
+            read_scope: ReadScopeConfig {
+                mode: ReadMode::Whitelist,
+                allow: Vec::new(),
+                allow_descend: Vec::new(),
+                deny: Vec::new(),
+                deny_descend: Vec::new(),
+            },
+            shell_sees_staged_writes: true,
+            shell_tier: ShellTierSelection {
+                tier: ShellTier::Tier0,
+                reason: None,
+                downgraded_from: None,
+                granted_passthrough: Vec::new(),
+                passthrough_warnings: Vec::new(),
+                netfilterd_chain_attempted: false,
+            },
+            net_proxy: NetProxyConfig::default(),
+            net_app: NetAppPolicy::default(),
+            vm_sandbox: None,
+        };
+        let mut state = ConversationState::new(harness_engine::system_blocks_for(&stale_ctx));
+
+        let tier3_ctx = ToolCtx {
+            shell_tier: ShellTierSelection {
+                tier: ShellTier::Tier3,
+                ..stale_ctx.shell_tier.clone()
+            },
+            ..stale_ctx
+        };
+
+        refresh_system_for_ctx(&mut state, &tier3_ctx);
+        let rendered = state
+            .system
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("/workspace"));
+        assert!(rendered.contains("Linuxコンテナ実行環境"));
+        assert!(!rendered.contains(r"C:\Users"));
+        assert!(!rendered.contains("PowerShell"));
     }
 }

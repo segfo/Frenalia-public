@@ -69,7 +69,7 @@ pub async fn compact(
         content: vec![ContentBlock::Text(COMPACTION_INSTRUCTION.to_string())],
     });
 
-    let req = CompletionRequest {
+    let mut req = CompletionRequest {
         system: state.system.clone(),
         messages: to_summarize,
         tools: Vec::new(),
@@ -80,6 +80,13 @@ pub async fn compact(
         sampling: Sampling::default(),
         model: model.to_string(),
     };
+    if req
+        .system
+        .iter()
+        .any(|s| s.text.contains("Tier3のLinuxコンテナ実行環境"))
+    {
+        crate::sanitize_completion_request_for_tier3(&mut req);
+    }
 
     let mut stream = provider.stream(req).await?;
     let mut summary = String::new();
