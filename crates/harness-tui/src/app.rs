@@ -296,6 +296,7 @@ impl AppState {
 
     pub fn toggle_fold(&mut self) {
         self.collapsed = !self.collapsed;
+        self.scroll_offset = 0;
     }
 
     /// マウスホイールイベントを処理する。過去ログの閲覧を妨げないよう、承認モーダル表示中でも
@@ -319,6 +320,10 @@ impl AppState {
         if self.input.trim().is_empty() {
             return None;
         }
+        // A local submit starts a new visible turn. Even if the user had been
+        // browsing older transcript lines, jump back to live output so the
+        // prompt, Thinking indicator, and following deltas stay visible.
+        self.scroll_offset = 0;
         let text = std::mem::take(&mut self.input);
         self.input_cursor = 0;
         self.input_selection_anchor = None;
@@ -1480,6 +1485,20 @@ mod tests {
     }
 
     #[test]
+    fn submitting_input_returns_transcript_to_latest() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.scroll_lines(12);
+        for c in "hi".chars() {
+            app.on_key(key(c));
+        }
+
+        let action = app.on_key(alt(KeyCode::Enter));
+
+        assert!(matches!(action, Some(Action::Submit(text)) if text == "hi"));
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
     fn scroll_lines_clamps_at_zero_and_saturates_upward() {
         let mut app = AppState::new("mock".into(), "mock-model".into());
         assert_eq!(app.scroll_offset, 0);
@@ -1515,6 +1534,18 @@ mod tests {
 
         app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(app.collapsed);
+    }
+
+    #[test]
+    fn ctrl_o_returns_transcript_to_latest() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.scroll_lines(1);
+
+        let action = app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+
+        assert!(action.is_none());
+        assert!(!app.collapsed);
+        assert_eq!(app.scroll_offset, 0);
     }
 
     #[test]

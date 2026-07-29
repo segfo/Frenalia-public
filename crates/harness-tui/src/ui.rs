@@ -313,10 +313,17 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
 
 fn render_transcript(f: &mut Frame, area: Rect, app: &AppState) {
     let lines = transcript_lines(app, app.collapsed);
-    let total = lines.len() as u16;
+    let block = Block::default().borders(Borders::ALL);
+    let text_width = area.width.saturating_sub(2);
+    let total = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(text_width)
+        .min(u16::MAX as usize) as u16;
     let viewport = area.height.saturating_sub(2);
     // `AppState::scroll_offset`は総行数を知らずに増減されるため、ここで実際の行数に対して
-    // クランプする（上限を超えて遡ろうとしても先頭で止まる）。
+    // クランプする（上限を超えて遡ろうとしても先頭で止まる）。Paragraphのscrollはwrap後の
+    // 表示行を数えるため、ここもwrap後の行数で計算する。そうしないとCtrl+Oでツール出力や
+    // thinkingを展開した時、長い行の折り返し分だけ末尾までスクロールできなくなる。
     let max_offset = total.saturating_sub(viewport);
     let offset = app.scroll_offset.min(max_offset);
     let scroll = max_offset.saturating_sub(offset);
@@ -326,9 +333,8 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &AppState) {
     } else {
         "transcript".to_string()
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(lines)
-        .block(block)
+        .block(block.title(title))
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(paragraph, area);
@@ -616,5 +622,15 @@ mod tests {
         assert_eq!(input_scroll_start(5, 6), 0);
         assert_eq!(input_scroll_start(6, 6), 1);
         assert_eq!(input_scroll_start(9, 6), 4);
+    }
+
+    #[test]
+    fn paragraph_line_count_accounts_for_wrapped_transcript_lines() {
+        let lines = vec![Line::from("1234567890abcdefghij")];
+        let wrapped = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .line_count(10);
+
+        assert_eq!(wrapped, 2);
     }
 }
