@@ -1,5 +1,5 @@
 //! Windows Tier2a: AppContainer（package SID + capability SID）。
-//! `plans/DESIGN-SANDBOX.md` §6.3/§7 D-02参照。実験的・オプトイン（`--experimental-tier1a`）。
+//! `plans/DESIGN-SANDBOX.md` §6.3/§7 D-02参照。Windows既定Tier候補。
 //!
 //! Tier1（`win_restricted`、制限トークン + 低IL）と異なり、Tier2aは**トークンを差し替えず**
 //! `CreateProcessW`の拡張属性リストに`SECURITY_CAPABILITIES`を積むことで、呼び出しスレッド
@@ -135,9 +135,8 @@ pub fn ensure_profile(name: &str) -> Result<OwnedContainerSid, AppContainerError
     unsafe {
         let name_w = wide(name);
         let display_w = wide("Harness Shell Sandbox");
-        let desc_w = wide(
-            "AppContainer for harness run_shell Tier2a (experimental, see plans/DESIGN-SANDBOX.md SS6.3)",
-        );
+        let desc_w =
+            wide("AppContainer for harness run_shell Tier2a (see plans/DESIGN-SANDBOX.md SS6.3)");
 
         match CreateAppContainerProfile(
             PCWSTR(name_w.as_ptr()),
@@ -541,7 +540,7 @@ pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContain
 }
 
 /// `grant_ace_inheritable_ro`のRW版（Tier2aが既定でプローブされるようになったことに伴う
-/// `preflight`の高速化、`--sandbox`自動カスケード実装ラウンド）。`grant_ace_recursive`は
+/// `preflight`の高速化）。`grant_ace_recursive`は
 /// workspace_root配下の全ノードへ毎回個別に`SetNamedSecurityInfoW`書込を試みる（`grant_ace_mask`
 /// 内部の冪等スキップにより実際のWin32書込呼び出し自体は2回目以降省略されるが、読取確認は
 /// 変わらず全ノード分発生する）。root へ継承ACEを1件付与するだけで、付与時点で既に存在する
@@ -1181,7 +1180,7 @@ pub fn preflight(
     wfp_chain_pipe: Option<String>,
 ) -> Result<PreflightOutcome, AppContainerError> {
     let sid = ensure_profile(CONTAINER_NAME)?;
-    // `--sandbox`自動カスケードによりTier2aが既定でプローブされるようになったため、
+    // Tier2aが既定でプローブされるため、
     // 起動のたびにワークスペース全体へ個別書込を試みる`grant_ace_recursive`ではなく、
     // 高速化版（root継承ACE1件+フォールバック確認walk、`grant_ace_inheritable_rw`のdoc参照）
     // を使う。

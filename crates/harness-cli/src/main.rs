@@ -313,34 +313,21 @@ struct Cli {
     #[arg(long = "require-sandbox", num_args = 0..=1, default_missing_value = "write-containment")]
     require_sandbox: Option<String>,
 
-    /// 【非推奨・no-op】Windowsでは`--sandbox`自動カスケード実装ラウンドよりTier2a
-    /// （AppContainer）がフラグ無しで既定プローブされるようになったため、このフラグは
-    /// 効果を持たない（`plans/DESIGN-SANDBOX.md` §6.3/§7 D-02改訂版参照）。指定した場合は
-    /// 起動時に非推奨noteを表示するのみ。Tier3も含めて試したい場合は`--sandbox`を使うこと。
-    #[arg(long = "experimental-tier1a", default_value_t = false)]
-    experimental_tier2a: bool,
+    /// Windows専用のTier3（Hyper-V外層AlmaLinux VM + Incus内層コンテナ）を明示的に使う。
+    /// VM起動オーバーヘッドが高いため既定では試さない。ゴールデン像VHDXが無い等で起動
+    /// できない場合はTier2aへカスケードするが、Tier2aも使えない場合は起動を拒否する。
+    #[arg(long = "vm-sandbox", default_value_t = false, conflicts_with = "tier1")]
+    vm_sandbox: bool,
 
-    /// Windows専用の実験的Tier3（Hyper-V外層AlmaLinux VM + Incus内層コンテナ）を試す
-    /// （`plans/DESIGN-SANDBOX-VMISOLATION.md`、既定はfalse）。`run_shell`はコンテナ内実行に
-    /// 委譲される。ゴールデン像VHDX（`C:\ProgramData\harness\golden-images\almalinux-golden.vhdx`）
-    /// が無い等で起動できない場合はTier2aへカスケードし（Tier2aも失敗すればTier1へ）警告する。
-    /// 管理者昇格（Hyper-V操作用の常駐デーモン`harness-vmsandboxd`、D-21）を1回要する。
-    /// `--sandbox`と同じ効果（便利エイリアス、どちらを指定してもTier3が有効化される）。
-    #[arg(long = "experimental-tier3", default_value_t = false)]
-    experimental_tier3: bool,
-
-    /// シェル隔離の完全カスケードを有効化する（Windowsのみ意味を持つ: Tier3→Tier2a→Tier1を
-    /// 順に試す）。既定はfalse。`--experimental-tier3`と同じ効果を持つ便利エイリアスであり、
-    /// どちらか一方を指定すればよい。Tier2a単体は`--sandbox`/`--experimental-tier3`を指定
-    /// しなくてもフラグ無しで既定プローブされるため、本フラグが追加で有効化するのは
-    /// Tier3（VM）の試行のみ（`plans/DESIGN-SANDBOX.md` §6.3/§7 D-02改訂版）。Linuxでは
-    /// Tier2bが既に既定の上限のため事実上ノーオプ。
-    #[arg(long = "sandbox", default_value_t = false)]
-    sandbox: bool,
+    /// Windows Tier1（Restricted Token + 低Integrity Level + Job Object）を明示的に使う。
+    /// Tier2aの機密性/network遮断を諦めるオプトインであり、Tier2a preflight失敗時の
+    /// 逃がし弁として使う。
+    #[arg(long = "tier1", default_value_t = false, conflicts_with = "vm_sandbox")]
+    tier1: bool,
 
     /// Tier3起動をウォームスタート（production checkpointからの`Restore-VMSnapshot`）で行う
     /// （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.1、既定はfalse=毎回コールドブート）。
-    /// `--experimental-tier3`と併用が前提（Tier3自体が無効なら無視される）。初回はテンプレート
+    /// `--vm-sandbox`と併用が前提（Tier3自体が無効なら無視される）。初回はテンプレート
     /// provisioningのため通常のコールドブート並みの時間がかかるが、2回目以降のセッションは
     /// 起動レイテンシが大幅に短縮される。固定静的IPの制約上Tier3は元々同時1セッションのみが
     /// 前提のため、ウォームVMはマシン全体で1つに固定され、直列化ロックで排他される。
@@ -843,9 +830,20 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
         );
     }
 
+    if cli.tier1 && !cfg!(windows) {
+        eprintln!("error: --tier1 is only supported on Windows");
+        return ExitCode::FAILURE;
+    }
+
     let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
-    let opt_in_tier3 = cli.sandbox || cli.experimental_tier3;
-    let shell_tier = match select_tier(require_sandbox, workspace_root, opt_in_tier3, &[], None) {
+    let shell_tier = match select_tier(
+        require_sandbox,
+        workspace_root,
+        cli.vm_sandbox,
+        cli.tier1,
+        &[],
+        None,
+    ) {
         Ok(sel) => sel,
         Err(e) => {
             eprintln!("error: shell tier selection failed: {e}");
@@ -2188,20 +2186,14 @@ async fn main() -> ExitCode {
         _ => {}
     }
 
-    // `--experimental-tier1a`は非推奨・no-op化した（`--sandbox`自動カスケード実装ラウンドより
-    // Tier2aはフラグ無しで既定プローブされるため）。指定された場合は一度だけ情報表示する。
-    if cli.experimental_tier2a {
-        eprintln!(
-            "note: --experimental-tier1a is deprecated and has no effect; Tier2a (AppContainer) \
-             is now attempted automatically on Windows. Use --sandbox (or --experimental-tier3) \
-             to also attempt Tier3."
-        );
+    if cli.tier1 && !cfg!(windows) {
+        eprintln!("error: --tier1 is only supported on Windows");
+        return ExitCode::FAILURE;
     }
 
     // WFP 出口強制（Layer2、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）の
     // named pipeを、`select_tier`（内部で`preflight`を呼ぶ）より前に用意しておく。
-    // Tier2aはフラグ無しで既定プローブされるため（`--sandbox`カスケードの中間フォールバック
-    // としても到達し得る）、ドメインポリシー監査が有効な場合は常に投機的に用意しておく
+    // Tier2aはフラグ無しで既定プローブされるため、ドメインポリシー監査が有効な場合は常に投機的に用意しておく
     // （そうでなければWFPは不要＝シナリオ(C)、パイプすら作らずUACゼロを保つ）。ここで作った
     // パイプ名は、`preflight`経由で特権分離ヘルパーへ「処理完了後この名前でnetfilterdを
     // 連鎖起動してほしい」という指示として渡す（シナリオ(A)）。実際にTier2aへ降格せずに
@@ -2235,7 +2227,8 @@ async fn main() -> ExitCode {
     let shell_tier = match select_tier(
         require_sandbox,
         &workspace_root,
-        cli.experimental_tier3 || cli.sandbox,
+        cli.vm_sandbox,
+        cli.tier1,
         &fs_passthrough,
         wfp_chain_pipe,
     ) {
@@ -2298,9 +2291,8 @@ async fn main() -> ExitCode {
     let net_loopback_ports =
         net_loopback_ports_for_agents(net_proxy.proxy_addr, net_proxy.fake_dns_addr);
 
-    // WFPシナリオ(A)/(B)/(C)の最終確定。`shell_tier`が実際にTier2aへ着地し、かつ許可ドメインが
-    // あるときだけ有効化する（`experimental_tier2a`はオプトインの意図であって、preflight失敗で
-    // Tier1へ降格した場合はWFPも当然無効）。
+    // WFPシナリオ(A)/(B)/(C)の最終確定。`shell_tier`が実際にTier2aへ着地し、かつ
+    // 許可ドメインがあるときだけ有効化する。
     #[cfg(windows)]
     let net_wfp: Option<harness_sandbox::netfilterd::NetfilterHandle> = {
         let domain_policy_requested = net_proxy.domain_policy_enabled;

@@ -90,19 +90,17 @@ pub struct ReadScopeConfig {
 }
 
 /// シェル隔離Tier（M12、`plans/DESIGN-SANDBOX.md` §6）。Tier1'（VHDX）は本フェーズの
-/// 対象外（設計書がexperimental/オプトイン枠と位置付ける既定外Tier）。Tier2a（AppContainer）は
-/// D-02が定める「既定にせずフラグでオプトイン」の実験的Tierとして実装済み。
+/// 対象外。Tier2a（AppContainer）/Tier2b（bubblewrap）は既定の上限Tierとして実装済み。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellTier {
     /// Windows: Hyper-V外層VM（AlmaLinux）+ Incus内層コンテナ（`plans/DESIGN-SANDBOX-VMISOLATION.md`）。
-    /// vNIC単位で出口を強制できる唯一のTier。実験的/フラグ付き（`--experimental-tier3`、D-02と
-    /// 同じ「既定にせずオプトイン」思想）。`run_shell`は`ToolCtx.vm_sandbox`経由でコンテナ内実行に
+    /// vNIC単位で出口を強制できる唯一のTier。VM起動オーバーヘッドが高いため`--vm-sandbox`
+    /// で明示オプトインする。`run_shell`は`ToolCtx.vm_sandbox`経由でコンテナ内実行に
     /// 委譲する（他Tierと異なり実プロセスをホスト側にspawnしない）。
     Tier3,
     /// Linux: bubblewrap（user+mount+network namespace + OverlayFS）。
     Tier2b,
-    /// Windows: AppContainer（package SID + capability SID）。実験的/フラグ付き
-    /// （`--experimental-tier1a`、D-02）。範囲外書込の物理拒否に加え、network を
+    /// Windows: AppContainer（package SID + capability SID）。範囲外書込の物理拒否に加え、network を
     /// capabilityゲートでdefault-denyにする（T-04/T-10対策の核）。
     Tier2a,
     /// Windows: Restricted Token + 低Integrity Level + Job Object。

@@ -860,8 +860,8 @@ mod tests {
         // `ToolCtx::new`はテスト既定でTier0（プレースホルダ）を積む。実行時は
         // `harness-cli`が起動時に`select_tier`で解決した値を積むため、ここでも
         // 実際のOS隔離Tier選択を再現する（さもないとTier1経路が単体テストで一切通らない）。
-        // WindowsではTier2aがフラグ無しで既定プローブされるようになったため（`--sandbox`
-        // 自動カスケード実装ラウンド）、`tier2a_preflight_override`でTier1へ強制降格させ
+        // WindowsではTier2aがフラグ無しで既定プローブされるため、`--tier1`相当の
+        // `opt_in_tier1=true`を指定してTier1へ直接降ろし、
         // 決定論的にする（実Win32 preflightを単体テストで走らせない、既存Tier1テストの
         // 挙動を変えないため）。`opt_in_tier3=false`固定。
         let probes = harness_sandbox::shell_tier::Probes {
@@ -872,6 +872,7 @@ mod tests {
             harness_core::RequireSandbox::None,
             &root,
             false,
+            true,
             &[],
             None,
             &probes,
@@ -1280,7 +1281,7 @@ mod tests {
         // 実Tier2a preflightを走らせる（`opt_in_Tier2a=true`）。AppContainer不可の環境では
         // Tier1へ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
         let selection =
-            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), false, &[], None)
+            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), false, false, &[], None)
                 .unwrap();
         if selection.tier != ShellTier::Tier2a {
             eprintln!(
@@ -1379,7 +1380,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let selection =
-            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), false, &[], None)
+            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), false, false, &[], None)
                 .unwrap();
         if selection.tier != ShellTier::Tier2a {
             eprintln!(
@@ -1392,6 +1393,9 @@ mod tests {
 
         let mut ctx = ToolCtx::new(dir.path().to_path_buf());
         ctx.shell_tier = selection;
+        // This E2E is specifically for --net-allow-app / internetClient capability.
+        // Domain policy has precedence and intentionally suppresses app-level grants.
+        ctx.net_proxy.domain_policy_enabled = false;
         ctx.net_app = NetAppPolicy {
             allow_apps: vec!["powershell".to_string(), "pwsh".to_string()],
         };
