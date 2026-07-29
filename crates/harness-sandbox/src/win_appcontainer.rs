@@ -987,6 +987,17 @@ const FS_IO_PROBE_COMMAND: &str = "\
         exit 3 \
     }";
 
+const CONTROL_DIR_WRITE_DENY_PROBE_COMMAND: &str = "\
+    $ErrorActionPreference = 'Stop'; \
+    $p = Join-Path $env:HARNESS_CONTROL_DIR ([Guid]::NewGuid().ToString() + '.tmp'); \
+    try { \
+        New-Item -ItemType File -Path $p -Force | Out-Null; \
+        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; \
+        exit 4 \
+    } catch { \
+        exit 0 \
+    }";
+
 fn smoke_test_spawn(
     sid: PSID,
     workspace_root: &Path,
@@ -1033,6 +1044,59 @@ fn smoke_test_spawn(
         )));
     }
     Ok(())
+}
+
+fn smoke_test_harness_control_write_denied(
+    sid: PSID,
+    workspace_root: &Path,
+) -> Result<(), AppContainerError> {
+    let control_dir = workspace_root.join(".harness");
+    if !control_dir.exists() {
+        return Ok(());
+    }
+
+    let (shell, _) = resolve_shell();
+    let mut env = crate::secret_env::build_child_env();
+    env.push((
+        "HARNESS_CONTROL_DIR".to_string(),
+        control_dir.to_string_lossy().into_owned(),
+    ));
+    let child = spawn(
+        &shell,
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            CONTROL_DIR_WRITE_DENY_PROBE_COMMAND,
+        ],
+        workspace_root,
+        &env,
+        false,
+        sid,
+        NetworkCapability::Deny,
+    )
+    .map_err(|e| {
+        AppContainerError::Preflight(format!(
+            ".harness write-deny probe shell could not start: {e}"
+        ))
+    })?;
+    let (_, _, code) = child.write_stdin_read_output_and_wait(None).map_err(|e| {
+        AppContainerError::Preflight(format!(
+            ".harness write-deny probe shell could not start: {e}"
+        ))
+    })?;
+    if code == 0 {
+        return Ok(());
+    }
+    if code == 4 {
+        return Err(AppContainerError::Preflight(
+            ".harness remained writable inside AppContainer after control-plane ACL protection"
+                .to_string(),
+        ));
+    }
+    Err(AppContainerError::Preflight(format!(
+        ".harness write-deny probe exited with unexpected code {code}"
+    )))
 }
 
 /// fs passthrough（D-13）の到達性プローブ用コマンド。`FS_IO_PROBE_COMMAND`と同じ
@@ -1206,12 +1270,13 @@ pub fn preflight(
     // 高速化版（root継承ACE1件+フォールバック確認walk、`grant_ace_inheritable_rw`のdoc参照）
     // を使う。
     grant_ace_inheritable_rw(workspace_root, sid.as_psid())?;
-    let tmp_dir = workspace_root
-        .join(".harness")
-        .join("sandbox")
-        .join("Tier2a-tmp");
+    protect_harness_control_dir_from_appcontainer(workspace_root, sid.as_psid())?;
+    let tmp_dir = workspace_root.join(format!(".harness-tier2a-probe-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| AppContainerError::Preflight(e.to_string()))?;
-    smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir)?;
+    let smoke_result = smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    smoke_result?;
+    smoke_test_harness_control_write_denied(sid.as_psid(), workspace_root)?;
 
     let mut warnings = Vec::new();
     let mut denied_passthrough: Vec<(std::path::PathBuf, String, String)> = Vec::new();
@@ -1427,8 +1492,11 @@ pub fn preflight(
 /// `ACCESS_ALLOWED_ACE_TYPE`（WinNT.h）。`windows`クレートはこの値を定数として公開して
 /// いないため、既知の固定値としてここに置く。
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+/// `ACCESS_DENIED_ACE_TYPE`（WinNT.h）。Deny ACEもこのクレートが書くので、revoke時は
+/// Allow ACEと同じSID照合で取り除く。
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
-/// [BUG-020の修正] `dacl`から`sid`宛の`ACCESS_ALLOWED_ACE`だけを取り除いた新しいDACLを、
+/// [BUG-020の修正] `dacl`から`sid`宛のAllow/Deny ACEだけを取り除いた新しいDACLを、
 /// 対象外のACEは`GetAce`で読んだ生バイト列のまま`AddAce`でコピーして構築する（trustee・
 /// access mask・`AceFlags`——`INHERITED_ACE`を含め——を一切変更しない）。
 ///
@@ -1442,7 +1510,7 @@ const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 /// `INHERITED_ACE`フラグの有無に関わらず対象`sid`だけを正確に取り除ける。DACLの保護状態
 /// （`SE_DACL_PROTECTED`）はこの関数の外で呼び出し側が読み取り・維持する（`revoke_ace`参照）。
 ///
-/// `ACCESS_ALLOWED_ACE_TYPE`以外のACE種別（このコードベースが自ら書き込むことはない）は
+/// Allow/Deny以外のACE種別（このコードベースが自ら書き込むことはない）は
 /// trusteeを解釈せず常に保持する（未知の種別を誤って消さない安全側の判断）。
 unsafe fn copy_dacl_excluding_sid(
     dacl: *const ACL,
@@ -1470,7 +1538,10 @@ unsafe fn copy_dacl_excluding_sid(
             GetAce(dacl, i, &mut ace_ptr)?;
             let header = &*(ace_ptr as *const ACE_HEADER);
 
-            let is_target = if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
+            let is_target = if header.AceType == ACCESS_ALLOWED_ACE_TYPE
+                || header.AceType == ACCESS_DENIED_ACE_TYPE
+            {
+                // ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE share the Mask/SidStart layout.
                 let allowed = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
                 let entry_sid = PSID((&allowed.SidStart) as *const u32 as *mut c_void);
                 EqualSid(entry_sid, sid).is_ok()
@@ -1530,6 +1601,69 @@ unsafe fn set_dacl_single_object_with_protection(
         let _ = CloseHandle(handle);
         result
     }
+}
+
+fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    };
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut existing_dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing_dacl),
+            None,
+            &mut sd,
+        )
+        .ok()
+        .map_err(to_err)?;
+
+        let mut new_buf: Vec<u8> = Vec::new();
+        let new_dacl = match copy_dacl_excluding_sid(existing_dacl as *const _, sid, &mut new_buf) {
+            Ok(dacl) => dacl,
+            Err(e) => {
+                let _ = LocalFree(HLOCAL(sd.0));
+                return Err(to_err(e));
+            }
+        };
+        let _ = LocalFree(HLOCAL(sd.0));
+        set_dacl_single_object_with_protection(path, new_dacl, true).map_err(to_err)?;
+    }
+    Ok(())
+}
+
+fn protect_harness_control_dir_from_appcontainer(
+    workspace_root: &Path,
+    sid: PSID,
+) -> Result<(), AppContainerError> {
+    let harness_dir = workspace_root.join(".harness");
+    if !harness_dir.exists() {
+        return Ok(());
+    }
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    collect_dirs_and_files(&harness_dir, &mut dirs, &mut files).map_err(|e| {
+        AppContainerError::AclGrant {
+            path: harness_dir.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+
+    for file in &files {
+        remove_sid_aces_and_protect(file, sid)?;
+    }
+    for dir in dirs.iter().rev() {
+        remove_sid_aces_and_protect(dir, sid)?;
+    }
+    Ok(())
 }
 
 /// `path`のDACLから、`sid`（trustee）に対する既存ACEを全て取り除く。元は
@@ -2968,6 +3102,42 @@ mod traverse_diagnostics {
              the drive-root traverse constraint may have changed and this assertion (and the \
              M12 追記3 findings) should be revisited"
         );
+    }
+
+    /// Tier2aのpreflightはworkspace全体へAppContainer SIDのRW ACEを付けるが、制御面である
+    /// `.harness/**` だけは子プロセスから書けてはいけない。preflight内の通常I/O probeと
+    /// `.harness` write-deny probeを両方通し、この不変条件を実機で確認する。
+    #[test]
+    #[ignore]
+    fn preflight_keeps_harness_control_dir_unwritable_to_appcontainer_child() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        std::fs::create_dir_all(workspace.path().join(".harness")).expect("create .harness");
+        std::fs::write(
+            workspace.path().join(".harness").join("settings.json"),
+            "{}\n",
+        )
+        .expect("seed settings");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let result = preflight(workspace.path(), &[], None);
+        if result.is_err() {
+            let output = std::process::Command::new("icacls")
+                .arg(workspace.path().join(".harness"))
+                .output()
+                .expect("icacls .harness");
+            println!(
+                "=== .harness icacls after failed preflight ===\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        result.expect("preflight must protect .harness from AppContainer writes");
+
+        let harness_dir = workspace.path().join(".harness");
+        assert_no_sid_ace_recursive(&harness_dir, sid.as_psid())
+            .expect(".harness must not carry AppContainer SID ACEs");
+
+        revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
     }
 
     /// D-13（fs passthrough allowlist）実機E2E: 中立な外部ディレクトリ（workspace外、`grant_ace_recursive`
