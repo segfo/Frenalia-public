@@ -73,6 +73,36 @@ fn build_change_rows(
         .collect()
 }
 
+/// `SandboxFs::apply()`の結果をtranscriptへ1行のInfo通知として積む。変更パネルの`c`、
+/// `/fsstage commit <file>`、`/fsstage commit_all`の3経路で共通のため関数化した。
+fn push_apply_report(app: &mut AppState, report: &harness_sandbox::ApplyReport) {
+    app.transcript.push(app::TranscriptItem::Info(format!(
+        "applied {} change(s){}{}{}",
+        report.applied.len(),
+        if report.conflicts.is_empty() {
+            String::new()
+        } else {
+            format!(", {} conflict(s) skipped", report.conflicts.len())
+        },
+        if report.ext_blocked.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {} out-of-workspace change(s) need --dangerously-allow via `harness apply`",
+                report.ext_blocked.len()
+            )
+        },
+        if report.hard_denied.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {} config-injection change(s) blocked (D-05, cannot be applied)",
+                report.hard_denied.len()
+            )
+        }
+    )));
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     provider: Box<dyn LlmProvider>,
@@ -248,26 +278,54 @@ pub async fn run(
                                             }
                                         }
                                     }
+                                    // `AppState::submit_input`が`/fsstage`を`Action::Slash`ではなく
+                                    // 専用の`Action`（`OpenChangesPanel`/`ListChanges`/`CommitChanges`/
+                                    // `CommitAllChanges`/`DiscardChanges`）へ直接変換するため、ここには
+                                    // 到達しない（engineアクターはSandboxFsへアクセスしないため）。
+                                    SlashCommand::FsStage(_) => unreachable!(
+                                        "AppState::submit_input converts /fsstage into a dedicated Action before it reaches Action::Slash"
+                                    ),
                                 },
                                 Action::Quit => {}
-                                Action::ToggleChangesPanel => {
-                                    if app.changes_panel.is_some() {
-                                        app.close_changes_panel();
-                                    } else {
-                                        match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
-                                            Ok(fs) => match fs.change_set() {
-                                                Ok(entries) => {
-                                                    let rows = build_change_rows(&workspace_root_for_panel, &fs, entries);
-                                                    app.open_changes_panel(rows);
-                                                }
-                                                Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                    message: format!("failed to read staged changes: {e}"),
-                                                }),
-                                            },
+                                Action::OpenChangesPanel => {
+                                    match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
+                                        Ok(fs) => match fs.change_set() {
+                                            Ok(entries) => {
+                                                let rows = build_change_rows(&workspace_root_for_panel, &fs, entries);
+                                                app.open_changes_panel(rows);
+                                            }
                                             Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to open sandbox: {e}"),
+                                                message: format!("failed to read staged changes: {e}"),
                                             }),
-                                        }
+                                        },
+                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("failed to open sandbox: {e}"),
+                                        }),
+                                    }
+                                }
+                                Action::ListChanges => {
+                                    match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
+                                        Ok(fs) => match fs.change_set() {
+                                            Ok(entries) if entries.is_empty() => {
+                                                app.transcript.push(app::TranscriptItem::Info(
+                                                    "(no staged changes)".to_string(),
+                                                ));
+                                            }
+                                            Ok(entries) => {
+                                                for e in &entries {
+                                                    app.transcript.push(app::TranscriptItem::Info(format!(
+                                                        "{:?}\t{:?}\t{}",
+                                                        e.op, e.target, e.path
+                                                    )));
+                                                }
+                                            }
+                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                                message: format!("failed to read staged changes: {e}"),
+                                            }),
+                                        },
+                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("failed to open sandbox: {e}"),
+                                        }),
                                     }
                                 }
                                 Action::CommitChanges(only_paths) => {
@@ -277,33 +335,24 @@ pub async fn run(
                                             only_paths: Some(&only_paths),
                                             allow_ext: false,
                                         }) {
-                                            Ok(report) => {
-                                                app.transcript.push(app::TranscriptItem::Info(format!(
-                                                    "applied {} change(s){}{}{}",
-                                                    report.applied.len(),
-                                                    if report.conflicts.is_empty() {
-                                                        String::new()
-                                                    } else {
-                                                        format!(", {} conflict(s) skipped", report.conflicts.len())
-                                                    },
-                                                    if report.ext_blocked.is_empty() {
-                                                        String::new()
-                                                    } else {
-                                                        format!(
-                                                            ", {} out-of-workspace change(s) need --dangerously-allow via `harness apply`",
-                                                            report.ext_blocked.len()
-                                                        )
-                                                    },
-                                                    if report.hard_denied.is_empty() {
-                                                        String::new()
-                                                    } else {
-                                                        format!(
-                                                            ", {} config-injection change(s) blocked (D-05, cannot be applied)",
-                                                            report.hard_denied.len()
-                                                        )
-                                                    }
-                                                )));
-                                            }
+                                            Ok(report) => push_apply_report(&mut app, &report),
+                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                                message: format!("apply failed: {e}"),
+                                            }),
+                                        },
+                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("failed to open sandbox: {e}"),
+                                        }),
+                                    }
+                                }
+                                Action::CommitAllChanges => {
+                                    match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
+                                        Ok(fs) => match fs.apply(&ApplyOptions {
+                                            only_glob: None,
+                                            only_paths: None,
+                                            allow_ext: false,
+                                        }) {
+                                            Ok(report) => push_apply_report(&mut app, &report),
                                             Err(e) => app.apply(harness_core::AgentEvent::Error {
                                                 message: format!("apply failed: {e}"),
                                             }),

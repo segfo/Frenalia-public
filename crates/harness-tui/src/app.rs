@@ -47,8 +47,10 @@ pub struct PermissionView {
     pub diff: Option<Vec<DiffLine>>,
 }
 
-/// `/model /mode /allow /compact /clear /fork /sessions`（M9、DESIGN.md L349
-/// 「スラッシュコマンド」+ セッションFork/一覧の拡張）。
+/// `/model /mode /allow /compact /clear /fork /sessions /fsstage`（M9、DESIGN.md L349
+/// 「スラッシュコマンド」+ セッションFork/一覧の拡張。`/fsstage`はM10の変更（changes）パネルを
+/// キーバインドではなくスラッシュコマンドから操作するためのもの。Ctrl+GはVSCode統合ターミナルの
+/// 既定ショートカットと衝突するため、`/fsstage`へ置き換えて廃止した）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SlashCommand {
     Model(String),
@@ -60,6 +62,24 @@ pub enum SlashCommand {
     Fork,
     /// セッションピッカーを開き、既存セッションへ切り替える。
     Sessions,
+    /// `/fsstage`のサブコマンド（変更パネル/ステージ済み変更の操作）。
+    FsStage(FsStageCommand),
+}
+
+/// `/fsstage`のサブコマンド。
+///
+/// - `/fsstage` `/fsstage list`: 一覧をtranscriptへテキスト表示（非対話）
+/// - `/fsstage commit`: 対話パネルを開く（ファイル毎accept/reject、旧Ctrl+G相当）
+/// - `/fsstage commit <file>`: 指定ファイル1件だけを非対話で即commit
+/// - `/fsstage commit_all`: 全件を非対話で即commit
+/// - `/fsstage discard`: 全破棄（非対話、パネルを開かない）
+#[derive(Debug, Clone, PartialEq)]
+pub enum FsStageCommand {
+    List,
+    Open,
+    CommitAll,
+    CommitFile(String),
+    Discard,
 }
 
 /// `/`始まりの入力行をパースする。不正なコマンド/引数は`Err(理由)`。
@@ -78,7 +98,23 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "/clear" => Ok(SlashCommand::Clear),
         "/fork" => Ok(SlashCommand::Fork),
         "/sessions" => Ok(SlashCommand::Sessions),
+        "/fsstage" => parse_fsstage_subcommand(rest).map(SlashCommand::FsStage),
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// `/fsstage`の`rest`（サブコマンド以降）をパースする。
+fn parse_fsstage_subcommand(rest: &str) -> Result<FsStageCommand, String> {
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("");
+    let sub_rest = parts.next().unwrap_or("").trim();
+    match sub {
+        "" | "list" => Ok(FsStageCommand::List),
+        "commit" if sub_rest.is_empty() => Ok(FsStageCommand::Open),
+        "commit" => Ok(FsStageCommand::CommitFile(sub_rest.to_string())),
+        "commit_all" => Ok(FsStageCommand::CommitAll),
+        "discard" => Ok(FsStageCommand::Discard),
+        other => Err(format!("unknown /fsstage subcommand: {other}")),
     }
 }
 
@@ -91,14 +127,19 @@ pub enum Action {
     /// 現在進行中のターンをキャンセルする（M9、Escキー）。
     Cancel,
     Quit,
-    /// 変更（changes）パネルの開閉トグル（M10、Ctrl+G）。開く際は呼び出し側
+    /// 変更（changes）パネルを開く（`/fsstage commit`、旧Ctrl+G相当）。呼び出し側
     /// （`harness-tui::run`）が`SandboxFs::change_set()`を読んで`AppState::open_changes_panel`
-    /// を呼ぶ（`AppState`自体はサンドボックスへアクセスしない）。
-    ToggleChangesPanel,
-    /// 変更パネルで`c`（コミット）を押した結果。reject印の付いたエントリを除いた
-    /// パス集合（`SandboxFs::apply`の`only_paths`にそのまま渡す）。
+    /// を呼ぶ（`AppState`自体はサンドボックスへアクセスしない）。既にパネルが開いていても
+    /// 単に最新の変更セットで開き直す（トグルではない）。
+    OpenChangesPanel,
+    /// 変更パネルで`c`（コミット）を押した結果、または`/fsstage commit <file>`/`commit_all`。
+    /// reject印の付いたエントリを除いたパス集合（`SandboxFs::apply`の`only_paths`にそのまま渡す）。
     CommitChanges(Vec<String>),
-    /// 変更パネルで`x`（破棄）を押した結果。
+    /// `/fsstage commit_all`（非対話、パネルを開かず全件commit）。
+    CommitAllChanges,
+    /// `/fsstage list`（非対話、パネルを開かずtranscriptへテキスト表示）。
+    ListChanges,
+    /// 変更パネルで`x`（破棄）を押した結果、または`/fsstage discard`（非対話）。
     DiscardChanges,
 }
 
@@ -236,10 +277,6 @@ impl AppState {
         });
     }
 
-    pub fn close_changes_panel(&mut self) {
-        self.changes_panel = None;
-    }
-
     /// キーイベントecho（`note_key_event`）を有効化し、有効である旨のバナーをtranscriptへ出す。
     /// バナーは`HARNESS_KEY_DEBUG`が実際に効いているかを起動直後に一目で確認するためのもの。
     pub fn enable_key_debug(&mut self) {
@@ -332,6 +369,17 @@ impl AppState {
         self.input_last_edit_was_insert = false;
         if text.trim_start().starts_with('/') {
             return match parse_slash_command(&text) {
+                Ok(SlashCommand::FsStage(fs_cmd)) => {
+                    self.transcript
+                        .push(TranscriptItem::Info(format!("> {text}")));
+                    Some(match fs_cmd {
+                        FsStageCommand::List => Action::ListChanges,
+                        FsStageCommand::Open => Action::OpenChangesPanel,
+                        FsStageCommand::CommitAll => Action::CommitAllChanges,
+                        FsStageCommand::CommitFile(path) => Action::CommitChanges(vec![path]),
+                        FsStageCommand::Discard => Action::DiscardChanges,
+                    })
+                }
                 Ok(cmd) => {
                     self.transcript
                         .push(TranscriptItem::Info(format!("> {text}")));
@@ -655,12 +703,6 @@ impl AppState {
                 self.toggle_fold();
                 None
             }
-            // 変更（changes）パネルの開閉トグル（M10）。パネル自体を開く処理
-            // （`SandboxFs::change_set()`の読み込み）は`harness-tui::run`側が担う
-            // （`AppState`はサンドボックスへアクセスしないため）。
-            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Some(Action::ToggleChangesPanel)
-            }
             // 入力欄の全選択（アンカー=先頭、カーソル=末尾という選択の特殊ケース）。
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input_selection_anchor = Some(0);
@@ -899,6 +941,64 @@ mod tests {
     fn parses_fork_and_sessions_slash_commands() {
         assert_eq!(parse_slash_command("/fork"), Ok(SlashCommand::Fork));
         assert_eq!(parse_slash_command("/sessions"), Ok(SlashCommand::Sessions));
+    }
+
+    #[test]
+    fn parses_fsstage_subcommands() {
+        assert_eq!(
+            parse_slash_command("/fsstage"),
+            Ok(SlashCommand::FsStage(FsStageCommand::List))
+        );
+        assert_eq!(
+            parse_slash_command("/fsstage list"),
+            Ok(SlashCommand::FsStage(FsStageCommand::List))
+        );
+        assert_eq!(
+            parse_slash_command("/fsstage commit"),
+            Ok(SlashCommand::FsStage(FsStageCommand::Open))
+        );
+        assert_eq!(
+            parse_slash_command("/fsstage commit a/b.txt"),
+            Ok(SlashCommand::FsStage(FsStageCommand::CommitFile(
+                "a/b.txt".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_slash_command("/fsstage commit_all"),
+            Ok(SlashCommand::FsStage(FsStageCommand::CommitAll))
+        );
+        assert_eq!(
+            parse_slash_command("/fsstage discard"),
+            Ok(SlashCommand::FsStage(FsStageCommand::Discard))
+        );
+        assert!(parse_slash_command("/fsstage nope").is_err());
+    }
+
+    #[test]
+    fn submit_input_routes_fsstage_to_dedicated_actions_not_slash() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.input = "/fsstage commit_all".to_string();
+        let action = app.submit_input();
+        assert!(matches!(action, Some(Action::CommitAllChanges)));
+
+        app.input = "/fsstage commit report.txt".to_string();
+        let action = app.submit_input();
+        assert!(matches!(
+            action,
+            Some(Action::CommitChanges(paths)) if paths == vec!["report.txt".to_string()]
+        ));
+
+        app.input = "/fsstage discard".to_string();
+        let action = app.submit_input();
+        assert!(matches!(action, Some(Action::DiscardChanges)));
+
+        app.input = "/fsstage commit".to_string();
+        let action = app.submit_input();
+        assert!(matches!(action, Some(Action::OpenChangesPanel)));
+
+        app.input = "/fsstage".to_string();
+        let action = app.submit_input();
+        assert!(matches!(action, Some(Action::ListChanges)));
     }
 
     #[test]
@@ -1814,7 +1914,7 @@ mod tests {
         }
     }
 
-    /// 変更パネル表示中はCtrl+G/Ctrl+C等を含む通常のキー処理を一切通さず、パネル専用の
+    /// 変更パネル表示中はCtrl+C等を含む通常のキー処理を一切通さず、パネル専用の
     /// キーだけを処理する（承認モーダルと同じ排他パターン、§リッチTUI「変更パネル」）。
     #[test]
     fn changes_panel_consumes_keys_and_ignores_normal_input() {
