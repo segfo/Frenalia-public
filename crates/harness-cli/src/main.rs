@@ -14,9 +14,9 @@
 //! `--dangerously-allow`（`--permission-mode accept-all`の明示必須化・ワイルドカード
 //! `--allow`ルールの明示必須化、§非対話モード「危険/ワイルドカードは`--dangerously-allow`」）を
 //! 追加した。M10で`harness_sandbox::SandboxFs`（オーバーレイFS）を配線し、`--live`/`--staged`/
-//! `--workspace-commit`（明示時はそのまま採用、省略時はパス毎のgit認識型判定：追跡済み・
-//! 変更ゼロ→live、それ以外→headless既定staged/TUI既定workspace_commit）、および
-//! `apply`/`changes`/`discard`サブコマンドを追加した。
+//! `--workspace-commit`、および`apply`/`changes`/`discard`サブコマンドを追加した。
+//! 省略時は常に`--live`相当（オプトイン。書込/読取の実防御はシェル隔離Tierに委ねる、
+//! `plans/DESIGN-SANDBOX.md` §7 D-29）。
 
 use std::io::Read;
 use std::net::SocketAddr;
@@ -34,7 +34,7 @@ use harness_engine::{
     parse_allowlist_rule, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode,
 };
 use harness_providers::{AnthropicProvider, OpenAiProvider};
-use harness_sandbox::{select_tier, ApplyOptions, SandboxFs};
+use harness_sandbox::{select_tier, ApplyOptions, SandboxFs, WorkspaceWriteMode};
 use harness_tools::ToolRegistry;
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-8";
@@ -292,18 +292,19 @@ struct Cli {
     #[arg(long = "enter-submits")]
     enter_submits: Option<bool>,
 
-    /// 即実FS（オーバーレイ無し）。`--staged`/`--workspace-commit`と併用不可
-    /// （§書込ステージング3モード、M10）。
+    /// 即実FS（オーバーレイ無し）。省略時の既定と同じ動作（D-29）。`--staged`/
+    /// `--workspace-commit`と併用不可（§書込ステージング3モード、M10）。
     #[arg(long = "live", conflicts_with_all = ["staged", "workspace_commit"])]
     live: bool,
 
-    /// 全書込をステージングし、実FSは`harness apply`まで不変にする
-    /// （headless既定、§書込ステージング3モード）。
+    /// 全書込をステージングし、実FSは`harness apply`まで不変にする。明示指定時のみ
+    /// 有効なオプトイン機能で、既定の安全策ではない（§書込ステージング3モード、D-29）。
     #[arg(long = "staged", conflicts_with_all = ["live", "workspace_commit"])]
     staged: bool,
 
-    /// workspace内はステージング→レビュー＆コミット、workspace外は常にsandbox隔離
-    /// （対話TUI既定、§書込ステージング3モード）。
+    /// workspace内はステージング→レビュー＆コミット、workspace外は常にsandbox隔離。
+    /// 明示指定時のみ有効なオプトイン機能で、既定の安全策ではない
+    /// （§書込ステージング3モード、D-29）。
     #[arg(long = "workspace-commit", conflicts_with_all = ["live", "staged"])]
     workspace_commit: bool,
 
@@ -382,6 +383,17 @@ struct Cli {
     /// `harness fs revoke`で撤収すること。
     #[arg(long = "force-system-acl")]
     force_system_acl: bool,
+
+    /// Tier2a限定のCopy-on-Writeモード（D-30、`plans/AppContainerベース Copy-on-Write
+    /// ワークスペース設計書.md`）。指定時、workspaceへのACLをRead/Execute/Traverseのみ
+    /// （既定のRead/Write/Execute/DeleteではなくD-13と同じread-onlyマスク）へ切り替え、
+    /// `run_shell`子プロセスの書込をworkspace外のCoW upper（`%LOCALAPPDATA%\harness\cow\
+    /// <session-id>\`）へRedirector DLLで誘導する。フックが無効・回避されても、ACLが
+    /// RO付与済みである限りworkspace本体への書込は`ACCESS_DENIED`でfail-closeする
+    /// （フックは境界にしない、D-01不変）。既定（フラグ無指定）はD-29のまま
+    /// `Live`＋workspace RWを維持する完全なオプトイン。Tier2a以外では起動を拒否する。
+    #[arg(long = "cow", default_value_t = false)]
+    cow: bool,
 }
 
 /// `--require-sandbox[=confidential]`の文字列表現を`RequireSandbox`へ変換する
@@ -395,25 +407,19 @@ fn parse_require_sandbox(value: Option<&str>) -> RequireSandbox {
     }
 }
 
-/// `--live`/`--staged`/`--workspace-commit`から`(explicit, fallback_mode)`を決める。
-/// 明示指定が無い場合、`fallback_mode`はgit認識型判定（追跡済み・変更ゼロ→live）で
-/// liveと判定されなかったパスにだけ適用される既定モード（headless=Staged/TUI=WorkspaceCommit）。
-fn resolve_staging_mode(
-    live: bool,
-    staged: bool,
-    workspace_commit: bool,
-    is_headless: bool,
-) -> (bool, StagingMode) {
+/// `--live`/`--staged`/`--workspace-commit`から`StagingMode`を決める。
+/// 明示指定が無い場合は常に`Live`（オプトイン。書込/読取の防御はシェル隔離Tierに委ねる、
+/// D-29）。`live`分岐は他の2フラグが立っていなければ既定でも同じ結果になるため論理的には
+/// 冗長だが、`cli.live`を読む唯一の箇所なのでdead-code警告を避けるために明示しておく。
+fn resolve_staging_mode(live: bool, staged: bool, workspace_commit: bool) -> StagingMode {
     if live {
-        (true, StagingMode::Live)
+        StagingMode::Live
     } else if staged {
-        (true, StagingMode::Staged)
+        StagingMode::Staged
     } else if workspace_commit {
-        (true, StagingMode::WorkspaceCommit)
-    } else if is_headless {
-        (false, StagingMode::Staged)
+        StagingMode::WorkspaceCommit
     } else {
-        (false, StagingMode::WorkspaceCommit)
+        StagingMode::Live
     }
 }
 
@@ -421,6 +427,29 @@ fn resolve_staging_mode(
 /// `workspace_root`からの相対パスで返す。
 fn sandbox_dir_for_session(session_id: &str) -> PathBuf {
     PathBuf::from(".harness").join("sandbox").join(session_id)
+}
+
+/// `--cow`（D-30）のCoW upper実体を置く場所。workspace外（`plans/AppContainerベース
+/// Copy-on-Write ワークスペース設計書.md` §9の推奨に従い、再帰的なパスマッピングを防止し
+/// `.harness`のPROTECTED DACL（`protect_harness_control_dir_from_appcontainer`）と衝突しない
+/// ようにする）。`ProjectDirs::data_local_dir()`は`%LOCALAPPDATA%\harness`（Windows）に
+/// 解決される（`fs_ledger_path`が使う`config_dir()`＝`%APPDATA%\harness\config`とは別系統）。
+fn cow_upper_dir_for_session(session_id: &str) -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "harness")
+        .map(|d| d.data_local_dir().join("cow").join(session_id))
+}
+
+/// `--cow`フラグから`WorkspaceWriteMode`を決める。`session_id`はCoW upperの採番に使う
+/// （`sandbox_dir_for_session`と同じ採番元）。`--cow`指定時に`ProjectDirs`が解決できない
+/// （HOME未設定等の異常環境）場合は起動を拒否する（安全側: upperが無いままRW付与に
+/// フォールバックしない）。
+fn resolve_write_mode(cow: bool, session_id: &str) -> Result<WorkspaceWriteMode, String> {
+    if !cow {
+        return Ok(WorkspaceWriteMode::DirectRw);
+    }
+    let upper_dir = cow_upper_dir_for_session(session_id)
+        .ok_or_else(|| "--cow: could not resolve %LOCALAPPDATA% for the CoW upper directory (is HOME/USERPROFILE set?)".to_string())?;
+    Ok(WorkspaceWriteMode::Cow { upper_dir })
 }
 
 /// `--session <id>`指定が無い場合に`.harness/sandbox/`直下で最も更新日時の新しいものを選ぶ
@@ -796,12 +825,7 @@ struct ApplyReportJson {
 fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
     let settings = harness_config::Settings::load(workspace_root);
 
-    let (explicit, staging_mode) = resolve_staging_mode(
-        cli.live,
-        cli.staged,
-        cli.workspace_commit,
-        cli.print.is_some(),
-    );
+    let staging_mode = resolve_staging_mode(cli.live, cli.staged, cli.workspace_commit);
     let read_scope = settings
         .read
         .clone()
@@ -825,11 +849,11 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
     }
     let run_shell_path_extra = settings.run_shell.clone().unwrap_or_default().path_extra();
 
-    if !cli.fs_allow.is_empty() || cli.force_system_acl {
+    if !cli.fs_allow.is_empty() || cli.force_system_acl || cli.cow {
         eprintln!(
-            "note: --fs-allow/--force-system-acl are ignored by `harness prompt` (fs passthrough \
-             is not probed by this diagnostic command); the printed prompt reflects read-scope/\
-             net settings only."
+            "note: --fs-allow/--force-system-acl/--cow are ignored by `harness prompt` (fs \
+             passthrough and ACL mode are not probed by this diagnostic command); the printed \
+             prompt reflects read-scope/net settings only."
         );
     }
 
@@ -846,6 +870,7 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
         cli.tier1,
         &[],
         None,
+        &WorkspaceWriteMode::DirectRw,
     ) {
         Ok(sel) => sel,
         Err(e) => {
@@ -858,7 +883,6 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
         workspace_root: workspace_root.to_path_buf(),
         staging: StagingConfig {
             mode: staging_mode,
-            explicit,
             sandbox_dir: None,
         },
         read_scope,
@@ -868,6 +892,7 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
         net_app,
         run_shell_path_extra,
         vm_sandbox: None,
+        cow_upper_dir: None,
     };
     for block in harness_engine::system_blocks_for(&ctx) {
         println!("{}", block.text);
@@ -935,7 +960,6 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
     };
     let staging = StagingConfig {
         mode: StagingMode::Staged,
-        explicit: true,
         sandbox_dir: Some(sandbox_dir),
     };
     let fs = match SandboxFs::open(workspace_root, &staging) {
@@ -1068,6 +1092,16 @@ struct FsLedgerEntry {
     /// 撤収時も同じ特権が要るため記録する。旧台帳（このフィールド欠落）は`false`扱い（後方互換）。
     #[serde(default)]
     forced: bool,
+    /// このパスを現在`.harness/settings.json`の`fs.read`/`fs.read_write`/`fs.read_exec`で
+    /// 宣言しているワークスペースroot文字列の集合（D-27、`vm_ledger::WorkspaceResourceEntry.refcount`
+    /// と同型の参照カウント）。空なら「settings.json経由の宣言者が現在いない」。
+    #[serde(default)]
+    settings_workspaces: Vec<String>,
+    /// 一度でも`.harness/settings.json`経由（`--fs-allow`ではなく）で付与されたことがあるか（D-27）。
+    /// `false`のままなら`--fs-allow`専用エントリであり、`reconcile_fs_ledger_for_workspace`の
+    /// 自動撤収対象にしない（D2/D3のsticky挙動を維持する）。
+    #[serde(default)]
+    settings_managed: bool,
 }
 
 /// 到達不能/付与失敗だったfs passthrough候補。`harness fs list`/`harness fs denied`で表示し、
@@ -1118,9 +1152,24 @@ fn traverse_ledger_path() -> Option<PathBuf> {
         .map(|d| d.config_dir().join("traverse-grant-ledger.json"))
 }
 
+/// fs ledgerの名前付きロック名（`vm_ledger.rs`の`Local\harness-tier3-vm-ledger`と同じ命名）。
+/// 複数`harness.exe`同時起動下でのread-modify-writeレースを防ぐ（D-27）。
+const FS_LEDGER_LOCK_NAME: &str = "Local\\harness-fs-passthrough-ledger";
+
 /// 台帳が存在しない/読めない/パースできない場合は空扱い（`harness-config`の設定読み込みと
-/// 同じfail-open方針、起動を止めない）。
+/// 同じfail-open方針、起動を止めない）。単発の読取専用アクセス用（ロック込み）。
+/// 複合的なread-modify-writeを行う場合は`with_named_lock`の中で`load_fs_ledger_unlocked`を使うこと。
+#[cfg(windows)]
 fn load_fs_ledger() -> FsLedger {
+    harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, load_fs_ledger_unlocked)
+}
+
+#[cfg(not(windows))]
+fn load_fs_ledger() -> FsLedger {
+    load_fs_ledger_unlocked()
+}
+
+fn load_fs_ledger_unlocked() -> FsLedger {
     let Some(path) = fs_ledger_path() else {
         return FsLedger::default();
     };
@@ -1178,7 +1227,7 @@ fn set_file_readonly(path: &Path, readonly: bool) {
 #[cfg(not(windows))]
 fn set_file_readonly(_path: &Path, _readonly: bool) {}
 
-fn save_fs_ledger(ledger: &FsLedger) {
+fn save_fs_ledger_unlocked(ledger: &FsLedger) {
     let Some(path) = fs_ledger_path() else {
         return;
     };
@@ -1196,65 +1245,108 @@ fn save_traverse_ledger(ledger: &TraverseLedger) {
     }
 }
 
-/// `--fs-allow`でTier2a preflightが実際にACE付与を試みたルートを台帳へ記録する（D2/D3）。
-/// 同一パスは上書き（冪等）。ACE自体は「付けっぱなし」（D2）だが、台帳があるので後から
-/// `harness fs revoke`/`revoke-all`で一括撤収できる。
-fn record_fs_passthrough_grant(path: &Path, writable: bool, forced: bool) {
-    let mut ledger = load_fs_ledger();
-    let path_str = path.to_string_lossy().into_owned();
-    let granted_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Some(entry) = ledger.entries.iter_mut().find(|e| e.path == path_str) {
-        entry.writable = writable;
-        entry.granted_at_unix_secs = granted_at;
-        entry.forced = forced;
-    } else {
-        ledger.entries.push(FsLedgerEntry {
-            path: path_str.clone(),
-            writable,
-            granted_at_unix_secs: granted_at,
-            forced,
-        });
-    }
-    ledger.denied_entries.retain(|e| e.path != path_str);
-    save_fs_ledger(&ledger);
+/// `--fs-allow`/`.harness/settings.json`でTier2a preflightが実際にACE付与を試みたルートを
+/// 台帳へ記録する（D2/D3）。同一パスは上書き（冪等）。ACE自体は「付けっぱなし」（D2）だが、
+/// 台帳があるので後から`harness fs revoke`/`revoke-all`で一括撤収できる。
+/// `settings_workspace`が`Some`なら、このパスが`.harness/settings.json`経由（`--fs-allow`ではなく）で
+/// 宣言されたことを示し、`settings_workspaces`（D-27の参照カウント）へワークスペースrootを
+/// dedup追加し`settings_managed`を立てる（一度立ったら以後trueのまま維持し、`--fs-allow`のみの
+/// 再起動を挟んでも自動整合対象であり続ける）。
+fn record_fs_passthrough_grant(
+    path: &Path,
+    writable: bool,
+    forced: bool,
+    settings_workspace: Option<&str>,
+) {
+    harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, || {
+        let mut ledger = load_fs_ledger_unlocked();
+        let path_str = path.to_string_lossy().into_owned();
+        let granted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(entry) = ledger.entries.iter_mut().find(|e| e.path == path_str) {
+            entry.writable = writable;
+            entry.granted_at_unix_secs = granted_at;
+            entry.forced = forced;
+            if let Some(ws) = settings_workspace {
+                if !entry.settings_workspaces.iter().any(|w| w == ws) {
+                    entry.settings_workspaces.push(ws.to_string());
+                }
+                entry.settings_managed = true;
+            }
+        } else {
+            ledger.entries.push(FsLedgerEntry {
+                path: path_str.clone(),
+                writable,
+                granted_at_unix_secs: granted_at,
+                forced,
+                settings_workspaces: settings_workspace
+                    .map(|ws| vec![ws.to_string()])
+                    .unwrap_or_default(),
+                settings_managed: settings_workspace.is_some(),
+            });
+        }
+        ledger.denied_entries.retain(|e| e.path != path_str);
+        save_fs_ledger_unlocked(&ledger);
+    });
 }
 
 fn record_fs_passthrough_denied(path: &Path, access: &str, reason: &str) {
-    let mut ledger = load_fs_ledger();
-    let path_str = path.to_string_lossy().into_owned();
-    let denied_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Some(entry) = ledger
-        .denied_entries
-        .iter_mut()
-        .find(|e| e.path == path_str && e.access == access)
-    {
-        entry.reason = reason.to_string();
-        entry.last_denied_at_unix_secs = denied_at;
-        entry.count = entry.count.saturating_add(1);
-    } else {
-        ledger.denied_entries.push(FsDeniedLedgerEntry {
-            path: path_str,
-            access: access.to_string(),
-            reason: reason.to_string(),
-            last_denied_at_unix_secs: denied_at,
-            count: 1,
-        });
-    }
-    save_fs_ledger(&ledger);
+    harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, || {
+        let mut ledger = load_fs_ledger_unlocked();
+        let path_str = path.to_string_lossy().into_owned();
+        let denied_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(entry) = ledger
+            .denied_entries
+            .iter_mut()
+            .find(|e| e.path == path_str && e.access == access)
+        {
+            entry.reason = reason.to_string();
+            entry.last_denied_at_unix_secs = denied_at;
+            entry.count = entry.count.saturating_add(1);
+        } else {
+            ledger.denied_entries.push(FsDeniedLedgerEntry {
+                path: path_str,
+                access: access.to_string(),
+                reason: reason.to_string(),
+                last_denied_at_unix_secs: denied_at,
+                count: 1,
+            });
+        }
+        save_fs_ledger_unlocked(&ledger);
+    });
 }
 
 fn remove_fs_passthrough_grant(path: &Path) {
-    let mut ledger = load_fs_ledger();
-    let path_str = path.to_string_lossy().into_owned();
-    ledger.entries.retain(|e| e.path != path_str);
-    ledger.denied_entries.retain(|e| e.path != path_str);
-    save_fs_ledger(&ledger);
+    harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, || {
+        let mut ledger = load_fs_ledger_unlocked();
+        let path_str = path.to_string_lossy().into_owned();
+        ledger.entries.retain(|e| e.path != path_str);
+        ledger.denied_entries.retain(|e| e.path != path_str);
+        save_fs_ledger_unlocked(&ledger);
+    });
+}
+
+/// `reconcile_fs_ledger_for_workspace`専用の除去。orphan候補を確定してからACE撤収を試みるまでの
+/// 間（ロックを一旦手放す）に、別プロセスが同じパスを新たに宣言し直す競合（TOCTOU）を考慮し、
+/// 撤収成功後もなお「settings管理下で参照者ゼロ」のままである場合だけ台帳から除去する（D-27）。
+/// 競合で参照者が復活していた場合は台帳エントリを残す（ACEは撤収済みのため、次回起動の
+/// `reconcile_fs_ledger_for_workspace`が再度grantを試みて整合を取り戻す）。
+#[cfg(windows)]
+fn remove_fs_passthrough_grant_if_still_orphaned(path: &Path) {
+    harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, || {
+        let mut ledger = load_fs_ledger_unlocked();
+        let path_str = path.to_string_lossy().into_owned();
+        ledger.entries.retain(|e| {
+            e.path != path_str || (e.settings_managed && !e.settings_workspaces.is_empty())
+        });
+        ledger.denied_entries.retain(|e| e.path != path_str);
+        save_fs_ledger_unlocked(&ledger);
+    });
 }
 
 /// `grant-traverse`が実際にACE付与を試みたパスをtraverse台帳へ記録する（D10の巻き戻し用）。
@@ -1541,45 +1633,52 @@ fn fs_revoke_one(_path: &Path) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// 台帳の全fs passthroughエントリを撤収する。`fs_revoke_one`をループで呼ぶと
-/// システム保護パスの数だけUACが出かねないため、まず全エントリを本体内で試行し（UAC無し）、
-/// 残ったパスだけを**1回のヘルパー要求へまとめて**エスカレーションする（`BUG-015`決定：
-/// 起動あたりUAC最小化、grant側`preflight`と同じ考え方）。
+/// `entries`のfs passthrough ACEを撤収する共通処理（元は`fs_revoke_all`本体）。まず全エントリを
+/// 本体内で試行し（UAC無し）、残ったパスだけを**1回のヘルパー要求へまとめて**エスカレーションする
+/// （`BUG-015`決定：起動あたりUAC最小化、grant側`preflight`と同じ考え方）。撤収に成功したパスは
+/// `on_revoked`で台帳から除去する（`fs_revoke_all`は常に除去、`reconcile_fs_ledger_for_workspace`は
+/// TOCTOU再チェック付きの除去を渡す。D-27）。返り値は`(実際に撤収できたパス, (失敗パス, 理由))`。
 #[cfg(windows)]
-fn fs_revoke_all() -> ExitCode {
-    let ledger = load_fs_ledger();
-    if ledger.entries.is_empty() {
-        println!("(no fs passthrough entries)");
-        return ExitCode::SUCCESS;
-    }
+fn revoke_fs_ledger_entries(
+    entries: &[FsLedgerEntry],
+    note: &str,
+    on_revoked: fn(&Path),
+) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
     let sid = match harness_sandbox::win_appcontainer::ensure_profile(
         harness_sandbox::win_appcontainer::CONTAINER_NAME,
     ) {
         Ok(sid) => sid,
         Err(e) => {
-            eprintln!("failed to resolve sandbox SID: {e}");
-            return ExitCode::FAILURE;
+            let reason = format!("failed to resolve sandbox SID: {e}");
+            return (
+                Vec::new(),
+                entries
+                    .iter()
+                    .map(|entry| (PathBuf::from(&entry.path), reason.clone()))
+                    .collect(),
+            );
         }
     };
 
     use harness_sandbox::win_appcontainer::RevokeOutcome;
-    // 本体内で撤収しきれなかったパスを`forced`情報付きで集める（ヘルパーで撤収時、forcedなら
-    // `SeRestorePrivilege`を有効化して撤収するため）。
     let mut remaining: Vec<harness_sandbox::privhelper::FsAllowRevoke> = Vec::new();
-    for entry in &ledger.entries {
+    let mut revoked_paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
         let path = PathBuf::from(&entry.path);
         match revoke_passthrough_outcome(&path, &sid, entry.forced) {
             RevokeOutcome::FullyRevoked => {
-                remove_fs_passthrough_grant(&path);
-                println!("revoked: {}", path.display());
+                on_revoked(&path);
+                println!("{note}: {}", path.display());
+                revoked_paths.push(path);
             }
             RevokeOutcome::RootClearedDescendantsBlocked => {
-                remove_fs_passthrough_grant(&path);
+                on_revoked(&path);
                 println!(
-                    "revoked: {} (root cleared; TrustedInstaller-owned descendants beyond our \
+                    "{note}: {} (root cleared; TrustedInstaller-owned descendants beyond our \
                      control -- not orphaned)",
                     path.display()
                 );
+                revoked_paths.push(path);
             }
             RevokeOutcome::Failed => remaining.push(harness_sandbox::privhelper::FsAllowRevoke {
                 path,
@@ -1589,7 +1688,7 @@ fn fs_revoke_all() -> ExitCode {
     }
 
     if remaining.is_empty() {
-        return ExitCode::SUCCESS;
+        return (revoked_paths, Vec::new());
     }
 
     let escalated: Result<harness_sandbox::privhelper::FsAllowRevokeOutcome, String> =
@@ -1619,27 +1718,41 @@ fn fs_revoke_all() -> ExitCode {
     match escalated {
         Ok((revoked, root_cleared, failures)) => {
             for path in revoked.iter().chain(root_cleared.iter()) {
-                remove_fs_passthrough_grant(path);
+                on_revoked(path);
                 println!(
-                    "revoked via privilege-separation helper (UAC, one-time): {}",
+                    "{note} via privilege-separation helper (UAC, one-time): {}",
                     path.display()
                 );
+                revoked_paths.push(path.clone());
             }
-            if failures.is_empty() {
-                ExitCode::SUCCESS
-            } else {
-                for (path, reason) in &failures {
-                    eprintln!("revoke incomplete for {} : {reason}", path.display());
-                }
-                ExitCode::FAILURE
-            }
+            (revoked_paths, failures)
         }
         Err(reason) => {
-            for entry in &remaining {
-                eprintln!("revoke failed for {}: {reason}", entry.path.display());
-            }
-            ExitCode::FAILURE
+            let failures = remaining
+                .iter()
+                .map(|entry| (entry.path.clone(), reason.clone()))
+                .collect();
+            (revoked_paths, failures)
         }
+    }
+}
+
+/// 台帳の全fs passthroughエントリを撤収する（`harness fs revoke-all`本体）。
+#[cfg(windows)]
+fn fs_revoke_all() -> ExitCode {
+    let ledger = load_fs_ledger();
+    if ledger.entries.is_empty() {
+        println!("(no fs passthrough entries)");
+        return ExitCode::SUCCESS;
+    }
+    let (_, failures) = revoke_fs_ledger_entries(&ledger.entries, "revoked", remove_fs_passthrough_grant);
+    if failures.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        for (path, reason) in &failures {
+            eprintln!("revoke incomplete for {} : {reason}", path.display());
+        }
+        ExitCode::FAILURE
     }
 }
 
@@ -1647,6 +1760,62 @@ fn fs_revoke_all() -> ExitCode {
 fn fs_revoke_all() -> ExitCode {
     eprintln!("error: fs passthrough revoke is Windows-only (Tier2a specific)");
     ExitCode::FAILURE
+}
+
+/// 起動のたびに、このワークスペースの`.harness/settings.json`が現在宣言しているfs passthrough
+/// パス集合（`settings_fs_paths`）と台帳の`settings_workspaces`参照カウントを突き合わせ、
+/// (1)このワークスペースが新規に宣言したパスへタグを追加し、(2)もう宣言していないパスから
+/// タグを外す（D-27）。タグを外した結果、どのワークスペースからも参照されなくなった
+/// `settings_managed`エントリだけをACE撤収対象にする（`--fs-allow`専用のエントリは
+/// `settings_managed`が立たないため対象外＝既存のsticky挙動を維持）。
+/// Tier2aが実際に選択されるかどうかとは独立に、`select_tier`（preflight）より前に毎回呼ぶ。
+#[cfg(windows)]
+fn reconcile_fs_ledger_for_workspace(
+    workspace_root: &Path,
+    settings_fs_paths: &std::collections::HashSet<String>,
+) {
+    let ws = workspace_root.to_string_lossy().into_owned();
+    let orphan_candidates: Vec<FsLedgerEntry> =
+        harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, || {
+            let mut ledger = load_fs_ledger_unlocked();
+            for entry in ledger.entries.iter_mut() {
+                let declared_now = settings_fs_paths.contains(&entry.path);
+                let was_tagged = entry.settings_workspaces.iter().any(|w| w == &ws);
+                if declared_now && !was_tagged {
+                    entry.settings_workspaces.push(ws.clone());
+                    entry.settings_managed = true;
+                } else if !declared_now && was_tagged {
+                    entry.settings_workspaces.retain(|w| w != &ws);
+                }
+            }
+            let candidates: Vec<FsLedgerEntry> = ledger
+                .entries
+                .iter()
+                .filter(|entry| entry.settings_managed && entry.settings_workspaces.is_empty())
+                .cloned()
+                .collect();
+            save_fs_ledger_unlocked(&ledger);
+            candidates
+        });
+
+    if orphan_candidates.is_empty() {
+        return;
+    }
+    eprintln!(
+        "note: the following fs passthrough paths are no longer declared by any workspace's \
+         .harness/settings.json; auto-revoking their ACE (D-27):"
+    );
+    for entry in &orphan_candidates {
+        eprintln!("  {}", entry.path);
+    }
+    let (_, failures) = revoke_fs_ledger_entries(
+        &orphan_candidates,
+        "auto-revoked",
+        remove_fs_passthrough_grant_if_still_orphaned,
+    );
+    for (path, reason) in &failures {
+        eprintln!("warning: auto-revoke failed for {} : {reason}", path.display());
+    }
 }
 
 /// `grant-traverse --dry-run`本体。`target`の祖先チェーン（ドライブルートまで）を、一切書込まず
@@ -2134,16 +2303,12 @@ async fn main() -> ExitCode {
         }
     };
 
-    // 書込ステージング設定（M10）。`sandbox_dir`は`session.id()`確定後でなければ組めないため
-    // ここで`ToolCtx`を構築する。明示`--live`時はオーバーレイ自体を使わない
-    // （`sandbox_dir: None`、M9までの直接実FSアクセスとバイト等価・監査ログも作らない）。
-    let (explicit, staging_mode) = resolve_staging_mode(
-        cli.live,
-        cli.staged,
-        cli.workspace_commit,
-        cli.print.is_some(),
-    );
-    let sandbox_dir = if explicit && staging_mode == StagingMode::Live {
+    // 書込ステージング設定（M10・D-29）。`sandbox_dir`は`session.id()`確定後でなければ組めない
+    // ため、ここで`ToolCtx`を構築する。既定（フラグ無指定）を含め`Live`実効時はオーバーレイ
+    // 自体を使わない（`sandbox_dir: None`、M9までの直接実FSアクセスとバイト等価・監査ログも
+    // 作らない）。書込/読取の実防御はシェル隔離Tier（既定Tier2a=AppContainer）に委ねる。
+    let staging_mode = resolve_staging_mode(cli.live, cli.staged, cli.workspace_commit);
+    let sandbox_dir = if staging_mode == StagingMode::Live {
         None
     } else {
         Some(sandbox_dir_for_session(&session.id()))
@@ -2204,8 +2369,16 @@ async fn main() -> ExitCode {
     // `.harness/settings.json`の`fs.allow`を和集合でマージする（重複除去、net_appと同形）。
     // 各要素は`<path>[:rw]`（末尾`:rw`が無ければread-only既定、D-13）。パスは`workspace_root`
     // 基準で絶対化する（既に絶対パスなら`Path::join`はそのまま採用する）。
-    let mut fs_allow_raw: Vec<(String, harness_config::FsAccess)> =
+    let settings_fs_entries: Vec<(String, harness_config::FsAccess)> =
         settings.fs.clone().unwrap_or_default().to_fs_passthrough();
+    // このワークスペースが現在`.harness/settings.json`経由で宣言しているfs passthroughパスの
+    // 絶対パス集合（D-27）。`--fs-allow`由来のパスは含めない（対象は設定ファイル経由の宣言のみ）。
+    // `fs_passthrough`と同じ`workspace_root.join`で絶対化し、台帳に記録される文字列表現と一致させる。
+    let settings_fs_paths: std::collections::HashSet<String> = settings_fs_entries
+        .iter()
+        .map(|(path, _)| workspace_root.join(path).to_string_lossy().into_owned())
+        .collect();
+    let mut fs_allow_raw: Vec<(String, harness_config::FsAccess)> = settings_fs_entries;
     for entry in &cli.fs_allow {
         let (path, access) = match entry.strip_suffix(":rw") {
             Some(p) => (p.to_string(), harness_config::FsAccess::ReadWrite),
@@ -2243,6 +2416,14 @@ async fn main() -> ExitCode {
              this OS"
         );
     }
+
+    // fs passthrough ACEのライフサイクル自動整合（D-27）。`.harness/settings.json`から
+    // 消えたエントリのうち、どのワークスペースからも参照されなくなったものだけACEを撤収する
+    // （複数ワークスペースが同じパスを共有宣言している場合は、他が参照している限り残す）。
+    // Tier2aが実際に選択されるかどうかとは独立に、起動のたびに毎回行う（設定変更の反映は
+    // Tierの降格有無と無関係のため）。`select_tier`（preflight）より前に行う。
+    #[cfg(windows)]
+    reconcile_fs_ledger_for_workspace(&workspace_root, &settings_fs_paths);
 
     // D7: --require-sandboxとの矛盾チェック。write-containmentは範囲外書込を禁じるため:rwのみ
     // 拒否（:roは書込に無関係で許可）。confidentialは範囲外を読めない保証のため:ro/:rwいずれも
@@ -2308,6 +2489,17 @@ async fn main() -> ExitCode {
     #[cfg(not(windows))]
     let wfp_chain_pipe: Option<String> = None;
 
+    if cli.cow && !cfg!(windows) {
+        eprintln!("error: --cow is only supported on Windows (Tier2a/AppContainer)");
+        return ExitCode::FAILURE;
+    }
+    let write_mode = match resolve_write_mode(cli.cow, &session.id()) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let shell_tier = match select_tier(
         require_sandbox,
         &workspace_root,
@@ -2315,6 +2507,7 @@ async fn main() -> ExitCode {
         cli.tier1,
         &fs_passthrough,
         wfp_chain_pipe,
+        &write_mode,
     ) {
         Ok(selection) => selection,
         Err(e) => {
@@ -2483,7 +2676,11 @@ async fn main() -> ExitCode {
                 .find(|fp| &fp.path == path)
                 .map(|fp| fp.forced)
                 .unwrap_or(false);
-            record_fs_passthrough_grant(path, *writable, forced);
+            let path_str = path.to_string_lossy().into_owned();
+            let settings_workspace = settings_fs_paths
+                .contains(&path_str)
+                .then(|| workspace_root.to_string_lossy().into_owned());
+            record_fs_passthrough_grant(path, *writable, forced, settings_workspace.as_deref());
             if forced {
                 eprintln!(
                     "WARNING: forced system ACL grant (--force-system-acl, SeRestorePrivilege): {} \
@@ -2526,7 +2723,6 @@ async fn main() -> ExitCode {
         workspace_root: workspace_root.clone(),
         staging: StagingConfig {
             mode: staging_mode,
-            explicit,
             sandbox_dir,
         },
         read_scope,
@@ -2536,6 +2732,7 @@ async fn main() -> ExitCode {
         net_app,
         run_shell_path_extra,
         vm_sandbox: None,
+        cow_upper_dir: write_mode.upper_dir().map(|p| p.to_path_buf()),
     };
 
     let mut state = ConversationState::new(harness_engine::system_blocks_for(&tool_ctx));
@@ -2779,6 +2976,8 @@ mod fs_ledger_tests {
                 writable: false,
                 granted_at_unix_secs: 1_700_000_000,
                 forced: true,
+                settings_workspaces: Vec::new(),
+                settings_managed: false,
             }],
             denied_entries: Vec::new(),
         };
@@ -2803,6 +3002,36 @@ mod fs_ledger_tests {
         let back: FsLedger = serde_json::from_str(&json).unwrap();
         assert_eq!(back.denied_entries[0].access, "read_exec");
         assert_eq!(back.denied_entries[0].count, 2);
+    }
+}
+
+#[cfg(test)]
+mod staging_mode_tests {
+    use super::resolve_staging_mode;
+    use harness_core::StagingMode;
+
+    /// D-29: フラグ無指定時は常にLive（オプトイン、既定の安全策ではない）。
+    #[test]
+    fn no_flags_defaults_to_live() {
+        assert_eq!(resolve_staging_mode(false, false, false), StagingMode::Live);
+    }
+
+    #[test]
+    fn staged_flag_selects_staged() {
+        assert_eq!(resolve_staging_mode(false, true, false), StagingMode::Staged);
+    }
+
+    #[test]
+    fn workspace_commit_flag_selects_workspace_commit() {
+        assert_eq!(
+            resolve_staging_mode(false, false, true),
+            StagingMode::WorkspaceCommit
+        );
+    }
+
+    #[test]
+    fn live_flag_selects_live() {
+        assert_eq!(resolve_staging_mode(true, false, false), StagingMode::Live);
     }
 }
 

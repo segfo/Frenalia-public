@@ -28,21 +28,22 @@ pub struct ToolResult {
 /// 「許可された書込の実FS効果をどこへ落とすか」だけを決める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagingMode {
-    /// 即実FS（オーバーレイ無し）。
+    /// 即実FS（オーバーレイ無し）。フラグ無指定時の既定（D-29、`SandboxFs`ステージングは
+    /// 既定の安全策ではなくオプトインのレビュー用機能。書込/読取の実防御はシェル隔離Tier
+    /// （既定Tier2a=AppContainer）に一本化する）。
     Live,
-    /// 全書込staging、実FSは手動`apply`まで不変（headless/未信頼の既定）。
+    /// 全書込staging、実FSは手動`apply`まで不変。`--staged`明示指定時のみ。
     Staged,
     /// workspace内はstaging→レビュー&コミット、workspace外は常にsandbox隔離。
+    /// `--workspace-commit`明示指定時のみ。
     WorkspaceCommit,
 }
 
-/// ツールのステージング設定。`explicit`が`true`なら`mode`をそのまま使い、`false`なら
-/// パス毎のgit認識型判定（追跡済み・変更ゼロ→live、それ以外→`mode`）に委ねる
-/// （`harness-sandbox::SandboxFs`が判定の実体を持つ。`harness-core`は値を運ぶだけ）。
+/// ツールのステージング設定。`mode`をそのまま使う（M10当時あった「パス毎のgit認識型判定への
+/// 委譲」は削除済み、D-29参照）。
 #[derive(Debug, Clone)]
 pub struct StagingConfig {
     pub mode: StagingMode,
-    pub explicit: bool,
     /// オーバーレイ・マニフェストの置き場所。**`workspace_root`からの相対パス**
     /// （例 `.harness/sandbox/<session-id>`）で持つ。オーバーレイの実体を常にworkspace内に
     /// 置くことで、`WorkspaceJail`（cap-std主ゲート）1つだけで実FS・オーバーレイの両方を
@@ -55,7 +56,6 @@ impl Default for StagingConfig {
     fn default() -> Self {
         Self {
             mode: StagingMode::Live,
-            explicit: false,
             sandbox_dir: None,
         }
     }
@@ -368,6 +368,12 @@ pub struct ToolCtx {
     /// `ToolCtx`を経由させる。`Arc`は`ToolCtx`が`Clone`である前提（既存フィールドと同様、
     /// 生ハンドルではなく共有可能な参照を運ぶ）。
     pub vm_sandbox: Option<std::sync::Arc<dyn VmShellExecutor>>,
+    /// `--cow`（D-30）指定時のCoW upperディレクトリ（workspace外）。`Some`はTier2aで
+    /// workspaceがRead/Execute/Traverseのみ（RO）で付与されており、`run_shell`子プロセスの
+    /// 書込はRedirector DLLによりこのディレクトリへ誘導される（フック失敗時はACLにより
+    /// `ACCESS_DENIED`でfail-close、`plans/DESIGN-SANDBOX.md §7 D-30`）。`None`は既定
+    /// （D-29、workspace RW直接）。
+    pub cow_upper_dir: Option<std::path::PathBuf>,
 }
 
 impl ToolCtx {
@@ -384,6 +390,7 @@ impl ToolCtx {
             run_shell_path_extra: Vec::new(),
             shell_sees_staged_writes: false,
             vm_sandbox: None,
+            cow_upper_dir: None,
         }
     }
 }

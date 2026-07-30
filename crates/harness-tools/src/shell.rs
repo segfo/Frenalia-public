@@ -288,6 +288,8 @@ impl Tool for RunShellTool {
             ctx.net_proxy.enforced_by_wfp && ctx.net_proxy.domain_policy_enabled,
             net_domain_policy_requested,
             ctx.vm_sandbox.as_ref(),
+            &ctx.workspace_root,
+            ctx.cow_upper_dir.as_deref(),
         )
         .await?;
 
@@ -492,10 +494,16 @@ async fn run_isolated(
     net_proxy_enforced: bool,
     net_domain_policy_requested: bool,
     vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
+    workspace_root: &Path,
+    cow_upper_dir: Option<&Path>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     // Tier2a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
     // 「このTierでは無効」と明記する、`call`参照）。
     let _ = &net;
+    // `workspace_root`/`cow_upper_dir`（D-30、`--cow`）はWindows Tier2a経路でのみ使う
+    // （Redirector DLL注入用のenv注入先パス）。
+    #[cfg(not(windows))]
+    let _ = (workspace_root, cow_upper_dir);
     if tier == ShellTier::Tier3 {
         return run_tier3(command, cwd, env, dur, vm_sandbox).await;
     }
@@ -510,6 +518,8 @@ async fn run_isolated(
                 net,
                 net_proxy_enforced,
                 net_domain_policy_requested,
+                workspace_root,
+                cow_upper_dir,
             )
             .await;
         }
@@ -626,6 +636,7 @@ async fn run_linux_tier2b(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 async fn run_windows_tier2a(
     command: &str,
     cwd: &Path,
@@ -634,6 +645,8 @@ async fn run_windows_tier2a(
     net: NetDecision,
     net_proxy_enforced: bool,
     net_domain_policy_requested: bool,
+    workspace_root: &Path,
+    cow_upper_dir: Option<&Path>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let _ = std::fs::create_dir_all(cwd);
     let sid = harness_sandbox::win_appcontainer::ensure_profile(
@@ -647,6 +660,10 @@ async fn run_windows_tier2a(
     let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
     let cwd_owned = cwd.to_path_buf();
     let env_owned = env.to_vec();
+    let cow = cow_upper_dir.map(|upper_dir| harness_sandbox::win_appcontainer::CowInject {
+        workspace_root,
+        upper_dir,
+    });
 
     // アプリ単位network制御（軸1、D-10/D-11）。`Allow`のときのみ`internetClient`を付与する
     // （`DeniedByChaining`/`Deny`はどちらも既定のcapability空＝network全遮断のまま）。
@@ -668,6 +685,7 @@ async fn run_windows_tier2a(
         true,
         sid.as_psid(),
         net_capability,
+        cow,
     )
     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child.kill_token();
@@ -926,6 +944,7 @@ mod tests {
             true,
             &[],
             None,
+            &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .expect("tier selection without --require-sandbox never fails");
@@ -1366,8 +1385,16 @@ mod tests {
         // 実Tier2a preflightを走らせる（`opt_in_Tier2a=true`）。AppContainer不可の環境では
         // Tier1へ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
         let selection =
-            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), false, false, &[], None)
-                .unwrap();
+            harness_sandbox::select_tier(
+                RequireSandbox::None,
+                dir.path(),
+                false,
+                false,
+                &[],
+                None,
+                &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
+            )
+            .unwrap();
         if selection.tier != ShellTier::Tier2a {
             eprintln!(
                 "skipping Tier2a test: preflight downgraded to {} ({:?})",
@@ -1465,8 +1492,16 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let selection =
-            harness_sandbox::select_tier(RequireSandbox::None, dir.path(), false, false, &[], None)
-                .unwrap();
+            harness_sandbox::select_tier(
+                RequireSandbox::None,
+                dir.path(),
+                false,
+                false,
+                &[],
+                None,
+                &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
+            )
+            .unwrap();
         if selection.tier != ShellTier::Tier2a {
             eprintln!(
                 "skipping Tier2a net-allow-app test: preflight downgraded to {} ({:?})",

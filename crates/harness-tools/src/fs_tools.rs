@@ -387,7 +387,6 @@ mod tests {
             workspace_root: dir.path().to_path_buf(),
             staging: StagingConfig {
                 mode: StagingMode::Staged,
-                explicit: true,
                 sandbox_dir: Some(PathBuf::from(".harness/sandbox/test-session")),
             },
             read_scope: Default::default(),
@@ -397,6 +396,7 @@ mod tests {
             run_shell_path_extra: Vec::new(),
             shell_sees_staged_writes: false,
             vm_sandbox: None,
+            cow_upper_dir: None,
         };
 
         let tool = WriteFileTool;

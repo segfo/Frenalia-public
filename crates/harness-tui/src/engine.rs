@@ -240,7 +240,6 @@ mod tests {
             workspace_root: PathBuf::from(r"C:\Users\segfo\Documents\AI\harness"),
             staging: StagingConfig {
                 mode: StagingMode::WorkspaceCommit,
-                explicit: false,
                 sandbox_dir: None,
             },
             read_scope: ReadScopeConfig {
@@ -264,6 +263,7 @@ mod tests {
             net_app: NetAppPolicy::default(),
             run_shell_path_extra: Vec::new(),
             vm_sandbox: None,
+            cow_upper_dir: None,
         };
         let mut state = ConversationState::new(harness_engine::system_blocks_for(&stale_ctx));
 

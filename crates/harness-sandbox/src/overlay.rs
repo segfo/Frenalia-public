@@ -22,7 +22,7 @@ use harness_core::{ReadScopeConfig, StagingConfig, StagingMode};
 
 use crate::manifest::{self, ManifestEntry, ManifestOp, ManifestTarget};
 use crate::read_scope::ReadScope;
-use crate::{check_relative_path, git, JailError, WorkspaceJail};
+use crate::{check_relative_path, JailError, WorkspaceJail};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
@@ -154,10 +154,8 @@ pub struct ApplyReport {
 /// `WorkspaceJail`をそのまま素通しする純live実装として振る舞う（M9までの既存挙動と等価）。
 pub struct SandboxFs {
     jail: WorkspaceJail,
-    workspace_root: PathBuf,
     sandbox_dir: Option<PathBuf>,
     mode: StagingMode,
-    explicit: bool,
     read_scope: ReadScope,
 }
 
@@ -176,10 +174,8 @@ impl SandboxFs {
         let jail = WorkspaceJail::open(workspace_root)?;
         Ok(Self {
             jail,
-            workspace_root: workspace_root.to_path_buf(),
             sandbox_dir: staging.sandbox_dir.clone(),
             mode: staging.mode,
-            explicit: staging.explicit,
             read_scope: ReadScope::open(read_scope_config),
         })
     }
@@ -204,18 +200,6 @@ impl SandboxFs {
             .join(key)
     }
 
-    /// git認識型の既定判定（`explicit`時はそのまま`self.mode`）。
-    fn effective_mode(&self, rel: &Path) -> StagingMode {
-        if self.explicit {
-            return self.mode;
-        }
-        if git::is_clean_tracked(&self.workspace_root, rel) {
-            StagingMode::Live
-        } else {
-            self.mode
-        }
-    }
-
     fn classify_for_write(&self, path: &str) -> Result<Target, SandboxError> {
         let p = Path::new(path);
         if p.is_absolute() {
@@ -234,7 +218,7 @@ impl SandboxFs {
         if self.sandbox_dir.is_none() {
             return Ok(Target::Live { rel });
         }
-        match self.effective_mode(&rel) {
+        match self.mode {
             StagingMode::Live => Ok(Target::Live { rel }),
             StagingMode::Staged | StagingMode::WorkspaceCommit => Ok(Target::Tree { rel }),
         }
@@ -554,6 +538,14 @@ impl SandboxFs {
                 (ManifestTarget::Live, _) => Ok(()),
             };
             result?;
+            // 実FSへの反映が終わったステージ済みコピー（`tree/`・`_ext/`配下）はもう不要なので
+            // 削除する。`Delete`エントリは元々`overlay_path`を持たない（`remove()`参照）ため対象外。
+            // 消し忘れてもコミット済みマニフェスト（`prune_manifest`で除去済み）から再参照される
+            // ことはなく実害は無いが、コミット後もsandbox_dir配下にコピーが残り続けるのを防ぐため、
+            // best-effortで消す（失敗してもcommit自体は成功扱いにする）。
+            if !e.overlay_path.is_empty() {
+                let _ = self.jail.remove_file(&e.overlay_path);
+            }
             report.applied.push(e.path.clone());
             applied_keys.push((e.target, e.path.clone()));
         }
@@ -612,7 +604,6 @@ mod tests {
     fn staged_config(sandbox_dir: &str) -> StagingConfig {
         StagingConfig {
             mode: StagingMode::Staged,
-            explicit: true,
             sandbox_dir: Some(PathBuf::from(sandbox_dir)),
         }
     }
@@ -678,7 +669,6 @@ mod tests {
             dir.path(),
             &StagingConfig {
                 mode: StagingMode::Live,
-                explicit: true,
                 sandbox_dir: Some(PathBuf::from(".harness/sandbox/s1")),
             },
         )
@@ -716,6 +706,14 @@ mod tests {
         let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
         fs.write_string("keep.txt", "keep-content").unwrap();
         fs.write_string("skip.txt", "skip-content").unwrap();
+        // `change_set()`は内部でHashMapを畳み込むため順序を仮定できず、pathで探す。
+        let skip_overlay_path = fs
+            .change_set()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.path == "skip.txt")
+            .unwrap()
+            .overlay_path;
 
         let report = fs
             .apply(&ApplyOptions {
@@ -735,6 +733,15 @@ mod tests {
         let remaining = fs.change_set().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].path, "skip.txt");
+
+        // 適用済み(`keep.txt`)のステージ済みコピーは`apply`後に削除される一方、
+        // 未適用のまま残る`skip.txt`のステージ済みコピーはまだ削除されない
+        // （次回applyやdiscardまで、レビュー対象として`sandbox_dir`配下に残る）。
+        assert!(!dir
+            .path()
+            .join(".harness/sandbox/s1/tree/keep.txt")
+            .exists());
+        assert!(dir.path().join(&skip_overlay_path).exists());
     }
 
     #[test]

@@ -73,6 +73,10 @@ pub struct EnvironmentFacts {
     pub net_proxy: NetProxyConfig,
     pub net_app: NetAppPolicy,
     pub shell_sees_staged_writes: bool,
+    /// `--cow`（D-30）のCoW upperディレクトリ。`Some`ならworkspaceはRead/Execute/Traverseのみ
+    /// （RO）で付与されており、`run_shell`子プロセスの書込は透過的にこの外部ディレクトリへ
+    /// 誘導される（Redirector DLL経由、フック失敗時はACLによりfail-close）。
+    pub cow_upper_dir: Option<PathBuf>,
 }
 
 impl EnvironmentFacts {
@@ -88,6 +92,7 @@ impl EnvironmentFacts {
             run_shell_path_extra,
             shell_sees_staged_writes,
             vm_sandbox,
+            cow_upper_dir,
         } = ctx;
         let _ = run_shell_path_extra;
         // vm_sandbox: Tier3実行チャネルの生ハンドル自体はモデルへ伝える事実を持たない
@@ -102,6 +107,7 @@ impl EnvironmentFacts {
             net_proxy: net_proxy.clone(),
             net_app: net_app.clone(),
             shell_sees_staged_writes: *shell_sees_staged_writes,
+            cow_upper_dir: cow_upper_dir.clone(),
         }
     }
 }
@@ -117,6 +123,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
         net_proxy,
         net_app,
         shell_sees_staged_writes,
+        cow_upper_dir,
     } = facts;
 
     let mut lines = Vec::new();
@@ -134,6 +141,9 @@ pub fn render(facts: &EnvironmentFacts) -> String {
         visible_workspace_root
     ));
     lines.push(render_staging(staging, *shell_sees_staged_writes));
+    if let Some(line) = render_cow(cow_upper_dir) {
+        lines.push(line);
+    }
     lines.push(render_read_scope(read_scope));
     lines.extend(render_shell_tier(shell_tier));
     if let Some(line) = render_net_proxy(net_proxy) {
@@ -181,7 +191,6 @@ fn render_workspace_root(workspace_root: &std::path::Path, tier: ShellTier) -> S
 fn render_staging(staging: &StagingConfig, shell_sees_staged_writes: bool) -> String {
     let StagingConfig {
         mode,
-        explicit: _,
         sandbox_dir: _,
     } = staging;
     match mode {
@@ -214,6 +223,23 @@ fn render_staging(staging: &StagingConfig, shell_sees_staged_writes: bool) -> St
             }
         }
     }
+}
+
+/// D-30: `--cow`時、workspaceはRead/Execute/Traverseのみで付与されている。モデルへは
+/// 「run_shell内の直接書込は成功しない前提で組み立てよ」という事実を明示する
+/// （Redirector DLLが実際に誘導できるかはベストエフォートで、モデルの計画自体はACLの
+/// 保証だけを頼りにすべきという意図、フックは境界にしない=D-01）。
+fn render_cow(cow_upper_dir: &Option<PathBuf>) -> Option<String> {
+    cow_upper_dir.as_ref().map(|upper| {
+        format!(
+            "Copy-on-Writeモード: 有効。ワークスペース本体はread-onlyで付与されており、\
+             run_shellが起動するプロセスから直接書込むと失敗します（Access Denied）。書込は\
+             透過リダイレクト機構が{}へ誘導しようと試みますが、誘導自体はベストエフォートの\
+             利便性機構であり、境界（保護）はワークスペース本体がread-onlyであること自体に\
+             依存します。",
+            upper.display()
+        )
+    })
 }
 
 fn render_read_scope(read_scope: &ReadScopeConfig) -> String {

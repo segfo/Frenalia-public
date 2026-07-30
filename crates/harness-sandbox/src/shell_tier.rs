@@ -96,6 +96,34 @@ pub struct FsPassthrough {
     pub forced: bool,
 }
 
+/// Tier2aがworkspaceへ付与するACLの種別（D-30、`plans/DESIGN-SANDBOX.md` §7）。
+/// `select_tier`から`preflight`まで貫通させる唯一のパラメータとし、`match`の全分岐
+/// （`..`無し）でACL付与関数の選択を強制する（`WorkspaceWriteMode`のバリアントを増やした
+/// 場合、ACL決定を書き忘れるとコンパイルエラーになる——`harness-core::ToolCtx`/
+/// `EnvironmentFacts`の2段ゲートと同じ思想）。Windows以外では値を運ぶだけで無視される
+/// （`FsPassthrough`と同じ扱い）。
+#[derive(Debug, Clone)]
+pub enum WorkspaceWriteMode {
+    /// 既定（D-29）。workspaceへ`grant_ace_inheritable_rw`でRead/Write/Execute/Deleteを
+    /// 直接付与する。CoW upperは存在しない。
+    DirectRw,
+    /// `--cow`（D-30）。workspaceへは`grant_ace_inheritable_ro`でRead/Execute/Traverseのみ
+    /// 付与し、`upper_dir`（workspace外、`--cow`時に確保される）へ`grant_ace_inheritable_rw`を
+    /// 付与する。透過的なリダイレクトはRedirector DLL（Phase 2）が担い、フックが無効・回避・
+    /// 未対応APIで通過された場合もworkspace本体への書込はACLにより`ACCESS_DENIED`で
+    /// fail-closeする（フックは境界にしない、D-01/D-30）。
+    Cow { upper_dir: PathBuf },
+}
+
+impl WorkspaceWriteMode {
+    pub fn upper_dir(&self) -> Option<&Path> {
+        match self {
+            WorkspaceWriteMode::DirectRw => None,
+            WorkspaceWriteMode::Cow { upper_dir } => Some(upper_dir),
+        }
+    }
+}
+
 /// OS能力プローブ結果。テストから注入できるようにフィールドを公開する。
 #[derive(Debug, Clone, Default)]
 pub struct Probes {
@@ -152,6 +180,7 @@ pub fn select_tier(
     opt_in_tier1: bool,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
+    write_mode: &WorkspaceWriteMode,
 ) -> Result<ShellTierSelection, TierError> {
     select_tier_with_probes(
         require,
@@ -160,11 +189,13 @@ pub fn select_tier(
         opt_in_tier1,
         passthrough,
         wfp_chain_pipe,
+        write_mode,
         &Probes::detect(),
     )
 }
 
 /// テスト用: プローブ結果を注入して選択ロジックのみを検証する。
+#[allow(clippy::too_many_arguments)]
 pub fn select_tier_with_probes(
     require: RequireSandbox,
     workspace_root: &Path,
@@ -172,6 +203,7 @@ pub fn select_tier_with_probes(
     opt_in_tier1: bool,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
+    write_mode: &WorkspaceWriteMode,
     probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
     let selection = best_effort_tier(
@@ -180,6 +212,7 @@ pub fn select_tier_with_probes(
         opt_in_tier1,
         passthrough,
         wfp_chain_pipe,
+        write_mode,
         probes,
     )?;
     if satisfies(selection.tier, require) {
@@ -217,6 +250,7 @@ fn try_tier2a(
     workspace_root: &Path,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
+    write_mode: &WorkspaceWriteMode,
     probes: &Probes,
 ) -> Result<ShellTierSelection, String> {
     match &probes.tier2a_preflight_override {
@@ -226,7 +260,12 @@ fn try_tier2a(
         // 単体テストでは避ける、既存の分岐と同じ考え方）。D8: passthroughの到達不能は
         // Tier選択自体を左右せず`passthrough_warnings`として運ぶだけ。
         None => {
-            match crate::win_appcontainer::preflight(workspace_root, passthrough, wfp_chain_pipe) {
+            match crate::win_appcontainer::preflight(
+                workspace_root,
+                passthrough,
+                wfp_chain_pipe,
+                write_mode,
+            ) {
                 Ok(outcome) => Ok(ShellTierSelection::direct(ShellTier::Tier2a)
                     .with_passthrough_warnings(outcome.warnings)
                     .with_denied_passthrough(outcome.denied_passthrough)
@@ -245,6 +284,7 @@ fn best_effort_tier(
     opt_in_tier1: bool,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
+    write_mode: &WorkspaceWriteMode,
     probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
     if opt_in_tier1 {
@@ -261,7 +301,13 @@ fn best_effort_tier(
         };
         return match probe_result {
             Ok(()) => Ok(ShellTierSelection::direct(ShellTier::Tier3)),
-            Err(tier3_reason) => match try_tier2a(workspace_root, passthrough, wfp_chain_pipe, probes) {
+            Err(tier3_reason) => match try_tier2a(
+                workspace_root,
+                passthrough,
+                wfp_chain_pipe,
+                write_mode,
+                probes,
+            ) {
                 Ok(tier2a_selection) => {
                     // Tier2aへ実際に着地するので、「なぜTier3ではないか」を理由として持たせる
                     // （既存の単発降格の形をそのまま踏襲、Tier2a到達自体は成功のため
@@ -284,7 +330,13 @@ fn best_effort_tier(
 
     // フラグなしの既定パス: Tier2aを無条件にプローブする（Linuxのbwrapプローブと同じ
     // 「フラグなし常時プローブ」構造）。失敗時はTier1へ暗黙降格せず、起動時エラーにする。
-    match try_tier2a(workspace_root, passthrough, wfp_chain_pipe, probes) {
+    match try_tier2a(
+        workspace_root,
+        passthrough,
+        wfp_chain_pipe,
+        write_mode,
+        probes,
+    ) {
         Ok(selection) => Ok(selection),
         Err(reason) => Err(TierError::Unavailable {
             attempted: ShellTier::Tier2a.label(),
@@ -300,6 +352,7 @@ fn best_effort_tier(
     _opt_in_tier1: bool,
     _passthrough: &[FsPassthrough],
     _wfp_chain_pipe: Option<String>,
+    _write_mode: &WorkspaceWriteMode,
     probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
     if probes.linux_tier2b_available() {
@@ -326,6 +379,7 @@ fn best_effort_tier(
     _opt_in_tier1: bool,
     _passthrough: &[FsPassthrough],
     _wfp_chain_pipe: Option<String>,
+    _write_mode: &WorkspaceWriteMode,
     _probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
     Ok(ShellTierSelection::downgraded(
@@ -359,6 +413,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -382,6 +437,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap_err();
@@ -402,6 +458,7 @@ mod tests {
             true,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -423,6 +480,7 @@ mod tests {
             true,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap_err();
@@ -443,6 +501,7 @@ mod tests {
             true,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -463,6 +522,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -489,6 +549,7 @@ mod tests {
             false,
             &passthrough,
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -516,6 +577,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap_err();
@@ -536,6 +598,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -557,6 +620,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -580,6 +644,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -604,6 +669,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap_err();
@@ -631,6 +697,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap_err();
@@ -652,6 +719,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -674,6 +742,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -697,6 +766,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap();
@@ -718,6 +788,7 @@ mod tests {
             false,
             &[],
             None,
+            &WorkspaceWriteMode::DirectRw,
             &probes,
         )
         .unwrap_err();
