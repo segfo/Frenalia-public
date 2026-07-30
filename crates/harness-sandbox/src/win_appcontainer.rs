@@ -25,7 +25,7 @@
 //! （D-11）。宛先無差別（宛先単位の細粒度はWFP=管理者、本実装のスコープ外）。
 
 use std::ffi::c_void;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -52,22 +52,29 @@ use windows::Win32::Security::{
     TOKEN_PRIVILEGES_ATTRIBUTES, TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    CreateFileW, ReadFile, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
+    READ_CONTROL, WRITE_DAC,
 };
+use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Memory::{
+    VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+};
 use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use windows::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, OpenProcessToken, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    STARTUPINFOW,
+    CreateProcessW, CreateRemoteThread, DeleteProcThreadAttributeList, GetCurrentProcess,
+    GetExitCodeProcess, GetExitCodeThread, InitializeProcThreadAttributeList, OpenProcessToken,
+    ResumeThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
-use crate::shell_tier::{FsAccess, FsPassthrough};
+use crate::shell_tier::{FsAccess, FsPassthrough, WorkspaceWriteMode};
 use crate::win_common::{
     build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, long_path_wide,
     read_two_pipes_to_strings, wide, write_all,
@@ -637,6 +644,157 @@ fn appcontainer_pipe(sid: PSID) -> windows::core::Result<(HANDLE, HANDLE)> {
     Ok((read, write))
 }
 
+/// D-30: Redirector DLL（`harness-redirector.dll`）のパス。`harness-privhelper.exe`と同じ規約
+/// （`privhelper::helper_exe_path`）で、本体exeと同じディレクトリから探す。cdylibの出力
+/// ファイル名はパッケージ名のハイフンをアンダースコアへ変換した`harness_redirector.dll`。
+fn redirector_dll_path() -> Result<PathBuf, AppContainerError> {
+    let current = std::env::current_exe()
+        .map_err(|e| AppContainerError::Win32(format!("current_exe: {e}")))?;
+    let dir = current.parent().ok_or_else(|| {
+        AppContainerError::Win32("current_exe has no parent directory".to_string())
+    })?;
+    Ok(dir.join("harness_redirector.dll"))
+}
+
+/// D-30: suspended状態の`process`へRedirector DLLを注入する（設計書§10.2手順8-9）。
+/// `VirtualAllocEx`+`WriteProcessMemory`でDLLパス文字列（UTF-16）を対象プロセスへ書き込み、
+/// `kernel32!LoadLibraryW`を開始アドレスとする`CreateRemoteThread`でロードさせる。
+///
+/// **既知の制約**: `CreateRemoteThread`のスレッド開始関数シグネチャは`DWORD`（32bit）を
+/// 返す前提だが`LoadLibraryW`は`HMODULE`（64bitポインタ）を返すため、`GetExitCodeThread`で
+/// 取得できるのは戻り値の下位32bitのみである。ここでは「非ゼロなら成功」の粗い判定に留め、
+/// 正確な初期化完了確認はDLL側が書き込む`HARNESS_COW_READY_HANDLE`（`wait_cow_ready`）に委ねる。
+unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContainerError> {
+    let dll_path = redirector_dll_path()?;
+    if !dll_path.exists() {
+        return Err(AppContainerError::Win32(format!(
+            "redirector DLL not found at {} (expected next to the harness executable)",
+            dll_path.display()
+        )));
+    }
+    let path_w: Vec<u16> = dll_path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let size = path_w.len() * std::mem::size_of::<u16>();
+
+    unsafe {
+        let remote_buf = VirtualAllocEx(
+            process,
+            None,
+            size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if remote_buf.is_null() {
+            return Err(AppContainerError::Win32(
+                "VirtualAllocEx(redirector path) failed".to_string(),
+            ));
+        }
+
+        let write_ok = WriteProcessMemory(
+            process,
+            remote_buf,
+            path_w.as_ptr() as *const c_void,
+            size,
+            None,
+        );
+        if write_ok.is_err() {
+            let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
+            return Err(AppContainerError::Win32(
+                "WriteProcessMemory(redirector path) failed".to_string(),
+            ));
+        }
+
+        let kernel32_name: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+        let kernel32 = match GetModuleHandleW(PCWSTR(kernel32_name.as_ptr())) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
+                return Err(AppContainerError::Win32(format!(
+                    "GetModuleHandleW(kernel32.dll): {e}"
+                )));
+            }
+        };
+        let load_library_addr =
+            GetProcAddress(kernel32, windows::core::PCSTR(c"LoadLibraryW".as_ptr() as *const u8));
+        let Some(load_library_addr) = load_library_addr else {
+            let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
+            return Err(AppContainerError::Win32(
+                "GetProcAddress(LoadLibraryW) failed".to_string(),
+            ));
+        };
+        let start_routine: windows::Win32::System::Threading::LPTHREAD_START_ROUTINE =
+            Some(std::mem::transmute::<
+                *const c_void,
+                unsafe extern "system" fn(*mut c_void) -> u32,
+            >(load_library_addr as *const c_void));
+
+        let mut thread_id: u32 = 0;
+        let remote_thread = CreateRemoteThread(
+            process,
+            None,
+            0,
+            start_routine,
+            Some(remote_buf),
+            0,
+            Some(&mut thread_id),
+        );
+        let remote_thread = match remote_thread {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
+                return Err(AppContainerError::Win32(format!(
+                    "CreateRemoteThread(LoadLibraryW): {e}"
+                )));
+            }
+        };
+
+        // LoadLibraryW自体の完了（≠フック初期化完了、それは`wait_cow_ready`が確認する）を
+        // 短時間だけ待つ。DLLロード自体は通常数十ms未満で終わるため5秒で十分。
+        WaitForSingleObject(remote_thread, 5000);
+        let mut exit_code: u32 = 0;
+        let _ = GetExitCodeThread(remote_thread, &mut exit_code);
+        let _ = CloseHandle(remote_thread);
+        let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
+
+        if exit_code == 0 {
+            return Err(AppContainerError::Win32(
+                "LoadLibraryW returned NULL in target process (redirector DLL failed to load)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// D-30: Redirector DLLが`HARNESS_COW_READY_HANDLE`へ1バイト書き込むのを`timeout`まで待つ
+/// （設計書§10.2手順9「DLL初期化完了を確認する」）。別スレッドで`ReadFile`を行い
+/// `mpsc::recv_timeout`で待つ——匿名パイプの読み取り端は`WaitForSingleObject`で
+/// シグナル状態を待てないため。
+fn wait_cow_ready(ready_read: HANDLE, timeout: std::time::Duration) -> Result<(), String> {
+    struct SendHandle(HANDLE);
+    unsafe impl Send for SendHandle {}
+    let handle = SendHandle(ready_read);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let handle = handle;
+        let mut buf = [0u8; 1];
+        let mut read_bytes = 0u32;
+        let ok = unsafe { ReadFile(handle.0, Some(&mut buf), Some(&mut read_bytes), None) };
+        let _ = tx.send(ok.is_ok() && read_bytes == 1);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("redirector DLL signaled failure (hook install did not succeed)".to_string()),
+        Err(_) => Err(format!(
+            "timed out after {timeout:?} waiting for redirector DLL ready signal"
+        )),
+    }
+}
+
 /// spawn済みの子プロセス。`RestrictedChild`（`win_restricted.rs`）と同形のHANDLEベース
 /// I/Oラッパ。
 pub struct AppContainerChild {
@@ -727,6 +885,15 @@ pub enum NetworkCapability {
     InternetClient,
 }
 
+/// `--cow`（D-30）時にRedirector DLLを注入するための設定。`spawn`/`spawn_impl`は`Some`の
+/// ときのみ、`CREATE_SUSPENDED`起動窓（§10.2）でDLLを注入し、初期化完了イベントを待って
+/// から`ResumeThread`する。`None`（既定・D-29）ではこの一連の処理を一切行わない。
+#[derive(Debug, Clone, Copy)]
+pub struct CowInject<'a> {
+    pub workspace_root: &'a Path,
+    pub upper_dir: &'a Path,
+}
+
 /// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する。
 /// Tier1の`CreateProcessAsUserW`+制限トークンとは別方式: トークンは差し替えず、呼び出し
 /// スレッド自身のトークンのまま拡張属性リストでAppContainerへ閉じ込める。そのため
@@ -735,6 +902,7 @@ pub enum NetworkCapability {
 /// `net`が`InternetClient`のときのみcapability配列に`internetClient` SIDを1個積む。SIDの
 /// 生成（`ConvertStringSidToSidW`）と解放（`LocalFree`）はこの関数内に閉じ込め、呼び出し側へ
 /// unsafeなSID寿命管理を漏らさない（`spawn_with_capabilities`は診断専用のまま温存）。
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     exe: &str,
     args: &[&str],
@@ -743,9 +911,12 @@ pub fn spawn(
     want_stdin: bool,
     container_sid: PSID,
     net: NetworkCapability,
+    cow: Option<CowInject<'_>>,
 ) -> Result<AppContainerChild, AppContainerError> {
     match net {
-        NetworkCapability::Deny => spawn_impl(exe, args, cwd, env, want_stdin, container_sid, &[]),
+        NetworkCapability::Deny => {
+            spawn_impl(exe, args, cwd, env, want_stdin, container_sid, &[], cow)
+        }
         NetworkCapability::InternetClient => unsafe {
             let mut cap_sid = PSID::default();
             let sid_str = wide("S-1-15-3-1");
@@ -764,6 +935,7 @@ pub fn spawn(
                 want_stdin,
                 container_sid,
                 &capabilities,
+                cow,
             );
             let _ = LocalFree(HLOCAL(cap_sid.0));
             result
@@ -784,12 +956,22 @@ pub(crate) fn spawn_with_capabilities(
     container_sid: PSID,
     capabilities: &[SID_AND_ATTRIBUTES],
 ) -> Result<AppContainerChild, AppContainerError> {
-    spawn_impl(exe, args, cwd, env, want_stdin, container_sid, capabilities)
+    spawn_impl(
+        exe,
+        args,
+        cwd,
+        env,
+        want_stdin,
+        container_sid,
+        capabilities,
+        None,
+    )
 }
 
 /// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する実体。
 /// `capabilities`が空なら`CapabilityCount=0`（本番`spawn`の既定=D-02）、空でなければ
 /// 診断専用`spawn_with_capabilities`経由でのみ呼ばれる。
+#[allow(clippy::too_many_arguments)]
 fn spawn_impl(
     exe: &str,
     args: &[&str],
@@ -798,6 +980,7 @@ fn spawn_impl(
     want_stdin: bool,
     container_sid: PSID,
     capabilities: &[SID_AND_ATTRIBUTES],
+    cow: Option<CowInject<'_>>,
 ) -> Result<AppContainerChild, AppContainerError> {
     // どのWin32呼び出しが失敗したかをエラー文字列に残す（AppContainerの起動は失敗モードが
     // 多く、0x57 ERROR_INVALID_PARAMETER等がどの段で出たかを区別できないと切り分けられない）。
@@ -822,6 +1005,18 @@ fn spawn_impl(
         (None, None)
     };
 
+    // D-30（`--cow`）: Redirector DLL初期化完了をLauncherへ知らせるための子側書込端。
+    // `appcontainer_pipe`は既にpackage SIDへのACL付与を済ませているため、名前付きイベントを
+    // 別途ACL構成するより既存の実績あるパイプ生成経路を再利用する（stdio 3本と同じ扱い）。
+    let ready_pipe = if cow.is_some() {
+        let (r, w) =
+            appcontainer_pipe(container_sid).map_err(|e| step("appcontainer_pipe(cow-ready)", e))?;
+        clear_inherit(r);
+        Some((r, w))
+    } else {
+        None
+    };
+
     let mut cmdline = format!("\"{exe}\"");
     for a in args {
         cmdline.push(' ');
@@ -831,6 +1026,29 @@ fn spawn_impl(
     }
     let mut cmdline_w = wide(&cmdline);
     let cwd_w = wide(&cwd.to_string_lossy());
+    // D-30: CoW有効時、Redirector DLL（`harness-redirector`）へworkspace/upperのパスと
+    // 準備完了通知用パイプの生ハンドル値を環境変数経由で渡す。ハンドル値はプロセス作成時に
+    // `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`（下記）で継承させるため、子プロセス内でも
+    // 同一の数値のまま有効である（Windowsのハンドル継承の仕様）。
+    let mut env_owned;
+    let env = if let (Some(c), Some((_, ready_write))) = (cow, &ready_pipe) {
+        env_owned = env.to_vec();
+        env_owned.push((
+            "HARNESS_COW_WORKSPACE".to_string(),
+            c.workspace_root.to_string_lossy().into_owned(),
+        ));
+        env_owned.push((
+            "HARNESS_COW_UPPER".to_string(),
+            c.upper_dir.to_string_lossy().into_owned(),
+        ));
+        env_owned.push((
+            "HARNESS_COW_READY_HANDLE".to_string(),
+            (ready_write.0 as usize).to_string(),
+        ));
+        &env_owned
+    } else {
+        env
+    };
     let mut env_block = build_env_block(env);
 
     let mut capabilities_buf = capabilities.to_vec();
@@ -845,19 +1063,33 @@ fn spawn_impl(
         Reserved: 0,
     };
 
+    // INV-2（ハンドル継承対策、設計書§23）: `bInheritHandles=true`のまま無制限に継承させず、
+    // `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`でstdioの3本（子側の書込/読取端のみ、いずれも
+    // `create_pipe_with_sddl`が既に`bInheritHandle=true`で作成済み・親側端は上で`clear_inherit`
+    // 済み）に限定する。リスト中の全ハンドルが継承可能である必要があるため、この配列は
+    // `STARTUPINFOEXW`のhStdOutput/hStdError/hStdInputと完全に一致させる。
+    let mut inherit_handles: Vec<HANDLE> = vec![stdout_write, stderr_write];
+    if let Some(r) = stdin_read {
+        inherit_handles.push(r);
+    }
+    if let Some((_, ready_write)) = &ready_pipe {
+        inherit_handles.push(*ready_write);
+    }
+
     let result: Result<PROCESS_INFORMATION, AppContainerError> = unsafe {
         let mut attr_list_size: usize = 0;
         // 1回目は必要サイズ取得のためだけの呼び出しで、バッファ不足エラーになるのが正常
-        // （ERROR_INSUFFICIENT_BUFFER）なので戻り値は捨てる。
+        // （ERROR_INSUFFICIENT_BUFFER）なので戻り値は捨てる。属性数2
+        // （SECURITY_CAPABILITIES + HANDLE_LIST）。
         let _ = InitializeProcThreadAttributeList(
             LPPROC_THREAD_ATTRIBUTE_LIST::default(),
-            1,
+            2,
             0,
             &mut attr_list_size,
         );
         let mut attr_list_buf = vec![0u8; attr_list_size];
         let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list_buf.as_mut_ptr() as *mut c_void);
-        let init_result = InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size)
+        let init_result = InitializeProcThreadAttributeList(attr_list, 2, 0, &mut attr_list_size)
             .map_err(|e| step("InitializeProcThreadAttributeList", e));
 
         init_result.and_then(|()| {
@@ -870,7 +1102,19 @@ fn spawn_impl(
                 None,
                 None,
             )
-            .map_err(|e| step("UpdateProcThreadAttribute", e));
+            .map_err(|e| step("UpdateProcThreadAttribute(SECURITY_CAPABILITIES)", e))
+            .and_then(|()| {
+                UpdateProcThreadAttribute(
+                    attr_list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    Some(inherit_handles.as_mut_ptr() as *const c_void),
+                    inherit_handles.len() * std::mem::size_of::<HANDLE>(),
+                    None,
+                    None,
+                )
+                .map_err(|e| step("UpdateProcThreadAttribute(HANDLE_LIST)", e))
+            });
 
             let out = update_result.and_then(|()| {
                 let startup_info_ex = STARTUPINFOEXW {
@@ -886,13 +1130,19 @@ fn spawn_impl(
                 };
 
                 let mut process_info = PROCESS_INFORMATION::default();
+                // `CREATE_SUSPENDED`（設計書§10.2）: メインスレッドを起こす前に
+                // `AssignProcessToJobObject`を完了させ、子がJob Object外で孫プロセスを
+                // 作れる窓（TOCTOU）を無くす。Phase 2のDLL注入もこの一時停止窓で行う。
                 CreateProcessW(
                     None,
                     PWSTR(cmdline_w.as_mut_ptr()),
                     None,
                     None,
                     true,
-                    EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                    EXTENDED_STARTUPINFO_PRESENT
+                        | CREATE_NO_WINDOW
+                        | CREATE_UNICODE_ENVIRONMENT
+                        | CREATE_SUSPENDED,
                     Some(env_block.as_mut_ptr() as *mut _),
                     PCWSTR(cwd_w.as_ptr()),
                     &startup_info_ex.StartupInfo,
@@ -914,6 +1164,9 @@ fn spawn_impl(
         if let Some(r) = stdin_read {
             let _ = CloseHandle(r);
         }
+        if let Some((_, ready_write)) = &ready_pipe {
+            let _ = CloseHandle(*ready_write);
+        }
     }
 
     let process_info = match result {
@@ -926,14 +1179,66 @@ fn spawn_impl(
                 if let Some(w) = stdin_write {
                     let _ = CloseHandle(w);
                 }
+                if let Some((ready_read, _)) = &ready_pipe {
+                    let _ = CloseHandle(*ready_read);
+                }
             }
             return Err(e);
         }
     };
 
     unsafe {
-        AssignProcessToJobObject(job, process_info.hProcess)
-            .map_err(|e| step("AssignProcessToJobObject", e))?;
+        // suspended状態のうちにJobへ割り当ててからResumeする（INV-2/§10.2）。ここで失敗した
+        // 場合、suspendedのままの孤立プロセスを残さないよう強制終了してから返す。
+        if let Err(e) = AssignProcessToJobObject(job, process_info.hProcess)
+            .map_err(|e| step("AssignProcessToJobObject", e))
+        {
+            let _ = TerminateProcess(process_info.hProcess, 1);
+            let _ = CloseHandle(process_info.hThread);
+            let _ = CloseHandle(process_info.hProcess);
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(stdout_read);
+            let _ = CloseHandle(stderr_read);
+            if let Some(w) = stdin_write {
+                let _ = CloseHandle(w);
+            }
+            if let Some((ready_read, _)) = &ready_pipe {
+                let _ = CloseHandle(*ready_read);
+            }
+            return Err(e);
+        }
+
+        // D-30（`--cow`）: suspended窓でRedirector DLLを注入する（設計書§10.2手順8-10）。
+        // 注入または初期化確認に失敗した場合、対象プロセスを終了する（fail-close、
+        // §10.2既定・§25.1）。workspace本体はACLで既にRO付与済みのため、この失敗パスは
+        // 「透過リダイレクトが効かないまま起動を許す」ことはない——単に起動自体を拒否する。
+        if let Some(c) = cow {
+            if let Some((ready_read, _)) = ready_pipe {
+                let inject_result: Result<(), AppContainerError> =
+                    inject_redirector(process_info.hProcess).and_then(|()| {
+                        wait_cow_ready(ready_read, std::time::Duration::from_secs(5))
+                            .map_err(AppContainerError::Win32)
+                    });
+                let _ = CloseHandle(ready_read);
+                if let Err(e) = inject_result {
+                    let _ = TerminateProcess(process_info.hProcess, 1);
+                    let _ = CloseHandle(process_info.hThread);
+                    let _ = CloseHandle(process_info.hProcess);
+                    let _ = CloseHandle(job);
+                    let _ = CloseHandle(stdout_read);
+                    let _ = CloseHandle(stderr_read);
+                    if let Some(w) = stdin_write {
+                        let _ = CloseHandle(w);
+                    }
+                    return Err(AppContainerError::Win32(format!(
+                        "cow redirector injection failed for workspace {}: {e}",
+                        c.workspace_root.display()
+                    )));
+                }
+            }
+        }
+
+        let _ = ResumeThread(process_info.hThread);
         let _ = CloseHandle(process_info.hThread);
     }
 
@@ -1025,6 +1330,7 @@ fn smoke_test_spawn(
         false,
         sid,
         NetworkCapability::Deny,
+        None,
     )
     .map_err(|e| AppContainerError::Preflight(format!("shell could not start: {e}")))?;
     let (_, _, code) = child
@@ -1074,6 +1380,7 @@ fn smoke_test_harness_control_write_denied(
         false,
         sid,
         NetworkCapability::Deny,
+        None,
     )
     .map_err(|e| {
         AppContainerError::Preflight(format!(
@@ -1197,6 +1504,7 @@ fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Op
         false,
         sid,
         NetworkCapability::Deny,
+        None,
     ) {
         Ok(child) => child,
         Err(e) => {
@@ -1263,15 +1571,38 @@ pub fn preflight(
     workspace_root: &Path,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
+    write_mode: &WorkspaceWriteMode,
 ) -> Result<PreflightOutcome, AppContainerError> {
     let sid = ensure_profile(CONTAINER_NAME)?;
-    // Tier2aが既定でプローブされるため、
-    // 起動のたびにワークスペース全体へ個別書込を試みる`grant_ace_recursive`ではなく、
-    // 高速化版（root継承ACE1件+フォールバック確認walk、`grant_ace_inheritable_rw`のdoc参照）
-    // を使う。
-    grant_ace_inheritable_rw(workspace_root, sid.as_psid())?;
+    // D-30: `write_mode`がACL付与方針を唯一決める。`match`を全分岐（`..`無し）にすることで、
+    // `WorkspaceWriteMode`へバリアントを追加した際にACL決定漏れをコンパイルエラーにする。
+    match write_mode {
+        WorkspaceWriteMode::DirectRw => {
+            // 既定（D-29）。Tier2aが既定でプローブされるため、起動のたびにワークスペース全体へ
+            // 個別書込を試みる`grant_ace_recursive`ではなく、高速化版（root継承ACE1件+
+            // フォールバック確認walk、`grant_ace_inheritable_rw`のdoc参照）を使う。
+            grant_ace_inheritable_rw(workspace_root, sid.as_psid())?;
+        }
+        WorkspaceWriteMode::Cow { upper_dir } => {
+            // `--cow`（D-30）。workspaceはRead/Execute/Traverseのみ（D-13と同じ関数）。
+            // Redirector DLLが無効・回避されても、この時点でACLがROである限り
+            // workspace本体への書込は`ACCESS_DENIED`でfail-closeする。
+            grant_ace_inheritable_ro(workspace_root, sid.as_psid())?;
+            std::fs::create_dir_all(upper_dir)
+                .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
+            grant_ace_inheritable_rw(upper_dir, sid.as_psid())?;
+        }
+    }
     protect_harness_control_dir_from_appcontainer(workspace_root, sid.as_psid())?;
-    let tmp_dir = workspace_root.join(format!(".harness-tier2a-probe-{}", std::process::id()));
+    // D-30: `FS_IO_PROBE_COMMAND`はprobe_dirへの書込を試みる。Cowモードではworkspace自体が
+    // 意図的にROなので、probe_dirをworkspace配下に置くと「workspaceが書けない」という
+    // Cowモードの正しい挙動を誤ってtraverse ACE不足として誤診断してしまう。probe_dirは
+    // 書込可能であるべき場所（DirectRw時はworkspace、Cow時はupper_dir）に置く。
+    let probe_base = match write_mode {
+        WorkspaceWriteMode::DirectRw => workspace_root,
+        WorkspaceWriteMode::Cow { upper_dir } => upper_dir.as_path(),
+    };
+    let tmp_dir = probe_base.join(format!(".harness-tier2a-probe-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| AppContainerError::Preflight(e.to_string()))?;
     let smoke_result = smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir);
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -2026,6 +2357,7 @@ mod traverse_diagnostics {
             false,
             sid,
             NetworkCapability::Deny,
+        None,
         )
         .expect("spawn should succeed even if the shell command itself fails inside");
         let (out, err, code) = child
@@ -2053,6 +2385,7 @@ mod traverse_diagnostics {
             false,
             sid,
             NetworkCapability::Deny,
+        None,
         )
         .expect("spawn should succeed even if the shell command itself fails inside");
         let (out, err, code) = child
@@ -2111,6 +2444,7 @@ mod traverse_diagnostics {
             false,
             sid.as_psid(),
             NetworkCapability::Deny,
+        None,
         )
         .expect("spawn should succeed");
         let (out, err, code) = child
@@ -2328,6 +2662,7 @@ mod traverse_diagnostics {
                 false,
                 sid.as_psid(),
                 NetworkCapability::Deny,
+                None,
             )
             .expect("spawn should succeed");
             let (out, err, code) = child
@@ -2366,6 +2701,7 @@ mod traverse_diagnostics {
             false,
             sid,
             NetworkCapability::Deny,
+        None,
         )
         .expect("spawn should succeed even if the shell command itself fails inside");
         let (out, err, code) = child
@@ -2952,6 +3288,7 @@ mod traverse_diagnostics {
                 false,
                 sid.as_psid(),
                 NetworkCapability::Deny,
+                None,
             )
             .expect("spawn should succeed");
             let pid = unsafe { GetProcessId(child.process) };
@@ -3050,6 +3387,7 @@ mod traverse_diagnostics {
                 false,
                 sid.as_psid(),
                 NetworkCapability::Deny,
+                None,
             )
             .expect("spawn should succeed");
             let (out, err, code) = child
@@ -3119,7 +3457,7 @@ mod traverse_diagnostics {
         .expect("seed settings");
 
         let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
-        let result = preflight(workspace.path(), &[], None);
+        let result = preflight(workspace.path(), &[], None, &WorkspaceWriteMode::DirectRw);
         if result.is_err() {
             let output = std::process::Command::new("icacls")
                 .arg(workspace.path().join(".harness"))
@@ -3506,6 +3844,7 @@ mod traverse_diagnostics {
             false,
             sid.as_psid(),
             NetworkCapability::Deny,
+        None,
         )
         .expect("spawn(link.exe) call itself should succeed (CreateProcessW returning a handle is separate from the loader later failing DLL init)");
         let (out, err, code) = child
@@ -4206,5 +4545,132 @@ mod force_grant_gate_tests {
             reason.is_some(),
             "a non-canonicalizable path must be refused (fail-safe): {reason:?}"
         );
+    }
+}
+
+/// D-30（`--cow`）の実機E2E。`cargo build -p harness-redirector -p harness-sandbox --tests`
+/// 実行後、`target/debug/harness_redirector.dll`をテストバイナリと同じディレクトリ
+/// （`target/debug/deps/`）へコピーしてから`--ignored`で実行する（`redirector_dll_path`は
+/// `current_exe()`の親ディレクトリを見るため、実運用の`harness.exe`同梱と揃える）。
+#[cfg(all(windows, test))]
+mod cow_diagnostics {
+    use super::*;
+
+    const COW_WRITE_PROBE_COMMAND: &str = "\
+        $ErrorActionPreference = 'Stop'; \
+        try { \
+            Set-Content -LiteralPath 'important.txt' -Value 'modified-by-child' -NoNewline; \
+            New-Item -ItemType File -Path 'new.txt' -Force | Out-Null; \
+            Set-Content -LiteralPath 'new.txt' -Value 'created-by-child' -NoNewline; \
+            exit 0 \
+        } catch { \
+            Write-Output $_.Exception.Message; \
+            exit 9 \
+        }";
+
+    /// 境界（Phase 1）+ 透過（Phase 2）を通しで確認する。workspaceをROで付与し、Redirector DLLを
+    /// 注入したAppContainer子から`important.txt`を上書き・`new.txt`を新規作成させる。
+    /// 期待結果: 子は成功（exit 0）、workspace本体は不変、upperへ変更が反映される。
+    #[test]
+    #[ignore]
+    fn cow_write_is_redirected_to_upper_and_workspace_stays_unchanged() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+        std::fs::write(workspace.path().join("important.txt"), "original")
+            .expect("seed important.txt");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", COW_WRITE_PROBE_COMMAND],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+
+        assert_eq!(
+            code, 0,
+            "child write should succeed via redirector (stdout={stdout} stderr={stderr})"
+        );
+
+        let workspace_content = std::fs::read_to_string(workspace.path().join("important.txt"))
+            .expect("workspace important.txt must still exist");
+        assert_eq!(
+            workspace_content, "original",
+            "workspace body must remain unchanged (boundary=ACL, not the hook)"
+        );
+        assert!(
+            !workspace.path().join("new.txt").exists(),
+            "new file must not appear in workspace"
+        );
+
+        let upper_content = std::fs::read_to_string(upper.path().join("important.txt"))
+            .expect("upper important.txt must exist after copy-up + redirected write");
+        assert_eq!(upper_content, "modified-by-child");
+        let upper_new_content = std::fs::read_to_string(upper.path().join("new.txt"))
+            .expect("upper new.txt must exist");
+        assert_eq!(upper_new_content, "created-by-child");
+    }
+
+    /// fail-close確認（Phase 1のみ、DLL注入なし）: workspaceをROで付与した状態で、Redirector DLLを
+    /// 注入しない（`cow: None`のまま`spawn`する）子から直接書込ませると、フックが存在しなくても
+    /// ACLだけでACCESS_DENIEDになることを確認する（D-01/D-30「フックは境界ではない」の実証）。
+    #[test]
+    #[ignore]
+    fn workspace_write_fails_closed_without_redirector_injection() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+        std::fs::write(workspace.path().join("important.txt"), "original")
+            .expect("seed important.txt");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        // `cow: None` — DLLを注入しない。ACLだけが境界として効くはず。
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", COW_WRITE_PROBE_COMMAND],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            None,
+        )
+        .expect("spawn without cow injection should still succeed (process starts)");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+
+        assert_ne!(
+            code, 0,
+            "workspace write must fail without the redirector (fail-close via ACL, D-01/D-30): \
+             stdout={stdout} stderr={stderr}"
+        );
+        let workspace_content = std::fs::read_to_string(workspace.path().join("important.txt"))
+            .expect("workspace important.txt must still exist");
+        assert_eq!(workspace_content, "original");
     }
 }
