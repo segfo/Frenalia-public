@@ -14,6 +14,8 @@ crate-type = ["cdylib"]
 
 [target.'cfg(windows)'.dependencies]
 retour = { version = "0.3", default-features = false }
+harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
+serde_json = "1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",

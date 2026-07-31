@@ -73,7 +73,7 @@ fn ext_key(path: &str) -> Result<String, JailError> {
 
 /// `pattern`に単一`*`（複数可）を含む素朴なglobマッチ。`AllowlistRule`と同系統の簡易実装
 /// （M10のスコープでは`--only`の絞り込みに足りれば十分、`globset`級の完全なglob文法は不要）。
-fn simple_glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn simple_glob_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
         return true;
     }
@@ -506,6 +506,9 @@ impl SandboxFs {
                     .ok()
                     .map(|s| hash_content(&s)),
                 ManifestTarget::Live => None,
+                // 到達不能: `change_set()`（`self.folded_entries()`由来）はCowを絶対に出力しない
+                // （§manifest.rsのdoc参照）。網羅性のためだけの腕。
+                ManifestTarget::Cow => None,
             };
             if current_hash != e.baseline_hash {
                 // baseline照合の相違（サイレントなlost update / TOCTOU防止）。
@@ -536,6 +539,8 @@ impl SandboxFs {
                     std::fs::write(target_path, content).map_err(Into::into)
                 }
                 (ManifestTarget::Live, _) => Ok(()),
+                // 到達不能（上記`ManifestTarget::Cow => None`と同じ理由）。
+                (ManifestTarget::Cow, _) => Ok(()),
             };
             result?;
             // 実FSへの反映が終わったステージ済みコピー（`tree/`・`_ext/`配下）はもう不要なので

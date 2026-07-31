@@ -80,35 +80,63 @@ impl From<PermissionModeArg> for PermissionMode {
     }
 }
 
-/// ステージ済み変更（`harness_sandbox::SandboxFs`のオーバーレイ）を操作するサブコマンド
-/// （§オーバーレイFS「レビュー＆コミット」、M10）。
+/// `harness changes`/`apply`/`discard`の`--source`（既定`all`）。stagedマニフェストと
+/// `--cow`操作台帳のどちらを対象にするか（`plans/AppContainerベース Copy-on-Write
+/// ワークスペース設計書.md` §19 Phase 2、両機構をツールとして分けず統合する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum ChangeSourceArg {
+    Staged,
+    Cow,
+    #[default]
+    All,
+}
+
+impl ChangeSourceArg {
+    fn wants_staged(self) -> bool {
+        matches!(self, ChangeSourceArg::Staged | ChangeSourceArg::All)
+    }
+    fn wants_cow(self) -> bool {
+        matches!(self, ChangeSourceArg::Cow | ChangeSourceArg::All)
+    }
+}
+
+/// ステージ済み変更（`harness_sandbox::SandboxFs`のオーバーレイ）・CoW操作台帳を操作する
+/// サブコマンド（§オーバーレイFS「レビュー＆コミット」、M10。`--cow`統合はPhase 2）。
 #[derive(Subcommand)]
 enum Commands {
-    /// ステージ済み変更を一覧表示する。
+    /// 変更を一覧表示する（既定は`--source all`でstaged/CoW両方）。
     Changes {
-        /// 対象セッションID（省略時は`.harness/sandbox/`内で最も新しいもの）。
+        /// 対象セッションID（`--source staged`では`.harness/sandbox/`、`--source cow`では
+        /// CoW upper置き場のセッションIDとして解決する。省略時はそれぞれ最も新しいもの）。
         #[arg(long)]
         session: Option<String>,
+        #[arg(long = "source", value_enum, default_value_t = ChangeSourceArg::All)]
+        source: ChangeSourceArg,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },
-    /// ステージ済み変更を実FSへ選択適用する。
+    /// 変更を実FSへ選択適用する（既定は`--source all`）。
     Apply {
         #[arg(long)]
         session: Option<String>,
+        #[arg(long = "source", value_enum, default_value_t = ChangeSourceArg::All)]
+        source: ChangeSourceArg,
         /// 選択適用フィルタ（`*`ワイルドカード対応、例 `src/*`）。省略時は全件対象。
         #[arg(long)]
         only: Option<String>,
-        /// `_ext/`（workspace外ターゲット、例 `C:\Windows\x`）の適用を許可する。
+        /// `_ext/`（workspace外ターゲット、例 `C:\Windows\x`）の適用を許可する。staged専用
+        /// （CoWはworkspace外への書込を記録しないため常に無関係）。
         #[arg(long = "dangerously-allow", default_value_t = false)]
         dangerously_allow: bool,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },
-    /// ステージ済み変更を全て破棄する。
+    /// 変更を全て破棄する（既定は`--source all`）。
     Discard {
         #[arg(long)]
         session: Option<String>,
+        #[arg(long = "source", value_enum, default_value_t = ChangeSourceArg::All)]
+        source: ChangeSourceArg,
     },
     /// fs passthrough allowlist（軸2・D-13）の台帳保守サブコマンド。
     /// `--fs-allow`実行時フラグとは独立の、ユーザグローバル台帳を操作する副コマンド
@@ -122,6 +150,15 @@ enum Commands {
     Tier3 {
         #[command(subcommand)]
         action: Tier3Action,
+    },
+    /// `--cow`のupper置き場（`%LOCALAPPDATA%\harness\data\cow\<session-id>`）を確認・
+    /// workspace本体へ反映・破棄するサブコマンド。upper置き場はセッション終了時に
+    /// 自動削除されない（エージェントの作業内容そのものが入っているため）ので、
+    /// クラッシュ・強制終了で中断したセッションも`--resume <id> --cow`で再開して
+    /// 中身を確認できる。
+    Cow {
+        #[command(subcommand)]
+        action: CowAction,
     },
     /// ネットワーク監査ログ（`net-audit.jsonl`）を表示する。
     Net {
@@ -209,6 +246,24 @@ enum FsAction {
     /// traverse台帳の全エントリを撤収する。`grant-traverse`で付与した箇所を手打ちで覚える
     /// 必要がなく、記録済みの箇所だけを自動で対象にする。
     RevokeTraverseAll,
+    /// `preflight`が起動のたびに付与するworkspace本体のACE（通常起動=RWX、`--cow`=RO）を
+    /// 撤収する。同じworkspaceを今も使っている他のharnessセッションが無いことを名前付き
+    /// mutexで確認し、あれば「使用中」として拒否する（`harness_sandbox::workspace_ledger`
+    /// 参照）。CoWのupper_dirには一切触れない（別コマンド`harness cow discard`が担当）。
+    RevokeWorkspace { path: PathBuf },
+    /// これまで許可を付けたことがある全workspaceに対して`revoke-workspace`と同じ処理をする。
+    /// 使用中のworkspaceは自動的にスキップされる（一覧に表示のみ）。
+    RevokeWorkspaceAll,
+}
+
+/// `harness cow`サブコマンドの各操作。Windows Tier2a `--cow`固有機能のため、Windows以外は
+/// エラーで終了する。単一セッション向けの一覧・適用・破棄は`harness changes`/`apply`/
+/// `discard --source cow`へ統合済み（Phase 2）——`list`だけは全workspace横断の棚卸し用
+/// として引き続きここに残す。
+#[derive(Subcommand)]
+enum CowAction {
+    /// `%LOCALAPPDATA%\harness\data\cow\`配下にある全upper置き場を一覧表示する。
+    List,
 }
 
 #[derive(Parser)]
@@ -299,13 +354,15 @@ struct Cli {
 
     /// 全書込をステージングし、実FSは`harness apply`まで不変にする。明示指定時のみ
     /// 有効なオプトイン機能で、既定の安全策ではない（§書込ステージング3モード、D-29）。
-    #[arg(long = "staged", conflicts_with_all = ["live", "workspace_commit"])]
+    /// `--cow`とは互いに排他（マニフェスト方式とCoW方式という別々の書込捕捉機構を
+    /// 同時に有効化しない）。
+    #[arg(long = "staged", conflicts_with_all = ["live", "workspace_commit", "cow"])]
     staged: bool,
 
     /// workspace内はステージング→レビュー＆コミット、workspace外は常にsandbox隔離。
     /// 明示指定時のみ有効なオプトイン機能で、既定の安全策ではない
-    /// （§書込ステージング3モード、D-29）。
-    #[arg(long = "workspace-commit", conflicts_with_all = ["live", "staged"])]
+    /// （§書込ステージング3モード、D-29）。`--cow`とは互いに排他（`staged`と同じ理由）。
+    #[arg(long = "workspace-commit", conflicts_with_all = ["live", "staged", "cow"])]
     workspace_commit: bool,
 
     /// シェル隔離Tierの最低要求（M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。指定時は
@@ -392,7 +449,9 @@ struct Cli {
     /// RO付与済みである限りworkspace本体への書込は`ACCESS_DENIED`でfail-closeする
     /// （フックは境界にしない、D-01不変）。既定（フラグ無指定）はD-29のまま
     /// `Live`＋workspace RWを維持する完全なオプトイン。Tier2a以外では起動を拒否する。
-    #[arg(long = "cow", default_value_t = false)]
+    /// `--staged`/`--workspace-commit`とは互いに排他（マニフェスト方式とCoW方式という
+    /// 別々の書込捕捉機構を同時に有効化しない。`--live`とは意味的に矛盾しないため排他にしない）。
+    #[arg(long = "cow", default_value_t = false, conflicts_with_all = ["staged", "workspace_commit"])]
     cow: bool,
 }
 
@@ -923,20 +982,52 @@ fn to_sandbox_fs_access(access: harness_config::FsAccess) -> harness_sandbox::Fs
     }
 }
 
+/// `source`が`cow`を含む場合に、`--session`（省略時は最新）からCoW upper_dirを解決する。
+/// Windows専用機構（Tier2a `--cow`）のため非Windowsでは常に`None`（`--source cow`単体を
+/// 明示された場合の「対象なし」判定は呼び出し元が行う）。
+#[cfg(windows)]
+fn cow_upper_dir_for_source(source: ChangeSourceArg, session: Option<&str>) -> Option<PathBuf> {
+    if source.wants_cow() {
+        resolve_cow_upper_dir(session)
+    } else {
+        None
+    }
+}
+#[cfg(not(windows))]
+fn cow_upper_dir_for_source(_source: ChangeSourceArg, _session: Option<&str>) -> Option<PathBuf> {
+    None
+}
+
+/// CoW upper_dirから`apply`に必要な`(upper_dir, workspace_root)`ペアを解決する
+/// （セッションメタファイルが無ければ「どのworkspace向けか分からない」ため`None`）。
+#[cfg(windows)]
+fn cow_apply_target(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    harness_sandbox::workspace_ledger::read_cow_session_meta(dir)
+        .map(|m| (dir.to_path_buf(), PathBuf::from(m.workspace_root)))
+}
+#[cfg(not(windows))]
+fn cow_apply_target(_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    None
+}
+
 /// `apply`/`changes`/`discard`サブコマンドを処理する。プロバイダ資格情報を一切必要としない
-/// （§非対話モード、プロンプトは一切送らない）。
+/// （§非対話モード、プロンプトは一切送らない）。`--source`（既定`all`）でstagedマニフェスト・
+/// `--cow`操作台帳のどちらを対象にするか選べる（`plans/AppContainerベース Copy-on-Write
+/// ワークスペース設計書.md` §19 Phase 2、ツールを分けず統合する）。
 fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
-    let (session, output_format_and_kind) = match &cmd {
+    let (session, source, output_format_and_kind) = match &cmd {
         Commands::Changes {
             session,
+            source,
             output_format,
-        } => (session.clone(), Some(*output_format)),
+        } => (session.clone(), *source, Some(*output_format)),
         Commands::Apply {
             session,
+            source,
             output_format,
             ..
-        } => (session.clone(), Some(*output_format)),
-        Commands::Discard { session } => (session.clone(), None),
+        } => (session.clone(), *source, Some(*output_format)),
+        Commands::Discard { session, source } => (session.clone(), *source, None),
         // `Fs`/`Tier3`/`Prompt`はmain()側でそれぞれ専用の振り分け先へ処理済みで、ここには
         // 到達しない（workspace sandboxのstaging設定を一切必要としないため、`SandboxFs`を開く
         // このパスとは責務が別）。
@@ -946,6 +1037,9 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
         Commands::Tier3 { .. } => {
             unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
         }
+        Commands::Cow { .. } => {
+            unreachable!("Commands::Cow is dispatched before run_sandbox_subcommand")
+        }
         Commands::Net { .. } => {
             unreachable!("Commands::Net is dispatched before run_sandbox_subcommand")
         }
@@ -954,25 +1048,39 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
         }
     };
 
-    let Some(sandbox_dir) = resolve_sandbox_dir(workspace_root, session.as_deref()) else {
-        eprintln!("no staged sandbox found under .harness/sandbox/ (nothing to show)");
-        return ExitCode::FAILURE;
-    };
-    let staging = StagingConfig {
-        mode: StagingMode::Staged,
-        sandbox_dir: Some(sandbox_dir),
-    };
-    let fs = match SandboxFs::open(workspace_root, &staging) {
-        Ok(fs) => fs,
-        Err(e) => {
-            eprintln!("failed to open sandbox: {e}");
-            return ExitCode::FAILURE;
+    let staged_fs: Option<SandboxFs> = if source.wants_staged() {
+        match resolve_sandbox_dir(workspace_root, session.as_deref()) {
+            Some(sandbox_dir) => {
+                let staging = StagingConfig {
+                    mode: StagingMode::Staged,
+                    sandbox_dir: Some(sandbox_dir),
+                };
+                match SandboxFs::open(workspace_root, &staging) {
+                    Ok(fs) => Some(fs),
+                    Err(e) => {
+                        eprintln!("failed to open sandbox: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            None => None,
         }
+    } else {
+        None
     };
+    let cow_upper_dir = cow_upper_dir_for_source(source, session.as_deref());
+
+    if staged_fs.is_none() && cow_upper_dir.is_none() {
+        eprintln!("no staged sandbox or CoW upper directory found (nothing to show)");
+        return ExitCode::FAILURE;
+    }
 
     match cmd {
         Commands::Changes { .. } => {
-            let changes = match fs.change_set() {
+            let changes = match harness_sandbox::changes::list_unified_changes(
+                staged_fs.as_ref(),
+                cow_upper_dir.as_deref(),
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("failed to read changes: {e}");
@@ -994,10 +1102,15 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                 }
                 OutputFormat::Text => {
                     if changes.is_empty() {
-                        println!("(no staged changes)");
+                        println!("(no changes)");
                     }
                     for c in &changes {
-                        println!("{:?}\t{:?}\t{}", c.op, c.target, c.path);
+                        println!(
+                            "{:<5} {:<7} {}",
+                            format!("{:?}", c.source).to_lowercase(),
+                            format!("{:?}", c.op).to_lowercase(),
+                            c.path
+                        );
                     }
                 }
             }
@@ -1008,11 +1121,16 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
             dangerously_allow,
             ..
         } => {
-            let report = match fs.apply(&ApplyOptions {
-                only_glob: only.as_deref(),
-                only_paths: None,
-                allow_ext: dangerously_allow,
-            }) {
+            let cow_target = cow_upper_dir.as_deref().and_then(cow_apply_target);
+            let report = match harness_sandbox::changes::apply_unified_changes(
+                staged_fs.as_ref(),
+                cow_target.as_ref().map(|(d, w)| (d.as_path(), w.as_path())),
+                &ApplyOptions {
+                    only_glob: only.as_deref(),
+                    only_paths: None,
+                    allow_ext: dangerously_allow,
+                },
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("apply failed: {e}");
@@ -1057,21 +1175,40 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
-        Commands::Discard { .. } => match fs.discard() {
-            Ok(()) => {
-                println!("discarded staged changes");
-                ExitCode::SUCCESS
+        Commands::Discard { .. } => {
+            if let Some(dir) = &cow_upper_dir {
+                if let Some(session_id) = dir.file_name().and_then(|n| n.to_str()) {
+                    if cow_session_is_live_checked(session_id) {
+                        eprintln!(
+                            "session {session_id} is still running; refusing to discard its \
+                             CoW changes"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("discard failed: {e}");
-                ExitCode::FAILURE
+            match harness_sandbox::changes::discard_unified_changes(
+                staged_fs.as_ref(),
+                cow_upper_dir.as_deref(),
+            ) {
+                Ok(()) => {
+                    println!("discarded changes");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("discard failed: {e}");
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
         Commands::Fs { .. } => {
             unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand")
         }
         Commands::Tier3 { .. } => {
             unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Cow { .. } => {
+            unreachable!("Commands::Cow is dispatched before run_sandbox_subcommand")
         }
         Commands::Net { .. } => {
             unreachable!("Commands::Net is dispatched before run_sandbox_subcommand")
@@ -1080,6 +1217,15 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
             unreachable!("Commands::Prompt is dispatched before run_sandbox_subcommand")
         }
     }
+}
+
+#[cfg(windows)]
+fn cow_session_is_live_checked(session_id: &str) -> bool {
+    harness_sandbox::workspace_ledger::cow_session_is_live(session_id)
+}
+#[cfg(not(windows))]
+fn cow_session_is_live_checked(_session_id: &str) -> bool {
+    false
 }
 
 /// fs passthrough台帳（D5、ユーザグローバル、`directories`設定ディレクトリ配下）の1エントリ。
@@ -1123,33 +1269,12 @@ struct FsLedger {
     denied_entries: Vec<FsDeniedLedgerEntry>,
 }
 
-/// traverse台帳（D10の巻き戻し用、`fs-passthrough-ledger.json`とは別ファイル）の1エントリ。
-/// `grant-traverse`は`writable`という概念を持たない（付与するアクセス権は常に
-/// `FILE_TRAVERSE | FILE_READ_ATTRIBUTES`固定）ため、`FsLedgerEntry`とは別の小さな型にする。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct TraverseLedgerEntry {
-    path: String,
-    granted_at_unix_secs: u64,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct TraverseLedger {
-    entries: Vec<TraverseLedgerEntry>,
-}
-
 /// 台帳ファイルのパス（`%APPDATA%\harness\config\fs-passthrough-ledger.json`相当、`harness-config`の
 /// `user_settings_path`と同じ土台）。横断的な穴を1台帳に集約し、どのプロジェクトからでも
 /// 全撤収できるようにする（D5）。
 fn fs_ledger_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "harness")
         .map(|d| d.config_dir().join("fs-passthrough-ledger.json"))
-}
-
-/// traverse台帳ファイルのパス。`fs-passthrough-ledger.json`と意味が異なる記録
-/// （ドライブルート/祖先ディレクトリへのtraverse付与）を混在させないため、別ファイルにする。
-fn traverse_ledger_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "harness")
-        .map(|d| d.config_dir().join("traverse-grant-ledger.json"))
 }
 
 /// fs ledgerの名前付きロック名（`vm_ledger.rs`の`Local\harness-tier3-vm-ledger`と同じ命名）。
@@ -1176,16 +1301,6 @@ fn load_fs_ledger_unlocked() -> FsLedger {
     match std::fs::read_to_string(&path) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(_) => FsLedger::default(),
-    }
-}
-
-fn load_traverse_ledger() -> TraverseLedger {
-    let Some(path) = traverse_ledger_path() else {
-        return TraverseLedger::default();
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => TraverseLedger::default(),
     }
 }
 
@@ -1229,15 +1344,6 @@ fn set_file_readonly(_path: &Path, _readonly: bool) {}
 
 fn save_fs_ledger_unlocked(ledger: &FsLedger) {
     let Some(path) = fs_ledger_path() else {
-        return;
-    };
-    if let Ok(s) = serde_json::to_string_pretty(ledger) {
-        write_ledger_file(&path, &s);
-    }
-}
-
-fn save_traverse_ledger(ledger: &TraverseLedger) {
-    let Some(path) = traverse_ledger_path() else {
         return;
     };
     if let Ok(s) = serde_json::to_string_pretty(ledger) {
@@ -1349,33 +1455,6 @@ fn remove_fs_passthrough_grant_if_still_orphaned(path: &Path) {
     });
 }
 
-/// `grant-traverse`が実際にACE付与を試みたパスをtraverse台帳へ記録する（D10の巻き戻し用）。
-/// `record_fs_passthrough_grant`と同じ冪等upsert。
-fn record_traverse_grant(path: &Path) {
-    let mut ledger = load_traverse_ledger();
-    let path_str = path.to_string_lossy().into_owned();
-    let granted_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Some(entry) = ledger.entries.iter_mut().find(|e| e.path == path_str) {
-        entry.granted_at_unix_secs = granted_at;
-    } else {
-        ledger.entries.push(TraverseLedgerEntry {
-            path: path_str,
-            granted_at_unix_secs: granted_at,
-        });
-    }
-    save_traverse_ledger(&ledger);
-}
-
-fn remove_traverse_grant(path: &Path) {
-    let mut ledger = load_traverse_ledger();
-    let path_str = path.to_string_lossy().into_owned();
-    ledger.entries.retain(|e| e.path != path_str);
-    save_traverse_ledger(&ledger);
-}
-
 /// `harness fs`サブコマンドのディスパッチ（プロバイダ資格情報・workspace sandboxのいずれも
 /// 必要としない、`run_sandbox_subcommand`とは独立のパス）。
 /// `harness tier3`サブコマンドの処理本体（A9、D-24）。
@@ -1441,13 +1520,34 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
                     e.granted_at_unix_secs
                 );
             }
-            let traverse_ledger = load_traverse_ledger();
+            let traverse_ledger = harness_sandbox::traverse_ledger::load_traverse_ledger();
             println!("=== traverse grants (grant-traverse) ===");
             if traverse_ledger.entries.is_empty() {
                 println!("(none)");
             }
             for e in &traverse_ledger.entries {
                 println!("{}\tgranted_at_unix={}", e.path, e.granted_at_unix_secs);
+            }
+            #[cfg(windows)]
+            {
+                let workspace_ledger = harness_sandbox::workspace_ledger::load_workspace_ledger();
+                println!("=== workspace grants (preflight) ===");
+                if workspace_ledger.entries.is_empty() {
+                    println!("(none)");
+                }
+                for e in &workspace_ledger.entries {
+                    let live =
+                        harness_sandbox::workspace_ledger::live_modes(&PathBuf::from(&e.path));
+                    let status = if live.is_empty() {
+                        "idle".to_string()
+                    } else {
+                        format!("in use: {}", live.join(", "))
+                    };
+                    println!(
+                        "{}\tmode={}\tgranted_at_unix={}\t{status}",
+                        e.path, e.mode, e.granted_at_unix_secs
+                    );
+                }
             }
             println!("=== denied fs passthrough candidates ===");
             if ledger.denied_entries.is_empty() {
@@ -1483,9 +1583,11 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
                 fs_grant_traverse(&target)
             }
         }
+        FsAction::RevokeWorkspace { path } => fs_revoke_workspace(&path),
+        FsAction::RevokeWorkspaceAll => fs_revoke_workspace_all(),
         FsAction::RevokeTraverse { path } => fs_revoke_traverse_one(&path),
         FsAction::RevokeTraverseAll => {
-            let ledger = load_traverse_ledger();
+            let ledger = harness_sandbox::traverse_ledger::load_traverse_ledger();
             if ledger.entries.is_empty() {
                 println!("(no traverse grants recorded)");
                 return ExitCode::SUCCESS;
@@ -1880,7 +1982,7 @@ fn fs_grant_traverse(target: &Path) -> ExitCode {
             harness_sandbox::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
         if !preview.is_empty() && preview.iter().all(|node| node.already_sufficient) {
             for node in &preview {
-                record_traverse_grant(&node.path);
+                harness_sandbox::traverse_ledger::record_traverse_grant(&node.path);
             }
             println!(
                 "grant-traverse: all {} ancestor node(s) already have \
@@ -1906,7 +2008,7 @@ fn fs_grant_traverse(target: &Path) -> ExitCode {
     ) {
         Ok(granted) => {
             for node in &granted {
-                record_traverse_grant(node);
+                harness_sandbox::traverse_ledger::record_traverse_grant(node);
             }
             println!(
                 "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES via privilege-separation helper \
@@ -1929,7 +2031,7 @@ fn fs_grant_traverse(target: &Path) -> ExitCode {
             reason,
         }) => {
             for node in &granted {
-                record_traverse_grant(node);
+                harness_sandbox::traverse_ledger::record_traverse_grant(node);
             }
             eprintln!(
                 "grant-traverse chain partially failed for {}: {reason}. {} node(s) that DID \
@@ -1969,7 +2071,7 @@ fn fs_grant_traverse_direct(target: &Path) -> ExitCode {
     let (granted, result) =
         harness_sandbox::win_appcontainer::grant_traverse_chain(target, sid.as_psid());
     for node in &granted {
-        record_traverse_grant(node);
+        harness_sandbox::traverse_ledger::record_traverse_grant(node);
     }
     match result {
         Ok(()) => {
@@ -2029,7 +2131,7 @@ fn fs_revoke_traverse_one(path: &Path) -> ExitCode {
         },
     ) {
         Ok(_) => {
-            remove_traverse_grant(path);
+            harness_sandbox::traverse_ledger::remove_traverse_grant(path);
             println!(
                 "revoked traverse ACE via privilege-separation helper: {}",
                 path.display()
@@ -2060,7 +2162,7 @@ fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
     }
     match harness_sandbox::win_appcontainer::assert_no_sid_ace(path, sid.as_psid()) {
         Ok(()) => {
-            remove_traverse_grant(path);
+            harness_sandbox::traverse_ledger::remove_traverse_grant(path);
             println!("revoked traverse ACE: {}", path.display());
             ExitCode::SUCCESS
         }
@@ -2078,6 +2180,170 @@ fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
 fn fs_revoke_traverse_one(_path: &Path) -> ExitCode {
     eprintln!("error: fs revoke-traverse is Windows-only (Tier2a specific)");
     ExitCode::FAILURE
+}
+
+/// workspace本体のACE（`preflight`が毎回付与するRWX/RO）を撤収する。名前付きmutexで
+/// 「今もこのworkspaceを使っている他のharnessセッションが無いか」を確認してから撤収する
+/// （`harness_sandbox::workspace_ledger`参照）。CoWのupper_dirには一切触れない。
+#[cfg(windows)]
+fn fs_revoke_workspace(path: &Path) -> ExitCode {
+    let canonical = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("failed to canonicalize {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let live = harness_sandbox::workspace_ledger::live_modes(&canonical);
+    if !live.is_empty() {
+        eprintln!(
+            "workspace {} is still in use by another harness session (mode(s): {}); refusing \
+             to revoke",
+            canonical.display(),
+            live.join(", ")
+        );
+        return ExitCode::FAILURE;
+    }
+    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
+        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    ) {
+        Ok(sid) => sid,
+        Err(e) => {
+            eprintln!("failed to resolve sandbox SID: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match harness_sandbox::win_appcontainer::revoke_ace_recursive(&canonical, sid.as_psid()) {
+        Ok(()) => {
+            harness_sandbox::workspace_ledger::remove_workspace_entry(&canonical);
+            println!("revoked workspace access: {}", canonical.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "failed to revoke workspace access for {}: {e}",
+                canonical.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn fs_revoke_workspace(_path: &Path) -> ExitCode {
+    eprintln!("error: workspace revoke is Windows-only (Tier2a specific)");
+    ExitCode::FAILURE
+}
+
+/// 記録済みの全workspaceに対して`fs_revoke_workspace`を試みる。使用中のworkspaceは
+/// スキップし、それ以外を撤収する。
+#[cfg(windows)]
+fn fs_revoke_workspace_all() -> ExitCode {
+    let ledger = harness_sandbox::workspace_ledger::load_workspace_ledger();
+    if ledger.entries.is_empty() {
+        println!("(no workspace grants recorded)");
+        return ExitCode::SUCCESS;
+    }
+    let mut any_failed = false;
+    for entry in &ledger.entries {
+        let path = PathBuf::from(&entry.path);
+        let live = harness_sandbox::workspace_ledger::live_modes(&path);
+        if !live.is_empty() {
+            println!(
+                "skipping {} (in use by another harness session, mode(s): {})",
+                path.display(),
+                live.join(", ")
+            );
+            continue;
+        }
+        if fs_revoke_workspace(&path) != ExitCode::SUCCESS {
+            any_failed = true;
+        }
+    }
+    if any_failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+#[cfg(not(windows))]
+fn fs_revoke_workspace_all() -> ExitCode {
+    eprintln!("error: workspace revoke is Windows-only (Tier2a specific)");
+    ExitCode::FAILURE
+}
+
+#[cfg(windows)]
+fn run_cow_subcommand(action: CowAction) -> ExitCode {
+    match action {
+        CowAction::List => cow_list(),
+    }
+}
+
+#[cfg(not(windows))]
+fn run_cow_subcommand(_action: CowAction) -> ExitCode {
+    eprintln!("error: harness cow is Windows-only (Tier2a --cow specific)");
+    ExitCode::FAILURE
+}
+
+#[cfg(windows)]
+fn cow_upper_dir_for(session_id: &str) -> Option<PathBuf> {
+    harness_sandbox::workspace_ledger::cow_upper_root().map(|root| root.join(session_id))
+}
+
+#[cfg(windows)]
+fn cow_list() -> ExitCode {
+    let sessions = harness_sandbox::workspace_ledger::list_cow_sessions();
+    if sessions.is_empty() {
+        println!("(no CoW upper directories found)");
+        return ExitCode::SUCCESS;
+    }
+    for session_id in sessions {
+        let Some(upper_dir) = cow_upper_dir_for(&session_id) else {
+            continue;
+        };
+        let live = harness_sandbox::workspace_ledger::cow_session_is_live(&session_id);
+        let files = harness_sandbox::workspace_ledger::list_cow_upper_files(&upper_dir);
+        let workspace_root = harness_sandbox::workspace_ledger::read_cow_session_meta(&upper_dir)
+            .map(|m| m.workspace_root)
+            .unwrap_or_else(|| "(unknown, meta file missing)".to_string());
+        println!(
+            "{session_id}\tworkspace={workspace_root}\t{}\tchanged_files={}",
+            if live { "live" } else { "orphaned" },
+            files.len()
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// `--source cow`（`Commands::Changes`/`Apply`/`Discard`）向けに、セッションIDまたは
+/// 「最も新しいCoW upper置き場」からupper_dirを解決する。`resolve_sandbox_dir`のstaged版と
+/// 同じ「最新セッションを選ぶ」考え方（`main.rs`の既存ロジック）をCoW側にも適用する。
+#[cfg(windows)]
+fn resolve_cow_upper_dir(session: Option<&str>) -> Option<PathBuf> {
+    if let Some(id) = session {
+        let dir = cow_upper_dir_for(id)?;
+        return if dir.exists() { Some(dir) } else { None };
+    }
+    let root = harness_sandbox::workspace_ledger::cow_upper_root()?;
+    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+    let entries = std::fs::read_dir(&root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(_, t)| modified > *t) {
+            newest = Some((path, modified));
+        }
+    }
+    newest.map(|(p, _)| p)
 }
 
 #[tokio::main]
@@ -2125,6 +2391,7 @@ async fn main() -> ExitCode {
         return match cmd {
             Commands::Fs { action } => run_fs_subcommand(action),
             Commands::Tier3 { action } => run_tier3_subcommand(action),
+            Commands::Cow { action } => run_cow_subcommand(action),
             Commands::Net { action } => run_net_subcommand(action, &workspace_root),
             Commands::Prompt => run_prompt_subcommand(&cli, &workspace_root),
             other => run_sandbox_subcommand(other, &workspace_root),

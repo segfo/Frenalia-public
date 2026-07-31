@@ -38,8 +38,8 @@ use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, TokenElevation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-    TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, TokenElevation, TokenUser, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
@@ -137,6 +137,17 @@ pub enum PrivilegedRequest {
     /// （ツリー全体を再walk＋root再プローブ）で撤収する。`forced`なパスは`SeRestorePrivilege`下で
     /// 撤収する（grantと対称に`forced`を運び新たな非対称を作らない、`FsAllowRevoke`参照）。
     RevokeFsAllow { entries: Vec<FsAllowRevoke> },
+    /// `win_appcontainer::preflight`が自動検知した、workspace_root/upper_dir祖先チェーンの
+    /// traverse不足（複数ターゲットあり得る、`--cow`ではworkspace_rootとupper_dirの2つ）と
+    /// `--fs-allow`昇格要求を、1回のUACへまとめて処理する（起動あたりUAC最大1回の原則、
+    /// `plans/DESIGN-SANDBOX-PRIVSEP.md` D-16「特権昇格デーモンを使う際の注意点」参照）。
+    /// 既存の`GrantTraverse`（単一target、`harness fs grant-traverse`専用）・`GrantFsAllow`は
+    /// このvariant導入後も変更しない——`preflight`がtraverse不足を検知しない通常起動では、
+    /// この新variantを一切通らず既存の`GrantFsAllow`単体パスのまま動く。
+    GrantWorkspaceAccess {
+        traverse_targets: Vec<PathBuf>,
+        fs_allow_entries: Vec<FsAllowGrant>,
+    },
 }
 
 /// IPCワイヤ上のトップレベル型。`PrivilegedRequest`本体を薄く包み、WFP連鎖起動の指示
@@ -196,6 +207,17 @@ pub enum PrivilegedResponse {
     },
     /// 要求全体を拒否した場合の単純な失敗（スキーマ不一致等、部分適用の概念が無い操作）。
     Err(String),
+    /// `GrantWorkspaceAccess`の結果。`traverse_granted`/`traverse_error`は`GrantChain`と同じ意味
+    /// （複数targetを順に処理し、途中のtargetで失敗した場合はそこで打ち切るが、それまでに
+    /// 成功したノードは全ターゲット分`traverse_granted`へ積む。呼び出し側は`traverse_error`の
+    /// 有無に関わらず`traverse_granted`の全ノードを台帳へ記録しなければならない）。
+    /// `fs_allow_granted`/`fs_allow_failures`は`FsAllowResult`と同じ意味。
+    WorkspaceAccessResult {
+        traverse_granted: Vec<PathBuf>,
+        traverse_error: Option<String>,
+        fs_allow_granted: Vec<PathBuf>,
+        fs_allow_failures: Vec<(PathBuf, String)>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -523,6 +545,10 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
         PrivilegedResponse::RevokeFsAllowResult { .. } => Err(PrivHelperError::Ipc(
             "unexpected RevokeFsAllowResult response for a non-RevokeFsAllow request".to_string(),
         )),
+        PrivilegedResponse::WorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
+            "unexpected WorkspaceAccessResult response for a non-GrantWorkspaceAccess request"
+                .to_string(),
+        )),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }
 }
@@ -572,6 +598,58 @@ pub fn run_privileged_fs_allow_with_netfilterd_chain(
         PrivilegedResponse::RevokeFsAllowResult { .. } => Err(PrivHelperError::Ipc(
             "unexpected RevokeFsAllowResult response for a GrantFsAllow request".to_string(),
         )),
+        PrivilegedResponse::WorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
+            "unexpected WorkspaceAccessResult response for a GrantFsAllow request".to_string(),
+        )),
+        PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
+    }
+}
+
+/// `run_privileged_workspace_access`の成功値（traverse付与ノード一覧・traverse失敗理由・
+/// fs-allow付与一覧・fs-allow失敗一覧）。
+pub type WorkspaceAccessOutcome = (Vec<PathBuf>, Option<String>, Vec<PathBuf>, Vec<(PathBuf, String)>);
+
+/// `GrantWorkspaceAccess`専用の委譲関数（`win_appcontainer::preflight`がtraverse不足を自動検知
+/// したときに呼ぶ）。`run_privileged_fs_allow_with_netfilterd_chain`と同じく`chain_pipe`で
+/// WFP連鎖起動にも対応する——**新しい特権操作を追加する際の注意点**: 同一起動内で2回目の
+/// `run_privileged*`（＝2回目のUAC）を独立に呼び出してはならない。この関数のように、
+/// 1回の起動で必要になり得る特権操作をすべて1つの`PrivilegedRequestEnvelope`へ束ねること
+/// （`plans/DESIGN-SANDBOX-PRIVSEP.md` D-16参照）。
+pub fn run_privileged_workspace_access(
+    traverse_targets: Vec<PathBuf>,
+    fs_allow_entries: Vec<FsAllowGrant>,
+    chain_pipe: Option<String>,
+) -> Result<WorkspaceAccessOutcome, PrivHelperError> {
+    let envelope = PrivilegedRequestEnvelope {
+        request: PrivilegedRequest::GrantWorkspaceAccess {
+            traverse_targets,
+            fs_allow_entries,
+        },
+        chain_netfilterd_pipe: chain_pipe,
+    };
+    match run_privileged_raw(&envelope)? {
+        PrivilegedResponse::WorkspaceAccessResult {
+            traverse_granted,
+            traverse_error,
+            fs_allow_granted,
+            fs_allow_failures,
+        } => Ok((
+            traverse_granted,
+            traverse_error,
+            fs_allow_granted,
+            fs_allow_failures,
+        )),
+        PrivilegedResponse::Ok => Ok((Vec::new(), None, Vec::new(), Vec::new())),
+        PrivilegedResponse::GrantChain { granted, error } => {
+            Ok((granted, error, Vec::new(), Vec::new()))
+        }
+        PrivilegedResponse::FsAllowResult { granted, failures } => {
+            Ok((Vec::new(), None, granted, failures))
+        }
+        PrivilegedResponse::RevokeFsAllowResult { .. } => Err(PrivHelperError::Ipc(
+            "unexpected RevokeFsAllowResult response for a GrantWorkspaceAccess request"
+                .to_string(),
+        )),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }
 }
@@ -598,6 +676,9 @@ pub fn run_privileged_revoke_fs_allow(
         PrivilegedResponse::FsAllowResult { granted, failures } => {
             Ok((granted, Vec::new(), failures))
         }
+        PrivilegedResponse::WorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
+            "unexpected WorkspaceAccessResult response for a RevokeFsAllow request".to_string(),
+        )),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }
 }
@@ -913,6 +994,103 @@ unsafe fn launch_netfilterd_chained(pipe_name: &str) -> Result<(), PrivHelperErr
     Ok(())
 }
 
+/// `GrantFsAllow`/`GrantWorkspaceAccess`共通の実処理。エントリごとに成否が独立する
+/// （`GrantTraverse`のような連鎖ではないため、1エントリの失敗が他エントリを止めない）。
+fn grant_fs_allow_entries(
+    sid: PSID,
+    entries: Vec<FsAllowGrant>,
+) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+    let mut granted = Vec::new();
+    let mut failures = Vec::new();
+    for entry in entries {
+        let started = std::time::Instant::now();
+        // forced（--force-system-acl, D-19）は`SeRestorePrivilege`で全DACLをバイパスして
+        // 書くため、書込前に必ず host パスの絶対拒否ゲートを通す（唯一の防壁）。
+        if entry.forced {
+            if let Some(reason) = win_appcontainer::is_force_grant_forbidden(&entry.path) {
+                log::line(&format!(
+                    "  entry {} : forced grant REFUSED by deny-gate: {reason}",
+                    entry.path.display()
+                ));
+                failures.push((entry.path, reason));
+                continue;
+            }
+        }
+        let do_grant =
+            || win_appcontainer::grant_ace_inheritable_access(&entry.path, sid, entry.access);
+        // forcedのみ`SeRestorePrivilege`を有効化して実行する（TrustedInstaller所有ノードへも
+        // 所有権を変えずにACEを書ける）。非forcedは従来どおり特権無しで実行する。
+        let result = if entry.forced {
+            win_appcontainer::with_restore_privilege(do_grant)
+        } else {
+            do_grant()
+        };
+        match result {
+            Ok(()) => {
+                log::line(&format!(
+                    "  entry {} [{}{}] : granted in {}ms",
+                    entry.path.display(),
+                    if entry.access.is_read_write() { "rw" } else { "ro" },
+                    if entry.forced { ",forced" } else { "" },
+                    started.elapsed().as_millis()
+                ));
+                granted.push(entry.path);
+            }
+            Err(e) => {
+                log::line(&format!(
+                    "  entry {} [{}{}] : FAILED after {}ms: {e}",
+                    entry.path.display(),
+                    if entry.access.is_read_write() { "rw" } else { "ro" },
+                    if entry.forced { ",forced" } else { "" },
+                    started.elapsed().as_millis()
+                ));
+                failures.push((entry.path, e.to_string()));
+            }
+        }
+    }
+    (granted, failures)
+}
+
+/// `GrantWorkspaceAccess`用: 複数のtraverseターゲット（`--cow`ならworkspace_root・upper_dirの
+/// 2つ）を独立に処理する。`GrantTraverse`（単一target）と異なり、1ターゲットのチェーンが
+/// 途中で失敗しても他のターゲットの処理は続行する（workspace_rootとupper_dirは別の祖先
+/// チェーンであり、片方の失敗がもう片方を無意味にするとは限らないため）。最初に発生した
+/// エラーのみ`traverse_error`へ載せる（`target: reason`形式でどのターゲットの失敗か分かるようにする）。
+/// いずれの場合も、実際にACEが付与された全ノードを`granted`へ積む（孤立ACE防止、`GrantChain`と
+/// 同じ不変条件）。
+fn grant_traverse_targets(
+    sid: PSID,
+    targets: Vec<PathBuf>,
+) -> (Vec<PathBuf>, Option<String>) {
+    let mut all_granted = Vec::new();
+    let mut first_error: Option<String> = None;
+    for target in targets {
+        let (granted, result) = win_appcontainer::grant_traverse_chain_with_progress(
+            &target,
+            sid,
+            |node, node_result, elapsed| match node_result {
+                Ok(()) => log::line(&format!(
+                    "  node {} : granted in {}ms",
+                    node.display(),
+                    elapsed.as_millis()
+                )),
+                Err(e) => log::line(&format!(
+                    "  node {} : FAILED after {}ms: {e}",
+                    node.display(),
+                    elapsed.as_millis()
+                )),
+            },
+        );
+        all_granted.extend(granted);
+        if let Err(e) = result {
+            if first_error.is_none() {
+                first_error = Some(format!("{}: {e}", target.display()));
+            }
+        }
+    }
+    (all_granted, first_error)
+}
+
 /// 固定スキーマの要求だけを実行する（D-16の核: ここに到達する時点でスキーマ検証済み、
 /// 自由形式のコマンド文字列は一切扱わない）。SIDはIPCで受け取らず、安定定数
 /// `CONTAINER_NAME`から`ensure_profile`で自ら導出する。
@@ -975,73 +1153,41 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 "dispatch: GrantFsAllow {} entrie(s)",
                 entries.len()
             ));
-            let mut granted = Vec::new();
-            let mut failures = Vec::new();
-            for entry in entries {
-                let started = std::time::Instant::now();
-                // forced（--force-system-acl, D-19）は`SeRestorePrivilege`で全DACLをバイパスして
-                // 書くため、書込前に必ず host パスの絶対拒否ゲートを通す（唯一の防壁）。
-                if entry.forced {
-                    if let Some(reason) = win_appcontainer::is_force_grant_forbidden(&entry.path) {
-                        log::line(&format!(
-                            "  entry {} : forced grant REFUSED by deny-gate: {reason}",
-                            entry.path.display()
-                        ));
-                        failures.push((entry.path, reason));
-                        continue;
-                    }
-                }
-                let do_grant = || {
-                    win_appcontainer::grant_ace_inheritable_access(
-                        &entry.path,
-                        sid.as_psid(),
-                        entry.access,
-                    )
-                };
-                // forcedのみ`SeRestorePrivilege`を有効化して実行する（TrustedInstaller所有ノードへも
-                // 所有権を変えずにACEを書ける）。非forcedは従来どおり特権無しで実行する。
-                let result = if entry.forced {
-                    win_appcontainer::with_restore_privilege(do_grant)
-                } else {
-                    do_grant()
-                };
-                match result {
-                    Ok(()) => {
-                        log::line(&format!(
-                            "  entry {} [{}{}] : granted in {}ms",
-                            entry.path.display(),
-                            if entry.access.is_read_write() {
-                                "rw"
-                            } else {
-                                "ro"
-                            },
-                            if entry.forced { ",forced" } else { "" },
-                            started.elapsed().as_millis()
-                        ));
-                        granted.push(entry.path);
-                    }
-                    Err(e) => {
-                        log::line(&format!(
-                            "  entry {} [{}{}] : FAILED after {}ms: {e}",
-                            entry.path.display(),
-                            if entry.access.is_read_write() {
-                                "rw"
-                            } else {
-                                "ro"
-                            },
-                            if entry.forced { ",forced" } else { "" },
-                            started.elapsed().as_millis()
-                        ));
-                        failures.push((entry.path, e.to_string()));
-                    }
-                }
-            }
+            let (granted, failures) = grant_fs_allow_entries(sid.as_psid(), entries);
             log::line(&format!(
                 "dispatch: GrantFsAllow done, {} granted, {} failed",
                 granted.len(),
                 failures.len()
             ));
             PrivilegedResponse::FsAllowResult { granted, failures }
+        }
+        PrivilegedRequest::GrantWorkspaceAccess {
+            traverse_targets,
+            fs_allow_entries,
+        } => {
+            log::line(&format!(
+                "dispatch: GrantWorkspaceAccess {} traverse target(s), {} fs-allow entrie(s)",
+                traverse_targets.len(),
+                fs_allow_entries.len()
+            ));
+            let (traverse_granted, traverse_error) =
+                grant_traverse_targets(sid.as_psid(), traverse_targets);
+            let (fs_allow_granted, fs_allow_failures) =
+                grant_fs_allow_entries(sid.as_psid(), fs_allow_entries);
+            log::line(&format!(
+                "dispatch: GrantWorkspaceAccess done, {} traverse node(s) granted (error={:?}), \
+                 {} fs-allow granted, {} fs-allow failed",
+                traverse_granted.len(),
+                traverse_error,
+                fs_allow_granted.len(),
+                fs_allow_failures.len()
+            ));
+            PrivilegedResponse::WorkspaceAccessResult {
+                traverse_granted,
+                traverse_error,
+                fs_allow_granted,
+                fs_allow_failures,
+            }
         }
         PrivilegedRequest::RevokeFsAllow { entries } => {
             log::line(&format!(
@@ -1208,6 +1354,70 @@ mod tests {
                 assert!(!entries[0].forced);
                 assert_eq!(entries[1].access, FsAccess::ReadWrite);
                 assert!(entries[1].forced);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// `GrantWorkspaceAccess`（`preflight`のtraverse自動付与+fs-allow昇格の合成リクエスト）が
+    /// 複数targets/entriesを保持したままラウンドトリップすることを確認する。
+    #[test]
+    fn grant_workspace_access_request_roundtrips_through_json() {
+        let req = PrivilegedRequest::GrantWorkspaceAccess {
+            traverse_targets: vec![
+                PathBuf::from(r"C:\Users\example\workspace"),
+                PathBuf::from(r"C:\Users\example\AppData\Local\harness\cow\session-1"),
+            ],
+            fs_allow_entries: vec![FsAllowGrant {
+                path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
+                access: FsAccess::ReadExec,
+                forced: false,
+            }],
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let decoded: PrivilegedRequest = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            PrivilegedRequest::GrantWorkspaceAccess {
+                traverse_targets,
+                fs_allow_entries,
+            } => {
+                assert_eq!(traverse_targets.len(), 2);
+                assert_eq!(
+                    traverse_targets[1],
+                    PathBuf::from(r"C:\Users\example\AppData\Local\harness\cow\session-1")
+                );
+                assert_eq!(fs_allow_entries.len(), 1);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// `WorkspaceAccessResult`応答が、traverse側のエラーとfs-allow側の成否混在の両方を
+    /// 失わずにラウンドトリップできることを確認する。
+    #[test]
+    fn workspace_access_result_roundtrips_through_json() {
+        let response = PrivilegedResponse::WorkspaceAccessResult {
+            traverse_granted: vec![PathBuf::from(r"C:\"), PathBuf::from(r"C:\Users")],
+            traverse_error: Some(r"C:\Users\example\workspace: access denied".to_string()),
+            fs_allow_granted: vec![PathBuf::from(r"C:\ProgramData\Tool")],
+            fs_allow_failures: vec![(PathBuf::from(r"C:\Windows\System32"), "denied".to_string())],
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let decoded: PrivilegedResponse = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            PrivilegedResponse::WorkspaceAccessResult {
+                traverse_granted,
+                traverse_error,
+                fs_allow_granted,
+                fs_allow_failures,
+            } => {
+                assert_eq!(traverse_granted.len(), 2);
+                assert_eq!(
+                    traverse_error,
+                    Some(r"C:\Users\example\workspace: access denied".to_string())
+                );
+                assert_eq!(fs_allow_granted.len(), 1);
+                assert_eq!(fs_allow_failures.len(), 1);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

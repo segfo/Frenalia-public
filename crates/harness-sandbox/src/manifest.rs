@@ -6,14 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// マニフェスト1件の操作種別。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManifestOp {
-    Create,
-    Modify,
-    Delete,
-}
+/// マニフェスト1件の操作種別。`crates/harness-change-ledger`の`ChangeOp`をそのまま使う
+/// （CoW操作台帳と変種名・serde表現が完全に一致するため、同じ意味の列挙を2箇所で育てて
+/// 片方だけ古くなる事故を防ぐ）。
+pub use harness_change_ledger::ChangeOp as ManifestOp;
 
 /// 書込先の分類。`Live`は実FSへ直接書いた際の監査専用エントリ（`changes()`には出ない）、
 /// `Tree`はworkspace内オーバーレイミラー（`<sandbox_dir>/tree/<rel>`）、`Ext`はworkspace外
@@ -24,6 +20,11 @@ pub enum ManifestTarget {
     Live,
     Tree,
     Ext,
+    /// `--cow`操作台帳由来の変更（TUI変更パネル・`harness changes --source cow`統合表示用、
+    /// Phase 2）。stagedマニフェスト（`SandboxFs::change_set()`/`apply()`）からは出力しない
+    /// ——`overlay.rs`の網羅マッチにこの腕があるのは型の網羅性を満たすためだけの到達不能
+    /// コードで、CoW側の実際の適用は`harness_sandbox::changes::apply_unified_changes`が担う。
+    Cow,
 }
 
 /// マニフェスト1行分のレコード。

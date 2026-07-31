@@ -1567,6 +1567,9 @@ fn required_passthrough_mask(access: FsAccess) -> u32 {
     fs_access_mask(access)
 }
 
+/// `preflight`のfs-allow昇格結果（`granted`パス一覧、`(path, reason)`失敗一覧）。
+type FsAllowElevationOutcome = (Vec<std::path::PathBuf>, Vec<(std::path::PathBuf, String)>);
+
 pub fn preflight(
     workspace_root: &Path,
     passthrough: &[FsPassthrough],
@@ -1574,6 +1577,29 @@ pub fn preflight(
     write_mode: &WorkspaceWriteMode,
 ) -> Result<PreflightOutcome, AppContainerError> {
     let sid = ensure_profile(CONTAINER_NAME)?;
+
+    // workspaceのアクセスモード（通常起動=RWX / `--cow`=RO、将来`--cow_exec`=RXを追加予定）は
+    // 同じworkspaceに対して混在させてはいけない——ACEはファイルに1つしか付けられないため、
+    // モードが違うセッションが同時に動くと片方の前提を裏切る（例: ROのはずが後から来た
+    // RWXセッションのせいで書けてしまう）。ACE付与の前に、名前付きmutexで他モードが
+    // 使用中でないか確認し、自モードの生存マーカーを確保する
+    // （`crate::workspace_ledger::begin_workspace_mode`のdoc参照、モード衝突チェックと
+    // マーカー作成は内部で`with_named_lock`により直列化されるため、2プロセスがほぼ同時に
+    // 別モードで起動しても早い者勝ちの事故にはならない）。
+    let workspace_mode = match write_mode {
+        WorkspaceWriteMode::DirectRw => "rwx",
+        WorkspaceWriteMode::Cow { .. } => "ro",
+    };
+    let canonical_workspace_root = workspace_root.canonicalize().map_err(|e| {
+        AppContainerError::Preflight(format!(
+            "failed to canonicalize workspace root {}: {e}",
+            workspace_root.display()
+        ))
+    })?;
+    crate::workspace_ledger::begin_workspace_mode(&canonical_workspace_root, workspace_mode)
+        .map_err(AppContainerError::Preflight)?;
+    crate::workspace_ledger::record_workspace_grant(&canonical_workspace_root, workspace_mode);
+
     // D-30: `write_mode`がACL付与方針を唯一決める。`match`を全分岐（`..`無し）にすることで、
     // `WorkspaceWriteMode`へバリアントを追加した際にACL決定漏れをコンパイルエラーにする。
     match write_mode {
@@ -1591,23 +1617,49 @@ pub fn preflight(
             std::fs::create_dir_all(upper_dir)
                 .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
             grant_ace_inheritable_rw(upper_dir, sid.as_psid())?;
+            // `harness cow status`/`apply`/`list`がworkspace_rootを引けるよう、upper_dir自身に
+            // 由来を記録する（`workspace_ledger::write_cow_session_meta`のdoc参照）。
+            crate::workspace_ledger::write_cow_session_meta(
+                upper_dir,
+                &canonical_workspace_root,
+                upper_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown-session"),
+            );
+            // CoWのupper_dirはセッション専有（他セッションと共有しない）なので、他モードとの
+            // 衝突チェックは不要。セッションID（upper_dirの最終パス要素、
+            // `cow_upper_dir_for_session`参照）で名前を付けた生存マーカーだけを確保し、
+            // `harness cow discard`等が「まだこのセッションが動いているか」を判定できるように
+            // する（`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`Phase 6の
+            // 前段）。
+            let session_id = upper_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown-session");
+            crate::workspace_ledger::hold_cow_session_marker(session_id).map_err(|e| {
+                AppContainerError::Preflight(format!(
+                    "failed to create CoW session marker for {session_id}: {e}"
+                ))
+            })?;
         }
     }
     protect_harness_control_dir_from_appcontainer(workspace_root, sid.as_psid())?;
-    // D-30: `FS_IO_PROBE_COMMAND`はprobe_dirへの書込を試みる。Cowモードではworkspace自体が
-    // 意図的にROなので、probe_dirをworkspace配下に置くと「workspaceが書けない」という
-    // Cowモードの正しい挙動を誤ってtraverse ACE不足として誤診断してしまう。probe_dirは
-    // 書込可能であるべき場所（DirectRw時はworkspace、Cow時はupper_dir）に置く。
-    let probe_base = match write_mode {
-        WorkspaceWriteMode::DirectRw => workspace_root,
-        WorkspaceWriteMode::Cow { upper_dir } => upper_dir.as_path(),
-    };
-    let tmp_dir = probe_base.join(format!(".harness-tier2a-probe-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir).map_err(|e| AppContainerError::Preflight(e.to_string()))?;
-    let smoke_result = smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir);
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    smoke_result?;
-    smoke_test_harness_control_write_denied(sid.as_psid(), workspace_root)?;
+
+    // workspace_root（Cow時はupper_dirも）の祖先traverseチェーンが不足していないか事前に判定する
+    // （読み取り専用、UAC無し）。不足分は下のfs-allow昇格要求と合流させ、1回のprivhelper呼び出し
+    // （起動あたりUAC最大1回）で解消する。以前はtraverse不足を`smoke_test_spawn`（下記）が
+    // リアクティブに検知してTier1bへ静かに降格するだけだったが、privhelper経由で自動付与できる
+    // 経路（`GrantWorkspaceAccess`）が整ったため、ここで先回りして解消する
+    // （`plans/DESIGN-SANDBOX-PRIVSEP.md` D-16「特権昇格デーモンを使う際の注意点」参照）。
+    let mut traverse_targets: Vec<std::path::PathBuf> = vec![workspace_root.to_path_buf()];
+    if let WorkspaceWriteMode::Cow { upper_dir } = write_mode {
+        traverse_targets.push(upper_dir.clone());
+    }
+    let missing_traverse: Vec<std::path::PathBuf> = traverse_targets
+        .into_iter()
+        .filter(|target| !traverse_chain_sufficient(target, sid.as_psid()))
+        .collect();
 
     let mut warnings = Vec::new();
     let mut denied_passthrough: Vec<(std::path::PathBuf, String, String)> = Vec::new();
@@ -1685,10 +1737,23 @@ pub fn preflight(
         }
     }
 
-    if !needs_elevation.is_empty() {
-        let elevated = if crate::privhelper::is_elevated() {
+    if !missing_traverse.is_empty() || !needs_elevation.is_empty() {
+        let elevated: Result<FsAllowElevationOutcome, String> = if crate::privhelper::is_elevated() {
             // 本体が既に管理者（§5.3、grant-traverseの`*_direct`と同じ考え方）:
-            // ヘルパーを経由せずその場で直接付与する。
+            // ヘルパーを経由せずその場で直接付与する。traverseが不足していれば先に解消する
+            // （workspace_root/upper_dirへ到達できなければfs-allow付与自体が無意味なため）。
+            for target in &missing_traverse {
+                let (granted_nodes, result) = grant_traverse_chain(target, sid.as_psid());
+                for node in &granted_nodes {
+                    crate::traverse_ledger::record_traverse_grant(node);
+                }
+                if let Err(e) = result {
+                    return Err(AppContainerError::Preflight(format!(
+                        "failed to grant traverse ACE (admin, direct) for {}: {e}",
+                        target.display()
+                    )));
+                }
+            }
             let mut granted = Vec::new();
             let mut failures = Vec::new();
             for entry in &needs_elevation {
@@ -1715,11 +1780,38 @@ pub fn preflight(
             Ok((granted, failures))
         } else {
             netfilterd_chain_attempted = wfp_chain_pipe.is_some();
-            crate::privhelper::run_privileged_fs_allow_with_netfilterd_chain(
+            match crate::privhelper::run_privileged_workspace_access(
+                missing_traverse.clone(),
                 needs_elevation.clone(),
                 wfp_chain_pipe.clone(),
-            )
-            .map_err(|e| e.to_string())
+            ) {
+                Ok((traverse_granted, traverse_error, granted, failures)) => {
+                    for node in &traverse_granted {
+                        crate::traverse_ledger::record_traverse_grant(node);
+                    }
+                    if let Some(reason) = traverse_error {
+                        if !missing_traverse.is_empty() {
+                            return Err(AppContainerError::Preflight(format!(
+                                "failed to grant traverse ACE via privilege-separation helper: \
+                                 {reason}"
+                            )));
+                        }
+                    }
+                    Ok((granted, failures))
+                }
+                Err(e) => {
+                    // traverseが不足していて、それがprivhelper経由でも解消できなかった場合は
+                    // Tier2a自体が成立しない（fail-close、workspace FS I/Oが動かない）ため即座に
+                    // 打ち切る。UAC拒否（`ElevationDeclined`）もここに含まれる。
+                    if !missing_traverse.is_empty() {
+                        return Err(AppContainerError::Preflight(format!(
+                            "traverse ACE grant via privilege-separation helper failed (UAC \
+                             declined or helper error?): {e}"
+                        )));
+                    }
+                    Err(e.to_string())
+                }
+            }
         };
 
         match elevated {
@@ -1811,6 +1903,22 @@ pub fn preflight(
             }
         }
     }
+
+    // D-30: `FS_IO_PROBE_COMMAND`はprobe_dirへの書込を試みる。Cowモードではworkspace自体が
+    // 意図的にROなので、probe_dirをworkspace配下に置くと「workspaceが書けない」という
+    // Cowモードの正しい挙動を誤ってtraverse ACE不足として誤診断してしまう。probe_dirは
+    // 書込可能であるべき場所（DirectRw時はworkspace、Cow時はupper_dir）に置く。上のtraverse
+    // 自動付与を経た後の保険として、未知の原因によるFS I/O拒否をここで最終確認する。
+    let probe_base = match write_mode {
+        WorkspaceWriteMode::DirectRw => workspace_root,
+        WorkspaceWriteMode::Cow { upper_dir } => upper_dir.as_path(),
+    };
+    let tmp_dir = probe_base.join(format!(".harness-tier2a-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| AppContainerError::Preflight(e.to_string()))?;
+    let smoke_result = smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    smoke_result?;
+    smoke_test_harness_control_write_denied(sid.as_psid(), workspace_root)?;
 
     Ok(PreflightOutcome {
         warnings,
@@ -2308,6 +2416,16 @@ pub fn preview_traverse_chain(target: &Path, sid: PSID) -> Vec<TraversePreviewNo
             }
         })
         .collect()
+}
+
+/// `preflight`用: `target`の祖先チェーン（ドライブルートまで）が全ノードで既に
+/// `FILE_TRAVERSE|FILE_READ_ATTRIBUTES`を持つか（＝privhelper経由の自動付与が不要か）を、
+/// 一切書込まず判定する（`preview_traverse_chain`の読み取り専用ロジックをそのまま再利用、
+/// `--dry-run`用の表示整形は行わない）。
+pub fn traverse_chain_sufficient(target: &Path, sid: PSID) -> bool {
+    preview_traverse_chain(target, sid)
+        .iter()
+        .all(|node| node.already_sufficient)
 }
 
 /// `TIER1A-OPEN-ISSUES.md`課題1（traverse問題の検証プラン）の診断テスト群。
@@ -4555,6 +4673,9 @@ mod force_grant_gate_tests {
 #[cfg(all(windows, test))]
 mod cow_diagnostics {
     use super::*;
+    use crate::changes;
+    use crate::manifest::ManifestOp;
+    use crate::overlay::ApplyOptions;
 
     const COW_WRITE_PROBE_COMMAND: &str = "\
         $ErrorActionPreference = 'Stop'; \
@@ -4672,5 +4793,503 @@ mod cow_diagnostics {
         let workspace_content = std::fs::read_to_string(workspace.path().join("important.txt"))
             .expect("workspace important.txt must still exist");
         assert_eq!(workspace_content, "original");
+    }
+
+    /// シナリオ1+3: 単発`--cow`セッションで上書き・新規作成を行い、操作台帳（`.harness-cow-ops.jsonl`）
+    /// の記録内容と、`changes::apply_unified_changes`によるworkspace本体への反映・台帳のprune
+    /// までを一気通貫で確認する（`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`
+    /// §19、Phase 1/2の実機E2E）。
+    #[test]
+    #[ignore]
+    fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+        std::fs::write(workspace.path().join("important.txt"), "original")
+            .expect("seed important.txt");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        const CMD: &str = "\
+            $ErrorActionPreference = 'Stop'; \
+            try { \
+                Set-Content -LiteralPath 'important.txt' -Value 'overwritten-single' -NoNewline; \
+                New-Item -ItemType File -Path 'new.txt' -Force | Out-Null; \
+                Set-Content -LiteralPath 'new.txt' -Value 'created-single' -NoNewline; \
+                exit 0 \
+            } catch { \
+                Write-Output $_.Exception.Message; \
+                exit 9 \
+            }";
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", CMD],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+        let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+        let important = ledger
+            .iter()
+            .find(|c| c.path == "important.txt")
+            .expect("ledger must record important.txt");
+        assert_eq!(important.op, ManifestOp::Modify);
+        assert_eq!(
+            important.baseline_hash,
+            Some(harness_change_ledger::hash_bytes(b"original"))
+        );
+        let new = ledger
+            .iter()
+            .find(|c| c.path == "new.txt")
+            .expect("ledger must record new.txt");
+        assert_eq!(new.op, ManifestOp::Create);
+        assert_eq!(new.baseline_hash, None);
+
+        let report = changes::apply_unified_changes(
+            None,
+            Some((upper.path(), workspace.path())),
+            &ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            },
+        )
+        .expect("apply_unified_changes should succeed");
+        assert!(
+            report.applied.iter().any(|p| p == "important.txt"),
+            "applied={:?}",
+            report.applied
+        );
+        assert!(
+            report.applied.iter().any(|p| p == "new.txt"),
+            "applied={:?}",
+            report.applied
+        );
+        assert!(report.conflicts.is_empty(), "conflicts={:?}", report.conflicts);
+        assert!(report.hard_denied.is_empty(), "hard_denied={:?}", report.hard_denied);
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("important.txt")).unwrap(),
+            "overwritten-single"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("new.txt")).unwrap(),
+            "created-single"
+        );
+
+        let ledger_after = crate::workspace_ledger::read_cow_ledger(upper.path());
+        assert!(
+            ledger_after.is_empty(),
+            "applied entries must be pruned from the ledger: {ledger_after:?}"
+        );
+    }
+
+    /// シナリオ2+3: 同一workspaceに対する2つの`--cow`セッション（別々のupper）を並行実行し、
+    /// 互いのupperが混ざらないこと・workspace本体が両方から不変であることを確認したうえで、
+    /// 片方を先にapplyしもう片方を後からapplyすると、baseline hash不一致でconflictとして
+    /// 検知される（TOCTOU防止、`overlay.rs::apply()`と同じ意味論）ことを確認する。
+    #[test]
+    #[ignore]
+    fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper_a = tempfile::tempdir().expect("upper_a tempdir");
+        let upper_b = tempfile::tempdir().expect("upper_b tempdir");
+        std::fs::write(workspace.path().join("important.txt"), "original")
+            .expect("seed important.txt");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        // workspace本体へのRO ACEはworkspace単位で共有されるモードのため、同じ"ro"モードの
+        // 複数セッションに対して複数回`preflight`を呼んでも（`workspace_ledger::begin_workspace_mode`
+        // は他モードとの排他しか見ないため）衝突しない。**ただし各upper_dirへのRW ACEは
+        // upper_dirごとに個別に付与される**（`preflight`のCowブランチの`grant_ace_inheritable_rw(upper_dir, ..)`
+        // 参照）ため、upper_a・upper_bそれぞれについて`preflight`を呼ぶ必要がある
+        // （実機E2Eで発見: 1回しか呼ばないとpreflightされなかった側の子がACCESS_DENIEDで失敗する）。
+        preflight(
+            workspace.path(),
+            &[],
+            None,
+            &WorkspaceWriteMode::Cow {
+                upper_dir: upper_a.path().to_path_buf(),
+            },
+        )
+        .expect("preflight (cow, upper_a)");
+        preflight(
+            workspace.path(),
+            &[],
+            None,
+            &WorkspaceWriteMode::Cow {
+                upper_dir: upper_b.path().to_path_buf(),
+            },
+        )
+        .expect("preflight (cow, upper_b)");
+
+        fn probe_cmd(suffix: &str) -> String {
+            format!(
+                "$ErrorActionPreference = 'Stop'; \
+                 try {{ \
+                     Set-Content -LiteralPath 'important.txt' -Value 'overwritten-by-{suffix}' -NoNewline; \
+                     New-Item -ItemType File -Path 'new.txt' -Force | Out-Null; \
+                     Set-Content -LiteralPath 'new.txt' -Value 'created-by-{suffix}' -NoNewline; \
+                     exit 0 \
+                 }} catch {{ \
+                     Write-Output $_.Exception.Message; \
+                     exit 9 \
+                 }}"
+            )
+        }
+        let cmd_a = probe_cmd("a");
+        let cmd_b = probe_cmd("b");
+
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        // 両方を先にspawnしてから待つ（＝両プロセスが実際に同時にOS上で走っている状態を作る）。
+        let child_a = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", &cmd_a],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper_a.path(),
+            }),
+        )
+        .expect("spawn A with cow injection should succeed");
+        let child_b = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", &cmd_b],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper_b.path(),
+            }),
+        )
+        .expect("spawn B with cow injection should succeed");
+
+        let (stdout_a, stderr_a, code_a) = child_a
+            .write_stdin_read_output_and_wait(None)
+            .expect("child A should run to completion");
+        assert_eq!(code_a, 0, "stdout={stdout_a} stderr={stderr_a}");
+        let (stdout_b, stderr_b, code_b) = child_b
+            .write_stdin_read_output_and_wait(None)
+            .expect("child B should run to completion");
+        assert_eq!(code_b, 0, "stdout={stdout_b} stderr={stderr_b}");
+
+        let ledger_a = crate::workspace_ledger::read_cow_ledger(upper_a.path());
+        assert_eq!(
+            ledger_a.iter().find(|c| c.path == "important.txt").unwrap().op,
+            ManifestOp::Modify
+        );
+        assert_eq!(
+            std::fs::read_to_string(upper_a.path().join("important.txt")).unwrap(),
+            "overwritten-by-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(upper_a.path().join("new.txt")).unwrap(),
+            "created-by-a"
+        );
+        let ledger_b = crate::workspace_ledger::read_cow_ledger(upper_b.path());
+        assert_eq!(
+            ledger_b.iter().find(|c| c.path == "important.txt").unwrap().op,
+            ManifestOp::Modify
+        );
+        assert_eq!(
+            std::fs::read_to_string(upper_b.path().join("important.txt")).unwrap(),
+            "overwritten-by-b"
+        );
+        assert_eq!(
+            std::fs::read_to_string(upper_b.path().join("new.txt")).unwrap(),
+            "created-by-b"
+        );
+
+        // workspace本体は両セッションから見て不変のまま（境界＝ACLの再確認）。
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("important.txt")).unwrap(),
+            "original"
+        );
+        assert!(!workspace.path().join("new.txt").exists());
+
+        // セッションAを先に適用する。
+        let report_a = changes::apply_unified_changes(
+            None,
+            Some((upper_a.path(), workspace.path())),
+            &ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            },
+        )
+        .expect("apply A should succeed");
+        assert!(report_a.applied.iter().any(|p| p == "important.txt"));
+        assert!(report_a.applied.iter().any(|p| p == "new.txt"));
+        assert!(report_a.conflicts.is_empty(), "conflicts={:?}", report_a.conflicts);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("important.txt")).unwrap(),
+            "overwritten-by-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("new.txt")).unwrap(),
+            "created-by-a"
+        );
+
+        // セッションBを後から適用する。workspaceは既にAの内容へ変わっているため、Bのbaseline
+        // （important.txt="original"、new.txt=None＝新規作成想定）はどちらも現在値と食い違い、
+        // TOCTOU競合として拒否されるはず（`report.applied`は空、両方`conflicts`に入る）。
+        let report_b = changes::apply_unified_changes(
+            None,
+            Some((upper_b.path(), workspace.path())),
+            &ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            },
+        )
+        .expect("apply B should succeed (as an operation; entries land in conflicts)");
+        assert!(
+            report_b.applied.is_empty(),
+            "B's changes must not be applied over A's: applied={:?}",
+            report_b.applied
+        );
+        assert!(report_b.conflicts.iter().any(|p| p == "important.txt"));
+        assert!(report_b.conflicts.iter().any(|p| p == "new.txt"));
+
+        // Bのapply試行後もworkspaceはAの内容のまま変化していないこと。
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("important.txt")).unwrap(),
+            "overwritten-by-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("new.txt")).unwrap(),
+            "created-by-a"
+        );
+    }
+
+    /// リネームE2E: `NtSetInformationFile`の`FileRenameInformation`フック
+    /// （`rewrite_rename_target`）が実際にWindowsから渡される移動先パスを正しく解釈できるかを
+    /// 確認する探索的テスト。旧パスの`Delete`＋新パスの`Create`の2レコードに分解されること
+    /// （設計書§19.4）・upper側で実際にリネームが再現されること・applyでworkspace本体に
+    /// 反映されることを確認する。
+    #[test]
+    #[ignore]
+    fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+        std::fs::write(workspace.path().join("old.txt"), "original-content")
+            .expect("seed old.txt");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        const CMD: &str = "\
+            $ErrorActionPreference = 'Stop'; \
+            try { \
+                Rename-Item -LiteralPath 'old.txt' -NewName 'new.txt'; \
+                exit 0 \
+            } catch { \
+                Write-Output $_.Exception.Message; \
+                exit 9 \
+            }";
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", CMD],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+        let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+        let old_entry = ledger
+            .iter()
+            .find(|c| c.path == "old.txt")
+            .expect("ledger must record old.txt as deleted");
+        assert_eq!(old_entry.op, ManifestOp::Delete);
+        assert_eq!(
+            old_entry.baseline_hash,
+            Some(harness_change_ledger::hash_bytes(b"original-content"))
+        );
+        let new_entry = ledger
+            .iter()
+            .find(|c| c.path == "new.txt")
+            .expect("ledger must record new.txt as created");
+        assert_eq!(new_entry.op, ManifestOp::Create);
+        assert_eq!(new_entry.baseline_hash, None);
+
+        assert!(!upper.path().join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(upper.path().join("new.txt")).unwrap(),
+            "original-content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("old.txt")).unwrap(),
+            "original-content"
+        );
+        assert!(!workspace.path().join("new.txt").exists());
+
+        let report = changes::apply_unified_changes(
+            None,
+            Some((upper.path(), workspace.path())),
+            &ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            },
+        )
+        .expect("apply_unified_changes should succeed");
+        assert!(report.applied.iter().any(|p| p == "old.txt"), "applied={:?}", report.applied);
+        assert!(report.applied.iter().any(|p| p == "new.txt"), "applied={:?}", report.applied);
+
+        assert!(!workspace.path().join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("new.txt")).unwrap(),
+            "original-content"
+        );
+    }
+
+    /// 削除E2E: `FileDispositionInformation`/`FILE_DELETE_ON_CLOSE`＋`NtClose`フックの組合せと、
+    /// DLLが`run_shell`呼び出しごとに別プロセスへ再ロードされても台帳ファイルを読み直して
+    /// 「論理的に削除済み」集合を再構築できること（設計書§19.7）を、実際に2回子プロセスを
+    /// 起動して確認する。
+    #[test]
+    #[ignore]
+    fn cow_ledger_records_delete_persists_across_processes_and_applies() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+        std::fs::write(workspace.path().join("doomed.txt"), "to-be-deleted")
+            .expect("seed doomed.txt");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+
+        const DELETE_CMD: &str = "\
+            $ErrorActionPreference = 'Stop'; \
+            try { \
+                Remove-Item -LiteralPath 'doomed.txt' -Force; \
+                exit 0 \
+            } catch { \
+                Write-Output $_.Exception.Message; \
+                exit 9 \
+            }";
+        let child1 = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", DELETE_CMD],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+            }),
+        )
+        .expect("spawn (delete) with cow injection should succeed");
+        let (stdout1, stderr1, code1) = child1
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+        assert_eq!(code1, 0, "stdout={stdout1} stderr={stderr1}");
+
+        let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+        let entry = ledger
+            .iter()
+            .find(|c| c.path == "doomed.txt")
+            .expect("ledger must record doomed.txt as deleted");
+        assert_eq!(entry.op, ManifestOp::Delete);
+        assert_eq!(
+            entry.baseline_hash,
+            Some(harness_change_ledger::hash_bytes(b"to-be-deleted"))
+        );
+        assert!(!upper.path().join("doomed.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("doomed.txt")).unwrap(),
+            "to-be-deleted",
+            "workspace body must remain unchanged (fail-closed real delete)"
+        );
+
+        // 2回目の子プロセス（＝DLLが再ロードされる）で、台帳の再生により論理削除が
+        // 引き継がれていることを確認する。
+        const CHECK_CMD: &str = "\
+            (Test-Path -LiteralPath 'doomed.txt') | Write-Output; \
+            exit 0";
+        let child2 = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", CHECK_CMD],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+            }),
+        )
+        .expect("spawn (check) with cow injection should succeed");
+        let (stdout2, stderr2, code2) = child2
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+        assert_eq!(code2, 0, "stdout={stdout2} stderr={stderr2}");
+        assert_eq!(
+            stdout2.trim(),
+            "False",
+            "a freshly-loaded DLL must still treat doomed.txt as deleted (ledger replay, §19.7)"
+        );
+
+        let report = changes::apply_unified_changes(
+            None,
+            Some((upper.path(), workspace.path())),
+            &ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            },
+        )
+        .expect("apply_unified_changes should succeed");
+        assert!(report.applied.iter().any(|p| p == "doomed.txt"), "applied={:?}", report.applied);
+        assert!(!workspace.path().join("doomed.txt").exists());
     }
 }

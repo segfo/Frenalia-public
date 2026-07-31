@@ -966,6 +966,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-change-ledger"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harness-cli"
 version = "0.1.0"
 dependencies = [
@@ -1056,7 +1064,9 @@ dependencies = [
 name = "harness-redirector"
 version = "0.1.0"
 dependencies = [
+ "harness-change-ledger",
  "retour",
+ "serde_json",
  "windows",
 ]
 
@@ -1066,6 +1076,7 @@ version = "0.1.0"
 dependencies = [
  "cap-std",
  "directories",
+ "harness-change-ledger",
  "harness-core",
  "rand 0.9.4",
  "reqwest",

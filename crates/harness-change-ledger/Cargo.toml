@@ -1,0 +1,13 @@
+[package]
+name = "harness-change-ledger"
+version.workspace = true
+edition.workspace = true
+
+# CoW操作台帳（`.harness-cow-ops.jsonl`）のレコード型・ハッシュ関数・再生ロジック。
+# `crates/harness-redirector`（書く側、非信頼プロセスへ注入されるDLL）と`harness-sandbox`
+# （読む側・適用する側）の両方が参照するため、serdeのみに依存する最小クレートに保つ
+# （`harness-core`はasync-trait/futures/schemarsまで抱えており、DLLへ持ち込むには重い。
+# `plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` §19参照）。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

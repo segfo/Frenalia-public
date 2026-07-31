@@ -19,6 +19,7 @@
 //! （`StagingConfig.sandbox_dir`はworkspace_rootからの相対パス）に置くため、この`WorkspaceJail`
 //! 1つだけで実FS・オーバーレイの両方を仲介できる（新たなambient authorityを増やさない）。
 
+pub mod changes;
 pub mod manifest;
 pub mod overlay;
 pub mod read_scope;
@@ -30,6 +31,14 @@ pub mod privhelper;
 
 #[cfg(windows)]
 pub mod win_appcontainer;
+
+/// workspace本体/CoW upper_dirの生存管理（名前付きmutex）はWin32 API依存のためwindows専用。
+#[cfg(windows)]
+pub mod workspace_ledger;
+
+/// windows専用ではない（`harness fs list`のような表示系コマンドが非Windowsでも空台帳を
+/// 表示できるよう、元のmain.rs実装と同じく全プラットフォームでコンパイルする）。
+pub mod traverse_ledger;
 
 #[cfg(windows)]
 mod win_common;
@@ -64,6 +73,7 @@ pub mod smb_share;
 #[cfg(target_os = "linux")]
 pub mod linux_bwrap;
 
+pub use changes::{ChangeSource, UnifiedChangeEntry};
 pub use manifest::{ManifestOp, ManifestTarget};
 pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};
 pub use read_scope::{ReadScope, ReadScopeError};
