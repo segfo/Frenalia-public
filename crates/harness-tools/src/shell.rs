@@ -220,6 +220,10 @@ impl Tool for RunShellTool {
         let dur = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
         let mut env = harness_sandbox::build_child_env();
         append_path_extra(&mut env, &ctx.run_shell_path_extra);
+        // D-14b: モデル実行`git`のhooks/fsmonitor/pagerを無効化する（T-07対策、
+        // `harness_sandbox::git_hardening_env`のdoc参照）。envは全子孫プロセスへ自動継承される
+        // ため、`git`が孫プロセスとして起動されても届く。
+        env.extend(harness_sandbox::git_hardening_env());
 
         // 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15、
         // `plans/AppContainerを用いたドメインベース通信制御アーキテクチャ設計書.md` §5）。

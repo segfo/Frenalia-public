@@ -202,7 +202,13 @@ fn build_merge_attempt(
     std::fs::write(&theirs_path, theirs)?;
 
     // `-p`は結果を標準出力へ出すオプションで、`mine`ファイル自体を書き換えない。
+    // D-14b/D-06: harnessが内部起動するgitにもhooks/fsmonitor/pager無効化を適用する
+    // （`crate::git_hardening_env`のdoc参照）。envはallowlist方式のクリーンenvへ合成する。
+    let mut env = crate::secret_env::build_child_env();
+    env.extend(crate::secret_env::git_hardening_env());
     let output = Command::new(git)
+        .env_clear()
+        .envs(env)
         .arg("merge-file")
         .arg("-p")
         .arg("--diff3")

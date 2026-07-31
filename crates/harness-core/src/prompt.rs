@@ -144,6 +144,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
     if let Some(line) = render_cow(cow_upper_dir) {
         lines.push(line);
     }
+    lines.push(render_git_hardening());
     lines.push(render_read_scope(read_scope));
     lines.extend(render_shell_tier(shell_tier));
     if let Some(line) = render_net_proxy(net_proxy) {
@@ -240,6 +241,18 @@ fn render_cow(cow_upper_dir: &Option<PathBuf>) -> Option<String> {
             upper.display()
         )
     })
+}
+
+/// D-14b: モデル実行`git`は常にhooks/fsmonitor/pagerが無効化されている
+/// （`harness_sandbox::git_hardening_env`、`run_shell`のenvへ常時合成）。境界ではなく
+/// ハードニングなので、その旨を明示してモデルの誤診（「なぜpre-commit hookが走らないのか」等）を
+/// 防ぐ。Tier・staging等に依存しない常時trueの事実のため`EnvironmentFacts`に専用フィールドは
+/// 持たせない。
+fn render_git_hardening() -> String {
+    "gitの挙動: run_shellが起動するgitはhooks（core.hooksPath）・fsmonitor・pagerが常に\
+     無効化されています。pre-commit hook等は発火しません。これはセキュリティのハードニングで\
+     あり、既定のgit動作を変えるための解除手段ではありません。"
+        .to_string()
 }
 
 fn render_read_scope(read_scope: &ReadScopeConfig) -> String {
