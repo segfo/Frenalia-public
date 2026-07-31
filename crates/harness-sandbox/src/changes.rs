@@ -140,7 +140,15 @@ fn apply_cow_changes(
                 if let Some(parent) = workspace_abs.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::copy(&upper_abs, &workspace_abs).map(|_| ())
+                let copied = std::fs::copy(&upper_abs, &workspace_abs).map(|_| ());
+                if copied.is_ok() {
+                    // upper側の実体を消しておかないと、Redirectorの`copy_up`が
+                    // 「既にupperにある＝このセッションで一度触った」と誤認して、次の
+                    // 変更を台帳へ記録しなくなる（BUG-034）。ベストエフォート、失敗しても
+                    // commit自体は成功扱いにする（`overlay.rs::apply()`と同じ扱い）。
+                    let _ = std::fs::remove_file(&upper_abs);
+                }
+                copied
             }
         };
         result.map_err(SandboxError::Io)?;
@@ -171,4 +179,90 @@ pub fn discard_unified_changes(
     #[cfg(not(windows))]
     let _ = cow_upper_dir;
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use harness_change_ledger::{hash_bytes, now_millis, ChangeOp, CowOpEntry, COW_OPS_LEDGER_FILENAME};
+
+    fn write_ledger(upper_dir: &Path, entries: &[CowOpEntry]) {
+        let mut out = String::new();
+        for e in entries {
+            out.push_str(&serde_json::to_string(e).unwrap());
+            out.push('\n');
+        }
+        std::fs::write(upper_dir.join(COW_OPS_LEDGER_FILENAME), out).unwrap();
+    }
+
+    fn no_filter_opts() -> ApplyOptions<'static> {
+        ApplyOptions {
+            only_glob: None,
+            only_paths: None,
+            allow_ext: false,
+        }
+    }
+
+    /// BUG-034回帰テスト: commit（`apply_cow_changes`）はupper側の実体を消し忘れると、
+    /// Redirectorの`copy_up`（`upper_path.exists()`で「既に触った」と判定する冪等ガード）が
+    /// 次の変更を台帳へ記録しなくなる。ここでは`copy_up`自体は動かさず、その代わりに
+    /// 「1回目のcommit後、2回目の変更が正しく新規エントリとして台帳経由で適用できるか」を
+    /// 直接検証する（`copy_up`が正しく動く前提＝upper側の実体が残っていないことが必要）。
+    #[test]
+    fn commit_removes_upper_copy_so_next_edit_is_tracked_again() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+
+        std::fs::write(upper.path().join("a.txt"), "first").unwrap();
+        write_ledger(
+            upper.path(),
+            &[CowOpEntry {
+                op: ChangeOp::Create,
+                path: "a.txt".to_string(),
+                baseline_hash: None,
+                ts_unix_millis: now_millis(),
+            }],
+        );
+
+        let report1 =
+            apply_unified_changes(None, Some((upper.path(), workspace.path())), &no_filter_opts())
+                .unwrap();
+        assert_eq!(report1.applied, vec!["a.txt".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+            "first"
+        );
+        assert!(
+            !upper.path().join("a.txt").exists(),
+            "commit後はupper側の実体が削除されているべき（BUG-034）"
+        );
+
+        // 2回目の変更。`copy_up`は実workspace側の現在内容（"first"）をbaselineとして
+        // 記録するはずなので、そのハッシュを使う。
+        let baseline_hash = hash_bytes(b"first");
+        std::fs::write(upper.path().join("a.txt"), "second").unwrap();
+        write_ledger(
+            upper.path(),
+            &[CowOpEntry {
+                op: ChangeOp::Modify,
+                path: "a.txt".to_string(),
+                baseline_hash: Some(baseline_hash),
+                ts_unix_millis: now_millis(),
+            }],
+        );
+
+        let report2 =
+            apply_unified_changes(None, Some((upper.path(), workspace.path())), &no_filter_opts())
+                .unwrap();
+        assert_eq!(
+            report2.applied,
+            vec!["a.txt".to_string()],
+            "2回目の変更も検知・適用されるべき（BUG-034の再発防止）"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+            "second"
+        );
+        assert!(!upper.path().join("a.txt").exists());
+    }
 }
