@@ -156,6 +156,23 @@ fn get_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
+/// BUG-033調査用の診断計装（`docs/bugs/BUG-033.md`参照、再発時の再調査用に残置）。
+/// releaseビルドでは`cfg!(debug_assertions)`により本体が定数畳み込みで消えるため、配布
+/// バイナリには影響しない。`%TEMP%\harness-cow-debug.log`へ無条件で追記する。CONFIG初期化前の
+/// 呼び出しでも書けるよう`Config`に依存しない。`--cow`のフック呼び出し頻度は対話セッションの
+/// シェルコマンド数程度で済むため、ログ肥大やI/O再入（`copy_up`同様に自分自身のフックへ
+/// 戻ってくる可能性はあるが、`%TEMP%`はworkspace外なので`workspace_relative`が`None`を返し
+/// 無限ループにはならない）の実害は無い想定。
+fn debug_log(msg: &str) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let path = std::env::temp_dir().join("harness-cow-debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{}] {msg}", now_millis());
+    }
+}
+
 /// `OBJECT_ATTRIBUTES.ObjectName`（`UNICODE_STRING`、UTF-16・非NUL終端）をRustの`String`へ。
 /// `RootDirectory`が`Some`（相対open）の場合は、このDLLの最小スコープでは解決せず
 /// `None`を返す（相対openはworkspace外判定ができないため素通しする、§16「非対応パス形は
@@ -165,7 +182,29 @@ unsafe fn object_attributes_path(oa: *const OBJECT_ATTRIBUTES) -> Option<PathBuf
         return None;
     }
     let oa = unsafe { &*oa };
-    if !oa.RootDirectory.is_invalid() && oa.RootDirectory.0 as isize != 0 {
+    let root_dir_value = oa.RootDirectory.0 as isize;
+    let is_relative = !oa.RootDirectory.is_invalid() && root_dir_value != 0;
+    // ObjectNameは診断ログのためRootDirectoryの有無に関わらず読む（本来のロジックはこの下で
+    // `is_relative`ならNoneを返す従来通りの挙動を維持する）。
+    let raw_name = if !oa.ObjectName.is_null() {
+        let us = unsafe { &*oa.ObjectName };
+        if us.Buffer.is_null() || us.Length == 0 {
+            String::new()
+        } else {
+            let len_u16 = (us.Length as usize) / 2;
+            let slice = unsafe { std::slice::from_raw_parts(us.Buffer.0, len_u16) };
+            String::from_utf16_lossy(slice)
+        }
+    } else {
+        String::new()
+    };
+    if raw_name.to_ascii_lowercase().contains("test.txt") {
+        debug_log(&format!(
+            "object_attributes_path: root_dir={root_dir_value:#x} is_relative={is_relative} \
+             raw_name={raw_name:?}"
+        ));
+    }
+    if is_relative {
         return None;
     }
     let name_ptr = oa.ObjectName;
@@ -431,9 +470,25 @@ unsafe extern "system" fn hooked_nt_create_file(
         ) {
             if let Some(rel) = workspace_relative(cfg, &path) {
                 let rel_str = rel_to_string(&rel);
+                let is_probe = rel_str.to_ascii_lowercase().contains("test.txt");
+                if is_probe {
+                    debug_log(&format!(
+                        "hooked_nt_create_file: rel={rel_str:?} desired_access={:#x} \
+                         disposition={:#x} write_intent={} upper_exists={}",
+                        desired_access.0,
+                        create_disposition.0,
+                        is_write_intent(desired_access.0, Some(create_disposition.0)),
+                        cfg.upper_dir.join(&rel).is_file(),
+                    ));
+                }
                 if let Some(status) =
                     check_deleted(&rel_str, is_create_capable_disposition(create_disposition.0))
                 {
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_create_file: rel={rel_str:?} check_deleted short-circuit status={status:?}"
+                        ));
+                    }
                     return status;
                 }
                 if is_write_intent(desired_access.0, Some(create_disposition.0)) {
@@ -459,6 +514,12 @@ unsafe extern "system" fn hooked_nt_create_file(
                             ea_length,
                         )
                     };
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_create_file: rel={rel_str:?} branch=write-redirect \
+                             upper_path={upper_path:?} status={status:?}"
+                        ));
+                    }
                     track_new_handle(file_handle, status, &rel_str, create_options.0);
                     return status;
                 }
@@ -488,6 +549,12 @@ unsafe extern "system" fn hooked_nt_create_file(
                             ea_length,
                         )
                     };
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_create_file: rel={rel_str:?} branch=read-through \
+                             upper_path={upper_path:?} status={status:?}"
+                        ));
+                    }
                     track_new_handle(file_handle, status, &rel_str, create_options.0);
                     return status;
                 }
@@ -511,6 +578,12 @@ unsafe extern "system" fn hooked_nt_create_file(
                         ea_length,
                     )
                 };
+                if is_probe {
+                    debug_log(&format!(
+                        "hooked_nt_create_file: rel={rel_str:?} branch=passthrough-no-upper \
+                         status={status:?}"
+                    ));
+                }
                 track_new_handle(file_handle, status, &rel_str, create_options.0);
                 return status;
             }
@@ -566,9 +639,23 @@ unsafe extern "system" fn hooked_nt_open_file(
         ) {
             if let Some(rel) = workspace_relative(cfg, &path) {
                 let rel_str = rel_to_string(&rel);
+                let is_probe = rel_str.to_ascii_lowercase().contains("test.txt");
+                if is_probe {
+                    debug_log(&format!(
+                        "hooked_nt_open_file: rel={rel_str:?} desired_access={desired_access:#x} \
+                         write_intent={} upper_exists={}",
+                        is_write_intent(desired_access, None),
+                        cfg.upper_dir.join(&rel).is_file(),
+                    ));
+                }
                 // `NtOpenFile`は既存ファイルを開く操作のみ（`FILE_OPEN`相当）のため、
                 // 論理削除済みなら常に失敗させる（再作成の余地は無い）。
                 if let Some(status) = check_deleted(&rel_str, false) {
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_open_file: rel={rel_str:?} check_deleted short-circuit status={status:?}"
+                        ));
+                    }
                     return status;
                 }
                 if is_write_intent(desired_access, None) {
@@ -589,6 +676,12 @@ unsafe extern "system" fn hooked_nt_open_file(
                             open_options,
                         )
                     };
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_open_file: rel={rel_str:?} branch=write-redirect \
+                             upper_path={upper_path:?} status={status:?}"
+                        ));
+                    }
                     track_new_handle(file_handle, status, &rel_str, open_options);
                     return status;
                 }
@@ -609,6 +702,12 @@ unsafe extern "system" fn hooked_nt_open_file(
                             open_options,
                         )
                     };
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_open_file: rel={rel_str:?} branch=read-through \
+                             upper_path={upper_path:?} status={status:?}"
+                        ));
+                    }
                     track_new_handle(file_handle, status, &rel_str, open_options);
                     return status;
                 }
@@ -623,6 +722,12 @@ unsafe extern "system" fn hooked_nt_open_file(
                         open_options,
                     )
                 };
+                if is_probe {
+                    debug_log(&format!(
+                        "hooked_nt_open_file: rel={rel_str:?} branch=passthrough-no-upper \
+                         status={status:?}"
+                    ));
+                }
                 track_new_handle(file_handle, status, &rel_str, open_options);
                 return status;
             }
@@ -809,7 +914,20 @@ unsafe extern "system" fn hooked_nt_query_full_attributes_file(
         ) {
             if let Some(rel) = workspace_relative(cfg, &path) {
                 let rel_str = rel_to_string(&rel);
+                let is_probe = rel_str.to_ascii_lowercase().contains("test.txt");
+                if is_probe {
+                    debug_log(&format!(
+                        "hooked_nt_query_full_attributes_file: rel={rel_str:?} upper_exists={}",
+                        cfg.upper_dir.join(&rel).is_file(),
+                    ));
+                }
                 if let Some(status) = check_deleted(&rel_str, false) {
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_query_full_attributes_file: rel={rel_str:?} \
+                             check_deleted short-circuit status={status:?}"
+                        ));
+                    }
                     return status;
                 }
                 // read-through: `Test-Path`/`.NET File.Exists`が使うこの経路も、upperに版が
@@ -820,7 +938,20 @@ unsafe extern "system" fn hooked_nt_query_full_attributes_file(
                         unsafe { build_redirected_oa(object_attributes, &upper_wide) };
                     redirected_oa.ObjectName = &mut redirected_name;
                     let hook = QUERY_FULL_ATTR_HOOK.get().expect("hook installed");
-                    return unsafe { hook.call(&redirected_oa, file_information) };
+                    let status = unsafe { hook.call(&redirected_oa, file_information) };
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_query_full_attributes_file: rel={rel_str:?} \
+                             branch=read-through upper_path={upper_path:?} status={status:?}"
+                        ));
+                    }
+                    return status;
+                }
+                if is_probe {
+                    debug_log(&format!(
+                        "hooked_nt_query_full_attributes_file: rel={rel_str:?} \
+                         branch=passthrough-no-upper"
+                    ));
                 }
             }
         }
@@ -840,7 +971,20 @@ unsafe extern "system" fn hooked_nt_query_attributes_file(
         ) {
             if let Some(rel) = workspace_relative(cfg, &path) {
                 let rel_str = rel_to_string(&rel);
+                let is_probe = rel_str.to_ascii_lowercase().contains("test.txt");
+                if is_probe {
+                    debug_log(&format!(
+                        "hooked_nt_query_attributes_file: rel={rel_str:?} upper_exists={}",
+                        cfg.upper_dir.join(&rel).is_file(),
+                    ));
+                }
                 if let Some(status) = check_deleted(&rel_str, false) {
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_query_attributes_file: rel={rel_str:?} \
+                             check_deleted short-circuit status={status:?}"
+                        ));
+                    }
                     return status;
                 }
                 // read-through（`hooked_nt_query_full_attributes_file`と同じ理由）。
@@ -850,7 +994,20 @@ unsafe extern "system" fn hooked_nt_query_attributes_file(
                         unsafe { build_redirected_oa(object_attributes, &upper_wide) };
                     redirected_oa.ObjectName = &mut redirected_name;
                     let hook = QUERY_ATTR_HOOK.get().expect("hook installed");
-                    return unsafe { hook.call(&redirected_oa, file_information) };
+                    let status = unsafe { hook.call(&redirected_oa, file_information) };
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_query_attributes_file: rel={rel_str:?} \
+                             branch=read-through upper_path={upper_path:?} status={status:?}"
+                        ));
+                    }
+                    return status;
+                }
+                if is_probe {
+                    debug_log(&format!(
+                        "hooked_nt_query_attributes_file: rel={rel_str:?} \
+                         branch=passthrough-no-upper"
+                    ));
                 }
             }
         }
