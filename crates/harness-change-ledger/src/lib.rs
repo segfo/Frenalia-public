@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 /// （`.harness-cow-session.json`と同じ階層、命名も揃える）。
 pub const COW_OPS_LEDGER_FILENAME: &str = ".harness-cow-ops.jsonl";
 
+/// baseline内容ミラーのディレクトリ名。`<upper_dir>/.harness-cow-baseline/<rel>`に
+/// セッションが最初に触った瞬間の実workspace内容を保存する（3-way merge用の材料、
+/// `harness resolve`が読む。台帳の`baseline_hash`はハッシュ値のみでmerge材料にならない）。
+pub const COW_BASELINE_DIRNAME: &str = ".harness-cow-baseline";
+
 /// 操作種別。移動/リネームには専用の種別を作らず「旧パスの`Delete`＋新パスの`Create`」の
 /// 2レコードへ分解して記録する（§19「移動・リネーム・コピー＋削除の扱い」決定事項）。
 ///

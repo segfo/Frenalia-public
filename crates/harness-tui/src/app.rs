@@ -73,6 +73,8 @@ pub enum SlashCommand {
 /// - `/fsstage commit <file>`: 指定ファイル1件だけを非対話で即commit
 /// - `/fsstage commit_all`: 全件を非対話で即commit
 /// - `/fsstage discard`: 全破棄（非対話、パネルを開かない）
+/// - `/fsstage resolve` `/fsstage resolve <path>`: コンフリクト解消（非対話、結果を
+///   transcriptへ積むだけ、パネルは開かない）。省略時は全コンフリクト対象、指定時は1件だけ。
 #[derive(Debug, Clone, PartialEq)]
 pub enum FsStageCommand {
     List,
@@ -80,6 +82,7 @@ pub enum FsStageCommand {
     CommitAll,
     CommitFile(String),
     Discard,
+    Resolve(Option<String>),
 }
 
 /// `/`始まりの入力行をパースする。不正なコマンド/引数は`Err(理由)`。
@@ -114,6 +117,8 @@ fn parse_fsstage_subcommand(rest: &str) -> Result<FsStageCommand, String> {
         "commit" => Ok(FsStageCommand::CommitFile(sub_rest.to_string())),
         "commit_all" => Ok(FsStageCommand::CommitAll),
         "discard" => Ok(FsStageCommand::Discard),
+        "resolve" if sub_rest.is_empty() => Ok(FsStageCommand::Resolve(None)),
+        "resolve" => Ok(FsStageCommand::Resolve(Some(sub_rest.to_string()))),
         other => Err(format!("unknown /fsstage subcommand: {other}")),
     }
 }
@@ -141,6 +146,10 @@ pub enum Action {
     ListChanges,
     /// 変更パネルで`x`（破棄）を押した結果、または`/fsstage discard`（非対話）。
     DiscardChanges,
+    /// `/fsstage resolve [path]`（非対話、パネルを開かない）。`Some(path)`なら1件だけ、
+    /// `None`なら全コンフリクト対象。呼び出し側（`harness-tui::run`）が
+    /// `harness_sandbox::resolve`を叩き、エディタ起動の前後で端末を中断・復帰させる。
+    ResolveChanges(Option<String>),
 }
 
 /// 変更（changes）パネルの表示用1行。`ChangeEntry`本体に加え、差分プレビュー
@@ -378,6 +387,7 @@ impl AppState {
                         FsStageCommand::CommitAll => Action::CommitAllChanges,
                         FsStageCommand::CommitFile(path) => Action::CommitChanges(vec![path]),
                         FsStageCommand::Discard => Action::DiscardChanges,
+                        FsStageCommand::Resolve(path) => Action::ResolveChanges(path),
                     })
                 }
                 Ok(cmd) => {
@@ -970,6 +980,16 @@ mod tests {
         assert_eq!(
             parse_slash_command("/fsstage discard"),
             Ok(SlashCommand::FsStage(FsStageCommand::Discard))
+        );
+        assert_eq!(
+            parse_slash_command("/fsstage resolve"),
+            Ok(SlashCommand::FsStage(FsStageCommand::Resolve(None)))
+        );
+        assert_eq!(
+            parse_slash_command("/fsstage resolve a/b.txt"),
+            Ok(SlashCommand::FsStage(FsStageCommand::Resolve(Some(
+                "a/b.txt".to_string()
+            ))))
         );
         assert!(parse_slash_command("/fsstage nope").is_err());
     }

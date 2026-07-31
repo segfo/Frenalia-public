@@ -200,6 +200,16 @@ impl SandboxFs {
             .join(key)
     }
 
+    /// baseline内容ミラー（`resolve`コマンドの3-way merge材料、DESIGN「baseline内容の保存」）。
+    /// `overlay_path`と対になるが別ディレクトリなので`tree`/`_ext`実体と衝突しない。
+    fn baseline_mirror_rel(&self, rel: &Path) -> PathBuf {
+        self.sandbox_dir
+            .as_ref()
+            .expect("sandbox_dir present")
+            .join("baseline")
+            .join(rel)
+    }
+
     fn classify_for_write(&self, path: &str) -> Result<Target, SandboxError> {
         let p = Path::new(path);
         if p.is_absolute() {
@@ -322,11 +332,12 @@ impl SandboxFs {
             }
             Target::Tree { rel } => {
                 let overlay_rel = self.tree_overlay_rel(&rel);
-                let baseline_hash = self
-                    .jail
-                    .read_to_string(&normalize_str(&rel))
-                    .ok()
-                    .map(|s| hash_content(&s));
+                let baseline_content = self.jail.read_to_string(&normalize_str(&rel)).ok();
+                let baseline_hash = baseline_content.as_deref().map(hash_content);
+                if let Some(base) = &baseline_content {
+                    let baseline_rel = self.baseline_mirror_rel(&rel);
+                    self.jail.write_string(&normalize_str(&baseline_rel), base)?;
+                }
                 self.jail
                     .write_string(&normalize_str(&overlay_rel), content)?;
                 let op = if baseline_hash.is_none() {
@@ -346,9 +357,12 @@ impl SandboxFs {
             }
             Target::Ext { key, original } => {
                 let overlay_rel = self.ext_overlay_rel(&key);
-                let baseline_hash = std::fs::read_to_string(Path::new(&original))
-                    .ok()
-                    .map(|s| hash_content(&s));
+                let baseline_content = std::fs::read_to_string(Path::new(&original)).ok();
+                let baseline_hash = baseline_content.as_deref().map(hash_content);
+                if let Some(base) = &baseline_content {
+                    let baseline_rel = self.baseline_mirror_rel(Path::new(&key));
+                    self.jail.write_string(&normalize_str(&baseline_rel), base)?;
+                }
                 self.jail
                     .write_string(&normalize_str(&overlay_rel), content)?;
                 let op = if baseline_hash.is_none() {
@@ -561,6 +575,63 @@ impl SandboxFs {
         Ok(report)
     }
 
+    /// `overlay_path`（`change_set()`が返すworkspace相対パス）が指すオーバーレイ実体を読む
+    /// （`resolve`の`mine`側の材料、Tree/Ext両対応）。
+    pub fn overlay_content(&self, overlay_path: &str) -> Result<String, SandboxError> {
+        Ok(self.jail.read_to_string(overlay_path)?)
+    }
+
+    /// `overlay_path`と対になるbaselineミラー（`baseline/<rel-or-key>`）があれば読む
+    /// （`resolve`の`base`側の材料。無ければ`None`——本機能導入前に発生したコンフリクト等）。
+    pub fn baseline_mirror_content(&self, overlay_path: &str) -> Option<String> {
+        let sandbox_dir = self.sandbox_dir.as_ref()?;
+        let rel_within = Path::new(overlay_path).strip_prefix(sandbox_dir).ok()?;
+        // `overlay_path`は`<sandbox_dir>/tree/<rel>`または`<sandbox_dir>/_ext/<key>`の形
+        // （`tree_overlay_rel`/`ext_overlay_rel`参照）。先頭の`tree`/`_ext`を読み飛ばし、
+        // 残りを`baseline/`配下の同じ相対位置として読む。
+        let mut components = rel_within.components();
+        components.next()?;
+        let remainder: PathBuf = components.collect();
+        let mirror_rel = self.baseline_mirror_rel(&remainder);
+        self.jail.read_to_string(&normalize_str(&mirror_rel)).ok()
+    }
+
+    /// 実workspace側の現在内容（`resolve`の`theirs`側の材料）。`target`がTreeなら`path`は
+    /// workspace相対、Extなら絶対パス。
+    pub fn real_content(&self, target: ManifestTarget, path: &str) -> Option<String> {
+        match target {
+            ManifestTarget::Tree => self.jail.read_to_string(path).ok(),
+            ManifestTarget::Ext => std::fs::read_to_string(Path::new(path)).ok(),
+            ManifestTarget::Live | ManifestTarget::Cow => None,
+        }
+    }
+
+    /// `resolve`が3-way mergeの結果を確定させる: 実workspaceへ書き、オーバーレイ実体・
+    /// マニフェストエントリを除去する（`apply()`の該当ステップを単一エントリに適用したもの）。
+    pub fn finalize_resolved(
+        &self,
+        target: ManifestTarget,
+        path: &str,
+        overlay_path: &str,
+        content: &str,
+    ) -> Result<(), SandboxError> {
+        match target {
+            ManifestTarget::Tree => self.jail.write_string(path, content)?,
+            ManifestTarget::Ext => {
+                let target_path = Path::new(path);
+                if let Some(parent) = target_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(target_path, content)?;
+            }
+            ManifestTarget::Live | ManifestTarget::Cow => return Ok(()),
+        }
+        if !overlay_path.is_empty() {
+            let _ = self.jail.remove_file(overlay_path);
+        }
+        self.prune_manifest(&[(target, path.to_string())])
+    }
+
     /// 適用済みエントリをマニフェストから除去する（再適用/永続的な"pending"表示を防ぐ）。
     fn prune_manifest(&self, applied: &[(ManifestTarget, String)]) -> Result<(), SandboxError> {
         let Some(manifest_rel) = self.manifest_path() else {
@@ -643,6 +714,30 @@ mod tests {
         assert_eq!(changes[0].target, ManifestTarget::Tree);
         assert_eq!(changes[0].op, ManifestOp::Create);
         assert_eq!(changes[0].path, "newfile.txt");
+    }
+
+    #[test]
+    fn staged_modify_writes_baseline_mirror_of_pre_edit_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "original").unwrap();
+        let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
+
+        fs.write_string("a.txt", "edited").unwrap();
+
+        let baseline_abs = dir.path().join(".harness/sandbox/s1/baseline/a.txt");
+        assert_eq!(std::fs::read_to_string(&baseline_abs).unwrap(), "original");
+        // real workspace must stay untouched by staged writes.
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "original");
+    }
+
+    #[test]
+    fn staged_create_of_new_path_writes_no_baseline_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
+
+        fs.write_string("newfile.txt", "staged content").unwrap();
+
+        assert!(!dir.path().join(".harness/sandbox/s1/baseline/newfile.txt").exists());
     }
 
     #[cfg(windows)]

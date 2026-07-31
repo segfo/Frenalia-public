@@ -131,6 +131,20 @@ enum Commands {
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },
+    /// `apply`がbaseline照合の相違で拒否したコンフリクトを`git merge-file`の3-way mergeで
+    /// 解消する（既定は`--source all`）。非コンフリクト分はこのコマンドの実行過程で先に
+    /// 実FSへ適用される（`apply`と同じ経路を通るため）。自動マージできなかった分だけ
+    /// `$VISUAL`/`$EDITOR`（Windowsは既定`notepad.exe`）を起動して手で解消させる。
+    Resolve {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long = "source", value_enum, default_value_t = ChangeSourceArg::All)]
+        source: ChangeSourceArg,
+        /// 自動マージできた分もエディタで確認したい場合に指定する（既定はオフ＝
+        /// 自動マージできた分は即適用する）。
+        #[arg(long = "always-edit", default_value_t = false)]
+        always_edit: bool,
+    },
     /// 変更を全て破棄する（既定は`--source all`）。
     Discard {
         #[arg(long)]
@@ -1028,6 +1042,7 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
             ..
         } => (session.clone(), *source, Some(*output_format)),
         Commands::Discard { session, source } => (session.clone(), *source, None),
+        Commands::Resolve { session, source, .. } => (session.clone(), *source, None),
         // `Fs`/`Tier3`/`Prompt`はmain()側でそれぞれ専用の振り分け先へ処理済みで、ここには
         // 到達しない（workspace sandboxのstaging設定を一切必要としないため、`SandboxFs`を開く
         // このパスとは責務が別）。
@@ -1170,6 +1185,73 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                 }
             }
             if has_conflicts_or_blocked {
+                ExitCode::from(4)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Commands::Resolve { always_edit, .. } => {
+            let cow_target = cow_upper_dir.as_deref().and_then(cow_apply_target);
+            let cow_pair = cow_target.as_ref().map(|(d, w)| (d.as_path(), w.as_path()));
+            let (report, prepared) =
+                match harness_sandbox::resolve::prepare_resolve(staged_fs.as_ref(), cow_pair) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("resolve failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            for p in &report.applied {
+                println!("applied (no conflict): {p}");
+            }
+            if report.conflicts.is_empty() {
+                println!("no conflicts to resolve");
+                return ExitCode::SUCCESS;
+            }
+
+            let mut resolved = 0usize;
+            let mut failed = 0usize;
+            for attempt in &prepared.attempts {
+                if always_edit || attempt.needs_edit {
+                    let mut cmd = match harness_sandbox::resolve::editor_command() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("{}: {e}", attempt.path);
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    match cmd.arg(&attempt.merged_path).status() {
+                        Ok(s) if s.success() => {}
+                        Ok(s) => {
+                            eprintln!("{}: editor exited with {s}; skipping", attempt.path);
+                            failed += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("{}: failed to launch editor: {e}", attempt.path);
+                            failed += 1;
+                            continue;
+                        }
+                    }
+                }
+                match attempt.finalize(staged_fs.as_ref(), cow_pair) {
+                    Ok(()) => {
+                        println!("resolved: {}", attempt.path);
+                        resolved += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("{}: failed to finalize: {e}", attempt.path);
+                        failed += 1;
+                    }
+                }
+            }
+            for s in &prepared.skipped {
+                println!("skipped: {} ({})", s.path, s.reason);
+                failed += 1;
+            }
+            println!("{resolved} resolved, {failed} skipped/failed");
+            if failed > 0 {
                 ExitCode::from(4)
             } else {
                 ExitCode::SUCCESS

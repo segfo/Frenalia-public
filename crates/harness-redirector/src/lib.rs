@@ -32,7 +32,10 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use harness_change_ledger::{hash_bytes, now_millis, parse_ledger, ChangeOp, CowOpEntry, COW_OPS_LEDGER_FILENAME};
+use harness_change_ledger::{
+    hash_bytes, now_millis, parse_ledger, ChangeOp, CowOpEntry, COW_BASELINE_DIRNAME,
+    COW_OPS_LEDGER_FILENAME,
+};
 use retour::GenericDetour;
 use windows::core::PCWSTR;
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -252,7 +255,18 @@ fn baseline_hash_for(cfg: &Config, rel: &str) -> Option<String> {
         return v.clone();
     }
     let workspace_abs = cfg.workspace_root.join(rel.replace('/', "\\"));
-    let hash = std::fs::read(&workspace_abs).ok().map(|b| hash_bytes(&b));
+    let bytes = std::fs::read(&workspace_abs).ok();
+    if let Some(b) = &bytes {
+        let mirror_path = cfg
+            .upper_dir
+            .join(COW_BASELINE_DIRNAME)
+            .join(rel.replace('/', "\\"));
+        if let Some(parent) = mirror_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&mirror_path, b);
+    }
+    let hash = bytes.as_ref().map(|b| hash_bytes(b));
     guard.insert(rel.to_string(), hash.clone());
     hash
 }
@@ -1046,4 +1060,53 @@ extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c_void) 
         }
     }
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `baseline_hash_for`は初回アクセス時（キャッシュmiss）にbaseline内容を
+    /// `.harness-cow-baseline/<rel>`へミラーする（設計書「baseline内容の保存」）。
+    /// `rel`にテスト固有のユニークなキーを使い、プロセスグローバルな`baseline_cache`を
+    /// 他のテストと共有しても衝突しないようにする。
+    #[test]
+    fn baseline_hash_for_writes_mirror_on_first_access() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("baseline_mirror_probe.txt"), "original").unwrap();
+        let cfg = Config {
+            workspace_root: workspace.path().to_path_buf(),
+            upper_dir: upper.path().to_path_buf(),
+        };
+
+        let hash = baseline_hash_for(&cfg, "baseline_mirror_probe.txt");
+
+        assert!(hash.is_some());
+        let mirror = upper
+            .path()
+            .join(COW_BASELINE_DIRNAME)
+            .join("baseline_mirror_probe.txt");
+        assert_eq!(std::fs::read_to_string(mirror).unwrap(), "original");
+    }
+
+    /// 新規作成（baselineが存在しない）パスはミラーを書かない。
+    #[test]
+    fn baseline_hash_for_writes_no_mirror_when_path_does_not_exist() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            workspace_root: workspace.path().to_path_buf(),
+            upper_dir: upper.path().to_path_buf(),
+        };
+
+        let hash = baseline_hash_for(&cfg, "does_not_exist_probe.txt");
+
+        assert!(hash.is_none());
+        assert!(!upper
+            .path()
+            .join(COW_BASELINE_DIRNAME)
+            .join("does_not_exist_probe.txt")
+            .exists());
+    }
 }

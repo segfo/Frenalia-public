@@ -11,6 +11,7 @@ harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.18"
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 which = "7"

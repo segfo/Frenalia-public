@@ -23,6 +23,7 @@ pub mod changes;
 pub mod manifest;
 pub mod overlay;
 pub mod read_scope;
+pub mod resolve;
 pub mod secret_env;
 pub mod shell_tier;
 

@@ -24,33 +24,54 @@ pub struct TerminalGuard;
 
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        // マウスホイールでのtranscriptスクロール用（`AppState::on_mouse`参照）。
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-        if supports_keyboard_enhancement().unwrap_or(false) {
-            execute!(
-                io::stdout(),
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )?;
-            KEYBOARD_ENHANCEMENT_ENABLED.store(true, Ordering::SeqCst);
-        }
+        enter_screen()?;
         install_panic_hook();
         Ok(Self)
+    }
+
+    /// 外部エディタ（`git merge-file`のconflict marker解消、`resolve.rs`参照）のような対話
+    /// 子プロセスへ端末を明け渡す前に呼ぶ。代替スクリーン・raw mode・マウスキャプチャを一時的に
+    /// 解除するだけで、`Drop`と違いpanic hookは触らない（プロセス自体は継続するため）。
+    /// `resume()`と対で使うこと——`suspend()`だけ呼んで`resume()`を呼ばずに終了すると、
+    /// 端末が生モードのまま残る。
+    pub fn suspend(&self) -> io::Result<()> {
+        leave_screen()
+    }
+
+    /// `suspend()`で明け渡した端末を取り戻す。呼び出し側は戻り値に関わらず、その後
+    /// 強制再描画（`ratatui::Terminal::clear()`等）を行うこと（エディタが残した内容を消すため）。
+    pub fn resume(&self) -> io::Result<()> {
+        enter_screen()
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore();
+        let _ = leave_screen();
     }
 }
 
-fn restore() {
-    if KEYBOARD_ENHANCEMENT_ENABLED.swap(false, Ordering::SeqCst) {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+fn enter_screen() -> io::Result<()> {
+    enable_raw_mode()?;
+    // マウスホイールでのtranscriptスクロール用（`AppState::on_mouse`参照）。
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    if supports_keyboard_enhancement().unwrap_or(false) {
+        execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+        KEYBOARD_ENHANCEMENT_ENABLED.store(true, Ordering::SeqCst);
     }
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    Ok(())
+}
+
+fn leave_screen() -> io::Result<()> {
+    if KEYBOARD_ENHANCEMENT_ENABLED.swap(false, Ordering::SeqCst) {
+        execute!(io::stdout(), PopKeyboardEnhancementFlags)?;
+    }
+    disable_raw_mode()?;
+    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    Ok(())
 }
 
 /// panicで`TerminalGuard::drop`が走らない経路（unwind前にprintされる等）に備え、
@@ -58,7 +79,7 @@ fn restore() {
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore();
+        let _ = leave_screen();
         default_hook(info);
     }));
 }

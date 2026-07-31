@@ -1067,6 +1067,7 @@ dependencies = [
  "harness-change-ledger",
  "retour",
  "serde_json",
+ "tempfile",
  "windows",
 ]
 

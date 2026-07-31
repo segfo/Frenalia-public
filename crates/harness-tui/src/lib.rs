@@ -503,6 +503,135 @@ pub async fn run(
                                         }
                                     }
                                 }
+                                Action::ResolveChanges(only_path) => {
+                                    let staged_fs_opt = if cow_upper_dir_for_panel.is_none() {
+                                        match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
+                                            Ok(fs) => Some(fs),
+                                            Err(e) => {
+                                                app.apply(harness_core::AgentEvent::Error {
+                                                    message: format!("failed to open sandbox: {e}"),
+                                                });
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    if cow_upper_dir_for_panel.is_some() || staged_fs_opt.is_some() {
+                                        let cow_pair = cow_upper_dir_for_panel
+                                            .as_ref()
+                                            .map(|d| (d.as_path(), workspace_root_for_panel.as_path()));
+                                        match harness_sandbox::resolve::prepare_resolve(
+                                            staged_fs_opt.as_ref(),
+                                            cow_pair,
+                                        ) {
+                                            Ok((report, prepared)) => {
+                                                for p in &report.applied {
+                                                    app.transcript.push(app::TranscriptItem::Info(format!(
+                                                        "applied (no conflict): {p}"
+                                                    )));
+                                                }
+                                                if report.conflicts.is_empty() {
+                                                    app.transcript.push(app::TranscriptItem::Info(
+                                                        "no conflicts to resolve".to_string(),
+                                                    ));
+                                                } else {
+                                                    let mut resolved = 0usize;
+                                                    let mut failed = 0usize;
+                                                    for attempt in &prepared.attempts {
+                                                        if let Some(want) = &only_path {
+                                                            if &attempt.path != want {
+                                                                continue;
+                                                            }
+                                                        }
+                                                        if attempt.needs_edit {
+                                                            match harness_sandbox::resolve::editor_command() {
+                                                                Ok(mut cmd) => {
+                                                                    // エディタは対話子プロセスなので、
+                                                                    // 代替スクリーン・raw mode・マウスキャプチャを
+                                                                    // 一時的に明け渡してから起動・待機する
+                                                                    // （`TerminalGuard::suspend`/`resume`）。
+                                                                    if let Err(e) = guard.suspend() {
+                                                                        app.transcript.push(app::TranscriptItem::Error(format!(
+                                                                            "failed to suspend terminal: {e}"
+                                                                        )));
+                                                                        failed += 1;
+                                                                        continue;
+                                                                    }
+                                                                    let status = cmd.arg(&attempt.merged_path).status();
+                                                                    let _ = guard.resume();
+                                                                    // エディタが残した画面内容を消し、
+                                                                    // TUIを再描画する。
+                                                                    term.clear()?;
+                                                                    match status {
+                                                                        Ok(s) if s.success() => {}
+                                                                        Ok(s) => {
+                                                                            app.transcript.push(app::TranscriptItem::Error(format!(
+                                                                                "{}: editor exited with {s}; skipping",
+                                                                                attempt.path
+                                                                            )));
+                                                                            failed += 1;
+                                                                            continue;
+                                                                        }
+                                                                        Err(e) => {
+                                                                            app.transcript.push(app::TranscriptItem::Error(format!(
+                                                                                "{}: failed to launch editor: {e}",
+                                                                                attempt.path
+                                                                            )));
+                                                                            failed += 1;
+                                                                            continue;
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    app.transcript.push(app::TranscriptItem::Error(format!(
+                                                                        "{}: {e}",
+                                                                        attempt.path
+                                                                    )));
+                                                                    failed += 1;
+                                                                    continue;
+                                                                }
+                                                            }
+                                                        }
+                                                        match attempt.finalize(staged_fs_opt.as_ref(), cow_pair) {
+                                                            Ok(()) => {
+                                                                app.transcript.push(app::TranscriptItem::Info(format!(
+                                                                    "resolved: {}",
+                                                                    attempt.path
+                                                                )));
+                                                                resolved += 1;
+                                                            }
+                                                            Err(e) => {
+                                                                app.transcript.push(app::TranscriptItem::Error(format!(
+                                                                    "{}: failed to finalize: {e}",
+                                                                    attempt.path
+                                                                )));
+                                                                failed += 1;
+                                                            }
+                                                        }
+                                                    }
+                                                    for s in &prepared.skipped {
+                                                        if let Some(want) = &only_path {
+                                                            if &s.path != want {
+                                                                continue;
+                                                            }
+                                                        }
+                                                        app.transcript.push(app::TranscriptItem::Info(format!(
+                                                            "skipped: {} ({})",
+                                                            s.path, s.reason
+                                                        )));
+                                                    }
+                                                    app.transcript.push(app::TranscriptItem::Info(format!(
+                                                        "{resolved} resolved, {failed} skipped/failed"
+                                                    )));
+                                                }
+                                            }
+                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                                message: format!("resolve failed: {e}"),
+                                            }),
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
