@@ -15,6 +15,7 @@ crate-type = ["cdylib"]
 [target.'cfg(windows)'.dependencies]
 retour = { version = "0.3", default-features = false }
 harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
@@ -28,6 +29,9 @@ windows = { version = "0.58", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
     "Wdk_System_SystemServices",
+    "Wdk_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
 ] }
 
 [dev-dependencies]

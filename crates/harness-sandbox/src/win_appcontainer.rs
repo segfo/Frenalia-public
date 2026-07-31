@@ -4795,6 +4795,72 @@ mod cow_diagnostics {
         assert_eq!(workspace_content, "original");
     }
 
+    /// Phase 4a: Redirector DLLが`run_shell`の直接の子（powershell）だけでなく、その子がさらに
+    /// 起動する孫プロセス（cmd.exe）にも再注入され、孫からの書込みもupperへ透過リダイレクトされる
+    /// ことを確認する（設計書§19.2/§22/§32 Phase 4a、`/dig`2026-08-01決定）。
+    #[test]
+    #[ignore]
+    fn cow_write_from_grandchild_process_is_redirected_to_upper() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        // cmd.exeは直接の子（powershell）がCreateProcessで起動する孫プロセス。`>`はcmd自身の
+        // リダイレクトなので、書込を行うのはcmd.exe自身（孫）——PowerShellの`>`と混同しないよう
+        // 二重引用符で1引数にまとめてcmd側の解釈に委ねる。cmdの終了コードには依存せず、
+        // 結果は実FSを直接調べて確認する。
+        const CMD: &str = "\
+            cmd.exe /c \"echo created-by-grandchild>new_by_grandchild.txt\"; \
+            exit 0";
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", CMD],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+        assert!(
+            !workspace.path().join("new_by_grandchild.txt").exists(),
+            "grandchild's write must not appear in the read-only workspace"
+        );
+        let upper_content =
+            std::fs::read_to_string(upper.path().join("new_by_grandchild.txt")).expect(
+                "upper must contain the grandchild's write \
+                 (redirector DLL must have been re-injected into the grandchild, Phase 4a)",
+            );
+        assert!(
+            upper_content.trim().contains("created-by-grandchild"),
+            "unexpected upper content: {upper_content:?}"
+        );
+
+        let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+        assert!(
+            !warnings_path.exists(),
+            "grandchild injection should not have failed in this environment: {:?}",
+            std::fs::read_to_string(&warnings_path)
+        );
+    }
+
     /// シナリオ1+3: 単発`--cow`セッションで上書き・新規作成を行い、操作台帳（`.harness-cow-ops.jsonl`）
     /// の記録内容と、`changes::apply_unified_changes`によるworkspace本体への反映・台帳のprune
     /// までを一気通貫で確認する（`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`

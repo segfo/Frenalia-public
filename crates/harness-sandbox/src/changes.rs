@@ -140,15 +140,24 @@ fn apply_cow_changes(
                 if let Some(parent) = workspace_abs.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let copied = std::fs::copy(&upper_abs, &workspace_abs).map(|_| ());
-                if copied.is_ok() {
-                    // upper側の実体を消しておかないと、Redirectorの`copy_up`が
-                    // 「既にupperにある＝このセッションで一度触った」と誤認して、次の
-                    // 変更を台帳へ記録しなくなる（BUG-034）。ベストエフォート、失敗しても
-                    // commit自体は成功扱いにする（`overlay.rs::apply()`と同じ扱い）。
-                    let _ = std::fs::remove_file(&upper_abs);
+                if upper_abs.is_dir() {
+                    // ディレクトリ作成そのものの記録（例: `mkdir .git`が台帳へ`Create`として
+                    // 残る）。`std::fs::copy`はディレクトリに対して失敗し`?`で
+                    // apply全体を巻き添えにしていた（tier2a_e2e.rsのD-05ハードデニーテストで
+                    // 発見）。実体化するだけでよく、配下の個別ファイルエントリが引き続き
+                    // 同じupper_dirを参照するため、ここではupper側を消さない。
+                    std::fs::create_dir_all(&workspace_abs)
+                } else {
+                    let copied = std::fs::copy(&upper_abs, &workspace_abs).map(|_| ());
+                    if copied.is_ok() {
+                        // upper側の実体を消しておかないと、Redirectorの`copy_up`が
+                        // 「既にupperにある＝このセッションで一度触った」と誤認して、次の
+                        // 変更を台帳へ記録しなくなる（BUG-034）。ベストエフォート、失敗しても
+                        // commit自体は成功扱いにする（`overlay.rs::apply()`と同じ扱い）。
+                        let _ = std::fs::remove_file(&upper_abs);
+                    }
+                    copied
                 }
-                copied
             }
         };
         result.map_err(SandboxError::Io)?;
@@ -264,5 +273,45 @@ mod tests {
             "second"
         );
         assert!(!upper.path().join("a.txt").exists());
+    }
+
+    /// 回帰テスト: 台帳に新規ディレクトリ作成（例`mkdir .git`）のCreateエントリが含まれると、
+    /// 修正前は`std::fs::copy`をディレクトリへ試みて失敗し、apply全体が(他の正常なエントリも
+    /// 巻き添えで)エラーになっていた（`crates/harness-cli/tests/tier2a_e2e.rs`の
+    /// D-05ハードデニーテストで発見）。
+    #[test]
+    fn commit_handles_directory_create_entries_without_failing_the_whole_apply() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir_all(upper.path().join("sub")).unwrap();
+        std::fs::write(upper.path().join("sub").join("a.txt"), "hello").unwrap();
+        write_ledger(
+            upper.path(),
+            &[
+                CowOpEntry {
+                    op: ChangeOp::Create,
+                    path: "sub".to_string(),
+                    baseline_hash: None,
+                    ts_unix_millis: now_millis(),
+                },
+                CowOpEntry {
+                    op: ChangeOp::Create,
+                    path: "sub/a.txt".to_string(),
+                    baseline_hash: None,
+                    ts_unix_millis: now_millis(),
+                },
+            ],
+        );
+
+        let report =
+            apply_unified_changes(None, Some((upper.path(), workspace.path())), &no_filter_opts())
+                .unwrap();
+        assert_eq!(report.applied, vec!["sub".to_string(), "sub/a.txt".to_string()]);
+        assert!(workspace.path().join("sub").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("sub").join("a.txt")).unwrap(),
+            "hello"
+        );
     }
 }
