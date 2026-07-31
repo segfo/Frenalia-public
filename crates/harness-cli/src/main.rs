@@ -46,6 +46,10 @@ enum ProviderKind {
     Anthropic,
     Openai,
     Lmstudio,
+    /// out-of-processのTier2a E2Eテスト専用（`e2e-mock` feature必須）。
+    /// `docs/DEV-ENVIRONMENT.md`「Tier2a E2Eテストの実行方法」参照。
+    #[cfg(feature = "e2e-mock")]
+    Mock,
 }
 
 impl ProviderKind {
@@ -54,6 +58,8 @@ impl ProviderKind {
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::Openai => "openai",
             ProviderKind::Lmstudio => "lmstudio",
+            #[cfg(feature = "e2e-mock")]
+            ProviderKind::Mock => "mock",
         }
     }
 }
@@ -467,6 +473,18 @@ struct Cli {
     /// 別々の書込捕捉機構を同時に有効化しない。`--live`とは意味的に矛盾しないため排他にしない）。
     #[arg(long = "cow", default_value_t = false, conflicts_with_all = ["staged", "workspace_commit"])]
     cow: bool,
+
+    /// `--provider mock`用の台本ファイル（`Vec<Vec<StreamEvent>>`のJSON）。
+    /// out-of-processのTier2a E2Eテスト専用（`e2e-mock` feature必須）。
+    #[cfg(feature = "e2e-mock")]
+    #[arg(long = "mock-turns")]
+    mock_turns: Option<PathBuf>,
+
+    /// `--provider mock`が受信した`CompletionRequest`をJSONLへ追記する先。
+    /// out-of-processのTier2a E2Eテスト専用（`e2e-mock` feature必須）。
+    #[cfg(feature = "e2e-mock")]
+    #[arg(long = "mock-record-requests")]
+    mock_record_requests: Option<PathBuf>,
 }
 
 /// `--require-sandbox[=confidential]`の文字列表現を`RequireSandbox`へ変換する
@@ -556,13 +574,32 @@ fn resolve_sandbox_dir(workspace_root: &Path, session: Option<&str>) -> Option<P
     newest.map(|(name, _)| sandbox_dir_for_session(&name))
 }
 
+#[cfg(feature = "e2e-mock")]
+fn build_mock_provider(
+    mock_turns: Option<&Path>,
+    mock_record_requests: Option<&Path>,
+) -> Result<Box<dyn LlmProvider>, String> {
+    let turns_path = mock_turns
+        .ok_or_else(|| "--provider mock requires --mock-turns <path>".to_string())?;
+    let mut provider = harness_providers::MockProvider::from_turns_file(turns_path)
+        .map_err(|e| format!("failed to read --mock-turns {}: {e}", turns_path.display()))?;
+    if let Some(record_path) = mock_record_requests {
+        provider = provider.with_request_record_path(record_path.to_path_buf());
+    }
+    Ok(Box::new(provider))
+}
+
 fn build_provider(
     kind: ProviderKind,
     base_url_override: Option<String>,
+    #[cfg(feature = "e2e-mock")] mock_turns: Option<&Path>,
+    #[cfg(feature = "e2e-mock")] mock_record_requests: Option<&Path>,
 ) -> Result<Box<dyn LlmProvider>, String> {
     // §設定とシークレット: CLIフラグ > env優先、プロジェクト設定に永続化しない・ログに出さない・
     // 起動時fail-fast。
     match kind {
+        #[cfg(feature = "e2e-mock")]
+        ProviderKind::Mock => build_mock_provider(mock_turns, mock_record_requests),
         ProviderKind::Anthropic => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| "ANTHROPIC_API_KEY is not set".to_string())?;
@@ -873,6 +910,8 @@ fn resolve_model(model: Option<String>, kind: ProviderKind) -> Result<String, St
         (None, ProviderKind::Lmstudio) => {
             Err("--model is required when --provider lmstudio is used".into())
         }
+        #[cfg(feature = "e2e-mock")]
+        (None, ProviderKind::Mock) => Ok("mock".to_string()),
     }
 }
 
@@ -2551,7 +2590,14 @@ async fn main() -> ExitCode {
         }
     }
 
-    let provider = match build_provider(cli.provider, cli.base_url) {
+    let provider = match build_provider(
+        cli.provider,
+        cli.base_url,
+        #[cfg(feature = "e2e-mock")]
+        cli.mock_turns.as_deref(),
+        #[cfg(feature = "e2e-mock")]
+        cli.mock_record_requests.as_deref(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");

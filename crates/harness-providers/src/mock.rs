@@ -5,6 +5,7 @@
 //! ワイヤ形式（HTTP/SSE）を一切経由しないため、`harness-engine`のエージェントループを
 //! 決定的に駆動できる（§実装マイルストーン M6検証条件「mockプロバイダのgolden-transcriptテスト」）。
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -17,6 +18,10 @@ use harness_core::{
 pub struct MockProvider {
     turns: Mutex<Vec<Vec<StreamEvent>>>,
     capabilities: ProviderCapabilities,
+    /// `stream()`が受け取った`CompletionRequest`をJSONL(1行1リクエスト)で追記する先。
+    /// out-of-process E2Eテスト（`tier2a_e2e.rs`）が、モデルへ実際に何が送信されたかを
+    /// 直接assertするための記録経路（BUG-030型のシステムプロンプト未送信を検出する）。
+    record_path: Option<PathBuf>,
 }
 
 impl MockProvider {
@@ -32,7 +37,23 @@ impl MockProvider {
                 prompt_caching: false,
                 context_window: 200_000,
             },
+            record_path: None,
         }
+    }
+
+    /// `turns`のJSON表現（`Vec<Vec<StreamEvent>>`をそのままシリアライズしたもの）を
+    /// ファイルから読んで構築する。CLI（`--mock-turns <path>`）が使う。
+    pub fn from_turns_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let data = std::fs::read_to_string(path)?;
+        let turns: Vec<Vec<StreamEvent>> = serde_json::from_str(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Self::new(turns))
+    }
+
+    /// `stream()`が受け取った`CompletionRequest`をこのパスへJSONL追記するようにする。
+    pub fn with_request_record_path(mut self, path: PathBuf) -> Self {
+        self.record_path = Some(path);
+        self
     }
 }
 
@@ -44,8 +65,24 @@ impl LlmProvider for MockProvider {
 
     async fn stream(
         &self,
-        _req: CompletionRequest,
+        req: CompletionRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        if let Some(path) = &self.record_path {
+            if let Ok(line) = serde_json::to_string(&req) {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+        }
+
         let mut turns = self.turns.lock().unwrap();
         if turns.is_empty() {
             return Err(ProviderError::InvalidRequest {

@@ -11,6 +11,12 @@ path = "src/lib.rs"
 name = "harness"
 path = "src/main.rs"
 
+[features]
+# out-of-processのTier2a E2Eテスト（`tests/tier2a_e2e.rs`）専用。既定オフ、リリースビルドに
+# 一切露出しない（`--provider mock`はテストフックのため、`docs/DEV-ENVIRONMENT.md`
+# 「Tier2a E2Eテストの実行方法」参照）。
+e2e-mock = []
+
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6"
