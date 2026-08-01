@@ -15,6 +15,7 @@ members = [
     "crates/harness-tui",
     "crates/harness-cli",
     "crates/tier2a-net-e2e",
+    "crates/tier2a-proc-probe",
 ]
 
 [workspace.package]

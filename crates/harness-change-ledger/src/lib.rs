@@ -7,7 +7,7 @@
 //! （`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` §19参照）。
 
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 use serde::{Deserialize, Serialize};
 
@@ -59,9 +59,19 @@ pub fn now_millis() -> u128 {
 /// バイト列版）。DLLが記録した値をharness-sandbox側が検証するため、両者は必ずこの実装を
 /// 共有する。`overlay.rs::hash_content`（文字列版、staged系専用）とは値が一致しなくてよい
 /// （staged系とCoW系はそれぞれ自分の記録と自分の計算だけを突き合わせる）。
+///
+/// **`content.hash(&mut hasher)`（`<[u8] as Hash>::hash`）を使わないこと**——スライスの
+/// `Hash`実装は要素本体の前に`Hasher::write_length_prefix(len)`（既定実装は`write_usize`）で
+/// 長さを書き込むため、`usize`の幅（x64=8バイト／x86=4バイト）に応じて**同じ内容でも
+/// 異なるハッシュ値**になる。Phase 4b（WOW64孫プロセスへのRedirector DLL再注入）実機E2E
+/// （`cow_containment_holds_across_three_generations_all_bitness_chains`）で、32bit孫が
+/// 記録したbaseline_hashが64bitの`apply`側の再計算値と一致せず、変更していないファイルが
+/// 常にTOCTOU競合として誤検知される不具合として発覚した（`docs/bugs/BUG-042.md`）。
+/// `Hasher::write`はバイト列をそのまま渡すだけで長さプレフィックスを挟まないため、
+/// ビット幅に依存しない。
 pub fn hash_bytes(content: &[u8]) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
+    hasher.write(content);
     format!("{:016x}", hasher.finish())
 }
 

@@ -5610,4 +5610,412 @@ mod cow_diagnostics {
         assert!(report.applied.iter().any(|p| p == "doomed.txt"), "applied={:?}", report.applied);
         assert!(!workspace.path().join("doomed.txt").exists());
     }
+
+    /// 子・孫・ひ孫（3世代）にわたる封じ込めを、全8ビット幅チェーン
+    /// （3世代 × {x64,x86}）で確認する。`crates/tier2a-proc-probe`（`tier2a_proc_probe`/
+    /// `tier2a_proc_probe_x86`、`docs/DEV-ENVIRONMENT.md`「Tier2aプローブアプリのビルド・配置」
+    /// 参照）を直接Launcherの子（gen1）として起動し、各世代がworkspace内FS操作
+    /// （create/modify/delete/rename）・workspace外への脱走試行（`C:\Windows`・
+    /// `%USERPROFILE%`・workspaceの親）・ネットワーク到達性・自身の識別情報（bitness・
+    /// token integrity level・AppContainer package SID・Redirector DLLロード有無）を検査し、
+    /// `--chain`の残りに従って次世代を再帰的にspawnしてJSONで報告する。
+    ///
+    /// 期待値は伝播規則で決まる（設計書§13.2の対応マトリクス）:
+    /// - Launcher→gen1: gen1がx64のときのみ注入される（`inject_redirector`はx64専用、
+    ///   x86ターゲットでは`spawn()`自体が`Err`を返し起動そのものを拒否する——Q6のfail-open
+    ///   ではなく、Launcher直下はfail-closed拒否）。
+    /// - gen(i)→gen(i+1): gen(i)が注入済みで、かつ`x86→x64`でない場合のみ成立
+    ///   （x86→x64はHeaven's Gate相当が必要なため対象外、素通し＋警告記録のみ）。
+    /// - 注入が途切れた世代以降は、プロセス生成自体は拒否されない（Q6）が、CoW透過は
+    ///   一切効かずworkspace ROのACLでfail-closeし続ける（回復しない）。
+    #[test]
+    #[ignore]
+    fn cow_containment_holds_across_three_generations_all_bitness_chains() {
+        use serde_json::Value;
+
+        const CHAINS: [[&str; 3]; 8] = [
+            ["x64", "x64", "x64"],
+            ["x64", "x64", "x86"],
+            ["x64", "x86", "x64"],
+            ["x64", "x86", "x86"],
+            ["x86", "x64", "x64"],
+            ["x86", "x64", "x86"],
+            ["x86", "x86", "x64"],
+            ["x86", "x86", "x86"],
+        ];
+
+        fn proc_probe_exe_paths() -> (PathBuf, PathBuf) {
+            let current = std::env::current_exe().expect("current_exe");
+            let dir = current.parent().expect("current_exe has parent").to_path_buf();
+            let x64 = dir.join("tier2a_proc_probe.exe");
+            let x86 = dir.join("tier2a_proc_probe_x86.exe");
+            assert!(
+                x64.exists(),
+                "tier2a_proc_probe.exe not found at {} (build with `cargo build -p \
+                 tier2a-proc-probe` and copy next to the test binary per \
+                 docs/DEV-ENVIRONMENT.md)",
+                x64.display()
+            );
+            assert!(
+                x86.exists(),
+                "tier2a_proc_probe_x86.exe not found at {} (build with `cargo build -p \
+                 tier2a-proc-probe --target i686-pc-windows-msvc` and copy next to the test \
+                 binary per docs/DEV-ENVIRONMENT.md)",
+                x86.display()
+            );
+            (x64, x86)
+        }
+
+        /// Launcherの直接注入はx64専用、DLL内の孫再注入は`x86→x64`のみ対象外
+        /// （§13.2）という伝播規則から、各世代の注入成否を導く。
+        fn expected_injected(chain: &[&str; 3]) -> [bool; 3] {
+            let mut injected = [false; 3];
+            injected[0] = chain[0] == "x64";
+            for i in 1..3 {
+                let propagate_ok = !(chain[i - 1] == "x86" && chain[i] == "x64");
+                injected[i] = injected[i - 1] && propagate_ok;
+            }
+            injected
+        }
+
+        fn gen_tag(gen: usize, arch: &str) -> String {
+            format!("gen{}-{arch}", gen + 1)
+        }
+
+        fn seed_modify_content(tag: &str) -> String {
+            format!("seed-modify-{tag}")
+        }
+        fn seed_delete_content(tag: &str) -> String {
+            format!("seed-delete-{tag}")
+        }
+        fn seed_rename_content(tag: &str) -> String {
+            format!("seed-rename-{tag}")
+        }
+
+        fn seed_tag_files(workspace: &Path, tag: &str) {
+            std::fs::write(
+                workspace.join(format!("{tag}-seed.txt")),
+                seed_modify_content(tag),
+            )
+            .expect("seed -seed.txt");
+            std::fs::write(
+                workspace.join(format!("{tag}-del.txt")),
+                seed_delete_content(tag),
+            )
+            .expect("seed -del.txt");
+            std::fs::write(
+                workspace.join(format!("{tag}-ren.txt")),
+                seed_rename_content(tag),
+            )
+            .expect("seed -ren.txt");
+        }
+
+        /// workspace本体はCoWの境界（ACL）なので、注入の成否に関わらず常に不変であるはず。
+        fn assert_workspace_untouched_for_tag(workspace: &Path, tag: &str) {
+            assert!(
+                !workspace.join(format!("{tag}-new.txt")).exists(),
+                "workspace must never receive a direct write for {tag}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace.join(format!("{tag}-seed.txt"))).unwrap(),
+                seed_modify_content(tag),
+                "workspace seed file for {tag} must stay unmodified"
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace.join(format!("{tag}-del.txt"))).unwrap(),
+                seed_delete_content(tag),
+                "workspace delete-target for {tag} must still exist unmodified"
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace.join(format!("{tag}-ren.txt"))).unwrap(),
+                seed_rename_content(tag),
+                "workspace rename-source for {tag} must still exist unmodified"
+            );
+            assert!(
+                !workspace.join(format!("{tag}-ren2.txt")).exists(),
+                "workspace must never see the rename target for {tag}"
+            );
+        }
+
+        fn assert_upper_reflects_tag(upper: &Path, tag: &str, injected: bool) {
+            let new_path = upper.join(format!("{tag}-new.txt"));
+            let seed_path = upper.join(format!("{tag}-seed.txt"));
+            let del_path = upper.join(format!("{tag}-del.txt"));
+            let ren_path = upper.join(format!("{tag}-ren.txt"));
+            let ren2_path = upper.join(format!("{tag}-ren2.txt"));
+            if injected {
+                assert_eq!(
+                    std::fs::read_to_string(&new_path)
+                        .unwrap_or_else(|e| panic!("upper must contain {tag}-new.txt: {e}")),
+                    format!("created-by-{tag}")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&seed_path)
+                        .unwrap_or_else(|e| panic!("upper must contain {tag}-seed.txt: {e}")),
+                    format!("modified-by-{tag}")
+                );
+                assert!(!del_path.exists(), "{tag}-del.txt must not be copied up to upper");
+                assert!(!ren_path.exists(), "{tag}-ren.txt must not remain in upper");
+                assert_eq!(
+                    std::fs::read_to_string(&ren2_path)
+                        .unwrap_or_else(|e| panic!("upper must contain {tag}-ren2.txt: {e}")),
+                    seed_rename_content(tag)
+                );
+            } else {
+                assert!(
+                    !new_path.exists(),
+                    "{tag} was not injected: upper must not see the new file"
+                );
+                assert!(
+                    !seed_path.exists(),
+                    "{tag} was not injected: upper must not see the modified file"
+                );
+                assert!(
+                    !ren2_path.exists(),
+                    "{tag} was not injected: upper must not see the rename target"
+                );
+            }
+        }
+
+        fn assert_ledger_for_tag(
+            ledger: &[harness_change_ledger::CowChange],
+            tag: &str,
+            injected: bool,
+        ) {
+            let find = |path: &str| ledger.iter().find(|c| c.path == path);
+            if injected {
+                let new_entry = find(&format!("{tag}-new.txt"))
+                    .unwrap_or_else(|| panic!("ledger must record {tag}-new.txt"));
+                assert_eq!(new_entry.op, ManifestOp::Create);
+                let seed_entry = find(&format!("{tag}-seed.txt"))
+                    .unwrap_or_else(|| panic!("ledger must record {tag}-seed.txt"));
+                assert_eq!(seed_entry.op, ManifestOp::Modify);
+                assert_eq!(
+                    seed_entry.baseline_hash,
+                    Some(harness_change_ledger::hash_bytes(
+                        seed_modify_content(tag).as_bytes()
+                    ))
+                );
+                let del_entry = find(&format!("{tag}-del.txt"))
+                    .unwrap_or_else(|| panic!("ledger must record {tag}-del.txt"));
+                assert_eq!(del_entry.op, ManifestOp::Delete);
+                assert_eq!(
+                    del_entry.baseline_hash,
+                    Some(harness_change_ledger::hash_bytes(
+                        seed_delete_content(tag).as_bytes()
+                    ))
+                );
+                let ren_old = find(&format!("{tag}-ren.txt"))
+                    .unwrap_or_else(|| panic!("ledger must record {tag}-ren.txt as deleted"));
+                assert_eq!(ren_old.op, ManifestOp::Delete);
+                let ren_new = find(&format!("{tag}-ren2.txt"))
+                    .unwrap_or_else(|| panic!("ledger must record {tag}-ren2.txt as created"));
+                assert_eq!(ren_new.op, ManifestOp::Create);
+            } else {
+                for suffix in ["-new.txt", "-seed.txt", "-del.txt", "-ren.txt", "-ren2.txt"] {
+                    assert!(
+                        find(&format!("{tag}{suffix}")).is_none(),
+                        "{tag} was not injected: ledger must not record {tag}{suffix}"
+                    );
+                }
+            }
+        }
+
+        fn nested_reports(top: &Value) -> Vec<Value> {
+            let mut out = vec![top.clone()];
+            let mut cur = top.clone();
+            loop {
+                let child = cur
+                    .get("spawn")
+                    .and_then(|s| s.get("child"))
+                    .cloned()
+                    .filter(|c| !c.is_null());
+                match child {
+                    Some(c) => {
+                        out.push(c.clone());
+                        cur = c;
+                    }
+                    None => break,
+                }
+            }
+            out
+        }
+
+        let (x64_exe, x86_exe) = proc_probe_exe_paths();
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+
+        // 読み取り側の脱走試行用: workspace外（ACL未付与）の秘密ファイル。全チェーンで
+        // 使い回して構わない（読み取り専用チェックのため、書き換わらない）。
+        let outside_dir = tempfile::tempdir().expect("outside tempdir");
+        let outside_secret = outside_dir.path().join("outside-secret.txt");
+        std::fs::write(&outside_secret, "must-not-be-readable-from-sandbox")
+            .expect("seed outside-secret.txt");
+
+        for chain in CHAINS {
+            let workspace = tempfile::tempdir().expect("workspace tempdir");
+            let upper = tempfile::tempdir().expect("upper tempdir");
+
+            let tags: Vec<String> = (0..3).map(|i| gen_tag(i, chain[i])).collect();
+            for tag in &tags {
+                seed_tag_files(workspace.path(), tag);
+            }
+
+            let write_mode = WorkspaceWriteMode::Cow {
+                upper_dir: upper.path().to_path_buf(),
+            };
+            preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+            let injected = expected_injected(&chain);
+            let gen1_exe = if chain[0] == "x64" { &x64_exe } else { &x86_exe };
+            let rest_chain = chain[1..].join(",");
+            let timeout_secs = "20";
+            let args: Vec<String> = vec![
+                "--gen".to_string(),
+                "1".to_string(),
+                "--chain".to_string(),
+                rest_chain,
+                "--x64-exe".to_string(),
+                x64_exe.display().to_string(),
+                "--x86-exe".to_string(),
+                x86_exe.display().to_string(),
+                "--outside-read".to_string(),
+                outside_secret.display().to_string(),
+                "--timeout-secs".to_string(),
+                timeout_secs.to_string(),
+            ];
+            let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+
+            let env = crate::secret_env::build_child_env();
+            let spawn_result = spawn(
+                &gen1_exe.display().to_string(),
+                &args_ref,
+                workspace.path(),
+                &env,
+                false,
+                sid.as_psid(),
+                NetworkCapability::Deny,
+                Some(CowInject {
+                    workspace_root: workspace.path(),
+                    upper_dir: upper.path(),
+                }),
+            );
+
+            if chain[0] == "x86" {
+                // Launcher直下の注入はx64専用。gen1がx86の場合、`spawn()`自体が起動を
+                // 拒否する（fail-closed refusal、Q6のfail-openとは異なる）はず。
+                assert!(
+                    spawn_result.is_err(),
+                    "chain={chain:?}: launcher must refuse to start an x86 gen1 rather than \
+                     start it without cow injection"
+                );
+                for tag in &tags {
+                    assert_workspace_untouched_for_tag(workspace.path(), tag);
+                    assert_upper_reflects_tag(upper.path(), tag, false);
+                }
+                continue;
+            }
+
+            let child = spawn_result.expect("spawn with cow injection should succeed (gen1=x64)");
+            let (stdout, stderr, code) = child
+                .write_stdin_read_output_and_wait(None)
+                .expect("child should run to completion");
+            assert_ne!(
+                code, 97,
+                "chain={chain:?}: probe watchdog fired (chain hung), stdout={stdout} \
+                 stderr={stderr}"
+            );
+
+            let top: Value = stdout
+                .lines()
+                .rev()
+                .find_map(|line| serde_json::from_str(line).ok())
+                .unwrap_or_else(|| {
+                    panic!("chain={chain:?}: no JSON report line in stdout={stdout} stderr={stderr}")
+                });
+            let reports = nested_reports(&top);
+            assert_eq!(
+                reports.len(),
+                3,
+                "chain={chain:?}: expected all 3 generations to run and report (Q6: process \
+                 creation is never refused once gen1 started), got {} reports: {reports:?}",
+                reports.len()
+            );
+
+            for (i, report) in reports.iter().enumerate() {
+                let compiled_arch = report["identity"]["compiled_arch"].as_str().unwrap_or("");
+                let expected_arch = if chain[i] == "x64" { "x86_64" } else { "x86" };
+                assert_eq!(
+                    compiled_arch, expected_arch,
+                    "chain={chain:?} gen{}: unexpected compiled_arch in report {report:?}",
+                    i + 1
+                );
+
+                let connect_ok = report["net"]["connect"]["ok"].as_bool().unwrap_or(true);
+                assert!(
+                    !connect_ok,
+                    "chain={chain:?} gen{}: outbound connect must be denied \
+                     (NetworkCapability::Deny inherited across all generations): {report:?}",
+                    i + 1
+                );
+
+                for escape_op in [
+                    "escape-write-windows",
+                    "escape-write-userprofile",
+                    "escape-write-parent",
+                    "escape-read-outside",
+                ] {
+                    let entry = report["escape"]
+                        .as_array()
+                        .and_then(|arr| arr.iter().find(|e| e["op"] == escape_op));
+                    if let Some(entry) = entry {
+                        let ok = entry["ok"].as_bool().unwrap_or(true);
+                        assert!(
+                            !ok,
+                            "chain={chain:?} gen{}: escape attempt {escape_op} must fail: {entry:?}",
+                            i + 1
+                        );
+                    }
+                }
+
+                // ベースライン観測（win.ini）: 全8チェーン・全世代で実測した結果、常に
+                // `ok:true`（`ALL APPLICATION PACKAGES`への既定read権により、AppContainer
+                // からでも読める）と確定的だったため、単なる記録確認ではなく積極的な
+                // assertへ格上げする。workspace外の`escape-read-outside`（常にdeny）との
+                // 対比で、封じ込め境界が「AppContainerだから何も読めない」ではなく
+                // 「ACLが付与されたworkspace/upper以外は読めない」ことを示す対照実験になる。
+                let baseline = report["escape"]
+                    .as_array()
+                    .and_then(|arr| arr.iter().find(|e| e["op"] == "escape-read-baseline"));
+                let baseline_ok = baseline.and_then(|e| e["ok"].as_bool()).unwrap_or(false);
+                assert!(
+                    baseline_ok,
+                    "chain={chain:?} gen{}: win.ini baseline read must succeed (default \
+                     ALL APPLICATION PACKAGES read ACL), got {baseline:?}",
+                    i + 1
+                );
+            }
+
+            for (i, tag) in tags.iter().enumerate() {
+                assert_workspace_untouched_for_tag(workspace.path(), tag);
+                assert_upper_reflects_tag(upper.path(), tag, injected[i]);
+            }
+
+            let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+            for (i, tag) in tags.iter().enumerate() {
+                assert_ledger_for_tag(&ledger, tag, injected[i]);
+            }
+
+            // 伝播が途切れた世代がある場合（本8チェーンでは`x64,x86,x64`のみ該当）、
+            // 警告台帳に何らかの理由が記録されているはず（Q6、内容までは固定しない）。
+            if injected.iter().any(|&v| !v) && injected[0] {
+                let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+                let warnings = std::fs::read_to_string(&warnings_path).unwrap_or_default();
+                assert!(
+                    !warnings.trim().is_empty(),
+                    "chain={chain:?}: injection propagation broke mid-chain but no warning was \
+                     recorded"
+                );
+            }
+        }
+    }
 }
