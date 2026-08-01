@@ -11,6 +11,8 @@ use std::hash::Hasher;
 
 use serde::{Deserialize, Serialize};
 
+pub mod store;
+
 /// 台帳ファイル名。`<upper_dir>/.harness-cow-ops.jsonl`に置く
 /// （`.harness-cow-session.json`と同じ階層、命名も揃える）。
 pub const COW_OPS_LEDGER_FILENAME: &str = ".harness-cow-ops.jsonl";

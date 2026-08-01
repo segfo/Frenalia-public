@@ -23,4 +23,5 @@ which = "7"
 libc = "0.2"
 
 [dev-dependencies]
+harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 tempfile = "3"

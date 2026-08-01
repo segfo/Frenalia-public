@@ -971,6 +971,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1102,6 +1103,7 @@ dependencies = [
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
+ "harness-change-ledger",
  "harness-core",
  "harness-sandbox",
  "libc",

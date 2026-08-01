@@ -84,10 +84,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use harness_change_ledger::{
-    hash_bytes, now_millis, parse_ledger, ChangeOp, CowOpEntry, COW_BASELINE_DIRNAME,
-    COW_OPS_LEDGER_FILENAME,
-};
+use harness_change_ledger::{now_millis, parse_ledger, store, ChangeOp, COW_OPS_LEDGER_FILENAME};
 use retour::GenericDetour;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Wdk::Foundation::{OBJECT_ATTRIBUTES, OBJECT_INFORMATION_CLASS, OBJECT_NAME_INFORMATION};
@@ -566,47 +563,25 @@ fn rel_to_string(rel: &Path) -> String {
 }
 
 /// `rel`（workspace相対、`/`区切り）を、そのセッションで最初に触った瞬間の実workspace側
-/// ハッシュへ解決する（キャッシュ済みならそれを返す、設計書§19.5）。
+/// ハッシュへ解決する（キャッシュ済みならそれを返す、設計書§19.5）。権威となる計算・
+/// baselineミラー書込は`harness_change_ledger::store::baseline_hash_and_mirror`が唯一の実装
+/// （host内蔵ツール`write_file`/`edit_file`側も同じ関数を呼ぶ、BUG-042の再発防止）——ここでの
+/// `baseline_cache`はDLLのホットパス向けのメモ化に過ぎない。
 fn baseline_hash_for(cfg: &Config, rel: &str) -> Option<String> {
     let cache = baseline_cache();
     let mut guard = cache.lock().unwrap();
     if let Some(v) = guard.get(rel) {
         return v.clone();
     }
-    let workspace_abs = cfg.workspace_root.join(rel.replace('/', "\\"));
-    let bytes = std::fs::read(&workspace_abs).ok();
-    if let Some(b) = &bytes {
-        let mirror_path = cfg
-            .upper_dir
-            .join(COW_BASELINE_DIRNAME)
-            .join(rel.replace('/', "\\"));
-        if let Some(parent) = mirror_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&mirror_path, b);
-    }
-    let hash = bytes.as_ref().map(|b| hash_bytes(b));
+    let hash = store::baseline_hash_and_mirror(&cfg.upper_dir, &cfg.workspace_root, rel);
     guard.insert(rel.to_string(), hash.clone());
     hash
 }
 
 /// 台帳（`<upper_dir>/.harness-cow-ops.jsonl`）へ1エントリを追記し、メモリ上の削除済み集合も
-/// 更新する。追記は`OpenOptions::append`（Windowsでは`FILE_APPEND_DATA`扱い）で行い、1レコード
-/// ＝1行を1回の書込みで出す（設計書§19.2「追記の並行性」）。
+/// 更新する。追記の実体は`store::append_entry`（host側と共有、設計書§19.2「追記の並行性」）。
 fn append_ledger_entry(cfg: &Config, op: ChangeOp, rel: &str, baseline_hash: Option<String>) {
-    let entry = CowOpEntry {
-        op,
-        path: rel.to_string(),
-        baseline_hash,
-        ts_unix_millis: now_millis(),
-    };
-    if let Ok(mut line) = serde_json::to_string(&entry) {
-        line.push('\n');
-        let ledger_path = cfg.upper_dir.join(COW_OPS_LEDGER_FILENAME);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&ledger_path) {
-            let _ = f.write_all(line.as_bytes());
-        }
-    }
+    store::append_entry(&cfg.upper_dir, op, rel, baseline_hash);
     let deleted = deleted_paths_state();
     let mut g = deleted.lock().unwrap();
     match op {
@@ -2107,7 +2082,7 @@ mod tests {
         assert!(hash.is_some());
         let mirror = upper
             .path()
-            .join(COW_BASELINE_DIRNAME)
+            .join(harness_change_ledger::COW_BASELINE_DIRNAME)
             .join("baseline_mirror_probe.txt");
         assert_eq!(std::fs::read_to_string(mirror).unwrap(), "original");
     }
@@ -2127,7 +2102,7 @@ mod tests {
         assert!(hash.is_none());
         assert!(!upper
             .path()
-            .join(COW_BASELINE_DIRNAME)
+            .join(harness_change_ledger::COW_BASELINE_DIRNAME)
             .join("does_not_exist_probe.txt")
             .exists());
     }

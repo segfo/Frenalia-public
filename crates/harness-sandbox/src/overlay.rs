@@ -111,6 +111,21 @@ enum Target {
     Tree { rel: PathBuf },
     /// workspace外・オーバーレイ経由（`_ext/`）。
     Ext { key: String, original: String },
+    /// `--cow`のCoW upperディレクトリ経由（D-30、`ToolCtx.cow_upper_dir`）。host内蔵ツール
+    /// （write_file/edit_file等）がRedirector DLLと同じupperディレクトリ・同じ操作台帳
+    /// （`.harness-cow-ops.jsonl`）へ書く経路。workspace内相対パスのみ対応
+    /// （workspace外絶対パスは今のところ`classify_for_write`のLive相当拒否のまま、Phase 3で
+    /// 対応予定）。
+    Cow { rel: PathBuf },
+}
+
+/// `--cow`起動時のCoWバックエンド。upper側の実体アクセスは`WorkspaceJail`
+/// （cap-std主ゲート）をupper_dirに対して開いた別インスタンスに統一し、`std::fs`直叩きに
+/// よるambient accessの増加を避ける。台帳・baselineミラーの読み書きは
+/// `harness_change_ledger::store`（DLLと共有、BUG-042再発防止）に委譲する。
+struct CowBackend {
+    upper_dir: PathBuf,
+    jail: WorkspaceJail,
 }
 
 /// `changes()`が返す1件（レビュー対象、`apply`/`discard`の単位）。
@@ -154,9 +169,11 @@ pub struct ApplyReport {
 /// `WorkspaceJail`をそのまま素通しする純live実装として振る舞う（M9までの既存挙動と等価）。
 pub struct SandboxFs {
     jail: WorkspaceJail,
+    workspace_root: PathBuf,
     sandbox_dir: Option<PathBuf>,
     mode: StagingMode,
     read_scope: ReadScope,
+    cow: Option<CowBackend>,
 }
 
 impl SandboxFs {
@@ -165,18 +182,44 @@ impl SandboxFs {
     }
 
     /// `read.allow`/`read.allow_descend`/`read.deny`/`read.deny_descend`（M11）を
-    /// 反映した`SandboxFs`を開く。
+    /// 反映した`SandboxFs`を開く。`--cow`のCoWバックエンドは使わない（`cow_upper_dir=None`
+    /// 相当）、`ToolCtx.cow_upper_dir`を運べる呼び出し元は`open_with_cow`を使うこと。
     pub fn open_with_read_scope(
         workspace_root: &Path,
         staging: &StagingConfig,
         read_scope_config: &ReadScopeConfig,
     ) -> Result<Self, SandboxError> {
+        Self::open_with_cow(workspace_root, staging, read_scope_config, None)
+    }
+
+    /// `ToolCtx.cow_upper_dir`をそのまま渡して`SandboxFs`を開く（host内蔵ツール
+    /// write_file/edit_file/read_file/grep/glob向け）。`Some`なら、workspace内相対パスへの
+    /// 書込/読取/削除/列挙はRedirector DLLと同じupperディレクトリ・同じ操作台帳
+    /// （`.harness-cow-ops.jsonl`）を経由する。
+    pub fn open_with_cow(
+        workspace_root: &Path,
+        staging: &StagingConfig,
+        read_scope_config: &ReadScopeConfig,
+        cow_upper_dir: Option<&Path>,
+    ) -> Result<Self, SandboxError> {
         let jail = WorkspaceJail::open(workspace_root)?;
+        let cow = match cow_upper_dir {
+            Some(upper_dir) => {
+                std::fs::create_dir_all(upper_dir)?;
+                Some(CowBackend {
+                    upper_dir: upper_dir.to_path_buf(),
+                    jail: WorkspaceJail::open(upper_dir)?,
+                })
+            }
+            None => None,
+        };
         Ok(Self {
             jail,
+            workspace_root: workspace_root.to_path_buf(),
             sandbox_dir: staging.sandbox_dir.clone(),
             mode: staging.mode,
             read_scope: ReadScope::open(read_scope_config),
+            cow,
         })
     }
 
@@ -225,6 +268,11 @@ impl SandboxFs {
             });
         }
         let rel = check_relative_path(path)?;
+        if self.cow.is_some() {
+            // `--cow`と`--staged`/`--workspace-commit`はCLI起動時に排他化されている
+            // （Phase 0、`conflicts_with_all`）ため、両方Someになることは実運用上ない。
+            return Ok(Target::Cow { rel });
+        }
         if self.sandbox_dir.is_none() {
             return Ok(Target::Live { rel });
         }
@@ -322,9 +370,26 @@ impl SandboxFs {
     }
 
     /// ワークスペース内へ書き込む。`path`が絶対パスなら`_ext/`へ、相対パスは実効モードに
-    /// 応じて実FS直書き（live）かオーバーレイ（tree）かへ振り分ける。
+    /// 応じて実FS直書き（live）かオーバーレイ（tree）かCoW upperかへ振り分ける。
     pub fn write_string(&self, path: &str, content: &str) -> Result<(), SandboxError> {
         match self.classify_for_write(path)? {
+            Target::Cow { rel } => {
+                let cow = self.cow.as_ref().expect("cow backend present for Target::Cow");
+                let rel_str = normalize_str(&rel);
+                let baseline_hash = harness_change_ledger::store::baseline_hash_and_mirror(
+                    &cow.upper_dir,
+                    &self.workspace_root,
+                    &rel_str,
+                );
+                cow.jail.write_string(&rel_str, content)?;
+                let op = if baseline_hash.is_none() {
+                    harness_change_ledger::ChangeOp::Create
+                } else {
+                    harness_change_ledger::ChangeOp::Modify
+                };
+                harness_change_ledger::store::append_entry(&cow.upper_dir, op, &rel_str, baseline_hash);
+                Ok(())
+            }
             Target::Live { rel } => {
                 self.jail.write_string(&normalize_str(&rel), content)?;
                 self.log_live_audit(&rel, content);
@@ -395,6 +460,19 @@ impl SandboxFs {
         if self.read_scope.is_denied_rel(&rel) {
             return Err(SandboxError::NotFound(path.to_string()));
         }
+        if let Some(cow) = &self.cow {
+            let rel_str = normalize_str(&rel);
+            if harness_change_ledger::store::deleted_set(&cow.upper_dir).contains(&rel_str) {
+                return Err(SandboxError::NotFound(path.to_string()));
+            }
+            return match cow.jail.read_to_string(&rel_str) {
+                Ok(s) => Ok(s),
+                Err(JailError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(self.jail.read_to_string(path)?)
+                }
+                Err(e) => Err(e.into()),
+            };
+        }
         if self.sandbox_dir.is_none() {
             return Ok(self.jail.read_to_string(path)?);
         }
@@ -410,12 +488,27 @@ impl SandboxFs {
     /// 論理削除（tombstone）。M10時点でこれを発火する組み込みツールは無く、`SandboxFs`単体の
     /// 契約として提供する（§オーバーレイFS「論理削除（tombstone）」）。
     pub fn remove(&self, path: &str) -> Result<(), SandboxError> {
+        let rel = check_relative_path(path)?;
+        if let Some(cow) = &self.cow {
+            let rel_str = normalize_str(&rel);
+            let baseline_hash = harness_change_ledger::store::baseline_hash_and_mirror(
+                &cow.upper_dir,
+                &self.workspace_root,
+                &rel_str,
+            );
+            harness_change_ledger::store::append_entry(
+                &cow.upper_dir,
+                harness_change_ledger::ChangeOp::Delete,
+                &rel_str,
+                baseline_hash,
+            );
+            return Ok(());
+        }
         if self.sandbox_dir.is_none() {
             return Err(SandboxError::NotFound(
                 "staging is not enabled for this ToolCtx (live-only)".to_string(),
             ));
         }
-        let rel = check_relative_path(path)?;
         let baseline_hash = self.read_to_string(path).ok().map(|s| hash_content(&s));
         self.append_entry(ManifestEntry {
             op: ManifestOp::Delete,
@@ -439,7 +532,19 @@ impl SandboxFs {
             .into_iter()
             .map(|p| normalize_str(&p))
             .collect();
-        if self.sandbox_dir.is_some() {
+        if let Some(cow) = &self.cow {
+            for c in harness_change_ledger::store::replay_ledger(&cow.upper_dir) {
+                // ext（workspace外絶対パス）エントリはPhase 3対応まで対象外。
+                if c.path.contains(':') || c.path.starts_with('/') {
+                    continue;
+                }
+                if c.op == harness_change_ledger::ChangeOp::Delete {
+                    set.remove(&c.path);
+                } else {
+                    set.insert(c.path);
+                }
+            }
+        } else if self.sandbox_dir.is_some() {
             for c in self.change_set()? {
                 if c.target != ManifestTarget::Tree {
                     continue;
@@ -458,6 +563,19 @@ impl SandboxFs {
     /// grep用: read-throughで実効内容を持つファイルハンドルを開く。
     pub fn open_file_for_read(&self, path: &str) -> Result<File, SandboxError> {
         let rel = check_relative_path(path)?;
+        if let Some(cow) = &self.cow {
+            let rel_str = normalize_str(&rel);
+            if harness_change_ledger::store::deleted_set(&cow.upper_dir).contains(&rel_str) {
+                return Err(SandboxError::NotFound(path.to_string()));
+            }
+            return match cow.jail.open_file(&rel_str) {
+                Ok(f) => Ok(f),
+                Err(JailError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(self.jail.open_file(path)?)
+                }
+                Err(e) => Err(e.into()),
+            };
+        }
         if self.sandbox_dir.is_some() {
             if let Some(entry) = self.latest_tree_entry(&rel)? {
                 if entry.op == ManifestOp::Delete {
@@ -472,6 +590,19 @@ impl SandboxFs {
     /// glob用: read-throughで実効mtimeを返す。
     pub fn modified(&self, path: &str) -> Result<SystemTime, SandboxError> {
         let rel = check_relative_path(path)?;
+        if let Some(cow) = &self.cow {
+            let rel_str = normalize_str(&rel);
+            if harness_change_ledger::store::deleted_set(&cow.upper_dir).contains(&rel_str) {
+                return Ok(self.jail.modified(path)?);
+            }
+            return match cow.jail.modified(&rel_str) {
+                Ok(t) => Ok(t),
+                Err(JailError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(self.jail.modified(path)?)
+                }
+                Err(e) => Err(e.into()),
+            };
+        }
         if self.sandbox_dir.is_some() {
             if let Some(entry) = self.latest_tree_entry(&rel)? {
                 if entry.op != ManifestOp::Delete {
@@ -971,6 +1102,114 @@ mod tests {
 
         assert!(!dir.path().join(".harness/sandbox/s1").exists());
         assert!(fs.change_set().unwrap().is_empty());
+    }
+
+    fn cow_fs(workspace_root: &Path, upper_dir: &Path) -> SandboxFs {
+        SandboxFs::open_with_cow(
+            workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(upper_dir),
+        )
+        .unwrap()
+    }
+
+    /// CoW一本化の核心（Phase 1）: `write_string`はworkspace本体へ一切触れず、upper側の
+    /// 実体・Redirector DLLと共有する操作台帳の両方へ記録される。
+    #[test]
+    fn cow_write_redirects_to_upper_and_leaves_workspace_untouched() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+
+        fs.write_string("notes.txt", "hello").unwrap();
+
+        assert!(!ws.path().join("notes.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(upper.path().join("notes.txt")).unwrap(),
+            "hello"
+        );
+        let changes = harness_change_ledger::store::replay_ledger(upper.path());
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "notes.txt");
+        assert_eq!(changes[0].op, harness_change_ledger::ChangeOp::Create);
+    }
+
+    /// `write_file`→`read_file`のread-through整合: run_shellが書いた（＝upperに載った）
+    /// 内容も含め、CoW時の`read_to_string`は「upper優先、無ければworkspace」の順で読める。
+    #[test]
+    fn cow_read_prefers_upper_over_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "workspace-content").unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+
+        assert_eq!(fs.read_to_string("a.txt").unwrap(), "workspace-content");
+
+        fs.write_string("a.txt", "upper-content").unwrap();
+        assert_eq!(fs.read_to_string("a.txt").unwrap(), "upper-content");
+    }
+
+    /// 論理削除（`remove`）は台帳へDeleteを記録するだけで、`read_to_string`はNotFoundを返す
+    /// （設計書§19.7「削除済み＞upper＞workspace」）。
+    #[test]
+    fn cow_remove_marks_deleted_and_read_returns_not_found() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("existing.txt"), "orig").unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+
+        fs.remove("existing.txt").unwrap();
+
+        assert!(
+            ws.path().join("existing.txt").exists(),
+            "論理削除は実workspaceを物理削除しない"
+        );
+        let err = fs.read_to_string("existing.txt").unwrap_err();
+        assert!(matches!(err, SandboxError::NotFound(_)));
+    }
+
+    /// `walk_files`はupper側の新規作成・削除を実workspaceの一覧へ反映する（grep/glob用）。
+    #[test]
+    fn cow_walk_files_reflects_upper_changes() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("real.txt"), "r").unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+        fs.write_string("staged_new.txt", "n").unwrap();
+        fs.remove("real.txt").unwrap();
+
+        let mut files: Vec<String> = fs
+            .walk_files()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        files.sort();
+
+        assert_eq!(files, vec!["staged_new.txt".to_string()]);
+    }
+
+    /// baselineハッシュは台帳に既存エントリがあればそれを権威として複製する
+    /// （`harness_change_ledger::store`をDLLと共有するため、2回目の書込でbaselineが
+    /// 再計算されて食い違うことはない）。
+    #[test]
+    fn cow_second_write_reuses_recorded_baseline_not_current_workspace_content() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "original").unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+
+        fs.write_string("a.txt", "first-edit").unwrap();
+        fs.write_string("a.txt", "second-edit").unwrap();
+
+        let changes = harness_change_ledger::store::replay_ledger(upper.path());
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].baseline_hash,
+            Some(harness_change_ledger::hash_bytes(b"original"))
+        );
+        assert_eq!(changes[0].op, harness_change_ledger::ChangeOp::Modify);
     }
 
     #[test]

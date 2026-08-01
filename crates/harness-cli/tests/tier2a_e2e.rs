@@ -93,6 +93,19 @@ fn end_turn(text: &str) -> Vec<StreamEvent> {
     ]
 }
 
+/// host内蔵`write_file`ツールを1回だけ呼ぶ台本（CoW一本化: run_shellではなくwrite_file自身が
+/// CoW upperへ捕まることを確認するための対照ケース）。
+fn write_file_tool_turns(path: &str, content: &str) -> Vec<Vec<StreamEvent>> {
+    vec![
+        tool_use_turn(
+            "call_1",
+            "write_file",
+            serde_json::json!({ "path": path, "content": content }),
+        ),
+        end_turn("done"),
+    ]
+}
+
 /// 1回の`run_shell`呼び出し（PowerShellスクリプト1本）だけを行う台本。
 fn run_shell_script_turns(script: &str) -> Vec<Vec<StreamEvent>> {
     vec![
@@ -536,6 +549,52 @@ fn case_h_toctou_conflict() -> Result<(), String> {
     Ok(())
 }
 
+/// I: host内蔵`write_file`ツール自身が`--cow`時にCoW保護を経由すること（2026-08-01実機ドライ
+/// ランで発見したバグの回帰確認、Phase 1修正）。`run_shell`経由（PowerShellの`Set-Content`）
+/// ではなく`write_file`ツールを直接呼ぶ台本で、(a) workspace本体がwrite_file実行直後は
+/// 無傷、(b) 新規CoWセッションが記録され、(c) `apply --source cow`で反映される、ことを検証する。
+fn case_i_write_file_tool_is_captured_by_cow() -> Result<(), String> {
+    let ws = case_dir("cow-i-write-file-tool");
+    let before = list_cow_sessions();
+    let run = run_harness(
+        &ws,
+        &write_file_tool_turns("notes.txt", "written via write_file tool"),
+        &["--cow"],
+        "cow-i",
+    );
+    if !run.status.success() {
+        return Err(format!("harness invocation failed: {}", run.stderr));
+    }
+    assert_prompt_sane(&run, &["Copy-on-Write"])?;
+
+    if ws.join("notes.txt").exists() {
+        return Err(
+            "write_file must not touch the real workspace directly under --cow (regression)"
+                .to_string(),
+        );
+    }
+    let session = new_cow_session(&before)?;
+
+    let report = apply_cow(&ws, &session, None)?;
+    let applied: Vec<String> = report["applied"]
+        .as_array()
+        .ok_or("missing applied[]")?
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    if applied != vec!["notes.txt".to_string()] {
+        return Err(format!("expected only notes.txt applied, got {applied:?}: {report}"));
+    }
+    expect_eq(
+        "notes.txt",
+        &read_file(&ws.join("notes.txt"))?,
+        "written via write_file tool",
+    )?;
+
+    cleanup_on_success(&ws, &[&session], "cow-i");
+    Ok(())
+}
+
 /// `tier2a_cow_commit_matrix`と`tier2a_net_policy_matrix`は同じテストバイナリ内の別々の
 /// `#[test]`関数であり、既定では別スレッドで並行実行される。両者は共有WFPエンジン・
 /// netfilterdの単一インスタンス・`C:\harness-e2e`を奪い合うため、Q5(機構ごとに1テストで
@@ -558,6 +617,7 @@ fn tier2a_cow_commit_matrix() {
         ("F-partial-then-rest", case_f_partial_then_rest_matches_commit_all),
         ("G-hard-deny-config-injection", case_g_hard_deny_config_injection),
         ("H-toctou-conflict", case_h_toctou_conflict),
+        ("I-write-file-tool-captured", case_i_write_file_tool_is_captured_by_cow),
     ];
     let mut passed = 0;
     let total = cases.len();
