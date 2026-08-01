@@ -13,7 +13,12 @@ edition.workspace = true
 crate-type = ["cdylib"]
 
 [target.'cfg(windows)'.dependencies]
-retour = { version = "0.3", default-features = false }
+# `retour`はi686（x86、Phase 4b WOW64再注入向け）で0.3系がビルド不能（クレート自体の
+# `impl_hookable!`マクロが`extern "win64"`を`target_arch`ゲート無しで全ターゲットへ展開しようと
+# しコンパイルエラーになる、実機確認済み）。`target_arch`ゲートが修正済みの0.4系プレリリースへ
+# x64・x86両方を統一する（`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` §13.2、
+# x64側も切り替え後にcow_diagnostics全件（x64/WOW64/Memory-mapped file/ledger系）で再検証済み）。
+retour = { version = "0.4.0-alpha.4", default-features = false }
 harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,6 +37,7 @@ windows = { version = "0.58", features = [
     "Wdk_System_Threading",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
 ] }
 
 [dev-dependencies]

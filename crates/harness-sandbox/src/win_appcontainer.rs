@@ -4676,6 +4676,14 @@ mod cow_diagnostics {
     use crate::changes;
     use crate::manifest::ManifestOp;
     use crate::overlay::ApplyOptions;
+    use std::sync::Mutex;
+
+    /// `cow_write_from_wow64_grandchild_process_is_redirected_to_upper`と
+    /// `cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning`は、テストバイナリの
+    ///隣にある`harness_redirector_x86.dll`という単一の共有ファイルを読む/一時的にリネームする。
+    /// `cargo test`は既定で`#[test]`関数を並行実行するため、この2つを直列化しないと片方が
+    /// リネーム中にもう片方が「ファイルが見つからない」で誤って失敗し得る（実機で確認済み）。
+    static WOW64_DLL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     const COW_WRITE_PROBE_COMMAND: &str = "\
         $ErrorActionPreference = 'Stop'; \
@@ -4859,6 +4867,250 @@ mod cow_diagnostics {
             "grandchild injection should not have failed in this environment: {:?}",
             std::fs::read_to_string(&warnings_path)
         );
+    }
+
+    /// Phase 4b: 32bit（WOW64）孫プロセス（`C:\Windows\SysWOW64\cmd.exe`）にもRedirector DLLが
+    /// 再注入され、書込みがupperへ透過リダイレクトされることを確認する（設計書§32 Phase 4b、
+    /// `/dig`2026-08-02決定「エントリポイントtrap方式」）。直接の子（powershell、x64）から
+    /// SysWOW64のcmd.exeを明示パスで起動する（64bitプロセスがSysWOW64を直接指定すればWOW64
+    /// ファイルシステムリダイレクトの影響を受けない）。x86 Redirector DLL
+    /// （`harness_redirector_x86.dll`）がこのテストバイナリと同じディレクトリ
+    /// （`target/debug/deps/`）に存在する前提（`docs/DEV-ENVIRONMENT.md`「Tier2a E2Eテストの
+    /// 実行方法」参照、x64 DLLの探索規約`redirector_dll_path`と同じ、`crate::wow64`の
+    /// `x86_sibling_dll_path`参照）。
+    #[test]
+    #[ignore]
+    fn cow_write_from_wow64_grandchild_process_is_redirected_to_upper() {
+        let _lock = WOW64_DLL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        const CMD: &str = "\
+            C:\\Windows\\SysWOW64\\cmd.exe /c \"echo created-by-wow64-grandchild>new_by_wow64.txt\"; \
+            exit 0";
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", CMD],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+        assert!(
+            !workspace.path().join("new_by_wow64.txt").exists(),
+            "wow64 grandchild's write must not appear in the read-only workspace"
+        );
+        let upper_content =
+            std::fs::read_to_string(upper.path().join("new_by_wow64.txt")).expect(
+                "upper must contain the wow64 grandchild's write \
+                 (redirector DLL must have been re-injected via the entry-point trap, Phase 4b)",
+            );
+        assert!(
+            upper_content.trim().contains("created-by-wow64-grandchild"),
+            "unexpected upper content: {upper_content:?}"
+        );
+
+        let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+        assert!(
+            !warnings_path.exists(),
+            "wow64 grandchild injection should not have failed in this environment: {:?}",
+            std::fs::read_to_string(&warnings_path)
+        );
+    }
+
+    /// Phase 4b失敗系: x86版Redirector DLL（`harness_redirector_x86.dll`）が存在しない場合、
+    /// WOW64孫プロセスへの注入は失敗するが、孫プロセスの生成自体は拒否されず（Q6）、書込みは
+    /// workspaceのACLでfail-closeし（transparent性の欠如のみ）、警告台帳に理由が記録されること。
+    /// このテストは`harness_redirector_x86.dll`を一時的にリネームして実行する。
+    #[test]
+    #[ignore]
+    fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
+        let _lock = WOW64_DLL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+
+        let current = std::env::current_exe().expect("current_exe");
+        let dir = current.parent().expect("current_exe has parent");
+        let x86_dll = dir.join("harness_redirector_x86.dll");
+        let x86_dll_backup = dir.join("harness_redirector_x86.dll.disabled-for-test");
+        let had_x86_dll = x86_dll.exists();
+        if had_x86_dll {
+            std::fs::rename(&x86_dll, &x86_dll_backup).expect("temporarily rename x86 dll");
+        }
+        // パニックしても必ずリネームを戻す。
+        let restore = scopeguard(|| {
+            if had_x86_dll {
+                let _ = std::fs::rename(&x86_dll_backup, &x86_dll);
+            }
+        });
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        const CMD: &str = "\
+            C:\\Windows\\SysWOW64\\cmd.exe /c \"echo should-not-appear-in-upper>should_not_exist.txt\"; \
+            exit 0";
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", CMD],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, _code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+        let _ = (stdout, stderr);
+
+        drop(restore);
+
+        assert!(
+            !workspace.path().join("should_not_exist.txt").exists(),
+            "workspace must stay unchanged regardless of injection outcome"
+        );
+        assert!(
+            !upper.path().join("should_not_exist.txt").exists(),
+            "without the x86 redirector dll, the write must fail closed (workspace ACL denies \
+             it) rather than silently succeed via a stale/mismatched injection"
+        );
+        let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+        let warnings = std::fs::read_to_string(&warnings_path).expect(
+            "warning ledger must record the injection failure when the x86 redirector dll is \
+             missing (Q6: grandchild creation itself must not be refused)",
+        );
+        assert!(
+            warnings.contains("32bit") || warnings.contains("wow64") || warnings.contains("WOW64"),
+            "warning entry should mention the wow64/32bit injection path: {warnings}"
+        );
+    }
+
+    /// パニック時にも確実にクロージャを実行する簡易scopeguard（`scopeguard`クレート依存を
+    /// 避けるための最小実装。テストコード専用）。
+    struct ScopeGuard<F: FnMut()>(F);
+    impl<F: FnMut()> Drop for ScopeGuard<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+    fn scopeguard<F: FnMut()>(f: F) -> ScopeGuard<F> {
+        ScopeGuard(f)
+    }
+
+    /// 設計書§21（Memory-mapped file）の実測: 書込可能な`MemoryMappedFile`は`CreateFromFile`の
+    /// 時点で`FILE_WRITE_DATA`付きの`NtCreateFile`/`NtOpenFile`を要求するため、既存の
+    /// `is_write_intent`によるopen時リダイレクトだけでカバーできているはず、という仮説を実機で
+    /// 検証する（`NtCreateSection`自体は未フックのまま）。期待どおりならこのテストが回帰テスト
+    /// として残り、`NtCreateSection`フックの追加実装は不要と判断する。
+    #[test]
+    #[ignore]
+    fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+        std::fs::write(workspace.path().join("important.txt"), "original")
+            .expect("seed important.txt");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        // 書込可能なview（ReadWrite）を作成し、8バイト全体を書き換える(元の"original"と
+        // 同じ長さにして容量周りの複雑さを避ける)。`mapName`に`$null`を渡すと.NET側で
+        // 「Map name cannot be an empty string」となる（PowerShellの引数束縛で空文字列化される、
+        // 実機確認済み）ため、セッション固有のGUIDを名前として渡す。
+        const CMD: &str = "\
+            $ErrorActionPreference = 'Stop'; \
+            try { \
+                $mapName = [guid]::NewGuid().ToString(); \
+                $mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateFromFile( \
+                    'important.txt', [System.IO.FileMode]::Open, $mapName, 0, \
+                    [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite); \
+                $accessor = $mmf.CreateViewAccessor(0, 8, \
+                    [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite); \
+                $bytes = [System.Text.Encoding]::ASCII.GetBytes('mmapwrt!'); \
+                $accessor.WriteArray(0, $bytes, 0, $bytes.Length); \
+                $accessor.Flush(); \
+                $accessor.Dispose(); \
+                $mmf.Dispose(); \
+                exit 0 \
+            } catch { \
+                Write-Output $_.Exception.Message; \
+                exit 9 \
+            }";
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", CMD],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+        let workspace_content =
+            std::fs::read_to_string(workspace.path().join("important.txt"))
+                .expect("workspace important.txt must still exist");
+        assert_eq!(
+            workspace_content, "original",
+            "workspace must stay unchanged (mmap write must not bypass the ACL boundary)"
+        );
+
+        let upper_content = std::fs::read_to_string(upper.path().join("important.txt")).expect(
+            "upper must contain the mmap write (open-time redirection must have copy-up'd the \
+             file before the writable view was created)",
+        );
+        assert_eq!(upper_content, "mmapwrt!");
+
+        let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+        let important = ledger
+            .iter()
+            .find(|c| c.path == "important.txt")
+            .expect("ledger must record important.txt as modified via the mmap write");
+        assert_eq!(important.op, ManifestOp::Modify);
     }
 
     /// シナリオ1+3: 単発`--cow`セッションで上書き・新規作成を行い、操作台帳（`.harness-cow-ops.jsonl`）

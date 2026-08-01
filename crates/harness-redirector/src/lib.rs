@@ -61,11 +61,20 @@
 //!
 //! 注入・初期化のいずれかに失敗しても、孫プロセスの生成自体は拒否しない（Q6）。かわりに
 //! `<upper_dir>/.harness-cow-warnings.jsonl`へ理由を追記する（`append_warning_entry`）。
-//! 32bitターゲット（WOW64）はPhase 4bの対象で、x64専用のこのDLLをロードしようとすると
-//! `LoadLibraryW`が自然に失敗する（`ERROR_BAD_EXE_FORMAT`相当）ため、そのまま「注入失敗」の
-//! 経路で警告化される（明示的なビット幅事前判定は行わない）。
+//!
+//! ## Phase 4b: 32bit（WOW64）ターゲットへの再注入
+//!
+//! 32bitターゲット（WOW64、x64ホスト上のx86プロセス）は`IsWow64Process2`で判定し、
+//! [`wow64::inject_grandchild_wow64`]（別モジュール、詳細はそちらのモジュールdoc参照）へ
+//! 委譲する。x64専用のこのDLLをそのまま`LoadLibraryW`することはできない
+//! （`ERROR_BAD_EXE_FORMAT`相当で失敗する）ため、`harness.exe`と同じディレクトリに配置された
+//! 兄弟の`harness_redirector_x86.dll`（i686ビルド）を注入する。x86→x64（32bitプロセスから
+//! 64bit孫プロセスを起動するケース）はHeaven's Gate相当の実装コストに見合わないため対象外とし、
+//! 素通し（警告台帳へ記録するのみ）とする。
 
 #![cfg(windows)]
+
+mod wow64;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -1562,15 +1571,35 @@ unsafe fn inject_grandchild_and_maybe_resume(
         pi.hProcess.0 as usize, pi.hThread.0 as usize
     ));
     if let Some(cfg) = CONFIG.get() {
-        let injected = unsafe { inject_grandchild(pi.hProcess) };
-        debug_log(&format!("{caller}: inject_grandchild returned {injected}"));
+        let is_wow64 = unsafe { wow64::is_wow64_target(pi.hProcess) };
+        let injected = if is_wow64 {
+            match self_dll_path() {
+                Some(x64_dll_path) => unsafe {
+                    wow64::inject_grandchild_wow64(pi.hProcess, pi.hThread, &x64_dll_path)
+                },
+                None => {
+                    debug_log(&format!("{caller}: self_dll_path() failed for wow64 injection"));
+                    false
+                }
+            }
+        } else {
+            unsafe { inject_grandchild(pi.hProcess) }
+        };
+        debug_log(&format!(
+            "{caller}: injection (wow64={is_wow64}) returned {injected}"
+        ));
         if !injected {
-            append_warning_entry(
-                cfg,
+            let message = if is_wow64 {
+                "grandchild redirector re-injection failed or timed out (32bit/WOW64 target, \
+                 Phase 4b); writes from this process will not be redirected to the CoW upper \
+                 directory (workspace stays read-only ACL, so writes fail closed rather than \
+                 silently missing the ledger)"
+            } else {
                 "grandchild redirector re-injection failed or timed out; writes from this \
                  process will not be redirected to the CoW upper directory (workspace stays \
-                 read-only ACL, so writes fail closed rather than silently missing the ledger)",
-            );
+                 read-only ACL, so writes fail closed rather than silently missing the ledger)"
+            };
+            append_warning_entry(cfg, message);
         }
     } else {
         // このプロセス自体がまだ設定未完了（フック設置競合等の異常系）。孫は素通し。
