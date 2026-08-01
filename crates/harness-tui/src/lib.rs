@@ -20,9 +20,9 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use harness_core::{LlmProvider, StagingConfig, ToolCtx};
+use harness_core::{LlmProvider, ReadScopeConfig, StagingConfig, ToolCtx};
 use harness_engine::{ConversationState, PermissionArbiter, SessionStore};
-use harness_sandbox::{ApplyOptions, ManifestOp, ManifestTarget, SandboxFs};
+use harness_sandbox::{ApplyOptions, ManifestOp, SandboxFs};
 use harness_tools::ToolRegistry;
 
 pub use app::{Action, AppState, ChangeRow, ChangesPanelState, SlashCommand};
@@ -45,30 +45,20 @@ pub fn init_file_logging(log_dir: &std::path::Path) -> tracing_appender::non_blo
 }
 
 /// 変更パネル（M10）を開く際、`SandboxFs::change_set()`の各エントリに差分プレビューを
-/// 添えて`ChangeRow`へ変換する。baseline（変更前）の内容は実FSから直接読む
-/// （`Tree`はworkspace内の相対パス、`Ext`は絶対パスそのもの）。表示専用のbest-effort読取
-/// のため、読めない場合は空文字列扱いにする（§リッチTUI「変更パネル」）。
-fn build_change_rows(
-    workspace_root: &std::path::Path,
-    fs: &SandboxFs,
-    entries: Vec<harness_sandbox::ChangeEntry>,
-) -> Vec<ChangeRow> {
+/// 添えて`ChangeRow`へ変換する。CoW一本化（Phase 2）により`--staged`/`--cow`は同じ
+/// `SandboxFs`バックエンドを使うため、この1関数だけで両方をカバーする（以前あった
+/// `build_cow_change_rows`との重複は解消済み）。baseline（変更前）は実workspace側の現在
+/// 内容、current（変更後）はオーバーレイ側の内容。表示専用のbest-effort読取のため、
+/// 読めない場合は空文字列扱いにする（§リッチTUI「変更パネル」）。
+fn build_change_rows(fs: &SandboxFs, entries: Vec<harness_sandbox::ChangeEntry>) -> Vec<ChangeRow> {
     entries
         .into_iter()
         .map(|entry| {
-            let baseline = match entry.target {
-                ManifestTarget::Tree => std::fs::read_to_string(workspace_root.join(&entry.path)),
-                ManifestTarget::Ext => std::fs::read_to_string(&entry.path),
-                ManifestTarget::Live => Ok(String::new()),
-                // 到達不能: staged経路（`fs.change_set()`）はCowを絶対に出力しない
-                // （`manifest.rs`のdoc参照、CoW側は`build_cow_change_rows`が別途担う）。
-                ManifestTarget::Cow => Ok(String::new()),
-            }
-            .unwrap_or_default();
+            let baseline = fs.real_content(&entry.path).unwrap_or_default();
             let current = if entry.op == ManifestOp::Delete {
                 String::new()
             } else {
-                fs.read_to_string(&entry.overlay_path).unwrap_or_default()
+                fs.overlay_content(&entry.path).unwrap_or_default()
             };
             let diff = diff::line_diff(&baseline, &current);
             ChangeRow { entry, diff }
@@ -76,39 +66,15 @@ fn build_change_rows(
         .collect()
 }
 
-/// `--cow`セッション向けの変更パネル行を組み立てる。`harness_sandbox::changes::list_unified_changes`
-/// （`staged_fs=None`でCoW側だけを列挙）の結果を`ChangeRow`へ変換する。staged側の
-/// `build_change_rows`と違い、変更後の内容はstagedオーバーレイ（workspace内）ではなく
-/// upper_dir（workspace外）にあるため、`SandboxFs`のjail越しではなく`std::fs`で直接読む
-/// （`--cow`と`--staged`/`--workspace-commit`は互いに排他なので、この2関数が同時に
-/// 使われることは無い、`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` §19）。
-fn build_cow_change_rows(
+/// 変更パネル（`/fsstage`系Action）が使う`SandboxFs`を開く。CoW一本化（Phase 2）により、
+/// `--staged`/`--cow`いずれもこの1関数・1つの`SandboxFs`インスタンスで扱える
+/// （以前あったAction毎のstaged/CoW分岐は解消済み）。
+fn open_panel_fs(
     workspace_root: &std::path::Path,
-    upper_dir: &std::path::Path,
-    entries: Vec<harness_sandbox::UnifiedChangeEntry>,
-) -> Vec<ChangeRow> {
-    entries
-        .into_iter()
-        .map(|e| {
-            let rel = e.path.replace('/', "\\");
-            let baseline = std::fs::read_to_string(workspace_root.join(&rel)).unwrap_or_default();
-            let current = if e.op == ManifestOp::Delete {
-                String::new()
-            } else {
-                std::fs::read_to_string(upper_dir.join(&rel)).unwrap_or_default()
-            };
-            let diff = diff::line_diff(&baseline, &current);
-            let entry = harness_sandbox::ChangeEntry {
-                op: e.op,
-                target: ManifestTarget::Cow,
-                path: e.path,
-                overlay_path: String::new(),
-                baseline_hash: e.baseline_hash,
-                new_hash: None,
-            };
-            ChangeRow { entry, diff }
-        })
-        .collect()
+    staging: &StagingConfig,
+    cow_upper_dir: Option<&std::path::Path>,
+) -> Result<SandboxFs, harness_sandbox::SandboxError> {
+    SandboxFs::open_with_cow(workspace_root, staging, &ReadScopeConfig::default(), cow_upper_dir)
 }
 
 /// `SandboxFs::apply()`の結果をtranscriptへ1行のInfo通知として積む。変更パネルの`c`、
@@ -231,9 +197,9 @@ pub async fn run(
     let staging_for_panel: StagingConfig = ctx.staging.clone();
     // `--cow`（D-30）指定時のCoW upperディレクトリ。`--cow`は`--staged`/`--workspace-commit`と
     // 互いに排他（`harness-cli::main.rs`のPhase 0）のため、1セッション内で
-    // `staging_for_panel`（stagedマニフェスト）とこの値の両方が意味を持つことはない。
-    // `/fsstage`系Actionはこの値の有無でstaged/CoWのどちらを操作するか分岐する
-    // （`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` §19 Phase 2）。
+    // `staging_for_panel.sandbox_dir`とこの値の両方が意味を持つことはない。CoW一本化
+    // （Phase 2）以降、`open_panel_fs`がこの値の有無に関わらず単一の`SandboxFs`を組み立てる
+    // （`--staged`/`--cow`は同じバックエンドを使うため、Action側は分岐を持たない）。
     let cow_upper_dir_for_panel = ctx.cow_upper_dir.clone();
     let mut engine = spawn_engine(
         provider,
@@ -332,36 +298,24 @@ pub async fn run(
                                 },
                                 Action::Quit => {}
                                 Action::OpenChangesPanel => {
-                                    if let Some(upper_dir) = &cow_upper_dir_for_panel {
-                                        match harness_sandbox::changes::list_unified_changes(None, Some(upper_dir)) {
+                                    match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                        Ok(fs) => match fs.change_set() {
                                             Ok(entries) => {
-                                                let rows = build_cow_change_rows(&workspace_root_for_panel, upper_dir, entries);
+                                                let rows = build_change_rows(&fs, entries);
                                                 app.open_changes_panel(rows);
                                             }
                                             Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to read CoW changes: {e}"),
+                                                message: format!("failed to read changes: {e}"),
                                             }),
-                                        }
-                                    } else {
-                                        match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
-                                            Ok(fs) => match fs.change_set() {
-                                                Ok(entries) => {
-                                                    let rows = build_change_rows(&workspace_root_for_panel, &fs, entries);
-                                                    app.open_changes_panel(rows);
-                                                }
-                                                Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                    message: format!("failed to read staged changes: {e}"),
-                                                }),
-                                            },
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to open sandbox: {e}"),
-                                            }),
-                                        }
+                                        },
+                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("failed to open sandbox: {e}"),
+                                        }),
                                     }
                                 }
                                 Action::ListChanges => {
-                                    if let Some(upper_dir) = &cow_upper_dir_for_panel {
-                                        match harness_sandbox::changes::list_unified_changes(None, Some(upper_dir)) {
+                                    match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                        Ok(fs) => match fs.change_set() {
                                             Ok(entries) if entries.is_empty() => {
                                                 app.transcript.push(app::TranscriptItem::Info(
                                                     "(no changes)".to_string(),
@@ -370,161 +324,82 @@ pub async fn run(
                                             Ok(entries) => {
                                                 for e in &entries {
                                                     app.transcript.push(app::TranscriptItem::Info(format!(
-                                                        "{:<5} {:<7} {}",
-                                                        format!("{:?}", e.source).to_lowercase(),
+                                                        "{:<7} {}",
                                                         format!("{:?}", e.op).to_lowercase(),
                                                         e.path
                                                     )));
                                                 }
                                             }
                                             Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to read CoW changes: {e}"),
+                                                message: format!("failed to read changes: {e}"),
                                             }),
-                                        }
-                                    } else {
-                                        match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
-                                            Ok(fs) => match fs.change_set() {
-                                                Ok(entries) if entries.is_empty() => {
-                                                    app.transcript.push(app::TranscriptItem::Info(
-                                                        "(no staged changes)".to_string(),
-                                                    ));
-                                                }
-                                                Ok(entries) => {
-                                                    for e in &entries {
-                                                        app.transcript.push(app::TranscriptItem::Info(format!(
-                                                            "{:<7} {:<5} {}",
-                                                            format!("{:?}", e.op).to_lowercase(),
-                                                            format!("{:?}", e.target).to_lowercase(),
-                                                            e.path
-                                                        )));
-                                                    }
-                                                }
-                                                Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                    message: format!("failed to read staged changes: {e}"),
-                                                }),
-                                            },
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to open sandbox: {e}"),
-                                            }),
-                                        }
+                                        },
+                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("failed to open sandbox: {e}"),
+                                        }),
                                     }
                                 }
                                 Action::CommitChanges(only_paths) => {
-                                    if let Some(upper_dir) = &cow_upper_dir_for_panel {
-                                        match harness_sandbox::changes::apply_unified_changes(
-                                            None,
-                                            Some((upper_dir, &workspace_root_for_panel)),
-                                            &ApplyOptions {
-                                                only_glob: None,
-                                                only_paths: Some(&only_paths),
-                                                allow_ext: false,
-                                            },
-                                        ) {
+                                    match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                        Ok(fs) => match fs.apply(&ApplyOptions {
+                                            only_glob: None,
+                                            only_paths: Some(&only_paths),
+                                            allow_ext: false,
+                                        }) {
                                             Ok(report) => push_apply_report(&mut app, &report),
                                             Err(e) => app.apply(harness_core::AgentEvent::Error {
                                                 message: format!("apply failed: {e}"),
                                             }),
-                                        }
-                                    } else {
-                                        match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
-                                            Ok(fs) => match fs.apply(&ApplyOptions {
-                                                only_glob: None,
-                                                only_paths: Some(&only_paths),
-                                                allow_ext: false,
-                                            }) {
-                                                Ok(report) => push_apply_report(&mut app, &report),
-                                                Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                    message: format!("apply failed: {e}"),
-                                                }),
-                                            },
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to open sandbox: {e}"),
-                                            }),
-                                        }
+                                        },
+                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("failed to open sandbox: {e}"),
+                                        }),
                                     }
                                 }
                                 Action::CommitAllChanges => {
-                                    if let Some(upper_dir) = &cow_upper_dir_for_panel {
-                                        match harness_sandbox::changes::apply_unified_changes(
-                                            None,
-                                            Some((upper_dir, &workspace_root_for_panel)),
-                                            &ApplyOptions {
-                                                only_glob: None,
-                                                only_paths: None,
-                                                allow_ext: false,
-                                            },
-                                        ) {
+                                    match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                        Ok(fs) => match fs.apply(&ApplyOptions {
+                                            only_glob: None,
+                                            only_paths: None,
+                                            allow_ext: false,
+                                        }) {
                                             Ok(report) => push_apply_report(&mut app, &report),
                                             Err(e) => app.apply(harness_core::AgentEvent::Error {
                                                 message: format!("apply failed: {e}"),
                                             }),
-                                        }
-                                    } else {
-                                        match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
-                                            Ok(fs) => match fs.apply(&ApplyOptions {
-                                                only_glob: None,
-                                                only_paths: None,
-                                                allow_ext: false,
-                                            }) {
-                                                Ok(report) => push_apply_report(&mut app, &report),
-                                                Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                    message: format!("apply failed: {e}"),
-                                                }),
-                                            },
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to open sandbox: {e}"),
-                                            }),
-                                        }
+                                        },
+                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("failed to open sandbox: {e}"),
+                                        }),
                                     }
                                 }
                                 Action::DiscardChanges => {
-                                    if let Some(upper_dir) = &cow_upper_dir_for_panel {
-                                        match harness_sandbox::changes::discard_unified_changes(None, Some(upper_dir)) {
+                                    match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                        Ok(fs) => match fs.discard() {
                                             Ok(()) => app.transcript.push(app::TranscriptItem::Info(
-                                                "discarded CoW changes".to_string(),
+                                                "discarded changes".to_string(),
                                             )),
                                             Err(e) => app.apply(harness_core::AgentEvent::Error {
                                                 message: format!("discard failed: {e}"),
                                             }),
-                                        }
-                                    } else {
-                                        match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
-                                            Ok(fs) => match fs.discard() {
-                                                Ok(()) => app.transcript.push(app::TranscriptItem::Info(
-                                                    "discarded staged changes".to_string(),
-                                                )),
-                                                Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                    message: format!("discard failed: {e}"),
-                                                }),
-                                            },
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to open sandbox: {e}"),
-                                            }),
-                                        }
+                                        },
+                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("failed to open sandbox: {e}"),
+                                        }),
                                     }
                                 }
                                 Action::ResolveChanges(only_path) => {
-                                    let staged_fs_opt = if cow_upper_dir_for_panel.is_none() {
-                                        match SandboxFs::open(&workspace_root_for_panel, &staging_for_panel) {
-                                            Ok(fs) => Some(fs),
-                                            Err(e) => {
-                                                app.apply(harness_core::AgentEvent::Error {
-                                                    message: format!("failed to open sandbox: {e}"),
-                                                });
-                                                None
-                                            }
+                                    let fs_opt = match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                        Ok(fs) => Some(fs),
+                                        Err(e) => {
+                                            app.apply(harness_core::AgentEvent::Error {
+                                                message: format!("failed to open sandbox: {e}"),
+                                            });
+                                            None
                                         }
-                                    } else {
-                                        None
                                     };
-                                    if cow_upper_dir_for_panel.is_some() || staged_fs_opt.is_some() {
-                                        let cow_pair = cow_upper_dir_for_panel
-                                            .as_ref()
-                                            .map(|d| (d.as_path(), workspace_root_for_panel.as_path()));
-                                        match harness_sandbox::resolve::prepare_resolve(
-                                            staged_fs_opt.as_ref(),
-                                            cow_pair,
-                                        ) {
+                                    if let Some(fs) = fs_opt {
+                                        match harness_sandbox::resolve::prepare_resolve(&fs) {
                                             Ok((report, prepared)) => {
                                                 for p in &report.applied {
                                                     app.transcript.push(app::TranscriptItem::Info(format!(
@@ -593,7 +468,7 @@ pub async fn run(
                                                                 }
                                                             }
                                                         }
-                                                        match attempt.finalize(staged_fs_opt.as_ref(), cow_pair) {
+                                                        match attempt.finalize(&fs) {
                                                             Ok(()) => {
                                                                 app.transcript.push(app::TranscriptItem::Info(format!(
                                                                     "resolved: {}",

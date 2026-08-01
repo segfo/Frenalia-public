@@ -86,77 +86,52 @@ impl From<PermissionModeArg> for PermissionMode {
     }
 }
 
-/// `harness changes`/`apply`/`discard`の`--source`（既定`all`）。stagedマニフェストと
-/// `--cow`操作台帳のどちらを対象にするか（`plans/AppContainerベース Copy-on-Write
-/// ワークスペース設計書.md` §19 Phase 2、両機構をツールとして分けず統合する）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
-enum ChangeSourceArg {
-    Staged,
-    Cow,
-    #[default]
-    All,
-}
-
-impl ChangeSourceArg {
-    fn wants_staged(self) -> bool {
-        matches!(self, ChangeSourceArg::Staged | ChangeSourceArg::All)
-    }
-    fn wants_cow(self) -> bool {
-        matches!(self, ChangeSourceArg::Cow | ChangeSourceArg::All)
-    }
-}
-
 /// ステージ済み変更（`harness_sandbox::SandboxFs`のオーバーレイ）・CoW操作台帳を操作する
-/// サブコマンド（§オーバーレイFS「レビュー＆コミット」、M10。`--cow`統合はPhase 2）。
+/// サブコマンド（§オーバーレイFS「レビュー＆コミット」、M10）。CoW一本化（Phase 2）により
+/// `--staged`/`--cow`は同じ`SandboxFs`バックエンドを使うため、以前あった`--source
+/// staged|cow|all`は廃止した——`--session <id>`（省略時は最新）が指すセッションを
+/// `--staged`用の置き場・`--cow`用の置き場の順で自動的に探す（1セッションは常にどちらか
+/// 一方でしか起動されない、Phase 0の`conflicts_with_all`）。
 #[derive(Subcommand)]
 enum Commands {
-    /// 変更を一覧表示する（既定は`--source all`でstaged/CoW両方）。
+    /// 変更を一覧表示する。
     Changes {
-        /// 対象セッションID（`--source staged`では`.harness/sandbox/`、`--source cow`では
-        /// CoW upper置き場のセッションIDとして解決する。省略時はそれぞれ最も新しいもの）。
+        /// 対象セッションID（省略時は最も新しいもの）。
         #[arg(long)]
         session: Option<String>,
-        #[arg(long = "source", value_enum, default_value_t = ChangeSourceArg::All)]
-        source: ChangeSourceArg,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },
-    /// 変更を実FSへ選択適用する（既定は`--source all`）。
+    /// 変更を実FSへ選択適用する。
     Apply {
         #[arg(long)]
         session: Option<String>,
-        #[arg(long = "source", value_enum, default_value_t = ChangeSourceArg::All)]
-        source: ChangeSourceArg,
         /// 選択適用フィルタ（`*`ワイルドカード対応、例 `src/*`）。省略時は全件対象。
         #[arg(long)]
         only: Option<String>,
-        /// `_ext/`（workspace外ターゲット、例 `C:\Windows\x`）の適用を許可する。staged専用
-        /// （CoWはworkspace外への書込を記録しないため常に無関係）。
+        /// workspace外ターゲット（例 `C:\Windows\x`）の適用を許可する。Phase 2時点では
+        /// workspace外書込自体を記録しないため常に無関係（Phase 3で復活予定）。
         #[arg(long = "dangerously-allow", default_value_t = false)]
         dangerously_allow: bool,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },
     /// `apply`がbaseline照合の相違で拒否したコンフリクトを`git merge-file`の3-way mergeで
-    /// 解消する（既定は`--source all`）。非コンフリクト分はこのコマンドの実行過程で先に
-    /// 実FSへ適用される（`apply`と同じ経路を通るため）。自動マージできなかった分だけ
-    /// `$VISUAL`/`$EDITOR`（Windowsは既定`notepad.exe`）を起動して手で解消させる。
+    /// 解消する。非コンフリクト分はこのコマンドの実行過程で先に実FSへ適用される（`apply`と
+    /// 同じ経路を通るため）。自動マージできなかった分だけ`$VISUAL`/`$EDITOR`（Windowsは
+    /// 既定`notepad.exe`）を起動して手で解消させる。
     Resolve {
         #[arg(long)]
         session: Option<String>,
-        #[arg(long = "source", value_enum, default_value_t = ChangeSourceArg::All)]
-        source: ChangeSourceArg,
         /// 自動マージできた分もエディタで確認したい場合に指定する（既定はオフ＝
         /// 自動マージできた分は即適用する）。
         #[arg(long = "always-edit", default_value_t = false)]
         always_edit: bool,
     },
-    /// 変更を全て破棄する（既定は`--source all`）。
+    /// 変更を全て破棄する。
     Discard {
         #[arg(long)]
         session: Option<String>,
-        #[arg(long = "source", value_enum, default_value_t = ChangeSourceArg::All)]
-        source: ChangeSourceArg,
     },
     /// fs passthrough allowlist（軸2・D-13）の台帳保守サブコマンド。
     /// `--fs-allow`実行時フラグとは独立の、ユーザグローバル台帳を操作する副コマンド
@@ -278,8 +253,8 @@ enum FsAction {
 
 /// `harness cow`サブコマンドの各操作。Windows Tier2a `--cow`固有機能のため、Windows以外は
 /// エラーで終了する。単一セッション向けの一覧・適用・破棄は`harness changes`/`apply`/
-/// `discard --source cow`へ統合済み（Phase 2）——`list`だけは全workspace横断の棚卸し用
-/// として引き続きここに残す。
+/// `discard`（`--session`で対象のCoWセッションを自動的に見つける）へ統合済み（Phase 2）
+/// ——`list`だけは全workspace横断の棚卸し用として引き続きここに残す。
 #[derive(Subcommand)]
 enum CowAction {
     /// `%LOCALAPPDATA%\harness\data\cow\`配下にある全upper置き場を一覧表示する。
@@ -1035,53 +1010,51 @@ fn to_sandbox_fs_access(access: harness_config::FsAccess) -> harness_sandbox::Fs
     }
 }
 
-/// `source`が`cow`を含む場合に、`--session`（省略時は最新）からCoW upper_dirを解決する。
-/// Windows専用機構（Tier2a `--cow`）のため非Windowsでは常に`None`（`--source cow`単体を
-/// 明示された場合の「対象なし」判定は呼び出し元が行う）。
-#[cfg(windows)]
-fn cow_upper_dir_for_source(source: ChangeSourceArg, session: Option<&str>) -> Option<PathBuf> {
-    if source.wants_cow() {
-        resolve_cow_upper_dir(session)
-    } else {
-        None
+/// `--session <id>`（省略時は最新）から、そのセッションが使ったオーバーレイ置き場を解決する。
+/// `--staged`置き場（workspace内`.harness/sandbox/<id>`）を先に試し、無ければ`--cow`置き場
+/// （workspace外CoW upperディレクトリ、Windows専用）を試す——1セッションは常にどちらか
+/// 一方でしか起動されない（Phase 0の`conflicts_with_all`）ため、両方見つかることはない。
+/// どちらも見つからなければ`None`。
+fn resolve_session_overlay(
+    workspace_root: &Path,
+    session: Option<&str>,
+) -> Option<(StagingConfig, Option<PathBuf>)> {
+    if let Some(sandbox_dir) = resolve_sandbox_dir(workspace_root, session) {
+        if workspace_root.join(&sandbox_dir).exists() {
+            return Some((
+                StagingConfig {
+                    mode: StagingMode::Staged,
+                    sandbox_dir: Some(sandbox_dir),
+                },
+                None,
+            ));
+        }
     }
-}
-#[cfg(not(windows))]
-fn cow_upper_dir_for_source(_source: ChangeSourceArg, _session: Option<&str>) -> Option<PathBuf> {
+    if let Some(dir) = cow_upper_dir_checked(session) {
+        return Some((StagingConfig::default(), Some(dir)));
+    }
     None
 }
 
-/// CoW upper_dirから`apply`に必要な`(upper_dir, workspace_root)`ペアを解決する
-/// （セッションメタファイルが無ければ「どのworkspace向けか分からない」ため`None`）。
 #[cfg(windows)]
-fn cow_apply_target(dir: &Path) -> Option<(PathBuf, PathBuf)> {
-    harness_sandbox::workspace_ledger::read_cow_session_meta(dir)
-        .map(|m| (dir.to_path_buf(), PathBuf::from(m.workspace_root)))
+fn cow_upper_dir_checked(session: Option<&str>) -> Option<PathBuf> {
+    resolve_cow_upper_dir(session)
 }
 #[cfg(not(windows))]
-fn cow_apply_target(_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+fn cow_upper_dir_checked(_session: Option<&str>) -> Option<PathBuf> {
     None
 }
 
-/// `apply`/`changes`/`discard`サブコマンドを処理する。プロバイダ資格情報を一切必要としない
-/// （§非対話モード、プロンプトは一切送らない）。`--source`（既定`all`）でstagedマニフェスト・
-/// `--cow`操作台帳のどちらを対象にするか選べる（`plans/AppContainerベース Copy-on-Write
-/// ワークスペース設計書.md` §19 Phase 2、ツールを分けず統合する）。
+/// `apply`/`changes`/`discard`/`resolve`サブコマンドを処理する。プロバイダ資格情報を
+/// 一切必要としない（§非対話モード、プロンプトは一切送らない）。CoW一本化（Phase 2）に
+/// より`--staged`/`--cow`は同じ`SandboxFs`バックエンドを使うため、単一の`SandboxFs`だけを
+/// 組み立てて全サブコマンドで使い回す。
 fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
-    let (session, source, output_format_and_kind) = match &cmd {
-        Commands::Changes {
-            session,
-            source,
-            output_format,
-        } => (session.clone(), *source, Some(*output_format)),
-        Commands::Apply {
-            session,
-            source,
-            output_format,
-            ..
-        } => (session.clone(), *source, Some(*output_format)),
-        Commands::Discard { session, source } => (session.clone(), *source, None),
-        Commands::Resolve { session, source, .. } => (session.clone(), *source, None),
+    let (session, output_format_and_kind) = match &cmd {
+        Commands::Changes { session, output_format } => (session.clone(), Some(*output_format)),
+        Commands::Apply { session, output_format, .. } => (session.clone(), Some(*output_format)),
+        Commands::Discard { session } => (session.clone(), None),
+        Commands::Resolve { session, .. } => (session.clone(), None),
         // `Fs`/`Tier3`/`Prompt`はmain()側でそれぞれ専用の振り分け先へ処理済みで、ここには
         // 到達しない（workspace sandboxのstaging設定を一切必要としないため、`SandboxFs`を開く
         // このパスとは責務が別）。
@@ -1102,39 +1075,27 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
         }
     };
 
-    let staged_fs: Option<SandboxFs> = if source.wants_staged() {
-        match resolve_sandbox_dir(workspace_root, session.as_deref()) {
-            Some(sandbox_dir) => {
-                let staging = StagingConfig {
-                    mode: StagingMode::Staged,
-                    sandbox_dir: Some(sandbox_dir),
-                };
-                match SandboxFs::open(workspace_root, &staging) {
-                    Ok(fs) => Some(fs),
-                    Err(e) => {
-                        eprintln!("failed to open sandbox: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
-    let cow_upper_dir = cow_upper_dir_for_source(source, session.as_deref());
-
-    if staged_fs.is_none() && cow_upper_dir.is_none() {
+    let Some((staging, cow_upper_dir)) = resolve_session_overlay(workspace_root, session.as_deref())
+    else {
         eprintln!("no staged sandbox or CoW upper directory found (nothing to show)");
         return ExitCode::FAILURE;
-    }
+    };
+    let fs = match SandboxFs::open_with_cow(
+        workspace_root,
+        &staging,
+        &harness_core::ReadScopeConfig::default(),
+        cow_upper_dir.as_deref(),
+    ) {
+        Ok(fs) => fs,
+        Err(e) => {
+            eprintln!("failed to open sandbox: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     match cmd {
         Commands::Changes { .. } => {
-            let changes = match harness_sandbox::changes::list_unified_changes(
-                staged_fs.as_ref(),
-                cow_upper_dir.as_deref(),
-            ) {
+            let changes = match fs.change_set() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("failed to read changes: {e}");
@@ -1160,8 +1121,7 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                     }
                     for c in &changes {
                         println!(
-                            "{:<5} {:<7} {}",
-                            format!("{:?}", c.source).to_lowercase(),
+                            "{:<7} {}",
                             format!("{:?}", c.op).to_lowercase(),
                             c.path
                         );
@@ -1175,16 +1135,11 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
             dangerously_allow,
             ..
         } => {
-            let cow_target = cow_upper_dir.as_deref().and_then(cow_apply_target);
-            let report = match harness_sandbox::changes::apply_unified_changes(
-                staged_fs.as_ref(),
-                cow_target.as_ref().map(|(d, w)| (d.as_path(), w.as_path())),
-                &ApplyOptions {
-                    only_glob: only.as_deref(),
-                    only_paths: None,
-                    allow_ext: dangerously_allow,
-                },
-            ) {
+            let report = match fs.apply(&ApplyOptions {
+                only_glob: only.as_deref(),
+                only_paths: None,
+                allow_ext: dangerously_allow,
+            }) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("apply failed: {e}");
@@ -1230,16 +1185,13 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
             }
         }
         Commands::Resolve { always_edit, .. } => {
-            let cow_target = cow_upper_dir.as_deref().and_then(cow_apply_target);
-            let cow_pair = cow_target.as_ref().map(|(d, w)| (d.as_path(), w.as_path()));
-            let (report, prepared) =
-                match harness_sandbox::resolve::prepare_resolve(staged_fs.as_ref(), cow_pair) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("resolve failed: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
+            let (report, prepared) = match harness_sandbox::resolve::prepare_resolve(&fs) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("resolve failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             for p in &report.applied {
                 println!("applied (no conflict): {p}");
             }
@@ -1274,7 +1226,7 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                         }
                     }
                 }
-                match attempt.finalize(staged_fs.as_ref(), cow_pair) {
+                match attempt.finalize(&fs) {
                     Ok(()) => {
                         println!("resolved: {}", attempt.path);
                         resolved += 1;
@@ -1308,10 +1260,7 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                     }
                 }
             }
-            match harness_sandbox::changes::discard_unified_changes(
-                staged_fs.as_ref(),
-                cow_upper_dir.as_deref(),
-            ) {
+            match fs.discard() {
                 Ok(()) => {
                     println!("discarded changes");
                     ExitCode::SUCCESS
@@ -2437,9 +2386,9 @@ fn cow_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `--source cow`（`Commands::Changes`/`Apply`/`Discard`）向けに、セッションIDまたは
-/// 「最も新しいCoW upper置き場」からupper_dirを解決する。`resolve_sandbox_dir`のstaged版と
-/// 同じ「最新セッションを選ぶ」考え方（`main.rs`の既存ロジック）をCoW側にも適用する。
+/// `resolve_session_overlay`のCoW側解決に使う。セッションIDまたは「最も新しいCoW
+/// upper置き場」からupper_dirを解決する。`resolve_sandbox_dir`のstaged版と同じ
+/// 「最新セッションを選ぶ」考え方をCoW側にも適用する。
 #[cfg(windows)]
 fn resolve_cow_upper_dir(session: Option<&str>) -> Option<PathBuf> {
     if let Some(id) = session {

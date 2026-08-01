@@ -315,37 +315,16 @@ fn collect_files_relative(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// `upper_dir`直下の操作台帳（`.harness-cow-ops.jsonl`）を読み、現在の論理的な変更一覧を返す
-/// （`harness changes --source cow`・apply/discardの入力）。再生ロジック自体は
-/// `harness-change-ledger`の関数を呼ぶだけで、Redirector DLL初期化時の再生と同じコードを使う
-/// （2つに分かれると挙動がずれるため、`plans/AppContainerベース Copy-on-Write ワークスペース
-/// 設計書.md` §19.7参照）。台帳が無ければ空（変更なし）を返す。
+/// （`harness changes`・apply/discardの入力）。CoW一本化（Phase 2）により、実体は
+/// `harness_change_ledger::store::replay_ledger`（`--staged`のオーバーレイディレクトリにも
+/// 同じ関数を使う、`SandboxFs::change_set`参照）そのもの。台帳が無ければ空（変更なし）を返す。
 pub fn read_cow_ledger(upper_dir: &Path) -> Vec<harness_change_ledger::CowChange> {
-    let ledger_path = upper_dir.join(harness_change_ledger::COW_OPS_LEDGER_FILENAME);
-    let Ok(contents) = std::fs::read_to_string(&ledger_path) else {
-        return Vec::new();
-    };
-    let entries = harness_change_ledger::parse_ledger(&contents);
-    harness_change_ledger::replay(&entries)
+    harness_change_ledger::store::replay_ledger(upper_dir)
 }
 
 /// `apply`が実際にworkspace本体へ反映した`applied_paths`を台帳から取り除く（適用済みの
-/// 変更が`harness changes --source cow`に永続的に残り続けるのを防ぐ、`overlay.rs`の
-/// `prune_manifest`と同じ発想）。台帳が無ければ何もしない。
+/// 変更が`harness changes`に永続的に残り続けるのを防ぐ）。実体は`store::prune_ledger`。
 pub fn prune_cow_ledger(upper_dir: &Path, applied_paths: &[String]) -> std::io::Result<()> {
-    let ledger_path = upper_dir.join(harness_change_ledger::COW_OPS_LEDGER_FILENAME);
-    let Ok(contents) = std::fs::read_to_string(&ledger_path) else {
-        return Ok(());
-    };
-    let entries = harness_change_ledger::parse_ledger(&contents);
-    let mut out = String::new();
-    for e in entries {
-        if applied_paths.iter().any(|p| p == &e.path) {
-            continue;
-        }
-        if let Ok(line) = serde_json::to_string(&e) {
-            out.push_str(&line);
-            out.push('\n');
-        }
-    }
-    std::fs::write(&ledger_path, out)
+    harness_change_ledger::store::prune_ledger(upper_dir, applied_paths);
+    Ok(())
 }

@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppState, ChangesPanelState, ToolCardStatus, TranscriptItem, SPINNER_FRAMES};
 use crate::diff::DiffKind;
-use harness_sandbox::{ManifestOp, ManifestTarget};
+use harness_sandbox::ManifestOp;
 
 /// 入力欄が自動で伸びる最大行数。これを超えると内部スクロールする（カーソル行が
 /// 常に見えるよう毎フレーム再計算する。transcriptの`scroll_offset`のような永続的な
@@ -470,10 +470,6 @@ fn render_changes_panel(f: &mut Frame, area: Rect, panel: &ChangesPanelState) {
                     ManifestOp::Modify => "M",
                     ManifestOp::Delete => "D",
                 };
-                let target_glyph = match row.entry.target {
-                    ManifestTarget::Ext => " (ext)",
-                    _ => "",
-                };
                 let mark = if panel.rejected.contains(&i) {
                     "[ ]"
                 } else {
@@ -486,7 +482,7 @@ fn render_changes_panel(f: &mut Frame, area: Rect, panel: &ChangesPanelState) {
                     Color::White
                 };
                 Line::from(Span::styled(
-                    format!("{cursor}{mark} {op_glyph} {}{target_glyph}", row.entry.path),
+                    format!("{cursor}{mark} {op_glyph} {}", row.entry.path),
                     Style::default().fg(color),
                 ))
             })

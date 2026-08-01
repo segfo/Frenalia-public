@@ -1924,11 +1924,8 @@ mod tests {
         ChangeRow {
             entry: harness_sandbox::ChangeEntry {
                 op: harness_sandbox::ManifestOp::Create,
-                target: harness_sandbox::ManifestTarget::Tree,
                 path: path.to_string(),
-                overlay_path: format!("overlay/{path}"),
                 baseline_hash: None,
-                new_hash: Some("h".to_string()),
             },
             diff: Vec::new(),
         }

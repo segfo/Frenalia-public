@@ -102,7 +102,7 @@ struct PathState {
 }
 
 /// 台帳エントリを順に再生し、パスごとの「セッション開始時点と比べた最終的な変更」の一覧を
-/// 返す（`harness changes --source cow`・apply/discardの入力になる）。
+/// 返す（`harness changes`・apply/discardの入力になる）。
 ///
 /// リネームは「旧パスのDelete＋新パスのCreate」という2つの独立したパスへのエントリとして
 /// 記録されているため、ここでは特別扱いせずパスごとに素直に畳み込む。ある1つのパスが

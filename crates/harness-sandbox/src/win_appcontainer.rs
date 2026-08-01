@@ -4673,9 +4673,26 @@ mod force_grant_gate_tests {
 #[cfg(all(windows, test))]
 mod cow_diagnostics {
     use super::*;
-    use crate::changes;
     use crate::manifest::ManifestOp;
-    use crate::overlay::ApplyOptions;
+    use crate::overlay::{ApplyOptions, ApplyReport, SandboxError, SandboxFs};
+    use harness_core::{ReadScopeConfig, StagingConfig};
+
+    /// CoW一本化（Phase 2）後の`--cow` apply呼び出しヘルパー。`changes::apply_unified_changes`
+    /// （Phase 2で削除、`SandboxFs`自身が唯一のapply実装になった）の実機E2Eテストからの
+    /// 呼び出しをこの薄いラッパへ置き換えている。
+    fn apply_cow(
+        upper_dir: &std::path::Path,
+        workspace_root: &std::path::Path,
+        opts: &ApplyOptions,
+    ) -> Result<ApplyReport, SandboxError> {
+        let fs = SandboxFs::open_with_cow(
+            workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(upper_dir),
+        )?;
+        fs.apply(opts)
+    }
     use std::sync::Mutex;
 
     /// `cow_write_from_wow64_grandchild_process_is_redirected_to_upper`と
@@ -5180,16 +5197,16 @@ mod cow_diagnostics {
         assert_eq!(new.op, ManifestOp::Create);
         assert_eq!(new.baseline_hash, None);
 
-        let report = changes::apply_unified_changes(
-            None,
-            Some((upper.path(), workspace.path())),
+        let report = apply_cow(
+            upper.path(),
+            workspace.path(),
             &ApplyOptions {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
             },
         )
-        .expect("apply_unified_changes should succeed");
+        .expect("apply_cow should succeed");
         assert!(
             report.applied.iter().any(|p| p == "important.txt"),
             "applied={:?}",
@@ -5351,9 +5368,9 @@ mod cow_diagnostics {
         assert!(!workspace.path().join("new.txt").exists());
 
         // セッションAを先に適用する。
-        let report_a = changes::apply_unified_changes(
-            None,
-            Some((upper_a.path(), workspace.path())),
+        let report_a = apply_cow(
+            upper_a.path(),
+            workspace.path(),
             &ApplyOptions {
                 only_glob: None,
                 only_paths: None,
@@ -5376,9 +5393,9 @@ mod cow_diagnostics {
         // セッションBを後から適用する。workspaceは既にAの内容へ変わっているため、Bのbaseline
         // （important.txt="original"、new.txt=None＝新規作成想定）はどちらも現在値と食い違い、
         // TOCTOU競合として拒否されるはず（`report.applied`は空、両方`conflicts`に入る）。
-        let report_b = changes::apply_unified_changes(
-            None,
-            Some((upper_b.path(), workspace.path())),
+        let report_b = apply_cow(
+            upper_b.path(),
+            workspace.path(),
             &ApplyOptions {
                 only_glob: None,
                 only_paths: None,
@@ -5482,16 +5499,16 @@ mod cow_diagnostics {
         );
         assert!(!workspace.path().join("new.txt").exists());
 
-        let report = changes::apply_unified_changes(
-            None,
-            Some((upper.path(), workspace.path())),
+        let report = apply_cow(
+            upper.path(),
+            workspace.path(),
             &ApplyOptions {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
             },
         )
-        .expect("apply_unified_changes should succeed");
+        .expect("apply_cow should succeed");
         assert!(report.applied.iter().any(|p| p == "old.txt"), "applied={:?}", report.applied);
         assert!(report.applied.iter().any(|p| p == "new.txt"), "applied={:?}", report.applied);
 
@@ -5597,16 +5614,16 @@ mod cow_diagnostics {
             "a freshly-loaded DLL must still treat doomed.txt as deleted (ledger replay, §19.7)"
         );
 
-        let report = changes::apply_unified_changes(
-            None,
-            Some((upper.path(), workspace.path())),
+        let report = apply_cow(
+            upper.path(),
+            workspace.path(),
             &ApplyOptions {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
             },
         )
-        .expect("apply_unified_changes should succeed");
+        .expect("apply_cow should succeed");
         assert!(report.applied.iter().any(|p| p == "doomed.txt"), "applied={:?}", report.applied);
         assert!(!workspace.path().join("doomed.txt").exists());
     }

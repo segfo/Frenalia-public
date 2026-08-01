@@ -19,7 +19,6 @@
 //! （`StagingConfig.sandbox_dir`はworkspace_rootからの相対パス）に置くため、この`WorkspaceJail`
 //! 1つだけで実FS・オーバーレイの両方を仲介できる（新たなambient authorityを増やさない）。
 
-pub mod changes;
 pub mod manifest;
 pub mod overlay;
 pub mod read_scope;
@@ -74,8 +73,7 @@ pub mod smb_share;
 #[cfg(target_os = "linux")]
 pub mod linux_bwrap;
 
-pub use changes::{ChangeSource, UnifiedChangeEntry};
-pub use manifest::{ManifestOp, ManifestTarget};
+pub use manifest::ManifestOp;
 pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};
 pub use read_scope::{ReadScope, ReadScopeError};
 pub use secret_env::{build_child_env, git_hardening_env};

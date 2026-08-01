@@ -221,14 +221,13 @@ fn cow_upper_dir(session_id: &str) -> PathBuf {
 }
 
 /// `--cwd`はclapのトップレベル引数であり、サブコマンド名(`apply`)より前に置かないと
-/// 「unexpected argument」で拒否される(手動確認済み)。
+/// 「unexpected argument」で拒否される(手動確認済み)。CoW一本化（Phase 2）により`--source`は
+/// 廃止済み——`--session`が指すCoWセッションを`apply`が自動的に見つける。
 fn apply_cow(ws: &Path, session_id: &str, only: Option<&str>) -> Result<serde_json::Value, String> {
     let mut args = vec![
         "--cwd".to_string(),
         ws.to_str().unwrap().to_string(),
         "apply".to_string(),
-        "--source".to_string(),
-        "cow".to_string(),
         "--session".to_string(),
         session_id.to_string(),
         "--output-format".to_string(),
@@ -539,8 +538,6 @@ fn case_h_toctou_conflict() -> Result<(), String> {
             "--cwd",
             ws.to_str().unwrap(),
             "discard",
-            "--source",
-            "cow",
             "--session",
             &session2,
         ])
@@ -552,7 +549,7 @@ fn case_h_toctou_conflict() -> Result<(), String> {
 /// I: host内蔵`write_file`ツール自身が`--cow`時にCoW保護を経由すること（2026-08-01実機ドライ
 /// ランで発見したバグの回帰確認、Phase 1修正）。`run_shell`経由（PowerShellの`Set-Content`）
 /// ではなく`write_file`ツールを直接呼ぶ台本で、(a) workspace本体がwrite_file実行直後は
-/// 無傷、(b) 新規CoWセッションが記録され、(c) `apply --source cow`で反映される、ことを検証する。
+/// 無傷、(b) 新規CoWセッションが記録され、(c) `apply`で反映される、ことを検証する。
 fn case_i_write_file_tool_is_captured_by_cow() -> Result<(), String> {
     let ws = case_dir("cow-i-write-file-tool");
     let before = list_cow_sessions();

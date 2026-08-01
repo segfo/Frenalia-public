@@ -5,6 +5,10 @@
 //! 箇所には標準的なconflict markerが残るので、それをユーザーのエディタで開いて手で解消させる。
 //! `plans/e2e-1-2-async-harp.md`「コンフリクト解消コマンド」設計方針参照。
 //!
+//! CoW一本化（Phase 2）以降、`--staged`/`--cow`は同じ`SandboxFs`バックエンドを使うため、
+//! このモジュールは`staged_fs: Option<&SandboxFs>`/`cow: Option<(&Path, &Path)>`という
+//! 2系統の引数ではなく、単一の`fs: &SandboxFs`だけを受け取る。
+//!
 //! CLI（`crates/harness-cli`）とTUI（`crates/harness-tui`）の両方から呼ばれる想定のため、
 //! エディタプロセスの起動そのもの（TUIは端末の中断・復帰を挟む必要がある）はこのモジュールの
 //! 責務にしない——`prepare_resolve`が3-way mergeまで済ませた`MergeAttempt`一覧を返し、
@@ -14,8 +18,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::changes::ChangeSource;
-use crate::manifest::ManifestTarget;
 use crate::overlay::{ApplyOptions, ApplyReport, SandboxError, SandboxFs};
 
 #[derive(Debug, thiserror::Error)]
@@ -39,19 +41,14 @@ pub enum ResolveError {
 /// conflict markerが残っているので、呼び出し側がエディタで開いて保存させてから`finalize`
 /// すること。
 pub struct MergeAttempt {
-    pub source: ChangeSource,
-    pub target: ManifestTarget,
-    /// staged: workspace相対パス（Tree）または絶対パス（Ext）。CoW: workspace相対パス。
+    /// workspace相対パス（`/`区切り）。
     pub path: String,
-    /// stagedのみ意味を持つ（オーバーレイ実体の除去・マニフェストprune用）。CoWは空文字列。
-    overlay_path: String,
     pub merged_path: PathBuf,
     pub needs_edit: bool,
 }
 
 /// baselineミラーが無い等、3-way mergeの材料が揃わずスキップしたコンフリクト。
 pub struct SkippedConflict {
-    pub source: ChangeSource,
     pub path: String,
     pub reason: String,
 }
@@ -68,19 +65,12 @@ pub struct PreparedResolve {
 /// 設計「まずapplyと同じ経路でコンフリクト一覧を求める」）。コンフリクトした各パスについて
 /// `mine`/`base`/`theirs`を集め`git merge-file`を試みる。`git`がPATHに無ければ、実際に何かを
 /// 書く前に`ResolveError::GitNotFound`で即座に失敗する。
-pub fn prepare_resolve(
-    staged_fs: Option<&SandboxFs>,
-    cow: Option<(&Path, &Path)>,
-) -> Result<(ApplyReport, PreparedResolve), ResolveError> {
-    let report = crate::changes::apply_unified_changes(
-        staged_fs,
-        cow,
-        &ApplyOptions {
-            only_glob: None,
-            only_paths: None,
-            allow_ext: false,
-        },
-    )?;
+pub fn prepare_resolve(fs: &SandboxFs) -> Result<(ApplyReport, PreparedResolve), ResolveError> {
+    let report = fs.apply(&ApplyOptions {
+        only_glob: None,
+        only_paths: None,
+        allow_ext: false,
+    })?;
     if report.conflicts.is_empty() {
         return Ok((
             report,
@@ -97,65 +87,28 @@ pub fn prepare_resolve(
     let mut attempts = Vec::new();
     let mut skipped = Vec::new();
 
-    if let Some(fs) = staged_fs {
-        for e in fs.change_set()? {
-            if !report.conflicts.iter().any(|p| p == &e.path) {
-                continue;
-            }
-            match (
-                fs.baseline_mirror_content(&e.overlay_path),
-                fs.real_content(e.target, &e.path),
-            ) {
-                (Some(base), Some(theirs)) => {
-                    let mine = fs.overlay_content(&e.overlay_path)?;
-                    attempts.push(build_merge_attempt(
-                        &git,
-                        ChangeSource::Staged,
-                        e.target,
-                        &e.path,
-                        &e.overlay_path,
-                        &mine,
-                        &base,
-                        &theirs,
-                        tmp_dir.path(),
-                    )?);
-                }
-                _ => skipped.push(no_baseline_skip(ChangeSource::Staged, &e.path)),
-            }
+    for e in fs.change_set()? {
+        if !report.conflicts.iter().any(|p| p == &e.path) {
+            continue;
         }
-    }
-
-    #[cfg(windows)]
-    if let Some((upper_dir, workspace_root)) = cow {
-        for c in crate::workspace_ledger::read_cow_ledger(upper_dir) {
-            if !report.conflicts.iter().any(|p| p == &c.path) {
-                continue;
+        match (
+            fs.baseline_mirror_content(&e.path),
+            fs.real_content(&e.path),
+        ) {
+            (Some(base), Some(theirs)) => {
+                // 削除エントリはオーバーレイに実体を持たないため`mine`は空文字列扱いにする
+                // （削除の3-way mergeとして自然な表現）。
+                let mine = fs.overlay_content(&e.path).unwrap_or_default();
+                attempts.push(build_merge_attempt(
+                    &git,
+                    &e.path,
+                    &mine,
+                    &base,
+                    &theirs,
+                    tmp_dir.path(),
+                )?);
             }
-            let base_path = upper_dir
-                .join(harness_change_ledger::COW_BASELINE_DIRNAME)
-                .join(c.path.replace('/', "\\"));
-            let mine_path = upper_dir.join(c.path.replace('/', "\\"));
-            let theirs_path = workspace_root.join(c.path.replace('/', "\\"));
-            match (
-                std::fs::read_to_string(&base_path),
-                std::fs::read_to_string(&mine_path),
-                std::fs::read_to_string(&theirs_path),
-            ) {
-                (Ok(base), Ok(mine), Ok(theirs)) => {
-                    attempts.push(build_merge_attempt(
-                        &git,
-                        ChangeSource::Cow,
-                        ManifestTarget::Tree,
-                        &c.path,
-                        "",
-                        &mine,
-                        &base,
-                        &theirs,
-                        tmp_dir.path(),
-                    )?);
-                }
-                _ => skipped.push(no_baseline_skip(ChangeSource::Cow, &c.path)),
-            }
+            _ => skipped.push(no_baseline_skip(&e.path)),
         }
     }
 
@@ -169,9 +122,8 @@ pub fn prepare_resolve(
     ))
 }
 
-fn no_baseline_skip(source: ChangeSource, path: &str) -> SkippedConflict {
+fn no_baseline_skip(path: &str) -> SkippedConflict {
     SkippedConflict {
-        source,
         path: path.to_string(),
         reason: "no baseline recorded for this path (predates `resolve` support, or created \
                   outside this session); resolve manually (--only to exclude from apply, or \
@@ -180,13 +132,9 @@ fn no_baseline_skip(source: ChangeSource, path: &str) -> SkippedConflict {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_merge_attempt(
     git: &Path,
-    source: ChangeSource,
-    target: ManifestTarget,
     path: &str,
-    overlay_path: &str,
     mine: &str,
     base: &str,
     theirs: &str,
@@ -220,10 +168,7 @@ fn build_merge_attempt(
     let needs_edit = !output.status.success();
 
     Ok(MergeAttempt {
-        source,
-        target,
         path: path.to_string(),
-        overlay_path: overlay_path.to_string(),
         merged_path,
         needs_edit,
     })
@@ -263,11 +208,7 @@ impl MergeAttempt {
     /// 実workspaceへ確定・オーバーレイ/台帳エントリを除去する。`<<<<<<<`等のconflict markerが
     /// まだ残っていても、ユーザーが明示的に保存した内容を最終判断として尊重しそのまま書く
     /// （設計方針4）——ただし残っていた場合はstderrへ警告だけ出す。
-    pub fn finalize(
-        &self,
-        staged_fs: Option<&SandboxFs>,
-        cow: Option<(&Path, &Path)>,
-    ) -> Result<(), ResolveError> {
+    pub fn finalize(&self, fs: &SandboxFs) -> Result<(), ResolveError> {
         let content = std::fs::read_to_string(&self.merged_path)?;
         if content.contains("<<<<<<<") || content.contains(">>>>>>>") {
             eprintln!(
@@ -275,32 +216,9 @@ impl MergeAttempt {
                 self.path
             );
         }
-        match self.source {
-            ChangeSource::Staged => {
-                let fs = staged_fs.expect("staged MergeAttempt requires staged_fs");
-                fs.finalize_resolved(self.target, &self.path, &self.overlay_path, &content)?;
-            }
-            ChangeSource::Cow => finalize_cow(cow, &self.path, &content)?,
-        }
+        fs.finalize_resolved(&self.path, &content)?;
         Ok(())
     }
-}
-
-#[cfg(windows)]
-fn finalize_cow(cow: Option<(&Path, &Path)>, path: &str, content: &str) -> Result<(), ResolveError> {
-    let (upper_dir, workspace_root) = cow.expect("cow MergeAttempt requires cow upper/workspace");
-    let real_abs = workspace_root.join(path.replace('/', "\\"));
-    if let Some(parent) = real_abs.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&real_abs, content)?;
-    let _ = crate::workspace_ledger::prune_cow_ledger(upper_dir, std::slice::from_ref(&path.to_string()));
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn finalize_cow(_cow: Option<(&Path, &Path)>, _path: &str, _content: &str) -> Result<(), ResolveError> {
-    unreachable!("CoW MergeAttempt is only constructed under #[cfg(windows)] in prepare_resolve")
 }
 
 #[cfg(test)]
@@ -331,7 +249,7 @@ mod tests {
         )
         .unwrap();
 
-        let (report, prepared) = prepare_resolve(Some(&fs), None).unwrap();
+        let (report, prepared) = prepare_resolve(&fs).unwrap();
         assert_eq!(report.conflicts, vec!["a.txt".to_string()]);
         assert!(prepared.skipped.is_empty());
         assert_eq!(prepared.attempts.len(), 1);
@@ -341,7 +259,7 @@ mod tests {
         let merged = std::fs::read_to_string(&attempt.merged_path).unwrap();
         assert_eq!(merged, "line1-mine\nline2\nline3\nline4\nline5-theirs\n");
 
-        attempt.finalize(Some(&fs), None).unwrap();
+        attempt.finalize(&fs).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "line1-mine\nline2\nline3\nline4\nline5-theirs\n"
@@ -357,7 +275,7 @@ mod tests {
         fs.write_string("a.txt", "line1-mine\n").unwrap();
         std::fs::write(dir.path().join("a.txt"), "line1-theirs\n").unwrap();
 
-        let (_report, prepared) = prepare_resolve(Some(&fs), None).unwrap();
+        let (_report, prepared) = prepare_resolve(&fs).unwrap();
         assert_eq!(prepared.attempts.len(), 1);
         let attempt = &prepared.attempts[0];
         assert!(attempt.needs_edit, "overlapping edits must not auto-apply");
@@ -365,7 +283,7 @@ mod tests {
         assert!(merged.contains("<<<<<<<"));
 
         // ユーザーがエディタで保存したものと見なして、そのまま確定させる。
-        attempt.finalize(Some(&fs), None).unwrap();
+        attempt.finalize(&fs).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             merged
@@ -379,10 +297,11 @@ mod tests {
         let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
         fs.write_string("a.txt", "mine\n").unwrap();
         // 本機能導入前に発生したコンフリクトを模して、baselineミラーだけを消す。
-        std::fs::remove_file(dir.path().join(".harness/sandbox/s1/baseline/a.txt")).unwrap();
+        std::fs::remove_file(dir.path().join(".harness/sandbox/s1/.harness-cow-baseline/a.txt"))
+            .unwrap();
         std::fs::write(dir.path().join("a.txt"), "theirs\n").unwrap();
 
-        let (report, prepared) = prepare_resolve(Some(&fs), None).unwrap();
+        let (report, prepared) = prepare_resolve(&fs).unwrap();
         assert_eq!(report.conflicts, vec!["a.txt".to_string()]);
         assert!(prepared.attempts.is_empty());
         assert_eq!(prepared.skipped.len(), 1);

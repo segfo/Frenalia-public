@@ -46,9 +46,9 @@ pub fn baseline_hash_and_mirror(upper_dir: &Path, workspace_root: &Path, rel: &s
     if let Some(existing) = existing_baseline(upper_dir, rel) {
         return existing;
     }
-    let workspace_abs = workspace_root.join(rel.replace('/', "\\"));
+    let workspace_abs = workspace_root.join(rel);
     let bytes = std::fs::read(&workspace_abs).ok()?;
-    let mirror_path = upper_dir.join(COW_BASELINE_DIRNAME).join(rel.replace('/', "\\"));
+    let mirror_path = upper_dir.join(COW_BASELINE_DIRNAME).join(rel);
     if let Some(parent) = mirror_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -93,7 +93,39 @@ pub fn replay_ledger(upper_dir: &Path) -> Vec<crate::CowChange> {
 
 /// `rel`のupper側実体パス（`<upper_dir>/<rel>`）。
 pub fn upper_path_for(upper_dir: &Path, rel: &str) -> PathBuf {
-    upper_dir.join(rel.replace('/', "\\"))
+    upper_dir.join(rel)
+}
+
+/// baselineミラー（`<upper_dir>/.harness-cow-baseline/<rel>`）の内容を読む
+/// （`resolve`の`base`側材料・TUI変更パネルのdiffプレビュー用）。無ければ`None`
+/// （baselineミラー導入前に発生したコンフリクト等）。
+pub fn read_baseline_mirror(upper_dir: &Path, rel: &str) -> Option<String> {
+    std::fs::read_to_string(upper_dir.join(COW_BASELINE_DIRNAME).join(rel)).ok()
+}
+
+/// upper側の現在内容を読む（`resolve`の`mine`側材料・TUI変更パネルのdiffプレビュー用）。
+pub fn read_overlay_content(upper_dir: &Path, rel: &str) -> Option<String> {
+    std::fs::read_to_string(upper_path_for(upper_dir, rel)).ok()
+}
+
+/// `apply`/`resolve`が実際にworkspace本体へ反映した`applied_paths`を台帳から取り除く
+/// （適用済みの変更が`change_set()`に永続的に残り続けるのを防ぐ）。台帳が無ければ何もしない。
+pub fn prune_ledger(upper_dir: &Path, applied_paths: &[String]) {
+    let ledger_path = upper_dir.join(COW_OPS_LEDGER_FILENAME);
+    let Ok(contents) = std::fs::read_to_string(&ledger_path) else {
+        return;
+    };
+    let mut out = String::new();
+    for entry in parse_ledger(&contents) {
+        if applied_paths.iter().any(|p| p == &entry.path) {
+            continue;
+        }
+        if let Ok(line) = serde_json::to_string(&entry) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    let _ = std::fs::write(&ledger_path, out);
 }
 
 /// `C:\Windows\probe.txt` → `c/Windows/probe.txt`、`/etc/passwd` → `etc/passwd` のように、
