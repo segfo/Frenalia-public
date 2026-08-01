@@ -1684,20 +1684,56 @@ pub fn preflight(
     let mut needs_elevation: Vec<crate::privhelper::FsAllowGrant> = Vec::new();
     let mut netfilterd_chain_attempted = false;
 
-    for fp in passthrough {
-        if !fp.path.exists() {
+    for requested in passthrough {
+        if !requested.path.exists() {
             let reason = "path does not exist, skipped".to_string();
-            warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
-            denied_passthrough.push((fp.path.clone(), fp.access.label().to_string(), reason));
+            warnings.push(format!("fs-allow {} : {reason}", requested.path.display()));
+            denied_passthrough.push((
+                requested.path.clone(),
+                requested.access.label().to_string(),
+                reason,
+            ));
             continue;
         }
+
+        // D-30（`--cow`）: fs-allowの`:rw`要求は、実際にOSへ付与するACLではRead止まりにする
+        // （実行権限は与えない、`FsAccess::Read`。`FsAccess::ReadExec`ではない点に注意）。
+        // `--cow`が存在する理由は「変更のあったファイルだけを単位としてレビュー・ロールバック
+        // できること」（CoW＝ファイル単位の巻き戻し可能性が本質、スナップショット全体コピー
+        // 方式ではない）であり、明示的にRO/ReadExecなfs-allowエントリはそもそも書込の余地が
+        // 無いので対象外——ここで動的にRWをRO化しているのは、あくまで「元々RWだったものへ
+        // 強制的にRedirector DLLのフックを通す書込経路」を作るための道具であって、頼まれても
+        // いない実行権限まで付与する理由は無い（ユーザー指摘により`ReadExec`から`Read`へ訂正、
+        // 2026-08-02）。workspace本体が`--cow`下で`grant_ace_inheritable_ro`
+        // （`FsAccess::ReadExec`）を使うのは、workspace内のツール・スクリプトを実行できる
+        // 必要があるというworkspace固有の事情であり、任意の外部fs-allowパスには適用されない。
+        // 書込境界はACLであり、Redirector DLLの`_ext` captureはあくまで透過性のための利便性
+        // （D-01「フックは境界にしない」）。ここで実RWを付与してしまうと、DLL注入失敗・バグ・
+        // 迂回時にfail-closeせず実ファイルへ直接書けてしまい、workspace本体との一貫性が崩れる
+        // （BUG-043発見時の実機検証を経てユーザー指摘により追加、2026-08-02）。`requested`
+        // （ユーザーが本来要求したアクセス）は`granted_passthrough`の記録に使い、
+        // `ext_capture_roots`（`crates/harness-tools/src/shell.rs`）の判定材料として残す。
+        let downgrade_to_ro =
+            matches!(write_mode, WorkspaceWriteMode::Cow { .. }) && requested.access.is_read_write();
+        let effective_access = if downgrade_to_ro {
+            FsAccess::Read
+        } else {
+            requested.access
+        };
+        let fp = FsPassthrough {
+            path: requested.path.clone(),
+            access: effective_access,
+            forced: requested.forced,
+        };
+        let fp = &fp;
+        let requested_rw = requested.access.is_read_write();
 
         // 事前チェック（決定1）: 既にsid宛のACEが要求マスクの上位集合を持っていれば、
         // 本体内のwalkもprivhelperのUACも一切スキップする（ユーザ所有パスの再実行はUAC無し）。
         let required = required_passthrough_mask(fp.access);
         let already_sufficient = matches!(sid_ace_mask(&fp.path, sid.as_psid()), Ok(Some(existing)) if existing & required == required);
         if already_sufficient {
-            granted_passthrough.push((fp.path.clone(), fp.access.is_read_write()));
+            granted_passthrough.push((fp.path.clone(), requested_rw));
             if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
                 denied_passthrough.push((
                     fp.path.clone(),
@@ -1712,7 +1748,7 @@ pub fn preflight(
         let grant_result = grant_ace_inheritable_access(&fp.path, sid.as_psid(), fp.access);
         match grant_result {
             Ok(()) => {
-                granted_passthrough.push((fp.path.clone(), fp.access.is_read_write()));
+                granted_passthrough.push((fp.path.clone(), requested_rw));
                 if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
                     denied_passthrough.push((
                         fp.path.clone(),
@@ -4817,6 +4853,27 @@ mod cow_diagnostics {
         }];
         let outcome = preflight(workspace.path(), &passthrough, None, &write_mode)
             .expect("preflight (cow + fs-allow rw)");
+
+        // D-01/D-30: `--cow`下では`--fs-allow <path>:rw`要求でも実ACLは読取のみに留め、
+        // 頼まれていない実行権限も付与しない（境界はACLのまま、DLLの`_ext` captureは
+        // あくまで透過性。CoWの本質は「変更のあったファイル単位でレビュー・ロールバック
+        // できること」であり、明示的にRO/ReadExecなエントリはそもそも書込の余地が無いので
+        // 対象外——ユーザー指摘により追加・訂正、2026-08-02）。
+        let actual_mask = sid_ace_mask(&external, sid.as_psid())
+            .expect("sid_ace_mask should succeed")
+            .expect("package SID must have some ACE on the fs-allow root");
+        // `FILE_GENERIC_READ`と`FILE_GENERIC_EXECUTE`はSYNCHRONIZE/READ_CONTROL等の
+        // 標準ビットを共有するため、個別ビットのAND判定では正しく切り分けられない
+        // （どちらのマスクにも0x120080相当が含まれる）。「`fs_access_mask(FsAccess::Read)`と
+        // 完全一致」で判定する方が正確。
+        assert_eq!(
+            actual_mask,
+            fs_access_mask(FsAccess::Read),
+            "--cow下ではfs-allow:rwでも実ACLはFsAccess::Read相当ちょうどでなければならない\
+             （書込/削除はもちろん、頼まれていない実行権限も含まれてはいけない。境界はACL、\
+             _ext captureは透過性のみ）: actual_mask={actual_mask:#x}"
+        );
+
         let ext_capture_roots: Vec<std::path::PathBuf> = outcome
             .granted_passthrough
             .iter()
