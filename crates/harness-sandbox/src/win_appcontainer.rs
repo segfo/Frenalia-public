@@ -892,6 +892,10 @@ pub enum NetworkCapability {
 pub struct CowInject<'a> {
     pub workspace_root: &'a Path,
     pub upper_dir: &'a Path,
+    /// Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴。
+    /// Redirector DLLへ`HARNESS_COW_EXT_ROOTS`として渡し、これら配下への書込も`_ext/<key>`
+    /// 経由で操作台帳へcaptureする。空なら`--cow`単体（workspace内のみcapture、既存挙動）。
+    pub ext_capture_roots: &'a [PathBuf],
 }
 
 /// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する。
@@ -1045,6 +1049,15 @@ fn spawn_impl(
             "HARNESS_COW_READY_HANDLE".to_string(),
             (ready_write.0 as usize).to_string(),
         ));
+        if !c.ext_capture_roots.is_empty() {
+            let joined = c
+                .ext_capture_roots
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(";");
+            env_owned.push(("HARNESS_COW_EXT_ROOTS".to_string(), joined));
+        }
         &env_owned
     } else {
         env
@@ -1544,6 +1557,7 @@ fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Op
 /// （TrustedInstaller所有等）で失敗した「部分適用」ケースは、`sid_ace_mask`でrootを権威的に
 /// プローブして`Ok`/`Err`によらず記録する（BUG-017: 記録漏れが「撤収経路の無い孤立ACE」を
 /// 生むため、幻の台帳エントリより孤立ACEの方を重く見て記録側に倒す）。
+#[derive(Debug)]
 pub struct PreflightOutcome {
     pub warnings: Vec<String>,
     pub denied_passthrough: Vec<(std::path::PathBuf, String, String)>,
@@ -4744,6 +4758,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn with cow injection should succeed");
@@ -4773,6 +4788,159 @@ mod cow_diagnostics {
         let upper_new_content = std::fs::read_to_string(upper.path().join("new.txt"))
             .expect("upper new.txt must exist");
         assert_eq!(upper_new_content, "created-by-child");
+    }
+
+    /// Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴
+    /// （`preflight`の`granted_passthrough`）への子プロセスの書込が、Redirector DLLにより
+    /// `_ext/<key>`経由でupperへcaptureされ、実ターゲットには一切触れないことを確認する。
+    #[test]
+    #[ignore]
+    fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_untouched() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+        // `fs_passthrough_ro_then_rw_then_revoke_cycle`と同じ理由（コメント参照）で
+        // `C:\`直下1階層に置く（中間祖先のtraverse ACE不足による未解決rw書込を避ける）。
+        let external = std::path::PathBuf::from(format!(
+            "C:\\harness-Tier2a-cow-ext-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&external).expect("create external rw root");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        let passthrough = [FsPassthrough {
+            path: external.clone(),
+            access: FsAccess::ReadWrite,
+            forced: false,
+        }];
+        let outcome = preflight(workspace.path(), &passthrough, None, &write_mode)
+            .expect("preflight (cow + fs-allow rw)");
+        let ext_capture_roots: Vec<std::path::PathBuf> = outcome
+            .granted_passthrough
+            .iter()
+            .filter(|(_, writable)| *writable)
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert!(
+            !ext_capture_roots.is_empty(),
+            "fs-allow rw grant should have succeeded: {outcome:?}"
+        );
+
+        let probe_path = external.join("probe.txt");
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; try {{ \
+                Set-Content -LiteralPath '{}' -Value 'ext-write' -NoNewline; exit 0 \
+            }} catch {{ Write-Output $_.Exception.Message; exit 9 }}",
+            probe_path.display()
+        );
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", &script],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+                ext_capture_roots: &ext_capture_roots,
+            }),
+        )
+        .expect("spawn with cow+ext injection should succeed");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+        assert!(
+            !probe_path.exists(),
+            "real external target must stay untouched (captured into upper's _ext instead)"
+        );
+        let original = harness_change_ledger::store::normalize_abs_path(&probe_path.to_string_lossy());
+        let key = harness_change_ledger::store::ext_key(&original).expect("ext_key");
+        let upper_ext_path = upper.path().join("_ext").join(&key);
+        assert_eq!(
+            std::fs::read_to_string(&upper_ext_path).expect("upper _ext copy must exist"),
+            "ext-write"
+        );
+
+        let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+        let entry = ledger
+            .iter()
+            .find(|c| c.path == original)
+            .expect("ledger must record the ext write keyed by the original absolute path");
+        assert_eq!(entry.op, ManifestOp::Create);
+
+        let _ = std::fs::remove_dir_all(&external);
+    }
+
+    /// Phase 4（設計書§19.8）: workspace内でも`--fs-allow`のRW穴（ext capture root）でもない
+    /// 絶対パスへの書込試行は、ACLにより実際に拒否され（`STATUS_ACCESS_DENIED`）、その事実が
+    /// `.harness-cow-denied.jsonl`へ監査記録される（境界自体はACLが保証し、この台帳は
+    /// 可視性のみ）。
+    #[test]
+    #[ignore]
+    fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+        let outside = std::path::PathBuf::from(format!(
+            "C:\\harness-Tier2a-cow-denied-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&outside).expect("create outside dir (no ACE granted)");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        let probe_path = outside.join("denied.txt");
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; try {{ \
+                Set-Content -LiteralPath '{}' -Value 'should-not-write' -NoNewline; exit 0 \
+            }} catch {{ Write-Output $_.Exception.Message; exit 9 }}",
+            probe_path.display()
+        );
+        let (shell, _) = resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", &script],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+                ext_capture_roots: &[],
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+        assert_ne!(
+            code, 0,
+            "write outside workspace/ext roots must fail: stdout={stdout} stderr={stderr}"
+        );
+        assert!(!probe_path.exists());
+
+        let denied = harness_change_ledger::store::read_denied_log(upper.path());
+        let original = harness_change_ledger::store::normalize_abs_path(&probe_path.to_string_lossy());
+        assert!(
+            denied.iter().any(|e| e.path == original),
+            "denied write attempt must be recorded: denied={denied:?} expected={original}"
+        );
+
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// fail-close確認（Phase 1のみ、DLL注入なし）: workspaceをROで付与した状態で、Redirector DLLを
@@ -4855,6 +5023,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn with cow injection should succeed");
@@ -4924,6 +5093,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn with cow injection should succeed");
@@ -5003,6 +5173,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn with cow injection should succeed");
@@ -5100,6 +5271,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn with cow injection should succeed");
@@ -5172,6 +5344,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn with cow injection should succeed");
@@ -5306,6 +5479,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper_a.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn A with cow injection should succeed");
@@ -5320,6 +5494,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper_b.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn B with cow injection should succeed");
@@ -5463,6 +5638,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn with cow injection should succeed");
@@ -5560,6 +5736,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn (delete) with cow injection should succeed");
@@ -5601,6 +5778,7 @@ mod cow_diagnostics {
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper.path(),
+                ext_capture_roots: &[],
             }),
         )
         .expect("spawn (check) with cow injection should succeed");
@@ -5914,6 +6092,7 @@ mod cow_diagnostics {
                 Some(CowInject {
                     workspace_root: workspace.path(),
                     upper_dir: upper.path(),
+                ext_capture_roots: &[],
                 }),
             );
 

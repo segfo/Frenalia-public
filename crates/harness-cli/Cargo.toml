@@ -21,6 +21,7 @@ e2e-mock = []
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6"
 dotenvy = "0.15.7"
+harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 harness-config = { version = "0.1.0", path = "../harness-config" }
 harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-engine = { version = "0.1.0", path = "../harness-engine" }

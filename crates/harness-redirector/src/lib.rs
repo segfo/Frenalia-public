@@ -96,7 +96,7 @@ use windows::Wdk::Storage::FileSystem::{
     FILE_RENAME_INFORMATION, NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS,
 };
 use windows::Win32::Foundation::{
-    BOOL, CloseHandle, HANDLE, HMODULE, NTSTATUS, STATUS_OBJECT_NAME_NOT_FOUND,
+    BOOL, CloseHandle, HANDLE, HMODULE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_NOT_FOUND,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_ACCESS_RIGHTS, FILE_APPEND_DATA, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_WRITE,
@@ -114,8 +114,8 @@ use windows::Win32::System::ProcessStatus::{
 };
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::Win32::System::Threading::{
-    CreateRemoteThread, CreateThread, GetExitCodeThread, ResumeThread, WaitForSingleObject,
-    PROCESS_INFORMATION, THREAD_CREATION_FLAGS,
+    CreateRemoteThread, CreateThread, GetCurrentProcessId, GetExitCodeThread, ResumeThread,
+    WaitForSingleObject, PROCESS_INFORMATION, THREAD_CREATION_FLAGS,
 };
 
 /// `retour`が要求する生のNt関数シグネチャ。`windows`クレートの`Wdk`ラッパは実体が
@@ -216,6 +216,11 @@ const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;
 struct Config {
     workspace_root: PathBuf,
     upper_dir: PathBuf,
+    /// Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴の
+    /// ルート一覧（DOS形式、正規化前）。ここに含まれるパスへの書込は、workspace内と同じ
+    /// `_ext/<key>`経由の操作台帳captureの対象になる（境界＝ACLはfs-allowが既に張っている、
+    /// ここはあくまで透過性・変更の可視化のためのcaptureであってACL自体を変えない）。
+    ext_capture_roots: Vec<PathBuf>,
 }
 
 /// 孫プロセスへの再注入が失敗した/初期化未完了だった場合の警告台帳ファイル名
@@ -285,6 +290,31 @@ fn baseline_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
 fn deleted_paths_state() -> &'static Mutex<HashSet<String>> {
     static D: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     D.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Phase 4: 既にこのプロセスで`.harness-cow-denied.jsonl`へ記録済みのパス集合（同一パスへの
+/// 繰り返し拒否試行で台帳が肥大しないようにする、プロセス内のみのdedup——別プロセス/セッションで
+/// 再度記録され得るが実害は無い）。
+fn denied_paths_state() -> &'static Mutex<HashSet<String>> {
+    static D: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    D.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// ACLで実際に拒否された（`STATUS_ACCESS_DENIED`）workspace外書込試行を
+/// `<upper_dir>/.harness-cow-denied.jsonl`へ1行追記する（Phase 4、設計書§19.8）。
+/// 同一パスは初回のみ記録する。追記の実体は`store::append_denied_entry`
+/// （`harness cow audit`の読み側と型を共有、host側で拒否を検知する経路が将来できても
+/// 同じ形式で書けるようにするため）。
+fn record_denied_attempt(cfg: &Config, path: &Path, access_mask: u32) {
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    {
+        let mut g = denied_paths_state().lock().unwrap();
+        if !g.insert(path_str.clone()) {
+            return;
+        }
+    }
+    let pid = unsafe { GetCurrentProcessId() };
+    store::append_denied_entry(&cfg.upper_dir, &path_str, access_mask, pid);
 }
 
 /// `deleted_paths_state`を最後に同期した時点での台帳ファイルの読み込み済みバイトオフセット。
@@ -562,19 +592,67 @@ fn rel_to_string(rel: &Path) -> String {
     rel.to_string_lossy().replace('\\', "/")
 }
 
-/// `rel`（workspace相対、`/`区切り）を、そのセッションで最初に触った瞬間の実workspace側
-/// ハッシュへ解決する（キャッシュ済みならそれを返す、設計書§19.5）。権威となる計算・
-/// baselineミラー書込は`harness_change_ledger::store::baseline_hash_and_mirror`が唯一の実装
+/// `path`が`ext_capture_roots`のいずれか配下であれば、`(ext_key, 正規化済み絶対パス文字列)`を
+/// 返す（Phase 3、設計書§19.8）。`workspace_relative`と同じ大小無視・パス区切り境界判定。
+fn ext_relative(cfg: &Config, path: &Path) -> Option<(String, String)> {
+    let path_lc = path.to_string_lossy().to_ascii_lowercase();
+    for root in &cfg.ext_capture_roots {
+        let root_lc = root.to_string_lossy().to_ascii_lowercase();
+        let is_under = path_lc == root_lc
+            || (path_lc.starts_with(&root_lc) && path_lc.as_bytes().get(root_lc.len()) == Some(&b'\\'));
+        if is_under {
+            let original = store::normalize_abs_path(&path.to_string_lossy());
+            let key = store::ext_key(&original).ok()?;
+            return Some((key, original));
+        }
+    }
+    None
+}
+
+/// `workspace_relative`/`ext_relative`の判定結果を統一する。`rel`は`cfg.upper_dir.join(&rel)`で
+/// 常に正しいupper側実体パスになる（workspace内なら`<rel>`そのまま、`_ext`ならcapture root配下
+/// への写像`_ext/<key>`）。`ledger_key`は操作台帳・`check_deleted`・ハンドル対応表で使う識別子
+/// （workspace内ならworkspace相対パス、`_ext`なら正規化済み絶対パス文字列——host側`apply()`が
+/// `workspace_root.join(&path)`でそのまま実ターゲットを求められる形、設計書§19.8）。
+struct Classified {
+    rel: PathBuf,
+    ledger_key: String,
+}
+
+fn classify_target(cfg: &Config, path: &Path) -> Option<Classified> {
+    if let Some(rel) = workspace_relative(cfg, path) {
+        let ledger_key = rel_to_string(&rel);
+        return Some(Classified { rel, ledger_key });
+    }
+    let (key, original) = ext_relative(cfg, path)?;
+    Some(Classified {
+        rel: Path::new("_ext").join(&key),
+        ledger_key: original,
+    })
+}
+
+/// `ledger_key`（`Classified::ledger_key`、workspace相対パスまたは`_ext`の正規化済み絶対パス）を、
+/// そのセッションで最初に触った瞬間の実内容ハッシュへ解決する（キャッシュ済みならそれを返す、
+/// 設計書§19.5）。権威となる計算・baselineミラー書込は`harness_change_ledger::store`（`_ext`は
+/// `baseline_hash_and_mirror_ext`、workspace内は`baseline_hash_and_mirror`）が唯一の実装
 /// （host内蔵ツール`write_file`/`edit_file`側も同じ関数を呼ぶ、BUG-042の再発防止）——ここでの
-/// `baseline_cache`はDLLのホットパス向けのメモ化に過ぎない。
-fn baseline_hash_for(cfg: &Config, rel: &str) -> Option<String> {
+/// `baseline_cache`はDLLのホットパス向けのメモ化に過ぎない。`ledger_key`が絶対パスかどうかで
+/// `_ext`かworkspace内かを判定する（workspace相対パスは`check_relative_path`相当の生成元
+/// （`workspace_relative`）が絶対パスを作らないため、この判定で一意に決まる）。
+fn baseline_hash_for(cfg: &Config, ledger_key: &str) -> Option<String> {
     let cache = baseline_cache();
     let mut guard = cache.lock().unwrap();
-    if let Some(v) = guard.get(rel) {
+    if let Some(v) = guard.get(ledger_key) {
         return v.clone();
     }
-    let hash = store::baseline_hash_and_mirror(&cfg.upper_dir, &cfg.workspace_root, rel);
-    guard.insert(rel.to_string(), hash.clone());
+    let hash = if Path::new(ledger_key).is_absolute() {
+        store::ext_key(ledger_key)
+            .ok()
+            .and_then(|key| store::baseline_hash_and_mirror_ext(&cfg.upper_dir, ledger_key, &key))
+    } else {
+        store::baseline_hash_and_mirror(&cfg.upper_dir, &cfg.workspace_root, ledger_key)
+    };
+    guard.insert(ledger_key.to_string(), hash.clone());
     hash
 }
 
@@ -653,8 +731,19 @@ impl Drop for ReentryGuard {
 /// （`\??\`プレフィックス）が必須——プレフィックス無しのDOSパスをそのまま渡すと
 /// `NtCreateFile`から見て不正な名前になり`STATUS_OBJECT_NAME_INVALID`（「指定されたパスは
 /// 無効です」）で失敗する（実機検証で確認）。
+///
+/// **`/`→`\`正規化が必須**（Phase 3実機E2Eで発見）: `classify_target`のPhase 3 `_ext`分岐は
+/// `store::ext_key()`が返す`/`区切りのキー文字列（例`"c/harness-.../probe.txt"`）を
+/// `PathBuf::join`で連結するが、`PathBuf::join`は引数中の`/`を`\`へ**変換しない**
+/// （`Path`のcomponent解析は`/`も区切りとして認識するが、`to_string_lossy()`が返す生の
+/// 内部表現は連結時の元の区切り文字をそのまま保持する）。Win32層（`CreateFileW`等、
+/// `std::fs`はこちらを使う）は`/`を`\`と同様に解釈するため気付きにくいが、NT名前空間
+/// （`NtCreateFile`が見るのはこちら）は`/`を区切りとして認識せず不正な名前として拒否する
+/// （実機E2Eで`STATUS_OBJECT_NAME_INVALID`を確認）。ここで一括正規化することで、
+/// 呼び出し元がどう`PathBuf`を組み立てても安全にする。
 fn nt_path_wide(upper_path: &Path) -> Vec<u16> {
-    let nt_path = format!(r"\??\{}", upper_path.to_string_lossy());
+    let normalized = upper_path.to_string_lossy().replace('/', "\\");
+    let nt_path = format!(r"\??\{normalized}");
     nt_path.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -762,8 +851,7 @@ unsafe extern "system" fn hooked_nt_create_file(
             CONFIG.get(),
             unsafe { object_attributes_path(object_attributes) },
         ) {
-            if let Some(rel) = workspace_relative(cfg, &path) {
-                let rel_str = rel_to_string(&rel);
+            if let Some(Classified { rel, ledger_key: rel_str }) = classify_target(cfg, &path) {
                 let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
                     || rel_str.to_ascii_lowercase().contains("grandchild");
                 if is_probe {
@@ -881,6 +969,31 @@ unsafe extern "system" fn hooked_nt_create_file(
                 }
                 track_new_handle(file_handle, status, &rel_str, create_options.0);
                 return status;
+            } else if is_write_intent(desired_access.0, Some(create_disposition.0)) {
+                // Phase 4（設計書§19.8）: workspace内でもext capture root配下でもない絶対パスへの
+                // 書込意図。素通しさせ、実際にACLで拒否された（`STATUS_ACCESS_DENIED`）場合のみ
+                // 監査台帳へ記録する（境界自体はACLが既に保証しているので、ここでは何も遮断/
+                // 誘導しない——フックは境界にしない、D-01）。
+                let hook = CREATE_FILE_HOOK.get().expect("hook installed");
+                let status = unsafe {
+                    hook.call(
+                        file_handle,
+                        desired_access,
+                        object_attributes,
+                        io_status_block,
+                        allocation_size,
+                        file_attributes,
+                        share_access,
+                        create_disposition,
+                        create_options,
+                        ea_buffer,
+                        ea_length,
+                    )
+                };
+                if status == STATUS_ACCESS_DENIED {
+                    record_denied_attempt(cfg, &path, desired_access.0);
+                }
+                return status;
             }
         }
     }
@@ -932,8 +1045,7 @@ unsafe extern "system" fn hooked_nt_open_file(
             CONFIG.get(),
             unsafe { object_attributes_path(object_attributes) },
         ) {
-            if let Some(rel) = workspace_relative(cfg, &path) {
-                let rel_str = rel_to_string(&rel);
+            if let Some(Classified { rel, ledger_key: rel_str }) = classify_target(cfg, &path) {
                 let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
                     || rel_str.to_ascii_lowercase().contains("grandchild");
                 if is_probe {
@@ -1026,6 +1138,23 @@ unsafe extern "system" fn hooked_nt_open_file(
                 }
                 track_new_handle(file_handle, status, &rel_str, open_options);
                 return status;
+            } else if is_write_intent(desired_access, None) {
+                // Phase 4（設計書§19.8）: `hooked_nt_create_file`と同じ理由。
+                let hook = OPEN_FILE_HOOK.get().expect("hook installed");
+                let status = unsafe {
+                    hook.call(
+                        file_handle,
+                        desired_access,
+                        object_attributes,
+                        io_status_block,
+                        share_access,
+                        open_options,
+                    )
+                };
+                if status == STATUS_ACCESS_DENIED {
+                    record_denied_attempt(cfg, &path, desired_access);
+                }
+                return status;
             }
         }
     }
@@ -1080,7 +1209,9 @@ fn build_rename_info_buffer(
 ) -> (Vec<u8>, usize) {
     let header_offset = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
     let name_wide: Vec<u16> = {
-        let nt_path = format!(r"\??\{}", new_upper_path.to_string_lossy());
+        // `nt_path_wide`と同じ理由で`/`→`\`正規化が必須（Phase 3実機E2Eで発見）。
+        let normalized = new_upper_path.to_string_lossy().replace('/', "\\");
+        let nt_path = format!(r"\??\{normalized}");
         nt_path.encode_utf16().collect()
     };
     let name_bytes_len = name_wide.len() * 2;
@@ -1111,8 +1242,7 @@ unsafe fn rewrite_rename_target(
 ) -> Option<(Vec<u8>, usize)> {
     let old_rel = handle_paths().lock().unwrap().get(&handle_key).cloned()?;
     let new_path = unsafe { rename_target_path(info_ptr) }?;
-    let new_rel = workspace_relative(cfg, &new_path)?;
-    let new_rel_str = rel_to_string(&new_rel);
+    let Classified { rel: new_rel, ledger_key: new_rel_str } = classify_target(cfg, &new_path)?;
     let upper_new = cfg.upper_dir.join(&new_rel);
     if let Some(parent) = upper_new.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1208,8 +1338,7 @@ unsafe extern "system" fn hooked_nt_query_full_attributes_file(
             CONFIG.get(),
             unsafe { object_attributes_path(object_attributes) },
         ) {
-            if let Some(rel) = workspace_relative(cfg, &path) {
-                let rel_str = rel_to_string(&rel);
+            if let Some(Classified { rel, ledger_key: rel_str }) = classify_target(cfg, &path) {
                 let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
                     || rel_str.to_ascii_lowercase().contains("grandchild");
                 if is_probe {
@@ -1266,8 +1395,7 @@ unsafe extern "system" fn hooked_nt_query_attributes_file(
             CONFIG.get(),
             unsafe { object_attributes_path(object_attributes) },
         ) {
-            if let Some(rel) = workspace_relative(cfg, &path) {
-                let rel_str = rel_to_string(&rel);
+            if let Some(Classified { rel, ledger_key: rel_str }) = classify_target(cfg, &path) {
                 let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
                     || rel_str.to_ascii_lowercase().contains("grandchild");
                 if is_probe {
@@ -1741,9 +1869,17 @@ fn init() {
             return;
         }
     };
+    // Phase 3（設計書§19.8）: `;`区切りのDOS形式絶対パス一覧。空文字列要素は無視する
+    // （`get_env`が空文字列全体は既に`None`扱いにするが、"C:\a;;C:\b"のような中間の
+    // 空要素を防御的に無視する）。
+    let ext_capture_roots: Vec<PathBuf> = get_env("HARNESS_COW_EXT_ROOTS")
+        .map(|v| v.split(';').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
+        .unwrap_or_default();
+    debug_log(&format!("init: HARNESS_COW_EXT_ROOTS={ext_capture_roots:?}"));
     let cfg = Config {
         workspace_root,
         upper_dir,
+        ext_capture_roots,
     };
     load_deleted_set(&cfg);
     let _ = CONFIG.set(cfg);
@@ -2011,6 +2147,7 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             upper_dir: upper.path().to_path_buf(),
+            ext_capture_roots: Vec::new(),
         };
         let ledger_path = upper.path().join(COW_OPS_LEDGER_FILENAME);
 
@@ -2075,6 +2212,7 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             upper_dir: upper.path().to_path_buf(),
+            ext_capture_roots: Vec::new(),
         };
 
         let hash = baseline_hash_for(&cfg, "baseline_mirror_probe.txt");
@@ -2095,6 +2233,7 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             upper_dir: upper.path().to_path_buf(),
+            ext_capture_roots: Vec::new(),
         };
 
         let hash = baseline_hash_for(&cfg, "does_not_exist_probe.txt");
@@ -2105,5 +2244,83 @@ mod tests {
             .join(harness_change_ledger::COW_BASELINE_DIRNAME)
             .join("does_not_exist_probe.txt")
             .exists());
+    }
+
+    /// Phase 3（設計書§19.8）: `ext_capture_roots`配下の絶対パスは`ext_relative`が
+    /// `(ext_key, 正規化済み絶対パス)`を返し、`classify_target`は`_ext/<key>`へのupper
+    /// マッピングを返す。
+    #[test]
+    fn classify_target_maps_ext_capture_root_path_to_ext_prefixed_rel() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let capture_root = tempfile::tempdir().unwrap();
+        let target = capture_root.path().join("cache").join("probe.txt");
+        let cfg = Config {
+            workspace_root: workspace.path().to_path_buf(),
+            upper_dir: upper.path().to_path_buf(),
+            ext_capture_roots: vec![capture_root.path().to_path_buf()],
+        };
+
+        let classified = classify_target(&cfg, &target).expect("must classify under capture root");
+
+        let expected_key = store::ext_key(&store::normalize_abs_path(&target.to_string_lossy())).unwrap();
+        assert_eq!(classified.rel, Path::new("_ext").join(&expected_key));
+        assert_eq!(
+            classified.ledger_key,
+            store::normalize_abs_path(&target.to_string_lossy())
+        );
+        assert_eq!(
+            cfg.upper_dir.join(&classified.rel),
+            upper.path().join("_ext").join(&expected_key)
+        );
+    }
+
+    /// capture root配下でもworkspace配下でもないパスは`None`（素通し対象）。
+    #[test]
+    fn classify_target_returns_none_outside_workspace_and_capture_roots() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            workspace_root: workspace.path().to_path_buf(),
+            upper_dir: upper.path().to_path_buf(),
+            ext_capture_roots: Vec::new(),
+        };
+
+        assert!(classify_target(&cfg, &elsewhere.path().join("x.txt")).is_none());
+    }
+
+    /// `baseline_hash_for`はledger_keyが絶対パス（`_ext`）なら`baseline_hash_and_mirror_ext`
+    /// 経由でbaselineミラーを`.harness-cow-baseline/_ext/<key>`へ書く（BUG-042型の値ずれ防止:
+    /// workspace内と誤って`workspace_root.join(絶対パス)`を計算しないことを確認する）。
+    #[test]
+    fn baseline_hash_for_routes_absolute_ledger_key_through_ext_mirror() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("probe.txt");
+        std::fs::write(&target, b"ext-original").unwrap();
+        let cfg = Config {
+            workspace_root: workspace.path().to_path_buf(),
+            upper_dir: upper.path().to_path_buf(),
+            ext_capture_roots: vec![outside.path().to_path_buf()],
+        };
+        let original = store::normalize_abs_path(&target.to_string_lossy());
+        let key = store::ext_key(&original).unwrap();
+
+        let hash = baseline_hash_for(&cfg, &original);
+
+        assert_eq!(hash, Some(harness_change_ledger::hash_bytes(b"ext-original")));
+        let mirror = upper
+            .path()
+            .join(harness_change_ledger::COW_BASELINE_DIRNAME)
+            .join("_ext")
+            .join(&key);
+        assert_eq!(std::fs::read_to_string(mirror).unwrap(), "ext-original");
+        // workspace配下には何も新規作成されていないこと（誤ってworkspace_root.join(絶対パス)を
+        // 計算していれば、`PathBuf::join`が絶対パスで丸ごと置き換わり実質`target`と同じパスを
+        // 指してしまう——今回は書込先自体が無いためディレクトリの中身が空のままであることで
+        // 間接的に確認する）。
+        assert!(std::fs::read_dir(workspace.path()).unwrap().next().is_none());
     }
 }

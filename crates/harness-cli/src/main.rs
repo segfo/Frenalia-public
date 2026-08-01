@@ -259,6 +259,16 @@ enum FsAction {
 enum CowAction {
     /// `%LOCALAPPDATA%\harness\data\cow\`配下にある全upper置き場を一覧表示する。
     List,
+    /// ACLで実際に拒否された（`STATUS_ACCESS_DENIED`）workspace外書込試行の監査ログ
+    /// （`.harness-cow-denied.jsonl`、Phase 4・設計書§19.8）を表示する。境界自体はACLが
+    /// 既に保証しているため、これは可視性・監査目的のコマンドであり空でも異常ではない。
+    Audit {
+        /// 対象セッションID（省略時は最も新しいCoWセッション）。
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
+    },
 }
 
 #[derive(Parser)]
@@ -1125,6 +1135,18 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
                             format!("{:?}", c.op).to_lowercase(),
                             c.path
                         );
+                    }
+                    // Phase 4（設計書§19.8）: CoWセッションなら拒否監査ログの件数もフッタに
+                    // 出す（`--cow`の書込境界自体はACLが保証しているので、これは可視性のみ）。
+                    if let Some(dir) = &cow_upper_dir {
+                        let denied = harness_change_ledger::store::read_denied_log(dir);
+                        if !denied.is_empty() {
+                            println!(
+                                "({} workspace-external write attempt(s) were denied by ACL; \
+                                 see `harness cow audit`)",
+                                denied.len()
+                            );
+                        }
                     }
                 }
             }
@@ -2347,6 +2369,7 @@ fn fs_revoke_workspace_all() -> ExitCode {
 fn run_cow_subcommand(action: CowAction) -> ExitCode {
     match action {
         CowAction::List => cow_list(),
+        CowAction::Audit { session, output_format } => cow_audit(session.as_deref(), output_format),
     }
 }
 
@@ -2359,6 +2382,42 @@ fn run_cow_subcommand(_action: CowAction) -> ExitCode {
 #[cfg(windows)]
 fn cow_upper_dir_for(session_id: &str) -> Option<PathBuf> {
     harness_sandbox::workspace_ledger::cow_upper_root().map(|root| root.join(session_id))
+}
+
+/// `harness cow audit`: `.harness-cow-denied.jsonl`（Phase 4、設計書§19.8）を表示する。
+#[cfg(windows)]
+fn cow_audit(session: Option<&str>, output_format: OutputFormat) -> ExitCode {
+    let Some(upper_dir) = resolve_cow_upper_dir(session) else {
+        eprintln!("no CoW upper directory found (nothing to show)");
+        return ExitCode::FAILURE;
+    };
+    let entries = harness_change_ledger::store::read_denied_log(&upper_dir);
+    match output_format {
+        OutputFormat::Json => {
+            if let Ok(s) = serde_json::to_string(&entries) {
+                println!("{s}");
+            }
+        }
+        OutputFormat::Jsonl => {
+            for e in &entries {
+                if let Ok(s) = serde_json::to_string(e) {
+                    println!("{s}");
+                }
+            }
+        }
+        OutputFormat::Text => {
+            if entries.is_empty() {
+                println!("(no denied write attempts recorded)");
+            }
+            for e in &entries {
+                println!(
+                    "denied: {} (access_mask={:#x}, pid={})",
+                    e.path, e.access_mask, e.pid
+                );
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(windows)]

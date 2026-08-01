@@ -22,6 +22,25 @@ pub const COW_OPS_LEDGER_FILENAME: &str = ".harness-cow-ops.jsonl";
 /// `harness resolve`が読む。台帳の`baseline_hash`はハッシュ値のみでmerge材料にならない）。
 pub const COW_BASELINE_DIRNAME: &str = ".harness-cow-baseline";
 
+/// Phase 4（設計書§19.8）: ACLで実際に拒否された（`STATUS_ACCESS_DENIED`）workspace外書込
+/// 試行の監査台帳ファイル名（`<upper_dir>/.harness-cow-denied.jsonl`）。境界自体はACLが
+/// 既に保証しているため、この台帳は可視性・監査目的のみ（無くても安全性は変わらない）。
+/// `.harness-cow-warnings.jsonl`（DLL注入失敗の警告、`crates/harness-redirector`内で
+/// 完結する別台帳）とは用途が異なるため分離する。
+pub const COW_DENIED_LEDGER_FILENAME: &str = ".harness-cow-denied.jsonl";
+
+/// `COW_DENIED_LEDGER_FILENAME`の1行分のレコード。書く側（DLL、`store::append_denied_entry`）
+/// と読む側（`harness cow audit`、`store::read_denied_log`）が同じ型を共有する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CowDeniedEntry {
+    /// 拒否されたアクセス先の正規化済み絶対パス（`/`区切り）。
+    pub path: String,
+    /// `NtCreateFile`/`NtOpenFile`に渡された`desired_access`（生のアクセスマスク）。
+    pub access_mask: u32,
+    pub pid: u32,
+    pub ts_unix_millis: u128,
+}
+
 /// 操作種別。移動/リネームには専用の種別を作らず「旧パスの`Delete`＋新パスの`Create`」の
 /// 2レコードへ分解して記録する（§19「移動・リネーム・コピー＋削除の扱い」決定事項）。
 ///

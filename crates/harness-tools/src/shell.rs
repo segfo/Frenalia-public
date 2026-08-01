@@ -294,6 +294,7 @@ impl Tool for RunShellTool {
             ctx.vm_sandbox.as_ref(),
             &ctx.workspace_root,
             ctx.cow_upper_dir.as_deref(),
+            &ctx.shell_tier.granted_passthrough,
         )
         .await?;
 
@@ -500,6 +501,7 @@ async fn run_isolated(
     vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
     workspace_root: &Path,
     cow_upper_dir: Option<&Path>,
+    granted_passthrough: &[(std::path::PathBuf, bool)],
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     // Tier2a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
     // 「このTierでは無効」と明記する、`call`参照）。
@@ -507,7 +509,7 @@ async fn run_isolated(
     // `workspace_root`/`cow_upper_dir`（D-30、`--cow`）はWindows Tier2a経路でのみ使う
     // （Redirector DLL注入用のenv注入先パス）。
     #[cfg(not(windows))]
-    let _ = (workspace_root, cow_upper_dir);
+    let _ = (workspace_root, cow_upper_dir, granted_passthrough);
     if tier == ShellTier::Tier3 {
         return run_tier3(command, cwd, env, dur, vm_sandbox).await;
     }
@@ -524,6 +526,7 @@ async fn run_isolated(
                 net_domain_policy_requested,
                 workspace_root,
                 cow_upper_dir,
+                granted_passthrough,
             )
             .await;
         }
@@ -651,6 +654,7 @@ async fn run_windows_tier2a(
     net_domain_policy_requested: bool,
     workspace_root: &Path,
     cow_upper_dir: Option<&Path>,
+    granted_passthrough: &[(std::path::PathBuf, bool)],
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let _ = std::fs::create_dir_all(cwd);
     let sid = harness_sandbox::win_appcontainer::ensure_profile(
@@ -664,9 +668,18 @@ async fn run_windows_tier2a(
     let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
     let cwd_owned = cwd.to_path_buf();
     let env_owned = env.to_vec();
+    // Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴を
+    // Redirector DLLのext capture対象として渡す（境界＝ACLはfs-allowが既に張っている、
+    // ここは変更の可視化のためのcapture）。
+    let ext_capture_roots: Vec<std::path::PathBuf> = granted_passthrough
+        .iter()
+        .filter(|(_, writable)| *writable)
+        .map(|(path, _)| path.clone())
+        .collect();
     let cow = cow_upper_dir.map(|upper_dir| harness_sandbox::win_appcontainer::CowInject {
         workspace_root,
         upper_dir,
+        ext_capture_roots: ext_capture_roots.as_slice(),
     });
 
     // アプリ単位network制御（軸1、D-10/D-11）。`Allow`のときのみ`internetClient`を付与する

@@ -981,6 +981,7 @@ dependencies = [
  "clap",
  "directories",
  "dotenvy",
+ "harness-change-ledger",
  "harness-config",
  "harness-core",
  "harness-engine",

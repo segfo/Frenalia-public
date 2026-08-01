@@ -210,11 +210,26 @@ impl SandboxFs {
     }
 
     /// ワークスペース内へ書き込む。オーバーレイ無効ならworkspace実体へ直書き、有効なら
-    /// オーバーレイディレクトリ・操作台帳へ記録する。workspace外の絶対パスは現時点では
-    /// 一律拒否する（Phase 3で`_ext`相当の対応を復活させる予定、既存Liveの拒否挙動を踏襲）。
+    /// オーバーレイディレクトリ・操作台帳へ記録する。workspace外の絶対パスはオーバーレイ有効時
+    /// のみ`_ext/<key>`（`store::ext_key`）へ記録する（Phase 3）。オーバーレイ無効（純live）
+    /// なら既存のLive挙動どおり拒否する。
     pub fn write_string(&self, path: &str, content: &str) -> Result<(), SandboxError> {
         if Path::new(path).is_absolute() {
-            return Err(SandboxError::Jail(JailError::Escape(path.to_string())));
+            let Some(overlay) = &self.overlay else {
+                return Err(SandboxError::Jail(JailError::Escape(path.to_string())));
+            };
+            let original = store::normalize_abs_path(path);
+            let key = store::ext_key(&original)
+                .map_err(|e| SandboxError::Jail(JailError::UnsafePath(e)))?;
+            let baseline_hash = store::baseline_hash_and_mirror_ext(&overlay.dir, &original, &key);
+            overlay.jail.write_string(&format!("_ext/{key}"), content)?;
+            let op = if baseline_hash.is_none() {
+                ChangeOp::Create
+            } else {
+                ChangeOp::Modify
+            };
+            store::append_entry(&overlay.dir, op, &original, baseline_hash);
+            return Ok(());
         }
         let rel = check_relative_path(path)?;
         match &self.overlay {
@@ -240,6 +255,19 @@ impl SandboxFs {
     /// （blacklist）の場合のみ`ReadScope`経由で読める（M11、`plans/DESIGN-SANDBOX.md` §5）。
     pub fn read_to_string(&self, path: &str) -> Result<String, SandboxError> {
         if Path::new(path).is_absolute() {
+            if let Some(overlay) = &self.overlay {
+                let original = store::normalize_abs_path(path);
+                if let Ok(key) = store::ext_key(&original) {
+                    if store::deleted_set(&overlay.dir).contains(&original) {
+                        return Err(SandboxError::NotFound(path.to_string()));
+                    }
+                    match overlay.jail.read_to_string(&format!("_ext/{key}")) {
+                        Ok(s) => return Ok(s),
+                        Err(JailError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
             return Ok(self.read_scope.read_external_to_string(Path::new(path))?);
         }
         let rel = check_relative_path(path)?;
@@ -265,12 +293,20 @@ impl SandboxFs {
     /// 論理削除（tombstone）。オーバーレイが無効な純live構成では使えない
     /// （`SandboxFs`単体の契約として提供、§オーバーレイFS「論理削除（tombstone）」）。
     pub fn remove(&self, path: &str) -> Result<(), SandboxError> {
-        let rel = check_relative_path(path)?;
         let Some(overlay) = &self.overlay else {
             return Err(SandboxError::NotFound(
                 "staging is not enabled for this ToolCtx (live-only)".to_string(),
             ));
         };
+        if Path::new(path).is_absolute() {
+            let original = store::normalize_abs_path(path);
+            let key = store::ext_key(&original)
+                .map_err(|e| SandboxError::Jail(JailError::UnsafePath(e)))?;
+            let baseline_hash = store::baseline_hash_and_mirror_ext(&overlay.dir, &original, &key);
+            store::append_entry(&overlay.dir, ChangeOp::Delete, &original, baseline_hash);
+            return Ok(());
+        }
+        let rel = check_relative_path(path)?;
         let rel_str = normalize_str(&rel);
         let baseline_hash =
             store::baseline_hash_and_mirror(&overlay.dir, &self.workspace_root, &rel_str);
@@ -291,6 +327,11 @@ impl SandboxFs {
             .collect();
         if let Some(overlay) = &self.overlay {
             for c in store::replay_ledger(&overlay.dir) {
+                // `_ext`（workspace外絶対パス）エントリはworkspace相対のファイル一覧に含めない
+                // （grep/globはworkspace内を対象とする）。
+                if Path::new(&c.path).is_absolute() {
+                    continue;
+                }
                 if c.op == ChangeOp::Delete {
                     set.remove(&c.path);
                 } else {
@@ -416,6 +457,11 @@ fn apply_overlay_changes(
                 continue;
             }
         }
+        let is_ext = Path::new(&c.path).is_absolute();
+        if is_ext && !opts.allow_ext {
+            report.ext_blocked.push(c.path.clone());
+            continue;
+        }
         if harness_core::is_config_injection_path(&c.path) {
             report.hard_denied.push(c.path.clone());
             continue;
@@ -432,7 +478,17 @@ fn apply_overlay_changes(
             continue;
         }
 
-        let overlay_abs = store::upper_path_for(overlay_dir, &c.path);
+        let overlay_abs = if is_ext {
+            // `store::upper_path_for`は`overlay_dir.join(絶対パス)`となり`PathBuf::join`の
+            // 「絶対パスなら丸ごと置き換える」仕様で誤った場所を指してしまうため、
+            // `_ext/<key>`（`ext_key`）経由の実体パスを別途解決する。
+            let key = store::ext_key(&c.path).map_err(|e| {
+                SandboxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+            })?;
+            store::upper_ext_path_for(overlay_dir, &key)
+        } else {
+            store::upper_path_for(overlay_dir, &c.path)
+        };
         let result: std::io::Result<()> = match c.op {
             ChangeOp::Delete => {
                 if workspace_abs.exists() {
@@ -565,17 +621,83 @@ mod tests {
         assert!(matches!(err, SandboxError::Jail(JailError::Escape(_))));
     }
 
-    /// Phase 2時点ではworkspace外への書込は`--staged`でも一律拒否する（ext統一はPhase 3）。
+    #[cfg(windows)]
+    fn ext_probe_path() -> (PathBuf, String) {
+        // 実際に存在する一時ディレクトリ配下の絶対パスをプローブに使う（baselineハッシュの
+        // 「実在するファイルの内容を読む」経路も一緒に検証するため）。
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("probe.txt");
+        std::mem::forget(outside); // このテストの間だけ存在すればよいので、tempdirは意図的にリークする。
+        (target.clone(), target.to_string_lossy().to_string())
+    }
+    #[cfg(not(windows))]
+    fn ext_probe_path() -> (PathBuf, String) {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("probe.txt");
+        std::mem::forget(outside);
+        (target.clone(), target.to_string_lossy().to_string())
+    }
+
+    /// Phase 3: `--staged`でもworkspace外絶対パスへの書込は`_ext/<key>`へ記録され、実FSには
+    /// 触れない（`--cow`の`_ext`扱いと同じ経路、設計書§19.8）。
     #[test]
-    fn staged_mode_rejects_absolute_path_writes_until_phase3() {
+    fn staged_mode_redirects_absolute_path_writes_to_ext() {
         let dir = tempfile::tempdir().unwrap();
         let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
-        #[cfg(windows)]
-        let abs = r"C:\Windows\x";
-        #[cfg(not(windows))]
-        let abs = "/etc/passwd";
-        let err = fs.write_string(abs, "x").unwrap_err();
-        assert!(matches!(err, SandboxError::Jail(JailError::Escape(_))));
+        let (target, abs) = ext_probe_path();
+
+        fs.write_string(&abs, "probe-content").unwrap();
+
+        assert!(!target.exists(), "real target must stay untouched");
+        assert_eq!(fs.read_to_string(&abs).unwrap(), "probe-content");
+        let changes = fs.change_set().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].op, ChangeOp::Create);
+        assert_eq!(changes[0].path, harness_change_ledger::store::normalize_abs_path(&abs));
+    }
+
+    /// `apply`はworkspace外エントリを`allow_ext`無しでは`ext_blocked`へ回し、実際には書かない。
+    #[test]
+    fn apply_blocks_ext_entries_without_allow_ext() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
+        let (target, abs) = ext_probe_path();
+        fs.write_string(&abs, "probe-content").unwrap();
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            })
+            .unwrap();
+
+        assert!(report.applied.is_empty());
+        assert_eq!(report.ext_blocked.len(), 1);
+        assert!(!target.exists());
+    }
+
+    /// `apply`が`allow_ext: true`のとき、実際にworkspace外の実ファイルへ書き込む。
+    #[test]
+    fn apply_writes_ext_entries_when_allow_ext_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
+        let (target, abs) = ext_probe_path();
+        fs.write_string(&abs, "probe-content").unwrap();
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: true,
+            })
+            .unwrap();
+
+        assert_eq!(
+            report.applied,
+            vec![harness_change_ledger::store::normalize_abs_path(&abs)]
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "probe-content");
     }
 
     #[test]
