@@ -815,8 +815,12 @@ fn format_net_audit_text(events: &[serde_json::Value]) -> String {
             .unwrap_or_else(|| "-".to_string());
         let remote = event_string(event, "remote_addr").unwrap_or("-");
         output.push_str(&format!(
-            "{kind:<8} {protocol:<8} {allowed:<5} {host:<40} {port:<5} {remote:<39} {reason}\n"
+            "{kind:<8} {protocol:<8} {allowed:<5} {host:<40} {port:<5} {remote:<39} {reason}"
         ));
+        if let Some(connect_host) = event_string(event, "connect_host") {
+            output.push_str(&format!(" via={connect_host}"));
+        }
+        output.push('\n');
     }
     output
 }

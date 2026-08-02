@@ -369,6 +369,11 @@ fn render_net_proxy(net_proxy: &NetProxyConfig) -> Option<String> {
         audit_log_path: _,
         proxy_addr: _,
         fake_dns_addr: _,
+        // `TlsInspection::Sni`（現状唯一のバリアント）はSNI/ALPNのみ見て復号しないため、
+        // モデルに見える制約はドメイン許可集合と変わらない。復号バリアントを追加する
+        // 実装者は、ここで`match`させて「通信内容が復号され監査ログに残る」旨を
+        // 出力へ追加すること（`NetProxyConfig.tls_inspection`のdoc comment参照）。
+        tls_inspection: _,
     } = net_proxy;
     if !*domain_policy_enabled {
         return None;

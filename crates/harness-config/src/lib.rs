@@ -137,6 +137,7 @@ impl NetSettings {
             audit_log_path: None,
             proxy_addr: None,
             fake_dns_addr: None,
+            ..Default::default()
         }
     }
 

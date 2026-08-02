@@ -1065,6 +1065,111 @@ fn net_case_07_wfp_start_failure_is_fail_closed() -> Result<(), String> {
     )
 }
 
+/// `run_net_case`はcase-matrixバイナリ専用のため、`keepalive-reuse`/`connect-sni`のような
+/// 個別プローブ呼び出しを`run_shell`経由でサンドボックス内から実行し、tool_calls結果の
+/// 最後のJSON行を返す（案08/09専用）。ワークスペースは呼び出し側が判定を終えてから
+/// `cleanup_on_success`すること（先に消すと失敗時の調査ができなくなる）。
+fn run_net_probe_script(
+    name: &str,
+    allow_domains: &[&str],
+    script: &str,
+) -> Result<(PathBuf, serde_json::Value), String> {
+    let ws = net_case_ws(name);
+    let mut extra_args = vec!["--staged"];
+    for d in allow_domains {
+        extra_args.push("--net-allow-domain");
+        extra_args.push(d);
+    }
+    let run = run_harness(&ws, &run_shell_script_turns(script), &extra_args, name);
+    if !run.status.success() {
+        return Err(format!("harness invocation itself failed: {}", run.stderr));
+    }
+    assert_prompt_sane(&run, &["run_shell"])?;
+    let outcome = parse_json_stdout(&run)?;
+    let result_text = outcome["tool_calls"]
+        .get(0)
+        .and_then(|c| c["result"].as_str())
+        .ok_or_else(|| format!("no tool_calls[0].result in outcome: {outcome}"))?;
+    let last_json = result_text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .next_back()
+        .ok_or_else(|| format!("no parseable JSON line in probe output: {result_text}"))?;
+    Ok((ws, last_json))
+}
+
+/// 08: HTTP keep-alive。`tier2a-net-e2e.exe keepalive-reuse`が1本のTCP接続上で
+/// 許可(example.com)→拒否(google.com)→許可(example.com)の3リクエストを送る。拒否後も
+/// 接続が維持されリクエストごとにポリシーが再評価されることを実AppContainer子プロセス
+/// 経由で確認する（`crates/harness-tools/src/net_proxy.rs`の
+/// `keepalive_connection_reevaluates_policy_per_request`ユニットテストと同じ主張の実機版）。
+fn net_case_08_keepalive_reevaluates_per_request() -> Result<(), String> {
+    let script = ".\\tier2a-net-e2e.exe keepalive-reuse http://example.com/ http://google.com/";
+    let (ws, json) = run_net_probe_script("net-08-keepalive", &["example.com"], script)?;
+    let ok = json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let statuses: Vec<u64> = json["statuses"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default();
+    if !ok || statuses.len() != 3 || statuses[1] != 403 {
+        return Err(format!(
+            "expected [2xx, 403, 2xx] on one keep-alive connection, got statuses={statuses:?}: {json}"
+        ));
+    }
+
+    let audit_path = ws.join(".harness").join("sandbox");
+    let audit_entries = collect_audit_entries(&audit_path)?;
+    let denied = audit_entries.iter().any(|e| {
+        e.get("allowed") == Some(&serde_json::Value::Bool(false))
+            && e
+                .get("host")
+                .and_then(|h| h.as_str())
+                .map(|h| h.contains("google.com"))
+                .unwrap_or(false)
+    });
+    if !denied {
+        return Err(format!(
+            "no audit deny entry for google.com on the keep-alive connection: {audit_entries:?}"
+        ));
+    }
+
+    cleanup_on_success(&ws, &[], "net-08-keepalive");
+    Ok(())
+}
+
+/// 09: CONNECTトンネル内のTLS SNI検査。`example.com`へCONNECTした上で、ClientHelloの
+/// SNIを許可リスト外の`notallowed.invalid.example`に差し替えて送る。トンネルは即座に
+/// 閉じられ（`outcome=tunnel_closed`）、監査ログに`protocol=tls_sni`かつ`reason=sni_denied`の
+/// エントリが残ることを実機で確認する（`crates/harness-tools/src/tunnel.rs`の
+/// `SniTunnelHandler`が実AppContainer子プロセス配下でも機能していることの確認）。
+fn net_case_09_connect_sni_denied_closes_tunnel() -> Result<(), String> {
+    let script = ".\\tier2a-net-e2e.exe connect-sni example.com --sni notallowed.invalid.example";
+    let (ws, json) = run_net_probe_script("net-09-connect-sni", &["example.com"], script)?;
+    let ok = json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let outcome = json.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+    if !ok || outcome != "tunnel_closed" {
+        return Err(format!(
+            "expected outcome=tunnel_closed for an SNI-denied ClientHello, got: {json}"
+        ));
+    }
+
+    let audit_path = ws.join(".harness").join("sandbox");
+    let audit_entries = collect_audit_entries(&audit_path)?;
+    let found = audit_entries.iter().any(|e| {
+        e.get("protocol").and_then(|p| p.as_str()) == Some("tls_sni")
+            && e.get("allowed") == Some(&serde_json::Value::Bool(false))
+            && e.get("reason").and_then(|r| r.as_str()) == Some("sni_denied")
+    });
+    if !found {
+        return Err(format!(
+            "no tls_sni/sni_denied audit entry found: {audit_entries:?}"
+        ));
+    }
+
+    cleanup_on_success(&ws, &[], "net-09-connect-sni");
+    Ok(())
+}
+
 #[test]
 #[ignore]
 fn tier2a_net_policy_matrix() {
@@ -1080,6 +1185,8 @@ fn tier2a_net_policy_matrix() {
         ("05-raw-tcp-layer2", net_case_05_raw_tcp_bypasses_proxy),
         ("06-numeric-ip-layer1", net_case_06_numeric_ip_obfuscation),
         ("07-wfp-start-failure-fail-closed", net_case_07_wfp_start_failure_is_fail_closed),
+        ("08-keepalive-reevaluates-per-request", net_case_08_keepalive_reevaluates_per_request),
+        ("09-connect-sni-denied-closes-tunnel", net_case_09_connect_sni_denied_closes_tunnel),
     ];
     let mut passed = 0;
     let total = cases.len();

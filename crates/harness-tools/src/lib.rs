@@ -22,6 +22,8 @@ mod fs_tools;
 pub mod net_proxy;
 mod search;
 mod shell;
+pub mod tls_sni;
+pub mod tunnel;
 mod web;
 
 use std::collections::HashMap;

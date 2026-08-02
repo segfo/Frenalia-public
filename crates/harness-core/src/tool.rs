@@ -256,6 +256,20 @@ pub struct NetProxyConfig {
     /// CLIがセッションスコープで先に起動したFake DNS Agentの待受アドレス。`Some`なら
     /// `run_shell`は新規Fake DNSを起動せず、このアドレスを診断envへ注入する。
     pub fake_dns_addr: Option<std::net::SocketAddr>,
+    /// CONNECT/SOCKS5トンネル内のTLSをどこまで検査するか（`harness_tools::tunnel::TunnelHandler`の
+    /// 実装選択に対応）。既定`Sni`はClientHelloのSNI/ALPNのみを見て復号しない。
+    pub tls_inspection: TlsInspection,
+}
+
+/// CONNECT/SOCKS5トンネル内のTLS検査強度。`harness_tools::tunnel`の`TunnelHandler`実装選択に
+/// 対応する。バリアントを追加する実装者は、このenumを`match`で分解している箇所（本ファイルの
+/// `Default`実装、`crates/harness-core/src/prompt.rs`の`render_net_proxy`）が全て追随することを
+/// 確認すること——特に復号を伴うバリアントを追加する場合は、通信内容が復号され監査ログに残る旨を
+/// 必ずシステムプロンプトへ宣言すること（`plans/DESIGN-SANDBOX-PRIVSEP.md` D-32）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsInspection {
+    /// ClientHelloのSNI/ALPNのみallowlist評価する。トンネル内容は復号しない。
+    Sni,
 }
 
 impl Default for NetProxyConfig {
@@ -267,6 +281,7 @@ impl Default for NetProxyConfig {
             audit_log_path: None,
             proxy_addr: None,
             fake_dns_addr: None,
+            tls_inspection: TlsInspection::Sni,
         }
     }
 }

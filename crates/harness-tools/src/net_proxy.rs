@@ -5,25 +5,48 @@
 //! この制御を素通りできる。Tier2aで`harness-netfilterd`のWFP default-denyと併用できた場合だけ、
 //! raw socketはWFP側で拒否され、このプロキシ経由の通信だけが通る。
 //!
-//! SOCKS5も同じポートで受け付ける。SOCKS5 `ATYP=0x03`（ドメイン名指定）はProxy側で
-//! 名前解決するremote DNS経路として扱い、`ATYP=IPv4/IPv6`はドメイン制御を迂回するため既定拒否。
-//! HTTP CONNECT/forward proxyのIP literal宛先も、同じ共通ドメインポリシーで既定拒否する。
+//! HTTP(S)経路は`hyper`/`hyper-util`（legacy client + auto server）で実装し、HTTP/1.1の
+//! フレーミング（`Content-Length`/`Transfer-Encoding`の併存・重複拒否込み）を正しく扱い、
+//! keep-alive接続上の複数リクエストをリクエスト単位でポリシー再評価する。h2c
+//! （cleartext HTTP/2、prior knowledge）も同一ポートで受け付ける。上流接続は
+//! `scheme+authority`単位でプールし再利用する。SOCKS5も同じポートで受け付ける。
 //!
-//! **既知の制約**: 1接続=1リクエストのみ扱う（HTTP keep-aliveの複数リクエスト再利用は
-//! 未対応）。CONNECT（HTTPS）はトンネル確立後は宛先ホスト名以降のTLS内容を一切検査しない
-//! （検査すればMITM相当になり別の複雑さを持ち込むため、ドメイン単位の可視化に留める設計）。
+//! SOCKS5 `ATYP=0x03`（ドメイン名指定）はProxy側で名前解決するremote DNS経路として扱い、
+//! `ATYP=IPv4/IPv6`はドメイン制御を迂回するため既定拒否。HTTP CONNECT/forward proxyの
+//! IP literal宛先も、同じ共通ドメインポリシーで既定拒否する。
+//!
+//! CONNECT/SOCKS5トンネル確立後は`crate::tunnel::TunnelHandler`（既定`SniTunnelHandler`）へ
+//! 委譲する。v1はTLS ClientHelloのSNI/ALPNだけをallowlist評価し、**トンネル内容は復号しない**
+//! （検査層は差し替え可能な拡張点であり、将来監査目的の復号層を足す場合は`TunnelHandler`の
+//! 別実装を用意すればよい。`crate::tunnel`のモジュールdoc参照）。
+//!
+//! **既知の制約**: raw socketで環境変数を読まず直接connectする子はそもそもこのプロキシを
+//! 経由しない（境界はWFP側、`raw_socket_bypasses_proxy_entirely_by_design`参照）。
 
+use std::convert::Infallible;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
+use http::header::{self, HeaderMap};
+use http::{Method, Request, Response, StatusCode, Uri};
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client as LegacyClient;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use harness_core::{DomainPolicy, NetProxyConfig};
+
+use crate::tunnel::{SniTunnelHandler, Tunnel, TunnelHandler};
 
 /// リクエスト1件の監査結果。`kind`は将来Fake DNS/WFPイベントを同じJSONLへ載せるための種別。
 #[derive(Debug, Clone, Serialize)]
@@ -36,6 +59,12 @@ pub struct NetAuditEntry {
     pub allowed: bool,
     pub reason: &'static str,
     pub matched_pattern: Option<String>,
+    /// `protocol="tls_sni"`のとき、トンネル外側（CONNECT/SOCKS5宛先）のホスト名。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_host: Option<String>,
+    /// `protocol="tls_sni"`のとき、ClientHelloのALPN候補。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -56,26 +85,7 @@ impl NetAuditLog {
         self.jsonl_path.as_deref()
     }
 
-    fn record_proxy(
-        &self,
-        protocol: &'static str,
-        host: String,
-        port: Option<u16>,
-        allowed: bool,
-        reason: &'static str,
-        matched_pattern: Option<String>,
-    ) {
-        let entry = NetAuditEntry {
-            timestamp_unix_ms: now_unix_ms(),
-            kind: "proxy",
-            protocol,
-            host,
-            port,
-            allowed,
-            reason,
-            matched_pattern,
-        };
-
+    fn push(&self, entry: NetAuditEntry) {
         if let Some(path) = &self.jsonl_path {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -93,6 +103,55 @@ impl NetAuditLog {
 
         // awaitをまたがない同期ロックのみ（std::sync::Mutexを非同期コードで安全に使う条件）。
         self.entries.lock().unwrap().push(entry);
+    }
+
+    fn record_proxy(
+        &self,
+        protocol: &'static str,
+        host: String,
+        port: Option<u16>,
+        allowed: bool,
+        reason: &'static str,
+        matched_pattern: Option<String>,
+    ) {
+        self.push(NetAuditEntry {
+            timestamp_unix_ms: now_unix_ms(),
+            kind: "proxy",
+            protocol,
+            host,
+            port,
+            allowed,
+            reason,
+            matched_pattern,
+            connect_host: None,
+            alpn: None,
+        });
+    }
+
+    /// トンネル内で観測したTLS ClientHelloの結果を記録する（`crate::tunnel::SniTunnelHandler`から呼ばれる）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_tls_sni(
+        &self,
+        host: String,
+        port: Option<u16>,
+        allowed: bool,
+        reason: &'static str,
+        matched_pattern: Option<String>,
+        connect_host: Option<String>,
+        alpn: Option<Vec<String>>,
+    ) {
+        self.push(NetAuditEntry {
+            timestamp_unix_ms: now_unix_ms(),
+            kind: "proxy",
+            protocol: "tls_sni",
+            host,
+            port,
+            allowed,
+            reason,
+            matched_pattern,
+            connect_host,
+            alpn,
+        });
     }
 
     pub fn entries(&self) -> Vec<NetAuditEntry> {
@@ -120,6 +179,57 @@ impl Drop for LocalProxy {
     }
 }
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
+
+fn empty_body() -> BoxBody {
+    Empty::<Bytes>::new()
+        .map_err(|never: Infallible| match never {})
+        .boxed()
+}
+
+fn incoming_body(body: Incoming) -> BoxBody {
+    body.map_err(|e| Box::new(e) as BoxError).boxed()
+}
+
+fn resp_status(code: StatusCode) -> Response<BoxBody> {
+    Response::builder()
+        .status(code)
+        .body(empty_body())
+        .expect("status-only response is always valid")
+}
+
+/// hop-by-hopヘッダ（RFC 7230 §6.1、`Connection`が列挙する追加分含む）をリクエスト・
+/// レスポンス双方から除去する。`Content-Length`/`Transfer-Encoding`もここで落とし、
+/// 実際のフレーミングはhyperがbodyの`size_hint`から再計算する。
+fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    if let Some(conn) = headers.get(header::CONNECTION) {
+        if let Ok(s) = conn.to_str() {
+            let extra: Vec<String> = s
+                .split(',')
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect();
+            for name in extra {
+                headers.remove(name.as_str());
+            }
+        }
+    }
+    for name in [
+        "connection",
+        "proxy-connection",
+        "proxy-authorization",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+    ] {
+        headers.remove(name);
+    }
+}
+
 /// `config.domain_policy_enabled=false`なら`Ok(None)`。有効なら`allow_domains`が空でも
 /// 全拒否ポリシーとして`127.0.0.1`の空きポートへbindし、accept loopを起動する。
 pub async fn spawn_local_proxy(config: &NetProxyConfig) -> std::io::Result<Option<LocalProxy>> {
@@ -129,7 +239,13 @@ pub async fn spawn_local_proxy(config: &NetProxyConfig) -> std::io::Result<Optio
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
     let audit = Arc::new(NetAuditLog::new(config.audit_log_path.clone()));
-    let policy = DomainPolicy::new(config.allow_domains.clone());
+    let policy = Arc::new(DomainPolicy::new(config.allow_domains.clone()));
+    let tunnel_handler: Arc<dyn TunnelHandler> = match config.tls_inspection {
+        harness_core::TlsInspection::Sni => Arc::new(SniTunnelHandler::default()),
+    };
+    let http_client: LegacyClient<HttpConnector, Incoming> =
+        LegacyClient::builder(TokioExecutor::new()).build_http();
+
     let audit_for_task = audit.clone();
     let accept_task = tokio::spawn(async move {
         loop {
@@ -139,8 +255,10 @@ pub async fn spawn_local_proxy(config: &NetProxyConfig) -> std::io::Result<Optio
             };
             let policy = policy.clone();
             let audit = audit_for_task.clone();
+            let tunnel_handler = tunnel_handler.clone();
+            let http_client = http_client.clone();
             tokio::spawn(async move {
-                let _ = handle_conn(stream, &policy, &audit).await;
+                let _ = handle_conn(stream, policy, audit, tunnel_handler, http_client).await;
             });
         }
     });
@@ -160,133 +278,84 @@ fn domain_allowed(host: &str, allow_domains: &[String]) -> bool {
         .allowed
 }
 
-const MAX_HEADER_BYTES: usize = 8 * 1024;
-
-/// リクエスト行+ヘッダを`\r\n\r\n`まで読み、`(header_bytes, leftover)`を返す。`leftover`は
-/// ヘッダ境界の直後に既に読めてしまっていたボディ/トンネル開始バイト列（先頭書込に使う）。
-async fn read_headers(
-    stream: &mut TcpStream,
-    initial: Vec<u8>,
-) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let mut buf = initial;
-    let mut chunk = [0u8; 1024];
-    loop {
-        if let Some(pos) = find_header_end(&buf) {
-            let leftover = buf.split_off(pos);
-            return Ok(Some((buf, leftover)));
-        }
-        if buf.len() > MAX_HEADER_BYTES {
-            return Ok(None);
-        }
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-async fn write_status(stream: &mut TcpStream, code: u16, reason: &str) -> std::io::Result<()> {
-    stream
-        .write_all(format!("HTTP/1.1 {code} {reason}\r\n\r\n").as_bytes())
-        .await
-}
-
+/// 新規接続の入口。先頭バイトをpeek（消費しない）してSOCKS5（`0x05`）かHTTP(S)かを
+/// 振り分ける。HTTP(S)側はここから先を丸ごとhyperの`auto::Builder`へ渡し、
+/// HTTP/1.1のフレーミング・keep-alive・h2cの扱いはhyperに委ねる。
 async fn handle_conn(
-    mut stream: TcpStream,
-    policy: &DomainPolicy,
-    audit: &NetAuditLog,
+    stream: TcpStream,
+    policy: Arc<DomainPolicy>,
+    audit: Arc<NetAuditLog>,
+    tunnel_handler: Arc<dyn TunnelHandler>,
+    http_client: LegacyClient<HttpConnector, Incoming>,
 ) -> std::io::Result<()> {
     let mut first = [0u8; 1];
-    if stream.read_exact(&mut first).await.is_err() {
+    let n = stream.peek(&mut first).await?;
+    if n == 0 {
         return Ok(());
     }
     if first[0] == 0x05 {
-        return handle_socks5(stream, policy, audit).await;
+        return handle_socks5(stream, policy.as_ref(), audit.as_ref(), tunnel_handler.as_ref())
+            .await;
     }
 
-    let Some((header_bytes, leftover)) = read_headers(&mut stream, vec![first[0]]).await? else {
-        return Ok(());
-    };
-    let header_text = String::from_utf8_lossy(&header_bytes);
-    let mut lines = header_text.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
-    let headers: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
-
-    let mut parts = request_line.splitn(3, ' ');
-    let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
-        write_status(&mut stream, 400, "Bad Request").await?;
-        return Ok(());
-    };
-
-    if method.eq_ignore_ascii_case("CONNECT") {
-        let host = target.rsplit_once(':').map(|(h, _)| h).unwrap_or(target);
-        let port = target
-            .rsplit_once(':')
-            .and_then(|(_, p)| p.parse::<u16>().ok());
-        let decision = policy.evaluate_host(host);
-        audit.record_proxy(
-            "http_connect",
-            host.to_string(),
-            port,
-            decision.allowed,
-            decision.reason,
-            decision.matched_pattern,
-        );
-        if !decision.allowed {
-            write_status(&mut stream, 403, "Forbidden").await?;
-            return Ok(());
-        }
-        let mut upstream = match TcpStream::connect(target).await {
-            Ok(s) => s,
-            Err(_) => {
-                write_status(&mut stream, 502, "Bad Gateway").await?;
-                return Ok(());
-            }
-        };
-        stream
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
-        if !leftover.is_empty() {
-            upstream.write_all(&leftover).await?;
-        }
-        let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
-        return Ok(());
-    }
-
-    // 平文HTTP（絶対URI形式）: `GET http://host[:port]/path HTTP/1.1`。
-    let host_header = headers.iter().find_map(|h| {
-        let (k, v) = h.split_once(':')?;
-        if k.trim().eq_ignore_ascii_case("host") {
-            Some(v.trim().to_string())
-        } else {
-            None
-        }
+    let io = TokioIo::new(stream);
+    let service = service_fn(move |req: Request<Incoming>| {
+        let policy = policy.clone();
+        let audit = audit.clone();
+        let tunnel_handler = tunnel_handler.clone();
+        let http_client = http_client.clone();
+        async move { handle_http_request(req, policy, audit, tunnel_handler, http_client).await }
     });
-    let parsed_url = reqwest::Url::parse(target).ok();
-    let (host, port, forward_target) = if let Some(u) = &parsed_url {
-        let host = u.host_str().unwrap_or("").to_string();
-        let port = u.port_or_known_default().unwrap_or(80);
-        let mut path = u.path().to_string();
-        if let Some(q) = u.query() {
-            path.push('?');
-            path.push_str(q);
-        }
-        (host, port, path)
-    } else if let Some(hh) = &host_header {
-        let (h, p) = hh
-            .split_once(':')
-            .map(|(h, p)| (h.to_string(), p.parse().unwrap_or(80)))
-            .unwrap_or_else(|| (hh.clone(), 80));
-        (h, p, target.to_string())
-    } else {
-        write_status(&mut stream, 400, "Bad Request").await?;
-        return Ok(());
+    let _ = auto::Builder::new(TokioExecutor::new())
+        .serve_connection_with_upgrades(io, service)
+        .await;
+    Ok(())
+}
+
+async fn handle_http_request(
+    mut req: Request<Incoming>,
+    policy: Arc<DomainPolicy>,
+    audit: Arc<NetAuditLog>,
+    tunnel_handler: Arc<dyn TunnelHandler>,
+    http_client: LegacyClient<HttpConnector, Incoming>,
+) -> Result<Response<BoxBody>, Infallible> {
+    if req.method() == Method::CONNECT {
+        return Ok(handle_connect(req, policy, audit, tunnel_handler).await);
+    }
+
+    // origin-form（`Host`ヘッダ方式）を絶対URIへ正規化する。HTTP proxyへ送るクライアントは
+    // 絶対URI形式（`GET http://host/path HTTP/1.1`）を使うことが多いが、両対応にする。
+    if req.uri().authority().is_none() {
+        let Some(host_hdr) = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+        else {
+            return Ok(resp_status(StatusCode::BAD_REQUEST));
+        };
+        let pq = req
+            .uri()
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+        let new_uri = match Uri::builder()
+            .scheme("http")
+            .authority(host_hdr)
+            .path_and_query(pq)
+            .build()
+        {
+            Ok(u) => u,
+            Err(_) => return Ok(resp_status(StatusCode::BAD_REQUEST)),
+        };
+        *req.uri_mut() = new_uri;
+    }
+
+    let Some(authority) = req.uri().authority().cloned() else {
+        return Ok(resp_status(StatusCode::BAD_REQUEST));
     };
+    let host = authority.host().to_string();
+    let port = authority.port_u16().unwrap_or(80);
 
     let decision = policy.evaluate_host(&host);
     audit.record_proxy(
@@ -298,43 +367,90 @@ async fn handle_conn(
         decision.matched_pattern,
     );
     if !decision.allowed {
-        write_status(&mut stream, 403, "Forbidden").await?;
-        return Ok(());
+        return Ok(resp_status(StatusCode::FORBIDDEN));
     }
 
-    let mut upstream = match TcpStream::connect((host.as_str(), port)).await {
-        Ok(s) => s,
-        Err(_) => {
-            write_status(&mut stream, 502, "Bad Gateway").await?;
-            return Ok(());
+    strip_hop_by_hop(req.headers_mut());
+    // 上流は常にHTTP/1.1で話す（h2c/h2はクライアント⇔プロキシ間のみ。上流に平文h2は存在しない
+    // 前提のプロトコル変換）。フロント側がh2だった場合、`req.version()`をそのまま転送すると
+    // H1専用の`http_client`が`UserUnsupportedVersion`で拒否するため、ここで明示的に揃える。
+    *req.version_mut() = http::Version::HTTP_11;
+    match http_client.request(req).await {
+        Ok(resp) => {
+            let (mut parts, body) = resp.into_parts();
+            strip_hop_by_hop(&mut parts.headers);
+            Ok(Response::from_parts(parts, incoming_body(body)))
         }
+        Err(_) => Ok(resp_status(StatusCode::BAD_GATEWAY)),
+    }
+}
+
+async fn handle_connect(
+    req: Request<Incoming>,
+    policy: Arc<DomainPolicy>,
+    audit: Arc<NetAuditLog>,
+    tunnel_handler: Arc<dyn TunnelHandler>,
+) -> Response<BoxBody> {
+    let Some(authority) = req.uri().authority().cloned() else {
+        return resp_status(StatusCode::BAD_REQUEST);
     };
-    upstream
-        .write_all(format!("{method} {forward_target} HTTP/1.1\r\n").as_bytes())
-        .await?;
-    for h in &headers {
-        upstream.write_all(h.as_bytes()).await?;
-        upstream.write_all(b"\r\n").await?;
+    let host = authority.host().to_string();
+    let port = authority.port_u16().unwrap_or(443);
+
+    let decision = policy.evaluate_host(&host);
+    audit.record_proxy(
+        "http_connect",
+        host.clone(),
+        Some(port),
+        decision.allowed,
+        decision.reason,
+        decision.matched_pattern,
+    );
+    if !decision.allowed {
+        return resp_status(StatusCode::FORBIDDEN);
     }
-    upstream.write_all(b"\r\n").await?;
-    if !leftover.is_empty() {
-        upstream.write_all(&leftover).await?;
-    }
-    // 平文HTTPは1接続=1リクエストのみ扱う（モジュールdoc「既知の制約」）。CONNECTと違い
-    // 真のトンネルではないため、レスポンスを片方向で中継したら明示的に接続を閉じる
-    // （関数終了で`stream`がdropされFIN送出）。curlの`Proxy-Connection: Keep-Alive`が
-    // 次リクエストを同一接続へ載せようとしても、サーバ側クローズを見て新規接続へ
-    // 正しくフォールバックする（RFC 7230準拠のクライアントの標準動作）。
-    let _ = tokio::io::copy(&mut upstream, &mut stream).await;
-    Ok(())
+
+    let upstream = match TcpStream::connect((host.as_str(), port)).await {
+        Ok(s) => s,
+        Err(_) => return resp_status(StatusCode::BAD_GATEWAY),
+    };
+
+    tokio::spawn(async move {
+        if let Ok(upgraded) = hyper::upgrade::on(req).await {
+            let client_io = TokioIo::new(upgraded);
+            let tunnel = Tunnel {
+                protocol: "http_connect",
+                connect_host: host,
+                connect_port: port,
+                client: Box::new(client_io),
+                upstream: Box::new(upstream),
+                policy: policy.as_ref(),
+                audit: audit.as_ref(),
+            };
+            let _ = tunnel_handler.handle(tunnel).await;
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(empty_body())
+        .expect("status-only response is always valid")
 }
 
 async fn handle_socks5(
     mut stream: TcpStream,
     policy: &DomainPolicy,
     audit: &NetAuditLog,
+    tunnel_handler: &dyn TunnelHandler,
 ) -> std::io::Result<()> {
-    // RFC 1928 greeting: VER, NMETHODS, METHODS...
+    // VERバイトは`handle_conn`側でpeek済み（未消費）なので、ここで正式に読む。
+    let mut ver = [0u8; 1];
+    stream.read_exact(&mut ver).await?;
+    if ver[0] != 0x05 {
+        return Ok(());
+    }
+
+    // RFC 1928 greeting: VER(読済み), NMETHODS, METHODS...
     let mut nmethods = [0u8; 1];
     stream.read_exact(&mut nmethods).await?;
     let mut methods = vec![0u8; nmethods[0] as usize];
@@ -398,7 +514,7 @@ async fn handle_socks5(
         return Ok(());
     }
 
-    let mut upstream = match TcpStream::connect((host.as_str(), port)).await {
+    let upstream = match TcpStream::connect((host.as_str(), port)).await {
         Ok(s) => s,
         Err(_) => {
             write_socks5_reply(&mut stream, 0x04).await?; // Host unreachable.
@@ -406,7 +522,17 @@ async fn handle_socks5(
         }
     };
     write_socks5_reply(&mut stream, 0x00).await?;
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+
+    let tunnel = Tunnel {
+        protocol: "socks5",
+        connect_host: host,
+        connect_port: port,
+        client: Box::new(stream),
+        upstream: Box::new(upstream),
+        policy,
+        audit,
+    };
+    let _ = tunnel_handler.handle(tunnel).await;
     Ok(())
 }
 
@@ -420,6 +546,7 @@ async fn write_socks5_reply(stream: &mut TcpStream, rep: u8) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     #[test]
@@ -473,6 +600,8 @@ mod tests {
     }
 
     /// 許可ドメインへのCONNECTはトンネルが確立し、監査ログにALLOWで記録される。
+    /// トンネル内には非TLSの`hello`を流すため、SNI検査層が2件目の監査エントリ
+    /// （`reason=sni_not_tls`）を残す（`crate::tunnel::SniTunnelHandler`が挟まったため）。
     #[tokio::test]
     async fn connect_to_allowed_domain_tunnels_and_audits() {
         // ダミーの「宛先サーバ」を127.0.0.1の別ポートに立てる。
@@ -515,9 +644,11 @@ mod tests {
         assert_eq!(&echoed, b"hello");
 
         let entries = proxy.audit.entries();
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
         assert_eq!(entries[0].host, "localhost");
         assert!(entries[0].allowed);
+        assert_eq!(entries[1].protocol, "tls_sni");
+        assert_eq!(entries[1].reason, "sni_not_tls");
     }
 
     /// 未許可ドメインへのCONNECTは403で拒否され、監査ログにDENYで記録される
@@ -678,6 +809,8 @@ mod tests {
         assert_eq!(value["reason"], "domain_denied");
     }
 
+    /// SOCKS5経路でもCONNECT経路と同じくトンネル確立後にSNI検査層が挟まり、
+    /// 非TLSの`hello`は`sni_not_tls`として2件目の監査エントリになる。
     #[tokio::test]
     async fn socks5_domain_connect_tunnels_and_audits() {
         let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -716,9 +849,11 @@ mod tests {
         assert_eq!(&echoed, b"hello");
 
         let entries = proxy.audit.entries();
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
         assert_eq!(entries[0].host, "localhost");
         assert!(entries[0].allowed);
+        assert_eq!(entries[1].protocol, "tls_sni");
+        assert_eq!(entries[1].reason, "sni_not_tls");
     }
 
     #[tokio::test]
@@ -815,5 +950,461 @@ mod tests {
 
         // プロキシの監査ログには一切現れない（バイパスされたことの確認）。
         assert!(proxy.audit.entries().is_empty());
+    }
+
+    /// HTTP keep-alive: 1本のTCP接続上で許可→拒否→許可の3リクエストを送り、
+    /// 拒否後も接続が維持されリクエストごとに再評価されることを確認する。
+    #[tokio::test]
+    async fn keepalive_connection_reevaluates_policy_per_request() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let accept_count_task = accept_count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = target_listener.accept().await else {
+                    break;
+                };
+                accept_count_task.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let (reader, mut writer) = sock.split();
+                    let mut reader = BufReader::new(reader);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        if line == "\r\n" {
+                            let body = b"ok";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                body.len()
+                            );
+                            if writer.write_all(resp.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            if writer.write_all(body).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let config = NetProxyConfig {
+            allow_domains: vec!["localhost".to_string()],
+            ..Default::default()
+        };
+        let proxy = spawn_local_proxy(&config).await.unwrap().unwrap();
+
+        let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+        let allowed_target = format!("http://localhost:{}/", target_addr.port());
+        let denied_target = "http://denied.example/";
+
+        for target in [allowed_target.as_str(), denied_target, allowed_target.as_str()] {
+            client
+                .write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        let mut reader = BufReader::new(&mut client);
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            let mut status_line = String::new();
+            reader.read_line(&mut status_line).await.unwrap();
+            // ヘッダ・ボディを読み飛ばして次のステータス行まで進む。
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line
+                    .to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            statuses.push(status_line);
+        }
+
+        assert!(statuses[0].starts_with("HTTP/1.1 200"), "{:?}", statuses);
+        assert!(statuses[1].starts_with("HTTP/1.1 403"), "{:?}", statuses);
+        assert!(statuses[2].starts_with("HTTP/1.1 200"), "{:?}", statuses);
+
+        // 上流接続はhost:port単位でプールされ、2回の許可リクエストで1本しか使われない。
+        assert_eq!(accept_count.load(Ordering::SeqCst), 1);
+
+        let entries = proxy.audit.entries();
+        assert_eq!(entries.len(), 3, "entries: {entries:?}");
+        assert!(entries[0].allowed);
+        assert!(!entries[1].allowed);
+        assert!(entries[2].allowed);
+    }
+
+    /// `Content-Length`付きPOSTボディが欠落せず上流へ届くことの回帰テスト
+    /// （旧実装は平文HTTPパスでリクエストボディを一切転送していなかった）。
+    #[tokio::test]
+    async fn post_request_body_is_forwarded_completely() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_task = received.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = target_listener.accept().await.unwrap();
+            let (reader, mut writer) = sock.split();
+            let mut reader = BufReader::new(reader);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            *received_task.lock().unwrap() = body;
+            writer
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let config = NetProxyConfig {
+            allow_domains: vec!["localhost".to_string()],
+            ..Default::default()
+        };
+        let proxy = spawn_local_proxy(&config).await.unwrap().unwrap();
+        let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+
+        let payload = b"the quick brown fox jumps over the lazy dog";
+        let request = format!(
+            "POST http://localhost:{}/ HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            target_addr.port(),
+            payload.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.write_all(payload).await.unwrap();
+
+        let mut reader = BufReader::new(&mut client);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await.unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 200"), "{status_line}");
+
+        assert_eq!(received.lock().unwrap().as_slice(), payload);
+    }
+
+    /// CONNECTトンネル内でSNI不許可ドメインを名乗るClientHelloを送ると、トンネルは
+    /// 即座に切断され上流へは何も届かない。監査には`reason=sni_denied`が残る。
+    #[tokio::test]
+    async fn connect_tunnel_sni_denied_closes_tunnel_and_reaches_no_upstream() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let received_any = Arc::new(AtomicUsize::new(0));
+        let received_any_task = received_any.clone();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = target_listener.accept().await {
+                let mut buf = [0u8; 16];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    if n > 0 {
+                        received_any_task.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+
+        // CONNECT先ホストは実際にTCP接続できる必要があるため`localhost`（許可済み）を使い、
+        // ClientHelloのSNIだけを許可リスト外の`denied.example`にする（SNI自体は名前解決しない）。
+        let config = NetProxyConfig {
+            allow_domains: vec!["localhost".to_string()],
+            ..Default::default()
+        };
+        let proxy = spawn_local_proxy(&config).await.unwrap().unwrap();
+        let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+        client
+            .write_all(
+                format!("CONNECT localhost:{} HTTP/1.1\r\n\r\n", target_addr.port()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(&mut client);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await.unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 200"), "{status_line}");
+        let mut blank = String::new();
+        reader.read_line(&mut blank).await.unwrap();
+
+        let hello = build_client_hello("denied.example");
+        client.write_all(&hello).await.unwrap();
+
+        // トンネルは閉じられるので、これ以上読んでもEOFになる。
+        let mut buf = [0u8; 8];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "tunnel should be closed after sni_denied");
+
+        assert_eq!(
+            received_any.load(Ordering::SeqCst),
+            0,
+            "denied ClientHello must not reach upstream"
+        );
+
+        let entries = proxy.audit.entries();
+        let sni_entry = entries
+            .iter()
+            .find(|e| e.protocol == "tls_sni")
+            .expect("tls_sni entry");
+        assert_eq!(sni_entry.reason, "sni_denied");
+        assert!(!sni_entry.allowed);
+        assert_eq!(sni_entry.host, "denied.example");
+        assert_eq!(sni_entry.connect_host.as_deref(), Some("localhost"));
+    }
+
+    /// SNIがCONNECT宛先と異なるが両方許可ドメインの場合は、通信は継続され
+    /// `reason=sni_host_mismatch`として監査に残るだけ（拒否しない）。
+    #[tokio::test]
+    async fn connect_tunnel_sni_host_mismatch_is_allowed_and_audited() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_task = received.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = target_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            *received_task.lock().unwrap() = buf[..n].to_vec();
+        });
+
+        let config = NetProxyConfig {
+            allow_domains: vec!["localhost".to_string(), "allowed-b.example".to_string()],
+            ..Default::default()
+        };
+        let proxy = spawn_local_proxy(&config).await.unwrap().unwrap();
+        let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+        client
+            .write_all(
+                format!("CONNECT localhost:{} HTTP/1.1\r\n\r\n", target_addr.port()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(&mut client);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await.unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 200"), "{status_line}");
+        let mut blank = String::new();
+        reader.read_line(&mut blank).await.unwrap();
+
+        let hello = build_client_hello("allowed-b.example");
+        client.write_all(&hello).await.unwrap();
+
+        // 少し待って上流へバイトが届くのを許容する。
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !received.lock().unwrap().is_empty(),
+            "mismatched-but-allowed SNI should still be piped to upstream"
+        );
+
+        let entries = proxy.audit.entries();
+        let sni_entry = entries
+            .iter()
+            .find(|e| e.protocol == "tls_sni")
+            .expect("tls_sni entry");
+        assert_eq!(sni_entry.reason, "sni_host_mismatch");
+        assert!(sni_entry.allowed);
+        assert_eq!(sni_entry.host, "allowed-b.example");
+        assert_eq!(sni_entry.connect_host.as_deref(), Some("localhost"));
+    }
+
+    /// `TunnelHandler`が拡張点として機能することの回帰確認: CONNECT/SOCKS5の受理ロジックを
+    /// 一切変えずに検査層を丸ごと差し替えられる（将来の復号層もこの形で追加できる）。
+    /// 差し替えたハンドラは呼ばれたことをフラグで示しつつ、実際の中継は
+    /// `copy_bidirectional`（`SniTunnelHandler`と同じ中継手段）で行い、
+    /// 呼ばれたハンドラが`SniTunnelHandler`ではなくこちらであることをechoで確認する。
+    #[tokio::test]
+    async fn tunnel_handler_can_be_swapped_without_touching_connect_logic() {
+        struct FlagHandler(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl TunnelHandler for FlagHandler {
+            async fn handle(&self, mut tunnel: Tunnel<'_>) -> std::io::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let _ =
+                    tokio::io::copy_bidirectional(&mut tunnel.client, &mut tunnel.upstream).await;
+                Ok(())
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let audit = Arc::new(NetAuditLog::new(None));
+        let policy = Arc::new(DomainPolicy::new(vec!["localhost".to_string()]));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<dyn TunnelHandler> = Arc::new(FlagHandler(invoked.clone()));
+        let http_client: LegacyClient<HttpConnector, Incoming> =
+            LegacyClient::builder(TokioExecutor::new()).build_http();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_conn(stream, policy, audit, handler, http_client).await;
+            }
+        });
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = target_listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(&buf[..n]).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                format!("CONNECT localhost:{} HTTP/1.1\r\n\r\n", target_addr.port()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(&mut client);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await.unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 200"), "{status_line}");
+        let mut blank = String::new();
+        reader.read_line(&mut blank).await.unwrap();
+
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+
+        assert_eq!(invoked.load(Ordering::SeqCst), 1);
+    }
+
+    /// h2c（cleartext HTTP/2、prior knowledge）クライアントからのリクエストも
+    /// 同一ポートで受け付けられ、許可ドメインへ正しく中継されることを確認する。
+    #[tokio::test]
+    async fn h2c_prior_knowledge_request_is_proxied() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = target_listener.accept().await.unwrap();
+            let (reader, mut writer) = sock.split();
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            writer
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let config = NetProxyConfig {
+            allow_domains: vec!["localhost".to_string()],
+            ..Default::default()
+        };
+        let proxy = spawn_local_proxy(&config).await.unwrap().unwrap();
+
+        let stream = TcpStream::connect(proxy.addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let uri: Uri = format!("http://localhost:{}/", target_addr.port())
+            .parse()
+            .unwrap();
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"ok");
+    }
+
+    /// SNI検査に使うClientHelloを実際にrustlsで生成する（`sni`拡張のみ最低限、TLS1.2）。
+    fn build_client_hello(sni: &str) -> Vec<u8> {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| {
+                let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+                let _ = rustls::crypto::CryptoProvider::install_default((*provider).clone());
+                provider
+            });
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+        let mut conn =
+            rustls::ClientConnection::new(std::sync::Arc::new(config), server_name).unwrap();
+        let mut buf = Vec::new();
+        while conn.wants_write() {
+            conn.write_tls(&mut buf).unwrap();
+        }
+        buf
+    }
+
+    #[derive(Debug)]
+    struct NoVerify;
+
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::CryptoProvider::get_default()
+                .map(|p| p.signature_verification_algorithms.supported_schemes())
+                .unwrap_or_default()
+        }
     }
 }
