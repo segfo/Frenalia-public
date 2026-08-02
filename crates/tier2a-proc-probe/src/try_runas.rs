@@ -3,6 +3,8 @@
 //! `crates/harness-sandbox/src/privhelper.rs`の`launch_helper_elevated`とほぼ同一のWin32呼び出し
 //! （`ShellExecuteExW`、`lpVerb="runas"`、`SEE_MASK_NOCLOSEPROCESS`、`nShow=SW_HIDE`）を、
 //! AppContainer内の子プロセスから実行してみて、UAC昇格ブローカへ到達できるかを確認する。
+//! 本体との差分は`SEE_MASK_FLAG_NO_UI`を追加している点だけで、その理由と影響は下記
+//! 「副次的な発見」に記す。
 //!
 //! 「LLMが`run_shell`で`harness.exe`を再実行し、特権昇格ヘルパー経由で任意パスへ
 //! サンドボックスSID宛のACEを撒かせる」という攻撃経路（`/dig`セッションで検討）の
@@ -10,15 +12,23 @@
 //! 到達できず即座に失敗する、というのが一般的なWindowsの挙動だが、この特定の
 //! AppContainerプロファイル（capability構成・no-console等）での実機確認は無かった。
 //!
-//! **実機確認済み（2026-08-02）**: `ShellExecuteExW(runas)`は`ERROR_CANCELLED`(1223)で
-//! 即座に失敗し、UAC同意ダイアログ（「このアプリがデバイスに変更を加えることを許可しますか？」）
-//! は画面に一切表示されないことを目視確認した。リンク2（入れ子harnessが特権昇格ブローカへ
-//! 到達する経路）は実機でも構造的に閉じている。
+//! **実機確認済み（2026-08-02）**: `SEE_MASK_FLAG_NO_UI`を付けた現行プローブでは、
+//! `ShellExecuteExW(runas)`は`ERROR_ACCESS_DENIED`(5)で即座に失敗し、UAC同意ダイアログ
+//! （「このアプリがデバイスに変更を加えることを許可しますか？」）は画面に一切表示されない
+//! ことを目視確認した。AppContainerトークンはAPI呼び出しの時点でシェルに拒否され、UAC同意
+//! ブローカ（consent.exe/AIS）へは一切到達しない。リンク2（入れ子harnessが特権昇格ブローカへ
+//! 到達する経路）は実機でも構造的に閉じている。この`ERROR_ACCESS_DENIED`(5)は、
+//! `crates/harness-sandbox/src/win_appcontainer.rs`の回帰テスト
+//! `traverse_diagnostics::appcontainer_child_cannot_reach_uac_elevation_broker`が固定assert
+//! している値でもある。
 //!
-//! **副次的な発見**: 初回検証時は`SEE_MASK_FLAG_NO_UI`を付けていなかったため、
-//! `ShellExecuteExW`失敗時にシェル自身が「指定されたデバイス、パス、またはファイルに
-//! アクセスできません」というエラーダイアログを対話デスクトップ上に表示することが判明した
-//! （UAC同意画面ではなく、単なるアクセス拒否の通知）。AppContainerの「対話UIを持たない」という
+//! **副次的な発見**: 初回検証時は`SEE_MASK_FLAG_NO_UI`を付けていなかった。このとき同じ拒否は
+//! `ERROR_CANCELLED`(1223、`launch_helper_elevated`が`ElevationDeclined`へ変換するのと同じ
+//! コード)として返り、さらに`ShellExecuteExW`が戻るまでに約17秒かかっていた。その間、シェル
+//! 自身が「指定されたデバイス、パス、またはファイルにアクセスできません」というエラー
+//! ダイアログを対話デスクトップ上に表示する（UAC同意画面ではなく、単なるアクセス拒否の通知）。
+//! つまり返るエラーコードと所要時間は`SEE_MASK_FLAG_NO_UI`の有無で変わるが、
+//! 「特権昇格には至らない」という結論はどちらでも同じである。AppContainerの「対話UIを持たない」という
 //! 想定は絶対ではなく、シェルのエラーUIのような経路では可視化され得る——今回のセキュリティ結論
 //! （特権付与は起きない）には影響しないが、サンドボックス化された子プロセスが対話デスクトップへ
 //! 予期しないダイアログを出しうるという事実は覚えておく価値がある。以降の再実行で毎回ダイアログを
