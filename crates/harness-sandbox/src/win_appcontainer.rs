@@ -2700,9 +2700,12 @@ mod traverse_diagnostics {
             println!("=== Experiment F setup failed: {e:?} ===");
         }
 
-        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
-        println!("=== C:\\ traverse ACE revoke result: {revoke_result:?} ===");
-        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+        // 【BUG-046】ドライブルート（`C:\`）のACEはD10の恒久的な修復として維持されているため、
+        // ここでは**revokeしない**。上の付与は永続ACEが要求マスクの上位集合であるため
+        // `grant_ace_mask`の冪等スキップで既にno-opであり、revokeだけが効くと永続ACEの純減に
+        // なってTier1a/Tier2aのFS I/Oがマシン全体で壊れる（詳細は`docs/bugs/BUG-046.md`）。
+        // 同ファイルの`grant_traverse_chain_then_revoke_each_node_on_neutral_tree`が
+        // `granted.iter().skip(1)`でドライブルートを後始末対象から外しているのと同じ原則。
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2846,9 +2849,12 @@ mod traverse_diagnostics {
         }
 
         // 必ず原状復帰: grant成否に関わらずrevokeを試みる（冪等、既存ACE無しでも安全）。
-        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
-        println!("=== C:\\ traverse ACE revoke result: {revoke_result:?} ===");
-        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+        // 【BUG-046】ドライブルート（`C:\`）のACEはD10の恒久的な修復として維持されているため、
+        // ここでは**revokeしない**。上の付与は永続ACEが要求マスクの上位集合であるため
+        // `grant_ace_mask`の冪等スキップで既にno-opであり、revokeだけが効くと永続ACEの純減に
+        // なってTier1a/Tier2aのFS I/Oがマシン全体で壊れる（詳細は`docs/bugs/BUG-046.md`）。
+        // 同ファイルの`grant_traverse_chain_then_revoke_each_node_on_neutral_tree`が
+        // `granted.iter().skip(1)`でドライブルートを後始末対象から外しているのと同じ原則。
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -3127,9 +3133,12 @@ mod traverse_diagnostics {
             );
         }
 
-        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
-        println!("=== C:\\ traverse ACE revoke result: {revoke_result:?} ===");
-        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+        // 【BUG-046】ドライブルート（`C:\`）のACEはD10の恒久的な修復として維持されているため、
+        // ここでは**revokeしない**。上の付与は永続ACEが要求マスクの上位集合であるため
+        // `grant_ace_mask`の冪等スキップで既にno-opであり、revokeだけが効くと永続ACEの純減に
+        // なってTier1a/Tier2aのFS I/Oがマシン全体で壊れる（詳細は`docs/bugs/BUG-046.md`）。
+        // 同ファイルの`grant_traverse_chain_then_revoke_each_node_on_neutral_tree`が
+        // `granted.iter().skip(1)`でドライブルートを後始末対象から外しているのと同じ原則。
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -3292,9 +3301,12 @@ mod traverse_diagnostics {
             }
         }
 
-        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
-        println!("=== C:\\ traverse ACE revoke result: {revoke_result:?} ===");
-        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+        // 【BUG-046】ドライブルート（`C:\`）のACEはD10の恒久的な修復として維持されているため、
+        // ここでは**revokeしない**。上の付与は永続ACEが要求マスクの上位集合であるため
+        // `grant_ace_mask`の冪等スキップで既にno-opであり、revokeだけが効くと永続ACEの純減に
+        // なってTier1a/Tier2aのFS I/Oがマシン全体で壊れる（詳細は`docs/bugs/BUG-046.md`）。
+        // 同ファイルの`grant_traverse_chain_then_revoke_each_node_on_neutral_tree`が
+        // `granted.iter().skip(1)`でドライブルートを後始末対象から外しているのと同じ原則。
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -3340,9 +3352,12 @@ mod traverse_diagnostics {
             }
         }
 
-        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
-        println!("=== C:\\ ACE revoke result: {revoke_result:?} ===");
-        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+        // 【BUG-046】ドライブルート（`C:\`）のACEはD10の恒久的な修復として維持されているため、
+        // ここでは**revokeしない**。上の付与は永続ACEが要求マスクの上位集合であるため
+        // `grant_ace_mask`の冪等スキップで既にno-opであり、revokeだけが効くと永続ACEの純減に
+        // なってTier1a/Tier2aのFS I/Oがマシン全体で壊れる（詳細は`docs/bugs/BUG-046.md`）。
+        // 同ファイルの`grant_traverse_chain_then_revoke_each_node_on_neutral_tree`が
+        // `granted.iter().skip(1)`でドライブルートを後始末対象から外しているのと同じ原則。
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -3386,9 +3401,12 @@ mod traverse_diagnostics {
             );
         }
 
-        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
-        println!("=== C:\\ ACE revoke result: {revoke_result:?} ===");
-        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+        // 【BUG-046】ドライブルート（`C:\`）のACEはD10の恒久的な修復として維持されているため、
+        // ここでは**revokeしない**。上の付与は永続ACEが要求マスクの上位集合であるため
+        // `grant_ace_mask`の冪等スキップで既にno-opであり、revokeだけが効くと永続ACEの純減に
+        // なってTier1a/Tier2aのFS I/Oがマシン全体で壊れる（詳細は`docs/bugs/BUG-046.md`）。
+        // 同ファイルの`grant_traverse_chain_then_revoke_each_node_on_neutral_tree`が
+        // `granted.iter().skip(1)`でドライブルートを後始末対象から外しているのと同じ原則。
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -3467,9 +3485,12 @@ mod traverse_diagnostics {
             println!("=== experiment_h_procmon_target: exit={code} ===\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
         }
 
-        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
-        println!("=== C:\\ traverse ACE revoke result: {revoke_result:?} ===");
-        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+        // 【BUG-046】ドライブルート（`C:\`）のACEはD10の恒久的な修復として維持されているため、
+        // ここでは**revokeしない**。上の付与は永続ACEが要求マスクの上位集合であるため
+        // `grant_ace_mask`の冪等スキップで既にno-opであり、revokeだけが効くと永続ACEの純減に
+        // なってTier1a/Tier2aのFS I/Oがマシン全体で壊れる（詳細は`docs/bugs/BUG-046.md`）。
+        // 同ファイルの`grant_traverse_chain_then_revoke_each_node_on_neutral_tree`が
+        // `granted.iter().skip(1)`でドライブルートを後始末対象から外しているのと同じ原則。
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -3571,9 +3592,12 @@ mod traverse_diagnostics {
             );
         }
 
-        let revoke_result = revoke_ace(&drive_root, sid.as_psid());
-        println!("=== C:\\ ACE revoke result: {revoke_result:?} ===");
-        revoke_result.expect("revert: revoke_ace on C:\\ must not fail silently (manual recovery: icacls C:\\ /remove:g <container-SID> if this panics)");
+        // 【BUG-046】ドライブルート（`C:\`）のACEはD10の恒久的な修復として維持されているため、
+        // ここでは**revokeしない**。上の付与は永続ACEが要求マスクの上位集合であるため
+        // `grant_ace_mask`の冪等スキップで既にno-opであり、revokeだけが効くと永続ACEの純減に
+        // なってTier1a/Tier2aのFS I/Oがマシン全体で壊れる（詳細は`docs/bugs/BUG-046.md`）。
+        // 同ファイルの`grant_traverse_chain_then_revoke_each_node_on_neutral_tree`が
+        // `granted.iter().skip(1)`でドライブルートを後始末対象から外しているのと同じ原則。
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
