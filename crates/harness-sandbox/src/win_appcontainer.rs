@@ -3670,6 +3670,115 @@ mod traverse_diagnostics {
         revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
     }
 
+    /// 特権昇格ヘルパー(D-16)レビュー用の実機検証（`/dig`セッションで検討した「LLMが
+    /// `run_shell`でharnessを再実行し、`--fs-allow`/`grant-traverse`経由で任意パスへ
+    /// サンドボックスSID宛のACEを撒かせる」攻撃経路のリンク2: 入れ子のharnessがAppContainer内から
+    /// `ShellExecuteExW(runas)`（`privhelper.rs::launch_helper_elevated`と同一の呼び出し）で
+    /// UAC昇格ブローカへ到達できるか）。
+    ///
+    /// AppContainer内の子プロセス（`tier2a-proc-probe.exe --try-runas <privhelper.exeの絶対パス>`）
+    /// から`ShellExecuteExW(runas)`を試み、結果をJSONで報告させる。**手動実行時は画面を監視し、
+    /// UACダイアログが表示された場合は必ずキャンセルすること**（`try_runas`モジュールdocの
+    /// 安全性の配慮により、仮に誤って「許可」しても実際のACL書込みには到達しないが、
+    /// 昇格プロセスを残さないため）。
+    #[test]
+    #[ignore]
+    fn appcontainer_child_cannot_reach_uac_elevation_broker() {
+        let helper_path = {
+            let current = std::env::current_exe().expect("current_exe");
+            let dir = current.parent().expect("current_exe has parent").to_path_buf();
+            let p = dir.join("harness-privhelper.exe");
+            assert!(
+                p.exists(),
+                "harness-privhelper.exe not found at {} (build with `cargo build -p \
+                 harness-privhelper` and ensure it sits next to the test binary)",
+                p.display()
+            );
+            p
+        };
+        let probe_exe = {
+            let current = std::env::current_exe().expect("current_exe");
+            let dir = current.parent().expect("current_exe has parent").to_path_buf();
+            let p = dir.join("tier2a_proc_probe.exe");
+            assert!(
+                p.exists(),
+                "tier2a_proc_probe.exe not found at {} (build with `cargo build -p \
+                 tier2a-proc-probe`)",
+                p.display()
+            );
+            p
+        };
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        preflight(workspace.path(), &[], None, &WorkspaceWriteMode::DirectRw)
+            .expect("preflight (direct-rw)");
+
+        let env = crate::secret_env::build_child_env();
+        let args = ["--try-runas", &helper_path.to_string_lossy()];
+        let child = spawn(
+            &probe_exe.to_string_lossy(),
+            &args,
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            None,
+        )
+        .expect("spawn probe inside AppContainer");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("probe should run to completion");
+        assert_ne!(
+            code, 97,
+            "probe watchdog fired (ShellExecuteExW hung, likely awaiting UAC interaction on the \
+             interactive desktop), stdout={stdout} stderr={stderr}"
+        );
+
+        let report: serde_json::Value = stdout
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str(line).ok())
+            .unwrap_or_else(|| panic!("no JSON report line in stdout={stdout} stderr={stderr}"));
+        println!("=== try_runas report ===\n{report:#}");
+
+        revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
+
+        // 実機確認済み（2026-08-02）: AppContainer内からの`ShellExecuteExW(runas)`は
+        // `ERROR_ACCESS_DENIED`(5)で即座に失敗し（0.5秒程度、UACダイアログは画面に一切
+        // 表示されない）、リンク2（入れ子harnessが特権昇格ブローカへ到達する経路）を実機でも
+        // 構造的に塞いでいることを目視確認済み。AppContainerトークンはAPI呼び出しの時点で
+        // 拒否され、UAC同意ブローカ（consent.exe/AIS）へは一切到達しない。
+        //
+        // 副次的な発見（`try_runas`モジュールdoc参照）: `SEE_MASK_FLAG_NO_UI`を付けない場合、
+        // `ShellExecuteExW`はこの拒否を`ERROR_CANCELLED`(1223、`launch_helper_elevated`が
+        // `ElevationDeclined`へ変換するのと同じコード)として返し、加えてシェル自身が
+        // 「指定されたデバイス、パス、またはファイルにアクセスできません」という**エラー
+        // ダイアログを対話デスクトップへ表示**するまでに約17秒かかっていた（UAC同意画面では
+        // なく単なるアクセス拒否通知だが、AppContainerが対話UIを一切出せないわけではないという
+        // 事実の記録）。`SEE_MASK_FLAG_NO_UI`を付けるとUI試行自体が起きず、即座に
+        // `ERROR_ACCESS_DENIED`で返る。
+        //
+        // 以下は不変条件が崩れた場合（例: 将来のWindows更新やcapability構成変更でAppContainer
+        // からUACに到達できるようになった場合）に検知するための回帰assert。
+        assert_eq!(
+            report["ok"].as_bool(),
+            Some(false),
+            "ShellExecuteExW(runas) succeeded from inside AppContainer — this would mean a \
+             nested harness process could reach the UAC elevation broker (D-16/D-17's implicit \
+             assumption is broken), report={report:#}"
+        );
+        assert_eq!(
+            report["win32_error"].as_u64(),
+            Some(5), // ERROR_ACCESS_DENIED
+            "expected ShellExecuteExW(runas) to fail with ERROR_ACCESS_DENIED (5) when called \
+             from inside AppContainer with SEE_MASK_FLAG_NO_UI; a different error code may \
+             indicate a different failure mode worth re-investigating, report={report:#}"
+        );
+    }
+
+
     /// D-13（fs passthrough allowlist）実機E2E: 中立な外部ディレクトリ（workspace外、`grant_ace_recursive`
     /// 済みのworkspaceとは別ルート）へ、まずread-only ACEを付与して子プロセスから読取成功・書込拒否を
     /// 確認し、次にread-write ACEへ差し替えて書込成功を確認、最後に`revoke_ace_recursive`で

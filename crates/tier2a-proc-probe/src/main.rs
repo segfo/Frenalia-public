@@ -24,6 +24,8 @@ use serde_json::{json, Value};
 
 #[cfg(windows)]
 mod winid;
+#[cfg(windows)]
+mod try_runas;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_NET_TARGET: &str = "1.1.1.1:443";
@@ -43,6 +45,10 @@ struct Args {
     /// Redirector DLLの設定伝播が環境変数ではなく注入パラメータで行われることを検証するため、
     /// 「途中の世代が自前のenv blockを組み立てて子を起動する」実アプリの挙動を模擬する。
     sanitize_env: bool,
+    /// 特権昇格ヘルパー(D-16)レビュー用: 指定時、通常のFS/脱走/ネット検査は行わず、
+    /// `ShellExecuteExW(runas)`をAppContainer内から試みた結果だけをJSONで報告する
+    /// （`try_runas`モジュールdoc参照）。値は`harness-privhelper.exe`の絶対パス。
+    try_runas: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -55,6 +61,7 @@ fn parse_args() -> Args {
     let mut dns_name = DEFAULT_DNS_NAME.to_string();
     let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
     let mut sanitize_env = false;
+    let mut try_runas = None;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -76,6 +83,7 @@ fn parse_args() -> Args {
             "--dns-name" => dns_name = next(),
             "--timeout-secs" => timeout_secs = next().parse().unwrap_or(DEFAULT_TIMEOUT_SECS),
             "--sanitize-env" => sanitize_env = true,
+            "--try-runas" => try_runas = Some(next()),
             _ => {}
         }
     }
@@ -90,6 +98,7 @@ fn parse_args() -> Args {
         dns_name,
         timeout_secs,
         sanitize_env,
+        try_runas,
     }
 }
 
@@ -337,6 +346,16 @@ fn spawn_watchdog(timeout_secs: u64) {
 fn main() -> ExitCode {
     let args = parse_args();
     spawn_watchdog(args.timeout_secs);
+
+    #[cfg(windows)]
+    if let Some(helper_path) = &args.try_runas {
+        let report = try_runas::try_runas(helper_path);
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("try_runas report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
 
     let arch = compiled_arch();
     let tag = format!("gen{}-{arch}", args.gen);
