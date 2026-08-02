@@ -457,17 +457,35 @@ unsafe fn remote_load_library(process: HANDLE, load_library_addr: usize, dll_pat
     exit_code != 0
 }
 
-unsafe fn remote_call_init(process: HANDLE, init_addr: usize) -> bool {
+/// `cfg`はBUG-045のF2で追加した設定引き渡し。32bit孫のenv blockに依存せず設定を届けるため、
+/// [`super::write_remote_config_blob`]で書き込んだブロブのアドレスをスレッドパラメータに渡す
+/// （`VirtualAllocEx`はWOW64プロセスに対して4GB未満のアドレスを返すため32bit側で正しく読める）。
+unsafe fn remote_call_init(process: HANDLE, init_addr: usize, cfg: &super::Config) -> bool {
     let start: windows::Win32::System::Threading::LPTHREAD_START_ROUTINE = Some(unsafe {
         std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(init_addr)
     });
+    let config_blob = unsafe { super::write_remote_config_blob(process, cfg) };
     let mut tid: u32 = 0;
-    let thread = unsafe { CreateRemoteThread(process, None, 0, start, None, 0, Some(&mut tid)) };
+    let thread =
+        unsafe { CreateRemoteThread(
+            process,
+            None,
+            0,
+            start,
+            config_blob.map(|p| p as *const c_void),
+            0,
+            Some(&mut tid),
+        ) };
     let Ok(thread) = thread else {
         debug_log(&format!(
             "wow64: CreateRemoteThread(harness_cow_init) failed, GetLastError={:#x}",
             unsafe { windows::Win32::Foundation::GetLastError().0 }
         ));
+        if let Some(buf) = config_blob {
+            unsafe {
+                let _ = VirtualFreeEx(process, buf, 0, MEM_RELEASE);
+            }
+        }
         return false;
     };
     let wait_result = unsafe { WaitForSingleObject(thread, 5000) };
@@ -475,6 +493,9 @@ unsafe fn remote_call_init(process: HANDLE, init_addr: usize) -> bool {
     unsafe {
         let _ = GetExitCodeThread(thread, &mut exit_code);
         let _ = CloseHandle(thread);
+        if let Some(buf) = config_blob {
+            let _ = VirtualFreeEx(process, buf, 0, MEM_RELEASE);
+        }
     }
     debug_log(&format!(
         "wow64: harness_cow_init wait_result={:#x} exit_code={:#x}",
@@ -485,7 +506,12 @@ unsafe fn remote_call_init(process: HANDLE, init_addr: usize) -> bool {
 
 /// Phase 4b本体。`process`/`thread`はまだSUSPENDEDのWOW64孫。`x64_dll_path`は自DLL（x64）の
 /// パスで、ここから兄弟の`harness_redirector_x86.dll`を導出する。成功したら`true`。
-pub(crate) unsafe fn inject_grandchild_wow64(process: HANDLE, thread: HANDLE, x64_dll_path: &Path) -> bool {
+pub(crate) unsafe fn inject_grandchild_wow64(
+    process: HANDLE,
+    thread: HANDLE,
+    x64_dll_path: &Path,
+    cfg: &super::Config,
+) -> bool {
     debug_log("wow64: inject_grandchild_wow64 enter");
     let Some((image_base, entry_va)) = (unsafe { remote_wow64_image_base_and_entry(process) })
     else {
@@ -575,7 +601,7 @@ pub(crate) unsafe fn inject_grandchild_wow64(process: HANDLE, thread: HANDLE, x6
             return false;
         };
         let init_addr = remote_dll_base + init_rva as usize;
-        unsafe { remote_call_init(process, init_addr) }
+        unsafe { remote_call_init(process, init_addr, cfg) }
     })();
 
     unsafe {

@@ -11,6 +11,15 @@
 //! `STATUS_ACCESS_DENIED`でfail-closeする。このDLLの役割は、フックが機能する場合に
 //! `ACCESS_DENIED`を回避してCoW upperへ書けるようにする「利便性」のみ。
 //!
+//! ## 設定の伝播（2経路、BUG-045のF2以降）
+//!
+//! * **直接の子**: 環境変数（下記`HARNESS_COW_*`）。Launcherが子のenv blockへ設定する。
+//! * **孫以降**: 親世代のDLLが`harness_cow_init`のスレッドパラメータへ渡す設定ブロブ
+//!   （[`serialize_config_blob`]、`VirtualAllocEx`+`WriteProcessMemory`で相手のアドレス空間へ
+//!   書く）。**envに依存しない**ため、途中の世代が自前のenv blockを組み立てて子を起動しても
+//!   （`hooked_create_process_w`は設計どおり`lpEnvironment`を素通しする）設定が途切れない。
+//!   パラメータがNULL/不正なら従来どおり環境変数へフォールバックする（[`resolve_config`]）。
+//!
 //! 設定は環境変数で受け取る（Launcher=`win_appcontainer::spawn_impl`が子のenv blockへ設定、
 //! `CreateProcessW`はsuspended起動のためプロセス作成時点でPEBのEnvironmentは既に確定しており、
 //! メインスレッド再開前でも`GetEnvironmentVariableW`で読める）。
@@ -253,11 +262,21 @@ static CREATE_PROCESS_AS_USER_W_HOOK: OnceLock<GenericDetour<CreateProcessAsUser
 /// （Phase 4a、`inject_grandchild`参照）。
 static SELF_MODULE: OnceLock<usize> = OnceLock::new();
 
-/// `init()`の重複実行を防ぐ。孫プロセスでは`DllMain`の`DLL_PROCESS_ATTACH`が自動的に起動する
+/// `init()`の同時実行を防ぐ。孫プロセスでは`DllMain`の`DLL_PROCESS_ATTACH`が自動的に起動する
 /// 内部初期化スレッドと、Launcher役の親プロセス側から`CreateRemoteThread`で明示的に呼ばれる
-/// `harness_cow_init`エクスポートの2経路が同一プロセス内で競合し得るため、`std::sync::Once`で
-/// 一本化する（Phase 4a、モジュールdoc参照）。
-static INIT_ONCE: std::sync::Once = std::sync::Once::new();
+/// `harness_cow_init`エクスポートの2経路が同一プロセス内で競合し得るため直列化する
+/// （Phase 4a、モジュールdoc参照）。
+///
+/// BUG-045: 以前は`std::sync::Once`だったが、**失敗した初期化まで確定させてしまう**ため
+/// `Mutex`+[`INIT_SUCCEEDED`]へ置き換えた。`DllMain`側のスレッド（設定を環境変数からしか
+/// 取れない）が先に走って失敗しても、後から来る`harness_cow_init`（注入パラメータで設定を
+/// 直接受け取れる、F2）が再試行できる必要がある。成功は冪等に一度だけ確定する。
+static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// `init()`が最後まで成功（6つのファイルフック設置完了）したか。`harness_cow_init`の戻り値
+/// そのものであり、注入側（`inject_grandchild`／`wow64::remote_call_init`）が
+/// `GetExitCodeThread`で読む唯一の成否シグナルになる（BUG-045のF1）。
+static INIT_SUCCEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// ハンドル値→workspace相対パス（`/`区切り）。`NtClose`で確実に取り除く（際限なく膨らまない
 /// ようにする、設計書§19.6）。
@@ -325,6 +344,80 @@ fn ledger_read_offset() -> &'static Mutex<u64> {
 
 fn get_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
+}
+
+/// 注入パラメータ（`harness_cow_init`の引数）で運ぶ設定のバイト列上限。実際の中身は
+/// 3行のパス文字列なので通常は数百バイトで、この上限は「NUL終端が壊れていた場合に
+/// 無限に読み進めない」ための安全弁。
+const CONFIG_BLOB_MAX_LEN: usize = 64 * 1024;
+
+/// 注入パラメータで運ぶ設定のシリアライズ（BUG-045のF2）。`\n`区切り3行・NUL終端のUTF-8:
+///
+/// ```text
+/// <workspace_root>\n<upper_dir>\n<ext_capture_roots を ';' で連結>\0
+/// ```
+///
+/// 環境変数（`HARNESS_COW_*`）と等価な情報を、**子孫プロセスのenv blockに依存せずに**
+/// 渡すための唯一の形式。途中の世代が自前のenv blockを組み立てて子を起動しても設定が
+/// 途切れないようにする（モジュールdoc「設定の伝播」参照）。
+fn serialize_config_blob(cfg: &Config) -> Vec<u8> {
+    let ext = cfg
+        .ext_capture_roots
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(";");
+    let mut bytes = format!(
+        "{}\n{}\n{}",
+        cfg.workspace_root.to_string_lossy(),
+        cfg.upper_dir.to_string_lossy(),
+        ext
+    )
+    .into_bytes();
+    bytes.push(0);
+    bytes
+}
+
+/// [`serialize_config_blob`]の逆。自プロセス内のNUL終端バイト列を指すポインタから設定を復元する。
+///
+/// # Safety
+/// `param`はNULLか、自プロセスで読み取り可能なNUL終端バイト列の先頭でなければならない
+/// （注入側が`VirtualAllocEx`+`WriteProcessMemory`で書き込んだ領域）。
+unsafe fn deserialize_config_blob(param: *const u8) -> Option<Config> {
+    if param.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while len < CONFIG_BLOB_MAX_LEN {
+        if unsafe { *param.add(len) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == 0 || len >= CONFIG_BLOB_MAX_LEN {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(param, len) };
+    parse_config_blob(&String::from_utf8_lossy(bytes))
+}
+
+/// 復元のうち文字列解析だけを切り出した部分（単体テスト可能にするため）。
+fn parse_config_blob(text: &str) -> Option<Config> {
+    let mut lines = text.split('\n');
+    let workspace_root = lines.next().filter(|s| !s.is_empty())?;
+    let upper_dir = lines.next().filter(|s| !s.is_empty())?;
+    let ext_capture_roots = lines
+        .next()
+        .unwrap_or("")
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    Some(Config {
+        workspace_root: PathBuf::from(workspace_root),
+        upper_dir: PathBuf::from(upper_dir),
+        ext_capture_roots,
+    })
 }
 
 /// BUG-033調査用の診断計装（`docs/bugs/BUG-033.md`参照、再発時の再調査用に残置）。
@@ -1507,10 +1600,42 @@ unsafe fn find_remote_module_base(process: HANDLE, dll_path: &Path) -> Option<us
     None
 }
 
-/// Phase 4a本体: `process`（`NtCreateUserProcess`が返したばかりの、まだSUSPENDEDの孫）へ
+/// BUG-045のF2: 設定ブロブ（[`serialize_config_blob`]）を孫プロセスのアドレス空間へ書き込み、
+/// `harness_cow_init`のスレッドパラメータとして渡せるポインタを返す。呼び出し元は
+/// `CreateRemoteThread`の終了待ちのあとで`VirtualFreeEx`する責務を持つ。
+/// WOW64（32bitターゲット）でも`VirtualAllocEx`は4GB未満のアドレスを返すため同じ経路で使える。
+unsafe fn write_remote_config_blob(process: HANDLE, cfg: &Config) -> Option<*mut c_void> {
+    let bytes = serialize_config_blob(cfg);
+    let remote = unsafe {
+        VirtualAllocEx(process, None, bytes.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+    };
+    if remote.is_null() {
+        debug_log("write_remote_config_blob: VirtualAllocEx failed");
+        return None;
+    }
+    let written = unsafe {
+        WriteProcessMemory(
+            process,
+            remote,
+            bytes.as_ptr() as *const c_void,
+            bytes.len(),
+            None,
+        )
+    };
+    if written.is_err() {
+        debug_log("write_remote_config_blob: WriteProcessMemory failed");
+        unsafe {
+            let _ = VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+        }
+        return None;
+    }
+    Some(remote)
+}
+
+/// Phase 4a本体: `process`（`CreateProcessW`が返したばかりの、まだSUSPENDEDの孫）へ
 /// このDLL自身を2段階で再注入する（モジュールdoc参照）。成功＝フック設置完了確認まで
-/// 済んだら`true`を返す。
-unsafe fn inject_grandchild(process: HANDLE) -> bool {
+/// 済んだら`true`を返す。`cfg`は孫へ引き渡す設定（BUG-045のF2）。
+unsafe fn inject_grandchild(process: HANDLE, cfg: &Config) -> bool {
     debug_log(&format!(
         "inject_grandchild: enter process_handle={:#x}",
         process.0 as usize
@@ -1632,14 +1757,31 @@ unsafe fn inject_grandchild(process: HANDLE) -> bool {
             remote_init_addr,
         )
     });
+    // BUG-045のF2: 設定を孫プロセスのenv blockに頼らず、スレッドパラメータとして直接渡す。
+    // 失敗しても致命ではない（孫側は環境変数へフォールバックする）ため`None`で続行する。
+    let config_blob = unsafe { write_remote_config_blob(process, cfg) };
     let mut tid2: u32 = 0;
-    let init_thread =
-        unsafe { CreateRemoteThread(process, None, 0, init_start, None, 0, Some(&mut tid2)) };
+    let init_thread = unsafe {
+        CreateRemoteThread(
+            process,
+            None,
+            0,
+            init_start,
+            config_blob.map(|p| p as *const c_void),
+            0,
+            Some(&mut tid2),
+        )
+    };
     let Ok(init_thread) = init_thread else {
         debug_log(&format!(
             "inject_grandchild: CreateRemoteThread(harness_cow_init) failed, GetLastError={:#x}",
             unsafe { windows::Win32::Foundation::GetLastError().0 }
         ));
+        if let Some(buf) = config_blob {
+            unsafe {
+                let _ = VirtualFreeEx(process, buf, 0, MEM_RELEASE);
+            }
+        }
         return false;
     };
     let init_wait_result = unsafe { WaitForSingleObject(init_thread, 5000) };
@@ -1647,6 +1789,9 @@ unsafe fn inject_grandchild(process: HANDLE) -> bool {
     unsafe {
         let _ = GetExitCodeThread(init_thread, &mut init_exit);
         let _ = CloseHandle(init_thread);
+        if let Some(buf) = config_blob {
+            let _ = VirtualFreeEx(process, buf, 0, MEM_RELEASE);
+        }
     }
     debug_log(&format!(
         "inject_grandchild: step2 harness_cow_init wait_result={:#x} exit_code={:#x}",
@@ -1678,7 +1823,7 @@ unsafe fn inject_grandchild_and_maybe_resume(
         let injected = if is_wow64 {
             match self_dll_path() {
                 Some(x64_dll_path) => unsafe {
-                    wow64::inject_grandchild_wow64(pi.hProcess, pi.hThread, &x64_dll_path)
+                    wow64::inject_grandchild_wow64(pi.hProcess, pi.hThread, &x64_dll_path, cfg)
                 },
                 None => {
                     debug_log(&format!("{caller}: self_dll_path() failed for wow64 injection"));
@@ -1686,7 +1831,7 @@ unsafe fn inject_grandchild_and_maybe_resume(
                 }
             }
         } else {
-            unsafe { inject_grandchild(pi.hProcess) }
+            unsafe { inject_grandchild(pi.hProcess, cfg) }
         };
         debug_log(&format!(
             "{caller}: injection (wow64={is_wow64}) returned {injected}"
@@ -1845,13 +1990,23 @@ fn load_deleted_set(cfg: &Config) {
     *ledger_read_offset().lock().unwrap() = contents.len() as u64;
 }
 
-/// フック設置本体（`DllMain`からは呼ばない、Loader Lock回避のため専用スレッドから呼ぶ、
-/// 設計書§13.4）。設定を読み・フックを設置し、成功したら`HARNESS_COW_READY_EVENT`へ
-/// シグナルする。失敗時はシグナルしない——Launcher側は待機タイムアウトでプロセスを
-/// 終了する（設計書§10.2 既定・§25.1）。
-fn init() {
+/// 設定の取得（BUG-045のF2）。注入パラメータ（`harness_cow_init`の引数、非NULLなら正）を
+/// 優先し、無ければ環境変数`HARNESS_COW_*`へフォールバックする。Launcherが直接起動する子
+/// （`win_appcontainer.rs`の`inject_redirector`）はenv経路、DLL自身が再注入する孫以降は
+/// パラメータ経路を通る。
+///
+/// # Safety
+/// `param`は[`deserialize_config_blob`]の要件を満たすこと。
+unsafe fn resolve_config(param: *const u8) -> Option<Config> {
+    if let Some(cfg) = unsafe { deserialize_config_blob(param) } {
+        debug_log(&format!(
+            "init: config from injection parameter workspace={:?} upper={:?} ext_roots={:?}",
+            cfg.workspace_root, cfg.upper_dir, cfg.ext_capture_roots
+        ));
+        return Some(cfg);
+    }
     debug_log(&format!(
-        "init: enter, HARNESS_COW_WORKSPACE={:?} HARNESS_COW_UPPER={:?}",
+        "init: config from env, HARNESS_COW_WORKSPACE={:?} HARNESS_COW_UPPER={:?}",
         get_env("HARNESS_COW_WORKSPACE"),
         get_env("HARNESS_COW_UPPER")
     ));
@@ -1859,14 +2014,14 @@ fn init() {
         Some(v) => PathBuf::from(v),
         None => {
             debug_log("init: HARNESS_COW_WORKSPACE not set, bail");
-            return;
+            return None;
         }
     };
     let upper_dir = match get_env("HARNESS_COW_UPPER") {
         Some(v) => PathBuf::from(v),
         None => {
             debug_log("init: HARNESS_COW_UPPER not set, bail");
-            return;
+            return None;
         }
     };
     // Phase 3（設計書§19.8）: `;`区切りのDOS形式絶対パス一覧。空文字列要素は無視する
@@ -1876,10 +2031,45 @@ fn init() {
         .map(|v| v.split(';').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
         .unwrap_or_default();
     debug_log(&format!("init: HARNESS_COW_EXT_ROOTS={ext_capture_roots:?}"));
-    let cfg = Config {
+    Some(Config {
         workspace_root,
         upper_dir,
         ext_capture_roots,
+    })
+}
+
+/// [`init`]を直列化し、**成功だけを確定させる**入口（BUG-045）。既に成功済みなら即`true`
+/// （冪等）。失敗は確定させないため、先行した`DllMain`スレッドがenv欠落で失敗しても、
+/// 後続の`harness_cow_init(param)`が注入パラメータで再試行できる。
+///
+/// # Safety
+/// `param`は[`resolve_config`]の要件を満たすこと。
+unsafe fn ensure_init(param: *const u8) -> bool {
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if INIT_SUCCEEDED.load(std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+    let ok = unsafe { init(param) };
+    if ok {
+        INIT_SUCCEEDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    ok
+}
+
+/// フック設置本体（`DllMain`からは呼ばない、Loader Lock回避のため専用スレッドから呼ぶ、
+/// 設計書§13.4）。設定を読み・フックを設置し、成功したらready通知を送る。
+/// 失敗時は通知しない——Launcher側は待機タイムアウトでプロセスを終了する
+/// （設計書§10.2 既定・§25.1）。
+///
+/// 戻り値は「6つのファイルフックの設置まで完了したか」。BUG-045のF1修正前はこの成否が
+/// 呼び出し元へ一切伝わらず、フック未設置でも注入側が成功と誤判定していた。直接呼ばず
+/// [`ensure_init`]経由で使うこと。
+///
+/// # Safety
+/// `param`は[`resolve_config`]の要件を満たすこと。
+unsafe fn init(param: *const u8) -> bool {
+    let Some(cfg) = (unsafe { resolve_config(param) }) else {
+        return false;
     };
     load_deleted_set(&cfg);
     let _ = CONFIG.set(cfg);
@@ -1888,28 +2078,28 @@ fn init() {
         Some(a) => a,
         None => {
             debug_log("init: resolve_ntdll_export(NtCreateFile) failed, bail");
-            return;
+            return false;
         }
     };
     let open_file_addr = match unsafe { resolve_ntdll_export("NtOpenFile") } {
         Some(a) => a,
         None => {
             debug_log("init: resolve_ntdll_export(NtOpenFile) failed, bail");
-            return;
+            return false;
         }
     };
     let set_info_addr = match unsafe { resolve_ntdll_export("NtSetInformationFile") } {
         Some(a) => a,
         None => {
             debug_log("init: resolve_ntdll_export(NtSetInformationFile) failed, bail");
-            return;
+            return false;
         }
     };
     let close_addr = match unsafe { resolve_ntdll_export("NtClose") } {
         Some(a) => a,
         None => {
             debug_log("init: resolve_ntdll_export(NtClose) failed, bail");
-            return;
+            return false;
         }
     };
     let query_full_attr_addr =
@@ -1917,14 +2107,14 @@ fn init() {
             Some(a) => a,
             None => {
                 debug_log("init: resolve_ntdll_export(NtQueryFullAttributesFile) failed, bail");
-                return;
+                return false;
             }
         };
     let query_attr_addr = match unsafe { resolve_ntdll_export("NtQueryAttributesFile") } {
         Some(a) => a,
         None => {
             debug_log("init: resolve_ntdll_export(NtQueryAttributesFile) failed, bail");
-            return;
+            return false;
         }
     };
 
@@ -1939,42 +2129,42 @@ fn init() {
     let create_detour = match unsafe { GenericDetour::new(create_file_fn, hooked_nt_create_file) }
     {
         Ok(d) => d,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let open_detour = match unsafe { GenericDetour::new(open_file_fn, hooked_nt_open_file) } {
         Ok(d) => d,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let set_info_detour =
         match unsafe { GenericDetour::new(set_info_fn, hooked_nt_set_information_file) } {
             Ok(d) => d,
-            Err(_) => return,
+            Err(_) => return false,
         };
     let close_detour = match unsafe { GenericDetour::new(close_fn, hooked_nt_close) } {
         Ok(d) => d,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let query_full_attr_detour = match unsafe {
         GenericDetour::new(query_full_attr_fn, hooked_nt_query_full_attributes_file)
     } {
         Ok(d) => d,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let query_attr_detour =
         match unsafe { GenericDetour::new(query_attr_fn, hooked_nt_query_attributes_file) } {
             Ok(d) => d,
-            Err(_) => return,
+            Err(_) => return false,
         };
     if unsafe { create_detour.enable() }.is_err() {
         debug_log("init: create_detour.enable() failed, bail");
-        return;
+        return false;
     }
     if unsafe { open_detour.enable() }.is_err() {
         debug_log("init: open_detour.enable() failed, bail");
         unsafe {
             let _ = create_detour.disable();
         }
-        return;
+        return false;
     }
     if unsafe { set_info_detour.enable() }.is_err() {
         debug_log("init: set_info_detour.enable() failed, bail");
@@ -1982,7 +2172,7 @@ fn init() {
             let _ = create_detour.disable();
             let _ = open_detour.disable();
         }
-        return;
+        return false;
     }
     if unsafe { close_detour.enable() }.is_err() {
         debug_log("init: close_detour.enable() failed, bail");
@@ -1991,7 +2181,7 @@ fn init() {
             let _ = open_detour.disable();
             let _ = set_info_detour.disable();
         }
-        return;
+        return false;
     }
     if unsafe { query_full_attr_detour.enable() }.is_err() {
         debug_log("init: query_full_attr_detour.enable() failed, bail");
@@ -2001,7 +2191,7 @@ fn init() {
             let _ = set_info_detour.disable();
             let _ = close_detour.disable();
         }
-        return;
+        return false;
     }
     if unsafe { query_attr_detour.enable() }.is_err() {
         debug_log("init: query_attr_detour.enable() failed, bail");
@@ -2012,7 +2202,7 @@ fn init() {
             let _ = close_detour.disable();
             let _ = query_full_attr_detour.disable();
         }
-        return;
+        return false;
     }
     let _ = CREATE_FILE_HOOK.set(create_detour);
     let _ = OPEN_FILE_HOOK.set(open_detour);
@@ -2034,6 +2224,7 @@ fn init() {
     ));
 
     signal_ready();
+    true
 }
 
 /// `CreateProcessW`/`CreateProcessAsUserW`のベストエフォートフック設置（Phase 4a、BUG-041修正、
@@ -2091,24 +2282,35 @@ fn signal_ready() {
     }
 }
 
+/// `DllMain`が起動する内部初期化スレッド。設定は環境変数からしか取れない（`DllMain`は
+/// 注入パラメータを受け取れない）ため`param=NULL`で試みる。ここで失敗しても確定はせず、
+/// 後続の`harness_cow_init`（注入パラメータ付き）が再試行できる（BUG-045）。
 unsafe extern "system" fn init_thread_proc(_param: *mut c_void) -> u32 {
-    INIT_ONCE.call_once(init);
+    let _ = unsafe { ensure_init(std::ptr::null()) };
     0
 }
 
-/// Phase 4a: 親プロセス側の`hooked_nt_create_user_process`が孫プロセスへ`CreateRemoteThread`で
+/// Phase 4a: 親プロセス側の`hooked_create_process_w`が孫プロセスへ`CreateRemoteThread`で
 /// 明示的に呼ぶエクスポート（`#[no_mangle]`必須、`GetProcAddress`で名前解決される）。
-/// `DllMain`の内部初期化スレッドとの競合は`INIT_ONCE`が吸収するため、呼び出し順は問わない——
-/// この関数のリモートスレッドが終了した時点でフック設置が完了していることだけが保証される
+/// `DllMain`の内部初期化スレッドとの競合は[`ensure_init`]が吸収するため、呼び出し順は問わない——
+/// この関数のリモートスレッドが終了した時点でフック設置の成否が確定していることだけが保証される
 /// （`inject_grandchild`の同期点、モジュールdoc参照）。
+///
+/// `param`は注入側が`VirtualAllocEx`+`WriteProcessMemory`で書き込んだ設定ブロブ
+/// （[`serialize_config_blob`]の形式、NULL可）。**戻り値は初期化の実際の成否**（成功=1・失敗=0）で、
+/// 注入側は`GetExitCodeThread`でこれを読む。BUG-045のF1修正前は常に1を返しており、フック未設置でも
+/// 注入成功と誤判定して警告台帳に何も残らなかった。
 ///
 /// # Safety
 /// `CreateRemoteThread`のスレッド開始関数として呼ばれる前提（`LPTHREAD_START_ROUTINE`互換
-/// シグネチャ）。`_param`は使用しない。呼び出し元スレッドの状態に依存する処理は行わない。
+/// シグネチャ）。`param`は[`deserialize_config_blob`]の要件を満たすこと。
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn harness_cow_init(_param: *mut c_void) -> u32 {
-    INIT_ONCE.call_once(init);
-    1
+pub unsafe extern "system" fn harness_cow_init(param: *mut c_void) -> u32 {
+    if unsafe { ensure_init(param as *const u8) } {
+        1
+    } else {
+        0
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -2135,6 +2337,43 @@ extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c_void) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-045のF2: 注入パラメータで運ぶ設定ブロブが往復すること（env非依存の設定伝播）。
+    /// ext_capture_rootsが空の場合・複数ある場合の両方を1関数で見る。
+    #[test]
+    fn config_blob_round_trips_through_serialize_and_parse() {
+        let cfg = Config {
+            workspace_root: PathBuf::from(r"C:\ws\project"),
+            upper_dir: PathBuf::from(r"C:\upper\abc"),
+            ext_capture_roots: vec![PathBuf::from(r"C:\ext one"), PathBuf::from(r"D:\ext2")],
+        };
+        let blob = serialize_config_blob(&cfg);
+        assert_eq!(blob.last(), Some(&0u8), "blob must be NUL-terminated");
+        let parsed = unsafe { deserialize_config_blob(blob.as_ptr()) }.expect("parse");
+        assert_eq!(parsed.workspace_root, cfg.workspace_root);
+        assert_eq!(parsed.upper_dir, cfg.upper_dir);
+        assert_eq!(parsed.ext_capture_roots, cfg.ext_capture_roots);
+
+        let empty_ext = Config {
+            workspace_root: PathBuf::from(r"C:\ws"),
+            upper_dir: PathBuf::from(r"C:\upper"),
+            ext_capture_roots: Vec::new(),
+        };
+        let parsed = unsafe { deserialize_config_blob(serialize_config_blob(&empty_ext).as_ptr()) }
+            .expect("parse (no ext roots)");
+        assert!(parsed.ext_capture_roots.is_empty());
+    }
+
+    /// 壊れた/不足したブロブは`None`になり、環境変数フォールバックへ落ちること
+    /// （`resolve_config`の分岐条件）。
+    #[test]
+    fn config_blob_parse_rejects_incomplete_input() {
+        assert!(unsafe { deserialize_config_blob(std::ptr::null()) }.is_none());
+        assert!(parse_config_blob("").is_none());
+        assert!(parse_config_blob("C:\\ws").is_none(), "upper_dir missing");
+        assert!(parse_config_blob("\nC:\\upper\n").is_none(), "workspace empty");
+        assert!(parse_config_blob("C:\\ws\n\n").is_none(), "upper empty");
+    }
 
     /// Q9（増分tail再読込）の回帰テスト。`deleted_paths_state`/`ledger_read_offset`は
     /// プロセスグローバルな唯一のsingletonであり、他のテストと並行実行されると相互汚染し得るため、

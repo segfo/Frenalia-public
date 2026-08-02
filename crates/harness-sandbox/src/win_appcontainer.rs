@@ -5863,8 +5863,12 @@ mod cow_diagnostics {
         assert!(!workspace.path().join("doomed.txt").exists());
     }
 
-    /// 子・孫・ひ孫（3世代）にわたる封じ込めを、全8ビット幅チェーン
-    /// （3世代 × {x64,x86}）で確認する。`crates/tier2a-proc-probe`（`tier2a_proc_probe`/
+    /// 世代チェーンごとの封じ込め検証本体（`chains`の各要素が1チェーン＝
+    /// `["x64", "x86", ...]`のようなgen1から数えたビット幅の並び。長さ＝世代数で、**上限は無い**）。
+    /// `timeout_secs`は各プローブプロセスのwatchdog（世代が深いほど注入待ちが積み上がるため
+    /// 呼び出し側が調整する）。
+    ///
+    /// `crates/tier2a-proc-probe`（`tier2a_proc_probe`/
     /// `tier2a_proc_probe_x86`、`docs/DEV-ENVIRONMENT.md`「Tier2aプローブアプリのビルド・配置」
     /// 参照）を直接Launcherの子（gen1）として起動し、各世代がworkspace内FS操作
     /// （create/modify/delete/rename）・workspace外への脱走試行（`C:\Windows`・
@@ -5880,21 +5884,8 @@ mod cow_diagnostics {
     ///   （x86→x64はHeaven's Gate相当が必要なため対象外、素通し＋警告記録のみ）。
     /// - 注入が途切れた世代以降は、プロセス生成自体は拒否されない（Q6）が、CoW透過は
     ///   一切効かずworkspace ROのACLでfail-closeし続ける（回復しない）。
-    #[test]
-    #[ignore]
-    fn cow_containment_holds_across_three_generations_all_bitness_chains() {
+    fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: bool) {
         use serde_json::Value;
-
-        const CHAINS: [[&str; 3]; 8] = [
-            ["x64", "x64", "x64"],
-            ["x64", "x64", "x86"],
-            ["x64", "x86", "x64"],
-            ["x64", "x86", "x86"],
-            ["x86", "x64", "x64"],
-            ["x86", "x64", "x86"],
-            ["x86", "x86", "x64"],
-            ["x86", "x86", "x86"],
-        ];
 
         fn proc_probe_exe_paths() -> (PathBuf, PathBuf) {
             let current = std::env::current_exe().expect("current_exe");
@@ -5919,11 +5910,12 @@ mod cow_diagnostics {
         }
 
         /// Launcherの直接注入はx64専用、DLL内の孫再注入は`x86→x64`のみ対象外
-        /// （§13.2）という伝播規則から、各世代の注入成否を導く。
-        fn expected_injected(chain: &[&str; 3]) -> [bool; 3] {
-            let mut injected = [false; 3];
+        /// （§13.2）という伝播規則から、各世代の注入成否を導く。規則自体に世代数の
+        /// 上限が無いため、チェーン長に対して一般のループで畳み込む（再帰性の期待値そのもの）。
+        fn expected_injected(chain: &[&str]) -> Vec<bool> {
+            let mut injected = vec![false; chain.len()];
             injected[0] = chain[0] == "x64";
-            for i in 1..3 {
+            for i in 1..chain.len() {
                 let propagate_ok = !(chain[i - 1] == "x86" && chain[i] == "x64");
                 injected[i] = injected[i - 1] && propagate_ok;
             }
@@ -6103,11 +6095,11 @@ mod cow_diagnostics {
         std::fs::write(&outside_secret, "must-not-be-readable-from-sandbox")
             .expect("seed outside-secret.txt");
 
-        for chain in CHAINS {
+        for chain in chains {
             let workspace = tempfile::tempdir().expect("workspace tempdir");
             let upper = tempfile::tempdir().expect("upper tempdir");
 
-            let tags: Vec<String> = (0..3).map(|i| gen_tag(i, chain[i])).collect();
+            let tags: Vec<String> = (0..chain.len()).map(|i| gen_tag(i, chain[i])).collect();
             for tag in &tags {
                 seed_tag_files(workspace.path(), tag);
             }
@@ -6117,10 +6109,9 @@ mod cow_diagnostics {
             };
             preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
-            let injected = expected_injected(&chain);
+            let injected = expected_injected(chain);
             let gen1_exe = if chain[0] == "x64" { &x64_exe } else { &x86_exe };
             let rest_chain = chain[1..].join(",");
-            let timeout_secs = "20";
             let args: Vec<String> = vec![
                 "--gen".to_string(),
                 "1".to_string(),
@@ -6135,6 +6126,14 @@ mod cow_diagnostics {
                 "--timeout-secs".to_string(),
                 timeout_secs.to_string(),
             ];
+            // BUG-045のF2: 各世代が次世代を起動するとき`HARNESS_COW_*`を落とさせる
+            // （自前env blockを組み立てる実アプリの模擬）。設定が注入パラメータで
+            // 伝わっていれば期待値`injected`は変わらない。
+            let mut args = args;
+            if sanitize_env {
+                args.push("--sanitize-env".to_string());
+            }
+            let args = args;
             let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
 
             let env = crate::secret_env::build_child_env();
@@ -6188,9 +6187,10 @@ mod cow_diagnostics {
             let reports = nested_reports(&top);
             assert_eq!(
                 reports.len(),
-                3,
-                "chain={chain:?}: expected all 3 generations to run and report (Q6: process \
+                chain.len(),
+                "chain={chain:?}: expected all {} generations to run and report (Q6: process \
                  creation is never refused once gen1 started), got {} reports: {reports:?}",
+                chain.len(),
                 reports.len()
             );
 
@@ -6258,8 +6258,9 @@ mod cow_diagnostics {
                 assert_ledger_for_tag(&ledger, tag, injected[i]);
             }
 
-            // 伝播が途切れた世代がある場合（本8チェーンでは`x64,x86,x64`のみ該当）、
-            // 警告台帳に何らかの理由が記録されているはず（Q6、内容までは固定しない）。
+            // 伝播が途切れた世代がある場合（`x86→x64`が含まれるチェーン）、警告台帳に
+            // 何らかの理由が記録されているはず（Q6、内容までは固定しない）。BUG-045のF1修正で
+            // 「注入は成功したがフック設置に失敗した」ケースもここに落ちるようになった。
             if injected.iter().any(|&v| !v) && injected[0] {
                 let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
                 let warnings = std::fs::read_to_string(&warnings_path).unwrap_or_default();
@@ -6270,5 +6271,69 @@ mod cow_diagnostics {
                 );
             }
         }
+    }
+
+    /// 子・孫・ひ孫（3世代）にわたる封じ込めを、全8ビット幅チェーン（3世代 × {x64,x86}）で
+    /// 確認する。ビット幅の組合せ網羅はこのテストが担当する（深さ方向は
+    /// [`cow_containment_is_recursive_beyond_three_generations`]）。
+    #[test]
+    #[ignore]
+    fn cow_containment_holds_across_three_generations_all_bitness_chains() {
+        run_containment_chains(
+            &[
+                &["x64", "x64", "x64"],
+                &["x64", "x64", "x86"],
+                &["x64", "x86", "x64"],
+                &["x64", "x86", "x86"],
+                &["x86", "x64", "x64"],
+                &["x86", "x64", "x86"],
+                &["x86", "x86", "x64"],
+                &["x86", "x86", "x86"],
+            ],
+            20,
+            false,
+        );
+    }
+
+    /// 封じ込めが**世代数に依存しない**ことを実機で示す（玄孫＝gen4以降まで、5世代）。
+    ///
+    /// 再帰性そのものはコード構造から従う——境界（AppContainerトークン・Job Object）は
+    /// 子孫へ無条件に継承され、透過性（Redirector DLL）は「注入された世代が自分の
+    /// `CreateProcessW`/`CreateProcessAsUserW`をフックし次世代へ同じDLLを注入する」という
+    /// 自己相似構造（`harness-redirector`の`install_create_process_hooks`／
+    /// `inject_grandchild_and_maybe_resume`）で、どちらにも世代カウンタや深さの上限が無い。
+    /// このテストはその帰結を実測で裏付けるものなので、ビット幅の全網羅（2^5=32）ではなく
+    /// 再帰の証明に必要な代表3チェーンだけを回す。
+    ///
+    /// - 全x64: 5世代を通してリダイレクト・操作台帳記録が続くこと（深さに上限が無い）。
+    /// - 深い位置でのx64→x86: WOW64再注入（Phase 4b）が孫より深い世代でも成立すること。
+    /// - 深い位置でのx86→x64: 既知の唯一の断絶点が起きた後、**それ以降の全世代**が
+    ///   非注入のままでもworkspace本体は無傷（fail-close）で、警告台帳に記録が残ること。
+    #[test]
+    #[ignore]
+    fn cow_containment_is_recursive_beyond_three_generations() {
+        // 世代ごとに2段階のリモートスレッド注入（WOW64はさらにエントリポイントtrapの
+        // ポーリング）が直列に積み上がるため、3世代テストの20秒では足りない。
+        run_containment_chains(
+            &[
+                &["x64", "x64", "x64", "x64", "x64"],
+                &["x64", "x64", "x64", "x86", "x86"],
+                &["x64", "x64", "x86", "x64", "x64"],
+            ],
+            60,
+            false,
+        );
+    }
+
+    /// BUG-045のF2の回帰テスト: **途中の世代が自前のenv blockを組み立てて次世代を起動しても**
+    /// CoWリダイレクトが途切れないこと。プローブが`--sanitize-env`で`HARNESS_COW_*`を全て
+    /// 落として子を起動するため、Redirector DLLの設定が環境変数依存のままなら
+    /// gen2以降は`init()`が設定を取れずフック未設置になり、upper/操作台帳にgen2・gen3の
+    /// 変更が現れなくなる（＝このテストが落ちる）。設定を`harness_cow_init`の
+    /// スレッドパラメータで渡す修正が入っているため、期待値は通常チェーンと同じ全世代注入。
+    #[test]
+    #[ignore]
+    fn cow_containment_survives_env_block_sanitized_by_intermediate_generation() {
+        run_containment_chains(&[&["x64", "x64", "x64"]], 30, true);
     }
 }

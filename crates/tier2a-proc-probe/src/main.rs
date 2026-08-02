@@ -39,6 +39,10 @@ struct Args {
     net_target: String,
     dns_name: String,
     timeout_secs: u64,
+    /// 次世代を起動するとき`HARNESS_COW_*`環境変数を落とす（BUG-045のF2の再現・回帰用）。
+    /// Redirector DLLの設定伝播が環境変数ではなく注入パラメータで行われることを検証するため、
+    /// 「途中の世代が自前のenv blockを組み立てて子を起動する」実アプリの挙動を模擬する。
+    sanitize_env: bool,
 }
 
 fn parse_args() -> Args {
@@ -50,6 +54,7 @@ fn parse_args() -> Args {
     let mut net_target = DEFAULT_NET_TARGET.to_string();
     let mut dns_name = DEFAULT_DNS_NAME.to_string();
     let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
+    let mut sanitize_env = false;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -70,6 +75,7 @@ fn parse_args() -> Args {
             "--net-target" => net_target = next(),
             "--dns-name" => dns_name = next(),
             "--timeout-secs" => timeout_secs = next().parse().unwrap_or(DEFAULT_TIMEOUT_SECS),
+            "--sanitize-env" => sanitize_env = true,
             _ => {}
         }
     }
@@ -83,6 +89,7 @@ fn parse_args() -> Args {
         net_target,
         dns_name,
         timeout_secs,
+        sanitize_env,
     }
 }
 
@@ -275,6 +282,20 @@ fn spawn_child(args: &Args, tag_prefix_gen: u32) -> Value {
     cmd.arg("--net-target").arg(&args.net_target);
     cmd.arg("--dns-name").arg(&args.dns_name);
     cmd.arg("--timeout-secs").arg(args.timeout_secs.to_string());
+    if args.sanitize_env {
+        cmd.arg("--sanitize-env");
+        // 実アプリが`CreateProcessW`へ自前のenv blockを渡す状況の模擬（BUG-045のF2）。
+        // Redirector DLLの設定が環境変数に依存していれば、この時点で以降の全世代の
+        // リダイレクトが失われる。
+        for key in [
+            "HARNESS_COW_WORKSPACE",
+            "HARNESS_COW_UPPER",
+            "HARNESS_COW_EXT_ROOTS",
+            "HARNESS_COW_READY_HANDLE",
+        ] {
+            cmd.env_remove(key);
+        }
+    }
     if let Ok(cwd) = env::current_dir() {
         cmd.current_dir(cwd);
     }
@@ -330,6 +351,7 @@ fn main() -> ExitCode {
     let report = json!({
         "gen": args.gen,
         "tag": tag,
+        "sanitize_env": args.sanitize_env,
         "identity": identity,
         "fs": fs_results,
         "escape": escape_results,
