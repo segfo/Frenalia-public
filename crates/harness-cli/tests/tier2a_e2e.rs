@@ -130,13 +130,27 @@ struct HarnessRun {
 /// 台本化されたrun_shellをheadlessで実行するために必須（Defaultモードだと
 /// Exec種別のrun_shellは拒否される、既存`headless_output.rs`参照）。
 fn run_harness(ws: &Path, turns: &[Vec<StreamEvent>], extra_args: &[&str], case_name: &str) -> HarnessRun {
+    run_harness_with_exe(&harness_exe(), ws, turns, extra_args, case_name)
+}
+
+/// `run_harness`の`harness.exe`パスを差し替え可能な版。WFP fail-closedケース
+/// （`net_case_07_wfp_start_failure_is_fail_closed`）が、`harness-netfilterd.exe`の解決先
+/// （`current_exe().parent()`）を差し替えるために専用の一時ディレクトリへコピーした
+/// `harness.exe`を起動するのに使う。
+fn run_harness_with_exe(
+    exe: &Path,
+    ws: &Path,
+    turns: &[Vec<StreamEvent>],
+    extra_args: &[&str],
+    case_name: &str,
+) -> HarnessRun {
     let scratch = scratch_dir();
     let turns_path = scratch.join(format!("{case_name}-turns.json"));
     let record_path = scratch.join(format!("{case_name}-requests.jsonl"));
     let _ = std::fs::remove_file(&record_path);
     std::fs::write(&turns_path, serde_json::to_string(turns).unwrap()).expect("write turns file");
 
-    let mut cmd = Command::new(harness_exe());
+    let mut cmd = Command::new(exe);
     cmd.args([
         "--provider",
         "mock",
@@ -592,6 +606,182 @@ fn case_i_write_file_tool_is_captured_by_cow() -> Result<(), String> {
     Ok(())
 }
 
+/// J: `discard`（upper丸ごと破棄）。`--output-format`が無くテキスト出力のみ（`Discard`は
+/// JSON化されていない）ため、既存`case_h_toctou_conflict`が後始末目的で同コマンドを呼ぶ
+/// 前例に倣い、終了コードと文字列マッチで検証する。
+fn case_j_discard_removes_all_changes() -> Result<(), String> {
+    let ws = case_dir("cow-j-discard");
+    let session1 = setup_baseline(&ws, "cow-j")?;
+    let (session2, _) = run_round2(&ws, ROUND2_SCRIPT, "cow-j-r2")?;
+
+    let output = Command::new(harness_exe())
+        .args(["--cwd", ws.to_str().unwrap(), "discard", "--session", &session2])
+        .output()
+        .map_err(|e| format!("failed to spawn harness discard: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "discard should succeed for a non-live session: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("discarded changes") {
+        return Err(format!("expected discard stdout to contain 'discarded changes', got: {stdout}"));
+    }
+    // round2の変更（`helloworld!!!`）はworkspaceへ一切反映されず、round1のbaselineのまま。
+    expect_eq(
+        "test.txt must remain at the round1 baseline after discard",
+        &read_file(&ws.join("test.txt"))?,
+        "helloworld",
+    )?;
+    let after = list_cow_sessions();
+    if after.contains(&session2) {
+        return Err(format!("session {session2} must be gone from list_cow_sessions() after discard"));
+    }
+
+    cleanup_on_success(&ws, &[&session1], "cow-j");
+    Ok(())
+}
+
+/// K: `resolve`（3-way merge）。baseline（3行）に対し、CoWセッション側が1行目を、実workspace
+/// 側（TOCTOU、`case_h_toctou_conflict`と同型の外部書き換え）が3行目を、それぞれ非重複に
+/// 変更する。`git merge-file`は重ならない変更を自動マージできるため、`--always-edit`無し
+/// （既定）でもエディタを起動せず即座に解消される——エディタが起動する分岐（コンフリクトが
+/// 真に重なる場合）はここでは検証しない（Windowsで`notepad.exe`が起動しテストがハングする
+/// リスクを避けるため、既存E2Eの注意事項どおり自動マージ可能なケースに限定する）。
+fn case_k_resolve_auto_merges_non_overlapping_conflict() -> Result<(), String> {
+    let ws = case_dir("cow-k-resolve");
+    let before = list_cow_sessions();
+    let baseline_script = "Set-Content test.txt \"line1`nline2`nline3\" -NoNewline";
+    let run1 = run_harness(&ws, &run_shell_script_turns(baseline_script), &["--cow"], "cow-k-r1");
+    if !run1.status.success() {
+        return Err(format!("baseline harness invocation failed: {}", run1.stderr));
+    }
+    let session1 = new_cow_session(&before)?;
+    let report1 = apply_cow(&ws, &session1, None)?;
+    if report1["applied"].as_array().map(|a| a.len()).unwrap_or(0) != 1 {
+        return Err(format!("expected baseline commit to apply exactly test.txt: {report1}"));
+    }
+    expect_eq(
+        "test.txt (baseline)",
+        &read_file(&ws.join("test.txt"))?,
+        "line1\nline2\nline3",
+    )?;
+
+    let (session2, _) = run_round2(
+        &ws,
+        "Set-Content test.txt \"line1-cow`nline2`nline3\" -NoNewline",
+        "cow-k-r2",
+    )?;
+
+    // セッション外からの書き換え(TOCTOU、`case_h`と同型)。CoW側とは別の行(3行目)を変更する
+    // ため、非重複な変更として自動マージできる。
+    std::fs::write(ws.join("test.txt"), "line1\nline2\nline3-external")
+        .map_err(|e| format!("failed to simulate external write: {e}"))?;
+
+    let output = Command::new(harness_exe())
+        .args(["--cwd", ws.to_str().unwrap(), "resolve", "--session", &session2])
+        .output()
+        .map_err(|e| format!("failed to spawn harness resolve: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "resolve should succeed for a non-overlapping conflict: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("resolved: test.txt") || !stdout.contains("1 resolved, 0 skipped/failed") {
+        return Err(format!(
+            "expected resolve to auto-merge test.txt without needing an editor, got: {stdout}"
+        ));
+    }
+    expect_eq(
+        "test.txt must contain both non-overlapping edits after auto-merge",
+        &read_file(&ws.join("test.txt"))?,
+        "line1-cow\nline2\nline3-external",
+    )?;
+
+    cleanup_on_success(&ws, &[&session1, &session2], "cow-k");
+    Ok(())
+}
+
+/// L: `--resume <id> --cow`によるセッション再開（設計書§19.11、仕様確定: 同一upper_dirを
+/// 再利用し同一セッションIDで継続キャプチャする）。1つの`--cow`セッションで変更を行い
+/// （discardせず）プロセスを終了し、同じセッションIDで`--resume --cow`により再開して
+/// 追加の変更を行い、`apply`で両方の変更が反映されることを確認する。
+fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
+    let ws = case_dir("cow-l-resume");
+    let before = list_cow_sessions();
+    let run1 = run_harness(
+        &ws,
+        &write_file_tool_turns("first.txt", "written in round 1"),
+        &["--cow"],
+        "cow-l-r1",
+    );
+    if !run1.status.success() {
+        return Err(format!("round1 harness invocation failed: {}", run1.stderr));
+    }
+    let session_id = new_cow_session(&before)?;
+    // round1のプロセスは正常終了しdiscardしていない前提（liveness mutexは名前付きmutexで、
+    // 所有プロセスの終了とともにOSが解放するため、再開時に「まだliveと誤認識される」ことは
+    // 無い、設計書§19.11参照）。
+    if cow_session_is_live(&session_id) {
+        return Err(format!("session {session_id} should not be live after its process exited"));
+    }
+
+    // 同一session_idで--resume --cowにより再開し、2つ目のファイルを追加する。
+    let run2 = run_harness_with_exe(
+        &harness_exe(),
+        &ws,
+        &write_file_tool_turns("second.txt", "written in round 2 after resume"),
+        &["--cow", "--resume", &session_id],
+        "cow-l-r2",
+    );
+    if !run2.status.success() {
+        return Err(format!("resumed harness invocation failed: {}", run2.stderr));
+    }
+    // resumeは新しいCoWセッションを作らず、同じsession_idのupper_dirを再利用しているはず。
+    let after_resume = list_cow_sessions();
+    if !after_resume.contains(&session_id) {
+        return Err(format!("session {session_id} should still exist after resume"));
+    }
+    let new_sessions: Vec<&String> = after_resume.difference(&before).collect();
+    if new_sessions != vec![&session_id] {
+        return Err(format!(
+            "resume must not create a new CoW session, expected only {session_id:?}, got {new_sessions:?}"
+        ));
+    }
+
+    let report = apply_cow(&ws, &session_id, None)?;
+    let mut applied: Vec<String> = report["applied"]
+        .as_array()
+        .ok_or("missing applied[]")?
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    applied.sort();
+    if applied != vec!["first.txt".to_string(), "second.txt".to_string()] {
+        return Err(format!(
+            "expected both round1 and round2 files to be captured under the same session, got {applied:?}: {report}"
+        ));
+    }
+    expect_eq("first.txt", &read_file(&ws.join("first.txt"))?, "written in round 1")?;
+    expect_eq(
+        "second.txt",
+        &read_file(&ws.join("second.txt"))?,
+        "written in round 2 after resume",
+    )?;
+
+    cleanup_on_success(&ws, &[&session_id], "cow-l");
+    Ok(())
+}
+
+fn cow_session_is_live(session_id: &str) -> bool {
+    harness_sandbox::workspace_ledger::cow_session_is_live(session_id)
+}
+
 /// `tier2a_cow_commit_matrix`と`tier2a_net_policy_matrix`は同じテストバイナリ内の別々の
 /// `#[test]`関数であり、既定では別スレッドで並行実行される。両者は共有WFPエンジン・
 /// netfilterdの単一インスタンス・`C:\harness-e2e`を奪い合うため、Q5(機構ごとに1テストで
@@ -615,6 +805,9 @@ fn tier2a_cow_commit_matrix() {
         ("G-hard-deny-config-injection", case_g_hard_deny_config_injection),
         ("H-toctou-conflict", case_h_toctou_conflict),
         ("I-write-file-tool-captured", case_i_write_file_tool_is_captured_by_cow),
+        ("J-discard", case_j_discard_removes_all_changes),
+        ("K-resolve-auto-merge", case_k_resolve_auto_merges_non_overlapping_conflict),
+        ("L-resume-continues-session", case_l_resume_continues_same_cow_session),
     ];
     let mut passed = 0;
     let total = cases.len();
@@ -672,6 +865,31 @@ fn net_case_ws(name: &str) -> PathBuf {
 /// `sandbox_dir`を確保するのは、それが無いと`net-audit.jsonl`自体が書かれないため
 /// (`crates/harness-tools/src/shell.rs`の`audit_log_path`はstaging有効時のみ設定される)。
 fn run_net_case(name: &str, allow_domains: &[&str], case_matrix_case: &str, deny_hosts_expected: &[&str]) -> Result<(), String> {
+    run_net_case_with_exe(&harness_exe(), name, allow_domains, case_matrix_case, deny_hosts_expected)
+}
+
+/// `run_net_case`の`harness.exe`パスを差し替え可能な版（WFP fail-closedケース専用）。
+fn run_net_case_with_exe(
+    exe: &Path,
+    name: &str,
+    allow_domains: &[&str],
+    case_matrix_case: &str,
+    deny_hosts_expected: &[&str],
+) -> Result<(), String> {
+    run_net_case_with_exe_and_stderr_check(exe, name, allow_domains, case_matrix_case, deny_hosts_expected, None)
+}
+
+/// `run_net_case_with_exe`に、harness自身のstderrへ特定文字列が出ていることの追加検証を
+/// 挟めるようにした版。WFP fail-closedケースが、単に通信が拒否されただけでなく
+/// 「WFP起動失敗によるfail-closed」という想定した理由で拒否されたことを確認するのに使う。
+fn run_net_case_with_exe_and_stderr_check(
+    exe: &Path,
+    name: &str,
+    allow_domains: &[&str],
+    case_matrix_case: &str,
+    deny_hosts_expected: &[&str],
+    stderr_must_contain: Option<&str>,
+) -> Result<(), String> {
     let ws = net_case_ws(name);
     let mut extra_args = vec!["--staged"];
     for d in allow_domains {
@@ -679,9 +897,17 @@ fn run_net_case(name: &str, allow_domains: &[&str], case_matrix_case: &str, deny
         extra_args.push(d);
     }
     let script = format!(".\\tier2a-net-e2e.exe case-matrix --case {case_matrix_case}");
-    let run = run_harness(&ws, &run_shell_script_turns(&script), &extra_args, name);
+    let run = run_harness_with_exe(exe, &ws, &run_shell_script_turns(&script), &extra_args, name);
     if !run.status.success() {
         return Err(format!("harness invocation itself failed: {}", run.stderr));
+    }
+    if let Some(needle) = stderr_must_contain {
+        if !run.stderr.contains(needle) {
+            return Err(format!(
+                "expected stderr to contain {needle:?} (confirms the specific fail-closed reason), got: {}",
+                run.stderr
+            ));
+        }
     }
     assert_prompt_sane(&run, &["run_shell"])?;
     let outcome = parse_json_stdout(&run)?;
@@ -769,6 +995,76 @@ fn net_case_06_numeric_ip_obfuscation() -> Result<(), String> {
     run_net_case("net-06-numeric", &["example.com"], "numeric-ip", &[])
 }
 
+/// `crates/tier2a-mock-netfilterd`（`docs/DEV-ENVIRONMENT.md`参照）。本物の
+/// `harness-netfilterd.exe`とは無関係な別クレートで、named pipeへ一瞬だけ接続してすぐ
+/// 切断するだけの、WFP fail-closed E2E専用のフォールト注入バイナリ。
+fn mock_netfilterd_exe() -> PathBuf {
+    harness_exe()
+        .parent()
+        .expect("harness exe has a parent dir")
+        .join("tier2a-mock-netfilterd.exe")
+}
+
+/// `harness-netfilterd.exe`の解決先(`current_exe().parent()`、`netfilterd.rs::daemon_exe_path`)
+/// を差し替えるための専用launcherディレクトリを用意する。`harness.exe`をコピーし、隣に
+/// `tier2a-mock-netfilterd.exe`を`harness-netfilterd.exe`という名前でコピーする。本物の
+/// `target/debug/harness-netfilterd.exe`・共有WFPエンジンには一切触れない。
+fn wfp_fail_closed_launcher_exe() -> PathBuf {
+    let dir = Path::new(CASE_ROOT).join("_launcher-wfp-failclosed");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create launcher dir");
+    let harness_copy = dir.join("harness.exe");
+    std::fs::copy(harness_exe(), &harness_copy).expect("copy harness.exe into launcher dir");
+    std::fs::copy(mock_netfilterd_exe(), dir.join("harness-netfilterd.exe"))
+        .expect("copy mock netfilterd exe into launcher dir as harness-netfilterd.exe");
+    harness_copy
+}
+
+/// 07: WFP fail-closed。`--net-allow-domain example.com`でドメインポリシーを要求しつつ、
+/// `harness-netfilterd.exe`の解決先を即座に切断するモックへ差し替えることで、
+/// `NetfilterHandle::start`のハンドシェイクを確実に失敗させる（実WFPエンジン・実netfilterdは
+/// 一切起動しない、決定論的なフォールト注入）。`should_grant_tier2a_network_capability`
+/// （`crates/harness-tools/src/shell.rs`）により、この状態ではAppContainer capability自体が
+/// `Deny`になる——example.comを明示許可していても、Layer1協調プロキシへの縮退運用にすら
+/// ならず、ソケット生成そのものが一切できない、より強いfail-closed（`main.rs`のWFP起動失敗
+/// 警告文言もこの挙動に合わせて修正済み）。既存のcase 01（ドメイン未指定）と同じ
+/// "all-denied"のcase-matrixで両ホストとも拒否されることを検証しつつ、stderrに
+/// fail-closedの理由が明記されていることも二重に確認する。BFEサービス停止・
+/// `FwpmEngineOpen0`自体の失敗は別経路のため、このケースの対象外（`docs/STATUS.md`参照）。
+///
+/// **`deny_hosts_expected`を空にする理由**: `run_net_case`の「二重証拠」（case-matrix結果＋
+/// `net-audit.jsonl`のdeny記録）は、Local Proxy Agentへ到達できてこそ書かれる監査ログを
+/// 前提にしている。しかしcapability自体が`Deny`のこのケースでは、サンドボックス化された
+/// プロセスはLocal Proxy Agentへloopback到達すること自体ができず、監査ログには何も書かれ
+/// ない（`audit entries: []`が正しい結果）。これは「アプリ層のプロキシまで到達して拒否
+/// された」場合より強い証拠（AppContainer境界そのもので止まっている）なので、caseの成否は
+/// case-matrix自身のJSON出力（プローブが実際に接続を試みて失敗したか）だけで判定する。
+///
+/// **既知の脆さ（発見済み、テスト側で回避）**: Tier2aのAppContainerプロファイル
+/// （`harness.shell.sandbox`）は全ケースで共有される。`harness-netfilterd`はWFP適用時に
+/// このSIDをWindowsのAppContainer loopback exemptionへ一時追加し、「このセッションで
+/// 新規追加した場合のみ」teardown時に削除する（設計書`AppContainerを用いたドメインベース
+/// 通信制御アーキテクチャ設計書.md:133`）。本セッションでの動作確認中、`sudo`呼び出しの
+/// 中断・`taskkill`によるプロセス強制終了を繰り返した結果、このexemptionが残留した状態で
+/// 本ケースを実行し、モックがWFP起動を阻止していてもLayer1プロキシへのloopback到達だけは
+/// 生き残ってしまう（`CheckNetIsolation LoopbackExempt -s`で残留を確認、`sudo
+/// CheckNetIsolation LoopbackExempt -d -n=harness.shell.sandbox`で解消）という現象を実機で
+/// 観測した。正常終了時のteardownがこのexemptionを確実に削除しているかは未検証のまま
+/// 残っている（BUG-046と同型の「共有プロファイルへの残留状態」クラスの脆弱性の可能性が
+/// あるが、今回の観測はテスト実行中の異常終了が原因である可能性が高く切り分けられて
+/// いない）。次にTier2a関連のE2Eが不可解に失敗したら、まずこれを疑うこと。
+fn net_case_07_wfp_start_failure_is_fail_closed() -> Result<(), String> {
+    let exe = wfp_fail_closed_launcher_exe();
+    run_net_case_with_exe_and_stderr_check(
+        &exe,
+        "net-07-wfp-failclosed",
+        &["example.com"],
+        "all-denied",
+        &[],
+        Some("Tier2a run_shell network capability will remain denied"),
+    )
+}
+
 #[test]
 #[ignore]
 fn tier2a_net_policy_matrix() {
@@ -783,6 +1079,7 @@ fn tier2a_net_policy_matrix() {
         ("03-example-allowed", net_case_03_example_allowed),
         ("05-raw-tcp-layer2", net_case_05_raw_tcp_bypasses_proxy),
         ("06-numeric-ip-layer1", net_case_06_numeric_ip_obfuscation),
+        ("07-wfp-start-failure-fail-closed", net_case_07_wfp_start_failure_is_fail_closed),
     ];
     let mut passed = 0;
     let total = cases.len();

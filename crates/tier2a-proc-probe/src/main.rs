@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+mod spawn_via;
 #[cfg(windows)]
 mod winid;
 #[cfg(windows)]
@@ -49,6 +50,10 @@ struct Args {
     /// `ShellExecuteExW(runas)`をAppContainer内から試みた結果だけをJSONで報告する
     /// （`try_runas`モジュールdoc参照）。値は`harness-privhelper.exe`の絶対パス。
     try_runas: Option<String>,
+    /// Tier2a残課題#5（`CreateProcessA`/`WinExec`直接フック）検証用: 指定時、通常のFS/脱走/
+    /// ネット検査は行わず、`(モード, コマンドライン)`で指定されたコマンドを`CreateProcessA`
+    /// または`WinExec`で直接起動した結果だけをJSONで報告する（`spawn_via`モジュールdoc参照）。
+    spawn_via: Option<(String, String)>,
 }
 
 fn parse_args() -> Args {
@@ -62,6 +67,7 @@ fn parse_args() -> Args {
     let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
     let mut sanitize_env = false;
     let mut try_runas = None;
+    let mut spawn_via = None;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -84,6 +90,8 @@ fn parse_args() -> Args {
             "--timeout-secs" => timeout_secs = next().parse().unwrap_or(DEFAULT_TIMEOUT_SECS),
             "--sanitize-env" => sanitize_env = true,
             "--try-runas" => try_runas = Some(next()),
+            "--spawn-via-createprocessa" => spawn_via = Some(("createprocessa".to_string(), next())),
+            "--spawn-via-winexec" => spawn_via = Some(("winexec".to_string(), next())),
             _ => {}
         }
     }
@@ -99,6 +107,7 @@ fn parse_args() -> Args {
         timeout_secs,
         sanitize_env,
         try_runas,
+        spawn_via,
     }
 }
 
@@ -353,6 +362,15 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("try_runas report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some((mode, cmdline)) = &args.spawn_via {
+        let report = spawn_via::run(mode, cmdline);
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("spawn_via report must serialize")
         );
         return ExitCode::SUCCESS;
     }

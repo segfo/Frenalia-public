@@ -3035,9 +3035,15 @@ async fn main() -> ExitCode {
             ) {
                 Ok(handle) => Some(handle),
                 Err(e) => {
+                    // `should_grant_tier2a_network_capability`（`crates/harness-tools/src/
+                    // shell.rs`）は`domain_policy_requested && !enforced_by_wfp`のとき
+                    // `NetworkCapability::Deny`を返す。つまりWFP起動失敗時はLayer1協調
+                    // プロキシへの縮退ではなく、AppContainer capability自体が付与されず
+                    // run_shell子プロセスはソケットを一切生成できない（fail-closed）。
                     eprintln!(
-                        "warning: failed to start WFP netfilterd (network egress will only be \
-                         enforced by the cooperative proxy, Layer1, this session): {e}"
+                        "warning: failed to start WFP netfilterd; Tier2a run_shell network \
+                         capability will remain denied for this session (fail-closed, no \
+                         outbound sockets at all, not merely unenforced): {e}"
                     );
                     None
                 }

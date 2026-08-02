@@ -95,7 +95,7 @@ use std::sync::{Mutex, OnceLock};
 
 use harness_change_ledger::{now_millis, parse_ledger, store, ChangeOp, COW_OPS_LEDGER_FILENAME};
 use retour::GenericDetour;
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{PCSTR, PCWSTR, PSTR, PWSTR};
 use windows::Wdk::Foundation::{OBJECT_ATTRIBUTES, OBJECT_INFORMATION_CLASS, OBJECT_NAME_INFORMATION};
 use windows::Wdk::Foundation::NtQueryObject;
 use windows::Wdk::Storage::FileSystem::{
@@ -124,7 +124,7 @@ use windows::Win32::System::ProcessStatus::{
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::Win32::System::Threading::{
     CreateRemoteThread, CreateThread, GetCurrentProcessId, GetExitCodeThread, ResumeThread,
-    WaitForSingleObject, PROCESS_INFORMATION, THREAD_CREATION_FLAGS,
+    WaitForSingleObject, PROCESS_INFORMATION, STARTUPINFOA, THREAD_CREATION_FLAGS,
 };
 
 /// `retour`が要求する生のNt関数シグネチャ。`windows`クレートの`Wdk`ラッパは実体が
@@ -217,6 +217,36 @@ type CreateProcessAsUserWFn = unsafe extern "system" fn(
     *mut c_void,
 ) -> BOOL;
 
+/// 残課題#5（Phase 4a以降）: `kernel32!CreateProcessA`。`CreateProcessWFn`と同じ引数個数・
+/// 意味だが、文字列引数がANSI（`PCSTR`/`PSTR`）になる。`CreateProcessA`は内部で
+/// `CreateProcessW`を経由せず直接`CreateProcessInternalW`（より下位の共通API）を呼ぶため
+/// （一般的なWindows内部実装のknown-how、実装側のコードコメントとも符合）、既存の
+/// `CreateProcessW`/`CreateProcessAsUserW`フックは`CreateProcessA`呼び出しを完全に素通しして
+/// いた。同じ「オリジナルが完全に返った後に注入する」安全なタイミング（BUG-041の教訓）を
+/// そのまま適用する。
+type CreateProcessAFn = unsafe extern "system" fn(
+    PCSTR,
+    PSTR,
+    *const c_void,
+    *const c_void,
+    BOOL,
+    u32,
+    *const c_void,
+    PCSTR,
+    *const c_void,
+    *mut c_void,
+) -> BOOL;
+
+/// 残課題#5: `kernel32!WinExec`。`UINT WinExec(LPCSTR lpCmdLine, UINT uCmdShow)`。
+/// `CreateProcessA`/`W`と違い`dwCreationFlags`も`lpProcessInformation`も呼び出し元へ一切
+/// 公開しないため、この関数自身のシグネチャ経由では「suspendedで起動して孫へ注入してから
+/// resumeする」ことができない。そのため`hooked_win_exec`は本物の`WinExec`を呼ばず、
+/// 代わりに（フック済みの）`CreateProcessA`相当のロジック（`hooked_create_process_a`関数を
+/// 直接呼ぶ、`GenericDetour::call`＝オリジナル関数呼び出しではない点に注意）を自前で実行し、
+/// 得られた`PROCESS_INFORMATION`を注入に使ってから、WinExecの戻り値規約（成功時は32より
+/// 大きい値、失敗時はエラーコード相当の32以下の値）に変換する。
+type WinExecFn = unsafe extern "system" fn(PCSTR, u32) -> u32;
+
 /// Win32 `PROCESS_CREATION_FLAGS`の`CREATE_SUSPENDED`ビット（`windows`クレートの
 /// `windows::Win32::System::Threading::CREATE_SUSPENDED`と同値だが、フック関数の引数型が
 /// 生の`u32`のためリテラルとして持つ）。
@@ -255,6 +285,8 @@ static QUERY_ATTR_HOOK: OnceLock<GenericDetour<NtQueryAttributesFileFn>> = OnceL
 static CREATE_PROCESS_W_HOOK: OnceLock<GenericDetour<CreateProcessWFn>> = OnceLock::new();
 static CREATE_PROCESS_AS_USER_W_HOOK: OnceLock<GenericDetour<CreateProcessAsUserWFn>> =
     OnceLock::new();
+static CREATE_PROCESS_A_HOOK: OnceLock<GenericDetour<CreateProcessAFn>> = OnceLock::new();
+static WIN_EXEC_HOOK: OnceLock<GenericDetour<WinExecFn>> = OnceLock::new();
 
 /// このDLL自身がロードされているモジュールベースアドレス（`DllMain`の`hinst`引数、数値上は
 /// そのプロセスにおけるロードベースアドレスと一致する——Windowsの仕様）。孫プロセス内での
@@ -1951,6 +1983,106 @@ unsafe extern "system" fn hooked_create_process_as_user_w(
     ok
 }
 
+/// 残課題#5: `CreateProcessA`のフック本体。`hooked_create_process_w`と全く同じ構造
+/// （`CREATE_SUSPENDED`強制→オリジナル呼び出し→`inject_grandchild_and_maybe_resume`）。
+/// `hooked_win_exec`からも（`GenericDetour::call`を経由するのではなく）このRust関数を
+/// 直接呼び出す形で再利用する。
+unsafe extern "system" fn hooked_create_process_a(
+    application_name: PCSTR,
+    command_line: PSTR,
+    process_attributes: *const c_void,
+    thread_attributes: *const c_void,
+    inherit_handles: BOOL,
+    creation_flags: u32,
+    environment: *const c_void,
+    current_directory: PCSTR,
+    startup_info: *const c_void,
+    process_information: *mut c_void,
+) -> BOOL {
+    let hook = CREATE_PROCESS_A_HOOK.get().expect("hook installed");
+    let caller_wanted_suspended = creation_flags & CREATE_SUSPENDED_FLAG != 0;
+    let forced_flags = creation_flags | CREATE_SUSPENDED_FLAG;
+    let ok = unsafe {
+        hook.call(
+            application_name,
+            command_line,
+            process_attributes,
+            thread_attributes,
+            inherit_handles,
+            forced_flags,
+            environment,
+            current_directory,
+            startup_info,
+            process_information,
+        )
+    };
+    if !ok.as_bool() {
+        return ok;
+    }
+    unsafe {
+        inject_grandchild_and_maybe_resume(
+            process_information,
+            caller_wanted_suspended,
+            "hooked_create_process_a",
+        );
+    }
+    ok
+}
+
+/// 残課題#5: `WinExec`のフック本体。モジュールdoc（`WinExecFn`定義の直前）参照——本物の
+/// `WinExec`は呼ばず、`hooked_create_process_a`を直接呼んでsuspended起動→注入→resumeの
+/// 経路へ載せ、`PROCESS_INFORMATION`が得られたら`WinExec`の戻り値規約（成功時33、失敗時
+/// `ERROR_BAD_FORMAT`=11等の32以下の値）へ変換する。`ReentryGuard`は不要
+/// （`hooked_create_process_a`自身のプロセス生成はファイルI/Oフックの再入対象外）。
+unsafe extern "system" fn hooked_win_exec(cmd_line: PCSTR, cmd_show: u32) -> u32 {
+    const ERROR_BAD_FORMAT: u32 = 11;
+    if cmd_line.is_null() {
+        return ERROR_BAD_FORMAT;
+    }
+    // `hooked_create_process_a`は`CREATE_PROCESS_A_HOOK`が設置済みである前提で書かれている
+    // （`.expect("hook installed")`）。`install_create_process_hooks`はベストエフォートで
+    // 各フックを独立に試みるため、理論上`WinExec`だけ設置に成功し`CreateProcessA`は
+    // 失敗する組合せがあり得る——その場合はpanicさせず素直に失敗を返す。
+    if CREATE_PROCESS_A_HOOK.get().is_none() {
+        return ERROR_BAD_FORMAT;
+    }
+    // `lpCommandLine`はCreateProcessA側で書換可能である必要があるため、呼び出し元所有の
+    // 読み取り専用バッファをそのまま渡さずローカルのミュータブルバッファへコピーする。
+    let mut buf: Vec<u8> = unsafe { cmd_line.as_bytes() }.to_vec();
+    buf.push(0);
+
+    let mut startup_info = STARTUPINFOA {
+        cb: std::mem::size_of::<STARTUPINFOA>() as u32,
+        dwFlags: windows::Win32::System::Threading::STARTF_USESHOWWINDOW,
+        wShowWindow: cmd_show as u16,
+        ..Default::default()
+    };
+    let mut process_info = PROCESS_INFORMATION::default();
+
+    let ok = unsafe {
+        hooked_create_process_a(
+            PCSTR::null(),
+            PSTR(buf.as_mut_ptr()),
+            std::ptr::null(),
+            std::ptr::null(),
+            BOOL(0),
+            0,
+            std::ptr::null(),
+            PCSTR::null(),
+            &mut startup_info as *mut _ as *const c_void,
+            &mut process_info as *mut _ as *mut c_void,
+        )
+    };
+    if !ok.as_bool() {
+        return ERROR_BAD_FORMAT;
+    }
+    unsafe {
+        let _ = CloseHandle(process_info.hThread);
+        let _ = CloseHandle(process_info.hProcess);
+    }
+    33 // WinExecの戻り値規約: 32より大きい値=成功（具体的な値に意味は無い）。
+}
+
 unsafe fn resolve_ntdll_export(name: &str) -> Option<*const c_void> {
     unsafe { resolve_module_export("ntdll.dll", name) }
 }
@@ -2252,6 +2384,28 @@ fn install_create_process_hooks() {
                 {
                     if unsafe { detour.enable() }.is_ok() {
                         let _ = CREATE_PROCESS_AS_USER_W_HOOK.set(detour);
+                    }
+                }
+            }
+        }
+        // 残課題#5: `CreateProcessA`/`WinExec`も同じベストエフォート方針で追加する
+        // （失敗しても他フックには影響しない、モジュールdoc「CreateProcessAFn」参照）。
+        if CREATE_PROCESS_A_HOOK.get().is_none() {
+            if let Some(addr) = unsafe { resolve_module_export(module, "CreateProcessA") } {
+                let target: CreateProcessAFn = unsafe { std::mem::transmute(addr) };
+                if let Ok(detour) = unsafe { GenericDetour::new(target, hooked_create_process_a) } {
+                    if unsafe { detour.enable() }.is_ok() {
+                        let _ = CREATE_PROCESS_A_HOOK.set(detour);
+                    }
+                }
+            }
+        }
+        if WIN_EXEC_HOOK.get().is_none() {
+            if let Some(addr) = unsafe { resolve_module_export(module, "WinExec") } {
+                let target: WinExecFn = unsafe { std::mem::transmute(addr) };
+                if let Ok(detour) = unsafe { GenericDetour::new(target, hooked_win_exec) } {
+                    if unsafe { detour.enable() }.is_ok() {
+                        let _ = WIN_EXEC_HOOK.set(detour);
                     }
                 }
             }

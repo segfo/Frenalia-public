@@ -16,6 +16,8 @@ members = [
     "crates/harness-cli",
     "crates/tier2a-net-e2e",
     "crates/tier2a-proc-probe",
+    "crates/tier2a-mock-netfilterd",
+    "crates/dev-elevated-runner",
 ]
 
 [workspace.package]

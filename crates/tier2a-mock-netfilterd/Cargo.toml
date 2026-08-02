@@ -1,0 +1,22 @@
+[package]
+name = "tier2a-mock-netfilterd"
+version.workspace = true
+edition.workspace = true
+
+# Tier2a WFP fail-closed E2E（`crates/harness-cli/tests/tier2a_e2e.rs`）専用のフォールト注入用
+# バイナリ。本物の`harness-netfilterd.exe`のプロトコル（引数[1]=named pipe名）だけを真似て
+# named pipeへclientとして一瞬だけ接続し、何も応答せずすぐ切断する。これにより
+# `NetfilterHandle::start`のハンドシェイクを高速かつ決定論的に失敗させ、WFP起動失敗時の
+# fail-closedを検証できる。production（`crates/harness-netfilterd`）とは独立したクレートで、
+# 通常のharnessビルド成果物には含まれない（テストが明示的にビルド・配置する）。
+
+[[bin]]
+name = "tier2a-mock-netfilterd"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+] }

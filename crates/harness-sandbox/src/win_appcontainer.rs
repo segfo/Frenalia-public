@@ -5245,6 +5245,152 @@ mod cow_diagnostics {
         );
     }
 
+    /// テスト専用: `crates/tier2a-proc-probe`のx64ビルド成果物を、直接の子プロセスとして
+    /// 起動するための実行ファイルパス（Redirector DLLの通常注入経路＝Phase 1-3を経て、
+    /// この直接の子自身が`CreateProcessA`/`WinExec`で"ひ孫"を起動する土台に使う）。
+    fn tier2a_proc_probe_x64_exe() -> PathBuf {
+        let current = std::env::current_exe().expect("current_exe");
+        let dir = current.parent().expect("current_exe has parent").to_path_buf();
+        let exe = dir.join("tier2a_proc_probe.exe");
+        assert!(
+            exe.exists(),
+            "tier2a_proc_probe.exe not found at {} (build with `cargo build -p \
+             tier2a-proc-probe` and copy next to the test binary per docs/DEV-ENVIRONMENT.md)",
+            exe.display()
+        );
+        exe
+    }
+
+    /// 残課題#5: `CreateProcessA`は`CreateProcessW`を経由せず直接`CreateProcessInternalW`を
+    /// 呼ぶため、以前は既存フック（`CreateProcessW`/`CreateProcessAsUserW`のみ）を完全に
+    /// 素通ししていた。`tier2a-proc-probe`（Redirector DLL注入済みの直接の子）が自身の中で
+    /// `CreateProcessA`を呼んで起動した孫プロセスの書込みも、CoW upperへ透過リダイレクト
+    /// されることを確認する（`crates/harness-redirector/src/lib.rs`の`hooked_create_process_a`）。
+    #[test]
+    #[ignore]
+    fn cow_write_via_createprocessa_grandchild_is_redirected_to_upper() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        let probe = tier2a_proc_probe_x64_exe();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            probe.to_str().expect("probe path is valid utf-8"),
+            &[
+                "--spawn-via-createprocessa",
+                "cmd.exe /c \"echo created-by-createprocessa>new_by_createprocessa.txt\"",
+            ],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+                ext_capture_roots: &[],
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+        assert!(
+            !workspace.path().join("new_by_createprocessa.txt").exists(),
+            "grandchild's write must not appear in the read-only workspace"
+        );
+        let upper_content =
+            std::fs::read_to_string(upper.path().join("new_by_createprocessa.txt")).expect(
+                "upper must contain the grandchild's write (CreateProcessA hook must have \
+                 re-injected the redirector DLL, residual issue #5)",
+            );
+        assert!(
+            upper_content.trim().contains("created-by-createprocessa"),
+            "unexpected upper content: {upper_content:?}"
+        );
+
+        let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+        assert!(
+            !warnings_path.exists(),
+            "grandchild injection via CreateProcessA should not have failed in this \
+             environment: {:?}",
+            std::fs::read_to_string(&warnings_path)
+        );
+    }
+
+    /// 残課題#5: `WinExec`は`dwCreationFlags`も`lpProcessInformation`も呼び出し元へ公開しない
+    /// ため、`hooked_win_exec`（`crates/harness-redirector/src/lib.rs`）は本物の`WinExec`を
+    /// 呼ばず内部で`CreateProcessA`相当の経路へ委譲して注入する設計になっている。その経路が
+    /// 実際に機能し、`WinExec`で起動した孫プロセスの書込みもCoW upperへ透過リダイレクトされる
+    /// ことを確認する。
+    #[test]
+    #[ignore]
+    fn cow_write_via_winexec_grandchild_is_redirected_to_upper() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+
+        let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        let probe = tier2a_proc_probe_x64_exe();
+        let env = crate::secret_env::build_child_env();
+        let child = spawn(
+            probe.to_str().expect("probe path is valid utf-8"),
+            &[
+                "--spawn-via-winexec",
+                "cmd.exe /c \"echo created-by-winexec>new_by_winexec.txt\"",
+            ],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+                ext_capture_roots: &[],
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+        assert!(
+            !workspace.path().join("new_by_winexec.txt").exists(),
+            "grandchild's write must not appear in the read-only workspace"
+        );
+        let upper_content = std::fs::read_to_string(upper.path().join("new_by_winexec.txt"))
+            .expect(
+                "upper must contain the grandchild's write (WinExec hook must have re-injected \
+                 the redirector DLL via its CreateProcessA-based reimplementation, residual \
+                 issue #5)",
+            );
+        assert!(
+            upper_content.trim().contains("created-by-winexec"),
+            "unexpected upper content: {upper_content:?}"
+        );
+
+        let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+        assert!(
+            !warnings_path.exists(),
+            "grandchild injection via WinExec should not have failed in this environment: {:?}",
+            std::fs::read_to_string(&warnings_path)
+        );
+    }
+
     /// Phase 4b: 32bit（WOW64）孫プロセス（`C:\Windows\SysWOW64\cmd.exe`）にもRedirector DLLが
     /// 再注入され、書込みがupperへ透過リダイレクトされることを確認する（設計書§32 Phase 4b、
     /// `/dig`2026-08-02決定「エントリポイントtrap方式」）。直接の子（powershell、x64）から

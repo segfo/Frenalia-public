@@ -96,11 +96,15 @@ pub fn try_runas(helper_path: &str) -> Value {
     }
 
     // 成功した場合（hProcessが有効）は直後に後始末する（モジュールdoc「安全性の配慮」参照）。
-    let hprocess_valid = !info.hProcess.is_invalid();
+    // `SHELLEXECUTEINFOW`はpacked構造体のため、フィールドへの参照を経由するメソッド呼び出し
+    // （`.is_invalid()`）は不整列参照になり得る（i686ターゲットでE0793、実機確認済み）。
+    // 値をローカル変数へコピーしてから扱う。
+    let h_process = info.hProcess;
+    let hprocess_valid = !h_process.is_invalid();
     if hprocess_valid {
         unsafe {
-            let _ = TerminateProcess(info.hProcess, 1);
-            let _ = CloseHandle(info.hProcess);
+            let _ = TerminateProcess(h_process, 1);
+            let _ = CloseHandle(h_process);
         }
     }
 
