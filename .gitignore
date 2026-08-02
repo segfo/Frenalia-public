@@ -3,6 +3,7 @@
 /.env
 tools/procmon/*.PML
 *.exe
+*.dll
 # procmonの生CSV/PMLキャプチャ（スクラッチ、巨大化しうる。BUG-013調査で使用）
 /Logfile.CSV
 /Logfile.PML
