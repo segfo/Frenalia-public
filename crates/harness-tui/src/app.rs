@@ -225,7 +225,8 @@ pub struct AppState {
     /// スピナーのフレーム送り用カウンタ。`tick()`が33ms間隔で呼ぶ。
     pub spinner_frame: usize,
     /// `true`のときEnterが送信（後方互換モード）。`false`（既定）のときEnterは入力欄に改行を
-    /// 挿入し、送信はAlt+Enterで行う。いずれのモードでもShift+Enterは無効化（何もしない）。
+    /// 挿入し、送信はAlt+EnterまたはShift+Enterで行う（`true`のときもAlt+Enter/Shift+Enterは
+    /// 常に送信）。
     /// （`.harness/settings.json`の`enter_submits`、`harness-cli`が`AppState::new`後に
     /// この`pub`フィールドへ直接設定する。他の全31箇所の`AppState::new`呼び出し
     /// ―主に既存テスト―を変更せずに済むよう、コンストラクタ引数にはしない）。
@@ -234,6 +235,10 @@ pub struct AppState {
     /// echoし、VS Code等の端末が実際にどんな`code`/`modifiers`を届けているかを画面で観測する
     /// （Enter系キー化けの検証用。`harness-cli`が`AppState::new`後にこのpubフィールドへ設定）。
     pub key_debug: bool,
+    /// `TERM_PROGRAM=vscode`のとき`true`（`terminal::host_is_vscode`）。キー処理の分岐には
+    /// 使わない（Shift+Enterが送信になるかどうかはSHIFT修飾が実際に届くか否かで自然に決まる）。
+    /// 入力欄のヒント文字列（Alt+Enter/Shift+Enterどちらを案内するか）の表示専用。
+    pub host_is_vscode: bool,
     /// 変更（changes）パネル（M10）。`Some`の間は他の全キー入力をパネル操作専用に奪う
     /// （`pending_permission`と同じ排他パターン）。
     pub changes_panel: Option<ChangesPanelState>,
@@ -273,6 +278,7 @@ impl AppState {
             spinner_frame: 0,
             enter_submits: false,
             key_debug: false,
+            host_is_vscode: false,
             changes_panel: None,
         }
     }
@@ -744,11 +750,14 @@ impl AppState {
             // モーダル非表示時のEscはターン単位のキャンセル（設計書§リッチTUI「Escで
             // CancellationToken発火」）。Ctrl-Cはプロセス終了のまま維持する。
             KeyCode::Esc => Some(Action::Cancel),
-            // Shift+Enterは無効化（何もしない）。SHIFT修飾を届けられる端末でのみこのアームが
-            // 効き、送信キーはAlt+Enterに一本化する（下記）。
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => None,
+            // 送信キーはAlt+Enter・Shift+Enterの両方。VS Code統合ターミナル（xterm.js）は
+            // Shift修飾を落として素のEnterとして届けるため、そちらでは自然に改行のままになる
+            // （＝SHIFT修飾が実際に届くかどうか自体が端末の自動検出になっている）。
             KeyCode::Enter
-                if !(key.modifiers.contains(KeyModifiers::ALT) || self.enter_submits) =>
+                if !(key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+                    || self.enter_submits) =>
             {
                 if self.selection_range().is_some() {
                     self.push_undo_snapshot(false);
@@ -762,9 +771,9 @@ impl AppState {
                 self.input_cursor += 1;
                 None
             }
-            // ここに来るのはAlt+Enter（送信キー）または`enter_submits`時の素のEnter。VS Code統合
-            // ターミナルでも物理Alt+EnterはネイティブにESC+CRとして送られ、crosstermがESC
-            // プレフィックスをAlt修飾と解釈するため、keybindingの細工なしに届く（M09で検証）。
+            // ここに来るのはAlt+Enter・Shift+Enter（送信キー）または`enter_submits`時の素のEnter。
+            // VS Code統合ターミナルでも物理Alt+EnterはネイティブにESC+CRとして送られ、crossterm
+            // がESCプレフィックスをAlt修飾と解釈するため、keybindingの細工なしに届く（M09で検証）。
             KeyCode::Enter => self.submit_input(),
             KeyCode::Backspace => {
                 if self.selection_range().is_some() {
@@ -1571,19 +1580,37 @@ mod tests {
         assert!(app.pending_permission.is_none());
     }
 
-    /// Shift+Enterは無効化されており、送信も改行もせず何も起きない（入力はそのまま）。
-    /// 物理Shift+EnterはVS Code統合ターミナルではShift修飾が失われ素のEnterと区別できないため、
-    /// SHIFT修飾を届けられる端末での誤送信を防ぐ目的で明示的にno-opにしている。
+    /// Shift+Enterは送信キー。Windows Terminal/conhostではSHIFT修飾が実際に届くため送信になる
+    /// （VS Code統合ターミナルではShift修飾が失われ素のEnterとして届くため改行のままになる——
+    /// それはcrossterm/xterm.js側の挙動であり、`on_key`にはSHIFT付きのイベントが渡る前提）。
     #[test]
-    fn shift_enter_is_disabled_and_does_nothing() {
+    fn shift_enter_submits_input() {
         let mut app = AppState::new("mock".into(), "mock-model".into());
         for c in "hi".chars() {
-            assert!(app.on_key(key(c)).is_none());
+            app.on_key(key(c));
         }
-        assert!(app.on_key(shift(KeyCode::Enter)).is_none());
-        // 送信されず、改行も挿入されず、入力は保持される。
-        assert_eq!(app.input, "hi");
-        assert!(app.transcript.is_empty());
+        let action = app.on_key(shift(KeyCode::Enter));
+        match action {
+            Some(Action::Submit(text)) => assert_eq!(text, "hi"),
+            other => panic!("expected Submit action, got {other:?}"),
+        }
+        assert!(app.input.is_empty());
+    }
+
+    /// `enter_submits`フラグが立っていても、Shift+Enterは（Alt+Enterと同様）常に送信のまま。
+    #[test]
+    fn shift_enter_submits_even_when_enter_submits_flag_enabled() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.enter_submits = true;
+        for c in "hi".chars() {
+            app.on_key(key(c));
+        }
+        let action = app.on_key(shift(KeyCode::Enter));
+        match action {
+            Some(Action::Submit(text)) => assert_eq!(text, "hi"),
+            other => panic!("expected Submit action, got {other:?}"),
+        }
+        assert!(app.input.is_empty());
     }
 
     /// 既定（`enter_submits == false`）では、素のEnterは送信せず入力欄へ改行を挿入し、送信は

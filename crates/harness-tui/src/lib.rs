@@ -215,6 +215,7 @@ pub async fn run(
     );
     let mut app = AppState::new(provider_label, model);
     app.enter_submits = enter_submits;
+    app.host_is_vscode = terminal::host_is_vscode();
     // Enter系キー化けの検証用: `HARNESS_KEY_DEBUG`（`0`/空以外）で受信キーイベントを画面へecho。
     if std::env::var("HARNESS_KEY_DEBUG")
         .map(|v| !v.is_empty() && v != "0")

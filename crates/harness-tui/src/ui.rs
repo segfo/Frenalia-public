@@ -382,8 +382,10 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
 fn render_input(f: &mut Frame, area: Rect, app: &AppState) {
     let title = if app.enter_submits {
         "input (Enter=送信, Esc=中断, PageUp/PageDown=スクロール, Ctrl-C=終了)"
-    } else {
+    } else if app.host_is_vscode {
         "input (Enter=改行, Alt+Enter=送信, Esc=中断, PageUp/PageDown=スクロール, Ctrl-C=終了)"
+    } else {
+        "input (Enter=改行, Shift+Enter=送信, Esc=中断, PageUp/PageDown=スクロール, Ctrl-C=終了)"
     };
     let block = Block::default().borders(Borders::ALL).title(title);
 

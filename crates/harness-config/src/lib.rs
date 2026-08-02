@@ -23,7 +23,7 @@ pub struct Settings {
     pub max_turns: Option<usize>,
     pub output_format: Option<String>,
     /// `true`ならTUI入力欄でEnterが送信（後方互換モード）。既定（`None`/`false`）では
-    /// Shift+Enterが送信、素のEnterは改行を挿入する（§リッチTUI「入力ボックス」）。
+    /// Alt+EnterまたはShift+Enterが送信、素のEnterは改行を挿入する（§リッチTUI「入力ボックス」）。
     pub enter_submits: Option<bool>,
     /// 読取スコープ設定（M11、`plans/DESIGN-SANDBOX.md` §5）。省略時は
     /// `ReadSettings::default()`（whitelist・外部ルート無し＝M10までと等価）。

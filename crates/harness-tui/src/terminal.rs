@@ -20,6 +20,16 @@ use crossterm::terminal::{
 /// 区別可能にする。非対応端末では`app.rs`側が従来通りShift無しEnterとして扱う。
 static KEYBOARD_ENHANCEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// `TERM_PROGRAM=vscode`かどうか（大小無視）。表示専用（入力欄のヒント文字列で
+/// Alt+Enter/Shift+Enterどちらを案内するか）に使う判定で、キー処理の分岐には使わない
+/// ——送信キーの実際の挙動はSHIFT修飾が届くか否かで自然に決まるため、誤検出しても
+/// 動作は壊れずヒント文言がずれるだけに留まる。
+pub fn host_is_vscode() -> bool {
+    std::env::var("TERM_PROGRAM")
+        .map(|v| v.eq_ignore_ascii_case("vscode"))
+        .unwrap_or(false)
+}
+
 pub struct TerminalGuard;
 
 impl TerminalGuard {
