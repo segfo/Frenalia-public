@@ -115,16 +115,30 @@ fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
     })
 }
 
-pub async fn run() -> ExitCode {
+/// [`stage_configure`]の出力。Stage3（`stage_open_session`）以降が必要とする値を運ぶ。
+struct Configured {
+    cli: Cli,
+    workspace_root: PathBuf,
+    resume_id: Option<String>,
+    resume_wants_picker: bool,
+    settings: harness_config::Settings,
+    provider: Box<dyn LlmProvider>,
+    model: String,
+    max_turns: usize,
+    enter_submits: bool,
+    tools: ToolRegistry,
+    arbiter: PermissionArbiter,
+}
+
+/// `settings.json`読込・`early_require_sandbox`とconfidentialの矛盾チェック・provider構築・
+/// model解決・`ToolRegistry`・allowlist・`PermissionArbiter`。
+fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode> {
     let ParsedArgs {
         cli,
         workspace_root,
         resume_id,
         resume_wants_picker,
-    } = match stage_parse_args() {
-        Ok(p) => p,
-        Err(code) => return code,
-    };
+    } = parsed;
 
     // §設定とシークレット「既定 → ユーザ → プロジェクト → CLIフラグ（最優先）」。CLIフラグが
     // 明示されていればそちらを使い、無ければ`settings.json`階層へフォールバックする
@@ -143,7 +157,7 @@ pub async fn run() -> ExitCode {
             validate_and_merge_net_allow_domains(&mut early_net_proxy, &cli.net_allow_domain)
         {
             eprintln!("error: invalid network domain policy: {e}");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
         let mut early_net_app = settings.net.clone().unwrap_or_default().to_net_app_policy();
         for app in &cli.net_allow_app {
@@ -158,13 +172,13 @@ pub async fn run() -> ExitCode {
                  all outbound network unconditionally; refusing to start rather than silently \
                  ignoring network allow rules or weakening the confidentiality guarantee)"
             );
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     }
 
     let provider = match build_provider(
         cli.provider,
-        cli.base_url,
+        cli.base_url.clone(),
         #[cfg(feature = "e2e-mock")]
         cli.mock_turns.as_deref(),
         #[cfg(feature = "e2e-mock")]
@@ -173,14 +187,14 @@ pub async fn run() -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
-    let model = match resolve_model(cli.model.or(settings.model.clone()), cli.provider) {
+    let model = match resolve_model(cli.model.clone().or(settings.model.clone()), cli.provider) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
     let max_turns = cli
@@ -200,7 +214,7 @@ pub async fn run() -> ExitCode {
         eprintln!(
             "--permission-mode accept-all requires --dangerously-allow (see plans/DESIGN.md §非対話モード)"
         );
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
 
     let allowlist: Vec<_> = settings
@@ -222,6 +236,55 @@ pub async fn run() -> ExitCode {
         })
         .collect();
     let arbiter = PermissionArbiter::new(cli.permission_mode.into(), allowlist);
+
+    Ok(Configured {
+        cli,
+        workspace_root,
+        resume_id,
+        resume_wants_picker,
+        settings,
+        provider,
+        model,
+        max_turns,
+        enter_submits,
+        tools,
+        arbiter,
+    })
+}
+
+pub async fn run() -> ExitCode {
+    let ParsedArgs {
+        cli,
+        workspace_root,
+        resume_id,
+        resume_wants_picker,
+    } = match stage_parse_args() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    let configured = match stage_configure(ParsedArgs {
+        cli,
+        workspace_root,
+        resume_id,
+        resume_wants_picker,
+    }) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let Configured {
+        cli,
+        workspace_root,
+        resume_id,
+        resume_wants_picker,
+        settings,
+        provider,
+        model,
+        max_turns,
+        enter_submits,
+        tools,
+        arbiter,
+    } = configured;
 
     // JSONL追記型セッション永続化（M9、§非対話モード「JSONL 追記型セッション永続化
     // （`--resume`/`--continue`）」）。`.harness/sessions/`直下に1ファイル1セッション。
