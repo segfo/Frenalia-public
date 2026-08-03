@@ -165,9 +165,11 @@ async fn executor_trait_drives_one_step_through_dyn() {
     let executor: &dyn Executor = &executor;
 
     let result = executor
-        .raw_turn(RawTurnRequest {
-            req: minimal_request(&tools, &ctx, "read greeting.txt"),
-        })
+        .raw_turn(RawTurnRequest::user_facing(minimal_request(
+            &tools,
+            &ctx,
+            "read greeting.txt",
+        )))
         .await
         .unwrap();
 
@@ -202,9 +204,11 @@ async fn executor_trait_cannot_bypass_the_permission_gate() {
     let executor: &dyn Executor = &executor;
 
     let result = executor
-        .raw_turn(RawTurnRequest {
-            req: minimal_request(&tools, &ctx, "run a shell command"),
-        })
+        .raw_turn(RawTurnRequest::user_facing(minimal_request(
+            &tools,
+            &ctx,
+            "run a shell command",
+        )))
         .await
         .unwrap();
 

@@ -5,7 +5,7 @@
 //! 直接駆動する（§ワークスペース構成の慣例。`M06-openai-family-lmstudio.md`の
 //! golden-transcriptテストと同じ方針）。stdoutは`Vec<u8>`へ差し替えてキャプチャする。
 
-use harness_cognition::CognitiveOrchestrator;
+use harness_cognition::{CognitiveOrchestrator, PhaseBudgets};
 use harness_core::{BlockKind, CognitionLevel, StopReason, StreamEvent, ToolCtx, Usage};
 use harness_engine::{AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode};
 use harness_providers::MockProvider;
@@ -88,7 +88,7 @@ async fn json_output_has_stable_schema_and_allowed_tool_call() {
         &tools,
         &ctx,
         &arbiter,
-        &CognitiveOrchestrator::new(CognitionLevel::Off).unwrap(),
+        &CognitiveOrchestrator::new(CognitionLevel::Off, PhaseBudgets::default()).unwrap(),
         AgentLoopConfig {
             model: "mock".into(),
             max_tokens: 100,
@@ -149,7 +149,7 @@ async fn json_output_records_denied_tool_call() {
         &tools,
         &ctx,
         &arbiter,
-        &CognitiveOrchestrator::new(CognitionLevel::Off).unwrap(),
+        &CognitiveOrchestrator::new(CognitionLevel::Off, PhaseBudgets::default()).unwrap(),
         AgentLoopConfig {
             model: "mock".into(),
             max_tokens: 100,
@@ -185,7 +185,7 @@ async fn jsonl_output_emits_one_agent_event_per_line() {
         &tools,
         &ctx,
         &arbiter,
-        &CognitiveOrchestrator::new(CognitionLevel::Off).unwrap(),
+        &CognitiveOrchestrator::new(CognitionLevel::Off, PhaseBudgets::default()).unwrap(),
         AgentLoopConfig {
             model: "mock".into(),
             max_tokens: 100,
@@ -237,7 +237,7 @@ async fn json_output_surfaces_provider_error_with_nonzero_exit() {
         &tools,
         &ctx,
         &arbiter,
-        &CognitiveOrchestrator::new(CognitionLevel::Off).unwrap(),
+        &CognitiveOrchestrator::new(CognitionLevel::Off, PhaseBudgets::default()).unwrap(),
         AgentLoopConfig {
             model: "mock".into(),
             max_tokens: 100,

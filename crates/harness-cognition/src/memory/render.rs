@@ -16,8 +16,16 @@ pub enum MemoryView {
     GoalSummary,
     /// ゴール + unknowns + 既存仮説の要旨。Hypothesize用。
     Unknowns,
-    /// 対象仮説1本 + その`predicts`。Investigate用。
+    /// 対象仮説1本 + その`predicts`。Distill用（生出力をどの仮説に照らして蒸留するか）。
     HypothesisPlan(HypId),
+    /// 対象仮説 + `predicts` + **既に得た観測のclaim**。Investigate用。
+    ///
+    /// [`HypothesisPlan`](MemoryView::HypothesisPlan)と分けているのは、Investigateが
+    /// 同じ仮説について複数ラウンド回るため。既に何を観測したかが見えないと、モデルは
+    /// 毎ラウンド同じツール呼び出しを出し、進展しないまま予算を使い切る（`plans/DESIGN-COGNITION.md`
+    /// §3.3の表からの変更点。M15で実測される前に構造的に潰しておく）。Distillは1回の生出力を
+    /// 見るだけなので、この余分を載せない。
+    InvestigationState(HypId),
     /// 対象仮説 + supporting/refuting evidenceの**claimだけ**。Verify用。
     EvidenceFor(HypId),
     /// 対象仮説 + 直近のVerifyの結論。Critic用。
@@ -64,6 +72,7 @@ impl WorkingMemory {
             MemoryView::GoalSummary => self.render_goal_summary(),
             MemoryView::Unknowns => self.render_unknowns(reduction),
             MemoryView::HypothesisPlan(hyp) => self.render_hypothesis_plan(hyp),
+            MemoryView::InvestigationState(hyp) => self.render_investigation_state(hyp),
             MemoryView::EvidenceFor(hyp) => self.render_evidence_for(hyp, reduction),
             MemoryView::VerificationOf(hyp) => self.render_verification_of(hyp),
             MemoryView::ConfirmedForGoal(goal) => self.render_confirmed_for_goal(goal),
@@ -128,6 +137,28 @@ impl WorkingMemory {
             &mut out,
             "反証条件（これが見えれば偽）",
             h.predicts.iter().cloned(),
+        );
+        out
+    }
+
+    /// Investigate用。`HypothesisPlan`に「既に確認済みの観測」を足したもの。
+    fn render_investigation_state(&self, hyp: HypId) -> String {
+        let mut out = self.render_hypothesis_plan(hyp);
+        if out.is_empty() {
+            return out;
+        }
+        let Some(h) = self.hypothesis(hyp) else {
+            return out;
+        };
+        // 支持・反証を区別せず「もう見たこと」として1つの節にまとめる。ここでの用途は
+        // 同じ観測を取り直させないことだけで、支持/反証の判断はVerifyの仕事だから。
+        push_section(
+            &mut out,
+            "既に確認済みの観測（重複して調べない）",
+            h.supporting
+                .iter()
+                .chain(h.refuting.iter())
+                .filter_map(|id| self.claim_line(*id)),
         );
         out
     }
@@ -334,6 +365,22 @@ mod tests {
         // 他の仮説も、既に集めた証拠も入れない（§3.3「対象仮説1本 + その predicts」）。
         assert!(!out.contains("原因はタイムアウト値"), "{out}");
         assert!(!out.contains("並列実行時だけ失敗する"), "{out}");
+    }
+
+    /// Investigateは**既に得た観測**まで見る（同じツール呼び出しを繰り返させないため）。
+    /// Distillが使う`HypothesisPlan`との差分がここに出る。
+    #[test]
+    fn investigation_state_view_adds_the_observations_already_collected() {
+        let (mem, alive, _) = memory_with_two_hypotheses();
+        let out = mem.render(MemoryView::InvestigationState(alive), Reduction::Full);
+        assert!(out.contains("原因はロック順序"), "{out}");
+        assert!(out.contains("並列時のみ失敗"), "{out}");
+        // 支持・反証を区別せず「もう見たこと」として並べる。
+        assert!(out.contains("並列実行時だけ失敗する"), "{out}");
+        assert!(out.contains("シングルスレッドでは緑"), "{out}");
+        // 他の仮説やその証拠までは持ち込まない。
+        assert!(!out.contains("原因はタイムアウト値"), "{out}");
+        assert!(!out.contains("無関係な観測"), "{out}");
     }
 
     #[test]

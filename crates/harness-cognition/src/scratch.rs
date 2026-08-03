@@ -72,7 +72,10 @@ impl ScratchStore {
     /// （`harness_engine::turn`の大出力切詰めと同じ形。まず機械的に切り詰め、
     /// 意味的な抽出はDistillフェーズのLLMコールが行う＝§6.2の2段構え）。
     pub fn zoom(&self, raw_ref: &RawRef, max_chars: usize) -> io::Result<String> {
-        Ok(truncate_head_tail(&self.read_raw(raw_ref)?, max_chars))
+        Ok(crate::text::truncate_head_tail(
+            &self.read_raw(raw_ref)?,
+            max_chars,
+        ))
     }
 
     /// `tool_call_id`をファイル名として安全に使えるか検査してからパスを組む。
@@ -93,19 +96,6 @@ impl ScratchStore {
         }
         Ok(self.raw_dir.join(format!("{tool_call_id}.txt")))
     }
-}
-
-/// `content`が`max_chars`文字を超える場合、先頭/末尾を残し中間を省略記号に置き換える。
-fn truncate_head_tail(content: &str, max_chars: usize) -> String {
-    let total = content.chars().count();
-    if total <= max_chars {
-        return content.to_string();
-    }
-    let half = max_chars / 2;
-    let head: String = content.chars().take(half).collect();
-    let tail: String = content.chars().skip(total - half).collect();
-    let omitted = total - 2 * half;
-    format!("{head}\n... [{omitted} chars truncated] ...\n{tail}")
 }
 
 #[cfg(test)]

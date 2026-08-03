@@ -31,17 +31,26 @@ pub use permission::{
 pub use session::{SessionStore, SessionSummary};
 pub use turn::{
     CompletedToolCall, EngineError, Executor, RawTurn, RawTurnRequest, RawTurnResult,
-    ToolCallDecision, TurnExecutor,
+    ToolCallDecision, TurnExecutor, TurnVisibility,
 };
 
 /// TUI等のフロントエンドへ`AgentEvent`を流すための送信口。ヘッドレスCLIは`None`を渡し
 /// 従来通り`on_text_delta`コールバックのみでstdout出力する（§非対話モード、既存挙動を維持）。
 pub type EventSink = tokio::sync::mpsc::UnboundedSender<AgentEvent>;
 
-pub(crate) fn emit(events: Option<&EventSink>, ev: AgentEvent) {
+/// `EventSink`が繋がっていればイベントを流す（受信側が落ちていても無視する）。
+///
+/// 認知レイヤー（`harness-cognition`）もフェーズ遷移・台帳更新のイベントを同じ
+/// `EventSink`へ流すため公開している。送信の形を2箇所に持たないための1関数
+/// （`docs/CODE-STRUCTURE-RULES.md` 規則5）。
+pub fn emit_event(events: Option<&EventSink>, ev: AgentEvent) {
     if let Some(tx) = events {
         let _ = tx.send(ev);
     }
+}
+
+pub(crate) fn emit(events: Option<&EventSink>, ev: AgentEvent) {
+    emit_event(events, ev);
 }
 
 /// リクエスト全体（system+messages+tools）をJSONシリアライズした文字数からの粗い近似
@@ -212,7 +221,7 @@ where
         );
 
         let result = match executor
-            .raw_turn_with_deltas(req.clone(), &mut on_text_delta)
+            .raw_turn_with_deltas(RawTurnRequest::user_facing(req.clone()), &mut on_text_delta)
             .await
         {
             Ok(r) => r,
@@ -250,7 +259,10 @@ where
                     sanitize::completion_request(&mut retry_req);
                 }
                 match executor
-                    .raw_turn_with_deltas(retry_req, &mut on_text_delta)
+                    .raw_turn_with_deltas(
+                        RawTurnRequest::user_facing(retry_req),
+                        &mut on_text_delta,
+                    )
                     .await
                 {
                     Ok(r) => r,

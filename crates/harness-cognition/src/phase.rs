@@ -62,14 +62,19 @@ pub fn spec(phase: Phase, target: Option<HypId>, goal: Option<GoalId>) -> PhaseS
             wants_schema: true,
         },
         Phase::Investigate => PhaseSpec {
-            view: target.map_or(MemoryView::None, MemoryView::HypothesisPlan),
+            // 同じ仮説について複数ラウンド回るので、既に得た観測まで見せる（M15での変更点、
+            // `crate::memory::render::MemoryView::InvestigationState`のdoc参照）。
+            view: target.map_or(MemoryView::None, MemoryView::InvestigationState),
             // §3.3「read-only + 指定MCPのみ」。write/execを候補から物理的に外す。
             tools: ToolSelection::ReadOnly,
             wants_schema: true,
         },
         Phase::Distill => PhaseSpec {
-            // 入力は生出力（scratchから注入）だけで、台帳スライスは要らない。
-            view: MemoryView::None,
+            // 主入力は生出力（scratchから注入）だが、対象の仮説と反証条件は要る——
+            // Distillの出力スキーマが`relation: supports|refutes`を要求しており、
+            // 何に対する支持/反証なのかが分からないと判定できないため（§3.3の
+            // 「生出力（1件ずつ）」からのM15での変更点）。他の仮説・既存の証拠は載せない。
+            view: target.map_or(MemoryView::None, MemoryView::HypothesisPlan),
             tools: ToolSelection::None,
             wants_schema: true,
         },
@@ -297,6 +302,24 @@ mod tests {
         let s = spec(Phase::Decide, None, None);
         assert!(s.tools.admits(RiskClass::Write));
         assert!(s.tools.admits(RiskClass::Exec));
+    }
+
+    /// Investigateは既に得た観測込み、Distillは対象仮説のみ（M15での変更点。
+    /// 前者は同一仮説を複数ラウンド調査するため、後者は`relation`判定に仮説が要るため）。
+    #[test]
+    fn investigate_and_distill_look_at_the_target_hypothesis_through_different_views() {
+        let h = HypId(2);
+        assert_eq!(
+            spec(Phase::Investigate, Some(h), None).view,
+            MemoryView::InvestigationState(h)
+        );
+        assert_eq!(
+            spec(Phase::Distill, Some(h), None).view,
+            MemoryView::HypothesisPlan(h)
+        );
+        // 対象が無ければどちらも空ビューへ落ちる（組み立ては失敗しない）。
+        assert_eq!(spec(Phase::Distill, None, None).view, MemoryView::None);
+        assert_eq!(spec(Phase::Investigate, None, None).view, MemoryView::None);
     }
 
     /// 対象仮説が指定されなければビューは空になる（組み立て自体は失敗しない）。

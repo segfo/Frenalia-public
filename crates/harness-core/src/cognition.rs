@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 /// 認知レイヤーをどこまで働かせるか。
 ///
 /// `plans/DESIGN-COGNITION.md` §2.3の最終形では headless の既定は `Auto` だが、
-/// `Auto`の難易度ルータはM17、`Always`のHIVフルループはM15–M19で実装するため、
-/// **現時点で実行できるのは`Off`だけ**。現在の既定は`docs/STATUS.md`が持つ。
+/// `Auto`の難易度ルータはM17で実装するため、**現時点で実行できるのは`Off`と`Always`**。
+/// `Always`はHIVループの「ライト」構成（Orient/Critic/PlannerはM19）で走る。
+/// 現在の既定と構成の差は`docs/STATUS.md`が持つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CognitionLevel {

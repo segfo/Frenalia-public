@@ -186,7 +186,13 @@ fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode> {
         .map(CognitionLevel::from)
         .or_else(|| settings.cognition.clone().and_then(|c| c.default_level))
         .unwrap_or_default();
-    let cognition = match CognitiveOrchestrator::new(cognition_level) {
+    // `cognition.budgets`はフェーズ単位の部分上書き（書かなかったフェーズは
+    // `plans/DESIGN-COGNITION.md` §3.3の既定表のまま）。
+    let phase_budgets = match settings.cognition.as_ref().and_then(|c| c.budgets.as_ref()) {
+        Some(overrides) => harness_cognition::PhaseBudgets::default().with_overrides(overrides),
+        None => harness_cognition::PhaseBudgets::default(),
+    };
+    let cognition = match CognitiveOrchestrator::new(cognition_level, phase_budgets) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
@@ -364,7 +370,10 @@ fn stage_open_session(configured: Configured) -> Result<SessionOpened, ExitCode>
         enter_submits,
         tools,
         arbiter,
-        cognition,
+        // 認知レイヤーの生出力scratch（`.harness/cognition/<session-id>/raw/`）を、会話履歴と
+        // **同じセッションID**へ向ける（`plans/DESIGN-COGNITION.md` §5）。M20の`--resume`が
+        // 台帳と履歴を同じ鍵で復元できるようにするため、ここで確定したIDを渡す。
+        cognition: cognition.with_session_id(session.id()),
         sessions_dir,
         session,
         session_messages,

@@ -59,13 +59,16 @@ pub struct AssembledCall {
 /// 何を組むか。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PhaseInput<'a> {
-    /// 対象仮説（Investigate/Verify/Critic）。
+    /// 対象仮説（Investigate/Distill/Verify/Critic）。
     pub target: Option<HypId>,
     /// 対象ゴール（Decide）。
     pub goal: Option<GoalId>,
-    /// Distillへ注入する生出力（`ScratchStore::zoom`で読み出したもの）。
-    /// 台帳には入っていないので、必要なフェーズだけがここで明示的に運ぶ。
+    /// 注入する生出力（`ScratchStore::zoom`で読み出したもの）。台帳には入っていないので、
+    /// 必要なフェーズ（Distill、およびツールフェーズの結論コール）だけが明示的に運ぶ。
     pub raw_output: Option<&'a str>,
+    /// 直前の出力がスキーマ検証に落ちたときの理由（§3.4のリジェクト再実行）。
+    /// 同じ失敗を繰り返させないため、何が不足していたかを本文へ足す。
+    pub repair: Option<&'a str>,
 }
 
 /// フェーズ別最小コンテキストの組立器。
@@ -101,19 +104,54 @@ impl ContextAssembler {
         tools: &ToolRegistry,
         caps: &ProviderCapabilities,
     ) -> AssembledCall {
+        let selection = spec(phase, input.target, input.goal).tools;
+        let tool_specs = select_tools(tools, ctx, selection);
+        self.assemble(phase, input, mem, ctx, tool_specs, caps)
+    }
+
+    /// ツールを一切渡さず、スキーマだけを要求するコールを組む（必ず[`CallKind::SchemaOnly`]）。
+    ///
+    /// 用途は2つあり、どちらも【T7】のコール分割（`plans/DESIGN-COGNITION.md` §3.3）に当たる:
+    /// (a) `schema_with_tools`でないプロバイダで[`CallKind::ToolsOnly`]になったフェーズの
+    /// 結論を取る、(b) ツールフェーズでモデルがツールだけ呼んで構造化出力を返さなかった場合の
+    /// 取り直し。いずれもツール実行は済んでいるので、その観測を`input.raw_output`で運ぶ。
+    pub fn build_conclusion(
+        &self,
+        phase: Phase,
+        input: PhaseInput<'_>,
+        mem: &WorkingMemory,
+        ctx: &ToolCtx,
+        caps: &ProviderCapabilities,
+    ) -> AssembledCall {
+        self.assemble(phase, input, mem, ctx, Vec::new(), caps)
+    }
+
+    fn assemble(
+        &self,
+        phase: Phase,
+        input: PhaseInput<'_>,
+        mem: &WorkingMemory,
+        ctx: &ToolCtx,
+        tool_specs: Vec<ToolSpec>,
+        caps: &ProviderCapabilities,
+    ) -> AssembledCall {
         let budget = self.budgets.get(phase);
         let spec = spec(phase, input.target, input.goal);
-        let tool_specs = select_tools(tools, ctx, spec.tools);
         let kind = call_kind(spec.wants_schema, !tool_specs.is_empty(), caps);
 
         let system = self.system_blocks(phase, ctx, !tool_specs.is_empty());
-        let raw = input.raw_output.unwrap_or("");
+        let mut body = Body {
+            slice: String::new(),
+            raw: input.raw_output.unwrap_or("").to_string(),
+            // 修復指示は縮約の対象にしない（これ自体が「次に何を直すか」で、削ると
+            // 同じ失敗を繰り返す。数十文字なので嵩にもならない）。
+            repair: input.repair.map(str::to_string),
+        };
 
         // 1段目: 台帳スライスの構造的な縮約（決定的な順序、§6.1）。
-        let mut slice = String::new();
         for reduction in Reduction::LEVELS {
-            slice = mem.render(spec.view, reduction);
-            let req = self.request(&system, &tool_specs, &slice, raw, kind, phase, budget);
+            body.slice = mem.render(spec.view, reduction);
+            let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
             if harness_engine::estimate_tokens(&req) <= u64::from(budget.max_in) {
                 return finish(req, kind);
             }
@@ -121,21 +159,12 @@ impl ContextAssembler {
 
         // 2段目: 生出力の機械的な切詰め（§6.2「まず機械的に切詰め → 蒸留で意味的に抽出」）。
         // スライスより先に削るのは、構造的縮約を通り抜けた後で残っている嵩の主因が
-        // 生出力だから（Distillフェーズでは台帳スライス自体が空である）。
-        let mut raw_owned = raw.to_string();
+        // 生出力だから（Distillフェーズの台帳スライスは対象仮説1本だけで小さい）。
         let mut steps = 0;
-        while raw_owned.chars().count() > MIN_BODY_CHARS && steps < MAX_SHRINK_STEPS {
-            raw_owned = shrink(&raw_owned);
+        while body.raw.chars().count() > MIN_BODY_CHARS && steps < MAX_SHRINK_STEPS {
+            body.raw = shrink(&body.raw);
             steps += 1;
-            let req = self.request(
-                &system,
-                &tool_specs,
-                &slice,
-                &raw_owned,
-                kind,
-                phase,
-                budget,
-            );
+            let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
             if harness_engine::estimate_tokens(&req) <= u64::from(budget.max_in) {
                 return finish(req, kind);
             }
@@ -143,18 +172,10 @@ impl ContextAssembler {
 
         // 3段目: 台帳スライス自体の切詰め（構造を保てなくなるので最後）。
         let mut steps = 0;
-        while slice.chars().count() > MIN_BODY_CHARS && steps < MAX_SHRINK_STEPS {
-            slice = shrink(&slice);
+        while body.slice.chars().count() > MIN_BODY_CHARS && steps < MAX_SHRINK_STEPS {
+            body.slice = shrink(&body.slice);
             steps += 1;
-            let req = self.request(
-                &system,
-                &tool_specs,
-                &slice,
-                &raw_owned,
-                kind,
-                phase,
-                budget,
-            );
+            let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
             if harness_engine::estimate_tokens(&req) <= u64::from(budget.max_in) {
                 return finish(req, kind);
             }
@@ -162,15 +183,7 @@ impl ContextAssembler {
 
         // ここまで来たら固定費（システムプロンプト + ツールspec）が予算を超えている。
         // 削れるものが無いので、そのまま返して超過を`estimated_input_tokens`で見せる。
-        let req = self.request(
-            &system,
-            &tool_specs,
-            &slice,
-            &raw_owned,
-            kind,
-            phase,
-            budget,
-        );
+        let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
         finish(req, kind)
     }
 
@@ -194,13 +207,11 @@ impl ContextAssembler {
         blocks
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn request(
         &self,
         system: &[SystemBlock],
         tools: &[ToolSpec],
-        slice: &str,
-        raw: &str,
+        body: &Body,
         kind: CallKind,
         phase: Phase,
         budget: TokenBudget,
@@ -211,7 +222,7 @@ impl ContextAssembler {
             // **後ろ**に置く。プレフィックスを汚さないことでprompt cachingが効く余地を残す。
             messages: vec![Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text(body(slice, raw))],
+                content: vec![ContentBlock::Text(body.render())],
             }],
             tools: tools.to_vec(),
             tool_choice: if tools.is_empty() {
@@ -279,42 +290,49 @@ fn select_tools(tools: &ToolRegistry, ctx: &ToolCtx, selection: ToolSelection) -
     specs
 }
 
-fn body(slice: &str, raw: &str) -> String {
-    let mut out = String::new();
-    if !slice.trim().is_empty() {
-        out.push_str(slice);
-    }
-    if !raw.trim().is_empty() {
-        if !out.is_empty() {
+/// userメッセージ本文の材料。縮約はこの3要素のうち`slice`と`raw`にだけ効く。
+struct Body {
+    slice: String,
+    raw: String,
+    repair: Option<String>,
+}
+
+impl Body {
+    fn render(&self) -> String {
+        let mut out = String::new();
+        if !self.slice.trim().is_empty() {
+            out.push_str(&self.slice);
+        }
+        if !self.raw.trim().is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("## ツール出力（生）\n\n```\n");
+            out.push_str(&self.raw);
+            out.push_str("\n```\n");
+        }
+        if let Some(repair) = &self.repair {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            // 末尾に置くのは、直前に読んだ指示が最も効きやすいのと、
+            // §6.5の安定プレフィックスを汚さないため。
+            out.push_str("## 前回の出力の不備（同じ誤りを繰り返さないこと）\n\n");
+            out.push_str(repair);
             out.push('\n');
         }
-        out.push_str("## ツール出力（生）\n\n```\n");
-        out.push_str(raw);
-        out.push_str("\n```\n");
+        if out.trim().is_empty() {
+            // 空のuserメッセージはプロバイダによっては400になる。
+            out.push_str("（作業記憶は空である。）");
+        }
+        out
     }
-    if out.trim().is_empty() {
-        // 空のuserメッセージはプロバイダによっては400になる。
-        out.push_str("（作業記憶は空である。）");
-    }
-    out
 }
 
 /// 3/4ずつ削る（頭尾を残して中間を省略）。幾何級数なので必ず`MIN_BODY_CHARS`へ収束する。
 fn shrink(text: &str) -> String {
     let target = text.chars().count() * 3 / 4;
-    truncate_head_tail(text, target.max(MIN_BODY_CHARS))
-}
-
-fn truncate_head_tail(content: &str, max_chars: usize) -> String {
-    let total = content.chars().count();
-    if total <= max_chars {
-        return content.to_string();
-    }
-    let half = max_chars / 2;
-    let head: String = content.chars().take(half).collect();
-    let tail: String = content.chars().skip(total - half).collect();
-    let omitted = total - 2 * half;
-    format!("{head}\n... [{omitted} chars truncated] ...\n{tail}")
+    crate::text::truncate_head_tail(text, target.max(MIN_BODY_CHARS))
 }
 
 #[cfg(test)]
@@ -568,13 +586,16 @@ mod tests {
         );
     }
 
-    /// Distillは台帳ではなく生出力を見る（§3.3）。生出力は台帳に無いので、
-    /// 呼び出し側がscratchから読んで明示的に渡す経路になっている。
+    /// Distillの主入力は生出力（§3.3）。生出力は台帳に無いので、呼び出し側がscratchから
+    /// 読んで明示的に渡す経路になっている。台帳側から載るのは**対象仮説1本だけ**で、
+    /// これは出力スキーマの`relation: supports|refutes`を判定するために要る（M15での変更点）。
     #[test]
-    fn distill_receives_the_raw_output_and_no_ledger_slice() {
+    fn distill_receives_the_raw_output_and_only_the_target_hypothesis() {
+        let (_, hyp, _) = memory();
         let call = build(
             Phase::Distill,
             PhaseInput {
+                target: Some(hyp),
                 raw_output: Some("line A\nline B"),
                 ..Default::default()
             },
@@ -583,8 +604,72 @@ mod tests {
             panic!()
         };
         assert!(text.contains("line A"), "{text}");
-        // 台帳スライスは載らない。
+        assert!(text.contains("原因はロック順序"), "{text}");
+        // 既に集めた証拠は載せない（蒸留の対象は今回の生出力1件だけ）。
+        assert!(!text.contains("2箇所で逆順にlockを取得している"), "{text}");
+    }
+
+    /// 対象仮説が無ければ台帳スライスは空のまま（組み立ては失敗しない）。
+    #[test]
+    fn distill_without_a_target_carries_the_raw_output_alone() {
+        let call = build(
+            Phase::Distill,
+            PhaseInput {
+                raw_output: Some("line A"),
+                ..Default::default()
+            },
+        );
+        let ContentBlock::Text(text) = &call.req.messages[0].content[0] else {
+            panic!()
+        };
+        assert!(text.contains("line A"), "{text}");
         assert!(!text.contains("原因はロック順序"), "{text}");
+    }
+
+    /// 【T7】の結論コール: ツールを外してスキーマだけを要求する。ツール実行済みの観測は
+    /// `raw_output`で運ぶ。
+    #[test]
+    fn build_conclusion_drops_the_tools_and_always_requests_a_schema() {
+        let (mem, _, goal) = memory();
+        let call = assembler().build_conclusion(
+            Phase::Decide,
+            PhaseInput {
+                goal: Some(goal),
+                raw_output: Some("edit_file applied 3 lines"),
+                ..Default::default()
+            },
+            &mem,
+            &ctx(),
+            &caps(false),
+        );
+        assert_eq!(call.kind, CallKind::SchemaOnly);
+        assert!(call.req.tools.is_empty());
+        assert_eq!(call.req.tool_choice, ToolChoice::None);
+        assert!(call.req.output.is_some());
+        let ContentBlock::Text(text) = &call.req.messages[0].content[0] else {
+            panic!()
+        };
+        assert!(text.contains("edit_file applied 3 lines"), "{text}");
+    }
+
+    /// スキーマ検証に落ちたときの再実行では、何が不正だったかを本文の**末尾**へ足す
+    /// （§3.4のリジェクト再実行。直前に読んだ指示が最も効く位置で、かつ§6.5の
+    /// 安定プレフィックスを汚さない）。
+    #[test]
+    fn repair_instruction_is_appended_to_the_end_of_the_body() {
+        let call = build(
+            Phase::Hypothesize,
+            PhaseInput {
+                repair: Some("hypotheses[0].predicts が空だった"),
+                ..Default::default()
+            },
+        );
+        let ContentBlock::Text(text) = &call.req.messages[0].content[0] else {
+            panic!()
+        };
+        assert!(text.contains("predicts が空だった"), "{text}");
+        let repair_at = text.find("前回の出力の不備").unwrap();
+        assert!(text[repair_at..].contains("predicts が空だった"));
     }
 
     /// **予算の担保**: 巨大な生出力を渡しても、組み立て結果は予算内に収まる。

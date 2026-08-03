@@ -556,6 +556,48 @@ impl AppState {
                     "context compacted ({removed_messages} messages summarized)"
                 )));
             }
+            // --- 認知レイヤー（M15）---
+            // 台帳ビュー（推論パネル、`plans/DESIGN-COGNITION.md` §8）はまだ作らず、
+            // トランスクリプトへ1行ずつ残す。フェーズ本文はモデルが返した構造化出力
+            // （`TurnVisibility::Internal`）なのでここには一切流れてこない——見えるのは
+            // 「今どのフェーズか」「何を仮説にしたか」「何を観測したか」「判定はどうだったか」
+            // という**推論の骨格だけ**になる。
+            AgentEvent::PhaseChanged { phase } => {
+                // フェーズ境界で「考え中」インジケータを畳む（次フェーズが新たに開く）。
+                self.end_thinking_progress(false);
+                self.transcript
+                    .push(TranscriptItem::Info(format!("[認知] {phase}")));
+            }
+            AgentEvent::HypothesisFormed {
+                id,
+                statement,
+                predicts,
+            } => {
+                self.transcript.push(TranscriptItem::Info(format!(
+                    "[仮説] {id} {statement}（反証条件: {}）",
+                    predicts.join(" / ")
+                )));
+            }
+            AgentEvent::EvidenceAdded { id, claim, source } => {
+                self.transcript.push(TranscriptItem::Info(format!(
+                    "[証拠] {id} {claim}（出典: {source}）"
+                )));
+            }
+            AgentEvent::VerificationResult {
+                hyp,
+                verdict,
+                missing,
+                promoted,
+            } => {
+                let mut line = format!("[検証] {hyp} {verdict}");
+                if promoted {
+                    line.push_str("（確証）");
+                }
+                if !missing.is_empty() {
+                    line.push_str(&format!("／不足: {}", missing.join(" / ")));
+                }
+                self.transcript.push(TranscriptItem::Info(line));
+            }
             AgentEvent::SessionSwitched {
                 source_id,
                 new_id,

@@ -6,7 +6,7 @@
 //! 会話履歴と`AgentEvent`の列が一致することを確認する。M14以降で`Off`の経路に何かを
 //! 挟み込んでしまった場合、ここが落ちる。
 
-use harness_cognition::CognitiveOrchestrator;
+use harness_cognition::{CognitiveOrchestrator, PhaseBudgets};
 use harness_core::{
     AgentEvent, BlockKind, CognitionLevel, ContentBlock, Message, StopReason, StreamEvent, ToolCtx,
     Usage,
@@ -137,7 +137,8 @@ async fn run_scenario(via_orchestrator: bool) -> RunResult {
     };
 
     let outcome = if via_orchestrator {
-        let orchestrator = CognitiveOrchestrator::new(CognitionLevel::Off).unwrap();
+        let orchestrator =
+            CognitiveOrchestrator::new(CognitionLevel::Off, PhaseBudgets::default()).unwrap();
         orchestrator
             .run(
                 &provider,

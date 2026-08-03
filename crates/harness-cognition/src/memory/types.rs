@@ -140,6 +140,9 @@ impl SourceRef {
     /// レンダリング用の1行表現。
     pub fn describe(&self) -> String {
         match self {
+            // `(0, 0)`は「ファイル全体」（行範囲が分からない観測）。`path:0-0`と出すと
+            // 存在しない行を指しているように読めるので、範囲ごと省く。
+            SourceRef::File { path, lines } if *lines == (0, 0) => path.clone(),
             SourceRef::File { path, lines } => format!("{path}:{}-{}", lines.0, lines.1),
             SourceRef::Shell { cmd, exit } => format!("shell `{cmd}` (exit {exit})"),
             SourceRef::Web { url, fetched_at } => format!("{url} ({fetched_at})"),
@@ -214,6 +217,12 @@ pub struct Decision {
     pub goal: GoalId,
     pub action: String,
     pub based_on: Vec<HypId>,
+    /// その行動が効いたかをどう確かめるか（§3.3 Decideの`then_verify`）。
+    ///
+    /// §3.1の`Decision`には無いフィールドだが、ここで捨てるとDecideに出させた
+    /// 「確認方法」が台帳にも最終回答にも残らない（M15での追加）。実際に確認まで
+    /// 走らせるのはM19/M20の再検証ループで、M15は提示するだけ。
+    pub verify_hint: Option<String>,
 }
 
 /// 決着できず、ユーザへ返す（または調査が要る）問い（§3.1・§3.5）。
@@ -264,5 +273,15 @@ mod tests {
         };
         assert_eq!(s.describe(), "src/turn.rs:40-52");
         assert!(!s.describe().contains('\n'));
+    }
+
+    /// 行範囲が分からない観測（ファイル全体）は範囲を出さない。
+    #[test]
+    fn a_whole_file_source_renders_without_a_line_range() {
+        let s = SourceRef::File {
+            path: "src/turn.rs".into(),
+            lines: (0, 0),
+        };
+        assert_eq!(s.describe(), "src/turn.rs");
     }
 }

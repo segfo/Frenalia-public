@@ -3,17 +3,17 @@
 //! `harness-engine`（1ステップ＝`RawTurn`）とフロントエンド（`harness-cli`/`harness-tui`）の
 //! 間に立ち、**認知の唯一の強制点**として「次に何をするか」を決める層。
 //!
-//! # 現在の実装範囲（M14）
+//! # 現在の実装範囲（M15）
 //!
-//! [`CognitiveOrchestrator`]は`CognitionLevel::Off`（素朴ループ）だけを実行できる。
-//! `Auto`/`Always`は[`CognitiveOrchestrator::new`]が拒否する——黙って`Off`へ落とすと
-//! 「賢く動いているつもりで素朴ループだった」という気付けない劣化になるため、
-//! 起動時に明示エラーにする。各段階の実装マイルストーンは`docs/INDEX.md`（M15–M20）。
+//! [`CognitiveOrchestrator`]が実行できるのは`CognitionLevel::Off`（素朴ループ）と
+//! `Always`（HIVループの**ライト構成**: Hypothesize→Investigate→Distill→Verify→Decide）。
+//! `Auto`は難易度ルータ（M17）が無いため[`CognitiveOrchestrator::new`]が拒否する——黙って
+//! `Off`へ落とすと「賢く動いているつもりで素朴ループだった」という気付けない劣化になるため、
+//! 起動時に明示エラーにする。各段階の実装マイルストーンは`docs/INDEX.md`（M16–M20）。
 //!
-//! M14で[`memory`]（構造化台帳）・[`scratch`]（生出力の退避）・[`context`]
-//! （フェーズ別最小コンテキスト組立）を実装した。**これらはまだ実行経路に配線されていない**
-//! ——フェーズを順に回す状態機械（`HivEngine`）はM15であり、駆動部の無い段階で配線しても
-//! 未検証のコードが実行経路に増えるだけだからである。M15はこれらを組み合わせるだけで済む。
+//! 部品は[`memory`]（構造化台帳）・[`scratch`]（生出力の退避）・[`context`]（フェーズ別
+//! 最小コンテキスト組立、M14）と、それらを回す[`hiv`]（状態機械、M15）に分かれている。
+//! Orient/Critic/Planner（フル構成）はM19、`Validity`による妥当性評価はM16。
 //!
 //! この層は`LlmProvider`を直接持たず、必ず`harness_engine`の`Executor`／素朴ループを経由する。
 //! そのためパーミッション・fsジェイル・サンドボックスの強制点は`harness-engine`側の1箇所に
@@ -24,14 +24,17 @@
 #![deny(clippy::wildcard_enum_match_arm)]
 
 pub mod context;
+pub mod hiv;
 pub mod memory;
 pub mod orchestrator;
 pub mod phase;
 pub mod prompts;
 pub mod schema;
 pub mod scratch;
+mod text;
 
 pub use context::{AssembledCall, CallKind, ContextAssembler, PhaseInput};
+pub use hiv::{HivContext, HivEngine, HivLimits, HivOutcome, HivStop};
 pub use memory::{MemoryView, WorkingMemory};
 pub use orchestrator::{CognitiveOrchestrator, UnsupportedLevel};
 pub use phase::{PhaseBudgets, PhaseSpec, ToolSelection};

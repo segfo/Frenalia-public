@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::cognition::Phase;
 use crate::provider::{StopReason, Usage};
 use crate::tool::{RiskClass, ToolOutput};
 
@@ -62,6 +63,38 @@ pub enum AgentEvent {
         source_id: Option<String>,
         new_id: String,
         message_count: usize,
+    },
+    /// 認知レイヤーが次のフェーズへ遷移した（`plans/DESIGN-COGNITION.md` §8、M15）。
+    /// 遷移権限を持つのは`harness_cognition::hiv::HivEngine`だけで、フロントエンドは
+    /// これを表示するだけ（`CognitionLevel::Off`では一度も発行されない）。
+    PhaseChanged {
+        phase: Phase,
+    },
+    /// 仮説が台帳へ追加された（M15）。
+    ///
+    /// 台帳の型（`Hypothesis`/`Evidence`/`Verdict`）は`harness-cognition`にあり、
+    /// `harness-core`がそれらに依存すると依存が逆流する。そのため識別子は
+    /// `HypId::label()`済みの短い文字列（`"H2"`・`"E3"`）で運ぶ。表示・突き合わせには
+    /// これで足り、フロントエンドが台帳の内部表現を知る必要も無くなる。
+    HypothesisFormed {
+        id: String,
+        statement: String,
+        /// 反証条件（何が観測されれば偽か）。空の仮説は状態機械が弾くので、ここは常に非空。
+        predicts: Vec<String>,
+    },
+    /// 蒸留された事実が台帳へ追加された（M15）。`source`は`SourceRef::describe()`の1行表現。
+    EvidenceAdded {
+        id: String,
+        claim: String,
+        source: String,
+    },
+    /// 仮説の検証結果が出た（M15）。`verdict`は`"confirms"`/`"refutes"`/`"inconclusive"`、
+    /// `promoted`は§3.4の接地チェックまで通って`Confirmed`へ昇格したか。
+    VerificationResult {
+        hyp: String,
+        verdict: String,
+        missing: Vec<String>,
+        promoted: bool,
     },
     Error {
         message: String,

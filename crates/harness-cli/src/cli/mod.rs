@@ -294,8 +294,9 @@ pub(crate) struct Cli {
     /// 認知レイヤーの段階（`plans/DESIGN-COGNITION.md` §2）。省略時は`settings.json`の
     /// `cognition.default_level`→既定値の順にフォールバックする。
     ///
-    /// **現在実行できるのは`off`（素朴ループ）だけ**で、`auto`/`always`を指定すると
-    /// 起動時にエラーになる（黙って`off`へ降格しない）。実装マイルストーンは`docs/INDEX.md`。
+    /// **現在実行できるのは`off`（素朴ループ）と`always`（HIVループのライト構成: 仮説→調査→
+    /// 蒸留→検証→決定）**で、`auto`（難易度ルータ）を指定すると起動時にエラーになる
+    /// （黙って`off`へ降格しない）。実装マイルストーンは`docs/INDEX.md`。
     #[arg(long = "cognition", value_enum)]
     cognition: Option<CognitionLevelArg>,
 

@@ -42,14 +42,54 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
 
 const MAX_RETRIES: u32 = 3;
 
+/// このターンのassistantテキストが**ユーザ向けの応答**なのか、**認知レイヤー内部の機構**なのか。
+///
+/// 認知レイヤーの各フェーズ（`plans/DESIGN-COGNITION.md` §3.3）はスキーマ強制された
+/// JSONを返させる解釈コールで、その中身はユーザへ見せる文章ではない。`Internal`のターンで
+/// `TextDelta`/`ThinkingDelta`を流すと、TUIのトランスクリプトとヘッドレスのtext出力へ
+/// 生JSONが垂れ流される。**どのターンの本文が最終回答かを知っているのは認知層だけ**なので、
+/// 判断をここで受け取り、発行するかどうかをこの1箇所で決める。
+///
+/// ツール関連イベント（`ToolCallProposed`/`ToolStarted`/`ToolFinished`）は`Internal`でも
+/// 発行する——実際にワークスペースを触る操作はフェーズの内外を問わずユーザに見えるべきで、
+/// TUIの承認モーダル・ヘッドレスJSONの`tool_calls`集計もこれを前提にしている。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnVisibility {
+    /// 本文をそのままユーザへ見せる（素朴ループの全ターン）。
+    #[default]
+    UserFacing,
+    /// 本文は認知レイヤーが解釈する構造化出力。デルタを一切流さない。
+    Internal,
+}
+
 /// 1ステップの入力。認知レイヤー（M14以降）は`ContextAssembler`が組んだ最小コンテキストを、
 /// 素朴ループは`ConversationState`全体を、それぞれここへ載せる。
 ///
 /// `plans/DESIGN-COGNITION.md` §1のスケッチにある`allowed: ToolGate`（フェーズ毎の許可ツール
-/// 制限、§7.3）はM15で、`budget: TokenBudget`（§6）はM14で追加する。M13時点では絞る側の
-/// 実装が無く、常に全許可の値を運ぶだけのフィールドになるため置いていない。
+/// 制限、§7.3）は`ContextAssembler`が渡すツールspecを絞ることで実現しており（M14）、
+/// ここには持たない。`budget: TokenBudget`（§6）も同様に`max_tokens`と組立側の縮約へ
+/// 落ちているため、常に全許可の値を運ぶだけのフィールドは置いていない。
 pub struct RawTurnRequest {
     pub req: CompletionRequest,
+    pub visibility: TurnVisibility,
+}
+
+impl RawTurnRequest {
+    /// 素朴ループのターン（本文をユーザへ流す）。
+    pub fn user_facing(req: CompletionRequest) -> Self {
+        Self {
+            req,
+            visibility: TurnVisibility::UserFacing,
+        }
+    }
+
+    /// 認知レイヤーのフェーズコール（本文は構造化出力なので流さない）。
+    pub fn internal(req: CompletionRequest) -> Self {
+        Self {
+            req,
+            visibility: TurnVisibility::Internal,
+        }
+    }
 }
 
 /// そのツール呼び出しが**実際に実行されたか**、されなかったなら何故か。
@@ -192,12 +232,17 @@ impl<'a> TurnExecutor<'a> {
     /// 認知レイヤーは`AgentEvent`を消費するのでこのコールバックを必要としない。
     pub async fn raw_turn_with_deltas<F>(
         &self,
-        mut req: CompletionRequest,
+        request: RawTurnRequest,
         on_text_delta: &mut F,
     ) -> Result<RawTurnResult, EngineError>
     where
         F: FnMut(&str),
     {
+        let RawTurnRequest {
+            mut req,
+            visibility,
+        } = request;
+        let visible = visibility == TurnVisibility::UserFacing;
         // 呼び出し側が伏字化済みのリクエストを渡してくる経路（`run_agent_loop`）もあるが、
         // ここを choke point にするため無条件に適用する（[`crate::sanitize`]は冪等）。
         if self.is_tier3() {
@@ -237,19 +282,23 @@ impl<'a> TurnExecutor<'a> {
                     tool_input_raw: String::new(),
                 }),
                 StreamEvent::TextDelta { index, text } => {
-                    let visible_text = sanitize::visible_delta(&text, self.ctx);
-                    on_text_delta(&visible_text);
-                    emit(self.events, AgentEvent::TextDelta { text: visible_text });
+                    if visible {
+                        let visible_text = sanitize::visible_delta(&text, self.ctx);
+                        on_text_delta(&visible_text);
+                        emit(self.events, AgentEvent::TextDelta { text: visible_text });
+                    }
                     if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
                         b.text.push_str(&text);
                     }
                 }
                 StreamEvent::ThinkingDelta { index, text } => {
-                    let visible_text = sanitize::visible_delta(&text, self.ctx);
-                    emit(
-                        self.events,
-                        AgentEvent::ThinkingDelta { text: visible_text },
-                    );
+                    if visible {
+                        let visible_text = sanitize::visible_delta(&text, self.ctx);
+                        emit(
+                            self.events,
+                            AgentEvent::ThinkingDelta { text: visible_text },
+                        );
+                    }
                     if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
                         b.text.push_str(&text);
                     }
@@ -443,7 +492,7 @@ impl<'a> TurnExecutor<'a> {
 #[async_trait]
 impl Executor for TurnExecutor<'_> {
     async fn raw_turn(&self, r: RawTurnRequest) -> Result<RawTurnResult, EngineError> {
-        self.raw_turn_with_deltas(r.req, &mut |_: &str| {}).await
+        self.raw_turn_with_deltas(r, &mut |_: &str| {}).await
     }
 }
 
