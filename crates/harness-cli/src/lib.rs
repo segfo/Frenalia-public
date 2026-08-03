@@ -11,6 +11,7 @@
 /// `main.rs`（binターゲット）はclap定義とディスパッチだけを持ち、実処理はlib側の
 /// このモジュールが持つ（`docs/CODE-STRUCTURE-RULES.md`規則4: 終端クレートなので
 /// テスト可能性を優先してlibへ置く）。
+pub mod cli;
 pub mod fs_grants;
 
 use std::collections::HashMap;
