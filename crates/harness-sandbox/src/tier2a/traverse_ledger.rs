@@ -30,12 +30,19 @@ pub struct TraverseLedger {
 /// `fs-passthrough-ledger.json`と意味が異なる記録（ドライブルート/祖先ディレクトリへの
 /// traverse付与）を混在させないため、別ファイルにする。
 ///
-/// ロック名を渡していない（＝read-modify-writeを直列化しない）のは移設前からの挙動を
-/// そのまま保存しているため。複数`harness.exe`同時起動下でのロストアップデートは
-/// `docs/STATUS.md`の残課題として扱う。
+/// この台帳はD10の巻き戻し（`harness fs revoke-traverse`）の対象一覧のため、複数
+/// `harness.exe`同時起動下でのロストアップデートは付与済みtraverse ACEが追跡不能な
+/// まま実マシンに残ることを意味する。`Local\harness-traverse-grant-ledger`で
+/// read-modify-writeを直列化する（`fs-passthrough-ledger.json`/`tier3-vm-ledger.json`と
+/// 同じ方針、R-01）。
 fn ledger() -> &'static Ledger<TraverseLedger> {
     static LEDGER: OnceLock<Ledger<TraverseLedger>> = OnceLock::new();
-    LEDGER.get_or_init(|| Ledger::in_config_dir("traverse-grant-ledger.json", None))
+    LEDGER.get_or_init(|| {
+        Ledger::in_config_dir(
+            "traverse-grant-ledger.json",
+            Some("Local\\harness-traverse-grant-ledger"),
+        )
+    })
 }
 
 /// 台帳ファイルのパス（`%APPDATA%\harness\config\traverse-grant-ledger.json`）。

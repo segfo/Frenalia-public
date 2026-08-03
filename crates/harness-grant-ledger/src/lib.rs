@@ -106,9 +106,9 @@ pub struct Ledger<T> {
     path: Option<PathBuf>,
     /// `Some`なら[`with_named_lock`]で直列化する。`None`ならロックしない。
     ///
-    /// **現状は台帳ごとに異なる**（`fs-passthrough`と`tier3-vm`はロックあり、
-    /// `traverse-grant`と`workspace-grant`はロック無し）。統合時点では既存の振る舞いを
-    /// そのまま保存しており、揃えるかどうかは別途判断する（`docs/STATUS.md`）。
+    /// 4台帳（`fs-passthrough`・`traverse-grant`・`tier3-vm`・`workspace-grant`）はいずれも
+    /// `Local\harness-<台帳名>-ledger`形式のロック名を渡し、read-modify-writeを直列化する。
+    /// `None`はAPIとしては引き続きサポートするが（テスト用途等）、実運用の4台帳では使わない。
     lock_name: Option<String>,
     _payload: PhantomData<T>,
 }
@@ -360,5 +360,49 @@ mod tests {
             assert_eq!(path.file_name().unwrap(), "example-ledger.json");
             assert!(path.parent().unwrap().ends_with("config"));
         }
+    }
+
+    /// R-01: 名前付きロックが実際に並行`update`を直列化することの確認（`traverse-grant`・
+    /// `workspace-grant`にロック名を追加する根拠）。名前付きmutexはプロセス跨ぎだが同一
+    /// プロセス内のスレッド間でも機能するため、実プロセスを起動せず`std::thread`で検証できる。
+    /// テスト専用のロック名を使い、実運用4台帳のロックとは衝突させない。
+    #[cfg(windows)]
+    #[test]
+    fn a_named_lock_serializes_concurrent_updates_across_threads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger: Ledger<TestLedger> = Ledger::at_path(
+            tmp.path().join("ledger.json"),
+            Some("Local\\harness-grant-ledger-concurrency-test"),
+        );
+        let thread_count = 20;
+        std::thread::scope(|scope| {
+            for i in 0..thread_count {
+                let ledger = &ledger;
+                scope.spawn(move || {
+                    ledger.update(|l| l.entries.push(format!("entry-{i}")));
+                });
+            }
+        });
+        assert_eq!(ledger.load().entries.len(), thread_count);
+    }
+
+    /// ロック名`None`でも`update`を複数スレッドから呼んで壊れない（パニックしない・
+    /// 台帳が読める状態を保つ）ことを確認する。`None`はAPIとして引き続きサポートするため、
+    /// この経路自体は壊していないことの確認であり、ロストアップデートが起き得ることは
+    /// 妨げない（件数の完全一致は主張しない）。
+    #[test]
+    fn update_without_a_lock_name_does_not_corrupt_the_ledger_under_concurrent_writers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger: Ledger<TestLedger> = Ledger::at_path(tmp.path().join("ledger.json"), None);
+        let thread_count = 20;
+        std::thread::scope(|scope| {
+            for i in 0..thread_count {
+                let ledger = &ledger;
+                scope.spawn(move || {
+                    ledger.update(|l| l.entries.push(format!("entry-{i}")));
+                });
+            }
+        });
+        assert!(ledger.load().entries.len() <= thread_count);
     }
 }

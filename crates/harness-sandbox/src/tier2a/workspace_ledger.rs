@@ -150,15 +150,17 @@ pub struct WorkspaceLedger {
 
 /// ファイル入出力（誤削除防止の2層・fail-open）は`harness-grant-ledger`の`Ledger<T>`が持つ。
 ///
-/// ロック名を渡していない（＝read-modify-writeを直列化しない）のは移設前からの挙動を
-/// そのまま保存しているため。この台帳は一覧表示専用で安全性判定には使わない（安全性は常に
-/// 名前付きmutexで判定する、モジュールdoc参照）が、ロストアップデートで一覧から漏れる
-/// 可能性自体は残る。`docs/STATUS.md`の残課題として扱う。
+/// この台帳は一覧表示専用で安全性判定には使わない（安全性は常に名前付きmutexで判定する、
+/// モジュールdoc参照）が、`Local\harness-workspace-grant-ledger`でread-modify-writeを
+/// 直列化する（`fs-passthrough-ledger.json`/`tier3-vm-ledger.json`と同じ方針、R-01）。
 fn ledger() -> &'static harness_grant_ledger::Ledger<WorkspaceLedger> {
     static LEDGER: std::sync::OnceLock<harness_grant_ledger::Ledger<WorkspaceLedger>> =
         std::sync::OnceLock::new();
     LEDGER.get_or_init(|| {
-        harness_grant_ledger::Ledger::in_config_dir("workspace-grant-ledger.json", None)
+        harness_grant_ledger::Ledger::in_config_dir(
+            "workspace-grant-ledger.json",
+            Some("Local\\harness-workspace-grant-ledger"),
+        )
     })
 }
 
