@@ -7,7 +7,21 @@
 use super::*;
 
 
-pub async fn run() -> ExitCode {
+/// [`stage_parse_args`]の出力。Stage2（`stage_configure`）以降が必要とする値だけを運ぶ。
+struct ParsedArgs {
+    cli: Cli,
+    workspace_root: PathBuf,
+    resume_id: Option<String>,
+    resume_wants_picker: bool,
+}
+
+/// 昇格チェック警告・`.env`・`Cli::parse`・`workspace_root`解決・資格情報不要な
+/// サブコマンドの早期dispatch・`--resume`の妥当性検査。
+///
+/// `Err(ExitCode)`は「エラー」に限らない――早期dispatch・`--list-sessions`のように、
+/// 正常終了として即座に返すべき`ExitCode`もここに含む（[`run`]側は`Ok`/`Err`を区別せず
+/// そのまま返す）。
+fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
     // 本体プロセスが管理者権限で起動されていないかを確認する（D-16、
     // `plans/DESIGN-SANDBOX-PRIVSEP.md` §5.3）。harness本体は常に非管理者トークンで動作する
     // 設計であり、ヘルパー機構が無い間は実害が無いが（WFP/VHDX自体を使わないため）、
@@ -36,7 +50,7 @@ pub async fn run() -> ExitCode {
             Ok(dir) => dir,
             Err(e) => {
                 eprintln!("failed to resolve current directory: {e}");
-                return ExitCode::FAILURE;
+                return Err(ExitCode::FAILURE);
             }
         },
     };
@@ -48,21 +62,21 @@ pub async fn run() -> ExitCode {
     // 丸ごと借用したいため。単純な`cli.command`のムーブだと`cli.command`フィールドだけが
     // 部分ムーブされ、以降`&cli`が取れなくなる。
     if let Some(cmd) = cli.command.take() {
-        return match cmd {
+        return Err(match cmd {
             Commands::Fs { action } => crate::fs_grants::run_fs_subcommand(action),
             Commands::Tier3 { action } => run_tier3_subcommand(action),
             Commands::Cow { action } => run_cow_subcommand(action),
             Commands::Net { action } => run_net_subcommand(action, &workspace_root),
             Commands::Prompt => run_prompt_subcommand(&cli, &workspace_root),
             other => run_sandbox_subcommand(other, &workspace_root),
-        };
+        });
     }
 
     // `--list-sessions`はプロバイダ資格情報を一切必要としないため、他のあらゆる検証より前に
     // 処理して即終了する（§非対話モード、プロンプトは一切送らない）。
     if cli.list_sessions {
         let sessions_dir = workspace_root.join(".harness").join("sessions");
-        return match harness_engine::SessionStore::list(&sessions_dir) {
+        return Err(match harness_engine::SessionStore::list(&sessions_dir) {
             Ok(summaries) => {
                 print_session_list(&summaries, cli.output_format);
                 ExitCode::SUCCESS
@@ -71,7 +85,7 @@ pub async fn run() -> ExitCode {
                 eprintln!("failed to list sessions in {}: {e}", sessions_dir.display());
                 ExitCode::FAILURE
             }
-        };
+        });
     }
 
     // 引数なし`--resume`（値省略、空文字列扱い）はヘッドレスでは非対話原則により拒否する。
@@ -80,18 +94,37 @@ pub async fn run() -> ExitCode {
     let resume_wants_picker = cli.resume.as_deref() == Some("");
     if resume_wants_picker && cli.print.is_some() {
         eprintln!("--resume without a value opens an interactive picker and is not supported with -p/--print; pass --resume <id> explicitly");
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
     let resume_id = cli.resume.clone().filter(|s| !s.is_empty());
 
     if cli.fork_session && resume_id.is_none() && !cli.continue_session {
         eprintln!("--fork-session requires --resume <id> or --continue");
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
     if cli.fork_session && resume_wants_picker {
         eprintln!("--fork-session cannot be combined with a bare --resume (use the picker's 'f' key instead)");
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
+
+    Ok(ParsedArgs {
+        cli,
+        workspace_root,
+        resume_id,
+        resume_wants_picker,
+    })
+}
+
+pub async fn run() -> ExitCode {
+    let ParsedArgs {
+        cli,
+        workspace_root,
+        resume_id,
+        resume_wants_picker,
+    } = match stage_parse_args() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
 
     // §設定とシークレット「既定 → ユーザ → プロジェクト → CLIフラグ（最優先）」。CLIフラグが
     // 明示されていればそちらを使い、無ければ`settings.json`階層へフォールバックする
