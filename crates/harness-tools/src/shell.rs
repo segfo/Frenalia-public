@@ -11,8 +11,8 @@
 //! **M12（シェル隔離Tier）**: 子プロセスのenvは常にallowlist方式のクリーンenv
 //! （`harness_sandbox::build_child_env`、D-07）。`ctx.shell_tier`（`harness-cli`が起動時に
 //! 1回選択）に応じて実際の隔離機構を切り替える:
-//! - Windows Tier1: Restricted Token + 低IL + Job Object（`harness_sandbox::win_restricted`）。
-//! - Linux Tier2b: `bwrap`でラップ（`harness_sandbox::linux_bwrap`）。本セッションでは実機未検証
+//! - Windows Tier1: Restricted Token + 低IL + Job Object（`harness_sandbox::tier1::win_restricted`）。
+//! - Linux Tier2b: `bwrap`でラップ（`harness_sandbox::tier2b::linux_bwrap`）。本セッションでは実機未検証
 //!   （Windows専用環境、WSL2で別途再検証が必要）。
 //! - Tier0（保険・全OS）: 通常spawn + Job Object(Win)/rlimit(unix) + 出力バイト上限。
 //!
@@ -612,7 +612,7 @@ async fn run_tier0(
     #[cfg(windows)]
     {
         if let Some(handle) = child.raw_handle() {
-            let _ = harness_sandbox::win_restricted::attach_job_object(handle as isize);
+            let _ = harness_sandbox::tier1::win_restricted::attach_job_object(handle as isize);
         }
     }
 
@@ -629,14 +629,14 @@ async fn run_linux_tier2b(
     dur: Duration,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let session_dir = cwd.join(".harness").join("sandbox").join("tier2b");
-    let config = harness_sandbox::linux_bwrap::BwrapConfig {
+    let config = harness_sandbox::tier2b::linux_bwrap::BwrapConfig {
         workspace_root: cwd.to_path_buf(),
         upper_dir: session_dir.join("upper"),
         work_dir: session_dir.join("work"),
     };
     let _ = std::fs::create_dir_all(&config.upper_dir);
     let _ = std::fs::create_dir_all(&config.work_dir);
-    let bwrap_args = harness_sandbox::linux_bwrap::build_args(&config);
+    let bwrap_args = harness_sandbox::tier2b::linux_bwrap::build_args(&config);
 
     let mut cmd = Command::new("bwrap");
     cmd.args(&bwrap_args);
@@ -666,14 +666,14 @@ async fn run_windows_tier2a(
     granted_passthrough: &[(std::path::PathBuf, bool)],
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let _ = std::fs::create_dir_all(cwd);
-    let sid = harness_sandbox::win_appcontainer::ensure_profile(
-        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    let sid = harness_sandbox::tier2a::win_appcontainer::ensure_profile(
+        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
     )
     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
     // preflightのsmoke testと同一のシェル解決を使う（pwshのストアアプリ実行エイリアスは
     // AppContainerで起動不可＝`resolve_shell`が実在のpowershell.exeへフォールバックする）。
-    let (bin, shell_label) = harness_sandbox::win_appcontainer::resolve_shell();
+    let (bin, shell_label) = harness_sandbox::tier2a::win_appcontainer::resolve_shell();
     let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
     let cwd_owned = cwd.to_path_buf();
     let mut env_owned = env.to_vec();
@@ -688,7 +688,7 @@ async fn run_windows_tier2a(
         .filter(|(_, writable)| *writable)
         .map(|(path, _)| path.clone())
         .collect();
-    let cow = cow_upper_dir.map(|upper_dir| harness_sandbox::win_appcontainer::CowInject {
+    let cow = cow_upper_dir.map(|upper_dir| harness_sandbox::tier2a::win_appcontainer::CowInject {
         workspace_root,
         upper_dir,
         ext_capture_roots: ext_capture_roots.as_slice(),
@@ -701,12 +701,12 @@ async fn run_windows_tier2a(
         net_proxy_enforced,
         net_domain_policy_requested,
     ) {
-        harness_sandbox::win_appcontainer::NetworkCapability::InternetClient
+        harness_sandbox::tier2a::win_appcontainer::NetworkCapability::InternetClient
     } else {
-        harness_sandbox::win_appcontainer::NetworkCapability::Deny
+        harness_sandbox::tier2a::win_appcontainer::NetworkCapability::Deny
     };
 
-    let child = harness_sandbox::win_appcontainer::spawn(
+    let child = harness_sandbox::tier2a::win_appcontainer::spawn(
         &bin,
         &args,
         &cwd_owned,
@@ -747,7 +747,7 @@ async fn run_windows_tier1(
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let _ = std::fs::create_dir_all(cwd);
     // cwd1つだけに継承可能な低ILラベルを付与する（非再帰・冪等、モジュールdocの既知の限界参照）。
-    let _ = harness_sandbox::win_restricted::set_low_integrity_label(cwd);
+    let _ = harness_sandbox::tier1::win_restricted::set_low_integrity_label(cwd);
 
     let (bin, shell_label) = if which::which("pwsh").is_ok() {
         ("pwsh", "pwsh(tier1)")
@@ -761,7 +761,7 @@ async fn run_windows_tier1(
     // （`RUN_SHELL_BOOTSTRAP_SCRIPT`のdoc参照）。
     env_owned.push((RUN_SHELL_COMMAND_ENV_VAR.to_string(), command.to_string()));
 
-    let child = harness_sandbox::win_restricted::spawn(bin, &args, &cwd_owned, &env_owned, true)
+    let child = harness_sandbox::tier1::win_restricted::spawn(bin, &args, &cwd_owned, &env_owned, true)
         .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child.kill_token();
     let stdin_bytes = run_shell_bootstrap_stdin();

@@ -1,7 +1,7 @@
 //! Windows Filtering Platform (WFP) 出口強制フィルタ（Layer2、`plans/DESIGN-SANDBOX-PRIVSEP.md`
 //! §3・`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`）。
 //!
-//! `harness-netfilterd`（常駐デーモン、`crate::netfilterd`）の中でのみ呼ばれる。本体プロセス
+//! `harness-netfilterd`（常駐デーモン、`crate::tier2a::netfilterd`）の中でのみ呼ばれる。本体プロセス
 //! （非管理者）はここのWin32 APIを直接呼ばない。`FWPM_SESSION_FLAG_DYNAMIC`で開いたセッションは
 //! エンジンハンドルを閉じた瞬間（＝このプロセスの終了時）にBFEが登録済みのプロバイダ・
 //! サブレイヤー・フィルタを自動削除するため（付録A #1）、`WfpSession`はプロセス生存期間の
@@ -63,6 +63,10 @@ pub enum WfpError {
     Win32(String),
     #[error("failed to configure AppContainer loopback exemption: {0}")]
     LoopbackExemption(String),
+    /// v1では構築されない。WFP層で許可ドメインをIP解決して外部宛先を直接allowする設計
+    /// （仕様書の旧案）へ戻す場合に使う枠として、エラー分類を仕様書と対応させたまま残す
+    /// （`WfpOptions::allow_domains`のdocと同じ理由）。
+    #[allow(dead_code)]
     #[error("domain resolution failed for {domain}: {reason}")]
     DnsResolve { domain: String, reason: String },
     #[error("no IP addresses resolved for any allowed domain")]
@@ -86,13 +90,20 @@ fn check(status: u32, op: &str) -> Result<(), WfpError> {
 }
 
 /// `WfpApplyRules`要求のオプション（仕様書§6のCLIオプションに対応）。
+///
+/// `netfilterd::NetfilterPolicy`（IPCワイヤ形式）と同じ7フィールドを持つが、レイヤーが違う
+/// （こちらはWFPエンジンへ渡す層で、フィールドごとにWFP固有の意味を持つ。統合するかは
+/// `docs/STATUS.md` R-02）。`#[allow(dead_code)]`が付いた3つは**WFPフィルタ生成では
+/// 読まない**（各フィールドのdoc参照）。`pub(crate)`化により、それが警告として可視化された。
 #[derive(Debug, Clone, Default)]
 pub struct WfpOptions {
     /// 旧IPC/旧設計との後方互換フィールド。v1の理想形ではWFP層で許可ドメインをIP解決して
     /// 外部宛先を直接allowしないため、この値はWFPフィルタ生成では使用しない。
+    #[allow(dead_code)]
     pub allow_domains: Vec<String>,
     /// 旧IPC互換フィールド。v1の強制ドメイン制御では広いlocalhost許可を作らないため、
     /// WFPフィルタ生成では無視する。loopbackを開く場合は下のポート指定を使う。
+    #[allow(dead_code)]
     pub allow_loopback: bool,
     /// 旧IPC互換のloopback許可ポート。新規呼び出しではTCP/UDP別フィールドを使う。
     /// この値は旧クライアント互換のためTCP/UDP両方を許可する。
@@ -103,6 +114,7 @@ pub struct WfpOptions {
     pub allow_loopback_udp_ports: Vec<u16>,
     /// 現状未使用（システム設定DNSサーバの動的取得は未実装、§4.3の`--allow-direct-dns`）。
     /// フィールドとしては仕様書との対応を保つために残す。
+    #[allow(dead_code)]
     pub allow_direct_dns: bool,
     /// WFP block/drop監査イベントを追記するJSONLパス。`None`ならWFP監査購読を起動しない。
     pub audit_log_path: Option<PathBuf>,
@@ -1084,7 +1096,7 @@ mod tests {
     #[test]
     #[ignore = "requires administrator token, BFE, and real Windows AppContainer/WFP state"]
     fn e2e_wfp_blocks_direct_external_connect_and_logs_drop() {
-        if !crate::privhelper::is_elevated() {
+        if !crate::tier2a::privhelper::is_elevated() {
             panic!("WFP E2E requires an elevated administrator token");
         }
 
@@ -1106,9 +1118,9 @@ mod tests {
             }
         });
 
-        let sid = crate::win_appcontainer::ensure_profile(crate::win_appcontainer::CONTAINER_NAME)
+        let sid = crate::tier2a::win_appcontainer::ensure_profile(crate::tier2a::win_appcontainer::CONTAINER_NAME)
             .expect("ensure AppContainer profile");
-        crate::win_appcontainer::grant_ace_recursive(dir.path(), sid.as_psid())
+        crate::tier2a::win_appcontainer::grant_ace_recursive(dir.path(), sid.as_psid())
             .expect("grant temp dir ACE to AppContainer");
         let opts = WfpOptions {
             allow_domains: Vec::new(),
@@ -1120,7 +1132,7 @@ mod tests {
             audit_log_path: Some(audit_path.clone()),
         };
         let session = WfpSession::apply(sid.as_psid(), &opts).expect("apply WFP rules");
-        let (shell, _) = crate::win_appcontainer::resolve_shell();
+        let (shell, _) = crate::tier2a::win_appcontainer::resolve_shell();
         let env = crate::secret_env::build_child_env();
         let command = format!(
             "$ErrorActionPreference = 'Stop'; \
@@ -1130,14 +1142,14 @@ mod tests {
              try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('8.8.8.8', 53); $c.Close() }} catch {{ $blocked = $true }}; \
              if ($ok -and $blocked) {{ Write-Output 'HARNESS_WFP_E2E_OK'; exit 0 }} else {{ Write-Output \"ok=$ok blocked=$blocked\"; exit 7 }}"
         );
-        let child = crate::win_appcontainer::spawn(
+        let child = crate::tier2a::win_appcontainer::spawn(
             &shell,
             &["-NoProfile", "-NonInteractive", "-Command", &command],
             dir.path(),
             &env,
             false,
             sid.as_psid(),
-            crate::win_appcontainer::NetworkCapability::InternetClient,
+            crate::tier2a::win_appcontainer::NetworkCapability::InternetClient,
             None,
         )
         .expect("spawn AppContainer child");

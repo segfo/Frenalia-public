@@ -212,7 +212,7 @@ fn parse_json_stdout(run: &HarnessRun) -> Result<serde_json::Value, String> {
 }
 
 fn list_cow_sessions() -> HashSet<String> {
-    harness_sandbox::workspace_ledger::list_cow_sessions()
+    harness_sandbox::tier2a::workspace_ledger::list_cow_sessions()
         .into_iter()
         .collect()
 }
@@ -229,7 +229,7 @@ fn new_cow_session(before: &HashSet<String>) -> Result<String, String> {
 }
 
 fn cow_upper_dir(session_id: &str) -> PathBuf {
-    harness_sandbox::workspace_ledger::cow_upper_root()
+    harness_sandbox::tier2a::workspace_ledger::cow_upper_root()
         .expect("resolve %LOCALAPPDATA%\\harness\\cow")
         .join(session_id)
 }
@@ -779,7 +779,7 @@ fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
 }
 
 fn cow_session_is_live(session_id: &str) -> bool {
-    harness_sandbox::workspace_ledger::cow_session_is_live(session_id)
+    harness_sandbox::tier2a::workspace_ledger::cow_session_is_live(session_id)
 }
 
 /// M（BUG-047回帰）: `ROUND1_SCRIPT`/`ROUND2_SCRIPT`ベースのA〜L系ケースは、いずれもラウンド間で

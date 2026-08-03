@@ -54,13 +54,13 @@ pub fn render(f: &mut Frame, app: &AppState) {
 }
 
 /// Tier3サンドボックス準備中の待機画面（`sandbox_prep::run_prep_screen`から呼ばれる）。
-/// `latest`は合成進捗ticker（`harness_sandbox::vmsandboxd_progress`、経過時間からの推測——
+/// `latest`は合成進捗ticker（`harness_sandbox::tier3::vmsandboxd_progress`、経過時間からの推測——
 /// daemonの実測値ではない、モジュールdoc参照）からの最新イベント。初回tick到達前（`None`）
 /// でも画面を空白にせず、スピナーと接続中の文言を出す。
 #[cfg(windows)]
 pub fn render_prep_screen(
     f: &mut Frame,
-    latest: Option<&harness_sandbox::vmsandboxd_progress::SandboxPrepEvent>,
+    latest: Option<&harness_sandbox::tier3::vmsandboxd_progress::SandboxPrepEvent>,
     warm_requested: bool,
 ) {
     let rect = centered_rect(60, 30, f.area());

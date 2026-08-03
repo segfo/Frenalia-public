@@ -1,6 +1,6 @@
 //! Tier3専用の常駐デーモン制御（`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.2）。
 //!
-//! `crate::netfilterd`と同じ理由で別プロセス・別モジュールにしている: Hyper-V VM + Incus
+//! `crate::tier2a::netfilterd`と同じ理由で別プロセス・別モジュールにしている: Hyper-V VM + Incus
 //! コンテナは`harness`本体プロセスと独立に生存し続けるため（WFPの`FWPM_SESSION_FLAG_DYNAMIC`
 //! とは逆の性質）、ゲスト⇄ホストのブローカー役はharnessセッション全体の生存期間中
 //! 昇格トークンのまま常駐する必要がある。IPCの配線（named pipe + JSON、
@@ -62,7 +62,7 @@ use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-use crate::vmsandbox::{VmSandboxConfig, VmSession};
+use crate::tier3::vmsandbox::{VmSandboxConfig, VmSession};
 use crate::win_common::wide;
 
 /// 親→daemonへ送るメッセージ。`StartSession`→`Exec`(N回)→`Teardown`の順に送る。
@@ -87,7 +87,7 @@ pub enum VmRequest {
     },
     Teardown,
     /// GC専用モード（`harness tier3 gc`、A9）でのみ送られる1回きりのリクエスト。
-    /// `StartSession`を経由せず、`crate::vmsandbox::gc_orphan_sessions`を実行して
+    /// `StartSession`を経由せず、`crate::tier3::vmsandbox::gc_orphan_sessions`を実行して
     /// 即座に終了する（D-24、`serve_gc_only`参照）。
     Gc,
     /// [BUG-029] `harness tier3 gc`が常駐daemon（`serve_resident`）へ「本当にセッションが
@@ -1192,7 +1192,7 @@ fn query_active_sessions(pipe: HANDLE) -> Result<usize, VmSandboxIpcError> {
 /// `VmSandboxHandle::start`とは異なりセッションを開始せず、`--gc-only`引数付きで起動した
 /// daemon（`serve_gc`）が[`VmRequest::Gc`]を1件処理して即座に終了するのを待つだけの
 /// 軽量な経路。ウォームVM・現在セッション（gc-only起動時は存在しない）は台帳側の
-/// 選定ロジック（`crate::vm_ledger::select_orphan_vm_names`・`daemon_pid`生存判定）で
+/// 選定ロジック（`crate::tier3::vm_ledger::select_orphan_vm_names`・`daemon_pid`生存判定）で
 /// GC対象から除外される。
 ///
 /// **BUG-027対策（2層防御の1層目）**: `gc_orphan_sessions`側の`daemon_pid`生存判定
@@ -1377,7 +1377,7 @@ impl SessionRegistry {
 
     /// 空いているslot番号（`0..max_sessions`）を確保する。上限に達していれば`None`。
     /// `slot`はコンテナの静的IP・SNIプロキシポートの衝突回避に使われる
-    /// （`crate::vmsandbox::container_static_ip_cidr`/`sni_proxy_port_for_slot`）。
+    /// （`crate::tier3::vmsandbox::container_static_ip_cidr`/`sni_proxy_port_for_slot`）。
     fn try_acquire_slot(&self) -> Option<u8> {
         let mut slots = self.active_slots.lock().unwrap();
         for slot in 0..self.max_sessions {
@@ -1585,7 +1585,7 @@ fn serve_inner(
     let config = VmSandboxConfig::default();
 
     // **Phase B**: 孤児VM/差分VHDXの撤収（旧D-24、`gc_orphan_sessions`）はもう本関数の
-    // 呼び出しごとには行わない。VM自体が`crate::vm_host::VmHost`の参照カウントで管理される
+    // 呼び出しごとには行わない。VM自体が`crate::tier3::vm_host::VmHost`の参照カウントで管理される
     // 共有resident資源になったため、GCは「daemonが今から初めてVMを起動しようとする瞬間
     // （`VmHost::attach`のStopped→Running遷移）」にのみ実行される——セッション途中で
     // 誤って現在生存中のVMを孤児扱いしてしまう事故を構造的に防ぐため。
@@ -1699,7 +1699,7 @@ fn send_response(pipe: HANDLE, resp: &VmResponse) -> Result<(), VmSandboxIpcErro
 
 /// daemon側のGC専用エントリポイント（`harness-vmsandboxd.exe <pipe> --gc-only`から呼ぶ）。
 /// `serve`（`StartSession`起点の長期常駐ループ）とは別経路: [`VmRequest::Gc`]を1件受けて
-/// `crate::vmsandbox::gc_orphan_sessions`を実行し、結果を返してすぐ終了する（`run_gc_only`
+/// `crate::tier3::vmsandbox::gc_orphan_sessions`を実行し、結果を返してすぐ終了する（`run_gc_only`
 /// のdoc参照）。
 pub fn serve_gc(pipe_name: &str) -> Result<(), VmSandboxIpcError> {
     let pipe = unsafe {
@@ -1728,7 +1728,7 @@ fn serve_gc_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
     match serde_json::from_slice::<VmRequest>(&request_bytes) {
         Ok(VmRequest::Gc) => {
             let config = VmSandboxConfig::default();
-            let reaped = crate::vmsandbox::gc_orphan_sessions(&config, "");
+            let reaped = crate::tier3::vmsandbox::gc_orphan_sessions(&config, "");
             send_response(
                 pipe,
                 &VmResponse::GcReport {
@@ -2313,7 +2313,7 @@ mod tests {
     /// 管理者権限でテストを実行している場合はこのテストをスキップする）。
     #[test]
     fn access_check_write_denies_system_root_for_non_admin() {
-        if crate::privhelper::is_elevated() {
+        if crate::tier2a::privhelper::is_elevated() {
             eprintln!("skipping: test process is elevated, System32 write would be allowed");
             return;
         }

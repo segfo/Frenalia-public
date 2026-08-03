@@ -1,9 +1,9 @@
 //! WFP専用の常駐デーモン制御（Layer2、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`
 //! 付録C「アーキテクチャ決定」参照）。
 //!
-//! `harness-privhelper`（`crate::privhelper`）とは意図的に別プロセス・別モジュールにしている。
+//! `harness-privhelper`（`crate::tier2a::privhelper`）とは意図的に別プロセス・別モジュールにしている。
 //! `FWPM_SESSION_FLAG_DYNAMIC`のフィルタは、エンジンハンドルを保持するプロセスが生きている
-//! 間だけ有効（`crate::wfp`参照）であり、これは「1起動=1操作で即終了、常駐しない」という
+//! 間だけ有効（`crate::tier2a::wfp`参照）であり、これは「1起動=1操作で即終了、常駐しない」という
 //! `harness-privhelper`の設計原則（D-16）と本質的に相容れない。そのため`harness-netfilterd`は
 //! **harnessセッション全体**（`harness`本体プロセス1回の起動、複数の`run_shell`呼び出しに
 //! またがる）の生存期間中だけ昇格トークンのまま常駐する専用バイナリとして新設した。
@@ -63,8 +63,8 @@ use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-use crate::wfp::{WfpOptions, WfpSession};
-use crate::win_appcontainer::{self, CONTAINER_NAME};
+use crate::tier2a::wfp::{WfpOptions, WfpSession};
+use crate::tier2a::win_appcontainer::{self, CONTAINER_NAME};
 use crate::win_common::wide;
 
 /// daemonへ投入させるネットワークポリシー一式（`ApplyRules`のペイロード）。

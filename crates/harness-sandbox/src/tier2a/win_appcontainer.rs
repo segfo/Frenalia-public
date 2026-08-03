@@ -165,7 +165,7 @@ pub fn ensure_profile(name: &str) -> Result<OwnedContainerSid, AppContainerError
 // --- 責務別サブモジュール（docs/CODE-STRUCTURE-RULES.md 規則1/3） ---
 //
 // 分割線は「どのOS機構を触るか」で引いている。公開パス
-// （`harness_sandbox::win_appcontainer::preflight` 等）を変えないため、各モジュールの
+// （`harness_sandbox::tier2a::win_appcontainer::preflight` 等）を変えないため、各モジュールの
 // 公開項目はここでglob再エクスポートする。
 
 mod acl_grant;

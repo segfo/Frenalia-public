@@ -227,7 +227,7 @@ pub fn select_tier_with_probes(
 
 /// Tier3の軽量可用性チェック（ゴールデン像VHDXの存在のみ確認、実際のVM起動はしない）。
 /// `plans/DESIGN-SANDBOX-VMISOLATION.md`の固定運用規約と同じパスを見る
-/// （`harness_sandbox::vmsandbox::VmSandboxConfig::default().golden_vhdx`と同一値、
+/// （`harness_sandbox::tier3::vmsandbox::VmSandboxConfig::default().golden_vhdx`と同一値、
 /// 循環依存を避けるためここでは値を直接埋め込む——両者が乖離したら単体テストで検知できないが、
 /// Phase 1では許容する）。
 #[cfg(windows)]
@@ -260,7 +260,7 @@ fn try_tier2a(
         // 単体テストでは避ける、既存の分岐と同じ考え方）。D8: passthroughの到達不能は
         // Tier選択自体を左右せず`passthrough_warnings`として運ぶだけ。
         None => {
-            match crate::win_appcontainer::preflight(
+            match crate::tier2a::win_appcontainer::preflight(
                 workspace_root,
                 passthrough,
                 wfp_chain_pipe,

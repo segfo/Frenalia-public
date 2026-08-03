@@ -2,11 +2,20 @@
 //! §ファイルサンドボックス・ステージング・シェル隔離、および §ツールシステム
 //! 「fsジェイル（cap-std を主ゲート）」参照。
 //!
-//! M4時点のスコープは「層1: ワークスペースjail＝モード非依存の不変条件」のみだった。
-//! M10で `overlay`（`SandboxFs`: 書込リダイレクト・read-through・変更マニフェスト・
-//! 論理削除tombstone・`--live`/`--staged`/`--workspace_commit`3モード・apply/discard）を
-//! 追加した。読取スコープ（whitelist/blacklist反転モード）・シェル隔離Tierは引き続き
-//! M11/M12のスコープで本クレートには未実装。
+//! 本クレートは次の3層を持つ。
+//!
+//! 1. **ワークスペースjail**（本ファイルの`WorkspaceJail`）— モード非依存の不変条件。
+//! 2. **Tier非依存の機構** — `overlay`（`SandboxFs`: 書込リダイレクト・read-through・
+//!    変更マニフェスト・論理削除tombstone・`--live`/`--staged`/`--workspace_commit`の3モード・
+//!    apply/discard）、`read_scope`（whitelist/blacklist反転モード）、`resolve`、`secret_env`、
+//!    `manifest`。
+//! 3. **シェル隔離Tierごとの実装** — `tier1`（Windows制限トークン+低IL）・`tier2a`
+//!    （Windows AppContainer、既定）・`tier2b`（Linux bubblewrap）・`tier3`（Hyper-V VM +
+//!    Incusコンテナ）。どのTierを選ぶかの判定は`shell_tier`が持つ（Tier横断のため
+//!    どのtierモジュールにも属さない）。
+//!
+//! Tierごとのモジュールは`tierN`のファサード越しにのみ公開する。そこに現れていない
+//! モジュール（`tier2a::wfp`・`tier3::vm_host`等）はそのTier内部の実装詳細である。
 //!
 //! **主ゲートはcap-std**: 起動時（実際にはツール呼び出しごと。§実装ノート参照）に開いた
 //! `cap_std::fs::Dir` ハンドルからの相対openに統一し、絶対パス再解決を経由したTOCTOU
@@ -19,26 +28,16 @@
 //! （`StagingConfig.sandbox_dir`はworkspace_rootからの相対パス）に置くため、この`WorkspaceJail`
 //! 1つだけで実FS・オーバーレイの両方を仲介できる（新たなambient authorityを増やさない）。
 
+// --- Tier非依存 ---
+
 pub mod manifest;
 pub mod overlay;
 pub mod read_scope;
 pub mod resolve;
 pub mod secret_env;
+
+/// どのシェル隔離Tierを選ぶかの判定。Tier横断のためどの`tierN`にも属さない。
 pub mod shell_tier;
-
-#[cfg(windows)]
-pub mod privhelper;
-
-#[cfg(windows)]
-pub mod win_appcontainer;
-
-/// workspace本体/CoW upper_dirの生存管理（名前付きmutex）はWin32 API依存のためwindows専用。
-#[cfg(windows)]
-pub mod workspace_ledger;
-
-/// windows専用ではない（`harness fs list`のような表示系コマンドが非Windowsでも空台帳を
-/// 表示できるよう、元のmain.rs実装と同じく全プラットフォームでコンパイルする）。
-pub mod traverse_ledger;
 
 #[cfg(windows)]
 mod win_common;
@@ -50,35 +49,24 @@ mod win_common;
 #[cfg(windows)]
 pub use win_common::decode_console_bytes;
 
-#[cfg(windows)]
-pub mod win_restricted;
+// --- シェル隔離Tierごとの実装 ---
+//
+// 各`tierN`の`mod.rs`がそのTierのファサード。外部へ見せるモジュールと、Tier内部の
+// 実装詳細（`pub(crate)`）の区別はそこで宣言する。
 
 #[cfg(windows)]
-pub mod wfp;
+pub mod tier1;
 
-#[cfg(windows)]
-pub mod netfilterd;
-
-#[cfg(windows)]
-pub mod vmsandbox;
-
-#[cfg(windows)]
-pub mod vm_host;
-
-#[cfg(windows)]
-pub mod vmsandboxd;
-
-#[cfg(windows)]
-pub mod vmsandboxd_progress;
-
-#[cfg(windows)]
-pub mod vm_ledger;
-
-#[cfg(windows)]
-pub mod smb_share;
+/// Tier2a本体はwindows専用だが、`tier2a::traverse_ledger`だけは全プラットフォームで
+/// コンパイルする（`harness fs list`が非Windowsでも空台帳を表示できるようにするため、
+/// 移設前からの挙動）。そのため本モジュール自体には`#[cfg(windows)]`を付けない。
+pub mod tier2a;
 
 #[cfg(target_os = "linux")]
-pub mod linux_bwrap;
+pub mod tier2b;
+
+#[cfg(windows)]
+pub mod tier3;
 
 pub use manifest::ManifestOp;
 pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};

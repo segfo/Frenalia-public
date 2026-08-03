@@ -319,7 +319,7 @@ pub fn preflight(
     // モードが違うセッションが同時に動くと片方の前提を裏切る（例: ROのはずが後から来た
     // RWXセッションのせいで書けてしまう）。ACE付与の前に、名前付きmutexで他モードが
     // 使用中でないか確認し、自モードの生存マーカーを確保する
-    // （`crate::workspace_ledger::begin_workspace_mode`のdoc参照、モード衝突チェックと
+    // （`crate::tier2a::workspace_ledger::begin_workspace_mode`のdoc参照、モード衝突チェックと
     // マーカー作成は内部で`with_named_lock`により直列化されるため、2プロセスがほぼ同時に
     // 別モードで起動しても早い者勝ちの事故にはならない）。
     let workspace_mode = match write_mode {
@@ -332,9 +332,9 @@ pub fn preflight(
             workspace_root.display()
         ))
     })?;
-    crate::workspace_ledger::begin_workspace_mode(&canonical_workspace_root, workspace_mode)
+    crate::tier2a::workspace_ledger::begin_workspace_mode(&canonical_workspace_root, workspace_mode)
         .map_err(AppContainerError::Preflight)?;
-    crate::workspace_ledger::record_workspace_grant(&canonical_workspace_root, workspace_mode);
+    crate::tier2a::workspace_ledger::record_workspace_grant(&canonical_workspace_root, workspace_mode);
 
     // D-30: `write_mode`がACL付与方針を唯一決める。`match`を全分岐（`..`無し）にすることで、
     // `WorkspaceWriteMode`へバリアントを追加した際にACL決定漏れをコンパイルエラーにする。
@@ -355,7 +355,7 @@ pub fn preflight(
             grant_ace_inheritable_rw(upper_dir, sid.as_psid())?;
             // `harness cow status`/`apply`/`list`がworkspace_rootを引けるよう、upper_dir自身に
             // 由来を記録する（`workspace_ledger::write_cow_session_meta`のdoc参照）。
-            crate::workspace_ledger::write_cow_session_meta(
+            crate::tier2a::workspace_ledger::write_cow_session_meta(
                 upper_dir,
                 &canonical_workspace_root,
                 upper_dir
@@ -373,7 +373,7 @@ pub fn preflight(
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown-session");
-            crate::workspace_ledger::hold_cow_session_marker(session_id).map_err(|e| {
+            crate::tier2a::workspace_ledger::hold_cow_session_marker(session_id).map_err(|e| {
                 AppContainerError::Preflight(format!(
                     "failed to create CoW session marker for {session_id}: {e}"
                 ))
@@ -403,7 +403,7 @@ pub fn preflight(
     // 本体プロセス内（非管理者）でACCESS_DENIEDになったエントリ（システム保護パス等）だけを
     // ここへ集め、後段で1回の特権分離ヘルパー要求へまとめる（起動あたりUAC最大1回、
     // `TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」の決定）。
-    let mut needs_elevation: Vec<crate::privhelper::FsAllowGrant> = Vec::new();
+    let mut needs_elevation: Vec<crate::tier2a::privhelper::FsAllowGrant> = Vec::new();
     let mut netfilterd_chain_attempted = false;
 
     for requested in passthrough {
@@ -500,7 +500,7 @@ pub fn preflight(
                 // 本体（非管理者）内では書けなかった。システム保護パス（所有者がSYSTEM/
                 // TrustedInstaller等）の可能性があるため、即座に警告へ落とさず後段の
                 // 特権分離ヘルパー経路へ回す。
-                needs_elevation.push(crate::privhelper::FsAllowGrant {
+                needs_elevation.push(crate::tier2a::privhelper::FsAllowGrant {
                     path: fp.path.clone(),
                     access: fp.access,
                     forced: fp.forced,
@@ -510,14 +510,14 @@ pub fn preflight(
     }
 
     if !missing_traverse.is_empty() || !needs_elevation.is_empty() {
-        let elevated: Result<FsAllowElevationOutcome, String> = if crate::privhelper::is_elevated() {
+        let elevated: Result<FsAllowElevationOutcome, String> = if crate::tier2a::privhelper::is_elevated() {
             // 本体が既に管理者（§5.3、grant-traverseの`*_direct`と同じ考え方）:
             // ヘルパーを経由せずその場で直接付与する。traverseが不足していれば先に解消する
             // （workspace_root/upper_dirへ到達できなければfs-allow付与自体が無意味なため）。
             for target in &missing_traverse {
                 let (granted_nodes, result) = grant_traverse_chain(target, sid.as_psid());
                 for node in &granted_nodes {
-                    crate::traverse_ledger::record_traverse_grant(node);
+                    crate::tier2a::traverse_ledger::record_traverse_grant(node);
                 }
                 if let Err(e) = result {
                     return Err(AppContainerError::Preflight(format!(
@@ -552,14 +552,14 @@ pub fn preflight(
             Ok((granted, failures))
         } else {
             netfilterd_chain_attempted = wfp_chain_pipe.is_some();
-            match crate::privhelper::run_privileged_workspace_access(
+            match crate::tier2a::privhelper::run_privileged_workspace_access(
                 missing_traverse.clone(),
                 needs_elevation.clone(),
                 wfp_chain_pipe.clone(),
             ) {
                 Ok((traverse_granted, traverse_error, granted, failures)) => {
                     for node in &traverse_granted {
-                        crate::traverse_ledger::record_traverse_grant(node);
+                        crate::tier2a::traverse_ledger::record_traverse_grant(node);
                     }
                     if let Some(reason) = traverse_error {
                         if !missing_traverse.is_empty() {

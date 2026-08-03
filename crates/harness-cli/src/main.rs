@@ -243,7 +243,7 @@ enum FsAction {
     RevokeTraverseAll,
     /// `preflight`が起動のたびに付与するworkspace本体のACE（通常起動=RWX、`--cow`=RO）を
     /// 撤収する。同じworkspaceを今も使っている他のharnessセッションが無いことを名前付き
-    /// mutexで確認し、あれば「使用中」として拒否する（`harness_sandbox::workspace_ledger`
+    /// mutexで確認し、あれば「使用中」として拒否する（`harness_sandbox::tier2a::workspace_ledger`
     /// 参照）。CoWのupper_dirには一切触れない（別コマンド`harness cow discard`が担当）。
     RevokeWorkspace { path: PathBuf },
     /// これまで許可を付けたことがある全workspaceに対して`revoke-workspace`と同じ処理をする。
@@ -1004,7 +1004,7 @@ fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
 fn shell_sees_staged_writes(shell_tier: &harness_core::ShellTierSelection) -> bool {
     #[cfg(windows)]
     {
-        use harness_sandbox::vmsandbox::{VmSandboxConfig, WorkspaceShareMode};
+        use harness_sandbox::tier3::vmsandbox::{VmSandboxConfig, WorkspaceShareMode};
 
         shell_tier.tier == harness_core::ShellTier::Tier3
             && VmSandboxConfig::default().workspace_share_mode == WorkspaceShareMode::Cifs
@@ -1317,7 +1317,7 @@ fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
 
 #[cfg(windows)]
 fn cow_session_is_live_checked(session_id: &str) -> bool {
-    harness_sandbox::workspace_ledger::cow_session_is_live(session_id)
+    harness_sandbox::tier2a::workspace_ledger::cow_session_is_live(session_id)
 }
 #[cfg(not(windows))]
 fn cow_session_is_live_checked(_session_id: &str) -> bool {
@@ -1483,7 +1483,7 @@ fn remove_fs_passthrough_grant_if_still_orphaned(path: &Path) {
 #[cfg(windows)]
 fn run_tier3_subcommand(action: Tier3Action) -> ExitCode {
     match action {
-        Tier3Action::Gc => match harness_sandbox::vmsandboxd::run_gc_only() {
+        Tier3Action::Gc => match harness_sandbox::tier3::vmsandboxd::run_gc_only() {
             Ok(reaped) => {
                 if reaped.is_empty() {
                     println!("(no orphaned Tier3 VMs found)");
@@ -1501,7 +1501,7 @@ fn run_tier3_subcommand(action: Tier3Action) -> ExitCode {
             }
         },
         Tier3Action::StopDaemon => {
-            match harness_sandbox::vmsandboxd::stop_resident_daemon_if_idle() {
+            match harness_sandbox::tier3::vmsandboxd::stop_resident_daemon_if_idle() {
                 Ok(true) => {
                     println!("Tier3 daemon is stopping");
                     ExitCode::SUCCESS
@@ -1542,7 +1542,7 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
                     e.granted_at_unix_secs
                 );
             }
-            let traverse_ledger = harness_sandbox::traverse_ledger::load_traverse_ledger();
+            let traverse_ledger = harness_sandbox::tier2a::traverse_ledger::load_traverse_ledger();
             println!("=== traverse grants (grant-traverse) ===");
             if traverse_ledger.entries.is_empty() {
                 println!("(none)");
@@ -1552,14 +1552,14 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
             }
             #[cfg(windows)]
             {
-                let workspace_ledger = harness_sandbox::workspace_ledger::load_workspace_ledger();
+                let workspace_ledger = harness_sandbox::tier2a::workspace_ledger::load_workspace_ledger();
                 println!("=== workspace grants (preflight) ===");
                 if workspace_ledger.entries.is_empty() {
                     println!("(none)");
                 }
                 for e in &workspace_ledger.entries {
                     let live =
-                        harness_sandbox::workspace_ledger::live_modes(&PathBuf::from(&e.path));
+                        harness_sandbox::tier2a::workspace_ledger::live_modes(&PathBuf::from(&e.path));
                     let status = if live.is_empty() {
                         "idle".to_string()
                     } else {
@@ -1609,7 +1609,7 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
         FsAction::RevokeWorkspaceAll => fs_revoke_workspace_all(),
         FsAction::RevokeTraverse { path } => fs_revoke_traverse_one(&path),
         FsAction::RevokeTraverseAll => {
-            let ledger = harness_sandbox::traverse_ledger::load_traverse_ledger();
+            let ledger = harness_sandbox::tier2a::traverse_ledger::load_traverse_ledger();
             if ledger.entries.is_empty() {
                 println!("(no traverse grants recorded)");
                 return ExitCode::SUCCESS;
@@ -1642,15 +1642,15 @@ fn run_fs_subcommand(action: FsAction) -> ExitCode {
 #[cfg(windows)]
 fn revoke_passthrough_outcome(
     path: &Path,
-    sid: &harness_sandbox::win_appcontainer::OwnedContainerSid,
+    sid: &harness_sandbox::tier2a::win_appcontainer::OwnedContainerSid,
     forced: bool,
-) -> harness_sandbox::win_appcontainer::RevokeOutcome {
+) -> harness_sandbox::tier2a::win_appcontainer::RevokeOutcome {
     if forced {
-        harness_sandbox::win_appcontainer::with_restore_privilege(|| {
-            harness_sandbox::win_appcontainer::revoke_passthrough(path, sid.as_psid())
+        harness_sandbox::tier2a::win_appcontainer::with_restore_privilege(|| {
+            harness_sandbox::tier2a::win_appcontainer::revoke_passthrough(path, sid.as_psid())
         })
     } else {
-        harness_sandbox::win_appcontainer::revoke_passthrough(path, sid.as_psid())
+        harness_sandbox::tier2a::win_appcontainer::revoke_passthrough(path, sid.as_psid())
     }
 }
 
@@ -1669,8 +1669,8 @@ fn ledger_forced_flag(path: &Path) -> bool {
 /// （検証パスが残件を見つけた場合は台帳に残し、次回再試行できるようにする）。
 #[cfg(windows)]
 fn fs_revoke_one(path: &Path) -> ExitCode {
-    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
-        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
+        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
     ) {
         Ok(sid) => sid,
         Err(e) => {
@@ -1679,7 +1679,7 @@ fn fs_revoke_one(path: &Path) -> ExitCode {
         }
     };
     let forced = ledger_forced_flag(path);
-    use harness_sandbox::win_appcontainer::RevokeOutcome;
+    use harness_sandbox::tier2a::win_appcontainer::RevokeOutcome;
     match revoke_passthrough_outcome(path, &sid, forced) {
         RevokeOutcome::FullyRevoked => {
             remove_fs_passthrough_grant(path);
@@ -1699,7 +1699,7 @@ fn fs_revoke_one(path: &Path) -> ExitCode {
     }
 
     // 本体内で完結しなかった（システム保護パスの可能性）→特権分離ヘルパーへ委譲する。
-    if harness_sandbox::privhelper::is_elevated() {
+    if harness_sandbox::tier2a::privhelper::is_elevated() {
         // 本体が既に管理者（§5.3、fs_grant_traverse_directと同じ考え方）: 直接再試行する。
         match revoke_passthrough_outcome(path, &sid, forced) {
             RevokeOutcome::FullyRevoked | RevokeOutcome::RootClearedDescendantsBlocked => {
@@ -1716,11 +1716,11 @@ fn fs_revoke_one(path: &Path) -> ExitCode {
             }
         }
     }
-    let revoke_entry = harness_sandbox::privhelper::FsAllowRevoke {
+    let revoke_entry = harness_sandbox::tier2a::privhelper::FsAllowRevoke {
         path: path.to_path_buf(),
         forced,
     };
-    match harness_sandbox::privhelper::run_privileged_revoke_fs_allow(vec![revoke_entry]) {
+    match harness_sandbox::tier2a::privhelper::run_privileged_revoke_fs_allow(vec![revoke_entry]) {
         Ok((revoked, root_cleared, failures)) => {
             let cleared = revoked.iter().chain(root_cleared.iter()).any(|p| p == path);
             // 撤収できたパス（root_cleared含む）は台帳から除去する。
@@ -1768,8 +1768,8 @@ fn revoke_fs_ledger_entries(
     note: &str,
     on_revoked: fn(&Path),
 ) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
-    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
-        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
+        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
     ) {
         Ok(sid) => sid,
         Err(e) => {
@@ -1784,8 +1784,8 @@ fn revoke_fs_ledger_entries(
         }
     };
 
-    use harness_sandbox::win_appcontainer::RevokeOutcome;
-    let mut remaining: Vec<harness_sandbox::privhelper::FsAllowRevoke> = Vec::new();
+    use harness_sandbox::tier2a::win_appcontainer::RevokeOutcome;
+    let mut remaining: Vec<harness_sandbox::tier2a::privhelper::FsAllowRevoke> = Vec::new();
     let mut revoked_paths: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let path = PathBuf::from(&entry.path);
@@ -1804,7 +1804,7 @@ fn revoke_fs_ledger_entries(
                 );
                 revoked_paths.push(path);
             }
-            RevokeOutcome::Failed => remaining.push(harness_sandbox::privhelper::FsAllowRevoke {
+            RevokeOutcome::Failed => remaining.push(harness_sandbox::tier2a::privhelper::FsAllowRevoke {
                 path,
                 forced: entry.forced,
             }),
@@ -1815,8 +1815,8 @@ fn revoke_fs_ledger_entries(
         return (revoked_paths, Vec::new());
     }
 
-    let escalated: Result<harness_sandbox::privhelper::FsAllowRevokeOutcome, String> =
-        if harness_sandbox::privhelper::is_elevated() {
+    let escalated: Result<harness_sandbox::tier2a::privhelper::FsAllowRevokeOutcome, String> =
+        if harness_sandbox::tier2a::privhelper::is_elevated() {
             // 本体が既に管理者: 直接再試行する（ヘルパーもUACも不要）。
             let mut revoked = Vec::new();
             let mut root_cleared = Vec::new();
@@ -1835,7 +1835,7 @@ fn revoke_fs_ledger_entries(
             }
             Ok((revoked, root_cleared, failures))
         } else {
-            harness_sandbox::privhelper::run_privileged_revoke_fs_allow(remaining.clone())
+            harness_sandbox::tier2a::privhelper::run_privileged_revoke_fs_allow(remaining.clone())
                 .map_err(|e| e.to_string())
         };
 
@@ -1946,8 +1946,8 @@ fn reconcile_fs_ledger_for_workspace(
 /// BUG-011）。
 #[cfg(windows)]
 fn fs_grant_traverse_preview(target: &Path) -> ExitCode {
-    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
-        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
+        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
     ) {
         Ok(sid) => sid,
         Err(e) => {
@@ -1955,7 +1955,7 @@ fn fs_grant_traverse_preview(target: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let preview = harness_sandbox::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
+    let preview = harness_sandbox::tier2a::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
     println!("=== grant-traverse --dry-run: {} ===", target.display());
     println!("(read-only: no ACE has been written, no UAC prompt was shown)");
     for node in &preview {
@@ -1993,14 +1993,14 @@ fn fs_grant_traverse(target: &Path) -> ExitCode {
     // 既にFILE_TRAVERSE|FILE_READ_ATTRIBUTESを持っているなら、privhelperもUACも一切呼ばず
     // 即座に成功する。`preview_traverse_chain`は`--dry-run`が使うのと同じ読み取り専用ヘルパで、
     // `WRITE_DAC`もUACも要らない。
-    if let Ok(sid) = harness_sandbox::win_appcontainer::ensure_profile(
-        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    if let Ok(sid) = harness_sandbox::tier2a::win_appcontainer::ensure_profile(
+        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
     ) {
         let preview =
-            harness_sandbox::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
+            harness_sandbox::tier2a::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
         if !preview.is_empty() && preview.iter().all(|node| node.already_sufficient) {
             for node in &preview {
-                harness_sandbox::traverse_ledger::record_traverse_grant(&node.path);
+                harness_sandbox::tier2a::traverse_ledger::record_traverse_grant(&node.path);
             }
             println!(
                 "grant-traverse: all {} ancestor node(s) already have \
@@ -2016,17 +2016,17 @@ fn fs_grant_traverse(target: &Path) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     }
-    if harness_sandbox::privhelper::is_elevated() {
+    if harness_sandbox::tier2a::privhelper::is_elevated() {
         return fs_grant_traverse_direct(target);
     }
-    match harness_sandbox::privhelper::run_privileged(
-        &harness_sandbox::privhelper::PrivilegedRequest::GrantTraverse {
+    match harness_sandbox::tier2a::privhelper::run_privileged(
+        &harness_sandbox::tier2a::privhelper::PrivilegedRequest::GrantTraverse {
             target: target.to_path_buf(),
         },
     ) {
         Ok(granted) => {
             for node in &granted {
-                harness_sandbox::traverse_ledger::record_traverse_grant(node);
+                harness_sandbox::tier2a::traverse_ledger::record_traverse_grant(node);
             }
             println!(
                 "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES via privilege-separation helper \
@@ -2044,12 +2044,12 @@ fn fs_grant_traverse(target: &Path) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Err(harness_sandbox::privhelper::PrivHelperError::PartialGrantChain {
+        Err(harness_sandbox::tier2a::privhelper::PrivHelperError::PartialGrantChain {
             granted,
             reason,
         }) => {
             for node in &granted {
-                harness_sandbox::traverse_ledger::record_traverse_grant(node);
+                harness_sandbox::tier2a::traverse_ledger::record_traverse_grant(node);
             }
             eprintln!(
                 "grant-traverse chain partially failed for {}: {reason}. {} node(s) that DID \
@@ -2077,8 +2077,8 @@ fn fs_grant_traverse(target: &Path) -> ExitCode {
 /// 管理者で起動されたこと自体を警告する」に対応)。
 #[cfg(windows)]
 fn fs_grant_traverse_direct(target: &Path) -> ExitCode {
-    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
-        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
+        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
     ) {
         Ok(sid) => sid,
         Err(e) => {
@@ -2087,9 +2087,9 @@ fn fs_grant_traverse_direct(target: &Path) -> ExitCode {
         }
     };
     let (granted, result) =
-        harness_sandbox::win_appcontainer::grant_traverse_chain(target, sid.as_psid());
+        harness_sandbox::tier2a::win_appcontainer::grant_traverse_chain(target, sid.as_psid());
     for node in &granted {
-        harness_sandbox::traverse_ledger::record_traverse_grant(node);
+        harness_sandbox::tier2a::traverse_ledger::record_traverse_grant(node);
     }
     match result {
         Ok(()) => {
@@ -2140,16 +2140,16 @@ fn fs_grant_traverse(_target: &Path) -> ExitCode {
 /// 本体が既に昇格済みなら直接、それ以外は特権分離ヘルパー（D-16）経由で実行する。
 #[cfg(windows)]
 fn fs_revoke_traverse_one(path: &Path) -> ExitCode {
-    if harness_sandbox::privhelper::is_elevated() {
+    if harness_sandbox::tier2a::privhelper::is_elevated() {
         return fs_revoke_traverse_one_direct(path);
     }
-    match harness_sandbox::privhelper::run_privileged(
-        &harness_sandbox::privhelper::PrivilegedRequest::RevokeTraverse {
+    match harness_sandbox::tier2a::privhelper::run_privileged(
+        &harness_sandbox::tier2a::privhelper::PrivilegedRequest::RevokeTraverse {
             path: path.to_path_buf(),
         },
     ) {
         Ok(_) => {
-            harness_sandbox::traverse_ledger::remove_traverse_grant(path);
+            harness_sandbox::tier2a::traverse_ledger::remove_traverse_grant(path);
             println!(
                 "revoked traverse ACE via privilege-separation helper: {}",
                 path.display()
@@ -2165,8 +2165,8 @@ fn fs_revoke_traverse_one(path: &Path) -> ExitCode {
 
 #[cfg(windows)]
 fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
-    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
-        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
+        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
     ) {
         Ok(sid) => sid,
         Err(e) => {
@@ -2174,13 +2174,13 @@ fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = harness_sandbox::win_appcontainer::revoke_ace(path, sid.as_psid()) {
+    if let Err(e) = harness_sandbox::tier2a::win_appcontainer::revoke_ace(path, sid.as_psid()) {
         eprintln!("revoke-traverse failed for {}: {e}", path.display());
         return ExitCode::FAILURE;
     }
-    match harness_sandbox::win_appcontainer::assert_no_sid_ace(path, sid.as_psid()) {
+    match harness_sandbox::tier2a::win_appcontainer::assert_no_sid_ace(path, sid.as_psid()) {
         Ok(()) => {
-            harness_sandbox::traverse_ledger::remove_traverse_grant(path);
+            harness_sandbox::tier2a::traverse_ledger::remove_traverse_grant(path);
             println!("revoked traverse ACE: {}", path.display());
             ExitCode::SUCCESS
         }
@@ -2202,7 +2202,7 @@ fn fs_revoke_traverse_one(_path: &Path) -> ExitCode {
 
 /// workspace本体のACE（`preflight`が毎回付与するRWX/RO）を撤収する。名前付きmutexで
 /// 「今もこのworkspaceを使っている他のharnessセッションが無いか」を確認してから撤収する
-/// （`harness_sandbox::workspace_ledger`参照）。CoWのupper_dirには一切触れない。
+/// （`harness_sandbox::tier2a::workspace_ledger`参照）。CoWのupper_dirには一切触れない。
 #[cfg(windows)]
 fn fs_revoke_workspace(path: &Path) -> ExitCode {
     let canonical = match path.canonicalize() {
@@ -2212,7 +2212,7 @@ fn fs_revoke_workspace(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let live = harness_sandbox::workspace_ledger::live_modes(&canonical);
+    let live = harness_sandbox::tier2a::workspace_ledger::live_modes(&canonical);
     if !live.is_empty() {
         eprintln!(
             "workspace {} is still in use by another harness session (mode(s): {}); refusing \
@@ -2222,8 +2222,8 @@ fn fs_revoke_workspace(path: &Path) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let sid = match harness_sandbox::win_appcontainer::ensure_profile(
-        harness_sandbox::win_appcontainer::CONTAINER_NAME,
+    let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
+        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
     ) {
         Ok(sid) => sid,
         Err(e) => {
@@ -2231,9 +2231,9 @@ fn fs_revoke_workspace(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match harness_sandbox::win_appcontainer::revoke_ace_recursive(&canonical, sid.as_psid()) {
+    match harness_sandbox::tier2a::win_appcontainer::revoke_ace_recursive(&canonical, sid.as_psid()) {
         Ok(()) => {
-            harness_sandbox::workspace_ledger::remove_workspace_entry(&canonical);
+            harness_sandbox::tier2a::workspace_ledger::remove_workspace_entry(&canonical);
             println!("revoked workspace access: {}", canonical.display());
             ExitCode::SUCCESS
         }
@@ -2257,7 +2257,7 @@ fn fs_revoke_workspace(_path: &Path) -> ExitCode {
 /// スキップし、それ以外を撤収する。
 #[cfg(windows)]
 fn fs_revoke_workspace_all() -> ExitCode {
-    let ledger = harness_sandbox::workspace_ledger::load_workspace_ledger();
+    let ledger = harness_sandbox::tier2a::workspace_ledger::load_workspace_ledger();
     if ledger.entries.is_empty() {
         println!("(no workspace grants recorded)");
         return ExitCode::SUCCESS;
@@ -2265,7 +2265,7 @@ fn fs_revoke_workspace_all() -> ExitCode {
     let mut any_failed = false;
     for entry in &ledger.entries {
         let path = PathBuf::from(&entry.path);
-        let live = harness_sandbox::workspace_ledger::live_modes(&path);
+        let live = harness_sandbox::tier2a::workspace_ledger::live_modes(&path);
         if !live.is_empty() {
             println!(
                 "skipping {} (in use by another harness session, mode(s): {})",
@@ -2307,7 +2307,7 @@ fn run_cow_subcommand(_action: CowAction) -> ExitCode {
 
 #[cfg(windows)]
 fn cow_upper_dir_for(session_id: &str) -> Option<PathBuf> {
-    harness_sandbox::workspace_ledger::cow_upper_root().map(|root| root.join(session_id))
+    harness_sandbox::tier2a::workspace_ledger::cow_upper_root().map(|root| root.join(session_id))
 }
 
 /// `harness cow audit`: `.harness-cow-denied.jsonl`（Phase 4、設計書§19.8）を表示する。
@@ -2348,7 +2348,7 @@ fn cow_audit(session: Option<&str>, output_format: OutputFormat) -> ExitCode {
 
 #[cfg(windows)]
 fn cow_list() -> ExitCode {
-    let sessions = harness_sandbox::workspace_ledger::list_cow_sessions();
+    let sessions = harness_sandbox::tier2a::workspace_ledger::list_cow_sessions();
     if sessions.is_empty() {
         println!("(no CoW upper directories found)");
         return ExitCode::SUCCESS;
@@ -2357,9 +2357,9 @@ fn cow_list() -> ExitCode {
         let Some(upper_dir) = cow_upper_dir_for(&session_id) else {
             continue;
         };
-        let live = harness_sandbox::workspace_ledger::cow_session_is_live(&session_id);
-        let files = harness_sandbox::workspace_ledger::list_cow_upper_files(&upper_dir);
-        let workspace_root = harness_sandbox::workspace_ledger::read_cow_session_meta(&upper_dir)
+        let live = harness_sandbox::tier2a::workspace_ledger::cow_session_is_live(&session_id);
+        let files = harness_sandbox::tier2a::workspace_ledger::list_cow_upper_files(&upper_dir);
+        let workspace_root = harness_sandbox::tier2a::workspace_ledger::read_cow_session_meta(&upper_dir)
             .map(|m| m.workspace_root)
             .unwrap_or_else(|| "(unknown, meta file missing)".to_string());
         println!(
@@ -2380,7 +2380,7 @@ fn resolve_cow_upper_dir(session: Option<&str>) -> Option<PathBuf> {
         let dir = cow_upper_dir_for(id)?;
         return if dir.exists() { Some(dir) } else { None };
     }
-    let root = harness_sandbox::workspace_ledger::cow_upper_root()?;
+    let root = harness_sandbox::tier2a::workspace_ledger::cow_upper_root()?;
     let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
     let entries = std::fs::read_dir(&root).ok()?;
     for entry in entries.flatten() {
@@ -2409,7 +2409,7 @@ async fn main() -> ExitCode {
     // 「本体が管理者ならヘルパー経由でない直接呼び出しに倒れていないか」を明示的に確認する
     // 材料として警告ログを残す。拒否はしない。
     #[cfg(windows)]
-    if harness_sandbox::privhelper::is_elevated() {
+    if harness_sandbox::tier2a::privhelper::is_elevated() {
         eprintln!(
             "warning: harness is running with an elevated (administrator) token. harness is \
              designed to always run as a non-administrator process; privileged operations \
@@ -2795,9 +2795,9 @@ async fn main() -> ExitCode {
     // パイプは未使用のまま閉じるか、`NetfilterHandle::start`の直接起動へ切り替える
     // （下記`net_wfp`解決を参照）。
     #[cfg(windows)]
-    let wfp_prelude: Option<harness_sandbox::netfilterd::PreparedPipe> =
+    let wfp_prelude: Option<harness_sandbox::tier2a::netfilterd::PreparedPipe> =
         if net_proxy.domain_policy_enabled {
-            match harness_sandbox::netfilterd::prepare_pipe() {
+            match harness_sandbox::tier2a::netfilterd::prepare_pipe() {
                 Ok(prepared) => Some(prepared),
                 Err(e) => {
                     eprintln!(
@@ -2900,7 +2900,7 @@ async fn main() -> ExitCode {
     // WFPシナリオ(A)/(B)/(C)の最終確定。`shell_tier`が実際にTier2aへ着地し、かつ
     // 許可ドメインがあるときだけ有効化する。
     #[cfg(windows)]
-    let net_wfp: Option<harness_sandbox::netfilterd::NetfilterHandle> = {
+    let net_wfp: Option<harness_sandbox::tier2a::netfilterd::NetfilterHandle> = {
         let domain_policy_requested = net_proxy.domain_policy_enabled;
         let tier2a_domain_policy =
             shell_tier.tier == harness_core::ShellTier::Tier2a && domain_policy_requested;
@@ -2922,9 +2922,9 @@ async fn main() -> ExitCode {
             // シナリオ(A): privhelperが既に連鎖起動を試みている。同じパイプでハンドシェイクする。
             match wfp_prelude {
                 Some(prepared) => {
-                    match harness_sandbox::netfilterd::NetfilterHandle::connect_after_chain_launch(
+                    match harness_sandbox::tier2a::netfilterd::NetfilterHandle::connect_after_chain_launch(
                         prepared.into_handle(),
-                        harness_sandbox::netfilterd::NetfilterPolicy {
+                        harness_sandbox::tier2a::netfilterd::NetfilterPolicy {
                             allow_domains: Vec::new(),
                             allow_loopback: false,
                             allow_loopback_ports: Vec::new(),
@@ -2952,8 +2952,8 @@ async fn main() -> ExitCode {
             // 投機的パイプは使わない（`NetfilterHandle::start`が自前で新規パイプを作るため）、
             // dropして自動的に閉じる。
             drop(wfp_prelude);
-            match harness_sandbox::netfilterd::NetfilterHandle::start(
-                harness_sandbox::netfilterd::NetfilterPolicy {
+            match harness_sandbox::tier2a::netfilterd::NetfilterHandle::start(
+                harness_sandbox::tier2a::netfilterd::NetfilterPolicy {
                     allow_domains: Vec::new(),
                     allow_loopback: false,
                     allow_loopback_ports: Vec::new(),
@@ -3105,7 +3105,7 @@ async fn main() -> ExitCode {
             // 同様の役割を果たす、`crates/harness-tui/src/lib.rs`参照）。
             #[cfg(windows)]
             let vm_sandbox_handle: Option<
-                std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>,
+                std::sync::Arc<harness_sandbox::tier3::vmsandboxd::VmSandboxHandle>,
             > = if tool_ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
                 start_tier3_with_progress(
                     &tool_ctx.workspace_root,
@@ -3217,7 +3217,7 @@ async fn main() -> ExitCode {
 
 /// 非対話モード（`--print`）専用: Tier3 VMサンドボックスの起動をブロッキングのまま
 /// （`tokio::task::spawn_blocking`越しに）待ちつつ、`vmsandboxd_progress`の合成進捗
-/// （経過時間ベースの推測、daemonの実測値ではない——`harness_sandbox::vmsandboxd_progress`の
+/// （経過時間ベースの推測、daemonの実測値ではない——`harness_sandbox::tier3::vmsandboxd_progress`の
 /// モジュールdoc・`plans/DESIGN-SANDBOX-VMISOLATION.md`参照）をstderrへ間引いて出力する。
 /// TUI分岐（`harness_tui::run`内の`sandbox_prep::run_prep_screen`）と対になる非対話側の実装。
 #[cfg(windows)]
@@ -3226,9 +3226,9 @@ async fn start_tier3_with_progress(
     allow_domains: &[String],
     tier3_warm: bool,
     tier3_max_sessions: u8,
-) -> Option<std::sync::Arc<harness_sandbox::vmsandboxd::VmSandboxHandle>> {
-    use harness_sandbox::vmsandboxd::VmSandboxHandle;
-    use harness_sandbox::vmsandboxd_progress::{run_synthetic_ticker, SandboxPrepEvent};
+) -> Option<std::sync::Arc<harness_sandbox::tier3::vmsandboxd::VmSandboxHandle>> {
+    use harness_sandbox::tier3::vmsandboxd::VmSandboxHandle;
+    use harness_sandbox::tier3::vmsandboxd_progress::{run_synthetic_ticker, SandboxPrepEvent};
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SandboxPrepEvent>();
     let ticker = tokio::spawn(run_synthetic_ticker(tx, tier3_warm));

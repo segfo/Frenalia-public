@@ -57,7 +57,7 @@ use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLE
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use crate::shell_tier::FsAccess;
-use crate::win_appcontainer::{self, AppContainerError, CONTAINER_NAME};
+use crate::tier2a::win_appcontainer::{self, AppContainerError, CONTAINER_NAME};
 use crate::win_common::wide;
 
 /// ヘルパーへ委譲する操作。自由形式のコマンド文字列ではなく固定スキーマに限定する（D-16）。

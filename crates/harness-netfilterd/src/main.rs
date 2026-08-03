@@ -17,7 +17,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    match harness_sandbox::netfilterd::serve(&pipe_name) {
+    match harness_sandbox::tier2a::netfilterd::serve(&pipe_name) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("harness-netfilterd: {e}");

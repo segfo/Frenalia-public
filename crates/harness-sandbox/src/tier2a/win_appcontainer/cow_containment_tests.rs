@@ -217,7 +217,7 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
         "ext-write"
     );
 
-    let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
     let entry = ledger
         .iter()
         .find(|c| c.path == original)
@@ -788,7 +788,7 @@ fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
     );
     assert_eq!(upper_content, "mmapwrt!");
 
-    let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
     let important = ledger
         .iter()
         .find(|c| c.path == "important.txt")
@@ -847,7 +847,7 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
         .expect("child should run to completion");
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
 
-    let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
     let important = ledger
         .iter()
         .find(|c| c.path == "important.txt")
@@ -896,7 +896,7 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
         "created-single"
     );
 
-    let ledger_after = crate::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger_after = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
     assert!(
         ledger_after.is_empty(),
         "applied entries must be pruned from the ledger: {ledger_after:?}"
@@ -1002,7 +1002,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
         .expect("child B should run to completion");
     assert_eq!(code_b, 0, "stdout={stdout_b} stderr={stderr_b}");
 
-    let ledger_a = crate::workspace_ledger::read_cow_ledger(upper_a.path());
+    let ledger_a = crate::tier2a::workspace_ledger::read_cow_ledger(upper_a.path());
     assert_eq!(
         ledger_a.iter().find(|c| c.path == "important.txt").unwrap().op,
         ManifestOp::Modify
@@ -1015,7 +1015,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
         std::fs::read_to_string(upper_a.path().join("new.txt")).unwrap(),
         "created-by-a"
     );
-    let ledger_b = crate::workspace_ledger::read_cow_ledger(upper_b.path());
+    let ledger_b = crate::tier2a::workspace_ledger::read_cow_ledger(upper_b.path());
     assert_eq!(
         ledger_b.iter().find(|c| c.path == "important.txt").unwrap().op,
         ManifestOp::Modify
@@ -1141,7 +1141,7 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
         .expect("child should run to completion");
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
 
-    let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
     let old_entry = ledger
         .iter()
         .find(|c| c.path == "old.txt")
@@ -1239,7 +1239,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
         .expect("child should run to completion");
     assert_eq!(code1, 0, "stdout={stdout1} stderr={stderr1}");
 
-    let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
     let entry = ledger
         .iter()
         .find(|c| c.path == "doomed.txt")
@@ -1690,7 +1690,7 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
             assert_upper_reflects_tag(upper.path(), tag, injected[i]);
         }
 
-        let ledger = crate::workspace_ledger::read_cow_ledger(upper.path());
+        let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
         for (i, tag) in tags.iter().enumerate() {
             assert_ledger_for_tag(&ledger, tag, injected[i]);
         }

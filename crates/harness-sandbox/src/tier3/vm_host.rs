@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::vmsandbox::{
+use crate::tier3::vmsandbox::{
     reset_known_hosts_file, run_powershell, wait_for_guest_ready, EgressSession, IncusClient,
     VmError, VmSandboxConfig,
 };
@@ -70,7 +70,7 @@ enum VmHostState {
         warm: bool,
         /// 現在出口を構成している全アクティブセッション（`slot` -> (コンテナIP,
         /// 許可ドメイン一覧)）。`configure_egress`/`release_egress`がこの集合全体から
-        /// nginx/nftables設定を毎回再生成する（A-8是正、`crate::vmsandbox::apply_egress_ruleset`
+        /// nginx/nftables設定を毎回再生成する（A-8是正、`crate::tier3::vmsandbox::apply_egress_ruleset`
         /// のdoc参照）。
         egress_sessions: HashMap<u8, (String, Vec<String>)>,
     },
@@ -107,8 +107,8 @@ impl VmHost {
                 // 明示的にcold要求: parkされたVM/checkpointは今回使わないため完全撤収して
                 // からStoppedパスへフォールスルーする（コード重複を避けるため再帰する）。
                 let diff_vhdx = resident_diff_vhdx_path(config);
-                let _ = crate::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
-                crate::vm_ledger::remove_vm_host();
+                let _ = crate::tier3::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
+                crate::tier3::vm_ledger::remove_vm_host();
                 *guard = VmHostState::Stopped;
                 drop(guard);
                 self.attach(config, warm)
@@ -118,7 +118,7 @@ impl VmHost {
                 // 同一daemonプロセス内での状態遷移であり、daemonクラッシュを経ていない
                 // （クラッシュ後の孤児回収はStopped分岐が担う）。
                 let (incus, diff_vhdx, actually_warm) = boot_resident_vm(config, true)?;
-                crate::vm_ledger::record_vm_host(RESIDENT_VM_NAME, &diff_vhdx, std::process::id());
+                crate::tier3::vm_ledger::record_vm_host(RESIDENT_VM_NAME, &diff_vhdx, std::process::id());
                 let result = incus.clone();
                 *guard = VmHostState::Running {
                     incus,
@@ -135,10 +135,10 @@ impl VmHost {
                 // 「現在アクティブなセッションはゼロ」が確定している。前回セッションが
                 // daemonクラッシュ等で撤収できず残した孤児（同名の常駐VM）を、固定静的IP
                 // 衝突を避けるため新規起動前に必ず撤収する。
-                let _ = crate::vmsandbox::gc_orphan_sessions(config, "");
+                let _ = crate::tier3::vmsandbox::gc_orphan_sessions(config, "");
 
                 let (incus, diff_vhdx, actually_warm) = boot_resident_vm(config, warm)?;
-                crate::vm_ledger::record_vm_host(RESIDENT_VM_NAME, &diff_vhdx, std::process::id());
+                crate::tier3::vm_ledger::record_vm_host(RESIDENT_VM_NAME, &diff_vhdx, std::process::id());
                 let result = incus.clone();
                 *guard = VmHostState::Running {
                     incus,
@@ -199,8 +199,8 @@ impl VmHost {
                 }
             }
         }
-        let _ = crate::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
-        crate::vm_ledger::remove_vm_host();
+        let _ = crate::tier3::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
+        crate::tier3::vm_ledger::remove_vm_host();
         *guard = VmHostState::Stopped;
     }
 
@@ -226,7 +226,7 @@ impl VmHost {
         };
         egress_sessions.insert(slot, (container_ip, allow_domains));
         let active = egress_sessions_snapshot(egress_sessions);
-        crate::vmsandbox::apply_egress_ruleset(config.guest_ip, ssh_key, &active)
+        crate::tier3::vmsandbox::apply_egress_ruleset(config.guest_ip, ssh_key, &active)
     }
 
     /// セッション終了時、このセッション（`slot`）分の出口設定を集合から取り除き、残った
@@ -247,7 +247,7 @@ impl VmHost {
         };
         egress_sessions.remove(&slot);
         let active = egress_sessions_snapshot(egress_sessions);
-        crate::vmsandbox::apply_egress_ruleset(config.guest_ip, ssh_key, &active)
+        crate::tier3::vmsandbox::apply_egress_ruleset(config.guest_ip, ssh_key, &active)
     }
 
     /// 現在アタッチ中（refcount > 0）かどうか。テスト・診断専用。
@@ -340,7 +340,7 @@ Start-VM -Name '{name}'
         Err(e) => {
             // 実機E2Eで発見済みの教訓（`VmSession::start`の旧コメント参照）: ここで失敗した
             // VMを孤児のまま残すと、固定静的IPの制約上次回起動が必ずIP重複で壊れる。
-            let _ = crate::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
+            let _ = crate::tier3::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
             Err(e)
         }
     }
@@ -416,7 +416,7 @@ fn ensure_warm_template(config: &VmSandboxConfig) -> Result<(), VmError> {
     std::fs::create_dir_all(&config.vm_work_dir)?;
 
     // 前回の途中失敗（checkpoint作成前にVMだけ残った等）の後始末。存在しなければ無害に失敗する。
-    let _ = crate::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
+    let _ = crate::tier3::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
 
     let script = format!(
         r#"
@@ -437,7 +437,7 @@ Start-VM -Name '{name}'
     run_powershell(&script)?;
 
     if let Err(e) = wait_for_guest_ready(config, COLD_BOOT_GUEST_WAIT) {
-        let _ = crate::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
+        let _ = crate::tier3::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
         return Err(e);
     }
 
@@ -446,7 +446,7 @@ Start-VM -Name '{name}'
         name = RESIDENT_VM_NAME,
         checkpoint = RESIDENT_CHECKPOINT_NAME,
     )) {
-        let _ = crate::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
+        let _ = crate::tier3::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
         return Err(e);
     }
 
@@ -457,7 +457,7 @@ Start-VM -Name '{name}'
 /// 呼び出しで最初からやり直す。
 fn discard_warm_template(config: &VmSandboxConfig) {
     let diff_vhdx = resident_diff_vhdx_path(config);
-    let _ = crate::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
+    let _ = crate::tier3::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
 }
 
 #[cfg(test)]
