@@ -1,0 +1,95 @@
+//! フェーズ別のシステムプロンプト。`plans/DESIGN-COGNITION.md` §6.1
+//! 「フェーズ（ロール）毎に専用の**小さな**システムプロンプト」。
+//!
+//! # 「言語解釈者」としての指示
+//!
+//! どのプロンプトも、モデルへ**小さな解釈タスク1つ**だけを渡す（§0基本思想）。
+//! 「次はこうして」というフロー誘導は書かない——遷移権限はハーネスの状態機械
+//! （M15の`HivEngine`）にあり、プロンプトで祈らないのが設計の要だから。
+//!
+//! 日本語なのは`harness_core::render_environment_prompt`（環境事実）と揃えるため。
+//! 1コールのシステムプロンプトはこの2枚（フェーズ役割 + 必要なら環境事実）だけになる。
+
+use harness_core::Phase;
+
+/// そのフェーズの役割プロンプト。
+pub fn system_prompt(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Orient => {
+            "あなたは調査の状況把握を担当する。与えられたゴールと、これまでに確証された事実だけを見て、\
+             (1) ゴールを検証可能な形へ言い換え、(2) 完了条件を列挙し、(3) まだ分かっていないことを洗い出す。\
+             推測で事実を補わない。分かっていないことは「分かっていない」と書く。"
+        }
+        Phase::Hypothesize => {
+            "あなたは仮説を立てる担当である。ゴールと未知の事項から、原因または解決方針の仮説を立てる。\
+             各仮説には必ず**反証条件**（何が観測されればその仮説が偽だと分かるか）を付ける。\
+             反証条件を書けない主張は仮説ではないので出さない。confidenceは調査の優先順位付けにのみ使われる、\
+             自己申告の目安である。"
+        }
+        Phase::Investigate => {
+            "あなたは調査計画を立てる担当である。対象の仮説とその反証条件を見て、\
+             どの情報源に何を問い合わせれば**反証条件を判定できるか**を計画する。\
+             各ステップには、何が見えることを期待しているか（expects）を書く。\
+             仮説を支持する証拠より先に、反証しうる観測を取りに行く。"
+        }
+        Phase::Distill => {
+            "あなたはツール出力から事実を蒸留する担当である。与えられた生出力から、\
+             対象の仮説と反証条件に**関係する事実だけ**を短く抜き出す。\
+             生出力に書かれていないことを足さない。解釈や推測を事実として書かない。\
+             関係する記述が無ければ空で返す。"
+        }
+        Phase::Verify => {
+            "あなたは仮説を検証する担当である。まず**反証を試みる**。集められた証拠が反証条件を\
+             満たしていないか、支持する証拠が本当に仮説を支持しているかを見る。\
+             判定できるだけの観測が揃っていなければinconclusiveとし、何が足りないかをmissingに書く。\
+             証拠に書かれていないことを根拠にしない。"
+        }
+        Phase::Critic => {
+            "あなたは結論を批判する担当である。与えられた仮説と検証結果に対し、\
+             **反証を試みることだけ**を行う。最も弱い根拠を指摘し、それを覆すにはどんな観測が\
+             必要かを述べる。同意することが仕事ではない。結論を追認しない。"
+        }
+        Phase::Decide => {
+            "あなたは行動を決める担当である。確証済みの仮説だけを根拠に、ゴールを達成するための\
+             次の行動を1つ決める。合わせて、その行動が効いたかをどう確かめるか（then_verify）を書く。\
+             確証されていない仮説を根拠にしない。"
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 全フェーズにプロンプトがあり、かつ**小さい**こと（§6.1）。
+    /// 役割プロンプトが肥大すると、小トークン多コール設計の前提が崩れる。
+    #[test]
+    fn every_phase_has_a_small_role_prompt() {
+        for phase in Phase::ALL {
+            let p = system_prompt(phase);
+            assert!(!p.is_empty(), "{phase}");
+            let chars = p.chars().count();
+            assert!(chars < 400, "{phase}: role prompt is {chars} chars");
+        }
+    }
+
+    /// フェーズごとに違う指示であること（コピペで同じ文面になっていないか）。
+    #[test]
+    fn phase_prompts_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for phase in Phase::ALL {
+            assert!(
+                seen.insert(system_prompt(phase)),
+                "duplicate prompt for {phase}"
+            );
+        }
+    }
+
+    /// 反証優先（§3.4）が、仮説・検証・批判の3フェーズで明示されていること。
+    #[test]
+    fn falsification_first_is_stated_where_it_matters() {
+        assert!(system_prompt(Phase::Hypothesize).contains("反証条件"));
+        assert!(system_prompt(Phase::Verify).contains("反証"));
+        assert!(system_prompt(Phase::Critic).contains("反証"));
+    }
+}

@@ -53,6 +53,15 @@ impl LlmProvider for AnthropicProvider {
         &self,
         req: CompletionRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        // 構造化出力の写像はここで決まる（`harness_core::schema`が唯一の判断点）。
+        // Anthropicは`native_json_schema:false`なので、スキーマ強制は「スキーマを
+        // input_schemaとする単一ツール + tool_choice強制」へ降格し、`req.output`は消える。
+        // `req.output`が`None`のときは`req`を一切書き換えないので、既存の全経路は不変。
+        //
+        // `schema_with_thinking:false`（thinking有効時はtool_choice強制が400）への対応は
+        // 不要。このアダプタはthinkingを一切リクエストへ載せていないため、強制と衝突しない。
+        let mut req = req;
+        let strategy = harness_core::apply_schema_strategy(&mut req, &self.capabilities());
         let body = to_wire_request(&req);
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
@@ -150,7 +159,15 @@ impl LlmProvider for AnthropicProvider {
             }
         };
 
-        Ok(Box::pin(s))
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> = Box::pin(s);
+        // ツール強制降格を採った場合だけ、応答の`tool_use`ブロックをテキストへ戻す
+        // （認知レイヤーからはnative経路と同じ形に見える）。
+        Ok(match strategy {
+            harness_core::SchemaStrategy::ForcedTool { name } => {
+                harness_core::unwrap_forced_tool_stream(stream, name)
+            }
+            _ => stream,
+        })
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -538,5 +555,51 @@ mod tests {
         assert_eq!(value["system"][0]["type"], "text");
         assert_eq!(value["system"][0]["text"], "system facts");
         assert_eq!(value["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// 契約テスト（`plans/DESIGN.md` §主なリスクと対策「structured output の3プロバイダ写像」の
+    /// **tool強制**経路）。Anthropicは`native_json_schema:false`なので、スキーマ強制は
+    /// 「スキーマを`input_schema`とする単一ツール + `tool_choice:{type:tool}`」へ降格し、
+    /// その結果がワイヤ形式まで通ることを確認する。
+    #[test]
+    fn json_schema_contract_degrades_to_a_single_forced_tool() {
+        let mut req = CompletionRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            output: Some(harness_core::OutputContract::JsonSchema {
+                name: "verify_output".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "verdict": { "type": "string" } },
+                    "required": ["verdict"],
+                    "additionalProperties": false
+                }),
+                strict: true,
+            }),
+            parallel_tool_calls: None,
+            max_tokens: 100,
+            sampling: Default::default(),
+            model: "claude-test".to_string(),
+        };
+
+        let caps = AnthropicProvider::new("k").capabilities();
+        let strategy = harness_core::apply_schema_strategy(&mut req, &caps);
+        assert_eq!(
+            strategy,
+            harness_core::SchemaStrategy::ForcedTool {
+                name: "verify_output".to_string()
+            }
+        );
+
+        let value = serde_json::to_value(to_wire_request(&req)).unwrap();
+        assert_eq!(value["tools"][0]["name"], "verify_output");
+        assert_eq!(
+            value["tools"][0]["input_schema"]["properties"]["verdict"]["type"],
+            "string"
+        );
+        assert_eq!(value["tool_choice"]["type"], "tool");
+        assert_eq!(value["tool_choice"]["name"], "verify_output");
     }
 }

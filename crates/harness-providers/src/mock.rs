@@ -55,6 +55,14 @@ impl MockProvider {
         self.record_path = Some(path);
         self
     }
+
+    /// 能力表明を差し替える。`OutputContract`の写像（`harness_core::schema`）は
+    /// `ProviderCapabilities`で分岐するため、3戦略（native / ツール強制 / プロンプト埋込）を
+    /// テストから踏み分けるのに使う。
+    pub fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
 }
 
 #[async_trait]

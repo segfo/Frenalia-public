@@ -8,9 +8,10 @@ pub mod message;
 pub mod net_policy;
 pub mod prompt;
 pub mod provider;
+pub mod schema;
 pub mod tool;
 
-pub use cognition::CognitionLevel;
+pub use cognition::{CognitionLevel, Phase, TokenBudget};
 pub use config_injection::is_config_injection_path;
 pub use event::AgentEvent;
 pub use message::{ContentBlock, Message, Role};
@@ -23,6 +24,7 @@ pub use provider::{
     BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities, ProviderError,
     Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
 };
+pub use schema::{apply_schema_strategy, unwrap_forced_tool_stream, SchemaStrategy};
 pub use tool::{
     NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, RequireSandbox, RiskClass, ShellTier,
     ShellTierSelection, StagingConfig, StagingMode, TlsInspection, Tool, ToolCtx, ToolError,

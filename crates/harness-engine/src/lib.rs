@@ -48,7 +48,11 @@ pub(crate) fn emit(events: Option<&EventSink>, ev: AgentEvent) {
 /// （chars/4）。`AgentEvent::TurnStarted.estimated_input_tokens`用（TUIのリアルタイム表示、
 /// §リッチTUI「ライブ表示」）。プロバイダの正確なinputトークン数は`TurnCompleted`の
 /// `usage.input`でしか分からないため、送信直後にひとまず出す概算値に過ぎない。
-fn estimate_tokens(req: &CompletionRequest) -> u64 {
+///
+/// 認知レイヤーの`ContextAssembler`（M14）も**同じ推定器**でフェーズ別予算を会計する。
+/// TUI表示と予算会計がずれないようにするためで、推定器のコピーを作らない
+/// （`docs/CODE-STRUCTURE-RULES.md` 規則5）。
+pub fn estimate_tokens(req: &CompletionRequest) -> u64 {
     serde_json::to_string(req)
         .map(|s| (s.chars().count() as u64) / 4)
         .unwrap_or(0)

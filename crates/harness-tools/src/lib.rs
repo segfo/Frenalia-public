@@ -91,6 +91,15 @@ impl ToolRegistry {
     pub fn to_specs_for_ctx(&self, ctx: &ToolCtx) -> Vec<ToolSpec> {
         self.tools.values().map(|t| t.spec_for_ctx(ctx)).collect()
     }
+
+    /// 登録済みツールを走査する。認知レイヤーの`ContextAssembler`（M14）が、フェーズごとに
+    /// `RiskClass`で候補集合を絞る（§7.3 ToolGate）ために使う。
+    ///
+    /// **反復順は不定**（内部が`HashMap`）。決定的な順序が要る呼び出し側は自分で並べること。
+    /// `get`が既に`&Arc<dyn Tool>`を公開しているので、これで到達可能性は増えない。
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
+        self.tools.values()
+    }
 }
 
 /// `WorkspaceJail`のエラーを`ToolError`へ写像する共通ヘルパー。全fs系ツールから使う。

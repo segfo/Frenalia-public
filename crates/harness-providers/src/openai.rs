@@ -21,8 +21,8 @@ use futures::stream::{BoxStream, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use harness_core::{
-    BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderCapabilities,
-    ProviderError, Role, StopReason, StreamEvent, ToolChoice, ToolSpec, Usage,
+    BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, OutputContract,
+    ProviderCapabilities, ProviderError, Role, StopReason, StreamEvent, ToolChoice, ToolSpec, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -46,10 +46,24 @@ fn wire_log_append(path: &std::path::Path, value: &serde_json::Value) {
     }
 }
 
+/// 同じChat Completionsワイヤ形式を話すが、**能力表明が違う**系統。
+///
+/// `plans/DESIGN.md` §構造化出力: LMStudioのスキーマ強制はllama.cppのgrammar制約デコードで
+/// 実現されるため`tools`と併用できない（`schema xor tools`）。一方OpenAI Chat Completionsは
+/// 【T7】の通り`tools`と`response_format:json_schema`を併用できる。`ContextAssembler`は
+/// この差を`ProviderCapabilities.schema_with_tools`で見てコール分割の要否を決めるので、
+/// 同一アダプタでも系統を区別する必要がある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiFamily {
+    OpenAi,
+    LmStudio,
+}
+
 pub struct OpenAiProvider {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
+    family: OpenAiFamily,
 }
 
 impl OpenAiProvider {
@@ -62,13 +76,28 @@ impl OpenAiProvider {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url,
+            family: OpenAiFamily::OpenAi,
         }
     }
 
     /// §設定「LMStudio は単に `base_url=http://localhost:1234/v1` の openai-family プロファイル」。
     /// LMStudioは認証不要のため空キーで構わない（§プロバイダ抽象「LMStudioは空キー可」）。
+    ///
+    /// `id()`は`"openai"`のまま変えない（`--provider`の解決・既存ログの互換）。違うのは
+    /// [`OpenAiFamily`]に基づく能力表明だけ。
     pub fn lmstudio() -> Self {
-        Self::with_base_url(String::new(), DEFAULT_LMSTUDIO_BASE_URL.to_string())
+        Self {
+            family: OpenAiFamily::LmStudio,
+            ..Self::with_base_url(String::new(), DEFAULT_LMSTUDIO_BASE_URL.to_string())
+        }
+    }
+
+    /// LMStudioのbase_urlを差し替える（実機テスト用）。系統は`LmStudio`のまま。
+    pub fn lmstudio_with_base_url(base_url: String) -> Self {
+        Self {
+            family: OpenAiFamily::LmStudio,
+            ..Self::with_base_url(String::new(), base_url)
+        }
     }
 }
 
@@ -82,6 +111,10 @@ impl LlmProvider for OpenAiProvider {
         &self,
         req: CompletionRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        // 構造化出力の写像はここで決まる（`harness_core::schema`が唯一の判断点）。
+        // `req.output`が`None`のときは`req`を一切書き換えないので、既存の全経路は不変。
+        let mut req = req;
+        let strategy = harness_core::apply_schema_strategy(&mut req, &self.capabilities());
         let body = to_wire_request(&req);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
@@ -148,7 +181,15 @@ impl LlmProvider for OpenAiProvider {
             }
         };
 
-        Ok(Box::pin(s))
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> = Box::pin(s);
+        // ツール強制降格を採った場合だけ、応答の`tool_use`ブロックをテキストへ戻す
+        // （認知レイヤーからはnative経路と同じ形に見える）。
+        Ok(match strategy {
+            harness_core::SchemaStrategy::ForcedTool { name } => {
+                harness_core::unwrap_forced_tool_stream(stream, name)
+            }
+            _ => stream,
+        })
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -156,7 +197,8 @@ impl LlmProvider for OpenAiProvider {
             native_json_schema: true,
             forced_tool_choice: true,
             schema_with_thinking: true,
-            schema_with_tools: true,
+            // LMStudio（llama.cppのgrammar制約デコード）はスキーマとツールを併用できない。
+            schema_with_tools: self.family == OpenAiFamily::OpenAi,
             prompt_caching: true,
             context_window: 128_000,
         }
@@ -186,6 +228,11 @@ struct WireRequest {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    /// 構造化出力のネイティブ強制（`plans/DESIGN.md` §構造化出力）。降格経路
+    /// （ツール強制・プロンプト埋込）では`harness_core::apply_schema_strategy`が
+    /// `req.output`を`None`にしてから来るので、ここは常に`None`になる。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -276,6 +323,23 @@ fn to_wire_request(req: &CompletionRequest) -> WireRequest {
         tools,
         tool_choice,
         parallel_tool_calls: req.parallel_tool_calls,
+        response_format: req.output.as_ref().map(output_contract_to_wire),
+    }
+}
+
+/// `OutputContract`をChat Completionsの`response_format`へ写す
+/// （`plans/DESIGN.md` §構造化出力「OpenAI / LMStudio」行）。
+fn output_contract_to_wire(output: &OutputContract) -> serde_json::Value {
+    match output {
+        OutputContract::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => serde_json::json!({
+            "type": "json_schema",
+            "json_schema": { "name": name, "strict": strict, "schema": schema },
+        }),
+        OutputContract::JsonObject => serde_json::json!({ "type": "json_object" }),
     }
 }
 
@@ -1017,6 +1081,141 @@ mod tests {
         assert_eq!(value["tools"][0]["type"], "function");
         assert_eq!(value["tools"][0]["function"]["name"], "read_file");
         assert_eq!(value["tool_choice"], "auto");
+    }
+
+    fn schema_request(output: Option<OutputContract>) -> CompletionRequest {
+        CompletionRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            output,
+            parallel_tool_calls: None,
+            max_tokens: 100,
+            sampling: Default::default(),
+            model: "gpt-test".to_string(),
+        }
+    }
+
+    /// 契約テスト（`plans/DESIGN.md` §主なリスクと対策「structured output の3プロバイダ写像」の
+    /// native経路）。`OutputContract::JsonSchema`が`response_format`のネイティブ形式になる。
+    #[test]
+    fn json_schema_contract_becomes_native_response_format() {
+        let req = schema_request(Some(OutputContract::JsonSchema {
+            name: "hypothesize_output".to_string(),
+            schema: serde_json::json!({ "type": "object", "additionalProperties": false }),
+            strict: true,
+        }));
+        let value = serde_json::to_value(to_wire_request(&req)).unwrap();
+
+        assert_eq!(value["response_format"]["type"], "json_schema");
+        assert_eq!(
+            value["response_format"]["json_schema"]["name"],
+            "hypothesize_output"
+        );
+        assert_eq!(value["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            value["response_format"]["json_schema"]["schema"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn json_object_contract_becomes_loose_json_mode() {
+        let req = schema_request(Some(OutputContract::JsonObject));
+        let value = serde_json::to_value(to_wire_request(&req)).unwrap();
+        assert_eq!(
+            value["response_format"],
+            serde_json::json!({"type": "json_object"})
+        );
+    }
+
+    /// 契約が無いリクエストには`response_format`キー自体が現れない（既存の全経路が
+    /// ワイヤ形式レベルで不変であることの担保）。
+    #[test]
+    fn no_contract_omits_response_format_entirely() {
+        let value = serde_json::to_value(to_wire_request(&schema_request(None))).unwrap();
+        assert!(
+            value.get("response_format").is_none(),
+            "response_format must be absent, got {value}"
+        );
+    }
+
+    /// LMStudioはgrammar制約デコードのためスキーマとツールを併用できない
+    /// （`plans/DESIGN.md` §構造化出力）。`ContextAssembler`がコール分割の要否を
+    /// この能力表明で決めるので、系統ごとの差をここで固定する。
+    #[test]
+    fn lmstudio_declares_that_schema_and_tools_cannot_be_combined() {
+        assert!(!OpenAiProvider::lmstudio().capabilities().schema_with_tools);
+        assert!(OpenAiProvider::new("k").capabilities().schema_with_tools);
+        // 併用不可なだけで、スキーマ強制自体は使える（llama.cppのgrammar）。
+        assert!(OpenAiProvider::lmstudio().capabilities().native_json_schema);
+        // id()は系統で変えない（`--provider`解決・既存ログの互換）。
+        assert_eq!(OpenAiProvider::lmstudio().id(), "openai");
+    }
+
+    /// 実機E2E（LMStudio）: `response_format:json_schema`が**実際に効いているか**を確かめる。
+    ///
+    /// llama.cppのgrammar制約デコードはトークン生成そのものを縛るため、プロンプトでお願いする
+    /// 場合と違い小型モデルでもスキーマから外れられない。認知レイヤーの全フェーズがこれに
+    /// 依存する（`plans/DESIGN-COGNITION.md` §3.4）ので、cheap層にローカルモデルを割り当てる
+    /// M17の前提として一度は実機で確認しておく。
+    ///
+    /// 実行: LMStudioサーバを起動した状態で
+    /// `cargo test -p harness-providers -- --ignored --nocapture lmstudio_enforces`
+    #[tokio::test]
+    #[ignore = "requires a running LMStudio server on localhost:1234"]
+    async fn lmstudio_enforces_json_schema_natively() {
+        use futures::StreamExt as _;
+
+        let provider = OpenAiProvider::lmstudio();
+        let req = CompletionRequest {
+            system: vec![],
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text(
+                    "テストが落ちる原因の仮説を1つ立てよ。".to_string(),
+                )],
+            }],
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            output: Some(OutputContract::JsonSchema {
+                name: "hypothesize_output".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "statement": { "type": "string" },
+                        "predicts": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["statement", "predicts"],
+                    "additionalProperties": false
+                }),
+                strict: true,
+            }),
+            parallel_tool_calls: None,
+            max_tokens: 512,
+            sampling: Default::default(),
+            model: String::new(), // LMStudioはロード済みモデルへフォールバックする
+        };
+
+        let mut stream = provider.stream(req).await.expect("stream");
+        let mut text = String::new();
+        while let Some(ev) = stream.next().await {
+            if let StreamEvent::TextDelta { text: t, .. } = ev.expect("stream event") {
+                text.push_str(&t);
+            }
+        }
+
+        println!("LMStudio raw output: {text}");
+        let value: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("output must be parseable JSON");
+        assert!(value["statement"].is_string(), "{value}");
+        assert!(value["predicts"].is_array(), "{value}");
+        assert_eq!(
+            value.as_object().map(|o| o.len()),
+            Some(2),
+            "additionalProperties:false should keep the object to the declared keys: {value}"
+        );
     }
 
     /// assistantのtool_use + 後続userのtool_resultが、OpenAIの

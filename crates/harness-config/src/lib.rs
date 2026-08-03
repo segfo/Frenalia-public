@@ -44,13 +44,20 @@ pub struct Settings {
 
 /// `.harness/settings.json`の`cognition`キー。
 ///
-/// `plans/DESIGN-COGNITION.md` §8のデルタ表は`budgets`/`model_tiers`/`sources`も挙げるが、
-/// それぞれ読む側（ContextAssembler・ModelRouter・SourceBroker）が実装されるM14/M16/M17で
-/// 追加する。設定だけ先に受け付けても黙って無視されるだけで、誤解を招くため。
+/// `plans/DESIGN-COGNITION.md` §8のデルタ表は`model_tiers`/`sources`も挙げるが、
+/// それぞれ読む側（ModelRouter・SourceBroker）が実装されるM17/M16で追加する。
+/// 設定だけ先に受け付けても黙って無視されるだけで、誤解を招くため。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CognitionSettings {
     /// `off` | `auto` | `always`。CLIの`--cognition`が指定されていればそちらが優先。
     pub default_level: Option<harness_core::CognitionLevel>,
+    /// フェーズ別トークン予算の上書き（`plans/DESIGN-COGNITION.md` §3.3の表・§6.1）。
+    /// 書かなかったフェーズは既定値のまま（`harness_cognition::PhaseBudgets`が部分上書きする）。
+    ///
+    /// ```jsonc
+    /// "cognition": { "budgets": { "distill": { "max_in": 6000, "max_out": 800 } } }
+    /// ```
+    pub budgets: Option<std::collections::BTreeMap<harness_core::Phase, harness_core::TokenBudget>>,
 }
 
 /// `.harness/settings.json`の`run_shell`キー。シークレットenvの転送は禁止し、PATH追加だけを扱う。
@@ -356,6 +363,39 @@ mod tests {
 
         let empty: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(empty.cognition.is_none());
+    }
+
+    /// `cognition.budgets`はフェーズ名をキーに部分指定できる（書かなかったフェーズは
+    /// `harness_cognition::PhaseBudgets`の既定表のまま）。
+    #[test]
+    fn parses_partial_cognition_budgets() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "cognition": { "budgets": { "distill": { "max_in": 6000, "max_out": 800 } } }
+        }))
+        .unwrap();
+
+        let budgets = settings.cognition.unwrap().budgets.unwrap();
+        assert_eq!(budgets.len(), 1);
+        assert_eq!(
+            budgets[&harness_core::Phase::Distill],
+            harness_core::TokenBudget {
+                max_in: 6000,
+                max_out: 800
+            }
+        );
+    }
+
+    /// 綴りを間違えたフェーズ名は黙って無視されず、パースエラーになる
+    /// （黙って既定値で走ると「設定したのに効かない」に気付けない）。
+    #[test]
+    fn unknown_phase_name_in_budgets_is_rejected() {
+        let parsed: Result<Settings, _> = serde_json::from_value(serde_json::json!({
+            "cognition": { "budgets": { "distil": { "max_in": 6000, "max_out": 800 } } }
+        }));
+        assert!(
+            parsed.is_err(),
+            "typo in a phase name must not be silently ignored"
+        );
     }
 
     #[test]
