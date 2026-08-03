@@ -44,7 +44,7 @@ pub(crate) fn acquire_or_repair_workspace_share(
     incus: &IncusClient,
     container_name: &str,
 ) -> Result<(String, String), VmError> {
-    let existing = crate::tier3::vm_ledger::load()
+    let existing = crate::vm_ledger::load()
         .workspace_resources
         .into_iter()
         .find(|e| e.workspace_id == workspace_id);
@@ -54,7 +54,7 @@ pub(crate) fn acquire_or_repair_workspace_share(
 
     match (action, existing) {
         (WorkspaceAction::Reuse, Some(existing)) => {
-            crate::tier3::vm_ledger::record_workspace_resource(
+            crate::vm_ledger::record_workspace_resource(
                 workspace_id,
                 workspace_root,
                 &existing.smb_share_name,
@@ -112,11 +112,11 @@ pub(crate) fn repair_workspace_share(
     config: &VmSandboxConfig,
     host_ssh_key: &Path,
     mount_point: &str,
-    existing: &crate::tier3::vm_ledger::WorkspaceResourceEntry,
+    existing: &crate::vm_ledger::WorkspaceResourceEntry,
     incus: &IncusClient,
     container_name: &str,
 ) -> Result<(String, String), VmError> {
-    match crate::tier3::smb_share::rotate_share_password(&existing.smb_user) {
+    match crate::smb_share::rotate_share_password(&existing.smb_user) {
         Ok(password) => {
             remount_workspace_share(
                 config,
@@ -129,7 +129,7 @@ pub(crate) fn repair_workspace_share(
                 incus,
                 container_name,
             )?;
-            crate::tier3::vm_ledger::record_workspace_resource(
+            crate::vm_ledger::record_workspace_resource(
                 workspace_id,
                 workspace_root,
                 &existing.smb_share_name,
@@ -141,7 +141,7 @@ pub(crate) fn repair_workspace_share(
         Err(_) => {
             // アカウント自体が既に存在しない（状態S4/S5）。共有・アカウントを作り直す
             // （`destroy_ephemeral_share`はbest-effort、無くても無害）。
-            crate::tier3::smb_share::destroy_ephemeral_share(
+            crate::smb_share::destroy_ephemeral_share(
                 &existing.smb_share_name,
                 &existing.smb_user,
                 Some(workspace_root),
@@ -172,7 +172,7 @@ pub(crate) fn create_fresh_workspace_share(
     container_name: &str,
 ) -> Result<(String, String), VmError> {
     let (share, user, password, sid) =
-        crate::tier3::smb_share::create_ephemeral_share(workspace_id, workspace_root)?;
+        crate::smb_share::create_ephemeral_share(workspace_id, workspace_root)?;
     remount_workspace_share(
         config,
         host_ssh_key,
@@ -184,7 +184,7 @@ pub(crate) fn create_fresh_workspace_share(
         incus,
         container_name,
     )?;
-    crate::tier3::vm_ledger::record_workspace_resource(workspace_id, workspace_root, &share, &user, &sid);
+    crate::vm_ledger::record_workspace_resource(workspace_id, workspace_root, &share, &user, &sid);
     Ok((share, user))
 }
 

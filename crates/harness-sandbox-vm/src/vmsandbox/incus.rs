@@ -7,7 +7,7 @@
 use super::*;
 
 /// Incus REST APIのmTLSクライアント（`plans/vm-spike/incus_common.py`のRust移植）。
-/// **`Clone`（Phase B、`crate::tier3::vm_host::VmHost`）**: 内部は`String`（base_url）・`IpAddr`
+/// **`Clone`（Phase B、`crate::vm_host::VmHost`）**: 内部は`String`（base_url）・`IpAddr`
 /// （Copy）・`reqwest::blocking::Client`（内部Arc、実接続を保持しない設定オブジェクト）のみ
 /// なので複製は安全。常駐VMへ複数セッションが同時にアタッチする際、各セッションが同じ
 /// resident VMへの接続設定を独立に保持できるようにするために必要。

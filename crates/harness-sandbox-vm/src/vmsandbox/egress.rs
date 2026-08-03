@@ -17,7 +17,7 @@ pub(crate) const INCUS_BRIDGE_IP: &str = "10.76.180.1";
 /// SNI prereadプロキシのlistenポートの基準値。**Phase B**: 常駐VM上に複数セッションが同居する
 /// ため、セッションごとに`SNI_PROXY_PORT_BASE + slot`でポートを分ける（`slot`は
 /// `vmsandboxd::SessionRegistry`が同時実行数上限の枠として払い出す番号、
-/// `crate::tier3::vmsandbox::container_static_ip_cidr`と同じ`slot`を共有する）。単一ポートのままだと、
+/// `crate::vmsandbox::container_static_ip_cidr`と同じ`slot`を共有する）。単一ポートのままだと、
 /// 全セッションの許可ドメインが1つの`map`に混ざり、会話単位で出口を絞るというTier3の目的が
 /// 崩れる（S-5、DNATは認可ではない）。
 pub(crate) const SNI_PROXY_PORT_BASE: u16 = 8444;
@@ -35,7 +35,7 @@ pub(crate) fn sni_audit_log_path_for_slot(slot: u8) -> String {
 }
 
 /// 常駐VM上で現在出口許可リストを構成中の1セッション分の情報
-/// （`crate::tier3::vm_host::VmHost`が全アクティブセッション分をまとめて保持する）。
+/// （`crate::vm_host::VmHost`が全アクティブセッション分をまとめて保持する）。
 #[derive(Debug, Clone)]
 pub(crate) struct EgressSession {
     pub slot: u8,
@@ -166,7 +166,7 @@ pub(crate) fn build_nftables_script(sessions: &[EgressSession]) -> String {
 /// SNI prereadプロキシ + nftables DNAT/filter + コンテナ側Incus ACLを、AlmaLinux VM自体へ
 /// SSH経由で構成する。**Phase B**: `active_sessions`は呼び出し時点で出口を構成している
 /// 全セッション（このセッション自身を含む）——1本の呼び出しが常にVM全体の設定を丸ごと
-/// 再生成するため、呼び出し側（`crate::tier3::vm_host::VmHost`）が単一ロックの下で
+/// 再生成するため、呼び出し側（`crate::vm_host::VmHost`）が単一ロックの下で
 /// 「集合を更新→この関数を呼ぶ」を一体で行う必要がある（さもないと2セッション目の呼び出しが
 /// 1セッション目の設定を消す、A-8）。
 pub(crate) fn apply_egress_ruleset(

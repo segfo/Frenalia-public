@@ -4,7 +4,7 @@ use super::*;
 
 pub(crate) fn run_tier3_subcommand(action: Tier3Action) -> ExitCode {
     match action {
-        Tier3Action::Gc => match harness_sandbox::tier3::vmsandboxd::run_gc_only() {
+        Tier3Action::Gc => match harness_sandbox_vm::vmsandboxd::run_gc_only() {
             Ok(reaped) => {
                 if reaped.is_empty() {
                     println!("(no orphaned Tier3 VMs found)");
@@ -22,7 +22,7 @@ pub(crate) fn run_tier3_subcommand(action: Tier3Action) -> ExitCode {
             }
         },
         Tier3Action::StopDaemon => {
-            match harness_sandbox::tier3::vmsandboxd::stop_resident_daemon_if_idle() {
+            match harness_sandbox_vm::vmsandboxd::stop_resident_daemon_if_idle() {
                 Ok(true) => {
                     println!("Tier3 daemon is stopping");
                     ExitCode::SUCCESS

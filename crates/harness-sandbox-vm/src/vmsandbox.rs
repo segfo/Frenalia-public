@@ -1,7 +1,7 @@
 //! Tier3（Hyper-V外層AlmaLinux VM + Incus内層コンテナ）の実行機構本体
 //! （`plans/DESIGN-SANDBOX-VMISOLATION.md`、`plans/vm-spike/RESULTS.md`）。
 //!
-//! `harness-vmsandboxd`（常駐デーモン、`crate::tier3::vmsandboxd`）の中でのみ呼ばれる。本体プロセス
+//! `harness-vmsandboxd`（常駐デーモン、`crate::vmsandboxd`）の中でのみ呼ばれる。本体プロセス
 //! （非管理者）はここのHyper-V操作を直接呼ばない（D-21）。Incus REST APIはmTLS越しの
 //! ネットワーク呼び出しであり管理者権限を要しないが、デーモンプロセス内に閉じて構わないため
 //! ここへ同居させる。
@@ -14,14 +14,14 @@
 //!
 //! **Phase 3実装済み（台帳+GC・ウォームスタート）**、**Phase B実装済み（VM共有化・
 //! マルチセッション並行化、`DESIGN-SANDBOX-VMISOLATION.md`項目8）**:
-//! - **VM共有化（`crate::tier3::vm_host::VmHost`）**: 外層VMはもうセッションごとに新規作成される
+//! - **VM共有化（`crate::vm_host::VmHost`）**: 外層VMはもうセッションごとに新規作成される
 //!   専有物ではなく、参照カウントされる共有resident資源になった。`VmSession::start`は
 //!   `VmHost::attach`（未起動なら起動、起動済みなら`refcount`を増やして即座にアタッチ）を
 //!   呼ぶだけで、VM作成コード自体は`vm_host`モジュールへ移動した。ウォームスタート
 //!   （`--tier3-warm`）もこの`attach`の内部実装（checkpointからの`Restore-VMSnapshot`）に
 //!   統合され、`WarmLock`によるファイルロック直列化は不要になった（daemonプロセス内の
 //!   `Mutex`一本で足りる、daemon自体がS-2の固定パイプ名で単一プロセスに保証されているため）。
-//! - **台帳+GC（D-24）**: `crate::tier3::vm_ledger`のスキーマをVM共有化に合わせて分離した
+//! - **台帳+GC（D-24）**: `crate::vm_ledger`のスキーマをVM共有化に合わせて分離した
 //!   （単一の`VmHostEntry`＋`workspace_id`単位の`WorkspaceResourceEntry`群）。
 //!   `gc_orphan_sessions`は`VmHost::attach`のStopped→Running遷移直前にのみ呼ばれる
 //!   （セッション途中で誤って現在生存中のVMを孤児扱いしないため）。
@@ -79,7 +79,7 @@ use serde::Deserialize;
 // | `workspace_share` | SMB / PowerShell / SSH |
 // | `session`         | 上記全部を束ねる |
 //
-// 公開パス（`harness_sandbox::tier3::vmsandbox::VmSession` 等）を変えないため、
+// 公開パス（`harness_sandbox_vm::vmsandbox::VmSession` 等）を変えないため、
 // 各モジュールの公開項目はここでglob再エクスポートする。
 
 mod config;
@@ -272,11 +272,11 @@ mod tests {
             .canonicalize()
             .expect("repo root must resolve");
         let config = VmSandboxConfig::default();
-        let workspace_id = crate::tier3::smb_share::compute_workspace_id(&workspace_root);
+        let workspace_id = crate::smb_share::compute_workspace_id(&workspace_root);
 
         // 状態S6を自己完結で構成する: 台帳にだけ（ゲスト側マウント無しで）エントリを作る。
         // `smb_share_name`/`smb_user`/`smb_user_sid`はダミー（実際のWindows資源は作らない）。
-        crate::tier3::vm_ledger::record_workspace_resource(
+        crate::vm_ledger::record_workspace_resource(
             &workspace_id,
             &workspace_root,
             "harness-ws-bug026-repro",
@@ -305,6 +305,6 @@ mod tests {
         }
 
         // 後始末: 万一パニックした場合も含め、注入した台帳エントリと実資源をGCへ寄せる。
-        let _ = crate::tier3::vmsandbox::gc_orphan_sessions(&config, "");
+        let _ = crate::vmsandbox::gc_orphan_sessions(&config, "");
     }
 }

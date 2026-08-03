@@ -134,11 +134,11 @@ pub async fn run(
     // 約212秒/ウォーム再利用約20秒、`docs/STATUS.md`Tier3残課題#3）このオルタネートスクリーン内で
     // 進捗画面を表示する（`TerminalGuard::enter()`は再入不可のため、`main.rs`側で別途端末を
     // 握るのではなくここで行う）。表示する進捗は経過時間ベースの合成データであり、daemonの
-    // 実測値ではない（`harness_sandbox::tier3::vmsandboxd_progress`のモジュールdoc、
+    // 実測値ではない（`harness_sandbox_vm::vmsandboxd_progress`のモジュールdoc、
     // `plans/DESIGN-SANDBOX-VMISOLATION.md`参照）。
     #[cfg(windows)]
     let vm_sandbox_handle: Option<
-        std::sync::Arc<harness_sandbox::tier3::vmsandboxd::VmSandboxHandle>,
+        std::sync::Arc<harness_sandbox_vm::vmsandboxd::VmSandboxHandle>,
     > = if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
         sandbox_prep::run_prep_screen(
             &mut term,

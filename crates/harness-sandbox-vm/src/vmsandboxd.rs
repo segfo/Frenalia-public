@@ -1,6 +1,6 @@
 //! Tier3専用の常駐デーモン制御（`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.2）。
 //!
-//! `crate::tier2a::netfilterd`と同じ理由で別プロセス・別モジュールにしている: Hyper-V VM + Incus
+//! `harness_sandbox::tier2a::netfilterd`と同じ理由で別プロセス・別モジュールにしている: Hyper-V VM + Incus
 //! コンテナは`harness`本体プロセスと独立に生存し続けるため（WFPの`FWPM_SESSION_FLAG_DYNAMIC`
 //! とは逆の性質）、ゲスト⇄ホストのブローカー役はharnessセッション全体の生存期間中
 //! 昇格トークンのまま常駐する必要がある。IPCの配線（named pipe + JSON、
@@ -57,8 +57,8 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-use crate::tier3::vmsandbox::{VmSandboxConfig, VmSession};
-use crate::win_common::wide;
+use crate::vmsandbox::{VmSandboxConfig, VmSession};
+use harness_sandbox::win_common::wide;
 
 /// 親→daemonへ送るメッセージ。`StartSession`→`Exec`(N回)→`Teardown`の順に送る。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +82,7 @@ pub enum VmRequest {
     },
     Teardown,
     /// GC専用モード（`harness tier3 gc`、A9）でのみ送られる1回きりのリクエスト。
-    /// `StartSession`を経由せず、`crate::tier3::vmsandbox::gc_orphan_sessions`を実行して
+    /// `StartSession`を経由せず、`crate::vmsandbox::gc_orphan_sessions`を実行して
     /// 即座に終了する（D-24、`serve_gc_only`参照）。
     Gc,
     /// [BUG-029] `harness tier3 gc`が常駐daemon（`serve_resident`）へ「本当にセッションが
@@ -159,9 +159,9 @@ const DAEMON_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_milli
 const DAEMON_IDLE_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 // 名前付きパイプIPCの下回り（DACL・オーバーラップドI/O・フレーミング）は
-// `crate::win_pipe_ipc`が持つ。以前はこのファイル・`tier2a/privhelper.rs`・
+// `harness_sandbox::win_pipe_ipc`が持つ。以前はこのファイル・`tier2a/privhelper.rs`・
 // `tier2a/netfilterd.rs`の3箇所に同じ一式がコピーされていた。
-use crate::win_pipe_ipc::{
+use harness_sandbox::win_pipe_ipc::{
     connect_with_timeout, current_user_sid_string, read_framed_timeout, sid_string_from_token,
     user_only_security_attributes, write_framed_timeout,
 };
@@ -169,11 +169,11 @@ use crate::win_pipe_ipc::{
 /// このモジュール用の使い捨てパイプ名（GC経路専用。常駐daemonは`session_daemon_pipe_name`の
 /// 固定名を使う）。
 fn unique_pipe_name() -> String {
-    crate::win_pipe_ipc::unique_pipe_name("vmsandboxd")
+    harness_sandbox::win_pipe_ipc::unique_pipe_name("vmsandboxd")
 }
 
-impl From<crate::win_pipe_ipc::PipeIpcError> for VmSandboxIpcError {
-    fn from(e: crate::win_pipe_ipc::PipeIpcError) -> Self {
+impl From<harness_sandbox::win_pipe_ipc::PipeIpcError> for VmSandboxIpcError {
+    fn from(e: harness_sandbox::win_pipe_ipc::PipeIpcError) -> Self {
         VmSandboxIpcError::Ipc(e.into_message())
     }
 }
@@ -762,7 +762,7 @@ mod tests {
     /// 管理者権限でテストを実行している場合はこのテストをスキップする）。
     #[test]
     fn access_check_write_denies_system_root_for_non_admin() {
-        if crate::tier2a::privhelper::is_elevated() {
+        if harness_sandbox::tier2a::privhelper::is_elevated() {
             eprintln!("skipping: test process is elevated, System32 write would be allowed");
             return;
         }

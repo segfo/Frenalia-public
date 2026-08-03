@@ -995,7 +995,7 @@ async fn headless_branch(
     // 同様の役割を果たす、`crates/harness-tui/src/lib.rs`参照）。
     #[cfg(windows)]
     let vm_sandbox_handle: Option<
-        std::sync::Arc<harness_sandbox::tier3::vmsandboxd::VmSandboxHandle>,
+        std::sync::Arc<harness_sandbox_vm::vmsandboxd::VmSandboxHandle>,
     > = if tool_ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
         start_tier3_with_progress(
             &tool_ctx.workspace_root,
@@ -1123,7 +1123,7 @@ pub async fn run() -> ExitCode {
 
 /// 非対話モード（`--print`）専用: Tier3 VMサンドボックスの起動をブロッキングのまま
 /// （`tokio::task::spawn_blocking`越しに）待ちつつ、`vmsandboxd_progress`の合成進捗
-/// （経過時間ベースの推測、daemonの実測値ではない——`harness_sandbox::tier3::vmsandboxd_progress`の
+/// （経過時間ベースの推測、daemonの実測値ではない——`harness_sandbox_vm::vmsandboxd_progress`の
 /// モジュールdoc・`plans/DESIGN-SANDBOX-VMISOLATION.md`参照）をstderrへ間引いて出力する。
 /// TUI分岐（`harness_tui::run`内の`sandbox_prep::run_prep_screen`）と対になる非対話側の実装。
 #[cfg(windows)]
@@ -1132,9 +1132,9 @@ async fn start_tier3_with_progress(
     allow_domains: &[String],
     tier3_warm: bool,
     tier3_max_sessions: u8,
-) -> Option<std::sync::Arc<harness_sandbox::tier3::vmsandboxd::VmSandboxHandle>> {
-    use harness_sandbox::tier3::vmsandboxd::VmSandboxHandle;
-    use harness_sandbox::tier3::vmsandboxd_progress::{run_synthetic_ticker, SandboxPrepEvent};
+) -> Option<std::sync::Arc<harness_sandbox_vm::vmsandboxd::VmSandboxHandle>> {
+    use harness_sandbox_vm::vmsandboxd::VmSandboxHandle;
+    use harness_sandbox_vm::vmsandboxd_progress::{run_synthetic_ticker, SandboxPrepEvent};
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SandboxPrepEvent>();
     let ticker = tokio::spawn(run_synthetic_ticker(tx, tier3_warm));

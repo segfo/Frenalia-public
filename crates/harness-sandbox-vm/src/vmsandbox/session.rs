@@ -2,15 +2,15 @@
 //! 束ねる層。
 //!
 //! `VmSession::attach_to_guest`が「常駐VMへアタッチ→コンテナ作成/起動→ワークスペース資源の
-//! 確保」までを行い、`teardown`が撤収する。VM自体の起動/撤収は`crate::tier3::vm_host::VmHost`が
+//! 確保」までを行い、`teardown`が撤収する。VM自体の起動/撤収は`crate::vm_host::VmHost`が
 //! 参照カウントで管理する共有資源のため、本モジュールは自分のコンテナとワークスペース単位
 //! 資源だけを知る。`gc_orphan_sessions`は前回の異常終了で残った資源を回収する。
 
 use super::*;
 
 /// 稼働中のTier3セッション（常駐VM上の1コンテナ）を表す。`VmSandboxHandle`
-/// （`crate::tier3::vmsandboxd`）がデーモンプロセス内で保持し続ける。**Phase B**: VM自体は
-/// `crate::tier3::vm_host::VmHost`が参照カウントで管理する共有resident資源になったため、本構造体は
+/// （`crate::vmsandboxd`）がデーモンプロセス内で保持し続ける。**Phase B**: VM自体は
+/// `crate::vm_host::VmHost`が参照カウントで管理する共有resident資源になったため、本構造体は
 /// もはやVMの識別子（旧`vm_name`/`diff_vhdx`）を保持しない——teardown時にVMを操作するのは
 /// `VmHost::release`の責務であり、本構造体が知る必要があるのは自分のコンテナと
 /// ワークスペース単位資源（`workspace_id`）だけである。
@@ -103,7 +103,7 @@ pub(crate) fn wait_for_guest_ready(
 
 
 impl VmSession {
-    /// 常駐VM（`crate::tier3::vm_host::VmHost`が参照カウントで管理）へアタッチ→コンテナ作成/起動→
+    /// 常駐VM（`crate::vm_host::VmHost`が参照カウントで管理）へアタッチ→コンテナ作成/起動→
     /// ワークスペース資源の確保、までを一気に行う。**Phase B**: VM自体の起動は
     /// `VmHost::attach`が担う。2セッション目以降は既に起動済みのVMへ即座にアタッチするだけで、
     /// 新規VM作成は発生しない。`slot`は`vmsandboxd::SessionRegistry`が同時実行数上限の枠として
@@ -116,7 +116,7 @@ impl VmSession {
         slot: u8,
     ) -> Result<Self, VmError> {
         let session_id = unique_session_id();
-        let incus = crate::tier3::vm_host::VmHost::global().attach(config, warm)?;
+        let incus = crate::vm_host::VmHost::global().attach(config, warm)?;
         let result = Self::attach_to_guest(
             workspace_root,
             config,
@@ -129,7 +129,7 @@ impl VmSession {
             // VM自体は他セッションが使用中の可能性があるため、ここでは「このセッションの
             // 取り分」を返上するだけでよい（refcountが0になれば`VmHost::release`が実際に
             // VMを停止する）。
-            crate::tier3::vm_host::VmHost::global().release(config);
+            crate::vm_host::VmHost::global().release(config);
         }
         result
     }
@@ -310,7 +310,7 @@ impl VmSession {
             }
             let key = ensure_ssh_keypair()?;
             attach_egress_acl(&incus, &container_name)?;
-            crate::tier3::vm_host::VmHost::global().configure_egress(
+            crate::vm_host::VmHost::global().configure_egress(
                 config,
                 &key,
                 slot,
@@ -320,7 +320,7 @@ impl VmSession {
             Some(key)
         };
 
-        let workspace_id = crate::tier3::smb_share::compute_workspace_id(workspace_root);
+        let workspace_id = crate::smb_share::compute_workspace_id(workspace_root);
 
         // ワークスペース共有（`WorkspaceShareMode`、移行期間の切り替えフラグ）。
         // `Cifs`: Windows側でSMB共有→SSH経由でゲストへ認証情報配布→ゲスト内`mount -t cifs`
@@ -365,7 +365,7 @@ impl VmSession {
                     // `release_workspace_resource`が`None`を返すため何もしない
                     // （そちらは`create_ephemeral_share`自身がbest-effortで後始末済み）。
                     if let Some(removed) =
-                        crate::tier3::vm_ledger::release_workspace_resource(&workspace_id)
+                        crate::vm_ledger::release_workspace_resource(&workspace_id)
                     {
                         let _ = ssh_exec(
                             config.guest_ip,
@@ -375,7 +375,7 @@ impl VmSession {
                             ),
                             Duration::from_secs(15),
                         );
-                        crate::tier3::smb_share::destroy_ephemeral_share(
+                        crate::smb_share::destroy_ephemeral_share(
                             &removed.smb_share_name,
                             &removed.smb_user,
                             Some(Path::new(&removed.workspace_root)),
@@ -392,7 +392,7 @@ impl VmSession {
                 // F3: `add_disk_device`失敗時は、直前に増やした/作ったワークスペース資源の
                 // refcountを必ず巻き戻す。ロックはこの巻き戻しの間保持したまま
                 // （再取得するとデッドロックする）。
-                if let Some(removed) = crate::tier3::vm_ledger::release_workspace_resource(&workspace_id) {
+                if let Some(removed) = crate::vm_ledger::release_workspace_resource(&workspace_id) {
                     let _ = ssh_exec(
                         config.guest_ip,
                         &host_ssh_key,
@@ -401,7 +401,7 @@ impl VmSession {
                         ),
                         Duration::from_secs(15),
                     );
-                    crate::tier3::smb_share::destroy_ephemeral_share(
+                    crate::smb_share::destroy_ephemeral_share(
                         &removed.smb_share_name,
                         &removed.smb_user,
                         Some(Path::new(&removed.workspace_root)),
@@ -518,7 +518,7 @@ impl VmSession {
         )
     }
 
-    /// **Phase B**: VM自体はもう`self`が所有していない（`crate::tier3::vm_host::VmHost`が参照カウント
+    /// **Phase B**: VM自体はもう`self`が所有していない（`crate::vm_host::VmHost`が参照カウント
     /// で管理する共有resident資源）ため、`config`を受け取って最後に`VmHost::release`を呼ぶ。
     pub fn teardown(self, workspace_root: &Path, config: &VmSandboxConfig) -> Result<(), VmError> {
         // `WorkspaceShareMode::Cifs`セッションはライブ共有のためワークスペースの中身は
@@ -540,7 +540,7 @@ impl VmSession {
                 &self.session_id,
                 self.slot,
             );
-            let _ = crate::tier3::vm_host::VmHost::global().release_egress(config, ssh_key, self.slot);
+            let _ = crate::vm_host::VmHost::global().release_egress(config, ssh_key, self.slot);
         }
         let _ = self.incus.stop_container(&self.container_name);
         let _ = self.incus.delete_container(&self.container_name);
@@ -552,7 +552,7 @@ impl VmSession {
             // `attach_to_guest`の作成判定と同じロックで直列化する（TOCTOU是正、
             // `WORKSPACE_RESOURCE_LOCK`のdoc参照）。
             let _workspace_lock = WORKSPACE_RESOURCE_LOCK.lock().unwrap();
-            if let Some(removed) = crate::tier3::vm_ledger::release_workspace_resource(&self.workspace_id)
+            if let Some(removed) = crate::vm_ledger::release_workspace_resource(&self.workspace_id)
             {
                 if let Ok(host_ssh_key) = ensure_ssh_keypair() {
                     let mount_point = format!("/mnt/harness-workspace-{}", self.workspace_id);
@@ -566,7 +566,7 @@ impl VmSession {
                         Duration::from_secs(15),
                     );
                 }
-                crate::tier3::smb_share::destroy_ephemeral_share(
+                crate::smb_share::destroy_ephemeral_share(
                     &removed.smb_share_name,
                     &removed.smb_user,
                     Some(Path::new(&removed.workspace_root)),
@@ -574,7 +574,7 @@ impl VmSession {
             }
         }
 
-        crate::tier3::vm_host::VmHost::global().release(config);
+        crate::vm_host::VmHost::global().release(config);
         copy_out_result
     }
 
@@ -585,7 +585,7 @@ impl VmSession {
 
 /// D-24: 台帳+実機照会の両方を突き合わせ、前回の孤児resident VM・差分VHDX・ワークスペース
 /// 単位資源を撤収する（`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.6・§4・項目8）。
-/// **Phase B**: `crate::tier3::vm_host::VmHost::attach`のStopped→Running遷移直前、または
+/// **Phase B**: `crate::vm_host::VmHost::attach`のStopped→Running遷移直前、または
 /// `harness tier3 gc`（別プロセス）から呼ばれる。VMが1台の共有resident資源になったため、
 /// 孤児判定の単位も「複数の`session_id`エントリ」から「単一のVMホストエントリ」へ変わった——
 /// 孤児と判定された場合、そのVMの生存期間中に参照カウントを管理していたdaemonプロセスの
@@ -609,12 +609,12 @@ impl VmSession {
 /// 項目9）。GC自体の失敗で`StartSession`を失敗させないよう、呼び出し側は戻り値を無視して
 /// 構わない設計（stderrへログするのみ）。
 pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) -> Vec<String> {
-    let ledger = crate::tier3::vm_ledger::load();
+    let ledger = crate::vm_ledger::load();
 
     let resident_daemon_alive = ledger
         .vm_host
         .as_ref()
-        .map(|h| crate::tier3::vm_ledger::is_pid_alive(h.daemon_pid))
+        .map(|h| crate::vm_ledger::is_pid_alive(h.daemon_pid))
         .unwrap_or(false);
     if resident_daemon_alive {
         eprintln!(
@@ -638,19 +638,19 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
         }
     };
 
-    let orphans = crate::tier3::vm_ledger::select_orphan_vm_names(&ledger, &existing_vm_names);
+    let orphans = crate::vm_ledger::select_orphan_vm_names(&ledger, &existing_vm_names);
 
     // F4: 孤児VMの有無に関わらず、台帳上のworkspace_resourcesは無条件で整合させる
     // （resident_daemon_aliveでないと確定した以上、アクティブセッションは存在しないため
     // 台帳上の全エントリは定義上stale）。
-    for resource in crate::tier3::vm_ledger::select_all_workspace_resources(&ledger) {
-        crate::tier3::smb_share::destroy_ephemeral_share(
+    for resource in crate::vm_ledger::select_all_workspace_resources(&ledger) {
+        crate::smb_share::destroy_ephemeral_share(
             &resource.smb_share_name,
             &resource.smb_user,
             Some(Path::new(&resource.workspace_root)),
         );
     }
-    let cleared = crate::tier3::vm_ledger::update(|current| {
+    let cleared = crate::vm_ledger::update(|current| {
         current.workspace_resources.clear();
         current.clone()
     });
@@ -658,8 +658,8 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
     // F4: 台帳に載っていないWindows側実体（状態S2/S3）も実体側から直接走査して回収する。
     // 直前のループで台帳追跡分は既に破棄済みのため、ここで見つかるのは真に台帳から
     // 不可視だった孤児のみ。
-    for (share, user, path) in crate::tier3::smb_share::enumerate_windows_workspace_shares() {
-        crate::tier3::smb_share::destroy_ephemeral_share(&share, &user, Some(&path));
+    for (share, user, path) in crate::smb_share::enumerate_windows_workspace_shares() {
+        crate::smb_share::destroy_ephemeral_share(&share, &user, Some(&path));
     }
 
     if orphans.is_empty() {
@@ -668,7 +668,7 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
 
     for vm_name in &orphans {
         // **実機で発見**: `vm_name`から`{vm_name}.diff.vhdx`という命名規則を推測すると、
-        // 実際の常駐VMの差分VHDXファイル名（`crate::tier3::vm_host::resident_diff_vhdx_path`が
+        // 実際の常駐VMの差分VHDXファイル名（`crate::vm_host::resident_diff_vhdx_path`が
         // 決める固定名`resident.diff.vhdx`）と一致しない。台帳に記録が無い場合
         // （`vm_host`が`None`になった後の再実行等）は、常駐VM名である前提で正しいパスを導く。
         let diff_vhdx = cleared
@@ -677,8 +677,8 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
             .filter(|h| &h.vm_name == vm_name)
             .map(|h| PathBuf::from(&h.diff_vhdx))
             .unwrap_or_else(|| {
-                if vm_name == crate::tier3::vm_host::RESIDENT_VM_NAME {
-                    crate::tier3::vm_host::resident_diff_vhdx_path(config)
+                if vm_name == crate::vm_host::RESIDENT_VM_NAME {
+                    crate::vm_host::resident_diff_vhdx_path(config)
                 } else {
                     config.vm_work_dir.join(format!("{vm_name}.diff.vhdx"))
                 }
@@ -687,7 +687,7 @@ pub fn gc_orphan_sessions(config: &VmSandboxConfig, current_session_id: &str) ->
             eprintln!("gc_orphan_sessions: failed to tear down orphan VM {vm_name}: {e}");
         }
     }
-    crate::tier3::vm_ledger::remove_vm_host();
+    crate::vm_ledger::remove_vm_host();
 
     // 台帳・生存VMのどちらからも参照されなくなった差分VHDXの取りこぼしを一掃する
     // （teardown_vm自体が消し忘れた場合の保険、`vm_work_dir`直下のみを対象にする）。

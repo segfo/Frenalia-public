@@ -20,7 +20,9 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Pipes::CreatePipe;
 
-pub(crate) fn wide(s: &str) -> Vec<u16> {
+/// `harness-sandbox-vm`（`smb_share`・`vmsandboxd`）から参照されるため`pub`
+/// （`docs/CODE-STRUCTURE-RULES.md`規則4）。
+pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 

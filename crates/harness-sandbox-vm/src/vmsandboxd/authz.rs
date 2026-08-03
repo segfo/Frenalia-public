@@ -3,7 +3,7 @@
 //!
 //! 常駐daemonは固定名のパイプ（`session_daemon_pipe_name`）でサーバとして待ち受けるため、
 //! 同一ユーザーの誰でも名前を知り得る。パイプのDACLを呼び出しユーザー専有にする
-//! （`crate::win_pipe_ipc::user_only_security_attributes`）だけでは「同一ユーザーの別プロセス」を
+//! （`harness_sandbox::win_pipe_ipc::user_only_security_attributes`）だけでは「同一ユーザーの別プロセス」を
 //! 排除できないため、次の3段で認可する。
 //!
 //! 1. **身元検証** — `verify_pipe_client_identity`が、接続元PIDのトークンSIDと実行イメージパスを

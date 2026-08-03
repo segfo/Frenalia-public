@@ -560,7 +560,7 @@ fn query_active_sessions(pipe: HANDLE) -> Result<usize, VmSandboxIpcError> {
 /// `VmSandboxHandle::start`とは異なりセッションを開始せず、`--gc-only`引数付きで起動した
 /// daemon（`serve_gc`）が[`VmRequest::Gc`]を1件処理して即座に終了するのを待つだけの
 /// 軽量な経路。ウォームVM・現在セッション（gc-only起動時は存在しない）は台帳側の
-/// 選定ロジック（`crate::tier3::vm_ledger::select_orphan_vm_names`・`daemon_pid`生存判定）で
+/// 選定ロジック（`crate::vm_ledger::select_orphan_vm_names`・`daemon_pid`生存判定）で
 /// GC対象から除外される。
 ///
 /// **BUG-027対策（2層防御の1層目）**: `gc_orphan_sessions`側の`daemon_pid`生存判定

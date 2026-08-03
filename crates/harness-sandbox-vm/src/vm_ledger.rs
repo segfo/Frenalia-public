@@ -5,11 +5,11 @@
 //! `FWPM_SESSION_FLAG_DYNAMIC`とは逆の性質、`vmsandboxd.rs`モジュールdoc参照）、
 //! daemonがクラッシュ等で撤収を完了できなかった場合、走行中VM・差分VHDXが
 //! 孤児として残り得る。この台帳は、次回起動時に前回の孤児を検出・撤収するGC
-//! （`crate::tier3::vmsandbox::gc_orphan_sessions`）の記録媒体として機能する。
+//! （`crate::vmsandbox::gc_orphan_sessions`）の記録媒体として機能する。
 //!
 //! **Phase B（`VmHost`常駐化）でのスキーマ変更**: 従来は「1セッション=1VM」だったため
 //! `session_id`＝`vm_name`のエントリを複数持つ配列だったが、VMが1台の共有resident資源
-//! （`crate::tier3::vm_host::VmHost`）になったことで意味が変わった。台帳を2種類のエントリへ
+//! （`crate::vm_host::VmHost`）になったことで意味が変わった。台帳を2種類のエントリへ
 //! 分離する:
 //! - [`VmHostEntry`]: resident VM自体（固定`vm_name`）が起動中かどうかを表す**単一**エントリ。
 //! - [`WorkspaceResourceEntry`][]: `workspace_id`単位で参照カウント共有されるWindows側資源
@@ -26,7 +26,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// resident VM（`crate::tier3::vm_host::VmHost`が管理する共有VM）が起動中であることを示す台帳エントリ。
+/// resident VM（`crate::vm_host::VmHost`が管理する共有VM）が起動中であることを示す台帳エントリ。
 /// 台帳全体で最大1件（`VmLedger::vm_host`が`Option`である理由）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmHostEntry {
@@ -146,7 +146,7 @@ pub fn remove_vm_host() {
 /// 追加、既存なら`refcount += 1`して共有情報はそのまま）。`create_ephemeral_share`が
 /// 実際に`New-SmbShare`/`New-LocalUser`を実行した直後に呼ぶ（新規作成時のみ）か、
 /// 既存資源を再利用する場合は共有情報を引数に渡さず参照カウントだけ増やす
-/// （呼び出し側は`crate::tier3::smb_share::create_ephemeral_share`の呼び出し要否をこの関数の
+/// （呼び出し側は`crate::smb_share::create_ephemeral_share`の呼び出し要否をこの関数の
 /// 戻り値では判断しない——daemon内`SessionRegistry`が「新規か再利用か」を先に判定し、
 /// 新規の場合のみ`create_ephemeral_share`を呼んでからこの関数へ結果を渡す設計とする）。
 pub fn record_workspace_resource(
@@ -200,7 +200,7 @@ fn upsert_workspace_resource_in_ledger(
 }
 
 /// 参照カウントをデクリメントする。0になった場合はエントリを台帳から除去し、呼び出し側が
-/// `crate::tier3::smb_share::destroy_ephemeral_share`を呼ぶための情報として`Some`で返す
+/// `crate::smb_share::destroy_ephemeral_share`を呼ぶための情報として`Some`で返す
 /// （まだ他セッションが使用中＝`refcount > 0`のままなら`None`を返し、共有・アカウントは
 /// 破棄しない）。
 pub fn release_workspace_resource(workspace_id: &str) -> Option<WorkspaceResourceEntry> {
@@ -230,7 +230,7 @@ fn release_workspace_resource_in_ledger(
     }
 }
 
-/// GCで撤収すべきresident VM名を副作用なしに選定する（`crate::tier3::vmsandbox::gc_orphan_sessions`
+/// GCで撤収すべきresident VM名を副作用なしに選定する（`crate::vmsandbox::gc_orphan_sessions`
 /// から呼ばれる、テスト容易性のため純関数化）。**`VmHost::attach`がStopped→Runningへ遷移する
 /// 直前にのみ**呼ばれる想定——daemon生存中のセッション途中で誤って現在のresident VMを孤児
 /// 扱いしないよう、呼び出し側がタイミングを保証する。

@@ -2,7 +2,7 @@
 //! （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.2参照）。
 //!
 //! `harness.exe`が`runas`で昇格起動する別バイナリ。S-2でパイプの向きが反転したため、この
-//! daemon自身が固定named pipe名（[`harness_sandbox::tier3::vmsandboxd::serve_resident`]内で定義）の
+//! daemon自身が固定named pipe名（[`harness_sandbox_vm::vmsandboxd::serve_resident`]内で定義）の
 //! サーバとなり、`StartSession`でVM+コンテナを起動したら**常駐を続け**、`run_shell`呼び出しの
 //! たびに送られる`Exec`を反復処理する。`Teardown`（または親のクラッシュによるパイプ切断）を
 //! 受けても、daemonプロセス自体は終了せず次のセッションの接続を待ち続ける
@@ -28,7 +28,7 @@ fn main() -> std::process::ExitCode {
     // ではなく、1件の`Gc`リクエストだけを処理して即終了する（`vmsandboxd::serve_gc`参照）。
     // この経路は使い捨てパイプ名のままなのでS-2の対象外（`--owner-sid`/`--owner-exe`は不要）。
     if rest.first().map(String::as_str) == Some("--gc-only") {
-        return run_result(harness_sandbox::tier3::vmsandboxd::serve_gc(&pipe_name));
+        return run_result(harness_sandbox_vm::vmsandboxd::serve_gc(&pipe_name));
     }
 
     let (owner_sid, owner_exe, max_sessions) = match parse_owner_args(&rest) {
@@ -38,7 +38,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    run_result(harness_sandbox::tier3::vmsandboxd::serve_resident(
+    run_result(harness_sandbox_vm::vmsandboxd::serve_resident(
         &owner_sid,
         &owner_exe,
         max_sessions,
@@ -83,7 +83,7 @@ fn parse_owner_args(rest: &[String]) -> Result<(String, std::path::PathBuf, u8),
 
 #[cfg(windows)]
 fn run_result(
-    result: Result<(), harness_sandbox::tier3::vmsandboxd::VmSandboxIpcError>,
+    result: Result<(), harness_sandbox_vm::vmsandboxd::VmSandboxIpcError>,
 ) -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

@@ -9,3 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
+harness-sandbox-vm = { version = "0.1.0", path = "../harness-sandbox-vm" }

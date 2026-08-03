@@ -1,7 +1,7 @@
 //! Tier3 VMサンドボックスの起動待ち画面。`picker.rs`と同じ流儀で、呼び出し側が既に
 //! `TerminalGuard::enter()`済みの`term`/`term_events`を借りて描画する。
 //!
-//! ここで表示する進捗は`harness_sandbox::tier3::vmsandboxd_progress`が生成する**経過時間ベースの
+//! ここで表示する進捗は`harness_sandbox_vm::vmsandboxd_progress`が生成する**経過時間ベースの
 //! 合成データ**であり、daemon（`vmsandboxd`）の実測値ではない（同モジュールのdoc参照）。
 
 use std::io::{self, Stdout};
@@ -13,8 +13,8 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use harness_sandbox::tier3::vmsandboxd::VmSandboxHandle;
-use harness_sandbox::tier3::vmsandboxd_progress::{run_synthetic_ticker, SandboxPrepEvent};
+use harness_sandbox_vm::vmsandboxd::VmSandboxHandle;
+use harness_sandbox_vm::vmsandboxd_progress::{run_synthetic_ticker, SandboxPrepEvent};
 
 /// `term`/`term_events`は呼び出し側が既に`TerminalGuard::enter`済みであることを前提とする
 /// （`picker::run_picker`と同じ契約）。戻り値`None`はVM起動失敗（呼び出し側は既存の警告文言

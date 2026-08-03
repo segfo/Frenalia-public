@@ -1,0 +1,37 @@
+[package]
+name = "harness-sandbox-vm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+directories = "6"
+harness-core = { version = "0.1.0", path = "../harness-core" }
+harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
+harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.18"
+
+[target.'cfg(windows)'.dependencies]
+# Incus mTLSクライアント用。デーモンプロセス内で同期IPC呼び出しの一部として使うため
+# `blocking`を使う（`vmsandboxd`自体が非async、`harness-netfilterd`と同じ設計）。
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
+# セッション使い捨てSMBアカウントのパスワード生成用（OSのCSPRNGを使う`rand::rngs::OsRng`経由、
+# `unique_session_id`のPID+タイムスタンプとは異なり実際に秘密として使うため暗号論的乱数が必要）。
+rand = "0.9"
+# 準備画面の合成進捗ticker（`vmsandboxd_progress`）用。`vmsandboxd`自体は非asyncのまま
+# （`spawn_blocking`越しに呼ばれる）で、tokioはこのtickerと呼び出し側の`select!`にのみ使う。
+tokio = { version = "1.52.3", features = ["sync", "time"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

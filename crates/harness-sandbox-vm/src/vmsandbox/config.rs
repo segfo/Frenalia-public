@@ -102,10 +102,10 @@ pub(crate) fn run_powershell(script: &str) -> Result<String, VmError> {
         return Err(VmError::PowerShell(format!(
             "exit={:?} stderr={}",
             output.status.code(),
-            crate::decode_console_bytes(&output.stderr)
+            harness_sandbox::decode_console_bytes(&output.stderr)
         )));
     }
-    Ok(crate::decode_console_bytes(&output.stdout).trim().to_string())
+    Ok(harness_sandbox::decode_console_bytes(&output.stdout).trim().to_string())
 }
 
 /// **Phase B実機E2Eで発見したバグ**: `std::process::id()`+ミリ秒タイムスタンプという

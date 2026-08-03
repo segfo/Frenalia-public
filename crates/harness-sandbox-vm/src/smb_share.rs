@@ -22,8 +22,8 @@ use std::process::Stdio;
 
 use rand::Rng;
 
-use crate::tier3::vmsandbox::VmError;
-use crate::tier2a::win_appcontainer::{grant_ace_inheritable_rw, revoke_ace_recursive};
+use crate::vmsandbox::VmError;
+use harness_sandbox::tier2a::win_appcontainer::{grant_ace_inheritable_rw, revoke_ace_recursive};
 
 /// `New-LocalUser`のアカウント名。Windowsローカルアカウント名の20文字制限に収まるよう、
 /// `workspace_id`（`short_id(canonicalized workspace_root)`、`vmsandbox::compute_workspace_id`
@@ -112,10 +112,10 @@ fn run_powershell_stdin(script: &str) -> Result<String, VmError> {
         return Err(VmError::PowerShell(format!(
             "exit={:?} stderr={}",
             output.status.code(),
-            crate::decode_console_bytes(&output.stderr)
+            harness_sandbox::decode_console_bytes(&output.stderr)
         )));
     }
-    Ok(crate::decode_console_bytes(&output.stdout).trim().to_string())
+    Ok(harness_sandbox::decode_console_bytes(&output.stdout).trim().to_string())
 }
 
 /// PowerShellの文字列リテラル内で安全に埋め込めるよう、シングルクォートを`''`へ
@@ -127,7 +127,7 @@ fn ps_quote(s: &str) -> String {
 
 /// セッション使い捨てのSMB共有とローカルアカウントを作成する。戻り値は
 /// `(share_name, user_name, password)`。呼び出し側はこの直後に
-/// `crate::tier3::vm_ledger::record_smb_share`で台帳へ追記し、`password`をSSH経由でゲストへ
+/// `crate::vm_ledger::record_smb_share`で台帳へ追記し、`password`をSSH経由でゲストへ
 /// credentials fileとして配布する（このモジュールはSSH配布自体は行わない）。
 ///
 /// **NTFSアクセス権の付与（S1スパイクで実機検証済み）**: `New-SmbShare -FullAccess`は
@@ -200,7 +200,7 @@ pub fn create_ephemeral_share(
         match run_powershell_stdin(&script) {
             Ok(sid_string) => {
                 let sid_owned = unsafe {
-                    let sid_w = crate::win_common::wide(&sid_string);
+                    let sid_w = harness_sandbox::win_common::wide(&sid_string);
                     let mut psid = windows::Win32::Security::PSID::default();
                     windows::Win32::Security::Authorization::ConvertStringSidToSidW(
                         windows::core::PCWSTR(sid_w.as_ptr()),
@@ -252,11 +252,11 @@ pub fn create_ephemeral_share(
 /// 呼び出し側の実装ミスに対する防御的なフォールバックとして残す。
 pub fn destroy_ephemeral_share(share_name: &str, user_name: &str, workspace_root: Option<&Path>) {
     if let Some(workspace_root) = workspace_root {
-        if let Ok(sid_string) = crate::tier3::vmsandbox::run_powershell(&format!(
+        if let Ok(sid_string) = crate::vmsandbox::run_powershell(&format!(
             "(Get-LocalUser -Name '{user_name}' -ErrorAction Stop).SID.Value"
         )) {
             let sid_result = unsafe {
-                let sid_w = crate::win_common::wide(&sid_string);
+                let sid_w = harness_sandbox::win_common::wide(&sid_string);
                 let mut psid = windows::Win32::Security::PSID::default();
                 windows::Win32::Security::Authorization::ConvertStringSidToSidW(
                     windows::core::PCWSTR(sid_w.as_ptr()),
@@ -288,7 +288,7 @@ fn remove_smb_share_with_retry(share_name: &str) {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(200 * attempt as u64));
         }
-        match crate::tier3::vmsandbox::run_powershell(&format!(
+        match crate::vmsandbox::run_powershell(&format!(
             "if (Get-SmbShare -Name '{share_name}' -ErrorAction SilentlyContinue) {{ \
              Remove-SmbShare -Name '{share_name}' -Force -ErrorAction Stop }}"
         )) {
@@ -315,7 +315,7 @@ fn remove_local_user_with_retry(user_name: &str) {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(200 * attempt as u64));
         }
-        match crate::tier3::vmsandbox::run_powershell(&format!(
+        match crate::vmsandbox::run_powershell(&format!(
             "if (Get-LocalUser -Name '{user_name}' -ErrorAction SilentlyContinue) {{ \
              Remove-LocalUser -Name '{user_name}' -ErrorAction Stop }}"
         )) {
@@ -370,7 +370,7 @@ pub fn enumerate_windows_workspace_shares() -> Vec<(String, String, std::path::P
 Get-SmbShare -Name 'harness-ws-*' -ErrorAction SilentlyContinue |
     ForEach-Object { "$($_.Name)`t$($_.Path)" }
 "#;
-    let Ok(stdout) = crate::tier3::vmsandbox::run_powershell(script) else {
+    let Ok(stdout) = crate::vmsandbox::run_powershell(script) else {
         return Vec::new();
     };
     parse_workspace_share_listing(&stdout)
@@ -436,13 +436,31 @@ Get-NetFirewallRule -DisplayGroup 'File and Printer Sharing' -ErrorAction Silent
         switch_name = ps_quote(switch_name),
         subnet_cidr = subnet_cidr,
     );
-    crate::tier3::vmsandbox::run_powershell(&script)?;
+    crate::vmsandbox::run_powershell(&script)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// テスト用: `create_ephemeral_share`が作った資源を、正常終了・`?`による早期return・
+    /// パニックのいずれの経路でも確実に後片付けする（`Drop`）。かつて正常系の最後でだけ
+    /// `destroy_ephemeral_share`を呼んでいたため、途中の`net use`失敗（実機で観測済みの
+    /// システムエラー67）で`?`が発火すると使い捨てアカウント・実workspaceへのACEが孤児化する
+    /// 欠陥があった。`destroy_ephemeral_share`自体はbest-effortで冪等なため、テスト内で
+    /// 明示的に呼んだ後にもう一度Dropで呼ばれても実害はない。
+    struct EphemeralShareGuard {
+        share: String,
+        user: String,
+        workspace_root: Option<std::path::PathBuf>,
+    }
+
+    impl Drop for EphemeralShareGuard {
+        fn drop(&mut self) {
+            destroy_ephemeral_share(&self.share, &self.user, self.workspace_root.as_deref());
+        }
+    }
 
     #[test]
     fn short_id_is_deterministic_and_fixed_length() {
@@ -545,9 +563,15 @@ mod tests {
             let _ = std::fs::remove_dir_all(&scratch);
         };
 
+        let mut guard: Option<EphemeralShareGuard> = None;
         let result = (|| -> Result<(), String> {
             let (share, user, password, _sid) = create_ephemeral_share(&session_id, &scratch)
                 .map_err(|e| format!("create_ephemeral_share failed: {e:?}"))?;
+            guard = Some(EphemeralShareGuard {
+                share: share.clone(),
+                user: user.clone(),
+                workspace_root: Some(scratch.clone()),
+            });
 
             let unc = format!(r"\\localhost\{share}");
 
@@ -586,7 +610,7 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
             let sid_string = run_ps_capture(&format!("(Get-LocalUser -Name '{user}').SID.Value"))
                 .map_err(|e| format!("failed to look up SID before revoke: {e}"))?;
             let sid_owned = unsafe {
-                let sid_w = crate::win_common::wide(&sid_string);
+                let sid_w = harness_sandbox::win_common::wide(&sid_string);
                 let mut psid = windows::Win32::Security::PSID::default();
                 windows::Win32::Security::Authorization::ConvertStringSidToSidW(
                     windows::core::PCWSTR(sid_w.as_ptr()),
@@ -616,10 +640,10 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
                 );
             }
 
-            destroy_ephemeral_share(&share, &user, Some(&scratch));
             Ok(())
         })();
 
+        drop(guard);
         cleanup();
         result.expect("SMB mount verification spike must succeed end-to-end");
     }
@@ -636,8 +660,8 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
             return Err(format!(
                 "exit={:?} stdout={} stderr={}",
                 output.status.code(),
-                crate::decode_console_bytes(&output.stdout),
-                crate::decode_console_bytes(&output.stderr)
+                harness_sandbox::decode_console_bytes(&output.stdout),
+                harness_sandbox::decode_console_bytes(&output.stderr)
             ));
         }
         Ok(())
@@ -660,10 +684,10 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
             return Err(format!(
                 "exit={:?} stderr={}",
                 output.status.code(),
-                crate::decode_console_bytes(&output.stderr)
+                harness_sandbox::decode_console_bytes(&output.stderr)
             ));
         }
-        Ok(crate::decode_console_bytes(&output.stdout).trim().to_string())
+        Ok(harness_sandbox::decode_console_bytes(&output.stdout).trim().to_string())
     }
 
     /// [実リポジトリ本体での検証] ユーザー指示による5段階検証のうち、最終段（このharness
@@ -675,10 +699,13 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
     ///
     /// **安全策**: `assert!`ではなくすべて`Err`返却にして、途中で条件を満たさなくても
     /// パニックで巻き戻し処理を飛ばさないようにする（実リポジトリへの変更のため、
-    /// revoke/共有削除を確実に実行してから最後に成否を確定させる）。事前に`icacls`で
-    /// ルートのベースラインDACLを記録し（本テストのassert対象ではなく、テスト実行者が
-    /// 目視で比較できるようログへ出力するのみ）、事後に同じユーザーのACEが残っていないかも
-    /// 確認する。
+    /// revoke/共有削除を確実に実行してから最後に成否を確定させる）。`?`による早期returnの
+    /// 経路でも確実にteardownされるよう、後片付けは`EphemeralShareGuard`（`Drop`）に持たせる
+    /// （かつては正常系の最後でだけ`destroy_ephemeral_share`を呼んでおり、`net use`の一時的な
+    /// 失敗＝実機で観測済みのシステムエラー67で`?`が発火すると資源が孤児化する欠陥があった）。
+    /// 事前に`icacls`でルートのベースラインDACLを記録し（本テストのassert対象ではなく、
+    /// テスト実行者が目視で比較できるようログへ出力するのみ）、事後に同じユーザーのACEが
+    /// 残っていないかも確認する。
     #[test]
     #[ignore]
     fn real_repo_root_smb_grant_revoke_at_full_scale() {
@@ -695,10 +722,16 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
         let unique = std::process::id();
         let session_id = format!("reporoot{unique}");
 
+        let mut guard: Option<EphemeralShareGuard> = None;
         let result = (|| -> Result<(), String> {
             let t_grant = std::time::Instant::now();
             let (share, user, password, _sid) = create_ephemeral_share(&session_id, &repo_root)
                 .map_err(|e| format!("create_ephemeral_share (grant included) failed: {e:?}"))?;
+            guard = Some(EphemeralShareGuard {
+                share: share.clone(),
+                user: user.clone(),
+                workspace_root: Some(repo_root.clone()),
+            });
             let grant_elapsed = t_grant.elapsed();
             println!("=== real repo root (~57k files incl. target/) create_ephemeral_share (incl. grant_ace_inheritable_rw) took {grant_elapsed:?} ===");
 
@@ -725,7 +758,7 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
             let sid_string = run_ps_capture(&format!("(Get-LocalUser -Name '{user}').SID.Value"))
                 .map_err(|e| format!("SID lookup before revoke failed: {e}"))?;
             let sid_owned = unsafe {
-                let sid_w = crate::win_common::wide(&sid_string);
+                let sid_w = harness_sandbox::win_common::wide(&sid_string);
                 let mut psid = windows::Win32::Security::PSID::default();
                 windows::Win32::Security::Authorization::ConvertStringSidToSidW(
                     windows::core::PCWSTR(sid_w.as_ptr()),
@@ -772,8 +805,6 @@ exit 0
             ));
             let _ = run_ps(&format!("net use '{unc}' /delete /y"));
 
-            destroy_ephemeral_share(&share, &user, Some(&repo_root));
-
             if read_after_revoke {
                 return Err(
                     "after revoke_ace_recursive, SMB read of the real repo must be denied"
@@ -783,6 +814,7 @@ exit 0
             Ok(())
         })();
 
+        drop(guard);
         let after_acl = run_ps_capture(&format!("icacls '{}'", repo_root.display()))
             .unwrap_or_else(|e| format!("<failed to capture post-test ACL: {e}>"));
         println!("=== ACL after test (should match baseline, modulo ordering) ===\n{after_acl}");

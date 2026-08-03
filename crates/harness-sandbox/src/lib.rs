@@ -10,12 +10,13 @@
 //!    apply/discard）、`read_scope`（whitelist/blacklist反転モード）、`resolve`、`secret_env`、
 //!    `manifest`。
 //! 3. **シェル隔離Tierごとの実装** — `tier1`（Windows制限トークン+低IL）・`tier2a`
-//!    （Windows AppContainer、既定）・`tier2b`（Linux bubblewrap）・`tier3`（Hyper-V VM +
-//!    Incusコンテナ）。どのTierを選ぶかの判定は`shell_tier`が持つ（Tier横断のため
-//!    どのtierモジュールにも属さない）。
+//!    （Windows AppContainer、既定）・`tier2b`（Linux bubblewrap）。Tier3（Hyper-V VM +
+//!    Incusコンテナ）は`harness-sandbox-vm`クレートが持つ（本クレートの**上**に載る、
+//!    `plans/DESIGN.md` §ワークスペース構成参照）。どのTierを選ぶかの判定は`shell_tier`が
+//!    持つ（Tier横断のためどのtierモジュールにも属さない）。
 //!
 //! Tierごとのモジュールは`tierN`のファサード越しにのみ公開する。そこに現れていない
-//! モジュール（`tier2a::wfp`・`tier3::vm_host`等）はそのTier内部の実装詳細である。
+//! モジュール（`tier2a::wfp`等）はそのTier内部の実装詳細である。
 //!
 //! **主ゲートはcap-std**: 起動時（実際にはツール呼び出しごと。§実装ノート参照）に開いた
 //! `cap_std::fs::Dir` ハンドルからの相対openに統一し、絶対パス再解決を経由したTOCTOU
@@ -39,14 +40,17 @@ pub mod secret_env;
 /// どのシェル隔離Tierを選ぶかの判定。Tier横断のためどの`tierN`にも属さない。
 pub mod shell_tier;
 
+/// `harness-sandbox-vm`（Tier3）がACL/コンソール出力の共通ヘルパーとして参照するため`pub`
+/// （`docs/CODE-STRUCTURE-RULES.md`規則4、外部利用が実測されたため公開面へ昇格した）。
 #[cfg(windows)]
-mod win_common;
+pub mod win_common;
 
 /// 名前付きパイプIPCの下回り（DACL・オーバーラップドI/O・長さプレフィックス・フレーミング）。
-/// `tier2a::privhelper`・`tier2a::netfilterd`・`tier3::vmsandboxd`が共有するため、
-/// どの`tierN`にも属さずここに置く。
+/// `tier2a::privhelper`・`tier2a::netfilterd`・`harness-sandbox-vm`の`vmsandboxd`が共有する
+/// ため、どの`tierN`にも属さずここに置く。`harness-sandbox-vm`から参照されるため`pub`
+/// （`docs/CODE-STRUCTURE-RULES.md`規則4）。
 #[cfg(windows)]
-pub(crate) mod win_pipe_ipc;
+pub mod win_pipe_ipc;
 
 /// BUG-051: 子プロセスのコンソール出力（起動直後のANSIコードページ由来のメッセージと、
 /// ブートストラップ適用後のUTF-8が同一ストリーム内で混在し得る）を復号するために使う。
@@ -70,9 +74,6 @@ pub mod tier2a;
 
 #[cfg(target_os = "linux")]
 pub mod tier2b;
-
-#[cfg(windows)]
-pub mod tier3;
 
 pub use manifest::ManifestOp;
 pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};

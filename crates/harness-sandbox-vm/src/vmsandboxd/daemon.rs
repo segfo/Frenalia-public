@@ -50,7 +50,7 @@ impl SessionRegistry {
 
     /// 空いているslot番号（`0..max_sessions`）を確保する。上限に達していれば`None`。
     /// `slot`はコンテナの静的IP・SNIプロキシポートの衝突回避に使われる
-    /// （`crate::tier3::vmsandbox::container_static_ip_cidr`/`sni_proxy_port_for_slot`）。
+    /// （`crate::vmsandbox::container_static_ip_cidr`/`sni_proxy_port_for_slot`）。
     fn try_acquire_slot(&self) -> Option<u8> {
         let mut slots = self.active_slots.lock().unwrap();
         for slot in 0..self.max_sessions {
@@ -258,7 +258,7 @@ fn serve_inner(
     let config = VmSandboxConfig::default();
 
     // **Phase B**: 孤児VM/差分VHDXの撤収（旧D-24、`gc_orphan_sessions`）はもう本関数の
-    // 呼び出しごとには行わない。VM自体が`crate::tier3::vm_host::VmHost`の参照カウントで管理される
+    // 呼び出しごとには行わない。VM自体が`crate::vm_host::VmHost`の参照カウントで管理される
     // 共有resident資源になったため、GCは「daemonが今から初めてVMを起動しようとする瞬間
     // （`VmHost::attach`のStopped→Running遷移）」にのみ実行される——セッション途中で
     // 誤って現在生存中のVMを孤児扱いしてしまう事故を構造的に防ぐため。
@@ -373,7 +373,7 @@ fn send_response(pipe: HANDLE, resp: &VmResponse) -> Result<(), VmSandboxIpcErro
 
 /// daemon側のGC専用エントリポイント（`harness-vmsandboxd.exe <pipe> --gc-only`から呼ぶ）。
 /// `serve`（`StartSession`起点の長期常駐ループ）とは別経路: [`VmRequest::Gc`]を1件受けて
-/// `crate::tier3::vmsandbox::gc_orphan_sessions`を実行し、結果を返してすぐ終了する（`run_gc_only`
+/// `crate::vmsandbox::gc_orphan_sessions`を実行し、結果を返してすぐ終了する（`run_gc_only`
 /// のdoc参照）。
 pub fn serve_gc(pipe_name: &str) -> Result<(), VmSandboxIpcError> {
     let pipe = unsafe {
@@ -402,7 +402,7 @@ fn serve_gc_inner(pipe: HANDLE) -> Result<(), VmSandboxIpcError> {
     match serde_json::from_slice::<VmRequest>(&request_bytes) {
         Ok(VmRequest::Gc) => {
             let config = VmSandboxConfig::default();
-            let reaped = crate::tier3::vmsandbox::gc_orphan_sessions(&config, "");
+            let reaped = crate::vmsandbox::gc_orphan_sessions(&config, "");
             send_response(
                 pipe,
                 &VmResponse::GcReport {

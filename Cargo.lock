@@ -1026,6 +1026,7 @@ dependencies = [
  "harness-grant-ledger",
  "harness-providers",
  "harness-sandbox",
+ "harness-sandbox-vm",
  "harness-tools",
  "harness-tui",
  "serde",
@@ -1133,6 +1134,23 @@ dependencies = [
  "harness-change-ledger",
  "harness-core",
  "harness-grant-ledger",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "which",
+ "windows",
+]
+
+[[package]]
+name = "harness-sandbox-vm"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "harness-core",
+ "harness-grant-ledger",
+ "harness-sandbox",
  "rand 0.9.4",
  "reqwest",
  "serde",
@@ -1140,7 +1158,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "which",
  "windows",
 ]
 
@@ -1183,6 +1200,7 @@ dependencies = [
  "harness-core",
  "harness-engine",
  "harness-sandbox",
+ "harness-sandbox-vm",
  "harness-tools",
  "ratatui",
  "serde_json",
@@ -1199,6 +1217,7 @@ name = "harness-vmsandboxd"
 version = "0.1.0"
 dependencies = [
  "harness-sandbox",
+ "harness-sandbox-vm",
 ]
 
 [[package]]

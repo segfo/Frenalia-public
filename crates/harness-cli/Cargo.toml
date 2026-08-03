@@ -28,6 +28,7 @@ harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
 harness-engine = { version = "0.1.0", path = "../harness-engine" }
 harness-providers = { version = "0.1.0", path = "../harness-providers" }
 harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
+harness-sandbox-vm = { version = "0.1.0", path = "../harness-sandbox-vm" }
 harness-tools = { version = "0.1.0", path = "../harness-tools" }
 harness-tui = { version = "0.1.0", path = "../harness-tui" }
 serde = { version = "1", features = ["derive"] }

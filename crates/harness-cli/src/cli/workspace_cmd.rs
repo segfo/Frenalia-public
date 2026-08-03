@@ -118,7 +118,7 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
 pub(crate) fn shell_sees_staged_writes(shell_tier: &harness_core::ShellTierSelection) -> bool {
     #[cfg(windows)]
     {
-        use harness_sandbox::tier3::vmsandbox::{VmSandboxConfig, WorkspaceShareMode};
+        use harness_sandbox_vm::vmsandbox::{VmSandboxConfig, WorkspaceShareMode};
 
         shell_tier.tier == harness_core::ShellTier::Tier3
             && VmSandboxConfig::default().workspace_share_mode == WorkspaceShareMode::Cifs

@@ -39,8 +39,8 @@ pub(crate) fn ssh_exec(
         .output()
         .map_err(|e| VmError::Io(format!("failed to spawn ssh: {e}")))?;
     Ok((
-        crate::decode_console_bytes(&output.stdout),
-        crate::decode_console_bytes(&output.stderr),
+        harness_sandbox::decode_console_bytes(&output.stdout),
+        harness_sandbox::decode_console_bytes(&output.stderr),
         output.status.code().unwrap_or(-1),
     ))
 }
@@ -116,7 +116,7 @@ pub(crate) fn ssh_push_file(
     if !output.status.success() {
         return Err(VmError::Io(format!(
             "ssh_push_file to {remote_path} failed: {}",
-            crate::decode_console_bytes(&output.stderr)
+            harness_sandbox::decode_console_bytes(&output.stderr)
         )));
     }
     Ok(())

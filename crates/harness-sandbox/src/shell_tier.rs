@@ -227,7 +227,7 @@ pub fn select_tier_with_probes(
 
 /// Tier3の軽量可用性チェック（ゴールデン像VHDXの存在のみ確認、実際のVM起動はしない）。
 /// `plans/DESIGN-SANDBOX-VMISOLATION.md`の固定運用規約と同じパスを見る
-/// （`harness_sandbox::tier3::vmsandbox::VmSandboxConfig::default().golden_vhdx`と同一値、
+/// （`harness_sandbox_vm::vmsandbox::VmSandboxConfig::default().golden_vhdx`と同一値、
 /// 循環依存を避けるためここでは値を直接埋め込む——両者が乖離したら単体テストで検知できないが、
 /// Phase 1では許容する）。
 #[cfg(windows)]

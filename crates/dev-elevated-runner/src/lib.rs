@@ -47,6 +47,13 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture", "win_appcontainer::cow_diagnostics",
         ],
     ),
+    (
+        "e2e-sandbox-vm-ignored",
+        &[
+            "test", "-p", "harness-sandbox-vm", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture",
+        ],
+    ),
     // `dev-elevated-runner`自身は除外する。デーモン(`dev-elevated-runnerd.exe`)がこの
     // コマンドを実行している間、自分自身の実行ファイルは起動中でロックされておりリンクし
     // 直せない（実機で`error: failed to remove file ...dev-elevated-runnerd.exe: アクセスが
