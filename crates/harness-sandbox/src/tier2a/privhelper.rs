@@ -1252,6 +1252,194 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
     }
 }
 
+/// 名前付きパイプIPC下回りの現行の振る舞いを固定するcharacterization test。
+///
+/// この9関数（`run_overlapped`・`connect_with_timeout`・`write_all_timeout`・
+/// `read_exact_timeout`・`write_framed_timeout`・`read_framed_timeout`・
+/// `user_only_security_attributes`・`unique_pipe_name`・`current_user_sid_string`）は
+/// `tier2a::netfilterd`・`tier3::vmsandboxd`にもコピーとして存在し、共通モジュールへ
+/// 1本化する予定である（`docs/CODE-STRUCTURE-RULES.md`規則5）。統合の前後で振る舞いが
+/// 変わっていないことを示す基準としてここに置く（規則6）。統合後はテストごと共通モジュールへ移す。
+///
+/// 既存の`framed_message_roundtrips_over_a_real_named_pipe`（`netfilterd`/`vmsandboxd`側）は
+/// write→readが対称でありさえすれば通るため、**ワイヤ上のバイト列が変わったことを検出できない**。
+/// 別プロセス間で交換する形なので、ここではバイト列そのものを固定する。
+#[cfg(all(windows, test))]
+mod pipe_ipc_characterization {
+    use super::*;
+
+    fn short_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(5)
+    }
+
+    /// テスト用の接続済みパイプ対を作る。戻り値は(server, client)。
+    fn connected_pipe_pair() -> (HANDLE, HANDLE, String) {
+        let pipe_name = unique_pipe_name();
+        let sid = current_user_sid_string().expect("current_user_sid_string");
+        let mut sa = user_only_security_attributes(&sid).expect("user_only_security_attributes");
+
+        let server = unsafe {
+            let pipe_name_w = wide(&pipe_name);
+            let handle = CreateNamedPipeW(
+                PCWSTR(pipe_name_w.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                Some(&mut sa as *mut _),
+            );
+            let _ = LocalFree(HLOCAL(sa.lpSecurityDescriptor));
+            assert!(!handle.is_invalid(), "CreateNamedPipeW failed");
+            handle
+        };
+
+        let name_for_client = pipe_name.clone();
+        let client_thread = std::thread::spawn(move || unsafe {
+            let pipe_name_w = wide(&name_for_client);
+            CreateFileW(
+                PCWSTR(pipe_name_w.as_ptr()),
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+                windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                None,
+            )
+            .expect("client CreateFileW")
+            .0 as usize
+        });
+
+        connect_with_timeout(server, short_timeout()).expect("connect_with_timeout");
+        let client = HANDLE(client_thread.join().unwrap() as *mut _);
+        (server, client, pipe_name)
+    }
+
+    fn close_pair(server: HANDLE, client: HANDLE) {
+        unsafe {
+            let _ = DisconnectNamedPipe(server);
+            let _ = CloseHandle(server);
+            let _ = CloseHandle(client);
+        }
+    }
+
+    /// フレーム形式は「4バイトのリトルエンディアン長プレフィックス + ペイロード」。
+    /// 生バイト列を読み出して固定する（往復テストでは検出できない変化を捕まえるため）。
+    #[test]
+    fn a_frame_is_a_4_byte_little_endian_length_prefix_followed_by_the_payload() {
+        let (server, client, _) = connected_pipe_pair();
+
+        write_framed_timeout(client, b"hi", short_timeout()).expect("write_framed_timeout");
+
+        let mut raw = [0u8; 6];
+        read_exact_timeout(server, &mut raw, short_timeout()).expect("read_exact_timeout");
+        assert_eq!(raw, [0x02, 0x00, 0x00, 0x00, b'h', b'i']);
+
+        close_pair(server, client);
+    }
+
+    /// 長さ0のフレームは長さプレフィックスだけを書き、読み側は空のVecを返す
+    /// （`read_framed_timeout`が`len > 0`のときだけペイロードを読む分岐）。
+    #[test]
+    fn a_zero_length_frame_writes_only_the_prefix_and_reads_back_empty() {
+        let (server, client, _) = connected_pipe_pair();
+
+        write_framed_timeout(client, b"", short_timeout()).expect("write_framed_timeout");
+        let received = read_framed_timeout(server, short_timeout()).expect("read_framed_timeout");
+        assert!(received.is_empty());
+
+        close_pair(server, client);
+    }
+
+    /// 複数フレームを続けて書いても、境界が保たれたまま1つずつ読み出せる
+    /// （バイトストリームモードのパイプ上で長さプレフィックスがフレーム境界を担う）。
+    #[test]
+    fn consecutive_frames_keep_their_boundaries() {
+        let (server, client, _) = connected_pipe_pair();
+
+        write_framed_timeout(client, b"first", short_timeout()).unwrap();
+        write_framed_timeout(client, b"second-longer", short_timeout()).unwrap();
+
+        assert_eq!(
+            read_framed_timeout(server, short_timeout()).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            read_framed_timeout(server, short_timeout()).unwrap(),
+            b"second-longer"
+        );
+
+        close_pair(server, client);
+    }
+
+    /// データが来ない状態での読取はタイムアウトでエラーになる（無限待ちしない）。
+    #[test]
+    fn reading_with_nothing_on_the_wire_times_out_instead_of_blocking_forever() {
+        let (server, client, _) = connected_pipe_pair();
+
+        let started = std::time::Instant::now();
+        let result = read_framed_timeout(server, std::time::Duration::from_millis(300));
+        assert!(result.is_err(), "expected a timeout error, got {result:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "read should have returned promptly after the timeout"
+        );
+
+        close_pair(server, client);
+    }
+
+    /// パイプ名は呼び出しごとに一意で、この機構専用の接頭辞を持つ。
+    #[test]
+    fn pipe_names_are_unique_and_prefixed_for_this_mechanism() {
+        let a = unique_pipe_name();
+        let b = unique_pipe_name();
+        assert_ne!(a, b);
+        assert!(a.starts_with(r"\\.\pipe\harness-privhelper-"), "got {a}");
+        assert!(a.contains(&std::process::id().to_string()));
+    }
+
+    /// パイプのDACLは呼び出しユーザーのSIDだけを許可する（他ユーザ・Administratorsは
+    /// DACLに列挙されないtrusteeとして暗黙deny）。SDDLの生成結果に自分のSIDが含まれ、
+    /// かつ他のtrusteeが入っていないことを、セキュリティ記述子から確認する。
+    #[test]
+    fn the_pipe_dacl_names_only_the_calling_user() {
+        let sid = current_user_sid_string().expect("current_user_sid_string");
+        let sa = user_only_security_attributes(&sid).expect("user_only_security_attributes");
+
+        // 生成に使ったSDDLと同じ形へ戻せることを、記述子を文字列化して確認する。
+        let mut out = windows::core::PWSTR::null();
+        let ok = unsafe {
+            windows::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                PSECURITY_DESCRIPTOR(sa.lpSecurityDescriptor),
+                SDDL_REVISION_1,
+                windows::Win32::Security::DACL_SECURITY_INFORMATION,
+                &mut out,
+                None,
+            )
+        };
+        assert!(ok.is_ok(), "ConvertSecurityDescriptorToStringSecurityDescriptorW failed");
+        let sddl = crate::win_common::pwstr_to_string(out);
+        unsafe {
+            let _ = LocalFree(HLOCAL(out.0 as *mut _));
+            let _ = LocalFree(HLOCAL(sa.lpSecurityDescriptor));
+        }
+
+        // 生成元は`D:(A;;GA;;;<sid>)`。ACEはちょうど1件で、呼び出しユーザーへ
+        // GENERIC_ALLのみ。Administratorsを含む他のtrusteeは列挙されない＝暗黙deny。
+        assert_eq!(
+            sddl,
+            format!("D:(A;;GA;;;{sid})"),
+            "the pipe DACL must grant GENERIC_ALL to the calling user and no one else"
+        );
+        // `P`（protected、継承ACEを受け付けない）は付いていない。名前付きパイプは
+        // 継承元のコンテナを持たないため実効的な差が無く、付与していないのが現行の挙動。
+        assert!(!sddl.contains("D:P"), "unexpected protected flag in {sddl}");
+        // ハンドル自体は子プロセスへ継承させない。
+        assert_eq!(sa.bInheritHandle.0, 0, "the pipe handle must not be inheritable");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
