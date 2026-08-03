@@ -252,26 +252,25 @@ fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode> {
     })
 }
 
-pub async fn run() -> ExitCode {
-    let ParsedArgs {
-        cli,
-        workspace_root,
-        resume_id,
-        resume_wants_picker,
-    } = match stage_parse_args() {
-        Ok(p) => p,
-        Err(code) => return code,
-    };
+/// [`stage_open_session`]の出力。Stage4（`stage_prepare_sandbox`）以降が必要とする値を運ぶ。
+struct SessionOpened {
+    cli: Cli,
+    workspace_root: PathBuf,
+    resume_wants_picker: bool,
+    settings: harness_config::Settings,
+    provider: Box<dyn LlmProvider>,
+    model: String,
+    max_turns: usize,
+    enter_submits: bool,
+    tools: ToolRegistry,
+    arbiter: PermissionArbiter,
+    sessions_dir: PathBuf,
+    session: harness_engine::SessionStore,
+    session_messages: Vec<harness_core::Message>,
+}
 
-    let configured = match stage_configure(ParsedArgs {
-        cli,
-        workspace_root,
-        resume_id,
-        resume_wants_picker,
-    }) {
-        Ok(c) => c,
-        Err(code) => return code,
-    };
+/// `sessions_dir`作成・`SessionStore`解決・`--fork-session`・履歴読込。
+fn stage_open_session(configured: Configured) -> Result<SessionOpened, ExitCode> {
     let Configured {
         cli,
         workspace_root,
@@ -294,14 +293,14 @@ pub async fn run() -> ExitCode {
             "failed to create sessions directory {}: {e}",
             sessions_dir.display()
         );
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
     let mut session =
         match resolve_session(&sessions_dir, resume_id.as_deref(), cli.continue_session) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{e}");
-                return ExitCode::FAILURE;
+                return Err(ExitCode::FAILURE);
             }
         };
 
@@ -316,7 +315,7 @@ pub async fn run() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("failed to fork session {source_id}: {e}");
-                return ExitCode::FAILURE;
+                return Err(ExitCode::FAILURE);
             }
         }
     }
@@ -329,9 +328,66 @@ pub async fn run() -> ExitCode {
         Ok(msgs) => msgs,
         Err(e) => {
             eprintln!("failed to load session {}: {e}", session.path().display());
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
+
+    Ok(SessionOpened {
+        cli,
+        workspace_root,
+        resume_wants_picker,
+        settings,
+        provider,
+        model,
+        max_turns,
+        enter_submits,
+        tools,
+        arbiter,
+        sessions_dir,
+        session,
+        session_messages,
+    })
+}
+
+pub async fn run() -> ExitCode {
+    let ParsedArgs {
+        cli,
+        workspace_root,
+        resume_id,
+        resume_wants_picker,
+    } = match stage_parse_args() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    let configured = match stage_configure(ParsedArgs {
+        cli,
+        workspace_root,
+        resume_id,
+        resume_wants_picker,
+    }) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let session_opened = match stage_open_session(configured) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let SessionOpened {
+        cli,
+        workspace_root,
+        resume_wants_picker,
+        settings,
+        provider,
+        model,
+        max_turns,
+        enter_submits,
+        tools,
+        arbiter,
+        sessions_dir,
+        session,
+        session_messages,
+    } = session_opened;
 
     // 書込ステージング設定（M10・D-29）。`sandbox_dir`は`session.id()`確定後でなければ組めない
     // ため、ここで`ToolCtx`を構築する。既定（フラグ無指定）を含め`Live`実効時はオーバーレイ
