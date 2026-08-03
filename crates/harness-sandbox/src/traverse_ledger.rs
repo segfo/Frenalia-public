@@ -104,3 +104,93 @@ pub fn remove_traverse_grant(path: &Path) {
     ledger.entries.retain(|e| e.path != path_str);
     save_traverse_ledger(&ledger);
 }
+
+/// `write_ledger_file`の現行の振る舞いを固定するcharacterization test。
+///
+/// この関数は`fs-passthrough-ledger`・`tier3-vm-ledger`・`workspace-grant-ledger`にも
+/// ほぼ同一のコピーが存在し（`docs/CODE-STRUCTURE-RULES.md`規則5）、`harness-grant-ledger`
+/// クレートへ1本化する予定である。統合の前後で振る舞いが変わっていないことを示す基準として
+/// ここに置く（規則6）。統合後はテストごと新クレートへ移す。
+///
+/// パス解決（`traverse_ledger_path`）は`%APPDATA%`固定でテストから差し替えられないため、
+/// ここでは明示パスを受け取る`write_ledger_file`だけを対象にする。
+#[cfg(test)]
+mod write_ledger_file_characterization {
+    use super::*;
+
+    #[test]
+    fn creates_missing_parent_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested").join("deeper").join("ledger.json");
+        write_ledger_file(&path, "{}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+    }
+
+    #[test]
+    fn first_write_creates_no_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ledger.json");
+        write_ledger_file(&path, r#"{"entries":[]}"#);
+        assert!(!tmp.path().join("ledger.json.bak").exists());
+    }
+
+    /// 誤削除防止の2層のうち`.bak`側。上書き時、**旧内容**が`.json.bak`へ退避される。
+    #[test]
+    fn overwrite_backs_up_the_previous_contents_to_json_bak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ledger.json");
+        write_ledger_file(&path, "OLD");
+        write_ledger_file(&path, "NEW");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "NEW");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("ledger.json.bak")).unwrap(),
+            "OLD"
+        );
+    }
+
+    /// 誤削除防止の2層のうちread-only属性側（`-Force`無しの`Remove-Item`を弾く）。
+    /// 上書き時は一旦解除してから書き、書込後に再付与する。
+    #[cfg(windows)]
+    #[test]
+    fn write_leaves_the_file_readonly_and_can_still_overwrite_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ledger.json");
+        write_ledger_file(&path, "first");
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+        write_ledger_file(&path, "second");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+    }
+
+    /// 非Windowsでは`set_readonly`がchmodのworld-writable相当になり有効な防御にならないため
+    /// 何もしない。`workspace_ledger`のコピーだけこの`#[cfg]`ガードを欠いている。
+    #[cfg(not(windows))]
+    #[test]
+    fn readonly_attribute_is_not_touched_on_non_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ledger.json");
+        write_ledger_file(&path, "first");
+        assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
+    }
+
+    /// 読取側のfail-open: 壊れたJSON・存在しないファイルはいずれも空台帳として扱い、
+    /// 起動を止めない（`harness-config`の設定読み込みと同じ方針）。
+    #[test]
+    fn corrupt_or_missing_json_deserializes_to_the_default_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let corrupt = tmp.path().join("corrupt.json");
+        std::fs::write(&corrupt, "{ this is not json").unwrap();
+
+        let from_corrupt: TraverseLedger = std::fs::read_to_string(&corrupt)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        assert!(from_corrupt.entries.is_empty());
+
+        let from_missing: TraverseLedger = std::fs::read_to_string(tmp.path().join("nope.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        assert!(from_missing.entries.is_empty());
+    }
+}
