@@ -1,0 +1,178 @@
+//! `harness fs`サブコマンド群。付与済みACEの一覧・撤収・traverse付与を担う。
+//!
+//! プロバイダ資格情報もworkspace sandboxも必要としない独立した経路で、`main`の
+//! 起動パイプラインより前にディスパッチされる。
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use clap::Subcommand;
+
+
+mod ledger;
+
+mod revoke;
+mod traverse;
+mod workspace;
+
+pub(crate) use ledger::*;
+
+// `main`（binターゲット）の起動パイプラインから直接呼ぶものだけ`pub`で出す。
+pub use ledger::{record_fs_passthrough_denied, record_fs_passthrough_grant};
+pub use revoke::reconcile_fs_ledger_for_workspace;
+pub(crate) use revoke::*;
+pub(crate) use traverse::*;
+pub(crate) use workspace::*;
+
+/// `harness fs`サブコマンドの各操作。Windows Tier2a固有機能のため、Windows以外では
+/// `List`以外はエラーで終了する（台帳自体はクロスプラットフォームのJSONだが、実際のACE
+/// 付与・撤収はWin32のSID/ACLに依存するため）。
+#[derive(Subcommand)]
+pub enum FsAction {
+    /// fs passthrough台帳（ユーザグローバル、D5）を一覧表示する。
+    List,
+    /// 到達不能/付与失敗だったfs passthrough候補だけを一覧表示する。
+    Denied,
+    /// 指定ルートのfs passthroughを撤収する（再walk revoke + 検証パス + 台帳から除去、D3/D4）。
+    Revoke { path: PathBuf },
+    /// 台帳の全エントリを撤収する。
+    RevokeAll,
+    /// `target`とその全祖先（ドライブルートまで）へ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を
+    /// 連鎖付与する（D10連鎖化、`TIER1A-OPEN-ISSUES.md`項目6）。例えば
+    /// `C:\Users\<user>\.cargo`を指定すると、`C:\`・`C:\Users`・`C:\Users\<user>`・
+    /// `C:\Users\<user>\.cargo`の4ノード全てへ、UAC 1回で付与する。`WRITE_DAC`が要るため
+    /// 非管理者では特権分離ヘルパー(D-16)経由でUACを表示する。付与に成功した各ノードは、
+    /// 撤収用の別台帳(traverse台帳)へ個別に記録される。
+    GrantTraverse {
+        target: PathBuf,
+        /// 実際には何も書き込まず、付与予定の祖先チェーンと各ノードの既存ACE有無だけを
+        /// 表示する（`GetNamedSecurityInfoW`のみ、`SetNamedSecurityInfoW`は一切呼ばない）。
+        /// UACも表示されない。プロファイルルート近傍への書込みは実機で病的に遅くなりうる
+        /// ため（BUG-011）、本実行の前に対象ノードを確認したい場合に使う。
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+    },
+    /// `grant-traverse`で付与したtraverse ACEを1件撤収する（非再帰・単一ノード、D10の巻き戻し）。
+    /// 注意: `grant-traverse`が連鎖付与した祖先ノード（`C:\Users`等）は、他のpassthroughルートと
+    /// **共有されている可能性がある**。この`revoke-traverse`は指定した1ノードだけを撤収するため、
+    /// 他の到達性がまだその祖先ノードに依存している場合は、それを壊してしまう。祖先ノードの
+    /// 要否を意識せず一括で戻したい場合は`revoke-traverse-all`を使うこと。
+    RevokeTraverse { path: PathBuf },
+    /// traverse台帳の全エントリを撤収する。`grant-traverse`で付与した箇所を手打ちで覚える
+    /// 必要がなく、記録済みの箇所だけを自動で対象にする。
+    RevokeTraverseAll,
+    /// `preflight`が起動のたびに付与するworkspace本体のACE（通常起動=RWX、`--cow`=RO）を
+    /// 撤収する。同じworkspaceを今も使っている他のharnessセッションが無いことを名前付き
+    /// mutexで確認し、あれば「使用中」として拒否する（`harness_sandbox::tier2a::workspace_ledger`
+    /// 参照）。CoWのupper_dirには一切触れない（別コマンド`harness cow discard`が担当）。
+    RevokeWorkspace { path: PathBuf },
+    /// これまで許可を付けたことがある全workspaceに対して`revoke-workspace`と同じ処理をする。
+    /// 使用中のworkspaceは自動的にスキップされる（一覧に表示のみ）。
+    RevokeWorkspaceAll,
+}
+
+/// `harness fs`サブコマンドのディスパッチ（プロバイダ資格情報・workspace sandboxのいずれも
+/// 必要としない、起動パイプラインとは独立の経路）。
+pub fn run_fs_subcommand(action: FsAction) -> ExitCode {
+    match action {
+        FsAction::List => {
+            let ledger = load_fs_ledger();
+            println!("=== fs passthrough (--fs-allow) ===");
+            if ledger.entries.is_empty() {
+                println!("(none)");
+            }
+            for e in &ledger.entries {
+                println!(
+                    "{}\t{}{}\tgranted_at_unix={}",
+                    e.path,
+                    if e.writable { "rw" } else { "ro" },
+                    if e.forced { " [forced]" } else { "" },
+                    e.granted_at_unix_secs
+                );
+            }
+            let traverse_ledger = harness_sandbox::tier2a::traverse_ledger::load_traverse_ledger();
+            println!("=== traverse grants (grant-traverse) ===");
+            if traverse_ledger.entries.is_empty() {
+                println!("(none)");
+            }
+            for e in &traverse_ledger.entries {
+                println!("{}\tgranted_at_unix={}", e.path, e.granted_at_unix_secs);
+            }
+            #[cfg(windows)]
+            {
+                let workspace_ledger = harness_sandbox::tier2a::workspace_ledger::load_workspace_ledger();
+                println!("=== workspace grants (preflight) ===");
+                if workspace_ledger.entries.is_empty() {
+                    println!("(none)");
+                }
+                for e in &workspace_ledger.entries {
+                    let live =
+                        harness_sandbox::tier2a::workspace_ledger::live_modes(&PathBuf::from(&e.path));
+                    let status = if live.is_empty() {
+                        "idle".to_string()
+                    } else {
+                        format!("in use: {}", live.join(", "))
+                    };
+                    println!(
+                        "{}\tmode={}\tgranted_at_unix={}\t{status}",
+                        e.path, e.mode, e.granted_at_unix_secs
+                    );
+                }
+            }
+            println!("=== denied fs passthrough candidates ===");
+            if ledger.denied_entries.is_empty() {
+                println!("(none)");
+            }
+            for e in &ledger.denied_entries {
+                println!(
+                    "{}\t{}\tcount={}\tlast_denied_at_unix={}\t{}",
+                    e.path, e.access, e.count, e.last_denied_at_unix_secs, e.reason
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        FsAction::Denied => {
+            let ledger = load_fs_ledger();
+            if ledger.denied_entries.is_empty() {
+                println!("(no denied fs passthrough candidates recorded)");
+            }
+            for e in &ledger.denied_entries {
+                println!(
+                    "{}\t{}\tcount={}\tlast_denied_at_unix={}\t{}",
+                    e.path, e.access, e.count, e.last_denied_at_unix_secs, e.reason
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        FsAction::Revoke { path } => fs_revoke_one(&path),
+        FsAction::RevokeAll => fs_revoke_all(),
+        FsAction::GrantTraverse { target, dry_run } => {
+            if dry_run {
+                fs_grant_traverse_preview(&target)
+            } else {
+                fs_grant_traverse(&target)
+            }
+        }
+        FsAction::RevokeWorkspace { path } => fs_revoke_workspace(&path),
+        FsAction::RevokeWorkspaceAll => fs_revoke_workspace_all(),
+        FsAction::RevokeTraverse { path } => fs_revoke_traverse_one(&path),
+        FsAction::RevokeTraverseAll => {
+            let ledger = harness_sandbox::tier2a::traverse_ledger::load_traverse_ledger();
+            if ledger.entries.is_empty() {
+                println!("(no traverse grants recorded)");
+                return ExitCode::SUCCESS;
+            }
+            let mut any_failed = false;
+            for entry in ledger.entries.clone() {
+                if fs_revoke_traverse_one(&PathBuf::from(&entry.path)) != ExitCode::SUCCESS {
+                    any_failed = true;
+                }
+            }
+            if any_failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+    }
+}

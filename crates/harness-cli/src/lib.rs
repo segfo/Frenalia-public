@@ -6,6 +6,13 @@
 //! ロジックを`W: std::io::Write`に対する汎用関数として公開する
 //! （§実装マイルストーン M8検証条件「`harness -p ... --output-format json | jq`が安定スキーマ」）。
 
+/// `harness fs`サブコマンド群（付与済みACEの一覧・撤収・traverse付与）。
+///
+/// `main.rs`（binターゲット）はclap定義とディスパッチだけを持ち、実処理はlib側の
+/// このモジュールが持つ（`docs/CODE-STRUCTURE-RULES.md`規則4: 終端クレートなので
+/// テスト可能性を優先してlibへ置く）。
+pub mod fs_grants;
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::ExitCode;
