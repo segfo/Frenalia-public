@@ -1,10 +1,20 @@
 //! harness-cli のライブラリ部分。`plans/DESIGN.md` §非対話（ヘッドレス）モード参照。
 //!
-//! M8で`--output-format text|json|jsonl`の3形式出力を担う`run_headless`をここへ切り出した。
-//! `main.rs`（binターゲット）は薄いclapエントリのみを持ち、`MockProvider`
-//! （`harness-providers`）を使ったユニットテストがしやすいよう、実際にstdoutへ書き出す
-//! ロジックを`W: std::io::Write`に対する汎用関数として公開する
-//! （§実装マイルストーン M8検証条件「`harness -p ... --output-format json | jq`が安定スキーマ」）。
+//! **`main.rs`（binターゲット）は`#[tokio::main]`と[`cli::run`]の呼び出しだけを持つ。**
+//! clap定義・起動パイプライン・各サブコマンドの実装は全てこちら側にある——binの中のコードは
+//! `tests/`から到達できず、テストが書けないため（`docs/CODE-STRUCTURE-RULES.md`規則4。
+//! `harness-cli`はワークスペースの終端クレートで誰にも依存されていないので、libの公開面を
+//! 広げても外部の契約にならない）。
+//!
+//! | モジュール | 役割 |
+//! |---|---|
+//! | 本ファイル | `run_headless`（`--output-format text/json/jsonl`の3形式出力、M8） |
+//! | [`cli`] | clap定義・起動パイプライン・各サブコマンド |
+//! | [`fs_grants`] | `harness fs`（付与済みACEの一覧・撤収・traverse付与） |
+//!
+//! `run_headless`は実際にstdoutへ書き出すロジックを`W: std::io::Write`に対する汎用関数として
+//! 公開する（`MockProvider`を使ったユニットテストのため。§実装マイルストーン M8検証条件
+//! 「`harness -p ... --output-format json | jq`が安定スキーマ」）。
 
 /// `harness fs`サブコマンド群（付与済みACEの一覧・撤収・traverse付与）。
 ///
