@@ -1020,6 +1020,7 @@ dependencies = [
  "directories",
  "dotenvy",
  "harness-change-ledger",
+ "harness-cognition",
  "harness-config",
  "harness-core",
  "harness-engine",
@@ -1033,6 +1034,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "harness-cognition"
+version = "0.1.0"
+dependencies = [
+ "harness-core",
+ "harness-engine",
+ "harness-providers",
+ "harness-tools",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1197,6 +1212,7 @@ dependencies = [
  "async-trait",
  "crossterm",
  "futures",
+ "harness-cognition",
  "harness-core",
  "harness-engine",
  "harness-sandbox",

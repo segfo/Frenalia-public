@@ -31,8 +31,9 @@ use std::process::ExitCode;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+use harness_cognition::CognitiveOrchestrator;
 use harness_core::{AgentEvent, LlmProvider, ProviderError, StopReason, ToolCtx, Usage};
-use harness_engine::{run_agent_loop, AgentLoopConfig, ConversationState, PermissionGate};
+use harness_engine::{AgentLoopConfig, ConversationState, PermissionGate};
 use harness_tools::ToolRegistry;
 
 /// `--output-format`の3値（§非対話モード「出力」）。
@@ -135,27 +136,29 @@ pub async fn run_headless<W: Write>(
     tools: &ToolRegistry,
     ctx: &ToolCtx,
     gate: &dyn PermissionGate,
+    cognition: &CognitiveOrchestrator,
     config: AgentLoopConfig,
     output_format: OutputFormat,
     writer: &mut W,
 ) -> ExitCode {
     match output_format {
         OutputFormat::Text => {
-            let result = run_agent_loop(
-                provider,
-                state,
-                tools,
-                ctx,
-                gate,
-                config,
-                None,
-                None,
-                |delta| {
-                    let _ = writer.write_all(delta.as_bytes());
-                    let _ = writer.flush();
-                },
-            )
-            .await;
+            let result = cognition
+                .run(
+                    provider,
+                    state,
+                    tools,
+                    ctx,
+                    gate,
+                    config,
+                    None,
+                    None,
+                    |delta: &str| {
+                        let _ = writer.write_all(delta.as_bytes());
+                        let _ = writer.flush();
+                    },
+                )
+                .await;
             match &result {
                 Ok(_) => {
                     let _ = writeln!(writer);
@@ -168,7 +171,7 @@ pub async fn run_headless<W: Write>(
         }
         OutputFormat::Json | OutputFormat::Jsonl => {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let loop_fut = run_agent_loop(
+            let loop_fut = cognition.run(
                 provider,
                 state,
                 tools,
@@ -177,7 +180,7 @@ pub async fn run_headless<W: Write>(
                 config,
                 Some(&tx),
                 None,
-                |_delta| {},
+                |_delta: &str| {},
             );
             tokio::pin!(loop_fut);
 

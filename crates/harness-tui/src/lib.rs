@@ -20,6 +20,7 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use harness_cognition::CognitiveOrchestrator;
 use harness_core::{LlmProvider, ReadScopeConfig, StagingConfig, ToolCtx};
 use harness_engine::{ConversationState, PermissionArbiter, SessionStore};
 use harness_sandbox::{ApplyOptions, ManifestOp, SandboxFs};
@@ -74,7 +75,12 @@ fn open_panel_fs(
     staging: &StagingConfig,
     cow_upper_dir: Option<&std::path::Path>,
 ) -> Result<SandboxFs, harness_sandbox::SandboxError> {
-    SandboxFs::open_with_cow(workspace_root, staging, &ReadScopeConfig::default(), cow_upper_dir)
+    SandboxFs::open_with_cow(
+        workspace_root,
+        staging,
+        &ReadScopeConfig::default(),
+        cow_upper_dir,
+    )
 }
 
 /// `SandboxFs::apply()`の結果をtranscriptへ1行のInfo通知として積む。変更パネルの`c`、
@@ -113,6 +119,7 @@ pub async fn run(
     tools: ToolRegistry,
     mut ctx: ToolCtx,
     arbiter: PermissionArbiter,
+    cognition: CognitiveOrchestrator,
     model: String,
     max_tokens: u32,
     max_turns: usize,
@@ -206,6 +213,7 @@ pub async fn run(
         tools,
         ctx,
         arbiter,
+        cognition,
         model.clone(),
         max_tokens,
         max_turns,

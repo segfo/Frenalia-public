@@ -1,6 +1,7 @@
 //! harness-core: 共有語彙（IR）とtrait定義。プロバイダ非依存・フロントエンド非依存。
 //! `plans/DESIGN.md` §全体アーキテクチャ 参照。
 
+pub mod cognition;
 pub mod config_injection;
 pub mod event;
 pub mod message;
@@ -9,6 +10,7 @@ pub mod prompt;
 pub mod provider;
 pub mod tool;
 
+pub use cognition::CognitionLevel;
 pub use config_injection::is_config_injection_path;
 pub use event::AgentEvent;
 pub use message::{ContentBlock, Message, Role};
@@ -23,6 +25,6 @@ pub use provider::{
 };
 pub use tool::{
     NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, RequireSandbox, RiskClass, ShellTier,
-    ShellTierSelection, StagingConfig, StagingMode, Tool, ToolCtx, ToolError, ToolOutput,
-    ToolResult, ToolSpec, ToolUse, TlsInspection, VmShellExecutor,
+    ShellTierSelection, StagingConfig, StagingMode, TlsInspection, Tool, ToolCtx, ToolError,
+    ToolOutput, ToolResult, ToolSpec, ToolUse, VmShellExecutor,
 };

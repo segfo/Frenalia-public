@@ -7,6 +7,7 @@ edition.workspace = true
 async-trait = "0.1.89"
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3.32"
+harness-cognition = { version = "0.1.0", path = "../harness-cognition" }
 harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-engine = { version = "0.1.0", path = "../harness-engine" }
 harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }

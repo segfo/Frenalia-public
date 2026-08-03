@@ -12,16 +12,15 @@
 
 pub mod compaction;
 pub mod permission;
+mod sanitize;
 pub mod session;
+pub mod turn;
 
-use std::time::Duration;
-
-use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use harness_core::{
-    AgentEvent, BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError,
-    Role, Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, ToolCtx, ToolOutput, Usage,
+    AgentEvent, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError, Role,
+    Sampling, StopReason, SystemBlock, ToolChoice, ToolCtx, ToolSpec, Usage,
 };
 use harness_tools::ToolRegistry;
 
@@ -30,32 +29,19 @@ pub use permission::{
     PermissionGate, PermissionMode,
 };
 pub use session::{SessionStore, SessionSummary};
+pub use turn::{
+    CompletedToolCall, EngineError, Executor, RawTurn, RawTurnRequest, RawTurnResult,
+    ToolCallDecision, TurnExecutor,
+};
 
 /// TUI等のフロントエンドへ`AgentEvent`を流すための送信口。ヘッドレスCLIは`None`を渡し
 /// 従来通り`on_text_delta`コールバックのみでstdout出力する（§非対話モード、既存挙動を維持）。
 pub type EventSink = tokio::sync::mpsc::UnboundedSender<AgentEvent>;
 
-fn emit(events: Option<&EventSink>, ev: AgentEvent) {
+pub(crate) fn emit(events: Option<&EventSink>, ev: AgentEvent) {
     if let Some(tx) = events {
         let _ = tx.send(ev);
     }
-}
-
-/// ツール出力がこれを超える文字数なら頭尾切詰めする（M9、DESIGN.md L349「大出力 head+tail
-/// 切詰め」）。会話履歴に積む前に適用するため、モデルへ送るコンテキスト自体を圧迫しない。
-const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
-
-/// `content`が`max_chars`文字を超える場合、先頭/末尾を残し中間を省略記号に置き換える。
-fn truncate_head_tail(content: &str, max_chars: usize) -> String {
-    let total = content.chars().count();
-    if total <= max_chars {
-        return content.to_string();
-    }
-    let half = max_chars / 2;
-    let head: String = content.chars().take(half).collect();
-    let tail: String = content.chars().skip(total - half).collect();
-    let omitted = total - 2 * half;
-    format!("{head}\n... [{omitted} chars truncated] ...\n{tail}")
 }
 
 /// リクエスト全体（system+messages+tools）をJSONシリアライズした文字数からの粗い近似
@@ -66,162 +52,6 @@ fn estimate_tokens(req: &CompletionRequest) -> u64 {
     serde_json::to_string(req)
         .map(|s| (s.chars().count() as u64) / 4)
         .unwrap_or(0)
-}
-
-pub(crate) fn sanitize_completion_request_for_tier3(req: &mut CompletionRequest) {
-    for block in &mut req.system {
-        sanitize_string(&mut block.text);
-    }
-    sanitize_messages_for_tier3(&mut req.messages);
-    for tool in &mut req.tools {
-        sanitize_string(&mut tool.description);
-        sanitize_json_value(&mut tool.input_schema);
-    }
-}
-
-fn sanitize_messages_for_tier3(messages: &mut [Message]) {
-    for msg in messages {
-        sanitize_content_blocks_for_tier3(&mut msg.content);
-    }
-}
-
-fn sanitize_content_blocks_for_tier3(blocks: &mut Vec<ContentBlock>) {
-    blocks.retain_mut(|block| match block {
-        ContentBlock::Text(text) => {
-            sanitize_string(text);
-            true
-        }
-        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => false,
-        ContentBlock::ToolUse {
-            id: _,
-            name: _,
-            input,
-        } => {
-            sanitize_json_value(input);
-            true
-        }
-        ContentBlock::ToolResult { content, .. } => {
-            sanitize_string(content);
-            true
-        }
-        ContentBlock::Image { .. } => true,
-    });
-}
-
-fn sanitize_tool_output_for_tier3(output: &mut ToolOutput) {
-    sanitize_string(&mut output.content);
-}
-
-fn sanitize_visible_delta_for_tier3(text: &str, ctx: &ToolCtx) -> String {
-    if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
-        redact_windows_absolute_paths(text)
-    } else {
-        text.to_string()
-    }
-}
-
-fn sanitize_json_value(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(s) => sanitize_string(s),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                sanitize_json_value(item);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for (_key, value) in map {
-                sanitize_json_value(value);
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
-}
-
-fn sanitize_string(s: &mut String) {
-    *s = redact_windows_absolute_paths(s);
-}
-
-fn redact_windows_absolute_paths(input: &str) -> String {
-    let chars: Vec<char> = input.chars().collect();
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    while i < chars.len() {
-        if is_windows_drive_path_at(&chars, i) {
-            out.push_str("/workspace");
-            i += 3;
-            while i < chars.len() && is_windows_path_char(chars[i]) {
-                i += 1;
-            }
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn is_windows_drive_path_at(chars: &[char], i: usize) -> bool {
-    i + 2 < chars.len()
-        && chars[i].is_ascii_alphabetic()
-        && chars[i + 1] == ':'
-        && is_windows_separator(chars[i + 2])
-}
-
-fn is_windows_separator(c: char) -> bool {
-    c == '\\' || c == '/' || c == '¥'
-}
-
-fn is_windows_path_char(c: char) -> bool {
-    !c.is_whitespace()
-        && !matches!(
-            c,
-            '"' | '\'' | '`' | ')' | '）' | ']' | '】' | '}' | '。' | '、' | ',' | ';' | '|'
-        )
-}
-
-/// リトライ可能な`ProviderError`（`RateLimited`/`Overloaded`/`Transport{retriable:true}`）かどうか。
-/// `ContextTooLong`はここに含めない（呼び出し側でコンテキスト圧縮を挟んでから明示的に再試行する、
-/// §主なリスクと対策「分類を確定。外周の共通リトライラッパがこれを見てリトライ可否・待機を決める」）。
-fn is_retriable(e: &ProviderError) -> bool {
-    matches!(
-        e,
-        ProviderError::RateLimited { .. }
-            | ProviderError::Overloaded
-            | ProviderError::Transport { retriable: true }
-    )
-}
-
-fn retry_delay(e: &ProviderError, attempt: u32) -> Duration {
-    if let ProviderError::RateLimited {
-        retry_after: Some(d),
-    } = e
-    {
-        return *d;
-    }
-    Duration::from_millis(200 * 2u64.saturating_pow(attempt))
-}
-
-const MAX_RETRIES: u32 = 3;
-
-/// `provider.stream`をリトライ可能なエラーに対して指数バックオフで最大`MAX_RETRIES`回まで
-/// 再試行する。`ContextTooLong`はここでは扱わず、そのまま呼び出し側へ伝播する
-/// （`run_agent_loop`側でコンテキスト圧縮を挟んだ1回限りの再試行を行う）。
-async fn stream_with_retry(
-    provider: &dyn LlmProvider,
-    req: &CompletionRequest,
-) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
-{
-    let mut attempt = 0;
-    loop {
-        match provider.stream(req.clone()).await {
-            Ok(s) => return Ok(s),
-            Err(e) if attempt < MAX_RETRIES && is_retriable(&e) => {
-                tokio::time::sleep(retry_delay(&e, attempt)).await;
-                attempt += 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
 }
 
 /// 会話のIR履歴。
@@ -266,69 +96,6 @@ pub fn system_blocks_for(ctx: &ToolCtx) -> Vec<SystemBlock> {
     }]
 }
 
-/// 1ターン分の結果。テキスト・停止理由・使用トークン量を蓄積したもの。
-#[derive(Debug, Clone)]
-pub struct TurnOutcome {
-    pub text: String,
-    pub stop_reason: StopReason,
-    pub usage: Usage,
-}
-
-/// 1プロバイダターンを実行する。ツール呼び出しへのディスパッチ・継続ループは
-/// `run_agent_loop` が担う（§エージェントループの「1回のステップ」のうち、
-/// ここではステップ1〜3のみを担う）。
-/// `on_text_delta` は `StreamEvent::TextDelta` 受信の都度呼ばれる（トークン逐次表示用）。
-pub async fn run_single_turn<F>(
-    provider: &dyn LlmProvider,
-    state: &ConversationState,
-    model: String,
-    max_tokens: u32,
-    mut on_text_delta: F,
-) -> Result<TurnOutcome, ProviderError>
-where
-    F: FnMut(&str),
-{
-    let req = CompletionRequest {
-        system: state.system.clone(),
-        messages: state.messages.clone(),
-        tools: Vec::new(),
-        tool_choice: ToolChoice::Auto,
-        output: None,
-        parallel_tool_calls: None,
-        max_tokens,
-        sampling: Sampling::default(),
-        model,
-    };
-
-    let mut stream = provider.stream(req).await?;
-    let mut text = String::new();
-    let mut stop_reason = StopReason::EndTurn;
-    let mut usage = Usage::default();
-
-    while let Some(event) = stream.next().await {
-        match event? {
-            StreamEvent::TextDelta { text: delta, .. } => {
-                on_text_delta(&delta);
-                text.push_str(&delta);
-            }
-            StreamEvent::Done {
-                stop_reason: sr,
-                usage: u,
-            } => {
-                stop_reason = sr;
-                usage = u;
-            }
-            _ => {}
-        }
-    }
-
-    Ok(TurnOutcome {
-        text,
-        stop_reason,
-        usage,
-    })
-}
-
 /// `run_agent_loop` の結果。複数ターンにまたがる最終的なテキスト・停止理由・
 /// 直近ターンの使用トークン量を返す。
 #[derive(Debug, Clone)]
@@ -342,84 +109,6 @@ pub struct AgentLoopOutcome {
     pub cancelled: bool,
 }
 
-/// ストリーム受信中のブロックを蓄積する作業用構造体。
-/// `StreamEvent`はブロック単位に一般化されているため、`BlockStart`〜`BlockStop`の間に届く
-/// デルタをindexごとに蓄積し、ストリーム完了後に`ContentBlock`へ組み立てる
-/// （§プロバイダ抽象「ブロック単位に一般化」）。
-struct BlockAccum {
-    index: usize,
-    kind: BlockKind,
-    text: String,
-    signature: Option<String>,
-    tool_input_raw: String,
-}
-
-/// 引数JSONの連結・パースに失敗した`tool_use`（Phase5-B）。ターン全体を落とさず、
-/// `content`へは空入力の`ToolUse`を積んだ上でこの理由を控え、実行はスキップして
-/// `is_error`な`tool_result`を合成する（`run_agent_loop`「unknown tool」と同じ扱い）。
-struct MalformedToolInput {
-    id: String,
-    name: String,
-    raw: String,
-}
-
-impl BlockAccum {
-    fn into_content_block(self) -> Result<ContentBlock, MalformedToolInput> {
-        match self.kind {
-            BlockKind::Text => Ok(ContentBlock::Text(self.text)),
-            BlockKind::Thinking => Ok(ContentBlock::Thinking {
-                text: self.text,
-                signature: self.signature,
-            }),
-            BlockKind::RedactedThinking => Ok(ContentBlock::RedactedThinking { data: self.text }),
-            BlockKind::ToolUse { id, name } => {
-                // OpenAIは引数文字列断片・Anthropicは部分JSONオブジェクト断片だが、
-                // いずれも連結すれば1つのJSONテキストになるため、BlockStop相当の
-                // このタイミングで一度だけパースする（§プロバイダ抽象「ツール引数の正規化」）。
-                let input = if self.tool_input_raw.trim().is_empty() {
-                    serde_json::Value::Object(Default::default())
-                } else {
-                    match serde_json::from_str(&self.tool_input_raw) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            return Err(MalformedToolInput {
-                                id,
-                                name,
-                                raw: self.tool_input_raw,
-                            })
-                        }
-                    }
-                };
-                Ok(ContentBlock::ToolUse { id, name, input })
-            }
-        }
-    }
-}
-
-/// `HARNESS_WIRE_LOG=<path>`設定時のみ、ブロック組み立て結果（`tool_input_raw`の連結後文字列と
-/// パース成否）をJSONL追記する（`harness-providers::openai`の同名フックと対をなす、
-/// `run_shell`不安定性調査のPhase2観測基盤）。未設定時はゼロコスト。
-fn wire_log_block_assembly(kind: &str, id: &str, name: &str, raw: &str, ok: bool) {
-    let Some(path) = std::env::var_os("HARNESS_WIRE_LOG") else {
-        return;
-    };
-    use std::io::Write as _;
-    let value = serde_json::json!({
-        "kind": kind,
-        "tool_use_id": id,
-        "name": name,
-        "tool_input_raw": raw,
-        "parse_ok": ok,
-    });
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(std::path::PathBuf::from(path))
-    {
-        let _ = writeln!(f, "{value}");
-    }
-}
-
 /// `run_agent_loop` のターン単位パラメータ。素の引数列だと `clippy::too_many_arguments` に
 /// 触れるため1つにまとめた（値自体の意味は各フィールドのコメント通り）。
 pub struct AgentLoopConfig {
@@ -429,12 +118,47 @@ pub struct AgentLoopConfig {
     pub max_turns: usize,
 }
 
-/// 1回のステップ = 1プロバイダターン + 承認済みツール実行（§エージェントループ）を
-/// `stop_reason != ToolUse` になるまで繰り返す。`gate`が全ツール呼び出しの実行前に
-/// 必ず参照される唯一の強制点で（§パーミッション（承認）システム）、`Decision::Deny`の場合は
-/// ツールを実行せずエラーの`ToolResult`を合成する（§エージェントループ 手順4）。
-/// `events`が`Some`なら`AgentEvent`をその都度発行する（M7、`harness-tui`の`AppState`が
-/// これを畳み込んで描画する。§リッチTUI「`AppState`は`AgentEvent`を畳み込んで更新」）。
+/// `ConversationState`全体を1リクエストへ写す。認知レイヤー（M14以降）はここを通らず、
+/// `ContextAssembler`が組んだ最小コンテキストを直接[`TurnExecutor`]へ渡す。
+fn build_request(
+    state: &ConversationState,
+    tool_specs: &[ToolSpec],
+    config: &AgentLoopConfig,
+) -> CompletionRequest {
+    CompletionRequest {
+        system: state.system.clone(),
+        messages: state.messages.clone(),
+        tools: tool_specs.to_vec(),
+        tool_choice: if tool_specs.is_empty() {
+            ToolChoice::None
+        } else {
+            ToolChoice::Auto
+        },
+        output: None,
+        // Phase5-D（run_shell不安定性調査）: 並列tool_callを明示的に抑止する。LMStudio実機
+        // 観測で、2件目以降の`arguments`断片チャンクが`index`を省略することがあり
+        // （`harness-providers::openai::WireToolCallDelta`のコメント参照）、複数tool_callが
+        // 同時に開いていると引数JSONの取り違えが起きる。`parallel_tool_calls:false`は
+        // プロバイダに1回のターンで最大1個のtool_callしか出させないための一次防御であり、
+        // 二次防御としてopenai.rs側も`index`省略時は「直近に開いたブロック」へ倒す
+        // （0固定より安全）。
+        parallel_tool_calls: Some(false),
+        max_tokens: config.max_tokens,
+        sampling: Sampling::default(),
+        model: config.model.clone(),
+    }
+}
+
+/// 素朴なエージェントループ（`CognitionLevel::Off`の実体、`plans/DESIGN-COGNITION.md` §1）。
+/// [`TurnExecutor::raw_turn_with_deltas`]（1ステップ）を、`tool_use`が出なくなるまで繰り返す。
+///
+/// ここが持つのは**1ステップの外側の責務だけ**: ターン予算（`max_turns`）・会話履歴への追記・
+/// `ContextTooLong`のリアクティブ圧縮・ターン境界のイベント発行。プロバイダ呼び出し・
+/// ストリーム消費・パーミッション判定・ツール実行は全て[`crate::turn`]側にある。
+///
+/// `gate`が全ツール呼び出しの実行前に必ず参照される唯一の強制点である性質
+/// （§パーミッション（承認）システム）は[`TurnExecutor`]へ移ったが、認知レイヤーも同じ
+/// 経路しか持たないため強制点は1箇所のまま保たれる。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agent_loop<F>(
     provider: &dyn LlmProvider,
@@ -451,6 +175,8 @@ where
     F: FnMut(&str),
 {
     let tool_specs = tools.to_specs_for_ctx(ctx);
+    let executor = TurnExecutor::new(provider, tools, ctx, gate, events, cancel);
+    let tier3 = ctx.shell_tier.tier == harness_core::ShellTier::Tier3;
 
     /// キャンセルによる早期returnの共通形。§エージェントループ「ストリーム途中は部分assistant
     /// 破棄／ツール実行中は全tool_useへcancelled合成」のいずれの経路も、この形の
@@ -470,30 +196,9 @@ where
             return Ok(cancelled_outcome());
         }
 
-        let mut req = CompletionRequest {
-            system: state.system.clone(),
-            messages: state.messages.clone(),
-            tools: tool_specs.clone(),
-            tool_choice: if tool_specs.is_empty() {
-                ToolChoice::None
-            } else {
-                ToolChoice::Auto
-            },
-            output: None,
-            // Phase5-D（run_shell不安定性調査）: 並列tool_callを明示的に抑止する。LMStudio実機
-            // 観測で、2件目以降の`arguments`断片チャンクが`index`を省略することがあり
-            // （`harness-providers::openai::WireToolCallDelta`のコメント参照）、複数tool_callが
-            // 同時に開いていると引数JSONの取り違えが起きる。`parallel_tool_calls:false`は
-            // プロバイダに1回のターンで最大1個のtool_callしか出させないための一次防御であり、
-            // 二次防御としてopenai.rs側も`index`省略時は「直近に開いたブロック」へ倒す
-            // （0固定より安全）。
-            parallel_tool_calls: Some(false),
-            max_tokens: config.max_tokens,
-            sampling: Sampling::default(),
-            model: config.model.clone(),
-        };
-        if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
-            sanitize_completion_request_for_tier3(&mut req);
+        let mut req = build_request(state, &tool_specs, &config);
+        if tier3 {
+            sanitize::completion_request(&mut req);
         }
         emit(
             events,
@@ -502,9 +207,14 @@ where
             },
         );
 
-        let mut stream = match stream_with_retry(provider, &req).await {
-            Ok(s) => s,
-            Err(ProviderError::ContextTooLong) => {
+        let result = match executor
+            .raw_turn_with_deltas(req.clone(), &mut on_text_delta)
+            .await
+        {
+            Ok(r) => r,
+            // 圧縮リトライは**ストリーム開始前**の失敗にだけ効く。受信中に届いた
+            // `ContextTooLong`（`EngineError::Stream`）は下の一般アームでそのまま返す。
+            Err(EngineError::Call(ProviderError::ContextTooLong)) => {
                 let removed = compaction::compact(
                     provider,
                     state,
@@ -528,16 +238,18 @@ where
                         removed_messages: removed,
                     },
                 );
-                let retry_req = CompletionRequest {
+                let mut retry_req = CompletionRequest {
                     messages: state.messages.clone(),
                     ..req
                 };
-                let mut retry_req = retry_req;
-                if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
-                    sanitize_completion_request_for_tier3(&mut retry_req);
+                if tier3 {
+                    sanitize::completion_request(&mut retry_req);
                 }
-                match stream_with_retry(provider, &retry_req).await {
-                    Ok(s) => s,
+                match executor
+                    .raw_turn_with_deltas(retry_req, &mut on_text_delta)
+                    .await
+                {
+                    Ok(r) => r,
                     Err(e) => {
                         emit(
                             events,
@@ -545,7 +257,7 @@ where
                                 message: e.to_string(),
                             },
                         );
-                        return Err(e);
+                        return Err(e.into_provider_error());
                     }
                 }
             }
@@ -556,254 +268,49 @@ where
                         message: e.to_string(),
                     },
                 );
-                return Err(e);
+                return Err(e.into_provider_error());
             }
         };
-        let mut blocks: Vec<BlockAccum> = Vec::new();
-        let mut stop_reason = StopReason::EndTurn;
-        let mut usage = Usage::default();
 
-        loop {
-            let next = match cancel {
-                Some(c) => tokio::select! {
-                    _ = c.cancelled() => None,
-                    ev = stream.next() => Some(ev),
-                },
-                None => Some(stream.next().await),
-            };
-            let Some(event) = next else {
-                // ストリーム途中でキャンセルされた: 蓄積中のblocksはstateへ一切pushせず破棄する
-                // （§エージェントループ キャンセル整合「ストリーム途中は部分assistant破棄」）。
+        let raw = match result {
+            RawTurnResult::Completed(raw) => raw,
+            RawTurnResult::CancelledMidStream => {
                 emit(events, AgentEvent::Cancelled);
                 return Ok(cancelled_outcome());
-            };
-            let Some(event) = event else {
-                break;
-            };
-            let event = match event {
-                Ok(e) => e,
-                Err(e) => {
-                    emit(
-                        events,
-                        AgentEvent::Error {
-                            message: e.to_string(),
-                        },
-                    );
-                    return Err(e);
-                }
-            };
-            match event {
-                StreamEvent::BlockStart { index, kind } => blocks.push(BlockAccum {
-                    index,
-                    kind,
-                    text: String::new(),
-                    signature: None,
-                    tool_input_raw: String::new(),
-                }),
-                StreamEvent::TextDelta { index, text } => {
-                    let visible_text = sanitize_visible_delta_for_tier3(&text, ctx);
-                    on_text_delta(&visible_text);
-                    emit(events, AgentEvent::TextDelta { text: visible_text });
-                    if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
-                        b.text.push_str(&text);
-                    }
-                }
-                StreamEvent::ThinkingDelta { index, text } => {
-                    let visible_text = sanitize_visible_delta_for_tier3(&text, ctx);
-                    emit(events, AgentEvent::ThinkingDelta { text: visible_text });
-                    if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
-                        b.text.push_str(&text);
-                    }
-                }
-                StreamEvent::SignatureDelta { index, sig } => {
-                    if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
-                        b.signature = Some(sig);
-                    }
-                }
-                StreamEvent::ToolInputDelta {
-                    index,
-                    json_fragment,
-                } => {
-                    if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
-                        b.tool_input_raw.push_str(&json_fragment);
-                    }
-                }
-                StreamEvent::BlockStop { .. } => {}
-                StreamEvent::Done {
-                    stop_reason: sr,
-                    usage: u,
-                } => {
-                    stop_reason = sr;
-                    usage = u;
-                }
             }
-        }
-
-        // Phase5-B: 引数JSONパース失敗は`?`でターン全体を落とさない。空入力の`ToolUse`として
-        // contentへは積んだ上で、当該idを`malformed`へ控え、後段の実行ループでスキップして
-        // is_errorなtool_resultを合成する（tool_use/tool_result対応を崩さないため）。
-        let mut content = Vec::with_capacity(blocks.len());
-        let mut malformed: std::collections::HashMap<String, MalformedToolInput> =
-            std::collections::HashMap::new();
-        for b in blocks {
-            match b.into_content_block() {
-                Ok(block) => {
-                    if let ContentBlock::ToolUse { id, name, .. } = &block {
-                        wire_log_block_assembly("tool_input_assembled", id, name, "", true);
-                    }
-                    content.push(block);
-                }
-                Err(m) => {
-                    wire_log_block_assembly("tool_input_assembled", &m.id, &m.name, &m.raw, false);
-                    content.push(ContentBlock::ToolUse {
-                        id: m.id.clone(),
-                        name: m.name.clone(),
-                        input: serde_json::Value::Object(Default::default()),
-                    });
-                    malformed.insert(m.id.clone(), m);
-                }
-            }
-        }
-        if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
-            sanitize_content_blocks_for_tier3(&mut content);
-        }
+        };
 
         state.messages.push(Message {
             role: Role::Assistant,
-            content: content.clone(),
+            content: raw.content,
         });
 
-        // Phase5-C: `stop_reason`（プロバイダの`finish_reason`）ではなく、実際に`content`へ
-        // `ToolUse`ブロックが積まれたかどうかで分岐する。LMStudio実機観測で、tool_callが
-        // 積まれているのに`finish_reason:"stop"`が返る揺れがあったため（Phase1候補C）。
-        let has_tool_use = content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-        if !has_tool_use {
+        // Phase5-C: `stop_reason`（プロバイダの`finish_reason`）ではなく、実際に`ToolUse`が
+        // 積まれたかどうかで分岐する。LMStudio実機観測で、tool_callが積まれているのに
+        // `finish_reason:"stop"`が返る揺れがあったため（Phase1候補C）。`tool_calls`は
+        // `content`中の`ToolUse`と1対1で対応するので、空＝ツール呼び出し無し。
+        if raw.tool_calls.is_empty() {
             emit(
                 events,
                 AgentEvent::TurnCompleted {
-                    stop_reason: stop_reason.clone(),
-                    usage,
+                    stop_reason: raw.stop_reason.clone(),
+                    usage: raw.usage,
                 },
             );
-            let text = content
-                .into_iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text(t) => Some(t),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
             return Ok(AgentLoopOutcome {
-                text,
-                stop_reason,
-                usage,
+                text: raw.text,
+                stop_reason: raw.stop_reason,
+                usage: raw.usage,
                 cancelled: false,
             });
         }
 
-        let mut results = Vec::new();
-        let mut cancelled_mid_tool = false;
-        for block in &content {
-            if let ContentBlock::ToolUse { id, name, input } = block {
-                if !cancelled_mid_tool && cancel.is_some_and(|c| c.is_cancelled()) {
-                    cancelled_mid_tool = true;
-                }
-                if cancelled_mid_tool {
-                    // 残り全てのtool_useへcancelledなtool_resultを合成する
-                    // （§エージェントループ キャンセル整合「ツール実行中は全tool_useへ
-                    // cancelled合成 → 続行で400にならない」、実際にツールは呼ばない）。
-                    results.push(ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: "cancelled by user".to_string(),
-                        is_error: true,
-                    });
-                    continue;
-                }
-                emit(
-                    events,
-                    AgentEvent::ToolCallProposed {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    },
-                );
-                let output = if let Some(m) = malformed.get(id) {
-                    // Phase5-B: 引数JSONが壊れていたtool_use。ツールは呼ばず、モデルへ
-                    // 差し戻して自己修正させる（`unknown tool`と同じ「エラーの説明を
-                    // tool_resultとして返す」パターン）。
-                    ToolOutput {
-                        content: format!(
-                            "malformed tool_use input for {name}: arguments did not parse as \
-                             JSON (raw: {})",
-                            truncate_head_tail(&m.raw, 500)
-                        ),
-                        is_error: true,
-                    }
-                } else {
-                    match tools.get(name) {
-                        Some(tool) => {
-                            let risk = tool.risk(input);
-                            let decision = gate.resolve(name, risk, &arg_repr(input), input).await;
-                            if decision.is_allow() {
-                                emit(
-                                    events,
-                                    AgentEvent::ToolStarted {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                    },
-                                );
-                                tool.call(input.clone(), ctx)
-                                    .await
-                                    .unwrap_or_else(|e| ToolOutput {
-                                        content: e.to_string(),
-                                        is_error: true,
-                                    })
-                            } else {
-                                ToolOutput {
-                                    content: format!(
-                                        "permission denied by policy: {name} ({risk:?})"
-                                    ),
-                                    is_error: true,
-                                }
-                            }
-                        }
-                        None => ToolOutput {
-                            content: format!("unknown tool: {name}"),
-                            is_error: true,
-                        },
-                    }
-                };
-                let mut output = output;
-                if ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
-                    sanitize_tool_output_for_tier3(&mut output);
-                }
-                let truncated_content = truncate_head_tail(&output.content, MAX_TOOL_OUTPUT_CHARS);
-                emit(
-                    events,
-                    AgentEvent::ToolFinished {
-                        id: id.clone(),
-                        output: ToolOutput {
-                            content: truncated_content.clone(),
-                            is_error: output.is_error,
-                        },
-                    },
-                );
-                results.push(ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: truncated_content,
-                    is_error: output.is_error,
-                });
-            }
-        }
-
         state.messages.push(Message {
             role: Role::User,
-            content: results,
+            content: raw.tool_calls.iter().map(|c| c.to_tool_result()).collect(),
         });
 
-        if cancelled_mid_tool {
+        if raw.cancelled_mid_tool {
             emit(events, AgentEvent::Cancelled);
             return Ok(cancelled_outcome());
         }
@@ -818,9 +325,11 @@ where
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use async_trait::async_trait;
-    use futures::stream;
+    use futures::{stream, StreamExt};
+    use harness_core::{BlockKind, StreamEvent, ToolOutput};
 
     #[test]
     fn estimate_tokens_grows_with_request_size() {
@@ -1458,5 +967,78 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome2.text, "continued fine");
+    }
+
+    /// characterization test（M13: `raw_turn`抽出の回帰ガード）。mid-toolキャンセルで
+    /// 「まだ手を付けていない残りの`tool_use`」は、対応する`tool_result`だけが合成され
+    /// `AgentEvent`は**一切出ない**（`ToolCallProposed`/`ToolStarted`/`ToolFinished`の
+    /// どれも発行されない）。ツール実行ループを`raw_turn`側へ移すとき、合成経路にも
+    /// うっかりイベント発行を足すと`harness-cli`の`tool_calls`集計（`ToolCallProposed`と
+    /// `ToolFinished`をidで対応付ける）に実行されていない呼び出しが混ざるため、ここで固定する。
+    #[tokio::test]
+    async fn cancelled_remaining_tool_calls_emit_no_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            turns: Mutex::new(vec![multi_tool_use_turn(&[
+                ("call_1", "slow_tool", serde_json::json!({})),
+                ("call_2", "slow_tool", serde_json::json!({})),
+            ])]),
+        };
+        let mut state = ConversationState::new(Vec::new());
+        state.push_user_text("run two slow tools");
+        let mut tools = harness_tools::ToolRegistry::new();
+        tools.register(std::sync::Arc::new(SlowTool));
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let cancel = CancellationToken::new();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = {
+            let run_fut = run_agent_loop(
+                &provider,
+                &mut state,
+                &tools,
+                &ctx,
+                &arbiter,
+                AgentLoopConfig {
+                    model: "mock".into(),
+                    max_tokens: 100,
+                    max_turns: 5,
+                },
+                Some(&events_tx),
+                Some(&cancel),
+                |_| {},
+            );
+            tokio::pin!(run_fut);
+            let cancel_after_delay = async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                cancel.cancel();
+            };
+            let (outcome, ()) = tokio::join!(run_fut, cancel_after_delay);
+            outcome.unwrap()
+        };
+        assert!(outcome.cancelled);
+
+        let mut tool_events: Vec<(&'static str, String)> = Vec::new();
+        while let Ok(ev) = events_rx.try_recv() {
+            match ev {
+                AgentEvent::ToolCallProposed { id, .. } => {
+                    tool_events.push(("ToolCallProposed", id))
+                }
+                AgentEvent::ToolStarted { id, .. } => tool_events.push(("ToolStarted", id)),
+                AgentEvent::ToolFinished { id, .. } => tool_events.push(("ToolFinished", id)),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            tool_events,
+            vec![
+                ("ToolCallProposed", "call_1".to_string()),
+                ("ToolStarted", "call_1".to_string()),
+                ("ToolFinished", "call_1".to_string()),
+            ],
+            "the cancelled second tool_use must not emit any tool event"
+        );
     }
 }

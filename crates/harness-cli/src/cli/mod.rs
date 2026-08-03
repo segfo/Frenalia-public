@@ -15,7 +15,6 @@
 //! | [`tier3_cmd`] | `tier3`（常駐daemonの状態確認とGC） |
 //! | [`cow_cmd`] | `cow`（upper_dir一覧・拒否監査） |
 
-
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -24,9 +23,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{run_headless, OutputFormat};
+use harness_cognition::CognitiveOrchestrator;
 use harness_core::{
-    normalize_domain_pattern, LlmProvider, NetProxyConfig, RequireSandbox, StagingConfig,
-    StagingMode, ToolCtx,
+    normalize_domain_pattern, CognitionLevel, LlmProvider, NetProxyConfig, RequireSandbox,
+    StagingConfig, StagingMode, ToolCtx,
 };
 use harness_engine::{
     parse_allowlist_rule, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode,
@@ -70,6 +70,25 @@ pub(crate) enum PermissionModeArg {
     AcceptEdits,
     AcceptAll,
     Deny,
+}
+
+/// `--cognition off|auto|always`（`plans/DESIGN-COGNITION.md` §2.3）。
+/// `harness_core::CognitionLevel`と1対1で、clapの`ValueEnum`をcoreへ持ち込まないための橋。
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum CognitionLevelArg {
+    Off,
+    Auto,
+    Always,
+}
+
+impl From<CognitionLevelArg> for CognitionLevel {
+    fn from(v: CognitionLevelArg) -> Self {
+        match v {
+            CognitionLevelArg::Off => CognitionLevel::Off,
+            CognitionLevelArg::Auto => CognitionLevel::Auto,
+            CognitionLevelArg::Always => CognitionLevel::Always,
+        }
+    }
 }
 
 impl From<PermissionModeArg> for PermissionMode {
@@ -202,7 +221,6 @@ pub(crate) enum NetAction {
     },
 }
 
-
 /// `harness cow`サブコマンドの各操作。Windows Tier2a `--cow`固有機能のため、Windows以外は
 /// エラーで終了する。単一セッション向けの一覧・適用・破棄は`harness changes`/`apply`/
 /// `discard`（`--session`で対象のCoWセッションを自動的に見つける）へ統合済み（Phase 2）
@@ -272,6 +290,14 @@ pub(crate) struct Cli {
     /// 正式な設定項目化）。省略時は`settings.json`階層→既定値の順にフォールバックする。
     #[arg(long = "max-turns")]
     max_turns: Option<usize>,
+
+    /// 認知レイヤーの段階（`plans/DESIGN-COGNITION.md` §2）。省略時は`settings.json`の
+    /// `cognition.default_level`→既定値の順にフォールバックする。
+    ///
+    /// **現在実行できるのは`off`（素朴ループ）だけ**で、`auto`/`always`を指定すると
+    /// 起動時にエラーになる（黙って`off`へ降格しない）。実装マイルストーンは`docs/INDEX.md`。
+    #[arg(long = "cognition", value_enum)]
+    cognition: Option<CognitionLevelArg>,
 
     /// ワークスペースルートを明示指定する（省略時はカレントディレクトリ、§非対話モード）。
     #[arg(long = "cwd")]
@@ -423,7 +449,6 @@ pub(crate) struct Cli {
     #[arg(long = "mock-record-requests")]
     mock_record_requests: Option<PathBuf>,
 }
-
 
 pub mod cow_cmd;
 pub mod net_cmd;

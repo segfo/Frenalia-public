@@ -37,6 +37,20 @@ pub struct Settings {
     /// `run_shell`子プロセス向けの非シークレット設定。省略時は
     /// `RunShellSettings::default()`（追加PATH無し＝従来通り）。
     pub run_shell: Option<RunShellSettings>,
+    /// 認知レイヤー設定（M13〜、`plans/DESIGN-COGNITION.md` §2.3）。省略時は
+    /// `CognitionSettings::default()`（`default_level`未指定＝`CognitionLevel`の既定）。
+    pub cognition: Option<CognitionSettings>,
+}
+
+/// `.harness/settings.json`の`cognition`キー。
+///
+/// `plans/DESIGN-COGNITION.md` §8のデルタ表は`budgets`/`model_tiers`/`sources`も挙げるが、
+/// それぞれ読む側（ContextAssembler・ModelRouter・SourceBroker）が実装されるM14/M16/M17で
+/// 追加する。設定だけ先に受け付けても黙って無視されるだけで、誤解を招くため。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CognitionSettings {
+    /// `off` | `auto` | `always`。CLIの`--cognition`が指定されていればそちらが優先。
+    pub default_level: Option<harness_core::CognitionLevel>,
 }
 
 /// `.harness/settings.json`の`run_shell`キー。シークレットenvの転送は禁止し、PATH追加だけを扱う。
@@ -325,6 +339,23 @@ mod tests {
         assert_eq!(settings.model.as_deref(), Some("project-model"));
         assert_eq!(settings.max_turns, Some(10));
         let _ = dir; // ディレクトリ自体は使わないが構造を保つため保持
+    }
+
+    /// `cognition.default_level`は`CognitionLevel`のsnake_case表現をそのまま書ける
+    /// （CLIの`--cognition`と同じ綴り）。キー自体が無ければ`None`のまま。
+    #[test]
+    fn parses_cognition_default_level() {
+        let settings: Settings = serde_json::from_value(
+            serde_json::json!({ "cognition": { "default_level": "always" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            settings.cognition.unwrap().default_level,
+            Some(harness_core::CognitionLevel::Always)
+        );
+
+        let empty: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.cognition.is_none());
     }
 
     #[test]

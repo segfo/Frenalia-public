@@ -3,7 +3,8 @@
 //! `harness_engine::SessionStore` + `harness_cli::run_headless`の組み合わせを直接駆動する
 //! （§ワークスペース構成の慣例、`headless_output.rs`と同じ方針）。
 
-use harness_core::{BlockKind, StopReason, StreamEvent, ToolCtx, Usage};
+use harness_cognition::CognitiveOrchestrator;
+use harness_core::{BlockKind, CognitionLevel, StopReason, StreamEvent, ToolCtx, Usage};
 use harness_engine::{
     AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode, SessionStore,
 };
@@ -55,6 +56,7 @@ async fn run_one_turn(
         &tools,
         &ctx,
         &arbiter,
+        &CognitiveOrchestrator::new(CognitionLevel::Off).unwrap(),
         AgentLoopConfig {
             model: "mock".into(),
             max_tokens: 100,

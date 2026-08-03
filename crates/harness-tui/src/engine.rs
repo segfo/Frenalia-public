@@ -17,9 +17,10 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use harness_cognition::CognitiveOrchestrator;
 use harness_core::{AgentEvent, LlmProvider, ToolCtx};
 use harness_engine::{
-    compaction, run_agent_loop, AgentLoopConfig, ConversationState, PermissionArbiter, SessionStore,
+    compaction, AgentLoopConfig, ConversationState, PermissionArbiter, SessionStore,
 };
 use harness_tools::ToolRegistry;
 use tokio::sync::mpsc;
@@ -88,6 +89,7 @@ pub fn spawn_engine(
     tools: ToolRegistry,
     ctx: ToolCtx,
     arbiter: PermissionArbiter,
+    cognition: CognitiveOrchestrator,
     model: String,
     max_tokens: u32,
     max_turns: usize,
@@ -118,7 +120,7 @@ pub fn spawn_engine(
                     let turn_cancel = CancellationToken::new();
                     *cancel_for_task.lock().unwrap() = turn_cancel.clone();
 
-                    let result = run_agent_loop(
+                    let result = cognition.run(
                         provider.as_ref(),
                         &mut state,
                         &tools,
@@ -129,7 +131,7 @@ pub fn spawn_engine(
                         Some(&turn_cancel),
                         // TextDelta は`events`側で既に発行されるため、ここでの二重出力は不要
                         // （§リッチTUI: TUIは`AgentEvent`のみを消費する）。
-                        |_delta| {},
+                        |_delta: &str| {},
                     )
                     .await;
                     let _ = session.append_messages(&state.messages[before_turn..]);

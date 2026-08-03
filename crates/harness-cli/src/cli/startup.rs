@@ -6,7 +6,6 @@
 
 use super::*;
 
-
 /// [`stage_parse_args`]の出力。Stage2（`stage_configure`）以降が必要とする値だけを運ぶ。
 struct ParsedArgs {
     cli: Cli,
@@ -128,6 +127,9 @@ struct Configured {
     enter_submits: bool,
     tools: ToolRegistry,
     arbiter: PermissionArbiter,
+    /// 認知レイヤーの入口（M13時点では`CognitionLevel::Off`＝素朴ループへの委譲のみ）。
+    /// 未実装の段階はStage2で弾くため、ここまで来た時点で必ず実行可能な段階になっている。
+    cognition: CognitiveOrchestrator,
 }
 
 /// `settings.json`読込・`early_require_sandbox`とconfidentialの矛盾チェック・provider構築・
@@ -175,6 +177,22 @@ fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode> {
             return Err(ExitCode::FAILURE);
         }
     }
+
+    // 未実装の認知段階はここで止める。純粋な引数の妥当性検査なので、APIキーの有無や
+    // サンドボックス準備・VM起動より**前**に判定する（`--cognition always`を指定したのに
+    // 「APIキーがありません」だけが出る、という取り違えを避ける）。
+    let cognition_level = cli
+        .cognition
+        .map(CognitionLevel::from)
+        .or_else(|| settings.cognition.clone().and_then(|c| c.default_level))
+        .unwrap_or_default();
+    let cognition = match CognitiveOrchestrator::new(cognition_level) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
 
     let provider = match build_provider(
         cli.provider,
@@ -249,6 +267,7 @@ fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode> {
         enter_submits,
         tools,
         arbiter,
+        cognition,
     })
 }
 
@@ -264,6 +283,7 @@ struct SessionOpened {
     enter_submits: bool,
     tools: ToolRegistry,
     arbiter: PermissionArbiter,
+    cognition: CognitiveOrchestrator,
     sessions_dir: PathBuf,
     session: harness_engine::SessionStore,
     session_messages: Vec<harness_core::Message>,
@@ -283,6 +303,7 @@ fn stage_open_session(configured: Configured) -> Result<SessionOpened, ExitCode>
         enter_submits,
         tools,
         arbiter,
+        cognition,
     } = configured;
 
     // JSONL追記型セッション永続化（M9、§非対話モード「JSONL 追記型セッション永続化
@@ -343,6 +364,7 @@ fn stage_open_session(configured: Configured) -> Result<SessionOpened, ExitCode>
         enter_submits,
         tools,
         arbiter,
+        cognition,
         sessions_dir,
         session,
         session_messages,
@@ -360,6 +382,7 @@ struct SandboxPrepared {
     enter_submits: bool,
     tools: ToolRegistry,
     arbiter: PermissionArbiter,
+    cognition: CognitiveOrchestrator,
     sessions_dir: PathBuf,
     session: harness_engine::SessionStore,
     session_messages: Vec<harness_core::Message>,
@@ -393,6 +416,7 @@ fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<SandboxPrepare
         enter_submits,
         tools,
         arbiter,
+        cognition,
         sessions_dir,
         session,
         session_messages,
@@ -621,6 +645,7 @@ fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<SandboxPrepare
         enter_submits,
         tools,
         arbiter,
+        cognition,
         sessions_dir,
         session,
         session_messages,
@@ -651,6 +676,7 @@ async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         enter_submits,
         tools,
         arbiter,
+        cognition,
         sessions_dir,
         mut session,
         session_messages,
@@ -833,7 +859,12 @@ async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
             let settings_workspace = settings_fs_paths
                 .contains(&path_str)
                 .then(|| workspace_root.to_string_lossy().into_owned());
-            crate::fs_grants::record_fs_passthrough_grant(path, *writable, forced, settings_workspace.as_deref());
+            crate::fs_grants::record_fs_passthrough_grant(
+                path,
+                *writable,
+                forced,
+                settings_workspace.as_deref(),
+            );
             if forced {
                 eprintln!(
                     "WARNING: forced system ACL grant (--force-system-acl, SeRestorePrivilege): {} \
@@ -899,6 +930,7 @@ async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 &tools,
                 &mut tool_ctx,
                 &arbiter,
+                &cognition,
                 model,
                 max_turns,
                 cli.output_format,
@@ -915,6 +947,7 @@ async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 tools,
                 tool_ctx,
                 arbiter,
+                cognition,
                 model,
                 max_turns,
                 cli.provider.label().to_string(),
@@ -961,6 +994,7 @@ async fn headless_branch(
     tools: &ToolRegistry,
     tool_ctx: &mut ToolCtx,
     arbiter: &PermissionArbiter,
+    cognition: &CognitiveOrchestrator,
     model: String,
     max_turns: usize,
     output_format: OutputFormat,
@@ -1024,6 +1058,7 @@ async fn headless_branch(
         tools,
         tool_ctx,
         arbiter,
+        cognition,
         AgentLoopConfig {
             model,
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -1052,6 +1087,7 @@ async fn tui_branch(
     tools: ToolRegistry,
     tool_ctx: ToolCtx,
     arbiter: PermissionArbiter,
+    cognition: CognitiveOrchestrator,
     model: String,
     max_turns: usize,
     provider_label: String,
@@ -1077,6 +1113,7 @@ async fn tui_branch(
         tools,
         tool_ctx,
         arbiter,
+        cognition,
         model,
         DEFAULT_MAX_TOKENS,
         max_turns,
@@ -1119,7 +1156,6 @@ pub async fn run() -> ExitCode {
     };
     stage_run_agent(sandbox_prepared).await
 }
-
 
 /// 非対話モード（`--print`）専用: Tier3 VMサンドボックスの起動をブロッキングのまま
 /// （`tokio::task::spawn_blocking`越しに）待ちつつ、`vmsandboxd_progress`の合成進捗
@@ -1190,4 +1226,3 @@ async fn start_tier3_with_progress(
         }
     }
 }
-
