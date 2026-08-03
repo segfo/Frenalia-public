@@ -530,12 +530,8 @@ pub async fn run() -> ExitCode {
                     match harness_sandbox::tier2a::netfilterd::NetfilterHandle::connect_after_chain_launch(
                         prepared.into_handle(),
                         harness_sandbox::tier2a::netfilterd::NetfilterPolicy {
-                            allow_domains: Vec::new(),
-                            allow_loopback: false,
-                            allow_loopback_ports: Vec::new(),
                             allow_loopback_tcp_ports: net_loopback_ports.tcp.clone(),
                             allow_loopback_udp_ports: net_loopback_ports.udp.clone(),
-                            allow_direct_dns: false,
                             audit_log_path: net_proxy.audit_log_path.clone(),
                         },
                     ) {
@@ -559,12 +555,8 @@ pub async fn run() -> ExitCode {
             drop(wfp_prelude);
             match harness_sandbox::tier2a::netfilterd::NetfilterHandle::start(
                 harness_sandbox::tier2a::netfilterd::NetfilterPolicy {
-                    allow_domains: Vec::new(),
-                    allow_loopback: false,
-                    allow_loopback_ports: Vec::new(),
                     allow_loopback_tcp_ports: net_loopback_ports.tcp.clone(),
                     allow_loopback_udp_ports: net_loopback_ports.udp.clone(),
-                    allow_direct_dns: false,
                     audit_log_path: net_proxy.audit_log_path.clone(),
                 },
             ) {

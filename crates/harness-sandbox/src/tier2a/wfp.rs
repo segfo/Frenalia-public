@@ -64,8 +64,7 @@ pub enum WfpError {
     #[error("failed to configure AppContainer loopback exemption: {0}")]
     LoopbackExemption(String),
     /// v1では構築されない。WFP層で許可ドメインをIP解決して外部宛先を直接allowする設計
-    /// （仕様書の旧案）へ戻す場合に使う枠として、エラー分類を仕様書と対応させたまま残す
-    /// （`WfpOptions::allow_domains`のdocと同じ理由）。
+    /// （仕様書の旧案）へ戻す場合に使う枠として、エラー分類を仕様書と対応させたまま残す。
     #[allow(dead_code)]
     #[error("domain resolution failed for {domain}: {reason}")]
     DnsResolve { domain: String, reason: String },
@@ -91,31 +90,16 @@ fn check(status: u32, op: &str) -> Result<(), WfpError> {
 
 /// `WfpApplyRules`要求のオプション（仕様書§6のCLIオプションに対応）。
 ///
-/// `netfilterd::NetfilterPolicy`（IPCワイヤ形式）と同じ7フィールドを持つが、レイヤーが違う
-/// （こちらはWFPエンジンへ渡す層で、フィールドごとにWFP固有の意味を持つ。統合するかは
-/// `docs/STATUS.md` R-02）。`#[allow(dead_code)]`が付いた3つは**WFPフィルタ生成では
-/// 読まない**（各フィールドのdoc参照）。`pub(crate)`化により、それが警告として可視化された。
+/// `netfilterd::NetfilterPolicy`（IPCワイヤ形式）と同じ3フィールドを持つが、レイヤーが違う
+/// （こちらはWFPエンジンへ渡す層）。旧IPC互換のためだけに存在し実体を持たなかった
+/// `allow_domains`・`allow_loopback`・`allow_loopback_ports`・`allow_direct_dns`はR-02で
+/// 両型から削除した（`docs/STATUS.md`参照）。
 #[derive(Debug, Clone, Default)]
 pub struct WfpOptions {
-    /// 旧IPC/旧設計との後方互換フィールド。v1の理想形ではWFP層で許可ドメインをIP解決して
-    /// 外部宛先を直接allowしないため、この値はWFPフィルタ生成では使用しない。
-    #[allow(dead_code)]
-    pub allow_domains: Vec<String>,
-    /// 旧IPC互換フィールド。v1の強制ドメイン制御では広いlocalhost許可を作らないため、
-    /// WFPフィルタ生成では無視する。loopbackを開く場合は下のポート指定を使う。
-    #[allow(dead_code)]
-    pub allow_loopback: bool,
-    /// 旧IPC互換のloopback許可ポート。新規呼び出しではTCP/UDP別フィールドを使う。
-    /// この値は旧クライアント互換のためTCP/UDP両方を許可する。
-    pub allow_loopback_ports: Vec<u16>,
     /// TCPで許可するloopback宛先ポート。Local Proxy AgentとFake DNS TCPをここへ入れる。
     pub allow_loopback_tcp_ports: Vec<u16>,
     /// UDPで許可するloopback宛先ポート。Fake DNS UDPをここへ入れる。
     pub allow_loopback_udp_ports: Vec<u16>,
-    /// 現状未使用（システム設定DNSサーバの動的取得は未実装、§4.3の`--allow-direct-dns`）。
-    /// フィールドとしては仕様書との対応を保つために残す。
-    #[allow(dead_code)]
-    pub allow_direct_dns: bool,
     /// WFP block/drop監査イベントを追記するJSONLパス。`None`ならWFP監査購読を起動しない。
     pub audit_log_path: Option<PathBuf>,
 }
@@ -348,10 +332,7 @@ fn remove_loopback_exemption(exemption: LoopbackExemption) -> Result<(), WfpErro
 impl WfpSession {
     /// `container_sid`宛のALLOW/DENYルールを投入する（仕様書§5.1・§5.2）。
     pub fn apply(container_sid: PSID, opts: &WfpOptions) -> Result<Self, WfpError> {
-        if opts.allow_loopback_ports.is_empty()
-            && opts.allow_loopback_tcp_ports.is_empty()
-            && opts.allow_loopback_udp_ports.is_empty()
-        {
+        if opts.allow_loopback_tcp_ports.is_empty() && opts.allow_loopback_udp_ports.is_empty() {
             return Err(WfpError::NoAddressesResolved);
         }
 
@@ -663,14 +644,11 @@ fn apply_within_transaction(
         add_default_deny_filter(engine, container_sid, FWPM_LAYER_ALE_AUTH_CONNECT_V6)?;
 
         // 4. ループバック許可（任意）。Proxy/Fake DNSの待受だけを開けるため、
-        // v1ではポート指定の限定allowだけを張る。旧IPC互換の`allow_loopback`
-        // はフィールドとして受けるが、広いlocalhost許可には使わない。
-        let mut tcp_ports = opts.allow_loopback_ports.clone();
-        tcp_ports.extend(opts.allow_loopback_tcp_ports.iter().copied());
+        // v1ではポート指定の限定allowだけを張る。
+        let mut tcp_ports = opts.allow_loopback_tcp_ports.clone();
         tcp_ports.sort_unstable();
         tcp_ports.dedup();
-        let mut udp_ports = opts.allow_loopback_ports.clone();
-        udp_ports.extend(opts.allow_loopback_udp_ports.iter().copied());
+        let mut udp_ports = opts.allow_loopback_udp_ports.clone();
         udp_ports.sort_unstable();
         udp_ports.dedup();
         if !tcp_ports.is_empty() {
@@ -923,39 +901,17 @@ mod tests {
         const _: () = assert!(WEIGHT_ALLOW > WEIGHT_DENY);
     }
 
+    /// R-02で削除した旧IPC互換フィールド（`allow_domains`・`allow_loopback`・
+    /// `allow_direct_dns`）が持っていた「TCP/UDPどちらのloopbackポートも指定しなければ
+    /// fail-closedになる」という性質そのものは、フィールド削除後も`WfpOptions::default()`
+    /// で変わらず確認できる。
     #[test]
-    fn options_with_only_legacy_allow_domains_are_fail_closed() {
-        let opts = WfpOptions {
-            allow_domains: vec!["example.com".to_string()],
-            allow_loopback: false,
-            allow_loopback_ports: Vec::new(),
-            allow_loopback_tcp_ports: Vec::new(),
-            allow_loopback_udp_ports: Vec::new(),
-            allow_direct_dns: false,
-            audit_log_path: None,
-        };
+    fn options_without_any_loopback_ports_are_fail_closed() {
+        let opts = WfpOptions::default();
         match WfpSession::apply(PSID::default(), &opts) {
             Err(WfpError::NoAddressesResolved) => {}
             Err(other) => panic!("unexpected error: {other}"),
-            Ok(_) => panic!("domain-only WFP options must not open an external allow path"),
-        }
-    }
-
-    #[test]
-    fn legacy_broad_allow_loopback_without_ports_is_fail_closed() {
-        let opts = WfpOptions {
-            allow_domains: Vec::new(),
-            allow_loopback: true,
-            allow_loopback_ports: Vec::new(),
-            allow_loopback_tcp_ports: Vec::new(),
-            allow_loopback_udp_ports: Vec::new(),
-            allow_direct_dns: false,
-            audit_log_path: None,
-        };
-        match WfpSession::apply(PSID::default(), &opts) {
-            Err(WfpError::NoAddressesResolved) => {}
-            Err(other) => panic!("unexpected error: {other}"),
-            Ok(_) => panic!("broad loopback allow must not be treated as a v1 permit path"),
+            Ok(_) => panic!("empty loopback port options must not open any allow path"),
         }
     }
 
@@ -1123,12 +1079,8 @@ mod tests {
         crate::tier2a::win_appcontainer::grant_ace_recursive(dir.path(), sid.as_psid())
             .expect("grant temp dir ACE to AppContainer");
         let opts = WfpOptions {
-            allow_domains: Vec::new(),
-            allow_loopback: false,
-            allow_loopback_ports: vec![allowed_port],
-            allow_loopback_tcp_ports: Vec::new(),
+            allow_loopback_tcp_ports: vec![allowed_port],
             allow_loopback_udp_ports: Vec::new(),
-            allow_direct_dns: false,
             audit_log_path: Some(audit_path.clone()),
         };
         let session = WfpSession::apply(sid.as_psid(), &opts).expect("apply WFP rules");

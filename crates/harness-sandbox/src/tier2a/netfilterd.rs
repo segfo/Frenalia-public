@@ -58,26 +58,22 @@ use crate::win_common::wide;
 
 /// daemonへ投入させるネットワークポリシー一式（`ApplyRules`のペイロード）。
 ///
-/// この7項目は`NetfilterHandle::start`→`connect_and_apply`、および
+/// この3項目は`NetfilterHandle::start`→`connect_and_apply`、および
 /// `NetfilterHandle::connect_after_chain_launch`→`connect_and_apply`という経路を、
-/// 常に「まとめて1つ」として貫通する。個別の引数に展開すると各段で引数が7個を超え、
-/// 順序の取り違えを型で防げなくなるため、1つの値として運ぶ。
+/// 常に「まとめて1つ」として貫通する。
 ///
 /// **serde表現は`ApplyRules`のstruct variantだった頃とバイト等価**（外部タグ付き列挙型の
 /// newtype variantは、内側の構造体をそのままタグの値として書くため）。`netfilterd.exe`は
 /// 別プロセスとしてこのJSONを読むので、表現の不変は
-/// `apply_rules_request_json_wire_format_is_stable`が固定している。
+/// `apply_rules_request_json_wire_format_is_stable`が固定している。旧IPC互換のためだけに
+/// 存在し実体を持たなかった`allow_domains`・`allow_loopback`・`allow_loopback_ports`・
+/// `allow_direct_dns`はR-02で削除した（`docs/STATUS.md`参照）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetfilterPolicy {
-    pub allow_domains: Vec<String>,
-    pub allow_loopback: bool,
-    #[serde(default)]
-    pub allow_loopback_ports: Vec<u16>,
     #[serde(default)]
     pub allow_loopback_tcp_ports: Vec<u16>,
     #[serde(default)]
     pub allow_loopback_udp_ports: Vec<u16>,
-    pub allow_direct_dns: bool,
     #[serde(default)]
     pub audit_log_path: Option<PathBuf>,
 }
@@ -474,16 +470,10 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
     };
 
     // `NetfilterPolicy`はIPCワイヤ形式、`WfpOptions`はWFPエンジンへ渡す層のオプションで、
-    // 現状フィールドは同形だが所有するレイヤーが違う（`WfpOptions`側は「旧IPC互換のため
-    // WFPフィルタ生成では無視する」といったWFP固有の意味をフィールドごとに持つ）。
-    // 型は分けたまま、ここで明示的に写す。
+    // 現状フィールドは同形だが所有するレイヤーが違う。型は分けたまま、ここで明示的に写す。
     let opts = WfpOptions {
-        allow_domains: policy.allow_domains,
-        allow_loopback: policy.allow_loopback,
-        allow_loopback_ports: policy.allow_loopback_ports,
         allow_loopback_tcp_ports: policy.allow_loopback_tcp_ports,
         allow_loopback_udp_ports: policy.allow_loopback_udp_ports,
-        allow_direct_dns: policy.allow_direct_dns,
         audit_log_path: policy.audit_log_path,
     };
     let session = match WfpSession::apply(sid.as_psid(), &opts) {
@@ -536,35 +526,20 @@ mod tests {
     #[test]
     fn apply_rules_request_roundtrips_through_json() {
         let req = NetfilterRequest::ApplyRules(NetfilterPolicy {
-            allow_domains: vec!["github.com".to_string(), "api.anthropic.com".to_string()],
-            allow_loopback: true,
-            allow_loopback_ports: vec![18080, 18053],
             allow_loopback_tcp_ports: vec![18080, 18053],
             allow_loopback_udp_ports: vec![18053],
-            allow_direct_dns: false,
             audit_log_path: Some(PathBuf::from(".harness/sandbox/session-x/net-audit.jsonl")),
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: NetfilterRequest = serde_json::from_slice(&bytes).unwrap();
         match decoded {
             NetfilterRequest::ApplyRules(NetfilterPolicy {
-                allow_domains,
-                allow_loopback,
-                allow_loopback_ports,
                 allow_loopback_tcp_ports,
                 allow_loopback_udp_ports,
-                allow_direct_dns,
                 audit_log_path,
             }) => {
-                assert_eq!(
-                    allow_domains,
-                    vec!["github.com".to_string(), "api.anthropic.com".to_string()]
-                );
-                assert!(allow_loopback);
-                assert_eq!(allow_loopback_ports, vec![18080, 18053]);
                 assert_eq!(allow_loopback_tcp_ports, vec![18080, 18053]);
                 assert_eq!(allow_loopback_udp_ports, vec![18053]);
-                assert!(!allow_direct_dns);
                 assert_eq!(
                     audit_log_path,
                     Some(PathBuf::from(".harness/sandbox/session-x/net-audit.jsonl"))
@@ -581,17 +556,13 @@ mod tests {
     #[test]
     fn apply_rules_request_json_wire_format_is_stable() {
         let req = NetfilterRequest::ApplyRules(NetfilterPolicy {
-            allow_domains: vec!["github.com".to_string()],
-            allow_loopback: true,
-            allow_loopback_ports: vec![18080],
             allow_loopback_tcp_ports: vec![18080],
             allow_loopback_udp_ports: vec![18053],
-            allow_direct_dns: false,
             audit_log_path: Some(PathBuf::from("net-audit.jsonl")),
         });
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
-            r#"{"ApplyRules":{"allow_domains":["github.com"],"allow_loopback":true,"allow_loopback_ports":[18080],"allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"allow_direct_dns":false,"audit_log_path":"net-audit.jsonl"}}"#
+            r#"{"ApplyRules":{"allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"audit_log_path":"net-audit.jsonl"}}"#
         );
         assert_eq!(
             serde_json::to_string(&NetfilterRequest::Teardown).unwrap(),
@@ -631,21 +602,24 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// R-02で削除した旧IPC互換フィールド（`allow_domains`・`allow_loopback`・
+    /// `allow_direct_dns`）だけを持つ、実在しない旧クライアントのJSONを渡しても、
+    /// 未知フィールドとして無視されて読める（壊れない）ことを確認する
+    /// （`docs/STATUS.md` R-02、削除の根拠）。
     #[test]
-    fn apply_rules_request_accepts_legacy_json_without_loopback_ports() {
+    fn apply_rules_request_ignores_removed_legacy_fields_in_json() {
         let legacy =
             r#"{"ApplyRules":{"allow_domains":[],"allow_loopback":true,"allow_direct_dns":false}}"#;
         let decoded: NetfilterRequest = serde_json::from_str(legacy).unwrap();
         match decoded {
             NetfilterRequest::ApplyRules(NetfilterPolicy {
-                allow_loopback_ports,
                 allow_loopback_tcp_ports,
                 allow_loopback_udp_ports,
-                ..
+                audit_log_path,
             }) => {
-                assert!(allow_loopback_ports.is_empty());
                 assert!(allow_loopback_tcp_ports.is_empty());
                 assert!(allow_loopback_udp_ports.is_empty());
+                assert_eq!(audit_log_path, None);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
