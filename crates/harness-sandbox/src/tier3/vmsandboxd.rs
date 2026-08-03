@@ -31,34 +31,29 @@ use serde::{Deserialize, Serialize};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING,
-    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY,
+    HANDLE, HLOCAL, WAIT_OBJECT_0,
 };
-use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
-};
+use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows::Win32::Security::{
-    AccessCheck, DuplicateToken, GetTokenInformation, SecurityImpersonation, TokenUser,
-    DACL_SECURITY_INFORMATION, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-    TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER,
+    AccessCheck, DuplicateToken, SecurityImpersonation, DACL_SECURITY_INFORMATION, GENERIC_MAPPING,
+    GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSECURITY_DESCRIPTOR,
+    SECURITY_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+    CreateFileW, FlushFileBuffers, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
     FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     GetNamedPipeServerProcessId, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
     WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -163,42 +158,23 @@ const DAEMON_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_milli
 /// 昇格済みdaemonプロセスを終了し、次回Tier3利用時に必要なら再起動する。
 const DAEMON_IDLE_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// トークンハンドルからSDDL文字列表現のSIDを取り出す共通ロジック（`current_user_sid_string`・
-/// `query_process_token_sid`（S-2、クライアント身元検証）の両方が使う）。
-fn sid_string_from_token(token: HANDLE) -> windows::core::Result<String> {
-    unsafe {
-        let mut ret_len = 0u32;
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut ret_len);
-        let mut buf = vec![0u8; ret_len as usize];
-        GetTokenInformation(
-            token,
-            TokenUser,
-            Some(buf.as_mut_ptr() as *mut _),
-            ret_len,
-            &mut ret_len,
-        )?;
+// 名前付きパイプIPCの下回り（DACL・オーバーラップドI/O・フレーミング）は
+// `crate::win_pipe_ipc`が持つ。以前はこのファイル・`tier2a/privhelper.rs`・
+// `tier2a/netfilterd.rs`の3箇所に同じ一式がコピーされていた。
+use crate::win_pipe_ipc::{
+    connect_with_timeout, current_user_sid_string, read_framed_timeout, sid_string_from_token,
+    user_only_security_attributes, write_framed_timeout,
+};
 
-        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
-        let sid = token_user.User.Sid;
-        let mut sid_str_ptr = windows::core::PWSTR::null();
-        ConvertSidToStringSidW(sid, &mut sid_str_ptr)?;
-        let sid_str = crate::win_common::pwstr_to_string(sid_str_ptr);
-        let _ = LocalFree(HLOCAL(sid_str_ptr.0 as *mut _));
-        Ok(sid_str)
-    }
+/// このモジュール用の使い捨てパイプ名（GC経路専用。常駐daemonは`session_daemon_pipe_name`の
+/// 固定名を使う）。
+fn unique_pipe_name() -> String {
+    crate::win_pipe_ipc::unique_pipe_name("vmsandboxd")
 }
 
-fn current_user_sid_string() -> windows::core::Result<String> {
-    unsafe {
-        let mut token = HANDLE::default();
-        OpenProcessToken(
-            GetCurrentProcess(),
-            windows::Win32::Security::TOKEN_QUERY,
-            &mut token,
-        )?;
-        let result = sid_string_from_token(token);
-        let _ = CloseHandle(token);
-        result
+impl From<crate::win_pipe_ipc::PipeIpcError> for VmSandboxIpcError {
+    fn from(e: crate::win_pipe_ipc::PipeIpcError) -> Self {
+        VmSandboxIpcError::Ipc(e.into_message())
     }
 }
 
@@ -474,24 +450,6 @@ fn authorize_workspace_root(
     Ok(())
 }
 
-fn user_only_security_attributes(sid: &str) -> windows::core::Result<SECURITY_ATTRIBUTES> {
-    let sddl = format!("D:(A;;GA;;;{sid})");
-    unsafe {
-        let sddl_w = wide(&sddl);
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl_w.as_ptr()),
-            SDDL_REVISION_1,
-            &mut sd,
-            None,
-        )?;
-        Ok(SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd.0,
-            bInheritHandle: false.into(),
-        })
-    }
-}
 
 /// 常駐セッションdaemonの固定named pipe名（S-2）。パイプの向きを反転させ常駐daemonが
 /// サーバになるため、GC専用の使い捨て名（[`unique_pipe_name`]、GC経路は変更なし）とは別に
@@ -502,157 +460,7 @@ fn session_daemon_pipe_name() -> &'static str {
     r"\\.\pipe\harness-vmsandboxd-session"
 }
 
-fn unique_pipe_name() -> String {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        r"\\.\pipe\harness-vmsandboxd-{}-{}-{}",
-        std::process::id(),
-        n,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    )
-}
 
-fn run_overlapped<F>(
-    handle: HANDLE,
-    timeout: std::time::Duration,
-    op_name: &str,
-    start: F,
-) -> Result<u32, VmSandboxIpcError>
-where
-    F: FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
-{
-    unsafe {
-        let event = CreateEventW(None, true, false, PCWSTR::null())
-            .map_err(|e| VmSandboxIpcError::Ipc(format!("{op_name}: CreateEventW failed: {e}")))?;
-        let mut overlapped = OVERLAPPED {
-            hEvent: event,
-            ..Default::default()
-        };
-
-        let pending = match start(&mut overlapped as *mut _) {
-            Ok(()) => false,
-            Err(e) => {
-                let code = e.code();
-                if code == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) {
-                    true
-                } else if code == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) {
-                    // クライアントが`ConnectNamedPipe`呼び出し前に既に接続済みだった場合。
-                    // `netfilterd.rs`で実機発見・修正した既知の競合と同じ（モジュールdoc参照）。
-                    let _ = CloseHandle(event);
-                    return Ok(0);
-                } else {
-                    let _ = CloseHandle(event);
-                    return Err(VmSandboxIpcError::Ipc(format!(
-                        "{op_name} failed to start: {e}"
-                    )));
-                }
-            }
-        };
-
-        if pending {
-            let wait = WaitForSingleObject(event, timeout.as_millis().min(u32::MAX as u128) as u32);
-            if wait != WAIT_OBJECT_0 {
-                let _ = CancelIoEx(handle, Some(&overlapped as *const _));
-                let mut transferred = 0u32;
-                let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, true);
-                let _ = CloseHandle(event);
-                return Err(VmSandboxIpcError::Ipc(format!(
-                    "{op_name} timed out after {timeout:?}"
-                )));
-            }
-        }
-
-        let mut transferred = 0u32;
-        let result = GetOverlappedResult(handle, &overlapped, &mut transferred, false);
-        let _ = CloseHandle(event);
-        result.map_err(|e| {
-            VmSandboxIpcError::Ipc(format!("{op_name}: GetOverlappedResult failed: {e}"))
-        })?;
-        Ok(transferred)
-    }
-}
-
-fn connect_with_timeout(
-    pipe: HANDLE,
-    timeout: std::time::Duration,
-) -> Result<(), VmSandboxIpcError> {
-    run_overlapped(pipe, timeout, "ConnectNamedPipe", |ov| unsafe {
-        ConnectNamedPipe(pipe, Some(ov))
-    })?;
-    Ok(())
-}
-
-fn write_all_timeout(
-    handle: HANDLE,
-    buf: &[u8],
-    timeout: std::time::Duration,
-) -> Result<(), VmSandboxIpcError> {
-    let mut offset = 0usize;
-    while offset < buf.len() {
-        let slice = &buf[offset..];
-        let written = run_overlapped(handle, timeout, "WriteFile", |ov| unsafe {
-            WriteFile(handle, Some(slice), None, Some(ov))
-        })?;
-        if written == 0 {
-            return Err(VmSandboxIpcError::Ipc(
-                "WriteFile wrote 0 bytes".to_string(),
-            ));
-        }
-        offset += written as usize;
-    }
-    Ok(())
-}
-
-fn read_exact_timeout(
-    handle: HANDLE,
-    buf: &mut [u8],
-    timeout: std::time::Duration,
-) -> Result<(), VmSandboxIpcError> {
-    let mut offset = 0usize;
-    while offset < buf.len() {
-        let slice = &mut buf[offset..];
-        let read = run_overlapped(handle, timeout, "ReadFile", |ov| unsafe {
-            ReadFile(handle, Some(slice), None, Some(ov))
-        })?;
-        if read == 0 {
-            return Err(VmSandboxIpcError::Ipc(
-                "ReadFile read 0 bytes (pipe closed?)".to_string(),
-            ));
-        }
-        offset += read as usize;
-    }
-    Ok(())
-}
-
-fn write_framed_timeout(
-    handle: HANDLE,
-    payload: &[u8],
-    timeout: std::time::Duration,
-) -> Result<(), VmSandboxIpcError> {
-    let len = (payload.len() as u32).to_le_bytes();
-    write_all_timeout(handle, &len, timeout)?;
-    write_all_timeout(handle, payload, timeout)?;
-    Ok(())
-}
-
-fn read_framed_timeout(
-    handle: HANDLE,
-    timeout: std::time::Duration,
-) -> Result<Vec<u8>, VmSandboxIpcError> {
-    let mut len_buf = [0u8; 4];
-    read_exact_timeout(handle, &mut len_buf, timeout)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        read_exact_timeout(handle, &mut payload, timeout)?;
-    }
-    Ok(payload)
-}
 
 fn daemon_exe_path() -> Result<PathBuf, VmSandboxIpcError> {
     let current = std::env::current_exe()
@@ -1433,7 +1241,7 @@ pub fn serve_resident(
             unsafe {
                 let _ = CloseHandle(pipe);
             }
-            return Err(e);
+            return Err(e.into());
         }
 
         let client_pid = match verify_pipe_client_identity(pipe, &owner_sid_owned, &owner_exe_owned)
@@ -1694,7 +1502,8 @@ fn serve_inner(
 fn send_response(pipe: HANDLE, resp: &VmResponse) -> Result<(), VmSandboxIpcError> {
     let bytes = serde_json::to_vec(resp)
         .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to serialize response: {e}")))?;
-    write_framed_timeout(pipe, &bytes, TEARDOWN_RESPONSE_TIMEOUT)
+    write_framed_timeout(pipe, &bytes, TEARDOWN_RESPONSE_TIMEOUT)?;
+    Ok(())
 }
 
 /// daemon側のGC専用エントリポイント（`harness-vmsandboxd.exe <pipe> --gc-only`から呼ぶ）。

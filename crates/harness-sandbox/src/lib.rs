@@ -42,6 +42,12 @@ pub mod shell_tier;
 #[cfg(windows)]
 mod win_common;
 
+/// 名前付きパイプIPCの下回り（DACL・オーバーラップドI/O・長さプレフィックス・フレーミング）。
+/// `tier2a::privhelper`・`tier2a::netfilterd`・`tier3::vmsandboxd`が共有するため、
+/// どの`tierN`にも属さずここに置く。
+#[cfg(windows)]
+pub(crate) mod win_pipe_ipc;
+
 /// BUG-051: 子プロセスのコンソール出力（起動直後のANSIコードページ由来のメッセージと、
 /// ブートストラップ適用後のUTF-8が同一ストリーム内で混在し得る）を復号するために使う。
 /// `run_shell`（Tier0/1/2a）に限らず、Windowsコマンドの出力をエラーメッセージへ載せる

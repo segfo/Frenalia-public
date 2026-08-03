@@ -31,28 +31,21 @@ use serde::{Deserialize, Serialize};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED,
-    HANDLE, HLOCAL, WAIT_OBJECT_0,
-};
-use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, HANDLE, HLOCAL, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, TokenElevation, TokenUser, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, TokenElevation, PSID, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-    PIPE_WAIT,
+    CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
+    GetCurrentProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
 };
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -272,75 +265,24 @@ pub fn is_elevated() -> bool {
     }
 }
 
-/// 現在プロセスのユーザSIDを`S-1-...`形式の文字列で取得する（named pipeのDACLを
-/// このユーザへ限定するため）。
-fn current_user_sid_string() -> windows::core::Result<String> {
-    unsafe {
-        let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+// 名前付きパイプIPCの下回り（DACL・オーバーラップドI/O・フレーミング）は
+// `crate::win_pipe_ipc`が持つ。以前はこのファイル・`tier2a/netfilterd.rs`・
+// `tier3/vmsandboxd.rs`の3箇所に同じ一式がコピーされていた（そのうち`run_overlapped`の
+// タイムアウトのクランプが本ファイルにだけ無い、という劣化も起きていた）。
+use crate::win_pipe_ipc::{
+    connect_with_timeout, current_user_sid_string, read_framed_timeout,
+    user_only_security_attributes, write_framed_timeout,
+};
 
-        let mut ret_len = 0u32;
-        // 1回目は必要バッファサイズを問い合わせるだけの呼び出し（ERROR_INSUFFICIENT_BUFFERを
-        // 無視する、Win32の定型パターン）。
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut ret_len);
-        let mut buf = vec![0u8; ret_len as usize];
-        let get_result = GetTokenInformation(
-            token,
-            TokenUser,
-            Some(buf.as_mut_ptr() as *mut _),
-            ret_len,
-            &mut ret_len,
-        );
-        let _ = CloseHandle(token);
-        get_result?;
-
-        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
-        let sid = token_user.User.Sid;
-        let mut sid_str_ptr = windows::core::PWSTR::null();
-        ConvertSidToStringSidW(sid, &mut sid_str_ptr)?;
-        let sid_str = crate::win_common::pwstr_to_string(sid_str_ptr);
-        let _ = LocalFree(HLOCAL(sid_str_ptr.0 as *mut _));
-        Ok(sid_str)
-    }
-}
-
-/// 現在ユーザのSIDのみへフルアクセスを許可するセキュリティ記述子を作る（named pipe用）。
-/// 他ユーザ（Administrators含む、`sid`以外の全て）は既定拒否（DACLに列挙されないtrusteeへの
-/// 暗黙deny）。
-fn user_only_security_attributes(sid: &str) -> windows::core::Result<SECURITY_ATTRIBUTES> {
-    let sddl = format!("D:(A;;GA;;;{sid})");
-    unsafe {
-        let sddl_w = wide(&sddl);
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl_w.as_ptr()),
-            SDDL_REVISION_1,
-            &mut sd,
-            None,
-        )?;
-        Ok(SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd.0,
-            bInheritHandle: false.into(),
-        })
-    }
-}
-
-/// 一意なパイプ名を作る（PID + 単調増加カウンタで衝突回避、暗号論的乱数は不要 — 名前の
-/// 推測可能性はDACLで既に閉じているため、名前自体の秘匿性には依存しない設計）。
+/// このモジュール用のパイプ名。
 fn unique_pipe_name() -> String {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        r"\\.\pipe\harness-privhelper-{}-{}-{}",
-        std::process::id(),
-        n,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    )
+    crate::win_pipe_ipc::unique_pipe_name("privhelper")
+}
+
+impl From<crate::win_pipe_ipc::PipeIpcError> for PrivHelperError {
+    fn from(e: crate::win_pipe_ipc::PipeIpcError) -> Self {
+        PrivHelperError::Ipc(e.into_message())
+    }
 }
 
 /// 親がヘルパーの接続を待つ上限（`ShellExecuteExW`のUACダイアログ操作自体はここに含まれない。
@@ -355,155 +297,6 @@ const REQUEST_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// 踏まえ、余裕を持たせた値。Phase 2の実測結果次第で調整する。
 const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// オーバーラップドI/O 1回分（`ConnectNamedPipe`/`ReadFile`/`WriteFile`のいずれか）を
-/// `timeout`以内に完了させる。`start`は対応するWin32 I/O開始APIを呼び出すクロージャで、
-/// `ERROR_IO_PENDING`（正常系、非同期処理が始まった）と`ERROR_PIPE_CONNECTED`
-/// （`ConnectNamedPipe`固有の「相手が呼び出し前に既に繋がっていた」正常系）はここで吸収する。
-/// タイムアウト時は`CancelIoEx`で取り消してから返るため、staleな非同期I/Oをハンドルに
-/// 残さない（呼び出し側がすぐハンドルを閉じても問題ない状態にする）。
-fn run_overlapped<F>(
-    handle: HANDLE,
-    timeout: std::time::Duration,
-    op_name: &str,
-    start: F,
-) -> Result<u32, PrivHelperError>
-where
-    F: FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
-{
-    unsafe {
-        let event = CreateEventW(None, true, false, PCWSTR::null())
-            .map_err(|e| PrivHelperError::Ipc(format!("{op_name}: CreateEventW failed: {e}")))?;
-        let mut overlapped = OVERLAPPED {
-            hEvent: event,
-            ..Default::default()
-        };
-
-        let pending = match start(&mut overlapped as *mut _) {
-            Ok(()) => false,
-            Err(e) => {
-                let code = e.code();
-                if code == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) {
-                    true
-                } else if code == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) {
-                    // クライアントが`ConnectNamedPipe`呼び出し前に既に接続済みだった（synchronous
-                    // completion）。MSDNの既知の注意点: このケースではOVERLAPPEDのイベントは
-                    // シグナルされないため、後続の`GetOverlappedResult`を呼んではいけない
-                    // （呼ぶと`ERROR_IO_INCOMPLETE`で失敗する）。ここで即座に成功として返す。
-                    // 【2026-07-25実機E2Eで発見・修正】従来この関数は昇格の`runas`起動（低速、
-                    // クライアントが繋がるまで数秒かかる）でしか使われておらず、この競合が
-                    // 顕在化しなかった。WFP連鎖起動（`netfilterd`が特権分離ヘルパー経由で即座に
-                    // 接続してくる、UAC待ちが無い経路）を追加した際、この機種で実際に
-                    // `ERROR_IO_INCOMPLETE`が発生し発覚した（`netfilterd.rs`の同名関数と同じ修正）。
-                    let _ = CloseHandle(event);
-                    return Ok(0);
-                } else {
-                    let _ = CloseHandle(event);
-                    return Err(PrivHelperError::Ipc(format!(
-                        "{op_name} failed to start: {e}"
-                    )));
-                }
-            }
-        };
-
-        if pending {
-            let wait = WaitForSingleObject(event, timeout.as_millis() as u32);
-            if wait != WAIT_OBJECT_0 {
-                // タイムアウトまたは待機自体の失敗。取り消して、取り消し完了(bWait=true)まで
-                // 待ってから返る — ハンドルをこの後すぐ閉じても`OVERLAPPED`がstaleに
-                // ならないようにするため。
-                let _ = CancelIoEx(handle, Some(&overlapped as *const _));
-                let mut transferred = 0u32;
-                let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, true);
-                let _ = CloseHandle(event);
-                return Err(PrivHelperError::Ipc(format!(
-                    "{op_name} timed out after {timeout:?}"
-                )));
-            }
-        }
-
-        let mut transferred = 0u32;
-        let result = GetOverlappedResult(handle, &overlapped, &mut transferred, false);
-        let _ = CloseHandle(event);
-        result.map_err(|e| {
-            PrivHelperError::Ipc(format!("{op_name}: GetOverlappedResult failed: {e}"))
-        })?;
-        Ok(transferred)
-    }
-}
-
-fn connect_with_timeout(pipe: HANDLE, timeout: std::time::Duration) -> Result<(), PrivHelperError> {
-    run_overlapped(pipe, timeout, "ConnectNamedPipe", |ov| unsafe {
-        ConnectNamedPipe(pipe, Some(ov))
-    })?;
-    Ok(())
-}
-
-fn write_all_timeout(
-    handle: HANDLE,
-    buf: &[u8],
-    timeout: std::time::Duration,
-) -> Result<(), PrivHelperError> {
-    let mut offset = 0usize;
-    while offset < buf.len() {
-        let slice = &buf[offset..];
-        let written = run_overlapped(handle, timeout, "WriteFile", |ov| unsafe {
-            WriteFile(handle, Some(slice), None, Some(ov))
-        })?;
-        if written == 0 {
-            return Err(PrivHelperError::Ipc("WriteFile wrote 0 bytes".to_string()));
-        }
-        offset += written as usize;
-    }
-    Ok(())
-}
-
-fn read_exact_timeout(
-    handle: HANDLE,
-    buf: &mut [u8],
-    timeout: std::time::Duration,
-) -> Result<(), PrivHelperError> {
-    let mut offset = 0usize;
-    while offset < buf.len() {
-        let slice = &mut buf[offset..];
-        let read = run_overlapped(handle, timeout, "ReadFile", |ov| unsafe {
-            ReadFile(handle, Some(slice), None, Some(ov))
-        })?;
-        if read == 0 {
-            return Err(PrivHelperError::Ipc(
-                "ReadFile read 0 bytes (pipe closed?)".to_string(),
-            ));
-        }
-        offset += read as usize;
-    }
-    Ok(())
-}
-
-/// `write_framed`のオーバーラップド・タイムアウト付き版。
-fn write_framed_timeout(
-    handle: HANDLE,
-    payload: &[u8],
-    timeout: std::time::Duration,
-) -> Result<(), PrivHelperError> {
-    let len = (payload.len() as u32).to_le_bytes();
-    write_all_timeout(handle, &len, timeout)?;
-    write_all_timeout(handle, payload, timeout)?;
-    Ok(())
-}
-
-/// `read_framed`のオーバーラップド・タイムアウト付き版。
-fn read_framed_timeout(
-    handle: HANDLE,
-    timeout: std::time::Duration,
-) -> Result<Vec<u8>, PrivHelperError> {
-    let mut len_buf = [0u8; 4];
-    read_exact_timeout(handle, &mut len_buf, timeout)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        read_exact_timeout(handle, &mut payload, timeout)?;
-    }
-    Ok(payload)
-}
 
 /// ヘルパー実行ファイル（`harness-privhelper.exe`）のパスを、本体exeと同じディレクトリから
 /// 解決する（PATH検索に頼らない固定ロケーション、D-16の「小さく独立にビルド・監査可能な
@@ -901,7 +694,7 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
             unsafe {
                 let _ = CloseHandle(pipe);
             }
-            return Err(e);
+            return Err(e.into());
         }
     };
     let (response, chain_netfilterd_pipe) =
@@ -942,7 +735,7 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
         }
     }
 
-    write_result
+    write_result.map_err(Into::into)
 }
 
 /// ヘルパー実行ファイルと同じディレクトリから`harness-netfilterd.exe`を解決する
@@ -1267,6 +1060,9 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
 #[cfg(all(windows, test))]
 mod pipe_ipc_characterization {
     use super::*;
+    use crate::win_pipe_ipc::read_exact_timeout;
+    use windows::Win32::Security::Authorization::SDDL_REVISION_1;
+    use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 
     fn short_timeout() -> std::time::Duration {
         std::time::Duration::from_secs(5)
