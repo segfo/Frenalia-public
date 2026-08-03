@@ -7,6 +7,7 @@ members = [
     "crates/harness-tools",
     "crates/harness-sandbox",
     "crates/harness-change-ledger",
+    "crates/harness-grant-ledger",
     "crates/harness-redirector",
     "crates/harness-privhelper",
     "crates/harness-netfilterd",

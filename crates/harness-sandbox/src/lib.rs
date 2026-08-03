@@ -91,43 +91,13 @@ use std::path::{Component, Path, PathBuf};
 use cap_std::fs::{Dir, File};
 use cap_std::time::SystemTime;
 
-/// 名前付きOSミューテックスで`f`を直列化する（`vm_ledger.rs`の`with_ledger_lock`と同型、
-/// `harness-cli`側の台帳（`fs-passthrough-ledger.json`等）が複数`harness.exe`同時起動下で
-/// read-modify-writeレースを起こさないようにするための汎用ヘルパー）。`name`は
-/// `Local\`接頭辞を含む完全なカーネルオブジェクト名を渡すこと（呼び出し側ごとに衝突しない
-/// 名前にする）。ミューテックス取得自体に失敗した場合はロック無しで`f`を実行する
-/// （`vm_ledger.rs`と同じfail-open方針、台帳操作自体を止めない）。
-#[cfg(windows)]
-pub fn with_named_lock<R>(name: &str, f: impl FnOnce() -> R) -> R {
-    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{
-        CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
-    };
-
-    let wide_name = win_common::wide(name);
-    let handle = unsafe { CreateMutexW(None, false, windows::core::PCWSTR(wide_name.as_ptr())) };
-    let Ok(handle) = handle else {
-        return f();
-    };
-    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-    if wait != WAIT_OBJECT_0 {
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
-        return f();
-    }
-    let result = f();
-    unsafe {
-        let _ = ReleaseMutex(handle);
-        let _ = CloseHandle(handle);
-    }
-    result
-}
-
-#[cfg(not(windows))]
-pub fn with_named_lock<R>(_name: &str, f: impl FnOnce() -> R) -> R {
-    f()
-}
+/// 名前付きOSミューテックスで`f`を直列化する汎用ヘルパー。
+///
+/// 実体は[`harness_grant_ledger::with_named_lock`]（台帳のread-modify-writeを複数
+/// `harness.exe`同時起動下で直列化するのが元々の用途）。`harness-cli`と
+/// `workspace_ledger::begin_workspace_mode`が既にこのパスで参照しているため、
+/// 呼び出し側を書き換えずに済むよう再エクスポートする。
+pub use harness_grant_ledger::with_named_lock;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JailError {

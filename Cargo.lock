@@ -1023,6 +1023,7 @@ dependencies = [
  "harness-config",
  "harness-core",
  "harness-engine",
+ "harness-grant-ledger",
  "harness-providers",
  "harness-sandbox",
  "harness-tools",
@@ -1069,6 +1070,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "harness-grant-ledger"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "windows",
 ]
 
 [[package]]
@@ -1120,6 +1132,7 @@ dependencies = [
  "directories",
  "harness-change-ledger",
  "harness-core",
+ "harness-grant-ledger",
  "rand 0.9.4",
  "reqwest",
  "serde",

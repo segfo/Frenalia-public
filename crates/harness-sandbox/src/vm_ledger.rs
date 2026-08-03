@@ -22,7 +22,7 @@
 //! 素の`rm`/`Remove-Item`からの保護）。この台帳自体もクリーンアップ操作で
 //! 誤って削除してはならないファイルとして同じ規律のもとに置く（`CLAUDE.md`参照）。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -95,137 +95,52 @@ pub struct VmLedger {
     pub workspace_resources: Vec<WorkspaceResourceEntry>,
 }
 
-/// 台帳ファイルのパス（`%APPDATA%\harness\config\tier3-vm-ledger.json`、既存台帳群と同じ
-/// `ProjectDirs::config_dir()`配下）。
-fn ledger_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "harness")
-        .map(|d| d.config_dir().join("tier3-vm-ledger.json"))
+/// 台帳ファイル（`%APPDATA%\harness\config\tier3-vm-ledger.json`）。ファイル入出力
+/// （誤削除防止の2層・fail-open）と名前付きmutexによる直列化は`harness-grant-ledger`の
+/// `Ledger<T>`が持つ。
+fn ledger() -> &'static harness_grant_ledger::Ledger<VmLedger> {
+    static LEDGER: std::sync::OnceLock<harness_grant_ledger::Ledger<VmLedger>> =
+        std::sync::OnceLock::new();
+    LEDGER.get_or_init(|| {
+        harness_grant_ledger::Ledger::in_config_dir(
+            "tier3-vm-ledger.json",
+            Some("Local\\harness-tier3-vm-ledger"),
+        )
+    })
 }
 
-#[cfg(windows)]
-fn with_ledger_lock<R>(f: impl FnOnce() -> R) -> R {
-    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{
-        CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
-    };
-
-    let name = crate::win_common::wide("Local\\harness-tier3-vm-ledger");
-    let handle = unsafe { CreateMutexW(None, false, windows::core::PCWSTR(name.as_ptr())) };
-    let Ok(handle) = handle else {
-        return f();
-    };
-    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-    if wait != WAIT_OBJECT_0 {
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
-        return f();
-    }
-    let result = f();
-    unsafe {
-        let _ = ReleaseMutex(handle);
-        let _ = CloseHandle(handle);
-    }
-    result
-}
-
-#[cfg(not(windows))]
-fn with_ledger_lock<R>(f: impl FnOnce() -> R) -> R {
-    f()
-}
-
-/// 台帳が存在しない/読めない/パースできない場合は空扱い（`harness-cli`の
-/// `load_fs_ledger`と同じfail-open方針、daemonの起動を止めない）。**Phase Bでスキーマを
-/// 破壊的に変更したため、旧スキーマ（`entries: [...]`）のファイルは黙って空扱いになる**
-/// （このファイルは`%APPDATA%`配下のローカル運用状態であり、ユーザーデータではないため
-/// 移行コードは書かない。実際にVMが孤児として起動中だった場合は、後段の
+/// 台帳が存在しない/読めない/パースできない場合は空扱い（fail-open、daemonの起動を止めない）。
+/// **Phase Bでスキーマを破壊的に変更したため、旧スキーマ（`entries: [...]`）のファイルは
+/// 黙って空扱いになる**（このファイルは`%APPDATA%`配下のローカル運用状態であり、ユーザー
+/// データではないため移行コードは書かない。実際にVMが孤児として起動中だった場合は、後段の
 /// `existing_vm_names`（Hyper-V実機照会）が belt-and-suspenders として拾う）。
 pub fn load() -> VmLedger {
-    with_ledger_lock(load_unlocked)
+    ledger().load()
 }
 
-fn load_unlocked() -> VmLedger {
-    let Some(path) = ledger_path() else {
-        return VmLedger::default();
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => VmLedger::default(),
-    }
+pub fn save(ledger_value: &VmLedger) {
+    ledger().save(ledger_value);
 }
 
-pub fn save(ledger: &VmLedger) {
-    with_ledger_lock(|| save_unlocked(ledger));
-}
-
-fn save_unlocked(ledger: &VmLedger) {
-    let Some(path) = ledger_path() else {
-        return;
-    };
-    if let Ok(s) = serde_json::to_string_pretty(ledger) {
-        write_ledger_file(&path, &s);
-    }
-}
-
-/// 台帳ファイルへの書込を、誤削除防止の2層（read-only属性＋`.bak`バックアップ）を
-/// 通して行う（`harness-cli::write_ledger_file`と同じパターン、`CLAUDE.md`のクリーン
-/// アップ禁止ファイル規約参照）。
-fn write_ledger_file(path: &Path, contents: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if path.exists() {
-        set_file_readonly(path, false);
-        let backup_path = path.with_extension("json.bak");
-        let _ = std::fs::copy(path, &backup_path);
-    }
-    if std::fs::write(path, contents).is_ok() {
-        set_file_readonly(path, true);
-    }
-}
-
-#[cfg(windows)]
-fn set_file_readonly(path: &Path, readonly: bool) {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mut perms = metadata.permissions();
-        perms.set_readonly(readonly);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-}
-
-#[cfg(not(windows))]
-fn set_file_readonly(_path: &Path, _readonly: bool) {}
-
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use harness_grant_ledger::now_unix_secs;
 
 /// `VmHost::attach`がVM起動（コールド/ウォームいずれか）に成功した直後に呼ぶ（冪等upsert）。
 /// `daemon_pid`はこのVMを起動した常駐daemonプロセス自身のPID（`std::process::id()`）。
 /// BUG-027対策の生存判定に使う（`is_pid_alive`のdoc参照）。
 pub fn record_vm_host(vm_name: &str, diff_vhdx: &Path, daemon_pid: u32) {
-    with_ledger_lock(|| {
-        let mut ledger = load_unlocked();
-        ledger.vm_host = Some(VmHostEntry {
+    ledger().update(|l| {
+        l.vm_host = Some(VmHostEntry {
             vm_name: vm_name.to_string(),
             diff_vhdx: diff_vhdx.to_string_lossy().into_owned(),
             daemon_pid,
             created_at_unix_secs: now_unix_secs(),
         });
-        save_unlocked(&ledger);
     });
 }
 
 /// `VmHost::release`がVM撤収（refcountが0になった）に成功した後に呼ぶ。
 pub fn remove_vm_host() {
-    with_ledger_lock(|| {
-        let mut ledger = load_unlocked();
-        ledger.vm_host = None;
-        save_unlocked(&ledger);
-    });
+    ledger().update(|l| l.vm_host = None);
 }
 
 /// `workspace_id`単位資源の参照カウントをインクリメントする（新規作成時は`refcount=1`で
@@ -242,17 +157,15 @@ pub fn record_workspace_resource(
     user: &str,
     user_sid: &str,
 ) {
-    with_ledger_lock(|| {
-        let mut ledger = load_unlocked();
+    ledger().update(|l| {
         upsert_workspace_resource_in_ledger(
-            &mut ledger,
+            l,
             workspace_id,
             workspace_root,
             share_name,
             user,
             user_sid,
         );
-        save_unlocked(&ledger);
     });
 }
 
@@ -292,21 +205,11 @@ fn upsert_workspace_resource_in_ledger(
 /// （まだ他セッションが使用中＝`refcount > 0`のままなら`None`を返し、共有・アカウントは
 /// 破棄しない）。
 pub fn release_workspace_resource(workspace_id: &str) -> Option<WorkspaceResourceEntry> {
-    with_ledger_lock(|| {
-        let mut ledger = load_unlocked();
-        let result = release_workspace_resource_in_ledger(&mut ledger, workspace_id);
-        save_unlocked(&ledger);
-        result
-    })
+    ledger().update(|l| release_workspace_resource_in_ledger(l, workspace_id))
 }
 
 pub fn update<R>(f: impl FnOnce(&mut VmLedger) -> R) -> R {
-    with_ledger_lock(|| {
-        let mut ledger = load_unlocked();
-        let result = f(&mut ledger);
-        save_unlocked(&ledger);
-        result
-    })
+    ledger().update(f)
 }
 
 /// [`release_workspace_resource`]の純粋ロジック部分（テストはこちらを直接呼ぶ、

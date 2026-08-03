@@ -1365,86 +1365,26 @@ struct FsLedger {
     denied_entries: Vec<FsDeniedLedgerEntry>,
 }
 
-/// 台帳ファイルのパス（`%APPDATA%\harness\config\fs-passthrough-ledger.json`相当、`harness-config`の
-/// `user_settings_path`と同じ土台）。横断的な穴を1台帳に集約し、どのプロジェクトからでも
-/// 全撤収できるようにする（D5）。
-fn fs_ledger_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "harness")
-        .map(|d| d.config_dir().join("fs-passthrough-ledger.json"))
+/// 台帳ファイル（`%APPDATA%\harness\config\fs-passthrough-ledger.json`）。横断的な穴を
+/// 1台帳に集約し、どのプロジェクトからでも全撤収できるようにする（D5）。
+///
+/// ファイル入出力（誤削除防止の2層・fail-open）と、複数`harness.exe`同時起動下での
+/// read-modify-write直列化（D-27）は`harness-grant-ledger`の`Ledger<T>`が持つ。
+fn fs_ledger() -> &'static harness_grant_ledger::Ledger<FsLedger> {
+    static LEDGER: std::sync::OnceLock<harness_grant_ledger::Ledger<FsLedger>> =
+        std::sync::OnceLock::new();
+    LEDGER.get_or_init(|| {
+        harness_grant_ledger::Ledger::in_config_dir(
+            "fs-passthrough-ledger.json",
+            Some("Local\\harness-fs-passthrough-ledger"),
+        )
+    })
 }
 
-/// fs ledgerの名前付きロック名（`vm_ledger.rs`の`Local\harness-tier3-vm-ledger`と同じ命名）。
-/// 複数`harness.exe`同時起動下でのread-modify-writeレースを防ぐ（D-27）。
-const FS_LEDGER_LOCK_NAME: &str = "Local\\harness-fs-passthrough-ledger";
-
-/// 台帳が存在しない/読めない/パースできない場合は空扱い（`harness-config`の設定読み込みと
-/// 同じfail-open方針、起動を止めない）。単発の読取専用アクセス用（ロック込み）。
-/// 複合的なread-modify-writeを行う場合は`with_named_lock`の中で`load_fs_ledger_unlocked`を使うこと。
-#[cfg(windows)]
+/// 台帳が存在しない/読めない/パースできない場合は空扱い（fail-open、起動を止めない）。
+/// 単発の読取専用アクセス用。複合的なread-modify-writeには`fs_ledger().update(..)`を使うこと。
 fn load_fs_ledger() -> FsLedger {
-    harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, load_fs_ledger_unlocked)
-}
-
-#[cfg(not(windows))]
-fn load_fs_ledger() -> FsLedger {
-    load_fs_ledger_unlocked()
-}
-
-fn load_fs_ledger_unlocked() -> FsLedger {
-    let Some(path) = fs_ledger_path() else {
-        return FsLedger::default();
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => FsLedger::default(),
-    }
-}
-
-/// 台帳ファイルへの書込を、誤削除防止の2層（read-only属性＋`.bak`バックアップ）を通して行う
-/// 共通ヘルパ。エージェント（コーディングツール）による無関係な一括クリーンアップの巻き込みで
-/// 台帳が消えると、実際に付与済みのACE（`C:\`等の実システム変更）を追跡する手段が失われ、
-/// 「付けたはずだが記録が無い」孤立した穴が残ってしまうため、次の2つを行う。
-/// 1. 上書き前に既存ファイルのread-onlyを解除し、`.bak`へコピーしておく（万一の復元用）。
-/// 2. 書込後にread-only属性を付与する（`-Force`無しの素の`rm`/`Remove-Item`による削除を防ぐ。
-///    確信犯的な`-Force`削除までは防げない、という限界を持つ多層防御の1枚）。
-fn write_ledger_file(path: &Path, contents: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if path.exists() {
-        set_file_readonly(path, false);
-        let backup_path = path.with_extension("json.bak");
-        let _ = std::fs::copy(path, &backup_path);
-    }
-    if std::fs::write(path, contents).is_ok() {
-        set_file_readonly(path, true);
-    }
-}
-
-/// `path`のread-only属性を切り替える（Windowsの`attrib +R`/`-R`相当）。誤削除防止の一環
-/// （`write_ledger_file`参照）。非Windowsでは`set_readonly`の意味論が異なり
-/// （chmodのworld-writable相当になり得る）有効な防御にならないため何もしない
-/// （`readonly`がリテラル`false`でないためclippyの`permissions_set_readonly_false`は
-/// 誤検知しないが、cfg分岐でも意図を明確にする）。
-#[cfg(windows)]
-fn set_file_readonly(path: &Path, readonly: bool) {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mut perms = metadata.permissions();
-        perms.set_readonly(readonly);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-}
-
-#[cfg(not(windows))]
-fn set_file_readonly(_path: &Path, _readonly: bool) {}
-
-fn save_fs_ledger_unlocked(ledger: &FsLedger) {
-    let Some(path) = fs_ledger_path() else {
-        return;
-    };
-    if let Ok(s) = serde_json::to_string_pretty(ledger) {
-        write_ledger_file(&path, &s);
-    }
+    fs_ledger().load()
 }
 
 /// `--fs-allow`/`.harness/settings.json`でTier2a preflightが実際にACE付与を試みたルートを
@@ -1460,13 +1400,9 @@ fn record_fs_passthrough_grant(
     forced: bool,
     settings_workspace: Option<&str>,
 ) {
-    harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, || {
-        let mut ledger = load_fs_ledger_unlocked();
+    fs_ledger().update(|ledger| {
         let path_str = path.to_string_lossy().into_owned();
-        let granted_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let granted_at = harness_grant_ledger::now_unix_secs();
         if let Some(entry) = ledger.entries.iter_mut().find(|e| e.path == path_str) {
             entry.writable = writable;
             entry.granted_at_unix_secs = granted_at;
@@ -1490,18 +1426,13 @@ fn record_fs_passthrough_grant(
             });
         }
         ledger.denied_entries.retain(|e| e.path != path_str);
-        save_fs_ledger_unlocked(&ledger);
     });
 }
 
 fn record_fs_passthrough_denied(path: &Path, access: &str, reason: &str) {
-    harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, || {
-        let mut ledger = load_fs_ledger_unlocked();
+    fs_ledger().update(|ledger| {
         let path_str = path.to_string_lossy().into_owned();
-        let denied_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let denied_at = harness_grant_ledger::now_unix_secs();
         if let Some(entry) = ledger
             .denied_entries
             .iter_mut()
@@ -1519,17 +1450,14 @@ fn record_fs_passthrough_denied(path: &Path, access: &str, reason: &str) {
                 count: 1,
             });
         }
-        save_fs_ledger_unlocked(&ledger);
     });
 }
 
 fn remove_fs_passthrough_grant(path: &Path) {
-    harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, || {
-        let mut ledger = load_fs_ledger_unlocked();
+    fs_ledger().update(|ledger| {
         let path_str = path.to_string_lossy().into_owned();
         ledger.entries.retain(|e| e.path != path_str);
         ledger.denied_entries.retain(|e| e.path != path_str);
-        save_fs_ledger_unlocked(&ledger);
     });
 }
 
@@ -1540,14 +1468,12 @@ fn remove_fs_passthrough_grant(path: &Path) {
 /// `reconcile_fs_ledger_for_workspace`が再度grantを試みて整合を取り戻す）。
 #[cfg(windows)]
 fn remove_fs_passthrough_grant_if_still_orphaned(path: &Path) {
-    harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, || {
-        let mut ledger = load_fs_ledger_unlocked();
+    fs_ledger().update(|ledger| {
         let path_str = path.to_string_lossy().into_owned();
         ledger.entries.retain(|e| {
             e.path != path_str || (e.settings_managed && !e.settings_workspaces.is_empty())
         });
         ledger.denied_entries.retain(|e| e.path != path_str);
-        save_fs_ledger_unlocked(&ledger);
     });
 }
 
@@ -1973,28 +1899,24 @@ fn reconcile_fs_ledger_for_workspace(
     settings_fs_paths: &std::collections::HashSet<String>,
 ) {
     let ws = workspace_root.to_string_lossy().into_owned();
-    let orphan_candidates: Vec<FsLedgerEntry> =
-        harness_sandbox::with_named_lock(FS_LEDGER_LOCK_NAME, || {
-            let mut ledger = load_fs_ledger_unlocked();
-            for entry in ledger.entries.iter_mut() {
-                let declared_now = settings_fs_paths.contains(&entry.path);
-                let was_tagged = entry.settings_workspaces.iter().any(|w| w == &ws);
-                if declared_now && !was_tagged {
-                    entry.settings_workspaces.push(ws.clone());
-                    entry.settings_managed = true;
-                } else if !declared_now && was_tagged {
-                    entry.settings_workspaces.retain(|w| w != &ws);
-                }
+    let orphan_candidates: Vec<FsLedgerEntry> = fs_ledger().update(|ledger| {
+        for entry in ledger.entries.iter_mut() {
+            let declared_now = settings_fs_paths.contains(&entry.path);
+            let was_tagged = entry.settings_workspaces.iter().any(|w| w == &ws);
+            if declared_now && !was_tagged {
+                entry.settings_workspaces.push(ws.clone());
+                entry.settings_managed = true;
+            } else if !declared_now && was_tagged {
+                entry.settings_workspaces.retain(|w| w != &ws);
             }
-            let candidates: Vec<FsLedgerEntry> = ledger
-                .entries
-                .iter()
-                .filter(|entry| entry.settings_managed && entry.settings_workspaces.is_empty())
-                .cloned()
-                .collect();
-            save_fs_ledger_unlocked(&ledger);
-            candidates
-        });
+        }
+        ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.settings_managed && entry.settings_workspaces.is_empty())
+            .cloned()
+            .collect()
+    });
 
     if orphan_candidates.is_empty() {
         return;

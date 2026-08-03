@@ -148,81 +148,50 @@ pub struct WorkspaceLedger {
     pub entries: Vec<WorkspaceLedgerEntry>,
 }
 
-fn workspace_ledger_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "harness")
-        .map(|d| d.config_dir().join("workspace-grant-ledger.json"))
+/// ファイル入出力（誤削除防止の2層・fail-open）は`harness-grant-ledger`の`Ledger<T>`が持つ。
+///
+/// ロック名を渡していない（＝read-modify-writeを直列化しない）のは移設前からの挙動を
+/// そのまま保存しているため。この台帳は一覧表示専用で安全性判定には使わない（安全性は常に
+/// 名前付きmutexで判定する、モジュールdoc参照）が、ロストアップデートで一覧から漏れる
+/// 可能性自体は残る。`docs/STATUS.md`の残課題として扱う。
+fn ledger() -> &'static harness_grant_ledger::Ledger<WorkspaceLedger> {
+    static LEDGER: std::sync::OnceLock<harness_grant_ledger::Ledger<WorkspaceLedger>> =
+        std::sync::OnceLock::new();
+    LEDGER.get_or_init(|| {
+        harness_grant_ledger::Ledger::in_config_dir("workspace-grant-ledger.json", None)
+    })
 }
 
 pub fn load_workspace_ledger() -> WorkspaceLedger {
-    let Some(path) = workspace_ledger_path() else {
-        return WorkspaceLedger::default();
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => WorkspaceLedger::default(),
-    }
+    ledger().load()
 }
 
-/// `traverse_ledger::write_ledger_file`と同じロジックの複製（誤削除防止の2層: read-only属性＋
-/// `.bak`バックアップ）。各台帳が独立して自分の書込ヘルパを持つ既存の方針を踏襲する。
-fn write_ledger_file(path: &Path, contents: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if path.exists() {
-        set_file_readonly(path, false);
-        let backup_path = path.with_extension("json.bak");
-        let _ = std::fs::copy(path, &backup_path);
-    }
-    if std::fs::write(path, contents).is_ok() {
-        set_file_readonly(path, true);
-    }
-}
-
-fn set_file_readonly(path: &Path, readonly: bool) {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mut perms = metadata.permissions();
-        perms.set_readonly(readonly);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-}
-
-pub fn save_workspace_ledger(ledger: &WorkspaceLedger) {
-    let Some(path) = workspace_ledger_path() else {
-        return;
-    };
-    if let Ok(s) = serde_json::to_string_pretty(ledger) {
-        write_ledger_file(&path, &s);
-    }
+pub fn save_workspace_ledger(ledger_value: &WorkspaceLedger) {
+    ledger().save(ledger_value);
 }
 
 /// `preflight`成功時に呼ぶ。台帳は一覧表示専用なので、既存エントリは単純に上書きする
 /// （安全性判定には使わないため、モードの食い違い自体はここでは警告のみに留める）。
 pub fn record_workspace_grant(path: &Path, mode: &str) {
-    let mut ledger = load_workspace_ledger();
     let path_str = path.to_string_lossy().into_owned();
-    let granted_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Some(entry) = ledger.entries.iter_mut().find(|e| e.path == path_str) {
-        entry.mode = mode.to_string();
-        entry.granted_at_unix_secs = granted_at;
-    } else {
-        ledger.entries.push(WorkspaceLedgerEntry {
-            path: path_str,
-            mode: mode.to_string(),
-            granted_at_unix_secs: granted_at,
-        });
-    }
-    save_workspace_ledger(&ledger);
+    let granted_at = harness_grant_ledger::now_unix_secs();
+    ledger().update(|l| {
+        if let Some(entry) = l.entries.iter_mut().find(|e| e.path == path_str) {
+            entry.mode = mode.to_string();
+            entry.granted_at_unix_secs = granted_at;
+        } else {
+            l.entries.push(WorkspaceLedgerEntry {
+                path: path_str,
+                mode: mode.to_string(),
+                granted_at_unix_secs: granted_at,
+            });
+        }
+    });
 }
 
 pub fn remove_workspace_entry(path: &Path) {
-    let mut ledger = load_workspace_ledger();
     let path_str = path.to_string_lossy().into_owned();
-    ledger.entries.retain(|e| e.path != path_str);
-    save_workspace_ledger(&ledger);
+    ledger().update(|l| l.entries.retain(|e| e.path != path_str));
 }
 
 // --- CoW upper_dirのセッションメタデータ・列挙（`harness cow`サブコマンド用） ---
