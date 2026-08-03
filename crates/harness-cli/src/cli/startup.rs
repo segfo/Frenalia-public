@@ -349,30 +349,39 @@ fn stage_open_session(configured: Configured) -> Result<SessionOpened, ExitCode>
     })
 }
 
-pub async fn run() -> ExitCode {
-    let ParsedArgs {
-        cli,
-        workspace_root,
-        resume_id,
-        resume_wants_picker,
-    } = match stage_parse_args() {
-        Ok(p) => p,
-        Err(code) => return code,
-    };
+/// [`stage_prepare_sandbox`]の出力。Stage5（`stage_run_agent`）が必要とする値を運ぶ。
+struct SandboxPrepared {
+    cli: Cli,
+    workspace_root: PathBuf,
+    resume_wants_picker: bool,
+    provider: Box<dyn LlmProvider>,
+    model: String,
+    max_turns: usize,
+    enter_submits: bool,
+    tools: ToolRegistry,
+    arbiter: PermissionArbiter,
+    sessions_dir: PathBuf,
+    session: harness_engine::SessionStore,
+    session_messages: Vec<harness_core::Message>,
+    staging_mode: StagingMode,
+    sandbox_dir: Option<PathBuf>,
+    read_scope: harness_core::ReadScopeConfig,
+    net_proxy: NetProxyConfig,
+    net_app: harness_core::NetAppPolicy,
+    run_shell_path_extra: Vec<String>,
+    fs_passthrough: Vec<harness_sandbox::FsPassthrough>,
+    settings_fs_paths: std::collections::HashSet<String>,
+    #[cfg(windows)]
+    wfp_prelude: Option<harness_sandbox::tier2a::netfilterd::PreparedPipe>,
+    #[cfg(not(windows))]
+    wfp_prelude: Option<String>,
+    write_mode: harness_sandbox::WorkspaceWriteMode,
+    shell_tier: harness_core::ShellTierSelection,
+}
 
-    let configured = match stage_configure(ParsedArgs {
-        cli,
-        workspace_root,
-        resume_id,
-        resume_wants_picker,
-    }) {
-        Ok(c) => c,
-        Err(code) => return code,
-    };
-    let session_opened = match stage_open_session(configured) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
+/// staging mode・`sandbox_dir`・`read_scope`・net proxy/app・`require_sandbox`・
+/// fs passthrough・privhelper昇格・WFP連鎖パイプ・`write_mode`・`select_tier`。
+fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<SandboxPrepared, ExitCode> {
     let SessionOpened {
         cli,
         workspace_root,
@@ -414,7 +423,7 @@ pub async fn run() -> ExitCode {
         .to_net_proxy_config();
     if let Err(e) = validate_and_merge_net_allow_domains(&mut net_proxy, &cli.net_allow_domain) {
         eprintln!("error: invalid network domain policy: {e}");
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
     if net_proxy.audit_log_path.is_none() {
         if let Some(dir) = &sandbox_dir {
@@ -448,7 +457,7 @@ pub async fn run() -> ExitCode {
              mode denies all outbound network unconditionally; refusing to start rather than \
              silently ignoring network allow rules or weakening the confidentiality guarantee)"
         );
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
 
     // fs passthrough allowlist（軸2・D-13）。CLI `--fs-allow`（繰り返し）と
@@ -486,7 +495,7 @@ pub async fn run() -> ExitCode {
              present); forcing writable ACEs into system-protected paths is refused. Drop :rw or \
              drop --force-system-acl."
         );
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
     let fs_passthrough: Vec<harness_sandbox::FsPassthrough> = fs_allow_raw
         .into_iter()
@@ -523,7 +532,7 @@ pub async fn run() -> ExitCode {
                  forbids writes outside the workspace; use read-only --fs-allow entries instead, \
                  or drop --require-sandbox)"
             );
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
         RequireSandbox::Confidential if !fs_passthrough.is_empty() => {
             eprintln!(
@@ -532,14 +541,14 @@ pub async fn run() -> ExitCode {
                  --fs-allow breaks this guarantee; refusing to start rather than silently \
                  weakening it)"
             );
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
         _ => {}
     }
 
     if cli.tier1 && !cfg!(windows) {
         eprintln!("error: --tier1 is only supported on Windows");
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
 
     // WFP 出口強制（Layer2、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）の
@@ -577,13 +586,13 @@ pub async fn run() -> ExitCode {
 
     if cli.cow && !cfg!(windows) {
         eprintln!("error: --cow is only supported on Windows (Tier2a/AppContainer)");
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
     let write_mode = match resolve_write_mode(cli.cow, &session.id()) {
         Ok(mode) => mode,
         Err(e) => {
             eprintln!("error: {e}");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
     let shell_tier = match select_tier(
@@ -598,9 +607,90 @@ pub async fn run() -> ExitCode {
         Ok(selection) => selection,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
+
+    Ok(SandboxPrepared {
+        cli,
+        workspace_root,
+        resume_wants_picker,
+        provider,
+        model,
+        max_turns,
+        enter_submits,
+        tools,
+        arbiter,
+        sessions_dir,
+        session,
+        session_messages,
+        staging_mode,
+        sandbox_dir,
+        read_scope,
+        net_proxy,
+        net_app,
+        run_shell_path_extra,
+        fs_passthrough,
+        settings_fs_paths,
+        wfp_prelude,
+        write_mode,
+        shell_tier,
+    })
+}
+
+pub async fn run() -> ExitCode {
+    let ParsedArgs {
+        cli,
+        workspace_root,
+        resume_id,
+        resume_wants_picker,
+    } = match stage_parse_args() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    let configured = match stage_configure(ParsedArgs {
+        cli,
+        workspace_root,
+        resume_id,
+        resume_wants_picker,
+    }) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let session_opened = match stage_open_session(configured) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let sandbox_prepared = match stage_prepare_sandbox(session_opened) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let SandboxPrepared {
+        cli,
+        workspace_root,
+        resume_wants_picker,
+        provider,
+        model,
+        max_turns,
+        enter_submits,
+        tools,
+        arbiter,
+        sessions_dir,
+        session,
+        session_messages,
+        staging_mode,
+        sandbox_dir,
+        read_scope,
+        mut net_proxy,
+        net_app,
+        run_shell_path_extra,
+        fs_passthrough,
+        settings_fs_paths,
+        wfp_prelude,
+        write_mode,
+        shell_tier,
+    } = sandbox_prepared;
 
     let _session_proxy = if net_proxy.domain_policy_enabled {
         match harness_tools::net_proxy::spawn_local_proxy(&net_proxy).await {
