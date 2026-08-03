@@ -142,11 +142,11 @@ impl RestrictedChild {
     /// （ブロッキング。呼び出し側が`spawn_blocking`で包む）。
     pub fn write_stdin_read_output_and_wait(
         mut self,
-        stdin_payload: Option<&str>,
+        stdin_payload: Option<&[u8]>,
     ) -> Result<(String, String, i32), RestrictedError> {
         if let Some(payload) = stdin_payload {
             if let Some(stdin) = self.stdin_write.take() {
-                write_all(stdin, payload.as_bytes());
+                write_all(stdin, payload);
                 unsafe {
                     let _ = CloseHandle(stdin);
                 }

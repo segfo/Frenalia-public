@@ -95,7 +95,76 @@ pub(crate) fn read_to_string(handle: HANDLE) -> String {
             out.extend_from_slice(&buf[..read as usize]);
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    decode_console_bytes(&out)
+}
+
+/// BUG-051: 子プロセスのコンソール出力を復号する。まず全体をUTF-8として試し、それで
+/// 妥当ならそのまま返す（正常系のほぼ全ケースはここで完了し、追加コストは無い）。
+///
+/// 失敗した場合のみ`\n`で行に分割し、行ごとに「UTF-8として妥当ならUTF-8、そうでなければ
+/// ANSIコードページ（`GetACP()`）」として復号する。この分割はマルチバイト文字を分断しない
+/// ——CP932の妥当な2バイト列（先行`0x81-0x9F`/`0xE0-0xFC`、後続`0x40-0x7E`/`0x80-0xFC`）を
+/// 全探索した結果、`0x0A`を含むものは0件と確認済み。
+///
+/// **なぜ1本のストリーム内で混在し得るか**: PowerShellは起動直後、
+/// `[Console]::OutputEncoding`をUTF-8へ切り替えるブートストラップが実行される**前**に
+/// メッセージ（`InitializeDefaultDrives`失敗等）をstderrへ書くことがあり、これはANSI
+/// コードページのバイト列で届く。以降の出力（ブートストラップ適用後）はUTF-8になるため、
+/// 同一ストリーム内で前半ANSI・後半UTF-8という構成になり得る（実機Tier2aで確認、BUG-051）。
+/// これはBUG-049/BUG-050（コマンド**入力**側のエンコーディング）とは別の**出力**側の欠陥。
+#[cfg(windows)]
+pub fn decode_console_bytes(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(bytes.len());
+    for (i, line) in bytes.split(|&b| b == b'\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match std::str::from_utf8(line) {
+            Ok(s) => out.push_str(s),
+            Err(_) => out.push_str(&decode_ansi_lossy(line)),
+        }
+    }
+    out
+}
+
+/// `bytes`をANSIコードページ（`GetACP()`）としてベストエフォートで復号する。
+/// `decode_console_bytes`の非UTF-8行専用のフォールバック——復号方向にはBUG-050の
+/// ベストフィット問題（符号化方向のみ）は存在しない。`MultiByteToWideChar`自体が失敗した
+/// 場合（未知のコードページ等、通常起き得ない）は`from_utf8_lossy`へ更に退避する。
+#[cfg(windows)]
+fn decode_ansi_lossy(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let cp = unsafe { windows::Win32::Globalization::GetACP() };
+    let needed = unsafe {
+        windows::Win32::Globalization::MultiByteToWideChar(
+            cp,
+            windows::Win32::Globalization::MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0),
+            bytes,
+            None,
+        )
+    };
+    if needed <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut wide = vec![0u16; needed as usize];
+    let written = unsafe {
+        windows::Win32::Globalization::MultiByteToWideChar(
+            cp,
+            windows::Win32::Globalization::MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0),
+            bytes,
+            Some(&mut wide),
+        )
+    };
+    if written <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    wide.truncate(written as usize);
+    String::from_utf16_lossy(&wide)
 }
 
 /// `HANDLE`は`windows`クレートで`Send`を実装しない（生ポインタ相当のため）。
@@ -166,3 +235,5 @@ pub(crate) fn create_job_object() -> windows::core::Result<HANDLE> {
         Ok(job)
     }
 }
+
+

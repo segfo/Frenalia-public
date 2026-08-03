@@ -43,6 +43,13 @@ pub mod traverse_ledger;
 #[cfg(windows)]
 mod win_common;
 
+/// BUG-051: 子プロセスのコンソール出力（起動直後のANSIコードページ由来のメッセージと、
+/// ブートストラップ適用後のUTF-8が同一ストリーム内で混在し得る）を復号するために使う。
+/// `run_shell`（Tier0/1/2a）に限らず、Windowsコマンドの出力をエラーメッセージへ載せる
+/// 全ての箇所（`win_appcontainer`・`smb_share`・`vmsandbox`）が共通で通す唯一の入口。
+#[cfg(windows)]
+pub use win_common::decode_console_bytes;
+
 #[cfg(windows)]
 pub mod win_restricted;
 

@@ -163,10 +163,10 @@ pub(crate) fn run_powershell(script: &str) -> Result<String, VmError> {
         return Err(VmError::PowerShell(format!(
             "exit={:?} stderr={}",
             output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
+            crate::decode_console_bytes(&output.stderr)
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(crate::decode_console_bytes(&output.stdout).trim().to_string())
 }
 
 /// **Phase B実機E2Eで発見したバグ**: `std::process::id()`+ミリ秒タイムスタンプという
@@ -373,8 +373,8 @@ fn ssh_exec(
         .output()
         .map_err(|e| VmError::Io(format!("failed to spawn ssh: {e}")))?;
     Ok((
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
+        crate::decode_console_bytes(&output.stdout),
+        crate::decode_console_bytes(&output.stderr),
         output.status.code().unwrap_or(-1),
     ))
 }
@@ -450,7 +450,7 @@ fn ssh_push_file(
     if !output.status.success() {
         return Err(VmError::Io(format!(
             "ssh_push_file to {remote_path} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::decode_console_bytes(&output.stderr)
         )));
     }
     Ok(())

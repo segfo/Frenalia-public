@@ -820,11 +820,11 @@ impl AppContainerChild {
 
     pub fn write_stdin_read_output_and_wait(
         mut self,
-        stdin_payload: Option<&str>,
+        stdin_payload: Option<&[u8]>,
     ) -> Result<(String, String, i32), AppContainerError> {
         if let Some(payload) = stdin_payload {
             if let Some(stdin) = self.stdin_write.take() {
-                write_all(stdin, payload.as_bytes());
+                write_all(stdin, payload);
                 unsafe {
                     let _ = CloseHandle(stdin);
                 }

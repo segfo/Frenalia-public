@@ -591,6 +591,13 @@ async fn run_tier0(
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let invocation = platform_shell_command(command);
     let mut cmd = invocation.cmd;
+    let env_owned: Vec<(String, String)>;
+    let env = if let Some((k, v)) = &invocation.extra_env {
+        env_owned = env.iter().cloned().chain(std::iter::once((k.to_string(), v.clone()))).collect();
+        env_owned.as_slice()
+    } else {
+        env
+    };
     apply_common_command_settings(&mut cmd, cwd, env, invocation.stdin_payload.is_some());
 
     #[cfg(unix)]
@@ -667,7 +674,10 @@ async fn run_windows_tier2a(
     let (bin, shell_label) = harness_sandbox::win_appcontainer::resolve_shell();
     let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
     let cwd_owned = cwd.to_path_buf();
-    let env_owned = env.to_vec();
+    let mut env_owned = env.to_vec();
+    // BUG-050: コマンド本体はstdinスクリプトへ文字列として埋め込まず、env経由で渡す
+    // （`RUN_SHELL_BOOTSTRAP_SCRIPT`のdoc参照）。
+    env_owned.push((RUN_SHELL_COMMAND_ENV_VAR.to_string(), command.to_string()));
     // Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴を
     // Redirector DLLのext capture対象として渡す（境界＝ACLはfs-allowが既に張っている、
     // ここは変更の可視化のためのcapture）。
@@ -706,10 +716,10 @@ async fn run_windows_tier2a(
     )
     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child.kill_token();
-    let command_owned = with_utf8_output_encoding_preamble(command);
+    let stdin_bytes = run_shell_bootstrap_stdin();
 
     let handle = tokio::task::spawn_blocking(move || {
-        child.write_stdin_read_output_and_wait(Some(&command_owned))
+        child.write_stdin_read_output_and_wait(Some(&stdin_bytes))
     });
 
     match timeout(dur, handle).await {
@@ -744,15 +754,18 @@ async fn run_windows_tier1(
     };
     let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
     let cwd_owned = cwd.to_path_buf();
-    let env_owned = env.to_vec();
+    let mut env_owned = env.to_vec();
+    // BUG-050: コマンド本体はstdinスクリプトへ文字列として埋め込まず、env経由で渡す
+    // （`RUN_SHELL_BOOTSTRAP_SCRIPT`のdoc参照）。
+    env_owned.push((RUN_SHELL_COMMAND_ENV_VAR.to_string(), command.to_string()));
 
     let child = harness_sandbox::win_restricted::spawn(bin, &args, &cwd_owned, &env_owned, true)
         .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child.kill_token();
-    let command_owned = with_utf8_output_encoding_preamble(command);
+    let stdin_bytes = run_shell_bootstrap_stdin();
 
     let handle = tokio::task::spawn_blocking(move || {
-        child.write_stdin_read_output_and_wait(Some(&command_owned))
+        child.write_stdin_read_output_and_wait(Some(&stdin_bytes))
     });
 
     match timeout(dur, handle).await {
@@ -818,13 +831,13 @@ fn apply_unix_rlimits(cmd: &mut Command) {
 /// stdin書込+stdout/stderr並行読み+timeoutの共通ロジック（`tokio::process::Child`向け）。
 async fn run_with_pipes(
     child: &mut tokio::process::Child,
-    stdin_payload: Option<String>,
+    stdin_payload: Option<Vec<u8>>,
     dur: Duration,
 ) -> Result<(String, String, Option<i32>), ToolError> {
     if let Some(payload) = stdin_payload {
         let mut stdin = child.stdin.take().expect("stdin is piped");
         stdin
-            .write_all(payload.as_bytes())
+            .write_all(&payload)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
         drop(stdin);
@@ -838,17 +851,17 @@ async fn run_with_pipes(
         // バイト列に遭遇すると`Err`を返し、`let _ =`で握り潰していたため出力が無言で空文字列
         // （exit code 0・出力なし）になっていた。CP932（Shift-JIS）等、UTF-8でない既定コード
         // ページのコンソール出力（日本語ファイル名を含む`dir`等）で確実に踏む。生バイトを
-        // 読み切ってから`from_utf8_lossy`する（Tier2a/1bの`win_common::read_to_string`と同じ
-        // 方針）。
+        // 読み切ってから復号する（BUG-051、`decode_console_output`のdoc参照。Tier1/Tier2aの
+        // `win_common::decode_console_bytes`と同じ方針を共有する）。
         let stdout_fut = async {
             let mut buf = Vec::new();
             let _ = stdout.read_to_end(&mut buf).await;
-            String::from_utf8_lossy(&buf).into_owned()
+            decode_console_output(&buf)
         };
         let stderr_fut = async {
             let mut buf = Vec::new();
             let _ = stderr.read_to_end(&mut buf).await;
-            String::from_utf8_lossy(&buf).into_owned()
+            decode_console_output(&buf)
         };
         let (out, err) = tokio::join!(stdout_fut, stderr_fut);
         let status = child
@@ -868,12 +881,15 @@ async fn run_with_pipes(
     }
 }
 
-/// 起動する子プロセスコマンドと、記録用のシェルラベル・stdin経由で渡すコマンド文字列
-/// （argvへの文字列補間を避けるためのペイロード、Windowsのみ使用）をまとめたもの。
+/// 起動する子プロセスコマンドと、記録用のシェルラベル・stdin経由で渡すブートストラップ・
+/// 追加env（Windowsのみ使用）をまとめたもの。
 struct ShellInvocation {
     cmd: Command,
-    stdin_payload: Option<String>,
+    stdin_payload: Option<Vec<u8>>,
     shell_label: &'static str,
+    /// BUG-050: コマンド本体を運ぶ追加env（Windowsのみ）。呼び出し元が`env`へ追加してから
+    /// spawnする（`git_hardening_env()`と同じ、既存の`env`可変配列に足すだけのパターン）。
+    extra_env: Option<(&'static str, String)>,
 }
 
 /// Unixは`sh -c <command>`（argvの1要素として渡るためWindowsの`-Command`文字列補間問題は無い）。
@@ -885,11 +901,14 @@ fn platform_shell_command(command: &str) -> ShellInvocation {
         cmd,
         stdin_payload: None,
         shell_label: "sh",
+        extra_env: None,
     }
 }
 
-/// Windowsはpwsh7優先→Windows PowerShell 5.1フォールバック。コマンド文字列はargvへ
-/// 埋め込まず`-Command -`でstdinから渡す（§ツールシステム run_shell「シェル選択」）。
+/// Windowsはpwsh7優先→Windows PowerShell 5.1フォールバック。コマンド文字列はargvへも
+/// stdinスクリプトへも埋め込まず、**env経由**で渡す（BUG-050、§ツールシステム run_shell
+/// 「シェル選択」）。stdinへ書くのは`RUN_SHELL_BOOTSTRAP_SCRIPT`という固定の純ASCII文字列
+/// だけで、コマンドの中身に一切依存しない。
 #[cfg(windows)]
 fn platform_shell_command(command: &str) -> ShellInvocation {
     let (bin, shell_label) = if which::which("pwsh").is_ok() {
@@ -901,38 +920,76 @@ fn platform_shell_command(command: &str) -> ShellInvocation {
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", "-"]);
     ShellInvocation {
         cmd,
-        stdin_payload: Some(with_utf8_output_encoding_preamble(command)),
+        stdin_payload: Some(run_shell_bootstrap_stdin()),
         shell_label,
+        extra_env: Some((RUN_SHELL_COMMAND_ENV_VAR, command.to_string())),
     }
 }
 
-/// Windows PowerShell（pwsh/5.1いずれも）は既定の出力エンコーディングがシステムのANSI
-/// コードページ（日本語Windowsなら通常CP932/Shift-JIS）であり、われわれの実装は
-/// 子プロセス出力を常に`from_utf8_lossy`で読む（`win_common::read_to_string`・Tier0の
-/// `run_with_pipes`）。この不一致により、日本語等の非ASCII出力を含むコマンド（例:
-/// 日本語ファイル名の`dir`）が文字化けする（Phase5-G、`run_shell`不安定性調査）。
+/// BUG-050: コマンド本体を運ぶenv変数名。`CreateProcessW`の環境ブロック（UTF-16、
+/// `win_common::build_env_block`）を経由するため、CP932等のANSIコードページでは表現できない
+/// 文字（絵文字・ハングル・非BMP等）も無損失で子へ渡る。読み取り後は
+/// `RUN_SHELL_BOOTSTRAP_SCRIPT`内で`Remove-Item Env:`により孫プロセスへの継承を絶つ。
+#[cfg(windows)]
+const RUN_SHELL_COMMAND_ENV_VAR: &str = "HARNESS_RUN_SHELL_COMMAND";
+
+/// BUG-049/BUG-050: `-Command -`（stdin経由）で流すブートストラップ。**内容はコマンドに
+/// 依存しない固定の純ASCII文字列**であり、これがstdinの符号化問題（BUG-049修正が
+/// `WideCharToMultiByte`のベストフィット変換で持ち込んだ検査回避＝BUG-050の根本原因）を
+/// 完全に消し去る——stdinへ非ASCIIバイトが一切乗らないため、コードページ変換自体が
+/// 不要になる。
+///
+/// コマンド本体は`RUN_SHELL_COMMAND_ENV_VAR`からenv経由で読み、`[scriptblock]::Create`で
+/// 実行する。**判定用の元コマンドは一切変更しない**: `classify_net_app`等の危険構文検査は
+/// 呼び出し元で元の`command`文字列に対して行い（`shell.rs`の`classify_net_app`・
+/// `harness-engine::permission::looks_like_allowlist_bypass`）、このブートストラップは
+/// 検査結果とは独立に常に同じ内容で送られる。
+///
+/// 実測（Windows PowerShell 5.1・pwsh 7.6.4、`CREATE_NO_WINDOW`下）:
+/// 絵文字・非BMP文字（`𠮷`）・複合文字（`が`）を含むコマンド、日本語ファイル名の作成・削除、
+/// いずれもバイト完全一致で往復する。ベストフィット変換の検体（`¦`→`|`）も`¦`のまま保たれる。
 ///
 /// また、`-Command -`（stdin経由）実行の終了コードはPowerShellプロセス自身の終了コードで
 /// あり、スクリプトが明示的に`exit`しない限り**最後の文（statement）の成否からブール化
 /// （0/1）されるだけ**で、ネイティブコマンドの実際の終了コード（例: `7`）は失われる
-/// （Phase5-H実測: `cmd /c exit 7`だけを実行すると`0`でも`7`でもなく`1`が返る）。
-/// スクリプト末尾へ`$LASTEXITCODE`/`$?`を明示的に`exit`する1行を追加し、最後の文の
-/// 終了コードを正確に伝播させる（bashの`sh -c`と同じ「最後のコマンドの終了状態」意味論。
-/// 途中の文の失敗を検知したい場合は、bashの`set -e`と同様モデル側が`$ErrorActionPreference
-/// = 'Stop'`等を明示する前提で、harness側では強制しない）。
+/// （Phase5-H実測）。末尾の`$LASTEXITCODE`/`$?`判定で、bashの`sh -c`と同じ「最後のコマンドの
+/// 終了状態」意味論に揃える。
 ///
-/// stdin経由で渡すコマンド文字列の先頭に出力エンコーディング固定を、末尾に終了コード伝播を
-/// 付与する。Tier0（本関数）・Tier2a（`run_windows_tier2a`）・Tier1（`run_windows_tier1`）の
-/// 3経路全てがこの関数を通す（Tier横断で1箇所に集約し、個別に実装して食い違うことを防ぐ）。
-/// **判定用の`command`自体は変更しない**: `classify_net_app`等のallowlist判定は呼び出し元で
-/// 元の`command`に対して行い、この関数が返す文字列は実行直前のstdinペイロードとしてのみ使う。
+/// Tier0（本関数の呼び出し元`platform_shell_command`）・Tier2a（`run_windows_tier2a`）・
+/// Tier1（`run_windows_tier1`）の3経路全てがこの1関数を通す（Tier横断で1箇所に集約し、
+/// 個別に実装して食い違うことを防ぐ）。
 #[cfg(windows)]
-fn with_utf8_output_encoding_preamble(command: &str) -> String {
-    format!(
-        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
-         $OutputEncoding = [System.Text.Encoding]::UTF8; {command}\n\
-         if ($LASTEXITCODE) {{ exit $LASTEXITCODE }} elseif (-not $?) {{ exit 1 }}"
-    )
+const RUN_SHELL_BOOTSTRAP_SCRIPT: &str = "\
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+$OutputEncoding = [System.Text.Encoding]::UTF8; \
+$__harness_cmd = $env:HARNESS_RUN_SHELL_COMMAND; \
+Remove-Item Env:HARNESS_RUN_SHELL_COMMAND -ErrorAction SilentlyContinue; \
+. ([scriptblock]::Create($__harness_cmd)); \
+if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif (-not $?) { exit 1 }
+";
+
+#[cfg(windows)]
+fn run_shell_bootstrap_stdin() -> Vec<u8> {
+    debug_assert!(
+        RUN_SHELL_BOOTSTRAP_SCRIPT.is_ascii(),
+        "BUG-050: bootstrap must stay pure ASCII so no code-page conversion is ever needed"
+    );
+    RUN_SHELL_BOOTSTRAP_SCRIPT.as_bytes().to_vec()
+}
+
+/// BUG-051: Tier0（本関数）・Tier1・Tier2aが共通で使う出力デコーダ。Windowsでは
+/// `harness_sandbox::decode_console_bytes`（起動直後のANSIコードページ由来のメッセージと
+/// ブートストラップ適用後のUTF-8が同一ストリーム内で混在し得ることへの対処、`win_common`の
+/// doc参照）を通す。Unix（`sh -c`）にはこの種の混在は無いため`from_utf8_lossy`のまま。
+fn decode_console_output(bytes: &[u8]) -> String {
+    #[cfg(windows)]
+    {
+        harness_sandbox::decode_console_bytes(bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 #[cfg(test)]
