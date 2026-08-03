@@ -1,20 +1,20 @@
 # Frenalia
 
-Freneliaは、Rustで開発する汎用AIエージェント・ハーネスです。
+Frenaliaは、Rustで開発する汎用AIエージェント・ハーネスです。
 
 Claude Codeのようなエージェント実行体験を提供しつつ、ツール実行・サブプロセスを明示的な権限境界（サンドボックス）の内側へ閉じ込めることを目指しています。
 
 モデルプロバイダ、ツール、実行ポリシー、サンドボックス、フロントエンドを分離し、それぞれを独立して拡張できる構成を採用します。
 
 > [!IMPORTANT]
-> Freneliaは現在、設計および初期実装段階です。  
-> このREADMEにはプロジェクトの構想と目標アーキテクチャを含みます。記載しているすべての機能が実装済みとは限りません。
+> Frenaliaは、基盤フェーズ（会話ループ・プロバイダ・ツール・権限ゲート・多層サンドボックス・TUI/ヘッドレス実行、後述のM00–M12）を実装済みです。
+> 現在は認知レイヤー（Working Memory・仮説駆動調査ループ・モデル階層化ルータ等、後述のM13–M20）を実装中で、このREADMEではその部分のみ今後の計画として記載しています。
 
 ---
 
 ## プロジェクトの目的
 
-Freneliaは、次の機能を備えた汎用エージェント基盤を目指します。
+Frenaliaは、次の機能を備えた汎用エージェント基盤を目指します。
 
 - プロバイダに依存しないエージェントランタイム
 - Claude Codeに類似したツール呼び出し型ワークフロー
@@ -27,7 +27,7 @@ Freneliaは、次の機能を備えた汎用エージェント基盤を目指し
 
 基本原則は次の通りです。
 
-> モデルは操作を提案できますが、実際に何を許可するかはFreneliaが決定します。
+> モデルは操作を提案できますが、実際に何を許可するかはFrenaliaが決定します。
 
 ---
 
@@ -35,17 +35,18 @@ Freneliaは、次の機能を備えた汎用エージェント基盤を目指し
 
 ### マルチプロバイダLLM
 
-Freneliaは、エージェントエンジンが特定のAPI形式へ依存しないよう、正規化されたプロバイダ抽象を採用します。
+Frenaliaは、エージェントエンジンが特定のAPI形式へ依存しないよう、正規化されたプロバイダ抽象を採用します。
 
-対応予定のプロバイダは次のとおりです。
+対応済みのプロバイダは次のとおりです。
 
 - OpenAI Chat Completions API
-- OpenAI Responses API
-- OpenAI互換エンドポイント
-- LM Studio
+- OpenAI互換エンドポイント / LM Studio（`OpenAiProvider`が`base_url`を切り替えるだけの同一コードパス）
 - Anthropic Messages API
 - 決定論的なテストに使用するMockプロバイダ
 
+次は未実装です（後続マイルストーンへ先送り）。
+
+- OpenAI Responses API
 
 ### エージェント・ツールループ
 
@@ -59,7 +60,7 @@ Freneliaは、エージェントエンジンが特定のAPI形式へ依存しな
 6. ツール結果を共通形式でモデルへ返す
 7. ターンが完了するまで処理を継続する
 
-組み込みツールとして、次の機能を予定しています。
+組み込みツールとして、次を実装済みです。
 
 - `read_file`
 - `write_file`
@@ -73,7 +74,7 @@ Freneliaは、エージェントエンジンが特定のAPI形式へ依存しな
 
 すべてのツール呼び出しは、実行前に中央集約されたパーミッション判定を通過します。
 
-想定しているパーミッションモードは次のとおりです。
+実装済みのパーミッションモードは次のとおりです。
 
 - **Plan**  
   読み取り専用です。書き込み、コマンド実行、ネットワーク操作を拒否します。
@@ -101,16 +102,16 @@ web_fetch:*.rust-lang.org
 
 パーミッション層は、TUIとヘッドレスモードの両方で共通です。
 
-フロントエンドごとに異なる実行経路を持たせず、中央の強制点を迂回できない構造を目指します。
+フロントエンドごとに異なる実行経路を持たせず、中央の強制点を迂回できない構造になっています。
 
 ### 多層サンドボックス
 
-Freneliaでは、サンドボックスを単一機能ではなく、複数の保証を組み合わせた防御層として扱います。
+Frenaliaでは、サンドボックスを単一機能ではなく、複数の保証を組み合わせた防御層として扱います。
 
-目標設計には、次の要素を含みます。
+実装済みの要素には、次を含みます。
 
 - Capabilityベースのワークスペースアクセス
-- パス、シンボリックリンク、reparse pointの検査
+- パス・シンボリックリンクの検査（walk時の`is_symlink()`スキップ、脱走防止。reparse point種別ごとの明示的な区別は未実装）
 - 読み取り・書き込みスコープ
 - 秘密情報を含む環境変数の除去
 - ステージングされたファイル変更
@@ -122,48 +123,48 @@ Freneliaでは、サンドボックスを単一機能ではなく、複数の保
 
 シェル実行は、ホスト環境で利用できる保証に応じてTierへ分類します。
 
-| Tier | 想定する隔離方式 |
-|---|---|
-| **Tier 3** | Hyper-V VMとIncusコンテナによる隔離（要オプトイン） |
-| **Tier 2a** | Windows AppContainer、明示ACL、Capabilityによるネットワーク制御（Windows既定） |
-| **Tier 2b** | Linux namespace、Bubblewrap、OverlayFS、Landlock、ネットワーク制限（Linux既定） |
-| **Tier 1** | Restricted Token、Low Integrity、Job Object（Tier2aからのフォールバック先） |
-| **Tier 0** | ツール側制限のみを用いるベストエフォート実行（Tier2b/Tier1からのフォールバック先） |
+| Tier | 隔離方式 | 状態 | 選択方法 |
+|---|---|---|---|
+| **Tier 3** | Hyper-V VMとIncusコンテナによる隔離 | 完了（実機E2E確認済み） | `--vm-sandbox` |
+| **Tier 2a** | Windows AppContainer、明示ACL、Capabilityによるネットワーク制御 | 完了 | Windows既定（フラグ不要） |
+| **Tier 2b** | Linux namespace、Bubblewrap、OverlayFS、Landlock、ネットワーク制限 | 完了（この開発機では実機Linux未検証） | Linux既定 |
+| **Tier 1** | Restricted Token、Low Integrity、Job Object | 完了 | Windowsで`--tier1`明示時 |
+| **Tier 1'（VHDX）** | VHDXベースの追加隔離 | 意図的に未実装（対応しないと決定済み） | — |
+| **Tier 0** | ツール側制限のみを用いるベストエフォート実行 | 完了（保険） | Tier2a/1が明示的に使えない場合 |
 
-要求した隔離レベルを利用できない場合は、明示的に降格を通知します。
+Windowsでは、Tier2a上でさらにCopy-on-Write（`--cow`）モードを選択できます。子プロセスの書き込みをRedirector DLLで上位レイヤーへ透過的にリダイレクトし、ワークスペース本体は読み取り専用ACLで保護したまま、レビュー可能な差分として扱います（孫プロセス・32bit(WOW64)プロセスへの伝播、削除/リネームの検知まで実装済み）。
 
-厳格なサンドボックスが必要な実行では、弱いTierへ降格せず処理を拒否できる設計とします。
+Windows既定パスでは、Tier2aが利用できない場合は弱いTierへ暗黙に降格せず、起動エラーとして拒否します。Tier1で実行するには`--tier1`を明示する必要があります。厳格なサンドボックスが必要な実行では、要求したTierが使えないことを明示し、弱いTierへ降格しない設計です。
 
 ### ファイルのステージングとレビュー
 
-ファイルサンドボックスでは、複数の書き込みモードを想定しています。
+ファイルサンドボックスは、次の3つの書き込みモードを実装しています。
 
 - **Live**  
-  ワークスペースへ直接書き込みます。
+  ワークスペースへ直接書き込みます（既定）。
 
-- **Workspace Commit**  
-  ワークスペース内の変更をステージングし、後からまとめてレビューして適用します。
-
-- **Staged**  
+- **Staged**（`--staged`）  
   明示的に適用するまで、すべての変更を実ファイルシステムの外側へ保持します。
 
-- **Copy-on-Write**  
-  対応する子プロセスの書き込みを上位レイヤーへリダイレクトし、レビュー可能な変更として扱います。
+- **Workspace Commit**（`--workspace-commit`）  
+  ワークスペース内の変更はステージングし、ワークスペース外への操作はサンドボックスで隔離した上で、後からまとめてレビューして適用します。
 
-ステージングされた操作はマニフェストへ記録し、ユーザーが変更単位で確認、許可、拒否、適用できるようにします。
+Windows Tier2aの`--cow`は、独立した4つ目のモードではなく、`Staged`と同じ統合バックエンド（`SandboxFs`）を使い、Redirector DLLによるOS強制の透過リダイレクトを追加したものです。
+
+ステージングされた操作はマニフェスト（変更台帳）へ記録し、ユーザーが変更単位で確認、許可、拒否、適用できます。
 
 ### リッチTUI
 
-非同期イベントストリームを利用したTUIを実装予定です。
+非同期イベントストリームを利用したTUIを実装済みです。
 
 TUIでは、次の情報を表示します。
 
 - アシスタント応答のストリーミング表示
-- プロバイダが対応する場合のThinking・Reasoningブロック
-- ツール呼び出しカード
+- プロバイダが対応する場合のThinking・Reasoningブロック（Ctrl+Oで開閉）
+- ツール呼び出しカード（実行中/完了・出力・終了コード）
 - パーミッション承認ダイアログ
 - コマンド出力と終了コード
-- ステージングされたファイル変更
+- ステージングされたファイル変更（変更パネル）
 - トークン使用量とプロバイダ状態
 - サンドボックスTierと実行ポリシー
 
@@ -171,13 +172,13 @@ TUIとヘッドレスモードは、同じエンジンと同じセキュリテ�
 
 ### ヘッドレス・CI実行
 
-Freneliaは、非対話環境での利用も想定しています。
+Frenaliaは、非対話環境での利用も想定しています。
 
 ```bash
-Frenelia -p "テストスイートを実行して失敗原因を要約してください"
+harness -p "テストスイートを実行して失敗原因を要約してください"
 ```
 
-出力形式として、次を予定しています。
+出力形式として、次を実装済みです。
 
 ```text
 text
@@ -193,48 +194,60 @@ jsonl
 
 ## アーキテクチャ
 
-Freneliaは、責務を明確に分離したCargo workspaceとして構成します。
+Frenaliaは、責務を明確に分離したCargo workspaceとして構成します。
 
 ```text
-Frenelia-core
+harness-core
 ├── 会話IRと共通イベント型
 ├── Provider・Tool trait
 └── 共通エラー型とUsage情報
 
-Frenelia-config
-├── 階層設定
-├── プロバイダプロファイル
-└── パーミッションルール
+harness-config
+├── 階層設定（既定→ユーザ→プロジェクト）
+├── パーミッションルール
+└── サンドボックス・ネットワーク設定
 
-Frenelia-providers
-├── OpenAI
-├── OpenAI互換 / LM Studio
+harness-providers
+├── OpenAI / OpenAI互換 / LM Studio
 ├── Anthropic
 └── Mockプロバイダ
 
-Frenelia-tools
+harness-tools
 ├── 組み込みツール
 ├── ToolRegistry
 └── JSON Schema生成
 
-Frenelia-sandbox
-├── ワークスペースjail
-├── ステージングとオーバーレイ
-├── シェル隔離Tier
+harness-sandbox
+├── ワークスペースjail・オーバーレイ（SandboxFs）
+├── シェル隔離Tier（Tier0〜Tier3）
 └── 読み取り・書き込み・プロセス・ネットワークポリシー
 
-Frenelia-engine
+harness-change-ledger
+└── CoW/staged変更の共有台帳実装
+
+harness-redirector
+└── Windows Tier2a CoW用Redirector DLL（NT API フック）
+
+harness-privhelper
+└── Windows特権分離ヘルパー（UAC昇格1回への集約）
+
+harness-netfilterd / harness-vmsandboxd
+└── Windowsネットワーク制御daemon / Tier3 VM常駐daemon
+
+harness-engine
 ├── ConversationState
 ├── エージェントループ
 ├── Permission Arbiter
 └── ツールディスパッチ
 
-Frenelia-tui
+harness-tui
 └── 対話型ターミナルフロントエンド
 
-Frenelia-cli
+harness-cli
 └── CLI・ヘッドレス実行エントリポイント
 ```
+
+上記に加えて、Tier2a関連の実機E2Eテスト・フォールト注入モック・特権昇格ヘルパーのテスト補助を担う小規模クレート（`tier2a-net-e2e`、`tier2a-proc-probe`、`tier2a-mock-netfilterd`、`dev-elevated-runner`）があります。
 
 拡張可能な境界は、主に次の2つです。
 
@@ -249,7 +262,7 @@ Frenelia-cli
 
 ## セキュリティ方針
 
-Freneliaは、生成されたコマンドや外部から取得されたコードを**信頼できないものである**としています。
+Frenaliaは、生成されたコマンドや外部から取得されたコードを**信頼できないものである**としています。
 
 そのため、次の原則に基づいて設計します。
 
@@ -273,11 +286,11 @@ Freneliaは、生成されたコマンドや外部から取得されたコード
 
 ハーネス組み込みのツールによるネットワークやファイルシステムへの読み書き経路だけでなく、子プロセスによる外部との直接通信や迂回経路、ファイルの読み書きもアクセス制御の対象になります。
 
-### 6. 降格の可視化
+### 5. 降格の可視化
 
 弱い隔離へ切り替わった場合、それを同等のセキュリティとして扱わず、ユーザーへ明示します。（強制停止します）
 
-### 7. 監査可能性
+### 6. 監査可能性
 
 すべての許可・拒否判断について、どのルールによって決定されたかを記録できるようにします。
 
@@ -293,21 +306,23 @@ Freneliaは、生成されたコマンドや外部から取得されたコード
 
 Windowsは補助的な対応ではなく、主要プラットフォームとして設計します。
 
-具体的には、次のWindows固有要素を考慮します。
+具体的には、次のWindows固有要素を実装済みです。
 
-- PowerShell 7
-- Windows PowerShell 5.1
+- PowerShell 7（フォールバックとしてWindows PowerShell 5.1）
 - AppContainer
 - Restricted Token
 - Integrity Level
 - Job Object
 - Windows Filtering Platform
 - Hyper-V
-- ADS
 - UNCパス
-- 予約デバイス名
-- Reparse Point
-- Windows固有のパス正規化
+- 予約デバイス名（CON/PRN/AUX/NUL等）
+- Windows固有のパス正規化（`\\?\`長パスプレフィックス等）
+
+次の2つは未対応です。
+
+- ADS（代替データストリーム、Zone.Identifier等）の明示的な検査
+- Reparse Pointの明示的なハンドリング（`FSCTL_GET_REPARSE_POINT`等）
 
 利用可能なサンドボックスTierは、OSとホスト環境によって異なります。
 
@@ -315,62 +330,64 @@ Windowsは補助的な対応ではなく、主要プラットフォームとし�
 
 ## 設定例
 
-設定形式は現在検討中ですが、ユーザー設定、プロジェクト設定、CLI引数を階層的にマージする構成を想定しています。
+設定は、既定→ユーザー設定（`directories`が解決する設定ディレクトリ配下の`settings.json`、Windowsは`%APPDATA%`）→プロジェクト設定（`<project_root>/.harness/settings.json`）の順にディープマージされます。CLIフラグはこれよりさらに優先されます。実際のスキーマはフラットな構造で、次のような形をとります。
 
 ```json
 {
-  "provider": {
-    "default": "local"
+  "provider": "local",
+  "model": "local-model",
+  "permission_mode": "accept-edits",
+  "allow": [
+    "run_shell:git status",
+    "run_shell:cargo test",
+    "write_file:src/**"
+  ],
+  "run_shell": {
+    "path_extra": []
   },
-  "providers": {
-    "local": {
-      "kind": "openai-compatible",
-      "base_url": "http://127.0.0.1:1234/v1",
-      "model": "local-model"
-    }
+  "net": {
+    "allow_domains": [],
+    "allow_apps": []
   },
-  "permissions": {
-    "mode": "default",
-    "allow": [
-      "run_shell:git status",
-      "run_shell:cargo test",
-      "write_file:src/**"
-    ]
+  "fs": {
+    "read": [],
+    "read_write": [],
+    "read_exec": []
   },
-  "sandbox": {
-    "require": true,
-    "network": "deny-by-default"
+  "read": {
+    "mode": "whitelist",
+    "allow": []
   }
 }
 ```
 
-この例は設計意図を示すためのものであり、初回安定版までに変更される可能性があります。
+`provider`はプロファイルオブジェクトではなく単一の文字列で、接続先（`base_url`等）の切り替えはCLIフラグ・環境変数側で行います。APIキーなどのシークレットは設定ファイルでは一切扱わず、環境変数から読み込みます。
 
 ---
 
 ## 現在の状況
 
-Freneliaは、設計および初期実装段階です。
+Frenaliaは、基盤フェーズ（M00–M12、`plans/DESIGN.md`）を完了しています。
 
-現在は主に次の領域を検討・実装しています。
-
-- プロバイダ非依存の会話IR
-- ストリーミングイベントの正規化
-- ToolとPermissionの境界
-- Windows向けサンドボックスアーキテクチャ
+- プロバイダ非依存の会話IRとストリーミングイベント正規化
+- ToolとPermissionの境界（中央集約Arbiter）
+- Windows/Linux向けサンドボックスアーキテクチャ（Tier0〜Tier3、Windows Tier2a CoWモード含む）
 - ファイルステージングとワークスペース隔離
 - TUIとヘッドレスフロントエンド
-- 脅威モデルに基づく実行Tier
-- ネットワーク出口制御
-- 監査ログ
+- 脅威モデルに基づく実行Tierと自動降格の可視化
+- ネットワーク出口制御と監査ログ
+
+現在は認知レイヤー（M13–M20、`plans/DESIGN-COGNITION.md`）を実装中です。Executor抽出、WorkingMemory/ContextAssembler、仮説駆動調査ループ（HIV状態機械）、モデル階層化ルータ、Effortスイッチ、Planner+Critic、収束保証とresumeなどが対象で、いずれも未着手です。
+
+詳細な進捗は`docs/INDEX.md`（フェーズ軸）、機構ごとの残課題は`docs/STATUS.md`を参照してください。
 
 ---
 
 ## コントリビューション
 
-Freneliaは現在、設計と実装の基盤を固めている段階です。
+Frenaliaは現在、基盤フェーズを完了し認知レイヤーの実装を進めている段階です。
 
-リポジトリ構成が安定した後、次のようなコントリビューションを歓迎する予定です。
+次のようなコントリビューションを歓迎する予定です。
 
 - 設計レビュー
 - 脅威モデルの検討
