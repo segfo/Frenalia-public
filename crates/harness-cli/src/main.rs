@@ -3002,13 +3002,15 @@ async fn main() -> ExitCode {
                 Some(prepared) => {
                     match harness_sandbox::netfilterd::NetfilterHandle::connect_after_chain_launch(
                         prepared.into_handle(),
-                        Vec::new(),
-                        false,
-                        Vec::new(),
-                        net_loopback_ports.tcp.clone(),
-                        net_loopback_ports.udp.clone(),
-                        false,
-                        net_proxy.audit_log_path.clone(),
+                        harness_sandbox::netfilterd::NetfilterPolicy {
+                            allow_domains: Vec::new(),
+                            allow_loopback: false,
+                            allow_loopback_ports: Vec::new(),
+                            allow_loopback_tcp_ports: net_loopback_ports.tcp.clone(),
+                            allow_loopback_udp_ports: net_loopback_ports.udp.clone(),
+                            allow_direct_dns: false,
+                            audit_log_path: net_proxy.audit_log_path.clone(),
+                        },
                     ) {
                         Ok(handle) => Some(handle),
                         Err(e) => {
@@ -3029,13 +3031,15 @@ async fn main() -> ExitCode {
             // dropして自動的に閉じる。
             drop(wfp_prelude);
             match harness_sandbox::netfilterd::NetfilterHandle::start(
-                Vec::new(),
-                false,
-                Vec::new(),
-                net_loopback_ports.tcp.clone(),
-                net_loopback_ports.udp.clone(),
-                false,
-                net_proxy.audit_log_path.clone(),
+                harness_sandbox::netfilterd::NetfilterPolicy {
+                    allow_domains: Vec::new(),
+                    allow_loopback: false,
+                    allow_loopback_ports: Vec::new(),
+                    allow_loopback_tcp_ports: net_loopback_ports.tcp.clone(),
+                    allow_loopback_udp_ports: net_loopback_ports.udp.clone(),
+                    allow_direct_dns: false,
+                    audit_log_path: net_proxy.audit_log_path.clone(),
+                },
             ) {
                 Ok(handle) => Some(handle),
                 Err(e) => {

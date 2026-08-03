@@ -67,22 +67,36 @@ use crate::wfp::{WfpOptions, WfpSession};
 use crate::win_appcontainer::{self, CONTAINER_NAME};
 use crate::win_common::wide;
 
+/// daemonへ投入させるネットワークポリシー一式（`ApplyRules`のペイロード）。
+///
+/// この7項目は`NetfilterHandle::start`→`connect_and_apply`、および
+/// `NetfilterHandle::connect_after_chain_launch`→`connect_and_apply`という経路を、
+/// 常に「まとめて1つ」として貫通する。個別の引数に展開すると各段で引数が7個を超え、
+/// 順序の取り違えを型で防げなくなるため、1つの値として運ぶ。
+///
+/// **serde表現は`ApplyRules`のstruct variantだった頃とバイト等価**（外部タグ付き列挙型の
+/// newtype variantは、内側の構造体をそのままタグの値として書くため）。`netfilterd.exe`は
+/// 別プロセスとしてこのJSONを読むので、表現の不変は
+/// `apply_rules_request_json_wire_format_is_stable`が固定している。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetfilterPolicy {
+    pub allow_domains: Vec<String>,
+    pub allow_loopback: bool,
+    #[serde(default)]
+    pub allow_loopback_ports: Vec<u16>,
+    #[serde(default)]
+    pub allow_loopback_tcp_ports: Vec<u16>,
+    #[serde(default)]
+    pub allow_loopback_udp_ports: Vec<u16>,
+    pub allow_direct_dns: bool,
+    #[serde(default)]
+    pub audit_log_path: Option<PathBuf>,
+}
+
 /// 親→daemonへ送るメッセージ。1セッションで`ApplyRules`→`Teardown`の順に2回送る。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetfilterRequest {
-    ApplyRules {
-        allow_domains: Vec<String>,
-        allow_loopback: bool,
-        #[serde(default)]
-        allow_loopback_ports: Vec<u16>,
-        #[serde(default)]
-        allow_loopback_tcp_ports: Vec<u16>,
-        #[serde(default)]
-        allow_loopback_udp_ports: Vec<u16>,
-        allow_direct_dns: bool,
-        #[serde(default)]
-        audit_log_path: Option<PathBuf>,
-    },
+    ApplyRules(NetfilterPolicy),
     Teardown,
 }
 
@@ -459,13 +473,7 @@ pub fn prepare_pipe() -> Result<PreparedPipe, NetfilterError> {
 fn connect_and_apply(
     pipe: HANDLE,
     daemon_process: Option<HANDLE>,
-    allow_domains: Vec<String>,
-    allow_loopback: bool,
-    allow_loopback_ports: Vec<u16>,
-    allow_loopback_tcp_ports: Vec<u16>,
-    allow_loopback_udp_ports: Vec<u16>,
-    allow_direct_dns: bool,
-    audit_log_path: Option<PathBuf>,
+    policy: NetfilterPolicy,
 ) -> Result<NetfilterHandle, NetfilterError> {
     let connect_result = connect_with_timeout(pipe, CONNECT_TIMEOUT).map_err(|e| {
         NetfilterError::Ipc(format!(
@@ -483,15 +491,7 @@ fn connect_and_apply(
         return Err(e);
     }
 
-    let req = NetfilterRequest::ApplyRules {
-        allow_domains,
-        allow_loopback,
-        allow_loopback_ports,
-        allow_loopback_tcp_ports,
-        allow_loopback_udp_ports,
-        allow_direct_dns,
-        audit_log_path,
-    };
+    let req = NetfilterRequest::ApplyRules(policy);
     let apply_result = (|| -> Result<(), NetfilterError> {
         let bytes = serde_json::to_vec(&req)
             .map_err(|e| NetfilterError::Ipc(format!("failed to serialize request: {e}")))?;
@@ -529,15 +529,7 @@ fn connect_and_apply(
 impl NetfilterHandle {
     /// daemonを昇格起動し、`ApplyRules`を送って応答を待つ（親側、非管理者本体から呼ぶ、
     /// シナリオB＝特権分離ヘルパーが不要なケース）。
-    pub fn start(
-        allow_domains: Vec<String>,
-        allow_loopback: bool,
-        allow_loopback_ports: Vec<u16>,
-        allow_loopback_tcp_ports: Vec<u16>,
-        allow_loopback_udp_ports: Vec<u16>,
-        allow_direct_dns: bool,
-        audit_log_path: Option<PathBuf>,
-    ) -> Result<Self, NetfilterError> {
+    pub fn start(policy: NetfilterPolicy) -> Result<Self, NetfilterError> {
         let prepared = prepare_pipe()?;
         let pipe_name = prepared.name().to_string();
         let pipe = prepared.into_handle();
@@ -553,17 +545,7 @@ impl NetfilterHandle {
             }
         };
 
-        connect_and_apply(
-            pipe,
-            Some(daemon_process),
-            allow_domains,
-            allow_loopback,
-            allow_loopback_ports,
-            allow_loopback_tcp_ports,
-            allow_loopback_udp_ports,
-            allow_direct_dns,
-            audit_log_path,
-        )
+        connect_and_apply(pipe, Some(daemon_process), policy)
     }
 
     /// 既に（特権分離ヘルパー経由で）daemonの起動を依頼済みのパイプへ接続し、`ApplyRules`を
@@ -572,25 +554,9 @@ impl NetfilterHandle {
     /// プロセスハンドルを持たない（`daemon_process: None`、構造体docの注記参照）。
     pub fn connect_after_chain_launch(
         pipe: HANDLE,
-        allow_domains: Vec<String>,
-        allow_loopback: bool,
-        allow_loopback_ports: Vec<u16>,
-        allow_loopback_tcp_ports: Vec<u16>,
-        allow_loopback_udp_ports: Vec<u16>,
-        allow_direct_dns: bool,
-        audit_log_path: Option<PathBuf>,
+        policy: NetfilterPolicy,
     ) -> Result<Self, NetfilterError> {
-        connect_and_apply(
-            pipe,
-            None,
-            allow_domains,
-            allow_loopback,
-            allow_loopback_ports,
-            allow_loopback_tcp_ports,
-            allow_loopback_udp_ports,
-            allow_direct_dns,
-            audit_log_path,
-        )
+        connect_and_apply(pipe, None, policy)
     }
 
     /// `Teardown`を送ってdaemonの終了を待つ（対象アプリ終了を検知した親から呼ぶ、正常系）。
@@ -677,32 +643,8 @@ pub fn serve(pipe_name: &str) -> Result<(), NetfilterError> {
 fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
     // 1回目: ApplyRules を待つ。
     let request_bytes = read_framed_timeout(pipe, APPLY_RESPONSE_TIMEOUT)?;
-    let (
-        allow_domains,
-        allow_loopback,
-        allow_loopback_ports,
-        allow_loopback_tcp_ports,
-        allow_loopback_udp_ports,
-        allow_direct_dns,
-        audit_log_path,
-    ) = match serde_json::from_slice::<NetfilterRequest>(&request_bytes) {
-        Ok(NetfilterRequest::ApplyRules {
-            allow_domains,
-            allow_loopback,
-            allow_loopback_ports,
-            allow_loopback_tcp_ports,
-            allow_loopback_udp_ports,
-            allow_direct_dns,
-            audit_log_path,
-        }) => (
-            allow_domains,
-            allow_loopback,
-            allow_loopback_ports,
-            allow_loopback_tcp_ports,
-            allow_loopback_udp_ports,
-            allow_direct_dns,
-            audit_log_path,
-        ),
+    let policy = match serde_json::from_slice::<NetfilterRequest>(&request_bytes) {
+        Ok(NetfilterRequest::ApplyRules(policy)) => policy,
         Ok(NetfilterRequest::Teardown) => {
             let resp = NetfilterResponse::Err(
                 "expected ApplyRules as the first message, got Teardown".to_string(),
@@ -726,14 +668,18 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
         }
     };
 
+    // `NetfilterPolicy`はIPCワイヤ形式、`WfpOptions`はWFPエンジンへ渡す層のオプションで、
+    // 現状フィールドは同形だが所有するレイヤーが違う（`WfpOptions`側は「旧IPC互換のため
+    // WFPフィルタ生成では無視する」といったWFP固有の意味をフィールドごとに持つ）。
+    // 型は分けたまま、ここで明示的に写す。
     let opts = WfpOptions {
-        allow_domains,
-        allow_loopback,
-        allow_loopback_ports,
-        allow_loopback_tcp_ports,
-        allow_loopback_udp_ports,
-        allow_direct_dns,
-        audit_log_path,
+        allow_domains: policy.allow_domains,
+        allow_loopback: policy.allow_loopback,
+        allow_loopback_ports: policy.allow_loopback_ports,
+        allow_loopback_tcp_ports: policy.allow_loopback_tcp_ports,
+        allow_loopback_udp_ports: policy.allow_loopback_udp_ports,
+        allow_direct_dns: policy.allow_direct_dns,
+        audit_log_path: policy.audit_log_path,
     };
     let session = match WfpSession::apply(sid.as_psid(), &opts) {
         Ok(s) => s,
@@ -783,7 +729,7 @@ mod tests {
 
     #[test]
     fn apply_rules_request_roundtrips_through_json() {
-        let req = NetfilterRequest::ApplyRules {
+        let req = NetfilterRequest::ApplyRules(NetfilterPolicy {
             allow_domains: vec!["github.com".to_string(), "api.anthropic.com".to_string()],
             allow_loopback: true,
             allow_loopback_ports: vec![18080, 18053],
@@ -791,11 +737,11 @@ mod tests {
             allow_loopback_udp_ports: vec![18053],
             allow_direct_dns: false,
             audit_log_path: Some(PathBuf::from(".harness/sandbox/session-x/net-audit.jsonl")),
-        };
+        });
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: NetfilterRequest = serde_json::from_slice(&bytes).unwrap();
         match decoded {
-            NetfilterRequest::ApplyRules {
+            NetfilterRequest::ApplyRules(NetfilterPolicy {
                 allow_domains,
                 allow_loopback,
                 allow_loopback_ports,
@@ -803,7 +749,7 @@ mod tests {
                 allow_loopback_udp_ports,
                 allow_direct_dns,
                 audit_log_path,
-            } => {
+            }) => {
                 assert_eq!(
                     allow_domains,
                     vec!["github.com".to_string(), "api.anthropic.com".to_string()]
@@ -820,6 +766,31 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// `NetfilterRequest`のJSON表現そのものを固定する。上の往復テストは encode→decode が
+    /// 対称でありさえすれば通るため、ワイヤ形式が変わったことを検出できない。この列挙型は
+    /// 別プロセス（`harness-netfilterd`）との名前付きパイプIPCで交換される境界の形なので、
+    /// 表現を変えるときは意図的な変更であることがここで分かるようにする。
+    #[test]
+    fn apply_rules_request_json_wire_format_is_stable() {
+        let req = NetfilterRequest::ApplyRules(NetfilterPolicy {
+            allow_domains: vec!["github.com".to_string()],
+            allow_loopback: true,
+            allow_loopback_ports: vec![18080],
+            allow_loopback_tcp_ports: vec![18080],
+            allow_loopback_udp_ports: vec![18053],
+            allow_direct_dns: false,
+            audit_log_path: Some(PathBuf::from("net-audit.jsonl")),
+        });
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"ApplyRules":{"allow_domains":["github.com"],"allow_loopback":true,"allow_loopback_ports":[18080],"allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"allow_direct_dns":false,"audit_log_path":"net-audit.jsonl"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&NetfilterRequest::Teardown).unwrap(),
+            r#""Teardown""#
+        );
     }
 
     #[test]
@@ -860,12 +831,12 @@ mod tests {
             r#"{"ApplyRules":{"allow_domains":[],"allow_loopback":true,"allow_direct_dns":false}}"#;
         let decoded: NetfilterRequest = serde_json::from_str(legacy).unwrap();
         match decoded {
-            NetfilterRequest::ApplyRules {
+            NetfilterRequest::ApplyRules(NetfilterPolicy {
                 allow_loopback_ports,
                 allow_loopback_tcp_ports,
                 allow_loopback_udp_ports,
                 ..
-            } => {
+            }) => {
                 assert!(allow_loopback_ports.is_empty());
                 assert!(allow_loopback_tcp_ports.is_empty());
                 assert!(allow_loopback_udp_ports.is_empty());

@@ -436,7 +436,9 @@ fn truncate_to_limit(mut s: String) -> String {
     s
 }
 
-fn append_path_extra(env: &mut Vec<(String, String)>, path_extra: &[String]) {
+/// 既存の`PATH`エントリへ`path_extra`を追記する。`env`は要素を増減させず既存の`PATH`値だけを
+/// 書き換えるため、`&mut Vec`ではなくスライスで受ける（`Vec`からは自動で型強制される）。
+fn append_path_extra(env: &mut [(String, String)], path_extra: &[String]) {
     if path_extra.is_empty() {
         return;
     }

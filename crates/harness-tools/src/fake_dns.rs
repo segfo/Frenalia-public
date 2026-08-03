@@ -43,6 +43,16 @@ pub struct FakeDnsAuditEntry {
     pub matched_pattern: Option<String>,
 }
 
+/// 1件のDNS問い合わせに対する判定結果（`FakeDnsAuditLog::record_query`へ渡す）。
+/// ポリシー評価とFake IP割当の結果をまとめた値で、問い合わせ自体の識別情報
+/// （protocol/host/qtype）とは別グループとして持つ。
+struct QueryOutcome {
+    fake_ip: Option<Ipv4Addr>,
+    allowed: bool,
+    reason: &'static str,
+    matched_pattern: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct FakeDnsAuditLog {
     entries: Mutex<Vec<FakeDnsAuditEntry>>,
@@ -66,10 +76,7 @@ impl FakeDnsAuditLog {
         protocol: &'static str,
         host: String,
         qtype: u16,
-        fake_ip: Option<Ipv4Addr>,
-        allowed: bool,
-        reason: &'static str,
-        matched_pattern: Option<String>,
+        outcome: QueryOutcome,
     ) {
         let entry = FakeDnsAuditEntry {
             timestamp_unix_ms: now_unix_ms(),
@@ -77,10 +84,10 @@ impl FakeDnsAuditLog {
             protocol,
             host,
             qtype: qtype_name(qtype),
-            fake_ip,
-            allowed,
-            reason,
-            matched_pattern,
+            fake_ip: outcome.fake_ip,
+            allowed: outcome.allowed,
+            reason: outcome.reason,
+            matched_pattern: outcome.matched_pattern,
         };
 
         if let Some(path) = &self.jsonl_path {
@@ -270,10 +277,12 @@ fn handle_dns_query(
         protocol,
         question.host.clone(),
         question.qtype,
-        fake_ip,
-        policy_allows,
-        reason,
-        decision.matched_pattern,
+        QueryOutcome {
+            fake_ip,
+            allowed: policy_allows,
+            reason,
+            matched_pattern: decision.matched_pattern,
+        },
     );
     Some(build_response(packet, &question, fake_ip))
 }
