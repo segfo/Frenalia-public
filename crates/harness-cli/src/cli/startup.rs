@@ -638,34 +638,9 @@ fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<SandboxPrepare
     })
 }
 
-pub async fn run() -> ExitCode {
-    let ParsedArgs {
-        cli,
-        workspace_root,
-        resume_id,
-        resume_wants_picker,
-    } = match stage_parse_args() {
-        Ok(p) => p,
-        Err(code) => return code,
-    };
-
-    let configured = match stage_configure(ParsedArgs {
-        cli,
-        workspace_root,
-        resume_id,
-        resume_wants_picker,
-    }) {
-        Ok(c) => c,
-        Err(code) => return code,
-    };
-    let session_opened = match stage_open_session(configured) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let sandbox_prepared = match stage_prepare_sandbox(session_opened) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
+/// Local Proxy/Fake DNS起動・`ToolCtx`構築・`ConversationState`・TUI/headless分岐。
+/// 5段の最終段のため`Result`ではなく`ExitCode`を直接返す。
+async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     let SandboxPrepared {
         cli,
         workspace_root,
@@ -677,7 +652,7 @@ pub async fn run() -> ExitCode {
         tools,
         arbiter,
         sessions_dir,
-        session,
+        mut session,
         session_messages,
         staging_mode,
         sandbox_dir,
@@ -690,7 +665,7 @@ pub async fn run() -> ExitCode {
         wfp_prelude,
         write_mode,
         shell_tier,
-    } = sandbox_prepared;
+    } = sandbox;
 
     let _session_proxy = if net_proxy.domain_policy_enabled {
         match harness_tools::net_proxy::spawn_local_proxy(&net_proxy).await {
@@ -918,98 +893,29 @@ pub async fn run() -> ExitCode {
 
     let exit_code = match cli.print {
         Some(print) => {
-            let prompt = if print == "-" {
-                let mut buf = String::new();
-                if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-                    eprintln!("failed to read prompt from stdin: {e}");
-                    return ExitCode::FAILURE;
-                }
-                buf
-            } else {
-                print
-            };
-
-            state.push_user_text(prompt);
-            if let Err(e) = session.append_messages(&state.messages[state.messages.len() - 1..]) {
-                eprintln!(
-                    "failed to persist session {}: {e}",
-                    session.path().display()
-                );
-                return ExitCode::FAILURE;
-            }
-            let before_run = state.messages.len();
-
-            // Tier3準備（VM+コンテナ起動、コールドブート数分/ウォーム再利用約20秒）を
-            // ここで行い、待機中はstderrへ進捗行を出す（TUI分岐は`harness_tui::run`内で
-            // 同様の役割を果たす、`crates/harness-tui/src/lib.rs`参照）。
-            #[cfg(windows)]
-            let vm_sandbox_handle: Option<
-                std::sync::Arc<harness_sandbox::tier3::vmsandboxd::VmSandboxHandle>,
-            > = if tool_ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
-                start_tier3_with_progress(
-                    &tool_ctx.workspace_root,
-                    &tool_ctx.net_proxy.allow_domains,
-                    cli.tier3_warm,
-                    cli.tier3_max_sessions.max(1),
-                )
-                .await
-            } else {
-                None
-            };
-            #[cfg(not(windows))]
-            let vm_sandbox_handle: Option<std::sync::Arc<()>> = None;
-
-            #[cfg(windows)]
-            {
-                tool_ctx.vm_sandbox = vm_sandbox_handle
-                    .clone()
-                    .map(|h| h as std::sync::Arc<dyn harness_core::VmShellExecutor>);
-            }
-
-            let mut stdout = std::io::stdout();
-            let exit = run_headless(
+            headless_branch(
+                print,
                 provider.as_ref(),
-                &mut state,
                 &tools,
-                &tool_ctx,
+                &mut tool_ctx,
                 &arbiter,
-                AgentLoopConfig {
-                    model,
-                    max_tokens: DEFAULT_MAX_TOKENS,
-                    max_turns,
-                },
+                model,
+                max_turns,
                 cli.output_format,
-                &mut stdout,
+                cli.tier3_warm,
+                cli.tier3_max_sessions.max(1),
+                &mut state,
+                &mut session,
             )
-            .await;
-            let _ = session.append_messages(&state.messages[before_run..]);
-
-            #[cfg(windows)]
-            if let Some(handle) = vm_sandbox_handle {
-                if let Err(e) = handle.stop() {
-                    eprintln!("warning: failed to cleanly tear down Tier3 VM sandbox session: {e}");
-                }
-            }
-
-            exit
+            .await
         }
         None => {
-            let log_dir = workspace_root.join(".harness").join("logs");
-            if let Err(e) = std::fs::create_dir_all(&log_dir) {
-                eprintln!("failed to create log directory {}: {e}", log_dir.display());
-                return ExitCode::FAILURE;
-            }
-            // tracing出力先をファイルへ切り替えた後でなければTUI側の`tracing::debug!`等が
-            // 直接stdoutを汚してしまう（§リッチTUI「tracingは全てtracing-appenderでファイルへ」）。
-            let _log_guard = harness_tui::init_file_logging(&log_dir);
-
-            let result = harness_tui::run(
+            tui_branch(
                 provider,
                 tools,
                 tool_ctx,
                 arbiter,
                 model,
-                DEFAULT_MAX_TOKENS,
                 max_turns,
                 cli.provider.label().to_string(),
                 state,
@@ -1020,15 +926,7 @@ pub async fn run() -> ExitCode {
                 cli.tier3_warm,
                 cli.tier3_max_sessions.max(1),
             )
-            .await;
-
-            match result {
-                Ok(_) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("tui error: {e}");
-                    ExitCode::FAILURE
-                }
-            }
+            .await
         }
     };
 
@@ -1053,6 +951,175 @@ pub async fn run() -> ExitCode {
 
     exit_code
 }
+
+/// `stage_run_agent`の非対話（`-p`/`--print`）分岐。`tool_ctx`はTier3準備完了後の
+/// `vm_sandbox`書き戻しのため`&mut`で受ける。
+#[allow(clippy::too_many_arguments)]
+async fn headless_branch(
+    print: String,
+    provider: &dyn LlmProvider,
+    tools: &ToolRegistry,
+    tool_ctx: &mut ToolCtx,
+    arbiter: &PermissionArbiter,
+    model: String,
+    max_turns: usize,
+    output_format: OutputFormat,
+    tier3_warm: bool,
+    tier3_max_sessions: u8,
+    state: &mut ConversationState,
+    session: &mut harness_engine::SessionStore,
+) -> ExitCode {
+    let prompt = if print == "-" {
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("failed to read prompt from stdin: {e}");
+            return ExitCode::FAILURE;
+        }
+        buf
+    } else {
+        print
+    };
+
+    state.push_user_text(prompt);
+    if let Err(e) = session.append_messages(&state.messages[state.messages.len() - 1..]) {
+        eprintln!(
+            "failed to persist session {}: {e}",
+            session.path().display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let before_run = state.messages.len();
+
+    // Tier3準備（VM+コンテナ起動、コールドブート数分/ウォーム再利用約20秒）を
+    // ここで行い、待機中はstderrへ進捗行を出す（TUI分岐は`harness_tui::run`内で
+    // 同様の役割を果たす、`crates/harness-tui/src/lib.rs`参照）。
+    #[cfg(windows)]
+    let vm_sandbox_handle: Option<
+        std::sync::Arc<harness_sandbox::tier3::vmsandboxd::VmSandboxHandle>,
+    > = if tool_ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+        start_tier3_with_progress(
+            &tool_ctx.workspace_root,
+            &tool_ctx.net_proxy.allow_domains,
+            tier3_warm,
+            tier3_max_sessions,
+        )
+        .await
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let vm_sandbox_handle: Option<std::sync::Arc<()>> = None;
+
+    #[cfg(windows)]
+    {
+        tool_ctx.vm_sandbox = vm_sandbox_handle
+            .clone()
+            .map(|h| h as std::sync::Arc<dyn harness_core::VmShellExecutor>);
+    }
+
+    let mut stdout = std::io::stdout();
+    let exit = run_headless(
+        provider,
+        state,
+        tools,
+        tool_ctx,
+        arbiter,
+        AgentLoopConfig {
+            model,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            max_turns,
+        },
+        output_format,
+        &mut stdout,
+    )
+    .await;
+    let _ = session.append_messages(&state.messages[before_run..]);
+
+    #[cfg(windows)]
+    if let Some(handle) = vm_sandbox_handle {
+        if let Err(e) = handle.stop() {
+            eprintln!("warning: failed to cleanly tear down Tier3 VM sandbox session: {e}");
+        }
+    }
+
+    exit
+}
+
+/// `stage_run_agent`の対話（TUI）分岐。
+#[allow(clippy::too_many_arguments)]
+async fn tui_branch(
+    provider: Box<dyn LlmProvider>,
+    tools: ToolRegistry,
+    tool_ctx: ToolCtx,
+    arbiter: PermissionArbiter,
+    model: String,
+    max_turns: usize,
+    provider_label: String,
+    state: ConversationState,
+    session: harness_engine::SessionStore,
+    sessions_dir: PathBuf,
+    enter_submits: bool,
+    resume_wants_picker: bool,
+    tier3_warm: bool,
+    tier3_max_sessions: u8,
+) -> ExitCode {
+    let log_dir = tool_ctx.workspace_root.join(".harness").join("logs");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("failed to create log directory {}: {e}", log_dir.display());
+        return ExitCode::FAILURE;
+    }
+    // tracing出力先をファイルへ切り替えた後でなければTUI側の`tracing::debug!`等が
+    // 直接stdoutを汚してしまう（§リッチTUI「tracingは全てtracing-appenderでファイルへ」）。
+    let _log_guard = harness_tui::init_file_logging(&log_dir);
+
+    let result = harness_tui::run(
+        provider,
+        tools,
+        tool_ctx,
+        arbiter,
+        model,
+        DEFAULT_MAX_TOKENS,
+        max_turns,
+        provider_label,
+        state,
+        session,
+        sessions_dir,
+        enter_submits,
+        resume_wants_picker,
+        tier3_warm,
+        tier3_max_sessions,
+    )
+    .await;
+
+    match result {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("tui error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+pub async fn run() -> ExitCode {
+    let parsed = match stage_parse_args() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let configured = match stage_configure(parsed) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let session_opened = match stage_open_session(configured) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let sandbox_prepared = match stage_prepare_sandbox(session_opened) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    stage_run_agent(sandbox_prepared).await
+}
+
 
 /// 非対話モード（`--print`）専用: Tier3 VMサンドボックスの起動をブロッキングのまま
 /// （`tokio::task::spawn_blocking`越しに）待ちつつ、`vmsandboxd_progress`の合成進捗
