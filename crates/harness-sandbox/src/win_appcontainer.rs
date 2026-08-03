@@ -2972,7 +2972,7 @@ mod traverse_diagnostics {
                 match icacls_out {
                     Ok(o) => println!(
                         "=== icacls on freshly-created h1-probe.tmp ===\n{}",
-                        String::from_utf8_lossy(&o.stdout)
+                        crate::decode_console_bytes(&o.stdout)
                     ),
                     Err(e) => println!("=== icacls failed to run: {e} ==="),
                 }
@@ -3007,7 +3007,7 @@ mod traverse_diagnostics {
                     Ok(o) if o.status.success() => {
                         println!(
                             "=== H5 icacls /setintegritylevel Medium succeeded: {} ===",
-                            String::from_utf8_lossy(&o.stdout)
+                            crate::decode_console_bytes(&o.stdout)
                         );
                         run_probe_bool(
                             sid.as_psid(),
@@ -3018,8 +3018,8 @@ mod traverse_diagnostics {
                     Ok(o) => {
                         println!(
                             "=== H5 icacls /setintegritylevel failed: stdout={} stderr={} ===",
-                            String::from_utf8_lossy(&o.stdout),
-                            String::from_utf8_lossy(&o.stderr)
+                            crate::decode_console_bytes(&o.stdout),
+                            crate::decode_console_bytes(&o.stderr)
                         );
                         false
                     }
@@ -3526,8 +3526,8 @@ mod traverse_diagnostics {
         println!(
             "=== experiment_h_procmon_control: exit={:?} ===\n--- stdout ---\n{}\n--- stderr ---\n{}",
             output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            crate::decode_console_bytes(&output.stdout),
+            crate::decode_console_bytes(&output.stderr)
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
@@ -3657,8 +3657,8 @@ mod traverse_diagnostics {
                 .expect("icacls .harness");
             println!(
                 "=== .harness icacls after failed preflight ===\n{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                crate::decode_console_bytes(&output.stdout),
+                crate::decode_console_bytes(&output.stderr)
             );
         }
         result.expect("preflight must protect .harness from AppContainer writes");
@@ -4571,7 +4571,7 @@ New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -Pas
             std::process::Command::new("icacls")
                 .arg(path)
                 .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .map(|o| crate::decode_console_bytes(&o.stdout))
                 .unwrap_or_default()
         };
         let baseline_icacls = icacls_output(&nested_dir);
@@ -4684,7 +4684,7 @@ New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -Pas
                 println!(
                     "=== S1 DEBUG: icacls on {} after revoke_ace_recursive ===\n{}",
                     probe_target.display(),
-                    String::from_utf8_lossy(&out.stdout)
+                    crate::decode_console_bytes(&out.stdout)
                 );
             }
 
@@ -4748,10 +4748,10 @@ New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -Pas
             return Err(format!(
                 "exit={:?} stderr={}",
                 output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
+                crate::decode_console_bytes(&output.stderr)
             ));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(crate::decode_console_bytes(&output.stdout).trim().to_string())
     }
 
     /// `Start-Process -Credential`でSMBの実効アクセスに近い形（実際のログオンセッション、

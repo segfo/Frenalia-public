@@ -431,3 +431,353 @@ Get-NetFirewallRule -DisplayGroup 'File and Printer Sharing' -ErrorAction Silent
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_id_is_deterministic_and_fixed_length() {
+        let a = short_id("harness-tier3-1234-5678");
+        let b = short_id("harness-tier3-1234-5678");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 8);
+    }
+
+    #[test]
+    fn ephemeral_names_stay_within_windows_username_length_limit() {
+        let session_id = "harness-tier3-999999-1234567890123";
+        let user = ephemeral_user_name(session_id);
+        // Windowsローカルアカウント名は20文字まで。
+        assert!(user.len() <= 20, "user name too long: {user}");
+    }
+
+    #[test]
+    fn generate_password_produces_sufficient_length_and_varies() {
+        let a = generate_password();
+        let b = generate_password();
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
+    }
+
+    /// S-2段階7の回帰テスト: `workspace_root`にシングルクォートを含む場合でも、
+    /// 生成スクリプトの`New-SmbShare -Path '...'`行がクォートで正しく閉じること
+    /// （修正前は`path`だけ`ps_quote`が漏れており、ここでスクリプトが壊れていた）。
+    #[test]
+    fn build_create_share_script_escapes_single_quote_in_workspace_root() {
+        let path = Path::new(r"C:\work\it's a repo");
+        let script =
+            build_create_share_script("hns3-aaaaaaaa", "harness-ws-aaaaaaaa", "pw", path, "HOST");
+        assert!(
+            script.contains(r"-Path 'C:\work\it''s a repo'"),
+            "expected the path to be escaped in the generated script, got: {script}"
+        );
+        // エスケープ漏れの症状（生の`'`がそのまま出力へ紛れ込む）が無いことも直接確認する。
+        assert!(!script.contains(r"-Path 'C:\work\it's a repo'"));
+    }
+
+    #[test]
+    fn ps_quote_escapes_single_quotes() {
+        assert_eq!(ps_quote("it's"), "it''s");
+    }
+
+    /// BUG-026 F4回帰: `Get-SmbShare`の出力パースが共有名からアカウント名を正しく導出し、
+    /// タブ区切り・空行・命名規則に合わない行を適切に無視することを検証する。
+    #[test]
+    fn parse_workspace_share_listing_extracts_share_user_and_path() {
+        let stdout =
+            "harness-ws-62d45a6b\tC:\\work\\project\nharness-ws-abcd1234\tC:\\other\\repo\n";
+        let parsed = parse_workspace_share_listing(stdout);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "harness-ws-62d45a6b");
+        assert_eq!(parsed[0].1, "hns3-62d45a6b");
+        assert_eq!(parsed[0].2, std::path::PathBuf::from("C:\\work\\project"));
+        assert_eq!(parsed[1].0, "harness-ws-abcd1234");
+        assert_eq!(parsed[1].1, "hns3-abcd1234");
+    }
+
+    #[test]
+    fn parse_workspace_share_listing_ignores_malformed_or_empty_lines() {
+        let stdout = "\nnot-a-harness-share\tC:\\x\n\tC:\\missing-name\nharness-ws-only-name\n";
+        assert!(parse_workspace_share_listing(stdout).is_empty());
+    }
+
+    #[test]
+    fn parse_workspace_share_listing_handles_empty_input() {
+        assert!(parse_workspace_share_listing("").is_empty());
+    }
+
+    /// [SMBマウント検証スパイク] `create_ephemeral_share`/`destroy_ephemeral_share`が実際に
+    /// SMB経由（`\\localhost\<share>`、実際のネットワーク認証・共有権限・NTFS権限を全て通る
+    /// 経路）でread/writeを許可/拒否できることを実機検証する。対象はharnessリポジトリ全体では
+    /// なく、リポジトリ配下の使い捨てスクラッチディレクトリ（`plans/vm-spike/smb-spike-tmp`）に
+    /// 限定する（ユーザー確認済みの方針。revoke側にS1で発見したバグの再発が万一あった場合でも、
+    /// リポジトリ全体のACLへ影響が及ぶリスクを避けるため）。
+    ///
+    /// 検証の要点: NTFS ACE取り消し（`revoke_ace_recursive`）**だけ**を先に単独実行し、共有・
+    /// アカウント自体はまだ生きている状態でSMBアクセスが拒否されることを確認する。これにより
+    /// 「アクセスできなくなったのは共有/アカウントが消えたからではなく、NTFS権限が正しく
+    /// 取り消されたから」であることを、共有レベル権限とは独立に証明できる。
+    #[test]
+    #[ignore]
+    fn smb_mount_access_is_granted_then_actually_revoked() {
+        let unique = std::process::id();
+        let session_id = format!("smbspike{unique}");
+        let repo_root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plans/vm-spike");
+        let scratch = repo_root
+            .canonicalize()
+            .expect("plans/vm-spike must exist")
+            .join(format!("smb-spike-tmp-{unique}"));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        std::fs::write(scratch.join("preexisting.txt"), b"hello from host")
+            .expect("seed preexisting file");
+
+        let cleanup = || {
+            let _ = std::fs::remove_dir_all(&scratch);
+        };
+
+        let result = (|| -> Result<(), String> {
+            let (share, user, password, _sid) = create_ephemeral_share(&session_id, &scratch)
+                .map_err(|e| format!("create_ephemeral_share failed: {e:?}"))?;
+
+            let unc = format!(r"\\localhost\{share}");
+
+            // (1) 共有・アカウント・NTFS付与すべて生きている状態で、実際にSMB経由の
+            // read/writeが機能することを確認する。
+            let connect_script = format!(
+                r#"
+$ErrorActionPreference = 'Stop'
+net use '{unc}' /user:localhost\{user} '{password}' | Out-Null
+if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
+"#
+            );
+            run_ps(&connect_script)
+                .map_err(|e| format!("net use (initial connect) failed: {e}"))?;
+
+            let read_ok = run_ps_bool(&format!(
+                "Get-Content -LiteralPath '{unc}\\preexisting.txt' -ErrorAction Stop | Out-Null"
+            ));
+            let write_ok = run_ps_bool(&format!(
+                "'written over smb' | Set-Content -LiteralPath '{unc}\\from-smb.txt' -ErrorAction Stop"
+            ));
+            let _ = run_ps(&format!("net use '{unc}' /delete /y"));
+
+            if !read_ok {
+                return Err(
+                    "expected to be able to read preexisting.txt over SMB after grant".to_string(),
+                );
+            }
+            if !write_ok {
+                return Err(
+                    "expected to be able to write a new file over SMB after grant".to_string(),
+                );
+            }
+
+            // (2) NTFS ACE取り消しだけを単独実行する（共有・アカウントはまだ生かしたまま）。
+            let sid_string = run_ps_capture(&format!("(Get-LocalUser -Name '{user}').SID.Value"))
+                .map_err(|e| format!("failed to look up SID before revoke: {e}"))?;
+            let sid_owned = unsafe {
+                let sid_w = crate::win_common::wide(&sid_string);
+                let mut psid = windows::Win32::Security::PSID::default();
+                windows::Win32::Security::Authorization::ConvertStringSidToSidW(
+                    windows::core::PCWSTR(sid_w.as_ptr()),
+                    &mut psid,
+                )
+                .map_err(|e| format!("ConvertStringSidToSidW failed: {e}"))?;
+                psid
+            };
+            revoke_ace_recursive(&scratch, sid_owned)
+                .map_err(|e| format!("revoke_ace_recursive failed: {e:?}"))?;
+
+            // (3) 共有・アカウントはまだ存在するので再接続自体は成功するはずだが、NTFS権限が
+            // 無くなっているためread/writeは拒否されるはず。
+            run_ps(&connect_script)
+                .map_err(|e| format!("net use (post-revoke reconnect) failed: {e}"))?;
+            let read_after_revoke = run_ps_bool(&format!(
+                "Get-Content -LiteralPath '{unc}\\preexisting.txt' -ErrorAction Stop | Out-Null"
+            ));
+            let _ = run_ps(&format!("net use '{unc}' /delete /y"));
+
+            if read_after_revoke {
+                return Err(
+                    "after revoke_ace_recursive, SMB read must be denied (share/account still \
+                     exist at this point, only the NTFS ACE was removed) — proves the NTFS \
+                     revoke, not account/share teardown, is what enforces access"
+                        .to_string(),
+                );
+            }
+
+            destroy_ephemeral_share(&share, &user, Some(&scratch));
+            Ok(())
+        })();
+
+        cleanup();
+        result.expect("SMB mount verification spike must succeed end-to-end");
+    }
+
+    /// PowerShellを`-Command`経由で実行し成否だけ見る（`net use`等、副作用のみに関心がある
+    /// 呼び出し用）。
+    fn run_ps(script: &str) -> Result<(), String> {
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env_remove("PSModulePath")
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "exit={:?} stdout={} stderr={}",
+                output.status.code(),
+                crate::decode_console_bytes(&output.stdout),
+                crate::decode_console_bytes(&output.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// PowerShellスクリプトを実行し、成功/失敗をboolへ潰す（read/writeの許可・拒否確認用、
+    /// `run_ps`と異なりエラー内容は捨てる——許可/拒否の2値だけが関心事のため）。
+    fn run_ps_bool(script: &str) -> bool {
+        run_ps(script).is_ok()
+    }
+
+    /// PowerShellスクリプトの標準出力を1文字列として取得する（SID文字列取得用）。
+    fn run_ps_capture(script: &str) -> Result<String, String> {
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env_remove("PSModulePath")
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "exit={:?} stderr={}",
+                output.status.code(),
+                crate::decode_console_bytes(&output.stderr)
+            ));
+        }
+        Ok(crate::decode_console_bytes(&output.stdout).trim().to_string())
+    }
+
+    /// [実リポジトリ本体での検証] ユーザー指示による5段階検証のうち、最終段（このharness
+    /// リポジトリのルート自体、`target/`込みの実規模＝約57,000ファイル、14GB）への実適用。
+    /// スクラッチディレクトリでの検証（`smb_mount_access_is_granted_then_actually_revoked`）は
+    /// 数百ファイル規模だったが、Tier2aの`grant_ace_inheritable_ro`/`_rw`が実運用で処理する
+    /// のはこの規模（MSVCツールチェーン等）であり、「Tier2aと同等」を主張するならこの規模で
+    /// 実際に速いことを示す必要がある、というのがこのテストの動機。
+    ///
+    /// **安全策**: `assert!`ではなくすべて`Err`返却にして、途中で条件を満たさなくても
+    /// パニックで巻き戻し処理を飛ばさないようにする（実リポジトリへの変更のため、
+    /// revoke/共有削除を確実に実行してから最後に成否を確定させる）。事前に`icacls`で
+    /// ルートのベースラインDACLを記録し（本テストのassert対象ではなく、テスト実行者が
+    /// 目視で比較できるようログへ出力するのみ）、事後に同じユーザーのACEが残っていないかも
+    /// 確認する。
+    #[test]
+    #[ignore]
+    fn real_repo_root_smb_grant_revoke_at_full_scale() {
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root must resolve");
+        println!("=== repo root under test: {} ===", repo_root.display());
+
+        let baseline_acl = run_ps_capture(&format!("icacls '{}'", repo_root.display()))
+            .unwrap_or_else(|e| format!("<failed to capture baseline: {e}>"));
+        println!("=== baseline ACL (before grant) ===\n{baseline_acl}");
+
+        let unique = std::process::id();
+        let session_id = format!("reporoot{unique}");
+
+        let result = (|| -> Result<(), String> {
+            let t_grant = std::time::Instant::now();
+            let (share, user, password, _sid) = create_ephemeral_share(&session_id, &repo_root)
+                .map_err(|e| format!("create_ephemeral_share (grant included) failed: {e:?}"))?;
+            let grant_elapsed = t_grant.elapsed();
+            println!("=== real repo root (~57k files incl. target/) create_ephemeral_share (incl. grant_ace_inheritable_rw) took {grant_elapsed:?} ===");
+
+            let unc = format!(r"\\localhost\{share}");
+            let connect_script = format!(
+                r#"
+$ErrorActionPreference = 'Stop'
+net use '{unc}' /user:localhost\{user} '{password}' | Out-Null
+if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
+"#
+            );
+            run_ps(&connect_script).map_err(|e| format!("net use (connect) failed: {e}"))?;
+
+            let read_ok = run_ps_bool(&format!(
+                "Get-Content -LiteralPath '{unc}\\CLAUDE.md' -TotalCount 1 -ErrorAction Stop | Out-Null"
+            ));
+            let _ = run_ps(&format!("net use '{unc}' /delete /y"));
+            if !read_ok {
+                return Err(
+                    "expected to read CLAUDE.md over SMB after grant on real repo root".to_string(),
+                );
+            }
+
+            let sid_string = run_ps_capture(&format!("(Get-LocalUser -Name '{user}').SID.Value"))
+                .map_err(|e| format!("SID lookup before revoke failed: {e}"))?;
+            let sid_owned = unsafe {
+                let sid_w = crate::win_common::wide(&sid_string);
+                let mut psid = windows::Win32::Security::PSID::default();
+                windows::Win32::Security::Authorization::ConvertStringSidToSidW(
+                    windows::core::PCWSTR(sid_w.as_ptr()),
+                    &mut psid,
+                )
+                .map_err(|e| format!("ConvertStringSidToSidW failed: {e}"))?;
+                psid
+            };
+
+            let t_revoke = std::time::Instant::now();
+            revoke_ace_recursive(&repo_root, sid_owned)
+                .map_err(|e| format!("revoke_ace_recursive on real repo root failed: {e:?}"))?;
+            let revoke_elapsed = t_revoke.elapsed();
+            println!("=== real repo root (~57k files incl. target/) revoke_ace_recursive took {revoke_elapsed:?} ===");
+
+            // `icacls /findsid`は「SIDが見つからない」場合（＝このチェックが望む合格状態）でも
+            // 終了コード1332（ERROR_NONE_MAPPED）を返す。この誤検知バグの再発防止として明示的に
+            // `exit 0`を末尾へ置く——さもないと、スクリプトの最後の文が`throw`しない`if`ブロックの
+            // ままだと、`run_ps`（`powershell.exe`プロセス自身の終了コード）が最後に実行した
+            // ネイティブコマンドの失敗終了コードをそのまま引き継ぎ、「SIDが正しく消えている
+            // （成功）」という望ましい結果自体が`run_ps`から見て失敗扱いになる（実機で5/5
+            // 再現・本行追加で解消を確認）。`run_shell`本体のPhase5-H（`$LASTEXITCODE`が
+            // スクリプト末尾の文の成否からブール化される問題）と同じクラスの罠。
+            let lingering_sid_check = format!(
+                r#"
+$ErrorActionPreference = 'Stop'
+$out = icacls '{}' /findsid '{}' /T /C 2>&1 | Out-String
+if ($out -match [regex]::Escape('{}')) {{
+    throw "SID still appears in ACL tree after revoke: $out"
+}}
+exit 0
+"#,
+                repo_root.display(),
+                sid_string,
+                sid_string,
+            );
+            run_ps(&lingering_sid_check)
+                .map_err(|e| format!("post-revoke ACL SID scan failed: {e}"))?;
+
+            run_ps(&connect_script)
+                .map_err(|e| format!("net use (post-revoke reconnect) failed: {e}"))?;
+            let read_after_revoke = run_ps_bool(&format!(
+                "Get-Content -LiteralPath '{unc}\\CLAUDE.md' -TotalCount 1 -ErrorAction Stop | Out-Null"
+            ));
+            let _ = run_ps(&format!("net use '{unc}' /delete /y"));
+
+            destroy_ephemeral_share(&share, &user, Some(&repo_root));
+
+            if read_after_revoke {
+                return Err(
+                    "after revoke_ace_recursive, SMB read of the real repo must be denied"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        })();
+
+        let after_acl = run_ps_capture(&format!("icacls '{}'", repo_root.display()))
+            .unwrap_or_else(|e| format!("<failed to capture post-test ACL: {e}>"));
+        println!("=== ACL after test (should match baseline, modulo ordering) ===\n{after_acl}");
+
+        result.expect("real repo root SMB grant/revoke verification must succeed end-to-end");
+    }
+}

@@ -3173,6 +3173,56 @@ mod tests {
         assert!(parse_config_blob("C:\\ws\n\n").is_none(), "upper empty");
     }
 
+    /// BUG-048 F1回帰: `FILE_GENERIC_WRITE`ベースの旧実装は`SYNCHRONIZE`/`READ_CONTROL`を
+    /// 誤って書込ビットとして扱っていた。実機ログで観測した`0x100001`
+    /// （`FILE_LIST_DIRECTORY|SYNCHRONIZE`、`Get-ChildItem`のディレクトリopen）が
+    /// `write_intent=false`になることを確認する。
+    #[test]
+    fn is_write_intent_does_not_flag_synchronize_or_list_directory() {
+        const FILE_LIST_DIRECTORY: u32 = 0x1;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const FILE_OPEN: u32 = 1;
+        assert!(!is_write_intent(FILE_LIST_DIRECTORY | SYNCHRONIZE, Some(FILE_OPEN)));
+        assert!(!is_write_intent(SYNCHRONIZE | READ_CONTROL, None));
+        // `FILE_GENERIC_READ`相当（READ_DATA|READ_ATTRIBUTES|READ_EA|READ_CONTROL|SYNCHRONIZE）。
+        const FILE_GENERIC_READ: u32 = 0x0012_0089;
+        assert!(!is_write_intent(FILE_GENERIC_READ, Some(FILE_OPEN)));
+    }
+
+    /// 書込を意味するビットは引き続き検出されること（DELETE単体・APPEND単体を含む）。
+    #[test]
+    fn is_write_intent_flags_actual_write_bits() {
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_APPEND_DATA: u32 = 0x4;
+        const FILE_WRITE_DATA: u32 = 0x2;
+        const FILE_OPEN_IF: u32 = 3;
+        const FILE_OVERWRITE_IF: u32 = 5;
+        assert!(is_write_intent(DELETE, Some(FILE_OPEN_IF)));
+        assert!(is_write_intent(FILE_APPEND_DATA, None));
+        assert!(is_write_intent(FILE_WRITE_DATA, None));
+        assert!(is_write_intent(0, Some(FILE_OVERWRITE_IF)), "OVERWRITE_IF disposition alone");
+    }
+
+    /// BUG-048 F2回帰: ディレクトリopen（`FILE_DIRECTORY_FILE`）は、書込ビットが立っていても
+    /// 新規作成dispositionでなければリダイレクト対象から除外する。既存ディレクトリを
+    /// `DELETE`/`WRITE_ATTRIBUTES`込みで開くケース（`Remove-Item`のパス解決等）を想定。
+    #[test]
+    fn should_redirect_write_excludes_existing_directory_open_but_allows_mkdir() {
+        const FILE_OPEN: u32 = 1;
+        const FILE_CREATE: u32 = 2;
+        let dir_flag = FILE_DIRECTORY_FILE.0;
+        // 既存ディレクトリを書込アクセス込みで開く（削除・属性変更等）→リダイレクトしない。
+        assert!(!should_redirect_write(true, dir_flag, Some(FILE_OPEN)));
+        // `NtOpenFile`相当（disposition無し）でのディレクトリopen→リダイレクトしない。
+        assert!(!should_redirect_write(true, dir_flag, None));
+        // 新規ディレクトリ作成（mkdir相当）→引き続きリダイレクトする。
+        assert!(should_redirect_write(true, dir_flag, Some(FILE_CREATE)));
+        // ファイル（ディレクトリフラグ無し）は従来通り。
+        assert!(should_redirect_write(true, 0, Some(FILE_OPEN)));
+        assert!(!should_redirect_write(false, 0, Some(FILE_OPEN)), "write_intent=falseなら常にfalse");
+    }
+
     /// Q9（増分tail再読込）の回帰テスト。`deleted_paths_state`/`ledger_read_offset`は
     /// プロセスグローバルな唯一のsingletonであり、他のテストと並行実行されると相互汚染し得るため、
     /// この1関数内で「初期ロード→兄弟プロセスによる追記を模擬→check_deleted経由での増分反映→
@@ -3359,5 +3409,145 @@ mod tests {
         // 指してしまう——今回は書込先自体が無いためディレクトリの中身が空のままであることで
         // 間接的に確認する）。
         assert!(std::fs::read_dir(workspace.path()).unwrap().next().is_none());
+    }
+
+    fn names(entries: &[dir_merge::MergedEntry]) -> Vec<String> {
+        entries.iter().map(|e| String::from_utf16_lossy(&e.name)).collect()
+    }
+
+    /// BUG-047 §7.8優先順位: whiteout済みは除外・upper優先・同名upperが無いbaseのみ採用。
+    #[test]
+    fn merge_dir_entries_applies_whiteout_and_upper_priority() {
+        let base = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("only_base.txt"), "b").unwrap();
+        std::fs::write(base.path().join("both.txt"), "base-version").unwrap();
+        std::fs::write(base.path().join("deleted.txt"), "b").unwrap();
+        std::fs::write(upper.path().join("only_upper.txt"), "u").unwrap();
+        std::fs::write(upper.path().join("both.txt"), "upper-version").unwrap();
+
+        let mut deleted = HashSet::new();
+        deleted.insert("deleted.txt".to_string());
+
+        let merged = dir_merge::merge_dir_entries(base.path(), upper.path(), &deleted, "");
+        let mut got = names(&merged);
+        got.sort();
+        assert_eq!(got, vec!["both.txt", "only_base.txt", "only_upper.txt"]);
+        let both = merged.iter().find(|e| String::from_utf16_lossy(&e.name) == "both.txt").unwrap();
+        assert_eq!(both.end_of_file, "upper-version".len() as i64, "upper must win over same-name base");
+    }
+
+    /// セッション中に新規作成（baseには無くupperにのみ存在）したファイルがマージ結果に
+    /// 現れること（BUG-047のユーザー報告シナリオそのもの）。
+    #[test]
+    fn merge_dir_entries_surfaces_session_created_file_missing_from_base() {
+        let base = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(upper.path().join("test.txt"), "new").unwrap();
+
+        let merged = dir_merge::merge_dir_entries(base.path(), upper.path(), &HashSet::new(), "");
+
+        assert_eq!(names(&merged), vec!["test.txt"]);
+    }
+
+    #[test]
+    fn merge_dir_entries_empty_directories_yield_empty_result() {
+        let base = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let merged = dir_merge::merge_dir_entries(base.path(), upper.path(), &HashSet::new(), "");
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn wildcard_match_supports_star_and_question_mark() {
+        assert!(dir_merge::wildcard_match("*", "anything.txt"));
+        assert!(dir_merge::wildcard_match("", "anything.txt"));
+        assert!(dir_merge::wildcard_match("*.txt", "test.txt"));
+        assert!(!dir_merge::wildcard_match("*.txt", "test.ps1"));
+        assert!(dir_merge::wildcard_match("te?t.txt", "test.txt"));
+        assert!(!dir_merge::wildcard_match("te?t.txt", "teXXt.txt"));
+        assert!(dir_merge::wildcard_match("TEST.TXT", "test.txt"), "case-insensitive");
+    }
+
+    /// マーシャルしたバイト列を`FILE_NAMES_INFORMATION`として読み戻し、`NextEntryOffset`の
+    /// チェーンとファイル名が正しく往復することを確認する（Stage 1の最難関部分の検証）。
+    #[test]
+    fn marshal_entries_round_trips_file_names_information() {
+        use windows::Wdk::Storage::FileSystem::{FileNamesInformation, FILE_NAMES_INFORMATION};
+        let base = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(upper.path().join(n), "x").unwrap();
+        }
+        let merged = dir_merge::merge_dir_entries(base.path(), upper.path(), &HashSet::new(), "");
+        assert_eq!(merged.len(), 3);
+
+        let mut buf = vec![0u8; 4096];
+        let (bytes_written, consumed) =
+            dir_merge::marshal_entries(&mut buf, FileNamesInformation, &merged, 0, false);
+        assert_eq!(consumed, 3);
+        assert!(bytes_written > 0 && bytes_written <= buf.len());
+
+        // NextEntryOffsetチェーンを歩いて、書き込んだ3件のファイル名を読み戻す。
+        let mut offset = 0usize;
+        let mut read_names = Vec::new();
+        loop {
+            let ptr = buf[offset..].as_ptr() as *const FILE_NAMES_INFORMATION;
+            let header = unsafe { &*ptr };
+            let name_offset = offset + std::mem::offset_of!(FILE_NAMES_INFORMATION, FileName);
+            let len_u16 = (header.FileNameLength as usize) / 2;
+            let name_bytes = &buf[name_offset..name_offset + header.FileNameLength as usize];
+            let name_u16: Vec<u16> = name_bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            assert_eq!(name_u16.len(), len_u16);
+            read_names.push(String::from_utf16_lossy(&name_u16));
+            if header.NextEntryOffset == 0 {
+                break;
+            }
+            offset += header.NextEntryOffset as usize;
+        }
+        assert_eq!(read_names, vec!["a.txt", "b.txt", "c.txt"]);
+    }
+
+    /// バッファが1件も入らない小ささなら`consumed == 0`（呼び出し元がSTATUS_BUFFER_OVERFLOWへ
+    /// 変換する契約、Stage 1.2の「全件入らない場合」の一番厳しいケース）。
+    #[test]
+    fn marshal_entries_reports_zero_consumed_when_buffer_too_small() {
+        use windows::Wdk::Storage::FileSystem::FileNamesInformation;
+        let base = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(upper.path().join("longer-file-name.txt"), "x").unwrap();
+        let merged = dir_merge::merge_dir_entries(base.path(), upper.path(), &HashSet::new(), "");
+
+        let mut tiny_buf = vec![0u8; 4];
+        let (bytes_written, consumed) =
+            dir_merge::marshal_entries(&mut tiny_buf, FileNamesInformation, &merged, 0, false);
+        assert_eq!(consumed, 0);
+        assert_eq!(bytes_written, 0);
+    }
+
+    /// `return_single_entry`は最大1件だけ書くこと。複数回呼び出し（`start`をずらす）で
+    /// 残りのエントリへページングできること（Stage 1.3のカーソル継続の基礎）。
+    #[test]
+    fn marshal_entries_return_single_entry_and_pagination() {
+        use windows::Wdk::Storage::FileSystem::FileNamesInformation;
+        let base = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        for n in ["a.txt", "b.txt"] {
+            std::fs::write(upper.path().join(n), "x").unwrap();
+        }
+        let merged = dir_merge::merge_dir_entries(base.path(), upper.path(), &HashSet::new(), "");
+
+        let mut buf = vec![0u8; 4096];
+        let (_, consumed_first) =
+            dir_merge::marshal_entries(&mut buf, FileNamesInformation, &merged, 0, true);
+        assert_eq!(consumed_first, 1, "return_single_entry must yield exactly one record");
+
+        let mut buf2 = vec![0u8; 4096];
+        let (_, consumed_rest) =
+            dir_merge::marshal_entries(&mut buf2, FileNamesInformation, &merged, 1, false);
+        assert_eq!(consumed_rest, 1, "continuation from start=1 must yield the remaining entry");
     }
 }

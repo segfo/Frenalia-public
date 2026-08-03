@@ -782,6 +782,156 @@ fn cow_session_is_live(session_id: &str) -> bool {
     harness_sandbox::workspace_ledger::cow_session_is_live(session_id)
 }
 
+/// M（BUG-047回帰）: `ROUND1_SCRIPT`/`ROUND2_SCRIPT`ベースのA〜L系ケースは、いずれもラウンド間で
+/// `apply_cow`（コミット）を挟むため、「セッション中に新規作成したファイルをそのセッション内で
+/// 削除する」経路を一度も通らない。BUG-047はまさにその経路（`NtQueryDirectoryFile`未フックにより
+/// ディレクトリ列挙がupper側だけの新規ファイルを見落とし、`Remove-Item`が「存在しない」と誤判定
+/// する）で発生したため、既存マトリクスでは検出できなかった（ユーザー報告: ハーネス起動後に
+/// 新規作成したファイルを削除しようとすると失敗する。ハーネス起動前から存在するファイルの削除は
+/// 問題なかった——後者は個別パス指定のオープンだけで完結し列挙を経由しないため）。
+/// この1回の`run_shell`セッション内でNew-Item→Test-Path→Remove-Item→Test-Pathまで完結させ、
+/// commit/discardを一切挟まない。
+fn case_m_new_file_created_and_deleted_within_same_cow_session() -> Result<(), String> {
+    let ws = case_dir("cow-m-create-delete-same-session");
+    let before = list_cow_sessions();
+    let script = "$created = Test-Path newfile.txt; \
+New-Item newfile.txt -ItemType File | Out-Null; \
+$existsAfterCreate = Test-Path newfile.txt; \
+try { Remove-Item newfile.txt -ErrorAction Stop; $deleted = $true; $err = $null } \
+catch { $deleted = $false; $err = $_.Exception.Message }; \
+$existsAfterDelete = Test-Path newfile.txt; \
+[pscustomobject]@{ createdBefore = $created; existsAfterCreate = $existsAfterCreate; \
+deleted = $deleted; err = $err; existsAfterDelete = $existsAfterDelete } | ConvertTo-Json -Compress";
+    let run = run_harness(&ws, &run_shell_script_turns(script), &["--cow"], "cow-m");
+    if !run.status.success() {
+        return Err(format!("harness invocation failed: {}", run.stderr));
+    }
+    let session = new_cow_session(&before)?;
+    assert_prompt_sane(&run, &["run_shell"])?;
+
+    let outcome = parse_json_stdout(&run)?;
+    let result_text = outcome["tool_calls"]
+        .get(0)
+        .and_then(|c| c["result"].as_str())
+        .ok_or_else(|| format!("no tool_calls[0].result in outcome: {outcome}"))?;
+    // ネットワーク診断ログ等、無関係な行がstdoutへ混入し得る（実機確認: fake DNSの
+    // 診断行）ため、他ケース（`net_case_matrix`系）と同じく「JSONとして解釈できて
+    // 目的のキーを持つ最後の行」を探す（単純な「最後の非空行」だと診断行を誤って
+    // 拾ってしまう）。
+    let report: serde_json::Value = result_text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|v| v.get("existsAfterDelete").is_some())
+        .ok_or_else(|| format!("could not find the expected JSON summary line in output: {result_text}"))?;
+
+    if report["createdBefore"].as_bool() != Some(false) {
+        return Err(format!("newfile.txt should not exist before New-Item: {report}"));
+    }
+    if report["existsAfterCreate"].as_bool() != Some(true) {
+        return Err(format!("newfile.txt should exist right after New-Item: {report}"));
+    }
+    if report["deleted"].as_bool() != Some(true) {
+        return Err(format!(
+            "Remove-Item on the session-created file must succeed \
+             (BUG-047: it previously failed as ItemNotFoundException because directory \
+             enumeration never saw the upper-only file): {report}"
+        ));
+    }
+    if !report["err"].is_null() {
+        return Err(format!("Remove-Item must not raise an error: {report}"));
+    }
+    if report["existsAfterDelete"].as_bool() != Some(false) {
+        return Err(format!("newfile.txt must be gone after Remove-Item: {report}"));
+    }
+
+    cleanup_on_success(&ws, &[&session], "cow-m");
+    Ok(())
+}
+
+/// N（BUG-048回帰）: `is_write_intent`が`FILE_GENERIC_WRITE`（`SYNCHRONIZE`/`READ_CONTROL`込み）
+/// で判定していたため、`Get-ChildItem`のディレクトリopenや`Get-Content`の読み取りopenまで
+/// 「書込意図あり」と誤判定し、以下のユーザー報告そのものの症状を起こしていた
+/// （`docs/CowIssueSummary.md`）:
+/// - `Get-ChildItem`がworkspace本体ではなくCoW upperの中身だけを返す
+/// - 既存ファイルの読み取り（`Get-Content`）だけで`.harness-cow-ops.jsonl`へ偽の`modify`が
+///   積まれる
+///
+/// このケースは1セッション内で、事前に存在するファイル/サブディレクトリとセッション中に
+/// 新規作成したファイルが同じ`Get-ChildItem`結果に揃って現れること・サブディレクトリの列挙も
+/// 動くこと・純粋な読み取りが台帳を汚さないことを検証する。
+fn case_n_ls_merges_preexisting_and_new_files_read_does_not_dirty_ledger() -> Result<(), String> {
+    let ws = case_dir("cow-n-ls-merge-and-clean-read");
+    std::fs::write(ws.join("seed.txt"), "seed-content").map_err(|e| e.to_string())?;
+    std::fs::create_dir(ws.join("sub")).map_err(|e| e.to_string())?;
+    std::fs::write(ws.join("sub").join("inner.txt"), "inner-content").map_err(|e| e.to_string())?;
+
+    let before = list_cow_sessions();
+    // `Get-Content`の戻り値はPSPath/PSParentPath等のETS(拡張型システム)ノートプロパティ付きの
+    // Stringで、そのままpscustomobjectのプロパティへ入れると`ConvertTo-Json`がノートプロパティ
+    // ごとシリアライズしてしまう（実行して発見したPowerShellの既知の挙動）。`[string]`へ
+    // 明示キャストして生の文字列だけを残す。
+    let script = "New-Item newfile.txt -ItemType File | Out-Null; \
+$names = (Get-ChildItem -Force -Name) -join ','; \
+$subNames = (Get-ChildItem -Force -Name sub) -join ','; \
+$seedContent = [string](Get-Content seed.txt -Raw); \
+[pscustomobject]@{ names = $names; subNames = $subNames; seedContent = $seedContent } \
+| ConvertTo-Json -Compress";
+    let run = run_harness(&ws, &run_shell_script_turns(script), &["--cow"], "cow-n");
+    if !run.status.success() {
+        return Err(format!("harness invocation failed: {}", run.stderr));
+    }
+    let session = new_cow_session(&before)?;
+    assert_prompt_sane(&run, &["run_shell"])?;
+
+    let outcome = parse_json_stdout(&run)?;
+    let result_text = outcome["tool_calls"]
+        .get(0)
+        .and_then(|c| c["result"].as_str())
+        .ok_or_else(|| format!("no tool_calls[0].result in outcome: {outcome}"))?;
+    let report: serde_json::Value = result_text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|v| v.get("names").is_some())
+        .ok_or_else(|| format!("could not find the expected JSON summary line in output: {result_text}"))?;
+
+    let names = report["names"].as_str().unwrap_or_default();
+    let name_list: Vec<&str> = names.split(',').collect();
+    for expected in ["seed.txt", "sub", "newfile.txt"] {
+        if !name_list.contains(&expected) {
+            return Err(format!(
+                "BUG-048: Get-ChildItem must show pre-existing and session-created entries \
+                 together, but {expected:?} is missing from {name_list:?} (report={report})"
+            ));
+        }
+    }
+
+    let sub_names = report["subNames"].as_str().unwrap_or_default();
+    if !sub_names.split(',').any(|n| n == "inner.txt") {
+        return Err(format!(
+            "subdirectory enumeration must show pre-existing file: subNames={sub_names:?} (report={report})"
+        ));
+    }
+
+    let seed_content = report["seedContent"].as_str().unwrap_or_default();
+    if seed_content.trim() != "seed-content" {
+        return Err(format!("Get-Content seed.txt returned unexpected content: {report}"));
+    }
+
+    let ops_path = cow_upper_dir(&session).join(".harness-cow-ops.jsonl");
+    if ops_path.exists() {
+        let ops_text = std::fs::read_to_string(&ops_path).unwrap_or_default();
+        if ops_text.contains("seed.txt") {
+            return Err(format!(
+                "BUG-048: reading seed.txt must not append a fake ledger entry (copy-up on \
+                 read-only open), but ops ledger contains it: {ops_text}"
+            ));
+        }
+    }
+
+    cleanup_on_success(&ws, &[&session], "cow-n");
+    Ok(())
+}
+
 /// `tier2a_cow_commit_matrix`と`tier2a_net_policy_matrix`は同じテストバイナリ内の別々の
 /// `#[test]`関数であり、既定では別スレッドで並行実行される。両者は共有WFPエンジン・
 /// netfilterdの単一インスタンス・`C:\harness-e2e`を奪い合うため、Q5(機構ごとに1テストで
@@ -808,6 +958,14 @@ fn tier2a_cow_commit_matrix() {
         ("J-discard", case_j_discard_removes_all_changes),
         ("K-resolve-auto-merge", case_k_resolve_auto_merges_non_overlapping_conflict),
         ("L-resume-continues-session", case_l_resume_continues_same_cow_session),
+        (
+            "M-create-delete-same-session",
+            case_m_new_file_created_and_deleted_within_same_cow_session,
+        ),
+        (
+            "N-ls-merge-and-clean-read",
+            case_n_ls_merges_preexisting_and_new_files_read_does_not_dirty_ledger,
+        ),
     ];
     let mut passed = 0;
     let total = cases.len();

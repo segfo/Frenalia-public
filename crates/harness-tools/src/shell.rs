@@ -1362,11 +1362,9 @@ mod tests {
     /// （U+FFFD等）せずそのまま返ること。修正前はコンソール既定コードページ（CP932想定）と
     /// われわれの`from_utf8_lossy`読取りが食い違い、非ASCII出力が破壊されていた。
     ///
-    /// **既知の残存限界**: この回帰テストはASCIIのみのコマンド文字列（`Get-Content`）が
-    /// 非ASCIIファイル内容を読み出すケースに限定している。モデルが日本語literalを
-    /// `run_shell`の`command`文字列自体に直接埋め込むケース（例:
-    /// `Write-Output 'こんにちは'`）は別の問題（`-Command -`のstdin経由スクリプト読取り側の
-    /// コードページ）で、実機確認では出力側の修正だけでは直らなかった（`docs/bugs/`参照）。
+    /// これは**出力側**の回帰テスト。コマンド文字列自体に非ASCIIを埋め込む**入力側**は
+    /// [BUG-049](../../docs/bugs/BUG-049.md)で別途修正済み（下の
+    /// `run_shell_executes_command_containing_non_ascii_literal`が回帰テスト）。
     #[cfg(windows)]
     #[tokio::test]
     async fn run_shell_returns_japanese_file_content_without_mojibake() {
@@ -1390,15 +1388,120 @@ mod tests {
         assert!(!out.content.contains('\u{FFFD}'), "{}", out.content);
     }
 
-    // **調査メモ（Phase5-G、`command`文字列自体への日本語literal直接埋め込み）**:
-    // `Write-Output 'こんにちは世界'`のようにモデルが日本語literalを`command`へ直接書く
-    // ケースは、実LMStudio E2E（`huihui-qwen3.6-35b-a3b-claude-4.7-opus-abliterated-mtp`、
-    // Tier1、`docs/bugs/BUG-030.md`参照）で正しく`こんにちは世界`が返ることを確認した。
-    // 一方、同じ入力を`cargo test`経由のユニットテストとして実行すると、`cargo run`で
-    // ビルドした`harness.exe`を直接起動した場合とは異なり毎回確実に文字化けする
-    // （`cargo test`のプロセス起動コンテキスト固有の再現しない挙動、原因未特定）。
-    // 実挙動（E2E）と食い違う不安定なユニットテストを残すよりはbugドキュメントへの記録に
-    // 留める方が誠実と判断し、ここには追加しない。
+    /// BUG-049回帰テスト: モデルが非ASCIIリテラルを`command`文字列**自体**へ書いたとき、
+    /// それがPowerShellへ壊れずに届くこと。修正前は`-Command -`のstdinペイロードをUTF-8で
+    /// 書いていたが、PowerShell 5.1はstdinをコンソール入力コードページ（日本語Windowsでは
+    /// CP932）で復号するため、`Remove-Item 'テスト - コピー.txt'`が
+    /// `繝・せ繝・- 繧ｳ繝斐・.txt`を探しに行き「存在しない」で失敗していた。
+    ///
+    /// ファイル**名**の一致で検証する（`Write-Output`の出力比較ではなく実際のFS解決を通す）ため、
+    /// 非ASCII名のファイルを作って`Test-Path`させる。旧「調査メモ」が指摘していた
+    /// 「`cargo test`経由だと必ず文字化けする」現象は、まさにこの欠陥そのものだった
+    /// （`cargo test`はコンソールを持たない起動コンテキストで`GetConsoleCP()`が異なるため、
+    /// 直接起動時よりも再現しやすかった）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_executes_command_containing_non_ascii_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("テスト - コピー.txt");
+        std::fs::write(&file_path, "x").unwrap();
+        let tool = RunShellTool;
+        // 既存の`run_shell_returns_japanese_file_content_without_mojibake`と同じく絶対パスで
+        // 指定する（相対パス解決はTierごとのcwd事情が混ざるため、ここでは符号化だけを見る）。
+        let out = tool
+            .call(
+                json!({ "command": format!(
+                    "if (Test-Path '{}') {{ Write-Output 'FOUND' }} else {{ Write-Output 'MISSING' }}",
+                    file_path.display()
+                ) }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("FOUND"),
+            "non-ASCII literal in the command must reach PowerShell intact: {}",
+            out.content
+        );
+    }
+
+    /// BUG-050回帰テスト: 絵文字・非BMP文字（`𠮷`）・結合文字（`が`）を含むコマンドが実行できる
+    /// こと。BUG-049修正のコードページ変換方式ではCP932で表現できないこれらの文字は`?`へ
+    /// 潰れていた（ANSIコードページ変換自体を廃止したBUG-050修正で解消）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_executes_command_containing_emoji_and_non_bmp_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = RunShellTool;
+        let out = tool
+            .call(
+                json!({ "command": "Write-Output '🚀 𠮷野家 が'" }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("🚀 𠮷野家 が"), "{}", out.content);
+    }
+
+    /// BUG-050回帰テスト（セキュリティ）: `WideCharToMultiByte`の既定のベストフィット変換は
+    /// CP932下で`¦`(U+00A6)を`|`へ、`¥`(U+00A5)を`\`へ合成する。危険構文検査
+    /// （`contains_chaining_metachar`・`looks_like_allowlist_bypass`）はモデルの元コマンドに
+    /// 対して行われるため、変換後だけメタ文字が現れると検査が素通りになる（BUG-050）。
+    /// コードページ変換自体を廃止したことで、送ったバイト表現がそのままPowerShellへ届き、
+    /// `¦`が`|`に化けないことを確認する。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_does_not_best_fit_convert_broken_bar_into_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = RunShellTool;
+        let out = tool
+            .call(
+                json!({ "command": "Write-Output 'a¦b'" }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("a¦b"),
+            "U+00A6 must not be best-fit-converted into a pipe character: {}",
+            out.content
+        );
+    }
+
+    /// BUG-050回帰テスト: コマンド本体を運ぶ`HARNESS_RUN_SHELL_COMMAND`が、
+    /// ブートストラップスクリプト内の`Remove-Item Env:`で読み取り直後に消え、
+    /// 孫プロセスへ継承されないこと。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_does_not_leak_command_env_var_to_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = RunShellTool;
+        let out = tool
+            .call(
+                json!({ "command": "cmd /c echo [%HARNESS_RUN_SHELL_COMMAND%]" }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("[%HARNESS_RUN_SHELL_COMMAND%]"),
+            "env var must be gone by the time a grandchild reads it (cmd.exe leaves an unexpanded \
+             literal when the variable is undefined): {}",
+            out.content
+        );
+    }
+
+    /// ブートストラップの中身が宣言済みのenv変数名を実際に参照していること（定数の食い違いを
+    /// コンパイル時ではなくテストで固定する。`concat!`は任意のconst文字列を受け付けないため）。
+    #[cfg(windows)]
+    #[test]
+    fn bootstrap_script_references_the_declared_env_var_name() {
+        assert!(RUN_SHELL_BOOTSTRAP_SCRIPT.contains(RUN_SHELL_COMMAND_ENV_VAR));
+    }
 
     #[tokio::test]
     async fn run_shell_times_out() {

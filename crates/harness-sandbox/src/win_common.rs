@@ -237,3 +237,111 @@ pub(crate) fn create_job_object() -> windows::core::Result<HANDLE> {
 }
 
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BUG-051回帰: 妥当なUTF-8（絵文字・非BMP文字含む）はバイト単位で無変更に通ること。
+    #[test]
+    fn decode_console_bytes_keeps_valid_utf8_unchanged() {
+        let s = "ASCII + 日本語 + 🚀 + 𠮷野家\r\n2行目\n";
+        assert_eq!(decode_console_bytes(s.as_bytes()), s);
+    }
+
+    /// BUG-051回帰: 起動直後のANSIコードページ由来の行と、ブートストラップ適用後のUTF-8の行が
+    /// 同一ストリーム内に混在しても、両方とも正しく復元されること。ANSIコードページに依存しない
+    /// 検証にするため、`GetACP()`で符号化した行を使う（このマシンのコードページがCP932でも
+    /// UTF-8(65001)でも成立する）。
+    #[test]
+    fn decode_console_bytes_recovers_mixed_utf8_and_ansi_lines() {
+        let ansi_line = "起動直後のANSI行";
+        let utf8_line = "ブートストラップ後のUTF-8行 🚀";
+        let ansi_bytes = encode_ansi_for_test(ansi_line);
+
+        let mut mixed = Vec::new();
+        mixed.extend_from_slice(&ansi_bytes);
+        mixed.push(b'\n');
+        mixed.extend_from_slice(utf8_line.as_bytes());
+        mixed.push(b'\n');
+
+        let cp = unsafe { windows::Win32::Globalization::GetACP() };
+        if cp == 65001 {
+            // このマシンのANSI CPがUTF-8の場合、ansi_bytes自体がUTF-8になるため
+            // 全体が最初のUTF-8一括デコードで通る（分岐は踏まないが結果は正しい）。
+            assert_eq!(
+                decode_console_bytes(&mixed),
+                format!("{ansi_line}\n{utf8_line}\n")
+            );
+            return;
+        }
+        // 全体を一括UTF-8デコードすると失敗する入力であることを前提として確認する
+        // （さもないと本テストは行単位フォールバック経路を検証できていない）。
+        assert!(std::str::from_utf8(&mixed).is_err());
+        assert_eq!(
+            decode_console_bytes(&mixed),
+            format!("{ansi_line}\n{utf8_line}\n")
+        );
+    }
+
+    /// CRLF・末尾に改行が無い場合の両方で内容が保持されること。
+    #[test]
+    fn decode_console_bytes_preserves_crlf_and_missing_trailing_newline() {
+        let ansi_line = "日本語のみの1行（末尾改行なし）";
+        let bytes = encode_ansi_for_test(ansi_line);
+        let cp = unsafe { windows::Win32::Globalization::GetACP() };
+        if cp == 65001 {
+            assert_eq!(decode_console_bytes(&bytes), ansi_line);
+            return;
+        }
+        assert_eq!(decode_console_bytes(&bytes), ansi_line);
+
+        let crlf = "行1\r\n行2\r\n".to_string().into_bytes();
+        assert_eq!(decode_console_bytes(&crlf), "行1\r\n行2\r\n");
+    }
+
+    /// UTF-8としてもANSIコードページとしても復号できない極端なバイト列でpanicせず、
+    /// `U+FFFD`を含む文字列へ安全に退避すること。
+    #[test]
+    fn decode_console_bytes_does_not_panic_on_undecodable_bytes() {
+        let bytes = vec![0xFFu8, 0xFE, 0x00, 0x01, 0x0A, 0x80, 0x81];
+        let out = decode_console_bytes(&bytes);
+        assert!(!out.is_empty() || bytes.is_empty());
+    }
+
+    #[test]
+    fn decode_console_bytes_handles_empty_input() {
+        assert_eq!(decode_console_bytes(&[]), "");
+    }
+
+    /// テスト専用: `str`を現在のANSIコードページ（`GetACP()`）でエンコードする
+    /// （`encode_console_bytes`の逆写像に相当するが、対称性検証のためテストだけに持つ）。
+    fn encode_ansi_for_test(s: &str) -> Vec<u8> {
+        let cp = unsafe { windows::Win32::Globalization::GetACP() };
+        let utf16: Vec<u16> = s.encode_utf16().collect();
+        let needed = unsafe {
+            windows::Win32::Globalization::WideCharToMultiByte(
+                cp,
+                windows::Win32::Globalization::WC_NO_BEST_FIT_CHARS,
+                &utf16,
+                None,
+                windows::core::PCSTR::null(),
+                None,
+            )
+        };
+        assert!(needed > 0, "WideCharToMultiByte(needed) failed for {s:?}");
+        let mut buf = vec![0u8; needed as usize];
+        let written = unsafe {
+            windows::Win32::Globalization::WideCharToMultiByte(
+                cp,
+                windows::Win32::Globalization::WC_NO_BEST_FIT_CHARS,
+                &utf16,
+                Some(&mut buf),
+                windows::core::PCSTR::null(),
+                None,
+            )
+        };
+        assert!(written > 0, "WideCharToMultiByte(write) failed for {s:?}");
+        buf.truncate(written as usize);
+        buf
+    }
+}
