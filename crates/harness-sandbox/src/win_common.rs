@@ -48,6 +48,51 @@ pub(crate) fn pwstr_to_string(p: windows::core::PWSTR) -> String {
     unsafe { p.to_string().unwrap_or_default() }
 }
 
+/// SIDのバイト列コピー。Win32が返すSIDは呼び出し側で解放規則が異なる（`FreeSid`/`LocalFree`/
+/// 配列ごと解放）ため、**中身をコピーして所有権を単純化する**。`loopback_exemption`（exemption
+/// 一覧から読み出したSID）と`win_appcontainer`（capability SID）が共有する（規則5）。
+///
+/// `pub`なのは、`traverse_capability_sid`の戻り値としてクレート外（`harness-cli`の
+/// `harness fs grant-traverse`）まで届くため（`docs/CODE-STRUCTURE-RULES.md`規則4）。
+#[derive(Debug, Clone)]
+pub struct OwnedSid {
+    bytes: Vec<u8>,
+}
+
+impl OwnedSid {
+    /// # Safety
+    /// `sid`は有効なSIDを指していること。
+    pub unsafe fn copy_from(
+        sid: windows::Win32::Security::PSID,
+    ) -> windows::core::Result<Self> {
+        use windows::Win32::Security::{CopySid, GetLengthSid, PSID};
+        let len = GetLengthSid(sid);
+        if len == 0 {
+            return Err(windows::core::Error::from_win32());
+        }
+        let mut bytes = vec![0u8; len as usize];
+        CopySid(len, PSID(bytes.as_mut_ptr() as *mut _), sid)?;
+        Ok(Self { bytes })
+    }
+
+    pub fn as_psid(&self) -> windows::Win32::Security::PSID {
+        windows::Win32::Security::PSID(self.bytes.as_ptr() as *mut _)
+    }
+}
+
+/// SIDを文字列表現（`S-1-5-21-...`）へ変換する。`win_pipe_ipc`（パイプDACL用のユーザSID）と
+/// `tier2a::loopback_exemption`（台帳の鍵にするpackage SID）が共有する。
+pub(crate) fn sid_to_string(sid: windows::Win32::Security::PSID) -> windows::core::Result<String> {
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    unsafe {
+        let mut sid_str_ptr = windows::core::PWSTR::null();
+        ConvertSidToStringSidW(sid, &mut sid_str_ptr)?;
+        let sid_str = pwstr_to_string(sid_str_ptr);
+        let _ = LocalFree(HLOCAL(sid_str_ptr.0 as *mut _));
+        Ok(sid_str)
+    }
+}
+
 /// `CreatePipe`の`bInheritHandle=TRUE`は両端を継承可能にする。子へ渡さない側（親が保持し続ける側）
 /// を継承不可へ戻さないと、子が余分な複製ハンドルを継承してしまい、親が閉じてもEOFにならず
 /// 子が永久にハングする（BUG-004、MSDN「Creating a Child Process with Redirected Input and
@@ -238,6 +283,44 @@ pub(crate) fn create_job_object() -> windows::core::Result<HANDLE> {
     }
 }
 
+// --- 名前付きmutexによる「そのプロセスはまだ生きているか」の表明・確認 ---
+//
+// プロセスIDを記録して自分でliveness確認する方式ではなく、名前付きmutexを使う。作成した
+// プロセスが（正常終了でもクラッシュでも）いなくなるとWindows自身がオブジェクトを破棄する
+// ため、`OpenMutexW`で聞くだけで生存確認ができる。`workspace_ledger`（workspaceモード/CoW
+// セッションの生存）と`loopback_exemption`（exemptionの所有者の生存）が共有する
+// （`docs/CODE-STRUCTURE-RULES.md`規則5）。
+
+/// `name`という名前付きmutexが現在誰かに保持されているか（＝生きたプロセスが存在するか）。
+pub(crate) fn mutex_exists(name: &str) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    let wide = wide(name);
+    unsafe {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(wide.as_ptr())) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// `name`という名前付きmutexを作成（既に存在すれば単にハンドルを開くだけ）し、
+/// **意図的に`CloseHandle`しない**。生のWin32 `HANDLE`はDropで自動closeされないため、
+/// この関数を抜けた後もハンドルはプロセスが終了するまで有効なまま残る。プロセスが
+/// 正常終了・クラッシュのいずれで消えても、Windowsがこのハンドルを自動的に閉じ、
+/// 参照が0になったオブジェクト自体も破棄される——それが「このモード/セッション/所有者は
+/// もう生きていない」という合図になる。
+pub(crate) fn hold_mutex_for_process_lifetime(name: &str) -> windows::core::Result<()> {
+    use windows::Win32::System::Threading::CreateMutexW;
+    let wide = wide(name);
+    unsafe {
+        CreateMutexW(None, false, PCWSTR(wide.as_ptr()))?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

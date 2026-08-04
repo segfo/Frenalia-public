@@ -44,13 +44,34 @@ fn appcontainer_pipe(sid: PSID) -> windows::core::Result<(HANDLE, HANDLE)> {
 /// D-30: Redirector DLL（`harness-redirector.dll`）のパス。`harness-privhelper.exe`と同じ規約
 /// （`privhelper::helper_exe_path`）で、本体exeと同じディレクトリから探す。cdylibの出力
 /// ファイル名はパッケージ名のハイフンをアンダースコアへ変換した`harness_redirector.dll`。
-fn redirector_dll_path() -> Result<PathBuf, AppContainerError> {
+pub(crate) fn redirector_dll_path() -> Result<PathBuf, AppContainerError> {
     let current = std::env::current_exe()
         .map_err(|e| AppContainerError::Win32(format!("current_exe: {e}")))?;
     let dir = current.parent().ok_or_else(|| {
         AppContainerError::Win32("current_exe has no parent directory".to_string())
     })?;
     Ok(dir.join("harness_redirector.dll"))
+}
+
+/// D-37: サンドボックスの子プロセスが`LoadLibraryW`で読み込むRedirector DLL（x64と、WOW64孫
+/// 向けのx86）のパス。**実在するものだけ**を返す。
+///
+/// 共有package SIDだった頃は、リポジトリroot（＝workspace）への継承ACEがたまたま
+/// `target/debug/*.dll`まで覆っていたため明示的な付与が不要だった。セッションごとにSIDが
+/// 変わる今は、そのセッションのSIDへ読取+実行を明示的に与えないと注入が失敗し、`--cow`の
+/// 書込が（境界＝ACLは効いたまま）透過的にupperへ落ちなくなる。
+pub(crate) fn redirector_dll_paths() -> Vec<PathBuf> {
+    let Ok(x64) = redirector_dll_path() else {
+        return Vec::new();
+    };
+    let x86 = x64
+        .parent()
+        .map(|dir| dir.join("harness_redirector_x86.dll"));
+    [Some(x64), x86]
+        .into_iter()
+        .flatten()
+        .filter(|p| p.exists())
+        .collect()
 }
 
 /// D-30: suspended状態の`process`へRedirector DLLを注入する（設計書§10.2手順8-9）。
@@ -314,9 +335,30 @@ pub fn spawn(
     net: NetworkCapability,
     cow: Option<CowInject<'_>>,
 ) -> Result<AppContainerChild, AppContainerError> {
+    const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+
+    // D-37: package SIDはセッションごとに変わるが、祖先ディレクトリのtraverse ACEは
+    // harness共通のcapability SID宛に一度だけ付与してある。そのcapabilityを常にトークンへ
+    // 積む（これが無いと、新しいセッションのpackage SIDでは祖先を辿れずFS I/Oが落ちる）。
+    // networkのcapability（`internetClient`）とは目的も寿命も直交する。
+    let traverse_cap = super::traverse_capability_sid()?;
+    let mut capabilities = vec![SID_AND_ATTRIBUTES {
+        Sid: traverse_cap.as_psid(),
+        Attributes: SE_GROUP_ENABLED,
+    }];
+
     match net {
         NetworkCapability::Deny => {
-            spawn_impl(exe, args, cwd, env, want_stdin, container_sid, &[], cow)
+            spawn_impl(
+                exe,
+                args,
+                cwd,
+                env,
+                want_stdin,
+                container_sid,
+                &capabilities,
+                cow,
+            )
         }
         NetworkCapability::InternetClient => unsafe {
             let mut cap_sid = PSID::default();
@@ -324,10 +366,10 @@ pub fn spawn(
             ConvertStringSidToSidW(PCWSTR(sid_str.as_ptr()), &mut cap_sid).map_err(|e| {
                 AppContainerError::Win32(format!("ConvertStringSidToSidW(internetClient): {e}"))
             })?;
-            let capabilities = [SID_AND_ATTRIBUTES {
+            capabilities.push(SID_AND_ATTRIBUTES {
                 Sid: cap_sid,
-                Attributes: 0x0000_0004, // SE_GROUP_ENABLED
-            }];
+                Attributes: SE_GROUP_ENABLED,
+            });
             let result = spawn_impl(
                 exe,
                 args,

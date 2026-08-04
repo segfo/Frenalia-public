@@ -146,10 +146,7 @@ impl Executor for PhaseExecutor {
                     },
                     decision: ToolCallDecision::Executed,
                 };
-                RawTurnResult::Completed(turn(
-                    text.unwrap_or_default().to_string(),
-                    vec![call],
-                ))
+                RawTurnResult::Completed(turn(text.unwrap_or_default().to_string(), vec![call]))
             }
             Reply::CancelledMidStream => RawTurnResult::CancelledMidStream,
             Reply::Error => {

@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use windows::core::GUID;
-use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0,
     FwpmFilterCreateEnumHandle0, FwpmFilterDeleteById0, FwpmFilterDestroyEnumHandle0,
@@ -40,18 +40,50 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_MATCH_EQUAL, FWP_SID, FWP_UINT16, FWP_UINT32, FWP_UINT64, FWP_UINT8, FWP_V4_ADDR_AND_MASK,
     FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
 };
-use windows::Win32::NetworkManagement::WindowsFirewall::{
-    NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
-};
-use windows::Win32::Security::{
-    CopySid, EqualSid, GetLengthSid, PSECURITY_DESCRIPTOR, PSID, SID, SID_AND_ATTRIBUTES,
-};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, PSID, SID};
 
-/// harness専用のWFPプロバイダ・サブレイヤーGUID（固定、仕様書§4.2）。他プロバイダとの
-/// 名前衝突を避けるため、この2値は将来も変更しない（変更するとteardown時に旧オブジェクトが
-/// 孤立フィルタとして残るリスクがある）。
-const PROVIDER_KEY: GUID = GUID::from_u128(0x8f2c1a90_5e4b_4b8a_9c3d_1a2b3c4d5e6f);
-const SUBLAYER_KEY: GUID = GUID::from_u128(0x8f2c1a91_5e4b_4b8a_9c3d_1a2b3c4d5e6f);
+use crate::tier2a::loopback_exemption::{self, LoopbackExemptionGuard};
+
+/// harness専用のWFPプロバイダ・サブレイヤーGUIDの**名前空間**（固定、仕様書§4.2）。
+///
+/// この2値そのものをキーとして使っていた頃は、2セッション目の`apply`が
+/// `cleanup_stale_objects`で**先行セッションのフィルタを全削除**し、後発が終了すると先行が
+/// `internetClient`を持ったままdefault-denyだけ失う（fail-open）という欠陥があった
+/// （実機で再現・`docs/STATUS.md`旧Tier2a残課題#8）。D-37でpackage SIDがセッション単位に
+/// なったのに合わせ、**キー自体もセッション単位に導出する**。上位96bitを固定して
+/// 「harnessのオブジェクトである」ことは判別可能なまま、下位32bitへセッション固有値を混ぜる。
+const PROVIDER_KEY_NAMESPACE: u128 = 0x8f2c1a90_5e4b_4b8a_9c3d_1a2b00000000;
+const SUBLAYER_KEY_NAMESPACE: u128 = 0x8f2c1a91_5e4b_4b8a_9c3d_1a2b00000000;
+
+/// セッション固有値。**フィルタを条件付けるのと同じ識別子（セッションプロファイル名）から
+/// 決定論的に導出する**——`apply`と`teardown`が同じキーを見る必要があり、かつ別セッションとは
+/// 必ず違う値でなければならないため、乱数でもプロセス固有値でもなく名前のハッシュを使う
+/// （`netfilterd`はセッションごとに別プロセスだが、キーの根拠をデーモン側のプロセスIDに
+/// 置くと「なぜ衝突しないのか」がフィルタの意味と結びつかなくなる）。
+fn session_key_suffix(session_profile: &str) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_profile.hash(&mut hasher);
+    // 0は「名前空間そのもの」と紛らわしいので避ける。
+    (hasher.finish() as u32) | 1
+}
+
+/// 1セッション分のWFPオブジェクトキー。`apply`が決めて`WfpSession`が持ち続ける。
+#[derive(Debug, Clone, Copy)]
+struct SessionKeys {
+    provider: GUID,
+    sublayer: GUID,
+}
+
+impl SessionKeys {
+    fn for_session(session_profile: &str) -> Self {
+        let suffix = session_key_suffix(session_profile) as u128;
+        Self {
+            provider: GUID::from_u128(PROVIDER_KEY_NAMESPACE | suffix),
+            sublayer: GUID::from_u128(SUBLAYER_KEY_NAMESPACE | suffix),
+        }
+    }
+}
 
 /// サブレイヤー内でのweight（仕様書§4.5）。許可ルールは拒否ルールより高い値にする。
 const WEIGHT_ALLOW: u64 = 0xF00;
@@ -96,6 +128,9 @@ fn check(status: u32, op: &str) -> Result<(), WfpError> {
 /// 両型から削除した（`docs/STATUS.md`参照）。
 #[derive(Debug, Clone, Default)]
 pub struct WfpOptions {
+    /// このWFPセッションが属するharnessセッションのプロファイル名（D-37）。フィルタを
+    /// 条件付けるpackage SIDと、プロバイダ/サブレイヤーGUIDの導出元を兼ねる。
+    pub session_profile: String,
     /// TCPで許可するloopback宛先ポート。Local Proxy AgentとFake DNS TCPをここへ入れる。
     pub allow_loopback_tcp_ports: Vec<u16>,
     /// UDPで許可するloopback宛先ポート。Fake DNS UDPをここへ入れる。
@@ -107,10 +142,11 @@ pub struct WfpOptions {
 /// 適用済みWFPセッション。`teardown`を呼ぶまでエンジンハンドルを保持し続ける
 /// （＝フィルタが有効であり続ける、DYNAMICセッションの性質そのもの）。
 pub struct WfpSession {
+    keys: SessionKeys,
     engine: HANDLE,
     event_subscription: Option<HANDLE>,
     audit_context: Option<*mut WfpAuditSink>,
-    loopback_exemption: Option<LoopbackExemption>,
+    loopback_exemption: Option<LoopbackExemptionGuard>,
 }
 
 // HANDLEは値として複数スレッド間で運んでよい（他の`win_*`モジュールと同じ扱い）。
@@ -119,36 +155,6 @@ unsafe impl Send for WfpSession {}
 #[derive(Debug)]
 struct WfpAuditSink {
     path: PathBuf,
-}
-
-#[derive(Debug)]
-struct OwnedSid {
-    bytes: Vec<u8>,
-}
-
-impl OwnedSid {
-    unsafe fn copy_from(sid: PSID) -> Result<Self, WfpError> {
-        let len = GetLengthSid(sid);
-        if len == 0 {
-            return Err(WfpError::LoopbackExemption(
-                "GetLengthSid returned zero".to_string(),
-            ));
-        }
-        let mut bytes = vec![0u8; len as usize];
-        CopySid(len, PSID(bytes.as_mut_ptr() as *mut _), sid).map_err(|e| {
-            WfpError::LoopbackExemption(format!("CopySid failed while copying SID: {e}"))
-        })?;
-        Ok(Self { bytes })
-    }
-
-    fn as_psid(&self) -> PSID {
-        PSID(self.bytes.as_ptr() as *mut _)
-    }
-}
-
-#[derive(Debug)]
-struct LoopbackExemption {
-    sid: OwnedSid,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,71 +268,16 @@ fn now_unix_ms() -> u128 {
         .as_millis()
 }
 
-unsafe fn sid_equals(left: PSID, right: PSID) -> bool {
-    EqualSid(left, right).is_ok()
+/// loopback exemptionの確保（D-36）。「既に載っていれば何もしない／自分が載せた場合だけ外す」
+/// というプロセスローカルな判断は、複数セッションが同一のpackage SIDを共有する構造では成立
+/// しない（BUG-053）。所有権は[`crate::tier2a::loopback_exemption`]の台帳が持つ。
+fn ensure_loopback_exemption(container_sid: PSID) -> Result<LoopbackExemptionGuard, WfpError> {
+    loopback_exemption::acquire(container_sid)
+        .map_err(|e| WfpError::LoopbackExemption(e.to_string()))
 }
 
-unsafe fn current_loopback_exemptions() -> Result<Vec<OwnedSid>, WfpError> {
-    let mut count = 0u32;
-    let mut raw: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
-    let status = NetworkIsolationGetAppContainerConfig(&mut count, &mut raw);
-    if status != 0 {
-        return Err(WfpError::LoopbackExemption(format!(
-            "NetworkIsolationGetAppContainerConfig failed with Win32 status {status}"
-        )));
-    }
-
-    let mut sids = Vec::new();
-    if !raw.is_null() {
-        let slice = std::slice::from_raw_parts(raw, count as usize);
-        for entry in slice {
-            sids.push(OwnedSid::copy_from(entry.Sid)?);
-        }
-        let _ = LocalFree(HLOCAL(raw as *mut c_void));
-    }
-    Ok(sids)
-}
-
-unsafe fn set_loopback_exemptions(sids: &[OwnedSid]) -> Result<(), WfpError> {
-    let entries: Vec<SID_AND_ATTRIBUTES> = sids
-        .iter()
-        .map(|sid| SID_AND_ATTRIBUTES {
-            Sid: sid.as_psid(),
-            Attributes: 0,
-        })
-        .collect();
-    let status = NetworkIsolationSetAppContainerConfig(&entries);
-    if status != 0 {
-        return Err(WfpError::LoopbackExemption(format!(
-            "NetworkIsolationSetAppContainerConfig failed with Win32 status {status}"
-        )));
-    }
-    Ok(())
-}
-
-fn ensure_loopback_exemption(container_sid: PSID) -> Result<Option<LoopbackExemption>, WfpError> {
-    unsafe {
-        let mut current = current_loopback_exemptions()?;
-        if current
-            .iter()
-            .any(|existing| sid_equals(existing.as_psid(), container_sid))
-        {
-            return Ok(None);
-        }
-
-        let sid = OwnedSid::copy_from(container_sid)?;
-        current.push(OwnedSid::copy_from(container_sid)?);
-        set_loopback_exemptions(&current)?;
-        Ok(Some(LoopbackExemption { sid }))
-    }
-}
-
-fn remove_loopback_exemption(exemption: LoopbackExemption) -> Result<(), WfpError> {
-    unsafe {
-        let mut current = current_loopback_exemptions()?;
-        current.retain(|existing| !sid_equals(existing.as_psid(), exemption.sid.as_psid()));
-        set_loopback_exemptions(&current)
-    }
+fn remove_loopback_exemption(guard: LoopbackExemptionGuard) -> Result<(), WfpError> {
+    loopback_exemption::release(guard).map_err(|e| WfpError::LoopbackExemption(e.to_string()))
 }
 
 impl WfpSession {
@@ -336,7 +287,8 @@ impl WfpSession {
             return Err(WfpError::NoAddressesResolved);
         }
 
-        cleanup_stale_objects();
+        let keys = SessionKeys::for_session(&opts.session_profile);
+        cleanup_stale_objects(keys);
         let engine = open_dynamic_engine()?;
 
         let result = (|| -> Result<(), WfpError> {
@@ -344,7 +296,7 @@ impl WfpSession {
                 check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             }
 
-            let txn_result = apply_within_transaction(engine, container_sid, opts);
+            let txn_result = apply_within_transaction(engine, container_sid, opts, keys);
 
             unsafe {
                 match &txn_result {
@@ -361,7 +313,7 @@ impl WfpSession {
         match result {
             Ok(()) => {
                 let loopback_exemption = match ensure_loopback_exemption(container_sid) {
-                    Ok(exemption) => exemption,
+                    Ok(guard) => Some(guard),
                     Err(e) => {
                         unsafe {
                             let _ = FwpmEngineClose0(engine);
@@ -372,6 +324,7 @@ impl WfpSession {
                 let (event_subscription, audit_context) =
                     start_wfp_drop_audit(engine, opts.audit_log_path.clone());
                 Ok(WfpSession {
+                    keys,
                     engine,
                     event_subscription,
                     audit_context,
@@ -391,6 +344,7 @@ impl WfpSession {
     /// （仕様書§5.5正常系）。呼び出し後、`self`は消費される。
     pub fn teardown(mut self) -> Result<(), WfpError> {
         let engine = self.engine;
+        let keys = self.keys;
         let event_subscription = self.event_subscription;
         let audit_context = self.audit_context;
         let loopback_exemption = self.loopback_exemption.take();
@@ -409,8 +363,8 @@ impl WfpSession {
                 // 前に個別削除するのが本来だが、本ラウンドはフィルタIDを保持していないため、
                 // サブレイヤー・プロバイダの削除のみ行う。DYNAMICセッションではエンジンクローズ時に
                 // 残りのフィルタもBFEにより自動削除される（付録A #1、フェイルセーフとして機能する）。
-                let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_KEY as *const GUID);
-                let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_KEY as *const GUID);
+                let _ = FwpmSubLayerDeleteByKey0(engine, &keys.sublayer as *const GUID);
+                let _ = FwpmProviderDeleteByKey0(engine, &keys.provider as *const GUID);
             }
             unsafe {
                 check(
@@ -543,7 +497,7 @@ fn open_dynamic_engine() -> Result<HANDLE, WfpError> {
     }
 }
 
-fn cleanup_stale_objects() {
+fn cleanup_stale_objects(keys: SessionKeys) {
     unsafe {
         let mut engine = HANDLE::default();
         let status = FwpmEngineOpen0(
@@ -557,14 +511,14 @@ fn cleanup_stale_objects() {
             return;
         }
 
-        delete_filters_in_own_sublayer(engine);
-        let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_KEY as *const GUID);
-        let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_KEY as *const GUID);
+        delete_filters_in_own_sublayer(engine, keys);
+        let _ = FwpmSubLayerDeleteByKey0(engine, &keys.sublayer as *const GUID);
+        let _ = FwpmProviderDeleteByKey0(engine, &keys.provider as *const GUID);
         let _ = FwpmEngineClose0(engine);
     }
 }
 
-unsafe fn delete_filters_in_own_sublayer(engine: HANDLE) {
+unsafe fn delete_filters_in_own_sublayer(engine: HANDLE, keys: SessionKeys) {
     let mut enum_handle = HANDLE::default();
     if FwpmFilterCreateEnumHandle0(engine, None, &mut enum_handle) != 0 {
         return;
@@ -588,7 +542,7 @@ unsafe fn delete_filters_in_own_sublayer(engine: HANDLE) {
                 continue;
             }
             let filter = &**filter_ptr;
-            if filter.subLayerKey == SUBLAYER_KEY {
+            if filter.subLayerKey == keys.sublayer {
                 let _ = FwpmFilterDeleteById0(engine, filter.filterId);
             }
         }
@@ -604,11 +558,12 @@ fn apply_within_transaction(
     engine: HANDLE,
     container_sid: PSID,
     opts: &WfpOptions,
+    keys: SessionKeys,
 ) -> Result<(), WfpError> {
     unsafe {
         // 1. プロバイダ登録。
         let provider = FWPM_PROVIDER0 {
-            providerKey: PROVIDER_KEY,
+            providerKey: keys.provider,
             displayData: display_data("harness netfilterd", "harness WFP egress guard (Layer2)"),
             ..Default::default()
         };
@@ -622,9 +577,9 @@ fn apply_within_transaction(
         )?;
 
         // 2. サブレイヤー登録。
-        let mut provider_key_for_sublayer = PROVIDER_KEY;
+        let mut provider_key_for_sublayer = keys.provider;
         let sublayer = FWPM_SUBLAYER0 {
-            subLayerKey: SUBLAYER_KEY,
+            subLayerKey: keys.sublayer,
             displayData: display_data("harness netfilterd", "harness WFP egress guard sublayer"),
             providerKey: &mut provider_key_for_sublayer as *mut GUID,
             weight: 0x100,
@@ -640,8 +595,8 @@ fn apply_within_transaction(
         )?;
 
         // 3. デフォルト拒否フィルタ（v4/v6両方）。
-        add_default_deny_filter(engine, container_sid, FWPM_LAYER_ALE_AUTH_CONNECT_V4)?;
-        add_default_deny_filter(engine, container_sid, FWPM_LAYER_ALE_AUTH_CONNECT_V6)?;
+        add_default_deny_filter(engine, container_sid, FWPM_LAYER_ALE_AUTH_CONNECT_V4, keys)?;
+        add_default_deny_filter(engine, container_sid, FWPM_LAYER_ALE_AUTH_CONNECT_V6, keys)?;
 
         // 4. ループバック許可（任意）。Proxy/Fake DNSの待受だけを開けるため、
         // v1ではポート指定の限定allowだけを張る。
@@ -652,12 +607,12 @@ fn apply_within_transaction(
         udp_ports.sort_unstable();
         udp_ports.dedup();
         if !tcp_ports.is_empty() {
-            add_allow_v4_loopback_ports_filter(engine, container_sid, &tcp_ports, 6)?;
-            add_allow_v6_loopback_ports_filter(engine, container_sid, &tcp_ports, 6)?;
+            add_allow_v4_loopback_ports_filter(engine, container_sid, &tcp_ports, 6, keys)?;
+            add_allow_v6_loopback_ports_filter(engine, container_sid, &tcp_ports, 6, keys)?;
         }
         if !udp_ports.is_empty() {
-            add_allow_v4_loopback_ports_filter(engine, container_sid, &udp_ports, 17)?;
-            add_allow_v6_loopback_ports_filter(engine, container_sid, &udp_ports, 17)?;
+            add_allow_v4_loopback_ports_filter(engine, container_sid, &udp_ports, 17, keys)?;
+            add_allow_v6_loopback_ports_filter(engine, container_sid, &udp_ports, 17, keys)?;
         }
     }
     Ok(())
@@ -696,10 +651,11 @@ unsafe fn add_default_deny_filter(
     engine: HANDLE,
     container_sid: PSID,
     layer: GUID,
+    keys: SessionKeys,
 ) -> Result<(), WfpError> {
     let mut weight_value = WEIGHT_DENY;
     let condition = package_id_condition(container_sid);
-    let mut provider_key = PROVIDER_KEY;
+    let mut provider_key_value = keys.provider;
     let filter = FWPM_FILTER0 {
         filterKey: GUID::new().map_err(WfpError::from)?,
         displayData: display_data(
@@ -707,9 +663,9 @@ unsafe fn add_default_deny_filter(
             "AppContainer SID scoped default deny",
         ),
         flags: FWPM_FILTER_FLAG_NONE,
-        providerKey: &mut provider_key as *mut GUID,
+        providerKey: &mut provider_key_value as *mut GUID,
         layerKey: layer,
-        subLayerKey: SUBLAYER_KEY,
+        subLayerKey: keys.sublayer,
         weight: FWP_VALUE0 {
             r#type: FWP_UINT64,
             Anonymous: FWP_VALUE0_0 {
@@ -742,13 +698,14 @@ unsafe fn add_allow_v4_loopback_ports_filter(
     container_sid: PSID,
     ports: &[u16],
     protocol: u8,
+    keys: SessionKeys,
 ) -> Result<(), WfpError> {
     let loopback = FWP_V4_ADDR_AND_MASK {
         addr: u32::from(std::net::Ipv4Addr::LOCALHOST),
         mask: u32::MAX,
     };
     let mut conditions = loopback_port_conditions_v4(container_sid, &loopback, ports, protocol);
-    add_allow_filter(engine, FWPM_LAYER_ALE_AUTH_CONNECT_V4, &mut conditions)
+    add_allow_filter(engine, FWPM_LAYER_ALE_AUTH_CONNECT_V4, &mut conditions, keys)
 }
 
 unsafe fn add_allow_v6_loopback_ports_filter(
@@ -756,13 +713,14 @@ unsafe fn add_allow_v6_loopback_ports_filter(
     container_sid: PSID,
     ports: &[u16],
     protocol: u8,
+    keys: SessionKeys,
 ) -> Result<(), WfpError> {
     let loopback = FWP_V6_ADDR_AND_MASK {
         addr: std::net::Ipv6Addr::LOCALHOST.octets(),
         prefixLength: 128,
     };
     let mut conditions = loopback_port_conditions_v6(container_sid, &loopback, ports, protocol);
-    add_allow_filter(engine, FWPM_LAYER_ALE_AUTH_CONNECT_V6, &mut conditions)
+    add_allow_filter(engine, FWPM_LAYER_ALE_AUTH_CONNECT_V6, &mut conditions, keys)
 }
 
 unsafe fn loopback_port_conditions_v4(
@@ -840,16 +798,17 @@ unsafe fn add_allow_filter(
     engine: HANDLE,
     layer: GUID,
     conditions: &mut [FWPM_FILTER_CONDITION0],
+    keys: SessionKeys,
 ) -> Result<(), WfpError> {
     let mut weight_value = WEIGHT_ALLOW;
-    let mut provider_key = PROVIDER_KEY;
+    let mut provider_key_value = keys.provider;
     let filter = FWPM_FILTER0 {
         filterKey: GUID::new().map_err(WfpError::from)?,
         displayData: display_data("harness allow", "harness WFP egress allow-list entry"),
         flags: FWPM_FILTER_FLAG_NONE,
-        providerKey: &mut provider_key as *mut GUID,
+        providerKey: &mut provider_key_value as *mut GUID,
         layerKey: layer,
-        subLayerKey: SUBLAYER_KEY,
+        subLayerKey: keys.sublayer,
         weight: FWP_VALUE0 {
             r#type: FWP_UINT64,
             Anonymous: FWP_VALUE0_0 {
@@ -881,18 +840,39 @@ unsafe fn add_allow_filter(
 mod tests {
     use super::*;
 
-    /// 実際のWFP呼び出し(要管理者権限・BFE)は行わず、GUID定数・weight値が期待通りの
-    /// 形であることだけを確認する(実機WFP検証は`netfilterd`の手動E2Eで行う)。
+    /// 実際のWFP呼び出し(要管理者権限・BFE)は行わず、GUIDの形だけを確認する
+    /// (実機WFP検証は`netfilterd`の手動E2Eで行う)。
+    ///
+    /// D-37でキーはセッション単位になった。**プロセス内では安定**（`apply`と`teardown`が
+    /// 同じキーを見る必要がある）かつ**プロバイダとサブレイヤーは別値**、そして
+    /// **上位96bitは名前空間として固定**（harnessのオブジェクトだと判別できる）ことを固定する。
     #[test]
-    fn provider_and_sublayer_keys_are_distinct_and_stable() {
-        assert_ne!(PROVIDER_KEY, SUBLAYER_KEY);
+    fn provider_and_sublayer_keys_are_distinct_stable_and_namespaced() {
+        let keys = SessionKeys::for_session("harness.shell.sandbox.1-100");
+        assert_ne!(keys.provider, keys.sublayer);
         assert_eq!(
-            PROVIDER_KEY,
-            GUID::from_u128(0x8f2c1a90_5e4b_4b8a_9c3d_1a2b3c4d5e6f)
+            keys.provider,
+            SessionKeys::for_session("harness.shell.sandbox.1-100").provider,
+            "同じセッションなら同じキー（applyとteardownが一致する必要がある）"
         );
+
+        const NAMESPACE_MASK: u128 = !0xFFFF_FFFFu128;
+        assert_eq!(keys.provider.to_u128() & NAMESPACE_MASK, PROVIDER_KEY_NAMESPACE);
+        assert_eq!(keys.sublayer.to_u128() & NAMESPACE_MASK, SUBLAYER_KEY_NAMESPACE);
+    }
+
+    /// セッション（プロファイル名）が違えばキーも違う。これが#8（後発の`apply`が先行の
+    /// フィルタを消す）を構造的に閉じている根拠なので、名前→キーの写像を直接固定する。
+    #[test]
+    fn different_sessions_get_different_keys() {
+        let a = SessionKeys::for_session("harness.shell.sandbox.1-100");
+        let b = SessionKeys::for_session("harness.shell.sandbox.2-100");
+        assert_ne!(a.provider, b.provider);
+        assert_ne!(a.sublayer, b.sublayer);
         assert_eq!(
-            SUBLAYER_KEY,
-            GUID::from_u128(0x8f2c1a91_5e4b_4b8a_9c3d_1a2b3c4d5e6f)
+            session_key_suffix("harness.shell.sandbox.1-100") & 1,
+            1,
+            "0にはしない（名前空間そのものと紛らわしいため）"
         );
     }
 
@@ -1040,6 +1020,131 @@ mod tests {
         assert_eq!(value["remote_host"], "example.com");
     }
 
+    /// `docs/STATUS.md` Tier2a残課題#8の再現。プロバイダ/サブレイヤーGUIDは固定値なので、
+    /// 2セッション目の`apply`が`cleanup_stale_objects()`で**先行セッションのフィルタを消す**
+    /// （＝先行の出口強制が無音で外れる）のか、`FwpmProviderAdd0`が`ALREADY_EXISTS`で
+    /// **失敗する**（fail-closed）のかを実機で確かめる。
+    ///
+    /// 実行例（要管理者権限）: `dev-elevated-run.exe e2e-wfp-multisession`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires administrator token and BFE; mutates machine-global WFP state"]
+    fn e2e_a_second_session_does_not_disturb_the_first_sessions_filters() {
+        if !crate::tier2a::privhelper::is_elevated() {
+            panic!("WFP multi-session E2E requires an elevated administrator token");
+        }
+        let sid = crate::tier2a::win_appcontainer::ensure_profile(
+            crate::tier2a::win_appcontainer::CONTAINER_NAME,
+        )
+        .expect("ensure AppContainer profile");
+
+        /// 自サブレイヤー配下に今あるフィルタのID集合（実機の観測値）。
+        fn filter_ids_in_sublayer(keys: SessionKeys) -> std::collections::BTreeSet<u64> {
+            let mut ids = std::collections::BTreeSet::new();
+            unsafe {
+                let mut engine = HANDLE::default();
+                if FwpmEngineOpen0(
+                    windows::core::PCWSTR::null(),
+                    windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT,
+                    None,
+                    None,
+                    &mut engine as *mut HANDLE,
+                ) != 0
+                {
+                    return ids;
+                }
+                let mut enum_handle = HANDLE::default();
+                if FwpmFilterCreateEnumHandle0(engine, None, &mut enum_handle) == 0 {
+                    loop {
+                        let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
+                        let mut returned = 0u32;
+                        let status =
+                            FwpmFilterEnum0(engine, enum_handle, 64, &mut entries, &mut returned);
+                        if status != 0 || returned == 0 {
+                            if !entries.is_null() {
+                                let mut memory = entries as *mut c_void;
+                                FwpmFreeMemory0(&mut memory);
+                            }
+                            break;
+                        }
+                        let slice = std::slice::from_raw_parts(entries, returned as usize);
+                        for filter_ptr in slice.iter().filter(|f| !f.is_null()) {
+                            let filter = &**filter_ptr;
+                            if filter.subLayerKey == keys.sublayer {
+                                ids.insert(filter.filterId);
+                            }
+                        }
+                        let mut memory = entries as *mut c_void;
+                        FwpmFreeMemory0(&mut memory);
+                    }
+                    let _ = FwpmFilterDestroyEnumHandle0(engine, enum_handle);
+                }
+                let _ = FwpmEngineClose0(engine);
+            }
+            ids
+        }
+
+        // 実運用では2セッションのLocal Proxyポートは別々になる。同じにすると
+        // 「Aのフィルタが消えてもBのフィルタが同じ穴を開ける」ため差分が見えない。
+        let listener_a = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener_b = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // D-37: 2つの**別セッション**（別プロファイル名）を模す。実運用ではセッションごとに
+        // 別プロセスの`harness-netfilterd`が動くが、キーもフィルタ条件もプロファイル名から
+        // 決まるので、1プロセス内でも同じ構造を再現できる。
+        let profile_a = crate::tier2a::session_profile::profile_name_for("wfp-test-a");
+        let profile_b = crate::tier2a::session_profile::profile_name_for("wfp-test-b");
+        let keys_a = SessionKeys::for_session(&profile_a);
+        let keys_b = SessionKeys::for_session(&profile_b);
+        let opts_a = WfpOptions {
+            session_profile: profile_a.clone(),
+            allow_loopback_tcp_ports: vec![listener_a.local_addr().unwrap().port()],
+            allow_loopback_udp_ports: Vec::new(),
+            audit_log_path: None,
+        };
+        let opts_b = WfpOptions {
+            session_profile: profile_b.clone(),
+            allow_loopback_tcp_ports: vec![listener_b.local_addr().unwrap().port()],
+            allow_loopback_udp_ports: Vec::new(),
+            audit_log_path: None,
+        };
+
+        let session_a = WfpSession::apply(sid.as_psid(), &opts_a).expect("session A apply");
+        let ids_a = filter_ids_in_sublayer(keys_a);
+        eprintln!("[e2e] セッションAのフィルタ: {ids_a:?}");
+        assert!(!ids_a.is_empty(), "Aのフィルタが投入されていない");
+
+        let session_b = WfpSession::apply(sid.as_psid(), &opts_b).expect("session B apply");
+        let ids_b = filter_ids_in_sublayer(keys_b);
+        let a_after_b = filter_ids_in_sublayer(keys_a);
+        eprintln!("[e2e] セッションBのフィルタ: {ids_b:?}");
+        eprintln!("[e2e] B適用後もAに残っているフィルタ: {a_after_b:?}");
+
+        // **これが#8の修正点**: 後発の`apply`（`cleanup_stale_objects`込み）が先行のフィルタを
+        // 削らない。以前は共有サブレイヤーだったため、ここでAの4件が全滅していた。
+        assert_eq!(
+            a_after_b, ids_a,
+            "後発セッションのapplyが先行セッションのフィルタを削っている（先行の出口強制が無音で外れる）"
+        );
+        assert!(
+            ids_a.is_disjoint(&ids_b),
+            "セッションごとにフィルタは別物であるべき: A={ids_a:?} B={ids_b:?}"
+        );
+
+        // 後発だけ終了させても、先行のフィルタは残る（DYNAMICセッションは自分のぶんだけ消す）。
+        session_b.teardown().expect("session B teardown");
+        let a_after_b_teardown = filter_ids_in_sublayer(keys_a);
+        eprintln!("[e2e] B終了後にAに残っているフィルタ: {a_after_b_teardown:?}");
+        assert_eq!(
+            a_after_b_teardown, ids_a,
+            "後発の終了で先行セッションのフィルタまで消えている（実行中のサンドボックスが無防備になる）"
+        );
+
+        session_a.teardown().expect("session A teardown");
+        let after_all = filter_ids_in_sublayer(keys_a);
+        eprintln!("[e2e] 全終了後: {after_all:?}");
+        assert!(after_all.is_empty(), "全セッション終了後にフィルタが残っている");
+    }
+
     /// 管理者権限+BFE有効なWindows実機でのみ手動実行するE2E。
     ///
     /// 実行例:
@@ -1074,11 +1179,14 @@ mod tests {
             }
         });
 
-        let sid = crate::tier2a::win_appcontainer::ensure_profile(crate::tier2a::win_appcontainer::CONTAINER_NAME)
+        // D-37: 本番と同じ形——WFPの条件も子プロセスも「このセッションのプロファイル」で揃える。
+        let session_profile = crate::tier2a::session_profile::current_profile_name();
+        let sid = crate::tier2a::win_appcontainer::ensure_profile(&session_profile)
             .expect("ensure AppContainer profile");
         crate::tier2a::win_appcontainer::grant_ace_recursive(dir.path(), sid.as_psid())
             .expect("grant temp dir ACE to AppContainer");
         let opts = WfpOptions {
+            session_profile: session_profile.clone(),
             allow_loopback_tcp_ports: vec![allowed_port],
             allow_loopback_udp_ports: Vec::new(),
             audit_log_path: Some(audit_path.clone()),

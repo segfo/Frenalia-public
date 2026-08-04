@@ -178,6 +178,7 @@ impl LlmProvider for AnthropicProvider {
             schema_with_tools: false,
             prompt_caching: true,
             context_window: 200_000,
+            local: false,
         }
     }
 }

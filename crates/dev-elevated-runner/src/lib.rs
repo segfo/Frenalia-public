@@ -48,6 +48,20 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "e2e-loopback-exemption",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "loopback",
+        ],
+    ),
+    (
+        "e2e-wfp-multisession",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "wfp::tests::e2e_",
+        ],
+    ),
+    (
         "e2e-sandbox-vm-ignored",
         &[
             "test", "-p", "harness-sandbox-vm", "--lib", "--", "--ignored", "--test-threads=1",

@@ -186,6 +186,40 @@ pub async fn spawn_fake_dns(config: &FakeDnsConfig) -> std::io::Result<FakeDnsAg
     })
 }
 
+/// Windowsの動的ポート範囲の先頭（既定値。`netsh int ipv4 show dynamicport`）。
+const DYNAMIC_PORT_START: u16 = 49152;
+
+/// 候補ポートを跳ばす幅。Windowsの**ポート除外レンジ**（`netsh int ipv4 show
+/// excludedportrange`）はプロトコル別で、Hyper-Vが有効な環境ではUDP専用の除外ブロックが
+/// **100ポート幅**で多数予約される（この開発機の実測で20本以上）。TCPのport 0割り当ては
+/// ほぼ連番なので、除外ブロックに差し掛かると`port 0`のリトライを何度繰り返しても
+/// 同じブロックの中で全滅する。ブロック幅より1大きいstrideで候補を選び直せば必ず外へ出る。
+const EXCLUSION_BLOCK_STRIDE: u16 = 101;
+
+/// OS任せ（`port 0`）で試す回数。通常はこれで足りる。
+const OS_CHOICE_ATTEMPTS: usize = 4;
+/// 明示ポートで試す回数（除外ブロックを跨ぐstride付き）。
+const STRIDED_ATTEMPTS: usize = 28;
+
+/// `i`番目の候補ポート。起点を時刻由来にして、複数プロセスが同時に起動しても同じ場所で
+/// 競合し続けないようにする。
+fn strided_candidate_port(seed: u32, i: usize) -> u16 {
+    let span = (u16::MAX - DYNAMIC_PORT_START) as u32;
+    // seedを先に範囲へ畳んでから足す。`seed + i*stride`のままだと、seedがu32の上限付近の
+    // ときにu32側で先に一周してしまい、候補の間隔がstrideより狭くなる（除外ブロックを
+    // 跨げなくなる）。
+    let base = seed % span;
+    let offset = (base + (i as u32) * EXCLUSION_BLOCK_STRIDE as u32) % span;
+    DYNAMIC_PORT_START + offset as u16
+}
+
+/// TCPとUDPを**同じポート番号**で確保する（DNSの慣習であり、子プロセスへは
+/// `HARNESS_FAKE_DNS_ADDR`として1つのaddrしか渡さないため）。
+///
+/// ペアで取る以上、「TCPは取れたがUDPは取れない」ポートに当たり得る。Windowsの除外レンジは
+/// プロトコル別なので、これは異常系ではなく**日常的に起こる**（[`EXCLUSION_BLOCK_STRIDE`]の
+/// 説明参照。実測ではFake DNSの起動が`WSAEACCES`(10013)で失敗していた、
+/// [BUG-054](../../../docs/bugs/BUG-054.md)）。
 async fn bind_dns_sockets(
     preferred_port: Option<u16>,
 ) -> std::io::Result<(TcpListener, UdpSocket)> {
@@ -195,8 +229,20 @@ async fn bind_dns_sockets(
         }
     }
     let mut last_err = None;
-    for _ in 0..32 {
+    for _ in 0..OS_CHOICE_ATTEMPTS {
         match bind_dns_sockets_on_port(0).await {
+            Ok(pair) => return Ok(pair),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    // OS任せが続けて失敗した＝割り当てカーソルが除外ブロックに入っている可能性が高い。
+    // ブロックを跨ぐ幅で明示的に候補を選び直す。
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    for i in 0..STRIDED_ATTEMPTS {
+        match bind_dns_sockets_on_port(strided_candidate_port(seed, i)).await {
             Ok(pair) => return Ok(pair),
             Err(e) => last_err = Some(e),
         }
@@ -538,6 +584,31 @@ mod tests {
         assert!(!entries[0].allowed);
         assert_eq!(entries[0].reason, "ip_literal_denied");
         assert_eq!(entries[0].matched_pattern, None);
+    }
+
+    /// 候補ポートは動的ポート範囲に収まり、**除外ブロック幅（100）より大きい間隔**で動く。
+    /// これが崩れると、Hyper-V由来のUDP除外ブロックに差し掛かったときに全リトライが
+    /// 同じブロック内で全滅する（[`EXCLUSION_BLOCK_STRIDE`]のdoc参照）。
+    #[test]
+    fn strided_candidates_stay_in_range_and_cross_exclusion_blocks() {
+        for seed in [0u32, 12_345, u32::MAX] {
+            let ports: Vec<u16> = (0..STRIDED_ATTEMPTS)
+                .map(|i| strided_candidate_port(seed, i))
+                .collect();
+            assert!(
+                ports.iter().all(|p| *p >= DYNAMIC_PORT_START),
+                "動的ポート範囲の外を選ばない: {ports:?}"
+            );
+            for pair in ports.windows(2) {
+                let step = pair[1].abs_diff(pair[0]);
+                // 通常はstrideちょうど、範囲を一周する箇所では「span - stride」になる。
+                // どちらも除外ブロック幅（100）より大きいことが要件。
+                assert!(
+                    step > 100,
+                    "連続候補が同じ100ポートブロックに留まらないこと: {pair:?} (step={step})"
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -140,6 +140,16 @@ pub enum PrivilegedRequest {
     GrantWorkspaceAccess {
         traverse_targets: Vec<PathBuf>,
         fs_allow_entries: Vec<FsAllowGrant>,
+        /// D-37: `fs_allow_entries`の付与先package SIDを決めるセッションプロファイル名。
+        ///
+        /// **SIDそのものではなく名前を運ぶ**（生ポインタを特権境界へ渡さないという既存方針の
+        /// 維持）。受信側は`session_profile::is_session_profile_name`で形を検証してから
+        /// `ensure_profile`で導出するので、任意のAppContainerへACEを付けさせることはできない。
+        /// `traverse_targets`側は名前に依存しない——祖先traverseはharness共通のcapability SID
+        /// （固定名から昇格側が自ら導出する）宛に付与するため、こちらは従来どおりIPCで
+        /// SID識別子を一切受け取らない。
+        #[serde(default)]
+        session_profile: String,
     },
 }
 
@@ -624,6 +634,7 @@ mod tests {
                 access: FsAccess::ReadExec,
                 forced: false,
             }],
+            session_profile: "harness.shell.sandbox.1234-5678".to_string(),
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: PrivilegedRequest = serde_json::from_slice(&bytes).unwrap();
@@ -631,7 +642,9 @@ mod tests {
             PrivilegedRequest::GrantWorkspaceAccess {
                 traverse_targets,
                 fs_allow_entries,
+                session_profile,
             } => {
+                assert_eq!(session_profile, "harness.shell.sandbox.1234-5678");
                 assert_eq!(traverse_targets.len(), 2);
                 assert_eq!(
                     traverse_targets[1],
@@ -641,6 +654,33 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// D-34: プロセス境界を越える形はバイト列そのものを固定する。D-37で`session_profile`を
+    /// 足したので、その位置と名前もここで固定される（昇格側は受け取った名前を
+    /// `is_session_profile_name`で検証してから使うため、形が変わったら気付ける必要がある）。
+    #[test]
+    fn grant_workspace_access_request_json_wire_format_is_stable() {
+        let req = PrivilegedRequest::GrantWorkspaceAccess {
+            traverse_targets: vec![PathBuf::from("C:/ws")],
+            fs_allow_entries: Vec::new(),
+            session_profile: "harness.shell.sandbox.1-2".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"GrantWorkspaceAccess":{"traverse_targets":["C:/ws"],"fs_allow_entries":[],"session_profile":"harness.shell.sandbox.1-2"}}"#
+        );
+    }
+
+    /// 昇格側が受け取るプロファイル名は検証される（任意のAppContainerへACEを付けさせない）。
+    #[test]
+    fn only_session_profile_names_are_accepted_by_the_elevated_side() {
+        use crate::tier2a::session_profile::is_session_profile_name;
+        assert!(is_session_profile_name("harness.shell.sandbox.1-2"));
+        assert!(!is_session_profile_name(
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe"
+        ));
+        assert!(!is_session_profile_name("harness.shell.sandbox"));
     }
 
     /// `WorkspaceAccessResult`応答が、traverse側のエラーとfs-allow側の成否混在の両方を

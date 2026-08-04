@@ -72,7 +72,7 @@ impl ScratchStore {
     /// （`harness_engine::turn`の大出力切詰めと同じ形。まず機械的に切り詰め、
     /// 意味的な抽出はDistillフェーズのLLMコールが行う＝§6.2の2段構え）。
     pub fn zoom(&self, raw_ref: &RawRef, max_chars: usize) -> io::Result<String> {
-        Ok(crate::text::truncate_head_tail(
+        Ok(harness_core::text::truncate_head_tail(
             &self.read_raw(raw_ref)?,
             max_chars,
         ))

@@ -27,10 +27,10 @@
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, WAIT_OBJECT_0,
+    CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
     GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
@@ -81,12 +81,7 @@ pub fn sid_string_from_token(token: HANDLE) -> windows::core::Result<String> {
         )?;
 
         let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
-        let sid = token_user.User.Sid;
-        let mut sid_str_ptr = windows::core::PWSTR::null();
-        ConvertSidToStringSidW(sid, &mut sid_str_ptr)?;
-        let sid_str = crate::win_common::pwstr_to_string(sid_str_ptr);
-        let _ = LocalFree(HLOCAL(sid_str_ptr.0 as *mut _));
-        Ok(sid_str)
+        crate::win_common::sid_to_string(token_user.User.Sid)
     }
 }
 

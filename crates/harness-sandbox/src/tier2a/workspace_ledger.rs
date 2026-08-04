@@ -21,6 +21,10 @@
 
 use std::path::{Path, PathBuf};
 
+// 生存確認そのもの（`mutex_exists`・`hold_mutex_for_process_lifetime`）は、同じ手法を使う
+// `loopback_exemption`と共有するため`crate::win_common`が持つ（規則5・コピーを作らない）。
+use crate::win_common::{hold_mutex_for_process_lifetime, mutex_exists};
+
 /// 現在サポートするworkspaceアクセスモード。将来`--cow_exec`（RX、読取+実行のみ許可）を
 /// 追加する場合はここに`"rx"`を足すだけでよい（mutex名の分岐だけで衝突チェックが機能する）。
 pub const KNOWN_MODES: &[&str] = &["rwx", "ro"];
@@ -42,41 +46,6 @@ fn mode_mutex_name(path_key: &str, mode: &str) -> String {
 
 fn setup_lock_name(path_key: &str) -> String {
     format!("Local\\harness-ws-setup-{path_key}")
-}
-
-/// `name`という名前付きmutexが現在誰かに保持されているか（＝生きたセッションが存在するか）。
-fn mutex_exists(name: &str) -> bool {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
-    let wide = crate::win_common::wide(name);
-    unsafe {
-        match OpenMutexW(
-            SYNCHRONIZATION_SYNCHRONIZE,
-            false,
-            windows::core::PCWSTR(wide.as_ptr()),
-        ) {
-            Ok(h) => {
-                let _ = CloseHandle(h);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-}
-
-/// `name`という名前付きmutexを作成（既に存在すれば単にハンドルを開くだけ）し、
-/// **意図的に`CloseHandle`しない**。生のWin32 `HANDLE`はDropで自動closeされないため、
-/// この関数を抜けた後もハンドルはプロセスが終了するまで有効なまま残る。プロセスが
-/// 正常終了・クラッシュのいずれで消えても、Windowsがこのハンドルを自動的に閉じ、
-/// 参照が0になったオブジェクト自体も破棄される——それが「このモード/セッションはもう
-/// 使われていない」という合図になる。
-fn hold_mutex_for_process_lifetime(name: &str) -> windows::core::Result<()> {
-    use windows::Win32::System::Threading::CreateMutexW;
-    let wide = crate::win_common::wide(name);
-    unsafe {
-        CreateMutexW(None, false, windows::core::PCWSTR(wide.as_ptr()))?;
-    }
-    Ok(())
 }
 
 /// `path`（canonicalize済み）に対して`mode`でのアクセスを開始してよいか確認し、よければ

@@ -1198,19 +1198,15 @@ fn wfp_fail_closed_launcher_exe() -> PathBuf {
 /// された」場合より強い証拠（AppContainer境界そのもので止まっている）なので、caseの成否は
 /// case-matrix自身のJSON出力（プローブが実際に接続を試みて失敗したか）だけで判定する。
 ///
-/// **既知の脆さ（発見済み、テスト側で回避）**: Tier2aのAppContainerプロファイル
-/// （`harness.shell.sandbox`）は全ケースで共有される。`harness-netfilterd`はWFP適用時に
-/// このSIDをWindowsのAppContainer loopback exemptionへ一時追加し、「このセッションで
-/// 新規追加した場合のみ」teardown時に削除する（設計書`AppContainerを用いたドメインベース
-/// 通信制御アーキテクチャ設計書.md:133`）。本セッションでの動作確認中、`sudo`呼び出しの
-/// 中断・`taskkill`によるプロセス強制終了を繰り返した結果、このexemptionが残留した状態で
-/// 本ケースを実行し、モックがWFP起動を阻止していてもLayer1プロキシへのloopback到達だけは
-/// 生き残ってしまう（`CheckNetIsolation LoopbackExempt -s`で残留を確認、`sudo
-/// CheckNetIsolation LoopbackExempt -d -n=harness.shell.sandbox`で解消）という現象を実機で
-/// 観測した。正常終了時のteardownがこのexemptionを確実に削除しているかは未検証のまま
-/// 残っている（BUG-046と同型の「共有プロファイルへの残留状態」クラスの脆弱性の可能性が
-/// あるが、今回の観測はテスト実行中の異常終了が原因である可能性が高く切り分けられて
-/// いない）。次にTier2a関連のE2Eが不可解に失敗したら、まずこれを疑うこと。
+/// **かつての既知の脆さ（[BUG-053](../../../docs/bugs/BUG-053.md)で解消済み）**: Tier2aの
+/// AppContainerプロファイル（`harness.shell.sandbox`）は全ケースで共有される。かつて
+/// `harness-netfilterd`はloopback exemptionを「このセッションで新規追加した場合のみ」teardown時に
+/// 削除する設計だったため、`sudo`呼び出しの中断・`taskkill`による強制終了の後にexemptionが残留し、
+/// モックがWFP起動を阻止していてもLayer1プロキシへのloopback到達だけが生き残る、という現象を実機で
+/// 観測していた（`CheckNetIsolation LoopbackExempt -s`で残留を確認していた）。現在は所有権を
+/// プロセス跨ぎの参照カウントで管理し（D-36、`crates/harness-sandbox/src/tier2a/loopback_exemption.rs`）、
+/// 最後の所有者が抜けた時点で確実に削除される。生存所有者が居ない残留は次セッションが引き取って
+/// 掃除するため、異常終了後も1サイクルで自己修復する。
 fn net_case_07_wfp_start_failure_is_fail_closed() -> Result<(), String> {
     let exe = wfp_fail_closed_launcher_exe();
     run_net_case_with_exe_and_stderr_check(

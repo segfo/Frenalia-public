@@ -254,6 +254,7 @@ mod tests {
             schema_with_tools,
             prompt_caching: false,
             context_window: 128_000,
+            local: false,
         }
     }
 
@@ -329,7 +330,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(out.value.unwrap().hypotheses[0].predicts, vec!["Yが見えれば偽"]);
+        assert_eq!(
+            out.value.unwrap().hypotheses[0].predicts,
+            vec!["Yが見えれば偽"]
+        );
         assert_eq!(out.calls, 2);
         // 2回目には「何が不正だったか」が載る。
         let second = &exec.seen()[1].req;
@@ -383,7 +387,11 @@ mod tests {
         let exec = PhaseExecutor::new([(
             Phase::Decide,
             vec![
-                Reply::tool("write_file", serde_json::json!({ "path": "a.rs" }), "written"),
+                Reply::tool(
+                    "write_file",
+                    serde_json::json!({ "path": "a.rs" }),
+                    "written",
+                ),
                 Reply::Text(
                     serde_json::json!({ "action": "書いた", "then_verify": "cargo test" })
                         .to_string(),
@@ -425,7 +433,11 @@ mod tests {
         let exec = PhaseExecutor::new([(
             Phase::Decide,
             vec![
-                Reply::tool("write_file", serde_json::json!({ "path": "a.rs" }), "written"),
+                Reply::tool(
+                    "write_file",
+                    serde_json::json!({ "path": "a.rs" }),
+                    "written",
+                ),
                 Reply::Text(
                     serde_json::json!({ "action": "書いた", "then_verify": "cargo test" })
                         .to_string(),
@@ -449,7 +461,10 @@ mod tests {
         assert_eq!(out.calls, 2);
         let seen = exec.seen();
         assert!(seen[0].req.output.is_none(), "1回目はツール実行専用");
-        assert!(seen[1].req.output.is_some(), "結論コールでスキーマを要求する");
+        assert!(
+            seen[1].req.output.is_some(),
+            "結論コールでスキーマを要求する"
+        );
     }
 
     /// Investigateの計画は補助なので、取れなくても追加コールを投げずに先へ進む。

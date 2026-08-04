@@ -92,6 +92,7 @@ async fn read_file_tool_loop_produces_expected_transcript() {
             model: "mock".into(),
             max_tokens: 100,
             max_turns: 5,
+            compaction: Default::default(),
         },
         None,
         None,
@@ -369,6 +370,7 @@ async fn agent_event_sequence_for_tool_turn_is_stable() {
             model: "mock".into(),
             max_tokens: 100,
             max_turns: 5,
+            compaction: Default::default(),
         },
         Some(&events_tx),
         None,
@@ -434,6 +436,7 @@ async fn context_too_long_compacts_once_without_second_turn_started() {
             model: "mock".into(),
             max_tokens: 100,
             max_turns: 5,
+            compaction: Default::default(),
         },
         Some(&events_tx),
         None,
@@ -505,6 +508,7 @@ async fn context_too_long_mid_stream_does_not_compact() {
             model: "mock".into(),
             max_tokens: 100,
             max_turns: 5,
+            compaction: Default::default(),
         },
         Some(&events_tx),
         None,
@@ -526,5 +530,294 @@ async fn context_too_long_mid_stream_does_not_compact() {
         state.messages.len(),
         messages_before,
         "a failed turn must not push a partial assistant message"
+    );
+}
+
+// --- 予防的縮約（使用率トリガ、`plans/PLAN-COMPACTION.md`） ---
+
+/// `tool_use`と対になる`tool_result`を持つ1ターン分のメッセージ列。
+fn tool_round(id: &str, result_chars: usize) -> Vec<Message> {
+    vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({}),
+            }],
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: "x".repeat(result_chars),
+                is_error: false,
+            }],
+        },
+    ]
+}
+
+fn tool_result_lengths(state: &ConversationState) -> Vec<usize> {
+    state
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { content, .. } => Some(content.chars().count()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 予防的縮約は**ターン開始前**に走る。固定する性質は2つ。
+///
+/// 1. イベント順が `ContextShrunk` → `ContextCompacted` → `TurnStarted`。①（切詰め）を②（要約）
+///    より先に試し、どちらも`TurnStarted`より前に出る（`estimated_input_tokens`が縮約後の値に
+///    なり、TUI表示と実送信量が一致する）。
+/// 2. リアクティブ経路（`ContextTooLong`捕捉）とは順序が逆になる——あちらは`TurnStarted`の**後**。
+#[tokio::test]
+async fn the_usage_trigger_shrinks_then_summarizes_before_the_turn_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(vec![
+        // ②ローリング要約のコール（①だけでは目標に届かない）。
+        ScriptedCall::Streams(end_turn("summary of earlier turns")),
+        // 本題のターン。
+        ScriptedCall::Streams(end_turn("done")),
+    ]);
+
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("t1");
+    state.messages.extend(tool_round("call_1", 8_000));
+    state.push_user_text("t2");
+    state.messages.extend(tool_round("call_2", 8_000));
+    state.push_user_text("t3");
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            // 実`n_ctx`が小さいローカルモデル相当。閾値500トークン・目標300トークン。
+            compaction: harness_engine::compaction::CompactionPolicy {
+                trigger_ratio: 0.5,
+                target_ratio: 0.3,
+                context_window: 1_000,
+            },
+        },
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.text, "done");
+    assert_eq!(
+        drain_event_kinds(&mut events_rx),
+        vec![
+            "ContextShrunk",
+            "ContextCompacted",
+            "TurnStarted",
+            "TextDelta",
+            "TurnCompleted"
+        ],
+        "preventive compaction must run (and be reported) before the turn starts"
+    );
+}
+
+/// 後方互換。既定ポリシー（クラウド既定 0.85/0.6・200,000）では、通常サイズの履歴で
+/// 使用率トリガが**発火しない**。M13で固定したバイト等価性がこの機構の追加で崩れないこと。
+#[tokio::test]
+async fn the_default_policy_does_not_fire_on_an_ordinary_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(vec![ScriptedCall::Streams(end_turn("done"))]);
+
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("t1");
+    state.messages.extend(tool_round("call_1", 8_000));
+    state.push_user_text("t2");
+    state.messages.extend(tool_round("call_2", 8_000));
+    state.push_user_text("t3");
+    let before = state.messages.len();
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            compaction: Default::default(),
+        },
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        provider.calls_made(),
+        1,
+        "no summary call may be made when the trigger does not fire"
+    );
+    assert_eq!(
+        drain_event_kinds(&mut events_rx),
+        vec!["TurnStarted", "TextDelta", "TurnCompleted"],
+    );
+    assert_eq!(
+        tool_result_lengths(&state),
+        vec![8_000, 8_000],
+        "history must be left byte-identical"
+    );
+    // 追加されたのはassistantの応答1件だけ。
+    assert_eq!(state.messages.len(), before + 1);
+}
+
+/// リアクティブ経路のフォールバック。要約できる形でない（外部ユーザターンが1件しか無い）ため
+/// `compact`は0を返すが、**諦める前に保護なしの深い切詰めを1回だけ試す**。
+/// これが無いと「直近ターンだけで超過している」状況で必ずエラーになっていた。
+#[tokio::test]
+async fn a_reactive_failure_that_cannot_be_summarized_falls_back_to_shrinking() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(vec![
+        ScriptedCall::CallFails(ProviderError::ContextTooLong),
+        ScriptedCall::Streams(end_turn("done")),
+    ]);
+
+    // 外部ユーザターンは1件だけ＝`compact`は要約コールを打たずに0を返す。
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("t1");
+    state.messages.extend(tool_round("call_1", 8_000));
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            compaction: Default::default(),
+        },
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.text, "done");
+    assert_eq!(
+        provider.calls_made(),
+        2,
+        "the summary call must be skipped when there is nothing to summarize"
+    );
+    assert_eq!(
+        drain_event_kinds(&mut events_rx),
+        vec!["TurnStarted", "ContextShrunk", "TextDelta", "TurnCompleted"],
+        "the reactive fallback reports the truncation and retries without a second TurnStarted"
+    );
+    let lengths = tool_result_lengths(&state);
+    assert!(lengths[0] < 8_000, "tool_result must have been truncated");
+}
+
+/// 振動防止。閾値を超えたまま複数ターン回っても、**②ローリング要約は1回の`run_agent_loop`で
+/// 高々1回**しか打たれない。
+///
+/// `plans/PLAN-COMPACTION.md`が当初指定していた「削減量が0なら履歴が伸びるまで再試行しない」と
+/// いう長さベースのクールダウンは、このループが毎周回で必ずメッセージを増やす（assistant応答＋
+/// `tool_result`）ため構造的に一度も成立しない。実際に止めたいのは「①が少しだけ削って目標に
+/// 届かず、毎ターン②の要約コールを打つ」形の振動であり、①が成功している限り長さでは止まらない。
+#[tokio::test]
+async fn the_rolling_summary_runs_at_most_once_per_agent_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), "x".repeat(20_000)).unwrap();
+
+    let provider = ScriptedProvider::new(vec![
+        // ターン1の縮約で打たれる②の要約コール。
+        ScriptedCall::Streams(end_turn("summary")),
+        // ターン1本体（ツールを呼ぶのでループが続く）。
+        ScriptedCall::Streams(tool_use_turn(
+            "call_x",
+            "read_file",
+            serde_json::json!({ "path": "f.txt" }),
+        )),
+        // ターン2本体。ここで②が再び打たれるなら、この台本は使い切られて panic する。
+        ScriptedCall::Streams(end_turn("done")),
+    ]);
+
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("t1");
+    state.messages.extend(tool_round("call_1", 8_000));
+    state.push_user_text("t2");
+    state.messages.extend(tool_round("call_2", 8_000));
+    state.push_user_text("t3");
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            // 何をどう削っても閾値を下回れない、極端に小さいウィンドウ。
+            compaction: harness_engine::compaction::CompactionPolicy {
+                trigger_ratio: 0.5,
+                target_ratio: 0.3,
+                context_window: 1_000,
+            },
+        },
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.text, "done");
+    assert_eq!(
+        provider.calls_made(),
+        3,
+        "1 summary call + 2 turns; a second summary call would mean oscillation"
+    );
+    let kinds = drain_event_kinds(&mut events_rx);
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "ContextCompacted").count(),
+        1,
+        "the rolling summary must not repeat: {kinds:?}"
     );
 }

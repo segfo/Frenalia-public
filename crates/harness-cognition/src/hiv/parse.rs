@@ -174,10 +174,9 @@ mod tests {
     /// 文字列リテラル中の波括弧で切り出しを打ち切らないこと。
     #[test]
     fn braces_inside_strings_do_not_terminate_the_object() {
-        let out: DecideOutput = parse_phase_output(
-            r#"{"action":"`if x { y }` を直す","then_verify":"cargo test"}"#,
-        )
-        .unwrap();
+        let out: DecideOutput =
+            parse_phase_output(r#"{"action":"`if x { y }` を直す","then_verify":"cargo test"}"#)
+                .unwrap();
         assert_eq!(out.action, "`if x { y }` を直す");
         assert_eq!(out.then_verify, "cargo test");
     }

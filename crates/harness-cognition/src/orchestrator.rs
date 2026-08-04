@@ -2,8 +2,8 @@
 //! 唯一の強制点」・§2「Effortスイッチ」。
 
 use harness_core::{
-    AgentEvent, CognitionLevel, ContentBlock, LlmProvider, Message, ProviderError, Role, StopReason,
-    ToolCtx,
+    AgentEvent, CognitionLevel, ContentBlock, LlmProvider, Message, ProviderError, Role,
+    StopReason, ToolCtx,
 };
 use harness_engine::{
     emit_event, run_agent_loop, AgentLoopConfig, AgentLoopOutcome, ConversationState, EventSink,
@@ -234,9 +234,7 @@ impl CognitiveOrchestrator {
             // `Other`を4にする）。「答えは返ったが確証はしていない」を呼び出し側の
             // スクリプトが区別できるようにするため。
             HivStop::Blocked { .. } => StopReason::Other("cognition_blocked".to_string()),
-            HivStop::BudgetExhausted => {
-                StopReason::Other("cognition_budget_exhausted".to_string())
-            }
+            HivStop::BudgetExhausted => StopReason::Other("cognition_budget_exhausted".to_string()),
             HivStop::Cancelled => StopReason::Other("cancelled".to_string()),
         };
         emit_event(
@@ -299,7 +297,10 @@ mod tests {
 
     #[test]
     fn off_and_always_are_constructible() {
-        assert_eq!(orchestrator(CognitionLevel::Off).level(), CognitionLevel::Off);
+        assert_eq!(
+            orchestrator(CognitionLevel::Off).level(),
+            CognitionLevel::Off
+        );
         assert_eq!(
             orchestrator(CognitionLevel::Always).level(),
             CognitionLevel::Always
@@ -309,8 +310,8 @@ mod tests {
     /// 未実装の段階は起動時に止まる（黙って`Off`へ降格しない）。M15時点では`Auto`だけ。
     #[test]
     fn auto_is_rejected_until_the_router_exists() {
-        let err = CognitiveOrchestrator::new(CognitionLevel::Auto, PhaseBudgets::default())
-            .unwrap_err();
+        let err =
+            CognitiveOrchestrator::new(CognitionLevel::Auto, PhaseBudgets::default()).unwrap_err();
         assert_eq!(err.level, CognitionLevel::Auto);
         let msg = err.to_string();
         assert!(msg.contains("not implemented yet"), "{msg}");

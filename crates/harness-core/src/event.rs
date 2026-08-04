@@ -57,6 +57,20 @@ pub enum AgentEvent {
     ContextCompacted {
         removed_messages: usize,
     },
+    /// コンテキスト縮約の①段（`tool_result`の選択的切詰め）が走った
+    /// （`plans/PLAN-COMPACTION.md`「縮約の順序」）。
+    ///
+    /// [`AgentEvent::ContextCompacted`]と**別の変種にしている**のは、あちらが「要約に畳み込まれ
+    /// 削除された元メッセージ数」を意味するためで、0メッセージ削除の切詰めを同じ変種で表すと
+    /// 嘘になる。モデルが既に見たツール出力を静かに縮めるのは可視化すべき副作用である
+    /// （`docs/SECURITY-PRINCIPLES.md` P-04「書込はレビュー可能にする」と同じ発想）。
+    ContextShrunk {
+        /// 短くした`tool_result`ブロック数。**メッセージ数・ブロック数自体は変わらない**
+        /// （`tool_use`との対応を壊さないため）。
+        truncated_blocks: usize,
+        /// 削減できたトークン概算。
+        saved_tokens: u64,
+    },
     /// セッションが切り替わった（`/fork`でのFork、`/sessions`ピッカーでの選択、M9拡張）。
     /// `source_id`はForkの場合のみ元セッションIDを持つ（`/sessions`での単純な切替では`None`）。
     SessionSwitched {

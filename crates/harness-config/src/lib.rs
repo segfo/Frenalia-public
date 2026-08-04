@@ -40,6 +40,9 @@ pub struct Settings {
     /// 認知レイヤー設定（M13〜、`plans/DESIGN-COGNITION.md` §2.3）。省略時は
     /// `CognitionSettings::default()`（`default_level`未指定＝`CognitionLevel`の既定）。
     pub cognition: Option<CognitionSettings>,
+    /// コンテキスト縮約設定（`plans/PLAN-COMPACTION.md`）。省略時はプロバイダの
+    /// `ProviderCapabilities`から解決した既定（ローカル`0.5`/`0.3`、クラウド`0.85`/`0.6`）。
+    pub compaction: Option<CompactionSettings>,
 }
 
 /// `.harness/settings.json`の`cognition`キー。
@@ -58,6 +61,29 @@ pub struct CognitionSettings {
     /// "cognition": { "budgets": { "distill": { "max_in": 6000, "max_out": 800 } } }
     /// ```
     pub budgets: Option<std::collections::BTreeMap<harness_core::Phase, harness_core::TokenBudget>>,
+}
+
+/// `.harness/settings.json`の`compaction`キー（`plans/PLAN-COMPACTION.md`「設定」）。
+///
+/// いずれも省略可で、省略時はプロバイダの`ProviderCapabilities`から解決した既定へ落ちる
+/// （`local`なら`0.5`/`0.3`、クラウドなら`0.85`/`0.6`）。
+///
+/// ```jsonc
+/// "compaction": { "context_window": 8192, "trigger_ratio": 0.5, "target_ratio": 0.3 }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompactionSettings {
+    /// 使用率判定の分母の上書き。省略時は`ProviderCapabilities.context_window`。
+    ///
+    /// LMStudioの`capabilities()`は128,000を返すが、実`n_ctx`はサーバのロード設定依存で
+    /// 8k–32kのことが多い。この上書きが無いと使用率閾値そのものが意味を持たないため、
+    /// ローカルモデルを使う場合は実質必須の設定になる。CLIの`--context-window`が最優先。
+    pub context_window: Option<u32>,
+    /// 使用率がこれを超えたら縮約する。
+    pub trigger_ratio: Option<f32>,
+    /// 縮約後に目指す水準。`trigger_ratio`より小さくないと毎ターン再発火して振動する
+    /// （逆転していれば起動時にエラーで止める。黙って直さない）。
+    pub target_ratio: Option<f32>,
 }
 
 /// `.harness/settings.json`の`run_shell`キー。シークレットenvの転送は禁止し、PATH追加だけを扱う。
@@ -346,6 +372,32 @@ mod tests {
         assert_eq!(settings.model.as_deref(), Some("project-model"));
         assert_eq!(settings.max_turns, Some(10));
         let _ = dir; // ディレクトリ自体は使わないが構造を保つため保持
+    }
+
+    /// `compaction`は3項目とも独立に省略でき、書いたものだけが`Some`になる
+    /// （省略値の解決＝プロバイダ既定へのフォールバックは`harness-engine`側の責務で、
+    /// ここは「書かれたことだけを運ぶ」）。
+    #[test]
+    fn parses_partial_compaction_settings() {
+        let settings: Settings =
+            serde_json::from_value(serde_json::json!({ "compaction": { "context_window": 8192 } }))
+                .unwrap();
+        let c = settings.compaction.unwrap();
+        assert_eq!(c.context_window, Some(8192));
+        assert_eq!(c.trigger_ratio, None);
+        assert_eq!(c.target_ratio, None);
+
+        let full: Settings = serde_json::from_value(serde_json::json!({
+            "compaction": { "context_window": 32768, "trigger_ratio": 0.5, "target_ratio": 0.3 }
+        }))
+        .unwrap();
+        let c = full.compaction.unwrap();
+        assert_eq!(c.context_window, Some(32_768));
+        assert_eq!(c.trigger_ratio, Some(0.5));
+        assert_eq!(c.target_ratio, Some(0.3));
+
+        let empty: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.compaction.is_none());
     }
 
     /// `cognition.default_level`は`CognitionLevel`のsnake_case表現をそのまま書ける

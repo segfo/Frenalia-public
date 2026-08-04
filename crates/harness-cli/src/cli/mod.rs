@@ -291,6 +291,16 @@ pub(crate) struct Cli {
     #[arg(long = "max-turns")]
     max_turns: Option<usize>,
 
+    /// コンテキスト縮約の判定に使う分母（トークン）。省略時は`settings.json`の
+    /// `compaction.context_window`→プロバイダの`ProviderCapabilities.context_window`の順。
+    ///
+    /// **LMStudioでは実質必須**。`capabilities()`は128,000を返すが、実`n_ctx`はサーバの
+    /// ロード設定依存で8k–32kのことが多く、合っていないと使用率閾値が意味を持たない
+    /// （`plans/PLAN-COMPACTION.md`）。比率（`trigger_ratio`/`target_ratio`）は
+    /// `settings.json`のみで、フラグは持たない——実機検証のたびに書き換えるのは分母だけだから。
+    #[arg(long = "context-window")]
+    context_window: Option<u32>,
+
     /// 認知レイヤーの段階（`plans/DESIGN-COGNITION.md` §2）。省略時は`settings.json`の
     /// `cognition.default_level`→既定値の順にフォールバックする。
     ///

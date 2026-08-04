@@ -162,6 +162,15 @@ pub struct ProviderCapabilities {
     pub prompt_caching: bool,
     /// コンテキスト圧縮の発火分母。
     pub context_window: u32,
+    /// ローカル推論サーバ（LMStudio等）か。クラウドAPIなら`false`。
+    ///
+    /// 縮約の既定閾値をローカルだけ大幅に低くする（`plans/PLAN-COMPACTION.md`「既定値と
+    /// ローカル判定」）ための分岐に使う。理由は3つあり、いずれもクラウドには当てはまらない:
+    /// 宣言された`context_window`がRoPEスケーリング等で名目上伸ばした値であることが多く後半の
+    /// 文脈が実質参照されないこと、実`n_ctx`がサーバのロード設定依存でモデルカードの最大値とは
+    /// 別なこと、超過時に400を返さず黙って古いトークンを捨てる実装がありリアクティブ経路が
+    /// 当てにならないこと。
+    pub local: bool,
 }
 
 /// cache_read/creation を分離保持 → 圧縮判定は合算、コスト表示は分別。

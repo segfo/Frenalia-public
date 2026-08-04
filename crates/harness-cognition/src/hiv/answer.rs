@@ -121,7 +121,12 @@ mod tests {
     fn confirmed_memory() -> WorkingMemory {
         let mut mem = WorkingMemory::new();
         let g = mem.add_goal("テストの失敗を直す", vec!["cargo testが緑".into()]);
-        let h = mem.add_hypothesis(g, "原因はロック順序", vec!["単一スレッドでは緑".into()], 0.8);
+        let h = mem.add_hypothesis(
+            g,
+            "原因はロック順序",
+            vec!["単一スレッドでは緑".into()],
+            0.8,
+        );
         mem.add_evidence(
             |id| Evidence {
                 id,

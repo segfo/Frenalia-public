@@ -357,16 +357,55 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
         PrivilegedRequest::GrantWorkspaceAccess {
             traverse_targets,
             fs_allow_entries,
+            session_profile,
         } => {
             log::line(&format!(
-                "dispatch: GrantWorkspaceAccess {} traverse target(s), {} fs-allow entrie(s)",
+                "dispatch: GrantWorkspaceAccess {} traverse target(s), {} fs-allow entrie(s),                  session_profile={session_profile}",
                 traverse_targets.len(),
                 fs_allow_entries.len()
             ));
+            // D-37: 祖先traverseはharness共通のcapability SID宛（固定名から自ら導出、IPC入力に
+            // 依存しない）。fs-allowはセッション固有のpackage SID宛で、その名前だけをIPCで
+            // 受け取る——**形を検証してから**導出し、任意のAppContainerへACEを付けさせない。
+            let traverse_cap = match win_appcontainer::traverse_capability_sid() {
+                Ok(cap) => cap,
+                Err(e) => {
+                    log::line(&format!("dispatch: traverse_capability_sid failed: {e}"));
+                    return PrivilegedResponse::Err(format!(
+                        "failed to derive the traverse capability SID: {e}"
+                    ));
+                }
+            };
             let (traverse_granted, traverse_error) =
-                grant_traverse_targets(sid.as_psid(), traverse_targets);
-            let (fs_allow_granted, fs_allow_failures) =
-                grant_fs_allow_entries(sid.as_psid(), fs_allow_entries);
+                grant_traverse_targets(traverse_cap.as_psid(), traverse_targets);
+
+            let (fs_allow_granted, fs_allow_failures) = if fs_allow_entries.is_empty() {
+                (Vec::new(), Vec::new())
+            } else if !crate::tier2a::session_profile::is_session_profile_name(&session_profile) {
+                log::line("dispatch: rejected a malformed session profile name");
+                let failures = fs_allow_entries
+                    .into_iter()
+                    .map(|e| {
+                        (
+                            e.path,
+                            "rejected: malformed session profile name".to_string(),
+                        )
+                    })
+                    .collect();
+                (Vec::new(), failures)
+            } else {
+                match win_appcontainer::ensure_profile(&session_profile) {
+                    Ok(session_sid) => grant_fs_allow_entries(session_sid.as_psid(), fs_allow_entries),
+                    Err(e) => {
+                        log::line(&format!("dispatch: ensure_profile(session) failed: {e}"));
+                        let failures = fs_allow_entries
+                            .into_iter()
+                            .map(|entry| (entry.path, format!("failed to resolve session SID: {e}")))
+                            .collect();
+                        (Vec::new(), failures)
+                    }
+                }
+            };
             log::line(&format!(
                 "dispatch: GrantWorkspaceAccess done, {} traverse node(s) granted (error={:?}), \
                  {} fs-allow granted, {} fs-allow failed",

@@ -31,7 +31,6 @@ pub mod phase;
 pub mod prompts;
 pub mod schema;
 pub mod scratch;
-mod text;
 
 pub use context::{AssembledCall, CallKind, ContextAssembler, PhaseInput};
 pub use hiv::{HivContext, HivEngine, HivLimits, HivOutcome, HivStop};

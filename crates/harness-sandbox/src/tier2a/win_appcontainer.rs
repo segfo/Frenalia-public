@@ -136,9 +136,85 @@ impl Drop for OwnedContainerSid {
     }
 }
 
+/// harnessサンドボックスが共通で携えるcapabilityの名前（D-37）。
+///
+/// **祖先ディレクトリのtraverse ACEだけ**をこのcapability SID宛に付与する。package SIDが
+/// セッションごとに変わっても、祖先への付与は一度きり（＝昇格も一度きり）で済ませるための
+/// 逃がし方であり、実機で「capability無しの新package SIDは本番のFS I/O判定に失敗し、
+/// capability有りなら成功する」ことを確認したうえで採っている。
+///
+/// **残存リスク**: capability SIDはトークンへ任意に積めるため、harness以外のプロセスが同じ
+/// capability名でAppContainerを作れば同じ祖先をtraverseできる。ただし得られるのは通過と
+/// 属性読み取りだけで、内容の読み取りには各パスのACEが別途要る（通常のユーザープロセスが
+/// 既に持つ権限と同等）。
+pub const TRAVERSE_CAPABILITY_NAME: &str = "harnessSandboxTraverse";
+
+/// [`TRAVERSE_CAPABILITY_NAME`]から導出したcapability SID。祖先traverseの付与先であり、
+/// 子プロセス起動時にトークンへ積む値でもある。
+pub fn traverse_capability_sid() -> Result<crate::win_common::OwnedSid, AppContainerError> {
+    use windows::Win32::Security::DeriveCapabilitySidsFromName;
+    let name_w = wide(TRAVERSE_CAPABILITY_NAME);
+    unsafe {
+        let mut group_sids: *mut PSID = std::ptr::null_mut();
+        let mut group_count = 0u32;
+        let mut cap_sids: *mut PSID = std::ptr::null_mut();
+        let mut cap_count = 0u32;
+        DeriveCapabilitySidsFromName(
+            PCWSTR(name_w.as_ptr()),
+            &mut group_sids,
+            &mut group_count,
+            &mut cap_sids,
+            &mut cap_count,
+        )
+        .map_err(|e| win32_err("DeriveCapabilitySidsFromName", e))?;
+
+        let owned = if cap_sids.is_null() || cap_count == 0 {
+            Err(AppContainerError::Win32(
+                "DeriveCapabilitySidsFromName returned no capability SID".to_string(),
+            ))
+        } else {
+            crate::win_common::OwnedSid::copy_from(*cap_sids)
+                .map_err(|e| win32_err("CopySid(capability)", e))
+        };
+
+        // グループ・capability双方の配列と各要素を解放する（MSDN記載の解放規則）。
+        for i in 0..group_count as usize {
+            let _ = LocalFree(HLOCAL((*group_sids.add(i)).0 as *mut _));
+        }
+        let _ = LocalFree(HLOCAL(group_sids as *mut _));
+        for i in 0..cap_count as usize {
+            let _ = LocalFree(HLOCAL((*cap_sids.add(i)).0 as *mut _));
+        }
+        let _ = LocalFree(HLOCAL(cap_sids as *mut _));
+        owned
+    }
+}
+
+/// [`ensure_profile`]を直列化する名前付きmutex。
+///
+/// プロファイル（`CONTAINER_NAME`）はマシン/ユーザー全体で1つの共有資源で、作成と参照が
+/// 同時に走ると`CreateAppContainerProfile`／`DeriveAppContainerSidFromAppContainerName`が
+/// `E_UNEXPECTED`(0x8000FFFF)を返す（実測: 並列10回中2回失敗・直列10回中0回失敗、
+/// [BUG-054](../../../docs/bugs/BUG-054.md)）。プロファイルはユーザー単位のレジストリハイブに
+/// 保存されるため`Local\`名前空間で足りる（同一セッションなら非昇格の本体と昇格した
+/// `harness-netfilterd`の双方から同じ名前で見える）。
+const PROFILE_LOCK: &str = r"Local\harness-appcontainer-profile";
+
+/// Win32呼び出しの失敗に**どのAPIか**を添える。`windows::core::Error`の`Display`は
+/// HRESULTの汎用文言（「致命的なエラーです。」等）しか持たず、これだけでは調査が始められない。
+fn win32_err(op: &str, e: windows::core::Error) -> AppContainerError {
+    AppContainerError::Win32(format!("{op}: {e}"))
+}
+
 /// harness専用のAppContainerプロファイルを作成する（既に存在すれば既存SIDを取得するのみ、
 /// capability再指定は不要で副作用が無い）。
+///
+/// 同一プロファイルへの並行アクセスは[`PROFILE_LOCK`]で直列化する。
 pub fn ensure_profile(name: &str) -> Result<OwnedContainerSid, AppContainerError> {
+    crate::with_named_lock(PROFILE_LOCK, || ensure_profile_locked(name))
+}
+
+fn ensure_profile_locked(name: &str) -> Result<OwnedContainerSid, AppContainerError> {
     unsafe {
         let name_w = wide(name);
         let display_w = wide("Harness Shell Sandbox");
@@ -153,10 +229,11 @@ pub fn ensure_profile(name: &str) -> Result<OwnedContainerSid, AppContainerError
         ) {
             Ok(sid) => Ok(OwnedContainerSid(sid)),
             Err(e) if e.code() == ERROR_ALREADY_EXISTS.to_hresult() => {
-                let sid = DeriveAppContainerSidFromAppContainerName(PCWSTR(name_w.as_ptr()))?;
+                let sid = DeriveAppContainerSidFromAppContainerName(PCWSTR(name_w.as_ptr()))
+                    .map_err(|e| win32_err("DeriveAppContainerSidFromAppContainerName", e))?;
                 Ok(OwnedContainerSid(sid))
             }
-            Err(e) => Err(AppContainerError::from(e)),
+            Err(e) => Err(win32_err("CreateAppContainerProfile", e)),
         }
     }
 }

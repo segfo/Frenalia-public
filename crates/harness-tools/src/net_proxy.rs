@@ -65,6 +65,10 @@ pub struct NetAuditEntry {
     /// `protocol="tls_sni"`のとき、ClientHelloのALPN候補。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alpn: Option<Vec<String>>,
+    /// `reason`だけでは足りない補足（現状は上流接続失敗のOSエラー文字列）。
+    /// **ポリシー判定の結果ではなく、なぜ通信が成立しなかったかの診断情報**を載せる。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -125,6 +129,35 @@ impl NetAuditLog {
             matched_pattern,
             connect_host: None,
             alpn: None,
+            detail: None,
+        });
+    }
+
+    /// ポリシー上は許可されたのに上流へ接続できなかったことを記録する。
+    ///
+    /// これが無いと、失敗は`502 Bad Gateway`／SOCKS5の`0x04`という**外向きの結果**にしか
+    /// 残らず、原因（名前解決の失敗か、拒否か、到達不能か）が監査ログから完全に消える。
+    /// `docs/STATUS.md` Tier2a残課題#6の切り分けが長く止まっていた理由がまさにこれだった
+    /// （[BUG-054](../../../docs/bugs/BUG-054.md)）。
+    fn record_upstream_failure(
+        &self,
+        protocol: &'static str,
+        host: String,
+        port: Option<u16>,
+        error: &std::io::Error,
+    ) {
+        self.push(NetAuditEntry {
+            timestamp_unix_ms: now_unix_ms(),
+            kind: "proxy",
+            protocol,
+            host,
+            port,
+            allowed: false,
+            reason: "upstream_connect_failed",
+            matched_pattern: None,
+            connect_host: None,
+            alpn: None,
+            detail: Some(format!("{:?}: {error}", error.kind())),
         });
     }
 
@@ -151,6 +184,7 @@ impl NetAuditLog {
             matched_pattern,
             connect_host,
             alpn,
+            detail: None,
         });
     }
 
@@ -410,9 +444,12 @@ async fn handle_connect(
         return resp_status(StatusCode::FORBIDDEN);
     }
 
-    let upstream = match TcpStream::connect((host.as_str(), port)).await {
+    let upstream = match crate::dial::connect_upstream(host.as_str(), port).await {
         Ok(s) => s,
-        Err(_) => return resp_status(StatusCode::BAD_GATEWAY),
+        Err(e) => {
+            audit.record_upstream_failure("http_connect", host.clone(), Some(port), &e);
+            return resp_status(StatusCode::BAD_GATEWAY);
+        }
     };
 
     tokio::spawn(async move {
@@ -514,9 +551,10 @@ async fn handle_socks5(
         return Ok(());
     }
 
-    let upstream = match TcpStream::connect((host.as_str(), port)).await {
+    let upstream = match crate::dial::connect_upstream(host.as_str(), port).await {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) => {
+            audit.record_upstream_failure("socks5", host.clone(), Some(port), &e);
             write_socks5_reply(&mut stream, 0x04).await?; // Host unreachable.
             return Ok(());
         }

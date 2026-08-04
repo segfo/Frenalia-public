@@ -1,0 +1,109 @@
+//! スラッシュコマンドの語彙と構文解析（純粋関数）。
+//!
+//! 入力欄の文字列を[`SlashCommand`]/[`FsStageCommand`]へ写すだけで、状態もI/Oも持たない。
+//! キー入力の解釈（[`super::input`]）とも、エンジンからのイベント消費（[`super::events`]）とも
+//! 独立している。
+
+use super::*;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SlashCommand {
+    Model(String),
+    Mode(PermissionMode),
+    Allow(AllowlistRule),
+    Compact,
+    Clear,
+    /// 現在のセッションをForkし、以降の追記を新しいセッションファイルへ切り替える。
+    Fork,
+    /// セッションピッカーを開き、既存セッションへ切り替える。
+    Sessions,
+    /// `/fsstage`のサブコマンド（変更パネル/ステージ済み変更の操作）。
+    FsStage(FsStageCommand),
+}
+
+/// `/fsstage`のサブコマンド。
+///
+/// - `/fsstage` `/fsstage list`: 一覧をtranscriptへテキスト表示（非対話）
+/// - `/fsstage commit`: 対話パネルを開く（ファイル毎accept/reject、旧Ctrl+G相当）
+/// - `/fsstage commit <file>`: 指定ファイル1件だけを非対話で即commit
+/// - `/fsstage commit_all`: 全件を非対話で即commit
+/// - `/fsstage discard`: 全破棄（非対話、パネルを開かない）
+/// - `/fsstage resolve` `/fsstage resolve <path>`: コンフリクト解消（非対話、結果を
+///   transcriptへ積むだけ、パネルは開かない）。省略時は全コンフリクト対象、指定時は1件だけ。
+#[derive(Debug, Clone, PartialEq)]
+pub enum FsStageCommand {
+    List,
+    Open,
+    CommitAll,
+    CommitFile(String),
+    Discard,
+    Resolve(Option<String>),
+}
+
+/// `/`始まりの入力行をパースする。不正なコマンド/引数は`Err(理由)`。
+pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
+    let mut parts = input.trim().splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("").trim();
+    match cmd {
+        "/model" if !rest.is_empty() => Ok(SlashCommand::Model(rest.to_string())),
+        "/model" => Err("usage: /model <model-id>".to_string()),
+        "/mode" => rest.parse::<PermissionMode>().map(SlashCommand::Mode),
+        "/allow" => parse_allowlist_rule(rest)
+            .map(SlashCommand::Allow)
+            .ok_or_else(|| "usage: /allow <tool>:<pattern>".to_string()),
+        "/compact" => Ok(SlashCommand::Compact),
+        "/clear" => Ok(SlashCommand::Clear),
+        "/fork" => Ok(SlashCommand::Fork),
+        "/sessions" => Ok(SlashCommand::Sessions),
+        "/fsstage" => parse_fsstage_subcommand(rest).map(SlashCommand::FsStage),
+        other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// `/fsstage`の`rest`（サブコマンド以降）をパースする。
+pub(super) fn parse_fsstage_subcommand(rest: &str) -> Result<FsStageCommand, String> {
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("");
+    let sub_rest = parts.next().unwrap_or("").trim();
+    match sub {
+        "" | "list" => Ok(FsStageCommand::List),
+        "commit" if sub_rest.is_empty() => Ok(FsStageCommand::Open),
+        "commit" => Ok(FsStageCommand::CommitFile(sub_rest.to_string())),
+        "commit_all" => Ok(FsStageCommand::CommitAll),
+        "discard" => Ok(FsStageCommand::Discard),
+        "resolve" if sub_rest.is_empty() => Ok(FsStageCommand::Resolve(None)),
+        "resolve" => Ok(FsStageCommand::Resolve(Some(sub_rest.to_string()))),
+        other => Err(format!("unknown /fsstage subcommand: {other}")),
+    }
+}
+
+/// キー入力の結果、engineアクター/oneshotへ伝えるべきアクション。
+#[derive(Debug)]
+
+pub enum Action {
+    Submit(String),
+    Respond(String, Decision),
+    Slash(SlashCommand),
+    /// 現在進行中のターンをキャンセルする（M9、Escキー）。
+    Cancel,
+    Quit,
+    /// 変更（changes）パネルを開く（`/fsstage commit`、旧Ctrl+G相当）。呼び出し側
+    /// （`harness-tui::run`）が`SandboxFs::change_set()`を読んで`AppState::open_changes_panel`
+    /// を呼ぶ（`AppState`自体はサンドボックスへアクセスしない）。既にパネルが開いていても
+    /// 単に最新の変更セットで開き直す（トグルではない）。
+    OpenChangesPanel,
+    /// 変更パネルで`c`（コミット）を押した結果、または`/fsstage commit <file>`/`commit_all`。
+    /// reject印の付いたエントリを除いたパス集合（`SandboxFs::apply`の`only_paths`にそのまま渡す）。
+    CommitChanges(Vec<String>),
+    /// `/fsstage commit_all`（非対話、パネルを開かず全件commit）。
+    CommitAllChanges,
+    /// `/fsstage list`（非対話、パネルを開かずtranscriptへテキスト表示）。
+    ListChanges,
+    /// 変更パネルで`x`（破棄）を押した結果、または`/fsstage discard`（非対話）。
+    DiscardChanges,
+    /// `/fsstage resolve [path]`（非対話、パネルを開かない）。`Some(path)`なら1件だけ、
+    /// `None`なら全コンフリクト対象。呼び出し側（`harness-tui::run`）が
+    /// `harness_sandbox::resolve`を叩き、エディタ起動の前後で端末を中断・復帰させる。
+    ResolveChanges(Option<String>),
+}

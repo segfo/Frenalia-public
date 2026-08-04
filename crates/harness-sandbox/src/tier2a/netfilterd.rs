@@ -53,7 +53,7 @@ use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLE
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use crate::tier2a::wfp::{WfpOptions, WfpSession};
-use crate::tier2a::win_appcontainer::{self, CONTAINER_NAME};
+use crate::tier2a::win_appcontainer;
 use crate::win_common::wide;
 
 /// daemonへ投入させるネットワークポリシー一式（`ApplyRules`のペイロード）。
@@ -70,6 +70,13 @@ use crate::win_common::wide;
 /// `allow_direct_dns`はR-02で削除した（`docs/STATUS.md`参照）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetfilterPolicy {
+    /// D-37: WFPフィルタを条件付けるAppContainerのセッションプロファイル名。
+    ///
+    /// **SIDではなく名前を運ぶ**（privhelperと同じ方針）。昇格側は
+    /// `session_profile::is_session_profile_name`で形を検証してから`ensure_profile`で
+    /// 導出するので、任意のAppContainerへフィルタを張らせることはできない。
+    #[serde(default)]
+    pub session_profile: String,
     #[serde(default)]
     pub allow_loopback_tcp_ports: Vec<u16>,
     #[serde(default)]
@@ -460,7 +467,19 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
         }
     };
 
-    let sid = match win_appcontainer::ensure_profile(CONTAINER_NAME) {
+    // D-37: フィルタの条件になるpackage SIDは、要求で受け取ったセッションプロファイル名から
+    // 導出する。名前の形を先に検証し、harnessのセッションプロファイル以外は拒否する。
+    if !crate::tier2a::session_profile::is_session_profile_name(&policy.session_profile) {
+        let resp = NetfilterResponse::Err(format!(
+            "rejected malformed session profile name: {:?}",
+            policy.session_profile
+        ));
+        send_response(pipe, &resp)?;
+        return Err(NetfilterError::Ipc(
+            "malformed session profile name".to_string(),
+        ));
+    }
+    let sid = match win_appcontainer::ensure_profile(&policy.session_profile) {
         Ok(sid) => sid,
         Err(e) => {
             let resp = NetfilterResponse::Err(format!("failed to resolve sandbox SID: {e}"));
@@ -472,6 +491,7 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
     // `NetfilterPolicy`はIPCワイヤ形式、`WfpOptions`はWFPエンジンへ渡す層のオプションで、
     // 現状フィールドは同形だが所有するレイヤーが違う。型は分けたまま、ここで明示的に写す。
     let opts = WfpOptions {
+        session_profile: policy.session_profile.clone(),
         allow_loopback_tcp_ports: policy.allow_loopback_tcp_ports,
         allow_loopback_udp_ports: policy.allow_loopback_udp_ports,
         audit_log_path: policy.audit_log_path,
@@ -526,6 +546,7 @@ mod tests {
     #[test]
     fn apply_rules_request_roundtrips_through_json() {
         let req = NetfilterRequest::ApplyRules(NetfilterPolicy {
+            session_profile: "harness.shell.sandbox.1234-5678".to_string(),
             allow_loopback_tcp_ports: vec![18080, 18053],
             allow_loopback_udp_ports: vec![18053],
             audit_log_path: Some(PathBuf::from(".harness/sandbox/session-x/net-audit.jsonl")),
@@ -534,10 +555,12 @@ mod tests {
         let decoded: NetfilterRequest = serde_json::from_slice(&bytes).unwrap();
         match decoded {
             NetfilterRequest::ApplyRules(NetfilterPolicy {
+                session_profile,
                 allow_loopback_tcp_ports,
                 allow_loopback_udp_ports,
                 audit_log_path,
             }) => {
+                assert_eq!(session_profile, "harness.shell.sandbox.1234-5678");
                 assert_eq!(allow_loopback_tcp_ports, vec![18080, 18053]);
                 assert_eq!(allow_loopback_udp_ports, vec![18053]);
                 assert_eq!(
@@ -556,13 +579,15 @@ mod tests {
     #[test]
     fn apply_rules_request_json_wire_format_is_stable() {
         let req = NetfilterRequest::ApplyRules(NetfilterPolicy {
+            session_profile: "harness.shell.sandbox.1-2".to_string(),
             allow_loopback_tcp_ports: vec![18080],
             allow_loopback_udp_ports: vec![18053],
             audit_log_path: Some(PathBuf::from("net-audit.jsonl")),
         });
+        // D-37で`session_profile`を先頭へ追加した（昇格側はこの名前を検証してからSIDを導出する）。
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
-            r#"{"ApplyRules":{"allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"audit_log_path":"net-audit.jsonl"}}"#
+            r#"{"ApplyRules":{"session_profile":"harness.shell.sandbox.1-2","allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"audit_log_path":"net-audit.jsonl"}}"#
         );
         assert_eq!(
             serde_json::to_string(&NetfilterRequest::Teardown).unwrap(),
@@ -613,10 +638,14 @@ mod tests {
         let decoded: NetfilterRequest = serde_json::from_str(legacy).unwrap();
         match decoded {
             NetfilterRequest::ApplyRules(NetfilterPolicy {
+                session_profile,
                 allow_loopback_tcp_ports,
                 allow_loopback_udp_ports,
                 audit_log_path,
             }) => {
+                // 名前が欠落したJSONは空文字として読める。空文字は
+                // `is_session_profile_name`が拒否するので、`serve_inner`はfail-closedになる。
+                assert!(session_profile.is_empty());
                 assert!(allow_loopback_tcp_ports.is_empty());
                 assert!(allow_loopback_udp_ports.is_empty());
                 assert_eq!(audit_log_path, None);

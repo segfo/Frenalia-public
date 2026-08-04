@@ -9,6 +9,7 @@ pub mod net_policy;
 pub mod prompt;
 pub mod provider;
 pub mod schema;
+pub mod text;
 pub mod tool;
 
 pub use cognition::{CognitionLevel, Phase, TokenBudget};
@@ -25,6 +26,7 @@ pub use provider::{
     Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
 };
 pub use schema::{apply_schema_strategy, unwrap_forced_tool_stream, SchemaStrategy};
+pub use text::truncate_head_tail;
 pub use tool::{
     NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, RequireSandbox, RiskClass, ShellTier,
     ShellTierSelection, StagingConfig, StagingMode, TlsInspection, Tool, ToolCtx, ToolError,

@@ -134,6 +134,7 @@ async fn run_scenario(via_orchestrator: bool) -> RunResult {
         model: "mock".into(),
         max_tokens: 100,
         max_turns: 5,
+        compaction: Default::default(),
     };
 
     let outcome = if via_orchestrator {

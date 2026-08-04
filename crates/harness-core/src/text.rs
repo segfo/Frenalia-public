@@ -1,13 +1,15 @@
-//! 文字列の機械的な切詰め。`plans/DESIGN-COGNITION.md` §6.2「まず機械的に切詰め →
-//! 蒸留で意味的に抽出」の前段フィルタで、台帳スライスの縮約（[`crate::context`]）・
-//! 生出力の遅延展開（[`crate::scratch`]）・観測の蒸留入力（[`crate::hiv::evidence`]）の
-//! 3箇所が同じ関数を使う（`docs/CODE-STRUCTURE-RULES.md` 規則5）。
+//! 文字列の機械的な切詰め。
+//!
+//! **`harness-engine`（縮約①段・ツール出力の投入時切詰め）と`harness-cognition`（台帳スライスの
+//! 縮約・生出力の遅延展開・観測の蒸留入力）が同じ関数を使う**ため、両方が依存する`harness-core`が
+//! 持つ（`docs/CODE-STRUCTURE-RULES.md`規則5）。以前は両クレートに**バイト単位で同一の実装が
+//! 2つ**あり、片方だけ直すと静かに食い違う状態だった。
 
 /// `content`が`max_chars`文字を超える場合、先頭/末尾を残し中間を省略記号に置き換える。
 ///
 /// 文字数（`chars().count()`）で数えるのはトークン概算が文字数ベースだからで、
 /// バイト数で切ると日本語で境界が壊れる。
-pub(crate) fn truncate_head_tail(content: &str, max_chars: usize) -> String {
+pub fn truncate_head_tail(content: &str, max_chars: usize) -> String {
     let total = content.chars().count();
     if total <= max_chars {
         return content.to_string();

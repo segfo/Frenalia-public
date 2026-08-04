@@ -31,3 +31,5 @@ libc = "0.2"
 [dev-dependencies]
 harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 tempfile = "3"
+# `dial`のstagger挙動を実時間を待たずに検証するため（`tokio::test(start_paused)`）。
+tokio = { version = "1.42", features = ["test-util"] }

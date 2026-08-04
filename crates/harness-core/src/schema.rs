@@ -195,6 +195,7 @@ mod tests {
             schema_with_tools: with_tools,
             prompt_caching: false,
             context_window: 128_000,
+            local: false,
         }
     }
 

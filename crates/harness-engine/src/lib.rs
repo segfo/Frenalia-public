@@ -62,9 +62,30 @@ pub(crate) fn emit(events: Option<&EventSink>, ev: AgentEvent) {
 /// TUI表示と予算会計がずれないようにするためで、推定器のコピーを作らない
 /// （`docs/CODE-STRUCTURE-RULES.md` 規則5）。
 pub fn estimate_tokens(req: &CompletionRequest) -> u64 {
-    serde_json::to_string(req)
+    estimate_json_tokens(req)
+}
+
+/// 任意のIR値をJSONシリアライズした文字数からの粗い近似（chars/4）。
+///
+/// [`estimate_tokens`]（リクエスト全体）と[`estimate_messages`]（履歴の一部）の**共通のコア**で、
+/// 推定式を1箇所に閉じるために抽出してある（`docs/CODE-STRUCTURE-RULES.md` 規則5）。
+/// 縮約の発火判定（`plans/PLAN-COMPACTION.md`）は「リクエスト全体」ではなく「前ターン以降に
+/// 積んだメッセージだけ」を測る必要があり、同じ式の2つ目の実装を作らないための土台。
+///
+/// シリアライズに失敗したら`0`を返す。推定値は判定を**早める**方向にしか使わないので、
+/// 0へ倒しても「縮約しそこねてリアクティブ経路が受け止める」だけで済む（fail-open だが、
+/// この値は保護境界ではない）。
+pub fn estimate_json_tokens<T: serde::Serialize>(value: &T) -> u64 {
+    serde_json::to_string(value)
         .map(|s| (s.chars().count() as u64) / 4)
         .unwrap_or(0)
+}
+
+/// メッセージ列だけのトークン概算。[`estimate_tokens`]と同じ推定器に載る。
+///
+/// 縮約の(B)超過直前トリガが「前ターンの実測`usage`に反映されていない未計測分」を積むのに使う。
+pub fn estimate_messages(messages: &[Message]) -> u64 {
+    estimate_json_tokens(&messages)
 }
 
 /// 会話のIR履歴。
@@ -129,6 +150,9 @@ pub struct AgentLoopConfig {
     pub max_tokens: u32,
     /// 暴走ループの保険（`--max-turns` としての正式な設定化はM9のスコープ）。
     pub max_turns: usize,
+    /// コンテキスト縮約のポリシー（`plans/PLAN-COMPACTION.md`）。
+    /// `CompactionPolicy::resolve`で解決済みのものを渡す（解決の失敗は起動時に止める）。
+    pub compaction: compaction::CompactionPolicy,
 }
 
 /// `ConversationState`全体を1リクエストへ写す。認知レイヤー（M14以降）はここを通らず、
@@ -203,6 +227,24 @@ where
         }
     }
 
+    // 縮約のヒステリシス状態（`plans/PLAN-COMPACTION.md`「ヒステリシス」）。
+    // `mark`は前ターンの実測`usage`がカバーする範囲の終端。0初期化なので、`--resume`で
+    // 復元した履歴全体が初回の「未計測分」として数えられる。
+    let mut last_usage: Option<Usage> = None;
+    let mut mark: usize = 0;
+    // ②ローリング要約を既に打ったか。**1回の`run_agent_loop`で②は高々1回**に制限する。
+    //
+    // `plans/PLAN-COMPACTION.md`は「削減量が0だったら履歴が伸びるまで再試行しない」という
+    // 長さベースのクールダウンを指定しているが、このループは毎周回で必ずメッセージが増える
+    // （assistant応答＋tool_result）ため、その条件は**構造的に一度も成立しない**。
+    // 実際に止めたい振動は「①が少しだけ削って目標に届かず、毎ターン②の要約コールを打つ」で、
+    // ①が成功している限り長さベースの判定では止まらない。
+    //
+    // ②は「直近`keep_recent_turns`件より前」を丸ごと畳む操作なので、同じ`run_agent_loop`の
+    // 中で2回目を打っても、新しい外部ユーザターンが無い以上ほぼ何も足せない一方、
+    // 要約を要約し直して情報を失い、prompt cacheを再び全ミスさせる。1回に制限してよい。
+    let mut summarized = false;
+
     for _ in 0..config.max_turns {
         if cancel.is_some_and(|c| c.is_cancelled()) {
             emit(events, AgentEvent::Cancelled);
@@ -213,6 +255,24 @@ where
         if tier3 {
             sanitize::completion_request(&mut req);
         }
+
+        // 予防的縮約は`TurnStarted`を出す**前**に行う。こうすると
+        // `estimated_input_tokens`が縮約後の値になり、TUI表示と実送信量が一致する。
+        let pressure = assess_pressure(state, mark, last_usage, estimate_tokens(&req), &config);
+        if pressure.should_compact() {
+            let outcome =
+                relieve_pressure(provider, state, &config, events, &pressure, summarized).await?;
+            summarized |= outcome.summarized;
+            if outcome.relieved {
+                req = build_request(state, &tool_specs, &config);
+                if tier3 {
+                    sanitize::completion_request(&mut req);
+                }
+            }
+            // 何も縮められなくてもエラーにはせずそのまま送る——推定は外れ得るので、
+            // 推定だけを根拠に送信を止めない（外れていればリアクティブ経路が受け止める）。
+        }
+
         emit(
             events,
             AgentEvent::TurnStarted {
@@ -233,24 +293,49 @@ where
                     state,
                     &config.model,
                     compaction::DEFAULT_KEEP_RECENT_TURNS,
+                    compaction::summarize::chunk_tokens_for(config.compaction.context_window),
                 )
                 .await?;
-                if removed == 0 {
-                    let e = ProviderError::ContextTooLong;
+                if removed > 0 {
                     emit(
                         events,
-                        AgentEvent::Error {
-                            message: e.to_string(),
+                        AgentEvent::ContextCompacted {
+                            removed_messages: removed,
                         },
                     );
-                    return Err(e);
+                } else {
+                    // 直近2ターンだけで超過している等、要約では畳めない形。諦める前に
+                    // **保護なし・深い下限**の切詰めを1回だけ試す（最後の手段）。
+                    //
+                    // ここでポリシーの`target_savings`を使ってはいけない。この経路に来た時点で
+                    // 「推定は超過していないと言ったのにプロバイダが超過だと言った」＝分母
+                    // （`context_window`）が実態と合っていないことが確定しており、その分母から
+                    // 導いた目標は0になり得る。削減目標は置かず、**下限まで削り切る**。
+                    let scope = state.messages.len();
+                    let out = compaction::shrink_largest_tool_results(
+                        &mut state.messages,
+                        scope,
+                        u64::MAX,
+                        compaction::shrink::FALLBACK_FLOOR_CHARS,
+                    );
+                    if out.is_noop() {
+                        let e = ProviderError::ContextTooLong;
+                        emit(
+                            events,
+                            AgentEvent::Error {
+                                message: e.to_string(),
+                            },
+                        );
+                        return Err(e);
+                    }
+                    emit(
+                        events,
+                        AgentEvent::ContextShrunk {
+                            truncated_blocks: out.blocks,
+                            saved_tokens: out.saved_tokens,
+                        },
+                    );
                 }
-                emit(
-                    events,
-                    AgentEvent::ContextCompacted {
-                        removed_messages: removed,
-                    },
-                );
                 let mut retry_req = CompletionRequest {
                     messages: state.messages.clone(),
                     ..req
@@ -300,6 +385,10 @@ where
             role: Role::Assistant,
             content: raw.content,
         });
+        // 実測`usage`は「このリクエストの入力＋その応答」をカバーする。assistantメッセージを
+        // 積んだ**この時点**が計測済みの終端で、この後に積むtool_resultは次ターンの未計測分。
+        last_usage = Some(raw.usage);
+        mark = state.messages.len();
 
         // Phase5-C: `stop_reason`（プロバイダの`finish_reason`）ではなく、実際に`ToolUse`が
         // 積まれたかどうかで分岐する。LMStudio実機観測で、tool_callが積まれているのに
@@ -337,6 +426,100 @@ where
     })
 }
 
+/// 現時点のコンテキスト圧を測る。`mark`以降のメッセージが「前ターンの実測`usage`に
+/// 反映されていない未計測分」。
+fn assess_pressure(
+    state: &ConversationState,
+    mark: usize,
+    last_usage: Option<Usage>,
+    fallback_estimate: u64,
+    config: &AgentLoopConfig,
+) -> compaction::ContextPressure {
+    let unmeasured = estimate_messages(&state.messages[mark.min(state.messages.len())..]);
+    compaction::assess(
+        last_usage,
+        fallback_estimate,
+        unmeasured,
+        config.max_tokens,
+        &config.compaction,
+    )
+}
+
+/// [`relieve_pressure`]の結果。
+struct Relief {
+    /// 履歴が実際に小さくなったか（`true`ならリクエストを組み直す）。
+    relieved: bool,
+    /// このコールで②ローリング要約を打ったか（1回の`run_agent_loop`で高々1回に制限する）。
+    summarized: bool,
+}
+
+/// 予防的縮約。**安い順に①→②**（`plans/PLAN-COMPACTION.md`「縮約の順序」）。
+///
+/// 目標に届かなくてもエラーにはしない——推定は外れ得るので、推定だけを根拠に送信を止めない
+/// （外れていればリアクティブ経路が受け止める）。
+///
+/// `already_summarized`が`true`なら②を飛ばして①だけ行う（振動防止）。
+async fn relieve_pressure(
+    provider: &dyn LlmProvider,
+    state: &mut ConversationState,
+    config: &AgentLoopConfig,
+    events: Option<&EventSink>,
+    pressure: &compaction::ContextPressure,
+    already_summarized: bool,
+) -> Result<Relief, ProviderError> {
+    let target = pressure.target_savings();
+    let mut relieved = false;
+
+    // ① tool_resultの選択的切詰め。LLMコール0・ブロック対応を壊さない・prompt cacheも壊さない。
+    // 直近1ターンは保護する（モデルがまさに参照中の出力なので削らない）。
+    let protect_from = compaction::protect_boundary(&state.messages, 1).unwrap_or(0);
+    let out = compaction::shrink_largest_tool_results(
+        &mut state.messages,
+        protect_from,
+        target,
+        compaction::shrink::PREVENTIVE_FLOOR_CHARS,
+    );
+    if !out.is_noop() {
+        relieved = true;
+        emit(
+            events,
+            AgentEvent::ContextShrunk {
+                truncated_blocks: out.blocks,
+                saved_tokens: out.saved_tokens,
+            },
+        );
+    }
+    if out.saved_tokens >= target || already_summarized {
+        return Ok(Relief {
+            relieved,
+            summarized: false,
+        });
+    }
+
+    // ② ローリング要約。不可逆でprompt cacheを全ミスさせるので①で足りなければ初めて使う。
+    let removed = compaction::compact(
+        provider,
+        state,
+        &config.model,
+        compaction::DEFAULT_KEEP_RECENT_TURNS,
+        compaction::summarize::chunk_tokens_for(config.compaction.context_window),
+    )
+    .await?;
+    if removed > 0 {
+        relieved = true;
+        emit(
+            events,
+            AgentEvent::ContextCompacted {
+                removed_messages: removed,
+            },
+        );
+    }
+    Ok(Relief {
+        relieved,
+        summarized: true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +550,39 @@ mod tests {
         });
 
         assert!(estimate_tokens(&large) > estimate_tokens(&small));
+    }
+
+    /// `estimate_tokens`・`estimate_messages`が**同一のコア**（`estimate_json_tokens`）に
+    /// 載っていること。縮約の発火判定はリクエスト全体ではなく未計測のメッセージだけを測るため
+    /// 別入口が要るが、推定式が枝分かれすると「TUI表示の概算」と「縮約の判定」がずれる
+    /// （`docs/CODE-STRUCTURE-RULES.md` 規則5）。
+    #[test]
+    fn the_request_and_message_estimators_share_one_core() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text("あ".repeat(1000))],
+        }];
+        let req = CompletionRequest {
+            system: vec![],
+            messages: messages.clone(),
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            output: None,
+            parallel_tool_calls: None,
+            max_tokens: 100,
+            sampling: Sampling::default(),
+            model: "mock".into(),
+        };
+
+        assert_eq!(estimate_tokens(&req), estimate_json_tokens(&req));
+        assert_eq!(
+            estimate_messages(&messages),
+            estimate_json_tokens(&messages)
+        );
+        // メッセージ単体の見積りはリクエスト全体を上回らない（包含関係）。
+        assert!(estimate_messages(&messages) < estimate_tokens(&req));
+        // 空なら実質ゼロ（JSONの`[]`ぶんだけ）。
+        assert_eq!(estimate_messages(&[]), 0);
     }
 
     /// あらかじめ用意したターンごとの`StreamEvent`列を順番に返すテスト用プロバイダ。
@@ -509,6 +725,7 @@ mod tests {
                 model: "mock".into(),
                 max_tokens: 100,
                 max_turns: 5,
+                compaction: Default::default(),
             },
             None,
             None,
@@ -572,6 +789,7 @@ mod tests {
                 model: "mock".into(),
                 max_tokens: 100,
                 max_turns: 5,
+                compaction: Default::default(),
             },
             Some(&events_tx),
             None,
@@ -645,6 +863,7 @@ mod tests {
                 model: "mock".into(),
                 max_tokens: 100,
                 max_turns: 5,
+                compaction: Default::default(),
             },
             None,
             None,
@@ -693,6 +912,7 @@ mod tests {
                 model: "mock".into(),
                 max_tokens: 100,
                 max_turns: 5,
+                compaction: Default::default(),
             },
             None,
             None,
@@ -741,6 +961,7 @@ mod tests {
                 model: "mock".into(),
                 max_tokens: 100,
                 max_turns: 5,
+                compaction: Default::default(),
             },
             None,
             None,
@@ -811,6 +1032,7 @@ mod tests {
                     model: "mock".into(),
                     max_tokens: 100,
                     max_turns: 5,
+                    compaction: Default::default(),
                 },
                 None,
                 Some(&cancel),
@@ -920,6 +1142,7 @@ mod tests {
                     model: "mock".into(),
                     max_tokens: 100,
                     max_turns: 5,
+                    compaction: Default::default(),
                 },
                 None,
                 Some(&cancel),
@@ -975,6 +1198,7 @@ mod tests {
                 model: "mock".into(),
                 max_tokens: 100,
                 max_turns: 5,
+                compaction: Default::default(),
             },
             None,
             None,
@@ -1020,6 +1244,7 @@ mod tests {
                     model: "mock".into(),
                     max_tokens: 100,
                     max_turns: 5,
+                    compaction: Default::default(),
                 },
                 Some(&events_tx),
                 Some(&cancel),

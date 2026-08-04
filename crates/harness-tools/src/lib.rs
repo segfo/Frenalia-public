@@ -17,6 +17,7 @@
 //! 実行前の許可判定（`PermissionArbiter`）はM4で`harness-engine`に実装したが、
 //! ツール本体はそれを意識しない（呼ばれた時点で既に許可済み）。
 
+mod dial;
 pub mod fake_dns;
 mod fs_tools;
 pub mod net_proxy;

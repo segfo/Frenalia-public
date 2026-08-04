@@ -51,6 +51,24 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // D-37: fs-allowの穴はセッション固有SID宛にもなり得る。**生きていないセッション**のぶんを
+    // 先に非昇格で剥がしておく（実行中のセッションのACEは触らない）。旧共有プロファイル宛の
+    // 撤収は下の既存フロー（昇格エスカレーション付き）がそのまま担当する。
+    //
+    // **既知の限界**: 死んだセッションがシステム保護パスへ付けたACEは、ここでは剥がせない
+    // （昇格が要る）。ただしそのSIDは二度と生成されないため、残っても不活性である。
+    for profile in harness_sandbox::tier2a::session_profile::revocable_profile_names()
+        .into_iter()
+        .filter(|p| harness_sandbox::tier2a::session_profile::is_session_profile_name(p))
+    {
+        if let Ok(dead_sid) = harness_sandbox::tier2a::win_appcontainer::ensure_profile(&profile) {
+            let _ = harness_sandbox::tier2a::win_appcontainer::revoke_ace_recursive(
+                path,
+                dead_sid.as_psid(),
+            );
+        }
+    }
+
     let forced = ledger_forced_flag(path);
     use harness_sandbox::tier2a::win_appcontainer::RevokeOutcome;
     match revoke_passthrough_outcome(path, &sid, forced) {

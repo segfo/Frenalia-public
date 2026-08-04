@@ -1,5 +1,9 @@
 //! 祖先ディレクトリチェーンへのtraverse ACE付与と撤収（D10、`harness fs grant-traverse` /
 //! `revoke-traverse`）。書込前に対象ノードを列挙する`--dry-run`プレビューを持つ。
+//!
+//! **付与先はharness共通のcapability SID**（D-37）。package SIDはセッションごとに変わるため、
+//! 祖先traverseをそこへ紐付けると起動のたびに昇格が要る。capability SIDは全harnessサンドボックスの
+//! トークンへ積まれるので、**一度きりの付与**で以後の全セッションが祖先を辿れる。
 
 use super::*;
 
@@ -11,9 +15,7 @@ use super::*;
 /// BUG-011）。
 #[cfg(windows)]
 pub(crate) fn fs_grant_traverse_preview(target: &Path) -> ExitCode {
-    let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
-        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
-    ) {
+    let sid = match harness_sandbox::tier2a::win_appcontainer::traverse_capability_sid() {
         Ok(sid) => sid,
         Err(e) => {
             eprintln!("dry-run: failed to resolve sandbox SID: {e}");
@@ -58,9 +60,7 @@ pub(crate) fn fs_grant_traverse(target: &Path) -> ExitCode {
     // 既にFILE_TRAVERSE|FILE_READ_ATTRIBUTESを持っているなら、privhelperもUACも一切呼ばず
     // 即座に成功する。`preview_traverse_chain`は`--dry-run`が使うのと同じ読み取り専用ヘルパで、
     // `WRITE_DAC`もUACも要らない。
-    if let Ok(sid) = harness_sandbox::tier2a::win_appcontainer::ensure_profile(
-        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
-    ) {
+    if let Ok(sid) = harness_sandbox::tier2a::win_appcontainer::traverse_capability_sid() {
         let preview =
             harness_sandbox::tier2a::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
         if !preview.is_empty() && preview.iter().all(|node| node.already_sufficient) {
@@ -142,9 +142,7 @@ pub(crate) fn fs_grant_traverse(target: &Path) -> ExitCode {
 /// 管理者で起動されたこと自体を警告する」に対応)。
 #[cfg(windows)]
 pub(crate) fn fs_grant_traverse_direct(target: &Path) -> ExitCode {
-    let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
-        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
-    ) {
+    let sid = match harness_sandbox::tier2a::win_appcontainer::traverse_capability_sid() {
         Ok(sid) => sid,
         Err(e) => {
             eprintln!("failed to resolve sandbox SID: {e}");
@@ -230,9 +228,7 @@ pub(crate) fn fs_revoke_traverse_one(path: &Path) -> ExitCode {
 
 #[cfg(windows)]
 pub(crate) fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
-    let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
-        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
-    ) {
+    let sid = match harness_sandbox::tier2a::win_appcontainer::traverse_capability_sid() {
         Ok(sid) => sid,
         Err(e) => {
             eprintln!("failed to resolve sandbox SID: {e}");

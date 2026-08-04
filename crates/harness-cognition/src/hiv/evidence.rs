@@ -51,7 +51,7 @@ pub(crate) fn observations(
                 .as_ref()
                 .and_then(|r| scratch.and_then(|s| s.zoom(r, max_chars).ok()))
                 .unwrap_or_else(|| {
-                    crate::text::truncate_head_tail(&call.output.content, max_chars)
+                    harness_core::text::truncate_head_tail(&call.output.content, max_chars)
                 });
             Observation {
                 source,
@@ -182,7 +182,11 @@ mod tests {
 
     #[test]
     fn read_only_calls_become_file_sources() {
-        let c = call("read_file", serde_json::json!({ "path": "src/lib.rs" }), "x");
+        let c = call(
+            "read_file",
+            serde_json::json!({ "path": "src/lib.rs" }),
+            "x",
+        );
         assert_eq!(
             source_ref_for(&c, Some(RiskClass::ReadOnly)),
             SourceRef::File {
@@ -241,7 +245,11 @@ mod tests {
     /// **実行されなかった呼び出しは観測にしない**（拒否理由が事実として台帳に載るのを防ぐ）。
     #[test]
     fn calls_that_never_ran_are_not_observations() {
-        let mut denied = call("run_shell", serde_json::json!({}), "permission denied by policy");
+        let mut denied = call(
+            "run_shell",
+            serde_json::json!({}),
+            "permission denied by policy",
+        );
         denied.decision = ToolCallDecision::DeniedByPolicy;
         let mut cancelled = call("read_file", serde_json::json!({}), "cancelled by user");
         cancelled.decision = ToolCallDecision::CancelledBeforeStart;
@@ -281,7 +289,11 @@ mod tests {
     #[test]
     fn observations_survive_without_a_scratch_store() {
         let obs = observations(
-            &[call("read_file", serde_json::json!({ "path": "a" }), "content")],
+            &[call(
+                "read_file",
+                serde_json::json!({ "path": "a" }),
+                "content",
+            )],
             |_| Some(RiskClass::ReadOnly),
             None,
             1_000,

@@ -194,6 +194,19 @@ pub(crate) fn protect_harness_control_dir_from_appcontainer(
 /// （`SE_DACL_PROTECTED`）は呼び出し前後で変更しない（このノードが元々継承を受けていなければ
 /// 書き戻し後も受けない、元々継承を受けていれば書き戻し後も受け続ける——ユーザーが独自に
 /// 設定した保護状態を巻き込んで変更しない）。
+/// D-37: セッションが付けたACEを1件撤収する（`session_profile`の回収経路が注入する処理）。
+///
+/// プロファイル名からSIDを導出して剥がし、ついでにworkspace一覧台帳からも消す。
+/// `session_profile`側はACL APIを知らない（規則3の分割線）ので、その具体をここが持つ。
+/// preflightの起動時GCと、CLIのセッション終了時撤収の**両方がこの1本を使う**。
+pub fn revoke_session_grant(path: &Path, profile_name: &str) {
+    let Ok(sid) = ensure_profile(profile_name) else {
+        return;
+    };
+    let _ = revoke_ace_recursive(path, sid.as_psid());
+    crate::tier2a::workspace_ledger::remove_workspace_entry(path);
+}
+
 pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
         path: path.to_path_buf(),

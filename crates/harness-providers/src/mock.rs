@@ -36,6 +36,10 @@ impl MockProvider {
                 schema_with_tools: true,
                 prompt_caching: false,
                 context_window: 200_000,
+                // `local: false` + 大きな`context_window`により、既存のgolden testでは使用率
+                // トリガが発火しない＝M13で固定したバイト等価性が保たれる
+                // （`plans/PLAN-COMPACTION.md`「既定値とローカル判定」）。
+                local: false,
             },
             record_path: None,
         }

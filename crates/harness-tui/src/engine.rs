@@ -93,6 +93,8 @@ pub fn spawn_engine(
     model: String,
     max_tokens: u32,
     max_turns: usize,
+    // `harness-cli`が`settings.json`/CLIフラグとプロバイダcapabilityから解決済みのもの。
+    compaction: compaction::CompactionPolicy,
     mut state: ConversationState,
     mut session: SessionStore,
     sessions_dir: PathBuf,
@@ -126,7 +128,12 @@ pub fn spawn_engine(
                         &tools,
                         &ctx,
                         gate_for_task.as_ref(),
-                        AgentLoopConfig { model: model.clone(), max_tokens, max_turns },
+                        AgentLoopConfig {
+                            model: model.clone(),
+                            max_tokens,
+                            max_turns,
+                            compaction,
+                        },
                         Some(&events_tx),
                         Some(&turn_cancel),
                         // TextDelta は`events`側で既に発行されるため、ここでの二重出力は不要
@@ -153,6 +160,9 @@ pub fn spawn_engine(
                                 &mut state,
                                 &model,
                                 compaction::DEFAULT_KEEP_RECENT_TURNS,
+                                compaction::summarize::chunk_tokens_for(
+                                    compaction.context_window,
+                                ),
                             )
                             .await
                             {

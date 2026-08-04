@@ -144,6 +144,7 @@ async fn naive_loop_request_sizes(workspace: &std::path::Path, rounds: usize) ->
             model: "mock".into(),
             max_tokens: 1_000,
             max_turns: rounds + 2,
+            compaction: Default::default(),
         },
         None,
         None,
@@ -168,6 +169,7 @@ fn caps() -> ProviderCapabilities {
         schema_with_tools: true,
         prompt_caching: true,
         context_window: 128_000,
+        local: false,
     }
 }
 

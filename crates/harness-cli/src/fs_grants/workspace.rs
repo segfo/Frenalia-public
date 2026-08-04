@@ -26,28 +26,42 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
-        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
-    ) {
-        Ok(sid) => sid,
-        Err(e) => {
-            eprintln!("failed to resolve sandbox SID: {e}");
-            return ExitCode::FAILURE;
+    // D-37: workspaceのACEはセッションごとの package SID 宛になった。撤収対象は
+    // 「旧共有プロファイル」＋「生きていないセッションのプロファイル」で、実行中のセッションの
+    // ぶんは触らない（実行中の他セッションから権限を奪わない、BUG-053と同じ原則）。
+    let mut failures = Vec::new();
+    let mut revoked = 0usize;
+    for profile in harness_sandbox::tier2a::session_profile::revocable_profile_names() {
+        let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(&profile) {
+            Ok(sid) => sid,
+            Err(e) => {
+                failures.push(format!("{profile}: failed to resolve SID: {e}"));
+                continue;
+            }
+        };
+        match harness_sandbox::tier2a::win_appcontainer::revoke_ace_recursive(
+            &canonical,
+            sid.as_psid(),
+        ) {
+            Ok(()) => revoked += 1,
+            Err(e) => failures.push(format!("{profile}: {e}")),
         }
-    };
-    match harness_sandbox::tier2a::win_appcontainer::revoke_ace_recursive(&canonical, sid.as_psid()) {
-        Ok(()) => {
-            harness_sandbox::tier2a::workspace_ledger::remove_workspace_entry(&canonical);
-            println!("revoked workspace access: {}", canonical.display());
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!(
-                "failed to revoke workspace access for {}: {e}",
-                canonical.display()
-            );
-            ExitCode::FAILURE
-        }
+    }
+    if failures.is_empty() {
+        harness_sandbox::tier2a::workspace_ledger::remove_workspace_entry(&canonical);
+        println!(
+            "revoked workspace access for {} harness profile(s): {}",
+            revoked,
+            canonical.display()
+        );
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "failed to revoke workspace access for {}: {}",
+            canonical.display(),
+            failures.join("; ")
+        );
+        ExitCode::FAILURE
     }
 }
 

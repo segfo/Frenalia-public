@@ -201,6 +201,10 @@ impl LlmProvider for OpenAiProvider {
             schema_with_tools: self.family == OpenAiFamily::OpenAi,
             prompt_caching: true,
             context_window: 128_000,
+            // LMStudioの実`n_ctx`はロード設定依存でこの128,000とは一致しない。実測値へ寄せるのは
+            // `settings.json`の`compaction.context_window`／`--context-window`の役目で、ここは
+            // 「ローカルである」ことの表明だけを担う（`plans/PLAN-COMPACTION.md`）。
+            local: self.family == OpenAiFamily::LmStudio,
         }
     }
 }

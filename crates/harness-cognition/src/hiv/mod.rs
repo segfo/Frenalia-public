@@ -82,7 +82,9 @@ pub enum HivStop {
     /// Decideまで到達した。
     Decided,
     /// 構造化出力が規定回数取れない等でこれ以上進めない（fail-closed）。
-    Blocked { reason: String },
+    Blocked {
+        reason: String,
+    },
     /// 上限（ラウンド・コール数）に当たった。
     BudgetExhausted,
     Cancelled,
@@ -268,9 +270,12 @@ impl HivEngine {
             proposed = out.hypotheses.into_iter().next();
         }
         let added = proposed.map(|p| {
-            let id = self
-                .mem
-                .add_hypothesis(goal, p.statement.clone(), p.predicts.clone(), p.confidence);
+            let id = self.mem.add_hypothesis(
+                goal,
+                p.statement.clone(),
+                p.predicts.clone(),
+                p.confidence,
+            );
             emit_event(
                 cx.events,
                 AgentEvent::HypothesisFormed {
@@ -282,11 +287,13 @@ impl HivEngine {
             id
         });
 
-        Ok(Some(match added.or_else(|| self.next_open_hypothesis(None)) {
-            Some(hyp) => State::Investigate(hyp),
-            // 仮説の上限に達していて、未決着のものも無い。持っている材料で結論へ。
-            None => State::Decide,
-        }))
+        Ok(Some(
+            match added.or_else(|| self.next_open_hypothesis(None)) {
+                Some(hyp) => State::Investigate(hyp),
+                // 仮説の上限に達していて、未決着のものも無い。持っている材料で結論へ。
+                None => State::Decide,
+            },
+        ))
     }
 
     async fn step_investigate(
@@ -294,7 +301,8 @@ impl HivEngine {
         hyp: HypId,
         cx: &HivContext<'_>,
     ) -> Result<Option<State>, PhaseError> {
-        self.mem.set_hypothesis_status(hyp, HypStatus::Investigating);
+        self.mem
+            .set_hypothesis_status(hyp, HypStatus::Investigating);
         let result: PhaseValue<InvestigateOutput> = self
             .runner(cx)
             .run(
@@ -492,7 +500,10 @@ impl HivEngine {
         self.calls_made += result.calls;
         self.usage.input = self.usage.input.saturating_add(result.usage.input);
         self.usage.output = self.usage.output.saturating_add(result.usage.output);
-        self.usage.cache_read = self.usage.cache_read.saturating_add(result.usage.cache_read);
+        self.usage.cache_read = self
+            .usage
+            .cache_read
+            .saturating_add(result.usage.cache_read);
         self.usage.cache_creation = self
             .usage
             .cache_creation
@@ -508,7 +519,10 @@ fn verify_method_for(plan: Option<&InvestigateOutput>) -> VerifyMethod {
         return VerifyMethod::ReRead;
     };
     let sources: Vec<&str> = plan.plan.iter().map(|s| s.source.as_str()).collect();
-    if sources.iter().any(|s| s.contains("shell") || s.contains("test")) {
+    if sources
+        .iter()
+        .any(|s| s.contains("shell") || s.contains("test"))
+    {
         VerifyMethod::RunTest
     } else if sources.len() > 1 {
         VerifyMethod::CrossSource
@@ -533,6 +547,7 @@ mod tests {
             schema_with_tools: true,
             prompt_caching: false,
             context_window: 128_000,
+            local: false,
         }
     }
 
@@ -654,7 +669,9 @@ mod tests {
             outcome.answer
         );
         assert!(
-            outcome.answer.contains("shell.rsがpowershellを起動している"),
+            outcome
+                .answer
+                .contains("shell.rsがpowershellを起動している"),
             "{}",
             outcome.answer
         );
@@ -667,7 +684,10 @@ mod tests {
     async fn every_phase_call_is_marked_internal() {
         let exec = PhaseExecutor::new([
             (Phase::Hypothesize, vec![hypothesize("X")]),
-            (Phase::Investigate, vec![Reply::Text("{\"plan\":[]}".into())]),
+            (
+                Phase::Investigate,
+                vec![Reply::Text("{\"plan\":[]}".into())],
+            ),
             (Phase::Verify, vec![verify("inconclusive")]),
             (Phase::Decide, vec![decide()]),
         ]);
@@ -682,7 +702,12 @@ mod tests {
 
         assert!(!exec.seen().is_empty());
         for seen in exec.seen() {
-            assert_eq!(seen.visibility, TurnVisibility::Internal, "{:?}", seen.phase);
+            assert_eq!(
+                seen.visibility,
+                TurnVisibility::Internal,
+                "{:?}",
+                seen.phase
+            );
         }
     }
 
@@ -761,7 +786,9 @@ mod tests {
         ] {
             let mut e = engine(HivLimits::default());
             let g = e.mem.add_goal("直す", vec![]);
-            let h = e.mem.add_hypothesis(g, "原因はX", vec!["Yが見える".into()], 0.7);
+            let h = e
+                .mem
+                .add_hypothesis(g, "原因はX", vec!["Yが見える".into()], 0.7);
             let recorded = source.clone();
             e.mem.add_evidence(
                 move |id| Evidence {
@@ -905,7 +932,11 @@ mod tests {
         )]);
         let (engine, outcome) = run(&exec, HivLimits::default()).await;
 
-        assert_eq!(exec.calls_to(Phase::Investigate), 0, "調査へ進んではならない");
+        assert_eq!(
+            exec.calls_to(Phase::Investigate),
+            0,
+            "調査へ進んではならない"
+        );
         assert_eq!(exec.calls_to(Phase::Hypothesize), 3, "1回目 + 再実行2回");
         let HivStop::Blocked { reason } = &outcome.stop else {
             panic!("expected fail-closed, got {:?}", outcome.stop);
@@ -913,7 +944,10 @@ mod tests {
         assert!(reason.contains("predicts"), "{reason}");
 
         let mem = engine.memory();
-        assert!(mem.hypotheses().is_empty(), "検証を通らない仮説は台帳へ入れない");
+        assert!(
+            mem.hypotheses().is_empty(),
+            "検証を通らない仮説は台帳へ入れない"
+        );
         assert_eq!(mem.goals()[0].status, GoalStatus::Blocked);
         assert!(mem.open_questions()[0].blocking);
         // 回答は「確証していない」ことを明示する（でっち上げない）。

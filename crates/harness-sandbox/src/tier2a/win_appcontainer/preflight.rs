@@ -312,7 +312,18 @@ pub fn preflight(
     wfp_chain_pipe: Option<String>,
     write_mode: &WorkspaceWriteMode,
 ) -> Result<PreflightOutcome, AppContainerError> {
-    let sid = ensure_profile(CONTAINER_NAME)?;
+    // D-37: プロファイルはセッション単位。共有package SIDをやめ、workspace・CoW upper_dir・
+    // fs-allowの穴はこのセッションのSIDにだけ紐付ける（別セッション・別workspaceから到達
+    // できないようにする）。祖先のtraverseだけはharness共通のcapability SIDが持つ（下記）。
+    //
+    // 起動のたびに、死んだセッションが残した資源をここで回収する（台帳＋生存マーカー、
+    // 台帳が失われていても接頭辞付きプロファイルの列挙で回収できる）。
+    crate::tier2a::session_profile::gc_dead_sessions(&revoke_session_grant);
+    let profile_name = crate::tier2a::session_profile::begin_session()
+        .map_err(AppContainerError::Preflight)?;
+    let sid = ensure_profile(&profile_name)?;
+    // 祖先traverseの付与先（D-37）。package SIDと違いセッションを跨いで永続する。
+    let traverse_sid = traverse_capability_sid()?;
 
     // workspaceのアクセスモード（通常起動=RWX / `--cow`=RO、将来`--cow_exec`=RXを追加予定）は
     // 同じworkspaceに対して混在させてはいけない——ACEはファイルに1つしか付けられないため、
@@ -344,15 +355,18 @@ pub fn preflight(
             // 個別書込を試みる`grant_ace_recursive`ではなく、高速化版（root継承ACE1件+
             // フォールバック確認walk、`grant_ace_inheritable_rw`のdoc参照）を使う。
             grant_ace_inheritable_rw(workspace_root, sid.as_psid())?;
+            crate::tier2a::session_profile::record_granted_path(workspace_root);
         }
         WorkspaceWriteMode::Cow { upper_dir } => {
             // `--cow`（D-30）。workspaceはRead/Execute/Traverseのみ（D-13と同じ関数）。
             // Redirector DLLが無効・回避されても、この時点でACLがROである限り
             // workspace本体への書込は`ACCESS_DENIED`でfail-closeする。
             grant_ace_inheritable_ro(workspace_root, sid.as_psid())?;
+            crate::tier2a::session_profile::record_granted_path(workspace_root);
             std::fs::create_dir_all(upper_dir)
                 .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
             grant_ace_inheritable_rw(upper_dir, sid.as_psid())?;
+            crate::tier2a::session_profile::record_granted_path(upper_dir);
             // `harness cow status`/`apply`/`list`がworkspace_rootを引けるよう、upper_dir自身に
             // 由来を記録する（`workspace_ledger::write_cow_session_meta`のdoc参照）。
             crate::tier2a::workspace_ledger::write_cow_session_meta(
@@ -388,16 +402,39 @@ pub fn preflight(
     // リアクティブに検知してTier1bへ静かに降格するだけだったが、privhelper経由で自動付与できる
     // 経路（`GrantWorkspaceAccess`）が整ったため、ここで先回りして解消する
     // （`plans/DESIGN-SANDBOX-PRIVSEP.md` D-16「特権昇格デーモンを使う際の注意点」参照）。
-    let mut traverse_targets: Vec<std::path::PathBuf> = vec![workspace_root.to_path_buf()];
+    // D-37: 見るのは**祖先だけ**。workspace_root/upper_dir自身への到達権はセッション固有の
+    // package SID宛の継承ACE（すぐ上で付与済み）が与えるので、共通capability SIDのACEを
+    // そこへ要求してはいけない。ここでleafまで含めると、セッションのたびに新しいworkspaceで
+    // 「capability SIDのACEが無い」と判定され、毎回昇格を要求してしまう。
+    let mut traverse_targets: Vec<std::path::PathBuf> =
+        workspace_root.parent().map(|p| p.to_path_buf()).into_iter().collect();
     if let WorkspaceWriteMode::Cow { upper_dir } = write_mode {
-        traverse_targets.push(upper_dir.clone());
+        if let Some(parent) = upper_dir.parent() {
+            traverse_targets.push(parent.to_path_buf());
+        }
     }
     let missing_traverse: Vec<std::path::PathBuf> = traverse_targets
         .into_iter()
-        .filter(|target| !traverse_chain_sufficient(target, sid.as_psid()))
+        .filter(|target| !traverse_chain_sufficient(target, traverse_sid.as_psid()))
         .collect();
 
     let mut warnings = Vec::new();
+
+    // D-37: Redirector DLL（`--cow`の透過性）はworkspaceの外＝harness.exeの隣にあるため、
+    // workspaceへの継承ACEでは覆えない。共有package SIDだった頃はリポジトリrootへの継承ACEが
+    // たまたま`target/debug/*.dll`まで届いていたが、セッションごとにSIDが変わる今は明示的に
+    // 読取+実行を与える必要がある（無ければ注入が失敗し、境界＝ACLは効いたまま透過性だけが失われる）。
+    if matches!(write_mode, WorkspaceWriteMode::Cow { .. }) {
+        for dll in redirector_dll_paths() {
+            match grant_ace_inheritable_access(&dll, sid.as_psid(), FsAccess::ReadExec) {
+                Ok(()) => crate::tier2a::session_profile::record_granted_path(&dll),
+                Err(e) => warnings.push(format!(
+                    "cow: failed to grant the redirector DLL to this session ({}): {e}",
+                    dll.display()
+                )),
+            }
+        }
+    }
     let mut denied_passthrough: Vec<(std::path::PathBuf, String, String)> = Vec::new();
     let mut granted_passthrough: Vec<(std::path::PathBuf, bool)> = Vec::new();
     // 本体プロセス内（非管理者）でACCESS_DENIEDになったエントリ（システム保護パス等）だけを
@@ -471,6 +508,7 @@ pub fn preflight(
         match grant_result {
             Ok(()) => {
                 granted_passthrough.push((fp.path.clone(), requested_rw));
+                crate::tier2a::session_profile::record_granted_path(&fp.path);
                 if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
                     denied_passthrough.push((
                         fp.path.clone(),
@@ -515,7 +553,7 @@ pub fn preflight(
             // ヘルパーを経由せずその場で直接付与する。traverseが不足していれば先に解消する
             // （workspace_root/upper_dirへ到達できなければfs-allow付与自体が無意味なため）。
             for target in &missing_traverse {
-                let (granted_nodes, result) = grant_traverse_chain(target, sid.as_psid());
+                let (granted_nodes, result) = grant_traverse_chain(target, traverse_sid.as_psid());
                 for node in &granted_nodes {
                     crate::tier2a::traverse_ledger::record_traverse_grant(node);
                 }

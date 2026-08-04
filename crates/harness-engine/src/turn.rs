@@ -35,6 +35,7 @@ use harness_tools::ToolRegistry;
 
 use crate::permission::{arg_repr, PermissionGate};
 use crate::{emit, sanitize, EventSink};
+use harness_core::text::truncate_head_tail;
 
 /// ツール出力がこれを超える文字数なら頭尾切詰めする（M9、DESIGN.md L349「大出力 head+tail
 /// 切詰め」）。会話履歴に積む前に適用するため、モデルへ送るコンテキスト自体を圧迫しない。
@@ -582,19 +583,6 @@ fn assemble_content(
         }
     }
     (content, malformed)
-}
-
-/// `content`が`max_chars`文字を超える場合、先頭/末尾を残し中間を省略記号に置き換える。
-fn truncate_head_tail(content: &str, max_chars: usize) -> String {
-    let total = content.chars().count();
-    if total <= max_chars {
-        return content.to_string();
-    }
-    let half = max_chars / 2;
-    let head: String = content.chars().take(half).collect();
-    let tail: String = content.chars().skip(total - half).collect();
-    let omitted = total - 2 * half;
-    format!("{head}\n... [{omitted} chars truncated] ...\n{tail}")
 }
 
 /// `HARNESS_WIRE_LOG=<path>`設定時のみ、ブロック組み立て結果（`tool_input_raw`の連結後文字列と

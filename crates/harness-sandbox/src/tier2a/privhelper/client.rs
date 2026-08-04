@@ -129,6 +129,8 @@ pub fn run_privileged_workspace_access(
         request: PrivilegedRequest::GrantWorkspaceAccess {
             traverse_targets,
             fs_allow_entries,
+            // D-37: fs-allowの付与先はこのセッションのpackage SID（名前で渡し、受信側が検証・導出する）。
+            session_profile: crate::tier2a::session_profile::current_profile_name(),
         },
         chain_netfilterd_pipe: chain_pipe,
     };

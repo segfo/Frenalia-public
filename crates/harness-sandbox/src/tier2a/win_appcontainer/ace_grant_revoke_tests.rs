@@ -984,3 +984,70 @@ exit $p.ExitCode
         Err(_) => false,
     }
 }
+
+/// **workspace封じ込めがセッションを跨いで保たれること**（D-37の受け入れ条件、
+/// `docs/STATUS.md`旧Tier2a残課題#9）。
+///
+/// D-37以前は全セッションが固定名のプロファイル＝同一package SIDで動き、`preflight`が付けた
+/// workspace ACEも撤収されなかったため、**あるworkspaceのサンドボックスから、過去にharnessが
+/// 開いた別のworkspaceの中身が読めた**（実測済み）。セッションごとに別プロファイルへ分けた
+/// 今は、セッションAのSIDにセッションBのworkspaceのACEが無いので構造的に届かない。
+#[test]
+#[ignore = "spawns a real AppContainer child and grants ACEs to two temp workspaces"]
+fn a_sandbox_cannot_reach_another_sessions_workspace() {
+    // 2つの**別セッション**を模す（D-37: プロファイル名がセッションごとに変わる）。
+    let name_a = crate::tier2a::session_profile::profile_name_for("test-session-a");
+    let name_b = crate::tier2a::session_profile::profile_name_for("test-session-b");
+    let sid_a = ensure_profile(&name_a).expect("session A profile");
+    let sid_b = ensure_profile(&name_b).expect("session B profile");
+
+    // 各セッションは自分のworkspaceにだけACEを持つ。
+    let ws_a = tempfile::tempdir().unwrap();
+    grant_ace_inheritable_rw(ws_a.path(), sid_a.as_psid()).expect("grant ws_a to session A");
+    let ws_b = tempfile::tempdir().unwrap();
+    grant_ace_inheritable_rw(ws_b.path(), sid_b.as_psid()).expect("grant ws_b to session B");
+    let secret = ws_b.path().join("other-workspace-secret.txt");
+    std::fs::write(&secret, "SECRET_FROM_OTHER_WORKSPACE").unwrap();
+
+    let (shell, _) = resolve_shell();
+    let env = crate::secret_env::build_child_env();
+    let command = format!(
+        "try {{ Get-Content -Path '{}' -ErrorAction Stop }} catch {{ Write-Output \"DENIED: $_\" }}",
+        secret.display()
+    );
+    // セッションAのSIDで起動した子から、セッションBのworkspaceを読みにいく。
+    let child = spawn(
+        &shell,
+        &["-NoProfile", "-NonInteractive", "-Command", &command],
+        ws_a.path(),
+        &env,
+        false,
+        sid_a.as_psid(),
+        NetworkCapability::Deny,
+        None,
+    )
+    .expect("spawn AppContainer child in session A");
+    let (stdout, stderr, _code) = child.write_stdin_read_output_and_wait(None).unwrap();
+    eprintln!("[probe] セッションAの子から セッションBのworkspace を読んだ結果:
+{stdout}{stderr}");
+
+    let leaked = stdout.contains("SECRET_FROM_OTHER_WORKSPACE");
+    eprintln!("[probe] 別セッションのworkspaceが読めたか: {leaked}");
+
+    // 後始末（テストが作ったACEとプロファイルを撤収する。順序はACE→プロファイル）。
+    let _ = revoke_ace_recursive(ws_a.path(), sid_a.as_psid());
+    let _ = revoke_ace_recursive(ws_b.path(), sid_b.as_psid());
+    for name in [&name_a, &name_b] {
+        unsafe {
+            let w = crate::win_common::wide(name);
+            let _ = windows::Win32::Security::Isolation::DeleteAppContainerProfile(
+                windows::core::PCWSTR(w.as_ptr()),
+            );
+        }
+    }
+
+    assert!(
+        !leaked,
+        "別セッションのworkspaceの中身がサンドボックスから読めている（D-37が崩れている）"
+    );
+}

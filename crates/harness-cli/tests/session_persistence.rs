@@ -61,6 +61,7 @@ async fn run_one_turn(
             model: "mock".into(),
             max_tokens: 100,
             max_turns: 5,
+            compaction: Default::default(),
         },
         OutputFormat::Text,
         &mut out,

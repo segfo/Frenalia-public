@@ -178,6 +178,7 @@ async fn run_always(turns: Vec<Vec<StreamEvent>>) -> Run {
                 model: "mock".into(),
                 max_tokens: 1_000,
                 max_turns: 30,
+                compaction: Default::default(),
             },
             Some(&events_tx),
             None,

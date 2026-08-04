@@ -332,7 +332,7 @@ impl Body {
 /// 3/4ずつ削る（頭尾を残して中間を省略）。幾何級数なので必ず`MIN_BODY_CHARS`へ収束する。
 fn shrink(text: &str) -> String {
     let target = text.chars().count() * 3 / 4;
-    crate::text::truncate_head_tail(text, target.max(MIN_BODY_CHARS))
+    harness_core::text::truncate_head_tail(text, target.max(MIN_BODY_CHARS))
 }
 
 #[cfg(test)]
@@ -348,6 +348,7 @@ mod tests {
             schema_with_tools,
             prompt_caching: true,
             context_window: 128_000,
+            local: false,
         }
     }
 

@@ -666,8 +666,10 @@ async fn run_windows_tier2a(
     granted_passthrough: &[(std::path::PathBuf, bool)],
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let _ = std::fs::create_dir_all(cwd);
+    // D-37: 子プロセスはこの**セッションのプロファイル**で起動する。`preflight`がACEを付けたのも
+    // 同じSIDなので、固定名（＝別のプロファイル）で導出すると workspace へ書けなくなる。
     let sid = harness_sandbox::tier2a::win_appcontainer::ensure_profile(
-        harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
+        &harness_sandbox::tier2a::session_profile::current_profile_name(),
     )
     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
