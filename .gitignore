@@ -2,6 +2,8 @@
 /.harness
 /.env
 tools/procmon/*.PML
+tools/flake/*
+*.pyc
 *.exe
 *.dll
 *.zip
