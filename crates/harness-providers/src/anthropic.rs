@@ -203,6 +203,10 @@ struct WireRequest {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_k: Option<u32>,
+    // `Sampling.frequency_penalty`/`presence_penalty`はここに写さない。Anthropic Messages APIに
+    // 対応するパラメタが無く、送れば400になる。これらは縮退ガードの回復の梯子 (b) 段
+    // （`plans/DESIGN-COGNITION.md` §11.3）だけが載せる値で、Anthropic経由では (b) は
+    // 温度の揺らぎだけになる（設計上許容している降格）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireToolSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]

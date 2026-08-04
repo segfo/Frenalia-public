@@ -35,6 +35,9 @@ pub(crate) enum Reply {
     },
     /// ストリーム途中でキャンセルされた。
     CancelledMidStream,
+    /// 縮退ガードが回復の梯子を使い切った（M21、`plans/DESIGN-COGNITION.md` §11.4）。
+    /// `TurnExecutor`の中で既に再送を試み尽くした後の状態を表す。
+    Discarded,
     /// プロバイダ呼び出し自体の失敗。
     Error,
 }
@@ -149,6 +152,9 @@ impl Executor for PhaseExecutor {
                 RawTurnResult::Completed(turn(text.unwrap_or_default().to_string(), vec![call]))
             }
             Reply::CancelledMidStream => RawTurnResult::CancelledMidStream,
+            Reply::Discarded => RawTurnResult::Discarded {
+                kind: harness_core::DegenerateKind::ShortPeriodRepeat,
+            },
             Reply::Error => {
                 return Err(EngineError::Call(ProviderError::Transport {
                     retriable: false,

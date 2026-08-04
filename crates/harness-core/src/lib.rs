@@ -11,10 +11,11 @@ pub mod provider;
 pub mod schema;
 pub mod text;
 pub mod tool;
+pub mod wire_log;
 
 pub use cognition::{CognitionLevel, Phase, TokenBudget};
 pub use config_injection::is_config_injection_path;
-pub use event::AgentEvent;
+pub use event::{discarded_marker, AgentEvent, DegenerateKind, CANCELLED_REASON};
 pub use message::{ContentBlock, Message, Role};
 pub use net_policy::{
     domain_match, is_ip_literal, normalize_domain_pattern, validate_domain_pattern, DomainPolicy,

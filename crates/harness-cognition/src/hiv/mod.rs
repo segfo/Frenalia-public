@@ -204,6 +204,16 @@ impl HivEngine {
                     self.mem.add_open_question(text.clone(), true);
                     break HivStop::Blocked { reason: text };
                 }
+                // 縮退（§11.4）。`TurnExecutor`が回復の梯子を登り切ってなお壊れた出力しか
+                // 返らなかったので、修復指示を添えた再実行にも意味が無い。fail-closedで畳む。
+                Err(PhaseError::Degenerate { phase, kind }) => {
+                    let text = format!(
+                        "{phase}フェーズの出力が縮退した（{}）。再推論の梯子を使い切っても回復しなかった",
+                        kind.as_str()
+                    );
+                    self.mem.add_open_question(text.clone(), true);
+                    break HivStop::Blocked { reason: text };
+                }
                 Err(PhaseError::Provider(e)) => {
                     let reason = format!("プロバイダ呼び出しに失敗した: {e}");
                     provider_error = Some(e);
@@ -971,6 +981,32 @@ mod tests {
         assert!(outcome.answer.is_empty(), "cancel時は回答を出さない");
         assert!(engine.memory().evidence().is_empty());
         assert_eq!(engine.memory().hypotheses().len(), 1);
+    }
+
+    /// **M21**: 縮退ガードが梯子を使い切ったら fail-closed でゴールを畳む
+    /// （`plans/DESIGN-COGNITION.md` §11.4）。素朴ループへ黙って降格しない。
+    #[tokio::test]
+    async fn a_degenerate_phase_blocks_the_goal_and_says_so() {
+        let exec = PhaseExecutor::new([
+            (Phase::Hypothesize, vec![hypothesize("X")]),
+            (Phase::Investigate, vec![Reply::Discarded]),
+        ]);
+        let (engine, outcome) = run(&exec, HivLimits::default()).await;
+
+        let HivStop::Blocked { reason } = &outcome.stop else {
+            panic!("expected fail-closed, got {:?}", outcome.stop);
+        };
+        assert!(reason.contains("縮退"), "{reason}");
+        assert!(reason.contains("short_period_repeat"), "{reason}");
+        assert!(outcome.provider_error.is_none(), "プロバイダ障害ではない");
+
+        let mem = engine.memory();
+        assert_eq!(mem.goals()[0].status, GoalStatus::Blocked);
+        // 何が起きたかをユーザへ返す（黙って「分かりませんでした」にしない）。
+        assert!(mem.open_questions()[0].blocking);
+        assert!(!outcome.answer.is_empty());
+        // 未蒸留の生出力は証拠にしない（捨てたコールから何も学ばない）。
+        assert!(mem.evidence().is_empty());
     }
 
     /// プロバイダ失敗はそのまま呼び出し側へ返す（素朴ループと同じ扱い）。

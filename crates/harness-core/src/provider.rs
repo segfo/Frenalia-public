@@ -22,6 +22,17 @@ pub trait LlmProvider: Send + Sync {
         None
     }
 
+    /// モデルの内部状態をリセットする（縮退ガードの回復の梯子 (d) 段、
+    /// `plans/DESIGN-COGNITION.md` §11.5）。**対応しないプロバイダは`false`を返し、梯子はその段を飛ばす。**
+    ///
+    /// 実装しているのはLM Studio（`OpenAiFamily::LmStudio`）だけで、Anthropic・OpenAIクラウド・
+    /// mockはこの既定のまま。呼ぶかどうかは`degeneracy.auto_recycle`（既定`false`）が決める——
+    /// **推論サーバは複数のharnessセッションで共有され得るため、再ロードはもう片方の進行中の推論を
+    /// 巻き添えで殺す**。他者に影響する操作を暗黙の既定にはできない。
+    async fn recycle(&self, _model: &str) -> Result<bool, ProviderError> {
+        Ok(false)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
     }
@@ -59,6 +70,12 @@ pub struct Sampling {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
+    /// 既出トークンへのペナルティ（縮退ガードの回復の梯子 (b) 段、
+    /// `plans/DESIGN-COGNITION.md` §11.3）。**OpenAI系にしか写らない**——Anthropic Messages API に
+    /// 対応するパラメタが無いため、そちらのアダプタでは落とす（(b)段は温度の揺らぎだけになる）。
+    pub frequency_penalty: Option<f32>,
+    /// 同上。話題の反復を抑える側。
+    pub presence_penalty: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

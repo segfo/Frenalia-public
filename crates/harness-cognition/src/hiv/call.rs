@@ -60,6 +60,16 @@ pub(crate) enum PhaseError {
     },
     /// キャンセルされた。台帳へは何も足さずに畳む。
     Cancelled,
+    /// 回復の梯子を使い切ってなお縮退した（`plans/DESIGN-COGNITION.md` §11.4）。
+    /// **fail-closed**でゴールを打ち切る（上位tierへのエスカレーションはM17待ち）。
+    ///
+    /// スキーマ検証の失敗（[`PhaseError::SchemaRejected`]）と分けているのは、原因が
+    /// 「モデルが要求を理解できなかった」ではなく「モデルの出力そのものが壊れた」だからで、
+    /// 修復指示を添えて再実行しても意味が無い（既に`TurnExecutor`が§11.3の梯子を登り切っている）。
+    Degenerate {
+        phase: Phase,
+        kind: harness_core::DegenerateKind,
+    },
     Provider(harness_core::ProviderError),
 }
 
@@ -96,7 +106,7 @@ impl PhaseRunner<'_> {
             .assembler
             .build(phase, input, mem, self.ctx, self.tools, &self.caps);
         let schema_requested = call.kind != CallKind::ToolsOnly;
-        let raw = self.turn(call, &mut usage, &mut calls).await?;
+        let raw = self.turn(phase, call, &mut usage, &mut calls).await?;
         let tool_calls = raw.tool_calls.clone();
 
         let mut reason = if schema_requested {
@@ -143,7 +153,7 @@ impl PhaseRunner<'_> {
                 self.ctx,
                 &self.caps,
             );
-            let raw = self.turn(call, &mut usage, &mut calls).await?;
+            let raw = self.turn(phase, call, &mut usage, &mut calls).await?;
             attempts += 1;
             match parse_and_validate(&raw.text, validate) {
                 Ok(value) => {
@@ -172,6 +182,7 @@ impl PhaseRunner<'_> {
     /// TUIのトランスクリプトにもヘッドレスのtext出力にも流れない。
     async fn turn(
         &self,
+        phase: Phase,
         call: AssembledCall,
         usage: &mut Usage,
         calls: &mut usize,
@@ -185,7 +196,6 @@ impl PhaseRunner<'_> {
                 estimated_input_tokens: call.estimated_input_tokens,
             },
         );
-        *calls += 1;
         let result = self
             .exec
             .raw_turn(RawTurnRequest::internal(call.req))
@@ -194,7 +204,13 @@ impl PhaseRunner<'_> {
         match result {
             // ストリーム途中のキャンセル: 部分assistantは破棄済みで、台帳へも何も足さない。
             RawTurnResult::CancelledMidStream => Err(PhaseError::Cancelled),
+            // 縮退で捨てたコールは**数えない**（§11.3「進捗予算と回復予算を混ぜない」）。
+            // 数えると「モデルが壊れていた」だけの理由で`max_phase_calls`が減り、
+            // ログ上は「予算切れ」としか見えず原因と結果が分離できなくなる。
+            RawTurnResult::Discarded { kind } => Err(PhaseError::Degenerate { phase, kind }),
             RawTurnResult::Completed(raw) => {
+                // 実際に成立したコールだけを数える（上の2経路は`*calls`を増やさない）。
+                *calls += 1;
                 add_usage(usage, &raw.usage);
                 if raw.cancelled_mid_tool {
                     // ツールの一部だけが走った状態。未蒸留の生出力は証拠にしない（§3.2【T6】）。
@@ -465,6 +481,60 @@ mod tests {
             seen[1].req.output.is_some(),
             "結論コールでスキーマを要求する"
         );
+    }
+
+    /// **M21の受入条件（認知層側）**: 縮退ガードが梯子を使い切ったら`Degenerate`で
+    /// fail-closedになり、**捨てたコールは`PhaseValue.calls`に数えない**
+    /// （§11.3「進捗予算と回復予算を混ぜない」）。数えてしまうと、モデルが壊れていただけの
+    /// 理由で`max_phase_calls`が減り、ログ上は「予算切れ」としか見えなくなる。
+    #[tokio::test]
+    async fn a_discarded_call_fails_closed_and_is_not_charged_to_the_phase_budget() {
+        let h = Harness::new();
+        let exec = PhaseExecutor::new([(Phase::Hypothesize, vec![Reply::Discarded])]);
+
+        let err = h
+            .runner(&exec, true)
+            .run::<HypothesizeOutput>(
+                Phase::Hypothesize,
+                PhaseInput::default(),
+                &h.mem,
+                Conclusion::Required,
+                validate_hypothesize,
+            )
+            .await
+            .unwrap_err();
+
+        let PhaseError::Degenerate { phase, kind } = err else {
+            panic!("expected a degeneracy stop, got {err:?}");
+        };
+        assert_eq!(phase, Phase::Hypothesize);
+        assert_eq!(kind, harness_core::DegenerateKind::ShortPeriodRepeat);
+        // スキーマ再実行の輪に入らず、1回で止まる（梯子は`TurnExecutor`が既に登り切っている）。
+        assert_eq!(exec.calls_to(Phase::Hypothesize), 1);
+    }
+
+    /// 縮退の**手前まで**は通常どおり数える。上のテストと対にして「数えないのは
+    /// 捨てたコールだけ」であることを固定する。
+    #[tokio::test]
+    async fn only_the_discarded_call_is_excluded_from_the_count() {
+        let h = Harness::new();
+        let exec = PhaseExecutor::new([(
+            Phase::Hypothesize,
+            vec![hypothesis_without_predicts(), good_hypothesis()],
+        )]);
+
+        let out: PhaseValue<HypothesizeOutput> = h
+            .runner(&exec, true)
+            .run(
+                Phase::Hypothesize,
+                PhaseInput::default(),
+                &h.mem,
+                Conclusion::Required,
+                validate_hypothesize,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.calls, 2, "成立したコールは1回目も再実行も数える");
     }
 
     /// Investigateの計画は補助なので、取れなくても追加コールを投げずに先へ進む。

@@ -94,6 +94,7 @@ async fn json_output_has_stable_schema_and_allowed_tool_call() {
             max_tokens: 100,
             max_turns: 5,
             compaction: Default::default(),
+            degeneracy: None,
         },
         OutputFormat::Json,
         &mut out,
@@ -156,6 +157,7 @@ async fn json_output_records_denied_tool_call() {
             max_tokens: 100,
             max_turns: 5,
             compaction: Default::default(),
+            degeneracy: None,
         },
         OutputFormat::Json,
         &mut out,
@@ -193,6 +195,7 @@ async fn jsonl_output_emits_one_agent_event_per_line() {
             max_tokens: 100,
             max_turns: 5,
             compaction: Default::default(),
+            degeneracy: None,
         },
         OutputFormat::Jsonl,
         &mut out,
@@ -246,6 +249,7 @@ async fn json_output_surfaces_provider_error_with_nonzero_exit() {
             max_tokens: 100,
             max_turns: 1,
             compaction: Default::default(),
+            degeneracy: None,
         },
         OutputFormat::Json,
         &mut out,
@@ -258,4 +262,136 @@ async fn json_output_surfaces_provider_error_with_nonzero_exit() {
     assert!(parsed.stop_reason.is_none());
     // 1ターン目までに発行された`ToolCallProposed`/`ToolFinished`は捕捉されている。
     assert_eq!(parsed.tool_calls.len(), 1);
+}
+
+// --- 縮退ガードと出力契約（M21、`plans/DESIGN-COGNITION.md` §11.4） ---
+
+/// `？`の反復で`MaxTokens`に達する縮退ストリーム（LMStudio実機で観測した形）。
+fn degenerate_turn() -> Vec<StreamEvent> {
+    let mut events = vec![StreamEvent::BlockStart {
+        index: 0,
+        kind: BlockKind::Thinking,
+    }];
+    for _ in 0..16 {
+        events.push(StreamEvent::ThinkingDelta {
+            index: 0,
+            text: "\u{ff1f}".repeat(64),
+        });
+    }
+    events.push(StreamEvent::BlockStop { index: 0 });
+    events.push(StreamEvent::Done {
+        stop_reason: StopReason::MaxTokens,
+        usage: Usage::default(),
+    });
+    events
+}
+
+fn guarded_config() -> AgentLoopConfig {
+    AgentLoopConfig {
+        model: "mock".into(),
+        max_tokens: 100,
+        max_turns: 5,
+        compaction: Default::default(),
+        degeneracy: Some(harness_engine::degeneracy::DegeneracyDetector::new(
+            Default::default(),
+        )),
+    }
+}
+
+async fn run_guarded(turns: Vec<Vec<StreamEvent>>, format: OutputFormat) -> String {
+    let provider = MockProvider::new(turns);
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("やって");
+    let tools = ToolRegistry::with_builtin_tools();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+
+    let mut out = Vec::new();
+    run_headless(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        &CognitiveOrchestrator::new(CognitionLevel::Off, PhaseBudgets::default()).unwrap(),
+        guarded_config(),
+        format,
+        &mut out,
+    )
+    .await;
+    String::from_utf8(out).unwrap()
+}
+
+/// **正常時の`text`出力は1バイトも変わらない**（§11.4）。ガードを有効にしても、
+/// 縮退が起きない限り区切りマーカーは一切現れない。
+#[tokio::test]
+async fn the_text_format_is_byte_identical_when_nothing_degenerates() {
+    let with_guard = run_guarded(vec![end_turn("hi there")], OutputFormat::Text).await;
+    assert_eq!(with_guard, "hi there\n");
+    assert!(!with_guard.contains('\x1e'), "{with_guard:?}");
+}
+
+/// 縮退時だけ区切りマーカーが出て、`bytes=`で下流が末尾を切り詰められる。
+#[tokio::test]
+async fn the_text_format_emits_a_rewind_marker_only_when_a_turn_is_discarded() {
+    let stdout = run_guarded(
+        vec![degenerate_turn(), end_turn("最終回答")],
+        OutputFormat::Text,
+    )
+    .await;
+
+    // thinkingだけが流れて本文は0バイトだったので`bytes=0`。マーカーは行として完結する。
+    assert_eq!(
+        stdout,
+        "\x1e[harness:discarded bytes=0 reason=short_period_repeat]\n最終回答\n"
+    );
+}
+
+/// `jsonl`は`TurnDiscarded`行がそのまま出る（既に機械可読なので加工しない）。
+#[tokio::test]
+async fn jsonl_emits_the_turn_discarded_event_verbatim() {
+    let stdout = run_guarded(
+        vec![degenerate_turn(), end_turn("最終回答")],
+        OutputFormat::Jsonl,
+    )
+    .await;
+
+    let events: Vec<harness_core::AgentEvent> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each jsonl line must be a valid AgentEvent"))
+        .collect();
+    let discarded: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            harness_core::AgentEvent::TurnDiscarded {
+                kind, next_rung, ..
+            } => Some((*kind, next_rung.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(discarded.len(), 1, "{events:?}");
+    assert_eq!(discarded[0].0, harness_core::DegenerateKind::ShortPeriodRepeat);
+    assert_eq!(discarded[0].1.as_deref(), Some("jitter"));
+}
+
+/// `json`は`discarded_turns`へ集計される。**`turns`とは独立**——梯子は1つの
+/// `TurnStarted`の内側で回るので、捨てた回はターン数に現れない。
+#[tokio::test]
+async fn json_counts_discarded_turns_separately_from_turns() {
+    let stdout = run_guarded(
+        vec![degenerate_turn(), end_turn("最終回答")],
+        OutputFormat::Json,
+    )
+    .await;
+    let parsed: JsonOutcome = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert_eq!(parsed.discarded_turns, 1);
+    assert_eq!(parsed.turns, 1, "捨てた回はターン数に現れない");
+    assert_eq!(parsed.result, "最終回答");
+
+    // 正常時は常に0。
+    let healthy = run_guarded(vec![end_turn("hi")], OutputFormat::Json).await;
+    let parsed: JsonOutcome = serde_json::from_str(healthy.trim()).unwrap();
+    assert_eq!(parsed.discarded_turns, 0);
 }

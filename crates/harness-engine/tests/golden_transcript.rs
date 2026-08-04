@@ -93,6 +93,7 @@ async fn read_file_tool_loop_produces_expected_transcript() {
             max_tokens: 100,
             max_turns: 5,
             compaction: Default::default(),
+            degeneracy: None,
         },
         None,
         None,
@@ -162,7 +163,7 @@ async fn executor_trait_drives_one_step_through_dyn() {
     let ctx = ToolCtx::new(dir.path().to_path_buf());
     let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
 
-    let executor = TurnExecutor::new(&provider, &tools, &ctx, &arbiter, None, None);
+    let executor = TurnExecutor::new(&provider, &tools, &ctx, &arbiter, None, None, None);
     let executor: &dyn Executor = &executor;
 
     let result = executor
@@ -201,7 +202,7 @@ async fn executor_trait_cannot_bypass_the_permission_gate() {
     let ctx = ToolCtx::new(dir.path().to_path_buf());
     let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
 
-    let executor = TurnExecutor::new(&provider, &tools, &ctx, &arbiter, None, None);
+    let executor = TurnExecutor::new(&provider, &tools, &ctx, &arbiter, None, None, None);
     let executor: &dyn Executor = &executor;
 
     let result = executor
@@ -371,6 +372,7 @@ async fn agent_event_sequence_for_tool_turn_is_stable() {
             max_tokens: 100,
             max_turns: 5,
             compaction: Default::default(),
+            degeneracy: None,
         },
         Some(&events_tx),
         None,
@@ -437,6 +439,7 @@ async fn context_too_long_compacts_once_without_second_turn_started() {
             max_tokens: 100,
             max_turns: 5,
             compaction: Default::default(),
+            degeneracy: None,
         },
         Some(&events_tx),
         None,
@@ -509,6 +512,7 @@ async fn context_too_long_mid_stream_does_not_compact() {
             max_tokens: 100,
             max_turns: 5,
             compaction: Default::default(),
+            degeneracy: None,
         },
         Some(&events_tx),
         None,
@@ -613,6 +617,7 @@ async fn the_usage_trigger_shrinks_then_summarizes_before_the_turn_starts() {
                 target_ratio: 0.3,
                 context_window: 1_000,
             },
+            degeneracy: None,
         },
         Some(&events_tx),
         None,
@@ -666,6 +671,7 @@ async fn the_default_policy_does_not_fire_on_an_ordinary_history() {
             max_tokens: 100,
             max_turns: 5,
             compaction: Default::default(),
+            degeneracy: None,
         },
         Some(&events_tx),
         None,
@@ -724,6 +730,7 @@ async fn a_reactive_failure_that_cannot_be_summarized_falls_back_to_shrinking() 
             max_tokens: 100,
             max_turns: 5,
             compaction: Default::default(),
+            degeneracy: None,
         },
         Some(&events_tx),
         None,
@@ -800,6 +807,7 @@ async fn the_rolling_summary_runs_at_most_once_per_agent_loop() {
                 target_ratio: 0.3,
                 context_window: 1_000,
             },
+            degeneracy: None,
         },
         Some(&events_tx),
         None,
@@ -820,4 +828,320 @@ async fn the_rolling_summary_runs_at_most_once_per_agent_loop() {
         1,
         "the rolling summary must not repeat: {kinds:?}"
     );
+}
+
+// --- 縮退ガード（M21、`plans/DESIGN-COGNITION.md` §11） ---
+//
+// 検知器・ゲート・梯子の判定式そのものは`harness-engine`の`degeneracy`モジュール内の
+// 単体テストが固定している。ここで固定するのは**エージェントループとの繋がり**——
+// 捨てた出力が履歴に残らないこと、再送で正常完了できること、使い切ったら畳むこと、
+// そして**正常な応答では一切発火しないこと**。
+
+/// 縮退したストリーム（`？`の反復で`MaxTokens`到達）。`forced-repeat`プロンプトに対して
+/// LMStudio実機が返したのと同じ形（`tools/lmstudio_mgmt_probe.py`の実測結果、2026-08-04）。
+fn degenerate_turn() -> Vec<StreamEvent> {
+    let mut events = vec![StreamEvent::BlockStart {
+        index: 0,
+        kind: BlockKind::Thinking,
+    }];
+    // 1デルタ64文字 × 16 = 1,024文字。①の窓（512）と評価の刻みを確実に跨ぐ。
+    for _ in 0..16 {
+        events.push(StreamEvent::ThinkingDelta {
+            index: 0,
+            text: "\u{ff1f}".repeat(64),
+        });
+    }
+    events.push(StreamEvent::BlockStop { index: 0 });
+    events.push(StreamEvent::Done {
+        stop_reason: StopReason::MaxTokens,
+        usage: Usage::default(),
+    });
+    events
+}
+
+fn guarded_config() -> AgentLoopConfig {
+    AgentLoopConfig {
+        model: "mock".into(),
+        max_tokens: 100,
+        max_turns: 5,
+        compaction: Default::default(),
+        degeneracy: Some(harness_engine::degeneracy::DegeneracyDetector::new(
+            Default::default(),
+        )),
+    }
+}
+
+fn drain_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        out.push(ev);
+    }
+    out
+}
+
+fn discard_rungs(events: &[AgentEvent]) -> Vec<Option<String>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnDiscarded { next_rung, .. } => Some(next_rung.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// **M21の受入条件**: 縮退した回は履歴に残らず、再送で正常完了する。
+#[tokio::test]
+async fn a_degenerate_turn_is_discarded_and_the_retry_completes_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![degenerate_turn(), end_turn("落ち着いて答えます")]);
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("こんにちは");
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        guarded_config(),
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.text, "落ち着いて答えます");
+    assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+
+    // 縮退分の痕跡が履歴に一切残らない（user発話 + 再送のassistantのみ）。
+    assert_eq!(state.messages.len(), 2, "{:?}", state.messages);
+    let history = serde_json::to_string(&state.messages).unwrap();
+    assert!(
+        !history.contains('\u{ff1f}'),
+        "捨てた本文が履歴に残っている: {history}"
+    );
+
+    let events = drain_events(&mut events_rx);
+    let discards = discard_rungs(&events);
+    assert_eq!(discards, vec![Some("jitter".to_string())], "{events:?}");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::TurnDiscarded {
+            kind: harness_core::DegenerateKind::ShortPeriodRepeat,
+            ..
+        }
+    )));
+}
+
+/// 梯子を使い切ったら fail-closed で畳む。履歴は呼び出し前と同一のまま。
+#[tokio::test]
+async fn exhausting_the_ladder_folds_the_turn_without_touching_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new((0..8).map(|_| degenerate_turn()).collect());
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("こんにちは");
+    let before = state.messages.clone();
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        guarded_config(),
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Other("degenerate_output".to_string())
+    );
+    assert!(outcome.text.is_empty());
+    assert!(!outcome.cancelled, "縮退はキャンセルとは別の畳み方");
+    assert_eq!(state.messages, before, "履歴を一切触らない");
+
+    let events = drain_events(&mut events_rx);
+    // (b)を2回・(c)を2回試して諦める。`auto_recycle`は既定OFFなので (d) を飛ばして (f) へ。
+    assert_eq!(
+        discard_rungs(&events),
+        vec![
+            Some("jitter".to_string()),
+            Some("jitter_with_notice".to_string()),
+            Some("jitter_with_notice".to_string()),
+            None,
+        ],
+        "{events:?}"
+    );
+    // `max_turns`超過のエラーにはならない（回復予算と進捗予算を混ぜない、§11.3）。
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+}
+
+/// **誤検知してはならない**: 正常な応答では`TurnDiscarded`が1件も出ず、
+/// 出力も履歴もガード無しのときと変わらない。
+#[tokio::test]
+async fn a_healthy_turn_is_untouched_by_the_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("greeting.txt"), "hello world").unwrap();
+    let script = || {
+        vec![
+            tool_use_turn(
+                "call_1",
+                "read_file",
+                serde_json::json!({ "path": "greeting.txt" }),
+            ),
+            end_turn("The file says: hello world"),
+        ]
+    };
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+
+    let mut with_guard = ConversationState::new(Vec::new());
+    with_guard.push_user_text("read greeting.txt");
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let guarded = run_agent_loop(
+        &MockProvider::new(script()),
+        &mut with_guard,
+        &tools,
+        &ctx,
+        &arbiter,
+        guarded_config(),
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let mut without_guard = ConversationState::new(Vec::new());
+    without_guard.push_user_text("read greeting.txt");
+    let plain = run_agent_loop(
+        &MockProvider::new(script()),
+        &mut without_guard,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            compaction: Default::default(),
+            degeneracy: None,
+        },
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(guarded.text, plain.text);
+    assert_eq!(guarded.stop_reason, plain.stop_reason);
+    assert_eq!(
+        with_guard.messages, without_guard.messages,
+        "履歴もガード無しと等価"
+    );
+    assert!(
+        !drain_events(&mut events_rx)
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnDiscarded { .. })),
+        "正常な応答で発火してはならない"
+    );
+}
+
+/// text形式の区切りマーカーが「捨てた可視バイト数」を正しく運ぶ
+/// （§11.4「下流は自分のバッファを末尾から`n`バイト切り詰めよ」）。
+#[tokio::test]
+async fn the_text_marker_lets_the_downstream_rewind_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    // 本文を流してから縮退する台本（可視バイトが0でないケース）。
+    let mut degenerate_with_text = vec![
+        StreamEvent::BlockStart {
+            index: 0,
+            kind: BlockKind::Text,
+        },
+        StreamEvent::TextDelta {
+            index: 0,
+            text: "途中まで書いた".to_string(),
+        },
+        StreamEvent::BlockStop { index: 0 },
+        StreamEvent::BlockStart {
+            index: 1,
+            kind: BlockKind::Thinking,
+        },
+    ];
+    for _ in 0..16 {
+        degenerate_with_text.push(StreamEvent::ThinkingDelta {
+            index: 1,
+            text: "\u{ff1f}".repeat(64),
+        });
+    }
+    degenerate_with_text.push(StreamEvent::Done {
+        stop_reason: StopReason::MaxTokens,
+        usage: Usage::default(),
+    });
+
+    let provider = MockProvider::new(vec![degenerate_with_text, end_turn("最終回答")]);
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("やって");
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+
+    let mut sink = String::new();
+    run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        guarded_config(),
+        None,
+        None,
+        |d| sink.push_str(d),
+    )
+    .await
+    .unwrap();
+
+    let discarded = "途中まで書いた";
+    let marker = harness_core::discarded_marker(
+        harness_core::DegenerateKind::ShortPeriodRepeat.as_str(),
+        discarded.len() as u64,
+    );
+    assert_eq!(sink, format!("{discarded}{marker}最終回答"));
+
+    // 下流の復元手順そのもの: マーカーを取り除き、`bytes`ぶん末尾を切り詰める。
+    let (head, rest) = sink.split_once('\x1e').unwrap();
+    let (m, tail) = rest.split_once('\n').unwrap();
+    let bytes: usize = m
+        .split("bytes=")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        &head[..head.len() - bytes],
+        "",
+        "捨てた範囲を過不足なく復元できる"
+    );
+    assert_eq!(tail, "最終回答");
 }

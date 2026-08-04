@@ -135,6 +135,7 @@ async fn run_scenario(via_orchestrator: bool) -> RunResult {
         max_tokens: 100,
         max_turns: 5,
         compaction: Default::default(),
+        degeneracy: None,
     };
 
     let outcome = if via_orchestrator {

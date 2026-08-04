@@ -145,6 +145,7 @@ async fn naive_loop_request_sizes(workspace: &std::path::Path, rounds: usize) ->
             max_tokens: 1_000,
             max_turns: rounds + 2,
             compaction: Default::default(),
+            degeneracy: None,
         },
         None,
         None,

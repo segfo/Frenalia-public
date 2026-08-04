@@ -173,7 +173,15 @@ impl CognitiveOrchestrator {
             });
         };
 
-        let executor = TurnExecutor::new(provider, tools, ctx, gate, events, cancel);
+        let executor = TurnExecutor::new(
+            provider,
+            tools,
+            ctx,
+            gate,
+            events,
+            cancel,
+            config.degeneracy.as_ref(),
+        );
         let assembler = ContextAssembler::new(config.model.clone(), self.budgets.clone());
         let scratch = self.open_scratch(ctx);
         let limits = HivLimits {

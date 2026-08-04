@@ -17,6 +17,10 @@ pub(super) struct Configured {
     pub(super) model: String,
     pub(super) max_turns: usize,
     pub(super) compaction: harness_engine::compaction::CompactionPolicy,
+    /// 縮退ガードの移動統計（`plans/DESIGN-COGNITION.md` §11）。**セッション全体で1つ**を
+    /// ここで作り、発話ごとに`AgentLoopConfig`へcloneして渡す（中身は`Arc`）。
+    /// `degeneracy.enabled:false`なら`None`＝機構ごと無効。
+    pub(super) degeneracy: Option<harness_engine::degeneracy::DegeneracyDetector>,
     pub(super) enter_submits: bool,
     pub(super) tools: ToolRegistry,
     pub(super) arbiter: PermissionArbiter,
@@ -143,6 +147,10 @@ pub(super) fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode
         }
     };
 
+    // 縮退ガード（`plans/DESIGN-COGNITION.md` §11）。統計はセッション全体を寿命とするので、
+    // ここで1つだけ作って発話ごとにcloneして配る。
+    let degeneracy = resolve_degeneracy(settings.degeneracy.as_ref());
+
     let tools = ToolRegistry::with_builtin_tools();
 
     // §非対話モード「危険/ワイルドカードは`--dangerously-allow`」: accept-allモードは
@@ -184,10 +192,50 @@ pub(super) fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode
         model,
         max_turns,
         compaction,
+        degeneracy,
         enter_submits,
         tools,
         arbiter,
         cognition,
     })
+}
+
+/// `settings.json`の`degeneracy`キーを`DegeneracyDetector`へ解決する
+/// （`plans/DESIGN-COGNITION.md` §11.6）。
+///
+/// `harness-engine`は`harness-config`に依存しないという既存の依存の向き
+/// （`CompactionOverrides`と同じ）を保つため、写像はここが持つ。
+/// **`enabled:false`は`None`**＝この機構が一切呼ばれない状態にする（黙って弱めるのではなく、
+/// 検知器そのものを渡さない形で切る）。
+fn resolve_degeneracy(
+    settings: Option<&harness_config::DegeneracySettings>,
+) -> Option<harness_engine::degeneracy::DegeneracyDetector> {
+    use harness_engine::degeneracy::{
+        DegeneracyConfig, DegeneracyDetector, NgramConfig, ShortPeriodConfig,
+    };
+
+    let s = settings.cloned().unwrap_or_default();
+    if !s.is_enabled() {
+        return None;
+    }
+    let d = DegeneracyConfig::default();
+    let sp = s.short_period.unwrap_or_default();
+    let ng = s.ngram.unwrap_or_default();
+    Some(DegeneracyDetector::new(DegeneracyConfig {
+        auto_recycle: s.auto_recycle.unwrap_or(d.auto_recycle),
+        gate_multiplier: s.gate_multiplier.unwrap_or(d.gate_multiplier),
+        recovery_multiplier: s.recovery_multiplier.unwrap_or(d.recovery_multiplier),
+        short_period: ShortPeriodConfig {
+            window: sp.window.unwrap_or(d.short_period.window),
+            max_period: sp.max_period.unwrap_or(d.short_period.max_period),
+            min_repeats: sp.min_repeats.unwrap_or(d.short_period.min_repeats),
+        },
+        ngram: NgramConfig {
+            window: ng.window.unwrap_or(d.ngram.window),
+            n: ng.n.unwrap_or(d.ngram.n),
+            seen_ratio_max: ng.seen_ratio_max.unwrap_or(d.ngram.seen_ratio_max),
+        },
+        reasoning_only_ratio: s.reasoning_only_ratio.unwrap_or(d.reasoning_only_ratio),
+    }))
 }
 

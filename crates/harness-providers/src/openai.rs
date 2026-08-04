@@ -11,7 +11,6 @@
 //! OpenAI Responses API（stateless variant、`encrypted_content`往復）はDESIGN.md §プロバイダ抽象が
 //! 明示的に「M6とは別の後続マイルストーンへ切り出す」と定めているため、本ファイルのスコープ外。
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use async_stream::try_stream;
@@ -29,22 +28,9 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234/v1";
 
 /// `HARNESS_WIRE_LOG=<path>`が設定されているときだけ、送信リクエストボディと受信SSEチャンクを
-/// そのままJSONL追記する（`run_shell`不安定性調査、Phase 2観測基盤）。未設定時はゼロコスト
-/// （`std::env::var_os`1回のみ）。1行1JSONオブジェクト、`kind`フィールドで種別を区別する。
-fn wire_log_path() -> Option<PathBuf> {
-    std::env::var_os("HARNESS_WIRE_LOG").map(PathBuf::from)
-}
-
-fn wire_log_append(path: &std::path::Path, value: &serde_json::Value) {
-    use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "{value}");
-    }
-}
+/// そのままJSONL追記する（`run_shell`不安定性調査、Phase 2観測基盤）。実体は
+/// `harness_core::wire_log`が持つ（3箇所で同じ追記処理を持たないため、規則5）。
+use harness_core::wire_log::{append as wire_log_append, path as wire_log_path};
 
 /// 同じChat Completionsワイヤ形式を話すが、**能力表明が違う**系統。
 ///
@@ -64,6 +50,14 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     family: OpenAiFamily,
+    /// LM Studio 管理REST API（`/api/v1/`）のBearerトークン。`harness-cli`の起動処理が
+    /// `LM_API_TOKEN`環境変数から読んで渡す（§設定とシークレット「シークレットはenv優先、
+    /// 設定ファイルでは扱わない」）。
+    ///
+    /// この開発機のLM Studioでは`/api/v1/`も`/v1/`も認証不要だったため（2026-08-04実測、
+    /// `tools/lmstudio_mgmt_probe.py`）、通常は`None`のまま動く。トークンを要求する構成の
+    /// ために口だけ用意してある。
+    mgmt_token: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -77,6 +71,24 @@ impl OpenAiProvider {
             api_key: api_key.into(),
             base_url,
             family: OpenAiFamily::OpenAi,
+            mgmt_token: None,
+        }
+    }
+
+    /// LM Studio 管理APIのトークンを設定する（`harness-cli`が`LM_API_TOKEN`から読む）。
+    pub fn with_mgmt_token(mut self, token: Option<String>) -> Self {
+        self.mgmt_token = token.filter(|t| !t.is_empty());
+        self
+    }
+
+    /// 管理REST APIのbase URL。`base_url`末尾の`/v1`を`/api/v1`へ置換して導出する
+    /// （`plans/DESIGN-COGNITION.md` §11.5）。OpenAI互換の`/v1/`とは別系統。
+    fn mgmt_base_url(&self) -> String {
+        let trimmed = self.base_url.trim_end_matches('/');
+        match trimmed.strip_suffix("/v1") {
+            Some(root) => format!("{root}/api/v1"),
+            // `/v1`で終わらない形の`base_url`が渡されたら、素直に足す。
+            None => format!("{trimmed}/api/v1"),
         }
     }
 
@@ -192,6 +204,83 @@ impl LlmProvider for OpenAiProvider {
         })
     }
 
+    /// 縮退ガードの回復の梯子 (d) 段（`plans/DESIGN-COGNITION.md` §11.5）。
+    /// **LM Studio 系統でのみ実装**し、OpenAIクラウドでは`false`を返して段を飛ばさせる。
+    ///
+    /// LM Studio 公式REST API（`/api/v1/`、OpenAI互換の`/v1/`とは別系統）で
+    /// models → unload → load を行う。**外部プロセスは一切起動しない**——プロバイダが既に
+    /// 喋っている同じ host:port へのHTTPコールが増えるだけなので、`settings.json`の
+    /// 権限クラスもプロセス起動経路も変わらない。
+    ///
+    /// # ロード設定を捕捉して復元する理由
+    ///
+    /// `load`のボディには`context_length`/`eval_batch_size`/`flash_attention`/`num_experts`/
+    /// `offload_kv_cache_to_gpu`がある。`model`だけ渡すと LM Studio 側の既定・プリセットで
+    /// 静かに別設定になり得る。**「縮退から回復したはずが、以後ずっとコンテキスト長が違う」
+    /// という追跡困難な二次故障**になるため、捕捉した設定をそのまま送り、エコーと照合して
+    /// 食い違えば`Err`で止める（fail-closed。梯子は最終段へ落ちる）。
+    ///
+    /// これは縮約側（`plans/PLAN-COMPACTION.md`）との責務境界そのものでもある——
+    /// **分母（`context_window`）の正しさは縮約側、その不変性はここ**。
+    async fn recycle(&self, model: &str) -> Result<bool, ProviderError> {
+        if self.family != OpenAiFamily::LmStudio {
+            return Ok(false);
+        }
+        let mgmt = self.mgmt_base_url();
+        let captured = self.capture_load_config(&mgmt, model).await?;
+        let Some((instance_id, load_config)) = captured else {
+            // ロードされていないモデルは再ロードのしようがない（JITロード構成）。
+            // 段を飛ばして次へ進ませる。
+            return Ok(false);
+        };
+
+        self.mgmt_post(
+            &mgmt,
+            "models/unload",
+            &serde_json::json!({ "instance_id": instance_id }),
+        )
+        .await?;
+
+        let mut body = match &load_config {
+            // 捕捉できた設定をそのまま復元する。
+            Some(cfg) => cfg.clone(),
+            // 取得できない場合は`model`のみでロードし、エコーの結果をログへ出す
+            // （保証はできないが沈黙はしない、§11.5）。
+            None => serde_json::Map::new().into(),
+        };
+        let obj = body
+            .as_object_mut()
+            .ok_or_else(|| ProviderError::InvalidRequest {
+                msg: "lmstudio load config was not a JSON object".to_string(),
+            })?;
+        obj.insert("model".to_string(), serde_json::Value::String(model.into()));
+        obj.insert("echo_load_config".to_string(), serde_json::Value::Bool(true));
+
+        let echoed = self.mgmt_post(&mgmt, "models/load", &body).await?;
+        let echoed_config = echoed.get("load_config");
+        harness_core::wire_log::record(|| {
+            serde_json::json!({
+                "kind": "lmstudio_recycle",
+                "model": model,
+                "captured_load_config": load_config,
+                "echoed_load_config": echoed_config,
+            })
+        });
+
+        if let (Some(want), Some(got)) = (&load_config, echoed_config) {
+            if let Some(diff) = first_load_config_mismatch(want, got) {
+                return Err(ProviderError::InvalidRequest {
+                    msg: format!(
+                        "lmstudio reloaded `{model}` with a different load config ({diff}); \
+                         refusing to continue because the context window would silently diverge \
+                         from what compaction assumes (plans/DESIGN-COGNITION.md §11.5)"
+                    ),
+                });
+            }
+        }
+        Ok(true)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_json_schema: true,
@@ -207,6 +296,117 @@ impl LlmProvider for OpenAiProvider {
             local: self.family == OpenAiFamily::LmStudio,
         }
     }
+}
+
+// --- LM Studio 管理REST API（§11.5、(d)段） ---
+
+/// `load`のエコーと照合しないキー。
+///
+/// `prompt_template`は`GET /api/v1/models`の`loaded_instances[].config`には**含まれないが**、
+/// `POST /models/load`の`echo_load_config`応答には含まれる（2026-08-04実測、
+/// `tools/lmstudio_mgmt_probe.py`）。捕捉できない値を照合対象にすると必ず食い違うため除外する。
+const UNCOMPARED_LOAD_KEYS: &[&str] = &["prompt_template"];
+
+impl OpenAiProvider {
+    /// 対象モデルのロード済みインスタンスIDと現在のロード設定を取る。
+    /// ロードされていなければ`None`。
+    async fn capture_load_config(
+        &self,
+        mgmt: &str,
+        model: &str,
+    ) -> Result<Option<(String, Option<serde_json::Value>)>, ProviderError> {
+        let body = self.mgmt_get(mgmt, "models").await?;
+        let models = body
+            .get("models")
+            .and_then(|m| m.as_array())
+            .ok_or_else(|| ProviderError::InvalidRequest {
+                msg: "lmstudio management API returned no `models` array".to_string(),
+            })?;
+        for m in models {
+            if m.get("key").and_then(|k| k.as_str()) != Some(model) {
+                continue;
+            }
+            let Some(instances) = m.get("loaded_instances").and_then(|i| i.as_array()) else {
+                continue;
+            };
+            let Some(first) = instances.first() else {
+                continue;
+            };
+            let id = first
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or(model)
+                .to_string();
+            return Ok(Some((id, first.get("config").cloned())));
+        }
+        Ok(None)
+    }
+
+    async fn mgmt_get(&self, mgmt: &str, path: &str) -> Result<serde_json::Value, ProviderError> {
+        let mut req = self.http.get(format!("{mgmt}/{path}"));
+        if let Some(t) = &self.mgmt_token {
+            req = req.bearer_auth(t);
+        }
+        Self::mgmt_send(req).await
+    }
+
+    async fn mgmt_post(
+        &self,
+        mgmt: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let mut req = self.http.post(format!("{mgmt}/{path}")).json(body);
+        if let Some(t) = &self.mgmt_token {
+            req = req.bearer_auth(t);
+        }
+        Self::mgmt_send(req).await
+    }
+
+    async fn mgmt_send(req: reqwest::RequestBuilder) -> Result<serde_json::Value, ProviderError> {
+        let resp = req
+            .send()
+            .await
+            .map_err(|_| ProviderError::Transport { retriable: false })?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                code: Some(truncate_for_message(&text)),
+            });
+        }
+        // `unload`のように本文が空の応答もある。空はnullとして扱う。
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|_| ProviderError::Transport { retriable: false })
+    }
+}
+
+/// 捕捉したロード設定とエコーされた設定の**最初の食い違い**を人間可読な1行で返す。
+///
+/// 等値比較ではなく**捕捉したキーだけの部分比較**にしているのは、エコー側にしか無いキーが
+/// 実在するため（[`UNCOMPARED_LOAD_KEYS`]のコメント参照）。エコー側の追加キーは無視し、
+/// 「こちらが指定した設定が守られたか」だけを見る。
+fn first_load_config_mismatch(want: &serde_json::Value, got: &serde_json::Value) -> Option<String> {
+    let want = want.as_object()?;
+    let got = got.as_object()?;
+    for (k, v) in want {
+        if UNCOMPARED_LOAD_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        match got.get(k) {
+            Some(actual) if actual == v => {}
+            Some(actual) => return Some(format!("{k}: requested {v}, got {actual}")),
+            None => return Some(format!("{k}: requested {v}, missing from the echo")),
+        }
+    }
+    None
+}
+
+fn truncate_for_message(s: &str) -> String {
+    harness_core::text::truncate_head_tail(s, 200)
 }
 
 fn parse_wire<T: DeserializeOwned>(data: &str) -> Result<T, ProviderError> {
@@ -226,6 +426,12 @@ struct WireRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+    /// 縮退ガードの回復の梯子 (b) 段だけが載せる（`plans/DESIGN-COGNITION.md` §11.3）。
+    /// 通常のターンでは`Sampling`が`None`のままなので、送信ボディは1バイトも変わらない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,6 +530,8 @@ fn to_wire_request(req: &CompletionRequest) -> WireRequest {
         max_tokens: req.max_tokens,
         temperature: req.sampling.temperature,
         top_p: req.sampling.top_p,
+        frequency_penalty: req.sampling.frequency_penalty,
+        presence_penalty: req.sampling.presence_penalty,
         tools,
         tool_choice,
         parallel_tool_calls: req.parallel_tool_calls,
@@ -1277,5 +1485,137 @@ mod tests {
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[1]["tool_call_id"], "call_1");
         assert_eq!(messages[1]["content"], "file contents");
+    }
+
+    // --- 縮退ガードの (d) 段（`plans/DESIGN-COGNITION.md` §11.5） ---
+
+    /// 管理APIのbase URLは`base_url`末尾の`/v1`を`/api/v1`へ置換して導く。
+    /// OpenAI互換の`/v1/`とは別系統であることの固定。
+    #[test]
+    fn the_management_base_url_is_derived_from_the_openai_compatible_one() {
+        assert_eq!(
+            OpenAiProvider::lmstudio().mgmt_base_url(),
+            "http://localhost:1234/api/v1"
+        );
+        assert_eq!(
+            OpenAiProvider::lmstudio_with_base_url("http://host:9999/v1/".into()).mgmt_base_url(),
+            "http://host:9999/api/v1"
+        );
+        // `/v1`で終わらない形でも壊れない。
+        assert_eq!(
+            OpenAiProvider::lmstudio_with_base_url("http://host:9999".into()).mgmt_base_url(),
+            "http://host:9999/api/v1"
+        );
+    }
+
+    /// **ロード設定の照合は部分比較**。`prompt_template`は`GET /models`側に含まれず
+    /// `load`のエコー側にしか無いため（2026-08-04実測）、等値比較にすると必ず食い違う。
+    #[test]
+    fn the_load_config_check_ignores_keys_that_only_the_echo_carries() {
+        let captured = serde_json::json!({ "context_length": 262144, "num_experts": 8 });
+        let echoed = serde_json::json!({
+            "context_length": 262144,
+            "num_experts": 8,
+            "prompt_template": { "type": "jinja", "template": "..." },
+            "physical_batch_size": 512,
+        });
+        assert_eq!(first_load_config_mismatch(&captured, &echoed), None);
+    }
+
+    /// **食い違いは fail-closed**。再ロードでコンテキスト長が変われば、縮約の分母が実態と
+    /// 乖離して「追跡困難な二次故障」になるため、黙って進めない。
+    #[test]
+    fn a_changed_context_length_is_reported_as_a_mismatch() {
+        let captured = serde_json::json!({ "context_length": 262144 });
+        let echoed = serde_json::json!({ "context_length": 8192 });
+        let diff = first_load_config_mismatch(&captured, &echoed).expect("mismatch");
+        assert!(diff.contains("context_length"), "{diff}");
+        assert!(diff.contains("262144"), "{diff}");
+        assert!(diff.contains("8192"), "{diff}");
+
+        // エコーからキーごと落ちた場合も食い違いとして扱う（守られた保証が無い）。
+        let dropped = first_load_config_mismatch(&captured, &serde_json::json!({}))
+            .expect("a missing key is a mismatch");
+        assert!(dropped.contains("missing from the echo"), "{dropped}");
+    }
+
+    /// 非LMStudio系統では (d) 段を持たない＝`false`を返して梯子に飛ばさせる。
+    #[tokio::test]
+    async fn recycling_is_not_supported_outside_lmstudio() {
+        let p = OpenAiProvider::new("key");
+        assert!(!p.recycle("gpt-4o").await.unwrap());
+    }
+
+    /// **実機E2E**（`docs/DEV-ENVIRONMENT.md`のLMStudioサーバが要る、`#[ignore]`）。
+    ///
+    /// `plans/DESIGN-COGNITION.md` §11.5 の手順（models → unload → load + echo照合）を
+    /// 実サーバに対して1往復させ、**再ロードの前後でロード設定が変わらない**ことを確認する。
+    /// これがM21の実機E2E受入条件の3番目（`docs/INDEX.md`）。
+    ///
+    /// ```bash
+    /// cargo test -p harness-providers -- --ignored lmstudio_recycle
+    /// ```
+    ///
+    /// 対象モデルがロードされていない場合は`Ok(false)`（段を飛ばす）が正しい挙動なので、
+    /// そのときはテストを成立させずに理由を出して終える。
+    #[tokio::test]
+    #[ignore = "requires a running LM Studio server with the model loaded"]
+    async fn lmstudio_recycle_preserves_the_load_config() {
+        const MODEL: &str = "luffythefox/qwen3.6-35b-a3b-uncensored-genesis-v2-apex-mtp-gguf/qwen3.6-35b-a3b-uncensored-genesis-mtp-apex.gguf";
+        let p = OpenAiProvider::lmstudio();
+        let mgmt = p.mgmt_base_url();
+
+        let Some((_, before)) = p.capture_load_config(&mgmt, MODEL).await.unwrap() else {
+            eprintln!("skipped: `{MODEL}` is not loaded in LM Studio");
+            return;
+        };
+        let before = before.expect("the management API should report the load config");
+
+        // 照合に失敗すれば`Err`になる（fail-closed）。成功＝設定が守られた。
+        assert!(p.recycle(MODEL).await.unwrap(), "reload should be supported");
+
+        let (_, after) = p
+            .capture_load_config(&mgmt, MODEL)
+            .await
+            .unwrap()
+            .expect("the model must be loaded again after a recycle");
+        let after = after.expect("the management API should report the load config");
+        assert_eq!(
+            first_load_config_mismatch(&before, &after),
+            None,
+            "before={before}\nafter={after}"
+        );
+        // 縮約の分母そのもの。ここが変わると使用率判定が実態と乖離する
+        // （`plans/PLAN-COMPACTION.md`「M21との接点」の責務境界）。
+        assert_eq!(before["context_length"], after["context_length"]);
+    }
+
+    /// (b) 段が載せるペナルティはOpenAI系のワイヤへ写る。**通常のターンでは
+    /// `Sampling`が`None`のままなので、送信ボディは1バイトも変わらない**。
+    #[test]
+    fn the_recovery_penalties_map_to_the_wire_only_when_set() {
+        let mut req = CompletionRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            output: None,
+            parallel_tool_calls: None,
+            max_tokens: 100,
+            sampling: Default::default(),
+            model: "m".into(),
+        };
+        let plain = serde_json::to_value(to_wire_request(&req)).unwrap();
+        assert!(plain.get("frequency_penalty").is_none(), "{plain}");
+        assert!(plain.get("presence_penalty").is_none(), "{plain}");
+
+        req.sampling.frequency_penalty = Some(0.4);
+        req.sampling.presence_penalty = Some(0.4);
+        let jittered = serde_json::to_value(to_wire_request(&req)).unwrap();
+        // f32→JSON数値の丸めがあるので値そのものではなく近さで見る。
+        for key in ["frequency_penalty", "presence_penalty"] {
+            let v = jittered[key].as_f64().unwrap_or_else(|| panic!("{key}: {jittered}"));
+            assert!((v - 0.4).abs() < 1e-6, "{key} = {v}");
+        }
     }
 }

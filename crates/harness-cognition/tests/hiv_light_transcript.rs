@@ -179,6 +179,7 @@ async fn run_always(turns: Vec<Vec<StreamEvent>>) -> Run {
                 max_tokens: 1_000,
                 max_turns: 30,
                 compaction: Default::default(),
+                degeneracy: None,
             },
             Some(&events_tx),
             None,

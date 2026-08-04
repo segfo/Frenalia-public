@@ -6,6 +6,11 @@
 //! `ConversationState`の代わりに自前の作業記憶から組んだ最小コンテキストを渡して
 //! **1ステップだけ**回す。どちらも入口はこの[`TurnExecutor`]1つ。
 //!
+//! | ファイル | 責務 |
+//! |---|---|
+//! | 本ファイル | 型・[`Executor`]・回復の梯子のドライバ・ツール実行 |
+//! | [`stream`] | 1回のストリーム受信・ブロック組み立て・縮退検知器への供給 |
+//!
 //! # なぜツール実行までこの中に置くか
 //!
 //! ツール実行を呼び出し側へ出すと、認知レイヤーが`PermissionGate`を通さずに
@@ -19,29 +24,29 @@
 //! ここは**会話履歴を持たない**。`ConversationState`への追記・ターン予算・
 //! コンテキスト圧縮・ターン境界のイベント（`TurnStarted`/`TurnCompleted`/`Cancelled`/`Error`）は
 //! すべて呼び出し側の責務。ここが発行するのは1ステップ内部の
-//! `TextDelta`/`ThinkingDelta`/`ToolCallProposed`/`ToolStarted`/`ToolFinished`だけ。
+//! `TextDelta`/`ThinkingDelta`/`ToolCallProposed`/`ToolStarted`/`ToolFinished`と、
+//! 縮退で捨てた回の`TurnDiscarded`だけ。
 
-use std::time::Duration;
+mod stream;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use harness_core::{
-    AgentEvent, BlockKind, CompletionRequest, ContentBlock, LlmProvider, ProviderError, StopReason,
-    StreamEvent, ToolCtx, ToolOutput, Usage,
+    discarded_marker, AgentEvent, CompletionRequest, ContentBlock, DegenerateKind, LlmProvider,
+    ProviderError, StopReason, ToolCtx, ToolOutput, Usage, CANCELLED_REASON,
 };
 use harness_tools::ToolRegistry;
 
+use crate::degeneracy::{ladder, CallWatch, Degenerate, DegeneracyDetector};
 use crate::permission::{arg_repr, PermissionGate};
 use crate::{emit, sanitize, EventSink};
 use harness_core::text::truncate_head_tail;
+use stream::{Attempt, MalformedToolInput};
 
 /// ツール出力がこれを超える文字数なら頭尾切詰めする（M9、DESIGN.md L349「大出力 head+tail
 /// 切詰め」）。会話履歴に積む前に適用するため、モデルへ送るコンテキスト自体を圧迫しない。
 const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
-
-const MAX_RETRIES: u32 = 3;
 
 /// このターンのassistantテキストが**ユーザ向けの応答**なのか、**認知レイヤー内部の機構**なのか。
 ///
@@ -149,14 +154,21 @@ pub struct RawTurn {
     pub cancelled_mid_tool: bool,
 }
 
-/// 1ステップの結果。「ストリーム途中でキャンセルされた場合は会話履歴を一切触ってはならない」
-/// という整合性の不変条件（`plans/DESIGN.md` §エージェントループ「ストリーム途中は部分
-/// assistant破棄」）を、見落とし得るフラグではなく**型**で強制するために2値にしている。
+/// 1ステップの結果。「部分的にしか届かなかった応答は会話履歴を一切触ってはならない」という
+/// 整合性の不変条件（`plans/DESIGN.md` §エージェントループ「ストリーム途中は部分assistant破棄」・
+/// `plans/DESIGN-COGNITION.md` §11.4）を、見落とし得るフラグではなく**型**で強制する。
+///
+/// 破棄の理由は2つあり（キャンセルと縮退）、後始末は同一（部分assistantを一切積まない）だが
+/// 呼び出し側の畳み方が違うため、別バリアントにしてある。
 #[derive(Debug, Clone)]
 pub enum RawTurnResult {
     Completed(RawTurn),
     /// 部分的に蓄積していたassistantブロックは破棄済み。呼び出し側は履歴へ何も積まない。
     CancelledMidStream,
+    /// 回復の梯子（`plans/DESIGN-COGNITION.md` §11.3）を使い切ってなお縮退した。
+    /// 部分assistantは破棄済みで、**ツールは1つも実行されていない**。
+    /// 呼び出し側は履歴へ何も積まない。
+    Discarded { kind: DegenerateKind },
 }
 
 /// 1ステップの失敗。**ストリーム開始前**（プロバイダ呼び出し自体の失敗）と**開始後**
@@ -194,6 +206,10 @@ pub trait Executor: Send + Sync {
 }
 
 /// [`Executor`]の実装。1ステップに必要な参照だけを束ねた、状態を持たない実行器。
+///
+/// 縮退ガードの移動統計はセッション全体を寿命とするため、`degeneracy`だけは
+/// 呼び出し側が所有する[`DegeneracyDetector`]を借りる形にしてある（中身は`Arc`）。
+/// `None`ならガードは完全に無効で、M21以前と同じ経路になる。
 pub struct TurnExecutor<'a> {
     provider: &'a dyn LlmProvider,
     tools: &'a ToolRegistry,
@@ -201,9 +217,11 @@ pub struct TurnExecutor<'a> {
     gate: &'a dyn PermissionGate,
     events: Option<&'a EventSink>,
     cancel: Option<&'a CancellationToken>,
+    degeneracy: Option<&'a DegeneracyDetector>,
 }
 
 impl<'a> TurnExecutor<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: &'a dyn LlmProvider,
         tools: &'a ToolRegistry,
@@ -211,6 +229,7 @@ impl<'a> TurnExecutor<'a> {
         gate: &'a dyn PermissionGate,
         events: Option<&'a EventSink>,
         cancel: Option<&'a CancellationToken>,
+        degeneracy: Option<&'a DegeneracyDetector>,
     ) -> Self {
         Self {
             provider,
@@ -219,6 +238,7 @@ impl<'a> TurnExecutor<'a> {
             gate,
             events,
             cancel,
+            degeneracy,
         }
     }
 
@@ -231,6 +251,13 @@ impl<'a> TurnExecutor<'a> {
     /// trait側は`&dyn Executor`にするためジェネリクスを持てない。そのため
     /// **inherentメソッドを本体、trait実装をno-op委譲**の2段構えにしている。
     /// 認知レイヤーは`AgentEvent`を消費するのでこのコールバックを必要としない。
+    ///
+    /// # 回復の梯子
+    ///
+    /// 縮退を検知したらここでリクエストを作り直して再送する（§11.3）。**外へ
+    /// [`RawTurnResult::Discarded`]を返すのは梯子を使い切ったときだけ**。梯子の各段は
+    /// 毎回**元のリクエストから**組み直す（前段の書き換えを積み重ねない）。
+    /// `TurnExecutor`は会話履歴を持たないので、触るのは`req`のコピーだけで履歴は汚れない。
     pub async fn raw_turn_with_deltas<F>(
         &self,
         request: RawTurnRequest,
@@ -240,95 +267,158 @@ impl<'a> TurnExecutor<'a> {
         F: FnMut(&str),
     {
         let RawTurnRequest {
-            mut req,
+            req: mut base_req,
             visibility,
         } = request;
         let visible = visibility == TurnVisibility::UserFacing;
         // 呼び出し側が伏字化済みのリクエストを渡してくる経路（`run_agent_loop`）もあるが、
         // ここを choke point にするため無条件に適用する（[`crate::sanitize`]は冪等）。
         if self.is_tier3() {
-            sanitize::completion_request(&mut req);
+            sanitize::completion_request(&mut base_req);
         }
 
-        let mut stream = stream_with_retry(self.provider, &req)
-            .await
-            .map_err(EngineError::Call)?;
-
-        let mut blocks: Vec<BlockAccum> = Vec::new();
-        let mut stop_reason = StopReason::EndTurn;
-        let mut usage = Usage::default();
+        let mut ladder: Option<ladder::Ladder> = None;
+        // 現在の段。`None`は「素の1回目」（梯子はまだ登っていない）。
+        let mut rung: Option<ladder::Rung> = None;
+        let mut retries = 0u32;
 
         loop {
-            let next = match self.cancel {
-                Some(c) => tokio::select! {
-                    _ = c.cancelled() => None,
-                    ev = stream.next() => Some(ev),
-                },
-                None => Some(stream.next().await),
-            };
-            let Some(event) = next else {
-                // 蓄積中の`blocks`は呼び出し側へ渡さず破棄する。
-                return Ok(RawTurnResult::CancelledMidStream);
-            };
-            let Some(event) = event else {
-                break;
-            };
-            let event = event.map_err(EngineError::Stream)?;
-            match event {
-                StreamEvent::BlockStart { index, kind } => blocks.push(BlockAccum {
-                    index,
-                    kind,
-                    text: String::new(),
-                    signature: None,
-                    tool_input_raw: String::new(),
-                }),
-                StreamEvent::TextDelta { index, text } => {
-                    if visible {
-                        let visible_text = sanitize::visible_delta(&text, self.ctx);
-                        on_text_delta(&visible_text);
-                        emit(self.events, AgentEvent::TextDelta { text: visible_text });
-                    }
-                    if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
-                        b.text.push_str(&text);
-                    }
+            let mut req = base_req.clone();
+            if let Some(r) = rung {
+                ladder::apply(&mut req, r, retries);
+                if self.is_tier3() {
+                    sanitize::completion_request(&mut req);
                 }
-                StreamEvent::ThinkingDelta { index, text } => {
-                    if visible {
-                        let visible_text = sanitize::visible_delta(&text, self.ctx);
-                        emit(
-                            self.events,
-                            AgentEvent::ThinkingDelta { text: visible_text },
-                        );
-                    }
-                    if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
-                        b.text.push_str(&text);
-                    }
+            }
+
+            let mut watch = self
+                .degeneracy
+                .map(|d| d.watch(&req.model, req.max_tokens));
+            let stream::StreamOutcome {
+                attempt,
+                emitted_bytes,
+            } = self
+                .stream_once(&req, on_text_delta, watch.as_mut(), visible)
+                .await?;
+
+            match attempt {
+                Attempt::Cancelled => {
+                    // キャンセルも意味論は「直前の部分assistantは捨てられた」なので、
+                    // 縮退と同じ区切りマーカーを出す（§11.4「既存の同型の穴も同時に塞ぐ」）。
+                    self.emit_marker(on_text_delta, CANCELLED_REASON, emitted_bytes, visible);
+                    return Ok(RawTurnResult::CancelledMidStream);
                 }
-                StreamEvent::SignatureDelta { index, sig } => {
-                    if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
-                        b.signature = Some(sig);
-                    }
-                }
-                StreamEvent::ToolInputDelta {
-                    index,
-                    json_fragment,
+                Attempt::Completed {
+                    content,
+                    malformed,
+                    stop_reason,
+                    usage,
                 } => {
-                    if let Some(b) = blocks.iter_mut().find(|b| b.index == index) {
-                        b.tool_input_raw.push_str(&json_fragment);
+                    // 縮退しなかったコールだけが母集団へ入る（§11.2の自己敗北的フィードバック回避）。
+                    if let Some(w) = watch {
+                        w.record_clean();
                     }
+                    return self
+                        .complete(content, malformed, stop_reason, usage)
+                        .await
+                        .map(RawTurnResult::Completed);
                 }
-                StreamEvent::BlockStop { .. } => {}
-                StreamEvent::Done {
-                    stop_reason: sr,
-                    usage: u,
-                } => {
-                    stop_reason = sr;
-                    usage = u;
+                Attempt::Degenerate(hit) => {
+                    let Some(w) = watch.as_ref() else {
+                        // 検知器が無ければ`Degenerate`は返らない（到達しない）。
+                        unreachable!("degeneracy detected without a detector");
+                    };
+                    let next = self.advance_ladder(&mut ladder, w, &base_req.model).await;
+                    self.report_discard(on_text_delta, &hit, emitted_bytes, next, visible, &req);
+                    if next == ladder::Rung::Exhausted {
+                        return Ok(RawTurnResult::Discarded { kind: hit.kind });
+                    }
+                    rung = Some(next);
+                    retries += 1;
                 }
             }
         }
+    }
 
-        let (mut content, malformed) = assemble_content(blocks);
+    /// 梯子を1段進める。(d) 段が選ばれたらここで実際にモデルを再ロードし、
+    /// **失敗したら段を`Exhausted`へ落とす**（対応しないプロバイダはその段を飛ばす、§11.5）。
+    async fn advance_ladder(
+        &self,
+        ladder: &mut Option<ladder::Ladder>,
+        watch: &CallWatch<'_>,
+        model: &str,
+    ) -> ladder::Rung {
+        let l = ladder.get_or_insert_with(|| {
+            ladder::Ladder::new(watch.recovery_budget(), watch.recycle_enabled())
+        });
+        let mut next = l.advance(watch.elapsed());
+        if next == ladder::Rung::Recycle && !matches!(self.provider.recycle(model).await, Ok(true)) {
+            next = ladder::Rung::Exhausted;
+        }
+        next
+    }
+
+    /// 破棄をイベント・text区切りマーカー・wire logの3経路へ出す。
+    ///
+    /// イベントとマーカーの両方を無条件に出してよいのは、実際に届くのが常に片方だけだから——
+    /// TUI・headless json/jsonl では`on_text_delta`がno-opクロージャ、headless text では
+    /// `events`が`None`になる。
+    #[allow(clippy::too_many_arguments)]
+    fn report_discard<F>(
+        &self,
+        on_text_delta: &mut F,
+        hit: &Degenerate,
+        emitted_bytes: u64,
+        next: ladder::Rung,
+        visible: bool,
+        req: &CompletionRequest,
+    ) where
+        F: FnMut(&str),
+    {
+        // 捨てた本文と発火理由を残す（§11.6「捨てた本文の保全」）。誤検知だったのかを事後に
+        // 確かめられるようにするためで、新しい保存経路は作らず既存のwire logを再利用する。
+        harness_core::wire_log::record(|| {
+            serde_json::json!({
+                "kind": "turn_discarded",
+                "degenerate_kind": hit.kind.as_str(),
+                "reason": hit.reason,
+                "next_rung": next.as_str(),
+                "model": req.model,
+                "max_tokens": req.max_tokens,
+                "discarded_bytes": emitted_bytes,
+            })
+        });
+        emit(
+            self.events,
+            AgentEvent::TurnDiscarded {
+                kind: hit.kind,
+                reason: hit.reason.clone(),
+                discarded_bytes: emitted_bytes,
+                next_rung: (next != ladder::Rung::Exhausted).then(|| next.as_str().to_string()),
+            },
+        );
+        self.emit_marker(on_text_delta, hit.kind.as_str(), emitted_bytes, visible);
+    }
+
+    /// text形式の区切りマーカーを流す。**`Internal`のターンでは出さない**——そもそも本文を
+    /// 1バイトも流していないので、下流に切り詰める対象が無い（出すとかえって偽の区切りになる）。
+    fn emit_marker<F>(&self, on_text_delta: &mut F, reason: &str, bytes: u64, visible: bool)
+    where
+        F: FnMut(&str),
+    {
+        if visible {
+            on_text_delta(&discarded_marker(reason, bytes));
+        }
+    }
+
+    /// 完走したストリームを`RawTurn`へ仕上げる（伏字化 → 本文の連結 → ツール実行）。
+    async fn complete(
+        &self,
+        mut content: Vec<ContentBlock>,
+        malformed: std::collections::HashMap<String, MalformedToolInput>,
+        stop_reason: StopReason,
+        usage: Usage,
+    ) -> Result<RawTurn, EngineError> {
         if self.is_tier3() {
             sanitize::content_blocks(&mut content);
         }
@@ -344,14 +434,14 @@ impl<'a> TurnExecutor<'a> {
 
         let (tool_calls, cancelled_mid_tool) = self.execute_tool_calls(&content, &malformed).await;
 
-        Ok(RawTurnResult::Completed(RawTurn {
+        Ok(RawTurn {
             content,
             text,
             tool_calls,
             stop_reason,
             usage,
             cancelled_mid_tool,
-        }))
+        })
     }
 
     /// `content`中の`ToolUse`を順に処理する。戻り値の`Vec`は`ToolUse`ブロックと1対1で対応する
@@ -494,160 +584,5 @@ impl<'a> TurnExecutor<'a> {
 impl Executor for TurnExecutor<'_> {
     async fn raw_turn(&self, r: RawTurnRequest) -> Result<RawTurnResult, EngineError> {
         self.raw_turn_with_deltas(r, &mut |_: &str| {}).await
-    }
-}
-
-/// ストリーム受信中のブロックを蓄積する作業用構造体。
-/// `StreamEvent`はブロック単位に一般化されているため、`BlockStart`〜`BlockStop`の間に届く
-/// デルタをindexごとに蓄積し、ストリーム完了後に`ContentBlock`へ組み立てる
-/// （§プロバイダ抽象「ブロック単位に一般化」）。
-struct BlockAccum {
-    index: usize,
-    kind: BlockKind,
-    text: String,
-    signature: Option<String>,
-    tool_input_raw: String,
-}
-
-/// 引数JSONの連結・パースに失敗した`tool_use`（Phase5-B）。ターン全体を落とさず、
-/// `content`へは空入力の`ToolUse`を積んだ上でこの理由を控え、実行はスキップして
-/// `is_error`な`tool_result`を合成する（「unknown tool」と同じ扱い）。
-struct MalformedToolInput {
-    id: String,
-    name: String,
-    raw: String,
-}
-
-impl BlockAccum {
-    fn into_content_block(self) -> Result<ContentBlock, MalformedToolInput> {
-        match self.kind {
-            BlockKind::Text => Ok(ContentBlock::Text(self.text)),
-            BlockKind::Thinking => Ok(ContentBlock::Thinking {
-                text: self.text,
-                signature: self.signature,
-            }),
-            BlockKind::RedactedThinking => Ok(ContentBlock::RedactedThinking { data: self.text }),
-            BlockKind::ToolUse { id, name } => {
-                // OpenAIは引数文字列断片・Anthropicは部分JSONオブジェクト断片だが、
-                // いずれも連結すれば1つのJSONテキストになるため、BlockStop相当の
-                // このタイミングで一度だけパースする（§プロバイダ抽象「ツール引数の正規化」）。
-                let input = if self.tool_input_raw.trim().is_empty() {
-                    serde_json::Value::Object(Default::default())
-                } else {
-                    match serde_json::from_str(&self.tool_input_raw) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            return Err(MalformedToolInput {
-                                id,
-                                name,
-                                raw: self.tool_input_raw,
-                            })
-                        }
-                    }
-                };
-                Ok(ContentBlock::ToolUse { id, name, input })
-            }
-        }
-    }
-}
-
-/// 蓄積したブロック列を`content`へ組み立てる。引数JSONパース失敗はターン全体を落とさず、
-/// 空入力の`ToolUse`として`content`へ積んだ上で理由を控える（`tool_use`/`tool_result`の
-/// 対応を崩さないため）。
-fn assemble_content(
-    blocks: Vec<BlockAccum>,
-) -> (
-    Vec<ContentBlock>,
-    std::collections::HashMap<String, MalformedToolInput>,
-) {
-    let mut content = Vec::with_capacity(blocks.len());
-    let mut malformed: std::collections::HashMap<String, MalformedToolInput> =
-        std::collections::HashMap::new();
-    for b in blocks {
-        match b.into_content_block() {
-            Ok(block) => {
-                if let ContentBlock::ToolUse { id, name, .. } = &block {
-                    wire_log_block_assembly("tool_input_assembled", id, name, "", true);
-                }
-                content.push(block);
-            }
-            Err(m) => {
-                wire_log_block_assembly("tool_input_assembled", &m.id, &m.name, &m.raw, false);
-                content.push(ContentBlock::ToolUse {
-                    id: m.id.clone(),
-                    name: m.name.clone(),
-                    input: serde_json::Value::Object(Default::default()),
-                });
-                malformed.insert(m.id.clone(), m);
-            }
-        }
-    }
-    (content, malformed)
-}
-
-/// `HARNESS_WIRE_LOG=<path>`設定時のみ、ブロック組み立て結果（`tool_input_raw`の連結後文字列と
-/// パース成否）をJSONL追記する（`harness-providers::openai`の同名フックと対をなす、
-/// `run_shell`不安定性調査のPhase2観測基盤）。未設定時はゼロコスト。
-fn wire_log_block_assembly(kind: &str, id: &str, name: &str, raw: &str, ok: bool) {
-    let Some(path) = std::env::var_os("HARNESS_WIRE_LOG") else {
-        return;
-    };
-    use std::io::Write as _;
-    let value = serde_json::json!({
-        "kind": kind,
-        "tool_use_id": id,
-        "name": name,
-        "tool_input_raw": raw,
-        "parse_ok": ok,
-    });
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(std::path::PathBuf::from(path))
-    {
-        let _ = writeln!(f, "{value}");
-    }
-}
-
-/// リトライ可能な`ProviderError`（`RateLimited`/`Overloaded`/`Transport{retriable:true}`）かどうか。
-/// `ContextTooLong`はここに含めない（呼び出し側でコンテキスト圧縮を挟んでから明示的に再試行する、
-/// §主なリスクと対策「分類を確定。外周の共通リトライラッパがこれを見てリトライ可否・待機を決める」）。
-fn is_retriable(e: &ProviderError) -> bool {
-    matches!(
-        e,
-        ProviderError::RateLimited { .. }
-            | ProviderError::Overloaded
-            | ProviderError::Transport { retriable: true }
-    )
-}
-
-fn retry_delay(e: &ProviderError, attempt: u32) -> Duration {
-    if let ProviderError::RateLimited {
-        retry_after: Some(d),
-    } = e
-    {
-        return *d;
-    }
-    Duration::from_millis(200 * 2u64.saturating_pow(attempt))
-}
-
-/// `provider.stream`をリトライ可能なエラーに対して指数バックオフで最大`MAX_RETRIES`回まで
-/// 再試行する。`ContextTooLong`はここでは扱わず、そのまま呼び出し側へ伝播する
-/// （`run_agent_loop`側でコンテキスト圧縮を挟んだ1回限りの再試行を行う）。
-async fn stream_with_retry(
-    provider: &dyn LlmProvider,
-    req: &CompletionRequest,
-) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
-{
-    let mut attempt = 0;
-    loop {
-        match provider.stream(req.clone()).await {
-            Ok(s) => return Ok(s),
-            Err(e) if attempt < MAX_RETRIES && is_retriable(&e) => {
-                tokio::time::sleep(retry_delay(&e, attempt)).await;
-                attempt += 1;
-            }
-            Err(e) => return Err(e),
-        }
     }
 }

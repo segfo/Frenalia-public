@@ -110,7 +110,127 @@ pub enum AgentEvent {
         missing: Vec<String>,
         promoted: bool,
     },
+    /// 縮退したターンを破棄した（`plans/DESIGN-COGNITION.md` §11.4、M21）。
+    ///
+    /// **このイベントが出たターンはツールを一度も実行していない**——検知はストリーム受信中
+    /// （①②④）またはストリーム完了直後（③、`ToolUse`ゼロが発火条件）に起きるため、
+    /// ツール実行へ到達しない。したがって捨てたコールは副作用を持たない。
+    ///
+    /// `next_rung`が`Some`なら回復の梯子（§11.3）を1段登って再送する。`None`なら梯子を
+    /// 使い切っており、このターンは`RawTurnResult::Discarded`として呼び出し側へ返る。
+    TurnDiscarded {
+        kind: DegenerateKind,
+        /// 発火理由の1行説明（「疑い状態（出力量が平常の3.4倍）→ 新規性率0.94」）。
+        /// §11.2「発火理由が常にログ1行で説明できる」をここで満たす。
+        reason: String,
+        /// このコールで下流へ実際に流した可視テキストのUTF-8バイト数。
+        /// `--output-format text`の下流は自バッファを末尾からこの数だけ切り詰めればよい
+        /// （[`discarded_marker`]と同じ値）。
+        discarded_bytes: u64,
+        /// 次に登る段のラベル。使い切ったら`None`。
+        next_rung: Option<String>,
+    },
     Error {
         message: String,
     },
+}
+
+/// 縮退の種別（`plans/DESIGN-COGNITION.md` §11.1 の検知器4種と1対1）。
+///
+/// 機構の本体は`harness-engine::degeneracy`にあるが、この enum だけは
+/// [`AgentEvent::TurnDiscarded`]が`Serialize`で運ぶため`harness-core`側に置く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DegenerateKind {
+    /// ① 短周期反復。直近512文字の最小周期が32以下（`？？？？…`・`・・・・…`）。
+    ShortPeriodRepeat,
+    /// ② 新規性率の枯渇。直近1024文字の90%超が既出の32-gramに含まれる。
+    /// **「長い」ではなく「新しいことを言わなくなった」を測る**ので、正当な長文は通る。
+    NoveltyCollapse,
+    /// ③ 完走時の無産出。`MaxTokens`で終わったのに`Text`0文字かつ`ToolUse`ゼロ。
+    NoOutputAtMaxTokens,
+    /// ④ reasoning-only 上限。thinkingだけが出力枠を食い潰し、本文もツールも出ない。
+    /// ③を完走前に捕まえる早期版。
+    ReasoningOnly,
+}
+
+impl DegenerateKind {
+    /// [`discarded_marker`]と構造化ログで使う安定した短い名前。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DegenerateKind::ShortPeriodRepeat => "short_period_repeat",
+            DegenerateKind::NoveltyCollapse => "novelty_collapse",
+            DegenerateKind::NoOutputAtMaxTokens => "no_output_at_max_tokens",
+            DegenerateKind::ReasoningOnly => "reasoning_only",
+        }
+    }
+}
+
+impl std::fmt::Display for DegenerateKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `--output-format text`で「直前の出力のどこからが捨てる範囲か」を下流へ伝えるマーカー
+/// （`plans/DESIGN-COGNITION.md` §11.4）。
+///
+/// text形式では`events`が`None`のため[`AgentEvent::TurnDiscarded`]は届かない。かわりに
+/// `TurnExecutor`がテキストデルタの経路へこの1行を流す。**書式の宣言点はこの関数1つだけ**にして、
+/// 契約が二重化しないようにする。
+///
+/// `bytes`を載せるのは、終端マーカーだけでは下流が捨てる範囲を復元できないため。
+/// 「自分のバッファを末尾から`bytes`バイト切り詰めよ」と自己完結で伝える。梯子を2回登れば
+/// 2つのマーカーが順に出るので、下流は順に適用すればよい。
+///
+/// `\x1e`はASCII RS（record separator）で端末では不可視。**このマーカーは異常時にしか出ないので、
+/// 正常時の出力は1バイトも変わらない**（`plans/DESIGN.md` §ヘッドレスで確立した
+/// `--output-format text`の契約を壊さない）。
+///
+/// `reason`は[`DegenerateKind::as_str`]、またはEscキャンセルの[`CANCELLED_REASON`]。
+pub fn discarded_marker(reason: &str, bytes: u64) -> String {
+    format!("\x1e[harness:discarded bytes={bytes} reason={reason}]\n")
+}
+
+/// [`discarded_marker`]の`reason`のうち、縮退ではなくEscキャンセルによる破棄を表すもの。
+///
+/// キャンセルも意味論は同じ「直前の部分assistantは捨てられた」だが、text形式には
+/// これまでなんのマーカーも出ていなかった（§11.4「既存の同型の穴も同時に塞ぐ」）。
+pub const CANCELLED_REASON: &str = "cancelled";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_marker_is_self_describing_and_terminated() {
+        let m = discarded_marker(DegenerateKind::ShortPeriodRepeat.as_str(), 1_234);
+        assert_eq!(m, "\x1e[harness:discarded bytes=1234 reason=short_period_repeat]\n");
+        assert!(m.starts_with('\x1e'), "端末で不可視なRSで始まる");
+        assert!(m.ends_with('\n'), "行として完結する");
+    }
+
+    /// バイト数が0でも桁が増えても書式が壊れない（下流のパーサが固定長を仮定できない）。
+    #[test]
+    fn the_marker_survives_any_byte_count() {
+        for bytes in [0u64, 9, 10, u64::MAX] {
+            let m = discarded_marker(CANCELLED_REASON, bytes);
+            assert!(m.contains(&format!("bytes={bytes} ")), "{m}");
+            assert!(m.contains("reason=cancelled]"), "{m}");
+        }
+    }
+
+    /// 種別名は構造化ログとマーカーの両方に出る安定した識別子なので、重複しないこと。
+    #[test]
+    fn every_kind_has_a_distinct_stable_name() {
+        let names = [
+            DegenerateKind::ShortPeriodRepeat,
+            DegenerateKind::NoveltyCollapse,
+            DegenerateKind::NoOutputAtMaxTokens,
+            DegenerateKind::ReasoningOnly,
+        ]
+        .map(DegenerateKind::as_str);
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
+        assert!(!unique.contains(&CANCELLED_REASON));
+    }
 }

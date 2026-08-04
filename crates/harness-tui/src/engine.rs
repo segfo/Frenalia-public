@@ -95,6 +95,9 @@ pub fn spawn_engine(
     max_turns: usize,
     // `harness-cli`が`settings.json`/CLIフラグとプロバイダcapabilityから解決済みのもの。
     compaction: compaction::CompactionPolicy,
+    // 縮退ガードの移動統計（`plans/DESIGN-COGNITION.md` §11）。**セッション全体で1つ**を
+    // 借り、発話ごとに`clone`して`AgentLoopConfig`へ載せる（中身は`Arc`なので統計は共有される）。
+    degeneracy: Option<harness_engine::degeneracy::DegeneracyDetector>,
     mut state: ConversationState,
     mut session: SessionStore,
     sessions_dir: PathBuf,
@@ -133,6 +136,7 @@ pub fn spawn_engine(
                             max_tokens,
                             max_turns,
                             compaction,
+                            degeneracy: degeneracy.clone(),
                         },
                         Some(&events_tx),
                         Some(&turn_cancel),

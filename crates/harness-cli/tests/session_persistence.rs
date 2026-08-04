@@ -62,6 +62,7 @@ async fn run_one_turn(
             max_tokens: 100,
             max_turns: 5,
             compaction: Default::default(),
+            degeneracy: None,
         },
         OutputFormat::Text,
         &mut out,

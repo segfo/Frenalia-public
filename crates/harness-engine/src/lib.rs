@@ -11,6 +11,7 @@
 //! リトライ/リアクティブ圧縮・JSONLセッション永続化（`session`モジュール）を追加した。
 
 pub mod compaction;
+pub mod degeneracy;
 pub mod permission;
 mod sanitize;
 pub mod session;
@@ -153,6 +154,13 @@ pub struct AgentLoopConfig {
     /// コンテキスト縮約のポリシー（`plans/PLAN-COMPACTION.md`）。
     /// `CompactionPolicy::resolve`で解決済みのものを渡す（解決の失敗は起動時に止める）。
     pub compaction: compaction::CompactionPolicy,
+    /// 縮退ガード（`plans/DESIGN-COGNITION.md` §11、M21）。`None`なら機構ごと無効
+    /// （`settings.json`の`degeneracy.enabled:false`）。
+    ///
+    /// 移動統計の寿命は**セッション全体**だが`TurnExecutor`は1発話ごとに作り直されるので、
+    /// セッション側（`harness-cli`/`harness-tui`）が1つ所有し、発話ごとに`clone`して
+    /// ここへ載せる（中身は`Arc`なので統計は共有される）。
+    pub degeneracy: Option<degeneracy::DegeneracyDetector>,
 }
 
 /// `ConversationState`全体を1リクエストへ写す。認知レイヤー（M14以降）はここを通らず、
@@ -212,7 +220,15 @@ where
     F: FnMut(&str),
 {
     let tool_specs = tools.to_specs_for_ctx(ctx);
-    let executor = TurnExecutor::new(provider, tools, ctx, gate, events, cancel);
+    let executor = TurnExecutor::new(
+        provider,
+        tools,
+        ctx,
+        gate,
+        events,
+        cancel,
+        config.degeneracy.as_ref(),
+    );
     let tier3 = ctx.shell_tier.tier == harness_core::ShellTier::Tier3;
 
     /// キャンセルによる早期returnの共通形。§エージェントループ「ストリーム途中は部分assistant
@@ -378,6 +394,32 @@ where
             RawTurnResult::CancelledMidStream => {
                 emit(events, AgentEvent::Cancelled);
                 return Ok(cancelled_outcome());
+            }
+            // 回復の梯子を使い切ってなお縮退した（`plans/DESIGN-COGNITION.md` §11.4）。
+            // 履歴へは何も積まず、このターンで畳む。
+            //
+            // **捨てたコールは`max_turns`に算入しない**——ループを継続せずここで返すので、
+            // 「モデルが壊れていた」だけの理由でターン予算が減ることも、ログ上で
+            // 「予算切れ」に見えて原因（縮退）と結果（未達）が混ざることも無い
+            // （§11.3「進捗予算と回復予算を混ぜない」）。
+            //
+            // 発火理由・捨てた本文は`TurnDiscarded`イベントと`HARNESS_WIRE_LOG`が既に運んでいる
+            // （`crate::turn`）ので、ここで改めて記録はしない。
+            RawTurnResult::Discarded { .. } => {
+                let stop_reason = StopReason::Other("degenerate_output".to_string());
+                emit(
+                    events,
+                    AgentEvent::TurnCompleted {
+                        stop_reason: stop_reason.clone(),
+                        usage: Usage::default(),
+                    },
+                );
+                return Ok(AgentLoopOutcome {
+                    text: String::new(),
+                    stop_reason,
+                    usage: Usage::default(),
+                    cancelled: false,
+                });
             }
         };
 
@@ -726,6 +768,7 @@ mod tests {
                 max_tokens: 100,
                 max_turns: 5,
                 compaction: Default::default(),
+                degeneracy: None,
             },
             None,
             None,
@@ -790,6 +833,7 @@ mod tests {
                 max_tokens: 100,
                 max_turns: 5,
                 compaction: Default::default(),
+                degeneracy: None,
             },
             Some(&events_tx),
             None,
@@ -864,6 +908,7 @@ mod tests {
                 max_tokens: 100,
                 max_turns: 5,
                 compaction: Default::default(),
+                degeneracy: None,
             },
             None,
             None,
@@ -913,6 +958,7 @@ mod tests {
                 max_tokens: 100,
                 max_turns: 5,
                 compaction: Default::default(),
+                degeneracy: None,
             },
             None,
             None,
@@ -962,6 +1008,7 @@ mod tests {
                 max_tokens: 100,
                 max_turns: 5,
                 compaction: Default::default(),
+                degeneracy: None,
             },
             None,
             None,
@@ -1033,6 +1080,7 @@ mod tests {
                     max_tokens: 100,
                     max_turns: 5,
                     compaction: Default::default(),
+                    degeneracy: None,
                 },
                 None,
                 Some(&cancel),
@@ -1143,6 +1191,7 @@ mod tests {
                     max_tokens: 100,
                     max_turns: 5,
                     compaction: Default::default(),
+                    degeneracy: None,
                 },
                 None,
                 Some(&cancel),
@@ -1199,6 +1248,7 @@ mod tests {
                 max_tokens: 100,
                 max_turns: 5,
                 compaction: Default::default(),
+                degeneracy: None,
             },
             None,
             None,
@@ -1245,6 +1295,7 @@ mod tests {
                     max_tokens: 100,
                     max_turns: 5,
                     compaction: Default::default(),
+                    degeneracy: None,
                 },
                 Some(&events_tx),
                 Some(&cancel),

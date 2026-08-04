@@ -105,6 +105,13 @@ pub struct AppState {
     /// 直前の`TextDelta`がAssistantテキストの続きかどうか。`TurnStarted`/ツールカード挿入で
     /// リセットし、新しいターンのテキストが別の`Assistant`項目として積まれるようにする。
     turn_open: bool,
+    /// 現在の試行が書き始めた`transcript`上の位置（`transcript.len()`）。
+    ///
+    /// 縮退で1回分の応答が破棄されたとき（`AgentEvent::TurnDiscarded`、M21）に、
+    /// **画面に出てしまった本文をここまで巻き戻す**ために持つ。`TurnStarted`で設定し、
+    /// 破棄を1件処理するたびに更新する（更新しないと、次の破棄で「破棄しました」の
+    /// 記録行まで消えてしまう）。
+    turn_transcript_mark: usize,
     pub should_quit: bool,
     /// transcriptの最新行から何行遡っているか（0=最新へ追従）。総行数は折り畳み状態に応じて
     /// 描画時にしか決まらないため、上限のクランプは`ui.rs::render_transcript`側で行う。
@@ -176,6 +183,7 @@ impl AppState {
             last_usage: Usage::default(),
             last_stop_reason: None,
             turn_open: false,
+            turn_transcript_mark: 0,
             should_quit: false,
             scroll_offset: 0,
             collapsed: true,

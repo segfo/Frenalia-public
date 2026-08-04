@@ -55,6 +55,11 @@ pub struct JsonOutcome {
     pub turns: usize,
     pub tool_calls: Vec<JsonToolCall>,
     pub usage: Usage,
+    /// 縮退で破棄したLLMコールの数（M21、`plans/DESIGN-COGNITION.md` §11.4）。
+    ///
+    /// 回復の梯子を1段登るたびに1増える。**`turns`とは独立**——梯子は1つの`TurnStarted`の
+    /// 内側で回るので、捨てた回はターン数に現れない。正常時は常に`0`。
+    pub discarded_turns: usize,
     pub error: Option<String>,
 }
 
@@ -79,9 +84,11 @@ fn record_event(
     usage: &mut Usage,
     pending: &mut HashMap<String, (String, serde_json::Value)>,
     tool_calls: &mut Vec<JsonToolCall>,
+    discarded_turns: &mut usize,
 ) {
     match ev {
         AgentEvent::TurnStarted { .. } => *turns += 1,
+        AgentEvent::TurnDiscarded { .. } => *discarded_turns += 1,
         AgentEvent::TurnCompleted { usage: u, .. } => *usage = *u,
         AgentEvent::ToolCallProposed { id, name, input } => {
             pending.insert(id.clone(), (name.clone(), input.clone()));
@@ -188,6 +195,7 @@ pub async fn run_headless<W: Write>(
             let mut usage = Usage::default();
             let mut pending = HashMap::new();
             let mut tool_calls = Vec::new();
+            let mut discarded_turns = 0usize;
 
             let result = loop {
                 tokio::select! {
@@ -198,7 +206,7 @@ pub async fn run_headless<W: Write>(
                                 let _ = writeln!(writer, "{line}");
                             }
                         }
-                        record_event(&ev, &mut turns, &mut usage, &mut pending, &mut tool_calls);
+                        record_event(&ev, &mut turns, &mut usage, &mut pending, &mut tool_calls, &mut discarded_turns);
                     }
                     res = &mut loop_fut => {
                         break res;
@@ -213,7 +221,7 @@ pub async fn run_headless<W: Write>(
                         let _ = writeln!(writer, "{line}");
                     }
                 }
-                record_event(&ev, &mut turns, &mut usage, &mut pending, &mut tool_calls);
+                record_event(&ev, &mut turns, &mut usage, &mut pending, &mut tool_calls, &mut discarded_turns);
             }
 
             if output_format == OutputFormat::Json {
@@ -223,6 +231,7 @@ pub async fn run_headless<W: Write>(
                     turns,
                     tool_calls,
                     usage,
+                    discarded_turns,
                     error: result.as_ref().err().map(|e| e.to_string()),
                 };
                 if let Ok(line) = serde_json::to_string(&outcome) {

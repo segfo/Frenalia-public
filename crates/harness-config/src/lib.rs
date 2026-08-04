@@ -43,6 +43,9 @@ pub struct Settings {
     /// コンテキスト縮約設定（`plans/PLAN-COMPACTION.md`）。省略時はプロバイダの
     /// `ProviderCapabilities`から解決した既定（ローカル`0.5`/`0.3`、クラウド`0.85`/`0.6`）。
     pub compaction: Option<CompactionSettings>,
+    /// 縮退ガード設定（`plans/DESIGN-COGNITION.md` §11.6、M21）。省略時は
+    /// `DegeneracySettings::default()`（有効・`auto_recycle`は無効）。
+    pub degeneracy: Option<DegeneracySettings>,
 }
 
 /// `.harness/settings.json`の`cognition`キー。
@@ -84,6 +87,61 @@ pub struct CompactionSettings {
     /// 縮約後に目指す水準。`trigger_ratio`より小さくないと毎ターン再発火して振動する
     /// （逆転していれば起動時にエラーで止める。黙って直さない）。
     pub target_ratio: Option<f32>,
+}
+
+/// `.harness/settings.json`の`degeneracy`キー（`plans/DESIGN-COGNITION.md` §11.6）。
+///
+/// ```jsonc
+/// "degeneracy": {
+///   "enabled": true,                 // 既定 true。この機構全体の無効化スイッチ
+///   "auto_recycle": false,           // 既定 false。(d)段。LMStudio系統でのみ意味を持つ
+///   "gate_multiplier": 3.0,          // 平常中央値の何倍で「疑い」状態へ入るか
+///   "recovery_multiplier": 3.0,      // 回復に使ってよい壁時計時間 = 中央値 × これ
+///   "short_period":  { "window": 512,  "max_period": 32, "min_repeats": 8 },
+///   "ngram":         { "window": 1024, "n": 32, "seen_ratio_max": 0.90 },
+///   "reasoning_only_ratio": 0.6      // max_tokens の何割を thinking だけで食ったら kill
+/// }
+/// ```
+///
+/// **`enabled`という単一の無効化スイッチを置く**のは、この機構が本来正常な動作を阻害し得る
+/// 唯一のクラスの機能だからである（他の機構は「拒否する」方向で、これは「捨ててやり直す」方向）。
+/// 想定外の誤検知に当たった人が、ハーネス全体を使えなくなる前に切れる口を1つ確保する。
+///
+/// `auto_recycle`は**booleanだけ**であり、実行内容（エンドポイントと手順）は完全にコード側にある。
+/// 設定ファイルは宣言のみを持ちコード実行ベクタにならない——`docs/SECURITY-PRINCIPLES.md` P-08 と
+/// 脅威モデル T-08（`.harness/settings.json`自己追記）の前提を変えない。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DegeneracySettings {
+    pub enabled: Option<bool>,
+    pub auto_recycle: Option<bool>,
+    pub gate_multiplier: Option<f32>,
+    pub recovery_multiplier: Option<f32>,
+    pub short_period: Option<ShortPeriodSettings>,
+    pub ngram: Option<NgramSettings>,
+    pub reasoning_only_ratio: Option<f32>,
+}
+
+/// `degeneracy.short_period`（①短周期反復の窓・周期上限・最小反復回数）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShortPeriodSettings {
+    pub window: Option<usize>,
+    pub max_period: Option<usize>,
+    pub min_repeats: Option<usize>,
+}
+
+/// `degeneracy.ngram`（②新規性率の窓・n-gram長・既出率の上限）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct NgramSettings {
+    pub window: Option<usize>,
+    pub n: Option<usize>,
+    pub seen_ratio_max: Option<f64>,
+}
+
+impl DegeneracySettings {
+    /// この機構全体が有効か（既定`true`）。
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 /// `.harness/settings.json`の`run_shell`キー。シークレットenvの転送は禁止し、PATH追加だけを扱う。

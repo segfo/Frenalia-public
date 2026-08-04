@@ -1096,3 +1096,86 @@ fn changes_panel_esc_closes_without_action() {
     assert!(action.is_none());
     assert!(app.changes_panel.is_none());
 }
+
+// --- 縮退ガード（M21、`plans/DESIGN-COGNITION.md` §11.4） ---
+
+fn discarded(next_rung: Option<&str>) -> AgentEvent {
+    AgentEvent::TurnDiscarded {
+        kind: harness_core::DegenerateKind::ShortPeriodRepeat,
+        reason: "直近512文字の最小周期が1文字（512回反復）".into(),
+        discarded_bytes: 42,
+        next_rung: next_rung.map(str::to_string),
+    }
+}
+
+/// 縮退した応答は**画面から消える**。捨てた出力が残っていると、再試行の本文と
+/// 連結して読めてしまう（§11.4「当該assistant部分の表示を破棄して再描画」）。
+#[test]
+fn a_discarded_turn_rewinds_the_transcript_to_the_start_of_the_attempt() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.apply(AgentEvent::TextDelta {
+        text: "前のターンの回答".into(),
+    });
+    app.apply(AgentEvent::TurnCompleted {
+        stop_reason: StopReason::EndTurn,
+        usage: Usage::default(),
+    });
+
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    app.apply(AgentEvent::TextDelta {
+        text: "壊れかけた出力".into(),
+    });
+    app.apply(discarded(Some("jitter")));
+
+    // 前のターンは残り、このターンの本文だけが消えて記録行に置き換わる。
+    assert_eq!(app.transcript.len(), 2, "{:?}", app.transcript);
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s == "前のターンの回答")
+    );
+    let TranscriptItem::Info(line) = &app.transcript[1] else {
+        panic!("expected an Info line, got {:?}", app.transcript[1]);
+    };
+    assert!(line.contains("[縮退]"), "{line}");
+    assert!(line.contains("short_period_repeat"), "{line}");
+    assert!(line.contains("再試行: jitter"), "{line}");
+
+    // 再送の本文は新しい項目として積まれる（記録行へ連結しない）。
+    app.apply(AgentEvent::TextDelta {
+        text: "落ち着いた回答".into(),
+    });
+    assert_eq!(app.transcript.len(), 3);
+    assert!(matches!(&app.transcript[2], TranscriptItem::Assistant(s) if s == "落ち着いた回答"));
+}
+
+/// 同じターンで2回破棄されても、**1回目の記録行は消えない**。消えると
+/// 「何回捨てたのか」がユーザから見えなくなる。
+#[test]
+fn repeated_discards_within_one_turn_keep_every_record_line() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    app.apply(AgentEvent::TextDelta { text: "壊れ1".into() });
+    app.apply(discarded(Some("jitter")));
+    app.apply(AgentEvent::TextDelta { text: "壊れ2".into() });
+    app.apply(discarded(None));
+
+    assert_eq!(app.transcript.len(), 2, "{:?}", app.transcript);
+    for item in &app.transcript {
+        let TranscriptItem::Info(line) = item else {
+            panic!("expected only record lines, got {item:?}");
+        };
+        assert!(line.contains("[縮退]"), "{line}");
+    }
+    assert!(
+        matches!(&app.transcript[1], TranscriptItem::Info(l) if l.contains("使い切った")),
+        "{:?}",
+        app.transcript[1]
+    );
+    // 捨てた本文はどちらも残っていない。
+    let all = format!("{:?}", app.transcript);
+    assert!(!all.contains("壊れ1"), "{all}");
+    assert!(!all.contains("壊れ2"), "{all}");
+}

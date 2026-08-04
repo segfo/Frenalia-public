@@ -138,10 +138,21 @@ pub(crate) fn build_provider(
         // §設定「LMStudio は単に base_url=http://localhost:1234/v1 の openai-family
         // プロファイル」。`--base-url`/`OPENAI_API_KEY`/`OPENAI_BASE_URL`での上書きも許す。
         ProviderKind::Lmstudio => {
-            let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            // 管理REST API（`/api/v1/`）のトークン。縮退ガードの (d) 段が使う
+            // （`plans/DESIGN-COGNITION.md` §11.5）。この開発機のLM Studioでは認証不要のため
+            // 通常は未設定で、その場合はトークンを付けずに叩く。
+            let mgmt_token = std::env::var("LM_API_TOKEN").ok();
             match base_url_override.or_else(|| std::env::var("OPENAI_BASE_URL").ok()) {
-                Some(base_url) => Ok(Box::new(OpenAiProvider::with_base_url(api_key, base_url))),
-                None => Ok(Box::new(OpenAiProvider::lmstudio())),
+                // **`with_base_url`ではなく`lmstudio_with_base_url`を使う**。前者は系統を
+                // `OpenAiFamily::OpenAi`にしてしまい、`--provider lmstudio --base-url ...`が
+                // `schema_with_tools:true`・`local:false`・`recycle`無効という、実体と食い違う
+                // 能力表明で走っていた（縮約のローカル既定値も (d) 段も効かない）。
+                Some(base_url) => Ok(Box::new(
+                    OpenAiProvider::lmstudio_with_base_url(base_url).with_mgmt_token(mgmt_token),
+                )),
+                None => Ok(Box::new(
+                    OpenAiProvider::lmstudio().with_mgmt_token(mgmt_token),
+                )),
             }
         }
     }

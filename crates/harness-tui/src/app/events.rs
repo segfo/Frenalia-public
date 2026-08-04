@@ -13,6 +13,7 @@ impl AppState {
             } => {
                 self.turn_open = false;
                 self.turn_in_flight = true;
+                self.turn_transcript_mark = self.transcript.len();
                 self.current_turn_upstream_estimate = estimated_input_tokens;
                 self.current_turn_downstream_chars = 0;
                 self.saw_thinking_this_turn = false;
@@ -152,6 +153,32 @@ impl AppState {
                     "context shrunk ({truncated_blocks} tool results truncated, \
                      ~{saved_tokens} tokens saved)"
                 )));
+            }
+            // 縮退した応答を破棄した（M21、`plans/DESIGN-COGNITION.md` §11.4）。
+            // **画面に出てしまった本文をこの試行の開始位置まで巻き戻す**——捨てた出力が
+            // 残っていると、次の試行の本文と連結して読めてしまう。
+            //
+            // 巻き戻した後に記録行を1本置き、markをその後ろへ進める。進めないと、
+            // 同じターンで2回目の破棄が起きたときにこの記録行まで消えてしまい、
+            // 「何回捨てたのか」がユーザから見えなくなる。
+            AgentEvent::TurnDiscarded {
+                kind,
+                reason,
+                next_rung,
+                ..
+            } => {
+                self.transcript
+                    .truncate(self.turn_transcript_mark.min(self.transcript.len()));
+                let next = match &next_rung {
+                    Some(rung) => format!("再試行: {rung}"),
+                    None => "再試行の手立てを使い切った".to_string(),
+                };
+                self.transcript.push(TranscriptItem::Info(format!(
+                    "[縮退] 応答を破棄した（{kind}）: {reason} — {next}"
+                )));
+                self.turn_transcript_mark = self.transcript.len();
+                self.turn_open = false;
+                self.end_thinking_progress(false);
             }
             // --- 認知レイヤー（M15）---
             // 台帳ビュー（推論パネル、`plans/DESIGN-COGNITION.md` §8）はまだ作らず、
