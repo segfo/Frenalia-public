@@ -37,6 +37,9 @@ pub(super) struct SandboxPrepared {
     pub(super) wfp_prelude: Option<String>,
     pub(super) write_mode: harness_sandbox::WorkspaceWriteMode,
     pub(super) shell_tier: harness_core::ShellTierSelection,
+    /// MCPサーバ宣言（M15.5）。承認照合・起動はStage5（`stage_run_agent`）が、Tier確定と
+    /// WFP適用の間で行う（順序が本質、`startup::mcp`のモジュールdoc参照）。
+    pub(super) mcp_decls: Vec<harness_mcp::McpServerDecl>,
 }
 
 /// staging mode・`sandbox_dir`・`read_scope`・net proxy/app・`require_sandbox`・
@@ -103,6 +106,18 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
         }
     }
     let run_shell_path_extra = settings.run_shell.clone().unwrap_or_default().path_extra();
+
+    // MCPサーバ宣言（M15.5）。**ここでは解釈だけ**で、承認照合も起動も行わない
+    // （`startup::mcp`のモジュールdoc参照）。綴り間違いは黙って無視せず起動を止める——
+    // 「設定したのに効かない」に気付けないと、裏取りしたつもりで裏取りしていない結論を
+    // 受け取ることになる。
+    let mcp_decls = match harness_mcp::parse_mcp_settings(settings.mcp.as_ref()) {
+        Ok(decls) => decls,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
 
     // シェル隔離Tier選択（M12、`plans/DESIGN-SANDBOX.md` §6/§7 D-03）。`--require-sandbox`指定時は
     // 自動降格せず起動を拒否する（既存の`--dangerously-allow`と同じfail-fastパターン）。
@@ -301,6 +316,7 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
         wfp_prelude,
         write_mode,
         shell_tier,
+        mcp_decls,
     })
 }
 

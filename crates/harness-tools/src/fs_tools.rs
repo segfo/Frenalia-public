@@ -400,6 +400,7 @@ mod tests {
             shell_sees_staged_writes: false,
             vm_sandbox: None,
             cow_upper_dir: None,
+            mcp_servers: Vec::new(),
         };
 
         let tool = WriteFileTool;
@@ -442,6 +443,7 @@ mod tests {
             shell_sees_staged_writes: false,
             vm_sandbox: None,
             cow_upper_dir: Some(upper_path.clone()),
+            mcp_servers: Vec::new(),
         };
 
         let tool = WriteFileTool;

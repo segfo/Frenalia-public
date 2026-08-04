@@ -481,6 +481,54 @@ mod tests {
         );
     }
 
+    /// M15.5/D-40: MCPツールは`mcp__<server>__<tool>`という名前で通常ツールとして載り、
+    /// **宣言でread-onlyと宣言されなかったものは`RiskClass::Network`になる**（`harness-mcp`側）。
+    /// ここではその結果がゲートでどう扱われるかを固定する——`Default`モードでプロンプト、
+    /// ヘッドレスでは自動拒否。認知レイヤーもこのゲートをバイパスしない。
+    #[test]
+    fn an_unallowlisted_mcp_tool_prompts_interactively_and_is_denied_headless() {
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let input = serde_json::json!({ "title": "ship it" }).to_string();
+
+        assert_eq!(
+            arbiter.classify("mcp__jira__create_issue", RiskClass::Network, &input),
+            Classification::Prompt
+        );
+        assert_eq!(
+            arbiter.decide("mcp__jira__create_issue", RiskClass::Network, &input),
+            Decision::Deny
+        );
+    }
+
+    /// read-onlyと宣言されたMCPツールは、組み込みのread系と同じく自動許可される。
+    #[test]
+    fn a_declared_read_only_mcp_tool_is_allowed_like_any_other_read() {
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        assert_eq!(
+            arbiter.decide("mcp__company-docs__search", RiskClass::ReadOnly, "{}"),
+            Decision::Allow
+        );
+    }
+
+    /// allowlistルールはMCPの名前空間付きツール名でそのまま書ける（登録名・`arg_repr`・
+    /// ルールが同じ表記であることの担保、`plans/DESIGN.md` §ツールシステム）。
+    #[test]
+    fn allowlist_rules_can_target_mcp_tools_by_their_namespaced_name() {
+        let arbiter = PermissionArbiter::new(
+            PermissionMode::Default,
+            vec![AllowlistRule::new("mcp__jira__create_issue", "*")],
+        );
+        assert_eq!(
+            arbiter.decide("mcp__jira__create_issue", RiskClass::Network, "{}"),
+            Decision::Allow
+        );
+        // 別サーバの同名ツールには波及しない。
+        assert_eq!(
+            arbiter.decide("mcp__other__create_issue", RiskClass::Network, "{}"),
+            Decision::Deny
+        );
+    }
+
     #[test]
     fn parses_allowlist_rule() {
         let rule = parse_allowlist_rule("run_shell:git status*").unwrap();

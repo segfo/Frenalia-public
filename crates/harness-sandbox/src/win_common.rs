@@ -32,7 +32,14 @@ pub fn wide(s: &str) -> Vec<u16> {
 /// 付与し、この制約を回避する。ACLを扱う全経路（`win_appcontainer.rs`のgrant/revoke系）は
 /// パスの文字列化に必ずこれを使うこと（生の`wide(&path.to_string_lossy())`を直接呼ばない）。
 pub(crate) fn long_path_wide(path: &std::path::Path) -> Vec<u16> {
-    let s = path.to_string_lossy();
+    // `\\?\`を付けた時点でそのパスは**verbatim**になり、Win32はもう正規化してくれない
+    // ——区切りは`\`でなければならず、`/`のままだとACL APIが`ERROR_FILE_NOT_FOUND`
+    // （0x80070002）で失敗する。`workspace_root.join(..)`由来のパスは元から`\`なのでこれまで
+    // 露呈しなかったが、**ユーザーが設定ファイルへ直接書いたパス**（MCP宣言の`command`、
+    // `fs.allow`等）は`C:/foo/bar`の形で来る。ここは全ACL経路が通る一点なので、
+    // 呼び出し側ごとに正規化を撒くのではなくここで吸収する（規則5: 同じ欠陥を複数箇所に
+    // 作らない）。実測: `harness mcp`の宣言に`c:/...`と書いた起動でACE付与が失敗していた。
+    let s = path.to_string_lossy().replace('/', "\\");
     if s.starts_with(r"\\?\") {
         return wide(&s);
     }
@@ -325,6 +332,42 @@ pub(crate) fn hold_mutex_for_process_lifetime(name: &str) -> windows::core::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn long_path_string(path: &str) -> String {
+        let wide = long_path_wide(std::path::Path::new(path));
+        String::from_utf16_lossy(&wide[..wide.len() - 1])
+    }
+
+    /// `\\?\`はverbatimなので区切りが`\`でなければならない。設定ファイルへ`C:/foo`と書かれた
+    /// パス（MCP宣言の`command`・`fs.allow`等）でACL付与が`ERROR_FILE_NOT_FOUND`にならないこと。
+    #[test]
+    fn forward_slashes_are_normalised_before_the_verbatim_prefix_is_added() {
+        assert_eq!(
+            long_path_string("C:/Users/me/tools/server.exe"),
+            r"\\?\C:\Users\me\tools\server.exe"
+        );
+        assert_eq!(long_path_string(r"C:\Users\me"), r"\\?\C:\Users\me");
+    }
+
+    /// 既に`\\?\`が付いているパスは二重に付けない（`std::fs::canonicalize`の戻り値が来る経路）。
+    #[test]
+    fn an_already_verbatim_path_is_left_alone() {
+        assert_eq!(long_path_string(r"\\?\C:\Users\me"), r"\\?\C:\Users\me");
+        assert_eq!(
+            long_path_string(r"\\?\C:/Users/me"),
+            r"\\?\C:\Users\me",
+            "a verbatim prefix with forward slashes is still broken; normalise it too"
+        );
+    }
+
+    /// UNCパスは`\\?\UNC\`形式へ変換する（既存挙動の固定）。
+    #[test]
+    fn unc_paths_use_the_unc_verbatim_form() {
+        assert_eq!(
+            long_path_string(r"\\server\share\dir"),
+            r"\\?\UNC\server\share\dir"
+        );
+    }
 
     /// BUG-051回帰: 妥当なUTF-8（絵文字・非BMP文字含む）はバイト単位で無変更に通ること。
     #[test]

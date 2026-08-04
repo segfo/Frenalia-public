@@ -10,6 +10,16 @@
 //! | `tier3-vm-ledger.json` | Hyper-V VM・差分VHDX・SMB共有 | `harness-sandbox` |
 //! | `workspace-grant-ledger.json` | preflightが付与したworkspaceの継承ACE（一覧表示用） | `harness-sandbox` |
 //!
+//! `Ledger<T>`はこの4台帳以外にも使われる。**性質が違うもの**が2つある。
+//!
+//! | 台帳 | 記録する内容 | 消えたときに起きること |
+//! |---|---|---|
+//! | `appcontainer-session-ledger.json` | セッション/MCPサーバのプロファイルとACE付与先（D-37/D-38） | 接頭辞によるGC経路へ縮退（`session_profile`のdoc参照） |
+//! | `mcp-approval-ledger.json` | **ユーザーがどのMCPサーバ宣言を起動してよいと決めたか**（D-39） | 全サーバが未承認扱いになり再承認が要るだけ（fail-closed） |
+//!
+//! 後者は「実マシンへ加えた変更」ではなく**判断の記録**なので、消えても孤立した穴は残らない。
+//! だからクリーンアップ禁止ファイル（下記）には含めない。
+//!
 //! **`harness-change-ledger`とは別物**である。あちらは1セッション内のCoW変更（どのファイルを
 //! 書き換えたか）を記録する揮発的なもので、こちらは**実マシンへ加えた永続的な変更**を記録する。
 //! こちらの3ファイル（`fs-passthrough`・`traverse-grant`・`tier3-vm`）は、消えると

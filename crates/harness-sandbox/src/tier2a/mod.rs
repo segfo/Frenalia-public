@@ -15,6 +15,7 @@
 //! | `wfp` | Windows Filtering Platformの薄いラッパ。`netfilterd`（昇格側）からのみ使う |
 //! | `loopback_exemption` | AppContainer loopback exemption（マシン全体で1本）のプロセス跨ぎ所有権管理（D-36） |
 //! | [`session_profile`] | セッション単位のAppContainerプロファイル名・生存マーカー・台帳・孤児回収（D-37） |
+//! | [`mcp_profile`] | MCPサーバごとのAppContainerプロファイル名と、信頼境界での名前検証（D-38） |
 //!
 //! 設計正本は`plans/DESIGN-SANDBOX-APPPOLICY.md`、CoWモード（D-30）は
 //! `plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`。
@@ -22,6 +23,10 @@
 /// セッション単位のAppContainerプロファイル管理（D-37）。**windows専用ではない**
 /// （純粋な名前生成・回収判定は他プラットフォームでもコンパイル・テストできる）。
 pub mod session_profile;
+
+/// MCPサーバごとのAppContainerプロファイル名（D-38）。`session_profile`と同じ理由で
+/// windows専用にしない（名前生成と検証は純粋関数）。
+pub mod mcp_profile;
 
 /// 付与したtraverse ACEの記録。**windows専用ではない**（`harness fs list`のような表示系
 /// コマンドが非Windowsでも空台帳を表示できるよう、全プラットフォームでコンパイルする）。

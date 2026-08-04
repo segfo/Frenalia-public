@@ -246,15 +246,19 @@ fn ensure_profile_locked(name: &str) -> Result<OwnedContainerSid, AppContainerEr
 // 公開項目はここでglob再エクスポートする。
 
 mod acl_grant;
+mod mcp_preflight;
 mod preflight;
 mod revoke;
 mod spawn;
+mod spawn_session;
 mod traverse;
 
 pub use acl_grant::*;
+pub use mcp_preflight::*;
 pub use preflight::*;
 pub use revoke::*;
 pub use spawn::*;
+pub use spawn_session::*;
 pub use traverse::*;
 
 // --- テスト群（実Win32・実AppContainerを使う重い回帰テストのため別ファイル） ---
@@ -271,3 +275,7 @@ mod force_grant_gate_tests;
 
 #[cfg(all(windows, test))]
 mod cow_containment_tests;
+
+/// MCPサーバ隔離（D-38）の実機E2E。`docs/STATUS.md`「MCPクライアント機構」残課題#3/#4。
+#[cfg(all(windows, test))]
+mod mcp_e2e_tests;

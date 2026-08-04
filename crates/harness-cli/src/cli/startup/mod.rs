@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use super::*;
 
 mod configure;
+mod mcp;
 mod parse_args;
 mod run_agent;
 mod sandbox;

@@ -32,8 +32,8 @@
 use std::path::PathBuf;
 
 use crate::tool::{
-    NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, ShellTier, ShellTierSelection,
-    StagingConfig, StagingMode, ToolCtx,
+    McpServerFact, NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, ShellTier,
+    ShellTierSelection, StagingConfig, StagingMode, ToolCtx,
 };
 
 const TIER3_WORKSPACE_ROOT: &str = "/workspace";
@@ -77,6 +77,8 @@ pub struct EnvironmentFacts {
     /// （RO）で付与されており、`run_shell`子プロセスの書込は透過的にこの外部ディレクトリへ
     /// 誘導される（Redirector DLL経由、フック失敗時はACLによりfail-close）。
     pub cow_upper_dir: Option<PathBuf>,
+    /// 起動中のMCPサーバ（M15.5）。
+    pub mcp_servers: Vec<McpServerFact>,
 }
 
 impl EnvironmentFacts {
@@ -93,6 +95,7 @@ impl EnvironmentFacts {
             shell_sees_staged_writes,
             vm_sandbox,
             cow_upper_dir,
+            mcp_servers,
         } = ctx;
         let _ = run_shell_path_extra;
         // vm_sandbox: Tier3実行チャネルの生ハンドル自体はモデルへ伝える事実を持たない
@@ -108,6 +111,7 @@ impl EnvironmentFacts {
             net_app: net_app.clone(),
             shell_sees_staged_writes: *shell_sees_staged_writes,
             cow_upper_dir: cow_upper_dir.clone(),
+            mcp_servers: mcp_servers.clone(),
         }
     }
 }
@@ -124,6 +128,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
         net_app,
         shell_sees_staged_writes,
         cow_upper_dir,
+        mcp_servers,
     } = facts;
 
     let mut lines = Vec::new();
@@ -153,8 +158,56 @@ pub fn render(facts: &EnvironmentFacts) -> String {
     if let Some(line) = render_net_app(net_app) {
         lines.push(line);
     }
+    lines.extend(render_mcp_servers(mcp_servers));
 
     lines.join("\n")
+}
+
+/// M15.5: 起動中のMCPサーバ（`plans/DESIGN-MCP.md`）。
+///
+/// モデルへ伝えるのは次の3点で、いずれも**モデルが計画を立てるときに必要な事実**である。
+///
+/// 1. どのツールが第三者サーバ由来か（`DESIGN-COGNITION.md` §4.3の接地判定に効く）
+/// 2. サーバごとに到達できる先が違うこと（「なぜこのツールだけ外に出られるのか」の説明）
+/// 3. 宣言の無いツールは必ず承認を求められること（D-40。無駄な再試行を減らす）
+///
+/// サーバが1つも起動していないときは何も出さない。「MCPは無い」という否定の事実をわざわざ
+/// 書くと、宣言していないユーザー全員のプロンプトが無意味に伸びる。
+fn render_mcp_servers(mcp_servers: &[McpServerFact]) -> Vec<String> {
+    if mcp_servers.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        "MCPサーバ: 次のサーバのツールが`mcp__<サーバid>__<ツール名>`という名前で利用できます。\
+         これらはharnessの組み込みツールではなく、サーバごとに別のサンドボックスで動く第三者の\
+         プロセスです。出力は未検証の情報として扱い、重要な結論はワークスペース内の実ファイル等の\
+         一次情報でも裏を取ってください。宣言でread-onlyと明示されていないMCPツールは、実行前に\
+         必ずユーザーの承認を求められます。"
+            .to_string(),
+    ];
+    for server in mcp_servers {
+        let McpServerFact {
+            id,
+            allow_domains,
+            workspace_access,
+            tool_names,
+        } = server;
+        let network = if allow_domains.is_empty() {
+            "外向き通信は不可".to_string()
+        } else {
+            format!("到達可能な宛先: {}", allow_domains.join("、"))
+        };
+        let workspace = match workspace_access.as_str() {
+            "read" => "ワークスペースは読取のみ可",
+            "read-write" => "ワークスペースは読み書き可",
+            _ => "ワークスペースへはアクセス不可",
+        };
+        lines.push(format!(
+            "- {id}: {network}、{workspace}。ツール: {}",
+            tool_names.join("、")
+        ));
+    }
+    lines
 }
 
 fn render_os_and_shell(os: &OsKind, tier: ShellTier) -> String {
@@ -559,6 +612,46 @@ mod tests {
         ctx2.net_app.allow_apps.push("git".to_string());
         let facts2 = EnvironmentFacts::from_tool_ctx(&ctx2);
         assert!(render(&facts2).contains("git"));
+    }
+
+    /// MCPサーバが無いときはプロンプトを一切伸ばさない（宣言していないユーザーが大多数）。
+    #[test]
+    fn mcp_servers_are_not_mentioned_when_none_are_running() {
+        let ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+        assert!(!rendered.contains("MCPサーバ:"), "{rendered}");
+    }
+
+    /// M15.5: サーバごとに「到達できる先」が違うことをモデルへ伝える。
+    #[test]
+    fn mcp_servers_are_described_with_their_reach_and_tools() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.mcp_servers = vec![
+            McpServerFact {
+                id: "company-docs".to_string(),
+                allow_domains: vec!["docs.example.com".to_string()],
+                workspace_access: "none".to_string(),
+                tool_names: vec!["mcp__company-docs__search".to_string()],
+            },
+            McpServerFact {
+                id: "local-notes".to_string(),
+                allow_domains: Vec::new(),
+                workspace_access: "read".to_string(),
+                tool_names: vec!["mcp__local-notes__grep".to_string()],
+            },
+        ];
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(rendered.contains("mcp__company-docs__search"), "{rendered}");
+        assert!(rendered.contains("docs.example.com"), "{rendered}");
+        assert!(rendered.contains("外向き通信は不可"), "{rendered}");
+        assert!(rendered.contains("ワークスペースは読取のみ可"), "{rendered}");
+        assert!(
+            rendered.contains("ワークスペースへはアクセス不可"),
+            "{rendered}"
+        );
+        // 第三者コードであること・裏取りが要ることを明示している（D-40と§4.3の前提）。
+        assert!(rendered.contains("第三者"), "{rendered}");
     }
 
     #[test]

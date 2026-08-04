@@ -280,6 +280,7 @@ mod tests {
             run_shell_path_extra: Vec::new(),
             vm_sandbox: None,
             cow_upper_dir: None,
+            mcp_servers: Vec::new(),
         };
         let mut state = ConversationState::new(harness_engine::system_blocks_for(&stale_ctx));
 

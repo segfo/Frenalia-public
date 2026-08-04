@@ -108,6 +108,10 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
         run_shell_path_extra,
         vm_sandbox: None,
         cow_upper_dir: None,
+        // `harness prompt`はMCPサーバを起動しない（診断用の読み取り専用コマンドであり、
+        // 第三者プロセスを起こす副作用を持たせない）。実行時に何が載るかは`harness mcp list`
+        // で確認する。
+        mcp_servers: Vec::new(),
     };
     for block in harness_engine::system_blocks_for(&ctx) {
         println!("{}", block.text);
@@ -197,6 +201,9 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         }
         Commands::Net { .. } => {
             unreachable!("Commands::Net is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Mcp { .. } => {
+            unreachable!("Commands::Mcp is dispatched before run_sandbox_subcommand")
         }
         Commands::Prompt => {
             unreachable!("Commands::Prompt is dispatched before run_sandbox_subcommand")
@@ -422,6 +429,9 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         }
         Commands::Net { .. } => {
             unreachable!("Commands::Net is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Mcp { .. } => {
+            unreachable!("Commands::Mcp is dispatched before run_sandbox_subcommand")
         }
         Commands::Prompt => {
             unreachable!("Commands::Prompt is dispatched before run_sandbox_subcommand")

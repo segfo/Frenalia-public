@@ -13,6 +13,7 @@ members = [
     "crates/harness-privhelper",
     "crates/harness-netfilterd",
     "crates/harness-vmsandboxd",
+    "crates/harness-mcp",
     "crates/harness-engine",
     "crates/harness-cognition",
     "crates/harness-tui",

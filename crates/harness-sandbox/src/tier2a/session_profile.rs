@@ -94,6 +94,24 @@ pub struct SessionEntry {
     #[serde(default)]
     pub granted_paths: Vec<String>,
     pub created_at_unix_secs: u64,
+    /// このセッションが起動したMCPサーバのプロファイル（D-38、`plans/DESIGN-MCP.md` §3.1）。
+    ///
+    /// **既存の台帳ファイルとの後方互換のため`#[serde(default)]`で後付けする**（実マシンに
+    /// 既に存在する`appcontainer-session-ledger.json`は上の3フィールドしか持たない）。
+    /// MCPプロファイルはセッションと同じ寿命なので、独立した台帳ではなくここへぶら下げる
+    /// ——セッションが死ねば`plan_reclaim`が同じ判定で一緒に回収する。
+    #[serde(default)]
+    pub mcp: Vec<McpProfileEntry>,
+}
+
+/// セッション配下のMCPサーバプロファイル1件。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpProfileEntry {
+    pub profile_name: String,
+    /// このMCPサーバのSID宛にACEを付けたパス（実行ファイル・依存ディレクトリ・
+    /// 宣言が明示要求したworkspaceパス）。**workspaceは既定で含まれない**（§3.2）。
+    #[serde(default)]
+    pub granted_paths: Vec<String>,
 }
 
 fn ledger() -> Ledger<SessionLedger> {
@@ -109,9 +127,27 @@ pub struct ReclaimTarget {
     pub granted_paths: Vec<String>,
 }
 
-/// 台帳と「実在するセッションプロファイル名の一覧」から、回収すべきものを決める。
+/// harness由来のプロファイル名からセッショントークンを取り出す。
+///
+/// `run_shell`用は`harness.shell.sandbox.<token>`、MCPサーバ用は
+/// `harness.mcp.<token>.<server-id>`。**どちらもトークンで生存判定する**ので、GCは種別を
+/// 意識せずに回収できる（MCPプロファイルはセッションと同じ寿命、`mcp_profile`のdoc参照）。
+pub fn token_of_profile(name: &str) -> Option<&str> {
+    if let Some(token) = name.strip_prefix(&format!("{PROFILE_PREFIX}.")) {
+        return (!token.is_empty()).then_some(token);
+    }
+    let suffix = name.strip_prefix(&format!(
+        "{}.",
+        crate::tier2a::mcp_profile::MCP_PROFILE_PREFIX
+    ))?;
+    let (token, server_id) = suffix.rsplit_once('.')?;
+    (!token.is_empty() && !server_id.is_empty()).then_some(token)
+}
+
+/// 台帳と「実在するharnessプロファイル名の一覧」から、回収すべきものを決める。
 ///
 /// - 台帳にあり、生存マーカーが無い → そのパスのACEを剥がしてプロファイルを消す
+///   （`run_shell`用プロファイルと、そのセッションが起動したMCPサーバのプロファイルの両方）
 /// - 台帳に無いが接頭辞付きプロファイルが実在し、生存マーカーも無い → プロファイルだけ消す
 ///   （台帳が失われた場合の回収経路。モジュールdoc参照）
 /// - 生存マーカーがある → 触らない（実行中の他セッション）
@@ -122,25 +158,35 @@ pub fn plan_reclaim(
 ) -> Vec<ReclaimTarget> {
     let mut targets = Vec::new();
     for entry in &ledger.sessions {
-        if !is_live(&entry.token) {
+        if is_live(&entry.token) {
+            continue;
+        }
+        targets.push(ReclaimTarget {
+            profile_name: entry.profile_name.clone(),
+            granted_paths: entry.granted_paths.clone(),
+        });
+        for mcp in &entry.mcp {
             targets.push(ReclaimTarget {
-                profile_name: entry.profile_name.clone(),
-                granted_paths: entry.granted_paths.clone(),
+                profile_name: mcp.profile_name.clone(),
+                granted_paths: mcp.granted_paths.clone(),
             });
         }
     }
     let known: std::collections::HashSet<&str> = ledger
         .sessions
         .iter()
-        .map(|e| e.profile_name.as_str())
+        .flat_map(|e| {
+            std::iter::once(e.profile_name.as_str())
+                .chain(e.mcp.iter().map(|m| m.profile_name.as_str()))
+        })
         .collect();
     for name in existing_profiles {
-        if known.contains(name.as_str()) || !is_session_profile_name(name) {
+        if known.contains(name.as_str()) {
             continue;
         }
-        let token = name
-            .strip_prefix(&format!("{PROFILE_PREFIX}."))
-            .unwrap_or_default();
+        let Some(token) = token_of_profile(name) else {
+            continue;
+        };
         if !is_live(token) {
             targets.push(ReclaimTarget {
                 profile_name: name.clone(),
@@ -169,6 +215,7 @@ mod win {
     }
 
     /// `%LOCALAPPDATA%\Packages`から接頭辞付きプロファイル名を列挙する（台帳非依存の回収経路）。
+    /// `run_shell`用（D-37）とMCPサーバ用（D-38）の両方を拾う。
     pub(super) fn existing_profiles() -> Vec<String> {
         let Some(local) = std::env::var_os("LOCALAPPDATA") else {
             return Vec::new();
@@ -184,7 +231,7 @@ mod win {
             // 名前部分だけを取り出す。
             .filter_map(|name| {
                 let base = name.split('_').next().unwrap_or(&name).to_string();
-                is_session_profile_name(&base).then_some(base)
+                crate::tier2a::mcp_profile::is_harness_profile_name(&base).then_some(base)
             })
             .collect()
     }
@@ -228,6 +275,7 @@ pub fn begin_session() -> Result<String, String> {
                 profile_name: entry_name,
                 granted_paths: Vec::new(),
                 created_at_unix_secs: now_unix_secs(),
+                mcp: Vec::new(),
             });
         }
     });
@@ -243,6 +291,50 @@ pub fn record_granted_path(path: &Path) {
             if !entry.granted_paths.contains(&path_str) {
                 entry.granted_paths.push(path_str);
             }
+        }
+    });
+}
+
+/// このセッションが起動するMCPサーバのプロファイルを台帳へ登録し、その名前を返す（D-38）。
+/// 冪等——同じ`server_id`で2回呼んでもエントリは増えない。
+///
+/// **プロファイルの実作成（`ensure_profile`）より先に呼ぶこと。** 逆順だと、作成直後に落ちた
+/// 場合に「実在するが台帳に無いプロファイル」が残る——接頭辞による回収経路があるので致命では
+/// ないが、ACEを剥がす対象が分からなくなる。
+pub fn record_mcp_profile(server_id: &str) -> String {
+    let token = session_token();
+    let name = crate::tier2a::mcp_profile::current_mcp_profile_name(server_id);
+    let entry_name = name.clone();
+    ledger().update(|l| {
+        if let Some(entry) = l.sessions.iter_mut().find(|e| e.token == token) {
+            if !entry.mcp.iter().any(|m| m.profile_name == entry_name) {
+                entry.mcp.push(McpProfileEntry {
+                    profile_name: entry_name,
+                    granted_paths: Vec::new(),
+                });
+            }
+        }
+    });
+    name
+}
+
+/// MCPサーバのSID宛にACEを付けたパスを台帳へ記録する（撤収時に剥がす対象）。
+pub fn record_mcp_granted_path(profile_name: &str, path: &Path) {
+    let token = session_token();
+    let path_str = path.to_string_lossy().into_owned();
+    ledger().update(|l| {
+        let Some(entry) = l.sessions.iter_mut().find(|e| e.token == token) else {
+            return;
+        };
+        let Some(mcp) = entry
+            .mcp
+            .iter_mut()
+            .find(|m| m.profile_name == profile_name)
+        else {
+            return;
+        };
+        if !mcp.granted_paths.contains(&path_str) {
+            mcp.granted_paths.push(path_str);
         }
     });
 }
@@ -279,23 +371,32 @@ pub const LEGACY_SHARED_PROFILE: &str = PROFILE_PREFIX;
 /// 「実行中の他セッションから権限を奪う」誤りになる。
 pub fn revocable_profile_names() -> Vec<String> {
     let mut names = vec![LEGACY_SHARED_PROFILE.to_string()];
-    let ledger_names: Vec<(String, String)> = ledger()
+    let ledger_names: Vec<(String, Vec<String>)> = ledger()
         .load()
         .sessions
         .into_iter()
-        .map(|e| (e.token, e.profile_name))
+        .map(|e| {
+            let profiles = std::iter::once(e.profile_name)
+                .chain(e.mcp.into_iter().map(|m| m.profile_name))
+                .collect();
+            (e.token, profiles)
+        })
         .collect();
-    for (token, profile) in ledger_names {
-        if !win::is_live(&token) && !names.contains(&profile) {
-            names.push(profile);
+    for (token, profiles) in ledger_names {
+        if win::is_live(&token) {
+            continue;
+        }
+        for profile in profiles {
+            if !names.contains(&profile) {
+                names.push(profile);
+            }
         }
     }
     for profile in win::existing_profiles() {
-        let token = profile
-            .strip_prefix(&format!("{PROFILE_PREFIX}."))
-            .unwrap_or_default()
-            .to_string();
-        if !token.is_empty() && !win::is_live(&token) && !names.contains(&profile) {
+        let Some(token) = token_of_profile(&profile) else {
+            continue;
+        };
+        if !win::is_live(token) && !names.contains(&profile) {
             names.push(profile);
         }
     }
@@ -321,13 +422,16 @@ pub fn end_session(revoke: &dyn Fn(&Path, &str)) {
     else {
         return;
     };
-    reclaim_targets(
-        &[ReclaimTarget {
-            profile_name: entry.profile_name,
-            granted_paths: entry.granted_paths,
-        }],
-        revoke,
-    );
+    // MCPサーバのプロファイルも同じ経路で撤収する（このセッションと同じ寿命、D-38）。
+    let mut targets = vec![ReclaimTarget {
+        profile_name: entry.profile_name,
+        granted_paths: entry.granted_paths,
+    }];
+    targets.extend(entry.mcp.into_iter().map(|m| ReclaimTarget {
+        profile_name: m.profile_name,
+        granted_paths: m.granted_paths,
+    }));
+    reclaim_targets(&targets, revoke);
 }
 
 #[cfg(test)]
@@ -341,7 +445,20 @@ mod tests {
             profile_name: profile_name_for(token),
             granted_paths: paths.iter().map(|p| p.to_string()).collect(),
             created_at_unix_secs: 0,
+            mcp: Vec::new(),
         }
+    }
+
+    fn entry_with_mcp(token: &str, servers: &[(&str, &[&str])]) -> SessionEntry {
+        let mut e = entry(token, &[]);
+        e.mcp = servers
+            .iter()
+            .map(|(id, paths)| McpProfileEntry {
+                profile_name: crate::tier2a::mcp_profile::mcp_profile_name_for(token, id),
+                granted_paths: paths.iter().map(|p| p.to_string()).collect(),
+            })
+            .collect();
+        e
     }
 
     fn liveness(live: &HashSet<String>) -> impl Fn(&str) -> bool + '_ {
@@ -440,6 +557,96 @@ mod tests {
                 format!("revoke:C:\\b:{}", profile_name_for("t")),
             ]
         );
+    }
+
+    /// D-38: MCPサーバのプロファイルはセッションと同じ寿命で、セッションが死ねば
+    /// `run_shell`用プロファイルと一緒に回収される。
+    #[test]
+    fn mcp_profiles_are_reclaimed_together_with_their_session() {
+        let ledger = SessionLedger {
+            sessions: vec![entry_with_mcp(
+                "dead",
+                &[("docs", &["C:\\mcp\\docs"]), ("jira", &[])],
+            )],
+        };
+        let targets = plan_reclaim(&ledger, &[], &liveness(&HashSet::new()));
+
+        let names: Vec<&str> = targets.iter().map(|t| t.profile_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                profile_name_for("dead").as_str(),
+                "harness.mcp.dead.docs",
+                "harness.mcp.dead.jira",
+            ]
+        );
+        assert_eq!(targets[1].granted_paths, vec!["C:\\mcp\\docs".to_string()]);
+    }
+
+    /// 実行中のセッションのMCPプロファイルは触らない（BUG-053と同じ「実行中の他セッションから
+    /// 権限を奪う」誤りを、MCP側で再生産しない）。
+    #[test]
+    fn mcp_profiles_of_a_live_session_are_never_reclaimed() {
+        let ledger = SessionLedger {
+            sessions: vec![entry_with_mcp("alive", &[("docs", &["C:\\mcp\\docs"])])],
+        };
+        let mut live = HashSet::new();
+        live.insert("alive".to_string());
+        assert!(plan_reclaim(&ledger, &[], &liveness(&live)).is_empty());
+    }
+
+    /// 台帳が消えても、MCPプロファイルも接頭辞の実在から回収できる（`run_shell`側と同じ経路）。
+    #[test]
+    fn orphan_mcp_profiles_are_reclaimed_by_prefix_alone() {
+        let existing = vec![
+            "harness.mcp.orphan.docs".to_string(),
+            "harness.mcp.running.docs".to_string(),
+            "some.other.appcontainer".to_string(),
+        ];
+        let mut live = HashSet::new();
+        live.insert("running".to_string());
+
+        let targets = plan_reclaim(&SessionLedger::default(), &existing, &liveness(&live));
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].profile_name, "harness.mcp.orphan.docs");
+    }
+
+    /// 台帳にあるMCPプロファイルを、実在プロファイル側で二重に数えない。
+    #[test]
+    fn a_dead_mcp_profile_is_reclaimed_once_even_if_both_sources_see_it() {
+        let ledger = SessionLedger {
+            sessions: vec![entry_with_mcp("dead", &[("docs", &["C:\\mcp"])])],
+        };
+        let existing = vec![
+            profile_name_for("dead"),
+            "harness.mcp.dead.docs".to_string(),
+        ];
+        let targets = plan_reclaim(&ledger, &existing, &liveness(&HashSet::new()));
+        assert_eq!(targets.len(), 2, "{targets:?}");
+    }
+
+    #[test]
+    fn tokens_are_extracted_from_both_profile_families() {
+        assert_eq!(
+            token_of_profile("harness.shell.sandbox.1234-5678"),
+            Some("1234-5678")
+        );
+        assert_eq!(
+            token_of_profile("harness.mcp.1234-5678.docs"),
+            Some("1234-5678")
+        );
+        assert_eq!(token_of_profile("harness.mcp.1234-5678"), None);
+        assert_eq!(token_of_profile("microsoft.windowsterminal"), None);
+    }
+
+    /// 既存の台帳ファイル（`mcp`フィールドが無い）をそのまま読めること。実マシンには
+    /// この形のJSONが既に存在するので、後方互換が崩れると起動時のGCが台帳を失う。
+    #[test]
+    fn a_pre_mcp_ledger_file_still_deserializes() {
+        let legacy = r#"{"sessions":[{"token":"t","profile_name":"harness.shell.sandbox.t","granted_paths":["C:\\ws"],"created_at_unix_secs":1}]}"#;
+        let ledger: SessionLedger = serde_json::from_str(legacy).unwrap();
+        assert_eq!(ledger.sessions[0].granted_paths, vec!["C:\\ws".to_string()]);
+        assert!(ledger.sessions[0].mcp.is_empty());
     }
 
     #[test]

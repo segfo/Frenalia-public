@@ -73,7 +73,7 @@ pub struct NetfilterPolicy {
     /// D-37: WFPフィルタを条件付けるAppContainerのセッションプロファイル名。
     ///
     /// **SIDではなく名前を運ぶ**（privhelperと同じ方針）。昇格側は
-    /// `session_profile::is_session_profile_name`で形を検証してから`ensure_profile`で
+    /// `mcp_profile::is_harness_profile_name`で形を検証してから`ensure_profile`で
     /// 導出するので、任意のAppContainerへフィルタを張らせることはできない。
     #[serde(default)]
     pub session_profile: String,
@@ -83,6 +83,29 @@ pub struct NetfilterPolicy {
     pub allow_loopback_udp_ports: Vec<u16>,
     #[serde(default)]
     pub audit_log_path: Option<PathBuf>,
+    /// D-38（M15.5）: MCPサーバごとの出口ポリシー。**追加は必ず末尾へ**——このJSONは
+    /// 別プロセス（`harness-netfilterd.exe`）が読むワイヤ形式で、
+    /// `apply_rules_request_json_wire_format_is_stable`が表現を固定している。
+    ///
+    /// サーバごとに別のpackage SIDを持つので（`plans/DESIGN-MCP.md` §3.1）、
+    /// **サーバ別の宛先allowlistがWFP＋専用プロキシの組で自然に書ける**（§3.2）。
+    /// 各エントリはそのサーバ専用プロキシのloopbackポートだけを許可する。
+    #[serde(default)]
+    pub mcp_profiles: Vec<McpNetfilterPolicy>,
+}
+
+/// 1つのMCPサーバに対する出口ポリシー（D-38）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpNetfilterPolicy {
+    /// `harness.mcp.<session-token>.<server-id>`。昇格側が形を検証してからSIDを導出する。
+    #[serde(default)]
+    pub profile: String,
+    /// このサーバが到達してよいloopbackのTCPポート（＝このサーバ専用プロキシの待受ポート）。
+    /// **空なら外向き通信は一切できない**（capability自体も付かないので二重にdenyされる）。
+    #[serde(default)]
+    pub allow_loopback_tcp_ports: Vec<u16>,
+    #[serde(default)]
+    pub allow_loopback_udp_ports: Vec<u16>,
 }
 
 /// 親→daemonへ送るメッセージ。1セッションで`ApplyRules`→`Teardown`の順に2回送る。
@@ -448,6 +471,61 @@ pub fn serve(pipe_name: &str) -> Result<(), NetfilterError> {
     result
 }
 
+/// 1つのpackage SIDへ張る出口ポリシー（IPCワイヤ形式から昇格側の作業単位へ均した形）。
+///
+/// `run_shell`セッション（D-37）とMCPサーバ（D-38）は、**WFPから見れば同じ形**——
+/// 「あるpackage SIDに対しdefault-deny、指定のloopbackポートだけallow」——なので、
+/// ここで1つの型へ均してから適用ループを1本にする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicyTarget {
+    profile: String,
+    tcp_ports: Vec<u16>,
+    udp_ports: Vec<u16>,
+}
+
+/// ポリシーを適用単位の一覧へ均す（純粋関数。Win32もWFPも触らないので単体テストできる）。
+fn policy_targets(policy: &NetfilterPolicy) -> Vec<PolicyTarget> {
+    let mut targets = vec![PolicyTarget {
+        profile: policy.session_profile.clone(),
+        tcp_ports: policy.allow_loopback_tcp_ports.clone(),
+        udp_ports: policy.allow_loopback_udp_ports.clone(),
+    }];
+    for mcp in &policy.mcp_profiles {
+        targets.push(PolicyTarget {
+            profile: mcp.profile.clone(),
+            tcp_ports: mcp.allow_loopback_tcp_ports.clone(),
+            udp_ports: mcp.allow_loopback_udp_ports.clone(),
+        });
+    }
+    targets
+}
+
+/// 1つのプロファイルに対してWFPフィルタを張る（**名前検証はここが唯一の関門**）。
+fn apply_one(
+    target: &PolicyTarget,
+    audit_log_path: Option<PathBuf>,
+) -> Result<WfpSession, NetfilterError> {
+    if !crate::tier2a::mcp_profile::is_harness_profile_name(&target.profile) {
+        return Err(NetfilterError::Ipc(format!(
+            "rejected malformed appcontainer profile name: {:?}",
+            target.profile
+        )));
+    }
+    let sid = win_appcontainer::ensure_profile(&target.profile)
+        .map_err(|e| NetfilterError::Ipc(format!("failed to resolve sandbox SID: {e}")))?;
+
+    // `NetfilterPolicy`はIPCワイヤ形式、`WfpOptions`はWFPエンジンへ渡す層のオプションで、
+    // フィールドは同形だが所有するレイヤーが違う。型は分けたまま、ここで明示的に写す。
+    let opts = WfpOptions {
+        session_profile: target.profile.clone(),
+        allow_loopback_tcp_ports: target.tcp_ports.clone(),
+        allow_loopback_udp_ports: target.udp_ports.clone(),
+        audit_log_path,
+    };
+    WfpSession::apply(sid.as_psid(), &opts)
+        .map_err(|e| NetfilterError::Ipc(format!("WFP rule application failed: {e}")))
+}
+
 fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
     // 1回目: ApplyRules を待つ。
     let request_bytes = read_framed_timeout(pipe, APPLY_RESPONSE_TIMEOUT)?;
@@ -467,43 +545,25 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
         }
     };
 
-    // D-37: フィルタの条件になるpackage SIDは、要求で受け取ったセッションプロファイル名から
-    // 導出する。名前の形を先に検証し、harnessのセッションプロファイル以外は拒否する。
-    if !crate::tier2a::session_profile::is_session_profile_name(&policy.session_profile) {
-        let resp = NetfilterResponse::Err(format!(
-            "rejected malformed session profile name: {:?}",
-            policy.session_profile
-        ));
-        send_response(pipe, &resp)?;
-        return Err(NetfilterError::Ipc(
-            "malformed session profile name".to_string(),
-        ));
+    // D-37/D-38: フィルタの条件になるpackage SIDは、要求で受け取ったプロファイル名から導出する。
+    // 名前の形を先に検証し、harness由来のプロファイル（`run_shell`セッション用またはMCPサーバ用）
+    // 以外は拒否する。ここが緩むと、非特権側が任意のAppContainerへWFPフィルタを張らせられる。
+    let mut sessions: Vec<WfpSession> = Vec::new();
+    for target in policy_targets(&policy) {
+        match apply_one(&target, policy.audit_log_path.clone()) {
+            Ok(session) => sessions.push(session),
+            Err(e) => {
+                // 1つでも張れなければ全体を失敗させる（fail-closed）。既に張った分は
+                // ここで畳んでから返す——中途半端に一部だけ強制された状態を残さない。
+                for session in sessions {
+                    let _ = session.teardown();
+                }
+                let resp = NetfilterResponse::Err(e.to_string());
+                send_response(pipe, &resp)?;
+                return Err(NetfilterError::Ipc(e.to_string()));
+            }
+        }
     }
-    let sid = match win_appcontainer::ensure_profile(&policy.session_profile) {
-        Ok(sid) => sid,
-        Err(e) => {
-            let resp = NetfilterResponse::Err(format!("failed to resolve sandbox SID: {e}"));
-            send_response(pipe, &resp)?;
-            return Err(NetfilterError::Ipc(e.to_string()));
-        }
-    };
-
-    // `NetfilterPolicy`はIPCワイヤ形式、`WfpOptions`はWFPエンジンへ渡す層のオプションで、
-    // 現状フィールドは同形だが所有するレイヤーが違う。型は分けたまま、ここで明示的に写す。
-    let opts = WfpOptions {
-        session_profile: policy.session_profile.clone(),
-        allow_loopback_tcp_ports: policy.allow_loopback_tcp_ports,
-        allow_loopback_udp_ports: policy.allow_loopback_udp_ports,
-        audit_log_path: policy.audit_log_path,
-    };
-    let session = match WfpSession::apply(sid.as_psid(), &opts) {
-        Ok(s) => s,
-        Err(e) => {
-            let resp = NetfilterResponse::Err(format!("WFP rule application failed: {e}"));
-            send_response(pipe, &resp)?;
-            return Err(NetfilterError::Ipc(e.to_string()));
-        }
-    };
     send_response(pipe, &NetfilterResponse::Applied)?;
 
     // 2回目: Teardown、または親のクラッシュによるパイプ切断を待つ。
@@ -516,7 +576,17 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
         )
     );
 
-    let session_teardown = session.teardown();
+    // 全プロファイル分を畳む。1つの失敗が他の撤収を止めないよう、最初のエラーだけを覚えて
+    // 最後まで回す（残したフィルタはDYNAMICセッションなのでプロセス終了時にBFEが消すが、
+    // 「片付け損ねた」ことを応答から隠さない）。
+    let mut session_teardown: Result<(), crate::tier2a::wfp::WfpError> = Ok(());
+    for session in sessions {
+        if let Err(e) = session.teardown() {
+            if session_teardown.is_ok() {
+                session_teardown = Err(e);
+            }
+        }
+    }
 
     if is_explicit_teardown {
         let resp = match &session_teardown {
@@ -550,6 +620,7 @@ mod tests {
             allow_loopback_tcp_ports: vec![18080, 18053],
             allow_loopback_udp_ports: vec![18053],
             audit_log_path: Some(PathBuf::from(".harness/sandbox/session-x/net-audit.jsonl")),
+            mcp_profiles: Vec::new(),
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: NetfilterRequest = serde_json::from_slice(&bytes).unwrap();
@@ -559,6 +630,7 @@ mod tests {
                 allow_loopback_tcp_ports,
                 allow_loopback_udp_ports,
                 audit_log_path,
+                mcp_profiles: _,
             }) => {
                 assert_eq!(session_profile, "harness.shell.sandbox.1234-5678");
                 assert_eq!(allow_loopback_tcp_ports, vec![18080, 18053]);
@@ -583,16 +655,102 @@ mod tests {
             allow_loopback_tcp_ports: vec![18080],
             allow_loopback_udp_ports: vec![18053],
             audit_log_path: Some(PathBuf::from("net-audit.jsonl")),
+            mcp_profiles: vec![McpNetfilterPolicy {
+                profile: "harness.mcp.1-2.docs".to_string(),
+                allow_loopback_tcp_ports: vec![19090],
+                allow_loopback_udp_ports: vec![],
+            }],
         });
         // D-37で`session_profile`を先頭へ追加した（昇格側はこの名前を検証してからSIDを導出する）。
+        // D-38（M15.5）で`mcp_profiles`を**末尾へ**追加した——既存フィールドの位置を動かすと、
+        // 旧`harness-netfilterd.exe`との組み合わせで静かに壊れる。
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
-            r#"{"ApplyRules":{"session_profile":"harness.shell.sandbox.1-2","allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"audit_log_path":"net-audit.jsonl"}}"#
+            r#"{"ApplyRules":{"session_profile":"harness.shell.sandbox.1-2","allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"audit_log_path":"net-audit.jsonl","mcp_profiles":[{"profile":"harness.mcp.1-2.docs","allow_loopback_tcp_ports":[19090],"allow_loopback_udp_ports":[]}]}}"#
         );
         assert_eq!(
             serde_json::to_string(&NetfilterRequest::Teardown).unwrap(),
             r#""Teardown""#
         );
+    }
+
+    /// MCPサーバを1つも使わない（＝これまでどおりの）起動では、`mcp_profiles`が空配列として
+    /// 載るだけで他は一切変わらない。
+    #[test]
+    fn a_policy_without_mcp_servers_keeps_the_previous_shape_plus_an_empty_list() {
+        let req = NetfilterRequest::ApplyRules(NetfilterPolicy {
+            session_profile: "harness.shell.sandbox.1-2".to_string(),
+            allow_loopback_tcp_ports: vec![18080],
+            allow_loopback_udp_ports: vec![18053],
+            audit_log_path: None,
+            mcp_profiles: Vec::new(),
+        });
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"ApplyRules":{"session_profile":"harness.shell.sandbox.1-2","allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"audit_log_path":null,"mcp_profiles":[]}}"#
+        );
+    }
+
+    /// `mcp_profiles`を知らない旧クライアントのJSONも読める（`#[serde(default)]`）。
+    #[test]
+    fn a_request_without_mcp_profiles_still_deserializes() {
+        let legacy = r#"{"ApplyRules":{"session_profile":"harness.shell.sandbox.1-2","allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[],"audit_log_path":null}}"#;
+        let decoded: NetfilterRequest = serde_json::from_str(legacy).unwrap();
+        match decoded {
+            NetfilterRequest::ApplyRules(policy) => assert!(policy.mcp_profiles.is_empty()),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// D-38: `run_shell`セッションとMCPサーバは、WFPから見れば同じ「SID＋許可ポート」の形へ
+    /// 均される。順序は`session_profile`が先で、以降は宣言順。
+    #[test]
+    fn policy_targets_flattens_the_session_and_every_mcp_server() {
+        let policy = NetfilterPolicy {
+            session_profile: "harness.shell.sandbox.1-2".to_string(),
+            allow_loopback_tcp_ports: vec![18080],
+            allow_loopback_udp_ports: vec![18053],
+            audit_log_path: None,
+            mcp_profiles: vec![
+                McpNetfilterPolicy {
+                    profile: "harness.mcp.1-2.docs".to_string(),
+                    allow_loopback_tcp_ports: vec![19090],
+                    allow_loopback_udp_ports: vec![],
+                },
+                McpNetfilterPolicy {
+                    profile: "harness.mcp.1-2.jira".to_string(),
+                    allow_loopback_tcp_ports: vec![19091],
+                    allow_loopback_udp_ports: vec![],
+                },
+            ],
+        };
+        let targets = policy_targets(&policy);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.profile.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "harness.shell.sandbox.1-2",
+                "harness.mcp.1-2.docs",
+                "harness.mcp.1-2.jira"
+            ]
+        );
+        // サーバごとに許可ポートが違う＝サーバ別の宛先allowlistになっている（§3.2）。
+        assert_eq!(targets[1].tcp_ports, vec![19090]);
+        assert_eq!(targets[2].tcp_ports, vec![19091]);
+    }
+
+    /// **信頼境界**: 昇格側は、渡された名前がharness由来のプロファイルの形であることを
+    /// 確認してからSIDを導出する。この判定が緩むと任意のAppContainerへフィルタを張れる。
+    #[test]
+    fn only_harness_profile_names_are_accepted_by_the_elevated_side() {
+        use crate::tier2a::mcp_profile::is_harness_profile_name;
+        assert!(is_harness_profile_name("harness.shell.sandbox.1-2"));
+        assert!(is_harness_profile_name("harness.mcp.1-2.docs"));
+        for bad in ["", "harness.shell.sandbox", "harness.mcp", "windows.immersivecontrolpanel"] {
+            assert!(!is_harness_profile_name(bad), "should reject {bad:?}");
+        }
     }
 
     #[test]
@@ -642,13 +800,15 @@ mod tests {
                 allow_loopback_tcp_ports,
                 allow_loopback_udp_ports,
                 audit_log_path,
+                mcp_profiles,
             }) => {
                 // 名前が欠落したJSONは空文字として読める。空文字は
-                // `is_session_profile_name`が拒否するので、`serve_inner`はfail-closedになる。
+                // `is_harness_profile_name`が拒否するので、`serve_inner`はfail-closedになる。
                 assert!(session_profile.is_empty());
                 assert!(allow_loopback_tcp_ports.is_empty());
                 assert!(allow_loopback_udp_ports.is_empty());
                 assert_eq!(audit_log_path, None);
+                assert!(mcp_profiles.is_empty());
             }
             other => panic!("unexpected variant: {other:?}"),
         }

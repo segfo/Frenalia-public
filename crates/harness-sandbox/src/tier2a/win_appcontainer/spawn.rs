@@ -236,6 +236,34 @@ impl AppContainerChild {
         KillToken(self.process)
     }
 
+    /// D-38/`DESIGN-MCP.md` §3.3: 一問一答ではなく、プロセスを生かしたまま何度も往復させる
+    /// 長寿命セッションへ変換する（MCP stdio用）。`want_stdin: true`で起動したものだけが
+    /// 変換できる——書き込み口が無いセッションは往復できない。
+    ///
+    /// 変換後はこの`AppContainerChild`のDropを走らせない（ハンドルの所有権が
+    /// [`super::spawn_session::AppContainerSession`]へ移るため）。
+    pub fn into_session(
+        mut self,
+    ) -> Result<super::spawn_session::AppContainerSession, AppContainerError> {
+        let Some(stdin_write) = self.stdin_write.take() else {
+            // ここでErrを返した場合はDropが通常どおり走り、残りのハンドルを閉じる。
+            return Err(AppContainerError::Win32(
+                "a long-lived session requires a stdin pipe (spawn with want_stdin = true)"
+                    .to_string(),
+            ));
+        };
+        let (process, job, stdout_read, stderr_read) =
+            (self.process, self.job, self.stdout_read, self.stderr_read);
+        std::mem::forget(self);
+        Ok(super::spawn_session::AppContainerSession::new(
+            process,
+            job,
+            stdin_write,
+            stdout_read,
+            stderr_read,
+        ))
+    }
+
     pub fn write_stdin_read_output_and_wait(
         mut self,
         stdin_payload: Option<&[u8]>,

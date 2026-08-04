@@ -54,6 +54,16 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture", "loopback",
         ],
     ),
+    // M15.5: MCPサーバ隔離（D-38）の実機E2E。workspace/`.harness`への到達不可（残課題#4）と、
+    // サーバ別の出口allowlist（残課題#3）。`--test-threads=1`はAppContainerプロファイル・
+    // WFPというマシン全体の共有状態を触るため（Tier2a残課題#4と同じ理由）。
+    (
+        "e2e-mcp",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "win_appcontainer::mcp_e2e_tests",
+        ],
+    ),
     (
         "e2e-wfp-multisession",
         &[

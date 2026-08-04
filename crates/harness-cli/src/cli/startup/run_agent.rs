@@ -38,7 +38,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         wfp_prelude,
         write_mode,
         shell_tier,
+        mcp_decls,
     } = sandbox;
+    let mut tools = tools;
 
     let _session_proxy = if net_proxy.domain_policy_enabled {
         match harness_tools::net_proxy::spawn_local_proxy(&net_proxy).await {
@@ -92,6 +94,20 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     let net_loopback_ports =
         net_loopback_ports_for_agents(net_proxy.proxy_addr, net_proxy.fake_dns_addr);
 
+    // MCP手順1〜3（D-38/D-39、`startup::mcp`のモジュールdoc）: 承認照合 → サーバごとの
+    // AppContainerプロファイル作成 → サーバ専用プロキシ起動。**プロセスはまだ起こさない**——
+    // 実起動は下のWFP適用が終わってから行う（出口強制の効かない窓を作らないため）。
+    let mcp_startup = super::mcp::prepare_mcp_servers(
+        &mcp_decls,
+        &workspace_root,
+        shell_tier.tier,
+        cli.print.is_none(),
+        net_proxy.audit_log_path.clone(),
+    )
+    .await;
+    #[cfg(windows)]
+    let mcp_netfilter_entries = mcp_startup.netfilter_entries();
+
     // WFPシナリオ(A)/(B)/(C)の最終確定。`shell_tier`が実際にTier2aへ着地し、かつ
     // 許可ドメインがあるときだけ有効化する。
     #[cfg(windows)]
@@ -126,6 +142,10 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                             allow_loopback_tcp_ports: net_loopback_ports.tcp.clone(),
                             allow_loopback_udp_ports: net_loopback_ports.udp.clone(),
                             audit_log_path: net_proxy.audit_log_path.clone(),
+                            // D-38: MCPサーバは別のpackage SIDなので、同じApplyRulesで
+                            // サーバごとのフィルタも張る（それぞれ自分の専用プロキシの
+                            // ポートだけ許可される）。
+                            mcp_profiles: mcp_netfilter_entries.clone(),
                         },
                     ) {
                         Ok(handle) => Some(handle),
@@ -153,6 +173,8 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                     allow_loopback_tcp_ports: net_loopback_ports.tcp.clone(),
                     allow_loopback_udp_ports: net_loopback_ports.udp.clone(),
                     audit_log_path: net_proxy.audit_log_path.clone(),
+                    // D-38: 上のシナリオ(A)と同じ理由でMCPサーバ分も一緒に張る。
+                    mcp_profiles: mcp_netfilter_entries.clone(),
                 },
             ) {
                 Ok(handle) => Some(handle),
@@ -255,6 +277,25 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         net_proxy.enforced_by_wfp = true;
     }
 
+
+    // MCP手順5（`startup::mcp`のモジュールdoc）: **WFPの適用が終わったここで初めて**
+    // サーバのプロセスを起こす。
+    //
+    // その前に、network要求のあるサーバをWFPの強制なしに起動しないことを確認する。WFPが無いと
+    // `internetClient` capabilityを持つサーバは専用プロキシを無視して直接外へ出られるため、
+    // 「宛先を絞ったつもりで絞れていない」状態になる。`run_shell`側が
+    // `should_grant_tier2a_network_capability`で採っているのと同じfail-closedである。
+    let mut mcp_startup = mcp_startup;
+    #[cfg(windows)]
+    if net_wfp.is_none() {
+        mcp_startup.drop_servers_needing_egress_enforcement();
+    }
+    #[cfg(not(windows))]
+    mcp_startup.drop_servers_needing_egress_enforcement();
+
+    let (mut mcp_runtime, mcp_facts, _mcp_proxies) =
+        super::mcp::launch_mcp_servers(mcp_startup, &mut tools);
+
     let mut tool_ctx = ToolCtx {
         workspace_root: workspace_root.clone(),
         staging: StagingConfig {
@@ -269,6 +310,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         run_shell_path_extra,
         vm_sandbox: None,
         cow_upper_dir: write_mode.upper_dir().map(|p| p.to_path_buf()),
+        mcp_servers: mcp_facts,
     };
 
     let mut state = ConversationState::new(harness_engine::system_blocks_for(&tool_ctx));
@@ -318,6 +360,11 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
             .await
         }
     };
+
+    // MCPサーバを落とす（WFPのteardownより前）。**先に喋る側を止める**——WFPを先に外すと、
+    // 落ちるまでのわずかな間だけ出口強制の無いサーバが生きていることになる。プロセスの生存自体は
+    // Job Objectに紐付いているので、ここを通らずに落ちた場合も道連れで終了する。
+    mcp_runtime.shutdown();
 
     // セッション終了時のWFP netfilterdのteardown（headless・対話モード共通の末尾）。
     // ここに到達せずにmainが早期returnした場合（このブロックより前のエラーパス）は、

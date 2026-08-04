@@ -322,6 +322,28 @@ pub trait VmShellExecutor: Send + Sync + std::fmt::Debug {
     ) -> Result<(String, String, Option<i32>), String>;
 }
 
+/// 起動中のMCPサーバ1件について、モデルへ伝える事実（M15.5、`plans/DESIGN-MCP.md`）。
+///
+/// MCPサーバのツールは組み込みツールと同じ姿で`ToolRegistry`に載るが、**実体は第三者プロセス
+/// であり、それぞれ別のサンドボックス（別package SID）で動き、到達できる先が違う**。モデルが
+/// 「なぜこのツールはネットワークに出られてあのツールは出られないのか」を説明できる必要が
+/// あるため、`EnvironmentFacts`が宣言する（`crates/harness-core/src/prompt.rs`）。
+///
+/// 値の生成は`harness-mcp`の`McpRuntime::facts`が行う（`harness-core`は「重い依存ゼロ」原則の
+/// ため値を運ぶだけ、`StagingConfig`/`ReadScopeConfig`と同じ役割分担）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerFact {
+    /// 宣言のid（ツール名`mcp__<id>__<tool>`の中央部分）。
+    pub id: String,
+    /// このサーバだけが到達できる許可ドメイン。空なら外向き通信は一切できない。
+    pub allow_domains: Vec<String>,
+    /// ワークスペースへのアクセス（`none` / `read` / `read-write`）。既定は`none`
+    /// （MCPサーバにはworkspaceへのACEを一切付けない、`DESIGN-MCP.md` §3.2）。
+    pub workspace_access: String,
+    /// 登録されたツール名（名前空間付き）。
+    pub tool_names: Vec<String>,
+}
+
 /// 実行前ゲート（`PermissionArbiter`）が参照するリスク分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -389,6 +411,9 @@ pub struct ToolCtx {
     /// `ACCESS_DENIED`でfail-close、`plans/DESIGN-SANDBOX.md §7 D-30`）。`None`は既定
     /// （D-29、workspace RW直接）。
     pub cow_upper_dir: Option<std::path::PathBuf>,
+    /// 起動中のMCPサーバ（M15.5、`plans/DESIGN-MCP.md`）。空なら宣言が無いか、いずれも
+    /// 承認されていないか、このOSでは起動しない（P-05）。
+    pub mcp_servers: Vec<McpServerFact>,
 }
 
 impl ToolCtx {
@@ -406,6 +431,7 @@ impl ToolCtx {
             shell_sees_staged_writes: false,
             vm_sandbox: None,
             cow_upper_dir: None,
+            mcp_servers: Vec::new(),
         }
     }
 }

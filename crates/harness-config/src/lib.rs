@@ -46,6 +46,18 @@ pub struct Settings {
     /// 縮退ガード設定（`plans/DESIGN-COGNITION.md` §11.6、M21）。省略時は
     /// `DegeneracySettings::default()`（有効・`auto_recycle`は無効）。
     pub degeneracy: Option<DegeneracySettings>,
+    /// MCPサーバ宣言（M15.5、`plans/DESIGN-MCP.md` §4.1）。**ここだけ型を付けずに生の
+    /// `Value`で運ぶ。**
+    ///
+    /// 宣言の型（`harness_mcp::McpServerDecl`）は承認ハッシュ（D-39）と一体で、ハッシュ対象の
+    /// 完全性をコンパイル時に担保する構造を持つため`harness-mcp`から動かせない。一方で
+    /// `harness-config`が`harness-mcp`へ依存すると、`harness-config`に依存する`harness-policy`
+    /// （M15.7、意図的に純粋クレートとして保たれている）まで`harness-sandbox`とWin32を
+    /// 引きずり込むことになる。
+    ///
+    /// そのため**この階層はマージだけを担当し、解釈は`harness_mcp::parse_mcp_settings`が行う**。
+    /// 設定階層のディープマージ（ユーザ→プロジェクト）はこの`Value`に対して正しく効く。
+    pub mcp: Option<serde_json::Value>,
 }
 
 /// `.harness/settings.json`の`cognition`キー。

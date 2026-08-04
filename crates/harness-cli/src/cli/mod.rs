@@ -177,6 +177,14 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: NetAction,
     },
+    /// MCPサーバ宣言の承認台帳（M15.5、`plans/DESIGN-MCP.md` §4.2 D-39）を操作する。
+    /// **宣言は承認台帳と一致したときだけ起動に使われる**——`.harness/settings.json`への
+    /// 既存の多層防御はすべて「書込」への防御であり、リポジトリに同梱された宣言には一度も
+    /// 発火しないため、ワークスペース外の台帳との照合が要る。
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// 現在のフラグ・`.harness/settings.json`構成から実際に組み立てられるシステムプロンプト
     /// （`harness_core::EnvironmentFacts`のレンダリング結果）をそのまま標準出力へ出して終了する。
     /// 「今モデルは何を知らされているのか」を確認するための読み取り専用診断コマンド
@@ -462,6 +470,7 @@ pub(crate) struct Cli {
 }
 
 pub mod cow_cmd;
+pub mod mcp_cmd;
 pub mod net_cmd;
 pub mod setup;
 pub mod startup;
@@ -469,6 +478,7 @@ pub mod tier3_cmd;
 pub mod workspace_cmd;
 
 pub(crate) use cow_cmd::*;
+pub(crate) use mcp_cmd::*;
 pub(crate) use net_cmd::*;
 pub(crate) use setup::*;
 pub(crate) use tier3_cmd::*;

@@ -65,6 +65,9 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
             Commands::Tier3 { action } => run_tier3_subcommand(action),
             Commands::Cow { action } => run_cow_subcommand(action),
             Commands::Net { action } => run_net_subcommand(action, &workspace_root),
+            // `mcp`は`.harness/settings.json`の宣言とユーザグローバルの承認台帳しか触らず、
+            // sandboxもプロバイダ資格情報も要らない（`net`/`policy`と同じ位置づけ）。
+            Commands::Mcp { action } => run_mcp(action, &workspace_root),
             Commands::Prompt => run_prompt_subcommand(&cli, &workspace_root),
             other => run_sandbox_subcommand(other, &workspace_root),
         });

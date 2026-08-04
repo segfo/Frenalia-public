@@ -27,6 +27,7 @@ harness-config = { version = "0.1.0", path = "../harness-config" }
 harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
 harness-engine = { version = "0.1.0", path = "../harness-engine" }
+harness-mcp = { version = "0.1.0", path = "../harness-mcp" }
 harness-providers = { version = "0.1.0", path = "../harness-providers" }
 harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
 harness-sandbox-vm = { version = "0.1.0", path = "../harness-sandbox-vm" }
