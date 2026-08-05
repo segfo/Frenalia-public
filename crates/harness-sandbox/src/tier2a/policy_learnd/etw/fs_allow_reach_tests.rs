@@ -16,8 +16,15 @@
 //!
 //! > 明示的に許可したはずのパスなのに、削除・移動・`cmd`経由の読取ができない。
 //!
-//! 本テストはこれを**実測で決着させる**ためのものである。行列を埋めることが目的であり、
-//! assertは測定が成立していることの確認（下記の必須対照）に絞る。
+//! 本テストはこれを**実測で決着させる**ために書かれた（結果は`plans/etw-spike/RESULTS.md` §19:
+//! 読み・書き・実行・`cmd`経由の読取は通り、**削除と移動だけが祖先で拒否される**）。
+//!
+//! **D-45（`plans/DESIGN-SANDBOX-APPPOLICY.md`）でこの穴は塞がれた**——`preflight`が
+//! `--fs-allow`エントリの**親**も`traverse_targets`へ入れるようになった。したがって現在は
+//! 条件(a)（＝`preflight`を通しただけ＝製品そのもの）でも7操作すべてが成功しなければならず、
+//! 本テストは**測定であると同時にD-45の受け入れテスト**になっている（下記のassert）。
+//! 条件(b)（手動で`grant_traverse_chain`）はD-45後は実質的に冪等な操作で、
+//! 「(a)で既に開通していること」の裏取りとして残してある。
 //!
 //! # 併せて測る軸: CoW redirector DLL（`docs/STATUS.md` Tier2a残課題#7）
 //!
@@ -147,6 +154,17 @@ impl Drop for TraverseRestore {
                     crate::tier2a::traverse_ledger::remove_traverse_grant(node);
                     println!("  restored (revoked traverse): {}", node.display());
                 }
+                // パスが既に消えているならACEも一緒に消えている（剥がす対象が無い）。
+                // ここで台帳エントリを残すと、実在しないパスを指すphantomが積み上がる
+                // ——実際にW1の測定はこの経路で2件残した。台帳は「harnessがACEを付けた場所」の
+                // 記録なので、対象が消えた時点で記録も消すのが正しい。
+                Err(e) if !node.exists() => {
+                    crate::tier2a::traverse_ledger::remove_traverse_grant(node);
+                    println!(
+                        "  restored (path already gone, ledger entry dropped): {} ({e})",
+                        node.display()
+                    );
+                }
                 Err(e) => println!(
                     "  !! FAILED to revoke traverse on {} : {e} -- run \
                      `harness fs revoke-traverse {}` manually",
@@ -177,14 +195,16 @@ impl TraverseRestore {
             .collect();
         let (granted, result) =
             crate::tier2a::win_appcontainer::grant_traverse_chain(target, self.sid.as_psid());
-        for node in &granted {
-            crate::tier2a::traverse_ledger::record_traverse_grant(node);
-        }
         if let Err(e) = result {
             println!("  !! grant_traverse_chain({}) failed: {e}", target.display());
         }
+        // 台帳へ記録するのは**今回新たに付与したノードだけ**にする。`grant_traverse_chain`は
+        // 冪等スキップしたノードも戻り値へ含めるため、戻り値をそのまま記録すると
+        // 「測定前から在った付与」の時刻まで書き換えてしまい、撤収対象（`granted_by_us`）とも
+        // ずれる。記録と撤収は同じ集合でなければ、片方だけ残るphantomが生まれる。
         for node in newly {
             if granted.contains(&node) && !self.granted_by_us.contains(&node) {
+                crate::tier2a::traverse_ledger::record_traverse_grant(&node);
                 self.granted_by_us.push(node);
             }
         }
@@ -388,6 +408,80 @@ fn run_phase(
     results
 }
 
+/// `docs/STATUS.md` Tier2a残課題#7の切り分け: **注入機構を通さずに**、AppContainerの子自身に
+/// `LoadLibraryW`を呼ばせて`GetLastError`を取る。
+///
+/// #7の症状（`LoadLibraryW returned NULL in target process`）は`inject_redirector`が
+/// `CreateRemoteThread`のスレッド終了コードだけを見ているために出るもので、**Win32エラーコードが
+/// 一切残らない**。原因の候補（ACL/権利・依存DLL・ビット数・注入タイミング）を分けるには、
+/// 「そもそもこのAppContainerはこのDLLをロードできるのか」を独立に測るしかない。
+///
+/// プローブexeは`workspace`（このセッションのSIDへRWで付与済み）へコピーして実行する。
+/// `target\debug\deps`の到達性という別問題を測定に混ぜないための措置である。
+fn probe_load_library_in_appcontainer(
+    label: &str,
+    session_sid: windows::Win32::Security::PSID,
+    workspace: &std::path::Path,
+    dll: &std::path::Path,
+) -> String {
+    let source = {
+        let current = std::env::current_exe().expect("current_exe");
+        current
+            .parent()
+            .expect("current_exe has parent")
+            .join("tier2a_proc_probe.exe")
+    };
+    if !source.exists() {
+        let msg = format!("(skipped: {} not found)", source.display());
+        println!("  [{label}] {msg}");
+        return msg;
+    }
+    let staged = workspace.join("load-library-probe.exe");
+    if let Err(e) = std::fs::copy(&source, &staged) {
+        let msg = format!("(skipped: could not stage the probe exe: {e})");
+        println!("  [{label}] {msg}");
+        return msg;
+    }
+
+    let env = crate::secret_env::build_child_env();
+    let child = spawn(
+        &staged.to_string_lossy(),
+        &[
+            "--load-library",
+            &dll.to_string_lossy(),
+            "--timeout-secs",
+            "20",
+        ],
+        workspace,
+        &env,
+        false,
+        session_sid,
+        NetworkCapability::Deny,
+        None,
+    );
+    let out = match child {
+        Ok(child) => match child.write_stdin_read_output_and_wait(None) {
+            Ok((stdout, stderr, code)) => {
+                let line = stdout
+                    .lines()
+                    .rev()
+                    .find(|l| l.trim_start().starts_with('{'))
+                    .unwrap_or("")
+                    .to_string();
+                if line.is_empty() {
+                    format!("(no JSON; exit={code} stderr={})", stderr.trim())
+                } else {
+                    line
+                }
+            }
+            Err(e) => format!("(probe I/O failed: {e})"),
+        },
+        Err(e) => format!("(spawn failed: {e})"),
+    };
+    println!("  [{label}] {out}");
+    out
+}
+
 #[test]
 #[ignore = "requires administrator rights (ETW), creates an AppContainer profile and grants \
             persistent capability-SID traverse ACEs (revoked on drop); run via \
@@ -475,6 +569,23 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
         println!("  denied: {} [{access}] {reason}", path.display());
     }
 
+    // [BUG-057の回帰] `--fs-allow`で付与したパスは**session ledgerに載っていなければならない**。
+    // 載っていないと`end_session`の自動撤収から漏れ、「fs passthroughはセッション終了で失効する」
+    // （D-37の仕様、`docs/STATUS.md`が不変条件として明記）が破れる。
+    // `fs-passthrough-ledger.json`（`harness fs revoke`が見る方）には載るので、手動撤収だけは
+    // 効く——**自動撤収だけが静かに漏れる**という気付きにくい形の欠陥だった。
+    let recorded = crate::tier2a::session_profile::granted_paths_for_current_session();
+    println!("=== session ledger after preflight: {recorded:?} ===");
+    for fp in &passthrough {
+        let path_str = fp.path.to_string_lossy().into_owned();
+        assert!(
+            recorded.contains(&path_str),
+            "BUG-057: {} was granted by preflight but is not in the session ledger, so \
+             `end_session` will not revoke it (recorded = {recorded:?})",
+            fp.path.display()
+        );
+    }
+
     // 条件(d)のプローブツリーへは何も与えない。`never_allowed`はfs-allowにも入れていない。
 
     // --- CoW redirector DLL: `preflight`のCoW分岐とまったく同じ呼び出しを再現する ---
@@ -489,17 +600,30 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
             "    session SID ACE before: {:?}",
             crate::tier2a::win_appcontainer::sid_ace_mask(dll, sid.as_psid())
         );
-        match grant_ace_inheritable_access(dll, sid.as_psid(), FsAccess::ReadExec) {
-            Ok(()) => println!("    grant_ace_inheritable_access -> Ok"),
-            Err(e) => println!("    grant_ace_inheritable_access -> Err({e})"),
-        }
-        // **Errでも実際にはACEが載っているのか**を権威的に確認する。載っているのに
-        // `preflight`が失敗扱いにしているなら、それは撤収経路の無い孤立ACEである。
+        // [BUG-059の回帰] ファイルを渡しても`Ok`が返ること。修正前はACEを付けた**後**に
+        // `collect_dirs_and_files`の`read_dir`が`ERROR_DIRECTORY`(267)で落ちて`Err`になり、
+        // `preflight`がそれを失敗扱いにするため撤収経路の無い孤立ACEが残っていた。
+        let granted = grant_ace_inheritable_access(dll, sid.as_psid(), FsAccess::ReadExec);
+        println!("    grant_ace_inheritable_access -> {granted:?}");
+        assert!(
+            granted.is_ok(),
+            "BUG-059: granting a file must not report failure: {granted:?}"
+        );
+        // `preflight`のCoW分岐と同じく台帳へ記録する（記録しないと`end_session`で剥がれず、
+        // このテスト自身が孤立ACEの発生源になる）。
+        crate::tier2a::session_profile::record_granted_path(dll);
         println!(
             "    session SID ACE after : {:?}",
             crate::tier2a::win_appcontainer::sid_ace_mask(dll, sid.as_psid())
         );
     }
+
+    // --- STATUS #7の切り分け: 注入機構抜きでDLLをロードできるか（条件(a)＝祖先未付与） ---
+    println!("=== [a] LoadLibraryW from inside the AppContainer (STATUS #7 triage) ===");
+    let load_a: Vec<String> = dlls
+        .iter()
+        .map(|dll| probe_load_library_in_appcontainer("a", sid.as_psid(), &workspace, dll))
+        .collect();
 
     // --- フェーズA: 条件(a) fs-allowのみ / (c) workspace内 / (d) 未許可 / DLL現状 ---
     let mut cells_a = Vec::new();
@@ -587,6 +711,12 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
             dest: dll.clone(),
         });
     }
+    println!("=== [b] LoadLibraryW from inside the AppContainer (after ancestor traverse) ===");
+    let load_b: Vec<String> = dlls
+        .iter()
+        .map(|dll| probe_load_library_in_appcontainer("b", sid.as_psid(), &workspace, dll))
+        .collect();
+
     let results_b = run_phase("B", sid.as_psid(), &workspace, &cells_b, &probe_trees);
 
     // --- 行列 ---
@@ -630,6 +760,26 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
          cause and option A would not help."
     );
 
+    println!("=== STATUS #7 triage: LoadLibraryW inside the AppContainer ===");
+    for (i, dll) in dlls.iter().enumerate() {
+        println!("  {}", dll.display());
+        println!(
+            "    (a) ancestors NOT granted : {}",
+            load_a.get(i).map(String::as_str).unwrap_or("(none)")
+        );
+        println!(
+            "    (b) ancestors granted     : {}",
+            load_b.get(i).map(String::as_str).unwrap_or("(none)")
+        );
+    }
+    println!(
+        "HOW TO READ #7: `ok:true` in (a) means the AppContainer CAN load this DLL, so the \
+         `LoadLibraryW returned NULL` seen by cow_containment_tests comes from the INJECTION \
+         mechanism (CreateRemoteThread into a CREATE_SUSPENDED process), not from the DLL or its \
+         ACL. `last_error:5` = access/rights, `126` = a dependency is unreachable, `193` = bitness, \
+         `1114` = the DLL's own initialisation failed."
+    );
+
     // --- 必須の対照 ---
     // 1) 成功しなければならないセル: workspace内の読み書き・削除・移動。
     //    全滅したら「対象の性質」ではなく測定の不備である。
@@ -644,6 +794,9 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     }
     // 2) 失敗しなければならないセル: fs-allowしていない深い未付与パスの読取。
     //    成功したら「未付与のつもりが付与済み」＝測定不成立である。
+    //    **D-45後も、これはFAILのままでなければならない**——祖先のtraverseは「通過」しか
+    //    与えないので、fs-allowしていない兄弟ディレクトリの中身は読めてはいけない。
+    //    ここが通り出したらD-45が権限を広げすぎたということである。
     let key = "d_unallowed|read_dotnet".to_string();
     let value = results_a.get(&key).map(String::as_str).unwrap_or("(missing)");
     assert!(
@@ -653,20 +806,49 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
         never_allowed.display()
     );
 
-    // DLLへ載せたセッションSIDのACEは`record_granted_path`されていないので`end_session`では
-    // 剥がれない（`preflight`が`Err`扱いにするため。**これ自体が孤立ACEの温床である**）。
-    // 測定が原因でACEを積み増さないよう、ここで明示的に剥がす。
-    println!("=== revoking this session's ACE on the redirector DLL(s) ===");
-    for dll in &dlls {
-        match revoke_ace(dll, sid.as_psid()) {
-            Ok(()) => println!("  revoked: {}", dll.display()),
-            Err(e) => println!("  !! could not revoke {} : {e}", dll.display()),
-        }
+    // 3) [D-45の受け入れ] 条件(a)＝`preflight`を通しただけ＝**製品そのもの**で、7操作すべてが
+    //    成功しなければならない。D-45以前はここで`delete`と`move`がFAILしていた
+    //    （RESULTS.md §19.2）。`--fs-allow`の親を`traverse_targets`へ入れる変更が効いていれば
+    //    OKへ変わる。変わらないなら、決定は実装できていない。
+    for op_name in [
+        "read_dotnet",
+        "read_netfx",
+        "read_cmd",
+        "write_dotnet",
+        "delete",
+        "move",
+        "exec",
+    ] {
+        let key = format!("a_fsallow|{op_name}");
+        let Some(value) = results_a.get(&key) else {
+            continue;
+        };
+        assert!(
+            value.starts_with("OK"),
+            "D-45 regression: `--fs-allow` alone must now allow every operation, but {key} = \
+             {value}. Before D-45 `delete`/`move` failed here because nothing granted traverse to \
+             the fs-allow ancestors (RESULTS.md §19.2); if they fail again, preflight's \
+             traverse_targets no longer includes the fs-allow parents"
+        );
     }
 
+    // [BUG-059の回帰] DLLへ載せたACEは台帳に載っているので、**`end_session`が剥がす**。
+    // 修正前はここで明示的に剥がしていた——テスト側で手当てしていたということは、製品側では
+    // 誰も剥がしていなかったということである（実機に4件残留していた）。
+    println!("=== end_session must revoke the redirector DLL ACEs by itself ===");
     crate::tier2a::session_profile::end_session(
         &crate::tier2a::win_appcontainer::revoke_session_grant,
     );
+    for dll in &dlls {
+        let remaining = crate::tier2a::win_appcontainer::sid_ace_mask(dll, sid.as_psid());
+        println!("  {} -> {remaining:?}", dll.display());
+        assert!(
+            matches!(remaining, Ok(None)),
+            "BUG-059: end_session must remove this session's ACE from {} but it is still \
+             there ({remaining:?}) -- that is exactly how the 4 orphaned ACEs accumulated",
+            dll.display()
+        );
+    }
     println!("=== restoring machine state ===");
     drop(restore);
     for dll in &dlls {
@@ -677,4 +859,16 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
         );
     }
     let _ = std::fs::remove_dir_all(&root);
+
+    // **D-45以降、祖先traverseを付けるのは`preflight`自身**（`TraverseRestore`ではない）。
+    // その付与は`traverse_ledger`へ永続記録されるが、プローブツリーはたった今消したので、
+    // 残せば「実在しないパスを指すエントリ」＝phantomになる（実際にW1の測定は2件残した）。
+    // 台帳は「harnessがACEを付けた場所」の記録なので、対象が消えた時点で記録も消す。
+    let root_prefix = root.to_string_lossy().to_ascii_lowercase();
+    for entry in crate::tier2a::traverse_ledger::load_traverse_ledger().entries {
+        if entry.path.to_ascii_lowercase().starts_with(&root_prefix) {
+            println!("  pruning traverse-ledger entry for the deleted probe tree: {}", entry.path);
+            crate::tier2a::traverse_ledger::remove_traverse_grant(std::path::Path::new(&entry.path));
+        }
+    }
 }

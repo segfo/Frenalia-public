@@ -385,11 +385,34 @@ pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContain
     grant_ace_inheritable_access(root, sid, FsAccess::ReadExec)
 }
 
+/// `root`がファイルのときは、継承ACE＋ツリーwalkではなく**単一オブジェクトへの付与1件**で終える。
+///
+/// BUG-059: この分岐が無かった頃、`root`がファイル（`--cow`のredirector DLL・ファイル1件を指す
+/// `--fs-allow`）だと`grant_ace_access`でACEを付けた**後**に`collect_dirs_and_files`の`read_dir`が
+/// `ERROR_DIRECTORY`(267)で落ち、**ACEは載っているのに`Err`が返っていた**。呼び出し側は`Err`を
+/// 「何も起きなかった」と解釈して台帳へ記録しないため、撤収経路の無い孤立ACEが残っていた。
+///
+/// ファイルに`CONTAINER_INHERIT_ACE|OBJECT_INHERIT_ACE`を立ててもWindowsは受け付けるが
+/// （継承先が無いので実害は無い）、意味が無いので`is_dir: false`で付ける。
+fn grant_ace_access_if_file(
+    root: &Path,
+    sid: PSID,
+    access: FsAccess,
+) -> Option<Result<(), AppContainerError>> {
+    if root.is_dir() {
+        return None;
+    }
+    Some(grant_ace_access(root, sid, false, access))
+}
+
 pub fn grant_ace_inheritable_access(
     root: &Path,
     sid: PSID,
     access: FsAccess,
 ) -> Result<(), AppContainerError> {
+    if let Some(result) = grant_ace_access_if_file(root, sid, access) {
+        return result;
+    }
     grant_ace_access(root, sid, true, access)?;
 
     let mut dirs = Vec::new();
@@ -428,6 +451,12 @@ pub fn grant_ace_inheritable_access(
 /// readdir + 各ノードの`sid_ace_mask`読取確認）は依然としてO(n)で残る。恒久的な解決
 /// （付与済みキャッシュの永続化等）は本ラウンドのスコープ外とし、既知の制約として記録する。
 pub fn grant_ace_inheritable_rw(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    // BUG-059と同じ分岐（`grant_ace_access_if_file`のdoc参照）。現在の呼び出し元は
+    // ディレクトリしか渡さないが、**同じクラスの保険は同じクラスの関数すべてに入れる**
+    // ——BUG-059は「1箇所だけ直して、後から足された経路が同じ穴を開けた」形だった。
+    if !root.is_dir() {
+        return grant_ace(root, sid, false);
+    }
     grant_ace(root, sid, true)?;
 
     let mut dirs = Vec::new();

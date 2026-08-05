@@ -207,6 +207,107 @@ pub fn revoke_session_grant(path: &Path, profile_name: &str) {
     crate::tier2a::workspace_ledger::remove_workspace_entry(path);
 }
 
+/// AppContainer SIDの文字列接頭辞（`S-1-15-2-<hash…>`）。パッケージSID／capability SIDの
+/// うち、`SECURITY_APP_PACKAGE_BASE_RID`(2)で始まるものがAppContainerのパッケージSIDである。
+const APPCONTAINER_SID_PREFIX: &str = "S-1-15-2-";
+
+/// `path`に載っているAppContainerパッケージSID宛の明示ACEのうち、`keep_profiles`のどの
+/// プロファイルのSIDとも一致しないものを剥がし、剥がしたSID文字列を返す。
+///
+/// **なぜ「残す側」を名指しするのか**: プロファイルが削除済みのSIDは名前へ逆引きできない
+/// （`DeriveAppContainerSidFromAppContainerName`は名前→SIDの一方向）ため、「死んだセッションの
+/// SIDを列挙して剥がす」方式は既に残ってしまったACEには効かない。生存しているセッション
+/// （`session_profile::live_profile_names`）のSIDだけを残し、それ以外を剥がす向きにする。
+///
+/// 対象は**呼び出し側が明示した既知パス**に限る（現状はredirector DLL）。マシン全体を
+/// 走査する掃除機にはしない——それはこのプロセスが所有していない変更まで巻き込む。
+///
+/// BUG-059で実マシンに4件残留していた孤立ACEの回収経路。付与側（`preflight`）に保険を
+/// 入れて新規発生は止めたが、**既に残っているものは台帳に無いので`fs revoke`では届かない**。
+pub fn revoke_stale_appcontainer_aces(
+    path: &Path,
+    keep_profiles: &[String],
+) -> Result<Vec<String>, AppContainerError> {
+    let keep: Vec<String> = keep_profiles
+        .iter()
+        .filter_map(|name| ensure_profile(name).ok())
+        .filter_map(|sid| crate::win_common::sid_to_string(sid.as_psid()).ok())
+        .collect();
+
+    let mut removed = Vec::new();
+    for (sid_string, sid) in appcontainer_sid_aces(path)? {
+        if keep.contains(&sid_string) {
+            continue;
+        }
+        revoke_ace(path, sid.as_psid())?;
+        removed.push(sid_string);
+    }
+    Ok(removed)
+}
+
+/// `path`のDACLに明示ACEを持つAppContainerパッケージSIDを列挙する（重複除去）。
+///
+/// `sid_ace_mask`と同じ`GetExplicitEntriesFromAclW`経由で読む（`GetAce`によるACEヘッダの
+/// 直接パースより低リスク、同関数のコメント参照）。SIDはWin32が確保した配列の中を指すため、
+/// 解放前に[`crate::win_common::OwnedSid`]へコピーして所有権を単純化する。
+fn appcontainer_sid_aces(
+    path: &Path,
+) -> Result<Vec<(String, crate::win_common::OwnedSid)>, AppContainerError> {
+    let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    };
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+        .ok()
+        .map_err(to_err)?;
+
+        let mut count: u32 = 0;
+        let mut entries: *mut EXPLICIT_ACCESS_W = std::ptr::null_mut();
+        let err = GetExplicitEntriesFromAclW(dacl as *const _, &mut count, &mut entries);
+        if let Err(e) = err.ok() {
+            let _ = LocalFree(HLOCAL(sd.0));
+            return Err(to_err(e));
+        }
+
+        let mut found: Vec<(String, crate::win_common::OwnedSid)> = Vec::new();
+        if !entries.is_null() {
+            for entry in std::slice::from_raw_parts(entries, count as usize) {
+                if entry.Trustee.TrusteeForm != TRUSTEE_IS_SID {
+                    continue;
+                }
+                let entry_sid = PSID(entry.Trustee.ptstrName.0 as *mut c_void);
+                let Ok(sid_string) = crate::win_common::sid_to_string(entry_sid) else {
+                    continue;
+                };
+                if !sid_string.starts_with(APPCONTAINER_SID_PREFIX)
+                    || found.iter().any(|(s, _)| s == &sid_string)
+                {
+                    continue;
+                }
+                if let Ok(owned) = crate::win_common::OwnedSid::copy_from(entry_sid) {
+                    found.push((sid_string, owned));
+                }
+            }
+            let _ = LocalFree(HLOCAL(entries as *mut _));
+        }
+        let _ = LocalFree(HLOCAL(sd.0));
+        Ok(found)
+    }
+}
+
 pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
         path: path.to_path_buf(),
@@ -254,7 +355,18 @@ pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
 /// D-13のfs passthrough撤収（`harness fs revoke`）本体。`grant_ace_recursive`と同じ
 /// `collect_dirs_and_files`（symlinkスキップ済み）を使い再walkするため、付与後に増えた
 /// ファイルも含めて現在のツリー全体から取り除く（決定D3: 台帳はルートのみ記録、撤収は再walk）。
+///
+/// **`root`がファイルのときは単一オブジェクトの撤収1件で終える**（BUG-059の撤収側）。
+/// この分岐が無かった頃、`collect_dirs_and_files`の`read_dir`が`ERROR_DIRECTORY`(267)で落ちて
+/// **1件も剥がさずに`Err`を返していた**。`end_session`はこの関数を通して撤収するので、
+/// ファイルへ付けたACE（`--cow`のredirector DLL・ファイル1件を指す`--fs-allow`）は
+/// **台帳に正しく載っていても剥がれない**。付与側だけを直しても孤立ACEは止まらなかった、
+/// というのが実機E2Eで判明した順序である（付与側=`grant_ace_inheritable_access`、
+/// 記録側=`preflight`、撤収側=ここ、の3つが揃って初めて閉じる）。
 pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    if root.is_file() {
+        return revoke_ace(root, sid);
+    }
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {

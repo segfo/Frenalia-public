@@ -395,6 +395,35 @@ fn required_passthrough_mask(access: FsAccess) -> u32 {
 /// `preflight`のfs-allow昇格結果（`granted`パス一覧、`(path, reason)`失敗一覧）。
 type FsAllowElevationOutcome = (Vec<std::path::PathBuf>, Vec<(std::path::PathBuf, String)>);
 
+/// BUG-059の回収: redirector DLLに残った、**生存していないセッション**宛のACEを剥がす。
+///
+/// 付与側（下記CoW分岐）に保険を入れて新規発生は止めたが、記録漏れの間に積み上がったACEは
+/// 台帳に無いため`gc_dead_sessions`の撤収対象に入らない（実機に4件残留していた）。DLLは
+/// harness自身の実行ファイルの隣という**既知の固定パス**なので、そこだけを直接掃く。
+///
+/// 失敗しても起動は止めない——これは後始末であって境界ではなく、ここで`Err`を返すと
+/// 「掃除できないマシンではTier2aが起動できない」という筋の悪い依存を作る。
+fn sweep_stale_redirector_dll_aces() {
+    let live = crate::tier2a::session_profile::live_profile_names();
+    for dll in redirector_dll_paths() {
+        match revoke_stale_appcontainer_aces(&dll, &live) {
+            Ok(removed) if !removed.is_empty() => {
+                eprintln!(
+                    "harness: removed {} stale AppContainer ACE(s) left on {} by sessions that are \
+                     no longer running (see docs/bugs/BUG-059.md)",
+                    removed.len(),
+                    dll.display()
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "harness: could not sweep stale AppContainer ACEs on {}: {e}",
+                dll.display()
+            ),
+        }
+    }
+}
+
 pub fn preflight(
     workspace_root: &Path,
     passthrough: &[FsPassthrough],
@@ -411,6 +440,7 @@ pub fn preflight(
     let profile_name = crate::tier2a::session_profile::begin_session()
         .map_err(AppContainerError::Preflight)?;
     let sid = ensure_profile(&profile_name)?;
+    sweep_stale_redirector_dll_aces();
     // 祖先traverseの付与先（D-37）。package SIDと違いセッションを跨いで永続する。
     let traverse_sid = traverse_capability_sid()?;
 
@@ -502,6 +532,35 @@ pub fn preflight(
             traverse_targets.push(parent.to_path_buf());
         }
     }
+    // D-45（W1の実測から確定、`plans/etw-spike/RESULTS.md` §19）: `--fs-allow`で許可した
+    // パスの**親**もここへ入れる。対象自身への継承ACEだけでは、削除（`Remove-Item`）と
+    // 移動（`Move-Item`）が失敗する——この2つは祖先ディレクトリを「通過」ではなく
+    // **オープン**するため、対象へ到達する前に祖先で拒否される（拒否は対象ファイルではなく
+    // 祖先に出るので、対象パスだけを見ていると「失敗しているのに拒否0件」に見える）。
+    // 読取・書込・実行・`cmd /c type`はフルパスのファイルopenなので祖先未付与でも通る。
+    //
+    // マスクは現行の`FILE_TRAVERSE|FILE_READ_ATTRIBUTES`のままでよい（§19.2で7操作すべてが
+    // これで通ることを実測した）。`SYNCHRONIZE`・`FILE_LIST_DIRECTORY`まで広げると
+    // `C:\`・`C:\Users`が列挙可能になり機密性の実害が出るので広げない。
+    //
+    // **親を入れる（leafは入れない）**。leafへの到達権はこのセッション固有のpackage SIDが
+    // 継承ACEで与える（上のfs-allowループ）。ここでcapability SIDのACEをleafへ要求すると、
+    // 新しいパスを指定するたびに「capability SIDのACEが無い」と判定され毎回昇格を求めてしまう。
+    //
+    // 存在しないパスは入れない——後段のループが`path does not exist, skipped`として弾く
+    // ものへ、先回りしてマシンのACLを書き換える理由が無い。
+    for requested in passthrough {
+        if !requested.path.exists() {
+            continue;
+        }
+        let Some(parent) = requested.path.parent() else {
+            continue;
+        };
+        let parent = parent.to_path_buf();
+        if !traverse_targets.contains(&parent) {
+            traverse_targets.push(parent);
+        }
+    }
     let missing_traverse: Vec<std::path::PathBuf> = traverse_targets
         .into_iter()
         .filter(|target| !traverse_chain_sufficient(target, traverse_sid.as_psid()))
@@ -517,10 +576,28 @@ pub fn preflight(
         for dll in redirector_dll_paths() {
             match grant_ace_inheritable_access(&dll, sid.as_psid(), FsAccess::ReadExec) {
                 Ok(()) => crate::tier2a::session_profile::record_granted_path(&dll),
-                Err(e) => warnings.push(format!(
-                    "cow: failed to grant the redirector DLL to this session ({}): {e}",
-                    dll.display()
-                )),
+                // BUG-059 / BUG-017と同じ保険: `Err`は「何も起きなかった」を意味しない。
+                // 副作用を伴う関数が途中で失敗したとき、ACEが既に載っているかは呼び出し側からは
+                // 分からない。載っているのに記録しないと**撤収経路の無い孤立ACE**になる
+                // （実機に4件残留していた）。rootを権威的にプローブして実在すれば記録する。
+                // `grant_ace_inheritable_access`側のファイル分岐（層1）を直した後も、この保険は
+                // 残す——記録漏れの代償（孤立ACE）は、幻の台帳エントリより重い。
+                Err(e) => {
+                    if matches!(sid_ace_mask(&dll, sid.as_psid()), Ok(Some(_))) {
+                        crate::tier2a::session_profile::record_granted_path(&dll);
+                        warnings.push(format!(
+                            "cow: granting the redirector DLL to this session reported an error \
+                             ({}): {e} -- but the ACE is present on the file, so it was recorded \
+                             in the session ledger and will be revoked at session end",
+                            dll.display()
+                        ));
+                    } else {
+                        warnings.push(format!(
+                            "cow: failed to grant the redirector DLL to this session ({}): {e}",
+                            dll.display()
+                        ));
+                    }
+                }
             }
         }
     }
@@ -582,6 +659,12 @@ pub fn preflight(
         let already_sufficient = matches!(sid_ace_mask(&fp.path, sid.as_psid()), Ok(Some(existing)) if existing & required == required);
         if already_sufficient {
             granted_passthrough.push((fp.path.clone(), requested_rw));
+            // BUG-057: 付与を**スキップした**場合もsession ledgerへ記録する。ACEを実際に
+            // 書いたのが前のセッションだったとしても、載っているのは**このセッションのSID宛**
+            // であり（D-37でSIDはセッション固有）、撤収責任はこのセッションにある。
+            // 記録しないと`end_session`の撤収対象から漏れ、「fs passthroughはセッション終了で
+            // 失効する」（D-37の仕様）が破れる。
+            crate::tier2a::session_profile::record_granted_path(&fp.path);
             if let Some(diagnosis) =
                 probe_passthrough(sid.as_psid(), traverse_sid.as_psid(), workspace_root, fp)
             {
@@ -726,6 +809,11 @@ pub fn preflight(
                         .map(|e| e.access.is_read_write())
                         .unwrap_or(false);
                     granted_passthrough.push((path.clone(), writable));
+                    // BUG-057: 昇格経由（privhelper / 本体が既に管理者の直接付与、どちらも
+                    // この`granted`へ合流する）の付与もsession ledgerへ記録する。ここが
+                    // 抜けていたため、`fs-passthrough-ledger.json`（`harness fs revoke`が見る）
+                    // には載るのに`end_session`の自動撤収からは漏れていた。
+                    crate::tier2a::session_profile::record_granted_path(path);
                     if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
                         if let Some(diagnosis) = probe_passthrough(
                             sid.as_psid(),
@@ -756,6 +844,9 @@ pub fn preflight(
                     // 実在すれば台帳へ記録して`fs revoke`で後から掃除できるようにする。
                     if matches!(sid_ace_mask(path, sid.as_psid()), Ok(Some(_))) {
                         granted_passthrough.push((path.clone(), writable));
+                        // BUG-057: 部分適用でACEが実在するなら、`end_session`の撤収対象にも入れる
+                        // （`fs revoke`だけでなく自動撤収からも漏らさない）。
+                        crate::tier2a::session_profile::record_granted_path(path);
                         warnings.push(format!(
                             "fs-allow {} : partially applied via privilege-separation helper \
                              (D-16) -- some descendant failed ({reason}), but the root itself now \
@@ -783,6 +874,8 @@ pub fn preflight(
                     if matches!(sid_ace_mask(&entry.path, sid.as_psid()), Ok(Some(_))) {
                         granted_passthrough
                             .push((entry.path.clone(), entry.access.is_read_write()));
+                        // BUG-057: 上と同じ（ヘルパーが完走できなかった場合の部分適用）。
+                        crate::tier2a::session_profile::record_granted_path(&entry.path);
                         warnings.push(format!(
                             "fs-allow {} : partially applied -- the privilege-separation helper \
                              (D-16) could not fully complete ({reason}), but the root itself now \

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+mod load_library;
 mod spawn_via;
 #[cfg(windows)]
 mod winid;
@@ -54,6 +55,10 @@ struct Args {
     /// ネット検査は行わず、`(モード, コマンドライン)`で指定されたコマンドを`CreateProcessA`
     /// または`WinExec`で直接起動した結果だけをJSONで報告する（`spawn_via`モジュールdoc参照）。
     spawn_via: Option<(String, String)>,
+    /// `docs/STATUS.md` Tier2a残課題#7の切り分け用: 指定時、通常の検査は行わず、指定パスの
+    /// DLLを`LoadLibraryW`でロードした結果と`GetLastError`だけをJSONで報告する
+    /// （`load_library`モジュールdoc参照）。
+    load_library: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -68,6 +73,7 @@ fn parse_args() -> Args {
     let mut sanitize_env = false;
     let mut try_runas = None;
     let mut spawn_via = None;
+    let mut load_library = None;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -92,6 +98,7 @@ fn parse_args() -> Args {
             "--try-runas" => try_runas = Some(next()),
             "--spawn-via-createprocessa" => spawn_via = Some(("createprocessa".to_string(), next())),
             "--spawn-via-winexec" => spawn_via = Some(("winexec".to_string(), next())),
+            "--load-library" => load_library = Some(next()),
             _ => {}
         }
     }
@@ -108,6 +115,7 @@ fn parse_args() -> Args {
         sanitize_env,
         try_runas,
         spawn_via,
+        load_library,
     }
 }
 
@@ -362,6 +370,15 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("try_runas report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(dll) = &args.load_library {
+        let report = load_library::run(dll);
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("load_library report must serialize")
         );
         return ExitCode::SUCCESS;
     }

@@ -295,6 +295,22 @@ pub fn record_granted_path(path: &Path) {
     });
 }
 
+/// このセッションが撤収責任を負っているパス（[`record_granted_path`]で積んだもの）。
+///
+/// [`end_session`]が実際に剥がす集合そのもので、「付与したのに記録し忘れていないか」を
+/// 機械的に確かめるために公開する（BUG-057・BUG-059はどちらも**付与したのに記録しなかった**
+/// 欠陥だった。台帳を読めなければ、その種の漏れはテストで固定できない）。
+pub fn granted_paths_for_current_session() -> Vec<String> {
+    let token = session_token();
+    ledger()
+        .load()
+        .sessions
+        .into_iter()
+        .find(|e| e.token == token)
+        .map(|e| e.granted_paths)
+        .unwrap_or_default()
+}
+
 /// このセッションが起動するMCPサーバのプロファイルを台帳へ登録し、その名前を返す（D-38）。
 /// 冪等——同じ`server_id`で2回呼んでもエントリは増えない。
 ///
@@ -397,6 +413,43 @@ pub fn revocable_profile_names() -> Vec<String> {
             continue;
         };
         if !win::is_live(token) && !names.contains(&profile) {
+            names.push(profile);
+        }
+    }
+    names
+}
+
+/// **生存している**セッション（とそのMCPサーバ）のプロファイル名を列挙する。
+///
+/// [`revocable_profile_names`]の裏返しで、「剥がしてはいけない側」を明示的に取るための関数。
+/// 台帳に無いACEを既知パスから掃く経路（BUG-059の孤立ACE回収、`preflight`）が使う——
+/// **プロファイルが削除済みのSIDは名前へ逆引きできない**（`DeriveAppContainerSidFrom
+/// AppContainerName`は名前→SIDの一方向）ので、「死んだものを名指しして剥がす」方式が使えない。
+/// 残す側を名指しし、それ以外を剥がすという向きにするしかない。
+///
+/// 実行中の他セッションのACEを巻き込まないことが、この関数の唯一の存在意義である
+/// （BUG-053で直したのと同じ「実行中の他セッションから権限を奪う」誤りを繰り返さない）。
+pub fn live_profile_names() -> Vec<String> {
+    let mut names = Vec::new();
+    for entry in ledger().load().sessions {
+        if !win::is_live(&entry.token) {
+            continue;
+        }
+        for profile in std::iter::once(entry.profile_name)
+            .chain(entry.mcp.into_iter().map(|m| m.profile_name))
+        {
+            if !names.contains(&profile) {
+                names.push(profile);
+            }
+        }
+    }
+    // 台帳が失われていても、接頭辞付きプロファイルの列挙と生存マーカーで生存判定はできる
+    // （`revocable_profile_names`と同じ二重化）。
+    for profile in win::existing_profiles() {
+        let Some(token) = token_of_profile(&profile) else {
+            continue;
+        };
+        if win::is_live(token) && !names.contains(&profile) {
             names.push(profile);
         }
     }

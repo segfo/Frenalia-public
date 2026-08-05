@@ -421,6 +421,54 @@ fn grant_traverse_then_revoke_traverse_on_neutral_dir() {
     );
 }
 
+/// [BUG-059] `grant_ace_inheritable_access`に**ファイル**を渡しても`Ok`が返り、ACEが載ること。
+///
+/// この関数は「rootへ継承ありACEを1件付け、伝播が届かなかった子孫だけ個別に補う」という
+/// ツリー向けの高速化版で、`root`がファイルである場合が想定されていなかった。ACEを付けた
+/// **後**に`collect_dirs_and_files`の`read_dir`が`ERROR_DIRECTORY`(267)で落ちるため、
+/// **ACEは載っているのに`Err`が返る**。呼び出し側（`preflight`のredirector DLL分岐）は
+/// `Err`を「何も起きなかった」と解釈して台帳へ記録せず、撤収経路の無い孤立ACEが
+/// `--cow`起動のたびに1件ずつ実マシンに積み上がっていた（実機に4件残留）。
+///
+/// 管理者権限もAppContainerプロファイル作成も要らない——付与先には
+/// `traverse_capability_sid`（`DeriveCapabilitySidsFromName`による純粋な導出。プロファイルを
+/// 作らない）を使い、対象はテストが自分で作った一時ファイルなので、マシンには何も残らない。
+/// そのため`#[ignore]`にせず通常の`cargo test`で走らせる（この欠陥の再発は、実機E2Eを
+/// 回さなければ気付けない類のものにしてはいけない）。
+#[test]
+fn grant_ace_inheritable_access_on_a_file_succeeds_and_leaves_the_ace() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("redirector-like.dll");
+    std::fs::write(&file, b"not really a dll").expect("write probe file");
+
+    let sid = traverse_capability_sid().expect("derive traverse capability SID");
+
+    let result = grant_ace_inheritable_access(&file, sid.as_psid(), FsAccess::ReadExec);
+    assert!(
+        result.is_ok(),
+        "granting to a file must not report failure (BUG-059): {result:?}"
+    );
+
+    let required = fs_access_mask(FsAccess::ReadExec);
+    let mask = sid_ace_mask(&file, sid.as_psid()).expect("read back the ACE");
+    let mask = mask.expect("the file must carry an ACE for the capability SID after the grant");
+    assert_eq!(
+        mask & required,
+        required,
+        "the ACE on the file must cover the requested access (got {mask:#x}, want {required:#x})"
+    );
+
+    // **撤収側も対称でなければ意味が無い。** `end_session`は`revoke_ace_recursive`を通して
+    // 剥がすので、そちらがファイルで落ちるなら台帳に正しく載っていても孤立ACEは残り続ける
+    // （実機E2Eでこの順序で判明した——付与側だけ直しても`end_session`が剥がせなかった）。
+    revoke_ace_recursive(&file, sid.as_psid()).expect("revoke_ace_recursive on a file");
+    assert_eq!(
+        sid_ace_mask(&file, sid.as_psid()).expect("read back after revoke"),
+        None,
+        "revoke_ace_recursive must remove the ACE from a file root too (BUG-059, revoke side)"
+    );
+}
+
 /// `grant_traverse_chain`が祖先を浅い方(ドライブルート)から深い方(target自身)へ、
 /// 重複なく列挙することを確認する（Win32呼び出しを伴わない純粋なパス演算のみ、
 /// クロスプラットフォームで実行可能）。実際のACE付与成否は
