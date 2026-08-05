@@ -1351,3 +1351,275 @@ fn tier2a_net_policy_matrix() {
     }
     assert_eq!(passed, total, "{passed}/{total} network policy matrix cases passed (see per-case JSON above for details)");
 }
+
+// ============================================================================
+// W6: `--fs-allow`を実CLIフラグ経由で通すE2E
+//
+// `plans/PLAN-M15.7-FOLLOWUP.md` F10が指摘していた穴——`--fs-allow`は`preflight`の
+// 単体テストでは測られていたが、**実CLIフラグからサンドボックスの子まで通す経路**の
+// 回帰テストが1件も無かった。D-45（fs-allowの祖先へtraverseを付与する）を入れた今、
+// ここが赤くなれば「明示的に許可したパスが使えない」という退行を機械的に検出できる。
+//
+// `dev-elevated-run.exe e2e-fs-allow`（フィルタ`tier2a_fs_allow`）。
+
+/// `--fs-allow`のエントリを`C:\`直下に作る。深い場所（`%TEMP%`等）に置くと、この機で
+/// 既に付与済みの祖先traverseに相乗りしてしまい、**D-45が効いているのか、以前からの
+/// 付与のおかげなのかを区別できない**（RESULTS.md §19の測定と同じ理由）。
+fn fs_allow_case_dir(name: &str) -> PathBuf {
+    let dir = PathBuf::from(format!(r"C:\harness-e2e-fsallow-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create fs-allow target dir");
+    dir
+}
+
+/// ROで許可したエントリは**読めて書けない**。境界はACLなので、書込は子プロセスの側で
+/// `ACCESS_DENIED`にならなければならない。
+fn fs_allow_case_ro_reads_but_cannot_write() -> Result<(), String> {
+    let ws = case_dir("fs-allow-ro");
+    let target = fs_allow_case_dir("ro");
+    std::fs::write(target.join("secret.txt"), "readable").map_err(|e| e.to_string())?;
+
+    let allow = format!("{}", target.display());
+    // PowerShellはパス区切りに`/`を受け付ける。Rustの文字列・シェル・PowerShellの3段で
+    // バックスラッシュを重ねるとエスケープ事故になるので、スクリプト内では`/`で書く。
+    let t = target.display().to_string().replace('\\', "/");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $r = Get-Content -LiteralPath '{t}/secret.txt' -Raw; Write-Output ('READ=' + $r); \
+         try {{ Set-Content -LiteralPath '{t}/written.txt' -Value 'x' -ErrorAction Stop; \
+           Write-Output 'WRITE=OK' }} catch {{ Write-Output 'WRITE=DENIED' }}"
+    );
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(&script),
+        &["--fs-allow", &allow],
+        "fs-allow-ro",
+    );
+    let json = parse_json_stdout(&run)?;
+    let text = json.to_string();
+    if !text.contains("READ=readable") {
+        return Err(format!("read-only fs-allow entry was not readable: {text}"));
+    }
+    if !text.contains("WRITE=DENIED") {
+        return Err(format!(
+            "read-only fs-allow entry must not be writable (boundary is the ACL, not the hook): {text}"
+        ));
+    }
+    let leaked = target.join("written.txt");
+    if leaked.exists() {
+        return Err(format!("the child actually wrote {}", leaked.display()));
+    }
+
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup_on_success(&ws, &[], "fs-allow-ro");
+    Ok(())
+}
+
+/// `:rw`で許可したエントリは**書けて・消せて・移動できる**。
+///
+/// 削除と移動はD-45（`--fs-allow`の祖先へtraverseを付与する）が入るまで失敗していた
+/// （RESULTS.md §19.2）。この2操作は祖先ディレクトリを通過ではなく**オープン**するため、
+/// 対象自身へのACEだけでは足りない。**このケースがD-45の製品経路での回帰テストである。**
+fn fs_allow_case_rw_can_write_delete_and_move() -> Result<(), String> {
+    let ws = case_dir("fs-allow-rw");
+    let target = fs_allow_case_dir("rw");
+    std::fs::write(target.join("to-delete.txt"), "bye").map_err(|e| e.to_string())?;
+    std::fs::write(target.join("to-move.txt"), "move me").map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(target.join("dest")).map_err(|e| e.to_string())?;
+
+    let allow = format!("{}:rw", target.display());
+    let t = target.display().to_string().replace('\\', "/");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         try {{ Set-Content -LiteralPath '{t}/new.txt' -Value 'created' -ErrorAction Stop; \
+           Write-Output 'WRITE=OK' }} catch {{ Write-Output 'WRITE=FAIL' }}; \
+         try {{ Remove-Item -LiteralPath '{t}/to-delete.txt' -ErrorAction Stop; \
+           Write-Output 'DELETE=OK' }} catch {{ Write-Output 'DELETE=FAIL' }}; \
+         try {{ Move-Item -LiteralPath '{t}/to-move.txt' -Destination '{t}/dest/moved.txt' \
+           -ErrorAction Stop; Write-Output 'MOVE=OK' }} catch {{ Write-Output 'MOVE=FAIL' }}"
+    );
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(&script),
+        &["--fs-allow", &allow],
+        "fs-allow-rw",
+    );
+    let json = parse_json_stdout(&run)?;
+    let text = json.to_string();
+    for expected in ["WRITE=OK", "DELETE=OK", "MOVE=OK"] {
+        if !text.contains(expected) {
+            return Err(format!(
+                "`--fs-allow <path>:rw` must allow write/delete/move (D-45: the fs-allow ancestors \
+                 get a traverse ACE); missing {expected} in: {text}"
+            ));
+        }
+    }
+    if target.join("to-delete.txt").exists() {
+        return Err("delete reported OK but the file is still there".to_string());
+    }
+    if !target.join("dest").join("moved.txt").exists() {
+        return Err("move reported OK but the destination file does not exist".to_string());
+    }
+
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup_on_success(&ws, &[], "fs-allow-rw");
+    Ok(())
+}
+
+/// `--fs-allow`が付けたACEは**セッション終了で失効する**（D-37の仕様、`docs/STATUS.md`が
+/// 不変条件として明記）。BUG-057は「昇格経由の付与がsession ledgerに載らず、
+/// `end_session`の自動撤収から漏れる」欠陥だった——`harness fs revoke`は効くので気付きにくい。
+/// harnessプロセスが終了した後に対象へAppContainer SIDのACEが残っていないことを確かめる。
+fn fs_allow_case_ace_is_revoked_when_the_session_ends() -> Result<(), String> {
+    let ws = case_dir("fs-allow-revoke");
+    let target = fs_allow_case_dir("revoke");
+    std::fs::write(target.join("f.txt"), "x").map_err(|e| e.to_string())?;
+
+    let allow = format!("{}:rw", target.display());
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns("Write-Output 'ran'"),
+        &["--fs-allow", &allow],
+        "fs-allow-revoke",
+    );
+    parse_json_stdout(&run)?;
+
+    // harnessは既に終了している。ACEが残っていれば、それは撤収経路から漏れたということ。
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "@((Get-Acl '{}').Access | Where-Object {{ $_.IdentityReference -like 'S-1-15-2-*' }}).Count",
+                target.display()
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("failed to run Get-Acl: {e}"))?;
+    let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if count != "0" {
+        return Err(format!(
+            "BUG-057: {} still carries {count} AppContainer ACE(s) after the harness session ended; \
+             `--fs-allow` grants must expire with the session (D-37)",
+            target.display()
+        ));
+    }
+
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup_on_success(&ws, &[], "fs-allow-revoke");
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn tier2a_fs_allow_matrix() {
+    let cases: Vec<(&str, CaseFn)> = vec![
+        ("ro-reads-but-cannot-write", fs_allow_case_ro_reads_but_cannot_write),
+        ("rw-write-delete-move", fs_allow_case_rw_can_write_delete_and_move),
+        ("ace-revoked-at-session-end", fs_allow_case_ace_is_revoked_when_the_session_ends),
+    ];
+    let mut passed = 0;
+    let total = cases.len();
+    for (name, f) in cases {
+        if run_named_case(name, f) {
+            passed += 1;
+        }
+    }
+    assert_eq!(passed, total, "{passed}/{total} fs-allow cases passed (see per-case JSON above)");
+}
+
+// ============================================================================
+// W7: netfilterdからの連鎖起動（追加UACなし経路）をassertにする
+//
+// `docs/STATUS.md`のOS監査収集器・残課題`a`は「`--policy-learn`＋ドメインポリシー有効の
+// 組み合わせで実際にUACが増えないことは未確認」だった。「UACが増えないことを目視で確認」は
+// **人間にしか実行できず、再実行も自動検証もできない**。同じ事実を機械的に取り直す。
+//
+// 経路(A)（netfilterdの昇格トークンから`harness-policy-learnd.exe`を連鎖起動する＝追加UACなし）
+// が採られたことは、次の2つと同値である。
+//
+// 1. 「パイプを用意できなかった」「連鎖先が応答しないので直接起動へフォールバックする」の
+//    どちらの警告もstderrに出ていない（`run_agent.rs`のこの2箇所以外に経路(A)を諦める道は無い）
+// 2. 収集器が実際に動いて`fs-audit.jsonl`を書いている
+//
+// `dev-elevated-run.exe e2e-chain-launch`（フィルタ`tier2a_chain_launch`）。
+
+/// 経路(A)を諦めたときに`run_agent.rs`が出す警告。**どちらもstderrに現れてはいけない。**
+const CHAIN_LAUNCH_GIVE_UP_MARKERS: &[&str] = &[
+    // `prepare_pipe`が失敗した（run_agent.rs、`policy_learn_prelude`）
+    "could not prepare the policy-learning pipe",
+    // 連鎖先が応答せず`runas`直接起動へ落ちた（UACが1回増える）
+    "falling back to launching it directly",
+];
+
+fn chain_launch_case_no_extra_uac_path_is_taken() -> Result<(), String> {
+    let ws = case_dir("chain-launch");
+    // 3つとも必要な条件である。
+    // - `--net-allow-domain`: ドメインポリシーが無いと`netfilterd`自体が起動せず、
+    //   連鎖の**親**が存在しない（経路(A)が原理的に成立しない）
+    // - `--staged`: 既定のLive staging modeでは`sandbox_dir`が`None`になり、
+    //   `fs-audit.jsonl`の置き場が決まらないので収集器はそもそも起動しない
+    //   （`run_agent.rs`が「could not resolve a sandbox session directory」と警告して無効化する）
+    // - `--policy-learn true`: 収集器を有効にする
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns("Get-Content -LiteralPath 'C:/Windows/System32/config/SAM' -ErrorAction SilentlyContinue; Write-Output 'ran'"),
+        &["--staged", "--policy-learn", "true", "--net-allow-domain", "example.com"],
+        "chain-launch",
+    );
+    parse_json_stdout(&run)?;
+
+    for marker in CHAIN_LAUNCH_GIVE_UP_MARKERS {
+        if run.stderr.contains(marker) {
+            return Err(format!(
+                "the chain-launch path (A) was abandoned -- stderr contains {marker:?}, which means \
+                 the collector was launched via `runas` instead (one extra UAC prompt). \
+                 stderr={}",
+                run.stderr
+            ));
+        }
+    }
+
+    // 収集器が実際に動いた証拠。`.harness/sandbox/session-*/fs-audit.jsonl`。
+    let sandbox_dir = ws.join(".harness").join("sandbox");
+    let audit = std::fs::read_dir(&sandbox_dir)
+        .map_err(|e| {
+            format!(
+                "no sandbox dir at {}: {e}\n--- harness stderr ---\n{}",
+                sandbox_dir.display(),
+                run.stderr
+            )
+        })?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join("fs-audit.jsonl"))
+        .find(|p| p.exists());
+    let Some(audit) = audit else {
+        return Err(format!(
+            "no fs-audit.jsonl under {} -- the collector never wrote anything, so the chain launch \
+             did not actually produce a working collector. stderr={}",
+            sandbox_dir.display(),
+            run.stderr
+        ));
+    };
+    let body = std::fs::read_to_string(&audit).map_err(|e| e.to_string())?;
+    if body.trim().is_empty() {
+        return Err(format!("{} exists but is empty", audit.display()));
+    }
+
+    cleanup_on_success(&ws, &[], "chain-launch");
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn tier2a_chain_launch_uses_the_no_extra_uac_path() {
+    let cases: Vec<(&str, CaseFn)> = vec![("no-extra-uac", chain_launch_case_no_extra_uac_path_is_taken)];
+    let mut passed = 0;
+    let total = cases.len();
+    for (name, f) in cases {
+        if run_named_case(name, f) {
+            passed += 1;
+        }
+    }
+    assert_eq!(passed, total, "{passed}/{total} chain-launch cases passed (see per-case JSON above)");
+}

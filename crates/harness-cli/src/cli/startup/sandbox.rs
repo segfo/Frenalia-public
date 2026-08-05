@@ -77,6 +77,25 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
     } else {
         Some(sandbox_dir_for_session(&session.id()))
     };
+    // **ここで実際に作る。** このディレクトリは`net-audit.jsonl`/`fs-audit.jsonl`の置き場として
+    // 昇格ヘルパー（`harness-netfilterd`・`harness-policy-learnd`）へ渡され、受け取った側は
+    // D-44の検証で`canonicalize`する——存在しないパスは正規化できないので**起動が失敗する**。
+    // 監査ログの書き手はどちらも「最初の1件を書くときに親を`create_dir_all`する」遅延作成
+    // （`net_proxy.rs`の`push`）なので、新規ワークスペースでは検証の時点でまだ存在しない。
+    // その結果`--net-allow-domain`はWFPを起動できずfail-closed（通信が一切できない）になり、
+    // `--policy-learn`は収集器を起動できずに黙って無効化されていた。
+    // 遅延作成に頼れるのは書き手が1人のときだけで、**パスを他プロセスへ渡す瞬間から
+    // 「存在すること」が契約になる**。
+    if let Some(dir) = &sandbox_dir {
+        let path = workspace_root.join(dir);
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            eprintln!(
+                "warning: could not create the sandbox session directory {} ({e}); \
+                 network/FS audit sinks that depend on it will be unavailable this session",
+                path.display()
+            );
+        }
+    }
     let read_scope = settings
         .read
         .clone()
