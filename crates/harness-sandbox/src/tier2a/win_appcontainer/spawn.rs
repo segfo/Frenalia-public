@@ -236,6 +236,13 @@ impl AppContainerChild {
         KillToken(self.process)
     }
 
+    /// 子プロセスのPID。M15.7のOS監査収集器が「このETWイベントは誰のものか」を
+    /// 突き合わせるのに使う（ETWは`EventHeader.ProcessId`しか運ばないため、
+    /// 起動側でPIDを知っておく必要がある）。
+    pub fn pid(&self) -> u32 {
+        unsafe { windows::Win32::System::Threading::GetProcessId(self.process) }
+    }
+
     /// D-38/`DESIGN-MCP.md` §3.3: 一問一答ではなく、プロセスを生かしたまま何度も往復させる
     /// 長寿命セッションへ変換する（MCP stdio用）。`want_stdin: true`で起動したものだけが
     /// 変換できる——書き込み口が無いセッションは往復できない。

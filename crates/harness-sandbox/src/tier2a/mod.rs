@@ -35,6 +35,10 @@ pub mod traverse_ledger;
 
 #[cfg(windows)]
 pub mod netfilterd;
+/// ポリシー学習ヘルパー（M15.7、OS監査によるFSアクセス拒否の収集）。ETWセッションが
+/// Windows専用のため、モジュールごとwindows専用にする。
+#[cfg(windows)]
+pub mod policy_learnd;
 #[cfg(windows)]
 pub mod privhelper;
 #[cfg(windows)]

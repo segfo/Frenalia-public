@@ -35,6 +35,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         run_shell_path_extra,
         fs_passthrough,
         settings_fs_paths,
+        policy_learn: policy_learn_enabled,
         wfp_prelude,
         write_mode,
         shell_tier,
@@ -108,6 +109,28 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     #[cfg(windows)]
     let mcp_netfilter_entries = mcp_startup.netfilter_entries();
 
+    // M15.7: OS監査収集器を**netfilterdの昇格トークンから連鎖起動する**ための接続先を先に作る
+    // （追加UACを出さない経路）。netfilterdが起動しない構成ではこのパイプは使われず、
+    // dropで閉じて`runas`の直接起動へフォールバックする。
+    #[cfg(windows)]
+    let policy_learn_prelude: Option<
+        harness_sandbox::tier2a::policy_learnd::client::PreparedLearnPipe,
+    > = if policy_learn_enabled && shell_tier.tier == harness_core::ShellTier::Tier2a {
+        match harness_sandbox::tier2a::policy_learnd::client::prepare_pipe() {
+            Ok(prepared) => Some(prepared),
+            Err(e) => {
+                eprintln!(
+                    "warning: could not prepare the policy-learning pipe ({e}); will fall back to                      launching the collector directly (one extra UAC prompt)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    let policy_learn_pipe_name = policy_learn_prelude.as_ref().map(|p| p.name().to_string());
+
     // WFPシナリオ(A)/(B)/(C)の最終確定。`shell_tier`が実際にTier2aへ着地し、かつ
     // 許可ドメインがあるときだけ有効化する。
     #[cfg(windows)]
@@ -146,6 +169,10 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                             // サーバごとのフィルタも張る（それぞれ自分の専用プロキシの
                             // ポートだけ許可される）。
                             mcp_profiles: mcp_netfilter_entries.clone(),
+                            // M15.7/D-44: 昇格側が`audit_log_path`を検証するための基準。
+                            // 渡さないと監査ログが無効化される（fail-safe側）。
+                            workspace_root: Some(workspace_root.clone()),
+                            chain_launch_policy_learnd: policy_learn_pipe_name.clone(),
                         },
                     ) {
                         Ok(handle) => Some(handle),
@@ -175,6 +202,8 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                     audit_log_path: net_proxy.audit_log_path.clone(),
                     // D-38: 上のシナリオ(A)と同じ理由でMCPサーバ分も一緒に張る。
                     mcp_profiles: mcp_netfilter_entries.clone(),
+                    workspace_root: Some(workspace_root.clone()),
+                    chain_launch_policy_learnd: policy_learn_pipe_name.clone(),
                 },
             ) {
                 Ok(handle) => Some(handle),
@@ -277,6 +306,101 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         net_proxy.enforced_by_wfp = true;
     }
 
+    // M15.7: OS監査によるFSアクセス拒否の収集（`--policy-learn`、`plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。
+    //
+    // **`ToolCtx`へは載せない。** 収集器は完全に受動的で`run_shell`の挙動を1つも変えないため、
+    // モデルから見える制約は不変であり`EnvironmentFacts`の更新も要らない（`ToolCtx`へ足すと
+    // 2段のコンパイル時ゲートが正しく発火してしまう）。`net_wfp`と同じくここでハンドルを持ち、
+    // 同じ場所でteardownする。
+    //
+    // 起動経路は2つ（`privhelper`→`netfilterd`のシナリオ(A)/(B)と同じ構図）:
+    // - **(A) 連鎖起動** — netfilterdが自分の昇格トークンのまま起こす。**追加UACなし**
+    // - **(B) 直接runas** — netfilterdが居ない/連鎖が失敗したときのフォールバック。UACが1回
+    #[cfg(windows)]
+    let policy_learn: Option<harness_sandbox::tier2a::policy_learnd::client::PolicyLearnHandle> = {
+        use harness_sandbox::tier2a::policy_learnd::{client as learn_client, LearnPolicy};
+
+        // 収集できない条件を先に潰し、残った場合だけ起動する。潰す条件ごとに理由を出すのは、
+        // 「指定したのに何も集まらない」が黙って起きるのを防ぐため。
+        let disabled_reason = if !policy_learn_enabled {
+            Some(String::new()) // 明示的に無効。警告は出さない
+        } else if shell_tier.tier != harness_core::ShellTier::Tier2a {
+            Some(format!(
+                "--policy-learn only collects denials from Tier2a (AppContainer) child                  processes; this session is running at {}, so nothing will be collected",
+                shell_tier.tier.label()
+            ))
+        } else if sandbox_dir.is_none() {
+            Some(
+                "--policy-learn could not resolve a sandbox session directory to write                  fs-audit.jsonl into; collection is disabled this session"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        if let Some(reason) = disabled_reason {
+            if !reason.is_empty() {
+                eprintln!("warning: {reason}");
+            }
+            drop(policy_learn_prelude);
+            None
+        } else {
+            let sink = workspace_root
+                .join(sandbox_dir.as_ref().expect("checked in disabled_reason"))
+                .join("fs-audit.jsonl");
+            let policy = LearnPolicy {
+                session_profile: harness_sandbox::tier2a::session_profile::current_profile_name(),
+                workspace_root: workspace_root.clone(),
+                fs_audit_log_path: sink,
+                harness_pid: Some(std::process::id()),
+            };
+
+            // (A) netfilterdが起動していて、かつパイプを用意できていれば連鎖起動を試す。
+            let chained = match (policy_learn_prelude, net_wfp.is_some()) {
+                (Some(prepared), true) => {
+                    match learn_client::connect_after_chain_launch(
+                        prepared.into_handle(),
+                        policy.clone(),
+                    ) {
+                        Ok(handle) => Some(handle),
+                        Err(e) => {
+                            eprintln!(
+                                "warning: the chain-launched collector did not answer ({e});                                  falling back to launching it directly (one UAC prompt)"
+                            );
+                            None
+                        }
+                    }
+                }
+                (prepared, _) => {
+                    drop(prepared);
+                    None
+                }
+            };
+
+            // (B) フォールバック。D-43: 起こせなくても**セッションは止めない**。
+            let handle = match chained {
+                Some(handle) => Some(handle),
+                None => match learn_client::start(policy) {
+                    Ok(handle) => Some(handle),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: --policy-learn could not start the OS audit collector                              ({e}); the session continues without it. `harness policy suggest`                              still works from the preflight / network / CoW records."
+                        );
+                        None
+                    }
+                },
+            };
+
+            if let Some(handle) = handle.as_ref() {
+                if !handle.etw_available() {
+                    eprintln!(
+                        "warning: the policy-learning collector started but could not open an                          ETW session; no denials will be collected this session (the reason is                          recorded in fs-audit.jsonl)"
+                    );
+                }
+            }
+            handle
+        }
+    };
 
     // MCP手順5（`startup::mcp`のモジュールdoc）: **WFPの適用が終わったここで初めて**
     // サーバのプロセスを起こす。
@@ -382,6 +506,26 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     if let Some(handle) = net_wfp {
         if let Err(e) = handle.stop() {
             eprintln!("warning: failed to cleanly tear down WFP netfilterd session: {e}");
+        }
+    }
+
+    // M15.7: OS監査収集器の撤収。ここへ到達せずに落ちた場合（クラッシュ・Ctrl+C）は、
+    // `PolicyLearnHandle`のDropがパイプを閉じ、収集器側の`ReadFile`が`ERROR_BROKEN_PIPE`に
+    // なって自発的に撤収する（netfilterdと同じフェイルセーフ）。
+    #[cfg(windows)]
+    if let Some(handle) = policy_learn {
+        match handle.stop() {
+            Ok(written) => {
+                if written > 0 {
+                    eprintln!(
+                        "note: --policy-learn recorded {written} denied file access(es); run \
+                         `harness policy suggest` to see what to allow"
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "warning: failed to cleanly tear down the policy-learning collector: {e}"
+            ),
         }
     }
 

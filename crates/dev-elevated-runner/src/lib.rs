@@ -47,6 +47,65 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture", "win_appcontainer::cow_diagnostics",
         ],
     ),
+    // M15.7 A-3: ETW実現性スパイク（判定ゲート）。`Microsoft-Windows-Kernel-File`の
+    // リアルタイムセッションでACL拒否が観測できるかを実機で確かめる。
+    // M15.7: Global Object Access Auditing を AppContainer の package SID へ絞れるかの実測。
+    // **マシンの監査ポリシーを一時的に変更する**（テスト側のDropガードで撤去）。
+    (
+        "etw-audit-scope",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "can_global_object_access_auditing_be_scoped",
+        ],
+    ),
+    // M15.7: 許可レベル×操作種別の真理値表（拒否から操作種別を推定できるかの実測）。
+    // M15.7: 削除の拒否がCreate段階で起きるのか、SetInformation段階なのかの実測。
+    (
+        "etw-delete-denial",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "where_does_a_delete_denial_surface",
+        ],
+    ),
+    // M15.7 / 残課題a-2: 「開けるが操作で落ちる」拒否がどのイベント列として現れるか。
+    (
+        "etw-operation-denial",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "where_does_an_operation_stage_denial_surface",
+        ],
+    ),
+    (
+        "etw-access-matrix",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "access_denials_by_granted_level_and_operation",
+        ],
+    ),
+    // M15.7: 既知の未検証項目（EventsLost・変換不能パス・相関取りこぼし・短命プロセス帰属率・
+    // DELETE_PATHの失敗時発火）の実測。
+    (
+        "etw-diagnostics",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "policy_learnd::etw::diagnostics_tests",
+        ],
+    ),
+    // M15.7 A-4d: AppContainer子プロセスでのETW実測（拒否の観測・PID帰属・PackageFullNameの有無）。
+    (
+        "e2e-policy-learn",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "appcontainer_child_denials",
+        ],
+    ),
+    (
+        "spike-etw-fs",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "policy_learnd::etw::spike_tests",
+        ],
+    ),
     (
         "e2e-loopback-exemption",
         &[

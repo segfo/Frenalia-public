@@ -26,6 +26,9 @@ name = "dev-elevated-run"
 path = "src/client.rs"
 
 [dependencies]
+# D-44の逃がし弁の環境変数名を**文字列として複製しない**ために依存する（規則5）。
+# 名前がずれると、E2Eが「ゲートに引っ掛かって全滅」という形で静かに壊れる。
+harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

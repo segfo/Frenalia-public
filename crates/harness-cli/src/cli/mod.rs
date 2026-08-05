@@ -177,6 +177,15 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: NetAction,
     },
+    /// ポリシー学習ヘルパー（M15.7、`plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。
+    /// サンドボックスが拒否した資源を4経路（preflight・network・CoW・OS監査）から集め、
+    /// 「では何を許せばよいか」を`.harness/settings.json`への差分として提案する。
+    /// **提案が自動適用されることはない**（D-42）——反映は`apply --accept <id>`という
+    /// 明示操作を経てのみ行われ、変更は次回起動から発効する。
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
     /// MCPサーバ宣言の承認台帳（M15.5、`plans/DESIGN-MCP.md` §4.2 D-39）を操作する。
     /// **宣言は承認台帳と一致したときだけ起動に使われる**——`.harness/settings.json`への
     /// 既存の多層防御はすべて「書込」への防御であり、リポジトリに同梱された宣言には一度も
@@ -224,6 +233,81 @@ pub(crate) enum NetAction {
         /// 拒否イベントだけを表示する。
         #[arg(long = "deny-only", default_value_t = false)]
         deny_only: bool,
+        #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
+    },
+}
+
+/// `harness policy`サブコマンドの各操作（M15.7）。
+///
+/// `--source`/`--generalize`は`suggest`と`apply`の**両方**が受け取る。提案idは
+/// 「どの経路をどの粒度で畳んだか」に依存するため、同じ提案を指すには同じ条件で
+/// 再計算する必要があるからである（idだけを別条件で使い回すと別のものが適用される）。
+#[derive(Subcommand)]
+pub(crate) enum PolicyAction {
+    /// 拒否された資源から許可ルールの候補を生成し、`.harness/settings.json`への差分として
+    /// 表示する。**このコマンドは何も書き込まない。**
+    Suggest {
+        /// 対象セッションID（省略時は`.harness/sandbox/`内で最も新しいもの）。
+        #[arg(long)]
+        session: Option<String>,
+        /// 収集源の限定（`all`（既定）/`preflight`/`net`/`cow`/`etw`）。
+        #[arg(long)]
+        source: Option<String>,
+        /// 一般化の度合い（`none`＝畳まない / `dir`（既定）＝同一ディレクトリ配下を親1本へ /
+        /// `auto`＝加えてバージョン番号・ハッシュを`*`へ）。広げるほど頼んでいない場所まで
+        /// 開くため、選ぶのはユーザーである。
+        #[arg(long)]
+        generalize: Option<String>,
+        #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
+    },
+    /// 選んだ提案だけを`.harness/settings.json`へ書き込む（D-42の「明示操作」）。
+    ///
+    /// 「全件受理」のショートハンドは意図的に用意していない。1件でも未知のid・
+    /// `--require-sandbox`と矛盾する提案があれば、**何も書かずに**失敗する（部分適用しない）。
+    /// 書き込んだ変更は次回起動から発効する（harnessは自分のconfigを実行中に再読込しない）。
+    Apply {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        generalize: Option<String>,
+        /// 受理する提案のid（`fs-1`・`net-2`）。カンマ区切り・繰り返し指定の両方に対応する。
+        #[arg(long)]
+        accept: Vec<String>,
+        /// 対話確認を省略する。stdinが端末でない場合（パイプ・CI）は指定が必須。
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+    /// 正規化済みの拒否候補を4経路横断で一覧表示する（提案へ畳む前の生の材料）。
+    Audit {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
+    },
+    /// OS監査収集器（`harness-policy-learnd.exe`）を単体で起動し、指定時間だけFSアクセス拒否を
+    /// 集めてから提案を表示する（M15.7）。**UACが1回出る**——ETWリアルタイムセッションの
+    /// 開始には管理者権限が要るため。
+    ///
+    /// セッション中ずっと集めたい場合は`--policy-learn`フラグを使う。こちらは
+    /// 「この操作をサンドボックス下で走らせたら何が拒否されるか」を単発で調べる用途。
+    ///
+    /// 収集器が起動できない環境（非管理者・ETWプロバイダ不在）でも**エラーにはしない**——
+    /// その事実を明示して、既存3経路の記録だけで提案する（D-43 fail-open）。
+    Learn {
+        /// 収集する秒数。省略時は60秒。
+        #[arg(long, default_value_t = 60)]
+        duration: u64,
+        /// 対象セッションID（省略時は`.harness/sandbox/`内で最も新しいもの）。
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        generalize: Option<String>,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },
@@ -456,6 +540,20 @@ pub(crate) struct Cli {
     #[arg(long = "cow", default_value_t = false, conflicts_with_all = ["staged", "workspace_commit"])]
     cow: bool,
 
+    /// セッション中、OS監査によるFSアクセス拒否の収集を有効にする（M15.7、
+    /// `plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。**指定するとUACが1回出る**——ETWリアルタイム
+    /// セッションの開始に管理者権限が要るため、収集器（`harness-policy-learnd.exe`）を昇格起動する。
+    ///
+    /// 集めた拒否は`.harness/sandbox/session-<id>/fs-audit.jsonl`へ書かれ、`harness policy suggest`が
+    /// 既存3経路（preflight・network・CoW）と合わせて許可ルールの候補を提案する。
+    /// **収集は提案の材料を増やすだけで、権限を自動で広げることは一切しない**（D-42）。
+    ///
+    /// 収集器が起動できなくてもharnessは止まらない（D-43 fail-open）。その場合は
+    /// 「収集できていない」ことが`fs-audit.jsonl`の制御レコードとして残る。
+    /// 省略時は`settings.json`の`policy.learn`→既定(false)の順にフォールバックする。
+    #[arg(long = "policy-learn")]
+    policy_learn: Option<bool>,
+
     /// `--provider mock`用の台本ファイル（`Vec<Vec<StreamEvent>>`のJSON）。
     /// out-of-processのTier2a E2Eテスト専用（`e2e-mock` feature必須）。
     #[cfg(feature = "e2e-mock")]
@@ -472,6 +570,7 @@ pub(crate) struct Cli {
 pub mod cow_cmd;
 pub mod mcp_cmd;
 pub mod net_cmd;
+pub mod policy_cmd;
 pub mod setup;
 pub mod startup;
 pub mod tier3_cmd;
@@ -480,6 +579,7 @@ pub mod workspace_cmd;
 pub(crate) use cow_cmd::*;
 pub(crate) use mcp_cmd::*;
 pub(crate) use net_cmd::*;
+pub(crate) use policy_cmd::*;
 pub(crate) use setup::*;
 pub(crate) use tier3_cmd::*;
 pub(crate) use workspace_cmd::*;

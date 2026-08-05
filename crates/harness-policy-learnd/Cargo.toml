@@ -1,0 +1,10 @@
+[package]
+name = "harness-policy-learnd"
+version.workspace = true
+edition.workspace = true
+
+# ポリシー学習ヘルパー（M15.7、`plans/DESIGN-SANDBOX-APPPOLICY.md` §11）の昇格側バイナリ。
+# `harness-netfilterd`と同じく、binクレートは薄いmainだけを持ち実体は`harness-sandbox`側にある
+# （信頼境界＝ファイル境界、D-35）。
+[dependencies]
+harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }

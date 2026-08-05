@@ -298,6 +298,14 @@ unsafe fn launch_helper_elevated(
     helper_path: &std::path::Path,
     pipe_name: &str,
 ) -> Result<HANDLE, PrivHelperError> {
+    // T-21/D-44: 昇格する前に、その実行ファイルと置き場が非管理者から書けないことを確かめる。
+    // ここを検査しないと、`target\debug\harness-privhelper.exe`を書ける中IL のコードが
+    // 次のUACで管理者実行を取れる（ローカル特権昇格）。既定は拒否、開発機は
+    // `HARNESS_ALLOW_USER_WRITABLE_ELEVATED_HELPERS=1`で警告付き続行。
+    crate::elevated_launch::verify_elevation_target(helper_path).map_err(|e| {
+        PrivHelperError::Win32(format!("refusing to elevate the privilege-separation helper: {e}"))
+    })?;
+
     let verb_w = wide("runas");
     let file_w = wide(&helper_path.to_string_lossy());
     let params_w = wide(pipe_name);

@@ -156,6 +156,12 @@ fn netfilterd_exe_path() -> Result<PathBuf, PrivHelperError> {
 /// 常駐し続けるデーモンであり、ヘルパー自身はこの直後に終了する）。
 unsafe fn launch_netfilterd_chained(pipe_name: &str) -> Result<(), PrivHelperError> {
     let netfilterd_path = netfilterd_exe_path()?;
+    // T-21/D-44: **この経路はUACを出さない**（既に昇格したトークンをそのまま子へ継承させる）ので、
+    // 差し替えられた実行ファイルはユーザーの目に触れずに管理者として走る。runas経路より危険なため、
+    // ここでの検査は特に落とせない。
+    crate::elevated_launch::verify_elevation_target(&netfilterd_path).map_err(|e| {
+        PrivHelperError::Ipc(format!("refusing to chain-launch the WFP daemon: {e}"))
+    })?;
     // コマンドラインの第0引数（実行ファイルパス）はCreateProcessWの規約上quoteが要る。
     let cmdline = format!("\"{}\" {}", netfilterd_path.display(), pipe_name);
     let mut cmdline_w = wide(&cmdline);
@@ -381,8 +387,12 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
 
             let (fs_allow_granted, fs_allow_failures) = if fs_allow_entries.is_empty() {
                 (Vec::new(), Vec::new())
-            } else if !crate::tier2a::session_profile::is_session_profile_name(&session_profile) {
-                log::line("dispatch: rejected a malformed session profile name");
+            // D-38: MCPサーバのプロファイル（`harness.mcp.<token>.<id>`）も、実行ファイルが
+            // システム保護パスにある場合（`C:\Program Files\nodejs`等）にここへ来る。
+            // 検証は`is_harness_profile_name`1本に統一する——2つの述語を呼び分ける形にすると、
+            // 片方の呼び出しを足し忘れたときに検証をすり抜ける経路が生まれる。
+            } else if !crate::tier2a::mcp_profile::is_harness_profile_name(&session_profile) {
+                log::line("dispatch: rejected a malformed appcontainer profile name");
                 let failures = fs_allow_entries
                     .into_iter()
                     .map(|e| {

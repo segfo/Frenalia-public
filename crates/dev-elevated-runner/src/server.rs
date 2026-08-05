@@ -122,6 +122,15 @@ fn main() -> std::process::ExitCode {
                     eprintln!("dev-elevated-runnerd: running `cargo {}`", args.join(" "));
                     match std::process::Command::new("cargo")
                         .args(args)
+                        // M15.7 / D-44: 昇格ヘルパーの起動時DACLゲートは既定で拒否だが、
+                        // 開発ビルドは`target\debug`が必ずユーザー書込可なので必ず引っ掛かる。
+                        // ここで逃がし弁を注入しないと、E2Eが1本も走らなくなる。
+                        // **ゲート自体の検証は`elevated_launch`の専用テストが担う**ので、
+                        // ここで通してもゲートが未検証になることは無い。
+                        .env(
+                            harness_sandbox::elevated_launch::ALLOW_USER_WRITABLE_HELPERS_ENV,
+                            "1",
+                        )
                         .current_dir(&repo_root)
                         .output()
                     {

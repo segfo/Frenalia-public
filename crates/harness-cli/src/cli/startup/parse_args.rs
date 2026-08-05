@@ -65,6 +65,10 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
             Commands::Tier3 { action } => run_tier3_subcommand(action),
             Commands::Cow { action } => run_cow_subcommand(action),
             Commands::Net { action } => run_net_subcommand(action, &workspace_root),
+            // `policy`はワークスペースの監査ログ・ユーザグローバル台帳・`.harness/settings.json`
+            // しか触らず、sandboxもプロバイダ資格情報も要らない（`net`と同じ位置づけ）。
+            // `--require-sandbox`の矛盾チェック（D-42）のため`&cli`も渡す。
+            Commands::Policy { action } => run_policy_subcommand(action, &workspace_root, &cli),
             // `mcp`は`.harness/settings.json`の宣言とユーザグローバルの承認台帳しか触らず、
             // sandboxもプロバイダ資格情報も要らない（`net`/`policy`と同じ位置づけ）。
             Commands::Mcp { action } => run_mcp(action, &workspace_root),

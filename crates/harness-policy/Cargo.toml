@@ -1,0 +1,22 @@
+[package]
+name = "harness-policy"
+version.workspace = true
+edition.workspace = true
+
+# ポリシー学習ヘルパーの提案エンジン（M15.7、`plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。
+#
+# **純粋クレートに保つ**: Win32もファイルI/Oも持たず、入力は文字列、出力は値。理由は3つある。
+# (1) 昇格側（`harness-policy-learnd`）と非特権側（`harness-cli`）が`FsAuditEvent`型を共有する
+#     必要があり、`harness-change-ledger`と同じ「両岸が参照する最小の型クレート」の役割を負う。
+# (2) 正規化・一般化は提案の質そのものなので、実機・管理者権限なしに全数テストできる形にする。
+# (3) 将来TUIから使う余地を残す（`harness-tui`は`harness-cli`に依存できない）。
+#
+# `harness-config`へ依存するのは、提案の出力先が`fs.{read,read_write,read_exec}`・
+# `net.allow_domains`という設定スキーマの語彙そのものだから（語彙を複製しない、規則5）。
+[dependencies]
+harness-config = { version = "0.1.0", path = "../harness-config" }
+# `RequireSandbox`（`gate.rs`の矛盾チェックの入力）だけを使う。判定の語彙を複製しないため
+# 型を借りるのであって、`harness-core`のツール層・プロバイダ層には触れない。
+harness-core = { version = "0.1.0", path = "../harness-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

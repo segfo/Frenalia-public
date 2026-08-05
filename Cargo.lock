@@ -569,6 +569,7 @@ dependencies = [
 name = "dev-elevated-runner"
 version = "0.1.0"
 dependencies = [
+ "harness-sandbox",
  "serde",
  "serde_json",
  "windows",
@@ -1026,6 +1027,7 @@ dependencies = [
  "harness-engine",
  "harness-grant-ledger",
  "harness-mcp",
+ "harness-policy",
  "harness-providers",
  "harness-sandbox",
  "harness-sandbox-vm",
@@ -1128,6 +1130,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-policy"
+version = "0.1.0"
+dependencies = [
+ "harness-config",
+ "harness-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "harness-policy-learnd"
+version = "0.1.0"
+dependencies = [
+ "harness-sandbox",
+]
+
+[[package]]
 name = "harness-privhelper"
 version = "0.1.0"
 dependencies = [
@@ -1169,8 +1188,10 @@ dependencies = [
  "cap-std",
  "directories",
  "harness-change-ledger",
+ "harness-config",
  "harness-core",
  "harness-grant-ledger",
+ "harness-policy",
  "serde",
  "serde_json",
  "tempfile",

@@ -279,3 +279,18 @@ mod cow_containment_tests;
 /// MCPサーバ隔離（D-38）の実機E2E。`docs/STATUS.md`「MCPクライアント機構」残課題#3/#4。
 #[cfg(all(windows, test))]
 mod mcp_e2e_tests;
+
+/// **診断テスト専用**の口。任意のマスク・継承指定でACEを付ける。
+///
+/// 本体の`grant_ace_mask`は`pub(crate)`のままにし、ここだけを`#[cfg(test)]`で開ける
+/// ——「許可レベル×操作」の真理値表（`policy_learnd::etw::access_matrix_tests`）は
+/// マスクを1ビット単位で制御する必要があるが、その自由度を製品コードの公開面へは出さない。
+#[cfg(all(windows, test))]
+pub(crate) fn grant_ace_mask_for_test(
+    path: &std::path::Path,
+    sid: windows::Win32::Security::PSID,
+    access: u32,
+    inheritance: windows::Win32::Security::ACE_FLAGS,
+) -> Result<(), AppContainerError> {
+    acl_grant::grant_ace_mask(path, sid, access, inheritance)
+}

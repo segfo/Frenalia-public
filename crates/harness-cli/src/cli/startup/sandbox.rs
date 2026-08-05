@@ -31,6 +31,9 @@ pub(super) struct SandboxPrepared {
     pub(super) run_shell_path_extra: Vec<String>,
     pub(super) fs_passthrough: Vec<harness_sandbox::FsPassthrough>,
     pub(super) settings_fs_paths: std::collections::HashSet<String>,
+    /// M15.7: セッション中のOS監査収集を有効にするか（`--policy-learn`→`settings.policy.learn`→false）。
+    /// **`ToolCtx`には載せない**——収集器は受動的で`run_shell`の挙動を変えないため。
+    pub(super) policy_learn: bool,
     #[cfg(windows)]
     pub(super) wfp_prelude: Option<harness_sandbox::tier2a::netfilterd::PreparedPipe>,
     #[cfg(not(windows))]
@@ -105,6 +108,12 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
             net_app.allow_apps.push(app.clone());
         }
     }
+    // M15.7: `--policy-learn`が最優先、無指定なら`settings.json`の`policy.learn`、既定false
+    // （オプトイン。有効化するとUACが1回出るため、黙って有効にはしない）。
+    let policy_learn = cli
+        .policy_learn
+        .unwrap_or_else(|| settings.policy.clone().unwrap_or_default().learn_enabled());
+
     let run_shell_path_extra = settings.run_shell.clone().unwrap_or_default().path_extra();
 
     // MCPサーバ宣言（M15.5）。**ここでは解釈だけ**で、承認照合も起動も行わない
@@ -313,6 +322,7 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
         run_shell_path_extra,
         fs_passthrough,
         settings_fs_paths,
+        policy_learn,
         wfp_prelude,
         write_mode,
         shell_tier,

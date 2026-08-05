@@ -58,6 +58,34 @@ pub struct Settings {
     /// そのため**この階層はマージだけを担当し、解釈は`harness_mcp::parse_mcp_settings`が行う**。
     /// 設定階層のディープマージ（ユーザ→プロジェクト）はこの`Value`に対して正しく効く。
     pub mcp: Option<serde_json::Value>,
+    /// ポリシー学習ヘルパー設定（M15.7、`plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。省略時は
+    /// `PolicySettings::default()`（収集は無効・一般化は`dir`）。
+    pub policy: Option<PolicySettings>,
+}
+
+/// `.harness/settings.json`の`policy`キー（M15.7）。
+///
+/// ```jsonc
+/// "policy": { "learn": false, "generalize": "dir" }
+/// ```
+///
+/// **`learn`は収集の有効化だけを表し、提案の適用には一切関与しない**（D-42）。
+/// 設定ファイルから許可ルールが自動で増える経路は、この機構のどこにも存在しない。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PolicySettings {
+    /// セッション中にOS監査収集器を起動するか（CLIの`--policy-learn`が優先）。
+    /// **有効にするとUACが1回出る**（収集器はETWセッションのため昇格が要る）。
+    pub learn: Option<bool>,
+    /// `harness policy suggest`の既定の一般化度合い（`none` | `dir` | `auto`）。
+    /// CLIの`--generalize`が優先。
+    pub generalize: Option<String>,
+}
+
+impl PolicySettings {
+    /// セッション中の収集が有効か（既定は無効＝オプトイン）。
+    pub fn learn_enabled(&self) -> bool {
+        self.learn.unwrap_or(false)
+    }
 }
 
 /// `.harness/settings.json`の`cognition`キー。
@@ -184,11 +212,26 @@ pub struct FsSettings {
     pub read_exec: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// serde表現（`read`/`read_write`/`read_exec`）は`fs.{read,read_write,read_exec}`の設定キー名と
+/// 一致させる。`harness-policy`の提案・`fs-audit.jsonl`のイベントがこの綴りをそのまま運ぶため
+/// （`plans/DESIGN-SANDBOX-APPPOLICY.md` §11.1「`access`は設定スキーマと同じ語彙へ寄せる」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FsAccess {
     Read,
     ReadWrite,
     ReadExec,
+}
+
+impl FsAccess {
+    /// `fs.{read,read_write,read_exec}`の設定キー名。
+    pub fn settings_key(self) -> &'static str {
+        match self {
+            FsAccess::Read => "read",
+            FsAccess::ReadWrite => "read_write",
+            FsAccess::ReadExec => "read_exec",
+        }
+    }
 }
 
 impl FsSettings {

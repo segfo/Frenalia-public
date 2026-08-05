@@ -31,6 +31,9 @@
 
 // --- Tier非依存 ---
 
+/// 昇格ヘルパーの起動側・受信側に共通するガード（T-21/D-44、監査シンクのパス検証）。
+/// **windows専用ではない**（パス検証は純粋で全プラットフォームでテストできる）。
+pub mod elevated_launch;
 pub mod manifest;
 pub mod overlay;
 pub mod read_scope;

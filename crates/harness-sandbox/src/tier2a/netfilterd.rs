@@ -92,6 +92,29 @@ pub struct NetfilterPolicy {
     /// 各エントリはそのサーバ専用プロキシのloopbackポートだけを許可する。
     #[serde(default)]
     pub mcp_profiles: Vec<McpNetfilterPolicy>,
+    /// workspaceルート。**`audit_log_path`を昇格側で検証するためだけに運ぶ**（M15.7 / D-44）。
+    ///
+    /// これが無いと、非昇格の親が渡した任意`PathBuf`へ昇格daemonが追記することになり、
+    /// **管理者権限での任意パス追記プリミティブ**になる。基準を親から受け取る点は変わらないが、
+    /// 「`<workspace_root>/.harness/sandbox/`配下であること」という制約は受信側で強制できるので、
+    /// 親が嘘の基準を送っても書ける先はその嘘の基準の配下に限られる——`C:\Windows`のような
+    /// 任意の場所へは向けられない（`crate::elevated_launch::validate_audit_sink_path`が
+    /// reparse pointも解決してから再確認する）。
+    ///
+    /// **追加は必ず末尾へ**（`apply_rules_request_json_wire_format_is_stable`が表現を固定している）。
+    #[serde(default)]
+    pub workspace_root: Option<PathBuf>,
+    /// M15.7: OS監査収集器（`harness-policy-learnd.exe`）を、このdaemonの昇格トークンのまま
+    /// 連鎖起動する先のパイプ名。`None`なら連鎖起動しない。
+    ///
+    /// **これがあると`--policy-learn`で追加のUACが出ない。** 無い場合、非特権側は
+    /// `policy_learnd::client::start`（`runas`）へフォールバックしUACが1回増える
+    /// ——機能は同じで、増えるのはプロンプトの回数だけ（`privhelper`→`netfilterd`の
+    /// シナリオ(A)/(B)と同じ構図）。
+    ///
+    /// **追加は必ず末尾へ**（`apply_rules_request_json_wire_format_is_stable`が表現を固定している）。
+    #[serde(default)]
+    pub chain_launch_policy_learnd: Option<String>,
 }
 
 /// 1つのMCPサーバに対する出口ポリシー（D-38）。
@@ -185,6 +208,11 @@ unsafe fn launch_daemon_elevated(
     daemon_path: &std::path::Path,
     pipe_name: &str,
 ) -> Result<HANDLE, NetfilterError> {
+    // T-21/D-44: 昇格する前に、その実行ファイルと置き場が非管理者から書けないことを確かめる。
+    crate::elevated_launch::verify_elevation_target(daemon_path).map_err(|e| {
+        NetfilterError::Win32(format!("refusing to elevate the WFP daemon: {e}"))
+    })?;
+
     let verb_w = wide("runas");
     let file_w = wide(&daemon_path.to_string_lossy());
     let params_w = wide(pipe_name);
@@ -548,9 +576,29 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
     // D-37/D-38: フィルタの条件になるpackage SIDは、要求で受け取ったプロファイル名から導出する。
     // 名前の形を先に検証し、harness由来のプロファイル（`run_shell`セッション用またはMCPサーバ用）
     // 以外は拒否する。ここが緩むと、非特権側が任意のAppContainerへWFPフィルタを張らせられる。
+    // M15.7 / D-44: 監査ログの書込先を**受信側で**検証する。親（非昇格）は攻撃者と同じ権限で
+    // 動きうるので（P-01）、送信側で検証しても意味が無い。検証はプロファイルごとではなく
+    // ここで1回だけ行う——同じ値を複数の`apply_one`へ配るので、判定が分かれる余地を作らない。
+    //
+    // `workspace_root`を運ばない旧形式の要求は**監査ログを無効化して続行する**。WFPの出口強制
+    // そのものは監査に依存しないため、境界は落とさずに任意パス追記だけを閉じられる（P-07）。
+    let audit_log_path = match (&policy.audit_log_path, &policy.workspace_root) {
+        (Some(path), Some(root)) => {
+            match crate::elevated_launch::validate_audit_sink_path(path, root) {
+                Ok(resolved) => Some(resolved),
+                Err(e) => {
+                    let message = format!("rejected audit log path: {e}");
+                    send_response(pipe, &NetfilterResponse::Err(message.clone()))?;
+                    return Err(NetfilterError::Ipc(message));
+                }
+            }
+        }
+        (Some(_), None) | (None, _) => None,
+    };
+
     let mut sessions: Vec<WfpSession> = Vec::new();
     for target in policy_targets(&policy) {
-        match apply_one(&target, policy.audit_log_path.clone()) {
+        match apply_one(&target, audit_log_path.clone()) {
             Ok(session) => sessions.push(session),
             Err(e) => {
                 // 1つでも張れなければ全体を失敗させる（fail-closed）。既に張った分は
@@ -565,6 +613,18 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
         }
     }
     send_response(pipe, &NetfilterResponse::Applied)?;
+
+    // M15.7: OS監査収集器の連鎖起動。**WFPの適用が終わってから**行う（順序に依存は無いが、
+    // 出口強制の確立を遅らせないため後ろに置く）。
+    //
+    // 失敗はベストエフォートで無視する——収集器は境界ではない（P-07）ので、起こせなくても
+    // WFPの出口強制は続く。非特権側は`Started`が来ないことでタイムアウトし、`runas`での
+    // 直接起動へフォールバックできる。
+    if let Some(learn_pipe) = policy.chain_launch_policy_learnd.as_deref() {
+        if let Err(e) = unsafe { launch_policy_learnd_chained(learn_pipe) } {
+            eprintln!("harness-netfilterd: could not chain-launch the policy-learning collector: {e}");
+        }
+    }
 
     // 2回目: Teardown、または親のクラッシュによるパイプ切断を待つ。
     let teardown_result = read_framed_timeout(pipe, DAEMON_WAIT_FOR_TEARDOWN_TIMEOUT);
@@ -602,6 +662,56 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
     session_teardown.map_err(|e| NetfilterError::Ipc(e.to_string()))
 }
 
+/// 昇格済みトークンのまま`harness-policy-learnd.exe`を子として起動する（M15.7）。
+///
+/// `ShellExecuteExW(runas)`は使わない——既に管理者トークンを持つプロセスからの通常の
+/// `CreateProcessW`はそのトークンを子へ継承させるため、2回目のUACが出ない。これが
+/// この経路の存在理由そのものである（`privhelper`→`netfilterd`と同じ構図）。
+///
+/// **UACを出さない経路なので、差し替えられた実行ファイルはユーザーの目に触れずに管理者として走る。**
+/// したがってD-44の配置検査はここでも落とせない。
+unsafe fn launch_policy_learnd_chained(pipe_name: &str) -> Result<(), NetfilterError> {
+    let current = std::env::current_exe()
+        .map_err(|e| NetfilterError::Win32(format!("failed to resolve current exe: {e}")))?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| NetfilterError::Win32("current exe has no parent directory".to_string()))?;
+    let collector = dir.join("harness-policy-learnd.exe");
+
+    crate::elevated_launch::verify_elevation_target(&collector).map_err(|e| {
+        NetfilterError::Win32(format!("refusing to chain-launch the collector: {e}"))
+    })?;
+
+    // 第0引数（実行ファイルパス）はCreateProcessWの規約上quoteが要る。
+    let cmdline = format!("\"{}\" {}", collector.display(), pipe_name);
+    let mut cmdline_w = wide(&cmdline);
+    let startup_info = windows::Win32::System::Threading::STARTUPINFOW {
+        cb: std::mem::size_of::<windows::Win32::System::Threading::STARTUPINFOW>() as u32,
+        dwFlags: windows::Win32::System::Threading::STARTF_USESHOWWINDOW,
+        wShowWindow: SW_HIDE.0 as u16,
+        ..Default::default()
+    };
+    let mut process_info = windows::Win32::System::Threading::PROCESS_INFORMATION::default();
+    windows::Win32::System::Threading::CreateProcessW(
+        PCWSTR::null(),
+        windows::core::PWSTR(cmdline_w.as_mut_ptr()),
+        None,
+        None,
+        false,
+        windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0),
+        None,
+        PCWSTR::null(),
+        &startup_info as *const _,
+        &mut process_info,
+    )
+    .map_err(|e| NetfilterError::Win32(format!("CreateProcessW failed: {e}")))?;
+
+    // 収集器はharnessセッションの生存期間中、独立して常駐する。ここでは待たない。
+    let _ = CloseHandle(process_info.hProcess);
+    let _ = CloseHandle(process_info.hThread);
+    Ok(())
+}
+
 fn send_response(pipe: HANDLE, resp: &NetfilterResponse) -> Result<(), NetfilterError> {
     let bytes = serde_json::to_vec(resp)
         .map_err(|e| NetfilterError::Ipc(format!("failed to serialize response: {e}")))?;
@@ -621,6 +731,8 @@ mod tests {
             allow_loopback_udp_ports: vec![18053],
             audit_log_path: Some(PathBuf::from(".harness/sandbox/session-x/net-audit.jsonl")),
             mcp_profiles: Vec::new(),
+            workspace_root: None,
+            chain_launch_policy_learnd: None,
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: NetfilterRequest = serde_json::from_slice(&bytes).unwrap();
@@ -631,6 +743,8 @@ mod tests {
                 allow_loopback_udp_ports,
                 audit_log_path,
                 mcp_profiles: _,
+                workspace_root: _,
+                chain_launch_policy_learnd: _,
             }) => {
                 assert_eq!(session_profile, "harness.shell.sandbox.1234-5678");
                 assert_eq!(allow_loopback_tcp_ports, vec![18080, 18053]);
@@ -660,13 +774,16 @@ mod tests {
                 allow_loopback_tcp_ports: vec![19090],
                 allow_loopback_udp_ports: vec![],
             }],
+            workspace_root: None,
+            chain_launch_policy_learnd: None,
         });
         // D-37で`session_profile`を先頭へ追加した（昇格側はこの名前を検証してからSIDを導出する）。
-        // D-38（M15.5）で`mcp_profiles`を**末尾へ**追加した——既存フィールドの位置を動かすと、
-        // 旧`harness-netfilterd.exe`との組み合わせで静かに壊れる。
+        // D-38（M15.5）で`mcp_profiles`を、M15.7（D-44）で`workspace_root`を、いずれも**末尾へ**
+        // 追加した——既存フィールドの位置を動かすと、旧`harness-netfilterd.exe`との組み合わせで
+        // 静かに壊れる。`workspace_root`は`audit_log_path`を受信側で検証するためだけに運ぶ。
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
-            r#"{"ApplyRules":{"session_profile":"harness.shell.sandbox.1-2","allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"audit_log_path":"net-audit.jsonl","mcp_profiles":[{"profile":"harness.mcp.1-2.docs","allow_loopback_tcp_ports":[19090],"allow_loopback_udp_ports":[]}]}}"#
+            r#"{"ApplyRules":{"session_profile":"harness.shell.sandbox.1-2","allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"audit_log_path":"net-audit.jsonl","mcp_profiles":[{"profile":"harness.mcp.1-2.docs","allow_loopback_tcp_ports":[19090],"allow_loopback_udp_ports":[]}],"workspace_root":null,"chain_launch_policy_learnd":null}}"#
         );
         assert_eq!(
             serde_json::to_string(&NetfilterRequest::Teardown).unwrap(),
@@ -684,10 +801,12 @@ mod tests {
             allow_loopback_udp_ports: vec![18053],
             audit_log_path: None,
             mcp_profiles: Vec::new(),
+            workspace_root: None,
+            chain_launch_policy_learnd: None,
         });
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
-            r#"{"ApplyRules":{"session_profile":"harness.shell.sandbox.1-2","allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"audit_log_path":null,"mcp_profiles":[]}}"#
+            r#"{"ApplyRules":{"session_profile":"harness.shell.sandbox.1-2","allow_loopback_tcp_ports":[18080],"allow_loopback_udp_ports":[18053],"audit_log_path":null,"mcp_profiles":[],"workspace_root":null,"chain_launch_policy_learnd":null}}"#
         );
     }
 
@@ -699,6 +818,40 @@ mod tests {
         match decoded {
             NetfilterRequest::ApplyRules(policy) => assert!(policy.mcp_profiles.is_empty()),
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// **M15.7 / D-44**: `workspace_root`を運ぶ要求では、`audit_log_path`が
+    /// `<workspace_root>/.harness/sandbox/`配下に限定される。ここが緩むと、非昇格の親が
+    /// 昇格daemonに任意パスへ追記させられる（管理者権限での任意パス追記プリミティブ）。
+    ///
+    /// `serve_inner`はWin32ハンドルを要求するので直接は呼べない。判定の実体である
+    /// `validate_audit_sink_path`を、`serve_inner`が渡すのと同じ組み合わせで確かめる。
+    #[test]
+    fn the_audit_sink_path_is_constrained_to_the_declared_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        std::fs::create_dir_all(workspace.join(".harness").join("sandbox").join("session-x"))
+            .unwrap();
+
+        let good = workspace
+            .join(".harness")
+            .join("sandbox")
+            .join("session-x")
+            .join("net-audit.jsonl");
+        assert!(crate::elevated_launch::validate_audit_sink_path(&good, workspace).is_ok());
+
+        // 親が「ここへ書け」と言っても、workspace外なら昇格側が拒否する。
+        for evil in [
+            std::path::PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts"),
+            workspace.join(".git").join("config"),
+            workspace.join(".harness").join("settings.json"),
+        ] {
+            assert!(
+                crate::elevated_launch::validate_audit_sink_path(&evil, workspace).is_err(),
+                "{} must be rejected as an audit sink",
+                evil.display()
+            );
         }
     }
 
@@ -723,6 +876,8 @@ mod tests {
                     allow_loopback_udp_ports: vec![],
                 },
             ],
+            workspace_root: None,
+            chain_launch_policy_learnd: None,
         };
         let targets = policy_targets(&policy);
         assert_eq!(
@@ -801,12 +956,18 @@ mod tests {
                 allow_loopback_udp_ports,
                 audit_log_path,
                 mcp_profiles,
+                workspace_root,
+                chain_launch_policy_learnd,
             }) => {
                 // 名前が欠落したJSONは空文字として読める。空文字は
                 // `is_harness_profile_name`が拒否するので、`serve_inner`はfail-closedになる。
                 assert!(session_profile.is_empty());
                 assert!(allow_loopback_tcp_ports.is_empty());
                 assert!(allow_loopback_udp_ports.is_empty());
+                // `workspace_root`が無い旧形式。`serve_inner`はこの場合、監査ログを無効化して
+                // 続行する（任意パス追記を閉じつつ、WFPの出口強制そのものは落とさない）。
+                assert_eq!(workspace_root, None);
+                assert_eq!(chain_launch_policy_learnd, None);
                 assert_eq!(audit_log_path, None);
                 assert!(mcp_profiles.is_empty());
             }

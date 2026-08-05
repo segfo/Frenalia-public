@@ -6,7 +6,12 @@ edition.workspace = true
 [dependencies]
 cap-std = "4.0.2"
 directories = "6"
+# M15.7: OS監査収集器が書く`fs-audit.jsonl`のレコード型（`harness_policy::FsAuditEvent`）と
+# access語彙（`harness_config::FsAccess`）を、読む側（`harness-cli`）と共有するため。
+# どちらも純粋クレートで、Win32もasyncも持ち込まない。
+harness-config = { version = "0.1.0", path = "../harness-config" }
 harness-core = { version = "0.1.0", path = "../harness-core" }
+harness-policy = { version = "0.1.0", path = "../harness-policy" }
 harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
 serde = { version = "1", features = ["derive"] }
@@ -48,6 +53,17 @@ windows = { version = "0.58", features = [
     # LoadLibraryW解決に使う。
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
+    # M15.7（ポリシー学習ヘルパー）: `Microsoft-Windows-Kernel-File`のリアルタイム
+    # ETWセッションと、TDHによるイベントプロパティ抽出に使う。
+    "Win32_System_Diagnostics_Etw",
+    # M15.7スパイク: `NtCreateFile`をRootDirectory相対で直接呼び、ETWの各系統が
+    # 相対openをどう報告するかを実測する（BUG-033と同じ形の入力を作るため）。
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_System_IO",
+    # `EVENT_TRACE_LOGFILEW`/`OpenTraceW`は`Win32_System_Time`（`SYSTEMTIME`）を
+    # 構造体メンバに持つため、Etw単体では有効にならない。
+    "Win32_System_Time",
 ] }
 
 [dev-dependencies]
