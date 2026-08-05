@@ -16,6 +16,7 @@ use crate::context::ContextAssembler;
 use crate::hiv::{HivContext, HivEngine, HivLimits, HivStop};
 use crate::phase::PhaseBudgets;
 use crate::scratch::ScratchStore;
+use crate::source::SourceCatalog;
 
 /// まだ実装されていない`CognitionLevel`が要求された。
 ///
@@ -55,6 +56,9 @@ pub struct CognitiveOrchestrator {
     level: CognitionLevel,
     budgets: PhaseBudgets,
     limits: HivLimits,
+    /// 情報源カタログ（M16、§4.2）。既定は内蔵ツールだけ——`settings.json`の
+    /// `cognition.sources`があれば`harness-cli`が[`Self::with_catalog`]で載せる。
+    catalog: SourceCatalog,
     /// scratch（生出力の退避先）をセッションディレクトリへ向けるためのID。
     /// 未設定なら退避せずインメモリで進む（調査自体は止めない）。
     session_id: Option<String>,
@@ -71,10 +75,17 @@ impl CognitiveOrchestrator {
                 level,
                 budgets,
                 limits: HivLimits::default(),
+                catalog: SourceCatalog::with_builtin_defaults(),
                 session_id: None,
             }),
             CognitionLevel::Auto => Err(UnsupportedLevel { level }),
         }
+    }
+
+    /// `settings.json`の`cognition.sources`を反映したカタログを載せる（§4.2）。
+    pub fn with_catalog(mut self, catalog: SourceCatalog) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     /// 生出力の退避先を`<workspace_root>/.harness/cognition/<session-id>/`にする（§5）。
@@ -182,7 +193,8 @@ impl CognitiveOrchestrator {
             cancel,
             config.degeneracy.as_ref(),
         );
-        let assembler = ContextAssembler::new(config.model.clone(), self.budgets.clone());
+        let assembler = ContextAssembler::new(config.model.clone(), self.budgets.clone())
+            .with_catalog(self.catalog.clone());
         let scratch = self.open_scratch(ctx);
         let limits = HivLimits {
             // `--max-turns`を認知層へ拡張する（§3.5）。フェーズ1つ＝1コールなので、
@@ -190,7 +202,7 @@ impl CognitiveOrchestrator {
             max_phase_calls: config.max_turns,
             ..self.limits
         };
-        let mut engine = HivEngine::new(assembler, scratch, limits);
+        let mut engine = HivEngine::new(assembler, scratch, self.catalog.clone(), limits);
 
         let cx = HivContext {
             exec: &executor,

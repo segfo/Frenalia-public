@@ -202,9 +202,14 @@ impl AppState {
                     predicts.join(" / ")
                 )));
             }
-            AgentEvent::EvidenceAdded { id, claim, source } => {
+            AgentEvent::EvidenceAdded {
+                id,
+                claim,
+                source,
+                validity,
+            } => {
                 self.transcript.push(TranscriptItem::Info(format!(
-                    "[証拠] {id} {claim}（出典: {source}）"
+                    "[証拠] {id} {claim}（出典: {source}／妥当性: {validity}）"
                 )));
             }
             AgentEvent::VerificationResult {
@@ -212,8 +217,9 @@ impl AppState {
                 verdict,
                 missing,
                 promoted,
+                strength,
             } => {
-                let mut line = format!("[検証] {hyp} {verdict}");
+                let mut line = format!("[検証] {hyp} {verdict}（根拠: {strength}）");
                 if promoted {
                     line.push_str("（確証）");
                 }

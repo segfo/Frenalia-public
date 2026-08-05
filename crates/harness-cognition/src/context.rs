@@ -25,6 +25,7 @@ use crate::memory::render::Reduction;
 use crate::memory::types::{GoalId, HypId};
 use crate::memory::WorkingMemory;
 use crate::phase::{spec, PhaseBudgets, ToolSelection};
+use crate::source::SourceCatalog;
 use crate::{prompts, schema};
 
 /// 台帳スライス・生出力をこれ以上は削らない下限（文字数）。ここまで削っても予算に
@@ -76,6 +77,7 @@ pub struct PhaseInput<'a> {
 pub struct ContextAssembler {
     model: String,
     budgets: PhaseBudgets,
+    catalog: SourceCatalog,
 }
 
 impl ContextAssembler {
@@ -85,7 +87,14 @@ impl ContextAssembler {
         Self {
             model: model.into(),
             budgets,
+            catalog: SourceCatalog::default(),
         }
+    }
+
+    /// 情報源カタログを載せる（§4.2）。Investigateのコールにだけ「使える情報源」節として現れる。
+    pub fn with_catalog(mut self, catalog: SourceCatalog) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     pub fn budget(&self, phase: Phase) -> TokenBudget {
@@ -106,7 +115,13 @@ impl ContextAssembler {
     ) -> AssembledCall {
         let selection = spec(phase, input.target, input.goal).tools;
         let tool_specs = select_tools(tools, ctx, selection);
-        self.assemble(phase, input, mem, ctx, tool_specs, caps)
+        // カタログを見せるのはInvestigateだけ（§4.2「Investigateフェーズの入力に使える情報源の
+        // 一覧だけを渡す」）。情報源を選ぶのはこのフェーズの仕事で、他のフェーズには
+        // 選択肢を増やす意味が無い。
+        let catalog = (phase == Phase::Investigate)
+            .then(|| self.catalog.render_for_investigate(tools))
+            .filter(|s| !s.is_empty());
+        self.assemble(phase, input, mem, ctx, tool_specs, catalog, caps)
     }
 
     /// ツールを一切渡さず、スキーマだけを要求するコールを組む（必ず[`CallKind::SchemaOnly`]）。
@@ -123,9 +138,11 @@ impl ContextAssembler {
         ctx: &ToolCtx,
         caps: &ProviderCapabilities,
     ) -> AssembledCall {
-        self.assemble(phase, input, mem, ctx, Vec::new(), caps)
+        // 結論コールにはツールが載らないので、情報源カタログも要らない（もう選ばない）。
+        self.assemble(phase, input, mem, ctx, Vec::new(), None, caps)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
         &self,
         phase: Phase,
@@ -133,6 +150,7 @@ impl ContextAssembler {
         mem: &WorkingMemory,
         ctx: &ToolCtx,
         tool_specs: Vec<ToolSpec>,
+        catalog: Option<String>,
         caps: &ProviderCapabilities,
     ) -> AssembledCall {
         let budget = self.budgets.get(phase);
@@ -141,6 +159,7 @@ impl ContextAssembler {
 
         let system = self.system_blocks(phase, ctx, !tool_specs.is_empty());
         let mut body = Body {
+            catalog,
             slice: String::new(),
             raw: input.raw_output.unwrap_or("").to_string(),
             // 修復指示は縮約の対象にしない（これ自体が「次に何を直すか」で、削ると
@@ -151,6 +170,16 @@ impl ContextAssembler {
         // 1段目: 台帳スライスの構造的な縮約（決定的な順序、§6.1）。
         for reduction in Reduction::LEVELS {
             body.slice = mem.render(spec.view, reduction);
+            let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
+            if harness_engine::estimate_tokens(&req) <= u64::from(budget.max_in) {
+                return finish(req, kind);
+            }
+        }
+
+        // 1.5段目: 情報源カタログを落とす。**生出力や台帳より先に捨てる**——カタログは
+        // 「どれを使うと良さそうか」のヒントに過ぎず、ツールspecは残るので調査自体は続けられる。
+        // 一方、生出力や台帳を削ると観測そのものが失われる。
+        if body.catalog.take().is_some() {
             let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
             if harness_engine::estimate_tokens(&req) <= u64::from(budget.max_in) {
                 return finish(req, kind);
@@ -290,8 +319,10 @@ fn select_tools(tools: &ToolRegistry, ctx: &ToolCtx, selection: ToolSelection) -
     specs
 }
 
-/// userメッセージ本文の材料。縮約はこの3要素のうち`slice`と`raw`にだけ効く。
+/// userメッセージ本文の材料。縮約は`catalog`（丸ごと落とす）・`raw`・`slice`（切詰め）に効く。
 struct Body {
+    /// 情報源カタログ（Investigateのみ、§4.2）。
+    catalog: Option<String>,
     slice: String,
     raw: String,
     repair: Option<String>,
@@ -302,6 +333,12 @@ impl Body {
         let mut out = String::new();
         if !self.slice.trim().is_empty() {
             out.push_str(&self.slice);
+        }
+        if let Some(catalog) = &self.catalog {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(catalog);
         }
         if !self.raw.trim().is_empty() {
             if !out.is_empty() {
@@ -339,6 +376,7 @@ fn shrink(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::memory::types::{Evidence, EvidenceId, RawRef, SourceRef};
+    use crate::memory::validity::{Freshness, TrustLevel, Validity};
 
     fn caps(schema_with_tools: bool) -> ProviderCapabilities {
         ProviderCapabilities {
@@ -373,6 +411,7 @@ mod tests {
                     path: "src/lib.rs".to_string(),
                     lines: (40, 52),
                 },
+                validity: Validity::seed(TrustLevel::High, Freshness::Fresh),
                 raw_ref: Some(RawRef {
                     tool_call_id: "call_1".to_string(),
                     chars: 9_000,
@@ -588,10 +627,11 @@ mod tests {
     }
 
     /// Distillの主入力は生出力（§3.3）。生出力は台帳に無いので、呼び出し側がscratchから
-    /// 読んで明示的に渡す経路になっている。台帳側から載るのは**対象仮説1本だけ**で、
-    /// これは出力スキーマの`relation: supports|refutes`を判定するために要る（M15での変更点）。
+    /// 読んで明示的に渡す経路になっている。台帳側から載るのは**対象仮説と、その仮説に
+    /// 紐付く既存観測**だけ——前者は`relation: supports|refutes`の判定に（M15）、後者は
+    /// `contradicts`（§4.3の矛盾検出、M16）に要る。他の仮説の証拠は載せない。
     #[test]
-    fn distill_receives_the_raw_output_and_only_the_target_hypothesis() {
+    fn distill_receives_the_raw_output_the_target_hypothesis_and_its_observations() {
         let (_, hyp, _) = memory();
         let call = build(
             Phase::Distill,
@@ -606,8 +646,89 @@ mod tests {
         };
         assert!(text.contains("line A"), "{text}");
         assert!(text.contains("原因はロック順序"), "{text}");
-        // 既に集めた証拠は載せない（蒸留の対象は今回の生出力1件だけ）。
-        assert!(!text.contains("2箇所で逆順にlockを取得している"), "{text}");
+        assert!(text.contains("2箇所で逆順にlockを取得している"), "{text}");
+        // 情報源カタログはInvestigate専用（ここには載らない）。
+        assert!(!text.contains("使える情報源"), "{text}");
+    }
+
+    /// **§4.2**: 情報源カタログはInvestigateのコールにだけ載る（選ぶのがこのフェーズだから）。
+    #[test]
+    fn the_source_catalog_is_shown_to_investigate_only() {
+        let (mem, hyp, goal) = memory();
+        let assembler =
+            assembler().with_catalog(crate::source::SourceCatalog::with_builtin_defaults());
+        let tools = ToolRegistry::with_builtin_tools();
+
+        let investigate = assembler.build(
+            Phase::Investigate,
+            PhaseInput {
+                target: Some(hyp),
+                ..Default::default()
+            },
+            &mem,
+            &ctx(),
+            &tools,
+            &caps(true),
+        );
+        let ContentBlock::Text(text) = &investigate.req.messages[0].content[0] else {
+            panic!()
+        };
+        assert!(text.contains("使える情報源"), "{text}");
+        assert!(text.contains("read_file"), "{text}");
+        assert!(text.contains("信頼度"), "{text}");
+
+        for (phase, input) in [
+            (Phase::Hypothesize, PhaseInput::default()),
+            (
+                Phase::Decide,
+                PhaseInput {
+                    goal: Some(goal),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let call = assembler.build(phase, input, &mem, &ctx(), &tools, &caps(true));
+            let ContentBlock::Text(text) = &call.req.messages[0].content[0] else {
+                panic!()
+            };
+            assert!(!text.contains("使える情報源"), "{phase}: {text}");
+        }
+    }
+
+    /// カタログは**予算超過時に真っ先に落ちる**（ツールspecが残るので調査は続けられる）。
+    #[test]
+    fn the_catalog_is_the_first_thing_dropped_when_the_budget_is_tight() {
+        let (mem, hyp, _) = memory();
+        let assembler = ContextAssembler::new(
+            "test-model",
+            PhaseBudgets::default().with_overrides(&std::collections::BTreeMap::from([(
+                Phase::Investigate,
+                TokenBudget {
+                    // ツールspec + システムプロンプトでほぼ埋まる水準。
+                    max_in: 700,
+                    max_out: 1_000,
+                },
+            )])),
+        )
+        .with_catalog(crate::source::SourceCatalog::with_builtin_defaults());
+
+        let call = assembler.build(
+            Phase::Investigate,
+            PhaseInput {
+                target: Some(hyp),
+                ..Default::default()
+            },
+            &mem,
+            &ctx(),
+            &ToolRegistry::with_builtin_tools(),
+            &caps(true),
+        );
+        let ContentBlock::Text(text) = &call.req.messages[0].content[0] else {
+            panic!()
+        };
+        assert!(!text.contains("使える情報源"), "{text}");
+        // 調査対象の仮説（本題）は残っている。
+        assert!(text.contains("原因はロック順序"), "{text}");
     }
 
     /// 対象仮説が無ければ台帳スライスは空のまま（組み立ては失敗しない）。
@@ -716,6 +837,7 @@ mod tests {
                             path: format!("src/file{i}.rs"),
                             lines: (1, 100),
                         },
+                        validity: Validity::seed(TrustLevel::High, Freshness::Fresh),
                         raw_ref: None,
                     },
                     Some((h, j % 2 == 0)),

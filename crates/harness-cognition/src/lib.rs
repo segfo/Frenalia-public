@@ -11,9 +11,10 @@
 //! `Off`へ落とすと「賢く動いているつもりで素朴ループだった」という気付けない劣化になるため、
 //! 起動時に明示エラーにする。各段階の実装マイルストーンは`docs/INDEX.md`（M16–M20）。
 //!
-//! 部品は[`memory`]（構造化台帳）・[`scratch`]（生出力の退避）・[`context`]（フェーズ別
-//! 最小コンテキスト組立、M14）と、それらを回す[`hiv`]（状態機械、M15）に分かれている。
-//! Orient/Critic/Planner（フル構成）はM19、`Validity`による妥当性評価はM16。
+//! 部品は[`memory`]（構造化台帳と妥当性評価）・[`scratch`]（生出力の退避）・[`context`]
+//! （フェーズ別最小コンテキスト組立、M14）・[`source`]（情報源カタログ、M16）と、
+//! それらを回す[`hiv`]（状態機械、M15）に分かれている。
+//! Orient/Critic/Planner（フル構成）はM19。
 //!
 //! この層は`LlmProvider`を直接持たず、必ず`harness_engine`の`Executor`／素朴ループを経由する。
 //! そのためパーミッション・fsジェイル・サンドボックスの強制点は`harness-engine`側の1箇所に
@@ -31,10 +32,13 @@ pub mod phase;
 pub mod prompts;
 pub mod schema;
 pub mod scratch;
+pub mod source;
 
 pub use context::{AssembledCall, CallKind, ContextAssembler, PhaseInput};
 pub use hiv::{HivContext, HivEngine, HivLimits, HivOutcome, HivStop};
+pub use memory::validity::{EvidenceStrength, Freshness, Grade, TrustLevel, Validity};
 pub use memory::{MemoryView, WorkingMemory};
 pub use orchestrator::{CognitiveOrchestrator, UnsupportedLevel};
 pub use phase::{PhaseBudgets, PhaseSpec, ToolSelection};
 pub use scratch::ScratchStore;
+pub use source::{SourceCatalog, SourceEntry};

@@ -89,8 +89,11 @@ pub(super) fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode
         Some(overrides) => harness_cognition::PhaseBudgets::default().with_overrides(overrides),
         None => harness_cognition::PhaseBudgets::default(),
     };
+    // `cognition.sources`は内蔵ツールの既定カタログへの上乗せ（M16、§4.2）。宣言の`trust`は
+    // 既に`Settings::load`が【T5】の上限へクランプ済みなので、ここでは解釈するだけでよい。
+    let source_catalog = build_source_catalog(&settings);
     let cognition = match CognitiveOrchestrator::new(cognition_level, phase_budgets) {
-        Ok(c) => c,
+        Ok(c) => c.with_catalog(source_catalog),
         Err(e) => {
             eprintln!("error: {e}");
             return Err(ExitCode::FAILURE);
@@ -239,3 +242,34 @@ fn resolve_degeneracy(
     }))
 }
 
+
+/// `settings.json`の`cognition.sources`を情報源カタログへ写す（M16、
+/// `plans/DESIGN-COGNITION.md` §4.2）。
+///
+/// 内蔵ツールの既定カタログへの**上乗せ**なので、宣言が無くてもカタログは空にならない
+/// （`read_file`等は常に情報源として見える）。文字列の解釈は
+/// `harness_cognition::SourceEntry::from_declaration`が持ち、ここは形を変えるだけ。
+fn build_source_catalog(settings: &harness_config::Settings) -> harness_cognition::SourceCatalog {
+    let declared = settings
+        .cognition
+        .as_ref()
+        .and_then(|c| c.sources.as_ref())
+        .map(|sources| {
+            sources
+                .iter()
+                // idの無いエントリは何も指していないので落とす。
+                .filter_map(|s| {
+                    let id = s.id.as_deref()?;
+                    Some(harness_cognition::SourceEntry::from_declaration(
+                        id,
+                        s.kind.as_deref(),
+                        s.use_for.clone().unwrap_or_default(),
+                        s.trust.as_deref(),
+                        s.freshness.as_deref(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    harness_cognition::SourceCatalog::with_builtin_defaults().merged_with(declared)
+}

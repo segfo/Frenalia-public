@@ -14,6 +14,7 @@
 
 use serde::de::DeserializeOwned;
 
+use crate::memory::types::EvidenceId;
 use crate::schema::{
     DecideOutput, DistillOutput, HypothesizeOutput, InvestigateOutput, VerifyOutput,
 };
@@ -134,6 +135,35 @@ pub(crate) fn validate_decide(out: &DecideOutput) -> Result<(), String> {
     Ok(())
 }
 
+/// Distillが申告した`contradicts`（E番号）のうち、**台帳に実在するものだけ**を返す。
+///
+/// スキーマ検証に落とさず黙って捨てるのは、矛盾の申告が蒸留の主産物ではないため
+/// ——存在しない番号を1つ書いただけで蒸留全体をやり直させると、正しく抽出できた事実まで
+/// 失うことになる。捏造されたIDを**台帳へ通さない**ことだけをここで担保する
+/// （`crate::hiv::evidence`の「出典はハーネスが決める」と同じ姿勢）。
+///
+/// `known`は台帳に実在する証拠ID、`own`はいま積もうとしている証拠自身（自己参照の除外用）。
+pub(crate) fn resolve_contradicts(
+    labels: &[String],
+    known: &[EvidenceId],
+    own: Option<EvidenceId>,
+) -> Vec<EvidenceId> {
+    let mut out: Vec<EvidenceId> = Vec::new();
+    for label in labels {
+        let Some(id) = known
+            .iter()
+            .find(|id| id.label().eq_ignore_ascii_case(label.trim()))
+        else {
+            continue;
+        };
+        if Some(*id) == own || out.contains(id) {
+            continue;
+        }
+        out.push(*id);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +238,33 @@ mod tests {
     #[test]
     fn empty_distillation_is_accepted() {
         validate_distill(&DistillOutput { evidence: vec![] }).unwrap();
+    }
+
+    /// **§4.3の矛盾検出の入口**: 台帳に実在するE番号だけを通す。捏造・自己参照・重複は捨てる。
+    #[test]
+    fn only_existing_evidence_ids_are_accepted_as_contradictions() {
+        // 自分自身（E7）も台帳には既に載っている（先に積んでからIDを解決するため）。
+        let known = [EvidenceId(3), EvidenceId(5), EvidenceId(7)];
+        let labels = [
+            "E3".to_string(),   // 実在
+            "E9".to_string(),   // 捏造
+            "E5".to_string(),   // 実在
+            "E3".to_string(),   // 重複
+            "E7".to_string(),   // いま積もうとしている自分自身
+            "".to_string(),     // 空
+            "H3".to_string(),   // 種別違い（仮説ID）
+        ];
+        let resolved = resolve_contradicts(&labels, &known, Some(EvidenceId(7)));
+        assert_eq!(resolved, vec![EvidenceId(3), EvidenceId(5)]);
+    }
+
+    /// 前後の空白と大小文字は吸収する（モデルの表記ゆれで矛盾を取り逃さない）。
+    #[test]
+    fn contradiction_labels_tolerate_whitespace_and_case() {
+        let known = [EvidenceId(3)];
+        assert_eq!(
+            resolve_contradicts(&[" e3 ".to_string()], &known, None),
+            vec![EvidenceId(3)]
+        );
     }
 }

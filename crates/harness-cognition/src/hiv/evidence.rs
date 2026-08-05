@@ -12,10 +12,13 @@
 use harness_core::RiskClass;
 use harness_engine::{CompletedToolCall, EventSink, ToolCallDecision};
 
+use crate::hiv::parse::resolve_contradicts;
 use crate::memory::types::{Evidence, HypId, RawRef, SourceRef};
+use crate::memory::validity::Validity;
 use crate::memory::WorkingMemory;
 use crate::schema::{DistillOutput, EvidenceRelation};
 use crate::scratch::ScratchStore;
+use crate::source::{split_mcp_tool_name, SourceCatalog};
 
 /// 1回のツール呼び出しから得た観測。
 #[derive(Debug, Clone)]
@@ -64,11 +67,19 @@ pub(crate) fn observations(
 
 /// ツール呼び出しから出典を決める。
 ///
-/// ツール名の固定表ではなく`RiskClass`で分けるのは、M16のSourceBroker（情報源カタログ）が
-/// ここを置き換えるまでの繋ぎとして、read-onlyツールが増えても壊れないようにするため。
-/// 未知のツール名でも「何を触る種類の操作だったか」は`RiskClass`が持っている。
+/// MCPだけは**ツール名の名前空間**（`crate::source::MCP_PREFIX`、`plans/DESIGN-MCP.md` §5）で判定する
+/// ——MCPサーバのツールは`RiskClass`だけ見れば内蔵ツールと区別が付かないが、§4.2の接地優先順位は
+/// 「ローカル一次証拠 → MCPで裏取り」という**出所の違い**を要求しており、そこを潰せない。
+/// それ以外はツール名の固定表ではなく`RiskClass`で分ける（read-onlyツールが増えても壊れない）。
 fn source_ref_for(call: &CompletedToolCall, risk: Option<RiskClass>) -> SourceRef {
     let input = &call.input;
+    if let Some((server, tool)) = split_mcp_tool_name(&call.name) {
+        return SourceRef::Mcp {
+            server: server.to_string(),
+            tool: tool.to_string(),
+            args_digest: args_digest(input),
+        };
+    }
     match risk {
         Some(RiskClass::Network) => SourceRef::Web {
             url: string_field(input, &["url"]).unwrap_or_else(|| call.name.clone()),
@@ -111,6 +122,23 @@ fn line_range(input: &serde_json::Value) -> (u32, u32) {
     }
 }
 
+/// MCP呼び出しの引数のダイジェスト（`SourceRef::Mcp.args_digest`）。
+///
+/// 用途は監査と「同じ問い合わせをしたか」の判定だけなので、暗号学的強度は要らない。
+/// FNV-1aを直に書くのは、ハッシュ依存クレートを増やさずに**バージョンを跨いで安定**させる
+/// ため（`DefaultHasher`は標準ライブラリの版で値が変わりうる）。`serde_json::Value`の
+/// オブジェクトはキー順が正規化されているので、同じ引数からは必ず同じ文字列になる。
+fn args_digest(input: &serde_json::Value) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for byte in input.to_string().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
 fn unix_seconds() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -119,11 +147,15 @@ fn unix_seconds() -> String {
 }
 
 /// 蒸留結果を台帳へ載せ、`EvidenceAdded`を発行する。戻り値は追加できた件数。
+///
+/// `trust`/`freshness`はカタログが決める（§4.3「信頼度は情報源の宣言 + 種別から決める」）。
+/// `grade`は台帳が引き直すので、ここでは触らない。
 pub(crate) fn record_distilled(
     mem: &mut WorkingMemory,
     target: HypId,
     observation: &Observation,
     out: DistillOutput,
+    catalog: &SourceCatalog,
     events: Option<&EventSink>,
 ) -> usize {
     let mut added = 0;
@@ -131,9 +163,15 @@ pub(crate) fn record_distilled(
         if distilled.claim.trim().is_empty() {
             continue;
         }
+        // 矛盾の申告は**この証拠を積む前**の台帳に対して解決する。積んだ後に解決すると
+        // 「自分自身と矛盾する」という申告を弾く根拠がIDの一致だけになり、脆くなる。
+        let known: Vec<_> = mem.evidence().iter().map(|e| e.id).collect();
+        let conflicts = resolve_contradicts(&distilled.contradicts, &known, None);
+
         let source = observation.source.clone();
         let raw_ref = observation.raw_ref.clone();
         let claim = distilled.claim.clone();
+        let (trust, freshness) = catalog.validity_seed(&observation.source);
         let link = match distilled.relation {
             EvidenceRelation::Supports => Some((target, true)),
             EvidenceRelation::Refutes => Some((target, false)),
@@ -145,16 +183,25 @@ pub(crate) fn record_distilled(
                 id,
                 claim,
                 source,
+                validity: Validity::seed(trust, freshness),
                 raw_ref,
             },
             link,
         );
+        for other in conflicts {
+            mem.record_conflict(id, other);
+        }
+        let validity = mem
+            .evidence_by_id(id)
+            .map(|e| e.validity.describe())
+            .unwrap_or_default();
         harness_engine::emit_event(
             events,
             harness_core::AgentEvent::EvidenceAdded {
                 id: id.label(),
                 claim: distilled.claim,
                 source: observation.source.describe(),
+                validity,
             },
         );
         added += 1;
@@ -166,6 +213,20 @@ pub(crate) fn record_distilled(
 mod tests {
     use super::*;
     use harness_core::ToolOutput;
+
+    fn distilled(
+        claim: &str,
+        relation: EvidenceRelation,
+        contradicts: &[&str],
+    ) -> crate::schema::DistilledEvidence {
+        crate::schema::DistilledEvidence {
+            claim: claim.to_string(),
+            relation,
+            // モデルの自己申告する`source`は台帳へ入らない（このモジュールのdoc）。
+            source: "https://evil.example".to_string(),
+            contradicts: contradicts.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
 
     fn call(name: &str, input: serde_json::Value, content: &str) -> CompletedToolCall {
         CompletedToolCall {
@@ -240,6 +301,49 @@ mod tests {
             panic!("network tools must be recorded as web sources");
         };
         assert_eq!(url, "https://example.com");
+    }
+
+    /// **M16**: MCPツールは`RiskClass`ではなく**名前空間**で判定する。
+    /// MCPの多くは`RiskClass::Network`だが、§4.2の接地優先順位はwebとMCPを区別する。
+    #[test]
+    fn mcp_namespaced_tools_become_mcp_sources_regardless_of_their_risk_class() {
+        let c = call(
+            "mcp__company-docs__search_docs",
+            serde_json::json!({ "q": "run_shell" }),
+            "spec says powershell",
+        );
+        for risk in [
+            Some(RiskClass::Network),
+            Some(RiskClass::ReadOnly),
+            None,
+        ] {
+            let SourceRef::Mcp { server, tool, .. } = source_ref_for(&c, risk) else {
+                panic!("mcp/ tools must be recorded as MCP sources (risk={risk:?})");
+            };
+            assert_eq!((server.as_str(), tool.as_str()), ("company-docs", "search_docs"));
+        }
+    }
+
+    /// 引数ダイジェストは同じ引数から同じ値、違う引数から違う値になる（監査・同一性判定用）。
+    #[test]
+    fn the_args_digest_is_stable_and_discriminating() {
+        let a = serde_json::json!({ "q": "run_shell", "limit": 5 });
+        let b = serde_json::json!({ "limit": 5, "q": "run_shell" });
+        let c = serde_json::json!({ "q": "read_file", "limit": 5 });
+        // `serde_json::Value`のオブジェクトはキー順が正規化されるので、書き順は影響しない。
+        assert_eq!(args_digest(&a), args_digest(&b));
+        assert_ne!(args_digest(&a), args_digest(&c));
+        assert_eq!(args_digest(&a).len(), 16);
+    }
+
+    /// `mcp`で始まるだけの名前（`mcp_helper`等）を誤ってMCP扱いしない。
+    #[test]
+    fn a_tool_merely_starting_with_mcp_is_not_an_mcp_source() {
+        let c = call("mcp_helper", serde_json::json!({ "path": "a.rs" }), "x");
+        assert!(matches!(
+            source_ref_for(&c, Some(RiskClass::ReadOnly)),
+            SourceRef::File { .. }
+        ));
     }
 
     /// **実行されなかった呼び出しは観測にしない**（拒否理由が事実として台帳に載るのを防ぐ）。
@@ -322,23 +426,12 @@ mod tests {
             &obs,
             DistillOutput {
                 evidence: vec![
-                    crate::schema::DistilledEvidence {
-                        claim: "支持する事実".to_string(),
-                        relation: EvidenceRelation::Supports,
-                        source: "モデルの自己申告は使われない".to_string(),
-                    },
-                    crate::schema::DistilledEvidence {
-                        claim: "反証する事実".to_string(),
-                        relation: EvidenceRelation::Refutes,
-                        source: "https://evil.example".to_string(),
-                    },
-                    crate::schema::DistilledEvidence {
-                        claim: "無関係な事実".to_string(),
-                        relation: EvidenceRelation::Neutral,
-                        source: String::new(),
-                    },
+                    distilled("支持する事実", EvidenceRelation::Supports, &[]),
+                    distilled("反証する事実", EvidenceRelation::Refutes, &[]),
+                    distilled("無関係な事実", EvidenceRelation::Neutral, &[]),
                 ],
             },
+            &SourceCatalog::with_builtin_defaults(),
             None,
         );
 
@@ -350,5 +443,94 @@ mod tests {
         for e in mem.evidence() {
             assert!(matches!(e.source, SourceRef::File { .. }), "{:?}", e.source);
         }
+    }
+
+    /// **§4.3の矛盾検出**: Distillが挙げたE番号のうち実在するものだけが台帳へ記録される。
+    #[test]
+    fn declared_contradictions_are_recorded_only_for_evidence_that_exists() {
+        let mut mem = WorkingMemory::new();
+        let g = mem.add_goal("直す", vec![]);
+        let h = mem.add_hypothesis(g, "原因はX", vec!["Yが見える".into()], 0.5);
+        let obs = Observation {
+            source: SourceRef::File {
+                path: "src/lib.rs".to_string(),
+                lines: (0, 0),
+            },
+            excerpt: "raw".to_string(),
+            raw_ref: None,
+        };
+        let catalog = SourceCatalog::with_builtin_defaults();
+
+        record_distilled(
+            &mut mem,
+            h,
+            &obs,
+            DistillOutput {
+                evidence: vec![distilled("Aと書いてある", EvidenceRelation::Supports, &[])],
+            },
+            &catalog,
+            None,
+        );
+        let first = mem.evidence()[0].id;
+
+        record_distilled(
+            &mut mem,
+            h,
+            &obs,
+            DistillOutput {
+                evidence: vec![distilled(
+                    "Bと書いてある",
+                    EvidenceRelation::Supports,
+                    // 実在するものと、存在しないものを混ぜる。
+                    &[&first.label(), "E99"],
+                )],
+            },
+            &catalog,
+            None,
+        );
+        let second = mem.evidence()[1].id;
+
+        assert_eq!(
+            mem.evidence_by_id(second).unwrap().validity.conflicts,
+            vec![first],
+            "実在するE番号だけが矛盾として記録される"
+        );
+        assert_eq!(
+            mem.evidence_by_id(first).unwrap().validity.conflicts,
+            vec![second],
+            "矛盾は双方向に記録される"
+        );
+    }
+
+    /// `trust`/`freshness`はカタログが決める（§4.3「情報源の宣言 + 種別から決める」）。
+    #[test]
+    fn validity_is_seeded_from_the_source_catalog() {
+        let mut mem = WorkingMemory::new();
+        let g = mem.add_goal("直す", vec![]);
+        let h = mem.add_hypothesis(g, "原因はX", vec![], 0.5);
+        let obs = Observation {
+            source: SourceRef::Web {
+                url: "https://example.com".to_string(),
+                fetched_at: "0".to_string(),
+            },
+            excerpt: "raw".to_string(),
+            raw_ref: None,
+        };
+
+        record_distilled(
+            &mut mem,
+            h,
+            &obs,
+            DistillOutput {
+                evidence: vec![distilled("webの主張", EvidenceRelation::Supports, &[])],
+            },
+            &SourceCatalog::with_builtin_defaults(),
+            None,
+        );
+
+        let v = &mem.evidence()[0].validity;
+        assert_eq!(v.trust, crate::memory::validity::TrustLevel::Low);
+        // webは接地種別ではないので、単独では確証の根拠にならない。
+        assert_eq!(v.grade, crate::memory::validity::Grade::Unverified);
     }
 }

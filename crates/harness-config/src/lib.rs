@@ -90,9 +90,8 @@ impl PolicySettings {
 
 /// `.harness/settings.json`の`cognition`キー。
 ///
-/// `plans/DESIGN-COGNITION.md` §8のデルタ表は`model_tiers`/`sources`も挙げるが、
-/// それぞれ読む側（ModelRouter・SourceBroker）が実装されるM17/M16で追加する。
-/// 設定だけ先に受け付けても黙って無視されるだけで、誤解を招くため。
+/// `plans/DESIGN-COGNITION.md` §8のデルタ表は`model_tiers`も挙げるが、読む側（ModelRouter）が
+/// 実装されるM17で追加する。設定だけ先に受け付けても黙って無視されるだけで、誤解を招くため。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CognitionSettings {
     /// `off` | `auto` | `always`。CLIの`--cognition`が指定されていればそちらが優先。
@@ -104,6 +103,111 @@ pub struct CognitionSettings {
     /// "cognition": { "budgets": { "distill": { "max_in": 6000, "max_out": 800 } } }
     /// ```
     pub budgets: Option<std::collections::BTreeMap<harness_core::Phase, harness_core::TokenBudget>>,
+    /// 情報源カタログ（M16、`plans/DESIGN-COGNITION.md` §4.2・§7.5）。内蔵ツール・MCP・webを
+    /// **用途と信頼度で横並びに**宣言する。書かなかった情報源は種別の既定値で扱われる。
+    ///
+    /// ```jsonc
+    /// "cognition": {
+    ///   "sources": [
+    ///     { "id": "mcp/company-docs", "kind": "mcp", "use_for": ["社内仕様"],
+    ///       "trust": "high", "freshness": "authoritative" },
+    ///     { "id": "web_fetch", "kind": "web", "use_for": ["一般調査"], "trust": "medium" }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// **どのMCPサーバを起動してよいかの宣言とは別のキーである**（§4.2）——あちらは
+    /// 「起動してよいか」（`plans/DESIGN-MCP.md` §4）、こちらは「起動できるもののうち、
+    /// どれをどの用途の情報源としてモデルへ見せるか」。per-tool `RiskClass`宣言（D-40）も
+    /// ここには置かない。あれはMCP機構が所有し、認知層は`Tool::risk()`の結果に従うだけ。
+    pub sources: Option<Vec<SourceSetting>>,
+}
+
+/// `cognition.sources[]`の1エントリ（`plans/DESIGN-COGNITION.md` §4.2）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SourceSetting {
+    /// 内蔵ツール名（`read_file`等）、MCPサーバid（`mcp/company-docs`）、
+    /// またはMCPツールの完全名（`mcp/company-docs/search_docs`）。
+    pub id: Option<String>,
+    /// `file` | `shell` | `web` | `mcp` | `memory`。省略時は`id`から推測する。
+    pub kind: Option<String>,
+    /// 用途タグ。Investigateへ渡すカタログに出る唯一の説明文。
+    pub use_for: Option<Vec<String>>,
+    /// `high` | `medium` | `low`。【T5】プロジェクト設定からは**引き下げのみ**可能
+    /// （[`clamp_project_source_trust`]）。
+    pub trust: Option<String>,
+    /// `authoritative` | `fresh` | `stale` | `unknown`。
+    pub freshness: Option<String>,
+}
+
+/// 【T5】`cognition.sources[].trust`は**上限**として解釈する（`plans/DESIGN-COGNITION.md` §4.2）。
+///
+/// プロジェクト同梱の`.harness/settings.json`はリポジトリをcloneしただけで存在し得るので、
+/// そこから妥当性の重み付けを**引き上げられる**と、悪意あるリポジトリが自分の情報源を
+/// 「信頼度high」と自称できてしまう。引き下げは安全側なので許す。
+///
+/// `Settings::load`はJSON層をディープマージしてからデシリアライズするため、マージ後には
+/// どの層の値かが分からない。したがってこのクランプは**マージの過程で**掛ける必要がある。
+/// `user`はユーザ層（マージ前）、`merged`はプロジェクト層まで載せた結果。
+///
+/// ユーザ層に宣言の無いidの上限は`medium`とする——プロジェクト設定だけで`high`を名乗れる道を
+/// 残さないため。ユーザが明示的に`high`と書いた情報源だけが`high`になる。
+pub fn clamp_project_source_trust(user: &serde_json::Value, merged: &mut serde_json::Value) {
+    let ceilings: std::collections::HashMap<String, u8> = source_entries(user)
+        .filter_map(|e| {
+            let id = e.get("id")?.as_str()?.to_string();
+            Some((id, trust_rank(e.get("trust").and_then(|v| v.as_str()))))
+        })
+        .collect();
+
+    let Some(entries) = merged
+        .get_mut("cognition")
+        .and_then(|c| c.get_mut("sources"))
+        .and_then(|s| s.as_array_mut())
+    else {
+        return;
+    };
+    for entry in entries {
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
+        let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        // ユーザ層に宣言が無ければ上限は`medium`（rank 1）。
+        let ceiling = ceilings.get(id).copied().unwrap_or(1);
+        let declared = trust_rank(obj.get("trust").and_then(|v| v.as_str()));
+        if declared > ceiling {
+            obj.insert(
+                "trust".to_string(),
+                serde_json::Value::String(trust_name(ceiling).to_string()),
+            );
+        }
+    }
+}
+
+fn source_entries(root: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    root.get("cognition")
+        .and_then(|c| c.get("sources"))
+        .and_then(|s| s.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+}
+
+/// 未知の綴り・未指定は`medium`（rank 1）へ倒す。未知の値を`high`扱いしない。
+fn trust_rank(trust: Option<&str>) -> u8 {
+    match trust {
+        Some("high") => 2,
+        Some("low") => 0,
+        _ => 1,
+    }
+}
+
+fn trust_name(rank: u8) -> &'static str {
+    match rank {
+        2 => "high",
+        0 => "low",
+        _ => "medium",
+    }
 }
 
 /// `.harness/settings.json`の`compaction`キー（`plans/PLAN-COMPACTION.md`「設定」）。
@@ -460,9 +564,13 @@ impl Settings {
                 deep_merge(&mut merged, user_json);
             }
         }
+        // 【T5】のクランプに要るので、プロジェクト層を載せる前のユーザ層を控えておく
+        // （マージ後はどの層の値かが分からなくなる）。
+        let user_layer = merged.clone();
         if let Some(project_json) = read_json(&project_settings_path(project_root)) {
             deep_merge(&mut merged, project_json);
         }
+        clamp_project_source_trust(&user_layer, &mut merged);
 
         serde_json::from_value(merged).unwrap_or_default()
     }
@@ -548,6 +656,83 @@ mod tests {
                 max_out: 800
             }
         );
+    }
+
+    /// `cognition.sources`は各フィールドを独立に省略できる（書いたものだけが`Some`）。
+    #[test]
+    fn parses_partial_cognition_sources() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "cognition": { "sources": [
+                { "id": "mcp/company-docs", "kind": "mcp", "use_for": ["社内仕様"],
+                  "trust": "high", "freshness": "authoritative" },
+                { "id": "web_fetch" }
+            ] }
+        }))
+        .unwrap();
+
+        let sources = settings.cognition.unwrap().sources.unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].trust.as_deref(), Some("high"));
+        assert_eq!(sources[0].use_for.as_deref(), Some(&["社内仕様".to_string()][..]));
+        assert_eq!(sources[1].id.as_deref(), Some("web_fetch"));
+        assert_eq!(sources[1].trust, None, "省略は種別既定へ落とす（読む側の責務）");
+    }
+
+    /// **【T5】**: プロジェクト同梱設定はtrustを**引き下げられるが引き上げられない**。
+    /// cloneしただけで存在し得るファイルから妥当性の重み付けを汚染させないため。
+    #[test]
+    fn a_project_setting_can_lower_source_trust_but_never_raise_it() {
+        let user = serde_json::json!({
+            "cognition": { "sources": [
+                { "id": "mcp/company-docs", "trust": "medium" },
+                { "id": "mcp/audited",      "trust": "high" }
+            ] }
+        });
+        let mut merged = user.clone();
+        deep_merge(
+            &mut merged,
+            serde_json::json!({
+                "cognition": { "sources": [
+                    // 引き上げようとする（拒否される）
+                    { "id": "mcp/company-docs", "trust": "high" },
+                    // 引き下げる（通る）
+                    { "id": "mcp/audited",      "trust": "low" },
+                    // ユーザ層に宣言が無いidを`high`と自称する（mediumへ抑えられる）
+                    { "id": "mcp/evil",         "trust": "high" }
+                ] }
+            }),
+        );
+        clamp_project_source_trust(&user, &mut merged);
+
+        let settings: Settings = serde_json::from_value(merged).unwrap();
+        let sources = settings.cognition.unwrap().sources.unwrap();
+        let trust = |id: &str| {
+            sources
+                .iter()
+                .find(|s| s.id.as_deref() == Some(id))
+                .and_then(|s| s.trust.clone())
+        };
+        assert_eq!(trust("mcp/company-docs").as_deref(), Some("medium"));
+        assert_eq!(trust("mcp/audited").as_deref(), Some("low"));
+        assert_eq!(trust("mcp/evil").as_deref(), Some("medium"));
+    }
+
+    /// 未知の綴りのtrustを`high`扱いしない（未知の値は`medium`へ倒す）。
+    #[test]
+    fn an_unknown_trust_spelling_is_not_treated_as_high() {
+        assert_eq!(trust_rank(Some("HIGH")), trust_rank(None));
+        assert_eq!(trust_rank(Some("absolute")), 1);
+        assert_eq!(trust_rank(Some("high")), 2);
+        assert_eq!(trust_rank(Some("low")), 0);
+    }
+
+    /// `cognition.sources`が無い設定でクランプしても壊れない。
+    #[test]
+    fn clamping_is_a_no_op_without_a_source_catalog() {
+        let user = serde_json::json!({});
+        let mut merged = serde_json::json!({ "model": "m" });
+        clamp_project_source_trust(&user, &mut merged);
+        assert_eq!(merged, serde_json::json!({ "model": "m" }));
     }
 
     /// 綴りを間違えたフェーズ名は黙って無視されず、パースエラーになる

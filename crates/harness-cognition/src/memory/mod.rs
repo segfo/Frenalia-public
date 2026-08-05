@@ -16,11 +16,15 @@
 
 pub mod render;
 pub mod types;
+pub mod validity;
+
+use std::collections::BTreeSet;
 
 use types::{
     Decision, Evidence, EvidenceId, Goal, GoalId, GoalStatus, HypId, HypStatus, Hypothesis,
-    OpenQuestion, Verdict, Verification,
+    OpenQuestion, SourceKind, Verdict, Verification,
 };
+use validity::{EvidenceStrength, Grade, GradeInput, Resolution, Validity};
 
 pub use render::MemoryView;
 
@@ -105,7 +109,124 @@ impl WorkingMemory {
                 }
             }
         }
+        self.recompute_validity();
         id
+    }
+
+    /// 新しい証拠が既存の証拠と矛盾することを記録する（§4.3の矛盾検出）。
+    ///
+    /// 相手のIDは呼び出し側（`crate::hiv::parse`）が**台帳に実在することを検証済み**で渡す。
+    /// ここで自己参照だけは弾く——同じ証拠が自分と矛盾する状態は台帳の不変条件を壊す。
+    pub fn record_conflict(&mut self, a: EvidenceId, b: EvidenceId) {
+        if a == b {
+            return;
+        }
+        for (own, other) in [(a, b), (b, a)] {
+            if let Some(e) = self.evidence.iter_mut().find(|e| e.id == own) {
+                if !e.validity.conflicts.contains(&other) {
+                    e.validity.conflicts.push(other);
+                }
+            }
+        }
+        self.recompute_validity();
+    }
+
+    /// 未決着の矛盾を§4.3の規則（信頼度 → 鮮度）で決着させる。
+    ///
+    /// 戻り値は**決着できなかった組**。呼び出し側（`crate::hiv`）がこれを`OpenQuestion`にする
+    /// ——台帳自身が問いを立てないのは、「ユーザへ何を返すか」の判断が状態機械の側にあるため。
+    pub fn resolve_conflicts(&mut self) -> Vec<(EvidenceId, EvidenceId)> {
+        let pairs: BTreeSet<(EvidenceId, EvidenceId)> = self
+            .evidence
+            .iter()
+            .flat_map(|e| {
+                e.validity
+                    .conflicts
+                    .iter()
+                    .map(move |other| (e.id.min(*other), e.id.max(*other)))
+            })
+            .collect();
+
+        let mut undecided = Vec::new();
+        for (a, b) in pairs {
+            let (Some(ea), Some(eb)) = (self.evidence_by_id(a), self.evidence_by_id(b)) else {
+                continue;
+            };
+            let loser = match validity::resolve_conflict(
+                (ea.validity.trust, ea.validity.freshness),
+                (eb.validity.trust, eb.validity.freshness),
+            ) {
+                Resolution::First => b,
+                Resolution::Second => a,
+                Resolution::Undecided => {
+                    undecided.push((a, b));
+                    continue;
+                }
+            };
+            // 決着したので両者から相手を外す。**負けた側の証拠は消さない**——台帳は
+            // 「何を観測したか」の記録であり、決着の結果は`superseded_by`として残る。
+            let winner = if loser == a { b } else { a };
+            for (own, other) in [(a, b), (b, a)] {
+                if let Some(e) = self.evidence.iter_mut().find(|e| e.id == own) {
+                    e.validity.conflicts.retain(|c| *c != other);
+                    if own == loser {
+                        e.validity.superseded_by = Some(winner);
+                    }
+                }
+            }
+        }
+        self.recompute_validity();
+        undecided
+    }
+
+    /// 台帳の全証拠について`Validity.grade`を引き直す（§4.3）。
+    ///
+    /// **派生値が陳腐化しないことの担保はこの1関数**であり、証拠の追加・矛盾の記録・決着の
+    /// すべてがここを通る。`grade`をアクセサ側で都度計算する形にしなかったのは、設計（§3.4・
+    /// §4.3）が「各EvidenceはSourceRefとValidityを保持する」と定めており、監査ログや
+    /// `--resume`（M20）でそのまま直列化できる必要があるため。
+    fn recompute_validity(&mut self) {
+        let linked: Vec<(EvidenceId, bool, BTreeSet<SourceKind>)> = self
+            .evidence
+            .iter()
+            .map(|e| {
+                // その証拠を支持として持つ仮説の、他の支持証拠の種別を集める。
+                let siblings: BTreeSet<SourceKind> = self
+                    .hypotheses
+                    .iter()
+                    .filter(|h| h.supporting.contains(&e.id))
+                    .flat_map(|h| h.supporting.iter())
+                    .filter(|id| **id != e.id)
+                    .filter_map(|id| self.evidence_by_id(*id))
+                    // 決着で退けられた観測は裏取りに使わない。
+                    .filter(|other| other.validity.superseded_by.is_none())
+                    .map(|other| other.source.kind())
+                    .collect();
+                let is_linked = self
+                    .hypotheses
+                    .iter()
+                    .any(|h| h.supporting.contains(&e.id) || h.refuting.contains(&e.id));
+                (e.id, is_linked, siblings)
+            })
+            .collect();
+
+        for (id, is_linked, siblings) in linked {
+            let Some(e) = self.evidence.iter_mut().find(|e| e.id == id) else {
+                continue;
+            };
+            let kind = e.source.kind();
+            e.validity.grade = validity::grade_for(GradeInput {
+                kind,
+                has_unresolved_conflict: !e.validity.conflicts.is_empty(),
+                superseded: e.validity.superseded_by.is_some(),
+                // **裏取りとして数えるのは接地種別だけ**。web証拠が2件並んでも
+                // `Corroborated`にはしない（§4.2でwebは補助扱い）。
+                corroborated_by_other_kind: siblings
+                    .iter()
+                    .any(|k| *k != kind && k.is_grounding()),
+                linked_to_hypothesis: is_linked,
+            });
+        }
     }
 
     /// 検証結果を記録し、仮説の状態を更新する。
@@ -198,6 +319,59 @@ impl WorkingMemory {
         self.evidence.iter().find(|e| e.id == id)
     }
 
+    /// 仮説の根拠の強さ（§3.4 `evidence_strength`）。**ハーネスが決定的に算出する**ので、
+    /// 自己申告の`Hypothesis.confidence`と違い監査で再現できる。
+    pub fn evidence_strength(&self, hyp: HypId) -> EvidenceStrength {
+        let Some(h) = self.hypothesis(hyp) else {
+            return EvidenceStrength::Ungrounded;
+        };
+        let validities = |ids: &'_ [EvidenceId]| -> Vec<&Validity> {
+            ids.iter()
+                .filter_map(|id| self.evidence_by_id(*id))
+                .map(|e| &e.validity)
+                .collect()
+        };
+        let supporting = validities(&h.supporting);
+        let refuting = validities(&h.refuting);
+        validity::evidence_strength(supporting.into_iter(), refuting.into_iter())
+    }
+
+    /// §3.4【E1】の接地が支持証拠にあるか（`File`/`Shell`/`Mcp`のいずれか1件以上）。
+    /// 矛盾の決着で退けられた観測は数えない。
+    pub fn has_grounded_support(&self, hyp: HypId) -> bool {
+        self.hypothesis(hyp).is_some_and(|h| {
+            h.supporting.iter().any(|id| {
+                self.evidence_by_id(*id)
+                    .is_some_and(|e| e.validity.counts_as_grounding(e.source.kind()))
+            })
+        })
+    }
+
+    /// 支持証拠のうち、まだ決着していない矛盾を抱えているもの（§3.4の遷移条件
+    /// 「未決着Conflictingなし」の判定材料）。
+    pub fn unresolved_conflicts(&self, hyp: HypId) -> Vec<EvidenceId> {
+        self.hypothesis(hyp)
+            .into_iter()
+            .flat_map(|h| h.supporting.iter())
+            .filter(|id| {
+                self.evidence_by_id(**id)
+                    .is_some_and(|e| e.validity.grade == Grade::Conflicting)
+            })
+            .copied()
+            .collect()
+    }
+
+    /// 支持証拠に現れた接地種別の集合（§4.2のCrossSource判定・カタログからの示唆に使う）。
+    pub fn grounded_kinds(&self, hyp: HypId) -> BTreeSet<SourceKind> {
+        self.hypothesis(hyp)
+            .into_iter()
+            .flat_map(|h| h.supporting.iter())
+            .filter_map(|id| self.evidence_by_id(*id))
+            .filter(|e| e.validity.superseded_by.is_none())
+            .map(|e| e.source.kind())
+            .collect()
+    }
+
     /// 直近の検証結果（Criticフェーズが「この結論を反証せよ」と問うための材料）。
     pub fn latest_verification(&self, hyp: HypId) -> Option<&Verification> {
         self.verifications.iter().rev().find(|v| v.hyp == hyp)
@@ -230,16 +404,30 @@ impl WorkingMemory {
 #[cfg(test)]
 mod tests {
     use super::types::{RawRef, SourceRef, VerifyMethod};
+    use super::validity::{Freshness, TrustLevel};
     use super::*;
 
     fn file_evidence(claim: &str) -> impl FnOnce(EvidenceId) -> Evidence + '_ {
-        move |id| Evidence {
-            id,
-            claim: claim.to_string(),
-            source: SourceRef::File {
+        source_evidence(
+            claim,
+            SourceRef::File {
                 path: "src/lib.rs".to_string(),
                 lines: (1, 5),
             },
+            TrustLevel::High,
+        )
+    }
+
+    fn source_evidence(
+        claim: &str,
+        source: SourceRef,
+        trust: TrustLevel,
+    ) -> impl FnOnce(EvidenceId) -> Evidence + '_ {
+        move |id| Evidence {
+            id,
+            claim: claim.to_string(),
+            source,
+            validity: Validity::seed(trust, Freshness::Fresh),
             raw_ref: Some(RawRef {
                 tool_call_id: "call_1".to_string(),
                 chars: 8_000,
@@ -321,6 +509,146 @@ mod tests {
         mem.set_hypothesis_status(refuted, HypStatus::Refuted);
 
         assert_eq!(mem.investigation_order(), vec![high, low]);
+    }
+
+    /// **M16の要**: `grade`は派生値であり、証拠が増えるたびに引き直される。
+    /// 「再計算し忘れた台帳」が観測できないことを固定する。
+    #[test]
+    fn grades_are_recomputed_on_every_mutation() {
+        let mut mem = WorkingMemory::new();
+        let g = mem.add_goal("直す", vec![]);
+        let h = mem.add_hypothesis(g, "原因はX", vec!["Yが見える".into()], 0.5);
+
+        // webだけの観測は単独では確証の根拠にならない（§4.2でwebは補助扱い）。
+        let web = mem.add_evidence(
+            source_evidence(
+                "ドキュメントにそう書いてある",
+                SourceRef::Web {
+                    url: "https://example.com".into(),
+                    fetched_at: "0".into(),
+                },
+                TrustLevel::Medium,
+            ),
+            Some((h, true)),
+        );
+        assert_eq!(mem.evidence_by_id(web).unwrap().validity.grade, Grade::Unverified);
+        assert!(!mem.has_grounded_support(h));
+
+        // ローカルファイルで裏取りできた瞬間、**既存のweb証拠のgradeも**引き直される。
+        let file = mem.add_evidence(file_evidence("実装がそうなっている"), Some((h, true)));
+        assert_eq!(
+            mem.evidence_by_id(web).unwrap().validity.grade,
+            Grade::Corroborated,
+            "追加された別種の接地が既存証拠の妥当性へ反映されなければならない"
+        );
+        // 逆向き（file側）はwebを裏取りに数えない——webは補助なので接地扱いしない。
+        assert_eq!(
+            mem.evidence_by_id(file).unwrap().validity.grade,
+            Grade::SingleSource
+        );
+        assert!(mem.has_grounded_support(h));
+    }
+
+    /// 矛盾は両者に記録され、決着するまで`Conflicting`のまま（§4.3）。
+    #[test]
+    fn a_recorded_conflict_marks_both_sides_until_it_is_decided() {
+        let mut mem = WorkingMemory::new();
+        let g = mem.add_goal("直す", vec![]);
+        let h = mem.add_hypothesis(g, "原因はX", vec![], 0.5);
+        let weak = mem.add_evidence(
+            source_evidence(
+                "旧仕様ではAを呼ぶ",
+                SourceRef::Web {
+                    url: "https://example.com".into(),
+                    fetched_at: "0".into(),
+                },
+                TrustLevel::Low,
+            ),
+            Some((h, true)),
+        );
+        let strong = mem.add_evidence(file_evidence("実装はBを呼ぶ"), Some((h, true)));
+
+        mem.record_conflict(weak, strong);
+        for id in [weak, strong] {
+            assert_eq!(mem.evidence_by_id(id).unwrap().validity.grade, Grade::Conflicting);
+        }
+        assert_eq!(mem.unresolved_conflicts(h), vec![weak, strong]);
+        // 未決着の矛盾を抱えた接地は確証の根拠に数えない。
+        assert!(mem.has_grounded_support(h), "接地種別であること自体は変わらない");
+
+        // 信頼度差で決着し、負けた側だけが根拠から外れる。
+        assert!(mem.resolve_conflicts().is_empty());
+        assert!(mem.unresolved_conflicts(h).is_empty());
+        assert_eq!(
+            mem.evidence_by_id(weak).unwrap().validity.superseded_by,
+            Some(strong)
+        );
+        assert_eq!(mem.evidence_by_id(weak).unwrap().validity.grade, Grade::Unverified);
+        assert_eq!(
+            mem.evidence_by_id(strong).unwrap().validity.grade,
+            Grade::SingleSource
+        );
+        // 負けた観測も台帳からは消えない（監査性）。
+        assert_eq!(mem.evidence().len(), 2);
+    }
+
+    /// 信頼度も鮮度も同じ矛盾は決着させず、呼び出し側へ返す（§4.3「決着不能ならOpenQuestion」）。
+    #[test]
+    fn an_evenly_matched_conflict_is_reported_back_unresolved() {
+        let mut mem = WorkingMemory::new();
+        let g = mem.add_goal("直す", vec![]);
+        let h = mem.add_hypothesis(g, "原因はX", vec![], 0.5);
+        let a = mem.add_evidence(file_evidence("Aと書いてある"), Some((h, true)));
+        let b = mem.add_evidence(file_evidence("Bと書いてある"), Some((h, true)));
+        mem.record_conflict(a, b);
+
+        assert_eq!(mem.resolve_conflicts(), vec![(a, b)]);
+        assert_eq!(mem.unresolved_conflicts(h), vec![a, b]);
+    }
+
+    /// 自己参照の矛盾は記録しない（台帳の不変条件）。
+    #[test]
+    fn an_evidence_cannot_conflict_with_itself() {
+        let mut mem = WorkingMemory::new();
+        let g = mem.add_goal("直す", vec![]);
+        let h = mem.add_hypothesis(g, "原因はX", vec![], 0.5);
+        let e = mem.add_evidence(file_evidence("観測"), Some((h, true)));
+        mem.record_conflict(e, e);
+        assert!(mem.evidence_by_id(e).unwrap().validity.conflicts.is_empty());
+    }
+
+    /// `evidence_strength`は台帳から決定的に決まる（§3.4）。
+    #[test]
+    fn evidence_strength_is_derived_from_the_ledger() {
+        let mut mem = WorkingMemory::new();
+        let g = mem.add_goal("直す", vec![]);
+        let h = mem.add_hypothesis(g, "原因はX", vec![], 0.5);
+        assert_eq!(mem.evidence_strength(h), EvidenceStrength::Ungrounded);
+
+        mem.add_evidence(file_evidence("観測1"), Some((h, true)));
+        let with_one = mem.evidence_strength(h);
+        assert!(with_one > EvidenceStrength::Ungrounded);
+
+        mem.add_evidence(
+            source_evidence(
+                "MCPでも同じ",
+                SourceRef::Mcp {
+                    server: "docs".into(),
+                    tool: "search".into(),
+                    args_digest: "d".into(),
+                },
+                TrustLevel::High,
+            ),
+            Some((h, true)),
+        );
+        assert!(
+            mem.evidence_strength(h) > with_one,
+            "別種ソースでの裏取りは根拠を強くする"
+        );
+        assert_eq!(
+            mem.grounded_kinds(h),
+            BTreeSet::from([SourceKind::File, SourceKind::Mcp])
+        );
     }
 
     #[test]

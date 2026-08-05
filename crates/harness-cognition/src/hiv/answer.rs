@@ -9,11 +9,16 @@
 //!    確証済み仮説が無いときに何を書くかは、モデルの裁量ではなく台帳の状態で決まる。
 
 use crate::hiv::HivStop;
-use crate::memory::types::HypStatus;
+use crate::memory::types::{HypStatus, SourceKind};
+use crate::memory::validity::Grade;
 use crate::memory::WorkingMemory;
 
 /// 最終回答（Markdown）。
-pub(crate) fn render(mem: &WorkingMemory, stop: &HivStop) -> String {
+///
+/// `mcp_available`が`false`のとき、単一ソースの根拠には**「MCP裏取り不可」を明記する**
+/// （§4.2「隠さない」）。降格したこと自体は結論を止める理由にならないが、黙って落とすと
+/// 読み手が「裏取り済みの結論」と受け取ってしまう。
+pub(crate) fn render(mem: &WorkingMemory, stop: &HivStop, mcp_available: bool) -> String {
     let mut out = String::new();
 
     out.push_str("## 結論\n\n");
@@ -45,10 +50,19 @@ pub(crate) fn render(mem: &WorkingMemory, stop: &HivStop) -> String {
         confirmed
     };
 
+    // 確証済みの結論が、裏取りできないまま単一ソースに載っているか（§4.2の降格の明示）。
+    let mut single_source_without_mcp = false;
+
     if !shown.is_empty() {
         out.push_str("\n## 根拠\n\n");
         for h in shown {
-            out.push_str(&format!("- {} [{:?}] {}\n", h.id, h.status, h.statement));
+            out.push_str(&format!(
+                "- {} [{:?}] {}（根拠の強さ: {}）\n",
+                h.id,
+                h.status,
+                h.statement,
+                mem.evidence_strength(h.id).as_str()
+            ));
             for id in h.supporting.iter().chain(h.refuting.iter()) {
                 let Some(e) = mem.evidence_by_id(*id) else {
                     continue;
@@ -58,17 +72,34 @@ pub(crate) fn render(mem: &WorkingMemory, stop: &HivStop) -> String {
                 } else {
                     "支持"
                 };
+                // 妥当性まで出すのが§4.3の監査性（「どのソースの・どの妥当性の情報に
+                // 基づくか」）。台帳の値をそのまま写すので、回答と台帳がずれようがない。
                 out.push_str(&format!(
-                    "  - [{mark}] {} {}（出典: {}）\n",
+                    "  - [{mark}] {} {}（出典: {}／妥当性: {}）\n",
                     e.id,
                     e.claim,
-                    e.source.describe()
+                    e.source.describe(),
+                    e.validity.describe()
                 ));
+                if h.status == HypStatus::Confirmed
+                    && h.supporting.contains(id)
+                    && e.validity.grade == Grade::SingleSource
+                    && e.source.kind() != SourceKind::Mcp
+                {
+                    single_source_without_mcp = true;
+                }
             }
             if let Some(v) = mem.latest_verification(h.id) {
                 out.push_str(&format!("  - 検証: {:?} — {}\n", v.verdict, v.note));
             }
         }
+    }
+
+    if single_source_without_mcp && !mcp_available {
+        out.push_str(
+            "\n**MCP裏取り不可**: 参照できるMCP情報源が無いため、上の根拠はローカルの観測\
+             だけに基づく（`single_source`）。別系統の情報源での照合は行えていない。\n",
+        );
     }
 
     // Decideの`then_verify`は「この行動が効いたかをどう確かめるか」。M15は確認まで
@@ -117,6 +148,7 @@ mod tests {
     use crate::memory::types::{
         Decision, Evidence, SourceRef, Verdict, Verification, VerifyMethod,
     };
+    use crate::memory::validity::{Freshness, TrustLevel, Validity};
 
     fn confirmed_memory() -> WorkingMemory {
         let mut mem = WorkingMemory::new();
@@ -135,6 +167,7 @@ mod tests {
                     path: "src/lib.rs".to_string(),
                     lines: (40, 52),
                 },
+                validity: Validity::seed(TrustLevel::High, Freshness::Fresh),
                 raw_ref: None,
             },
             Some((h, true)),
@@ -158,12 +191,31 @@ mod tests {
 
     #[test]
     fn a_decided_goal_reports_the_action_with_its_grounded_evidence() {
-        let out = render(&confirmed_memory(), &HivStop::Decided);
+        let out = render(&confirmed_memory(), &HivStop::Decided, true);
         assert!(out.contains("lockの取得順を揃える"), "{out}");
         assert!(out.contains("2箇所で逆順にlockを取得している"), "{out}");
-        // 出典が必ず付く（監査性）。
+        // 出典と妥当性が必ず付く（§4.3の監査性）。
         assert!(out.contains("src/lib.rs:40-52"), "{out}");
+        assert!(out.contains("single_source"), "{out}");
+        assert!(out.contains("根拠の強さ"), "{out}");
         assert!(out.contains("cargo test --workspace"), "{out}");
+    }
+
+    /// **§4.2「隠さない」**: MCPで裏取りできていないなら、そう書く。
+    /// ただし結論そのものは出す（降格しても止まらない）。
+    #[test]
+    fn a_single_source_conclusion_says_that_mcp_corroboration_was_unavailable() {
+        let mem = confirmed_memory();
+        let without_mcp = render(&mem, &HivStop::Decided, false);
+        assert!(without_mcp.contains("MCP裏取り不可"), "{without_mcp}");
+        assert!(
+            without_mcp.contains("lockの取得順を揃える"),
+            "降格しても結論は出す: {without_mcp}"
+        );
+
+        // MCPが使える構成では、この注記は出ない（出す理由が無い）。
+        let with_mcp = render(&mem, &HivStop::Decided, true);
+        assert!(!with_mcp.contains("MCP裏取り不可"), "{with_mcp}");
     }
 
     /// **§3.5**: 確証できなかったときに、それらしい結論をでっち上げない。
@@ -174,7 +226,7 @@ mod tests {
         mem.add_hypothesis(g, "原因はキャッシュ", vec!["消せば直る".into()], 0.5);
         mem.add_open_question("再現条件が不明", true);
 
-        let out = render(&mem, &HivStop::BudgetExhausted);
+        let out = render(&mem, &HivStop::BudgetExhausted, true);
         assert!(out.contains("確証できた仮説はない"), "{out}");
         assert!(out.contains("予算"), "{out}");
         assert!(out.contains("**[要判断]** 再現条件が不明"), "{out}");
@@ -190,6 +242,7 @@ mod tests {
             &HivStop::Blocked {
                 reason: "hypothesize が3回ともスキーマ検証に落ちた".to_string(),
             },
+            true,
         );
         assert!(out.contains("スキーマ検証に落ちた"), "{out}");
         assert!(out.contains("推測を結論として返すことはしない"), "{out}");

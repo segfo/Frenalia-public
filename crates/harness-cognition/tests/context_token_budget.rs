@@ -30,6 +30,7 @@
 
 use harness_cognition::context::{ContextAssembler, PhaseInput};
 use harness_cognition::memory::types::{Evidence, EvidenceId, SourceRef};
+use harness_cognition::memory::validity::{Freshness, TrustLevel, Validity};
 use harness_cognition::memory::WorkingMemory;
 use harness_cognition::phase::PhaseBudgets;
 use harness_cognition::ScratchStore;
@@ -221,6 +222,7 @@ fn cognitive_request_sizes(workspace: &std::path::Path, rounds: usize) -> Vec<(P
                     path,
                     lines: (1, 100),
                 },
+                validity: Validity::seed(TrustLevel::High, Freshness::Fresh),
                 raw_ref: Some(raw_ref),
             },
             Some((hyp, i % 2 == 0)),
@@ -432,6 +434,7 @@ async fn raw_tool_output_lives_in_scratch_and_not_in_the_assembled_request() {
                 path: "module_0.rs".to_string(),
                 lines: (1, 100),
             },
+            validity: Validity::seed(TrustLevel::High, Freshness::Fresh),
             raw_ref: Some(raw_ref),
         },
         Some((hyp, true)),

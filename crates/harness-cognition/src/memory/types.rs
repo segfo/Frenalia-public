@@ -3,14 +3,13 @@
 //! ここは**純粋なデータ**で、ファイルにもネットワークにも触れない。生出力の退避は
 //! [`crate::scratch`]、レンダリングは[`super::render`]が持つ。
 //!
-//! # M14で意図的に持たないもの
-//!
-//! `Evidence.validity: Validity`（§4.3の妥当性評価）と`evidence_strength`（§3.4）は
-//! **M16**（SourceBroker + 妥当性）で追加する。評価する側の実装が無い段階で置くと、
-//! 常に既定値を運ぶだけの未検証フィールドになるため（M13が`ToolGate`/`TokenBudget`を
-//! 見送ったのと同じ理由、`docs/phases/cognition/M13-executor-extraction.md`）。
+//! 妥当性評価（`Validity`・`Grade`・`evidence_strength`）は[`super::validity`]が持つ。
+//! 型をこちらへ混ぜないのは、あちらが**判定規則**（§4.3を機械規則へ写したもの）を
+//! 伴うためで、ここは規則を持たない素のデータに保つ。
 
 use serde::{Deserialize, Serialize};
+
+use super::validity::Validity;
 
 /// 台帳内のIDは**追記順の連番**で、`WorkingMemory`だけが採番する。
 /// 外から作れないようにフィールドを非公開にし、「台帳に存在しないIDを参照する」状態を
@@ -107,8 +106,32 @@ pub struct Hypothesis {
     pub refuting: Vec<EvidenceId>,
 }
 
+/// [`SourceRef`]の種別だけを取り出したもの。§4.2のCrossSource判定（「別種のソースで
+/// 裏取りできているか」）は中身ではなく種別の異同で決まるので、比較用にこれを使う。
+///
+/// `Ord`を導出するのは集合（`BTreeSet`）に入れるため。順序自体に意味は無く、
+/// 「どの種別で裏取りできたか」を決定的に列挙するための道具でしかない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    File,
+    Shell,
+    Web,
+    Mcp,
+    Memory,
+    ModelPrior,
+}
+
+impl SourceKind {
+    /// §3.4【E1】の接地種別か。`Confirmed`へ上げるにはこのいずれかが1件以上要る
+    /// ——`ModelPrior`単独はもちろん、`Web`単独でも確証にしない。
+    pub fn is_grounding(self) -> bool {
+        matches!(self, SourceKind::File | SourceKind::Shell | SourceKind::Mcp)
+    }
+}
+
 /// 証拠がどこから来たか（§4.2）。`ModelPrior`が最弱で、単独では`Confirmed`の根拠にできない
-/// （§4.3の接地必須ルール。機械チェックはM15/M16）。
+/// （§4.3の接地必須ルール。機械チェックは`crate::hiv::HivEngine::can_confirm`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceRef {
@@ -153,9 +176,22 @@ impl SourceRef {
     }
 
     /// 一次証拠（ワークスペースの実ファイル・shell観測）か。§4.2の接地優先順位で
-    /// 最上位に来る種別で、§3.4の`Confirmed`遷移条件が要求する接地でもある。
+    /// 最上位に来る種別。`Mcp`は「一次で得た主張の裏取り」の位置なのでここには入らない
+    /// （`Confirmed`遷移が要求する接地の下限は[`SourceKind::is_grounding`]の方）。
     pub fn is_primary(&self) -> bool {
         matches!(self, SourceRef::File { .. } | SourceRef::Shell { .. })
+    }
+
+    /// 種別だけを取り出す（§4.2のCrossSource判定用）。
+    pub fn kind(&self) -> SourceKind {
+        match self {
+            SourceRef::File { .. } => SourceKind::File,
+            SourceRef::Shell { .. } => SourceKind::Shell,
+            SourceRef::Web { .. } => SourceKind::Web,
+            SourceRef::Mcp { .. } => SourceKind::Mcp,
+            SourceRef::Memory { .. } => SourceKind::Memory,
+            SourceRef::ModelPrior => SourceKind::ModelPrior,
+        }
     }
 }
 
@@ -176,6 +212,9 @@ pub struct Evidence {
     /// 数百トークンに蒸留された主張。ここに生出力を入れてはならない。
     pub claim: String,
     pub source: SourceRef,
+    /// 妥当性評価（§4.3）。`trust`/`freshness`は積む時点で情報源カタログが決め、
+    /// `grade`/`conflicts`は台帳が変異のたびに再計算する（[`super::validity`]のdoc参照）。
+    pub validity: Validity,
     /// 生出力へのポインタ。`None`は生出力を持たない証拠（長期記憶ノート等）。
     pub raw_ref: Option<RawRef>,
 }
@@ -273,6 +312,63 @@ mod tests {
         };
         assert_eq!(s.describe(), "src/turn.rs:40-52");
         assert!(!s.describe().contains('\n'));
+    }
+
+    /// §3.4【E1】の接地種別の下限。`Web`/`Memory`/`ModelPrior`は接地にならない。
+    #[test]
+    fn only_file_shell_and_mcp_kinds_count_as_grounding() {
+        for kind in [SourceKind::File, SourceKind::Shell, SourceKind::Mcp] {
+            assert!(kind.is_grounding(), "{kind:?}");
+        }
+        for kind in [SourceKind::Web, SourceKind::Memory, SourceKind::ModelPrior] {
+            assert!(!kind.is_grounding(), "{kind:?}");
+        }
+    }
+
+    /// `kind()`が全バリアントを写していること（`SourceRef`にバリアントを足すと落ちる）。
+    #[test]
+    fn every_source_ref_maps_to_its_kind() {
+        let cases = [
+            (
+                SourceRef::File {
+                    path: "a".into(),
+                    lines: (0, 0),
+                },
+                SourceKind::File,
+            ),
+            (
+                SourceRef::Shell {
+                    cmd: "ls".into(),
+                    exit: 0,
+                },
+                SourceKind::Shell,
+            ),
+            (
+                SourceRef::Web {
+                    url: "https://example.com".into(),
+                    fetched_at: "0".into(),
+                },
+                SourceKind::Web,
+            ),
+            (
+                SourceRef::Mcp {
+                    server: "docs".into(),
+                    tool: "search".into(),
+                    args_digest: "d".into(),
+                },
+                SourceKind::Mcp,
+            ),
+            (
+                SourceRef::Memory {
+                    note_id: "n".into(),
+                },
+                SourceKind::Memory,
+            ),
+            (SourceRef::ModelPrior, SourceKind::ModelPrior),
+        ];
+        for (source, kind) in cases {
+            assert_eq!(source.kind(), kind, "{source:?}");
+        }
     }
 
     /// 行範囲が分からない観測（ファイル全体）は範囲を出さない。

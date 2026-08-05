@@ -73,8 +73,10 @@ pub fn spec(phase: Phase, target: Option<HypId>, goal: Option<GoalId>) -> PhaseS
             // 主入力は生出力（scratchから注入）だが、対象の仮説と反証条件は要る——
             // Distillの出力スキーマが`relation: supports|refutes`を要求しており、
             // 何に対する支持/反証なのかが分からないと判定できないため（§3.3の
-            // 「生出力（1件ずつ）」からのM15での変更点）。他の仮説・既存の証拠は載せない。
-            view: target.map_or(MemoryView::None, MemoryView::HypothesisPlan),
+            // 「生出力（1件ずつ）」からのM15での変更点）。加えてM16では**対象仮説の
+            // 既存観測**も載せる——`contradicts`（§4.3の矛盾検出）はE番号で答えさせるので、
+            // 番号が見えていないと答えようがないため。他の仮説の証拠は載せない。
+            view: target.map_or(MemoryView::None, MemoryView::DistillTarget),
             tools: ToolSelection::None,
             wants_schema: true,
         },
@@ -304,8 +306,8 @@ mod tests {
         assert!(s.tools.admits(RiskClass::Exec));
     }
 
-    /// Investigateは既に得た観測込み、Distillは対象仮説のみ（M15での変更点。
-    /// 前者は同一仮説を複数ラウンド調査するため、後者は`relation`判定に仮説が要るため）。
+    /// Investigateは「重複して調べない」ため、Distillは「矛盾を指摘させる」ために、
+    /// それぞれ別のビューで対象仮説を見る（同じ材料でも用途が違うので節の見出しが違う）。
     #[test]
     fn investigate_and_distill_look_at_the_target_hypothesis_through_different_views() {
         let h = HypId(2);
@@ -315,7 +317,7 @@ mod tests {
         );
         assert_eq!(
             spec(Phase::Distill, Some(h), None).view,
-            MemoryView::HypothesisPlan(h)
+            MemoryView::DistillTarget(h)
         );
         // 対象が無ければどちらも空ビューへ落ちる（組み立ては失敗しない）。
         assert_eq!(spec(Phase::Distill, None, None).view, MemoryView::None);

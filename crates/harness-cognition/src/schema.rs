@@ -74,8 +74,13 @@ fn schema_for(phase: Phase) -> serde_json::Value {
                         // union（supports|refutes）の平坦化。
                         ("relation", enum_prop(&["supports", "refutes", "neutral"])),
                         ("source", string_prop()),
+                        // §4.3の矛盾検出。既存の観測（E番号つきで入力に載る）のうち、
+                        // このclaimと両立しないものを挙げさせる。**判定するのはモデルだが、
+                        // 記録するかどうかはハーネスが決める**（`crate::hiv::parse`が
+                        // E番号の実在を検証してから台帳へ通す）。
+                        ("contradicts", string_array()),
                     ],
-                    &["claim", "relation", "source"],
+                    &["claim", "relation", "source", "contradicts"],
                 )),
             )],
             &["evidence"],
@@ -191,6 +196,14 @@ pub struct DistilledEvidence {
     pub claim: String,
     pub relation: EvidenceRelation,
     pub source: String,
+    /// このclaimと両立しない既存の証拠のID（`"E3"`）。§4.3の矛盾検出。
+    ///
+    /// スキーマ側では必須（strictは全プロパティのrequiredを要求する）だが、受け皿は
+    /// **欠落を許す**。`SchemaStrategy::PromptEmbedded`への降格経路ではモデルが省くことが
+    /// あり、そこで丸ごとデシリアライズに失敗すると蒸留そのものが落ちるため。欠落は
+    /// 「矛盾なし」として受け、意味の検証は`crate::hiv::parse`が行う（§3.4の2段構え）。
+    #[serde(default)]
+    pub contradicts: Vec<String>,
 }
 
 /// `supports:HypId|refutes:HypId`の平坦化（スキーマ規約のunion禁止）。
@@ -345,10 +358,12 @@ mod tests {
         assert_eq!(inv.plan[0].source, "read_file");
 
         let distill: DistillOutput = serde_json::from_value(serde_json::json!({
-            "evidence": [{ "claim": "2箇所で逆順に取得している", "relation": "supports", "source": "src/lib.rs:40-52" }]
+            "evidence": [{ "claim": "2箇所で逆順に取得している", "relation": "supports",
+                           "source": "src/lib.rs:40-52", "contradicts": ["E3"] }]
         }))
         .unwrap();
         assert_eq!(distill.evidence[0].relation, EvidenceRelation::Supports);
+        assert_eq!(distill.evidence[0].contradicts, vec!["E3".to_string()]);
 
         let verify: VerifyOutput = serde_json::from_value(serde_json::json!({
             "verdict": "confirms", "missing": [], "note": "再現した"
@@ -414,6 +429,29 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert!(required.contains(&"predicts"), "{required:?}");
+    }
+
+    /// §4.3の矛盾検出は、Distillの出力スキーマが`contradicts`を要求することで成立する。
+    #[test]
+    fn distill_schema_asks_which_existing_observations_are_contradicted() {
+        let s = schema(Phase::Distill);
+        let required: Vec<&str> = s["properties"]["evidence"]["items"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"contradicts"), "{required:?}");
+    }
+
+    /// `contradicts`の欠落はデシリアライズを落とさない（プロンプト埋込降格への保険）。
+    #[test]
+    fn a_missing_contradicts_field_is_read_as_no_conflict() {
+        let distill: DistillOutput = serde_json::from_value(serde_json::json!({
+            "evidence": [{ "claim": "c", "relation": "neutral", "source": "s" }]
+        }))
+        .unwrap();
+        assert!(distill.evidence[0].contradicts.is_empty());
     }
 
     /// §3.4「confidenceは遷移ゲートに使わない」の、スキーマ側の担保。Verifyには

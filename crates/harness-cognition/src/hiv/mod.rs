@@ -41,13 +41,14 @@ use tokio_util::sync::CancellationToken;
 use crate::context::{ContextAssembler, PhaseInput};
 use crate::hiv::call::{Conclusion, PhaseError, PhaseRunner, PhaseValue};
 use crate::memory::types::{
-    Decision, GoalId, GoalStatus, HypId, HypStatus, SourceRef, Verdict, Verification, VerifyMethod,
+    Decision, GoalId, GoalStatus, HypId, HypStatus, Verdict, Verification, VerifyMethod,
 };
 use crate::memory::WorkingMemory;
 use crate::schema::{
     DecideOutput, DistillOutput, HypothesizeOutput, InvestigateOutput, VerifyOutput, VerifyVerdict,
 };
 use crate::scratch::ScratchStore;
+use crate::source::SourceCatalog;
 
 /// ループの上限（`plans/DESIGN-COGNITION.md` §3.5のうちM15で実装する部分）。
 ///
@@ -126,6 +127,9 @@ pub struct HivEngine {
     mem: WorkingMemory,
     assembler: ContextAssembler,
     scratch: Option<ScratchStore>,
+    /// 情報源カタログ（M16、§4.2）。証拠の`trust`/`freshness`の決定と、CrossSourceの
+    /// 示唆に使う。`ContextAssembler`も同じカタログを持つ（あちらはInvestigateへ見せる用）。
+    catalog: SourceCatalog,
     limits: HivLimits,
     /// 実際に投げたプロバイダ呼び出しの数（スキーマ再実行も1回として数える）。
     calls_made: usize,
@@ -140,12 +144,14 @@ impl HivEngine {
     pub fn new(
         assembler: ContextAssembler,
         scratch: Option<ScratchStore>,
+        catalog: SourceCatalog,
         limits: HivLimits,
     ) -> Self {
         Self {
             mem: WorkingMemory::new(),
             assembler,
             scratch,
+            catalog,
             limits,
             calls_made: 0,
             usage: Usage::default(),
@@ -232,7 +238,7 @@ impl HivEngine {
             // `AgentLoopOutcome.text`が空になるのと同じ扱い）。
             HivStop::Cancelled => String::new(),
             HivStop::Decided | HivStop::Blocked { .. } | HivStop::BudgetExhausted => {
-                answer::render(&self.mem, &stop)
+                answer::render(&self.mem, &stop, self.catalog.has_mcp(cx.tools))
             }
         };
         HivOutcome {
@@ -356,7 +362,14 @@ impl HivEngine {
                 )
                 .await?;
             let out = self.account(distilled).expect("Required yields a value");
-            evidence::record_distilled(&mut self.mem, hyp, &observation, out, cx.events);
+            evidence::record_distilled(
+                &mut self.mem,
+                hyp,
+                &observation,
+                out,
+                &self.catalog,
+                cx.events,
+            );
         }
 
         Ok(Some(State::Verify(hyp)))
@@ -367,6 +380,18 @@ impl HivEngine {
         hyp: HypId,
         cx: &HivContext<'_>,
     ) -> Result<Option<State>, PhaseError> {
+        // **§4.3「Verifyで決着」**: 検証コールの前に矛盾を機械的に決着させる。先に済ませるのは、
+        // 決着の結果が`Validity.grade`を通じて検証コールの入力（台帳スライス）へ反映されるため。
+        for (a, b) in self.mem.resolve_conflicts() {
+            self.mem.add_open_question(
+                format!(
+                    "{a}と{b}が矛盾しており、信頼度・鮮度のどちらでも優劣が付かない。\
+                     どちらを採るか判断が要る。"
+                ),
+                false,
+            );
+        }
+
         let result: PhaseValue<VerifyOutput> = self
             .runner(cx)
             .run(
@@ -389,14 +414,21 @@ impl HivEngine {
         };
         let mut missing = out.missing;
 
-        // **§3.4の接地チェック**: 自己申告の`confirms`だけでは確証にしない。
-        if verdict == Verdict::Confirms && !self.has_primary_grounding(hyp) {
-            verdict = Verdict::Inconclusive;
-            missing.push(
-                "ワークスペースのファイル・shell実行・MCPのいずれかで直接観測した証拠が無い\
-                 （web・モデルの内部知識だけでは確証にしない）"
-                    .to_string(),
-            );
+        // **§3.4の遷移条件**: 自己申告の`confirms`だけでは確証にしない。
+        if verdict == Verdict::Confirms {
+            if let Err(reason) = self.can_confirm(hyp) {
+                verdict = Verdict::Inconclusive;
+                missing.push(reason);
+            }
+        }
+        // 確証したが単一ソースどまりで、まだ使っていない別種の接地が残っている場合は
+        // 裏取りを促す（§4.3「裏取り強化ルール」）。**確証は止めない**——§4.2が
+        // 「MCPが使えないときはCrossSource要求を免除」「降格しても結論は出せる」と定めており、
+        // 使える情報源が残っているかどうかで結論の可否が変わるのは筋が通らないため。
+        if verdict == Verdict::Confirms {
+            if let Some(hint) = self.cross_source_hint(hyp, cx.tools) {
+                missing.push(hint);
+            }
         }
 
         self.mem.record_verification(Verification {
@@ -418,6 +450,7 @@ impl HivEngine {
                 verdict: format!("{verdict:?}").to_lowercase(),
                 missing,
                 promoted,
+                strength: self.mem.evidence_strength(hyp).as_str().to_string(),
             },
         );
 
@@ -474,20 +507,57 @@ impl HivEngine {
         Ok(None)
     }
 
-    /// §3.4の接地種別の下限（【E1】）。`File`/`Shell`/`Mcp`のいずれかが1件以上要る
-    /// ——`ModelPrior`単独はもちろん、`Web`単独でも確証にしない。
+    /// §3.4の`Confirmed`遷移条件。**条件を足すのはこの関数だけ**にする（判定を1箇所に保つ）。
     ///
-    /// **M16で`Validity`（Corroborated/Conflicting）が入っても、M19でCritic通過が
-    /// 加わっても、条件を足すのはこの関数だけ**にする（§3.4の判定を1箇所に保つ）。
-    fn has_primary_grounding(&self, hyp: HypId) -> bool {
-        let Some(h) = self.mem.hypothesis(hyp) else {
-            return false;
-        };
-        h.supporting.iter().any(|id| {
-            self.mem
-                .evidence_by_id(*id)
-                .is_some_and(|e| e.source.is_primary() || matches!(e.source, SourceRef::Mcp { .. }))
-        })
+    /// 現在の条件は2つ:
+    ///
+    /// 1. **接地種別の下限【E1】** — `File`/`Shell`/`Mcp`のいずれかが1件以上。`ModelPrior`単独は
+    ///    もちろん、`Web`単独でも確証にしない。矛盾の決着で退けられた観測も数えない。
+    /// 2. **未決着Conflictingなし**（M16） — 支持証拠が矛盾を抱えたままなら確証へ上げない。
+    ///
+    /// M19のCritic通過はここへ足す。`Err`の中身はそのまま`Verification.missing`へ入り、
+    /// ユーザにも次ラウンドのモデルにも「何が足りないか」として見える。
+    fn can_confirm(&self, hyp: HypId) -> Result<(), String> {
+        if !self.mem.has_grounded_support(hyp) {
+            return Err("ワークスペースのファイル・shell実行・MCPのいずれかで直接観測した証拠が無い\
+                 （web・モデルの内部知識だけでは確証にしない）"
+                .to_string());
+        }
+        let conflicts = self.mem.unresolved_conflicts(hyp);
+        if !conflicts.is_empty() {
+            let labels: Vec<String> = conflicts.iter().map(|id| id.label()).collect();
+            return Err(format!(
+                "支持する証拠に未決着の矛盾がある（{}）。どちらが正しいかを判定できる観測が要る",
+                labels.join("・")
+            ));
+        }
+        Ok(())
+    }
+
+    /// 裏取りの示唆（§4.3「裏取り強化ルール」）。単一ソースどまりで、かつ**実際に呼べる**
+    /// 別種の接地が残っているときだけ返す。カタログに無いものは示唆しない——出せない要求を
+    /// `missing`へ書くと、次ラウンドのモデルが達成不能な指示を追い続ける。
+    fn cross_source_hint(&self, hyp: HypId, tools: &ToolRegistry) -> Option<String> {
+        let used = self.mem.grounded_kinds(hyp);
+        let left = self.catalog.grounding_kinds_not_yet_used(tools, &used);
+        if left.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = left
+            .iter()
+            .map(|k| match k {
+                crate::memory::types::SourceKind::File => "ワークスペースのファイル",
+                crate::memory::types::SourceKind::Shell => "コマンド実行",
+                crate::memory::types::SourceKind::Mcp => "MCP",
+                crate::memory::types::SourceKind::Web
+                | crate::memory::types::SourceKind::Memory
+                | crate::memory::types::SourceKind::ModelPrior => "その他",
+            })
+            .collect();
+        Some(format!(
+            "単一の情報源しか根拠になっていない。{}でも裏取りできればより確かになる（必須ではない）",
+            names.join("・")
+        ))
     }
 
     fn rounds_left(&self, hyp: HypId) -> bool {
@@ -545,7 +615,8 @@ fn verify_method_for(plan: Option<&InvestigateOutput>) -> VerifyMethod {
 mod tests {
     use super::testing::{phase_of, PhaseExecutor, Reply};
     use super::*;
-    use crate::memory::types::Evidence;
+    use crate::memory::types::{Evidence, SourceRef};
+    use crate::memory::validity::{Freshness, TrustLevel, Validity};
     use crate::phase::PhaseBudgets;
     use harness_engine::TurnVisibility;
 
@@ -562,9 +633,15 @@ mod tests {
     }
 
     fn engine(limits: HivLimits) -> HivEngine {
+        engine_with(SourceCatalog::with_builtin_defaults(), limits)
+    }
+
+    fn engine_with(catalog: SourceCatalog, limits: HivLimits) -> HivEngine {
         HivEngine::new(
-            ContextAssembler::new("test-model", PhaseBudgets::default()),
+            ContextAssembler::new("test-model", PhaseBudgets::default())
+                .with_catalog(catalog.clone()),
             None,
+            catalog,
             limits,
         )
     }
@@ -583,9 +660,14 @@ mod tests {
     }
 
     fn distill(claim: &str, relation: &str) -> Reply {
+        distill_contradicting(claim, relation, &[])
+    }
+
+    fn distill_contradicting(claim: &str, relation: &str, contradicts: &[&str]) -> Reply {
         Reply::Text(
             serde_json::json!({
-                "evidence": [{ "claim": claim, "relation": relation, "source": "read_file" }]
+                "evidence": [{ "claim": claim, "relation": relation, "source": "read_file",
+                               "contradicts": contradicts }]
             })
             .to_string(),
         )
@@ -805,12 +887,46 @@ mod tests {
                     id,
                     claim: "観測".to_string(),
                     source: recorded,
+                    validity: Validity::seed(TrustLevel::High, Freshness::Fresh),
                     raw_ref: None,
                 },
                 Some((h, true)),
             );
-            assert_eq!(e.has_primary_grounding(h), grounded, "{source:?}");
+            assert_eq!(e.can_confirm(h).is_ok(), grounded, "{source:?}");
         }
+    }
+
+    /// **§3.4のもう1つの遷移条件（M16）**: 支持証拠が未決着の矛盾を抱えていたら確証へ上げない。
+    #[test]
+    fn an_unresolved_conflict_blocks_confirmation() {
+        let mut e = engine(HivLimits::default());
+        let g = e.mem.add_goal("直す", vec![]);
+        let h = e
+            .mem
+            .add_hypothesis(g, "原因はX", vec!["Yが見える".into()], 0.7);
+        let mut add = |claim: &'static str, trust| {
+            e.mem.add_evidence(
+                move |id| Evidence {
+                    id,
+                    claim: claim.to_string(),
+                    source: SourceRef::File {
+                        path: "a.rs".into(),
+                        lines: (0, 0),
+                    },
+                    validity: Validity::seed(trust, Freshness::Fresh),
+                    raw_ref: None,
+                },
+                Some((h, true)),
+            )
+        };
+        let a = add("Aと書いてある", TrustLevel::High);
+        let b = add("Bと書いてある", TrustLevel::High);
+        assert!(e.can_confirm(h).is_ok(), "矛盾が無いうちは接地だけで通る");
+
+        e.mem.record_conflict(a, b);
+        let err = e.can_confirm(h).unwrap_err();
+        assert!(err.contains("未決着の矛盾"), "{err}");
+        assert!(err.contains(&a.label()) && err.contains(&b.label()), "{err}");
     }
 
     /// 自己申告の`confirms`がweb証拠だけで来ても`Confirmed`へ上げず、不足を記録する。

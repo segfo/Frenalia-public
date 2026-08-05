@@ -16,8 +16,15 @@ pub enum MemoryView {
     GoalSummary,
     /// ゴール + unknowns + 既存仮説の要旨。Hypothesize用。
     Unknowns,
-    /// 対象仮説1本 + その`predicts`。Distill用（生出力をどの仮説に照らして蒸留するか）。
+    /// 対象仮説1本 + その`predicts`。
     HypothesisPlan(HypId),
+    /// [`HypothesisPlan`](MemoryView::HypothesisPlan) + **既存観測のclaim（E番号つき）**。Distill用。
+    ///
+    /// E番号を見せるのは§4.3の矛盾検出のため——Distillの出力スキーマの`contradicts`は
+    /// 「どの既存観測と両立しないか」をE番号で答えさせるので、番号が見えていないと答えようがない。
+    /// 予算が苦しいときは既存観測の節から落ちる（[`Reduction::DropUnlinkedEvidence`]以上）。
+    /// 矛盾を検出できなくなるだけで、蒸留そのものは成立し続ける。
+    DistillTarget(HypId),
     /// 対象仮説 + `predicts` + **既に得た観測のclaim**。Investigate用。
     ///
     /// [`HypothesisPlan`](MemoryView::HypothesisPlan)と分けているのは、Investigateが
@@ -72,6 +79,7 @@ impl WorkingMemory {
             MemoryView::GoalSummary => self.render_goal_summary(),
             MemoryView::Unknowns => self.render_unknowns(reduction),
             MemoryView::HypothesisPlan(hyp) => self.render_hypothesis_plan(hyp),
+            MemoryView::DistillTarget(hyp) => self.render_distill_target(hyp, reduction),
             MemoryView::InvestigationState(hyp) => self.render_investigation_state(hyp),
             MemoryView::EvidenceFor(hyp) => self.render_evidence_for(hyp, reduction),
             MemoryView::VerificationOf(hyp) => self.render_verification_of(hyp),
@@ -137,6 +145,26 @@ impl WorkingMemory {
             &mut out,
             "反証条件（これが見えれば偽）",
             h.predicts.iter().cloned(),
+        );
+        out
+    }
+
+    /// Distill用。`HypothesisPlan`に「既存の観測（E番号つき）」を足したもの（§4.3の矛盾検出）。
+    fn render_distill_target(&self, hyp: HypId, reduction: Reduction) -> String {
+        let mut out = self.render_hypothesis_plan(hyp);
+        if out.is_empty() || reduction >= Reduction::DropUnlinkedEvidence {
+            return out;
+        }
+        let Some(h) = self.hypothesis(hyp) else {
+            return out;
+        };
+        push_section(
+            &mut out,
+            "既存の観測（両立しないものがあればそのE番号をcontradictsに書く）",
+            h.supporting
+                .iter()
+                .chain(h.refuting.iter())
+                .filter_map(|id| self.claim_line(*id)),
         );
         out
     }
@@ -235,9 +263,18 @@ impl WorkingMemory {
 
     // --- 補助 ---
 
+    /// 証拠1件の1行表現。**妥当性まで出す**のは、Verifyが「単一ソースのままか」「矛盾を
+    /// 抱えたままか」を見て判定できる必要があるため（§4.3）。生出力へのポインタは出さない。
     fn claim_line(&self, id: crate::memory::types::EvidenceId) -> Option<String> {
-        self.evidence_by_id(id)
-            .map(|e| format!("{} {}（出典: {}）", e.id, e.claim, e.source.describe()))
+        self.evidence_by_id(id).map(|e| {
+            format!(
+                "{} {}（出典: {}／妥当性: {}）",
+                e.id,
+                e.claim,
+                e.source.describe(),
+                e.validity.describe()
+            )
+        })
     }
 
     /// どの仮説にも紐付いていない証拠。
@@ -304,6 +341,7 @@ mod tests {
     use crate::memory::types::{
         Evidence, EvidenceId, RawRef, SourceRef, Verdict, Verification, VerifyMethod,
     };
+    use crate::memory::validity::{Freshness, TrustLevel, Validity};
 
     fn evidence(claim: &str) -> impl FnOnce(EvidenceId) -> Evidence + '_ {
         move |id| Evidence {
@@ -313,6 +351,7 @@ mod tests {
                 path: "src/lib.rs".to_string(),
                 lines: (1, 5),
             },
+            validity: Validity::seed(TrustLevel::High, Freshness::Fresh),
             raw_ref: Some(RawRef {
                 tool_call_id: "call_1".to_string(),
                 chars: 12_000,
@@ -364,6 +403,37 @@ mod tests {
         assert!(out.contains("並列時のみ失敗"), "{out}");
         // 他の仮説も、既に集めた証拠も入れない（§3.3「対象仮説1本 + その predicts」）。
         assert!(!out.contains("原因はタイムアウト値"), "{out}");
+        assert!(!out.contains("並列実行時だけ失敗する"), "{out}");
+    }
+
+    /// **§4.3の矛盾検出の前提**: Distillのビューは既存観測を**E番号つきで**見せる
+    /// （`contradicts`はE番号で答えさせるので、番号が見えていないと答えようがない）。
+    #[test]
+    fn distill_view_shows_existing_observations_with_their_ids() {
+        let (mem, alive, _) = memory_with_two_hypotheses();
+        let out = mem.render(MemoryView::DistillTarget(alive), Reduction::Full);
+        assert!(out.contains("原因はロック順序"), "{out}");
+        assert!(out.contains("並列実行時だけ失敗する"), "{out}");
+        let first = mem.hypothesis(alive).unwrap().supporting[0].label();
+        assert!(
+            out.contains(&first),
+            "E番号（{first}）が見えなければcontradictsを書けない: {out}"
+        );
+        assert!(out.contains("contradicts"), "{out}");
+        // 他の仮説に紐付かない観測までは持ち込まない。
+        assert!(!out.contains("無関係な観測"), "{out}");
+    }
+
+    /// 予算が苦しいときは既存観測から落ちる（矛盾を検出できなくなるだけで蒸留は成立する）。
+    #[test]
+    fn distill_view_drops_the_existing_observations_under_budget_pressure() {
+        let (mem, alive, _) = memory_with_two_hypotheses();
+        let out = mem.render(
+            MemoryView::DistillTarget(alive),
+            Reduction::DropUnlinkedEvidence,
+        );
+        assert!(out.contains("原因はロック順序"), "{out}");
+        assert!(out.contains("並列時のみ失敗"), "反証条件は残す: {out}");
         assert!(!out.contains("並列実行時だけ失敗する"), "{out}");
     }
 

@@ -101,6 +101,10 @@ pub enum AgentEvent {
         id: String,
         claim: String,
         source: String,
+        /// 妥当性の1行表現（`"single_source/trust:high"`、M16）。`Validity::describe()`の結果を
+        /// 文字列で運ぶ——台帳の型は`harness-cognition`にあり、ここが依存すると逆流するため
+        /// （`HypothesisFormed.id`と同じ理由）。
+        validity: String,
     },
     /// 仮説の検証結果が出た（M15）。`verdict`は`"confirms"`/`"refutes"`/`"inconclusive"`、
     /// `promoted`は§3.4の接地チェックまで通って`Confirmed`へ昇格したか。
@@ -109,6 +113,9 @@ pub enum AgentEvent {
         verdict: String,
         missing: Vec<String>,
         promoted: bool,
+        /// 根拠の強さ（`"strong"`/`"moderate"`/`"weak"`/`"ungrounded"`、M16）。
+        /// ハーネスが台帳から決定的に算出したもので、モデルの自己申告ではない（§3.4）。
+        strength: String,
     },
     /// 縮退したターンを破棄した（`plans/DESIGN-COGNITION.md` §11.4、M21）。
     ///
