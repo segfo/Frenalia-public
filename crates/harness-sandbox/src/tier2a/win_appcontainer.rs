@@ -267,6 +267,24 @@ pub use traverse::*;
 // `smoke_test_spawn`・`grant_ace_mask`・`sid_ace_mask`・`probe_passthrough`といった内部関数を
 // `pub`にせざるを得ず、公開面を絞る方針と衝突するため（`docs/CODE-STRUCTURE-RULES.md`規則2/4）。
 
+/// テスト用: **このセッションの**package SID（D-37）。
+///
+/// `preflight`を呼ぶ実機テストは必ずこれを使い、旧共有プロファイル`CONTAINER_NAME`を
+/// 使ってはいけない。D-37でプロファイルはセッション単位になり、`preflight`がworkspace・
+/// CoW upper・redirector DLLへACEを付ける先も、製品が子プロセスを起動するSID
+/// （`harness-tools/src/shell.rs`）も、どちらもセッションSIDになった。テストだけが
+/// `CONTAINER_NAME`のまま取り残されると、**`preflight`は正しくACEを付けるのに子はそのACEを
+/// 持たない別のSIDで動く**——redirector DLLを読めず`LoadLibraryW`がNULLを返す。
+/// これが`docs/STATUS.md`旧Tier2a残課題#7（CoW封じ込めE2E 16/17赤）の正体だった。
+/// 製品の`--cow`経路は壊れておらず、E2Eだけが実態を測らなくなっていた。
+///
+/// `session_token`はプロセス内で固定なので、`preflight`の前後どちらで呼んでも同じSIDになる。
+#[cfg(all(windows, test))]
+fn session_sid() -> OwnedContainerSid {
+    ensure_profile(&crate::tier2a::session_profile::current_profile_name())
+        .expect("ensure_profile (this session's profile, D-37)")
+}
+
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;
 

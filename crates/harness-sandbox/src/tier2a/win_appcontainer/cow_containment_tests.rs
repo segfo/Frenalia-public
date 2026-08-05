@@ -66,7 +66,7 @@ fn cow_write_is_redirected_to_upper_and_workspace_stays_unchanged() {
     std::fs::write(workspace.path().join("important.txt"), "original")
         .expect("seed important.txt");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -133,7 +133,7 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
     ));
     std::fs::create_dir_all(&external).expect("create external rw root");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -242,7 +242,7 @@ fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
     ));
     std::fs::create_dir_all(&outside).expect("create outside dir (no ACE granted)");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -302,7 +302,7 @@ fn workspace_write_fails_closed_without_redirector_injection() {
     std::fs::write(workspace.path().join("important.txt"), "original")
         .expect("seed important.txt");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -345,7 +345,7 @@ fn cow_write_from_grandchild_process_is_redirected_to_upper() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -430,7 +430,7 @@ fn cow_write_via_createprocessa_grandchild_is_redirected_to_upper() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -495,7 +495,7 @@ fn cow_write_via_winexec_grandchild_is_redirected_to_upper() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -565,7 +565,7 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_upper() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -645,7 +645,7 @@ fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
         }
     });
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -723,7 +723,7 @@ fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
     std::fs::write(workspace.path().join("important.txt"), "original")
         .expect("seed important.txt");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -808,7 +808,7 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
     std::fs::write(workspace.path().join("important.txt"), "original")
         .expect("seed important.txt");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -916,7 +916,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
     std::fs::write(workspace.path().join("important.txt"), "original")
         .expect("seed important.txt");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     // workspace本体へのRO ACEはworkspace単位で共有されるモードのため、同じ"ro"モードの
     // 複数セッションに対して複数回`preflight`を呼んでも（`workspace_ledger::begin_workspace_mode`
     // は他モードとの排他しか見ないため）衝突しない。**ただし各upper_dirへのRW ACEは
@@ -1104,7 +1104,7 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
     std::fs::write(workspace.path().join("old.txt"), "original-content")
         .expect("seed old.txt");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -1201,7 +1201,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
     std::fs::write(workspace.path().join("doomed.txt"), "to-be-deleted")
         .expect("seed doomed.txt");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         upper_dir: upper.path().to_path_buf(),
     };
@@ -1523,7 +1523,30 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
     }
 
     let (x64_exe, x86_exe) = proc_probe_exe_paths();
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    let sid = session_sid();
+
+    // D-37: プロセス生成チェーンのプローブexeは`target\debug\deps`にあり、**workspaceの外**である。
+    // 旧共有プロファイルの頃はリポジトリrootへの継承ACEがたまたまここまで届いていたが、
+    // セッションSIDになった今は誰も付与しない。その結果サンドボックスの子からは
+    // `exe.exists()`すらfalseになり、次世代を起動できずに
+    // `spawn.error = "probe exe not found"`でチェーンが1世代で切れる。
+    // redirector DLLに対して`preflight`のCoW分岐がやっているのと同じ扱いを、
+    // **テスト専用のこのexeにも**明示的に与える（製品のサンドボックスがこのexeへ到達できる
+    // 必要は無いので、付与はテスト側の責務である）。
+    let probe_exes = [x64_exe.clone(), x86_exe.clone()];
+    for exe in &probe_exes {
+        grant_ace_inheritable_access(exe, sid.as_psid(), FsAccess::ReadExec)
+            .expect("grant the chain probe exe to this session (D-37)");
+        // 台帳へ載せておけば、テストがパニックしても次回起動のGCが剥がす。
+        crate::tier2a::session_profile::record_granted_path(exe);
+    }
+    let guard_sid = session_sid();
+    let guard_exes = probe_exes.clone();
+    let _probe_exe_guard = scopeguard(move || {
+        for exe in &guard_exes {
+            let _ = revoke_ace(exe, guard_sid.as_psid());
+        }
+    });
 
     // 読み取り側の脱走試行用: workspace外（ACL未付与）の秘密ファイル。全チェーンで
     // 使い回して構わない（読み取り専用チェックのため、書き換わらない）。

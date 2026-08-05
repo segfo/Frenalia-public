@@ -148,7 +148,11 @@ fn preflight_keeps_harness_control_dir_unwritable_to_appcontainer_child() {
     )
     .expect("seed settings");
 
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    // D-37: `preflight`が付与するのはこのセッションのSID。旧共有`CONTAINER_NAME`で子を
+    // 起動すると、workspaceにも`.harness`にもそのSIDのACEが無い状態で走るため、
+    // 「`.harness`へ書けない」が**正しい理由で**成立しているのか（保護が効いている）
+    // 「そもそもどこにも書けない」だけなのか区別できない。旧STATUS残課題#7と同じ形の取り違え。
+    let sid = session_sid();
     let result = preflight(workspace.path(), &[], None, &WorkspaceWriteMode::DirectRw);
     if result.is_err() {
         let output = std::process::Command::new("icacls")
@@ -210,7 +214,8 @@ fn appcontainer_child_cannot_reach_uac_elevation_broker() {
     };
 
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    // D-37: `preflight`が付与する先＝このセッションのSIDで子を起動する（上と同じ理由）。
+    let sid = session_sid();
     preflight(workspace.path(), &[], None, &WorkspaceWriteMode::DirectRw)
         .expect("preflight (direct-rw)");
 
