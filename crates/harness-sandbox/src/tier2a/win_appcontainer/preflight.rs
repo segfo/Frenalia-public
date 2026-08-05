@@ -168,58 +168,145 @@ const FS_PASSTHROUGH_RW_PROBE_COMMAND: &str = "\
         exit 3 \
     }";
 
-/// D9: passthroughルートが到達不能だったときの原因診断。生エラーメッセージに加え、
-/// **`path`自身からドライブルートまでの全祖先**（`grant_traverse_chain`と同じ列挙順）の
-/// traverse ACE有無を実地チェックし、欠けているノードを名指しする。従来はドライブルート
-/// 1箇所しか見ていなかったが、`C:\Users\<user>\.cargo`のように中間の祖先（`C:\Users`・
-/// `C:\Users\<user>`）が欠けているケースを診断できなかった
-/// （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記10で判明）。
-/// 修復手順は`harness fs grant-traverse <path>`（連鎖化済み、追記13）を1回提示するだけでよい。
-fn diagnose_unreachable_passthrough(sid: PSID, path: &Path, raw_message: &str) -> String {
-    let mut chain: Vec<std::path::PathBuf> = path.ancestors().map(|p| p.to_path_buf()).collect();
-    chain.reverse();
+/// D9診断の材料。**Win32の読み取り結果をここへ写してから判定へ渡す**ことで、判定側
+/// （[`describe_passthrough_chain`]）を実機・管理者権限なしに全数テストできる形に保つ
+/// （`docs/CODE-STRUCTURE-RULES.md`規則3、先行例は`session_profile::plan_reclaim`）。
+///
+/// **`leaf`と`ancestors`でSIDの系統が違う**のが本型の存在理由である（D-37、BUG-058）。
+pub(crate) struct PassthroughChainFacts {
+    /// leaf（fs-allowで許可したパス自身）が**セッションpackage SID**から見て持つマスク。
+    pub(crate) leaf_mask: Option<u32>,
+    /// leafに必要なマスク（[`required_passthrough_mask`]）。
+    pub(crate) required_leaf_mask: u32,
+    /// leafの親からドライブルートまでの祖先が、**capability SID**から見て持つマスク
+    /// （浅い方から深い方の順、`grant_traverse_chain`と同じ列挙順）。
+    pub(crate) ancestors: Vec<(std::path::PathBuf, Option<u32>)>,
+}
 
-    let mut missing = Vec::new();
-    for node in &chain {
-        match sid_ace_mask(node, sid) {
-            Ok(Some(mask)) if mask & FILE_TRAVERSE.0 != 0 && mask & FILE_READ_ATTRIBUTES.0 != 0 => {
-            }
-            Ok(Some(_)) => missing.push(format!(
-                "{} (has a sandbox SID ACE but missing FILE_TRAVERSE|FILE_READ_ATTRIBUTES)",
+const TRAVERSE_REQUIRED_MASK: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;
+
+/// D9の診断文を組み立てる（純粋関数）。
+///
+/// **祖先とleafは別の主体が別のACEで賄っている**（D-37）。祖先の通過権は全セッションで
+/// 共有する永続capability SID（`traverse_capability_sid`）が持ち、leafへの読み書きは
+/// そのセッション限りのpackage SIDが持つ。したがって診断も2系統に分けなければならない
+/// ——BUG-058以前は両方をセッションSIDで見ていたため、traverseが正常でも全祖先を
+/// 「ACEが無い」と報告していた。
+pub(crate) fn describe_passthrough_chain(
+    path: &Path,
+    raw_message: &str,
+    facts: &PassthroughChainFacts,
+) -> String {
+    let missing_ancestors: Vec<String> = facts
+        .ancestors
+        .iter()
+        .filter(|(_, mask)| !mask.is_some_and(|m| m & TRAVERSE_REQUIRED_MASK == TRAVERSE_REQUIRED_MASK))
+        .map(|(node, mask)| match mask {
+            Some(_) => format!(
+                "{} (has a traverse-capability ACE but missing FILE_TRAVERSE|FILE_READ_ATTRIBUTES)",
                 node.display()
-            )),
-            Ok(None) | Err(_) => missing.push(format!(
-                "{} (no traverse ACE for the sandbox SID)",
+            ),
+            None => format!(
+                "{} (no ACE for the traverse capability SID)",
                 node.display()
-            )),
-        }
+            ),
+        })
+        .collect();
+
+    let leaf_problem = match facts.leaf_mask {
+        Some(mask) if mask & facts.required_leaf_mask == facts.required_leaf_mask => None,
+        Some(mask) => Some(format!(
+            "the target itself carries a session SID ACE with mask {mask:#010x}, which does not \
+             cover the requested {:#010x}",
+            facts.required_leaf_mask
+        )),
+        None => Some("the target itself carries no ACE for this session's package SID".to_string()),
+    };
+
+    let mut diagnosis = Vec::new();
+    if !missing_ancestors.is_empty() {
+        diagnosis.push(format!(
+            "missing traverse ACE (traverse capability SID) on {} ancestor node(s): {} -- fix \
+             (admin, one-time, grants the whole chain in one UAC prompt): \
+             harness fs grant-traverse {}",
+            missing_ancestors.len(),
+            missing_ancestors.join(", "),
+            path.display()
+        ));
+    }
+    if let Some(leaf) = leaf_problem {
+        diagnosis.push(leaf);
     }
 
-    if missing.is_empty() {
+    if diagnosis.is_empty() {
         return format!(
             "fs-allow {} : unreachable inside AppContainer (probe error: {raw_message}); \
-             all ancestor traverse ACEs (up to the drive root) look fine, cause unknown \
-             (path may not exist, or a read-only file attribute is blocking a :rw request)",
+             the target's own session SID ACE and all ancestor traverse ACEs (up to the drive \
+             root) look fine, cause unknown (path may not exist, or a read-only file attribute \
+             is blocking a :rw request)",
             path.display()
         );
     }
     format!(
         "fs-allow {} : unreachable inside AppContainer (probe error: {raw_message}) -- \
-         diagnosis: missing traverse ACE on {} ancestor node(s): {} (see \
-         docs/phases/foundation/M12-shell-isolation-tiers.md 追記10・追記13). \
-         fix (admin, one-time, grants the whole chain in one UAC prompt): \
-         harness fs grant-traverse {}",
+         diagnosis: {} (see docs/phases/foundation/M12-shell-isolation-tiers.md 追記10・追記13, \
+         and docs/bugs/BUG-058.md for why the two SIDs are checked separately)",
         path.display(),
-        missing.len(),
-        missing.join(", "),
-        path.display()
+        diagnosis.join("; ")
     )
+}
+
+/// D9: passthroughルートが到達不能だったときの原因診断。生エラーメッセージに加え、
+/// **leafの親からドライブルートまでの全祖先**（`grant_traverse_chain`と同じ列挙順）の
+/// traverse ACE有無と、**leaf自身**のアクセス権を実地チェックし、欠けている方を名指しする。
+/// 従来はドライブルート1箇所しか見ていなかったが、`C:\Users\<user>\.cargo`のように中間の
+/// 祖先（`C:\Users`・`C:\Users\<user>`）が欠けているケースを診断できなかった
+/// （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記10で判明）。
+///
+/// **`session_sid`と`traverse_sid`を分けて受ける**のはD-37以降の必然である（BUG-058）。
+/// Win32の読み取りだけをここで行い、判定は[`describe_passthrough_chain`]へ委ねる。
+fn diagnose_unreachable_passthrough(
+    session_sid: PSID,
+    traverse_sid: PSID,
+    path: &Path,
+    access: FsAccess,
+    raw_message: &str,
+) -> String {
+    // leaf自身は列挙から外す（`ancestors()`の先頭は`path`自身）。leafが持つべきなのは
+    // traverse ACEではなくセッションSIDのアクセス権なので、同じ基準で見てはいけない。
+    let mut ancestors: Vec<std::path::PathBuf> = path
+        .parent()
+        .into_iter()
+        .flat_map(|parent| parent.ancestors().map(|p| p.to_path_buf()))
+        .collect();
+    ancestors.reverse();
+
+    let facts = PassthroughChainFacts {
+        leaf_mask: sid_ace_mask(path, session_sid).unwrap_or(None),
+        required_leaf_mask: required_passthrough_mask(access),
+        ancestors: ancestors
+            .into_iter()
+            .map(|node| {
+                let mask = sid_ace_mask(&node, traverse_sid).unwrap_or(None);
+                (node, mask)
+            })
+            .collect(),
+    };
+    describe_passthrough_chain(path, raw_message, &facts)
 }
 
 /// D8: passthroughルート1件へコンテナ内から実I/Oプローブ（疎通テスト）を行う。到達可なら
 /// `None`、到達不能なら診断メッセージ（D9）を返す。全体のTier選択には影響しない
 /// （`preflight`が結果を警告一覧として集約するだけで、壊れた穴以外は継続する）。
-pub(crate) fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthrough) -> Option<String> {
+///
+/// `sid`は子プロセスを起動するセッションpackage SID、`traverse_sid`は祖先チェーンの
+/// 通過権を持つcapability SID。**両方を受けるのはD9診断が2系統を区別するため**（BUG-058）。
+pub(crate) fn probe_passthrough(
+    sid: PSID,
+    traverse_sid: PSID,
+    workspace_root: &Path,
+    fp: &FsPassthrough,
+) -> Option<String> {
     let (shell, _) = resolve_shell();
     let mut env = crate::secret_env::build_child_env();
     env.push((
@@ -253,7 +340,9 @@ pub(crate) fn probe_passthrough(sid: PSID, workspace_root: &Path, fp: &FsPassthr
         Ok((_, _, 0)) => None,
         Ok((stdout, _, _code)) => Some(diagnose_unreachable_passthrough(
             sid,
+            traverse_sid,
             &fp.path,
+            fp.access,
             stdout.trim(),
         )),
         Err(e) => Some(format!(
@@ -493,7 +582,9 @@ pub fn preflight(
         let already_sufficient = matches!(sid_ace_mask(&fp.path, sid.as_psid()), Ok(Some(existing)) if existing & required == required);
         if already_sufficient {
             granted_passthrough.push((fp.path.clone(), requested_rw));
-            if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
+            if let Some(diagnosis) =
+                probe_passthrough(sid.as_psid(), traverse_sid.as_psid(), workspace_root, fp)
+            {
                 denied_passthrough.push((
                     fp.path.clone(),
                     fp.access.label().to_string(),
@@ -509,7 +600,9 @@ pub fn preflight(
             Ok(()) => {
                 granted_passthrough.push((fp.path.clone(), requested_rw));
                 crate::tier2a::session_profile::record_granted_path(&fp.path);
-                if let Some(diagnosis) = probe_passthrough(sid.as_psid(), workspace_root, fp) {
+                if let Some(diagnosis) =
+                    probe_passthrough(sid.as_psid(), traverse_sid.as_psid(), workspace_root, fp)
+                {
                     denied_passthrough.push((
                         fp.path.clone(),
                         fp.access.label().to_string(),
@@ -634,9 +727,12 @@ pub fn preflight(
                         .unwrap_or(false);
                     granted_passthrough.push((path.clone(), writable));
                     if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
-                        if let Some(diagnosis) =
-                            probe_passthrough(sid.as_psid(), workspace_root, fp)
-                        {
+                        if let Some(diagnosis) = probe_passthrough(
+                            sid.as_psid(),
+                            traverse_sid.as_psid(),
+                            workspace_root,
+                            fp,
+                        ) {
                             denied_passthrough.push((
                                 fp.path.clone(),
                                 fp.access.label().to_string(),

@@ -292,6 +292,8 @@ fn appcontainer_child_cannot_reach_uac_elevation_broker() {
 #[ignore]
 fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
     let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
+    // D-37: 祖先の通過権は永続capability SIDが持つ。D9診断はこちらで祖先を見る（BUG-058）。
+    let traverse_sid = traverse_capability_sid().expect("traverse capability SID");
 
     // workspace（FS I/Oのgate）とpassthrough対象（中立な外部ルート）は別ディレクトリにする。
     let workspace = std::path::PathBuf::from(format!(
@@ -334,7 +336,12 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         access: FsAccess::ReadExec,
         forced: false,
     };
-    let ro_diagnosis = probe_passthrough(sid.as_psid(), &workspace, &ro_probe);
+    let ro_diagnosis = probe_passthrough(
+        sid.as_psid(),
+        traverse_sid.as_psid(),
+        &workspace,
+        &ro_probe,
+    );
     assert!(
         ro_diagnosis.is_none(),
         "read probe on read-only passthrough should succeed: {ro_diagnosis:?}"
@@ -344,8 +351,12 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         access: FsAccess::ReadWrite,
         forced: false,
     };
-    let write_should_fail =
-        probe_passthrough(sid.as_psid(), &workspace, &rw_probe_against_ro_grant);
+    let write_should_fail = probe_passthrough(
+        sid.as_psid(),
+        traverse_sid.as_psid(),
+        &workspace,
+        &rw_probe_against_ro_grant,
+    );
     assert!(
         write_should_fail.is_some(),
         "write probe must fail while only read-only ACE is granted"
@@ -358,7 +369,12 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         access: FsAccess::ReadWrite,
         forced: false,
     };
-    let rw_diagnosis = probe_passthrough(sid.as_psid(), &workspace, &rw_probe);
+    let rw_diagnosis = probe_passthrough(
+        sid.as_psid(),
+        traverse_sid.as_psid(),
+        &workspace,
+        &rw_probe,
+    );
     assert!(
         rw_diagnosis.is_none(),
         "write probe on read-write passthrough should succeed: {rw_diagnosis:?}"

@@ -273,6 +273,11 @@ mod ace_grant_revoke_tests;
 #[cfg(all(windows, test))]
 mod force_grant_gate_tests;
 
+/// D9診断（`describe_passthrough_chain`）の純粋関数テスト。**実機も管理者権限も要らない**
+/// ——祖先とleafでSIDの系統が違うこと（D-37、BUG-058）をここで固定する。
+#[cfg(all(windows, test))]
+mod passthrough_diagnosis_tests;
+
 #[cfg(all(windows, test))]
 mod cow_containment_tests;
 

@@ -43,12 +43,24 @@ mod audit_scope_tests;
 #[path = "access_matrix_tests.rs"]
 mod access_matrix_tests;
 
-/// 削除の拒否がどの段階で現れるか（§12.4の再検証）。
+/// 削除の拒否がどの段階で現れるか（§12.4の再検証）。**その結論（§16）は§18で撤回された**
+/// ——残す理由はモジュールdoc参照（規則2の明示的例外）。
 #[cfg(all(windows, test))]
 #[path = "delete_denial_tests.rs"]
 mod delete_denial_tests;
 
-/// 「開けるが操作で落ちる」拒否がどのイベント列として現れるか（残課題a-2の実装方針を決める実測）。
+/// 「開けるが操作で落ちる」拒否は起きるのか（残課題a-2の決着、§18）。**起きない**——
+/// ACL起因の拒否は必ず`Create`段に出る。
 #[cfg(all(windows, test))]
 #[path = "operation_denial_tests.rs"]
 mod operation_denial_tests;
+
+/// `--fs-allow`で許可したパスへ、祖先が未付与の状態で到達できるかの実測
+/// （`plans/PLAN-M15.7-FOLLOWUP.md` W1、§19）。CoW redirector DLLの到達性
+/// （`docs/STATUS.md` Tier2a残課題#7）も同じ軸で測る。
+///
+/// **モジュール名は`KNOWN_TARGETS`の`etw-fs-allow-reach`のフィルタ文字列と一致していなければ
+/// ならない**（改名するとBUG-056と同じ「0件マッチ」が再発する）。
+#[cfg(all(windows, test))]
+#[path = "fs_allow_reach_tests.rs"]
+mod fs_allow_reach_tests;

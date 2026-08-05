@@ -40,11 +40,15 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "tier2a_net_policy_matrix",
         ],
     ),
+    // フィルタはモジュール名と一致していなければならない。`cow_diagnostics`→
+    // `cow_containment_tests`の改名にここが追随しておらず、CoW封じ込めE2E一式が
+    // 「0件マッチ＝exit 0」で黙って緑になっていた（`docs/bugs/BUG-056.md`）。
+    // 同クラスの再発は`check_tests_actually_ran`が捕まえる。
     (
         "cow-diagnostics",
         &[
             "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "win_appcontainer::cow_diagnostics",
+            "--nocapture", "win_appcontainer::cow_containment_tests",
         ],
     ),
     // M15.7 A-3: ETW実現性スパイク（判定ゲート）。`Microsoft-Windows-Kernel-File`の
@@ -137,6 +141,37 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture",
         ],
     ),
+    // --- `plans/PLAN-M15.7-FOLLOWUP.md` W1/W6/W7 用（テスト本体は各工程で書く） ---
+    //
+    // **キーの追加はデーモン停止＋再ビルド＋UACを伴うので、テストより先にまとめて登録する。**
+    // ここに書いたフィルタ文字列はテスト名に対する契約であり、後から名前を変えると
+    // 再びこの往復が要る。テストが存在しない間これら3件は`check_tests_actually_ran`により
+    // **非0で失敗する**（「まだ書いていない」を緑と誤認しないため、意図した挙動）。
+    //
+    // W1: `--fs-allow`の到達性を、祖先が未付与の状態で実測する。
+    (
+        "etw-fs-allow-reach",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "policy_learnd::etw::fs_allow_reach_tests",
+        ],
+    ),
+    // W6: `--fs-allow`を実CLIフラグ経由で通すout-of-process E2E。
+    (
+        "e2e-fs-allow",
+        &[
+            "test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture",
+            "tier2a_fs_allow",
+        ],
+    ),
+    // W7: netfilterdからのpolicy-learnd連鎖起動（追加UACなし経路）をassertにする。
+    (
+        "e2e-chain-launch",
+        &[
+            "test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture",
+            "tier2a_chain_launch",
+        ],
+    ),
     // `dev-elevated-runner`自身は除外する。デーモン(`dev-elevated-runnerd.exe`)がこの
     // コマンドを実行している間、自分自身の実行ファイルは起動中でロックされておりリンクし
     // 直せない（実機で`error: failed to remove file ...dev-elevated-runnerd.exe: アクセスが
@@ -182,6 +217,160 @@ pub fn resolve_target_args(target: &str) -> Option<&'static [&'static str]> {
         .iter()
         .find(|(name, _)| *name == target)
         .map(|(_, args)| *args)
+}
+
+/// `cargo test`のstdoutから、**実際に実行された**テスト件数（passed + failed）を数える。
+///
+/// テストハーネスはバイナリごとに
+/// `test result: ok. 12 passed; 0 failed; 3 ignored; 0 measured; 45 filtered out; ...`
+/// を1行印字する。複数のテストバイナリが走る対象（`e2e-all`等）では**合計**を返す
+/// ——個々のバイナリが0件になるのは正常（`--ignored`が1つも当たらないターゲットがある）で、
+/// 「どれも走らなかった」だけが異常だからである。
+///
+/// `test result:`行が1つも無ければ`None`。これは「0件走った」とは違う状態
+/// （テストハーネスがそもそも起動していない＝ビルド失敗等）なので、呼び出し側が
+/// 区別できるようにする。
+pub fn executed_test_count(stdout: &str) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for line in stdout.lines() {
+        let Some(summary) = line.trim_start().strip_prefix("test result:") else {
+            continue;
+        };
+        let passed = count_before(summary, "passed").unwrap_or(0);
+        let failed = count_before(summary, "failed").unwrap_or(0);
+        total = Some(total.unwrap_or(0) + passed + failed);
+    }
+    total
+}
+
+/// `ok. 12 passed; 0 failed; ...`から`label`直前の数値を取り出す。
+///
+/// 失敗した実行の要約は`FAILED. 10 passed; 2 failed; ...`という形なので、
+/// 小文字の`failed`を探せば見出し語の`FAILED.`とは衝突しない。
+fn count_before(summary: &str, label: &str) -> Option<u64> {
+    let index = summary.find(label)?;
+    summary[..index].split_whitespace().next_back()?.parse().ok()
+}
+
+/// テストターゲットなのに1件も走らなかったら、それは「緑」ではなく**壊れたフィルタ**である。
+///
+/// `cargo test`はフィルタが1件もマッチしなくてもexit 0を返すため、`KNOWN_TARGETS`の
+/// フィルタ文字列がモジュール改名に追随しそこねると、E2E一式が黙って走らなくなる
+/// （`docs/bugs/BUG-056.md`。CoW封じ込めE2E 17件が実際にこれを踏んだ）。
+/// **「テストが走っていない」は「テストが通った」と外形上区別が付かない**ので、
+/// ここで明示的に潰す。
+///
+/// テストを実行しないターゲット（`workspace-build`・`workspace-clippy`）は対象外。
+/// 未知のキーも`Ok`にする——入力検証は[`validate_target`]の責務であり、ここを
+/// 意味の違う2つ目のゲートにしない。
+pub fn check_tests_actually_ran(target: &str, stdout: &str) -> Result<(), String> {
+    let Some(args) = resolve_target_args(target) else {
+        return Ok(());
+    };
+    if args.first() != Some(&"test") {
+        return Ok(());
+    }
+    match executed_test_count(stdout) {
+        Some(0) => Err(format!(
+            "target {target:?} reported success but ran 0 tests. `cargo test` exits 0 when its \
+             filter matches nothing, so this is a broken filter, not a pass. Check the filter for \
+             {target:?} in KNOWN_TARGETS (crates/dev-elevated-runner/src/lib.rs) against the \
+             actual module/test names -- see docs/bugs/BUG-056.md"
+        )),
+        None => Err(format!(
+            "target {target:?} reported success but its output contains no test-harness summary \
+             ('test result:' line). The test binaries probably never started"
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BUG-056の実物。`cargo test -p harness-sandbox --lib -- --ignored --test-threads=1
+    /// --nocapture win_appcontainer::cow_diagnostics`（改名前のフィルタ）が実際に印字した出力。
+    /// **捏造せず実機から採る**——このクラスを閉じる関数が、想像した書式ではなく
+    /// 本物の書式を相手にしていることを固定するため。
+    const ZERO_TESTS: &str = "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; \
+                              0 measured; 252 filtered out; finished in 0.00s\n";
+
+    #[test]
+    fn a_normal_run_counts_the_tests_it_executed() {
+        let stdout = "running 12 tests\n\ntest result: ok. 12 passed; 0 failed; 3 ignored; \
+                      0 measured; 45 filtered out; finished in 1.23s\n";
+        assert_eq!(executed_test_count(stdout), Some(12));
+        assert!(check_tests_actually_ran("cow-diagnostics", stdout).is_ok());
+    }
+
+    /// 実行件数であって成功件数ではない。失敗を含む実行は「走った」に数える
+    /// （失敗そのものは終了コードが既に伝えている）。見出し語の`FAILED.`を
+    /// `failed`と取り違えないことも、ここで一緒に固定される。
+    #[test]
+    fn a_failing_run_still_counts_as_having_run() {
+        let stdout = "test result: FAILED. 10 passed; 2 failed; 0 ignored; 0 measured; \
+                      0 filtered out; finished in 4.00s\n";
+        assert_eq!(executed_test_count(stdout), Some(12));
+    }
+
+    /// 複数のテストバイナリが走る対象（`e2e-all`）では、0件のバイナリが混ざるのは正常。
+    /// 判定は合計で行う。
+    #[test]
+    fn one_empty_binary_among_several_is_not_a_failure() {
+        let stdout = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; \
+                      0 measured; 7 filtered out; finished in 0.00s\n\nrunning 3 tests\n\n\
+                      test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; \
+                      0 filtered out; finished in 9.00s\n";
+        assert_eq!(executed_test_count(stdout), Some(3));
+        assert!(check_tests_actually_ran("e2e-all", stdout).is_ok());
+    }
+
+    /// BUG-056そのもの。全バイナリ0件なら、exit 0でも失敗にする。
+    #[test]
+    fn a_target_that_ran_no_tests_at_all_is_reported_as_broken() {
+        assert_eq!(executed_test_count(ZERO_TESTS), Some(0));
+        let error = check_tests_actually_ran("cow-diagnostics", ZERO_TESTS)
+            .expect_err("0 tests must not be treated as a pass");
+        assert!(error.contains("ran 0 tests"), "{error}");
+        // 次に踏む人が原因へ最短で行けること（メッセージの中身も契約の一部）。
+        assert!(error.contains("KNOWN_TARGETS"), "{error}");
+        assert!(error.contains("BUG-056"), "{error}");
+    }
+
+    /// テストハーネスが1度も起動しなかった場合は「0件」とは別の失敗として報告する。
+    #[test]
+    fn output_without_any_harness_summary_is_reported_separately() {
+        assert_eq!(executed_test_count("error: could not compile `harness-cli`"), None);
+        let error = check_tests_actually_ran("cow-diagnostics", "error: could not compile")
+            .expect_err("a missing harness summary must not be treated as a pass");
+        assert!(error.contains("no test-harness summary"), "{error}");
+    }
+
+    /// テストを実行しないターゲットは対象外（`cargo build`の出力に`test result:`は無い）。
+    #[test]
+    fn non_test_targets_are_out_of_scope() {
+        assert!(check_tests_actually_ran("workspace-build", "    Finished `dev` profile").is_ok());
+        assert!(check_tests_actually_ran("workspace-clippy", "").is_ok());
+        // 入力検証は`validate_target`の責務なので、未知のキーはここでは判定しない。
+        assert!(check_tests_actually_ran("no-such-target", ZERO_TESTS).is_ok());
+        assert!(validate_target("no-such-target").is_err());
+    }
+
+    /// `KNOWN_TARGETS`の中で`cargo test`を走らせる全ターゲットが、この検知の対象に入ること。
+    /// 新しいテストターゲットを足したときに、この検知だけ素通りする形にならないよう固定する。
+    #[test]
+    fn every_test_target_is_covered_by_the_zero_test_check() {
+        for (name, args) in KNOWN_TARGETS {
+            if args.first() != Some(&"test") {
+                continue;
+            }
+            assert!(
+                check_tests_actually_ran(name, ZERO_TESTS).is_err(),
+                "test target {name:?} would silently pass with 0 tests"
+            );
+        }
+    }
 }
 
 #[cfg(windows)]

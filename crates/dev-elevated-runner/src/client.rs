@@ -12,7 +12,7 @@ fn main() -> std::process::ExitCode {
         current_user_sid_string, pipe_name_for_current_user, read_framed_timeout, wide,
         write_framed_timeout,
     };
-    use dev_elevated_runner::{validate_target, RunRequest, RunResponse};
+    use dev_elevated_runner::{check_tests_actually_ran, validate_target, RunRequest, RunResponse};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Storage::FileSystem::{
@@ -156,11 +156,17 @@ fn main() -> std::process::ExitCode {
     };
     print!("{}", response.stdout);
     eprint!("{}", response.stderr);
-    if response.exit_code == 0 {
-        std::process::ExitCode::SUCCESS
-    } else {
-        std::process::ExitCode::FAILURE
+    if response.exit_code != 0 {
+        return std::process::ExitCode::FAILURE;
     }
+    // 成功したときだけ「本当に走ったのか」を見る。`cargo test`はフィルタが1件も
+    // マッチしなくてもexit 0を返すので、ここを見ないと壊れたフィルタが緑に見える
+    // （BUG-056）。非0のときは既に失敗しているので二重に判定しない。
+    if let Err(e) = check_tests_actually_ran(&target, &response.stdout) {
+        eprintln!("dev-elevated-run: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 #[cfg(not(windows))]

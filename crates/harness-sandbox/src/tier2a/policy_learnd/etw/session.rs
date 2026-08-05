@@ -44,24 +44,34 @@ const KERNEL_FILE_KEYWORD_OP_END: u64 = 0x40;
 const KERNEL_FILE_KEYWORD_CREATE: u64 = 0x80;
 
 /// `FileKey`→`FileName`の対応イベント（Id=10/11）を開けるキーワード。
+#[cfg(test)]
 pub const KERNEL_FILE_KEYWORD_FILENAME: u64 = 0x10;
 /// `SetInformation`(17)・`SetDelete`(18)・`Rename`(19)等を開けるキーワード。
+#[cfg(test)]
 pub const KERNEL_FILE_KEYWORD_FILEIO: u64 = 0x20;
 /// `Read`(15)を開けるキーワード。
+#[cfg(test)]
 pub const KERNEL_FILE_KEYWORD_READ: u64 = 0x100;
 /// `Write`(16)を開けるキーワード。
+#[cfg(test)]
 pub const KERNEL_FILE_KEYWORD_WRITE: u64 = 0x200;
 
 /// 生イベント捕捉の上限。マシン全体のFSアクセスが流れてくる（実測で5.9秒に20万件）ので、
 /// **診断であっても無制限にメモリを使わない**。超えた分は捨てて件数だけ数える。
+#[cfg(test)]
 const RAW_CAPTURE_CAPACITY: usize = 400_000;
 
-/// 生イベント1件（**診断専用**）。
+/// 生イベント1件（**診断専用**、テストビルドにしか存在しない）。
 ///
-/// 本番の収集経路は`Create`＋`OperationEnd`しか見ないが、
-/// [a-2](../../../../../docs/STATUS.md)（削除・リネームの拒否の取りこぼし）を直すには
-/// 「拒否が実際にどのイベント列として現れるか」をまず知る必要がある。
-/// **設計を決める前に事実を採るための器**であり、production pathでは捕捉しない。
+/// 本番の収集経路は`Create`＋`OperationEnd`しか見ない。この器は
+/// [a-2](../../../../../docs/STATUS.md)（削除・リネームの拒否の取りこぼし）が本当に
+/// あるのかを実測するために足したもので、答えは**無い**だった
+/// （`plans/etw-spike/RESULTS.md` §18: ACL起因の拒否は必ず`Create`段に出る）。
+/// 結論が出た以上、本番バイナリへ載せる理由は無いので`#[cfg(test)]`で締める
+/// ——「本番経路では`raw_events`が`None`だから安全」という**実行時の約束を、
+/// コンパイル時の不在へ格上げする**。同じ問いが再燃したときの実測器としては
+/// `super::operation_denial_tests`が残る。
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct RawFsEvent {
     pub event_id: u16,
@@ -139,9 +149,11 @@ struct Sink {
     /// ——`DELETE_PATH`等が**失敗時にも発火するか**は、これを見ないと分からない。
     event_histogram: Mutex<std::collections::BTreeMap<u16, u64>>,
     /// 生イベント列（**診断専用**、[`RawFsEvent`]）。`None`なら捕捉しない。
-    /// production pathではここが`None`なので、TDHの追加呼び出しも発生しない。
+    /// **本番ビルドにはこのフィールド自体が存在しない**（`#[cfg(test)]`）。
+    #[cfg(test)]
     raw_events: Option<Mutex<Vec<RawFsEvent>>>,
     /// 容量超過で捨てた生イベントの数。捕捉が途中で切れたことを隠さないために数える。
+    #[cfg(test)]
     raw_dropped: Mutex<u64>,
 }
 
@@ -193,7 +205,9 @@ impl EtwFsSession {
     /// **診断専用**: 追加キーワードを開けたうえで、生イベント列も捕捉する。
     ///
     /// 「拒否が実際にどのイベント列として現れるか」を採るための入口
-    /// （`docs/STATUS.md`のa-2）。捕捉は[`RAW_CAPTURE_CAPACITY`]で頭打ちにする。
+    /// （`docs/STATUS.md`のa-2、結論は`plans/etw-spike/RESULTS.md` §18）。
+    /// 捕捉は[`RAW_CAPTURE_CAPACITY`]で頭打ちにする。
+    #[cfg(test)]
     pub fn start_with_raw_capture(
         session_name: &str,
         extra_keywords: u64,
@@ -202,6 +216,7 @@ impl EtwFsSession {
     }
 
     /// 捕捉した生イベント列と、容量超過で捨てた件数。
+    #[cfg(test)]
     pub fn raw_events(&self) -> (Vec<RawFsEvent>, u64) {
         let events = self
             .sink
@@ -228,6 +243,11 @@ impl EtwFsSession {
         extra_keywords: u64,
         capture_raw: bool,
     ) -> Result<Self, EtwError> {
+        // 生イベント捕捉はテストビルドにしか存在しない（[`RawFsEvent`]のdoc参照）ので、
+        // 本番ビルドではこの引数に行き先が無い。関数全体を`allow(unused_variables)`で
+        // 黙らせると将来の別の未使用まで巻き込むため、ここだけを潰す。
+        #[cfg(not(test))]
+        let _ = capture_raw;
         let name_w = wide(session_name);
         let (mut properties_buf, session_handle) = start_trace(&name_w)?;
 
@@ -275,7 +295,9 @@ impl EtwFsSession {
             observed_paths: Mutex::new(Vec::new()),
             process_starts: Mutex::new(Vec::new()),
             event_histogram: Mutex::new(std::collections::BTreeMap::new()),
+            #[cfg(test)]
             raw_events: capture_raw.then(|| Mutex::new(Vec::new())),
+            #[cfg(test)]
             raw_dropped: Mutex::new(0),
         });
 
@@ -707,8 +729,10 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
         return;
     }
 
-    // 生イベント捕捉（診断専用）。**本番経路は`raw_events`が`None`なので何もしない**
-    // ——TDHの追加呼び出しが走らないことを、この分岐の外へ出さないことで保証する。
+    // 生イベント捕捉（診断専用）。**この分岐は本番ビルドに存在しない**（`#[cfg(test)]`）
+    // ——TDHの追加呼び出しが走らないことを、実行時の`raw_events == None`ではなく
+    // コンパイル時の不在で保証する（[`RawFsEvent`]のdoc参照）。
+    #[cfg(test)]
     if let Some(raw) = sink.raw_events.as_ref() {
         if let Ok(mut events) = raw.lock() {
             if events.len() < RAW_CAPTURE_CAPACITY {
