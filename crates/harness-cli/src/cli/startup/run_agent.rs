@@ -40,6 +40,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         write_mode,
         shell_tier,
         mcp_decls,
+        mcp_gates,
     } = sandbox;
     let mut tools = tools;
 
@@ -100,6 +101,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // 実起動は下のWFP適用が終わってから行う（出口強制の効かない窓を作らないため）。
     let mcp_startup = super::mcp::prepare_mcp_servers(
         &mcp_decls,
+        &mcp_gates,
         &workspace_root,
         shell_tier.tier,
         cli.print.is_none(),

@@ -554,6 +554,33 @@ pub(crate) struct Cli {
     #[arg(long = "policy-learn")]
     policy_learn: Option<bool>,
 
+    /// MCPのStreamable HTTPトランスポートをこの実行に限り有効にする（M15.6、D-41/D-49）。
+    ///
+    /// **既定は無効。** stdioのMCPサーバと違い、この経路はharness本体が直接HTTPで喋るため、
+    /// AppContainer・WFPの出口強制・協調プロキシのいずれも掛からない（`plans/DESIGN-MCP.md` §6.2）。
+    /// 恒久的に有効化するなら、**ユーザ設定**の`settings.json`へ
+    /// `"mcp": { "allow_streamable_http": true }`と書く（プロジェクトの
+    /// `.harness/settings.json`からは有効化できない）。
+    #[arg(long = "allow-mcp-http", default_value_t = false)]
+    allow_mcp_http: bool,
+
+    /// Streamable HTTPのMCPサーバとして接続してよいドメインを追加する（繰り返し指定可、
+    /// `*.example.com`形式のサフィックスワイルドカード対応）。
+    ///
+    /// ユーザ設定の`mcp.http_allow_domains`と合算する（和集合）。**空なら1つも起動しない**
+    /// （closed-by-default）。宣言のURLはリポジトリ側が書けるので、承認プロンプトでの目視だけを
+    /// 唯一のゲートにしないための独立した層である（D-49）。loopbackは免除される。
+    #[arg(long = "allow-mcp-http-domain")]
+    allow_mcp_http_domain: Vec<String>,
+
+    /// Streamable HTTPで、**リモートホストへの平文http接続**をこの実行に限り許す（D-49）。
+    ///
+    /// 既定ではhttpsだけを許す（loopbackは常に平文可）。平文でリモートへ繋ぐと、宣言した
+    /// ヘッダ（認証トークンを含む）が暗号化されずに流れる。設定ファイルにも宣言側にも
+    /// 同等のスイッチは**用意しない**——セッション限りの明示操作に留めるため。
+    #[arg(long = "allow-mcp-http-plaintext", default_value_t = false)]
+    allow_mcp_http_plaintext: bool,
+
     /// `--provider mock`用の台本ファイル（`Vec<Vec<StreamEvent>>`のJSON）。
     /// out-of-processのTier2a E2Eテスト専用（`e2e-mock` feature必須）。
     #[cfg(feature = "e2e-mock")]

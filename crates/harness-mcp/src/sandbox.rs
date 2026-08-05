@@ -48,8 +48,11 @@ pub fn prepare(decl: &McpServerDecl, workspace_root: &Path) -> Result<PrepareOut
     Ok(PrepareOutcome {
         prepared: PreparedServer {
             decl: decl.clone(),
-            profile_name: outcome.profile_name,
-            proxy_addr: None,
+            isolation: crate::runtime::PreparedIsolation::AppContainer {
+                profile_name: outcome.profile_name,
+                // 専用プロキシは呼び出し側（`harness-cli`）がこの後に立てる（起動順序3）。
+                proxy_addr: None,
+            },
         },
         warnings: outcome.warnings,
     })

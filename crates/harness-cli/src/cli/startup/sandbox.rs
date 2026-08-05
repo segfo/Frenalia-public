@@ -43,6 +43,9 @@ pub(super) struct SandboxPrepared {
     /// MCPサーバ宣言（M15.5）。承認照合・起動はStage5（`stage_run_agent`）が、Tier確定と
     /// WFP適用の間で行う（順序が本質、`startup::mcp`のモジュールdoc参照）。
     pub(super) mcp_decls: Vec<harness_mcp::McpServerDecl>,
+    /// Streamable HTTPのセッションゲート（M15.6、D-49）。**ユーザ層設定とCLIからしか来ない**
+    /// ——プロジェクト層の分は`harness_config::clamp_project_mcp_http_gates`が剥がしている。
+    pub(super) mcp_gates: harness_mcp::McpGates,
 }
 
 /// staging mode・`sandbox_dir`・`read_scope`・net proxy/app・`require_sandbox`・
@@ -141,6 +144,17 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
     // 受け取ることになる。
     let mcp_decls = match harness_mcp::parse_mcp_settings(settings.mcp.as_ref()) {
         Ok(decls) => decls,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+
+    // M15.6（D-49）: Streamable HTTPのゲート。`settings.mcp`はここへ来る時点で
+    // プロジェクト層の分が剥がされている（`harness_config::clamp_project_mcp_http_gates`）ので、
+    // 残っているのはユーザ層の値だけ。そこへCLIフラグを重ねる。
+    let mcp_gates = match build_mcp_gates(&cli, settings.mcp.as_ref()) {
+        Ok(gates) => gates,
         Err(e) => {
             eprintln!("error: {e}");
             return Err(ExitCode::FAILURE);
@@ -346,6 +360,46 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
         write_mode,
         shell_tier,
         mcp_decls,
+        mcp_gates,
+    })
+}
+
+/// Streamable HTTPのセッションゲート（D-49）を、ユーザ層設定とCLIフラグから組み立てる。
+///
+/// - 有効化: どちらか一方で足りる（`net_proxy`/`net_app`と同じ「CLIが上乗せ」の形）
+/// - 宛先allowlist: 両者の**和集合**。CLIで足せるが、設定から取り除くことはできない
+/// - 平文: **CLIだけ**。設定ファイルにも宣言にも同等のスイッチを置かない
+fn build_mcp_gates(
+    cli: &Cli,
+    mcp_settings: Option<&serde_json::Value>,
+) -> Result<harness_mcp::McpGates, String> {
+    let settings = harness_mcp::parse_mcp_http_gates(mcp_settings)?;
+
+    let mut domains = settings.http_allow_domains;
+    for domain in &cli.allow_mcp_http_domain {
+        // 構文は`--net-allow-domain`と同一（`normalize_domain_pattern`）。
+        let domain = normalize_domain_pattern(domain)?;
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+
+    let enabled = settings.allow_streamable_http || cli.allow_mcp_http;
+    if !enabled && (!cli.allow_mcp_http_domain.is_empty() || cli.allow_mcp_http_plaintext) {
+        eprintln!(
+            "warning: --allow-mcp-http-domain/--allow-mcp-http-plaintext have no effect without \
+             --allow-mcp-http (or \"mcp\": {{ \"allow_streamable_http\": true }} in your user \
+             settings.json)"
+        );
+    }
+
+    Ok(harness_mcp::McpGates {
+        streamable_http_enabled: enabled,
+        http_endpoints: harness_mcp::EndpointGates {
+            allow_domains: harness_core::DomainPolicy::new(domains),
+            plaintext_allowed: cli.allow_mcp_http_plaintext,
+        },
+        http_ca_bundle: settings.http_ca_bundle.map(PathBuf::from),
     })
 }
 

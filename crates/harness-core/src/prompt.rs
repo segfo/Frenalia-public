@@ -191,19 +191,27 @@ fn render_mcp_servers(mcp_servers: &[McpServerFact]) -> Vec<String> {
             allow_domains,
             workspace_access,
             tool_names,
+            transport,
+            endpoint,
         } = server;
-        let network = if allow_domains.is_empty() {
-            "外向き通信は不可".to_string()
-        } else {
-            format!("到達可能な宛先: {}", allow_domains.join("、"))
+        // Streamable HTTP（M15.6）はharness本体が直接喋る経路で、AppContainerの外にある。
+        // `allow_domains`（＝AppContainer子の宛先制御）は常に空なので、stdioと同じ文言だと
+        // 「外向き通信は不可」という**事実に反する**説明になる。
+        let reach = match endpoint {
+            Some(endpoint) => format!(
+                "harness本体が{endpoint}へ直接HTTPで接続する第三者サーバ（サンドボックスの外）"
+            ),
+            None if allow_domains.is_empty() => "外向き通信は不可".to_string(),
+            None => format!("到達可能な宛先: {}", allow_domains.join("、")),
         };
         let workspace = match workspace_access.as_str() {
             "read" => "ワークスペースは読取のみ可",
             "read-write" => "ワークスペースは読み書き可",
             _ => "ワークスペースへはアクセス不可",
         };
+        let _ = transport; // 種別そのものは`endpoint`の有無から読み取れるので重ねて出さない。
         lines.push(format!(
-            "- {id}: {network}、{workspace}。ツール: {}",
+            "- {id}: {reach}、{workspace}。ツール: {}",
             tool_names.join("、")
         ));
     }
@@ -694,12 +702,16 @@ mod tests {
                 allow_domains: vec!["docs.example.com".to_string()],
                 workspace_access: "none".to_string(),
                 tool_names: vec!["mcp__company-docs__search".to_string()],
+                transport: "stdio".to_string(),
+                endpoint: None,
             },
             McpServerFact {
                 id: "local-notes".to_string(),
                 allow_domains: Vec::new(),
                 workspace_access: "read".to_string(),
                 tool_names: vec!["mcp__local-notes__grep".to_string()],
+                transport: "stdio".to_string(),
+                endpoint: None,
             },
         ];
         let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
@@ -714,6 +726,29 @@ mod tests {
         );
         // 第三者コードであること・裏取りが要ることを明示している（D-40と§4.3の前提）。
         assert!(rendered.contains("第三者"), "{rendered}");
+    }
+
+    /// M15.6: Streamable HTTPのサーバは**サンドボックスの外**にいる。`allow_domains`が空だ
+    /// からといってstdioと同じ「外向き通信は不可」を描くと、モデルへ嘘の制約を伝えることになる。
+    #[test]
+    fn a_streamable_http_server_is_not_described_as_unable_to_reach_the_network() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.mcp_servers = vec![McpServerFact {
+            id: "corp-mcp".to_string(),
+            allow_domains: Vec::new(),
+            workspace_access: "none".to_string(),
+            tool_names: vec!["mcp__corp-mcp__search".to_string()],
+            transport: "streamable_http".to_string(),
+            endpoint: Some("mcp.corp.example/mcp".to_string()),
+        }];
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(
+            !rendered.contains("外向き通信は不可"),
+            "a streamable-http server does reach the network: {rendered}"
+        );
+        assert!(rendered.contains("mcp.corp.example/mcp"), "{rendered}");
+        assert!(rendered.contains("サンドボックスの外"), "{rendered}");
     }
 
     /// passthroughが1つも無いときはプロンプトを伸ばさない（既存のゴールデンが割れないこと）。

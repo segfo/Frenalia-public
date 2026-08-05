@@ -9,7 +9,11 @@
 //! | [`decl`] | 宣言の型・検証・承認ハッシュ | §4 |
 //! | [`approval`] | 承認台帳（ワークスペース外） | §4.2、D-39 |
 //! | [`protocol`] | JSON-RPC 2.0 と MCP メソッドのワイヤ形式 | §6 |
-//! | [`transport`] | 通信路の抽象（stdioのみ実装） | §6.1、D-41 |
+//! | [`transport`] | 通信路の抽象 | §6 |
+//! | `transport_stdio`（windows） | AppContainer子プロセスとのstdio | §6.1 |
+//! | [`http_wire`] | Streamable HTTPの純粋な判断（宛先ゲート・ヘッダ・SSE・証明書ピン） | §6.2、D-49/D-52 |
+//! | [`cert_probe`] | 承認前にサーバ証明書を見る（HTTPは一言も喋らない） | §6.2、D-52 |
+//! | [`transport_http`] | Streamable HTTPの実通信 | §6.2、D-41/D-51 |
 //! | [`client`] | 1サーバ＝1セッションの往復 | §3.3 |
 //! | [`tool`] | `Tool` traitへの写像・`RiskClass` | §5、D-40 |
 //! | [`runtime`] | 宣言→承認照合→起動→登録→撤収 | §3・§4 |
@@ -24,17 +28,25 @@
 //!
 //! ## Windows以外
 //!
-//! 隔離機構（AppContainer）が無い環境ではMCPサーバを**起動しない**（P-05: 能力が無いときは
-//! 降格ではなく拒否へ倒す、`DESIGN-MCP.md` §3.4）。`runtime`はそのOSでは常に「起動対象なし＋
-//! 理由」を返す。
+//! **stdioサーバ**は隔離機構（AppContainer）が無い環境では**起動しない**（P-05: 能力が
+//! 無いときは降格ではなく拒否へ倒す、`DESIGN-MCP.md` §3.4）。`runtime`はそのOSでは常に
+//! 「起動対象なし＋理由」を返す。
+//!
+//! **Streamable HTTPサーバはこの制限を受けない**（D-50）。§3.4のゲートは「サーバプロセスを
+//! 隔離できるか」の判断であり、HTTPには隔離すべき子プロセスが存在しない——harness本体が
+//! 喋る。代わりに効くのがD-49の3段ゲート（ユーザ層オプトイン・宛先allowlist・平文の可否）
+//! と、既存の承認台帳（D-39）である。
 
 pub mod approval;
+pub mod cert_probe;
 pub mod client;
 pub mod decl;
+pub mod http_wire;
 pub mod protocol;
 pub mod runtime;
 pub mod tool;
 pub mod transport;
+pub mod transport_http;
 
 #[cfg(windows)]
 pub mod sandbox;
@@ -47,12 +59,18 @@ pub use transport_stdio::AppContainerTransportFactory;
 
 pub use approval::{ApprovalStore, McpApproval, McpApprovalLedger};
 pub use decl::{
-    namespaced_tool_name, parse_mcp_settings, McpNetworkDecl, McpServerDecl, McpSettings,
-    McpTransportKind, McpWorkspaceAccess,
+    namespaced_tool_name, parse_mcp_http_gates, parse_mcp_settings, McpHttpSettings,
+    McpNetworkDecl, McpServerDecl, McpSettings, McpTransportKind, McpWorkspaceAccess,
 };
 pub use harness_core::McpServerFact;
-pub use runtime::{McpRuntime, McpStartupPlan, PreparedServer, SkipReason, SkippedServer};
+pub use cert_probe::PresentedCertificate;
+pub use http_wire::{CertPin, Endpoint, EndpointGates};
+pub use runtime::{
+    DefaultTransportFactory, McpGates, McpRuntime, McpStartupPlan, PreparedIsolation,
+    PreparedServer, SkipReason, SkippedServer,
+};
 pub use tool::McpTool;
+pub use transport_http::HttpTransportFactory;
 
 /// このクレートが返すエラー。
 #[derive(Debug, Clone, thiserror::Error)]

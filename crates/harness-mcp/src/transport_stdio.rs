@@ -21,7 +21,7 @@ use harness_sandbox::tier2a::win_appcontainer::{
     spawn, AppContainerSession, NetworkCapability, SessionError,
 };
 
-use crate::runtime::{PreparedServer, TransportFactory};
+use crate::runtime::{PreparedIsolation, PreparedServer, TransportFactory};
 use crate::transport::{LineAccumulator, Transport};
 use crate::McpError;
 
@@ -85,8 +85,22 @@ impl TransportFactory for AppContainerTransportFactory {
             reason,
         };
 
+        // 隔離の実体を持たない`PreparedServer`でこの経路へ来ることはあり得ないが、型で
+        // 分けてある以上ここで落とす（空文字のプロファイル名で起動しない）。
+        let PreparedIsolation::AppContainer {
+            profile_name,
+            proxy_addr,
+        } = &prepared.isolation
+        else {
+            return Err(spawn_error(
+                "this server was prepared for the streamable-http transport, which has no \
+                 AppContainer profile to spawn into"
+                    .to_string(),
+            ));
+        };
+
         // network要求があるのに専用プロキシが無い場合は起動しない（fail-closed、モジュールdoc）。
-        if !decl.network.is_deny() && prepared.proxy_addr.is_none() {
+        if !decl.network.is_deny() && proxy_addr.is_none() {
             return Err(spawn_error(
                 "the declaration requests network access but no dedicated proxy is listening for \
                  this server; refusing to start it unrestricted"
@@ -94,7 +108,7 @@ impl TransportFactory for AppContainerTransportFactory {
             ));
         }
 
-        let sid = harness_sandbox::tier2a::win_appcontainer::ensure_profile(&prepared.profile_name)
+        let sid = harness_sandbox::tier2a::win_appcontainer::ensure_profile(profile_name)
             .map_err(|e| spawn_error(format!("failed to resolve the sandbox profile: {e}")))?;
 
         let command = std::path::PathBuf::from(&decl.command);
@@ -104,9 +118,9 @@ impl TransportFactory for AppContainerTransportFactory {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir);
 
-        let env = build_env(prepared);
+        let env = build_env(&decl.env, *proxy_addr);
         let args: Vec<&str> = decl.args.iter().map(String::as_str).collect();
-        let net = if prepared.proxy_addr.is_some() {
+        let net = if proxy_addr.is_some() {
             NetworkCapability::InternetClient
         } else {
             NetworkCapability::Deny
@@ -140,9 +154,12 @@ impl TransportFactory for AppContainerTransportFactory {
 /// 素通しはallowlist方式（`harness_sandbox::build_child_env`、D-07）で、そこへ宣言のenvと
 /// プロキシ設定を重ねる。**宣言のenvが最後**なのは、ユーザーが承認した内容が最終的な決定権を
 /// 持つべきだからで、その内容はハッシュとして承認台帳に固定されている（D-39）。
-fn build_env(prepared: &PreparedServer) -> Vec<(String, String)> {
+fn build_env(
+    declared: &std::collections::BTreeMap<String, String>,
+    proxy_addr: Option<std::net::SocketAddr>,
+) -> Vec<(String, String)> {
     let mut env = harness_sandbox::build_child_env();
-    if let Some(addr) = prepared.proxy_addr {
+    if let Some(addr) = proxy_addr {
         let http = format!("http://{addr}");
         env.push(("HTTP_PROXY".to_string(), http.clone()));
         env.push(("HTTPS_PROXY".to_string(), http.clone()));
@@ -150,7 +167,7 @@ fn build_env(prepared: &PreparedServer) -> Vec<(String, String)> {
         env.push(("https_proxy".to_string(), http));
         env.push(("ALL_PROXY".to_string(), format!("socks5h://{addr}")));
     }
-    for (k, v) in &prepared.decl.env {
+    for (k, v) in declared {
         env.retain(|(name, _)| name != k);
         env.push((k.clone(), v.clone()));
     }
@@ -162,30 +179,19 @@ mod tests {
     use super::*;
     use crate::decl::{McpNetworkDecl, McpServerDecl, McpTransportKind, McpWorkspaceAccess};
 
-    fn prepared(network: Vec<&str>, proxy: Option<&str>) -> PreparedServer {
-        PreparedServer {
-            decl: McpServerDecl {
-                id: "docs".to_string(),
-                transport: McpTransportKind::Stdio,
-                command: "node.exe".to_string(),
-                args: vec![],
-                env: [("DOCS_ROOT".to_string(), "C:\\docs".to_string())]
-                    .into_iter()
-                    .collect(),
-                tools: Default::default(),
-                network: McpNetworkDecl {
-                    allow_domains: network.into_iter().map(String::from).collect(),
-                },
-                workspace: McpWorkspaceAccess::None,
-            },
-            profile_name: "harness.mcp.test.docs".to_string(),
-            proxy_addr: proxy.map(|a| a.parse().unwrap()),
-        }
+    fn declared_env() -> std::collections::BTreeMap<String, String> {
+        [("DOCS_ROOT".to_string(), "C:\\docs".to_string())]
+            .into_iter()
+            .collect()
+    }
+
+    fn proxy(addr: &str) -> Option<std::net::SocketAddr> {
+        Some(addr.parse().unwrap())
     }
 
     #[test]
     fn a_server_without_network_gets_no_proxy_variables() {
-        let env = build_env(&prepared(vec![], None));
+        let env = build_env(&declared_env(), None);
         assert!(!env.iter().any(|(k, _)| k.eq_ignore_ascii_case("HTTP_PROXY")));
         assert!(!env.iter().any(|(k, _)| k == "ALL_PROXY"));
     }
@@ -193,7 +199,7 @@ mod tests {
     /// 専用プロキシのアドレスが注入される（宛先を絞るのはそのプロキシ、§3.2）。
     #[test]
     fn a_server_with_network_is_pointed_at_its_own_proxy() {
-        let env = build_env(&prepared(vec!["docs.example.com"], Some("127.0.0.1:19090")));
+        let env = build_env(&declared_env(), proxy("127.0.0.1:19090"));
         let get = |k: &str| {
             env.iter()
                 .find(|(n, _)| n == k)
@@ -207,12 +213,9 @@ mod tests {
 
     #[test]
     fn declared_env_is_present_and_wins_over_the_inherited_allowlist() {
-        let mut server = prepared(vec![], None);
-        server
-            .decl
-            .env
-            .insert("PATH".to_string(), "C:\\only\\this".to_string());
-        let env = build_env(&server);
+        let mut declared = declared_env();
+        declared.insert("PATH".to_string(), "C:\\only\\this".to_string());
+        let env = build_env(&declared, None);
 
         let paths: Vec<&str> = env
             .iter()
@@ -228,9 +231,44 @@ mod tests {
     /// 秘密っぽい環境変数はallowlist側から入らない（D-07。宣言に書いたものだけが渡る）。
     #[test]
     fn secret_looking_inherited_variables_do_not_reach_the_server() {
-        let env = build_env(&prepared(vec![], None));
+        let env = build_env(&declared_env(), None);
         assert!(!env
             .iter()
             .any(|(k, _)| k.to_ascii_uppercase().contains("API_KEY")));
+    }
+
+    /// HTTP用に用意された`PreparedServer`でstdioのファクトリを呼んでも、空のプロファイル名で
+    /// 起動したりせずエラーになる（`PreparedIsolation`を型で分けている理由）。
+    #[test]
+    fn the_stdio_factory_refuses_a_server_prepared_for_streamable_http() {
+        let endpoint = crate::http_wire::validate_endpoint(
+            "http://127.0.0.1:3000/mcp",
+            &crate::http_wire::EndpointGates::default(),
+        )
+        .unwrap();
+        let prepared = PreparedServer {
+            decl: McpServerDecl {
+                id: "docs".to_string(),
+                transport: McpTransportKind::StreamableHttp,
+                command: String::new(),
+                args: vec![],
+                env: Default::default(),
+                url: "http://127.0.0.1:3000/mcp".to_string(),
+                headers: Default::default(),
+                tls_pin: None,
+                tools: Default::default(),
+                network: McpNetworkDecl::default(),
+                workspace: McpWorkspaceAccess::None,
+            },
+            isolation: PreparedIsolation::Direct {
+                endpoint,
+                ca_bundle: None,
+                tls_pin: None,
+            },
+        };
+        assert!(matches!(
+            AppContainerTransportFactory.create(&prepared),
+            Err(McpError::Spawn { .. })
+        ));
     }
 }

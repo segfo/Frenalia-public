@@ -33,12 +33,26 @@ pub const MAX_SERVER_ID_LEN: usize = 32;
 pub const TOOL_NAME_PREFIX: &str = "mcp__";
 pub const TOOL_NAME_SEPARATOR: &str = "__";
 
-/// トランスポート種別（D-41）。既定はstdio。Streamable HTTPはM15.6で追加する。
+/// トランスポート種別（D-41）。既定はstdio。
+///
+/// **`StreamableHttp`はharness本体が直接喋る経路**で、AppContainerの箱の外にある（§6.2）。
+/// したがってWFPの`FWPM_CONDITION_ALE_PACKAGE_ID`条件にも協調プロキシにも掛からない。
+/// 有効化がユーザー層設定/CLIからのオプトインなのはこのため（D-49）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransportKind {
     #[default]
     Stdio,
+    StreamableHttp,
+}
+
+impl McpTransportKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            McpTransportKind::Stdio => "stdio",
+            McpTransportKind::StreamableHttp => "streamable_http",
+        }
+    }
 }
 
 /// サーバのworkspace要求（`DESIGN-MCP.md` §3.2）。既定は`None`＝ACEを一切付けない。
@@ -68,25 +82,55 @@ impl McpNetworkDecl {
 }
 
 /// 1つのMCPサーバ宣言。設定ファイルの`mcp.servers[]`1件に対応する。
+///
+/// **トランスポートごとに意味を持つ項目が違う**（stdioは`command`/`args`/`env`/`network`/
+/// `workspace`、Streamable HTTPは`url`/`headers`）。他方の項目が書かれていたら
+/// [`McpServerDecl::validate`]がエラーにする——書いても効かない項目を黙って無視すると、
+/// 「設定したのに効かない」に気付けないため（[`parse_mcp_settings`]と同じ方針）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerDecl {
     pub id: String,
     #[serde(default)]
     pub transport: McpTransportKind,
-    /// 起動する実行ファイル。**ここに書かれたものをharnessがそのまま起動する**ので、
+    /// 【stdio】起動する実行ファイル。**ここに書かれたものをharnessがそのまま起動する**ので、
     /// 承認台帳（D-39）の照合対象の中核である。
+    #[serde(default)]
     pub command: String,
+    /// 【stdio】
     #[serde(default)]
     pub args: Vec<String>,
-    /// サーバへ渡す追加環境変数。harness自身のenvは継承させない（clean env）。
+    /// 【stdio】サーバへ渡す追加環境変数。harness自身のenvは継承させない（clean env）。
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// 【HTTP】接続先のMCPエンドポイント。**このホストが承認・allowlistの対象**であり、
+    /// リダイレクトを追わない（D-49）ので、実際に喋る相手はここに書かれたホストだけになる。
+    #[serde(default)]
+    pub url: String,
+    /// 【HTTP】毎リクエストに付ける追加ヘッダ。値に`${env:NAME}`と書くと起動時にharness自身の
+    /// 環境変数から解決する（[`crate::http_wire::expand_headers`]）。
+    ///
+    /// **承認ハッシュ・[`McpServerDecl::describe`]が見るのは展開前の文字列**なので、
+    /// トークンの実値は承認台帳にもプロンプトにも出ない。
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// 【HTTP】サーバ証明書のピン（`sha256:<64桁の16進>`。D-52）。
+    ///
+    /// 指定すると、**通常の証明書検証（CA連鎖と名前）の代わりに**「提示された証明書のDERの
+    /// SHA-256がこの値と一致すること」だけを見る。私有CAを立てられない社内サーバの
+    /// 自己署名証明書を、OS証明書ストアを触らずに、しかも**その1枚に限って**受け入れるための
+    /// 経路である（SSHの`known_hosts`と同じモデル）。
+    ///
+    /// 省略時（`None`）は通常の検証。**「検証しない」という選択肢はどちらにも無い。**
+    #[serde(default)]
+    pub tls_pin: Option<String>,
     /// per-tool `RiskClass`宣言（D-40）。**ここに無いツールは非readとして扱う**ので、
     /// 空でも宣言として妥当（すべてのツールがパーミッションゲートを通るだけ）。
     #[serde(default)]
     pub tools: BTreeMap<String, RiskClass>,
+    /// 【stdio】
     #[serde(default)]
     pub network: McpNetworkDecl,
+    /// 【stdio】
     #[serde(default)]
     pub workspace: McpWorkspaceAccess,
 }
@@ -109,6 +153,52 @@ pub enum DeclError {
     NamespacedNameTooLong { id: String, tool: String },
     #[error("duplicate server id: {0:?}")]
     DuplicateId(String),
+    #[error("server {id:?} uses the streamable_http transport but has an empty \"url\"")]
+    EmptyUrl { id: String },
+    #[error("server {id:?} has an unusable \"url\": {reason}")]
+    InvalidUrl { id: String, reason: String },
+    /// 書いても効かない項目を**黙って無視しない**（型の doc 参照）。
+    #[error(
+        "server {id:?} uses the {transport} transport, which ignores {field:?}; remove it rather \
+         than leaving a setting that has no effect"
+    )]
+    FieldNotApplicable {
+        id: String,
+        transport: &'static str,
+        field: &'static str,
+    },
+    #[error(
+        "server {id:?} declares the http header {header:?}, which is not a valid header name \
+         (RFC 9110 token characters only)"
+    )]
+    InvalidHeaderName { id: String, header: String },
+    /// harness自身が組み立てるヘッダを宣言側から上書きさせない（プロトコル状態が壊れる）。
+    #[error("server {id:?} declares the http header {header:?}, which harness sets itself")]
+    ReservedHeaderName { id: String, header: String },
+    #[error("server {id:?} has an unusable \"tls_pin\": {reason}")]
+    InvalidTlsPin { id: String, reason: String },
+    /// ピンは接続先の同一性そのものなので、平文では意味を持たない（D-52）。
+    #[error(
+        "server {id:?} declares a \"tls_pin\" but its url is plaintext http; a certificate pin \
+         only means something over TLS"
+    )]
+    TlsPinWithoutTls { id: String },
+}
+
+/// harnessがStreamable HTTPで自分で組み立てるヘッダ。宣言側からの指定を拒否する。
+pub const RESERVED_HTTP_HEADERS: &[&str] = &[
+    "accept",
+    "content-type",
+    "mcp-session-id",
+    "mcp-protocol-version",
+];
+
+/// RFC 9110のfield-name（token）として妥当か。
+pub fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
+        })
 }
 
 /// サーバidとして妥当か（AppContainerプロファイル名・ツール名の両方の材料になる）。
@@ -138,14 +228,17 @@ pub fn namespaced_tool_name(server_id: &str, tool: &str) -> String {
 
 impl McpServerDecl {
     /// 宣言そのものの妥当性を検査する（サーバとの通信前に行う）。
+    ///
+    /// **ここで見るのは宣言の形だけ**である。接続してよい相手かどうか（ドメインallowlist・
+    /// 平文の可否・トランスポートの有効化）はセッション側のゲートで、
+    /// [`crate::runtime::McpRuntime::plan`]が判定する。
     pub fn validate(&self) -> Result<(), DeclError> {
         if !is_valid_server_id(&self.id) {
             return Err(DeclError::InvalidId(self.id.clone()));
         }
-        if self.command.trim().is_empty() {
-            return Err(DeclError::EmptyCommand {
-                id: self.id.clone(),
-            });
+        match self.transport {
+            McpTransportKind::Stdio => self.validate_stdio_fields()?,
+            McpTransportKind::StreamableHttp => self.validate_http_fields()?,
         }
         for tool in self.tools.keys() {
             if !is_valid_mcp_tool_name(tool) {
@@ -155,6 +248,97 @@ impl McpServerDecl {
                 });
             }
             self.check_namespaced_len(tool)?;
+        }
+        Ok(())
+    }
+
+    /// stdio宣言に、HTTPでしか意味を持たない項目が書かれていないか。
+    fn validate_stdio_fields(&self) -> Result<(), DeclError> {
+        let not_applicable = |field| DeclError::FieldNotApplicable {
+            id: self.id.clone(),
+            transport: "stdio",
+            field,
+        };
+        if !self.url.trim().is_empty() {
+            return Err(not_applicable("url"));
+        }
+        if !self.headers.is_empty() {
+            return Err(not_applicable("headers"));
+        }
+        if self.tls_pin.is_some() {
+            return Err(not_applicable("tls_pin"));
+        }
+        if self.command.trim().is_empty() {
+            return Err(DeclError::EmptyCommand {
+                id: self.id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// HTTP宣言に、stdioでしか意味を持たない項目が書かれていないか＋URLとヘッダ名の形。
+    ///
+    /// `command`/`args`/`env`はAppContainer子プロセスが無いので使い道が無く、
+    /// `network`/`workspace`は与える先のpackage SIDが存在しない（§6.2）。
+    fn validate_http_fields(&self) -> Result<(), DeclError> {
+        let not_applicable = |field| DeclError::FieldNotApplicable {
+            id: self.id.clone(),
+            transport: "streamable_http",
+            field,
+        };
+        if !self.command.trim().is_empty() {
+            return Err(not_applicable("command"));
+        }
+        if !self.args.is_empty() {
+            return Err(not_applicable("args"));
+        }
+        if !self.env.is_empty() {
+            return Err(not_applicable("env"));
+        }
+        if !self.network.is_deny() {
+            return Err(not_applicable("network"));
+        }
+        if self.workspace != McpWorkspaceAccess::None {
+            return Err(not_applicable("workspace"));
+        }
+
+        if self.url.trim().is_empty() {
+            return Err(DeclError::EmptyUrl {
+                id: self.id.clone(),
+            });
+        }
+        // URLの解析は`http_wire`の1実装だけが持つ（セッションゲートも同じ関数を通る）。
+        let parsed =
+            crate::http_wire::parse_endpoint_url(&self.url).map_err(|e| DeclError::InvalidUrl {
+                id: self.id.clone(),
+                reason: e.to_string(),
+            })?;
+
+        if let Some(pin) = &self.tls_pin {
+            crate::http_wire::parse_cert_pin(pin).map_err(|e| DeclError::InvalidTlsPin {
+                id: self.id.clone(),
+                reason: e.to_string(),
+            })?;
+            if !parsed.is_tls() {
+                return Err(DeclError::TlsPinWithoutTls {
+                    id: self.id.clone(),
+                });
+            }
+        }
+
+        for header in self.headers.keys() {
+            if !is_valid_header_name(header) {
+                return Err(DeclError::InvalidHeaderName {
+                    id: self.id.clone(),
+                    header: header.clone(),
+                });
+            }
+            if RESERVED_HTTP_HEADERS.contains(&header.to_ascii_lowercase().as_str()) {
+                return Err(DeclError::ReservedHeaderName {
+                    id: self.id.clone(),
+                    header: header.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -196,6 +380,9 @@ impl McpServerDecl {
             command,
             args,
             env,
+            url,
+            headers,
+            tls_pin,
             tools,
             network,
             workspace,
@@ -216,6 +403,14 @@ impl McpServerDecl {
             command: &'a str,
             args: &'a [String],
             env: &'a BTreeMap<String, String>,
+            url: &'a str,
+            /// **展開前**の値（`${env:NAME}`のまま）。実値をハッシュすると、トークンを
+            /// ローテートしただけで承認が失効し、かつ台帳が実値の存在を示唆してしまう。
+            headers: &'a BTreeMap<String, String>,
+            /// **必ずハッシュへ入れる**（D-52）。ピンは「どの証明書を受け入れるか」そのもので、
+            /// 承認後に差し替えられたら、ユーザーが目で確かめた1枚とは別の証明書が通る。
+            /// 表記ゆれ（区切り・大小文字）で承認が失効しないよう正規化してから入れる。
+            tls_pin: Option<String>,
             tools: &'a BTreeMap<String, RiskClass>,
             allow_domains: Vec<String>,
             workspace: &'a McpWorkspaceAccess,
@@ -227,6 +422,15 @@ impl McpServerDecl {
             command,
             args,
             env,
+            url,
+            headers,
+            tls_pin: tls_pin.as_ref().map(|raw| {
+                crate::http_wire::parse_cert_pin(raw)
+                    .map(|pin| pin.to_declaration_string())
+                    // 不正なピンは`validate`が起動を止めるが、ハッシュは常に計算されうる。
+                    // 正規化できない値は生のまま入れる（別の値として扱われるだけで安全側）。
+                    .unwrap_or_else(|_| raw.clone())
+            }),
             tools,
             allow_domains,
             workspace,
@@ -245,15 +449,61 @@ impl McpServerDecl {
     pub fn describe(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("  id:        {}\n", self.id));
-        out.push_str(&format!("  transport: {:?}\n", self.transport));
-        out.push_str(&format!("  command:   {}\n", self.command));
-        out.push_str(&format!("  args:      {:?}\n", self.args));
-        out.push_str("  env:\n");
-        if self.env.is_empty() {
-            out.push_str("    (none)\n");
-        } else {
-            for (k, v) in &self.env {
-                out.push_str(&format!("    {k}={v}\n"));
+        out.push_str(&format!("  transport: {}\n", self.transport.label()));
+        match self.transport {
+            McpTransportKind::Stdio => {
+                out.push_str(&format!("  command:   {}\n", self.command));
+                out.push_str(&format!("  args:      {:?}\n", self.args));
+                out.push_str("  env:\n");
+                if self.env.is_empty() {
+                    out.push_str("    (none)\n");
+                } else {
+                    for (k, v) in &self.env {
+                        out.push_str(&format!("    {k}={v}\n"));
+                    }
+                }
+            }
+            McpTransportKind::StreamableHttp => {
+                out.push_str(&format!("  url:       {}\n", self.url));
+                match &self.tls_pin {
+                    Some(pin) => {
+                        // 目視照合しやすい形で出す（D-52。ユーザーはこの値をサーバ運用者と
+                        // 突き合わせて承認可否を決める）。
+                        let readable = crate::http_wire::parse_cert_pin(pin)
+                            .map(|p| p.to_readable())
+                            .unwrap_or_else(|_| format!("{pin} (UNPARSABLE)"));
+                        out.push_str(&format!("  tls pin:   sha256 {readable}\n"));
+                    }
+                    None => out.push_str(
+                        "  tls pin:   (none -- the certificate is validated normally, against \
+                         the OS certificate store)\n",
+                    ),
+                }
+                out.push_str("  headers:\n");
+                if self.headers.is_empty() {
+                    out.push_str("    (none)\n");
+                } else {
+                    // 値は展開前のまま出す。`${env:TOKEN}`と書かれていれば実値は出ない。
+                    for (k, v) in &self.headers {
+                        out.push_str(&format!("    {k}: {v}\n"));
+                    }
+                }
+                // D-41の「有効化した時点でこの経路がharnessの出口制御の外にあることを明示する」。
+                out.push_str(
+                    "  NOTE: harness itself makes this connection. Unlike a stdio server, it does \
+                     NOT run in an AppContainer, and its traffic is NOT subject to the WFP egress \
+                     filters or the cooperative proxy. What it can reach is decided by the URL \
+                     above (redirects are refused) and by whatever the server operator allows.\n",
+                );
+                if self.tls_pin.is_some() {
+                    // D-52: ピンは連鎖と名前の検証を**置き換える**。何を承認しているのかを書く。
+                    out.push_str(
+                        "  NOTE: the tls pin REPLACES normal certificate validation for this \
+                         server -- the certificate chain and the host name are not checked, and \
+                         only a certificate whose sha256 matches exactly is accepted. Verify the \
+                         fingerprint with whoever runs the server before approving.\n",
+                    );
+                }
             }
         }
         out.push_str("  tools (declared RiskClass; anything not listed is treated as non-read):\n");
@@ -268,18 +518,22 @@ impl McpServerDecl {
                 ));
             }
         }
-        out.push_str(&format!(
-            "  network:   {}\n",
-            if self.network.is_deny() {
-                "deny (no outbound sockets at all)".to_string()
-            } else {
-                format!(
-                    "allow via a dedicated proxy: {}",
-                    self.network.allow_domains.join(", ")
-                )
-            }
-        ));
-        out.push_str(&format!("  workspace: {:?}\n", self.workspace));
+        // network/workspaceはstdio（AppContainerのpackage SID）にだけ意味がある。HTTPでは
+        // `validate`が既定値以外を拒否しているので、出しても「deny/None」しか言えず紛らわしい。
+        if self.transport == McpTransportKind::Stdio {
+            out.push_str(&format!(
+                "  network:   {}\n",
+                if self.network.is_deny() {
+                    "deny (no outbound sockets at all)".to_string()
+                } else {
+                    format!(
+                        "allow via a dedicated proxy: {}",
+                        self.network.allow_domains.join(", ")
+                    )
+                }
+            ));
+            out.push_str(&format!("  workspace: {:?}\n", self.workspace));
+        }
         out
     }
 }
@@ -296,14 +550,46 @@ impl McpServerDecl {
 ///       "tools": { "search": "read_only" },
 ///       "network": { "allow_domains": ["docs.example.com"] },
 ///       "workspace": "none"
+///     },
+///     {
+///       "id": "corp-mcp",
+///       "transport": "streamable_http",
+///       "url": "https://mcp.corp.example/mcp",
+///       "headers": { "Authorization": "Bearer ${env:CORP_MCP_TOKEN}" },
+///       "tools": { "search": "read_only" }
 ///     }
-///   ]
+///   ],
+///   "allow_streamable_http": true,
+///   "http_allow_domains": ["mcp.corp.example"]
 /// }
 /// ```
+///
+/// **`servers`以外の3キーはユーザ層設定でしか効かない**（D-49）。プロジェクト層
+/// （`<root>/.harness/settings.json`）に書かれた分は`harness_config::clamp_project_mcp_http_gates`
+/// がマージの過程で剥がす——宣言そのものはリポジトリ同梱でよいが、その宣言を**起動してよいと
+/// 決める側**まで同じ場所から動かせると、D-41のオプトインをリポジトリが自称できてしまう。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpSettings {
     #[serde(default)]
     pub servers: Vec<McpServerDecl>,
+    /// Streamable HTTPトランスポートを有効にする（D-41/D-49。既定は無効）。
+    #[serde(default)]
+    pub allow_streamable_http: bool,
+    /// HTTP MCPエンドポイントとして接続してよいドメイン。**空なら1つも起動しない**
+    /// （closed-by-default）。構文は`net.allow_domains`と同一（`*.example.com`）。
+    #[serde(default)]
+    pub http_allow_domains: Vec<String>,
+    /// 私有CAのPEMバンドル。OS証明書ストアに入れられない場合の逃げ道で、既定は不要。
+    #[serde(default)]
+    pub http_ca_bundle: Option<String>,
+}
+
+/// [`parse_mcp_http_gates`]が返す、宣言以外の`mcp`キー（＝セッション側のゲート）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpHttpSettings {
+    pub allow_streamable_http: bool,
+    pub http_allow_domains: Vec<String>,
+    pub http_ca_bundle: Option<String>,
 }
 
 /// `harness-config`が運んできた生の`mcp`キーを解釈する。
@@ -315,9 +601,28 @@ pub fn parse_mcp_settings(value: Option<&serde_json::Value>) -> Result<Vec<McpSe
     let Some(value) = value else {
         return Ok(Vec::new());
     };
-    let settings: McpSettings = serde_json::from_value(value.clone())
-        .map_err(|e| format!("invalid \"mcp\" section in settings.json: {e}"))?;
-    Ok(settings.servers)
+    Ok(parse_mcp_section(value)?.servers)
+}
+
+/// 宣言以外の`mcp`キー（HTTPトランスポートのゲート）を解釈する。
+///
+/// `parse_mcp_settings`と同じ`McpSettings`を通すので、綴り間違い・型違いはここでも
+/// エラーになる（`"allow_streamable_http": "true"`が黙って無効にならない）。
+pub fn parse_mcp_http_gates(value: Option<&serde_json::Value>) -> Result<McpHttpSettings, String> {
+    let Some(value) = value else {
+        return Ok(McpHttpSettings::default());
+    };
+    let settings = parse_mcp_section(value)?;
+    Ok(McpHttpSettings {
+        allow_streamable_http: settings.allow_streamable_http,
+        http_allow_domains: settings.http_allow_domains,
+        http_ca_bundle: settings.http_ca_bundle,
+    })
+}
+
+fn parse_mcp_section(value: &serde_json::Value) -> Result<McpSettings, String> {
+    serde_json::from_value(value.clone())
+        .map_err(|e| format!("invalid \"mcp\" section in settings.json: {e}"))
 }
 
 /// 宣言の集合を検証する（id重複はここで弾く。プロファイル名・ツール名が衝突するため）。
@@ -345,6 +650,9 @@ mod tests {
             env: [("DOCS_ROOT".to_string(), "C:\\docs".to_string())]
                 .into_iter()
                 .collect(),
+            url: String::new(),
+            headers: Default::default(),
+            tls_pin: None,
             tools: [("search".to_string(), RiskClass::ReadOnly)]
                 .into_iter()
                 .collect(),
@@ -520,12 +828,24 @@ mod tests {
         assert!(parse_mcp_settings(None).unwrap().is_empty());
     }
 
+    /// `command`が無い宣言は、パースは通るが**検証で落ちる**。
+    ///
+    /// M15.6で`command`はトランスポート依存になったので（HTTPには実行ファイルが無い）、
+    /// serdeの必須フィールドでは表せなくなった。落とす場所がパースから検証へ移っただけで、
+    /// 黙って起動しないという点は変わらない（`SkipReason::Invalid`として報告される）。
+    #[test]
+    fn a_stdio_declaration_without_a_command_is_rejected_at_validation_time() {
+        let value = serde_json::json!({ "servers": [ { "id": "docs" } ] });
+        let decls = parse_mcp_settings(Some(&value)).unwrap();
+        assert!(matches!(
+            decls[0].validate(),
+            Err(DeclError::EmptyCommand { .. })
+        ));
+    }
+
     /// 綴り間違い・型違いは黙って無視されずエラーになる（「設定したのに効かない」を防ぐ）。
     #[test]
     fn a_malformed_mcp_section_is_an_error_rather_than_being_ignored() {
-        let value = serde_json::json!({ "servers": [ { "id": "docs" } ] });
-        assert!(parse_mcp_settings(Some(&value)).is_err(), "command is required");
-
         let value = serde_json::json!({ "servers": "not an array" });
         assert!(parse_mcp_settings(Some(&value)).is_err());
 
@@ -543,5 +863,327 @@ mod tests {
         let mut decl = sample();
         decl.command = "   ".to_string();
         assert!(matches!(decl.validate(), Err(DeclError::EmptyCommand { .. })));
+    }
+
+    // --- M15.6: Streamable HTTP ---
+
+    fn http_sample() -> McpServerDecl {
+        McpServerDecl {
+            id: "corp-mcp".to_string(),
+            transport: McpTransportKind::StreamableHttp,
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            url: "https://mcp.corp.example/mcp".to_string(),
+            headers: [(
+                "Authorization".to_string(),
+                "Bearer ${env:CORP_MCP_TOKEN}".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            tls_pin: None,
+            tools: [("search".to_string(), RiskClass::ReadOnly)]
+                .into_iter()
+                .collect(),
+            network: McpNetworkDecl::default(),
+            workspace: McpWorkspaceAccess::None,
+        }
+    }
+
+    #[test]
+    fn a_valid_streamable_http_declaration_passes_validation() {
+        assert_eq!(http_sample().validate(), Ok(()));
+    }
+
+    #[test]
+    fn the_settings_parser_understands_the_streamable_http_transport() {
+        let value = serde_json::json!({
+            "servers": [ {
+                "id": "corp-mcp",
+                "transport": "streamable_http",
+                "url": "https://mcp.corp.example/mcp"
+            } ]
+        });
+        let decls = parse_mcp_settings(Some(&value)).unwrap();
+        assert_eq!(decls[0].transport, McpTransportKind::StreamableHttp);
+        assert_eq!(decls[0].validate(), Ok(()));
+    }
+
+    /// **書いても効かない項目を黙って無視しない。** stdio専用の項目をHTTP宣言へ書いたら落とす。
+    #[test]
+    fn stdio_only_fields_on_an_http_declaration_are_rejected_rather_than_ignored() {
+        type Mutation = (&'static str, Box<dyn Fn(&mut McpServerDecl)>);
+        let cases: Vec<Mutation> = vec![
+            ("command", Box::new(|d: &mut McpServerDecl| d.command = "node.exe".to_string())),
+            ("args", Box::new(|d: &mut McpServerDecl| d.args = vec!["x".to_string()])),
+            (
+                "env",
+                Box::new(|d: &mut McpServerDecl| {
+                    d.env.insert("K".to_string(), "V".to_string());
+                }),
+            ),
+            (
+                "network",
+                Box::new(|d: &mut McpServerDecl| {
+                    d.network.allow_domains = vec!["a.example".to_string()]
+                }),
+            ),
+            (
+                "workspace",
+                Box::new(|d: &mut McpServerDecl| d.workspace = McpWorkspaceAccess::Read),
+            ),
+        ];
+        for (field, mutate) in cases {
+            let mut decl = http_sample();
+            mutate(&mut decl);
+            match decl.validate() {
+                Err(DeclError::FieldNotApplicable { field: got, .. }) => assert_eq!(got, field),
+                other => panic!("{field} should be rejected on an http declaration: {other:?}"),
+            }
+        }
+    }
+
+    /// 逆向きも同じ（stdio宣言にurl/headersを書いたら落とす）。
+    #[test]
+    fn http_only_fields_on_a_stdio_declaration_are_rejected_rather_than_ignored() {
+        let mut decl = sample();
+        decl.url = "https://mcp.corp.example/mcp".to_string();
+        assert!(matches!(
+            decl.validate(),
+            Err(DeclError::FieldNotApplicable { field: "url", .. })
+        ));
+
+        let mut decl = sample();
+        decl.headers
+            .insert("Authorization".to_string(), "Bearer x".to_string());
+        assert!(matches!(
+            decl.validate(),
+            Err(DeclError::FieldNotApplicable {
+                field: "headers",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_http_declaration_needs_a_usable_url() {
+        let mut decl = http_sample();
+        decl.url = "  ".to_string();
+        assert!(matches!(decl.validate(), Err(DeclError::EmptyUrl { .. })));
+
+        for bad in ["ftp://example.com/mcp", "file:///c:/x", "not a url"] {
+            let mut decl = http_sample();
+            decl.url = bad.to_string();
+            assert!(
+                matches!(decl.validate(), Err(DeclError::InvalidUrl { .. })),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    /// harnessが自分で組み立てるヘッダを宣言側から差し替えさせない（プロトコル状態が壊れる）。
+    #[test]
+    fn headers_that_harness_sets_itself_are_rejected() {
+        for reserved in [
+            "Mcp-Session-Id",
+            "mcp-protocol-version",
+            "Accept",
+            "Content-Type",
+        ] {
+            let mut decl = http_sample();
+            decl.headers.insert(reserved.to_string(), "x".to_string());
+            assert!(
+                matches!(decl.validate(), Err(DeclError::ReservedHeaderName { .. })),
+                "should reject {reserved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_header_names_are_rejected() {
+        for bad in ["has space", "colon:name", "", "quote\"name"] {
+            let mut decl = http_sample();
+            decl.headers.insert(bad.to_string(), "x".to_string());
+            assert!(
+                matches!(decl.validate(), Err(DeclError::InvalidHeaderName { .. })),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    /// **D-39**: url・headersも承認ハッシュ対象。承認後に接続先やトークン参照を差し替えられない。
+    #[test]
+    fn the_url_and_headers_participate_in_the_approval_hash() {
+        let base = http_sample();
+        let base_hash = base.approval_hash();
+
+        let mut moved = base.clone();
+        moved.url = "https://evil.example/mcp".to_string();
+        assert_ne!(moved.approval_hash(), base_hash, "url must be hashed");
+
+        let mut extra_header = base.clone();
+        extra_header
+            .headers
+            .insert("X-Tenant".to_string(), "other".to_string());
+        assert_ne!(
+            extra_header.approval_hash(),
+            base_hash,
+            "headers must be hashed"
+        );
+    }
+
+    /// **D-41**: stdioで承認したものがHTTPで起動されない（トランスポート種別もハッシュ対象）。
+    #[test]
+    fn an_approval_does_not_carry_across_transports() {
+        let stdio = sample();
+        let http = McpServerDecl {
+            transport: McpTransportKind::StreamableHttp,
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            url: "https://mcp.corp.example/mcp".to_string(),
+            ..sample()
+        };
+        assert_ne!(stdio.approval_hash(), http.approval_hash());
+    }
+
+    /// 承認プロンプト（`describe`）は、実トークンではなく**展開前の参照**を見せる。
+    #[test]
+    fn describe_shows_the_unexpanded_header_value_not_the_secret() {
+        let described = http_sample().describe();
+        assert!(described.contains("${env:CORP_MCP_TOKEN}"), "{described}");
+        assert!(described.contains("https://mcp.corp.example/mcp"), "{described}");
+        // D-41: この経路がharnessの出口制御の外にあることを承認時に明示する。
+        assert!(described.contains("NOT run in an AppContainer"), "{described}");
+    }
+
+    // --- D-52: 証明書ピン ---
+
+    const PIN: &str = "sha256:9f6aab9ea64d8e00eeffbc2a5b57aacfecdf76000520fcfb84b0c36d6d113f0f";
+
+    #[test]
+    fn a_declaration_with_a_certificate_pin_is_valid() {
+        let mut decl = http_sample();
+        decl.tls_pin = Some(PIN.to_string());
+        assert_eq!(decl.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_malformed_certificate_pin_is_rejected() {
+        for bad in ["sha1:aabb", "sha256:短すぎ", "not-a-pin"] {
+            let mut decl = http_sample();
+            decl.tls_pin = Some(bad.to_string());
+            assert!(
+                matches!(decl.validate(), Err(DeclError::InvalidTlsPin { .. })),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    /// 平文httpにピンを書いても意味が無い（見る証明書が無い）ので、黙って無視せず落とす。
+    #[test]
+    fn a_certificate_pin_on_a_plaintext_url_is_rejected() {
+        let mut decl = http_sample();
+        decl.url = "http://mcp.corp.internal/mcp".to_string();
+        decl.tls_pin = Some(PIN.to_string());
+        assert!(matches!(
+            decl.validate(),
+            Err(DeclError::TlsPinWithoutTls { .. })
+        ));
+    }
+
+    /// stdio宣言にピンを書いても効かないので、黙って無視せず落とす
+    /// （このテストで実際に取りこぼしが見つかった）。
+    #[test]
+    fn a_certificate_pin_on_a_stdio_declaration_is_rejected() {
+        let mut decl = sample();
+        decl.tls_pin = Some(PIN.to_string());
+        assert!(
+            matches!(
+                decl.validate(),
+                Err(DeclError::FieldNotApplicable {
+                    field: "tls_pin",
+                    ..
+                })
+            ),
+            "a stdio server has no tls to pin: {:?}",
+            decl.validate()
+        );
+    }
+
+    /// **D-52/D-39**: ピンは承認ハッシュ対象。承認後に別の証明書へ差し替えられない。
+    #[test]
+    fn the_certificate_pin_participates_in_the_approval_hash() {
+        let base = http_sample();
+        let mut pinned = base.clone();
+        pinned.tls_pin = Some(PIN.to_string());
+        assert_ne!(pinned.approval_hash(), base.approval_hash());
+
+        let mut other = base.clone();
+        other.tls_pin = Some(format!("sha256:{}", "a".repeat(64)));
+        assert_ne!(other.approval_hash(), pinned.approval_hash());
+    }
+
+    /// 表記ゆれ（区切り・大小文字）で承認が失効しない——同じ証明書を指しているため。
+    #[test]
+    fn pin_formatting_does_not_invalidate_the_approval() {
+        let mut a = http_sample();
+        a.tls_pin = Some(PIN.to_string());
+        let mut b = http_sample();
+        b.tls_pin = Some("SHA256:9F6AAB9E:A64D8E00:EEFFBC2A:5B57AACF:ECDF7600:0520FCFB:84B0C36D:6D113F0F".to_string());
+        assert_eq!(a.approval_hash(), b.approval_hash());
+    }
+
+    /// 承認プロンプトは指紋を目視照合できる形で出し、**何を置き換えるのか**も書く。
+    #[test]
+    fn describe_shows_the_pin_and_what_it_replaces() {
+        let mut decl = http_sample();
+        decl.tls_pin = Some(PIN.to_string());
+        let described = decl.describe();
+        assert!(described.contains("9f6aab9e a64d8e00"), "{described}");
+        assert!(described.contains("REPLACES normal certificate validation"), "{described}");
+    }
+
+    /// ピンが無い宣言は「通常の検証を通る」と明示する（沈黙させない）。
+    #[test]
+    fn describe_says_when_there_is_no_pin() {
+        assert!(
+            http_sample().describe().contains("validated normally"),
+            "{}",
+            http_sample().describe()
+        );
+    }
+
+    /// 宣言以外の`mcp`キー（セッションゲート）も型で読む。
+    #[test]
+    fn the_http_gates_are_parsed_from_the_mcp_section() {
+        let value = serde_json::json!({
+            "servers": [],
+            "allow_streamable_http": true,
+            "http_allow_domains": ["mcp.corp.example"]
+        });
+        let gates = parse_mcp_http_gates(Some(&value)).unwrap();
+        assert!(gates.allow_streamable_http);
+        assert_eq!(gates.http_allow_domains, vec!["mcp.corp.example".to_string()]);
+        assert_eq!(gates.http_ca_bundle, None);
+    }
+
+    /// 既定は無効（D-41）。書かなければ閉じている。
+    #[test]
+    fn the_http_transport_is_disabled_when_the_gates_are_absent() {
+        assert!(!parse_mcp_http_gates(None).unwrap().allow_streamable_http);
+        let value = serde_json::json!({ "servers": [] });
+        assert!(
+            !parse_mcp_http_gates(Some(&value))
+                .unwrap()
+                .allow_streamable_http
+        );
+    }
+
+    /// `"true"`のような型違いを黙ってfalseにしない（有効化したつもりで無効を防ぐ）。
+    #[test]
+    fn a_misspelled_gate_value_is_an_error_rather_than_a_silent_default() {
+        let value = serde_json::json!({ "servers": [], "allow_streamable_http": "true" });
+        assert!(parse_mcp_http_gates(Some(&value)).is_err());
     }
 }

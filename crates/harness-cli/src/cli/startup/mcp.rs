@@ -13,10 +13,20 @@
 //! 4と5を入れ替えると、**WFPが効くまでの間サーバが無制限に外へ出られる窓**ができる。
 //! 1〜3をまとめた[`prepare_mcp_servers`]と、5だけを行う[`launch_mcp_servers`]に関数を割って
 //! あるのはそのためで、間にWFPの適用を挟むことを呼び出し側に強制する形になっている。
+//!
+//! ## Streamable HTTPはこの手順の2〜4を通らない（M15.6、D-50）
+//!
+//! HTTPサーバはharness本体が喋るので、AppContainerプロファイルも専用プロキシもWFPフィルタも
+//! 存在しない。統制は**接続前に済んでいる**——ユーザ層オプトイン・宛先allowlist・平文の可否
+//! （D-49、`McpRuntime::plan`が判定）と承認台帳（D-39）である。したがってこのモジュールは
+//! 承認済み宣言をトランスポートで振り分け、stdioだけをTier2aのゲートと2〜4へ通す。
 
 use std::path::Path;
 
-use harness_mcp::{ApprovalStore, McpRuntime, McpServerDecl, PreparedServer, SkippedServer};
+use harness_mcp::{
+    ApprovalStore, McpGates, McpRuntime, McpServerDecl, McpTransportKind, PreparedServer,
+    SkippedServer,
+};
 
 use super::*;
 
@@ -46,11 +56,14 @@ impl McpStartup {
     /// WFPが無いと、`internetClient` capabilityを持つサーバは専用プロキシを無視して直接外へ
     /// 出られる。「宛先を絞ったつもりで絞れていない」状態を作るくらいなら起動しない
     /// （`run_shell`側の`should_grant_tier2a_network_capability`と同じfail-closed）。
-    /// networkを要求していないサーバはcapabilityが空でソケットを作れないので、そのまま残す。
+    ///
+    /// 落とすかどうかの判断は`PreparedIsolation::needs_wfp_egress_enforcement`が持つ。
+    /// networkを要求していないstdioサーバはcapabilityが空でソケットを作れないので残り、
+    /// **Streamable HTTPサーバも残る**——WFPは元からこの経路に関係しない（D-50）。
     pub(super) fn drop_servers_needing_egress_enforcement(&mut self) {
         let mut kept = Vec::new();
         for server in std::mem::take(&mut self.prepared) {
-            if server.proxy_addr.is_none() {
+            if !server.isolation.needs_wfp_egress_enforcement() {
                 kept.push(server);
                 continue;
             }
@@ -69,7 +82,7 @@ impl McpStartup {
             let live: std::collections::BTreeSet<&str> = self
                 .prepared
                 .iter()
-                .map(|s| s.profile_name.as_str())
+                .filter_map(|s| s.isolation.profile_name())
                 .collect();
             self.netfilter_entries
                 .retain(|e| live.contains(e.profile.as_str()));
@@ -80,6 +93,7 @@ impl McpStartup {
 /// 手順1〜3。**プロセスはまだ起こさない。**
 pub(super) async fn prepare_mcp_servers(
     decls: &[McpServerDecl],
+    gates: &McpGates,
     workspace_root: &Path,
     shell_tier: harness_core::ShellTier,
     interactive: bool,
@@ -97,7 +111,7 @@ pub(super) async fn prepare_mcp_servers(
     }
 
     let store = ApprovalStore::in_config_dir();
-    let mut plan = McpRuntime::plan(decls, &store.load());
+    let mut plan = McpRuntime::plan(decls, &store.load(), gates);
 
     // 承認経路2（起動時プロンプト）。ヘッドレスでは呼ばない——`DESIGN.md` §パーミッションの
     // 「ヘッドレス時はプロンプトになるものを既定で自動拒否」と同じ規則。
@@ -106,14 +120,30 @@ pub(super) async fn prepare_mcp_servers(
     }
     startup.skipped = plan.skipped;
 
-    // P-05（`DESIGN-MCP.md` §3.4）: 隔離機構が無い環境ではMCPサーバを起動しない。
+    // トランスポートで振り分ける（モジュールdoc）。HTTPは隔離の実体が無いので、
+    // Tier2aのゲートも専用プロキシもWFPも通らない（D-50）。
+    let (http_decls, stdio_decls): (Vec<_>, Vec<_>) = plan
+        .approved
+        .into_iter()
+        .partition(|d| d.transport == McpTransportKind::StreamableHttp);
+
+    for decl in http_decls {
+        match McpRuntime::prepare_http(&decl, gates) {
+            Ok(prepared) => startup.prepared.push(prepared),
+            // `plan`が同じゲートを既に通しているのでここへ来るのは異常系だが、
+            // 落ちるなら起動せずに理由を出す。
+            Err(reason) => startup.skipped.push(SkippedServer { id: decl.id, reason }),
+        }
+    }
+
+    // P-05（`DESIGN-MCP.md` §3.4）: 隔離機構が無い環境では**stdioの**MCPサーバを起動しない。
     // 「隔離できないので素通しで起動する」という降格は用意しない。
     if !cfg!(windows) || shell_tier != harness_core::ShellTier::Tier2a {
-        for decl in plan.approved {
+        for decl in stdio_decls {
             startup.skipped.push(SkippedServer {
                 id: decl.id,
                 reason: harness_mcp::SkipReason::IsolationUnavailable(format!(
-                    "mcp servers require Tier2a (Windows AppContainer); the current shell \
+                    "stdio mcp servers require Tier2a (Windows AppContainer); the current shell \
                      isolation tier is {}",
                     shell_tier.label()
                 )),
@@ -123,7 +153,7 @@ pub(super) async fn prepare_mcp_servers(
     }
 
     #[cfg(windows)]
-    for decl in plan.approved {
+    for decl in stdio_decls {
         let mut prepared = match harness_mcp::sandbox::prepare(&decl, workspace_root) {
             Ok(outcome) => {
                 for warning in outcome.warnings {
@@ -143,7 +173,11 @@ pub(super) async fn prepare_mcp_servers(
         // §3.2: network要求のあるサーバには**そのサーバ専用の**協調プロキシを立てる。
         // 宛先の粒度はここが持ち、WFPは「このSIDはこのポートだけ」を強制する。
         let mut entry = harness_sandbox::tier2a::netfilterd::McpNetfilterPolicy {
-            profile: prepared.profile_name.clone(),
+            profile: prepared
+                .isolation
+                .profile_name()
+                .unwrap_or_default()
+                .to_string(),
             allow_loopback_tcp_ports: Vec::new(),
             allow_loopback_udp_ports: Vec::new(),
         };
@@ -157,7 +191,7 @@ pub(super) async fn prepare_mcp_servers(
             match harness_tools::net_proxy::spawn_local_proxy(&config).await {
                 Ok(Some(proxy)) => {
                     entry.allow_loopback_tcp_ports.push(proxy.addr.port());
-                    prepared.proxy_addr = Some(proxy.addr);
+                    prepared.set_proxy_addr(proxy.addr);
                     startup.proxies.push(proxy);
                 }
                 Ok(None) | Err(_) => {
@@ -205,18 +239,13 @@ pub(super) fn launch_mcp_servers(
         return (McpRuntime::default(), Vec::new(), proxies);
     }
 
-    #[cfg(windows)]
+    // トランスポート種別で本番の実装を振り分ける唯一の場所（`DefaultTransportFactory`）。
     let runtime = McpRuntime::start(
         prepared,
-        &harness_mcp::AppContainerTransportFactory,
+        &harness_mcp::DefaultTransportFactory,
         env!("CARGO_PKG_VERSION"),
         &mut skipped,
     );
-    #[cfg(not(windows))]
-    let runtime = {
-        let _ = prepared;
-        McpRuntime::default()
-    };
 
     for warning in runtime.warnings() {
         eprintln!("warning: {warning}");

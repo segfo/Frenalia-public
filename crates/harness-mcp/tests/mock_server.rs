@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use harness_core::{RiskClass, ToolCtx};
 use harness_mcp::approval::ApprovalStore;
 use harness_mcp::decl::{McpNetworkDecl, McpServerDecl, McpTransportKind, McpWorkspaceAccess};
-use harness_mcp::runtime::{McpRuntime, PreparedServer, SkippedServer, TransportFactory};
+use harness_mcp::runtime::{McpGates, McpRuntime, PreparedServer, SkippedServer, TransportFactory};
 use harness_mcp::transport::{LineAccumulator, Transport};
 use harness_mcp::McpError;
 
@@ -148,6 +148,9 @@ fn decl_with(tools: &[(&str, RiskClass)]) -> McpServerDecl {
         command: MOCK_SERVER.to_string(),
         args: Vec::new(),
         env: BTreeMap::new(),
+        url: String::new(),
+        headers: BTreeMap::new(),
+        tls_pin: None,
         tools: tools
             .iter()
             .map(|(name, risk)| (name.to_string(), *risk))
@@ -159,9 +162,11 @@ fn decl_with(tools: &[(&str, RiskClass)]) -> McpServerDecl {
 
 fn prepared(decl: McpServerDecl) -> PreparedServer {
     PreparedServer {
-        profile_name: "harness.mcp.test.mock".to_string(),
+        isolation: harness_mcp::PreparedIsolation::AppContainer {
+            profile_name: "harness.mcp.test.mock".to_string(),
+            proxy_addr: None,
+        },
         decl,
-        proxy_addr: None,
     }
 }
 
@@ -291,11 +296,11 @@ fn the_same_declaration_starts_only_after_it_is_approved() {
     let store = ApprovalStore::at_path(dir.path().join("ledger.json"));
     let decl = decl_with(&[("search", RiskClass::ReadOnly)]);
 
-    let plan = McpRuntime::plan(std::slice::from_ref(&decl), &store.load());
+    let plan = McpRuntime::plan(std::slice::from_ref(&decl), &store.load(), &McpGates::default());
     assert!(plan.approved.is_empty());
 
     store.approve(&decl);
-    let plan = McpRuntime::plan(std::slice::from_ref(&decl), &store.load());
+    let plan = McpRuntime::plan(std::slice::from_ref(&decl), &store.load(), &McpGates::default());
     assert_eq!(plan.approved.len(), 1);
 
     let (runtime, skipped) = start(decl, Vec::new());

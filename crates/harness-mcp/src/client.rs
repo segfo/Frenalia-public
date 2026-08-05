@@ -83,6 +83,14 @@ impl McpClient {
                 SUPPORTED_PROTOCOL_VERSIONS.join(", ")
             )));
         }
+        // ネゴシエート結果をトランスポートへ伝える（Streamable HTTPは以後の全リクエストへ
+        // `MCP-Protocol-Version`ヘッダを付ける必要がある。stdioでは既定のno-op）。
+        // **`notifications/initialized`より前に**伝えないと、その通知だけヘッダが欠ける。
+        if let Ok(mut inner) = self.inner.lock() {
+            inner
+                .transport
+                .on_protocol_negotiated(&init.protocol_version);
+        }
         self.notify("notifications/initialized", None)?;
 
         let mut tools = Vec::new();

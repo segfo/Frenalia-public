@@ -342,6 +342,14 @@ pub struct McpServerFact {
     pub workspace_access: String,
     /// 登録されたツール名（名前空間付き）。
     pub tool_names: Vec<String>,
+    /// `stdio` | `streamable_http`（M15.6、`DESIGN-MCP.md` §6）。
+    pub transport: String,
+    /// Streamable HTTPのときの接続先（`host[:port]/path`）。stdioでは`None`。
+    ///
+    /// **これが`Some`のサーバはサンドボックスの外にある**（D-50）。`allow_domains`は
+    /// AppContainer子の宛先制御を表す値なのでHTTPでは常に空になり、この項目が無いと
+    /// システムプロンプトが「外向き通信は不可」と事実に反する説明をしてしまう。
+    pub endpoint: Option<String>,
 }
 
 /// 実行前ゲート（`PermissionArbiter`）が参照するリスク分類。

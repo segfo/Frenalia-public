@@ -1,21 +1,26 @@
 //! `Transport` trait と、改行区切りフレーミングの共通部品。
 //!
 //! `plans/DESIGN-MCP.md` §6は「`Transport`はtraitとして切り、実装を差し替えられる形にする」と
-//! 定める。M15.5が実装するのはstdio（§6.1、AppContainerの箱の中）だけで、Streamable HTTP
-//! （§6.2、D-41のオプトイン）はM15.6でこのtraitの別実装として足す。
+//! 定める。実装は2つある——[`crate::transport_stdio`]（§6.1、AppContainerの箱の中。Windows専用）と
+//! [`crate::transport_http`]（§6.2、harness本体が喋るオプトイン経路）。
 //!
 //! ## なぜ同期APIなのか
 //!
-//! 実体がAppContainer子プロセスの生HANDLEパイプ（`ReadFile`/`WriteFile`）であり、
+//! stdioの実体がAppContainer子プロセスの生HANDLEパイプ（`ReadFile`/`WriteFile`）であり、
 //! `harness-sandbox`の他のIPC（`netfilterd`・`vmsandboxd`）と同じくブロッキングである。
 //! 呼び出し側（`Tool::call`）は`tokio::task::spawn_blocking`越しに呼ぶ——`VmShellExecutor`
 //! （`harness-core`）が同期メソッドを持つのと同じ理由・同じ扱い。
+//!
+//! HTTP実装は非同期のHTTPクライアントを使うが、**ブロックする側を専用スレッドへ閉じ込めて**
+//! この同期APIに合わせている（trait側を非同期化するとstdioが`spawn_blocking`のまま二重になる）。
 //!
 //! ## フレーム形式
 //!
 //! MCPのstdioトランスポートは**改行区切りのJSON**で、メッセージ本体に改行を含めてはならない。
 //! したがって「1行＝1メッセージ」で扱ってよい（`netfilterd`の長さプレフィックス方式とは別物で、
 //! こちらは相手がMCP仕様に従う任意実装なので仕様どおりの改行区切りに合わせる）。
+//! Streamable HTTPの区切りはSSE（空行区切り）で、[`crate::http_wire::SseAccumulator`]が
+//! [`LineAccumulator`]の上に載る。
 
 use std::time::Duration;
 
@@ -40,13 +45,26 @@ pub trait Transport: Send {
 
     /// プロセス/接続を落とす。冪等。
     fn shutdown(&mut self);
+
+    /// `initialize`でネゴシエートされたプロトコルバージョンが確定したときに呼ばれる。
+    ///
+    /// stdioには関係が無いので既定はno-op。**Streamable HTTPはこれを必要とする**——
+    /// MCP仕様は`initialize`以降の全リクエストへ`MCP-Protocol-Version`ヘッダを求めており、
+    /// 送らないクライアントはサーバから2025-03-26とみなされる。バージョンを知っているのは
+    /// [`crate::client::McpClient`]だけなので、トランスポートへはここで伝える。
+    fn on_protocol_negotiated(&mut self, version: &str) {
+        let _ = version;
+    }
 }
 
 /// バイト列から改行区切りの行を切り出す蓄積バッファ。
 ///
 /// パイプからの読み取りは行境界と無関係な塊で返るため、どの`Transport`実装でもこの分解が要る。
 /// 純粋なので単体テストで固定できる（`docs/CODE-STRUCTURE-RULES.md` 規則3の副次効果）。
-#[derive(Debug, Default)]
+///
+/// **`Default`は`new()`と同じ**（derive すると`max_line_bytes`が0になり、最初の1バイトで
+/// 上限超過エラーになる）。
+#[derive(Debug)]
 pub struct LineAccumulator {
     buf: Vec<u8>,
     /// 行が来ないまま無制限にメモリを食うのを防ぐ上限。未信頼のサーバが改行を一切送らずに
@@ -56,6 +74,12 @@ pub struct LineAccumulator {
 
 /// 1行の上限（16MiB）。MCPのツール応答は大きくなり得るが、無制限にはしない。
 pub const DEFAULT_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+impl Default for LineAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LineAccumulator {
     pub fn new() -> Self {
@@ -80,25 +104,37 @@ impl LineAccumulator {
     /// CRLFで書く場合がある）。空行は読み飛ばす。
     pub fn take_line(&mut self) -> Result<Option<String>, McpError> {
         loop {
-            let Some(pos) = self.buf.iter().position(|b| *b == b'\n') else {
-                if self.buf.len() > self.max_line_bytes {
-                    return Err(McpError::Protocol(format!(
-                        "server sent more than {} bytes without a newline",
-                        self.max_line_bytes
-                    )));
-                }
+            let Some(line) = self.take_raw_line()? else {
                 return Ok(None);
             };
-            let mut line = self.buf.drain(..=pos).collect::<Vec<u8>>();
-            line.pop(); // '\n'
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            if line.iter().all(u8::is_ascii_whitespace) {
+            if line.bytes().all(|b| b.is_ascii_whitespace()) {
                 continue;
             }
-            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            return Ok(Some(line));
         }
+    }
+
+    /// 空行も落とさずに1行返す。
+    ///
+    /// **SSEは空行がイベントの区切り**（`plans/DESIGN-MCP.md` §6.2）なので、
+    /// [`crate::http_wire::SseAccumulator`]はこちらを使う。JSON-RPCの改行区切り
+    /// （[`take_line`](Self::take_line)）では空行に意味が無いので読み飛ばす、という違い。
+    pub fn take_raw_line(&mut self) -> Result<Option<String>, McpError> {
+        let Some(pos) = self.buf.iter().position(|b| *b == b'\n') else {
+            if self.buf.len() > self.max_line_bytes {
+                return Err(McpError::Protocol(format!(
+                    "server sent more than {} bytes without a newline",
+                    self.max_line_bytes
+                )));
+            }
+            return Ok(None);
+        };
+        let mut line = self.buf.drain(..=pos).collect::<Vec<u8>>();
+        line.pop(); // '\n'
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        Ok(Some(String::from_utf8_lossy(&line).into_owned()))
     }
 }
 

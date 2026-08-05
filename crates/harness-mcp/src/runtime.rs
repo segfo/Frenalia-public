@@ -3,7 +3,7 @@
 //! ## 起動が2段に割れている（順序が本質）
 //!
 //! ```text
-//! 1. plan()        宣言の検証と承認照合。副作用なし・プラットフォーム非依存
+//! 1. plan()        宣言の検証・セッションゲート（D-49）・承認照合。副作用なし・OS非依存
 //! 2. prepare_all() サーバごとのAppContainerプロファイル作成 + preflight（Windows専用）
 //! 3. （呼び出し側）network要求のあるサーバごとに協調プロキシを立て、proxy_addrを埋める
 //! 4. （呼び出し側）WFPへ全プロファイルの出口ポリシーを適用する
@@ -14,6 +14,11 @@
 //! 無制限に外へ出られる窓ができる。この順序を守る責任は呼び出し側（`harness-cli`の起動
 //! パイプライン）にあり、そのために2段に割ってある。
 //!
+//! **2〜4はstdio専用である**（M15.6、D-50）。Streamable HTTPにはAppContainerプロファイルも
+//! 専用プロキシもWFPフィルタも存在しない——喋るのはharness本体である。代わりに1で
+//! [`McpGates`]の3段ゲートを通り、[`McpRuntime::prepare_http`]が検証済みの`Endpoint`を
+//! 持つ[`PreparedServer`]を作る。統制は接続前に完結している。
+//!
 //! ## 1サーバの失敗が他を巻き込まない
 //!
 //! 起動・ハンドシェイクの失敗は`warnings`へ積み、他のサーバは起動し続ける。MCPは「あれば使う」
@@ -21,6 +26,7 @@
 //! 根拠のみで結論してよい」）、1つ落ちたからといってセッション全体を止める理由が無い。
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,13 +34,30 @@ use harness_core::{McpServerFact, Tool};
 
 use crate::approval::McpApprovalLedger;
 use crate::client::McpClient;
-use crate::decl::{is_valid_mcp_tool_name, McpServerDecl};
+use crate::decl::{is_valid_mcp_tool_name, McpServerDecl, McpTransportKind};
+use crate::http_wire::{validate_endpoint, CertPin, Endpoint, EndpointGates, HttpWireError};
 use crate::tool::{McpTool, DEFAULT_CALL_TIMEOUT};
 use crate::transport::Transport;
 use crate::McpError;
 
 /// ハンドシェイク（`initialize`+`tools/list`）を待つ既定の上限。
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// セッション側のゲート（`plans/DESIGN-MCP.md` §6.2、D-49）。
+///
+/// **ここに入る値はユーザ層設定かCLIからしか来ない。** プロジェクト層
+/// （`<root>/.harness/settings.json`）に書かれた分は`harness_config::clamp_project_mcp_http_gates`
+/// がマージの過程で剥がしている。宣言（`mcp.servers[]`）はリポジトリ同梱でよいが、
+/// その宣言を**起動してよいと決める側**は同じ場所から動かせない、というのがD-49の要点。
+#[derive(Debug, Clone, Default)]
+pub struct McpGates {
+    /// `mcp.allow_streamable_http` または `--allow-mcp-http`。既定は無効（D-41）。
+    pub streamable_http_enabled: bool,
+    /// 宛先allowlist・平文の可否。既定は「何も許さない」。
+    pub http_endpoints: EndpointGates,
+    /// 私有CAのPEMバンドル（`mcp.http_ca_bundle`）。
+    pub http_ca_bundle: Option<PathBuf>,
+}
 
 /// [`McpRuntime::plan`]の結果。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -59,12 +82,17 @@ pub enum SkipReason {
     NotApproved { stale: bool },
     /// 宣言自体が不正（id・ツール名・長さ等）。
     Invalid(String),
-    /// 隔離機構が無いOS（P-05、`DESIGN-MCP.md` §3.4）。
+    /// 隔離機構が無いOS（P-05、`DESIGN-MCP.md` §3.4）。**stdioにだけ適用する**——
+    /// HTTPには隔離すべき子プロセスが無い（D-50）。
     UnsupportedPlatform,
     /// AppContainerプロファイル作成・preflightの失敗。
     IsolationUnavailable(String),
     /// 起動・ハンドシェイクの失敗。
     StartFailed(String),
+    /// Streamable HTTPが有効化されていない（D-41/D-49）。既定はこれ。
+    StreamableHttpNotEnabled,
+    /// 宛先がゲートを通らない（allowlist非該当・平文・IPリテラル等）。
+    HttpEndpointRejected(HttpWireError),
 }
 
 impl SkippedServer {
@@ -78,8 +106,8 @@ impl SkippedServer {
             ),
             SkipReason::NotApproved { stale: true } => format!(
                 "mcp server {:?} was approved earlier, but its declaration has changed since \
-                 (command/args/env/tools/network/workspace). The approval is void; re-approve \
-                 with `harness mcp approve {}` after reviewing what changed",
+                 (transport/command/args/env/url/headers/tools/network/workspace). The approval \
+                 is void; re-approve with `harness mcp approve {}` after reviewing what changed",
                 self.id, self.id
             ),
             SkipReason::Invalid(why) => {
@@ -97,6 +125,20 @@ impl SkippedServer {
             SkipReason::StartFailed(why) => {
                 format!("mcp server {:?} failed to start: {why}", self.id)
             }
+            SkipReason::StreamableHttpNotEnabled => format!(
+                "mcp server {:?} uses the streamable_http transport, which is off by default. \
+                 harness itself makes that connection, so it is NOT covered by the AppContainer \
+                 sandbox, the WFP egress filters or the cooperative proxy. Turn it on with \
+                 \"mcp\": {{ \"allow_streamable_http\": true }} in your *user* settings.json (a \
+                 project's .harness/settings.json cannot turn it on), or pass --allow-mcp-http \
+                 for a single run",
+                self.id
+            ),
+            SkipReason::HttpEndpointRejected(why) => format!(
+                "mcp server {:?} is not started because harness will not connect to its endpoint: \
+                 {why}",
+                self.id
+            ),
         }
     }
 }
@@ -105,11 +147,80 @@ impl SkippedServer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedServer {
     pub decl: McpServerDecl,
-    /// このサーバ専用のAppContainerプロファイル名（D-38、`harness.mcp.<token>.<id>`）。
-    pub profile_name: String,
-    /// このサーバ専用の協調プロキシ待受アドレス。`network`要求のあるサーバだけ`Some`。
-    /// WFPはこのサーバのpackage SIDに対し**このポートだけ**を許可する（§3.2）。
-    pub proxy_addr: Option<SocketAddr>,
+    pub isolation: PreparedIsolation,
+}
+
+/// このサーバをどこへ閉じ込めたか。
+///
+/// **enumにしてあるのは、HTTPに意味の無いプロファイル名を空文字で持たせないため**である。
+/// 「隔離されていない」という事実を型で見えるようにしておかないと、`profile_name`を使う
+/// 側が黙って空文字を受け取り、隔離があるつもりのコードが書ける。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreparedIsolation {
+    /// stdio（D-38）。サーバごとの専用AppContainerプロファイルの中で動く。
+    AppContainer {
+        /// `harness.mcp.<token>.<id>`。
+        profile_name: String,
+        /// このサーバ専用の協調プロキシ待受アドレス。`network`要求のあるサーバだけ`Some`。
+        /// WFPはこのサーバのpackage SIDに対し**このポートだけ**を許可する（§3.2）。
+        proxy_addr: Option<SocketAddr>,
+    },
+    /// Streamable HTTP（§6.2、D-50）。harness本体が喋るので隔離の実体が無い。
+    /// 統制はD-49の3段ゲートと承認台帳（D-39）が持ち、それは接続前に済んでいる。
+    Direct {
+        /// [`validate_endpoint`]を通ったものだけがここに入る。
+        endpoint: Endpoint,
+        ca_bundle: Option<PathBuf>,
+        /// 宣言の`tls_pin`（D-52）。`Some`ならCA連鎖と名前の検証はこれに置き換わる。
+        tls_pin: Option<CertPin>,
+    },
+}
+
+impl PreparedServer {
+    /// 専用の協調プロキシが立った後に、その待受アドレスを埋める（起動順序3、§3.2）。
+    ///
+    /// HTTPサーバに対しては何もしない——AppContainerの外なので、プロキシを指しても
+    /// 強制するWFPフィルタが無く、「絞ったつもり」を作るだけになる。
+    pub fn set_proxy_addr(&mut self, addr: SocketAddr) {
+        if let PreparedIsolation::AppContainer { proxy_addr, .. } = &mut self.isolation {
+            *proxy_addr = Some(addr);
+        }
+    }
+}
+
+impl PreparedIsolation {
+    /// AppContainerプロファイル名（HTTPなら`None`）。
+    pub fn profile_name(&self) -> Option<&str> {
+        match self {
+            PreparedIsolation::AppContainer { profile_name, .. } => Some(profile_name),
+            PreparedIsolation::Direct { .. } => None,
+        }
+    }
+
+    /// 専用プロキシのアドレス（HTTP、およびnetwork要求の無いstdioなら`None`）。
+    pub fn proxy_addr(&self) -> Option<SocketAddr> {
+        match self {
+            PreparedIsolation::AppContainer { proxy_addr, .. } => *proxy_addr,
+            PreparedIsolation::Direct { .. } => None,
+        }
+    }
+
+    /// WFPの出口強制が無効なセッションで、このサーバを落とす必要があるか。
+    ///
+    /// - `AppContainer`＋専用プロキシ → **落とす**。`internetClient` capabilityを持つのに
+    ///   宛先が強制されない状態になる（`run_shell`側の`should_grant_tier2a_network_capability`
+    ///   と同じfail-closed）
+    /// - `AppContainer`＋プロキシ無し → capabilityが空でソケットを作れないので残す
+    /// - `Direct` → WFPは元から関係しない（harness本体の通信）ので残す
+    pub fn needs_wfp_egress_enforcement(&self) -> bool {
+        matches!(
+            self,
+            PreparedIsolation::AppContainer {
+                proxy_addr: Some(_),
+                ..
+            }
+        )
+    }
 }
 
 /// 生きているMCPサーバ1件。
@@ -139,8 +250,17 @@ pub struct McpRuntime {
 }
 
 impl McpRuntime {
-    /// 宣言を検証し、承認台帳と照合する。**副作用なし・プラットフォーム非依存**。
-    pub fn plan(decls: &[McpServerDecl], ledger: &McpApprovalLedger) -> McpStartupPlan {
+    /// 宣言を検証し、セッション側のゲート（D-49）と承認台帳（D-39）を照合する。
+    /// **副作用なし・プラットフォーム非依存**で、ここで落ちたサーバは
+    /// プロセスもTCP接続もTLSハンドシェイクも一度も起こさない。
+    ///
+    /// **ゲートを承認より先に見る。** 「承認したのに起動しない」より
+    /// 「そもそもこの経路が閉じている」の方が、ユーザーが次に取るべき行動に直結する。
+    pub fn plan(
+        decls: &[McpServerDecl],
+        ledger: &McpApprovalLedger,
+        gates: &McpGates,
+    ) -> McpStartupPlan {
         let mut plan = McpStartupPlan::default();
         let mut seen: std::collections::BTreeSet<String> = Default::default();
 
@@ -159,6 +279,13 @@ impl McpRuntime {
                 });
                 continue;
             }
+            if let Some(reason) = transport_gate(decl, gates) {
+                plan.skipped.push(SkippedServer {
+                    id: decl.id.clone(),
+                    reason,
+                });
+                continue;
+            }
             if ledger.is_approved(decl) {
                 plan.approved.push(decl.clone());
             } else {
@@ -171,6 +298,36 @@ impl McpRuntime {
             }
         }
         plan
+    }
+
+    /// Streamable HTTP宣言の`PreparedServer`を作る（D-50: 隔離Tierに依存しない）。
+    ///
+    /// stdio側の`prepare`（`crate::sandbox`、Windows専用）に対応するもので、こちらは
+    /// AppContainerプロファイルもpreflightも要らない代わりに、**接続先ゲートをもう一度通す**。
+    /// [`plan`](Self::plan)が既に通しているが、[`Endpoint`]を作れるのがその関数だけなので、
+    /// 「ゲートを通っていないURLでは`PreparedServer`を作れない」構造になる。
+    pub fn prepare_http(
+        decl: &McpServerDecl,
+        gates: &McpGates,
+    ) -> Result<PreparedServer, SkipReason> {
+        let endpoint = validate_endpoint(&decl.url, &gates.http_endpoints)
+            .map_err(SkipReason::HttpEndpointRejected)?;
+        // 形式は`decl.validate()`が既に通しているが、ここでも読めなければ起動しない
+        // （読めないピンを黙って「ピン無し＝通常検証」へ落とさない。D-52はfail-closed）。
+        let tls_pin = match &decl.tls_pin {
+            Some(raw) => Some(crate::http_wire::parse_cert_pin(raw).map_err(|e| {
+                SkipReason::Invalid(format!("unusable \"tls_pin\": {e}"))
+            })?),
+            None => None,
+        };
+        Ok(PreparedServer {
+            decl: decl.clone(),
+            isolation: PreparedIsolation::Direct {
+                endpoint,
+                ca_bundle: gates.http_ca_bundle.clone(),
+                tls_pin,
+            },
+        })
     }
 
     /// 準備済みサーバを実際に起動し、ツールを登録する。
@@ -242,6 +399,13 @@ impl McpRuntime {
             allow_domains: server.decl.network.allow_domains.clone(),
             workspace_access: workspace_access_label(server.decl.workspace).to_string(),
             tool_names: tool_names.clone(),
+            transport: server.decl.transport.label().to_string(),
+            // HTTPは`allow_domains`が空なので、これが無いとシステムプロンプトが
+            // 「外向き通信は不可」と嘘を描く（`harness_core::prompt::render_mcp_servers`）。
+            endpoint: match &server.isolation {
+                PreparedIsolation::AppContainer { .. } => None,
+                PreparedIsolation::Direct { endpoint, .. } => Some(endpoint.display().to_string()),
+            },
         };
 
         Ok((
@@ -295,6 +459,53 @@ impl Drop for McpRuntime {
     }
 }
 
+/// トランスポート別のセッションゲート（D-49）。通れば`None`。
+fn transport_gate(decl: &McpServerDecl, gates: &McpGates) -> Option<SkipReason> {
+    match decl.transport {
+        // stdioにセッションゲートは無い（隔離そのものが統制なので、Tier判定は呼び出し側）。
+        McpTransportKind::Stdio => None,
+        McpTransportKind::StreamableHttp => {
+            if !gates.streamable_http_enabled {
+                return Some(SkipReason::StreamableHttpNotEnabled);
+            }
+            validate_endpoint(&decl.url, &gates.http_endpoints)
+                .err()
+                .map(SkipReason::HttpEndpointRejected)
+        }
+    }
+}
+
+/// 本番のトランスポートをトランスポート種別で振り分ける（`harness-cli`が使う唯一の実装）。
+///
+/// 差し替え境界としての[`TransportFactory`]はそのまま残す——テストが台本トランスポートを
+/// 差し込めるのはここで、本番コードに「隔離なしのstdio」を置かずに済ませるための分割線
+/// でもある（`plans/DESIGN-MCP.md` §3.4）。
+pub struct DefaultTransportFactory;
+
+impl TransportFactory for DefaultTransportFactory {
+    fn create(&self, prepared: &PreparedServer) -> Result<Box<dyn Transport>, McpError> {
+        match prepared.decl.transport {
+            McpTransportKind::Stdio => {
+                #[cfg(windows)]
+                {
+                    crate::transport_stdio::AppContainerTransportFactory.create(prepared)
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(McpError::Unsupported(format!(
+                        "mcp server {:?} uses the stdio transport, which harness only isolates \
+                         with Windows AppContainer",
+                        prepared.decl.id
+                    )))
+                }
+            }
+            McpTransportKind::StreamableHttp => {
+                crate::transport_http::HttpTransportFactory.create(prepared)
+            }
+        }
+    }
+}
+
 fn workspace_access_label(access: crate::decl::McpWorkspaceAccess) -> &'static str {
     match access {
         crate::decl::McpWorkspaceAccess::None => "none",
@@ -319,11 +530,42 @@ mod tests {
             command: "node.exe".to_string(),
             args: vec!["server.js".to_string()],
             env: Default::default(),
+            url: String::new(),
+            headers: Default::default(),
+            tls_pin: None,
             tools: [("search".to_string(), RiskClass::ReadOnly)]
                 .into_iter()
                 .collect(),
             network: McpNetworkDecl::default(),
             workspace: McpWorkspaceAccess::None,
+        }
+    }
+
+    fn http_decl(id: &str, url: &str) -> McpServerDecl {
+        McpServerDecl {
+            transport: McpTransportKind::StreamableHttp,
+            command: String::new(),
+            args: Vec::new(),
+            url: url.to_string(),
+            ..decl(id)
+        }
+    }
+
+    /// stdioには効かないゲート（stdioの統制は隔離そのもの）。HTTPは既定で全部閉じている。
+    fn no_gates() -> McpGates {
+        McpGates::default()
+    }
+
+    fn http_gates(domains: &[&str], plaintext: bool) -> McpGates {
+        McpGates {
+            streamable_http_enabled: true,
+            http_endpoints: EndpointGates {
+                allow_domains: harness_core::DomainPolicy::new(
+                    domains.iter().map(|d| d.to_string()).collect(),
+                ),
+                plaintext_allowed: plaintext,
+            },
+            http_ca_bundle: None,
         }
     }
 
@@ -356,9 +598,11 @@ mod tests {
 
     fn prepared(decl: McpServerDecl) -> PreparedServer {
         PreparedServer {
-            profile_name: format!("harness.mcp.test.{}", decl.id),
+            isolation: PreparedIsolation::AppContainer {
+                profile_name: format!("harness.mcp.test.{}", decl.id),
+                proxy_addr: None,
+            },
             decl,
-            proxy_addr: None,
         }
     }
 
@@ -367,7 +611,7 @@ mod tests {
         let (_dir, store) = store();
         let d = decl("docs");
         store.approve(&d);
-        let plan = McpRuntime::plan(std::slice::from_ref(&d), &store.load());
+        let plan = McpRuntime::plan(std::slice::from_ref(&d), &store.load(), &no_gates());
         assert_eq!(plan.approved, vec![d]);
         assert!(plan.skipped.is_empty());
     }
@@ -377,7 +621,7 @@ mod tests {
     #[test]
     fn an_unapproved_declaration_never_reaches_the_transport_factory() {
         let (_dir, store) = store();
-        let plan = McpRuntime::plan(&[decl("docs")], &store.load());
+        let plan = McpRuntime::plan(&[decl("docs")], &store.load(), &no_gates());
         assert!(plan.approved.is_empty());
         assert_eq!(plan.skipped.len(), 1);
         assert_eq!(
@@ -402,6 +646,133 @@ mod tests {
         assert!(runtime.is_empty());
     }
 
+    /// 承認済みの宣言が、ゲートを通らない理由で落ちたときも**1回も起動しない**ことを、
+    /// 同じ観測の仕方（ファクトリの呼び出し回数）で確かめる。
+    fn assert_never_reaches_the_factory(decl: McpServerDecl, gates: &McpGates) -> SkipReason {
+        let (_dir, store) = store();
+        store.approve(&decl);
+        let plan = McpRuntime::plan(std::slice::from_ref(&decl), &store.load(), gates);
+        assert!(
+            plan.approved.is_empty(),
+            "the gate must reject this before approval is even consulted"
+        );
+        assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let factory = SpyFactory {
+            calls: calls.clone(),
+            script: handshake_script("[]"),
+        };
+        let mut skipped = plan.skipped.clone();
+        let prepared_list: Vec<PreparedServer> = plan.approved.into_iter().map(prepared).collect();
+        let runtime = McpRuntime::start(prepared_list, &factory, "0.1.0", &mut skipped);
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no connection may be attempted for a server that failed the gate"
+        );
+        assert!(runtime.is_empty());
+        plan.skipped[0].reason.clone()
+    }
+
+    /// **完了条件: 既定で無効**（D-41）。承認済みでも、オプトインが無ければ接続を一度も試みない。
+    #[test]
+    fn streamable_http_is_off_by_default_and_never_reaches_the_transport_factory() {
+        let reason = assert_never_reaches_the_factory(
+            http_decl("corp", "https://mcp.corp.example/mcp"),
+            &McpGates::default(),
+        );
+        assert_eq!(reason, SkipReason::StreamableHttpNotEnabled);
+
+        let message = SkippedServer {
+            id: "corp".to_string(),
+            reason,
+        }
+        .message();
+        // 「どこで有効化すればよいか」まで書く（プロジェクト設定では無理だという点も）。
+        assert!(message.contains("--allow-mcp-http"), "{message}");
+        assert!(message.contains("user* settings.json"), "{message}");
+    }
+
+    /// D-49: 有効化しても、宛先allowlistに載っていなければ接続しない（closed-by-default）。
+    #[test]
+    fn an_enabled_transport_still_refuses_a_host_outside_the_allowlist() {
+        let reason = assert_never_reaches_the_factory(
+            http_decl("corp", "https://mcp.corp.example/mcp"),
+            &http_gates(&["other.example"], false),
+        );
+        assert!(
+            matches!(
+                reason,
+                SkipReason::HttpEndpointRejected(HttpWireError::HostNotAllowlisted { .. })
+            ),
+            "{reason:?}"
+        );
+    }
+
+    /// D-49: 平文httpはallowlistに載っていても、CLIフラグ無しでは接続しない。
+    #[test]
+    fn plaintext_http_to_a_remote_host_needs_the_cli_flag() {
+        let reason = assert_never_reaches_the_factory(
+            http_decl("corp", "http://mcp.corp.example/mcp"),
+            &http_gates(&["mcp.corp.example"], false),
+        );
+        assert!(
+            matches!(
+                reason,
+                SkipReason::HttpEndpointRejected(HttpWireError::PlaintextNotAllowed)
+            ),
+            "{reason:?}"
+        );
+    }
+
+    /// 3段すべてを通した宣言は起動対象になり、`Direct`（隔離の実体なし）として準備される。
+    #[test]
+    fn a_fully_gated_and_approved_http_declaration_is_prepared_without_isolation() {
+        let (_dir, store) = store();
+        let d = http_decl("corp", "https://mcp.corp.example/mcp");
+        store.approve(&d);
+        let gates = http_gates(&["mcp.corp.example"], false);
+
+        let plan = McpRuntime::plan(std::slice::from_ref(&d), &store.load(), &gates);
+        assert_eq!(plan.approved, vec![d.clone()]);
+        assert!(plan.skipped.is_empty());
+
+        let prepared = McpRuntime::prepare_http(&d, &gates).unwrap();
+        assert_eq!(prepared.isolation.profile_name(), None);
+        assert_eq!(prepared.isolation.proxy_addr(), None);
+        assert!(
+            !prepared.isolation.needs_wfp_egress_enforcement(),
+            "WFP has nothing to do with a connection harness itself makes"
+        );
+    }
+
+    /// loopbackはallowlistにも平文ゲートにも掛からない（ローカル開発用サーバ）。
+    #[test]
+    fn a_loopback_http_server_starts_with_the_opt_in_alone() {
+        let (_dir, store) = store();
+        let d = http_decl("local", "http://127.0.0.1:3000/mcp");
+        store.approve(&d);
+        let gates = McpGates {
+            streamable_http_enabled: true,
+            ..McpGates::default()
+        };
+        let plan = McpRuntime::plan(std::slice::from_ref(&d), &store.load(), &gates);
+        assert_eq!(plan.approved, vec![d], "{:?}", plan.skipped);
+    }
+
+    /// **stdioのゲートは変わっていない**（HTTPのオプトインはstdioに影響しない）。
+    #[test]
+    fn the_http_gates_do_not_change_how_stdio_declarations_are_planned() {
+        let (_dir, store) = store();
+        let d = decl("docs");
+        store.approve(&d);
+        for gates in [no_gates(), http_gates(&[], true)] {
+            let plan = McpRuntime::plan(std::slice::from_ref(&d), &store.load(), &gates);
+            assert_eq!(plan.approved, vec![d.clone()]);
+        }
+    }
+
     /// 承認後に宣言が変わった場合は、ユーザーへの説明が変わる（stale）。
     #[test]
     fn a_changed_declaration_is_reported_as_a_void_approval() {
@@ -411,7 +782,7 @@ mod tests {
 
         let mut changed = d.clone();
         changed.args = vec!["evil.js".to_string()];
-        let plan = McpRuntime::plan(&[changed], &store.load());
+        let plan = McpRuntime::plan(&[changed], &store.load(), &no_gates());
 
         assert!(plan.approved.is_empty());
         assert_eq!(
@@ -426,7 +797,7 @@ mod tests {
         let (_dir, store) = store();
         let mut bad = decl("docs");
         bad.id = "Bad Id".to_string();
-        let plan = McpRuntime::plan(&[bad], &store.load());
+        let plan = McpRuntime::plan(&[bad], &store.load(), &no_gates());
         assert!(matches!(plan.skipped[0].reason, SkipReason::Invalid(_)));
     }
 
@@ -435,7 +806,7 @@ mod tests {
         let (_dir, store) = store();
         let d = decl("docs");
         store.approve(&d);
-        let plan = McpRuntime::plan(&[d.clone(), d], &store.load());
+        let plan = McpRuntime::plan(&[d.clone(), d], &store.load(), &no_gates());
         assert_eq!(plan.approved.len(), 1);
         assert_eq!(plan.skipped.len(), 1);
     }

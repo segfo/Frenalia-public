@@ -45,6 +45,16 @@ fn load_decls(workspace_root: &Path) -> Result<Vec<McpServerDecl>, String> {
     harness_mcp::parse_mcp_settings(settings.mcp.as_ref())
 }
 
+/// ユーザ層のStreamable HTTPゲート（D-49）。`Settings::load`がプロジェクト層の分を
+/// 既に剥がしているので、ここで読めるのはユーザ層の値だけである。
+///
+/// **CLIフラグ（`--allow-mcp-http`等）はここには効かない**——それらは起動時のフラグで、
+/// `harness mcp`サブコマンドの対象外。表示にはその旨を添える。
+fn load_http_gates(workspace_root: &Path) -> harness_mcp::McpHttpSettings {
+    let settings = harness_config::Settings::load(workspace_root);
+    harness_mcp::parse_mcp_http_gates(settings.mcp.as_ref()).unwrap_or_default()
+}
+
 pub(crate) fn run_mcp(action: McpAction, workspace_root: &Path) -> ExitCode {
     let decls = match load_decls(workspace_root) {
         Ok(decls) => decls,
@@ -56,29 +66,52 @@ pub(crate) fn run_mcp(action: McpAction, workspace_root: &Path) -> ExitCode {
     let store = ApprovalStore::in_config_dir();
 
     match action {
-        McpAction::List { output_format } => list(&decls, &store, output_format),
+        McpAction::List { output_format } => {
+            list(&decls, &store, &load_http_gates(workspace_root), output_format)
+        }
         McpAction::Approve { id, yes } => approve(&decls, &store, &id, yes),
         McpAction::Revoke { id } => revoke(&store, &id),
     }
 }
 
-fn list(decls: &[McpServerDecl], store: &ApprovalStore, output_format: OutputFormat) -> ExitCode {
+/// 一覧に出す状態。承認だけでなく**セッションゲート**（D-49）も見る——「承認済みなのに
+/// 起動しない」の理由が一覧から読めないと、ユーザーは次に何をすべきか分からない。
+fn status_of(
+    decl: &McpServerDecl,
+    ledger: &harness_mcp::McpApprovalLedger,
+    gates: &harness_mcp::McpHttpSettings,
+) -> &'static str {
+    if decl.transport == harness_mcp::McpTransportKind::StreamableHttp
+        && !gates.allow_streamable_http
+    {
+        return "http-not-enabled";
+    }
+    if ledger.is_approved(decl) {
+        "approved"
+    } else if ledger.approval_for_id(&decl.id).is_some() {
+        "changed-since-approval"
+    } else {
+        "not-approved"
+    }
+}
+
+fn list(
+    decls: &[McpServerDecl],
+    store: &ApprovalStore,
+    gates: &harness_mcp::McpHttpSettings,
+    output_format: OutputFormat,
+) -> ExitCode {
     let ledger = store.load();
     let rows: Vec<serde_json::Value> = decls
         .iter()
         .map(|decl| {
-            let status = if ledger.is_approved(decl) {
-                "approved"
-            } else if ledger.approval_for_id(&decl.id).is_some() {
-                "changed-since-approval"
-            } else {
-                "not-approved"
-            };
             serde_json::json!({
                 "id": decl.id,
-                "status": status,
+                "status": status_of(decl, &ledger, gates),
+                "transport": decl.transport.label(),
                 "command": decl.command,
                 "args": decl.args,
+                "url": decl.url,
                 "network": decl.network.allow_domains,
                 "workspace": format!("{:?}", decl.workspace).to_lowercase(),
                 "declared_tools": decl.tools.len(),
@@ -91,6 +124,8 @@ fn list(decls: &[McpServerDecl], store: &ApprovalStore, output_format: OutputFor
         OutputFormat::Json | OutputFormat::Jsonl => {
             let out = serde_json::json!({
                 "ledger_path": store.path().map(|p| p.display().to_string()),
+                "streamable_http_enabled": gates.allow_streamable_http,
+                "streamable_http_allow_domains": gates.http_allow_domains,
                 "servers": rows,
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
@@ -118,9 +153,37 @@ fn list(decls: &[McpServerDecl], store: &ApprovalStore, output_format: OutputFor
             if let Some(path) = store.path() {
                 println!("approval ledger: {}", path.display());
             }
+            if decls
+                .iter()
+                .any(|d| d.transport == harness_mcp::McpTransportKind::StreamableHttp)
+            {
+                print_http_gate_status(gates);
+            }
         }
     }
     ExitCode::SUCCESS
+}
+
+/// HTTP宣言がある場合だけ、そのゲートの現状と開け方を出す（D-49）。
+fn print_http_gate_status(gates: &harness_mcp::McpHttpSettings) {
+    if gates.allow_streamable_http {
+        println!(
+            "streamable http: enabled; allowed domains: {}",
+            if gates.http_allow_domains.is_empty() {
+                "(none -- no remote endpoint will be contacted; loopback is exempt)".to_string()
+            } else {
+                gates.http_allow_domains.join(", ")
+            }
+        );
+    } else {
+        println!(
+            "streamable http: DISABLED. Servers using it will not start even once approved. \
+             Enable it in your *user* settings.json with \"mcp\": {{ \"allow_streamable_http\": \
+             true, \"http_allow_domains\": [\"...\"] }}, or pass --allow-mcp-http (plus \
+             --allow-mcp-http-domain) for a single run. A project's .harness/settings.json cannot \
+             enable it."
+        );
+    }
 }
 
 fn approve(
@@ -148,11 +211,33 @@ fn approve(
 
     println!("About to approve this mcp server declaration:\n");
     print!("{}", decl.describe());
-    println!(
-        "\nharness will start this program and expose its tools to the model. The server runs in \
-         its own AppContainer sandbox, but it is third-party code: treat approval as \"I am \
-         willing to run this\", not \"this is safe\".\n"
-    );
+    match decl.transport {
+        harness_mcp::McpTransportKind::Stdio => println!(
+            "\nharness will start this program and expose its tools to the model. The server runs \
+             in its own AppContainer sandbox, but it is third-party code: treat approval as \"I am \
+             willing to run this\", not \"this is safe\".\n"
+        ),
+        // D-41「有効化した時点でこの経路がharnessの出口制御の外にあることを明示する」。
+        harness_mcp::McpTransportKind::StreamableHttp => println!(
+            "\nharness itself will connect to the url above and expose that server's tools to the \
+             model. Unlike a stdio server there is no sandbox here: harness sends the declared \
+             headers from its own process, over its own network position. Approval means \"I trust \
+             whoever operates this endpoint\". Approving is not enough on its own -- the transport \
+             must also be enabled and the host allowlisted (`harness mcp list` shows both).\n"
+        ),
+    }
+    if decl.transport == harness_mcp::McpTransportKind::StreamableHttp
+        && decl.url.starts_with("http://")
+    {
+        println!(
+            "WARNING: this url is plaintext http. Unless it is loopback, the declared headers \
+             (including any credentials) travel unencrypted, and harness will refuse to connect \
+             without --allow-mcp-http-plaintext.\n"
+        );
+    }
+    if decl.transport == harness_mcp::McpTransportKind::StreamableHttp {
+        print_presented_certificate(decl);
+    }
     if let Some(existing) = store.load().approval_for_id(id) {
         println!(
             "NOTE: this id was approved before, but the declaration has changed since \
@@ -169,6 +254,62 @@ fn approve(
     store.approve(decl);
     println!("approved {id:?}.");
     ExitCode::SUCCESS
+}
+
+/// **承認の前に、サーバが実際に提示する証明書を見せる**（D-52）。
+///
+/// `tls_pin`は64桁の16進なので、それだけでは何を承認しようとしているのか判断できない。
+/// TLSハンドシェイクだけ行って（**HTTPリクエストは送らない**＝宣言されたヘッダも
+/// 認証トークンもまだ渡らない）、発行元・サブジェクト・SAN・有効期限・指紋を並べ、
+/// 宣言のピンと一致するかまで出す。
+///
+/// **繋がらなくても承認は妨げない。** ネットワークの都合でサーバが見えないことはあり、
+/// 「今つながらないから承認できない」はユーザーの作業を止めるだけで安全性を上げない
+/// （承認はあくまで宣言に対する記録で、実接続時の検証は別に効く）。
+fn print_presented_certificate(decl: &McpServerDecl) {
+    // 下見は`Endpoint`（D-49のゲートを通った証）ではなく`ParsedUrl`で行う——ゲートは
+    // 「接続して喋ってよいか」の判断で、ここは一言も喋らない（`cert_probe`のdoc参照）。
+    let Ok(endpoint) = harness_mcp::http_wire::parse_endpoint_url(&decl.url) else {
+        return;
+    };
+    if !endpoint.is_tls() {
+        return;
+    }
+
+    println!("Looking at the certificate this server presents (no request is sent yet)...");
+    match harness_mcp::cert_probe::probe(&endpoint) {
+        Ok(Some(presented)) => {
+            print!("{}", presented.describe());
+            match &decl.tls_pin {
+                Some(declared) => {
+                    let matches = harness_mcp::http_wire::parse_cert_pin(declared)
+                        .map(|pin| pin == presented.pin)
+                        .unwrap_or(false);
+                    if matches {
+                        println!("    -> MATCHES the tls_pin in the declaration.\n");
+                    } else {
+                        println!(
+                            "    -> DOES NOT MATCH the tls_pin in the declaration. Either the \
+                             server changed its certificate, or you are not talking to the \
+                             server you think you are. Do not approve until you have resolved \
+                             this with whoever runs it.\n"
+                        );
+                    }
+                }
+                None => println!(
+                    "    -> the declaration has no tls_pin, so this certificate must validate \
+                     against the OS certificate store (or \"mcp.http_ca_bundle\"). To pin this \
+                     exact certificate instead, add:\n         \"tls_pin\": \"{}\"\n",
+                    presented.pin.to_declaration_string()
+                ),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => println!(
+            "    (could not reach the server to look at its certificate: {e})\n     You can still \
+             approve the declaration; the certificate is checked again on every connection.\n"
+        ),
+    }
 }
 
 fn revoke(store: &ApprovalStore, id: &str) -> ExitCode {

@@ -184,6 +184,56 @@ pub fn clamp_project_source_trust(user: &serde_json::Value, merged: &mut serde_j
     }
 }
 
+/// `mcp`キーのうち、**ユーザ層でしか効かない**もの（`plans/DESIGN-MCP.md` D-49）。
+///
+/// 宣言（`mcp.servers[]`）はプロジェクト設定からも受け付ける（D-39）。リポジトリ同梱の宣言は
+/// 承認台帳で止めるという設計であり、そこは変わらない。**変えられては困るのは、その宣言を
+/// 「起動してよい」と決める側**である——Streamable HTTPはharness本体が喋る経路で、
+/// AppContainerもWFPも協調プロキシも掛からない（§6.2）。有効化・宛先allowlist・信頼するCAまで
+/// プロジェクト設定から動かせると、リポジトリが自分で自分を許可できてしまう。
+const USER_ONLY_MCP_KEYS: &[&str] = &[
+    "allow_streamable_http",
+    "http_allow_domains",
+    "http_ca_bundle",
+];
+
+/// D-49のクランプ。[`clamp_project_source_trust`]と同じく**マージの過程で**掛ける
+/// （マージ後にはどの層の値かが分からなくなる）。
+///
+/// これらのキーについては、**マージ結果をユーザ層の値そのものへ戻す**。捨てて既定値に
+/// するのではない——プロジェクト層が`http_allow_domains`を書いただけでユーザ自身の
+/// allowlistが消えると、リポジトリが「権限を広げる」代わりに「ユーザの設定を壊す」
+/// ことができてしまう。安全側ではあるが、プロジェクト層の影響をゼロにするのが本来の意図。
+///
+/// 上書きを無視したことは警告として出す——黙って無視すると「設定したのに効かない」に
+/// 気付けない（[`parse_mcp_settings`](harness_mcp)と同じ方針）。
+pub fn clamp_project_mcp_http_gates(user: &serde_json::Value, merged: &mut serde_json::Value) {
+    let user_mcp = user.get("mcp").cloned();
+    let Some(mcp) = merged.get_mut("mcp").and_then(|m| m.as_object_mut()) else {
+        return;
+    };
+    for key in USER_ONLY_MCP_KEYS {
+        let user_value = user_mcp.as_ref().and_then(|m| m.get(*key));
+        // マージ結果がユーザ層の値と同じなら、プロジェクト層は触っていない。
+        if mcp.get(*key) == user_value {
+            continue;
+        }
+        eprintln!(
+            "warning: ignoring \"mcp.{key}\" from the project settings. Streamable HTTP runs \
+             outside the sandbox, so it can only be set in your user settings.json or on the \
+             command line (see DESIGN-MCP.md D-49)."
+        );
+        match user_value {
+            Some(value) => {
+                mcp.insert((*key).to_string(), value.clone());
+            }
+            None => {
+                mcp.remove(*key);
+            }
+        }
+    }
+}
+
 fn source_entries(root: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
     root.get("cognition")
         .and_then(|c| c.get("sources"))
@@ -571,6 +621,7 @@ impl Settings {
             deep_merge(&mut merged, project_json);
         }
         clamp_project_source_trust(&user_layer, &mut merged);
+        clamp_project_mcp_http_gates(&user_layer, &mut merged);
 
         serde_json::from_value(merged).unwrap_or_default()
     }
@@ -724,6 +775,103 @@ mod tests {
         assert_eq!(trust_rank(Some("absolute")), 1);
         assert_eq!(trust_rank(Some("high")), 2);
         assert_eq!(trust_rank(Some("low")), 0);
+    }
+
+    // --- D-49: Streamable HTTPのゲートはユーザ層でしか効かない ---
+
+    fn merged_mcp(user: &serde_json::Value, project: serde_json::Value) -> serde_json::Value {
+        let mut merged = user.clone();
+        deep_merge(&mut merged, project);
+        clamp_project_mcp_http_gates(user, &mut merged);
+        merged.get("mcp").cloned().unwrap_or_default()
+    }
+
+    /// **D-49の中核**: プロジェクト設定はStreamable HTTPを自分で有効化できない。
+    #[test]
+    fn a_project_cannot_enable_the_streamable_http_transport() {
+        let user = serde_json::json!({});
+        let mcp = merged_mcp(
+            &user,
+            serde_json::json!({ "mcp": {
+                "servers": [ { "id": "evil", "transport": "streamable_http",
+                               "url": "https://evil.example/mcp" } ],
+                "allow_streamable_http": true,
+                "http_allow_domains": ["evil.example"],
+                "http_ca_bundle": "C:/evil/ca.pem"
+            } }),
+        );
+
+        assert_eq!(mcp.get("allow_streamable_http"), None);
+        assert_eq!(mcp.get("http_allow_domains"), None);
+        assert_eq!(mcp.get("http_ca_bundle"), None);
+        // **宣言そのものは残る**（D-39: 承認台帳が止める。宣言の場所は制限しない）。
+        assert!(mcp["servers"].as_array().unwrap().len() == 1);
+    }
+
+    /// ユーザ層で有効化した分はそのまま残る（クランプが効きすぎない）。
+    #[test]
+    fn the_user_layer_keeps_its_own_gates() {
+        let user = serde_json::json!({ "mcp": {
+            "allow_streamable_http": true,
+            "http_allow_domains": ["mcp.corp.example"]
+        } });
+        let mcp = merged_mcp(&user, serde_json::json!({ "mcp": { "servers": [] } }));
+
+        assert_eq!(mcp["allow_streamable_http"], serde_json::json!(true));
+        assert_eq!(
+            mcp["http_allow_domains"],
+            serde_json::json!(["mcp.corp.example"])
+        );
+    }
+
+    /// **プロジェクト層はallowlistを広げられない。** ディープマージだと配列は置き換えなので、
+    /// プロジェクト層の値は捨てて**ユーザ層の値へ戻す**。
+    #[test]
+    fn a_project_cannot_widen_the_user_allowlist() {
+        let user = serde_json::json!({ "mcp": {
+            "allow_streamable_http": true,
+            "http_allow_domains": ["mcp.corp.example"]
+        } });
+        let mcp = merged_mcp(
+            &user,
+            serde_json::json!({ "mcp": { "http_allow_domains": ["evil.example"] } }),
+        );
+
+        assert_eq!(
+            mcp["http_allow_domains"],
+            serde_json::json!(["mcp.corp.example"]),
+            "the user's own allowlist must survive a project that tried to replace it"
+        );
+        assert_eq!(mcp["allow_streamable_http"], serde_json::json!(true));
+    }
+
+    /// **プロジェクト層はユーザの設定を壊すこともできない。** 権限を広げられないだけでなく、
+    /// 書いただけでユーザ自身のallowlistが消える（＝自分の構成が動かなくなる）のも防ぐ。
+    #[test]
+    fn a_project_cannot_disable_what_the_user_enabled() {
+        let user = serde_json::json!({ "mcp": {
+            "allow_streamable_http": true,
+            "http_allow_domains": ["mcp.corp.example"]
+        } });
+        let mcp = merged_mcp(
+            &user,
+            serde_json::json!({ "mcp": { "allow_streamable_http": false } }),
+        );
+
+        assert_eq!(mcp["allow_streamable_http"], serde_json::json!(true));
+        assert_eq!(
+            mcp["http_allow_domains"],
+            serde_json::json!(["mcp.corp.example"])
+        );
+    }
+
+    /// `mcp`キーが無い設定でクランプしても壊れない。
+    #[test]
+    fn the_mcp_gate_clamp_is_a_no_op_without_an_mcp_section() {
+        let user = serde_json::json!({});
+        let mut merged = serde_json::json!({ "model": "m" });
+        clamp_project_mcp_http_gates(&user, &mut merged);
+        assert_eq!(merged, serde_json::json!({ "model": "m" }));
     }
 
     /// `cognition.sources`が無い設定でクランプしても壊れない。
