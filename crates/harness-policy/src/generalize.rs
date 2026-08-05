@@ -163,45 +163,142 @@ pub fn generalize_with_granted(
         groups = wildcard_volatile_segments(groups);
     }
 
-    groups.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+    // グループ → 提案は 1:N である（[`escalate`]が昇格候補を並べるため）。**展開してから
+    // 並べ替え、その後にidを振る**——先にグループを並べてから展開すると、昇格で生まれた提案の
+    // idが挿入順に依存し、`--accept fs-2`が実行ごとに別のものを指しかねない。
+    let mut expanded: Vec<Expanded> = Vec::new();
+    for group in groups {
+        expanded.extend(expand(group, granted));
+    }
+    expanded.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
 
     let mut fs_seq = 0usize;
     let mut net_seq = 0usize;
-    groups
+    expanded
         .into_iter()
-        .map(|group| {
-            let id = if group.key == SettingsKey::NetAllowDomains {
+        .map(|item| {
+            let id = if item.key == SettingsKey::NetAllowDomains {
                 net_seq += 1;
                 format!("net-{net_seq}")
             } else {
                 fs_seq += 1;
                 format!("fs-{fs_seq}")
             };
-            let mut warnings = warnings_for(&group);
-            // §15.1: このグループが覆うパスのうち1つでも「既に許可済みなのに拒否された」なら、
-            // その許可では足りないことが**確定している**。
-            if !granted.is_empty() {
-                let insufficient = group.evidence.iter().find_map(|candidate| {
-                    match &candidate.requested {
-                        Requested::Fs { path, .. } => {
-                            crate::insufficient::diagnose(granted.covering(path))
-                        }
-                        Requested::Net { .. } => None,
-                    }
-                });
-                if let Some(insufficient) = insufficient {
-                    warnings.push(insufficient.explain().to_string());
-                }
-            }
             RuleProposal {
                 id,
-                key: group.key,
-                value: group.value,
-                evidence: group.evidence,
+                key: item.key,
+                value: item.value,
+                evidence: item.evidence,
+                warnings: item.warnings,
+            }
+        })
+        .collect()
+}
+
+/// idを振る前の提案。1つの[`Group`]から1件以上生まれる。
+struct Expanded {
+    key: SettingsKey,
+    value: String,
+    evidence: Vec<DeniedCandidate>,
+    warnings: Vec<String>,
+}
+
+/// 1グループを提案（1件以上）へ展開する。
+///
+/// # なぜ昇格が要るのか（D-46）
+///
+/// 「既に`fs.read`で許可済みのパスで拒否が観測された」とき、旧実装は**同じ`fs.read`を提案し直し、
+/// 警告として「もう一度fs.readを足しても直らない」と書いていた**。`key`も`value`も変わらないので
+/// `harness policy apply`は`(no changes)`を印字して終わり——ツールが効かないと自分で言う提案を出し、
+/// 適用しても何も起きない状態だった。CLIから`fs.read_write`へ到達する経路が存在しなかった。
+///
+/// そこで、その提案を**昇格候補で置き換える**。判定の入力は`value`そのもの（evidenceの一員では
+/// なく）にする——`value`が既に覆われている＝**設定へ足しても意味が無いことが確定している**ので、
+/// 置き換えるべき条件と`(no changes)`になる条件がちょうど一致する。畳み込みで生まれた親を
+/// 子の1件だけを根拠に昇格させると、書込が要らない範囲まで広げてしまう。
+fn expand(group: Group, granted: &crate::insufficient::GrantedPaths) -> Vec<Expanded> {
+    let base_warnings = warnings_for(&group);
+
+    let covering = match group.key {
+        SettingsKey::NetAllowDomains => None,
+        SettingsKey::FsRead | SettingsKey::FsReadWrite | SettingsKey::FsReadExec => {
+            granted.covering(&group.value)
+        }
+    };
+    let Some(insufficient) = crate::insufficient::diagnose(covering) else {
+        // 昇格しない場合でも、証拠の**一員**が許可済みなら注記だけは載せる（旧来の挙動）。
+        // 親へ畳んだ提案そのものは広げないが、「この配下には既に許可済みで、なお拒否された
+        // ものがある」は判断材料として残す価値がある。
+        let mut warnings = base_warnings;
+        if !granted.is_empty() {
+            let from_evidence = group.evidence.iter().find_map(|candidate| {
+                match &candidate.requested {
+                    Requested::Fs { path, .. } => {
+                        crate::insufficient::diagnose(granted.covering(path))
+                    }
+                    Requested::Net { .. } => None,
+                }
+            });
+            if let Some(from_evidence) = from_evidence {
+                warnings.push(from_evidence.explain().to_string());
+            }
+        }
+        return vec![Expanded {
+            key: group.key,
+            value: group.value,
+            evidence: group.evidence,
+            warnings,
+        }];
+    };
+
+    // **昇格先を1つに決め打たない。** `read`許可下の拒否から言えるのは「書込・削除・実行の
+    // いずれか」までで、どれかは決まらない（`FILE_EXECUTE`も`DELETE`も`FILE_GENERIC_READ`/
+    // `FILE_GENERIC_WRITE`のどちらにも含まれない）。片方へ自動で寄せると、実行が目的だった
+    // 場合に頼まれていない書込穴を提案することになり P-03 に反する。両方を並べて選ばせる
+    // （D-42: 適用は常にユーザーの明示操作）。
+    escalation_targets(&insufficient)
+        .into_iter()
+        .map(|(key, why)| {
+            let mut warnings = base_warnings.clone();
+            warnings.push(insufficient.explain().to_string());
+            warnings.push(why.to_string());
+            Expanded {
+                key,
+                value: group.value.clone(),
+                evidence: group.evidence.clone(),
                 warnings,
             }
         })
         .collect()
+}
+
+/// 「その許可では足りない」から導ける昇格先と、それを選ぶべき場面の説明。
+fn escalation_targets(
+    insufficient: &crate::insufficient::Insufficient,
+) -> Vec<(SettingsKey, &'static str)> {
+    use crate::insufficient::Insufficient;
+    match insufficient {
+        Insufficient::ReadWasNotEnough => vec![
+            (
+                SettingsKey::FsReadWrite,
+                "accept this one if the failing operation writes, deletes or renames",
+            ),
+            (
+                SettingsKey::FsReadExec,
+                "accept this one instead if the failing operation runs a program from that path",
+            ),
+        ],
+        Insufficient::ReadExecWasNotEnough => vec![(
+            SettingsKey::FsReadWrite,
+            "execute is already allowed here, so what is missing is write or delete",
+        )],
+        Insufficient::ReadWriteWasNotEnough => vec![(
+            SettingsKey::FsReadExec,
+            "write is already allowed here, so the failing operation is either running a program \
+             or asking for a right this mechanism does not grant at all (taking ownership, \
+             changing the ACL) -- in the latter case no settings change will help",
+        )],
+    }
 }
 
 struct Group {

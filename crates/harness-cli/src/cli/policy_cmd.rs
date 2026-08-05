@@ -11,8 +11,11 @@
 //! - [`PolicyAction::Apply`]は`--accept <id>`で明示された提案**だけ**を書く。全件適用の
 //!   ショートハンド（`--all`等）は用意しない——「触れば通る」経路を1つも作らないため、
 //!   受理は常に個別の意思表示にする。
-//! - 書込前に`--require-sandbox`との矛盾チェック（`harness_policy::gate`）を通し、
-//!   1件でも矛盾していれば**何も書かずに**失敗する（部分適用しない）。
+//! - 書込前に2つのチェックを通し、1件でも引っ掛かれば**何も書かずに**失敗する（部分適用しない）。
+//!   `--require-sandbox`との矛盾（`harness_policy::gate`、D-42）と、
+//!   値が広すぎないか（`harness_policy::breadth`、D-47）。後者に`--force`のような
+//!   抜け道は用意しない——回避したいユーザーは`.harness/settings.json`を手で編集する。
+//!   どちらのチェックも[`PolicyAction::Audit`]には掛けない（D-43「失敗を隠さない」）。
 
 use std::io::IsTerminal;
 
@@ -138,20 +141,55 @@ fn project_settings_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".harness").join("settings.json")
 }
 
-/// `.harness/settings.json`が既に許可しているFSパスを読む（§15.1の差分推論の入力）。
+/// 既に許可されているFSパスを読む（§15.1の差分推論の入力）。
 ///
-/// **既に許可済みなのに拒否された**＝その許可では足りない、が確定するので、提案へその旨を載せる。
-/// 読むのはここ（CLI層）で、判定は純粋クレート側が行う。
+/// **既に許可済みなのに拒否された**＝その許可では足りない、が確定するので、提案そのものを
+/// 昇格候補へ差し替える（D-46、`harness_policy::generalize`）。読むのはここ（CLI層）で、
+/// 判定は純粋クレート側が行う。
+///
+/// 収集源は2つある。**片方だけでは足りない**——
+///
+/// | 収集源 | 何を捉えるか |
+/// |---|---|
+/// | `.harness/settings.json`の`fs.*` | 設定ファイルで宣言した穴。access種別が正確 |
+/// | `fs-passthrough-ledger.json`の`entries` | **実際にACE付与が確認できた**ルート。`--fs-allow`由来を含む |
+///
+/// 台帳を混ぜる前は、`--fs-allow`だけで穴を開けたユーザーが「その許可では足りない」に
+/// 永遠に到達できなかった（`plans/PLAN-M15.7-FOLLOWUP.md` W4）。
 fn granted_paths(workspace_root: &Path) -> harness_policy::GrantedPaths {
+    let ledger_json = crate::fs_grants::fs_ledger()
+        .path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    granted_paths_from(workspace_root, &ledger_json)
+}
+
+/// [`granted_paths`]の判断部分。台帳の中身を引数で受けるのは**テストをこの開発機の実台帳から
+/// 切り離すため**——`fs-passthrough-ledger.json`はマシン全体で1つしか無く、差し替えられない。
+fn granted_paths_from(workspace_root: &Path, ledger_json: &str) -> harness_policy::GrantedPaths {
     let settings = harness_config::Settings::load(workspace_root);
-    harness_policy::GrantedPaths::new(
-        settings
-            .fs
-            .unwrap_or_default()
-            .to_fs_passthrough()
-            .into_iter()
-            .map(|(path, access)| (path.replace('\\', "/"), access))
-            .collect(),
+    // 設定の相対パスは`workspace_root`基準で絶対化する（`fs_passthrough`を組み立てる
+    // `startup::sandbox`と同じ扱い）。生のまま比較すると、相対指定した穴が拒否パス
+    // （常に絶対パス）と一致せず、覆っていないと誤判定する。
+    let from_settings: Vec<(String, harness_config::FsAccess)> = settings
+        .fs
+        .unwrap_or_default()
+        .to_fs_passthrough()
+        .into_iter()
+        .map(|(path, access)| {
+            (
+                workspace_root
+                    .join(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                access,
+            )
+        })
+        .collect();
+
+    harness_policy::GrantedPaths::merged(
+        from_settings,
+        harness_policy::normalize::granted_from_ledger(ledger_json),
     )
 }
 
@@ -197,9 +235,19 @@ fn render_proposals_text(proposals: &[RuleProposal], verdicts: &[(String, GateVe
             .find(|(id, _)| id == &proposal.id)
             .map(|(_, v)| v);
         let blocked = verdict.is_some_and(|v| v.is_rejected());
+        // D-47: 幅のガードは`--require-sandbox`とは別軸なので、印も別にする。
+        // **一覧からは消さない**（D-43「失敗を隠さない」）。
+        let breadth = harness_policy::breadth::check(proposal);
+        let mut marks = String::new();
+        if blocked {
+            marks.push_str("[blocked] ");
+        }
+        if breadth.is_too_broad() {
+            marks.push_str("[too-broad] ");
+        }
         out.push_str(&format!(
             "{}{}  {} = {:?}   (observed {}x via {})\n",
-            if blocked { "[blocked] " } else { "" },
+            marks,
             proposal.id,
             proposal.key.dotted(),
             proposal.value,
@@ -217,6 +265,9 @@ fn render_proposals_text(proposals: &[RuleProposal], verdicts: &[(String, GateVe
         if let Some(message) = verdict.and_then(|v| v.message()) {
             let label = if blocked { "refused" } else { "warning" };
             out.push_str(&format!("    {label}: {message}\n"));
+        }
+        if let Some(message) = breadth.message() {
+            out.push_str(&format!("    refused: {message}\n"));
         }
     }
     out.push_str(
@@ -536,10 +587,19 @@ fn apply_accepted(
         return ExitCode::FAILURE;
     }
 
-    // D-42: `read_write`への昇格等が`--require-sandbox`の宣言と矛盾していないか。
+    // 2軸の拒否を1箇所へ集める。どちらも**部分適用しない**（1件でも該当なら何も書かない）。
+    //
+    // - D-42: `read_write`への昇格等が`--require-sandbox`の宣言と矛盾していないか
+    // - D-47: 受理1回でマシン全体が開くような広すぎる値でないか
+    //
+    // 軸を分けたまま両方を通すのは、拒否された理由がユーザーから見て別物だからである
+    // （前者は自分の宣言との矛盾、後者は値そのものの広さ）。
     let mut refused = Vec::new();
     for proposal in &accepted {
         if let GateVerdict::Rejected(message) = gate::check_proposal(proposal, require_sandbox) {
+            refused.push(format!("{}: {message}", proposal.id));
+        }
+        if let Some(message) = harness_policy::breadth::check(proposal).message() {
             refused.push(format!("{}: {message}", proposal.id));
         }
     }

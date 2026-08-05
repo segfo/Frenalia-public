@@ -156,12 +156,25 @@ fn parse_access(label: &str) -> Option<FsAccess> {
 // 収集源1: preflight（`fs-passthrough-ledger.json`）
 // ---------------------------------------------------------------------------
 
-/// `fs-passthrough-ledger.json`の`denied_entries`だけを読むための最小の受け皿。
-/// 台帳の他の項目（`entries`＝実際に付与済みのACE）は提案の材料ではないので読まない。
+/// `fs-passthrough-ledger.json`のうち、この機構が読む2つの配列。
+///
+/// `denied_entries`は提案の**材料**（何が拒否されたか）、`entries`（実際に付与済みのACE）は
+/// 提案の**判定材料**（既に許可済みなのに拒否されたのか）である。役割が違うので混ぜない。
 #[derive(Debug, Deserialize)]
 struct PreflightLedger {
     #[serde(default)]
     denied_entries: Vec<PreflightDeniedEntry>,
+    #[serde(default)]
+    entries: Vec<PreflightGrantedEntry>,
+}
+
+/// 実際にACE付与が確認できたルート1件。**台帳は`writable`しか持たない**ので、
+/// `read`と`read_exec`はここでは区別できない（[`granted_from_ledger`]のdoc参照）。
+#[derive(Debug, Deserialize)]
+struct PreflightGrantedEntry {
+    path: String,
+    #[serde(default)]
+    writable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +226,40 @@ pub fn normalize_preflight(ledger_json: &str) -> SourceReport {
         candidates,
         notes,
     }
+}
+
+/// `fs-passthrough-ledger.json`の`entries`から「既に許可済みのパス」を取り出す
+/// （[`crate::insufficient::GrantedPaths::merged`]の入力、`plans/PLAN-M15.7-FOLLOWUP.md` W4）。
+///
+/// 台帳は`writable: bool`しか持たないので、access種別はこう対応させる。
+///
+/// | `writable` | access | 根拠 |
+/// |---|---|---|
+/// | `true` | `ReadWrite` | `--fs-allow <path>:rw` |
+/// | `false` | `ReadExec` | **`--fs-allow <path>`の既定は`Read`ではなく`ReadExec`**（`harness-cli`の`--fs-allow`解釈） |
+///
+/// **既知の不正確さ**: `--cow`下では`:rw`の実ACLが`Read`へ降格される（P-03、BUG-044）のに、
+/// 台帳へはユーザーが要求した`writable=true`が記録される。この場合ここは`ReadWrite`と見なすので
+/// 過大評価になる。ただし`--cow`下のworkspace外書込はRedirector DLLがupperへ捕捉するため、
+/// `:rw`パスのACL拒否が提案経路まで来ること自体が稀であり、追跡はしない。
+///
+/// 壊れた台帳は**空として扱う**（D-43。読めないことを理由に提案そのものを止めない）。
+pub fn granted_from_ledger(ledger_json: &str) -> Vec<(String, FsAccess)> {
+    let Ok(ledger) = serde_json::from_str::<PreflightLedger>(ledger_json) else {
+        return Vec::new();
+    };
+    ledger
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let access = if entry.writable {
+                FsAccess::ReadWrite
+            } else {
+                FsAccess::ReadExec
+            };
+            (normalize_path(&entry.path), access)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

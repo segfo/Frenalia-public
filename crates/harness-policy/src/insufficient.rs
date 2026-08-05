@@ -38,6 +38,28 @@ impl GrantedPaths {
         Self { entries }
     }
 
+    /// `.harness/settings.json`由来と`fs-passthrough-ledger.json`由来を合流させる。
+    ///
+    /// **設定ファイル側を優先する**（同じパスが両方にあれば台帳側を捨てる）。台帳は
+    /// `writable: bool`しか持たず`read`と`read_exec`を区別できないのに対し、設定側は
+    /// 正確なaccess種別を持つため。台帳にしか無いパスは`--fs-allow`由来である。
+    ///
+    /// 台帳を混ぜるのは、**`--fs-allow`で穴を開けたユーザーにも「その許可では足りない」を
+    /// 届けるため**である（`plans/PLAN-M15.7-FOLLOWUP.md` W4）。設定ファイルしか見ていなかった
+    /// 頃は、`--fs-allow`利用者だけが永遠に同じ`fs.read`提案を受け取り続けていた。
+    pub fn merged(settings: Vec<(String, FsAccess)>, ledger: Vec<(String, FsAccess)>) -> Self {
+        let mut entries = settings;
+        for (path, access) in ledger {
+            let already = entries
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(&path));
+            if !already {
+                entries.push((path, access));
+            }
+        }
+        Self { entries }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

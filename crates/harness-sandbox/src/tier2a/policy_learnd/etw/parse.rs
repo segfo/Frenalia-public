@@ -32,10 +32,40 @@
 //! `docs/STATUS.md`）。
 //!
 //! そこでここでは`CreateDisposition`（`CreateOptions`の上位8bit）から判る範囲だけを使い、
-//! **判らない場合は`Read`へ倒す**（[`access_from_create_options`]）。強い方（`ReadWrite`）へ
-//! 倒すと、読み取りしか要らなかった場所に書込許可を提案することになり、
-//! 「要求された権限を超えて与えない」（P-03）に反する。提案が狭すぎた場合はユーザーが
-//! `read_write`へ直せばよいが、広すぎる提案は気付かれずに受理されうる。
+//! **判らない場合は`Read`へ倒す**（[`access_from_create_options`]）。
+//!
+//! # なぜ2/4/5だけ`ReadWrite`へ寄せてよいのか（非対称の根拠、D-46）
+//!
+//! この非対称は精度の妥協でも恣意でもなく、**片側だけ証明が成立する**ことの反映である。
+//! 根拠は実測で固定してある（`disposition_semantics_tests.rs`、管理者権限もETWも要らないので
+//! `cargo test`で常時走る）。
+//!
+//! | 観測 | read許可**だけ**の状態での結果 | そこから言えること |
+//! |---|---|---|
+//! | disposition 4/5/0 | **必ず拒否**（P1/P2/P3） | `fs.read`をいくら足しても直らない ⇒ `ReadWrite`が要る |
+//! | disposition 3 で読む | 成功（N1） | `fs.read`は有効な修正になりうる |
+//! | disposition 3 で書く | 拒否（N2） | 3からは読/書を区別できない |
+//!
+//! 4/5/0が必ず拒否になるのは、**IOマネージャがdispositionを見て`FILE_WRITE_DATA`を実効マスクへ
+//! 足す**からである。呼び出し側が`DesiredAccess`に書込を1ビットも入れていなくても足される
+//! （許可DACLの下では、読取専用のハンドル要求でファイルが0バイトに切り詰められることを実測した）。
+//! したがって「拒否された」という観測と組み合わせたときだけ、dispositionは
+//! **`read`では足りないことの証明**になる。
+//!
+//! この向きの推定は`ReadWrite`を提案しても**要求されていた権限を超えない**ので、P-03とも整合する。
+//!
+//! **逆向き（3を`ReadWrite`へ寄せる）は成立しない。** N1が示すとおり3はread許可で通ることが
+//! あり、寄せると読み取りしか要らなかった場所に書込許可を提案することになる。提案が狭すぎた
+//! 場合はユーザーが直せるが、広すぎる提案は気付かれずに受理されうる。
+//!
+//! # 残る不完全さと、その回収経路
+//!
+//! N2のとおり書込も`FILE_OPEN_IF`(3)を通るため、**書込の拒否が`fs.read`として提案されうる**
+//! （`Add-Content`がまさにこれ。RESULTS.md §17.4）。ここは狭い側に外しているので危険ではないが、
+//! 黙っていると「提案どおりにしたのに直らない」になる。回収するのは推定側ではなく
+//! **昇格の梯子**である——既に`fs.read`で許可済みのパスで拒否が観測されたら、readでは足りない
+//! ことが確定するので、提案そのものを`fs.read_write`/`fs.read_exec`へ差し替える
+//! （`harness_policy::insufficient`・`harness_policy::generalize`、D-46）。
 //!
 //! なお`--cow`セッションではRedirector DLLが`NtCreateFile`の生の`DesiredAccess`を
 //! `.harness-cow-denied.jsonl`へ記録しており、そちらは正確である。2つの収集源は補完関係にある
@@ -172,7 +202,11 @@ impl Correlator {
 ///
 /// 上位8bitの`CreateDisposition`が「作る/上書きする」を意味する場合だけ`ReadWrite`とし、
 /// それ以外（`FILE_OPEN`・`FILE_OPEN_IF`等、既存を開くだけ）は**判らないので`Read`**とする。
-/// この非対称はP-03（要求された権限を超えて与えない）の適用であって、精度の妥協ではない。
+///
+/// **この非対称は片側だけ証明が成立することの反映である**（実測はモジュールdocの表、
+/// `disposition_semantics_tests.rs`）。read許可だけの状態でdisposition 4/5/0は必ず拒否されるので、
+/// その拒否に対して`fs.read`を提案しても直らないことが**確定している**。逆に disposition 3 は
+/// read許可で通ることがあるため、`ReadWrite`へ寄せるとP-03（要求された権限を超えて与えない）に反する。
 pub fn access_from_create_options(create_options: u32) -> FsAccess {
     let disposition = (create_options >> 24) & 0xFF;
     match disposition {

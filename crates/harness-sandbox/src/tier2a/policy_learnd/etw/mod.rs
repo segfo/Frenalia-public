@@ -64,3 +64,10 @@ mod operation_denial_tests;
 #[cfg(all(windows, test))]
 #[path = "fs_allow_reach_tests.rs"]
 mod fs_allow_reach_tests;
+
+/// [`parse::access_from_create_options`]が寄りかかっている前提——「disposition 2/4/5は
+/// 呼び出し側が書込を要求した証拠になる」——を`NtCreateFile`の戻り値で実測する（W3、D-46）。
+/// **ETWも管理者権限も要らないので`#[ignore]`を付けない**。前提が崩れた日に赤くなるべきもの。
+#[cfg(all(windows, test))]
+#[path = "disposition_semantics_tests.rs"]
+mod disposition_semantics_tests;

@@ -347,11 +347,16 @@ fn render_shell_tier(shell_tier: &ShellTierSelection) -> Vec<String> {
         tier,
         downgraded_from,
         reason,
-        passthrough_warnings: _,
-        denied_passthrough: _,
-        granted_passthrough: _,
+        passthrough_warnings,
+        denied_passthrough,
+        granted_passthrough,
         netfilterd_chain_attempted: _,
     } = shell_tier;
+
+    // D8/D9の到達性診断は**運用者向けの手順**（「`harness fs grant-traverse <path>`を実行せよ」）
+    // であり、モデルには実行できない。拒否されたパスとその理由は`denied_passthrough`が
+    // 構造化して持っているので、そちらだけをモデルへ伝える。
+    let _ = passthrough_warnings;
 
     let mut out = vec![tier_line(*tier)];
     if let Some(from) = downgraded_from {
@@ -366,7 +371,64 @@ fn render_shell_tier(shell_tier: &ShellTierSelection) -> Vec<String> {
             tier_label,
         ));
     }
+    out.extend(render_passthrough(granted_passthrough, denied_passthrough));
     out
+}
+
+/// `--fs-allow`/`settings.json`が開けた（あるいは開けなかった）ワークスペース外の穴。
+///
+/// # なぜモデルへ伝えるのか
+///
+/// **`denied`が見えないことは穴が無いことより悪い。** 付与に失敗したパスについて、モデルは
+/// 「ユーザーが許可したのだから使える」と思ったまま計画を立て、失敗し、原因が分からないまま
+/// 再試行する。ここで「触れない」と宣言しておけば、その空転が消える。
+///
+/// `granted`の方は逆に積極的な事実である——Tier2aの既定は「ワークスペース外は読めない」なので、
+/// 例外がどこにあるかを知らせないと、モデルは使える経路を使わない。
+///
+/// どちらも空なら1行も出さない（`render_mcp_servers`・`render_net_app`と同じ方針。宣言して
+/// いないユーザーのプロンプトを無意味に伸ばさない）。
+///
+/// `--cow`下では`:rw`の実ACLが`Read`へ降格される（P-03、BUG-044）が、その事実は
+/// [`render_cow`]が「ワークスペース本体はread-only、書込は透過リダイレクト、境界はACL」として
+/// 既に述べているので、ここで重複させない。
+fn render_passthrough(
+    granted: &[(PathBuf, bool)],
+    denied: &[(PathBuf, String, String)],
+) -> Vec<String> {
+    if granted.is_empty() && denied.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    if !granted.is_empty() {
+        let entries: Vec<String> = granted
+            .iter()
+            .map(|(path, writable)| {
+                format!(
+                    "{}（{}）",
+                    path.display(),
+                    if *writable { "読み書き" } else { "読取のみ" }
+                )
+            })
+            .collect();
+        lines.push(format!(
+            "ワークスペース外の例外（許可済み）: run_shellが起動するプロセスは、次の外部パスへ\
+             追加でアクセスできます: {}。これ以外のワークスペース外パスは既定どおり拒否されます。",
+            entries.join("、")
+        ));
+    }
+    if !denied.is_empty() {
+        let entries: Vec<String> = denied
+            .iter()
+            .map(|(path, access, reason)| format!("{}［{access}］: {reason}", path.display()))
+            .collect();
+        lines.push(format!(
+            "ワークスペース外の例外（許可に失敗）: 次のパスは許可が要求されましたが、実際には\
+             アクセスできません。**使える前提で計画を立てないでください**: {}。",
+            entries.join("、")
+        ));
+    }
+    lines
 }
 
 fn tier_display_label(tier: ShellTier) -> &'static str {
@@ -652,6 +714,68 @@ mod tests {
         );
         // 第三者コードであること・裏取りが要ることを明示している（D-40と§4.3の前提）。
         assert!(rendered.contains("第三者"), "{rendered}");
+    }
+
+    /// passthroughが1つも無いときはプロンプトを伸ばさない（既存のゴールデンが割れないこと）。
+    #[test]
+    fn passthrough_is_not_mentioned_when_there_is_none() {
+        let rendered = render(&facts_for(ShellTier::Tier2a, StagingMode::Live));
+
+        assert!(!rendered.contains("ワークスペース外の例外"), "{rendered}");
+    }
+
+    /// **W10の主目的。** 許可に失敗した穴はモデルへ必ず伝える——伝えないと、モデルは
+    /// 「使える」と思ったまま動いて空転する。
+    #[test]
+    fn failed_passthrough_grants_are_declared_as_unusable() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.shell_tier = ShellTierSelection::direct(ShellTier::Tier2a).with_denied_passthrough(
+            vec![(
+                PathBuf::from(r"C:\secrets"),
+                "read".to_string(),
+                "ACE grant failed with ACCESS_DENIED".to_string(),
+            )],
+        );
+
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(rendered.contains(r"C:\secrets"), "{rendered}");
+        assert!(rendered.contains("ACCESS_DENIED"), "{rendered}");
+        assert!(
+            rendered.contains("使える前提で計画を立てないでください"),
+            "{rendered}"
+        );
+    }
+
+    /// 到達できる外部パスは読取のみ/読み書きを描き分ける。
+    #[test]
+    fn granted_passthrough_distinguishes_read_only_from_writable() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.shell_tier = ShellTierSelection::direct(ShellTier::Tier2a).with_granted_passthrough(
+            vec![
+                (PathBuf::from(r"C:\tools"), false),
+                (PathBuf::from(r"D:\data"), true),
+            ],
+        );
+
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(rendered.contains(r"C:\tools（読取のみ）"), "{rendered}");
+        assert!(rendered.contains(r"D:\data（読み書き）"), "{rendered}");
+    }
+
+    /// D8/D9の到達性診断（運用者向けの手順）はモデルへ渡さない。
+    /// `harness fs grant-traverse`はモデルには実行できず、渡しても混乱の元にしかならない。
+    #[test]
+    fn operator_facing_reachability_diagnostics_stay_out_of_the_prompt() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.shell_tier = ShellTierSelection::direct(ShellTier::Tier2a).with_passthrough_warnings(
+            vec!["run `harness fs grant-traverse C:/x` to fix this".to_string()],
+        );
+
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(!rendered.contains("grant-traverse"), "{rendered}");
     }
 
     #[test]

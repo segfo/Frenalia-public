@@ -262,3 +262,164 @@ fn non_audit_read_proposals_do_not_carry_the_guess_disclosure() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 昇格の梯子（D-46、`plans/PLAN-M15.7-FOLLOWUP.md` W4）
+// ---------------------------------------------------------------------------
+
+fn granted(entries: &[(&str, FsAccess)]) -> crate::insufficient::GrantedPaths {
+    crate::insufficient::GrantedPaths::new(
+        entries
+            .iter()
+            .map(|(path, access)| ((*path).to_string(), *access))
+            .collect(),
+    )
+}
+
+/// **W4の本体。** 既に`fs.read`で許可済みのパスの拒否は、`fs.read`を提案し直しても
+/// `apply`が`(no changes)`になるだけなので、**昇格候補で置き換える**。
+///
+/// `read`許可下の拒否からは「書込・削除・実行のいずれか」までしか絞れないので、
+/// 片方へ自動で寄せず両方を並べる（P-03・D-42）。
+#[test]
+fn a_denial_under_an_existing_read_grant_is_replaced_by_both_escalation_targets() {
+    let proposals = generalize_with_granted(
+        &[fs("C:/tools/bin/rustc.exe", FsAccess::Read)],
+        Generalization::None,
+        &granted(&[("C:/tools", FsAccess::Read)]),
+    );
+
+    assert_eq!(proposals.len(), 2, "{proposals:#?}");
+    assert!(
+        proposals.iter().all(|p| p.value == "C:/tools/bin/rustc.exe"),
+        "the value is unchanged; only the key escalates: {proposals:#?}"
+    );
+    let keys: Vec<SettingsKey> = proposals.iter().map(|p| p.key).collect();
+    assert_eq!(keys, vec![SettingsKey::FsReadWrite, SettingsKey::FsReadExec]);
+    assert!(
+        !proposals.iter().any(|p| p.key == SettingsKey::FsRead),
+        "the redundant fs.read proposal must be gone -- applying it would print (no changes)"
+    );
+    // なぜkeyが変わったのかが提案自身から読めること。
+    assert!(proposals[0]
+        .warnings
+        .iter()
+        .any(|w| w.contains("ALREADY allowed as fs.read")));
+    assert!(proposals
+        .iter()
+        .any(|p| p.warnings.iter().any(|w| w.contains("runs a program"))));
+}
+
+/// `read_exec`許可下の拒否は`read_write`の1件だけになる（実行は既に許可済みなので候補から外れる）。
+#[test]
+fn a_denial_under_a_read_exec_grant_escalates_only_to_read_write() {
+    let proposals = generalize_with_granted(
+        &[fs("C:/tools/x.dll", FsAccess::Read)],
+        Generalization::None,
+        &granted(&[("C:/tools", FsAccess::ReadExec)]),
+    );
+
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].key, SettingsKey::FsReadWrite);
+}
+
+/// `read_write`許可下の拒否は`read_exec`の1件。ただし「この機構が付与しない権利かもしれない」
+/// ことを必ず添える——設定変更では直らない場合があると分かっていなければ、ユーザーは
+/// 提案を受理し続けることになる。
+#[test]
+fn a_denial_under_a_read_write_grant_escalates_to_read_exec_and_admits_the_limit() {
+    let proposals = generalize_with_granted(
+        &[fs("C:/data/tool.exe", FsAccess::Read)],
+        Generalization::None,
+        &granted(&[("C:/data", FsAccess::ReadWrite)]),
+    );
+
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].key, SettingsKey::FsReadExec);
+    assert!(proposals[0]
+        .warnings
+        .iter()
+        .any(|w| w.contains("does not grant at all")));
+}
+
+/// **畳んだ親を、子1件を根拠に昇格させない。** 提案の`value`（＝設定へ書かれる値）が
+/// 許可済みでないなら、それを足すことには意味がある。証拠の一員が許可済みであることは
+/// 判断材料として注記に残すが、keyは動かさない。
+#[test]
+fn a_folded_parent_is_annotated_but_not_escalated_when_only_a_child_was_granted() {
+    let proposals = generalize_with_granted(
+        &[
+            fs("C:/tools/bin/a.exe", FsAccess::Read),
+            fs("C:/tools/bin/b.exe", FsAccess::Read),
+        ],
+        Generalization::Directory,
+        &granted(&[("C:/tools/bin/a.exe", FsAccess::Read)]),
+    );
+
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].value, "C:/tools/bin");
+    assert_eq!(
+        proposals[0].key,
+        SettingsKey::FsRead,
+        "adding fs.read for the parent is a real change; do not widen it on one child's behalf"
+    );
+    assert!(
+        proposals[0]
+            .warnings
+            .iter()
+            .any(|w| w.contains("ALREADY allowed")),
+        "the evidence-level insufficiency is still worth showing: {:#?}",
+        proposals[0].warnings
+    );
+}
+
+/// 許可済みでないパスは従来どおり1件のまま（昇格経路が既定の挙動を変えていないこと）。
+#[test]
+fn an_ungranted_path_still_yields_exactly_one_proposal() {
+    let proposals = generalize_with_granted(
+        &[fs("C:/elsewhere/x.txt", FsAccess::Read)],
+        Generalization::None,
+        &granted(&[("C:/tools", FsAccess::Read)]),
+    );
+
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].key, SettingsKey::FsRead);
+}
+
+/// **idは入力の並び順に依存しない。** 1グループが複数提案へ割れても、`(key, value)`で
+/// 並べ替えてから採番するので`--accept fs-2`が実行ごとに別のものを指さない。
+#[test]
+fn ids_stay_deterministic_when_a_group_expands_into_several_proposals() {
+    let granted = granted(&[("C:/tools", FsAccess::Read)]);
+    let forward = vec![
+        fs("C:/tools/a.txt", FsAccess::Read),
+        fs("C:/zzz/b.txt", FsAccess::Read),
+    ];
+    let reversed: Vec<DeniedCandidate> = forward.iter().rev().cloned().collect();
+
+    let a = generalize_with_granted(&forward, Generalization::None, &granted);
+    let b = generalize_with_granted(&reversed, Generalization::None, &granted);
+
+    let ids_and_keys = |proposals: &[RuleProposal]| -> Vec<(String, SettingsKey, String)> {
+        proposals
+            .iter()
+            .map(|p| (p.id.clone(), p.key, p.value.clone()))
+            .collect()
+    };
+    assert_eq!(ids_and_keys(&a), ids_and_keys(&b));
+    assert_eq!(a.len(), 3, "2 escalated + 1 untouched: {a:#?}");
+}
+
+/// ネットワークの提案は昇格の対象外（FSパスの許可状態とは無関係）。
+#[test]
+fn domain_proposals_are_untouched_by_the_escalation_ladder() {
+    let proposals = generalize_with_granted(
+        &[net("api.example.com")],
+        Generalization::None,
+        &granted(&[("C:/", FsAccess::Read)]),
+    );
+
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].key, SettingsKey::NetAllowDomains);
+    assert_eq!(proposals[0].id, "net-1");
+}

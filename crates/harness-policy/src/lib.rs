@@ -24,6 +24,7 @@
 //! - **拒否を防がない**。ここは境界ではない（P-07）。収集源が1つも読めなくても、その事実を
 //!   [`SourceReport::available`]で可視化したうえで残りの経路だけで動く（D-43 fail-open）。
 
+pub mod breadth;
 pub mod diff;
 pub mod event;
 pub mod gate;
@@ -31,6 +32,7 @@ pub mod generalize;
 pub mod insufficient;
 pub mod normalize;
 
+pub use breadth::BreadthVerdict;
 pub use diff::{SettingsDiff, SettingsDiffEntry};
 pub use event::{FsAuditEvent, FsAuditKind};
 pub use gate::{check_proposal, GateVerdict};

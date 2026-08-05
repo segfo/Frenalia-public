@@ -379,6 +379,9 @@ fn empty_proposals_render_an_explicit_message() {
 /// **§15.1の差分推論がCLI経路で効く。** `.harness/settings.json`が既に`fs.read`で許可している
 /// パスで拒否が観測されたら、「readでは足りない」と提案へ載る——「`fs.read`を足したのに
 /// まだ失敗する」というユーザー体験上いちばん困る状況を解く。
+///
+/// **D-46以降は注記だけでなくkeyそのものが昇格する**ことも併せて固定する
+/// （注記だけだった頃は`apply`が`(no changes)`で終わっていた。W4）。
 #[test]
 fn a_denial_under_an_existing_read_grant_is_reported_as_insufficient() {
     let dir = tempfile::tempdir().unwrap();
@@ -403,7 +406,7 @@ fn a_denial_under_an_existing_read_grant_is_reported_as_insufficient() {
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
     let proposals =
-        input.proposals_with_granted(Generalization::None, &granted_paths(dir.path()));
+        input.proposals_with_granted(Generalization::None, &granted_paths_from(dir.path(), ""));
 
     let warning = proposals[0]
         .warnings
@@ -413,6 +416,12 @@ fn a_denial_under_an_existing_read_grant_is_reported_as_insufficient() {
     assert!(
         warning.contains("adding fs.read again will not"),
         "it must say that repeating fs.read does not help: {warning}"
+    );
+    assert!(
+        !proposals
+            .iter()
+            .any(|p| p.key == harness_policy::SettingsKey::FsRead),
+        "the proposal that cannot work must be replaced, not merely annotated: {proposals:#?}"
     );
 }
 
@@ -434,10 +443,301 @@ fn a_denial_on_an_ungranted_path_carries_no_insufficiency_claim() {
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
     let proposals =
-        input.proposals_with_granted(Generalization::None, &granted_paths(dir.path()));
+        input.proposals_with_granted(Generalization::None, &granted_paths_from(dir.path(), ""));
 
     assert!(!proposals[0]
         .warnings
         .iter()
         .any(|w| w.contains("ALREADY allowed")));
+}
+
+// ---------------------------------------------------------------------------
+// W4: 昇格の梯子がCLI経路で最後まで通ること（D-46）
+// ---------------------------------------------------------------------------
+
+/// 拒否1件だけを持つワークスペースを組み立てる。
+fn workspace_with_one_denial(settings_json: &str, denied_path: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let harness_dir = dir.path().join(".harness");
+    std::fs::create_dir_all(&harness_dir).unwrap();
+    std::fs::write(harness_dir.join("settings.json"), settings_json).unwrap();
+
+    let session_dir = harness_dir.join("sandbox").join("session-x");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("fs-audit.jsonl"),
+        format!(
+            r#"{{"kind":"etw","path":"{denied_path}","access":"read","allowed":false,"reason":"STATUS_ACCESS_DENIED","timestamp_unix_ms":1}}{}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+/// **W4の回帰の本体。** 「`fs.read`済みのパスで拒否 → 提案 → `apply --accept`」が
+/// `(no changes)`で終わらず、設定が実際に変わること。
+///
+/// これが壊れると、ツールが「効かない」と自分で言う提案を出し、適用しても何も起きない
+/// 状態（D-46以前）へ戻る。
+#[test]
+fn applying_an_escalated_proposal_actually_changes_the_settings() {
+    let dir = workspace_with_one_denial(
+        r#"{"fs":{"read":["C:/tools"]}}"#,
+        "C:/tools/bin/rustc.exe",
+    );
+    let settings_path = dir.path().join(".harness").join("settings.json");
+
+    let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
+    let proposals =
+        input.proposals_with_granted(Generalization::None, &granted_paths_from(dir.path(), ""));
+    let read_write = proposals
+        .iter()
+        .find(|p| p.key == harness_policy::SettingsKey::FsReadWrite)
+        .expect("an fs.read_write escalation must be offered");
+
+    let code = apply_accepted(
+        dir.path(),
+        &proposals,
+        std::slice::from_ref(&read_write.id),
+        true,
+        harness_core::RequireSandbox::None,
+    );
+    assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        written["fs"]["read_write"],
+        serde_json::json!(["C:/tools/bin/rustc.exe"]),
+        "the escalation must reach the settings file; anything else means apply printed \
+         (no changes) again"
+    );
+    assert_eq!(
+        written["fs"]["read"],
+        serde_json::json!(["C:/tools"]),
+        "the existing grant is left alone"
+    );
+}
+
+/// **F12の解消。** `--fs-allow`だけで開けた穴（`settings.json`には無い）でも、
+/// 台帳を根拠に「その許可では足りない」へ到達できる。
+///
+/// 台帳の`writable: false`は`--fs-allow <path>`の既定＝`read_exec`にあたるので、
+/// 昇格先は`fs.read_write`の1件になる。
+#[test]
+fn a_denial_on_an_fs_allow_only_path_escalates_via_the_ledger() {
+    let dir = workspace_with_one_denial("{}", "C:/tools/bin/rustc.exe");
+    let ledger = r#"{"entries":[{"path":"C:\\tools","writable":false,"granted_at_unix_secs":1}]}"#;
+
+    let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
+    let proposals = input.proposals_with_granted(
+        Generalization::None,
+        &granted_paths_from(dir.path(), ledger),
+    );
+
+    assert_eq!(proposals.len(), 1, "{proposals:#?}");
+    assert_eq!(proposals[0].key, harness_policy::SettingsKey::FsReadWrite);
+    assert!(proposals[0]
+        .warnings
+        .iter()
+        .any(|w| w.contains("ALREADY allowed as fs.read_exec")));
+}
+
+/// 台帳が読めない/壊れていても提案は止まらない（D-43）。この場合は単に
+/// 「許可済みと言える材料が無い」＝従来どおり1件の提案になる。
+#[test]
+fn a_broken_ledger_degrades_to_no_escalation_instead_of_failing() {
+    let dir = workspace_with_one_denial("{}", "C:/tools/bin/rustc.exe");
+
+    let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
+    let proposals = input.proposals_with_granted(
+        Generalization::None,
+        &granted_paths_from(dir.path(), "{ this is not json"),
+    );
+
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].key, harness_policy::SettingsKey::FsRead);
+}
+
+/// 設定の相対パス指定でも、拒否パス（常に絶対）と突き合わせられる。
+/// 絶対化していなかった頃は、相対指定した穴が「覆っていない」と誤判定されていた。
+#[test]
+fn relative_settings_paths_are_resolved_against_the_workspace_root() {
+    let dir = workspace_with_one_denial(r#"{"fs":{"read":["vendor"]}}"#, "PLACEHOLDER");
+    // 拒否パスはworkspace_root配下の絶対パスとして書き直す。
+    let denied = dir
+        .path()
+        .join("vendor")
+        .join("lib.dll")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let session_dir = dir.path().join(".harness").join("sandbox").join("session-x");
+    std::fs::write(
+        session_dir.join("fs-audit.jsonl"),
+        format!(
+            r#"{{"kind":"etw","path":"{denied}","access":"read","allowed":false,"reason":"denied","timestamp_unix_ms":1}}{}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
+    let proposals =
+        input.proposals_with_granted(Generalization::None, &granted_paths_from(dir.path(), ""));
+
+    assert!(
+        proposals
+            .iter()
+            .all(|p| p.key != harness_policy::SettingsKey::FsRead),
+        "the relative grant 'vendor' covers the denial, so fs.read must have escalated: \
+         {proposals:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W5: 提案の幅ガードがCLI経路で効くこと（D-47）
+// ---------------------------------------------------------------------------
+
+/// 祖先チェーンの拒否（`cmd`が祖先をオープンするために出る）から作った提案一式。
+fn ancestor_chain_proposals() -> Vec<harness_policy::RuleProposal> {
+    harness_policy::generalize::generalize(
+        &[
+            harness_policy::DeniedCandidate::fs(
+                Source::Etw,
+                "C:/",
+                harness_config::FsAccess::Read,
+                "STATUS_ACCESS_DENIED",
+                1,
+                0,
+            ),
+            harness_policy::DeniedCandidate::fs(
+                Source::Etw,
+                "C:/Users/me/.cargo/registry",
+                harness_config::FsAccess::Read,
+                "STATUS_ACCESS_DENIED",
+                1,
+                0,
+            ),
+        ],
+        Generalization::None,
+    )
+}
+
+/// **D-47の本体。** ドライブルートの提案は`--yes`が付いていても書かれない。
+#[test]
+fn apply_refuses_a_proposal_that_would_open_the_whole_drive() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_path = dir.path().join(".harness").join("settings.json");
+    let proposals = ancestor_chain_proposals();
+    let drive_root = proposals
+        .iter()
+        .find(|p| p.value == "C:/")
+        .expect("the drive-root proposal exists");
+
+    let code = apply_accepted(
+        dir.path(),
+        &proposals,
+        std::slice::from_ref(&drive_root.id),
+        true,
+        harness_core::RequireSandbox::None,
+    );
+
+    assert_ne!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    assert!(!settings_path.exists(), "nothing was written");
+}
+
+/// 同じ一覧の中の正当な提案は通る（ガードが全部を巻き込んでいないこと）。
+#[test]
+fn apply_still_accepts_the_narrow_proposal_from_the_same_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let proposals = ancestor_chain_proposals();
+    let narrow = proposals
+        .iter()
+        .find(|p| p.value == "C:/Users/me/.cargo/registry")
+        .expect("the narrow proposal exists");
+
+    let code = apply_accepted(
+        dir.path(),
+        &proposals,
+        std::slice::from_ref(&narrow.id),
+        true,
+        harness_core::RequireSandbox::None,
+    );
+    assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+
+    let written: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(".harness").join("settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        written["fs"]["read"],
+        serde_json::json!(["C:/Users/me/.cargo/registry"])
+    );
+}
+
+/// **部分適用しない。** 広すぎるものを1件混ぜたら、同時に指定した正当な提案も書かれない。
+#[test]
+fn apply_writes_nothing_when_one_of_the_accepted_ids_is_too_broad() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_path = dir.path().join(".harness").join("settings.json");
+    let proposals = ancestor_chain_proposals();
+    let all_ids: Vec<String> = proposals.iter().map(|p| p.id.clone()).collect();
+
+    let code = apply_accepted(
+        dir.path(),
+        &proposals,
+        &all_ids,
+        true,
+        harness_core::RequireSandbox::None,
+    );
+
+    assert_ne!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    assert!(
+        !settings_path.exists(),
+        "a partial apply would leave the user with a configuration they never reviewed as a whole"
+    );
+}
+
+/// `suggest`の一覧からは**消さない**。印と理由を付けて必ず見せる（D-43）。
+#[test]
+fn suggest_shows_the_too_broad_proposal_with_a_mark_and_a_reason() {
+    let proposals = ancestor_chain_proposals();
+
+    let text = render_output(&proposals, &[], OutputFormat::Text);
+
+    assert!(text.contains("[too-broad]"), "{text}");
+    assert!(text.contains("drive root"), "{text}");
+    assert!(
+        text.contains("C:/Users/me/.cargo/registry"),
+        "the narrow proposal is still listed too: {text}"
+    );
+    assert!(
+        !text.contains("[too-broad] fs-2"),
+        "the narrow proposal must not be marked: {text}"
+    );
+}
+
+/// `audit`（生の候補一覧）はガードの影響を受けない——収集器が何を観測したかは常に見せる。
+#[test]
+fn audit_listing_is_untouched_by_the_breadth_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join(".harness").join("sandbox").join("session-x");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("fs-audit.jsonl"),
+        concat!(
+            r#"{"kind":"etw","path":"C:/","access":"read","allowed":false,"reason":"STATUS_ACCESS_DENIED","timestamp_unix_ms":1}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
+    let text = render_candidates(&input, OutputFormat::Text);
+
+    assert!(
+        text.contains("C:/"),
+        "the observation itself must stay visible: {text}"
+    );
 }
