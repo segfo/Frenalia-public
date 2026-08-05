@@ -1009,6 +1009,7 @@ fn change_row(path: &str) -> ChangeRow {
             op: harness_sandbox::ManifestOp::Create,
             path: path.to_string(),
             baseline_hash: None,
+            rejected: None,
         },
         diff: Vec::new(),
     }

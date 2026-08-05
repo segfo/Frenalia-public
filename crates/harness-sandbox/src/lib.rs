@@ -84,7 +84,7 @@ pub use read_scope::{ReadScope, ReadScopeError};
 pub use secret_env::{build_child_env, git_hardening_env};
 pub use shell_tier::{select_tier, FsAccess, FsPassthrough, TierError, WorkspaceWriteMode};
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use cap_std::fs::{Dir, File};
 use cap_std::time::SystemTime;
@@ -130,6 +130,12 @@ impl WorkspaceJail {
     /// jailを開いた`Dir`ハンドルからの相対`create_dir_all`（openat相当）で作る
     /// （§ツールシステム`write_file`「親ディレクトリ作成」）。
     pub fn write_string(&self, rel_path: &str, content: &str) -> Result<(), JailError> {
+        self.write_bytes(rel_path, content.as_bytes())
+    }
+
+    /// [`Self::write_string`]のバイト列版。CoWのapplyは任意のバイナリ（画像・実行ファイル等）を
+    /// upperからworkspaceへ移すため、`&str`では表せない（`write_string`はこれを呼ぶ）。
+    pub fn write_bytes(&self, rel_path: &str, content: &[u8]) -> Result<(), JailError> {
         use std::io::Write as _;
 
         let rel = check_relative_path(rel_path)?;
@@ -139,8 +145,44 @@ impl WorkspaceJail {
             }
         }
         let mut file = self.dir.create(&rel)?;
-        file.write_all(content.as_bytes())?;
+        file.write_all(content)?;
         Ok(())
+    }
+
+    /// ジェイル内のファイルをバイト列として読む（applyのbaseline照合・upper側実体の読み出し用。
+    /// テキストとは限らないので[`Self::read_to_string`]では代用できない）。
+    pub fn read_bytes(&self, rel_path: &str) -> Result<Vec<u8>, JailError> {
+        use std::io::Read as _;
+
+        let rel = check_relative_path(rel_path)?;
+        let mut file = self.dir.open(&rel)?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// ジェイル内にディレクトリを（親ごと）作る。
+    pub fn create_dir_all(&self, rel_path: &str) -> Result<(), JailError> {
+        let rel = check_relative_path(rel_path)?;
+        Ok(self.dir.create_dir_all(&rel)?)
+    }
+
+    /// ジェイル内の`rel_path`がディレクトリか。**形が不正なパスは`false`**
+    /// （呼び出し側は先に`check_relative_path`で弾いている前提。ここで`Result`を返しても
+    /// 判断材料が増えない）。
+    pub fn is_dir(&self, rel_path: &str) -> bool {
+        let Ok(rel) = check_relative_path(rel_path) else {
+            return false;
+        };
+        self.dir.metadata(&rel).map(|m| m.is_dir()).unwrap_or(false)
+    }
+
+    /// ジェイル内に`rel_path`が存在するか（[`Self::is_dir`]と同じく形が不正なら`false`）。
+    pub fn exists(&self, rel_path: &str) -> bool {
+        let Ok(rel) = check_relative_path(rel_path) else {
+            return false;
+        };
+        self.dir.metadata(&rel).is_ok()
     }
 
     /// jailルート配下の全ファイルを相対パスで列挙する（`grep`/`glob`用）。
@@ -249,69 +291,18 @@ impl WorkspaceJail {
 /// `run_shell`の`cwd`のように、子プロセスへ渡すだけでcap-std経由のopenをしない値
 /// （設計書「これらはrun_shell子プロセスには効かない＝子の実FSアクセスを止めるのは
 /// OS隔離Tierだけ」§ツールシステム fsジェイル）に対して、最低限の形の妥当性だけ確認する用途。
+///
+/// **判定の実体は[`harness_change_ledger::validate_relative_path`]が持つ**（本関数は
+/// エラー型を`JailError`へ写すだけの薄い層）。同じ判定が`SandboxFs::apply`——つまり
+/// **サンドボックス子が書ける操作台帳を信頼側が読む地点**——でも要るためで、
+/// 2箇所へ別々に書くと片方だけ古くなる（`docs/CODE-STRUCTURE-RULES.md`規則5、
+/// [BUG-062](../../docs/bugs/BUG-062.md)）。台帳クレート側に置くのは依存の向きの都合
+/// （あちらはRedirector DLLも参照するので`harness-sandbox`へ依存できない）。
 pub fn check_relative_path(path: &str) -> Result<PathBuf, JailError> {
-    let rel = Path::new(path);
-    if rel.is_absolute() {
-        return Err(JailError::Escape(path.to_string()));
-    }
-    if path.starts_with("\\\\") || path.starts_with("//") {
-        return Err(JailError::UnsafePath(format!(
-            "UNC path is not allowed: {path}"
-        )));
-    }
-    for c in rel.components() {
-        match c {
-            Component::ParentDir => {
-                return Err(JailError::Escape(path.to_string()));
-            }
-            Component::Normal(part) => {
-                let s = part.to_string_lossy();
-                if s.contains(':') {
-                    return Err(JailError::UnsafePath(format!(
-                        "alternate data stream syntax is not allowed: {s}"
-                    )));
-                }
-                if is_reserved_windows_name(&s) {
-                    return Err(JailError::UnsafePath(format!(
-                        "reserved device name is not allowed: {s}"
-                    )));
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(rel.to_path_buf())
-}
-
-/// Windowsの予約デバイス名（大小・拡張子を無視、`NUL.txt`も対象）。
-/// §ツールシステム fsジェイル「予約デバイス名basename（大小・拡張子無視）」。
-fn is_reserved_windows_name(name: &str) -> bool {
-    let base = name.split('.').next().unwrap_or(name);
-    matches!(
-        base.to_ascii_uppercase().as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    )
+    harness_change_ledger::validate_relative_path(path).map_err(|rejection| match rejection {
+        harness_change_ledger::PathRejection::Escape => JailError::Escape(path.to_string()),
+        harness_change_ledger::PathRejection::Unsafe(reason) => JailError::UnsafePath(reason),
+    })
 }
 
 #[cfg(test)]

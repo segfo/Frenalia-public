@@ -87,7 +87,7 @@ fn open_panel_fs(
 /// `/fsstage commit <file>`、`/fsstage commit_all`の3経路で共通のため関数化した。
 fn push_apply_report(app: &mut AppState, report: &harness_sandbox::ApplyReport) {
     app.transcript.push(app::TranscriptItem::Info(format!(
-        "applied {} change(s){}{}{}",
+        "applied {} change(s){}{}{}{}",
         report.applied.len(),
         if report.conflicts.is_empty() {
             String::new()
@@ -108,6 +108,18 @@ fn push_apply_report(app: &mut AppState, report: &harness_sandbox::ApplyReport) 
             format!(
                 ", {} config-injection change(s) blocked (D-05, cannot be applied)",
                 report.hard_denied.len()
+            )
+        },
+        // BUG-062: 台帳のパスの形が不正だったもの。`hard_denied`とは原因が違う
+        // （あちらは「書いてはいけない場所」、こちらは「台帳が改竄されたか壊れている」）
+        // ので、件数も別に見せる。
+        if report.rejected.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {} change(s) rejected as malformed ledger paths (the operations ledger may \
+                 have been tampered with, see docs/bugs/BUG-062.md)",
+                report.rejected.len()
             )
         }
     )));

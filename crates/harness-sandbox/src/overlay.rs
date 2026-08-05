@@ -97,6 +97,14 @@ pub struct ChangeEntry {
     pub op: ChangeOp,
     pub path: String,
     pub baseline_hash: Option<String>,
+    /// 台帳の`path`が相対パスとして受け付けられない場合の理由（[BUG-062](../../docs/bugs/BUG-062.md)）。
+    ///
+    /// `Some`のエントリを`apply`は必ず拒否する。**それでも一覧からは消さない**——見た目が
+    /// 普通の相対パスに見える値（`x/../.git/config`）を黙って隠すと、ユーザは「何も無かった」と
+    /// 解釈してしまう。理由を添えて見せるのは`harness policy suggest`の`[too-broad]`と同じ扱いで、
+    /// D-43「失敗を隠さない」に従う。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
 }
 
 pub struct ApplyOptions<'a> {
@@ -124,6 +132,12 @@ pub struct ApplyReport {
     /// コミットを、実行前ゲート（`permission.rs::classify()`）をバイパスされた場合でも
     /// apply時に再度塞ぐ（T-11対策）。
     pub hard_denied: Vec<String>,
+    /// 台帳の`path`が相対パスとして受け付けられない形だったため拒否したエントリと、その理由
+    /// （[BUG-062](../../docs/bugs/BUG-062.md)）。`hard_denied`と分けているのは**原因が違う**
+    /// ため——あちらは「形としては正しいパスだが書いてはいけない場所」、こちらは
+    /// 「パスの形そのものが不正＝台帳が改竄されたか壊れている」である。運用上の対処も違う
+    /// （前者はレビューして諦める、後者は台帳を疑う）。
+    pub rejected: Vec<(String, String)>,
 }
 
 /// 書込リダイレクト・read-through・操作台帳・tombstoneを仲介するオーバーレイFS。
@@ -201,10 +215,20 @@ impl SandboxFs {
         };
         Ok(store::replay_ledger(&overlay.dir)
             .into_iter()
-            .map(|c| ChangeEntry {
-                op: c.op,
-                path: c.path,
-                baseline_hash: c.baseline_hash,
+            .map(|c| {
+                // `_ext`（絶対パス）は`store::ext_key`が別途検証する経路なので、ここでの
+                // 相対パス判定にはかけない（かけると全件が「不正」になる）。
+                let rejected = if Path::new(&c.path).is_absolute() {
+                    store::ext_key(&c.path).err()
+                } else {
+                    ledger_path_rejection(&c.path).err()
+                };
+                ChangeEntry {
+                    op: c.op,
+                    path: c.path,
+                    baseline_hash: c.baseline_hash,
+                    rejected,
+                }
             })
             .collect())
     }
@@ -387,7 +411,7 @@ impl SandboxFs {
         let Some(overlay) = &self.overlay else {
             return Ok(ApplyReport::default());
         };
-        apply_overlay_changes(&overlay.dir, &self.workspace_root, opts)
+        apply_overlay_changes(&self.jail, overlay, opts)
     }
 
     /// オーバーレイ側の現在内容を読む（`resolve`の`mine`側材料）。
@@ -434,16 +458,25 @@ impl SandboxFs {
     }
 }
 
-/// `apply()`の実体。`overlay_dir`は`--staged`ならworkspace内、`--cow`ならworkspace外
-/// （いずれも絶対パス）。`--staged`/`--cow`で別々に実装していたロジック（旧
-/// `SandboxFs::apply`・`changes.rs::apply_cow_changes`）をここへ一本化した（Phase 2）。
+/// `apply()`の実体。`--staged`/`--cow`で別々に実装していたロジック（旧`SandboxFs::apply`・
+/// `changes.rs::apply_cow_changes`）をここへ一本化した（Phase 2）。
+///
+/// **workspace側・overlay側とも、必ず`WorkspaceJail`（cap-stdの`Dir`からの相対open＝
+/// openat相当）を経由する。** 生の`std::fs`とパス結合でこれを行っていたのが
+/// [BUG-062](../../docs/bugs/BUG-062.md)——操作台帳`.harness-cow-ops.jsonl`はupper_dir配下に
+/// あってサンドボックス子へ書込可能なので、`c.path`は**敵対者が任意に決められる文字列**である。
+/// 検証せずに`workspace_root.join(&c.path)`すると、`..`ひとつでworkspace外へユーザ権限で
+/// 書けてしまい、`is_config_injection_path`（前置詞一致）も`x/../.git/config`で素通りした。
+///
+/// jail経由にすることで、パスの形（`..`・UNC・ADS・予約デバイス名）と、reparse pointを
+/// 辿ってjail外へ出る経路（設計書§17）の両方が同じ1つの機構で閉じる。
 fn apply_overlay_changes(
-    overlay_dir: &Path,
-    workspace_root: &Path,
+    jail: &WorkspaceJail,
+    overlay: &OverlayBackend,
     opts: &ApplyOptions,
 ) -> Result<ApplyReport, SandboxError> {
     let mut report = ApplyReport::default();
-    let changes = store::replay_ledger(overlay_dir);
+    let changes = store::replay_ledger(&overlay.dir);
     let mut applied_paths: Vec<String> = Vec::new();
 
     for c in &changes {
@@ -462,72 +495,148 @@ fn apply_overlay_changes(
             report.ext_blocked.push(c.path.clone());
             continue;
         }
+
+        // 台帳の値が相対パスとして受け付けられる形かを、実FSへ触る前に確かめる。
+        // ここを通ってはじめて、後段の`is_config_injection_path`（正規化前の前置詞一致）が
+        // 「正規化済みの相対パスしか来ない」という前提を持てる（BUG-062の層2）。
+        if !is_ext {
+            if let Err(reason) = ledger_path_rejection(&c.path) {
+                report.rejected.push((c.path.clone(), reason));
+                continue;
+            }
+        }
         if harness_core::is_config_injection_path(&c.path) {
             report.hard_denied.push(c.path.clone());
             continue;
         }
 
-        let workspace_abs = workspace_root.join(&c.path);
-        let current_hash = std::fs::read(&workspace_abs)
-            .ok()
-            .map(|b| harness_change_ledger::hash_bytes(&b));
+        // baseline照合（サイレントなlost update / TOCTOU防止、§オーバーレイFS
+        // 「相違なら適用拒否→再レビュー要求」）。workspace側の読取もjail経由。
+        let current_hash = if is_ext {
+            std::fs::read(&c.path)
+                .ok()
+                .map(|b| harness_change_ledger::hash_bytes(&b))
+        } else {
+            jail.read_bytes(&c.path)
+                .ok()
+                .map(|b| harness_change_ledger::hash_bytes(&b))
+        };
         if current_hash != c.baseline_hash {
-            // baseline照合の相違（サイレントなlost update / TOCTOU防止）。
-            // §オーバーレイFS「相違なら適用拒否→再レビュー要求」。
             report.conflicts.push(c.path.clone());
             continue;
         }
 
-        let overlay_abs = if is_ext {
-            // `store::upper_path_for`は`overlay_dir.join(絶対パス)`となり`PathBuf::join`の
-            // 「絶対パスなら丸ごと置き換える」仕様で誤った場所を指してしまうため、
-            // `_ext/<key>`（`ext_key`）経由の実体パスを別途解決する。
-            let key = store::ext_key(&c.path).map_err(|e| {
-                SandboxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-            })?;
-            store::upper_ext_path_for(overlay_dir, &key)
+        let outcome = if is_ext {
+            apply_ext_entry(overlay, c)
         } else {
-            store::upper_path_for(overlay_dir, &c.path)
+            apply_workspace_entry(jail, overlay, c)
         };
-        let result: std::io::Result<()> = match c.op {
-            ChangeOp::Delete => {
-                if workspace_abs.exists() {
-                    std::fs::remove_file(&workspace_abs)
-                } else {
-                    Ok(())
-                }
+        match outcome {
+            Ok(()) => {
+                report.applied.push(c.path.clone());
+                applied_paths.push(c.path.clone());
             }
-            ChangeOp::Create | ChangeOp::Modify => {
-                if let Some(parent) = workspace_abs.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if overlay_abs.is_dir() {
-                    // ディレクトリ作成そのものの記録（例`mkdir sub`が台帳へCreateとして残る）。
-                    // 実体化するだけでよく、配下の個別ファイルエントリが引き続き同じ
-                    // overlay_dirを参照するため、ここではoverlay側を消さない。
-                    std::fs::create_dir_all(&workspace_abs)
-                } else {
-                    let copied = std::fs::copy(&overlay_abs, &workspace_abs).map(|_| ());
-                    if copied.is_ok() {
-                        // overlay側の実体を消しておかないと、Redirectorのcopy_upが
-                        // 「既にupperにある＝このセッションで一度触った」と誤認して、次の
-                        // 変更を台帳へ記録しなくなる（BUG-034）。ベストエフォート、失敗しても
-                        // commit自体は成功扱いにする。
-                        let _ = std::fs::remove_file(&overlay_abs);
-                    }
-                    copied
-                }
+            // ジェイルが拒んだ1件は、バッチ全体を止めずにそのエントリの結果として記録する。
+            // ここに来る代表例が**overlay内に仕込まれたreparse point**で、cap-stdは
+            // `PermissionDenied("a path led outside of the filesystem")`で拒む（実測）。
+            // 1件の細工で正当な変更のcommitまで巻き添えにすると、攻撃者に「applyを永久に
+            // 妨害する」手段を与えることになる（可用性側の劣化）。
+            //
+            // 他のI/Oエラー（`_ext`分岐の生の`std::fs`等）は従来どおり致命として伝播させる
+            // ——そちらは「この1件が悪い」という判断材料が無い。
+            Err(SandboxError::Jail(e)) => {
+                report.rejected.push((c.path.clone(), e.to_string()));
             }
-        };
-        result.map_err(SandboxError::Io)?;
-        report.applied.push(c.path.clone());
-        applied_paths.push(c.path.clone());
+            Err(other) => return Err(other),
+        }
     }
 
     if !applied_paths.is_empty() {
-        store::prune_ledger(overlay_dir, &applied_paths);
+        store::prune_ledger(&overlay.dir, &applied_paths);
     }
     Ok(report)
+}
+
+/// 台帳の相対パスが受け付けられない理由（`None`相当＝`Ok`なら受け付ける）。
+/// 判定の実体は`harness_change_ledger::validate_relative_path`が持つ（`check_relative_path`と
+/// 同じ関数。2箇所へ別々に書かない、`docs/CODE-STRUCTURE-RULES.md`規則5）。
+fn ledger_path_rejection(path: &str) -> Result<(), String> {
+    match harness_change_ledger::validate_relative_path(path) {
+        Ok(_) => Ok(()),
+        Err(harness_change_ledger::PathRejection::Escape) => {
+            Err("path escapes the workspace root".to_string())
+        }
+        Err(harness_change_ledger::PathRejection::Unsafe(reason)) => Err(reason),
+    }
+}
+
+/// workspace内エントリ1件の適用。読み書きとも`WorkspaceJail`（openat相当）に閉じる。
+fn apply_workspace_entry(
+    jail: &WorkspaceJail,
+    overlay: &OverlayBackend,
+    c: &harness_change_ledger::CowChange,
+) -> Result<(), SandboxError> {
+    match c.op {
+        ChangeOp::Delete => {
+            if jail.exists(&c.path) {
+                jail.remove_file(&c.path)?;
+            }
+            Ok(())
+        }
+        ChangeOp::Create | ChangeOp::Modify => {
+            if overlay.jail.is_dir(&c.path) {
+                // ディレクトリ作成そのものの記録（例`mkdir sub`が台帳へCreateとして残る）。
+                // 実体化するだけでよく、配下の個別ファイルエントリが引き続き同じ
+                // overlayを参照するため、ここではoverlay側を消さない。
+                jail.create_dir_all(&c.path)?;
+                return Ok(());
+            }
+            let content = overlay.jail.read_bytes(&c.path)?;
+            jail.write_bytes(&c.path, &content)?;
+            // overlay側の実体を消しておかないと、Redirectorのcopy_upが「既にupperにある＝
+            // このセッションで一度触った」と誤認して、次の変更を台帳へ記録しなくなる
+            // （BUG-034）。ベストエフォート、失敗してもcommit自体は成功扱いにする。
+            let _ = overlay.jail.remove_file(&c.path);
+            Ok(())
+        }
+    }
+}
+
+/// workspace外絶対パス（`_ext`、Phase 3）エントリ1件の適用。
+///
+/// **宛先が意図的にworkspaceの外**なので、ここだけはjailに閉じられない（`allow_ext`＝
+/// `--dangerously-allow`という別の門を通っている）。ただし**読取元はoverlayのjail経由**で、
+/// パスは`store::ext_key`（`..`とUNCを拒否する）が導く`_ext/<key>`だけに限る。
+fn apply_ext_entry(
+    overlay: &OverlayBackend,
+    c: &harness_change_ledger::CowChange,
+) -> Result<(), SandboxError> {
+    let key = store::ext_key(&c.path).map_err(|e| {
+        SandboxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    })?;
+    let rel = format!("_ext/{key}");
+    let target = Path::new(&c.path);
+    match c.op {
+        ChangeOp::Delete => {
+            if target.exists() {
+                std::fs::remove_file(target)?;
+            }
+            Ok(())
+        }
+        ChangeOp::Create | ChangeOp::Modify => {
+            if overlay.jail.is_dir(&rel) {
+                std::fs::create_dir_all(target)?;
+                return Ok(());
+            }
+            let content = overlay.jail.read_bytes(&rel)?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(target, &content)?;
+            let _ = overlay.jail.remove_file(&rel);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -843,6 +952,204 @@ mod tests {
             "changed-by-someone-else",
             "conflicting apply must not overwrite"
         );
+    }
+
+    /// BUG-062の再現用: 「サンドボックス子が`<upper>/.harness-cow-ops.jsonl`へ直接書いた」
+    /// 状況を作る。upper_dirはAppContainer子へ`grant_ace_inheritable_rw`で渡っているので
+    /// （`win_appcontainer/preflight.rs`）、台帳の内容はP-01上ハーネスが信用してよい入力ではない。
+    ///
+    /// workspace_rootを`<tempdir>/root`に置くのは、`..`による脱出先を**同じtempdir内**に
+    /// 収めるため（%TEMP%直下へ書き出すテストにしない）。
+    fn tampered_ledger_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+        let ws = tempfile::tempdir().unwrap();
+        let upper_tmp = tempfile::tempdir().unwrap();
+        let workspace_root = ws.path().join("root");
+        let upper_dir = upper_tmp.path().join("upper");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&upper_dir).unwrap();
+        (ws, upper_tmp, workspace_root, upper_dir)
+    }
+
+    /// **BUG-062 (a)**: 台帳の相対パスに`..`が入っていると、`apply`がworkspace_rootの外へ
+    /// ユーザ権限で書ける。`apply`はworkspaceの主ゲート（cap-stdの`WorkspaceJail`）を
+    /// 通らなければならない。
+    #[test]
+    fn apply_refuses_ledger_paths_that_escape_the_workspace_root() {
+        let (ws, upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
+        // 敵対者がupper側に置いた実体。`upper_dir.join("../escape.txt")`がこれを指す。
+        std::fs::write(upper_tmp.path().join("escape.txt"), "pwned").unwrap();
+        store::append_entry(&upper_dir, ChangeOp::Create, "../escape.txt", None);
+
+        let fs = SandboxFs::open_with_cow(
+            &workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(&upper_dir),
+        )
+        .unwrap();
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            })
+            .unwrap();
+
+        assert!(
+            report.applied.is_empty(),
+            "an escaping ledger path must never be applied: {report:?}"
+        );
+        assert!(
+            !ws.path().join("escape.txt").exists(),
+            "apply wrote outside the workspace root (BUG-062)"
+        );
+    }
+
+    /// **BUG-062 (b)**: D-09/P-08の層3 hard-denyは`is_config_injection_path`の前置詞一致で
+    /// 判定しているため、`x/../.git/config`のように**正規化前は別の前置詞に見える**値で
+    /// 素通りする。実FS上は`.git/config`へ着地するので、設定注入がapply経路から通る。
+    #[test]
+    fn apply_hard_deny_is_not_bypassable_by_a_parent_dir_segment() {
+        let (_ws, _upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
+        // `upper_dir.join("x/../.git/config")`＝`<upper>/.git/config`。
+        std::fs::create_dir_all(upper_dir.join(".git")).unwrap();
+        std::fs::write(
+            upper_dir.join(".git/config"),
+            "[core]\n\thooksPath = /tmp/evil\n",
+        )
+        .unwrap();
+        store::append_entry(&upper_dir, ChangeOp::Create, "x/../.git/config", None);
+
+        let fs = SandboxFs::open_with_cow(
+            &workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(&upper_dir),
+        )
+        .unwrap();
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            })
+            .unwrap();
+
+        assert!(
+            report.applied.is_empty(),
+            "a config-injection path must never be applied: {report:?}"
+        );
+        assert!(
+            !workspace_root.join(".git/config").exists(),
+            "apply wrote .git/config through a `..` segment (BUG-062, D-09 bypass)"
+        );
+    }
+
+    /// **BUG-062 (c) / 設計書§17（Reparse Point対策）**: upper側に置かれたjunctionを
+    /// `apply`が辿ってはいけない。辿ると、ユーザ権限で走る信頼側が**upperの外の任意の
+    /// ファイル**を読み、その内容をworkspace（＝サンドボックスから読める場所）へ落とす。
+    ///
+    /// junctionの作成には管理者権限もdeveloper modeも要らない（symlinkと違い
+    /// `SeCreateSymbolicLinkPrivilege`を必要としない）ので、**このテストは通常の
+    /// `cargo test`で走る**。
+    #[cfg(windows)]
+    #[test]
+    fn apply_does_not_follow_a_junction_planted_in_the_overlay() {
+        let (_ws, upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
+        let secret_dir = upper_tmp.path().join("secrets");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("id_rsa"), "TOP-SECRET-KEY").unwrap();
+
+        // upper_dir/link -> upper_tmp/secrets（upperの外）へのjunction。
+        let link = upper_dir.join("link");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &secret_dir.to_string_lossy(),
+            ])
+            .output()
+            .expect("run mklink");
+        if !status.status.success() {
+            // junctionが作れない環境ではこのテストは何も主張できない。黙って緑にせず、
+            // 作れなかったという事実を出して飛ばす（推測で「対策済み」と書かないため）。
+            eprintln!(
+                "skipping: mklink /J failed on this machine: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            return;
+        }
+        assert!(
+            link.join("id_rsa").exists(),
+            "the junction itself must resolve, otherwise this test proves nothing"
+        );
+
+        store::append_entry(&upper_dir, ChangeOp::Create, "link/id_rsa", None);
+
+        let fs = SandboxFs::open_with_cow(
+            &workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(&upper_dir),
+        )
+        .unwrap();
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+            })
+            .unwrap();
+
+        let landed = workspace_root.join("link/id_rsa");
+        assert!(
+            !landed.exists(),
+            "apply followed a junction out of the overlay and copied the secret into the \
+             workspace (BUG-062 / 設計書§17). report={report:?}"
+        );
+        assert!(
+            report.applied.is_empty(),
+            "the junction entry must not count as applied: {report:?}"
+        );
+        // 1件の細工でバッチ全体が落ちるのではなく、そのエントリの結果として記録される。
+        assert_eq!(
+            report.rejected.len(),
+            1,
+            "the junction entry must be reported, not silently dropped: {report:?}"
+        );
+        assert_eq!(report.rejected[0].0, "link/id_rsa");
+    }
+
+    /// W1-4: applyが拒否する形のエントリは、一覧（`harness changes`・TUI変更パネル）から
+    /// **消えてはいけない**。理由付きで見せる（D-43「失敗を隠さない」）。
+    #[test]
+    fn change_set_marks_malformed_paths_instead_of_hiding_them() {
+        let (_ws, _upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
+        store::append_entry(&upper_dir, ChangeOp::Create, "../escape.txt", None);
+        store::append_entry(&upper_dir, ChangeOp::Create, "ok.txt", None);
+
+        let fs = SandboxFs::open_with_cow(
+            &workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(&upper_dir),
+        )
+        .unwrap();
+        let changes = fs.change_set().unwrap();
+
+        assert_eq!(changes.len(), 2, "the entry must stay visible: {changes:?}");
+        let escaping = changes
+            .iter()
+            .find(|c| c.path == "../escape.txt")
+            .expect("escaping entry must still be listed");
+        assert!(
+            escaping.rejected.is_some(),
+            "the escaping entry must carry a reason"
+        );
+        let ok = changes.iter().find(|c| c.path == "ok.txt").unwrap();
+        assert!(ok.rejected.is_none(), "a normal path must not be flagged");
     }
 
     #[test]

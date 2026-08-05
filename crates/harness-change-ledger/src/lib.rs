@@ -11,7 +11,10 @@ use std::hash::Hasher;
 
 use serde::{Deserialize, Serialize};
 
+pub mod path_rules;
 pub mod store;
+
+pub use path_rules::{validate_relative_path, PathRejection};
 
 /// 台帳ファイル名。`<upper_dir>/.harness-cow-ops.jsonl`に置く
 /// （`.harness-cow-session.json`と同じ階層、命名も揃える）。

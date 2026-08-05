@@ -1785,3 +1785,128 @@ fn cow_containment_is_recursive_beyond_three_generations() {
 fn cow_containment_survives_env_block_sanitized_by_intermediate_generation() {
     run_containment_chains(&[&["x64", "x64", "x64"]], 30, true);
 }
+
+/// **BUG-062 / 設計書§17（Reparse Point対策）の実機測定＋受け入れ。**
+///
+/// 2つのことを1度に確かめます。
+///
+/// 1. **到達性の実測**: AppContainer子は、書込可能なCoW upper_dir内に junction（mount point）を
+///    作れるのか。junctionはsymlinkと違い`SeCreateSymbolicLinkPrivilege`を必要としないため、
+///    「作れて当然」と思いがちですが、AppContainerトークン下で実際にどうなるかは測らないと
+///    分かりません（`plans/etw-spike/RESULTS.md` §18.5の教訓——推測で結論を書かない）。
+///    結果は成否どちらでも標準出力へ残します。
+/// 2. **受け入れ**: 上の結果に**関わらず**、`apply`の後にworkspaceへ機密が現れないこと。
+///    junctionが作れなければ経路が成立していないという理由で、作れれば`apply`が
+///    cap-stdのジェイルで拒む（`PermissionDenied: a path led outside of the filesystem`）
+///    という理由で、いずれも同じ不変条件へ帰着します。
+///
+/// 非昇格側の対になるテストは`overlay::tests::apply_does_not_follow_a_junction_planted_in_the_overlay`
+/// （こちらはユーザ権限でjunctionを植えるので、サンドボックス子にできることの上位集合を試します）。
+#[test]
+#[ignore]
+fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_upper() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let upper = tempfile::tempdir().expect("upper tempdir");
+    // 「サンドボックスの外にある機密」の代役。upperの外・workspaceの外に置く。
+    let secret_root = tempfile::tempdir().expect("secret tempdir");
+    std::fs::write(secret_root.path().join("id_rsa"), "TOP-SECRET-KEY").expect("seed secret");
+
+    let sid = session_sid();
+    let write_mode = WorkspaceWriteMode::Cow {
+        upper_dir: upper.path().to_path_buf(),
+    };
+    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+    // 子はupper_dir配下へ直接junctionを張ろうとする（upper_dirはRWで付与済み、
+    // かつRedirector DLLの`classify`はupper_dir配下をリダイレクト対象外にしている）。
+    //
+    // **2つの標的で測るのは交絡を切り分けるため**（`plans/etw-spike/RESULTS.md` §18.5）。
+    // 「機密ディレクトリ宛のjunctionが作れなかった」だけでは、*junctionが作れない*のか
+    // *その標的が見えないだけ*なのかが区別できない。子が確実に読み書きできる標的
+    // （upper配下に自分で作ったディレクトリ）でも失敗するなら、原因は標的ではなく
+    // junction作成そのものだと確定する。
+    let probe = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         New-Item -ItemType Directory -Path '{reachable}' -Force | Out-Null; \
+         try {{ \
+             New-Item -ItemType Junction -Path '{link_reachable}' -Target '{reachable}' | Out-Null; \
+             Write-Output 'reachable-target: created' \
+         }} catch {{ \
+             Write-Output ('reachable-target: failed: ' + $_.Exception.Message) \
+         }} \
+         try {{ \
+             New-Item -ItemType Junction -Path '{link_secret}' -Target '{secret}' | Out-Null; \
+             Write-Output 'secret-target: created'; \
+             exit 0 \
+         }} catch {{ \
+             Write-Output ('secret-target: failed: ' + $_.Exception.Message); \
+             exit 7 \
+         }}",
+        reachable = upper.path().join("inside").display(),
+        link_reachable = upper.path().join("link-inside").display(),
+        link_secret = upper.path().join("link").display(),
+        secret = secret_root.path().display()
+    );
+
+    let (shell, _) = resolve_shell();
+    let env = crate::secret_env::build_child_env();
+    let child = spawn(
+        &shell,
+        &["-NoProfile", "-NonInteractive", "-Command", &probe],
+        workspace.path(),
+        &env,
+        false,
+        sid.as_psid(),
+        NetworkCapability::Deny,
+        Some(CowInject {
+            workspace_root: workspace.path(),
+            upper_dir: upper.path(),
+            ext_capture_roots: &[],
+        }),
+    )
+    .expect("spawn with cow injection should succeed");
+    let (stdout, stderr, code) = child
+        .write_stdin_read_output_and_wait(None)
+        .expect("child should run to completion");
+
+    // 到達性の実測結果は成否どちらでも残す（これがこのテストの測定としての産物）。
+    println!(
+        "MEASUREMENT: AppContainer child planting a junction in the CoW upper dir -> \
+         exit={code} stdout={} stderr={}",
+        stdout.trim(),
+        stderr.trim()
+    );
+    let junction_created = code == 0 && upper.path().join("link").join("id_rsa").exists();
+
+    // 台帳へ「junction越しのパス」を1件積む。junctionが作れていれば、素の`std::fs::copy`は
+    // これを辿ってworkspaceへ機密を落とす（＝BUG-062以前の挙動）。
+    harness_change_ledger::store::append_entry(
+        upper.path(),
+        ManifestOp::Create,
+        "link/id_rsa",
+        None,
+    );
+
+    let report = apply_cow(
+        upper.path(),
+        workspace.path(),
+        &ApplyOptions {
+            only_glob: None,
+            only_paths: None,
+            allow_ext: false,
+        },
+    )
+    .expect("apply must not fail the whole batch because of one crafted entry");
+
+    let landed = workspace.path().join("link").join("id_rsa");
+    assert!(
+        !landed.exists(),
+        "apply followed a junction out of the CoW upper dir and copied the secret into the \
+         workspace (junction_created={junction_created}, report={report:?})"
+    );
+    assert!(
+        report.applied.is_empty(),
+        "the junction entry must never be applied (junction_created={junction_created}, \
+         report={report:?})"
+    );
+}

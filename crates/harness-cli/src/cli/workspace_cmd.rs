@@ -25,6 +25,8 @@ struct ApplyReportJson {
     conflicts: Vec<String>,
     ext_blocked: Vec<String>,
     hard_denied: Vec<String>,
+    /// 台帳のパスの形が不正だったため拒否したエントリ（BUG-062）。`(path, reason)`。
+    rejected: Vec<(String, String)>,
 }
 
 /// `harness prompt`: 現在のフラグ・`.harness/settings.json`構成から実際に組み立てられる
@@ -258,11 +260,21 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                         println!("(no changes)");
                     }
                     for c in &changes {
-                        println!(
-                            "{:<7} {}",
-                            format!("{:?}", c.op).to_lowercase(),
-                            c.path
-                        );
+                        // BUG-062: applyが拒否する形のパスは、一覧からは消さずに印と理由を
+                        // 添えて見せる（D-43「失敗を隠さない」。黙って隠すと、ユーザは
+                        // 「何も無かった」と解釈してしまう）。
+                        match &c.rejected {
+                            None => println!(
+                                "{:<7} {}",
+                                format!("{:?}", c.op).to_lowercase(),
+                                c.path
+                            ),
+                            Some(reason) => println!(
+                                "{:<7} {} [rejected: {reason}]",
+                                format!("{:?}", c.op).to_lowercase(),
+                                c.path
+                            ),
+                        }
                     }
                     // Phase 4（設計書§19.8）: CoWセッションなら拒否監査ログの件数もフッタに
                     // 出す（`--cow`の書込境界自体はACLが保証しているので、これは可視性のみ）。
@@ -300,7 +312,8 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
             // 非ゼロ終了コードに含める（D-05: 設定注入パスは絶対に解除しない）。
             let has_conflicts_or_blocked = !report.conflicts.is_empty()
                 || !report.ext_blocked.is_empty()
-                || !report.hard_denied.is_empty();
+                || !report.hard_denied.is_empty()
+                || !report.rejected.is_empty();
             match output_format_and_kind.unwrap_or_default() {
                 OutputFormat::Json => {
                     let json = ApplyReportJson {
@@ -308,6 +321,7 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                         conflicts: report.conflicts,
                         ext_blocked: report.ext_blocked,
                         hard_denied: report.hard_denied,
+                        rejected: report.rejected,
                     };
                     if let Ok(s) = serde_json::to_string(&json) {
                         println!("{s}");
@@ -325,6 +339,12 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                     }
                     for p in &report.hard_denied {
                         println!("hard-denied (config-injection path, D-05): {p}");
+                    }
+                    for (p, reason) in &report.rejected {
+                        println!(
+                            "rejected (malformed ledger path -- the operations ledger may have \
+                             been tampered with, see docs/bugs/BUG-062.md): {p} -- {reason}"
+                        );
                     }
                 }
             }
