@@ -88,6 +88,17 @@ impl CognitiveOrchestrator {
         self
     }
 
+    /// フェーズ予算を差し替える（§6.6 規則1のクランプ用）。
+    ///
+    /// [`Self::new`]と別にしてあるのは**解決の順序**による——`new`は「実装されていない
+    /// 認知段階を起動時に弾く」ためにプロバイダ構築より前で呼ぶ必要があり、一方で
+    /// 実コンテキスト窓はプロバイダcapabilityが要る。先に段階を弾き、窓が分かってから
+    /// 予算を詰め直す、という2段になる。
+    pub fn with_budgets(mut self, budgets: PhaseBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+
     /// 生出力の退避先を`<workspace_root>/.harness/cognition/<session-id>/`にする（§5）。
     /// 会話履歴と同じIDを使うことで、M20の`--resume`が両方を同じ鍵で復元できる。
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
@@ -211,6 +222,9 @@ impl CognitiveOrchestrator {
             caps: provider.capabilities(),
             events,
             cancel,
+            // 縮約ポリシーが解決済みの実コンテキスト窓（§6.6）。素朴ループが使用率判定の
+            // 分母に使うのと同じ値で、認知層では「1コールが収まるか」の判定に使う。
+            context_window: config.compaction.context_window,
         };
         let outcome = engine.run_goal(&goal, &cx).await;
 

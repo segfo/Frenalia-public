@@ -55,6 +55,24 @@ pub struct AssembledCall {
     /// `harness_engine::estimate_tokens`による入力トークン概算（TUI表示と同じ推定器）。
     /// 予算超過の判定は呼び出し側が`budget.max_in`と比べて行う。
     pub estimated_input_tokens: u64,
+    /// この組み立てに使った予算（縮小再試行では既定表より小さい、§6.6 規則3）。
+    pub budget: TokenBudget,
+}
+
+impl AssembledCall {
+    /// 入力概算が**フェーズ予算**に収まっているか。超過するのは固定費（システムプロンプト＋
+    /// ツールspec）だけで予算を食い切る構成のときで、§6.6 規則5により**送ってよい**
+    /// （コスト方針の逸脱であって整合性の破れではない）。
+    pub fn within_budget(&self) -> bool {
+        self.estimated_input_tokens <= u64::from(self.budget.max_in)
+    }
+
+    /// 入力概算＋出力枠が**実コンテキスト窓**に収まっているか（§6.6 規則2の送信前ゲート）。
+    /// こちらが偽なら送ってはいけない——400になるか、ローカル推論サーバでは黙って
+    /// 古いトークンを捨てられて*静かに間違った答え*が返る。
+    pub fn fits_context_window(&self, context_window: u32) -> bool {
+        self.estimated_input_tokens + u64::from(self.budget.max_out) <= u64::from(context_window)
+    }
 }
 
 /// 何を組むか。
@@ -113,6 +131,25 @@ impl ContextAssembler {
         tools: &ToolRegistry,
         caps: &ProviderCapabilities,
     ) -> AssembledCall {
+        self.build_with_budget(phase, input, mem, ctx, tools, caps, self.budgets.get(phase))
+    }
+
+    /// [`Self::build`]の予算を差し替えた版（§6.6 規則3、コンテキスト超過からの縮小再試行）。
+    ///
+    /// 予算を小さくすると組立の縮約段（下記`assemble`）がより深く効く。**フェーズ仕様
+    /// （ビュー・ツール候補・スキーマ）は変えない**——変えるとやり直しが別のコールになり、
+    /// 何を測っているのか分からなくなるため。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_with_budget(
+        &self,
+        phase: Phase,
+        input: PhaseInput<'_>,
+        mem: &WorkingMemory,
+        ctx: &ToolCtx,
+        tools: &ToolRegistry,
+        caps: &ProviderCapabilities,
+        budget: TokenBudget,
+    ) -> AssembledCall {
         let selection = spec(phase, input.target, input.goal).tools;
         let tool_specs = select_tools(tools, ctx, selection);
         // カタログを見せるのはInvestigateだけ（§4.2「Investigateフェーズの入力に使える情報源の
@@ -121,7 +158,7 @@ impl ContextAssembler {
         let catalog = (phase == Phase::Investigate)
             .then(|| self.catalog.render_for_investigate(tools))
             .filter(|s| !s.is_empty());
-        self.assemble(phase, input, mem, ctx, tool_specs, catalog, caps)
+        self.assemble(phase, input, mem, ctx, tool_specs, catalog, caps, budget)
     }
 
     /// ツールを一切渡さず、スキーマだけを要求するコールを組む（必ず[`CallKind::SchemaOnly`]）。
@@ -138,8 +175,21 @@ impl ContextAssembler {
         ctx: &ToolCtx,
         caps: &ProviderCapabilities,
     ) -> AssembledCall {
+        self.build_conclusion_with_budget(phase, input, mem, ctx, caps, self.budgets.get(phase))
+    }
+
+    /// [`Self::build_conclusion`]の予算を差し替えた版（§6.6 規則3）。
+    pub(crate) fn build_conclusion_with_budget(
+        &self,
+        phase: Phase,
+        input: PhaseInput<'_>,
+        mem: &WorkingMemory,
+        ctx: &ToolCtx,
+        caps: &ProviderCapabilities,
+        budget: TokenBudget,
+    ) -> AssembledCall {
         // 結論コールにはツールが載らないので、情報源カタログも要らない（もう選ばない）。
-        self.assemble(phase, input, mem, ctx, Vec::new(), None, caps)
+        self.assemble(phase, input, mem, ctx, Vec::new(), None, caps, budget)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -152,8 +202,8 @@ impl ContextAssembler {
         tool_specs: Vec<ToolSpec>,
         catalog: Option<String>,
         caps: &ProviderCapabilities,
+        budget: TokenBudget,
     ) -> AssembledCall {
-        let budget = self.budgets.get(phase);
         let spec = spec(phase, input.target, input.goal);
         let kind = call_kind(spec.wants_schema, !tool_specs.is_empty(), caps);
 
@@ -172,7 +222,7 @@ impl ContextAssembler {
             body.slice = mem.render(spec.view, reduction);
             let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
             if harness_engine::estimate_tokens(&req) <= u64::from(budget.max_in) {
-                return finish(req, kind);
+                return finish(req, kind, budget);
             }
         }
 
@@ -182,7 +232,7 @@ impl ContextAssembler {
         if body.catalog.take().is_some() {
             let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
             if harness_engine::estimate_tokens(&req) <= u64::from(budget.max_in) {
-                return finish(req, kind);
+                return finish(req, kind, budget);
             }
         }
 
@@ -195,7 +245,7 @@ impl ContextAssembler {
             steps += 1;
             let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
             if harness_engine::estimate_tokens(&req) <= u64::from(budget.max_in) {
-                return finish(req, kind);
+                return finish(req, kind, budget);
             }
         }
 
@@ -206,14 +256,14 @@ impl ContextAssembler {
             steps += 1;
             let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
             if harness_engine::estimate_tokens(&req) <= u64::from(budget.max_in) {
-                return finish(req, kind);
+                return finish(req, kind, budget);
             }
         }
 
         // ここまで来たら固定費（システムプロンプト + ツールspec）が予算を超えている。
         // 削れるものが無いので、そのまま返して超過を`estimated_input_tokens`で見せる。
         let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
-        finish(req, kind)
+        finish(req, kind, budget)
     }
 
     /// systemは「フェーズ役割」+「環境事実（ツールを渡すときだけ）」の最大2枚。
@@ -274,12 +324,13 @@ impl ContextAssembler {
     }
 }
 
-fn finish(req: CompletionRequest, kind: CallKind) -> AssembledCall {
+fn finish(req: CompletionRequest, kind: CallKind, budget: TokenBudget) -> AssembledCall {
     let estimated_input_tokens = harness_engine::estimate_tokens(&req);
     AssembledCall {
         req,
         kind,
         estimated_input_tokens,
+        budget,
     }
 }
 

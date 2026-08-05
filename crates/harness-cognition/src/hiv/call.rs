@@ -14,8 +14,14 @@
 //! [`ContextAssembler::build_conclusion`]（ツール無し・スキーマのみ）で行い、1回目の観測は
 //! `raw_output`として文章で運ぶ。これは【T7】のコール分割（`ToolsOnly`の結論コール）と
 //! 同じ経路なので、実装も1本で済む。
+//!
+//! **コンテキスト超過の縮小再試行（§6.6 規則3）はこの規則の例外ではない。** あちらは
+//! 「プロバイダ呼び出しがストリーム開始前に失敗した／そもそも送っていない」＝**ツールが
+//! 1つも実行されていない**状態からのやり直しなので、同じ`CallKind`で組み直してよい。
 
-use harness_core::{AgentEvent, Phase, ProviderCapabilities, ToolCtx, Usage};
+use harness_core::{
+    AgentEvent, Phase, ProviderCapabilities, ProviderError, TokenBudget, ToolCtx, Usage,
+};
 use harness_engine::{
     emit_event, CompletedToolCall, EventSink, Executor, RawTurn, RawTurnRequest, RawTurnResult,
 };
@@ -70,6 +76,21 @@ pub(crate) enum PhaseError {
         phase: Phase,
         kind: harness_core::DegenerateKind,
     },
+    /// 縮小の梯子（§6.6 規則3）を使い切ってなお、1コールが実コンテキスト窓に収まらない。
+    /// **fail-closed**でゴールを打ち切る。
+    ///
+    /// [`PhaseError::Provider`]と分けているのは、原因が「プロバイダが落ちた」ではなく
+    /// **こちらの構成（フェーズ予算と実`n_ctx`の組合せ）が成立していない**ことで、
+    /// ユーザーが`settings.json`の`cognition.budgets`／`compaction.context_window`で
+    /// 直せる種類の失敗だからである。メッセージもそこへ誘導する。
+    ContextOverflow {
+        phase: Phase,
+        /// 最後に組み立てたリクエストの入力概算。
+        estimated_input_tokens: u64,
+        /// そのとき確保しようとしていた出力枠。
+        max_out: u32,
+        context_window: u32,
+    },
     Provider(harness_core::ProviderError),
 }
 
@@ -83,7 +104,18 @@ pub(crate) struct PhaseRunner<'a> {
     pub cancel: Option<&'a CancellationToken>,
     pub assembler: &'a ContextAssembler,
     pub max_schema_retries: u32,
+    /// 判定に使う実コンテキスト窓（`AgentLoopConfig.compaction.context_window`＝
+    /// CLIの`--context-window`／`settings.json`の`compaction.context_window`／
+    /// プロバイダcapabilityの順で解決済みの値）。§6.6 規則2の分母。
+    pub context_window: u32,
 }
+
+/// 縮小再試行で`max_in`に掛ける分母（§6.6 規則3）。1段目は等倍＝この配列の前に置く。
+///
+/// 2段で止めるのは、`ContextAssembler`が予算内へ縮約する仕事を既にしており、ここで
+/// 効くのは「予算そのものが実態と合っていない」ケースだけだから。4分の1にしても入らない
+/// 構成は、刻みを増やしても入らない（固定費が支配的）。
+const BUDGET_SHRINK_DIVISORS: [u32; 2] = [2, 4];
 
 impl PhaseRunner<'_> {
     /// 1フェーズを最後まで進める。フェーズ内で発行するのは`PhaseChanged`1回と、
@@ -102,11 +134,19 @@ impl PhaseRunner<'_> {
         let mut calls = 0;
 
         // --- 1回目: フェーズ仕様通り（ツールが載ることがある） ---
-        let call = self
-            .assembler
-            .build(phase, input, mem, self.ctx, self.tools, &self.caps);
-        let schema_requested = call.kind != CallKind::ToolsOnly;
-        let raw = self.turn(phase, call, &mut usage, &mut calls).await?;
+        let (raw, kind) = self
+            .turn_within_window(
+                phase,
+                &|budget| {
+                    self.assembler.build_with_budget(
+                        phase, input, mem, self.ctx, self.tools, &self.caps, budget,
+                    )
+                },
+                &mut usage,
+                &mut calls,
+            )
+            .await?;
+        let schema_requested = kind != CallKind::ToolsOnly;
         let tool_calls = raw.tool_calls.clone();
 
         let mut reason = if schema_requested {
@@ -141,19 +181,29 @@ impl PhaseRunner<'_> {
         let mut failures = u32::from(reason.is_some());
         let mut attempts = 1;
         while failures <= self.max_schema_retries {
-            let call = self.assembler.build_conclusion(
-                phase,
-                PhaseInput {
-                    target: input.target,
-                    goal: input.goal,
-                    raw_output: observed.as_deref().or(input.raw_output),
-                    repair: reason.as_deref(),
-                },
-                mem,
-                self.ctx,
-                &self.caps,
-            );
-            let raw = self.turn(phase, call, &mut usage, &mut calls).await?;
+            let conclusion_input = PhaseInput {
+                target: input.target,
+                goal: input.goal,
+                raw_output: observed.as_deref().or(input.raw_output),
+                repair: reason.as_deref(),
+            };
+            let (raw, _) = self
+                .turn_within_window(
+                    phase,
+                    &|budget| {
+                        self.assembler.build_conclusion_with_budget(
+                            phase,
+                            conclusion_input,
+                            mem,
+                            self.ctx,
+                            &self.caps,
+                            budget,
+                        )
+                    },
+                    &mut usage,
+                    &mut calls,
+                )
+                .await?;
             attempts += 1;
             match parse_and_validate(&raw.text, validate) {
                 Ok(value) => {
@@ -175,6 +225,80 @@ impl PhaseRunner<'_> {
             phase,
             attempts,
             reason: reason.unwrap_or_else(|| "構造化出力を取得できなかった".to_string()),
+        })
+    }
+
+    /// 1コールを**実コンテキスト窓に収めて**投げる（`plans/DESIGN-COGNITION.md` §6.6）。
+    ///
+    /// ```text
+    /// 組立（等倍）→ 窓に収まるか? ──no──▶ max_inを1/2で組み直す ──▶ 1/4 ──▶ ContextOverflow
+    ///                    │yes
+    ///                    ▼
+    ///                  送信 ── ContextTooLong ──▶ 同じ梯子の次の段へ
+    /// ```
+    ///
+    /// 送らずに次段へ行く（規則2）のと、送って`ContextTooLong`が返る（規則3）のを**同じ梯子**に
+    /// 載せているのは、原因も対処も同一（このコールが窓に対して大きすぎる／縮めるしかない）
+    /// だからである。素朴ループ側の縮約（`plans/PLAN-COMPACTION.md`）と違って**会話履歴が無い**
+    /// ので、削る対象は台帳スライスと生出力＝`ContextAssembler`の縮約段しかない。
+    ///
+    /// `build`が返す`CallKind`は段によらず同じ（予算だけを差し替える）ので、
+    /// 呼び出し側へは最初に成立した段のものを返す。
+    ///
+    /// `build`に`Sync`が要るのは、この`Future`が`Send`でなければならないため
+    /// （TUIは`tokio::spawn`でエンジンを回す）。組立に使う参照はいずれも`Sync`なので制約は形式的。
+    async fn turn_within_window(
+        &self,
+        phase: Phase,
+        build: &(dyn Fn(TokenBudget) -> AssembledCall + Sync),
+        usage: &mut Usage,
+        calls: &mut usize,
+    ) -> Result<(RawTurn, CallKind), PhaseError> {
+        let base = self.assembler.budget(phase);
+        // 最後に組み立てた（＝一番小さい）コールの寸法。fail-closed時の説明に使う。
+        let mut last: Option<(u64, u32)> = None;
+
+        for divisor in std::iter::once(1).chain(BUDGET_SHRINK_DIVISORS) {
+            let budget = TokenBudget {
+                max_in: (base.max_in / divisor).max(crate::phase::MIN_CLAMPED_MAX_IN),
+                // `max_out`は縮めない。ここを削ると本文が出力枠を使い切って0文字になり、
+                // 縮退ガードの領分（§11）へ問題が移るだけで何も解決しない。
+                max_out: base.max_out,
+            };
+            let call = build(budget);
+            let kind = call.kind;
+            last = Some((call.estimated_input_tokens, call.budget.max_out));
+
+            if !call.fits_context_window(self.context_window) {
+                // 規則2: 送らない。ローカル推論サーバは超過を400で返さず黙って古いトークンを
+                // 捨てることがあり、送ると*静かに間違った答え*が返る。
+                record_overflow("skipped", phase, &call, self.context_window, divisor);
+                continue;
+            }
+            if !call.within_budget() {
+                // 規則5: フェーズ予算だけの超過（固定費が支配的）は送ってよい。
+                // 整合性ではなくコスト方針の逸脱なので、記録に留める。
+                record_overflow("over-budget", phase, &call, self.context_window, divisor);
+            }
+
+            match self.turn(phase, call, usage, calls).await {
+                Ok(raw) => return Ok((raw, kind)),
+                // 規則3: 推定が外れて実際に超過した。同じ梯子の次の段で組み直す。
+                // **ツールは1つも実行されていない**（`ContextTooLong`はストリーム開始前の
+                // 失敗で、`TurnExecutor`はストリーム完走後にしかツールを実行しない）ので、
+                // 同じ`CallKind`のまま組み直してよい。
+                Err(PhaseError::Provider(ProviderError::ContextTooLong)) => continue,
+                Err(other) => return Err(other),
+            }
+        }
+
+        // 規則4: 梯子を使い切った。素朴ループへ黙って降格させず、fail-closedで畳む。
+        let (estimated_input_tokens, max_out) = last.unwrap_or((0, base.max_out));
+        Err(PhaseError::ContextOverflow {
+            phase,
+            estimated_input_tokens,
+            max_out,
+            context_window: self.context_window,
         })
     }
 
@@ -220,6 +344,33 @@ impl PhaseRunner<'_> {
             }
         }
     }
+}
+
+/// 予算・窓の超過を`wire_log`へ残す（§6.6 規則5）。
+///
+/// 新しい`AgentEvent`の変種は足していない——出したいのは「送ったコールがどれくらいの寸法で、
+/// なぜ縮んだ／飛ばされたか」という**事後の診断**であって、フロントエンドが実時間で
+/// 表示すべきものではないため。同じ理由で縮退の破棄も`wire_log`へ落としている
+/// （`harness_engine::turn::TurnExecutor::report_discard`）。
+fn record_overflow(
+    outcome: &str,
+    phase: Phase,
+    call: &AssembledCall,
+    context_window: u32,
+    divisor: u32,
+) {
+    harness_core::wire_log::record(|| {
+        serde_json::json!({
+            "kind": "phase_call_oversized",
+            "outcome": outcome,
+            "phase": phase.to_string(),
+            "estimated_input_tokens": call.estimated_input_tokens,
+            "max_in": call.budget.max_in,
+            "max_out": call.budget.max_out,
+            "context_window": context_window,
+            "shrink_divisor": divisor,
+        })
+    });
 }
 
 fn parse_and_validate<T: DeserializeOwned>(
@@ -301,6 +452,7 @@ mod tests {
                 cancel: None,
                 assembler: &self.assembler,
                 max_schema_retries: 2,
+                context_window: 128_000,
             }
         }
     }
@@ -565,5 +717,122 @@ mod tests {
         assert!(out.value.is_none());
         assert_eq!(out.calls, 1);
         assert_eq!(out.tool_calls.len(), 1);
+    }
+
+    // --- §6.6 コンテキスト超過 -------------------------------------------------
+
+    /// 規則3: `ContextTooLong`は縮小して組み直す。**やり直しでもツールは載ったまま**——
+    /// この失敗はストリーム開始前なのでツールが1つも実行されておらず、
+    /// 「再実行ではツールを渡さない」（スキーマ修復の規則）とは前提が違う。
+    #[tokio::test]
+    async fn a_context_too_long_is_rebuilt_smaller_and_can_succeed() {
+        let h = Harness::new();
+        let exec = PhaseExecutor::new([(
+            Phase::Investigate,
+            vec![
+                Reply::ContextTooLong,
+                Reply::tool(
+                    "read_file",
+                    serde_json::json!({ "path": "a.rs" }),
+                    "content",
+                ),
+            ],
+        )]);
+
+        let out: PhaseValue<InvestigateOutput> = h
+            .runner(&exec, true)
+            .run(
+                Phase::Investigate,
+                PhaseInput::default(),
+                &h.mem,
+                Conclusion::Optional,
+                validate_investigate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.tool_calls.len(), 1);
+        // 超過で捨てたコールは数えない（縮退と同じ扱い＝進捗予算を食わない）。
+        assert_eq!(out.calls, 1);
+        let seen = exec.seen();
+        assert_eq!(seen.len(), 2, "1回目が超過、2回目が縮小後");
+        assert!(
+            !seen[1].req.tools.is_empty(),
+            "縮小してもフェーズ仕様（ツール候補）は変えない"
+        );
+        // `max_out`は縮めない（削ると本文が0文字になり縮退ガードの領分へ問題が移るだけ）。
+        assert_eq!(seen[0].req.max_tokens, seen[1].req.max_tokens);
+    }
+
+    /// 規則2: 窓に収まらないと分かっているコールは**送らない**。ローカル推論サーバは
+    /// 超過をエラーにせず黙って古いトークンを捨てることがあり、送ると静かに間違える。
+    /// 規則4: 梯子を使い切ったらfail-closed（`ContextOverflow`）。
+    #[tokio::test]
+    async fn a_call_that_cannot_fit_the_window_is_never_sent_and_fails_closed() {
+        let h = Harness::new();
+        let exec = PhaseExecutor::new([(Phase::Hypothesize, vec![good_hypothesis()])]);
+
+        let mut runner = h.runner(&exec, true);
+        // Hypothesizeの`max_out`（既定1,000）より狭い窓＝どの段でも収まらない。
+        runner.context_window = 900;
+
+        let err = runner
+            .run::<HypothesizeOutput>(
+                Phase::Hypothesize,
+                PhaseInput::default(),
+                &h.mem,
+                Conclusion::Required,
+                validate_hypothesize,
+            )
+            .await
+            .unwrap_err();
+
+        let PhaseError::ContextOverflow {
+            phase,
+            max_out,
+            context_window,
+            ..
+        } = err
+        else {
+            panic!("expected a context overflow, got {err:?}");
+        };
+        assert_eq!(phase, Phase::Hypothesize);
+        assert_eq!(max_out, 1_000);
+        assert_eq!(context_window, 900);
+        assert!(
+            exec.seen().is_empty(),
+            "収まらないと分かっているリクエストを1件も送ってはならない"
+        );
+    }
+
+    /// 規則3の梯子は有限（等倍・1/2・1/4の3段）で、使い切ったら止まる。
+    /// 超過が続く限り無限に再送し続けない（`max_phase_calls`と別の停止性）。
+    #[tokio::test]
+    async fn the_shrink_ladder_is_finite() {
+        let h = Harness::new();
+        // 最後の応答は繰り返されるので、常に`ContextTooLong`が返る。
+        let exec = PhaseExecutor::new([(Phase::Hypothesize, vec![Reply::ContextTooLong])]);
+
+        let err = h
+            .runner(&exec, true)
+            .run::<HypothesizeOutput>(
+                Phase::Hypothesize,
+                PhaseInput::default(),
+                &h.mem,
+                Conclusion::Required,
+                validate_hypothesize,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, PhaseError::ContextOverflow { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            exec.calls_to(Phase::Hypothesize),
+            3,
+            "等倍・1/2・1/4の3段で打ち切る"
+        );
     }
 }

@@ -102,10 +102,50 @@ pub fn spec(phase: Phase, target: Option<HypId>, goal: Option<GoalId>) -> PhaseS
     }
 }
 
+/// クランプ後もこれ以上は下げない`max_in`の下限。ここを割ると台帳スライスが
+/// [`crate::context`]の`MIN_BODY_CHARS`まで削られても収まらず、組み立てが必ず超過して返る。
+/// 縮小再試行（§6.6 規則3、[`crate::hiv::call`]）も同じ下限で止まる。
+pub(crate) const MIN_CLAMPED_MAX_IN: u32 = 512;
+
+/// クランプ後もこれ以上は下げない`max_out`の下限。構造化出力1件分が入らないと、
+/// どのフェーズもスキーマ検証に通らず`SchemaRejected`で必ず止まる。
+const MIN_CLAMPED_MAX_OUT: u32 = 256;
+
 /// フェーズ別トークン予算の表（§3.3「予算目安」列）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhaseBudgets {
     budgets: BTreeMap<Phase, TokenBudget>,
+}
+
+/// [`PhaseBudgets::clamped_to_window`]が実際に縮めた1フェーズ分の記述子
+/// （`plans/DESIGN-COGNITION.md` §6.6 規則1「黙って弱めない」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetClamp {
+    pub phase: Phase,
+    pub before: TokenBudget,
+    pub after: TokenBudget,
+    /// 下限まで削ってもコンテキスト窓に収まらなかった。この状態のフェーズは
+    /// 送信前ゲート（§6.6 規則2）で止まる可能性が高い。
+    pub still_too_large: bool,
+}
+
+impl std::fmt::Display for BudgetClamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: max_in {}→{}, max_out {}→{}{}",
+            self.phase,
+            self.before.max_in,
+            self.after.max_in,
+            self.before.max_out,
+            self.after.max_out,
+            if self.still_too_large {
+                "（下限まで削っても窓に収まらない）"
+            } else {
+                ""
+            }
+        )
+    }
 }
 
 impl Default for PhaseBudgets {
@@ -176,6 +216,52 @@ impl PhaseBudgets {
             self.budgets.insert(*phase, *budget);
         }
         self
+    }
+
+    /// 実コンテキスト窓に収まらないフェーズ予算を縮める（§6.6 規則1、予防）。
+    ///
+    /// 1コールは会話履歴を持たない独立した`max_in + max_out`なので、この和が窓を超える
+    /// 予算は**必ず**超過する。既定表（最大4,000+1,000）はクラウドモデルでは問題にならないが、
+    /// ローカル推論サーバの実`n_ctx`は4k–8kで、しかも推論を出すモデルでは
+    /// `cognition.budgets`の`max_out`を3,000–4,000へ引き上げる運用になる
+    /// （`docs/STATUS.md`認知レイヤー残課題#9）。この2つが噛み合うと起動直後から全コールが超過する。
+    ///
+    /// **`max_in`から先に削る**のは、`max_out`を削ると本文が出力枠を使い切って0文字になり、
+    /// 縮退ガードが毎コール発火して回復の梯子を登り切る（＝fail-closedで止まる）ためである。
+    /// 入力側は[`crate::context::ContextAssembler`]が段階的に縮約できるので、削っても
+    /// 「情報が減る」だけで壊れない。
+    ///
+    /// 戻り値の`Vec`は実際に縮めたフェーズだけ。空なら何も変えていない。
+    pub fn clamped_to_window(mut self, context_window: u32) -> (Self, Vec<BudgetClamp>) {
+        let mut clamps = Vec::new();
+        for phase in Phase::ALL {
+            let before = self.get(phase);
+            if u64::from(before.max_in) + u64::from(before.max_out) <= u64::from(context_window) {
+                continue;
+            }
+            // `max_out`を保ったまま`max_in`を下限まで削る。
+            let max_in = context_window
+                .saturating_sub(before.max_out)
+                .max(MIN_CLAMPED_MAX_IN);
+            // それでも収まらなければ`max_out`も下限まで削る。
+            let max_out = if u64::from(max_in) + u64::from(before.max_out)
+                > u64::from(context_window)
+            {
+                context_window.saturating_sub(max_in).max(MIN_CLAMPED_MAX_OUT)
+            } else {
+                before.max_out
+            };
+            let after = TokenBudget { max_in, max_out };
+            self.budgets.insert(phase, after);
+            clamps.push(BudgetClamp {
+                phase,
+                before,
+                after,
+                still_too_large: u64::from(after.max_in) + u64::from(after.max_out)
+                    > u64::from(context_window),
+            });
+        }
+        (self, clamps)
     }
 
     /// そのフェーズの予算。`Default`が全フェーズを埋めるので必ず値がある。
@@ -265,6 +351,78 @@ mod tests {
                 max_out: 500
             }
         );
+    }
+
+    /// §6.6 規則1: 収まる構成では1つも触らない（クラウド既定の200,000窓）。
+    #[test]
+    fn a_window_that_fits_leaves_every_budget_untouched() {
+        let before = PhaseBudgets::default();
+        let (after, clamps) = before.clone().clamped_to_window(200_000);
+        assert_eq!(after, before);
+        assert!(clamps.is_empty(), "{clamps:?}");
+    }
+
+    /// §6.6 規則1: 収まらないフェーズだけを、`max_in`から先に削る。
+    #[test]
+    fn a_narrow_window_shrinks_max_in_first_and_only_where_needed() {
+        // 4,096なら既定表のうちDistill/Verify（4,000+500）だけが超える。
+        let (after, clamps) = PhaseBudgets::default().clamped_to_window(4_096);
+        let touched: Vec<Phase> = clamps.iter().map(|c| c.phase).collect();
+        assert_eq!(touched, vec![Phase::Distill, Phase::Verify], "{clamps:?}");
+        for phase in [Phase::Distill, Phase::Verify] {
+            let b = after.get(phase);
+            // `max_out`は保たれ、`max_in`だけが窓に収まる値へ落ちる。
+            assert_eq!(b.max_out, 500, "{phase}");
+            assert_eq!(b.max_in, 4_096 - 500, "{phase}");
+        }
+        // 触られていないフェーズは既定のまま。
+        assert_eq!(
+            after.get(Phase::Hypothesize),
+            TokenBudget {
+                max_in: 3_000,
+                max_out: 1_000
+            }
+        );
+    }
+
+    /// §6.6 規則1: `max_in`の下限に当たったら`max_out`も削る。
+    /// 「推論を出すモデル向けに`max_out`を大きくしたまま、実`n_ctx`が小さい」構成がこれ。
+    #[test]
+    fn max_out_is_shrunk_only_after_max_in_hits_its_floor() {
+        let overrides = BTreeMap::from([(
+            Phase::Distill,
+            TokenBudget {
+                max_in: 4_000,
+                max_out: 3_500,
+            },
+        )]);
+        let (after, clamps) = PhaseBudgets::default()
+            .with_overrides(&overrides)
+            .clamped_to_window(2_048);
+        let b = after.get(Phase::Distill);
+        assert_eq!(b.max_in, MIN_CLAMPED_MAX_IN);
+        assert_eq!(b.max_out, 2_048 - MIN_CLAMPED_MAX_IN);
+        let clamp = clamps
+            .iter()
+            .find(|c| c.phase == Phase::Distill)
+            .expect("Distill was clamped");
+        assert_eq!(clamp.before.max_out, 3_500);
+        assert!(!clamp.still_too_large);
+    }
+
+    /// §6.6 規則1: 両方の下限を足しても入らない窓は、**黙って辻褄を合わせない**。
+    /// `still_too_large`を立てて、送信前ゲート（規則2）へ判断を渡す。
+    #[test]
+    fn a_window_smaller_than_both_floors_is_reported_as_still_too_large() {
+        let (after, clamps) = PhaseBudgets::default().clamped_to_window(600);
+        let b = after.get(Phase::Distill);
+        assert_eq!(b.max_in, MIN_CLAMPED_MAX_IN);
+        assert_eq!(b.max_out, MIN_CLAMPED_MAX_OUT);
+        assert!(clamps.iter().all(|c| c.still_too_large), "{clamps:?}");
+        // 記述子は前後の値を持つので、警告1行で何が起きたかを説明できる。
+        let text = clamps[0].to_string();
+        assert!(text.contains("max_in"), "{text}");
+        assert!(text.contains("窓に収まらない"), "{text}");
     }
 
     /// §7.3: Investigateはread-onlyしか候補に入れない（write/execを物理的に外す）。

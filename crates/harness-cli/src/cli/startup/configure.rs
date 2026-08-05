@@ -92,7 +92,7 @@ pub(super) fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode
     // `cognition.sources`は内蔵ツールの既定カタログへの上乗せ（M16、§4.2）。宣言の`trust`は
     // 既に`Settings::load`が【T5】の上限へクランプ済みなので、ここでは解釈するだけでよい。
     let source_catalog = build_source_catalog(&settings);
-    let cognition = match CognitiveOrchestrator::new(cognition_level, phase_budgets) {
+    let cognition = match CognitiveOrchestrator::new(cognition_level, phase_budgets.clone()) {
         Ok(c) => c.with_catalog(source_catalog),
         Err(e) => {
             eprintln!("error: {e}");
@@ -148,6 +148,28 @@ pub(super) fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode
             eprintln!("error: {e}");
             return Err(ExitCode::FAILURE);
         }
+    };
+
+    // 認知レイヤーのフェーズ予算を実コンテキスト窓へ詰め直す（`plans/DESIGN-COGNITION.md`
+    // §6.6 規則1）。1フェーズ＝会話履歴を持たない独立した`max_in + max_out`なので、この和が
+    // 窓を超える構成は起動直後から全コールが超過する。**縮めたことは黙っていない**——
+    // ユーザが`cognition.budgets`か`compaction.context_window`を直せる情報を出す。
+    let cognition = if cognition_level == CognitionLevel::Off {
+        // 素朴ループにフェーズ予算は関係しない（警告もノイズにしかならない）。
+        cognition
+    } else {
+        let (clamped, clamps) = phase_budgets.clamped_to_window(compaction.context_window);
+        if !clamps.is_empty() {
+            eprintln!(
+                "warning: cognition phase budgets do not fit the context window \
+                 ({} tokens); clamping:",
+                compaction.context_window
+            );
+            for clamp in &clamps {
+                eprintln!("  {clamp}");
+            }
+        }
+        cognition.with_budgets(clamped)
     };
 
     // 縮退ガード（`plans/DESIGN-COGNITION.md` §11）。統計はセッション全体を寿命とするので、

@@ -183,6 +183,16 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "tier2a_chain_launch",
         ],
     ),
+    // M16（認知レイヤー残課題#4）: 妥当性の経路を**本物のMCPサーバ**で通す。
+    // 事前に`cargo build -p harness-mcp --bin mcp-mock-server`が要る（テスト側が不在を検出して
+    // 手順付きで落とす）。`e2e-policy-learn`と**同時に走らせない**（docs/INDEX.mdの並列レーン注記）。
+    (
+        "e2e-mcp-corroboration",
+        &[
+            "test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture",
+            "tier2a_mcp_corroboration",
+        ],
+    ),
     // `dev-elevated-runner`自身は除外する。デーモン(`dev-elevated-runnerd.exe`)がこの
     // コマンドを実行している間、自分自身の実行ファイルは起動中でロックされておりリンクし
     // 直せない（実機で`error: failed to remove file ...dev-elevated-runnerd.exe: アクセスが

@@ -40,6 +40,10 @@ pub(crate) enum Reply {
     Discarded,
     /// プロバイダ呼び出し自体の失敗。
     Error,
+    /// プロバイダが「入力が長すぎる」と言って**ストリーム開始前に**失敗した
+    /// （`plans/DESIGN-COGNITION.md` §6.6 規則3）。この形の失敗ではツールは1つも
+    /// 実行されていないので、呼び出し側は同じフェーズを組み直して再送してよい。
+    ContextTooLong,
 }
 
 impl Reply {
@@ -159,6 +163,11 @@ impl Executor for PhaseExecutor {
                 return Err(EngineError::Call(ProviderError::Transport {
                     retriable: false,
                 }))
+            }
+            // `Call`（ストリーム開始前）であることが本質。`Stream`にすると
+            // 「途中まで届いた」意味になり、縮小再試行の前提が変わる。
+            Reply::ContextTooLong => {
+                return Err(EngineError::Call(ProviderError::ContextTooLong))
             }
         })
     }

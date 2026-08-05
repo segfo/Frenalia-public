@@ -111,6 +111,11 @@ pub struct HivContext<'a> {
     pub caps: ProviderCapabilities,
     pub events: Option<&'a EventSink>,
     pub cancel: Option<&'a CancellationToken>,
+    /// 1コールを収めるべき実コンテキスト窓（§6.6）。`caps.context_window`ではなく
+    /// **解決済みの値**（CLIの`--context-window`／`settings.json`の`compaction.context_window`／
+    /// capabilityの順）を受ける——ローカル推論サーバのcapabilityは128,000決め打ちで、
+    /// 実`n_ctx`（ロード設定）とは別物だから（`plans/PLAN-COMPACTION.md`）。
+    pub context_window: u32,
 }
 
 /// 内部の遷移状態。
@@ -220,6 +225,27 @@ impl HivEngine {
                     self.mem.add_open_question(text.clone(), true);
                     break HivStop::Blocked { reason: text };
                 }
+                // コンテキスト超過（§6.6 規則4）。縮小の梯子を使い切ってなお1コールが
+                // 窓に収まらない＝**設定の組合せが成立していない**ので、直し方を書いて畳む。
+                // 送れば通るかもしれない、で送らないのは、ローカル推論サーバが超過を
+                // エラーにせず黙って古いトークンを捨てる（＝静かに間違える）ためである。
+                Err(PhaseError::ContextOverflow {
+                    phase,
+                    estimated_input_tokens,
+                    max_out,
+                    context_window,
+                }) => {
+                    let text = format!(
+                        "{phase}フェーズの1コールがコンテキスト窓に収まらない（入力概算\
+                         {estimated_input_tokens} + 出力枠{max_out} > 窓{context_window}）。\
+                         settings.jsonの`cognition.budgets.{}`を小さくするか、\
+                         `compaction.context_window`（または--context-window）で実n_ctxを\
+                         正しく指定すること",
+                        phase.as_str()
+                    );
+                    self.mem.add_open_question(text.clone(), true);
+                    break HivStop::Blocked { reason: text };
+                }
                 Err(PhaseError::Provider(e)) => {
                     let reason = format!("プロバイダ呼び出しに失敗した: {e}");
                     provider_error = Some(e);
@@ -259,6 +285,7 @@ impl HivEngine {
             cancel: cx.cancel,
             assembler: &self.assembler,
             max_schema_retries: self.limits.max_schema_retries,
+            context_window: cx.context_window,
         }
     }
 
@@ -688,6 +715,15 @@ mod tests {
     }
 
     async fn run(exec: &PhaseExecutor, limits: HivLimits) -> (HivEngine, HivOutcome) {
+        // `caps()`と同じ広い窓。既定では§6.6の梯子を踏ませない。
+        run_with_window(exec, limits, caps().context_window).await
+    }
+
+    async fn run_with_window(
+        exec: &PhaseExecutor,
+        limits: HivLimits,
+        context_window: u32,
+    ) -> (HivEngine, HivOutcome) {
         let ctx = ToolCtx::new(std::path::PathBuf::from("C:/ws"));
         let tools = ToolRegistry::with_builtin_tools();
         let mut engine = engine(limits);
@@ -698,6 +734,7 @@ mod tests {
             caps: caps(),
             events: None,
             cancel: None,
+            context_window,
         };
         let outcome = engine.run_goal("run_shellが使うシェルを調べて", &cx).await;
         (engine, outcome)
@@ -1123,6 +1160,36 @@ mod tests {
         assert!(!outcome.answer.is_empty());
         // 未蒸留の生出力は証拠にしない（捨てたコールから何も学ばない）。
         assert!(mem.evidence().is_empty());
+    }
+
+    /// **§6.6 規則4**: 1コールが実コンテキスト窓に収まらないまま梯子を使い切ったら、
+    /// fail-closedでゴールを畳み、**直し方**を返す（設定の組合せが成立していないので、
+    /// ユーザが`cognition.budgets`／`compaction.context_window`で直せる）。
+    #[tokio::test]
+    async fn a_call_that_never_fits_the_window_blocks_the_goal_with_a_way_out() {
+        // どの応答も使われない——1コールも送らずに止まるのが正しい挙動。
+        let exec = PhaseExecutor::new([(Phase::Hypothesize, vec![hypothesize("X")])]);
+        let (engine, outcome) = run_with_window(&exec, HivLimits::default(), 900).await;
+
+        let HivStop::Blocked { reason } = &outcome.stop else {
+            panic!("expected fail-closed, got {:?}", outcome.stop);
+        };
+        assert!(reason.contains("コンテキスト窓"), "{reason}");
+        assert!(reason.contains("cognition.budgets"), "{reason}");
+        assert!(reason.contains("context_window"), "{reason}");
+        assert!(
+            outcome.provider_error.is_none(),
+            "プロバイダ障害ではなく構成の問題"
+        );
+        assert!(
+            exec.seen().is_empty(),
+            "収まらないと分かっているリクエストは送らない"
+        );
+
+        let mem = engine.memory();
+        assert_eq!(mem.goals()[0].status, GoalStatus::Blocked);
+        assert!(mem.open_questions()[0].blocking);
+        assert!(!outcome.answer.is_empty(), "何が起きたかは返す");
     }
 
     /// プロバイダ失敗はそのまま呼び出し側へ返す（素朴ループと同じ扱い）。
