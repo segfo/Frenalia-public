@@ -22,6 +22,22 @@ pub fn grant_traverse_drive_root(drive: &Path, sid: PSID) -> Result<(), AppConta
     )
 }
 
+/// [D-48] traverse ACEを1ノード撤収する**唯一の正規の扉**（`harness fs revoke-traverse <path>`本体）。
+///
+/// 主体（capability SID）を引数で受けずここで自ら導出するため、呼び出し側がSIDを取り違えようが
+/// ない（[BUG-061](../../../../docs/bugs/BUG-061.md)で実際に起きた事故の構造的な封じ込め）。
+/// 汎用の[`revoke_ace`]は台帳に載ったノードのcapability SID宛ACEを剥がすことを拒否するので
+/// （[BUG-046](../../../../docs/bugs/BUG-046.md)）、巻き戻したい経路は必ずここを通る。
+///
+/// **台帳エントリの除去はここでは行わない。** 昇格ヘルパー（`privhelper`）と本体では
+/// `%APPDATA%`が同じとは限らないため、台帳の書き込みは非昇格側の呼び出し元に寄せる既存の
+/// 分担をそのまま維持する。
+pub fn revoke_traverse_grant(path: &Path) -> Result<(), AppContainerError> {
+    let sid = traverse_capability_sid()?;
+    revoke_ace_unguarded(path, sid.as_psid())?;
+    assert_no_sid_ace(path, sid.as_psid())
+}
+
 /// `target`とその全祖先（ドライブルートまで）へ、`sid`の`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を
 /// 単一・非継承で付与する（D10連鎖化、`TIER1A-OPEN-ISSUES.md`項目6「多階層祖先traverse ACE不足」の
 /// 解消）。`C:\Users\<user>\.cargo`のようにドライブルート直下でないパスをpassthroughする場合、

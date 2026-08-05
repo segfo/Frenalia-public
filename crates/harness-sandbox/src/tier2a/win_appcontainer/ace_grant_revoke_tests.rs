@@ -14,6 +14,7 @@
 //! `parity_production_probe_matches_diagnostic_probe`が突き合わせる
 //! （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3）。
 
+use super::test_support::{SubstDrive, TestDirGuard};
 use super::*;
 
 const PROBE_COMMAND: &str = "\
@@ -301,11 +302,9 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
     let traverse_sid = traverse_capability_sid().expect("traverse capability SID");
 
     // workspace（FS I/Oのgate）とpassthrough対象（中立な外部ルート）は別ディレクトリにする。
-    let workspace = std::path::PathBuf::from(format!(
-        "C:\\harness-Tier2a-verify-passthrough-ws-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&workspace).expect("create workspace");
+    // [BUG-046 修正4] 後始末はRAII。assertが落ちてもマシンに残さない。
+    let workspace_guard = TestDirGuard::create("passthrough-ws");
+    let workspace = workspace_guard.path().to_path_buf();
     grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on workspace");
     let probe_dir = workspace
         .join(".harness")
@@ -318,7 +317,6 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
              failed on this machine ({e:?}); run `harness fs grant-traverse C:\\` as \
              administrator first (D10)"
         );
-        let _ = std::fs::remove_dir_all(&workspace);
         return;
     }
 
@@ -327,11 +325,8 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
     // 別種の未解決問題になり得ることが実機検証で判明した（読取は成功するがrw書込がAccess
     // Deniedになる、`diagnose_unreachable_passthrough`のD9 fallback「cause unknown」経路が
     // 正しく効いた）。M12追記8が検証した「ドライブルート直下1階層」の条件に揃える。
-    let external = std::path::PathBuf::from(format!(
-        "C:\\harness-Tier2a-verify-passthrough-ext-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&external).expect("create neutral external dir");
+    let external_guard = TestDirGuard::create("passthrough-ext");
+    let external = external_guard.path().to_path_buf();
     std::fs::write(external.join("existing.txt"), "pre-existing").expect("seed existing file");
 
     // 1. read-only付与 -> 読取成功・書込拒否。
@@ -392,9 +387,6 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         remaining.is_ok(),
         "sandbox SID ACE must be fully removed after revoke_ace_recursive: {remaining:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&workspace);
-    let _ = std::fs::remove_dir_all(&external);
 }
 
 /// `grant_traverse_drive_root`/`revoke_ace`/`assert_no_sid_ace`（いずれも非再帰・単一ノード）の
@@ -495,6 +487,93 @@ fn grant_traverse_chain_orders_ancestors_shallow_to_deep() {
     );
 }
 
+/// [BUG-046 修正3] traverse機構そのものを、**ACEが無いドライブルートから**検証する。
+///
+/// **なぜ必要だったか**: `grant_ace_mask`には冪等スキップ（要求マスクが既存ACEの部分集合なら
+/// `SetKernelObjectSecurity`を呼ばずに`Ok`を返す）がある。`C:\`には既に永続traverse ACEが
+/// 載っているので、`C:\`起点のテストは**付与APIを一度も呼ばないまま緑になる**——
+/// 「テストが緑」が「テストが何かを検証した」を意味しない状態だった。だから前提の
+/// **(1)剥奪されていることの確認**が要る。
+///
+/// **なぜ`subst`の仮想ドライブか**: 検証には「まだ誰もACEを付けていないドライブルート」が要る。
+/// `C:\`実体で剥奪→再付与を試すと、その間にテストが落ちた瞬間にマシン全体のTier2a FS I/Oが
+/// 壊れる（[BUG-046](../../../../docs/bugs/BUG-046.md)そのもの、[BUG-012](../../../../docs/bugs/BUG-012.md)と同型）。
+/// `subst`のルートはテスト所有のディレクトリなので**所有者権限だけで`WRITE_DAC`が通り、
+/// 管理者権限も要らない**。
+///
+/// 主体は本番と同じ**capability SID**（D-37）。台帳へは記録しないので、D-48のガード
+/// （台帳に載ったノードのcapability SID ACEを`revoke_ace`から守る）は発火しない。
+#[test]
+#[ignore]
+fn traverse_chain_grants_every_ancestor_on_a_test_owned_drive_root() {
+    let sid = traverse_capability_sid().expect("derive traverse capability SID");
+    let Some(drive) = SubstDrive::create() else {
+        eprintln!(
+            "skipping traverse_chain_grants_every_ancestor_on_a_test_owned_drive_root: \
+             no free drive letter for subst on this machine"
+        );
+        return;
+    };
+    let root = drive.root();
+    let nested = root.join("a").join("b").join("c");
+    std::fs::create_dir_all(&nested).expect("create nested dirs on the substituted drive");
+    let sibling = root.join("sibling");
+    std::fs::create_dir_all(&sibling).expect("create sibling dir");
+
+    // (1) 前提の保証: 対象チェーンのどのノードにもcapability SIDのACEが**無い**こと。
+    // これが成り立って初めて、次の付与が冪等スキップされず実際にWin32を叩くと言える。
+    let chain: Vec<std::path::PathBuf> = {
+        let mut c: Vec<std::path::PathBuf> = nested.ancestors().map(|p| p.to_path_buf()).collect();
+        c.reverse();
+        c
+    };
+    for node in &chain {
+        assert_eq!(
+            sid_ace_mask(node, sid.as_psid()).expect("read the pre-grant mask"),
+            None,
+            "precondition failed: {} already carries a capability-SID ACE, so grant_ace_mask \
+             would take its idempotent-skip path and this test would verify nothing",
+            node.display()
+        );
+    }
+
+    // (2) 付与。
+    let (granted, result) = grant_traverse_chain(&nested, sid.as_psid());
+    result.expect("grant_traverse_chain on a test-owned drive root");
+    assert_eq!(
+        granted, chain,
+        "grant_traverse_chain must report exactly the drive root and every intermediate node, \
+         shallow to deep"
+    );
+
+    // (3) 想定した全ノードへ、**厳密に**要求したマスクだけが載っていること。
+    for node in &granted {
+        assert_eq!(
+            sid_ace_mask(node, sid.as_psid()).expect("read the post-grant mask"),
+            Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0),
+            "node {} must carry exactly FILE_TRAVERSE | FILE_READ_ATTRIBUTES",
+            node.display()
+        );
+    }
+
+    // (4) 想定外のノードには載っていないこと（チェーン外へ漏れていない）。
+    assert_eq!(
+        sid_ace_mask(&sibling, sid.as_psid()).expect("read the sibling mask"),
+        None,
+        "{} is not on the ancestor chain and must not have been granted",
+        sibling.display()
+    );
+
+    // 巻き戻し（このツリーは台帳に無いのでD-48のガードは発火しない）。
+    for node in granted.iter().rev() {
+        revoke_ace(node, sid.as_psid())
+            .unwrap_or_else(|e| panic!("revoke_ace on {}: {e}", node.display()));
+        assert_no_sid_ace(node, sid.as_psid())
+            .unwrap_or_else(|e| panic!("ACE still present on {} after revoke: {e}", node.display()));
+    }
+    // `drive`のDropが`subst /D`と実体の削除を行う（panic時も同じ）。
+}
+
 /// `grant_traverse_chain`が多階層のネストしたディレクトリ全てへ個別にACEを付与し、
 /// `revoke_ace`で1件ずつ巻き戻せることを確認する（`TIER1A-OPEN-ISSUES.md`項目6
 /// 「多階層祖先traverse ACE不足」の解消の中核）。
@@ -522,10 +601,10 @@ fn grant_traverse_chain_orders_ancestors_shallow_to_deep() {
 #[ignore]
 fn grant_traverse_chain_then_revoke_each_node_on_neutral_tree() {
     let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
-    let test_root = std::path::PathBuf::from(format!(
-        "C:\\harness-Tier2a-verify-chain-{}",
-        std::process::id()
-    ));
+    // [BUG-046 修正4] ディレクトリ自体の後始末はRAII（panicでも走る）。ACEの後始末だけが
+    // 下の`cleanup`に残る（`granted`を借りるためガードにできない）。
+    let root_guard = TestDirGuard::create("chain");
+    let test_root = root_guard.path().to_path_buf();
     let nested = test_root.join("a").join("b").join("c");
     std::fs::create_dir_all(&nested).expect(
         "create test-owned nested dirs directly under C:\\ (needs admin write on drive root)",
@@ -536,10 +615,10 @@ fn grant_traverse_chain_then_revoke_each_node_on_neutral_tree() {
     let cleanup = || {
         // granted[0]はドライブルート(C:\)自身。D10の恒久的な修復として意図的に維持されて
         // いる既存ACEなので、このテストの後始末では**絶対に触らない**。
+        // （D-48のガードも同じことを機構側で守るが、ここは意図を明示するため残す。）
         for node in granted.iter().skip(1) {
             let _ = revoke_ace(node, sid.as_psid());
         }
-        let _ = std::fs::remove_dir_all(&test_root);
     };
 
     if let Err(e) = &result {
@@ -582,8 +661,6 @@ fn grant_traverse_chain_then_revoke_each_node_on_neutral_tree() {
             );
         }
     }
-
-    let _ = std::fs::remove_dir_all(&test_root);
 }
 
 
@@ -658,11 +735,8 @@ fn protect_dacl_preserve_inherited(path: &Path) -> windows::core::Result<()> {
 fn grant_ace_inheritable_ro_falls_back_for_protected_descendant() {
     let sid = ensure_profile(CONTAINER_NAME).expect("ensure_profile");
 
-    let workspace = std::path::PathBuf::from(format!(
-        "C:\\harness-Tier2a-verify-m-ws-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let workspace_guard = TestDirGuard::create("m-ws");
+    let workspace = workspace_guard.path().to_path_buf();
     grant_ace_recursive(&workspace, sid.as_psid()).expect("grant_ace_recursive on workspace");
     let probe_dir = workspace
         .join(".harness")
@@ -675,14 +749,11 @@ fn grant_ace_inheritable_ro_falls_back_for_protected_descendant() {
              workspace FS I/O gate failed on this machine ({e:?}); run `harness fs \
              grant-traverse C:\\` as administrator first (D10)"
         );
-        let _ = std::fs::remove_dir_all(&workspace);
         return;
     }
 
-    let root = std::path::PathBuf::from(format!(
-        "C:\\harness-Tier2a-verify-m-{}",
-        std::process::id()
-    ));
+    let root_guard = TestDirGuard::create("m");
+    let root = root_guard.path().to_path_buf();
 
     // 通常branch: root -> normal -> deep -> preexisting.txt（継承伝播で届く想定）。
     let normal_deep = root.join("normal").join("deep");
@@ -741,9 +812,6 @@ fn grant_ace_inheritable_ro_falls_back_for_protected_descendant() {
         "sandbox SID ACE must be fully removed from every node, including the protected \
          branch, after revoke_ace_recursive: {leftover:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 /// [S1スパイク] Tier3のSMB使い捨てワークスペース共有（`crates/harness-sandbox/src/

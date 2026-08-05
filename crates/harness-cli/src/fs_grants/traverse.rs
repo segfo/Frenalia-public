@@ -197,7 +197,7 @@ pub(crate) fn fs_grant_traverse(_target: &Path) -> ExitCode {
 
 /// 指定パスのtraverse ACEを撤収する（非再帰・単一ノード、D10の巻き戻し）。
 /// `grant_traverse_drive_root`（`grant_ace_mask`による非継承・単一ACE付与）の逆操作なので、
-/// `revoke_ace`（単一ノード）+ `assert_no_sid_ace`（単一ノード検証）を使う。
+/// `revoke_traverse_grant`（単一ノードの撤収＋単一ノードの検証、D-48の正規の扉）を使う。
 /// `revoke_ace_recursive`/`assert_no_sid_ace_recursive`（ツリー全体を再walk）は、`path`が
 /// ドライブルートの場合に不要な全走査を招くため使わない。`fs_grant_traverse`と同じく、
 /// 本体が既に昇格済みなら直接、それ以外は特権分離ヘルパー（D-16）経由で実行する。
@@ -228,28 +228,17 @@ pub(crate) fn fs_revoke_traverse_one(path: &Path) -> ExitCode {
 
 #[cfg(windows)]
 pub(crate) fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
-    let sid = match harness_sandbox::tier2a::win_appcontainer::traverse_capability_sid() {
-        Ok(sid) => sid,
-        Err(e) => {
-            eprintln!("failed to resolve sandbox SID: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Err(e) = harness_sandbox::tier2a::win_appcontainer::revoke_ace(path, sid.as_psid()) {
-        eprintln!("revoke-traverse failed for {}: {e}", path.display());
-        return ExitCode::FAILURE;
-    }
-    match harness_sandbox::tier2a::win_appcontainer::assert_no_sid_ace(path, sid.as_psid()) {
+    // D-48: 撤収と撤収済み検証は`revoke_traverse_grant`が一体で行う（主体のcapability SIDは
+    // 関数内で導出されるので、ここでSIDを取り違えようがない）。台帳エントリの除去だけが
+    // 呼び出し側の責務として残る。
+    match harness_sandbox::tier2a::win_appcontainer::revoke_traverse_grant(path) {
         Ok(()) => {
             harness_sandbox::tier2a::traverse_ledger::remove_traverse_grant(path);
             println!("revoked traverse ACE: {}", path.display());
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!(
-                "revoke-traverse verification failed for {}: {e}",
-                path.display()
-            );
+            eprintln!("revoke-traverse failed for {}: {e}", path.display());
             ExitCode::FAILURE
         }
     }

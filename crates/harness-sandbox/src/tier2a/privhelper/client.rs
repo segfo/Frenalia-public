@@ -30,8 +30,8 @@ fn helper_exe_path() -> Result<PathBuf, PrivHelperError> {
 /// 返り値は「実際にACEが付与されたノードの一覧」（`GrantTraverse`のみ意味を持つ。
 /// `RevokeTraverse`成功時は常に空`Vec`）。`Err(PrivHelperError::PartialGrantChain { granted, .. })`
 /// の場合も`granted`に途中まで成功したノードが入るため、呼び出し側は`Err`だからと無視せず
-/// 中身を確認して台帳へ反映する必要がある（孤立ACE防止）。`GrantFsAllow`はエントリごとに
-/// 成否が独立するため、この関数ではなく[`run_privileged_fs_allow`]を使う。
+/// 中身を確認して台帳へ反映する必要がある（孤立ACE防止）。fs-allowの付与はエントリごとに
+/// 成否が独立するため、この関数ではなく[`run_privileged_workspace_access`]を使う。
 pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelperError> {
     let envelope = PrivilegedRequestEnvelope::from(req.clone());
     match run_privileged_raw(&envelope)? {
@@ -44,9 +44,6 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
             granted,
             error: Some(reason),
         } => Err(PrivHelperError::PartialGrantChain { granted, reason }),
-        PrivilegedResponse::FsAllowResult { .. } => Err(PrivHelperError::Ipc(
-            "unexpected FsAllowResult response for a non-GrantFsAllow request".to_string(),
-        )),
         PrivilegedResponse::RevokeFsAllowResult { .. } => Err(PrivHelperError::Ipc(
             "unexpected RevokeFsAllowResult response for a non-RevokeFsAllow request".to_string(),
         )),
@@ -58,65 +55,21 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
     }
 }
 
-/// `run_privileged_fs_allow`の成功値（`granted`パス一覧、`(path, reason)`失敗一覧）。
-pub type FsAllowGrantOutcome = (Vec<PathBuf>, Vec<(PathBuf, String)>);
-
 /// `run_privileged_revoke_fs_allow`の成功値（`revoked`完全撤収一覧、`root_cleared`
 /// root撤収済み・子孫ブロック一覧、`(path, reason)`失敗一覧）。`revoked`と`root_cleared`は
 /// どちらも台帳から除去してよい（`root_cleared`は孤立ACEにならない、`RevokeOutcome`参照）。
 pub type FsAllowRevokeOutcome = (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>);
 
-/// `GrantFsAllow`専用の委譲関数。`run_privileged`と異なりエントリごとの成否（`granted`/
-/// `failures`）を両方とも呼び出し側へそのまま返す（1エントリの失敗が「エラー」ではなく
-/// 正常な部分結果であるため、`run_privileged`の`Result<Vec<PathBuf>, _>`という単一成功値の
-/// 形には馴染まない）。WFP連鎖起動が不要な既存呼び出し元向けの薄いラッパー
-/// （[`run_privileged_fs_allow_with_netfilterd_chain`]を`chain_pipe: None`で呼ぶだけ）。
-pub fn run_privileged_fs_allow(
-    entries: Vec<FsAllowGrant>,
-) -> Result<FsAllowGrantOutcome, PrivHelperError> {
-    run_privileged_fs_allow_with_netfilterd_chain(entries, None)
-}
-
-/// `run_privileged_fs_allow`のWFP連鎖起動対応版（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`
-/// 付録D シナリオ(A)）。`chain_pipe`が`Some`なら、ヘルパーはこのACL操作の応答を送った後、
-/// 指定named pipeで`harness-netfilterd`を追加起動してから終了する
-/// （モジュールdoc「例外: WFP連鎖起動」参照）。
-pub fn run_privileged_fs_allow_with_netfilterd_chain(
-    entries: Vec<FsAllowGrant>,
-    chain_pipe: Option<String>,
-) -> Result<FsAllowGrantOutcome, PrivHelperError> {
-    let envelope = PrivilegedRequestEnvelope {
-        request: PrivilegedRequest::GrantFsAllow { entries },
-        chain_netfilterd_pipe: chain_pipe,
-    };
-    match run_privileged_raw(&envelope)? {
-        PrivilegedResponse::FsAllowResult { granted, failures } => Ok((granted, failures)),
-        PrivilegedResponse::Ok => Ok((Vec::new(), Vec::new())),
-        PrivilegedResponse::GrantChain { granted, error } => {
-            // スキーマ上あり得ないはずの応答だが、fail-safeとして「全て失敗」扱いにはせず
-            // grantedをそのまま伝える（孤立ACE防止の原則を維持）。
-            Ok((
-                granted,
-                error.map(|e| vec![(PathBuf::new(), e)]).unwrap_or_default(),
-            ))
-        }
-        PrivilegedResponse::RevokeFsAllowResult { .. } => Err(PrivHelperError::Ipc(
-            "unexpected RevokeFsAllowResult response for a GrantFsAllow request".to_string(),
-        )),
-        PrivilegedResponse::WorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
-            "unexpected WorkspaceAccessResult response for a GrantFsAllow request".to_string(),
-        )),
-        PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
-    }
-}
-
 /// `run_privileged_workspace_access`の成功値（traverse付与ノード一覧・traverse失敗理由・
 /// fs-allow付与一覧・fs-allow失敗一覧）。
 pub type WorkspaceAccessOutcome = (Vec<PathBuf>, Option<String>, Vec<PathBuf>, Vec<(PathBuf, String)>);
 
-/// `GrantWorkspaceAccess`専用の委譲関数（`win_appcontainer::preflight`がtraverse不足を自動検知
-/// したときに呼ぶ）。`run_privileged_fs_allow_with_netfilterd_chain`と同じく`chain_pipe`で
-/// WFP連鎖起動にも対応する——**新しい特権操作を追加する際の注意点**: 同一起動内で2回目の
+/// `GrantWorkspaceAccess`専用の委譲関数。**非管理者からのTier2a起動が特権を要するときは、
+/// traverse付与・fs-allow昇格・WFP連鎖起動のいずれであっても必ずここを通る**
+/// （`win_appcontainer::preflight`はtraverse不足の有無で分岐しない）。`chain_pipe`が`Some`なら、
+/// ヘルパーはACL操作の応答を送った後に`harness-netfilterd`を追加起動する
+/// （モジュールdoc「例外: WFP連鎖起動」参照）。
+/// **新しい特権操作を追加する際の注意点**: 同一起動内で2回目の
 /// `run_privileged*`（＝2回目のUAC）を独立に呼び出してはならない。この関数のように、
 /// 1回の起動で必要になり得る特権操作をすべて1つの`PrivilegedRequestEnvelope`へ束ねること
 /// （`plans/DESIGN-SANDBOX-PRIVSEP.md` D-16参照）。
@@ -150,9 +103,6 @@ pub fn run_privileged_workspace_access(
         PrivilegedResponse::GrantChain { granted, error } => {
             Ok((granted, error, Vec::new(), Vec::new()))
         }
-        PrivilegedResponse::FsAllowResult { granted, failures } => {
-            Ok((Vec::new(), None, granted, failures))
-        }
         PrivilegedResponse::RevokeFsAllowResult { .. } => Err(PrivHelperError::Ipc(
             "unexpected RevokeFsAllowResult response for a GrantWorkspaceAccess request"
                 .to_string(),
@@ -161,9 +111,9 @@ pub fn run_privileged_workspace_access(
     }
 }
 
-/// `RevokeFsAllow`専用の委譲関数（`run_privileged_fs_allow`の裏対称、`BUG-015`参照）。
-/// `entries`は`harness fs revoke`/`revoke-all`が本体プロセス内で撤収しきれなかったパス
-/// （`forced`情報付き）の一覧。
+/// `RevokeFsAllow`専用の委譲関数（付与側＝`run_privileged_workspace_access`の裏対称、
+/// `BUG-015`参照）。`entries`は`harness fs revoke`/`revoke-all`が本体プロセス内で
+/// 撤収しきれなかったパス（`forced`情報付き）の一覧。
 pub fn run_privileged_revoke_fs_allow(
     entries: Vec<FsAllowRevoke>,
 ) -> Result<FsAllowRevokeOutcome, PrivHelperError> {
@@ -180,9 +130,6 @@ pub fn run_privileged_revoke_fs_allow(
             Vec::new(),
             error.map(|e| vec![(PathBuf::new(), e)]).unwrap_or_default(),
         )),
-        PrivilegedResponse::FsAllowResult { granted, failures } => {
-            Ok((granted, Vec::new(), failures))
-        }
         PrivilegedResponse::WorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
             "unexpected WorkspaceAccessResult response for a RevokeFsAllow request".to_string(),
         )),

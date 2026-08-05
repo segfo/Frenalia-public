@@ -51,6 +51,17 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture", "win_appcontainer::cow_containment_tests",
         ],
     ),
+    // ACE付与/撤収（fs passthrough・traverse chain・継承ACE）の実機回帰。BUG-046の修正3で
+    // 追加した`traverse_chain_grants_every_ancestor_on_a_test_owned_drive_root`を含む
+    // （そちらは`subst`のテスト所有ドライブを使うので単体では昇格不要だが、同モジュールの
+    // 他テストが`C:\`直下への書込を伴うためここから回す）。
+    (
+        "ace-grant-revoke",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "win_appcontainer::ace_grant_revoke_tests",
+        ],
+    ),
     // M15.7 A-3: ETW実現性スパイク（判定ゲート）。`Microsoft-Windows-Kernel-File`の
     // リアルタイムセッションでACL拒否が観測できるかを実機で確かめる。
     // M15.7: Global Object Access Auditing を AppContainer の package SID へ絞れるかの実測。

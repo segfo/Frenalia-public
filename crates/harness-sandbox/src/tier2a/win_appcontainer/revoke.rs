@@ -308,7 +308,61 @@ fn appcontainer_sid_aces(
     }
 }
 
+/// 祖先traverseの主体（`traverse_capability_sid`）のバイト列を1回だけ導出してキャッシュする。
+///
+/// `revoke_ace`はツリー全ノードで通る経路なので、ここで`DeriveCapabilitySidsFromName`を
+/// 毎回叩くわけにはいかない。導出に失敗した場合（あり得ないが）は`None`を持ち、ガードを
+/// 素通りさせる——**判定材料が無いときに撤収を止めると、正当な`fs revoke`まで巻き添えで
+/// 失敗する**ので、ここは開ける側へ倒す（境界そのものではなく事故防止のガードであるため）。
+fn cached_traverse_capability_sid() -> Option<&'static crate::win_common::OwnedSid> {
+    static SID: std::sync::OnceLock<Option<crate::win_common::OwnedSid>> =
+        std::sync::OnceLock::new();
+    SID.get_or_init(|| traverse_capability_sid().ok()).as_ref()
+}
+
+fn is_traverse_capability_sid(sid: PSID) -> bool {
+    match cached_traverse_capability_sid() {
+        Some(cap) => unsafe { EqualSid(cap.as_psid(), sid).is_ok() },
+        None => false,
+    }
+}
+
+/// [D-48] `path`のtraverse ACEが「traverse台帳に載った永続的な修復」かどうか。
+///
+/// [BUG-046](../../../../docs/bugs/BUG-046.md): 付与側`grant_ace_mask`には冪等スキップが
+/// あり、要求マスクが既存ACEの部分集合なら**何も書かない**。一方この撤収側は所有権の概念を
+/// 持たず、誰が付けたACEでも同じように消せる。この非対称のせいで「grantがno-op・revokeだけ
+/// 有効」となり、テストが`C:\`の永続ACEを純減させてマシン全体のTier2a FS I/Oを壊した。
+fn is_protected_traverse_grant(path: &Path, sid: PSID) -> bool {
+    is_traverse_capability_sid(sid) && crate::tier2a::traverse_ledger::is_recorded_traverse_node(path)
+}
+
+/// `path`のDACLから`sid`宛の明示ACEを取り除く（D-48のガード付き、通常はこちらを使う）。
+///
+/// traverse台帳に載ったノードの**capability SID宛ACE**だけは剥がさず`Err`を返す。巻き戻したい
+/// ときは名前の付いた扉[`revoke_traverse_grant`]（＝`harness fs revoke-traverse <path>`）を通ること。
+/// 「汎用APIでは触れない／名指しの関数でだけ触れる」という非対称が目的で、悪意ある呼び出しを
+/// 止めるためのものではない——**更新漏れの巻き添えを止める**ためのものである。
 pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    if is_protected_traverse_grant(path, sid) {
+        return Err(AppContainerError::AclRevoke {
+            path: path.to_path_buf(),
+            reason: format!(
+                "refusing to strip the persistent traverse ACE on {} (D-48): this node is \
+                 recorded in the traverse ledger, so its capability-SID ACE is a permanent \
+                 repair that Tier2a FS I/O depends on machine-wide. Use `harness fs \
+                 revoke-traverse <path>` (win_appcontainer::revoke_traverse_grant) if you really \
+                 mean to roll it back. See docs/bugs/BUG-046.md",
+                path.display()
+            ),
+        });
+    }
+    revoke_ace_unguarded(path, sid)
+}
+
+/// [`revoke_ace`]の実体（D-48のガードを通らない）。**このモジュールと
+/// [`revoke_traverse_grant`]以外から呼ばないこと。**
+pub(crate) fn revoke_ace_unguarded(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
         path: path.to_path_buf(),
         reason: e.to_string(),

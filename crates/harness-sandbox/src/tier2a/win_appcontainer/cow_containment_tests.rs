@@ -13,6 +13,7 @@
 //! **`--test-threads=1`で実行すること。** 並列だとAppContainerプロファイル・共有祖先への
 //! traverse ACE付与といったマシン全体の共有状態を複数テストが同時に触るため不安定になる。
 
+use super::test_support::scopeguard;
 use super::*;
 use crate::manifest::ManifestOp;
 use crate::overlay::{ApplyOptions, ApplyReport, SandboxError, SandboxFs};
@@ -696,18 +697,6 @@ fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
         warnings.contains("32bit") || warnings.contains("wow64") || warnings.contains("WOW64"),
         "warning entry should mention the wow64/32bit injection path: {warnings}"
     );
-}
-
-/// パニック時にも確実にクロージャを実行する簡易scopeguard（`scopeguard`クレート依存を
-/// 避けるための最小実装。テストコード専用）。
-struct ScopeGuard<F: FnMut()>(F);
-impl<F: FnMut()> Drop for ScopeGuard<F> {
-    fn drop(&mut self) {
-        (self.0)();
-    }
-}
-fn scopeguard<F: FnMut()>(f: F) -> ScopeGuard<F> {
-    ScopeGuard(f)
 }
 
 /// 設計書§21（Memory-mapped file）の実測: 書込可能な`MemoryMappedFile`は`CreateFromFile`の

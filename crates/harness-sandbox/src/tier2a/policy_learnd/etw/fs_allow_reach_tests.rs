@@ -56,8 +56,7 @@
 use crate::shell_tier::{FsAccess, FsPassthrough, WorkspaceWriteMode};
 use crate::tier2a::win_appcontainer::{
     grant_ace_inheritable_access, preflight, preview_traverse_chain, probe_passthrough,
-    redirector_dll_paths, resolve_shell, revoke_ace, spawn, traverse_capability_sid,
-    NetworkCapability,
+    redirector_dll_paths, resolve_shell, spawn, traverse_capability_sid, NetworkCapability,
 };
 
 use super::parse::to_settings_path;
@@ -149,7 +148,10 @@ struct TraverseRestore {
 impl Drop for TraverseRestore {
     fn drop(&mut self) {
         for node in self.granted_by_us.iter().rev() {
-            match revoke_ace(node, self.sid.as_psid()) {
+            // D-48: 撤収対象は台帳へ記録済みのノードなので、汎用の`revoke_ace`は拒否する
+            // （BUG-046のガード）。ここは「自分が付けたぶんだけ剥がす」ことを`grant_chain`で
+            // 保証したうえで巻き戻す正当な経路なので、名前の付いた扉を通る。
+            match crate::tier2a::win_appcontainer::revoke_traverse_grant(node) {
                 Ok(()) => {
                     crate::tier2a::traverse_ledger::remove_traverse_grant(node);
                     println!("  restored (revoked traverse): {}", node.display());

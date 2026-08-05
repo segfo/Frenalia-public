@@ -285,6 +285,10 @@ fn session_sid() -> OwnedContainerSid {
         .expect("ensure_profile (this session's profile, D-37)")
 }
 
+/// テスト間で共有する後始末ユーティリティ（RAIIガード）。実装は`test_support.rs`。
+#[cfg(all(windows, test))]
+mod test_support;
+
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;
 

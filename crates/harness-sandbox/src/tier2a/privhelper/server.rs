@@ -193,7 +193,7 @@ unsafe fn launch_netfilterd_chained(pipe_name: &str) -> Result<(), PrivHelperErr
     Ok(())
 }
 
-/// `GrantFsAllow`/`GrantWorkspaceAccess`共通の実処理。エントリごとに成否が独立する
+/// `GrantWorkspaceAccess`のfs-allow部分の実処理。エントリごとに成否が独立する
 /// （`GrantTraverse`のような連鎖ではないため、1エントリの失敗が他エントリを止めない）。
 fn grant_fs_allow_entries(
     sid: PSID,
@@ -291,8 +291,19 @@ fn grant_traverse_targets(
 }
 
 /// 固定スキーマの要求だけを実行する（D-16の核: ここに到達する時点でスキーマ検証済み、
-/// 自由形式のコマンド文字列は一切扱わない）。SIDはIPCで受け取らず、安定定数
-/// `CONTAINER_NAME`から`ensure_profile`で自ら導出する。
+/// 自由形式のコマンド文字列は一切扱わない）。**SIDはIPCで受け取らず、必ずこのバイナリ側で
+/// 自ら導出する**——ただしD-37以降、導出先は用途によって2系統ある。
+///
+/// | 用途 | 主体 | 導出元 |
+/// |---|---|---|
+/// | 祖先チェーンのtraverse（`GrantTraverse`/`RevokeTraverse`/`GrantWorkspaceAccess`のtraverse部分） | capability SID | `traverse_capability_sid()`（固定名`harnessSandboxTraverse`） |
+/// | leafへの読み書きの**付与**（`GrantWorkspaceAccess`のfs-allow部分） | セッションpackage SID | IPCで受けた**形を検証済みの**セッションプロファイル名 |
+/// | leafへの読み書きの**撤収**（`RevokeFsAllow`） | 旧共有package SID | `ensure_profile(CONTAINER_NAME)`（D-37以前のACEを掃除するのが役目） |
+///
+/// traverse側が`CONTAINER_NAME`のpackage SIDのままD-37から取り残されていたのが
+/// [BUG-061](../../../../docs/bugs/BUG-061.md)である。**この関数の冒頭で導出する`sid`を
+/// 使ってよいのは`RevokeFsAllow`だけ**——新しいアームを足す人は、上表のどの行に属するかを
+/// 決めてから主体を選ぶこと。
 fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
     let sid = match win_appcontainer::ensure_profile(CONTAINER_NAME) {
         Ok(sid) => sid,
@@ -307,9 +318,20 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 "dispatch: GrantTraverse target={}",
                 target.display()
             ));
+            // D-37/BUG-061: 祖先traverseの主体は**capability SID**であって、この関数の冒頭で
+            // 導出したpackage SIDではない。`GrantWorkspaceAccess`（下）と同じ導出をここでも行う。
+            let traverse_cap = match win_appcontainer::traverse_capability_sid() {
+                Ok(cap) => cap,
+                Err(e) => {
+                    log::line(&format!("dispatch: traverse_capability_sid failed: {e}"));
+                    return PrivilegedResponse::Err(format!(
+                        "failed to derive the traverse capability SID: {e}"
+                    ));
+                }
+            };
             let (granted, result) = win_appcontainer::grant_traverse_chain_with_progress(
                 &target,
-                sid.as_psid(),
+                traverse_cap.as_psid(),
                 |node, node_result, elapsed| match node_result {
                     Ok(()) => log::line(&format!(
                         "  node {} : granted in {}ms",
@@ -335,9 +357,10 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
         }
         PrivilegedRequest::RevokeTraverse { path } => {
             log::line(&format!("dispatch: RevokeTraverse path={}", path.display()));
+            // D-48/BUG-061: 撤収も主体はcapability SID。`revoke_traverse_grant`は主体を自ら
+            // 導出し、撤収と撤収済み検証を一体で行う（台帳の除去は非昇格の呼び出し元が行う）。
             let result: Result<(), AppContainerError> =
-                win_appcontainer::revoke_ace(&path, sid.as_psid())
-                    .and_then(|()| win_appcontainer::assert_no_sid_ace(&path, sid.as_psid()));
+                win_appcontainer::revoke_traverse_grant(&path);
             log::line(&format!(
                 "dispatch: RevokeTraverse done, error={:?}",
                 result.as_ref().err()
@@ -346,19 +369,6 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 Ok(()) => PrivilegedResponse::Ok,
                 Err(e) => PrivilegedResponse::Err(e.to_string()),
             }
-        }
-        PrivilegedRequest::GrantFsAllow { entries } => {
-            log::line(&format!(
-                "dispatch: GrantFsAllow {} entrie(s)",
-                entries.len()
-            ));
-            let (granted, failures) = grant_fs_allow_entries(sid.as_psid(), entries);
-            log::line(&format!(
-                "dispatch: GrantFsAllow done, {} granted, {} failed",
-                granted.len(),
-                failures.len()
-            ));
-            PrivilegedResponse::FsAllowResult { granted, failures }
         }
         PrivilegedRequest::GrantWorkspaceAccess {
             traverse_targets,

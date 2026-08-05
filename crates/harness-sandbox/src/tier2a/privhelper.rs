@@ -12,12 +12,13 @@
 //! 昇格したヘルパーのトークンも「同一ユーザの別integrity level」であり接続できる一方、
 //! 他ユーザのプロセスからは接続できない。
 //!
-//! **SIDは受け渡さない**: 要求スキーマにPSIDを含めない。ヘルパー自身が`ensure_profile`で
-//! `CONTAINER_NAME`（安定定数）からSIDを導出する。生ポインタをプロセス境界・特権境界を越えて
+//! **SIDは受け渡さない**: 要求スキーマにPSIDを含めない。ヘルパー自身が安定定数
+//! （`CONTAINER_NAME`・`TRAVERSE_CAPABILITY_NAME`）またはIPCで受けた**形を検証済みの**
+//! プロファイル名からSIDを導出する。生ポインタをプロセス境界・特権境界を越えて
 //! IPCで渡す必要自体を無くす設計判断。
 //!
 //! **例外: WFP連鎖起動**（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）。UAC起動回数を
-//! 最小化するため、`GrantFsAllow`要求が同時に「処理完了後、指定named pipeで`harness-netfilterd`を
+//! 最小化するため、`GrantWorkspaceAccess`要求が同時に「処理完了後、指定named pipeで`harness-netfilterd`を
 //! 起動してほしい」という指示（[`PrivilegedRequestEnvelope::chain_netfilterd_pipe`]）を伴うことが
 //! ある。この場合だけ、ヘルパーはACL操作の応答を送った**後**に`CreateProcessW`（`runas`は使わない、
 //! 自分の昇格済みトークンをそのまま子へ継承させる）で`harness-netfilterd.exe`を追加起動してから
@@ -56,7 +57,7 @@ use crate::win_common::wide;
 /// ヘルパーへ委譲する操作。自由形式のコマンド文字列ではなく固定スキーマに限定する（D-16）。
 /// 将来の特権操作（WFPフィルタ設置・VHDXマウント等、`DESIGN-SANDBOX-PRIVSEP.md` §5.2）は
 /// ここへvariantを追加する形で拡張する。
-/// `--fs-allow`の1エントリ（`GrantFsAllow`要求のペイロード）。`shell_tier::FsPassthrough`と
+/// `--fs-allow`の1エントリ（`GrantWorkspaceAccess`要求のペイロード）。`shell_tier::FsPassthrough`と
 /// 同形だが、IPCでシリアライズする要求スキーマとして独立させる（`shell_tier::FsPassthrough`は
 /// IPCを経由しない本体内部の値であり、両者の変更を意図せず連動させないため）。
 #[derive(Debug, Clone, Serialize)]
@@ -118,25 +119,25 @@ pub enum PrivilegedRequest {
     GrantTraverse { target: PathBuf },
     /// `GrantTraverse`で付与したACEを1件撤収する（`harness fs revoke-traverse`）。
     RevokeTraverse { path: PathBuf },
-    /// `--fs-allow`/`fs.allow`が本体プロセス内（非管理者）で`ACCESS_DENIED`になったエントリを
-    /// まとめて1回のUACで昇格付与する（システム保護パス、例`C:\ProgramData\...\VisualStudio\Setup`
-    /// への読取専用付与。`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」参照）。呼び出し側
-    /// （`win_appcontainer::preflight`）が事前にユーザ所有パスを本体内で処理済みなので、
-    /// ここに載るのは昇格が要ると判明したエントリのみ＝起動あたりUAC最大1回に抑えられる。
-    GrantFsAllow { entries: Vec<FsAllowGrant> },
     /// `harness fs revoke`/`revoke-all`が本体プロセス内（非管理者）で撤収しきれなかった
-    /// パス（`GrantFsAllow`でシステム保護パスへ付与したACE等）をまとめて1回のUACで撤収する
-    /// （`GrantFsAllow`の裏対称、`BUG-015`参照）。各エントリは`revoke_passthrough`
+    /// パス（`GrantWorkspaceAccess`でシステム保護パスへ付与したACE等）をまとめて1回のUACで
+    /// 撤収する（付与側の裏対称、`BUG-015`参照）。各エントリは`revoke_passthrough`
     /// （ツリー全体を再walk＋root再プローブ）で撤収する。`forced`なパスは`SeRestorePrivilege`下で
     /// 撤収する（grantと対称に`forced`を運び新たな非対称を作らない、`FsAllowRevoke`参照）。
+    ///
+    /// **付与側と違い、こちらは旧共有プロファイル（`CONTAINER_NAME`）のSIDを使う。** D-37以前に
+    /// 付けたACEと、既に終了したセッションのACEを掃除するのが役目だからである（生きている
+    /// セッションのSID宛ACEには触らない。判定は非昇格側の`harness fs revoke`が持つ）。
     RevokeFsAllow { entries: Vec<FsAllowRevoke> },
+    /// **非管理者からのTier2a起動が特権を要するときに通る唯一の要求**。
     /// `win_appcontainer::preflight`が自動検知した、workspace_root/upper_dir祖先チェーンの
     /// traverse不足（複数ターゲットあり得る、`--cow`ではworkspace_rootとupper_dirの2つ）と
     /// `--fs-allow`昇格要求を、1回のUACへまとめて処理する（起動あたりUAC最大1回の原則、
-    /// `plans/DESIGN-SANDBOX-PRIVSEP.md` D-16「特権昇格デーモンを使う際の注意点」参照）。
-    /// 既存の`GrantTraverse`（単一target、`harness fs grant-traverse`専用）・`GrantFsAllow`は
-    /// このvariant導入後も変更しない——`preflight`がtraverse不足を検知しない通常起動では、
-    /// この新variantを一切通らず既存の`GrantFsAllow`単体パスのまま動く。
+    /// `plans/DESIGN-SANDBOX-PRIVSEP.md` D-16/D-31「特権昇格デーモンを使う際の注意点」参照）。
+    /// `preflight`はtraverse不足の有無で分岐せず、常にこの1本へ束ねる。
+    ///
+    /// 残る`GrantTraverse`/`RevokeTraverse`は`harness fs grant-traverse`/`revoke-traverse`
+    /// （単一target、起動とは独立した手動コマンド）専用である。
     GrantWorkspaceAccess {
         traverse_targets: Vec<PathBuf>,
         fs_allow_entries: Vec<FsAllowGrant>,
@@ -190,16 +191,8 @@ pub enum PrivilegedResponse {
         granted: Vec<PathBuf>,
         error: Option<String>,
     },
-    /// `GrantFsAllow`の結果。エントリごとに成否が独立（`GrantChain`と違い連鎖ではないため、
-    /// 1エントリの失敗が他エントリの処理を止めない）。`granted`は実際にACEが付与された
-    /// パスの一覧、`failures`は`(path, reason)`の一覧。呼び出し側は`granted`を台帳へ記録し、
-    /// `failures`は警告として表示する（D8の既存の扱いに合わせる）。
-    FsAllowResult {
-        granted: Vec<PathBuf>,
-        failures: Vec<(PathBuf, String)>,
-    },
-    /// `RevokeFsAllow`の結果。`FsAllowResult`と同形だが、フィールド名を`granted`ではなく
-    /// `revoked`にして意味を明確にする。エントリごとに成否が独立する点も`FsAllowResult`と同じ。
+    /// `RevokeFsAllow`の結果。エントリごとに成否が独立（`GrantChain`と違い連鎖ではないため、
+    /// 1エントリの失敗が他エントリの処理を止めない）。
     /// `root_cleared`は「rootのACEは消えたが一部の子孫（TrustedInstaller所有等）にACEが残る」
     /// パス（BUG-016のrevoke非対称の解消、`RevokeOutcome::RootClearedDescendantsBlocked`）。
     /// 呼び出し側は`revoked`と`root_cleared`の両方を台帳から除去する（後者は孤立ACEにならない）。
@@ -214,7 +207,10 @@ pub enum PrivilegedResponse {
     /// （複数targetを順に処理し、途中のtargetで失敗した場合はそこで打ち切るが、それまでに
     /// 成功したノードは全ターゲット分`traverse_granted`へ積む。呼び出し側は`traverse_error`の
     /// 有無に関わらず`traverse_granted`の全ノードを台帳へ記録しなければならない）。
-    /// `fs_allow_granted`/`fs_allow_failures`は`FsAllowResult`と同じ意味。
+    /// `fs_allow_granted`はACE付与に成功したパスの一覧、`fs_allow_failures`は`(path, reason)`。
+    /// エントリごとに成否が独立する（traverseの連鎖と違い、1件の失敗が他を止めない）。
+    /// 呼び出し側は`fs_allow_granted`を台帳へ記録し、`fs_allow_failures`は警告として表示する
+    /// （D8の既存の扱いに合わせる）。
     WorkspaceAccessResult {
         traverse_granted: Vec<PathBuf>,
         traverse_error: Option<String>,
@@ -316,8 +312,8 @@ mod client;
 mod server;
 
 pub use client::{
-    run_privileged, run_privileged_fs_allow, run_privileged_fs_allow_with_netfilterd_chain,
-    run_privileged_revoke_fs_allow, run_privileged_workspace_access, FsAllowRevokeOutcome,
+    run_privileged, run_privileged_revoke_fs_allow, run_privileged_workspace_access,
+    FsAllowRevokeOutcome,
 };
 pub use server::serve;
 
@@ -522,12 +518,14 @@ mod tests {
     #[test]
     fn envelope_roundtrips_with_and_without_netfilterd_chain() {
         let envelope = PrivilegedRequestEnvelope {
-            request: PrivilegedRequest::GrantFsAllow {
-                entries: vec![FsAllowGrant {
+            request: PrivilegedRequest::GrantWorkspaceAccess {
+                traverse_targets: Vec::new(),
+                fs_allow_entries: vec![FsAllowGrant {
                     path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
                     access: FsAccess::ReadExec,
                     forced: false,
                 }],
+                session_profile: "harness.shell.sandbox.1234-5678".to_string(),
             },
             chain_netfilterd_pipe: Some(r"\\.\pipe\harness-netfilterd-1234-0".to_string()),
         };
@@ -538,7 +536,9 @@ mod tests {
             Some(r"\\.\pipe\harness-netfilterd-1234-0".to_string())
         );
         match decoded.request {
-            PrivilegedRequest::GrantFsAllow { entries } => assert_eq!(entries.len(), 1),
+            PrivilegedRequest::GrantWorkspaceAccess {
+                fs_allow_entries, ..
+            } => assert_eq!(fs_allow_entries.len(), 1),
             other => panic!("unexpected variant: {other:?}"),
         }
 
@@ -586,10 +586,16 @@ mod tests {
         }
     }
 
+    /// fs-allowエントリの`access`と`forced`が、エントリごとに独立してワイヤを渡ることを
+    /// 固定する。**`forced`は`SeRestorePrivilege`の有効化（D-19）を決めるフラグ**なので、
+    /// ここが黙って落ちたり別エントリの値と混ざったりすると、意図しないパスへ全DACLを
+    /// バイパスして書く経路になる。`grant_workspace_access_request_roundtrips_through_json`は
+    /// エントリ数しか見ないので、中身の検査はこちらが持つ。
     #[test]
-    fn grant_fs_allow_request_roundtrips_through_json() {
-        let req = PrivilegedRequest::GrantFsAllow {
-            entries: vec![
+    fn fs_allow_entries_keep_their_access_and_forced_flags_over_the_wire() {
+        let req = PrivilegedRequest::GrantWorkspaceAccess {
+            traverse_targets: Vec::new(),
+            fs_allow_entries: vec![
                 FsAllowGrant {
                     path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
                     access: FsAccess::ReadExec,
@@ -601,20 +607,23 @@ mod tests {
                     forced: true,
                 },
             ],
+            session_profile: "harness.shell.sandbox.1234-5678".to_string(),
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: PrivilegedRequest = serde_json::from_slice(&bytes).unwrap();
         match decoded {
-            PrivilegedRequest::GrantFsAllow { entries } => {
-                assert_eq!(entries.len(), 2);
+            PrivilegedRequest::GrantWorkspaceAccess {
+                fs_allow_entries, ..
+            } => {
+                assert_eq!(fs_allow_entries.len(), 2);
                 assert_eq!(
-                    entries[0].path,
+                    fs_allow_entries[0].path,
                     PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup")
                 );
-                assert_eq!(entries[0].access, FsAccess::ReadExec);
-                assert!(!entries[0].forced);
-                assert_eq!(entries[1].access, FsAccess::ReadWrite);
-                assert!(entries[1].forced);
+                assert_eq!(fs_allow_entries[0].access, FsAccess::ReadExec);
+                assert!(!fs_allow_entries[0].forced);
+                assert_eq!(fs_allow_entries[1].access, FsAccess::ReadWrite);
+                assert!(fs_allow_entries[1].forced);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -727,37 +736,6 @@ mod tests {
         assert_eq!(grant.access, FsAccess::ReadWrite);
         let revoke: FsAllowRevoke = serde_json::from_str(r#"{"path":"C:\\x"}"#).unwrap();
         assert!(!revoke.forced);
-    }
-
-    /// `FsAllowResult`応答が、成功エントリと失敗エントリが混在する状態でも両方を失わずに
-    /// ラウンドトリップできることを確認する（`GrantChain`と違い連鎖ではないので、1件の失敗が
-    /// 他の成功エントリを消してはならない）。
-    #[test]
-    fn fs_allow_result_response_roundtrips_with_mixed_outcomes() {
-        let resp = PrivilegedResponse::FsAllowResult {
-            granted: vec![PathBuf::from(
-                r"C:\ProgramData\Microsoft\VisualStudio\Setup",
-            )],
-            failures: vec![(
-                PathBuf::from(r"C:\Windows\System32\config"),
-                "access denied".to_string(),
-            )],
-        };
-        let bytes = serde_json::to_vec(&resp).unwrap();
-        let decoded: PrivilegedResponse = serde_json::from_slice(&bytes).unwrap();
-        match decoded {
-            PrivilegedResponse::FsAllowResult { granted, failures } => {
-                assert_eq!(
-                    granted,
-                    vec![PathBuf::from(
-                        r"C:\ProgramData\Microsoft\VisualStudio\Setup"
-                    )]
-                );
-                assert_eq!(failures.len(), 1);
-                assert_eq!(failures[0].0, PathBuf::from(r"C:\Windows\System32\config"));
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
     }
 
     #[test]
