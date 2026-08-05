@@ -1168,13 +1168,24 @@ fn mock_netfilterd_exe() -> PathBuf {
 /// `tier2a-mock-netfilterd.exe`を`harness-netfilterd.exe`という名前でコピーする。本物の
 /// `target/debug/harness-netfilterd.exe`・共有WFPエンジンには一切触れない。
 fn wfp_fail_closed_launcher_exe() -> PathBuf {
-    let dir = Path::new(CASE_ROOT).join("_launcher-wfp-failclosed");
+    wfp_fail_closed_launcher_exe_with_mode("_launcher-wfp-failclosed", None)
+}
+
+/// `wfp_fail_closed_launcher_exe`のモード指定版。モックの故障モードは**環境変数ではなく
+/// `mock-mode`ファイル**で渡す——モックは`ShellExecuteExW(runas)`経由で起動されうるが、
+/// その場合プロセスを生成するのはAppInfoサービスなのでテストプロセスの環境変数が継承されない
+/// （`crates/tier2a-mock-netfilterd/src/main.rs`のモジュールdoc参照）。
+fn wfp_fail_closed_launcher_exe_with_mode(dir_name: &str, mode: Option<&str>) -> PathBuf {
+    let dir = Path::new(CASE_ROOT).join(dir_name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create launcher dir");
     let harness_copy = dir.join("harness.exe");
     std::fs::copy(harness_exe(), &harness_copy).expect("copy harness.exe into launcher dir");
     std::fs::copy(mock_netfilterd_exe(), dir.join("harness-netfilterd.exe"))
         .expect("copy mock netfilterd exe into launcher dir as harness-netfilterd.exe");
+    if let Some(mode) = mode {
+        std::fs::write(dir.join("mock-mode"), mode).expect("write mock mode marker");
+    }
     harness_copy
 }
 
@@ -1216,6 +1227,42 @@ fn net_case_07_wfp_start_failure_is_fail_closed() -> Result<(), String> {
         "all-denied",
         &[],
         Some("Tier2a run_shell network capability will remain denied"),
+    )
+}
+
+/// 10: WFP fail-closed の**もう一方の分岐**（`docs/STATUS.md` Tier2a残課題#2）。
+///
+/// case 07 が固定しているのは`connect_and_apply`の**I/O失敗**分岐だけである（モックが接続直後に
+/// パイプを閉じるので`ERROR_BROKEN_PIPE`になる）。しかし現実には、**daemonは正常に起動して
+/// 応答も返すが、WFPエンジン自体が開けない**という失敗の形がある——BFEサービスが停止している、
+/// `FwpmEngineOpen0`が失敗する、等。このときdaemonは`NetfilterResponse::Err`を返し
+/// （`netfilterd.rs`の`serve_inner`）、親側は`NetfilterError::Rejected`へ写す。
+/// **`connect_and_apply`の中で通る分岐がcase 07とは違う。**
+///
+/// この分岐でもfail-closedでなければならない理由は capability の粒度にある。AppContainerの
+/// network capabilityは「全遮断」か「開放」の2値しかないので、`--net-allow-domain`を
+/// 指定した時点でharnessは子へcapabilityを与えざるを得ず、**子とインターネット全体の間に
+/// 立っているのはWFPフィルタだけ**になる。WFPが張れていないのにcapabilityを与えると、
+/// モデルから見える`EnvironmentFacts`にはドメイン制限が宣言されたまま出口が全開になる。
+///
+/// モックの`reject`モードは`ApplyRules`を読み切ってから`Err`応答を1フレーム返すので、
+/// 親から見た経路は実daemonがWFP失敗を報告したときと同じである。
+///
+/// **stderrの検査文字列に`daemon rejected the request`を選んでいるのが、このケースの肝**。
+/// case 07と同じ「capabilityがDenyになった」だけを見ると、モックの`reject`モードが
+/// 何かの理由で動かず**パイプを閉じてcase 07と同じ経路に落ちても緑になってしまう**
+/// （[BUG-056](../../../docs/bugs/BUG-056.md)と同じ「緑だが測っていない」形）。
+/// `NetfilterError::Rejected`のDisplayはこの分岐でしか出ないので、これを要求すれば
+/// 「意図した分岐を通った」ことまで固定できる。
+fn net_case_10_wfp_rejected_response_is_fail_closed() -> Result<(), String> {
+    let exe = wfp_fail_closed_launcher_exe_with_mode("_launcher-wfp-rejected", Some("reject"));
+    run_net_case_with_exe_and_stderr_check(
+        &exe,
+        "net-10-wfp-rejected",
+        &["example.com"],
+        "all-denied",
+        &[],
+        Some("daemon rejected the request: failed to apply WFP rules: mock fault injection"),
     )
 }
 
@@ -1341,6 +1388,7 @@ fn tier2a_net_policy_matrix() {
         ("07-wfp-start-failure-fail-closed", net_case_07_wfp_start_failure_is_fail_closed),
         ("08-keepalive-reevaluates-per-request", net_case_08_keepalive_reevaluates_per_request),
         ("09-connect-sni-denied-closes-tunnel", net_case_09_connect_sni_denied_closes_tunnel),
+        ("10-wfp-rejected-response-fail-closed", net_case_10_wfp_rejected_response_is_fail_closed),
     ];
     let mut passed = 0;
     let total = cases.len();

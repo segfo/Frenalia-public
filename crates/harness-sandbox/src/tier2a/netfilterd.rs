@@ -1035,3 +1035,102 @@ mod tests {
         }
     }
 }
+
+#[cfg(windows)]
+#[cfg(test)]
+mod real_daemon_failure_tests {
+    use super::*;
+
+    /// **`docs/STATUS.md` Tier2a残課題#2の「`FwpmEngineOpen0`自体の失敗」を、実daemon・実WFP
+    /// APIで測る。** マシン全体の状態は一切変えない。
+    ///
+    /// `net_case_07`（`tier2a_e2e.rs`）はモックがパイプを閉じるので`connect_and_apply`の
+    /// **I/O失敗**分岐しか通らない。`net_case_10`はモックが`Err`応答を返すので`Rejected`分岐を
+    /// 通るが、返しているのはモックである。ここが埋めるのは最後の1マス——
+    /// **本物の`harness-netfilterd.exe`が、本物の`FwpmEngineOpen0`に失敗したとき、
+    /// 本当に`NetfilterResponse::Err`を返すのか**。
+    ///
+    /// 失敗させる方法は「daemonを非昇格で起動する」だけである。**BFEサービスを止める必要は
+    /// ない**——止めるとWindows Defender Firewall（`mpssvc`が`bfe`に依存している）を巻き込む
+    /// うえ、観測できるのは結局「daemonが`Err`を返す」ことで、この経路と同じである。
+    ///
+    /// **実測で分かったこと（当初の想定は誤りでした）**: 非管理者でも`FwpmEngineOpen0`は
+    /// **成功します**。エンジンハンドルを開くこと自体は許可されており、拒否されるのは
+    /// フィルタストアを書き換える段——実測では`FwpmTransactionBegin0`が
+    /// `FWP status 0x00000005`（`ERROR_ACCESS_DENIED`）で落ちます。
+    /// したがって`docs/STATUS.md`残課題#2の「`FwpmEngineOpen0`自体の失敗」は、
+    /// **権限不足では再現しない**別の条件（BFEサービス停止等でRPC先が消えている場合）を
+    /// 指しています。このテストが埋めるのは「実daemンが実WFP APIの失敗をどう報告するか」で、
+    /// 失敗する具体的な関数名までは固定しません。
+    ///
+    /// **昇格下では自己スキップする。** 管理者で走らせると`FwpmEngineOpen0`が成功して
+    /// 実フィルタが張られてしまい、測定の前提が消えるうえ副作用が残る。
+    #[test]
+    fn a_non_elevated_real_daemon_reports_wfp_failure_as_a_rejected_response() {
+        if crate::tier2a::privhelper::is_elevated() {
+            println!(
+                "SKIP: this test must run non-elevated (an elevated daemon would actually open \
+                 the WFP engine and install real filters)"
+            );
+            return;
+        }
+        let daemon = match daemon_exe_path() {
+            Ok(p) if p.exists() => p,
+            other => {
+                println!("SKIP: harness-netfilterd.exe not found next to the test binary ({other:?}); \
+                          run `cargo build --workspace` first");
+                return;
+            }
+        };
+
+        let prepared = prepare_pipe().expect("prepare pipe");
+        let pipe_name = prepared.name().to_string();
+        let pipe = prepared.into_handle();
+
+        // **昇格させずに**起動する（`launch_daemon_elevated`は使わない）。これが故障注入。
+        let mut child = std::process::Command::new(&daemon)
+            .arg(&pipe_name)
+            .spawn()
+            .expect("spawn the real netfilterd non-elevated");
+
+        // **loopbackポートを必ず1つ入れる。** `WfpSession::apply`は
+        // 「TCP/UDPどちらのloopback許可も空」なら`NoAddressesResolved`で**即座に返り、
+        // `open_dynamic_engine`まで到達しない**（`wfp.rs`冒頭のガード）。空のポリシーで
+        // 回すと「WFP rule application failed: no IP addresses resolved...」という
+        // *別の*失敗で緑になり、`FwpmEngineOpen0`を一度も呼ばないまま
+        // 「エンジンの失敗を測った」と誤認する（この形で1度踏んだ）。
+        let policy = NetfilterPolicy {
+            session_profile: crate::tier2a::session_profile::current_profile_name(),
+            allow_loopback_tcp_ports: vec![18080],
+            ..Default::default()
+        };
+        let result = NetfilterHandle::connect_after_chain_launch(pipe, policy);
+        let _ = child.wait();
+
+        match result {
+            Err(NetfilterError::Rejected(msg)) => {
+                println!("MEASUREMENT: non-elevated real netfilterd -> Rejected({msg})");
+                // **実WFP APIの呼び出しが失敗したことまで要求する。** 「WFP」を含むだけで通す
+                // 緩い判定にすると、APIへ到達する前の事前チェック（`NoAddressesResolved`等）でも
+                // 緑になってしまう。実際に一度その形で緑になった。
+                assert!(
+                    msg.contains("win32 call failed"),
+                    "expected a real WFP API call to fail (that is what makes this a stand-in for \
+                     a stopped BFE). A failure before reaching the API would mean this test is \
+                     not measuring the WFP path at all: {msg}"
+                );
+            }
+            Err(other) => panic!(
+                "expected the daemon to answer with NetfilterResponse::Err (mapped to Rejected), \
+                 but the handshake failed at a different layer: {other}. That means the \
+                 `FwpmEngineOpen0`-failure path does NOT reach the Rejected branch, and \
+                 net_case_10's mock is not standing in for a real failure mode."
+            ),
+            Ok(_handle) => panic!(
+                "the non-elevated daemon reported success -- either this process is elevated \
+                 after all, or WFP no longer requires elevation. Either way the fault injection \
+                 did not happen and this test proves nothing."
+            ),
+        }
+    }
+}

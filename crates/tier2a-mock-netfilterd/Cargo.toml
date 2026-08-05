@@ -15,6 +15,9 @@ name = "tier2a-mock-netfilterd"
 path = "src/main.rs"
 
 [target.'cfg(windows)'.dependencies]
+# `reject`モードのフレーム読み書きは、パイプハンドルを`std::fs::File`へ包んで行う
+# （`src/main.rs`参照）。JSONもリテラルで持つ。**このクレートの依存を増やさないための
+# 意図的な選択**で、`serde_json`も`windows`の`Win32_System_IO`（ReadFile/WriteFile）も要らない。
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
