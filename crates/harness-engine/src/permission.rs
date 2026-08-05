@@ -410,6 +410,38 @@ mod tests {
         );
     }
 
+    /// **層3 hard-deny（D-05）は表記ゆれで迂回できてはならない。**
+    ///
+    /// ここは`apply`の再ゲートではなく**実行前の主ゲート**なので、素の
+    /// `arg_repr`（モデルが書いた文字列そのもの）が渡ってくる。`SandboxFs`側の
+    /// 正規化には頼れない。実測で次の2つが素通りしていた（`docs/bugs/BUG-063.md`）。
+    ///
+    /// - `.GIT/config` — 判定が大小を区別するのにNTFS/APFSは区別しない
+    /// - `././.git/config` — `strip_prefix("./")`が1回しか剥がさない
+    ///
+    /// どちらも`--cow`とは無関係に、Liveワークスペースへ`write_file`1回で届く。
+    #[test]
+    fn config_injection_hard_deny_is_not_bypassable_by_path_spelling() {
+        let arbiter = PermissionArbiter::new(
+            PermissionMode::AcceptAll,
+            vec![AllowlistRule::new("write_file", "*")],
+        );
+        for spelling in [
+            ".GIT/config",
+            ".Git/Config",
+            "././.git/config",
+            "./././.harness/settings.json",
+            ".\\.git\\config",
+            "x/../.git/config",
+        ] {
+            assert_eq!(
+                arbiter.classify("write_file", RiskClass::Write, spelling),
+                Classification::Deny,
+                "spelling {spelling:?} bypassed the D-05 hard-deny"
+            );
+        }
+    }
+
     #[test]
     fn config_injection_path_denied_even_if_allowlisted() {
         let arbiter = PermissionArbiter::new(

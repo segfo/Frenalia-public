@@ -38,7 +38,7 @@ pub enum PathRejection {
     Unsafe(String),
 }
 
-/// workspace相対パスとしての形だけを検査する。
+/// workspace相対パスとしての形を検査し、**正規形**を返す。
 ///
 /// 拒否するもの:
 ///
@@ -48,6 +48,16 @@ pub enum PathRejection {
 ///   畳むと別物になる値を後段へ渡さないため——これがBUG-062のD-09迂回の実体だった）
 /// - 代替データストリーム構文（成分に`:`を含む）
 /// - Windows予約デバイス名（`NUL.txt`のように拡張子付きも対象）
+/// - **成分末尾のドット・スペース**（`.git.`・`.git `）。Win32のパス正規化はこれらを
+///   落とすので、文字列としては別物なのに実FS上は同じ場所を指す。層ごとに落とす/落とさないが
+///   食い違うと迂回の余地になるため、**曖昧な表記そのものを拒否する**（実測では
+///   「書込側は落とすが読取側は落とさない」という不一致で偶然fail-closeしていた。
+///   偶然に頼らない）
+///
+/// **返すのは正規形**（`.`成分を取り除いたもの）である点が重要。`././.git/config`のような
+/// 値を素通ししていたため、`is_config_injection_path`（`./`を1回しか剥がさない）が
+/// D-09のhard-denyを取りこぼしていた。呼び出し側は**戻り値の方**を後段の判定とFS操作の
+/// 両方に使うこと——元の文字列を判定に使うと同じ穴が再生産される。
 pub fn validate_relative_path(path: &str) -> Result<PathBuf, PathRejection> {
     let rel = Path::new(path);
     // UNCは`is_absolute()`より**先**に見る。Windowsでは`\\server\share`もUNC prefix付きの
@@ -62,6 +72,7 @@ pub fn validate_relative_path(path: &str) -> Result<PathBuf, PathRejection> {
     if rel.is_absolute() {
         return Err(PathRejection::Escape);
     }
+    let mut canonical = PathBuf::new();
     for c in rel.components() {
         match c {
             Component::ParentDir => return Err(PathRejection::Escape),
@@ -77,6 +88,13 @@ pub fn validate_relative_path(path: &str) -> Result<PathBuf, PathRejection> {
                         "reserved device name is not allowed: {s}"
                     )));
                 }
+                if s.ends_with('.') || s.ends_with(' ') {
+                    return Err(PathRejection::Unsafe(format!(
+                        "a path component may not end with a dot or a space (Win32 strips them, \
+                         so the spelling is ambiguous): {s}"
+                    )));
+                }
+                canonical.push(part);
             }
             // **`is_absolute()`だけでは足りない**（Windows）。`Path::is_absolute`は
             // 「prefix（`C:`）とroot（`\`）の両方がある」ことを要求するので、次の2つは
@@ -91,10 +109,16 @@ pub fn validate_relative_path(path: &str) -> Result<PathBuf, PathRejection> {
             //
             // どちらもworkspace相対パスではないので拒否する。
             Component::Prefix(_) | Component::RootDir => return Err(PathRejection::Escape),
+            // `.`は正規形から取り除く（後段の前置詞一致を`././`で欺けないようにする）。
             Component::CurDir => {}
         }
     }
-    Ok(rel.to_path_buf())
+    if canonical.as_os_str().is_empty() {
+        return Err(PathRejection::Unsafe(format!(
+            "path has no usable component: {path}"
+        )));
+    }
+    Ok(canonical)
 }
 
 /// Windowsの予約デバイス名（大小・拡張子を無視、`NUL.txt`も対象）。
@@ -172,6 +196,56 @@ mod tests {
                 "expected escape for {p}"
             );
         }
+    }
+
+    /// **`.`成分は正規形から落とす。** 落とさずに素通しすると、後段の
+    /// `is_config_injection_path`（`./`を1回しか剥がさない）が`././.git/config`を
+    /// 取りこぼす（実測で確認したD-09迂回）。
+    #[test]
+    fn current_dir_components_are_removed_from_the_canonical_form() {
+        assert_eq!(
+            validate_relative_path("././.git/config").unwrap(),
+            PathBuf::from(".git").join("config")
+        );
+        assert_eq!(
+            validate_relative_path("./a.txt").unwrap(),
+            PathBuf::from("a.txt")
+        );
+        assert_eq!(
+            validate_relative_path("a/./b/./c.txt").unwrap(),
+            PathBuf::from("a").join("b").join("c.txt")
+        );
+    }
+
+    /// 成分が`.`だけになる値は「使える成分が無い」として拒否する
+    /// （空パスをFS操作へ渡さない）。
+    #[test]
+    fn a_path_made_only_of_current_dir_components_is_rejected() {
+        assert!(matches!(
+            validate_relative_path("."),
+            Err(PathRejection::Unsafe(_))
+        ));
+        assert!(matches!(
+            validate_relative_path("./././"),
+            Err(PathRejection::Unsafe(_))
+        ));
+    }
+
+    /// **末尾のドット・スペースは拒否する。** Win32のパス正規化はこれらを落とすので、
+    /// 文字列としては別物なのに実FS上は同じ場所を指す。実測では「書込側は落とすが
+    /// cap-stdの読取側は落とさない」という層間の不一致で偶然fail-closeしていたが、
+    /// 偶然に頼らず表記そのものを拒否する。
+    #[test]
+    fn components_ending_with_a_dot_or_space_are_rejected_as_ambiguous() {
+        for p in [".git./config", ".git /config", "a/b./c", "trailing "] {
+            assert!(
+                matches!(validate_relative_path(p), Err(PathRejection::Unsafe(_))),
+                "expected {p} to be rejected as an ambiguous spelling"
+            );
+        }
+        // 途中のドットは普通のファイル名なので通す。
+        assert!(validate_relative_path("a.b/c.txt").is_ok());
+        assert!(validate_relative_path(".gitignore").is_ok());
     }
 
     #[test]

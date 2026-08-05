@@ -221,7 +221,7 @@ impl SandboxFs {
                 let rejected = if Path::new(&c.path).is_absolute() {
                     store::ext_key(&c.path).err()
                 } else {
-                    ledger_path_rejection(&c.path).err()
+                    canonical_ledger_path(&c.path).err()
                 };
                 ChangeEntry {
                     op: c.op,
@@ -497,15 +497,26 @@ fn apply_overlay_changes(
         }
 
         // 台帳の値が相対パスとして受け付けられる形かを、実FSへ触る前に確かめる。
-        // ここを通ってはじめて、後段の`is_config_injection_path`（正規化前の前置詞一致）が
-        // 「正規化済みの相対パスしか来ない」という前提を持てる（BUG-062の層2）。
-        if !is_ext {
-            if let Err(reason) = ledger_path_rejection(&c.path) {
-                report.rejected.push((c.path.clone(), reason));
-                continue;
+        // ここを通ってはじめて、後段の`is_config_injection_path`（前置詞一致）が
+        // 「正規形の相対パスしか来ない」という前提を持てる（BUG-062の層2）。
+        //
+        // **以降は`canonical`（`.`成分を除いた正規形）だけを使う。** 元の`c.path`を判定や
+        // FS操作に使うと、`././.git/config`のような表記でhard-denyを取りこぼす
+        // （`is_config_injection_path`は`./`を1回しか剥がさない。実測で確認した迂回）。
+        // `c.path`を使ってよいのは**台帳の照合と報告**だけ——台帳に載っているのはその文字列
+        // なので、`prune_ledger`は元の綴りで引く必要がある。
+        let canonical = if is_ext {
+            c.path.clone()
+        } else {
+            match canonical_ledger_path(&c.path) {
+                Ok(p) => p,
+                Err(reason) => {
+                    report.rejected.push((c.path.clone(), reason));
+                    continue;
+                }
             }
-        }
-        if harness_core::is_config_injection_path(&c.path) {
+        };
+        if harness_core::is_config_injection_path(&canonical) {
             report.hard_denied.push(c.path.clone());
             continue;
         }
@@ -517,7 +528,7 @@ fn apply_overlay_changes(
                 .ok()
                 .map(|b| harness_change_ledger::hash_bytes(&b))
         } else {
-            jail.read_bytes(&c.path)
+            jail.read_bytes(&canonical)
                 .ok()
                 .map(|b| harness_change_ledger::hash_bytes(&b))
         };
@@ -529,7 +540,7 @@ fn apply_overlay_changes(
         let outcome = if is_ext {
             apply_ext_entry(overlay, c)
         } else {
-            apply_workspace_entry(jail, overlay, c)
+            apply_workspace_entry(jail, overlay, &canonical, c.op)
         };
         match outcome {
             Ok(()) => {
@@ -557,12 +568,12 @@ fn apply_overlay_changes(
     Ok(report)
 }
 
-/// 台帳の相対パスが受け付けられない理由（`None`相当＝`Ok`なら受け付ける）。
+/// 台帳の相対パスを検査し、**正規形**（`.`成分を除き`/`区切りに揃えたもの）を返す。
 /// 判定の実体は`harness_change_ledger::validate_relative_path`が持つ（`check_relative_path`と
 /// 同じ関数。2箇所へ別々に書かない、`docs/CODE-STRUCTURE-RULES.md`規則5）。
-fn ledger_path_rejection(path: &str) -> Result<(), String> {
+fn canonical_ledger_path(path: &str) -> Result<String, String> {
     match harness_change_ledger::validate_relative_path(path) {
-        Ok(_) => Ok(()),
+        Ok(canonical) => Ok(normalize_str(&canonical)),
         Err(harness_change_ledger::PathRejection::Escape) => {
             Err("path escapes the workspace root".to_string())
         }
@@ -571,32 +582,36 @@ fn ledger_path_rejection(path: &str) -> Result<(), String> {
 }
 
 /// workspace内エントリ1件の適用。読み書きとも`WorkspaceJail`（openat相当）に閉じる。
+///
+/// `rel`は[`canonical_ledger_path`]を通した正規形であること——台帳の生の綴りを渡すと、
+/// hard-denyの判定と実際に触る場所がずれる余地が戻ってしまう。
 fn apply_workspace_entry(
     jail: &WorkspaceJail,
     overlay: &OverlayBackend,
-    c: &harness_change_ledger::CowChange,
+    rel: &str,
+    op: ChangeOp,
 ) -> Result<(), SandboxError> {
-    match c.op {
+    match op {
         ChangeOp::Delete => {
-            if jail.exists(&c.path) {
-                jail.remove_file(&c.path)?;
+            if jail.exists(rel) {
+                jail.remove_file(rel)?;
             }
             Ok(())
         }
         ChangeOp::Create | ChangeOp::Modify => {
-            if overlay.jail.is_dir(&c.path) {
+            if overlay.jail.is_dir(rel) {
                 // ディレクトリ作成そのものの記録（例`mkdir sub`が台帳へCreateとして残る）。
                 // 実体化するだけでよく、配下の個別ファイルエントリが引き続き同じ
                 // overlayを参照するため、ここではoverlay側を消さない。
-                jail.create_dir_all(&c.path)?;
+                jail.create_dir_all(rel)?;
                 return Ok(());
             }
-            let content = overlay.jail.read_bytes(&c.path)?;
-            jail.write_bytes(&c.path, &content)?;
+            let content = overlay.jail.read_bytes(rel)?;
+            jail.write_bytes(rel, &content)?;
             // overlay側の実体を消しておかないと、Redirectorのcopy_upが「既にupperにある＝
             // このセッションで一度触った」と誤認して、次の変更を台帳へ記録しなくなる
             // （BUG-034）。ベストエフォート、失敗してもcommit自体は成功扱いにする。
-            let _ = overlay.jail.remove_file(&c.path);
+            let _ = overlay.jail.remove_file(rel);
             Ok(())
         }
     }
@@ -1120,6 +1135,82 @@ mod tests {
             "the junction entry must be reported, not silently dropped: {report:?}"
         );
         assert_eq!(report.rejected[0].0, "link/id_rsa");
+    }
+
+    /// **CoW設計書§32 Phase 5「例外的なパス形式」の実測＋受け入れ**（BUG-062の直系の続き）。
+    ///
+    /// D-09のhard-deny（`is_config_injection_path`）は**正規化前の文字列に対する前置詞一致**
+    /// なので、「文字列としては別物だが、実FS上は同じ場所へ着地する」表記があれば同じ形の
+    /// 迂回が成立する。BUG-062で見つかった`x/../.git/config`はその一例にすぎない。
+    ///
+    /// ここで試すのはWindowsのパス正規化に由来する表記ゆれである。
+    ///
+    /// | 表記 | 疑い |
+    /// |---|---|
+    /// | `././.git/config` | `strip_prefix("./")`が**1回しか**剥がさない |
+    /// | `.GIT/config` | 前置詞一致が**大小を区別する**のにNTFSは区別しない |
+    /// | `.git./config` | Win32が成分末尾のドットを落とす |
+    /// | `.git /config` | Win32が成分末尾のスペースを落とす |
+    ///
+    /// **どれか1つでも`.git/config`へ着地したらこのテストは落ちる。**
+    #[test]
+    fn apply_hard_deny_is_not_bypassable_by_exotic_path_spellings() {
+        let forms = [
+            "././.git/config",
+            ".GIT/config",
+            ".git./config",
+            ".git /config",
+        ];
+        let mut landed: Vec<(&str, String)> = Vec::new();
+
+        for form in forms {
+            let (_ws, _upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
+            // upper側に実体を置く。置けない表記（OSが受け付けない名前）はその時点で
+            // 迂回にならないので、作れなかったことを記録して次へ進む。
+            let src = upper_dir.join(form);
+            if let Some(parent) = src.parent() {
+                if std::fs::create_dir_all(parent).is_err() {
+                    println!("MEASUREMENT: {form:<20} -> could not create the overlay source");
+                    continue;
+                }
+            }
+            if std::fs::write(&src, "[core]\n\thooksPath = /tmp/evil\n").is_err() {
+                println!("MEASUREMENT: {form:<20} -> could not write the overlay source");
+                continue;
+            }
+            store::append_entry(&upper_dir, ChangeOp::Create, form, None);
+
+            let fs = SandboxFs::open_with_cow(
+                &workspace_root,
+                &StagingConfig::default(),
+                &ReadScopeConfig::default(),
+                Some(&upper_dir),
+            )
+            .unwrap();
+            let report = fs
+                .apply(&ApplyOptions {
+                    only_glob: None,
+                    only_paths: None,
+                    allow_ext: false,
+                })
+                .unwrap();
+
+            let target = workspace_root.join(".git").join("config");
+            let hit = target.exists();
+            println!(
+                "MEASUREMENT: {form:<20} -> applied={:?} hard_denied={:?} rejected={:?} \
+                 landed_on_.git/config={hit}",
+                report.applied, report.hard_denied, report.rejected
+            );
+            if hit {
+                landed.push((form, format!("{report:?}")));
+            }
+        }
+
+        assert!(
+            landed.is_empty(),
+            "these spellings reached .git/config even though D-09 must hard-deny it: {landed:#?}"
+        );
     }
 
     /// W1-4: applyが拒否する形のエントリは、一覧（`harness changes`・TUI変更パネル）から
