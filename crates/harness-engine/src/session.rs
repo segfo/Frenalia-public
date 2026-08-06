@@ -17,15 +17,28 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    /// `dir`直下に新規セッションファイルを作る（ディレクトリ自体は呼び出し側が
+    /// `dir`直下の新規セッションの**名前を決める**（ディレクトリ自体は呼び出し側が
     /// `create_dir_all`済みであることを前提とする）。
+    ///
+    /// **ファイルはここでは作らない**（[BUG-073](../../../docs/bugs/BUG-073.md)）。実体は
+    /// 最初の[`SessionStore::append_messages`]で作られるので、**1件も発話しなかったセッションは
+    /// ディスク上に存在しない**。起動して`/sessions`で別の会話へ移っただけ、`/clear`した直後に
+    /// 終了しただけ、といった操作で空ファイルが積もらなくなる（空セッションは復元しても何も
+    /// 得られないので、取っておく理由が無い）。
+    ///
+    /// 同一ミリ秒に別プロセスが作った実体があれば番号を進めて避ける。遅延生成では名前を
+    /// 予約できないが、**既存の会話へ追記してしまう**ことだけは防げる（従来の`File::create`は
+    /// 同名を切り詰めていたので、この点はむしろ良くなる）。
     pub fn create_new(dir: &Path) -> io::Result<Self> {
-        let millis = SystemTime::now()
+        let mut millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let path = dir.join(format!("session-{millis}.jsonl"));
-        File::create(&path)?;
+        let mut path = dir.join(format!("session-{millis}.jsonl"));
+        while path.exists() {
+            millis += 1;
+            path = dir.join(format!("session-{millis}.jsonl"));
+        }
         Ok(Self { path })
     }
 
@@ -37,6 +50,10 @@ impl SessionStore {
 
     /// `dir`直下の`session-*.jsonl`のうち更新日時が最も新しいものを開く（`--continue`用）。
     /// 1件も無ければ`Ok(None)`。
+    ///
+    /// BUG-073: **空のファイルは飛ばす。** `--continue`は「直前の会話の続き」を意味するので、
+    /// 中身の無いファイルを選んでも要求を満たせない（新しく作られるセッションはそもそも
+    /// 遅延生成で実体を持たないが、この修正より前に作られた0バイトのファイルが残り得る）。
     pub fn resume_latest(dir: &Path) -> io::Result<Option<Self>> {
         let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
         if !dir.exists() {
@@ -48,7 +65,11 @@ impl SessionStore {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let modified = entry.metadata()?.modified()?;
+            let meta = entry.metadata()?;
+            if meta.len() == 0 {
+                continue;
+            }
+            let modified = meta.modified()?;
             if newest.as_ref().is_none_or(|(_, t)| modified > *t) {
                 newest = Some((path, modified));
             }
@@ -85,6 +106,11 @@ impl SessionStore {
     }
 
     /// `dir`直下の全セッションを更新日時降順で列挙する（`--list-sessions`/`/sessions`用）。
+    ///
+    /// BUG-073: **メッセージが1件も無いセッションは載せない。** 選んでも復元するものが無く、
+    /// 一覧では`(0 msgs)`の無名の行として並ぶだけで、どれが本当の会話かを見分ける邪魔になる。
+    /// 新規セッションは遅延生成（[`SessionStore::create_new`]）で実体を持たないため通常は
+    /// 現れないが、この修正より前に作られた0バイトのファイルはここで落とす。
     pub fn list(dir: &Path) -> io::Result<Vec<SessionSummary>> {
         if !dir.exists() {
             return Ok(Vec::new());
@@ -99,6 +125,9 @@ impl SessionStore {
             let modified = entry.metadata()?.modified()?;
             let store = Self { path: path.clone() };
             let messages = store.load_messages().unwrap_or_default();
+            if messages.is_empty() {
+                continue;
+            }
             let first_prompt = messages
                 .iter()
                 .find(|m| m.role == harness_core::Role::User)
@@ -274,6 +303,55 @@ mod tests {
         assert_eq!(summaries[0].first_prompt.chars().count(), 63); // 60文字+"..."
         assert_eq!(summaries[1].id, older.id());
         assert_eq!(summaries[1].first_prompt, "older prompt");
+    }
+
+    // --- BUG-073: 会話していない空セッションを残さない ---
+
+    /// 名前を決めるだけで実体は作らない。1件も発話しなければディスクに何も残らない。
+    #[test]
+    fn create_new_does_not_touch_the_disk_until_the_first_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create_new(dir.path()).unwrap();
+        assert!(!store.path().exists(), "空のセッションが実体を持ってはいけない");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        store.append_messages(&[msg("hello")]).unwrap();
+        assert!(store.path().exists(), "最初の発話で初めて作られる");
+    }
+
+    /// 空セッションは一覧にも`--continue`にも現れない（0バイトの遺物ファイルも同様）。
+    #[test]
+    fn an_empty_session_is_invisible_to_list_and_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = SessionStore::create_new(dir.path()).unwrap();
+        real.append_messages(&[msg("real conversation")]).unwrap();
+
+        // 修正前の`create_new`が作っていた0バイトファイルを再現する（新しい方が
+        // 更新日時では勝つので、飛ばさないと`--continue`がこちらを選んでしまう）。
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let stale = dir.path().join("session-9999999999999.jsonl");
+        File::create(&stale).unwrap();
+
+        let summaries = SessionStore::list(dir.path()).unwrap();
+        assert_eq!(summaries.len(), 1, "{summaries:?}");
+        assert_eq!(summaries[0].id, real.id());
+
+        let latest = SessionStore::resume_latest(dir.path()).unwrap().unwrap();
+        assert_eq!(latest.path(), real.path());
+    }
+
+    /// 遅延生成では名前を予約できないので、既に実体がある名前は避ける
+    /// （避けないと他プロセスの会話へ追記してしまう）。
+    #[test]
+    fn create_new_avoids_a_name_that_already_has_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = SessionStore::create_new(dir.path()).unwrap();
+        first.append_messages(&[msg("first")]).unwrap();
+
+        let second = SessionStore::create_new(dir.path()).unwrap();
+        assert_ne!(second.path(), first.path());
+        second.append_messages(&[msg("second")]).unwrap();
+        assert_eq!(first.load_messages().unwrap(), vec![msg("first")]);
     }
 
     #[test]

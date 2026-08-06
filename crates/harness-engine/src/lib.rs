@@ -102,6 +102,22 @@ pub fn estimate_messages(messages: &[Message]) -> u64 {
 pub struct ConversationState {
     pub system: Vec<SystemBlock>,
     pub messages: Vec<Message>,
+    /// 圧縮で`messages`の**先頭が畳まれた**累計の目減り数（消えた件数 − 挿入した要約1件）。
+    ///
+    /// `messages`の添字は圧縮をまたぐと意味が変わる。この値を控えておけば、圧縮前に取った
+    /// 位置を圧縮後の添字へ読み替えられる（[`ConversationState::mark`]／
+    /// [`ConversationState::since`]、[BUG-075](../../../docs/bugs/BUG-075.md)）。
+    prefix_shift: usize,
+}
+
+/// ターン開始時の位置を控える栞（[BUG-075](../../../docs/bugs/BUG-075.md)）。
+///
+/// **生の`messages.len()`を控えてはいけない。** ターンの最中に圧縮が走ると履歴の先頭が
+/// 畳まれ、控えた添字が`messages`の長さを超える（＝スライスがパニックする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnMark {
+    len: usize,
+    shift: usize,
 }
 
 impl ConversationState {
@@ -109,6 +125,7 @@ impl ConversationState {
         Self {
             system,
             messages: Vec::new(),
+            prefix_shift: 0,
         }
     }
 
@@ -117,6 +134,28 @@ impl ConversationState {
             role: Role::User,
             content: vec![ContentBlock::Text(text.into())],
         });
+    }
+
+    /// 現在位置に栞を挟む。ターンを回す前に呼び、後で[`ConversationState::since`]へ渡す。
+    pub fn mark(&self) -> TurnMark {
+        TurnMark {
+            len: self.messages.len(),
+            shift: self.prefix_shift,
+        }
+    }
+
+    /// `mark`以降に増えたメッセージ。**間に圧縮が挟まっていても正しい**——畳まれた分だけ
+    /// 控えた位置を前へずらしてから切る。セッションJSONLへの追記はこれを使う。
+    pub fn since(&self, mark: TurnMark) -> &[Message] {
+        let folded = self.prefix_shift.saturating_sub(mark.shift);
+        let start = mark.len.saturating_sub(folded).min(self.messages.len());
+        &self.messages[start..]
+    }
+
+    /// 圧縮が`removed`件を要約1件へ置き換えたことを記録する。呼ぶのは
+    /// [`compaction::compact`]だけ（履歴の先頭を畳む唯一の場所）。
+    pub(crate) fn note_prefix_folded(&mut self, removed: usize) {
+        self.prefix_shift += removed.saturating_sub(1);
     }
 }
 
@@ -277,8 +316,15 @@ where
         let pressure = assess_pressure(state, mark, last_usage, estimate_tokens(&req), &config);
         if pressure.should_compact() {
             let outcome =
-                relieve_pressure(provider, state, &config, events, &pressure, summarized).await?;
+                relieve_pressure(provider, state, &config, events, &pressure, summarized, cancel)
+                    .await?;
             summarized |= outcome.summarized;
+            // BUG-074: 予防的縮約の要約コールは数十秒かかることがある。その最中のEscで
+            // 降りたなら、**リクエストを出す前に**ターンごと畳む（ループ先頭と同じ扱い）。
+            if cancel.is_some_and(|c| c.is_cancelled()) {
+                emit(events, AgentEvent::Cancelled);
+                return Ok(cancelled_outcome());
+            }
             if outcome.relieved {
                 req = build_request(state, &tool_specs, &config);
                 if tier3 {
@@ -304,14 +350,21 @@ where
             // 圧縮リトライは**ストリーム開始前**の失敗にだけ効く。受信中に届いた
             // `ContextTooLong`（`EngineError::Stream`）は下の一般アームでそのまま返す。
             Err(EngineError::Call(ProviderError::ContextTooLong)) => {
-                let removed = compaction::compact(
+                let outcome = compaction::compact(
                     provider,
                     state,
                     &config.model,
                     compaction::DEFAULT_KEEP_RECENT_TURNS,
                     compaction::summarize::chunk_tokens_for(config.compaction.context_window),
+                    cancel,
                 )
                 .await?;
+                // BUG-074: 要約の最中にEscで降りたなら再送しない。履歴は無傷なので、
+                // このターンをキャンセル扱いで畳んで次の発話を待つ。
+                let Some(removed) = outcome.removed() else {
+                    emit(events, AgentEvent::Cancelled);
+                    return Ok(cancelled_outcome());
+                };
                 if removed > 0 {
                     emit(
                         events,
@@ -508,6 +561,7 @@ async fn relieve_pressure(
     events: Option<&EventSink>,
     pressure: &compaction::ContextPressure,
     already_summarized: bool,
+    cancel: Option<&CancellationToken>,
 ) -> Result<Relief, ProviderError> {
     let target = pressure.target_savings();
     let mut relieved = false;
@@ -539,14 +593,23 @@ async fn relieve_pressure(
     }
 
     // ② ローリング要約。不可逆でprompt cacheを全ミスさせるので①で足りなければ初めて使う。
-    let removed = compaction::compact(
+    let outcome = compaction::compact(
         provider,
         state,
         &config.model,
         compaction::DEFAULT_KEEP_RECENT_TURNS,
         compaction::summarize::chunk_tokens_for(config.compaction.context_window),
+        cancel,
     )
     .await?;
+    // BUG-074: キャンセルなら履歴は無傷。①の切詰めは済んでいるのでそれだけ報告して返り、
+    // ターンを畳むかどうかは呼び出し元（`run_agent_loop`）が`cancel`を見て決める。
+    let Some(removed) = outcome.removed() else {
+        return Ok(Relief {
+            relieved,
+            summarized: false,
+        });
+    };
     if removed > 0 {
         relieved = true;
         emit(

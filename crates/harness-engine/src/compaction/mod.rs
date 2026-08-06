@@ -35,7 +35,7 @@ use harness_core::{ContentBlock, Message, Role};
 
 pub use budget::{assess, CompactionOverrides, CompactionPolicy, ContextPressure, PolicyError};
 pub use shrink::{shrink_largest_tool_results, ShrinkOutcome};
-pub use summarize::compact;
+pub use summarize::{compact, Compacted};
 
 /// `/compact`が特に指定しない場合の既定値: 直近2つの外部ユーザターンは逐語保持する。
 pub const DEFAULT_KEEP_RECENT_TURNS: usize = 2;

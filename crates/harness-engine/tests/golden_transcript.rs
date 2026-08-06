@@ -1145,3 +1145,91 @@ async fn the_text_marker_lets_the_downstream_rewind_exactly() {
     );
     assert_eq!(tail, "最終回答");
 }
+
+/// BUG-075: ターンの最中に圧縮が走ると`state.messages`の**先頭が畳まれる**ため、
+/// ターン前に控えた生の添字は`messages`の長さを超えてスライスをパニックさせる。
+/// `ConversationState::mark`/`since`はその読み替えを行い、**このターンで増えた分だけ**を返す。
+///
+/// 修正前の`&state.messages[before..]`は実測で
+/// `range start index 11 out of range for slice of length 5`でパニックした
+/// （TUIではengineタスクが死んでイベント経路が閉じ、TUIごと落ちる）。
+#[tokio::test]
+async fn a_compaction_inside_the_turn_does_not_break_the_session_append_slice() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(vec![
+        ScriptedCall::CallFails(ProviderError::ContextTooLong),
+        ScriptedCall::Streams(end_turn("summary of earlier turns")),
+        ScriptedCall::Streams(end_turn("done")),
+    ]);
+
+    // 圧縮で大きく畳めるだけの履歴（5往復）を用意する。
+    let mut state = ConversationState::new(Vec::new());
+    for i in 0..5 {
+        state.push_user_text(format!("turn{i}"));
+        state.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text(format!("reply{i}"))],
+        });
+    }
+    // 呼び出し側（`harness-tui::engine`・`harness-cli::run_agent`）と同じ順序:
+    // 新しい発話をpushして永続化し、そこへ栞を挟んでからターンを回す。
+    state.push_user_text("the new prompt");
+    let mark = state.mark();
+    assert_eq!(state.messages.len(), 11);
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+
+    run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            compaction: Default::default(),
+            degeneracy: None,
+        },
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    // 圧縮で履歴は縮んでいる（＝控えた添字11はもう使えない）。
+    assert!(
+        state.messages.len() < 11,
+        "この検証は圧縮が実際に起きることが前提: {}",
+        state.messages.len()
+    );
+
+    // セッションJSONLへ追記されるのはこのターンで増えた分だけ——assistantの応答1件。
+    let appended = state.since(mark);
+    assert_eq!(appended.len(), 1, "{appended:?}");
+    assert_eq!(appended[0].role, Role::Assistant);
+    assert_eq!(
+        appended[0].content,
+        vec![ContentBlock::Text("done".to_string())]
+    );
+}
+
+/// 圧縮が起きなければ`since`は素直に「控えた位置以降」を返す（読み替えが常時働いて
+/// 余計にずらす、という逆向きの壊れ方をしないこと）。
+#[test]
+fn without_compaction_the_mark_behaves_like_a_plain_index() {
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("a");
+    let mark = state.mark();
+    assert!(state.since(mark).is_empty());
+
+    state.push_user_text("b");
+    state.push_user_text("c");
+    let since = state.since(mark);
+    assert_eq!(since.len(), 2);
+    assert_eq!(since[0].content, vec![ContentBlock::Text("b".to_string())]);
+}

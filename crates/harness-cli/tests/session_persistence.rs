@@ -41,7 +41,7 @@ async fn run_one_turn(
     session
         .append_messages(&state.messages[state.messages.len() - 1..])
         .unwrap();
-    let before = state.messages.len();
+    let before = state.mark();
 
     let provider = MockProvider::new(vec![end_turn(reply)]);
     let tools = ToolRegistry::with_builtin_tools();
@@ -68,7 +68,7 @@ async fn run_one_turn(
         &mut out,
     )
     .await;
-    session.append_messages(&state.messages[before..]).unwrap();
+    session.append_messages(state.since(before)).unwrap();
 }
 
 /// `--resume <id>`相当: セッションファイルに保存済みのメッセージが新しい`ConversationState`へ

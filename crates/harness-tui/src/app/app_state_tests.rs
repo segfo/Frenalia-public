@@ -1181,3 +1181,211 @@ fn repeated_discards_within_one_turn_keep_every_record_line() {
     assert!(!all.contains("壊れ1"), "{all}");
     assert!(!all.contains("壊れ2"), "{all}");
 }
+
+// --- BUG-068: 復元した会話を画面へ積む ---
+
+fn msg(role: harness_core::Role, content: Vec<harness_core::ContentBlock>) -> harness_core::Message {
+    harness_core::Message { role, content }
+}
+
+/// 件数の通知だけでは「何を再開したのか」が分からない。user/assistantの本文と
+/// ツール呼び出しが、記録された順序どおりに並ぶこと。
+#[test]
+fn a_restored_session_renders_its_conversation_not_just_a_count() {
+    use harness_core::{ContentBlock, Role};
+    let messages = vec![
+        msg(Role::User, vec![ContentBlock::Text("最初の質問".into())]),
+        msg(
+            Role::Assistant,
+            vec![
+                ContentBlock::Thinking { text: "内心".into(), signature: None },
+                ContentBlock::Text("最初の回答".into()),
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({ "path": "a.txt" }),
+                },
+            ],
+        ),
+        msg(
+            Role::User,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "alpha".into(),
+                is_error: false,
+            }],
+        ),
+    ];
+
+    let items = restored_transcript_items(&messages);
+    assert!(
+        matches!(&items[0], TranscriptItem::User(t) if t == "最初の質問"),
+        "{items:?}"
+    );
+    assert!(
+        matches!(&items[1], TranscriptItem::Assistant(t) if t == "最初の回答"),
+        "{items:?}"
+    );
+    match &items[2] {
+        TranscriptItem::ToolCard { name, status, .. } => {
+            assert_eq!(name, "read_file");
+            // 結果は同じカードへ畳み込む（別行にしない）。
+            assert!(
+                matches!(status, ToolCardStatus::Done { is_error: false, output } if output == "alpha"),
+                "{status:?}"
+            );
+        }
+        other => panic!("expected a tool card, got {other:?}"),
+    }
+    assert_eq!(items.len(), 3, "thinkingは再表示しない: {items:?}");
+}
+
+/// `Thinking`を落とすのは、Tier3では履歴から除去される（`harness_engine::sanitize`）ため
+/// 「あるときと無いときで見え方が変わる」のを避けるという理由もある。空テキストも積まない。
+#[test]
+fn thinking_and_empty_text_are_dropped_on_restore() {
+    use harness_core::{ContentBlock, Role};
+    let messages = vec![msg(
+        Role::Assistant,
+        vec![
+            ContentBlock::Thinking { text: "内心".into(), signature: Some("sig".into()) },
+            ContentBlock::RedactedThinking { data: "xx".into() },
+            ContentBlock::Text("   ".into()),
+        ],
+    )];
+    assert!(restored_transcript_items(&messages).is_empty());
+}
+
+/// 対応する`ToolUse`が履歴に無い結果も**捨てない**（片側だけ残ったセッションファイルでも
+/// 情報を失わない）。
+#[test]
+fn an_orphaned_tool_result_is_still_shown() {
+    use harness_core::{ContentBlock, Role};
+    let messages = vec![msg(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "missing".into(),
+            content: "結果だけ残った".into(),
+            is_error: true,
+        }],
+    )];
+    let items = restored_transcript_items(&messages);
+    assert!(
+        matches!(&items[0], TranscriptItem::Info(l) if l.contains("missing") && l.contains("結果だけ残った")),
+        "{items:?}"
+    );
+}
+
+// --- BUG-070: `/compact`の進捗表示と二重起動の防止 ---
+
+/// 進行中は`begin_busy`が`false`を返す（呼び出し側がそれを見て2回目の要約を送らない）。
+#[test]
+fn busy_progress_refuses_to_start_twice() {
+    let mut app = AppState::new("p".into(), "m".into());
+    assert!(app.begin_busy("Compacting context"));
+    assert!(!app.begin_busy("Compacting context"), "二重起動を許してはいけない");
+    assert!(app.is_busy());
+    app.end_busy(BusyEnd::Finished);
+    assert!(!app.is_busy());
+    // 終わったら再度開始できる。
+    assert!(app.begin_busy("Compacting context"));
+}
+
+/// 進行中はtranscript本体を汚さず（一時表示はui.rs側）、終了時に所要時間を1行残す。
+#[test]
+fn busy_progress_leaves_one_record_line_when_it_finishes() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.begin_busy("Compacting context");
+    app.mark_busy_running();
+    assert!(app.transcript.is_empty(), "進行中はtranscriptへ積まない");
+    app.end_busy(BusyEnd::Finished);
+    assert_eq!(app.transcript.len(), 1, "{:?}", app.transcript);
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l)
+            if l.contains("Compacting context") && l.contains("finished")),
+        "{:?}",
+        app.transcript[0]
+    );
+}
+
+// --- BUG-071: キュー待ちと実行中を区別する ---
+
+/// 送っただけでは「実行中」にならない。engineが開始を通知して初めて実行中になる。
+#[test]
+fn a_queued_command_is_not_reported_as_running_until_the_engine_says_so() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.begin_busy("Compacting context");
+    let busy = app.busy_progress.as_ref().expect("表示は出ている");
+    assert!(
+        !busy.is_running(),
+        "送信＝開始ではない（ターン実行中はengineのキューで待つ）"
+    );
+
+    app.mark_busy_running();
+    assert!(app.busy_progress.as_ref().unwrap().is_running());
+}
+
+/// 開始通知を2回受けても実行開始時刻を巻き戻さない（経過時間が飛ぶのを防ぐ）。
+#[test]
+fn a_second_start_notice_does_not_rewind_the_clock() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.begin_busy("Compacting context");
+    app.mark_busy_running();
+    let first = app.busy_progress.as_ref().unwrap().started_at.unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    app.mark_busy_running();
+    assert_eq!(app.busy_progress.as_ref().unwrap().started_at.unwrap(), first);
+}
+
+/// 一度も始まらないまま終わったら「所要時間」を出さない（走っていないので嘘になる）。
+#[test]
+fn a_busy_that_never_ran_does_not_claim_a_duration() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.begin_busy("Compacting context");
+    app.end_busy(BusyEnd::Finished);
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l)
+            if l.contains("ended before it started") && !l.contains("finished")),
+        "{:?}",
+        app.transcript[0]
+    );
+}
+
+// --- BUG-072: 会話が入れ替わったら画面も入れ替える ---
+
+/// `clear_transcript`は表示だけでなくスクロール位置・ターン境界の目印も初期化する
+/// （残すと、消えた行を指したまま巻き戻し先がずれる）。
+#[test]
+fn clearing_the_transcript_also_resets_scroll_and_turn_marks() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 10,
+    });
+    app.apply(AgentEvent::TextDelta {
+        text: "前の会話".into(),
+    });
+    app.scroll_lines(5);
+    assert!(!app.transcript.is_empty());
+    assert_ne!(app.scroll_offset, 0);
+
+    app.clear_transcript();
+    assert!(app.transcript.is_empty());
+    assert_eq!(app.scroll_offset, 0);
+
+    // 消した直後に届いた縮退イベントが、まだ空のtranscriptを巻き戻そうとしても落ちない。
+    app.apply(AgentEvent::TurnDiscarded {
+        kind: harness_core::DegenerateKind::NoveltyCollapse,
+        reason: "test".into(),
+        discarded_bytes: 0,
+        next_rung: None,
+    });
+    assert_eq!(app.transcript.len(), 1, "{:?}", app.transcript);
+}
+
+/// 開始していないのに終了させても何も起きない（イベントが来るたびに呼ぶので冪等が要る）。
+#[test]
+fn ending_a_busy_that_never_started_is_a_no_op() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.end_busy(BusyEnd::Finished);
+    assert!(app.transcript.is_empty());
+}

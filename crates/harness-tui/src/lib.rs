@@ -26,7 +26,9 @@ use harness_engine::{ConversationState, PermissionArbiter, SessionStore};
 use harness_sandbox::{ApplyOptions, ManifestOp, SandboxFs};
 use harness_tools::ToolRegistry;
 
-pub use app::{Action, AppState, ChangeRow, ChangesPanelState, SlashCommand};
+pub use app::{
+    Action, AppState, BusyEnd, BusyProgress, ChangeRow, ChangesPanelState, SlashCommand,
+};
 pub use engine::{spawn_engine, EngineHandle};
 pub use gate::InteractiveGate;
 
@@ -217,6 +219,8 @@ pub async fn run(
     }
 
     let resumed_messages = state.messages.len();
+    // BUG-069: 復元した会話を画面へも積むため、engineへ`state`を渡す前に複製しておく。
+    let restored_messages: Vec<harness_core::Message> = state.messages.clone();
     let new_session_id = session.id();
     // `ctx`は`spawn_engine`へ移動するため、変更パネル（M10）用に先に複製しておく
     // （パネルの開閉・apply/discardはengineタスクを介さず、`ConversationState`と無関係に
@@ -264,14 +268,66 @@ pub async fn run(
     } else if resumed_messages > 0 {
         app.note_resumed_session(resumed_messages);
     }
+    // BUG-069: 件数の通知だけでは「何を再開したのか」が分からない。通知行の**後ろ**へ
+    // 実際のやりとりを積む（通知行が復元分の見出しになる）。
+    app.restore_transcript(&restored_messages);
 
     let mut tick = tokio::time::interval(TICK);
+    // BUG-069: `/sessions`で別セッションへ切り替えたとき、engineが返す`SessionSwitched`
+    // （見出し行）の**後ろ**へ復元分を積むための予約置き場。
+    let mut pending_restore: Option<Vec<harness_core::Message>> = None;
 
     loop {
         tokio::select! {
             ev = engine.events_rx.recv() => {
                 match ev {
-                    Some(ev) => app.apply(ev),
+                    Some(ev) => {
+                        let switched = matches!(ev, harness_core::AgentEvent::SessionSwitched { .. });
+                        // BUG-071: キューを抜けて実際に始まった時点で「待機中」→「実行中」へ移す。
+                        let starts_busy =
+                            matches!(ev, harness_core::AgentEvent::ContextCompactionStarted);
+                        // BUG-070: 要約の完了（成功・失敗のどちらでも）で進捗表示を畳む。
+                        // BUG-071/074: `Error`・`Cancelled`を要約の終了とみなしてよいのは
+                        // **実行中のときだけ**。キューで待っている間に届くこれらは先行する
+                        // ターンのものなので、畳むと要約が始まる前に進捗表示が消えてしまう。
+                        let busy_running =
+                            app.busy_progress.as_ref().is_some_and(|b| b.is_running());
+                        let ends_busy = match &ev {
+                            harness_core::AgentEvent::ContextCompacted { .. } => {
+                                Some(app::BusyEnd::Finished)
+                            }
+                            harness_core::AgentEvent::Error { .. } if busy_running => {
+                                Some(app::BusyEnd::Finished)
+                            }
+                            // BUG-074: 止めたものを「完了した」と書かない。
+                            harness_core::AgentEvent::Cancelled if busy_running => {
+                                Some(app::BusyEnd::Stopped)
+                            }
+                            _ => None,
+                        };
+                        // BUG-072: `/sessions`で**別の会話**へ移るときは、前の会話を画面から
+                        // 消してから見出し行を積む。残すと2つの会話が地続きに見え、モデルが
+                        // 見ていない前半まで「この会話の一部」として読めてしまう。
+                        // `/fork`（`pending_restore`が`None`）は同じ会話の続きなので消さない。
+                        if switched && pending_restore.is_some() {
+                            app.clear_transcript();
+                        }
+                        if starts_busy {
+                            app.mark_busy_running();
+                        }
+                        // 記録行は**結果行より先**に積む。`thinking_progress`が
+                        // `(thought for Ns)`を応答本文の前に出すのと同じで、スピナーがあった
+                        // 位置がそのまま記録になり、結果はその下に続く。
+                        if let Some(how) = ends_busy {
+                            app.end_busy(how);
+                        }
+                        app.apply(ev);
+                        if switched {
+                            if let Some(messages) = pending_restore.take() {
+                                app.restore_transcript(&messages);
+                            }
+                        }
+                    }
                     None => break,
                 }
             }
@@ -299,18 +355,46 @@ pub async fn run(
                                     SlashCommand::Model(m) => engine.set_model(m),
                                     SlashCommand::Mode(mode) => engine.gate.set_mode(mode),
                                     SlashCommand::Allow(rule) => engine.gate.add_allow(rule),
-                                    SlashCommand::Compact => engine.compact(),
-                                    SlashCommand::Clear => engine.clear(),
+                                    // BUG-070: 要約はLLM呼び出しなので数秒〜数十秒かかる。
+                                    // 進捗を出さないとユーザーは「効いていない」と思って
+                                    // 連打し、**その回数だけ要約が直列に走る**。
+                                    SlashCommand::Compact => {
+                                        if app.begin_busy("Compacting context") {
+                                            engine.compact();
+                                        } else {
+                                            app.transcript.push(app::TranscriptItem::Info(
+                                                "compaction is already running; ignoring this /compact".to_string(),
+                                            ));
+                                        }
+                                    }
+                                    // BUG-072: engine側は会話状態を捨てて新しいセッションへ
+                                    // 差し替えるので、画面も同時に空にする。片方だけ消すと
+                                    // 「画面には残っているのにモデルは覚えていない」という
+                                    // `/sessions`と同型のズレになる（engineは`/clear`で
+                                    // イベントを返さないので、ここで1行だけ通知も出す）。
+                                    SlashCommand::Clear => {
+                                        engine.clear();
+                                        app.clear_transcript();
+                                        app.transcript.push(app::TranscriptItem::Info(
+                                            "cleared conversation (started a new session)".to_string(),
+                                        ));
+                                    }
                                     SlashCommand::Fork => engine.fork(),
                                     SlashCommand::Sessions => {
                                         // ピッカーの間は描画/入力ループを一時的に明け渡す
                                         // （`/clear`等と同じくengineタスクへコマンドを送るだけの
                                         // 他分岐と異なり、選択自体をここでブロッキング的に待つ）。
                                         match picker::run_picker(&mut term, &mut term_events, &sessions_dir).await {
+                                            // BUG-069: 切替後の会話も画面へ積む。ただし
+                                            // engineは`SessionSwitched`通知を**非同期で**返すので、
+                                            // ここで積むと見出し行が復元分の後ろに来てしまう。
+                                            // 通知を受け取った時点で積むよう予約しておく。
                                             Ok(picker::PickerOutcome::Selected(s, msgs)) => {
+                                                pending_restore = Some(msgs.clone());
                                                 engine.switch_session(s, msgs);
                                             }
                                             Ok(picker::PickerOutcome::Forked { session: s, messages, .. }) => {
+                                                pending_restore = Some(messages.clone());
                                                 engine.switch_session(s, messages);
                                             }
                                             Ok(picker::PickerOutcome::Cancelled) => {}

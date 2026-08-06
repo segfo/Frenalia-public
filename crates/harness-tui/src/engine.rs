@@ -120,7 +120,8 @@ pub fn spawn_engine(
                     let Some(prompt) = prompt else { break };
                     state.push_user_text(prompt);
                     let _ = session.append_messages(&state.messages[state.messages.len() - 1..]);
-                    let before_turn = state.messages.len();
+                    // BUG-075: 生の`len()`を控えるとターン中の圧縮でスライスがパニックする。
+                    let before_turn = state.mark();
 
                     let turn_cancel = CancellationToken::new();
                     *cancel_for_task.lock().unwrap() = turn_cancel.clone();
@@ -145,7 +146,7 @@ pub fn spawn_engine(
                         |_delta: &str| {},
                     )
                     .await;
-                    let _ = session.append_messages(&state.messages[before_turn..]);
+                    let _ = session.append_messages(state.since(before_turn));
                     if let Err(e) = result {
                         let _ = events_tx.send(AgentEvent::Error {
                             message: e.to_string(),
@@ -159,6 +160,16 @@ pub fn spawn_engine(
                             model = m;
                         }
                         EngineCommand::Compact => {
+                            // BUG-074: Escは`cancel_slot`に入っているトークンを発火させる。
+                            // ターン用のものが入ったままだと`/compact`中のEscは**どこにも
+                            // 届かない**ので、要約用のトークンを作って差し替える
+                            // （＝Escは常に「いま走っているもの」を止める、という一貫した規則）。
+                            let compact_cancel = CancellationToken::new();
+                            *cancel_for_task.lock().unwrap() = compact_cancel.clone();
+                            // BUG-071: このコマンドは**キューで待たされ得る**（ターン実行中は
+                            // このループ本体が返らないので`command_rx`を1度もpollしない）。
+                            // 送信時ではなくここが実際の開始点なので、その時点を通知する。
+                            let _ = events_tx.send(AgentEvent::ContextCompactionStarted);
                             match compaction::compact(
                                 provider.as_ref(),
                                 &mut state,
@@ -167,12 +178,18 @@ pub fn spawn_engine(
                                 compaction::summarize::chunk_tokens_for(
                                     compaction.context_window,
                                 ),
+                                Some(&compact_cancel),
                             )
                             .await
                             {
-                                Ok(removed) => {
-                                    let _ = events_tx.send(AgentEvent::ContextCompacted {
-                                        removed_messages: removed,
+                                Ok(outcome) => {
+                                    let _ = events_tx.send(match outcome.removed() {
+                                        Some(removed_messages) => {
+                                            AgentEvent::ContextCompacted { removed_messages }
+                                        }
+                                        // 履歴は無傷のまま。ターンのキャンセルと同じ通知にする
+                                        // （ユーザーから見れば「止めた」という同じ操作の結果）。
+                                        None => AgentEvent::Cancelled,
                                     });
                                 }
                                 Err(e) => {

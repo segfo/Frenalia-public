@@ -319,6 +319,26 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
         )));
     }
 
+    // BUG-070: `/compact`のようなターン外のバックグラウンド処理も、走っていることが
+    // 見えないとユーザーは「効いていない」と思って連打してしまう。同じ位置・同じ見た目で
+    // 出す（新しい語彙を覚えさせない）。
+    //
+    // BUG-071: ただし**まだ走っていない**なら`(queued)`と断る。engineは単一タスクで
+    // ターンとコマンドを直列に処理するので、ターン実行中に送った`/compact`はキューで待つ。
+    // ここで区別しないと、上の`Thinking…`と並んで2本のスピナーが回り、**同時に処理されて
+    // いるように見えてしまう**。
+    if let Some(busy) = &app.busy_progress {
+        let glyph = SPINNER_FRAMES[app.spinner_frame % SPINNER_FRAMES.len()];
+        let elapsed = busy.elapsed().as_secs_f32();
+        let queued = if busy.is_running() { "" } else { " (queued)" };
+        lines.push(Line::from(Span::styled(
+            format!("{glyph} {}{queued}… ({elapsed:.1}s)", busy.label),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+
     lines
 }
 

@@ -4,6 +4,7 @@
 //! ときだけ呼ばれる。不可逆かつprompt cacheを全ミスさせるので、常に最後の手段。
 
 use futures::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 use harness_core::{
     CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError, Role, Sampling,
@@ -37,7 +38,8 @@ pub fn chunk_tokens_for(context_window: u32) -> u64 {
 /// thinking/redacted_thinkingは要約に取り込まず単純に破棄する（要約後は二度とプロバイダへ
 /// 送らないため「無改変で往復」の対象外）。
 ///
-/// 圧縮対象が無ければ（ターン境界が`keep_recent_turns`件以下）何もせず`Ok(0)`を返す。
+/// 圧縮対象が無ければ（ターン境界が`keep_recent_turns`件以下）何もせず
+/// `Ok(Compacted::Summarized { removed: 0 })`を返す。
 ///
 /// # チャンク分割
 ///
@@ -52,18 +54,26 @@ pub fn chunk_tokens_for(context_window: u32) -> u64 {
 /// （全滅させない）。1つも要約が取れないまま失敗した場合だけ`Err`を返す。`plans/PLAN-COMPACTION.md`は
 /// 「失敗したことは戻り値に出す」と書いているが、呼び出し元を触らないという同文書の要求と両立しない
 /// ため、**部分要約であることは要約テキスト自身に印字**し、戻り値では「全滅か否か」だけを区別する。
+///
+/// # キャンセル（[BUG-074](../../../../docs/bugs/BUG-074.md)）
+///
+/// `cancel`が発火したらチャンク境界とストリーム受信の両方で降り、[`Compacted::Cancelled`]を返す。
+/// **履歴は一切変更されない**——この関数は全チャンクの要約が揃ってから初めて`state.messages`を
+/// 書き換えるので、途中で降りれば会話は無傷のまま残る（部分要約で畳んで「途中で止めた」を
+/// 気付かせない、という結果にはならない）。
 pub async fn compact(
     provider: &dyn LlmProvider,
     state: &mut ConversationState,
     model: &str,
     keep_recent_turns: usize,
     chunk_tokens: u64,
-) -> Result<usize, ProviderError> {
+    cancel: Option<&CancellationToken>,
+) -> Result<Compacted, ProviderError> {
     let Some(cut) = super::protect_boundary(&state.messages, keep_recent_turns) else {
-        return Ok(0);
+        return Ok(Compacted::Summarized { removed: 0 });
     };
     if cut == 0 {
-        return Ok(0);
+        return Ok(Compacted::Summarized { removed: 0 });
     }
 
     let head = state.messages[..cut].to_vec();
@@ -73,8 +83,10 @@ pub async fn compact(
     let chunk_count = ranges.len();
 
     for (i, range) in ranges.into_iter().enumerate() {
-        match summarize_chunk(provider, state, model, &summary, &head[range]).await {
-            Ok(next) => summary = next,
+        match summarize_chunk(provider, state, model, &summary, &head[range], cancel).await {
+            Ok(Some(next)) => summary = next,
+            // キャンセルは失敗ではないので、取れた分で畳まずそのまま降りる。
+            Ok(None) => return Ok(Compacted::Cancelled),
             Err(e) => {
                 if summary.trim().is_empty() {
                     // 1つも取れていないなら縮約は成立していない。履歴は一切触らず失敗を返す。
@@ -104,8 +116,36 @@ pub async fn compact(
     }];
     new_messages.extend(state.messages.drain(cut..));
     state.messages = new_messages;
+    // BUG-075: 添字の意味がここでずれる。控えた位置を読み替えられるよう記録しておく
+    // （`messages`を書き換えるのと同じ場所で必ず更新する——離すと必ず片方が漏れる）。
+    state.note_prefix_folded(removed);
 
-    Ok(removed)
+    Ok(Compacted::Summarized { removed })
+}
+
+/// [`compact`]の結果。「畳んだ」と「キャンセルされた」を**別の値**にしてある
+/// （[BUG-074](../../../../docs/bugs/BUG-074.md)）。
+///
+/// 畳む対象が無かった場合も`Summarized { removed: 0 }`なので、`0`をキャンセルの意味に
+/// 流用しない。呼び出し側が「要約は走ったが何も減らなかった」と「ユーザーが止めた」を
+/// 取り違えると、`ContextCompacted { removed_messages: 0 }`のような**起きていない出来事**を
+/// 報告してしまう。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compacted {
+    /// 要約が完了し、`removed`件の元メッセージを要約1件へ置き換えた（0なら対象が無かった）。
+    Summarized { removed: usize },
+    /// 途中でキャンセルされた。**履歴は変更していない。**
+    Cancelled,
+}
+
+impl Compacted {
+    /// 畳んだ元メッセージ数。キャンセルされていれば`None`。
+    pub fn removed(self) -> Option<usize> {
+        match self {
+            Compacted::Summarized { removed } => Some(removed),
+            Compacted::Cancelled => None,
+        }
+    }
 }
 
 /// `messages`を`chunk_tokens`以内のチャンクへ割る。**分割点は必ずターン境界**。
@@ -148,13 +188,18 @@ fn chunk_ranges(messages: &[Message], chunk_tokens: u64) -> Vec<std::ops::Range<
 }
 
 /// 1チャンク分の要約コール。`prev`が空でなければ「ここまでの要約」を先頭に載せて畳み込む。
+///
+/// `cancel`が発火したら`Ok(None)`。**受信途中でも降りられる**ようにストリームの読み出し全体を
+/// レースの対象にしてある——要約は数十秒かかることがあり、「コールの切れ目でしか止まらない」
+/// では実用的なキャンセルにならない。
 async fn summarize_chunk(
     provider: &dyn LlmProvider,
     state: &ConversationState,
     model: &str,
     prev: &str,
     chunk: &[Message],
-) -> Result<String, ProviderError> {
+    cancel: Option<&CancellationToken>,
+) -> Result<Option<String>, ProviderError> {
     let mut messages: Vec<Message> = Vec::with_capacity(chunk.len() + 2);
     if !prev.trim().is_empty() {
         messages.push(Message {
@@ -189,14 +234,26 @@ async fn summarize_chunk(
         crate::sanitize::completion_request(&mut req);
     }
 
-    let mut stream = provider.stream(req).await?;
-    let mut out = String::new();
-    while let Some(event) = stream.next().await {
-        if let StreamEvent::TextDelta { text, .. } = event? {
-            out.push_str(&text);
+    let work = async {
+        let mut stream = provider.stream(req).await?;
+        let mut out = String::new();
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::TextDelta { text, .. } = event? {
+                out.push_str(&text);
+            }
         }
+        Ok::<String, ProviderError>(out)
+    };
+
+    match cancel {
+        // `biased`で先にキャンセルを見る。既に発火していればリクエストを1本も出さずに降りる。
+        Some(token) => tokio::select! {
+            biased;
+            _ = token.cancelled() => Ok(None),
+            result = work => result.map(Some),
+        },
+        None => work.await.map(Some),
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -212,6 +269,8 @@ mod tests {
         turns: Mutex<Vec<Vec<StreamEvent>>>,
         calls: std::sync::atomic::AtomicUsize,
         fail_from: Option<usize>,
+        /// `n`回目のコールを処理する時点でこのトークンを発火させる（Escを押した瞬間の再現）。
+        cancel_at: Option<(CancellationToken, usize)>,
     }
 
     impl MockProvider {
@@ -220,12 +279,24 @@ mod tests {
                 turns: Mutex::new(turns),
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 fail_from: None,
+                cancel_at: None,
             }
         }
 
         fn failing_from(turns: Vec<Vec<StreamEvent>>, fail_from: usize) -> Self {
             Self {
                 fail_from: Some(fail_from),
+                ..Self::new(turns)
+            }
+        }
+
+        fn cancelling_at(
+            turns: Vec<Vec<StreamEvent>>,
+            token: CancellationToken,
+            call: usize,
+        ) -> Self {
+            Self {
+                cancel_at: Some((token, call)),
                 ..Self::new(turns)
             }
         }
@@ -248,6 +319,11 @@ mod tests {
             ProviderError,
         > {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some((token, at)) = &self.cancel_at {
+                if n == *at {
+                    token.cancel();
+                }
+            }
             if self.fail_from.is_some_and(|f| n >= f) {
                 return Err(ProviderError::Overloaded);
             }
@@ -301,9 +377,11 @@ mod tests {
 
         let provider = MockProvider::new(vec![summary_turn("summary of turn1/turn2")]);
 
-        let removed = compact(&provider, &mut state, "mock-model", 1, 1_000_000)
+        let removed = compact(&provider, &mut state, "mock-model", 1, 1_000_000, None)
             .await
-            .unwrap();
+            .unwrap()
+            .removed()
+            .expect("キャンセルしていない");
 
         assert_eq!(removed, 4);
         assert_eq!(state.messages.len(), 3);
@@ -323,9 +401,11 @@ mod tests {
         state.messages.push(assistant_text("reply1"));
 
         let provider = MockProvider::new(vec![]);
-        let removed = compact(&provider, &mut state, "mock-model", 2, 1_000_000)
+        let removed = compact(&provider, &mut state, "mock-model", 2, 1_000_000, None)
             .await
-            .unwrap();
+            .unwrap()
+            .removed()
+            .expect("キャンセルしていない");
 
         assert_eq!(removed, 0);
         assert_eq!(state.messages.len(), 2);
@@ -385,9 +465,11 @@ mod tests {
             summary_turn("s4"),
         ]);
         // 1ターン（≒110トークン）ごとに1チャンクへ割れる予算。
-        let removed = compact(&provider, &mut state, "mock-model", 1, 120)
+        let removed = compact(&provider, &mut state, "mock-model", 1, 120, None)
             .await
-            .unwrap();
+            .unwrap()
+            .removed()
+            .expect("キャンセルしていない");
 
         assert_eq!(removed, 8);
         assert_eq!(provider.calls_made(), 4, "チャンクごとに1コール");
@@ -409,9 +491,11 @@ mod tests {
         state.messages.push(user_turn("recent"));
 
         let provider = MockProvider::failing_from(vec![summary_turn("s1"), summary_turn("s2")], 2);
-        let removed = compact(&provider, &mut state, "mock-model", 1, 120)
+        let removed = compact(&provider, &mut state, "mock-model", 1, 120, None)
             .await
-            .unwrap();
+            .unwrap()
+            .removed()
+            .expect("キャンセルしていない");
 
         assert_eq!(removed, 8, "履歴は畳まれる");
         match &state.messages[0].content[0] {
@@ -434,12 +518,75 @@ mod tests {
         let before = state.messages.clone();
 
         let provider = MockProvider::failing_from(vec![], 0);
-        let err = compact(&provider, &mut state, "mock-model", 1, 120)
+        let err = compact(&provider, &mut state, "mock-model", 1, 120, None)
             .await
             .unwrap_err();
 
         assert!(matches!(err, ProviderError::Overloaded));
         assert_eq!(state.messages, before, "失敗時に履歴を壊さない");
+    }
+
+    // --- BUG-074: 要約中のEscで降りられる ---
+
+    /// 既にキャンセル済みなら、providerへ**1本もリクエストを出さず**に降りる。
+    #[tokio::test]
+    async fn an_already_cancelled_compaction_never_calls_the_provider() {
+        let mut state = ConversationState::new(Vec::new());
+        for i in 0..3 {
+            state.messages.push(user_turn(&format!("turn{i}")));
+            state.messages.push(assistant_text("reply"));
+        }
+        let before = state.messages.clone();
+
+        let provider = MockProvider::new(vec![summary_turn("never used")]);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = compact(&provider, &mut state, "mock-model", 1, 120, Some(&cancel))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, Compacted::Cancelled);
+        assert_eq!(provider.calls_made(), 0, "1本も出さない");
+        assert_eq!(state.messages, before, "履歴は無傷");
+    }
+
+    /// 途中でキャンセルされたら、**取れていた要約で畳まない**。部分要約で畳むと
+    /// 「止めたのに履歴が変わっている」という取り返しのつかない結果になる
+    /// （失敗時の部分要約フォールバックとは意味が違う——あちらはユーザーが待っている）。
+    #[tokio::test]
+    async fn cancelling_partway_through_does_not_fold_a_partial_summary() {
+        let mut state = ConversationState::new(Vec::new());
+        for i in 0..4 {
+            state.messages.push(user_turn(&format!("turn{i}")));
+            state.messages.push(assistant_text(&"x".repeat(400)));
+        }
+        state.messages.push(user_turn("recent"));
+        let before = state.messages.clone();
+
+        let cancel = CancellationToken::new();
+        // 1本目のコールの最中にEscを押した状況。2本目に入る前に降りる。
+        let provider = MockProvider::cancelling_at(
+            vec![summary_turn("s1"), summary_turn("s2"), summary_turn("s3")],
+            cancel.clone(),
+            0,
+        );
+
+        let outcome = compact(&provider, &mut state, "mock-model", 1, 120, Some(&cancel))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, Compacted::Cancelled);
+        assert_eq!(provider.calls_made(), 1, "降りた後は打たない");
+        assert_eq!(state.messages, before, "部分要約で畳まない");
+    }
+
+    /// `Summarized { removed: 0 }`（畳む対象が無い）とキャンセルを取り違えない。
+    #[test]
+    fn nothing_to_compact_is_not_the_same_value_as_cancelled() {
+        assert_eq!(Compacted::Summarized { removed: 0 }.removed(), Some(0));
+        assert_eq!(Compacted::Cancelled.removed(), None);
+        assert_ne!(Compacted::Summarized { removed: 0 }, Compacted::Cancelled);
     }
 
     #[test]

@@ -52,6 +52,18 @@ pub enum AgentEvent {
     /// 部分assistantは破棄済み、ツール実行中なら残り全ての`tool_use`にcancelledな`tool_result`が
     /// 合成済みで、いずれの場合も`state`は次の`run_agent_loop`呼び出しが400にならない形に保たれる。
     Cancelled,
+    /// フロントエンドが**コマンドとして**起動したコンテキスト圧縮（TUIの`/compact`）が、
+    /// engineのコマンドキューを抜けて**実際に始まった**（[BUG-071](../../../docs/bugs/BUG-071.md)）。
+    ///
+    /// engineは単一タスクで、ターンとコマンドを`tokio::select!`の1つのループ本体で直列に
+    /// 処理する。したがって進行中のターンがあれば`/compact`はキューで待つ。**送信＝開始ではない**
+    /// ので、「待っている」と「走っている」をフロントエンドが区別できるようこれを出す。
+    ///
+    /// **エージェントループ内部の自動圧縮（`ContextTooLong`のリアクティブ経路・使用率トリガの
+    /// プロアクティブ経路）は発行しない。** あちらはターン進行中に起きるので既に`TurnStarted`
+    /// 以降の進捗表示があり、かつターン内のイベント列は
+    /// `crates/harness-engine/tests/golden_transcript.rs`が契約として固定している。
+    ContextCompactionStarted,
     /// コンテキスト圧縮が実行された（`/compact`手動起動、または`ProviderError::ContextTooLong`の
     /// リアクティブ経路、M9）。`removed_messages`は要約に畳み込まれ削除された元メッセージ数。
     ContextCompacted {

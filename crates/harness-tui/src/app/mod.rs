@@ -8,6 +8,7 @@ use harness_core::{AgentEvent, RiskClass, StopReason, ToolOutput, Usage};
 use harness_engine::{parse_allowlist_rule, AllowlistRule, Decision, PermissionMode};
 
 use crate::diff::{line_diff, DiffLine};
+use events::{pretty, MAX_OUTPUT_PREVIEW};
 
 /// transcript末尾に表示する一時的な「考え中」インジケータのスピナーグリフ。
 /// `AppState::spinner_frame`でインデックスし、`lib.rs`の描画tick（33ms間隔）ごとに送る。
@@ -68,6 +69,44 @@ mod tests;
 pub struct ChangeRow {
     pub entry: harness_sandbox::ChangeEntry,
     pub diff: Vec<DiffLine>,
+}
+
+/// ターン以外のバックグラウンド処理（`/compact`の要約）の進捗
+/// （[BUG-070](../../../docs/bugs/BUG-070.md)・[BUG-071](../../../docs/bugs/BUG-071.md)）。
+///
+/// **キュー待ちと実行中を別の状態として持つ**のが要点。engineは単一タスクでターンとコマンドを
+/// 直列に処理するため、ターン実行中に送った`/compact`はキューで待つ。送信時点から「実行中」と
+/// 見せると、ターンと要約が同時に走っているように見えてしまう。
+#[derive(Debug, Clone)]
+pub struct BusyProgress {
+    /// コマンドをengineへ送った時刻（＝キューに入った時刻）。
+    pub queued_at: Instant,
+    /// engineが実際に処理を始めた時刻（`AgentEvent::ContextCompactionStarted`受信時）。
+    /// キューで待っている間は`None`。
+    pub started_at: Option<Instant>,
+    pub label: String,
+}
+
+/// [`AppState::end_busy`]の終わり方。記録行の動詞を決めるためだけの区別だが、
+/// **止めたものを「完了した」と書かない**という点でこれは事実の区別である
+/// （[BUG-074](../../../docs/bugs/BUG-074.md)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyEnd {
+    /// 最後まで走った（成功・失敗のどちらでも、走り切ったならこちら）。
+    Finished,
+    /// ユーザーが止めた。
+    Stopped,
+}
+
+impl BusyProgress {
+    /// 画面に出す経過時間。実行中なら開始から、待機中はキューに入ってからの時間。
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started_at.unwrap_or(self.queued_at).elapsed()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.started_at.is_some()
+    }
 }
 
 /// 変更パネルの状態。`rejected`に含まれるインデックスは`c`（コミット）から除外される
@@ -159,6 +198,9 @@ pub struct AppState {
     /// 変更（changes）パネル（M10）。`Some`の間は他の全キー入力をパネル操作専用に奪う
     /// （`pending_permission`と同じ排他パターン）。
     pub changes_panel: Option<ChangesPanelState>,
+    /// ターン以外のバックグラウンド処理（`/compact`の要約）の進捗表示（BUG-070・BUG-071）。
+    /// `thinking_progress`と同じくtranscript末尾への一時表示で、`transcript`本体には積まない。
+    pub busy_progress: Option<BusyProgress>,
 }
 
 /// `PageUp`/`PageDown`1回あたりのスクロール行数。端末の実際の高さは`AppState`が知らないため
@@ -198,6 +240,7 @@ impl AppState {
             key_debug: false,
             host_is_vscode: false,
             changes_panel: None,
+            busy_progress: None,
         }
     }
 
@@ -235,6 +278,77 @@ impl AppState {
     /// 描画tick（33ms間隔）ごとに呼ぶ。スピナーのフレームを送るだけ。
     pub fn tick(&mut self) {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
+    }
+
+    /// ターン以外のバックグラウンド処理（`/compact`の要約など）を**キューへ入れた**ことを
+    /// 記録し、進捗表示を始める（[BUG-070](../../../docs/bugs/BUG-070.md)・
+    /// [BUG-071](../../../docs/bugs/BUG-071.md)）。
+    ///
+    /// `thinking_progress`と同じくtranscript末尾へ一時表示するだけで、`transcript`本体は
+    /// 汚さない。**既に進行中なら`false`を返す**ので、呼び出し側はそれを見て二重起動を防ぐ
+    /// （キュー待ちの間も`true`を返さない——engineのコマンドチャネルは無制限なので、
+    /// ここで止めないと待っている分だけ積み上がる）。
+    ///
+    /// この時点ではまだ**走っていない**。実際に始まったら[`AppState::mark_busy_running`]。
+    pub fn begin_busy(&mut self, label: &str) -> bool {
+        if self.busy_progress.is_some() {
+            return false;
+        }
+        self.busy_progress = Some(BusyProgress {
+            queued_at: Instant::now(),
+            started_at: None,
+            label: label.to_string(),
+        });
+        true
+    }
+
+    /// キューを抜けてengineが実際に処理を始めた（BUG-071）。表示を「待機中」から「実行中」へ移す。
+    /// 既に実行中なら何もしない（同じ開始通知を2回受けても時計を巻き戻さない）。
+    pub fn mark_busy_running(&mut self) {
+        if let Some(busy) = self.busy_progress.as_mut() {
+            if busy.started_at.is_none() {
+                busy.started_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// 進行中の表示を終了し、所要時間を記録行として1行残す。
+    /// キューで待った時間が実測できる場合は**それも併記する**——ターンの後ろで待っていたことが
+    /// 後から分からないと、「要約に何十秒もかかった」という誤解が残る。
+    ///
+    /// 呼ぶのは**結果行を積む前**。`thinking_progress`が`(thought for Ns)`を応答本文の前へ
+    /// 出すのと同じで、スピナーがあった位置がそのまま記録行になり、結果はその下に続く。
+    pub fn end_busy(&mut self, how: BusyEnd) {
+        let Some(busy) = self.busy_progress.take() else {
+            return;
+        };
+        let line = match busy.started_at {
+            Some(started) => {
+                let queued = started.duration_since(busy.queued_at).as_secs_f32();
+                let ran = started.elapsed().as_secs_f32();
+                // BUG-074: ユーザーが止めたものを「完了した」と言わない。
+                let verb = match how {
+                    BusyEnd::Finished => "finished in",
+                    BusyEnd::Stopped => "stopped after",
+                };
+                if queued >= 0.1 {
+                    format!(
+                        "{} {verb} {ran:.1}s ({queued:.1}s queued behind the current turn)",
+                        busy.label
+                    )
+                } else {
+                    format!("{} {verb} {ran:.1}s", busy.label)
+                }
+            }
+            // 開始通知を受けないまま終わった（engineタスクが落ちた等）。走っていないので
+            // 「所要時間」を出すと嘘になる。
+            None => format!("{} ended before it started", busy.label),
+        };
+        self.transcript.push(TranscriptItem::Info(line));
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.busy_progress.is_some()
     }
 
     /// `thinking_progress`が表示中だった場合、それを終了させる共通処理。thinkingを実際に
@@ -290,5 +404,98 @@ impl AppState {
         self.transcript.push(TranscriptItem::Info(format!(
             "resumed session ({message_count} messages)"
         )));
+    }
+
+    /// 復元した会話を実際に画面へ積む（[BUG-069](../../../docs/bugs/BUG-069.md)）。
+    ///
+    /// 件数の通知だけでは、**ユーザーが何を再開したのか分からない**。`--resume`・ピッカーの
+    /// Enter/`f`・対話中の`/sessions`/`/fork`はいずれも会話状態（engine側）を差し替えるが、
+    /// 画面のトランスクリプトは空のままだった。
+    pub fn restore_transcript(&mut self, messages: &[harness_core::Message]) {
+        for item in restored_transcript_items(messages) {
+            self.transcript.push(item);
+        }
+    }
+
+    /// 画面のトランスクリプトを空にする（[BUG-072](../../../docs/bugs/BUG-072.md)）。
+    ///
+    /// **会話そのものが別物に入れ替わる経路からだけ呼ぶ**——`/sessions`での別セッションへの
+    /// 切替と`/clear`。残したままだと前の会話と新しい会話が地続きに見え、ユーザーには
+    /// 1つの長い会話として読めてしまう（モデルは前半を見ていないのに、である）。
+    ///
+    /// `/fork`からは呼ばない。Forkは**同じ会話の続き**なので、画面もそのまま続くのが正しい。
+    pub fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.turn_open = false;
+        self.turn_transcript_mark = 0;
+        self.scroll_offset = 0;
+    }
+}
+
+/// 復元したメッセージ列を表示要素へ写す純粋関数（副作用が無いので単体テストできる）。
+///
+/// **`Thinking`/`RedactedThinking`は落とす**——署名付きで再表示しても読み物にならず、Tier3では
+/// そもそも履歴から除去される（`harness_engine::sanitize`）ため、あるときと無いときで
+/// 見え方が変わってしまう。`Image`も同様に落とす（TUIは画像を描けない）。
+pub fn restored_transcript_items(messages: &[harness_core::Message]) -> Vec<TranscriptItem> {
+    use harness_core::{ContentBlock, Role};
+
+    let mut items: Vec<TranscriptItem> = Vec::new();
+    for msg in messages {
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text(text) if text.trim().is_empty() => {}
+                ContentBlock::Text(text) => items.push(match msg.role {
+                    Role::User => TranscriptItem::User(text.clone()),
+                    _ => TranscriptItem::Assistant(text.clone()),
+                }),
+                ContentBlock::ToolUse { id, name, input } => items.push(TranscriptItem::ToolCard {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: pretty(input),
+                    // 履歴なので実行は既に終わっている。結果がこの後の`ToolResult`で
+                    // 見つかれば上書きする（見つからなければ「結果不明」のまま残す）。
+                    status: ToolCardStatus::Done {
+                        is_error: false,
+                        output: "(result not recorded in this session file)".to_string(),
+                    },
+                }),
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let card = items.iter_mut().rev().find(
+                        |i| matches!(i, TranscriptItem::ToolCard { id, .. } if id == tool_use_id),
+                    );
+                    let output = truncate_preview(content);
+                    match card {
+                        Some(TranscriptItem::ToolCard { status, .. }) => {
+                            *status = ToolCardStatus::Done {
+                                is_error: *is_error,
+                                output,
+                            };
+                        }
+                        // 対応する`ToolUse`が履歴に無い（片側だけ残った）場合も落とさない。
+                        _ => items.push(TranscriptItem::Info(format!(
+                            "tool result for {tool_use_id} (call not in this session file): {output}"
+                        ))),
+                    }
+                }
+                ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
+                | ContentBlock::Image { .. } => {}
+            }
+        }
+    }
+    items
+}
+
+fn truncate_preview(content: &str) -> String {
+    if content.chars().count() > MAX_OUTPUT_PREVIEW {
+        let head: String = content.chars().take(MAX_OUTPUT_PREVIEW).collect();
+        format!("{head}... (truncated)")
+    } else {
+        content.to_string()
     }
 }

@@ -582,7 +582,8 @@ async fn headless_branch(
         );
         return ExitCode::FAILURE;
     }
-    let before_run = state.messages.len();
+    // BUG-075: 生の`len()`を控えるとターン中の圧縮でスライスがパニックする。
+    let before_run = state.mark();
 
     // Tier3準備（VM+コンテナ起動、コールドブート数分/ウォーム再利用約20秒）を
     // ここで行い、待機中はstderrへ進捗行を出す（TUI分岐は`harness_tui::run`内で
@@ -630,7 +631,7 @@ async fn headless_branch(
         &mut stdout,
     )
     .await;
-    let _ = session.append_messages(&state.messages[before_run..]);
+    let _ = session.append_messages(state.since(before_run));
 
     #[cfg(windows)]
     if let Some(handle) = vm_sandbox_handle {

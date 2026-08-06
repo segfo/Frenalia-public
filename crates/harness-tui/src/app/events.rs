@@ -138,6 +138,11 @@ impl AppState {
                 self.turn_in_flight = false;
                 self.end_thinking_progress(false);
             }
+            // BUG-071: 開始したこと自体はtranscriptへ積まない。進捗は`busy_progress`が持つ
+            // 一時行で表し、待機中→実行中の遷移は`lib.rs`が`mark_busy_running`で行う
+            // （`AppState`は「イベントを畳んで画面を作る」責務だけを持ち、`busy_progress`の
+            // ライフサイクルはコマンドを送った側＝`lib.rs`が握る、という既存の分担に合わせる）。
+            AgentEvent::ContextCompactionStarted => {}
             AgentEvent::ContextCompacted { removed_messages } => {
                 self.transcript.push(TranscriptItem::Info(format!(
                     "context compacted ({removed_messages} messages summarized)"
@@ -249,7 +254,7 @@ pub(super) fn pretty(v: &serde_json::Value) -> String {
     serde_json::to_string(v).unwrap_or_default()
 }
 
-const MAX_OUTPUT_PREVIEW: usize = 400;
+pub(super) const MAX_OUTPUT_PREVIEW: usize = 400;
 
 pub(super) fn truncate_output(output: &ToolOutput) -> String {
     if output.content.chars().count() > MAX_OUTPUT_PREVIEW {
