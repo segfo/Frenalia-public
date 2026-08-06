@@ -25,18 +25,50 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
             CONFIG.get(),
             unsafe { object_attributes_path(object_attributes) },
         ) {
-            if let Some(Classified { rel, ledger_key: rel_str }) = classify_target(cfg, &path) {
+            if let Some(Classified { rel, ledger_key: rel_str, kind }) = classify_target(cfg, &path) {
                 let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
                     || rel_str.to_ascii_lowercase().contains("grandchild");
                 if is_probe {
                     debug_log(&format!(
-                        "hooked_nt_create_file: rel={rel_str:?} desired_access={:#x} \
+                        "hooked_nt_create_file: rel={rel_str:?} kind={kind:?} desired_access={:#x} \
                          disposition={:#x} write_intent={} upper_exists={}",
                         desired_access.0,
                         create_disposition.0,
                         is_write_intent(desired_access.0, Some(create_disposition.0)),
                         cfg.upper_dir.join(&rel).is_file(),
                     ));
+                }
+                // BUG-066: upper配下の実体を直接開いている＝**既にCoWの行き先**。誘導は
+                // 一切せず（upperのupperは作らない）、書込意図のときだけ台帳へ記録して
+                // 素通しする。tombstone判定（`check_deleted`）も掛けない——あれは
+                // 「workspaceをどう見せるか」の論理であって、行き先の実体への直接アクセスに
+                // 被せると、削除済みパスのupper実体を消すことすらできなくなる。
+                if kind == TargetKind::UpperAlias {
+                    if should_redirect_write(
+                        is_write_intent(desired_access.0, Some(create_disposition.0)),
+                        create_options.0,
+                        Some(create_disposition.0),
+                    ) {
+                        record_upper_alias_write(cfg, &rel_str);
+                    }
+                    let hook = CREATE_FILE_HOOK.get().expect("hook installed");
+                    let status = unsafe {
+                        hook.call(
+                            file_handle,
+                            desired_access,
+                            object_attributes,
+                            io_status_block,
+                            allocation_size,
+                            file_attributes,
+                            share_access,
+                            create_disposition,
+                            create_options,
+                            ea_buffer,
+                            ea_length,
+                        )
+                    };
+                    track_new_handle(file_handle, status, &rel_str, create_options.0);
+                    return status;
                 }
                 if let Some(status) =
                     check_deleted(cfg, &rel_str, is_create_capable_disposition(create_disposition.0))
@@ -223,16 +255,36 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
             CONFIG.get(),
             unsafe { object_attributes_path(object_attributes) },
         ) {
-            if let Some(Classified { rel, ledger_key: rel_str }) = classify_target(cfg, &path) {
+            if let Some(Classified { rel, ledger_key: rel_str, kind }) = classify_target(cfg, &path) {
                 let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
                     || rel_str.to_ascii_lowercase().contains("grandchild");
                 if is_probe {
                     debug_log(&format!(
-                        "hooked_nt_open_file: rel={rel_str:?} desired_access={desired_access:#x} \
-                         write_intent={} upper_exists={}",
+                        "hooked_nt_open_file: rel={rel_str:?} kind={kind:?} \
+                         desired_access={desired_access:#x} write_intent={} upper_exists={}",
                         is_write_intent(desired_access, None),
                         cfg.upper_dir.join(&rel).is_file(),
                     ));
+                }
+                // BUG-066: upper配下の実体を直接開いている（`hooked_nt_create_file`と同じ理由）。
+                if kind == TargetKind::UpperAlias {
+                    if should_redirect_write(is_write_intent(desired_access, None), open_options, None)
+                    {
+                        record_upper_alias_write(cfg, &rel_str);
+                    }
+                    let hook = OPEN_FILE_HOOK.get().expect("hook installed");
+                    let status = unsafe {
+                        hook.call(
+                            file_handle,
+                            desired_access,
+                            object_attributes,
+                            io_status_block,
+                            share_access,
+                            open_options,
+                        )
+                    };
+                    track_new_handle(file_handle, status, &rel_str, open_options);
+                    return status;
                 }
                 // `NtOpenFile`は既存ファイルを開く操作のみ（`FILE_OPEN`相当）のため、
                 // 論理削除済みなら常に失敗させる（再作成の余地は無い）。
@@ -420,7 +472,11 @@ pub(crate) unsafe fn rewrite_rename_target(
 ) -> Option<(Vec<u8>, usize)> {
     let old_rel = handle_paths().lock().unwrap().get(&handle_key).cloned()?;
     let new_path = unsafe { rename_target_path(info_ptr) }?;
-    let Classified { rel: new_rel, ledger_key: new_rel_str } = classify_target(cfg, &new_path)?;
+    let Classified { rel: new_rel, ledger_key: new_rel_str, kind: _ } =
+        classify_target(cfg, &new_path)?;
+    // `kind`で分岐しないのは、`UpperAlias`でも`rel`がupperルートからの相対なので
+    // `upper_dir.join(&new_rel)`が**移動先そのもの**（恒等）になるため。台帳の2行
+    // （旧パスDelete＋新パスCreate/Modify）はどちらの種別でも同じように要る。
     let upper_new = cfg.upper_dir.join(&new_rel);
     if let Some(parent) = upper_new.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -517,7 +573,12 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_full_attributes_file(
             CONFIG.get(),
             unsafe { object_attributes_path(object_attributes) },
         ) {
-            if let Some(Classified { rel, ledger_key: rel_str }) = classify_target(cfg, &path) {
+            if let Some(Classified { rel, ledger_key: rel_str, kind }) = classify_target(cfg, &path) {
+                // upper配下の実体そのものへの照会は、見せ方を変えない（素通し）。
+                if kind == TargetKind::UpperAlias {
+                    let hook = QUERY_FULL_ATTR_HOOK.get().expect("hook installed");
+                    return unsafe { hook.call(object_attributes, file_information) };
+                }
                 let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
                     || rel_str.to_ascii_lowercase().contains("grandchild");
                 if is_probe {
@@ -574,7 +635,12 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_attributes_file(
             CONFIG.get(),
             unsafe { object_attributes_path(object_attributes) },
         ) {
-            if let Some(Classified { rel, ledger_key: rel_str }) = classify_target(cfg, &path) {
+            if let Some(Classified { rel, ledger_key: rel_str, kind }) = classify_target(cfg, &path) {
+                // upper配下の実体そのものへの照会は、見せ方を変えない（素通し）。
+                if kind == TargetKind::UpperAlias {
+                    let hook = QUERY_ATTR_HOOK.get().expect("hook installed");
+                    return unsafe { hook.call(object_attributes, file_information) };
+                }
                 let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
                     || rel_str.to_ascii_lowercase().contains("grandchild");
                 if is_probe {

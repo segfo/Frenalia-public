@@ -210,6 +210,57 @@ mod tests {
         assert!(parsed.ext_capture_roots.is_empty());
     }
 
+    /// **BUG-066の追加検証（2026-08-06）**: DLLが受け取った設定のルートは、綴りが揺れていても
+    /// 同じ形へ揃うこと。`spawn`側（`normalize_cow_root`）が既に正規化しているが、DLL側でも
+    /// 独立に揃えるのは、注入blob経由の孫世代や、将来別経路から設定が来た場合の保険である。
+    #[test]
+    fn finalize_config_folds_every_root_spelling() {
+        let upper = tempfile::tempdir().unwrap();
+        for root in [
+            PathBuf::from(r"C:\ws\"),
+            PathBuf::from(r"\\?\C:\ws"),
+            PathBuf::from(r"\??\C:\ws"),
+        ] {
+            let cfg = finalize_config(Config {
+                workspace_root: root.clone(),
+                upper_dir: PathBuf::from(format!(r"\\?\{}\", upper.path().to_string_lossy())),
+                ext_capture_roots: vec![PathBuf::from(r"\\?\D:\ext\")],
+            });
+            assert_eq!(cfg.workspace_root, PathBuf::from(r"C:\ws"), "root={root:?}");
+            assert_eq!(cfg.upper_dir, upper.path());
+            assert_eq!(cfg.ext_capture_roots, vec![PathBuf::from(r"D:\ext")]);
+        }
+    }
+
+    /// **BUG-066の追加検証**: workspace_rootが絶対パスでない（`--cwd .`相当）ときだけ、
+    /// 警告台帳へ`config_workspace_not_absolute`が残ること。この形は判定規則では救えない
+    /// （絶対パスと照合しようがない）ので、**黙って透過性が全滅する代わりに名乗る**のが
+    /// 唯一の防御になる。2026-08-05のセッションにはこの痕跡がどこにも無かった。
+    #[test]
+    fn finalize_config_warns_when_the_workspace_root_is_not_absolute() {
+        let upper = tempfile::tempdir().unwrap();
+        let warnings = upper.path().join(COW_WARNINGS_LEDGER_FILENAME);
+
+        let cfg = finalize_config(Config {
+            workspace_root: PathBuf::from("."),
+            upper_dir: upper.path().to_path_buf(),
+            ext_capture_roots: Vec::new(),
+        });
+        assert_eq!(cfg.workspace_root, PathBuf::from("."));
+        let text = std::fs::read_to_string(&warnings).expect("warnings ledger must be written");
+        assert!(text.contains("config_workspace_not_absolute"), "{text}");
+        assert!(text.contains("BUG-066"), "the warning must point at the writeup: {text}");
+
+        // 絶対パスなら1行も増やさない（正常系を騒がせない）。
+        let before = std::fs::read_to_string(&warnings).unwrap_or_default();
+        finalize_config(Config {
+            workspace_root: PathBuf::from(r"C:\ws"),
+            upper_dir: upper.path().to_path_buf(),
+            ext_capture_roots: Vec::new(),
+        });
+        assert_eq!(std::fs::read_to_string(&warnings).unwrap_or_default(), before);
+    }
+
     /// 壊れた/不足したブロブは`None`になり、環境変数フォールバックへ落ちること
     /// （`resolve_config`の分岐条件）。
     #[test]
@@ -408,6 +459,86 @@ mod tests {
             cfg.upper_dir.join(&classified.rel),
             upper.path().join("_ext").join(&expected_key)
         );
+    }
+
+    /// **BUG-066の回帰テスト（B-1）**: workspace_rootの綴りが実際に渡されるパスと大小・
+    /// 末尾区切りで食い違っていても、workspace内と判定し**相対パスまで返し切る**こと。
+    /// 旧実装はここで`None`を返し、呼び出し側が「workspace外」と誤認して素通し→ACL拒否に
+    /// なっていた（`--cow`セッションで書込が1件もリダイレクトされない状態）。
+    #[test]
+    fn classify_target_matches_workspace_paths_whose_spelling_differs_in_case_or_trailing_sep() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let target = workspace.path().join("sub").join("merge-demo.txt");
+        for root in [
+            PathBuf::from(workspace.path().to_string_lossy().to_uppercase()),
+            PathBuf::from(format!("{}\\", workspace.path().to_string_lossy())),
+            PathBuf::from(format!("\\\\?\\{}", workspace.path().to_string_lossy())),
+        ] {
+            let cfg = Config {
+                workspace_root: root.clone(),
+                upper_dir: upper.path().to_path_buf(),
+                ext_capture_roots: Vec::new(),
+            };
+            let classified =
+                classify_target(&cfg, &target).unwrap_or_else(|| panic!("must classify with root={root:?}"));
+            assert_eq!(classified.kind, TargetKind::Workspace);
+            assert_eq!(classified.ledger_key, "sub/merge-demo.txt");
+            assert_eq!(cfg.upper_dir.join(&classified.rel), upper.path().join("sub").join("merge-demo.txt"));
+        }
+    }
+
+    /// **BUG-066の回帰テスト（B-2）**: upper配下の実体を直接指すパスは、同じファイルの
+    /// 別の綴りとして**workspaceと同じ台帳キー**へ写る（リダイレクトはしない）。
+    #[test]
+    fn classify_target_treats_a_path_inside_the_upper_dir_as_an_alias_with_the_same_ledger_key() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            workspace_root: workspace.path().to_path_buf(),
+            upper_dir: upper.path().to_path_buf(),
+            ext_capture_roots: Vec::new(),
+        };
+
+        let classified = classify_target(&cfg, &upper.path().join("merge-demo.txt"))
+            .expect("a direct write into the upper dir must classify");
+
+        assert_eq!(classified.kind, TargetKind::UpperAlias);
+        assert_eq!(classified.ledger_key, "merge-demo.txt");
+        // 誘導先は自分自身（＝「upperのupper」は作らない）。
+        assert_eq!(
+            cfg.upper_dir.join(&classified.rel),
+            upper.path().join("merge-demo.txt")
+        );
+    }
+
+    /// CoW自身の帳簿（`.harness-cow-*`）と`_ext`配下は別名として扱わない
+    /// （前者は変更ではない、後者はhost側の実体走査が拾う）。
+    #[test]
+    fn classify_target_ignores_cow_bookkeeping_and_ext_entries_inside_the_upper_dir() {
+        let workspace = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            workspace_root: workspace.path().to_path_buf(),
+            upper_dir: upper.path().to_path_buf(),
+            ext_capture_roots: Vec::new(),
+        };
+        for name in [
+            COW_OPS_LEDGER_FILENAME,
+            ".harness-cow-denied.jsonl",
+            ".harness-cow-session.json",
+        ] {
+            assert!(
+                classify_target(&cfg, &upper.path().join(name)).is_none(),
+                "{name} must not be recorded as a change"
+            );
+        }
+        assert!(classify_target(
+            &cfg,
+            &upper.path().join(harness_change_ledger::COW_BASELINE_DIRNAME).join("a.txt")
+        )
+        .is_none());
+        assert!(classify_target(&cfg, &upper.path().join("_ext").join("c").join("x.txt")).is_none());
     }
 
     /// capture root配下でもworkspace配下でもないパスは`None`（素通し対象）。

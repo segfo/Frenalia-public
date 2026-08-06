@@ -123,6 +123,14 @@ fn push_apply_report(app: &mut AppState, report: &harness_sandbox::ApplyReport) 
             )
         }
     )));
+    // BUG-066: 台帳に無いオーバーレイ実体は**件数だけでは足りない**——「適用されなかった変更が
+    // upperに残っている」という復旧手段そのものなので、パスを1件ずつ見せる。
+    for path in &report.unledgered {
+        app.transcript.push(app::TranscriptItem::Info(format!(
+            "unledgered (in the overlay but not recorded; baseline unknown, not applied): {path} \
+             -- `harness apply --adopt-unledgered` to take it",
+        )));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -370,6 +378,10 @@ pub async fn run(
                                             only_glob: None,
                                             only_paths: Some(&only_paths),
                                             allow_ext: false,
+                                            // BUG-066: baselineが不明なエントリはTUIからも
+                                            // 黙って取り込まない（`push_apply_report`が
+                                            // `unledgered:`として見せる）。
+                                            adopt_unledgered: false,
                                         }) {
                                             Ok(report) => push_apply_report(&mut app, &report),
                                             Err(e) => app.apply(harness_core::AgentEvent::Error {
@@ -387,6 +399,7 @@ pub async fn run(
                                             only_glob: None,
                                             only_paths: None,
                                             allow_ext: false,
+                                            adopt_unledgered: false,
                                         }) {
                                             Ok(report) => push_apply_report(&mut app, &report),
                                             Err(e) => app.apply(harness_core::AgentEvent::Error {
@@ -494,7 +507,16 @@ pub async fn run(
                                                             }
                                                         }
                                                         match attempt.finalize(&fs) {
-                                                            Ok(()) => {
+                                                            // BUG-065: markerが残ったまま書いた場合は
+                                                            // 未解決として数える（内容は書く）。
+                                                            Ok(true) => {
+                                                                app.transcript.push(app::TranscriptItem::Error(format!(
+                                                                    "unresolved: {} (conflict markers remain)",
+                                                                    attempt.path
+                                                                )));
+                                                                failed += 1;
+                                                            }
+                                                            Ok(false) => {
                                                                 app.transcript.push(app::TranscriptItem::Info(format!(
                                                                     "resolved: {}",
                                                                     attempt.path

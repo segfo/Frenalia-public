@@ -118,6 +118,157 @@ fn cow_write_is_redirected_to_upper_and_workspace_stays_unchanged() {
     assert_eq!(upper_new_content, "created-by-child");
 }
 
+/// **BUG-066の追加検証（2026-08-06）**: `HARNESS_COW_WORKSPACE`の綴りが揺れても、DLL単体で
+/// リダイレクトが成立することを実機で確かめる。
+///
+/// 2026-08-05の障害では、DLLがworkspace内の絶対パスを**workspace外と判定**して全書込がACL拒否に
+/// なっていた。候補だった綴りは4つ（相対パス・大小差・末尾区切り・`\\?\`前置）で、どれだったかは
+/// 残存証跡から特定できない。ここでは4つとも**実際にDLLへ届けて**結果を測る。
+///
+/// **正規化をすり抜けて生の綴りを届ける方法**: `spawn`は呼び出し側の`env`をそのまま子へ渡し、
+/// 自分の`HARNESS_COW_WORKSPACE`（`normalize_cow_root`済み）は**後から**push する。
+/// `build_env_block`の`sort_by_key`は安定ソートなので、呼び出し側が積んだ同名エントリが前に並び、
+/// 環境ブロックの線形探索では前勝ちになる。**この前提は推測しない**——プローブに
+/// `$env:HARNESS_COW_WORKSPACE`を印字させ、テスト自身が「生の綴りが届いたこと」を確認してから
+/// 結果を解釈する。
+#[test]
+#[ignore]
+fn cow_redirect_survives_every_workspace_root_spelling() {
+    // (ラベル, 綴りの作り方, リダイレクトが成立すべきか)
+    type Spelling = (&'static str, fn(&std::path::Path) -> String, bool);
+    let spellings: &[Spelling] = &[
+        ("control (as-is)", |p| p.to_string_lossy().into_owned(), true),
+        ("uppercased", |p| p.to_string_lossy().to_uppercase(), true),
+        ("trailing separator", |p| format!("{}\\", p.to_string_lossy()), true),
+        ("verbatim prefix", |p| format!(r"\\?\{}", p.to_string_lossy()), true),
+        // 相対パスだけは判定規則では救えない（絶対パスと照合しようがない）。**黙って壊れる
+        // のではなく名乗る**ことがここでの合格条件になる。
+        ("relative (--cwd .)", |_| ".".to_string(), false),
+    ];
+
+    for (label, make_spelling, expect_redirect) in spellings {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let upper = tempfile::tempdir().expect("upper tempdir");
+        std::fs::write(workspace.path().join("important.txt"), "original")
+            .expect("seed important.txt");
+
+        let sid = session_sid();
+        let write_mode = WorkspaceWriteMode::Cow {
+            upper_dir: upper.path().to_path_buf(),
+        };
+        // ACL付与は常に**実パス**で行う（実験対象はDLLが受け取る文字列だけに絞る）。
+        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+        let raw_spelling = make_spelling(workspace.path());
+        // 2026-08-05に実際に失敗した操作の形＝**絶対パス指定の書込**。
+        let script = format!(
+            "Write-Output \"COWWS=$env:HARNESS_COW_WORKSPACE\"; \
+             try {{ Set-Content -LiteralPath '{}' -Value 'modified-by-child' -NoNewline; \
+             Write-Output 'ABS=ok' }} catch {{ Write-Output 'ABS=fail' }}",
+            workspace.path().join("important.txt").display()
+        );
+
+        let (shell, _) = resolve_shell();
+        let mut env = crate::secret_env::build_child_env();
+        // `spawn`が後から積む正規化済みの値より前に並ぶ（安定ソート）。
+        env.insert(0, ("HARNESS_COW_WORKSPACE".to_string(), raw_spelling.clone()));
+        let child = spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", &script],
+            workspace.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            NetworkCapability::Deny,
+            Some(CowInject {
+                workspace_root: workspace.path(),
+                upper_dir: upper.path(),
+                ext_capture_roots: &[],
+            }),
+        )
+        .expect("spawn with cow injection should succeed");
+        let (stdout, stderr, _code) = child
+            .write_stdin_read_output_and_wait(None)
+            .expect("child should run to completion");
+
+        // 前提の検証: 生の綴りが本当に子へ届いたか（届いていなければ以降の解釈は無意味）。
+        assert!(
+            stdout.contains(&format!("COWWS={raw_spelling}")),
+            "[{label}] premise not met: the raw spelling did not reach the child. \
+             expected COWWS={raw_spelling}, stdout={stdout} stderr={stderr}"
+        );
+
+        let upper_file = upper.path().join("important.txt");
+        let ops = harness_change_ledger::store::read_ledger_entries(upper.path());
+        let denied = harness_change_ledger::store::read_denied_log(upper.path());
+        let denied_inside: Vec<&str> = denied
+            .iter()
+            .filter(|e| {
+                harness_change_ledger::path_rules::relative_under_root(
+                    &e.path,
+                    &workspace.path().to_string_lossy(),
+                )
+                .is_some()
+            })
+            .map(|e| e.path.as_str())
+            .collect();
+
+        if *expect_redirect {
+            assert!(
+                stdout.contains("ABS=ok"),
+                "[{label}] the write must succeed through the redirector: stdout={stdout}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&upper_file).ok().as_deref(),
+                Some("modified-by-child"),
+                "[{label}] the write must land in the upper dir"
+            );
+            assert!(
+                ops.iter().any(|e| e.path == "important.txt"),
+                "[{label}] the operations ledger must record it: ops={ops:?}"
+            );
+            assert!(
+                denied_inside.is_empty(),
+                "[{label}] no write inside the workspace may be denied: {denied_inside:?}"
+            );
+        } else {
+            // 相対パス: リダイレクトは成立しない（構造的に不可能）。**その代わり名乗る**。
+            assert!(
+                stdout.contains("ABS=fail"),
+                "[{label}] the write is expected to be denied by the read-only ACL: stdout={stdout}"
+            );
+            assert!(!upper_file.exists(), "[{label}] nothing may reach the upper dir");
+            assert!(ops.is_empty(), "[{label}] the operations ledger stays empty: ops={ops:?}");
+            assert!(
+                !denied_inside.is_empty(),
+                "[{label}] the denied ledger must record the in-workspace attempt so that \
+                 `harness changes` can report it as a lost change (BUG-066のC層): denied={denied:?}"
+            );
+            // 警告台帳のファイル名はRedirector DLL側（`state.rs`）の定数だが、このクレートは
+            // DLLへ依存しないので他の警告系テストと同じくリテラルで書く。
+            let warnings =
+                std::fs::read_to_string(upper.path().join(".harness-cow-warnings.jsonl"))
+                    .unwrap_or_default();
+            assert!(
+                warnings.contains("config_workspace_not_absolute"),
+                "[{label}] the DLL must announce why transparency is gone: warnings={warnings:?}"
+            );
+        }
+        // 実workspace本体は全ケースで不変（境界＝ACLはこの実験の影響を受けない）。
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("important.txt")).unwrap(),
+            "original",
+            "[{label}] the workspace body must never change (boundary = ACL)"
+        );
+        println!(
+            "MEASUREMENT: workspace_root spelling {label:?} -> redirect={} ops={} denied_inside={}",
+            stdout.contains("ABS=ok"),
+            ops.len(),
+            denied_inside.len()
+        );
+    }
+}
+
 /// Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴
 /// （`preflight`の`granted_passthrough`）への子プロセスの書込が、Redirector DLLにより
 /// `_ext/<key>`経由でupperへcaptureされ、実ターゲットには一切触れないことを確認する。
@@ -860,6 +1011,7 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
             only_glob: None,
             only_paths: None,
             allow_ext: false,
+            adopt_unledgered: false,
         },
     )
     .expect("apply_cow should succeed");
@@ -1033,6 +1185,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
             only_glob: None,
             only_paths: None,
             allow_ext: false,
+            adopt_unledgered: false,
         },
     )
     .expect("apply A should succeed");
@@ -1058,6 +1211,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
             only_glob: None,
             only_paths: None,
             allow_ext: false,
+            adopt_unledgered: false,
         },
     )
     .expect("apply B should succeed (as an operation; entries land in conflicts)");
@@ -1165,6 +1319,7 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
             only_glob: None,
             only_paths: None,
             allow_ext: false,
+            adopt_unledgered: false,
         },
     )
     .expect("apply_cow should succeed");
@@ -1282,6 +1437,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
             only_glob: None,
             only_paths: None,
             allow_ext: false,
+            adopt_unledgered: false,
         },
     )
     .expect("apply_cow should succeed");
@@ -1894,6 +2050,7 @@ fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_upper
             only_glob: None,
             only_paths: None,
             allow_ext: false,
+            adopt_unledgered: false,
         },
     )
     .expect("apply must not fail the whole batch because of one crafted entry");

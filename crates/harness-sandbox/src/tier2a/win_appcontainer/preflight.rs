@@ -424,12 +424,61 @@ fn sweep_stale_redirector_dll_aces() {
     }
 }
 
+/// プロセスのカレントディレクトリにできるパスの実測上限（文字数）。
+///
+/// **`CreateProcessW`が新しいプロセスへ与えるカレントディレクトリは`MAX_PATH`から逃げられません。**
+/// 末尾の区切りとNUL終端の分を含めて260に収まる必要がある＝ディレクトリ自体は258文字まで。
+///
+/// この開発機での実測（`LongPathsEnabled=1`、2026-08-06。[BUG-068](../../../../docs/bugs/BUG-068.md)）:
+///
+/// | 操作 | `longPathAware`マニフェスト無し | 有り |
+/// |---|---|---|
+/// | `SetCurrentDirectoryW`（自プロセス、295文字） | `ERROR_FILENAME_EXCED_RANGE`(206) | **成功** |
+/// | `CreateProcessW`＋`lpCurrentDirectory`（295文字） | `ERROR_DIRECTORY`(267) | `ERROR_DIRECTORY`(267) |
+/// | `CreateProcessW`＋継承（親のcwdが295文字） | （前提不成立） | `ERROR_INVALID_PARAMETER`(87) |
+///
+/// つまり**マニフェストのオプトインは自プロセスのcwdしか解放しません**（Microsoftの
+/// 「最大ファイルパスの制限」ページが挙げる対象一覧にも`SetCurrentDirectoryW`はあるが
+/// `CreateProcessW`は無い）。明示的に渡しても親から継承させても、子プロセスへ260超のcwdは
+/// 与えられないので、harness側にマニフェストを足しても**この制限は変わりません**（実測済み。
+/// 再検討する前にこの表を見ること）。境界は258文字で、259文字から失敗します。
+///
+/// `\\?\`前置も解決になりません。285文字のverbatim形も同じ267で失敗し、短いパスですら
+/// verbatim形のcwdは`cmd.exe`が「UNCパスはサポートされません」としてWindowsディレクトリへ
+/// 黙って切り替えます（＝verbatimをcwdに使ってはいけない）。
+const MAX_CHILD_CWD_LEN: usize = 258;
+
+/// workspaceを子プロセスのカレントディレクトリにできるか（[BUG-068](../../../../docs/bugs/BUG-068.md)の
+/// 追加検証で判明した、harnessではなくWindows側の限界）。
+///
+/// 超えている場合、`smoke_test_spawn`が`CreateProcessW: ディレクトリ名が無効です (0x8007010B)`で
+/// 落ちます——**存在する正しいディレクトリなのに「無効」と言われる**ので、原因に辿り着くのが
+/// 難しい。ACEを付ける前にここで止め、理由と回避策を名指しします。
+fn check_workspace_usable_as_child_cwd(workspace_root: &Path) -> Result<(), AppContainerError> {
+    let len = workspace_root.to_string_lossy().encode_utf16().count();
+    if len <= MAX_CHILD_CWD_LEN {
+        return Ok(());
+    }
+    Err(AppContainerError::Preflight(format!(
+        "the workspace path is {len} characters long; Windows cannot use a directory longer than \
+         {MAX_CHILD_CWD_LEN} characters as a process working directory (the limit is MAX_PATH \
+         including a trailing separator and the NUL terminator, and it is lifted by neither \
+         LongPathsEnabled nor a \\\\?\\ prefix). Every shell isolation tier hits this at spawn \
+         time, so `--tier1`/`--tier0` will not help either. Move the workspace somewhere shorter, \
+         or map it to a drive letter (`subst X: \"<workspace>\"`). Read-only commands \
+         (`harness changes`/`apply`) are unaffected: {}",
+        workspace_root.display()
+    )))
+}
+
 pub fn preflight(
     workspace_root: &Path,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
     write_mode: &WorkspaceWriteMode,
 ) -> Result<PreflightOutcome, AppContainerError> {
+    // ACEを1本も付ける前に、そもそもこのworkspaceで子プロセスを起動できるかを確かめる。
+    check_workspace_usable_as_child_cwd(workspace_root)?;
     // D-37: プロファイルはセッション単位。共有package SIDをやめ、workspace・CoW upper_dir・
     // fs-allowの穴はこのセッションのSIDにだけ紐付ける（別セッション・別workspaceから到達
     // できないようにする）。祖先のtraverseだけはharness共通のcapability SIDが持つ（下記）。

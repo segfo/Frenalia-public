@@ -144,6 +144,23 @@ fn run_harness_with_exe(
     extra_args: &[&str],
     case_name: &str,
 ) -> HarnessRun {
+    run_harness_full(exe, &ws.to_string_lossy(), None, turns, extra_args, case_name)
+}
+
+/// `--cwd`へ渡す**文字列**と、harnessプロセス自身のカレントディレクトリを別々に指定できる版
+/// （[BUG-066](../../../docs/bugs/BUG-066.md)の追加検証）。
+///
+/// `--cwd`の綴りが揺れても製品全体が壊れないことを確かめるために要る。特に`--cwd .`は
+/// 「ワークスペースへ`cd`してから起動する」という**利用者が実際に打つ形**であり、それを
+/// 再現するにはプロセスのcwdを立てる必要がある（`cwd_for_process`）。
+fn run_harness_full(
+    exe: &Path,
+    cwd_arg: &str,
+    cwd_for_process: Option<&Path>,
+    turns: &[Vec<StreamEvent>],
+    extra_args: &[&str],
+    case_name: &str,
+) -> HarnessRun {
     let scratch = scratch_dir();
     let turns_path = scratch.join(format!("{case_name}-turns.json"));
     let record_path = scratch.join(format!("{case_name}-requests.jsonl"));
@@ -159,7 +176,7 @@ fn run_harness_with_exe(
         "--mock-record-requests",
         record_path.to_str().unwrap(),
         "--cwd",
-        ws.to_str().unwrap(),
+        cwd_arg,
         "--permission-mode",
         "accept-all",
         "--dangerously-allow",
@@ -169,6 +186,9 @@ fn run_harness_with_exe(
         "(scripted; prompt text is ignored by the mock provider)",
     ]);
     cmd.args(extra_args);
+    if let Some(dir) = cwd_for_process {
+        cmd.current_dir(dir);
+    }
     let output = cmd.output().expect("failed to spawn harness.exe");
     HarnessRun {
         status: output.status,
@@ -932,6 +952,277 @@ $seedContent = [string](Get-Content seed.txt -Raw); \
     Ok(())
 }
 
+/// O（[BUG-066](../../../docs/bugs/BUG-066.md)の回帰）: `run_shell`から**CoW upperの絶対パスを
+/// 直接指定して**書いたファイルが、操作台帳に載り`changes`に現れ`apply`で実workspaceへ反映される。
+///
+/// 実際にモデルがやったのはこれである——workspace内への`Set-Content`が拒否され続けたので、
+/// システムプロンプトに書かれていたupperのパスへ直接書いた。upperはサンドボックス子へRW付与
+/// されているので書込自体は成功し、しかし`copy_up`を経由しないので台帳には何も残らず、
+/// `harness changes`は「変更なし」と答え、`discard`すれば作業ごと消える状態になっていた。
+///
+/// upperのパスは子プロセスから`$env:HARNESS_COW_UPPER`で引ける（Redirector DLLへ設定を渡す
+/// ための環境変数。モデルにはシステムプロンプトでも見えている）。
+///
+/// なお**DLLが注入されなかった/回避された場合**（台帳へ何も書かれない場合）の受け皿は
+/// host側の実体走査であり、そちらは`overlay.rs`のユニットテスト
+/// （`unledgered_*`）が固定している。ここで見るのはDLLが生きている経路の方。
+fn case_o_direct_write_into_the_upper_dir_is_recorded() -> Result<(), String> {
+    let ws = case_dir("cow-o-direct-upper-write");
+    let before = list_cow_sessions();
+    const SCRIPT: &str = "Set-Content (Join-Path $env:HARNESS_COW_UPPER 'direct.txt') \
+                          'written straight into the upper dir' -NoNewline";
+    let run = run_harness(&ws, &run_shell_script_turns(SCRIPT), &["--cow"], "cow-o");
+    if !run.status.success() {
+        return Err(format!("harness invocation failed: {}", run.stderr));
+    }
+    let session = new_cow_session(&before)?;
+
+    let upper_file = cow_upper_dir(&session).join("direct.txt");
+    if !upper_file.exists() {
+        return Err(format!(
+            "the script must have created {} (if this fails the test setup is wrong, not the fix)",
+            upper_file.display()
+        ));
+    }
+    let ops_text = std::fs::read_to_string(cow_upper_dir(&session).join(".harness-cow-ops.jsonl"))
+        .unwrap_or_default();
+    if !ops_text.contains("direct.txt") {
+        return Err(format!(
+            "BUG-066: a direct write into the upper dir must be recorded in the operations \
+             ledger, but the ledger is {ops_text:?}"
+        ));
+    }
+
+    let report = apply_cow(&ws, &session, None)?;
+    let applied: Vec<String> = report["applied"]
+        .as_array()
+        .ok_or("missing applied[]")?
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    if applied != vec!["direct.txt".to_string()] {
+        return Err(format!("expected direct.txt to be applied, got {applied:?}: {report}"));
+    }
+    expect_eq(
+        "direct.txt",
+        &read_file(&ws.join("direct.txt"))?,
+        "written straight into the upper dir",
+    )?;
+
+    cleanup_on_success(&ws, &[&session], "cow-o");
+    Ok(())
+}
+
+/// **BUG-066の追加検証（2026-08-06）**: `--cwd`の綴りが揺れても、製品を通しで動かして
+/// リダイレクトが成立することを確かめる（ケースP〜S共通の本体）。
+///
+/// 2026-08-05の障害では、DLLがworkspace内の絶対パスをworkspace外と判定して全書込が拒否されて
+/// いた。候補の綴りは4つあり、どれだったかは残存証跡から特定できない。ここでは4つとも
+/// **実`harness.exe`へ`--cwd`として渡して**測る。`cwd_for_process`を立てるのは`--cwd .`
+/// （ワークスペースへ`cd`してから起動する形）のためで、これが最も疑わしい候補である。
+///
+/// 子には**絶対パス指定の書込**をさせる（当時失敗したのがこの形。cwd相対のopenは別経路を通り、
+/// 綴りが揺れていても成立し得るため、綴りの影響を見るには絶対パスでなければならない）。
+fn run_cwd_spelling_case(
+    case_name: &str,
+    make_cwd_arg: fn(&Path) -> String,
+    use_process_cwd: bool,
+) -> Result<(), String> {
+    let ws = case_dir(case_name);
+    // `case_dir`は相対パスを返さない（`CASE_ROOT`固定）。実パスを控えてから綴りを作る。
+    let real = ws.canonicalize().map_err(|e| format!("canonicalize {}: {e}", ws.display()))?;
+    let real = real
+        .to_string_lossy()
+        .strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or(real.clone());
+    let cwd_arg = make_cwd_arg(&real);
+    assert_cow_redirect_through_cwd(case_name, &real, &cwd_arg, use_process_cwd, &ws)
+}
+
+/// ケースP〜Tの本体。`ws_root`（実在する実パス）をworkspaceとして`--cwd <cwd_arg>`で
+/// harnessを起動し、境界・透過性・可視性・自己診断の4点を確認する。
+fn assert_cow_redirect_through_cwd(
+    case_name: &str,
+    real: &Path,
+    cwd_arg: &str,
+    use_process_cwd: bool,
+    cleanup_root: &Path,
+) -> Result<(), String> {
+    let real = real.to_path_buf();
+    std::fs::write(real.join("notes.txt"), "original").map_err(|e| format!("seed notes.txt: {e}"))?;
+
+    let script = format!(
+        "Set-Content -LiteralPath '{}' -Value 'modified-by-agent' -NoNewline",
+        real.join("notes.txt").display()
+    );
+    let before = list_cow_sessions();
+    let run = run_harness_full(
+        &harness_exe(),
+        &cwd_arg,
+        use_process_cwd.then_some(real.as_path()),
+        &run_shell_script_turns(&script),
+        &["--cow"],
+        case_name,
+    );
+    if !run.status.success() {
+        return Err(format!(
+            "harness invocation failed with --cwd {cwd_arg:?}: stdout={} stderr={}",
+            run.stdout, run.stderr
+        ));
+    }
+    let session = new_cow_session(&before)?;
+    let upper = cow_upper_dir(&session);
+
+    // 1. 境界: workspace本体は不変。
+    expect_eq(
+        "workspace body must stay untouched under --cow",
+        &read_file(&real.join("notes.txt"))?,
+        "original",
+    )?;
+    // 2. 透過性: upperへリダイレクトされている。
+    let upper_content = read_file(&upper.join("notes.txt")).map_err(|e| {
+        format!("--cwd {cwd_arg:?}: the write was not redirected to the upper dir ({e}); \
+                 this is exactly the BUG-066 symptom")
+    })?;
+    expect_eq("upper content", &upper_content, "modified-by-agent")?;
+    // 3. 可視性: 操作台帳に載り、`apply`で実workspaceへ反映される。
+    let report = apply_cow(&real, &session, None)?;
+    let applied: Vec<String> = report["applied"]
+        .as_array()
+        .ok_or("missing applied[]")?
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    if applied != vec!["notes.txt".to_string()] {
+        return Err(format!("expected notes.txt applied, got {applied:?}: {report}"));
+    }
+    expect_eq("applied content", &read_file(&real.join("notes.txt"))?, "modified-by-agent")?;
+    // 4. 自己診断: workspace**内**への拒否が1件も無いこと（あればリダイレクトが働いていない）。
+    let denied = harness_change_ledger::store::read_denied_log(&upper);
+    let inside: Vec<&str> = denied
+        .iter()
+        .filter(|e| {
+            harness_change_ledger::path_rules::relative_under_root(
+                &e.path,
+                &real.to_string_lossy(),
+            )
+            .is_some()
+        })
+        .map(|e| e.path.as_str())
+        .collect();
+    if !inside.is_empty() {
+        return Err(format!(
+            "--cwd {cwd_arg:?}: writes inside the workspace were denied instead of redirected: {inside:?}"
+        ));
+    }
+
+    cleanup_on_success(cleanup_root, &[&session], case_name);
+    Ok(())
+}
+
+fn case_p_cwd_relative() -> Result<(), String> {
+    run_cwd_spelling_case("cow-p-cwd-relative", |_| ".".to_string(), true)
+}
+
+fn case_q_cwd_uppercased() -> Result<(), String> {
+    run_cwd_spelling_case(
+        "cow-q-cwd-uppercased",
+        |p| p.to_string_lossy().to_uppercase(),
+        false,
+    )
+}
+
+fn case_r_cwd_trailing_separator() -> Result<(), String> {
+    run_cwd_spelling_case(
+        "cow-r-cwd-trailing-sep",
+        |p| format!("{}\\", p.to_string_lossy()),
+        false,
+    )
+}
+
+fn case_s_cwd_verbatim_prefix() -> Result<(), String> {
+    run_cwd_spelling_case(
+        "cow-s-cwd-verbatim",
+        |p| format!(r"\\?\{}", p.to_string_lossy()),
+        false,
+    )
+}
+
+/// T: workspaceのパスが**`MAX_PATH`（260文字）を超える**場合は、理由を名指しして起動を断る。
+///
+/// `\\?\`前置は「Win32のパス正規化をスキップする」印で、その副作用として260文字制限が外れます。
+/// [BUG-068](../../../docs/bugs/BUG-068.md)で`--cwd`から前置を剥がしたので、**長いパスの扱いが
+/// 落ちていないか**を実際に測りました。結果は「元々使えなかった」で、原因はharnessではなく
+/// **Windowsのプロセス・カレントディレクトリの制限**です（実測: 258文字までOK、259文字から
+/// `ERROR_DIRECTORY`(267)。`\\?\`を付けた285文字も同じく失敗）。ACL API側は
+/// `win_common::long_path_wide`が直前で`\\?\`を付け直すので無傷ですが、**子プロセスのcwdに
+/// できない**ので`run_shell`が成立しません。
+///
+/// したがってこのケースが固定するのは「動くこと」ではなく**断り方**です。素の
+/// `CreateProcessW: ディレクトリ名が無効です (0x8007010B)`は、存在する正しいディレクトリを
+/// 指して「無効」と言うため原因に辿り着けません。`preflight`がACEを1本も付ける前に、
+/// 文字数・平台の制限・回避策（`subst`）を名指しして止めることを確認します。
+fn case_t_workspace_path_longer_than_max_path() -> Result<(), String> {
+    const CASE: &str = "cow-t-longpath";
+    let case_root = case_dir(CASE);
+    // `C:\harness-e2e\cow-t-longpath` + 41文字×6階層 ＝ 281文字。
+    let mut deep = case_root.clone();
+    for i in 0..6 {
+        deep = deep.join(format!("seg{i:02}-{}", "x".repeat(35)));
+    }
+    std::fs::create_dir_all(&deep)
+        .map_err(|e| format!("create deep workspace {}: {e}", deep.display()))?;
+    let len = deep.to_string_lossy().chars().count();
+    if len <= 260 {
+        return Err(format!("test setup is wrong: workspace path is only {len} chars"));
+    }
+    println!("MEASUREMENT: long workspace path is {len} chars");
+
+    let before = list_cow_sessions();
+    let run = run_harness_full(
+        &harness_exe(),
+        &deep.to_string_lossy(),
+        None,
+        &run_shell_script_turns("Write-Output 'unreachable'"),
+        &["--cow"],
+        CASE,
+    );
+    if run.status.success() {
+        return Err(format!(
+            "harness must refuse a workspace that cannot be a child process cwd, but it started: \
+             stdout={}",
+            run.stdout
+        ));
+    }
+    // 断り方の中身（**これがこのケースの本体**）。
+    for needle in [
+        "characters long",
+        "process working directory",
+        "LongPathsEnabled",
+        "subst",
+    ] {
+        if !run.stderr.contains(needle) {
+            return Err(format!(
+                "the refusal must explain itself and contain {needle:?}, got: {}",
+                run.stderr
+            ));
+        }
+    }
+    // ACEを付ける前に断っているので、CoWセッションも作られていないこと。
+    let after = list_cow_sessions();
+    let leaked: Vec<&String> = after.difference(&before).collect();
+    if !leaked.is_empty() {
+        return Err(format!("no CoW session may be created before refusing: {leaked:?}"));
+    }
+
+    let _ = std::fs::remove_dir_all(&case_root);
+    let scratch = scratch_dir();
+    let _ = std::fs::remove_file(scratch.join(format!("{CASE}-turns.json")));
+    let _ = std::fs::remove_file(scratch.join(format!("{CASE}-requests.jsonl")));
+    Ok(())
+}
+
 /// `tier2a_cow_commit_matrix`と`tier2a_net_policy_matrix`は同じテストバイナリ内の別々の
 /// `#[test]`関数であり、既定では別スレッドで並行実行される。両者は共有WFPエンジン・
 /// netfilterdの単一インスタンス・`C:\harness-e2e`を奪い合うため、Q5(機構ごとに1テストで
@@ -966,6 +1257,17 @@ fn tier2a_cow_commit_matrix() {
             "N-ls-merge-and-clean-read",
             case_n_ls_merges_preexisting_and_new_files_read_does_not_dirty_ledger,
         ),
+        (
+            "O-direct-upper-write-is-recorded",
+            case_o_direct_write_into_the_upper_dir_is_recorded,
+        ),
+        // P〜S: BUG-066追加検証。`--cwd`の綴り4形（相対・大小差・末尾区切り・`\\?\`）を
+        // 製品通しで測る（`run_cwd_spelling_case`のdoc参照）。
+        ("P-cwd-relative", case_p_cwd_relative),
+        ("Q-cwd-uppercased", case_q_cwd_uppercased),
+        ("R-cwd-trailing-separator", case_r_cwd_trailing_separator),
+        ("S-cwd-verbatim-prefix", case_s_cwd_verbatim_prefix),
+        ("T-workspace-longer-than-max-path", case_t_workspace_path_longer_than_max_path),
     ];
     let mut passed = 0;
     let total = cases.len();
@@ -1458,6 +1760,10 @@ fn fs_allow_case_ro_reads_but_cannot_write() -> Result<(), String> {
         return Err(format!("the child actually wrote {}", leaked.display()));
     }
 
+    // 台帳から自分のエントリを落としてから消す。`--fs-allow`由来のエントリは
+    // `settings_managed`が立たずD-27の自動撤収対象にならないので、放っておくと
+    // 実在しないパスを指す残骸が保護対象の台帳へ溜まり続ける（実機で21件溜まっていた）。
+    purge_fs_ledger_entries(&[&target]);
     let _ = std::fs::remove_dir_all(&target);
     cleanup_on_success(&ws, &[], "fs-allow-ro");
     Ok(())
@@ -1509,6 +1815,10 @@ fn fs_allow_case_rw_can_write_delete_and_move() -> Result<(), String> {
         return Err("move reported OK but the destination file does not exist".to_string());
     }
 
+    // 台帳から自分のエントリを落としてから消す。`--fs-allow`由来のエントリは
+    // `settings_managed`が立たずD-27の自動撤収対象にならないので、放っておくと
+    // 実在しないパスを指す残骸が保護対象の台帳へ溜まり続ける（実機で21件溜まっていた）。
+    purge_fs_ledger_entries(&[&target]);
     let _ = std::fs::remove_dir_all(&target);
     cleanup_on_success(&ws, &[], "fs-allow-rw");
     Ok(())
@@ -1553,6 +1863,10 @@ fn fs_allow_case_ace_is_revoked_when_the_session_ends() -> Result<(), String> {
         ));
     }
 
+    // 台帳から自分のエントリを落としてから消す。`--fs-allow`由来のエントリは
+    // `settings_managed`が立たずD-27の自動撤収対象にならないので、放っておくと
+    // 実在しないパスを指す残骸が保護対象の台帳へ溜まり続ける（実機で21件溜まっていた）。
+    purge_fs_ledger_entries(&[&target]);
     let _ = std::fs::remove_dir_all(&target);
     cleanup_on_success(&ws, &[], "fs-allow-revoke");
     Ok(())
@@ -1975,4 +2289,344 @@ fn tier2a_mcp_corroboration() {
         }
     }
     assert_eq!(passed, total, "{passed}/{total} mcp corroboration cases passed (see per-case JSON above)");
+}
+
+// ============================================================================
+// D-27: fs passthrough台帳のライフサイクル（参照カウントと並行起動時の整合性）
+//
+// `docs/STATUS.md`は「手動E2E（複数ワークスペース共有時の安全性・並行起動時のledger整合性）は
+// 未実施」と記録していた。どちらも**人間が目で確認しても再実行できない**種類の事実なので、
+// `plans/VERIFY-TODO.md`項目1をここで機械的なassertとして取り直す。
+//
+// 測っているのは`reconcile_fs_ledger_for_workspace`（`crates/harness-cli/src/fs_grants/revoke.rs`）
+// の2つの契約である。
+//
+//  1. **参照カウント**: `.harness/settings.json`がパスを宣言しているワークスペースのroot文字列を
+//     `settings_workspaces`へ積み、宣言を外したら抜く。**他のワークスペースがまだ宣言している間は
+//     台帳エントリを消さない**。誰も宣言しなくなって初めて撤収対象になる。
+//  2. **並行起動でlost updateしない**: 台帳のread-modify-writeは`with_named_lock`
+//     （`crates/harness-sandbox/src/lib.rs`）で直列化される。複数の`harness.exe`を同時に
+//     起動しても、あるプロセスのタグ付けが別のプロセスの書込に踏み潰されてはならない。
+//
+// **ACEの寿命はここでは測らない。** D-37でAppContainerプロファイルがセッション単位になった結果、
+// fs passthroughのACEはセッション固有SID宛に付き`end_session`が撤収する（＝harnessが終了した
+// 時点で必ず0本になる。その事実は`fs_allow_case_ace_is_revoked_when_the_session_ends`が固定して
+// いる）。したがって「他のワークスペースが参照しているからACEが残る」という測り方は**現在の設計
+// では成立しない**——残るのは台帳エントリの方であり、D-27が今守っているのは帳簿の側である。
+//
+// `dev-elevated-run.exe e2e-fs-ledger`（フィルタ`tier2a_fs_ledger_lifecycle`）。
+
+/// `%APPDATA%\harness\config\fs-passthrough-ledger.json`。**保護対象の台帳**（`docs/DEV-ENVIRONMENT.md`
+/// 「クリーンアップ時に絶対に消してはいけないファイル」）なので、テストは自分が足したエントリ以外に
+/// 触れない。ケース終了時に自分のエントリだけを取り除く。
+fn fs_passthrough_ledger_path() -> PathBuf {
+    directories::ProjectDirs::from("", "", "harness")
+        .expect("resolve harness config dir")
+        .config_dir()
+        .join("fs-passthrough-ledger.json")
+}
+
+/// 台帳の`entries`を`(path, settings_managed, settings_workspaces)`で読み出す。
+fn read_fs_ledger_entries() -> Result<Vec<(String, bool, Vec<String>)>, String> {
+    let path = fs_passthrough_ledger_path();
+    let data = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let json: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+    let entries = json
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("{} has no `entries` array", path.display()))?;
+    Ok(entries
+        .iter()
+        .map(|e| {
+            let path = e.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let managed = e.get("settings_managed").and_then(|v| v.as_bool()).unwrap_or(false);
+            let workspaces = e
+                .get("settings_workspaces")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|w| w.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            (path, managed, workspaces)
+        })
+        .collect())
+}
+
+/// 台帳から`target`のエントリを引く。無ければ`None`。
+fn fs_ledger_entry_for(target: &Path) -> Result<Option<(bool, Vec<String>)>, String> {
+    let key = target.to_string_lossy().to_string();
+    Ok(read_fs_ledger_entries()?
+        .into_iter()
+        .find(|(p, _, _)| *p == key)
+        .map(|(_, managed, ws)| (managed, ws)))
+}
+
+/// `<ws>/.harness/settings.json`へ`fs.read`宣言を書く（`paths`が空なら`fs`キーごと落とす）。
+fn write_fs_settings(ws: &Path, paths: &[&Path]) -> Result<(), String> {
+    let dir = ws.join(".harness");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let settings = if paths.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({
+            "fs": { "read": paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>() }
+        })
+    };
+    std::fs::write(
+        dir.join("settings.json"),
+        serde_json::to_string_pretty(&settings).unwrap(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// 台帳を汚したまま終わらないための後始末。`harness fs revoke <path>`は撤収できたときだけ
+/// エントリを消すので、ディレクトリを消した後だと残ることがある。テストが足したエントリは
+/// テストが責任を持って落とす。
+///
+/// **台帳ファイルはread-only属性付きで書かれている**（`harness-grant-ledger`の「誤削除防止の2層」）。
+/// 素の`std::fs::write`は黙って失敗するので、本体と同じく解除→書込→再付与の順で触る。
+fn purge_fs_ledger_entries(targets: &[&Path]) {
+    let path = fs_passthrough_ledger_path();
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return;
+    };
+    let keys: HashSet<String> = targets.iter().map(|t| t.to_string_lossy().to_string()).collect();
+    if let Some(entries) = json.get_mut("entries").and_then(|v| v.as_array_mut()) {
+        entries.retain(|e| {
+            !e.get("path")
+                .and_then(|v| v.as_str())
+                .map(|p| keys.contains(p))
+                .unwrap_or(false)
+        });
+    }
+    let Ok(text) = serde_json::to_string_pretty(&json) else {
+        return;
+    };
+    set_ledger_readonly(&path, false);
+    let wrote = std::fs::write(&path, text).is_ok();
+    set_ledger_readonly(&path, true);
+    assert!(wrote, "failed to purge test entries from {}", path.display());
+}
+
+fn set_ledger_readonly(path: &Path, readonly: bool) {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut perms = metadata.permissions();
+        perms.set_readonly(readonly);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+/// 2つのワークスペースが同じパスを宣言している間はエントリが生き、両方が宣言を外して初めて
+/// 撤収される（D-27の参照カウント）。
+fn fs_ledger_case_shared_declaration_is_refcounted() -> Result<(), String> {
+    let ws1 = case_dir("fs-ledger-ws1");
+    let ws2 = case_dir("fs-ledger-ws2");
+    let target = fs_allow_case_dir("ledger-shared");
+    std::fs::write(target.join("f.txt"), "x").map_err(|e| e.to_string())?;
+    let ws1_key = ws1.to_string_lossy().to_string();
+    let ws2_key = ws2.to_string_lossy().to_string();
+    let script = "Write-Output 'ran'";
+
+    let finish = |e: String| -> String {
+        purge_fs_ledger_entries(&[&target]);
+        let _ = std::fs::remove_dir_all(&target);
+        e
+    };
+
+    // (1) ws1が宣言して起動 → ws1だけがタグされる。
+    write_fs_settings(&ws1, &[&target])?;
+    let run = run_harness(&ws1, &run_shell_script_turns(script), &[], "fs-ledger-1");
+    parse_json_stdout(&run).map_err(&finish)?;
+    match fs_ledger_entry_for(&target).map_err(&finish)? {
+        Some((true, ws)) if ws == vec![ws1_key.clone()] => {}
+        other => {
+            return Err(finish(format!(
+                "after ws1 declared the path, the ledger entry should be settings_managed with \
+                 exactly [ws1]; got {other:?}"
+            )))
+        }
+    }
+
+    // (2) ws2も宣言して起動 → 参照が2つになる。
+    write_fs_settings(&ws2, &[&target])?;
+    let run = run_harness(&ws2, &run_shell_script_turns(script), &[], "fs-ledger-2");
+    parse_json_stdout(&run).map_err(&finish)?;
+    match fs_ledger_entry_for(&target).map_err(&finish)? {
+        Some((true, ws)) if ws.contains(&ws1_key) && ws.contains(&ws2_key) && ws.len() == 2 => {}
+        other => {
+            return Err(finish(format!(
+                "after ws2 also declared the path, both workspaces must be tagged; got {other:?}"
+            )))
+        }
+    }
+
+    // (3) ws1が宣言を外して再起動 → **ws2がまだ参照しているのでエントリは残る**（本題）。
+    write_fs_settings(&ws1, &[])?;
+    let run = run_harness(&ws1, &run_shell_script_turns(script), &[], "fs-ledger-3");
+    parse_json_stdout(&run).map_err(&finish)?;
+    match fs_ledger_entry_for(&target).map_err(&finish)? {
+        Some((true, ws)) if ws == vec![ws2_key.clone()] => {}
+        None => {
+            return Err(finish(
+                "D-27 violation: the entry was revoked while ws2 still declares the path in its \
+                 .harness/settings.json (a shared passthrough must survive until the last \
+                 declaring workspace drops it)"
+                    .to_string(),
+            ))
+        }
+        other => {
+            return Err(finish(format!(
+                "after ws1 dropped the declaration only ws2 should remain tagged; got {other:?}"
+            )))
+        }
+    }
+
+    // (4) ws2も宣言を外して再起動 → 参照ゼロになったので撤収され、台帳から消える。
+    write_fs_settings(&ws2, &[])?;
+    let run = run_harness(&ws2, &run_shell_script_turns(script), &[], "fs-ledger-4");
+    parse_json_stdout(&run).map_err(&finish)?;
+    if let Some(entry) = fs_ledger_entry_for(&target).map_err(&finish)? {
+        return Err(finish(format!(
+            "the entry must be auto-revoked once no workspace declares it; it is still there as \
+             {entry:?}"
+        )));
+    }
+    if !run.stderr.contains("no longer declared by any workspace") {
+        return Err(finish(format!(
+            "the auto-revoke must be announced on stderr (D-43: do not hide what was changed); \
+             stderr={}",
+            run.stderr
+        )));
+    }
+
+    purge_fs_ledger_entries(&[&target]);
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup_on_success(&ws1, &[], "fs-ledger-1");
+    cleanup_on_success(&ws2, &[], "fs-ledger-3");
+    cleanup_on_success(&ws1, &[], "fs-ledger-2");
+    cleanup_on_success(&ws2, &[], "fs-ledger-4");
+    Ok(())
+}
+
+/// 複数の`harness.exe`を**同時に**起動しても、各ワークスペースの宣言が台帳へ揃って残る
+/// （read-modify-writeが`with_named_lock`で直列化され、lost updateが起きない）。
+fn fs_ledger_case_concurrent_startups_do_not_lose_updates() -> Result<(), String> {
+    const N: usize = 4;
+    let shared = fs_allow_case_dir("ledger-concurrent-shared");
+    std::fs::write(shared.join("f.txt"), "x").map_err(|e| e.to_string())?;
+
+    let mut workspaces = Vec::new();
+    let mut owned = Vec::new();
+    for i in 0..N {
+        let ws = case_dir(&format!("fs-ledger-conc-{i}"));
+        let mine = fs_allow_case_dir(&format!("ledger-concurrent-{i}"));
+        std::fs::write(mine.join("f.txt"), "x").map_err(|e| e.to_string())?;
+        write_fs_settings(&ws, &[&shared, &mine])?;
+        workspaces.push(ws);
+        owned.push(mine);
+    }
+    let all_targets: Vec<&Path> = std::iter::once(shared.as_path())
+        .chain(owned.iter().map(|p| p.as_path()))
+        .collect();
+    let finish = |e: String| -> String {
+        purge_fs_ledger_entries(&all_targets);
+        for t in &all_targets {
+            let _ = std::fs::remove_dir_all(t);
+        }
+        e
+    };
+
+    // 台本ファイルはケース名ごとに別なので、同時起動しても互いに踏まない。
+    let turns = run_shell_script_turns("Write-Output 'ran'");
+    let scratch = scratch_dir();
+    let mut children = Vec::new();
+    for (i, ws) in workspaces.iter().enumerate() {
+        let case_name = format!("fs-ledger-conc-{i}");
+        let turns_path = scratch.join(format!("{case_name}-turns.json"));
+        std::fs::write(&turns_path, serde_json::to_string(&turns).unwrap())
+            .map_err(|e| finish(e.to_string()))?;
+        let mut cmd = Command::new(harness_exe());
+        cmd.args([
+            "--provider", "mock",
+            "--mock-turns", turns_path.to_str().unwrap(),
+            "--cwd", ws.to_str().unwrap(),
+            "--permission-mode", "accept-all",
+            "--dangerously-allow",
+            "--output-format", "json",
+            "-p", "(scripted)",
+        ]);
+        children.push(cmd.spawn().map_err(|e| finish(format!("failed to spawn harness.exe: {e}")))?);
+    }
+    let mut failures = Vec::new();
+    for (i, child) in children.into_iter().enumerate() {
+        let out = child.wait_with_output().map_err(|e| finish(e.to_string()))?;
+        if !out.status.success() {
+            failures.push(format!(
+                "concurrent harness #{i} exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(finish(failures.join("\n")));
+    }
+
+    // 共有パスは**全ワークスペース**からタグされていなければならない（1件でも欠けたら
+    // それが lost update そのもの）。各ワークスペース専用のパスも同様に残っている必要がある。
+    let shared_entry = fs_ledger_entry_for(&shared)
+        .map_err(&finish)?
+        .ok_or_else(|| finish("the shared path has no ledger entry at all".to_string()))?;
+    let tagged: HashSet<String> = shared_entry.1.into_iter().collect();
+    let missing: Vec<String> = workspaces
+        .iter()
+        .map(|w| w.to_string_lossy().to_string())
+        .filter(|w| !tagged.contains(w))
+        .collect();
+    if !missing.is_empty() {
+        return Err(finish(format!(
+            "lost update: {} of {N} concurrent workspaces are missing from the shared entry's \
+             settings_workspaces ({missing:?}); the ledger read-modify-write is not serialized",
+            missing.len()
+        )));
+    }
+    for (i, mine) in owned.iter().enumerate() {
+        match fs_ledger_entry_for(mine).map_err(&finish)? {
+            Some((true, ws)) if ws.len() == 1 => {}
+            other => {
+                return Err(finish(format!(
+                    "workspace #{i}'s own declaration was lost or mis-tagged: {other:?}"
+                )))
+            }
+        }
+    }
+
+    purge_fs_ledger_entries(&all_targets);
+    for t in &all_targets {
+        let _ = std::fs::remove_dir_all(t);
+    }
+    for (i, ws) in workspaces.iter().enumerate() {
+        cleanup_on_success(ws, &[], &format!("fs-ledger-conc-{i}"));
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn tier2a_fs_ledger_lifecycle() {
+    let cases: Vec<(&str, CaseFn)> = vec![
+        ("shared-declaration-is-refcounted", fs_ledger_case_shared_declaration_is_refcounted),
+        ("concurrent-startups-do-not-lose-updates", fs_ledger_case_concurrent_startups_do_not_lose_updates),
+    ];
+    let mut passed = 0;
+    let total = cases.len();
+    for (name, f) in cases {
+        if run_named_case(name, f) {
+            passed += 1;
+        }
+    }
+    assert_eq!(passed, total, "{passed}/{total} fs ledger lifecycle cases passed (see per-case JSON above)");
 }

@@ -46,10 +46,35 @@ pub(crate) fn cow_audit(session: Option<&str>, output_format: OutputFormat) -> E
             if entries.is_empty() {
                 println!("(no denied write attempts recorded)");
             }
+            // BUG-066: workspace内への拒否は意味が正反対（封じ込めではなく**透過性の失敗**＝
+            // その変更は失われている）なので、1件ずつ区別して見せる。
+            let workspace_root = crate::cli::workspace_cmd::cow_session_workspace_root(&upper_dir);
+            let mut inside = 0usize;
             for e in &entries {
+                let is_inside = workspace_root.as_deref().is_some_and(|root| {
+                    harness_change_ledger::path_rules::relative_under_root(&e.path, root).is_some()
+                });
+                if is_inside {
+                    inside += 1;
+                }
                 println!(
-                    "denied: {} (access_mask={:#x}, pid={})",
-                    e.path, e.access_mask, e.pid
+                    "denied: {} (access_mask={:#x}, pid={}){}",
+                    e.path,
+                    e.access_mask,
+                    e.pid,
+                    if is_inside {
+                        "  <-- INSIDE the workspace: the CoW redirect failed here, this change was lost"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            if inside > 0 {
+                println!(
+                    "WARNING: {inside} of {} denied attempt(s) targeted the workspace itself. \
+                     Those writes should have been redirected to the CoW upper directory; see \
+                     docs/bugs/BUG-066.md.",
+                    entries.len()
                 );
             }
         }

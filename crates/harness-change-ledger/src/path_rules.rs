@@ -121,6 +121,101 @@ pub fn validate_relative_path(path: &str) -> Result<PathBuf, PathRejection> {
     Ok(canonical)
 }
 
+/// NTパス／Win32拡張長パスの前置（`\??\`・`\\?\`）を剥がす。
+///
+/// Redirector DLL（`ntpath::strip_nt_prefix`）とhost側の照合が**同じ規則**で前置を落とすために
+/// ここへ置く（[BUG-066](../../../docs/bugs/BUG-066.md)。`std::fs::canonicalize`が返す
+/// verbatim形と、アプリが渡す素のDOS形が混ざる経路が複数ある）。
+pub fn strip_verbatim_prefix(path: &str) -> &str {
+    path.strip_prefix(r"\??\")
+        .or_else(|| path.strip_prefix(r"\\?\"))
+        .unwrap_or(path)
+}
+
+/// CoWのルート（workspace_root・upper_dir）の綴りを揃える: `\??\`/`\\?\`前置を落とし、
+/// 末尾の余分な区切りを落とす（`C:\`のようなドライブルートは保つ）。
+///
+/// [`relative_under_root`]は照合時にこれらの揺れを吸収するが、**綴りは揃えておかないと
+/// 別の場所で壊れる**——例えば`\\?\`付きのupper_dirを`nt_path_wide`が組み立てると
+/// `\??\\\?\C:\...`という不正なNTパスになる。設定を渡す側（`spawn`のenv/blob）と受け取る側
+/// （Redirector DLLの`resolve_config`）が同じ関数で揃える（[BUG-066](../../../docs/bugs/BUG-066.md)）。
+pub fn normalize_root_spelling(root: &str) -> String {
+    let mut s = strip_verbatim_prefix(root).to_string();
+    while s.len() > 1
+        && (s.ends_with('\\') || s.ends_with('/'))
+        && !s.ends_with(":\\")
+        && !s.ends_with(":/")
+    {
+        s.pop();
+    }
+    s
+}
+
+/// `path`が`root`配下（または`root`自身）なら、`root`からの相対部分を`/`区切りで返す
+/// （`root`自身なら空文字列）。配下でなければ`None`。
+///
+/// **「配下かどうかの判定」と「相対部分の算出」を必ず1つの規則で行う**のがこの関数の要点で、
+/// [BUG-066](../../../docs/bugs/BUG-066.md)の実体はここが分かれていたことだった——旧
+/// `harness-redirector`の`workspace_relative`は、配下判定を小文字化した文字列の前置詞一致で
+/// 行いながら、相対部分を`Path::strip_prefix`（**成分単位・case-sensitive**）で求めていた。
+/// 大小が1文字違うだけで「配下と判定したのに相対パスを作れない」状態になり、呼び出し側からは
+/// **workspace外と区別が付かない**（＝CoWのリダイレクトが黙って止まり、ACL拒否だけが残る）。
+///
+/// 吸収する表記ゆれ:
+///
+/// - 大文字小文字（Windowsのパスは大小を区別しない）
+/// - `/`と`\`の混在（Win32層はどちらも区切りとして受ける）
+/// - `root`末尾の余分な区切り（`C:\ws\`と`C:\ws`を同じものとして扱う）
+/// - `\??\`・`\\?\`前置（`strip_verbatim_prefix`）
+///
+/// 吸収**しない**もの: `..`・`.`成分（畳むと別物になり得るのでここでは解決しない。相対部分を
+/// 台帳キーとして使う側は[`validate_relative_path`]を別途通すこと）、8.3短縮名、
+/// シンボリックリンク／ジャンクション（実FSを触らないと解決できない。ここは純粋関数）。
+pub fn relative_under_root(path: &str, root: &str) -> Option<String> {
+    // **`to_lowercase`（Unicode版）は使わない**——小文字化でバイト長が変わる文字があり
+    // （例: `İ`は2バイトの`i̇`になる）、下で「正規化後のバイト位置＝元の文字列のバイト位置」と
+    // して相対部分を切り出す前提が壊れる。`to_ascii_lowercase`はASCII以外を素通しするので
+    // 長さが保存される（日本語を含むパスでも安全）。ASCII以外の大小差を吸収しない点は
+    // 既存の`workspace_relative`と同じ挙動である。
+    fn normalize(s: &str) -> String {
+        strip_verbatim_prefix(s)
+            .replace('/', "\\")
+            .to_ascii_lowercase()
+    }
+    let path_n = normalize(path);
+    let root_n = {
+        let mut r = normalize(root);
+        while r.len() > 1 && r.ends_with('\\') {
+            r.pop();
+        }
+        r
+    };
+    if root_n.is_empty() {
+        return None;
+    }
+    if path_n == root_n {
+        return Some(String::new());
+    }
+    // 区切り境界の確認（`C:\ws`が`C:\ws2\x`へ前置詞一致してしまうのを防ぐ）。上で末尾の
+    // 区切りを落としてあるので通常は境界1文字分ずらす。`root`が区切り1文字だけ（`\`）の
+    // 場合だけは落としていないのでずらさない。
+    let boundary = if root_n.ends_with('\\') { 0 } else { 1 };
+    if !path_n.starts_with(&root_n) {
+        return None;
+    }
+    if boundary == 1 && path_n.as_bytes().get(root_n.len()) != Some(&b'\\') {
+        return None;
+    }
+    // 相対部分は**元の綴りから**切り出す（台帳キーの大小を勝手に潰さないため）。正規化は
+    // 区切り文字を`\`へ1:1で置換しているだけなので、バイト位置は元の文字列と一致する
+    // （`strip_verbatim_prefix`で落とした分だけずらす）。
+    let stripped_len = path.len() - strip_verbatim_prefix(path).len();
+    let start = stripped_len + root_n.len() + boundary;
+    let rel = path.get(start..)?.replace('\\', "/");
+    let rel = rel.trim_start_matches('/').to_string();
+    Some(rel)
+}
+
 /// Windowsの予約デバイス名（大小・拡張子を無視、`NUL.txt`も対象）。
 fn is_reserved_windows_name(name: &str) -> bool {
     let base = name.split('.').next().unwrap_or(name);
@@ -287,5 +382,156 @@ mod tests {
         #[allow(clippy::join_absolute_paths)]
         let joined = Path::new(r"C:\ws").join("/Windows/x");
         assert_eq!(joined, Path::new(r"C:\Windows\x"));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_removes_nt_and_win32_long_path_prefixes() {
+        assert_eq!(strip_verbatim_prefix(r"\??\C:\ws\a.txt"), r"C:\ws\a.txt");
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\ws\a.txt"), r"C:\ws\a.txt");
+        assert_eq!(strip_verbatim_prefix(r"C:\ws\a.txt"), r"C:\ws\a.txt");
+    }
+
+    #[test]
+    fn normalize_root_spelling_drops_verbatim_prefix_and_trailing_separators() {
+        assert_eq!(normalize_root_spelling(r"\\?\C:\ws\"), r"C:\ws");
+        assert_eq!(normalize_root_spelling(r"\??\C:\ws"), r"C:\ws");
+        assert_eq!(normalize_root_spelling(r"C:\ws\\"), r"C:\ws");
+        assert_eq!(normalize_root_spelling("C:/ws/"), "C:/ws");
+        // ドライブルートは区切りを保つ（`C:`はドライブ相対パスという別物になるため）。
+        assert_eq!(normalize_root_spelling(r"C:\"), r"C:\");
+        assert_eq!(normalize_root_spelling(r"\\?\C:\"), r"C:\");
+    }
+
+    /// **BUG-066の回帰テスト（核心）**: 「配下と判定できる形」は全て相対パスまで返り切ること。
+    /// 旧実装は配下判定を小文字化した文字列で、相対部分の算出を`Path::strip_prefix`
+    /// （成分単位・case-sensitive）で行っていたため、この表のうち大小差の行で
+    /// **配下なのに`None`**を返し、呼び出し側がworkspace外と誤認していた。
+    #[test]
+    fn relative_under_root_absorbs_case_separator_trailing_and_verbatim_spellings() {
+        let cases = [
+            (r"C:\ws\a.txt", r"C:\ws", "a.txt"),
+            // 大文字小文字違い（両方向）。
+            (r"C:\WS\A.txt", r"C:\ws", "A.txt"),
+            (r"c:\ws\a.txt", r"C:\WS", "a.txt"),
+            // root末尾の余分な区切り。
+            (r"C:\ws\a.txt", r"C:\ws\", "a.txt"),
+            // 区切り文字の混在。
+            ("C:/ws/sub/a.txt", r"C:\ws", "sub/a.txt"),
+            (r"C:\ws\sub\a.txt", "C:/ws", "sub/a.txt"),
+            // verbatim前置（どちら側に付いていても）。
+            (r"\??\C:\ws\a.txt", r"C:\ws", "a.txt"),
+            (r"C:\ws\a.txt", r"\\?\C:\ws", "a.txt"),
+            (r"\\?\C:\ws\a.txt", r"\??\C:\ws", "a.txt"),
+            // ドライブルート直下（rootの末尾が既に区切り）。
+            (r"C:\a.txt", r"C:\", "a.txt"),
+        ];
+        for (path, root, expected) in cases {
+            assert_eq!(
+                relative_under_root(path, root).as_deref(),
+                Some(expected),
+                "path={path:?} root={root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_under_root_returns_empty_for_the_root_itself() {
+        assert_eq!(relative_under_root(r"C:\ws", r"C:\ws").as_deref(), Some(""));
+        assert_eq!(relative_under_root(r"C:\ws\", r"C:\ws").as_deref(), Some(""));
+    }
+
+    /// 前置詞一致だけでは配下と誤認する形（区切り境界の確認）と、そもそも配下でない形。
+    #[test]
+    fn relative_under_root_rejects_paths_outside_the_root() {
+        assert_eq!(relative_under_root(r"C:\ws2\a.txt", r"C:\ws"), None);
+        assert_eq!(relative_under_root(r"C:\wsx", r"C:\ws"), None);
+        assert_eq!(relative_under_root(r"D:\ws\a.txt", r"C:\ws"), None);
+        assert_eq!(relative_under_root(r"C:\other\a.txt", r"C:\ws"), None);
+        // 相対パスのroot（`--cwd .`相当）は照合の基準にならない＝配下と言い切れない。
+        assert_eq!(relative_under_root(r"C:\ws\a.txt", "."), None);
+        assert_eq!(relative_under_root(r"C:\ws\a.txt", ""), None);
+    }
+
+    /// ASCII以外を含むパスでも、相対部分がバイト位置ずれで壊れないこと
+    /// （`to_lowercase`ではなく`to_ascii_lowercase`を使っている理由の固定）。
+    #[test]
+    fn relative_under_root_handles_non_ascii_paths_without_corrupting_the_tail() {
+        assert_eq!(
+            relative_under_root(r"C:\ユーザー\ws\メモ.txt", r"C:\ユーザー\ws").as_deref(),
+            Some("メモ.txt")
+        );
+    }
+
+    /// [BUG-066](../../../docs/bugs/BUG-066.md)で壊れていた**旧規則**の再現（characterization）。
+    ///
+    /// 配下判定は小文字化した文字列の前置詞一致、相対部分の算出は`Path::strip_prefix`
+    /// （成分単位・**case-sensitive**）という、規則が2つに割れた実装。当時の
+    /// `harness-redirector`の`workspace_relative`そのもの。
+    fn legacy_workspace_relative(root: &str, path: &str) -> Option<String> {
+        let path_lc = path.to_ascii_lowercase();
+        let root_lc = root.to_ascii_lowercase();
+        let is_under = path_lc == root_lc
+            || (path_lc.starts_with(&root_lc)
+                && path_lc.as_bytes().get(root_lc.len()) == Some(&b'\\'));
+        if !is_under {
+            return None;
+        }
+        Path::new(path)
+            .strip_prefix(Path::new(root))
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// **BUG-066の追加検証（2026-08-06）**: 候補だった4つの綴りについて、旧規則が何を返し、
+    /// 新規則が何を返すかを表として固定する。
+    ///
+    /// 2026-08-05のセッションで`HARNESS_COW_WORKSPACE`がどの綴りだったかは残存証跡からは
+    /// **特定できない**（4形とも同じ症状＝workspace内の絶対パス書込が全滅、を作れる）。
+    /// このテストの目的は犯人特定ではなく、**4形すべてが旧規則で壊れていたこと**と
+    /// **新規則では壊れないこと**を実行可能な形で残すことにある。
+    ///
+    /// 相対パス（`--cwd .`）だけは**新規則でも`None`**である点が他の3つと違う——絶対パスと
+    /// 相対パスは照合しようがないので、ここは判定規則ではなく上流の正規化
+    /// （`spawn::normalize_cow_root`の`canonicalize`）と、DLL側の警告
+    /// （`config_workspace_not_absolute`）が守る領域である。
+    #[test]
+    fn bug066_spelling_matrix_legacy_rule_breaks_on_all_four_new_rule_does_not() {
+        const PATH: &str = r"C:\ws\merge-demo.txt";
+        // (綴りの説明, workspace_rootの綴り, 新規則の期待)
+        let cases: [(&str, &str, Option<&str>); 4] = [
+            ("case difference", r"C:\WS", Some("merge-demo.txt")),
+            ("trailing separator", r"C:\ws\", Some("merge-demo.txt")),
+            ("verbatim prefix", r"\\?\C:\ws", Some("merge-demo.txt")),
+            // 相対パスは新規則でも照合できない（＝上流の正規化と警告で守る領域）。
+            ("relative root", ".", None),
+        ];
+        for (label, root, expected_new) in cases {
+            assert_eq!(
+                legacy_workspace_relative(root, PATH),
+                None,
+                "{label}: 旧規則はここで`None`を返していた（＝workspace外と同じ扱いになり、\
+                 素通し→read-only ACLで拒否。CoWの透過性が黙って消える）"
+            );
+            assert_eq!(
+                relative_under_root(PATH, root).as_deref(),
+                expected_new,
+                "{label}: 新規則の期待値"
+            );
+        }
+        // 制御群: 綴りが完全に一致していれば旧規則でも通っていた（＝壊れていたのは表記ゆれの
+        // ときだけであり、CoW全体が常に壊れていたわけではないことの確認）。
+        assert_eq!(
+            legacy_workspace_relative(r"C:\ws", PATH).as_deref(),
+            Some("merge-demo.txt")
+        );
+    }
+
+    /// 相対部分は**元の綴りのまま**返す（台帳キーの大小を勝手に潰さない）。
+    #[test]
+    fn relative_under_root_preserves_the_original_spelling_of_the_tail() {
+        assert_eq!(
+            relative_under_root(r"C:\WS\Sub\MixedCase.TXT", r"c:\ws").as_deref(),
+            Some("Sub/MixedCase.TXT")
+        );
     }
 }

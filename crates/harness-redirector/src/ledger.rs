@@ -65,6 +65,28 @@ pub(crate) fn copy_up(cfg: &Config, rel: &str, workspace_path: &Path, upper_path
     append_ledger_entry(cfg, op, rel, baseline_hash);
 }
 
+/// upper配下の実体へ**直接**書かれた1件（＝`copy_up`を経由しない書込）を、workspace側と
+/// 同じ台帳キーで記録する（[BUG-066](../../../docs/bugs/BUG-066.md)）。
+///
+/// upper_dirはサンドボックス子へRW付与されており、`<upper>\<rel>`という綴りで書けば
+/// ACLも通るしフックの誘導も要らない。実際にモデルが`Set-Content <upper>\merge-demo.txt`を
+/// 実行し、upperには編集後の内容があるのに台帳が空＝`changes`/`apply`から見えない状態になった。
+/// 同じ実ファイルを指す2通りの綴りなのだから、**同じ台帳キーの操作として記録する**。
+/// baselineは`baseline_hash_for`が解決する（台帳に既存エントリがあればそれ、無ければ
+/// 実workspace側の現在内容＝セッション開始時点の姿。workspaceはROなので後から変わらない）。
+///
+/// 同一パスの2回目以降はプロセス内の集合で抑止する（`copy_up`の`upper_path.exists()`と同じ
+/// 役割）。兄弟プロセスや`copy_up`との重複追記は起こり得るが、`replay`はパス単位で畳むので
+/// 実害は無い（初回のbaselineが権威という規律も`baseline_hash_for`側で保たれる）。
+pub(crate) fn record_upper_alias_write(cfg: &Config, rel: &str) {
+    if !upper_alias_first_touch(rel) {
+        return;
+    }
+    let baseline_hash = baseline_hash_for(cfg, rel);
+    let op = if baseline_hash.is_some() { ChangeOp::Modify } else { ChangeOp::Create };
+    append_ledger_entry(cfg, op, rel, baseline_hash);
+}
+
 // `copy_up`（`std::fs::copy`/`create_dir_all`）はWin32のCreateFileW等を経由するため、
 // パッチ済みの`ntdll!NtCreateFile`/`NtOpenFile`を通って自分自身のフック関数へ再入する
 // （このDLLだけでなくプロセス内の全呼び出し元がパッチ済みの実体を叩くため、フック関数の内部から

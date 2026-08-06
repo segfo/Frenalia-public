@@ -165,6 +165,33 @@ pub fn remove_workspace_entry(path: &Path) {
     ledger().update(|l| l.entries.retain(|e| e.path != path_str));
 }
 
+/// `should_remove`がtrueを返したパスのエントリを落とす（`harness fs prune`、D-53）。
+/// 返り値は実際に落としたパスの一覧。
+///
+/// **判定は呼び出し側が持ち、本関数はロックと永続化だけを持つ。** 台帳ファイルを所有するのは
+/// このモジュールなので、CLI側で`load`→`save`する形にはしない（複数`harness.exe`同時起動下の
+/// lost updateを避ける、R-01）。
+///
+/// この台帳は`preflight`成功のたびに追記される一方、撤収（`revoke-workspace`）を明示的に
+/// 呼ばない限り誰も消さないため、使い捨てワークスペースを繰り返すと際限なく積もる
+/// （実測で1,043件・155KB）。**使用中かどうかの判定はここでは行わない**——生存判定は常に
+/// 名前付きmutex（[`live_modes`]）が持つというモジュールdocの方針を崩さないためで、
+/// そもそも実在しないパスに生きたセッションは在り得ない。
+pub fn prune_workspace_entries(should_remove: impl Fn(&Path) -> bool) -> Vec<String> {
+    ledger().update(|l| {
+        let mut removed = Vec::new();
+        l.entries.retain(|e| {
+            if should_remove(Path::new(&e.path)) {
+                removed.push(e.path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    })
+}
+
 // --- CoW upper_dirのセッションメタデータ・列挙（`harness cow`サブコマンド用） ---
 
 /// upper_dir直下に置く、セッションの由来（どのworkspaceのものか）を記録する小さなマーカー
@@ -220,38 +247,19 @@ pub fn list_cow_sessions() -> Vec<String> {
         .collect()
 }
 
-/// `upper_dir`配下にあるファイルの相対パス一覧を返す（セッションメタファイル自身は除外する）。
+/// `upper_dir`配下にあるファイルの相対パス一覧を返す（CoW自身の帳簿は除外する）。
 /// upper_dirには実際に触られたファイルしか存在しないため、この一覧がそのままworkspace本体
 /// に対する変更点になる。
+///
+/// 走査規則は`harness_change_ledger::store::scan_upper_content_files`が唯一の実装
+/// （`docs/CODE-STRUCTURE-RULES.md`規則5）。以前はここに独自の走査があり、除外していたのが
+/// セッションメタと操作台帳の2つだけだったため、denied/warnings台帳やbaselineミラーまで
+/// 「変更されたファイル」として数えていた（`harness cow list`の`changed_files=`が過大）。
 pub fn list_cow_upper_files(upper_dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_files_relative(upper_dir, upper_dir, &mut out);
-    out
-}
-
-fn collect_files_relative(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            collect_files_relative(root, &path, out);
-        } else if file_type.is_file() {
-            let name = path.file_name().and_then(|n| n.to_str());
-            if name == Some(COW_SESSION_META_FILENAME)
-                || name == Some(harness_change_ledger::COW_OPS_LEDGER_FILENAME)
-            {
-                continue;
-            }
-            if let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.to_path_buf());
-            }
-        }
-    }
+    harness_change_ledger::store::scan_upper_content_files(upper_dir)
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// `upper_dir`直下の操作台帳（`.harness-cow-ops.jsonl`）を読み、現在の論理的な変更一覧を返す

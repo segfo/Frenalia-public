@@ -170,6 +170,102 @@ pub fn read_denied_log(upper_dir: &Path) -> Vec<CowDeniedEntry> {
         .collect()
 }
 
+/// upper_dir配下にある「セッションの中身」ファイルを走査し、操作台帳のキー形
+/// （workspace内は`/`区切りの相対パス、`_ext/<key>`配下は絶対パス文字列）で返す。
+///
+/// **なぜ台帳を読むだけで済ませないのか**（[BUG-066](../../../docs/bugs/BUG-066.md)）:
+/// upper_dirはサンドボックス子プロセスへRW付与されている（`preflight`の
+/// `grant_ace_inheritable_rw(upper_dir, sid)`）ので、子は`copy_up`もフックも経由せず、
+/// upperの絶対パスを直接指定してファイルを置ける。実際BUG-066では、モデルが`run_shell`から
+/// `Set-Content <upper>\merge-demo.txt`と書いたためにupperには編集後の内容があるのに台帳が
+/// 空で、`harness changes`が「変更なし」と答え、`discard`すれば作業ごと消える状態になっていた。
+/// Redirector DLLは境界ではない（D-01）＝フックが黙って素通りしても成立する可視性が要る。
+/// **実体の走査だけが、書く側が何をしようと成立する**。
+///
+/// 除外するのはCoW自身の帳簿だけ（[`crate::COW_METADATA_PREFIX`]で始まるupper直下の
+/// ファイル・ディレクトリ）。ディレクトリ自体は返さない（空ディレクトリは変更として扱わない
+/// ——台帳経由の`mkdir`は台帳側のエントリで表現される）。
+pub fn scan_upper_content_files(upper_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_content_files(upper_dir, upper_dir, &mut out);
+    out.sort();
+    out
+}
+
+fn collect_content_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        // CoW自身の帳簿はupper直下にしか置かれないので、直下の要素名だけを見る。
+        if dir == root
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(crate::COW_METADATA_PREFIX))
+        {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_content_files(root, &path, out);
+        } else if file_type.is_file() {
+            if let Some(key) = upper_path_to_ledger_key(root, &path) {
+                out.push(key);
+            }
+        }
+    }
+}
+
+/// upper配下の実パスを操作台帳のキーへ写す（[`scan_upper_content_files`]の1件分）。
+/// `_ext/<key>`配下は[`ext_key`]の逆写像で絶対パスへ戻す。
+fn upper_path_to_ledger_key(root: &Path, path: &Path) -> Option<String> {
+    let rel = crate::path_rules::relative_under_root(
+        &path.to_string_lossy(),
+        &root.to_string_lossy(),
+    )?;
+    if rel.is_empty() {
+        return None;
+    }
+    match rel.strip_prefix("_ext/") {
+        Some(ext) => ext_key_to_abs_path(ext),
+        None => Some(rel),
+    }
+}
+
+/// [`ext_key`]の逆写像。`c/Windows/probe.txt` → `c:/Windows/probe.txt`、
+/// `etc/passwd` → `/etc/passwd`。
+///
+/// **ドライブ文字の大小は復元できない**（`ext_key`が小文字化するため）。台帳側のエントリと
+/// 突き合わせるときは必ず`ext_key`空間で比較すること（`c:/...`と`C:/...`を文字列比較すると
+/// 同じファイルを別物と誤認する）。Windowsのドライブ文字は大小を区別しないので、
+/// `apply`が実FSを触る用途では小文字のままで支障はない。
+fn ext_key_to_abs_path(key: &str) -> Option<String> {
+    let mut parts = key.splitn(2, '/');
+    let head = parts.next()?;
+    let rest = parts.next().unwrap_or("");
+    if head.len() == 1 && head.as_bytes()[0].is_ascii_alphabetic() {
+        return Some(format!("{head}:/{rest}"));
+    }
+    Some(format!("/{key}"))
+}
+
+/// 台帳キーの突き合わせ用の正規形。`_ext`（絶対パス）は[`ext_key`]空間へ、workspace内は
+/// 区切りを`/`へ揃えたうえで、**どちらも大小無視**にする（Windowsのパスは大小を区別せず、
+/// 台帳の綴りはアプリが渡した文字列、走査の綴りは実FSのディレクトリエントリなので、
+/// 同じファイルでも大小が食い違い得る）。
+pub fn ledger_key_match_form(key: &str) -> String {
+    let normalized = if Path::new(key).is_absolute() {
+        ext_key(key).unwrap_or_else(|_| key.to_string())
+    } else {
+        key.replace('\\', "/")
+    };
+    normalized.to_ascii_lowercase()
+}
+
 /// baselineミラー（`<upper_dir>/.harness-cow-baseline/<rel>`）の内容を読む
 /// （`resolve`の`base`側材料・TUI変更パネルのdiffプレビュー用）。無ければ`None`
 /// （baselineミラー導入前に発生したコンフリクト等）。
@@ -326,6 +422,57 @@ mod tests {
         let hash = baseline_hash_and_mirror_ext(upper.path(), "C:/Windows/probe.txt", "c/Windows/probe.txt");
 
         assert_eq!(hash, Some("stale".to_string()));
+    }
+
+    /// BUG-066: 台帳を経由せずupperへ直接置かれたファイルも走査で見つかること。CoW自身の
+    /// 帳簿（`.harness-cow-*`）だけが除外され、入れ子のディレクトリは掘って中身を拾う。
+    #[test]
+    fn scan_upper_content_files_finds_direct_writes_and_skips_cow_metadata() {
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(upper.path().join("direct.txt"), b"written without the ledger").unwrap();
+        std::fs::create_dir_all(upper.path().join("sub").join("deep")).unwrap();
+        std::fs::write(upper.path().join("sub").join("deep").join("nested.txt"), b"x").unwrap();
+        // CoW自身の帳簿一式（除外される側）。
+        append_entry(upper.path(), ChangeOp::Create, "direct.txt", None);
+        append_denied_entry(upper.path(), "C:/outside/x.txt", 0x4000_0000, 42);
+        std::fs::write(upper.path().join(".harness-cow-session.json"), b"{}").unwrap();
+        std::fs::write(upper.path().join(".harness-cow-warnings.jsonl"), b"{}\n").unwrap();
+        std::fs::write(upper.path().join(".harness-cow-debug.log"), b"log").unwrap();
+        std::fs::create_dir_all(upper.path().join(COW_BASELINE_DIRNAME)).unwrap();
+        std::fs::write(
+            upper.path().join(COW_BASELINE_DIRNAME).join("direct.txt"),
+            b"baseline mirror",
+        )
+        .unwrap();
+
+        let found = scan_upper_content_files(upper.path());
+
+        assert_eq!(found, vec!["direct.txt".to_string(), "sub/deep/nested.txt".to_string()]);
+    }
+
+    /// `_ext/<key>`配下は絶対パス形の台帳キーへ逆写像される（`ext_key`の逆）。
+    #[test]
+    fn scan_upper_content_files_maps_ext_entries_back_to_absolute_paths() {
+        let upper = tempfile::tempdir().unwrap();
+        let ext_dir = upper.path().join("_ext").join("c").join("outside");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("probe.txt"), b"x").unwrap();
+
+        let found = scan_upper_content_files(upper.path());
+
+        assert_eq!(found, vec!["c:/outside/probe.txt".to_string()]);
+    }
+
+    /// 突き合わせは`ext_key`空間・大小無視で行う（ドライブ文字の大小差・実FSの綴り差で
+    /// 「台帳にあるのに未記録」と誤判定しないため）。
+    #[test]
+    fn ledger_key_match_form_folds_case_and_ext_key_spelling() {
+        assert_eq!(
+            ledger_key_match_form("C:/Windows/Probe.txt"),
+            ledger_key_match_form("c:/windows/probe.txt")
+        );
+        assert_eq!(ledger_key_match_form("Sub/A.TXT"), ledger_key_match_form("sub/a.txt"));
+        assert_eq!(ledger_key_match_form(r"sub\a.txt"), "sub/a.txt");
     }
 
     #[test]

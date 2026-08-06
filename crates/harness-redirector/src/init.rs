@@ -57,7 +57,7 @@ pub(crate) unsafe fn resolve_config(param: *const u8) -> Option<Config> {
             "init: config from injection parameter workspace={:?} upper={:?} ext_roots={:?}",
             cfg.workspace_root, cfg.upper_dir, cfg.ext_capture_roots
         ));
-        return Some(cfg);
+        return Some(finalize_config(cfg));
     }
     debug_log(&format!(
         "init: config from env, HARNESS_COW_WORKSPACE={:?} HARNESS_COW_UPPER={:?}",
@@ -85,11 +85,43 @@ pub(crate) unsafe fn resolve_config(param: *const u8) -> Option<Config> {
         .map(|v| v.split(';').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
         .unwrap_or_default();
     debug_log(&format!("init: HARNESS_COW_EXT_ROOTS={ext_capture_roots:?}"));
-    Some(Config {
+    Some(finalize_config(Config {
         workspace_root,
         upper_dir,
         ext_capture_roots,
-    })
+    }))
+}
+
+/// 受け取った設定のルートの綴りを揃え（`normalize_root_spelling`）、**workspace_rootが
+/// 絶対パスでなければ警告台帳へ記録する**（[BUG-066](../../../docs/bugs/BUG-066.md)）。
+///
+/// workspace_rootが相対パス（`--cwd .`等）だと、アプリが渡す絶対パスとの照合が全て外れ、
+/// **workspace内への書込が1件残らずACL拒否になる**（＝`--cow`の透過性が全滅する）。
+/// それでも「フックは境界ではない」（D-01）以上、ここで起動を止める意味は無い——止めても
+/// 止めなくてもworkspaceはROのままで安全性は変わらない。変わるのは**なぜ書けないのかが
+/// 分かるかどうか**なので、理由を台帳へ残して続行する（実際BUG-066のセッションでは、
+/// この痕跡がどこにも無かったせいで原因の特定に会話ログの発掘が要った）。
+pub(crate) fn finalize_config(cfg: Config) -> Config {
+    use harness_change_ledger::path_rules::normalize_root_spelling;
+    let normalize = |p: &Path| PathBuf::from(normalize_root_spelling(&p.to_string_lossy()));
+    let cfg = Config {
+        workspace_root: normalize(&cfg.workspace_root),
+        upper_dir: normalize(&cfg.upper_dir),
+        ext_capture_roots: cfg.ext_capture_roots.iter().map(|p| normalize(p)).collect(),
+    };
+    if !cfg.workspace_root.is_absolute() {
+        append_warning_kind(
+            &cfg,
+            "config_workspace_not_absolute",
+            &format!(
+                "HARNESS_COW_WORKSPACE is not an absolute path ({}); every absolute-path write \
+                 into the workspace will fail to classify and be denied by the read-only ACL \
+                 instead of being redirected to the CoW upper directory (see docs/bugs/BUG-066.md)",
+                cfg.workspace_root.display()
+            ),
+        );
+    }
+    cfg
 }
 
 /// [`init`]を直列化し、**成功だけを確定させる**入口（BUG-045）。既に成功済みなら即`true`

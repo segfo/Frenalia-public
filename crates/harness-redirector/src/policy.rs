@@ -79,18 +79,46 @@ pub(crate) fn should_redirect_write(
 /// upper_dir配下は絶対に対象外とする（誤ってupperをworkspaceとして再変換すると無限
 /// リダイレクトになる、設計書§9）。
 pub(crate) fn workspace_relative(cfg: &Config, path: &Path) -> Option<PathBuf> {
-    let path_lc = path.to_string_lossy().to_ascii_lowercase();
-    let upper_lc = cfg.upper_dir.to_string_lossy().to_ascii_lowercase();
-    if path_lc.starts_with(&upper_lc) {
+    if relative_under(&cfg.upper_dir, path).is_some() {
         return None;
     }
-    let ws_lc = cfg.workspace_root.to_string_lossy().to_ascii_lowercase();
-    let is_under_workspace = path_lc == ws_lc
-        || (path_lc.starts_with(&ws_lc) && path_lc.as_bytes().get(ws_lc.len()) == Some(&b'\\'));
-    if !is_under_workspace {
+    relative_under(&cfg.workspace_root, path).map(|rel| rel_path_buf(&rel))
+}
+
+/// パス1本が`root`配下かを判定し、配下なら相対部分（`/`区切り、`root`自身なら空文字列）を返す。
+///
+/// **判定と相対部分の算出を必ず1つの規則で行う**ため、実体は
+/// `harness_change_ledger::path_rules::relative_under_root`（host側の照合と共有）へ委譲する。
+/// [BUG-066](../../../docs/bugs/BUG-066.md): 旧実装は「配下か」を小文字化した文字列の前置詞
+/// 一致で見ながら、相対部分を`Path::strip_prefix`（成分単位・**case-sensitive**）で求めていた。
+/// 大小が1文字違うだけで「配下と判定したのに`None`」になり、呼び出し側からはworkspace外と
+/// 区別が付かない＝**CoWのリダイレクトが黙って止まり、ACL拒否だけが残る**。末尾区切り・
+/// `\??\`/`\\?\`前置・`/`混在も同じ理由で共有ヘルパ側が吸収する。
+fn relative_under(root: &Path, path: &Path) -> Option<String> {
+    harness_change_ledger::path_rules::relative_under_root(
+        &path.to_string_lossy(),
+        &root.to_string_lossy(),
+    )
+}
+
+/// `/`区切りの相対パス文字列を、`upper_dir.join()`で使える`PathBuf`（`\`区切り）へ。
+fn rel_path_buf(rel: &str) -> PathBuf {
+    PathBuf::from(rel.replace('/', "\\"))
+}
+
+/// `path`が`upper_dir`配下（＝**既にCoWの行き先そのもの**）であれば、upperルートからの
+/// 相対パス（`/`区切り）を返す。CoW自身の帳簿（`.harness-cow-*`、upper直下）は`None`＝
+/// 完全に対象外にする（台帳・監査ログ自身の読み書きを「変更」として記録しないため）。
+pub(crate) fn upper_relative(cfg: &Config, path: &Path) -> Option<String> {
+    let rel = relative_under(&cfg.upper_dir, path)?;
+    if rel.is_empty() {
         return None;
     }
-    path.strip_prefix(&cfg.workspace_root).ok().map(|p| p.to_path_buf())
+    let top = rel.split('/').next().unwrap_or("");
+    if top.starts_with(harness_change_ledger::COW_METADATA_PREFIX) {
+        return None;
+    }
+    Some(rel)
 }
 
 pub(crate) fn rel_to_string(rel: &Path) -> String {
@@ -100,12 +128,8 @@ pub(crate) fn rel_to_string(rel: &Path) -> String {
 /// `path`が`ext_capture_roots`のいずれか配下であれば、`(ext_key, 正規化済み絶対パス文字列)`を
 /// 返す（Phase 3、設計書§19.8）。`workspace_relative`と同じ大小無視・パス区切り境界判定。
 pub(crate) fn ext_relative(cfg: &Config, path: &Path) -> Option<(String, String)> {
-    let path_lc = path.to_string_lossy().to_ascii_lowercase();
     for root in &cfg.ext_capture_roots {
-        let root_lc = root.to_string_lossy().to_ascii_lowercase();
-        let is_under = path_lc == root_lc
-            || (path_lc.starts_with(&root_lc) && path_lc.as_bytes().get(root_lc.len()) == Some(&b'\\'));
-        if is_under {
+        if relative_under(root, path).is_some() {
             let original = store::normalize_abs_path(&path.to_string_lossy());
             let key = store::ext_key(&original).ok()?;
             return Some((key, original));
@@ -122,16 +146,53 @@ pub(crate) fn ext_relative(cfg: &Config, path: &Path) -> Option<(String, String)
 pub(crate) struct Classified {
     pub(crate) rel: PathBuf,
     pub(crate) ledger_key: String,
+    pub(crate) kind: TargetKind,
+}
+
+/// 対象パスの種別。`UpperAlias`だけリダイレクトの扱いが違う（既に行き先に居るので
+/// 誘導しない＝記録だけする）ため、呼び出し側が分岐できるよう明示的に持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetKind {
+    /// workspace配下。upperへ誘導する（従来どおり）。
+    Workspace,
+    /// `--fs-allow`のext capture root配下。`_ext/<key>`へ誘導する（Phase 3）。
+    Ext,
+    /// **upper_dir配下＝workspaceパスの別名**（[BUG-066](../../../docs/bugs/BUG-066.md)）。
+    ///
+    /// upper_dirはサンドボックス子へRW付与されているので、子は`<upper>\<rel>`を直接指定して
+    /// 書ける（実際にモデルが`Set-Content <upper>\merge-demo.txt`をやった）。同じ実ファイルを
+    /// 指す2通りの綴りなのだから、**同じ台帳キーの操作として同一視する**のが一貫している。
+    /// 誘導先を作り直す（＝upperのupper）必要は無い——既に行き先だからである。
+    UpperAlias,
 }
 
 pub(crate) fn classify_target(cfg: &Config, path: &Path) -> Option<Classified> {
+    // upperを最初に見る（workspace配下にupperを置く構成でも、行き先側の解釈を優先する）。
+    if let Some(rel) = upper_relative(cfg, path) {
+        // `_ext/<key>`配下の別名は対象外にする。`ext_key`はドライブ文字を小文字化するため
+        // 絶対パスへ逆写像すると台帳の綴りと食い違い、同じファイルが2エントリに割れる。
+        // こちらはhost側の実体走査（`store::scan_upper_content_files`）が拾う。
+        if rel.starts_with("_ext/") {
+            return None;
+        }
+        return Some(Classified {
+            rel: rel_path_buf(&rel),
+            ledger_key: rel,
+            kind: TargetKind::UpperAlias,
+        });
+    }
     if let Some(rel) = workspace_relative(cfg, path) {
         let ledger_key = rel_to_string(&rel);
-        return Some(Classified { rel, ledger_key });
+        return Some(Classified {
+            rel,
+            ledger_key,
+            kind: TargetKind::Workspace,
+        });
     }
     let (key, original) = ext_relative(cfg, path)?;
     Some(Classified {
         rel: Path::new("_ext").join(&key),
         ledger_key: original,
+        kind: TargetKind::Ext,
     })
 }

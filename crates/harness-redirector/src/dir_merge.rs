@@ -500,8 +500,18 @@ pub(crate) unsafe fn filename_filter_string(us: *const windows::Win32::Foundatio
 /// 孫プロセスへ再注入が失敗した/未完了だった場合の警告を`.harness-cow-warnings.jsonl`へ
 /// 追記する（Q6）。孫の書込みが透過されないことを示すだけで、生成自体は拒否しない。
 pub(crate) fn append_warning_entry(cfg: &Config, message: &str) {
+    append_warning_kind(cfg, "grandchild_injection_incomplete", message);
+}
+
+/// `kind`を指定して警告台帳へ1行追記する（`append_warning_entry`の一般化）。
+///
+/// 透過性が失われる事象は**必ずここへ痕跡を残す**こと。BUG-066のセッションでは、
+/// workspace内への書込が1件もリダイレクトされないまま全てACL拒否されていたのに、
+/// なぜそうなったのかを示す記録がどこにも無かった（releaseビルドでは`debug_log`が
+/// 定数畳み込みで消えるため、後から追う手段が残らない）。
+pub(crate) fn append_warning_kind(cfg: &Config, kind: &str, message: &str) {
     let entry = CowWarningEntry {
-        kind: "grandchild_injection_incomplete",
+        kind,
         message,
         ts_unix_millis: now_millis(),
     };

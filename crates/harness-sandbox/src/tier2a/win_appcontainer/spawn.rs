@@ -351,6 +351,27 @@ pub struct CowInject<'a> {
     pub ext_capture_roots: &'a [PathBuf],
 }
 
+/// Redirector DLLへ渡すルートパスの綴りを揃える（[BUG-066](../../../../docs/bugs/BUG-066.md)）。
+///
+/// DLLは受け取った文字列で「このパスはworkspace配下か」を判定するため、`--cwd`の綴りが
+/// そのまま届くと表記ゆれで照合が外れる。外れると**workspace内への書込が1件残らずACL拒否**に
+/// なり（＝`--cow`の透過性が全滅し）、しかもそれが「workspace外への書込が拒否された」ように
+/// 見える。ここが`CowInject`を使う唯一の絞り（env・注入blobの両方がこの値から作られる）
+/// なので、渡す前に一度だけ揃える:
+///
+/// - `canonicalize`で相対パス（`--cwd .`）と`..`・8.3短縮名・シンボリックリンクを解決する
+/// - `\\?\`前置と末尾区切りを落とす（`normalize_root_spelling`。DLL側の`nt_path_wide`が
+///   `\??\`を前置するので、verbatim形のまま渡すと不正なNTパスになる）
+///
+/// `canonicalize`が失敗する場合（存在しないパス等）は綴りを揃えるだけに留める——ここは
+/// 境界ではないので、失敗しても起動を止める理由にはならない（D-01。workspaceはROのまま）。
+fn normalize_cow_root(path: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    PathBuf::from(harness_change_ledger::path_rules::normalize_root_spelling(
+        &resolved.to_string_lossy(),
+    ))
+}
+
 /// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する。
 /// Tier1の`CreateProcessAsUserW`+制限トークンとは別方式: トークンは差し替えず、呼び出し
 /// スレッド自身のトークンのまま拡張属性リストでAppContainerへ閉じ込める。そのため
@@ -486,13 +507,14 @@ fn spawn_impl(
     let mut env_owned;
     let env = if let (Some(c), Some((_, ready_write))) = (cow, &ready_pipe) {
         env_owned = env.to_vec();
+        // BUG-066: 綴りを揃えてから渡す（`normalize_cow_root`のdoc参照）。
         env_owned.push((
             "HARNESS_COW_WORKSPACE".to_string(),
-            c.workspace_root.to_string_lossy().into_owned(),
+            normalize_cow_root(c.workspace_root).to_string_lossy().into_owned(),
         ));
         env_owned.push((
             "HARNESS_COW_UPPER".to_string(),
-            c.upper_dir.to_string_lossy().into_owned(),
+            normalize_cow_root(c.upper_dir).to_string_lossy().into_owned(),
         ));
         env_owned.push((
             "HARNESS_COW_READY_HANDLE".to_string(),
@@ -502,7 +524,7 @@ fn spawn_impl(
             let joined = c
                 .ext_capture_roots
                 .iter()
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| normalize_cow_root(p).to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join(";");
             env_owned.push(("HARNESS_COW_EXT_ROOTS".to_string(), joined));
@@ -731,4 +753,57 @@ pub fn resolve_shell() -> (String, &'static str) {
         format!("{system_root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
         "powershell5.1(Tier2a)",
     )
+}
+
+#[cfg(test)]
+mod normalize_cow_root_tests {
+    use super::*;
+
+    /// **BUG-066の追加検証（2026-08-06）**: Redirector DLLへ渡す直前の正規化が、候補だった
+    /// 4つの綴りを**同一のcanonical絶対パス**へ畳むこと。ここが効いている限り、DLLは
+    /// 表記ゆれを一切見ない（DLL側の`relative_under_root`は二重の保険という位置付けになる）。
+    #[test]
+    fn every_workspace_root_spelling_folds_to_the_same_canonical_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path();
+        let expected = normalize_cow_root(real);
+        assert!(expected.is_absolute(), "canonical form must be absolute: {expected:?}");
+        assert!(
+            !expected.to_string_lossy().starts_with(r"\\?\"),
+            "verbatim prefix must be stripped so nt_path_wide can prepend \\??\\: {expected:?}"
+        );
+
+        let spellings = [
+            PathBuf::from(real.to_string_lossy().to_uppercase()),
+            PathBuf::from(format!("{}\\", real.to_string_lossy())),
+            PathBuf::from(format!(r"\\?\{}", real.to_string_lossy())),
+        ];
+        for spelling in spellings {
+            assert_eq!(
+                normalize_cow_root(&spelling),
+                expected,
+                "spelling {spelling:?} must fold to the canonical form"
+            );
+        }
+    }
+
+    /// 相対パス（`--cwd .`）は**プロセスのcwdを基準に**絶対化される。実運用では
+    /// harnessプロセスのcwdが利用者の意図したworkspaceなので、これが正しい解決になる
+    /// （プロセスのcwdは変更しない——並行テストを壊さないため、`current_dir()`と比較する）。
+    #[test]
+    fn a_relative_root_is_resolved_against_the_process_cwd() {
+        let cwd = std::env::current_dir().expect("current_dir");
+        assert_eq!(normalize_cow_root(Path::new(".")), normalize_cow_root(&cwd));
+        assert!(normalize_cow_root(Path::new(".")).is_absolute());
+    }
+
+    /// 存在しないパスは`canonicalize`できないので綴りの正規化だけが効く（起動は止めない、
+    /// D-01: ここは境界ではない）。**絶対パスにはならない**ので、この場合はDLL側が
+    /// 警告台帳へ`config_workspace_not_absolute`を残す方の防御が働く。
+    #[test]
+    fn a_nonexistent_relative_path_is_only_spelling_normalized() {
+        let normalized = normalize_cow_root(Path::new(r"no-such-dir-9f3a\"));
+        assert_eq!(normalized, PathBuf::from("no-such-dir-9f3a"));
+        assert!(!normalized.is_absolute());
+    }
 }

@@ -5,6 +5,31 @@
 
 use super::*;
 
+/// `--cwd`（省略時は`current_dir()`）で受け取ったworkspaceルートを、**完全修飾された
+/// 非verbatimパス**へ揃える（[BUG-067](../../../../docs/bugs/BUG-067.md)）。
+///
+/// この値は`ToolCtx.workspace_root`として全機構へ配られ、その多くが「完全修飾された絶対パス」を
+/// 暗黙の前提にしている。前提が破れると**起動できない**ことが実測で分かった:
+///
+/// * `--cwd .`（相対）→ `win_common::long_path_string`が`\\?\.`という不正なverbatimパスを作り、
+///   AppContainerへのACE付与が`0x80070002`（ファイルが見つかりません）で失敗する。
+/// * `--cwd \\?\C:\ws`（verbatim）→ `.harness`書込拒否プローブのPowerShellが`Join-Path`で
+///   verbatimパスを扱えず例外になり、preflightが「想定外の終了コード」で止まる。
+///
+/// **`canonicalize`は使わない。** あれはFSを触ってシンボリックリンク・ジャンクションを解決する
+/// ため、ACEを付ける対象がリンク自身からリンク先へすり替わる（境界の意味が変わる）。
+/// ここで欲しいのは綴りを揃えることだけなので、FSを一切触らない`std::path::absolute`
+/// （`GetFullPathNameW`相当。`.`/`..`は字句的に畳むがリンクは辿らない）を使う。verbatim前置は
+/// `absolute`が素通しする仕様なので、共有ヘルパで先に落とす。
+fn normalize_workspace_root(raw: &Path) -> PathBuf {
+    let stripped =
+        harness_change_ledger::path_rules::normalize_root_spelling(&raw.to_string_lossy());
+    let stripped = PathBuf::from(stripped);
+    // 失敗するのは空パス等の異常時のみ。**元の値を黙って捨てない**（後段のエラーメッセージが
+    // ユーザーの打った綴りを指せるように）。
+    std::path::absolute(&stripped).unwrap_or(stripped)
+}
+
 /// [`stage_parse_args`]の出力。Stage2（`stage_configure`）以降が必要とする値だけを運ぶ。
 pub(super) struct ParsedArgs {
     pub(super) cli: Cli,
@@ -52,6 +77,7 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
             }
         },
     };
+    let workspace_root = normalize_workspace_root(&workspace_root);
     harness_config::ensure_project_settings_file(&workspace_root);
 
     // `apply`/`changes`/`discard`サブコマンドはプロバイダ資格情報を一切必要としないため、
@@ -120,3 +146,38 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **BUG-067の回帰テスト**: `--cwd`の綴りが揺れても、以降の全機構が受け取るのは
+    /// 完全修飾された非verbatimパスであること。実測で分かった起動不能の2形
+    /// （相対パス・`\\?\`前置）が、ここで揃うことで解消する。
+    #[test]
+    fn workspace_root_is_normalized_to_a_fully_qualified_non_verbatim_path() {
+        let cwd = std::env::current_dir().expect("current_dir");
+        let expected = std::path::absolute(&cwd).expect("absolute(cwd)");
+
+        // 相対パス（`--cwd .`）はプロセスのcwd基準で完全修飾される。
+        assert_eq!(normalize_workspace_root(Path::new(".")), expected);
+        // verbatim前置は落ちる（`long_path_string`が二重の`\\?\`を作らないように）。
+        let verbatim = PathBuf::from(format!(r"\\?\{}", cwd.display()));
+        assert_eq!(normalize_workspace_root(&verbatim), expected);
+        // 末尾の区切りも落ちる。
+        let trailing = PathBuf::from(format!(r"{}\", cwd.display()));
+        assert_eq!(normalize_workspace_root(&trailing), expected);
+        // 既に正規形なら何も変えない（冪等）。
+        assert_eq!(normalize_workspace_root(&expected), expected);
+    }
+
+    /// **大小差は潰さない。** `canonicalize`ではなく`std::path::absolute`を使っているため
+    /// FSを触らず、綴りの大小はユーザーが打ったまま残る（Windowsのパス比較は大小を区別せず、
+    /// 判定側は`path_rules::relative_under_root`が吸収するので、ここで潰す必要が無い）。
+    /// シンボリックリンク・ジャンクションを解決しないこと（＝ACEを付ける対象がすり替わらない）
+    /// も同じ性質から従う。
+    #[test]
+    fn normalization_does_not_touch_the_filesystem_so_case_and_links_are_preserved() {
+        let upper = PathBuf::from(r"C:\WS\Sub");
+        assert_eq!(normalize_workspace_root(&upper), PathBuf::from(r"C:\WS\Sub"));
+    }
+}

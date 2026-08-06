@@ -1010,6 +1010,7 @@ fn change_row(path: &str) -> ChangeRow {
             path: path.to_string(),
             baseline_hash: None,
             rejected: None,
+            unledgered: false,
         },
         diff: Vec::new(),
     }

@@ -130,6 +130,13 @@ pub(crate) enum Commands {
         /// workspace外書込自体を記録しないため常に無関係（Phase 3で復活予定）。
         #[arg(long = "dangerously-allow", default_value_t = false)]
         dangerously_allow: bool,
+        /// オーバーレイに実体はあるが操作台帳に記録が無い変更（`changes`で`[unledgered]`と
+        /// 表示されるもの）も適用する。セッション開始時点の内容が分からないため、
+        /// **実workspace側を他の誰かが編集していても検知できない**まま上書きする
+        /// （docs/bugs/BUG-066.md）。workspace側に実体が無い新規作成は、このフラグ無しでも
+        /// 適用される。
+        #[arg(long = "adopt-unledgered", default_value_t = false)]
+        adopt_unledgered: bool,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },

@@ -297,6 +297,16 @@ pub(crate) fn record_denied_attempt(cfg: &Config, path: &Path, access_mask: u32)
     store::append_denied_entry(&cfg.upper_dir, &path_str, access_mask, pid);
 }
 
+/// BUG-066: upper配下の実体へ直接書かれたパスのうち、既にこのプロセスが台帳へ記録済みの集合
+/// （`record_upper_alias_write`の冪等化。`copy_up`の`upper_path.exists()`と同じ役割を果たす）。
+pub(crate) fn upper_alias_first_touch(rel: &str) -> bool {
+    static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .insert(rel.to_string())
+}
+
 /// `deleted_paths_state`を最後に同期した時点での台帳ファイルの読み込み済みバイトオフセット。
 pub(crate) fn ledger_read_offset() -> &'static Mutex<u64> {
     static O: OnceLock<Mutex<u64>> = OnceLock::new();

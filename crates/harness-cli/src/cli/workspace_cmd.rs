@@ -27,6 +27,64 @@ struct ApplyReportJson {
     hard_denied: Vec<String>,
     /// 台帳のパスの形が不正だったため拒否したエントリ（BUG-062）。`(path, reason)`。
     rejected: Vec<(String, String)>,
+    /// オーバーレイに実体はあるが台帳に記録が無く、baselineが不明なため適用を見送った
+    /// エントリ（BUG-066）。`--adopt-unledgered`で取り込める。
+    unledgered: Vec<String>,
+}
+
+/// CoWセッションの由来（`.harness-cow-session.json`のworkspace_root）。upper_dir自身に
+/// 書かれているので、`--cwd`の綴りに依存せずに引ける（Windows専用の`--cow`機構なので
+/// 他プラットフォームでは常に`None`）。
+pub(crate) fn cow_session_workspace_root(upper_dir: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        harness_sandbox::tier2a::workspace_ledger::read_cow_session_meta(upper_dir)
+            .map(|m| m.workspace_root)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = upper_dir;
+        None
+    }
+}
+
+/// 拒否監査台帳（`.harness-cow-denied.jsonl`）の要約を出す。
+///
+/// **workspace内と外を必ず区別する**（[BUG-066](../../../../docs/bugs/BUG-066.md)）。
+/// 両者は見た目こそ同じ「ACLに拒否された書込」だが、意味が正反対である:
+///
+/// * workspace**外**への拒否 → 封じ込めが設計どおり働いた記録。放置してよい。
+/// * workspace**内**への拒否 → CoWのリダイレクトが働かなかった記録。書けるはずの場所へ
+///   書けなかったのだから、**その変更は失われている**。
+///
+/// 実際BUG-066のセッションでは、workspace内への書込4件が拒否されていたのに
+/// 「14 workspace-external write attempt(s)」と表示され、事実と逆の案内になっていた。
+pub(crate) fn print_denied_summary(upper_dir: &Path) {
+    let denied = harness_change_ledger::store::read_denied_log(upper_dir);
+    if denied.is_empty() {
+        return;
+    }
+    let workspace_root = cow_session_workspace_root(upper_dir);
+    let (inside, outside): (Vec<_>, Vec<_>) = denied.iter().partition(|e| {
+        workspace_root.as_deref().is_some_and(|root| {
+            harness_change_ledger::path_rules::relative_under_root(&e.path, root).is_some()
+        })
+    });
+    if !outside.is_empty() {
+        println!(
+            "({} workspace-external write attempt(s) were denied by ACL; \
+             see `harness cow audit`)",
+            outside.len()
+        );
+    }
+    if !inside.is_empty() {
+        println!(
+            "WARNING: {} write attempt(s) INSIDE the workspace were denied by ACL. The CoW \
+             redirect did not work for those writes, so the changes were lost (they are not in \
+             the overlay either). See `harness cow audit` and docs/bugs/BUG-066.md.",
+            inside.len()
+        );
+    }
 }
 
 /// `harness prompt`: 現在のフラグ・`.harness/settings.json`構成から実際に組み立てられる
@@ -263,30 +321,26 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                         // BUG-062: applyが拒否する形のパスは、一覧からは消さずに印と理由を
                         // 添えて見せる（D-43「失敗を隠さない」。黙って隠すと、ユーザは
                         // 「何も無かった」と解釈してしまう）。
-                        match &c.rejected {
-                            None => println!(
-                                "{:<7} {}",
-                                format!("{:?}", c.op).to_lowercase(),
-                                c.path
-                            ),
-                            Some(reason) => println!(
-                                "{:<7} {} [rejected: {reason}]",
-                                format!("{:?}", c.op).to_lowercase(),
-                                c.path
-                            ),
+                        // BUG-066: 台帳に無いオーバーレイ実体も同じ流儀で印を付ける。
+                        let mut marks = String::new();
+                        if c.unledgered {
+                            marks.push_str(
+                                " [unledgered: present in the overlay but not recorded]",
+                            );
                         }
+                        if let Some(reason) = &c.rejected {
+                            marks.push_str(&format!(" [rejected: {reason}]"));
+                        }
+                        println!(
+                            "{:<7} {}{marks}",
+                            format!("{:?}", c.op).to_lowercase(),
+                            c.path
+                        );
                     }
                     // Phase 4（設計書§19.8）: CoWセッションなら拒否監査ログの件数もフッタに
                     // 出す（`--cow`の書込境界自体はACLが保証しているので、これは可視性のみ）。
                     if let Some(dir) = &cow_upper_dir {
-                        let denied = harness_change_ledger::store::read_denied_log(dir);
-                        if !denied.is_empty() {
-                            println!(
-                                "({} workspace-external write attempt(s) were denied by ACL; \
-                                 see `harness cow audit`)",
-                                denied.len()
-                            );
-                        }
+                        print_denied_summary(dir);
                     }
                 }
             }
@@ -295,12 +349,14 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         Commands::Apply {
             only,
             dangerously_allow,
+            adopt_unledgered,
             ..
         } => {
             let report = match fs.apply(&ApplyOptions {
                 only_glob: only.as_deref(),
                 only_paths: None,
                 allow_ext: dangerously_allow,
+                adopt_unledgered,
             }) {
                 Ok(r) => r,
                 Err(e) => {
@@ -313,7 +369,10 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
             let has_conflicts_or_blocked = !report.conflicts.is_empty()
                 || !report.ext_blocked.is_empty()
                 || !report.hard_denied.is_empty()
-                || !report.rejected.is_empty();
+                || !report.rejected.is_empty()
+                // BUG-066: 「upperに実体があるのに適用されなかった」は、黙って成功扱いに
+                // してはいけない代表例（そのまま`discard`されると作業が消える）。
+                || !report.unledgered.is_empty();
             match output_format_and_kind.unwrap_or_default() {
                 OutputFormat::Json => {
                     let json = ApplyReportJson {
@@ -322,6 +381,7 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                         ext_blocked: report.ext_blocked,
                         hard_denied: report.hard_denied,
                         rejected: report.rejected,
+                        unledgered: report.unledgered,
                     };
                     if let Ok(s) = serde_json::to_string(&json) {
                         println!("{s}");
@@ -344,6 +404,13 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                         println!(
                             "rejected (malformed ledger path -- the operations ledger may have \
                              been tampered with, see docs/bugs/BUG-062.md): {p} -- {reason}"
+                        );
+                    }
+                    for p in &report.unledgered {
+                        println!(
+                            "unledgered (in the overlay but not recorded, baseline unknown, not \
+                             applied): {p} -- re-run with `--adopt-unledgered` to take it \
+                             (see docs/bugs/BUG-066.md)"
                         );
                     }
                 }
@@ -397,7 +464,15 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                     }
                 }
                 match attempt.finalize(&fs) {
-                    Ok(()) => {
+                    // BUG-065: conflict markerが残ったまま書いた場合を「解決済み」と数えない。
+                    // 内容は設計方針4どおり書くが、機械可読な signal（この行と終了コード）は
+                    // 未解決だと言い切る——stderrの警告とstdoutの集計が食い違うと、
+                    // 呼び出し側のスクリプトは成功として素通りしてしまう（BUG-064と同じ型）。
+                    Ok(true) => {
+                        println!("unresolved: {} (conflict markers remain)", attempt.path);
+                        failed += 1;
+                    }
+                    Ok(false) => {
                         println!("resolved: {}", attempt.path);
                         resolved += 1;
                     }

@@ -70,6 +70,10 @@ pub fn prepare_resolve(fs: &SandboxFs) -> Result<(ApplyReport, PreparedResolve),
         only_glob: None,
         only_paths: None,
         allow_ext: false,
+        // 台帳に無いオーバーレイ実体（BUG-066）はbaselineミラーも無いので3-way mergeの材料が
+        // 揃わない。`resolve`の対象にはせず`report.unledgered`のまま呼び出し側へ返す
+        // （`harness apply --adopt-unledgered`で取り込むか、upperの実体を直接見てもらう）。
+        adopt_unledgered: false,
     })?;
     if report.conflicts.is_empty() {
         return Ok((
@@ -207,17 +211,24 @@ impl MergeAttempt {
     /// エディタでの編集後（または`needs_edit`が`false`ならそのまま）、`merged_path`を読み直し、
     /// 実workspaceへ確定・オーバーレイ/台帳エントリを除去する。`<<<<<<<`等のconflict markerが
     /// まだ残っていても、ユーザーが明示的に保存した内容を最終判断として尊重しそのまま書く
-    /// （設計方針4）——ただし残っていた場合はstderrへ警告だけ出す。
-    pub fn finalize(&self, fs: &SandboxFs) -> Result<(), ResolveError> {
+    /// （設計方針4）。
+    ///
+    /// **書くことと「解決した」と報告することは別**である（[BUG-065](../../../docs/bugs/BUG-065.md)）。
+    /// 戻り値`true`はconflict markerが残ったまま書いたことを示し、呼び出し側はそれを成功として
+    /// 数えてはならない。harnessには「人が意図してmarkerを残した」と「エディタが実際には走らな
+    /// かった」を区別する手段が無く、非対話環境では後者が起きる（Windowsのフォールバック
+    /// `notepad.exe`は端末を持たない文脈で即座に成功終了する）。
+    pub fn finalize(&self, fs: &SandboxFs) -> Result<bool, ResolveError> {
         let content = std::fs::read_to_string(&self.merged_path)?;
-        if content.contains("<<<<<<<") || content.contains(">>>>>>>") {
+        let markers_remain = content.contains("<<<<<<<") || content.contains(">>>>>>>");
+        if markers_remain {
             eprintln!(
                 "warning: conflict markers remain in {} after edit; applying as-is",
                 self.path
             );
         }
         fs.finalize_resolved(&self.path, &content)?;
-        Ok(())
+        Ok(markers_remain)
     }
 }
 
@@ -259,7 +270,10 @@ mod tests {
         let merged = std::fs::read_to_string(&attempt.merged_path).unwrap();
         assert_eq!(merged, "line1-mine\nline2\nline3\nline4\nline5-theirs\n");
 
-        attempt.finalize(&fs).unwrap();
+        assert!(
+            !attempt.finalize(&fs).unwrap(),
+            "a clean auto-merge must not report leftover conflict markers"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "line1-mine\nline2\nline3\nline4\nline5-theirs\n"
@@ -282,8 +296,13 @@ mod tests {
         let merged = std::fs::read_to_string(&attempt.merged_path).unwrap();
         assert!(merged.contains("<<<<<<<"));
 
-        // ユーザーがエディタで保存したものと見なして、そのまま確定させる。
-        attempt.finalize(&fs).unwrap();
+        // ユーザーがエディタで保存したものと見なして、そのまま確定させる。内容は設計方針4どおり
+        // そのまま書くが、**markerが残ったことを戻り値で申告する**（BUG-065）。呼び出し側は
+        // これを成功として数えてはならない。
+        assert!(
+            attempt.finalize(&fs).unwrap(),
+            "leftover conflict markers must be reported to the caller, not swallowed as success"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             merged

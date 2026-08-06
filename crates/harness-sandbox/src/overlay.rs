@@ -89,6 +89,19 @@ pub(crate) fn simple_glob_match(pattern: &str, text: &str) -> bool {
 struct OverlayBackend {
     dir: PathBuf,
     jail: WorkspaceJail,
+    /// 台帳に無い実体がオーバーレイに現れ得るか（[`effective_changes`]が走査するか）。
+    ///
+    /// `true`になるのは**オーバーレイがworkspaceの外にある場合＝`--cow`のupper**だけである。
+    /// そこはサンドボックス子へRW付与されていて、しかもworkspaceのビューからは見えないので、
+    /// 子が直接置いたファイルを取りこぼすと黙って失われる（[BUG-066](../../docs/bugs/BUG-066.md)）。
+    ///
+    /// `--staged`のオーバーレイはworkspace内（`<workspace_root>/<sandbox_dir>`）にあり、
+    /// **harness自身が同じディレクトリを監査ログの置き場として使う**（`net-audit.jsonl`・
+    /// `fs-audit.jsonl`、`cli/startup/sandbox.rs`）。ここを走査すると、その監査ログが
+    /// 「台帳に無い変更」として一覧に出て`apply`でworkspaceルートへコピーされてしまう。
+    /// またstagedではオーバーレイ外の書込はそのまま実workspaceへ落ちる（＝失われない）ので、
+    /// 走査が守るべきものが無い。
+    scan_for_unledgered: bool,
 }
 
 /// `changes()`が返す1件（レビュー対象、`apply`/`discard`の単位）。stagedもCoWも同じ形。
@@ -105,6 +118,18 @@ pub struct ChangeEntry {
     /// D-43「失敗を隠さない」に従う。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejected: Option<String>,
+    /// **オーバーレイに実体はあるが操作台帳に記録が無い**エントリ
+    /// （[BUG-066](../../docs/bugs/BUG-066.md)）。
+    ///
+    /// CoW upperディレクトリはサンドボックス子へRW付与されているので、子は台帳を経由せずに
+    /// 直接ファイルを置ける（実際モデルが`run_shell`から`Set-Content <upper>\merge-demo.txt`と
+    /// 書いた）。台帳だけを見ていると**upperに存在する変更が`changes`から消え、`discard`で
+    /// 黙って失われる**ため、実体の走査結果と突き合わせてここに立てる。
+    ///
+    /// `baseline_hash`は`op`が`Modify`のとき**不明**である（セッション開始時点の姿を記録した
+    /// ものが無い）。捏造すると第三者による同時編集の上書き検知が壊れるので`None`のままにし、
+    /// `apply`は既定でこの種のエントリを適用しない（`ApplyOptions::adopt_unledgered`）。
+    pub unledgered: bool,
 }
 
 pub struct ApplyOptions<'a> {
@@ -117,6 +142,14 @@ pub struct ApplyOptions<'a> {
     /// workspace外ターゲットを実際に適用してよいか（`--dangerously-allow`相当）。Phase 2時点では
     /// workspace外書込自体を`write_string`が受け付けないため常に無効（Phase 3で復活予定）。
     pub allow_ext: bool,
+    /// 台帳に記録が無いオーバーレイ実体（[`ChangeEntry::unledgered`]）のうち、**実workspace側に
+    /// 既に別内容のファイルがあるもの**を適用してよいか（CLIの`--adopt-unledgered`）。
+    ///
+    /// 既定は`false`。この種のエントリはセッション開始時点の姿（baseline）が分からないため、
+    /// 適用すると「セッション中に人が実workspaceを編集していた」場合の上書きを検知できない。
+    /// workspace側に実体が無いもの（純粋な新規作成）は失うものが無いので、このフラグに関係なく
+    /// 適用する（[BUG-066](../../docs/bugs/BUG-066.md)）。
+    pub adopt_unledgered: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -138,6 +171,11 @@ pub struct ApplyReport {
     /// 「パスの形そのものが不正＝台帳が改竄されたか壊れている」である。運用上の対処も違う
     /// （前者はレビューして諦める、後者は台帳を疑う）。
     pub rejected: Vec<(String, String)>,
+    /// オーバーレイに実体はあるが台帳に記録が無く（[`ChangeEntry::unledgered`]）、かつ実
+    /// workspace側に別内容のファイルがあるため適用を見送ったパス（[BUG-066](../../docs/bugs/BUG-066.md)）。
+    /// baselineが不明なので、適用すると人の同時編集を黙って上書きし得る。
+    /// `ApplyOptions::adopt_unledgered`で明示的に取り込める。
+    pub unledgered: Vec<String>,
 }
 
 /// 書込リダイレクト・read-through・操作台帳・tombstoneを仲介するオーバーレイFS。
@@ -193,9 +231,15 @@ impl SandboxFs {
         let overlay = match overlay_dir {
             Some(dir) => {
                 std::fs::create_dir_all(&dir)?;
+                let scan_for_unledgered = harness_change_ledger::path_rules::relative_under_root(
+                    &dir.to_string_lossy(),
+                    &workspace_root.to_string_lossy(),
+                )
+                .is_none();
                 Some(OverlayBackend {
                     jail: WorkspaceJail::open(&dir)?,
                     dir,
+                    scan_for_unledgered,
                 })
             }
             None => None,
@@ -213,21 +257,22 @@ impl SandboxFs {
         let Some(overlay) = &self.overlay else {
             return Ok(Vec::new());
         };
-        Ok(store::replay_ledger(&overlay.dir)
+        Ok(effective_changes(&self.jail, overlay)
             .into_iter()
-            .map(|c| {
+            .map(|e| {
                 // `_ext`（絶対パス）は`store::ext_key`が別途検証する経路なので、ここでの
                 // 相対パス判定にはかけない（かけると全件が「不正」になる）。
-                let rejected = if Path::new(&c.path).is_absolute() {
-                    store::ext_key(&c.path).err()
+                let rejected = if Path::new(&e.change.path).is_absolute() {
+                    store::ext_key(&e.change.path).err()
                 } else {
-                    canonical_ledger_path(&c.path).err()
+                    canonical_ledger_path(&e.change.path).err()
                 };
                 ChangeEntry {
-                    op: c.op,
-                    path: c.path,
-                    baseline_hash: c.baseline_hash,
+                    op: e.change.op,
+                    path: e.change.path,
+                    baseline_hash: e.change.baseline_hash,
                     rejected,
+                    unledgered: e.unledgered,
                 }
             })
             .collect())
@@ -350,7 +395,11 @@ impl SandboxFs {
             .map(|p| normalize_str(&p))
             .collect();
         if let Some(overlay) = &self.overlay {
-            for c in store::replay_ledger(&overlay.dir) {
+            // 台帳に載っていないオーバーレイ実体もここへ含める（BUG-066）。`read_to_string`は
+            // 元々「upperに実体があればそちら」を返すので、列挙にだけ出てこないと
+            // 「grepでは見つからないのにread_fileでは読める」というちぐはぐが残る。
+            for e in effective_changes(&self.jail, overlay) {
+                let c = e.change;
                 // `_ext`（workspace外絶対パス）エントリはworkspace相対のファイル一覧に含めない
                 // （grep/globはworkspace内を対象とする）。
                 if Path::new(&c.path).is_absolute() {
@@ -458,6 +507,86 @@ impl SandboxFs {
     }
 }
 
+/// このセッションに何があるかの1件（台帳由来か、オーバーレイ実体の走査由来か）。
+struct EffectiveChange {
+    change: harness_change_ledger::CowChange,
+    /// 走査でしか見つからなかった＝台帳に記録が無い（[`ChangeEntry::unledgered`]）。
+    unledgered: bool,
+}
+
+/// **このセッションに何があるか**を計算する唯一の場所。`change_set`（見せる）・
+/// `apply_overlay_changes`（反映する）・`walk_files`（列挙する）が同じ答えを使う。
+///
+/// 内訳は「操作台帳の再生」∪「オーバーレイ実体の走査のうち台帳に無いもの」である
+/// （走査するのは`--cow`のupperだけ。理由は[`OverlayBackend::scan_for_unledgered`]）。
+/// **なぜ台帳だけでは足りないか**（[BUG-066](../../docs/bugs/BUG-066.md)）: オーバーレイ
+/// ディレクトリはサンドボックス子へRW付与されているので、子は`copy_up`もフックも経由せず
+/// 直接ファイルを置ける。台帳だけを正本にすると、そうして置かれたファイルは
+/// `read_file`からは読めるのに`changes`には出ず、`apply`もせず、`discard`で消える
+/// ——**作業が黙って失われる**。Redirector DLLは境界ではない（D-01）ので、可視性を
+/// 「書く側が台帳に記録してくれること」へ依存させない。
+///
+/// 走査由来エントリの`op`は実workspace側の現在の姿から決める:
+///
+/// | 実workspace側 | 判定 |
+/// |---|---|
+/// | 実体が無い | `Create`（baseline `None`＝新規作成。適用しても失うものが無い） |
+/// | 実体があり内容が同じ | **変更ではない**ので列挙しない |
+/// | 実体があり内容が違う | `Modify`だが**baselineは不明**（`None`のまま。捏造しない） |
+fn effective_changes(jail: &WorkspaceJail, overlay: &OverlayBackend) -> Vec<EffectiveChange> {
+    let ledger = store::replay_ledger(&overlay.dir);
+    let known: BTreeSet<String> = ledger
+        .iter()
+        .map(|c| store::ledger_key_match_form(&c.path))
+        .collect();
+    let mut out: Vec<EffectiveChange> = ledger
+        .into_iter()
+        .map(|change| EffectiveChange { change, unledgered: false })
+        .collect();
+    if !overlay.scan_for_unledgered {
+        return out;
+    }
+
+    for key in store::scan_upper_content_files(&overlay.dir) {
+        if known.contains(&store::ledger_key_match_form(&key)) {
+            continue;
+        }
+        let is_ext = Path::new(&key).is_absolute();
+        let overlay_rel = if is_ext {
+            match store::ext_key(&key) {
+                Ok(k) => format!("_ext/{k}"),
+                Err(_) => continue,
+            }
+        } else {
+            key.clone()
+        };
+        let Ok(overlay_bytes) = overlay.jail.read_bytes(&overlay_rel) else {
+            continue;
+        };
+        let workspace_bytes = if is_ext {
+            std::fs::read(&key).ok()
+        } else {
+            canonical_ledger_path(&key)
+                .ok()
+                .and_then(|rel| jail.read_bytes(&rel).ok())
+        };
+        let op = match workspace_bytes {
+            None => ChangeOp::Create,
+            Some(current) if current == overlay_bytes => continue,
+            Some(_) => ChangeOp::Modify,
+        };
+        out.push(EffectiveChange {
+            change: harness_change_ledger::CowChange {
+                path: key,
+                op,
+                baseline_hash: None,
+            },
+            unledgered: true,
+        });
+    }
+    out
+}
+
 /// `apply()`の実体。`--staged`/`--cow`で別々に実装していたロジック（旧`SandboxFs::apply`・
 /// `changes.rs::apply_cow_changes`）をここへ一本化した（Phase 2）。
 ///
@@ -476,10 +605,11 @@ fn apply_overlay_changes(
     opts: &ApplyOptions,
 ) -> Result<ApplyReport, SandboxError> {
     let mut report = ApplyReport::default();
-    let changes = store::replay_ledger(&overlay.dir);
+    let changes = effective_changes(jail, overlay);
     let mut applied_paths: Vec<String> = Vec::new();
 
-    for c in &changes {
+    for entry in &changes {
+        let c = &entry.change;
         if let Some(glob) = opts.only_glob {
             if !simple_glob_match(glob, &c.path) {
                 continue;
@@ -523,18 +653,32 @@ fn apply_overlay_changes(
 
         // baseline照合（サイレントなlost update / TOCTOU防止、§オーバーレイFS
         // 「相違なら適用拒否→再レビュー要求」）。workspace側の読取もjail経由。
-        let current_hash = if is_ext {
-            std::fs::read(&c.path)
-                .ok()
-                .map(|b| harness_change_ledger::hash_bytes(&b))
+        //
+        // 台帳に無いエントリ（BUG-066）はbaselineが**不明**なのでこの照合が成立しない。
+        // `op`が`Create`＝実workspace側に実体が無い場合だけは失うものが無いので適用し、
+        // 実体があって内容が違う場合（`Modify`）は既定で見送る——ここで現在のハッシュを
+        // baselineとして採ってしまうと、セッション中に人が編集していた場合の上書きを
+        // 「検知できた上で無視した」のと同じことになる。取り込みは`adopt_unledgered`で
+        // 明示的に選ばせる。
+        if entry.unledgered {
+            if c.op == ChangeOp::Modify && !opts.adopt_unledgered {
+                report.unledgered.push(c.path.clone());
+                continue;
+            }
         } else {
-            jail.read_bytes(&canonical)
-                .ok()
-                .map(|b| harness_change_ledger::hash_bytes(&b))
-        };
-        if current_hash != c.baseline_hash {
-            report.conflicts.push(c.path.clone());
-            continue;
+            let current_hash = if is_ext {
+                std::fs::read(&c.path)
+                    .ok()
+                    .map(|b| harness_change_ledger::hash_bytes(&b))
+            } else {
+                jail.read_bytes(&canonical)
+                    .ok()
+                    .map(|b| harness_change_ledger::hash_bytes(&b))
+            };
+            if current_hash != c.baseline_hash {
+                report.conflicts.push(c.path.clone());
+                continue;
+            }
         }
 
         let outcome = if is_ext {
@@ -793,6 +937,7 @@ mod tests {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
+                adopt_unledgered: false,
             })
             .unwrap();
 
@@ -814,6 +959,7 @@ mod tests {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: true,
+                adopt_unledgered: false,
             })
             .unwrap();
 
@@ -855,6 +1001,7 @@ mod tests {
                 only_glob: Some("keep.txt"),
                 only_paths: None,
                 allow_ext: false,
+                adopt_unledgered: false,
             })
             .unwrap();
 
@@ -888,6 +1035,7 @@ mod tests {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
+                adopt_unledgered: false,
             })
             .unwrap();
 
@@ -911,6 +1059,7 @@ mod tests {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
+                adopt_unledgered: false,
             })
             .unwrap();
 
@@ -933,6 +1082,7 @@ mod tests {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
+                adopt_unledgered: false,
             })
             .unwrap();
 
@@ -957,6 +1107,7 @@ mod tests {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
+                adopt_unledgered: false,
             })
             .unwrap();
 
@@ -1007,6 +1158,7 @@ mod tests {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
+                adopt_unledgered: false,
             })
             .unwrap();
 
@@ -1047,6 +1199,7 @@ mod tests {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
+                adopt_unledgered: false,
             })
             .unwrap();
 
@@ -1115,6 +1268,7 @@ mod tests {
                 only_glob: None,
                 only_paths: None,
                 allow_ext: false,
+                adopt_unledgered: false,
             })
             .unwrap();
 
@@ -1192,6 +1346,7 @@ mod tests {
                     only_glob: None,
                     only_paths: None,
                     allow_ext: false,
+                    adopt_unledgered: false,
                 })
                 .unwrap();
 
@@ -1263,6 +1418,169 @@ mod tests {
             Some(upper_dir),
         )
         .unwrap()
+    }
+
+    // ---- BUG-066: 操作台帳を経由せずupperへ直接置かれたファイル ----
+    //
+    // 実機ではサンドボックス子プロセスが`Set-Content <upper>\x.txt`で作る状況（モデルが実際に
+    // やったのがこれ）。ここでは「台帳を通らずにupperへ実体が現れた」という**結果だけ**を
+    // `std::fs::write`で再現する——Redirector DLLが注入されていようが回避されていようが、
+    // **host側の突き合わせだけで成立する**ことを固定したいため。
+
+    fn write_directly_into_upper(upper: &Path, rel: &str, content: &str) {
+        let target = upper.join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, content).unwrap();
+    }
+
+    /// 台帳に記録が無いupper実体も`changes`に現れる（`unledgered`印付き）。これが無いと、
+    /// upperには在るのに「変更なし」と表示され`discard`で黙って消える。
+    #[test]
+    fn unledgered_upper_files_show_up_in_the_change_set() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+        write_directly_into_upper(upper.path(), "sub/direct.txt", "by the agent");
+
+        let changes = fs.change_set().unwrap();
+
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].path, "sub/direct.txt");
+        assert_eq!(changes[0].op, ChangeOp::Create);
+        assert!(changes[0].unledgered);
+        // 列挙（glob/grep）からも見えること＝「read_fileでは読めるのに一覧に出ない」を作らない。
+        assert!(fs.walk_files().unwrap().contains(&PathBuf::from("sub/direct.txt")));
+    }
+
+    /// 実workspace側に実体が無い（＝純粋な新規作成）なら、失うものが無いので既定で適用する。
+    #[test]
+    fn unledgered_new_file_is_applied_without_an_extra_flag() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+        write_directly_into_upper(upper.path(), "direct.txt", "by the agent");
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+                adopt_unledgered: false,
+            })
+            .unwrap();
+
+        assert_eq!(report.applied, vec!["direct.txt".to_string()]);
+        assert!(report.unledgered.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("direct.txt")).unwrap(),
+            "by the agent"
+        );
+    }
+
+    /// 実workspace側に別内容の実体がある場合はbaselineが不明なので**適用しない**
+    /// （人の同時編集を検知できないまま上書きするのを避ける）。明示フラグでのみ取り込む。
+    #[test]
+    fn unledgered_modification_needs_adopt_because_its_baseline_is_unknown() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("notes.txt"), "original").unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+        write_directly_into_upper(upper.path(), "notes.txt", "edited by the agent");
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+                adopt_unledgered: false,
+            })
+            .unwrap();
+        assert!(report.applied.is_empty());
+        assert_eq!(report.unledgered, vec!["notes.txt".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("notes.txt")).unwrap(),
+            "original",
+            "the workspace file must stay untouched until the user opts in"
+        );
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+                adopt_unledgered: true,
+            })
+            .unwrap();
+        assert_eq!(report.applied, vec!["notes.txt".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("notes.txt")).unwrap(),
+            "edited by the agent"
+        );
+    }
+
+    /// 内容が実workspace側と同じなら変更ではない（`apply`で書き戻す意味も無い）。
+    #[test]
+    fn unledgered_file_identical_to_the_workspace_is_not_a_change() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("same.txt"), "same bytes").unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+        write_directly_into_upper(upper.path(), "same.txt", "same bytes");
+
+        assert!(fs.change_set().unwrap().is_empty());
+    }
+
+    /// 台帳に載っているパスは走査で二重に数えない（綴りの大小差があっても同一視する）。
+    #[test]
+    fn a_ledgered_path_is_not_reported_twice_by_the_upper_scan() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+
+        fs.write_string("Ledgered.txt", "written through the tool").unwrap();
+
+        let changes = fs.change_set().unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(!changes[0].unledgered);
+    }
+
+    /// 台帳を経由しなくてもD-09のhard-denyは効く（`.git/config`をupperへ直接置いてもapplyは
+    /// 拒否する）。走査由来のエントリが台帳由来と同じゲートを通ることの確認。
+    #[test]
+    fn unledgered_config_injection_paths_are_still_hard_denied() {
+        let ws = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let fs = cow_fs(ws.path(), upper.path());
+        write_directly_into_upper(upper.path(), ".git/config", "[core]\n");
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+                adopt_unledgered: true,
+            })
+            .unwrap();
+
+        assert_eq!(report.hard_denied, vec![".git/config".to_string()]);
+        assert!(report.applied.is_empty());
+        assert!(!ws.path().join(".git/config").exists());
+    }
+
+    /// **`--staged`のオーバーレイは走査しない。** そこはworkspace内にあり、harness自身が
+    /// `net-audit.jsonl`等の監査ログ置き場として使っている（`cli/startup/sandbox.rs`）。
+    /// 走査すると監査ログが「台帳に無い変更」として一覧に出て、`apply`がworkspaceルートへ
+    /// コピーしてしまう。stagedではオーバーレイ外の書込は実workspaceへ直接落ちる（失われない）
+    /// ので、走査が守るべきものも無い。
+    #[test]
+    fn staged_overlay_is_not_scanned_so_harness_own_audit_logs_do_not_become_changes() {
+        let ws = tempfile::tempdir().unwrap();
+        let fs = SandboxFs::open(ws.path(), &staged_config(".harness/sandbox/s1")).unwrap();
+        let audit = ws.path().join(".harness/sandbox/s1/net-audit.jsonl");
+        std::fs::create_dir_all(audit.parent().unwrap()).unwrap();
+        std::fs::write(&audit, "{\"event\":\"connect\"}\n").unwrap();
+
+        assert!(fs.change_set().unwrap().is_empty());
     }
 
     /// CoW一本化の核心（Phase 1/2）: `write_string`はworkspace本体へ一切触れず、upper側の
