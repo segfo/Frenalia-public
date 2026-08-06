@@ -24,8 +24,11 @@
 // 分岐の書き漏らしをコンパイルエラーとして検出する（`harness_core::prompt`と同じ手法）。
 #![deny(clippy::wildcard_enum_match_arm)]
 
+pub(crate) mod call;
+pub mod census;
 pub mod context;
 pub mod hiv;
+pub(crate) mod ledger;
 pub mod memory;
 pub mod orchestrator;
 pub mod phase;
@@ -34,6 +37,8 @@ pub mod schema;
 pub mod scratch;
 pub mod source;
 
+pub use census::tool::CensusTool;
+pub use census::{CensusContext, CensusEngine, CensusLimits, CensusOutcome, CensusStop};
 pub use context::{AssembledCall, CallKind, ContextAssembler, PhaseInput};
 pub use hiv::{HivContext, HivEngine, HivLimits, HivOutcome, HivStop};
 pub use memory::validity::{EvidenceStrength, Freshness, Grade, TrustLevel, Validity};

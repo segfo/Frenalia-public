@@ -8,9 +8,6 @@ use std::collections::BTreeMap;
 
 use harness_core::{Phase, RiskClass, TokenBudget};
 
-use crate::memory::render::MemoryView;
-use crate::memory::types::{GoalId, HypId};
-
 /// そのフェーズがモデルへ渡すツールの候補集合（§7.3 ToolGateの、候補を絞る側）。
 ///
 /// **候補集合を絞るだけで、最終強制は`PermissionArbiter`のまま**である。ここで
@@ -38,50 +35,36 @@ impl ToolSelection {
 /// 1フェーズの仕様。
 #[derive(Debug, Clone, Copy)]
 pub struct PhaseSpec {
-    /// 台帳のどのスライスを入力にするか。
-    pub view: MemoryView,
     /// モデルへ渡すツールの候補集合。
     pub tools: ToolSelection,
     /// 出力スキーマを要求するか。`false`はツール実行のためのコール。
     pub wants_schema: bool,
 }
 
-/// フェーズ仕様を引く。`target`は対象仮説（Investigate/Verify/Critic）、`goal`は
-/// 対象ゴール（Decide）。指定が無い場合はビューが空になり、組み立ては失敗せず
-/// 「台帳スライス無し」のコールになる。
-pub fn spec(phase: Phase, target: Option<HypId>, goal: Option<GoalId>) -> PhaseSpec {
+/// フェーズ仕様を引く。`tools`/`wants_schema`はフェーズだけで決まる（対象仮説・対象ゴールの
+/// 値には依存しない）。台帳のどのスライスを見せるか（旧`view: MemoryView`）は
+/// [`crate::ledger::LedgerView`]の実装側（`WorkingMemory::render_slice`）が持つ——
+/// `target`/`goal`に依存する部分はそちらへ移した（`plans/PLAN-SURVEY-ENGINE.md`段階1）。
+pub fn spec(phase: Phase) -> PhaseSpec {
     match phase {
         Phase::Orient => PhaseSpec {
-            view: MemoryView::GoalSummary,
             tools: ToolSelection::None,
             wants_schema: true,
         },
         Phase::Hypothesize => PhaseSpec {
-            view: MemoryView::Unknowns,
             tools: ToolSelection::None,
             wants_schema: true,
         },
         Phase::Investigate => PhaseSpec {
-            // 同じ仮説について複数ラウンド回るので、既に得た観測まで見せる（M15での変更点、
-            // `crate::memory::render::MemoryView::InvestigationState`のdoc参照）。
-            view: target.map_or(MemoryView::None, MemoryView::InvestigationState),
             // §3.3「read-only + 指定MCPのみ」。write/execを候補から物理的に外す。
             tools: ToolSelection::ReadOnly,
             wants_schema: true,
         },
         Phase::Distill => PhaseSpec {
-            // 主入力は生出力（scratchから注入）だが、対象の仮説と反証条件は要る——
-            // Distillの出力スキーマが`relation: supports|refutes`を要求しており、
-            // 何に対する支持/反証なのかが分からないと判定できないため（§3.3の
-            // 「生出力（1件ずつ）」からのM15での変更点）。加えてM16では**対象仮説の
-            // 既存観測**も載せる——`contradicts`（§4.3の矛盾検出）はE番号で答えさせるので、
-            // 番号が見えていないと答えようがないため。他の仮説の証拠は載せない。
-            view: target.map_or(MemoryView::None, MemoryView::DistillTarget),
             tools: ToolSelection::None,
             wants_schema: true,
         },
         Phase::Verify => PhaseSpec {
-            view: target.map_or(MemoryView::None, MemoryView::EvidenceFor),
             // §3.3「検証系のみ（test/typecheck/re-read）」。M14の内蔵ツールでは
             // read-onlyがその最も近い候補集合になる（`run_shell`でのテスト実行を
             // 検証系として通すのはM15のRunCheckサブループの仕事）。
@@ -89,14 +72,26 @@ pub fn spec(phase: Phase, target: Option<HypId>, goal: Option<GoalId>) -> PhaseS
             wants_schema: true,
         },
         Phase::Critic => PhaseSpec {
-            view: target.map_or(MemoryView::None, MemoryView::VerificationOf),
             tools: ToolSelection::None,
             wants_schema: true,
         },
         Phase::Decide => PhaseSpec {
-            view: goal.map_or(MemoryView::None, MemoryView::ConfirmedForGoal),
             // ゴール達成に必要なwrite/exec。承認ゲートは従来通り必ず通る。
             tools: ToolSelection::All,
+            wants_schema: true,
+        },
+        Phase::Plan => PhaseSpec {
+            // 列挙自体はツール（`glob`等）で行う。モデルに数えさせない
+            // （`plans/PLAN-SURVEY-ENGINE.md`「列挙自体はツール」）。
+            tools: ToolSelection::ReadOnly,
+            wants_schema: true,
+        },
+        Phase::Collect => PhaseSpec {
+            tools: ToolSelection::ReadOnly,
+            wants_schema: true,
+        },
+        Phase::Join => PhaseSpec {
+            tools: ToolSelection::None,
             wants_schema: true,
         },
     }
@@ -104,7 +99,7 @@ pub fn spec(phase: Phase, target: Option<HypId>, goal: Option<GoalId>) -> PhaseS
 
 /// クランプ後もこれ以上は下げない`max_in`の下限。ここを割ると台帳スライスが
 /// [`crate::context`]の`MIN_BODY_CHARS`まで削られても収まらず、組み立てが必ず超過して返る。
-/// 縮小再試行（§6.6 規則3、[`crate::hiv::call`]）も同じ下限で止まる。
+/// 縮小再試行（§6.6 規則3、[`crate::call`]）も同じ下限で止まる。
 pub(crate) const MIN_CLAMPED_MAX_IN: u32 = 512;
 
 /// クランプ後もこれ以上は下げない`max_out`の下限。構造化出力1件分が入らないと、
@@ -201,6 +196,30 @@ impl Default for PhaseBudgets {
                     max_out: 500,
                 },
             ),
+            // `plans/PLAN-SURVEY-ENGINE.md`段階2。Plan/CollectはInvestigate準拠。
+            (
+                Phase::Plan,
+                TokenBudget {
+                    max_in: 3_000,
+                    max_out: 1_000,
+                },
+            ),
+            (
+                Phase::Collect,
+                TokenBudget {
+                    max_in: 3_000,
+                    max_out: 1_000,
+                },
+            ),
+            // Joinは多数のnotesを1度に読むため既定より大きめ。`cognition.budgets.join`で
+            // 上書き可能。
+            (
+                Phase::Join,
+                TokenBudget {
+                    max_in: 6_000,
+                    max_out: 1_500,
+                },
+            ),
         ]);
         Self { budgets }
     }
@@ -289,7 +308,7 @@ mod tests {
         for phase in Phase::ALL {
             let b = budgets.get(phase);
             assert!(b.max_in > 0 && b.max_out > 0, "{phase}");
-            let _ = spec(phase, None, None);
+            let _ = spec(phase);
         }
     }
 
@@ -365,16 +384,24 @@ mod tests {
     /// §6.6 規則1: 収まらないフェーズだけを、`max_in`から先に削る。
     #[test]
     fn a_narrow_window_shrinks_max_in_first_and_only_where_needed() {
-        // 4,096なら既定表のうちDistill/Verify（4,000+500）だけが超える。
+        // 4,096なら既定表のうちDistill/Verify（4,000+500）とJoin（6,000+1,500、
+        // `plans/PLAN-SURVEY-ENGINE.md`段階2）が超える。
         let (after, clamps) = PhaseBudgets::default().clamped_to_window(4_096);
         let touched: Vec<Phase> = clamps.iter().map(|c| c.phase).collect();
-        assert_eq!(touched, vec![Phase::Distill, Phase::Verify], "{clamps:?}");
+        assert_eq!(
+            touched,
+            vec![Phase::Distill, Phase::Verify, Phase::Join],
+            "{clamps:?}"
+        );
         for phase in [Phase::Distill, Phase::Verify] {
             let b = after.get(phase);
             // `max_out`は保たれ、`max_in`だけが窓に収まる値へ落ちる。
             assert_eq!(b.max_out, 500, "{phase}");
             assert_eq!(b.max_in, 4_096 - 500, "{phase}");
         }
+        let join = after.get(Phase::Join);
+        assert_eq!(join.max_out, 1_500);
+        assert_eq!(join.max_in, 4_096 - 1_500);
         // 触られていないフェーズは既定のまま。
         assert_eq!(
             after.get(Phase::Hypothesize),
@@ -428,7 +455,7 @@ mod tests {
     /// §7.3: Investigateはread-onlyしか候補に入れない（write/execを物理的に外す）。
     #[test]
     fn investigate_admits_read_only_tools_only() {
-        let s = spec(Phase::Investigate, None, None);
+        let s = spec(Phase::Investigate);
         assert!(s.tools.admits(RiskClass::ReadOnly));
         assert!(!s.tools.admits(RiskClass::Write));
         assert!(!s.tools.admits(RiskClass::Exec));
@@ -444,7 +471,7 @@ mod tests {
             Phase::Distill,
             Phase::Critic,
         ] {
-            let s = spec(phase, None, None);
+            let s = spec(phase);
             for risk in [
                 RiskClass::ReadOnly,
                 RiskClass::Write,
@@ -459,36 +486,13 @@ mod tests {
     /// Decideだけがwrite/execを候補に持つ（承認ゲートは別途必ず通る）。
     #[test]
     fn decide_admits_write_and_exec_candidates() {
-        let s = spec(Phase::Decide, None, None);
+        let s = spec(Phase::Decide);
         assert!(s.tools.admits(RiskClass::Write));
         assert!(s.tools.admits(RiskClass::Exec));
     }
 
-    /// Investigateは「重複して調べない」ため、Distillは「矛盾を指摘させる」ために、
-    /// それぞれ別のビューで対象仮説を見る（同じ材料でも用途が違うので節の見出しが違う）。
-    #[test]
-    fn investigate_and_distill_look_at_the_target_hypothesis_through_different_views() {
-        let h = HypId(2);
-        assert_eq!(
-            spec(Phase::Investigate, Some(h), None).view,
-            MemoryView::InvestigationState(h)
-        );
-        assert_eq!(
-            spec(Phase::Distill, Some(h), None).view,
-            MemoryView::DistillTarget(h)
-        );
-        // 対象が無ければどちらも空ビューへ落ちる（組み立ては失敗しない）。
-        assert_eq!(spec(Phase::Distill, None, None).view, MemoryView::None);
-        assert_eq!(spec(Phase::Investigate, None, None).view, MemoryView::None);
-    }
-
-    /// 対象仮説が指定されなければビューは空になる（組み立て自体は失敗しない）。
-    #[test]
-    fn missing_target_degrades_to_an_empty_view_rather_than_failing() {
-        assert_eq!(spec(Phase::Verify, None, None).view, MemoryView::None);
-        assert_eq!(
-            spec(Phase::Verify, Some(HypId(2)), None).view,
-            MemoryView::EvidenceFor(HypId(2))
-        );
-    }
+    // 「対象仮説/ゴールによってどのMemoryViewを見せるか」の検証は`memory::render`側の
+    // `view_for`が持つ（段階1で`spec()`から切り離した。旧テスト
+    // `investigate_and_distill_look_at_the_target_hypothesis_through_different_views`・
+    // `missing_target_degrades_to_an_empty_view_rather_than_failing`はそちらへ移設）。
 }

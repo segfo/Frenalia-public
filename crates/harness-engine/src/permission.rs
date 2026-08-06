@@ -100,6 +100,10 @@ pub enum Classification {
 }
 
 /// 全ツール呼び出しの実行前に必ず参照する唯一の強制点（§パーミッション）。
+///
+/// `Clone`は`census`ツール（`harness-cognition`）が内側の`TurnExecutor`用に
+/// 同じポリシーの複製を持つために使う（`plans/PLAN-CENSUS-ENGINE.md`段階3）。
+#[derive(Clone)]
 pub struct PermissionArbiter {
     mode: PermissionMode,
     allowlist: Vec<AllowlistRule>,

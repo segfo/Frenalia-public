@@ -13,6 +13,7 @@ mod ui;
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event as CEvent, EventStream, KeyEventKind};
@@ -137,7 +138,7 @@ fn push_apply_report(app: &mut AppState, report: &harness_sandbox::ApplyReport) 
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    provider: Box<dyn LlmProvider>,
+    provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
     mut ctx: ToolCtx,
     arbiter: PermissionArbiter,

@@ -19,17 +19,19 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{run_headless, OutputFormat};
-use harness_cognition::CognitiveOrchestrator;
+use harness_cognition::{CensusTool, CognitiveOrchestrator};
 use harness_core::{
     normalize_domain_pattern, CognitionLevel, LlmProvider, NetProxyConfig, RequireSandbox,
     StagingConfig, StagingMode, ToolCtx,
 };
 use harness_engine::{
-    parse_allowlist_rule, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode,
+    parse_allowlist_rule, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionGate,
+    PermissionMode,
 };
 use harness_providers::{AnthropicProvider, OpenAiProvider};
 use harness_sandbox::{select_tier, ApplyOptions, SandboxFs, WorkspaceWriteMode};
@@ -72,13 +74,15 @@ pub(crate) enum PermissionModeArg {
     Deny,
 }
 
-/// `--cognition off|auto|always`（`plans/DESIGN-COGNITION.md` §2.3）。
+/// `--cognition off|auto|always|census`（`plans/DESIGN-COGNITION.md` §2.3、
+/// `census`は`plans/PLAN-CENSUS-ENGINE.md`段階2）。
 /// `harness_core::CognitionLevel`と1対1で、clapの`ValueEnum`をcoreへ持ち込まないための橋。
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum CognitionLevelArg {
     Off,
     Auto,
     Always,
+    Census,
 }
 
 impl From<CognitionLevelArg> for CognitionLevel {
@@ -87,6 +91,7 @@ impl From<CognitionLevelArg> for CognitionLevel {
             CognitionLevelArg::Off => CognitionLevel::Off,
             CognitionLevelArg::Auto => CognitionLevel::Auto,
             CognitionLevelArg::Always => CognitionLevel::Always,
+            CognitionLevelArg::Census => CognitionLevel::Census,
         }
     }
 }

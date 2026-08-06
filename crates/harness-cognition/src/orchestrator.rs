@@ -12,6 +12,7 @@ use harness_engine::{
 use harness_tools::ToolRegistry;
 use tokio_util::sync::CancellationToken;
 
+use crate::census::{CensusContext, CensusEngine, CensusLimits, CensusStop};
 use crate::context::ContextAssembler;
 use crate::hiv::{HivContext, HivEngine, HivLimits, HivStop};
 use crate::phase::PhaseBudgets;
@@ -32,7 +33,7 @@ impl std::fmt::Display for UnsupportedLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let milestone = match self.level {
             CognitionLevel::Auto => "M17（難易度ルータ）",
-            CognitionLevel::Off | CognitionLevel::Always => {
+            CognitionLevel::Off | CognitionLevel::Always | CognitionLevel::Census => {
                 return write!(f, "cognition level `{}` is supported", self.level)
             }
         };
@@ -71,7 +72,7 @@ impl CognitiveOrchestrator {
     /// `budgets`は`settings.json`の`cognition.budgets`を反映した表（§3.3・§6.1）。
     pub fn new(level: CognitionLevel, budgets: PhaseBudgets) -> Result<Self, UnsupportedLevel> {
         match level {
-            CognitionLevel::Off | CognitionLevel::Always => Ok(Self {
+            CognitionLevel::Off | CognitionLevel::Always | CognitionLevel::Census => Ok(Self {
                 level,
                 budgets,
                 limits: HivLimits::default(),
@@ -108,6 +109,13 @@ impl CognitiveOrchestrator {
 
     pub fn level(&self) -> CognitionLevel {
         self.level
+    }
+
+    /// 実コンテキスト窓へクランプ済みのフェーズ予算（§6.6 規則1）。`census`ツール
+    /// （`plans/PLAN-CENSUS-ENGINE.md`段階3）が、内側の`CensusEngine`用に同じ表を
+    /// 再利用するために公開する。
+    pub fn budgets(&self) -> &PhaseBudgets {
+        &self.budgets
     }
 
     /// 1回のユーザ発話に対する処理を最後まで進める。
@@ -147,6 +155,20 @@ impl CognitiveOrchestrator {
             }
             CognitionLevel::Always => {
                 self.run_hiv(
+                    provider,
+                    state,
+                    tools,
+                    ctx,
+                    gate,
+                    config,
+                    events,
+                    cancel,
+                    on_text_delta,
+                )
+                .await
+            }
+            CognitionLevel::Census => {
+                self.run_census(
                     provider,
                     state,
                     tools,
@@ -270,6 +292,130 @@ impl CognitiveOrchestrator {
             HivStop::Blocked { .. } => StopReason::Other("cognition_blocked".to_string()),
             HivStop::BudgetExhausted => StopReason::Other("cognition_budget_exhausted".to_string()),
             HivStop::Cancelled => StopReason::Other("cancelled".to_string()),
+        };
+        emit_event(
+            events,
+            AgentEvent::TurnCompleted {
+                stop_reason: stop_reason.clone(),
+                usage: outcome.usage,
+            },
+        );
+
+        Ok(AgentLoopOutcome {
+            text: outcome.answer,
+            stop_reason,
+            usage: outcome.usage,
+            cancelled: false,
+        })
+    }
+
+    /// `CensusEngine`（網羅型フェーズパイプライン）の1ゴール分。`run_hiv`と同型だが、
+    /// **scratchが開けなければ起動時点でエラーにする**——`CensusEngine`の再開性は
+    /// `notes/`だけで成り立っているので（`plans/PLAN-CENSUS-ENGINE.md`段階2）、開けない
+    /// ままでは機構そのものが成立しない。`run_hiv`の「開けなくても続行」とは意図的に非対称。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_census<F>(
+        &self,
+        provider: &dyn LlmProvider,
+        state: &mut ConversationState,
+        tools: &ToolRegistry,
+        ctx: &ToolCtx,
+        gate: &dyn PermissionGate,
+        config: AgentLoopConfig,
+        events: Option<&EventSink>,
+        cancel: Option<&CancellationToken>,
+        mut on_text_delta: F,
+    ) -> Result<AgentLoopOutcome, ProviderError>
+    where
+        F: FnMut(&str),
+    {
+        let Some(goal) = last_user_text(state) else {
+            return Err(ProviderError::InvalidRequest {
+                msg: "cognition layer needs a user message to derive the goal from".to_string(),
+            });
+        };
+
+        let Some(scratch) = self.open_scratch(ctx) else {
+            let reason = "CensusEngineの再開性はscratchストア（notes/）だけで成り立っており、\
+                          開けなかったため起動できない（セッションIDが未設定か、\
+                          .harness/cognition/配下の作成に失敗した）"
+                .to_string();
+            emit_event(
+                events,
+                AgentEvent::Error {
+                    message: reason.clone(),
+                },
+            );
+            return Err(ProviderError::InvalidRequest { msg: reason });
+        };
+
+        let executor = TurnExecutor::new(
+            provider,
+            tools,
+            ctx,
+            gate,
+            events,
+            cancel,
+            config.degeneracy.as_ref(),
+        );
+        let assembler = ContextAssembler::new(config.model.clone(), self.budgets.clone());
+        let limits = CensusLimits {
+            // `--max-turns`を認知層へ拡張する（`run_hiv`と同じ扱い）。
+            max_phase_calls: config.max_turns,
+            ..CensusLimits::default()
+        };
+        let mut engine = CensusEngine::new(assembler, scratch, limits);
+
+        let cx = CensusContext {
+            exec: &executor,
+            ctx,
+            tools,
+            caps: provider.capabilities(),
+            events,
+            cancel,
+            context_window: config.compaction.context_window,
+        };
+        let outcome = engine.run_goal(&goal, &cx).await;
+
+        if let Some(e) = outcome.provider_error {
+            emit_event(
+                events,
+                AgentEvent::Error {
+                    message: e.to_string(),
+                },
+            );
+            return Err(e);
+        }
+
+        if outcome.stop == CensusStop::Cancelled {
+            emit_event(events, AgentEvent::Cancelled);
+            return Ok(AgentLoopOutcome {
+                text: String::new(),
+                stop_reason: StopReason::Other("cancelled".to_string()),
+                usage: outcome.usage,
+                cancelled: true,
+            });
+        }
+
+        on_text_delta(&outcome.answer);
+        emit_event(
+            events,
+            AgentEvent::TextDelta {
+                text: outcome.answer.clone(),
+            },
+        );
+        state.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text(outcome.answer.clone())],
+        });
+
+        let stop_reason = match &outcome.stop {
+            CensusStop::Joined => StopReason::EndTurn,
+            CensusStop::Blocked { .. } => StopReason::Other("cognition_blocked".to_string()),
+            CensusStop::BudgetExhausted => {
+                StopReason::Other("cognition_budget_exhausted".to_string())
+            }
+            CensusStop::Cancelled => StopReason::Other("cancelled".to_string()),
         };
         emit_event(
             events,

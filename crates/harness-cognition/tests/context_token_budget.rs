@@ -231,12 +231,14 @@ fn cognitive_request_sizes(workspace: &std::path::Path, rounds: usize) -> Vec<(P
     }
 
     // ライト構成（Involved）: Hypothesize→Investigate→Distill→Verify→Decide（§3.3）。
+    let hyp_label = hyp.label();
+    let goal_label = goal.label();
     let light = [
         (Phase::Hypothesize, PhaseInput::default()),
         (
             Phase::Investigate,
             PhaseInput {
-                target: Some(hyp),
+                target: Some(&hyp_label),
                 ..Default::default()
             },
         ),
@@ -250,14 +252,14 @@ fn cognitive_request_sizes(workspace: &std::path::Path, rounds: usize) -> Vec<(P
         (
             Phase::Verify,
             PhaseInput {
-                target: Some(hyp),
+                target: Some(&hyp_label),
                 ..Default::default()
             },
         ),
         (
             Phase::Decide,
             PhaseInput {
-                goal: Some(goal),
+                goal: Some(&goal_label),
                 ..Default::default()
             },
         ),
@@ -441,10 +443,11 @@ async fn raw_tool_output_lives_in_scratch_and_not_in_the_assembled_request() {
     );
 
     let assembler = ContextAssembler::new("mock", PhaseBudgets::default());
+    let hyp_label = hyp.label();
     let call = assembler.build(
         Phase::Verify,
         PhaseInput {
-            target: Some(hyp),
+            target: Some(&hyp_label),
             ..Default::default()
         },
         &mem,

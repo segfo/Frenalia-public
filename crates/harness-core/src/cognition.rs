@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 /// `Auto`の難易度ルータはM17で実装するため、**現時点で実行できるのは`Off`と`Always`**。
 /// `Always`はHIVループの「ライト」構成（Orient/Critic/PlannerはM19）で走る。
 /// 現在の既定と構成の差は`docs/STATUS.md`が持つ。
+///
+/// `Census`はHIVとは別の状態機械（`CensusEngine`: Plan→Collect→Distill×N→Join、終了条件は
+/// 「worklistが空＝網羅」）で、HIVの終了条件（仮説の判定）では表現できない「対象を全件処理して
+/// 終わる」仕事のために`plans/PLAN-CENSUS-ENGINE.md`が設計した（段階2）。`Survey`という語は
+/// 「`Census`（全数調査）＋HIV（注目箇所の事実調査）」を合成する将来の外側の型のために予約して
+/// あり、現時点のバリアントには使わない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CognitionLevel {
@@ -24,6 +30,8 @@ pub enum CognitionLevel {
     Auto,
     /// 常にHIVフルループ（M15–M19）。
     Always,
+    /// 常に`CensusEngine`（網羅型フェーズパイプライン、`plans/PLAN-CENSUS-ENGINE.md`）。
+    Census,
 }
 
 impl CognitionLevel {
@@ -33,6 +41,7 @@ impl CognitionLevel {
             CognitionLevel::Off => "off",
             CognitionLevel::Auto => "auto",
             CognitionLevel::Always => "always",
+            CognitionLevel::Census => "census",
         }
     }
 }
@@ -69,12 +78,22 @@ pub enum Phase {
     Critic,
     /// 確証済み仮説に基づき行動を決める。
     Decide,
+    /// `CensusEngine`専用（`plans/PLAN-CENSUS-ENGINE.md`段階2）。ユーザーの依頼と対象の
+    /// 列挙結果からworklistを組む。HIVの`Orient`とは役割が異なる別バリアント
+    /// （`Orient`はM19のHIVフル構成で状況把握として使う予定があり、流用するとプロンプト/
+    /// スキーマが将来衝突するため）。
+    Plan,
+    /// `CensusEngine`専用。worklistの1項目についてツールを叩き、生出力を得る。
+    Collect,
+    /// `CensusEngine`専用。`notes/*.md`の要約だけを連結し、最終回答を組む。
+    Join,
 }
 
 impl Phase {
-    /// 宣言順（`plans/DESIGN-COGNITION.md` §3.3の表と同じ並び）。設定の既定表を組むとき等に、
+    /// 宣言順（`plans/DESIGN-COGNITION.md` §3.3の表と同じ並び。`Plan`/`Collect`/`Join`は
+    /// `plans/PLAN-CENSUS-ENGINE.md`段階2で追加）。設定の既定表を組むとき等に、
     /// 網羅を書き忘れないための単一の列挙点。
-    pub const ALL: [Phase; 7] = [
+    pub const ALL: [Phase; 10] = [
         Phase::Orient,
         Phase::Hypothesize,
         Phase::Investigate,
@@ -82,6 +101,9 @@ impl Phase {
         Phase::Verify,
         Phase::Critic,
         Phase::Decide,
+        Phase::Plan,
+        Phase::Collect,
+        Phase::Join,
     ];
 
     /// 設定キー・イベント表示で使う正規名（`serde`の表現と一致させる）。
@@ -94,6 +116,9 @@ impl Phase {
             Phase::Verify => "verify",
             Phase::Critic => "critic",
             Phase::Decide => "decide",
+            Phase::Plan => "plan",
+            Phase::Collect => "collect",
+            Phase::Join => "join",
         }
     }
 }
@@ -162,7 +187,7 @@ mod tests {
         sorted.iter().zip(sorted.iter().skip(1)).for_each(|(a, b)| {
             assert_ne!(a, b, "Phase::ALL must not contain duplicates");
         });
-        assert_eq!(Phase::ALL.len(), 7);
+        assert_eq!(Phase::ALL.len(), 10);
     }
 
     /// フェーズ予算は設定ファイル（`BTreeMap<Phase, TokenBudget>`）から往復できる。

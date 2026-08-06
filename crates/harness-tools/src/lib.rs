@@ -39,6 +39,12 @@ pub use shell::RunShellTool;
 pub use web::WebFetchTool;
 
 /// 登録済みツールの集合。`ToolSpec` へ一括展開してプロバイダへ渡す。
+///
+/// `Clone`は`Arc<dyn Tool>`の浅いclone（安価）。`census`ツール（`harness-cognition`）が
+/// 自分自身を含まないスナップショットを内側の`TurnExecutor`へ渡すために使う——
+/// 生産コードで`census`を登録する直前にこの`clone()`を取ることで、`census`が自分自身を
+/// 再帰的に呼び出せる経路を構造的に作らない。
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
 }

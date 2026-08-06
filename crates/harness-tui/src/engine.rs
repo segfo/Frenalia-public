@@ -85,7 +85,7 @@ impl EngineHandle {
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_engine(
-    provider: Box<dyn LlmProvider>,
+    provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
     ctx: ToolCtx,
     arbiter: PermissionArbiter,

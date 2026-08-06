@@ -442,6 +442,33 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     let mut state = ConversationState::new(harness_engine::system_blocks_for(&tool_ctx));
     state.messages = session_messages;
 
+    // `census`ツール（`plans/PLAN-CENSUS-ENGINE.md`段階3）をここで1箇所だけ登録する。
+    // headless/TUI分岐の直前・MCPツール登録より後（`tools`が完成した時点）が唯一の生産
+    // コード地点で、`ToolRegistry::with_builtin_tools()`を直接叩くテスト群
+    // （`golden_transcript.rs`等）はこの経路を通らないため無改造のまま影響を受けない。
+    //
+    // `provider`をここで`Arc`化するのは、`census`の`call()`が`'static`な
+    // `Arc<dyn LlmProvider>`を要求するため（内側の`TurnExecutor`をツール呼び出しの
+    // たびに新しく組み立てる必要があり、外側のスタックフレームより長生きする必要がある）。
+    let provider: Arc<dyn LlmProvider> = Arc::from(provider);
+    // `census`自身を含まないスナップショット——このクローンを取った**後**に`census`を
+    // 登録することで、内側の`TurnExecutor`が`census`を再帰的に呼び出せる経路を構造的に
+    // 作らない（`harness_cognition::census::tool`のモジュールdoc「再帰的自己呼び出しの防止」）。
+    let inner_tools = Arc::new(tools.clone());
+    // 内側のゲートは常に`PermissionArbiter`（headless相当のポリシー判定）を使う。TUIの
+    // `InteractiveGate`（モーダル確認）は経由しない——`Phase::Collect`の候補ツールが
+    // `ToolSelection::ReadOnly`に限定されている限り、`PermissionArbiter::classify`は
+    // gate実装によらず常に`Allow`となるため実害が無い（詳細は`CensusTool`のモジュールdoc）。
+    let census_gate: Arc<dyn PermissionGate> = Arc::new(arbiter.clone());
+    tools.register(Arc::new(CensusTool::new(
+        provider.clone(),
+        census_gate,
+        inner_tools,
+        cognition.budgets().clone(),
+        model.clone(),
+        compaction.context_window,
+    )));
+
     let exit_code = match cli.print {
         Some(print) => {
             headless_branch(
@@ -652,7 +679,7 @@ async fn headless_branch(
 /// `stage_run_agent`の対話（TUI）分岐。
 #[allow(clippy::too_many_arguments)]
 async fn tui_branch(
-    provider: Box<dyn LlmProvider>,
+    provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
     tool_ctx: ToolCtx,
     arbiter: PermissionArbiter,

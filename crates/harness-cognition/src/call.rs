@@ -1,6 +1,12 @@
 //! 1フェーズ分の実行。組立 → `Executor::raw_turn` → 抽出 → 意味検証 → 修復再実行。
 //! `plans/DESIGN-COGNITION.md` §3.3（各フェーズのLLM呼び出し仕様）・§3.4（typed schemaによる強制）。
 //!
+//! HIV固有ではない汎用エンジン（`plans/PLAN-CENSUS-ENGINE.md`「継ぎ目は`PhaseRunner`の
+//! 台帳依存」）。`hiv::HivEngine`と`census::CensusEngine`の両方がここを土台にする——
+//! `mem: &WorkingMemory`ではなく`ledger: &dyn LedgerView`を受け取るように段階1で
+//! 一般化済みなので、`hiv/`直下に置いたままだと意味的に誤解を招くため`hiv/`から
+//! クレート直下へ移した（ロジックは無改造の純移動）。
+//!
 //! # 再実行が「同じフェーズをもう一度」で済む理由
 //!
 //! 各フェーズは会話履歴を持たない独立した1コール（§3.3）なので、やり直しは
@@ -31,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context::{AssembledCall, CallKind, ContextAssembler, PhaseInput};
 use crate::hiv::parse::parse_phase_output;
-use crate::memory::WorkingMemory;
+use crate::ledger::LedgerView;
 
 /// フェーズの構造化出力をどこまで必須にするか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +100,7 @@ pub(crate) enum PhaseError {
     Provider(harness_core::ProviderError),
 }
 
-/// フェーズ実行に要る周辺（`HivEngine`が毎回渡すもの）。
+/// フェーズ実行に要る周辺（`HivEngine`/`CensusEngine`が毎回渡すもの）。
 pub(crate) struct PhaseRunner<'a> {
     pub exec: &'a dyn Executor,
     pub ctx: &'a ToolCtx,
@@ -124,7 +130,7 @@ impl PhaseRunner<'_> {
         &self,
         phase: Phase,
         input: PhaseInput<'_>,
-        mem: &WorkingMemory,
+        ledger: &dyn LedgerView,
         conclusion: Conclusion,
         validate: fn(&T) -> Result<(), String>,
     ) -> Result<PhaseValue<T>, PhaseError> {
@@ -139,7 +145,7 @@ impl PhaseRunner<'_> {
                 phase,
                 &|budget| {
                     self.assembler.build_with_budget(
-                        phase, input, mem, self.ctx, self.tools, &self.caps, budget,
+                        phase, input, ledger, self.ctx, self.tools, &self.caps, budget,
                     )
                 },
                 &mut usage,
@@ -194,7 +200,7 @@ impl PhaseRunner<'_> {
                         self.assembler.build_conclusion_with_budget(
                             phase,
                             conclusion_input,
-                            mem,
+                            ledger,
                             self.ctx,
                             &self.caps,
                             budget,
@@ -410,6 +416,7 @@ mod tests {
     use super::*;
     use crate::hiv::parse::{validate_decide, validate_hypothesize, validate_investigate};
     use crate::hiv::testing::{PhaseExecutor, Reply};
+    use crate::memory::WorkingMemory;
     use crate::phase::PhaseBudgets;
     use crate::schema::{DecideOutput, HypothesizeOutput, InvestigateOutput};
 

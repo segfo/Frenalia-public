@@ -25,6 +25,10 @@ use crate::memory::types::RawRef;
 #[derive(Debug, Clone)]
 pub struct ScratchStore {
     raw_dir: PathBuf,
+    /// `CensusEngine`の再開性を支える蒸留済みノート（`plans/PLAN-CENSUS-ENGINE.md`段階2）。
+    /// `<item-id>.md`が既にあればその項目を飛ばせる——`notes/`だけで再開性が完結するので、
+    /// `WorkingMemory`の永続化（M20）を待たずに入れられる。
+    notes_dir: PathBuf,
 }
 
 impl ScratchStore {
@@ -39,15 +43,21 @@ impl ScratchStore {
             .join(session_id)
     }
 
-    /// `dir`配下に`raw/`を作って開く。
+    /// `dir`配下に`raw/`・`notes/`を作って開く。
     pub fn open(dir: &Path) -> io::Result<Self> {
         let raw_dir = dir.join("raw");
         std::fs::create_dir_all(&raw_dir)?;
-        Ok(Self { raw_dir })
+        let notes_dir = dir.join("notes");
+        std::fs::create_dir_all(&notes_dir)?;
+        Ok(Self { raw_dir, notes_dir })
     }
 
     pub fn raw_dir(&self) -> &Path {
         &self.raw_dir
+    }
+
+    pub fn notes_dir(&self) -> &Path {
+        &self.notes_dir
     }
 
     /// 生出力を退避し、台帳へ載せる[`RawRef`]を返す。
@@ -78,24 +88,70 @@ impl ScratchStore {
         ))
     }
 
+    /// `item_id`のノート（蒸留済み要約）が既にあるか。あれば`CensusEngine`はその項目の
+    /// `Collect`/`Distill`を打たずに飛ばす（実測で見えた「同じファイルを5回読む」を
+    /// 構造的に防ぐ）。
+    pub fn note_exists(&self, item_id: &str) -> io::Result<bool> {
+        Ok(self.note_path_for(item_id)?.exists())
+    }
+
+    /// 1項目ぶんのノートを書く。
+    pub fn put_note(&self, item_id: &str, content: &str) -> io::Result<()> {
+        std::fs::write(self.note_path_for(item_id)?, content)
+    }
+
+    /// `notes/`配下の全ノートをファイル名（＝item_id）昇順で返す。`Join`はこれだけを読み、
+    /// `raw/`（生出力）には一切触れない。
+    pub fn list_notes(&self) -> io::Result<Vec<(String, String)>> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&self.notes_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let content = std::fs::read_to_string(&path)?;
+            entries.push((id.to_string(), content));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
+    }
+
     /// `tool_call_id`をファイル名として安全に使えるか検査してからパスを組む。
     ///
     /// IDはプロバイダ由来の文字列（`call_abc123`等）で、ハーネスが生成した値ではない。
     /// `../`やドライブ指定を含むIDを渡されたら、`raw/`の外へ書き出せてしまう
     /// （`docs/SECURITY-PRINCIPLES.md`の「外来の文字列をパス要素にする前に検証する」）。
     fn path_for(&self, tool_call_id: &str) -> io::Result<PathBuf> {
-        if tool_call_id.is_empty()
-            || !tool_call_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unsafe tool_call_id for a scratch file name: {tool_call_id:?}"),
-            ));
-        }
+        validate_id(tool_call_id)?;
         Ok(self.raw_dir.join(format!("{tool_call_id}.txt")))
     }
+
+    /// [`Self::path_for`]の`notes/`版。`item_id`は`PlanOutput.items[].id`由来
+    /// （モデル生成のためハーネス側でサニタイズ済みだが、検証は共有経路のまま二重に行う）。
+    fn note_path_for(&self, item_id: &str) -> io::Result<PathBuf> {
+        validate_id(item_id)?;
+        Ok(self.notes_dir.join(format!("{item_id}.md")))
+    }
+}
+
+/// ファイル名要素として安全か（`../`・ドライブ指定・区切り文字を含まないか）を検査する。
+/// `raw/`・`notes/`の両パス関数が共有する。
+fn validate_id(id: &str) -> io::Result<()> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsafe id for a scratch file name: {id:?}"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -188,5 +244,45 @@ mod tests {
         for ok in ["call_1", "toolu_01A2b3C4", "call-abc-123", "0"] {
             store.put_raw(ok, "payload").unwrap();
         }
+    }
+
+    // --- notes/（`plans/PLAN-SURVEY-ENGINE.md`段階2） -------------------------------
+
+    #[test]
+    fn note_round_trips_and_is_detected_by_note_exists() {
+        let (_dir, store) = store();
+        assert!(!store.note_exists("item_1").unwrap());
+        store.put_note("item_1", "## 要約\n\n事実A").unwrap();
+        assert!(store.note_exists("item_1").unwrap());
+        let notes = store.list_notes().unwrap();
+        assert_eq!(notes, vec![("item_1".to_string(), "## 要約\n\n事実A".to_string())]);
+    }
+
+    /// `Join`はnotesをファイル名（＝item_id）昇順で読む。
+    #[test]
+    fn list_notes_is_sorted_by_item_id() {
+        let (_dir, store) = store();
+        store.put_note("item_3", "C").unwrap();
+        store.put_note("item_1", "A").unwrap();
+        store.put_note("item_2", "B").unwrap();
+        let ids: Vec<String> = store
+            .list_notes()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec!["item_1", "item_2", "item_3"]);
+    }
+
+    /// `raw/`と同じ検証を`notes/`側でも通す（共有の`validate_id`）。
+    #[test]
+    fn traversal_in_item_id_is_rejected_instead_of_escaping_the_notes_dir() {
+        let (dir, store) = store();
+        for evil in ["../escape", "a/b", ""] {
+            let err = store.put_note(evil, "payload").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "accepted {evil:?}");
+        }
+        let created: Vec<_> = std::fs::read_dir(dir.path().join("notes")).unwrap().collect();
+        assert!(created.is_empty());
     }
 }

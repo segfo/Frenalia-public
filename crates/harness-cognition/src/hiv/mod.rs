@@ -25,7 +25,6 @@
 //! 素朴ループと同じ文脈肥大が起きる（§0の弱点1）ため。
 
 pub(crate) mod answer;
-pub(crate) mod call;
 pub(crate) mod evidence;
 pub(crate) mod parse;
 #[cfg(test)]
@@ -38,8 +37,8 @@ use harness_engine::{emit_event, EventSink, Executor};
 use harness_tools::ToolRegistry;
 use tokio_util::sync::CancellationToken;
 
+use crate::call::{Conclusion, PhaseError, PhaseRunner, PhaseValue};
 use crate::context::{ContextAssembler, PhaseInput};
-use crate::hiv::call::{Conclusion, PhaseError, PhaseRunner, PhaseValue};
 use crate::memory::types::{
     Decision, GoalId, GoalStatus, HypId, HypStatus, Verdict, Verification, VerifyMethod,
 };
@@ -346,12 +345,13 @@ impl HivEngine {
     ) -> Result<Option<State>, PhaseError> {
         self.mem
             .set_hypothesis_status(hyp, HypStatus::Investigating);
+        let hyp_label = hyp.label();
         let result: PhaseValue<InvestigateOutput> = self
             .runner(cx)
             .run(
                 Phase::Investigate,
                 PhaseInput {
-                    target: Some(hyp),
+                    target: Some(&hyp_label),
                     ..Default::default()
                 },
                 &self.mem,
@@ -379,7 +379,7 @@ impl HivEngine {
                 .run(
                     Phase::Distill,
                     PhaseInput {
-                        target: Some(hyp),
+                        target: Some(&hyp_label),
                         raw_output: Some(&observation.excerpt),
                         ..Default::default()
                     },
@@ -419,12 +419,13 @@ impl HivEngine {
             );
         }
 
+        let hyp_label = hyp.label();
         let result: PhaseValue<VerifyOutput> = self
             .runner(cx)
             .run(
                 Phase::Verify,
                 PhaseInput {
-                    target: Some(hyp),
+                    target: Some(&hyp_label),
                     ..Default::default()
                 },
                 &self.mem,
@@ -503,12 +504,13 @@ impl HivEngine {
         goal: GoalId,
         cx: &HivContext<'_>,
     ) -> Result<Option<State>, PhaseError> {
+        let goal_label = goal.label();
         let result: PhaseValue<DecideOutput> = self
             .runner(cx)
             .run(
                 Phase::Decide,
                 PhaseInput {
-                    goal: Some(goal),
+                    goal: Some(&goal_label),
                     ..Default::default()
                 },
                 &self.mem,

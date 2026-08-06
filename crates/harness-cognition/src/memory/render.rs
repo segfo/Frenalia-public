@@ -4,8 +4,11 @@
 //! フェーズごとに**必要な項目だけ**をMarkdownへ落とす。全履歴を渡さないのが要点なので、
 //! ここで「何を渡さないか」が決まる。どのビューを使うかは[`crate::phase`]の表が持つ。
 
+use harness_core::Phase;
+
 use super::types::{HypStatus, Hypothesis};
 use super::WorkingMemory;
+use crate::ledger::LedgerView;
 use crate::memory::types::{GoalId, HypId};
 
 /// フェーズごとの台帳スライス（閉じた語彙）。`plans/DESIGN-COGNITION.md` §3.3の
@@ -308,6 +311,46 @@ impl WorkingMemory {
     }
 }
 
+/// `PhaseInput.target`/`.goal`から、そのフェーズが見るべき[`MemoryView`]を決める。
+/// 旧`phase::spec()`の`view`選択をそのまま移設したもの（`plans/PLAN-SURVEY-ENGINE.md`段階1）。
+/// クレート全体に効く`#![deny(clippy::wildcard_enum_match_arm)]`により、`Phase`へ
+/// 新バリアントを足すとここも確実にコンパイルエラーになる。
+fn view_for(phase: Phase, target: Option<HypId>, goal: Option<GoalId>) -> MemoryView {
+    match phase {
+        Phase::Orient => MemoryView::GoalSummary,
+        Phase::Hypothesize => MemoryView::Unknowns,
+        // 同じ仮説について複数ラウンド回るので、既に得た観測まで見せる（M15での変更点、
+        // `MemoryView::InvestigationState`のdoc参照）。
+        Phase::Investigate => target.map_or(MemoryView::None, MemoryView::InvestigationState),
+        // 主入力は生出力（scratchから注入）だが、対象の仮説と反証条件は要る——
+        // Distillの出力スキーマが`relation: supports|refutes`を要求しており、
+        // 何に対する支持/反証なのかが分からないと判定できないため。M16では**対象仮説の
+        // 既存観測**も載せる——`contradicts`（§4.3の矛盾検出）はE番号で答えさせるので、
+        // 番号が見えていないと答えようがないため。他の仮説の証拠は載せない。
+        Phase::Distill => target.map_or(MemoryView::None, MemoryView::DistillTarget),
+        Phase::Verify => target.map_or(MemoryView::None, MemoryView::EvidenceFor),
+        Phase::Critic => target.map_or(MemoryView::None, MemoryView::VerificationOf),
+        Phase::Decide => goal.map_or(MemoryView::None, MemoryView::ConfirmedForGoal),
+        // `CensusEngine`専用フェーズ。`WorkingMemory`はこれらを扱わない
+        // （`census::CensusLedger`が別途`LedgerView`を実装する）。
+        Phase::Plan | Phase::Collect | Phase::Join => MemoryView::None,
+    }
+}
+
+impl LedgerView for WorkingMemory {
+    fn render_slice(
+        &self,
+        phase: Phase,
+        target: Option<&str>,
+        goal: Option<&str>,
+        reduction: Reduction,
+    ) -> String {
+        let target = target.and_then(HypId::parse);
+        let goal = goal.and_then(GoalId::parse);
+        self.render(view_for(phase, target, goal), reduction)
+    }
+}
+
 fn digest_hypothesis(h: &Hypothesis) -> String {
     format!(
         "{} [{:?}] {}（支持{} / 反証{}）",
@@ -536,5 +579,67 @@ mod tests {
         let out = mem.render(MemoryView::EvidenceFor(h), Reduction::Full);
         assert!(!out.contains("支持する証拠"), "{out}");
         assert!(!out.contains("反証条件"), "{out}");
+    }
+
+    // 以下、`plans/PLAN-SURVEY-ENGINE.md`段階1（`LedgerView`抽象化）のテスト。
+
+    /// Investigateは「重複して調べない」ため、Distillは「矛盾を指摘させる」ために、
+    /// それぞれ別のビューで対象仮説を見る（`phase.rs`の旧テストから移設）。
+    #[test]
+    fn investigate_and_distill_look_at_the_target_hypothesis_through_different_views() {
+        let h = HypId(2);
+        assert_eq!(
+            view_for(Phase::Investigate, Some(h), None),
+            MemoryView::InvestigationState(h)
+        );
+        assert_eq!(
+            view_for(Phase::Distill, Some(h), None),
+            MemoryView::DistillTarget(h)
+        );
+        // 対象が無ければどちらも空ビューへ落ちる（組み立ては失敗しない）。
+        assert_eq!(view_for(Phase::Distill, None, None), MemoryView::None);
+        assert_eq!(view_for(Phase::Investigate, None, None), MemoryView::None);
+    }
+
+    /// 対象仮説が指定されなければビューは空になる（組み立て自体は失敗しない）。
+    #[test]
+    fn missing_target_degrades_to_an_empty_view_rather_than_failing() {
+        assert_eq!(view_for(Phase::Verify, None, None), MemoryView::None);
+        assert_eq!(
+            view_for(Phase::Verify, Some(HypId(2)), None),
+            MemoryView::EvidenceFor(HypId(2))
+        );
+    }
+
+    /// `LedgerView::render_slice`（文字列target/goal経由）が、既存の`render(view_for(...), ..)`
+    /// （型付きID経由）と全フェーズ・全縮約段階で同一文字列を返すことの回帰テスト
+    /// （段階1の受入条件「挙動が1バイトも変わらない」）。
+    #[test]
+    fn render_slice_matches_the_existing_render_for_every_phase_and_reduction_level() {
+        let (mem, alive, _) = memory_with_two_hypotheses();
+        let target_label = alive.label();
+        let goal = mem.hypothesis(alive).unwrap().goal;
+        let goal_label = goal.label();
+
+        for phase in [
+            Phase::Orient,
+            Phase::Hypothesize,
+            Phase::Investigate,
+            Phase::Distill,
+            Phase::Verify,
+            Phase::Critic,
+            Phase::Decide,
+        ] {
+            for reduction in Reduction::LEVELS {
+                let expected = mem.render(view_for(phase, Some(alive), Some(goal)), reduction);
+                let actual = (&mem as &dyn LedgerView).render_slice(
+                    phase,
+                    Some(&target_label),
+                    Some(&goal_label),
+                    reduction,
+                );
+                assert_eq!(actual, expected, "{phase:?} at {reduction:?}");
+            }
+        }
     }
 }

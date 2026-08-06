@@ -110,6 +110,24 @@ fn schema_for(phase: Phase) -> serde_json::Value {
             &[("action", string_prop()), ("then_verify", string_prop())],
             &["action", "then_verify"],
         ),
+        Phase::Plan => object(
+            &[(
+                "items",
+                array_of(object(
+                    &[("id", string_prop()), ("query", string_prop())],
+                    &["id", "query"],
+                )),
+            )],
+            &["items"],
+        ),
+        Phase::Collect => object(&[("summary", string_prop())], &["summary"]),
+        Phase::Join => object(
+            &[
+                ("summary", string_prop()),
+                ("key_findings", string_array()),
+            ],
+            &["summary", "key_findings"],
+        ),
     }
 }
 
@@ -241,6 +259,33 @@ pub struct CriticOutput {
 pub struct DecideOutput {
     pub action: String,
     pub then_verify: String,
+}
+
+/// `CensusEngine`専用（`plans/PLAN-CENSUS-ENGINE.md`段階2）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanOutput {
+    pub items: Vec<PlannedItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlannedItem {
+    pub id: String,
+    pub query: String,
+}
+
+/// `CensusEngine`専用。本来の産物はツール呼び出しの方（`Phase::Investigate`と同じく
+/// `Conclusion::Optional`で呼ぶ）。`summary`は使わないが、他フェーズとの構造的対称性のため
+/// スキーマを持つ。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectOutput {
+    pub summary: String,
+}
+
+/// `CensusEngine`専用。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JoinOutput {
+    pub summary: String,
+    pub key_findings: Vec<String>,
 }
 
 #[cfg(test)]

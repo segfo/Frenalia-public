@@ -21,9 +21,8 @@ use harness_core::{
 };
 use harness_tools::ToolRegistry;
 
+use crate::ledger::LedgerView;
 use crate::memory::render::Reduction;
-use crate::memory::types::{GoalId, HypId};
-use crate::memory::WorkingMemory;
 use crate::phase::{spec, PhaseBudgets, ToolSelection};
 use crate::source::SourceCatalog;
 use crate::{prompts, schema};
@@ -76,12 +75,16 @@ impl AssembledCall {
 }
 
 /// 何を組むか。
+///
+/// `target`/`goal`は[`HypId::label`]／[`GoalId::label`]相当の文字列表現。型付きIDのまま
+/// 持たないのは、この構造体が[`LedgerView::render_slice`]へそのまま渡る汎用の入力だから
+/// （HIVの`HypId`/`GoalId`に依存しない。`plans/PLAN-SURVEY-ENGINE.md`段階1）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PhaseInput<'a> {
     /// 対象仮説（Investigate/Distill/Verify/Critic）。
-    pub target: Option<HypId>,
+    pub target: Option<&'a str>,
     /// 対象ゴール（Decide）。
-    pub goal: Option<GoalId>,
+    pub goal: Option<&'a str>,
     /// 注入する生出力（`ScratchStore::zoom`で読み出したもの）。台帳には入っていないので、
     /// 必要なフェーズ（Distill、およびツールフェーズの結論コール）だけが明示的に運ぶ。
     pub raw_output: Option<&'a str>,
@@ -126,12 +129,12 @@ impl ContextAssembler {
         &self,
         phase: Phase,
         input: PhaseInput<'_>,
-        mem: &WorkingMemory,
+        ledger: &dyn LedgerView,
         ctx: &ToolCtx,
         tools: &ToolRegistry,
         caps: &ProviderCapabilities,
     ) -> AssembledCall {
-        self.build_with_budget(phase, input, mem, ctx, tools, caps, self.budgets.get(phase))
+        self.build_with_budget(phase, input, ledger, ctx, tools, caps, self.budgets.get(phase))
     }
 
     /// [`Self::build`]の予算を差し替えた版（§6.6 規則3、コンテキスト超過からの縮小再試行）。
@@ -144,13 +147,13 @@ impl ContextAssembler {
         &self,
         phase: Phase,
         input: PhaseInput<'_>,
-        mem: &WorkingMemory,
+        ledger: &dyn LedgerView,
         ctx: &ToolCtx,
         tools: &ToolRegistry,
         caps: &ProviderCapabilities,
         budget: TokenBudget,
     ) -> AssembledCall {
-        let selection = spec(phase, input.target, input.goal).tools;
+        let selection = spec(phase).tools;
         let tool_specs = select_tools(tools, ctx, selection);
         // カタログを見せるのはInvestigateだけ（§4.2「Investigateフェーズの入力に使える情報源の
         // 一覧だけを渡す」）。情報源を選ぶのはこのフェーズの仕事で、他のフェーズには
@@ -158,7 +161,7 @@ impl ContextAssembler {
         let catalog = (phase == Phase::Investigate)
             .then(|| self.catalog.render_for_investigate(tools))
             .filter(|s| !s.is_empty());
-        self.assemble(phase, input, mem, ctx, tool_specs, catalog, caps, budget)
+        self.assemble(phase, input, ledger, ctx, tool_specs, catalog, caps, budget)
     }
 
     /// ツールを一切渡さず、スキーマだけを要求するコールを組む（必ず[`CallKind::SchemaOnly`]）。
@@ -171,11 +174,11 @@ impl ContextAssembler {
         &self,
         phase: Phase,
         input: PhaseInput<'_>,
-        mem: &WorkingMemory,
+        ledger: &dyn LedgerView,
         ctx: &ToolCtx,
         caps: &ProviderCapabilities,
     ) -> AssembledCall {
-        self.build_conclusion_with_budget(phase, input, mem, ctx, caps, self.budgets.get(phase))
+        self.build_conclusion_with_budget(phase, input, ledger, ctx, caps, self.budgets.get(phase))
     }
 
     /// [`Self::build_conclusion`]の予算を差し替えた版（§6.6 規則3）。
@@ -183,13 +186,13 @@ impl ContextAssembler {
         &self,
         phase: Phase,
         input: PhaseInput<'_>,
-        mem: &WorkingMemory,
+        ledger: &dyn LedgerView,
         ctx: &ToolCtx,
         caps: &ProviderCapabilities,
         budget: TokenBudget,
     ) -> AssembledCall {
         // 結論コールにはツールが載らないので、情報源カタログも要らない（もう選ばない）。
-        self.assemble(phase, input, mem, ctx, Vec::new(), None, caps, budget)
+        self.assemble(phase, input, ledger, ctx, Vec::new(), None, caps, budget)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -197,14 +200,14 @@ impl ContextAssembler {
         &self,
         phase: Phase,
         input: PhaseInput<'_>,
-        mem: &WorkingMemory,
+        ledger: &dyn LedgerView,
         ctx: &ToolCtx,
         tool_specs: Vec<ToolSpec>,
         catalog: Option<String>,
         caps: &ProviderCapabilities,
         budget: TokenBudget,
     ) -> AssembledCall {
-        let spec = spec(phase, input.target, input.goal);
+        let spec = spec(phase);
         let kind = call_kind(spec.wants_schema, !tool_specs.is_empty(), caps);
 
         let system = self.system_blocks(phase, ctx, !tool_specs.is_empty());
@@ -219,7 +222,7 @@ impl ContextAssembler {
 
         // 1段目: 台帳スライスの構造的な縮約（決定的な順序、§6.1）。
         for reduction in Reduction::LEVELS {
-            body.slice = mem.render(spec.view, reduction);
+            body.slice = ledger.render_slice(phase, input.target, input.goal, reduction);
             let req = self.request(&system, &tool_specs, &body, kind, phase, budget);
             if harness_engine::estimate_tokens(&req) <= u64::from(budget.max_in) {
                 return finish(req, kind, budget);
@@ -426,8 +429,9 @@ fn shrink(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::types::{Evidence, EvidenceId, RawRef, SourceRef};
+    use crate::memory::types::{Evidence, EvidenceId, GoalId, HypId, RawRef, SourceRef};
     use crate::memory::validity::{Freshness, TrustLevel, Validity};
+    use crate::memory::WorkingMemory;
 
     fn caps(schema_with_tools: bool) -> ProviderCapabilities {
         ProviderCapabilities {
@@ -493,10 +497,11 @@ mod tests {
     #[test]
     fn assembled_request_carries_a_ledger_slice_not_a_transcript() {
         let (mem, hyp, _) = memory();
+        let hyp_label = hyp.label();
         let call = assembler().build(
             Phase::Verify,
             PhaseInput {
-                target: Some(hyp),
+                target: Some(&hyp_label),
                 ..Default::default()
             },
             &mem,
@@ -521,10 +526,11 @@ mod tests {
     #[test]
     fn investigate_receives_read_only_tool_specs_only() {
         let (_, hyp, _) = memory();
+        let hyp_label = hyp.label();
         let call = build(
             Phase::Investigate,
             PhaseInput {
-                target: Some(hyp),
+                target: Some(&hyp_label),
                 ..Default::default()
             },
         );
@@ -555,17 +561,18 @@ mod tests {
     #[test]
     fn tool_specs_are_ordered_deterministically() {
         let (_, hyp, _) = memory();
+        let hyp_label = hyp.label();
         let first = build(
             Phase::Investigate,
             PhaseInput {
-                target: Some(hyp),
+                target: Some(&hyp_label),
                 ..Default::default()
             },
         );
         let second = build(
             Phase::Investigate,
             PhaseInput {
-                target: Some(hyp),
+                target: Some(&hyp_label),
                 ..Default::default()
             },
         );
@@ -580,18 +587,20 @@ mod tests {
     #[test]
     fn tool_bearing_phases_include_the_environment_facts_declaration() {
         let (_, hyp, goal) = memory();
+        let hyp_label = hyp.label();
+        let goal_label = goal.label();
         for (phase, input) in [
             (
                 Phase::Investigate,
                 PhaseInput {
-                    target: Some(hyp),
+                    target: Some(&hyp_label),
                     ..Default::default()
                 },
             ),
             (
                 Phase::Decide,
                 PhaseInput {
-                    goal: Some(goal),
+                    goal: Some(&goal_label),
                     ..Default::default()
                 },
             ),
@@ -619,8 +628,9 @@ mod tests {
     #[test]
     fn schema_and_tools_are_split_when_the_provider_cannot_combine_them() {
         let (mem, hyp, _) = memory();
+        let hyp_label = hyp.label();
         let input = PhaseInput {
-            target: Some(hyp),
+            target: Some(&hyp_label),
             ..Default::default()
         };
         let tools = ToolRegistry::with_builtin_tools();
@@ -684,10 +694,11 @@ mod tests {
     #[test]
     fn distill_receives_the_raw_output_the_target_hypothesis_and_its_observations() {
         let (_, hyp, _) = memory();
+        let hyp_label = hyp.label();
         let call = build(
             Phase::Distill,
             PhaseInput {
-                target: Some(hyp),
+                target: Some(&hyp_label),
                 raw_output: Some("line A\nline B"),
                 ..Default::default()
             },
@@ -706,6 +717,8 @@ mod tests {
     #[test]
     fn the_source_catalog_is_shown_to_investigate_only() {
         let (mem, hyp, goal) = memory();
+        let hyp_label = hyp.label();
+        let goal_label = goal.label();
         let assembler =
             assembler().with_catalog(crate::source::SourceCatalog::with_builtin_defaults());
         let tools = ToolRegistry::with_builtin_tools();
@@ -713,7 +726,7 @@ mod tests {
         let investigate = assembler.build(
             Phase::Investigate,
             PhaseInput {
-                target: Some(hyp),
+                target: Some(&hyp_label),
                 ..Default::default()
             },
             &mem,
@@ -733,7 +746,7 @@ mod tests {
             (
                 Phase::Decide,
                 PhaseInput {
-                    goal: Some(goal),
+                    goal: Some(&goal_label),
                     ..Default::default()
                 },
             ),
@@ -750,6 +763,7 @@ mod tests {
     #[test]
     fn the_catalog_is_the_first_thing_dropped_when_the_budget_is_tight() {
         let (mem, hyp, _) = memory();
+        let hyp_label = hyp.label();
         let assembler = ContextAssembler::new(
             "test-model",
             PhaseBudgets::default().with_overrides(&std::collections::BTreeMap::from([(
@@ -766,7 +780,7 @@ mod tests {
         let call = assembler.build(
             Phase::Investigate,
             PhaseInput {
-                target: Some(hyp),
+                target: Some(&hyp_label),
                 ..Default::default()
             },
             &mem,
@@ -804,10 +818,11 @@ mod tests {
     #[test]
     fn build_conclusion_drops_the_tools_and_always_requests_a_schema() {
         let (mem, _, goal) = memory();
+        let goal_label = goal.label();
         let call = assembler().build_conclusion(
             Phase::Decide,
             PhaseInput {
-                goal: Some(goal),
+                goal: Some(&goal_label),
                 raw_output: Some("edit_file applied 3 lines"),
                 ..Default::default()
             },
@@ -896,13 +911,15 @@ mod tests {
             }
         }
 
+        let first_label = first.map(|h| h.label());
+        let g_label = g.label();
         let a = assembler();
         for phase in Phase::ALL {
             let call = a.build(
                 phase,
                 PhaseInput {
-                    target: first,
-                    goal: Some(g),
+                    target: first_label.as_deref(),
+                    goal: Some(&g_label),
                     ..Default::default()
                 },
                 &mem,

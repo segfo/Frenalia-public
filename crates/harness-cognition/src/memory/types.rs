@@ -25,6 +25,12 @@ macro_rules! ledger_id {
             pub fn label(self) -> String {
                 format!("{}{}", $prefix, self.0)
             }
+
+            /// [`Self::label`]の逆変換。`LedgerView::render_slice`が受け取る
+            /// `target: Option<&str>`／`goal: Option<&str>`を型付きIDへ戻すためのもの。
+            pub fn parse(s: &str) -> Option<Self> {
+                s.strip_prefix($prefix)?.parse::<u32>().ok().map(Self)
+            }
         }
 
         impl std::fmt::Display for $name {
