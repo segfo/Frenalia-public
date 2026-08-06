@@ -754,6 +754,36 @@ fn scroll_lines_clamps_at_zero_and_saturates_upward() {
     assert_eq!(app.scroll_offset, 2);
 }
 
+// --- BUG-076: 先頭より上へは「溜まらない」 ---
+
+/// 先頭まで遡った後にさらに上へ回しても、次の描画で上限まで切り詰められる。
+/// 切り詰めないと、下へ1回回しただけでは画面が動かない（回した回数だけ空回りする）。
+#[test]
+fn scrolling_past_the_top_does_not_bank_up_an_invisible_offset() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    // 遡れるのは3行分しかない画面で、ホイールを10ノッチ（=30行分）上へ回す。
+    for _ in 0..10 {
+        app.on_mouse(MouseEventKind::ScrollUp);
+    }
+    assert_eq!(app.scroll_offset, 30, "入力の時点では素直に加算される");
+
+    app.clamp_scroll(3); // 描画で上限が判明する
+    assert_eq!(app.scroll_offset, 3);
+
+    // 下へ1ノッチで最新へ戻る（修正前は27行分の空回りが残っていた）。
+    app.on_mouse(MouseEventKind::ScrollDown);
+    assert_eq!(app.scroll_offset, 0);
+}
+
+/// 上限内なら`clamp_scroll`は何もしない（常時切り詰めて位置を失う、という逆の壊れ方をしない）。
+#[test]
+fn clamp_scroll_leaves_a_position_that_is_within_range() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.scroll_lines(5);
+    app.clamp_scroll(100);
+    assert_eq!(app.scroll_offset, 5);
+}
+
 #[test]
 fn page_up_and_page_down_keys_scroll_by_a_page_without_emitting_an_action() {
     let mut app = AppState::new("mock".into(), "mock-model".into());

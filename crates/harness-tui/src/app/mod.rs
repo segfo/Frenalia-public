@@ -364,8 +364,23 @@ impl AppState {
         }
     }
 
+    /// 直近の描画で判明した上限まで`scroll_offset`を切り詰める
+    /// （[BUG-076](../../../docs/bugs/BUG-076.md)）。
+    ///
+    /// 総行数は折り畳み状態と端末幅に依存し**描画時にしか決まらない**ので、上限は
+    /// [`crate::ui::render`]の戻り値として受け取り、1フレーム描くごとにここへ渡す。
+    /// これを怠ると、先頭まで遡った後もホイールを回した分だけ`scroll_offset`が伸び続け、
+    /// **同じ回数だけ下へ回さないと画面が動かない**（画面は先頭で止まって見えるので、
+    /// ユーザーには操作が効かなくなったようにしか見えない）。
+    pub fn clamp_scroll(&mut self, max_offset: u16) {
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
+    }
+
     /// `delta`が正なら過去方向（上）へ、負なら最新方向（下）へスクロールする。
-    /// 下限0（最新）でクランプする。上限は総行数依存のため描画側でクランプする。
+    /// 下限0（最新）でクランプする。上限は総行数依存のため、描画のたびに
+    /// [`AppState::clamp_scroll`]で切り詰める。
     pub fn scroll_lines(&mut self, delta: i32) {
         if delta >= 0 {
             self.scroll_offset = self.scroll_offset.saturating_add(delta as u16);

@@ -16,7 +16,11 @@ use harness_sandbox::ManifestOp;
 /// スクロール状態は入力欄には持たせない）。
 const MAX_INPUT_VISIBLE_LINES: u16 = 6;
 
-pub fn render(f: &mut Frame, app: &AppState) {
+/// 1フレーム描画し、**この描画で判明した`scroll_offset`の上限**を返す
+/// （[BUG-076](../../../docs/bugs/BUG-076.md)）。総行数は折り畳み状態と端末幅に依存するため
+/// 描画時にしか決まらない。呼び出し側は戻り値で`AppState::clamp_scroll`を呼び、状態そのものを
+/// 切り詰める——ここで表示だけ止めても、状態は青天井に伸び続けてしまう。
+pub fn render(f: &mut Frame, app: &AppState) -> u16 {
     // 複数行入力（既定でEnterが改行を挿入するようになったため）にあわせ、入力欄の高さを
     // 行数に応じて`MAX_INPUT_VISIBLE_LINES`まで自動で伸ばす（それ以上は内部スクロール）。
     let input_line_count = app.input.split('\n').count() as u16;
@@ -30,7 +34,7 @@ pub fn render(f: &mut Frame, app: &AppState) {
         ])
         .split(f.area());
 
-    render_transcript(f, root[0], app);
+    let max_scroll = render_transcript(f, root[0], app);
     render_status(f, root[1], app);
     render_input(f, root[2], app);
 
@@ -51,6 +55,8 @@ pub fn render(f: &mut Frame, app: &AppState) {
         // 視認性を優先する。
         set_input_cursor(f, root[2], app);
     }
+
+    max_scroll
 }
 
 /// Tier3サンドボックス準備中の待機画面（`sandbox_prep::run_prep_screen`から呼ばれる）。
@@ -342,7 +348,8 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_transcript(f: &mut Frame, area: Rect, app: &AppState) {
+/// 戻り値は`scroll_offset`の上限（[`render`]がそのまま返す）。
+fn render_transcript(f: &mut Frame, area: Rect, app: &AppState) -> u16 {
     let lines = transcript_lines(app, app.collapsed);
     let block = Block::default().borders(Borders::ALL);
     let text_width = area.width.saturating_sub(2);
@@ -355,6 +362,9 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &AppState) {
     // クランプする（上限を超えて遡ろうとしても先頭で止まる）。Paragraphのscrollはwrap後の
     // 表示行を数えるため、ここもwrap後の行数で計算する。そうしないとCtrl+Oでツール出力や
     // thinkingを展開した時、長い行の折り返し分だけ末尾までスクロールできなくなる。
+    //
+    // BUG-076: このクランプは**表示にしか効かない**。上限は呼び出し側へ返し、
+    // `AppState::clamp_scroll`で状態そのものも切り詰めてもらう。
     let max_offset = total.saturating_sub(viewport);
     let offset = app.scroll_offset.min(max_offset);
     let scroll = max_offset.saturating_sub(offset);
@@ -369,6 +379,7 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &AppState) {
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(paragraph, area);
+    max_offset
 }
 
 fn render_status(f: &mut Frame, area: Rect, app: &AppState) {

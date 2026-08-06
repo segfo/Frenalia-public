@@ -649,7 +649,12 @@ pub async fn run(
             _ = tick.tick() => { app.tick(); }
         }
 
-        term.draw(|f| ui::render(f, &app))?;
+        // BUG-076: 遡れる上限は折り畳み状態と端末幅に依存し、描画時にしか決まらない。
+        // 描いた直後に状態そのものを切り詰める——表示側だけで止めると、先頭に着いた後も
+        // ホイールを回した分だけ`scroll_offset`が伸び、同じ回数下へ回すまで画面が動かない。
+        let mut max_scroll = 0u16;
+        term.draw(|f| max_scroll = ui::render(f, &app))?;
+        app.clamp_scroll(max_scroll);
 
         if app.should_quit {
             break;
