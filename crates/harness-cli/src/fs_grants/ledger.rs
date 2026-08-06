@@ -144,6 +144,35 @@ pub(crate) fn remove_fs_passthrough_grant(path: &Path) {
     });
 }
 
+/// `should_remove`がtrueを返したパスのエントリを台帳から落とす（`harness fs prune`、D-53）。
+/// `entries`と`denied_entries`の両方が対象。返り値は実際に落としたパスの一覧。
+///
+/// **判定（何を落とすか）は呼び出し側が持ち、本関数はロックと永続化だけを持つ。** 台帳ファイルを
+/// 所有するのはこのモジュールなので、CLI側で`load`→`save`する形にはしない（複数`harness.exe`
+/// 同時起動下のlost updateを避ける、R-01）。
+pub(crate) fn prune_fs_ledger_entries(should_remove: impl Fn(&Path) -> bool) -> Vec<String> {
+    fs_ledger().update(|ledger| {
+        let mut removed = Vec::new();
+        ledger.entries.retain(|e| {
+            if should_remove(Path::new(&e.path)) {
+                removed.push(e.path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ledger.denied_entries.retain(|e| {
+            if should_remove(Path::new(&e.path)) {
+                removed.push(e.path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    })
+}
+
 /// `reconcile_fs_ledger_for_workspace`専用の除去。orphan候補を確定してからACE撤収を試みるまでの
 /// 間（ロックを一旦手放す）に、別プロセスが同じパスを新たに宣言し直す競合（TOCTOU）を考慮し、
 /// 撤収成功後もなお「settings管理下で参照者ゼロ」のままである場合だけ台帳から除去する（D-27）。

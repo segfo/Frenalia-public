@@ -148,6 +148,31 @@ pub(crate) fn fs_revoke_one(_path: &Path) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// 撤収の進捗をどちらのストリームへ出すか。
+///
+/// **stdoutは`--output-format json`/`jsonl`の機械可読な出力そのもの**なので、エージェント起動中に
+/// 走る自動整合（D-27）が1行でも混ぜると`jq`が壊れる（[BUG-064](../../../../docs/bugs/BUG-064.md)）。
+/// 明示コマンド（`harness fs revoke-all`）の側は出力そのものがユーザーへの回答なのでstdoutが正しい。
+/// **どちらが正しいかは呼び出し文脈でしか決まらない**ため、共通処理側では決め打ちにせず引数で受ける。
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) enum RevokeAnnounce {
+    /// `harness fs revoke`/`revoke-all`。この出力自体がコマンドの結果である。
+    Stdout,
+    /// エージェント起動中の自動整合。stdoutは機械可読出力に予約されているので触らない。
+    Stderr,
+}
+
+#[cfg(windows)]
+impl RevokeAnnounce {
+    fn say(self, msg: &str) {
+        match self {
+            RevokeAnnounce::Stdout => println!("{msg}"),
+            RevokeAnnounce::Stderr => eprintln!("{msg}"),
+        }
+    }
+}
+
 /// `entries`のfs passthrough ACEを撤収する共通処理（元は`fs_revoke_all`本体）。まず全エントリを
 /// 本体内で試行し（UAC無し）、残ったパスだけを**1回のヘルパー要求へまとめて**エスカレーションする
 /// （`BUG-015`決定：起動あたりUAC最小化、grant側`preflight`と同じ考え方）。撤収に成功したパスは
@@ -158,6 +183,7 @@ pub(crate) fn revoke_fs_ledger_entries(
     entries: &[FsLedgerEntry],
     note: &str,
     on_revoked: fn(&Path),
+    announce: RevokeAnnounce,
 ) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
     let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(
         harness_sandbox::tier2a::win_appcontainer::CONTAINER_NAME,
@@ -183,16 +209,16 @@ pub(crate) fn revoke_fs_ledger_entries(
         match revoke_passthrough_outcome(&path, &sid, entry.forced) {
             RevokeOutcome::FullyRevoked => {
                 on_revoked(&path);
-                println!("{note}: {}", path.display());
+                announce.say(&format!("{note}: {}", path.display()));
                 revoked_paths.push(path);
             }
             RevokeOutcome::RootClearedDescendantsBlocked => {
                 on_revoked(&path);
-                println!(
+                announce.say(&format!(
                     "{note}: {} (root cleared; TrustedInstaller-owned descendants beyond our \
                      control -- not orphaned)",
                     path.display()
-                );
+                ));
                 revoked_paths.push(path);
             }
             RevokeOutcome::Failed => remaining.push(harness_sandbox::tier2a::privhelper::FsAllowRevoke {
@@ -234,10 +260,10 @@ pub(crate) fn revoke_fs_ledger_entries(
         Ok((revoked, root_cleared, failures)) => {
             for path in revoked.iter().chain(root_cleared.iter()) {
                 on_revoked(path);
-                println!(
+                announce.say(&format!(
                     "{note} via privilege-separation helper (UAC, one-time): {}",
                     path.display()
-                );
+                ));
                 revoked_paths.push(path.clone());
             }
             (revoked_paths, failures)
@@ -260,7 +286,12 @@ pub(crate) fn fs_revoke_all() -> ExitCode {
         println!("(no fs passthrough entries)");
         return ExitCode::SUCCESS;
     }
-    let (_, failures) = revoke_fs_ledger_entries(&ledger.entries, "revoked", remove_fs_passthrough_grant);
+    let (_, failures) = revoke_fs_ledger_entries(
+        &ledger.entries,
+        "revoked",
+        remove_fs_passthrough_grant,
+        RevokeAnnounce::Stdout,
+    );
     if failures.is_empty() {
         ExitCode::SUCCESS
     } else {
@@ -323,6 +354,9 @@ pub fn reconcile_fs_ledger_for_workspace(
         &orphan_candidates,
         "auto-revoked",
         remove_fs_passthrough_grant_if_still_orphaned,
+        // BUG-064: この経路はエージェント起動の途中で走る。stdoutは`--output-format json`/`jsonl`
+        // の機械可読出力に予約されているので、1行たりとも混ぜない。
+        RevokeAnnounce::Stderr,
     );
     for (path, reason) in &failures {
         eprintln!("warning: auto-revoke failed for {} : {reason}", path.display());

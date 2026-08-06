@@ -193,6 +193,16 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "tier2a_mcp_corroboration",
         ],
     ),
+    // D-27（`plans/VERIFY-TODO.md`項目1）: fs passthrough台帳の参照カウントと、並行起動時の
+    // read-modify-write直列化。**保護対象の`fs-passthrough-ledger.json`を触る**ため、
+    // 他のE2Eと同時に走らせない。
+    (
+        "e2e-fs-ledger",
+        &[
+            "test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture",
+            "tier2a_fs_ledger_lifecycle",
+        ],
+    ),
     // `dev-elevated-runner`自身は除外する。デーモン(`dev-elevated-runnerd.exe`)がこの
     // コマンドを実行している間、自分自身の実行ファイルは起動中でロックされておりリンクし
     // 直せない（実機で`error: failed to remove file ...dev-elevated-runnerd.exe: アクセスが

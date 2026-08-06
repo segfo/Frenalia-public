@@ -89,8 +89,8 @@ pub struct ReadScopeConfig {
     pub deny_descend: Vec<String>,
 }
 
-/// シェル隔離Tier（M12、`plans/DESIGN-SANDBOX.md` §6）。Tier1'（VHDX）は本フェーズの
-/// 対象外。Tier2a（AppContainer）/Tier2b（bubblewrap）は既定の上限Tierとして実装済み。
+/// シェル隔離Tier（M12、`plans/DESIGN-SANDBOX.md` §6）。
+/// Tier2a（AppContainer）/Tier2b（bubblewrap）は既定の上限Tierとして実装済み。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellTier {
     /// Windows: Hyper-V外層VM（AlmaLinux）+ Incus内層コンテナ（`plans/DESIGN-SANDBOX-VMISOLATION.md`）。

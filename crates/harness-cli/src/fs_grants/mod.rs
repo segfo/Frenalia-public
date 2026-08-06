@@ -11,6 +11,7 @@ use clap::Subcommand;
 
 mod ledger;
 
+mod prune;
 mod revoke;
 mod traverse;
 mod workspace;
@@ -19,6 +20,7 @@ pub(crate) use ledger::*;
 
 // `main`（binターゲット）の起動パイプラインから直接呼ぶものだけ`pub`で出す。
 pub use ledger::{record_fs_passthrough_denied, record_fs_passthrough_grant};
+pub(crate) use prune::fs_prune;
 pub use revoke::reconcile_fs_ledger_for_workspace;
 pub(crate) use revoke::*;
 pub(crate) use traverse::*;
@@ -37,6 +39,19 @@ pub enum FsAction {
     Revoke { path: PathBuf },
     /// 台帳の全エントリを撤収する。
     RevokeAll,
+    /// **実在しないパスを指す台帳エントリ**を3台帳（fs-passthrough・traverse-grant・
+    /// workspace-grant）から落とす（D-53）。台帳は`preflight`が起動のたびに追記する一方、
+    /// 明示的な`revoke-*`を呼ばない限り誰も消さないため記録が積もる。
+    ///
+    /// **ACEは一切撤収しない**（触るのは台帳の記録だけ）。「消えた」と確定できるのは
+    /// **ボリュームルートが到達可能でかつパスが存在しない**ときだけで、未マウントの
+    /// リムーバブル/オフラインのネットワークドライブ上のエントリは判定不能として残す
+    /// （実体とACEが生きている可能性があるため）。ドライブ/共有のルート自体も常に残す。
+    Prune {
+        /// 台帳を書き換えず、落とす対象と内訳を表示するだけにする。
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+    },
     /// `target`とその全祖先（ドライブルートまで）へ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を
     /// 連鎖付与する（D10連鎖化、`TIER1A-OPEN-ISSUES.md`項目6）。例えば
     /// `C:\Users\<user>\.cargo`を指定すると、`C:\`・`C:\Users`・`C:\Users\<user>`・
@@ -146,6 +161,7 @@ pub fn run_fs_subcommand(action: FsAction) -> ExitCode {
         }
         FsAction::Revoke { path } => fs_revoke_one(&path),
         FsAction::RevokeAll => fs_revoke_all(),
+        FsAction::Prune { dry_run } => fs_prune(dry_run),
         FsAction::GrantTraverse { target, dry_run } => {
             if dry_run {
                 fs_grant_traverse_preview(&target)

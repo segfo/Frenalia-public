@@ -80,6 +80,32 @@ pub fn remove_traverse_grant(path: &Path) {
     ledger().update(|l| l.entries.retain(|e| e.path != path_str));
 }
 
+/// `should_remove`がtrueを返したパスのエントリを落とす（`harness fs prune`、D-53）。
+/// 返り値は実際に落としたパスの一覧。
+///
+/// **判定は呼び出し側が持ち、本関数はロックと永続化だけを持つ。** 台帳ファイルを所有するのは
+/// このモジュールなので、CLI側で`load`→`save`する形にはしない（複数`harness.exe`同時起動下の
+/// lost updateを避ける、R-01）。
+///
+/// **D-48との関係**: この台帳に載っていることが`revoke_ace`のガードの発火条件なので、エントリを
+/// 落とすとその祖先ノードのガードが解除される。呼び出し側は`harness_grant_ledger::prune`の
+/// 判定を通すこと——`Gone`は「オブジェクトが存在しない」ことを意味し、存在しないオブジェクトに
+/// ACEは載っていないので、ガードが守るべきものがそもそも無い。
+pub fn prune_traverse_entries(should_remove: impl Fn(&Path) -> bool) -> Vec<String> {
+    ledger().update(|l| {
+        let mut removed = Vec::new();
+        l.entries.retain(|e| {
+            if should_remove(Path::new(&e.path)) {
+                removed.push(e.path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    })
+}
+
 /// 台帳のパス文字列とクエリのパスを突き合わせるための正規化。
 ///
 /// 区切りの`/`→`\`置換は`win_common::long_path_wide`（全ACL経路が通る一点で`C:/foo`のような

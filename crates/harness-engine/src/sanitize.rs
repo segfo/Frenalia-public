@@ -114,6 +114,31 @@ fn is_windows_drive_path_at(chars: &[char], i: usize) -> bool {
         && chars[i].is_ascii_alphabetic()
         && chars[i + 1] == ':'
         && is_windows_separator(chars[i + 2])
+        && !is_url_scheme_tail_at(chars, i)
+}
+
+/// `chars[i]`がURLスキームの**末尾1文字**に過ぎない場合を弾く（[BUG-067](../../../docs/bugs/BUG-067.md)）。
+///
+/// 走査は文字列の任意の位置で`<英字>:<区切り>`を探すので、`https://example.com`の`s:/`・
+/// `http://x`の`p:/`が「ドライブパス」に見えてしまい、URLが`http/workspace`のように壊れていた。
+/// **`run_shell`のコマンドも`web_fetch`のURLも同じ経路を通る**ので、Tier3では
+/// `curl`/`wget`/`git clone`/`pip install`が軒並み黙って壊れる。
+///
+/// URLだと言い切れるのは次の2条件が**両方**揃ったときだけにする。
+///
+/// 1. 直前が`[A-Za-z0-9+.-]`（RFC 3986のスキーム文字）である＝`s`や`p`がスキームの途中である
+/// 2. コロンの直後が`//`である＝authority形式（`scheme://host`）
+///
+/// 2を必須にするのが肝で、これが無いと`-IC:/include`のような**本物のドライブパス**まで
+/// 見逃して伏字化が漏れる（漏れは機密性の毀損なので、壊す側より慎重に倒す）。
+/// Windowsのドライブパスが`C://foo`と書かれることは実務上無いため、この2条件で
+/// 取りこぼす実パスは無い。
+fn is_url_scheme_tail_at(chars: &[char], i: usize) -> bool {
+    let preceded_by_scheme_char = i > 0
+        && (chars[i - 1].is_ascii_alphanumeric()
+            || matches!(chars[i - 1], '+' | '.' | '-'));
+    let authority_form = matches!(chars.get(i + 3), Some('/'));
+    preceded_by_scheme_char && authority_form
 }
 
 fn is_windows_separator(c: char) -> bool {
@@ -136,6 +161,40 @@ mod tests {
     /// リクエストを渡してくる場合でも choke point として無条件に再適用する。ここが冪等で
     /// ないと、二重適用でリクエストが壊れる（＝`run_agent_loop`の圧縮リトライ経路が
     /// 既に依存している性質でもある）。
+    /// BUG-067: URLのスキーム（`https:`/`http:`）の末尾1文字をドライブレターと誤認して
+    /// URLを壊していた。Tier3では`run_shell`のコマンドも`web_fetch`のURLもこの経路を通る。
+    #[test]
+    fn urls_are_not_mistaken_for_windows_drive_paths() {
+        for url in [
+            "https://example.com",
+            "http://x.test/a/b?q=1",
+            "ftp://host/f",
+            "git+ssh://git@host/repo.git",
+            "socks5h://127.0.0.1:1080",
+        ] {
+            assert_eq!(
+                redact_windows_absolute_paths(url),
+                url,
+                "a URL must survive redaction untouched: {url}"
+            );
+        }
+        assert_eq!(
+            redact_windows_absolute_paths("wget -qO- https://example.com | head -5"),
+            "wget -qO- https://example.com | head -5"
+        );
+    }
+
+    /// URLを守るために**本物のドライブパスを見逃してはいけない**（漏れは機密性の毀損）。
+    /// 直前が英数字でも、`X://`というauthority形式でない限り伏字化し続ける。
+    #[test]
+    fn real_drive_paths_are_still_redacted_even_when_glued_to_a_flag() {
+        assert_eq!(redact_windows_absolute_paths("-IC:/include"), "-I/workspace");
+        assert_eq!(redact_windows_absolute_paths(r"cd C:\Users\me"), "cd /workspace");
+        assert_eq!(redact_windows_absolute_paths("D:/tmp/x"), "/workspace");
+        // 単独の1文字スキームは判別不能なので、安全側（伏字化）へ倒す。
+        assert_eq!(redact_windows_absolute_paths("s://y"), "/workspace");
+    }
+
     #[test]
     fn redaction_is_idempotent() {
         let original = r#"see C:\Users\me\project\src and D:/tmp/x, then "E:\q" done"#;

@@ -49,6 +49,8 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+pub mod prune;
+
 /// 名前付きOSミューテックスで`f`を直列化する。
 ///
 /// 複数の`harness.exe`が同時に起動している状況で、台帳のread-modify-write
