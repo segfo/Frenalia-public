@@ -283,43 +283,17 @@ pub async fn run(
                 match ev {
                     Some(ev) => {
                         let switched = matches!(ev, harness_core::AgentEvent::SessionSwitched { .. });
-                        // BUG-071: キューを抜けて実際に始まった時点で「待機中」→「実行中」へ移す。
-                        let starts_busy =
-                            matches!(ev, harness_core::AgentEvent::ContextCompactionStarted);
-                        // BUG-070: 要約の完了（成功・失敗のどちらでも）で進捗表示を畳む。
-                        // BUG-071/074: `Error`・`Cancelled`を要約の終了とみなしてよいのは
-                        // **実行中のときだけ**。キューで待っている間に届くこれらは先行する
-                        // ターンのものなので、畳むと要約が始まる前に進捗表示が消えてしまう。
-                        let busy_running =
-                            app.busy_progress.as_ref().is_some_and(|b| b.is_running());
-                        let ends_busy = match &ev {
-                            harness_core::AgentEvent::ContextCompacted { .. } => {
-                                Some(app::BusyEnd::Finished)
-                            }
-                            harness_core::AgentEvent::Error { .. } if busy_running => {
-                                Some(app::BusyEnd::Finished)
-                            }
-                            // BUG-074: 止めたものを「完了した」と書かない。
-                            harness_core::AgentEvent::Cancelled if busy_running => {
-                                Some(app::BusyEnd::Stopped)
-                            }
-                            _ => None,
-                        };
+                        // BUG-078: 進捗表示（`busy_progress`）の**イベント側のライフサイクル**は
+                        // `AppState::apply`が握る。ここに置いていた頃は`app_state_tests`から
+                        // 一切テストできず、「engineが始めた縮約では表示が出ない」という穴が
+                        // 実端末で踏むまで見つからなかった。コマンド送信時の`begin_busy`
+                        // （キューへ入れた＝まだ走っていない）だけが送信側の責務として残る。
                         // BUG-072: `/sessions`で**別の会話**へ移るときは、前の会話を画面から
                         // 消してから見出し行を積む。残すと2つの会話が地続きに見え、モデルが
                         // 見ていない前半まで「この会話の一部」として読めてしまう。
                         // `/fork`（`pending_restore`が`None`）は同じ会話の続きなので消さない。
                         if switched && pending_restore.is_some() {
                             app.clear_transcript();
-                        }
-                        if starts_busy {
-                            app.mark_busy_running();
-                        }
-                        // 記録行は**結果行より先**に積む。`thinking_progress`が
-                        // `(thought for Ns)`を応答本文の前に出すのと同じで、スピナーがあった
-                        // 位置がそのまま記録になり、結果はその下に続く。
-                        if let Some(how) = ends_busy {
-                            app.end_busy(how);
                         }
                         app.apply(ev);
                         if switched {

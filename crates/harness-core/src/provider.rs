@@ -33,6 +33,27 @@ pub trait LlmProvider: Send + Sync {
         Ok(false)
     }
 
+    /// 実コンテキスト長を推論サーバへ**問い合わせて**返す（縮約の分母、`plans/PLAN-COMPACTION.md`）。
+    /// 分からない・対応していないプロバイダは`None`。
+    ///
+    /// # なぜ[`LlmProvider::capabilities`]と別なのか
+    ///
+    /// `capabilities`は同期で、宣言的な能力表明（このモデル系統は何ができるか）を返す場所である。
+    /// 実`n_ctx`は**サーバのロード設定**であり、HTTPコールなしには分からない。同期メソッドの中で
+    /// ブロッキングI/Oをすると非同期ランタイムを止めるので、経路を分けている。
+    ///
+    /// # 呼び出し規約
+    ///
+    /// - 呼ぶのは`harness-cli`の起動処理1箇所だけで、**明示指定（`--context-window`／
+    ///   `settings.json`の`compaction.context_window`）が無いときに限る**。ユーザーが書いた値を
+    ///   検出値で上書きしてはいけない。
+    /// - **fail-soft**。到達できない・形が違う・ロードされていないなら`None`を返して
+    ///   `capabilities().context_window`へ落ちる。分母はセキュリティ境界ではなく品質の調整値で、
+    ///   検出できないことを理由に起動を止める価値は無い（ただし何を使うかは起動時に出す）。
+    async fn detect_context_window(&self, _model: &str) -> Option<u32> {
+        None
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
     }

@@ -2,18 +2,70 @@
 //! （`--resume`/`--continue`）」）。`harness-cli`（ヘッドレス）と`harness-tui`（対話）の
 //! 両方から使う共有ロジックのため、両方が既に依存している`harness-engine`に置く。
 //!
-//! 1ファイル1セッション、1行1`Message`のJSONL。ファイル名は生成時刻ベース
+//! 1ファイル1セッション、1行1レコードのJSONL。ファイル名は生成時刻ベース
 //! （`session-{unix_millis}.jsonl`）で、`--resume <id>`はこの`{unix_millis}`部分を指定する。
+//!
+//! # レコードは2種類（[`Line`]）
+//!
+//! - **`Message`行**（既定・従来からの形）: 会話に増えたメッセージをそのまま追記する。
+//! - **チェックポイント行**: `{"kind":"checkpoint","messages":[…]}`。**そこまでの内容を
+//!   すべて置き換える**。コンテキスト圧縮が履歴の先頭を畳んだ時点で書き、`--resume`が
+//!   圧縮前の長い履歴へ戻ってしまうのを防ぐ。
+//!
+//! 「畳んだ件数」ではなく履歴全体を書くのは、縮約の①（`tool_result`の本文切詰め）が
+//! **件数を変えずに内容だけ変える**操作であり、件数の記録では表現できないからである。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use harness_core::Message;
+use serde::{Deserialize, Serialize};
+
+use harness_core::{ContentBlock, Message, Role};
 
 pub struct SessionStore {
     path: PathBuf,
+}
+
+/// JSONL1行の中身。**`Message`を先に置くことが必須**——`untagged`は上から順に試すので、
+/// 従来の`{"role":…,"content":…}`行が先に解け、`role`を持たないチェックポイント行だけが
+/// 次の候補へ落ちる（既存のセッションファイルを無変更で読める）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Line {
+    Message(Message),
+    Checkpoint(Checkpoint),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Checkpoint {
+    kind: CheckpointKind,
+    messages: Vec<Message>,
+}
+
+/// 書き込み用の借用版（履歴全体を`clone`せずに1行へ書くため。読み出しは[`Checkpoint`]）。
+#[derive(Serialize)]
+struct CheckpointRef<'a> {
+    kind: CheckpointKind,
+    messages: &'a [Message],
+}
+
+/// レコード種別。将来別種を足すときの識別子で、いまは1つだけ。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckpointKind {
+    Checkpoint,
+}
+
+/// ファイルを1パス解釈した結果。
+#[derive(Default)]
+struct Loaded {
+    /// チェックポイントを解決した後の履歴（`--resume`が復元するもの）。
+    messages: Vec<Message>,
+    /// **生の`Message`行**に最初に現れたUser/Textの本文（一覧のタイトル用）。解決後の先頭は
+    /// 圧縮の要約になり得るので、そちらをタイトルにすると`[compacted summary of …]`が並ぶ。
+    first_user_text: Option<String>,
 }
 
 impl SessionStore {
@@ -124,26 +176,22 @@ impl SessionStore {
             }
             let modified = entry.metadata()?.modified()?;
             let store = Self { path: path.clone() };
-            let messages = store.load_messages().unwrap_or_default();
-            if messages.is_empty() {
+            let loaded = store.read().unwrap_or_default();
+            if loaded.messages.is_empty() {
                 continue;
             }
-            let first_prompt = messages
-                .iter()
-                .find(|m| m.role == harness_core::Role::User)
-                .and_then(|m| {
-                    m.content.iter().find_map(|b| match b {
-                        harness_core::ContentBlock::Text(t) => Some(t.clone()),
-                        _ => None,
-                    })
-                })
+            // タイトルは**生の`Message`行**の最初のプロンプト。解決後の先頭を使うと、圧縮済みの
+            // セッションが揃って`[compacted summary of …]`という題名になり見分けられない。
+            let first_prompt = loaded
+                .first_user_text
                 .map(|t| truncate_chars(&t, 60))
                 .unwrap_or_default();
             out.push(SessionSummary {
                 id: store.id(),
                 path,
                 modified,
-                message_count: messages.len(),
+                // 復元される件数（＝チェックポイント解決後）を出す。
+                message_count: loaded.messages.len(),
                 first_prompt,
             });
         }
@@ -153,39 +201,87 @@ impl SessionStore {
 
     /// `msgs`を1行1メッセージのJSONLとして追記する。
     pub fn append_messages(&self, msgs: &[Message]) -> io::Result<()> {
+        let lines = msgs
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.append_lines(&lines)
+    }
+
+    /// その時点の履歴全体を**チェックポイント**1行として追記する。読み出し時、この行より前の
+    /// 内容はすべて捨てられる。
+    ///
+    /// コンテキスト圧縮が履歴の先頭を畳んだときに呼ぶ。増分追記だけではファイルに畳む前の
+    /// 履歴が残り続け、`--resume`が圧縮前の長い会話へ戻ってしまう。
+    ///
+    /// **空なら何も書かない。** 書くと「発話0件なのに実体があるセッション」ができ、
+    /// [`SessionStore::resume_latest`]は0バイトのファイルだけを飛ばすので`--continue`が
+    /// それを選んでしまう（[BUG-073](../../../docs/bugs/BUG-073.md)の不変条件）。
+    pub fn append_checkpoint(&self, msgs: &[Message]) -> io::Result<()> {
         if msgs.is_empty() {
+            return Ok(());
+        }
+        let line = serde_json::to_string(&CheckpointRef {
+            kind: CheckpointKind::Checkpoint,
+            messages: msgs,
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.append_lines(&[line])
+    }
+
+    /// 1回のopenで複数行を追記する。ファイルの遅延生成（BUG-073）もここに集約する。
+    fn append_lines(&self, lines: &[String]) -> io::Result<()> {
+        if lines.is_empty() {
             return Ok(());
         }
         let mut file = OpenOptions::new()
             .append(true)
             .create(true)
             .open(&self.path)?;
-        for m in msgs {
-            let line = serde_json::to_string(m)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        for line in lines {
             writeln!(file, "{line}")?;
         }
         Ok(())
     }
 
     /// 保存済みの全メッセージを順番通りに読み出す（`--resume`/`--continue`の会話復元用）。
+    /// チェックポイント行があれば、そこまでの内容は捨てて畳み直す。
     pub fn load_messages(&self) -> io::Result<Vec<Message>> {
+        Ok(self.read()?.messages)
+    }
+
+    /// ファイルを1パスで解釈する。[`load_messages`](SessionStore::load_messages)と
+    /// [`list`](SessionStore::list)が共有する唯一の読み出し口。
+    fn read(&self) -> io::Result<Loaded> {
         if !self.path.exists() {
-            return Ok(Vec::new());
+            return Ok(Loaded::default());
         }
         let file = File::open(&self.path)?;
         let reader = io::BufReader::new(file);
-        let mut out = Vec::new();
+        let mut loaded = Loaded::default();
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let msg: Message = serde_json::from_str(&line)
+            let record: Line = serde_json::from_str(&line)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            out.push(msg);
+            match record {
+                Line::Message(msg) => {
+                    if loaded.first_user_text.is_none() && msg.role == Role::User {
+                        loaded.first_user_text = msg.content.iter().find_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.clone()),
+                            _ => None,
+                        });
+                    }
+                    loaded.messages.push(msg);
+                }
+                // **それまでの蓄積を丸ごと置き換える**（これがチェックポイントの意味）。
+                Line::Checkpoint(cp) => loaded.messages = cp.messages,
+            }
         }
-        Ok(out)
+        Ok(loaded)
     }
 }
 
@@ -359,5 +455,86 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
         assert!(SessionStore::list(&missing).unwrap().is_empty());
+    }
+
+    // --- コンテキスト圧縮のチェックポイント（`--resume`が圧縮後から始まる） ---
+
+    #[test]
+    fn a_checkpoint_replaces_everything_written_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create_new(dir.path()).unwrap();
+        store
+            .append_messages(&[msg("t1"), msg("r1"), msg("t2"), msg("r2")])
+            .unwrap();
+
+        // 圧縮: 先頭3件を要約1件へ畳んだ状態を書く。
+        store
+            .append_checkpoint(&[msg("[compacted summary of 3 earlier messages]"), msg("r2")])
+            .unwrap();
+        // その後の発話は従来どおり増分で積む。
+        store.append_messages(&[msg("t3")]).unwrap();
+
+        assert_eq!(
+            store.load_messages().unwrap(),
+            vec![
+                msg("[compacted summary of 3 earlier messages]"),
+                msg("r2"),
+                msg("t3")
+            ]
+        );
+    }
+
+    /// 2回目の圧縮でも壊れない（後から書いたチェックポイントが勝つ）。
+    #[test]
+    fn the_last_checkpoint_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create_new(dir.path()).unwrap();
+        store.append_messages(&[msg("t1")]).unwrap();
+        store.append_checkpoint(&[msg("first fold")]).unwrap();
+        store.append_messages(&[msg("t2")]).unwrap();
+        store.append_checkpoint(&[msg("second fold")]).unwrap();
+
+        assert_eq!(store.load_messages().unwrap(), vec![msg("second fold")]);
+    }
+
+    /// 一覧のタイトルは**生の行の最初のプロンプト**。解決後の先頭を使うと、圧縮済みの
+    /// セッションが揃って`[compacted summary of …]`という題名になり見分けられない。
+    #[test]
+    fn a_checkpoint_does_not_become_the_session_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create_new(dir.path()).unwrap();
+        store
+            .append_messages(&[msg("original first prompt"), msg("r1"), msg("t2")])
+            .unwrap();
+        store
+            .append_checkpoint(&[msg("[compacted summary of 2 earlier messages]"), msg("t2")])
+            .unwrap();
+
+        let summaries = SessionStore::list(dir.path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].first_prompt, "original first prompt");
+        assert_eq!(summaries[0].message_count, 2, "復元される件数を出す");
+    }
+
+    /// BUG-073の不変条件: 発話0件のセッションはディスク上に存在してはいけない。
+    #[test]
+    fn an_empty_checkpoint_never_creates_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create_new(dir.path()).unwrap();
+        store.append_checkpoint(&[]).unwrap();
+        assert!(!store.path().exists());
+        assert!(SessionStore::resume_latest(dir.path()).unwrap().is_none());
+    }
+
+    /// `/fork`は「解決後の履歴」を引き継ぐ（圧縮された状態から分岐する）。
+    #[test]
+    fn fork_after_a_checkpoint_copies_the_compacted_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = SessionStore::create_new(dir.path()).unwrap();
+        source.append_messages(&[msg("t1"), msg("r1")]).unwrap();
+        source.append_checkpoint(&[msg("folded")]).unwrap();
+
+        let forked = SessionStore::fork_from(dir.path(), source.path()).unwrap();
+        assert_eq!(forked.load_messages().unwrap(), vec![msg("folded")]);
     }
 }

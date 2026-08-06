@@ -1381,6 +1381,128 @@ fn a_busy_that_never_ran_does_not_claim_a_duration() {
     );
 }
 
+// --- BUG-078: engineが自分の判断で始めた縮約にも進捗を出す ---
+
+/// **コマンドを送っていなくても**進捗表示が出る。予防的縮約の②要約は`TurnStarted`より前に
+/// 走るので、これが無いと「LMStudioは推論中なのに画面は無反応・トークンは0」になる。
+#[test]
+fn an_engine_initiated_compaction_shows_progress_without_a_command() {
+    let mut app = AppState::new("p".into(), "m".into());
+    assert!(!app.is_busy());
+
+    app.apply(AgentEvent::ContextCompactionStarted);
+
+    let busy = app.busy_progress.as_ref().expect("表示が出ていること");
+    assert!(busy.is_running(), "キューを経ていないので最初から実行中");
+    assert!(app.transcript.is_empty(), "進行中はtranscriptへ積まない");
+}
+
+/// 要約が0件で`ContextCompacted`が出なかった場合でも、`TurnStarted`で必ず畳む
+/// （畳まないとターン中ずっとスピナーが2本並ぶ）。記録行はターン境界の目印より**前**に置く。
+#[test]
+fn a_turn_start_closes_a_running_compaction_progress() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.apply(AgentEvent::ContextCompactionStarted);
+
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 1_234,
+    });
+
+    assert!(!app.is_busy(), "ターンが始まったら縮約の表示は畳む");
+    assert_eq!(app.transcript.len(), 1, "{:?}", app.transcript);
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l) if l.contains("Compacting context")),
+        "{:?}",
+        app.transcript[0]
+    );
+    assert_eq!(
+        app.turn_transcript_mark, 1,
+        "記録行はターン境界の目印より前（この行が巻き戻しで消えてはいけない）"
+    );
+}
+
+/// キューで待っている`/compact`を、**先行するターンの**縮約完了通知で畳まない（BUG-071の規則を
+/// `ContextCompacted`にも適用する）。畳むと要約が始まる前に表示が消える。
+#[test]
+fn a_queued_command_is_not_closed_by_a_compaction_from_the_running_turn() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.begin_busy("Compacting context");
+
+    app.apply(AgentEvent::ContextCompacted {
+        removed_messages: 8,
+    });
+
+    let busy = app.busy_progress.as_ref().expect("キュー待ちの表示は残る");
+    assert!(!busy.is_running());
+    assert_eq!(app.transcript.len(), 1, "結果行だけが積まれる");
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l) if l.contains("context compacted")),
+        "{:?}",
+        app.transcript[0]
+    );
+}
+
+// --- BUG-079: 本文に書かれたツール呼び出し ---
+
+/// 再送するときは、画面に出てしまった本文をこの試行の開始位置まで**巻き戻す**
+/// （残すと次の試行の本文と連結して読めてしまう）。記録行はターン境界の目印より前に置く。
+#[test]
+fn a_retried_text_tool_call_rewinds_the_attempt_and_leaves_a_record() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 10,
+    });
+    app.apply(AgentEvent::TextDelta {
+        text: "説明します。<tool_call><function=write_file>".into(),
+    });
+    assert!(!app.transcript.is_empty(), "本文が画面に出ている");
+
+    app.apply(AgentEvent::ToolCallWrittenAsText {
+        marker: "<tool_call>".into(),
+        discarded_bytes: 42,
+        retrying: true,
+    });
+
+    assert_eq!(app.transcript.len(), 1, "{:?}", app.transcript);
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l)
+            if l.contains("本文に書かれていたため実行されなかった") && l.contains("<tool_call>")),
+        "{:?}",
+        app.transcript[0]
+    );
+    assert_eq!(
+        app.turn_transcript_mark, 1,
+        "記録行は次の試行の巻き戻しで消えてはいけない"
+    );
+}
+
+/// 再送を使い切って**本文を答えとして採用する**ときは巻き戻さない（答えを失わない）。
+#[test]
+fn an_accepted_text_tool_call_keeps_the_body() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 10,
+    });
+    app.apply(AgentEvent::TextDelta {
+        text: "ツール呼び出しはこう書きます: <tool_call>".into(),
+    });
+    let before = app.transcript.len();
+
+    app.apply(AgentEvent::ToolCallWrittenAsText {
+        marker: "<tool_call>".into(),
+        discarded_bytes: 42,
+        retrying: false,
+    });
+
+    assert_eq!(app.transcript.len(), before + 1, "本文を消さず1行足すだけ");
+    assert!(
+        matches!(&app.transcript[before], TranscriptItem::Info(l)
+            if l.contains("実行していない") && l.contains("そのまま採用")),
+        "{:?}",
+        app.transcript[before]
+    );
+}
+
 // --- BUG-072: 会話が入れ替わったら画面も入れ替える ---
 
 /// `clear_transcript`は表示だけでなくスクロール位置・ターン境界の目印も初期化する

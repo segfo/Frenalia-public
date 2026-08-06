@@ -28,6 +28,7 @@
 //! 縮退で捨てた回の`TurnDiscarded`だけ。
 
 mod stream;
+mod text_tool_call;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -281,14 +282,21 @@ impl<'a> TurnExecutor<'a> {
         // 現在の段。`None`は「素の1回目」（梯子はまだ登っていない）。
         let mut rung: Option<ladder::Rung> = None;
         let mut retries = 0u32;
+        // BUG-079: 本文へツール呼び出しを書いたので通知付きで再送する、という状態。
+        // **1ターンにつき1回だけ**——2回目も同じなら、それは説明としてそう書いているのだと見て
+        // 本文をそのまま受け入れる（誤検出で答えを失わないため）。
+        let mut text_tool_call_retried = false;
 
         loop {
             let mut req = base_req.clone();
             if let Some(r) = rung {
                 ladder::apply(&mut req, r, retries);
-                if self.is_tier3() {
-                    sanitize::completion_request(&mut req);
-                }
+            }
+            if text_tool_call_retried {
+                ladder::append_notice(&mut req, text_tool_call::NOTICE);
+            }
+            if (rung.is_some() || text_tool_call_retried) && self.is_tier3() {
+                sanitize::completion_request(&mut req);
             }
 
             let mut watch = self
@@ -314,6 +322,26 @@ impl<'a> TurnExecutor<'a> {
                     stop_reason,
                     usage,
                 } => {
+                    // BUG-079: ツール呼び出しが本文テキストとして出ていたら、この試行は捨てて
+                    // 通知付きで1回だけ再送する。**本文からツール名も引数も取らない**——
+                    // ここで使うのは「やり直させるか」の真偽値だけ（`text_tool_call`のdoc）。
+                    if let Some(marker) = text_tool_call::detect(&content) {
+                        let retrying = !text_tool_call_retried;
+                        self.report_text_tool_call(
+                            on_text_delta,
+                            marker,
+                            emitted_bytes,
+                            retrying,
+                            visible,
+                            &req,
+                        );
+                        if retrying {
+                            // 捨てた試行は母集団へ入れない（使えなかったコールなので）。
+                            // `TurnExecutor`は会話履歴を持たないため、履歴は汚れていない。
+                            text_tool_call_retried = true;
+                            continue;
+                        }
+                    }
                     // 縮退しなかったコールだけが母集団へ入る（§11.2の自己敗北的フィードバック回避）。
                     if let Some(w) = watch {
                         w.record_clean();
@@ -398,6 +426,44 @@ impl<'a> TurnExecutor<'a> {
             },
         );
         self.emit_marker(on_text_delta, hit.kind.as_str(), emitted_bytes, visible);
+    }
+
+    /// 本文へ書かれたツール呼び出しを、イベント・text区切りマーカー・wire logの3経路へ出す
+    /// （[`TurnExecutor::report_discard`]と同じ理由で3つとも無条件に出す）。
+    ///
+    /// `retrying`が`false`なら**本文は捨てない**ので区切りマーカーも出さない——下流に
+    /// 切り詰めさせると、そのまま答えとして採用するテキストが消える。
+    fn report_text_tool_call<F>(
+        &self,
+        on_text_delta: &mut F,
+        marker: &str,
+        emitted_bytes: u64,
+        retrying: bool,
+        visible: bool,
+        req: &CompletionRequest,
+    ) where
+        F: FnMut(&str),
+    {
+        harness_core::wire_log::record(|| {
+            serde_json::json!({
+                "kind": "tool_call_written_as_text",
+                "marker": marker,
+                "retrying": retrying,
+                "model": req.model,
+                "discarded_bytes": emitted_bytes,
+            })
+        });
+        emit(
+            self.events,
+            AgentEvent::ToolCallWrittenAsText {
+                marker: marker.to_string(),
+                discarded_bytes: emitted_bytes,
+                retrying,
+            },
+        );
+        if retrying {
+            self.emit_marker(on_text_delta, "tool_call_written_as_text", emitted_bytes, visible);
+        }
     }
 
     /// text形式の区切りマーカーを流す。**`Internal`のターンでは出さない**——そもそも本文を

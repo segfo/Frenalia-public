@@ -27,7 +27,7 @@ pub async fn run() -> ExitCode {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let configured = match stage_configure(parsed) {
+    let configured = match stage_configure(parsed).await {
         Ok(c) => c,
         Err(code) => return code,
     };

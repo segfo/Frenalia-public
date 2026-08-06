@@ -108,6 +108,12 @@ pub struct ConversationState {
     /// 位置を圧縮後の添字へ読み替えられる（[`ConversationState::mark`]／
     /// [`ConversationState::since`]、[BUG-075](../../../docs/bugs/BUG-075.md)）。
     prefix_shift: usize,
+    /// 先頭を畳んだ回数。`prefix_shift`では代用できない——`removed == 1`の畳みでは
+    /// `prefix_shift`が増えないので「畳まれたか」の判定にならない。
+    ///
+    /// 用途は[`ConversationState::folded_since`]（セッションJSONLへ増分を追記するか
+    /// チェックポイントを書くかの判定）。
+    folds: usize,
 }
 
 /// ターン開始時の位置を控える栞（[BUG-075](../../../docs/bugs/BUG-075.md)）。
@@ -118,6 +124,7 @@ pub struct ConversationState {
 pub struct TurnMark {
     len: usize,
     shift: usize,
+    folds: usize,
 }
 
 impl ConversationState {
@@ -126,6 +133,7 @@ impl ConversationState {
             system,
             messages: Vec::new(),
             prefix_shift: 0,
+            folds: 0,
         }
     }
 
@@ -141,6 +149,7 @@ impl ConversationState {
         TurnMark {
             len: self.messages.len(),
             shift: self.prefix_shift,
+            folds: self.folds,
         }
     }
 
@@ -152,10 +161,20 @@ impl ConversationState {
         &self.messages[start..]
     }
 
+    /// `mark`以降に履歴の先頭が畳まれたか。
+    ///
+    /// `true`なら、セッションJSONLへ**増分だけ追記しても足りない**（ファイルには畳む前の
+    /// 履歴が残り続け、`--resume`が圧縮前へ戻ってしまう）。呼び出し側は
+    /// [`SessionStore::append_checkpoint`]でその時点の履歴全体を書く。
+    pub fn folded_since(&self, mark: TurnMark) -> bool {
+        self.folds > mark.folds
+    }
+
     /// 圧縮が`removed`件を要約1件へ置き換えたことを記録する。呼ぶのは
     /// [`compaction::compact`]だけ（履歴の先頭を畳む唯一の場所）。
     pub(crate) fn note_prefix_folded(&mut self, removed: usize) {
         self.prefix_shift += removed.saturating_sub(1);
+        self.folds += 1;
     }
 }
 
@@ -548,12 +567,14 @@ struct Relief {
     summarized: bool,
 }
 
-/// 予防的縮約。**安い順に①→②**（`plans/PLAN-COMPACTION.md`「縮約の順序」）。
+/// 予防的縮約。**安い順に①→②→③**（`plans/PLAN-COMPACTION.md`「縮約の順序」）。
 ///
 /// 目標に届かなくてもエラーにはしない——推定は外れ得るので、推定だけを根拠に送信を止めない
 /// （外れていればリアクティブ経路が受け止める）。
 ///
-/// `already_summarized`が`true`なら②を飛ばして①だけ行う（振動防止）。
+/// `already_summarized`が`true`なら②を飛ばす（振動防止）。**③は飛ばさない**——③が畳むのは
+/// 「このターンで新しく積まれたツール出力」であり、②と違って毎回新しい材料がある
+/// （材料が無ければ`digest_tool_results`自身が何もせず返る）。
 async fn relieve_pressure(
     provider: &dyn LlmProvider,
     state: &mut ConversationState,
@@ -565,6 +586,9 @@ async fn relieve_pressure(
 ) -> Result<Relief, ProviderError> {
     let target = pressure.target_savings();
     let mut relieved = false;
+    // ①②が削れたトークン概算の累計。次の段へ進むかの判断に使う（③はLLMコールを打つので、
+    // 既に目標へ届いているなら打たない）。
+    let mut saved = 0_u64;
 
     // ① tool_resultの選択的切詰め。LLMコール0・ブロック対応を壊さない・prompt cacheも壊さない。
     // 直近1ターンは保護する（モデルがまさに参照中の出力なので削らない）。
@@ -573,7 +597,7 @@ async fn relieve_pressure(
         &mut state.messages,
         protect_from,
         target,
-        compaction::shrink::PREVENTIVE_FLOOR_CHARS,
+        compaction::shrink::SHALLOW_FLOOR_CHARS,
     );
     if !out.is_noop() {
         relieved = true;
@@ -585,33 +609,145 @@ async fn relieve_pressure(
             },
         );
     }
-    if out.saved_tokens >= target || already_summarized {
+    saved += out.saved_tokens;
+    if saved >= target {
         return Ok(Relief {
             relieved,
             summarized: false,
         });
     }
 
-    // ② ローリング要約。不可逆でprompt cacheを全ミスさせるので①で足りなければ初めて使う。
+    let chunk_tokens = compaction::summarize::chunk_tokens_for(config.compaction.context_window);
+    let mut summarized = false;
+
+    // ②と③はそれぞれ**片方の領域しか**畳めない——②は「いまのターンより前」、③は「いまのターン」。
+    // どちらもLLMコールなので、**大きい山から先に崩す**（順番を固定すると、嵩張っていない側を
+    // 畳むために数分待ってから本題へ進む形になる。実測: 先頭が小さいのに②で390秒、そのあと
+    // ③で232秒。`docs/bugs/BUG-080.md`）。
+    let turn_start = compaction::protect_boundary(&state.messages, 1).unwrap_or(0);
+    let prefix_tokens = estimate_messages(&state.messages[..turn_start.min(state.messages.len())]);
+    let in_turn_tokens = estimate_messages(&state.messages[turn_start.min(state.messages.len())..]);
+
+    macro_rules! run_step {
+        ($step:expr) => {{
+            let step = $step.await?;
+            if step.cancelled {
+                return Ok(Relief {
+                    relieved,
+                    summarized,
+                });
+            }
+            relieved |= step.relieved;
+            summarized |= step.summarized;
+            saved += step.saved;
+        }};
+    }
+
+    let summary_worth_it =
+        !already_summarized && summary_is_worth_it(prefix_tokens, in_turn_tokens);
+
+    if in_turn_tokens > prefix_tokens {
+        run_step!(in_turn_digest(
+            provider, state, config, events, chunk_tokens, cancel
+        ));
+        if saved < target && summary_worth_it {
+            run_step!(rolling_summary(
+                provider, state, config, events, chunk_tokens, cancel
+            ));
+        }
+    } else {
+        if summary_worth_it {
+            run_step!(rolling_summary(
+                provider, state, config, events, chunk_tokens, cancel
+            ));
+        }
+        if saved < target {
+            run_step!(in_turn_digest(
+                provider, state, config, events, chunk_tokens, cancel
+            ));
+        }
+    }
+
+    // どこに嵩張っていて、どの段がどれだけ削ったのかを1行で残す。この情報が無いと
+    // 「390秒かけた要約は何を削ったのか」を後から説明できない（BUG-080の調査がまさにそれ）。
+    harness_core::wire_log::record(|| {
+        serde_json::json!({
+            "kind": "context_relief",
+            "target_savings": target,
+            "saved_estimate": saved,
+            "prefix_tokens": prefix_tokens,
+            "in_turn_tokens": in_turn_tokens,
+            "summarized": summarized,
+            "relieved": relieved,
+        })
+    });
+
+    Ok(Relief {
+        relieved,
+        summarized,
+    })
+}
+
+/// [`relieve_pressure`]の1段ぶんの結果。
+struct Step {
+    relieved: bool,
+    summarized: bool,
+    saved: u64,
+    /// キャンセルされた。履歴は無傷（各段がそう作られている）。
+    cancelled: bool,
+}
+
+/// ②を打つ価値があるか。**嵩張っている場所と比べる**。
+///
+/// ②のコストは畳む量に比例する（チャンクごとに1コール、実測390秒）。いまのターンの中に
+/// 先頭の3倍を超える量が積まれているなら、②はそもそも触れない領域が主役なので打たない
+/// ——そこは③の担当である（[BUG-080](../../../docs/bugs/BUG-080.md)）。
+///
+/// **削減目標（`target_savings`）と比べてはいけない。** あれは未計測分に安全係数2倍を掛けた
+/// 悲観値で、ターンの1周目は特に大きく出る。目標と比べると「②はいつも割に合わない」という
+/// 判定になり、履歴が伸び続ける。`already_summarized`（1周回に高々1回）とは別の判断。
+fn summary_is_worth_it(prefix_tokens: u64, in_turn_tokens: u64) -> bool {
+    prefix_tokens.saturating_mul(3) >= in_turn_tokens
+}
+
+/// ② ローリング要約。不可逆でprompt cacheを全ミスさせるので、安い段で足りないときだけ使う。
+async fn rolling_summary(
+    provider: &dyn LlmProvider,
+    state: &mut ConversationState,
+    config: &AgentLoopConfig,
+    events: Option<&EventSink>,
+    chunk_tokens: u64,
+    cancel: Option<&CancellationToken>,
+) -> Result<Step, ProviderError> {
+    // BUG-078: この経路は`TurnStarted`より**前**に走るので、開始を知らせないとフロントエンドは
+    // 進捗を出す手がかりを持たない。要約は履歴が大きいほど長い（チャンクごとに1コール）ため、
+    // 黙っていると「推論は進んでいるのに画面は無反応」という一番悪い形になる。
+    // ただし**畳むものが無ければ`compact`はproviderを呼ばない**ので、そのときは黙る。
+    if compaction::summarize::foldable_cut(&state.messages, compaction::DEFAULT_KEEP_RECENT_TURNS)
+        .is_some()
+    {
+        emit(events, AgentEvent::ContextCompactionStarted);
+    }
+    let before = estimate_messages(&state.messages);
     let outcome = compaction::compact(
         provider,
         state,
         &config.model,
         compaction::DEFAULT_KEEP_RECENT_TURNS,
-        compaction::summarize::chunk_tokens_for(config.compaction.context_window),
+        chunk_tokens,
         cancel,
     )
     .await?;
-    // BUG-074: キャンセルなら履歴は無傷。①の切詰めは済んでいるのでそれだけ報告して返り、
-    // ターンを畳むかどうかは呼び出し元（`run_agent_loop`）が`cancel`を見て決める。
+    // BUG-074: キャンセルなら履歴は無傷。呼び出し元が`cancel`を見てターンを畳む。
     let Some(removed) = outcome.removed() else {
-        return Ok(Relief {
-            relieved,
+        return Ok(Step {
+            relieved: false,
             summarized: false,
+            saved: 0,
+            cancelled: true,
         });
     };
     if removed > 0 {
-        relieved = true;
         emit(
             events,
             AgentEvent::ContextCompacted {
@@ -619,9 +755,50 @@ async fn relieve_pressure(
             },
         );
     }
-    Ok(Relief {
-        relieved,
+    Ok(Step {
+        relieved: removed > 0,
         summarized: true,
+        saved: before.saturating_sub(estimate_messages(&state.messages)),
+        cancelled: false,
+    })
+}
+
+/// ③ ターン内digest。①の保護境界と②のカット位置はどちらもターン境界なので、**このターンの
+/// 中で積み上がったツール出力にはここしか届かない**（`compaction::digest`のモジュールdoc）。
+async fn in_turn_digest(
+    provider: &dyn LlmProvider,
+    state: &mut ConversationState,
+    config: &AgentLoopConfig,
+    events: Option<&EventSink>,
+    chunk_tokens: u64,
+    cancel: Option<&CancellationToken>,
+) -> Result<Step, ProviderError> {
+    // 添字は②が先頭を畳んでいれば変わっているので、境界はここで**取り直す**。
+    let turn_start = compaction::protect_boundary(&state.messages, 1).unwrap_or(0);
+    let digested = compaction::digest_tool_results(
+        provider,
+        state,
+        &config.model,
+        turn_start,
+        chunk_tokens,
+        events,
+        cancel,
+    )
+    .await?;
+    if !digested.is_noop() {
+        emit(
+            events,
+            AgentEvent::ToolResultsDigested {
+                digested_blocks: digested.digested_blocks,
+                saved_tokens: digested.saved_tokens,
+            },
+        );
+    }
+    Ok(Step {
+        relieved: !digested.is_noop(),
+        summarized: false,
+        saved: digested.saved_tokens,
+        cancelled: digested.cancelled,
     })
 }
 

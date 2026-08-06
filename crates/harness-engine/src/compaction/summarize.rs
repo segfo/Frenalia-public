@@ -22,6 +22,13 @@ the work. Output only the summary text.";
 /// 1チャンクが1ターンすら入らないほど細切れになるのを防ぐ。
 pub const MIN_CHUNK_TOKENS: u64 = 1_024;
 
+/// 畳んだ要約メッセージの先頭。**書く側と「これは過去の要約か」を見る側が共有する唯一の目印**
+/// （[`compact`]の空振り判定と、その回帰テスト）。
+///
+/// 状態フラグではなく本文の目印にしてあるのは、`--resume`で復元した履歴でも効かせるため
+/// （チェックポイントから復元した`ConversationState`は`folds`が0で、フラグでは判定できない）。
+pub const FOLD_SUMMARY_PREFIX: &str = "[compacted summary of ";
+
 /// 要約コールの分割予算を`context_window`から決める。
 ///
 /// 1/4にするのは、チャンク本体に加えて「ここまでの要約」「指示文」「出力`max_tokens`」が
@@ -39,7 +46,9 @@ pub fn chunk_tokens_for(context_window: u32) -> u64 {
 /// 送らないため「無改変で往復」の対象外）。
 ///
 /// 圧縮対象が無ければ（ターン境界が`keep_recent_turns`件以下）何もせず
-/// `Ok(Compacted::Summarized { removed: 0 })`を返す。
+/// `Ok(Compacted::Summarized { removed: 0 })`を返す。**畳む対象が「過去に畳んだ要約1件」だけの
+/// ときも同じ**——要約を要約し直すLLMコールは情報を痩せさせるだけで何も足さない
+/// （`/compact`を続けて2回押したときに起きる）。
 ///
 /// # チャンク分割
 ///
@@ -69,12 +78,9 @@ pub async fn compact(
     chunk_tokens: u64,
     cancel: Option<&CancellationToken>,
 ) -> Result<Compacted, ProviderError> {
-    let Some(cut) = super::protect_boundary(&state.messages, keep_recent_turns) else {
+    let Some(cut) = foldable_cut(&state.messages, keep_recent_turns) else {
         return Ok(Compacted::Summarized { removed: 0 });
     };
-    if cut == 0 {
-        return Ok(Compacted::Summarized { removed: 0 });
-    }
 
     let head = state.messages[..cut].to_vec();
     let mut summary = String::new();
@@ -111,7 +117,7 @@ pub async fn compact(
     let mut new_messages = vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text(format!(
-            "[compacted summary of {removed} earlier messages]\n{summary}"
+            "{FOLD_SUMMARY_PREFIX}{removed} earlier messages]\n{summary}"
         ))],
     }];
     new_messages.extend(state.messages.drain(cut..));
@@ -145,6 +151,36 @@ impl Compacted {
             Compacted::Summarized { removed } => Some(removed),
             Compacted::Cancelled => None,
         }
+    }
+}
+
+/// 畳めるカット位置。`None`なら[`compact`]は**providerを1本も呼ばずに**0件で返る。
+///
+/// [`compact`]の早期returnの条件そのものを外へ出したもの。呼び出し側が
+/// 「[`AgentEvent::ContextCompactionStarted`](harness_core::AgentEvent::ContextCompactionStarted)を
+/// 出すか」を決めるのに使う——**何もしない縮約を「始まった」と報告しない**ため
+/// （[BUG-078](../../../../docs/bugs/BUG-078.md)）。判定を2箇所に書き写すと必ず食い違うので、
+/// 条件はこの関数だけが持つ。
+pub fn foldable_cut(messages: &[Message], keep_recent_turns: usize) -> Option<usize> {
+    let cut = super::protect_boundary(messages, keep_recent_turns)?;
+    if cut == 0 || is_only_a_previous_summary(&messages[..cut]) {
+        return None;
+    }
+    Some(cut)
+}
+
+/// カット対象が「過去に畳んだ要約1件」だけか（[`FOLD_SUMMARY_PREFIX`]で見る）。
+///
+/// `/compact`を続けて2回押すと、2回目のカット対象は1回目の要約1件だけになる。そのまま進むと
+/// **要約を要約し直すLLMコールが1本走り、情報だけ痩せて`removed: 1`と報告される**
+/// （[BUG-077](../../../../docs/bugs/BUG-077.md)）。ここで止める。
+fn is_only_a_previous_summary(head: &[Message]) -> bool {
+    match head {
+        [only] => {
+            only.role == Role::User
+                && matches!(&only.content[..], [ContentBlock::Text(t)] if t.starts_with(FOLD_SUMMARY_PREFIX))
+        }
+        _ => false,
     }
 }
 
@@ -259,111 +295,8 @@ async fn summarize_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::test_support::{assistant_text, summary_turn, user_turn, MockProvider};
     use crate::ConversationState;
-    use harness_core::{BlockKind, StopReason, Usage};
-    use std::sync::Mutex;
-
-    /// `fail_from`回目以降の呼び出しを`Overloaded`で失敗させられるスクリプトプロバイダ。
-    /// 部分要約フォールバックの検証に使う。
-    struct MockProvider {
-        turns: Mutex<Vec<Vec<StreamEvent>>>,
-        calls: std::sync::atomic::AtomicUsize,
-        fail_from: Option<usize>,
-        /// `n`回目のコールを処理する時点でこのトークンを発火させる（Escを押した瞬間の再現）。
-        cancel_at: Option<(CancellationToken, usize)>,
-    }
-
-    impl MockProvider {
-        fn new(turns: Vec<Vec<StreamEvent>>) -> Self {
-            Self {
-                turns: Mutex::new(turns),
-                calls: std::sync::atomic::AtomicUsize::new(0),
-                fail_from: None,
-                cancel_at: None,
-            }
-        }
-
-        fn failing_from(turns: Vec<Vec<StreamEvent>>, fail_from: usize) -> Self {
-            Self {
-                fail_from: Some(fail_from),
-                ..Self::new(turns)
-            }
-        }
-
-        fn cancelling_at(
-            turns: Vec<Vec<StreamEvent>>,
-            token: CancellationToken,
-            call: usize,
-        ) -> Self {
-            Self {
-                cancel_at: Some((token, call)),
-                ..Self::new(turns)
-            }
-        }
-
-        fn calls_made(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl LlmProvider for MockProvider {
-        fn id(&self) -> &str {
-            "mock"
-        }
-        async fn stream(
-            &self,
-            _req: CompletionRequest,
-        ) -> Result<
-            futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>,
-            ProviderError,
-        > {
-            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some((token, at)) = &self.cancel_at {
-                if n == *at {
-                    token.cancel();
-                }
-            }
-            if self.fail_from.is_some_and(|f| n >= f) {
-                return Err(ProviderError::Overloaded);
-            }
-            let mut turns = self.turns.lock().unwrap();
-            let events = turns.remove(0);
-            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
-        }
-    }
-
-    fn summary_turn(text: &str) -> Vec<StreamEvent> {
-        vec![
-            StreamEvent::BlockStart {
-                index: 0,
-                kind: BlockKind::Text,
-            },
-            StreamEvent::TextDelta {
-                index: 0,
-                text: text.to_string(),
-            },
-            StreamEvent::BlockStop { index: 0 },
-            StreamEvent::Done {
-                stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
-            },
-        ]
-    }
-
-    fn user_turn(text: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text(text.to_string())],
-        }
-    }
-
-    fn assistant_text(text: &str) -> Message {
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text(text.to_string())],
-        }
-    }
 
     #[tokio::test]
     async fn compacts_old_turns_and_keeps_recent_verbatim() {

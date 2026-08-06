@@ -31,7 +31,7 @@ pub(super) struct Configured {
 
 /// `settings.json`読込・`early_require_sandbox`とconfidentialの矛盾チェック・provider構築・
 /// model解決・`ToolRegistry`・allowlist・`PermissionArbiter`。
-pub(super) fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode> {
+pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode> {
     let ParsedArgs {
         cli,
         workspace_root,
@@ -130,15 +130,34 @@ pub(super) fn stage_configure(parsed: ParsedArgs) -> Result<Configured, ExitCode
         .or(settings.enter_submits)
         .unwrap_or(false);
 
-    // コンテキスト縮約のポリシー（`plans/PLAN-COMPACTION.md`）。CLIフラグ→`settings.json`→
-    // プロバイダcapabilityの順で解決する。**比率が逆転していれば黙って直さず起動時に止める**
-    // ——`target >= trigger`だと縮約しても閾値を下回らず、毎ターン要約コールを打ち続ける。
+    // コンテキスト縮約のポリシー（`plans/PLAN-COMPACTION.md`）。分母はCLIフラグ→`settings.json`
+    // →**推論サーバへの問い合わせ**→プロバイダcapabilityの順で解決する。
+    // **比率が逆転していれば黙って直さず起動時に止める**——`target >= trigger`だと縮約しても
+    // 閾値を下回らず、毎ターン要約コールを打ち続ける。
+    let explicit_window = cli
+        .context_window
+        .or(settings.compaction.as_ref().and_then(|c| c.context_window));
+    // 明示指定が無いときだけ問い合わせる（ユーザーが書いた値を検出値で上書きしない）。
+    // LM Studioの実`n_ctx`はロード設定依存で、capabilityの128,000とは無関係な値になる
+    // ——分母が実態と外れていると使用率トリガそのものが意味を持たない。
+    let context_window = match explicit_window {
+        Some(n) => Some(n),
+        None => {
+            let detected = provider.detect_context_window(&model).await;
+            // 検出できたら**必ず出す**。分母は発火点を決める値なので、黙って決めない。
+            if let Some(n) = detected {
+                eprintln!(
+                    "detected context window: {n} tokens (from the inference server; \
+                     override with --context-window or compaction.context_window)"
+                );
+            }
+            detected
+        }
+    };
     let compaction = match harness_engine::compaction::CompactionPolicy::resolve(
         &provider.capabilities(),
         harness_engine::compaction::CompactionOverrides {
-            context_window: cli
-                .context_window
-                .or(settings.compaction.as_ref().and_then(|c| c.context_window)),
+            context_window,
             trigger_ratio: settings.compaction.as_ref().and_then(|c| c.trigger_ratio),
             target_ratio: settings.compaction.as_ref().and_then(|c| c.target_ratio),
         },

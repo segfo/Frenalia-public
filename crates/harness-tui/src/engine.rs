@@ -146,7 +146,13 @@ pub fn spawn_engine(
                         |_delta: &str| {},
                     )
                     .await;
-                    let _ = session.append_messages(state.since(before_turn));
+                    // 圧縮で履歴の先頭が畳まれたターンは、増分追記では足りない——ファイルには
+                    // 畳む前の履歴が残り続け、`--resume`が圧縮前の長い会話へ戻ってしまう。
+                    let _ = if state.folded_since(before_turn) {
+                        session.append_checkpoint(&state.messages)
+                    } else {
+                        session.append_messages(state.since(before_turn))
+                    };
                     if let Err(e) = result {
                         let _ = events_tx.send(AgentEvent::Error {
                             message: e.to_string(),
@@ -170,11 +176,12 @@ pub fn spawn_engine(
                             // このループ本体が返らないので`command_rx`を1度もpollしない）。
                             // 送信時ではなくここが実際の開始点なので、その時点を通知する。
                             let _ = events_tx.send(AgentEvent::ContextCompactionStarted);
-                            match compaction::compact(
+                            // ②ローリング要約 →①残った側の`tool_result`切詰め。順序と範囲の根拠は
+                            // `harness_engine::compaction::manual`のモジュールdocが正本。
+                            match compaction::compact_now(
                                 provider.as_ref(),
                                 &mut state,
                                 &model,
-                                compaction::DEFAULT_KEEP_RECENT_TURNS,
                                 compaction::summarize::chunk_tokens_for(
                                     compaction.context_window,
                                 ),
@@ -182,16 +189,31 @@ pub fn spawn_engine(
                             )
                             .await
                             {
-                                Ok(outcome) => {
-                                    let _ = events_tx.send(match outcome.removed() {
-                                        Some(removed_messages) => {
-                                            AgentEvent::ContextCompacted { removed_messages }
+                                Ok(outcome) => match outcome.compacted.removed() {
+                                    Some(removed_messages) => {
+                                        let _ = events_tx.send(AgentEvent::ContextCompacted {
+                                            removed_messages,
+                                        });
+                                        // ①が縮めたのはモデルが既に見た出力なので、静かに
+                                        // やらず別イベントで可視化する。
+                                        if !outcome.shrunk.is_noop() {
+                                            let _ = events_tx.send(AgentEvent::ContextShrunk {
+                                                truncated_blocks: outcome.shrunk.blocks,
+                                                saved_tokens: outcome.shrunk.saved_tokens,
+                                            });
                                         }
-                                        // 履歴は無傷のまま。ターンのキャンセルと同じ通知にする
-                                        // （ユーザーから見れば「止めた」という同じ操作の結果）。
-                                        None => AgentEvent::Cancelled,
-                                    });
-                                }
+                                        // 何かが変わったときだけチェックポイントを残す
+                                        // （空振りのたびに履歴全体を書き足さない）。
+                                        if removed_messages > 0 || !outcome.shrunk.is_noop() {
+                                            let _ = session.append_checkpoint(&state.messages);
+                                        }
+                                    }
+                                    // 履歴は無傷のまま。ターンのキャンセルと同じ通知にする
+                                    // （ユーザーから見れば「止めた」という同じ操作の結果）。
+                                    None => {
+                                        let _ = events_tx.send(AgentEvent::Cancelled);
+                                    }
+                                },
                                 Err(e) => {
                                     let _ = events_tx.send(AgentEvent::Error {
                                         message: e.to_string(),

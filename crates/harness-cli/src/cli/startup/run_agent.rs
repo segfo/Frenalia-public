@@ -631,7 +631,13 @@ async fn headless_branch(
         &mut stdout,
     )
     .await;
-    let _ = session.append_messages(state.since(before_run));
+    // 圧縮で履歴の先頭が畳まれた場合は、増分追記では足りない——ファイルには畳む前の履歴が
+    // 残り続け、`--resume`が圧縮前の長い会話へ戻ってしまう。
+    let _ = if state.folded_since(before_run) {
+        session.append_checkpoint(&state.messages)
+    } else {
+        session.append_messages(state.since(before_run))
+    };
 
     #[cfg(windows)]
     if let Some(handle) = vm_sandbox_handle {

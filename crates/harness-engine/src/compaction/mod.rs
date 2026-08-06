@@ -11,10 +11,18 @@
 //!       │ target 到達?
 //!       ▼no
 //! ② summarize::compact（ローリング要約）  … LLMコール要・不可逆・prompt cache全ミス
-//!       │
+//!       │ target 到達?（②は1回の run_agent_loop で高々1回）
+//!       ▼no
+//! ③ digest::digest_tool_results          … LLMコール要。①②が構造的に届かない
+//!       │                                   **いまのターンの中**を畳む唯一の段
 //!       ▼
 //! 送信（target に届かなくてもエラーにしない＝リアクティブ経路が受け止める）
 //! ```
+//!
+//! ③が要る理由: ①の保護境界は「いまの外部ユーザターンの先頭」、②のカット位置は必ずターン境界
+//! なので、**1ターンの中で`read_file`を20回繰り返して積み上がったぶんにはどちらも触れない**。
+//! ③を入れる前の唯一の逃げ場は、リクエストが弾かれた後に走るリアクティブ・フォールバック
+//! （保護なし・下限512字の機械的切詰め）だった。
 //!
 //! ① を先に置く理由は3つある。嵩張っているのがほぼ常に`tool_result`であること。①は
 //! **`tool_use`/`tool_result`のブロック対応を壊さない**（ブロックを消さず中身を短くするだけ）ため
@@ -25,19 +33,37 @@
 //!
 //! `docs/CODE-STRUCTURE-RULES.md` 規則1（1,000行）ではなく**規則3の軸1「どの外部システムと
 //! 話すか」**で割ってある。[`budget`]・[`shrink`]は純粋関数でproviderを知らず、モック無しで
-//! 単体テストできる。providerに触るのは[`summarize`]だけ。
+//! 単体テストできる。providerに触るのは[`summarize`]と、それを手動経路の順序で束ねる[`manual`]。
+//!
+//! # 手動`/compact`は順序が逆（②→①）
+//!
+//! 上の図は自動経路（予防・リアクティブ）のもの。手動`/compact`は②を必ず打つので①を先に試す
+//! 意味が無く、逆順にする理由が3つある（[`manual`]のモジュールdocが正本）。
 
 pub mod budget;
+pub mod digest;
+pub mod manual;
 pub mod shrink;
 pub mod summarize;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use harness_core::{ContentBlock, Message, Role};
 
 pub use budget::{assess, CompactionOverrides, CompactionPolicy, ContextPressure, PolicyError};
+pub use digest::{digest_tool_results, DigestOutcome};
+pub use manual::{compact_now, ManualOutcome};
 pub use shrink::{shrink_largest_tool_results, ShrinkOutcome};
 pub use summarize::{compact, Compacted};
 
-/// `/compact`が特に指定しない場合の既定値: 直近2つの外部ユーザターンは逐語保持する。
+/// 逐語保持する直近の外部ユーザターン数。自動経路（②ローリング要約）と手動`/compact`で
+/// **同じ値を使う**。
+///
+/// 同じ値でも残るものは違う。自動経路は送信済みプロンプトが履歴に居る状態で走るので1枠を
+/// それが占め、`[要約][直前の1往復][現在のプロンプト…]`になる。手動`/compact`の時点では
+/// プロンプトがまだ無いので`[要約][直近2往復]`が残り、次の発話がその後ろに付く。
+/// **したがって「両経路で同じ見た目にする」ためにこの値を経路ごとに変えるのは誤り**——
+/// 片方を1にすると、そちらから直前のやり取りが消える。
 pub const DEFAULT_KEEP_RECENT_TURNS: usize = 2;
 
 /// `messages`中で「外部ユーザプロンプトの開始点」であるインデックス列を返す。

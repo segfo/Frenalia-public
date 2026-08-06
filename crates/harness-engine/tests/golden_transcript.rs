@@ -537,6 +537,148 @@ async fn context_too_long_mid_stream_does_not_compact() {
     );
 }
 
+// --- BUG-079: ツール呼び出しが本文テキストとして出た ---
+
+/// この開発機で実測した形（`<tool_call><function=write_file>…`）。構造化フィールドには何も
+/// 入らないので、ハーネスから見ると「モデルは喋っただけ」になる。
+fn text_form_tool_call() -> Vec<StreamEvent> {
+    end_turn(
+        "バグファイルが68件あります。\n\n<tool_call>\n<function=write_file>\n\
+         <parameter=path>\ntmp/collect_bugs.ps1\n</parameter>\n</function>\n</tool_call>",
+    )
+}
+
+/// 固定する性質: 本文にツール呼び出しが書かれていたら、その試行を捨てて**通知付きで1回再送**する。
+/// 再送は`raw_turn_with_deltas`の中なので`TurnStarted`は1回だけで、**捨てた本文は履歴に残らない**。
+#[tokio::test]
+async fn a_tool_call_written_as_text_is_retried_with_a_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(vec![
+        ScriptedCall::Streams(text_form_tool_call()),
+        // 再送: 今度はまともに答えた（呼び出し直すか、諦めて本文で答えるかはモデルの自由）。
+        ScriptedCall::Streams(end_turn("すみません。ツールで呼び出し直します。")),
+    ]);
+
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("バグカタログを全部見て傾向を分析して");
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            compaction: Default::default(),
+            degeneracy: None,
+        },
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.text, "すみません。ツールで呼び出し直します。");
+    assert_eq!(provider.calls_made(), 2, "通知付きで1回再送する");
+
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(event_kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "TurnStarted",
+            "TextDelta",
+            "ToolCallWrittenAsText",
+            "TextDelta",
+            "TurnCompleted"
+        ],
+        "再送はターンの中で起きる（`TurnStarted`は1回）"
+    );
+    match &events[2] {
+        AgentEvent::ToolCallWrittenAsText {
+            marker, retrying, ..
+        } => {
+            assert_eq!(marker, "<tool_call>", "何を見て判定したかを出す");
+            assert!(retrying);
+        }
+        other => panic!("expected ToolCallWrittenAsText, got {other:?}"),
+    }
+
+    // 捨てた試行は履歴に残らない（`TurnExecutor`は履歴を持たないので構造的にそうなる）。
+    assert_eq!(state.messages.len(), 2, "{:?}", state.messages);
+    assert_eq!(
+        state.messages[1].content,
+        vec![ContentBlock::Text(
+            "すみません。ツールで呼び出し直します。".to_string()
+        )]
+    );
+}
+
+/// 固定する性質: **再送は1回だけ**。2回目も同じなら、モデルは説明としてそう書いているのだと見て
+/// 本文をそのまま答えとして採用する（誤検出で答えを失わない）。無限に再送しないことの回帰でもある。
+#[tokio::test]
+async fn a_second_text_form_tool_call_is_accepted_instead_of_looping() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(vec![
+        ScriptedCall::Streams(text_form_tool_call()),
+        ScriptedCall::Streams(text_form_tool_call()),
+    ]);
+
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("ツール呼び出しの書き方を教えて");
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            compaction: Default::default(),
+            degeneracy: None,
+        },
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(provider.calls_made(), 2, "2回で打ち切る（無限に再送しない）");
+    assert!(
+        outcome.text.contains("<tool_call>"),
+        "答えを失わない: {}",
+        outcome.text
+    );
+
+    let events = drain_events(&mut events_rx);
+    let flags: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallWrittenAsText { retrying, .. } => Some(*retrying),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(flags, vec![true, false], "1回目は再送、2回目は受け入れ");
+}
+
 // --- 予防的縮約（使用率トリガ、`plans/PLAN-COMPACTION.md`） ---
 
 /// `tool_use`と対になる`tool_result`を持つ1ターン分のメッセージ列。
@@ -631,12 +773,168 @@ async fn the_usage_trigger_shrinks_then_summarizes_before_the_turn_starts() {
         drain_event_kinds(&mut events_rx),
         vec![
             "ContextShrunk",
+            // BUG-078: ②の要約コールは`TurnStarted`より前に走る唯一の長い待ちなので、
+            // 開始も報告する（さもないとフロントエンドは進捗を出す手がかりを持たない）。
+            "ContextCompactionStarted",
             "ContextCompacted",
             "TurnStarted",
             "TextDelta",
             "TurnCompleted"
         ],
         "preventive compaction must run (and be reported) before the turn starts"
+    );
+}
+
+/// ③段（ターン内digest）。**①②が構造的に届かない形**を固定する: 発話1回のうちに大きな
+/// ツール出力が積み上がった状態では、①は保護境界（＝いまのターンの先頭）より前に何も持たず、
+/// ②は畳めるターン境界を持たない。ここで何も起きないと、リクエストが弾かれるまで打つ手が無い。
+///
+/// 固定する性質:
+/// 1. digestのコールは1本（バッチ全体で1回）で、`TurnStarted`より**前**に報告される。
+/// 2. 「畳めるものが無い②」は`ContextCompactionStarted`を出さない（何もしない縮約を
+///    「始まった」と言わない）。出るのはdigestが自分のコールの前に出す1本だけ。
+/// 3. 直近2件の`tool_result`は逐語のまま（モデルがまさに参照中の出力）。
+#[tokio::test]
+async fn tool_output_piled_up_inside_one_turn_is_digested_before_the_turn_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(vec![
+        // ③digestのコール。
+        ScriptedCall::Streams(end_turn("・BUG-070: 進捗が無く連打される\n・…")),
+        // 本題のターン。
+        ScriptedCall::Streams(end_turn("done")),
+    ]);
+
+    // 発話1回のうちに4ファイル読んだ状態（ターン境界は先頭の1つだけ）。
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("read the bug catalog");
+    for i in 0..4 {
+        state.messages.extend(tool_round(&format!("call_{i}"), 8_000));
+    }
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            compaction: harness_engine::compaction::CompactionPolicy {
+                trigger_ratio: 0.5,
+                target_ratio: 0.3,
+                // digestのバッチ予算は`context_window / 4`なので、8,000字のツール出力2件を
+                // 1バッチに載せられる大きさにしておく（予算での打ち切り自体は
+                // `digest::tests::a_batch_is_capped_by_the_call_budget`が固定する）。
+                context_window: 16_000,
+            },
+            degeneracy: None,
+        },
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.text, "done");
+    assert_eq!(
+        drain_event_kinds(&mut events_rx),
+        vec![
+            "ContextCompactionStarted",
+            "ToolResultsDigested",
+            "TurnStarted",
+            "TextDelta",
+            "TurnCompleted"
+        ],
+        "in-turn digest must run (and be reported) before the turn starts"
+    );
+    assert_eq!(provider.calls_made(), 2, "digest 1本 + 本題1本");
+
+    let lengths = tool_result_lengths(&state);
+    assert!(lengths[0] < 2_000, "古い2件はdigestへ差し替わる: {lengths:?}");
+    assert!(lengths[1] < 2_000, "{lengths:?}");
+    assert_eq!(lengths[2], 8_000, "直近2件は逐語のまま");
+    assert_eq!(lengths[3], 8_000);
+}
+
+/// BUG-080: 嵩張っているのが**いまのターンの中**なら、②ローリング要約は**打たない**。
+///
+/// ②が触れるのは「いまのターンより前」だけなので、そこが小さいのに②を打つと、主役の山に
+/// 触れないまま数分（実測390秒）待つことになる。固定する性質は3つ。
+/// 1. ③digestのコールだけが走り、②の要約コールは走らない（`calls_made() == 2`）。
+/// 2. `ContextCompacted`（＝②が畳んだ）が出ない。
+/// 3. digestは絶対上限で切れるので、1回で全部畳もうとしない。
+#[tokio::test]
+async fn a_turn_heavy_history_is_digested_without_paying_for_a_rolling_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(vec![
+        ScriptedCall::Streams(end_turn("・68件のバグは表示側の欠陥が多い\n・…")), // ③digest
+        ScriptedCall::Streams(end_turn("done")),                                  // 本題
+    ]);
+
+    let mut state = ConversationState::new(Vec::new());
+    // 先頭（②の担当領域）は小さい。
+    state.push_user_text("前のターン");
+    state.messages.push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text("了解".to_string())],
+    });
+    // いまのターン（③の担当領域）に山がある。
+    state.push_user_text("バグカタログを全部見て傾向を分析して");
+    for i in 0..5 {
+        state.messages.extend(tool_round(&format!("call_{i}"), 8_000));
+    }
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            compaction: harness_engine::compaction::CompactionPolicy {
+                trigger_ratio: 0.5,
+                target_ratio: 0.3,
+                context_window: 16_000,
+            },
+            degeneracy: None,
+        },
+        Some(&events_tx),
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.text, "done");
+    assert_eq!(
+        provider.calls_made(),
+        2,
+        "digest 1本 + 本題1本（②の要約コールは打たない）"
+    );
+    let kinds = drain_event_kinds(&mut events_rx);
+    assert!(
+        kinds.contains(&"ToolResultsDigested".to_string()),
+        "{kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"ContextCompacted".to_string()),
+        "先頭が小さいので②は割に合わない: {kinds:?}"
     );
 }
 

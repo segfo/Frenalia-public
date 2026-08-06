@@ -153,7 +153,7 @@ pub fn apply(req: &mut CompletionRequest, rung: Rung, attempt: u32) {
         Rung::Jitter => jitter(req, attempt),
         Rung::JitterWithNotice => {
             jitter(req, attempt);
-            append_notice(req);
+            append_notice(req, REPETITION_NOTICE);
         }
         // (d) はリクエストを触らない（モデル側をリセットしてから素の再送を行う）。
         // ただし決定的な同一結果を避けるため、揺らしは残す。
@@ -173,16 +173,23 @@ fn jitter(req: &mut CompletionRequest, attempt: u32) {
     req.sampling.presence_penalty = Some(PRESENCE_PENALTY);
 }
 
-/// (c) 段の通知。**`req.system`の末尾に新しい非キャッシュブロックを足すだけ**にする。
+/// (c) 段の文面。
+const REPETITION_NOTICE: &str = "直前の応答は同じ内容の反復に陥り、有意な出力に到達しないまま\
+破棄された。今回は反復を避け、簡潔に、結論から書くこと。同じ文・同じ語の連続を出さないこと。";
+
+/// 再送時の通知を載せる**唯一の場所**。`req.system`の末尾に新しい非キャッシュブロックを足す。
 ///
 /// 既存の`cache:true`ブロックのテキストを書き換えるとプロンプトキャッシュが無効化される（§6.5）。
 /// 末尾に非キャッシュブロックを足せばキャッシュ済みプレフィクスは保たれる。
 /// `messages`側に足すとrole交替が崩れる危険がある。
-fn append_notice(req: &mut CompletionRequest) {
+///
+/// 呼び出しは2つ。(c)段の反復通知（[`REPETITION_NOTICE`]）と、本文へツール呼び出しを書いた
+/// ときの通知（`turn::text_tool_call::NOTICE`、[BUG-079](../../../../docs/bugs/BUG-079.md)）。
+/// **後者は縮退ではない**が、「壊れた応答を捨てて通知付きで再送する」という形は同じなので、
+/// この制約付きの足し方を2箇所へ書き写さない。
+pub(crate) fn append_notice(req: &mut CompletionRequest, text: &str) {
     req.system.push(SystemBlock {
-        text: "直前の応答は同じ内容の反復に陥り、有意な出力に到達しないまま破棄された。\
-               今回は反復を避け、簡潔に、結論から書くこと。同じ文・同じ語の連続を出さないこと。"
-            .to_string(),
+        text: text.to_string(),
         cache: false,
     });
 }

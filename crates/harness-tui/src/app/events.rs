@@ -11,6 +11,11 @@ impl AppState {
             AgentEvent::TurnStarted {
                 estimated_input_tokens,
             } => {
+                // BUG-078: 予防的縮約はターン開始**前**に走る。ここへ来た時点でそれは終わって
+                // いるので、進捗表示を畳んでから（＝記録行をターン境界の目印より前に置いてから）
+                // ターンの状態へ移る。要約が0件で`ContextCompacted`が出なかった場合の受け皿も
+                // これが兼ねる。
+                self.end_busy_if_running(BusyEnd::Finished);
                 self.turn_open = false;
                 self.turn_in_flight = true;
                 self.turn_transcript_mark = self.transcript.len();
@@ -126,12 +131,15 @@ impl AppState {
                 self.end_thinking_progress(false);
             }
             AgentEvent::Error { message } => {
+                self.end_busy_if_running(BusyEnd::Finished);
                 self.transcript.push(TranscriptItem::Error(message));
                 self.turn_open = false;
                 self.turn_in_flight = false;
                 self.end_thinking_progress(false);
             }
             AgentEvent::Cancelled => {
+                // BUG-074: 止めたものを「完了した」と書かない。
+                self.end_busy_if_running(BusyEnd::Stopped);
                 self.transcript
                     .push(TranscriptItem::Info("cancelled".to_string()));
                 self.turn_open = false;
@@ -139,11 +147,16 @@ impl AppState {
                 self.end_thinking_progress(false);
             }
             // BUG-071: 開始したこと自体はtranscriptへ積まない。進捗は`busy_progress`が持つ
-            // 一時行で表し、待機中→実行中の遷移は`lib.rs`が`mark_busy_running`で行う
-            // （`AppState`は「イベントを畳んで画面を作る」責務だけを持ち、`busy_progress`の
-            // ライフサイクルはコマンドを送った側＝`lib.rs`が握る、という既存の分担に合わせる）。
-            AgentEvent::ContextCompactionStarted => {}
+            // 一時行で表す。`/compact`コマンド経由なら`lib.rs`が既に`begin_busy`で置き場を
+            // 作っているので「待機中→実行中」へ移すだけ。**engineが自分の判断で始めた**
+            // 予防的縮約の要約（BUG-078）では置き場が無いので、ここで作る。
+            AgentEvent::ContextCompactionStarted => {
+                self.begin_busy_running("Compacting context");
+            }
             AgentEvent::ContextCompacted { removed_messages } => {
+                // 記録行は**結果行より先**に積む（スピナーがあった位置がそのまま記録になり、
+                // 結果はその下に続く）。
+                self.end_busy_if_running(BusyEnd::Finished);
                 self.transcript.push(TranscriptItem::Info(format!(
                     "context compacted ({removed_messages} messages summarized)"
                 )));
@@ -156,6 +169,19 @@ impl AppState {
             } => {
                 self.transcript.push(TranscriptItem::Info(format!(
                     "context shrunk ({truncated_blocks} tool results truncated, \
+                     ~{saved_tokens} tokens saved)"
+                )));
+            }
+            // ③段。切詰め（機械的・欠けが見て取れる）と違い**モデルが書いた要約**への
+            // 置き換えなので、別の文面で「digest」と名指しする。取りこぼしを疑ってツールを
+            // 再実行するかどうかはユーザー（とモデル）の判断材料になる。
+            AgentEvent::ToolResultsDigested {
+                digested_blocks,
+                saved_tokens,
+            } => {
+                self.end_busy_if_running(BusyEnd::Finished);
+                self.transcript.push(TranscriptItem::Info(format!(
+                    "tool outputs digested ({digested_blocks} outputs summarized in place, \
                      ~{saved_tokens} tokens saved)"
                 )));
             }
@@ -184,6 +210,33 @@ impl AppState {
                 self.turn_transcript_mark = self.transcript.len();
                 self.turn_open = false;
                 self.end_thinking_progress(false);
+            }
+            // BUG-079: ツール呼び出しが本文テキストとして出た。
+            //
+            // `retrying`なら`TurnDiscarded`と同じ扱い——**画面に出てしまった本文をこの試行の
+            // 開始位置まで巻き戻す**（捨てた出力が次の試行の本文と連結して読めてしまう）。
+            // `retrying`が`false`のときは本文をそのまま答えとして採用するので**巻き戻さない**。
+            AgentEvent::ToolCallWrittenAsText {
+                marker,
+                retrying,
+                ..
+            } => {
+                if retrying {
+                    self.transcript
+                        .truncate(self.turn_transcript_mark.min(self.transcript.len()));
+                    self.transcript.push(TranscriptItem::Info(format!(
+                        "[ツール呼び出し] 本文に書かれていたため実行されなかった（{marker}）\
+                         : 応答を破棄し、呼び出し直すよう伝えて再送する"
+                    )));
+                    self.turn_transcript_mark = self.transcript.len();
+                    self.turn_open = false;
+                    self.end_thinking_progress(false);
+                } else {
+                    self.transcript.push(TranscriptItem::Info(format!(
+                        "[ツール呼び出し] 本文に書かれた呼び出し（{marker}）は実行していない\
+                         。再送しても同じだったため、この応答をそのまま採用した"
+                    )));
+                }
             }
             // --- 認知レイヤー（M15）---
             // 台帳ビュー（推論パネル、`plans/DESIGN-COGNITION.md` §8）はまだ作らず、

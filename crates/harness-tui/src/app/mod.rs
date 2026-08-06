@@ -312,6 +312,33 @@ impl AppState {
         }
     }
 
+    /// **engineが自分の判断で始めた**長い処理の進捗表示（BUG-078: 予防的縮約の要約コール）。
+    ///
+    /// [`AppState::mark_busy_running`]だけでは足りない——`/compact`コマンド経由と違って
+    /// [`AppState::begin_busy`]を呼んだ者が居らず、置き場が空なので何も表示されない。
+    /// 待機（キュー）を経ていないので**最初から実行中**として作る。
+    pub fn begin_busy_running(&mut self, label: &str) {
+        if self.busy_progress.is_none() {
+            let now = Instant::now();
+            self.busy_progress = Some(BusyProgress {
+                queued_at: now,
+                started_at: Some(now),
+                label: label.to_string(),
+            });
+            return;
+        }
+        self.mark_busy_running();
+    }
+
+    /// **実行中の**進捗表示だけを畳む。キューで待っているものは畳まない——待っている間に届く
+    /// `Error`/`Cancelled`/`ContextCompacted`は**先行するターンのもの**であり、畳むと要約が
+    /// 始まる前に表示が消える（BUG-071/074）。
+    fn end_busy_if_running(&mut self, how: BusyEnd) {
+        if self.busy_progress.as_ref().is_some_and(|b| b.is_running()) {
+            self.end_busy(how);
+        }
+    }
+
     /// 進行中の表示を終了し、所要時間を記録行として1行残す。
     /// キューで待った時間が実測できる場合は**それも併記する**——ターンの後ろで待っていたことが
     /// 後から分からないと、「要約に何十秒もかかった」という誤解が残る。

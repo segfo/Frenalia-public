@@ -281,6 +281,25 @@ impl LlmProvider for OpenAiProvider {
         Ok(true)
     }
 
+    /// 実`n_ctx`をLM Studioの管理REST APIから取る（縮約の分母、`plans/PLAN-COMPACTION.md`）。
+    ///
+    /// 見るのは`GET /api/v1/models`の`loaded_instances[].config.context_length`——(d)段の
+    /// [`OpenAiProvider::recycle`]が「再ロードで変わってはいけない値」として捕捉・照合している
+    /// のと**同じフィールド**である。同じ値を2つの経路が別々に取りに行かないよう、取得は
+    /// [`OpenAiProvider::capture_load_config`]を共用する（規則5）。
+    ///
+    /// fail-soft: 到達できない・ロードされていない・形が違うなら`None`を返し、呼び出し側は
+    /// `capabilities().context_window`へ落ちる。
+    async fn detect_context_window(&self, model: &str) -> Option<u32> {
+        if self.family != OpenAiFamily::LmStudio {
+            return None;
+        }
+        let mgmt = self.mgmt_base_url();
+        // `Err`（到達不能・`models`配列が無い等）も「分からない」に畳む。
+        let (_, config) = self.capture_load_config(&mgmt, model).await.ok()??;
+        context_length_of(config.as_ref()?)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_json_schema: true,
@@ -299,6 +318,17 @@ impl LlmProvider for OpenAiProvider {
 }
 
 // --- LM Studio 管理REST API（§11.5、(d)段） ---
+
+/// ロード設定から実`n_ctx`を読む。
+///
+/// **`config.context_length`は「1リクエストが使えるコンテキスト長」として扱う。** 同じconfigには
+/// `parallel`（同時スロット数）もあり、LM Studioがこの2つを掛けてKVを確保するのか割るのかは
+/// 実測していない。掛け算を推測で入れると分母が実態と2倍以上ずれるので**そのまま使い**、
+/// 検出値は起動時に出す（違っていればユーザーが`compaction.context_window`で上書きできる）。
+fn context_length_of(config: &serde_json::Value) -> Option<u32> {
+    let n = config.get("context_length")?.as_u64()?;
+    u32::try_from(n).ok().filter(|n| *n > 0)
+}
 
 /// `load`のエコーと照合しないキー。
 ///
@@ -1485,6 +1515,63 @@ mod tests {
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[1]["tool_call_id"], "call_1");
         assert_eq!(messages[1]["content"], "file contents");
+    }
+
+    // --- 実`n_ctx`の自動検出（縮約の分母、`plans/PLAN-COMPACTION.md`） ---
+
+    /// この開発機のLM Studio 0.4.20が実際に返した`GET /api/v1/models`の該当部分
+    /// （2026-08-06実測。`parallel`が同居していることも含めて写してある）。
+    fn loaded_instance_config() -> serde_json::Value {
+        serde_json::json!({
+            "context_length": 262_144,
+            "eval_batch_size": 2_048,
+            "physical_batch_size": 512,
+            "parallel": 4,
+            "flash_attention": true,
+            "num_experts": 8,
+            "offload_kv_cache_to_gpu": true
+        })
+    }
+
+    #[test]
+    fn the_context_length_comes_from_the_load_config() {
+        assert_eq!(context_length_of(&loaded_instance_config()), Some(262_144));
+    }
+
+    /// `parallel`は**掛けも割りもしない**。LM Studioがこの2つをどう使ってKVを確保するかは
+    /// 未実測で、推測で係数を入れると分母が2倍以上ずれる（`context_length_of`のdoc参照）。
+    #[test]
+    fn the_parallel_slot_count_does_not_scale_the_denominator() {
+        let mut config = loaded_instance_config();
+        config["parallel"] = serde_json::json!(8);
+        assert_eq!(context_length_of(&config), Some(262_144));
+    }
+
+    /// 形が違う・欠けている・0はすべて「分からない」に畳む（呼び出し側がcapabilityへ落ちる）。
+    #[test]
+    fn a_missing_or_unusable_context_length_is_not_guessed() {
+        assert_eq!(context_length_of(&serde_json::json!({})), None);
+        assert_eq!(
+            context_length_of(&serde_json::json!({ "context_length": 0 })),
+            None
+        );
+        assert_eq!(
+            context_length_of(&serde_json::json!({ "context_length": "262144" })),
+            None,
+            "文字列は数として読まない（黙って0や巨大値へ化けるより分からない方が安全）"
+        );
+        assert_eq!(
+            context_length_of(&serde_json::json!({ "context_length": 5_000_000_000u64 })),
+            None,
+            "u32に収まらない値も拒否する"
+        );
+    }
+
+    /// クラウドのOpenAIでは問い合わせに行かない（管理APIが無いので毎起動で無駄な失敗をする）。
+    #[tokio::test]
+    async fn the_openai_family_never_probes_for_a_context_window() {
+        let provider = OpenAiProvider::new("key");
+        assert_eq!(provider.detect_context_window("gpt-4o").await, None);
     }
 
     // --- 縮退ガードの (d) 段（`plans/DESIGN-COGNITION.md` §11.5） ---

@@ -270,11 +270,15 @@ fn trust_name(rank: u8) -> &'static str {
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompactionSettings {
-    /// 使用率判定の分母の上書き。省略時は`ProviderCapabilities.context_window`。
+    /// 使用率判定の分母の上書き。**通常は省略でよい。**
     ///
-    /// LMStudioの`capabilities()`は128,000を返すが、実`n_ctx`はサーバのロード設定依存で
-    /// 8k–32kのことが多い。この上書きが無いと使用率閾値そのものが意味を持たないため、
-    /// ローカルモデルを使う場合は実質必須の設定になる。CLIの`--context-window`が最優先。
+    /// 解決順は CLIの`--context-window` → このキー → **推論サーバへの問い合わせ**
+    /// （`LlmProvider::detect_context_window`。LM Studioは`GET /api/v1/models`の
+    /// `loaded_instances[].config.context_length`＝実`n_ctx`を返す） →
+    /// `ProviderCapabilities.context_window`。
+    ///
+    /// 書くのは、検出値が実態と違うとき（LM Studioの`parallel`スロットの扱い等）や、
+    /// **宣言された窓より狭い予算で運用したい**ときだけである。比率だけを書けば足りる。
     pub context_window: Option<u32>,
     /// 使用率がこれを超えたら縮約する。
     pub trigger_ratio: Option<f32>,

@@ -37,13 +37,32 @@ async fn run_one_turn(
     prompt: &str,
     reply: &str,
 ) {
+    drive_turn(
+        session,
+        state,
+        prompt,
+        vec![end_turn(reply)],
+        Default::default(),
+    )
+    .await;
+}
+
+/// 1ターンを回して`main.rs`（`cli/startup/run_agent.rs`）と**同じ規則**でセッションへ書く。
+/// 圧縮が履歴の先頭を畳んだターンだけチェックポイントを書く、という分岐まで含めて模す。
+async fn drive_turn(
+    session: &SessionStore,
+    state: &mut ConversationState,
+    prompt: &str,
+    provider_turns: Vec<Vec<StreamEvent>>,
+    compaction: harness_engine::compaction::CompactionPolicy,
+) {
     state.push_user_text(prompt);
     session
         .append_messages(&state.messages[state.messages.len() - 1..])
         .unwrap();
     let before = state.mark();
 
-    let provider = MockProvider::new(vec![end_turn(reply)]);
+    let provider = MockProvider::new(provider_turns);
     let tools = ToolRegistry::with_builtin_tools();
     let dir = tempfile::tempdir().unwrap();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
@@ -61,14 +80,18 @@ async fn run_one_turn(
             model: "mock".into(),
             max_tokens: 100,
             max_turns: 5,
-            compaction: Default::default(),
+            compaction,
             degeneracy: None,
         },
         OutputFormat::Text,
         &mut out,
     )
     .await;
-    session.append_messages(state.since(before)).unwrap();
+    if state.folded_since(before) {
+        session.append_checkpoint(&state.messages).unwrap();
+    } else {
+        session.append_messages(state.since(before)).unwrap();
+    }
 }
 
 /// `--resume <id>`相当: セッションファイルに保存済みのメッセージが新しい`ConversationState`へ
@@ -103,6 +126,55 @@ async fn resume_restores_prior_messages_and_appends_continuation() {
         .unwrap();
     // 1ターン目のuser+assistant、2ターン目のuser+assistantの計4件が1ファイルに追記されている。
     assert_eq!(all_messages.len(), 4);
+}
+
+/// ターン中に圧縮が走ったら**チェックポイント**が書かれ、`--resume`が圧縮前の長い履歴へ
+/// 戻らないこと。JSONLは追記専用なので、これが無いと再開した瞬間に畳んだはずの履歴が
+/// 丸ごと復活する（圧縮の意味が消える）。
+#[tokio::test]
+async fn resume_after_a_compaction_starts_from_the_compacted_history() {
+    let sessions_dir = tempfile::tempdir().unwrap();
+    let session = SessionStore::create_new(sessions_dir.path()).unwrap();
+    let mut state = ConversationState::new(Vec::new());
+
+    for i in 0..3 {
+        run_one_turn(
+            &session,
+            &mut state,
+            &format!("question {i}"),
+            &"x".repeat(2_000),
+        )
+        .await;
+    }
+    let before_compaction = SessionStore::open(session.path().to_path_buf())
+        .load_messages()
+        .unwrap();
+    assert_eq!(before_compaction.len(), 6);
+
+    // 実`n_ctx`が小さいローカルモデル相当のポリシー。この履歴では次のターンの前に
+    // 予防的縮約の②（ローリング要約）が走る。
+    drive_turn(
+        &session,
+        &mut state,
+        "one more",
+        vec![end_turn("summary of earlier turns"), end_turn("done")],
+        harness_engine::compaction::CompactionPolicy {
+            trigger_ratio: 0.5,
+            target_ratio: 0.3,
+            context_window: 1_000,
+        },
+    )
+    .await;
+    assert!(
+        state.messages.len() < 8,
+        "履歴が畳まれていない: {}",
+        state.messages.len()
+    );
+
+    let resumed = SessionStore::open(session.path().to_path_buf())
+        .load_messages()
+        .unwrap();
+    assert_eq!(resumed, state.messages, "resumeは圧縮後の履歴から始まる");
 }
 
 /// `--continue`相当: `.harness/sessions/`内の最新セッションを自動選択できること。

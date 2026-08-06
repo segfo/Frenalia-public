@@ -30,9 +30,10 @@ impl ShrinkOutcome {
 /// トークン概算とのchars換算係数（`estimate_json_tokens`のchars/4の逆）。
 const CHARS_PER_TOKEN: u64 = 4;
 
-/// 予防経路での切詰め下限。ツール出力は投入時に既に8,000文字へ切られている（`turn.rs`の
-/// `MAX_TOOL_OUTPUT_CHARS`）ので、そこからさらに1/4まで許す。
-pub const PREVENTIVE_FLOOR_CHARS: usize = 2_000;
+/// 浅い切詰めの下限。**予防経路と手動`/compact`が使う**。ツール出力は投入時に既に8,000文字へ
+/// 切られている（`turn.rs`の`MAX_TOOL_OUTPUT_CHARS`）ので、そこからさらに1/4まで許す。
+/// 最後の手段の[`FALLBACK_FLOOR_CHARS`]と対。
+pub const SHALLOW_FLOOR_CHARS: usize = 2_000;
 
 /// リアクティブ経路のフォールバックでの切詰め下限。**最後の手段**なので深く削る。
 pub const FALLBACK_FLOOR_CHARS: usize = 512;
