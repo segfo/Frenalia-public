@@ -1,4 +1,9 @@
 //! `AppState`から毎フレーム全ウィジェットを再描画する（即時モード、§リッチTUI）。
+//!
+//! レビューパネル（1画面を占める自己完結した面）の描画だけは[`review`]へ分けている
+//! （`docs/CODE-STRUCTURE-RULES.md`規則3）。
+
+mod review;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -7,9 +12,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{AppState, ChangesPanelState, ToolCardStatus, TranscriptItem, SPINNER_FRAMES};
-use crate::diff::DiffKind;
-use harness_sandbox::ManifestOp;
+use crate::app::{AppState, ToolCardStatus, TranscriptItem, SPINNER_FRAMES};
+use harness_sandbox::textdiff::DiffKind;
 
 /// 入力欄が自動で伸びる最大行数。これを超えると内部スクロールする（カーソル行が
 /// 常に見えるよう毎フレーム再計算する。transcriptの`scroll_offset`のような永続的な
@@ -40,8 +44,8 @@ pub fn render(f: &mut Frame, app: &AppState) -> u16 {
 
     if let Some(pending) = &app.pending_permission {
         render_permission_modal(f, f.area(), pending);
-    } else if let Some(panel) = &app.changes_panel {
-        render_changes_panel(f, f.area(), panel);
+    } else if let Some(panel) = &app.review_panel {
+        review::render_review_panel(f, f.area(), panel);
     } else if app.selection_range().is_none() {
         // 端末の実カーソルを入力欄の入力末尾へ明示的に置く。ratatuiは`set_cursor_position`を
         // 呼ばない限りカーソルを隠したままにするため、これを怠るとOS/端末のIME（日本語等の
@@ -514,82 +518,6 @@ fn render_permission_modal(f: &mut Frame, area: Rect, pending: &crate::app::Perm
         .block(block)
         .wrap(Wrap { trim: false });
     f.render_widget(paragraph, rect);
-}
-
-/// 変更（changes）パネル: git status風の一覧（左）＋選択中エントリの差分（右）
-/// （§リッチTUI「変更（changes）パネル」、M10のTUIパネルはフルスコープ＝ファイル毎accept/reject）。
-fn render_changes_panel(f: &mut Frame, area: Rect, panel: &ChangesPanelState) {
-    let rect = centered_rect(90, 80, area);
-    f.render_widget(Clear, rect);
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(rect);
-
-    let list_lines: Vec<Line> = if panel.rows.is_empty() {
-        vec![Line::from("(no staged changes)")]
-    } else {
-        panel
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                let op_glyph = match row.entry.op {
-                    ManifestOp::Create => "A",
-                    ManifestOp::Modify => "M",
-                    ManifestOp::Delete => "D",
-                };
-                let mark = if panel.rejected.contains(&i) {
-                    "[ ]"
-                } else {
-                    "[x]"
-                };
-                let cursor = if i == panel.selected { ">" } else { " " };
-                let color = if panel.rejected.contains(&i) {
-                    Color::DarkGray
-                } else {
-                    Color::White
-                };
-                Line::from(Span::styled(
-                    format!("{cursor}{mark} {op_glyph} {}", row.entry.path),
-                    Style::default().fg(color),
-                ))
-            })
-            .collect()
-    };
-    let list_block = Block::default()
-        .borders(Borders::ALL)
-        .title("changes (↑↓ select, Enter/Space toggle, c=commit, x=discard-all, Esc=close)");
-    f.render_widget(Paragraph::new(list_lines).block(list_block), cols[0]);
-
-    let diff_lines: Vec<Line> = panel
-        .rows
-        .get(panel.selected)
-        .map(|row| {
-            row.diff
-                .iter()
-                .map(|d| {
-                    let (prefix, color) = match d.kind {
-                        DiffKind::Context => (" ", Color::Gray),
-                        DiffKind::Removed => ("-", Color::Red),
-                        DiffKind::Added => ("+", Color::Green),
-                    };
-                    Line::from(Span::styled(
-                        format!("{prefix} {}", d.text),
-                        Style::default().fg(color),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let diff_block = Block::default().borders(Borders::ALL).title("diff");
-    f.render_widget(
-        Paragraph::new(diff_lines)
-            .block(diff_block)
-            .wrap(Wrap { trim: false }),
-        cols[1],
-    );
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

@@ -278,6 +278,34 @@ pub fn read_overlay_content(upper_dir: &Path, rel: &str) -> Option<String> {
     std::fs::read_to_string(upper_path_for(upper_dir, rel)).ok()
 }
 
+/// **部分適用（ハンク単位apply）の後始末**: `rel`のbaselineを`new_workspace`（適用直後の実
+/// workspace内容）へ張り替える。baselineミラーを書き直し、台帳から`rel`の行を全て落として、
+/// 新しいハッシュを持つ`Modify`エントリを1件だけ入れ直す。
+///
+/// **なぜ追記だけでは足りないか**: [`crate::replay`]はパスごとに**最初の**エントリの
+/// `baseline_hash`を権威として採る（baselineは「セッション開始時点の姿」を意味するため、
+/// 2回目以降の書込みでも初回の値を保つ設計）。追記しても再生結果のbaselineは変わらないので、
+/// 意図的に張り替えるにはprune＋再appendの2手が要る。
+///
+/// **なぜ張り替えるのか**: 部分適用は実workspace側の内容を自分で書き換える。baselineを
+/// 元のままにしておくと、次に`apply`したとき「セッション中に第三者が実workspaceを編集した」
+/// と誤検知して残りのハンクが永久に適用できなくなる（`plans/PLAN-VSCODE-REVIEW.md`
+/// §部分適用後の台帳整合）。
+pub fn rebase_baseline(upper_dir: &Path, rel: &str, new_workspace: &[u8]) {
+    let mirror_path = upper_dir.join(COW_BASELINE_DIRNAME).join(rel);
+    if let Some(parent) = mirror_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&mirror_path, new_workspace);
+    prune_ledger(upper_dir, std::slice::from_ref(&rel.to_string()));
+    append_entry(
+        upper_dir,
+        ChangeOp::Modify,
+        rel,
+        Some(hash_bytes(new_workspace)),
+    );
+}
+
 /// `apply`/`resolve`が実際にworkspace本体へ反映した`applied_paths`を台帳から取り除く
 /// （適用済みの変更が`change_set()`に永続的に残り続けるのを防ぐ）。台帳が無ければ何もしない。
 pub fn prune_ledger(upper_dir: &Path, applied_paths: &[String]) {
@@ -364,6 +392,41 @@ mod tests {
         std::fs::write(ws.path().join("a.txt"), b"changed-since").unwrap();
         let hash = baseline_hash_and_mirror(upper.path(), ws.path(), "a.txt");
         assert_eq!(hash, Some("stale-hash".to_string()));
+    }
+
+    #[test]
+    fn rebase_baseline_replaces_the_authoritative_baseline_and_mirror() {
+        let upper = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), b"v1").unwrap();
+        // セッション中の書込み（baselineは"v1"で確定する）。
+        let baseline = baseline_hash_and_mirror(upper.path(), ws.path(), "a.txt");
+        append_entry(upper.path(), ChangeOp::Modify, "a.txt", baseline);
+
+        // 部分適用でworkspaceが"v2"になった。
+        rebase_baseline(upper.path(), "a.txt", b"v2");
+
+        let changes = replay_ledger(upper.path());
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].op, ChangeOp::Modify);
+        assert_eq!(changes[0].baseline_hash, Some(hash_bytes(b"v2")));
+        assert_eq!(
+            std::fs::read(upper.path().join(COW_BASELINE_DIRNAME).join("a.txt")).unwrap(),
+            b"v2"
+        );
+    }
+
+    #[test]
+    fn appending_alone_would_not_move_the_baseline() {
+        // `rebase_baseline`がprune＋再appendの2手を踏む理由（`replay`は最初のエントリの
+        // baselineを権威とするので、追記だけでは張り替わらない）を明示的に固定する。
+        let upper = tempfile::tempdir().unwrap();
+        append_entry(upper.path(), ChangeOp::Modify, "a.txt", Some("first".into()));
+        append_entry(upper.path(), ChangeOp::Modify, "a.txt", Some("second".into()));
+        assert_eq!(
+            replay_ledger(upper.path())[0].baseline_hash,
+            Some("first".to_string())
+        );
     }
 
     #[test]

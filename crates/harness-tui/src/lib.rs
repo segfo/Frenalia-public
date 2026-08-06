@@ -2,7 +2,6 @@
 //! 承認モーダルを`tokio::select!`ループで描画する（`plans/DESIGN.md` §リッチTUI）。
 
 mod app;
-mod diff;
 mod engine;
 mod gate;
 mod picker;
@@ -28,12 +27,17 @@ use harness_sandbox::{ApplyOptions, ManifestOp, SandboxFs};
 use harness_tools::ToolRegistry;
 
 pub use app::{
-    Action, AppState, BusyEnd, BusyProgress, ChangeRow, ChangesPanelState, SlashCommand,
+    Action, AppState, BusyEnd, BusyProgress, CommitSelection, PartialFile, ReviewPanelState,
+    ReviewRow, ReviewTarget, SlashCommand,
 };
 pub use engine::{spawn_engine, EngineHandle};
 pub use gate::InteractiveGate;
 
 const TICK: Duration = Duration::from_millis(33);
+
+#[cfg(test)]
+#[path = "review_flow_tests.rs"]
+mod review_flow_tests;
 
 /// tracingの出力先をログファイルへ切り替える（stdoutを汚さない、§リッチTUI「端末復帰」）。
 /// 返り値の`WorkerGuard`はプロセス終了まで保持しないとバッファが破棄されるため、
@@ -48,26 +52,60 @@ pub fn init_file_logging(log_dir: &std::path::Path) -> tracing_appender::non_blo
     guard
 }
 
-/// 変更パネル（M10）を開く際、`SandboxFs::change_set()`の各エントリに差分プレビューを
-/// 添えて`ChangeRow`へ変換する。CoW一本化（Phase 2）により`--staged`/`--cow`は同じ
+/// 変更パネル（M10）を開く際、`SandboxFs::change_set()`の各エントリをレビュー行
+/// （[`ReviewRow`]）へ変換する。CoW一本化（Phase 2）により`--staged`/`--cow`は同じ
 /// `SandboxFs`バックエンドを使うため、この1関数だけで両方をカバーする（以前あった
-/// `build_cow_change_rows`との重複は解消済み）。baseline（変更前）は実workspace側の現在
-/// 内容、current（変更後）はオーバーレイ側の内容。表示専用のbest-effort読取のため、
-/// 読めない場合は空文字列扱いにする（§リッチTUI「変更パネル」）。
-fn build_change_rows(fs: &SandboxFs, entries: Vec<harness_sandbox::ChangeEntry>) -> Vec<ChangeRow> {
+/// `build_cow_change_rows`との重複は解消済み）。
+///
+/// 差分（ハンク）と両側のハッシュの計算は`SandboxFs::review_file`が持つ——**部分適用が
+/// 同じ計算を再実行する**ため、表示側で別に計算してはならない
+/// （`plans/PLAN-VSCODE-REVIEW.md`「ハンク計算は表示側と適用側で同一実装を使う」）。
+fn build_change_rows(fs: &SandboxFs, entries: Vec<harness_sandbox::ChangeEntry>) -> Vec<ReviewRow> {
     entries
         .into_iter()
         .map(|entry| {
-            let baseline = fs.real_content(&entry.path).unwrap_or_default();
-            let current = if entry.op == ManifestOp::Delete {
-                String::new()
-            } else {
-                fs.overlay_content(&entry.path).unwrap_or_default()
+            let badge = match entry.op {
+                ManifestOp::Create => 'A',
+                ManifestOp::Modify => 'M',
+                ManifestOp::Delete => 'D',
             };
-            let diff = diff::line_diff(&baseline, &current);
-            ChangeRow { entry, diff }
+            ReviewRow {
+                label: entry.path.clone(),
+                badge,
+                review: fs.review_file(&entry),
+                target: ReviewTarget::Change { path: entry.path },
+            }
         })
         .collect()
+}
+
+/// 変更パネルの`c`／`/fsstage commit*`が返した選択を実際に適用する。ファイル単位
+/// （`SandboxFs::apply`）とハンク単位（`SandboxFs::apply_hunks`、ファイルごとに1回）へ
+/// 分かれるため、結果は1つの`ApplyReport`へまとめてから1行で報告する。
+fn apply_commit_selection(
+    fs: &SandboxFs,
+    selection: &CommitSelection,
+) -> Result<harness_sandbox::ApplyReport, harness_sandbox::SandboxError> {
+    let mut report = harness_sandbox::ApplyReport::default();
+    if !selection.whole_files.is_empty() {
+        report.merge(fs.apply(&ApplyOptions {
+            only_glob: None,
+            only_paths: Some(&selection.whole_files),
+            allow_ext: false,
+            // BUG-066: baselineが不明なエントリはTUIからも黙って取り込まない
+            // （`push_apply_report`が`unledgered:`として見せる）。
+            adopt_unledgered: false,
+        })?);
+    }
+    for partial in &selection.partial {
+        report.merge(fs.apply_hunks(&harness_sandbox::HunkSelection {
+            path: &partial.path,
+            workspace_hash: partial.workspace_hash.clone(),
+            overlay_hash: partial.overlay_hash.clone(),
+            accepted: &partial.accepted_hunks,
+        })?);
+    }
+    Ok(report)
 }
 
 /// 変更パネル（`/fsstage`系Action）が使う`SandboxFs`を開く。CoW一本化（Phase 2）により、
@@ -431,18 +469,24 @@ pub async fn run(
                                         }),
                                     }
                                 }
-                                Action::CommitChanges(only_paths) => {
+                                Action::CommitChanges(selection) => {
                                     match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
-                                        Ok(fs) => match fs.apply(&ApplyOptions {
-                                            only_glob: None,
-                                            only_paths: Some(&only_paths),
-                                            allow_ext: false,
-                                            // BUG-066: baselineが不明なエントリはTUIからも
-                                            // 黙って取り込まない（`push_apply_report`が
-                                            // `unledgered:`として見せる）。
-                                            adopt_unledgered: false,
-                                        }) {
-                                            Ok(report) => push_apply_report(&mut app, &report),
+                                        Ok(fs) => match apply_commit_selection(&fs, &selection) {
+                                            Ok(report) => {
+                                                push_apply_report(&mut app, &report);
+                                                // 部分適用したファイルは**オーバーレイに残る**
+                                                // （rejectしたハンクは非破壊）。件数だけの報告では
+                                                // 「まだ残っている」ことが伝わらないのでパスを出す。
+                                                for partial in &selection.partial {
+                                                    if report.applied.contains(&partial.path) {
+                                                        app.transcript.push(app::TranscriptItem::Info(format!(
+                                                            "partially applied ({} hunk(s)); the rejected hunks stay in the overlay: {}",
+                                                            partial.accepted_hunks.len(),
+                                                            partial.path
+                                                        )));
+                                                    }
+                                                }
+                                            }
                                             Err(e) => app.apply(harness_core::AgentEvent::Error {
                                                 message: format!("apply failed: {e}"),
                                             }),

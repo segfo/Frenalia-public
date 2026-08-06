@@ -70,7 +70,9 @@ fn submit_input_routes_fsstage_to_dedicated_actions_not_slash() {
     let action = app.submit_input();
     assert!(matches!(
         action,
-        Some(Action::CommitChanges(paths)) if paths == vec!["report.txt".to_string()]
+        Some(Action::CommitChanges(selection))
+            if selection.whole_files == vec!["report.txt".to_string()]
+                && selection.partial.is_empty()
     ));
 
     app.input = "/fsstage discard".to_string();
@@ -1033,20 +1035,50 @@ fn subsequent_text_deltas_still_append_to_the_same_assistant_item() {
     assert!(matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s == "Hello"));
 }
 
-fn change_row(path: &str) -> ChangeRow {
-    ChangeRow {
-        entry: harness_sandbox::ChangeEntry {
-            op: harness_sandbox::ManifestOp::Create,
-            path: path.to_string(),
-            baseline_hash: None,
-            rejected: None,
-            unledgered: false,
+// --- レビューパネル（`app::review`） ---
+
+/// レビュー行を**素のテキスト対から**組む。`ChangeEntry`も`ManifestOp`も構築していないのが
+/// 要点で、`ReviewPanel`の骨格がCoW専用型から外れたこと（段階3c）の機械的な証拠になる。
+/// Recall記憶の面も、同じようにテキストと`ReviewTarget`を差し替えるだけで載る。
+fn text_row(label: &str, old: &str, new: &str) -> ReviewRow {
+    ReviewRow {
+        label: label.to_string(),
+        badge: 'M',
+        review: harness_sandbox::FileReview {
+            hunks: harness_sandbox::textdiff::diff_hunks(old, new),
+            hunk_block: None,
+            workspace_hash: Some(format!("ws-hash-of-{label}")),
+            overlay_hash: Some(format!("ov-hash-of-{label}")),
         },
-        diff: Vec::new(),
+        target: ReviewTarget::Change {
+            path: label.to_string(),
+        },
     }
 }
 
-/// 変更パネル表示中はCtrl+C等を含む通常のキー処理を一切通さず、パネル専用の
+/// 差分を持たない行（ファイル単位の操作だけを見るテスト用）。
+fn change_row(path: &str) -> ReviewRow {
+    text_row(path, "", "")
+}
+
+fn numbered(range: std::ops::Range<usize>) -> String {
+    range.map(|i| format!("line{i}\n")).collect()
+}
+
+/// 離れた2箇所を変えた行（ハンクがちょうど2つになる）。
+fn two_hunk_row(path: &str) -> ReviewRow {
+    let old = numbered(0..30);
+    let new = old
+        .replace("line2\n", "CHANGED2\n")
+        .replace("line25\n", "CHANGED25\n");
+    text_row(path, &old, &new)
+}
+
+fn panel(app: &AppState) -> &ReviewPanelState {
+    app.review_panel.as_ref().unwrap()
+}
+
+/// レビューパネル表示中はCtrl+C等を含む通常のキー処理を一切通さず、パネル専用の
 /// キーだけを処理する（承認モーダルと同じ排他パターン、§リッチTUI「変更パネル」）。
 #[test]
 fn changes_panel_consumes_keys_and_ignores_normal_input() {
@@ -1069,14 +1101,14 @@ fn changes_panel_up_down_moves_selection_and_clamps() {
     ]);
 
     app.on_key(code(KeyCode::Up)); // 先頭でのUpは0のまま
-    assert_eq!(app.changes_panel.as_ref().unwrap().selected, 0);
+    assert_eq!(panel(&app).selected, 0);
 
     app.on_key(code(KeyCode::Down));
     app.on_key(code(KeyCode::Down));
-    assert_eq!(app.changes_panel.as_ref().unwrap().selected, 2);
+    assert_eq!(panel(&app).selected, 2);
 
     app.on_key(code(KeyCode::Down)); // 末尾でのDownは2のまま
-    assert_eq!(app.changes_panel.as_ref().unwrap().selected, 2);
+    assert_eq!(panel(&app).selected, 2);
 }
 
 /// Enter/Spaceで選択中のエントリのaccept/reject（`rejected`集合への出し入れ）がトグルする。
@@ -1086,10 +1118,10 @@ fn changes_panel_enter_toggles_reject_for_selected_entry() {
     app.open_changes_panel(vec![change_row("a.txt"), change_row("b.txt")]);
 
     app.on_key(code(KeyCode::Enter));
-    assert!(app.changes_panel.as_ref().unwrap().rejected.contains(&0));
+    assert!(panel(&app).rejected.contains(&0));
 
     app.on_key(code(KeyCode::Enter));
-    assert!(!app.changes_panel.as_ref().unwrap().rejected.contains(&0));
+    assert!(!panel(&app).rejected.contains(&0));
 }
 
 /// `c`でコミット: reject印を付けたエントリを除いたパス集合が`Action::CommitChanges`として
@@ -1100,11 +1132,12 @@ fn changes_panel_commit_excludes_rejected_entries_and_closes_panel() {
     app.open_changes_panel(vec![change_row("a.txt"), change_row("b.txt")]);
     app.on_key(code(KeyCode::Enter)); // a.txtをreject
 
-    let action = app.on_key(key('c'));
-    assert!(
-        matches!(action, Some(Action::CommitChanges(paths)) if paths == vec!["b.txt".to_string()])
-    );
-    assert!(app.changes_panel.is_none());
+    let Some(Action::CommitChanges(selection)) = app.on_key(key('c')) else {
+        panic!("expected CommitChanges");
+    };
+    assert_eq!(selection.whole_files, vec!["b.txt".to_string()]);
+    assert!(selection.partial.is_empty());
+    assert!(app.review_panel.is_none());
 }
 
 /// `x`で全破棄: `Action::DiscardChanges`が返り、パネルは閉じる。
@@ -1115,7 +1148,7 @@ fn changes_panel_discard_returns_action_and_closes_panel() {
 
     let action = app.on_key(key('x'));
     assert!(matches!(action, Some(Action::DiscardChanges)));
-    assert!(app.changes_panel.is_none());
+    assert!(app.review_panel.is_none());
 }
 
 /// Escでパネルを閉じる（何もコミット/破棄しない）。
@@ -1126,7 +1159,170 @@ fn changes_panel_esc_closes_without_action() {
 
     let action = app.on_key(code(KeyCode::Esc));
     assert!(action.is_none());
-    assert!(app.changes_panel.is_none());
+    assert!(app.review_panel.is_none());
+}
+
+/// Tabで一覧⇄diffペインのフォーカスが切り替わり、diffフォーカス中の↑↓はハンクカーソルを
+/// 動かす（一覧の選択行は動かない）。
+#[test]
+fn tab_switches_focus_and_arrows_move_the_hunk_cursor() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.open_changes_panel(vec![two_hunk_row("a.txt"), two_hunk_row("b.txt")]);
+    assert_eq!(panel(&app).focus, ReviewFocus::List);
+
+    app.on_key(code(KeyCode::Tab));
+    assert_eq!(panel(&app).focus, ReviewFocus::Diff);
+
+    app.on_key(code(KeyCode::Down));
+    assert_eq!(panel(&app).hunk_cursor, 1);
+    assert_eq!(panel(&app).selected, 0, "一覧の選択は動かない");
+
+    // 末尾のハンクでクランプする。
+    app.on_key(code(KeyCode::Down));
+    assert_eq!(panel(&app).hunk_cursor, 1);
+
+    app.on_key(code(KeyCode::Tab));
+    assert_eq!(panel(&app).focus, ReviewFocus::List);
+    app.on_key(code(KeyCode::Down));
+    assert_eq!(panel(&app).selected, 1);
+}
+
+/// diffフォーカス中のEnterはハンクをトグルし、`c`は「一部だけ採る」選択として返る。
+#[test]
+fn toggling_a_hunk_produces_a_partial_commit_selection() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.open_changes_panel(vec![two_hunk_row("a.txt")]);
+
+    app.on_key(code(KeyCode::Tab)); // diffペインへ
+    app.on_key(code(KeyCode::Down)); // 2つ目のハンクへ
+    app.on_key(code(KeyCode::Enter)); // 2つ目をreject
+    assert!(panel(&app).is_hunk_rejected(0, 1));
+
+    let Some(Action::CommitChanges(selection)) = app.on_key(key('c')) else {
+        panic!("expected CommitChanges");
+    };
+    assert!(selection.whole_files.is_empty());
+    assert_eq!(selection.partial.len(), 1);
+    let partial = &selection.partial[0];
+    assert_eq!(partial.path, "a.txt");
+    assert_eq!(partial.accepted_hunks, vec![0]);
+    // ハッシュは行が持っていたものがそのまま渡る（適用側のTOCTOU照合の材料）。
+    assert_eq!(partial.workspace_hash, "ws-hash-of-a.txt");
+    assert_eq!(partial.overlay_hash, "ov-hash-of-a.txt");
+}
+
+/// 全ハンクをrejectした行は、ファイル単位でも部分適用でも対象にならない
+/// （何も適用せずオーバーレイに残す）。
+#[test]
+fn rejecting_every_hunk_applies_nothing_for_that_row() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.open_changes_panel(vec![two_hunk_row("a.txt")]);
+
+    app.on_key(code(KeyCode::Tab));
+    app.on_key(code(KeyCode::Enter)); // hunk 0をreject
+    app.on_key(code(KeyCode::Down));
+    app.on_key(code(KeyCode::Enter)); // hunk 1をreject
+
+    let Some(Action::CommitChanges(selection)) = app.on_key(key('c')) else {
+        panic!("expected CommitChanges");
+    };
+    assert!(selection.whole_files.is_empty());
+    assert!(selection.partial.is_empty());
+}
+
+/// ハンク単位操作が使えない行（新規作成・非UTF-8等）では、diffフォーカス中のEnterを無視する。
+#[test]
+fn hunk_toggle_is_ignored_when_hunk_ops_are_blocked() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    let mut row = two_hunk_row("fresh.txt");
+    row.review.hunk_block = Some(harness_sandbox::HunkBlock::Create);
+    app.open_changes_panel(vec![row]);
+
+    app.on_key(code(KeyCode::Tab));
+    app.on_key(code(KeyCode::Enter));
+    assert!(!panel(&app).is_hunk_rejected(0, 0));
+
+    // ファイル単位のacceptはそのまま効く。
+    let Some(Action::CommitChanges(selection)) = app.on_key(key('c')) else {
+        panic!("expected CommitChanges");
+    };
+    assert_eq!(selection.whole_files, vec!["fresh.txt".to_string()]);
+}
+
+/// PgUp/PgDnでdiffペインがスクロールし、上下ともクランプされる。
+#[test]
+fn page_keys_scroll_the_diff_pane_and_clamp() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.open_changes_panel(vec![two_hunk_row("a.txt")]);
+    assert_eq!(panel(&app).diff_scroll, 0);
+
+    app.on_key(code(KeyCode::PageDown));
+    assert_eq!(panel(&app).diff_scroll, 10);
+
+    // 何度押しても最終行を超えない。
+    for _ in 0..20 {
+        app.on_key(code(KeyCode::PageDown));
+    }
+    let max = panel(&app).diff_view().len() as u16 - 1;
+    assert_eq!(panel(&app).diff_scroll, max);
+
+    for _ in 0..40 {
+        app.on_key(code(KeyCode::PageUp));
+    }
+    assert_eq!(panel(&app).diff_scroll, 0);
+}
+
+/// diffペインは離れた変更をハンクとして分けて出し、間の共通行は省略表示にする
+/// （旧fold実装では全体が1塊になり、この省略行も存在しなかった）。
+#[test]
+fn diff_view_splits_hunks_and_marks_the_skipped_gap() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.open_changes_panel(vec![two_hunk_row("a.txt")]);
+
+    let view = panel(&app).diff_view();
+    let headers: Vec<&ReviewDiffLine> = view
+        .iter()
+        .filter(|l| matches!(l, ReviewDiffLine::Header { .. }))
+        .collect();
+    assert_eq!(headers.len(), 2, "view: {view:#?}");
+    assert!(view
+        .iter()
+        .any(|l| matches!(l, ReviewDiffLine::Skipped(s) if s.contains("skipped"))));
+}
+
+/// ハンクカーソルを動かすとdiffペインがその見出しまで追従する（画面外のハンクを
+/// トグルしていて位置が分からない、という状態にしない）。
+#[test]
+fn moving_the_hunk_cursor_scrolls_the_diff_pane_to_it() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.open_changes_panel(vec![two_hunk_row("a.txt")]);
+
+    app.on_key(code(KeyCode::Tab));
+    assert_eq!(panel(&app).diff_scroll, 0);
+    app.on_key(code(KeyCode::Down));
+    assert!(panel(&app).diff_scroll > 0);
+    let view = panel(&app).diff_view();
+    assert!(matches!(
+        view[panel(&app).diff_scroll as usize],
+        ReviewDiffLine::Header { hunk: 1, .. }
+    ));
+}
+
+/// 行を移り変わってもスクロール位置とハンクカーソルが持ち越されない
+/// （前の行の位置のまま別のdiffを見ると、何も無い場所を見ていることになる）。
+#[test]
+fn changing_rows_resets_the_diff_pane_position() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.open_changes_panel(vec![two_hunk_row("a.txt"), two_hunk_row("b.txt")]);
+
+    app.on_key(code(KeyCode::Tab));
+    app.on_key(code(KeyCode::Down)); // hunk 1へ（スクロールも動く）
+    app.on_key(code(KeyCode::Tab));
+    app.on_key(code(KeyCode::Down)); // 次の行へ
+
+    assert_eq!(panel(&app).selected, 1);
+    assert_eq!(panel(&app).hunk_cursor, 0);
+    assert_eq!(panel(&app).diff_scroll, 0);
 }
 
 // --- 縮退ガード（M21、`plans/DESIGN-COGNITION.md` §11.4） ---

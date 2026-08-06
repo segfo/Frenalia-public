@@ -82,7 +82,7 @@ impl AppState {
                     let old = input.get("old_string").and_then(|v| v.as_str());
                     let new = input.get("new_string").and_then(|v| v.as_str());
                     match (old, new) {
-                        (Some(old), Some(new)) => Some(line_diff(old, new)),
+                        (Some(old), Some(new)) => Some(diff_lines(old, new)),
                         _ => None,
                     }
                 } else {

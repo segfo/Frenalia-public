@@ -30,7 +30,14 @@ impl AppState {
                         FsStageCommand::List => Action::ListChanges,
                         FsStageCommand::Open => Action::OpenChangesPanel,
                         FsStageCommand::CommitAll => Action::CommitAllChanges,
-                        FsStageCommand::CommitFile(path) => Action::CommitChanges(vec![path]),
+                        // 非対話の1ファイルcommitはファイル単位のまま（ハンク選択は対話UIが担う、
+                        // `plans/PLAN-VSCODE-REVIEW.md`「CLIはファイル単位のまま」）。
+                        FsStageCommand::CommitFile(path) => {
+                            Action::CommitChanges(CommitSelection {
+                                whole_files: vec![path],
+                                partial: Vec::new(),
+                            })
+                        }
                         FsStageCommand::Discard => Action::DiscardChanges,
                         FsStageCommand::Resolve(path) => Action::ResolveChanges(path),
                     })
@@ -157,37 +164,20 @@ impl AppState {
             return None;
         }
 
-        if let Some(panel) = &mut self.changes_panel {
-            match key.code {
-                KeyCode::Esc => self.changes_panel = None,
-                KeyCode::Up => panel.selected = panel.selected.saturating_sub(1),
-                KeyCode::Down => {
-                    panel.selected = (panel.selected + 1).min(panel.rows.len().saturating_sub(1))
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    let idx = panel.selected;
-                    if !panel.rejected.remove(&idx) {
-                        panel.rejected.insert(idx);
-                    }
-                }
-                KeyCode::Char('c') => {
-                    let accepted: Vec<String> = panel
-                        .rows
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| !panel.rejected.contains(i))
-                        .map(|(_, row)| row.entry.path.clone())
-                        .collect();
-                    self.changes_panel = None;
-                    return Some(Action::CommitChanges(accepted));
-                }
-                KeyCode::Char('x') => {
-                    self.changes_panel = None;
-                    return Some(Action::DiscardChanges);
-                }
-                _ => {}
-            }
-            return None;
+        // レビューパネル表示中は全キーをパネルへ渡す。骨格（選択・トグル・スクロール・
+        // ハンク操作）はパネル自身が処理し、ここには**面ごとのアクションへの写像**だけが残る
+        // （`app::review`のモジュールdoc参照）。
+        if let Some(panel) = &mut self.review_panel {
+            let command = panel.on_key(key)?;
+            let panel = self.review_panel.take()?;
+            return match command {
+                ReviewCommand::Close => None,
+                ReviewCommand::DiscardAll => Some(Action::DiscardChanges),
+                ReviewCommand::Primary(outcome) => Some(Action::CommitChanges(commit_selection(
+                    &panel.rows,
+                    &outcome,
+                ))),
+            };
         }
 
         match key.code {

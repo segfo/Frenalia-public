@@ -7,7 +7,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use harness_core::{AgentEvent, RiskClass, StopReason, ToolOutput, Usage};
 use harness_engine::{parse_allowlist_rule, AllowlistRule, Decision, PermissionMode};
 
-use crate::diff::{line_diff, DiffLine};
+use harness_sandbox::textdiff::{diff_lines, DiffLine};
+
 use events::{pretty, MAX_OUTPUT_PREVIEW};
 
 /// transcript末尾に表示する一時的な「考え中」インジケータのスピナーグリフ。
@@ -45,6 +46,7 @@ pub struct PermissionView {
     pub input: String,
     /// `tool == "edit_file"`の場合、`old_string`/`new_string`から計算した差分（M9、
     /// DESIGN.md L349「edit_fileの差分プレビューを承認モーダル内に描画」）。
+    /// 差分エンジンはレビューパネルと共有の`harness_sandbox::textdiff`。
     pub diff: Option<Vec<DiffLine>>,
 }
 
@@ -55,21 +57,18 @@ pub struct PermissionView {
 mod commands;
 mod events;
 mod input;
+mod review;
 
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, SlashCommand};
+pub use review::{
+    commit_selection, CommitSelection, PartialFile, ReviewCommand, ReviewDiffLine, ReviewFocus,
+    ReviewPanelState, ReviewRow, ReviewTarget,
+};
 
 #[cfg(test)]
 #[path = "app_state_tests.rs"]
 mod tests;
-
-/// 変更（changes）パネルの表示用1行。`ChangeEntry`本体に加え、差分プレビュー
-/// （パネルを開いた時点で一度だけ計算、`diff.rs::line_diff`）を持つ。
-#[derive(Debug, Clone)]
-pub struct ChangeRow {
-    pub entry: harness_sandbox::ChangeEntry,
-    pub diff: Vec<DiffLine>,
-}
 
 /// ターン以外のバックグラウンド処理（`/compact`の要約）の進捗
 /// （[BUG-070](../../../docs/bugs/BUG-070.md)・[BUG-071](../../../docs/bugs/BUG-071.md)）。
@@ -107,15 +106,6 @@ impl BusyProgress {
     pub fn is_running(&self) -> bool {
         self.started_at.is_some()
     }
-}
-
-/// 変更パネルの状態。`rejected`に含まれるインデックスは`c`（コミット）から除外される
-/// （既定は全件accept、reject印を付けたものだけ除外するgit-add -p同様のUX）。
-#[derive(Debug, Clone)]
-pub struct ChangesPanelState {
-    pub rows: Vec<ChangeRow>,
-    pub selected: usize,
-    pub rejected: std::collections::HashSet<usize>,
 }
 
 pub struct AppState {
@@ -195,9 +185,9 @@ pub struct AppState {
     /// 使わない（Shift+Enterが送信になるかどうかはSHIFT修飾が実際に届くか否かで自然に決まる）。
     /// 入力欄のヒント文字列（Alt+Enter/Shift+Enterどちらを案内するか）の表示専用。
     pub host_is_vscode: bool,
-    /// 変更（changes）パネル（M10）。`Some`の間は他の全キー入力をパネル操作専用に奪う
-    /// （`pending_permission`と同じ排他パターン）。
-    pub changes_panel: Option<ChangesPanelState>,
+    /// レビューパネル（M10の変更パネルを一般化したもの、`app::review`）。`Some`の間は
+    /// 他の全キー入力をパネル操作専用に奪う（`pending_permission`と同じ排他パターン）。
+    pub review_panel: Option<ReviewPanelState>,
     /// ターン以外のバックグラウンド処理（`/compact`の要約）の進捗表示（BUG-070・BUG-071）。
     /// `thinking_progress`と同じくtranscript末尾への一時表示で、`transcript`本体には積まない。
     pub busy_progress: Option<BusyProgress>,
@@ -239,18 +229,14 @@ impl AppState {
             enter_submits: false,
             key_debug: false,
             host_is_vscode: false,
-            changes_panel: None,
+            review_panel: None,
             busy_progress: None,
         }
     }
 
-    /// 変更パネルを開く（既定で全件accept、`rejected`は空）。
-    pub fn open_changes_panel(&mut self, rows: Vec<ChangeRow>) {
-        self.changes_panel = Some(ChangesPanelState {
-            rows,
-            selected: 0,
-            rejected: Default::default(),
-        });
+    /// 変更（CoW/Staged）のレビューパネルを開く（既定で全件accept、reject印は空）。
+    pub fn open_changes_panel(&mut self, rows: Vec<ReviewRow>) {
+        self.review_panel = Some(ReviewPanelState::changes(rows));
     }
 
     /// キーイベントecho（`note_key_event`）を有効化し、有効である旨のバナーをtranscriptへ出す。

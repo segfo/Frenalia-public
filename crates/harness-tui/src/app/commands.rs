@@ -93,9 +93,10 @@ pub enum Action {
     /// を呼ぶ（`AppState`自体はサンドボックスへアクセスしない）。既にパネルが開いていても
     /// 単に最新の変更セットで開き直す（トグルではない）。
     OpenChangesPanel,
-    /// 変更パネルで`c`（コミット）を押した結果、または`/fsstage commit <file>`/`commit_all`。
-    /// reject印の付いたエントリを除いたパス集合（`SandboxFs::apply`の`only_paths`にそのまま渡す）。
-    CommitChanges(Vec<String>),
+    /// レビューパネルで`c`（コミット）を押した結果、または`/fsstage commit <file>`。
+    /// ファイルまるごと適用する分（`SandboxFs::apply`の`only_paths`）と、ハンクを選んで
+    /// 適用する分（`SandboxFs::apply_hunks`）の両方を持つ（`app::review::commit_selection`）。
+    CommitChanges(CommitSelection),
     /// `/fsstage commit_all`（非対話、パネルを開かず全件commit）。
     CommitAllChanges,
     /// `/fsstage list`（非対話、パネルを開かずtranscriptへテキスト表示）。

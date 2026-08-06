@@ -21,3 +21,7 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 unicode-width = "0.2.2"
+
+[dev-dependencies]
+# `review_flow_tests`: 実FS上のオーバーレイに対して「パネル操作→部分適用」を通しで確かめる。
+tempfile = "3.27.0"

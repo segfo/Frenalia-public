@@ -36,9 +36,15 @@
 pub mod elevated_launch;
 pub mod manifest;
 pub mod overlay;
+/// オーバーレイ変更のハンク単位レビュー（材料の計算）と部分適用。`overlay`本体から分けた
+/// のは1ファイル1,000行の上限（`docs/CODE-STRUCTURE-RULES.md`規則1）と、
+/// 「1エントリ全体を適用する」既存経路と「ハンクを選んで合成する」経路が別の責務のため。
+pub mod overlay_hunks;
 pub mod read_scope;
 pub mod resolve;
 pub mod secret_env;
+/// レビュー面の差分エンジン（表示側と適用側で共有する唯一のハンク計算）。
+pub mod textdiff;
 
 /// どのシェル隔離Tierを選ぶかの判定。Tier横断のためどの`tierN`にも属さない。
 pub mod shell_tier;
@@ -80,6 +86,8 @@ pub mod tier2b;
 
 pub use manifest::ManifestOp;
 pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};
+pub use overlay_hunks::{FileReview, HunkBlock, HunkSelection};
+pub use textdiff::{DiffHunk, DiffKind, DiffLine};
 pub use read_scope::{ReadScope, ReadScopeError};
 pub use secret_env::{build_child_env, git_hardening_env};
 pub use shell_tier::{select_tier, FsAccess, FsPassthrough, TierError, WorkspaceWriteMode};

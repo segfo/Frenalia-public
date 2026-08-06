@@ -86,9 +86,9 @@ pub(crate) fn simple_glob_match(pattern: &str, text: &str) -> bool {
 /// `--staged`/`--cow`いずれかが有効なときの唯一のオーバーレイ実体。`dir`は絶対パス
 /// （`--staged`ならworkspace内`<workspace_root>/<sandbox_dir>`、`--cow`ならworkspace外の
 /// CoW upperディレクトリ）。
-struct OverlayBackend {
-    dir: PathBuf,
-    jail: WorkspaceJail,
+pub(crate) struct OverlayBackend {
+    pub(crate) dir: PathBuf,
+    pub(crate) jail: WorkspaceJail,
     /// 台帳に無い実体がオーバーレイに現れ得るか（[`effective_changes`]が走査するか）。
     ///
     /// `true`になるのは**オーバーレイがworkspaceの外にある場合＝`--cow`のupper**だけである。
@@ -178,13 +178,27 @@ pub struct ApplyReport {
     pub unledgered: Vec<String>,
 }
 
+impl ApplyReport {
+    /// 別の`apply`呼び出しの結果を取り込む。1回のコミット操作が「ファイル単位の`apply`」と
+    /// 「ハンク単位の`apply_hunks`（ファイルごとに1回）」へ分かれるため、UIへ出す前に
+    /// 1つの報告へまとめる（`harness-tui::push_apply_report`は1件しか受け取らない）。
+    pub fn merge(&mut self, other: ApplyReport) {
+        self.applied.extend(other.applied);
+        self.conflicts.extend(other.conflicts);
+        self.ext_blocked.extend(other.ext_blocked);
+        self.hard_denied.extend(other.hard_denied);
+        self.rejected.extend(other.rejected);
+        self.unledgered.extend(other.unledgered);
+    }
+}
+
 /// 書込リダイレクト・read-through・操作台帳・tombstoneを仲介するオーバーレイFS。
 /// `overlay`が`None`（純live、`StagingConfig::default()`かつ`cow_upper_dir=None`）なら、
 /// 内部の`WorkspaceJail`をそのまま素通しする（M9までの既存挙動と等価）。
 pub struct SandboxFs {
-    jail: WorkspaceJail,
+    pub(crate) jail: WorkspaceJail,
     workspace_root: PathBuf,
-    overlay: Option<OverlayBackend>,
+    pub(crate) overlay: Option<OverlayBackend>,
     read_scope: ReadScope,
 }
 
@@ -715,7 +729,7 @@ fn apply_overlay_changes(
 /// 台帳の相対パスを検査し、**正規形**（`.`成分を除き`/`区切りに揃えたもの）を返す。
 /// 判定の実体は`harness_change_ledger::validate_relative_path`が持つ（`check_relative_path`と
 /// 同じ関数。2箇所へ別々に書かない、`docs/CODE-STRUCTURE-RULES.md`規則5）。
-fn canonical_ledger_path(path: &str) -> Result<String, String> {
+pub(crate) fn canonical_ledger_path(path: &str) -> Result<String, String> {
     match harness_change_ledger::validate_relative_path(path) {
         Ok(canonical) => Ok(normalize_str(&canonical)),
         Err(harness_change_ledger::PathRejection::Escape) => {
