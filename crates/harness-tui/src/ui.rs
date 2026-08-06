@@ -382,6 +382,39 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &AppState) -> u16 {
     max_offset
 }
 
+/// ステータスバーに出すモデル名の上限文字数。超えた分は中間を省略する。
+///
+/// ローカル推論サーバのモデル名は長くなりがちで（`qwen3.6-35b-a3b-uncensored-genesis-v2-apex-mtp`
+/// のように45文字を超える）、そのまま出すとステータスバーの他の項目——`stop=`やトークン数——が
+/// 画面右端で切れて読めなくなる。
+const MODEL_LABEL_MAX_CHARS: usize = 25;
+
+/// `s`が`max_chars`を超える場合、**中間**を`…`1文字に置き換えて全体をちょうど`max_chars`に収める。
+///
+/// 末尾を落とす素朴な切詰めにしないのは、モデル名では前（系列名）と後ろ（版・量子化）の
+/// **両端が識別に効く**ため。`qwen3.6-35b-…-v2-apex-mtp`のように、どの系列のどの版かが
+/// 残る形にする。
+///
+/// 文字数（`chars().count()`）で数える。バイト数で切ると日本語を含む名前で境界が壊れる
+/// （`harness_core::text::truncate_head_tail`と同じ理由。あちらは改行と件数付きの注記を挟む
+/// **本文向け**で、1行に収めたいラベルには使えないためここで別に持つ）。
+fn elide_middle(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    // `…`自身が1文字使うので、収まらないなら省略記号だけにする。
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let keep = max_chars - 1;
+    let head_len = keep / 2;
+    let tail_len = keep - head_len;
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s.chars().skip(total - tail_len).collect();
+    format!("{head}…{tail}")
+}
+
 fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
     let stop = app
         .last_stop_reason
@@ -401,7 +434,11 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
     };
     let text = format!(
         " {} | model={} | stop={} | tokens turn({turn_tokens}) session(in={} out={})",
-        app.provider_label, app.model, stop, app.session_usage.input, app.session_usage.output,
+        app.provider_label,
+        elide_middle(&app.model, MODEL_LABEL_MAX_CHARS),
+        stop,
+        app.session_usage.input,
+        app.session_usage.output,
     );
     let paragraph = Paragraph::new(Line::from(Span::styled(
         text,
@@ -588,6 +625,37 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// 上限以下はそのまま。1文字も足さない（短いモデル名に`…`が付いて見えるのは誤り）。
+    #[test]
+    fn a_name_that_fits_is_returned_verbatim() {
+        assert_eq!(elide_middle("claude-opus-5", 25), "claude-opus-5");
+        assert_eq!(elide_middle(&"x".repeat(25), 25), "x".repeat(25));
+    }
+
+    /// 長い名前は**ちょうど上限の文字数**に収まり、系列名と版の両端が残る。
+    #[test]
+    fn a_long_name_keeps_both_ends_and_fits_exactly() {
+        let out = elide_middle("qwen3.6-35b-a3b-uncensored-genesis-v2-apex-mtp", 25);
+        assert_eq!(out.chars().count(), 25, "{out}");
+        assert_eq!(out, "qwen3.6-35b-…-v2-apex-mtp");
+    }
+
+    /// マルチバイト文字の途中で切らない（バイト数で切るとパニックする）。
+    #[test]
+    fn a_multibyte_name_is_cut_on_character_boundaries() {
+        let out = elide_middle(&"あ".repeat(100), 25);
+        assert_eq!(out.chars().count(), 25, "{out}");
+        assert!(out.starts_with("ああ") && out.ends_with("ああ"), "{out}");
+    }
+
+    /// 省略記号すら入らない上限でもパニックせず、上限を超えない。
+    #[test]
+    fn a_degenerate_limit_does_not_panic_or_overflow() {
+        assert_eq!(elide_middle("abcdef", 1), "…");
+        assert_eq!(elide_middle("abcdef", 0), "…");
+        assert_eq!(elide_middle("abcdef", 2).chars().count(), 2);
     }
 
     #[test]
