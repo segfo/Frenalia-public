@@ -391,6 +391,31 @@ pub fn spawn(
     net: NetworkCapability,
     cow: Option<CowInject<'_>>,
 ) -> Result<AppContainerChild, AppContainerError> {
+    spawn_with_workspace(exe, args, cwd, env, want_stdin, container_sid, net, cow, None)
+}
+
+/// [`spawn`]の、**workspaceツリーへのアクセスを与える版**（D-54）。
+///
+/// workspace本体のACEはworkspace＋モード単位のcapability SID宛に付いている
+/// （[`crate::tier2a::workspace_capability`]）ので、workspaceを読み書きする子には
+/// そのcapabilityをトークンへ積まないと何も見えない。
+///
+/// **既定（[`spawn`]）は積まない側**である。積まないと起こるのは`ACCESS_DENIED`＝
+/// fail-closedであり、逆向き（うっかり積む）だと境界が黙って消える。実際、MCPサーバは
+/// 専用プロファイルで起動し**workspaceを既定で持たない**（D-38 §3.2）——ここが既定で
+/// 積む設計だったら、MCPサーバがworkspace全体へ到達していた。
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_with_workspace(
+    exe: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(String, String)],
+    want_stdin: bool,
+    container_sid: PSID,
+    net: NetworkCapability,
+    cow: Option<CowInject<'_>>,
+    workspace_cap: Option<PSID>,
+) -> Result<AppContainerChild, AppContainerError> {
     const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 
     // D-37: package SIDはセッションごとに変わるが、祖先ディレクトリのtraverse ACEは
@@ -402,6 +427,13 @@ pub fn spawn(
         Sid: traverse_cap.as_psid(),
         Attributes: SE_GROUP_ENABLED,
     }];
+    // D-54: workspaceツリーのACEの主体。呼び出し側が明示したときだけ積む（上記doc）。
+    if let Some(sid) = workspace_cap {
+        capabilities.push(SID_AND_ATTRIBUTES {
+            Sid: sid,
+            Attributes: SE_GROUP_ENABLED,
+        });
+    }
 
     match net {
         NetworkCapability::Deny => {

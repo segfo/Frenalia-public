@@ -26,11 +26,40 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    // D-37: workspaceのACEはセッションごとの package SID 宛になった。撤収対象は
-    // 「旧共有プロファイル」＋「生きていないセッションのプロファイル」で、実行中のセッションの
-    // ぶんは触らない（実行中の他セッションから権限を奪わない、BUG-053と同じ原則）。
     let mut failures = Vec::new();
     let mut revoked = 0usize;
+
+    // D-54: workspaceツリーのACEの**現在の主体**は、workspace＋モード単位のcapability SIDで
+    // ある。これはセッションより長生きする（明示的に消すまで残る）ので、`fs revoke-workspace`が
+    // 唯一の撤収経路になる。全モード分を剥がしてから台帳のエントリを落とす——順序が逆だと
+    // 主体を引けなくなり、撤収経路の無い孤立ACEがツリーに残る。
+    let mut revoked_capabilities = 0usize;
+    for mode in harness_sandbox::tier2a::workspace_ledger::KNOWN_MODES {
+        let Some(name) =
+            harness_sandbox::tier2a::workspace_capability::lookup_capability_name(&canonical, mode)
+        else {
+            continue;
+        };
+        match harness_sandbox::tier2a::win_appcontainer::workspace_capability_sid(&canonical, mode) {
+            Ok(sid) => match harness_sandbox::tier2a::win_appcontainer::revoke_ace_recursive(
+                &canonical,
+                sid.as_psid(),
+            ) {
+                Ok(()) => {
+                    revoked_capabilities += 1;
+                    harness_sandbox::tier2a::workspace_capability::forget_capability(
+                        &canonical, mode,
+                    );
+                }
+                Err(e) => failures.push(format!("{name} ({mode}): {e}")),
+            },
+            Err(e) => failures.push(format!("{name} ({mode}): failed to resolve SID: {e}")),
+        }
+    }
+
+    // D-37時代の残骸（package SID 宛のACE）も同じ機会に剥がす。撤収対象は「旧共有
+    // プロファイル」＋「生きていないセッションのプロファイル」で、実行中のセッションの
+    // ぶんは触らない（実行中の他セッションから権限を奪わない、BUG-053と同じ原則）。
     for profile in harness_sandbox::tier2a::session_profile::revocable_profile_names() {
         let sid = match harness_sandbox::tier2a::win_appcontainer::ensure_profile(&profile) {
             Ok(sid) => sid,
@@ -50,8 +79,8 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
     if failures.is_empty() {
         harness_sandbox::tier2a::workspace_ledger::remove_workspace_entry(&canonical);
         println!(
-            "revoked workspace access for {} harness profile(s): {}",
-            revoked,
+            "revoked workspace access for {revoked_capabilities} workspace capability/capabilities \
+             and {revoked} harness profile(s): {}",
             canonical.display()
         );
         ExitCode::SUCCESS

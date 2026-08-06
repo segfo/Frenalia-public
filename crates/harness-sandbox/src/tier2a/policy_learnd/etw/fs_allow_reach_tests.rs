@@ -54,9 +54,13 @@
 //! ノードも戻り値に含めるため、戻り値をそのまま撤収対象にすると元から在ったACEまで剥がす）。
 
 use crate::shell_tier::{FsAccess, FsPassthrough, WorkspaceWriteMode};
+// D-54: `preflight`が付けるworkspace ACEの主体はworkspace capability SIDなので、子を起こす側は
+// 本番（`run_shell`）と同じくそれをトークンへ積む必要がある。素の`spawn`だとworkspaceが
+// 一切見えず、測定そのものが成立しない（`spawn_in_workspace`のdoc参照）。
+use crate::tier2a::win_appcontainer::test_support::spawn_in_workspace;
 use crate::tier2a::win_appcontainer::{
     grant_ace_inheritable_access, preflight, preview_traverse_chain, probe_passthrough,
-    redirector_dll_paths, resolve_shell, spawn, traverse_capability_sid, NetworkCapability,
+    redirector_dll_paths, resolve_shell, traverse_capability_sid, NetworkCapability,
 };
 
 use super::parse::to_settings_path;
@@ -306,7 +310,7 @@ fn run_phase(
     let script = build_script(cells);
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &script],
         workspace,
@@ -446,7 +450,7 @@ fn probe_load_library_in_appcontainer(
     }
 
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &staged.to_string_lossy(),
         &[
             "--load-library",
@@ -686,7 +690,7 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     // 「祖先が無い」と言い続けるなら診断はまだ壊れている。
     println!("=== D8/D9 re-probed after the traverse grant (condition b) ===");
     for fp in &passthrough {
-        match probe_passthrough(sid.as_psid(), restore.sid.as_psid(), &workspace, fp) {
+        match probe_passthrough(sid.as_psid(), restore.sid.as_psid(), None, &workspace, fp) {
             None => println!("  {} : reachable (D8 passed)", fp.path.display()),
             Some(diagnosis) => println!("  {} : {diagnosis}", fp.path.display()),
         }

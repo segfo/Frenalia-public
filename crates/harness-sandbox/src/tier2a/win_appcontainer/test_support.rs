@@ -8,6 +8,52 @@
 //! `docs/CODE-STRUCTURE-RULES.md`規則5により、同じ`ScopeGuard`を各テストファイルへ複製せず
 //! ここ1箇所に置く（元は`cow_containment_tests.rs`のprivate定義だった）。
 
+/// **本番の`run_shell`と同じ形で**AppContainer子を起こす（D-54）。
+///
+/// `preflight`はworkspaceツリーのACEを、セッションのpackage SIDではなく
+/// **workspace＋モード単位のcapability SID**へ付ける。そのcapabilityを子のトークンへ積まないと
+/// workspaceが一切見えず、PowerShellはcwdの設定に失敗して`C:\Windows\System32\...`へ
+/// フォールバックする（実測: `preflight`を呼ぶ実機テスト12件がこれで落ちた）。
+///
+/// `cwd`が**workspace rootそのもの**であることを前提にしている（`preflight`へ渡したのと同じ
+/// パス）。モードは台帳を引いて判定する——このテスト群のworkspaceは毎回新しい一時ディレクトリ
+/// で、`preflight`が登録するモードはちょうど1つなので曖昧さが無い。台帳に無ければ`None`を
+/// 積む（＝素の[`super::spawn`]と同じ）。
+///
+/// **`spawn`のシグネチャをそのまま写している**ので、テストの呼び出し側は関数名を差し替える
+/// だけでよい。引数を1本足す形にしなかったのは、19箇所の呼び出しを機械的に置換できる方が
+/// 取りこぼしが無いためである。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_in_workspace(
+    exe: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+    env: &[(String, String)],
+    want_stdin: bool,
+    container_sid: windows::Win32::Security::PSID,
+    net: super::NetworkCapability,
+    cow: Option<super::CowInject<'_>>,
+) -> Result<super::AppContainerChild, super::AppContainerError> {
+    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let cap = crate::tier2a::workspace_ledger::KNOWN_MODES
+        .iter()
+        .find(|mode| {
+            crate::tier2a::workspace_capability::lookup_capability_name(&canonical, mode).is_some()
+        })
+        .and_then(|mode| super::workspace_capability_sid(&canonical, mode).ok());
+    super::spawn_with_workspace(
+        exe,
+        args,
+        cwd,
+        env,
+        want_stdin,
+        container_sid,
+        net,
+        cow,
+        cap.as_ref().map(|s| s.as_psid()),
+    )
+}
+
 /// パニック時にも確実にクロージャを実行する簡易scopeguard（`scopeguard`クレート依存を
 /// 避けるための最小実装。テストコード専用）。
 pub(super) struct ScopeGuard<F: FnMut()>(F);

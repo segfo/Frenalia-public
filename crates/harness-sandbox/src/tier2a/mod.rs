@@ -12,6 +12,7 @@
 //! | [`netfilterd`] | ネットワークポリシーを適用する常駐daemonとのIPC（WFPフィルタ投入を依頼する） |
 //! | [`traverse_ledger`] | 祖先ディレクトリへ付与したtraverse ACEの記録（D10の巻き戻し用） |
 //! | [`workspace_ledger`] | workspace/CoW upper_dirの生存管理（名前付きmutex）と付与済みworkspaceの一覧 |
+//! | [`workspace_capability`] | workspace＋モード単位のFS付与の主体（capability名とその秘密、D-54） |
 //! | `wfp` | Windows Filtering Platformの薄いラッパ。`netfilterd`（昇格側）からのみ使う |
 //! | `loopback_exemption` | AppContainer loopback exemption（マシン全体で1本）のプロセス跨ぎ所有権管理（D-36） |
 //! | [`session_profile`] | セッション単位のAppContainerプロファイル名・生存マーカー・台帳・孤児回収（D-37） |
@@ -32,6 +33,10 @@ pub mod mcp_profile;
 /// コマンドが非Windowsでも空台帳を表示できるよう、全プラットフォームでコンパイルする）。
 /// Tier2a本体（下記）はWin32 API依存のためwindows専用。
 pub mod traverse_ledger;
+
+/// workspace＋モード単位のcapability名とその秘密（D-54）。`session_profile`と同じ理由で
+/// windows専用にしない（名前の導出・台帳・検証は純粋関数で、CSPRNGだけがcfg分岐する）。
+pub mod workspace_capability;
 
 #[cfg(windows)]
 pub mod netfilterd;

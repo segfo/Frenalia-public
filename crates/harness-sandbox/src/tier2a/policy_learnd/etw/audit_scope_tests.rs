@@ -27,7 +27,8 @@
 //! 置かないのは、途中で落ちたときに設定が残って監査ログを出し続けるのを避けるため。
 
 use crate::shell_tier::WorkspaceWriteMode;
-use crate::tier2a::win_appcontainer::{preflight, resolve_shell, spawn, NetworkCapability};
+use crate::tier2a::win_appcontainer::test_support::spawn_in_workspace;
+use crate::tier2a::win_appcontainer::{preflight, resolve_shell, NetworkCapability};
 
 /// `Object Access > File System`サブカテゴリのGUID。**ロケール非依存で指定するため**に使う
 /// （この機のauditpolは日本語で「ファイル システム」と表示する）。
@@ -191,7 +192,7 @@ fn can_global_object_access_auditing_be_scoped_to_an_appcontainer_package_sid() 
     );
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &command],
         workspace.path(),

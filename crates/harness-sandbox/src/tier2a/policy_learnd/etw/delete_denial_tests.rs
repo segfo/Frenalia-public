@@ -53,7 +53,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use crate::shell_tier::WorkspaceWriteMode;
-use crate::tier2a::win_appcontainer::{preflight, resolve_shell, spawn, NetworkCapability};
+use crate::tier2a::win_appcontainer::test_support::spawn_in_workspace;
+use crate::tier2a::win_appcontainer::{preflight, resolve_shell, NetworkCapability};
 
 use super::parse::to_settings_path;
 use super::session::EtwFsSession;
@@ -145,7 +146,7 @@ fn where_does_a_delete_denial_surface() {
 
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &script],
         workspace.path(),

@@ -41,6 +41,10 @@ windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Isolation",
+    # D-54: workspace capabilityの128bit秘密をOSのCSPRNG（`BCryptGenRandom`）で生成する。
+    # 秘密が推測できるとcapability名が導出でき、別ローカルアカウントからworkspace全体のRWへ
+    # 到達されるため、ここは弱い乱数へ退避せず失敗させる（`workspace_capability`のdoc参照）。
+    "Win32_Security_Cryptography",
     "Win32_System_Threading",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",

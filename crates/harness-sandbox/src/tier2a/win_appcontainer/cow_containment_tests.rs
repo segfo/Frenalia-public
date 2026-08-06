@@ -13,7 +13,7 @@
 //! **`--test-threads=1`で実行すること。** 並列だとAppContainerプロファイル・共有祖先への
 //! traverse ACE付与といったマシン全体の共有状態を複数テストが同時に触るため不安定になる。
 
-use super::test_support::scopeguard;
+use super::test_support::{scopeguard, spawn_in_workspace};
 use super::*;
 use crate::manifest::ManifestOp;
 use crate::overlay::{ApplyOptions, ApplyReport, SandboxError, SandboxFs};
@@ -75,7 +75,7 @@ fn cow_write_is_redirected_to_upper_and_workspace_stays_unchanged() {
 
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", COW_WRITE_PROBE_COMMAND],
         workspace.path(),
@@ -172,7 +172,7 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
         let mut env = crate::secret_env::build_child_env();
         // `spawn`が後から積む正規化済みの値より前に並ぶ（安定ソート）。
         env.insert(0, ("HARNESS_COW_WORKSPACE".to_string(), raw_spelling.clone()));
-        let child = spawn(
+        let child = spawn_in_workspace(
             &shell,
             &["-NoProfile", "-NonInteractive", "-Command", &script],
             workspace.path(),
@@ -337,7 +337,7 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
     );
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &script],
         workspace.path(),
@@ -409,7 +409,7 @@ fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
     );
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &script],
         workspace.path(),
@@ -463,7 +463,7 @@ fn workspace_write_fails_closed_without_redirector_injection() {
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
     // `cow: None` — DLLを注入しない。ACLだけが境界として効くはず。
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", COW_WRITE_PROBE_COMMAND],
         workspace.path(),
@@ -512,7 +512,7 @@ fn cow_write_from_grandchild_process_is_redirected_to_upper() {
         exit 0";
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", CMD],
         workspace.path(),
@@ -590,7 +590,7 @@ fn cow_write_via_createprocessa_grandchild_is_redirected_to_upper() {
 
     let probe = tier2a_proc_probe_x64_exe();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         probe.to_str().expect("probe path is valid utf-8"),
         &[
             "--spawn-via-createprocessa",
@@ -655,7 +655,7 @@ fn cow_write_via_winexec_grandchild_is_redirected_to_upper() {
 
     let probe = tier2a_proc_probe_x64_exe();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         probe.to_str().expect("probe path is valid utf-8"),
         &[
             "--spawn-via-winexec",
@@ -728,7 +728,7 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_upper() {
         exit 0";
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", CMD],
         workspace.path(),
@@ -808,7 +808,7 @@ fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
         exit 0";
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", CMD],
         workspace.path(),
@@ -894,7 +894,7 @@ fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
         }";
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", CMD],
         workspace.path(),
@@ -967,7 +967,7 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
         }";
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", CMD],
         workspace.path(),
@@ -1103,7 +1103,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
     // 両方を先にspawnしてから待つ（＝両プロセスが実際に同時にOS上で走っている状態を作る）。
-    let child_a = spawn(
+    let child_a = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &cmd_a],
         workspace.path(),
@@ -1118,7 +1118,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
         }),
     )
     .expect("spawn A with cow injection should succeed");
-    let child_b = spawn(
+    let child_b = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &cmd_b],
         workspace.path(),
@@ -1264,7 +1264,7 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
         }";
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", CMD],
         workspace.path(),
@@ -1363,7 +1363,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
             Write-Output $_.Exception.Message; \
             exit 9 \
         }";
-    let child1 = spawn(
+    let child1 = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", DELETE_CMD],
         workspace.path(),
@@ -1405,7 +1405,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
     const CHECK_CMD: &str = "\
         (Test-Path -LiteralPath 'doomed.txt') | Write-Output; \
         exit 0";
-    let child2 = spawn(
+    let child2 = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", CHECK_CMD],
         workspace.path(),
@@ -1742,7 +1742,7 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
 
         let env = crate::secret_env::build_child_env();
-        let spawn_result = spawn(
+        let spawn_result = spawn_in_workspace(
             &gen1_exe.display().to_string(),
             &args_ref,
             workspace.path(),
@@ -2006,7 +2006,7 @@ fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_upper
 
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &probe],
         workspace.path(),

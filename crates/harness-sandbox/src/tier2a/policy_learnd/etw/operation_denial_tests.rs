@@ -40,7 +40,8 @@ use windows::Win32::Security::NO_INHERITANCE;
 use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE};
 
 use crate::shell_tier::WorkspaceWriteMode;
-use crate::tier2a::win_appcontainer::{preflight, resolve_shell, spawn, NetworkCapability};
+use crate::tier2a::win_appcontainer::test_support::spawn_in_workspace;
+use crate::tier2a::win_appcontainer::{preflight, resolve_shell, NetworkCapability};
 
 use super::parse::{to_settings_path, STATUS_ACCESS_DENIED};
 use super::session::{
@@ -257,7 +258,7 @@ fn where_does_an_operation_stage_denial_surface() {
 
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &script],
         workspace.path(),

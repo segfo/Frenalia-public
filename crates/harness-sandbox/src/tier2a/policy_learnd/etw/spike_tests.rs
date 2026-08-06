@@ -408,7 +408,8 @@ fn session_enabled_kernel_process(outcome: &super::session::EtwFsOutcome) -> boo
 #[ignore = "requires administrator rights (ETW) and creates an AppContainer profile; run via dev-elevated-run.exe e2e-policy-learn"]
 fn appcontainer_child_denials_are_observable_and_attributable() {
     use crate::shell_tier::WorkspaceWriteMode;
-    use crate::tier2a::win_appcontainer::{preflight, spawn};
+    use crate::tier2a::win_appcontainer::preflight;
+    use crate::tier2a::win_appcontainer::test_support::spawn_in_workspace;
     use crate::tier2a::win_appcontainer::NetworkCapability;
 
     use super::scope::{ScopeTracker, ScopeVerdict};
@@ -449,7 +450,7 @@ fn appcontainer_child_denials_are_observable_and_attributable() {
     // シェルの解決も既存テストと同じ`resolve_shell()`に合わせる。
     let (shell, _) = crate::tier2a::win_appcontainer::resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn(
+    let child = spawn_in_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &command],
         workspace.path(),

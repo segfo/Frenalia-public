@@ -284,7 +284,8 @@ fn do_delete_and_rename_events_fire_when_the_operation_is_denied() {
 #[ignore = "requires administrator rights (ETW) and creates an AppContainer profile; run via dev-elevated-run.exe etw-diagnostics"]
 fn attribution_rate_for_very_short_lived_children() {
     use crate::shell_tier::WorkspaceWriteMode;
-    use crate::tier2a::win_appcontainer::{preflight, spawn, NetworkCapability};
+    use crate::tier2a::win_appcontainer::test_support::spawn_in_workspace;
+    use crate::tier2a::win_appcontainer::{preflight, NetworkCapability};
 
     const CHILDREN: usize = 12;
 
@@ -300,7 +301,7 @@ fn attribution_rate_for_very_short_lived_children() {
     let mut spawned_pids = Vec::new();
     let env = crate::secret_env::build_child_env();
     for _ in 0..CHILDREN {
-        match spawn(
+        match spawn_in_workspace(
             "cmd.exe",
             &["/c", "exit"],
             workspace.path(),

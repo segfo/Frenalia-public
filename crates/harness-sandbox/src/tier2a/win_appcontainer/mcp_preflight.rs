@@ -79,12 +79,20 @@ pub fn preflight_mcp_server(
     }
 
     if let Some((workspace_root, access)) = req.workspace {
+        // D-54: workspaceツリーへDACLを書く経路なので、背景の救済walk（`grant_job`）と
+        // 交差させない。`grant_ace_mask`は「読む→ACEを足す→書き戻す」なので、同じノードで
+        // 並行すると片方のACEが消える。走っていなければ即座に返る。
+        grant_job::wait_until_done().map_err(AppContainerError::Preflight)?;
         grant_ace_inheritable_access(workspace_root, sid.as_psid(), access)?;
         crate::tier2a::session_profile::record_mcp_granted_path(&profile_name, workspace_root);
         // P-08: `.harness`はどのMCPサーバからも開けない。workspaceへACEを付けた場合、
         // 継承でこの制御ディレクトリまで届いてしまうので、`run_shell`側と同じ経路で
         // package SIDのACEを除去しDACLをPROTECTED化する（承認台帳の自己書換を防ぐ、D-39）。
-        protect_harness_control_dir_from_appcontainer(workspace_root, sid.as_psid())?;
+        //
+        // 剥がすのは**このMCPサーバのpackage SIDだけ**でよい。MCPサーバはworkspace
+        // capability（D-54）をトークンへ積まない（`spawn`は既定で積まない、D-38 §3.2で
+        // workspaceは既定の許可対象ではない）ので、capability宛のACEはここでは主体にならない。
+        protect_harness_control_dir_from_appcontainer(workspace_root, &[sid.as_psid()])?;
     }
 
     Ok(McpPreflightOutcome {

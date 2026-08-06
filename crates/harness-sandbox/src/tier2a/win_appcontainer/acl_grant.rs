@@ -54,6 +54,90 @@ pub(crate) fn collect_dirs_and_files(
 /// 使うと、aclapiのツリー走査・パッケージSID解決RPCを一切経由せず、このオブジェクトのDACLだけを
 /// 直接差し替えられる。`grant_ace_recursive_ro`等の**意図的にツリー全体へ伝播/全走査したい既存
 /// 経路はこの関数を使わない**（そちらは`SetNamedSecurityInfoW`のままでよい、伝播が目的のため）。
+/// `HARNESS_PREFLIGHT_TIMING=1`のとき、起動時のACL作業の各段の所要時間をstderrへ出す
+/// （既定では何も出さない）。
+///
+/// preflightは「なぜか起動が遅い」の犯人になりやすい。実測で60秒かかっていた
+/// [BUG-081](../../../../docs/bugs/BUG-081.md)では、段ごとの内訳が出せないために
+/// 「どこが遅いか」の推測を何度も外した。次に遅くなったときに同じことを繰り返さないよう、
+/// 計測フック自体を残す。
+pub(crate) struct PhaseTiming {
+    enabled: bool,
+    started: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl PhaseTiming {
+    pub(crate) fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            enabled: std::env::var_os("HARNESS_PREFLIGHT_TIMING")
+                .is_some_and(|v| !v.is_empty() && v != "0"),
+            started: now,
+            last: now,
+        }
+    }
+
+    pub(crate) fn mark(&mut self, label: &str) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        eprintln!(
+            "preflight timing: {label} +{:.2}s (total {:.2}s)",
+            now.duration_since(self.last).as_secs_f32(),
+            now.duration_since(self.started).as_secs_f32()
+        );
+        self.last = now;
+    }
+
+    /// 件数だけでは追えない事象（「どのノードが継承から漏れたのか」等）のサンプルを出す。
+    /// 時計は進めない——観測の出力であって段の区切りではないため。
+    pub(crate) fn mark_lines(&self, label: &str, lines: &[String]) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!("preflight timing: {label} (showing {}):", lines.len());
+        for line in lines {
+            eprintln!("preflight timing:     {line}");
+        }
+    }
+}
+
+/// DACLをどう書くか。**この選択がツリー全体の挙動を決める**ので、呼び出し側に明示させる
+/// （[BUG-081](../../../../docs/bugs/BUG-081.md): 既定が`SingleObject`だと知らないまま
+/// `grant_ace_inheritable_*`が伝播を失い、フォールバックが全ノードで発火していた）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaclWrite {
+    /// このオブジェクトのDACLだけを差し替える（[`set_dacl_single_object`]）。
+    /// 子孫は一切触らない＝**継承ACEを足しても既存の子孫へは届かない**。
+    SingleObject,
+    /// 子孫へのauto-inherit再伝播を伴う（[`set_dacl_propagating`]）。
+    /// 継承ありACEを既存ツリー全体へ行き渡らせたいときだけ使う。
+    Propagate,
+}
+
+/// `new_dacl`を`path`へ設定し、**OSに子孫への再伝播をさせる**（`SetNamedSecurityInfoW`）。
+///
+/// `set_dacl_single_object`とは正反対の性質を持つ。伝播は子孫の数に比例したコストを持ち、
+/// プロファイルルート近傍では事実上ハングする（BUG-011/013、`plans/TIER1A-PRIVHELPER-HANG.md`）
+/// ため、**ツリー全体へ継承ACEを行き渡らせたい`grant_ace_inheritable_*`のroot付与だけ**が使う。
+/// traverse chain（祖先への非継承ACE付与）は伝播の必要が無く、かつ対象がプロファイルルート
+/// 近傍になりうるので、必ず`SingleObject`のままにすること。
+unsafe fn set_dacl_propagating(path: &Path, new_dacl: *mut ACL) -> windows::core::Result<()> {
+    let path_w = long_path_wide(path);
+    SetNamedSecurityInfoW(
+        PCWSTR(path_w.as_ptr()),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        Some(new_dacl as *const _),
+        None,
+    )
+    .ok()
+}
+
 unsafe fn set_dacl_single_object(path: &Path, new_dacl: *mut ACL) -> windows::core::Result<()> {
     let path_w = long_path_wide(path);
     let handle = CreateFileW(
@@ -229,6 +313,18 @@ pub(crate) fn grant_ace_mask(
     access: u32,
     inheritance: windows::Win32::Security::ACE_FLAGS,
 ) -> Result<(), AppContainerError> {
+    grant_ace_mask_with(path, sid, access, inheritance, DaclWrite::SingleObject)
+}
+
+/// [`grant_ace_mask`]の書込モード指定版。既定（`SingleObject`）以外を使うのは
+/// `grant_ace_inheritable_*`のroot付与だけ（[`DaclWrite`]のdoc参照）。
+pub(crate) fn grant_ace_mask_with(
+    path: &Path,
+    sid: PSID,
+    access: u32,
+    inheritance: windows::Win32::Security::ACE_FLAGS,
+    write: DaclWrite,
+) -> Result<(), AppContainerError> {
     // 冪等スキップ: 既にsid宛の明示ACEが要求マスクの上位集合を持っていれば
     // `SetNamedSecurityInfoW`（プロファイルルート近傍で病的に遅くなりうる、BUG-011）を
     // 呼ばずに済ませる。継承フラグの相違までは見ない（`inheritance`は`grant_ace_mask`の
@@ -275,7 +371,10 @@ pub(crate) fn grant_ace_mask(
             return Err(to_err(e));
         }
 
-        let set_result = set_dacl_single_object(path, new_dacl);
+        let set_result = match write {
+            DaclWrite::SingleObject => set_dacl_single_object(path, new_dacl),
+            DaclWrite::Propagate => set_dacl_propagating(path, new_dacl),
+        };
 
         let _ = LocalFree(HLOCAL(new_dacl as *mut _));
         let _ = LocalFree(HLOCAL(sd.0));
@@ -284,17 +383,43 @@ pub(crate) fn grant_ace_mask(
     Ok(())
 }
 
-/// workspace配下のノードへ read/write/execute/delete を付与する（ディレクトリは継承付き、
-/// ファイルは非継承）。`WRITE_DAC`/`WRITE_OWNER`は含めない（sandboxed子が自分でACLを緩める
-/// ことを防ぐ多層防御）。
-fn grant_ace(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainerError> {
-    let access = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0 | DELETE.0;
+/// `mask`を`path`へ付与する（ディレクトリは継承付き、ファイルは非継承）。
+/// [`grant_ace`]（workspaceのRWX）と[`grant_ace_access`]（`FsAccess`）の共通の底で、
+/// [`fix_descendants_missing_ace`]が**マスクの出どころを問わず**同じ形のACEを書けるようにする。
+fn grant_ace_raw(path: &Path, sid: PSID, mask: u32, is_dir: bool) -> Result<(), AppContainerError> {
     let inheritance = if is_dir {
         CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
     } else {
         NO_INHERITANCE
     };
-    grant_ace_mask(path, sid, access, inheritance)
+    grant_ace_mask(path, sid, mask, inheritance)
+}
+
+/// workspace配下のノードへ read/write/execute/delete を付与する（ディレクトリは継承付き、
+/// ファイルは非継承）。`WRITE_DAC`/`WRITE_OWNER`は含めない（sandboxed子が自分でACLを緩める
+/// ことを防ぐ多層防御）。
+fn grant_ace(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainerError> {
+    grant_ace_raw(path, sid, workspace_rwx_mask(), is_dir)
+}
+
+/// workspace配下へ与えるアクセス（read/write/execute/delete）。`WRITE_DAC`/`WRITE_OWNER`は
+/// 含めない（sandboxed子が自分でACLを緩めることを防ぐ多層防御）。`grant_ace`と
+/// [`grant_ace_propagating`]が同じ値を使うために切り出してある——ここがずれると、rootへ伝播
+/// させたACEと、フォールバックが個別に書くACEの権限が食い違う。
+pub(crate) fn workspace_rwx_mask() -> u32 {
+    FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0 | DELETE.0
+}
+
+/// [`grant_ace`]のroot専用版（継承あり＋既存子孫への伝播）。理由は
+/// [`grant_ace_access_propagating`]と同じ。
+fn grant_ace_propagating(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    grant_ace_mask_with(
+        root,
+        sid,
+        workspace_rwx_mask(),
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+        DaclWrite::Propagate,
+    )
 }
 
 /// `root`配下（`root`自身含む）へ再帰的にpackage SIDの許可ACEを付与する。継承フラグ
@@ -334,12 +459,26 @@ fn grant_ace_access(
     is_dir: bool,
     access: FsAccess,
 ) -> Result<(), AppContainerError> {
-    let inheritance = if is_dir {
-        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
-    } else {
-        NO_INHERITANCE
-    };
-    grant_ace_mask(path, sid, fs_access_mask(access), inheritance)
+    grant_ace_raw(path, sid, fs_access_mask(access), is_dir)
+}
+
+/// `grant_ace_access`のroot専用版: 継承ありACEを付けたうえで**OSに既存子孫へ伝播させる**。
+///
+/// これが`grant_ace_inheritable_*`の高速経路の本体である（M12追記14）。ここを
+/// `DaclWrite::SingleObject`で書くと伝播が起きず、後段のフォールバックが全ノードで発火して
+/// 付与がO(ファイル数)になる（[BUG-081](../../../../docs/bugs/BUG-081.md)）。
+fn grant_ace_access_propagating(
+    root: &Path,
+    sid: PSID,
+    access: FsAccess,
+) -> Result<(), AppContainerError> {
+    grant_ace_mask_with(
+        root,
+        sid,
+        fs_access_mask(access),
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+        DaclWrite::Propagate,
+    )
 }
 
 /// workspace配下のノードへ read/execute のみを付与する（`grant_ace`のread-only版、D-13）。
@@ -377,10 +516,20 @@ pub fn grant_ace_recursive_ro(root: &Path, sid: PSID) -> Result<(), AppContainer
 /// ただし継承をブロックする保護DACL（`PROTECTED_DACL_SECURITY_INFORMATION`が立った子。
 /// エクスプローラの「継承を無効にする」操作等で作られうる）が混在するツリーでは、その配下に
 /// 伝播が届かない。そのため付与後に全ノードを再walkし、`sid`のACEが実際に届いているか
-/// （`sid_ace_mask`で検出、継承経由・明示ACE経由を問わない）を確認し、**届いていないノードだけ**
-/// `grant_ace_ro`で個別に明示付与するフォールバックを行う（届いたノードはSetNamedSecurityInfoW
-/// を呼ばずに済むため、数GB規模のツリーで大半が継承境界に阻まれず伝播する場合ほど
-/// `grant_ace_recursive_ro`の全ノード明示付与より高速になる）。
+/// （[`sid_effective_ace_mask`]で検出、**継承経由・明示ACE経由を問わない**）を確認し、
+/// **届いていないノードだけ**`grant_ace_ro`で個別に明示付与するフォールバックを行う。
+///
+/// **この2点はどちらも欠けると意味を失う**（[BUG-081](../../../../docs/bugs/BUG-081.md)）:
+///
+/// 1. rootへの付与は[`DaclWrite::Propagate`]でなければならない。`SingleObject`（BUG-011/013の
+///    ハング対策で導入した単一オブジェクト書込）だと**伝播そのものが起きない**。
+/// 2. 到達確認は継承ACEを数える`sid_effective_ace_mask`でなければならない。
+///    `sid_ace_mask`（`GetExplicitEntriesFromAclW`）は継承ACEを拾わないので、伝播していても
+///    「届いていない」と判定してしまう。
+///
+/// どちらかが欠けるとフォールバックが全ノードで発火し、この関数は`grant_ace_recursive_ro`と
+/// 同じO(n)の明示付与へ退化する（実測: 254,000ファイルのworkspaceで起動が60秒、かつ
+/// セッションのACEがツリー全体へ残留した）。
 pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     grant_ace_inheritable_access(root, sid, FsAccess::ReadExec)
 }
@@ -413,8 +562,31 @@ pub fn grant_ace_inheritable_access(
     if let Some(result) = grant_ace_access_if_file(root, sid, access) {
         return result;
     }
-    grant_ace_access(root, sid, true, access)?;
+    grant_ace_access_propagating(root, sid, access)?;
+    fix_descendants_missing_ace(root, sid, fs_access_mask(access), &[], &|_, _| {})?;
+    Ok(())
+}
 
+/// 保護DACL等で継承が届かなかった既存子孫を洗い出し、そこだけへ明示ACEを書く（[`
+/// grant_ace_inheritable_ro`]のdocの「2点目」の実体）。
+///
+/// **rootへの伝播付与とこのwalkは分けてある**。伝播は書込1回で済むのに対し、walkは
+/// O(ファイル数)の読取確認で、この開発機のリポジトリ（26万ノード）では実測16秒かかる。
+/// 分けておくと、呼び出し側が「rootの付与だけ同期で済ませ、walkは背景へ回す」という選択を
+/// できる（D-54、`preflight`がそうする）。
+///
+/// - `skip`: この配下を丸ごと対象から外す。`preflight`は`.harness/`を渡す——直後に
+///   [`super::protect_harness_control_dir_from_appcontainer`]が剥がす場所なので、ここで
+///   付けるのは無駄なうえ、**walkを背景化すると剥がした後に付け直す競合**になる（D-05/D-09の
+///   制御面保護が無言で外れる）。
+/// - `progress`: `(処理済み, 全体)`で呼ばれる。表示のためだけのもので、判定には関与しない。
+pub fn fix_descendants_missing_ace(
+    root: &Path,
+    sid: PSID,
+    mask: u32,
+    skip: &[std::path::PathBuf],
+    progress: &dyn Fn(usize, usize),
+) -> Result<DescendantFixReport, AppContainerError> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
@@ -424,17 +596,56 @@ pub fn grant_ace_inheritable_access(
         }
     })?;
 
-    for dir in &dirs {
-        if !matches!(sid_ace_mask(dir, sid), Ok(Some(_))) {
-            grant_ace_access(dir, sid, true, access)?;
+    let is_skipped = |node: &Path| skip.iter().any(|s| path_is_within(node, s));
+    let total = dirs.len() + files.len();
+    let mut report = DescendantFixReport {
+        checked: total,
+        ..Default::default()
+    };
+    let mut processed = 0usize;
+    for (node, is_dir) in dirs
+        .iter()
+        .map(|d| (d, true))
+        .chain(files.iter().map(|f| (f, false)))
+    {
+        processed += 1;
+        // 進捗は1000件ごと（1件ごとに通知すると、通知そのものがwalkより重くなる）。
+        if processed.is_multiple_of(1000) || processed == total {
+            progress(processed, total);
         }
-    }
-    for file in &files {
-        if !matches!(sid_ace_mask(file, sid), Ok(Some(_))) {
-            grant_ace_access(file, sid, false, access)?;
+        if is_skipped(node) {
+            report.skipped += 1;
+            continue;
         }
+        match sid_effective_ace_mask(node, sid) {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(_) => report.probe_errors += 1,
+        }
+        if report.samples.len() < 8 {
+            report.samples.push(node.display().to_string());
+        }
+        grant_ace_raw(node, sid, mask, is_dir)?;
+        report.granted += 1;
     }
-    Ok(())
+    Ok(report)
+}
+
+/// [`fix_descendants_missing_ace`]の結果。件数だけでは追えない事象（「どのノードが継承から
+/// 漏れたのか」）のために`samples`も持つ——BUG-081の調査では、この数件のパスが原因特定の
+/// 決め手だった。
+#[derive(Debug, Default)]
+pub struct DescendantFixReport {
+    /// walkが見たノード数（`skip`配下を含む）。
+    pub checked: usize,
+    /// `skip`配下として対象外にした数。
+    pub skipped: usize,
+    /// 継承が届いておらず、明示ACEを書いた数。**0であることが健全な状態**。
+    pub granted: usize,
+    /// ACEを読めなかった数（判定できないので付与側に倒す）。
+    pub probe_errors: usize,
+    /// 明示付与したノードの先頭数件。
+    pub samples: Vec<String>,
 }
 
 /// `grant_ace_inheritable_ro`のRW版（Tier2aが既定でプローブされるようになったことに伴う
@@ -447,36 +658,53 @@ pub fn grant_ace_inheritable_access(
 /// 継承経由で既に充足）」パターンが使える。書込系Win32呼び出しの回数を大幅に削減できる
 /// （BUG-011「プロファイルルート近傍の書込みは病的に遅くなりうる」を踏まえると効果が大きい）。
 ///
-/// **明記するスコープ外**: 大規模ツリーでの全体walk自体のコスト（`collect_dirs_and_files`の
-/// readdir + 各ノードの`sid_ace_mask`読取確認）は依然としてO(n)で残る。恒久的な解決
-/// （付与済みキャッシュの永続化等）は本ラウンドのスコープ外とし、既知の制約として記録する。
+/// **残るコスト**: 全体walk自体（`collect_dirs_and_files`のreaddir + 各ノードの
+/// [`sid_effective_ace_mask`]読取確認）はO(n)のまま。**書込**が伝播1回で済むようになった分だけ
+/// 速くなるのであって、読取確認は依然として全ノードに対して走る（BUG-081の修正後に再測定し、
+/// 必要ならこのwalkを背景スレッドへ回す——判断は`docs/STATUS.md`のTier2a節）。
 pub fn grant_ace_inheritable_rw(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    grant_workspace_root_rw(root, sid)?;
+    let mut timing = PhaseTiming::start();
+    let report = fix_descendants_missing_ace(root, sid, workspace_rwx_mask(), &[], &|_, _| {})?;
+    timing.mark(&format!(
+        "  rw: reach check + fallback ({} checked, {} explicit grants, {} probe errors)",
+        report.checked, report.granted, report.probe_errors
+    ));
+    if !report.samples.is_empty() {
+        timing.mark_lines("  rw: not reached by inheritance", &report.samples);
+    }
+    Ok(())
+}
+
+/// workspace rootへのRWX継承ACE付与だけを行う（子孫の確認walkは伴わない、D-54）。
+///
+/// これ1件で、**付与時点で存在する子孫26万件へOSが継承ACEを物理コピーする**（実測20.7秒。
+/// NTFSのアクセス判定は対象自身のDACLしか見ないので、このコピーは要求そのものの費用であって
+/// 実装の無駄ではない、[BUG-081](../../../../docs/bugs/BUG-081.md)）。2回目以降は
+/// [`grant_ace_mask_with`]の冪等スキップが効き、Win32書込は1回も起きない。
+///
+/// 確認walk（保護DACLで継承が届かなかったノードの救済）は
+/// [`fix_descendants_missing_ace`]が別に持つ。
+pub fn grant_workspace_root_rw(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     // BUG-059と同じ分岐（`grant_ace_access_if_file`のdoc参照）。現在の呼び出し元は
     // ディレクトリしか渡さないが、**同じクラスの保険は同じクラスの関数すべてに入れる**
     // ——BUG-059は「1箇所だけ直して、後から足された経路が同じ穴を開けた」形だった。
     if !root.is_dir() {
         return grant_ace(root, sid, false);
     }
-    grant_ace(root, sid, true)?;
+    let mut timing = PhaseTiming::start();
+    grant_ace_propagating(root, sid)?;
+    timing.mark("  rw: propagating root grant");
+    Ok(())
+}
 
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
-        AppContainerError::AclGrant {
-            path: root.to_path_buf(),
-            reason: e.to_string(),
-        }
-    })?;
-
-    for dir in &dirs {
-        if !matches!(sid_ace_mask(dir, sid), Ok(Some(_))) {
-            grant_ace(dir, sid, true)?;
-        }
+/// [`grant_workspace_root_rw`]のread-only版（`--cow`のworkspace本体、D-30）。
+pub fn grant_workspace_root_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    if let Some(result) = grant_ace_access_if_file(root, sid, FsAccess::ReadExec) {
+        return result;
     }
-    for file in &files {
-        if !matches!(sid_ace_mask(file, sid), Ok(Some(_))) {
-            grant_ace(file, sid, false)?;
-        }
-    }
+    let mut timing = PhaseTiming::start();
+    grant_ace_access_propagating(root, sid, FsAccess::ReadExec)?;
+    timing.mark("  ro: propagating root grant");
     Ok(())
 }

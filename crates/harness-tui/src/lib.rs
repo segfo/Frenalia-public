@@ -35,6 +35,23 @@ pub use gate::InteractiveGate;
 
 const TICK: Duration = Duration::from_millis(33);
 
+/// D-54: 背景で走っているworkspaceのACL救済walkの進捗`(処理済み, 全体)`。
+///
+/// 走っていない・既に終わった場合は`None`（ステータスバーから表示が消える）。
+/// 失敗して終わった場合も`None`を返す——**失敗の扱いはここではなく`run_shell`が持つ**
+/// （`grant_job::wait_until_done`がfail-closedで断り、理由をツール結果として見せる）。
+/// 表示のためだけの関数に判定を持たせると、同じ事実が2箇所で解釈されることになる。
+#[cfg(windows)]
+fn poll_workspace_acl_progress() -> Option<(usize, usize)> {
+    let p = harness_sandbox::tier2a::win_appcontainer::grant_job::progress()?;
+    (!p.finished).then_some((p.done, p.total))
+}
+
+#[cfg(not(windows))]
+fn poll_workspace_acl_progress() -> Option<(usize, usize)> {
+    None
+}
+
 #[cfg(test)]
 #[path = "review_flow_tests.rs"]
 mod review_flow_tests;
@@ -665,7 +682,10 @@ pub async fn run(
                     _ => {}
                 }
             }
-            _ = tick.tick() => { app.tick(); }
+            _ = tick.tick() => {
+                app.tick();
+                app.workspace_acl_progress = poll_workspace_acl_progress();
+            }
         }
 
         // BUG-076: 遡れる上限は折り畳み状態と端末幅に依存し、描画時にしか決まらない。

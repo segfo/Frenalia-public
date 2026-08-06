@@ -38,8 +38,12 @@ const CONTROL_DIR_WRITE_DENY_PROBE_COMMAND: &str = "\
         exit 0 \
     }";
 
+/// `workspace_cap`は、workspaceツリーのACEの主体になったcapability SID（D-54）。本番の
+/// `run_shell`と**同じcapability構成**で起動しないとプローブの意味が無いので、`preflight`は
+/// ここへ必ず`Some`を渡す（`None`は自前でpackage SID宛のACEを付ける実機テスト専用）。
 pub(crate) fn smoke_test_spawn(
     sid: PSID,
+    workspace_cap: Option<PSID>,
     workspace_root: &Path,
     probe_dir: &Path,
 ) -> Result<(), AppContainerError> {
@@ -52,7 +56,7 @@ pub(crate) fn smoke_test_spawn(
         "HARNESS_PROBE_DIR".to_string(),
         probe_dir.to_string_lossy().into_owned(),
     ));
-    let child = spawn(
+    let child = spawn_with_workspace(
         &shell,
         &[
             "-NoProfile",
@@ -66,6 +70,7 @@ pub(crate) fn smoke_test_spawn(
         sid,
         NetworkCapability::Deny,
         None,
+        workspace_cap,
     )
     .map_err(|e| AppContainerError::Preflight(format!("shell could not start: {e}")))?;
     let (_, _, code) = child
@@ -89,6 +94,7 @@ pub(crate) fn smoke_test_spawn(
 
 fn smoke_test_harness_control_write_denied(
     sid: PSID,
+    workspace_cap: Option<PSID>,
     workspace_root: &Path,
 ) -> Result<(), AppContainerError> {
     let control_dir = workspace_root.join(".harness");
@@ -102,7 +108,9 @@ fn smoke_test_harness_control_write_denied(
         "HARNESS_CONTROL_DIR".to_string(),
         control_dir.to_string_lossy().into_owned(),
     ));
-    let child = spawn(
+    // D-54: workspace capabilityを積んだ状態で試す。積まずに拒否されても
+    // 「`.harness/`の保護が効いた」ことの証明にならない（workspaceごと届いていないだけ）。
+    let child = spawn_with_workspace(
         &shell,
         &[
             "-NoProfile",
@@ -116,6 +124,7 @@ fn smoke_test_harness_control_write_denied(
         sid,
         NetworkCapability::Deny,
         None,
+        workspace_cap,
     )
     .map_err(|e| {
         AppContainerError::Preflight(format!(
@@ -304,6 +313,7 @@ fn diagnose_unreachable_passthrough(
 pub(crate) fn probe_passthrough(
     sid: PSID,
     traverse_sid: PSID,
+    workspace_cap: Option<PSID>,
     workspace_root: &Path,
     fp: &FsPassthrough,
 ) -> Option<String> {
@@ -318,7 +328,9 @@ pub(crate) fn probe_passthrough(
     } else {
         FS_PASSTHROUGH_RO_PROBE_COMMAND
     };
-    let child = match spawn(
+    // 子のcwdは`workspace_root`なので、workspace capability（D-54）が無いと**プローブ対象の
+    // 手前で**起動に失敗する。穴そのものの到達性を測るために、本番と同じ構成で起動する。
+    let child = match spawn_with_workspace(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", command],
         workspace_root,
@@ -327,6 +339,7 @@ pub(crate) fn probe_passthrough(
         sid,
         NetworkCapability::Deny,
         None,
+        workspace_cap,
     ) {
         Ok(child) => child,
         Err(e) => {
@@ -477,8 +490,10 @@ pub fn preflight(
     wfp_chain_pipe: Option<String>,
     write_mode: &WorkspaceWriteMode,
 ) -> Result<PreflightOutcome, AppContainerError> {
+    let mut timing = PhaseTiming::start();
     // ACEを1本も付ける前に、そもそもこのworkspaceで子プロセスを起動できるかを確かめる。
     check_workspace_usable_as_child_cwd(workspace_root)?;
+    timing.mark("check_workspace_usable_as_child_cwd");
     // D-37: プロファイルはセッション単位。共有package SIDをやめ、workspace・CoW upper_dir・
     // fs-allowの穴はこのセッションのSIDにだけ紐付ける（別セッション・別workspaceから到達
     // できないようにする）。祖先のtraverseだけはharness共通のcapability SIDが持つ（下記）。
@@ -486,10 +501,13 @@ pub fn preflight(
     // 起動のたびに、死んだセッションが残した資源をここで回収する（台帳＋生存マーカー、
     // 台帳が失われていても接頭辞付きプロファイルの列挙で回収できる）。
     crate::tier2a::session_profile::gc_dead_sessions(&revoke_session_grant);
+    timing.mark("gc_dead_sessions");
     let profile_name = crate::tier2a::session_profile::begin_session()
         .map_err(AppContainerError::Preflight)?;
     let sid = ensure_profile(&profile_name)?;
+    timing.mark("begin_session + ensure_profile");
     sweep_stale_redirector_dll_aces();
+    timing.mark("sweep_stale_redirector_dll_aces");
     // 祖先traverseの付与先（D-37）。package SIDと違いセッションを跨いで永続する。
     let traverse_sid = traverse_capability_sid()?;
 
@@ -515,22 +533,39 @@ pub fn preflight(
         .map_err(AppContainerError::Preflight)?;
     crate::tier2a::workspace_ledger::record_workspace_grant(&canonical_workspace_root, workspace_mode);
 
+    // D-54: workspaceツリーへ付けるACEの主体。**セッションのpackage SIDではなく、この
+    // workspace＋モードに固有のcapability SID**へ付ける。付与の形（どのツリーへ何を許すか）は
+    // workspaceとモードで決まるものであって、セッションの属性ではない——主体をその形に
+    // 合わせることで、26万ノードへの継承ACEの伝播を**ワークスペースにつき一度きり**にする
+    // （毎起動で払っていた実測60秒が消える、BUG-081）。名前はワークスペースごとのランダム
+    // 秘密から導出され、サンドボックスから読めない台帳にだけ存在する
+    // （`crate::tier2a::workspace_capability`のdoc）。
+    let workspace_cap = workspace_capability_sid(&canonical_workspace_root, workspace_mode)?;
+    let workspace_cap_psid = Some(workspace_cap.as_psid());
+
     // D-30: `write_mode`がACL付与方針を唯一決める。`match`を全分岐（`..`無し）にすることで、
     // `WorkspaceWriteMode`へバリアントを追加した際にACL決定漏れをコンパイルエラーにする。
-    match write_mode {
+    //
+    // **workspace本体は`record_granted_path`しない**（D-54）。あれは「このセッションが撤収
+    // 責任を負う」という表明で、記録すると`end_session`/`gc_dead_sessions`がツリー全体の
+    // `revoke_ace_recursive`（実測30.8秒）を回してしまう。capability宛のACEはセッションより
+    // 長生きするのが仕様であり、撤収は`harness fs revoke-workspace`が明示的に行う。
+    let workspace_mask = match write_mode {
         WorkspaceWriteMode::DirectRw => {
-            // 既定（D-29）。Tier2aが既定でプローブされるため、起動のたびにワークスペース全体へ
-            // 個別書込を試みる`grant_ace_recursive`ではなく、高速化版（root継承ACE1件+
-            // フォールバック確認walk、`grant_ace_inheritable_rw`のdoc参照）を使う。
-            grant_ace_inheritable_rw(workspace_root, sid.as_psid())?;
-            crate::tier2a::session_profile::record_granted_path(workspace_root);
+            // 既定（D-29）。rootへ継承ACEを1件付けるだけで、OSが既存子孫へ伝播させる
+            // （`grant_workspace_root_rw`のdoc）。2回目以降の起動は冪等スキップでWin32書込0回。
+            grant_workspace_root_rw(workspace_root, workspace_cap.as_psid())?;
+            timing.mark("grant_workspace_root_rw(workspace_root)");
+            workspace_rwx_mask()
         }
         WorkspaceWriteMode::Cow { upper_dir } => {
             // `--cow`（D-30）。workspaceはRead/Execute/Traverseのみ（D-13と同じ関数）。
             // Redirector DLLが無効・回避されても、この時点でACLがROである限り
             // workspace本体への書込は`ACCESS_DENIED`でfail-closeする。
-            grant_ace_inheritable_ro(workspace_root, sid.as_psid())?;
-            crate::tier2a::session_profile::record_granted_path(workspace_root);
+            grant_workspace_root_ro(workspace_root, workspace_cap.as_psid())?;
+            // upper_dirは**セッション専有**（他セッションと共有しない）なので、主体は
+            // 従来どおりセッションのpackage SIDのままにする。D-54が置き換えるのは
+            // 「ワークスペースにつき一度きりで済むはずの付与」だけで、こちらは該当しない。
             std::fs::create_dir_all(upper_dir)
                 .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
             grant_ace_inheritable_rw(upper_dir, sid.as_psid())?;
@@ -560,9 +595,24 @@ pub fn preflight(
                     "failed to create CoW session marker for {session_id}: {e}"
                 ))
             })?;
+            fs_access_mask(FsAccess::ReadExec)
         }
-    }
-    protect_harness_control_dir_from_appcontainer(workspace_root, sid.as_psid())?;
+    };
+    // D-05/D-09の層3。剥がす主体は**capability SID（今の継承元）とpackage SID（D-37時代の
+    // 残骸）の両方**——片方だけだと剥がし残した側から制御面が書ける（`revoke.rs`のdoc参照）。
+    protect_harness_control_dir_from_appcontainer(
+        workspace_root,
+        &[workspace_cap.as_psid(), sid.as_psid()],
+    )?;
+    timing.mark("protect_harness_control_dir_from_appcontainer");
+
+    // 保護DACL（BUG-020の残存損害等）で継承が届かなかった既存子孫の救済が要るか。
+    // **ワークスペースにつき一度きり**で、実行は`preflight`の最後（他のACL作業を全て終えた後）に
+    // 背景スレッドへ委ねる（`grant_job`のdoc「DACL書込の競合を避けるための約束」）。
+    let needs_descendant_fix = !crate::tier2a::workspace_capability::tree_is_verified(
+        &canonical_workspace_root,
+        workspace_mode,
+    );
 
     // workspace_root（Cow時はupper_dirも）の祖先traverseチェーンが不足していないか事前に判定する
     // （読み取り専用、UAC無し）。不足分は下のfs-allow昇格要求と合流させ、1回のprivhelper呼び出し
@@ -715,7 +765,13 @@ pub fn preflight(
             // 失効する」（D-37の仕様）が破れる。
             crate::tier2a::session_profile::record_granted_path(&fp.path);
             if let Some(diagnosis) =
-                probe_passthrough(sid.as_psid(), traverse_sid.as_psid(), workspace_root, fp)
+                probe_passthrough(
+                    sid.as_psid(),
+                    traverse_sid.as_psid(),
+                    workspace_cap_psid,
+                    workspace_root,
+                    fp,
+                )
             {
                 denied_passthrough.push((
                     fp.path.clone(),
@@ -733,7 +789,13 @@ pub fn preflight(
                 granted_passthrough.push((fp.path.clone(), requested_rw));
                 crate::tier2a::session_profile::record_granted_path(&fp.path);
                 if let Some(diagnosis) =
-                    probe_passthrough(sid.as_psid(), traverse_sid.as_psid(), workspace_root, fp)
+                    probe_passthrough(
+                    sid.as_psid(),
+                    traverse_sid.as_psid(),
+                    workspace_cap_psid,
+                    workspace_root,
+                    fp,
+                )
                 {
                     denied_passthrough.push((
                         fp.path.clone(),
@@ -867,6 +929,7 @@ pub fn preflight(
                         if let Some(diagnosis) = probe_passthrough(
                             sid.as_psid(),
                             traverse_sid.as_psid(),
+                            workspace_cap_psid,
                             workspace_root,
                             fp,
                         ) {
@@ -963,10 +1026,33 @@ pub fn preflight(
     };
     let tmp_dir = probe_base.join(format!(".harness-tier2a-probe-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| AppContainerError::Preflight(e.to_string()))?;
-    let smoke_result = smoke_test_spawn(sid.as_psid(), workspace_root, &tmp_dir);
+    timing.mark("traverse/fs-allow/elevation");
+    let smoke_result = smoke_test_spawn(sid.as_psid(), workspace_cap_psid, workspace_root, &tmp_dir);
     let _ = std::fs::remove_dir_all(&tmp_dir);
     smoke_result?;
-    smoke_test_harness_control_write_denied(sid.as_psid(), workspace_root)?;
+    smoke_test_harness_control_write_denied(sid.as_psid(), workspace_cap_psid, workspace_root)?;
+    timing.mark("smoke tests");
+
+    // D-54: 救済walkはここで初めて起動する——**`preflight`のACL作業を全て終えた後**である
+    // ことが、DACL書込の競合を避ける条件になっている（`grant_job`のdoc）。rootへの継承付与は
+    // 既に同期で終わっているので、workspaceの大半はこの時点で到達可能であり、残りは
+    // 保護DACL配下だけである。子プロセスを起動する経路は`grant_job::wait_until_done`で
+    // 完了を待つ（待たずに走らせると、モデルには「そのファイルは無い」と見える）。
+    if needs_descendant_fix {
+        // 戻り値の`false`は「このプロセスでは既に別のジョブが走っている」＝`preflight`が2回
+        // 呼ばれた場合だけで、製品では起こらない（実機テストが同居するときだけ）。
+        let started = grant_job::start(
+            workspace_root,
+            workspace_cap,
+            workspace_mask,
+            vec![workspace_root.join(".harness")],
+            &canonical_workspace_root,
+            workspace_mode,
+        );
+        timing.mark(&format!(
+            "grant_job::start (background descendant fix-up, started={started})"
+        ));
+    }
 
     Ok(PreflightOutcome {
         warnings,

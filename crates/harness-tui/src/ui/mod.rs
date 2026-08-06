@@ -436,8 +436,18 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
     } else {
         format!("in={} out={}", app.last_usage.input, app.last_usage.output)
     };
+    // D-54: workspaceのACL救済walkが背景で走っている間だけ出る。この間`run_shell`は完了を
+    // 待つので、「TUIは出ているのにコマンドが動き出さない」理由がここで見える。
+    let acl = match app.workspace_acl_progress {
+        Some((done, total)) if total > 0 => format!(
+            " | workspace ACL {}% ({done}/{total})",
+            (done.min(total) * 100) / total
+        ),
+        Some(_) => " | workspace ACL 準備中".to_string(),
+        None => String::new(),
+    };
     let text = format!(
-        " {} | model={} | stop={} | tokens turn({turn_tokens}) session(in={} out={})",
+        " {} | model={} | stop={} | tokens turn({turn_tokens}) session(in={} out={}){acl}",
         app.provider_label,
         elide_middle(&app.model, MODEL_LABEL_MAX_CHARS),
         stop,

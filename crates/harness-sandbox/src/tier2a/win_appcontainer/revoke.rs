@@ -155,9 +155,17 @@ fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<(), AppContaine
     Ok(())
 }
 
+/// `.harness/**`（制御面）をサンドボックスから隔離する（D-05/D-09の層3）。各ノードから
+/// `sids`宛のACEを全て取り除いたうえで、DACLの継承を切る（`PROTECTED_DACL_SECURITY_INFORMATION`）。
+/// 継承を切るのは、workspace rootに載せた継承ACEがここへ降りてくるのを止めるためである。
+///
+/// **`sids`が複数なのはD-54の帰結**である。workspaceツリーのACEはworkspace＋モード単位の
+/// capability SID宛になったので、`.harness/`へ降りてくる主体もそれになる。一方、過去の
+/// セッションがpackage SID宛に付けたACEも実マシンには残り得る（D-37時代の残骸）。**どちらか
+/// 一方だけを剥がすと、剥がし残した側から制御面が書ける**ので、両方を渡して剥がす。
 pub(crate) fn protect_harness_control_dir_from_appcontainer(
     workspace_root: &Path,
-    sid: PSID,
+    sids: &[PSID],
 ) -> Result<(), AppContainerError> {
     let harness_dir = workspace_root.join(".harness");
     if !harness_dir.exists() {
@@ -173,11 +181,13 @@ pub(crate) fn protect_harness_control_dir_from_appcontainer(
         }
     })?;
 
-    for file in &files {
-        remove_sid_aces_and_protect(file, sid)?;
-    }
-    for dir in dirs.iter().rev() {
-        remove_sid_aces_and_protect(dir, sid)?;
+    for sid in sids {
+        for file in &files {
+            remove_sid_aces_and_protect(file, *sid)?;
+        }
+        for dir in dirs.iter().rev() {
+            remove_sid_aces_and_protect(dir, *sid)?;
+        }
     }
     Ok(())
 }
@@ -438,11 +448,20 @@ pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerEr
     Ok(())
 }
 
-/// `path`のDACLに`sid`（trustee）への明示ACEが残っていれば、その許可アクセスマスクの
+/// `path`のDACLに`sid`（trustee）への**明示**ACEが残っていれば、その許可アクセスマスクの
 /// 論理和を返す（複数エントリがあり得るため合算）。無ければ`None`。
 /// `GetExplicitEntriesFromAclW`は`BuildTrusteeWithSidW`で組み立てるのと同じ`TRUSTEE_W`を
 /// 返すため、`grant_ace_mask`/`revoke_ace`が使うAPIと対称な形で読み取れる
 /// （`GetAce`によるACEヘッダ直接パースより低リスク）。
+///
+/// **継承ACEは含まない**（`GetExplicitEntriesFromAclW`の仕様）。これは撤収側にとっては
+/// 正しい意味である——継承ACEはそのノードからは剥がせず、継承元でしか取り消せないため、
+/// 「このノードから剥がせるものがあるか」を問う`revoke_ace`系はここを見るのが正しい。
+///
+/// **アクセスが届いているかを問う用途にはこれを使ってはならない**。そちらは継承経由でも
+/// 届いていれば足りるので[`sid_effective_ace_mask`]を使う（[BUG-081](../../../../docs/bugs/BUG-081.md):
+/// 付与側のフォールバック判定がこちらを使っていたため、継承ACEが見えず全ノードへ明示ACEを
+/// 書いていた）。
 pub(crate) fn sid_ace_mask(path: &Path, sid: PSID) -> Result<Option<u32>, AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
         path: path.to_path_buf(),
@@ -485,6 +504,72 @@ pub(crate) fn sid_ace_mask(path: &Path, sid: PSID) -> Result<Option<u32>, AppCon
                 }
             }
             let _ = LocalFree(HLOCAL(entries as *mut _));
+        }
+        let _ = LocalFree(HLOCAL(sd.0));
+        Ok(mask)
+    }
+}
+
+/// `path`で`sid`に**実効的に**届いている許可アクセスマスク（明示ACE＋継承ACEの論理和）。
+/// 届いていなければ`None`。
+///
+/// [`sid_ace_mask`]との違いは継承ACEを数えるかどうかだけで、この1点が
+/// [BUG-081](../../../../docs/bugs/BUG-081.md)の中身である。付与側（`grant_ace_inheritable_*`の
+/// 「継承が届かなかったノードだけ明示付与する」フォールバック）が`sid_ace_mask`を使っていたため、
+/// rootの継承ACEが子孫へ伝播していても常に`None`と判定され、**全ノードへ明示ACEを書いていた**
+/// （254,000ファイルのworkspaceで起動が60秒、かつセッションのACEがツリー全体へ残留した）。
+///
+/// 実装は`GetExplicitEntriesFromAclW`ではなく`GetAce`でDACLを直接列挙する
+/// （[`crate::elevated_launch`]の`read_allow_aces`と同じ理由・同じ形）。**Allow ACEだけを数える**
+/// ——Deny ACEは「届いている」の根拠にならない。
+pub(crate) fn sid_effective_ace_mask(
+    path: &Path,
+    sid: PSID,
+) -> Result<Option<u32>, AppContainerError> {
+    let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    };
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+        .ok()
+        .map_err(to_err)?;
+
+        // NULL DACL＝誰でもフルアクセス。付与の要否判定としては「既に届いている」で正しい
+        // （ここでACEを書き足しても実効アクセスは変わらない）。
+        if dacl.is_null() {
+            let _ = LocalFree(HLOCAL(sd.0));
+            return Ok(Some(u32::MAX));
+        }
+
+        let mut mask: Option<u32> = None;
+        let count = (*dacl).AceCount as u32;
+        for index in 0..count {
+            let mut ace_ptr: *mut c_void = std::ptr::null_mut();
+            if GetAce(dacl, index, &mut ace_ptr).is_err() || ace_ptr.is_null() {
+                continue;
+            }
+            let header = ace_ptr as *const ACE_HEADER;
+            if (*header).AceType != ACCESS_ALLOWED_ACE_TYPE {
+                continue;
+            }
+            let ace = ace_ptr as *const ACCESS_ALLOWED_ACE;
+            let ace_sid = PSID(&(*ace).SidStart as *const u32 as *mut c_void);
+            if EqualSid(ace_sid, sid).is_ok() {
+                mask = Some(mask.unwrap_or(0) | (*ace).Mask);
+            }
         }
         let _ = LocalFree(HLOCAL(sd.0));
         Ok(mask)

@@ -708,7 +708,29 @@ async fn run_windows_tier2a(
         harness_sandbox::tier2a::win_appcontainer::NetworkCapability::Deny
     };
 
-    let child = harness_sandbox::tier2a::win_appcontainer::spawn(
+    // D-54: workspaceツリーのACEはworkspace＋モード単位のcapability SID宛に付いている。
+    // `preflight`が付与したのと同じ主体をこの子のトークンへ積まないと、workspaceが一切
+    // 見えない（package SIDだけでは届かない）。モードは`--cow`かどうかで決まり、
+    // `preflight`の`workspace_mode`と同じ語彙でなければならない——ずれると別の主体を導出し、
+    // 付与されていないcapabilityで起動して全アクセスが拒否される。
+    let workspace_mode = if cow_upper_dir.is_some() { "ro" } else { "rwx" };
+    let canonical_workspace = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let workspace_cap = harness_sandbox::tier2a::win_appcontainer::workspace_capability_sid(
+        &canonical_workspace,
+        workspace_mode,
+    )
+    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+    // D-54: 初回起動では、保護DACL配下を救済するwalkが背景で走っていることがある。終わる前に
+    // コマンドを走らせると、その配下がモデルには「存在しない/読めない」と見え、原因不明の
+    // 失敗になる。完了を待ち、walkが失敗していたら断る（fail-closed、`grant_job`のdoc）。
+    // 走っていなければ即座に返るので、2回目以降の起動では何のコストも無い。
+    harness_sandbox::tier2a::win_appcontainer::grant_job::wait_until_done()
+        .map_err(ToolError::ExecutionFailed)?;
+
+    let child = harness_sandbox::tier2a::win_appcontainer::spawn_with_workspace(
         &bin,
         &args,
         &cwd_owned,
@@ -717,6 +739,7 @@ async fn run_windows_tier2a(
         sid.as_psid(),
         net_capability,
         cow,
+        Some(workspace_cap.as_psid()),
     )
     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child.kill_token();

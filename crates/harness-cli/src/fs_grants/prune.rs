@@ -134,6 +134,29 @@ pub(crate) fn fs_prune(dry_run: bool) -> ExitCode {
         report.print("workspace-grant-ledger.json", dry_run);
     }
 
+    // --- workspace capability（D-54） ---
+    //
+    // 使い捨てworkspace（テストのtempdir等）を開くたびに1件増えるので、掃かないと
+    // **秘密の記録が際限なく積もる**。消えたツリーのACEを撤収できなくなる心配は無い
+    // ——ツリーが無いので撤収すべきものが存在しない。
+    #[cfg(windows)]
+    {
+        let entries = harness_sandbox::tier2a::workspace_capability::all_entries();
+        let paths: Vec<String> = entries.iter().map(|e| e.workspace.clone()).collect();
+        let (mut report, gone) = classify_all(&paths);
+        if !dry_run && !gone.is_empty() {
+            report.removed =
+                harness_sandbox::tier2a::workspace_capability::prune_capability_entries(|p| {
+                    gone.contains(&p.to_string_lossy().to_string())
+                });
+        } else {
+            report.removed = gone;
+        }
+        total_removed += report.removed.len();
+        total_unreachable += report.unreachable.len();
+        report.print("workspace-capability-ledger.json", dry_run);
+    }
+
     println!();
     if dry_run {
         println!("{total_removed} entries would be removed (re-run without --dry-run to apply)");

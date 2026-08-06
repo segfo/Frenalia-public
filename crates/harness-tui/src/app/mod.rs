@@ -170,6 +170,13 @@ pub struct AppState {
     saw_thinking_this_turn: bool,
     /// スピナーのフレーム送り用カウンタ。`tick()`が33ms間隔で呼ぶ。
     pub spinner_frame: usize,
+    /// D-54: workspaceのACL救済walkが背景で走っている間の進捗`(処理済み, 全体)`。
+    ///
+    /// **ワークスペースを初めてTier2aで開いた起動でしか出ない。** この間、保護DACL配下は
+    /// まだサンドボックスから見えず、`run_shell`は完了を待つ（`grant_job`のdoc）。
+    /// 「TUIは出ているのにコマンドが待たされる」理由をユーザーへ見せるための表示で、
+    /// 判定には一切関与しない。`lib.rs`の描画tickが`harness_sandbox`から取り込む。
+    pub workspace_acl_progress: Option<(usize, usize)>,
     /// `true`のときEnterが送信（後方互換モード）。`false`（既定）のときEnterは入力欄に改行を
     /// 挿入し、送信はAlt+EnterまたはShift+Enterで行う（`true`のときもAlt+Enter/Shift+Enterは
     /// 常に送信）。
@@ -226,6 +233,7 @@ impl AppState {
             thinking_progress: None,
             saw_thinking_this_turn: false,
             spinner_frame: 0,
+            workspace_acl_progress: None,
             enter_submits: false,
             key_debug: false,
             host_is_vscode: false,

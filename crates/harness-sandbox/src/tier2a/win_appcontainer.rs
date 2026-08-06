@@ -34,8 +34,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, ConvertStringSidToSidW, GetExplicitEntriesFromAclW,
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    SE_FILE_OBJECT, SE_KERNEL_OBJECT, TRUSTEE_IS_SID, TRUSTEE_W,
+    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, SE_KERNEL_OBJECT, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -152,8 +152,32 @@ pub const TRAVERSE_CAPABILITY_NAME: &str = "harnessSandboxTraverse";
 /// [`TRAVERSE_CAPABILITY_NAME`]から導出したcapability SID。祖先traverseの付与先であり、
 /// 子プロセス起動時にトークンへ積む値でもある。
 pub fn traverse_capability_sid() -> Result<crate::win_common::OwnedSid, AppContainerError> {
+    capability_sid_from_name(TRAVERSE_CAPABILITY_NAME)
+}
+
+/// このworkspace＋モードのFS付与の主体（D-54）。名前は
+/// [`crate::tier2a::workspace_capability`]がworkspaceごとのランダム秘密から導出し、
+/// マシンローカル台帳（`%APPDATA%\harness\config\`）に保存する。
+///
+/// **`workspace`はcanonicalize済みを渡すこと**（綴りが違うと別エントリ＝別主体になり、
+/// 同じツリーへ2つの主体のACEを撒くことになる）。台帳へまだ無ければここで発行する。
+pub fn workspace_capability_sid(
+    workspace: &Path,
+    mode: &str,
+) -> Result<crate::win_common::OwnedSid, AppContainerError> {
+    let name = crate::tier2a::workspace_capability::ensure_capability_name(workspace, mode)
+        .map_err(AppContainerError::Preflight)?;
+    capability_sid_from_name(&name)
+}
+
+/// 名前からcapability SIDを導出する（`DeriveCapabilitySidsFromName`）。
+///
+/// **名前を知っている者は誰でもこれを呼べる**（特権不要）。したがって、この関数で導出した
+/// SID宛にACEを付けることは「その名前を知る者へその権限を与える」ことと同義であり、
+/// 名前の推測しやすさがそのまま権限の境界になる（D-54、`workspace_capability`のdoc）。
+fn capability_sid_from_name(name: &str) -> Result<crate::win_common::OwnedSid, AppContainerError> {
     use windows::Win32::Security::DeriveCapabilitySidsFromName;
-    let name_w = wide(TRAVERSE_CAPABILITY_NAME);
+    let name_w = wide(name);
     unsafe {
         let mut group_sids: *mut PSID = std::ptr::null_mut();
         let mut group_count = 0u32;
@@ -246,6 +270,10 @@ fn ensure_profile_locked(name: &str) -> Result<OwnedContainerSid, AppContainerEr
 // 公開項目はここでglob再エクスポートする。
 
 mod acl_grant;
+/// 初回の救済walkを背景で回すジョブ（D-54）。**globではなく名前空間として公開する**
+/// ——`start`/`progress`/`wait_until_done`という短い名前は、それだけでは何のジョブか
+/// 分からないため（`grant_job::wait_until_done()`と書けば分かる）。
+pub mod grant_job;
 mod mcp_preflight;
 mod preflight;
 mod revoke;
@@ -285,9 +313,13 @@ fn session_sid() -> OwnedContainerSid {
         .expect("ensure_profile (this session's profile, D-37)")
 }
 
-/// テスト間で共有する後始末ユーティリティ（RAIIガード）。実装は`test_support.rs`。
+/// テスト間で共有する後始末ユーティリティ（RAIIガード）と、本番と同じcapability構成で
+/// 子を起こす`spawn_in_workspace`（D-54）。実装は`test_support.rs`。
+///
+/// `pub(crate)`なのは、`policy_learnd::etw`の実機テストも同じ`spawn_in_workspace`を使うため
+/// （`docs/CODE-STRUCTURE-RULES.md`規則5: 同じヘルパーの写しを作らない）。
 #[cfg(all(windows, test))]
-mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;

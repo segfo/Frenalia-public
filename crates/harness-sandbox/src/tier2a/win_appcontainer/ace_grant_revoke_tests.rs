@@ -14,7 +14,7 @@
 //! `parity_production_probe_matches_diagnostic_probe`が突き合わせる
 //! （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3）。
 
-use super::test_support::{SubstDrive, TestDirGuard};
+use super::test_support::{spawn_in_workspace, SubstDrive, TestDirGuard};
 use super::*;
 
 const PROBE_COMMAND: &str = "\
@@ -119,7 +119,7 @@ fn parity_production_probe_matches_diagnostic_probe() {
     std::fs::create_dir_all(&dir).expect("create neutral dir");
     grant_ace_recursive(&dir, sid.as_psid()).expect("grant_ace_recursive on neutral dir");
 
-    let production_result = smoke_test_spawn(sid.as_psid(), &dir, &dir);
+    let production_result = smoke_test_spawn(sid.as_psid(), None, &dir, &dir);
     println!("=== production probe (smoke_test_spawn) result: {production_result:?} ===");
 
     run_probe(sid.as_psid(), &dir);
@@ -222,7 +222,10 @@ fn appcontainer_child_cannot_reach_uac_elevation_broker() {
 
     let env = crate::secret_env::build_child_env();
     let args = ["--try-runas", &helper_path.to_string_lossy()];
-    let child = spawn(
+    // D-54: `preflight`が付けたworkspace ACEの主体はcapability SIDなので、本番と同じく
+    // それを積んで起こす（`spawn_in_workspace`のdoc）。素の`spawn`だとworkspaceが見えず、
+    // プローブがcwdを設定できずに落ちる。
+    let child = spawn_in_workspace(
         &probe_exe.to_string_lossy(),
         &args,
         workspace.path(),
@@ -311,7 +314,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         .join("sandbox")
         .join("Tier2a-tmp");
     std::fs::create_dir_all(&probe_dir).expect("create probe dir");
-    if let Err(e) = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir) {
+    if let Err(e) = smoke_test_spawn(sid.as_psid(), None, &workspace, &probe_dir) {
         eprintln!(
             "skipping fs_passthrough_ro_then_rw_then_revoke_cycle: workspace FS I/O gate \
              failed on this machine ({e:?}); run `harness fs grant-traverse C:\\` as \
@@ -336,9 +339,12 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         access: FsAccess::ReadExec,
         forced: false,
     };
+    // D-54: このテストはworkspaceへpackage SID宛のACEを直接付けているので、workspace
+    // capability（本番`preflight`が使う主体）は不要。`None`で本番と同じ経路を通す。
     let ro_diagnosis = probe_passthrough(
         sid.as_psid(),
         traverse_sid.as_psid(),
+        None,
         &workspace,
         &ro_probe,
     );
@@ -354,6 +360,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
     let write_should_fail = probe_passthrough(
         sid.as_psid(),
         traverse_sid.as_psid(),
+        None,
         &workspace,
         &rw_probe_against_ro_grant,
     );
@@ -372,6 +379,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
     let rw_diagnosis = probe_passthrough(
         sid.as_psid(),
         traverse_sid.as_psid(),
+        None,
         &workspace,
         &rw_probe,
     );
@@ -743,7 +751,7 @@ fn grant_ace_inheritable_ro_falls_back_for_protected_descendant() {
         .join("sandbox")
         .join("Tier2a-tmp");
     std::fs::create_dir_all(&probe_dir).expect("create probe dir");
-    if let Err(e) = smoke_test_spawn(sid.as_psid(), &workspace, &probe_dir) {
+    if let Err(e) = smoke_test_spawn(sid.as_psid(), None, &workspace, &probe_dir) {
         eprintln!(
             "skipping grant_ace_inheritable_ro_falls_back_for_protected_descendant: \
              workspace FS I/O gate failed on this machine ({e:?}); run `harness fs \
@@ -812,6 +820,139 @@ fn grant_ace_inheritable_ro_falls_back_for_protected_descendant() {
         "sandbox SID ACE must be fully removed from every node, including the protected \
          branch, after revoke_ace_recursive: {leftover:?}"
     );
+}
+
+/// [BUG-081] 継承ACEが子孫へ**伝播していること**と、到達確認がそれを**見えていること**を
+/// 同時に固定する。この2つはどちらが欠けてもフォールバックが全ノードで発火し、付与が
+/// O(ファイル数)へ退化する（実測で起動60秒・ツリー全体へACE残留）。
+///
+/// **`#[ignore]`にしない**——AppContainerプロファイルの作成も管理者権限も要らず、
+/// 自分が所有するtempdirのDACLを触るだけで、CIの`cargo test`で毎回走らせられる。
+/// SIDはharness共通のtraverse capability SID（`DeriveCapabilitySidsFromName`、プロファイル
+/// 作成不要）を借りる——tempdirのDACLに元から載っていないことが保証でき、「付与前はNone」を
+/// 前提にできるため。
+#[test]
+fn an_inherited_ace_reaches_descendants_and_the_effective_probe_sees_it() {
+    let sid = traverse_capability_sid().expect("traverse_capability_sid");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let nested = dir.path().join("a").join("b");
+    std::fs::create_dir_all(&nested).expect("create nested dirs");
+    let child = nested.join("f.txt");
+    std::fs::write(&child, b"hi").expect("seed file");
+
+    assert_eq!(
+        sid_effective_ace_mask(&child, sid.as_psid()).expect("probe before grant"),
+        None,
+        "borrowed SID must not already appear in the tempdir DACL"
+    );
+
+    grant_ace_inheritable_rw(dir.path(), sid.as_psid()).expect("grant_ace_inheritable_rw");
+
+    // (1) rootには明示の継承ありACEが載る。
+    assert!(
+        sid_ace_mask(dir.path(), sid.as_psid())
+            .expect("explicit probe on root")
+            .is_some(),
+        "the root must carry an explicit inheritable ACE"
+    );
+    // (2) 既存の子孫へ伝播が届いている（DaclWrite::Propagateが効いている）。
+    assert!(
+        sid_effective_ace_mask(&child, sid.as_psid())
+            .expect("effective probe on descendant")
+            .is_some(),
+        "the inheritable ACE must reach an already-existing descendant (DaclWrite::Propagate)"
+    );
+    // (3) 到達確認が継承を見えているので、フォールバックは1件も明示ACEを書いていない。
+    assert_eq!(
+        sid_ace_mask(&child, sid.as_psid()).expect("explicit probe on descendant"),
+        None,
+        "the fallback must not write an explicit ACE on a descendant already covered by \
+         inheritance -- writing one here is exactly BUG-081 (O(files) grant + residue)"
+    );
+
+    revoke_ace_recursive(dir.path(), sid.as_psid()).expect("revoke_ace_recursive");
+}
+
+/// [D-54] 背景ジョブ（`grant_job`）が救済walkを完走し、保護DACL配下まで届かせ、完走を
+/// 台帳へ記録すること。`wait_until_done`が実際に完了まで待つことも同時に固定する。
+///
+/// **`#[ignore]`にしてある理由は2つ**で、どちらも「他のテストと同じプロセスで走らせられない」
+/// という性質による。(1)`grant_job`は`OnceLock`で1プロセス1ジョブなので、他のテストが先に
+/// `start`すると黙って何もしない。(2)完走の記録は実マシンの`%APPDATA%`の台帳へ書かれる
+/// （tempdirのエントリが1件増える。`harness fs prune`が掃く）。
+///
+/// SIDは**本番と同じ**workspace capability SID（`workspace_capability_sid`）を使う。これは
+/// 台帳へエントリを作る副作用も持っていて、完走マークはそのエントリへ立つ——付与の主体と
+/// 記録の置き場が対になっていることまで含めて本番の順序をなぞる。
+#[test]
+#[ignore]
+fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    // `preflight`と同じ入口。新しい秘密から導出されるので、このSIDがtempdirのDACLに
+    // 元から載っていることは無い（＝「付与前はNone」を前提にできる）。
+    let sid = workspace_capability_sid(&root, "rwx").expect("workspace_capability_sid");
+
+    // 継承が届く枝と、継承を遮断した枝（`fix_descendants_missing_ace`が救う対象）。
+    let normal = root.join("normal");
+    std::fs::create_dir_all(&normal).expect("create normal branch");
+    std::fs::write(normal.join("a.txt"), b"inherited").expect("seed normal file");
+    let protected = root.join("protected");
+    std::fs::create_dir_all(&protected).expect("create protected branch");
+    let blocked = protected.join("blocked.txt");
+    std::fs::write(&blocked, b"needs the fallback").expect("seed protected file");
+    protect_dacl_preserve_inherited(&protected).expect("protect_dacl_preserve_inherited");
+
+    // `preflight`と同じ順序: rootへ伝播付与（同期）→ 救済walkは背景へ。
+    grant_workspace_root_rw(&root, sid.as_psid()).expect("grant_workspace_root_rw");
+    assert_eq!(
+        sid_effective_ace_mask(&blocked, sid.as_psid()).expect("probe the protected branch"),
+        None,
+        "the protected branch must NOT be reachable yet -- otherwise this test is not exercising \
+         the fallback at all"
+    );
+
+    // 1プロセス1ジョブなので、同じテストバイナリで先に`preflight`を通ったテストが居ると
+    // 開始できない。**その場合は黙って緑にせずskipする**——`start`が何もしていないのに
+    // 「フォールバックが効いた」と主張してしまうため（実際にこれで誤検知した）。
+    let started = grant_job::start(
+        &root,
+        sid.clone(),
+        workspace_rwx_mask(),
+        vec![root.join(".harness")],
+        &root,
+        "rwx",
+    );
+    if !started {
+        eprintln!(
+            "skipping the_background_job_finishes_the_descendant_fix_up_and_records_it: another \
+             test in this process already claimed the single background job slot; run it alone \
+             (`cargo test -p harness-sandbox --lib -- --ignored the_background_job_finishes`)"
+        );
+        revoke_ace_recursive(&root, sid.as_psid()).expect("revoke_ace_recursive");
+        crate::tier2a::workspace_capability::forget_capability(&root, "");
+        return;
+    }
+    grant_job::wait_until_done().expect("the background fix-up must finish successfully");
+
+    assert!(
+        sid_effective_ace_mask(&blocked, sid.as_psid())
+            .expect("probe the protected branch after the job")
+            .is_some(),
+        "the background job must have granted an explicit ACE where inheritance could not reach"
+    );
+    assert!(
+        crate::tier2a::workspace_capability::tree_is_verified(&root, "rwx"),
+        "a successful pass must be recorded so the next startup skips the O(files) walk"
+    );
+    assert_eq!(
+        grant_job::progress().map(|p| p.finished),
+        Some(true),
+        "the job must report itself finished after wait_until_done returned"
+    );
+
+    revoke_ace_recursive(&root, sid.as_psid()).expect("revoke_ace_recursive");
+    crate::tier2a::workspace_capability::forget_capability(&root, "");
 }
 
 /// [S1スパイク] Tier3のSMB使い捨てワークスペース共有（`crates/harness-sandbox/src/
