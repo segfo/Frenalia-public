@@ -121,6 +121,15 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture", "policy_learnd::etw::spike_tests",
         ],
     ),
+    // ポリシー設定モード(Tier1)構想向け: Kernel-Network/DNS-ClientのETW実現性スパイク
+    // (plans/POLICY-EDITOR-TOMOYO-DIG.md)。
+    (
+        "spike-etw-net",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "policy_learnd::etw::network_spike_tests",
+        ],
+    ),
     (
         "e2e-loopback-exemption",
         &[

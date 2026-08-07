@@ -27,6 +27,12 @@ pub mod volumes;
 #[path = "spike_tests.rs"]
 mod spike_tests;
 
+/// ネットワーク可視化(`Kernel-Network`/`DNS-Client`)の実現性スパイク。
+/// `plans/POLICY-EDITOR-TOMOYO-DIG.md`のポリシー設定モード(Tier1)構想向けの調査。
+#[cfg(all(windows, test))]
+#[path = "network_spike_tests.rs"]
+mod network_spike_tests;
+
 /// `docs/STATUS.md`「既知の未検証項目」#1〜#5を実測する。**assertより観測値の出力が主目的**。
 #[cfg(all(windows, test))]
 #[path = "diagnostics_tests.rs"]
