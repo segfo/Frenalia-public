@@ -299,6 +299,11 @@ impl Tool for RunShellTool {
         .await?;
 
         let code = code.unwrap_or(-1);
+        // シェルがコマンドを走らせる前に吐いた分を切り離す（`RUN_SHELL_OUTPUT_SENTINEL`）。
+        // 捨てずにフッターへ回すだけ——混ざったままだと、標準出力を持たないコマンドで
+        // 「シェルの起動時警告」が唯一の出力になり、失敗と見分けが付かない。
+        let (out_noise, out) = split_shell_startup_noise(&out);
+        let (err_noise, err) = split_shell_startup_noise(&err);
         let mut content = truncate_to_limit(out);
         let err = truncate_to_limit(err);
         if !err.is_empty() {
@@ -308,6 +313,13 @@ impl Tool for RunShellTool {
             content.push_str(&err);
         }
         content.push_str(&format!("\n[exit code: {code}]\n[shell: {shell_label}]"));
+        if let Some(noise) = merge_startup_noise(&out_noise, &err_noise) {
+            content.push_str(&format!(
+                "\n[shell-startup-noise (コマンドの実行前にシェル自身が出したもの。\
+                 コマンドの結果には影響しない): {}]",
+                truncate_to_limit(noise).replace('\n', " / ")
+            ));
+        }
         content.push_str(&format!("\n[tier: {}]", ctx.shell_tier.tier.label()));
         if let Some(reason) = &ctx.shell_tier.reason {
             content.push_str(&format!(
@@ -1006,11 +1018,79 @@ const RUN_SHELL_COMMAND_ENV_VAR: &str = "HARNESS_RUN_SHELL_COMMAND";
 const RUN_SHELL_BOOTSTRAP_SCRIPT: &str = "\
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
 $OutputEncoding = [System.Text.Encoding]::UTF8; \
+Write-Output '<<<harness-run-shell-begin>>>'; \
+[Console]::Error.WriteLine('<<<harness-run-shell-begin>>>'); \
 $__harness_cmd = $env:HARNESS_RUN_SHELL_COMMAND; \
 Remove-Item Env:HARNESS_RUN_SHELL_COMMAND -ErrorAction SilentlyContinue; \
 . ([scriptblock]::Create($__harness_cmd)); \
 if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif (-not $?) { exit 1 }
 ";
+
+/// シェル自身が**コマンドを走らせる前に**吐いた出力と、コマンドの出力を分ける境界印。
+///
+/// # なぜ要るか
+///
+/// PowerShellは起動時にプロファイル読込・プロバイダ初期化を行い、そこで出た警告が
+/// コマンドの出力と同じストリームに混ざる。混ざると、標準出力を持たないコマンド
+/// （`echo hoge > test.txt` のようなリダイレクト）では**シェルの警告だけが唯一の出力**になり、
+/// コマンドが失敗したように見える（モデルは実際にリトライループへ入った）。
+///
+/// 実例: このマシンにはSMBマップドライブ（`X:`/`Z:`）があり、AppContainerの子で
+/// PowerShellの`FileSystemProvider.InitializeDefaultDrives()`がそれを解決しようとして
+/// `\PIPE\wkssvc`・`\PIPE\DAV RPC SERVICE`を開き、両パイプのDACLにapp-package系ACEが
+/// 無いため`ACCESS_DENIED`になる。ドライブを外すと消えることを1差分実験で確認済み。
+/// **コマンド自体は成功している**——この警告は起動時ノイズでしかない。
+///
+/// # なぜ文字列マッチではなく境界印か
+///
+/// 上のメッセージは**OSのロケールで翻訳される**（この機では日本語）。既知の文言を
+/// マッチして消す実装は英語環境で素通りし、逆に別の言語では健全な出力を巻き込み得る
+/// （`bug-pattern-rules` B-05: 型で守れない複製、B-21: 検査と実体の乖離）。境界印なら
+/// ロケールにも文言にも依存せず、**このノイズだけでなくプロファイル由来の出力等にも効く**。
+///
+/// # 消さない
+///
+/// 印より前の出力は捨てず、`[shell-startup-noise: ...]`として別枠で見せる。サンドボックスが
+/// 何を拒否したかは診断の材料であり、黙って落とすと将来の調査不能地帯になる（B-10）。
+///
+/// 印が見つからない場合（Unix・Tier3・シェルが印に到達する前に死んだ場合）は
+/// **全部をコマンドの出力として扱う**——安全側（隠さない側）へ倒す。
+#[cfg(windows)]
+const RUN_SHELL_OUTPUT_SENTINEL: &str = "<<<harness-run-shell-begin>>>";
+
+/// 境界印で「シェル起動時ノイズ」と「コマンドの出力」に分ける。戻り値は`(noise, output)`。
+///
+/// 印は**最初の1つ**で切る。コマンドが同じ文字列を出力しても、それは印より後なので
+/// 分割位置は動かない（＝コマンド側から分割位置を操作できない）。
+#[cfg(windows)]
+fn split_shell_startup_noise(text: &str) -> (String, String) {
+    let Some(start) = text.find(RUN_SHELL_OUTPUT_SENTINEL) else {
+        return (String::new(), text.to_string());
+    };
+    let noise = text[..start].trim().to_string();
+    let rest = &text[start + RUN_SHELL_OUTPUT_SENTINEL.len()..];
+    (noise, rest.trim_start_matches(['\r', '\n']).to_string())
+}
+
+#[cfg(not(windows))]
+fn split_shell_startup_noise(text: &str) -> (String, String) {
+    (String::new(), text.to_string())
+}
+
+/// stdout側とstderr側のノイズを1つにまとめる（どちらも空なら`None`＝フッター行を出さない）。
+///
+/// PowerShellのプロバイダ初期化エラーがどちらのストリームへ出るかはホストの実装依存で、
+/// 実測でも両方あり得る。**同じ文言が両方に出たら1回だけ見せる**——2回出すと、
+/// 起きたことが2つあるように読める。
+fn merge_startup_noise(out_noise: &str, err_noise: &str) -> Option<String> {
+    match (out_noise.trim(), err_noise.trim()) {
+        ("", "") => None,
+        ("", e) => Some(e.to_string()),
+        (o, "") => Some(o.to_string()),
+        (o, e) if o == e => Some(o.to_string()),
+        (o, e) => Some(format!("{o}\n{e}")),
+    }
+}
 
 #[cfg(windows)]
 fn run_shell_bootstrap_stdin() -> Vec<u8> {
@@ -1545,6 +1625,73 @@ mod tests {
     #[test]
     fn bootstrap_script_references_the_declared_env_var_name() {
         assert!(RUN_SHELL_BOOTSTRAP_SCRIPT.contains(RUN_SHELL_COMMAND_ENV_VAR));
+    }
+
+    /// 境界印はブートストラップが実際に出す文字列と一致していなければならない（定数の
+    /// 食い違いをテストで固定する。上の`RUN_SHELL_COMMAND_ENV_VAR`と同じ理由）。
+    #[cfg(windows)]
+    #[test]
+    fn bootstrap_script_emits_the_declared_sentinel_on_both_streams() {
+        assert_eq!(
+            RUN_SHELL_BOOTSTRAP_SCRIPT.matches(RUN_SHELL_OUTPUT_SENTINEL).count(),
+            2,
+            "stdoutとstderrの両方へ出す必要がある（どちらへ出るかはホスト依存）"
+        );
+        // 印はコマンドを実行する行より**前**になければ意味が無い。
+        let sentinel_at = RUN_SHELL_BOOTSTRAP_SCRIPT
+            .find(RUN_SHELL_OUTPUT_SENTINEL)
+            .unwrap();
+        let exec_at = RUN_SHELL_BOOTSTRAP_SCRIPT
+            .find("scriptblock]::Create")
+            .unwrap();
+        assert!(sentinel_at < exec_at);
+    }
+
+    /// 起動時ノイズは切り離すが**捨てない**（`bug-pattern-rules` B-10）。
+    #[cfg(windows)]
+    #[test]
+    fn startup_noise_is_separated_from_the_command_output() {
+        let raw = format!(
+            "'FileSystem' プロバイダーで InitializeDefaultDrives 操作に失敗しました。\n{}\nhello\n",
+            RUN_SHELL_OUTPUT_SENTINEL
+        );
+        let (noise, output) = split_shell_startup_noise(&raw);
+        assert!(noise.contains("InitializeDefaultDrives"));
+        assert_eq!(output, "hello\n");
+    }
+
+    /// 印が無ければ**全部をコマンドの出力**として扱う（安全側＝隠さない側）。
+    /// Unix・Tier3・シェルが印に到達する前に死んだ場合がこれに当たる。
+    #[cfg(windows)]
+    #[test]
+    fn without_the_sentinel_nothing_is_treated_as_noise() {
+        let (noise, output) = split_shell_startup_noise("boom\n");
+        assert_eq!(noise, "");
+        assert_eq!(output, "boom\n");
+    }
+
+    /// コマンドが同じ文字列を出力しても分割位置は動かない（**最初の1つ**で切るため、
+    /// コマンド側から「ここまでをノイズ扱いにする」操作ができない）。
+    #[cfg(windows)]
+    #[test]
+    fn a_command_echoing_the_sentinel_cannot_move_the_split() {
+        let raw = format!(
+            "noise\n{s}\nreal-1\n{s}\nreal-2\n",
+            s = RUN_SHELL_OUTPUT_SENTINEL
+        );
+        let (noise, output) = split_shell_startup_noise(&raw);
+        assert_eq!(noise, "noise");
+        assert!(output.starts_with("real-1"));
+        assert!(output.contains("real-2"));
+    }
+
+    /// 同じ文言がstdoutとstderrの両方に出ても、見せるのは1回だけ
+    /// （2回出すと起きたことが2つあるように読める。B-32）。
+    #[test]
+    fn identical_noise_on_both_streams_is_shown_once() {
+        assert_eq!(merge_startup_noise("warn", "warn").as_deref(), Some("warn"));
+        assert_eq!(merge_startup_noise("", "").as_deref(), None);
+        assert_eq!(merge_startup_noise("a", "b").as_deref(), Some("a\nb"));
     }
 
     #[tokio::test]
