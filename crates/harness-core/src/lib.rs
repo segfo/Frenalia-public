@@ -4,6 +4,7 @@
 pub mod cognition;
 pub mod config_injection;
 pub mod event;
+pub mod git;
 pub mod message;
 pub mod net_policy;
 pub mod prompt;

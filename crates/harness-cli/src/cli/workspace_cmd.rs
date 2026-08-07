@@ -262,6 +262,9 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         Commands::Net { .. } => {
             unreachable!("Commands::Net is dispatched before run_sandbox_subcommand")
         }
+        Commands::Memory { .. } => {
+            unreachable!("Commands::Memory is dispatched before run_sandbox_subcommand")
+        }
         Commands::Policy { .. } => {
             unreachable!("Commands::Policy is dispatched before run_sandbox_subcommand")
         }
@@ -527,6 +530,9 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         }
         Commands::Net { .. } => {
             unreachable!("Commands::Net is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Memory { .. } => {
+            unreachable!("Commands::Memory is dispatched before run_sandbox_subcommand")
         }
         Commands::Policy { .. } => {
             unreachable!("Commands::Policy is dispatched before run_sandbox_subcommand")

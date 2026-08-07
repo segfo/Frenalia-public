@@ -15,16 +15,16 @@
 //! - `<out>/cow/` — 8シナリオ分のワークスペース。各シナリオが1セッション
 //!   （`.harness/sessions/session-<id>.jsonl`）＋1オーバーレイ（`.harness/sandbox/session-<id>/`）
 //!   を持ち、`harness --staged --resume <id>`で開くとその変更だけがレビュー対象になる。
-//! - `%APPDATA%\harness\memory\<workspace-key>\` — Recall記憶のレビュー用データ4種
-//!   （`plans/PLAN-RECALL-MEMORY.md`の配置に合わせたもの）。**Recall本体は未実装なので、
-//!   現時点でこれを開く経路はハーネスに無い**（データだけ先に用意してある）。
+//! - `%APPDATA%\harness\data\memory\<workspace-key>\` — Recall記憶のレビュー用データ4種
+//!   （`plans/PLAN-RECALL-MEMORY.md`）。**`RecallStore`経由で作る**ので、
+//!   `harness memory list --all`・TUIの`/memory`からそのまま見える。
 
 use std::path::{Path, PathBuf};
 
+use harness_cognition::{Checkpoint, CheckpointMeta, RecallStore, ReviewedWatermark};
 use harness_core::{ContentBlock, Message, Role, StagingConfig, StagingMode};
 use harness_engine::SessionStore;
 use harness_sandbox::SandboxFs;
-use sha2::{Digest, Sha256};
 
 /// 生成物であることの目印。既存ディレクトリを消す前にこれを確認する。
 const MARKER: &str = "REVIEW-E2E-FIXTURES.md";
@@ -612,14 +612,10 @@ fn build_combo(out: &Path) -> Option<ComboFixture> {
     }
     std::fs::write(ws.join("SCENARIOS.md"), scenario_table(&scenarios)).unwrap();
 
-    // 8件のうち3件はウォーターマークより古い＝レビュー済み、5件（短文2・長文3）が未レビュー。
-    let mut specs: Vec<CheckpointSpec> = Vec::new();
-    for i in 0..8 {
-        let mut spec = CheckpointSpec::new(i, i >= 5);
-        spec.created_at = format!("2026-08-{:02}T09:00:00Z", i + 1);
-        specs.push(spec);
-    }
-    let dir = write_memory(&ws, &specs, "2026-08-03T12:00:00Z")?;
+    // 8件のうち先頭3件をレビュー済みにする（ウォーターマークを添字2へ進める）＝
+    // 残り5件（短文2・長文3）が未レビュー。
+    let specs: Vec<CheckpointSpec> = (0..8).map(|i| CheckpointSpec::new(i, i >= 5)).collect();
+    let dir = write_memory(&ws, &specs, Some(2))?;
     println!("[combo] memory -> {} (8件中5件が未レビュー)", dir.display());
     Some(ComboFixture {
         workspace: ws,
@@ -705,12 +701,15 @@ fn combo_long(ws: &Path) -> Scenario {
 
 // ------------------------------------------------------------------- Recall
 
-/// `plans/PLAN-RECALL-MEMORY.md`の配置（`%APPDATA%\harness\memory\<workspace-key>\`、
-/// `<workspace-key>`＝正規化した絶対パスのSHA-256）に合わせて記憶データを置く。
+/// Recallの記憶データを**実装コード経由で**作る（`plans/PLAN-RECALL-MEMORY.md`）。
 ///
-/// **Recall本体は未実装**なので、ここで作るのは「その形をしたファイル」であり、ハーネスから
-/// 読む経路はまだ無い。フィールド名は設計書の記述（`{id, tags[], summary, created_at,
-/// goal_excerpt}`）に合わせてあるが、実装時に変わり得る。
+/// 置き場（`ProjectDirs::data_dir()`配下`memory/<workspace-key>/`）・workspace-keyの畳み込み・
+/// ID検証・front matterの形・`index.jsonl`・`reviewed.json`・git履歴化は、全て
+/// `RecallStore::append`／`mark_reviewed`が決める。**ここで同じ形式を書き下ろさない**——
+/// 以前この生成器は設計書の記述から形式を推測して手書きしており、実装と4点
+/// （置き場・keyの桁数・`created_at_ms`・ウォーターマークの形）で食い違って、生成しても
+/// `harness memory list`から1件も見えない状態になっていた（`bug-pattern-rules` B-05:
+/// コンパイラが守らない複製は静かにずれる）。
 fn build_recall_fixtures(out: &Path) -> Vec<(PathBuf, PathBuf)> {
     let variants: [(&str, usize, bool); 4] = [
         ("recall-multi-short", 6, false),
@@ -728,9 +727,10 @@ fn build_recall_fixtures(out: &Path) -> Vec<(PathBuf, PathBuf)> {
         )
         .unwrap();
         let specs: Vec<CheckpointSpec> = (0..count).map(|i| CheckpointSpec::new(i, long)).collect();
-        // ウォーターマークは最古のcheckpointより前に置く＝**全件が未レビュー**になる。
-        let Some(dir) = write_memory(&ws, &specs, "2026-08-01T00:00:00Z") else {
-            eprintln!("warning: %APPDATA%が解決できないためRecallデータを作りませんでした");
+        // ウォーターマークを進めない＝**全件が未レビュー**になる（既定の`ReviewedWatermark`は
+        // `{created_at_ms: 0, id: ""}`で、どのcheckpointよりも小さい）。
+        let Some(dir) = write_memory(&ws, &specs, None) else {
+            eprintln!("warning: 記憶ディレクトリを用意できなかったためRecallデータを作りませんでした");
             return made;
         };
         println!("[recall] {name} -> {}", dir.display());
@@ -739,89 +739,108 @@ fn build_recall_fixtures(out: &Path) -> Vec<(PathBuf, PathBuf)> {
     made
 }
 
+/// フィクスチャの`created_at_ms`の基点。**固定値**にすることで、生成し直しても同じIDになる
+/// （`recall_e2e.rs`の台本がIDをリテラルで参照できる）。
+const FIXTURE_EPOCH_MS: u64 = 1_785_000_000_000;
+
 struct CheckpointSpec {
-    id: String,
-    created_at: String,
-    long: bool,
     seq: usize,
+    long: bool,
 }
 
 impl CheckpointSpec {
-    fn new(i: usize, long: bool) -> Self {
-        Self {
-            id: format!("cp-{:03}", i + 1),
-            created_at: format!("2026-08-{:02}T{:02}:00:00Z", (i % 6) + 2, 9 + (i % 12)),
-            long,
-            seq: i,
+    fn new(seq: usize, long: bool) -> Self {
+        Self { seq, long }
+    }
+
+    fn created_at_ms(&self) -> u64 {
+        FIXTURE_EPOCH_MS + self.seq as u64 * 3_600_000
+    }
+
+    /// 決定的なID。`cp-<epoch millis>-<8hex>`という実装の採番規約
+    /// （`recall/checkpoint.rs::make_id`）に合わせるが、本文ハッシュではなく連番から作る
+    /// （再生成しても変わらないようにするため）。
+    fn id(&self) -> String {
+        format!("cp-{}-{:08x}", self.created_at_ms(), self.seq)
+    }
+
+    fn summary(&self) -> String {
+        if self.long {
+            format!(
+                "{}件目の記憶: AppContainer配下の書込み経路と、そこで確定した判断の要約（長文サンプル）",
+                self.seq
+            )
+        } else {
+            format!("{}件目の記憶: 短い要約サンプル", self.seq)
+        }
+    }
+
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            meta: CheckpointMeta {
+                id: self.id(),
+                created_at_ms: self.created_at_ms(),
+                tags: vec![
+                    "sandbox".to_string(),
+                    "tier2a".to_string(),
+                    if self.long { "長文" } else { "短文" }.to_string(),
+                ],
+                summary: self.summary(),
+                goal_excerpt: format!("ゴール{}: レビュー面のE2Eで使う記憶データ", self.seq),
+                // File出典のダイジェストは入れない（＝recall時のFreshnessは`Stale`側に倒れる）。
+                // ここで作りたいのは「レビュー運用の見え方」であって鮮度判定ではないため。
+                sources: Vec::new(),
+            },
+            body: checkpoint_body(self),
         }
     }
 }
 
-/// 1ワークスペース分の記憶ディレクトリ（`checkpoints/`＋`index.jsonl`＋`meta.json`＋
-/// `reviewed.json`）を書く。`reviewed_through`より**新しい**`created_at`のcheckpointが
-/// 未レビュー集合になる（ウォーターマーク方式）。
-fn write_memory(ws: &Path, specs: &[CheckpointSpec], reviewed_through: &str) -> Option<PathBuf> {
-    let dir = memory_root()?.join(workspace_key(ws));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).unwrap();
+/// 1ワークスペース分の記憶を`RecallStore`経由で作る。`reviewed_upto`に添字を渡すと、
+/// そこまでをレビュー済みにする（ウォーターマーク方式なので、それより新しい分が未レビュー）。
+fn write_memory(
+    ws: &Path,
+    specs: &[CheckpointSpec],
+    reviewed_upto: Option<usize>,
+) -> Option<PathBuf> {
+    let store = match RecallStore::for_workspace(ws) {
+        Ok(s) => s,
+        Err(reason) => {
+            eprintln!("warning: 記憶ディレクトリを解決できませんでした: {reason}");
+            return None;
+        }
+    };
+    // 前回の生成物を捨てる。**製品の撤収経路（`harness memory forget`と同じ`forget()`）を
+    // そのまま使う**——生成器が独自に`remove_dir_all`すると、消し方が実装とずれる。
+    if let Err(e) = store.forget() {
+        eprintln!("warning: 既存の記憶を削除できませんでした: {e}");
+        return None;
     }
-    std::fs::create_dir_all(dir.join("checkpoints")).unwrap();
-    std::fs::write(
-        dir.join("meta.json"),
-        serde_json::to_string_pretty(&serde_json::json!({
-            "workspace": normalized_workspace(ws),
-            "created_at": "2026-08-06T09:00:00Z",
-            "note": "generated by review-e2e-fixtures (Recall本体は未実装)",
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let mut index = String::new();
     for spec in specs {
-        std::fs::write(
-            dir.join("checkpoints").join(format!("{}.md", spec.id)),
-            checkpoint_body(spec),
-        )
-        .unwrap();
-        index.push_str(&serde_json::to_string(&serde_json::json!({
-            "id": spec.id,
-            "tags": ["sandbox", "tier2a", if spec.long { "長文" } else { "短文" }],
-            "summary": if spec.long {
-                format!("{}件目の記憶: AppContainer配下の書込み経路と、そこで確定した判断の要約（長文サンプル）", spec.seq)
-            } else {
-                format!("{}件目の記憶: 短い要約サンプル", spec.seq)
-            },
-            "created_at": spec.created_at,
-            "goal_excerpt": format!("ゴール{}: レビュー面のE2Eで使う記憶データ", spec.seq),
-        }))
-        .unwrap());
-        index.push('\n');
+        // `allow_unversioned = true`: gitが無い環境でもフィクスチャは作れるようにする
+        // （gitがあれば`append`が1書込み1コミットで履歴化する）。
+        if let Err(reason) = store.append(&spec.checkpoint(), true) {
+            eprintln!("warning: checkpointを書けませんでした: {reason}");
+            return None;
+        }
     }
-    std::fs::write(dir.join("index.jsonl"), index).unwrap();
-    std::fs::write(
-        dir.join("reviewed.json"),
-        serde_json::to_string_pretty(&serde_json::json!({
-            "reviewed_through": reviewed_through,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    Some(dir)
+    if let Some(i) = reviewed_upto {
+        let spec = &specs[i];
+        store.mark_reviewed(ReviewedWatermark {
+            created_at_ms: spec.created_at_ms(),
+            id: spec.id(),
+        });
+    }
+    Some(store.dir().to_path_buf())
 }
 
+/// checkpoint本体のMarkdown（front matterは`RecallStore`が付ける）。
 fn checkpoint_body(spec: &CheckpointSpec) -> String {
-    let (id, i, long) = (&spec.id, spec.seq, spec.long);
+    let (i, long) = (spec.seq, spec.long);
     let mut out = format!(
-        "# {id}\n\n\
-         - tags: sandbox, tier2a, {}\n\
-         - created_at: {}\n\
-         - grade: Corroborated\n\n\
-         ## ゴール\n\n\
+        "## ゴール\n\n\
          レビュー面のE2Eで使う記憶データ（{i}件目）。\n\n\
-         ## 確証済みの要点\n\n",
-        if long { "長文" } else { "短文" },
-        spec.created_at,
+         ## 確証済みの要点\n\n"
     );
     if long {
         for n in 0..12 {
@@ -838,26 +857,6 @@ fn checkpoint_body(spec: &CheckpointSpec) -> String {
         out.push_str("- 要点1: 短い記憶のサンプル。\n- 要点2: 2行目。\n\n## 出典\n\n- File: `README.md`\n");
     }
     out
-}
-
-fn memory_root() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "harness")
-        .map(|d| d.config_dir().parent().unwrap().join("memory"))
-}
-
-/// 設計書の`<workspace-key>`: `\`→`/`統一・小文字化・`\\?\`除去したうえでSHA-256。
-fn normalized_workspace(ws: &Path) -> String {
-    let abs = std::fs::canonicalize(ws).unwrap_or_else(|_| ws.to_path_buf());
-    abs.to_string_lossy()
-        .trim_start_matches(r"\\?\")
-        .replace('\\', "/")
-        .to_lowercase()
-}
-
-fn workspace_key(ws: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(normalized_workspace(ws).as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 // ------------------------------------------------------------------- README
@@ -885,16 +884,23 @@ fn write_readme(
          `↑↓`一覧・`Enter/Space`行トグル・`Tab`でdiffペインへ・`↑↓`ハンク移動・\n\
          `Enter/Space`ハンクトグル・`PgUp/PgDn`スクロール・`c`コミット・`x`全破棄・`Esc`閉じる。\n\n\
          シナリオ一覧は`cow/SCENARIOS.md`。\n\n\
-         ## Recall記憶（**まだ開けない**）\n\n\
-         Recall本体（`plans/PLAN-RECALL-MEMORY.md`）が未実装のため、ハーネスからこのデータを\n\
-         開く経路はまだ無い（`ReviewPanel`の骨格は面非依存だが、`ReviewTarget::Memory`と\n\
-         記憶ストアがまだ存在しない）。設計どおりの置き場・形式で先に作ってある。\n\n",
+         ## Recall記憶\n\n\
+         `RecallStore`経由で作ってあるので、そのまま開ける。\n\n\
+         ```powershell\n\
+         cd <下表のワークスペース>\n\
+         harness.exe memory list --all      # 一覧（既定は未レビュー分のみ）\n\
+         harness.exe memory show <id>       # 本文\n\
+         harness.exe memory review --mark-reviewed\n\
+         ```\n\n\
+         TUIからは`/memory`（`list`/`reviewed`/`discard <id>`）。起動時に未レビュー件数が\n\
+         1行通知される。**内蔵`ReviewPanel`のRecall面はまだ無い**\n\
+         （`plans/PLAN-VSCODE-REVIEW.md`側の未実装分）。\n\n",
         out.display(),
         cow_ws.display(),
         cow_ws.display()
     );
     if recall.is_empty() {
-        body.push_str("（%APPDATA%が解決できなかったため未生成）\n");
+        body.push_str("（記憶ディレクトリを解決できなかったため未生成）\n");
     } else {
         body.push_str("| ワークスペース | 記憶ディレクトリ | 件数 |\n|---|---|---|\n");
         for (ws, dir) in recall {
@@ -919,9 +925,9 @@ fn write_readme(
              cd {}\n\
              harness.exe --staged --resume combo-short   # または combo-long\n\
              ```\n\n\
-             - CoW側: `combo/SCENARIOS.md`（`/fsstage commit`でパネルが開く。**今すぐ試せる**）\n\
-             - Recall側: `{}`（checkpoint 8件のうち、ウォーターマーク`2026-08-03T12:00:00Z`より\n\
-               新しい5件が未レビュー。**開く経路は未実装**）\n",
+             - CoW側: `combo/SCENARIOS.md`（`/fsstage commit`でパネルが開く）\n\
+             - Recall側: `{}`（checkpoint 8件のうち先頭3件がレビュー済み、残り5件が未レビュー。\n\
+               `harness memory list`／TUIの`/memory`で見える）\n",
             combo.workspace.display(),
             combo.workspace.display(),
             combo.memory.display()

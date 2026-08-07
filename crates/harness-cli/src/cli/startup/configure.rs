@@ -92,8 +92,26 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
     // `cognition.sources`は内蔵ツールの既定カタログへの上乗せ（M16、§4.2）。宣言の`trust`は
     // 既に`Settings::load`が【T5】の上限へクランプ済みなので、ここでは解釈するだけでよい。
     let source_catalog = build_source_catalog(&settings);
+    // `cognition.recall`（`plans/PLAN-RECALL-MEMORY.md`）。省略時は既定（有効・
+    // 履歴なし書込みは無効・Stale再検証は無効）。`allow_unversioned`は`Settings::load`が
+    // 既にユーザー層限定へ、`stale_reverification`は既にプロジェクト層からの無効化不可へ
+    // クランプ済み。
+    let recall_settings = settings.cognition.as_ref().and_then(|c| c.recall.as_ref());
+    let recall_enabled = recall_settings.and_then(|r| r.enabled).unwrap_or(true);
+    let recall_allow_unversioned = recall_settings
+        .and_then(|r| r.allow_unversioned)
+        .unwrap_or(false);
+    let recall_top_k = recall_settings.and_then(|r| r.top_k).unwrap_or(5);
+    let recall_stale_reverification = recall_settings
+        .and_then(|r| r.stale_reverification)
+        .unwrap_or(false);
     let cognition = match CognitiveOrchestrator::new(cognition_level, phase_budgets.clone()) {
-        Ok(c) => c.with_catalog(source_catalog),
+        Ok(c) => c.with_catalog(source_catalog).with_recall_settings(
+            recall_enabled,
+            recall_allow_unversioned,
+            recall_top_k,
+            recall_stale_reverification,
+        ),
         Err(e) => {
             eprintln!("error: {e}");
             return Err(ExitCode::FAILURE);

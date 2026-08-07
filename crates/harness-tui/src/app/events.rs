@@ -298,6 +298,28 @@ impl AppState {
                 }
                 self.transcript.push(TranscriptItem::Info(line));
             }
+            // --- Recall（`plans/PLAN-RECALL-MEMORY.md`）---
+            // `skipped`が無音にならないよう、成功/スキップのどちらも1行残す（B-10）。
+            AgentEvent::MemoryRecalled {
+                candidates,
+                injected,
+                skipped,
+            } => {
+                let line = match skipped {
+                    Some(reason) => format!("[記憶] 読出しスキップ: {reason}"),
+                    None if candidates == 0 => "[記憶] 該当する過去の記憶なし".to_string(),
+                    None => format!("[記憶] {candidates}件ヒット→{injected}件を採用"),
+                };
+                self.transcript.push(TranscriptItem::Info(line));
+            }
+            AgentEvent::MemoryCheckpointed { id, skipped } => {
+                let line = match (id, skipped) {
+                    (Some(id), _) => format!("[記憶] 保存: {id}"),
+                    (None, Some(reason)) => format!("[記憶] 保存スキップ: {reason}"),
+                    (None, None) => "[記憶] 保存条件を満たさなかった".to_string(),
+                };
+                self.transcript.push(TranscriptItem::Info(line));
+            }
             AgentEvent::SessionSwitched {
                 source_id,
                 new_id,

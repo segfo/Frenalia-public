@@ -79,7 +79,7 @@ pub(crate) fn render(mem: &WorkingMemory, stop: &HivStop, mcp_available: bool) -
                     e.id,
                     e.claim,
                     e.source.describe(),
-                    e.validity.describe()
+                    e.validity.describe(e.source.kind())
                 ));
                 if h.status == HypStatus::Confirmed
                     && h.supporting.contains(id)

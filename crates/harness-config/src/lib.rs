@@ -121,6 +121,28 @@ pub struct CognitionSettings {
     /// どれをどの用途の情報源としてモデルへ見せるか」。per-tool `RiskClass`宣言（D-40）も
     /// ここには置かない。あれはMCP機構が所有し、認知層は`Tool::risk()`の結果に従うだけ。
     pub sources: Option<Vec<SourceSetting>>,
+    /// `Recall`（ゴールを横断する永続記憶、`plans/PLAN-RECALL-MEMORY.md`）の設定。
+    pub recall: Option<RecallSettings>,
+}
+
+/// `.harness/settings.json`の`cognition.recall`キー。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecallSettings {
+    /// 自動チェックポイント生成・自動読出し注入の有効化（既定true）。
+    pub enabled: Option<bool>,
+    /// gitが無い環境で履歴なし書込みを許すか（既定false）。**ユーザー層設定でのみ有効**
+    /// （[`clamp_project_recall_allow_unversioned`]）——cloneしたリポジトリの
+    /// `.harness/settings.json`だけで履歴無し書込みを有効化できてしまうと、
+    /// 「このワークスペースだけ事後レビューの手段を封じる」毒入れ経路になる。
+    pub allow_unversioned: Option<bool>,
+    /// bigram検索の上位K件（既定5）。
+    pub top_k: Option<usize>,
+    /// Recallのダイジェスト照合が`Stale`と判定した記憶に、機械的な再検証項目を積むか
+    /// （既定false、オプトイン）。**プロジェクト層からは有効化できるが無効化できない**
+    /// （[`clamp_project_recall_stale_reverification_floor`]）——`true`は「古い記憶を無警告で
+    /// 使わせない」という安全側の設定なので、`TrustLevel`の【T5】（引き下げは許すが
+    /// 引き上げは許さない）とは逆方向の非対称クランプになる。
+    pub stale_reverification: Option<bool>,
 }
 
 /// `cognition.sources[]`の1エントリ（`plans/DESIGN-COGNITION.md` §4.2）。
@@ -232,6 +254,95 @@ pub fn clamp_project_mcp_http_gates(user: &serde_json::Value, merged: &mut serde
             }
         }
     }
+}
+
+/// `cognition.recall.allow_unversioned`は**ユーザー層設定でのみ**有効化できる
+/// （`plans/PLAN-RECALL-MEMORY.md`）。[`clamp_project_mcp_http_gates`]と同じ形の
+/// クランプ——マージ結果をユーザ層の値へ戻す（プロジェクト層が`false`→`true`にできない）。
+///
+/// cloneしたリポジトリの`.harness/settings.json`だけでgit不在時の履歴なし書込みを
+/// 有効化できると、「このワークスペースの記憶だけ事後レビュー（`harness memory review`＋
+/// git履歴）の手段を封じる」毒入れ経路になる。読出しには影響しない
+/// （`allow_unversioned`は書込みの可否だけを制御する）。
+pub fn clamp_project_recall_allow_unversioned(user: &serde_json::Value, merged: &mut serde_json::Value) {
+    let user_value = user
+        .get("cognition")
+        .and_then(|c| c.get("recall"))
+        .and_then(|r| r.get("allow_unversioned"));
+
+    let Some(recall) = merged
+        .get_mut("cognition")
+        .and_then(|c| c.get_mut("recall"))
+        .and_then(|r| r.as_object_mut())
+    else {
+        return;
+    };
+    if recall.get("allow_unversioned") == user_value {
+        return;
+    }
+    eprintln!(
+        "warning: ignoring \"cognition.recall.allow_unversioned\" from the project settings. \
+         It can only be set in your user settings.json (see plans/PLAN-RECALL-MEMORY.md)."
+    );
+    match user_value {
+        Some(value) => {
+            recall.insert("allow_unversioned".to_string(), value.clone());
+        }
+        None => {
+            recall.remove("allow_unversioned");
+        }
+    }
+}
+
+/// `cognition.recall.stale_reverification`は**プロジェクト層から有効化はできるが無効化はできない**
+/// （`plans/PLAN-RECALL-MEMORY.md`、`docs/STATUS.md`認知レイヤー残課題#16）。
+///
+/// [`clamp_project_recall_allow_unversioned`]・[`clamp_project_source_trust`]（【T5】）と形は
+/// 同じ「マージ結果をユーザ層の値へ戻す」クランプだが、**方向が逆**——`allow_unversioned`は
+/// ユーザー層限定（プロジェクトは一切動かせない）、`source_trust`は引き下げのみ許可
+/// （プロジェクトは安全側にしか動かせない）だが、`stale_reverification`は`true`＝安全側なので
+/// **プロジェクトは引き上げる方向（`true`）にしか動かせない**。ユーザー層が`true`にしていれば、
+/// プロジェクト層が`false`と書いてもユーザーの値が勝つ。ユーザー層が`true`にしていなければ、
+/// プロジェクト層は自由に`true`/`false`を書ける（安全側への変更を妨げないため）。
+pub fn clamp_project_recall_stale_reverification_floor(
+    user: &serde_json::Value,
+    merged: &mut serde_json::Value,
+) {
+    let user_floor = user
+        .get("cognition")
+        .and_then(|c| c.get("recall"))
+        .and_then(|r| r.get("stale_reverification"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !user_floor {
+        // フロアが立っていない（ユーザー層がtrueにしていない）ので、プロジェクト層の値を
+        // そのまま通す。
+        return;
+    }
+
+    let Some(recall) = merged
+        .get_mut("cognition")
+        .and_then(|c| c.get_mut("recall"))
+        .and_then(|r| r.as_object_mut())
+    else {
+        return;
+    };
+    let merged_true = recall
+        .get("stale_reverification")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if merged_true {
+        return;
+    }
+    eprintln!(
+        "warning: ignoring an attempt to disable \"cognition.recall.stale_reverification\" from \
+         the project settings. Once enabled in your user settings.json it cannot be turned off by \
+         a project (see plans/PLAN-RECALL-MEMORY.md)."
+    );
+    recall.insert(
+        "stale_reverification".to_string(),
+        serde_json::Value::Bool(true),
+    );
 }
 
 fn source_entries(root: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
@@ -626,6 +737,8 @@ impl Settings {
         }
         clamp_project_source_trust(&user_layer, &mut merged);
         clamp_project_mcp_http_gates(&user_layer, &mut merged);
+        clamp_project_recall_allow_unversioned(&user_layer, &mut merged);
+        clamp_project_recall_stale_reverification_floor(&user_layer, &mut merged);
 
         serde_json::from_value(merged).unwrap_or_default()
     }
@@ -731,6 +844,112 @@ mod tests {
         assert_eq!(sources[0].use_for.as_deref(), Some(&["社内仕様".to_string()][..]));
         assert_eq!(sources[1].id.as_deref(), Some("web_fetch"));
         assert_eq!(sources[1].trust, None, "省略は種別既定へ落とす（読む側の責務）");
+    }
+
+    /// `cognition.recall`は各フィールドを独立に省略できる。
+    #[test]
+    fn parses_partial_cognition_recall_settings() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "cognition": { "recall": { "enabled": false, "top_k": 3 } }
+        }))
+        .unwrap();
+        let recall = settings.cognition.unwrap().recall.unwrap();
+        assert_eq!(recall.enabled, Some(false));
+        assert_eq!(recall.top_k, Some(3));
+        assert_eq!(recall.allow_unversioned, None);
+        assert_eq!(recall.stale_reverification, None);
+    }
+
+    // --- `cognition.recall.allow_unversioned`はユーザー層限定 ---
+
+    fn merged_recall(user: &serde_json::Value, project: serde_json::Value) -> serde_json::Value {
+        let mut merged = user.clone();
+        deep_merge(&mut merged, project);
+        clamp_project_recall_allow_unversioned(user, &mut merged);
+        merged
+            .get("cognition")
+            .and_then(|c| c.get("recall"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// プロジェクト層は`allow_unversioned`を独力で有効化できない（未決事項の確定に伴う
+    /// 設計判断）。
+    #[test]
+    fn a_project_cannot_enable_recall_allow_unversioned_on_its_own() {
+        let user = serde_json::json!({});
+        let recall = merged_recall(
+            &user,
+            serde_json::json!({ "cognition": { "recall": { "allow_unversioned": true } } }),
+        );
+        assert_eq!(recall.get("allow_unversioned"), None);
+    }
+
+    /// ユーザー層が明示的に`true`にしていれば、プロジェクト層に`false`と書かれていても
+    /// ユーザーの値が勝つ（マージ結果をユーザ層へ戻す、D-49と同じ形）。
+    #[test]
+    fn a_user_enabled_allow_unversioned_survives_a_conflicting_project_value() {
+        let user = serde_json::json!({ "cognition": { "recall": { "allow_unversioned": true } } });
+        let recall = merged_recall(
+            &user,
+            serde_json::json!({ "cognition": { "recall": { "allow_unversioned": false } } }),
+        );
+        assert_eq!(recall.get("allow_unversioned"), Some(&serde_json::json!(true)));
+    }
+
+    // --- `cognition.recall.stale_reverification`はプロジェクト層から有効化はできるが
+    //     無効化はできない（`allow_unversioned`・【T5】と方向が逆の非対称クランプ） ---
+
+    fn merged_recall_stale_reverification(
+        user: &serde_json::Value,
+        project: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut merged = user.clone();
+        deep_merge(&mut merged, project);
+        clamp_project_recall_stale_reverification_floor(user, &mut merged);
+        merged
+            .get("cognition")
+            .and_then(|c| c.get("recall"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// ユーザー層が未設定（フロアが立っていない）なら、プロジェクト層は自由に有効化できる
+    /// ——`true`は安全側の変更であり、それを妨げる理由が無い（`allow_unversioned`とは逆方向）。
+    #[test]
+    fn a_project_can_freely_enable_stale_reverification_when_the_user_has_not_set_a_floor() {
+        let user = serde_json::json!({});
+        let recall = merged_recall_stale_reverification(
+            &user,
+            serde_json::json!({ "cognition": { "recall": { "stale_reverification": true } } }),
+        );
+        assert_eq!(recall.get("stale_reverification"), Some(&serde_json::json!(true)));
+    }
+
+    /// ユーザー層が`true`にしていれば、プロジェクト層が`false`と書いてもユーザーの値が勝つ
+    /// （プロジェクトは無効化できない）。
+    #[test]
+    fn a_project_cannot_disable_stale_reverification_once_the_user_enabled_it() {
+        let user =
+            serde_json::json!({ "cognition": { "recall": { "stale_reverification": true } } });
+        let recall = merged_recall_stale_reverification(
+            &user,
+            serde_json::json!({ "cognition": { "recall": { "stale_reverification": false } } }),
+        );
+        assert_eq!(recall.get("stale_reverification"), Some(&serde_json::json!(true)));
+    }
+
+    /// ユーザー層が`false`（明示）でも、プロジェクト層は制約なく`true`にできる
+    /// （フロアは「ユーザーがtrueにしたか」でだけ立つ）。
+    #[test]
+    fn a_project_can_enable_stale_reverification_even_if_the_user_explicitly_disabled_it() {
+        let user =
+            serde_json::json!({ "cognition": { "recall": { "stale_reverification": false } } });
+        let recall = merged_recall_stale_reverification(
+            &user,
+            serde_json::json!({ "cognition": { "recall": { "stale_reverification": true } } }),
+        );
+        assert_eq!(recall.get("stale_reverification"), Some(&serde_json::json!(true)));
     }
 
     /// **【T5】**: プロジェクト同梱設定はtrustを**引き下げられるが引き上げられない**。

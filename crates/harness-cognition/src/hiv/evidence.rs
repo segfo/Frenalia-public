@@ -193,7 +193,7 @@ pub(crate) fn record_distilled(
         }
         let validity = mem
             .evidence_by_id(id)
-            .map(|e| e.validity.describe())
+            .map(|e| e.validity.describe(e.source.kind()))
             .unwrap_or_default();
         harness_engine::emit_event(
             events,

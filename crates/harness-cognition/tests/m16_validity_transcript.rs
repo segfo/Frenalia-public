@@ -234,8 +234,11 @@ async fn run_always_bounded(
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // Recallは明示的に切る（理由は`hiv_light_transcript.rs`の同じ箇所と同一——実`%APPDATA%`を
+    // 汚さない。Recall本体のE2Eは`harness-cli`の`tests/recall_e2e.rs`）。
     let orchestrator = CognitiveOrchestrator::new(CognitionLevel::Always, PhaseBudgets::default())
         .unwrap()
+        .with_recall_settings(false, false, 5, false)
         .with_catalog(catalog)
         .with_session_id("session-16");
     let outcome = orchestrator

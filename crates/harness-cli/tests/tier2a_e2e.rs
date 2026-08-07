@@ -46,6 +46,13 @@ fn scratch_dir() -> PathBuf {
     dir
 }
 
+/// ケース専用のRecall記憶データルート（`HARNESS_RECALL_DATA_ROOT`）。書込み先を決める側と
+/// 後始末する側が同じ式を使うための1関数（`bug-pattern-rules` B-01: 副作用を作ったら
+/// 撤収も同じ変更で書く／B-05: 同じパスを2箇所に別々に書かない）。
+fn recall_data_root(scratch: &Path, case_name: &str) -> PathBuf {
+    scratch.join("recall-memory").join(case_name)
+}
+
 /// ケース専用ワークスペース。既存があれば作り直す（前回失敗の残骸を引き継がない）。
 fn case_dir(name: &str) -> PathBuf {
     let dir = Path::new(CASE_ROOT).join(name);
@@ -186,6 +193,15 @@ fn run_harness_full(
         "(scripted; prompt text is ignored by the mock provider)",
     ]);
     cmd.args(extra_args);
+    // Recall（`plans/PLAN-RECALL-MEMORY.md`）の記憶ディレクトリをケース専用のscratchへ逃がす。
+    // `--cognition always`で回すケース（`run_cognition_harness`）はゴール完了時に
+    // checkpointを書くため、これが無いと実`%APPDATA%\harness\data\memory\`へE2Eの
+    // 残骸が溜まり続ける（`e2e-mock` featureが連れてくる`e2e-test-hooks`の逃がし口）。
+    // ケース単位にするのは`cleanup_on_success`が他ケースの分を巻き込まず消せるようにするため。
+    cmd.env(
+        "HARNESS_RECALL_DATA_ROOT",
+        recall_data_root(&scratch, case_name),
+    );
     if let Some(dir) = cwd_for_process {
         cmd.current_dir(dir);
     }
@@ -302,6 +318,7 @@ fn cleanup_on_success(ws: &Path, sessions: &[&str], case_name: &str) {
     let scratch = scratch_dir();
     let _ = std::fs::remove_file(scratch.join(format!("{case_name}-turns.json")));
     let _ = std::fs::remove_file(scratch.join(format!("{case_name}-requests.jsonl")));
+    let _ = std::fs::remove_dir_all(recall_data_root(&scratch, case_name));
 }
 
 fn run_named_case<F: FnOnce() -> Result<(), String>>(name: &str, f: F) -> bool {
@@ -1059,7 +1076,7 @@ fn assert_cow_redirect_through_cwd(
     let before = list_cow_sessions();
     let run = run_harness_full(
         &harness_exe(),
-        &cwd_arg,
+        cwd_arg,
         use_process_cwd.then_some(real.as_path()),
         &run_shell_script_turns(&script),
         &["--cow"],

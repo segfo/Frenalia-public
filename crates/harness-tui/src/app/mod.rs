@@ -66,7 +66,7 @@ mod input;
 mod review;
 
 use commands::parse_slash_command;
-pub use commands::{Action, FsStageCommand, SlashCommand};
+pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};
 pub use review::{
     commit_selection, CommitSelection, PartialFile, ReviewCommand, ReviewDiffLine, ReviewFocus,
     ReviewPanelState, ReviewRow, ReviewTarget,

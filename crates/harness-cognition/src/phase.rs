@@ -80,6 +80,13 @@ pub fn spec(phase: Phase) -> PhaseSpec {
             tools: ToolSelection::All,
             wants_schema: true,
         },
+        Phase::Recall => PhaseSpec {
+            // 候補の要約だけを見る解釈コール（`PhaseInput.raw_output`で運ぶ）。
+            // ツールは渡さない——検索そのものはbigramで済ませており、このコールは
+            // 関連性・信頼性判定に徹する。
+            tools: ToolSelection::None,
+            wants_schema: true,
+        },
         Phase::Plan => PhaseSpec {
             // 列挙自体はツール（`glob`等）で行う。モデルに数えさせない
             // （`plans/PLAN-SURVEY-ENGINE.md`「列挙自体はツール」）。
@@ -191,6 +198,14 @@ impl Default for PhaseBudgets {
             ),
             (
                 Phase::Decide,
+                TokenBudget {
+                    max_in: 2_000,
+                    max_out: 500,
+                },
+            ),
+            // `plans/PLAN-RECALL-MEMORY.md`。候補要約だけを見る小さな解釈コール。
+            (
+                Phase::Recall,
                 TokenBudget {
                     max_in: 2_000,
                     max_out: 500,

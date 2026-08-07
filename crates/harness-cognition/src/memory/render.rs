@@ -6,7 +6,7 @@
 
 use harness_core::Phase;
 
-use super::types::{HypStatus, Hypothesis};
+use super::types::{HypStatus, Hypothesis, SourceKind};
 use super::WorkingMemory;
 use crate::ledger::LedgerView;
 use crate::memory::types::{GoalId, HypId};
@@ -122,6 +122,20 @@ impl WorkingMemory {
                 let mark = if q.blocking { "**[blocking]** " } else { "" };
                 format!("{mark}{}", q.text)
             }),
+        );
+
+        // `plans/PLAN-RECALL-MEMORY.md`「読出し経路」3番。過去のrecallが注入した証拠
+        // （`SourceKind::Memory`、どの仮説にも紐付かない）をここで見せないと、
+        // Hypothesizeフェーズから注入した記憶が一切見えず機構が空振りする。
+        push_section(
+            &mut out,
+            "過去の記憶（要再検証）",
+            self.unlinked_evidence()
+                .filter(|id| {
+                    self.evidence_by_id(*id)
+                        .is_some_and(|e| e.source.kind() == SourceKind::Memory)
+                })
+                .filter_map(|id| self.claim_line(id)),
         );
         out
     }
@@ -275,7 +289,7 @@ impl WorkingMemory {
                 e.id,
                 e.claim,
                 e.source.describe(),
-                e.validity.describe()
+                e.validity.describe(e.source.kind())
             )
         })
     }
@@ -331,6 +345,9 @@ fn view_for(phase: Phase, target: Option<HypId>, goal: Option<GoalId>) -> Memory
         Phase::Verify => target.map_or(MemoryView::None, MemoryView::EvidenceFor),
         Phase::Critic => target.map_or(MemoryView::None, MemoryView::VerificationOf),
         Phase::Decide => goal.map_or(MemoryView::None, MemoryView::ConfirmedForGoal),
+        // `Recall`専用フェーズ。`WorkingMemory`はこれを扱わない
+        // （`recall::RecallLedger`が別途`LedgerView`を実装する、`plans/PLAN-RECALL-MEMORY.md`）。
+        Phase::Recall => MemoryView::None,
         // `CensusEngine`専用フェーズ。`WorkingMemory`はこれらを扱わない
         // （`census::CensusLedger`が別途`LedgerView`を実装する）。
         Phase::Plan | Phase::Collect | Phase::Join => MemoryView::None,
@@ -412,6 +429,42 @@ mod tests {
         mem.add_evidence(evidence("シングルスレッドでは緑"), Some((alive, false)));
         mem.add_evidence(evidence("無関係な観測"), None);
         (mem, alive, dead)
+    }
+
+    /// `plans/PLAN-RECALL-MEMORY.md`: 注入した過去の記憶（`SourceKind::Memory`、仮説に
+    /// 紐付かない）が`GoalSummary`/`Unknowns`双方のビューに現れること。**この拡張が無いと
+    /// 注入がHypothesizeから見えず機構が空振りする**。
+    #[test]
+    fn injected_memory_evidence_appears_in_goal_summary_and_unknowns() {
+        let mut mem = WorkingMemory::new();
+        mem.add_goal("バグを直す", vec![]);
+        mem.add_evidence(
+            |id| Evidence {
+                id,
+                claim: "過去の調査: 原因は設定ファイルの読込順序".to_string(),
+                source: SourceRef::Memory {
+                    note_id: "cp-1-aaaaaaaa".to_string(),
+                    reviewed: false,
+                },
+                validity: Validity::seed(TrustLevel::Low, Freshness::Stale),
+                raw_ref: None,
+            },
+            None,
+        );
+
+        let goal_summary = mem.render(MemoryView::GoalSummary, Reduction::Full);
+        assert!(
+            goal_summary.contains("過去の調査: 原因は設定ファイルの読込順序"),
+            "{goal_summary}"
+        );
+        assert!(goal_summary.contains("過去の記憶（要再検証）"), "{goal_summary}");
+        assert!(goal_summary.contains("未レビュー"), "{goal_summary}");
+
+        let unknowns = mem.render(MemoryView::Unknowns, Reduction::Full);
+        assert!(
+            unknowns.contains("過去の調査: 原因は設定ファイルの読込順序"),
+            "{unknowns}"
+        );
     }
 
     /// **生出力は台帳に無いのでレンダリングにも現れ得ない**が、生出力への

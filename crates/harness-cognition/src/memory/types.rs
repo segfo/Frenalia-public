@@ -160,6 +160,10 @@ pub enum SourceRef {
     },
     Memory {
         note_id: String,
+        /// 注入時点で`reviewed.json`のウォーターマークより新しかったか（`plans/PLAN-RECALL-MEMORY.md`
+        /// 「未レビュー表記」）。**正本は常に`reviewed.json`**——ここは注入時点の判定結果の
+        /// 写しでしかない（`bug-pattern-rules` B-13、同じ事実の正本を2つ持たない）。
+        reviewed: bool,
     },
     /// モデルの内部知識。必ず裏取りの対象になる。
     ModelPrior,
@@ -176,7 +180,13 @@ impl SourceRef {
             SourceRef::Shell { cmd, exit } => format!("shell `{cmd}` (exit {exit})"),
             SourceRef::Web { url, fetched_at } => format!("{url} ({fetched_at})"),
             SourceRef::Mcp { server, tool, .. } => format!("mcp/{server}/{tool}"),
-            SourceRef::Memory { note_id } => format!("memory/{note_id}"),
+            SourceRef::Memory { note_id, reviewed } => {
+                if *reviewed {
+                    format!("memory/{note_id}")
+                } else {
+                    format!("memory/{note_id}（未レビュー）")
+                }
+            }
             SourceRef::ModelPrior => "model prior (要裏取り)".to_string(),
         }
     }
@@ -367,6 +377,7 @@ mod tests {
             (
                 SourceRef::Memory {
                     note_id: "n".into(),
+                    reviewed: true,
                 },
                 SourceKind::Memory,
             ),

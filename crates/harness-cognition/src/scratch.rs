@@ -19,6 +19,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::fsname::validate_id;
 use crate::memory::types::RawRef;
 
 /// 1セッション分のscratch領域。
@@ -138,21 +139,6 @@ impl ScratchStore {
     }
 }
 
-/// ファイル名要素として安全か（`../`・ドライブ指定・区切り文字を含まないか）を検査する。
-/// `raw/`・`notes/`の両パス関数が共有する。
-fn validate_id(id: &str) -> io::Result<()> {
-    if id.is_empty()
-        || !id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unsafe id for a scratch file name: {id:?}"),
-        ));
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

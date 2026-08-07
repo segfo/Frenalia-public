@@ -12,10 +12,12 @@ name = "harness"
 path = "src/main.rs"
 
 [features]
-# out-of-processのTier2a E2Eテスト（`tests/tier2a_e2e.rs`）専用。既定オフ、リリースビルドに
-# 一切露出しない（`--provider mock`はテストフックのため、`docs/DEV-ENVIRONMENT.md`
-# 「Tier2a E2Eテストの実行方法」参照）。
-e2e-mock = []
+# out-of-processのE2Eテスト（`tests/tier2a_e2e.rs`・`tests/recall_e2e.rs`）専用。既定オフ、
+# リリースビルドに一切露出しない（`--provider mock`はテストフックのため、`docs/DEV-ENVIRONMENT.md`
+# 「Tier2a E2Eテストの実行方法」参照）。`harness-cognition/e2e-test-hooks`を連れてくるのは、
+# Recall E2Eが記憶の置き場を実`%APPDATA%`から一時ディレクトリへ逃がすため
+# （`HARNESS_RECALL_DATA_ROOT`）。
+e2e-mock = ["harness-cognition/e2e-test-hooks"]
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
@@ -39,7 +41,4 @@ serde_json = "1"
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }
 
 [dev-dependencies]
-# `examples/review-e2e-fixtures.rs`: Recall記憶の`<workspace-key>`（正規化した絶対パスの
-# SHA-256、`plans/PLAN-RECALL-MEMORY.md`）を計算するためだけに使う。
-sha2 = "0.10"
 tempfile = "3.27.0"

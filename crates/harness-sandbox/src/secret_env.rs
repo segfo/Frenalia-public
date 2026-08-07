@@ -53,46 +53,15 @@ pub fn build_child_env_from(
         .collect()
 }
 
-/// harnessが起動する全`git`（`run_shell`経由のモデル実行・`resolve.rs`の内部`git merge-file`の
-/// 双方）へ適用する、自動発火経路だけを潰すenv（D-06/D-14b、`plans/DESIGN-SANDBOX-APPPOLICY.md`
-/// §5.2）。`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`（git 2.31+）は`-c`と同じ
-/// 最高優先度の設定として扱われ、攻撃者が書き換える`.git/config`では上書きできない。
-///
-/// global config（`user.name`・credential helper・`safe.directory`）は意図的に生かす——
-/// `GIT_CONFIG_GLOBAL`/`SYSTEM`を空へ向ける旧`hardened_git_command`方式は、モデル実行`git commit`が
-/// `Author identity unknown`で即死する副作用を持つため採用しない。system config
-/// （`GIT_CONFIG_NOSYSTEM=1`）のみ無効化する。`core.hooksPath`は存在しないパスでよい
-/// （gitは不在のhookを黙ってスキップする）。
-pub fn git_hardening_env() -> Vec<(String, String)> {
-    vec![
-        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
-        ("GIT_CONFIG_COUNT".to_string(), "2".to_string()),
-        ("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string()),
-        (
-            "GIT_CONFIG_VALUE_0".to_string(),
-            "harness-empty-git-hooks-dir-does-not-exist".to_string(),
-        ),
-        ("GIT_CONFIG_KEY_1".to_string(), "core.fsmonitor".to_string()),
-        ("GIT_CONFIG_VALUE_1".to_string(), "false".to_string()),
-        ("GIT_PAGER".to_string(), "cat".to_string()),
-    ]
-}
+/// `harness_core::git::hardening_env`の再エクスポート。定義自体はそちらへ移した
+/// （`harness-cognition`のRecall機構が`harness-sandbox`へ依存せずに同じハードニングを使うため。
+/// `harness_core::git`のモジュールdoc参照）。既存呼び出し元（`shell.rs`・`resolve.rs`）は
+/// この再エクスポートにより無改造のまま動く。
+pub use harness_core::git::hardening_env as git_hardening_env;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn git_hardening_env_disables_hooks_fsmonitor_and_pager() {
-        let env = git_hardening_env();
-        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-        assert_eq!(get("GIT_CONFIG_NOSYSTEM"), Some("1"));
-        assert_eq!(get("GIT_CONFIG_COUNT"), Some("2"));
-        assert_eq!(get("GIT_CONFIG_KEY_0"), Some("core.hooksPath"));
-        assert_eq!(get("GIT_CONFIG_KEY_1"), Some("core.fsmonitor"));
-        assert_eq!(get("GIT_CONFIG_VALUE_1"), Some("false"));
-        assert_eq!(get("GIT_PAGER"), Some("cat"));
-    }
 
     #[test]
     fn strips_non_allowlisted_and_secret_looking_vars() {

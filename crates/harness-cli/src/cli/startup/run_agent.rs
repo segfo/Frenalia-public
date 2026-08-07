@@ -469,6 +469,12 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         compaction.context_window,
     )));
 
+    // `recall`ツール（`plans/PLAN-RECALL-MEMORY.md`段階3）。`census`と異なり内部で新しい
+    // `TurnExecutor`を組まない（`search`は決定的検索のみ、`remember`はファイル書込みのみ）
+    // ため、再帰対策（レジストリのスナップショット）は不要。`CognitionLevel`に関わらず常時
+    // 登録する（未使用時のコストはゼロ、`Off`の等価性を壊さない）。
+    tools.register(Arc::new(RecallTool::new(cognition.recall_allow_unversioned())));
+
     let exit_code = match cli.print {
         Some(print) => {
             headless_branch(

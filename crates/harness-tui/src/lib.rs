@@ -20,15 +20,15 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use harness_cognition::CognitiveOrchestrator;
+use harness_cognition::{CognitiveOrchestrator, RecallStore, ReviewedWatermark};
 use harness_core::{LlmProvider, ReadScopeConfig, StagingConfig, ToolCtx};
 use harness_engine::{ConversationState, PermissionArbiter, SessionStore};
 use harness_sandbox::{ApplyOptions, ManifestOp, SandboxFs};
 use harness_tools::ToolRegistry;
 
 pub use app::{
-    Action, AppState, BusyEnd, BusyProgress, CommitSelection, PartialFile, ReviewPanelState,
-    ReviewRow, ReviewTarget, SlashCommand,
+    Action, AppState, BusyEnd, BusyProgress, CommitSelection, MemoryCommand, PartialFile,
+    ReviewPanelState, ReviewRow, ReviewTarget, SlashCommand,
 };
 pub use engine::{spawn_engine, EngineHandle};
 pub use gate::InteractiveGate;
@@ -151,6 +151,57 @@ fn open_panel_fs(
         &ReadScopeConfig::default(),
         cow_upper_dir,
     )
+}
+
+/// `/memory`（`Recall`、`plans/PLAN-RECALL-MEMORY.md`）。表示行の生成はCLIの`harness memory`
+/// と共有する`harness_cognition::format_checkpoint_line`を使う（`bug-pattern-rules` B-05）。
+fn run_memory_slash_command(workspace_root: &std::path::Path, cmd: MemoryCommand) -> Vec<String> {
+    let store = match RecallStore::for_workspace(workspace_root) {
+        Ok(s) => s,
+        Err(reason) => return vec![format!("recall store unavailable: {reason}")],
+    };
+    if let Err(e) = store.open() {
+        return vec![format!("failed to open the recall store: {e}")];
+    }
+
+    match cmd {
+        MemoryCommand::List => match store.unreviewed() {
+            Ok(list) if list.is_empty() => vec!["no unreviewed checkpoints.".to_string()],
+            Ok(list) => list
+                .iter()
+                .map(|m| harness_cognition::format_checkpoint_line(m, false))
+                .collect(),
+            Err(e) => vec![format!("failed to list checkpoints: {e}")],
+        },
+        MemoryCommand::MarkReviewed => {
+            let unreviewed = match store.unreviewed() {
+                Ok(u) => u,
+                Err(e) => return vec![format!("failed to list checkpoints: {e}")],
+            };
+            if unreviewed.is_empty() {
+                return vec!["no unreviewed checkpoints.".to_string()];
+            }
+            let mut lines: Vec<String> = unreviewed
+                .iter()
+                .map(|m| harness_cognition::format_checkpoint_line(m, false))
+                .collect();
+            if let Some(latest) = unreviewed
+                .iter()
+                .max_by(|a, b| (a.created_at_ms, &a.id).cmp(&(b.created_at_ms, &b.id)))
+            {
+                store.mark_reviewed(ReviewedWatermark {
+                    created_at_ms: latest.created_at_ms,
+                    id: latest.id.clone(),
+                });
+                lines.push(format!("marked {} checkpoint(s) as reviewed.", unreviewed.len()));
+            }
+            lines
+        }
+        MemoryCommand::Discard(id) => match store.discard(&id) {
+            Ok(()) => vec![format!("discarded {id}.")],
+            Err(e) => vec![format!("failed to discard {id}: {e}")],
+        },
+    }
 }
 
 /// `SandboxFs::apply()`の結果をtranscriptへ1行のInfo通知として積む。変更パネルの`c`、
@@ -340,6 +391,22 @@ pub async fn run(
     // 実際のやりとりを積む（通知行が復元分の見出しになる）。
     app.restore_transcript(&restored_messages);
 
+    // `Recall`: セッション開始時に未レビュー件数を1行通知する（TUIのみ、headlessは
+    // 無人実行に通知の受け手がいないため通知しない、`plans/PLAN-RECALL-MEMORY.md`）。
+    // 解決・読出しに失敗しても通知しないだけで起動は止めない（fail-open）。
+    if let Ok(store) = RecallStore::for_workspace(&workspace_root_for_panel) {
+        if store.open().is_ok() {
+            if let Ok(unreviewed) = store.unreviewed() {
+                if !unreviewed.is_empty() {
+                    app.transcript.push(app::TranscriptItem::Info(format!(
+                        "{} unreviewed memory checkpoint(s). See `/memory`.",
+                        unreviewed.len()
+                    )));
+                }
+            }
+        }
+    }
+
     let mut tick = tokio::time::interval(TICK);
     // BUG-069: `/sessions`で別セッションへ切り替えたとき、engineが返す`SessionSwitched`
     // （見出し行）の**後ろ**へ復元分を積むための予約置き場。
@@ -454,6 +521,15 @@ pub async fn run(
                                     SlashCommand::FsStage(_) => unreachable!(
                                         "AppState::submit_input converts /fsstage into a dedicated Action before it reaches Action::Slash"
                                     ),
+                                    // `Recall`（`plans/PLAN-RECALL-MEMORY.md`）。`OpenChangesPanel`と
+                                    // 同じく、この非対話ループ内で直接ファイルI/Oを行う
+                                    // （記憶ディレクトリは小さいJSON/Markdownのみで、
+                                    // `open_panel_fs`と同程度の軽さ）。
+                                    SlashCommand::Memory(cmd) => {
+                                        for line in run_memory_slash_command(&workspace_root_for_panel, cmd) {
+                                            app.transcript.push(app::TranscriptItem::Info(line));
+                                        }
+                                    }
                                 },
                                 Action::Quit => {}
                                 Action::OpenChangesPanel => {

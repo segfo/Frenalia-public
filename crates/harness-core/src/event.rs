@@ -147,6 +147,31 @@ pub enum AgentEvent {
         /// ハーネスが台帳から決定的に算出したもので、モデルの自己申告ではない（§3.4）。
         strength: String,
     },
+    /// `Recall`機構（`plans/PLAN-RECALL-MEMORY.md`）が過去の記憶の読出しを試みた。
+    ///
+    /// **失敗・スキップも必ずこのイベントで報告する**（`bug-pattern-rules` B-10、
+    /// 「失敗を無視するのはよいが検知不能にするのは駄目」）。`ProjectDirs`が解決できない・
+    /// 判定コールが失敗した、等はゴールの完了そのものは止めない（fail-open）が、
+    /// `skipped`に理由を必ず入れることで「何も起きなかった」と「読出しを試みて何も無かった」
+    /// を区別できるようにする。
+    MemoryRecalled {
+        /// bigram検索でヒットした候補数（判定コール前）。
+        candidates: usize,
+        /// 判定コールを経て実際に台帳へ注入した件数。
+        injected: usize,
+        /// 読出しを行わなかった／完遂できなかった理由。`None`は正常に完了したことを意味する
+        /// （`candidates`/`injected`がともに0でも、それ自体は正常な「該当なし」であり
+        /// `skipped`ではない）。
+        skipped: Option<String>,
+    },
+    /// `Recall`機構がcheckpointの書込みを試みた。
+    MemoryCheckpointed {
+        /// 書けたら`Some(id)`。
+        id: Option<String>,
+        /// 書かなかった／書けなかった理由。`git`不在・`allow_unversioned`無効・
+        /// `ProjectDirs`未解決・commit失敗等（B-10、`MemoryRecalled`と同じ方針）。
+        skipped: Option<String>,
+    },
     /// 縮退したターンを破棄した（`plans/DESIGN-COGNITION.md` §11.4、M21）。
     ///
     /// **このイベントが出たターンはツールを一度も実行していない**——検知はストリーム受信中

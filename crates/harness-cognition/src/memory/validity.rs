@@ -87,13 +87,19 @@ impl TrustLevel {
 }
 
 /// 情報の鮮度（§4.3）。
+///
+/// `Ord`導出の順序（`Unknown < Stale < Fresh < Authoritative`）は[`resolve_conflict`]の決着に使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Freshness {
-    /// 判断の材料として最も古びない（権威ある一次資料）。
+    /// 照合材料が無い（宣言も無く、機械的に確かめる手段も無い）。種別の既定
+    /// （[`crate::source::default_freshness`]）はほとんどの種別でこの値になる。
     Unknown,
+    /// 機械的な照合が不一致・失敗した（例: Recallのダイジェスト照合、`recall/checkpoint.rs::freshness_of`）。
     Stale,
+    /// このセッションで実際に観測した、または機械的な照合が一致した。
     Fresh,
+    /// 判断の材料として最も古びない（権威ある一次資料、`cognition.sources[]`の宣言による）。
     Authoritative,
 }
 
@@ -140,8 +146,20 @@ impl Validity {
 
     /// レンダリング用の1行表現（`single_source/trust:high`）。矛盾に負けていればそれも出す
     /// ——「なぜこの観測を根拠に使わないのか」が台帳と最終回答から読めるようにするため。
-    pub fn describe(&self) -> String {
+    ///
+    /// **鮮度は種別既定と違うときだけ出す**——`freshness`はほとんどの種別で種別から一意に決まる
+    /// （[`crate::source::default_freshness`]）ため、無条件に出すと大半の行が情報ゼロの文字列で
+    /// プロンプトを膨らませる。`kind`は呼び出し側が`e.source.kind()`から渡す
+    /// （`Validity`自身はどの証拠に属するか知らないため、必ず渡してもらう）。
+    ///
+    /// Recallのダイジェスト照合（`recall/checkpoint.rs::freshness_of`）が決めた`Fresh`/`Stale`は
+    /// `Memory`の種別既定（`Unknown`＝照合材料なし）と必ず異なるため、このルールのままで表示される
+    /// （`plans/PLAN-RECALL-MEMORY.md`「読出し経路」4番、`docs/STATUS.md`認知レイヤー残課題#16）。
+    pub fn describe(&self, kind: SourceKind) -> String {
         let mut out = format!("{}/trust:{}", self.grade.as_str(), self.trust.as_str());
+        if self.freshness != crate::source::default_freshness(kind) {
+            out.push_str(&format!("／鮮度:{}", self.freshness.as_str()));
+        }
         if let Some(winner) = self.superseded_by {
             out.push_str(&format!("／{winner}に優先された"));
         }
@@ -348,7 +366,49 @@ mod tests {
         assert!(v.counts_as_grounding(SourceKind::File));
         v.superseded_by = Some(EvidenceId(7));
         assert!(!v.counts_as_grounding(SourceKind::File));
-        assert!(v.describe().contains("E7"), "{}", v.describe());
+        assert!(
+            v.describe(SourceKind::File).contains("E7"),
+            "{}",
+            v.describe(SourceKind::File)
+        );
+    }
+
+    /// **鮮度は種別既定と違うときだけ出る**（`docs/STATUS.md`認知レイヤー残課題#16の解消点）。
+    /// `File`の既定は`Fresh`なので、`Fresh`な観測では鮮度ラベルが出ない。`Memory`の既定は
+    /// `Unknown`なので、Recallのダイジェスト照合が決めた`Fresh`/`Stale`はどちらも既定と異なり
+    /// 必ず表示される。
+    #[test]
+    fn describe_shows_freshness_only_when_it_differs_from_the_kind_default() {
+        let file_fresh = validity(Grade::SingleSource, TrustLevel::High);
+        assert!(
+            !file_fresh.describe(SourceKind::File).contains("鮮度"),
+            "{}",
+            file_fresh.describe(SourceKind::File)
+        );
+
+        let mut memory_unknown = validity(Grade::Unverified, TrustLevel::Low);
+        memory_unknown.freshness = Freshness::Unknown;
+        assert!(
+            !memory_unknown.describe(SourceKind::Memory).contains("鮮度"),
+            "照合材料が無いだけの記憶は鮮度ラベルを出さない: {}",
+            memory_unknown.describe(SourceKind::Memory)
+        );
+
+        let mut memory_fresh = validity(Grade::Unverified, TrustLevel::Low);
+        memory_fresh.freshness = Freshness::Fresh;
+        assert!(
+            memory_fresh.describe(SourceKind::Memory).contains("鮮度:fresh"),
+            "{}",
+            memory_fresh.describe(SourceKind::Memory)
+        );
+
+        let mut memory_stale = validity(Grade::Unverified, TrustLevel::Low);
+        memory_stale.freshness = Freshness::Stale;
+        assert!(
+            memory_stale.describe(SourceKind::Memory).contains("鮮度:stale"),
+            "{}",
+            memory_stale.describe(SourceKind::Memory)
+        );
     }
 
     /// どの仮説にも紐付かない観測は、接地種別でも裏取り扱いにしない。

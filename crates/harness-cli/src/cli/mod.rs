@@ -24,7 +24,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{run_headless, OutputFormat};
-use harness_cognition::{CensusTool, CognitiveOrchestrator};
+use harness_cognition::{CensusTool, CognitiveOrchestrator, RecallTool};
 use harness_core::{
     normalize_domain_pattern, CognitionLevel, LlmProvider, NetProxyConfig, RequireSandbox,
     StagingConfig, StagingMode, ToolCtx,
@@ -189,6 +189,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: NetAction,
     },
+    /// ゴールを横断する永続記憶（`Recall`、`plans/PLAN-RECALL-MEMORY.md`）の保守サブコマンド。
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// ポリシー学習ヘルパー（M15.7、`plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。
     /// サンドボックスが拒否した資源を4経路（preflight・network・CoW・OS監査）から集め、
     /// 「では何を許せばよいか」を`.harness/settings.json`への差分として提案する。
@@ -247,6 +252,42 @@ pub(crate) enum NetAction {
         deny_only: bool,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
+    },
+}
+
+/// `harness memory`サブコマンドの各操作（`plans/PLAN-RECALL-MEMORY.md`「レビュー運用」）。
+#[derive(Subcommand)]
+pub(crate) enum MemoryAction {
+    /// checkpoint一覧。既定は未レビュー分のみ、`--all`で全件。
+    List {
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
+    },
+    /// 1件の本文を表示する。
+    Show { id: String },
+    /// 未レビューのcheckpointを一覧し、`--mark-reviewed`でウォーターマークを進める。
+    /// 外部diffビュワー起動は`plans/PLAN-VSCODE-REVIEW.md`が持つ（未実装）。
+    Review {
+        #[arg(long = "mark-reviewed", default_value_t = false)]
+        mark_reviewed: bool,
+    },
+    /// 1件を削除する（ファイル削除＋index再構築。gitがあれば削除もコミット）。
+    Discard { id: String },
+    /// `checkpoints/*.md`から`index.jsonl`を強制的に再構築する。
+    Reindex,
+    /// このワークスペースの記憶ディレクトリを丸ごと削除する。
+    Forget {
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+    /// このマシン上の全ワークスペースの記憶ディレクトリを一覧する。**既定では何も削除しない**
+    /// （dry-run）。元ワークスペースのパスが現在存在しないことは削除の根拠にしない
+    /// （未マウントのドライブと区別できないため）。
+    Gc {
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
 }
 
@@ -608,6 +649,7 @@ pub(crate) struct Cli {
 
 pub mod cow_cmd;
 pub mod mcp_cmd;
+pub mod memory_cmd;
 pub mod net_cmd;
 pub mod policy_cmd;
 pub mod setup;
@@ -617,6 +659,7 @@ pub mod workspace_cmd;
 
 pub(crate) use cow_cmd::*;
 pub(crate) use mcp_cmd::*;
+pub(crate) use memory_cmd::*;
 pub(crate) use net_cmd::*;
 pub(crate) use policy_cmd::*;
 pub(crate) use setup::*;

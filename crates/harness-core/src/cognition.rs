@@ -78,6 +78,11 @@ pub enum Phase {
     Critic,
     /// 確証済み仮説に基づき行動を決める。
     Decide,
+    /// `Recall`機構専用（`plans/PLAN-RECALL-MEMORY.md`）。検索でヒットしたcheckpoint候補の
+    /// 要約だけを見て、(a) 現在のゴールに関連するか、(b) 再利用にあたり再検証が要るか
+    /// （`fresh`/`needs_verification`/`ambiguous`）を判定する。決定的なbigram検索の後段
+    /// （関連性・信頼性判定）だけを担い、検索そのものはLLMコールを使わない。
+    Recall,
     /// `CensusEngine`専用（`plans/PLAN-CENSUS-ENGINE.md`段階2）。ユーザーの依頼と対象の
     /// 列挙結果からworklistを組む。HIVの`Orient`とは役割が異なる別バリアント
     /// （`Orient`はM19のHIVフル構成で状況把握として使う予定があり、流用するとプロンプト/
@@ -91,9 +96,17 @@ pub enum Phase {
 
 impl Phase {
     /// 宣言順（`plans/DESIGN-COGNITION.md` §3.3の表と同じ並び。`Plan`/`Collect`/`Join`は
-    /// `plans/PLAN-CENSUS-ENGINE.md`段階2で追加）。設定の既定表を組むとき等に、
-    /// 網羅を書き忘れないための単一の列挙点。
-    pub const ALL: [Phase; 10] = [
+    /// `plans/PLAN-CENSUS-ENGINE.md`段階2、`Recall`は`plans/PLAN-RECALL-MEMORY.md`で追加）。
+    /// 設定の既定表を組むとき等に、網羅を書き忘れないための単一の列挙点。
+    ///
+    /// **この配列自体はコンパイラの網羅性チェックが効かない**（stable Rustに列挙型の全
+    /// バリアント数を取得する手段が無いため）。新バリアントを足したときの実際の防波堤は、
+    /// このモジュール外にある**7箇所の網羅match**（`as_str`・`harness-cognition`の
+    /// `phase::spec`・`prompts::system_prompt`・`schema::schema_for`・`memory/render.rs`の
+    /// ビュー選択・`census/ledger.rs`の`render_slice`、いずれも`_ =>`を書けない設計）
+    /// ——これらが先にコンパイルエラーになるので、`ALL`を含むこの下のテストへ来る前に
+    /// 気付ける。
+    pub const ALL: [Phase; 11] = [
         Phase::Orient,
         Phase::Hypothesize,
         Phase::Investigate,
@@ -101,6 +114,7 @@ impl Phase {
         Phase::Verify,
         Phase::Critic,
         Phase::Decide,
+        Phase::Recall,
         Phase::Plan,
         Phase::Collect,
         Phase::Join,
@@ -116,6 +130,7 @@ impl Phase {
             Phase::Verify => "verify",
             Phase::Critic => "critic",
             Phase::Decide => "decide",
+            Phase::Recall => "recall",
             Phase::Plan => "plan",
             Phase::Collect => "collect",
             Phase::Join => "join",
@@ -178,16 +193,42 @@ mod tests {
         }
     }
 
-    /// `Phase::ALL`が全ての判別子を含むこと。`as_str`は`match`で全分岐を書くので、
-    /// バリアントを足したときに`ALL`だけ更新し忘れてもコンパイルは通ってしまう。
+    /// `Phase::ALL`に重複が無いことと、既知の全バリアントが`ALL`のメンバーシップmatchを
+    /// 通ることを検算する。
+    ///
+    /// **この関数だけでは「バリアントを足して`ALL`への追加を丸ごと忘れる」ミスを検出
+    /// できない**——`ALL`はただの配列リテラルであり、コンパイラの網羅性チェックが効くのは
+    /// `match`の腕に対してだけである。旧版はここを`assert_eq!(ALL.len(), 10)`という
+    /// 定数比較だけで済ませ、「網羅を保証する」ように読めるdocを書いていた点が問題だった
+    /// （`bug-pattern-rules` B-27。バリアントを足して`ALL`への追加を忘れても`len()`は
+    /// 変わらず、テストは通り続ける）。実際の防波堤は`ALL`の定義doc（上）に書いた7箇所の
+    /// 網羅matchが担う。この関数はその前提の上で、`ALL`自身の内部整合性（重複が無いこと・
+    /// 下の網羅matchに現れる既知バリアントが実際に`ALL`に載っていること）だけを検算する。
+    /// 網羅match自体は`Phase`に新バリアントを足すと真っ先にコンパイルエラーになるので、
+    /// 少なくともこの関数を書き換えるまでは`cargo test`が通らない。
     #[test]
-    fn phase_all_covers_every_variant() {
+    fn phase_all_has_no_duplicates_and_known_variants_are_members() {
         let mut sorted = Phase::ALL;
         sorted.sort();
-        sorted.iter().zip(sorted.iter().skip(1)).for_each(|(a, b)| {
-            assert_ne!(a, b, "Phase::ALL must not contain duplicates");
+        sorted.windows(2).for_each(|w| {
+            assert_ne!(w[0], w[1], "Phase::ALL must not contain duplicates");
         });
-        assert_eq!(Phase::ALL.len(), 10);
+
+        for phase in Phase::ALL {
+            match phase {
+                Phase::Orient
+                | Phase::Hypothesize
+                | Phase::Investigate
+                | Phase::Distill
+                | Phase::Verify
+                | Phase::Critic
+                | Phase::Decide
+                | Phase::Recall
+                | Phase::Plan
+                | Phase::Collect
+                | Phase::Join => {}
+            }
+        }
     }
 
     /// フェーズ予算は設定ファイル（`BTreeMap<Phase, TokenBudget>`）から往復できる。

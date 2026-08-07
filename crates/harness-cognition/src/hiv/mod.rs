@@ -40,11 +40,15 @@ use tokio_util::sync::CancellationToken;
 use crate::call::{Conclusion, PhaseError, PhaseRunner, PhaseValue};
 use crate::context::{ContextAssembler, PhaseInput};
 use crate::memory::types::{
-    Decision, GoalId, GoalStatus, HypId, HypStatus, Verdict, Verification, VerifyMethod,
+    Decision, GoalId, GoalStatus, HypId, HypStatus, SourceRef, Verdict, Verification, VerifyMethod,
 };
+use crate::memory::validity::Validity;
 use crate::memory::WorkingMemory;
+use crate::recall::judge::JudgeContext;
+use crate::recall::{checkpoint as recall_checkpoint, judge, search, RecallStore};
 use crate::schema::{
-    DecideOutput, DistillOutput, HypothesizeOutput, InvestigateOutput, VerifyOutput, VerifyVerdict,
+    DecideOutput, DistillOutput, HypothesizeOutput, InvestigateOutput, RecallTrust, VerifyOutput,
+    VerifyVerdict,
 };
 use crate::scratch::ScratchStore;
 use crate::source::SourceCatalog;
@@ -115,6 +119,20 @@ pub struct HivContext<'a> {
     /// capabilityの順）を受ける——ローカル推論サーバのcapabilityは128,000決め打ちで、
     /// 実`n_ctx`（ロード設定）とは別物だから（`plans/PLAN-COMPACTION.md`）。
     pub context_window: u32,
+    /// `Recall`（`plans/PLAN-RECALL-MEMORY.md`）の自動読出し注入先。`None`なら注入を
+    /// 一切試みない——テストで実`%APPDATA%`を汚さないための既定（本番は
+    /// `CognitiveOrchestrator::run_hiv`が`RecallStore::for_workspace`の解決に成功したときだけ
+    /// `Some`を渡す）。
+    pub recall_store: Option<&'a RecallStore>,
+    /// `cognition.recall.top_k`（既定5）。bigram検索の上位K件。
+    pub recall_top_k: usize,
+    /// `cognition.recall.stale_reverification`（既定false、オプトイン）。`true`なら
+    /// [`freshness_of`](crate::recall::checkpoint::freshness_of)が`Stale`と判定した記憶に対して
+    /// [`WorkingMemory::add_unknown`]で再検証項目を積む（`plans/PLAN-RECALL-MEMORY.md`
+    /// 「読出し経路」1番、`docs/STATUS.md`認知レイヤー残課題#16）。既定オフなのは、この帰結が
+    /// Hypothesizeのプロンプトを実際にどれだけ膨らませるか・再検証を促しすぎないかが
+    /// 未検証のため。
+    pub stale_reverification: bool,
 }
 
 /// 内部の遷移状態。
@@ -175,6 +193,7 @@ impl HivEngine {
     /// 「何が分かって何が分からなかったか」も伝わるため。区別は[`HivOutcome::stop`]で付く。
     pub async fn run_goal(&mut self, goal_text: &str, cx: &HivContext<'_>) -> HivOutcome {
         let goal = self.mem.add_goal(goal_text, Vec::new());
+        self.inject_recall(goal_text, cx).await;
         let mut state = State::Hypothesize;
         let mut provider_error = None;
 
@@ -272,6 +291,159 @@ impl HivEngine {
             stop,
             provider_error,
         }
+    }
+
+    /// `Recall`の自動読出し注入（`plans/PLAN-RECALL-MEMORY.md`「読出し経路」）。
+    ///
+    /// **失敗してもゴールを止めない**（`open_scratch`と同じfail-open、設計変更C）。
+    /// キャンセルだけは`AgentEvent::Cancelled`を出さず素通しする——注入自体はまだ
+    /// フェーズループに入る前なので、ここでキャンセルを検知しても`run_goal`のループ先頭が
+    /// すぐ拾う。
+    async fn inject_recall(&mut self, goal_text: &str, cx: &HivContext<'_>) {
+        let Some(store) = cx.recall_store else {
+            return;
+        };
+        if cx.cancel.is_some_and(|c| c.is_cancelled()) {
+            return;
+        }
+
+        let index = match store.list() {
+            Ok(index) => index,
+            Err(e) => {
+                emit_event(
+                    cx.events,
+                    AgentEvent::MemoryRecalled {
+                        candidates: 0,
+                        injected: 0,
+                        skipped: Some(format!("failed to read the recall index: {e}")),
+                    },
+                );
+                return;
+            }
+        };
+
+        let result = search::top_k(goal_text, &index, cx.recall_top_k, 0.05);
+        if result.picks.is_empty() {
+            emit_event(
+                cx.events,
+                AgentEvent::MemoryRecalled {
+                    candidates: 0,
+                    injected: 0,
+                    skipped: None,
+                },
+            );
+            return;
+        }
+
+        let judge_cx = JudgeContext {
+            exec: cx.exec,
+            ctx: cx.ctx,
+            tools: cx.tools,
+            caps: cx.caps,
+            events: cx.events,
+            cancel: cx.cancel,
+            assembler: &self.assembler,
+            context_window: cx.context_window,
+        };
+        let picks = match judge::judge(goal_text, &result.picks, &judge_cx).await {
+            Ok(picks) => picks,
+            Err(e) => {
+                emit_event(
+                    cx.events,
+                    AgentEvent::MemoryRecalled {
+                        candidates: result.picks.len(),
+                        injected: 0,
+                        skipped: Some(e.0),
+                    },
+                );
+                return;
+            }
+        };
+
+        let watermark = store.reviewed_watermark();
+        let mut injected = 0usize;
+        for pick in picks {
+            if !pick.relevant {
+                continue;
+            }
+            let Some(meta) = result.picks.iter().find(|m| m.id == pick.id) else {
+                continue;
+            };
+            // Freshnessは照合が決める。モデルの`trust`は「再検証が要るか」という別の軸
+            // （unknowns/open_questionへ積むかどうか）にのみ使う（未決④の確定）。
+            // 同期ファイルI/O（ダイジェスト再計算）を含むので`spawn_blocking`で包む
+            // （`bug-pattern-rules` B-31: 非同期ランタイム上で同期ブロッキングを直接呼ばない）。
+            // 稀なjoinエラー（パニック）は「照合材料が無い」相当のUnknownへ倒す（fail-open）。
+            let workspace_root = cx.ctx.workspace_root.clone();
+            let meta_for_digest = meta.clone();
+            let freshness = tokio::task::spawn_blocking(move || {
+                recall_checkpoint::freshness_of(&workspace_root, &meta_for_digest)
+            })
+            .await
+            .unwrap_or(crate::memory::validity::Freshness::Unknown);
+            let trust = self
+                .catalog
+                .validity_seed(&SourceRef::Memory {
+                    note_id: meta.id.clone(),
+                    reviewed: false,
+                })
+                .0;
+
+            match pick.trust {
+                RecallTrust::NeedsVerification => {
+                    self.mem
+                        .add_unknown(format!("記憶{}の内容を再検証する: {}", meta.id, meta.summary));
+                }
+                RecallTrust::Ambiguous => {
+                    self.mem
+                        .add_unknown(format!("記憶{}の内容を再検証する: {}", meta.id, meta.summary));
+                    self.mem.add_open_question(
+                        format!(
+                            "過去の記憶{}（{}）が現在のゴールに関連するか判断が曖昧だった。",
+                            meta.id, meta.summary
+                        ),
+                        false,
+                    );
+                }
+                RecallTrust::Fresh => {}
+            }
+
+            // `freshness_of`が`Stale`と判定した記憶（出典ファイルの内容が変わっている）への
+            // 機械的帰結（オプトイン、`docs/STATUS.md`認知レイヤー残課題#16の解消点）。上の
+            // `RecallTrust::NeedsVerification`（モデルの自己申告）と対称の形——こちらは
+            // ダイジェスト照合という機械的事実が引き金になる。既定オフなのは`HivContext::
+            // stale_reverification`のdocコメント参照。
+            if cx.stale_reverification && freshness == crate::memory::validity::Freshness::Stale {
+                self.mem.add_unknown(format!(
+                    "記憶{}を再検証する（出典ファイルの内容が変わっている）: {}",
+                    meta.id, meta.summary
+                ));
+            }
+
+            self.mem.add_evidence(
+                |id| crate::memory::types::Evidence {
+                    id,
+                    claim: meta.summary.clone(),
+                    source: SourceRef::Memory {
+                        note_id: meta.id.clone(),
+                        reviewed: store.is_reviewed(meta, &watermark),
+                    },
+                    validity: Validity::seed(trust, freshness),
+                    raw_ref: None,
+                },
+                None,
+            );
+            injected += 1;
+        }
+
+        emit_event(
+            cx.events,
+            AgentEvent::MemoryRecalled {
+                candidates: result.picks.len(),
+                injected,
+                skipped: None,
+            },
+        );
     }
 
     fn runner<'a>(&'a self, cx: &'a HivContext<'a>) -> PhaseRunner<'a> {
@@ -737,6 +909,11 @@ mod tests {
             events: None,
             cancel: None,
             context_window,
+            // 実`%APPDATA%`を汚さないため、既存のHIVテストはRecallを無効のまま走らせる
+            // （`recall::store`側に専用のテストがある）。
+            recall_store: None,
+            recall_top_k: 5,
+            stale_reverification: false,
         };
         let outcome = engine.run_goal("run_shellが使うシェルを調べて", &cx).await;
         (engine, outcome)
@@ -911,6 +1088,7 @@ mod tests {
             (
                 SourceRef::Memory {
                     note_id: "n1".into(),
+                    reviewed: true,
                 },
                 false,
             ),

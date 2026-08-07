@@ -60,6 +60,26 @@ fn parses_fsstage_subcommands() {
 }
 
 #[test]
+fn parses_memory_subcommands() {
+    assert_eq!(
+        parse_slash_command("/memory"),
+        Ok(SlashCommand::Memory(MemoryCommand::List))
+    );
+    assert_eq!(
+        parse_slash_command("/memory reviewed"),
+        Ok(SlashCommand::Memory(MemoryCommand::MarkReviewed))
+    );
+    assert_eq!(
+        parse_slash_command("/memory discard cp-1-aaaaaaaa"),
+        Ok(SlashCommand::Memory(MemoryCommand::Discard(
+            "cp-1-aaaaaaaa".to_string()
+        )))
+    );
+    assert!(parse_slash_command("/memory discard").is_err());
+    assert!(parse_slash_command("/memory nope").is_err());
+}
+
+#[test]
 fn submit_input_routes_fsstage_to_dedicated_actions_not_slash() {
     let mut app = AppState::new("mock".into(), "mock-model".into());
     app.input = "/fsstage commit_all".to_string();

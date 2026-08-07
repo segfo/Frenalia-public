@@ -313,13 +313,21 @@ fn default_trust(kind: SourceKind) -> TrustLevel {
     }
 }
 
-fn default_freshness(kind: SourceKind) -> Freshness {
+/// 種別から決まる既定の鮮度。**`Validity::describe`が「種別既定と違うときだけ鮮度を出す」判定に
+/// 使うため`pub(crate)`**（`plans/PLAN-RECALL-MEMORY.md`「読出し経路」4番）。
+///
+/// `Memory`の既定は`Unknown`（照合材料が無い）——`Stale`にしないのは、Recallの
+/// `freshness_of`（`recall/checkpoint.rs`）が実際に決めた`Fresh`/`Stale`がどちらも既定と異なる
+/// 値になるようにするため。既定を`Stale`のままにすると、ダイジェスト照合が実際に`Stale`と
+/// 判定した記憶が「種別既定のまま」に見えて`describe()`から鮮度が消えてしまう
+/// （`docs/STATUS.md`認知レイヤー残課題#16）。
+pub(crate) fn default_freshness(kind: SourceKind) -> Freshness {
     match kind {
         // このセッションで実際に観測したもの。
         SourceKind::File | SourceKind::Shell | SourceKind::Mcp => Freshness::Fresh,
-        SourceKind::Web => Freshness::Unknown,
-        // 長期記憶ノートは古い可能性があるので鵜呑みにしない（§7.4）。
-        SourceKind::Memory => Freshness::Stale,
+        // Recallのダイジェスト照合（`freshness_of`）が個別に決めるので、種別既定は
+        // 「照合材料が無い」を表す`Unknown`に留める。
+        SourceKind::Web | SourceKind::Memory => Freshness::Unknown,
         SourceKind::ModelPrior => Freshness::Unknown,
     }
 }

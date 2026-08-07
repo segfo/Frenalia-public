@@ -19,6 +19,20 @@ pub enum SlashCommand {
     Sessions,
     /// `/fsstage`のサブコマンド（変更パネル/ステージ済み変更の操作）。
     FsStage(FsStageCommand),
+    /// `/memory`のサブコマンド（`Recall`の事後レビュー運用、`plans/PLAN-RECALL-MEMORY.md`）。
+    Memory(MemoryCommand),
+}
+
+/// `/memory`のサブコマンド。
+///
+/// - `/memory`: 未レビューのcheckpoint一覧をtranscriptへ表示（非対話）
+/// - `/memory reviewed`: 一覧表示したうえでウォーターマークを進める
+/// - `/memory discard <id>`: 指定checkpointを削除
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemoryCommand {
+    List,
+    MarkReviewed,
+    Discard(String),
 }
 
 /// `/fsstage`のサブコマンド。
@@ -57,7 +71,22 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "/fork" => Ok(SlashCommand::Fork),
         "/sessions" => Ok(SlashCommand::Sessions),
         "/fsstage" => parse_fsstage_subcommand(rest).map(SlashCommand::FsStage),
+        "/memory" => parse_memory_subcommand(rest).map(SlashCommand::Memory),
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// `/memory`の`rest`（サブコマンド以降）をパースする。
+pub(super) fn parse_memory_subcommand(rest: &str) -> Result<MemoryCommand, String> {
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("");
+    let sub_rest = parts.next().unwrap_or("").trim();
+    match sub {
+        "" => Ok(MemoryCommand::List),
+        "reviewed" => Ok(MemoryCommand::MarkReviewed),
+        "discard" if !sub_rest.is_empty() => Ok(MemoryCommand::Discard(sub_rest.to_string())),
+        "discard" => Err("usage: /memory discard <id>".to_string()),
+        other => Err(format!("unknown /memory subcommand: {other}")),
     }
 }
 

@@ -151,6 +151,23 @@ pub fn normalize_root_spelling(root: &str) -> String {
     s
 }
 
+/// パス文字列を比較用に畳み込む: `\??\`/`\\?\`前置を落とし、`/`を`\`へ統一し、ASCII小文字化する。
+///
+/// **`to_lowercase`（Unicode版）は使わない**——小文字化でバイト長が変わる文字があり
+/// （例: `İ`は2バイトの`i̇`になる）、[`relative_under_root`]が「正規化後のバイト位置＝元の
+/// 文字列のバイト位置」として相対部分を切り出す前提が壊れる。`to_ascii_lowercase`はASCII以外を
+/// 素通しするので長さが保存される（日本語を含むパスでも安全）。ASCII以外の大小差を吸収しない点は
+/// 既存の`workspace_relative`と同じ挙動である。
+///
+/// `harness-cognition`のRecall機構（`plans/PLAN-RECALL-MEMORY.md`）がworkspace-key（記憶ディレクトリ
+/// 名の元になる綴りの畳み込み）にもこの関数を再利用する——独自実装すると、ここで踏んだ
+/// `to_lowercase`の罠を再び踏みかねない（`bug-pattern-rules` B-05: 参照できるものを複製しない）。
+pub fn fold_for_comparison(s: &str) -> String {
+    strip_verbatim_prefix(s)
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
 /// `path`が`root`配下（または`root`自身）なら、`root`からの相対部分を`/`区切りで返す
 /// （`root`自身なら空文字列）。配下でなければ`None`。
 ///
@@ -172,16 +189,7 @@ pub fn normalize_root_spelling(root: &str) -> String {
 /// 台帳キーとして使う側は[`validate_relative_path`]を別途通すこと）、8.3短縮名、
 /// シンボリックリンク／ジャンクション（実FSを触らないと解決できない。ここは純粋関数）。
 pub fn relative_under_root(path: &str, root: &str) -> Option<String> {
-    // **`to_lowercase`（Unicode版）は使わない**——小文字化でバイト長が変わる文字があり
-    // （例: `İ`は2バイトの`i̇`になる）、下で「正規化後のバイト位置＝元の文字列のバイト位置」と
-    // して相対部分を切り出す前提が壊れる。`to_ascii_lowercase`はASCII以外を素通しするので
-    // 長さが保存される（日本語を含むパスでも安全）。ASCII以外の大小差を吸収しない点は
-    // 既存の`workspace_relative`と同じ挙動である。
-    fn normalize(s: &str) -> String {
-        strip_verbatim_prefix(s)
-            .replace('/', "\\")
-            .to_ascii_lowercase()
-    }
+    let normalize = fold_for_comparison;
     let path_n = normalize(path);
     let root_n = {
         let mut r = normalize(root);

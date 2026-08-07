@@ -60,13 +60,14 @@ impl LedgerView for CensusLedger {
             // Distill/Joinの主入力は`PhaseInput.raw_output`（生出力の抜粋／notesの連結）で
             // 運ぶので、台帳スライスは要らない。
             Phase::Distill | Phase::Join => String::new(),
-            // HIV専用フェーズ。`CensusLedger`はこれらを扱わない。
+            // HIV専用・Recall専用フェーズ。`CensusLedger`はこれらを扱わない。
             Phase::Orient
             | Phase::Hypothesize
             | Phase::Investigate
             | Phase::Verify
             | Phase::Critic
-            | Phase::Decide => String::new(),
+            | Phase::Decide
+            | Phase::Recall => String::new(),
         }
     }
 }

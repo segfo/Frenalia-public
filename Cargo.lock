@@ -1103,7 +1103,6 @@ dependencies = [
  "harness-tui",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "tokio",
 ]
@@ -1113,15 +1112,20 @@ name = "harness-cognition"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "directories",
+ "harness-change-ledger",
  "harness-core",
  "harness-engine",
+ "harness-grant-ledger",
  "harness-providers",
  "harness-tools",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
+ "which",
 ]
 
 [[package]]

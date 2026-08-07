@@ -3,14 +3,30 @@ name = "harness-cognition"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# out-of-processのRecall E2Eテスト（`harness-cli`の`tests/recall_e2e.rs`）専用。既定オフ、
+# リリースビルドに一切露出しない。有効時のみ`RecallStore::data_root`が環境変数
+# `HARNESS_RECALL_DATA_ROOT`を読み、記憶の置き場を差し替えられるようにする
+# （`harness-cli`の`e2e-mock` featureから伝播する。`docs/DEV-ENVIRONMENT.md`参照）。
+e2e-test-hooks = []
+
 [dependencies]
 async-trait = "0.1"
+directories = "6"
+harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-engine = { version = "0.1.0", path = "../harness-engine" }
+harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
 harness-tools = { version = "0.1.0", path = "../harness-tools" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+# `rt`のみ（`spawn_blocking`の型自体はこのfeatureで公開される）。実行時のランタイムは
+# `harness-cli`側が提供する（`rt-multi-thread`は終端クレートの責務、`plans/PLAN-RECALL-MEMORY.md`
+# 「書込みはspawn_blockingで包む」設計変更F）。
+tokio = { version = "1.52.3", features = ["rt"] }
 tokio-util = "0.7"
+which = "7"
 
 [dev-dependencies]
 harness-providers = { version = "0.1.0", path = "../harness-providers" }

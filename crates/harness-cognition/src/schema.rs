@@ -110,6 +110,23 @@ fn schema_for(phase: Phase) -> serde_json::Value {
             &[("action", string_prop()), ("then_verify", string_prop())],
             &["action", "then_verify"],
         ),
+        Phase::Recall => object(
+            &[(
+                "picks",
+                array_of(object(
+                    &[
+                        ("id", string_prop()),
+                        ("relevant", bool_prop()),
+                        (
+                            "trust",
+                            enum_prop(&["fresh", "needs_verification", "ambiguous"]),
+                        ),
+                    ],
+                    &["id", "relevant", "trust"],
+                )),
+            )],
+            &["picks"],
+        ),
         Phase::Plan => object(
             &[(
                 "items",
@@ -259,6 +276,27 @@ pub struct CriticOutput {
 pub struct DecideOutput {
     pub action: String,
     pub then_verify: String,
+}
+
+/// `Recall`機構専用（`plans/PLAN-RECALL-MEMORY.md`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecallOutput {
+    pub picks: Vec<RecallPick>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecallPick {
+    pub id: String,
+    pub relevant: bool,
+    pub trust: RecallTrust,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallTrust {
+    Fresh,
+    NeedsVerification,
+    Ambiguous,
 }
 
 /// `CensusEngine`専用（`plans/PLAN-CENSUS-ENGINE.md`段階2）。

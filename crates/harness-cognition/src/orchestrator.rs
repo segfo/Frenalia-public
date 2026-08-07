@@ -16,6 +16,7 @@ use crate::census::{CensusContext, CensusEngine, CensusLimits, CensusStop};
 use crate::context::ContextAssembler;
 use crate::hiv::{HivContext, HivEngine, HivLimits, HivStop};
 use crate::phase::PhaseBudgets;
+use crate::recall::{checkpoint as recall_checkpoint, write as recall_write, RecallStore};
 use crate::scratch::ScratchStore;
 use crate::source::SourceCatalog;
 
@@ -63,6 +64,15 @@ pub struct CognitiveOrchestrator {
     /// scratch（生出力の退避先）をセッションディレクトリへ向けるためのID。
     /// 未設定なら退避せずインメモリで進む（調査自体は止めない）。
     session_id: Option<String>,
+    /// `cognition.recall.enabled`（既定true）。`plans/PLAN-RECALL-MEMORY.md`。
+    recall_enabled: bool,
+    /// `cognition.recall.allow_unversioned`（既定false、ユーザー層設定限定）。
+    recall_allow_unversioned: bool,
+    /// `cognition.recall.top_k`（既定5）。
+    recall_top_k: usize,
+    /// `cognition.recall.stale_reverification`（既定false、オプトイン。プロジェクト層は
+    /// 有効化のみ可）。`plans/PLAN-RECALL-MEMORY.md`、`docs/STATUS.md`認知レイヤー残課題#16。
+    recall_stale_reverification: bool,
 }
 
 impl CognitiveOrchestrator {
@@ -78,9 +88,28 @@ impl CognitiveOrchestrator {
                 limits: HivLimits::default(),
                 catalog: SourceCatalog::with_builtin_defaults(),
                 session_id: None,
+                recall_enabled: true,
+                recall_allow_unversioned: false,
+                recall_top_k: 5,
+                recall_stale_reverification: false,
             }),
             CognitionLevel::Auto => Err(UnsupportedLevel { level }),
         }
+    }
+
+    /// `cognition.recall`設定を反映する（`plans/PLAN-RECALL-MEMORY.md`）。
+    pub fn with_recall_settings(
+        mut self,
+        enabled: bool,
+        allow_unversioned: bool,
+        top_k: usize,
+        stale_reverification: bool,
+    ) -> Self {
+        self.recall_enabled = enabled;
+        self.recall_allow_unversioned = allow_unversioned;
+        self.recall_top_k = top_k.max(1);
+        self.recall_stale_reverification = stale_reverification;
+        self
     }
 
     /// `settings.json`の`cognition.sources`を反映したカタログを載せる（§4.2）。
@@ -116,6 +145,12 @@ impl CognitiveOrchestrator {
     /// 再利用するために公開する。
     pub fn budgets(&self) -> &PhaseBudgets {
         &self.budgets
+    }
+
+    /// `recall`ツール（`plans/PLAN-RECALL-MEMORY.md`段階3）が`RecallTool::new`へそのまま
+    /// 渡すための、`cognition.recall.allow_unversioned`の解決済み値。
+    pub fn recall_allow_unversioned(&self) -> bool {
+        self.recall_allow_unversioned
     }
 
     /// 1回のユーザ発話に対する処理を最後まで進める。
@@ -237,6 +272,27 @@ impl CognitiveOrchestrator {
         };
         let mut engine = HivEngine::new(assembler, scratch, self.catalog.clone(), limits);
 
+        // `Recall`の読出し（`plans/PLAN-RECALL-MEMORY.md`）。`for_workspace`の解決に失敗したら
+        // 理由付きで報告し、注入は行わずゴールを続行する（設計変更C、fail-open）。
+        let recall_store = if self.recall_enabled {
+            match RecallStore::for_workspace(&ctx.workspace_root) {
+                Ok(store) => Some(store),
+                Err(reason) => {
+                    emit_event(
+                        events,
+                        AgentEvent::MemoryRecalled {
+                            candidates: 0,
+                            injected: 0,
+                            skipped: Some(reason),
+                        },
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let cx = HivContext {
             exec: &executor,
             ctx,
@@ -247,6 +303,9 @@ impl CognitiveOrchestrator {
             // 縮約ポリシーが解決済みの実コンテキスト窓（§6.6）。素朴ループが使用率判定の
             // 分母に使うのと同じ値で、認知層では「1コールが収まるか」の判定に使う。
             context_window: config.compaction.context_window,
+            recall_store: recall_store.as_ref(),
+            recall_top_k: self.recall_top_k,
+            stale_reverification: self.recall_stale_reverification,
         };
         let outcome = engine.run_goal(&goal, &cx).await;
 
@@ -268,6 +327,52 @@ impl CognitiveOrchestrator {
                 usage: outcome.usage,
                 cancelled: true,
             });
+        }
+
+        // `Recall`の書込み（`plans/PLAN-RECALL-MEMORY.md`「書込み経路」1番）。`Decided`は常に、
+        // `BudgetExhausted`はConfirmed仮説が1件以上あるときだけ`from_working_memory`が
+        // `Some`を返す（確定①）。`Blocked`は`None`になり、ここでは何もしない。
+        //
+        // 読出し側で解決済みの`recall_store`をそのまま使う（`for_workspace`を2度呼ばない）。
+        // 読出しが`None`（解決失敗、既にMemoryRecalledで報告済み）なら、書込みも
+        // 同じ理由で行えないので改めて報告する。
+        if self.recall_enabled {
+            if let Some(cp) = recall_checkpoint::from_working_memory(
+                &goal,
+                engine.memory(),
+                &outcome.stop,
+                &ctx.workspace_root,
+            ) {
+                match recall_store {
+                    Some(store) => {
+                        let write_outcome = recall_write::write_checkpoint(
+                            store,
+                            self.recall_allow_unversioned,
+                            cp,
+                        )
+                        .await;
+                        emit_event(
+                            events,
+                            AgentEvent::MemoryCheckpointed {
+                                id: write_outcome.id,
+                                skipped: write_outcome.skipped,
+                            },
+                        );
+                    }
+                    None => {
+                        emit_event(
+                            events,
+                            AgentEvent::MemoryCheckpointed {
+                                id: None,
+                                skipped: Some(
+                                    "recall store could not be resolved earlier in this turn"
+                                        .to_string(),
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
         }
 
         // 最終回答は台帳から決定的に組んだもの（追加のLLMコールは使わない）。フェーズ中の
@@ -395,6 +500,40 @@ impl CognitiveOrchestrator {
                 usage: outcome.usage,
                 cancelled: true,
             });
+        }
+
+        // `Recall`の書込み（`plans/PLAN-RECALL-MEMORY.md`「書込み経路」2番）。`Joined`到達時
+        // のみ書く。**`census`ツール経由（会話中の1ツール呼び出し）では書かない**——外側の
+        // ターンがHIVならそちらのDecideで既に記録されるため、二重記録を避ける
+        // （`--cognition census`専用モードのこのフックだけが対象）。
+        if self.recall_enabled && outcome.stop == CensusStop::Joined {
+            let cp = recall_checkpoint::from_census_join(&goal, &outcome.answer);
+            match RecallStore::for_workspace(&ctx.workspace_root) {
+                Ok(store) => {
+                    let write_outcome = recall_write::write_checkpoint(
+                        store,
+                        self.recall_allow_unversioned,
+                        cp,
+                    )
+                    .await;
+                    emit_event(
+                        events,
+                        AgentEvent::MemoryCheckpointed {
+                            id: write_outcome.id,
+                            skipped: write_outcome.skipped,
+                        },
+                    );
+                }
+                Err(reason) => {
+                    emit_event(
+                        events,
+                        AgentEvent::MemoryCheckpointed {
+                            id: None,
+                            skipped: Some(reason),
+                        },
+                    );
+                }
+            }
         }
 
         on_text_delta(&outcome.answer);

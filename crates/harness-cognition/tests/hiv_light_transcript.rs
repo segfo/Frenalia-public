@@ -164,8 +164,13 @@ async fn run_always(turns: Vec<Vec<StreamEvent>>) -> Run {
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut deltas = String::new();
 
+    // Recallは明示的に切る。このテストが確かめているのはHIVの遷移であって記憶ではなく、
+    // 有効なままだと`RecallStore::for_workspace`が**実**`%APPDATA%\harness\data\memory\`へ
+    // tempdirワークスペース分のcheckpointとgitリポジトリを書き残す
+    // （`plans/PLAN-RECALL-MEMORY.md`。Recall本体のE2Eは`harness-cli`の`tests/recall_e2e.rs`）。
     let orchestrator = CognitiveOrchestrator::new(CognitionLevel::Always, PhaseBudgets::default())
         .unwrap()
+        .with_recall_settings(false, false, 5, false)
         .with_session_id(SESSION_ID);
     let outcome = orchestrator
         .run(

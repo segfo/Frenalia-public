@@ -27,12 +27,14 @@
 pub(crate) mod call;
 pub mod census;
 pub mod context;
+pub(crate) mod fsname;
 pub mod hiv;
 pub(crate) mod ledger;
 pub mod memory;
 pub mod orchestrator;
 pub mod phase;
 pub mod prompts;
+pub mod recall;
 pub mod schema;
 pub mod scratch;
 pub mod source;
@@ -45,5 +47,10 @@ pub use memory::validity::{EvidenceStrength, Freshness, Grade, TrustLevel, Valid
 pub use memory::{MemoryView, WorkingMemory};
 pub use orchestrator::{CognitiveOrchestrator, UnsupportedLevel};
 pub use phase::{PhaseBudgets, PhaseSpec, ToolSelection};
+pub use recall::tool::RecallTool;
+pub use recall::{
+    format_checkpoint_line, Checkpoint, CheckpointMeta, RecallStore, ReviewedWatermark,
+    WorkspaceSummary,
+};
 pub use scratch::ScratchStore;
 pub use source::{SourceCatalog, SourceEntry};

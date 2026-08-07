@@ -277,6 +277,13 @@ impl WorkingMemory {
         self.unknowns = unknowns;
     }
 
+    /// 未知事項を1件積む（既存を置き換えない）。`set_unknowns`が丸ごと差し替えるのに対し、
+    /// こちらは`Recall`の`needs_verification`判定（`plans/PLAN-RECALL-MEMORY.md`確定②）が
+    /// Orient未実行のLight HIVでも安全に1件だけ足せるようにするためのもの。
+    pub fn add_unknown(&mut self, text: impl Into<String>) {
+        self.unknowns.push(text.into());
+    }
+
     // --- 参照 ---
 
     pub fn goals(&self) -> &[Goal] {
