@@ -586,7 +586,7 @@ fn tool_card_transitions_from_running_to_done() {
     });
     match &app.transcript[0] {
         TranscriptItem::ToolCard { status, .. } => {
-            assert!(matches!(status, ToolCardStatus::Running))
+            assert!(matches!(status, ToolCardStatus::Running { .. }))
         }
         other => panic!("expected ToolCard, got {other:?}"),
     }
@@ -604,7 +604,47 @@ fn tool_card_transitions_from_running_to_done() {
                 assert!(!is_error);
                 assert_eq!(output, "hello");
             }
-            ToolCardStatus::Running => panic!("expected Done"),
+            ToolCardStatus::Running { .. } => panic!("expected Done"),
+        },
+        other => panic!("expected ToolCard, got {other:?}"),
+    }
+}
+
+/// [BUG-082フォローアップ] `ToolProgress`はカードの`wait_reason`だけを更新する
+/// （出力や完了状態には触れない）。空メッセージは「待機理由が無くなった」の合図で
+/// `None`へ戻す。
+#[test]
+fn tool_progress_updates_wait_reason_without_finishing_the_card() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.apply(AgentEvent::ToolCallProposed {
+        id: "call_1".into(),
+        name: "run_shell".into(),
+        input: serde_json::json!({"command": "echo hi"}),
+    });
+
+    app.apply(AgentEvent::ToolProgress {
+        id: "call_1".into(),
+        message: "workspace ACL: 継承を伝播中".into(),
+    });
+    match &app.transcript[0] {
+        TranscriptItem::ToolCard { status, .. } => match status {
+            ToolCardStatus::Running { wait_reason } => {
+                assert_eq!(wait_reason.as_deref(), Some("workspace ACL: 継承を伝播中"));
+            }
+            other => panic!("expected Running, got {other:?}"),
+        },
+        other => panic!("expected ToolCard, got {other:?}"),
+    }
+
+    // 空メッセージは待機理由の解除。
+    app.apply(AgentEvent::ToolProgress {
+        id: "call_1".into(),
+        message: String::new(),
+    });
+    match &app.transcript[0] {
+        TranscriptItem::ToolCard { status, .. } => match status {
+            ToolCardStatus::Running { wait_reason } => assert_eq!(*wait_reason, None),
+            other => panic!("expected Running, got {other:?}"),
         },
         other => panic!("expected ToolCard, got {other:?}"),
     }

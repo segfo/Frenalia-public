@@ -67,7 +67,7 @@ impl AppState {
                     id,
                     name,
                     input: pretty(&input),
-                    status: ToolCardStatus::Running,
+                    status: ToolCardStatus::Running { wait_reason: None },
                 });
             }
             AgentEvent::PermissionRequired {
@@ -97,8 +97,20 @@ impl AppState {
                 });
             }
             AgentEvent::ToolStarted { .. } => {}
+            // [BUG-082フォローアップ] `run_shell`等が背景条件（D-54のworkspace ACL伝播ジョブ等）
+            // で待たされている理由をツールカードへ映す。空文字列は「待機理由が無くなった」の
+            // 合図（`call_with_wait_reasons`のdoc参照、`harness-engine`）——直前の理由を
+            // 実行終了まで表示し続けないよう`None`へ戻す。
             AgentEvent::ToolProgress { id, message } => {
                 tracing::debug!(id, message, "tool progress");
+                if let Some(TranscriptItem::ToolCard {
+                    status: ToolCardStatus::Running { wait_reason },
+                    ..
+                }) = self.transcript.iter_mut().rev().find(
+                    |i| matches!(i, TranscriptItem::ToolCard { id: cid, .. } if *cid == id),
+                ) {
+                    *wait_reason = if message.is_empty() { None } else { Some(message) };
+                }
             }
             AgentEvent::ToolFinished { id, output } => {
                 if let Some(TranscriptItem::ToolCard { status, .. }) =

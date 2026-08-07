@@ -635,14 +635,55 @@ impl<'a> TurnExecutor<'a> {
                 name: name.to_string(),
             },
         );
-        let output = tool
-            .call(input.clone(), self.ctx)
-            .await
-            .unwrap_or_else(|e| ToolOutput {
-                content: e.to_string(),
-                is_error: true,
-            });
+        let output = self.call_with_wait_reasons(id, tool, input).await;
         (output, ToolCallDecision::Executed)
+    }
+
+    /// [BUG-082フォローアップ] `tool.call(...)`を待つ間、`WaitReason`（D-54のworkspace ACL
+    /// 伝播ジョブ等）を定期的に問い合わせ、変化があれば`AgentEvent::ToolProgress`として
+    /// ツールカードへ流す。
+    ///
+    /// **このメソッドはどの背景条件が存在するかを一切知らない**——`harness_tools::wait_reasons`
+    /// が返す集合を素通しでポーリングするだけなので、新しい待機理由が増えてもここは変更不要
+    /// （`WaitReason`のdoc参照）。ポーリング間隔（300ms）はツールカードの更新として十分な
+    /// 頻度で、かつ通常（待たされない）ツール呼び出しには実質コストを足さない——
+    /// `tokio::select!`は`tool.call(...)`が先に終わればそちらを即座に返す。
+    async fn call_with_wait_reasons(
+        &self,
+        id: &str,
+        tool: &std::sync::Arc<dyn harness_core::Tool>,
+        input: &serde_json::Value,
+    ) -> ToolOutput {
+        let call_future = tool.call(input.clone(), self.ctx);
+        tokio::pin!(call_future);
+        let wait_reasons = harness_tools::wait_reasons::known_wait_reasons();
+        let mut last_reason: Option<String> = None;
+        loop {
+            tokio::select! {
+                result = &mut call_future => {
+                    return result.unwrap_or_else(|e| ToolOutput {
+                        content: e.to_string(),
+                        is_error: true,
+                    });
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
+                    let reason = wait_reasons.describe_active();
+                    if reason != last_reason {
+                        // 空文字列は「待機理由が無くなった」の合図（TUI側で`wait_reason`を
+                        // クリアする）。`None`のまま黙って戻すと、ツールカードは直前の
+                        // （もう終わった）待機理由を実際の実行終了まで表示し続けてしまう。
+                        emit(
+                            self.events,
+                            AgentEvent::ToolProgress {
+                                id: id.to_string(),
+                                message: reason.clone().unwrap_or_default(),
+                            },
+                        );
+                        last_reason = reason;
+                    }
+                }
+            }
+        }
     }
 }
 

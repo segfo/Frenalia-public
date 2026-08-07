@@ -35,20 +35,32 @@ pub use gate::InteractiveGate;
 
 const TICK: Duration = Duration::from_millis(33);
 
-/// D-54: 背景で走っているworkspaceのACL救済walkの進捗`(処理済み, 全体)`。
+/// D-54/[BUG-082](../../../../docs/bugs/BUG-082.md) Part B: 背景で走っているworkspaceの
+/// ジョブ（rootへの伝播＋保護DACL配下の救済walk）の進捗`(フェーズ, 処理済み, 全体)`。
 ///
 /// 走っていない・既に終わった場合は`None`（ステータスバーから表示が消える）。
 /// 失敗して終わった場合も`None`を返す——**失敗の扱いはここではなく`run_shell`が持つ**
 /// （`grant_job::wait_until_done`がfail-closedで断り、理由をツール結果として見せる）。
 /// 表示のためだけの関数に判定を持たせると、同じ事実が2箇所で解釈されることになる。
 #[cfg(windows)]
-fn poll_workspace_acl_progress() -> Option<(usize, usize)> {
+fn poll_workspace_acl_progress() -> Option<(app::WorkspaceAclPhase, usize, usize)> {
     let p = harness_sandbox::tier2a::win_appcontainer::grant_job::progress()?;
-    (!p.finished).then_some((p.done, p.total))
+    if p.finished {
+        return None;
+    }
+    let phase = match p.phase {
+        harness_sandbox::tier2a::win_appcontainer::grant_job::JobPhase::Propagating => {
+            app::WorkspaceAclPhase::Propagating
+        }
+        harness_sandbox::tier2a::win_appcontainer::grant_job::JobPhase::Walking => {
+            app::WorkspaceAclPhase::Walking
+        }
+    };
+    Some((phase, p.done, p.total))
 }
 
 #[cfg(not(windows))]
-fn poll_workspace_acl_progress() -> Option<(usize, usize)> {
+fn poll_workspace_acl_progress() -> Option<(app::WorkspaceAclPhase, usize, usize)> {
     None
 }
 

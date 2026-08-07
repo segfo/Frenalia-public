@@ -727,8 +727,25 @@ async fn run_windows_tier2a(
     // コマンドを走らせると、その配下がモデルには「存在しない/読めない」と見え、原因不明の
     // 失敗になる。完了を待ち、walkが失敗していたら断る（fail-closed、`grant_job`のdoc）。
     // 走っていなければ即座に返るので、2回目以降の起動では何のコストも無い。
-    harness_sandbox::tier2a::win_appcontainer::grant_job::wait_until_done()
-        .map_err(ToolError::ExecutionFailed)?;
+    //
+    // [BUG-082フォローアップ] `wait_until_done`は`std::thread::sleep`で実待ちする**同期**
+    // 関数——これを`.await`無しでこの`async fn`の中で直接呼ぶと、tokioのワーカースレッドを
+    // 待ち時間ぶん（初回は20秒超）丸ごと専有してしまう。`dispatch_one`
+    // （`harness-engine`）の`tokio::select!`は`tool.call(...)`のpollがここで止まっている間
+    // 一切戻ってこられず、並行して待っているはずの`WaitReason`ポーリング（`AgentEvent::
+    // ToolProgress`でツールカードへ待機理由を出す機構）が実行機会を得られない
+    // ——ステータスバー側（`grant_job::progress()`を直接読むだけの非ブロッキング呼び出し）は
+    // 別経路（TUIの描画tick）なので動いて見え、ツールカードだけが更新されないという
+    // 形で発覚した。`spawn_blocking`でtokioの専用ブロッキングスレッドへ逃がし、
+    // このタスク自身は`.await`で協調的に譲る。
+    tokio::task::spawn_blocking(
+        harness_sandbox::tier2a::win_appcontainer::grant_job::wait_until_done,
+    )
+    .await
+    .map_err(|e| {
+        ToolError::ExecutionFailed(format!("workspace ACL wait task panicked: {e}"))
+    })?
+    .map_err(ToolError::ExecutionFailed)?;
 
     let child = harness_sandbox::tier2a::win_appcontainer::spawn_with_workspace(
         &bin,

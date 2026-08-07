@@ -17,7 +17,13 @@ pub const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴'
 
 #[derive(Debug, Clone)]
 pub enum ToolCardStatus {
-    Running,
+    Running {
+        /// [BUG-082フォローアップ] ツールが実際の処理へ入る前、何らかの背景条件
+        /// （D-54のworkspace ACL伝播ジョブ等）で待たされている理由。
+        /// `AgentEvent::ToolProgress`で更新され、条件が無くなると`None`へ戻る
+        /// （`harness_core::tool::WaitReason`のdoc参照）。`None`は「普通に実行中」。
+        wait_reason: Option<String>,
+    },
     Done { is_error: bool, output: String },
 }
 
@@ -108,6 +114,20 @@ impl BusyProgress {
     }
 }
 
+/// [BUG-082](../../../../docs/bugs/BUG-082.md) Part B: workspaceの背景ジョブが今どちらの
+/// フェーズにいるか（表示専用）。`harness_sandbox::tier2a::win_appcontainer::grant_job::JobPhase`
+/// を直接使わないのは、`win_appcontainer`モジュール自体が`#[cfg(windows)]`専用で、
+/// `AppState`のフィールド型を全プラットフォームでコンパイル可能にする必要があるため
+/// （`lib.rs`の`poll_workspace_acl_progress`がWindows側でこれへ変換する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceAclPhase {
+    /// rootへの継承ACE伝播（＋直後の`.harness/`再保護）。単一のブロッキングOS呼び出しの
+    /// ため中間進捗が無い。
+    Propagating,
+    /// 保護DACL配下の救済walk。`(done, total)`で進捗が分かる。
+    Walking,
+}
+
 pub struct AppState {
     pub transcript: Vec<TranscriptItem>,
     pub input: String,
@@ -170,13 +190,15 @@ pub struct AppState {
     saw_thinking_this_turn: bool,
     /// スピナーのフレーム送り用カウンタ。`tick()`が33ms間隔で呼ぶ。
     pub spinner_frame: usize,
-    /// D-54: workspaceのACL救済walkが背景で走っている間の進捗`(処理済み, 全体)`。
+    /// D-54/[BUG-082](../../../../docs/bugs/BUG-082.md) Part B: workspaceの背景ジョブ
+    /// （rootへの伝播＋保護DACL配下の救済walk）が走っている間の進捗
+    /// `(フェーズ, 処理済み, 全体)`。
     ///
-    /// **ワークスペースを初めてTier2aで開いた起動でしか出ない。** この間、保護DACL配下は
+    /// **ワークスペースを初めてTier2aで開いた起動でしか出ない。** この間、対応する範囲は
     /// まだサンドボックスから見えず、`run_shell`は完了を待つ（`grant_job`のdoc）。
     /// 「TUIは出ているのにコマンドが待たされる」理由をユーザーへ見せるための表示で、
     /// 判定には一切関与しない。`lib.rs`の描画tickが`harness_sandbox`から取り込む。
-    pub workspace_acl_progress: Option<(usize, usize)>,
+    pub workspace_acl_progress: Option<(WorkspaceAclPhase, usize, usize)>,
     /// `true`のときEnterが送信（後方互換モード）。`false`（既定）のときEnterは入力欄に改行を
     /// 挿入し、送信はAlt+EnterまたはShift+Enterで行う（`true`のときもAlt+Enter/Shift+Enterは
     /// 常に送信）。

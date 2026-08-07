@@ -31,5 +31,6 @@ pub use text::truncate_head_tail;
 pub use tool::{
     McpServerFact, NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, RequireSandbox,
     RiskClass, ShellTier, ShellTierSelection, StagingConfig, StagingMode, TlsInspection, Tool,
-    ToolCtx, ToolError, ToolOutput, ToolResult, ToolSpec, ToolUse, VmShellExecutor,
+    ToolCtx, ToolError, ToolOutput, ToolResult, ToolSpec, ToolUse, VmShellExecutor, WaitReason,
+    WaitReasons,
 };

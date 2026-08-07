@@ -254,9 +254,14 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
             } => {
                 if collapsed {
                     let (glyph, color, summary) = match status {
-                        ToolCardStatus::Running => {
+                        ToolCardStatus::Running { wait_reason: None } => {
                             ("⚙".to_string(), Color::Yellow, "running".to_string())
                         }
+                        // [BUG-082フォローアップ] 背景条件で待たされている間は理由を出す
+                        // （ユーザーには起動失敗と区別が付かないため、`docs/bugs/BUG-082.md`）。
+                        ToolCardStatus::Running {
+                            wait_reason: Some(reason),
+                        } => ("⏳".to_string(), Color::Yellow, reason.clone()),
                         ToolCardStatus::Done { is_error, output } => {
                             let lines = output.lines().count().max(1);
                             if *is_error {
@@ -277,9 +282,20 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
                     )));
                     lines.push(Line::from(format!("│ input: {input}")));
                     match status {
-                        ToolCardStatus::Running => {
+                        ToolCardStatus::Running { wait_reason: None } => {
                             lines.push(Line::from(Span::styled(
                                 "│ ... running",
+                                Style::default().fg(Color::Yellow),
+                            )));
+                        }
+                        // [BUG-082フォローアップ] 待機理由を明示する。開発者は「初回起動は
+                        // workspace ACL伝播を待つ」と知っているが、一般利用者にとって理由の
+                        // 無い数十秒の沈黙は起動失敗と区別が付かない（`docs/bugs/BUG-082.md`）。
+                        ToolCardStatus::Running {
+                            wait_reason: Some(reason),
+                        } => {
+                            lines.push(Line::from(Span::styled(
+                                format!("│ ... waiting: {reason}"),
                                 Style::default().fg(Color::Yellow),
                             )));
                         }
@@ -436,13 +452,18 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
     } else {
         format!("in={} out={}", app.last_usage.input, app.last_usage.output)
     };
-    // D-54: workspaceのACL救済walkが背景で走っている間だけ出る。この間`run_shell`は完了を
-    // 待つので、「TUIは出ているのにコマンドが動き出さない」理由がここで見える。
+    // D-54/BUG-082: workspaceの背景ジョブ（rootへの伝播＋保護DACL配下の救済walk）が
+    // 走っている間だけ出る。この間`run_shell`は完了を待つので、「TUIは出ているのに
+    // コマンドが動き出さない」理由がここで見える。伝播フェーズは単一のブロッキングOS
+    // 呼び出しのため中間進捗が無く（`total==0`のまま）、walkフェーズだけN/Mが出る。
     let acl = match app.workspace_acl_progress {
-        Some((done, total)) if total > 0 => format!(
-            " | workspace ACL {}% ({done}/{total})",
+        Some((crate::app::WorkspaceAclPhase::Walking, done, total)) if total > 0 => format!(
+            " | workspace ACL {}% (保護ノード検証 {done}/{total})",
             (done.min(total) * 100) / total
         ),
+        Some((crate::app::WorkspaceAclPhase::Propagating, _, _)) => {
+            " | workspace ACL 準備中 (継承を伝播中)".to_string()
+        }
         Some(_) => " | workspace ACL 準備中".to_string(),
         None => String::new(),
     };

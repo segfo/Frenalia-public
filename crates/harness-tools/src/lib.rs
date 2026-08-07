@@ -25,6 +25,7 @@ mod search;
 mod shell;
 pub mod tls_sni;
 pub mod tunnel;
+pub mod wait_reasons;
 mod web;
 
 use std::collections::HashMap;

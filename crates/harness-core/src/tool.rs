@@ -465,3 +465,38 @@ pub trait Tool: Send + Sync {
     fn risk(&self, input: &serde_json::Value) -> RiskClass;
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
 }
+
+/// [BUG-082フォローアップ] ツール呼び出しが実際の処理に入る**前**、何らかの背景条件で
+/// 無反応に見えている理由を説明できるもの（例: D-54のworkspace ACL伝播ジョブ）。
+///
+/// 開発者は「初回起動でrun_shellがACL伝播を待つ」ことを知っているが、一般利用者から見ると
+/// ツールカードが理由も無く"running"のまま数十秒動かないのは起動失敗と区別が付かない
+/// （`docs/bugs/BUG-082.md`のユーザー報告）。この trait はその理由を**汎用の形**で外へ出す
+/// ための唯一の境界であり、`grant_job`のような個々の背景ジョブがこれを実装することで、
+/// 呼び出し側（`harness-engine`のツール実行ループ）は「何が原因か」を一切知らないまま
+/// 待機理由をポーリングして`AgentEvent::ToolProgress`へ変換できる。**将来、他の背景条件
+/// （例: 昇格ヘルパーの起動待ち）が増えても、この trait を実装する側が増えるだけで、
+/// 呼び出し側の変更は不要**（`docs/CODE-STRUCTURE-RULES.md`規則5の「同じヘルパーの複製を
+/// 作らない」を待機理由の集約という形で満たす）。
+pub trait WaitReason: Send + Sync {
+    /// 今まさに何かを待たせているなら、短い日本語の説明を返す。待たせていなければ`None`。
+    /// 呼び出し側（[`WaitReasons::describe_active`]）が数百msごとに呼ぶ想定なので、
+    /// 重い処理（実際のI/O等）をここで行わないこと（既存の状態を読むだけに留める）。
+    fn describe(&self) -> Option<String>;
+}
+
+/// [`WaitReason`]の集合。**最初に何か言ってきたものが勝つ**（複数の待機理由を1行に
+/// 合成すると長くなり、かえって分かりにくいため）。
+#[derive(Clone, Default)]
+pub struct WaitReasons(std::sync::Arc<[std::sync::Arc<dyn WaitReason>]>);
+
+impl WaitReasons {
+    pub fn new(sources: Vec<std::sync::Arc<dyn WaitReason>>) -> Self {
+        Self(sources.into())
+    }
+
+    /// 登録済みの`WaitReason`を順に問い合わせ、最初に`Some`を返したものの説明を返す。
+    pub fn describe_active(&self) -> Option<String> {
+        self.0.iter().find_map(|source| source.describe())
+    }
+}
