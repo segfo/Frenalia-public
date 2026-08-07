@@ -43,6 +43,9 @@ pub mod overlay_hunks;
 pub mod read_scope;
 pub mod resolve;
 pub mod secret_env;
+/// セッションID → オーバーレイの置き場、の写像。起動時（`harness-cli`）とセッション切替時
+/// （`harness-tui`）の両方から引かれるため、どちらからも依存できるここに置く。
+pub mod session_scope;
 /// レビュー面の差分エンジン（表示側と適用側で共有する唯一のハンク計算）。
 pub mod textdiff;
 

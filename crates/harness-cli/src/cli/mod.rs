@@ -459,6 +459,15 @@ pub(crate) struct Cli {
     #[arg(long = "cwd")]
     cwd: Option<std::path::PathBuf>,
 
+    /// 内部用（`/workspace`の再起動が自分で付ける、`startup::relaunch`）。指定されたPIDの
+    /// プロセスが終了するまでStage4（preflight）へ進まない。
+    ///
+    /// 名前付きmutex（workspaceのモードマーカー・CoWのセッションマーカー）は**プロセス寿命に
+    /// 紐付いている**ため、前のharnessが消える前に新しい方がpreflightへ入ると「同じworkspaceを
+    /// 別モードで使用中」と誤判定され得る。人が手で打つものではないので`hide`する。
+    #[arg(long = "wait-for-pid", hide = true)]
+    wait_for_pid: Option<u32>,
+
     /// `.harness/sessions/session-<id>.jsonl`を復元して会話を継続する（M9、JSONL追記型
     /// セッション永続化）。`<id>`は`--continue`無しで起動した際にセッションファイル名から
     /// 拾える（`session-{id}.jsonl`）。値を省略した場合（`--resume`のみ）、対話TUI起動時に

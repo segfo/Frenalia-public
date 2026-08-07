@@ -226,10 +226,12 @@ pub fn read_cow_session_meta(upper_dir: &Path) -> Option<CowSessionMeta> {
     serde_json::from_str(&s).ok()
 }
 
-/// CoW upper_dir群の共通の親ディレクトリ（`%LOCALAPPDATA%\harness\data\cow`）。
-pub fn cow_upper_root() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "harness").map(|d| d.data_local_dir().join("cow"))
-}
+/// CoW upper_dir群の共通の親ディレクトリ（`%LOCALAPPDATA%\harness\cow`）。
+///
+/// 実体は[`crate::session_scope::cow_upper_root`]（セッションID→置き場の写像の正本）。
+/// ここから再公開しているのは、`harness cow`系サブコマンドがこのモジュール越しに引いて
+/// いるためで、**定義を2つ持たないことが目的**（`bug-pattern-rules` B-05）。
+pub use crate::session_scope::cow_upper_root;
 
 /// `cow_upper_root()`直下にある、これまでに作られた全セッションIDを列挙する（存在しなければ
 /// 空）。

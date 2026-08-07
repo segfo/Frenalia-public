@@ -475,6 +475,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // 登録する（未使用時のコストはゼロ、`Off`の等価性を壊さない）。
     tools.register(Arc::new(RecallTool::new(cognition.recall_allow_unversioned())));
 
+    // `/workspace`で選ばれた移動先。ここでは**まだ起動しない**——teardownを全部通した後で
+    // 起こす（`startup::relaunch`のモジュールdoc「置き場所が末尾でなければならない」）。
+    let mut relaunch_into: Option<PathBuf> = None;
     let exit_code = match cli.print {
         Some(print) => {
             headless_branch(
@@ -515,6 +518,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 resume_wants_picker,
                 cli.tier3_warm,
                 cli.tier3_max_sessions.max(1),
+                &mut relaunch_into,
             )
             .await
         }
@@ -572,6 +576,15 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     harness_sandbox::tier2a::session_profile::end_session(
         &harness_sandbox::tier2a::win_appcontainer::revoke_session_grant,
     );
+
+    // `/workspace`: **ここまでの撤収を全部通した後**に起こす（`startup::relaunch`）。
+    // 起こせなくても普通に終了するだけ——再起動できないことと端末を壊すことは別である。
+    if let Some(workspace) = relaunch_into {
+        if let Err(e) = super::relaunch::relaunch_in(&workspace) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     exit_code
 }
@@ -702,6 +715,10 @@ async fn tui_branch(
     resume_wants_picker: bool,
     tier3_warm: bool,
     tier3_max_sessions: u8,
+    // `/workspace`の移動先。TUIが自分でプロセスを起こすと、呼び出し元（`stage_run_agent`）の
+    // teardown順序（MCP停止→WFP撤収→policy-learn撤収→`end_session`）を迂回することになるので、
+    // 「どこへ移りたいか」だけを持ち帰らせる。
+    relaunch_into: &mut Option<PathBuf>,
 ) -> ExitCode {
     let log_dir = tool_ctx.workspace_root.join(".harness").join("logs");
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
@@ -735,7 +752,11 @@ async fn tui_branch(
     .await;
 
     match result {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(harness_tui::RunOutcome::Quit) => ExitCode::SUCCESS,
+        Ok(harness_tui::RunOutcome::Relaunch { workspace }) => {
+            *relaunch_into = Some(workspace);
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("tui error: {e}");
             ExitCode::FAILURE

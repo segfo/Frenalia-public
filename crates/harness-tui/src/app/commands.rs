@@ -21,6 +21,14 @@ pub enum SlashCommand {
     FsStage(FsStageCommand),
     /// `/memory`のサブコマンド（`Recall`の事後レビュー運用、`plans/PLAN-RECALL-MEMORY.md`）。
     Memory(MemoryCommand),
+    /// `/workspace <path>`: 別のワークスペースへ移る。
+    ///
+    /// **プロセス内では移らず、そのパスで`harness.exe`を起動し直す**（`crate::RunOutcome`）。
+    /// `workspace_root`はD-54のcapability台帳・モードmutex・preflight・背景`grant_job`・
+    /// traverse台帳・ログ出力先・MCP・Recall記憶鍵すべての基点で、プロセス途中で動かすことは
+    /// 起動パイプラインをもう一度実行するのと同義だからである（しかもmutex・loopback
+    /// exemption・WFPフィルタ・昇格ヘルパーのパイプはプロセス寿命に紐付いている）。
+    Workspace(String),
 }
 
 /// `/memory`のサブコマンド。
@@ -72,6 +80,8 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "/sessions" => Ok(SlashCommand::Sessions),
         "/fsstage" => parse_fsstage_subcommand(rest).map(SlashCommand::FsStage),
         "/memory" => parse_memory_subcommand(rest).map(SlashCommand::Memory),
+        "/workspace" if !rest.is_empty() => Ok(SlashCommand::Workspace(rest.to_string())),
+        "/workspace" => Err("usage: /workspace <path>".to_string()),
         other => Err(format!("unknown command: {other}")),
     }
 }

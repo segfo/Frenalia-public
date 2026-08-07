@@ -23,6 +23,15 @@ pub(super) struct SessionOpened {
     pub(super) sessions_dir: PathBuf,
     pub(super) session: harness_engine::SessionStore,
     pub(super) session_messages: Vec<harness_core::Message>,
+    /// `--fork-session`でforkした場合の**元**セッションID。
+    ///
+    /// Stage4がここから元セッションのオーバーレイを引き継がせる
+    /// （`session_scope::fork_overlay`）。**forkは会話だけでなく変更も分岐する**——
+    /// コピーしないと、`--resume <id> --fork-session`で開いた瞬間にそれまでの未適用変更が
+    /// レビュー対象から消える（実体は元セッション側に残るので失われはしないが、画面からは
+    /// 消える）。TUIの`/fork`と意味論を揃えるための値である（`bug-pattern-rules` B-06:
+    /// 同じ状態を作り得る経路を全部数える）。
+    pub(super) forked_from_session_id: Option<String>,
 }
 
 /// `sessions_dir`作成・`SessionStore`解決・`--fork-session`・履歴読込。
@@ -65,12 +74,14 @@ pub(super) fn stage_open_session(configured: Configured) -> Result<SessionOpened
 
     // `--fork-session`: 解決済みの元セッションを不変のまま、全履歴を新規セッションへコピーして
     // 以降の追記先を切り替える（Claude Codeの`--fork-session`/`/branch`相当）。
+    let mut forked_from_session_id = None;
     if cli.fork_session {
         let source_id = session.id();
         match harness_engine::SessionStore::fork_from(&sessions_dir, session.path()) {
             Ok(forked) => {
                 eprintln!("forked session {source_id} -> {}", forked.id());
                 session = forked;
+                forked_from_session_id = Some(source_id);
             }
             Err(e) => {
                 eprintln!("failed to fork session {source_id}: {e}");
@@ -111,6 +122,7 @@ pub(super) fn stage_open_session(configured: Configured) -> Result<SessionOpened
         sessions_dir,
         session,
         session_messages,
+        forked_from_session_id,
     })
 }
 

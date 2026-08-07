@@ -30,21 +30,12 @@ pub(crate) fn resolve_staging_mode(live: bool, staged: bool, workspace_commit: b
     }
 }
 
-/// `session_id`（`session-<id>`形式）に対応する`.harness/sandbox/<id>/`を
-/// `workspace_root`からの相対パスで返す。
-pub(crate) fn sandbox_dir_for_session(session_id: &str) -> PathBuf {
-    PathBuf::from(".harness").join("sandbox").join(session_id)
-}
-
-/// `--cow`（D-30）のCoW upper実体を置く場所。workspace外（`plans/AppContainerベース
-/// Copy-on-Write ワークスペース設計書.md` §9の推奨に従い、再帰的なパスマッピングを防止し
-/// `.harness`のPROTECTED DACL（`protect_harness_control_dir_from_appcontainer`）と衝突しない
-/// ようにする）。`ProjectDirs::data_local_dir()`は`%LOCALAPPDATA%\harness`（Windows）に
-/// 解決される（`fs_ledger_path`が使う`config_dir()`＝`%APPDATA%\harness\config`とは別系統）。
-pub(crate) fn cow_upper_dir_for_session(session_id: &str) -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "harness")
-        .map(|d| d.data_local_dir().join("cow").join(session_id))
-}
+// `session_id` → オーバーレイの置き場、の写像は`harness_sandbox::session_scope`が正本
+// （起動時のここと、セッション切替時の`harness-tui`の両方から引かれるため。以前は本ファイルと
+// `tier2a::workspace_ledger`に同じ`ProjectDirs::…join("cow")`が複製されていた）。
+pub(crate) use harness_sandbox::session_scope::{
+    cow_upper_dir_for_session, sandbox_dir_for_session,
+};
 
 /// `--cow`フラグから`WorkspaceWriteMode`を決める。`session_id`はCoW upperの採番に使う
 /// （`sandbox_dir_for_session`と同じ採番元）。`--cow`指定時に`ProjectDirs`が解決できない

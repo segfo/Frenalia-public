@@ -116,10 +116,18 @@ pub struct ReviewPanelState {
 
 impl ReviewPanelState {
     /// CoW/Staged面（オーバーレイの未適用変更）のインスタンス。
-    pub fn changes(rows: Vec<ReviewRow>) -> Self {
+    ///
+    /// `overlay_session_id`は**どのセッションのオーバーレイを見ているか**（`--live`では`None`）。
+    /// `/sessions`で切り替えられるようになった以上、見出しに出ていないと「いま何をコミット
+    /// しようとしているのか」が画面から分からない（`bug-pattern-rules` B-22）。
+    pub fn changes(rows: Vec<ReviewRow>, overlay_session_id: Option<&str>) -> Self {
+        let title = match overlay_session_id {
+            Some(id) => format!("changes — {id}"),
+            None => "changes".to_string(),
+        };
         Self {
             rows,
-            title: "changes".to_string(),
+            title,
             key_hint: "↑↓ select, Enter/Space toggle, Tab diff, PgUp/PgDn scroll, c=commit, \
                        x=discard-all, Esc=close"
                 .to_string(),

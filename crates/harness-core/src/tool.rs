@@ -41,7 +41,11 @@ pub enum StagingMode {
 
 /// ツールのステージング設定。`mode`をそのまま使う（M10当時あった「パス毎のgit認識型判定への
 /// 委譲」は削除済み、D-29参照）。
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`を持つのは、セッション切替（`/sessions`・`/fork`）でこの値が差し替わるように
+/// なったため——「切り替わったか」を判定できないと、切替の有無をテストで固定できない
+/// （`harness_sandbox::session_scope`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagingConfig {
     pub mode: StagingMode,
     /// オーバーレイ・マニフェストの置き場所。**`workspace_root`からの相対パス**

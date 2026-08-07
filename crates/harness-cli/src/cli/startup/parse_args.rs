@@ -22,12 +22,9 @@ use super::*;
 /// （`GetFullPathNameW`相当。`.`/`..`は字句的に畳むがリンクは辿らない）を使う。verbatim前置は
 /// `absolute`が素通しする仕様なので、共有ヘルパで先に落とす。
 fn normalize_workspace_root(raw: &Path) -> PathBuf {
-    let stripped =
-        harness_change_ledger::path_rules::normalize_root_spelling(&raw.to_string_lossy());
-    let stripped = PathBuf::from(stripped);
-    // 失敗するのは空パス等の異常時のみ。**元の値を黙って捨てない**（後段のエラーメッセージが
-    // ユーザーの打った綴りを指せるように）。
-    std::path::absolute(&stripped).unwrap_or(stripped)
+    // 実体は`harness_sandbox::session_scope`（TUIの`/workspace`も同じ関数を通す。
+    // 綴りの規則を2つ持つとBUG-066/BUG-068と同型の穴になる）。
+    harness_sandbox::session_scope::normalize_workspace_root(raw)
 }
 
 /// [`stage_parse_args`]の出力。Stage2（`stage_configure`）以降が必要とする値だけを運ぶ。

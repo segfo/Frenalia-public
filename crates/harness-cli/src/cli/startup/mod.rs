@@ -11,6 +11,8 @@ use super::*;
 mod configure;
 mod mcp;
 mod parse_args;
+/// `/workspace`（`harness_tui::RunOutcome::Relaunch`）の再起動と、その引数の組み立て。
+mod relaunch;
 mod run_agent;
 mod sandbox;
 mod session;

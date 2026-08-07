@@ -68,7 +68,16 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
         sessions_dir,
         session,
         session_messages,
+        forked_from_session_id,
     } = session_opened;
+
+    // `/workspace`の再起動で起こされた子は、ここから先（`select_tier`→`preflight`）へ入る前に
+    // 親の終了を待つ。名前付きmutex（workspaceのモードマーカー・CoWのセッションマーカー）は
+    // プロセス寿命に紐付いているので、親が生きているうちにpreflightへ入ると「使用中」と
+    // 誤判定され得る（`startup::relaunch`のモジュールdoc）。
+    if let Some(pid) = cli.wait_for_pid {
+        super::relaunch::wait_for_parent_exit(pid);
+    }
 
     // 書込ステージング設定（M10・D-29）。`sandbox_dir`は`session.id()`確定後でなければ組めない
     // ため、ここで`ToolCtx`を構築する。既定（フラグ無指定）を含め`Live`実効時はオーバーレイ
@@ -99,6 +108,34 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
             );
         }
     }
+
+    // `--fork-session`: 元セッションの未適用変更も分岐先へ持っていく。TUIの`/fork`と同じ
+    // `session_scope::fork_overlay`を通す——**同じ状態（forkされたセッション）を作り得る経路が
+    // 2つある**ので、片方だけ実装すると「CLIでforkしたときだけ変更が見えない」形の穴になる
+    // （`bug-pattern-rules` B-06）。`--cow`のACE付与は`preflight`が後で行うため、ここでは
+    // まだ`prepare_scope`のWindows分岐へ入らない`--staged`系だけが対象になる。
+    if let Some(source_id) = &forked_from_session_id {
+        let template = harness_sandbox::session_scope::ScopeTemplate::new(staging_mode, cli.cow);
+        let (from, to) = (
+            template.scope_for(source_id),
+            template.scope_for(&session.id()),
+        );
+        match harness_sandbox::session_scope::fork_overlay(&workspace_root, &from, &to) {
+            Ok(0) => {}
+            Ok(copied) => eprintln!(
+                "note: carried {copied} overlay file(s) from {source_id} into the forked session \
+                 (unapplied changes stay reviewable in both)"
+            ),
+            // 会話のforkは既に済んでいる。ここで起動を止めると「forkはできたが起動できない」に
+            // なるので、変更が分岐先へ来ていないことだけを名指しして続ける（元セッション側に
+            // 残っているので失われてはいない）。
+            Err(e) => eprintln!(
+                "warning: could not carry {source_id}'s unapplied changes into the forked session \
+                 ({e}); they remain reviewable with `harness changes --session {source_id}`"
+            ),
+        }
+    }
+
     let read_scope = settings
         .read
         .clone()

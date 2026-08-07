@@ -435,6 +435,31 @@ fn elide_middle(s: &str, max_chars: usize) -> String {
     format!("{head}…{tail}")
 }
 
+/// ステータスバーの「いまどこを見ているか」の部分（`ws=…` と `overlay=…`）。
+///
+/// **オーバーレイのセッションIDが会話のそれと違うときは併記する。** `/clear`は会話だけを
+/// 捨ててオーバーレイを引き継ぐ設計なので、この食い違いは正当だが黙っていてはいけない
+/// ——「いま見ている変更は、いまの会話が作ったものではない」ことが画面から分かる必要がある
+/// （BUG-072と同型の誤解を防ぐ。`bug-pattern-rules` B-22/B-32）。
+///
+/// `--live`ではオーバーレイが存在しないので`overlay=`自体を出さない（無いものの名前を
+/// 出すと「あるのに空」と読めてしまう）。
+fn scope_label(app: &AppState) -> String {
+    let ws = if app.workspace_label.is_empty() {
+        String::new()
+    } else {
+        format!(" | ws={}", app.workspace_label)
+    };
+    let Some(overlay) = &app.overlay_session_id else {
+        return ws;
+    };
+    if overlay == &app.conversation_session_id {
+        format!("{ws} | overlay={overlay}")
+    } else {
+        format!("{ws} | overlay={overlay} (会話={})", app.conversation_session_id)
+    }
+}
+
 fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
     let stop = app
         .last_stop_reason
@@ -468,12 +493,13 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
         None => String::new(),
     };
     let text = format!(
-        " {} | model={} | stop={} | tokens turn({turn_tokens}) session(in={} out={}){acl}",
+        " {} | model={} | stop={} | tokens turn({turn_tokens}) session(in={} out={}){}{acl}",
         app.provider_label,
         elide_middle(&app.model, MODEL_LABEL_MAX_CHARS),
         stop,
         app.session_usage.input,
         app.session_usage.output,
+        scope_label(app),
     );
     let paragraph = Paragraph::new(Line::from(Span::styled(
         text,
@@ -711,5 +737,65 @@ mod tests {
             .line_count(10);
 
         assert_eq!(wrapped, 2);
+    }
+}
+
+#[cfg(test)]
+mod scope_label_tests {
+    use super::*;
+
+    fn app_with(ws: &str, overlay: Option<&str>, conversation: &str) -> AppState {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.workspace_label = ws.to_string();
+        app.note_scope(overlay.unwrap_or(""), conversation);
+        app
+    }
+
+    /// 通常（`/sessions`直後など）はオーバーレイと会話が同じセッション。併記しない。
+    #[test]
+    fn the_overlay_is_shown_once_when_it_matches_the_conversation() {
+        let app = app_with("harness", Some("session-a"), "session-a");
+        assert_eq!(scope_label(&app), " | ws=harness | overlay=session-a");
+    }
+
+    /// `/clear`後は会話だけが新しくなる。**この食い違いは正当だが黙ってはいけない**
+    /// ——「いま見ている変更は、いまの会話が作ったものではない」が画面から分かる必要がある。
+    #[test]
+    fn a_mismatch_after_clear_is_spelled_out() {
+        let app = app_with("harness", Some("session-a"), "session-b");
+        assert_eq!(
+            scope_label(&app),
+            " | ws=harness | overlay=session-a (会話=session-b)"
+        );
+    }
+
+    /// `--live`はオーバーレイを持たないので`overlay=`自体を出さない（無いものの名前を出すと
+    /// 「あるのに空」と読めてしまう）。
+    #[test]
+    fn live_mode_shows_no_overlay_field_at_all() {
+        let app = app_with("harness", None, "session-a");
+        assert_eq!(scope_label(&app), " | ws=harness");
+    }
+
+    /// ステータスバー本体に実際に載ること（`scope_label`だけ直して繋ぎ忘れる形を防ぐ）。
+    #[test]
+    fn the_status_bar_actually_renders_the_scope() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let app = app_with("harness", Some("session-a"), "session-b");
+        let mut term = Terminal::new(TestBackend::new(200, 3)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_status(f, area, &app);
+        })
+        .unwrap();
+        // 全角文字は2セルを占め、片方が空になるので素朴な連結では「会 話」と割れる。
+        // ここで確かめたいのは「`scope_label`がステータスバーに実際に載っているか」なので、
+        // ASCII部分だけを見る（文言そのものは`scope_label`の各テストが固定している）。
+        let screen: String = term.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("ws=harness"), "{screen}");
+        assert!(screen.contains("overlay=session-a"), "{screen}");
+        assert!(screen.contains("=session-b"), "{screen}");
     }
 }

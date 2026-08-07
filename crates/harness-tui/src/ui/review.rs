@@ -187,7 +187,7 @@ mod tests {
         let new = old
             .replace("line2\n", "CHANGED2\n")
             .replace("line25\n", "CHANGED25\n");
-        ReviewPanelState::changes(vec![row("a.txt", &old, &new)])
+        ReviewPanelState::changes(vec![row("a.txt", &old, &new)], None)
     }
 
     /// ハンク見出し・差分行・省略行が実際に画面へ出る（スクロール0の位置）。
@@ -223,7 +223,7 @@ mod tests {
     /// 空のパネル（レビュー対象なし）でも落ちない。
     #[test]
     fn an_empty_panel_renders_a_placeholder() {
-        let screen = rendered(&ReviewPanelState::changes(Vec::new()));
+        let screen = rendered(&ReviewPanelState::changes(Vec::new(), None));
         assert!(screen.contains("nothing to review"), "{screen}");
     }
 }

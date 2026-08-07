@@ -15,6 +15,7 @@
 //! - `<out>/cow/` — 8シナリオ分のワークスペース。各シナリオが1セッション
 //!   （`.harness/sessions/session-<id>.jsonl`）＋1オーバーレイ（`.harness/sandbox/session-<id>/`）
 //!   を持ち、`harness --staged --resume <id>`で開くとその変更だけがレビュー対象になる。
+//!   起動後は`/sessions`でシナリオ間を行き来できる（会話とオーバーレイが1単位で切り替わる）。
 //! - `%APPDATA%\harness\data\memory\<workspace-key>\` — Recall記憶のレビュー用データ4種
 //!   （`plans/PLAN-RECALL-MEMORY.md`）。**`RecallStore`経由で作る**ので、
 //!   `harness memory list --all`・TUIの`/memory`からそのまま見える。
@@ -113,9 +114,9 @@ fn build_cow_scenarios(ws: &Path) {
 fn scenario_table(scenarios: &[Scenario]) -> String {
     let mut out = String::from(
         "# CoW/stagedシナリオ一覧\n\n\
-         各シナリオは`harness.exe --staged --resume <id>`で開く（レビュー対象は**起動時の\n\
-         セッション**で決まる。TUI内の`/sessions`では会話だけが切り替わり、レビュー対象は\n\
-         切り替わらない）。\n\n\
+         最初の1つは`harness.exe --staged --resume <id>`で開く。**以降はTUI内の`/sessions`で\n\
+         行き来できる**——会話とレビュー対象（オーバーレイ）は1単位で切り替わるので、\n\
+         シナリオごとに起動し直す必要は無い。\n\n\
          | `--resume` | 会話 | 件数 | 見どころ |\n|---|---|---|---|\n",
     );
     for s in scenarios {
@@ -873,17 +874,21 @@ fn write_readme(
          再実行すると**この中身は作り直される**（このファイルが目印）。\n\n\
          ## CoW/staged（内蔵ReviewPanelで今すぐ試せる）\n\n\
          ワークスペース: `{}`\n\n\
-         **シナリオごとに`--resume`で起動する。** レビューパネルが見るオーバーレイは\n\
-         **起動時のセッション**で決まるため、TUI内の`/sessions`で会話を切り替えても\n\
-         レビュー対象は切り替わらない（会話だけが変わる）。\n\n\
+         **1回起動すれば、あとは`/sessions`で全シナリオを見て回れる。** 会話とレビュー対象\n\
+         （オーバーレイ）は1単位で切り替わる。ステータスバーの`overlay=`が、いまどの\n\
+         セッションのオーバーレイを見ているかを常に示す。\n\n\
          ```powershell\n\
          cd {}\n\
          harness.exe --staged --resume multi-short\n\
          ```\n\n\
          起動したら`/fsstage commit`でパネルを開く。キーは\n\
          `↑↓`一覧・`Enter/Space`行トグル・`Tab`でdiffペインへ・`↑↓`ハンク移動・\n\
-         `Enter/Space`ハンクトグル・`PgUp/PgDn`スクロール・`c`コミット・`x`全破棄・`Esc`閉じる。\n\n\
+         `Enter/Space`ハンクトグル・`PgUp/PgDn`スクロール・`c`コミット・`x`全破棄・`Esc`閉じる。\n\
+         `Esc`で閉じてから`/sessions`で次のシナリオへ移り、また`/fsstage commit`する。\n\n\
          シナリオ一覧は`cow/SCENARIOS.md`。\n\n\
+         別ワークスペース（下のRecall用など）へは`/workspace <path>`で移る——ワークスペースは\n\
+         Tier2aのACL・mutex・preflightの基点なので、プロセス内では切り替えず**起動し直す**\n\
+         （移動先のセッションピッカーが出る）。\n\n\
          ## Recall記憶\n\n\
          `RecallStore`経由で作ってあるので、そのまま開ける。\n\n\
          ```powershell\n\

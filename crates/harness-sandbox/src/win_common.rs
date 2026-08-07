@@ -26,6 +26,27 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// 指定PIDのプロセスが終了するまで待つ。既に終了していれば即座に`true`、時間切れなら`false`。
+///
+/// **PIDではなくプロセスハンドルの生存で判定する**（`bug-pattern-rules` B-17）。PIDは再利用
+/// され得るが、`OpenProcess`で得たハンドルはそのプロセス自身を指し続ける。開けなかった場合は
+/// 「もう居ない」＝`true`として扱う（`ERROR_INVALID_PARAMETER`は消滅済みの正常系）。
+///
+/// `harness-cli`が`/workspace`の再起動で使う（`startup::relaunch`）。あちらは`windows`クレートに
+/// 依存していないのでここへ置く。
+pub fn wait_for_process_exit(pid: u32, timeout_ms: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
+            return true;
+        };
+        let status = WaitForSingleObject(handle, timeout_ms);
+        let _ = CloseHandle(handle);
+        status != WAIT_TIMEOUT
+    }
+}
+
 /// パスをそのまま`wide`へ渡すと、Win32 ACL API（`GetNamedSecurityInfoW`/`SetNamedSecurityInfoW`
 /// 等）は`MAX_PATH`（260文字）を超えるパスを`ERROR_INVALID_NAME`（0x8007007B）で拒否する
 /// （BUG-028）。`\\?\`ロングパス接頭辞（既に付いている場合・UNCパスの場合は付け直さない）を

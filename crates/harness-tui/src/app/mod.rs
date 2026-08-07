@@ -220,6 +220,18 @@ pub struct AppState {
     /// ターン以外のバックグラウンド処理（`/compact`の要約）の進捗表示（BUG-070・BUG-071）。
     /// `thinking_progress`と同じくtranscript末尾への一時表示で、`transcript`本体には積まない。
     pub busy_progress: Option<BusyProgress>,
+    /// いま開いているワークスペースの表示名（末尾のディレクトリ名）。`/workspace`で移動できる
+    /// ようになったため、どこにいるかが画面から分かる必要がある。
+    pub workspace_label: String,
+    /// **いま見ている／書いているオーバーレイ**の持ち主のセッションID（`--live`では`None`）。
+    ///
+    /// [`Self::conversation_session_id`]と食い違うことがある——`/clear`は会話だけを捨てて
+    /// オーバーレイを引き継ぐ設計なので、その後は「会話はセッションB、変更はセッションAの
+    /// オーバーレイ」になる。**この食い違いは正当だが、黙っていてはいけない**（BUG-072と
+    /// 同型の誤解を生む）。`ui::render_status`が両方を並べて出す。
+    pub overlay_session_id: Option<String>,
+    /// いま追記している会話のセッションID。
+    pub conversation_session_id: String,
 }
 
 /// `PageUp`/`PageDown`1回あたりのスクロール行数。端末の実際の高さは`AppState`が知らないため
@@ -261,12 +273,30 @@ impl AppState {
             host_is_vscode: false,
             review_panel: None,
             busy_progress: None,
+            workspace_label: String::new(),
+            overlay_session_id: None,
+            conversation_session_id: String::new(),
         }
     }
 
+    /// いま見ているオーバーレイと、いま追記している会話を記録する（表示用）。
+    ///
+    /// `overlay`が空文字なら`--live`（オーバーレイ無し）とみなす。呼ぶのは`crate::run`だけで、
+    /// スコープが確定した／差し替わった各点から1回ずつ。
+    pub fn note_scope(&mut self, overlay: &str, conversation: &str) {
+        self.overlay_session_id = (!overlay.is_empty()).then(|| overlay.to_string());
+        self.conversation_session_id = conversation.to_string();
+    }
+
     /// 変更（CoW/Staged）のレビューパネルを開く（既定で全件accept、reject印は空）。
+    /// 見出しに載るオーバーレイのセッションIDは、引数ではなく[`Self::overlay_session_id`]から
+    /// 取る。呼び出し側に渡させると「行はセッションBのもの、見出しはセッションA」という
+    /// ずれが型で防げない（`bug-pattern-rules` B-13: 同じ事実の正本を2つ持たない）。
     pub fn open_changes_panel(&mut self, rows: Vec<ReviewRow>) {
-        self.review_panel = Some(ReviewPanelState::changes(rows));
+        self.review_panel = Some(ReviewPanelState::changes(
+            rows,
+            self.overlay_session_id.as_deref(),
+        ));
     }
 
     /// キーイベントecho（`note_key_event`）を有効化し、有効である旨のバナーをtranscriptへ出す。

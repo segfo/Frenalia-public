@@ -21,7 +21,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use harness_cognition::{CognitiveOrchestrator, RecallStore, ReviewedWatermark};
-use harness_core::{LlmProvider, ReadScopeConfig, StagingConfig, ToolCtx};
+use harness_core::{LlmProvider, ReadScopeConfig, ToolCtx};
 use harness_engine::{ConversationState, PermissionArbiter, SessionStore};
 use harness_sandbox::{ApplyOptions, ManifestOp, SandboxFs};
 use harness_tools::ToolRegistry;
@@ -32,6 +32,26 @@ pub use app::{
 };
 pub use engine::{spawn_engine, EngineHandle};
 pub use gate::InteractiveGate;
+
+/// [`run`]が終わった理由。
+///
+/// `/workspace`をプロセス内の切替ではなく**再起動**にしているのは、`workspace_root`が
+/// D-54のcapability台帳・`begin_workspace_mode`のモードmutex・`preflight`・背景`grant_job`・
+/// traverse台帳・ログ出力先・MCP・Recall記憶鍵すべての基点だからである。プロセス途中で
+/// 動かすことは起動パイプライン（Stage1〜5）をもう一度実行するのと同義で、しかもmutex・
+/// loopback exemption・WFPフィルタ・昇格ヘルパーのパイプは**プロセス寿命に紐付いている**
+/// （それが設計）。プロセス内で解いて張り直すのは、既存の順序制約の二重実装になる。
+///
+/// 再起動そのものは`harness-cli`が行う——MCP停止・WFP撤収・policy-learn撤収・
+/// `session_profile::end_session`という**既存のteardown順序を全部通した後**に置けるのは
+/// あちら側だけであり、TUIが自分でプロセスを起こすとその順序を迂回することになる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    Quit,
+    /// `/workspace <path>`。`workspace`は正規化済み（`harness-cli`の
+    /// `normalize_workspace_root`と同じ規則）で、実在するディレクトリであることを確認済み。
+    Relaunch { workspace: PathBuf },
+}
 
 const TICK: Duration = Duration::from_millis(33);
 
@@ -142,14 +162,13 @@ fn apply_commit_selection(
 /// （以前あったAction毎のstaged/CoW分岐は解消済み）。
 fn open_panel_fs(
     workspace_root: &std::path::Path,
-    staging: &StagingConfig,
-    cow_upper_dir: Option<&std::path::Path>,
+    scope: &harness_sandbox::session_scope::SessionScope,
 ) -> Result<SandboxFs, harness_sandbox::SandboxError> {
     SandboxFs::open_with_cow(
         workspace_root,
-        staging,
+        &scope.staging,
         &ReadScopeConfig::default(),
-        cow_upper_dir,
+        scope.cow_upper_dir.as_deref(),
     )
 }
 
@@ -254,6 +273,119 @@ fn push_apply_report(app: &mut AppState, report: &harness_sandbox::ApplyReport) 
     }
 }
 
+/// `/workspace <path>`の引数を、起動時と**同じ規則**で正規化して実在確認する。
+///
+/// 綴りの正規化（`\\?\`前置の除去・`.`/`..`の字句的な畳み込み・絶対化）は
+/// `harness_change_ledger::path_rules::normalize_root_spelling` + `std::path::absolute` で行う
+/// ——`harness-cli`の`normalize_workspace_root`と**同じ2関数**である。ここに別の規則を書くと、
+/// 「`/workspace .`で入ったときだけ台帳のキーがずれる」というBUG-066/BUG-068と同型の穴になる
+/// （`bug-pattern-rules` B-05/B-19）。`canonicalize`は使わない——シンボリックリンクを辿って
+/// 対象をすり替えてしまい、境界の意味が変わる。
+fn resolve_workspace_arg(raw: &str, current: &std::path::Path) -> Result<PathBuf, String> {
+    let raw = raw.trim().trim_matches('"');
+    if raw.is_empty() {
+        return Err("usage: /workspace <path>".to_string());
+    }
+    // 相対パスは「いまのワークスペースから見て」解決する（cwdはTUIの起動時から変わらないが、
+    // ユーザーが画面で見ているのはワークスペースなので、そちらを基準にする方が驚きが少ない）。
+    let abs = harness_sandbox::session_scope::normalize_workspace_root(&current.join(raw));
+    if !abs.is_dir() {
+        return Err(format!("{} はディレクトリではありません", abs.display()));
+    }
+    Ok(abs)
+}
+
+/// ステータスバーへ出すオーバーレイ名。`--live`はオーバーレイを持たないので空
+/// （`AppState::note_scope`が`None`＝非表示として扱う）。
+fn overlay_label(scope: &harness_sandbox::session_scope::SessionScope) -> &str {
+    if scope.is_live() {
+        ""
+    } else {
+        &scope.session_id
+    }
+}
+
+/// 切替先のオーバーレイを用意し、成功したときだけ`Some`を返す（`/sessions`）。
+///
+/// **`None`のときは会話も切り替えない**（fail-closed）。書けないオーバーレイへ会話だけ移すと、
+/// 以後の書込が全部失敗し続けることになる。理由は必ず1行残す（B-10: 握り潰さない）。
+fn prepared_scope(
+    app: &mut AppState,
+    workspace_root: &std::path::Path,
+    template: &harness_sandbox::session_scope::ScopeTemplate,
+    session_id: &str,
+) -> Option<harness_sandbox::session_scope::SessionScope> {
+    let next = template.scope_for(session_id);
+    match harness_sandbox::session_scope::prepare_scope(workspace_root, &next) {
+        Ok(_) => Some(next),
+        Err(e) => {
+            app.transcript.push(app::TranscriptItem::Error(format!(
+                "{session_id} のオーバーレイを用意できませんでした: {e} （会話も切り替えていません）"
+            )));
+            None
+        }
+    }
+}
+
+/// 用意済みのスコープを「いま見ているオーバーレイ」として採用し、未適用件数を返す。
+///
+/// **開いているレビューパネルは閉じる**（`bug-pattern-rules` B-22）。パネルの行は開いた時点の
+/// オーバーレイから作られている一方、`c`（commit）は適用の瞬間に`open_panel_fs`で開き直す。
+/// 対象が変わったのに行が残っていると、**旧オーバーレイの一覧を見ながら新オーバーレイへ
+/// 適用する**ことになる。現状はパネル表示中に全キー入力をパネルが奪うのでここへ到達しないが、
+/// 条件は「その意図で書かれた経路」ではなく「その状態を作り得る全経路」で閉じる（BUG-085）。
+fn adopt_scope(
+    app: &mut AppState,
+    workspace_root: &std::path::Path,
+    review_scope: &mut harness_sandbox::session_scope::SessionScope,
+    next: harness_sandbox::session_scope::SessionScope,
+) -> usize {
+    *review_scope = next;
+    app.review_panel = None;
+    open_panel_fs(workspace_root, review_scope)
+        .and_then(|fs| fs.change_set())
+        .map(|entries| entries.len())
+        .unwrap_or(0)
+}
+
+/// `/fork`の第2段。新セッション用のオーバーレイを用意し、いまのオーバーレイの中身をそこへ
+/// コピーしてから、engineへ差し替えを伝える。
+///
+/// **失敗したらスコープを動かさない。** 会話のforkは既に済んでいるので巻き戻せないが、
+/// レビュー対象を元のオーバーレイに留めておけば変更は1つも失われない（非破壊）。
+/// 何が起きたかは必ず1行出す——黙って元のままにすると、`/fork`したのに分岐していないことに
+/// 気付けない（B-10）。
+fn fork_overlay_into(
+    app: &mut AppState,
+    engine: &EngineHandle,
+    workspace_root: &std::path::Path,
+    template: &harness_sandbox::session_scope::ScopeTemplate,
+    review_scope: &mut harness_sandbox::session_scope::SessionScope,
+    new_session_id: &str,
+) {
+    let next = template.scope_for(new_session_id);
+    if next.is_live() {
+        // `--live`はオーバーレイを持たないので、分岐すべき変更が存在しない。
+        return;
+    }
+    match harness_sandbox::session_scope::fork_overlay(workspace_root, review_scope, &next) {
+        Ok(copied) => {
+            let previous = review_scope.session_id.clone();
+            adopt_scope(app, workspace_root, review_scope, next);
+            engine.set_scope(review_scope.clone());
+            app.transcript.push(app::TranscriptItem::Info(format!(
+                "オーバーレイを {previous} から {} へコピーしました（{copied} ファイル）。以降の変更は分岐先だけに入ります",
+                review_scope.session_id
+            )));
+        }
+        Err(e) => app.transcript.push(app::TranscriptItem::Error(format!(
+            "会話はforkしましたが、オーバーレイのコピーに失敗しました: {e} \
+             （レビュー対象と書込先は {} のまま。変更は失われていません）",
+            review_scope.session_id
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     provider: Arc<dyn LlmProvider>,
@@ -274,7 +406,7 @@ pub async fn run(
     start_with_picker: bool,
     tier3_warm: bool,
     tier3_max_sessions: u8,
-) -> io::Result<()> {
+) -> io::Result<RunOutcome> {
     let guard = terminal::TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
@@ -346,13 +478,63 @@ pub async fn run(
     // `SandboxFs`を直接この描画ループから同期的に叩く。ピッカーが`session`を直接触るのと
     // 同じアーキテクチャ上の位置付け）。
     let workspace_root_for_panel = ctx.workspace_root.clone();
-    let staging_for_panel: StagingConfig = ctx.staging.clone();
-    // `--cow`（D-30）指定時のCoW upperディレクトリ。`--cow`は`--staged`/`--workspace-commit`と
-    // 互いに排他（`harness-cli::main.rs`のPhase 0）のため、1セッション内で
-    // `staging_for_panel.sandbox_dir`とこの値の両方が意味を持つことはない。CoW一本化
-    // （Phase 2）以降、`open_panel_fs`がこの値の有無に関わらず単一の`SandboxFs`を組み立てる
-    // （`--staged`/`--cow`は同じバックエンドを使うため、Action側は分岐を持たない）。
-    let cow_upper_dir_for_panel = ctx.cow_upper_dir.clone();
+    // このプロセスのオーバーレイ機構（`--live`/`--staged`/`--cow`）。**セッションを切り替えても
+    // 変わらない**——workspaceツリーのアクセス形状は起動時の`preflight`が確定し、capability・
+    // ACE・モードmutexがそれに紐付いているため（D-54）。切替で動くのは「どのセッションの
+    // オーバーレイか」だけで、それを`scope_for`が引く。
+    let scope_template = harness_sandbox::session_scope::ScopeTemplate::new(
+        ctx.staging.mode,
+        ctx.cow_upper_dir.is_some(),
+    );
+    // **いま見ている／書いているオーバーレイ**。`/sessions`・`/fork`で差し替わり、engine側の
+    // `ToolCtx`とこの値は常に同じものを指す（engineの確認イベントを受けてから更新するため、
+    // ずれる窓が無い）。パネルの開閉・apply/discardはengineタスクを介さず、
+    // `ConversationState`と無関係に`SandboxFs`を直接この描画ループから同期的に叩く
+    // （ピッカーが`session`を直接触るのと同じアーキテクチャ上の位置付け）。
+    let mut review_scope = scope_template.scope_for(&new_session_id);
+    // `AppState`はこの下でしか作れないので、ここで出したい警告を1つ預けておく。
+    let mut app_startup_scope_warning: Option<String> = None;
+    // 起動時ピッカー（`--resume`を引数なしで指定）が別のセッションを選んだ場合、`harness-cli`が
+    // 組んだ`ctx`は**ピッカーより前の使い捨てセッション**のオーバーレイを指したままである
+    // （`sandbox_dir`はセッションID確定時に決まるが、確定はピッカーの後になる）。ここで
+    // 選ばれたセッションのものへ揃える。`ctx`をまだ手放していないこの一点でしか直せない。
+    if ctx.staging != review_scope.staging || ctx.cow_upper_dir != review_scope.cow_upper_dir {
+        // ピッカーで`f`（fork）を選んだ場合は、元セッションの未適用変更も分岐先へ持っていく
+        // （`--fork-session`・`/fork`と同じ意味論。`bug-pattern-rules` B-06）。
+        let prepared = match &forked_from {
+            Some(source_id) => harness_sandbox::session_scope::fork_overlay(
+                &workspace_root_for_panel,
+                &scope_template.scope_for(source_id),
+                &review_scope,
+            )
+            .map(|_| ()),
+            None => harness_sandbox::session_scope::prepare_scope(
+                &workspace_root_for_panel,
+                &review_scope,
+            )
+            .map(|_| ()),
+        };
+        if let Err(e) = prepared {
+            // 用意できないなら**起動時のオーバーレイのまま続ける**（会話だけ選んだものになる）。
+            // 黙って続けると食い違いに気付けないので、必ず1行残す。
+            app_startup_scope_warning = Some(format!(
+                "could not switch the overlay to {}: {e} (reviewing session-{}'s overlay instead)",
+                review_scope.session_id,
+                ctx.staging
+                    .sandbox_dir
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "?".to_string())
+            ));
+            review_scope = scope_template.scope_for(&new_session_id);
+            review_scope.staging = ctx.staging.clone();
+            review_scope.cow_upper_dir = ctx.cow_upper_dir.clone();
+        } else {
+            ctx.staging = review_scope.staging.clone();
+            ctx.cow_upper_dir = review_scope.cow_upper_dir.clone();
+        }
+    }
     let mut engine = spawn_engine(
         provider,
         tools,
@@ -371,6 +553,14 @@ pub async fn run(
     let mut app = AppState::new(provider_label, model);
     app.enter_submits = enter_submits;
     app.host_is_vscode = terminal::host_is_vscode();
+    app.workspace_label = workspace_root_for_panel
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace_root_for_panel.to_string_lossy().into_owned());
+    app.note_scope(overlay_label(&review_scope), &new_session_id);
+    if let Some(warning) = app_startup_scope_warning.take() {
+        app.transcript.push(app::TranscriptItem::Error(warning));
+    }
     // Enter系キー化けの検証用: `HARNESS_KEY_DEBUG`（`0`/空以外）で受信キーイベントを画面へecho。
     if std::env::var("HARNESS_KEY_DEBUG")
         .map(|v| !v.is_empty() && v != "0")
@@ -411,6 +601,12 @@ pub async fn run(
     // BUG-069: `/sessions`で別セッションへ切り替えたとき、engineが返す`SessionSwitched`
     // （見出し行）の**後ろ**へ復元分を積むための予約置き場。
     let mut pending_restore: Option<Vec<harness_core::Message>> = None;
+    // 切り替え先のオーバーレイ。`pending_restore`と同じ理由で予約する——engineが実際に
+    // `ToolCtx`を差し替えたのは`SessionSwitched`が返ってきた時点なので、ピッカーから戻った
+    // 直後にここを更新すると、ターン実行中はパネルだけが先に新しい方を見ることになる。
+    let mut pending_scope: Option<harness_sandbox::session_scope::SessionScope> = None;
+    // `/workspace`で選ばれた移動先（ループを抜けて`harness-cli`が再起動する、§`RunOutcome`）。
+    let mut relaunch_into: Option<PathBuf> = None;
 
     loop {
         tokio::select! {
@@ -418,6 +614,13 @@ pub async fn run(
                 match ev {
                     Some(ev) => {
                         let switched = matches!(ev, harness_core::AgentEvent::SessionSwitched { .. });
+                        // `/fork`はengineの中で新IDが決まるので、それを受け取ってから
+                        // オーバーレイをコピーする（`EngineCommand::SetScope`＝第2段）。
+                        let forked_to = match &ev {
+                            harness_core::AgentEvent::SessionSwitched { source_id: Some(_), new_id, .. }
+                                if pending_restore.is_none() => Some(new_id.clone()),
+                            _ => None,
+                        };
                         // BUG-078: 進捗表示（`busy_progress`）の**イベント側のライフサイクル**は
                         // `AppState::apply`が握る。ここに置いていた頃は`app_state_tests`から
                         // 一切テストできず、「engineが始めた縮約では表示が出ない」という穴が
@@ -430,11 +633,39 @@ pub async fn run(
                         if switched && pending_restore.is_some() {
                             app.clear_transcript();
                         }
+                        let session_id_after = match &ev {
+                            harness_core::AgentEvent::SessionSwitched { new_id, .. } => Some(new_id.clone()),
+                            _ => None,
+                        };
                         app.apply(ev);
                         if switched {
                             if let Some(messages) = pending_restore.take() {
                                 app.restore_transcript(&messages);
                             }
+                            // engineが`ToolCtx`を差し替え終えた**この時点で**、パネル側も
+                            // 同じオーバーレイを指す（両者がずれる窓を作らない）。
+                            if let Some(next) = pending_scope.take() {
+                                let unapplied = adopt_scope(&mut app, &workspace_root_for_panel, &mut review_scope, next);
+                                app.transcript.push(app::TranscriptItem::Info(format!(
+                                    "レビュー対象を {} のオーバーレイへ切り替えました（未適用 {unapplied} 件。`/fsstage commit` で開けます）",
+                                    review_scope.session_id
+                                )));
+                            }
+                            if let Some(session_id) = &session_id_after {
+                                app.note_scope(overlay_label(&review_scope), session_id);
+                            }
+                        }
+                        // `/fork`の第2段: 新セッション用のオーバーレイを用意し、いまの
+                        // オーバーレイの中身をコピーしてから、engineへ差し替えを伝える。
+                        if let Some(new_id) = forked_to {
+                            fork_overlay_into(
+                                &mut app,
+                                &engine,
+                                &workspace_root_for_panel,
+                                &scope_template,
+                                &mut review_scope,
+                                &new_id,
+                            );
                         }
                     }
                     None => break,
@@ -499,12 +730,30 @@ pub async fn run(
                                             // ここで積むと見出し行が復元分の後ろに来てしまう。
                                             // 通知を受け取った時点で積むよう予約しておく。
                                             Ok(picker::PickerOutcome::Selected(s, msgs)) => {
-                                                pending_restore = Some(msgs.clone());
-                                                engine.switch_session(s, msgs);
+                                                // 会話とオーバーレイは1単位。置き場を用意
+                                                // できなければ**どちらも切り替えない**。
+                                                if let Some(next) = prepared_scope(&mut app, &workspace_root_for_panel, &scope_template, &s.id()) {
+                                                    pending_restore = Some(msgs.clone());
+                                                    pending_scope = Some(next.clone());
+                                                    engine.switch_session(s, msgs, next);
+                                                }
                                             }
-                                            Ok(picker::PickerOutcome::Forked { session: s, messages, .. }) => {
-                                                pending_restore = Some(messages.clone());
-                                                engine.switch_session(s, messages);
+                                            // ピッカーの`f`（fork）。**元セッションの未適用変更も
+                                            // 分岐先へ持っていく**（`/fork`・`--fork-session`と
+                                            // 同じ意味論、B-06）。
+                                            Ok(picker::PickerOutcome::Forked { source_id, session: s, messages }) => {
+                                                let next = scope_template.scope_for(&s.id());
+                                                let from = scope_template.scope_for(&source_id);
+                                                match harness_sandbox::session_scope::fork_overlay(&workspace_root_for_panel, &from, &next) {
+                                                    Ok(_) => {
+                                                        pending_restore = Some(messages.clone());
+                                                        pending_scope = Some(next.clone());
+                                                        engine.switch_session(s, messages, next);
+                                                    }
+                                                    Err(e) => app.transcript.push(app::TranscriptItem::Error(format!(
+                                                        "{source_id} のオーバーレイを分岐先へ引き継げませんでした: {e} （会話も切り替えていません）"
+                                                    ))),
+                                                }
                                             }
                                             Ok(picker::PickerOutcome::Cancelled) => {}
                                             Err(e) => {
@@ -525,6 +774,27 @@ pub async fn run(
                                     // 同じく、この非対話ループ内で直接ファイルI/Oを行う
                                     // （記憶ディレクトリは小さいJSON/Markdownのみで、
                                     // `open_panel_fs`と同程度の軽さ）。
+                                    // `/workspace`はプロセス内では移らない。ループを抜けて
+                                    // `harness-cli`が既存のteardownを全部通した後に起動し直す
+                                    // （`RunOutcome::Relaunch`のdoc）。
+                                    SlashCommand::Workspace(raw) => {
+                                        match resolve_workspace_arg(&raw, &workspace_root_for_panel) {
+                                            Ok(next) if next == workspace_root_for_panel => {
+                                                app.transcript.push(app::TranscriptItem::Info(
+                                                    "既にそのワークスペースを開いています".to_string(),
+                                                ));
+                                            }
+                                            Ok(next) => {
+                                                app.transcript.push(app::TranscriptItem::Info(format!(
+                                                    "{} を開き直します（このセッションは終了し、移動先のセッション一覧が出ます）",
+                                                    next.display()
+                                                )));
+                                                relaunch_into = Some(next);
+                                                app.should_quit = true;
+                                            }
+                                            Err(e) => app.transcript.push(app::TranscriptItem::Error(e)),
+                                        }
+                                    }
                                     SlashCommand::Memory(cmd) => {
                                         for line in run_memory_slash_command(&workspace_root_for_panel, cmd) {
                                             app.transcript.push(app::TranscriptItem::Info(line));
@@ -533,7 +803,7 @@ pub async fn run(
                                 },
                                 Action::Quit => {}
                                 Action::OpenChangesPanel => {
-                                    match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                    match open_panel_fs(&workspace_root_for_panel, &review_scope) {
                                         Ok(fs) => match fs.change_set() {
                                             Ok(entries) => {
                                                 let rows = build_change_rows(&fs, entries);
@@ -549,7 +819,7 @@ pub async fn run(
                                     }
                                 }
                                 Action::ListChanges => {
-                                    match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                    match open_panel_fs(&workspace_root_for_panel, &review_scope) {
                                         Ok(fs) => match fs.change_set() {
                                             Ok(entries) if entries.is_empty() => {
                                                 app.transcript.push(app::TranscriptItem::Info(
@@ -575,7 +845,7 @@ pub async fn run(
                                     }
                                 }
                                 Action::CommitChanges(selection) => {
-                                    match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                    match open_panel_fs(&workspace_root_for_panel, &review_scope) {
                                         Ok(fs) => match apply_commit_selection(&fs, &selection) {
                                             Ok(report) => {
                                                 push_apply_report(&mut app, &report);
@@ -602,7 +872,7 @@ pub async fn run(
                                     }
                                 }
                                 Action::CommitAllChanges => {
-                                    match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                    match open_panel_fs(&workspace_root_for_panel, &review_scope) {
                                         Ok(fs) => match fs.apply(&ApplyOptions {
                                             only_glob: None,
                                             only_paths: None,
@@ -620,7 +890,7 @@ pub async fn run(
                                     }
                                 }
                                 Action::DiscardChanges => {
-                                    match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                    match open_panel_fs(&workspace_root_for_panel, &review_scope) {
                                         Ok(fs) => match fs.discard() {
                                             Ok(()) => app.transcript.push(app::TranscriptItem::Info(
                                                 "discarded changes".to_string(),
@@ -635,7 +905,7 @@ pub async fn run(
                                     }
                                 }
                                 Action::ResolveChanges(only_path) => {
-                                    let fs_opt = match open_panel_fs(&workspace_root_for_panel, &staging_for_panel, cow_upper_dir_for_panel.as_deref()) {
+                                    let fs_opt = match open_panel_fs(&workspace_root_for_panel, &review_scope) {
                                         Ok(fs) => Some(fs),
                                         Err(e) => {
                                             app.apply(harness_core::AgentEvent::Error {
@@ -801,5 +1071,8 @@ pub async fn run(
         }
     }
 
-    Ok(())
+    Ok(match relaunch_into {
+        Some(workspace) => RunOutcome::Relaunch { workspace },
+        None => RunOutcome::Quit,
+    })
 }
