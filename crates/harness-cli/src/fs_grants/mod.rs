@@ -39,9 +39,9 @@ pub enum FsAction {
     Revoke { path: PathBuf },
     /// 台帳の全エントリを撤収する。
     RevokeAll,
-    /// **実在しないパスを指す台帳エントリ**を3台帳（fs-passthrough・traverse-grant・
-    /// workspace-grant）から落とす（D-53）。台帳は`preflight`が起動のたびに追記する一方、
-    /// 明示的な`revoke-*`を呼ばない限り誰も消さないため記録が積もる。
+    /// **実在しないパスを指す台帳エントリ**を4台帳（fs-passthrough・traverse-grant・
+    /// workspace-grant・workspace-capability）から落とす（D-53）。台帳は`preflight`が起動の
+    /// たびに追記する一方、明示的な`revoke-*`を呼ばない限り誰も消さないため記録が積もる。
     ///
     /// **ACEは一切撤収しない**（触るのは台帳の記録だけ）。「消えた」と確定できるのは
     /// **ボリュームルートが到達可能でかつパスが存在しない**ときだけで、未マウントの
