@@ -407,7 +407,10 @@ pub struct CompactionSettings {
 ///   "gate_multiplier": 3.0,          // 平常中央値の何倍で「疑い」状態へ入るか
 ///   "recovery_multiplier": 3.0,      // 回復に使ってよい壁時計時間 = 中央値 × これ
 ///   "short_period":  { "window": 512,  "max_period": 32, "min_repeats": 8 },
-///   "ngram":         { "window": 1024, "n": 32, "seen_ratio_max": 0.90 },
+///   "ngram":         {
+///     "window": 1024, "n": 32, "seen_ratio_max": 0.80,
+///     "min_hot_sections": 6, "min_hot_sections_suspect": 3
+///   },
 ///   "reasoning_only_ratio": 0.6      // max_tokens の何割を thinking だけで食ったら kill
 /// }
 /// ```
@@ -438,12 +441,16 @@ pub struct ShortPeriodSettings {
     pub min_repeats: Option<usize>,
 }
 
-/// `degeneracy.ngram`（②新規性率の窓・n-gram長・既出率の上限）。
+/// `degeneracy.ngram`（②新規性率の窓・n-gram長・既出率の上限・連続区間数）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct NgramSettings {
     pub window: Option<usize>,
     pub n: Option<usize>,
     pub seen_ratio_max: Option<f64>,
+    /// 平常時（異常ゲート閉）に必要な連続ホット区間数。
+    pub min_hot_sections: Option<usize>,
+    /// 疑い状態（異常ゲート開）に必要な連続ホット区間数。
+    pub min_hot_sections_suspect: Option<usize>,
 }
 
 impl DegeneracySettings {

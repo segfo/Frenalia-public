@@ -59,13 +59,15 @@ fn a_tool_call_disarms_the_no_output_detector() {
     assert_eq!(w.on_done(&StopReason::MaxTokens), None);
 }
 
-/// ④はゲートが開いて初めて評価される。統計が無ければコールドスタートの固定比率
-/// （`max_tokens × 4 × 0.75`）を超えたところで開く。
+/// ④はコールドスタート時（統計未蓄積）はゲート無しで、`max_tokens × 4 × reasoning_only_ratio`
+/// ちょうどで発火する。コールドスタートのゲート（`max_tokens × 4 × COLD_START_CHAR_RATIO = 0.75`）と
+/// ④の閾値（既定`0.6`）は**同じ量を同じ単位で見る2条件**なので、④をゲートしてしまうと
+/// 常に緩い側（0.75）が実効閾値になり、設定した0.6が黙って死ぬ（BUG-087）。
 #[test]
-fn the_reasoning_only_detector_needs_the_gate_to_open() {
+fn the_reasoning_only_detector_fires_without_a_gate_during_cold_start() {
     let d = detector();
-    // max_tokens=100 → ④の閾値は 100*4*0.6 = 240文字、ゲートは 100*4*0.75 = 300文字。
-    // つまりゲートが開くのが先に来ないので、④はゲートが開いた直後に発火する。
+    // max_tokens=100 → ④の閾値は 100*4*0.6 = 240文字。コールドスタートのゲート（300文字）
+    // より先に来るので、ゲートが一度も開かないうちに④が発火することを確認する。
     let mut w = d.watch("m", 100);
     let mut fired = None;
     for i in 0..40 {
@@ -83,7 +85,43 @@ fn the_reasoning_only_detector_needs_the_gate_to_open() {
     }
     let hit = fired.expect("thinkingだけが枠を食えば④が出る");
     assert_eq!(hit.kind, DegenerateKind::ReasoningOnly);
-    assert!(hit.reason.contains("疑い状態"), "{}", hit.reason);
+    // ゲートが一度も開いていない（コールドスタートの固定比率0.75に届く前）ことの確認。
+    assert!(!hit.reason.contains("疑い状態"), "{}", hit.reason);
+}
+
+/// 統計が温まっている（`is_warm`）場合は、④は従来どおり異常ゲートに従う
+/// （中央値という追加情報が使えるため）。平常の出力量そのものが大きい母集団では、
+/// ④の閾値を単体で超えても、ゲート（平常中央値の3倍）がまだ閉じていれば発火しない。
+#[test]
+fn the_reasoning_only_detector_still_needs_the_gate_once_warm() {
+    let d = detector();
+    let model = "reason-only-warm";
+    let max_tokens = 100;
+    // 平常の出力量を1,000文字前後で温める（中央値≈1,000 → ゲートは3,000文字で開く）。
+    for _ in 0..16 {
+        let mut baseline = d.watch(model, max_tokens);
+        baseline.on_text(&"平常の出力。".repeat(167));
+        baseline.record_clean();
+    }
+    let mut w = d.watch(model, max_tokens);
+    // ④の閾値（100*4*0.6=240文字）は超えるが、ゲート（3,000文字）には遠く届かない量。
+    let mut fired = None;
+    for i in 0..10 {
+        let chunk = format!(
+            "検討{i}: 経路{}を通る場合の前提は{}であり帰結は{}になる。",
+            i * 37 % 101,
+            i * 7 % 13,
+            i * 11 % 17
+        );
+        if let Some(hit) = w.on_thinking(&chunk) {
+            fired = Some(hit);
+            break;
+        }
+    }
+    assert!(
+        fired.is_none(),
+        "ゲートが閉じている間は④を評価しないはず: {fired:?}"
+    );
 }
 
 /// **発火理由が1行で説明できる**（§11.2）。ゲートが開いた理由が前置きされる。

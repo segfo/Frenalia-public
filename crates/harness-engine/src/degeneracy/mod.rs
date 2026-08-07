@@ -205,7 +205,14 @@ impl CallWatch<'_> {
         }
         // ④ は「thinkingだけが枠を食い潰している」ことの早期検知なので、
         // thinkingが伸びたこの瞬間にだけ評価すればよい。
-        if !open {
+        //
+        // **統計が温まっている（`is_warm`）ときだけ異常ゲートに従う。** コールドスタート時に
+        // ゲートを課すと、`cold_start_gate`（`chars > max_tokens×4×COLD_START_CHAR_RATIO`）と
+        // ④（`thinking_chars > max_tokens×4×reasoning_only_ratio`）が**同じ量を同じ単位で
+        // 見る2条件**になり、ANDで重ねた結果は常に緩い側（`COLD_START_CHAR_RATIO`）が実効閾値に
+        // なってしまう（BUG-087）。統計が温まれば中央値という別情報が使えるので、そちらは
+        // 従来どおりゲートする。
+        if self.is_warm() && !open {
             return None;
         }
         let hit = detect::reasoning_only(
@@ -239,10 +246,13 @@ impl CallWatch<'_> {
     /// ここで縮退と判定してもツールは1つも実行されていない。
     pub fn on_done(&mut self, stop_reason: &StopReason) -> Option<Degenerate> {
         let open = self.refresh_gate();
-        for w in [&self.text, &self.thinking, &self.tool_args] {
-            if let Some(hit) = w.evaluate(open) {
-                return self.finish(Some(hit));
-            }
+        let stream_hit = self
+            .text
+            .evaluate(open)
+            .or_else(|| self.thinking.evaluate(open))
+            .or_else(|| self.tool_args.evaluate(open));
+        if stream_hit.is_some() {
+            return self.finish(stream_hit);
         }
         let hit =
             detect::no_output_at_max_tokens(stop_reason, self.text.len(), self.tool_use_blocks);
@@ -259,6 +269,15 @@ impl CallWatch<'_> {
         if let Ok(mut stats) = self.detector.stats.lock() {
             stats.record_clean(self.key, sample);
         }
+    }
+
+    /// 統計母集団が判定に使えるだけ溜まっているか（`Stats::is_warm`のスナップショット）。
+    fn is_warm(&self) -> bool {
+        self.detector
+            .stats
+            .lock()
+            .map(|stats| stats.is_warm(&self.key))
+            .unwrap_or(false)
     }
 
     /// 異常ゲートを引き直す。一度開いたらこのコールの間は開いたまま（出力が伸びる方向にしか

@@ -8,13 +8,19 @@
 //! | # | 名前 | 判定 | ゲート |
 //! |---|---|---|---|
 //! | ① | 短周期反復 | 直近`window`文字の最小周期`p`が`p ≤ max_period`かつ`window/p ≥ min_repeats` | 不要（常時ON） |
-//! | ② | 新規性率 | 直近`window`文字のうち既出の`n`-gramで終わる文字の割合が`seen_ratio_max`超 | 要 |
+//! | ② | 新規性率 | `window/2`ごとの区間で既出`n`-gram比率が`seen_ratio_max`超の状態が連続`min_hot_sections`区間続く | 常時評価（ゲートは必要区間数を変える） |
 //! | ③ | 完走時の無産出 | `MaxTokens` ∧ `Text`合計0文字 ∧ `ToolUse`ゼロ | 不要（常時ON） |
-//! | ④ | reasoning-only上限 | thinking累積 > `max_tokens × 4 × ratio` ∧ `Text`/`ToolUse`がまだ0 | 要 |
+//! | ④ | reasoning-only上限 | thinking累積 > `max_tokens × 4 × ratio` ∧ `Text`/`ToolUse`がまだ0 | 統計が温まっているときのみ |
 //!
 //! ②を「反復回数」ではなく「新規性率」で定義するのは、**正当な長文と縮退を長さでは区別できない**
 //! ためである。正当な長文は最後まで新しい情報を出し続けるのに対し、縮退は新規性がゼロに漸近する。
 //! 「長い」ではなく「新しいことを言わなくなった」を測ることで、正当な長文が通ることが式として保証される。
+//!
+//! **②は「単発の閾値超過」ではなく「連続した区間で超過し続けているか」を見る。** 単発判定は
+//! 誤検知を避けるために閾値を高く（0.90）取らざるを得ず、コールドスタート時はさらに異常ゲートで
+//! 評価そのものを遅らせる必要があった（BUG-087）。連続性を証拠として要求すると、それ自体が
+//! 「これはループだ」の強い裏付けになるので、閾値を下げても誤検知は増えない。異常ゲートは
+//! 「評価するかどうか」ではなく「何区間の連続を要求するか」を変える形に変わる。
 
 use std::collections::HashMap;
 
@@ -39,11 +45,20 @@ impl Default for ShortPeriodConfig {
 }
 
 /// ②新規性率の設定（§11.6 `degeneracy.ngram`）。
+///
+/// `window`文字の窓を`window/2`ごとにずらしながら既出n-gram比率を測り、`seen_ratio_max`を
+/// 超えた区間が`min_hot_sections`（ゲート開時は`min_hot_sections_suspect`）連続したら発火する。
+/// 単発の閾値超過ではなく連続性を証拠にすることで、`seen_ratio_max`を0.90より低く取っても
+/// 誤検知が増えない（BUG-087）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NgramConfig {
     pub window: usize,
     pub n: usize,
     pub seen_ratio_max: f64,
+    /// 異常ゲートが閉じている（平常時）に必要な連続ホット区間数。
+    pub min_hot_sections: usize,
+    /// 異常ゲートが開いている（疑い状態）に必要な連続ホット区間数。平常時より少なくてよい。
+    pub min_hot_sections_suspect: usize,
 }
 
 impl Default for NgramConfig {
@@ -51,7 +66,9 @@ impl Default for NgramConfig {
         Self {
             window: 1_024,
             n: 32,
-            seen_ratio_max: 0.90,
+            seen_ratio_max: 0.80,
+            min_hot_sections: 6,
+            min_hot_sections_suspect: 3,
         }
     }
 }
@@ -84,6 +101,15 @@ pub struct StreamWatcher {
     gram_hashes: Vec<u64>,
     /// 次に評価する文字数のしきい。
     next_eval_at: usize,
+    /// ②の次の区間境界（この文字数に達したら1区間分の既出率を測る）。`window`刻みで開始し、
+    /// 以後`window/2`ずつ進む。
+    next_section_at: usize,
+    /// 直近まで連続してホット（既出率が`seen_ratio_max`超）だった区間数。
+    hot_run: usize,
+    /// 直近に測った区間の既出率（発火理由の文言・テストの観測点）。
+    last_section_ratio: f64,
+    /// これまでに測った区間既出率の最大値（テストで実測の余裕を固定する観測点）。
+    max_section_ratio: f64,
 }
 
 impl StreamWatcher {
@@ -95,7 +121,22 @@ impl StreamWatcher {
             first_seen: HashMap::new(),
             gram_hashes: Vec::new(),
             next_eval_at: EVAL_STRIDE,
+            next_section_at: ngram.window,
+            hot_run: 0,
+            last_section_ratio: 0.0,
+            max_section_ratio: 0.0,
         }
+    }
+
+    /// 直近に測った②の区間既出率。テスト・観測用。
+    pub fn last_section_ratio(&self) -> f64 {
+        self.last_section_ratio
+    }
+
+    /// これまでに測った②の区間既出率の最大値。テスト・観測用
+    /// （誤検知してはならない入力が閾値へどれだけ余裕を持っているかを固定する）。
+    pub fn max_section_ratio(&self) -> f64 {
+        self.max_section_ratio
     }
 
     pub fn len(&self) -> usize {
@@ -128,14 +169,14 @@ impl StreamWatcher {
     }
 
     /// 蓄積が止まった時点で明示的に評価する（`EVAL_STRIDE`の刻みで取りこぼした末尾ぶん）。
-    pub fn evaluate(&self, gate_open: bool) -> Option<(DegenerateKind, String)> {
+    ///
+    /// `&mut self`なのは、②が区間境界を跨ぐたびに`hot_run`を更新する内部状態を持つため。
+    pub fn evaluate(&mut self, gate_open: bool) -> Option<(DegenerateKind, String)> {
         if let Some(reason) = self.short_period_reason() {
             return Some((DegenerateKind::ShortPeriodRepeat, reason));
         }
-        if gate_open {
-            if let Some(reason) = self.novelty_reason() {
-                return Some((DegenerateKind::NoveltyCollapse, reason));
-            }
+        if let Some(reason) = self.novelty_reason(gate_open) {
+            return Some((DegenerateKind::NoveltyCollapse, reason));
         }
         None
     }
@@ -159,38 +200,69 @@ impl StreamWatcher {
         ))
     }
 
-    /// ② 直近`window`文字のうち、既出のn-gramで終わる文字の割合。
-    fn novelty_reason(&self) -> Option<String> {
+    /// ② `window/2`ごとの区間で既出n-gram比率を測り、`seen_ratio_max`超が連続する区間数を数える。
+    ///
+    /// `gate_open`はホット区間の測定自体には関係しない（証拠はゲート状態に関係なく積む）。
+    /// 使うのは「何区間連続したら発火とみなすか」の判定だけ——ゲートが閉じている平常時は
+    /// より多くの連続を要求し、開いている疑い状態では少ない連続で発火させる。
+    fn novelty_reason(&mut self, gate_open: bool) -> Option<String> {
         let cfg = self.ngram;
         // 窓を埋めるだけの分量が無いうちは判定しない（短い出力を誤って捕まえないため）。
-        if self.chars.len() < cfg.window || cfg.n == 0 || cfg.window < cfg.n {
+        if cfg.n == 0 || cfg.window < cfg.n {
             return None;
         }
-        let window_start = self.chars.len() - cfg.window;
+        // 大きなデルタが複数区間を跨いでも取りこぼさないよう、追いつくまで処理する。
+        let step = (cfg.window / 2).max(1);
+        while self.chars.len() >= self.next_section_at {
+            let ratio = self.section_ratio(self.next_section_at, cfg.window, cfg.n);
+            self.last_section_ratio = ratio;
+            self.max_section_ratio = self.max_section_ratio.max(ratio);
+            if ratio > cfg.seen_ratio_max {
+                self.hot_run += 1;
+            } else {
+                self.hot_run = 0;
+            }
+            self.next_section_at += step;
+        }
+        let required = if gate_open {
+            cfg.min_hot_sections_suspect
+        } else {
+            cfg.min_hot_sections
+        };
+        if required == 0 || self.hot_run < required {
+            return None;
+        }
+        Some(format!(
+            "直近{}文字中{}区間連続で既出率が{:.0}%を超えた（直近区間{:.0}%、{}-gram、閾値{:.0}%）",
+            cfg.window,
+            self.hot_run,
+            cfg.seen_ratio_max * 100.0,
+            self.last_section_ratio * 100.0,
+            cfg.n,
+            cfg.seen_ratio_max * 100.0
+        ))
+    }
+
+    /// `end`文字目までの`window`文字窓における既出n-gram比率。
+    fn section_ratio(&self, end: usize, window: usize, n: usize) -> f64 {
+        let window_start = end.saturating_sub(window);
+        if end < window_start + n {
+            return 0.0;
+        }
         let mut counted = 0usize;
         let mut seen = 0usize;
-        for end in (window_start + cfg.n)..=self.chars.len() {
-            let hash = self.gram_hashes[end - cfg.n];
+        for pos in (window_start + n)..=end {
+            let hash = self.gram_hashes[pos - n];
             counted += 1;
             // `track_ngram`が全位置を記録済みなので、初出位置が今より前なら「既出」。
-            if self.first_seen.get(&hash).is_some_and(|first| *first < end) {
+            if self.first_seen.get(&hash).is_some_and(|first| *first < pos) {
                 seen += 1;
             }
         }
         if counted == 0 {
-            return None;
+            return 0.0;
         }
-        let ratio = seen as f64 / counted as f64;
-        if ratio <= cfg.seen_ratio_max {
-            return None;
-        }
-        Some(format!(
-            "直近{}文字の{:.0}%が既出の{}-gram（閾値{:.0}%）",
-            cfg.window,
-            ratio * 100.0,
-            cfg.n,
-            cfg.seen_ratio_max * 100.0
-        ))
+        seen as f64 / counted as f64
     }
 
     /// 末尾で終わるn-gramのハッシュと初出位置を記録する（1文字追加ごとに1件）。
