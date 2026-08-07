@@ -5,6 +5,31 @@
 
 use super::*;
 
+/// walk中に対象ノードが消えていた（TOCTOU）ときの扱い。[`collect_dirs_and_files`]の呼び出し
+/// 側が**必ず選ぶ**——既定を置かないのは、この選択が経路ごとに正反対だからである。
+///
+/// [BUG-084](../../../../docs/bugs/BUG-084.md): 元は[`Self::Abort`]相当の挙動しか無く、
+/// `.harness/`の制御面保護（[`super::protect_harness_control_dir_from_appcontainer`]）が
+/// **ツリーの深い位置でファイルが1つ消えただけで1ノードも保護せずに`Ok`を返して**いた。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnVanished {
+    /// walk全体を`Err`で中断する。**列挙が完全であること自体を根拠に使う**経路向け
+    /// （撤収完全性の検証`assert_no_sid_ace_recursive`のように、「見えた範囲にACEが無い」を
+    /// 「ACEが無い」と読み替える経路では、黙って範囲が縮むと結論が嘘になる）。
+    Abort,
+    /// 消えたノードだけを飛ばして続行する。**残っているノードへ副作用を適用することが目的**の
+    /// 経路向け（消えたノードにACEを付ける/剥がす必要は無く、そこで打ち切ると**残り全部**が
+    /// 未処理のまま「成功」になる）。
+    Skip,
+}
+
+impl OnVanished {
+    /// このエラーを「ノードが消えていた」として飛ばしてよいか。
+    fn tolerates(self, e: &std::io::Error) -> bool {
+        self == Self::Skip && e.kind() == std::io::ErrorKind::NotFound
+    }
+}
+
 /// `path`が指すディレクトリ配下を、シンボリックリンク/リパースポイントを辿らずに再帰列挙する。
 /// 悪意あるsymlinkを辿ってworkspace外へpackage SIDの書込許可を誤って付与するスコープ逸脱を
 /// 防ぐため、`WorkspaceJail::walk_dir`の`is_symlink()`スキップと同じガードを独立に実装する
@@ -20,21 +45,44 @@ use super::*;
 /// なる。スコープが意図せず広がる・誤ったパスへ書き込む等の安全性の問題は無く、純粋に
 /// エラーメッセージの特定精度の話に留まる。直す場合は本関数の戻り値を
 /// `Result<(), (std::path::PathBuf, std::io::Error)>`のように失敗ノードを含む形へ変更する。
+///
+/// **そのTOCTOUを`Err`にするか飛ばすかは`on_vanished`で呼び出し側が選ぶ**（[`OnVanished`]、
+/// BUG-084）。飛ばす側を選んだ経路は、列挙が縮み得ることを前提に**処理できた件数を戻り値へ
+/// 載せる**こと——「打ち切ったのか全部やったのか」を呼び出し側が区別できなくなるため。
 pub(crate) fn collect_dirs_and_files(
     root: &Path,
     dirs: &mut Vec<std::path::PathBuf>,
     files: &mut Vec<std::path::PathBuf>,
+    on_vanished: OnVanished,
 ) -> std::io::Result<()> {
     dirs.push(root.to_path_buf());
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        // 消えたディレクトリは「配下に対象が1件も無い」のと同じ。自分自身を`dirs`から
+        // 取り消して（`push`の直後なので`pop`で正確に戻る）、walk全体は続ける。
+        Err(e) if on_vanished.tolerates(&e) => {
+            dirs.pop();
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if on_vanished.tolerates(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) if on_vanished.tolerates(&e) => continue,
+            Err(e) => return Err(e),
+        };
         if file_type.is_symlink() {
             continue;
         }
         let path = entry.path();
         if file_type.is_dir() {
-            collect_dirs_and_files(&path, dirs, files)?;
+            collect_dirs_and_files(&path, dirs, files, on_vanished)?;
         } else if file_type.is_file() {
             files.push(path);
         }
@@ -115,6 +163,25 @@ pub(crate) enum DaclWrite {
     /// 子孫へのauto-inherit再伝播を伴う（[`set_dacl_propagating`]）。
     /// 継承ありACEを既存ツリー全体へ行き渡らせたいときだけ使う。
     Propagate,
+}
+
+/// 冪等スキップ（「既にsid宛の明示ACEが要求マスクの上位集合を持っていれば書込を省く」）を
+/// 行うかどうか。[BUG-082](../../../../docs/bugs/BUG-082.md) Part Bで新設——既定
+/// （`SkipIfSufficient`）は変えないが、rootへ**伝播だけを目的に**無条件で書きたい呼び出し
+/// （[`propagate_workspace_root_grant`]）が現れたため、`DaclWrite`を導入したときと同じ作法
+/// （呼び出し側に明示させる）で分離する。
+///
+/// **`Always`が要る理由**: `preflight`の同期区間で先に`DaclWrite::SingleObject`のrootのみ
+/// 書込（B1の高速パス）を行うと、rootは以後「充足済み」に見える。その後background jobが
+/// 同じ内容を`DaclWrite::Propagate`で書こうとしても、既定の冪等スキップに引っかかって
+/// **伝播そのものが黙って起きない**——BUG-081層1（伝播を使う高速経路が、伝播しない書込APIへ
+/// 差し替えられていたのに機能は壊れず気付かれなかった）と同型の罠。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdempotentCheck {
+    /// 既存ACEが要求マスクを満たしていれば書込を省く（既定の挙動、全既存呼び出しはこちら）。
+    SkipIfSufficient,
+    /// 既存の状態を見ずに常に書き込む。rootへの伝播を無条件に発生させたいときだけ使う。
+    Always,
 }
 
 /// `new_dacl`を`path`へ設定し、**OSに子孫への再伝播をさせる**（`SetNamedSecurityInfoW`）。
@@ -317,7 +384,9 @@ pub(crate) fn grant_ace_mask(
 }
 
 /// [`grant_ace_mask`]の書込モード指定版。既定（`SingleObject`）以外を使うのは
-/// `grant_ace_inheritable_*`のroot付与だけ（[`DaclWrite`]のdoc参照）。
+/// `grant_ace_inheritable_*`のroot付与だけ（[`DaclWrite`]のdoc参照）。冪等スキップは常に
+/// 行う（[`IdempotentCheck::SkipIfSufficient`]）——それ以外が要る呼び出しは
+/// [`grant_ace_mask_with_checked`]を直接使う。
 pub(crate) fn grant_ace_mask_with(
     path: &Path,
     sid: PSID,
@@ -325,13 +394,36 @@ pub(crate) fn grant_ace_mask_with(
     inheritance: windows::Win32::Security::ACE_FLAGS,
     write: DaclWrite,
 ) -> Result<(), AppContainerError> {
+    grant_ace_mask_with_checked(
+        path,
+        sid,
+        access,
+        inheritance,
+        write,
+        IdempotentCheck::SkipIfSufficient,
+    )
+}
+
+/// [`grant_ace_mask_with`]の実体。冪等スキップの有無まで呼び出し側に明示させる版
+/// （[`IdempotentCheck`]のdoc参照）。`SkipIfSufficient`以外を渡すのは
+/// [`propagate_workspace_root_grant`]（`grant_job`の背景フェーズ）だけ。
+pub(crate) fn grant_ace_mask_with_checked(
+    path: &Path,
+    sid: PSID,
+    access: u32,
+    inheritance: windows::Win32::Security::ACE_FLAGS,
+    write: DaclWrite,
+    idempotent: IdempotentCheck,
+) -> Result<(), AppContainerError> {
     // 冪等スキップ: 既にsid宛の明示ACEが要求マスクの上位集合を持っていれば
     // `SetNamedSecurityInfoW`（プロファイルルート近傍で病的に遅くなりうる、BUG-011）を
     // 呼ばずに済ませる。継承フラグの相違までは見ない（`inheritance`は`grant_ace_mask`の
     // 呼び出しパターン上、同一pathへ複数の異なる継承指定で呼ばれることが無いため）。
-    if let Ok(Some(existing)) = sid_ace_mask(path, sid) {
-        if existing & access == access {
-            return Ok(());
+    if matches!(idempotent, IdempotentCheck::SkipIfSufficient) {
+        if let Ok(Some(existing)) = sid_ace_mask(path, sid) {
+            if existing & access == access {
+                return Ok(());
+            }
         }
     }
     let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
@@ -430,7 +522,7 @@ fn grant_ace_propagating(root: &Path, sid: PSID) -> Result<(), AppContainerError
 pub fn grant_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
+    collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
         AppContainerError::AclGrant {
             path: root.to_path_buf(),
             reason: e.to_string(),
@@ -492,7 +584,7 @@ fn grant_ace_ro(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainer
 pub fn grant_ace_recursive_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
+    collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
         AppContainerError::AclGrant {
             path: root.to_path_buf(),
             reason: e.to_string(),
@@ -589,7 +681,7 @@ pub fn fix_descendants_missing_ace(
 ) -> Result<DescendantFixReport, AppContainerError> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
+    collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
         AppContainerError::AclGrant {
             path: root.to_path_buf(),
             reason: e.to_string(),
@@ -706,5 +798,67 @@ pub fn grant_workspace_root_ro(root: &Path, sid: PSID) -> Result<(), AppContaine
     let mut timing = PhaseTiming::start();
     grant_ace_access_propagating(root, sid, FsAccess::ReadExec)?;
     timing.mark("  ro: propagating root grant");
+    Ok(())
+}
+
+/// [BUG-082 Part B] [`grant_workspace_root_rw`]の**伝播なし**版。`preflight`の同期区間は
+/// これを使う。
+///
+/// tier判定（`smoke_test_spawn`）に必要なのはrootのDACL自体にcapability SIDのACEが
+/// 載っていることだけで、**既存の子孫への伝播は不要**——`smoke_test_spawn`が使う`probe_dir`は
+/// preflightがその場で新規作成するディレクトリであり、Windowsは新規オブジェクト作成時に
+/// 親の**現在の**DACLから継承ACLを都度計算するため、既存子孫への伝播が未完でも正しく
+/// ACEを継承する。既存子孫への伝播（コストの本体、実測20秒超）は`grant_job`の背景フェーズ
+/// （[`propagate_workspace_root_grant`]）へ委ねる——この関数は常にミリ秒オーダーになる
+/// （`DaclWrite::SingleObject`、[`grant_ace`]と同じ土台）。
+pub fn grant_workspace_root_rw_fast(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    if !root.is_dir() {
+        return grant_ace(root, sid, false);
+    }
+    let mut timing = PhaseTiming::start();
+    grant_ace(root, sid, true)?;
+    timing.mark("  rw: fast (single-object) root grant");
+    Ok(())
+}
+
+/// [`grant_workspace_root_rw_fast`]のread-only版（`--cow`のworkspace本体、D-30）。
+pub fn grant_workspace_root_ro_fast(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    if let Some(result) = grant_ace_access_if_file(root, sid, FsAccess::ReadExec) {
+        return result;
+    }
+    let mut timing = PhaseTiming::start();
+    grant_ace_ro(root, sid, true)?;
+    timing.mark("  ro: fast (single-object) root grant");
+    Ok(())
+}
+
+/// [BUG-082 Part B] rootへの継承ACE伝播を**冪等チェック無しで無条件に**行う。`grant_job`の
+/// 背景フェーズだけが使う。
+///
+/// **`IdempotentCheck::Always`が必須の理由**: `preflight`の同期区間で先に
+/// `grant_workspace_root_rw_fast`/`_ro_fast`（`DaclWrite::SingleObject`）を通しているため、
+/// この時点でrootは既に「sid宛のACEが要求マスクを満たしている」ように見える。通常の
+/// `grant_ace_mask_with`（`IdempotentCheck::SkipIfSufficient`）を使うと、この冪等スキップが
+/// 効いて**伝播そのものが呼ばれない**——[BUG-081](../../../../docs/bugs/BUG-081.md)層1
+/// （伝播を使う高速経路が、伝播しない書込APIへ差し替えられ、機能は壊れないまま無症状に
+/// 退化していた）とまったく同じ形の罠なので、ここは意図を明示する専用関数にする。
+///
+/// `mask`は呼び出し側（`preflight`）が`workspace_mask`としてRWX/ROいずれかを渡す
+/// （`grant_job::start`の他の引数と同じ`mask`をそのまま使う）。
+pub(crate) fn propagate_workspace_root_grant(
+    root: &Path,
+    sid: PSID,
+    mask: u32,
+) -> Result<(), AppContainerError> {
+    let mut timing = PhaseTiming::start();
+    grant_ace_mask_with_checked(
+        root,
+        sid,
+        mask,
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+        DaclWrite::Propagate,
+        IdempotentCheck::Always,
+    )?;
+    timing.mark("  background: propagating root grant (unconditional)");
     Ok(())
 }

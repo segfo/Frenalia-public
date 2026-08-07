@@ -154,7 +154,30 @@ pub(super) async fn prepare_mcp_servers(
 
     #[cfg(windows)]
     for decl in stdio_decls {
-        let mut prepared = match harness_mcp::sandbox::prepare(&decl, workspace_root) {
+        // [BUG-085] `sandbox::prepare`は**同期**である。ACL書込に加えて、内部で
+        // `grant_job::wait_until_done()`（`std::thread::sleep`で最大300秒回る）を通るため、
+        // この`async fn`から直接呼ぶとtokioのワーカースレッドを待ち時間ぶん専有する。
+        // `run_shell`側（`harness-tools`の`run_windows_tier2a`）は同じ関数を
+        // `spawn_blocking`で包む規約を持っていたが、この経路には届いていなかった。
+        let decl_for_prepare = decl.clone();
+        let workspace_for_prepare = workspace_root.to_path_buf();
+        let prepare_result = tokio::task::spawn_blocking(move || {
+            harness_mcp::sandbox::prepare(&decl_for_prepare, &workspace_for_prepare)
+        })
+        .await;
+        let prepare_result = match prepare_result {
+            Ok(result) => result,
+            Err(join_err) => {
+                startup.skipped.push(SkippedServer {
+                    id: decl.id.clone(),
+                    reason: harness_mcp::SkipReason::IsolationUnavailable(format!(
+                        "the appcontainer preflight task for this server panicked: {join_err}"
+                    )),
+                });
+                continue;
+            }
+        };
+        let mut prepared = match prepare_result {
             Ok(outcome) => {
                 for warning in outcome.warnings {
                     eprintln!("warning: {warning}");

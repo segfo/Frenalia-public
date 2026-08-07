@@ -5,6 +5,17 @@
 
 use super::*;
 
+/// [BUG-083](../../../../docs/bugs/BUG-083.md) の実測プローブ。
+///
+/// **他のテストモジュールと違い`win_appcontainer.rs`ではなくここで宣言する。** 測定対象が
+/// このモジュールのprivate関数（[`set_dacl_single_object_with_protection`]・
+/// [`copy_dacl_excluding_sids`]・[`remove_sid_aces_and_protect`]）そのものであり、
+/// 兄弟モジュールからは触れないためである。ファイルを分けているのは
+/// `docs/CODE-STRUCTURE-RULES.md`規則2（`#[path]`での分割は明示的に許容）に従う。
+#[cfg(all(windows, test))]
+#[path = "dacl_protection_probe_tests.rs"]
+mod dacl_protection_probe_tests;
+
 /// `ACCESS_ALLOWED_ACE_TYPE`（WinNT.h）。`windows`クレートはこの値を定数として公開して
 /// いないため、既知の固定値としてここに置く。
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -12,7 +23,7 @@ const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 /// Allow ACEと同じSID照合で取り除く。
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
-/// [BUG-020の修正] `dacl`から`sid`宛のAllow/Deny ACEだけを取り除いた新しいDACLを、
+/// [BUG-020の修正] `dacl`から`sids`のいずれかに一致するAllow/Deny ACEを取り除いた新しいDACLを、
 /// 対象外のACEは`GetAce`で読んだ生バイト列のまま`AddAce`でコピーして構築する（trustee・
 /// access mask・`AceFlags`——`INHERITED_ACE`を含め——を一切変更しない）。
 ///
@@ -22,17 +33,24 @@ const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 /// 「凍結」（全ACEを明示化し継承を遮断）してから`REVOKE_ACCESS`をかけていた。しかしこの凍結は
 /// 対象`sid`と無関係な他trusteeのACEも含めてノードを継承から永久に切り離す副作用があり、
 /// `revoke_ace_recursive`が対象ツリー全体の継承を破壊するバグ（BUG-020、docs/bugs/BUG-020.md）
-/// を引き起こした。ここではACEを1件ずつ生のまま読み対象`sid`以外はそのままコピーするため、
-/// `INHERITED_ACE`フラグの有無に関わらず対象`sid`だけを正確に取り除ける。DACLの保護状態
+/// を引き起こした。ここではACEを1件ずつ生のまま読み対象`sids`以外はそのままコピーするため、
+/// `INHERITED_ACE`フラグの有無に関わらず対象だけを正確に取り除ける。DACLの保護状態
 /// （`SE_DACL_PROTECTED`）はこの関数の外で呼び出し側が読み取り・維持する（`revoke_ace`参照）。
 ///
 /// Allow/Deny以外のACE種別（このコードベースが自ら書き込むことはない）は
 /// trusteeを解釈せず常に保持する（未知の種別を誤って消さない安全側の判断）。
-unsafe fn copy_dacl_excluding_sid(
+///
+/// 戻り値の`usize`は実際に取り除いたACE件数。**呼び出し側はこれが0なら書込そのものを
+/// 省略できる**（[BUG-082](../../../../docs/bugs/BUG-082.md)）——`revoke_ace_unguarded`は
+/// 対象SIDが1本も無いノードで高価な`CreateFileW(WRITE_DAC)`＋`SetKernelObjectSecurity`を
+/// 省くためにこれを使う。ただし`remove_sid_aces_and_protect`のように書込の目的がACE除去では
+/// なく`SE_DACL_PROTECTED`の設定にある場合は、0件でも書込を省略してはならない
+/// （呼び出し側ごとに判断する。この関数自体は判断を持たない）。
+unsafe fn copy_dacl_excluding_sids(
     dacl: *const ACL,
-    sid: PSID,
+    sids: &[PSID],
     buf: &mut Vec<u8>,
-) -> windows::core::Result<*mut ACL> {
+) -> windows::core::Result<(*mut ACL, usize)> {
     unsafe {
         let mut size_info = ACL_SIZE_INFORMATION::default();
         GetAclInformation(
@@ -49,6 +67,7 @@ unsafe fn copy_dacl_excluding_sid(
         let new_dacl = buf.as_mut_ptr() as *mut ACL;
         InitializeAcl(new_dacl, buf_size, ACL_REVISION)?;
 
+        let mut removed = 0usize;
         for i in 0..size_info.AceCount {
             let mut ace_ptr: *mut c_void = std::ptr::null_mut();
             GetAce(dacl, i, &mut ace_ptr)?;
@@ -60,12 +79,14 @@ unsafe fn copy_dacl_excluding_sid(
                 // ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE share the Mask/SidStart layout.
                 let allowed = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
                 let entry_sid = PSID((&allowed.SidStart) as *const u32 as *mut c_void);
-                EqualSid(entry_sid, sid).is_ok()
+                sids.iter().any(|&sid| EqualSid(entry_sid, sid).is_ok())
             } else {
                 false
             };
 
-            if !is_target {
+            if is_target {
+                removed += 1;
+            } else {
                 AddAce(
                     new_dacl,
                     ACL_REVISION,
@@ -76,7 +97,7 @@ unsafe fn copy_dacl_excluding_sid(
             }
         }
 
-        Ok(new_dacl)
+        Ok((new_dacl, removed))
     }
 }
 
@@ -84,6 +105,20 @@ unsafe fn copy_dacl_excluding_sid(
 /// かどうか）も明示的に指定する。`grant_ace_mask`用の`set_dacl_single_object`は意図的に
 /// この状態へ触れない（呼び出し元が継承の有無を問わないため）が、`revoke_ace`は「対象sidを
 /// 取り除いた後、ノードの継承状態を呼び出し前と同じに保つ」ために必要とする。
+///
+/// **[BUG-083の修正] 保護状態はセキュリティ記述子自身の制御ビットで宣言する。**
+/// `SetKernelObjectSecurity`（＝`NtSetSecurityObject`）は`SECURITY_INFORMATION`引数の
+/// `PROTECTED_DACL_SECURITY_INFORMATION`／`UNPROTECTED_DACL_SECURITY_INFORMATION`修飾子を
+/// **無視する**——同じ情報を渡す口が2つあり、どちらが効くかは呼ぶ関数で違う。aclapi
+/// （`SetNamedSecurityInfoW`）は修飾子を解釈するが、カーネル経路は解釈せずSDのControlだけを見る。
+/// 修飾子だけを渡していた旧実装では`SE_DACL_PROTECTED`が一度も立たず、D-05/D-09が意図する
+/// `.harness/**`の継承遮断が実機で機能していなかった
+/// （[BUG-083](../../../../docs/bugs/BUG-083.md)、6経路の比較実測は
+/// `dacl_protection_probe_tests.rs`）。
+///
+/// 書込APIは`SetKernelObjectSecurity`のままにしてある。aclapiでも保護は立つが、それは
+/// BUG-011/013のハング（ツリー走査と継承の自動再計算）を招く経路であり、**保護のために
+/// aclapiへ戻す必要は無い**ことが同じ実測で分かっている。
 unsafe fn set_dacl_single_object_with_protection(
     path: &Path,
     new_dacl: *mut ACL,
@@ -106,6 +141,19 @@ unsafe fn set_dacl_single_object_with_protection(
         let result = (|| -> windows::core::Result<()> {
             InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION)?;
             SetSecurityDescriptorDacl(sd_ptr, true, Some(new_dacl as *const _), false)?;
+            // [BUG-083] 実際に効くのはこちら。両方向を明示するのは、`protected=false`の
+            // 「保護を外す／外れたままにする」も`revoke_sids_from_node`が依存する契約だからである
+            // （`InitializeSecurityDescriptor`直後はたまたま0だが、それに寄りかからない）。
+            SetSecurityDescriptorControl(
+                sd_ptr,
+                SE_DACL_PROTECTED,
+                if protected {
+                    SE_DACL_PROTECTED
+                } else {
+                    SECURITY_DESCRIPTOR_CONTROL(0)
+                },
+            )?;
+            // 修飾子は無視されるが、意図の表明として残す（読み手に「保護を書いている」と伝わる）。
             let protection_flag = if protected {
                 PROTECTED_DACL_SECURITY_INFORMATION
             } else {
@@ -119,7 +167,80 @@ unsafe fn set_dacl_single_object_with_protection(
     }
 }
 
-fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
+/// `path`のDACL制御ビット（`SECURITY_DESCRIPTOR_CONTROL`）を読む。
+///
+/// [`dacl_is_protected`]・[`unprotect_harness_control_dir`]・BUG-083のプローブが共有する。
+/// `revoke_sids_from_node`だけは既に`GetNamedSecurityInfoW`のSDを手元に持っているので、
+/// 読取を二重にしないため`GetSecurityDescriptorControl`を直接呼んでいる。
+fn dacl_control(path: &Path) -> windows::core::Result<u16> {
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        let result = GetSecurityDescriptorControl(sd, &mut control, &mut revision);
+        let _ = LocalFree(HLOCAL(sd.0));
+        result?;
+        Ok(control)
+    }
+}
+
+/// `path`のDACLが`SE_DACL_PROTECTED`（祖先からの継承を受け付けない状態）かどうか。
+///
+/// [BUG-083](../../../../docs/bugs/BUG-083.md)の修正以降、`.harness/**`はこれが`true`である
+/// ことが期待される不変条件になった。**「サンドボックスから書けない」の根拠そのものではない**
+/// （それはACEが物理的に無いこと）が、以後の再伝播を止める第1の防御である。
+/// [BUG-084] 本番経路はノードの消失を許容する必要があるので[`dacl_protection_state`]を使う。
+/// **こちらはテスト用**——「保護が立っているか」を二値で断言したいテストのための薄いラッパで、
+/// 消えていたら（測定が成立していないので）`Err`にする。
+#[cfg(test)]
+pub(crate) fn dacl_is_protected(path: &Path) -> Result<bool, AppContainerError> {
+    dacl_protection_state(path)?.ok_or_else(|| AppContainerError::AclRevoke {
+        path: path.to_path_buf(),
+        reason: "the node vanished while reading its DACL protection state".to_string(),
+    })
+}
+
+/// [`dacl_is_protected`]の、**ノードが消えていることを許容する**版（BUG-084）。
+/// `None`は「walkで見つけてから読むまでの間に消えた」ことだけを意味する（[`is_vanished`]）。
+fn dacl_protection_state(path: &Path) -> Result<Option<bool>, AppContainerError> {
+    match dacl_control(path) {
+        Ok(control) => Ok(Some(control & SE_DACL_PROTECTED.0 != 0)),
+        Err(e) if is_vanished(&e) => Ok(None),
+        Err(e) => Err(AppContainerError::AclRevoke {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        }),
+    }
+}
+
+/// Win32のエラーが「対象がもう存在しない」ものか（[BUG-084](../../../../docs/bugs/BUG-084.md)）。
+///
+/// `.harness/`の保護はwalkで集めたノードへ後から適用するので、集めてから触るまでの間に
+/// 消えることがある（harness自身が`.harness/`へ書いている最中に背景スレッドから走る）。
+/// 消えたノードは**保護する対象が無い**のであって失敗ではない。
+fn is_vanished(e: &windows::core::Error) -> bool {
+    e.code() == ERROR_FILE_NOT_FOUND.to_hresult() || e.code() == ERROR_PATH_NOT_FOUND.to_hresult()
+}
+
+/// `path`から`sid`宛のACEを剥がし、DACLの継承を切る。
+///
+/// 戻り値は**このノードが保護された状態になったか**。`false`は「walkで見つけてから触るまでの
+/// 間に消えた」ことだけを意味する（[`is_vanished`]）。エラーは`Err`のままで、握り潰さない。
+fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<bool, AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -128,7 +249,7 @@ fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<(), AppContaine
         let path_w = long_path_wide(path);
         let mut existing_dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = PSECURITY_DESCRIPTOR::default();
-        GetNamedSecurityInfoW(
+        if let Err(e) = GetNamedSecurityInfoW(
             PCWSTR(path_w.as_ptr()),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
@@ -139,20 +260,44 @@ fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<(), AppContaine
             &mut sd,
         )
         .ok()
-        .map_err(to_err)?;
+        {
+            return if is_vanished(&e) { Ok(false) } else { Err(to_err(e)) };
+        }
 
         let mut new_buf: Vec<u8> = Vec::new();
-        let new_dacl = match copy_dacl_excluding_sid(existing_dacl as *const _, sid, &mut new_buf) {
-            Ok(dacl) => dacl,
-            Err(e) => {
-                let _ = LocalFree(HLOCAL(sd.0));
-                return Err(to_err(e));
-            }
-        };
+        let (new_dacl, removed) =
+            match copy_dacl_excluding_sids(existing_dacl as *const _, &[sid], &mut new_buf) {
+                Ok(result) => result,
+                Err(e) => {
+                    let _ = LocalFree(HLOCAL(sd.0));
+                    return Err(to_err(e));
+                }
+            };
+        // 保護済みかは、既に手元にあるSDから読む（`dacl_is_protected`を呼ぶと同じノードを
+        // もう一度`GetNamedSecurityInfoW`することになる）。
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        let control_result = GetSecurityDescriptorControl(sd, &mut control, &mut revision);
         let _ = LocalFree(HLOCAL(sd.0));
-        set_dacl_single_object_with_protection(path, new_dacl, true).map_err(to_err)?;
+        control_result.map_err(to_err)?;
+
+        // [BUG-082と同型の冪等スキップ、BUG-083の修正で初めて成立] 剥がすACEが1本も無く、かつ
+        // 既に保護済みなら、このノードに対してこの関数がすることは何も無い。書込を省いて
+        // 高価な`CreateFileW(WRITE_DAC)`＋`SetKernelObjectSecurity`を避ける。
+        // **保護が立たなかった頃はこの判定が常に偽で、毎起動・全ノードを書き直していた。**
+        // 保護は`preflight`の同期区間と`grant_job`のフェーズ0.5の2回掛かるので効きは大きい。
+        if removed == 0 && control & SE_DACL_PROTECTED.0 != 0 {
+            return Ok(true);
+        }
+
+        // `new_dacl`は`new_buf`（このスコープで生きている自前バッファ）の中を指す。上の
+        // `LocalFree`が解放したのは読取用SD（コピー元）なので、書き戻しにはそのまま使える。
+        match set_dacl_single_object_with_protection(path, new_dacl, true) {
+            Ok(()) => Ok(true),
+            Err(e) if is_vanished(&e) => Ok(false),
+            Err(e) => Err(to_err(e)),
+        }
     }
-    Ok(())
 }
 
 /// `.harness/**`（制御面）をサンドボックスから隔離する（D-05/D-09の層3）。各ノードから
@@ -163,33 +308,166 @@ fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<(), AppContaine
 /// capability SID宛になったので、`.harness/`へ降りてくる主体もそれになる。一方、過去の
 /// セッションがpackage SID宛に付けたACEも実マシンには残り得る（D-37時代の残骸）。**どちらか
 /// 一方だけを剥がすと、剥がし残した側から制御面が書ける**ので、両方を渡して剥がす。
+/// **戻り値は実際に保護した状態にできたノード数**（[BUG-084](../../../../docs/bugs/BUG-084.md)）。
+/// 姉妹関数[`unprotect_harness_control_dir`]が解除件数を返すのと対称にしてある——D-05/D-09の
+/// 層3は「掛けたつもりで1件も掛かっていない」が症状として出ない機構なので（[BUG-083]は
+/// まさにそれがこの実機で恒常的に起きていた）、掛けた側にも件数の裏取り手段が要る。
 pub(crate) fn protect_harness_control_dir_from_appcontainer(
     workspace_root: &Path,
     sids: &[PSID],
-) -> Result<(), AppContainerError> {
+) -> Result<usize, AppContainerError> {
     let harness_dir = workspace_root.join(".harness");
-    if !harness_dir.exists() {
-        return Ok(());
+    // 剥がす主体が空なら保護は1件も掛からない。「全ノード保護済み」と数えないための番兵
+    // （呼び出し側は常に1つ以上渡すが、件数を返す関数が嘘をつく余地は残さない）。
+    if sids.is_empty() || !harness_dir.exists() {
+        return Ok(0);
     }
 
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(&harness_dir, &mut dirs, &mut files).map_err(|e| {
+    // [BUG-084] `OnVanished::Skip`。ツリーの一部が消えているのは実運用で普通に起こる
+    // ——`grant_job`の背景フェーズ0.5からここが呼ばれる間、harness自身が`.harness/`へ
+    // 書いている（セッションJSONL・ログ・cognition scratch）し、ユーザーがharness実行中に
+    // リポジトリを消すこともあれば、`preflight`を呼ぶ実機テストが一時ディレクトリを畳むことも
+    // ある。**打ち切ってはいけない**——消えた1ノードのために残り全部が未保護のまま
+    // 「保護済み」として返っていたのがBUG-084である。**`Err`にするのも駄目**で、
+    // `wait_until_done`はプロセス内の全ジョブを待つ設計なので、消えたworkspace1つの
+    // エラーが無関係なworkspaceの待ち手まで巻き添えで失敗させる。
+    collect_dirs_and_files(&harness_dir, &mut dirs, &mut files, OnVanished::Skip).map_err(|e| {
         AppContainerError::AclGrant {
             path: harness_dir.clone(),
             reason: e.to_string(),
         }
     })?;
 
-    for sid in sids {
-        for file in &files {
-            remove_sid_aces_and_protect(file, *sid)?;
+    // 走査順（files → `dirs.rev()`、＝葉から根へ）は保護をかける側の既定の向きで、
+    // 解除側（[`unprotect_harness_control_dir`]、根から葉へ）と逆。ノードを外側・SIDを内側に
+    // したのは件数を1ノード1回で数えるためで、`remove_sid_aces_and_protect`は毎回DACLを
+    // 読み直すので、SIDを外側に回していた旧実装と最終状態は同じである。
+    let mut protected = 0usize;
+    for node in files.iter().chain(dirs.iter().rev()) {
+        let mut node_protected = true;
+        for sid in sids {
+            node_protected = remove_sid_aces_and_protect(node, *sid)?;
+            // 消えたノードは以降のSIDでも同じなので、残りは試さない。
+            if !node_protected {
+                break;
+            }
         }
-        for dir in dirs.iter().rev() {
-            remove_sid_aces_and_protect(dir, *sid)?;
+        if node_protected {
+            protected += 1;
         }
     }
-    Ok(())
+    Ok(protected)
+}
+
+/// [BUG-083] [`protect_harness_control_dir_from_appcontainer`]が立てた継承遮断
+/// （`SE_DACL_PROTECTED`）を`.harness/**`から落とし、ユーザーのリポジトリを
+/// harnessが触る前の状態へ戻す。戻り値は実際に解除したノード数。
+///
+/// **なぜ専用の巻き戻し経路が要るのか**: 保護はACEと違って「このワークスペースを二度と
+/// harnessで使わない」と決めても自動では消えない。`.harness/**`が継承から切り離されたままだと、
+/// ユーザーが後からリポジトリのルートへ権限を足しても制御面だけ反映されない、という
+/// **消せない恒久変更**を実マシンに残すことになる。`harness fs revoke-workspace`が
+/// ACEを撤収した後にこれを呼ぶ（`crates/harness-cli/src/fs_grants/workspace.rs`）。
+///
+/// **解除はaclapi（`SetNamedSecurityInfoW`）で行う。** ここは`set_dacl_single_object_with_protection`
+/// （制御ビットを落とすだけ）ではなく、**Windowsに継承を計算し直させたい**場面である
+/// ——保護を外すだけでは祖先の継承ACEは戻ってこず、次に誰かが親へ伝播書込をするまで
+/// 中途半端な状態が続く。BUG-011/013の伝播コストが問題にならないのは対象が`.harness/`配下
+/// だけだからで（実機で24ノード、aclapi 1回あたり実測0.3ms程度）、**他のツリーへこの形を
+/// 広げてはいけない**。
+///
+/// **順序は上から下**（`collect_dirs_and_files`が返す`dirs`は前順なのでそのまま、`files`は最後）。
+/// 親の継承ACEが復元されてから子を解除しないと、子が受け取るべき継承ACEがまだ親に無い。
+/// 保護をかける側（files→`dirs.rev()`）とは逆向きである。
+pub fn unprotect_harness_control_dir(workspace_root: &Path) -> Result<usize, AppContainerError> {
+    let harness_dir = workspace_root.join(".harness");
+    if !harness_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    collect_dirs_and_files(&harness_dir, &mut dirs, &mut files, OnVanished::Skip).map_err(|e| {
+        AppContainerError::AclRevoke {
+            path: harness_dir.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+
+    let mut unprotected = 0usize;
+    for node in dirs.iter().chain(files.iter()) {
+        // 保護されていないノードは触らない——ユーザーが自分で保護したノードを巻き込んで
+        // 継承を復活させないため、ではなく（それは区別できない）、無駄なaclapi呼び出しを
+        // 避けるため。`.harness/`配下という限定されたツリーなので、ここに居る保護は
+        // 実質このコードが立てたものである。
+        //
+        // [BUG-084] 消えたノードは飛ばす。walkが`OnVanished::Skip`で消失を許容する以上、
+        // **集めてから触るまでの間に消えた**場合もここで許容しないと、掛ける側とだけ
+        // 対称性が崩れる（掛ける側は`remove_sid_aces_and_protect`が`Ok(false)`を返す）。
+        match dacl_protection_state(node)? {
+            None | Some(false) => continue,
+            Some(true) => {}
+        }
+        if unprotect_dacl_restoring_inheritance(node)? {
+            unprotected += 1;
+        }
+    }
+    Ok(unprotected)
+}
+
+/// `path`の`SE_DACL_PROTECTED`を落とし、祖先からの継承ACEをOSに計算し直させる
+/// （[`unprotect_harness_control_dir`]の1ノード分）。
+///
+/// 戻り値は**解除できたか**。`false`は「触る前に消えていた」ことだけを意味する
+/// （BUG-084、[`is_vanished`]）。
+fn unprotect_dacl_restoring_inheritance(path: &Path) -> Result<bool, AppContainerError> {
+    let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    };
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut existing_dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        if let Err(e) = GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing_dacl),
+            None,
+            &mut sd,
+        )
+        .ok()
+        {
+            return if is_vanished(&e) { Ok(false) } else { Err(to_err(e)) };
+        }
+
+        // 現在のDACLをそのまま渡し、`UNPROTECTED_…`で「継承を受け付ける状態へ戻せ」とだけ言う。
+        // aclapiは保護中に凍結されていたACEと、祖先から降りてくるべきACEを突き合わせて
+        // 正規化する（`pDacl=NULL`は「DACL無し＝誰でもフルコントロール」になるので**渡さない**
+        // ——`test_support::protect_dacl_preserve_inherited`のdocに記録した事故と同じ罠）。
+        let result = SetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(existing_dacl as *const _),
+            None,
+        )
+        .ok();
+
+        let _ = LocalFree(HLOCAL(sd.0));
+        match result {
+            Ok(()) => Ok(true),
+            Err(e) if is_vanished(&e) => Ok(false),
+            Err(e) => Err(to_err(e)),
+        }
+    }
 }
 
 /// `path`のDACLから、`sid`（trustee）に対する既存ACEを全て取り除く。元は
@@ -372,7 +650,24 @@ pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
 
 /// [`revoke_ace`]の実体（D-48のガードを通らない）。**このモジュールと
 /// [`revoke_traverse_grant`]以外から呼ばないこと。**
+///
+/// D-48ガードを一切かけない生のプリミティブである。ガードは[`revoke_ace`]（このモジュール内の
+/// 通常経路）と[`revoke_workspace_sids_recursive`]（workspace一括撤収）がそれぞれ**自分の
+/// 呼び出し方に合わせて**外側でかける——`revoke_traverse_grant`がここを直接呼ぶのは
+/// 「台帳に載った永続traverse ACEを意図的に剥がす唯一の正規の扉」だからで、ここへガードを
+/// 埋め込むとその扉自体が機能しなくなる。
 pub(crate) fn revoke_ace_unguarded(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    revoke_sids_from_node(path, &[sid]).map(|_rewrote| ())
+}
+
+/// [BUG-082] 1ノードから`sids`の全てを**DACL読取1回・（変更があれば）書込1回**で剥がす。
+/// D-48ガードは持たない生のプリミティブ（呼び出し側がガードするかを決める、
+/// [`revoke_ace_unguarded`]のdoc参照）。
+///
+/// 戻り値は実際に書込を行ったか（＝1本以上のACEを剥がしたか）。0件なら`false`を返し、
+/// 高価な`CreateFileW(WRITE_DAC)`＋`SetKernelObjectSecurity`を呼ばない
+/// （`copy_dacl_excluding_sids`のdoc参照）。
+fn revoke_sids_from_node(path: &Path, sids: &[PSID]) -> Result<bool, AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -395,13 +690,20 @@ pub(crate) fn revoke_ace_unguarded(path: &Path, sid: PSID) -> Result<(), AppCont
         .map_err(to_err)?;
 
         let mut new_buf: Vec<u8> = Vec::new();
-        let new_dacl = match copy_dacl_excluding_sid(existing_dacl as *const _, sid, &mut new_buf) {
-            Ok(dacl) => dacl,
-            Err(e) => {
-                let _ = LocalFree(HLOCAL(sd.0));
-                return Err(to_err(e));
-            }
-        };
+        let (new_dacl, removed) =
+            match copy_dacl_excluding_sids(existing_dacl as *const _, sids, &mut new_buf) {
+                Ok(result) => result,
+                Err(e) => {
+                    let _ = LocalFree(HLOCAL(sd.0));
+                    return Err(to_err(e));
+                }
+            };
+
+        if removed == 0 {
+            // [BUG-082] 対象sidのACEが1本も無いノード。読取だけで済ませ、書込を省略する。
+            let _ = LocalFree(HLOCAL(sd.0));
+            return Ok(false);
+        }
 
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
@@ -412,7 +714,7 @@ pub(crate) fn revoke_ace_unguarded(path: &Path, sid: PSID) -> Result<(), AppCont
 
         set_dacl_single_object_with_protection(path, new_dacl, was_protected).map_err(to_err)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// `root`配下（`root`自身含む）から`sid`のACEを再帰的に取り除く（`grant_ace_recursive`の逆）。
@@ -433,7 +735,7 @@ pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerEr
     }
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files).map_err(|e| {
+    collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
         AppContainerError::AclRevoke {
             path: root.to_path_buf(),
             reason: e.to_string(),
@@ -446,6 +748,99 @@ pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerEr
         revoke_ace(dir, sid)?;
     }
     Ok(())
+}
+
+/// [BUG-082] `fix_descendants_missing_ace`と対称の、workspace撤収専用の1walk一括撤収
+/// （`harness fs revoke-workspace`本体）。
+///
+/// [`revoke_ace_recursive`]はSIDごとに1回ツリー全体を舐め直す。`fs revoke-workspace`は
+/// workspace capability（最大2＝rwx/ro）＋撤収可能なharnessプロファイル（複数）を同じツリーから
+/// 一括で剥がすため、SIDの数だけ再walkするのは無駄である。**ここではノードごとにDACLを
+/// 1回だけ読み、対象の全SIDを1回の走査で除去し、変更があった場合だけ1回書き戻す。**
+///
+/// D-48ガード（[`is_protected_traverse_grant`]）はノードごとに`sids`側から事前に除いてから
+/// [`revoke_sids_from_node`]（生のプリミティブ、ガード無し）へ渡す。実運用では
+/// `fs_revoke_workspace`がtraverse capability SIDをここへ渡すことは無いが、コストは
+/// `EqualSid`比較（`is_traverse_capability_sid`）が数回増えるだけで無視できるため、将来の
+/// 呼び出し元が誤って含めても保護対象が守られるよう常にかけておく。
+///
+/// `progress`は`(処理済み, 全体)`で1000件ごとに呼ばれる（表示専用、`fix_descendants_missing_ace`
+/// と同じ間隔）。
+pub fn revoke_workspace_sids_recursive(
+    root: &Path,
+    sids: &[PSID],
+    progress: &dyn Fn(usize, usize),
+) -> Result<RevokeWorkspaceReport, AppContainerError> {
+    if sids.is_empty() {
+        return Ok(RevokeWorkspaceReport::default());
+    }
+    if root.is_file() {
+        let rewritten = revoke_sids_from_node_guarded(root, sids)?;
+        return Ok(RevokeWorkspaceReport {
+            checked: 1,
+            rewritten: usize::from(rewritten),
+        });
+    }
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
+        AppContainerError::AclRevoke {
+            path: root.to_path_buf(),
+            reason: e.to_string(),
+        }
+    })?;
+
+    let total = dirs.len() + files.len();
+    let mut report = RevokeWorkspaceReport {
+        checked: total,
+        ..Default::default()
+    };
+    // `collect_dirs_and_files`（このwalk）自体はtotalが定まるまで進捗を出せない
+    // （呼び出し側はここまで「不定長の作業中」としか示せない）。totalが分かった時点で
+    // すぐ1回`(0, total)`を通知する——1000件未満の小さいツリーだと以後
+    // `processed == total`の最後の1回しか呼ばれず、呼び出し側が「合計が分かった」ことを
+    // 知る機会が完走時まで無くなるため（`harness fs revoke-workspace`のCLI進捗表示が、
+    // 走査完了までスピナーから数値表示へ切り替えられない）。
+    progress(0, total);
+    let mut processed = 0usize;
+    for node in dirs.iter().chain(files.iter()) {
+        processed += 1;
+        // 進捗は1000件ごと（`fix_descendants_missing_ace`と同じ間隔。1件ごとだと通知自体が
+        // walkより重くなる）。
+        if processed.is_multiple_of(1000) || processed == total {
+            progress(processed, total);
+        }
+        if revoke_sids_from_node_guarded(node, sids)? {
+            report.rewritten += 1;
+        }
+    }
+    Ok(report)
+}
+
+/// [`revoke_sids_from_node`]にD-48ガードをかけた版。このノードで「保護された永続traverse付与」
+/// に該当するSIDだけを除去対象から外し、残りは正しく撤収する（バッチ全体を失敗させない、
+/// かつ保護対象は必ず守る——単一SID版の`revoke_ace`のように`Err`で丸ごと止めない設計）。
+fn revoke_sids_from_node_guarded(path: &Path, sids: &[PSID]) -> Result<bool, AppContainerError> {
+    let effective: Vec<PSID> = sids
+        .iter()
+        .copied()
+        .filter(|&sid| !is_protected_traverse_grant(path, sid))
+        .collect();
+    if effective.is_empty() {
+        return Ok(false);
+    }
+    revoke_sids_from_node(path, &effective)
+}
+
+/// [`revoke_workspace_sids_recursive`]の結果。件数だけでは「本当に走査したのか」が分からない
+/// ため、`checked`（読取だけ含む全ノード数）と`rewritten`（実際にDACLを書き換えた数）を分ける
+/// （`fix_descendants_missing_ace`の`DescendantFixReport`と対称）。
+#[derive(Debug, Default)]
+pub struct RevokeWorkspaceReport {
+    /// walkが見たノード数。
+    pub checked: usize,
+    /// 実際にACEを1本以上剥がして書き戻した数。
+    pub rewritten: usize,
 }
 
 /// `path`のDACLに`sid`（trustee）への**明示**ACEが残っていれば、その許可アクセスマスクの
@@ -582,9 +977,16 @@ pub(crate) fn sid_effective_ace_mask(
 pub fn assert_no_sid_ace_recursive(root: &Path, sid: PSID) -> Result<(), Vec<std::path::PathBuf>> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    if collect_dirs_and_files(root, &mut dirs, &mut files).is_err() {
-        // rootが既に存在しない（revoke後にユーザが削除した等）場合は「残存無し」として扱う。
-        return Ok(());
+    // [BUG-084] 消えたノードは飛ばす（`OnVanished::Skip`）——rootごと消えていれば`dirs`も
+    // `files`も空になり、下のループが何も見つけずに`Ok`＝「残存無し」になる。これは正しい
+    // （ACEを載せる先が無い）。
+    //
+    // **それ以外のwalk失敗を`Ok`にしてはいけない。** この関数の`Ok`は「完全に撤収できた」の
+    // 機械的な証拠として`revoke_passthrough`（→`fs revoke`の台帳掃除）が使うので、
+    // 「確かめられなかった」を「きれいだった」と読み替えると、撤収し損ねたACEを台帳から
+    // 消してしまい**二度と撤収対象に上がらなくなる**。確かめられなかったrootは残存側へ倒す。
+    if collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Skip).is_err() {
+        return Err(vec![root.to_path_buf()]);
     }
     let mut remaining = Vec::new();
     for node in dirs.iter().chain(files.iter()) {

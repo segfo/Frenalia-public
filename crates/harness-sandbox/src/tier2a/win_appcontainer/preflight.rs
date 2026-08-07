@@ -552,17 +552,18 @@ pub fn preflight(
     // 長生きするのが仕様であり、撤収は`harness fs revoke-workspace`が明示的に行う。
     let workspace_mask = match write_mode {
         WorkspaceWriteMode::DirectRw => {
-            // 既定（D-29）。rootへ継承ACEを1件付けるだけで、OSが既存子孫へ伝播させる
-            // （`grant_workspace_root_rw`のdoc）。2回目以降の起動は冪等スキップでWin32書込0回。
-            grant_workspace_root_rw(workspace_root, workspace_cap.as_psid())?;
-            timing.mark("grant_workspace_root_rw(workspace_root)");
+            // 既定（D-29）。[BUG-082 Part B] rootへ継承ACEを1件、**伝播なし**で付けるだけ
+            // （`grant_workspace_root_rw_fast`のdoc）——既存子孫への伝播は`grant_job`の
+            // 背景フェーズへ委ねる。2回目以降の起動は冪等スキップでWin32書込0回。
+            grant_workspace_root_rw_fast(workspace_root, workspace_cap.as_psid())?;
+            timing.mark("grant_workspace_root_rw_fast(workspace_root)");
             workspace_rwx_mask()
         }
         WorkspaceWriteMode::Cow { upper_dir } => {
             // `--cow`（D-30）。workspaceはRead/Execute/Traverseのみ（D-13と同じ関数）。
             // Redirector DLLが無効・回避されても、この時点でACLがROである限り
             // workspace本体への書込は`ACCESS_DENIED`でfail-closeする。
-            grant_workspace_root_ro(workspace_root, workspace_cap.as_psid())?;
+            grant_workspace_root_ro_fast(workspace_root, workspace_cap.as_psid())?;
             // upper_dirは**セッション専有**（他セッションと共有しない）なので、主体は
             // 従来どおりセッションのpackage SIDのままにする。D-54が置き換えるのは
             // 「ワークスペースにつき一度きりで済むはずの付与」だけで、こちらは該当しない。
@@ -600,11 +601,16 @@ pub fn preflight(
     };
     // D-05/D-09の層3。剥がす主体は**capability SID（今の継承元）とpackage SID（D-37時代の
     // 残骸）の両方**——片方だけだと剥がし残した側から制御面が書ける（`revoke.rs`のdoc参照）。
-    protect_harness_control_dir_from_appcontainer(
+    let protected_nodes = protect_harness_control_dir_from_appcontainer(
         workspace_root,
         &[workspace_cap.as_psid(), sid.as_psid()],
     )?;
-    timing.mark("protect_harness_control_dir_from_appcontainer");
+    // [BUG-084] 件数を出す。層3のhard-denyは「1件も掛かっていない」が症状として現れない
+    // （BUG-083はそれが恒常的に起きていた）ので、`HARNESS_PREFLIGHT_TIMING=1`で事後確認
+    // できる形にしておく。
+    timing.mark(&format!(
+        "protect_harness_control_dir_from_appcontainer ({protected_nodes} nodes)"
+    ));
 
     // 保護DACL（BUG-020の残存損害等）で継承が届かなかった既存子孫の救済が要るか。
     // **ワークスペースにつき一度きり**で、実行は`preflight`の最後（他のACL作業を全て終えた後）に
@@ -1039,18 +1045,36 @@ pub fn preflight(
     // 保護DACL配下だけである。子プロセスを起動する経路は`grant_job::wait_until_done`で
     // 完了を待つ（待たずに走らせると、モデルには「そのファイルは無い」と見える）。
     if needs_descendant_fix {
+        // [BUG-082 Part B] 背景フェーズが行う伝播はrootへの継承ACE伝播である。BUG-083の修正で
+        // `.harness/`の保護が実際に効くようになり、この伝播はOS側で`.harness/`の手前で止まるが、
+        // 保護が止められるのは**継承経由の伝播だけ**なので、保護前から物理コピーとして乗っていた
+        // ACEやD-37時代のpackage SID残骸に備えて背景側でも剥がし直す（第2の防御）。ここで渡す
+        // `.harness/`再保護用のSIDは、上の
+        // 同期`protect_harness_control_dir_from_appcontainer`呼び出しと**同じ集合**
+        // （workspace capability＋セッションSID）にする——片方だけだと剥がし残した側から
+        // 制御面が書けるのは同期区間と同じ理屈（`revoke.rs`のdoc参照）。`workspace_cap`は
+        // このすぐ後で`grant_job::start`へ移動するため、先にコピーを取っておく。
+        let session_sid_copy = unsafe { crate::win_common::OwnedSid::copy_from(sid.as_psid()) }
+            .map_err(|e| {
+                AppContainerError::Preflight(format!(
+                    "failed to copy the session SID for background .harness re-protection: {e}"
+                ))
+            })?;
+        let harness_protect_sids = vec![workspace_cap.clone(), session_sid_copy];
+
         // 戻り値の`false`は「このプロセスでは既に別のジョブが走っている」＝`preflight`が2回
         // 呼ばれた場合だけで、製品では起こらない（実機テストが同居するときだけ）。
         let started = grant_job::start(
             workspace_root,
             workspace_cap,
             workspace_mask,
+            harness_protect_sids,
             vec![workspace_root.join(".harness")],
             &canonical_workspace_root,
             workspace_mode,
         );
         timing.mark(&format!(
-            "grant_job::start (background descendant fix-up, started={started})"
+            "grant_job::start (background propagate + descendant fix-up, started={started})"
         ));
     }
 

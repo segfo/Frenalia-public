@@ -14,7 +14,9 @@
 //! `parity_production_probe_matches_diagnostic_probe`が突き合わせる
 //! （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3）。
 
-use super::test_support::{spawn_in_workspace, SubstDrive, TestDirGuard};
+use super::test_support::{
+    protect_dacl_preserve_inherited, spawn_in_workspace, SubstDrive, TestDirGuard,
+};
 use super::*;
 
 const PROBE_COMMAND: &str = "\
@@ -171,6 +173,15 @@ fn preflight_keeps_harness_control_dir_unwritable_to_appcontainer_child() {
     let harness_dir = workspace.path().join(".harness");
     assert_no_sid_ace_recursive(&harness_dir, sid.as_psid())
         .expect(".harness must not carry AppContainer SID ACEs");
+
+    // **`preflight`を呼んだテストは、一時ディレクトリを畳む前に背景ジョブの完了を待つ。**
+    // このテストは子プロセスを起こさないので、本番の`run_shell`（と`spawn_in_workspace`）が
+    // 通る`wait_until_done`ゲートを自分で通る必要がある。待たずに`TempDir`をDropすると、
+    // まだ走っているフェーズ0/0.5/1がツリーごと消えた先を触って失敗し、`wait_until_done`が
+    // **プロセス内の全ジョブ**を待つ設計であるために、その失敗が後続テストの待ちへ
+    // 巻き添えで表面化する（実際に`ace-grant-revoke`で
+    // `the_background_job_finishes_the_descendant_fix_up_and_records_it`が落ちた）。
+    grant_job::wait_until_done().expect("the background workspace grant job must finish");
 
     revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
 }
@@ -671,65 +682,6 @@ fn grant_traverse_chain_then_revoke_each_node_on_neutral_tree() {
     }
 }
 
-
-
-
-
-/// `path`のDACLに`PROTECTED_DACL_SECURITY_INFORMATION`を立て、祖先からの継承ACEが
-/// このノード配下へ伝播するのを遮断する。**このとき`path`が現在実効的に持つ全ACE
-/// （継承由来含む）を`GetExplicitEntriesFromAclW`で吸い出し、明示ACEとして保持し直す**
-/// ため、Administrators/自分自身等の既存アクセスは失われない（0 ACEにはしない）。
-///
-/// 当初の実装は`GetExplicitEntriesFromAclW`で現在のACEを吸い出してから`SetEntriesInAclW`で
-/// 組み直す方式だったが、`GetExplicitEntriesFromAclW`は**継承フラグ（`INHERITED_ACE`）が
-/// 立ったACEを一切拾わない**（名前どおり「明示」ACEのみが対象）ため、対象ディレクトリの
-/// ACEが全て継承由来（新規作成した子ディレクトリの典型）の場合は`count=0`になり、
-/// `SetEntriesInAclW(&[], None, ...)`が`new_dacl=NULL`を返してしまう。`SetNamedSecurityInfoW`
-/// に`pDacl=NULL`を渡すと「DACLそのものが無い＝誰でもフルコントロール」という最も危険な
-/// 状態になり、`grant_ace_ro(root)`自体は成功するのに対象ディレクトリのアクセス制御が
-/// 消え去るという事故を招いた（実機の`icacls`出力`"アクセスが設定されていません。すべての
-/// ユーザーがフル コントロールを保持しています。"`で発覚）。
-///
-/// 修正: ACEを個別に吸い出して再構築する必要は無い。`GetNamedSecurityInfoW`が返す
-/// `existing_dacl`は、継承由来かどうかを問わず**今この瞬間に有効な全ACEが物理的に
-/// 格納された実体**（NTFSは継承ACEを都度計算せず子オブジェクトへ都度複製して保持する）
-/// なので、そのポインタをそのまま`PROTECTED_DACL_SECURITY_INFORMATION`付きで書き戻すだけで
-/// 「今の実効アクセスを凍結しつつ、以後の祖先からの継承だけを遮断する」が実現できる
-/// （`.NET`の`SetAccessRuleProtection(true, true)`が内部で行うのと同じ操作）。
-fn protect_dacl_preserve_inherited(path: &Path) -> windows::core::Result<()> {
-    use windows::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
-    unsafe {
-        let path_w = wide(&path.to_string_lossy());
-        let mut existing_dacl: *mut ACL = std::ptr::null_mut();
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        GetNamedSecurityInfoW(
-            PCWSTR(path_w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut existing_dacl),
-            None,
-            &mut sd,
-        )
-        .ok()?;
-
-        let result = windows::Win32::Security::Authorization::SetNamedSecurityInfoW(
-            PCWSTR(path_w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(existing_dacl as *const _),
-            None,
-        )
-        .ok();
-
-        let _ = LocalFree(HLOCAL(sd.0));
-        result
-    }
-}
-
 /// Phase B-2の本実装（`grant_ace_inheritable_ro`）の実機検証。Experiment L
 /// （`docs/phases/foundation/M12-shell-isolation-tiers.md`）は継承ONの
 /// 単純ツリー1本しか検証しておらず、「保護DACL（継承を無効にした）子が混在するツリーでも
@@ -873,7 +825,8 @@ fn an_inherited_ace_reaches_descendants_and_the_effective_probe_sees_it() {
     revoke_ace_recursive(dir.path(), sid.as_psid()).expect("revoke_ace_recursive");
 }
 
-/// [D-54] 背景ジョブ（`grant_job`）が救済walkを完走し、保護DACL配下まで届かせ、完走を
+/// [D-54/[BUG-082](../../../../docs/bugs/BUG-082.md) Part B] 背景ジョブ（`grant_job`）が
+/// (0)rootへの継承ACE伝播、(0.5)`.harness/`の再保護、(1)救済walk、の3段を完走し、完走を
 /// 台帳へ記録すること。`wait_until_done`が実際に完了まで待つことも同時に固定する。
 ///
 /// **`#[ignore]`にしてある理由は2つ**で、どちらも「他のテストと同じプロセスで走らせられない」
@@ -896,15 +849,31 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
     // 継承が届く枝と、継承を遮断した枝（`fix_descendants_missing_ace`が救う対象）。
     let normal = root.join("normal");
     std::fs::create_dir_all(&normal).expect("create normal branch");
-    std::fs::write(normal.join("a.txt"), b"inherited").expect("seed normal file");
+    let normal_file = normal.join("a.txt");
+    std::fs::write(&normal_file, b"inherited").expect("seed normal file");
     let protected = root.join("protected");
     std::fs::create_dir_all(&protected).expect("create protected branch");
     let blocked = protected.join("blocked.txt");
     std::fs::write(&blocked, b"needs the fallback").expect("seed protected file");
     protect_dacl_preserve_inherited(&protected).expect("protect_dacl_preserve_inherited");
+    // [BUG-083の再現条件] `.harness/`も同じツリーに置く——背景ジョブのフェーズ0（伝播）は
+    // ツリー全体へ及ぶため、`.harness/`の子孫にもACEが届き得る。フェーズ0.5（再保護）が
+    // 正しく機能していれば、完走後はここにACEが残っていないはず。
+    let harness_dir = root.join(".harness");
+    std::fs::create_dir_all(&harness_dir).expect("create .harness");
+    let harness_file = harness_dir.join("settings.json");
+    std::fs::write(&harness_file, "{}\n").expect("seed .harness file");
 
-    // `preflight`と同じ順序: rootへ伝播付与（同期）→ 救済walkは背景へ。
-    grant_workspace_root_rw(&root, sid.as_psid()).expect("grant_workspace_root_rw");
+    // [BUG-082 Part B1] `preflight`と同じ順序: rootへ**伝播なし**の高速付与（同期）→
+    // 伝播＋救済walkは背景ジョブへ。
+    grant_workspace_root_rw_fast(&root, sid.as_psid()).expect("grant_workspace_root_rw_fast");
+    assert_eq!(
+        sid_effective_ace_mask(&normal_file, sid.as_psid()).expect("probe the normal branch before the job"),
+        None,
+        "the fast (single-object) root grant must NOT propagate to existing descendants -- if \
+         it did, the background job's own propagate step would have nothing left to prove and \
+         this test would not be exercising Part B2 at all"
+    );
     assert_eq!(
         sid_effective_ace_mask(&blocked, sid.as_psid()).expect("probe the protected branch"),
         None,
@@ -919,6 +888,7 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
         &root,
         sid.clone(),
         workspace_rwx_mask(),
+        vec![sid.clone()],
         vec![root.join(".harness")],
         &root,
         "rwx",
@@ -933,13 +903,34 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
         crate::tier2a::workspace_capability::forget_capability(&root, "");
         return;
     }
-    grant_job::wait_until_done().expect("the background fix-up must finish successfully");
+    grant_job::wait_until_done().expect("the background job must finish successfully");
 
+    // [BUG-082 Part B2回帰] 背景ジョブのフェーズ0（`propagate_workspace_root_grant`、
+    // `IdempotentCheck::Always`）が、直前の同期fast書込による冪等スキップの罠を踏まずに
+    // 実際に伝播していること。ここがBUG-081層1と同型の罠——踏むと`normal_file`は
+    // 永遠に`None`のままになる。
+    assert!(
+        sid_effective_ace_mask(&normal_file, sid.as_psid())
+            .expect("probe the normal branch after the job")
+            .is_some(),
+        "the background job's propagate phase must reach the normal branch (BUG-082 Part B2: \
+         IdempotentCheck::Always must actually bypass the idempotent skip)"
+    );
     assert!(
         sid_effective_ace_mask(&blocked, sid.as_psid())
             .expect("probe the protected branch after the job")
             .is_some(),
         "the background job must have granted an explicit ACE where inheritance could not reach"
+    );
+    // [BUG-083回帰] フェーズ0の伝播が`.harness/settings.json`へも届いた場合、フェーズ0.5
+    // （`.harness/`再保護）がそれを剥がし直しているはず。ここが`Some`のままなら、D-05/D-09の
+    // 制御面保護が背景ジョブによって無言で外れている。
+    assert_eq!(
+        sid_effective_ace_mask(&harness_file, sid.as_psid())
+            .expect("probe .harness/settings.json after the job"),
+        None,
+        "the background job's re-protection phase (BUG-083 mitigation) must strip the ACE that \
+         its own propagate phase just put on .harness/settings.json"
     );
     assert!(
         crate::tier2a::workspace_capability::tree_is_verified(&root, "rwx"),
@@ -1327,5 +1318,337 @@ fn a_sandbox_cannot_reach_another_sessions_workspace() {
     assert!(
         !leaked,
         "別セッションのworkspaceの中身がサンドボックスから読めている（D-37が崩れている）"
+    );
+}
+
+/// [BUG-082] workspace撤収の一括経路（`revoke_workspace_sids_recursive`）は、対象SIDの
+/// ACEが1本も無いツリーでは**書込を1件も行わない**（`checked`はノード数ぶん増えるが
+/// `rewritten`は0のまま）。旧`revoke_ace_recursive`をSIDごとに呼ぶ実装は、D-54以降
+/// capability SID宛にしかACEが無いにもかかわらずプロファイルSIDでも全ノードを無条件で
+/// 読取+書込しており、これが`fs revoke-workspace`が遅い主因だった（docs/bugs/BUG-082.md）。
+///
+/// 後半では実際にACEを付けたツリーに対して呼び、全ノードが`rewritten`に数えられ、かつ
+/// 完全に撤収されることも確認する（最適化が正しさを犠牲にしていないことの対）。
+///
+/// AppContainerプロファイルの作成も管理者権限も要らない（`traverse_capability_sid`は
+/// 純粋な導出、`grant_ace_recursive`/`revoke_workspace_sids_recursive`は自分が所有する
+/// tempdirのDACLしか触らない）ため`#[ignore]`にしない。
+#[test]
+fn revoke_workspace_sids_recursive_skips_writes_when_no_target_sid_is_present() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let nested = dir.path().join("a").join("b");
+    std::fs::create_dir_all(&nested).expect("create nested dirs");
+    std::fs::write(nested.join("f.txt"), b"hi").expect("seed file");
+    // dir自身 + "a" + "a/b" + "a/b/f.txt" = 4ノード。
+    let expected_nodes = 4usize;
+
+    let untouched = traverse_capability_sid().expect("traverse_capability_sid");
+    let report = revoke_workspace_sids_recursive(dir.path(), &[untouched.as_psid()], &|_, _| {})
+        .expect("revoke_workspace_sids_recursive on a clean tree");
+    assert_eq!(report.checked, expected_nodes, "must walk every node");
+    assert_eq!(
+        report.rewritten, 0,
+        "no node carries the target SID's ACE, so nothing should have been rewritten \
+         (BUG-082: the old per-SID walk rewrote every node unconditionally)"
+    );
+
+    // 後半: 実際に付けたツリーでは全ノードが書き換わり、かつ完全に撤収されること。
+    grant_ace_recursive(dir.path(), untouched.as_psid()).expect("grant_ace_recursive");
+    let report = revoke_workspace_sids_recursive(dir.path(), &[untouched.as_psid()], &|_, _| {})
+        .expect("revoke_workspace_sids_recursive on a granted tree");
+    assert_eq!(report.checked, expected_nodes);
+    assert_eq!(
+        report.rewritten, expected_nodes,
+        "every node explicitly carried the ACE (grant_ace_recursive grants each node \
+         individually), so every node must be rewritten"
+    );
+    assert!(
+        assert_no_sid_ace_recursive(dir.path(), untouched.as_psid()).is_ok(),
+        "the SID's ACE must be fully removed after revoke_workspace_sids_recursive"
+    );
+}
+
+/// [BUG-082] `protect_harness_control_dir_from_appcontainer`（D-05/D-09の制御面保護）は、
+/// `sids`のうち`.harness/`にACEを持たないものが混ざっていても、ACEを持つ他のSIDの除去まで
+/// 巻き添えでスキップしない。各`sid`は独立に処理される（`for sid in sids { for node in
+/// ... { remove_sid_aces_and_protect(node, sid) } }`）ため、この不変条件はループ構造そのもの
+/// から成り立つが、リファクタで崩れないよう固定しておく。
+///
+/// 本テストが見るのは**ACE除去そのものの正しさ**だけである。もう一方の柱である
+/// `SE_DACL_PROTECTED`の実効性は
+/// [`protect_harness_control_dir_actually_blocks_inheritance_and_can_be_rolled_back`]が持つ
+/// （[BUG-083](../../../../docs/bugs/BUG-083.md): この2つを分けずに「制御面が守られている」と
+/// 一括りにしていたため、保護フラグが一度も立っていないことに長く気付かなかった）。
+#[test]
+fn protect_harness_control_dir_removes_aces_for_every_sid_even_when_some_have_none() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let harness_dir = root.path().join(".harness");
+    std::fs::create_dir_all(&harness_dir).expect("create .harness");
+    let file = harness_dir.join("settings.json");
+    std::fs::write(&file, "{}\n").expect("seed file");
+
+    // `has_ace`はrootへの伝播で.harness/settings.jsonへも既にACEを持つ（除去対象）。
+    // `zero_ace`は台帳を経由しない純粋な導出SID（`capability_sid_from_name`、
+    // `traverse_capability_sid`と同じ形）で、.harness/配下に1本もACEを持たない
+    // （`removed == 0`のケース）。`workspace_capability_sid`は`%APPDATA%`の台帳へ実際に
+    // エントリを作る副作用を持つため、非`#[ignore]`テストでは避ける。
+    let has_ace = traverse_capability_sid().expect("traverse_capability_sid");
+    grant_workspace_root_rw(root.path(), has_ace.as_psid()).expect("grant_workspace_root_rw");
+    assert!(
+        sid_effective_ace_mask(&file, has_ace.as_psid())
+            .expect("probe before protect")
+            .is_some(),
+        "precondition failed: has_ace must reach .harness/settings.json before protection"
+    );
+    let zero_ace =
+        capability_sid_from_name("harnessBug082TestUnrelated").expect("derive an unrelated SID");
+    assert_eq!(
+        sid_ace_mask(&file, zero_ace.as_psid()).expect("probe zero_ace before protect"),
+        None,
+        "precondition failed: zero_ace must not already carry an ACE on .harness/settings.json"
+    );
+
+    // `zero_ace`を先に渡す（`has_ace`より前）——0件除去のSIDが先に処理されても、後続の
+    // SIDの除去に影響しないことを確認する並び。
+    protect_harness_control_dir_from_appcontainer(
+        root.path(),
+        &[zero_ace.as_psid(), has_ace.as_psid()],
+    )
+    .expect("protect_harness_control_dir_from_appcontainer");
+
+    assert_eq!(
+        sid_effective_ace_mask(&file, has_ace.as_psid()).expect("probe after protect"),
+        None,
+        "has_ace's inherited ACE must be removed from .harness/settings.json even when a \
+         zero-ACE SID was processed earlier in the same call"
+    );
+
+    revoke_ace_recursive(root.path(), has_ace.as_psid()).expect("cleanup has_ace's ACE");
+}
+
+/// [BUG-083] `.harness/`の継承遮断が**実際にOSに効いている**こと、そして
+/// **巻き戻せる**こと。
+///
+/// 分けて確認するのが要点である。BUG-083は「ACEが物理的に無いので子から書けない」という
+/// 機能的保証だけを見ていたため、`SE_DACL_PROTECTED`が一度も立っていなかったことを
+/// 誰も検知できなかった（既存の`preflight_keeps_harness_control_dir_unwritable_to_appcontainer_child`も
+/// `the_background_job_finishes_the_descendant_fix_up_and_records_it`も、フラグ自体は見ていない）。
+/// ここで見るのは次の3点:
+///
+/// 1. 保護後、`.harness/`とその配下で`SE_DACL_PROTECTED`が立っていること（フラグ）。
+/// 2. その状態で**親から伝播させても**`.harness/`配下へACEが届かないこと（挙動）。
+///    保護前は届くことも同時に確認して、テスト自身が空振りでないことを担保する。
+/// 3. `unprotect_harness_control_dir`で解除すると、また届くようになること（巻き戻し）。
+///
+/// 管理者権限も実spawnも要らない（tempdirのDACL操作だけ）。
+#[test]
+fn protect_harness_control_dir_actually_blocks_inheritance_and_can_be_rolled_back() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let harness_dir = root.path().join(".harness");
+    std::fs::create_dir_all(&harness_dir).expect("create .harness");
+    let file = harness_dir.join("settings.json");
+    std::fs::write(&file, "{}\n").expect("seed file");
+
+    // 台帳を経由しない純粋な導出SID（`%APPDATA%`へ副作用を残さない、上のテストと同じ手口）。
+    let sid = capability_sid_from_name("harnessBug083Blocked").expect("derive a probe SID");
+
+    // 前提: 保護前は親からの伝播が`.harness/settings.json`まで届く。ここが届かない環境だと
+    // 以降の`None`が「保護が効いた」の証拠にならない。
+    grant_workspace_root_rw(root.path(), sid.as_psid()).expect("grant before protect");
+    assert!(
+        sid_effective_ace_mask(&file, sid.as_psid())
+            .expect("probe before protect")
+            .is_some(),
+        "precondition failed: inheritance must reach .harness/settings.json before protection"
+    );
+
+    protect_harness_control_dir_from_appcontainer(root.path(), &[sid.as_psid()])
+        .expect("protect_harness_control_dir_from_appcontainer");
+
+    // (1) フラグそのもの。
+    for node in [harness_dir.as_path(), file.as_path()] {
+        assert!(
+            dacl_is_protected(node).expect("read the protection flag"),
+            "{} must carry SE_DACL_PROTECTED after the control-plane protection ran (BUG-083)",
+            node.display()
+        );
+    }
+
+    // (2) 挙動。**本番の背景フェーズ0がまさに呼ぶ関数**で親から伝播させる。
+    propagate_workspace_root_grant(root.path(), sid.as_psid(), workspace_rwx_mask())
+        .expect("propagate after protect");
+    assert_eq!(
+        sid_effective_ace_mask(&file, sid.as_psid()).expect("probe after propagate"),
+        None,
+        "the protection must stop the root's inheritable ACE from reaching .harness/** \
+         (BUG-083: this is the OS-enforced boundary, not the phase-0.5 workaround)"
+    );
+
+    // (3) 巻き戻し。ユーザーのリポジトリに消せない恒久変更を残さないための経路。
+    let unprotected =
+        unprotect_harness_control_dir(root.path()).expect("unprotect_harness_control_dir");
+    assert!(
+        unprotected >= 2,
+        "both .harness/ and .harness/settings.json were protected, so at least 2 nodes must \
+         have been rolled back (got {unprotected})"
+    );
+    for node in [harness_dir.as_path(), file.as_path()] {
+        assert!(
+            !dacl_is_protected(node).expect("read the protection flag after the rollback"),
+            "{} must no longer be protected after unprotect_harness_control_dir",
+            node.display()
+        );
+    }
+    propagate_workspace_root_grant(root.path(), sid.as_psid(), workspace_rwx_mask())
+        .expect("propagate after unprotect");
+    assert!(
+        sid_effective_ace_mask(&file, sid.as_psid())
+            .expect("probe after unprotect")
+            .is_some(),
+        "after the rollback the tree must behave like a normal one again (inheritance reaches \
+         .harness/**); if this fails, the rollback cleared the flag but left the node cut off"
+    );
+
+    revoke_ace_recursive(root.path(), sid.as_psid()).expect("cleanup the probe SID's ACEs");
+}
+
+/// [BUG-083] 撤収（`revoke_ace`）は**ノードの保護状態を変えない**。
+///
+/// `revoke_sids_from_node`は`was_protected`を読んで書き戻す設計だったが、保護が一度も
+/// 立たなかったため**この復元は実質死にコードだった**。BUG-083の修正で初めて実効を持つので、
+/// ここで固定する。BUG-020（撤収処理がツリー全体の継承を破壊した）の再発防止でもある
+/// ——保護されたノードから無関係なSIDを剥がしたときに保護が落ちると、ユーザーが自分で
+/// 「継承を無効にする」を設定したディレクトリを harness が黙って元に戻すことになる。
+#[test]
+fn revoking_an_ace_preserves_the_nodes_protection_state() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("protected");
+    std::fs::create_dir_all(&dir).expect("create dir");
+
+    let sid = capability_sid_from_name("harnessBug083Preserve").expect("derive a probe SID");
+    grant_ace_recursive(&dir, sid.as_psid()).expect("grant an ACE to revoke later");
+    // ユーザーが「継承を無効にする」を押した状態と同じ形にする（aclapi経由＝Windows自身の流儀）。
+    protect_dacl_preserve_inherited(&dir).expect("protect_dacl_preserve_inherited");
+    assert!(
+        dacl_is_protected(&dir).expect("read the protection flag"),
+        "precondition failed: the node must be protected before the revoke"
+    );
+
+    revoke_ace(&dir, sid.as_psid()).expect("revoke_ace");
+
+    assert_eq!(
+        sid_ace_mask(&dir, sid.as_psid()).expect("probe after revoke"),
+        None,
+        "the ACE must actually be gone (otherwise this test proves nothing about the revoke)"
+    );
+    assert!(
+        dacl_is_protected(&dir).expect("read the protection flag after the revoke"),
+        "revoke_ace must leave the node's SE_DACL_PROTECTED exactly as it found it (BUG-020: \
+         the old implementation changed the inheritance state of unrelated nodes)"
+    );
+}
+
+/// [BUG-084] `collect_dirs_and_files`の`OnVanished`。walk中に消えたノードを
+/// **飛ばす**か**walk全体を中断する**かを、呼び出し側が選べること。
+///
+/// この分岐がBUG-084の本体である。`Abort`しか無かった頃、`.harness/`配下でノードが1つ
+/// 消えただけで列挙が全部捨てられ、制御面保護が**1ノードも掛からないまま`Ok`**になっていた。
+///
+/// `Skip`が消えたディレクトリを`dirs`へ残さないことも同時に見る——残すと、呼び出し側が
+/// 存在しないパスへACL操作を掛けて今度は`Err`で落ちる（症状が入れ替わるだけになる）。
+#[test]
+fn the_walk_can_either_skip_vanished_nodes_or_abort_on_them() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let missing = root.path().join("already-gone");
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let err = collect_dirs_and_files(&missing, &mut dirs, &mut files, OnVanished::Abort)
+        .expect_err("Abort must surface the missing directory");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::NotFound,
+        "the aborting mode must report why it stopped"
+    );
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    collect_dirs_and_files(&missing, &mut dirs, &mut files, OnVanished::Skip)
+        .expect("Skip must treat a vanished directory as 'nothing to collect'");
+    assert!(
+        dirs.is_empty() && files.is_empty(),
+        "Skip must not leave the vanished directory in the result (it would be operated on \
+         later and fail there instead): dirs={dirs:?} files={files:?}"
+    );
+
+    // 健全なツリーでは両モードとも同じものを返す（`Skip`が取りこぼさないことの対照）。
+    let tree = root.path().join("tree");
+    std::fs::create_dir_all(tree.join("sub")).expect("create tree/sub");
+    std::fs::write(tree.join("sub").join("a.txt"), b"a").expect("seed a.txt");
+    let collect = |mode| {
+        let (mut dirs, mut files) = (Vec::new(), Vec::new());
+        collect_dirs_and_files(&tree, &mut dirs, &mut files, mode).expect("walk a healthy tree");
+        (dirs, files)
+    };
+    assert_eq!(
+        collect(OnVanished::Skip),
+        collect(OnVanished::Abort),
+        "the two modes must only differ on vanished nodes"
+    );
+}
+
+/// [BUG-084] `protect_harness_control_dir_from_appcontainer`が**実際に保護できたノード数**を
+/// 返すこと、そしてその数が実態（`SE_DACL_PROTECTED`が立っているノード）と一致すること。
+///
+/// 件数を返させるのは、D-05/D-09の層3が「掛けたつもりで1件も掛かっていない」を症状として
+/// 出さない機構だからである——[BUG-083](../../../../docs/bugs/BUG-083.md)は実際にそれが
+/// この実機で恒常的に起きていた。姉妹関数`unprotect_harness_control_dir`が解除件数を
+/// 返すのに対し、付与側だけが`Result<(), _>`だったのがBUG-084の非対称である。
+///
+/// `.harness/`が無いworkspaceで`0`を返すのも同じ理由で固定する——「守るものが無い」と
+/// 「守れなかった」を呼び出し側が区別できる必要がある。
+#[test]
+fn protect_harness_control_dir_reports_how_many_nodes_it_protected() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let harness_dir = root.path().join(".harness");
+    let sessions_dir = harness_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("create .harness/sessions");
+    let settings = harness_dir.join("settings.json");
+    std::fs::write(&settings, "{}\n").expect("seed settings.json");
+    let session = sessions_dir.join("session-1.jsonl");
+    std::fs::write(&session, "{}\n").expect("seed the session file");
+
+    // 台帳を経由しない純粋な導出SID（`%APPDATA%`へ副作用を残さない、姉妹テストと同じ手口）。
+    let sid = capability_sid_from_name("harnessBug084Count").expect("derive a probe SID");
+
+    let nodes = [
+        harness_dir.as_path(),
+        sessions_dir.as_path(),
+        settings.as_path(),
+        session.as_path(),
+    ];
+    let protected = protect_harness_control_dir_from_appcontainer(root.path(), &[sid.as_psid()])
+        .expect("protect_harness_control_dir_from_appcontainer");
+    assert_eq!(
+        protected,
+        nodes.len(),
+        "the protection pass must report every node it covered under .harness/"
+    );
+
+    // 件数が実態と一致していること。ここを見ないと「4と言い張るだけ」の数字になる。
+    for node in nodes {
+        assert!(
+            dacl_is_protected(node).expect("read the protection flag"),
+            "{} is counted as protected, so SE_DACL_PROTECTED must actually be set on it",
+            node.display()
+        );
+    }
+
+    let without_harness_dir = tempfile::tempdir().expect("tempdir");
+    assert_eq!(
+        protect_harness_control_dir_from_appcontainer(without_harness_dir.path(), &[sid.as_psid()])
+            .expect("a workspace without .harness/ is not an error"),
+        0,
+        "'there was nothing to protect' must be reported as 0, not as a silent success"
     );
 }

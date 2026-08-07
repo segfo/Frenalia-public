@@ -23,6 +23,14 @@
 /// **`spawn`のシグネチャをそのまま写している**ので、テストの呼び出し側は関数名を差し替える
 /// だけでよい。引数を1本足す形にしなかったのは、19箇所の呼び出しを機械的に置換できる方が
 /// 取りこぼしが無いためである。
+///
+/// [BUG-082] `run_shell`（`crates/harness-tools/src/shell.rs`）と同じく、spawnの**前**に
+/// `grant_job::wait_until_done()`を通す。D-54の背景ジョブがrootへの伝播（フェーズ0）まで
+/// 引き受けるようになったため、`preflight`直後に子を起こすテストは、既存の（新規作成でない）
+/// ファイルが**まだ見えていない**状態を踏みやすくなった——旧実装はrootへの伝播が`preflight`の
+/// 同期区間で完了していたため、この待ち合わせが無くても大半のテストは無症状だった
+/// （保護DACL配下だけを救う救済walkのみが背景だった頃の話）。「本番の`run_shell`と同じ形」を
+/// 名乗る以上、このゲートも含めて同じ形にする。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_in_workspace(
     exe: &str,
@@ -34,6 +42,8 @@ pub(crate) fn spawn_in_workspace(
     net: super::NetworkCapability,
     cow: Option<super::CowInject<'_>>,
 ) -> Result<super::AppContainerChild, super::AppContainerError> {
+    crate::tier2a::win_appcontainer::grant_job::wait_until_done()
+        .map_err(super::AppContainerError::Preflight)?;
     let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let cap = crate::tier2a::workspace_ledger::KNOWN_MODES
         .iter()
@@ -52,6 +62,75 @@ pub(crate) fn spawn_in_workspace(
         cow,
         cap.as_ref().map(|s| s.as_psid()),
     )
+}
+
+/// `path`のDACLに`PROTECTED_DACL_SECURITY_INFORMATION`を立て、祖先からの継承ACEが
+/// このノード配下へ伝播するのを遮断する。**このとき`path`が現在実効的に持つ全ACE
+/// （継承由来含む）をそのまま保持する**ため、Administrators/自分自身等の既存アクセスは
+/// 失われない（0 ACEにはしない）。
+///
+/// 当初の実装は`GetExplicitEntriesFromAclW`で現在のACEを吸い出してから`SetEntriesInAclW`で
+/// 組み直す方式だったが、`GetExplicitEntriesFromAclW`は**継承フラグ（`INHERITED_ACE`）が
+/// 立ったACEを一切拾わない**（名前どおり「明示」ACEのみが対象）ため、対象ディレクトリの
+/// ACEが全て継承由来（新規作成した子ディレクトリの典型）の場合は`count=0`になり、
+/// `SetEntriesInAclW(&[], None, ...)`が`new_dacl=NULL`を返してしまう。`SetNamedSecurityInfoW`
+/// に`pDacl=NULL`を渡すと「DACLそのものが無い＝誰でもフルコントロール」という最も危険な
+/// 状態になり、`grant_ace_ro(root)`自体は成功するのに対象ディレクトリのアクセス制御が
+/// 消え去るという事故を招いた（実機の`icacls`出力`"アクセスが設定されていません。すべての
+/// ユーザーがフル コントロールを保持しています。"`で発覚）。
+///
+/// 修正: ACEを個別に吸い出して再構築する必要は無い。`GetNamedSecurityInfoW`が返す
+/// `existing_dacl`は、継承由来かどうかを問わず**今この瞬間に有効な全ACEが物理的に
+/// 格納された実体**（NTFSは継承ACEを都度計算せず子オブジェクトへ都度複製して保持する）
+/// なので、そのポインタをそのまま`PROTECTED_DACL_SECURITY_INFORMATION`付きで書き戻すだけで
+/// 「今の実効アクセスを凍結しつつ、以後の祖先からの継承だけを遮断する」が実現できる
+/// （`.NET`の`SetAccessRuleProtection(true, true)`が内部で行うのと同じ操作）。
+///
+/// **`ace_grant_revoke_tests`と`dacl_protection_probe_tests`の2箇所から使う**ので、
+/// `docs/CODE-STRUCTURE-RULES.md`規則5に従い元の定義（`ace_grant_revoke_tests.rs`）から
+/// ここへ移した。前者は「保護DACL配下へ救済walkが届くか」の土台として、後者は
+/// [BUG-083](../../../../docs/bugs/BUG-083.md)の候補Bの書込経路そのものとして使う。
+pub(super) fn protect_dacl_preserve_inherited(
+    path: &std::path::Path,
+) -> windows::core::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    unsafe {
+        let path_w = crate::win_common::wide(&path.to_string_lossy());
+        let mut existing_dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing_dacl),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        let result = SetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(existing_dacl as *const _),
+            None,
+        )
+        .ok();
+
+        let _ = LocalFree(HLOCAL(sd.0));
+        result
+    }
 }
 
 /// パニック時にも確実にクロージャを実行する簡易scopeguard（`scopeguard`クレート依存を

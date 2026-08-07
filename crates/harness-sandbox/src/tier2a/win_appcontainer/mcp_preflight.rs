@@ -55,6 +55,18 @@ pub fn preflight_mcp_server(
 
     let mut warnings = Vec::new();
 
+    // D-54 / `grant_job`モジュールdocの「約束」4: workspaceツリーへDACLを書く経路は、背景の
+    // 伝播＋救済walkと交差させない。`grant_ace_mask`は「読む→ACEを足す→書き戻す」なので、
+    // 同じノードで並行すると片方のACEが消える。走っていなければ即座に返る。
+    //
+    // **[BUG-085] `req.workspace`の有無に関わらず、全てのACL書込より前に待つ。** 待ちを
+    // workspace付与の直前だけに置いていた頃は、下の`read_exec_roots`のACE付与が背景ジョブと
+    // 競合し得た——実行ファイルやスクリプトがworkspace配下にあるMCPサーバ宣言
+    // （`node C:\...\<workspace>\tools\mcp\server.js`のような、プロジェクト同梱のサーバ）では
+    // 付与先がworkspaceツリーの内側になるためである。「workspaceへのACEを付けるとき」ではなく
+    // 「workspaceツリーへDACLを書き得るとき」が待つ条件になる。
+    grant_job::wait_until_done().map_err(AppContainerError::Preflight)?;
+
     for root in read_exec_roots(req) {
         match is_force_grant_forbidden(&root) {
             Some(reason) => warnings.push(format!(
@@ -79,10 +91,6 @@ pub fn preflight_mcp_server(
     }
 
     if let Some((workspace_root, access)) = req.workspace {
-        // D-54: workspaceツリーへDACLを書く経路なので、背景の救済walk（`grant_job`）と
-        // 交差させない。`grant_ace_mask`は「読む→ACEを足す→書き戻す」なので、同じノードで
-        // 並行すると片方のACEが消える。走っていなければ即座に返る。
-        grant_job::wait_until_done().map_err(AppContainerError::Preflight)?;
         grant_ace_inheritable_access(workspace_root, sid.as_psid(), access)?;
         crate::tier2a::session_profile::record_mcp_granted_path(&profile_name, workspace_root);
         // P-08: `.harness`はどのMCPサーバからも開けない。workspaceへACEを付けた場合、
@@ -92,7 +100,19 @@ pub fn preflight_mcp_server(
         // 剥がすのは**このMCPサーバのpackage SIDだけ**でよい。MCPサーバはworkspace
         // capability（D-54）をトークンへ積まない（`spawn`は既定で積まない、D-38 §3.2で
         // workspaceは既定の許可対象ではない）ので、capability宛のACEはここでは主体にならない。
-        protect_harness_control_dir_from_appcontainer(workspace_root, &[sid.as_psid()])?;
+        let harness_dir_exists = workspace_root.join(".harness").exists();
+        let protected = protect_harness_control_dir_from_appcontainer(workspace_root, &[sid.as_psid()])?;
+        // [BUG-084] 保護が1件も掛からなかったことを、このサーバの起動前に見せる。
+        // ここは**第三者コードへworkspaceのACEを渡した直後**なので、制御面（D-05/D-09の層3、
+        // 承認台帳の自己書換防止＝D-39）が実際に閉じたかどうかが最も効く場所である。
+        if harness_dir_exists && protected == 0 {
+            warnings.push(format!(
+                "mcp {}: granted workspace access but the .harness control directory was not \
+                 protected on any node; this server may be able to reach the approval ledger. \
+                 Check the workspace for concurrent deletion under .harness",
+                req.server_id
+            ));
+        }
     }
 
     Ok(McpPreflightOutcome {
