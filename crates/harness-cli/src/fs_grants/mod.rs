@@ -9,17 +9,22 @@ use std::process::ExitCode;
 use clap::Subcommand;
 
 
-mod ledger;
-
 mod prune;
 mod revoke;
 mod traverse;
 mod workspace;
 
-pub(crate) use ledger::*;
+// 台帳そのもの（型・ロック・記録関数）は`harness-sandbox`が持つ。ACEを実際に付与するのは
+// `win_appcontainer::preflight`（あちら側）であり、**付与した側が記録する**形にしないと
+// 台帳に載らない付与＝孤立ACEが生まれるため（同モジュールのdoc参照）。ここに残るのは
+// `harness fs`が提供する操作——一覧・撤収・prune——だけである。
+pub(crate) use harness_sandbox::tier2a::fs_passthrough_ledger::*;
 
-// `main`（binターゲット）の起動パイプラインから直接呼ぶものだけ`pub`で出す。
-pub use ledger::{record_fs_passthrough_denied, record_fs_passthrough_grant};
+// `main`（binターゲット）の起動パイプラインから直接呼ぶものだけ`pub`で再エクスポートする
+// （`harness fs`の公開面を移設前と変えない）。
+pub use harness_sandbox::tier2a::fs_passthrough_ledger::{
+    record_fs_passthrough_denied, record_fs_passthrough_grant,
+};
 pub(crate) use prune::fs_prune;
 pub use revoke::reconcile_fs_ledger_for_workspace;
 pub(crate) use revoke::*;

@@ -276,6 +276,9 @@ mod acl_grant;
 /// ——`start`/`progress`/`wait_until_done`という短い名前は、それだけでは何のジョブか
 /// 分からないため（`grant_job::wait_until_done()`と書けば分かる）。
 pub mod grant_job;
+/// Tier2a子を起こすまでの前口上（主体の導出・背景walkの待ち・spawn）。`run_shell`と
+/// ポリシーエディタのパス2が共有する（モジュールdoc参照）。
+mod launch;
 mod mcp_preflight;
 mod preflight;
 /// `preflight`が打つ実機プローブ（実際にAppContainer子を起こしてFS I/Oを試す層）。
@@ -287,6 +290,7 @@ mod spawn_session;
 mod traverse;
 
 pub use acl_grant::*;
+pub use launch::*;
 pub use mcp_preflight::*;
 pub use preflight::*;
 pub(crate) use preflight_probe::*;

@@ -36,7 +36,6 @@ use windows::Win32::Security::{
     TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
     TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
-use windows::Win32::Storage::FileSystem::ReadFile;
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
@@ -46,8 +45,12 @@ use windows::Win32::System::Threading::{
 
 use crate::win_common::{
     build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl,
-    decode_console_bytes, read_two_pipes_to_strings, wide, write_all,
+    read_two_pipes_to_strings, stream_child_output, wide, write_all,
 };
+
+/// ストリーミング出力の1件（[`RestrictedChild::spawn_streaming`]用）。実体はTier2aと共有する
+/// [`crate::win_common::OutputEvent`]で、ここは既存の呼び出し元のための再エクスポートである。
+pub use crate::win_common::OutputEvent;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RestrictedError {
@@ -193,124 +196,22 @@ impl RestrictedChild {
         mut self,
         stdin_payload: Option<&[u8]>,
     ) -> tokio::sync::mpsc::UnboundedReceiver<OutputEvent> {
-        if let Some(payload) = stdin_payload {
-            if let Some(stdin) = self.stdin_write.take() {
-                write_all(stdin, payload);
-                unsafe {
-                    let _ = CloseHandle(stdin);
-                }
-            }
-        } else if let Some(stdin) = self.stdin_write.take() {
-            unsafe {
-                let _ = CloseHandle(stdin);
-            }
-        }
-
         // ハンドルの値だけを取り出し、`self`のDropが即座に閉じてしまわないよう
-        // `mem::forget`で無効化する。以降の後始末は各スレッドが自分の担当分だけ行う
-        // （`wfp.rs`の`WfpSession::teardown`と同じ「所有権をここで断つ」パターン）。
-        let stdout = SendHandle(self.stdout_read);
-        let stderr = SendHandle(self.stderr_read);
-        let process = SendHandle(self.process);
-        let job = SendHandle(self.job);
+        // `mem::forget`で無効化する。以降の後始末は`stream_child_output`が起こす
+        // 各スレッドが自分の担当分だけ行う。
+        let stdin_write = self.stdin_write.take();
+        let (process, job, stdout_read, stderr_read) =
+            (self.process, self.job, self.stdout_read, self.stderr_read);
         std::mem::forget(self);
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-        // stdout/stderrの読み取りとプロセス待機は**完全に独立したスレッド**で走らせる。
-        // 片方をもう片方の後始末（join）にぶら下げると、その依存の向きだけ`Exited`が
-        // `OutputClosed`を待つ形になってしまい、「孫プロセスがパイプを握っていても
-        // `Exited`は先に届く」という設計意図（モジュールdocの新設1番）を満たせない。
-        let tx_out = tx.clone();
-        let out_thread = std::thread::spawn(move || {
-            // RFC 2229の部分キャプチャが`stdout.0`だけを捉えて`SendHandle`のSend実装を
-            // 素通りしないよう、変数全体を明示的に再束縛してから使う。
-            let stdout = stdout;
-            stream_pipe_lines(stdout.0, |line| {
-                let _ = tx_out.send(OutputEvent::Stdout(line));
-            });
-            unsafe {
-                let _ = CloseHandle(stdout.0);
-            }
-        });
-        let tx_err = tx.clone();
-        let err_thread = std::thread::spawn(move || {
-            let stderr = stderr;
-            stream_pipe_lines(stderr.0, |line| {
-                let _ = tx_err.send(OutputEvent::Stderr(line));
-            });
-            unsafe {
-                let _ = CloseHandle(stderr.0);
-            }
-        });
-        let tx_closed = tx.clone();
-        std::thread::spawn(move || {
-            let _ = out_thread.join();
-            let _ = err_thread.join();
-            let _ = tx_closed.send(OutputEvent::OutputClosed);
-        });
-
-        std::thread::spawn(move || unsafe {
-            let process = process;
-            let job = job;
-            WaitForSingleObject(process.0, INFINITE);
-            let mut code: u32 = 0;
-            let _ = GetExitCodeProcess(process.0, &mut code);
-            let _ = tx.send(OutputEvent::Exited(code as i32));
-            // ジョブを閉じる＝kill-on-closeで、居残っている子孫（stdout/stderrを
-            // 握ったまま孤児化した孫プロセス）を巻き取って終了させる。これにより
-            // reader側の`ReadFile`がEOFで返り、`OutputClosed`が来ないまま無期限に
-            // ブロックする事態を避ける。
-            let _ = CloseHandle(job.0);
-            let _ = CloseHandle(process.0);
-        });
-
-        rx
-    }
-}
-
-/// ストリーミング出力の1件（[`RestrictedChild::spawn_streaming`]用）。
-#[derive(Debug, Clone)]
-pub enum OutputEvent {
-    Stdout(String),
-    Stderr(String),
-    /// stdout/stderrの両方がEOFに達した。**プロセスの終了（`Exited`）とは独立**——
-    /// 孫プロセスがハンドルを握ったままだと、こちらだけ遅れて届くことがある。
-    OutputClosed,
-    /// プロセスの終了コード。
-    Exited(i32),
-}
-
-/// `HANDLE`は`windows`クレートで`Send`を実装しないため、スレッド間で1回だけ受け渡す
-/// ための最小限のラッパ（`win_common::SendHandle`と同じ「単純な数値ハンドルなので
-/// 実際には安全」という判断、`docs/CODE-STRUCTURE-RULES.md`規則5的には複製だが、
-/// `win_common`側が`pub(crate)`にすらしていない1行型のため複製の方が単純）。
-#[derive(Clone, Copy)]
-struct SendHandle(HANDLE);
-unsafe impl Send for SendHandle {}
-
-/// パイプから行単位で読み、`\n`ごとにコールバックへ渡す（`win_common::decode_console_bytes`
-/// をBUG-051と同じ方針で1行分のバイト列に適用する）。EOF時に残った未改行の断片も
-/// 最後に1回だけ渡す。ブロッキング（呼び出し側が専用スレッドで回す）。
-fn stream_pipe_lines(handle: HANDLE, mut on_line: impl FnMut(String)) {
-    let mut pending = Vec::new();
-    let mut buf = [0u8; 8192];
-    unsafe {
-        loop {
-            let mut read = 0u32;
-            let ok = ReadFile(handle, Some(&mut buf), Some(&mut read), None);
-            if ok.is_err() || read == 0 {
-                break;
-            }
-            pending.extend_from_slice(&buf[..read as usize]);
-            while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = pending.drain(..=pos).collect();
-                on_line(decode_console_bytes(&line));
-            }
-        }
-    }
-    if !pending.is_empty() {
-        on_line(decode_console_bytes(&pending));
+        stream_child_output(
+            process,
+            job,
+            stdin_write,
+            stdout_read,
+            stderr_read,
+            stdin_payload,
+        )
     }
 }
 

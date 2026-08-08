@@ -292,16 +292,78 @@ pub fn proxy_env_vars(
     env
 }
 
+/// WFPのdefault-denyに開ける**loopbackの穴**（プロトコル別のポート一覧）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetLoopbackPorts {
+    pub tcp: Vec<u16>,
+    pub udp: Vec<u16>,
+}
+
+fn sorted_unique_ports(mut ports: Vec<u16>) -> Vec<u16> {
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// 起動済みのLocal Proxy / Fake DNSのアドレスから、WFPへ渡すloopback許可ポートを決める。
+///
+/// **プロトコルごとに分けるのが要点**である。ProxyはTCPのみ、Fake DNSはTCP・UDPの両方を
+/// 待ち受ける。まとめて両プロトコルへ開けると、Proxyのポート宛のUDPという**誰も待っていない
+/// 穴**をdefault-denyに開けることになる。
+///
+/// `run_shell`のセッション（`harness-cli`の起動パイプライン）と、ポリシーエディタのパス2
+/// （`plans/POLICY-EDITOR-TOMOYO-DIG.md`）の両方が使う（`proxy_env_vars`と同じ理由でここに置く
+/// ——`docs/CODE-STRUCTURE-RULES.md`規則5）。
+pub fn net_loopback_ports_for_agents(
+    proxy_addr: Option<SocketAddr>,
+    fake_dns_addr: Option<SocketAddr>,
+) -> NetLoopbackPorts {
+    let mut tcp = Vec::new();
+    let mut udp = Vec::new();
+    if let Some(addr) = proxy_addr {
+        tcp.push(addr.port());
+    }
+    if let Some(addr) = fake_dns_addr {
+        tcp.push(addr.port());
+        udp.push(addr.port());
+    }
+    NetLoopbackPorts {
+        tcp: sorted_unique_ports(tcp),
+        udp: sorted_unique_ports(udp),
+    }
+}
+
 /// `config.domain_policy_enabled=false`なら`Ok(None)`。有効なら`allow_domains`が空でも
 /// 全拒否ポリシーとして`127.0.0.1`の空きポートへbindし、accept loopを起動する。
 pub async fn spawn_local_proxy(config: &NetProxyConfig) -> std::io::Result<Option<LocalProxy>> {
+    spawn_local_proxy_with_policy(config, DomainPolicy::new(config.allow_domains.clone())).await
+}
+
+/// 評価に使う[`DomainPolicy`]を外から渡す版。
+///
+/// **`NetProxyConfig`へ「全許可」フラグを足さないための入口**である。ポリシーエディタの
+/// パス2（Tier2aでのドメイン記録、`plans/POLICY-EDITOR-TOMOYO-DIG.md`）は
+/// [`DomainPolicy::record_all`]を渡し、1回の完走で到達したドメインを取りこぼさず記録する。
+///
+/// 設定型（`NetProxyConfig`）側にモードを足さないのは2つの理由による。
+///
+/// 1. `harness_core::prompt`の`render_net_proxy`が`NetProxyConfig`を`..`無しで完全分解する
+///    コンパイル時ゲートを持っており、モデルへ宣言すべき制約かどうかの判断を毎回強制される
+///    ——記録モードはそもそもモデルへ送られないので、その判断の対象にすべきではない。
+/// 2. より重要な点として、設定ファイル・CLI引数という**通常の経路から「全許可」へ到達できる
+///    穴**を開けてしまう。`DomainPolicy`が型でモードを分けている理由そのものである
+///    （`harness_core::net_policy`のdoc）。
+pub async fn spawn_local_proxy_with_policy(
+    config: &NetProxyConfig,
+    policy: DomainPolicy,
+) -> std::io::Result<Option<LocalProxy>> {
     if !config.domain_policy_enabled {
         return Ok(None);
     }
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
     let audit = Arc::new(NetAuditLog::new(config.audit_log_path.clone()));
-    let policy = Arc::new(DomainPolicy::new(config.allow_domains.clone()));
+    let policy = Arc::new(policy);
     let tunnel_handler: Arc<dyn TunnelHandler> = match config.tls_inspection {
         harness_core::TlsInspection::Sni => Arc::new(SniTunnelHandler::default()),
     };
@@ -614,6 +676,45 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    /// WFPへ開けるloopbackの穴は**プロトコルごとに分ける**。まとめて両プロトコルへ開けると、
+    /// TCPしか待たないProxyのポート宛にUDPの穴が開く（`harness-cli`から移設したテスト）。
+    #[test]
+    fn loopback_ports_are_protocol_scoped_for_proxy_and_fake_dns() {
+        let ports = net_loopback_ports_for_agents(
+            Some("127.0.0.1:18080".parse().unwrap()),
+            Some("127.0.0.1:18053".parse().unwrap()),
+        );
+
+        assert_eq!(
+            ports,
+            NetLoopbackPorts {
+                tcp: vec![18053, 18080],
+                udp: vec![18053],
+            }
+        );
+    }
+
+    /// 同じポートを両エージェントが使っていても、重複を潰すだけでプロトコルは広げない。
+    #[test]
+    fn loopback_ports_are_deduplicated_without_widening_protocols() {
+        let ports = net_loopback_ports_for_agents(
+            Some("127.0.0.1:18053".parse().unwrap()),
+            Some("127.0.0.1:18053".parse().unwrap()),
+        );
+
+        assert_eq!(ports.tcp, vec![18053]);
+        assert_eq!(ports.udp, vec![18053]);
+    }
+
+    /// エージェントが1つも起動していなければ穴も開かない（**default-denyのまま**）。
+    #[test]
+    fn no_agents_means_no_loopback_holes() {
+        let ports = net_loopback_ports_for_agents(None, None);
+
+        assert!(ports.tcp.is_empty(), "穴が無い＝WFPのdefault-denyがそのまま残る");
+        assert!(ports.udp.is_empty());
+    }
 
     #[test]
     fn domain_allowed_matches_exact_and_wildcard() {

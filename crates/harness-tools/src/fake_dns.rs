@@ -130,11 +130,23 @@ impl Drop for FakeDnsAgent {
 }
 
 pub async fn spawn_fake_dns(config: &FakeDnsConfig) -> std::io::Result<FakeDnsAgent> {
+    spawn_fake_dns_with_policy(config, DomainPolicy::new(config.allow_domains.clone())).await
+}
+
+/// 評価に使う[`DomainPolicy`]を外から渡す版。理由は
+/// [`crate::net_proxy::spawn_local_proxy_with_policy`]と同じ——設定型へ「全許可」フラグを
+/// 足すと通常のCLI/設定経路からそこへ到達できてしまう。
+///
+/// **Proxyと同じポリシーを渡すこと。** 名前解決だけ通って接続で拒否される（またはその逆の）
+/// 食い違いは、記録の取りこぼしになる。
+pub async fn spawn_fake_dns_with_policy(
+    config: &FakeDnsConfig,
+    policy: DomainPolicy,
+) -> std::io::Result<FakeDnsAgent> {
     let (tcp_listener, socket) = bind_dns_sockets(config.preferred_port).await?;
     let addr = socket.local_addr()?;
     let audit = Arc::new(FakeDnsAuditLog::new(config.audit_log_path.clone()));
     let state = Arc::new(Mutex::new(FakeDnsState::default()));
-    let policy = DomainPolicy::new(config.allow_domains.clone());
     let policy_required = config.policy_required;
     let audit_for_task = audit.clone();
     let state_for_udp = state.clone();

@@ -271,6 +271,33 @@ impl AppContainerChild {
         ))
     }
 
+    /// ストリーミング版: stdin送出後、stdout/stderrを行単位で`OutputEvent`として流しつつ、
+    /// プロセス終了を別イベントとして通知する（ポリシーエディタのパス2＝Tier2aでのドメイン記録
+    /// のライブ表示用、`plans/POLICY-EDITOR-TOMOYO-DIG.md`参照）。
+    ///
+    /// 実装はTier1の`RestrictedChild::spawn_streaming`と**同じ関数**を共有する
+    /// （`win_common::stream_child_output`）——両者はHANDLEの構成が同形であり、
+    /// 「`Exited`と`OutputClosed`を独立させる」「待機スレッドがjobを閉じて居残った子孫を
+    /// 巻き取る」という作法をTierごとに書き直すと片方だけ直る事故になる。
+    pub fn spawn_streaming(
+        mut self,
+        stdin_payload: Option<&[u8]>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::win_common::OutputEvent> {
+        let stdin_write = self.stdin_write.take();
+        let (process, job, stdout_read, stderr_read) =
+            (self.process, self.job, self.stdout_read, self.stderr_read);
+        std::mem::forget(self);
+
+        crate::win_common::stream_child_output(
+            process,
+            job,
+            stdin_write,
+            stdout_read,
+            stderr_read,
+            stdin_payload,
+        )
+    }
+
     pub fn write_stdin_read_output_and_wait(
         mut self,
         stdin_payload: Option<&[u8]>,

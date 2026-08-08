@@ -16,7 +16,6 @@
 //! | [`cow_cmd`] | `cow`（upper_dir一覧・拒否監査） |
 
 use std::io::Read;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;

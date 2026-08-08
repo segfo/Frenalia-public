@@ -206,39 +206,15 @@ async fn run_windows_tier2a(
     cow_upper_dir: Option<&Path>,
     granted_passthrough: &[(std::path::PathBuf, bool)],
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
-    let _ = std::fs::create_dir_all(cwd);
-    // D-37: 子プロセスはこの**セッションのプロファイル**で起動する。`preflight`がACEを付けたのも
-    // 同じSIDなので、固定名（＝別のプロファイル）で導出すると workspace へ書けなくなる。
-    let sid = harness_sandbox::tier2a::win_appcontainer::ensure_profile(
-        &harness_sandbox::tier2a::session_profile::current_profile_name(),
-    )
-    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-
-    // preflightのsmoke testと同一のシェル解決を使う（pwshのストアアプリ実行エイリアスは
-    // AppContainerで起動不可＝`resolve_shell`が実在のpowershell.exeへフォールバックする）。
-    let (bin, shell_label) = harness_sandbox::tier2a::win_appcontainer::resolve_shell();
-    let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
-    let cwd_owned = cwd.to_path_buf();
     let mut env_owned = env.to_vec();
     // BUG-050: コマンド本体はstdinスクリプトへ文字列として埋め込まず、env経由で渡す
-    // （`RUN_SHELL_BOOTSTRAP_SCRIPT`のdoc参照）。
+    // （`RUN_SHELL_BOOTSTRAP_SCRIPT`のdoc参照）。`RUN_SHELL_COMMAND_ENV_VAR`はこのクレートの
+    // 定数なので、依存の向き上`spawn_shell_in_workspace`の中では積めない（あちらのdoc参照）。
     env_owned.push((RUN_SHELL_COMMAND_ENV_VAR.to_string(), command.to_string()));
-    // Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴を
-    // Redirector DLLのext capture対象として渡す（境界＝ACLはfs-allowが既に張っている、
-    // ここは変更の可視化のためのcapture）。
-    let ext_capture_roots: Vec<std::path::PathBuf> = granted_passthrough
-        .iter()
-        .filter(|(_, writable)| *writable)
-        .map(|(path, _)| path.clone())
-        .collect();
-    let cow = cow_upper_dir.map(|upper_dir| harness_sandbox::tier2a::win_appcontainer::CowInject {
-        workspace_root,
-        upper_dir,
-        ext_capture_roots: ext_capture_roots.as_slice(),
-    });
 
     // アプリ単位network制御（軸1、D-10/D-11）。`Allow`のときのみ`internetClient`を付与する
     // （`DeniedByChaining`/`Deny`はどちらも既定のcapability空＝network全遮断のまま）。
+    // **判定はここ（純粋関数）、付与は起動側**という分担を崩さない。
     let net_capability = if should_grant_tier2a_network_capability(
         net,
         net_proxy_enforced,
@@ -249,56 +225,30 @@ async fn run_windows_tier2a(
         harness_sandbox::tier2a::win_appcontainer::NetworkCapability::Deny
     };
 
-    // D-54: workspaceツリーのACEはworkspace＋モード単位のcapability SID宛に付いている。
-    // `preflight`が付与したのと同じ主体をこの子のトークンへ積まないと、workspaceが一切
-    // 見えない（package SIDだけでは届かない）。モードは`--cow`かどうかで決まり、
-    // `preflight`の`workspace_mode`と同じ語彙でなければならない——ずれると別の主体を導出し、
-    // 付与されていないcapabilityで起動して全アクセスが拒否される。
-    let workspace_mode = if cow_upper_dir.is_some() { "ro" } else { "rwx" };
-    let canonical_workspace = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let workspace_cap = harness_sandbox::tier2a::win_appcontainer::workspace_capability_sid(
-        &canonical_workspace,
-        workspace_mode,
-    )
-    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-
-    // D-54: 初回起動では、保護DACL配下を救済するwalkが背景で走っていることがある。終わる前に
-    // コマンドを走らせると、その配下がモデルには「存在しない/読めない」と見え、原因不明の
-    // 失敗になる。完了を待ち、walkが失敗していたら断る（fail-closed、`grant_job`のdoc）。
-    // 走っていなければ即座に返るので、2回目以降の起動では何のコストも無い。
-    //
-    // [BUG-082フォローアップ] `wait_until_done`は`std::thread::sleep`で実待ちする**同期**
-    // 関数——これを`.await`無しでこの`async fn`の中で直接呼ぶと、tokioのワーカースレッドを
-    // 待ち時間ぶん（初回は20秒超）丸ごと専有してしまう。`dispatch_one`
-    // （`harness-engine`）の`tokio::select!`は`tool.call(...)`のpollがここで止まっている間
-    // 一切戻ってこられず、並行して待っているはずの`WaitReason`ポーリング（`AgentEvent::
-    // ToolProgress`でツールカードへ待機理由を出す機構）が実行機会を得られない
-    // ——ステータスバー側（`grant_job::progress()`を直接読むだけの非ブロッキング呼び出し）は
-    // 別経路（TUIの描画tick）なので動いて見え、ツールカードだけが更新されないという
-    // 形で発覚した。`spawn_blocking`でtokioの専用ブロッキングスレッドへ逃がし、
-    // このタスク自身は`.await`で協調的に譲る。
-    tokio::task::spawn_blocking(
-        harness_sandbox::tier2a::win_appcontainer::grant_job::wait_until_done,
-    )
-    .await
-    .map_err(|e| {
-        ToolError::ExecutionFailed(format!("workspace ACL wait task panicked: {e}"))
-    })?
-    .map_err(ToolError::ExecutionFailed)?;
-
-    let child = harness_sandbox::tier2a::win_appcontainer::spawn_with_workspace(
-        &bin,
-        &args,
-        &cwd_owned,
-        &env_owned,
-        true,
-        sid.as_psid(),
+    let request = harness_sandbox::tier2a::win_appcontainer::WorkspaceSpawn {
+        cwd: cwd.to_path_buf(),
+        env: env_owned,
+        workspace_root: workspace_root.to_path_buf(),
+        cow_upper_dir: cow_upper_dir.map(|p| p.to_path_buf()),
+        granted_passthrough: granted_passthrough.to_vec(),
         net_capability,
-        cow,
-        Some(workspace_cap.as_psid()),
-    )
+    };
+
+    // [BUG-082フォローアップ] `spawn_shell_in_workspace`は内部で`grant_job::wait_until_done`
+    // （`std::thread::sleep`で実待ちする**同期**関数、初回は20秒超）を呼ぶ。これを`.await`無しで
+    // この`async fn`の中で直接呼ぶと、tokioのワーカースレッドを待ち時間ぶん丸ごと専有してしまう。
+    // `dispatch_one`（`harness-engine`）の`tokio::select!`は`tool.call(...)`のpollがここで
+    // 止まっている間一切戻ってこられず、並行して待っているはずの`WaitReason`ポーリング
+    // （`AgentEvent::ToolProgress`でツールカードへ待機理由を出す機構）が実行機会を得られない
+    // ——ステータスバー側（`grant_job::progress()`を直接読むだけの非ブロッキング呼び出し）は
+    // 別経路（TUIの描画tick）なので動いて見え、ツールカードだけが更新されないという形で発覚した。
+    // `spawn_blocking`でtokioの専用ブロッキングスレッドへ逃がし、このタスク自身は`.await`で
+    // 協調的に譲る。
+    let (child, shell_label) = tokio::task::spawn_blocking(move || {
+        harness_sandbox::tier2a::win_appcontainer::spawn_shell_in_workspace(request)
+    })
+    .await
+    .map_err(|e| ToolError::ExecutionFailed(format!("tier2a spawn task panicked: {e}")))?
     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child.kill_token();
     let stdin_bytes = run_shell_bootstrap_stdin();

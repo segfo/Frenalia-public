@@ -46,6 +46,13 @@ pub use shell::RunShellTool;
 /// **複製せずここから参照する**——文字列で綴った印や変数名はコンパイラが守らない（B-05）。
 #[cfg(windows)]
 pub use shell::{run_shell_bootstrap_stdin, RUN_SHELL_COMMAND_ENV_VAR, RUN_SHELL_OUTPUT_SENTINEL};
+/// Tier2aでコマンドを走らせる**5番目の経路**（`harness-policy-editor`のパス2＝Tier2aでの
+/// ドメイン記録）が、`run_shell`と同じ規則でnetwork capabilityの可否を決めるための共有部品。
+///
+/// ドメイン単位の制御を要求している状態では**WFPが立っているときだけ**capabilityを積む。
+/// これを経路ごとに書き直すと、片方だけ「proxyはあるがWFPが無い」状態で外向きソケットを
+/// 開けてしまう（proxyを読まない子は素通りできるので、それは強制ではない）。
+pub use shell::{should_grant_tier2a_network_capability, NetDecision};
 pub use web::WebFetchTool;
 
 /// 登録済みツールの集合。`ToolSpec` へ一括展開してプロバイダへ渡す。

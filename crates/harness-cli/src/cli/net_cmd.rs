@@ -36,36 +36,9 @@ pub(crate) fn validate_and_merge_net_allow_domains(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NetLoopbackPorts {
-    pub(crate) tcp: Vec<u16>,
-    pub(crate) udp: Vec<u16>,
-}
-
-pub(crate) fn sorted_unique_ports(mut ports: Vec<u16>) -> Vec<u16> {
-    ports.sort_unstable();
-    ports.dedup();
-    ports
-}
-
-pub(crate) fn net_loopback_ports_for_agents(
-    proxy_addr: Option<SocketAddr>,
-    fake_dns_addr: Option<SocketAddr>,
-) -> NetLoopbackPorts {
-    let mut tcp = Vec::new();
-    let mut udp = Vec::new();
-    if let Some(addr) = proxy_addr {
-        tcp.push(addr.port());
-    }
-    if let Some(addr) = fake_dns_addr {
-        tcp.push(addr.port());
-        udp.push(addr.port());
-    }
-    NetLoopbackPorts {
-        tcp: sorted_unique_ports(tcp),
-        udp: sorted_unique_ports(udp),
-    }
-}
+// loopback許可ポートの算出は`harness_tools::net_proxy`が持つ（Proxy/Fake DNSを起こす側と
+// 同じ場所。ポリシーエディタのパス2も同じ関数を使う）。ここは再エクスポートだけ。
+pub(crate) use harness_tools::net_proxy::net_loopback_ports_for_agents;
 
 fn event_string<'a>(event: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     event.get(key).and_then(|v| v.as_str())
@@ -198,8 +171,7 @@ pub(crate) fn run_net_subcommand(action: NetAction, workspace_root: &Path) -> Ex
 mod net_audit_tests {
     use super::{
         filter_net_audit_events, format_net_audit_output, net_audit_path,
-        net_loopback_ports_for_agents, validate_and_merge_net_allow_domains, NetLoopbackPorts,
-        OutputFormat,
+        validate_and_merge_net_allow_domains, OutputFormat,
     };
     use harness_core::NetProxyConfig;
     use serde_json::json;
@@ -242,32 +214,7 @@ mod net_audit_tests {
         );
     }
 
-    #[test]
-    fn loopback_ports_are_protocol_scoped_for_proxy_and_fake_dns() {
-        let ports = net_loopback_ports_for_agents(
-            Some("127.0.0.1:18080".parse().unwrap()),
-            Some("127.0.0.1:18053".parse().unwrap()),
-        );
-
-        assert_eq!(
-            ports,
-            NetLoopbackPorts {
-                tcp: vec![18053, 18080],
-                udp: vec![18053],
-            }
-        );
-    }
-
-    #[test]
-    fn loopback_ports_are_deduplicated_without_widening_protocols() {
-        let ports = net_loopback_ports_for_agents(
-            Some("127.0.0.1:18053".parse().unwrap()),
-            Some("127.0.0.1:18053".parse().unwrap()),
-        );
-
-        assert_eq!(ports.tcp, vec![18053]);
-        assert_eq!(ports.udp, vec![18053]);
-    }
+    // loopback許可ポートのテストは関数と一緒に`harness_tools::net_proxy`へ移設した。
 
     #[test]
     fn net_allow_domains_are_validated_and_deduplicated() {

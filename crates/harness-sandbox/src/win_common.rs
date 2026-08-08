@@ -7,7 +7,7 @@
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    LocalFree, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HLOCAL,
+    CloseHandle, LocalFree, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HLOCAL,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -19,6 +19,7 @@ use windows::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Pipes::CreatePipe;
+use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
 
 /// `harness-sandbox-vm`（`smb_share`・`vmsandboxd`）から参照されるため`pub`
 /// （`docs/CODE-STRUCTURE-RULES.md`規則4）。
@@ -275,6 +276,133 @@ pub(crate) fn read_two_pipes_to_strings(stdout: HANDLE, stderr: HANDLE) -> (Stri
     let err = read_to_string(stderr);
     let out = stdout_thread.join().unwrap_or_default();
     (out, err)
+}
+
+/// ストリーミング出力の1件（[`stream_child_output`]が流す）。
+///
+/// **`Exited`と`OutputClosed`は独立したイベントである。** 孫プロセスがstdout/stderrを
+/// 継承したまま握り続けると、直接の子が終了しても`OutputClosed`はすぐには来ない。
+/// 受け手は`Exited`を見た時点でタイムアウト判断などへ進んでよく、`OutputClosed`だけを
+/// 待ってハングする設計にしないこと。
+#[derive(Debug, Clone)]
+pub enum OutputEvent {
+    Stdout(String),
+    Stderr(String),
+    /// stdout/stderrの両方がEOFに達した。**プロセスの終了（`Exited`）とは独立**。
+    OutputClosed,
+    /// プロセスの終了コード。
+    Exited(i32),
+}
+
+/// spawn済みの子プロセスから、出力を行単位で流しつつ終了を別イベントで通知する。
+///
+/// Tier1（`win_restricted::RestrictedChild`）とTier2a（`win_appcontainer::AppContainerChild`）は
+/// **HANDLEの構成が同形**（process / job / stdin_write / stdout_read / stderr_read）なので、
+/// ストリーミングの実装はここ1つだけを持つ（`docs/CODE-STRUCTURE-RULES.md`規則5）。
+/// 呼び出し側は自分のDropを`mem::forget`で無効化してからハンドルを渡すこと——以降の後始末は
+/// 本関数が起こす各スレッドが自分の担当分だけ行う（`wfp.rs`の`WfpSession::teardown`と同じ
+/// 「所有権をここで断つ」パターン）。
+///
+/// `write_stdin_read_output_and_wait`と違い呼び出し側で`spawn_blocking`する必要はない
+/// ——OSスレッド4本（stdout読取・stderr読取・両者のjoin・プロセス待機）を内部で起こし、
+/// receiverだけを返す。
+pub(crate) fn stream_child_output(
+    process: HANDLE,
+    job: HANDLE,
+    stdin_write: Option<HANDLE>,
+    stdout_read: HANDLE,
+    stderr_read: HANDLE,
+    stdin_payload: Option<&[u8]>,
+) -> tokio::sync::mpsc::UnboundedReceiver<OutputEvent> {
+    if let Some(stdin) = stdin_write {
+        if let Some(payload) = stdin_payload {
+            write_all(stdin, payload);
+        }
+        unsafe {
+            let _ = CloseHandle(stdin);
+        }
+    }
+
+    let stdout = SendHandle(stdout_read);
+    let stderr = SendHandle(stderr_read);
+    let process = SendHandle(process);
+    let job = SendHandle(job);
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // stdout/stderrの読み取りとプロセス待機は**完全に独立したスレッド**で走らせる。
+    // 片方をもう片方の後始末（join）にぶら下げると、その依存の向きだけ`Exited`が
+    // `OutputClosed`を待つ形になってしまい、「孫プロセスがパイプを握っていても
+    // `Exited`は先に届く」という設計意図（[`OutputEvent`]のdoc）を満たせない。
+    let tx_out = tx.clone();
+    let out_thread = std::thread::spawn(move || {
+        // RFC 2229の部分キャプチャが`stdout.0`だけを捉えて`SendHandle`のSend実装を
+        // 素通りしないよう、変数全体を明示的に再束縛してから使う。
+        let stdout = stdout;
+        stream_pipe_lines(stdout.0, |line| {
+            let _ = tx_out.send(OutputEvent::Stdout(line));
+        });
+        unsafe {
+            let _ = CloseHandle(stdout.0);
+        }
+    });
+    let tx_err = tx.clone();
+    let err_thread = std::thread::spawn(move || {
+        let stderr = stderr;
+        stream_pipe_lines(stderr.0, |line| {
+            let _ = tx_err.send(OutputEvent::Stderr(line));
+        });
+        unsafe {
+            let _ = CloseHandle(stderr.0);
+        }
+    });
+    let tx_closed = tx.clone();
+    std::thread::spawn(move || {
+        let _ = out_thread.join();
+        let _ = err_thread.join();
+        let _ = tx_closed.send(OutputEvent::OutputClosed);
+    });
+
+    std::thread::spawn(move || unsafe {
+        let process = process;
+        let job = job;
+        WaitForSingleObject(process.0, INFINITE);
+        let mut code: u32 = 0;
+        let _ = GetExitCodeProcess(process.0, &mut code);
+        let _ = tx.send(OutputEvent::Exited(code as i32));
+        // ジョブを閉じる＝kill-on-closeで、居残っている子孫（stdout/stderrを握ったまま
+        // 孤児化した孫プロセス）を巻き取って終了させる。これによりreader側の`ReadFile`が
+        // EOFで返り、`OutputClosed`が来ないまま無期限にブロックする事態を避ける。
+        let _ = CloseHandle(job.0);
+        let _ = CloseHandle(process.0);
+    });
+
+    rx
+}
+
+/// パイプから行単位で読み、`\n`ごとにコールバックへ渡す（`decode_console_bytes`をBUG-051と
+/// 同じ方針で1行分のバイト列に適用する）。EOF時に残った未改行の断片も最後に1回だけ渡す。
+/// ブロッキング（呼び出し側が専用スレッドで回す）。
+fn stream_pipe_lines(handle: HANDLE, mut on_line: impl FnMut(String)) {
+    let mut pending = Vec::new();
+    let mut buf = [0u8; 8192];
+    unsafe {
+        loop {
+            let mut read = 0u32;
+            let ok = ReadFile(handle, Some(&mut buf), Some(&mut read), None);
+            if ok.is_err() || read == 0 {
+                break;
+            }
+            pending.extend_from_slice(&buf[..read as usize]);
+            while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=pos).collect();
+                on_line(decode_console_bytes(&line));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        on_line(decode_console_bytes(&pending));
+    }
 }
 
 /// 指定したSDDL文字列のセキュリティ記述子を持つ匿名パイプを作る（両端とも継承可能で返る）。

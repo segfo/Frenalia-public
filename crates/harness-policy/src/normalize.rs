@@ -139,7 +139,11 @@ impl SourceReport {
 /// パス表記の正規化（`\`→`/`のみ）。大文字小文字は**変えない**——Windowsのファイルシステムは
 /// 大小を区別しないが、ユーザーが設定ファイルで読む文字列としては元の見た目を保つ方がよく、
 /// 比較が要る場面（重複除去）だけ`eq_ignore_ascii_case`で吸収する。
-fn normalize_path(path: &str) -> String {
+///
+/// 候補・提案の値はすべてこの綴りで揃っている。**それらと突き合わせる側も同じ関数を通すこと**
+/// ——綴りを揃える規則を2つ持つとBUG-066/BUG-068と同型の穴になるので`pub`にしてある
+/// （ポリシーエディタの承認が、提案の値とワークスペースrootを比較するのに使う）。
+pub fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
@@ -274,6 +278,25 @@ pub fn granted_from_ledger(ledger_json: &str) -> Vec<(String, FsAccess)> {
 /// `net.allow_domains`が受け付けない（`normalize_domain_pattern`が拒否する）ため、
 /// 提案にしても適用できないから。
 pub fn normalize_net_audit(jsonl: &str) -> SourceReport {
+    normalize_net_audit_with_mode(jsonl, NetIntake::DeniedOnly)
+}
+
+/// `net-audit.jsonl`のどの行を候補にするか。
+///
+/// FS側の`Correlator::on_operation_end_any`（record-allモード）とまったく同じ形の分岐である
+/// ——収集器を「全部記録する」設定で回したとき、拒否だけを拾う正規化を通すと候補が**0件**に
+/// なるため、取り込み口の側にモードが要る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetIntake {
+    /// 通常運用（`harness net` / `harness policy suggest`）: 拒否された行だけを候補にする。
+    DeniedOnly,
+    /// ポリシーエディタのパス2（`DomainPolicy::record_all`で走らせた記録）:
+    /// **許可された行も候補にする**。全許可で走らせているので、拒否だけを見ると何も残らない。
+    All,
+}
+
+/// [`normalize_net_audit`]の取り込み口を選べる版（[`NetIntake`]参照）。
+pub fn normalize_net_audit_with_mode(jsonl: &str, intake: NetIntake) -> SourceReport {
     let mut notes = Vec::new();
     let mut folded: Vec<DeniedCandidate> = Vec::new();
     let mut ip_only_denies = 0usize;
@@ -289,7 +312,9 @@ pub fn normalize_net_audit(jsonl: &str) -> SourceReport {
                 continue;
             }
         };
-        if event.get("allowed").and_then(|v| v.as_bool()) != Some(false) {
+        if intake == NetIntake::DeniedOnly
+            && event.get("allowed").and_then(|v| v.as_bool()) != Some(false)
+        {
             continue;
         }
         let reason = event
@@ -316,10 +341,19 @@ pub fn normalize_net_audit(jsonl: &str) -> SourceReport {
     }
 
     if ip_only_denies > 0 {
-        notes.push(format!(
-            "{ip_only_denies} denied network event(s) carried no hostname (IP-only drops); \
-             net.allow_domains cannot express those, so they are not proposed"
-        ));
+        // 件数は必ず出す（黙って捨てると「通信が無かった」と区別できない、B-09）。
+        notes.push(match intake {
+            NetIntake::DeniedOnly => format!(
+                "{ip_only_denies} denied network event(s) carried no hostname (IP-only drops); \
+                 net.allow_domains cannot express those, so they are not proposed"
+            ),
+            NetIntake::All => format!(
+                "{ip_only_denies} network event(s) carried no hostname (IP-only); \
+                 net.allow_domains cannot express those, so they are not proposed. \
+                 これは既知の盲点です——OSのリゾルバを経由しない自前DNS実装や、IPを直接指定した \
+                 接続はドメイン名を復元できません"
+            ),
+        });
     }
 
     SourceReport {

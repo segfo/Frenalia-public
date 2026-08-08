@@ -34,6 +34,10 @@ pub mod mcp_profile;
 /// Tier2a本体（下記）はWin32 API依存のためwindows専用。
 pub mod traverse_ledger;
 
+/// 付与したfs passthrough ACE（`--fs-allow`・`.harness/settings.json`の`fs.*`）の記録。
+/// `traverse_ledger`と同じ理由で全プラットフォームでコンパイルする。
+pub mod fs_passthrough_ledger;
+
 /// workspace＋モード単位のcapability名とその秘密（D-54）。`session_profile`と同じ理由で
 /// windows専用にしない（名前の導出・台帳・検証は純粋関数で、CSPRNGだけがcfg分岐する）。
 pub mod workspace_capability;

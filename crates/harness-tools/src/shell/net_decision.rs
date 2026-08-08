@@ -7,7 +7,7 @@
 
 /// アプリ単位network制御（軸1、D-10/D-11）の判定結果。`classify_net_app`が返す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NetDecision {
+pub enum NetDecision {
     /// 許可リスト非空だが先頭execが不一致（既定）。
     Deny,
     /// 先頭execは一致したが、連鎖メタ文字（`|`/`&&`/`;`等）を含むため他exe混入の恐れがあり
@@ -87,7 +87,17 @@ pub(crate) fn classify_net_app(command: &str, allow_apps: &[String]) -> NetDecis
     NetDecision::Allow
 }
 
-pub(crate) fn should_grant_tier2a_network_capability(
+/// Tier2aの子へ`internetClient`を積んでよいか。
+///
+/// **軸が2つある。** ドメイン単位の制御（軸2）を要求しているときは、WFPのdefault-denyが
+/// 実際に立っている場合に限り許す——proxyだけでは環境変数を読まない子が素通りできるので、
+/// WFPが無いなら**capability自体を与えない**（fail-closed。「強制されていない」のではなく
+/// 「ソケットを1つも作れない」に倒す）。要求していないときはアプリ単位（軸1、D-10/D-11）の
+/// 判定だけを見る。
+///
+/// ポリシーエディタのパス2（Tier2aでのドメイン記録、`plans/POLICY-EDITOR-TOMOYO-DIG.md`）も
+/// **同じ規則**に従う必要があるため`pub`（判定を経路ごとに書き直すと片方だけ緩む）。
+pub fn should_grant_tier2a_network_capability(
     net: NetDecision,
     net_proxy_enforced: bool,
     net_domain_policy_requested: bool,
