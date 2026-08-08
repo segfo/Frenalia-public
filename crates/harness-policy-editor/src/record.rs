@@ -430,9 +430,9 @@ fn spawn_tier1(
     RecordError,
 > {
     let _ = std::fs::create_dir_all(request.cwd);
-    // 低ILラベルが付かないと、Tier1の子はcwd**内**にも書けない（BUG-087）。
+    // 低ILラベルが付かないと、Tier1の子はcwd**内**にも書けない（BUG-088）。
     // 致命的にはしないが、**事実は必ず残す**——ここを`let _ =`にしていたことが
-    // BUG-087を数か月見えなくした原因である。
+    // BUG-088を数か月見えなくした原因である。
     if let Err(e) = win_restricted::set_low_integrity_label(request.cwd) {
         warn(format!(
             "cwd（{}）へ低ILラベルを付けられませんでした: {e}。記録対象はcwd内にも\

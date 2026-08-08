@@ -33,7 +33,7 @@ const DRAIN: Duration = Duration::from_secs(4);
 // `SeSecurityPrivilege`の有効化が要るのでは」と疑ったが、それは誤りで、真因は
 // SDDL文字列`"S:(ML;NI;NW;;;LW)"`の`NI`がSDDLの正規ACEフラグトークンではないこと
 // （BUG-018の案Aが導入、以来ラベルは一度も付いていなかった）。修正済み
-// （docs/bugs/BUG-087.md、`win_restricted.rs`の`SDDL_LOW_LABEL`と回帰テスト3本）。
+// （docs/bugs/BUG-088.md、`win_restricted.rs`の`SDDL_LOW_LABEL`と回帰テスト3本）。
 
 /// **本命**: package SIDを持たないTier1のプロセスツリー（powershell.exe →孫の`cmd.exe`）で、
 /// 孫プロセスが行った`type`（読み取り）のFSアクセスが、`harness_pid`起点の親子継承だけで

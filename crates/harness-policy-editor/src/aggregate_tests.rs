@@ -126,7 +126,7 @@ fn an_empty_recording_says_so_instead_of_looking_like_a_clean_run() {
 }
 
 /// 拒否があったときは、Tier1固有の拒否とTier2aで要る許可の違いを注記する
-/// （BUG-087の設計メモ: 低ILラベルは継承しないのでサブディレクトリ内は書けない）。
+/// （BUG-088の設計メモ: 低ILラベルは継承しないのでサブディレクトリ内は書けない）。
 #[test]
 fn denials_carry_a_note_that_tier1_denials_differ_from_tier2a_needs() {
     let mut agg = Aggregate::new();
