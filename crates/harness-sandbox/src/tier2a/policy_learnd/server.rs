@@ -130,6 +130,9 @@ fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
     let volumes = drive_letter_map();
     let mut written = 0u64;
     let mut unconvertible = 0u64;
+    // record-allのツリー表示用。**ループの外**に置く（プロセスはあるバッチで起動し、
+    // 別のバッチでアクセスする）。deny-onlyモードでは使わない。
+    let mut tree = ProcessTree::new();
 
     let teardown_result = loop {
         match read_framed_timeout(pipe, DRAIN_INTERVAL) {
@@ -148,6 +151,7 @@ fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
                 flush_batch_record_all(
                     &sink_path,
                     &mut tracker,
+                    &mut tree,
                     &volumes,
                     starts,
                     records,
@@ -174,6 +178,7 @@ fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
             flush_batch_record_all(
                 &sink_path,
                 &mut tracker,
+                &mut tree,
                 &volumes,
                 starts,
                 records,
@@ -279,9 +284,14 @@ fn flush_batch(
 /// 永久に除外してしまう（`LearnPolicy.record_all`のdoc参照）。代わりに常に`None`を返す
 /// クロージャを渡し、`harness_pid`起点の親子継承（signal 2＋フォールバック）だけで
 /// スコープを決めさせる。
+///
+/// `tree`は**呼び出しをまたいで生き残る**（`serve_inner`が所有する）。プロセスは
+/// バッチNの`ProcessStart`で現れ、バッチN+1以降のアクセスを行うため、この関数の
+/// ローカルに置くと親PID・画像名がほぼ全件で欠落する。
 fn flush_batch_record_all(
     sink_path: &Path,
     tracker: &mut ScopeTracker,
+    tree: &mut ProcessTree,
     volumes: &[(String, String)],
     starts: Vec<super::etw::session::ProcessStartInfo>,
     records: Vec<AccessRecord>,
@@ -289,6 +299,13 @@ fn flush_batch_record_all(
 ) -> u64 {
     for start in &starts {
         tracker.on_process_start_probing(start, |_pid| None);
+        tree.insert(
+            start.pid,
+            ProcessIdentity {
+                parent_pid: start.parent_pid,
+                image_name: start.image_name.clone(),
+            },
+        );
     }
 
     let mut written = 0u64;
@@ -307,7 +324,8 @@ fn flush_batch_record_all(
         } else {
             format!("STATUS_ACCESS_DENIED ({:#010X})", record.status)
         };
-        let event = FsAuditEvent::observed(
+        let identity = tree.get(&record.pid);
+        let mut event = FsAuditEvent::observed(
             FsAuditKind::Etw,
             path,
             record.access,
@@ -315,13 +333,37 @@ fn flush_batch_record_all(
             reason,
             record.timestamp_unix_ms,
         )
-        .with_process(record.pid, None);
+        .with_process(
+            record.pid,
+            identity.and_then(|i| i.image_name.clone()),
+        );
+        // 親PIDが分かるのは`ProcessStart`を観測できた世代だけ。分からないものは
+        // `None`のまま残す（推測で埋めない——ツリー表示が嘘の親子関係を描くため）。
+        if let Some(parent_pid) = identity.and_then(|i| i.parent_pid) {
+            event = event.with_parent_process(parent_pid);
+        }
         if append_event(sink_path, &event) {
             written += 1;
         }
     }
     written
 }
+
+/// `ProcessStart`から拾ったプロセスの素性（record-allのツリー表示用）。
+///
+/// スコープ判定（[`ScopeTracker`]）とは別に持つ。あちらが答えるのは「対象か」だけで、
+/// 「誰の子か・何の実行ファイルか」は保持しない——判定に不要な情報を判定器へ足すと、
+/// 判定の単体テストがツリー表示の都合で壊れるようになる。
+#[derive(Debug, Clone)]
+struct ProcessIdentity {
+    parent_pid: Option<u32>,
+    image_name: Option<String>,
+}
+
+/// PID → 素性。**PID再利用は上書きで扱う**（新しい`ProcessStart`が来たら古い素性を捨てる）。
+/// [`ScopeTracker`]が`ProcessSequenceNumber`で行っている扱いと同じ方針だが、
+/// こちらは表示用なので順序の逆転までは追わない。
+type ProcessTree = std::collections::HashMap<u32, ProcessIdentity>;
 
 /// **取りこぼしを隠さない**（D-43）。収集の統計を制御レコードとして残す。
 fn record_collection_stats(
@@ -344,7 +386,7 @@ fn record_collection_stats(
         append_control(
             sink_path,
             &format!(
-                "unconvertible_paths: {unconvertible} denial(s) had a path that cannot be \
+                "unconvertible_paths: {unconvertible} event(s) had a path that cannot be \
                  expressed in settings (named pipes, unmapped volumes) and were dropped"
             ),
         );
@@ -354,7 +396,9 @@ fn record_collection_stats(
         append_control(
             sink_path,
             &format!(
-                "unresolved_process_scope: {unresolved} denial(s) came from a process that had \
+                // record-allでは拒否以外も流れるので「denial」とは言えない（B-32: 文言は
+                // ユーザーがその瞬間に取る行動を決める唯一の入力）。両モード共通の語にする。
+                "unresolved_process_scope: {unresolved} event(s) came from a process that had \
                  already exited, so it could not be attributed to this sandbox and was dropped"
             ),
         );
@@ -363,7 +407,9 @@ fn record_collection_stats(
         append_control(
             sink_path,
             &format!(
-                "attributed_by_parentage: {} process(es) were treated as in-scope because their                  parent was harness and the token query did not complete in time (they had                  already exited). This is an inference, not a proof.",
+                "attributed_by_parentage: {} process(es) were treated as in-scope because \
+                 their parent was harness and the token query did not complete in time (they \
+                 had already exited). This is an inference, not a proof.",
                 tracker.attributed_by_parentage_count()
             ),
         );
@@ -506,6 +552,7 @@ mod flush_batch_record_all_tests {
         let written = flush_batch_record_all(
             &sink_path,
             &mut tracker,
+            &mut ProcessTree::new(),
             &volumes,
             starts,
             records,
@@ -549,6 +596,7 @@ mod flush_batch_record_all_tests {
         let written = flush_batch_record_all(
             &sink_path,
             &mut tracker,
+            &mut ProcessTree::new(),
             &volumes,
             Vec::new(),
             records,
@@ -588,6 +636,7 @@ mod flush_batch_record_all_tests {
         let written = flush_batch_record_all(
             &sink_path,
             &mut tracker,
+            &mut ProcessTree::new(),
             &volumes,
             starts,
             records,
@@ -596,5 +645,116 @@ mod flush_batch_record_all_tests {
 
         assert_eq!(written, 0);
         assert_eq!(unconvertible, 1);
+    }
+
+    /// **`parent_process_id`/`image_path`に実際に書き手が居ることの回帰テスト。**
+    /// この2つはプロセスツリー表示のために足されたが、当初は代入箇所が本番に1つも無く、
+    /// 永久に`None`のままだった（B-01「対の片方だけ実装」）。
+    #[test]
+    fn records_carry_the_parent_pid_and_image_name_from_process_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("fs-audit.jsonl");
+        let mut tracker = ScopeTracker::new("").with_harness_pid(Some(100));
+        let mut tree = ProcessTree::new();
+        let volumes = drive_letter_map();
+        let mut unconvertible = 0u64;
+
+        let starts = vec![ProcessStartInfo {
+            pid: 200,
+            parent_pid: Some(100),
+            image_name: Some("cargo.exe".to_string()),
+            package_full_name: None,
+            process_sequence_number: Some(1),
+        }];
+        let records = vec![AccessRecord {
+            file_name: r"C:\work\Cargo.toml".to_string(),
+            pid: 200,
+            access: FsAccess::Read,
+            status: 0,
+            allowed: true,
+            timestamp_unix_ms: 1,
+            create_options: 0,
+        }];
+
+        flush_batch_record_all(
+            &sink_path,
+            &mut tracker,
+            &mut tree,
+            &volumes,
+            starts,
+            records,
+            &mut unconvertible,
+        );
+
+        let lines = read_lines(&sink_path);
+        assert_eq!(lines[0]["process_id"], 200);
+        assert_eq!(lines[0]["parent_process_id"], 100);
+        assert_eq!(lines[0]["image_path"], "cargo.exe");
+    }
+
+    /// **素性はバッチをまたいで生き残る。** プロセスはあるバッチの`ProcessStart`で現れ、
+    /// 別のバッチでファイルを触る——`ProcessTree`を関数のローカルにすると、実運用では
+    /// ほぼ全件で親PID・画像名が欠落する（`flush_batch_record_all`のdoc参照）。
+    #[test]
+    fn identities_survive_across_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("fs-audit.jsonl");
+        let mut tracker = ScopeTracker::new("").with_harness_pid(Some(100));
+        let mut tree = ProcessTree::new();
+        let volumes = drive_letter_map();
+        let mut unconvertible = 0u64;
+
+        // バッチ1: ProcessStartだけが届く（アクセスはまだ無い）。
+        flush_batch_record_all(
+            &sink_path,
+            &mut tracker,
+            &mut tree,
+            &volumes,
+            vec![ProcessStartInfo {
+                pid: 200,
+                parent_pid: Some(100),
+                image_name: Some("rustc.exe".to_string()),
+                package_full_name: None,
+                process_sequence_number: Some(1),
+            }],
+            Vec::new(),
+            &mut unconvertible,
+        );
+
+        // バッチ2: そのプロセスのアクセスだけが届く。
+        flush_batch_record_all(
+            &sink_path,
+            &mut tracker,
+            &mut tree,
+            &volumes,
+            Vec::new(),
+            vec![AccessRecord {
+                file_name: r"C:\work\src\lib.rs".to_string(),
+                pid: 200,
+                access: FsAccess::Read,
+                status: 0,
+                allowed: true,
+                timestamp_unix_ms: 2,
+                create_options: 0,
+            }],
+            &mut unconvertible,
+        );
+
+        let lines = read_lines(&sink_path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["parent_process_id"], 100);
+        assert_eq!(lines[0]["image_path"], "rustc.exe");
+    }
+
+    /// 記録モードが実際に送る`session_profile`は、昇格側の`validate_request`が使う
+    /// `is_session_profile_name`を通らなければならない（通らなければ収集は一度も
+    /// 始まらない）。ワイヤ形式テストが提示する名前と、この検証を突き合わせる。
+    #[test]
+    fn the_profile_name_the_record_mode_sends_passes_the_elevated_side_validation() {
+        let name = crate::tier2a::session_profile::current_profile_name();
+        assert!(
+            crate::tier2a::session_profile::is_session_profile_name(&name),
+            "record mode would be rejected by the collector: {name}"
+        );
     }
 }

@@ -140,6 +140,16 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture", "policy_learnd::etw::tier1_record_all_spike_tests",
         ],
     ),
+    // ポリシーエディタのパス1（Tier1でrecord-all記録）の実機E2E。ビルド済みの
+    // `harness-policy-editor.exe`を起動する形なので、収集器の解決経路（current_exeの隣）も
+    // 本番と同じものを通る（`crates/harness-policy-editor/tests/record_e2e.rs`）。
+    (
+        "e2e-policy-editor-record",
+        &[
+            "test", "-p", "harness-policy-editor", "--test", "record_e2e", "--", "--ignored",
+            "--test-threads=1", "--nocapture",
+        ],
+    ),
     (
         "e2e-loopback-exemption",
         &[

@@ -141,10 +141,23 @@ mod tests {
     }
 
     /// `record_all: true`のワイヤ形式も固定する（Tier1記録モードが実際に送る形）。
+    ///
+    /// **`session_profile`はrecord-allでもプロファイル名の形でなければならない。**
+    /// スコープ判定には使われない（Tier1にpackage SIDが無いため）が、昇格側の
+    /// `validate_request`が`is_session_profile_name`で形を検証しており、通らない名前を
+    /// 送ると収集がまったく始まらない。ここで独自の名前（`harness.policy-mode`等）を
+    /// 例示すると、それを写した実装が無言で拒否される——同じ主張を
+    /// `server.rs`の`the_profile_name_the_record_mode_sends_passes_the_elevated_side_validation`
+    /// が実際の検証関数に対して固定している。
     #[test]
     fn start_collect_request_with_record_all_true_wire_format_is_stable() {
+        let profile = "harness.shell.sandbox.4242-1700000000";
+        assert!(
+            crate::tier2a::session_profile::is_session_profile_name(profile),
+            "the example must be a name the elevated side actually accepts"
+        );
         let request = LearnRequest::StartCollect(LearnPolicy {
-            session_profile: "harness.policy-mode".to_string(),
+            session_profile: profile.to_string(),
             workspace_root: PathBuf::from("C:/work"),
             fs_audit_log_path: PathBuf::from("C:/work/.harness/sandbox/session-x/fs-audit.jsonl"),
             harness_pid: Some(4242),
@@ -153,7 +166,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_string(&request).unwrap(),
-            r#"{"StartCollect":{"session_profile":"harness.policy-mode","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":4242,"record_all":true}}"#
+            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.4242-1700000000","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":4242,"record_all":true}}"#
         );
     }
 

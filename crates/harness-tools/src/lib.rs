@@ -37,6 +37,15 @@ use harness_sandbox::JailError;
 pub use fs_tools::{EditFileTool, ReadFileTool, WriteFileTool};
 pub use search::{GlobTool, GrepTool};
 pub use shell::RunShellTool;
+/// Tier1でコマンドを走らせる**4番目の経路**（`harness-policy-editor`の記録モード）が、
+/// `run_shell`とまったく同じ形でシェルを起動するための共有部品。
+///
+/// コマンド本体はコマンドラインにもstdinスクリプトにも埋め込まず、`RUN_SHELL_COMMAND_ENV_VAR`
+/// 経由で渡して`run_shell_bootstrap_stdin()`をstdinへ流す（BUG-050）。出力は
+/// `RUN_SHELL_OUTPUT_SENTINEL`でシェル起動時ノイズと切り分ける（BUG-086）。
+/// **複製せずここから参照する**——文字列で綴った印や変数名はコンパイラが守らない（B-05）。
+#[cfg(windows)]
+pub use shell::{run_shell_bootstrap_stdin, RUN_SHELL_COMMAND_ENV_VAR, RUN_SHELL_OUTPUT_SENTINEL};
 pub use web::WebFetchTool;
 
 /// 登録済みツールの集合。`ToolSpec` へ一括展開してプロバイダへ渡す。

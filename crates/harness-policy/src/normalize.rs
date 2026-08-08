@@ -494,6 +494,86 @@ pub fn normalize_fs_audit(jsonl: &str) -> SourceReport {
     }
 }
 
+/// **大量観測向け**の逐次畳み込み器（ポリシーエディタの記録モード＝record-all用）。
+///
+/// # なぜ[`fold_fs`]と別に要るのか
+///
+/// | | [`fold_fs`]（既存、deny-only） | 本型（record-all） |
+/// |---|---|---|
+/// | 入力 | 拒否だけ（`normalize_fs_audit`が`allowed`を捨てる） | 拒否＋許可の両方 |
+/// | 件数の規模 | 数十件 | 実測3,131件、`cargo build`規模ならさらに桁が増える |
+/// | 畳み込み | `Vec`の線形走査（O(n·m)） | `HashMap`（O(n)） |
+///
+/// deny-onlyの規模では線形走査で十分だったが、record-allは**成功したアクセスも全部載る**ので
+/// 桁が変わる。既存経路の挙動を変えずに済ませるため、置き換えではなく並存させる。
+/// **両者が同じ結果を返すことは[`normalize_tests`]の同値性テストで固定する**——畳み込みの
+/// 実装が2つある以上、片方だけ直る事故（B-01）はテストでしか止められない。
+///
+/// # `DeniedCandidate`をrecord-allでも使う理由
+///
+/// 型名は"denied"だが、実体は「許可ルールが要る要求1件」であり、[`crate::generalize`]は
+/// この型でしか動かない。record-allでは`reason`に観測時の理由（`observed`等）が入り、
+/// 「拒否された」という含意は持たない。
+#[derive(Debug, Default)]
+pub struct FsFolder {
+    /// キーは`(小文字化したパス, access)`。Windowsのパス比較は大小を区別しないので、
+    /// 畳み込みも大小を無視する（[`fold_fs`]の`eq_ignore_ascii_case`と同じ規則）。
+    seen: std::collections::HashMap<(String, FsAccess), usize>,
+    folded: Vec<DeniedCandidate>,
+}
+
+impl FsFolder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 1件を畳み込む。同じ`(パス, access)`が既にあれば件数を増やし、無ければ追加する。
+    /// 最初に見た`reason`を保持する（後から来た同一パスの理由で上書きしない）。
+    pub fn add(
+        &mut self,
+        source: Source,
+        path: &str,
+        access: FsAccess,
+        reason: &str,
+        timestamp: u64,
+    ) {
+        let normalized = normalize_path(path);
+        let key = (normalized.to_ascii_lowercase(), access);
+        match self.seen.get(&key) {
+            Some(&index) => {
+                let existing = &mut self.folded[index];
+                existing.count = existing.count.saturating_add(1);
+                existing.last_seen_unix_ms = existing.last_seen_unix_ms.max(timestamp);
+            }
+            None => {
+                self.seen.insert(key, self.folded.len());
+                self.folded.push(DeniedCandidate::fs(
+                    source, normalized, access, reason, 1, timestamp,
+                ));
+            }
+        }
+    }
+
+    /// 観測順（初出順）の候補列。[`crate::generalize`]は入力順に依存しないので、
+    /// ここでの並びは表示・テストのための決定性だけを担う。
+    pub fn into_candidates(self) -> Vec<DeniedCandidate> {
+        self.folded
+    }
+
+    pub fn candidates(&self) -> &[DeniedCandidate] {
+        &self.folded
+    }
+
+    /// 畳み込み後の件数（＝異なる`(パス, access)`の数）。
+    pub fn len(&self) -> usize {
+        self.folded.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.folded.is_empty()
+    }
+}
+
 fn fold_fs(
     folded: &mut Vec<DeniedCandidate>,
     source: Source,

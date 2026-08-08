@@ -37,21 +37,42 @@
 //! | 用途 | どこから |
 //! |---|---|
 //! | Tier1起動・ストリーミング出力 | `harness_sandbox::tier1::win_restricted`（`spawn_streaming`） |
+//! | シェル起動の作法（コマンドはenv経由・stdinは固定ブートストラップ・境界印） | `harness_tools`（`run_shell`と共有、B-05） |
 //! | ETW収集器（record-all） | `harness_sandbox::tier2a::policy_learnd`（`LearnPolicy.record_all`） |
 //! | Local Proxy / Fake DNS | `harness_tools::net_proxy` / `fake_dns`（`proxy_env_vars`で環境変数注入） |
-//! | 正規表現の提案 | `harness_policy::generalize` |
+//! | 候補の畳み込みと正規表現の提案 | `harness_policy`（`FsFolder` / `generalize`） |
 //! | ネットワーク全許可（パス2） | `harness_core::DomainPolicy::record_all()` |
+//! | **パス1のオーケストレーション** | 本クレート [`record`] |
+//! | **記録セッションの置き場とマニフェスト** | 本クレート [`session_dir`] |
+//! | **観測イベントの集計と表示** | 本クレート [`aggregate`] |
 //! | **監査JSONLの追記追従読み** | 本クレート [`audit_tail`] |
 //! | **記録セッションの排他** | 本クレート [`session_lock`] |
 //!
 //! `harness-policy`は「**ファイルを読まない**」を明示的な契約にしているので、
 //! tailerはそちらへは置けない（同クレートのlib.rs参照）。
+//!
+//! # 画面遷移の順序を強制しない
+//!
+//! 記録（[`record`]）と閲覧（[`aggregate`]＋[`session_dir`]）は独立していて、
+//! 間の状態はワークスペース上のファイル（`fs-audit.jsonl`と`record-session.json`）が持つ。
+//! 「記録し終えたら編集画面へ進む」ような一方通行のウィザードにしないためで、
+//! 記録し直す・過去の記録を別の一般化度合いで見直す、をいつでも行える。
 
+pub mod aggregate;
 pub mod audit_tail;
+pub mod session_dir;
 pub mod session_lock;
 
+pub use aggregate::Aggregate;
 pub use audit_tail::AuditTail;
+pub use session_dir::{RecordManifest, RecordSessionDir, RecordStatus};
 pub use session_lock::{LockOutcome, RECORDING_MUTEX_NAME};
+
+#[cfg(windows)]
+pub mod record;
+
+#[cfg(windows)]
+pub use record::{record, RecordError, RecordEvent, RecordOutcome, RecordRequest};
 
 #[cfg(windows)]
 pub use session_lock::RecordingLock;

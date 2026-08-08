@@ -987,8 +987,11 @@ fn platform_shell_command(command: &str) -> ShellInvocation {
 /// `win_common::build_env_block`）を経由するため、CP932等のANSIコードページでは表現できない
 /// 文字（絵文字・ハングル・非BMP等）も無損失で子へ渡る。読み取り後は
 /// `RUN_SHELL_BOOTSTRAP_SCRIPT`内で`Remove-Item Env:`により孫プロセスへの継承を絶つ。
+///
+/// **`pub`である理由**: ポリシーエディタの記録モード（`harness-policy-editor`）が
+/// Tier1でコマンドを走らせる4番目の経路になるため。複製すると綴りが静かにずれる（B-05）。
 #[cfg(windows)]
-const RUN_SHELL_COMMAND_ENV_VAR: &str = "HARNESS_RUN_SHELL_COMMAND";
+pub const RUN_SHELL_COMMAND_ENV_VAR: &str = "HARNESS_RUN_SHELL_COMMAND";
 
 /// BUG-049/BUG-050: `-Command -`（stdin経由）で流すブートストラップ。**内容はコマンドに
 /// 依存しない固定の純ASCII文字列**であり、これがstdinの符号化問題（BUG-049修正が
@@ -1013,8 +1016,9 @@ const RUN_SHELL_COMMAND_ENV_VAR: &str = "HARNESS_RUN_SHELL_COMMAND";
 /// 終了状態」意味論に揃える。
 ///
 /// Tier0（本関数の呼び出し元`platform_shell_command`）・Tier2a（`run_windows_tier2a`）・
-/// Tier1（`run_windows_tier1`）の3経路全てがこの1関数を通す（Tier横断で1箇所に集約し、
-/// 個別に実装して食い違うことを防ぐ）。
+/// Tier1（`run_windows_tier1`）・ポリシーエディタの記録モード
+/// （`harness_policy_editor::record`、Tier1で対象コマンドを走らせる）の**4経路全て**が
+/// この1関数を通す（Tier横断で1箇所に集約し、個別に実装して食い違うことを防ぐ）。
 #[cfg(windows)]
 const RUN_SHELL_BOOTSTRAP_SCRIPT: &str = "\
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
@@ -1056,8 +1060,12 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif (-not $?) { exit 1 }
 ///
 /// 印が見つからない場合（Unix・Tier3・シェルが印に到達する前に死んだ場合）は
 /// **全部をコマンドの出力として扱う**——安全側（隠さない側）へ倒す。
+///
+/// **`pub`である理由**: ポリシーエディタの記録モードは出力を**行単位でストリーミング**
+/// するため、`split_shell_startup_noise`（全文が揃ってから切る）をそのままは使えない。
+/// 印そのものを共有して、切り方だけを各自の形に合わせる（B-05: 印の綴りは複製しない）。
 #[cfg(windows)]
-const RUN_SHELL_OUTPUT_SENTINEL: &str = "<<<harness-run-shell-begin>>>";
+pub const RUN_SHELL_OUTPUT_SENTINEL: &str = "<<<harness-run-shell-begin>>>";
 
 /// 境界印で「シェル起動時ノイズ」と「コマンドの出力」に分ける。戻り値は`(noise, output)`。
 ///
@@ -1093,8 +1101,10 @@ fn merge_startup_noise(out_noise: &str, err_noise: &str) -> Option<String> {
     }
 }
 
+/// ブートストラップをstdinへ流すためのバイト列。**Tier横断の4経路が共有する**
+/// （このdocの上にある`RUN_SHELL_BOOTSTRAP_SCRIPT`の最終段落を参照）。
 #[cfg(windows)]
-fn run_shell_bootstrap_stdin() -> Vec<u8> {
+pub fn run_shell_bootstrap_stdin() -> Vec<u8> {
     debug_assert!(
         RUN_SHELL_BOOTSTRAP_SCRIPT.is_ascii(),
         "BUG-050: bootstrap must stay pure ASCII so no code-page conversion is ever needed"

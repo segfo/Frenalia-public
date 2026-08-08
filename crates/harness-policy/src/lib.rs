@@ -38,7 +38,7 @@ pub use event::{FsAuditEvent, FsAuditKind};
 pub use gate::{check_proposal, GateVerdict};
 pub use generalize::{Generalization, RuleProposal, SettingsKey};
 pub use insufficient::{diagnose, GrantedPaths, Insufficient};
-pub use normalize::{DeniedCandidate, Requested, Source, SourceReport};
+pub use normalize::{DeniedCandidate, FsFolder, Requested, Source, SourceReport};
 
 /// 4経路ぶんの[`SourceReport`]をまとめた、提案生成の入力一式。
 ///

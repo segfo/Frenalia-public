@@ -255,3 +255,54 @@ fn path_separators_are_normalized_uniformly_across_sources() {
         assert_eq!(path, "C:/a/b");
     }
 }
+
+// --- FsFolder（record-all向けの畳み込み） -----------------------------------
+
+/// **畳み込みの実装が2つある以上、同値であることをテストで固定する**（B-01）。
+/// 同じ入力列に対し、既存の`fold_fs`（deny-onlyが使う線形走査）と`FsFolder`（record-allが
+/// 使うHashMap）が**同じ候補列**を返すこと。片方だけ直る事故はここで落ちる。
+#[test]
+fn fs_folder_and_fold_fs_agree_on_the_same_input() {
+    let input = [
+        (r"C:\a\b.txt", FsAccess::Read, 10u64),
+        ("C:/a/b.txt", FsAccess::Read, 20), // 区切り違い＝同一
+        (r"C:\A\B.TXT", FsAccess::Read, 15), // 大小違い＝同一
+        (r"C:\a\b.txt", FsAccess::ReadWrite, 30), // accessが違えば別候補
+        (r"C:\c.txt", FsAccess::Read, 5),
+    ];
+
+    let mut legacy: Vec<DeniedCandidate> = Vec::new();
+    let mut folder = FsFolder::new();
+    for (path, access, ts) in input {
+        fold_fs(&mut legacy, Source::Etw, path, access, "observed", ts);
+        folder.add(Source::Etw, path, access, "observed", ts);
+    }
+
+    assert_eq!(folder.into_candidates(), legacy);
+    assert_eq!(legacy.len(), 3, "3つの異なる(パス, access)へ畳まれる");
+    assert_eq!(legacy[0].count, 3);
+    assert_eq!(legacy[0].last_seen_unix_ms, 20, "最新のタイムスタンプを保つ");
+}
+
+/// record-allの主目的: **許可されたアクセスも候補になる**。`FsFolder`は`allowed`を見ない
+/// （見るのは呼び出し側の責務）ので、成功アクセスもそのまま畳み込める。
+#[test]
+fn fs_folder_folds_observed_accesses_regardless_of_the_outcome() {
+    let mut folder = FsFolder::new();
+    folder.add(Source::Etw, "C:/ok.txt", FsAccess::Read, "observed", 1);
+    folder.add(Source::Etw, "C:/ng.txt", FsAccess::Read, "STATUS_ACCESS_DENIED", 2);
+
+    let candidates = folder.into_candidates();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].reason, "observed");
+    assert_eq!(candidates[1].reason, "STATUS_ACCESS_DENIED");
+}
+
+/// 空のまま取り出しても壊れない（記録が1件も観測できなかった場合）。
+#[test]
+fn fs_folder_starts_empty() {
+    let folder = FsFolder::new();
+    assert!(folder.is_empty());
+    assert_eq!(folder.len(), 0);
+    assert!(folder.into_candidates().is_empty());
+}
