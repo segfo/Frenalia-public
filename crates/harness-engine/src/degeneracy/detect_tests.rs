@@ -108,14 +108,48 @@ fn a_looping_paragraph_collapses_novelty() {
     assert!(reason.contains("既出"), "{reason}");
 }
 
-/// ②はゲートが閉じている間は評価されない（§11.2「疑わしいときだけ厳しく見る」）。
+/// **連続性の要求そのものの固定**: 1区間だけホットでも発火しない。必要区間数(2)に届く
+/// 2区間目まで積んで初めて発火する。
 #[test]
-fn novelty_is_not_evaluated_while_the_gate_is_closed() {
+fn a_single_hot_section_alone_does_not_fire() {
+    let cfg = NgramConfig {
+        window: 256,
+        n: 16,
+        seen_ratio_max: 0.80,
+        min_hot_sections: 2,
+        min_hot_sections_suspect: 2,
+    };
+    let mut w = StreamWatcher::new(ShortPeriodConfig::default(), cfg);
+    let para = "この問題の原因はおそらく設定ファイルの読み込み順序にある。順序を入れ替えれば直るはずだ。";
+    assert!(para.chars().count() > cfg.n, "①②の対象になる長さであること");
+    // ちょうど1区間分（256文字）を同一段落の反復で埋める。
+    let one_section: String = para.repeat(10).chars().take(256).collect();
+    assert_eq!(
+        feed(&mut w, &one_section, true),
+        None,
+        "1区間だけでは連続性の要求(2区間)に届かないはず"
+    );
+    assert!(
+        w.max_section_ratio() > cfg.seen_ratio_max,
+        "この区間自体はホットのはず（前提が崩れていないか確認）: {}",
+        w.max_section_ratio()
+    );
+    // 2区間目もホットになるまで埋めると、必要区間数に達して発火する。
+    let hit = feed(&mut w, &one_section, true);
+    assert_eq!(hit.map(|h| h.0), Some(DegenerateKind::NoveltyCollapse));
+}
+
+/// ②はゲートの状態に関係なく常に評価されるが、**必要な連続ホット区間数**がゲートで変わる
+/// （§11.2「疑わしいときだけ厳しく見る」を、on/offではなく厳しさの量で表現する、BUG-087）。
+/// 同じ蓄積量でも、ゲートが閉じている（平常時）間は`min_hot_sections`（既定6）の連続を要求されて
+/// 届かず、ゲートを開く（疑い状態）と`min_hot_sections_suspect`（既定3）で足りて発火する。
+#[test]
+fn novelty_needs_more_consecutive_hot_sections_while_the_gate_is_closed() {
     let mut w = watcher();
     let para = "この問題の原因はおそらく設定ファイルの読み込み順序にある。順序を入れ替えれば直るはずだ。\
                 しかし本当にそうだろうか。もう一度確かめる必要がある。";
     assert_eq!(feed(&mut w, &para.repeat(40), false), None);
-    // 同じ蓄積のままゲートを開けると発火する＝差はゲートだけ。
+    // 同じ蓄積のままゲートを開けると、必要区間数が下がって発火する＝差はゲートだけ。
     assert_eq!(
         w.evaluate(true).map(|h| h.0),
         Some(DegenerateKind::NoveltyCollapse)
@@ -142,6 +176,12 @@ fn a_long_markdown_document_does_not_collapse_novelty() {
     }
     assert!(doc.chars().count() > 4_000);
     assert_eq!(feed(&mut w, &doc, true), None);
+    // `seen_ratio_max`（既定0.80）への引き下げに実測の余裕があることを固定する。
+    assert!(
+        w.max_section_ratio() < NgramConfig::default().seen_ratio_max,
+        "最大区間既出率{}が閾値に迫っている",
+        w.max_section_ratio()
+    );
 }
 
 /// **誤検知してはならない**: 同型の`impl`ブロックが並ぶ正当なコード。
@@ -159,6 +199,11 @@ fn repetitive_but_legitimate_code_does_not_collapse_novelty() {
     }
     assert!(code.chars().count() > 3_000);
     assert_eq!(feed(&mut w, &code, true), None);
+    assert!(
+        w.max_section_ratio() < NgramConfig::default().seen_ratio_max,
+        "最大区間既出率{}が閾値に迫っている",
+        w.max_section_ratio()
+    );
 }
 
 /// **誤検知してはならない**: 大きなJSON配列。構造の反復が最も激しい正当な形。
@@ -178,6 +223,12 @@ fn a_large_json_array_does_not_collapse_novelty() {
     let text = serde_json::to_string_pretty(&items).unwrap();
     assert!(text.chars().count() > 8_000);
     assert_eq!(feed(&mut w, &text, true), None);
+    // 構造反復が最も激しいケースなので、ここが閾値に迫っていないかを特に注視する。
+    assert!(
+        w.max_section_ratio() < NgramConfig::default().seen_ratio_max,
+        "最大区間既出率{}が閾値に迫っている",
+        w.max_section_ratio()
+    );
 }
 
 /// 窓を埋めるだけの分量が無いうちは②を判定しない（短い出力を誤って捕まえない）。

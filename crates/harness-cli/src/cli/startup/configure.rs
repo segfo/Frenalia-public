@@ -296,6 +296,10 @@ fn resolve_degeneracy(
             window: ng.window.unwrap_or(d.ngram.window),
             n: ng.n.unwrap_or(d.ngram.n),
             seen_ratio_max: ng.seen_ratio_max.unwrap_or(d.ngram.seen_ratio_max),
+            min_hot_sections: ng.min_hot_sections.unwrap_or(d.ngram.min_hot_sections),
+            min_hot_sections_suspect: ng
+                .min_hot_sections_suspect
+                .unwrap_or(d.ngram.min_hot_sections_suspect),
         },
         reasoning_only_ratio: s.reasoning_only_ratio.unwrap_or(d.reasoning_only_ratio),
     }))
@@ -331,4 +335,93 @@ fn build_source_catalog(settings: &harness_config::Settings) -> harness_cognitio
         })
         .unwrap_or_default();
     harness_cognition::SourceCatalog::with_builtin_defaults().merged_with(declared)
+}
+
+#[cfg(test)]
+mod tests {
+    //! `resolve_degeneracy`の写像テスト。
+    //!
+    //! 従来ワークスペースに1件も無かった穴を塞ぐ——「settings.jsonに書いた値が実際に
+    //! `DegeneracyConfig`へ届くか」を固定するテストが、`harness-config`側にも
+    //! `resolve_degeneracy`側にも存在しなかった（BUG-087調査で判明）。
+
+    use super::*;
+    use harness_config::{DegeneracySettings, NgramSettings, ShortPeriodSettings};
+    use harness_engine::degeneracy::DegeneracyConfig;
+
+    #[test]
+    fn enabled_false_disables_the_detector_entirely() {
+        let settings = DegeneracySettings {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(resolve_degeneracy(Some(&settings)).is_none());
+    }
+
+    #[test]
+    fn no_settings_at_all_uses_the_engine_default() {
+        let d = resolve_degeneracy(None).expect("既定はenabled=true");
+        assert_eq!(*d.config(), DegeneracyConfig::default());
+    }
+
+    #[test]
+    fn every_field_set_reaches_the_engine_config_verbatim() {
+        let settings = DegeneracySettings {
+            enabled: Some(true),
+            auto_recycle: Some(true),
+            gate_multiplier: Some(2.5),
+            recovery_multiplier: Some(4.0),
+            short_period: Some(ShortPeriodSettings {
+                window: Some(256),
+                max_period: Some(16),
+                min_repeats: Some(4),
+            }),
+            ngram: Some(NgramSettings {
+                window: Some(2_048),
+                n: Some(24),
+                seen_ratio_max: Some(0.75),
+                min_hot_sections: Some(5),
+                min_hot_sections_suspect: Some(2),
+            }),
+            reasoning_only_ratio: Some(0.4),
+        };
+        let d = resolve_degeneracy(Some(&settings)).expect("enabled=true");
+        let cfg = d.config();
+        assert!(cfg.auto_recycle);
+        assert_eq!(cfg.gate_multiplier, 2.5);
+        assert_eq!(cfg.recovery_multiplier, 4.0);
+        assert_eq!(cfg.short_period.window, 256);
+        assert_eq!(cfg.short_period.max_period, 16);
+        assert_eq!(cfg.short_period.min_repeats, 4);
+        assert_eq!(cfg.ngram.window, 2_048);
+        assert_eq!(cfg.ngram.n, 24);
+        assert_eq!(cfg.ngram.seen_ratio_max, 0.75);
+        assert_eq!(cfg.ngram.min_hot_sections, 5);
+        assert_eq!(cfg.ngram.min_hot_sections_suspect, 2);
+        assert_eq!(cfg.reasoning_only_ratio, 0.4);
+    }
+
+    #[test]
+    fn partial_ngram_settings_fall_back_field_by_field() {
+        // `ngram.n`だけ指定し、他のngramキー（`min_hot_sections`等）は既定へ落ちることを確認する。
+        // `NgramSettings`は全フィールド`Option`なので、`..Default::default()`で他を空にできる。
+        let settings = DegeneracySettings {
+            ngram: Some(NgramSettings {
+                n: Some(48),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let d = resolve_degeneracy(Some(&settings)).expect("enabled=true");
+        let cfg = d.config();
+        let default_ngram = DegeneracyConfig::default().ngram;
+        assert_eq!(cfg.ngram.n, 48);
+        assert_eq!(cfg.ngram.window, default_ngram.window);
+        assert_eq!(cfg.ngram.seen_ratio_max, default_ngram.seen_ratio_max);
+        assert_eq!(cfg.ngram.min_hot_sections, default_ngram.min_hot_sections);
+        assert_eq!(
+            cfg.ngram.min_hot_sections_suspect,
+            default_ngram.min_hot_sections_suspect
+        );
+    }
 }
