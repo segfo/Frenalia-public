@@ -114,20 +114,6 @@ impl BusyProgress {
     }
 }
 
-/// [BUG-082](../../../../docs/bugs/BUG-082.md) Part B: workspaceの背景ジョブが今どちらの
-/// フェーズにいるか（表示専用）。`harness_sandbox::tier2a::win_appcontainer::grant_job::JobPhase`
-/// を直接使わないのは、`win_appcontainer`モジュール自体が`#[cfg(windows)]`専用で、
-/// `AppState`のフィールド型を全プラットフォームでコンパイル可能にする必要があるため
-/// （`lib.rs`の`poll_workspace_acl_progress`がWindows側でこれへ変換する）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkspaceAclPhase {
-    /// rootへの継承ACE伝播（＋直後の`.harness/`再保護）。単一のブロッキングOS呼び出しの
-    /// ため中間進捗が無い。
-    Propagating,
-    /// 保護DACL配下の救済walk。`(done, total)`で進捗が分かる。
-    Walking,
-}
-
 pub struct AppState {
     pub transcript: Vec<TranscriptItem>,
     pub input: String,
@@ -190,15 +176,18 @@ pub struct AppState {
     saw_thinking_this_turn: bool,
     /// スピナーのフレーム送り用カウンタ。`tick()`が33ms間隔で呼ぶ。
     pub spinner_frame: usize,
-    /// D-54/[BUG-082](../../../../docs/bugs/BUG-082.md) Part B: workspaceの背景ジョブ
-    /// （rootへの伝播＋保護DACL配下の救済walk）が走っている間の進捗
-    /// `(フェーズ, 処理済み, 全体)`。
+    /// いま何かがツール実行を待たせているなら、その状態（表示専用）。
     ///
-    /// **ワークスペースを初めてTier2aで開いた起動でしか出ない。** この間、対応する範囲は
-    /// まだサンドボックスから見えず、`run_shell`は完了を待つ（`grant_job`のdoc）。
-    /// 「TUIは出ているのにコマンドが待たされる」理由をユーザーへ見せるための表示で、
-    /// 判定には一切関与しない。`lib.rs`の描画tickが`harness_sandbox`から取り込む。
-    pub workspace_acl_progress: Option<(WorkspaceAclPhase, usize, usize)>,
+    /// 現状の唯一の源はD-54/[BUG-082](../../../../docs/bugs/BUG-082.md) Part Bの
+    /// workspace背景ジョブ（rootへの伝播＋保護DACL配下の救済walk）で、**ワークスペースを
+    /// 初めてTier2aで開いた起動でしか出ない**。この間、対応する範囲はまだサンドボックスから
+    /// 見えず、`run_shell`は完了を待つ（`grant_job`のdoc）。「TUIは出ているのにコマンドが
+    /// 待たされる」理由をユーザーへ見せるための表示で、判定には一切関与しない。
+    ///
+    /// **TUIはどの背景ジョブが待たせているかを知らない**（`refactor-perspectives` R-01）。
+    /// `lib.rs`の描画tickが`harness_tools::wait_reasons`のレジストリから取り込むだけで、
+    /// 源が増えてもこのフィールドの型も描画も変わらない。
+    pub wait_state: Option<harness_core::tool::WaitState>,
     /// `true`のときEnterが送信（後方互換モード）。`false`（既定）のときEnterは入力欄に改行を
     /// 挿入し、送信はAlt+EnterまたはShift+Enterで行う（`true`のときもAlt+Enter/Shift+Enterは
     /// 常に送信）。
@@ -267,7 +256,7 @@ impl AppState {
             thinking_progress: None,
             saw_thinking_this_turn: false,
             spinner_frame: 0,
-            workspace_acl_progress: None,
+            wait_state: None,
             enter_submits: false,
             key_debug: false,
             host_is_vscode: false,

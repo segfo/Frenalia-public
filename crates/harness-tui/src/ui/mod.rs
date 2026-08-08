@@ -477,19 +477,15 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
     } else {
         format!("in={} out={}", app.last_usage.input, app.last_usage.output)
     };
-    // D-54/BUG-082: workspaceの背景ジョブ（rootへの伝播＋保護DACL配下の救済walk）が
-    // 走っている間だけ出る。この間`run_shell`は完了を待つので、「TUIは出ているのに
-    // コマンドが動き出さない」理由がここで見える。伝播フェーズは単一のブロッキングOS
-    // 呼び出しのため中間進捗が無く（`total==0`のまま）、walkフェーズだけN/Mが出る。
-    let acl = match app.workspace_acl_progress {
-        Some((crate::app::WorkspaceAclPhase::Walking, done, total)) if total > 0 => format!(
-            " | workspace ACL {}% (保護ノード検証 {done}/{total})",
-            (done.min(total) * 100) / total
-        ),
-        Some((crate::app::WorkspaceAclPhase::Propagating, _, _)) => {
-            " | workspace ACL 準備中 (継承を伝播中)".to_string()
-        }
-        Some(_) => " | workspace ACL 準備中".to_string(),
+    // 何かがツール実行を待たせている間だけ出る。現状の源はD-54/BUG-082のworkspace背景ジョブ
+    // （rootへの伝播＋保護DACL配下の救済walk）で、この間`run_shell`は完了を待つので、
+    // 「TUIは出ているのにコマンドが動き出さない」理由がここで見える。
+    //
+    // **どの背景ジョブかも、件数を出せる段かも、ここでは分岐しない**（R-01）。表示文字列は
+    // 源が作る。ここに`total > 0`のような判定を置くと、表示面を増やすたびに同じ判定が
+    // 複製される（旧実装はTUIと`grant_job`の両方に持っていた）。
+    let acl = match &app.wait_state {
+        Some(state) => format!(" | {}", state.label),
         None => String::new(),
     };
     let text = format!(

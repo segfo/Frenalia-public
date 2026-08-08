@@ -483,10 +483,33 @@ pub trait Tool: Send + Sync {
 /// 呼び出し側の変更は不要**（`docs/CODE-STRUCTURE-RULES.md`規則5の「同じヘルパーの複製を
 /// 作らない」を待機理由の集約という形で満たす）。
 pub trait WaitReason: Send + Sync {
-    /// 今まさに何かを待たせているなら、短い日本語の説明を返す。待たせていなければ`None`。
-    /// 呼び出し側（[`WaitReasons::describe_active`]）が数百msごとに呼ぶ想定なので、
-    /// 重い処理（実際のI/O等）をここで行わないこと（既存の状態を読むだけに留める）。
-    fn describe(&self) -> Option<String>;
+    /// 今まさに何かを待たせているなら、その状態を返す。待たせていなければ`None`。
+    ///
+    /// **待たせているかどうかの判定はこの1メソッドだけが持つ。** 説明文と進捗を別々の
+    /// メソッドで返す形にすると「終わっていたら`None`」の判定が2箇所に生まれ、片方だけが
+    /// 更新されて食い違う（`bug-pattern-rules` B-02: 対の片方だけ実装する）。実際、TUIの
+    /// ステータスバーが`grant_job::progress()`を直接読んでいた頃は、まさにその二重実装が
+    /// あった（`refactor-perspectives` R-01）。
+    ///
+    /// 呼び出し側は**33msごと**（TUIの描画tick）に呼び得るので、重い処理（実際のI/O等）を
+    /// ここで行わないこと——既存の状態を読むだけに留める。
+    fn active(&self) -> Option<WaitState>;
+}
+
+/// 「今なぜ待たされているか」の1件分。表示文字列は**具象側（`grant_job`等）が作る**——
+/// どの背景ジョブかによって言い回しが全く変わるドメイン固有の知識であり、汎用の側へ
+/// 持ち上げても結局どこかの具象に置くことになる（`refactor-perspectives` R-01の「誤検出」節）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitState {
+    /// ツールカードへ出す一文（`AgentEvent::ToolProgress`として流れる）。
+    pub description: String,
+    /// ステータスバーのような狭い場所へ出す短い一行。
+    ///
+    /// **百分率や件数を組み立てるのも具象側の仕事**にしてある。ここに`(done, total)`を
+    /// 生で持たせて表示側で組み立てさせると、「件数が未確定の段では出さない」という判定が
+    /// 表示面の数だけ複製される（旧実装がまさにそれで、`total > 0`のガードがTUIと
+    /// `grant_job`の両方にあった）。表示面が増えても具象側の1箇所だけを見ればよい形に保つ。
+    pub label: String,
 }
 
 /// [`WaitReason`]の集合。**最初に何か言ってきたものが勝つ**（複数の待機理由を1行に
@@ -499,8 +522,14 @@ impl WaitReasons {
         Self(sources.into())
     }
 
-    /// 登録済みの`WaitReason`を順に問い合わせ、最初に`Some`を返したものの説明を返す。
+    /// 登録済みの`WaitReason`を順に問い合わせ、最初に`Some`を返したものを返す。
+    pub fn active_state(&self) -> Option<WaitState> {
+        self.0.iter().find_map(|source| source.active())
+    }
+
+    /// [`Self::active_state`]の説明文だけを取る便宜メソッド。**どの源が勝つかは
+    /// `active_state`と必ず同じ**（同じ関数から導いているため、選ばれる源が食い違わない）。
     pub fn describe_active(&self) -> Option<String> {
-        self.0.iter().find_map(|source| source.describe())
+        self.active_state().map(|state| state.description)
     }
 }

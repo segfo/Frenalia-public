@@ -14,6 +14,12 @@ pub mod text;
 pub mod tool;
 pub mod wire_log;
 
+/// `tool.rs`の待機理由機構（`WaitReason`/`WaitReasons`/`WaitState`）のテスト。
+/// 本体が大きいので別ファイルにしている（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(test)]
+#[path = "tool_tests.rs"]
+mod tool_tests;
+
 pub use cognition::{CognitionLevel, Phase, TokenBudget};
 pub use config_injection::is_config_injection_path;
 pub use event::{discarded_marker, AgentEvent, DegenerateKind, CANCELLED_REASON};
@@ -33,5 +39,5 @@ pub use tool::{
     McpServerFact, NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, RequireSandbox,
     RiskClass, ShellTier, ShellTierSelection, StagingConfig, StagingMode, TlsInspection, Tool,
     ToolCtx, ToolError, ToolOutput, ToolResult, ToolSpec, ToolUse, VmShellExecutor, WaitReason,
-    WaitReasons,
+    WaitReasons, WaitState,
 };

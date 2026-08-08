@@ -110,24 +110,46 @@ impl WorkspaceGrantProgress {
 pub struct WorkspaceAclWaitReason;
 
 impl harness_core::tool::WaitReason for WorkspaceAclWaitReason {
-    fn describe(&self) -> Option<String> {
+    /// **表示に使う事実はここが唯一の出所**（`refactor-perspectives` R-01）。以前はツールカードが
+    /// この`describe`を、TUIステータスバーが`progress()`を直接読んでおり、「終わっていたら
+    /// 出さない」という同じ判定が2箇所にあった（片方だけ直すと表示が食い違う、B-02）。
+    ///
+    /// 失敗して終わった場合も`None`を返す——**失敗の扱いはここではなく`run_shell`が持つ**
+    /// （`wait_until_done`がfail-closedで断り、理由をツール結果として見せる）。表示のための
+    /// 関数に判定を持たせると、同じ事実が2箇所で解釈されることになる。
+    fn active(&self) -> Option<harness_core::tool::WaitState> {
         let p: WorkspaceGrantProgress = progress()?;
         if p.finished {
             return None;
         }
-        Some(match p.phase {
-            JobPhase::Propagating => {
+        // `total == 0`（母数が未確定・伝播段のように中間進捗が無い）で件数を出さない判定は
+        // **この1箇所だけ**が持つ。表示面ごとに`> 0`のガードを書かせない（B-02）。
+        let (description, label) = match p.phase {
+            JobPhase::Propagating => (
                 "実行ブロック中: 初回起動時中のため、ワークスペースへSandbox用ACLの適用中"
-                    .to_string()
-            }
-            JobPhase::Walking if p.total > 0 => format!(
-                "実行ブロック中: 保護されたノードを検証中 {}% ({}/{})",
-                p.percent(),
-                p.done,
-                p.total
+                    .to_string(),
+                "workspace ACL 準備中 (継承を伝播中)".to_string(),
             ),
-            JobPhase::Walking => "実行ブロック中: 保護されたノードを検証中".to_string(),
-        })
+            JobPhase::Walking if p.total > 0 => (
+                format!(
+                    "実行ブロック中: 保護されたノードを検証中 {}% ({}/{})",
+                    p.percent(),
+                    p.done,
+                    p.total
+                ),
+                format!(
+                    "workspace ACL {}% (保護ノード検証 {}/{})",
+                    p.percent(),
+                    p.done,
+                    p.total
+                ),
+            ),
+            JobPhase::Walking => (
+                "実行ブロック中: 保護されたノードを検証中".to_string(),
+                "workspace ACL 準備中".to_string(),
+            ),
+        };
+        Some(harness_core::tool::WaitState { description, label })
     }
 }
 
