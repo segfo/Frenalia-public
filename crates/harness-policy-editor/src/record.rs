@@ -41,22 +41,19 @@ use harness_sandbox::tier2a::policy_learnd::{self, LearnPolicy};
 
 use crate::aggregate::Aggregate;
 use crate::audit_tail::AuditTail;
+use crate::child_run::pump_child;
 use crate::session_dir::{now_unix_ms, RecordManifest, RecordSessionDir, RecordStatus};
 use crate::session_lock::{LockOutcome, RecordingLock};
+use crate::shell_output::ShellLine;
+
+pub use crate::child_run::AbortReason;
 
 /// ETWセッションを張ってから対象コマンドを起動するまでの待ち（モジュールdocの表を参照）。
 pub const WARMUP: Duration = Duration::from_millis(1500);
 /// 対象コマンド終了後、収集器を撤収するまでの待ち（同上）。
 pub const DRAIN: Duration = Duration::from_secs(4);
-/// 監査ログの追従読みとキャンセル確認の間隔。
+/// 収集器を撤収するまでの間、監査ログを読み続ける間隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// プロセス終了を観測してから、まだ届いていない出力を待つ猶予。
-///
-/// `Exited`（待機スレッド）と出力行（読取スレッド）は別々のスレッドから送られるので、
-/// **終了通知が最後の数行を追い越して届き得る**。ここで待たないと末尾が落ちる。
-/// 一方で`OutputClosed`だけを待つと、孫プロセスがstdout/stderrを握ったままのときに
-/// 止まらなくなる（`RestrictedChild::spawn_streaming`が2つを独立イベントにしている理由）。
-const OUTPUT_GRACE: Duration = Duration::from_secs(2);
 
 /// 記録の要求。
 pub struct RecordRequest<'a> {
@@ -103,10 +100,14 @@ pub enum RecordEvent {
     Warning(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AbortReason {
-    Canceled,
-    TimedOut,
+impl RecordEvent {
+    fn from_line(line: ShellLine) -> Self {
+        match line {
+            ShellLine::StartupNoise(l) => RecordEvent::StartupNoise(l),
+            ShellLine::Stdout(l) => RecordEvent::Stdout(l),
+            ShellLine::Stderr(l) => RecordEvent::Stderr(l),
+        }
+    }
 }
 
 /// 記録の結果。
@@ -259,78 +260,24 @@ pub fn record(
     on_event(RecordEvent::ChildStarted);
 
     // --- 出力と監査を同時に吸う -------------------------------------------------
-    let started = Instant::now();
-    let mut exit_code: Option<i32> = None;
-    let mut exited_at: Option<Instant> = None;
-    let mut output_closed = false;
-    let mut aborted: Option<AbortReason> = None;
-    let mut killed = false;
-    let mut out_filter = StartupNoiseFilter::new();
-    let mut err_filter = StartupNoiseFilter::new();
-
-    loop {
-        // 出力イベントを取れるだけ取る。
-        loop {
-            match rx.try_recv() {
-                Ok(OutputEvent::Stdout(line)) => {
-                    for event in out_filter.feed(line, /* stderr */ false) {
-                        on_event(event);
-                    }
-                }
-                Ok(OutputEvent::Stderr(line)) => {
-                    for event in err_filter.feed(line, /* stderr */ true) {
-                        on_event(event);
-                    }
-                }
-                Ok(OutputEvent::Exited(code)) => {
-                    exit_code = Some(code);
-                    exited_at = Some(Instant::now());
-                }
-                Ok(OutputEvent::OutputClosed) => output_closed = true,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // 送り手が全員居なくなった＝これ以上出力は来ない。
-                    output_closed = true;
-                    break;
-                }
-            }
-        }
-        drain_audit(&mut tail, &mut aggregate, on_event);
-
-        // **`Exited`を見た瞬間に抜けない。** `Exited`（待機スレッド）と出力行（読取スレッド）は
-        // 独立したスレッドから送られるので、終了通知が最後の数行を追い越して届き得る。
-        // 抜けるのは「出力も閉じた」か「猶予を使い切った」ときだけにする。
-        // 逆に`OutputClosed`だけを待って無限に粘ることもしない——孫プロセスが
-        // stdout/stderrを握ったままだとEOFが遅れる（`spawn_streaming`のdoc）。
-        if let Some(exited_at) = exited_at {
-            if output_closed || exited_at.elapsed() >= OUTPUT_GRACE {
-                break;
-            }
-        }
-        if !killed {
-            if (request.cancel)() {
-                aborted = Some(AbortReason::Canceled);
-            } else if request.timeout.is_some_and(|limit| started.elapsed() >= limit) {
-                aborted = Some(AbortReason::TimedOut);
-            }
-            if let Some(reason) = aborted {
-                on_event(RecordEvent::Aborted(reason));
-                // ジョブはkill-on-closeなので、この後`Exited`が届いて子孫ごと畳まれる。
-                kill_token.kill();
-                killed = true;
-            }
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-
-    // **印が一度も来なかった場合に溜め込んだ行を捨てない。** シェルがブートストラップの
-    // 最初の文へ到達する前に死んだとき、その出力が唯一の手掛かりになる（BUG-086の裏返し）。
-    for event in out_filter.flush(false) {
-        on_event(event);
-    }
-    for event in err_filter.flush(true) {
-        on_event(event);
-    }
+    // 微妙な判断（`Exited`と`OutputClosed`の独立・猶予・キャンセル）は`child_run`が持つ
+    // ——パス2とまったく同じものを通す。ここで違うのは`on_tick`（何の監査ログを読むか）だけ。
+    let outcome = {
+        let mut sink = Pass1Sink {
+            on_event,
+            tail: &mut tail,
+            aggregate: &mut aggregate,
+        };
+        pump_child(
+            &mut rx,
+            &|| kill_token.kill(),
+            request.timeout,
+            request.cancel,
+            &mut sink,
+        )
+    };
+    let exit_code = outcome.exit_code;
+    let aborted = outcome.aborted;
 
     if let Some(code) = exit_code {
         on_event(RecordEvent::Exited(code));
@@ -376,6 +323,28 @@ pub fn record(
         warnings,
         aggregate,
     })
+}
+
+/// パス1が[`pump_child`]へ渡す出力先。**このパスに固有なのは`on_tick`（FS監査JSONLを
+/// 追従読みする）だけ**で、行の切り分けも打ち切りの扱いも共有側が持つ。
+struct Pass1Sink<'a> {
+    on_event: &'a mut dyn FnMut(RecordEvent),
+    tail: &'a mut AuditTail,
+    aggregate: &'a mut Aggregate,
+}
+
+impl crate::child_run::ChildRunSink for Pass1Sink<'_> {
+    fn on_line(&mut self, line: ShellLine) {
+        (self.on_event)(RecordEvent::from_line(line));
+    }
+
+    fn on_tick(&mut self) {
+        drain_audit(self.tail, self.aggregate, self.on_event);
+    }
+
+    fn on_abort(&mut self, reason: AbortReason) {
+        (self.on_event)(RecordEvent::Aborted(reason));
+    }
 }
 
 /// 伝える価値のある事実を、**その場で見せる**と同時に**マニフェストへも残す**。
@@ -468,130 +437,3 @@ fn spawn_tier1(
     Ok((rx, kill_token))
 }
 
-/// シェルの起動時ノイズとコマンドの出力を、境界印で切り分けるストリーミング版。
-///
-/// [`harness_tools::RUN_SHELL_OUTPUT_SENTINEL`]は`run_shell`と共有する（B-05）。
-/// `run_shell`側は全文が揃ってから切る（`split_shell_startup_noise`）が、記録モードは
-/// 行が届くたびに流すので、**印が来るまで溜めて**から判断する。
-///
-/// 印は必ず出力の先頭付近に来る（ブートストラップの最初の文）ので、この待ちは実質ゼロ。
-/// **印が一度も来なかった場合は、溜めた行を全部コマンドの出力として流す**
-/// ——隠さない側へ倒す（`run_shell`側と同じ判断）。
-struct StartupNoiseFilter {
-    pending: Vec<String>,
-    seen_sentinel: bool,
-}
-
-impl StartupNoiseFilter {
-    fn new() -> Self {
-        Self {
-            pending: Vec::new(),
-            seen_sentinel: false,
-        }
-    }
-
-    fn feed(&mut self, line: String, stderr: bool) -> Vec<RecordEvent> {
-        if self.seen_sentinel {
-            return vec![Self::content(line, stderr)];
-        }
-        if line.contains(harness_tools::RUN_SHELL_OUTPUT_SENTINEL) {
-            self.seen_sentinel = true;
-            return std::mem::take(&mut self.pending)
-                .into_iter()
-                .map(RecordEvent::StartupNoise)
-                .collect();
-        }
-        self.pending.push(line);
-        Vec::new()
-    }
-
-    /// EOF時に呼ぶ。印が来ないまま終わったなら、溜めた行は**コマンドの出力**として出す。
-    fn flush(&mut self, stderr: bool) -> Vec<RecordEvent> {
-        if self.seen_sentinel {
-            return Vec::new();
-        }
-        std::mem::take(&mut self.pending)
-            .into_iter()
-            .map(|line| Self::content(line, stderr))
-            .collect()
-    }
-
-    fn content(line: String, stderr: bool) -> RecordEvent {
-        if stderr {
-            RecordEvent::Stderr(line)
-        } else {
-            RecordEvent::Stdout(line)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn labels(events: Vec<RecordEvent>) -> Vec<String> {
-        events
-            .into_iter()
-            .map(|e| match e {
-                RecordEvent::Stdout(l) => format!("out:{l}"),
-                RecordEvent::Stderr(l) => format!("err:{l}"),
-                RecordEvent::StartupNoise(l) => format!("noise:{l}"),
-                other => format!("{other:?}"),
-            })
-            .collect()
-    }
-
-    /// 印より前の行はノイズ、後の行はコマンドの出力（BUG-086と同じ切り方）。
-    #[test]
-    fn lines_before_the_sentinel_are_startup_noise_and_lines_after_are_output() {
-        let mut filter = StartupNoiseFilter::new();
-
-        assert!(filter
-            .feed("PowerShellの警告\n".to_string(), false)
-            .is_empty());
-        assert_eq!(
-            labels(filter.feed(
-                format!("{}\n", harness_tools::RUN_SHELL_OUTPUT_SENTINEL),
-                false
-            )),
-            vec!["noise:PowerShellの警告\n"]
-        );
-        assert_eq!(
-            labels(filter.feed("本当の出力\n".to_string(), false)),
-            vec!["out:本当の出力\n"]
-        );
-    }
-
-    /// **印が来ないまま終わったら、溜めた行は隠さずコマンドの出力として出す。**
-    /// （シェルが印に到達する前に死んだ場合。安全側＝隠さない側へ倒す）
-    #[test]
-    fn output_is_not_swallowed_when_the_sentinel_never_arrives() {
-        let mut filter = StartupNoiseFilter::new();
-        filter.feed("何かの出力\n".to_string(), true);
-
-        assert_eq!(labels(filter.flush(true)), vec!["err:何かの出力\n"]);
-    }
-
-    /// コマンド自身が印と同じ文字列を出力しても、分割位置は動かない
-    /// （**最初の1つ**で切るため、コマンド側から分割位置を操作できない）。
-    #[test]
-    fn the_command_cannot_move_the_split_by_printing_the_sentinel_itself() {
-        let mut filter = StartupNoiseFilter::new();
-        filter.feed(
-            format!("{}\n", harness_tools::RUN_SHELL_OUTPUT_SENTINEL),
-            false,
-        );
-
-        assert_eq!(
-            labels(filter.feed(
-                format!("{}\n", harness_tools::RUN_SHELL_OUTPUT_SENTINEL),
-                false
-            )),
-            vec![format!(
-                "out:{}\n",
-                harness_tools::RUN_SHELL_OUTPUT_SENTINEL
-            )],
-            "2度目の印は本文として扱う（分割は最初の1回だけ）"
-        );
-    }
-}

@@ -119,6 +119,24 @@ impl AuditTail {
         }
         (events, skipped)
     }
+
+    /// 完結した行のうちJSONとして読めたものを、**型を決めずに**返す（パス2の`net-audit.jsonl`用）。
+    ///
+    /// `net-audit.jsonl`にはProxy・Fake DNS・WFPの3種のレコードが混在し、キーの構成が違う
+    /// （`host`と`remote_host`等）。ここで1つの型へ押し込むと、その差を吸収する規則が
+    /// `harness_policy::normalize_net_audit`とこことの2箇所に生まれる——判定の正本は
+    /// あちらに置き、こちらは行を運ぶだけにする。**読めなかった件数は返す**（B-09）。
+    pub fn poll_json_values(&mut self) -> (Vec<serde_json::Value>, usize) {
+        let mut events = Vec::new();
+        let mut skipped = 0usize;
+        for line in self.poll() {
+            match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(value) => events.push(value),
+                Err(_) => skipped += 1,
+            }
+        }
+        (events, skipped)
+    }
 }
 
 #[cfg(test)]

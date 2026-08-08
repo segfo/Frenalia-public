@@ -3,8 +3,9 @@
 //!
 //! `docs/CODE-STRUCTURE-RULES.md`規則3の軸1（どの外部システムと話すか）で`shell.rs`から
 //! 切り出した。Tierごとの隔離機構は`super::runner`が扱い、ここは**Tierに依らずシェル共通**の
-//! ものだけを持つ——だからこそ Tier0/Tier1/Tier2a とポリシーエディタの記録モードの4経路が
-//! この1箇所を共有できる（個別に実装して綴りが食い違うことを防ぐ、B-05）。
+//! ものだけを持つ——だからこそ Tier0/Tier1/Tier2a とポリシーエディタの記録モード2つ
+//! （パス1＝Tier1でのFS記録、パス2＝Tier2aでのドメイン記録）の**5経路**がこの1箇所を
+//! 共有できる（個別に実装して綴りが食い違うことを防ぐ、B-05）。
 
 use tokio::process::Command;
 
@@ -86,8 +87,9 @@ pub const RUN_SHELL_COMMAND_ENV_VAR: &str = "HARNESS_RUN_SHELL_COMMAND";
 /// 終了状態」意味論に揃える。
 ///
 /// Tier0（本関数の呼び出し元`platform_shell_command`）・Tier2a（`run_windows_tier2a`）・
-/// Tier1（`run_windows_tier1`）・ポリシーエディタの記録モード
-/// （`harness_policy_editor::record`、Tier1で対象コマンドを走らせる）の**4経路全て**が
+/// Tier1（`run_windows_tier1`）・ポリシーエディタのパス1
+/// （`harness_policy_editor::record`、Tier1で対象コマンドを走らせる）・同パス2
+/// （`harness_policy_editor::record_net`、Tier2aで走らせる）の**5経路全て**が
 /// この1関数を通す（Tier横断で1箇所に集約し、個別に実装して食い違うことを防ぐ）。
 #[cfg(windows)]
 pub(crate) const RUN_SHELL_BOOTSTRAP_SCRIPT: &str = "\

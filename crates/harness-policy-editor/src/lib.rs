@@ -32,21 +32,45 @@
 //! 編集モードでの手直しだけに閉じず**記録モードへ戻って追加のライブ記録**もできる
 //! （本当に必要なアクセスを見落としたまま正規表現だけ書き足すのは推測に頼ることになるため）。
 //!
+//! **現状のUIはCLIだけで、3画面のTUIは未実装。** CLIは`record`（パス1）→`approve`（承認）→
+//! `record-net`（パス2）と`show`/`sessions`で、**互いに独立したコマンド**である（決定13：
+//! 記録し直す・過去の記録を別の一般化度合いで見直す、をいつでも行えるようにするため）。
+//!
+//! # ACEを付ける経路は1つだけ（決定18）
+//!
+//! [`approve`]は`policy.json`へ書くだけで、実マシンには何も残さない。実際のACE付与と
+//! 台帳への記録は[`record_net`]が`select_tier`→`preflight`経由で行う。承認時にも付けられる
+//! ようにすると付与経路が2つになり、片方だけが台帳へ記録する／片方だけが撤収できる、
+//! という形の事故になる（BUG-017の孤立ACEと同型）。
+//!
+//! # パス2は強制の上に成り立つ観測である（決定19）
+//!
+//! パス1が観測（fail-open、D-43）なのに対し、パス2は①Tier2aへ着地しなければ中止、
+//! ②WFPが立たなければ中止、の2箇所でfail-closedにする。強制が無い状態の観測を同じ顔で
+//! 出すと、ユーザーは「このドメインだけ使う」と読んでしまうため。
+//!
 //! # このクレートが持つもの / 借りるもの
 //!
 //! | 用途 | どこから |
 //! |---|---|
-//! | Tier1起動・ストリーミング出力 | `harness_sandbox::tier1::win_restricted`（`spawn_streaming`） |
+//! | Tier1/Tier2a起動・ストリーミング出力 | `harness_sandbox`（`win_common::stream_child_output`を両Tierが共有） |
+//! | Tier2a起動の前口上（主体の導出・背景walkの待ち） | `harness_sandbox::tier2a::win_appcontainer::spawn_shell_in_workspace`（`run_shell`と共有、D-54） |
 //! | シェル起動の作法（コマンドはenv経由・stdinは固定ブートストラップ・境界印） | `harness_tools`（`run_shell`と共有、B-05） |
 //! | ETW収集器（record-all） | `harness_sandbox::tier2a::policy_learnd`（`LearnPolicy.record_all`） |
-//! | Local Proxy / Fake DNS | `harness_tools::net_proxy` / `fake_dns`（`proxy_env_vars`で環境変数注入） |
-//! | 候補の畳み込みと正規表現の提案 | `harness_policy`（`FsFolder` / `generalize`） |
+//! | Local Proxy / Fake DNS | `harness_tools::net_proxy` / `fake_dns`（`*_with_policy`でポリシー注入・`proxy_env_vars`で環境変数注入） |
+//! | WFPの出口強制 | `harness_sandbox::tier2a::netfilterd` |
+//! | ACE付与と台帳 | `harness_sandbox`（`select_tier`→`preflight`・`tier2a::fs_passthrough_ledger`） |
+//! | 候補の畳み込みと正規表現の提案 | `harness_policy`（`FsFolder` / `generalize` / `NetIntake::All`） |
 //! | ネットワーク全許可（パス2） | `harness_core::DomainPolicy::record_all()` |
 //! | **パス1のオーケストレーション** | 本クレート [`record`] |
+//! | **パス2のオーケストレーション** | 本クレート [`record_net`] |
+//! | **承認（中間ステップ）** | 本クレート [`approve`] |
+//! | **`policy.json`（ドメイン型のポリシー）** | 本クレート [`policy_file`] |
 //! | **記録セッションの置き場とマニフェスト** | 本クレート [`session_dir`] |
-//! | **観測イベントの集計と表示** | 本クレート [`aggregate`] |
+//! | **観測イベントの集計と表示** | 本クレート [`aggregate`]（FS）/ [`net_aggregate`]（ドメイン） |
+//! | **子プロセスを回すループ・出力の切り分け** | 本クレート [`child_run`] / [`shell_output`]（パス1・2で共有） |
 //! | **監査JSONLの追記追従読み** | 本クレート [`audit_tail`] |
-//! | **記録セッションの排他** | 本クレート [`session_lock`] |
+//! | **記録セッションの排他** | 本クレート [`session_lock`]（パス1・2で共通の1本） |
 //!
 //! `harness-policy`は「**ファイルを読まない**」を明示的な契約にしているので、
 //! tailerはそちらへは置けない（同クレートのlib.rs参照）。
@@ -59,20 +83,35 @@
 //! 記録し直す・過去の記録を別の一般化度合いで見直す、をいつでも行える。
 
 pub mod aggregate;
+pub mod approve;
 pub mod audit_tail;
+pub mod net_aggregate;
+pub mod policy_file;
 pub mod session_dir;
 pub mod session_lock;
+pub mod shell_output;
+
+/// 記録対象の子プロセスを回し切るループ（パス1・パス2が共有）。Windows専用の
+/// `OutputEvent`を扱うため、モジュールごとwindows専用にする。
+#[cfg(windows)]
+pub mod child_run;
 
 pub use aggregate::Aggregate;
 pub use audit_tail::AuditTail;
+pub use policy_file::{PolicyDomain, PolicyFile, PolicyFileError};
 pub use session_dir::{RecordManifest, RecordSessionDir, RecordStatus};
 pub use session_lock::{LockOutcome, RECORDING_MUTEX_NAME};
 
 #[cfg(windows)]
 pub mod record;
+/// パス2（Tier2aでのドメイン記録）。AppContainer・WFP・Proxyに依存するためwindows専用。
+#[cfg(windows)]
+pub mod record_net;
 
 #[cfg(windows)]
 pub use record::{record, RecordError, RecordEvent, RecordOutcome, RecordRequest};
+#[cfg(windows)]
+pub use record_net::{record_net, NetRecordEvent, RecordNetError, RecordNetOutcome, RecordNetRequest};
 
 #[cfg(windows)]
 pub use session_lock::RecordingLock;

@@ -150,6 +150,17 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--test-threads=1", "--nocapture",
         ],
     ),
+    // ポリシーエディタのパス2（Tier2aでのドメイン記録）の実機E2E。WFPの出口強制daemonを
+    // 起こすため管理者権限と外部への到達性が要る（`crates/harness-policy-editor/tests/
+    // record_net_e2e.rs`）。**2本目は対のテスト**で、生ソケットがWFPに落とされることを
+    // 確かめる——落とされないなら1本目の「到達できた」は強制の証明にならない。
+    (
+        "e2e-policy-editor-pass2",
+        &[
+            "test", "-p", "harness-policy-editor", "--test", "record_net_e2e", "--", "--ignored",
+            "--test-threads=1", "--nocapture",
+        ],
+    ),
     (
         "e2e-loopback-exemption",
         &[

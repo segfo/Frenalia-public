@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 pub const RECORD_DIR_PREFIX: &str = "policy-editor-";
 /// 収集器が書く監査ログのファイル名（deny-onlyの`harness policy learn`と同じ名前）。
 pub const AUDIT_LOG_FILE_NAME: &str = "fs-audit.jsonl";
+/// パス2でProxy・Fake DNS・WFPが書く監査ログのファイル名（`harness net audit`と同じ名前）。
+pub const NET_AUDIT_LOG_FILE_NAME: &str = "net-audit.jsonl";
 /// 記録セッションのマニフェスト。
 pub const MANIFEST_FILE_NAME: &str = "record-session.json";
 
@@ -58,12 +60,24 @@ impl RecordStatus {
     }
 }
 
+/// `pass`フィールドを持たない旧マニフェストはパス1（FS記録）として読む。
+fn default_pass() -> u8 {
+    1
+}
+
 /// 記録セッション1回分の文脈。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordManifest {
     pub schema_version: u32,
     pub id: String,
-    /// Tier1で走らせたコマンド（そのままの綴り）。
+    /// 2パス記録のどちらか（1=Tier1でのFS記録、2=Tier2aでのドメイン記録）。
+    /// **旧マニフェスト（このフィールドが無いもの）はパス1として読む**（後方互換）。
+    #[serde(default = "default_pass")]
+    pub pass: u8,
+    /// パス2で使ったポリシードメイン名（パス1では`None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// 走らせたコマンド（そのままの綴り）。
     pub command: String,
     pub cwd: PathBuf,
     pub workspace_root: PathBuf,
@@ -98,6 +112,8 @@ impl RecordManifest {
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
             id: id.into(),
+            pass: default_pass(),
+            domain: None,
             command: command.into(),
             cwd: cwd.to_path_buf(),
             workspace_root: workspace_root.to_path_buf(),
@@ -150,6 +166,12 @@ impl RecordSessionDir {
 
     pub fn audit_log_path(&self) -> PathBuf {
         self.path.join(AUDIT_LOG_FILE_NAME)
+    }
+
+    /// パス2の監査ログ。**FS側と同じディレクトリの別ファイル**にする——1回の記録という
+    /// 単位は同じで、スキーマが違うだけだからである（`harness net audit`が読む形と同じ）。
+    pub fn net_audit_log_path(&self) -> PathBuf {
+        self.path.join(NET_AUDIT_LOG_FILE_NAME)
     }
 
     pub fn manifest_path(&self) -> PathBuf {
