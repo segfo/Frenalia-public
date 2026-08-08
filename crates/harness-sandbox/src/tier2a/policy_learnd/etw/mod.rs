@@ -77,3 +77,10 @@ mod fs_allow_reach_tests;
 #[cfg(all(windows, test))]
 #[path = "disposition_semantics_tests.rs"]
 mod disposition_semantics_tests;
+
+/// Tier1（`record_all`、ポリシー定義モード想定）の実現性スパイク。`harness_pid`起点の
+/// 親子継承だけでプロセスツリーを正しく相関・帰属できるかを実機で確かめる
+/// （`plans/POLICY-EDITOR-TOMOYO-DIG.md`）。
+#[cfg(all(windows, test))]
+#[path = "tier1_record_all_spike_tests.rs"]
+mod tier1_record_all_spike_tests;

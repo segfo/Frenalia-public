@@ -45,6 +45,11 @@ pub struct FsAuditEvent {
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_id: Option<u32>,
+    /// 親プロセスID。ポリシーエディタの記録モードが「プロセス単位で折り畳む」ツリー表示を
+    /// 組み立てるために使う。`#[serde(default)]`なので、この項目を持たない旧`fs-audit.jsonl`
+    /// （deny-only収集器が書いたもの）を読んでも失敗しない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_process_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
     pub timestamp_unix_ms: u64,
@@ -59,13 +64,27 @@ impl FsAuditEvent {
         reason: impl Into<String>,
         timestamp_unix_ms: u64,
     ) -> Self {
+        Self::observed(kind, path, access, false, reason, timestamp_unix_ms)
+    }
+
+    /// record-allモード用: 拒否・許可を問わず観測した1件を組み立てる。`denied`はこれの
+    /// `allowed=false`固定版に相当する（重複を避けるため`denied`側から委譲している）。
+    pub fn observed(
+        kind: FsAuditKind,
+        path: impl Into<String>,
+        access: FsAccess,
+        allowed: bool,
+        reason: impl Into<String>,
+        timestamp_unix_ms: u64,
+    ) -> Self {
         Self {
             kind,
             path: Some(path.into()),
             access: Some(access),
-            allowed: false,
+            allowed,
             reason: reason.into(),
             process_id: None,
+            parent_process_id: None,
             image_path: None,
             timestamp_unix_ms,
         }
@@ -80,6 +99,7 @@ impl FsAuditEvent {
             allowed: false,
             reason: reason.into(),
             process_id: None,
+            parent_process_id: None,
             image_path: None,
             timestamp_unix_ms,
         }
@@ -88,6 +108,11 @@ impl FsAuditEvent {
     pub fn with_process(mut self, pid: u32, image_path: Option<String>) -> Self {
         self.process_id = Some(pid);
         self.image_path = image_path;
+        self
+    }
+
+    pub fn with_parent_process(mut self, parent_pid: u32) -> Self {
+        self.parent_process_id = Some(parent_pid);
         self
     }
 
@@ -150,7 +175,61 @@ mod tests {
         let event: FsAuditEvent = serde_json::from_str(line).unwrap();
 
         assert_eq!(event.process_id, None);
+        assert_eq!(event.parent_process_id, None);
         assert_eq!(event.image_path, None);
         assert_eq!(event.access, Some(FsAccess::Read));
+    }
+
+    /// `parent_process_id`は`with_parent_process`で付与でき、往復する。
+    /// ポリシーエディタの記録モードがプロセスツリー表示を組み立てる材料。
+    #[test]
+    fn parent_process_id_round_trips() {
+        let event = FsAuditEvent::denied(
+            FsAuditKind::Etw,
+            r"C:\x.txt",
+            FsAccess::Read,
+            "denied",
+            1,
+        )
+        .with_process(200, Some(r"C:\cargo.exe".to_string()))
+        .with_parent_process(100);
+
+        let line = event.to_jsonl_line().unwrap();
+        assert!(line.contains(r#""parent_process_id":100"#), "{line}");
+
+        let round_tripped: FsAuditEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(round_tripped, event);
+    }
+
+    /// `observed`はrecord-allモード用の一般化されたコンストラクタで、`allowed`を明示できる。
+    /// `denied`はこれの`allowed=false`固定版に相当する（内部で委譲している）。
+    #[test]
+    fn observed_can_represent_both_allowed_and_denied_records() {
+        let allowed_event = FsAuditEvent::observed(
+            FsAuditKind::Etw,
+            r"C:\ok.txt",
+            FsAccess::Read,
+            true,
+            "observed",
+            5,
+        );
+        assert!(allowed_event.allowed);
+
+        let denied_via_observed = FsAuditEvent::observed(
+            FsAuditKind::Etw,
+            r"C:\secret.txt",
+            FsAccess::Read,
+            false,
+            "denied",
+            5,
+        );
+        let denied_via_denied = FsAuditEvent::denied(
+            FsAuditKind::Etw,
+            r"C:\secret.txt",
+            FsAccess::Read,
+            "denied",
+            5,
+        );
+        assert_eq!(denied_via_observed, denied_via_denied);
     }
 }

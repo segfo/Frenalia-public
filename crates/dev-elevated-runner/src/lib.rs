@@ -130,6 +130,16 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture", "policy_learnd::etw::network_spike_tests",
         ],
     ),
+    // ポリシー定義モード(Tier1)構想向け: record-allモードで、package SID無しのTier1
+    // プロセスツリーがharness_pid起点の親子継承だけで正しく相関・帰属できるかの実機スパイク
+    // (plans/POLICY-EDITOR-TOMOYO-DIG.md、`tier1-proxy-luminous-marshmallow.md`)。
+    (
+        "spike-etw-tier1-record-all",
+        &[
+            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
+            "--nocapture", "policy_learnd::etw::tier1_record_all_spike_tests",
+        ],
+    ),
     (
         "e2e-loopback-exemption",
         &[

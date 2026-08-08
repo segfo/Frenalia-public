@@ -10,6 +10,23 @@ const MAX_DOMAIN_PATTERN_LEN: usize = 253;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainPolicy {
     allow_domains: Vec<String>,
+    mode: DomainPolicyMode,
+}
+
+/// [`DomainPolicy`]の評価モード。
+///
+/// `RecordAll`はポリシーエディタの記録モード（Tier2aでのネットワーク学習パス）専用——
+/// 許可リストに関わらず、IPリテラル以外の宛先を全て許可として通す。これにより1回の完走で
+/// 到達したドメインを取りこぼさず記録できる。マジックパターン（`*`のような`allow_domains`への
+/// 特殊値）にしないのは、`validate_domain_pattern`の通常経路（CLI引数・設定ファイル）から
+/// 誤って到達できてしまうと「全許可」がユーザーの意図しない形で発動しかねないため——
+/// モードを型で分けることで、記録モードの起動経路だけが到達できるようにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DomainPolicyMode {
+    /// 通常運用: `allow_domains`に一致したドメインだけ許可する。
+    Allowlist,
+    /// 記録モード専用: IPリテラル拒否以外は全許可し、宛先の学習に使う。
+    RecordAll,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +49,22 @@ impl DomainPolicy {
         }
         Self {
             allow_domains: normalized,
+            mode: DomainPolicyMode::Allowlist,
         }
+    }
+
+    /// ポリシーエディタの記録モード（Tier2aでのネットワーク学習パス）専用の全許可ポリシー。
+    /// `allow_domains`は空のまま持つ——このモードでは評価に使わないが、
+    /// [`Self::allow_domains`]が空リストを一貫して返すようにするため。
+    pub fn record_all() -> Self {
+        Self {
+            allow_domains: Vec::new(),
+            mode: DomainPolicyMode::RecordAll,
+        }
+    }
+
+    pub fn is_record_all(&self) -> bool {
+        self.mode == DomainPolicyMode::RecordAll
     }
 
     pub fn allow_domains(&self) -> &[String] {
@@ -48,6 +80,13 @@ impl DomainPolicy {
             return DomainPolicyDecision {
                 allowed: false,
                 reason: "ip_literal_denied",
+                matched_pattern: None,
+            };
+        }
+        if self.mode == DomainPolicyMode::RecordAll {
+            return DomainPolicyDecision {
+                allowed: true,
+                reason: "record_all",
                 matched_pattern: None,
             };
         }
@@ -238,6 +277,41 @@ mod tests {
             policy.evaluate_host("API.TRUSTED.EXAMPLE").matched_pattern,
             Some("*.trusted.example".to_string())
         );
+    }
+
+    /// record-allモード: 通常のドメインはallow_domainsに関わらず全部許可される。
+    #[test]
+    fn record_all_mode_allows_any_non_ip_host_regardless_of_allow_domains() {
+        let policy = DomainPolicy::record_all();
+        assert!(policy.is_record_all());
+        assert!(policy.allow_domains().is_empty());
+
+        for host in ["example.com", "crates.io", "sub.anything.example", "a.b.c.d.example"] {
+            let decision = policy.evaluate_host(host);
+            assert!(decision.allowed, "{host} should be allowed in record-all mode");
+            assert_eq!(decision.reason, "record_all");
+            assert_eq!(decision.matched_pattern, None);
+        }
+    }
+
+    /// record-allモードでもIPリテラルは引き続き拒否する——全許可はドメイン名の学習が
+    /// 目的であり、IP直打ちは既存の非目標（アーキテクチャ設計書§9.2）のまま。
+    #[test]
+    fn record_all_mode_still_rejects_ip_literals() {
+        let policy = DomainPolicy::record_all();
+        for host in ["127.0.0.1", "[::1]", "198.18.0.1", "2130706433"] {
+            let decision = policy.evaluate_host(host);
+            assert!(!decision.allowed);
+            assert_eq!(decision.reason, "ip_literal_denied");
+        }
+    }
+
+    /// 通常の`DomainPolicy::new`はrecord-allモードにならない（既定はAllowlist）。
+    #[test]
+    fn new_constructs_an_allowlist_policy_not_record_all() {
+        let policy = DomainPolicy::new(vec!["example.com".to_string()]);
+        assert!(!policy.is_record_all());
+        assert!(!policy.evaluate_host("nope.com").allowed);
     }
 
     #[test]

@@ -265,19 +265,7 @@ impl Tool for RunShellTool {
         let fake_dns_addr = net_proxy
             .fake_dns_addr
             .or_else(|| fake_dns.as_ref().map(|dns| dns.addr));
-        if let Some(addr) = proxy_addr {
-            let http_proxy_url = format!("http://{}", addr);
-            let socks_proxy_url = format!("socks5h://{}", addr);
-            for key in ["ALL_PROXY", "all_proxy"] {
-                env.push((key.to_string(), socks_proxy_url.clone()));
-            }
-            for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-                env.push((key.to_string(), http_proxy_url.clone()));
-            }
-        }
-        if let Some(addr) = fake_dns_addr {
-            env.push(("HARNESS_FAKE_DNS_ADDR".to_string(), addr.to_string()));
-        }
+        env.extend(crate::net_proxy::proxy_env_vars(proxy_addr, fake_dns_addr));
 
         let net_decision = classify_net_app(&input.command, &ctx.net_app.allow_apps);
         let net_domain_policy_requested = ctx.net_proxy.domain_policy_enabled;
@@ -800,8 +788,21 @@ async fn run_windows_tier1(
     dur: Duration,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let _ = std::fs::create_dir_all(cwd);
-    // cwd1つだけに継承可能な低ILラベルを付与する（非再帰・冪等、モジュールdocの既知の限界参照）。
-    let _ = harness_sandbox::tier1::win_restricted::set_low_integrity_label(cwd);
+    // cwd1つだけに低ILラベルを付与する（非再帰・冪等、モジュールdocの既知の限界参照）。
+    //
+    // **失敗を握り潰さない**（B-10）。このラベルが付かないと低ILの子はcwd**内**にも書けなくなる
+    // ——つまり「Tier1は範囲内なら書ける」という保証そのものが静かに消える。実際、BUG-018の
+    // 案Aが入れた不正なSDDLでこの関数はずっと失敗し続けており、ここが`let _ =`だったせいで
+    // 誰も気付けなかった。致命的にはしない（D-43と同じくharnessは止めない）が、
+    // **事実は必ず出力へ残す**。
+    // stdoutは機械可読出力の契約なので使わない（B-24、BUG-064）。診断はstderrへ出す。
+    if let Err(e) = harness_sandbox::tier1::win_restricted::set_low_integrity_label(cwd) {
+        eprintln!(
+            "warning: failed to apply the low-integrity label to the Tier1 cwd ({}): {e}. \
+             Writes inside the sandbox cwd will be denied by Mandatory Integrity Control.",
+            cwd.display()
+        );
+    }
 
     let (bin, shell_label) = if which::which("pwsh").is_ok() {
         ("pwsh", "pwsh(tier1)")
@@ -1738,6 +1739,45 @@ mod tests {
             out.content
         );
         assert!(!outside.exists());
+    }
+
+    /// **`run_shell_tier1_rejects_write_outside_cwd`の対**（B-01/B-27）。
+    ///
+    /// 「cwd外への書込は拒否される」だけを検証していると、`set_low_integrity_label`が
+    /// 完全に効いていなくてもテストは緑のままになる——低ILの子はcwd**内**へも書けなくなるが、
+    /// 拒否側のテストしか無ければ誰も気付けない。実際、BUG-018の案Aが入れた不正なSDDL
+    /// （`NI`は正規のACEフラグトークンではない）のせいでラベルは一度も付いておらず、
+    /// この欠落したテストが理由で長期間検知されなかった（`win_restricted.rs`の
+    /// `SDDL_LOW_LABEL`のコメント参照）。**許可側もテストする。**
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_tier1_allows_write_inside_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join("tier1-inside-cwd.txt");
+        let tool = RunShellTool;
+        let command = format!(
+            "Set-Content -Path '{}' -Value 'allowed' -ErrorAction Stop",
+            inside.display()
+        );
+
+        let out = tool
+            .call(
+                json!({ "command": command }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !out.is_error,
+            "write inside the low-IL cwd must succeed (is the mandatory label actually applied?): {}",
+            out.content
+        );
+        assert!(
+            inside.exists(),
+            "the file must actually exist on disk after a successful write: {}",
+            out.content
+        );
     }
 
     /// Tier2a（AppContainer）の隔離セマンティクスを決定論的に検証する（LLM非依存、絶対パスを

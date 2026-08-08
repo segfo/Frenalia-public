@@ -264,6 +264,34 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+/// `run_shell`（`crates/harness-tools/src/shell.rs`）とポリシーエディタの記録モード
+/// （`plans/POLICY-EDITOR-TOMOYO-DIG.md`）の両方が使う、子プロセスへ注入する環境変数の
+/// 純粋な組み立て。`docs/CODE-STRUCTURE-RULES.md`規則5——同じロジックを2箇所に複製しない。
+///
+/// `proxy_addr`があれば`ALL_PROXY`/`all_proxy`（`socks5h://`、SOCKS5 remote DNSが主経路）と
+/// `HTTP_PROXY`/`HTTPS_PROXY`/`http_proxy`/`https_proxy`（`http://`、既存CLI互換）を返す。
+/// `fake_dns_addr`があれば`HARNESS_FAKE_DNS_ADDR`（診断用）を加える。どちらも無ければ空。
+pub fn proxy_env_vars(
+    proxy_addr: Option<SocketAddr>,
+    fake_dns_addr: Option<SocketAddr>,
+) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if let Some(addr) = proxy_addr {
+        let http_proxy_url = format!("http://{addr}");
+        let socks_proxy_url = format!("socks5h://{addr}");
+        for key in ["ALL_PROXY", "all_proxy"] {
+            env.push((key.to_string(), socks_proxy_url.clone()));
+        }
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            env.push((key.to_string(), http_proxy_url.clone()));
+        }
+    }
+    if let Some(addr) = fake_dns_addr {
+        env.push(("HARNESS_FAKE_DNS_ADDR".to_string(), addr.to_string()));
+    }
+    env
+}
+
 /// `config.domain_policy_enabled=false`なら`Ok(None)`。有効なら`allow_domains`が空でも
 /// 全拒否ポリシーとして`127.0.0.1`の空きポートへbindし、accept loopを起動する。
 pub async fn spawn_local_proxy(config: &NetProxyConfig) -> std::io::Result<Option<LocalProxy>> {
@@ -597,6 +625,59 @@ mod tests {
         assert!(domain_allowed("trusted.org", &allow));
         assert!(!domain_allowed("trusted.org.evil.com", &allow));
         assert!(!domain_allowed("nope.com", &allow));
+    }
+
+    /// characterization test: `run_shell`（shell.rs）が長年インラインで組み立てていた
+    /// env変数の**キー・値・順序**をそのまま固定する。`proxy_env_vars`への抽出前後で
+    /// 挙動が変わっていないことをこれで保証する。
+    #[test]
+    fn proxy_env_vars_matches_the_shape_run_shell_used_to_build_inline() {
+        let proxy_addr: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+        let fake_dns_addr: SocketAddr = "127.0.0.1:18053".parse().unwrap();
+
+        let env = proxy_env_vars(Some(proxy_addr), Some(fake_dns_addr));
+
+        assert_eq!(
+            env,
+            vec![
+                ("ALL_PROXY".to_string(), "socks5h://127.0.0.1:18080".to_string()),
+                ("all_proxy".to_string(), "socks5h://127.0.0.1:18080".to_string()),
+                ("HTTP_PROXY".to_string(), "http://127.0.0.1:18080".to_string()),
+                ("HTTPS_PROXY".to_string(), "http://127.0.0.1:18080".to_string()),
+                ("http_proxy".to_string(), "http://127.0.0.1:18080".to_string()),
+                ("https_proxy".to_string(), "http://127.0.0.1:18080".to_string()),
+                (
+                    "HARNESS_FAKE_DNS_ADDR".to_string(),
+                    "127.0.0.1:18053".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_env_vars_omits_proxy_keys_when_proxy_addr_is_none() {
+        let fake_dns_addr: SocketAddr = "127.0.0.1:18053".parse().unwrap();
+        let env = proxy_env_vars(None, Some(fake_dns_addr));
+        assert_eq!(
+            env,
+            vec![(
+                "HARNESS_FAKE_DNS_ADDR".to_string(),
+                "127.0.0.1:18053".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn proxy_env_vars_omits_fake_dns_key_when_fake_dns_addr_is_none() {
+        let proxy_addr: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+        let env = proxy_env_vars(Some(proxy_addr), None);
+        assert!(env.iter().all(|(k, _)| k != "HARNESS_FAKE_DNS_ADDR"));
+        assert_eq!(env.len(), 6);
+    }
+
+    #[test]
+    fn proxy_env_vars_is_empty_when_both_addrs_are_none() {
+        assert!(proxy_env_vars(None, None).is_empty());
     }
 
     #[tokio::test]

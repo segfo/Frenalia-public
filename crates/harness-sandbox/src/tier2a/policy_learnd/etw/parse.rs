@@ -121,6 +121,24 @@ pub struct Denial {
     pub create_options: u32,
 }
 
+/// 相関が成立した「観測された1件」（拒否・成功のいずれも含む）。record-allモード用。
+///
+/// [`Denial`]とほぼ同じ形だが`allowed`を持つ。統合せず並存させているのは、
+/// `Denial`が既にサーバ側・複数のテストファイルで「拒否のみ」という前提のまま
+/// 広く参照されており、record-allは今回新設するTier1経路専用の別系統だから
+/// （`docs/CODE-STRUCTURE-RULES.md`規則5は「型が違うだけの重複」を戒めるが、
+/// ここは意味が違う——deny-onlyの利用側を無変更に保つ方を優先した）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessRecord {
+    pub file_name: String,
+    pub pid: u32,
+    pub access: FsAccess,
+    pub status: u32,
+    pub allowed: bool,
+    pub timestamp_unix_ms: u64,
+    pub create_options: u32,
+}
+
 /// `Create`と`OperationEnd`を`Irp`で突き合わせる相関表。
 #[derive(Debug)]
 pub struct Correlator {
@@ -162,14 +180,22 @@ impl Correlator {
         }
     }
 
-    /// `OperationEnd`を受け取り、拒否だった場合だけ[`Denial`]を返す。
-    /// 相関する`Create`が無い（バッファ落ち・セッション開始前に始まったIRP）場合は`None`。
-    pub fn on_operation_end(&mut self, irp: u64, status: u32) -> Option<Denial> {
+    /// `Irp`に対応する`Create`を相関表から取り出す。見つからなければ
+    /// `unmatched_operation_ends`を増やして`None`（バッファ落ち・セッション開始前に
+    /// 始まったIRP）。deny-only/record-allの両モードが共有する下回り。
+    fn take_pending(&mut self, irp: u64) -> Option<PendingCreate> {
         let Some(create) = self.pending.remove(&irp) else {
             self.unmatched_operation_ends = self.unmatched_operation_ends.saturating_add(1);
             return None;
         };
         self.order.retain(|i| *i != irp);
+        Some(create)
+    }
+
+    /// `OperationEnd`を受け取り、拒否だった場合だけ[`Denial`]を返す（deny-onlyモード）。
+    /// 相関する`Create`が無い場合は`None`。
+    pub fn on_operation_end(&mut self, irp: u64, status: u32) -> Option<Denial> {
+        let create = self.take_pending(irp)?;
         if status != STATUS_ACCESS_DENIED {
             return None;
         }
@@ -178,6 +204,22 @@ impl Correlator {
             file_name: create.file_name,
             pid: create.pid,
             status,
+            timestamp_unix_ms: create.timestamp_unix_ms,
+            create_options: create.create_options,
+        })
+    }
+
+    /// `OperationEnd`を受け取り、拒否・成功を問わず[`AccessRecord`]を返す（record-allモード）。
+    /// 相関する`Create`が無い場合のみ`None`——`on_operation_end`と違い、結果の値では
+    /// 絞り込まない。
+    pub fn on_operation_end_any(&mut self, irp: u64, status: u32) -> Option<AccessRecord> {
+        let create = self.take_pending(irp)?;
+        Some(AccessRecord {
+            access: access_from_create_options(create.create_options),
+            file_name: create.file_name,
+            pid: create.pid,
+            status,
+            allowed: status != STATUS_ACCESS_DENIED,
             timestamp_unix_ms: create.timestamp_unix_ms,
             create_options: create.create_options,
         })
@@ -377,6 +419,77 @@ mod tests {
     #[test]
     fn zero_create_options_are_indistinguishable_from_file_supersede() {
         assert_eq!(access_from_create_options(0), FsAccess::Read);
+    }
+
+    /// record-allモード: 成功した操作も`allowed=true`で返る（deny-onlyモードなら消える件）。
+    #[test]
+    fn record_all_mode_returns_successful_operations_as_allowed() {
+        let mut correlator = Correlator::new(16);
+        correlator.on_create(1, create(r"\??\C:\ok.txt", 7, 0));
+
+        let record = correlator
+            .on_operation_end_any(1, 0)
+            .expect("record-all mode returns successes too");
+
+        assert_eq!(record.file_name, r"\??\C:\ok.txt");
+        assert_eq!(record.pid, 7);
+        assert_eq!(record.status, 0);
+        assert!(record.allowed);
+        assert_eq!(correlator.pending_len(), 0);
+    }
+
+    /// record-allモード: 拒否は`allowed=false`で返り、statusは維持される。
+    #[test]
+    fn record_all_mode_returns_denials_as_not_allowed() {
+        let mut correlator = Correlator::new(16);
+        correlator.on_create(1, create(r"\??\C:\secret.txt", 4242, 0x0200_0000));
+
+        let record = correlator
+            .on_operation_end_any(1, STATUS_ACCESS_DENIED)
+            .expect("a record is produced");
+
+        assert_eq!(record.file_name, r"\??\C:\secret.txt");
+        assert_eq!(record.pid, 4242);
+        assert_eq!(record.status, STATUS_ACCESS_DENIED);
+        assert!(!record.allowed);
+        assert_eq!(record.access, FsAccess::ReadWrite);
+    }
+
+    /// record-allモードでも、相関する`Create`が無い`OperationEnd`は黙って無視する
+    /// （deny-onlyモードと同じ下回りを共有しているため）。
+    #[test]
+    fn record_all_mode_ignores_operation_end_without_a_matching_create() {
+        let mut correlator = Correlator::new(16);
+
+        assert!(correlator.on_operation_end_any(0xDEAD, 0).is_none());
+        assert_eq!(correlator.unmatched_operation_end_count(), 1);
+    }
+
+    /// record-allモードでも容量上限は共有される（古いCreateから捨てる）。
+    #[test]
+    fn record_all_mode_shares_the_same_capacity_bound_as_deny_only() {
+        let mut correlator = Correlator::new(3);
+        for irp in 1..=5u64 {
+            correlator.on_create(irp, create(&format!(r"\??\C:\{irp}.txt"), 1, 0));
+        }
+
+        assert_eq!(correlator.pending_len(), 3);
+        assert!(correlator.on_operation_end_any(1, 0).is_none());
+        let record = correlator
+            .on_operation_end_any(5, 0)
+            .expect("the newest entry survives");
+        assert_eq!(record.file_name, r"\??\C:\5.txt");
+    }
+
+    /// deny-onlyとrecord-allは同じ相関表を共有できる——record-allで一度取り出したIrpを
+    /// deny-onlyで再度問い合わせても、既に消費済みなので`None`になる（二重計上しない）。
+    #[test]
+    fn a_record_consumed_by_one_mode_is_not_double_counted_by_the_other() {
+        let mut correlator = Correlator::new(16);
+        correlator.on_create(1, create(r"\??\C:\x.txt", 1, 0));
+
+        assert!(correlator.on_operation_end_any(1, STATUS_ACCESS_DENIED).is_some());
+        assert!(correlator.on_operation_end(1, STATUS_ACCESS_DENIED).is_none());
     }
 
     /// NTパスは設定へ書ける`C:/...`形式へ寄せる。

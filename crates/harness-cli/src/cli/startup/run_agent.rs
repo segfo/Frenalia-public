@@ -355,6 +355,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 workspace_root: workspace_root.clone(),
                 fs_audit_log_path: sink,
                 harness_pid: Some(std::process::id()),
+                record_all: false,
             };
 
             // (A) netfilterdが起動していて、かつパイプを用意できていれば連鎖起動を試す。

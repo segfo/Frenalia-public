@@ -31,7 +31,7 @@ use windows::Win32::Storage::FileSystem::{
 
 use harness_policy::event::{FsAuditEvent, FsAuditKind};
 
-use super::etw::parse::{to_settings_path, Denial};
+use super::etw::parse::{to_settings_path, AccessRecord, Denial};
 use super::etw::scope::{ScopeTracker, ScopeVerdict};
 use super::etw::session::EtwFsSession;
 use super::etw::volumes::drive_letter_map;
@@ -96,7 +96,12 @@ fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
     // ETWセッションを張る。失敗しても**止めない**（D-43）——事実を制御レコードへ書いて
     // 「収集できていない」ことを読む側へ伝えたうえで、Teardownまで待つ。
     let session_name = format!("harness-policy-learn-{}", policy.session_profile);
-    let session = match EtwFsSession::start(&session_name) {
+    let start_result = if policy.record_all {
+        EtwFsSession::start_record_all(&session_name)
+    } else {
+        EtwFsSession::start(&session_name)
+    };
+    let session = match start_result {
         Ok(session) => Some(session),
         Err(e) => {
             append_control(&sink_path, &format!("etw_session_start_failed: {e}"));
@@ -138,29 +143,53 @@ fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
             }
         }
         if let Some(session) = session.as_ref() {
+            written += if policy.record_all {
+                let (starts, records) = session.drain_records();
+                flush_batch_record_all(
+                    &sink_path,
+                    &mut tracker,
+                    &volumes,
+                    starts,
+                    records,
+                    &mut unconvertible,
+                )
+            } else {
+                let (starts, denials) = session.drain();
+                flush_batch(
+                    &sink_path,
+                    &mut tracker,
+                    &volumes,
+                    starts,
+                    denials,
+                    &mut unconvertible,
+                )
+            };
+        }
+    };
+
+    // 最後の取り残しを回収し、統計を制御レコードとして残す。
+    if let Some(session) = session {
+        written += if policy.record_all {
+            let (starts, records) = session.drain_records();
+            flush_batch_record_all(
+                &sink_path,
+                &mut tracker,
+                &volumes,
+                starts,
+                records,
+                &mut unconvertible,
+            )
+        } else {
             let (starts, denials) = session.drain();
-            written += flush_batch(
+            flush_batch(
                 &sink_path,
                 &mut tracker,
                 &volumes,
                 starts,
                 denials,
                 &mut unconvertible,
-            );
-        }
-    };
-
-    // 最後の取り残しを回収し、統計を制御レコードとして残す。
-    if let Some(session) = session {
-        let (starts, denials) = session.drain();
-        written += flush_batch(
-            &sink_path,
-            &mut tracker,
-            &volumes,
-            starts,
-            denials,
-            &mut unconvertible,
-        );
+            )
+        };
         let outcome = session.stop();
         record_collection_stats(&sink_path, &outcome, &tracker, unconvertible);
     }
@@ -234,6 +263,59 @@ fn flush_batch(
             denial.timestamp_unix_ms,
         )
         .with_process(denial.pid, None);
+        if append_event(sink_path, &event) {
+            written += 1;
+        }
+    }
+    written
+}
+
+/// [`flush_batch`]のrecord-all版（`LearnPolicy.record_all`、ポリシー定義モードのTier1パス）。
+/// 拒否だけでなく許可も含めて全アクセスを書き出す。
+///
+/// **スコープprobeに`probe_pid_in_container`を使わない**——Tier1（制限トークン）には
+/// AppContainerのpackage SIDが無いため、`TokenIsAppContainer`照会は生存中のTier1プロセスに
+/// 対しても確定的に`Some(false)`（「AppContainerではない」）を返してしまい、対象を
+/// 永久に除外してしまう（`LearnPolicy.record_all`のdoc参照）。代わりに常に`None`を返す
+/// クロージャを渡し、`harness_pid`起点の親子継承（signal 2＋フォールバック）だけで
+/// スコープを決めさせる。
+fn flush_batch_record_all(
+    sink_path: &Path,
+    tracker: &mut ScopeTracker,
+    volumes: &[(String, String)],
+    starts: Vec<super::etw::session::ProcessStartInfo>,
+    records: Vec<AccessRecord>,
+    unconvertible: &mut u64,
+) -> u64 {
+    for start in &starts {
+        tracker.on_process_start_probing(start, |_pid| None);
+    }
+
+    let mut written = 0u64;
+    for record in records {
+        let verdict = tracker.classify(record.pid, |_pid| None);
+        if verdict != ScopeVerdict::InScope {
+            continue;
+        }
+        let Some(path) = to_settings_path(&record.file_name, volumes) else {
+            // 設定へ書けない形（名前付きパイプ・未知のボリューム）。件数だけ数えて捨てる。
+            *unconvertible = unconvertible.saturating_add(1);
+            continue;
+        };
+        let reason = if record.allowed {
+            "observed".to_string()
+        } else {
+            format!("STATUS_ACCESS_DENIED ({:#010X})", record.status)
+        };
+        let event = FsAuditEvent::observed(
+            FsAuditKind::Etw,
+            path,
+            record.access,
+            record.allowed,
+            reason,
+            record.timestamp_unix_ms,
+        )
+        .with_process(record.pid, None);
         if append_event(sink_path, &event) {
             written += 1;
         }
@@ -365,4 +447,154 @@ fn send(pipe: HANDLE, response: &LearnResponse) -> Result<(), LearnError> {
         .map_err(|e| LearnError::Ipc(format!("failed to serialize response: {e}")))?;
     write_framed_timeout(pipe, &bytes, RESPONSE_WRITE_TIMEOUT)
         .map_err(|e| LearnError::Ipc(e.to_string()))
+}
+
+#[cfg(test)]
+mod flush_batch_record_all_tests {
+    use super::*;
+    use super::super::etw::session::ProcessStartInfo;
+    use harness_config::FsAccess;
+
+    fn read_lines(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// `harness_pid`起点のブートストラップ（`ScopeTracker`のsignal 2フォールバック）で
+    /// 第1世代が対象と判定され、その後の許可・拒否どちらのアクセスも書き出される。
+    /// Tier1にはAppContainer signalが無いため、probeクロージャは常に`None`を返す
+    /// （`flush_batch_record_all`のdoc参照）——それでもこの経路だけで拾えることを確認する。
+    #[test]
+    fn writes_both_allowed_and_denied_records_for_in_scope_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("fs-audit.jsonl");
+        let mut tracker = ScopeTracker::new("").with_harness_pid(Some(100));
+        let volumes = drive_letter_map();
+        let mut unconvertible = 0u64;
+
+        let starts = vec![ProcessStartInfo {
+            pid: 200,
+            parent_pid: Some(100),
+            image_name: Some("cargo.exe".to_string()),
+            package_full_name: None,
+            process_sequence_number: Some(1),
+        }];
+        let records = vec![
+            AccessRecord {
+                file_name: r"C:\work\Cargo.toml".to_string(),
+                pid: 200,
+                access: FsAccess::Read,
+                status: 0,
+                allowed: true,
+                timestamp_unix_ms: 1,
+                create_options: 0,
+            },
+            AccessRecord {
+                file_name: r"C:\Windows\System32\secret.dll".to_string(),
+                pid: 200,
+                access: FsAccess::Read,
+                status: 0xC000_0022,
+                allowed: false,
+                timestamp_unix_ms: 2,
+                create_options: 0,
+            },
+        ];
+
+        let written = flush_batch_record_all(
+            &sink_path,
+            &mut tracker,
+            &volumes,
+            starts,
+            records,
+            &mut unconvertible,
+        );
+
+        assert_eq!(written, 2);
+        let lines = read_lines(&sink_path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["allowed"], true);
+        assert_eq!(lines[0]["reason"], "observed");
+        assert_eq!(lines[1]["allowed"], false);
+        assert!(lines[1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("STATUS_ACCESS_DENIED"));
+        assert_eq!(unconvertible, 0);
+    }
+
+    /// `harness_pid`のブートストラップに繋がらないPID（親子関係が一切分からない）は
+    /// `Unknown`判定になり、書き出されない——`InScope`を確認できないものを無条件で
+    /// 拾わないことが記録モードの正しさの前提。
+    #[test]
+    fn unresolved_processes_are_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("fs-audit.jsonl");
+        let mut tracker = ScopeTracker::new("");
+        let volumes = drive_letter_map();
+        let mut unconvertible = 0u64;
+
+        let records = vec![AccessRecord {
+            file_name: r"C:\work\Cargo.toml".to_string(),
+            pid: 999,
+            access: FsAccess::Read,
+            status: 0,
+            allowed: true,
+            timestamp_unix_ms: 1,
+            create_options: 0,
+        }];
+
+        let written = flush_batch_record_all(
+            &sink_path,
+            &mut tracker,
+            &volumes,
+            Vec::new(),
+            records,
+            &mut unconvertible,
+        );
+
+        assert_eq!(written, 0);
+        assert!(!sink_path.exists());
+    }
+
+    /// 設定へ書けないパス（未知のボリューム）は書かず、件数だけ数える。
+    #[test]
+    fn unconvertible_paths_are_counted_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("fs-audit.jsonl");
+        let mut tracker = ScopeTracker::new("").with_harness_pid(Some(100));
+        let volumes = drive_letter_map();
+        let mut unconvertible = 0u64;
+
+        let starts = vec![ProcessStartInfo {
+            pid: 200,
+            parent_pid: Some(100),
+            image_name: None,
+            package_full_name: None,
+            process_sequence_number: Some(1),
+        }];
+        let records = vec![AccessRecord {
+            file_name: r"\Device\HarddiskVolume999\unknown.txt".to_string(),
+            pid: 200,
+            access: FsAccess::Read,
+            status: 0,
+            allowed: true,
+            timestamp_unix_ms: 1,
+            create_options: 0,
+        }];
+
+        let written = flush_batch_record_all(
+            &sink_path,
+            &mut tracker,
+            &volumes,
+            starts,
+            records,
+            &mut unconvertible,
+        );
+
+        assert_eq!(written, 0);
+        assert_eq!(unconvertible, 1);
+    }
 }

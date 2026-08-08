@@ -33,7 +33,7 @@ use windows::Win32::System::Diagnostics::Etw::{
 };
 
 use super::parse::{
-    Correlator, Denial, PendingCreate, EVENT_ID_CREATE, EVENT_ID_OPERATION_END,
+    AccessRecord, Correlator, Denial, PendingCreate, EVENT_ID_CREATE, EVENT_ID_OPERATION_END,
     KERNEL_FILE_PROVIDER_GUID,
 };
 use super::tdh;
@@ -136,6 +136,13 @@ pub enum EtwError {
 struct Sink {
     correlator: Mutex<Correlator>,
     denials: Mutex<Vec<Denial>>,
+    /// record-allモード（ポリシー定義モードのTier1パス）専用。`record_all=false`のときは
+    /// 常に空のまま——deny-onlyモードは従来通り`denials`だけを使う（B-06: 呼び出し元は
+    /// `start`/`start_record_all`のどちらかで固定され、両方へ同時に書くことはない）。
+    records: Mutex<Vec<AccessRecord>>,
+    /// `true`なら`EVENT_ID_OPERATION_END`受信時に`on_operation_end_any`（拒否・成功を問わず
+    /// 記録）を使う。`false`（既定）なら従来通り`on_operation_end`（拒否のみ）。
+    record_all: bool,
     /// 観測したイベント総数。0のままなら「セッションは張れたがイベントが流れてこなかった」
     /// ことが分かる——「拒否が無かった」との区別に要る（D-43）。
     seen_events: Mutex<u64>,
@@ -202,6 +209,14 @@ impl EtwFsSession {
         Self::start_with_extra_keywords(session_name, 0)
     }
 
+    /// ポリシー定義モード（Tier1、`record_all`）向け: 拒否だけでなく成功も含めて
+    /// 全アクセスを記録する。読み出しは[`Self::drain_records`]/[`Self::snapshot_records`]を使う
+    /// ——[`Self::drain`]/[`Self::snapshot`]（deny-onlyモード用）は常に空を返す
+    /// （`Sink.denials`へは書かないため）。
+    pub fn start_record_all(session_name: &str) -> Result<Self, EtwError> {
+        Self::start_inner(session_name, 0, false, true)
+    }
+
     /// **診断専用**: 追加キーワードを開けたうえで、生イベント列も捕捉する。
     ///
     /// 「拒否が実際にどのイベント列として現れるか」を採るための入口
@@ -212,7 +227,7 @@ impl EtwFsSession {
         session_name: &str,
         extra_keywords: u64,
     ) -> Result<Self, EtwError> {
-        Self::start_inner(session_name, extra_keywords, true)
+        Self::start_inner(session_name, extra_keywords, true, false)
     }
 
     /// 捕捉した生イベント列と、容量超過で捨てた件数。
@@ -235,13 +250,14 @@ impl EtwFsSession {
         session_name: &str,
         extra_keywords: u64,
     ) -> Result<Self, EtwError> {
-        Self::start_inner(session_name, extra_keywords, false)
+        Self::start_inner(session_name, extra_keywords, false, false)
     }
 
     fn start_inner(
         session_name: &str,
         extra_keywords: u64,
         capture_raw: bool,
+        record_all: bool,
     ) -> Result<Self, EtwError> {
         // 生イベント捕捉はテストビルドにしか存在しない（[`RawFsEvent`]のdoc参照）ので、
         // 本番ビルドではこの引数に行き先が無い。関数全体を`allow(unused_variables)`で
@@ -291,6 +307,8 @@ impl EtwFsSession {
         let sink = Arc::new(Sink {
             correlator: Mutex::new(Correlator::new(PENDING_CREATE_CAPACITY)),
             denials: Mutex::new(Vec::new()),
+            records: Mutex::new(Vec::new()),
+            record_all,
             seen_events: Mutex::new(0),
             observed_paths: Mutex::new(Vec::new()),
             process_starts: Mutex::new(Vec::new()),
@@ -358,6 +376,25 @@ impl EtwFsSession {
             .map(|mut d| std::mem::take(&mut *d))
             .unwrap_or_default();
         (starts, denials)
+    }
+
+    /// [`Self::drain`]のrecord-all版。`Self::start_record_all`で開始したセッションで使う
+    /// ——deny-onlyセッション（`Self::start`）で呼んでも常に空を返す（`Sink.records`へは
+    /// 書かれないため）。
+    pub fn drain_records(&self) -> (Vec<ProcessStartInfo>, Vec<AccessRecord>) {
+        let starts = self
+            .sink
+            .process_starts
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default();
+        let records = self
+            .sink
+            .records
+            .lock()
+            .map(|mut r| std::mem::take(&mut *r))
+            .unwrap_or_default();
+        (starts, records)
     }
 
     /// これまでに観測した拒否を取り出す（セッションは動いたまま）。
@@ -784,14 +821,27 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
             let Some(status) = tdh::property_u64(record, "Status") else {
                 return;
             };
-            let denial = sink
-                .correlator
-                .lock()
-                .ok()
-                .and_then(|mut c| c.on_operation_end(irp, status as u32));
-            if let Some(denial) = denial {
-                if let Ok(mut denials) = sink.denials.lock() {
-                    denials.push(denial);
+            if sink.record_all {
+                let record = sink
+                    .correlator
+                    .lock()
+                    .ok()
+                    .and_then(|mut c| c.on_operation_end_any(irp, status as u32));
+                if let Some(record) = record {
+                    if let Ok(mut records) = sink.records.lock() {
+                        records.push(record);
+                    }
+                }
+            } else {
+                let denial = sink
+                    .correlator
+                    .lock()
+                    .ok()
+                    .and_then(|mut c| c.on_operation_end(irp, status as u32));
+                if let Some(denial) = denial {
+                    if let Ok(mut denials) = sink.denials.lock() {
+                        denials.push(denial);
+                    }
                 }
             }
         }

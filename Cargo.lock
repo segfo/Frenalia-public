@@ -1217,6 +1217,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-policy-editor"
+version = "0.1.0"
+dependencies = [
+ "harness-config",
+ "harness-core",
+ "harness-policy",
+ "harness-sandbox",
+ "serde_json",
+ "tempfile",
+ "windows",
+]
+
+[[package]]
 name = "harness-policy-learnd"
 version = "0.1.0"
 dependencies = [

@@ -132,6 +132,13 @@ pub(crate) fn clear_inherit(handle: HANDLE) {
 }
 
 /// 環境変数をCreateProcess系API用のnull区切り環境ブロック（UTF-16、末尾ダブルNUL）へ変換する。
+///
+/// `CREATE_UNICODE_ENVIRONMENT`が要求する終端は、変数ゼロ件の場合も含めて**常に二重NUL**
+/// （`\0\0`）である——各変数は単一NULで終わり、ブロック全体の終わりにもう1つNULが要る。
+/// 変数が1件以上あればループの各`push(0)`＋関数末尾の`push(0)`で自然に二重になるが、
+/// **0件のときはループが1回も回らず`push(0)`が1回しか効かない**ため、単一NULのまま
+/// `CreateProcessAsUserW`へ渡ると`ERROR_INVALID_PARAMETER`になる（実機で確認済み——
+/// 本番経路は`build_child_env()`が常に非空を返すため露見しなかった潜在バグ）。
 pub(crate) fn build_env_block(env: &[(String, String)]) -> Vec<u16> {
     let mut entries: Vec<&(String, String)> = env.iter().collect();
     entries.sort_by_key(|a| a.0.to_ascii_uppercase());
@@ -141,6 +148,9 @@ pub(crate) fn build_env_block(env: &[(String, String)]) -> Vec<u16> {
         block.push(0);
     }
     block.push(0);
+    if env.is_empty() {
+        block.push(0);
+    }
     block
 }
 
@@ -353,6 +363,32 @@ pub(crate) fn hold_mutex_for_process_lifetime(name: &str) -> windows::core::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CREATE_UNICODE_ENVIRONMENT`は変数0件でも二重NUL終端を要求する。ループが1回も
+    /// 回らない0件の場合に単一NULのままにならないことを固定する（実機で
+    /// `CreateProcessAsUserW`が`ERROR_INVALID_PARAMETER`を返すことで発覚したバグの回帰）。
+    #[test]
+    fn empty_env_block_is_double_null_terminated() {
+        assert_eq!(build_env_block(&[]), vec![0u16, 0u16]);
+    }
+
+    /// 変数1件以上の場合は既存通り、各変数の後ろのNULと末尾のNULで自然に二重終端になる。
+    #[test]
+    fn non_empty_env_block_ends_with_two_nulls_after_the_last_entry() {
+        let block = build_env_block(&[("A".to_string(), "1".to_string())]);
+        assert_eq!(block, "A=1\0\0".encode_utf16().collect::<Vec<u16>>());
+    }
+
+    /// エントリはキー名（大文字化して比較）でソートされる。
+    #[test]
+    fn env_block_entries_are_sorted_by_uppercased_key() {
+        let block = build_env_block(&[
+            ("b".to_string(), "2".to_string()),
+            ("A".to_string(), "1".to_string()),
+        ]);
+        let joined = String::from_utf16(&block[..block.len() - 1]).unwrap();
+        assert_eq!(joined, "A=1\0b=2\0");
+    }
 
     fn long_path_string(path: &str) -> String {
         let wide = long_path_wide(std::path::Path::new(path));

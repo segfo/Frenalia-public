@@ -53,6 +53,18 @@ pub struct LearnPolicy {
     /// 権限が自動で広がることはない（D-42: 適用は常にユーザーの明示操作）。
     #[serde(default)]
     pub harness_pid: Option<u32>,
+    /// ポリシーエディタの記録モード（Tier1、`plans/POLICY-EDITOR-TOMOYO-DIG.md`）専用。
+    /// `true`なら拒否だけでなく全アクセス（成功も含む）を記録する（record-all）。
+    ///
+    /// このフラグはスコープ判定の方式も切り替える——Tier1（制限トークン）にはAppContainerの
+    /// package SIDが無いため、signal 1（`PackageFullName`一致）は元々空振りし、signal 3
+    /// （`TokenIsAppContainer`照会）は**誤って`Some(false)`を返し対象を永久に除外してしまう**
+    /// （Tier1プロセスは有効なトークンを持つが単にAppContainerではないだけなので、
+    /// `probe_pid_in_container`は生存中でも確定的に「違う」と答えてしまう）。そのため
+    /// `record_all=true`のときはprobeを使わず、`harness_pid`起点の親子継承（signal 2＋
+    /// フォールバック）だけでスコープを決める。
+    #[serde(default)]
+    pub record_all: bool,
 }
 
 /// 親→収集器。1セッションで`StartCollect`→`Teardown`の順に2回送る。
@@ -106,11 +118,42 @@ mod tests {
             workspace_root: PathBuf::from("C:/work"),
             fs_audit_log_path: PathBuf::from("C:/work/.harness/sandbox/session-x/fs-audit.jsonl"),
             harness_pid: None,
+            record_all: false,
         });
 
         assert_eq!(
             serde_json::to_string(&request).unwrap(),
-            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.1-2","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":null}}"#
+            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.1-2","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":null,"record_all":false}}"#
+        );
+    }
+
+    /// 旧バージョン（`record_all`フィールドを持たない）が書いたJSONも、
+    /// `#[serde(default)]`により`record_all: false`として読める（後方互換）。
+    #[test]
+    fn start_collect_request_without_record_all_defaults_to_false() {
+        let old_wire = r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.1-2","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":null}}"#;
+
+        let request: LearnRequest = serde_json::from_str(old_wire).unwrap();
+        match request {
+            LearnRequest::StartCollect(policy) => assert!(!policy.record_all),
+            _ => panic!("expected StartCollect"),
+        }
+    }
+
+    /// `record_all: true`のワイヤ形式も固定する（Tier1記録モードが実際に送る形）。
+    #[test]
+    fn start_collect_request_with_record_all_true_wire_format_is_stable() {
+        let request = LearnRequest::StartCollect(LearnPolicy {
+            session_profile: "harness.policy-mode".to_string(),
+            workspace_root: PathBuf::from("C:/work"),
+            fs_audit_log_path: PathBuf::from("C:/work/.harness/sandbox/session-x/fs-audit.jsonl"),
+            harness_pid: Some(4242),
+            record_all: true,
+        });
+
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"StartCollect":{"session_profile":"harness.policy-mode","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":4242,"record_all":true}}"#
         );
     }
 

@@ -9,12 +9,14 @@
 //!
 //! **既知の限界（正直に明記する）**: 低ILは既定で中IL（Medium、通常ファイルの既定）オブジェクトを
 //! read可（No-Read-Upは既定でない）＝機密性は守らない（T-04残存、§9-1）。書込は、spawn直前に
-//! 呼び出し側が`cwd`ディレクトリ**1つだけ**へ継承可能な低ILラベルを明示的に付与するため、
-//! **そのcwd配下に新規作成されるファイル/ディレクトリのみ**書込可能になる。cwd配下に
-//! 既にMedium ILで存在する既存ファイル（過去の非隔離buildの成果物等）への上書きは失敗し得る
-//! （既存ファイルへ遡ってラベルを再帰付与するのは、ユーザの実リポジトリのACLを広範囲に変更する
-//! 破壊的操作になるため意図的に行わない）。cwd外への書込は既定Mediumラベルのため一貫して拒否
-//! される（範囲外書込拒否＝Tier1の本来の保証、T-05）。
+//! 呼び出し側が`cwd`ディレクトリ**1つだけ**へ低ILラベルを明示的に付与するため、
+//! **そのcwd直下に新規作成されるファイル/ディレクトリのみ**書込可能になる
+//! （ラベルは継承させないので、cwd配下に新しく作った**サブディレクトリ**の中は
+//! 再びMedium扱いになる。BUG-018でTier2aの一時ディレクトリを巻き込んだため継承を止めた）。
+//! cwd配下に既にMedium ILで存在する既存ファイル（過去の非隔離buildの成果物等）への上書きは
+//! 失敗し得る（既存ファイルへ遡ってラベルを再帰付与するのは、ユーザの実リポジトリのACLを
+//! 広範囲に変更する破壊的操作になるため意図的に行わない）。cwd外への書込は既定Mediumラベルの
+//! ため一貫して拒否される（範囲外書込拒否＝Tier1の本来の保証、T-05）。
 //!
 //! この機密性・network遮断の欠落を埋める実験的Tier2a（AppContainer）は`win_appcontainer`参照。
 //! 低レベルのパイプ/HANDLE/env補助関数は`win_common`に共通化されている。
@@ -34,6 +36,7 @@ use windows::Win32::Security::{
     TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
     TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
+use windows::Win32::Storage::FileSystem::ReadFile;
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
@@ -43,7 +46,7 @@ use windows::Win32::System::Threading::{
 
 use crate::win_common::{
     build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl,
-    read_two_pipes_to_strings, wide, write_all,
+    decode_console_bytes, read_two_pipes_to_strings, wide, write_all,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -61,14 +64,23 @@ impl From<windows::core::Error> for RestrictedError {
 /// 低Integrity LevelのSDDL文字列（`S-1-16-4096`、Windowsの既定Low IL SID）。
 const LOW_IL_SDDL: &str = "S-1-16-4096";
 
-/// `dir`1つだけに、配下へ継承する低ILの必須ラベルACEを設定する（非再帰・冪等）。
+/// `dir`1つだけに低ILの必須ラベルACEを設定する（非再帰・冪等）。
 /// 既存の子孫には遡って効かない（モジュールdocコメントの既知の限界を参照）。
 pub fn set_low_integrity_label(dir: &Path) -> Result<(), RestrictedError> {
-    // SDDL: "S:(ML;NI;NW;;;LW)" = SACL(mandatory label)、no-inherit（子孫へ伝播させない）、
+    // SDDL: "S:(ML;;NW;;;LW)" = SACL(mandatory label)、継承フラグ無し（子孫へ伝播させない）、
     // no-write-up、対象SIDはLow mandatory level。
-    // CIOI（container+object inherit）だと .harness/sandbox/Tier2a-tmp にもラベルが継承され、
-    // Low IL 相当の AppContainer プロセスからの書込みが PRIVILEGE NOT HELD で拒否される（BUG-018）。
-    const SDDL_LOW_LABEL: &str = "S:(ML;NI;NW;;;LW)";
+    //
+    // 継承フラグを立てない理由（BUG-018）: `CIOI`（container+object inherit）だと
+    // `.harness/sandbox/Tier2a-tmp`にもラベルが継承され、Low IL相当のAppContainerプロセスからの
+    // 書込みが PRIVILEGE NOT HELD で拒否される。
+    //
+    // **`NI`と書いてはいけない**: BUG-018の案Aは`"S:(ML;NI;NW;;;LW)"`を採用したが、`NI`は
+    // SDDLの正規のACEフラグトークンではない（正規はCI/OI/NP/IO/ID/SA/FAのみ）。このため
+    // `ConvertStringSecurityDescriptorToSecurityDescriptorW`が`ERROR_INVALID_FLAGS`で失敗し、
+    // **ラベルが一度も付かない状態**が続いていた。呼び出し側が`let _ =`で結果を捨てていたので
+    // 無言のまま検知されず、報告症状（継承ラベルの汚染）は「付けない」ことで消えるため
+    // 当時のE2Eも通ってしまった。「継承させない」はフラグ欄を**空にする**ことで表す。
+    const SDDL_LOW_LABEL: &str = "S:(ML;;NW;;;LW)";
     unsafe {
         let sddl = wide(SDDL_LOW_LABEL);
         let mut sd = PSECURITY_DESCRIPTOR::default();
@@ -165,6 +177,140 @@ impl RestrictedChild {
             let _ = GetExitCodeProcess(self.process, &mut code);
             Ok((out, err, code as i32))
         }
+    }
+
+    /// ストリーミング版: stdin送出後、stdout/stderrを行単位で`OutputEvent`として流しつつ、
+    /// プロセス終了を別イベントとして通知する（ポリシーエディタの記録モードのライブ表示用、
+    /// `plans/POLICY-EDITOR-TOMOYO-DIG.md`参照）。`write_stdin_read_output_and_wait`と違い
+    /// 呼び出し側で`spawn_blocking`する必要はない——OSスレッド3本（stdout読取・stderr読取・
+    /// プロセス待機）を内部で起こし、`tokio::sync::mpsc`のreceiverだけを返す。
+    ///
+    /// **`Exited`と`OutputClosed`は独立したイベント**（モジュールdocの新設1番）。
+    /// 孫プロセスがstdout/stderrを継承したまま握り続けると、親（直接の子）プロセスが終了
+    /// しても`OutputClosed`はすぐには来ない。呼び出し側は`Exited`を見た時点でタイムアウト
+    /// 判断などへ進んでよく、`OutputClosed`だけを待ってハングする設計にしないこと。
+    pub fn spawn_streaming(
+        mut self,
+        stdin_payload: Option<&[u8]>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<OutputEvent> {
+        if let Some(payload) = stdin_payload {
+            if let Some(stdin) = self.stdin_write.take() {
+                write_all(stdin, payload);
+                unsafe {
+                    let _ = CloseHandle(stdin);
+                }
+            }
+        } else if let Some(stdin) = self.stdin_write.take() {
+            unsafe {
+                let _ = CloseHandle(stdin);
+            }
+        }
+
+        // ハンドルの値だけを取り出し、`self`のDropが即座に閉じてしまわないよう
+        // `mem::forget`で無効化する。以降の後始末は各スレッドが自分の担当分だけ行う
+        // （`wfp.rs`の`WfpSession::teardown`と同じ「所有権をここで断つ」パターン）。
+        let stdout = SendHandle(self.stdout_read);
+        let stderr = SendHandle(self.stderr_read);
+        let process = SendHandle(self.process);
+        let job = SendHandle(self.job);
+        std::mem::forget(self);
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // stdout/stderrの読み取りとプロセス待機は**完全に独立したスレッド**で走らせる。
+        // 片方をもう片方の後始末（join）にぶら下げると、その依存の向きだけ`Exited`が
+        // `OutputClosed`を待つ形になってしまい、「孫プロセスがパイプを握っていても
+        // `Exited`は先に届く」という設計意図（モジュールdocの新設1番）を満たせない。
+        let tx_out = tx.clone();
+        let out_thread = std::thread::spawn(move || {
+            // RFC 2229の部分キャプチャが`stdout.0`だけを捉えて`SendHandle`のSend実装を
+            // 素通りしないよう、変数全体を明示的に再束縛してから使う。
+            let stdout = stdout;
+            stream_pipe_lines(stdout.0, |line| {
+                let _ = tx_out.send(OutputEvent::Stdout(line));
+            });
+            unsafe {
+                let _ = CloseHandle(stdout.0);
+            }
+        });
+        let tx_err = tx.clone();
+        let err_thread = std::thread::spawn(move || {
+            let stderr = stderr;
+            stream_pipe_lines(stderr.0, |line| {
+                let _ = tx_err.send(OutputEvent::Stderr(line));
+            });
+            unsafe {
+                let _ = CloseHandle(stderr.0);
+            }
+        });
+        let tx_closed = tx.clone();
+        std::thread::spawn(move || {
+            let _ = out_thread.join();
+            let _ = err_thread.join();
+            let _ = tx_closed.send(OutputEvent::OutputClosed);
+        });
+
+        std::thread::spawn(move || unsafe {
+            let process = process;
+            let job = job;
+            WaitForSingleObject(process.0, INFINITE);
+            let mut code: u32 = 0;
+            let _ = GetExitCodeProcess(process.0, &mut code);
+            let _ = tx.send(OutputEvent::Exited(code as i32));
+            // ジョブを閉じる＝kill-on-closeで、居残っている子孫（stdout/stderrを
+            // 握ったまま孤児化した孫プロセス）を巻き取って終了させる。これにより
+            // reader側の`ReadFile`がEOFで返り、`OutputClosed`が来ないまま無期限に
+            // ブロックする事態を避ける。
+            let _ = CloseHandle(job.0);
+            let _ = CloseHandle(process.0);
+        });
+
+        rx
+    }
+}
+
+/// ストリーミング出力の1件（[`RestrictedChild::spawn_streaming`]用）。
+#[derive(Debug, Clone)]
+pub enum OutputEvent {
+    Stdout(String),
+    Stderr(String),
+    /// stdout/stderrの両方がEOFに達した。**プロセスの終了（`Exited`）とは独立**——
+    /// 孫プロセスがハンドルを握ったままだと、こちらだけ遅れて届くことがある。
+    OutputClosed,
+    /// プロセスの終了コード。
+    Exited(i32),
+}
+
+/// `HANDLE`は`windows`クレートで`Send`を実装しないため、スレッド間で1回だけ受け渡す
+/// ための最小限のラッパ（`win_common::SendHandle`と同じ「単純な数値ハンドルなので
+/// 実際には安全」という判断、`docs/CODE-STRUCTURE-RULES.md`規則5的には複製だが、
+/// `win_common`側が`pub(crate)`にすらしていない1行型のため複製の方が単純）。
+#[derive(Clone, Copy)]
+struct SendHandle(HANDLE);
+unsafe impl Send for SendHandle {}
+
+/// パイプから行単位で読み、`\n`ごとにコールバックへ渡す（`win_common::decode_console_bytes`
+/// をBUG-051と同じ方針で1行分のバイト列に適用する）。EOF時に残った未改行の断片も
+/// 最後に1回だけ渡す。ブロッキング（呼び出し側が専用スレッドで回す）。
+fn stream_pipe_lines(handle: HANDLE, mut on_line: impl FnMut(String)) {
+    let mut pending = Vec::new();
+    let mut buf = [0u8; 8192];
+    unsafe {
+        loop {
+            let mut read = 0u32;
+            let ok = ReadFile(handle, Some(&mut buf), Some(&mut read), None);
+            if ok.is_err() || read == 0 {
+                break;
+            }
+            pending.extend_from_slice(&buf[..read as usize]);
+            while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=pos).collect();
+                on_line(decode_console_bytes(&line));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        on_line(decode_console_bytes(&pending));
     }
 }
 
@@ -376,4 +522,186 @@ pub fn spawn(
         stdout_read,
         stderr_read,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **BUG-018の「修正」が実は無言で壊れていたことの回帰テスト。**
+    ///
+    /// 呼び出し側（`shell.rs`の`run_windows_tier1`）は`let _ =`で結果を捨てるため、この関数が
+    /// 失敗しても誰も気付けない（B-09/B-10）。実際、BUG-018の案Aで入れた`"S:(ML;NI;NW;;;LW)"`の
+    /// `NI`はSDDLの正規ACEフラグトークンではなく（正規はCI/OI/NP/IO/ID/SA/FA）、
+    /// `ConvertStringSecurityDescriptorToSecurityDescriptorW`が`ERROR_INVALID_FLAGS`で失敗し、
+    /// **ラベルは一度も付いていなかった**。報告された症状（継承ラベルの汚染）は
+    /// 「ラベルを付けない」ことで消えるため、当時のE2Eは通ってしまった。
+    ///
+    /// 冪等（2回呼んでも成功する）ことも同時に固定する。
+    #[test]
+    fn set_low_integrity_label_actually_succeeds_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        set_low_integrity_label(dir.path()).expect("first call must succeed");
+        set_low_integrity_label(dir.path()).expect("second call must succeed (idempotent)");
+    }
+
+    /// ラベルが**実際にオブジェクトへ書かれている**ことを、設定した値を読み直して確認する。
+    /// 「呼び出しが`Ok`を返した」と「ラベルが付いた」は別の事実なので、実効で検証する（B-25）。
+    #[test]
+    fn set_low_integrity_label_leaves_a_low_mandatory_label_on_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        set_low_integrity_label(dir.path()).expect("label must be applied");
+
+        let output = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .output()
+            .expect("icacls should run");
+        let text = String::from_utf8_lossy(&output.stdout);
+
+        // **ラベル行だけ**を取り出して調べる。DACLのACE行は親から継承した`(I)(OI)(CI)`を
+        // 正当に持つので、出力全体に対して継承フラグの有無を問うと必ず誤検出する。
+        let label_line = text
+            .lines()
+            .find(|line| line.contains("Mandatory Label"))
+            .unwrap_or_else(|| panic!("a mandatory label must be present on the directory: {text}"));
+
+        assert!(
+            label_line.contains("Low Mandatory Level"),
+            "the label must be the Low mandatory level: {label_line}"
+        );
+        assert!(
+            label_line.contains("(NW)"),
+            "the label must carry the no-write-up policy: {label_line}"
+        );
+        // BUG-018の本来の目的: 子孫へ継承させない。継承フラグが復活していないことを固定する。
+        assert!(
+            !label_line.contains("(OI)") && !label_line.contains("(CI)"),
+            "the mandatory label must not carry inheritance flags (BUG-018): {label_line}"
+        );
+    }
+
+    /// テスト用のPowerShell実行ファイル名。`cmd.exe`は`/C`の再トークン化が独特で
+    /// （複数の引用符付き引数を再連結する際の挙動がCommandLineToArgvW前提の
+    /// `spawn`の組み立てと噛み合わない、既知のWindowsの落とし穴）、実運用の
+    /// Tier1起動（`shell.rs`の`run_windows_tier1`）も同じ理由でPowerShellだけを使っている。
+    /// テストもそれに合わせ、cmd.exe固有の罠を踏まないようにする。
+    fn test_shell() -> &'static str {
+        "powershell"
+    }
+
+    /// テスト用の最小限だが現実的な子環境。`&[]`（真に空の環境）を渡すと、PowerShell自身が
+    /// `SystemRoot`等の初期化に必要な変数を持てず文字化けした起動時メッセージだけを吐いて
+    /// 異常終了する（実機で確認済み——`build_env_block`の二重NUL終端バグとは別の、
+    /// 「テストの入力が非現実的だった」という原因）。実運用の`run_windows_tier1`と同じく
+    /// `secret_env::build_child_env()`を使う。
+    fn test_env() -> Vec<(String, String)> {
+        crate::secret_env::build_child_env()
+    }
+
+    /// `spawn_streaming`はstdout/stderrを行単位で流し、両方がEOFに達したら`OutputClosed`、
+    /// プロセスが終了したら`Exited`を送る。`blocking_recv`を使うのは、このクレートが
+    /// tokioの`sync`/`time`機能しか有効化しておらず（`#[tokio::test]`が使える`rt`/`macros`は
+    /// 無い）、Tier1のspawn自体も管理者権限を要さないため素の`#[test]`で完結できるから。
+    #[test]
+    fn spawn_streaming_reports_stdout_stderr_and_exit() {
+        let cwd = std::env::temp_dir();
+        let child = spawn(
+            test_shell(),
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Write-Output out-line; Write-Error err-line",
+            ],
+            &cwd,
+            &test_env(),
+            false,
+        )
+        .expect("spawn should succeed");
+
+        let mut rx = child.spawn_streaming(None);
+        let mut stdout_lines = Vec::new();
+        let mut stderr_lines = Vec::new();
+        let mut saw_output_closed = false;
+        let mut exit_code = None;
+
+        // 3つのイベント全てを観測するまで受信する。`Exited`と`OutputClosed`はどちらが
+        // 先に届いても正しい（設計上、順序を仮定しない）。
+        while exit_code.is_none() || !saw_output_closed {
+            match rx.blocking_recv().expect("channel should not close early") {
+                OutputEvent::Stdout(line) => stdout_lines.push(line),
+                OutputEvent::Stderr(line) => stderr_lines.push(line),
+                OutputEvent::OutputClosed => saw_output_closed = true,
+                OutputEvent::Exited(code) => exit_code = Some(code),
+            }
+        }
+
+        assert!(
+            stdout_lines.iter().any(|l| l.contains("out-line")),
+            "{stdout_lines:?}"
+        );
+        assert!(
+            stderr_lines.iter().any(|l| l.contains("err-line")),
+            "{stderr_lines:?}"
+        );
+        // `Write-Error`はPowerShell自身の終了コードを1にする（-NonInteractiveでの既定挙動）。
+        // ここでの主張は「終了コードが伝播すること」であって0であることではない。
+        assert_eq!(exit_code, Some(1));
+    }
+
+    /// 非ゼロ終了コードもそのまま`Exited`に載る（`Write-Error`とは別経路——`exit N`による
+    /// 明示的な終了コード指定が正しく伝播することを確認する）。
+    #[test]
+    fn spawn_streaming_reports_non_zero_exit_code() {
+        let cwd = std::env::temp_dir();
+        let child = spawn(
+            test_shell(),
+            &["-NoProfile", "-NonInteractive", "-Command", "exit 7"],
+            &cwd,
+            &test_env(),
+            false,
+        )
+        .expect("spawn should succeed");
+
+        let mut rx = child.spawn_streaming(None);
+        let mut exit_code = None;
+        while let Some(event) = rx.blocking_recv() {
+            if let OutputEvent::Exited(code) = event {
+                exit_code = Some(code);
+                break;
+            }
+        }
+
+        assert_eq!(exit_code, Some(7));
+    }
+
+    /// stdinへ書いた内容がそのままstdoutへ反映される（`-Command -`でスクリプトをstdinから
+    /// 読む。実運用の`run_windows_tier1`と同じ形——BUG-050対策でコマンド本体を
+    /// コマンドラインへ文字列として埋め込まないパターンをテストでも踏襲する）。
+    #[test]
+    fn spawn_streaming_delivers_stdin_payload_before_reading_output() {
+        let cwd = std::env::temp_dir();
+        let child = spawn(
+            test_shell(),
+            &["-NoProfile", "-NonInteractive", "-Command", "-"],
+            &cwd,
+            &test_env(),
+            true,
+        )
+        .expect("spawn should succeed");
+
+        let mut rx = child.spawn_streaming(Some(b"Write-Output hello-from-stdin\r\n"));
+        let mut stdout_lines = Vec::new();
+        while let Some(event) = rx.blocking_recv() {
+            if let OutputEvent::Stdout(line) = event {
+                stdout_lines.push(line);
+            }
+        }
+
+        assert!(
+            stdout_lines.iter().any(|l| l.contains("hello-from-stdin")),
+            "{stdout_lines:?}"
+        );
+    }
 }
