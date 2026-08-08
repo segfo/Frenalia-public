@@ -14,7 +14,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
 };
 
-use super::preflight::{describe_passthrough_chain, PassthroughChainFacts};
+use super::preflight_probe::{describe_passthrough_chain, PassthroughChainFacts};
 
 /// 祖先が「通過できる」状態のマスク（`grant_traverse_chain`が実際に付与する値）。
 const TRAVERSE_OK: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;

@@ -278,6 +278,9 @@ mod acl_grant;
 pub mod grant_job;
 mod mcp_preflight;
 mod preflight;
+/// `preflight`が打つ実機プローブ（実際にAppContainer子を起こしてFS I/Oを試す層）。
+/// 決定（どのプローブをどの順で打つか）は`preflight`が持ち、ここは観測だけを持つ。
+mod preflight_probe;
 mod revoke;
 mod spawn;
 mod spawn_session;
@@ -286,6 +289,7 @@ mod traverse;
 pub use acl_grant::*;
 pub use mcp_preflight::*;
 pub use preflight::*;
+pub(crate) use preflight_probe::*;
 pub use revoke::*;
 pub use spawn::*;
 pub use spawn_session::*;
