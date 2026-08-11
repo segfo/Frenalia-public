@@ -7,7 +7,6 @@ mod gate;
 mod picker;
 #[cfg(windows)]
 mod sandbox_prep;
-mod terminal;
 mod ui;
 
 use std::io;
@@ -50,7 +49,9 @@ pub enum RunOutcome {
     Quit,
     /// `/workspace <path>`。`workspace`は正規化済み（`harness-cli`の
     /// `normalize_workspace_root`と同じ規則）で、実在するディレクトリであることを確認済み。
-    Relaunch { workspace: PathBuf },
+    Relaunch {
+        workspace: PathBuf,
+    },
 }
 
 const TICK: Duration = Duration::from_millis(33);
@@ -199,7 +200,10 @@ fn run_memory_slash_command(workspace_root: &std::path::Path, cmd: MemoryCommand
                     created_at_ms: latest.created_at_ms,
                     id: latest.id.clone(),
                 });
-                lines.push(format!("marked {} checkpoint(s) as reviewed.", unreviewed.len()));
+                lines.push(format!(
+                    "marked {} checkpoint(s) as reviewed.",
+                    unreviewed.len()
+                ));
             }
             lines
         }
@@ -394,7 +398,7 @@ pub async fn run(
     tier3_warm: bool,
     tier3_max_sessions: u8,
 ) -> io::Result<RunOutcome> {
-    let guard = terminal::TerminalGuard::enter()?;
+    let guard = harness_term::TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
     let mut term_events = EventStream::new();
@@ -539,7 +543,7 @@ pub async fn run(
     );
     let mut app = AppState::new(provider_label, model);
     app.enter_submits = enter_submits;
-    app.host_is_vscode = terminal::host_is_vscode();
+    app.host_is_vscode = harness_term::host_is_vscode();
     app.workspace_label = workspace_root_for_panel
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

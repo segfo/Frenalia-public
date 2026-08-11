@@ -12,6 +12,8 @@ harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-engine = { version = "0.1.0", path = "../harness-engine" }
 harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
 harness-sandbox-vm = { version = "0.1.0", path = "../harness-sandbox-vm" }
+# 端末の生モード/オルタネートスクリーン復帰（`harness-policy-editor`のTUIと共有）。
+harness-term = { version = "0.1.0", path = "../harness-term" }
 harness-tools = { version = "0.1.0", path = "../harness-tools" }
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 serde_json = "1"

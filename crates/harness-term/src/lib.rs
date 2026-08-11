@@ -1,5 +1,13 @@
 //! 端末の生モード/オルタネートスクリーンをRAII+panic hookで必ず復帰させる
-//! （§リッチTUI「端末復帰」）。
+//! （`plans/DESIGN.md` §リッチTUI「端末復帰」）。
+//!
+//! `harness-tui`（会話TUI）と`harness-policy-editor`（ポリシーエディタTUI）が共有する。
+//! 前者から後者を参照させないのは、ポリシーエディタが**会話エージェントとは独立した
+//! 2つ目のバイナリ**だからで、コピーにしないのは端末復帰が「壊れても例外が出ない」
+//! 種類のロジックだからである（`docs/CODE-STRUCTURE-RULES.md`規則5）。
+
+/// 末尾追従のスクロール表示（会話TUIのtranscriptとポリシーエディタの記録画面が共有）。
+pub mod scrollback;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +25,7 @@ use crossterm::terminal::{
 /// レガシー端末プロトコルでは素のEnterとShift+Enterがどちらも修飾キー無しの
 /// Enterとして届き区別できない。Kitty Keyboard Protocol対応端末（kitty/WezTerm/
 /// 新しめのWindows Terminal等）でのみ拡張フラグを有効化し、Shift+Enterを
-/// 区別可能にする。非対応端末では`app.rs`側が従来通りShift無しEnterとして扱う。
+/// 区別可能にする。非対応端末では呼び出し側が従来通りShift無しEnterとして扱う。
 static KEYBOARD_ENHANCEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// `TERM_PROGRAM=vscode`かどうか（大小無視）。表示専用（入力欄のヒント文字列で
@@ -39,9 +47,9 @@ impl TerminalGuard {
         Ok(Self)
     }
 
-    /// 外部エディタ（`git merge-file`のconflict marker解消、`resolve.rs`参照）のような対話
-    /// 子プロセスへ端末を明け渡す前に呼ぶ。代替スクリーン・raw mode・マウスキャプチャを一時的に
-    /// 解除するだけで、`Drop`と違いpanic hookは触らない（プロセス自体は継続するため）。
+    /// 外部エディタ（`git merge-file`のconflict marker解消、`harness-tui`の`resolve.rs`参照）の
+    /// ような対話子プロセスへ端末を明け渡す前に呼ぶ。代替スクリーン・raw mode・マウスキャプチャを
+    /// 一時的に解除するだけで、`Drop`と違いpanic hookは触らない（プロセス自体は継続するため）。
     /// `resume()`と対で使うこと——`suspend()`だけ呼んで`resume()`を呼ばずに終了すると、
     /// 端末が生モードのまま残る。
     pub fn suspend(&self) -> io::Result<()> {
@@ -63,7 +71,7 @@ impl Drop for TerminalGuard {
 
 fn enter_screen() -> io::Result<()> {
     enable_raw_mode()?;
-    // マウスホイールでのtranscriptスクロール用（`AppState::on_mouse`参照）。
+    // マウスホイールでのスクロール用（`harness-tui`の`AppState::on_mouse`参照）。
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     if supports_keyboard_enhancement().unwrap_or(false) {
         execute!(

@@ -24,7 +24,10 @@ pub enum ToolCardStatus {
         /// （`harness_core::tool::WaitReason`のdoc参照）。`None`は「普通に実行中」。
         wait_reason: Option<String>,
     },
-    Done { is_error: bool, output: String },
+    Done {
+        is_error: bool,
+        output: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -150,7 +153,10 @@ pub struct AppState {
     pub should_quit: bool,
     /// transcriptの最新行から何行遡っているか（0=最新へ追従）。総行数は折り畳み状態に応じて
     /// 描画時にしか決まらないため、上限のクランプは`ui.rs::render_transcript`側で行う。
-    pub scroll_offset: u16,
+    /// transcriptの末尾追従スクロール位置。
+    /// **実体は`harness_term::scrollback`**で、ポリシーエディタの記録画面と共有する
+    /// （同じ罠を二つ持つと、片方だけが折り返しを数え損ねる――実際にそうなった）。
+    pub scroll: harness_term::scrollback::Scrollback,
     /// `Ctrl+O`でトグルする、ツールカード/thinkingブロックの折り畳み表示状態。
     /// 既定は折り畳み（`true`）。
     pub collapsed: bool,
@@ -199,7 +205,7 @@ pub struct AppState {
     /// echoし、VS Code等の端末が実際にどんな`code`/`modifiers`を届けているかを画面で観測する
     /// （Enter系キー化けの検証用。`harness-cli`が`AppState::new`後にこのpubフィールドへ設定）。
     pub key_debug: bool,
-    /// `TERM_PROGRAM=vscode`のとき`true`（`terminal::host_is_vscode`）。キー処理の分岐には
+    /// `TERM_PROGRAM=vscode`のとき`true`（`harness_term::host_is_vscode`）。キー処理の分岐には
     /// 使わない（Shift+Enterが送信になるかどうかはSHIFT修飾が実際に届くか否かで自然に決まる）。
     /// 入力欄のヒント文字列（Alt+Enter/Shift+Enterどちらを案内するか）の表示専用。
     pub host_is_vscode: bool,
@@ -223,11 +229,9 @@ pub struct AppState {
     pub conversation_session_id: String,
 }
 
-/// `PageUp`/`PageDown`1回あたりのスクロール行数。端末の実際の高さは`AppState`が知らないため
-/// 固定値で近似する（おおよそ1画面分）。
-const PAGE_SCROLL_LINES: i32 = 10;
-/// マウスホイール1ノッチあたりのスクロール行数。
-const WHEEL_SCROLL_LINES: i32 = 3;
+// スクロール量（`PageUp`/`PageDown`とホイール1ノッチの行数）は
+// `harness_term::scrollback`が持つ。ここに複製を置くと、片方だけ変えたときに
+// 会話TUIとポリシーエディタで送り量が食い違う（B-05）。
 
 impl AppState {
     pub fn new(provider_label: String, model: String) -> Self {
@@ -247,7 +251,7 @@ impl AppState {
             turn_open: false,
             turn_transcript_mark: 0,
             should_quit: false,
-            scroll_offset: 0,
+            scroll: Default::default(),
             collapsed: true,
             turn_in_flight: false,
             current_turn_upstream_estimate: 0,
@@ -435,37 +439,36 @@ impl AppState {
     /// **同じ回数だけ下へ回さないと画面が動かない**（画面は先頭で止まって見えるので、
     /// ユーザーには操作が効かなくなったようにしか見えない）。
     pub fn clamp_scroll(&mut self, max_offset: u16) {
-        if self.scroll_offset > max_offset {
-            self.scroll_offset = max_offset;
-        }
+        self.scroll.clamp(max_offset);
+    }
+
+    /// 既存の呼び出し元・テスト向けの読み出し。
+    pub fn scroll_offset(&self) -> u16 {
+        self.scroll.offset()
     }
 
     /// `delta`が正なら過去方向（上）へ、負なら最新方向（下）へスクロールする。
     /// 下限0（最新）でクランプする。上限は総行数依存のため、描画のたびに
     /// [`AppState::clamp_scroll`]で切り詰める。
     pub fn scroll_lines(&mut self, delta: i32) {
-        if delta >= 0 {
-            self.scroll_offset = self.scroll_offset.saturating_add(delta as u16);
-        } else {
-            self.scroll_offset = self.scroll_offset.saturating_sub((-delta) as u16);
-        }
+        self.scroll.scroll_lines(delta);
     }
 
     pub fn scroll_page(&mut self, delta: i32) {
-        self.scroll_lines(delta * PAGE_SCROLL_LINES);
+        self.scroll.scroll_page(delta);
     }
 
     pub fn toggle_fold(&mut self) {
         self.collapsed = !self.collapsed;
-        self.scroll_offset = 0;
+        self.scroll.reset();
     }
 
     /// マウスホイールイベントを処理する。過去ログの閲覧を妨げないよう、承認モーダル表示中でも
     /// スクロール自体は許可する（`on_key`と異なり`pending_permission`をチェックしない）。
     pub fn on_mouse(&mut self, kind: MouseEventKind) {
         match kind {
-            MouseEventKind::ScrollUp => self.scroll_lines(WHEEL_SCROLL_LINES),
-            MouseEventKind::ScrollDown => self.scroll_lines(-WHEEL_SCROLL_LINES),
+            MouseEventKind::ScrollUp => self.scroll.wheel(true),
+            MouseEventKind::ScrollDown => self.scroll.wheel(false),
             _ => {}
         }
     }
@@ -505,7 +508,7 @@ impl AppState {
         self.transcript.clear();
         self.turn_open = false;
         self.turn_transcript_mark = 0;
-        self.scroll_offset = 0;
+        self.scroll.reset();
     }
 }
 

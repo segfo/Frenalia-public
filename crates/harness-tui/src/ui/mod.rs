@@ -370,36 +370,22 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
 
 /// 戻り値は`scroll_offset`の上限（[`render`]がそのまま返す）。
 fn render_transcript(f: &mut Frame, area: Rect, app: &AppState) -> u16 {
+    // 末尾追従の描画と上限の算出は`harness_term::scrollback`が持つ
+    // （ポリシーエディタの記録画面と共有。同局のdoc参照）。
+    // 戻り値の上限を`AppState::clamp_scroll`へ渡すのは呼び出し側の責務（BUG-076）。
     let lines = transcript_lines(app, app.collapsed);
-    let block = Block::default().borders(Borders::ALL);
-    let text_width = area.width.saturating_sub(2);
-    let total = Paragraph::new(lines.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(text_width)
-        .min(u16::MAX as usize) as u16;
-    let viewport = area.height.saturating_sub(2);
-    // `AppState::scroll_offset`は総行数を知らずに増減されるため、ここで実際の行数に対して
-    // クランプする（上限を超えて遡ろうとしても先頭で止まる）。Paragraphのscrollはwrap後の
-    // 表示行を数えるため、ここもwrap後の行数で計算する。そうしないとCtrl+Oでツール出力や
-    // thinkingを展開した時、長い行の折り返し分だけ末尾までスクロールできなくなる。
-    //
-    // BUG-076: このクランプは**表示にしか効かない**。上限は呼び出し側へ返し、
-    // `AppState::clamp_scroll`で状態そのものも切り詰めてもらう。
-    let max_offset = total.saturating_sub(viewport);
-    let offset = app.scroll_offset.min(max_offset);
-    let scroll = max_offset.saturating_sub(offset);
-
-    let title = if offset > 0 {
-        format!("transcript [scrolled, {offset} lines back]")
-    } else {
-        "transcript".to_string()
-    };
-    let paragraph = Paragraph::new(lines)
-        .block(block.title(title))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    f.render_widget(paragraph, area);
-    max_offset
+    let title = harness_term::scrollback::title_with_scroll(
+        "transcript ",
+        app.scroll,
+        "下へホイールで戻る",
+    );
+    harness_term::scrollback::render(
+        f,
+        area,
+        lines,
+        Block::default().borders(Borders::ALL).title(title),
+        app.scroll,
+    )
 }
 
 /// ステータスバーに出すモデル名の上限文字数。超えた分は中間を省略する。
@@ -456,7 +442,10 @@ fn scope_label(app: &AppState) -> String {
     if overlay == &app.conversation_session_id {
         format!("{ws} | overlay={overlay}")
     } else {
-        format!("{ws} | overlay={overlay} (会話={})", app.conversation_session_id)
+        format!(
+            "{ws} | overlay={overlay} (会話={})",
+            app.conversation_session_id
+        )
     }
 }
 
@@ -789,7 +778,13 @@ mod scope_label_tests {
         // 全角文字は2セルを占め、片方が空になるので素朴な連結では「会 話」と割れる。
         // ここで確かめたいのは「`scope_label`がステータスバーに実際に載っているか」なので、
         // ASCII部分だけを見る（文言そのものは`scope_label`の各テストが固定している）。
-        let screen: String = term.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
         assert!(screen.contains("ws=harness"), "{screen}");
         assert!(screen.contains("overlay=session-a"), "{screen}");
         assert!(screen.contains("=session-b"), "{screen}");

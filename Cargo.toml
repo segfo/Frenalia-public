@@ -19,6 +19,7 @@ members = [
     "crates/harness-mcp",
     "crates/harness-engine",
     "crates/harness-cognition",
+    "crates/harness-term",
     "crates/harness-tui",
     "crates/harness-cli",
     "crates/tier2a-net-e2e",

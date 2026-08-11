@@ -19,10 +19,10 @@ use std::sync::{Arc, Mutex};
 
 use harness_cognition::CognitiveOrchestrator;
 use harness_core::{AgentEvent, LlmProvider, ToolCtx};
-use harness_sandbox::session_scope::SessionScope;
 use harness_engine::{
     compaction, AgentLoopConfig, ConversationState, PermissionArbiter, SessionStore,
 };
+use harness_sandbox::session_scope::SessionScope;
 use harness_tools::ToolRegistry;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -431,9 +431,9 @@ mod tests {
         );
         assert_eq!(
             ctx.staging.sandbox_dir,
-            Some(
-                harness_sandbox::session_scope::sandbox_dir_for_session("session-new")
-            )
+            Some(harness_sandbox::session_scope::sandbox_dir_for_session(
+                "session-new"
+            ))
         );
         assert_eq!(ctx.cow_upper_dir, None);
         assert_eq!((ctx.workspace_root.clone(), ctx.shell_tier.tier), before);

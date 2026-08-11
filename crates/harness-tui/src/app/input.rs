@@ -14,7 +14,7 @@ impl AppState {
         // A local submit starts a new visible turn. Even if the user had been
         // browsing older transcript lines, jump back to live output so the
         // prompt, Thinking indicator, and following deltas stay visible.
-        self.scroll_offset = 0;
+        self.scroll.reset();
         let text = std::mem::take(&mut self.input);
         self.input_cursor = 0;
         self.input_selection_anchor = None;

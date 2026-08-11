@@ -1317,6 +1317,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-term"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "ratatui",
+]
+
+[[package]]
 name = "harness-tools"
 version = "0.1.0"
 dependencies = [
@@ -1357,6 +1365,7 @@ dependencies = [
  "harness-engine",
  "harness-sandbox",
  "harness-sandbox-vm",
+ "harness-term",
  "harness-tools",
  "ratatui",
  "serde_json",

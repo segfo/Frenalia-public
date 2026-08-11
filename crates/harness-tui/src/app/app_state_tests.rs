@@ -801,19 +801,19 @@ fn submitting_input_returns_transcript_to_latest() {
     let action = app.on_key(alt(KeyCode::Enter));
 
     assert!(matches!(action, Some(Action::Submit(text)) if text == "hi"));
-    assert_eq!(app.scroll_offset, 0);
+    assert_eq!(app.scroll_offset(), 0);
 }
 
 #[test]
 fn scroll_lines_clamps_at_zero_and_saturates_upward() {
     let mut app = AppState::new("mock".into(), "mock-model".into());
-    assert_eq!(app.scroll_offset, 0);
+    assert_eq!(app.scroll_offset(), 0);
     app.scroll_lines(-5);
-    assert_eq!(app.scroll_offset, 0, "should not go below 0");
+    assert_eq!(app.scroll_offset(), 0, "should not go below 0");
     app.scroll_lines(3);
-    assert_eq!(app.scroll_offset, 3);
+    assert_eq!(app.scroll_offset(), 3);
     app.scroll_lines(-1);
-    assert_eq!(app.scroll_offset, 2);
+    assert_eq!(app.scroll_offset(), 2);
 }
 
 // --- BUG-076: 先頭より上へは「溜まらない」 ---
@@ -827,14 +827,14 @@ fn scrolling_past_the_top_does_not_bank_up_an_invisible_offset() {
     for _ in 0..10 {
         app.on_mouse(MouseEventKind::ScrollUp);
     }
-    assert_eq!(app.scroll_offset, 30, "入力の時点では素直に加算される");
+    assert_eq!(app.scroll_offset(), 30, "入力の時点では素直に加算される");
 
     app.clamp_scroll(3); // 描画で上限が判明する
-    assert_eq!(app.scroll_offset, 3);
+    assert_eq!(app.scroll_offset(), 3);
 
     // 下へ1ノッチで最新へ戻る（修正前は27行分の空回りが残っていた）。
     app.on_mouse(MouseEventKind::ScrollDown);
-    assert_eq!(app.scroll_offset, 0);
+    assert_eq!(app.scroll_offset(), 0);
 }
 
 /// 上限内なら`clamp_scroll`は何もしない（常時切り詰めて位置を失う、という逆の壊れ方をしない）。
@@ -843,7 +843,7 @@ fn clamp_scroll_leaves_a_position_that_is_within_range() {
     let mut app = AppState::new("mock".into(), "mock-model".into());
     app.scroll_lines(5);
     app.clamp_scroll(100);
-    assert_eq!(app.scroll_offset, 5);
+    assert_eq!(app.scroll_offset(), 5);
 }
 
 #[test]
@@ -851,12 +851,12 @@ fn page_up_and_page_down_keys_scroll_by_a_page_without_emitting_an_action() {
     let mut app = AppState::new("mock".into(), "mock-model".into());
     let action = app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
     assert!(action.is_none());
-    assert!(app.scroll_offset > 0);
+    assert!(app.scroll_offset() > 0);
 
-    let after_up = app.scroll_offset;
+    let after_up = app.scroll_offset();
     let action = app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
     assert!(action.is_none());
-    assert!(app.scroll_offset < after_up);
+    assert!(app.scroll_offset() < after_up);
 }
 
 #[test]
@@ -881,18 +881,18 @@ fn ctrl_o_returns_transcript_to_latest() {
 
     assert!(action.is_none());
     assert!(!app.collapsed);
-    assert_eq!(app.scroll_offset, 0);
+    assert_eq!(app.scroll_offset(), 0);
 }
 
 #[test]
 fn mouse_wheel_scrolls_up_and_down() {
     let mut app = AppState::new("mock".into(), "mock-model".into());
     app.on_mouse(MouseEventKind::ScrollUp);
-    assert_eq!(app.scroll_offset, 3);
+    assert_eq!(app.scroll_offset(), 3);
     app.on_mouse(MouseEventKind::ScrollDown);
-    assert_eq!(app.scroll_offset, 0);
+    assert_eq!(app.scroll_offset(), 0);
     app.on_mouse(MouseEventKind::ScrollDown);
-    assert_eq!(app.scroll_offset, 0, "should not go below 0");
+    assert_eq!(app.scroll_offset(), 0, "should not go below 0");
 }
 
 /// スクロール操作は承認モーダル表示中でも通る（過去ログ閲覧を妨げないため、
@@ -909,7 +909,7 @@ fn mouse_scroll_works_even_while_permission_modal_is_pending() {
     assert!(app.pending_permission.is_some());
 
     app.on_mouse(MouseEventKind::ScrollUp);
-    assert_eq!(app.scroll_offset, 3);
+    assert_eq!(app.scroll_offset(), 3);
 }
 
 /// `TurnStarted`でUpstream概算・ライブ状態がセットされ、`TextDelta`/`ThinkingDelta`で
@@ -1419,9 +1419,7 @@ fn a_discarded_turn_rewinds_the_transcript_to_the_start_of_the_attempt() {
 
     // 前のターンは残り、このターンの本文だけが消えて記録行に置き換わる。
     assert_eq!(app.transcript.len(), 2, "{:?}", app.transcript);
-    assert!(
-        matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s == "前のターンの回答")
-    );
+    assert!(matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s == "前のターンの回答"));
     let TranscriptItem::Info(line) = &app.transcript[1] else {
         panic!("expected an Info line, got {:?}", app.transcript[1]);
     };
@@ -1445,9 +1443,13 @@ fn repeated_discards_within_one_turn_keep_every_record_line() {
     app.apply(AgentEvent::TurnStarted {
         estimated_input_tokens: 0,
     });
-    app.apply(AgentEvent::TextDelta { text: "壊れ1".into() });
+    app.apply(AgentEvent::TextDelta {
+        text: "壊れ1".into(),
+    });
     app.apply(discarded(Some("jitter")));
-    app.apply(AgentEvent::TextDelta { text: "壊れ2".into() });
+    app.apply(AgentEvent::TextDelta {
+        text: "壊れ2".into(),
+    });
     app.apply(discarded(None));
 
     assert_eq!(app.transcript.len(), 2, "{:?}", app.transcript);
@@ -1470,7 +1472,10 @@ fn repeated_discards_within_one_turn_keep_every_record_line() {
 
 // --- BUG-068: 復元した会話を画面へ積む ---
 
-fn msg(role: harness_core::Role, content: Vec<harness_core::ContentBlock>) -> harness_core::Message {
+fn msg(
+    role: harness_core::Role,
+    content: Vec<harness_core::ContentBlock>,
+) -> harness_core::Message {
     harness_core::Message { role, content }
 }
 
@@ -1484,7 +1489,10 @@ fn a_restored_session_renders_its_conversation_not_just_a_count() {
         msg(
             Role::Assistant,
             vec![
-                ContentBlock::Thinking { text: "内心".into(), signature: None },
+                ContentBlock::Thinking {
+                    text: "内心".into(),
+                    signature: None,
+                },
                 ContentBlock::Text("最初の回答".into()),
                 ContentBlock::ToolUse {
                     id: "t1".into(),
@@ -1534,7 +1542,10 @@ fn thinking_and_empty_text_are_dropped_on_restore() {
     let messages = vec![msg(
         Role::Assistant,
         vec![
-            ContentBlock::Thinking { text: "内心".into(), signature: Some("sig".into()) },
+            ContentBlock::Thinking {
+                text: "内心".into(),
+                signature: Some("sig".into()),
+            },
             ContentBlock::RedactedThinking { data: "xx".into() },
             ContentBlock::Text("   ".into()),
         ],
@@ -1569,7 +1580,10 @@ fn an_orphaned_tool_result_is_still_shown() {
 fn busy_progress_refuses_to_start_twice() {
     let mut app = AppState::new("p".into(), "m".into());
     assert!(app.begin_busy("Compacting context"));
-    assert!(!app.begin_busy("Compacting context"), "二重起動を許してはいけない");
+    assert!(
+        !app.begin_busy("Compacting context"),
+        "二重起動を許してはいけない"
+    );
     assert!(app.is_busy());
     app.end_busy(BusyEnd::Finished);
     assert!(!app.is_busy());
@@ -1620,7 +1634,10 @@ fn a_second_start_notice_does_not_rewind_the_clock() {
     let first = app.busy_progress.as_ref().unwrap().started_at.unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     app.mark_busy_running();
-    assert_eq!(app.busy_progress.as_ref().unwrap().started_at.unwrap(), first);
+    assert_eq!(
+        app.busy_progress.as_ref().unwrap().started_at.unwrap(),
+        first
+    );
 }
 
 /// 一度も始まらないまま終わったら「所要時間」を出さない（走っていないので嘘になる）。
@@ -1774,11 +1791,11 @@ fn clearing_the_transcript_also_resets_scroll_and_turn_marks() {
     });
     app.scroll_lines(5);
     assert!(!app.transcript.is_empty());
-    assert_ne!(app.scroll_offset, 0);
+    assert_ne!(app.scroll_offset(), 0);
 
     app.clear_transcript();
     assert!(app.transcript.is_empty());
-    assert_eq!(app.scroll_offset, 0);
+    assert_eq!(app.scroll_offset(), 0);
 
     // 消した直後に届いた縮退イベントが、まだ空のtranscriptを巻き戻そうとしても落ちない。
     app.apply(AgentEvent::TurnDiscarded {

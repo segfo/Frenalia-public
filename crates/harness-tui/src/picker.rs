@@ -33,7 +33,8 @@ pub enum PickerOutcome {
     Cancelled,
 }
 
-/// `term`/`term_events`は呼び出し側が既に`TerminalGuard::enter`済みであることを前提とする。
+/// `term`/`term_events`は呼び出し側が既に`harness_term::TerminalGuard::enter`済みであることを
+/// 前提とする。
 pub async fn run_picker(
     term: &mut Terminal<CrosstermBackend<Stdout>>,
     term_events: &mut EventStream,
