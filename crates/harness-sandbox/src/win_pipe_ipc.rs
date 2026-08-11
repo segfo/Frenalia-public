@@ -122,6 +122,34 @@ pub fn user_only_security_attributes(sid: &str) -> windows::core::Result<SECURIT
     }
 }
 
+/// パイプ名の接頭辞。[`unique_pipe_name`]が作り、[`is_harness_pipe_name`]が検証する。
+/// **両者が同じ定数を見ることがこの検証の前提**なので、綴りを2箇所に持たない。
+pub const HARNESS_PIPE_PREFIX: &str = r"\\.\pipe\harness-";
+
+/// **昇格側が受け取ったパイプ名を、ヘルパーへ渡す前に検証する**（P-01）。
+///
+/// # なぜ要るか
+///
+/// 連鎖起動されるヘルパーは、受け取った名前を`CreateFileW`で開いて**自分の応答を書き込む**。
+/// 名前が任意なら、それは「昇格プロセスが攻撃者の選んだ先へ書き込む」プリミティブになる
+/// （named pipeに見えない普通のファイルパスも`CreateFileW`は開ける）。名前を運ぶのは
+/// **非特権の親**であり、親は攻撃者と同じ権限で動きうるので、検証は受信側で行う。
+///
+/// 通す条件は「harnessが作った形」だけに絞る——接頭辞が一致し、その後ろに区切り文字
+/// （`\` / `/`）を含まず、印字可能ASCIIのみ。`..`のような相対要素は区切り文字を含まない
+/// 条件で自動的に排除される。
+pub fn is_harness_pipe_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(HARNESS_PIPE_PREFIX) else {
+        return false;
+    };
+    // 空（接頭辞そのもの）は名前として成立しない。長さの上限はWindowsのパス上限に合わせる。
+    if rest.is_empty() || name.len() > 256 {
+        return false;
+    }
+    rest.chars()
+        .all(|c| c.is_ascii_graphic() && c != '\\' && c != '/')
+}
+
 /// `\\.\pipe\harness-<component>-<pid>-<連番>-<ナノ秒>`という一意なパイプ名を作る。
 ///
 /// `component`は機構ごとの識別子（`privhelper`・`netfilterd`・`vmsandboxd`）。統合前は
@@ -131,7 +159,8 @@ pub fn unique_pipe_name(component: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
-        r"\\.\pipe\harness-{}-{}-{}-{}",
+        "{}{}-{}-{}-{}",
+        HARNESS_PIPE_PREFIX,
         component,
         std::process::id(),
         n,
@@ -140,82 +169,6 @@ pub fn unique_pipe_name(component: &str) -> String {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     )
-}
-
-/// オーバーラップドI/O操作を`timeout`付きで実行し、転送バイト数を返す。
-///
-/// `start`は`OVERLAPPED`を受け取って実際のWin32呼び出し（`ConnectNamedPipe`/`ReadFile`/
-/// `WriteFile`）を開始するクロージャ。タイムアウトした場合は`CancelIoEx`で取り消し、
-/// **取り消し完了まで待ってから**返る（`bWait=true`）——呼び出し側がこの直後にハンドルを
-/// 閉じても`OVERLAPPED`がstaleにならないようにするため。
-pub fn run_overlapped<F>(
-    handle: HANDLE,
-    timeout: std::time::Duration,
-    op_name: &str,
-    start: F,
-) -> Result<u32, PipeIpcError>
-where
-    F: FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
-{
-    unsafe {
-        let event = CreateEventW(None, true, false, PCWSTR::null())
-            .map_err(|e| PipeIpcError::Ipc(format!("{op_name}: CreateEventW failed: {e}")))?;
-        let mut overlapped = OVERLAPPED {
-            hEvent: event,
-            ..Default::default()
-        };
-
-        let pending = match start(&mut overlapped as *mut _) {
-            Ok(()) => false,
-            Err(e) => {
-                let code = e.code();
-                if code == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) {
-                    true
-                } else if code == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) {
-                    // クライアントが`ConnectNamedPipe`呼び出し前に既に接続済みだった
-                    // （synchronous completion）。MSDNの既知の注意点: このケースでは
-                    // OVERLAPPEDのイベントはシグナルされないため、後続の
-                    // `GetOverlappedResult`を呼んではいけない（呼ぶと`ERROR_IO_INCOMPLETE`で
-                    // 失敗する）。ここで即座に成功として返す。
-                    //
-                    // 【2026-07-25実機E2Eで発見・修正】UAC待ちの無い連鎖起動経路
-                    // （privhelperがnetfilterdを起動し、子が即座に接続してくる）でこの競合が
-                    // 実際に発生した。当時この関数は3箇所にコピーされていたため、同じ修正を
-                    // 手で複数箇所へ適用する必要があった。共通化はその再発防止でもある。
-                    let _ = CloseHandle(event);
-                    return Ok(0);
-                } else {
-                    let _ = CloseHandle(event);
-                    return Err(PipeIpcError::Ipc(format!("{op_name} failed to start: {e}")));
-                }
-            }
-        };
-
-        if pending {
-            // `as_millis()`は`u128`を返す。クランプ無しの`as u32`は約49.7日を超える
-            // タイムアウトを黙って切り詰めるため、`u32::MAX`（=`INFINITE`）で頭打ちにする。
-            let wait = WaitForSingleObject(event, timeout.as_millis().min(u32::MAX as u128) as u32);
-            if wait != WAIT_OBJECT_0 {
-                // タイムアウトまたは待機自体の失敗。取り消して、取り消し完了(bWait=true)まで
-                // 待ってから返る — ハンドルをこの後すぐ閉じても`OVERLAPPED`がstaleに
-                // ならないようにするため。
-                let _ = CancelIoEx(handle, Some(&overlapped as *const _));
-                let mut transferred = 0u32;
-                let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, true);
-                let _ = CloseHandle(event);
-                return Err(PipeIpcError::Ipc(format!(
-                    "{op_name} timed out after {timeout:?}"
-                )));
-            }
-        }
-
-        let mut transferred = 0u32;
-        let result = GetOverlappedResult(handle, &overlapped, &mut transferred, false);
-        let _ = CloseHandle(event);
-        result
-            .map_err(|e| PipeIpcError::Ipc(format!("{op_name}: GetOverlappedResult failed: {e}")))?;
-        Ok(transferred)
-    }
 }
 
 /// サーバ側でクライアントの接続を`timeout`付きで待つ。
@@ -296,4 +249,126 @@ pub fn read_framed_timeout(
         read_exact_timeout(handle, &mut payload, timeout)?;
     }
     Ok(payload)
+}
+
+/// オーバーラップドI/O操作を`timeout`付きで実行し、転送バイト数を返す。
+///
+/// `start`は`OVERLAPPED`を受け取って実際のWin32呼び出し（`ConnectNamedPipe`/`ReadFile`/
+/// `WriteFile`）を開始するクロージャ。タイムアウトした場合は`CancelIoEx`で取り消し、
+/// **取り消し完了まで待ってから**返る（`bWait=true`）——呼び出し側がこの直後にハンドルを
+/// 閉じても`OVERLAPPED`がstaleにならないようにするため。
+pub fn run_overlapped<F>(
+    handle: HANDLE,
+    timeout: std::time::Duration,
+    op_name: &str,
+    start: F,
+) -> Result<u32, PipeIpcError>
+where
+    F: FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
+{
+    unsafe {
+        let event = CreateEventW(None, true, false, PCWSTR::null())
+            .map_err(|e| PipeIpcError::Ipc(format!("{op_name}: CreateEventW failed: {e}")))?;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
+
+        let pending = match start(&mut overlapped as *mut _) {
+            Ok(()) => false,
+            Err(e) => {
+                let code = e.code();
+                if code == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) {
+                    true
+                } else if code == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) {
+                    // クライアントが`ConnectNamedPipe`呼び出し前に既に接続済みだった
+                    // （synchronous completion）。MSDNの既知の注意点: このケースでは
+                    // OVERLAPPEDのイベントはシグナルされないため、後続の
+                    // `GetOverlappedResult`を呼んではいけない（呼ぶと`ERROR_IO_INCOMPLETE`で
+                    // 失敗する）。ここで即座に成功として返す。
+                    //
+                    // 【2026-07-25実機E2Eで発見・修正】UAC待ちの無い連鎖起動経路
+                    // （privhelperがnetfilterdを起動し、子が即座に接続してくる）でこの競合が
+                    // 実際に発生した。当時この関数は3箇所にコピーされていたため、同じ修正を
+                    // 手で複数箇所へ適用する必要があった。共通化はその再発防止でもある。
+                    let _ = CloseHandle(event);
+                    return Ok(0);
+                } else {
+                    let _ = CloseHandle(event);
+                    return Err(PipeIpcError::Ipc(format!("{op_name} failed to start: {e}")));
+                }
+            }
+        };
+
+        if pending {
+            // `as_millis()`は`u128`を返す。クランプ無しの`as u32`は約49.7日を超える
+            // タイムアウトを黙って切り詰めるため、`u32::MAX`（=`INFINITE`）で頭打ちにする。
+            let wait = WaitForSingleObject(event, timeout.as_millis().min(u32::MAX as u128) as u32);
+            if wait != WAIT_OBJECT_0 {
+                // タイムアウトまたは待機自体の失敗。取り消して、取り消し完了(bWait=true)まで
+                // 待ってから返る — ハンドルをこの後すぐ閉じても`OVERLAPPED`がstaleに
+                // ならないようにするため。
+                let _ = CancelIoEx(handle, Some(&overlapped as *const _));
+                let mut transferred = 0u32;
+                let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, true);
+                let _ = CloseHandle(event);
+                return Err(PipeIpcError::Ipc(format!(
+                    "{op_name} timed out after {timeout:?}"
+                )));
+            }
+        }
+
+        let mut transferred = 0u32;
+        let result = GetOverlappedResult(handle, &overlapped, &mut transferred, false);
+        let _ = CloseHandle(event);
+        result.map_err(|e| {
+            PipeIpcError::Ipc(format!("{op_name}: GetOverlappedResult failed: {e}"))
+        })?;
+        Ok(transferred)
+    }
+}
+
+#[cfg(test)]
+mod pipe_name_tests {
+    use super::*;
+
+    /// **自分が作った名前は必ず通る。** これが崩れると、検証が正常な連鎖起動を止める。
+    #[test]
+    fn names_produced_by_unique_pipe_name_are_accepted() {
+        for component in ["netfilterd", "privhelper", "policy-learnd", "vmsandboxd"] {
+            let name = unique_pipe_name(component);
+            assert!(is_harness_pipe_name(&name), "{name}");
+        }
+    }
+
+    /// 対のテスト（B-35）: **昇格プロセスの書込先を攻撃者が選べる形は通さない。**
+    /// 通してしまうと、連鎖起動されたヘルパーが任意パスへ自分の応答を書く。
+    #[test]
+    fn names_that_could_redirect_an_elevated_write_are_rejected() {
+        for bad in [
+            // 別の場所を指すパス（`CreateFileW`は普通のファイルも開ける）
+            r"C:\Windows\System32\evil.txt",
+            r"\\.\pipe\someone-elses-pipe",
+            r"\\evil-host\pipe\harness-x",
+            // 接頭辞は合っているが区切り文字で外へ出る
+            r"\\.\pipe\harness-..\..\evil",
+            r"\\.\pipe\harness-a\b",
+            r"\\.\pipe\harness-a/b",
+            // 接頭辞そのもの（名前が無い）
+            r"\\.\pipe\harness-",
+            // 空・制御文字・空白
+            "",
+            "\\\\.\\pipe\\harness-a\nb",
+            r"\\.\pipe\harness-a b",
+        ] {
+            assert!(!is_harness_pipe_name(bad), "must be rejected: {bad:?}");
+        }
+    }
+
+    /// 長すぎる名前も落とす（`CreateFileW`へ渡す前に切る）。
+    #[test]
+    fn absurdly_long_names_are_rejected() {
+        let long = format!("{HARNESS_PIPE_PREFIX}{}", "a".repeat(300));
+        assert!(!is_harness_pipe_name(&long));
+    }
 }

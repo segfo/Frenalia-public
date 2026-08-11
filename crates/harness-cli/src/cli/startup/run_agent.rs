@@ -177,7 +177,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                             chain_launch_policy_learnd: policy_learn_pipe_name.clone(),
                         },
                     ) {
-                        Ok(handle) => Some(handle),
+                        // D-60: 応答は「ハンドル＋収集器の連鎖起動の結末」。結末を使うのは
+                        // ポリシーエディタ側だけなので、本体はここでは捨てる。
+                        Ok((handle, _chain)) => Some(handle),
                         Err(e) => {
                             eprintln!(
                                 "warning: WFP netfilterd chain-launch handshake failed (network \
@@ -208,7 +210,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                     chain_launch_policy_learnd: policy_learn_pipe_name.clone(),
                 },
             ) {
-                Ok(handle) => Some(handle),
+                Ok((handle, _chain)) => Some(handle),
                 Err(e) => {
                     // `should_grant_tier2a_network_capability`（`crates/harness-tools/src/
                     // shell.rs`）は`domain_policy_requested && !enforced_by_wfp`のとき

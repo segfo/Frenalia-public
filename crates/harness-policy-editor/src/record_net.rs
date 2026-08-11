@@ -495,7 +495,12 @@ fn run_pass2(
             harness_sandbox::tier2a::netfilterd::NetfilterHandle::start(policy)
         }
     };
-    state.wfp = Some(wfp.map_err(|e| RecordNetError::NoWfp(e.to_string()))?);
+    // `start`/`start_with_prelude`はD-60で「ハンドル＋連鎖起動の結末」を返すようになった。
+    // 結末を表示へ載せるのは後続のコミット（パス2の出力）なので、ここでは捨てる。
+    state.wfp = Some(
+        wfp.map(|(handle, _chain)| handle)
+            .map_err(|e| RecordNetError::NoWfp(e.to_string()))?,
+    );
     on_event(NetRecordEvent::WfpEnforced);
 
     // --- Tier2aで対象コマンドを起動 ----------------------------------------------

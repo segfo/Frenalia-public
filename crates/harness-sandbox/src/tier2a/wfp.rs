@@ -163,7 +163,12 @@ struct WfpAuditEntry {
     kind: &'static str,
     protocol: &'static str,
     allowed: bool,
-    reason: &'static str,
+    /// 失敗の**理由コードまで**入れられるよう`Cow`にしてある。かつては`&'static str`で、
+    /// `net_event_collection_enable_failed`のような「何が起きたか」だけを書いて
+    /// **なぜ起きたかを捨てていた**——実運用でこのレコードが発火したとき、原因を追う材料が
+    /// 何も残っていなかった（B-10: 握り潰してよいのは機能であって理由ではない）。
+    /// JSONの形は文字列のままで変わらない。
+    reason: std::borrow::Cow<'static, str>,
     local_addr: Option<String>,
     local_port: u16,
     remote_addr: Option<String>,
@@ -171,6 +176,50 @@ struct WfpAuditEntry {
     remote_port: u16,
     filter_id: Option<u64>,
     layer_id: Option<u16>,
+}
+
+impl WfpAuditEntry {
+    /// ネットワークイベントではない**制御レコード**（収集・購読の失敗、昇格側ヘルパーの
+    /// 連鎖起動の結末など）。`protocol = "control"`が目印で、読む側はこれを候補にしない
+    /// （`harness_policy::is_net_control_record`）。
+    fn control(reason: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self {
+            timestamp_unix_ms: now_unix_ms(),
+            kind: "wfp",
+            protocol: CONTROL_PROTOCOL,
+            allowed: false,
+            reason: reason.into(),
+            local_addr: None,
+            local_port: 0,
+            remote_addr: None,
+            remote_host: None,
+            remote_port: 0,
+            filter_id: None,
+            layer_id: None,
+        }
+    }
+}
+
+/// 制御レコードの目印。読む側（`harness_policy::is_net_control_record`）と同じ綴りである
+/// ことがこの機構の前提なので、値の変更は両方を同時に見て行う。
+const CONTROL_PROTOCOL: &str = "control";
+
+/// **昇格側の任意のコードから**、検証済みの監査シンクへ制御レコードを1行書く。
+///
+/// `netfilterd`が「収集器を連鎖起動できたか」を残すために使う。書き手を増やさず
+/// [`WfpAuditSink`]を通すのは、`net-audit.jsonl`のスキーマと追記の作法（親ディレクトリ作成・
+/// 1行1JSON・失敗は握り潰す）を2箇所に持たないため（`docs/CODE-STRUCTURE-RULES.md`規則5）。
+///
+/// **書込先は呼び出し側が`elevated_launch::validate_audit_sink_path`で検証済みのパスに限る。**
+/// 検証していないパスをここへ渡すと、管理者権限での任意パス追記になる（D-44）。
+pub(crate) fn record_control_event(
+    validated_audit_log_path: &std::path::Path,
+    reason: impl Into<std::borrow::Cow<'static, str>>,
+) {
+    let sink = WfpAuditSink {
+        path: validated_audit_log_path.to_path_buf(),
+    };
+    sink.record(&WfpAuditEntry::control(reason));
 }
 
 impl WfpAuditSink {
@@ -239,7 +288,7 @@ unsafe extern "system" fn wfp_net_event_callback(
         kind: "wfp",
         protocol: protocol_name(header.ipProtocol),
         allowed: false,
-        reason: "classify_drop",
+        reason: std::borrow::Cow::Borrowed("classify_drop"),
         local_addr,
         local_port: header.localPort,
         remote_addr,
@@ -427,20 +476,11 @@ fn start_wfp_drop_audit(
         let sink_ptr = Box::into_raw(sink);
         if set_status != 0 {
             let sink = Box::from_raw(sink_ptr);
-            sink.record(&WfpAuditEntry {
-                timestamp_unix_ms: now_unix_ms(),
-                kind: "wfp",
-                protocol: "control",
-                allowed: false,
-                reason: "net_event_collection_enable_failed",
-                local_addr: None,
-                local_port: 0,
-                remote_addr: None,
-                remote_host: None,
-                remote_port: 0,
-                filter_id: None,
-                layer_id: None,
-            });
+            // **理由コードまで残す。** これが無いと「有効化に失敗した」しか分からず、
+            // 権限不足なのか既定で無効なのかを後から追えない（実運用で発火している）。
+            sink.record(&WfpAuditEntry::control(format!(
+                "net_event_collection_enable_failed: FwpmEngineSetOption0 returned {set_status:#010x}"
+            )));
             return (None, None);
         }
 
@@ -457,20 +497,10 @@ fn start_wfp_drop_audit(
             (Some(handle), Some(sink_ptr))
         } else {
             let sink = Box::from_raw(sink_ptr);
-            sink.record(&WfpAuditEntry {
-                timestamp_unix_ms: now_unix_ms(),
-                kind: "wfp",
-                protocol: "control",
-                allowed: false,
-                reason: "net_event_subscribe_failed",
-                local_addr: None,
-                local_port: 0,
-                remote_addr: None,
-                remote_host: None,
-                remote_port: 0,
-                filter_id: None,
-                layer_id: None,
-            });
+            // 対（B-01）: 有効化側だけでなく購読側にも理由コードを載せる。
+            sink.record(&WfpAuditEntry::control(format!(
+                "net_event_subscribe_failed: FwpmNetEventSubscribe0 returned {status:#010x}"
+            )));
             (None, None)
         }
     }
@@ -495,6 +525,59 @@ fn open_dynamic_engine() -> Result<HANDLE, WfpError> {
         )?;
         Ok(engine)
     }
+}
+
+/// **テスト専用**: あるセッションプロファイルのサブレイヤーに、いま実際に存在するフィルタの
+/// ID集合を、**別のエンジンハンドルから**数える（実機の観測値）。
+///
+/// DYNAMICセッションが張ったフィルタもフィルタストアには載るので、外から列挙できる。
+/// これが「フィルタが本当に張られたか／本当に消えたか」を測る唯一の手段であり、
+/// `wfp::tests`（D-37のセッション独立性）と`netfilterd::reuse_e2e`（D-56の待機中0件）の
+/// **両方が同じ関数で測る**——別々に書くと、片方だけが違うものを数えていても気付けない。
+#[cfg(test)]
+pub(crate) fn filter_ids_for_session(session_profile: &str) -> std::collections::BTreeSet<u64> {
+    let keys = SessionKeys::for_session(session_profile);
+    let mut ids = std::collections::BTreeSet::new();
+    unsafe {
+        let mut engine = HANDLE::default();
+        if FwpmEngineOpen0(
+            windows::core::PCWSTR::null(),
+            windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT,
+            None,
+            None,
+            &mut engine as *mut HANDLE,
+        ) != 0
+        {
+            return ids;
+        }
+        let mut enum_handle = HANDLE::default();
+        if FwpmFilterCreateEnumHandle0(engine, None, &mut enum_handle) == 0 {
+            loop {
+                let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
+                let mut returned = 0u32;
+                let status = FwpmFilterEnum0(engine, enum_handle, 64, &mut entries, &mut returned);
+                if status != 0 || returned == 0 {
+                    if !entries.is_null() {
+                        let mut memory = entries as *mut c_void;
+                        FwpmFreeMemory0(&mut memory);
+                    }
+                    break;
+                }
+                let slice = std::slice::from_raw_parts(entries, returned as usize);
+                for filter_ptr in slice.iter().filter(|f| !f.is_null()) {
+                    let filter = &**filter_ptr;
+                    if filter.subLayerKey == keys.sublayer {
+                        ids.insert(filter.filterId);
+                    }
+                }
+                let mut memory = entries as *mut c_void;
+                FwpmFreeMemory0(&mut memory);
+            }
+            let _ = FwpmFilterDestroyEnumHandle0(engine, enum_handle);
+        }
+        let _ = FwpmEngineClose0(engine);
+    }
+    ids
 }
 
 fn cleanup_stale_objects(keys: SessionKeys) {
@@ -705,7 +788,12 @@ unsafe fn add_allow_v4_loopback_ports_filter(
         mask: u32::MAX,
     };
     let mut conditions = loopback_port_conditions_v4(container_sid, &loopback, ports, protocol);
-    add_allow_filter(engine, FWPM_LAYER_ALE_AUTH_CONNECT_V4, &mut conditions, keys)
+    add_allow_filter(
+        engine,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        &mut conditions,
+        keys,
+    )
 }
 
 unsafe fn add_allow_v6_loopback_ports_filter(
@@ -720,7 +808,12 @@ unsafe fn add_allow_v6_loopback_ports_filter(
         prefixLength: 128,
     };
     let mut conditions = loopback_port_conditions_v6(container_sid, &loopback, ports, protocol);
-    add_allow_filter(engine, FWPM_LAYER_ALE_AUTH_CONNECT_V6, &mut conditions, keys)
+    add_allow_filter(
+        engine,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        &mut conditions,
+        keys,
+    )
 }
 
 unsafe fn loopback_port_conditions_v4(
@@ -857,8 +950,14 @@ mod tests {
         );
 
         const NAMESPACE_MASK: u128 = !0xFFFF_FFFFu128;
-        assert_eq!(keys.provider.to_u128() & NAMESPACE_MASK, PROVIDER_KEY_NAMESPACE);
-        assert_eq!(keys.sublayer.to_u128() & NAMESPACE_MASK, SUBLAYER_KEY_NAMESPACE);
+        assert_eq!(
+            keys.provider.to_u128() & NAMESPACE_MASK,
+            PROVIDER_KEY_NAMESPACE
+        );
+        assert_eq!(
+            keys.sublayer.to_u128() & NAMESPACE_MASK,
+            SUBLAYER_KEY_NAMESPACE
+        );
     }
 
     /// セッション（プロファイル名）が違えばキーも違う。これが#8（後発の`apply`が先行の
@@ -946,7 +1045,7 @@ mod tests {
             kind: "wfp",
             protocol: "tcp",
             allowed: false,
-            reason: "classify_drop",
+            reason: std::borrow::Cow::Borrowed("classify_drop"),
             local_addr: Some("127.0.0.1".to_string()),
             local_port: 50000,
             remote_addr: Some("127.0.0.1".to_string()),
@@ -965,6 +1064,54 @@ mod tests {
         assert_eq!(value["reason"], "classify_drop");
         assert_eq!(value["remote_port"], 18080);
         assert_eq!(text.lines().count(), 1);
+    }
+
+    /// 制御レコードは`protocol:"control"`で、**理由コードまで**入る。
+    ///
+    /// 読む側（`harness_policy::is_net_control_record`）はこの1項目で候補から外すので、
+    /// 綴りが変わると集計と候補が静かにずれる。`reason`がJSON上ただの文字列であること
+    /// （`Cow`にしても形が変わっていないこと）も同時に固定する。
+    #[test]
+    fn a_control_record_is_marked_as_control_and_keeps_the_failure_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net-audit.jsonl");
+
+        record_control_event(
+            &path,
+            "net_event_collection_enable_failed: FwpmEngineSetOption0 returned 0x00000005"
+                .to_string(),
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["kind"], "wfp");
+        assert_eq!(value["protocol"], CONTROL_PROTOCOL);
+        assert_eq!(value["allowed"], false);
+        assert!(value["reason"].is_string(), "{value}");
+        assert!(
+            value["reason"].as_str().unwrap().contains("0x00000005"),
+            "**なぜ**失敗したかを残す（以前は理由コードを捨てていた）: {value}"
+        );
+        // 通信の記録ではないので、ホストもアドレスも持たない。読む側はこの形を見て
+        // 「ホスト名を復元できなかった拒否」と誤読しかねないため、`protocol`が唯一の目印。
+        assert!(value["remote_host"].is_null());
+        assert!(value["remote_addr"].is_null());
+    }
+
+    /// 追記であること（1回のセッションで複数の制御レコードが並ぶ——起動と子の観測で2行）。
+    #[test]
+    fn control_records_append_rather_than_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("net-audit.jsonl");
+
+        record_control_event(
+            &path,
+            "policy_learnd_chain_launched pipe=p pid=1 env_present=true",
+        );
+        record_control_event(&path, "policy_learnd_chain_child_alive");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
     }
 
     #[test]
@@ -1004,7 +1151,7 @@ mod tests {
             kind: "wfp",
             protocol: "tcp",
             allowed: false,
-            reason: "classify_drop",
+            reason: std::borrow::Cow::Borrowed("classify_drop"),
             local_addr: Some("127.0.0.1".to_string()),
             local_port: 50001,
             remote_addr: Some("198.18.0.1".to_string()),
@@ -1038,51 +1185,9 @@ mod tests {
         )
         .expect("ensure AppContainer profile");
 
-        /// 自サブレイヤー配下に今あるフィルタのID集合（実機の観測値）。
-        fn filter_ids_in_sublayer(keys: SessionKeys) -> std::collections::BTreeSet<u64> {
-            let mut ids = std::collections::BTreeSet::new();
-            unsafe {
-                let mut engine = HANDLE::default();
-                if FwpmEngineOpen0(
-                    windows::core::PCWSTR::null(),
-                    windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT,
-                    None,
-                    None,
-                    &mut engine as *mut HANDLE,
-                ) != 0
-                {
-                    return ids;
-                }
-                let mut enum_handle = HANDLE::default();
-                if FwpmFilterCreateEnumHandle0(engine, None, &mut enum_handle) == 0 {
-                    loop {
-                        let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
-                        let mut returned = 0u32;
-                        let status =
-                            FwpmFilterEnum0(engine, enum_handle, 64, &mut entries, &mut returned);
-                        if status != 0 || returned == 0 {
-                            if !entries.is_null() {
-                                let mut memory = entries as *mut c_void;
-                                FwpmFreeMemory0(&mut memory);
-                            }
-                            break;
-                        }
-                        let slice = std::slice::from_raw_parts(entries, returned as usize);
-                        for filter_ptr in slice.iter().filter(|f| !f.is_null()) {
-                            let filter = &**filter_ptr;
-                            if filter.subLayerKey == keys.sublayer {
-                                ids.insert(filter.filterId);
-                            }
-                        }
-                        let mut memory = entries as *mut c_void;
-                        FwpmFreeMemory0(&mut memory);
-                    }
-                    let _ = FwpmFilterDestroyEnumHandle0(engine, enum_handle);
-                }
-                let _ = FwpmEngineClose0(engine);
-            }
-            ids
-        }
+        // 自サブレイヤー配下に今あるフィルタのID集合（実機の観測値）。実装は
+        // `filter_ids_for_session`が持つ（`netfilterd::reuse_e2e`と共有する）。
+        let filter_ids_in_sublayer = filter_ids_for_session;
 
         // 実運用では2セッションのLocal Proxyポートは別々になる。同じにすると
         // 「Aのフィルタが消えてもBのフィルタが同じ穴を開ける」ため差分が見えない。
@@ -1093,8 +1198,8 @@ mod tests {
         // 決まるので、1プロセス内でも同じ構造を再現できる。
         let profile_a = crate::tier2a::session_profile::profile_name_for("wfp-test-a");
         let profile_b = crate::tier2a::session_profile::profile_name_for("wfp-test-b");
-        let keys_a = SessionKeys::for_session(&profile_a);
-        let keys_b = SessionKeys::for_session(&profile_b);
+        // 観測はプロファイル名で引く（サブレイヤーGUIDの導出は`filter_ids_for_session`の中）。
+        let (keys_a, keys_b) = (profile_a.as_str(), profile_b.as_str());
         let opts_a = WfpOptions {
             session_profile: profile_a.clone(),
             allow_loopback_tcp_ports: vec![listener_a.local_addr().unwrap().port()],
@@ -1142,7 +1247,10 @@ mod tests {
         session_a.teardown().expect("session A teardown");
         let after_all = filter_ids_in_sublayer(keys_a);
         eprintln!("[e2e] 全終了後: {after_all:?}");
-        assert!(after_all.is_empty(), "全セッション終了後にフィルタが残っている");
+        assert!(
+            after_all.is_empty(),
+            "全セッション終了後にフィルタが残っている"
+        );
     }
 
     /// 管理者権限+BFE有効なWindows実機でのみ手動実行するE2E。
