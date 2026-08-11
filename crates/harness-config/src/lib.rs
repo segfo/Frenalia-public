@@ -264,7 +264,10 @@ pub fn clamp_project_mcp_http_gates(user: &serde_json::Value, merged: &mut serde
 /// 有効化できると、「このワークスペースの記憶だけ事後レビュー（`harness memory review`＋
 /// git履歴）の手段を封じる」毒入れ経路になる。読出しには影響しない
 /// （`allow_unversioned`は書込みの可否だけを制御する）。
-pub fn clamp_project_recall_allow_unversioned(user: &serde_json::Value, merged: &mut serde_json::Value) {
+pub fn clamp_project_recall_allow_unversioned(
+    user: &serde_json::Value,
+    merged: &mut serde_json::Value,
+) {
     let user_value = user
         .get("cognition")
         .and_then(|c| c.get("recall"))
@@ -514,6 +517,15 @@ impl FsSettings {
     /// `fs.{read,read_write,read_exec}`と旧`fs.allow`を`(パス文字列, access)`へ変換する。
     /// 旧`fs.allow`は互換のため、`:rw`ならread_write、サフィックス無しなら従来の
     /// read+execute相当（read_exec）として扱う。
+    ///
+    /// # 同じパスが複数のバケツにあったときは、ここでは畳まない
+    ///
+    /// かつては[`merge_fs_access`]で1件へ畳んでいたが、その規則は`ReadWrite`と`ReadExec`を
+    /// `ReadWrite`へ寄せる（＝**実行権を黙って落とす**）ものだった。`fs.read_write`と
+    /// `fs.read_exec`の両方に同じパスを書いたユーザーは、実行できない理由が設定から読み取れない
+    /// 状態になる。和を表せるのは付与層（`harness_sandbox::FsAccess::ReadWriteExec`）だけなので、
+    /// **畳み込みはそちらへ寄せた**——この関数は宣言をそのままの粒度で返す。
+    /// 同じパスが2回現れ得るので、呼び出し側は`harness_sandbox::FsAccess::wider`で合成すること。
     pub fn to_fs_passthrough(&self) -> Vec<(String, FsAccess)> {
         let mut out = Vec::new();
         for path in self.read.clone().unwrap_or_default() {
@@ -535,22 +547,15 @@ impl FsSettings {
     }
 }
 
+/// 宣言を1件足す。**同じパス・同じaccessの重複だけ**を落とす（`fs.read`に同じ行が2度書かれた等）。
+///
+/// access種別が違う重複は**畳まずに両方残す**——ここで畳むと、和を表せない語彙（3値）へ
+/// 落とし込むことになり、必ずどちらかの権限が消える（[`FsSettings::to_fs_passthrough`]のdoc）。
 fn push_fs_entry(out: &mut Vec<(String, FsAccess)>, path: String, access: FsAccess) {
-    if let Some((_, existing)) = out.iter_mut().find(|(p, _)| p == &path) {
-        *existing = merge_fs_access(*existing, access);
-    } else {
-        out.push((path, access));
+    if out.iter().any(|(p, a)| p == &path && *a == access) {
+        return;
     }
-}
-
-fn merge_fs_access(a: FsAccess, b: FsAccess) -> FsAccess {
-    if a == FsAccess::ReadWrite || b == FsAccess::ReadWrite {
-        FsAccess::ReadWrite
-    } else if a == FsAccess::ReadExec || b == FsAccess::ReadExec {
-        FsAccess::ReadExec
-    } else {
-        FsAccess::Read
-    }
+    out.push((path, access));
 }
 
 /// `.harness/settings.json`の`net`キー（M12補遺、D-15/D-10）。
@@ -848,9 +853,15 @@ mod tests {
         let sources = settings.cognition.unwrap().sources.unwrap();
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].trust.as_deref(), Some("high"));
-        assert_eq!(sources[0].use_for.as_deref(), Some(&["社内仕様".to_string()][..]));
+        assert_eq!(
+            sources[0].use_for.as_deref(),
+            Some(&["社内仕様".to_string()][..])
+        );
         assert_eq!(sources[1].id.as_deref(), Some("web_fetch"));
-        assert_eq!(sources[1].trust, None, "省略は種別既定へ落とす（読む側の責務）");
+        assert_eq!(
+            sources[1].trust, None,
+            "省略は種別既定へ落とす（読む側の責務）"
+        );
     }
 
     /// `cognition.recall`は各フィールドを独立に省略できる。
@@ -901,7 +912,10 @@ mod tests {
             &user,
             serde_json::json!({ "cognition": { "recall": { "allow_unversioned": false } } }),
         );
-        assert_eq!(recall.get("allow_unversioned"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            recall.get("allow_unversioned"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     // --- `cognition.recall.stale_reverification`はプロジェクト層から有効化はできるが
@@ -930,7 +944,10 @@ mod tests {
             &user,
             serde_json::json!({ "cognition": { "recall": { "stale_reverification": true } } }),
         );
-        assert_eq!(recall.get("stale_reverification"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            recall.get("stale_reverification"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     /// ユーザー層が`true`にしていれば、プロジェクト層が`false`と書いてもユーザーの値が勝つ
@@ -943,7 +960,10 @@ mod tests {
             &user,
             serde_json::json!({ "cognition": { "recall": { "stale_reverification": false } } }),
         );
-        assert_eq!(recall.get("stale_reverification"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            recall.get("stale_reverification"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     /// ユーザー層が`false`（明示）でも、プロジェクト層は制約なく`true`にできる
@@ -956,7 +976,10 @@ mod tests {
             &user,
             serde_json::json!({ "cognition": { "recall": { "stale_reverification": true } } }),
         );
-        assert_eq!(recall.get("stale_reverification"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            recall.get("stale_reverification"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     /// **【T5】**: プロジェクト同梱設定はtrustを**引き下げられるが引き上げられない**。
