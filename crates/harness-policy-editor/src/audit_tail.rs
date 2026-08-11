@@ -177,10 +177,7 @@ mod tests {
         assert!(tail.poll().is_empty());
 
         append(&path, "second\nthird\n");
-        assert_eq!(
-            tail.poll(),
-            vec!["second".to_string(), "third".to_string()]
-        );
+        assert_eq!(tail.poll(), vec!["second".to_string(), "third".to_string()]);
         assert!(tail.poll().is_empty());
     }
 
@@ -202,10 +199,7 @@ mod tests {
 
         // 書き手が残りを書き終えたら、行全体が1回だけ返る。
         append(&path, "thout-newline-yet\n");
-        assert_eq!(
-            tail.poll(),
-            vec!["partial-without-newline-yet".to_string()]
-        );
+        assert_eq!(tail.poll(), vec!["partial-without-newline-yet".to_string()]);
     }
 
     /// ファイルが作り直されて縮んだら先頭から読み直す（古いオフセットのまま
@@ -257,6 +251,9 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].path.as_deref(), Some("C:/work/Cargo.toml"));
         assert!(events[0].allowed);
-        assert_eq!(skipped, 1, "foreign records must be counted, not silently lost");
+        assert_eq!(
+            skipped, 1,
+            "foreign records must be counted, not silently lost"
+        );
     }
 }

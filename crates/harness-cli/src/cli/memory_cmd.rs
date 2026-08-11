@@ -98,7 +98,10 @@ fn run_list(workspace_root: &Path, all: bool, output_format: OutputFormat) -> Ex
                 return ExitCode::SUCCESS;
             }
             for m in &list {
-                println!("{}", format_checkpoint_line(m, store.is_reviewed(m, &watermark)));
+                println!(
+                    "{}",
+                    format_checkpoint_line(m, store.is_reviewed(m, &watermark))
+                );
             }
         }
     }
@@ -189,9 +192,7 @@ fn run_reindex(workspace_root: &Path) -> ExitCode {
 
 fn run_forget(workspace_root: &Path, yes: bool) -> ExitCode {
     if !yes {
-        eprintln!(
-            "this deletes all checkpoints for this workspace. re-run with --yes to confirm."
-        );
+        eprintln!("this deletes all checkpoints for this workspace. re-run with --yes to confirm.");
         return ExitCode::FAILURE;
     }
     let store = match RecallStore::for_workspace(workspace_root) {

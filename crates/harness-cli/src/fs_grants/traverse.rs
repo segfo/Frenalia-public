@@ -22,7 +22,8 @@ pub(crate) fn fs_grant_traverse_preview(target: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let preview = harness_sandbox::tier2a::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
+    let preview =
+        harness_sandbox::tier2a::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
     println!("=== grant-traverse --dry-run: {} ===", target.display());
     println!("(read-only: no ACE has been written, no UAC prompt was shown)");
     for node in &preview {
@@ -61,8 +62,10 @@ pub(crate) fn fs_grant_traverse(target: &Path) -> ExitCode {
     // 即座に成功する。`preview_traverse_chain`は`--dry-run`が使うのと同じ読み取り専用ヘルパで、
     // `WRITE_DAC`もUACも要らない。
     if let Ok(sid) = harness_sandbox::tier2a::win_appcontainer::traverse_capability_sid() {
-        let preview =
-            harness_sandbox::tier2a::win_appcontainer::preview_traverse_chain(target, sid.as_psid());
+        let preview = harness_sandbox::tier2a::win_appcontainer::preview_traverse_chain(
+            target,
+            sid.as_psid(),
+        );
         if !preview.is_empty() && preview.iter().all(|node| node.already_sufficient) {
             for node in &preview {
                 harness_sandbox::tier2a::traverse_ledger::record_traverse_grant(&node.path);
@@ -249,4 +252,3 @@ pub(crate) fn fs_revoke_traverse_one(_path: &Path) -> ExitCode {
     eprintln!("error: fs revoke-traverse is Windows-only (Tier2a specific)");
     ExitCode::FAILURE
 }
-

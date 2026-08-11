@@ -618,4 +618,3 @@ pub(crate) fn urlencoding_path(path: &str) -> String {
         })
         .collect()
 }
-

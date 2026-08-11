@@ -661,7 +661,11 @@ async fn a_second_text_form_tool_call_is_accepted_instead_of_looping() {
     .await
     .unwrap();
 
-    assert_eq!(provider.calls_made(), 2, "2回で打ち切る（無限に再送しない）");
+    assert_eq!(
+        provider.calls_made(),
+        2,
+        "2回で打ち切る（無限に再送しない）"
+    );
     assert!(
         outcome.text.contains("<tool_call>"),
         "答えを失わない: {}",
@@ -808,7 +812,9 @@ async fn tool_output_piled_up_inside_one_turn_is_digested_before_the_turn_starts
     let mut state = ConversationState::new(Vec::new());
     state.push_user_text("read the bug catalog");
     for i in 0..4 {
-        state.messages.extend(tool_round(&format!("call_{i}"), 8_000));
+        state
+            .messages
+            .extend(tool_round(&format!("call_{i}"), 8_000));
     }
 
     let tools = ToolRegistry::with_builtin_tools();
@@ -858,7 +864,10 @@ async fn tool_output_piled_up_inside_one_turn_is_digested_before_the_turn_starts
     assert_eq!(provider.calls_made(), 2, "digest 1本 + 本題1本");
 
     let lengths = tool_result_lengths(&state);
-    assert!(lengths[0] < 2_000, "古い2件はdigestへ差し替わる: {lengths:?}");
+    assert!(
+        lengths[0] < 2_000,
+        "古い2件はdigestへ差し替わる: {lengths:?}"
+    );
     assert!(lengths[1] < 2_000, "{lengths:?}");
     assert_eq!(lengths[2], 8_000, "直近2件は逐語のまま");
     assert_eq!(lengths[3], 8_000);
@@ -889,7 +898,9 @@ async fn a_turn_heavy_history_is_digested_without_paying_for_a_rolling_summary()
     // いまのターン（③の担当領域）に山がある。
     state.push_user_text("バグカタログを全部見て傾向を分析して");
     for i in 0..5 {
-        state.messages.extend(tool_round(&format!("call_{i}"), 8_000));
+        state
+            .messages
+            .extend(tool_round(&format!("call_{i}"), 8_000));
     }
 
     let tools = ToolRegistry::with_builtin_tools();

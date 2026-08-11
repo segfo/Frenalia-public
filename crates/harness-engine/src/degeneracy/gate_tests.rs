@@ -57,7 +57,11 @@ fn the_window_slides() {
     warm(&mut stats, 100, 1.0);
     assert_eq!(stats.median_chars(&key()), Some(100));
     warm(&mut stats, 900, 9.0);
-    assert_eq!(stats.median_chars(&key()), Some(900), "古い100件は押し出された");
+    assert_eq!(
+        stats.median_chars(&key()),
+        Some(900),
+        "古い100件は押し出された"
+    );
 }
 
 /// **§11.2の核心**: 縮退と判定した実行を`record_clean`しない限り、母集団は汚れない。
@@ -74,15 +78,26 @@ fn degenerate_runs_never_enter_the_population() {
         assert!(verdict.open, "この出力量なら疑い状態に入る");
         // ここで record_clean を呼ばないのが規約。
     }
-    assert_eq!(stats.median_chars(&key()), Some(before), "閾値がずり上がらない");
-    assert!(stats.gate(&key(), 1_000_000, Duration::from_secs(600), 3.0).open);
+    assert_eq!(
+        stats.median_chars(&key()),
+        Some(before),
+        "閾値がずり上がらない"
+    );
+    assert!(
+        stats
+            .gate(&key(), 1_000_000, Duration::from_secs(600), 3.0)
+            .open
+    );
 }
 
 #[test]
 fn the_gate_opens_on_output_volume() {
     let mut stats = Stats::default();
     warm(&mut stats, 100, 1.0);
-    assert!(!stats.gate(&key(), 300, Duration::from_secs(1), 3.0).open, "3倍ちょうどは開かない");
+    assert!(
+        !stats.gate(&key(), 300, Duration::from_secs(1), 3.0).open,
+        "3倍ちょうどは開かない"
+    );
     let v = stats.gate(&key(), 301, Duration::from_secs(1), 3.0);
     assert!(v.open);
     assert!(v.reason.contains("出力量"), "{}", v.reason);
@@ -110,14 +125,24 @@ fn a_very_fast_population_does_not_leave_the_time_gate_permanently_open() {
     warm(&mut stats, 100, 0.000_1);
     // 中央値0.1msの3倍は0.3msだが、5msかかった程度では疑わない。
     assert!(!stats.gate(&key(), 10, Duration::from_millis(5), 3.0).open);
-    assert!(!stats.gate(&key(), 10, MIN_SUSPICIOUS_ELAPSED, 3.0).open, "下限ちょうどは開かない");
-    assert!(stats.gate(&key(), 10, Duration::from_secs(2), 3.0).open, "秒単位なら疑う");
+    assert!(
+        !stats.gate(&key(), 10, MIN_SUSPICIOUS_ELAPSED, 3.0).open,
+        "下限ちょうどは開かない"
+    );
+    assert!(
+        stats.gate(&key(), 10, Duration::from_secs(2), 3.0).open,
+        "秒単位なら疑う"
+    );
 }
 
 #[test]
 fn a_cold_population_keeps_the_gate_closed() {
     let stats = Stats::default();
-    assert!(!stats.gate(&key(), 1_000_000, Duration::from_secs(600), 3.0).open);
+    assert!(
+        !stats
+            .gate(&key(), 1_000_000, Duration::from_secs(600), 3.0)
+            .open
+    );
     assert!(!stats.is_warm(&key()));
 }
 
@@ -156,6 +181,10 @@ fn populations_are_keyed_by_model_and_max_tokens() {
     assert_eq!(stats.median_chars(&distill), Some(200));
     assert_eq!(stats.median_chars(&naive), Some(6_000));
     // 小さい予算のフェーズで6,000文字も出れば疑うが、大きい予算のターンでは平常。
-    assert!(stats.gate(&distill, 6_000, Duration::from_secs(1), 3.0).open);
+    assert!(
+        stats
+            .gate(&distill, 6_000, Duration::from_secs(1), 3.0)
+            .open
+    );
     assert!(!stats.gate(&naive, 6_000, Duration::from_secs(1), 3.0).open);
 }

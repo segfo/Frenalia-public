@@ -21,7 +21,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use harness_core::{
     BlockKind, CompletionRequest, ContentBlock, LlmProvider, Message, OutputContract,
-    ProviderCapabilities, ProviderError, Role, StopReason, StreamEvent, ToolChoice, ToolSpec, Usage,
+    ProviderCapabilities, ProviderError, Role, StopReason, StreamEvent, ToolChoice, ToolSpec,
+    Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -254,7 +255,10 @@ impl LlmProvider for OpenAiProvider {
                 msg: "lmstudio load config was not a JSON object".to_string(),
             })?;
         obj.insert("model".to_string(), serde_json::Value::String(model.into()));
-        obj.insert("echo_load_config".to_string(), serde_json::Value::Bool(true));
+        obj.insert(
+            "echo_load_config".to_string(),
+            serde_json::Value::Bool(true),
+        );
 
         let echoed = self.mgmt_post(&mgmt, "models/load", &body).await?;
         let echoed_config = echoed.get("load_config");
@@ -1659,7 +1663,10 @@ mod tests {
         let before = before.expect("the management API should report the load config");
 
         // 照合に失敗すれば`Err`になる（fail-closed）。成功＝設定が守られた。
-        assert!(p.recycle(MODEL).await.unwrap(), "reload should be supported");
+        assert!(
+            p.recycle(MODEL).await.unwrap(),
+            "reload should be supported"
+        );
 
         let (_, after) = p
             .capture_load_config(&mgmt, MODEL)
@@ -1701,7 +1708,9 @@ mod tests {
         let jittered = serde_json::to_value(to_wire_request(&req)).unwrap();
         // f32→JSON数値の丸めがあるので値そのものではなく近さで見る。
         for key in ["frequency_penalty", "presence_penalty"] {
-            let v = jittered[key].as_f64().unwrap_or_else(|| panic!("{key}: {jittered}"));
+            let v = jittered[key]
+                .as_f64()
+                .unwrap_or_else(|| panic!("{key}: {jittered}"));
             assert!((v - 0.4).abs() < 1e-6, "{key} = {v}");
         }
     }

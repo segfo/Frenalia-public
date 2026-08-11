@@ -97,10 +97,9 @@ fn main() -> std::process::ExitCode {
             };
             let ok = unsafe { ShellExecuteExW(&mut info) };
             if ok.is_err() {
-                eprintln!(
-                    "dev-elevated-run: failed to launch daemon: {:?}",
-                    unsafe { windows::Win32::Foundation::GetLastError() }
-                );
+                eprintln!("dev-elevated-run: failed to launch daemon: {:?}", unsafe {
+                    windows::Win32::Foundation::GetLastError()
+                });
                 return std::process::ExitCode::FAILURE;
             }
             // デーモンが名前付きパイプを作り終えるまで短くリトライする。
@@ -125,7 +124,9 @@ fn main() -> std::process::ExitCode {
     // クライアント側の診断用）。
     let _ = current_user_sid_string();
 
-    let request = RunRequest { target: target.clone() };
+    let request = RunRequest {
+        target: target.clone(),
+    };
     let request_bytes = serde_json::to_vec(&request).expect("serialize request");
     if let Err(e) = write_framed_timeout(pipe, &request_bytes, REQUEST_WRITE_TIMEOUT) {
         eprintln!("dev-elevated-run: failed to send request: {e}");

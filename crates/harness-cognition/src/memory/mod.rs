@@ -221,9 +221,7 @@ impl WorkingMemory {
                 superseded: e.validity.superseded_by.is_some(),
                 // **裏取りとして数えるのは接地種別だけ**。web証拠が2件並んでも
                 // `Corroborated`にはしない（§4.2でwebは補助扱い）。
-                corroborated_by_other_kind: siblings
-                    .iter()
-                    .any(|k| *k != kind && k.is_grounding()),
+                corroborated_by_other_kind: siblings.iter().any(|k| *k != kind && k.is_grounding()),
                 linked_to_hypothesis: is_linked,
             });
         }
@@ -538,7 +536,10 @@ mod tests {
             ),
             Some((h, true)),
         );
-        assert_eq!(mem.evidence_by_id(web).unwrap().validity.grade, Grade::Unverified);
+        assert_eq!(
+            mem.evidence_by_id(web).unwrap().validity.grade,
+            Grade::Unverified
+        );
         assert!(!mem.has_grounded_support(h));
 
         // ローカルファイルで裏取りできた瞬間、**既存のweb証拠のgradeも**引き直される。
@@ -577,11 +578,17 @@ mod tests {
 
         mem.record_conflict(weak, strong);
         for id in [weak, strong] {
-            assert_eq!(mem.evidence_by_id(id).unwrap().validity.grade, Grade::Conflicting);
+            assert_eq!(
+                mem.evidence_by_id(id).unwrap().validity.grade,
+                Grade::Conflicting
+            );
         }
         assert_eq!(mem.unresolved_conflicts(h), vec![weak, strong]);
         // 未決着の矛盾を抱えた接地は確証の根拠に数えない。
-        assert!(mem.has_grounded_support(h), "接地種別であること自体は変わらない");
+        assert!(
+            mem.has_grounded_support(h),
+            "接地種別であること自体は変わらない"
+        );
 
         // 信頼度差で決着し、負けた側だけが根拠から外れる。
         assert!(mem.resolve_conflicts().is_empty());
@@ -590,7 +597,10 @@ mod tests {
             mem.evidence_by_id(weak).unwrap().validity.superseded_by,
             Some(strong)
         );
-        assert_eq!(mem.evidence_by_id(weak).unwrap().validity.grade, Grade::Unverified);
+        assert_eq!(
+            mem.evidence_by_id(weak).unwrap().validity.grade,
+            Grade::Unverified
+        );
         assert_eq!(
             mem.evidence_by_id(strong).unwrap().validity.grade,
             Grade::SingleSource

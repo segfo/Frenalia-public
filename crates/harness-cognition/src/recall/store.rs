@@ -223,7 +223,11 @@ impl RecallStore {
     /// gitが無く`allow_unversioned`も無効なら`Err`（何も書かない）。gitはあるが`commit`に
     /// 失敗した場合は、**checkpoint自体は書けているので`Ok`のまま`commit_warning`へ理由を
     /// 載せる**（fail-open、`bug-pattern-rules` B-10）。
-    pub fn append(&self, cp: &Checkpoint, allow_unversioned: bool) -> Result<AppendOutcome, String> {
+    pub fn append(
+        &self,
+        cp: &Checkpoint,
+        allow_unversioned: bool,
+    ) -> Result<AppendOutcome, String> {
         harness_grant_ledger::with_named_lock(&self.lock_name(), || {
             self.append_locked(cp, allow_unversioned)
         })
@@ -247,7 +251,9 @@ impl RecallStore {
         }
 
         // 1. 本体（SSOT）を書く。
-        let path = self.checkpoint_path(&cp.meta.id).map_err(|e| e.to_string())?;
+        let path = self
+            .checkpoint_path(&cp.meta.id)
+            .map_err(|e| e.to_string())?;
         std::fs::write(&path, cp.to_file_contents()).map_err(|e| e.to_string())?;
 
         // 2. indexへ追記する（失敗しても次回`open`のrebuildが自己修復する。B-15の順序で

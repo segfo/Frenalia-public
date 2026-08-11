@@ -375,7 +375,9 @@ mod tests {
 
         assert_eq!(correlator.pending_len(), 3);
         assert!(
-            correlator.on_operation_end(1, STATUS_ACCESS_DENIED).is_none(),
+            correlator
+                .on_operation_end(1, STATUS_ACCESS_DENIED)
+                .is_none(),
             "the oldest entries were evicted"
         );
         let denial = correlator
@@ -409,7 +411,8 @@ mod tests {
 
         assert_eq!(access_from_create_options(0x0200_0000), FsAccess::ReadWrite); // FILE_CREATE
         assert_eq!(access_from_create_options(0x0400_0000), FsAccess::ReadWrite); // FILE_OVERWRITE
-        assert_eq!(access_from_create_options(0x0500_0060), FsAccess::ReadWrite); // FILE_OVERWRITE_IF
+        assert_eq!(access_from_create_options(0x0500_0060), FsAccess::ReadWrite);
+        // FILE_OVERWRITE_IF
     }
 
     /// `FILE_SUPERSEDE`（disposition 0）は意味としては上書きだが、`CreateOptions`が
@@ -488,8 +491,12 @@ mod tests {
         let mut correlator = Correlator::new(16);
         correlator.on_create(1, create(r"\??\C:\x.txt", 1, 0));
 
-        assert!(correlator.on_operation_end_any(1, STATUS_ACCESS_DENIED).is_some());
-        assert!(correlator.on_operation_end(1, STATUS_ACCESS_DENIED).is_none());
+        assert!(correlator
+            .on_operation_end_any(1, STATUS_ACCESS_DENIED)
+            .is_some());
+        assert!(correlator
+            .on_operation_end(1, STATUS_ACCESS_DENIED)
+            .is_none());
     }
 
     /// NTパスは設定へ書ける`C:/...`形式へ寄せる。

@@ -278,13 +278,14 @@ impl PhaseBudgets {
                 .saturating_sub(before.max_out)
                 .max(MIN_CLAMPED_MAX_IN);
             // それでも収まらなければ`max_out`も下限まで削る。
-            let max_out = if u64::from(max_in) + u64::from(before.max_out)
-                > u64::from(context_window)
-            {
-                context_window.saturating_sub(max_in).max(MIN_CLAMPED_MAX_OUT)
-            } else {
-                before.max_out
-            };
+            let max_out =
+                if u64::from(max_in) + u64::from(before.max_out) > u64::from(context_window) {
+                    context_window
+                        .saturating_sub(max_in)
+                        .max(MIN_CLAMPED_MAX_OUT)
+                } else {
+                    before.max_out
+                };
             let after = TokenBudget { max_in, max_out };
             self.budgets.insert(phase, after);
             clamps.push(BudgetClamp {

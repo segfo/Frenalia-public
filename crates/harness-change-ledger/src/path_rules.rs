@@ -445,7 +445,10 @@ mod tests {
     #[test]
     fn relative_under_root_returns_empty_for_the_root_itself() {
         assert_eq!(relative_under_root(r"C:\ws", r"C:\ws").as_deref(), Some(""));
-        assert_eq!(relative_under_root(r"C:\ws\", r"C:\ws").as_deref(), Some(""));
+        assert_eq!(
+            relative_under_root(r"C:\ws\", r"C:\ws").as_deref(),
+            Some("")
+        );
     }
 
     /// 前置詞一致だけでは配下と誤認する形（区切り境界の確認）と、そもそも配下でない形。

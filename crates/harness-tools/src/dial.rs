@@ -171,8 +171,10 @@ mod tests {
     fn fake_connector(
         plan: Vec<(SocketAddr, Duration, bool)>,
         log: std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>,
-    ) -> impl Fn(SocketAddr) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<SocketAddr>>>>
-    {
+    ) -> impl Fn(
+        SocketAddr,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<SocketAddr>>>> {
         move |addr: SocketAddr| {
             let entry = plan
                 .iter()
@@ -212,11 +214,17 @@ mod tests {
         );
 
         let started = tokio::time::Instant::now();
-        let got = connect_any_with(vec![stalled, live], connect).await.unwrap();
+        let got = connect_any_with(vec![stalled, live], connect)
+            .await
+            .unwrap();
         let elapsed = started.elapsed();
 
         assert_eq!(got, live);
-        assert_eq!(*log.lock().unwrap(), vec![stalled, live], "先頭→staggerで2番目");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![stalled, live],
+            "先頭→staggerで2番目"
+        );
         assert!(
             elapsed >= ATTEMPT_STAGGER && elapsed < ATTEMPT_STAGGER * 2,
             "staggerぶんだけ待つこと: {elapsed:?}"
@@ -239,7 +247,9 @@ mod tests {
         );
 
         let started = tokio::time::Instant::now();
-        let got = connect_any_with(vec![refused, live], connect).await.unwrap();
+        let got = connect_any_with(vec![refused, live], connect)
+            .await
+            .unwrap();
         let elapsed = started.elapsed();
 
         assert_eq!(got, live);

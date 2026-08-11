@@ -106,10 +106,16 @@ impl AppState {
                 if let Some(TranscriptItem::ToolCard {
                     status: ToolCardStatus::Running { wait_reason },
                     ..
-                }) = self.transcript.iter_mut().rev().find(
-                    |i| matches!(i, TranscriptItem::ToolCard { id: cid, .. } if *cid == id),
-                ) {
-                    *wait_reason = if message.is_empty() { None } else { Some(message) };
+                }) =
+                    self.transcript.iter_mut().rev().find(
+                        |i| matches!(i, TranscriptItem::ToolCard { id: cid, .. } if *cid == id),
+                    )
+                {
+                    *wait_reason = if message.is_empty() {
+                        None
+                    } else {
+                        Some(message)
+                    };
                 }
             }
             AgentEvent::ToolFinished { id, output } => {
@@ -229,9 +235,7 @@ impl AppState {
             // 開始位置まで巻き戻す**（捨てた出力が次の試行の本文と連結して読めてしまう）。
             // `retrying`が`false`のときは本文をそのまま答えとして採用するので**巻き戻さない**。
             AgentEvent::ToolCallWrittenAsText {
-                marker,
-                retrying,
-                ..
+                marker, retrying, ..
             } => {
                 if retrying {
                     self.transcript

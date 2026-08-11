@@ -457,7 +457,10 @@ mod tests {
             goal_summary.contains("過去の調査: 原因は設定ファイルの読込順序"),
             "{goal_summary}"
         );
-        assert!(goal_summary.contains("過去の記憶（要再検証）"), "{goal_summary}");
+        assert!(
+            goal_summary.contains("過去の記憶（要再検証）"),
+            "{goal_summary}"
+        );
         assert!(goal_summary.contains("未レビュー"), "{goal_summary}");
 
         let unknowns = mem.render(MemoryView::Unknowns, Reduction::Full);

@@ -271,13 +271,12 @@ pub fn validate_audit_sink_path(
         .ok_or_else(|| AuditSinkPathError::OutsideSandboxDir(requested.to_path_buf()))?;
 
     // reparse point（symlink/junction）を解決したうえでもう一度確かめる。
-    let resolved_parent =
-        parent
-            .canonicalize()
-            .map_err(|e| AuditSinkPathError::Unresolvable {
-                path: parent.to_path_buf(),
-                reason: e.to_string(),
-            })?;
+    let resolved_parent = parent
+        .canonicalize()
+        .map_err(|e| AuditSinkPathError::Unresolvable {
+            path: parent.to_path_buf(),
+            reason: e.to_string(),
+        })?;
     let resolved_sandbox_root =
         sandbox_root
             .canonicalize()
@@ -342,7 +341,10 @@ mod tests {
         let err = validate_audit_sink_path(Path::new(r"C:\Windows\System32\evil.jsonl"), workspace)
             .unwrap_err();
 
-        assert!(matches!(err, AuditSinkPathError::OutsideSandboxDir(_)), "{err}");
+        assert!(
+            matches!(err, AuditSinkPathError::OutsideSandboxDir(_)),
+            "{err}"
+        );
     }
 
     /// workspace内でも`.harness/sandbox/`の外は拒否する（`.git/config`等へ書かせない）。
@@ -355,7 +357,10 @@ mod tests {
         let err = validate_audit_sink_path(&workspace.join(".git").join("config"), workspace)
             .unwrap_err();
 
-        assert!(matches!(err, AuditSinkPathError::OutsideSandboxDir(_)), "{err}");
+        assert!(
+            matches!(err, AuditSinkPathError::OutsideSandboxDir(_)),
+            "{err}"
+        );
     }
 
     /// `..`で外へ出ようとする経路は、解決後の前方一致で落ちる。
@@ -366,13 +371,18 @@ mod tests {
         let sandbox = workspace.join(".harness").join("sandbox");
         std::fs::create_dir_all(&sandbox).unwrap();
 
-        let escaping = sandbox.join("..").join("..").join("..").join("escaped.jsonl");
+        let escaping = sandbox
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("escaped.jsonl");
         let err = validate_audit_sink_path(&escaping, workspace).unwrap_err();
 
         assert!(
             matches!(
                 err,
-                AuditSinkPathError::EscapesAfterResolution(_) | AuditSinkPathError::Unresolvable { .. }
+                AuditSinkPathError::EscapesAfterResolution(_)
+                    | AuditSinkPathError::Unresolvable { .. }
             ),
             "{err}"
         );
@@ -393,7 +403,10 @@ mod tests {
     #[test]
     fn comparison_is_case_insensitive_but_respects_component_boundaries() {
         let a = Path::new(r"C:\Work\.harness\sandbox\session-x");
-        assert!(starts_with_ignore_case(a, Path::new(r"c:\work\.HARNESS\SANDBOX")));
+        assert!(starts_with_ignore_case(
+            a,
+            Path::new(r"c:\work\.HARNESS\SANDBOX")
+        ));
         assert!(!starts_with_ignore_case(
             Path::new(r"C:\Work\.harness\sandbox-evil\x"),
             Path::new(r"C:\Work\.harness\sandbox")
@@ -425,9 +438,9 @@ mod elevation_target_tests {
     #[test]
     fn non_admin_trustees_holding_write_access_are_rejected() {
         for sid in [
-            "S-1-5-32-545",                              // BUILTIN\Users
-            "S-1-1-0",                                   // Everyone
-            "S-1-5-11",                                  // Authenticated Users
+            "S-1-5-32-545",                                   // BUILTIN\Users
+            "S-1-1-0",                                        // Everyone
+            "S-1-5-11",                                       // Authenticated Users
             "S-1-5-21-1111111111-2222222222-3333333333-1001", // 具体的なユーザー
         ] {
             assert!(

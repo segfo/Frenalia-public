@@ -93,8 +93,10 @@ const PENDING_CREATE_CAPACITY: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MofEtwError {
-    #[error("StartTraceW (system logger) failed: {0:?} (requires administrator rights; \
-             EVENT_TRACE_SYSTEM_LOGGER_MODE requires Windows 8 or later)")]
+    #[error(
+        "StartTraceW (system logger) failed: {0:?} (requires administrator rights; \
+             EVENT_TRACE_SYSTEM_LOGGER_MODE requires Windows 8 or later)"
+    )]
     StartTrace(WIN32_ERROR),
     #[error("OpenTraceW failed: {0:?}")]
     OpenTrace(WIN32_ERROR),
@@ -201,7 +203,12 @@ impl MofFsSession {
             }
         }
         MofFsOutcome {
-            denials: self.sink.denials.lock().map(|d| d.clone()).unwrap_or_default(),
+            denials: self
+                .sink
+                .denials
+                .lock()
+                .map(|d| d.clone())
+                .unwrap_or_default(),
             seen_events: self.sink.seen_events.lock().map(|c| *c).unwrap_or(0),
             observed_paths: self
                 .sink
@@ -236,10 +243,9 @@ fn system_properties_buffer(name_w: &[u16], enable_flags: EVENT_TRACE_FLAG) -> V
         (*properties).Wnode.BufferSize = total as u32;
         (*properties).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         (*properties).Wnode.ClientContext = 1; // QPC
-        // **private system logger**（Win8+）。`KERNEL_LOGGER_NAME`の単一インスタンス制約を
-        // 避けるため、`SystemTraceControlGuid`は設定せず任意名で張る。
-        (*properties).LogFileMode =
-            EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE;
+                                               // **private system logger**（Win8+）。`KERNEL_LOGGER_NAME`の単一インスタンス制約を
+                                               // 避けるため、`SystemTraceControlGuid`は設定せず任意名で張る。
+        (*properties).LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE;
         (*properties).EnableFlags = enable_flags;
         (*properties).LoggerNameOffset = struct_size as u32;
     }
@@ -421,6 +427,9 @@ mod tests {
     /// FileIoクラスGUIDが`{90CBDC39-4A3E-11D1-84F4-0000F80464E3}`であること。
     #[test]
     fn file_io_class_guid_matches_the_mof_definition() {
-        assert_eq!(format!("{FILE_IO_GUID:?}").to_uppercase(), "90CBDC39-4A3E-11D1-84F4-0000F80464E3");
+        assert_eq!(
+            format!("{FILE_IO_GUID:?}").to_uppercase(),
+            "90CBDC39-4A3E-11D1-84F4-0000F80464E3"
+        );
     }
 }

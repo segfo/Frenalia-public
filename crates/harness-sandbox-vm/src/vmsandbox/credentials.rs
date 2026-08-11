@@ -153,4 +153,3 @@ pub(crate) fn reset_known_hosts_file() -> Result<(), VmError> {
         Err(e) => Err(VmError::Io(e.to_string())),
     }
 }
-

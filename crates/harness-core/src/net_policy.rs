@@ -286,9 +286,17 @@ mod tests {
         assert!(policy.is_record_all());
         assert!(policy.allow_domains().is_empty());
 
-        for host in ["example.com", "crates.io", "sub.anything.example", "a.b.c.d.example"] {
+        for host in [
+            "example.com",
+            "crates.io",
+            "sub.anything.example",
+            "a.b.c.d.example",
+        ] {
             let decision = policy.evaluate_host(host);
-            assert!(decision.allowed, "{host} should be allowed in record-all mode");
+            assert!(
+                decision.allowed,
+                "{host} should be allowed in record-all mode"
+            );
             assert_eq!(decision.reason, "record_all");
             assert_eq!(decision.matched_pattern, None);
         }

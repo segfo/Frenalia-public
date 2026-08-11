@@ -25,7 +25,10 @@ fn source_selection_defaults_to_all_and_rejects_unknown_spellings() {
 
     let err = resolve_sources(Some("everything")).unwrap_err();
     assert!(err.contains("everything"), "{err}");
-    assert!(err.contains("preflight"), "the error lists the valid values");
+    assert!(
+        err.contains("preflight"),
+        "the error lists the valid values"
+    );
 }
 
 /// `--generalize`の既定は`dir`。未知の値は既定へ倒さずエラーにする——「設定したのに効かない」に
@@ -99,7 +102,11 @@ fn missing_collection_sources_yield_unavailable_reports_not_errors() {
 #[test]
 fn proposals_still_come_from_readable_sources_when_the_collector_is_absent() {
     let dir = tempfile::tempdir().unwrap();
-    let session_dir = dir.path().join(".harness").join("sandbox").join("session-x");
+    let session_dir = dir
+        .path()
+        .join(".harness")
+        .join("sandbox")
+        .join("session-x");
     std::fs::create_dir_all(&session_dir).unwrap();
     std::fs::write(
         session_dir.join("net-audit.jsonl"),
@@ -482,10 +489,8 @@ fn workspace_with_one_denial(settings_json: &str, denied_path: &str) -> tempfile
 /// 状態（D-46以前）へ戻る。
 #[test]
 fn applying_an_escalated_proposal_actually_changes_the_settings() {
-    let dir = workspace_with_one_denial(
-        r#"{"fs":{"read":["C:/tools"]}}"#,
-        "C:/tools/bin/rustc.exe",
-    );
+    let dir =
+        workspace_with_one_denial(r#"{"fs":{"read":["C:/tools"]}}"#, "C:/tools/bin/rustc.exe");
     let settings_path = dir.path().join(".harness").join("settings.json");
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
@@ -572,7 +577,11 @@ fn relative_settings_paths_are_resolved_against_the_workspace_root() {
         .join("lib.dll")
         .to_string_lossy()
         .replace('\\', "/");
-    let session_dir = dir.path().join(".harness").join("sandbox").join("session-x");
+    let session_dir = dir
+        .path()
+        .join(".harness")
+        .join("sandbox")
+        .join("session-x");
     std::fs::write(
         session_dir.join("fs-audit.jsonl"),
         format!(
@@ -722,7 +731,11 @@ fn suggest_shows_the_too_broad_proposal_with_a_mark_and_a_reason() {
 #[test]
 fn audit_listing_is_untouched_by_the_breadth_guard() {
     let dir = tempfile::tempdir().unwrap();
-    let session_dir = dir.path().join(".harness").join("sandbox").join("session-x");
+    let session_dir = dir
+        .path()
+        .join(".harness")
+        .join("sandbox")
+        .join("session-x");
     std::fs::create_dir_all(&session_dir).unwrap();
     std::fs::write(
         session_dir.join("fs-audit.jsonl"),

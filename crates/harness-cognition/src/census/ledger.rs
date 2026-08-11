@@ -80,12 +80,8 @@ mod tests {
     fn plan_slice_carries_the_goal_text() {
         let mut ledger = CensusLedger::new();
         ledger.set_goal_text("バグカタログの傾向を分析して".to_string());
-        let slice = (&ledger as &dyn LedgerView).render_slice(
-            Phase::Plan,
-            None,
-            None,
-            Reduction::Full,
-        );
+        let slice =
+            (&ledger as &dyn LedgerView).render_slice(Phase::Plan, None, None, Reduction::Full);
         assert!(slice.contains("バグカタログの傾向を分析して"), "{slice}");
     }
 

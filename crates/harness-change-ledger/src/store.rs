@@ -63,7 +63,11 @@ fn baseline_hash_and_mirror_from(
 /// 無ければ実workspace側の現在内容を読んでハッシュ化し、`<upper_dir>/.harness-cow-baseline/<rel>`
 /// へ内容ミラーを書く（`resolve`の3-way merge材料）。実workspaceに存在しなければ`None`
 /// （＝新規作成）。
-pub fn baseline_hash_and_mirror(upper_dir: &Path, workspace_root: &Path, rel: &str) -> Option<String> {
+pub fn baseline_hash_and_mirror(
+    upper_dir: &Path,
+    workspace_root: &Path,
+    rel: &str,
+) -> Option<String> {
     baseline_hash_and_mirror_from(upper_dir, rel, &workspace_root.join(rel), rel)
 }
 
@@ -77,7 +81,12 @@ pub fn baseline_hash_and_mirror_ext(
     ext_key: &str,
 ) -> Option<String> {
     let mirror_key = format!("_ext/{ext_key}");
-    baseline_hash_and_mirror_from(upper_dir, original_path, Path::new(original_path), &mirror_key)
+    baseline_hash_and_mirror_from(
+        upper_dir,
+        original_path,
+        Path::new(original_path),
+        &mirror_key,
+    )
 }
 
 /// 台帳（`<upper_dir>/.harness-cow-ops.jsonl`）へ1エントリを追記する。1レコード＝1行を1回の
@@ -223,10 +232,8 @@ fn collect_content_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
 /// upper配下の実パスを操作台帳のキーへ写す（[`scan_upper_content_files`]の1件分）。
 /// `_ext/<key>`配下は[`ext_key`]の逆写像で絶対パスへ戻す。
 fn upper_path_to_ledger_key(root: &Path, path: &Path) -> Option<String> {
-    let rel = crate::path_rules::relative_under_root(
-        &path.to_string_lossy(),
-        &root.to_string_lossy(),
-    )?;
+    let rel =
+        crate::path_rules::relative_under_root(&path.to_string_lossy(), &root.to_string_lossy())?;
     if rel.is_empty() {
         return None;
     }
@@ -363,7 +370,11 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let hash = baseline_hash_and_mirror(upper.path(), ws.path(), "new.txt");
         assert_eq!(hash, None);
-        assert!(!upper.path().join(COW_BASELINE_DIRNAME).join("new.txt").exists());
+        assert!(!upper
+            .path()
+            .join(COW_BASELINE_DIRNAME)
+            .join("new.txt")
+            .exists());
     }
 
     #[test]
@@ -385,7 +396,12 @@ mod tests {
         let upper = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("a.txt"), b"hello").unwrap();
-        append_entry(upper.path(), ChangeOp::Modify, "a.txt", Some("stale-hash".to_string()));
+        append_entry(
+            upper.path(),
+            ChangeOp::Modify,
+            "a.txt",
+            Some("stale-hash".to_string()),
+        );
 
         // 実workspace側は変わっていても、台帳に既存エントリがあればそれを権威として使う
         // （baselineは「セッション開始時点の姿」を意味し、2回目の呼び出しで再計算してはならない）。
@@ -421,8 +437,18 @@ mod tests {
         // `rebase_baseline`がprune＋再appendの2手を踏む理由（`replay`は最初のエントリの
         // baselineを権威とするので、追記だけでは張り替わらない）を明示的に固定する。
         let upper = tempfile::tempdir().unwrap();
-        append_entry(upper.path(), ChangeOp::Modify, "a.txt", Some("first".into()));
-        append_entry(upper.path(), ChangeOp::Modify, "a.txt", Some("second".into()));
+        append_entry(
+            upper.path(),
+            ChangeOp::Modify,
+            "a.txt",
+            Some("first".into()),
+        );
+        append_entry(
+            upper.path(),
+            ChangeOp::Modify,
+            "a.txt",
+            Some("second".into()),
+        );
         assert_eq!(
             replay_ledger(upper.path())[0].baseline_hash,
             Some("first".to_string())
@@ -441,7 +467,10 @@ mod tests {
 
     #[test]
     fn ext_key_maps_windows_drive_path() {
-        assert_eq!(ext_key(r"C:\Windows\probe.txt").unwrap(), "c/Windows/probe.txt");
+        assert_eq!(
+            ext_key(r"C:\Windows\probe.txt").unwrap(),
+            "c/Windows/probe.txt"
+        );
     }
 
     #[test]
@@ -472,7 +501,14 @@ mod tests {
 
         assert_eq!(hash, Some(hash_bytes(b"outside-content")));
         assert_eq!(
-            std::fs::read(upper.path().join(COW_BASELINE_DIRNAME).join("_ext").join(&key)).unwrap(),
+            std::fs::read(
+                upper
+                    .path()
+                    .join(COW_BASELINE_DIRNAME)
+                    .join("_ext")
+                    .join(&key)
+            )
+            .unwrap(),
             b"outside-content"
         );
     }
@@ -480,9 +516,18 @@ mod tests {
     #[test]
     fn baseline_hash_and_mirror_ext_reuses_ledger_entry_by_original_path() {
         let upper = tempfile::tempdir().unwrap();
-        append_entry(upper.path(), ChangeOp::Modify, "C:/Windows/probe.txt", Some("stale".to_string()));
+        append_entry(
+            upper.path(),
+            ChangeOp::Modify,
+            "C:/Windows/probe.txt",
+            Some("stale".to_string()),
+        );
 
-        let hash = baseline_hash_and_mirror_ext(upper.path(), "C:/Windows/probe.txt", "c/Windows/probe.txt");
+        let hash = baseline_hash_and_mirror_ext(
+            upper.path(),
+            "C:/Windows/probe.txt",
+            "c/Windows/probe.txt",
+        );
 
         assert_eq!(hash, Some("stale".to_string()));
     }
@@ -492,9 +537,17 @@ mod tests {
     #[test]
     fn scan_upper_content_files_finds_direct_writes_and_skips_cow_metadata() {
         let upper = tempfile::tempdir().unwrap();
-        std::fs::write(upper.path().join("direct.txt"), b"written without the ledger").unwrap();
+        std::fs::write(
+            upper.path().join("direct.txt"),
+            b"written without the ledger",
+        )
+        .unwrap();
         std::fs::create_dir_all(upper.path().join("sub").join("deep")).unwrap();
-        std::fs::write(upper.path().join("sub").join("deep").join("nested.txt"), b"x").unwrap();
+        std::fs::write(
+            upper.path().join("sub").join("deep").join("nested.txt"),
+            b"x",
+        )
+        .unwrap();
         // CoW自身の帳簿一式（除外される側）。
         append_entry(upper.path(), ChangeOp::Create, "direct.txt", None);
         append_denied_entry(upper.path(), "C:/outside/x.txt", 0x4000_0000, 42);
@@ -510,7 +563,10 @@ mod tests {
 
         let found = scan_upper_content_files(upper.path());
 
-        assert_eq!(found, vec!["direct.txt".to_string(), "sub/deep/nested.txt".to_string()]);
+        assert_eq!(
+            found,
+            vec!["direct.txt".to_string(), "sub/deep/nested.txt".to_string()]
+        );
     }
 
     /// `_ext/<key>`配下は絶対パス形の台帳キーへ逆写像される（`ext_key`の逆）。
@@ -534,7 +590,10 @@ mod tests {
             ledger_key_match_form("C:/Windows/Probe.txt"),
             ledger_key_match_form("c:/windows/probe.txt")
         );
-        assert_eq!(ledger_key_match_form("Sub/A.TXT"), ledger_key_match_form("sub/a.txt"));
+        assert_eq!(
+            ledger_key_match_form("Sub/A.TXT"),
+            ledger_key_match_form("sub/a.txt")
+        );
         assert_eq!(ledger_key_match_form(r"sub\a.txt"), "sub/a.txt");
     }
 

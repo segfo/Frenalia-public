@@ -16,7 +16,9 @@ pub(crate) fn self_dll_path() -> Option<PathBuf> {
     if len == 0 {
         return None;
     }
-    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &buf[..len as usize],
+    )))
 }
 
 /// `process`（孫プロセス、`LoadLibraryW`完了後）内で、`dll_path`と同じ完全パスを持つ
@@ -58,10 +60,19 @@ pub(crate) unsafe fn find_remote_module_base(process: HANDLE, dll_path: &Path) -
 /// `harness_cow_init`のスレッドパラメータとして渡せるポインタを返す。呼び出し元は
 /// `CreateRemoteThread`の終了待ちのあとで`VirtualFreeEx`する責務を持つ。
 /// WOW64（32bitターゲット）でも`VirtualAllocEx`は4GB未満のアドレスを返すため同じ経路で使える。
-pub(crate) unsafe fn write_remote_config_blob(process: HANDLE, cfg: &Config) -> Option<*mut c_void> {
+pub(crate) unsafe fn write_remote_config_blob(
+    process: HANDLE,
+    cfg: &Config,
+) -> Option<*mut c_void> {
     let bytes = serialize_config_blob(cfg);
     let remote = unsafe {
-        VirtualAllocEx(process, None, bytes.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        VirtualAllocEx(
+            process,
+            None,
+            bytes.len(),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
     };
     if remote.is_null() {
         debug_log("write_remote_config_blob: VirtualAllocEx failed");
@@ -106,7 +117,13 @@ pub(crate) unsafe fn inject_grandchild(process: HANDLE, cfg: &Config) -> bool {
     let size = path_w.len() * std::mem::size_of::<u16>();
 
     let remote_buf = unsafe {
-        VirtualAllocEx(process, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        VirtualAllocEx(
+            process,
+            None,
+            size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
     };
     if remote_buf.is_null() {
         debug_log(&format!(
@@ -116,7 +133,13 @@ pub(crate) unsafe fn inject_grandchild(process: HANDLE, cfg: &Config) -> bool {
         return false;
     }
     let write_ok = unsafe {
-        WriteProcessMemory(process, remote_buf, path_w.as_ptr() as *const c_void, size, None)
+        WriteProcessMemory(
+            process,
+            remote_buf,
+            path_w.as_ptr() as *const c_void,
+            size,
+            None,
+        )
     };
     if write_ok.is_err() {
         debug_log(&format!(
@@ -137,7 +160,10 @@ pub(crate) unsafe fn inject_grandchild(process: HANDLE, cfg: &Config) -> bool {
         return false;
     };
     let Some(load_library_addr) = (unsafe {
-        GetProcAddress(kernel32, windows::core::PCSTR(c"LoadLibraryW".as_ptr() as *const u8))
+        GetProcAddress(
+            kernel32,
+            windows::core::PCSTR(c"LoadLibraryW".as_ptr() as *const u8),
+        )
     }) else {
         unsafe {
             let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
@@ -151,7 +177,15 @@ pub(crate) unsafe fn inject_grandchild(process: HANDLE, cfg: &Config) -> bool {
     });
     let mut tid: u32 = 0;
     let load_thread = unsafe {
-        CreateRemoteThread(process, None, 0, load_start, Some(remote_buf), 0, Some(&mut tid))
+        CreateRemoteThread(
+            process,
+            None,
+            0,
+            load_start,
+            Some(remote_buf),
+            0,
+            Some(&mut tid),
+        )
     };
     let Ok(load_thread) = load_thread else {
         debug_log(&format!(
@@ -264,7 +298,9 @@ pub(crate) unsafe fn inject_grandchild_and_maybe_resume(
     caller: &str,
 ) {
     if process_information.is_null() {
-        debug_log(&format!("{caller}: lpProcessInformation is null, skip injection"));
+        debug_log(&format!(
+            "{caller}: lpProcessInformation is null, skip injection"
+        ));
         return;
     }
     let pi = unsafe { &*(process_information as *const PROCESS_INFORMATION) };
@@ -280,7 +316,9 @@ pub(crate) unsafe fn inject_grandchild_and_maybe_resume(
                     wow64::inject_grandchild_wow64(pi.hProcess, pi.hThread, &x64_dll_path, cfg)
                 },
                 None => {
-                    debug_log(&format!("{caller}: self_dll_path() failed for wow64 injection"));
+                    debug_log(&format!(
+                        "{caller}: self_dll_path() failed for wow64 injection"
+                    ));
                     false
                 }
             }

@@ -578,10 +578,8 @@ fn keepalive_reuse_result(args: KeepaliveReuseArgs) -> Value {
 
     match outcome {
         Ok(statuses) => {
-            let ok = statuses.len() == 3
-                && statuses[0] < 400
-                && statuses[1] == 403
-                && statuses[2] < 400;
+            let ok =
+                statuses.len() == 3 && statuses[0] < 400 && statuses[1] == 403 && statuses[2] < 400;
             result.insert("statuses".to_string(), json!(statuses));
             result.insert("ok".to_string(), json!(ok));
         }
@@ -720,8 +718,7 @@ fn connect_sni_result(args: ConnectSniArgs) -> Value {
             .write_all(connect_req.as_bytes())
             .map_err(|e| e.to_string())?;
 
-        let mut reader =
-            std::io::BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        let mut reader = std::io::BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
         let mut status_line = String::new();
         std::io::BufRead::read_line(&mut reader, &mut status_line).map_err(|e| e.to_string())?;
         if !status_line.starts_with("HTTP/1.1 200") {
@@ -790,7 +787,8 @@ fn build_client_hello(sni: &str) -> Vec<u8> {
         .expect("client connection construction cannot fail here");
     let mut buf = Vec::new();
     while conn.wants_write() {
-        conn.write_tls(&mut buf).expect("writing to a Vec cannot fail");
+        conn.write_tls(&mut buf)
+            .expect("writing to a Vec cannot fail");
     }
     buf
 }

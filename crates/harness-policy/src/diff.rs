@@ -67,7 +67,12 @@ pub fn compute_diff(existing: &Value, accepted: &[&RuleProposal]) -> SettingsDif
                 entries.last_mut().expect("just pushed")
             }
         };
-        if already_present || slot.added.iter().any(|v| v.eq_ignore_ascii_case(&proposal.value)) {
+        if already_present
+            || slot
+                .added
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(&proposal.value))
+        {
             continue;
         }
         slot.added.push(proposal.value.clone());
@@ -191,7 +196,10 @@ mod tests {
 
         assert_eq!(updated["model"], "keep-me");
         assert_eq!(updated["fs"]["read"], serde_json::json!(["C:/already"]));
-        assert_eq!(updated["fs"]["read_exec"], serde_json::json!(["C:/tools/bin"]));
+        assert_eq!(
+            updated["fs"]["read_exec"],
+            serde_json::json!(["C:/tools/bin"])
+        );
         assert_eq!(
             updated["net"]["allow_domains"],
             serde_json::json!(["api.example.com"])
@@ -204,10 +212,7 @@ mod tests {
         let all = proposals();
         let accepted: Vec<&RuleProposal> = all.iter().collect();
 
-        let once = apply_to_settings(
-            &Value::Null,
-            &compute_diff(&Value::Null, &accepted),
-        );
+        let once = apply_to_settings(&Value::Null, &compute_diff(&Value::Null, &accepted));
         let twice = apply_to_settings(&once, &compute_diff(&once, &accepted));
 
         assert_eq!(once, twice);
@@ -241,6 +246,9 @@ mod tests {
         let text = diff.render_text();
 
         assert!(text.contains(r#"+ fs.read_exec: "C:/tools/bin""#), "{text}");
-        assert!(text.contains(r#"+ net.allow_domains: "api.example.com""#), "{text}");
+        assert!(
+            text.contains(r#"+ net.allow_domains: "api.example.com""#),
+            "{text}"
+        );
     }
 }

@@ -97,7 +97,9 @@ impl AppContainerSession {
     /// 子プロセスのstdinへ書く。
     pub fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), SessionError> {
         if self.closed {
-            return Err(SessionError::Closed("session already shut down".to_string()));
+            return Err(SessionError::Closed(
+                "session already shut down".to_string(),
+            ));
         }
         while !bytes.is_empty() {
             let mut written = 0u32;

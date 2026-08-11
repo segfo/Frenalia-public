@@ -246,13 +246,13 @@ mod tests {
         // 自分自身（E7）も台帳には既に載っている（先に積んでからIDを解決するため）。
         let known = [EvidenceId(3), EvidenceId(5), EvidenceId(7)];
         let labels = [
-            "E3".to_string(),   // 実在
-            "E9".to_string(),   // 捏造
-            "E5".to_string(),   // 実在
-            "E3".to_string(),   // 重複
-            "E7".to_string(),   // いま積もうとしている自分自身
-            "".to_string(),     // 空
-            "H3".to_string(),   // 種別違い（仮説ID）
+            "E3".to_string(), // 実在
+            "E9".to_string(), // 捏造
+            "E5".to_string(), // 実在
+            "E3".to_string(), // 重複
+            "E7".to_string(), // いま積もうとしている自分自身
+            "".to_string(),   // 空
+            "H3".to_string(), // 種別違い（仮説ID）
         ];
         let resolved = resolve_contradicts(&labels, &known, Some(EvidenceId(7)));
         assert_eq!(resolved, vec![EvidenceId(3), EvidenceId(5)]);

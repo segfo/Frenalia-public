@@ -371,7 +371,10 @@ async fn jsonl_emits_the_turn_discarded_event_verbatim() {
         })
         .collect();
     assert_eq!(discarded.len(), 1, "{events:?}");
-    assert_eq!(discarded[0].0, harness_core::DegenerateKind::ShortPeriodRepeat);
+    assert_eq!(
+        discarded[0].0,
+        harness_core::DegenerateKind::ShortPeriodRepeat
+    );
     assert_eq!(discarded[0].1.as_deref(), Some("jitter"));
 }
 

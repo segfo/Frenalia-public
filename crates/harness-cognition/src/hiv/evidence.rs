@@ -312,15 +312,14 @@ mod tests {
             serde_json::json!({ "q": "run_shell" }),
             "spec says powershell",
         );
-        for risk in [
-            Some(RiskClass::Network),
-            Some(RiskClass::ReadOnly),
-            None,
-        ] {
+        for risk in [Some(RiskClass::Network), Some(RiskClass::ReadOnly), None] {
             let SourceRef::Mcp { server, tool, .. } = source_ref_for(&c, risk) else {
                 panic!("mcp/ tools must be recorded as MCP sources (risk={risk:?})");
             };
-            assert_eq!((server.as_str(), tool.as_str()), ("company-docs", "search_docs"));
+            assert_eq!(
+                (server.as_str(), tool.as_str()),
+                ("company-docs", "search_docs")
+            );
         }
     }
 

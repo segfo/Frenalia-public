@@ -68,7 +68,10 @@ pub(crate) unsafe fn object_attributes_path(oa: *const OBJECT_ATTRIBUTES) -> Opt
 /// （`known_root_nt_prefixes`）。システム全体のドライブ列挙が不要になり、workspace/upper
 /// 配下だけを解決できれば十分というこのDLLのスコープ（workspace外は既存の設計通り
 /// 安全側で素通し）とも一致する。
-pub(crate) unsafe fn resolve_relative_object_attributes_path(root: HANDLE, raw_name: &str) -> Option<PathBuf> {
+pub(crate) unsafe fn resolve_relative_object_attributes_path(
+    root: HANDLE,
+    raw_name: &str,
+) -> Option<PathBuf> {
     // 実機回帰テストで発見した誤検知: Windows Defender/AMSIプロバイダ（`MpOav.dll`等）が
     // レジストリのREG_EXPAND_SZ値を展開せずそのまま`NtCreateFile`の`ObjectName`へ渡すことがあり、
     // その結果`raw_name`が`%SystemDrive%\ProgramData\...\MpOav.dll`という**未展開の環境変数文字列を

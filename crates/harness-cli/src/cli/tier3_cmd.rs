@@ -45,5 +45,3 @@ pub(crate) fn run_tier3_subcommand(_action: Tier3Action) -> ExitCode {
     eprintln!("error: Tier3 (Hyper-V VM isolation) is Windows-only");
     ExitCode::FAILURE
 }
-
-

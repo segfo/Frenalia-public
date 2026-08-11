@@ -234,11 +234,7 @@ pub fn tree_is_verified(workspace: &Path, mode: &str) -> bool {
     tree_is_verified_in(&ledger(), workspace, mode)
 }
 
-fn mark_tree_verified_in(
-    ledger: &Ledger<WorkspaceCapabilityLedger>,
-    workspace: &Path,
-    mode: &str,
-) {
+fn mark_tree_verified_in(ledger: &Ledger<WorkspaceCapabilityLedger>, workspace: &Path, mode: &str) {
     let key = workspace_key(workspace);
     let now = now_unix_secs();
     ledger.update(|l| {
@@ -297,8 +293,8 @@ fn forget_capability_in(
     ledger.update(|l| {
         let mut removed = Vec::new();
         l.entries.retain(|e| {
-            let hit =
-                workspace_key(Path::new(&e.workspace)) == key && (mode.is_empty() || e.mode == mode);
+            let hit = workspace_key(Path::new(&e.workspace)) == key
+                && (mode.is_empty() || e.mode == mode);
             if hit {
                 removed.push(e.capability_name.clone());
             }
@@ -471,7 +467,10 @@ mod tests {
         assert!(lookup_capability_name_in(&l, ws, "rwx").is_none());
         assert!(l.load().entries.is_empty());
         let name = ensure_capability_name_in(&l, ws, "rwx").unwrap();
-        assert_eq!(lookup_capability_name_in(&l, ws, "rwx").as_deref(), Some(name.as_str()));
+        assert_eq!(
+            lookup_capability_name_in(&l, ws, "rwx").as_deref(),
+            Some(name.as_str())
+        );
     }
 
     #[test]

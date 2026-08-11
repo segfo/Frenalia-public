@@ -122,7 +122,10 @@ mod tests {
         assert_eq!(state.messages[8], assistant_text("reply2"));
 
         // ①: 生き残った両方の tool_result が下限付近まで縮む。
-        assert_eq!(out.shrunk.blocks, 2, "保護境界を置かないので直近ターンも縮む");
+        assert_eq!(
+            out.shrunk.blocks, 2,
+            "保護境界を置かないので直近ターンも縮む"
+        );
         for len in tool_result_lengths(&state.messages) {
             assert!(
                 (2_000..2_100).contains(&len),
@@ -140,7 +143,9 @@ mod tests {
         let mut state = ConversationState::new(Vec::new());
         for i in 0..3 {
             state.messages.push(user_turn(&format!("t{i}")));
-            state.messages.extend(tool_round(&format!("call_{i}"), 8_000));
+            state
+                .messages
+                .extend(tool_round(&format!("call_{i}"), 8_000));
             state.messages.push(assistant_text("reply"));
         }
         let before = state.messages.clone();

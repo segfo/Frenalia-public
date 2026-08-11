@@ -63,7 +63,10 @@ fn a_healthy_chain_does_not_blame_the_ancestors() {
         "with nothing missing, the diagnosis must fall back to 'cause unknown': {message}"
     );
     // 生エラーは常に残す（D-43「失敗を隠さない」）。
-    assert!(message.contains("Access to the path is denied."), "{message}");
+    assert!(
+        message.contains("Access to the path is denied."),
+        "{message}"
+    );
 }
 
 /// 中間の祖先だけが欠けているとき、**そのノードだけ**を名指しする。

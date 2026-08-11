@@ -131,7 +131,8 @@ fn the_reason_explains_both_the_gate_and_the_detector() {
     warm(&d, "m", 1_000);
     let mut w = d.watch("m", 1_000);
     // 平常は「了解。」の3文字。その3倍を超えると疑い状態に入る。
-    let para = "この問題の原因はおそらく設定ファイルの読み込み順序にある。順序を入れ替えれば直るはずだ。\
+    let para =
+        "この問題の原因はおそらく設定ファイルの読み込み順序にある。順序を入れ替えれば直るはずだ。\
                 しかし本当にそうだろうか。もう一度確かめる必要がある。";
     let hit = w.on_text(&para.repeat(40)).expect("②");
     assert_eq!(hit.kind, DegenerateKind::NoveltyCollapse);
@@ -147,7 +148,10 @@ fn only_clean_calls_widen_the_population() {
     let d = detector();
     warm(&d, "m", 1_000);
     let budget_before = d.watch("m", 1_000).recovery_budget();
-    assert!(budget_before.is_some(), "統計が温まっていれば回復予算が出る");
+    assert!(
+        budget_before.is_some(),
+        "統計が温まっていれば回復予算が出る"
+    );
 
     // 縮退したコールは`record_clean`せずに捨てる。
     for _ in 0..50 {

@@ -139,10 +139,7 @@ fn schema_for(phase: Phase) -> serde_json::Value {
         ),
         Phase::Collect => object(&[("summary", string_prop())], &["summary"]),
         Phase::Join => object(
-            &[
-                ("summary", string_prop()),
-                ("key_findings", string_array()),
-            ],
+            &[("summary", string_prop()), ("key_findings", string_array())],
             &["summary", "key_findings"],
         ),
     }

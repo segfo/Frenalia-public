@@ -105,7 +105,11 @@ pub(crate) fn debug_log(msg: &str) {
         Some(cfg) => cfg.upper_dir.join(".harness-cow-debug.log"),
         None => std::env::temp_dir().join("harness-cow-debug.log"),
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "[{}] {msg}", now_millis());
     }
 }

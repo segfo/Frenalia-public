@@ -32,7 +32,12 @@ pub(crate) fn baseline_hash_for(cfg: &Config, ledger_key: &str) -> Option<String
 
 /// 台帳（`<upper_dir>/.harness-cow-ops.jsonl`）へ1エントリを追記し、メモリ上の削除済み集合も
 /// 更新する。追記の実体は`store::append_entry`（host側と共有、設計書§19.2「追記の並行性」）。
-pub(crate) fn append_ledger_entry(cfg: &Config, op: ChangeOp, rel: &str, baseline_hash: Option<String>) {
+pub(crate) fn append_ledger_entry(
+    cfg: &Config,
+    op: ChangeOp,
+    rel: &str,
+    baseline_hash: Option<String>,
+) {
     store::append_entry(&cfg.upper_dir, op, rel, baseline_hash);
     let deleted = deleted_paths_state();
     let mut g = deleted.lock().unwrap();
@@ -61,7 +66,11 @@ pub(crate) fn copy_up(cfg: &Config, rel: &str, workspace_path: &Path, upper_path
     if workspace_path.is_file() {
         let _ = std::fs::copy(workspace_path, upper_path);
     }
-    let op = if baseline_hash.is_some() { ChangeOp::Modify } else { ChangeOp::Create };
+    let op = if baseline_hash.is_some() {
+        ChangeOp::Modify
+    } else {
+        ChangeOp::Create
+    };
     append_ledger_entry(cfg, op, rel, baseline_hash);
 }
 
@@ -83,7 +92,11 @@ pub(crate) fn record_upper_alias_write(cfg: &Config, rel: &str) {
         return;
     }
     let baseline_hash = baseline_hash_for(cfg, rel);
-    let op = if baseline_hash.is_some() { ChangeOp::Modify } else { ChangeOp::Create };
+    let op = if baseline_hash.is_some() {
+        ChangeOp::Modify
+    } else {
+        ChangeOp::Create
+    };
     append_ledger_entry(cfg, op, rel, baseline_hash);
 }
 
@@ -152,7 +165,10 @@ pub(crate) fn nt_path_wide(upper_path: &Path) -> Vec<u16> {
 pub(crate) unsafe fn build_redirected_oa(
     object_attributes: *const OBJECT_ATTRIBUTES,
     upper_wide: &[u16],
-) -> (OBJECT_ATTRIBUTES, windows::Win32::Foundation::UNICODE_STRING) {
+) -> (
+    OBJECT_ATTRIBUTES,
+    windows::Win32::Foundation::UNICODE_STRING,
+) {
     let mut redirected_oa = unsafe { *object_attributes };
     let redirected_name = windows::Win32::Foundation::UNICODE_STRING {
         Length: ((upper_wide.len() - 1) * 2) as u16,

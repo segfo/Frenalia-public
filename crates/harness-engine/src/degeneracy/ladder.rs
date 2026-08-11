@@ -163,10 +163,7 @@ pub fn apply(req: &mut CompletionRequest, rung: Rung, attempt: u32) {
 }
 
 fn jitter(req: &mut CompletionRequest, attempt: u32) {
-    let base = req
-        .sampling
-        .temperature
-        .unwrap_or(ASSUMED_BASE_TEMPERATURE);
+    let base = req.sampling.temperature.unwrap_or(ASSUMED_BASE_TEMPERATURE);
     // 上限を設けるのは、温度を上げ続けると別種の壊れ方（意味を成さない出力）になるため。
     req.sampling.temperature = Some((base + TEMPERATURE_STEP * attempt as f32).min(1.5));
     req.sampling.frequency_penalty = Some(FREQUENCY_PENALTY);

@@ -155,9 +155,7 @@ mod tests {
     /// 機械的な文字列にしない。
     #[test]
     fn every_outcome_explains_what_to_do_next() {
-        assert!(LockOutcome::AlreadyHeld
-            .message()
-            .contains("終了してから"));
+        assert!(LockOutcome::AlreadyHeld.message().contains("終了してから"));
         assert!(LockOutcome::AcquiredAfterAbandon
             .message()
             .contains("revoke-workspace"));

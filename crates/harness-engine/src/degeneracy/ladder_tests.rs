@@ -33,10 +33,18 @@ fn without_a_budget_the_ladder_walks_the_rungs_and_terminates() {
     assert_eq!(l.current(), Rung::Jitter);
     assert_eq!(l.advance(Duration::ZERO), Rung::Jitter, "(b)を2回試す");
     assert_eq!(l.advance(Duration::ZERO), Rung::JitterWithNotice);
-    assert_eq!(l.advance(Duration::ZERO), Rung::JitterWithNotice, "(c)を2回試す");
+    assert_eq!(
+        l.advance(Duration::ZERO),
+        Rung::JitterWithNotice,
+        "(c)を2回試す"
+    );
     // (d) が無効なので (c) の次は即 (f)。
     assert_eq!(l.advance(Duration::ZERO), Rung::Exhausted);
-    assert_eq!(l.advance(Duration::ZERO), Rung::Exhausted, "以後も終端のまま");
+    assert_eq!(
+        l.advance(Duration::ZERO),
+        Rung::Exhausted,
+        "以後も終端のまま"
+    );
 }
 
 /// (d) が有効なら (c) の後に1回だけ再ロードを試してから諦める。
@@ -47,7 +55,11 @@ fn recycle_is_tried_once_before_giving_up() {
         l.advance(Duration::ZERO);
     }
     assert_eq!(l.current(), Rung::Recycle);
-    assert_eq!(l.advance(Duration::ZERO), Rung::Exhausted, "再ロードは1回だけ");
+    assert_eq!(
+        l.advance(Duration::ZERO),
+        Rung::Exhausted,
+        "再ロードは1回だけ"
+    );
 }
 
 /// **§11.3の進行規則**: 予算を使い切ったら段を飛ばして最終段へジャンプする。
@@ -118,9 +130,16 @@ fn the_notice_is_appended_as_a_non_cached_block_and_leaves_the_prefix_intact() {
     apply(&mut req, Rung::JitterWithNotice, 1);
 
     assert_eq!(req.system.len(), 2);
-    assert_eq!(req.system[0], original, "キャッシュ済みプレフィクスは1バイトも変えない");
+    assert_eq!(
+        req.system[0], original,
+        "キャッシュ済みプレフィクスは1バイトも変えない"
+    );
     assert!(!req.system[1].cache, "追加ブロックはキャッシュしない");
-    assert!(req.system[1].text.contains("反復"), "{}", req.system[1].text);
+    assert!(
+        req.system[1].text.contains("反復"),
+        "{}",
+        req.system[1].text
+    );
     // messagesへは足さない（role交替が崩れる）。
     assert_eq!(req.messages.len(), 1);
     // (c) は (b) を含む。
@@ -138,8 +157,13 @@ fn the_exhausted_rung_does_not_touch_the_request() {
 
 #[test]
 fn every_rung_has_a_distinct_stable_name() {
-    let names = [Rung::Jitter, Rung::JitterWithNotice, Rung::Recycle, Rung::Exhausted]
-        .map(Rung::as_str);
+    let names = [
+        Rung::Jitter,
+        Rung::JitterWithNotice,
+        Rung::Recycle,
+        Rung::Exhausted,
+    ]
+    .map(Rung::as_str);
     let unique: std::collections::BTreeSet<_> = names.iter().collect();
     assert_eq!(unique.len(), names.len());
 }

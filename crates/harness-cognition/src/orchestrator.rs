@@ -510,12 +510,9 @@ impl CognitiveOrchestrator {
             let cp = recall_checkpoint::from_census_join(&goal, &outcome.answer);
             match RecallStore::for_workspace(&ctx.workspace_root) {
                 Ok(store) => {
-                    let write_outcome = recall_write::write_checkpoint(
-                        store,
-                        self.recall_allow_unversioned,
-                        cp,
-                    )
-                    .await;
+                    let write_outcome =
+                        recall_write::write_checkpoint(store, self.recall_allow_unversioned, cp)
+                            .await;
                     emit_event(
                         events,
                         AgentEvent::MemoryCheckpointed {

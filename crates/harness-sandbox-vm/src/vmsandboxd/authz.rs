@@ -18,7 +18,6 @@
 
 use super::*;
 
-
 /// 指定PIDのプロセスのトークンSIDを取得する（S-2、`verify_pipe_client_identity`専用）。
 /// `process_is_alive`（`vmsandbox.rs`）と同じ`PROCESS_QUERY_LIMITED_INFORMATION`で
 /// `OpenProcess`する（daemonは昇格済みトークンで動作しており、同一ユーザーの他プロセスを
@@ -183,7 +182,9 @@ pub(super) fn reject_dangerous_workspace_root(canonical: &Path) -> Result<(), Vm
 /// [`access_check_write`]（`AccessCheck`Win32 APIの入力）としてのみ渡し、daemon自身の
 /// スレッドをクライアント権限へ実際に偽装することはしない。段階3で明記した方針
 /// （`verify_pipe_client_identity`のdoc参照）と同じ理由。
-pub(super) fn duplicate_client_token_for_access_check(pid: u32) -> Result<HANDLE, VmSandboxIpcError> {
+pub(super) fn duplicate_client_token_for_access_check(
+    pid: u32,
+) -> Result<HANDLE, VmSandboxIpcError> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
             .map_err(|e| VmSandboxIpcError::Ipc(format!("OpenProcess({pid}) failed: {e}")))?;

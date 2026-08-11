@@ -56,7 +56,9 @@ use runner::run_isolated;
 /// Tier1でコマンドを走らせる4番目の経路（`harness-policy-editor`の記録モード）が使う。
 /// 実体と doc は[`platform`]が持つ——印や変数名の綴りを複製しないため（B-05）。
 #[cfg(windows)]
-pub use platform::{run_shell_bootstrap_stdin, RUN_SHELL_COMMAND_ENV_VAR, RUN_SHELL_OUTPUT_SENTINEL};
+pub use platform::{
+    run_shell_bootstrap_stdin, RUN_SHELL_COMMAND_ENV_VAR, RUN_SHELL_OUTPUT_SENTINEL,
+};
 
 /// Tier2aでコマンドを走らせる5番目の経路（`harness-policy-editor`のパス2）が使う。
 /// **同じ規則に従わせるための公開**であって、判定を作り直させないためのもの（[`net_decision`]）。

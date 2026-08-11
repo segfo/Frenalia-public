@@ -27,7 +27,10 @@ pub(crate) enum WorkspaceAction {
     CreateFresh,
 }
 
-pub(crate) fn decide_workspace_action(existing_present: bool, mount_healthy: bool) -> WorkspaceAction {
+pub(crate) fn decide_workspace_action(
+    existing_present: bool,
+    mount_healthy: bool,
+) -> WorkspaceAction {
     match (existing_present, mount_healthy) {
         (true, true) => WorkspaceAction::Reuse,
         (true, false) => WorkspaceAction::Repair,
@@ -249,4 +252,3 @@ pub(crate) fn remount_workspace_share(
     )?;
     Ok(())
 }
-

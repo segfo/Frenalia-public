@@ -22,7 +22,11 @@ pub struct WriteOutcome {
 }
 
 /// checkpointを1件書く。
-pub async fn write_checkpoint(store: RecallStore, allow_unversioned: bool, cp: Checkpoint) -> WriteOutcome {
+pub async fn write_checkpoint(
+    store: RecallStore,
+    allow_unversioned: bool,
+    cp: Checkpoint,
+) -> WriteOutcome {
     let joined = tokio::task::spawn_blocking(move || store.append(&cp, allow_unversioned)).await;
 
     match joined {
@@ -36,7 +40,9 @@ pub async fn write_checkpoint(store: RecallStore, allow_unversioned: bool, cp: C
         },
         Err(join_err) => WriteOutcome {
             id: None,
-            skipped: Some(format!("internal error while writing a checkpoint: {join_err}")),
+            skipped: Some(format!(
+                "internal error while writing a checkpoint: {join_err}"
+            )),
         },
     }
 }

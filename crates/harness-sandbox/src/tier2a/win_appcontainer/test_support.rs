@@ -90,9 +90,7 @@ pub(crate) fn spawn_in_workspace(
 /// `docs/CODE-STRUCTURE-RULES.md`規則5に従い元の定義（`ace_grant_revoke_tests.rs`）から
 /// ここへ移した。前者は「保護DACL配下へ救済walkが届くか」の土台として、後者は
 /// [BUG-083](../../../../docs/bugs/BUG-083.md)の候補Bの書込経路そのものとして使う。
-pub(super) fn protect_dacl_preserve_inherited(
-    path: &std::path::Path,
-) -> windows::core::Result<()> {
+pub(super) fn protect_dacl_preserve_inherited(path: &std::path::Path) -> windows::core::Result<()> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::{
@@ -198,7 +196,8 @@ impl SubstDrive {
     /// 空きドライブレターを`Z`から降順に探して割り当てる。空きが無ければ`None`
     /// （呼び出し側はskipする）。
     pub(super) fn create() -> Option<Self> {
-        let backing = std::env::temp_dir().join(format!("harness-subst-root-{}", std::process::id()));
+        let backing =
+            std::env::temp_dir().join(format!("harness-subst-root-{}", std::process::id()));
         std::fs::create_dir_all(&backing).ok()?;
 
         for letter in ('D'..='Z').rev() {

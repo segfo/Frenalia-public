@@ -68,7 +68,11 @@ pub(crate) fn ssh_exec_checked(
 /// `mountpoint -q`だけでなく実I/O（`ls`）まで確認するのは、SMBアカウント削除後のstale mount
 /// （マウントエントリ自体は残るが認証が通らない状態、状態S5）を「マウント有り」と誤判定
 /// しないため。
-pub(crate) fn guest_workspace_mount_is_healthy(host: IpAddr, key: &Path, mount_point: &str) -> bool {
+pub(crate) fn guest_workspace_mount_is_healthy(
+    host: IpAddr,
+    key: &Path,
+    mount_point: &str,
+) -> bool {
     match ssh_exec(
         host,
         key,
@@ -121,4 +125,3 @@ pub(crate) fn ssh_push_file(
     }
     Ok(())
 }
-

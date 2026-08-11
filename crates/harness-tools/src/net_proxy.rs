@@ -418,8 +418,13 @@ async fn handle_conn(
         return Ok(());
     }
     if first[0] == 0x05 {
-        return handle_socks5(stream, policy.as_ref(), audit.as_ref(), tunnel_handler.as_ref())
-            .await;
+        return handle_socks5(
+            stream,
+            policy.as_ref(),
+            audit.as_ref(),
+            tunnel_handler.as_ref(),
+        )
+        .await;
     }
 
     let io = TokioIo::new(stream);
@@ -712,7 +717,10 @@ mod tests {
     fn no_agents_means_no_loopback_holes() {
         let ports = net_loopback_ports_for_agents(None, None);
 
-        assert!(ports.tcp.is_empty(), "穴が無い＝WFPのdefault-denyがそのまま残る");
+        assert!(
+            ports.tcp.is_empty(),
+            "穴が無い＝WFPのdefault-denyがそのまま残る"
+        );
         assert!(ports.udp.is_empty());
     }
 
@@ -741,12 +749,30 @@ mod tests {
         assert_eq!(
             env,
             vec![
-                ("ALL_PROXY".to_string(), "socks5h://127.0.0.1:18080".to_string()),
-                ("all_proxy".to_string(), "socks5h://127.0.0.1:18080".to_string()),
-                ("HTTP_PROXY".to_string(), "http://127.0.0.1:18080".to_string()),
-                ("HTTPS_PROXY".to_string(), "http://127.0.0.1:18080".to_string()),
-                ("http_proxy".to_string(), "http://127.0.0.1:18080".to_string()),
-                ("https_proxy".to_string(), "http://127.0.0.1:18080".to_string()),
+                (
+                    "ALL_PROXY".to_string(),
+                    "socks5h://127.0.0.1:18080".to_string()
+                ),
+                (
+                    "all_proxy".to_string(),
+                    "socks5h://127.0.0.1:18080".to_string()
+                ),
+                (
+                    "HTTP_PROXY".to_string(),
+                    "http://127.0.0.1:18080".to_string()
+                ),
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://127.0.0.1:18080".to_string()
+                ),
+                (
+                    "http_proxy".to_string(),
+                    "http://127.0.0.1:18080".to_string()
+                ),
+                (
+                    "https_proxy".to_string(),
+                    "http://127.0.0.1:18080".to_string()
+                ),
                 (
                     "HARNESS_FAKE_DNS_ADDR".to_string(),
                     "127.0.0.1:18053".to_string()
@@ -1222,7 +1248,11 @@ mod tests {
         let allowed_target = format!("http://localhost:{}/", target_addr.port());
         let denied_target = "http://denied.example/";
 
-        for target in [allowed_target.as_str(), denied_target, allowed_target.as_str()] {
+        for target in [
+            allowed_target.as_str(),
+            denied_target,
+            allowed_target.as_str(),
+        ] {
             client
                 .write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
                 .await
@@ -1242,10 +1272,7 @@ mod tests {
                 if line == "\r\n" {
                     break;
                 }
-                if let Some(v) = line
-                    .to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                {
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                     content_length = v.trim().parse().unwrap_or(0);
                 }
             }

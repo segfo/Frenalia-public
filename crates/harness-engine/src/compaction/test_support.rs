@@ -41,7 +41,11 @@ impl MockProvider {
         }
     }
 
-    pub fn cancelling_at(turns: Vec<Vec<StreamEvent>>, token: CancellationToken, call: usize) -> Self {
+    pub fn cancelling_at(
+        turns: Vec<Vec<StreamEvent>>,
+        token: CancellationToken,
+        call: usize,
+    ) -> Self {
         Self {
             cancel_at: Some((token, call)),
             ..Self::new(turns)

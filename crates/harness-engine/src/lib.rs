@@ -334,9 +334,10 @@ where
         // `estimated_input_tokens`が縮約後の値になり、TUI表示と実送信量が一致する。
         let pressure = assess_pressure(state, mark, last_usage, estimate_tokens(&req), &config);
         if pressure.should_compact() {
-            let outcome =
-                relieve_pressure(provider, state, &config, events, &pressure, summarized, cancel)
-                    .await?;
+            let outcome = relieve_pressure(
+                provider, state, &config, events, &pressure, summarized, cancel,
+            )
+            .await?;
             summarized |= outcome.summarized;
             // BUG-074: 予防的縮約の要約コールは数十秒かかることがある。その最中のEscで
             // 降りたなら、**リクエストを出す前に**ターンごと畳む（ループ先頭と同じ扱い）。
@@ -648,22 +649,42 @@ async fn relieve_pressure(
 
     if in_turn_tokens > prefix_tokens {
         run_step!(in_turn_digest(
-            provider, state, config, events, chunk_tokens, cancel
+            provider,
+            state,
+            config,
+            events,
+            chunk_tokens,
+            cancel
         ));
         if saved < target && summary_worth_it {
             run_step!(rolling_summary(
-                provider, state, config, events, chunk_tokens, cancel
+                provider,
+                state,
+                config,
+                events,
+                chunk_tokens,
+                cancel
             ));
         }
     } else {
         if summary_worth_it {
             run_step!(rolling_summary(
-                provider, state, config, events, chunk_tokens, cancel
+                provider,
+                state,
+                config,
+                events,
+                chunk_tokens,
+                cancel
             ));
         }
         if saved < target {
             run_step!(in_turn_digest(
-                provider, state, config, events, chunk_tokens, cancel
+                provider,
+                state,
+                config,
+                events,
+                chunk_tokens,
+                cancel
             ));
         }
     }

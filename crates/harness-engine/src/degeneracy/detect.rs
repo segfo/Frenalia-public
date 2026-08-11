@@ -186,7 +186,12 @@ impl StreamWatcher {
         let cfg = self.short_period;
         let window = cfg.window.min(self.chars.len());
         // 最低でも`max_period × min_repeats`文字は見ないと「8回繰り返した」と言えない。
-        if window < cfg.max_period.saturating_mul(cfg.min_repeats).min(cfg.window) {
+        if window
+            < cfg
+                .max_period
+                .saturating_mul(cfg.min_repeats)
+                .min(cfg.window)
+        {
             return None;
         }
         let tail = &self.chars[self.chars.len() - window..];
@@ -322,7 +327,8 @@ pub fn no_output_at_max_tokens(
     text_chars: usize,
     tool_use_blocks: usize,
 ) -> Option<(DegenerateKind, String)> {
-    if *stop_reason != harness_core::StopReason::MaxTokens || text_chars > 0 || tool_use_blocks > 0 {
+    if *stop_reason != harness_core::StopReason::MaxTokens || text_chars > 0 || tool_use_blocks > 0
+    {
         return None;
     }
     Some((

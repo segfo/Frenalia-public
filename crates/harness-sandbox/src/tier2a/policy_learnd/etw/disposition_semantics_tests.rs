@@ -200,7 +200,12 @@ fn controls_the_read_only_dacl_allows_reading_and_refuses_writing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = read_only_file(dir.path(), "control.txt");
 
-    let c1 = Observation::take("C1 READ  + FILE_OPEN(1)", &path, FILE_GENERIC_READ, FILE_OPEN);
+    let c1 = Observation::take(
+        "C1 READ  + FILE_OPEN(1)",
+        &path,
+        FILE_GENERIC_READ,
+        FILE_OPEN,
+    );
     let c2 = Observation::take(
         "C2 WRITE + FILE_OPEN(1)",
         &path,

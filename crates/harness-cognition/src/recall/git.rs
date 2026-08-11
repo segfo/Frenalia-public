@@ -52,7 +52,9 @@ fn run(dir: &Path, args: &[&str]) -> Result<(), String> {
     cmd.env("GIT_COMMITTER_NAME", "harness");
     cmd.env("GIT_COMMITTER_EMAIL", "harness@localhost");
 
-    let output = cmd.output().map_err(|e| format!("failed to run git: {e}"))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -151,6 +153,9 @@ mod tests {
         std::fs::write(dir.path().join("b.txt"), "x").unwrap();
         commit_all(dir.path(), "checkpoint: hook test").unwrap();
 
-        assert!(!marker.exists(), "post-commit hook fired despite hardening env");
+        assert!(
+            !marker.exists(),
+            "post-commit hook fired despite hardening env"
+        );
     }
 }

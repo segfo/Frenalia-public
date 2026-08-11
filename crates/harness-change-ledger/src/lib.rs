@@ -143,11 +143,13 @@ pub fn replay(entries: &[CowOpEntry]) -> Vec<CowChange> {
     let mut states: std::collections::HashMap<String, PathState> = std::collections::HashMap::new();
     for entry in entries {
         let next_order = states.len();
-        let state = states.entry(entry.path.clone()).or_insert_with(|| PathState {
-            baseline_hash: entry.baseline_hash.clone(),
-            currently_present: false,
-            order: next_order,
-        });
+        let state = states
+            .entry(entry.path.clone())
+            .or_insert_with(|| PathState {
+                baseline_hash: entry.baseline_hash.clone(),
+                currently_present: false,
+                order: next_order,
+            });
         state.currently_present = !matches!(entry.op, ChangeOp::Delete);
     }
     let mut out: Vec<(usize, CowChange)> = states
@@ -215,7 +217,14 @@ mod tests {
     fn replay_new_create_is_create() {
         let entries = vec![entry(ChangeOp::Create, "a.txt", None)];
         let changes = replay(&entries);
-        assert_eq!(changes, vec![CowChange { path: "a.txt".into(), op: ChangeOp::Create, baseline_hash: None }]);
+        assert_eq!(
+            changes,
+            vec![CowChange {
+                path: "a.txt".into(),
+                op: ChangeOp::Create,
+                baseline_hash: None
+            }]
+        );
     }
 
     #[test]
@@ -224,7 +233,11 @@ mod tests {
         let changes = replay(&entries);
         assert_eq!(
             changes,
-            vec![CowChange { path: "a.txt".into(), op: ChangeOp::Modify, baseline_hash: Some("h1".into()) }]
+            vec![CowChange {
+                path: "a.txt".into(),
+                op: ChangeOp::Modify,
+                baseline_hash: Some("h1".into())
+            }]
         );
     }
 
@@ -234,7 +247,11 @@ mod tests {
         let changes = replay(&entries);
         assert_eq!(
             changes,
-            vec![CowChange { path: "a.txt".into(), op: ChangeOp::Delete, baseline_hash: Some("h1".into()) }]
+            vec![CowChange {
+                path: "a.txt".into(),
+                op: ChangeOp::Delete,
+                baseline_hash: Some("h1".into())
+            }]
         );
     }
 
@@ -250,8 +267,16 @@ mod tests {
         assert_eq!(
             changes,
             vec![
-                CowChange { path: "new.txt".into(), op: ChangeOp::Create, baseline_hash: None },
-                CowChange { path: "old.txt".into(), op: ChangeOp::Delete, baseline_hash: Some("h1".into()) },
+                CowChange {
+                    path: "new.txt".into(),
+                    op: ChangeOp::Create,
+                    baseline_hash: None
+                },
+                CowChange {
+                    path: "old.txt".into(),
+                    op: ChangeOp::Delete,
+                    baseline_hash: Some("h1".into())
+                },
             ]
         );
     }
@@ -274,7 +299,11 @@ mod tests {
         ];
         assert_eq!(
             replay(&entries),
-            vec![CowChange { path: "a.txt".into(), op: ChangeOp::Modify, baseline_hash: Some("h1".into()) }]
+            vec![CowChange {
+                path: "a.txt".into(),
+                op: ChangeOp::Modify,
+                baseline_hash: Some("h1".into())
+            }]
         );
     }
 

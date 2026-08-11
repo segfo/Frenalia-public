@@ -37,13 +37,22 @@ mod tests {
             "",
             "call 1",
         ] {
-            assert_eq!(validate_id(evil).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                validate_id(evil).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
         }
     }
 
     #[test]
     fn accepts_normal_ids() {
-        for ok in ["call_1", "toolu_01A2b3C4", "call-abc-123", "0", "cp-123-abcdef01"] {
+        for ok in [
+            "call_1",
+            "toolu_01A2b3C4",
+            "call-abc-123",
+            "0",
+            "cp-123-abcdef01",
+        ] {
             validate_id(ok).unwrap();
         }
     }

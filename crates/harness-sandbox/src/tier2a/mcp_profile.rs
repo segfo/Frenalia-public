@@ -118,7 +118,8 @@ mod tests {
     fn the_trust_boundary_predicate_accepts_both_harness_profile_families_only() {
         assert!(is_harness_profile_name(&profile_name_for("1234-5678")));
         assert!(is_harness_profile_name(&mcp_profile_name_for(
-            "1234-5678", "docs"
+            "1234-5678",
+            "docs"
         )));
 
         for bad in [

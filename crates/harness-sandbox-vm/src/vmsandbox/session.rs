@@ -101,7 +101,6 @@ pub(crate) fn wait_for_guest_ready(
     Ok(incus)
 }
 
-
 impl VmSession {
     /// 常駐VM（`crate::vm_host::VmHost`が参照カウントで管理）へアタッチ→コンテナ作成/起動→
     /// ワークスペース資源の確保、までを一気に行う。**Phase B**: VM自体の起動は
@@ -763,4 +762,3 @@ pub(crate) fn walk_files(root: &Path) -> Result<Vec<PathBuf>, VmError> {
     }
     Ok(out)
 }
-

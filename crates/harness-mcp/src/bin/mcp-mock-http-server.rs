@@ -100,11 +100,20 @@ fn handle(mut stream: TcpStream, mode: &str) -> std::io::Result<()> {
         // 壊れた行で落ちない（本物のサーバも落ちるべきではない）。
         Err(_) => return write_response(&mut stream, 400, Some("text/plain"), "bad json", &[]),
     };
-    let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or_default();
+    let method = rpc
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
     let is_initialize = method == "initialize";
 
     if mode == "expire-session" && !is_initialize {
-        return write_response(&mut stream, 404, Some("text/plain"), "session not found", &[]);
+        return write_response(
+            &mut stream,
+            404,
+            Some("text/plain"),
+            "session not found",
+            &[],
+        );
     }
 
     // 通知（id無し）には本文を返さない。MCP仕様は202 Acceptedを定める。

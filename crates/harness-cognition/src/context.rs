@@ -134,7 +134,15 @@ impl ContextAssembler {
         tools: &ToolRegistry,
         caps: &ProviderCapabilities,
     ) -> AssembledCall {
-        self.build_with_budget(phase, input, ledger, ctx, tools, caps, self.budgets.get(phase))
+        self.build_with_budget(
+            phase,
+            input,
+            ledger,
+            ctx,
+            tools,
+            caps,
+            self.budgets.get(phase),
+        )
     }
 
     /// [`Self::build`]の予算を差し替えた版（§6.6 規則3、コンテキスト超過からの縮小再試行）。

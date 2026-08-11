@@ -252,4 +252,3 @@ pub(crate) fn fetch_and_persist_audit_log(
     std::fs::write(audit_path, stdout)?;
     Ok(())
 }
-

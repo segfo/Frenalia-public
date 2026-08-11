@@ -139,7 +139,6 @@ impl ScratchStore {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,7 +240,10 @@ mod tests {
         store.put_note("item_1", "## 要約\n\n事実A").unwrap();
         assert!(store.note_exists("item_1").unwrap());
         let notes = store.list_notes().unwrap();
-        assert_eq!(notes, vec![("item_1".to_string(), "## 要約\n\n事実A".to_string())]);
+        assert_eq!(
+            notes,
+            vec![("item_1".to_string(), "## 要約\n\n事実A".to_string())]
+        );
     }
 
     /// `Join`はnotesをファイル名（＝item_id）昇順で読む。
@@ -268,7 +270,9 @@ mod tests {
             let err = store.put_note(evil, "payload").unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "accepted {evil:?}");
         }
-        let created: Vec<_> = std::fs::read_dir(dir.path().join("notes")).unwrap().collect();
+        let created: Vec<_> = std::fs::read_dir(dir.path().join("notes"))
+            .unwrap()
+            .collect();
         assert!(created.is_empty());
     }
 }

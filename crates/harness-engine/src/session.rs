@@ -408,7 +408,10 @@ mod tests {
     fn create_new_does_not_touch_the_disk_until_the_first_message() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::create_new(dir.path()).unwrap();
-        assert!(!store.path().exists(), "空のセッションが実体を持ってはいけない");
+        assert!(
+            !store.path().exists(),
+            "空のセッションが実体を持ってはいけない"
+        );
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 
         store.append_messages(&[msg("hello")]).unwrap();

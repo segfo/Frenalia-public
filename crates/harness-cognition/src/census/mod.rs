@@ -55,7 +55,9 @@ pub enum CensusStop {
     /// worklistを網羅し、Joinまで到達した。
     Joined,
     /// 構造化出力が規定回数取れない等でこれ以上進めない（fail-closed）。
-    Blocked { reason: String },
+    Blocked {
+        reason: String,
+    },
     /// コール数の上限に当たった。
     BudgetExhausted,
     Cancelled,
@@ -540,8 +542,16 @@ mod tests {
         let mut engine2 = engine(open_scratch(dir.path()));
         let outcome2 = engine2.run_goal("調べて", &h.cx(&exec2)).await;
         assert_eq!(outcome2.stop, CensusStop::Joined);
-        assert_eq!(exec2.calls_to(Phase::Collect), 0, "2回目はCollectを呼ばない");
-        assert_eq!(exec2.calls_to(Phase::Distill), 0, "2回目はDistillを呼ばない");
+        assert_eq!(
+            exec2.calls_to(Phase::Collect),
+            0,
+            "2回目はCollectを呼ばない"
+        );
+        assert_eq!(
+            exec2.calls_to(Phase::Distill),
+            0,
+            "2回目はDistillを呼ばない"
+        );
     }
 
     /// 2. 終了条件が「worklistが空（＝全項目にnotesがある）」であること。
@@ -629,9 +639,21 @@ mod tests {
         let mut eng = engine(open_scratch(dir.path()));
         let outcome = eng.run_goal("依頼", &h.cx(&exec)).await;
 
-        assert_eq!(outcome.stop, CensusStop::Joined, "1項目の失敗で全体を止めない");
-        assert_eq!(exec.calls_to(Phase::Collect), 2, "両方のitemでCollectを試みる");
-        assert_eq!(exec.calls_to(Phase::Distill), 1, "観測が取れたitem bだけdistillする");
+        assert_eq!(
+            outcome.stop,
+            CensusStop::Joined,
+            "1項目の失敗で全体を止めない"
+        );
+        assert_eq!(
+            exec.calls_to(Phase::Collect),
+            2,
+            "両方のitemでCollectを試みる"
+        );
+        assert_eq!(
+            exec.calls_to(Phase::Distill),
+            1,
+            "観測が取れたitem bだけdistillする"
+        );
     }
 
     /// 5. 各`Distill`コールは1観測だけを見る（履歴なし・他項目の観測を混ぜない）。
@@ -677,12 +699,18 @@ mod tests {
             panic!()
         };
         assert!(first.contains("content of a"), "{first}");
-        assert!(!first.contains("content of b"), "1件目はaの観測だけ: {first}");
+        assert!(
+            !first.contains("content of b"),
+            "1件目はaの観測だけ: {first}"
+        );
         let harness_core::ContentBlock::Text(second) = &distill_calls[1].req.messages[0].content[0]
         else {
             panic!()
         };
         assert!(second.contains("content of b"), "{second}");
-        assert!(!second.contains("content of a"), "2件目はbの観測だけ: {second}");
+        assert!(
+            !second.contains("content of a"),
+            "2件目はbの観測だけ: {second}"
+        );
     }
 }

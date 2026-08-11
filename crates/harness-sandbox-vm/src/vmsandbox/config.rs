@@ -105,7 +105,9 @@ pub(crate) fn run_powershell(script: &str) -> Result<String, VmError> {
             harness_sandbox::decode_console_bytes(&output.stderr)
         )));
     }
-    Ok(harness_sandbox::decode_console_bytes(&output.stdout).trim().to_string())
+    Ok(harness_sandbox::decode_console_bytes(&output.stdout)
+        .trim()
+        .to_string())
 }
 
 /// **Phase B実機E2Eで発見したバグ**: `std::process::id()`+ミリ秒タイムスタンプという
@@ -131,4 +133,3 @@ pub(crate) fn unique_session_id() -> String {
         n
     )
 }
-

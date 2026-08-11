@@ -6,7 +6,12 @@
 
 use super::*;
 
-fn start(pid: u32, parent: Option<u32>, package: Option<&str>, seq: Option<u64>) -> ProcessStartInfo {
+fn start(
+    pid: u32,
+    parent: Option<u32>,
+    package: Option<&str>,
+    seq: Option<u64>,
+) -> ProcessStartInfo {
     ProcessStartInfo {
         pid,
         parent_pid: parent,
@@ -78,7 +83,10 @@ fn an_unrelated_package_is_out_of_scope() {
 
 #[test]
 fn package_matching_is_case_insensitive_and_rejects_an_empty_profile() {
-    assert!(package_matches_profile("HARNESS.SHELL.SANDBOX.A1B2C3", PROFILE));
+    assert!(package_matches_profile(
+        "HARNESS.SHELL.SANDBOX.A1B2C3",
+        PROFILE
+    ));
     assert!(!package_matches_profile("anything", ""));
     assert!(!package_matches_profile("", PROFILE));
 }
@@ -146,7 +154,11 @@ fn a_failed_probe_is_not_cached_so_a_later_attempt_can_succeed() {
     assert_eq!(tracker.classify(999, |_| None), ScopeVerdict::Unknown);
 
     assert_eq!(tracker.classify(999, |_| Some(true)), ScopeVerdict::InScope);
-    assert_eq!(tracker.unresolved_count(), 1, "only the first attempt counted");
+    assert_eq!(
+        tracker.unresolved_count(),
+        1,
+        "only the first attempt counted"
+    );
 }
 
 /// `ProcessStart`で分かっているPIDには照会しない（`never_probe`がpanicしないことで確認）。
@@ -230,7 +242,10 @@ fn a_first_generation_child_is_identified_by_probing_at_process_start() {
 
     // 以後、拒否イベント時にはもうprobeしない（ProcessStart時に確定済み）。
     assert_eq!(tracker.classify(100, never_probe), ScopeVerdict::InScope);
-    assert!(!tracker.package_name_ever_matched(), "package name did not help");
+    assert!(
+        !tracker.package_name_ever_matched(),
+        "package name did not help"
+    );
 }
 
 /// 第1世代がprobeで確定したあとは、子孫がsignal 2（継承）で拾える——

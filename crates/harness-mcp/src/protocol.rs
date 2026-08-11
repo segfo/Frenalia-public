@@ -322,9 +322,10 @@ mod tests {
         assert!(notification.is_server_initiated());
         assert!(!notification.matches_id(7));
 
-        let error: JsonRpcIncoming =
-            serde_json::from_str(r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"nope"}}"#)
-                .unwrap();
+        let error: JsonRpcIncoming = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"nope"}}"#,
+        )
+        .unwrap();
         assert!(error.matches_id(7));
         assert_eq!(error.error.unwrap().code, -32601);
     }

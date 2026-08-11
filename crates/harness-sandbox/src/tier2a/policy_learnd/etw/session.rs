@@ -400,7 +400,12 @@ impl EtwFsSession {
     /// これまでに観測した拒否を取り出す（セッションは動いたまま）。
     pub fn snapshot(&self) -> EtwFsOutcome {
         EtwFsOutcome {
-            denials: self.sink.denials.lock().map(|d| d.clone()).unwrap_or_default(),
+            denials: self
+                .sink
+                .denials
+                .lock()
+                .map(|d| d.clone())
+                .unwrap_or_default(),
             seen_events: self.sink.seen_events.lock().map(|c| *c).unwrap_or(0),
             observed_paths: self
                 .sink
@@ -475,7 +480,12 @@ impl EtwFsSession {
             }
         }
         EtwFsOutcome {
-            denials: self.sink.denials.lock().map(|d| d.clone()).unwrap_or_default(),
+            denials: self
+                .sink
+                .denials
+                .lock()
+                .map(|d| d.clone())
+                .unwrap_or_default(),
             seen_events: self.sink.seen_events.lock().map(|c| *c).unwrap_or(0),
             observed_paths: self
                 .sink
@@ -893,7 +903,10 @@ mod tests {
     fn filetime_converts_to_unix_milliseconds() {
         assert_eq!(filetime_to_unix_ms(116_444_736_000_000_000), 0);
         // +1秒
-        assert_eq!(filetime_to_unix_ms(116_444_736_000_000_000 + 10_000_000), 1000);
+        assert_eq!(
+            filetime_to_unix_ms(116_444_736_000_000_000 + 10_000_000),
+            1000
+        );
         // 1970年より前（あり得ないが、負のオーバーフローで巨大な値にしない）
         assert_eq!(filetime_to_unix_ms(0), 0);
     }

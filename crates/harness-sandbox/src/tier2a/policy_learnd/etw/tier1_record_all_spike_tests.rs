@@ -66,10 +66,7 @@ fn tier1_grandchild_process_is_attributed_via_parentage_without_appcontainer_sig
     // gen1 = powershell.exe（このテストプロセス自身の直接の子）。
     // gen2 = cmd.exe（`&`呼び出し演算子でpowershellの子として起動、`type`でファイルを読む）。
     let env = crate::secret_env::build_child_env();
-    let command = format!(
-        "& cmd.exe /c type \"{}\"",
-        target_file.display()
-    );
+    let command = format!("& cmd.exe /c type \"{}\"", target_file.display());
     let child = win_restricted::spawn(
         "powershell",
         &["-NoProfile", "-NonInteractive", "-Command", &command],
@@ -80,15 +77,25 @@ fn tier1_grandchild_process_is_attributed_via_parentage_without_appcontainer_sig
     .expect("spawn Tier1 powershell");
     let harness_pid = std::process::id();
     let (out, err, code) = child.write_stdin_read_output_and_wait(None).unwrap();
-    assert_eq!(code, 0, "powershell should exit cleanly: out={out:?} err={err:?}");
-    assert!(out.contains("marker"), "the grandchild should have read the marker file: {out:?}");
+    assert_eq!(
+        code, 0,
+        "powershell should exit cleanly: out={out:?} err={err:?}"
+    );
+    assert!(
+        out.contains("marker"),
+        "the grandchild should have read the marker file: {out:?}"
+    );
 
     // ETWの配送には遅延があるので待ってからドレインする（既存スパイクと同じ作法）。
     std::thread::sleep(DRAIN);
 
     let mut tracker = ScopeTracker::new("").with_harness_pid(Some(harness_pid));
     let (starts, records) = session.drain_records();
-    eprintln!("[spike] observed {} ProcessStart, {} AccessRecord", starts.len(), records.len());
+    eprintln!(
+        "[spike] observed {} ProcessStart, {} AccessRecord",
+        starts.len(),
+        records.len()
+    );
     for start in &starts {
         eprintln!(
             "[spike] ProcessStart pid={} parent={:?} image={:?}",

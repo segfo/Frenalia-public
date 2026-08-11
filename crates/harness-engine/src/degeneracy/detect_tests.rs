@@ -37,7 +37,10 @@ fn a_single_repeated_character_is_a_short_period_repeat() {
 #[test]
 fn a_repeating_block_at_the_period_limit_still_fires() {
     let mut w = watcher();
-    let block: String = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほ0123".chars().take(32).collect();
+    let block: String = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほ0123"
+        .chars()
+        .take(32)
+        .collect();
     assert_eq!(block.chars().count(), 32);
     let hit = feed(&mut w, &block.repeat(16), false);
     assert_eq!(hit.map(|h| h.0), Some(DegenerateKind::ShortPeriodRepeat));
@@ -72,10 +75,22 @@ fn ordinary_prose_is_not_a_short_period_repeat() {
     let topics = [
         ("所有権", "値の破棄責任がただ1つの束縛に紐づく"),
         ("借用", "参照を通じて一時的なアクセスだけを渡す"),
-        ("ライフタイム", "参照が有効な範囲をコンパイラへ伝える注釈である"),
-        ("内部可変性", "共有参照の下でも変更を許す型が明示的に用意されている"),
-        ("Send と Sync", "スレッド間で値や参照を渡してよいかを型が表明する"),
-        ("Drop 順序", "束縛の逆順で解放され、その順序が観測可能な副作用になる"),
+        (
+            "ライフタイム",
+            "参照が有効な範囲をコンパイラへ伝える注釈である",
+        ),
+        (
+            "内部可変性",
+            "共有参照の下でも変更を許す型が明示的に用意されている",
+        ),
+        (
+            "Send と Sync",
+            "スレッド間で値や参照を渡してよいかを型が表明する",
+        ),
+        (
+            "Drop 順序",
+            "束縛の逆順で解放され、その順序が観測可能な副作用になる",
+        ),
     ];
     let mut text = String::new();
     for (i, (name, gist)) in topics.iter().cycle().take(24).enumerate() {
@@ -99,9 +114,13 @@ fn ordinary_prose_is_not_a_short_period_repeat() {
 #[test]
 fn a_looping_paragraph_collapses_novelty() {
     let mut w = watcher();
-    let para = "この問題の原因はおそらく設定ファイルの読み込み順序にある。順序を入れ替えれば直るはずだ。\
+    let para =
+        "この問題の原因はおそらく設定ファイルの読み込み順序にある。順序を入れ替えれば直るはずだ。\
                 しかし本当にそうだろうか。もう一度確かめる必要がある。";
-    assert!(para.chars().count() > 32, "①の周期上限より長い段落であること");
+    assert!(
+        para.chars().count() > 32,
+        "①の周期上限より長い段落であること"
+    );
     let hit = feed(&mut w, &para.repeat(40), true);
     let (kind, reason) = hit.expect("同一段落の反復は新規性が枯れる");
     assert_eq!(kind, DegenerateKind::NoveltyCollapse);
@@ -120,7 +139,8 @@ fn a_single_hot_section_alone_does_not_fire() {
         min_hot_sections_suspect: 2,
     };
     let mut w = StreamWatcher::new(ShortPeriodConfig::default(), cfg);
-    let para = "この問題の原因はおそらく設定ファイルの読み込み順序にある。順序を入れ替えれば直るはずだ。";
+    let para =
+        "この問題の原因はおそらく設定ファイルの読み込み順序にある。順序を入れ替えれば直るはずだ。";
     assert!(para.chars().count() > cfg.n, "①②の対象になる長さであること");
     // ちょうど1区間分（256文字）を同一段落の反復で埋める。
     let one_section: String = para.repeat(10).chars().take(256).collect();
@@ -146,7 +166,8 @@ fn a_single_hot_section_alone_does_not_fire() {
 #[test]
 fn novelty_needs_more_consecutive_hot_sections_while_the_gate_is_closed() {
     let mut w = watcher();
-    let para = "この問題の原因はおそらく設定ファイルの読み込み順序にある。順序を入れ替えれば直るはずだ。\
+    let para =
+        "この問題の原因はおそらく設定ファイルの読み込み順序にある。順序を入れ替えれば直るはずだ。\
                 しかし本当にそうだろうか。もう一度確かめる必要がある。";
     assert_eq!(feed(&mut w, &para.repeat(40), false), None);
     // 同じ蓄積のままゲートを開けると、必要区間数が下がって発火する＝差はゲートだけ。
@@ -263,7 +284,11 @@ fn every_condition_is_required_for_the_no_output_detector() {
 #[test]
 fn reasoning_that_eats_the_budget_without_output_is_degenerate() {
     // max_tokens=1000 → 枠は4000文字相当、その60%=2400文字を超えたら発火。
-    assert_eq!(reasoning_only(2_400, 0, 0, 1_000, 0.6), None, "境界ちょうどは発火しない");
+    assert_eq!(
+        reasoning_only(2_400, 0, 0, 1_000, 0.6),
+        None,
+        "境界ちょうどは発火しない"
+    );
     let hit = reasoning_only(2_401, 0, 0, 1_000, 0.6);
     assert_eq!(hit.map(|h| h.0), Some(DegenerateKind::ReasoningOnly));
 }
@@ -284,8 +309,14 @@ fn watchers_for_different_block_kinds_do_not_share_state() {
     let mut thinking = watcher();
     let mut text = watcher();
     assert!(feed(&mut thinking, &"？".repeat(512), false).is_some());
-    assert_eq!(feed(&mut text, "了解しました。ファイルを読みます。", false), None);
-    assert_eq!(text.len(), "了解しました。ファイルを読みます。".chars().count());
+    assert_eq!(
+        feed(&mut text, "了解しました。ファイルを読みます。", false),
+        None
+    );
+    assert_eq!(
+        text.len(),
+        "了解しました。ファイルを読みます。".chars().count()
+    );
 }
 
 // --- 最小周期そのもの ---

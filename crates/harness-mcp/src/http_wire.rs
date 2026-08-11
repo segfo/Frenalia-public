@@ -107,8 +107,8 @@ pub enum HttpWireError {
 /// 解析の実装をここ1箇所に持つことで、`decl::validate`が通したURLと
 /// [`validate_endpoint`]が接続するURLが食い違わない。
 pub fn parse_endpoint_url(url: &str) -> Result<ParsedUrl, HttpWireError> {
-    let parsed = reqwest::Url::parse(url.trim())
-        .map_err(|e| HttpWireError::Unparsable(e.to_string()))?;
+    let parsed =
+        reqwest::Url::parse(url.trim()).map_err(|e| HttpWireError::Unparsable(e.to_string()))?;
     let scheme = parsed.scheme().to_ascii_lowercase();
     if scheme != "http" && scheme != "https" {
         return Err(HttpWireError::UnsupportedScheme { scheme });
@@ -511,9 +511,11 @@ mod tests {
 
     #[test]
     fn a_declared_https_url_on_the_allowlist_is_accepted() {
-        let endpoint =
-            validate_endpoint("https://mcp.corp.example/mcp", &gates(&["mcp.corp.example"], false))
-                .unwrap();
+        let endpoint = validate_endpoint(
+            "https://mcp.corp.example/mcp",
+            &gates(&["mcp.corp.example"], false),
+        )
+        .unwrap();
         assert_eq!(endpoint.host(), "mcp.corp.example");
         assert!(endpoint.is_tls());
         assert!(!endpoint.is_loopback());
@@ -546,7 +548,10 @@ mod tests {
     #[test]
     fn a_host_outside_the_allowlist_is_rejected() {
         assert!(matches!(
-            validate_endpoint("https://evil.example/mcp", &gates(&["mcp.corp.example"], false)),
+            validate_endpoint(
+                "https://evil.example/mcp",
+                &gates(&["mcp.corp.example"], false)
+            ),
             Err(HttpWireError::HostNotAllowlisted { .. })
         ));
     }
@@ -555,12 +560,18 @@ mod tests {
     #[test]
     fn plaintext_to_a_remote_host_is_rejected_before_the_allowlist_is_consulted() {
         assert_eq!(
-            validate_endpoint("http://mcp.corp.example/mcp", &gates(&["mcp.corp.example"], false)),
+            validate_endpoint(
+                "http://mcp.corp.example/mcp",
+                &gates(&["mcp.corp.example"], false)
+            ),
             Err(HttpWireError::PlaintextNotAllowed)
         );
         assert!(
-            validate_endpoint("http://mcp.corp.example/mcp", &gates(&["mcp.corp.example"], true))
-                .is_ok(),
+            validate_endpoint(
+                "http://mcp.corp.example/mcp",
+                &gates(&["mcp.corp.example"], true)
+            )
+            .is_ok(),
             "--allow-mcp-http-plaintext should open exactly this case"
         );
     }
@@ -583,7 +594,10 @@ mod tests {
     #[test]
     fn a_remote_ip_literal_is_rejected_with_its_own_reason() {
         assert_eq!(
-            validate_endpoint("https://203.0.113.10/mcp", &gates(&["*.corp.example"], false)),
+            validate_endpoint(
+                "https://203.0.113.10/mcp",
+                &gates(&["*.corp.example"], false)
+            ),
             Err(HttpWireError::IpLiteralHost {
                 host: "203.0.113.10".to_string()
             })
@@ -624,8 +638,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let expanded =
-            expand_headers(&headers, &env_of(&[("CORP_MCP_TOKEN", "s3cret")])).unwrap();
+        let expanded = expand_headers(&headers, &env_of(&[("CORP_MCP_TOKEN", "s3cret")])).unwrap();
         assert_eq!(
             expanded,
             vec![("Authorization".to_string(), "Bearer s3cret".to_string())]
@@ -635,9 +648,12 @@ mod tests {
     /// 未定義のenvは黙って空にしない（401だけが返る状態を作らない）。
     #[test]
     fn a_missing_environment_variable_is_an_error_rather_than_an_empty_value() {
-        let headers = [("Authorization".to_string(), "Bearer ${env:NOPE}".to_string())]
-            .into_iter()
-            .collect();
+        let headers = [(
+            "Authorization".to_string(),
+            "Bearer ${env:NOPE}".to_string(),
+        )]
+        .into_iter()
+        .collect();
         assert_eq!(
             expand_headers(&headers, &env_of(&[])),
             Err(HeaderError::MissingEnv {
@@ -706,8 +722,14 @@ mod tests {
             .join(":");
 
         let expected = parse_cert_pin(&format!("sha256:{SAMPLE_HEX}")).unwrap();
-        assert_eq!(parse_cert_pin(&format!("sha256:{spaced}")).unwrap(), expected);
-        assert_eq!(parse_cert_pin(&format!("SHA256:{colons}")).unwrap(), expected);
+        assert_eq!(
+            parse_cert_pin(&format!("sha256:{spaced}")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_cert_pin(&format!("SHA256:{colons}")).unwrap(),
+            expected
+        );
     }
 
     /// 短い・長い・16進でない・アルゴリズム違いは黙って通さない。

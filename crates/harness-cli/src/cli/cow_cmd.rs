@@ -6,7 +6,10 @@ use super::*;
 pub(crate) fn run_cow_subcommand(action: CowAction) -> ExitCode {
     match action {
         CowAction::List => cow_list(),
-        CowAction::Audit { session, output_format } => cow_audit(session.as_deref(), output_format),
+        CowAction::Audit {
+            session,
+            output_format,
+        } => cow_audit(session.as_deref(), output_format),
     }
 }
 
@@ -95,9 +98,10 @@ pub(crate) fn cow_list() -> ExitCode {
         };
         let live = harness_sandbox::tier2a::workspace_ledger::cow_session_is_live(&session_id);
         let files = harness_sandbox::tier2a::workspace_ledger::list_cow_upper_files(&upper_dir);
-        let workspace_root = harness_sandbox::tier2a::workspace_ledger::read_cow_session_meta(&upper_dir)
-            .map(|m| m.workspace_root)
-            .unwrap_or_else(|| "(unknown, meta file missing)".to_string());
+        let workspace_root =
+            harness_sandbox::tier2a::workspace_ledger::read_cow_session_meta(&upper_dir)
+                .map(|m| m.workspace_root)
+                .unwrap_or_else(|| "(unknown, meta file missing)".to_string());
         println!(
             "{session_id}\tworkspace={workspace_root}\t{}\tchanged_files={}",
             if live { "live" } else { "orphaned" },

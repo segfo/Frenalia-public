@@ -179,6 +179,9 @@ mod tests {
     #[test]
     fn normalization_does_not_touch_the_filesystem_so_case_and_links_are_preserved() {
         let upper = PathBuf::from(r"C:\WS\Sub");
-        assert_eq!(normalize_workspace_root(&upper), PathBuf::from(r"C:\WS\Sub"));
+        assert_eq!(
+            normalize_workspace_root(&upper),
+            PathBuf::from(r"C:\WS\Sub")
+        );
     }
 }

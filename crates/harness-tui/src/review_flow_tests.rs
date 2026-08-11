@@ -153,7 +153,10 @@ fn adopting_another_sessions_scope_switches_what_the_panel_shows() {
 
     let rows = build_change_rows(
         &open_panel_fs(ws.path(), &review_scope).unwrap(),
-        open_panel_fs(ws.path(), &review_scope).unwrap().change_set().unwrap(),
+        open_panel_fs(ws.path(), &review_scope)
+            .unwrap()
+            .change_set()
+            .unwrap(),
     );
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].label, "from-a.txt");
@@ -165,7 +168,10 @@ fn adopting_another_sessions_scope_switches_what_the_panel_shows() {
     let fs = open_panel_fs(ws.path(), &review_scope).unwrap();
     let rows = build_change_rows(&fs, fs.change_set().unwrap());
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].label, "from-b.txt", "切替後もセッションAの変更を見ている");
+    assert_eq!(
+        rows[0].label, "from-b.txt",
+        "切替後もセッションAの変更を見ている"
+    );
 }
 
 /// B-22: スコープが変わったら**開いているパネルを閉じる**。旧オーバーレイの行を見ながら
@@ -196,7 +202,10 @@ fn the_panel_title_names_the_overlay_it_shows() {
     app.note_scope(overlay_label(&a), "session-a");
     let fs = open_panel_fs(ws.path(), &a).unwrap();
     app.open_changes_panel(build_change_rows(&fs, fs.change_set().unwrap()));
-    assert_eq!(app.review_panel.as_ref().unwrap().title, "changes — session-a");
+    assert_eq!(
+        app.review_panel.as_ref().unwrap().title,
+        "changes — session-a"
+    );
 }
 
 /// `/fork`: オーバーレイをコピーして分岐する。**両方に同じ変更がある**。
@@ -257,7 +266,10 @@ fn applying_one_forked_branch_makes_the_other_conflict_instead_of_applying_twice
     };
     let report = apply_commit_selection(&fs_dst, &selection).unwrap();
     assert_eq!(report.applied, vec!["a.txt".to_string()]);
-    assert_eq!(std::fs::read_to_string(ws.path().join("a.txt")).unwrap(), "new\n");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("a.txt")).unwrap(),
+        "new\n"
+    );
 
     // 元の分岐から同じ変更をもう一度適用しようとしても、workspaceは既に書き換わっている。
     // ここが素通りすると「同じ変更が2回入る」ことになる。
@@ -282,6 +294,9 @@ fn switching_sessions_in_live_mode_is_a_no_op() {
     let scope = template.scope_for("session-x");
     assert!(scope.is_live());
     assert_eq!(overlay_label(&scope), "");
-    assert_eq!(harness_sandbox::session_scope::prepare_scope(ws.path(), &scope).unwrap(), 0);
+    assert_eq!(
+        harness_sandbox::session_scope::prepare_scope(ws.path(), &scope).unwrap(),
+        0
+    );
     assert!(!ws.path().join(".harness").exists());
 }

@@ -59,9 +59,8 @@ fn issue_certificates() -> TestCa {
     server_params
         .distinguished_name
         .push(DnType::CommonName, "127.0.0.1");
-    server_params.subject_alt_names = vec![SanType::IpAddress(std::net::IpAddr::from([
-        127, 0, 0, 1,
-    ]))];
+    server_params.subject_alt_names =
+        vec![SanType::IpAddress(std::net::IpAddr::from([127, 0, 0, 1]))];
     let server_key = KeyPair::generate().expect("server key");
     let server_cert = server_params
         .signed_by(&server_key, &ca)
@@ -70,9 +69,7 @@ fn issue_certificates() -> TestCa {
     TestCa {
         ca_pem: ca.pem(),
         server_chain: vec![server_cert.der().clone(), ca.der().clone()],
-        server_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
-            server_key.serialize_der().into(),
-        ),
+        server_key: rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
     }
 }
 
@@ -151,8 +148,8 @@ fn relay_one(
     config: Arc<rustls::ServerConfig>,
     upstream: SocketAddr,
 ) -> std::io::Result<()> {
-    let connection = rustls::ServerConnection::new(config)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let connection =
+        rustls::ServerConnection::new(config).map_err(|e| std::io::Error::other(e.to_string()))?;
     let mut tls = rustls::StreamOwned::new(connection, tcp);
 
     let request = read_http_message(&mut tls)?;
@@ -261,10 +258,7 @@ fn the_same_server_works_once_its_ca_is_trusted() {
     let ca_path = dir.path().join("ca.pem");
     std::fs::write(&ca_path, &ca.ca_pem).unwrap();
 
-    let (runtime, skipped) = start(
-        decl(&front.url(), &[]),
-        &gates_with_ca(Some(ca_path)),
-    );
+    let (runtime, skipped) = start(decl(&front.url(), &[]), &gates_with_ca(Some(ca_path)));
 
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_eq!(
@@ -399,8 +393,7 @@ fn self_signed_with_pin() -> (TestCa, String) {
         .push(DnType::CommonName, "mcp.corp.internal");
     // **接続先の名前とは合っていない**（社内のオレオレ証明書にありがちな形）。
     // ピンはこれでも通す＝名前検証を置き換えていることの証拠になる。
-    params.subject_alt_names =
-        vec![SanType::DnsName("mcp.corp.internal".try_into().unwrap())];
+    params.subject_alt_names = vec![SanType::DnsName("mcp.corp.internal".try_into().unwrap())];
     let key = KeyPair::generate().expect("key");
     let cert = params.self_signed(&key).expect("self-signed leaf");
 
@@ -454,7 +447,10 @@ fn a_mismatched_pin_refuses_the_connection() {
     assert!(runtime.tools().is_empty());
     assert_eq!(skipped.len(), 1);
     assert!(
-        skipped[0].message().to_ascii_lowercase().contains("certificate"),
+        skipped[0]
+            .message()
+            .to_ascii_lowercase()
+            .contains("certificate"),
         "{}",
         skipped[0].message()
     );
@@ -488,7 +484,10 @@ fn the_presented_certificate_can_be_inspected_before_approving() {
     // 宣言へ書くべきピンが、そのまま得られる。
     assert_eq!(presented.pin.to_declaration_string(), pin);
     assert!(presented.self_signed, "{presented:?}");
-    assert!(presented.subject.contains("mcp.corp.internal"), "{presented:?}");
+    assert!(
+        presented.subject.contains("mcp.corp.internal"),
+        "{presented:?}"
+    );
     assert_eq!(presented.issuer, presented.subject);
     assert_eq!(
         presented.subject_alt_names,

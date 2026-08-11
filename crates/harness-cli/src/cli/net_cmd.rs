@@ -104,7 +104,10 @@ pub(crate) fn format_net_audit_text(events: &[serde_json::Value]) -> String {
     output
 }
 
-pub(crate) fn format_net_audit_output(events: &[serde_json::Value], output_format: OutputFormat) -> String {
+pub(crate) fn format_net_audit_output(
+    events: &[serde_json::Value],
+    output_format: OutputFormat,
+) -> String {
     match output_format {
         OutputFormat::Json => serde_json::to_string(events).unwrap_or_else(|_| "[]".to_string()),
         OutputFormat::Jsonl => {

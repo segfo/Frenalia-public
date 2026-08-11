@@ -98,14 +98,11 @@ pub fn spawn_shell_in_workspace(
         .filter(|(_, writable)| *writable)
         .map(|(path, _)| path.clone())
         .collect();
-    let cow = req
-        .cow_upper_dir
-        .as_ref()
-        .map(|upper_dir| CowInject {
-            workspace_root: &req.workspace_root,
-            upper_dir,
-            ext_capture_roots: ext_capture_roots.as_slice(),
-        });
+    let cow = req.cow_upper_dir.as_ref().map(|upper_dir| CowInject {
+        workspace_root: &req.workspace_root,
+        upper_dir,
+        ext_capture_roots: ext_capture_roots.as_slice(),
+    });
 
     // D-54: workspaceツリーのACEはworkspace＋モード単位のcapability SID宛に付いている。
     // `preflight`が付与したのと同じ主体をこの子のトークンへ積まないと、workspaceが一切
@@ -114,7 +111,8 @@ pub fn spawn_shell_in_workspace(
         .workspace_root
         .canonicalize()
         .unwrap_or_else(|_| req.workspace_root.clone());
-    let workspace_cap = super::workspace_capability_sid(&canonical_workspace, req.workspace_mode())?;
+    let workspace_cap =
+        super::workspace_capability_sid(&canonical_workspace, req.workspace_mode())?;
 
     // D-54: 初回起動では、保護DACL配下を救済するwalkが背景で走っていることがある。終わる前に
     // コマンドを走らせると、その配下がモデルには「存在しない/読めない」と見え、原因不明の
@@ -155,13 +153,21 @@ mod tests {
             granted_passthrough: Vec::new(),
             net_capability: NetworkCapability::Deny,
         };
-        assert_eq!(base.workspace_mode(), "rwx", "通常起動 = WorkspaceWriteMode::DirectRw");
+        assert_eq!(
+            base.workspace_mode(),
+            "rwx",
+            "通常起動 = WorkspaceWriteMode::DirectRw"
+        );
 
         let cow = WorkspaceSpawn {
             cow_upper_dir: Some(PathBuf::from(r"C:\ws\.harness\upper")),
             ..base
         };
-        assert_eq!(cow.workspace_mode(), "ro", "--cow = WorkspaceWriteMode::Cow");
+        assert_eq!(
+            cow.workspace_mode(),
+            "ro",
+            "--cow = WorkspaceWriteMode::Cow"
+        );
     }
 
     /// ext captureの対象は**書込可の穴だけ**（読み取り専用の穴はCoWの記録対象ではない）。

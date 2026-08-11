@@ -296,11 +296,19 @@ fn the_same_declaration_starts_only_after_it_is_approved() {
     let store = ApprovalStore::at_path(dir.path().join("ledger.json"));
     let decl = decl_with(&[("search", RiskClass::ReadOnly)]);
 
-    let plan = McpRuntime::plan(std::slice::from_ref(&decl), &store.load(), &McpGates::default());
+    let plan = McpRuntime::plan(
+        std::slice::from_ref(&decl),
+        &store.load(),
+        &McpGates::default(),
+    );
     assert!(plan.approved.is_empty());
 
     store.approve(&decl);
-    let plan = McpRuntime::plan(std::slice::from_ref(&decl), &store.load(), &McpGates::default());
+    let plan = McpRuntime::plan(
+        std::slice::from_ref(&decl),
+        &store.load(),
+        &McpGates::default(),
+    );
     assert_eq!(plan.approved.len(), 1);
 
     let (runtime, skipped) = start(decl, Vec::new());

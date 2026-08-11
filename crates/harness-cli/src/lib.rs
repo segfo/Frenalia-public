@@ -221,7 +221,14 @@ pub async fn run_headless<W: Write>(
                         let _ = writeln!(writer, "{line}");
                     }
                 }
-                record_event(&ev, &mut turns, &mut usage, &mut pending, &mut tool_calls, &mut discarded_turns);
+                record_event(
+                    &ev,
+                    &mut turns,
+                    &mut usage,
+                    &mut pending,
+                    &mut tool_calls,
+                    &mut discarded_turns,
+                );
             }
 
             if output_format == OutputFormat::Json {

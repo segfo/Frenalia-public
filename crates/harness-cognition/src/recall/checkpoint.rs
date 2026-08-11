@@ -319,12 +319,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut mem = WorkingMemory::new();
         mem.add_goal("調査中", vec![]);
-        let cp = from_working_memory(
-            "調査中",
-            &mem,
-            &HivStop::BudgetExhausted,
-            dir.path(),
-        );
+        let cp = from_working_memory("調査中", &mem, &HivStop::BudgetExhausted, dir.path());
         assert!(cp.is_none());
     }
 
@@ -344,9 +339,7 @@ mod tests {
         assert!(from_working_memory(
             "g",
             &mem,
-            &HivStop::Blocked {
-                reason: "x".into()
-            },
+            &HivStop::Blocked { reason: "x".into() },
             dir.path()
         )
         .is_none());

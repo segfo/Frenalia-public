@@ -120,7 +120,11 @@ impl McpClient {
         arguments: serde_json::Value,
         timeout: Duration,
     ) -> Result<ToolsCallResult, McpError> {
-        self.request_as("tools/call", Some(tools_call_params(tool, arguments)), timeout)
+        self.request_as(
+            "tools/call",
+            Some(tools_call_params(tool, arguments)),
+            timeout,
+        )
     }
 
     pub fn shutdown(&self) {
@@ -337,8 +341,7 @@ mod tests {
         (McpClient::new("docs", Box::new(transport)), sent)
     }
 
-    const INIT_OK: &str =
-        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"mock","version":"1"}}}"#;
+    const INIT_OK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"mock","version":"1"}}}"#;
 
     /// **完了条件のgolden**: `tools/list`の往復。送信バイト列と受信の解釈の両方を固定する。
     #[test]

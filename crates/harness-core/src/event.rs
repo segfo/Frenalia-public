@@ -284,7 +284,10 @@ mod tests {
     #[test]
     fn the_marker_is_self_describing_and_terminated() {
         let m = discarded_marker(DegenerateKind::ShortPeriodRepeat.as_str(), 1_234);
-        assert_eq!(m, "\x1e[harness:discarded bytes=1234 reason=short_period_repeat]\n");
+        assert_eq!(
+            m,
+            "\x1e[harness:discarded bytes=1234 reason=short_period_repeat]\n"
+        );
         assert!(m.starts_with('\x1e'), "端末で不可視なRSで始まる");
         assert!(m.ends_with('\n'), "行として完結する");
     }

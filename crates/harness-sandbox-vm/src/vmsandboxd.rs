@@ -51,8 +51,8 @@ use windows::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, WaitForSingleObject,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -199,7 +199,6 @@ pub use client::{
     prepare_pipe, run_gc_only, stop_resident_daemon_if_idle, PreparedPipe, VmSandboxHandle,
 };
 pub use daemon::{serve_gc, serve_resident};
-
 
 #[cfg(test)]
 mod tests {

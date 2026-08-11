@@ -64,8 +64,13 @@ impl Tool for ReadFileTool {
         let cow_upper_dir = ctx.cow_upper_dir.clone();
         let path_for_err = input.path.clone();
         let content = tokio::task::spawn_blocking(move || -> Result<String, ToolError> {
-            let fs = SandboxFs::open_with_cow(&workspace_root, &staging, &read_scope, cow_upper_dir.as_deref())
-                .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
+            let fs = SandboxFs::open_with_cow(
+                &workspace_root,
+                &staging,
+                &read_scope,
+                cow_upper_dir.as_deref(),
+            )
+            .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
             fs.read_to_string(&path_for_err)
                 .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))
         })
@@ -136,8 +141,13 @@ impl Tool for WriteFileTool {
         let path_for_output = input.path.clone();
         let bytes_written = input.content.len();
         tokio::task::spawn_blocking(move || -> Result<(), ToolError> {
-            let fs = SandboxFs::open_with_cow(&workspace_root, &staging, &read_scope, cow_upper_dir.as_deref())
-                .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
+            let fs = SandboxFs::open_with_cow(
+                &workspace_root,
+                &staging,
+                &read_scope,
+                cow_upper_dir.as_deref(),
+            )
+            .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
             fs.write_string(&path_for_err, &input.content)
                 .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))
         })
@@ -203,8 +213,13 @@ impl Tool for EditFileTool {
         let cow_upper_dir = ctx.cow_upper_dir.clone();
         let path_for_err = input.path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), ToolError> {
-            let fs = SandboxFs::open_with_cow(&workspace_root, &staging, &read_scope, cow_upper_dir.as_deref())
-                .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
+            let fs = SandboxFs::open_with_cow(
+                &workspace_root,
+                &staging,
+                &read_scope,
+                cow_upper_dir.as_deref(),
+            )
+            .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
             let content = fs
                 .read_to_string(&path_for_err)
                 .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;

@@ -225,10 +225,7 @@ pub enum Resolution {
 
 /// 矛盾する2件の証拠を決着させる。**追加のLLMコールを使わない**——決着の規則は§4.3が
 /// 既に決めており、モデルに問い直すと同じ入力から違う答えが返り得るため。
-pub fn resolve_conflict(
-    a: (TrustLevel, Freshness),
-    b: (TrustLevel, Freshness),
-) -> Resolution {
+pub fn resolve_conflict(a: (TrustLevel, Freshness), b: (TrustLevel, Freshness)) -> Resolution {
     match a.0.cmp(&b.0) {
         std::cmp::Ordering::Greater => return Resolution::First,
         std::cmp::Ordering::Less => return Resolution::Second,
@@ -397,7 +394,9 @@ mod tests {
         let mut memory_fresh = validity(Grade::Unverified, TrustLevel::Low);
         memory_fresh.freshness = Freshness::Fresh;
         assert!(
-            memory_fresh.describe(SourceKind::Memory).contains("鮮度:fresh"),
+            memory_fresh
+                .describe(SourceKind::Memory)
+                .contains("鮮度:fresh"),
             "{}",
             memory_fresh.describe(SourceKind::Memory)
         );
@@ -405,7 +404,9 @@ mod tests {
         let mut memory_stale = validity(Grade::Unverified, TrustLevel::Low);
         memory_stale.freshness = Freshness::Stale;
         assert!(
-            memory_stale.describe(SourceKind::Memory).contains("鮮度:stale"),
+            memory_stale
+                .describe(SourceKind::Memory)
+                .contains("鮮度:stale"),
             "{}",
             memory_stale.describe(SourceKind::Memory)
         );

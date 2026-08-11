@@ -82,7 +82,8 @@ pub const DIGEST_BATCH_TOKENS: u64 = 6_000;
 
 /// 抽出型の指示。「要約」ではなく「必要な事実の抜き出し」を求める——推測や結論を書かせると、
 /// 元の出力に無いことが履歴に残り、後続のターンがそれを事実として扱う。
-const DIGEST_INSTRUCTION: &str = "You are compressing the tool outputs above so they fit a smaller \
+const DIGEST_INSTRUCTION: &str =
+    "You are compressing the tool outputs above so they fit a smaller \
 context window. For each output, extract only what is needed to continue the task stated at the \
 top: file paths, identifiers, signatures, key facts, numbers, and error messages — verbatim when \
 short. Do not infer, do not draw conclusions, do not restate these instructions. Keep the outputs \
@@ -135,7 +136,8 @@ pub async fn digest_tool_results(
     // （バッチが空のときに開始だけ通知すると、何もしていない記録行が残る）。
     crate::emit(events, AgentEvent::ContextCompactionStarted);
 
-    let Some(digest) = call_digest(provider, state, model, turn_start, &batch, cancel).await? else {
+    let Some(digest) = call_digest(provider, state, model, turn_start, &batch, cancel).await?
+    else {
         return Ok(DigestOutcome {
             cancelled: true,
             ..Default::default()
@@ -147,7 +149,10 @@ pub async fn digest_tool_results(
     }
 
     // 書き戻し。digest本文は**バッチ先頭のブロック**へ入れ、後続は先頭逐語＋「上へまとめた」印。
-    let omitted_total: usize = batch.iter().map(|c| c.chars.saturating_sub(VERBATIM_HEAD_CHARS)).sum();
+    let omitted_total: usize = batch
+        .iter()
+        .map(|c| c.chars.saturating_sub(VERBATIM_HEAD_CHARS))
+        .sum();
     let count = batch.len();
     let mut saved_chars: u64 = 0;
     let mut digested_blocks = 0;
@@ -171,7 +176,8 @@ pub async fn digest_tool_results(
             // 却って伸びるなら触らない（小さいブロックで起こり得る）。
             continue;
         }
-        let ContentBlock::ToolResult { content, .. } = &mut state.messages[cand.mi].content[cand.bi]
+        let ContentBlock::ToolResult { content, .. } =
+            &mut state.messages[cand.mi].content[cand.bi]
         else {
             continue;
         };
@@ -389,7 +395,9 @@ mod tests {
         let mut state = ConversationState::new(Vec::new());
         state.messages.push(user_turn("read the bug catalog"));
         for i in 0..rounds {
-            state.messages.extend(tool_round(&format!("call_{i}"), chars));
+            state
+                .messages
+                .extend(tool_round(&format!("call_{i}"), chars));
         }
         state
     }
@@ -407,7 +415,8 @@ mod tests {
         let before_blocks: usize = state.messages.iter().map(|m| m.content.len()).sum();
         let scope = digest_scope(&state);
 
-        let provider = MockProvider::new(vec![summary_turn("・BUG-070: 進捗が無く連打される\n・…")]);
+        let provider =
+            MockProvider::new(vec![summary_turn("・BUG-070: 進捗が無く連打される\n・…")]);
         let out = digest_tool_results(&provider, &mut state, "mock", scope, 1_000_000, None, None)
             .await
             .unwrap();
@@ -417,7 +426,11 @@ mod tests {
         assert_eq!(provider.calls_made(), 1, "バッチ全体で1コール");
         assert_eq!(state.messages.len(), before_messages);
         assert_eq!(
-            state.messages.iter().map(|m| m.content.len()).sum::<usize>(),
+            state
+                .messages
+                .iter()
+                .map(|m| m.content.len())
+                .sum::<usize>(),
             before_blocks
         );
 
@@ -457,9 +470,16 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(contents[0].starts_with("# file 0 header"), "{}", &contents[0][..40]);
+        assert!(
+            contents[0].starts_with("# file 0 header"),
+            "{}",
+            &contents[0][..40]
+        );
         assert!(contents[0].contains("DIGEST-BODY"), "先頭にdigest本文");
-        assert!(contents[1].starts_with("# file 1 header"), "先頭は逐語で残る");
+        assert!(
+            contents[1].starts_with("# file 1 header"),
+            "先頭は逐語で残る"
+        );
         assert!(contents[1].contains("folded into the digest above"));
         assert!(!contents[1].contains("DIGEST-BODY"), "digestを複製しない");
     }
@@ -479,9 +499,10 @@ mod tests {
         assert_eq!(first.digested_blocks, 3, "1回で全部やらない");
 
         // 残った1件（＋新たな溜まり）は次の周回で畳まれる。
-        let second = digest_tool_results(&provider, &mut state, "mock", scope, u64::MAX, None, None)
-            .await
-            .unwrap();
+        let second =
+            digest_tool_results(&provider, &mut state, "mock", scope, u64::MAX, None, None)
+                .await
+                .unwrap();
         assert!(
             second.is_noop(),
             "残り1件は`DIGEST_MIN_BATCH_CHARS`未満なのでコールしない: {second:?}"
@@ -502,7 +523,9 @@ mod tests {
 
         // さらに5件読む。
         for i in 5..10 {
-            state.messages.extend(tool_round(&format!("call_{i}"), 8_000));
+            state
+                .messages
+                .extend(tool_round(&format!("call_{i}"), 8_000));
         }
         let out = digest_tool_results(&provider, &mut state, "mock", scope, 1_000_000, None, None)
             .await
@@ -510,10 +533,16 @@ mod tests {
 
         // 1回目でdigestした3件は候補から外れる（目印で識別）。残り＝逐語のまま溜まった
         // 5件（index 3,4と新規5件のうち直近2件を除く）から、絶対上限ぶんの3件を畳む。
-        assert_eq!(out.digested_blocks, 3, "上限で切りつつ、新しく読んだぶんだけを対象にする");
+        assert_eq!(
+            out.digested_blocks, 3,
+            "上限で切りつつ、新しく読んだぶんだけを対象にする"
+        );
         assert_eq!(provider.calls_made(), 2);
         let lengths = crate::compaction::test_support::tool_result_lengths(&state.messages);
-        assert!(lengths[0] < 2_000, "1回目のdigestは畳み直されない: {lengths:?}");
+        assert!(
+            lengths[0] < 2_000,
+            "1回目のdigestは畳み直されない: {lengths:?}"
+        );
         assert_eq!(lengths[8], 8_000, "直近2件は逐語のまま");
         assert_eq!(lengths[9], 8_000);
     }
@@ -558,9 +587,17 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let out = digest_tool_results(&provider, &mut state, "mock", scope, 1_000_000, None, Some(&cancel))
-            .await
-            .unwrap();
+        let out = digest_tool_results(
+            &provider,
+            &mut state,
+            "mock",
+            scope,
+            1_000_000,
+            None,
+            Some(&cancel),
+        )
+        .await
+        .unwrap();
 
         assert!(out.cancelled);
         assert!(out.is_noop());
@@ -578,7 +615,9 @@ mod tests {
         // いまのターン。
         state.messages.push(user_turn("current turn"));
         for i in 0..4 {
-            state.messages.extend(tool_round(&format!("call_{i}"), 8_000));
+            state
+                .messages
+                .extend(tool_round(&format!("call_{i}"), 8_000));
         }
         let scope = protect_boundary(&state.messages, 1).unwrap();
 

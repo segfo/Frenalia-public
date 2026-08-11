@@ -21,11 +21,15 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
     ea_length: u32,
 ) -> NTSTATUS {
     if let Some(_guard) = ReentryGuard::try_acquire() {
-        if let (Some(cfg), Some(path)) = (
-            CONFIG.get(),
-            unsafe { object_attributes_path(object_attributes) },
-        ) {
-            if let Some(Classified { rel, ledger_key: rel_str, kind }) = classify_target(cfg, &path) {
+        if let (Some(cfg), Some(path)) = (CONFIG.get(), unsafe {
+            object_attributes_path(object_attributes)
+        }) {
+            if let Some(Classified {
+                rel,
+                ledger_key: rel_str,
+                kind,
+            }) = classify_target(cfg, &path)
+            {
                 let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
                     || rel_str.to_ascii_lowercase().contains("grandchild");
                 if is_probe {
@@ -70,9 +74,11 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
                     track_new_handle(file_handle, status, &rel_str, create_options.0);
                     return status;
                 }
-                if let Some(status) =
-                    check_deleted(cfg, &rel_str, is_create_capable_disposition(create_disposition.0))
-                {
+                if let Some(status) = check_deleted(
+                    cfg,
+                    &rel_str,
+                    is_create_capable_disposition(create_disposition.0),
+                ) {
                     if is_probe {
                         debug_log(&format!(
                             "hooked_nt_create_file: rel={rel_str:?} check_deleted short-circuit status={status:?}"
@@ -228,13 +234,21 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
 
 /// 呼び出しが成功していれば、生成されたハンドルをハンドル→パス対応表へ登録し、
 /// `FILE_DELETE_ON_CLOSE`が立っていれば削除予定集合にも加える（設計書§19.6）。
-pub(crate) fn track_new_handle(file_handle: *mut HANDLE, status: NTSTATUS, rel_str: &str, create_options: u32) {
+pub(crate) fn track_new_handle(
+    file_handle: *mut HANDLE,
+    status: NTSTATUS,
+    rel_str: &str,
+    create_options: u32,
+) {
     if status.is_err() {
         return;
     }
     let handle = unsafe { *file_handle };
     let key = handle.0 as isize;
-    handle_paths().lock().unwrap().insert(key, rel_str.to_string());
+    handle_paths()
+        .lock()
+        .unwrap()
+        .insert(key, rel_str.to_string());
     if create_options & FILE_DELETE_ON_CLOSE.0 != 0 {
         delete_pending().lock().unwrap().insert(key);
     }
@@ -251,11 +265,15 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
     // `NtOpenFile`はcreate dispositionを取らない（常に`FILE_OPEN`相当）ため、write intentは
     // desired_accessのみで判定する。既存ファイルの書込open（copy-up要）が主な対象。
     if let Some(_guard) = ReentryGuard::try_acquire() {
-        if let (Some(cfg), Some(path)) = (
-            CONFIG.get(),
-            unsafe { object_attributes_path(object_attributes) },
-        ) {
-            if let Some(Classified { rel, ledger_key: rel_str, kind }) = classify_target(cfg, &path) {
+        if let (Some(cfg), Some(path)) = (CONFIG.get(), unsafe {
+            object_attributes_path(object_attributes)
+        }) {
+            if let Some(Classified {
+                rel,
+                ledger_key: rel_str,
+                kind,
+            }) = classify_target(cfg, &path)
+            {
                 let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
                     || rel_str.to_ascii_lowercase().contains("grandchild");
                 if is_probe {
@@ -268,8 +286,11 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
                 }
                 // BUG-066: upper配下の実体を直接開いている（`hooked_nt_create_file`と同じ理由）。
                 if kind == TargetKind::UpperAlias {
-                    if should_redirect_write(is_write_intent(desired_access, None), open_options, None)
-                    {
+                    if should_redirect_write(
+                        is_write_intent(desired_access, None),
+                        open_options,
+                        None,
+                    ) {
                         record_upper_alias_write(cfg, &rel_str);
                     }
                     let hook = OPEN_FILE_HOOK.get().expect("hook installed");
@@ -296,7 +317,8 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
                     }
                     return status;
                 }
-                if should_redirect_write(is_write_intent(desired_access, None), open_options, None) {
+                if should_redirect_write(is_write_intent(desired_access, None), open_options, None)
+                {
                     let upper_path = cfg.upper_dir.join(&rel);
                     copy_up(cfg, &rel_str, &path, &upper_path);
                     let upper_wide: Vec<u16> = nt_path_wide(&upper_path);
@@ -472,8 +494,11 @@ pub(crate) unsafe fn rewrite_rename_target(
 ) -> Option<(Vec<u8>, usize)> {
     let old_rel = handle_paths().lock().unwrap().get(&handle_key).cloned()?;
     let new_path = unsafe { rename_target_path(info_ptr) }?;
-    let Classified { rel: new_rel, ledger_key: new_rel_str, kind: _ } =
-        classify_target(cfg, &new_path)?;
+    let Classified {
+        rel: new_rel,
+        ledger_key: new_rel_str,
+        kind: _,
+    } = classify_target(cfg, &new_path)?;
     // `kind`で分岐しないのは、`UpperAlias`でも`rel`がupperルートからの相対なので
     // `upper_dir.join(&new_rel)`が**移動先そのもの**（恒等）になるため。台帳の2行
     // （旧パスDelete＋新パスCreate/Modify）はどちらの種別でも同じように要る。
@@ -487,12 +512,19 @@ pub(crate) unsafe fn rewrite_rename_target(
     let old_baseline = baseline_hash_for(cfg, &old_rel);
     append_ledger_entry(cfg, ChangeOp::Delete, &old_rel, old_baseline);
     let new_baseline = baseline_hash_for(cfg, &new_rel_str);
-    let new_op = if new_baseline.is_some() { ChangeOp::Modify } else { ChangeOp::Create };
+    let new_op = if new_baseline.is_some() {
+        ChangeOp::Modify
+    } else {
+        ChangeOp::Create
+    };
     append_ledger_entry(cfg, new_op, &new_rel_str, new_baseline);
 
     // 以降このハンドルに対する操作（例: リネーム直後の削除予約）は新パスを指すべきなので、
     // 対応表を更新しておく。
-    handle_paths().lock().unwrap().insert(handle_key, new_rel_str);
+    handle_paths()
+        .lock()
+        .unwrap()
+        .insert(handle_key, new_rel_str);
 
     Some(buf)
 }
@@ -542,7 +574,15 @@ pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
         }
     }
     let hook = SET_INFO_HOOK.get().expect("hook installed");
-    unsafe { hook.call(file_handle, io_status_block, file_information, length, file_information_class) }
+    unsafe {
+        hook.call(
+            file_handle,
+            io_status_block,
+            file_information,
+            length,
+            file_information_class,
+        )
+    }
 }
 
 pub(crate) unsafe extern "system" fn hooked_nt_close(handle: HANDLE) -> NTSTATUS {
@@ -569,11 +609,15 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_full_attributes_file(
     file_information: *mut windows::Wdk::Storage::FileSystem::FILE_NETWORK_OPEN_INFORMATION,
 ) -> NTSTATUS {
     if let Some(_guard) = ReentryGuard::try_acquire() {
-        if let (Some(cfg), Some(path)) = (
-            CONFIG.get(),
-            unsafe { object_attributes_path(object_attributes) },
-        ) {
-            if let Some(Classified { rel, ledger_key: rel_str, kind }) = classify_target(cfg, &path) {
+        if let (Some(cfg), Some(path)) = (CONFIG.get(), unsafe {
+            object_attributes_path(object_attributes)
+        }) {
+            if let Some(Classified {
+                rel,
+                ledger_key: rel_str,
+                kind,
+            }) = classify_target(cfg, &path)
+            {
                 // upper配下の実体そのものへの照会は、見せ方を変えない（素通し）。
                 if kind == TargetKind::UpperAlias {
                     let hook = QUERY_FULL_ATTR_HOOK.get().expect("hook installed");
@@ -631,11 +675,15 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_attributes_file(
     file_information: *mut windows::Wdk::Storage::FileSystem::FILE_BASIC_INFORMATION,
 ) -> NTSTATUS {
     if let Some(_guard) = ReentryGuard::try_acquire() {
-        if let (Some(cfg), Some(path)) = (
-            CONFIG.get(),
-            unsafe { object_attributes_path(object_attributes) },
-        ) {
-            if let Some(Classified { rel, ledger_key: rel_str, kind }) = classify_target(cfg, &path) {
+        if let (Some(cfg), Some(path)) = (CONFIG.get(), unsafe {
+            object_attributes_path(object_attributes)
+        }) {
+            if let Some(Classified {
+                rel,
+                ledger_key: rel_str,
+                kind,
+            }) = classify_target(cfg, &path)
+            {
                 // upper配下の実体そのものへの照会は、見せ方を変えない（素通し）。
                 if kind == TargetKind::UpperAlias {
                     let hook = QUERY_ATTR_HOOK.get().expect("hook installed");

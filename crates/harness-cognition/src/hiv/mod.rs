@@ -391,12 +391,16 @@ impl HivEngine {
 
             match pick.trust {
                 RecallTrust::NeedsVerification => {
-                    self.mem
-                        .add_unknown(format!("記憶{}の内容を再検証する: {}", meta.id, meta.summary));
+                    self.mem.add_unknown(format!(
+                        "記憶{}の内容を再検証する: {}",
+                        meta.id, meta.summary
+                    ));
                 }
                 RecallTrust::Ambiguous => {
-                    self.mem
-                        .add_unknown(format!("記憶{}の内容を再検証する: {}", meta.id, meta.summary));
+                    self.mem.add_unknown(format!(
+                        "記憶{}の内容を再検証する: {}",
+                        meta.id, meta.summary
+                    ));
                     self.mem.add_open_question(
                         format!(
                             "過去の記憶{}（{}）が現在のゴールに関連するか判断が曖昧だった。",
@@ -720,9 +724,11 @@ impl HivEngine {
     /// ユーザにも次ラウンドのモデルにも「何が足りないか」として見える。
     fn can_confirm(&self, hyp: HypId) -> Result<(), String> {
         if !self.mem.has_grounded_support(hyp) {
-            return Err("ワークスペースのファイル・shell実行・MCPのいずれかで直接観測した証拠が無い\
+            return Err(
+                "ワークスペースのファイル・shell実行・MCPのいずれかで直接観測した証拠が無い\
                  （web・モデルの内部知識だけでは確証にしない）"
-                .to_string());
+                    .to_string(),
+            );
         }
         let conflicts = self.mem.unresolved_conflicts(hyp);
         if !conflicts.is_empty() {
@@ -1143,7 +1149,10 @@ mod tests {
         e.mem.record_conflict(a, b);
         let err = e.can_confirm(h).unwrap_err();
         assert!(err.contains("未決着の矛盾"), "{err}");
-        assert!(err.contains(&a.label()) && err.contains(&b.label()), "{err}");
+        assert!(
+            err.contains(&a.label()) && err.contains(&b.label()),
+            "{err}"
+        );
     }
 
     /// 自己申告の`confirms`がweb証拠だけで来ても`Confirmed`へ上げず、不足を記録する。

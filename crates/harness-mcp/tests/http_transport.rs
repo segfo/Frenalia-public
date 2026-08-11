@@ -52,9 +52,15 @@ fn a_json_mode_server_completes_the_handshake_and_registers_namespaced_tools() {
         ]
     );
 
-    let search = tools.iter().find(|t| t.name() == "mcp__mock__search").unwrap();
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "mcp__mock__search")
+        .unwrap();
     assert_eq!(search.risk(&serde_json::json!({})), RiskClass::ReadOnly);
-    assert_eq!(search.input_schema()["properties"]["query"]["type"], "string");
+    assert_eq!(
+        search.input_schema()["properties"]["query"]["type"],
+        "string"
+    );
 }
 
 /// **完了条件のgolden**: 同じ往復が`text/event-stream`の応答でも成立する。
@@ -72,14 +78,14 @@ async fn tools_call_round_trips_over_http_without_explicit_nulls() {
     let server = MockServer::start("json");
     let (runtime, _skipped) = start(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
     let tools = runtime.tools();
-    let search = tools.iter().find(|t| t.name() == "mcp__mock__search").unwrap();
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "mcp__mock__search")
+        .unwrap();
 
     let ctx = ToolCtx::new(std::path::PathBuf::from("."));
     let out = search
-        .call(
-            serde_json::json!({ "query": "hello", "limit": null }),
-            &ctx,
-        )
+        .call(serde_json::json!({ "query": "hello", "limit": null }), &ctx)
         .await
         .unwrap();
     assert!(!out.is_error, "{out:?}");
@@ -97,7 +103,10 @@ async fn tools_call_round_trips_over_sse() {
     let server = MockServer::start("sse");
     let (runtime, _skipped) = start(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
     let tools = runtime.tools();
-    let search = tools.iter().find(|t| t.name() == "mcp__mock__search").unwrap();
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "mcp__mock__search")
+        .unwrap();
 
     let ctx = ToolCtx::new(std::path::PathBuf::from("."));
     let out = search
@@ -116,7 +125,10 @@ fn the_session_id_and_negotiated_protocol_version_are_sent_on_later_requests() {
     let server = MockServer::start("json");
     let (runtime, _skipped) = start(decl(&server.url(), &[]));
     let tools = runtime.tools();
-    let search = tools.iter().find(|t| t.name() == "mcp__mock__search").unwrap();
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "mcp__mock__search")
+        .unwrap();
 
     let seen = search.description();
     assert!(seen.contains("session=mock-session-1"), "{seen}");
@@ -138,7 +150,10 @@ fn declared_headers_reach_the_server() {
     let (runtime, skipped) = start(d);
     assert!(skipped.is_empty(), "{skipped:?}");
     let tools = runtime.tools();
-    let search = tools.iter().find(|t| t.name() == "mcp__mock__search").unwrap();
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "mcp__mock__search")
+        .unwrap();
     assert!(
         search.description().contains("authorization=Bearer s3cret"),
         "{}",
@@ -181,7 +196,10 @@ fn an_expired_session_fails_closed_with_an_explanation() {
     assert_eq!(skipped.len(), 1);
     let message = skipped[0].message();
     assert!(message.contains("session is gone"), "{message}");
-    assert!(message.contains("does not silently re-initialize"), "{message}");
+    assert!(
+        message.contains("does not silently re-initialize"),
+        "{message}"
+    );
 }
 
 /// 非2xxはエラーになり、**本文が診断へ載る**（原因が届かないと切り分けられない）。
@@ -192,7 +210,11 @@ fn a_server_error_is_reported_with_its_body() {
 
     assert!(runtime.tools().is_empty());
     assert_eq!(skipped.len(), 1);
-    assert!(skipped[0].message().contains("HTTP 500"), "{:?}", skipped[0]);
+    assert!(
+        skipped[0].message().contains("HTTP 500"),
+        "{:?}",
+        skipped[0]
+    );
 }
 
 /// 起動に失敗したサーバは報告され、ツールを1つも登録しない（stdio側と同じ扱い）。
@@ -203,7 +225,10 @@ fn a_server_that_fails_to_initialize_registers_nothing() {
 
     assert!(runtime.tools().is_empty());
     assert_eq!(skipped.len(), 1);
-    assert!(skipped[0].message().contains("failed to start"), "{skipped:?}");
+    assert!(
+        skipped[0].message().contains("failed to start"),
+        "{skipped:?}"
+    );
 }
 
 /// **完了条件**: 宣言の無いツール・サーバが`readOnlyHint`を自称するツールは、どちらも
@@ -250,7 +275,10 @@ async fn calls_after_shutdown_fail_rather_than_hanging() {
     let server = MockServer::start("json");
     let (mut runtime, _skipped) = start(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
     let tools = runtime.tools();
-    let search = tools.iter().find(|t| t.name() == "mcp__mock__search").unwrap();
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "mcp__mock__search")
+        .unwrap();
     runtime.shutdown();
 
     let ctx = ToolCtx::new(std::path::PathBuf::from("."));

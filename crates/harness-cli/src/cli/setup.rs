@@ -18,7 +18,11 @@ pub(crate) fn parse_require_sandbox(value: Option<&str>) -> RequireSandbox {
 /// 明示指定が無い場合は常に`Live`（オプトイン。書込/読取の防御はシェル隔離Tierに委ねる、
 /// D-29）。`live`分岐は他の2フラグが立っていなければ既定でも同じ結果になるため論理的には
 /// 冗長だが、`cli.live`を読む唯一の箇所なのでdead-code警告を避けるために明示しておく。
-pub(crate) fn resolve_staging_mode(live: bool, staged: bool, workspace_commit: bool) -> StagingMode {
+pub(crate) fn resolve_staging_mode(
+    live: bool,
+    staged: bool,
+    workspace_commit: bool,
+) -> StagingMode {
     if live {
         StagingMode::Live
     } else if staged {
@@ -41,7 +45,10 @@ pub(crate) use harness_sandbox::session_scope::{
 /// （`sandbox_dir_for_session`と同じ採番元）。`--cow`指定時に`ProjectDirs`が解決できない
 /// （HOME未設定等の異常環境）場合は起動を拒否する（安全側: upperが無いままRW付与に
 /// フォールバックしない）。
-pub(crate) fn resolve_write_mode(cow: bool, session_id: &str) -> Result<WorkspaceWriteMode, String> {
+pub(crate) fn resolve_write_mode(
+    cow: bool,
+    session_id: &str,
+) -> Result<WorkspaceWriteMode, String> {
     if !cow {
         return Ok(WorkspaceWriteMode::DirectRw);
     }
@@ -86,8 +93,8 @@ pub(crate) fn build_mock_provider(
     mock_turns: Option<&Path>,
     mock_record_requests: Option<&Path>,
 ) -> Result<Box<dyn LlmProvider>, String> {
-    let turns_path = mock_turns
-        .ok_or_else(|| "--provider mock requires --mock-turns <path>".to_string())?;
+    let turns_path =
+        mock_turns.ok_or_else(|| "--provider mock requires --mock-turns <path>".to_string())?;
     let mut provider = harness_providers::MockProvider::from_turns_file(turns_path)
         .map_err(|e| format!("failed to read --mock-turns {}: {e}", turns_path.display()))?;
     if let Some(record_path) = mock_record_requests {
@@ -201,7 +208,10 @@ impl From<&harness_engine::SessionSummary> for SessionListEntry {
     }
 }
 
-pub(crate) fn print_session_list(summaries: &[harness_engine::SessionSummary], format: OutputFormat) {
+pub(crate) fn print_session_list(
+    summaries: &[harness_engine::SessionSummary],
+    format: OutputFormat,
+) {
     let entries: Vec<SessionListEntry> = summaries.iter().map(SessionListEntry::from).collect();
     match format {
         OutputFormat::Json => {
@@ -242,7 +252,10 @@ mod staging_mode_tests {
 
     #[test]
     fn staged_flag_selects_staged() {
-        assert_eq!(resolve_staging_mode(false, true, false), StagingMode::Staged);
+        assert_eq!(
+            resolve_staging_mode(false, true, false),
+            StagingMode::Staged
+        );
     }
 
     #[test]
@@ -258,4 +271,3 @@ mod staging_mode_tests {
         assert_eq!(resolve_staging_mode(true, false, false), StagingMode::Live);
     }
 }
-

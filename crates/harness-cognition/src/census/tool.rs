@@ -257,10 +257,7 @@ mod tests {
             _arg_repr: &str,
             _input: &serde_json::Value,
         ) -> Decision {
-            self.resolved
-                .lock()
-                .unwrap()
-                .push((tool.to_string(), risk));
+            self.resolved.lock().unwrap().push((tool.to_string(), risk));
             Decision::Deny
         }
     }
@@ -281,7 +278,11 @@ mod tests {
 
         let provider = Arc::new(MockProvider::new(vec![
             end_turn(&plan_json(&[("a", "read a")])),
-            tool_use_turn("call_1", "read_file", serde_json::json!({ "path": "a.txt" })),
+            tool_use_turn(
+                "call_1",
+                "read_file",
+                serde_json::json!({ "path": "a.txt" }),
+            ),
             end_turn(&join_json("summary")),
         ]));
         let gate = Arc::new(RecordingGate::new());
@@ -301,7 +302,9 @@ mod tests {
 
         let calls = gate.resolved_calls();
         assert!(
-            calls.iter().any(|(tool, risk)| tool == "read_file" && *risk == RiskClass::ReadOnly),
+            calls
+                .iter()
+                .any(|(tool, risk)| tool == "read_file" && *risk == RiskClass::ReadOnly),
             "read_fileの許可判定がgateを経由していない: {calls:?}"
         );
         // 拒否されたので観測ゼロ→そのitemは失敗として記録され、ツール出力は最終回答に現れない。
@@ -322,7 +325,11 @@ mod tests {
         let provider = Arc::new(
             MockProvider::new(vec![
                 end_turn(&plan_json(&[("a", "read a")])),
-                tool_use_turn("call_1", "read_file", serde_json::json!({ "path": "a.txt" })),
+                tool_use_turn(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
                 end_turn(&distill_json("蒸留済みの短い要約")),
                 end_turn(&join_json("summary")),
             ])

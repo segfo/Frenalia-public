@@ -134,9 +134,8 @@ fn is_windows_drive_path_at(chars: &[char], i: usize) -> bool {
 /// Windowsのドライブパスが`C://foo`と書かれることは実務上無いため、この2条件で
 /// 取りこぼす実パスは無い。
 fn is_url_scheme_tail_at(chars: &[char], i: usize) -> bool {
-    let preceded_by_scheme_char = i > 0
-        && (chars[i - 1].is_ascii_alphanumeric()
-            || matches!(chars[i - 1], '+' | '.' | '-'));
+    let preceded_by_scheme_char =
+        i > 0 && (chars[i - 1].is_ascii_alphanumeric() || matches!(chars[i - 1], '+' | '.' | '-'));
     let authority_form = matches!(chars.get(i + 3), Some('/'));
     preceded_by_scheme_char && authority_form
 }
@@ -188,8 +187,14 @@ mod tests {
     /// 直前が英数字でも、`X://`というauthority形式でない限り伏字化し続ける。
     #[test]
     fn real_drive_paths_are_still_redacted_even_when_glued_to_a_flag() {
-        assert_eq!(redact_windows_absolute_paths("-IC:/include"), "-I/workspace");
-        assert_eq!(redact_windows_absolute_paths(r"cd C:\Users\me"), "cd /workspace");
+        assert_eq!(
+            redact_windows_absolute_paths("-IC:/include"),
+            "-I/workspace"
+        );
+        assert_eq!(
+            redact_windows_absolute_paths(r"cd C:\Users\me"),
+            "cd /workspace"
+        );
         assert_eq!(redact_windows_absolute_paths("D:/tmp/x"), "/workspace");
         // 単独の1文字スキームは判別不能なので、安全側（伏字化）へ倒す。
         assert_eq!(redact_windows_absolute_paths("s://y"), "/workspace");

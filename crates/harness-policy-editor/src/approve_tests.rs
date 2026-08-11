@@ -47,7 +47,11 @@ fn ids(values: &[&str]) -> Vec<String> {
 #[test]
 fn accepting_a_proposal_writes_it_into_the_policy_file() {
     let ws = workspace();
-    let proposals = vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/.cargo/**")];
+    let proposals = vec![proposal(
+        "fs-1",
+        SettingsKey::FsRead,
+        "C:/Users/x/.cargo/**",
+    )];
     let accept = ids(&["fs-1"]);
 
     let plan = plan(&request(ws.path(), &proposals, &accept)).expect("plan");
@@ -65,7 +69,11 @@ fn accepting_a_proposal_writes_it_into_the_policy_file() {
 #[test]
 fn planning_alone_never_touches_the_disk() {
     let ws = workspace();
-    let proposals = vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/.cargo/**")];
+    let proposals = vec![proposal(
+        "fs-1",
+        SettingsKey::FsRead,
+        "C:/Users/x/.cargo/**",
+    )];
     let accept = ids(&["fs-1"]);
 
     let _plan = plan(&request(ws.path(), &proposals, &accept)).expect("plan");
@@ -80,7 +88,11 @@ fn planning_alone_never_touches_the_disk() {
 #[test]
 fn there_is_no_accept_everything_shorthand() {
     let ws = workspace();
-    let proposals = vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/.cargo/**")];
+    let proposals = vec![proposal(
+        "fs-1",
+        SettingsKey::FsRead,
+        "C:/Users/x/.cargo/**",
+    )];
     let accept: Vec<String> = Vec::new();
 
     let err = plan(&request(ws.path(), &proposals, &accept)).expect_err("must refuse");
@@ -92,12 +104,19 @@ fn there_is_no_accept_everything_shorthand() {
 #[test]
 fn one_unknown_id_refuses_the_whole_batch() {
     let ws = workspace();
-    let proposals = vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/.cargo/**")];
+    let proposals = vec![proposal(
+        "fs-1",
+        SettingsKey::FsRead,
+        "C:/Users/x/.cargo/**",
+    )];
     let accept = ids(&["fs-1", "fs-99"]);
 
     let err = plan(&request(ws.path(), &proposals, &accept)).expect_err("must refuse");
 
-    assert!(matches!(err, ApproveError::UnknownIds(_)), "unexpected: {err}");
+    assert!(
+        matches!(err, ApproveError::UnknownIds(_)),
+        "unexpected: {err}"
+    );
     assert!(
         !crate::policy_file::path(ws.path()).exists(),
         "正しい方のidも書かれてはいけない"
@@ -126,7 +145,11 @@ fn one_too_broad_value_refuses_the_whole_batch() {
 #[test]
 fn a_narrow_value_of_the_same_shape_is_accepted() {
     let ws = workspace();
-    let proposals = vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/.cargo/**")];
+    let proposals = vec![proposal(
+        "fs-1",
+        SettingsKey::FsRead,
+        "C:/Users/x/.cargo/**",
+    )];
     let accept = ids(&["fs-1"]);
 
     let plan = plan(&request(ws.path(), &proposals, &accept)).expect("must be accepted");
@@ -158,7 +181,11 @@ fn a_proposal_that_contradicts_require_sandbox_refuses_the_whole_batch() {
 #[test]
 fn a_read_only_proposal_passes_the_same_require_sandbox() {
     let ws = workspace();
-    let proposals = vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/.cargo/**")];
+    let proposals = vec![proposal(
+        "fs-1",
+        SettingsKey::FsRead,
+        "C:/Users/x/.cargo/**",
+    )];
     let accept = ids(&["fs-1"]);
     let mut req = request(ws.path(), &proposals, &accept);
     req.require_sandbox = RequireSandbox::WriteContainment;
@@ -229,7 +256,11 @@ fn classification_survives_mixed_path_separators_and_case() {
 #[test]
 fn repeating_an_id_does_not_accept_it_twice() {
     let ws = workspace();
-    let proposals = vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/.cargo/**")];
+    let proposals = vec![proposal(
+        "fs-1",
+        SettingsKey::FsRead,
+        "C:/Users/x/.cargo/**",
+    )];
     let accept = ids(&["fs-1", "fs-1"]);
 
     let plan = plan(&request(ws.path(), &proposals, &accept)).expect("plan");
@@ -290,12 +321,19 @@ fn approving_on_top_of_a_corrupt_policy_file_fails_instead_of_overwriting_it() {
     let ws = workspace();
     std::fs::create_dir_all(ws.path().join(".harness")).unwrap();
     std::fs::write(crate::policy_file::path(ws.path()), b"{ broken").unwrap();
-    let proposals = vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/.cargo/**")];
+    let proposals = vec![proposal(
+        "fs-1",
+        SettingsKey::FsRead,
+        "C:/Users/x/.cargo/**",
+    )];
     let accept = ids(&["fs-1"]);
 
     let err = plan(&request(ws.path(), &proposals, &accept)).expect_err("must refuse");
 
-    assert!(matches!(err, ApproveError::PolicyFile(_)), "unexpected: {err}");
+    assert!(
+        matches!(err, ApproveError::PolicyFile(_)),
+        "unexpected: {err}"
+    );
     assert_eq!(
         std::fs::read(crate::policy_file::path(ws.path())).unwrap(),
         b"{ broken",

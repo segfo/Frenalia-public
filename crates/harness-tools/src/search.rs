@@ -94,8 +94,13 @@ impl Tool for GrepTool {
         let cow_upper_dir = ctx.cow_upper_dir.clone();
 
         tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
-            let fs = SandboxFs::open_with_cow(&workspace_root, &staging, &read_scope, cow_upper_dir.as_deref())
-                .map_err(|e| sandbox_error_to_tool_error("", e))?;
+            let fs = SandboxFs::open_with_cow(
+                &workspace_root,
+                &staging,
+                &read_scope,
+                cow_upper_dir.as_deref(),
+            )
+            .map_err(|e| sandbox_error_to_tool_error("", e))?;
 
             let matcher = RegexMatcherBuilder::new()
                 .case_insensitive(input.ignore_case.unwrap_or(false))
@@ -306,8 +311,13 @@ impl Tool for GlobTool {
         let cow_upper_dir = ctx.cow_upper_dir.clone();
 
         tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
-            let fs = SandboxFs::open_with_cow(&workspace_root, &staging, &read_scope, cow_upper_dir.as_deref())
-                .map_err(|e| sandbox_error_to_tool_error("", e))?;
+            let fs = SandboxFs::open_with_cow(
+                &workspace_root,
+                &staging,
+                &read_scope,
+                cow_upper_dir.as_deref(),
+            )
+            .map_err(|e| sandbox_error_to_tool_error("", e))?;
 
             let matcher = globset::Glob::new(&input.pattern)
                 .map_err(|e| ToolError::InvalidInput(format!("invalid glob: {e}")))?

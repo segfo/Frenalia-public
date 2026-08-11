@@ -64,8 +64,7 @@ const COW_WRITE_PROBE_COMMAND: &str = "\
 fn cow_write_is_redirected_to_upper_and_workspace_stays_unchanged() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
-    std::fs::write(workspace.path().join("important.txt"), "original")
-        .expect("seed important.txt");
+    std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
@@ -77,7 +76,12 @@ fn cow_write_is_redirected_to_upper_and_workspace_stays_unchanged() {
     let env = crate::secret_env::build_child_env();
     let child = spawn_in_workspace(
         &shell,
-        &["-NoProfile", "-NonInteractive", "-Command", COW_WRITE_PROBE_COMMAND],
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            COW_WRITE_PROBE_COMMAND,
+        ],
         workspace.path(),
         &env,
         false,
@@ -113,8 +117,8 @@ fn cow_write_is_redirected_to_upper_and_workspace_stays_unchanged() {
     let upper_content = std::fs::read_to_string(upper.path().join("important.txt"))
         .expect("upper important.txt must exist after copy-up + redirected write");
     assert_eq!(upper_content, "modified-by-child");
-    let upper_new_content = std::fs::read_to_string(upper.path().join("new.txt"))
-        .expect("upper new.txt must exist");
+    let upper_new_content =
+        std::fs::read_to_string(upper.path().join("new.txt")).expect("upper new.txt must exist");
     assert_eq!(upper_new_content, "created-by-child");
 }
 
@@ -137,10 +141,22 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
     // (ラベル, 綴りの作り方, リダイレクトが成立すべきか)
     type Spelling = (&'static str, fn(&std::path::Path) -> String, bool);
     let spellings: &[Spelling] = &[
-        ("control (as-is)", |p| p.to_string_lossy().into_owned(), true),
+        (
+            "control (as-is)",
+            |p| p.to_string_lossy().into_owned(),
+            true,
+        ),
         ("uppercased", |p| p.to_string_lossy().to_uppercase(), true),
-        ("trailing separator", |p| format!("{}\\", p.to_string_lossy()), true),
-        ("verbatim prefix", |p| format!(r"\\?\{}", p.to_string_lossy()), true),
+        (
+            "trailing separator",
+            |p| format!("{}\\", p.to_string_lossy()),
+            true,
+        ),
+        (
+            "verbatim prefix",
+            |p| format!(r"\\?\{}", p.to_string_lossy()),
+            true,
+        ),
         // 相対パスだけは判定規則では救えない（絶対パスと照合しようがない）。**黙って壊れる
         // のではなく名乗る**ことがここでの合格条件になる。
         ("relative (--cwd .)", |_| ".".to_string(), false),
@@ -171,7 +187,10 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
         let (shell, _) = resolve_shell();
         let mut env = crate::secret_env::build_child_env();
         // `spawn`が後から積む正規化済みの値より前に並ぶ（安定ソート）。
-        env.insert(0, ("HARNESS_COW_WORKSPACE".to_string(), raw_spelling.clone()));
+        env.insert(
+            0,
+            ("HARNESS_COW_WORKSPACE".to_string(), raw_spelling.clone()),
+        );
         let child = spawn_in_workspace(
             &shell,
             &["-NoProfile", "-NonInteractive", "-Command", &script],
@@ -237,8 +256,14 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
                 stdout.contains("ABS=fail"),
                 "[{label}] the write is expected to be denied by the read-only ACL: stdout={stdout}"
             );
-            assert!(!upper_file.exists(), "[{label}] nothing may reach the upper dir");
-            assert!(ops.is_empty(), "[{label}] the operations ledger stays empty: ops={ops:?}");
+            assert!(
+                !upper_file.exists(),
+                "[{label}] nothing may reach the upper dir"
+            );
+            assert!(
+                ops.is_empty(),
+                "[{label}] the operations ledger stays empty: ops={ops:?}"
+            );
             assert!(
                 !denied_inside.is_empty(),
                 "[{label}] the denied ledger must record the in-workspace attempt so that \
@@ -279,10 +304,8 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
     let upper = tempfile::tempdir().expect("upper tempdir");
     // `fs_passthrough_ro_then_rw_then_revoke_cycle`と同じ理由（コメント参照）で
     // `C:\`直下1階層に置く（中間祖先のtraverse ACE不足による未解決rw書込を避ける）。
-    let external = std::path::PathBuf::from(format!(
-        "C:\\harness-Tier2a-cow-ext-{}",
-        std::process::id()
-    ));
+    let external =
+        std::path::PathBuf::from(format!("C:\\harness-Tier2a-cow-ext-{}", std::process::id()));
     std::fs::create_dir_all(&external).expect("create external rw root");
 
     let sid = session_sid();
@@ -451,8 +474,7 @@ fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
 fn workspace_write_fails_closed_without_redirector_injection() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
-    std::fs::write(workspace.path().join("important.txt"), "original")
-        .expect("seed important.txt");
+    std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
@@ -465,7 +487,12 @@ fn workspace_write_fails_closed_without_redirector_injection() {
     // `cow: None` — DLLを注入しない。ACLだけが境界として効くはず。
     let child = spawn_in_workspace(
         &shell,
-        &["-NoProfile", "-NonInteractive", "-Command", COW_WRITE_PROBE_COMMAND],
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            COW_WRITE_PROBE_COMMAND,
+        ],
         workspace.path(),
         &env,
         false,
@@ -537,11 +564,10 @@ fn cow_write_from_grandchild_process_is_redirected_to_upper() {
         !workspace.path().join("new_by_grandchild.txt").exists(),
         "grandchild's write must not appear in the read-only workspace"
     );
-    let upper_content =
-        std::fs::read_to_string(upper.path().join("new_by_grandchild.txt")).expect(
-            "upper must contain the grandchild's write \
+    let upper_content = std::fs::read_to_string(upper.path().join("new_by_grandchild.txt")).expect(
+        "upper must contain the grandchild's write \
              (redirector DLL must have been re-injected into the grandchild, Phase 4a)",
-        );
+    );
     assert!(
         upper_content.trim().contains("created-by-grandchild"),
         "unexpected upper content: {upper_content:?}"
@@ -560,7 +586,10 @@ fn cow_write_from_grandchild_process_is_redirected_to_upper() {
 /// この直接の子自身が`CreateProcessA`/`WinExec`で"ひ孫"を起動する土台に使う）。
 fn tier2a_proc_probe_x64_exe() -> PathBuf {
     let current = std::env::current_exe().expect("current_exe");
-    let dir = current.parent().expect("current_exe has parent").to_path_buf();
+    let dir = current
+        .parent()
+        .expect("current_exe has parent")
+        .to_path_buf();
     let exe = dir.join("tier2a_proc_probe.exe");
     assert!(
         exe.exists(),
@@ -617,8 +646,8 @@ fn cow_write_via_createprocessa_grandchild_is_redirected_to_upper() {
         !workspace.path().join("new_by_createprocessa.txt").exists(),
         "grandchild's write must not appear in the read-only workspace"
     );
-    let upper_content =
-        std::fs::read_to_string(upper.path().join("new_by_createprocessa.txt")).expect(
+    let upper_content = std::fs::read_to_string(upper.path().join("new_by_createprocessa.txt"))
+        .expect(
             "upper must contain the grandchild's write (CreateProcessA hook must have \
              re-injected the redirector DLL, residual issue #5)",
         );
@@ -682,12 +711,11 @@ fn cow_write_via_winexec_grandchild_is_redirected_to_upper() {
         !workspace.path().join("new_by_winexec.txt").exists(),
         "grandchild's write must not appear in the read-only workspace"
     );
-    let upper_content = std::fs::read_to_string(upper.path().join("new_by_winexec.txt"))
-        .expect(
-            "upper must contain the grandchild's write (WinExec hook must have re-injected \
+    let upper_content = std::fs::read_to_string(upper.path().join("new_by_winexec.txt")).expect(
+        "upper must contain the grandchild's write (WinExec hook must have re-injected \
              the redirector DLL via its CreateProcessA-based reimplementation, residual \
              issue #5)",
-        );
+    );
     assert!(
         upper_content.trim().contains("created-by-winexec"),
         "unexpected upper content: {upper_content:?}"
@@ -713,7 +741,9 @@ fn cow_write_via_winexec_grandchild_is_redirected_to_upper() {
 #[test]
 #[ignore]
 fn cow_write_from_wow64_grandchild_process_is_redirected_to_upper() {
-    let _lock = WOW64_DLL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = WOW64_DLL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
 
@@ -753,11 +783,10 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_upper() {
         !workspace.path().join("new_by_wow64.txt").exists(),
         "wow64 grandchild's write must not appear in the read-only workspace"
     );
-    let upper_content =
-        std::fs::read_to_string(upper.path().join("new_by_wow64.txt")).expect(
-            "upper must contain the wow64 grandchild's write \
+    let upper_content = std::fs::read_to_string(upper.path().join("new_by_wow64.txt")).expect(
+        "upper must contain the wow64 grandchild's write \
              (redirector DLL must have been re-injected via the entry-point trap, Phase 4b)",
-        );
+    );
     assert!(
         upper_content.trim().contains("created-by-wow64-grandchild"),
         "unexpected upper content: {upper_content:?}"
@@ -778,7 +807,9 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_upper() {
 #[test]
 #[ignore]
 fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
-    let _lock = WOW64_DLL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = WOW64_DLL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
 
@@ -860,8 +891,7 @@ fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
 fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
-    std::fs::write(workspace.path().join("important.txt"), "original")
-        .expect("seed important.txt");
+    std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
@@ -914,9 +944,8 @@ fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
         .expect("child should run to completion");
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
 
-    let workspace_content =
-        std::fs::read_to_string(workspace.path().join("important.txt"))
-            .expect("workspace important.txt must still exist");
+    let workspace_content = std::fs::read_to_string(workspace.path().join("important.txt"))
+        .expect("workspace important.txt must still exist");
     assert_eq!(
         workspace_content, "original",
         "workspace must stay unchanged (mmap write must not bypass the ACL boundary)"
@@ -945,8 +974,7 @@ fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
 fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
-    std::fs::write(workspace.path().join("important.txt"), "original")
-        .expect("seed important.txt");
+    std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
@@ -1025,8 +1053,16 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
         "applied={:?}",
         report.applied
     );
-    assert!(report.conflicts.is_empty(), "conflicts={:?}", report.conflicts);
-    assert!(report.hard_denied.is_empty(), "hard_denied={:?}", report.hard_denied);
+    assert!(
+        report.conflicts.is_empty(),
+        "conflicts={:?}",
+        report.conflicts
+    );
+    assert!(
+        report.hard_denied.is_empty(),
+        "hard_denied={:?}",
+        report.hard_denied
+    );
 
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("important.txt")).unwrap(),
@@ -1054,8 +1090,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper_a = tempfile::tempdir().expect("upper_a tempdir");
     let upper_b = tempfile::tempdir().expect("upper_b tempdir");
-    std::fs::write(workspace.path().join("important.txt"), "original")
-        .expect("seed important.txt");
+    std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
 
     let sid = session_sid();
     // workspace本体へのRO ACEはworkspace単位で共有されるモードのため、同じ"ro"モードの
@@ -1145,7 +1180,11 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
 
     let ledger_a = crate::tier2a::workspace_ledger::read_cow_ledger(upper_a.path());
     assert_eq!(
-        ledger_a.iter().find(|c| c.path == "important.txt").unwrap().op,
+        ledger_a
+            .iter()
+            .find(|c| c.path == "important.txt")
+            .unwrap()
+            .op,
         ManifestOp::Modify
     );
     assert_eq!(
@@ -1158,7 +1197,11 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
     );
     let ledger_b = crate::tier2a::workspace_ledger::read_cow_ledger(upper_b.path());
     assert_eq!(
-        ledger_b.iter().find(|c| c.path == "important.txt").unwrap().op,
+        ledger_b
+            .iter()
+            .find(|c| c.path == "important.txt")
+            .unwrap()
+            .op,
         ManifestOp::Modify
     );
     assert_eq!(
@@ -1191,7 +1234,11 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
     .expect("apply A should succeed");
     assert!(report_a.applied.iter().any(|p| p == "important.txt"));
     assert!(report_a.applied.iter().any(|p| p == "new.txt"));
-    assert!(report_a.conflicts.is_empty(), "conflicts={:?}", report_a.conflicts);
+    assert!(
+        report_a.conflicts.is_empty(),
+        "conflicts={:?}",
+        report_a.conflicts
+    );
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("important.txt")).unwrap(),
         "overwritten-by-a"
@@ -1244,8 +1291,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
 fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
-    std::fs::write(workspace.path().join("old.txt"), "original-content")
-        .expect("seed old.txt");
+    std::fs::write(workspace.path().join("old.txt"), "original-content").expect("seed old.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
@@ -1323,8 +1369,16 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
         },
     )
     .expect("apply_cow should succeed");
-    assert!(report.applied.iter().any(|p| p == "old.txt"), "applied={:?}", report.applied);
-    assert!(report.applied.iter().any(|p| p == "new.txt"), "applied={:?}", report.applied);
+    assert!(
+        report.applied.iter().any(|p| p == "old.txt"),
+        "applied={:?}",
+        report.applied
+    );
+    assert!(
+        report.applied.iter().any(|p| p == "new.txt"),
+        "applied={:?}",
+        report.applied
+    );
 
     assert!(!workspace.path().join("old.txt").exists());
     assert_eq!(
@@ -1342,8 +1396,7 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
 fn cow_ledger_records_delete_persists_across_processes_and_applies() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let upper = tempfile::tempdir().expect("upper tempdir");
-    std::fs::write(workspace.path().join("doomed.txt"), "to-be-deleted")
-        .expect("seed doomed.txt");
+    std::fs::write(workspace.path().join("doomed.txt"), "to-be-deleted").expect("seed doomed.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
@@ -1441,7 +1494,11 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
         },
     )
     .expect("apply_cow should succeed");
-    assert!(report.applied.iter().any(|p| p == "doomed.txt"), "applied={:?}", report.applied);
+    assert!(
+        report.applied.iter().any(|p| p == "doomed.txt"),
+        "applied={:?}",
+        report.applied
+    );
     assert!(!workspace.path().join("doomed.txt").exists());
 }
 
@@ -1471,7 +1528,10 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
 
     fn proc_probe_exe_paths() -> (PathBuf, PathBuf) {
         let current = std::env::current_exe().expect("current_exe");
-        let dir = current.parent().expect("current_exe has parent").to_path_buf();
+        let dir = current
+            .parent()
+            .expect("current_exe has parent")
+            .to_path_buf();
         let x64 = dir.join("tier2a_proc_probe.exe");
         let x86 = dir.join("tier2a_proc_probe_x86.exe");
         assert!(
@@ -1580,7 +1640,10 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
                     .unwrap_or_else(|e| panic!("upper must contain {tag}-seed.txt: {e}")),
                 format!("modified-by-{tag}")
             );
-            assert!(!del_path.exists(), "{tag}-del.txt must not be copied up to upper");
+            assert!(
+                !del_path.exists(),
+                "{tag}-del.txt must not be copied up to upper"
+            );
             assert!(!ren_path.exists(), "{tag}-ren.txt must not remain in upper");
             assert_eq!(
                 std::fs::read_to_string(&ren2_path)
@@ -1715,7 +1778,11 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
         preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
         let injected = expected_injected(chain);
-        let gen1_exe = if chain[0] == "x64" { &x64_exe } else { &x86_exe };
+        let gen1_exe = if chain[0] == "x64" {
+            &x64_exe
+        } else {
+            &x86_exe
+        };
         let rest_chain = chain[1..].join(",");
         let args: Vec<String> = vec![
             "--gen".to_string(),
@@ -1753,7 +1820,7 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
             Some(CowInject {
                 workspace_root: workspace.path(),
                 upper_dir: upper.path(),
-            ext_capture_roots: &[],
+                ext_capture_roots: &[],
             }),
         );
 
@@ -1803,7 +1870,8 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
             let compiled_arch = report["identity"]["compiled_arch"].as_str().unwrap_or("");
             let expected_arch = if chain[i] == "x64" { "x86_64" } else { "x86" };
             assert_eq!(
-                compiled_arch, expected_arch,
+                compiled_arch,
+                expected_arch,
                 "chain={chain:?} gen{}: unexpected compiled_arch in report {report:?}",
                 i + 1
             );

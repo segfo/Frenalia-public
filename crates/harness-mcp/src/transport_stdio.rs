@@ -192,7 +192,9 @@ mod tests {
     #[test]
     fn a_server_without_network_gets_no_proxy_variables() {
         let env = build_env(&declared_env(), None);
-        assert!(!env.iter().any(|(k, _)| k.eq_ignore_ascii_case("HTTP_PROXY")));
+        assert!(!env
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("HTTP_PROXY")));
         assert!(!env.iter().any(|(k, _)| k == "ALL_PROXY"));
     }
 
@@ -222,10 +224,12 @@ mod tests {
             .filter(|(k, _)| k == "PATH")
             .map(|(_, v)| v.as_str())
             .collect();
-        assert_eq!(paths, vec!["C:\\only\\this"], "declared env must not be duplicated");
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "DOCS_ROOT" && v == "C:\\docs"));
+        assert_eq!(
+            paths,
+            vec!["C:\\only\\this"],
+            "declared env must not be duplicated"
+        );
+        assert!(env.iter().any(|(k, v)| k == "DOCS_ROOT" && v == "C:\\docs"));
     }
 
     /// 秘密っぽい環境変数はallowlist側から入らない（D-07。宣言に書いたものだけが渡る）。

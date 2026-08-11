@@ -77,7 +77,10 @@ impl PresentedCertificate {
             "    valid:       {} .. {}\n",
             self.not_before, self.not_after
         ));
-        out.push_str(&format!("    chain:       {} certificate(s) presented\n", self.chain_length));
+        out.push_str(&format!(
+            "    chain:       {} certificate(s) presented\n",
+            self.chain_length
+        ));
         out.push_str(&format!("    sha256:      {}\n", self.pin.to_readable()));
         out
     }
@@ -292,7 +295,9 @@ mod tests {
         let presented = parse_presented(b"not a certificate", 1);
         assert_eq!(presented.pin, CertPin::of_certificate(b"not a certificate"));
         assert!(presented.subject.contains("unparsable"));
-        assert!(presented.describe().contains("sha256:".trim_end_matches(':')));
+        assert!(presented
+            .describe()
+            .contains("sha256:".trim_end_matches(':')));
     }
 
     #[test]

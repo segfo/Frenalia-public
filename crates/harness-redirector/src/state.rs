@@ -6,7 +6,6 @@
 
 use super::*;
 
-
 /// `retour`が要求する生のNt関数シグネチャ。`windows`クレートの`Wdk`ラッパは実体が
 /// `windows_targets::link!`経由のIAT呼び出しであり、ここでフックする対象（`ntdll.dll`の
 /// エクスポート本体、`GetProcAddress`で取得したアドレス）とは別物。ABIが一致する生の
@@ -195,14 +194,19 @@ pub(crate) static CREATE_FILE_HOOK: OnceLock<GenericDetour<NtCreateFileFn>> = On
 pub(crate) static OPEN_FILE_HOOK: OnceLock<GenericDetour<NtOpenFileFn>> = OnceLock::new();
 pub(crate) static SET_INFO_HOOK: OnceLock<GenericDetour<NtSetInformationFileFn>> = OnceLock::new();
 pub(crate) static CLOSE_HOOK: OnceLock<GenericDetour<NtCloseFn>> = OnceLock::new();
-pub(crate) static QUERY_FULL_ATTR_HOOK: OnceLock<GenericDetour<NtQueryFullAttributesFileFn>> = OnceLock::new();
-pub(crate) static QUERY_ATTR_HOOK: OnceLock<GenericDetour<NtQueryAttributesFileFn>> = OnceLock::new();
+pub(crate) static QUERY_FULL_ATTR_HOOK: OnceLock<GenericDetour<NtQueryFullAttributesFileFn>> =
+    OnceLock::new();
+pub(crate) static QUERY_ATTR_HOOK: OnceLock<GenericDetour<NtQueryAttributesFileFn>> =
+    OnceLock::new();
 pub(crate) static QUERY_DIR_HOOK: OnceLock<GenericDetour<NtQueryDirectoryFileFn>> = OnceLock::new();
-pub(crate) static QUERY_DIR_EX_HOOK: OnceLock<GenericDetour<NtQueryDirectoryFileExFn>> = OnceLock::new();
-pub(crate) static CREATE_PROCESS_W_HOOK: OnceLock<GenericDetour<CreateProcessWFn>> = OnceLock::new();
+pub(crate) static QUERY_DIR_EX_HOOK: OnceLock<GenericDetour<NtQueryDirectoryFileExFn>> =
+    OnceLock::new();
+pub(crate) static CREATE_PROCESS_W_HOOK: OnceLock<GenericDetour<CreateProcessWFn>> =
+    OnceLock::new();
 pub(crate) static CREATE_PROCESS_AS_USER_W_HOOK: OnceLock<GenericDetour<CreateProcessAsUserWFn>> =
     OnceLock::new();
-pub(crate) static CREATE_PROCESS_A_HOOK: OnceLock<GenericDetour<CreateProcessAFn>> = OnceLock::new();
+pub(crate) static CREATE_PROCESS_A_HOOK: OnceLock<GenericDetour<CreateProcessAFn>> =
+    OnceLock::new();
 pub(crate) static WIN_EXEC_HOOK: OnceLock<GenericDetour<WinExecFn>> = OnceLock::new();
 
 /// このDLL自身がロードされているモジュールベースアドレス（`DllMain`の`hinst`引数、数値上は
@@ -225,7 +229,8 @@ pub(crate) static INIT_LOCK: Mutex<()> = Mutex::new(());
 /// `init()`が最後まで成功（6つのファイルフック設置完了）したか。`harness_cow_init`の戻り値
 /// そのものであり、注入側（`inject_grandchild`／`wow64::remote_call_init`）が
 /// `GetExitCodeThread`で読む唯一の成否シグナルになる（BUG-045のF1）。
-pub(crate) static INIT_SUCCEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static INIT_SUCCEEDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// ハンドル値→workspace相対パス（`/`区切り）。`NtClose`で確実に取り除く（際限なく膨らまない
 /// ようにする、設計書§19.6）。

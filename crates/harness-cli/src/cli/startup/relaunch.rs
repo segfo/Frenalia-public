@@ -142,7 +142,9 @@ mod tests {
     }
 
     fn strings(args: &[OsString]) -> Vec<String> {
-        args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 
     /// 書き換え結果を**実物のパーサへ食わせて**検算する。フラグ名を変えたのに
@@ -189,14 +191,23 @@ mod tests {
     #[test]
     fn a_valueless_resume_does_not_swallow_the_next_flag() {
         let out = relaunch_args(&os(&["--resume", "--cow"]), Path::new(r"C:\ws\next"), 7);
-        assert!(strings(&out).contains(&"--cow".to_string()), "{:?}", strings(&out));
+        assert!(
+            strings(&out).contains(&"--cow".to_string()),
+            "{:?}",
+            strings(&out)
+        );
         assert!(parsed(&out).cow);
     }
 
     #[test]
     fn the_equals_form_is_dropped_too() {
         let out = relaunch_args(
-            &os(&[r"--cwd=C:\ws\old", "--continue", "--fork-session", "--tier1"]),
+            &os(&[
+                r"--cwd=C:\ws\old",
+                "--continue",
+                "--fork-session",
+                "--tier1",
+            ]),
             Path::new(r"C:\ws\next"),
             7,
         );

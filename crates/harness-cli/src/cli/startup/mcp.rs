@@ -132,7 +132,10 @@ pub(super) async fn prepare_mcp_servers(
             Ok(prepared) => startup.prepared.push(prepared),
             // `plan`が同じゲートを既に通しているのでここへ来るのは異常系だが、
             // 落ちるなら起動せずに理由を出す。
-            Err(reason) => startup.skipped.push(SkippedServer { id: decl.id, reason }),
+            Err(reason) => startup.skipped.push(SkippedServer {
+                id: decl.id,
+                reason,
+            }),
         }
     }
 

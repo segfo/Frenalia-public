@@ -419,8 +419,8 @@ mod tests {
     /// カタログには出ない。
     #[test]
     fn a_declared_mcp_source_appears_only_once_its_tool_is_registered() {
-        let catalog =
-            SourceCatalog::with_builtin_defaults().merged_with([mcp_entry("mcp/company-docs", TrustLevel::High)]);
+        let catalog = SourceCatalog::with_builtin_defaults()
+            .merged_with([mcp_entry("mcp/company-docs", TrustLevel::High)]);
 
         let without = ToolRegistry::with_builtin_tools();
         assert!(!catalog.has_mcp(&without));
@@ -506,7 +506,11 @@ mod tests {
         assert_eq!(entry.use_for, vec!["公式ドキュメント".to_string()]);
         assert_eq!(entry.trust, TrustLevel::Medium);
         assert_eq!(
-            catalog.entries().iter().filter(|e| e.id == "web_fetch").count(),
+            catalog
+                .entries()
+                .iter()
+                .filter(|e| e.id == "web_fetch")
+                .count(),
             1
         );
     }
@@ -542,8 +546,8 @@ mod tests {
     /// CrossSourceの示唆: まだ使っていない接地種別だけを返す。
     #[test]
     fn cross_source_suggestions_exclude_the_kinds_already_used() {
-        let catalog =
-            SourceCatalog::with_builtin_defaults().merged_with([mcp_entry("mcp/company-docs", TrustLevel::High)]);
+        let catalog = SourceCatalog::with_builtin_defaults()
+            .merged_with([mcp_entry("mcp/company-docs", TrustLevel::High)]);
         let tools = registry_with(&[("mcp__company-docs__search_docs", RiskClass::ReadOnly)]);
 
         let used = BTreeSet::from([SourceKind::File]);
