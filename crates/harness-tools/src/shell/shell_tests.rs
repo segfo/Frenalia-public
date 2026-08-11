@@ -8,9 +8,9 @@
 
 use super::env::{path_entries_equal, path_separator};
 use super::net_decision::should_grant_tier2a_network_capability;
-use super::*;
 #[cfg(windows)]
-use super::platform::RUN_SHELL_BOOTSTRAP_SCRIPT;
+use super::platform::{CONSTRAINED_LANGUAGE_NOTICE, RUN_SHELL_BOOTSTRAP_SCRIPT};
+use super::*;
 
 mod tests {
     use super::*;
@@ -38,6 +38,7 @@ mod tests {
             &[],
             None,
             &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .expect("tier selection without --require-sandbox never fails");
@@ -445,23 +446,68 @@ mod tests {
         );
     }
 
-    /// BUG-050回帰テスト: 絵文字・非BMP文字（`𠮷`）・結合文字（`が`）を含むコマンドが実行できる
-    /// こと。BUG-049修正のコードページ変換方式ではCP932で表現できないこれらの文字は`?`へ
-    /// 潰れていた（ANSIコードページ変換自体を廃止したBUG-050修正で解消）。
+    /// コマンド文字列中のリテラルが、PowerShellのパーサへ**コードポイント単位で無改変に**
+    /// 届いたことを、出力側の符号化に一切依存せずに確かめる。
+    ///
+    /// 各文字のUTF-16単位を10進数（純ASCII）で出させて突き合わせる。stdoutの符号化が
+    /// ANSIコードページ固定になる環境（[BUG-102](../../docs/bugs/BUG-102.md)の
+    /// ConstrainedLanguage）でも、この経路は`?`へ潰れないので**両モードで同じ歯**を持つ。
+    /// 期待値はRust側のリテラルから計算する（数値の羅列を手で書くとリテラルを変えたときに
+    /// 静かにずれる）。
     #[cfg(windows)]
-    #[tokio::test]
-    async fn run_shell_executes_command_containing_emoji_and_non_bmp_literal() {
+    async fn assert_literal_reaches_powershell_intact(literal: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
         let tool = RunShellTool;
         let out = tool
             .call(
-                json!({ "command": "Write-Output '🚀 𠮷野家 が'" }),
+                json!({ "command": format!(
+                    "Write-Output ('CP=' + (([int[]][char[]]'{literal}') -join ','))"
+                ) }),
                 &ctx(dir.path().to_path_buf()),
             )
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.contains("🚀 𠮷野家 が"), "{}", out.content);
+        let expected: Vec<String> = literal.encode_utf16().map(|u| u.to_string()).collect();
+        assert!(
+            out.content.contains(&format!("CP={}", expected.join(","))),
+            "the literal must reach PowerShell without any code-point substitution: {}",
+            out.content
+        );
+        out.content
+    }
+
+    /// BUG-050回帰テスト: 絵文字・非BMP文字（`𠮷`）・結合文字（`が`）を含むコマンドが実行できる
+    /// こと。BUG-049修正のコードページ変換方式ではCP932で表現できないこれらの文字は`?`へ
+    /// 潰れていた（ANSIコードページ変換自体を廃止したBUG-050修正で解消）。
+    ///
+    /// BUG-102以降、**入力側（コマンドがPowerShellへ届くこと）と出力側（実行結果が
+    /// 文字化けせず戻ること）を分けて**検証する。前者はBUG-050が守った性質そのもので、
+    /// ConstrainedLanguageでも成立する。後者は`[Console]::OutputEncoding`を設定できないと
+    /// 成立しない（非BMPは`?`になる）ため、劣化を宣言している実行では要求しない。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_executes_command_containing_emoji_and_non_bmp_literal() {
+        const LITERAL: &str = "🚀 𠮷野家 が";
+        // 入力側: どのモードでも無改変で届くこと。
+        let probe = assert_literal_reaches_powershell_intact(LITERAL).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool = RunShellTool;
+        let out = tool
+            .call(
+                json!({ "command": format!("Write-Output '{LITERAL}'") }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        if probe.contains(CONSTRAINED_LANGUAGE_NOTICE) {
+            // BUG-102: この機のTier1ではstdoutがANSIコードページ固定で、非BMPは`?`へ潰れる。
+            // 出力の一致は要求できないが、上でコマンド自体が無改変で届いたことは確認済み。
+            return;
+        }
+        assert!(out.content.contains(LITERAL), "{}", out.content);
     }
 
     /// BUG-050回帰テスト（セキュリティ）: `WideCharToMultiByte`の既定のベストフィット変換は
@@ -470,9 +516,19 @@ mod tests {
     /// 対して行われるため、変換後だけメタ文字が現れると検査が素通りになる（BUG-050）。
     /// コードページ変換自体を廃止したことで、送ったバイト表現がそのままPowerShellへ届き、
     /// `¦`が`|`に化けないことを確認する。
+    ///
+    /// **検証点はPowerShellが受け取った文字**である（BUG-102で分離）。危険なのは
+    /// 「検査した文字列と実行される文字列の乖離」（B-21）であって、表示の乖離ではない。
+    /// コードポイントで見ることで、stdoutの符号化がANSIコードページ固定になる環境
+    /// （ConstrainedLanguage。実測でそこでは**出力側**が`¦`→`|`のベストフィット変換をする）でも
+    /// 本来の検証点が保たれていることを確かめられる。
     #[cfg(windows)]
     #[tokio::test]
     async fn run_shell_does_not_best_fit_convert_broken_bar_into_pipe() {
+        // 166 = U+00A6 BROKEN BAR。124（`|`）へ化けていればここで落ちる。
+        let probe = assert_literal_reaches_powershell_intact("a¦b").await;
+        assert!(probe.contains("CP=97,166,98"), "{probe}");
+
         let dir = tempfile::tempdir().unwrap();
         let tool = RunShellTool;
         let out = tool
@@ -483,6 +539,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
+        if out.content.contains(CONSTRAINED_LANGUAGE_NOTICE) {
+            // BUG-102: 表示だけがANSIコードページのベストフィットで`a|b`になる。実行された
+            // コマンドは`¦`のままであることを上で確認済みなので、検査回避（BUG-050）は生じない。
+            return;
+        }
         assert!(
             out.content.contains("a¦b"),
             "U+00A6 must not be best-fit-converted into a pipe character: {}",
@@ -522,13 +583,32 @@ mod tests {
         assert!(RUN_SHELL_BOOTSTRAP_SCRIPT.contains(RUN_SHELL_COMMAND_ENV_VAR));
     }
 
+    /// BUG-102: 劣化の宣言文とその識別用定数の対応を固定する（上の env 名と同じ理由）。
+    /// これがずれると、劣化しているのに劣化していないものとして扱われる。
+    #[cfg(windows)]
+    #[test]
+    fn bootstrap_script_announces_constrained_language() {
+        assert!(RUN_SHELL_BOOTSTRAP_SCRIPT.contains(CONSTRAINED_LANGUAGE_NOTICE));
+        // 宣言は境界印より前＝`[shell-startup-noise]`枠に入る位置でなければ、
+        // コマンドの出力に混ざる（B-33）。
+        let notice_at = RUN_SHELL_BOOTSTRAP_SCRIPT
+            .find(CONSTRAINED_LANGUAGE_NOTICE)
+            .unwrap();
+        let sentinel_at = RUN_SHELL_BOOTSTRAP_SCRIPT
+            .find(RUN_SHELL_OUTPUT_SENTINEL)
+            .unwrap();
+        assert!(notice_at < sentinel_at);
+    }
+
     /// 境界印はブートストラップが実際に出す文字列と一致していなければならない（定数の
     /// 食い違いをテストで固定する。上の`RUN_SHELL_COMMAND_ENV_VAR`と同じ理由）。
     #[cfg(windows)]
     #[test]
     fn bootstrap_script_emits_the_declared_sentinel_on_both_streams() {
         assert_eq!(
-            RUN_SHELL_BOOTSTRAP_SCRIPT.matches(RUN_SHELL_OUTPUT_SENTINEL).count(),
+            RUN_SHELL_BOOTSTRAP_SCRIPT
+                .matches(RUN_SHELL_OUTPUT_SENTINEL)
+                .count(),
             2,
             "stdoutとstderrの両方へ出す必要がある（どちらへ出るかはホスト依存）"
         );
@@ -537,9 +617,41 @@ mod tests {
             .find(RUN_SHELL_OUTPUT_SENTINEL)
             .unwrap();
         let exec_at = RUN_SHELL_BOOTSTRAP_SCRIPT
-            .find("scriptblock]::Create")
+            .find("Invoke-Expression")
             .unwrap();
         assert!(sentinel_at < exec_at);
+    }
+
+    /// BUG-102回帰テスト: ブートストラップがConstrainedLanguageでも走ること。
+    ///
+    /// WDACのCIポリシーが配備された機では低ILのPowerShell（＝Tier1）がConstrainedLanguageに
+    /// なり、.NET型のメソッド呼び出し・プロパティ設定が禁止される。旧実装は
+    /// `. ([scriptblock]::Create($__harness_cmd))`で**コマンドを実行する当の行**が落ちていた。
+    ///
+    /// 実機がWDAC無効でも壊れたことを検出できるよう、**定数の形**で固定する
+    /// （実行時の検証は下の`run_shell_*`群がTier1経由で行うが、それはCLになる機でしか
+    /// 赤くならない）。
+    #[cfg(windows)]
+    #[test]
+    fn bootstrap_script_is_constrained_language_safe() {
+        assert!(
+            !RUN_SHELL_BOOTSTRAP_SCRIPT.contains("scriptblock]::Create"),
+            "コマンド実行に.NETの静的メソッドを使うとConstrainedLanguageで1行も走らない"
+        );
+        assert!(RUN_SHELL_BOOTSTRAP_SCRIPT.contains("Invoke-Expression $__harness_cmd"));
+
+        // `[Console]::`に触る文は全てFullLanguageガードの内側にあること。ガードの外に1つでも
+        // あると、その`InvalidOperation`がコマンドの出力に見える（BUG-086と同型）。
+        for (at, _) in RUN_SHELL_BOOTSTRAP_SCRIPT.match_indices("[Console]::") {
+            let statement = RUN_SHELL_BOOTSTRAP_SCRIPT[..at]
+                .rsplit(';')
+                .next()
+                .unwrap_or_default();
+            assert!(
+                statement.contains("$__harness_full"),
+                "unguarded [Console]:: at byte {at} in the bootstrap script"
+            );
+        }
     }
 
     /// 起動時ノイズは切り離すが**捨てない**（`bug-pattern-rules` B-10）。
@@ -686,17 +798,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // 実Tier2a preflightを走らせる（`opt_in_Tier2a=true`）。AppContainer不可の環境では
         // Tier1へ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
-        let selection =
-            harness_sandbox::select_tier(
-                RequireSandbox::None,
-                dir.path(),
-                false,
-                false,
-                &[],
-                None,
-                &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
-            )
-            .unwrap();
+        let selection = harness_sandbox::select_tier(
+            RequireSandbox::None,
+            dir.path(),
+            false,
+            false,
+            &[],
+            None,
+            &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
+            None,
+        )
+        .unwrap();
         if selection.tier != ShellTier::Tier2a {
             eprintln!(
                 "skipping Tier2a test: preflight downgraded to {} ({:?})",
@@ -793,17 +905,17 @@ mod tests {
         use harness_core::{NetAppPolicy, RequireSandbox, ShellTier};
 
         let dir = tempfile::tempdir().unwrap();
-        let selection =
-            harness_sandbox::select_tier(
-                RequireSandbox::None,
-                dir.path(),
-                false,
-                false,
-                &[],
-                None,
-                &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
-            )
-            .unwrap();
+        let selection = harness_sandbox::select_tier(
+            RequireSandbox::None,
+            dir.path(),
+            false,
+            false,
+            &[],
+            None,
+            &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
+            None,
+        )
+        .unwrap();
         if selection.tier != ShellTier::Tier2a {
             eprintln!(
                 "skipping Tier2a net-allow-app test: preflight downgraded to {} ({:?})",

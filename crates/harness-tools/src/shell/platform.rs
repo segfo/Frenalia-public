@@ -4,7 +4,7 @@
 //! `docs/CODE-STRUCTURE-RULES.md`規則3の軸1（どの外部システムと話すか）で`shell.rs`から
 //! 切り出した。Tierごとの隔離機構は`super::runner`が扱い、ここは**Tierに依らずシェル共通**の
 //! ものだけを持つ——だからこそ Tier0/Tier1/Tier2a とポリシーエディタの記録モード2つ
-//! （パス1＝Tier1でのFS記録、パス2＝Tier2aでのドメイン記録）の**5経路**がこの1箇所を
+//! （パス1＝**Tier0**でのFS記録、パス2＝Tier2aでのドメイン記録）の**5経路**がこの1箇所を
 //! 共有できる（個別に実装して綴りが食い違うことを防ぐ、B-05）。
 
 use tokio::process::Command;
@@ -70,11 +70,47 @@ pub const RUN_SHELL_COMMAND_ENV_VAR: &str = "HARNESS_RUN_SHELL_COMMAND";
 /// 完全に消し去る——stdinへ非ASCIIバイトが一切乗らないため、コードページ変換自体が
 /// 不要になる。
 ///
-/// コマンド本体は`RUN_SHELL_COMMAND_ENV_VAR`からenv経由で読み、`[scriptblock]::Create`で
+/// コマンド本体は`RUN_SHELL_COMMAND_ENV_VAR`からenv経由で読み、`Invoke-Expression`で
 /// 実行する。**判定用の元コマンドは一切変更しない**: `classify_net_app`等の危険構文検査は
 /// 呼び出し元で元の`command`文字列に対して行い（`super::net_decision::classify_net_app`・
 /// `harness-engine::permission::looks_like_allowlist_bypass`）、このブートストラップは
 /// 検査結果とは独立に常に同じ内容で送られる。
+///
+/// # ConstrainedLanguageでも動くこと（BUG-102）
+///
+/// WDACのCIポリシーが配備された機では、**低ILのトークンで起動したPowerShellだけ**が
+/// ConstrainedLanguageモードになる（1差分測定で確定。制限トークンによる特権剥奪は無関係で、
+/// ILの値がLowかMediumかだけで反転する。AppContainer＝Tier2aは影響を受けない。
+/// 測定器は`harness-sandbox`の`examples/bug102-langmode-matrix.rs`）。このモードでは
+/// .NET型のメソッド呼び出しとプロパティ設定が禁止されるため、
+///
+/// - `. ([scriptblock]::Create($__harness_cmd))`（旧実装）は**コマンドを実行する当の行**が
+///   落ちる＝Tier1で1行も走らない。同じ意味で禁止構文を含まない`Invoke-Expression`へ替えた。
+///   終了コードの意味論（ネイティブの終了コード・`exit N`・パースエラー・失敗cmdlet）が
+///   旧実装と一致することは4ケースで実測済み。
+/// - `[Console]::*`の2行は`$__harness_full`ガードの内側へ移した。ガードしないと
+///   `InvalidOperation`が2行stderrへ出て、それがコマンドの出力に見える（BUG-086と同型）。
+///
+/// **`Invoke-Expression`はharness自身が「危険構文」として`looks_like_allowlist_bypass`で
+/// 検出する綴りでもある**（`permission.rs`の`iex `/`iex(`）。これは矛盾ではない——検査は
+/// **モデルが書いた元コマンド**に対して行い、本ブートストラップはharness自身の固定文字列で、
+/// 旧`[scriptblock]::Create`と同じく既存の`-Command -`のevalに能力を足さない（BUG-050の設計メモ）。
+/// ただしBUG-050が警告した「将来stdinペイロード自体を検査する層」を足すなら、
+/// **その層は本スクリプトを危険と判定する**ので、検査対象がenv側であることを再確認すること。
+///
+/// ConstrainedLanguageで残る制約は2つあり、どちらもモデルから見える。**黙って劣化させない**
+/// ため、その旨をコマンド実行前に1行stdoutへ出す（境界印より前なので
+/// `[shell-startup-noise: ...]`枠に入る、B-10）。
+///
+/// | 制約 | 理由 |
+/// |---|---|
+/// | ユーザーのコマンド自身も.NET呼び出しができない | 実行するのが同じセッションだから（不可避） |
+/// | stdoutの絵文字・非BMP文字が`?`へ潰れる | `[Console]::OutputEncoding`を設定できず、既定のANSIコードページ（CP932）で符号化される。`chcp 65001`は効かないことを実測済み。日本語は`decode_console_bytes`（BUG-051）が復元するので無事 |
+///
+/// stderrの境界印はConstrainedLanguageでは出せない（`[Console]::Error.WriteLine`が禁止で、
+/// `1>&2`はPowerShellの**パースエラー**、`Write-Error`は書式が付いて毎回ノイズ枠が立つ）。
+/// 印が無い場合は`split_shell_startup_noise`が**全部をコマンドの出力として扱う**＝
+/// 隠さない側へ倒れるので、安全側の劣化である。
 ///
 /// 実測（Windows PowerShell 5.1・pwsh 7.6.4、`CREATE_NO_WINDOW`下）:
 /// 絵文字・非BMP文字（`𠮷`）・複合文字（`が`）を含むコマンド、日本語ファイル名の作成・削除、
@@ -88,20 +124,39 @@ pub const RUN_SHELL_COMMAND_ENV_VAR: &str = "HARNESS_RUN_SHELL_COMMAND";
 ///
 /// Tier0（本関数の呼び出し元`platform_shell_command`）・Tier2a（`run_windows_tier2a`）・
 /// Tier1（`run_windows_tier1`）・ポリシーエディタのパス1
-/// （`harness_policy_editor::record`、Tier1で対象コマンドを走らせる）・同パス2
+/// （`harness_policy_editor::record`、**Tier0**の`tier0::win_plain::spawn`で走らせる。
+/// 2026-08-10にTier1から移した——`session_dir.rs`のdoc参照。ここが「Tier1で走らせる」と
+/// 書かれたまま残っていたため、BUG-102の実害評価が一度誤った）・同パス2
 /// （`harness_policy_editor::record_net`、Tier2aで走らせる）の**5経路全て**が
 /// この1関数を通す（Tier横断で1箇所に集約し、個別に実装して食い違うことを防ぐ）。
+///
+/// **低ILで走るのはTier1だけである**——BUG-102のConstrainedLanguageに落ちるのもTier1だけで、
+/// 他の4経路は影響を受けない。
 #[cfg(windows)]
 pub(crate) const RUN_SHELL_BOOTSTRAP_SCRIPT: &str = "\
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+$__harness_full = ([string]$ExecutionContext.SessionState.LanguageMode) -eq 'FullLanguage'; \
+if ($__harness_full) { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } \
+else { Write-Output 'harness: PowerShell is in ConstrainedLanguage mode (WDAC policy + low integrity level). \
+.NET method calls and property assignments fail, and characters outside the ANSI code page are replaced with ? on stdout.' }; \
 $OutputEncoding = [System.Text.Encoding]::UTF8; \
 Write-Output '<<<harness-run-shell-begin>>>'; \
-[Console]::Error.WriteLine('<<<harness-run-shell-begin>>>'); \
+if ($__harness_full) { [Console]::Error.WriteLine('<<<harness-run-shell-begin>>>') }; \
 $__harness_cmd = $env:HARNESS_RUN_SHELL_COMMAND; \
 Remove-Item Env:HARNESS_RUN_SHELL_COMMAND -ErrorAction SilentlyContinue; \
-. ([scriptblock]::Create($__harness_cmd)); \
+Invoke-Expression $__harness_cmd; \
 if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif (-not $?) { exit 1 }
 ";
+
+/// BUG-102: ConstrainedLanguageで走っていることを宣言する通知の識別部分。
+///
+/// `RUN_SHELL_BOOTSTRAP_SCRIPT`が境界印より前へ出すので、実行結果では
+/// `[shell-startup-noise: ...]`枠に現れる——**モデルへはこの枠だけで届く**ので、
+/// 製品コードにこれを読む側は無い（宣言はテキストで完結している）。
+///
+/// 定数にしてあるのは、劣化を判定するテストが文言をコピーすると静かにずれるため（B-05）。
+/// 宣言文との対応は`bootstrap_script_announces_constrained_language`が固定する。
+#[cfg(all(windows, test))]
+pub(crate) const CONSTRAINED_LANGUAGE_NOTICE: &str = "PowerShell is in ConstrainedLanguage mode";
 
 /// シェル自身が**コマンドを走らせる前に**吐いた出力と、コマンドの出力を分ける境界印。
 ///
