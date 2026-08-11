@@ -58,7 +58,10 @@ fn setup_lock_name(path_key: &str) -> String {
 /// すり抜ける（早い者勝ちの事故）。セットアップ用ロックは処理中だけ保持しすぐ解放され、
 /// 長期保持するのは自モードのmutexだけになる。
 pub fn begin_workspace_mode(path: &Path, mode: &str) -> Result<(), String> {
-    debug_assert!(KNOWN_MODES.contains(&mode), "unknown workspace mode: {mode}");
+    debug_assert!(
+        KNOWN_MODES.contains(&mode),
+        "unknown workspace mode: {mode}"
+    );
     let key = sanitize_path_for_object_name(path);
     crate::with_named_lock(&setup_lock_name(&key), || {
         for other in KNOWN_MODES.iter().filter(|m| **m != mode) {
@@ -147,7 +150,11 @@ pub fn record_workspace_grant(path: &Path, mode: &str) {
     let path_str = path.to_string_lossy().into_owned();
     let granted_at = harness_grant_ledger::now_unix_secs();
     ledger().update(|l| {
-        if let Some(entry) = l.entries.iter_mut().find(|e| e.path == path_str) {
+        if let Some(entry) = l
+            .entries
+            .iter_mut()
+            .find(|e| harness_grant_ledger::same_ledger_path(&e.path, &path_str))
+        {
             entry.mode = mode.to_string();
             entry.granted_at_unix_secs = granted_at;
         } else {
@@ -162,7 +169,10 @@ pub fn record_workspace_grant(path: &Path, mode: &str) {
 
 pub fn remove_workspace_entry(path: &Path) {
     let path_str = path.to_string_lossy().into_owned();
-    ledger().update(|l| l.entries.retain(|e| e.path != path_str));
+    ledger().update(|l| {
+        l.entries
+            .retain(|e| !harness_grant_ledger::same_ledger_path(&e.path, &path_str))
+    });
 }
 
 /// `should_remove`がtrueを返したパスのエントリを落とす（`harness fs prune`、D-53）。

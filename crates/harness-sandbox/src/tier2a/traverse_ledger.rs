@@ -64,7 +64,11 @@ pub fn record_traverse_grant(path: &Path) {
     let path_str = path.to_string_lossy().into_owned();
     let granted_at = harness_grant_ledger::now_unix_secs();
     ledger().update(|l| {
-        if let Some(entry) = l.entries.iter_mut().find(|e| e.path == path_str) {
+        if let Some(entry) = l
+            .entries
+            .iter_mut()
+            .find(|e| harness_grant_ledger::same_ledger_path(&e.path, &path_str))
+        {
             entry.granted_at_unix_secs = granted_at;
         } else {
             l.entries.push(TraverseLedgerEntry {
@@ -77,7 +81,10 @@ pub fn record_traverse_grant(path: &Path) {
 
 pub fn remove_traverse_grant(path: &Path) {
     let path_str = path.to_string_lossy().into_owned();
-    ledger().update(|l| l.entries.retain(|e| e.path != path_str));
+    ledger().update(|l| {
+        l.entries
+            .retain(|e| !harness_grant_ledger::same_ledger_path(&e.path, &path_str))
+    });
 }
 
 /// `should_remove`がtrueを返したパスのエントリを落とす（`harness fs prune`、D-53）。

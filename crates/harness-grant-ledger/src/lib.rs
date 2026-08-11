@@ -125,12 +125,26 @@ pub struct Ledger<T> {
     _payload: PhantomData<T>,
 }
 
+/// harnessのユーザースコープ設定ディレクトリ（`%APPDATA%\harness\config`）。
+///
+/// **ここはharnessの制御面である。** 付与済みACEの台帳（`fs-passthrough-ledger.json`・
+/// `traverse-grant-ledger.json`・`tier3-vm-ledger.json`）とMCPの承認台帳
+/// （`mcp-approval-ledger.json`、D-39）が入っており、サンドボックスから書けると
+/// **自分の許可を書き換えられる**（P-08。`<workspace>/.harness`と同じ性質だが、
+/// **綴りが全く違うので同じ判定では拾えない**）。
+///
+/// 解決規則を[`Ledger::in_config_dir`]と共有するために公開している——
+/// 候補から除外する側（`harness_policy_editor::exclusion`）が`%APPDATA%\harness`と
+/// 書き写すと、置き場を変えたときに静かにずれる（B-05）。
+pub fn config_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "harness").map(|d| d.config_dir().to_path_buf())
+}
+
 impl<T> Ledger<T> {
     /// `%APPDATA%\harness\config\<file_name>`を指す台帳を作る。
     pub fn in_config_dir(file_name: &str, lock_name: Option<&str>) -> Self {
         Self {
-            path: directories::ProjectDirs::from("", "", "harness")
-                .map(|d| d.config_dir().join(file_name)),
+            path: config_dir().map(|dir| dir.join(file_name)),
             lock_name: lock_name.map(str::to_owned),
             _payload: PhantomData,
         }
@@ -231,6 +245,28 @@ pub fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 台帳のパス文字列どうしが**同じファイルシステム上の対象**を指すかを判定する（B-19）。
+///
+/// # なぜ全台帳で共有するのか
+///
+/// これらの台帳は書き手が1つではありません——`harness fs`のCLIは引数をそのまま
+/// （`C:\Users\...`）、ポリシーエディタは設定パス由来のスラッシュ形（`C:/Users/...`）で
+/// 記録します。素の文字列比較だと、**同じディレクトリが2つのエントリとして積もり**、
+/// 撤収は片方しか消しません。実際にtraverse台帳には
+/// `C:\Users\segfo\AppData\Local\Temp`と`C:/Users/segfo/AppData/Local/Temp`が
+/// 並んで存在していました（BUG-101）。
+///
+/// 同じ判定を台帳ごとに書き写すと、片方だけ直って静かにずれます
+/// （`CODE-STRUCTURE-RULES`§5.0）。**記録側と撤収側の両方**がこの1つを通します（B-02）。
+///
+/// Windowsのファイルシステムは大小非区別なので、比較もそれに合わせます。
+pub fn same_ledger_path(a: &str, b: &str) -> bool {
+    fn key(s: &str) -> String {
+        s.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+    }
+    key(a) == key(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +278,62 @@ mod tests {
 
     fn ledger_at(dir: &Path) -> Ledger<TestLedger> {
         Ledger::at_path(dir.join("ledger.json"), None)
+    }
+
+    /// **`update`は1回ごとに台帳の全文を読み書きする**（さらに`.bak`へ全文コピーし、
+    /// 読取専用属性を外して書き戻す）。「1件足す」APIに見えるが実体はこれなので、
+    /// **ループの中で呼ぶとエントリ数の2乗でI/Oが増える**。
+    ///
+    /// 実運用でこれを踏んだ: ポリシーエディタのパス2が、workspace外のルート668件を
+    /// 1件ずつ`update`していた。台帳は実測185KB／66KBあり、合わせて約500MBのI/Oになって
+    /// 準備が数秒かかっていた（[BUG-092](../../../docs/bugs/BUG-092.md)）。
+    ///
+    /// このテストは**その性質を数字で固定する**——N件を1回の`update`でまとめたときの
+    /// 書込バイト数が、N回に分けたときより桁で小さいこと。**「まとめて書く方が速い」は
+    /// 直感だが、桁が違うことは測らないと分からない。**
+    #[test]
+    fn updating_once_per_entry_costs_quadratically_more_io_than_batching() {
+        fn bytes_written(dir: &Path, batched: bool, entries: usize) -> u64 {
+            let ledger = ledger_at(dir);
+            // 台帳が育った状態から測る（現実の台帳は既に数百件入っている）。
+            ledger.update(|l| {
+                for i in 0..entries {
+                    l.entries
+                        .push(format!("C:/Users/me/.cargo/registry/package-{i}"));
+                }
+            });
+            let size = std::fs::metadata(dir.join("ledger.json")).unwrap().len();
+
+            let added: Vec<String> = (0..entries).map(|i| format!("C:/extra/{i}")).collect();
+            if batched {
+                ledger.update(|l| l.entries.extend(added.iter().cloned()));
+                size
+            } else {
+                for one in &added {
+                    ledger.update(|l| l.entries.push(one.clone()));
+                }
+                size * entries as u64
+            }
+        }
+
+        const N: usize = 200;
+        let batched_dir = tempfile::tempdir().unwrap();
+        let per_entry_dir = tempfile::tempdir().unwrap();
+        let batched = bytes_written(batched_dir.path(), true, N);
+        let per_entry = bytes_written(per_entry_dir.path(), false, N);
+
+        assert!(
+            per_entry > batched * (N as u64 / 2),
+            "per-entry update should cost roughly N times more writes than one batched update \
+             (batched={batched} bytes, per-entry~{per_entry} bytes). If this ever becomes \
+             comparable, the cost model in the doc above is wrong and the batching in \
+             preflight/record_net can be simplified away."
+        );
+        // 中身は同じであること（速さのために記録を落としていない）。
+        assert_eq!(
+            ledger_at(batched_dir.path()).load().entries.len(),
+            ledger_at(per_entry_dir.path()).load().entries.len()
+        );
     }
 
     // --- 以下5件は harness-sandbox::traverse_ledger から移設した characterization test。
