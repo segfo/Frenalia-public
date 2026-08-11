@@ -2,8 +2,8 @@
 //!
 //! `sessions_dir`作成・`SessionStore`解決・`--fork-session`・履歴読込。
 
-use super::*;
 use super::configure::Configured;
+use super::*;
 
 /// [`stage_open_session`]の出力。Stage4（`stage_prepare_sandbox`）以降が必要とする値を運ぶ。
 pub(super) struct SessionOpened {
@@ -125,4 +125,3 @@ pub(super) fn stage_open_session(configured: Configured) -> Result<SessionOpened
         forked_from_session_id,
     })
 }
-

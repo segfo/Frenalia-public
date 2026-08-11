@@ -45,7 +45,7 @@
 
 use serde_json::{json, Value};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{GetLastError, CloseHandle, ERROR_CANCELLED};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
 use windows::Win32::System::Threading::TerminateProcess;
 use windows::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,

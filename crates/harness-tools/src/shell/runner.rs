@@ -22,10 +22,10 @@ use tokio::time::{timeout, Duration};
 
 use harness_core::{ShellTier, ToolError};
 
-use super::net_decision::NetDecision;
-use super::platform::{decode_console_output, platform_shell_command};
 #[cfg(windows)]
 use super::net_decision::should_grant_tier2a_network_capability;
+use super::net_decision::NetDecision;
+use super::platform::{decode_console_output, platform_shell_command};
 #[cfg(windows)]
 use super::platform::{run_shell_bootstrap_stdin, RUN_SHELL_COMMAND_ENV_VAR};
 
@@ -136,7 +136,11 @@ async fn run_tier0(
     let mut cmd = invocation.cmd;
     let env_owned: Vec<(String, String)>;
     let env = if let Some((k, v)) = &invocation.extra_env {
-        env_owned = env.iter().cloned().chain(std::iter::once((k.to_string(), v.clone()))).collect();
+        env_owned = env
+            .iter()
+            .cloned()
+            .chain(std::iter::once((k.to_string(), v.clone())))
+            .collect();
         env_owned.as_slice()
     } else {
         env
@@ -307,8 +311,9 @@ async fn run_windows_tier1(
     // （`RUN_SHELL_BOOTSTRAP_SCRIPT`のdoc参照）。
     env_owned.push((RUN_SHELL_COMMAND_ENV_VAR.to_string(), command.to_string()));
 
-    let child = harness_sandbox::tier1::win_restricted::spawn(bin, &args, &cwd_owned, &env_owned, true)
-        .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+    let child =
+        harness_sandbox::tier1::win_restricted::spawn(bin, &args, &cwd_owned, &env_owned, true)
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child.kill_token();
     let stdin_bytes = run_shell_bootstrap_stdin();
 

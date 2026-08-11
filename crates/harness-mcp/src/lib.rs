@@ -58,12 +58,12 @@ pub mod transport_stdio;
 pub use transport_stdio::AppContainerTransportFactory;
 
 pub use approval::{ApprovalStore, McpApproval, McpApprovalLedger};
+pub use cert_probe::PresentedCertificate;
 pub use decl::{
     namespaced_tool_name, parse_mcp_http_gates, parse_mcp_settings, McpHttpSettings,
     McpNetworkDecl, McpServerDecl, McpSettings, McpTransportKind, McpWorkspaceAccess,
 };
 pub use harness_core::McpServerFact;
-pub use cert_probe::PresentedCertificate;
 pub use http_wire::{CertPin, Endpoint, EndpointGates};
 pub use runtime::{
     DefaultTransportFactory, McpGates, McpRuntime, McpStartupPlan, PreparedIsolation,

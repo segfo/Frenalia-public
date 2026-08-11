@@ -91,7 +91,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncWriteExt, duplex};
+    use tokio::io::{duplex, AsyncWriteExt};
 
     /// 最小のTLS 1.2 ClientHello（SNI=`example.com`、ALPN=`http/1.1`）をrustlsの
     /// クライアント実装で実際に生成し、`peek_client_hello`が同じ値を復元できることを確認する。
@@ -137,7 +137,10 @@ mod tests {
     #[tokio::test]
     async fn peek_client_hello_returns_not_tls_for_plain_text() {
         let (mut client_io, mut server_io) = duplex(1024);
-        client_io.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        client_io
+            .write_all(b"GET / HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
         drop(client_io);
 
         let (peek, raw) = peek_client_hello(&mut server_io, Duration::from_secs(2), 16 * 1024)

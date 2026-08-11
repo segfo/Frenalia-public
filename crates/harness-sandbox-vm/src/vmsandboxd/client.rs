@@ -7,9 +7,8 @@
 //! このファイルのコードは**昇格しない**。daemon側（昇格トークンで動く）の実装は`daemon`、
 //! その認可判定は`authz`が持つ。
 
-use super::*;
 use super::authz::verify_pipe_server_identity;
-
+use super::*;
 
 /// 常駐セッションdaemonの固定named pipe名（S-2）。パイプの向きを反転させ常駐daemonが
 /// サーバになるため、GC専用の使い捨て名（[`unique_pipe_name`]、GC経路は変更なし）とは別に
@@ -19,8 +18,6 @@ use super::authz::verify_pipe_server_identity;
 pub(super) fn session_daemon_pipe_name() -> &'static str {
     r"\\.\pipe\harness-vmsandboxd-session"
 }
-
-
 
 fn daemon_exe_path() -> Result<PathBuf, VmSandboxIpcError> {
     let current = std::env::current_exe()

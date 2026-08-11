@@ -3,8 +3,8 @@
 //! `settings.json`読込・`require_sandbox`とconfidentialの矛盾チェック・認知段階の検査・
 //! provider構築・model解決・`ToolRegistry`・allowlist・`PermissionArbiter`。
 
-use super::*;
 use super::parse_args::ParsedArgs;
+use super::*;
 
 /// [`stage_configure`]の出力。Stage3（`stage_open_session`）以降が必要とする値を運ぶ。
 pub(super) struct Configured {
@@ -304,7 +304,6 @@ fn resolve_degeneracy(
         reasoning_only_ratio: s.reasoning_only_ratio.unwrap_or(d.reasoning_only_ratio),
     }))
 }
-
 
 /// `settings.json`の`cognition.sources`を情報源カタログへ写す（M16、
 /// `plans/DESIGN-COGNITION.md` §4.2）。
