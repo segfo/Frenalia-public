@@ -80,6 +80,13 @@ pub(crate) unsafe fn resolve_relative_object_attributes_path(
     // 誤って変更として記録・リダイレクトされる（実機`cow_ledger_records_single_session_changes_and_applies_cleanly`
     // で`%SystemDrive%/...`という台帳エントリとして再現）。`%`はcmd.exeの`>`リダイレクト等
     // 正規の相対ファイル名には現れないため、含む場合は解決不能として安全側で素通しする。
+    //
+    // **出所はAMSIに限らない**（BUG-104）。Windowsの既知フォルダ解決も同じ形を作る——
+    // `HKLM\...\ProfileList`の`ProgramData`が`%SystemDrive%\ProgramData`というREG_EXPAND_SZで、
+    // 子のenvに`SystemDrive`が無いと`ExpandEnvironmentStringsW`が未展開のまま返すため。
+    // なお**このガードが守っているのは台帳であって、実体の作成ではない**: BUG-104の現物は
+    // `--cow`ではないセッション（Redirector未ロード）で作られており、原因はenv allowlistの
+    // 欠落側にあった。そちらは`harness-sandbox`の`secret_env.rs`で修正済み。
     if raw_name.contains('%') {
         return None;
     }
