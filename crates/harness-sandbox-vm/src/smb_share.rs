@@ -115,7 +115,9 @@ fn run_powershell_stdin(script: &str) -> Result<String, VmError> {
             harness_sandbox::decode_console_bytes(&output.stderr)
         )));
     }
-    Ok(harness_sandbox::decode_console_bytes(&output.stdout).trim().to_string())
+    Ok(harness_sandbox::decode_console_bytes(&output.stdout)
+        .trim()
+        .to_string())
 }
 
 /// PowerShellの文字列リテラル内で安全に埋め込めるよう、シングルクォートを`''`へ
@@ -619,8 +621,15 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
                 .map_err(|e| format!("ConvertStringSidToSidW failed: {e}"))?;
                 psid
             };
-            revoke_ace_recursive(&scratch, sid_owned)
+            let report = revoke_ace_recursive(&scratch, sid_owned)
                 .map_err(|e| format!("revoke_ace_recursive failed: {e:?}"))?;
+            // [BUG-103] 「剥がした」と「剥がせなかったが例外も出なかった」を混ぜない。
+            if report.has_blocked() {
+                return Err(format!(
+                    "revoke_ace_recursive left ACEs behind: {:?}",
+                    report.blocked
+                ));
+            }
 
             // (3) 共有・アカウントはまだ存在するので再接続自体は成功するはずだが、NTFS権限が
             // 無くなっているためread/writeは拒否されるはず。
@@ -687,7 +696,9 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
                 harness_sandbox::decode_console_bytes(&output.stderr)
             ));
         }
-        Ok(harness_sandbox::decode_console_bytes(&output.stdout).trim().to_string())
+        Ok(harness_sandbox::decode_console_bytes(&output.stdout)
+            .trim()
+            .to_string())
     }
 
     /// [実リポジトリ本体での検証] ユーザー指示による5段階検証のうち、最終段（このharness
@@ -769,8 +780,15 @@ if ($LASTEXITCODE -ne 0) {{ throw "net use failed with exit $LASTEXITCODE" }}
             };
 
             let t_revoke = std::time::Instant::now();
-            revoke_ace_recursive(&repo_root, sid_owned)
+            let report = revoke_ace_recursive(&repo_root, sid_owned)
                 .map_err(|e| format!("revoke_ace_recursive on real repo root failed: {e:?}"))?;
+            // [BUG-103] 実測なので「何件剥がしたか」も出す（0件でも完走してしまう形にしない）。
+            println!(
+                "=== revoke report: checked={} rewritten={} blocked={} ===",
+                report.checked,
+                report.rewritten,
+                report.blocked.len()
+            );
             let revoke_elapsed = t_revoke.elapsed();
             println!("=== real repo root (~57k files incl. target/) revoke_ace_recursive took {revoke_elapsed:?} ===");
 
