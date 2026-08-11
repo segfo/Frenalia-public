@@ -54,7 +54,9 @@ pub fn run(mode: &str, cmdline: &str) -> Value {
                     };
                     json!({"mode": mode, "cmdline": cmdline, "ok": true, "exit_code": exit_code})
                 }
-                Err(e) => json!({"mode": mode, "cmdline": cmdline, "ok": false, "error": e.to_string()}),
+                Err(e) => {
+                    json!({"mode": mode, "cmdline": cmdline, "ok": false, "error": e.to_string()})
+                }
             }
         }
         "winexec" => {
@@ -65,7 +67,9 @@ pub fn run(mode: &str, cmdline: &str) -> Value {
             std::thread::sleep(std::time::Duration::from_millis(1500));
             json!({"mode": mode, "cmdline": cmdline, "ok": result > 31, "win_exec_result": result})
         }
-        other => json!({"mode": other, "cmdline": cmdline, "ok": false, "error": "unknown --spawn-via mode"}),
+        other => {
+            json!({"mode": other, "cmdline": cmdline, "ok": false, "error": "unknown --spawn-via mode"})
+        }
     }
 }
 

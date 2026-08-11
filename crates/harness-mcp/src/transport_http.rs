@@ -208,7 +208,10 @@ fn run_worker(
                     &diagnostics,
                 ));
                 match outcome {
-                    Ok(PostOutcome { new_session, messages }) => {
+                    Ok(PostOutcome {
+                        new_session,
+                        messages,
+                    }) => {
                         if let Some(id) = new_session {
                             session_id = Some(id);
                         }
@@ -275,9 +278,12 @@ fn build_client(config: &HttpConfig) -> Result<reqwest::Client, McpError> {
         }
     }
 
-    builder
-        .build()
-        .map_err(|e| McpError::Io(format!("could not build the mcp http client: {}", describe_with_causes(&e))))
+    builder.build().map_err(|e| {
+        McpError::Io(format!(
+            "could not build the mcp http client: {}",
+            describe_with_causes(&e)
+        ))
+    })
 }
 
 /// ピン留めされたクライアント（D-52）。
@@ -291,7 +297,11 @@ fn build_pinned_client(
     let provider = default_crypto_provider();
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .map_err(|e| McpError::Io(format!("could not configure tls for the pinned mcp client: {e}")))?
+        .map_err(|e| {
+            McpError::Io(format!(
+                "could not configure tls for the pinned mcp client: {e}"
+            ))
+        })?
         .dangerous()
         .with_custom_certificate_verifier(std::sync::Arc::new(PinnedCertVerifier { pin, provider }))
         .with_no_client_auth();
@@ -302,10 +312,12 @@ fn build_pinned_client(
     // **`Some(tls)`ではなく`tls`を渡す。** `tls_backend_preconfigured`は受け取った値を
     // 自分で`Some`へ包んでから`Option<rustls::ClientConfig>`へダウンキャストするので、
     // こちらで包むと`Option<Option<..>>`になり「不明なTLSバックエンド」で落ちる。
-    builder
-        .tls_backend_preconfigured(tls)
-        .build()
-        .map_err(|e| McpError::Io(format!("could not build the pinned mcp http client: {}", describe_with_causes(&e))))
+    builder.tls_backend_preconfigured(tls).build().map_err(|e| {
+        McpError::Io(format!(
+            "could not build the pinned mcp http client: {}",
+            describe_with_causes(&e)
+        ))
+    })
 }
 
 fn default_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
@@ -483,7 +495,9 @@ async fn post_once(
             )))
         }
         ResponseKind::Failed => {
-            let body = read_body_limited(response, diagnostics).await.unwrap_or_default();
+            let body = read_body_limited(response, diagnostics)
+                .await
+                .unwrap_or_default();
             record(
                 diagnostics,
                 &format!(
@@ -508,7 +522,10 @@ async fn read_body_limited(
     loop {
         let chunk = response.chunk().await.map_err(|e| {
             let why = describe_with_causes(&e);
-            record(diagnostics, &format!("reading the response body failed: {why}"));
+            record(
+                diagnostics,
+                &format!("reading the response body failed: {why}"),
+            );
             McpError::Io(format!("reading the mcp response body failed: {why}"))
         })?;
         let Some(chunk) = chunk else { break };
@@ -621,12 +638,11 @@ impl TransportFactory for HttpTransportFactory {
         };
 
         // `${env:...}`はharness自身のenvから解決する（サーバ側の設定ではない）。
-        let headers = expand_declared_headers(&prepared.decl.headers).map_err(|e| {
-            McpError::Spawn {
+        let headers =
+            expand_declared_headers(&prepared.decl.headers).map_err(|e| McpError::Spawn {
                 id: prepared.decl.id.clone(),
                 reason: e,
-            }
-        })?;
+            })?;
 
         Ok(Box::new(HttpTransport::connect(HttpConfig {
             endpoint: endpoint.clone(),

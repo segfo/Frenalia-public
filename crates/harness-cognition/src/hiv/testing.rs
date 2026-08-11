@@ -166,9 +166,7 @@ impl Executor for PhaseExecutor {
             }
             // `Call`（ストリーム開始前）であることが本質。`Stream`にすると
             // 「途中まで届いた」意味になり、縮小再試行の前提が変わる。
-            Reply::ContextTooLong => {
-                return Err(EngineError::Call(ProviderError::ContextTooLong))
-            }
+            Reply::ContextTooLong => return Err(EngineError::Call(ProviderError::ContextTooLong)),
         })
     }
 }

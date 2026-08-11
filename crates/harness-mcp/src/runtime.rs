@@ -315,9 +315,10 @@ impl McpRuntime {
         // 形式は`decl.validate()`が既に通しているが、ここでも読めなければ起動しない
         // （読めないピンを黙って「ピン無し＝通常検証」へ落とさない。D-52はfail-closed）。
         let tls_pin = match &decl.tls_pin {
-            Some(raw) => Some(crate::http_wire::parse_cert_pin(raw).map_err(|e| {
-                SkipReason::Invalid(format!("unusable \"tls_pin\": {e}"))
-            })?),
+            Some(raw) => Some(
+                crate::http_wire::parse_cert_pin(raw)
+                    .map_err(|e| SkipReason::Invalid(format!("unusable \"tls_pin\": {e}")))?,
+            ),
             None => None,
         };
         Ok(PreparedServer {
@@ -377,7 +378,10 @@ impl McpRuntime {
                 continue;
             }
             if let Err(e) = server.decl.check_namespaced_len(&def.name) {
-                warnings.push(format!("mcp server {:?}: {e}; skipping that tool", server.decl.id));
+                warnings.push(format!(
+                    "mcp server {:?}: {e}; skipping that tool",
+                    server.decl.id
+                ));
                 continue;
             }
             let risk = server.decl.risk_for_tool(&def.name);
@@ -635,8 +639,7 @@ mod tests {
             script: handshake_script("[]"),
         };
         let mut skipped = plan.skipped.clone();
-        let prepared_list: Vec<PreparedServer> =
-            plan.approved.into_iter().map(prepared).collect();
+        let prepared_list: Vec<PreparedServer> = plan.approved.into_iter().map(prepared).collect();
         let runtime = McpRuntime::start(prepared_list, &factory, "0.1.0", &mut skipped);
 
         assert!(

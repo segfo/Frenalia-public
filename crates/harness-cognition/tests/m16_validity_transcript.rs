@@ -64,7 +64,11 @@ impl Tool for StubMcpTool {
     fn risk(&self, _input: &serde_json::Value) -> RiskClass {
         self.risk
     }
-    async fn call(&self, _input: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
             content: self.output.to_string(),
             is_error: false,
@@ -294,7 +298,11 @@ fn corroboration_script() -> Vec<Vec<StreamEvent>> {
         // まだ裏取りできていないので決着させない。
         verify("inconclusive"),
         // ラウンド2: MCPで裏取り（§4.2の接地優先順位2）。
-        plan_and_tool_turn("call_2", READ_MCP, serde_json::json!({ "query": "run_shell" })),
+        plan_and_tool_turn(
+            "call_2",
+            READ_MCP,
+            serde_json::json!({ "query": "run_shell" }),
+        ),
         distill("社内仕様もPowerShellを既定としている", &[]),
         verify("confirms"),
         decide(),
@@ -333,11 +341,7 @@ fn evidence_events(events: &[AgentEvent]) -> Vec<(String, String)> {
 /// **M16の受入条件その1**: 別種の情報源で裏取りできると`Corroborated`へ上がり、確証まで進む。
 #[tokio::test]
 async fn a_claim_corroborated_by_mcp_reaches_confirmation() {
-    let run = run_always(
-        corroboration_script(),
-        &[(READ_MCP, RiskClass::ReadOnly)],
-    )
-    .await;
+    let run = run_always(corroboration_script(), &[(READ_MCP, RiskClass::ReadOnly)]).await;
 
     assert_eq!(run.stop_reason, StopReason::EndTurn);
 
@@ -351,7 +355,11 @@ async fn a_claim_corroborated_by_mcp_reaches_confirmation() {
 
     // 最終回答は台帳から組まれ、裏取り済みであることが読める。
     assert!(run.text.contains("corroborated"), "{}", run.text);
-    assert!(run.text.contains("mcp/company-docs/search_docs"), "{}", run.text);
+    assert!(
+        run.text.contains("mcp/company-docs/search_docs"),
+        "{}",
+        run.text
+    );
     assert!(run.text.contains("shell.rs"), "{}", run.text);
     assert!(
         run.text.contains("根拠の強さ: strong"),
@@ -361,9 +369,10 @@ async fn a_claim_corroborated_by_mcp_reaches_confirmation() {
     // 裏取りできているので、この注記は出ない。
     assert!(!run.text.contains("MCP裏取り不可"), "{}", run.text);
 
-    let promoted = run.events.iter().any(|e| {
-        matches!(e, AgentEvent::VerificationResult { promoted: true, .. })
-    });
+    let promoted = run
+        .events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::VerificationResult { promoted: true, .. }));
     assert!(promoted, "接地と裏取りが揃えば確証へ上がる");
 }
 
@@ -431,9 +440,10 @@ async fn contradicting_observations_block_confirmation_until_they_are_decided() 
     .await;
 
     // 矛盾を抱えたまま`Confirmed`へ上がっていないこと。
-    let promoted = run.events.iter().any(|e| {
-        matches!(e, AgentEvent::VerificationResult { promoted: true, .. })
-    });
+    let promoted = run
+        .events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::VerificationResult { promoted: true, .. }));
     assert!(!promoted, "未決着の矛盾があるうちは確証へ上げない");
 
     let missing: Vec<String> = run
@@ -468,7 +478,10 @@ async fn a_write_mcp_tool_is_never_offered_to_the_investigation_phase() {
     .await;
 
     let investigate: Vec<Vec<String>> = tool_names_of(&run, harness_core::Phase::Investigate);
-    assert!(!investigate.is_empty(), "Investigateのコールが記録されていない");
+    assert!(
+        !investigate.is_empty(),
+        "Investigateのコールが記録されていない"
+    );
     for names in &investigate {
         assert!(
             names.iter().any(|n| n == READ_MCP),
@@ -487,7 +500,9 @@ async fn a_write_mcp_tool_is_never_offered_to_the_investigation_phase() {
     let decide = tool_names_of(&run, harness_core::Phase::Decide);
     assert!(!decide.is_empty(), "Decideのコールが記録されていない");
     assert!(
-        decide.iter().all(|names| names.iter().any(|n| n == WRITE_MCP)),
+        decide
+            .iter()
+            .all(|names| names.iter().any(|n| n == WRITE_MCP)),
         "Decideで書込系MCPが候補に入っていない: {decide:?}"
     );
 }
@@ -496,11 +511,7 @@ async fn a_write_mcp_tool_is_never_offered_to_the_investigation_phase() {
 /// **登録されていないMCPは出てこない**——呼べない情報源を勧めない。
 #[tokio::test]
 async fn the_investigate_call_lists_only_the_sources_that_can_actually_be_called() {
-    let run = run_always(
-        corroboration_script(),
-        &[(READ_MCP, RiskClass::ReadOnly)],
-    )
-    .await;
+    let run = run_always(corroboration_script(), &[(READ_MCP, RiskClass::ReadOnly)]).await;
 
     let bodies: Vec<String> = run
         .requests

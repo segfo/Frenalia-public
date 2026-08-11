@@ -107,7 +107,10 @@ mod tests {
         let index = vec![meta("cp-1", "全く無関係なメモ", "別の話題")];
         let result = top_k("ZZZZZZZZ_QQQQQQQQ", &index, 5, 0.5);
         assert!(result.picks.is_empty());
-        assert_eq!(result.index_size, 1, "index has entries even though nothing matched");
+        assert_eq!(
+            result.index_size, 1,
+            "index has entries even though nothing matched"
+        );
     }
 
     #[test]
@@ -120,7 +123,13 @@ mod tests {
     #[test]
     fn top_k_limits_the_result_count() {
         let index: Vec<CheckpointMeta> = (0..10)
-            .map(|i| meta(&format!("cp-{i}"), "同じテーマの調査結果", "調査の対象は同じ"))
+            .map(|i| {
+                meta(
+                    &format!("cp-{i}"),
+                    "同じテーマの調査結果",
+                    "調査の対象は同じ",
+                )
+            })
             .collect();
         let result = top_k("同じテーマの調査結果", &index, 3, 0.0);
         assert_eq!(result.picks.len(), 3);

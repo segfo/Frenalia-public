@@ -289,9 +289,12 @@ impl CallWatch<'_> {
         let chars = (self.text.len() + self.thinking.len()) as u64;
         let elapsed = self.started.elapsed();
         let verdict = match self.detector.stats.lock() {
-            Ok(stats) if stats.is_warm(&self.key) => {
-                stats.gate(&self.key, chars, elapsed, self.detector.config.gate_multiplier)
-            }
+            Ok(stats) if stats.is_warm(&self.key) => stats.gate(
+                &self.key,
+                chars,
+                elapsed,
+                self.detector.config.gate_multiplier,
+            ),
             // 統計が無い（コールドスタート）／ロックが毒された場合は固定比率へ倒す。
             _ => gate::Stats::cold_start_gate(chars, self.max_tokens),
         };

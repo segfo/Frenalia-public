@@ -159,11 +159,10 @@ impl Tool for McpTool {
 
         // `McpClient`はブロッキング（生HANDLEパイプ）なので、ランタイムのワーカースレッドを
         // 塞がないよう`spawn_blocking`へ逃がす（`VmShellExecutor`経由のTier3 `run_shell`と同じ扱い）。
-        let result = tokio::task::spawn_blocking(move || {
-            client.call_tool(&remote_name, arguments, timeout)
-        })
-        .await
-        .map_err(|e| ToolError::ExecutionFailed(format!("mcp call task failed: {e}")))?;
+        let result =
+            tokio::task::spawn_blocking(move || client.call_tool(&remote_name, arguments, timeout))
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("mcp call task failed: {e}")))?;
 
         match result {
             Ok(call) => Ok(ToolOutput {

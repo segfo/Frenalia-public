@@ -136,7 +136,12 @@ struct HarnessRun {
 /// featureゲート下のモック経路）。`--permission-mode accept-all --dangerously-allow`は
 /// 台本化されたrun_shellをheadlessで実行するために必須（Defaultモードだと
 /// Exec種別のrun_shellは拒否される、既存`headless_output.rs`参照）。
-fn run_harness(ws: &Path, turns: &[Vec<StreamEvent>], extra_args: &[&str], case_name: &str) -> HarnessRun {
+fn run_harness(
+    ws: &Path,
+    turns: &[Vec<StreamEvent>],
+    extra_args: &[&str],
+    case_name: &str,
+) -> HarnessRun {
     run_harness_with_exe(&harness_exe(), ws, turns, extra_args, case_name)
 }
 
@@ -151,7 +156,14 @@ fn run_harness_with_exe(
     extra_args: &[&str],
     case_name: &str,
 ) -> HarnessRun {
-    run_harness_full(exe, &ws.to_string_lossy(), None, turns, extra_args, case_name)
+    run_harness_full(
+        exe,
+        &ws.to_string_lossy(),
+        None,
+        turns,
+        extra_args,
+        case_name,
+    )
 }
 
 /// `--cwd`へ渡す**文字列**と、harnessプロセス自身のカレントディレクトリを別々に指定できる版
@@ -217,12 +229,15 @@ fn run_harness_full(
 /// モックへ実際に送信された`CompletionRequest`を読み、BUG-030型
 /// （システムプロンプト・ツールスキーマの送信漏れ）を直接検出する（Q9）。
 fn assert_prompt_sane(run: &HarnessRun, must_contain: &[&str]) -> Result<(), String> {
-    let data = std::fs::read_to_string(&run.record_path)
-        .map_err(|e| format!("failed to read recorded requests {}: {e}", run.record_path.display()))?;
-    let first_line = data
-        .lines()
-        .next()
-        .ok_or_else(|| "no CompletionRequest was recorded (mock provider never called?)".to_string())?;
+    let data = std::fs::read_to_string(&run.record_path).map_err(|e| {
+        format!(
+            "failed to read recorded requests {}: {e}",
+            run.record_path.display()
+        )
+    })?;
+    let first_line = data.lines().next().ok_or_else(|| {
+        "no CompletionRequest was recorded (mock provider never called?)".to_string()
+    })?;
     let req: CompletionRequest = serde_json::from_str(first_line)
         .map_err(|e| format!("recorded request is not valid CompletionRequest JSON: {e}"))?;
     if req.system.is_empty() || req.system.iter().all(|b| b.text.trim().is_empty()) {
@@ -231,7 +246,12 @@ fn assert_prompt_sane(run: &HarnessRun, must_contain: &[&str]) -> Result<(), Str
     if !req.tools.iter().any(|t| t.name == "run_shell") {
         return Err("run_shell がツール定義として送信されていない".to_string());
     }
-    let system_text: String = req.system.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\n");
+    let system_text: String = req
+        .system
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     for needle in must_contain {
         if !system_text.contains(needle) {
             return Err(format!(
@@ -243,8 +263,12 @@ fn assert_prompt_sane(run: &HarnessRun, must_contain: &[&str]) -> Result<(), Str
 }
 
 fn parse_json_stdout(run: &HarnessRun) -> Result<serde_json::Value, String> {
-    serde_json::from_str(run.stdout.trim())
-        .map_err(|e| format!("stdout is not valid JSON: {e}\nstdout={}\nstderr={}", run.stdout, run.stderr))
+    serde_json::from_str(run.stdout.trim()).map_err(|e| {
+        format!(
+            "stdout is not valid JSON: {e}\nstdout={}\nstderr={}",
+            run.stdout, run.stderr
+        )
+    })
 }
 
 fn list_cow_sessions() -> HashSet<String> {
@@ -260,7 +284,9 @@ fn new_cow_session(before: &HashSet<String>) -> Result<String, String> {
     match new_ones.len() {
         1 => Ok(new_ones.remove(0).clone()),
         0 => Err("CoWセッションが新規作成されなかった".to_string()),
-        n => Err(format!("CoWセッションが{n}件同時に新規作成された（並行実行を疑う）")),
+        n => Err(format!(
+            "CoWセッションが{n}件同時に新規作成された（並行実行を疑う）"
+        )),
     }
 }
 
@@ -293,8 +319,9 @@ fn apply_cow(ws: &Path, session_id: &str, only: Option<&str>) -> Result<serde_js
         .map_err(|e| format!("failed to spawn harness apply: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("apply stdout is not valid JSON: {e} (stdout={stdout}, stderr={stderr})"))
+    serde_json::from_str(stdout.trim()).map_err(|e| {
+        format!("apply stdout is not valid JSON: {e} (stdout={stdout}, stderr={stderr})")
+    })
 }
 
 fn read_file(path: &Path) -> Result<String, String> {
@@ -364,16 +391,33 @@ fn setup_baseline(ws: &Path, case_name: &str) -> Result<String, String> {
     assert_prompt_sane(&run, &["run_shell"])?;
     let session1 = new_cow_session(&before)?;
     let report = apply_cow(ws, &session1, None)?;
-    let applied = report["applied"].as_array().ok_or("apply report missing applied[]")?;
+    let applied = report["applied"]
+        .as_array()
+        .ok_or("apply report missing applied[]")?;
     if applied.len() != 4 {
-        return Err(format!("round1 commit_all applied {} files, expected 4: {report}", applied.len()));
+        return Err(format!(
+            "round1 commit_all applied {} files, expected 4: {report}",
+            applied.len()
+        ));
     }
-    expect_eq("test.txt (baseline)", &read_file(&ws.join("test.txt"))?, "helloworld")?;
-    expect_eq("test1.txt (baseline)", &read_file(&ws.join("test1.txt"))?, "helloworld123")?;
+    expect_eq(
+        "test.txt (baseline)",
+        &read_file(&ws.join("test.txt"))?,
+        "helloworld",
+    )?;
+    expect_eq(
+        "test1.txt (baseline)",
+        &read_file(&ws.join("test1.txt"))?,
+        "helloworld123",
+    )?;
     Ok(session1)
 }
 
-fn run_round2(ws: &Path, script: &str, case_name: &str) -> Result<(String, HashSet<String>), String> {
+fn run_round2(
+    ws: &Path,
+    script: &str,
+    case_name: &str,
+) -> Result<(String, HashSet<String>), String> {
     let before = list_cow_sessions();
     let run = run_harness(ws, &run_shell_script_turns(script), &["--cow"], case_name);
     if !run.status.success() {
@@ -399,10 +443,22 @@ fn case_a_commit_only_new_file() -> Result<(), String> {
     if applied != vec!["test2.txt".to_string()] {
         return Err(format!("expected only test2.txt applied, got {applied:?}"));
     }
-    expect_eq("test2.txt", &read_file(&ws.join("test2.txt"))?, "helloworld123")?;
+    expect_eq(
+        "test2.txt",
+        &read_file(&ws.join("test2.txt"))?,
+        "helloworld123",
+    )?;
     // 他は未コミットのまま(ラウンド1の値のまま)であること。
-    expect_eq("test.txt unchanged", &read_file(&ws.join("test.txt"))?, "helloworld")?;
-    expect_eq("test1.txt unchanged", &read_file(&ws.join("test1.txt"))?, "helloworld123")?;
+    expect_eq(
+        "test.txt unchanged",
+        &read_file(&ws.join("test.txt"))?,
+        "helloworld",
+    )?;
+    expect_eq(
+        "test1.txt unchanged",
+        &read_file(&ws.join("test1.txt"))?,
+        "helloworld123",
+    )?;
     if !ws.join("test3.txt").exists() {
         return Err("test3.txt should still exist (delete not committed)".to_string());
     }
@@ -423,8 +479,16 @@ fn case_b_commit_only_modifications() -> Result<(), String> {
     apply_cow(&ws, &session2, Some("test.txt"))?;
     let report = apply_cow(&ws, &session2, Some("test1.txt"))?;
     let _ = report;
-    expect_eq("test.txt modified", &read_file(&ws.join("test.txt"))?, "helloworld!!!")?;
-    expect_eq("test1.txt modified", &read_file(&ws.join("test1.txt"))?, "evil")?;
+    expect_eq(
+        "test.txt modified",
+        &read_file(&ws.join("test.txt"))?,
+        "helloworld!!!",
+    )?;
+    expect_eq(
+        "test1.txt modified",
+        &read_file(&ws.join("test1.txt"))?,
+        "evil",
+    )?;
     if ws.join("test2.txt").exists() {
         return Err("test2.txt (create) should not be committed yet".to_string());
     }
@@ -446,7 +510,11 @@ fn case_c_commit_only_deletion() -> Result<(), String> {
     if ws.join("test3.txt").exists() {
         return Err("test3.txt should have been deleted".to_string());
     }
-    expect_eq("test.txt unchanged", &read_file(&ws.join("test.txt"))?, "helloworld")?;
+    expect_eq(
+        "test.txt unchanged",
+        &read_file(&ws.join("test.txt"))?,
+        "helloworld",
+    )?;
 
     cleanup_on_success(&ws, &[&session1, &session2], "cow-c");
     Ok(())
@@ -482,9 +550,17 @@ fn case_e_commit_all_at_once() -> Result<(), String> {
     if applied.len() != 6 {
         return Err(format!("expected 6 applied entries (modify x2, create x1, delete x1, rename=delete+create x2), got {}: {report}", applied.len()));
     }
-    expect_eq("test.txt", &read_file(&ws.join("test.txt"))?, "helloworld!!!")?;
+    expect_eq(
+        "test.txt",
+        &read_file(&ws.join("test.txt"))?,
+        "helloworld!!!",
+    )?;
     expect_eq("test1.txt", &read_file(&ws.join("test1.txt"))?, "evil")?;
-    expect_eq("test2.txt", &read_file(&ws.join("test2.txt"))?, "helloworld123")?;
+    expect_eq(
+        "test2.txt",
+        &read_file(&ws.join("test2.txt"))?,
+        "helloworld123",
+    )?;
     expect_eq("test5.txt", &read_file(&ws.join("test5.txt"))?, "baseline4")?;
     if ws.join("test3.txt").exists() || ws.join("test4.txt").exists() {
         return Err("test3.txt/test4.txt should be gone".to_string());
@@ -506,9 +582,17 @@ fn case_f_partial_then_rest_matches_commit_all() -> Result<(), String> {
     let final_report = apply_cow(&ws, &session2, None)?;
     let _ = final_report;
 
-    expect_eq("test.txt", &read_file(&ws.join("test.txt"))?, "helloworld!!!")?;
+    expect_eq(
+        "test.txt",
+        &read_file(&ws.join("test.txt"))?,
+        "helloworld!!!",
+    )?;
     expect_eq("test1.txt", &read_file(&ws.join("test1.txt"))?, "evil")?;
-    expect_eq("test2.txt", &read_file(&ws.join("test2.txt"))?, "helloworld123")?;
+    expect_eq(
+        "test2.txt",
+        &read_file(&ws.join("test2.txt"))?,
+        "helloworld123",
+    )?;
     expect_eq("test5.txt", &read_file(&ws.join("test5.txt"))?, "baseline4")?;
     if ws.join("test3.txt").exists() || ws.join("test4.txt").exists() {
         return Err("test3.txt/test4.txt should be gone after committing the rest".to_string());
@@ -538,8 +622,13 @@ Set-Content .git/config 'evil-injected' -NoNewline";
         .iter()
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
-    if !hard_denied.iter().any(|p| p.replace('\\', "/") == ".git/config") {
-        return Err(format!(".git/config should be hard_denied (D-05), got {report}"));
+    if !hard_denied
+        .iter()
+        .any(|p| p.replace('\\', "/") == ".git/config")
+    {
+        return Err(format!(
+            ".git/config should be hard_denied (D-05), got {report}"
+        ));
     }
     if ws.join(".git").join("config").exists() {
         return Err("D-05 violated: .git/config was written to the real workspace".to_string());
@@ -631,7 +720,9 @@ fn case_i_write_file_tool_is_captured_by_cow() -> Result<(), String> {
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
     if applied != vec!["notes.txt".to_string()] {
-        return Err(format!("expected only notes.txt applied, got {applied:?}: {report}"));
+        return Err(format!(
+            "expected only notes.txt applied, got {applied:?}: {report}"
+        ));
     }
     expect_eq(
         "notes.txt",
@@ -652,7 +743,13 @@ fn case_j_discard_removes_all_changes() -> Result<(), String> {
     let (session2, _) = run_round2(&ws, ROUND2_SCRIPT, "cow-j-r2")?;
 
     let output = Command::new(harness_exe())
-        .args(["--cwd", ws.to_str().unwrap(), "discard", "--session", &session2])
+        .args([
+            "--cwd",
+            ws.to_str().unwrap(),
+            "discard",
+            "--session",
+            &session2,
+        ])
         .output()
         .map_err(|e| format!("failed to spawn harness discard: {e}"))?;
     if !output.status.success() {
@@ -664,7 +761,9 @@ fn case_j_discard_removes_all_changes() -> Result<(), String> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.contains("discarded changes") {
-        return Err(format!("expected discard stdout to contain 'discarded changes', got: {stdout}"));
+        return Err(format!(
+            "expected discard stdout to contain 'discarded changes', got: {stdout}"
+        ));
     }
     // round2の変更（`helloworld!!!`）はworkspaceへ一切反映されず、round1のbaselineのまま。
     expect_eq(
@@ -674,7 +773,9 @@ fn case_j_discard_removes_all_changes() -> Result<(), String> {
     )?;
     let after = list_cow_sessions();
     if after.contains(&session2) {
-        return Err(format!("session {session2} must be gone from list_cow_sessions() after discard"));
+        return Err(format!(
+            "session {session2} must be gone from list_cow_sessions() after discard"
+        ));
     }
 
     cleanup_on_success(&ws, &[&session1], "cow-j");
@@ -691,14 +792,24 @@ fn case_k_resolve_auto_merges_non_overlapping_conflict() -> Result<(), String> {
     let ws = case_dir("cow-k-resolve");
     let before = list_cow_sessions();
     let baseline_script = "Set-Content test.txt \"line1`nline2`nline3\" -NoNewline";
-    let run1 = run_harness(&ws, &run_shell_script_turns(baseline_script), &["--cow"], "cow-k-r1");
+    let run1 = run_harness(
+        &ws,
+        &run_shell_script_turns(baseline_script),
+        &["--cow"],
+        "cow-k-r1",
+    );
     if !run1.status.success() {
-        return Err(format!("baseline harness invocation failed: {}", run1.stderr));
+        return Err(format!(
+            "baseline harness invocation failed: {}",
+            run1.stderr
+        ));
     }
     let session1 = new_cow_session(&before)?;
     let report1 = apply_cow(&ws, &session1, None)?;
     if report1["applied"].as_array().map(|a| a.len()).unwrap_or(0) != 1 {
-        return Err(format!("expected baseline commit to apply exactly test.txt: {report1}"));
+        return Err(format!(
+            "expected baseline commit to apply exactly test.txt: {report1}"
+        ));
     }
     expect_eq(
         "test.txt (baseline)",
@@ -718,7 +829,13 @@ fn case_k_resolve_auto_merges_non_overlapping_conflict() -> Result<(), String> {
         .map_err(|e| format!("failed to simulate external write: {e}"))?;
 
     let output = Command::new(harness_exe())
-        .args(["--cwd", ws.to_str().unwrap(), "resolve", "--session", &session2])
+        .args([
+            "--cwd",
+            ws.to_str().unwrap(),
+            "resolve",
+            "--session",
+            &session2,
+        ])
         .output()
         .map_err(|e| format!("failed to spawn harness resolve: {e}"))?;
     if !output.status.success() {
@@ -765,7 +882,9 @@ fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
     // 所有プロセスの終了とともにOSが解放するため、再開時に「まだliveと誤認識される」ことは
     // 無い、設計書§19.11参照）。
     if cow_session_is_live(&session_id) {
-        return Err(format!("session {session_id} should not be live after its process exited"));
+        return Err(format!(
+            "session {session_id} should not be live after its process exited"
+        ));
     }
 
     // 同一session_idで--resume --cowにより再開し、2つ目のファイルを追加する。
@@ -777,12 +896,17 @@ fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
         "cow-l-r2",
     );
     if !run2.status.success() {
-        return Err(format!("resumed harness invocation failed: {}", run2.stderr));
+        return Err(format!(
+            "resumed harness invocation failed: {}",
+            run2.stderr
+        ));
     }
     // resumeは新しいCoWセッションを作らず、同じsession_idのupper_dirを再利用しているはず。
     let after_resume = list_cow_sessions();
     if !after_resume.contains(&session_id) {
-        return Err(format!("session {session_id} should still exist after resume"));
+        return Err(format!(
+            "session {session_id} should still exist after resume"
+        ));
     }
     let new_sessions: Vec<&String> = after_resume.difference(&before).collect();
     if new_sessions != vec![&session_id] {
@@ -804,7 +928,11 @@ fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
             "expected both round1 and round2 files to be captured under the same session, got {applied:?}: {report}"
         ));
     }
-    expect_eq("first.txt", &read_file(&ws.join("first.txt"))?, "written in round 1")?;
+    expect_eq(
+        "first.txt",
+        &read_file(&ws.join("first.txt"))?,
+        "written in round 1",
+    )?;
     expect_eq(
         "second.txt",
         &read_file(&ws.join("second.txt"))?,
@@ -859,13 +987,19 @@ deleted = $deleted; err = $err; existsAfterDelete = $existsAfterDelete } | Conve
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .rfind(|v| v.get("existsAfterDelete").is_some())
-        .ok_or_else(|| format!("could not find the expected JSON summary line in output: {result_text}"))?;
+        .ok_or_else(|| {
+            format!("could not find the expected JSON summary line in output: {result_text}")
+        })?;
 
     if report["createdBefore"].as_bool() != Some(false) {
-        return Err(format!("newfile.txt should not exist before New-Item: {report}"));
+        return Err(format!(
+            "newfile.txt should not exist before New-Item: {report}"
+        ));
     }
     if report["existsAfterCreate"].as_bool() != Some(true) {
-        return Err(format!("newfile.txt should exist right after New-Item: {report}"));
+        return Err(format!(
+            "newfile.txt should exist right after New-Item: {report}"
+        ));
     }
     if report["deleted"].as_bool() != Some(true) {
         return Err(format!(
@@ -878,7 +1012,9 @@ deleted = $deleted; err = $err; existsAfterDelete = $existsAfterDelete } | Conve
         return Err(format!("Remove-Item must not raise an error: {report}"));
     }
     if report["existsAfterDelete"].as_bool() != Some(false) {
-        return Err(format!("newfile.txt must be gone after Remove-Item: {report}"));
+        return Err(format!(
+            "newfile.txt must be gone after Remove-Item: {report}"
+        ));
     }
 
     cleanup_on_success(&ws, &[&session], "cow-m");
@@ -929,7 +1065,9 @@ $seedContent = [string](Get-Content seed.txt -Raw); \
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .rfind(|v| v.get("names").is_some())
-        .ok_or_else(|| format!("could not find the expected JSON summary line in output: {result_text}"))?;
+        .ok_or_else(|| {
+            format!("could not find the expected JSON summary line in output: {result_text}")
+        })?;
 
     let names = report["names"].as_str().unwrap_or_default();
     let name_list: Vec<&str> = names.split(',').collect();
@@ -951,7 +1089,9 @@ $seedContent = [string](Get-Content seed.txt -Raw); \
 
     let seed_content = report["seedContent"].as_str().unwrap_or_default();
     if seed_content.trim() != "seed-content" {
-        return Err(format!("Get-Content seed.txt returned unexpected content: {report}"));
+        return Err(format!(
+            "Get-Content seed.txt returned unexpected content: {report}"
+        ));
     }
 
     let ops_path = cow_upper_dir(&session).join(".harness-cow-ops.jsonl");
@@ -1018,7 +1158,9 @@ fn case_o_direct_write_into_the_upper_dir_is_recorded() -> Result<(), String> {
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
     if applied != vec!["direct.txt".to_string()] {
-        return Err(format!("expected direct.txt to be applied, got {applied:?}: {report}"));
+        return Err(format!(
+            "expected direct.txt to be applied, got {applied:?}: {report}"
+        ));
     }
     expect_eq(
         "direct.txt",
@@ -1047,7 +1189,9 @@ fn run_cwd_spelling_case(
 ) -> Result<(), String> {
     let ws = case_dir(case_name);
     // `case_dir`は相対パスを返さない（`CASE_ROOT`固定）。実パスを控えてから綴りを作る。
-    let real = ws.canonicalize().map_err(|e| format!("canonicalize {}: {e}", ws.display()))?;
+    let real = ws
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {}: {e}", ws.display()))?;
     let real = real
         .to_string_lossy()
         .strip_prefix(r"\\?\")
@@ -1067,7 +1211,8 @@ fn assert_cow_redirect_through_cwd(
     cleanup_root: &Path,
 ) -> Result<(), String> {
     let real = real.to_path_buf();
-    std::fs::write(real.join("notes.txt"), "original").map_err(|e| format!("seed notes.txt: {e}"))?;
+    std::fs::write(real.join("notes.txt"), "original")
+        .map_err(|e| format!("seed notes.txt: {e}"))?;
 
     let script = format!(
         "Set-Content -LiteralPath '{}' -Value 'modified-by-agent' -NoNewline",
@@ -1099,8 +1244,10 @@ fn assert_cow_redirect_through_cwd(
     )?;
     // 2. 透過性: upperへリダイレクトされている。
     let upper_content = read_file(&upper.join("notes.txt")).map_err(|e| {
-        format!("--cwd {cwd_arg:?}: the write was not redirected to the upper dir ({e}); \
-                 this is exactly the BUG-066 symptom")
+        format!(
+            "--cwd {cwd_arg:?}: the write was not redirected to the upper dir ({e}); \
+                 this is exactly the BUG-066 symptom"
+        )
     })?;
     expect_eq("upper content", &upper_content, "modified-by-agent")?;
     // 3. 可視性: 操作台帳に載り、`apply`で実workspaceへ反映される。
@@ -1112,19 +1259,22 @@ fn assert_cow_redirect_through_cwd(
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
     if applied != vec!["notes.txt".to_string()] {
-        return Err(format!("expected notes.txt applied, got {applied:?}: {report}"));
+        return Err(format!(
+            "expected notes.txt applied, got {applied:?}: {report}"
+        ));
     }
-    expect_eq("applied content", &read_file(&real.join("notes.txt"))?, "modified-by-agent")?;
+    expect_eq(
+        "applied content",
+        &read_file(&real.join("notes.txt"))?,
+        "modified-by-agent",
+    )?;
     // 4. 自己診断: workspace**内**への拒否が1件も無いこと（あればリダイレクトが働いていない）。
     let denied = harness_change_ledger::store::read_denied_log(&upper);
     let inside: Vec<&str> = denied
         .iter()
         .filter(|e| {
-            harness_change_ledger::path_rules::relative_under_root(
-                &e.path,
-                &real.to_string_lossy(),
-            )
-            .is_some()
+            harness_change_ledger::path_rules::relative_under_root(&e.path, &real.to_string_lossy())
+                .is_some()
         })
         .map(|e| e.path.as_str())
         .collect();
@@ -1192,7 +1342,9 @@ fn case_t_workspace_path_longer_than_max_path() -> Result<(), String> {
         .map_err(|e| format!("create deep workspace {}: {e}", deep.display()))?;
     let len = deep.to_string_lossy().chars().count();
     if len <= 260 {
-        return Err(format!("test setup is wrong: workspace path is only {len} chars"));
+        return Err(format!(
+            "test setup is wrong: workspace path is only {len} chars"
+        ));
     }
     println!("MEASUREMENT: long workspace path is {len} chars");
 
@@ -1230,7 +1382,9 @@ fn case_t_workspace_path_longer_than_max_path() -> Result<(), String> {
     let after = list_cow_sessions();
     let leaked: Vec<&String> = after.difference(&before).collect();
     if !leaked.is_empty() {
-        return Err(format!("no CoW session may be created before refusing: {leaked:?}"));
+        return Err(format!(
+            "no CoW session may be created before refusing: {leaked:?}"
+        ));
     }
 
     let _ = std::fs::remove_dir_all(&case_root);
@@ -1259,13 +1413,28 @@ fn tier2a_cow_commit_matrix() {
         ("C-delete-only", case_c_commit_only_deletion),
         ("D-rename-only", case_d_commit_only_rename),
         ("E-commit-all", case_e_commit_all_at_once),
-        ("F-partial-then-rest", case_f_partial_then_rest_matches_commit_all),
-        ("G-hard-deny-config-injection", case_g_hard_deny_config_injection),
+        (
+            "F-partial-then-rest",
+            case_f_partial_then_rest_matches_commit_all,
+        ),
+        (
+            "G-hard-deny-config-injection",
+            case_g_hard_deny_config_injection,
+        ),
         ("H-toctou-conflict", case_h_toctou_conflict),
-        ("I-write-file-tool-captured", case_i_write_file_tool_is_captured_by_cow),
+        (
+            "I-write-file-tool-captured",
+            case_i_write_file_tool_is_captured_by_cow,
+        ),
         ("J-discard", case_j_discard_removes_all_changes),
-        ("K-resolve-auto-merge", case_k_resolve_auto_merges_non_overlapping_conflict),
-        ("L-resume-continues-session", case_l_resume_continues_same_cow_session),
+        (
+            "K-resolve-auto-merge",
+            case_k_resolve_auto_merges_non_overlapping_conflict,
+        ),
+        (
+            "L-resume-continues-session",
+            case_l_resume_continues_same_cow_session,
+        ),
         (
             "M-create-delete-same-session",
             case_m_new_file_created_and_deleted_within_same_cow_session,
@@ -1284,7 +1453,10 @@ fn tier2a_cow_commit_matrix() {
         ("Q-cwd-uppercased", case_q_cwd_uppercased),
         ("R-cwd-trailing-separator", case_r_cwd_trailing_separator),
         ("S-cwd-verbatim-prefix", case_s_cwd_verbatim_prefix),
-        ("T-workspace-longer-than-max-path", case_t_workspace_path_longer_than_max_path),
+        (
+            "T-workspace-longer-than-max-path",
+            case_t_workspace_path_longer_than_max_path,
+        ),
     ];
     let mut passed = 0;
     let total = cases.len();
@@ -1293,7 +1465,10 @@ fn tier2a_cow_commit_matrix() {
             passed += 1;
         }
     }
-    assert_eq!(passed, total, "{passed}/{total} CoW commit matrix cases passed (see per-case JSON above for details)");
+    assert_eq!(
+        passed, total,
+        "{passed}/{total} CoW commit matrix cases passed (see per-case JSON above for details)"
+    );
 }
 
 // ============================================================================
@@ -1341,8 +1516,19 @@ fn net_case_ws(name: &str) -> PathBuf {
 /// `allowed:false`エントリがあることを二重証拠として要求する(Q4)。`--staged`を付けて
 /// `sandbox_dir`を確保するのは、それが無いと`net-audit.jsonl`自体が書かれないため
 /// (`crates/harness-tools/src/shell.rs`の`audit_log_path`はstaging有効時のみ設定される)。
-fn run_net_case(name: &str, allow_domains: &[&str], case_matrix_case: &str, deny_hosts_expected: &[&str]) -> Result<(), String> {
-    run_net_case_with_exe(&harness_exe(), name, allow_domains, case_matrix_case, deny_hosts_expected)
+fn run_net_case(
+    name: &str,
+    allow_domains: &[&str],
+    case_matrix_case: &str,
+    deny_hosts_expected: &[&str],
+) -> Result<(), String> {
+    run_net_case_with_exe(
+        &harness_exe(),
+        name,
+        allow_domains,
+        case_matrix_case,
+        deny_hosts_expected,
+    )
 }
 
 /// `run_net_case`の`harness.exe`パスを差し替え可能な版（WFP fail-closedケース専用）。
@@ -1353,7 +1539,14 @@ fn run_net_case_with_exe(
     case_matrix_case: &str,
     deny_hosts_expected: &[&str],
 ) -> Result<(), String> {
-    run_net_case_with_exe_and_stderr_check(exe, name, allow_domains, case_matrix_case, deny_hosts_expected, None)
+    run_net_case_with_exe_and_stderr_check(
+        exe,
+        name,
+        allow_domains,
+        case_matrix_case,
+        deny_hosts_expected,
+        None,
+    )
 }
 
 /// `run_net_case_with_exe`に、harness自身のstderrへ特定文字列が出ていることの追加検証を
@@ -1374,7 +1567,13 @@ fn run_net_case_with_exe_and_stderr_check(
         extra_args.push(d);
     }
     let script = format!(".\\tier2a-net-e2e.exe case-matrix --case {case_matrix_case}");
-    let run = run_harness_with_exe(exe, &ws, &run_shell_script_turns(&script), &extra_args, name);
+    let run = run_harness_with_exe(
+        exe,
+        &ws,
+        &run_shell_script_turns(&script),
+        &extra_args,
+        name,
+    );
     if !run.status.success() {
         return Err(format!("harness invocation itself failed: {}", run.stderr));
     }
@@ -1401,9 +1600,13 @@ fn run_net_case_with_exe_and_stderr_check(
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .rfind(|v| v.get("passed").is_some())
         .and_then(|v| v["passed"].as_bool())
-        .ok_or_else(|| format!("could not find case-matrix summary line in output: {result_text}"))?;
+        .ok_or_else(|| {
+            format!("could not find case-matrix summary line in output: {result_text}")
+        })?;
     if !case_matrix_passed {
-        return Err(format!("case-matrix reported a mismatch (allow/deny did not match expectation): {result_text}"));
+        return Err(format!(
+            "case-matrix reported a mismatch (allow/deny did not match expectation): {result_text}"
+        ));
     }
 
     // 二重証拠: 監査ログにも対象ホストのallowed:falseが実際に記録されていること。
@@ -1412,7 +1615,10 @@ fn run_net_case_with_exe_and_stderr_check(
     for host in deny_hosts_expected {
         let found = audit_entries.iter().any(|e| {
             e.get("allowed") == Some(&serde_json::Value::Bool(false))
-                && e.get("host").and_then(|h| h.as_str()).map(|h| h.contains(host)).unwrap_or(false)
+                && e.get("host")
+                    .and_then(|h| h.as_str())
+                    .map(|h| h.contains(host))
+                    .unwrap_or(false)
         });
         if !found {
             return Err(format!(
@@ -1447,17 +1653,32 @@ fn collect_audit_entries(sandbox_root: &Path) -> Result<Vec<serde_json::Value>, 
 }
 
 fn net_case_01_none() -> Result<(), String> {
-    run_net_case("net-01-none", &[], "all-denied", &["example.com", "google.com"])
+    run_net_case(
+        "net-01-none",
+        &[],
+        "all-denied",
+        &["example.com", "google.com"],
+    )
 }
 
 fn net_case_02_invalid_domain() -> Result<(), String> {
-    run_net_case("net-02-invalid", &["invalidexample.com"], "all-denied", &["example.com", "google.com"])
+    run_net_case(
+        "net-02-invalid",
+        &["invalidexample.com"],
+        "all-denied",
+        &["example.com", "google.com"],
+    )
 }
 
 /// 03: example.com許可。case-matrix `domains`はexample.com=allow/google.com=denyを同時に
 /// アサートするため、これ自体がpositive control(通信路が生きていることの証明)を兼ねる(Q5)。
 fn net_case_03_example_allowed() -> Result<(), String> {
-    run_net_case("net-03-example", &["example.com"], "domains", &["google.com"])
+    run_net_case(
+        "net-03-example",
+        &["example.com"],
+        "domains",
+        &["google.com"],
+    )
 }
 
 /// 05: Layer2検証。example.comは許可済みだが、`raw-connect`はプロキシ環境変数を無視して
@@ -1641,8 +1862,7 @@ fn net_case_08_keepalive_reevaluates_per_request() -> Result<(), String> {
     let audit_entries = collect_audit_entries(&audit_path)?;
     let denied = audit_entries.iter().any(|e| {
         e.get("allowed") == Some(&serde_json::Value::Bool(false))
-            && e
-                .get("host")
+            && e.get("host")
                 .and_then(|h| h.as_str())
                 .map(|h| h.contains("google.com"))
                 .unwrap_or(false)
@@ -1704,10 +1924,22 @@ fn tier2a_net_policy_matrix() {
         ("03-example-allowed", net_case_03_example_allowed),
         ("05-raw-tcp-layer2", net_case_05_raw_tcp_bypasses_proxy),
         ("06-numeric-ip-layer1", net_case_06_numeric_ip_obfuscation),
-        ("07-wfp-start-failure-fail-closed", net_case_07_wfp_start_failure_is_fail_closed),
-        ("08-keepalive-reevaluates-per-request", net_case_08_keepalive_reevaluates_per_request),
-        ("09-connect-sni-denied-closes-tunnel", net_case_09_connect_sni_denied_closes_tunnel),
-        ("10-wfp-rejected-response-fail-closed", net_case_10_wfp_rejected_response_is_fail_closed),
+        (
+            "07-wfp-start-failure-fail-closed",
+            net_case_07_wfp_start_failure_is_fail_closed,
+        ),
+        (
+            "08-keepalive-reevaluates-per-request",
+            net_case_08_keepalive_reevaluates_per_request,
+        ),
+        (
+            "09-connect-sni-denied-closes-tunnel",
+            net_case_09_connect_sni_denied_closes_tunnel,
+        ),
+        (
+            "10-wfp-rejected-response-fail-closed",
+            net_case_10_wfp_rejected_response_is_fail_closed,
+        ),
     ];
     let mut passed = 0;
     let total = cases.len();
@@ -1716,7 +1948,10 @@ fn tier2a_net_policy_matrix() {
             passed += 1;
         }
     }
-    assert_eq!(passed, total, "{passed}/{total} network policy matrix cases passed (see per-case JSON above for details)");
+    assert_eq!(
+        passed, total,
+        "{passed}/{total} network policy matrix cases passed (see per-case JSON above for details)"
+    );
 }
 
 // ============================================================================
@@ -1733,7 +1968,10 @@ fn tier2a_net_policy_matrix() {
 /// 既に付与済みの祖先traverseに相乗りしてしまい、**D-45が効いているのか、以前からの
 /// 付与のおかげなのかを区別できない**（RESULTS.md §19の測定と同じ理由）。
 fn fs_allow_case_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(format!(r"C:\harness-e2e-fsallow-{name}-{}", std::process::id()));
+    let dir = PathBuf::from(format!(
+        r"C:\harness-e2e-fsallow-{name}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create fs-allow target dir");
     dir
@@ -1893,9 +2131,18 @@ fn fs_allow_case_ace_is_revoked_when_the_session_ends() -> Result<(), String> {
 #[ignore]
 fn tier2a_fs_allow_matrix() {
     let cases: Vec<(&str, CaseFn)> = vec![
-        ("ro-reads-but-cannot-write", fs_allow_case_ro_reads_but_cannot_write),
-        ("rw-write-delete-move", fs_allow_case_rw_can_write_delete_and_move),
-        ("ace-revoked-at-session-end", fs_allow_case_ace_is_revoked_when_the_session_ends),
+        (
+            "ro-reads-but-cannot-write",
+            fs_allow_case_ro_reads_but_cannot_write,
+        ),
+        (
+            "rw-write-delete-move",
+            fs_allow_case_rw_can_write_delete_and_move,
+        ),
+        (
+            "ace-revoked-at-session-end",
+            fs_allow_case_ace_is_revoked_when_the_session_ends,
+        ),
     ];
     let mut passed = 0;
     let total = cases.len();
@@ -1904,7 +2151,10 @@ fn tier2a_fs_allow_matrix() {
             passed += 1;
         }
     }
-    assert_eq!(passed, total, "{passed}/{total} fs-allow cases passed (see per-case JSON above)");
+    assert_eq!(
+        passed, total,
+        "{passed}/{total} fs-allow cases passed (see per-case JSON above)"
+    );
 }
 
 // ============================================================================
@@ -1992,7 +2242,8 @@ fn chain_launch_case_no_extra_uac_path_is_taken() -> Result<(), String> {
 #[test]
 #[ignore]
 fn tier2a_chain_launch_uses_the_no_extra_uac_path() {
-    let cases: Vec<(&str, CaseFn)> = vec![("no-extra-uac", chain_launch_case_no_extra_uac_path_is_taken)];
+    let cases: Vec<(&str, CaseFn)> =
+        vec![("no-extra-uac", chain_launch_case_no_extra_uac_path_is_taken)];
     let mut passed = 0;
     let total = cases.len();
     for (name, f) in cases {
@@ -2000,7 +2251,10 @@ fn tier2a_chain_launch_uses_the_no_extra_uac_path() {
             passed += 1;
         }
     }
-    assert_eq!(passed, total, "{passed}/{total} chain-launch cases passed (see per-case JSON above)");
+    assert_eq!(
+        passed, total,
+        "{passed}/{total} chain-launch cases passed (see per-case JSON above)"
+    );
 }
 
 // ============================================================================
@@ -2177,7 +2431,11 @@ fn mcp_corroboration_turns() -> Vec<Vec<StreamEvent>> {
             }]
         })),
         // ラウンド1: ワークスペースの実ファイル（接地優先順位1）。
-        plan_and_tool_turn("call_1", "read_file", serde_json::json!({ "path": "shell.rs" })),
+        plan_and_tool_turn(
+            "call_1",
+            "read_file",
+            serde_json::json!({ "path": "shell.rs" }),
+        ),
         distill("shell.rsがpowershell.exeを起動している"),
         // まだ裏取りできていないので決着させない。
         phase_text_turn(serde_json::json!({
@@ -2295,8 +2553,14 @@ fn mcp_case_without_the_declaration_it_stays_single_source() -> Result<(), Strin
 #[ignore]
 fn tier2a_mcp_corroboration() {
     let cases: Vec<(&str, CaseFn)> = vec![
-        ("real-server-corroborates", mcp_case_real_server_corroborates_a_local_observation),
-        ("no-declaration-stays-single-source", mcp_case_without_the_declaration_it_stays_single_source),
+        (
+            "real-server-corroborates",
+            mcp_case_real_server_corroborates_a_local_observation,
+        ),
+        (
+            "no-declaration-stays-single-source",
+            mcp_case_without_the_declaration_it_stays_single_source,
+        ),
     ];
     let mut passed = 0;
     let total = cases.len();
@@ -2305,7 +2569,10 @@ fn tier2a_mcp_corroboration() {
             passed += 1;
         }
     }
-    assert_eq!(passed, total, "{passed}/{total} mcp corroboration cases passed (see per-case JSON above)");
+    assert_eq!(
+        passed, total,
+        "{passed}/{total} mcp corroboration cases passed (see per-case JSON above)"
+    );
 }
 
 // ============================================================================
@@ -2357,12 +2624,23 @@ fn read_fs_ledger_entries() -> Result<Vec<(String, bool, Vec<String>)>, String> 
     Ok(entries
         .iter()
         .map(|e| {
-            let path = e.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            let managed = e.get("settings_managed").and_then(|v| v.as_bool()).unwrap_or(false);
+            let path = e
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let managed = e
+                .get("settings_managed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let workspaces = e
                 .get("settings_workspaces")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|w| w.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|w| w.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             (path, managed, workspaces)
         })
@@ -2410,7 +2688,10 @@ fn purge_fs_ledger_entries(targets: &[&Path]) {
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&data) else {
         return;
     };
-    let keys: HashSet<String> = targets.iter().map(|t| t.to_string_lossy().to_string()).collect();
+    let keys: HashSet<String> = targets
+        .iter()
+        .map(|t| t.to_string_lossy().to_string())
+        .collect();
     if let Some(entries) = json.get_mut("entries").and_then(|v| v.as_array_mut()) {
         entries.retain(|e| {
             !e.get("path")
@@ -2425,7 +2706,11 @@ fn purge_fs_ledger_entries(targets: &[&Path]) {
     set_ledger_readonly(&path, false);
     let wrote = std::fs::write(&path, text).is_ok();
     set_ledger_readonly(&path, true);
-    assert!(wrote, "failed to purge test entries from {}", path.display());
+    assert!(
+        wrote,
+        "failed to purge test entries from {}",
+        path.display()
+    );
 }
 
 fn set_ledger_readonly(path: &Path, readonly: bool) {
@@ -2567,19 +2852,30 @@ fn fs_ledger_case_concurrent_startups_do_not_lose_updates() -> Result<(), String
             .map_err(|e| finish(e.to_string()))?;
         let mut cmd = Command::new(harness_exe());
         cmd.args([
-            "--provider", "mock",
-            "--mock-turns", turns_path.to_str().unwrap(),
-            "--cwd", ws.to_str().unwrap(),
-            "--permission-mode", "accept-all",
+            "--provider",
+            "mock",
+            "--mock-turns",
+            turns_path.to_str().unwrap(),
+            "--cwd",
+            ws.to_str().unwrap(),
+            "--permission-mode",
+            "accept-all",
             "--dangerously-allow",
-            "--output-format", "json",
-            "-p", "(scripted)",
+            "--output-format",
+            "json",
+            "-p",
+            "(scripted)",
         ]);
-        children.push(cmd.spawn().map_err(|e| finish(format!("failed to spawn harness.exe: {e}")))?);
+        children.push(
+            cmd.spawn()
+                .map_err(|e| finish(format!("failed to spawn harness.exe: {e}")))?,
+        );
     }
     let mut failures = Vec::new();
     for (i, child) in children.into_iter().enumerate() {
-        let out = child.wait_with_output().map_err(|e| finish(e.to_string()))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| finish(e.to_string()))?;
         if !out.status.success() {
             failures.push(format!(
                 "concurrent harness #{i} exited with {}: {}",
@@ -2635,8 +2931,14 @@ fn fs_ledger_case_concurrent_startups_do_not_lose_updates() -> Result<(), String
 #[ignore]
 fn tier2a_fs_ledger_lifecycle() {
     let cases: Vec<(&str, CaseFn)> = vec![
-        ("shared-declaration-is-refcounted", fs_ledger_case_shared_declaration_is_refcounted),
-        ("concurrent-startups-do-not-lose-updates", fs_ledger_case_concurrent_startups_do_not_lose_updates),
+        (
+            "shared-declaration-is-refcounted",
+            fs_ledger_case_shared_declaration_is_refcounted,
+        ),
+        (
+            "concurrent-startups-do-not-lose-updates",
+            fs_ledger_case_concurrent_startups_do_not_lose_updates,
+        ),
     ];
     let mut passed = 0;
     let total = cases.len();
@@ -2645,5 +2947,8 @@ fn tier2a_fs_ledger_lifecycle() {
             passed += 1;
         }
     }
-    assert_eq!(passed, total, "{passed}/{total} fs ledger lifecycle cases passed (see per-case JSON above)");
+    assert_eq!(
+        passed, total,
+        "{passed}/{total} fs ledger lifecycle cases passed (see per-case JSON above)"
+    );
 }

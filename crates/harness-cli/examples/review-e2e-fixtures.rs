@@ -124,7 +124,11 @@ fn scenario_table(scenarios: &[Scenario]) -> String {
             "| `{}` | {}件・{} | {} | {} |\n",
             s.id,
             s.conversation.len(),
-            if s.conversation.len() > 4 { "長文" } else { "短文" },
+            if s.conversation.len() > 4 {
+                "長文"
+            } else {
+                "短文"
+            },
             s.files.len(),
             s.expect
         ));
@@ -226,12 +230,19 @@ fn short_ts(title: &str) -> String {
 
 /// `lines`行の疑似Rustソース。行番号を埋め込んであるので、どのハンクを見ているかが分かる。
 fn long_rs(lines: usize) -> String {
-    let mut out = String::from("//! 長文シナリオ用の疑似モジュール（自動生成）。\n\nuse std::collections::HashMap;\n\n");
+    let mut out = String::from(
+        "//! 長文シナリオ用の疑似モジュール（自動生成）。\n\nuse std::collections::HashMap;\n\n",
+    );
     for i in 0..lines {
         match i % 12 {
-            0 => out.push_str(&format!("/// 手続き{i}の説明。ここは変更されない文脈行です。\n")),
+            0 => out.push_str(&format!(
+                "/// 手続き{i}の説明。ここは変更されない文脈行です。\n"
+            )),
             1 => out.push_str(&format!("pub fn step_{i}(input: &str) -> String {{\n")),
-            2 => out.push_str(&format!("    let mut buf = String::with_capacity({});\n", i * 8)),
+            2 => out.push_str(&format!(
+                "    let mut buf = String::with_capacity({});\n",
+                i * 8
+            )),
             3 => out.push_str("    for (idx, ch) in input.char_indices() {\n"),
             4 => out.push_str("        if idx % 2 == 0 {\n"),
             5 => out.push_str("            buf.push(ch.to_ascii_uppercase());\n"),
@@ -359,15 +370,24 @@ fn multi_short(ws: &Path) -> Scenario {
         id,
         |ws| {
             write_file(ws, "multi-short/src/app.ts", &short_ts("app entry"));
-            write_file(ws, "multi-short/config.json", "{\n  \"name\": \"demo\",\n  \"retries\": 3\n}\n");
-            write_file(ws, "multi-short/notes/todo.md", "- [ ] 古いTODO\n- [ ] もう使っていない\n");
+            write_file(
+                ws,
+                "multi-short/config.json",
+                "{\n  \"name\": \"demo\",\n  \"retries\": 3\n}\n",
+            );
+            write_file(
+                ws,
+                "multi-short/notes/todo.md",
+                "- [ ] 古いTODO\n- [ ] もう使っていない\n",
+            );
         },
         |fs| {
             // 離れた2箇所を変える（＝ハンク2つ）。
             let modified = short_ts("app entry")
                 .replace("const name = \"world\";", "const name = \"harness\";")
                 .replace("export const RETRIES = 3;", "export const RETRIES = 5;");
-            fs.write_string("multi-short/src/app.ts", &modified).unwrap();
+            fs.write_string("multi-short/src/app.ts", &modified)
+                .unwrap();
             fs.write_string(
                 "multi-short/config.json",
                 "{\n  \"name\": \"demo\",\n  \"retries\": 5\n}\n",
@@ -422,7 +442,8 @@ fn multi_long(ws: &Path) -> Scenario {
                 .replace("pub fn step_97(", "pub fn step_97_renamed(")
                 .replace("pub fn step_193(", "pub fn step_193_renamed(")
                 .replace("pub fn step_301(", "pub fn step_301_renamed(");
-            fs.write_string("multi-long/src/engine.rs", &modified).unwrap();
+            fs.write_string("multi-long/src/engine.rs", &modified)
+                .unwrap();
 
             let doc = long_ja_doc(14)
                 .replace("## 0. 節タイトル0", "## 0. 節タイトル0（改訂）")
@@ -461,7 +482,13 @@ fn single_modify_short(ws: &Path) -> Scenario {
     let files = staged_overlay(
         ws,
         id,
-        |ws| write_file(ws, "single-modify-short/src/app.ts", &short_ts("single edit")),
+        |ws| {
+            write_file(
+                ws,
+                "single-modify-short/src/app.ts",
+                &short_ts("single edit"),
+            )
+        },
         |fs| {
             let modified = short_ts("single edit")
                 .replace("export const DEBUG = false;", "export const DEBUG = true;");
@@ -562,7 +589,13 @@ fn single_delete_short(ws: &Path) -> Scenario {
     let files = staged_overlay(
         ws,
         id,
-        |ws| write_file(ws, "single-delete-short/notes/scratch.md", "- 一時メモ\n- 消してよい\n"),
+        |ws| {
+            write_file(
+                ws,
+                "single-delete-short/notes/scratch.md",
+                "- 一時メモ\n- 消してよい\n",
+            )
+        },
         |fs| fs.remove("single-delete-short/notes/scratch.md").unwrap(),
     );
     Scenario {
@@ -579,8 +612,17 @@ fn single_delete_long(ws: &Path) -> Scenario {
     let files = staged_overlay(
         ws,
         id,
-        |ws| write_file(ws, "single-delete-long/legacy/huge_module.rs", &long_rs(400)),
-        |fs| fs.remove("single-delete-long/legacy/huge_module.rs").unwrap(),
+        |ws| {
+            write_file(
+                ws,
+                "single-delete-long/legacy/huge_module.rs",
+                &long_rs(400),
+            )
+        },
+        |fs| {
+            fs.remove("single-delete-long/legacy/huge_module.rs")
+                .unwrap()
+        },
     );
     Scenario {
         id,
@@ -641,10 +683,17 @@ fn combo_short(ws: &Path) -> Scenario {
         |fs| {
             let modified = short_ts("combo entry")
                 .replace("const name = \"world\";", "const name = \"combo\";")
-                .replace("export const TIMEOUT_MS = 1000;", "export const TIMEOUT_MS = 2500;");
-            fs.write_string("combo-short/src/app.ts", &modified).unwrap();
-            fs.write_string("combo-short/src/flags.ts", "export const FEATURE_X = true;\n")
+                .replace(
+                    "export const TIMEOUT_MS = 1000;",
+                    "export const TIMEOUT_MS = 2500;",
+                );
+            fs.write_string("combo-short/src/app.ts", &modified)
                 .unwrap();
+            fs.write_string(
+                "combo-short/src/flags.ts",
+                "export const FEATURE_X = true;\n",
+            )
+            .unwrap();
             fs.remove("combo-short/notes/scratch.md").unwrap();
         },
     );
@@ -678,7 +727,8 @@ fn combo_long(ws: &Path) -> Scenario {
                     &format!("pub fn step_{n}_renamed("),
                 );
             }
-            fs.write_string("combo-long/src/engine.rs", &modified).unwrap();
+            fs.write_string("combo-long/src/engine.rs", &modified)
+                .unwrap();
             let doc = long_ja_doc(16)
                 .replace("## 2. 節タイトル2", "## 2. 節タイトル2（改訂）")
                 .replace("## 11. 節タイトル11", "## 11. 節タイトル11（改訂）");
@@ -731,7 +781,9 @@ fn build_recall_fixtures(out: &Path) -> Vec<(PathBuf, PathBuf)> {
         // ウォーターマークを進めない＝**全件が未レビュー**になる（既定の`ReviewedWatermark`は
         // `{created_at_ms: 0, id: ""}`で、どのcheckpointよりも小さい）。
         let Some(dir) = write_memory(&ws, &specs, None) else {
-            eprintln!("warning: 記憶ディレクトリを用意できなかったためRecallデータを作りませんでした");
+            eprintln!(
+                "warning: 記憶ディレクトリを用意できなかったためRecallデータを作りませんでした"
+            );
             return made;
         };
         println!("[recall] {name} -> {}", dir.display());
@@ -852,10 +904,14 @@ fn checkpoint_body(spec: &CheckpointSpec) -> String {
         }
         out.push_str("\n## 出典\n\n");
         for n in 0..8 {
-            out.push_str(&format!("- File: `crates/harness-sandbox/src/module_{n}.rs`\n"));
+            out.push_str(&format!(
+                "- File: `crates/harness-sandbox/src/module_{n}.rs`\n"
+            ));
         }
     } else {
-        out.push_str("- 要点1: 短い記憶のサンプル。\n- 要点2: 2行目。\n\n## 出典\n\n- File: `README.md`\n");
+        out.push_str(
+            "- 要点1: 短い記憶のサンプル。\n- 要点2: 2行目。\n\n## 出典\n\n- File: `README.md`\n",
+        );
     }
     out
 }

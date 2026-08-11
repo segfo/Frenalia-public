@@ -18,12 +18,7 @@ pub(crate) unsafe fn resolve_module_export(module: &str, name: &str) -> Option<*
     let module_name: Vec<u16> = format!("{module}\0").encode_utf16().collect();
     let module = unsafe { GetModuleHandleW(PCWSTR(module_name.as_ptr())) }.ok()?;
     let name_c = format!("{name}\0");
-    let addr = unsafe {
-        GetProcAddress(
-            module,
-            windows::core::PCSTR(name_c.as_ptr()),
-        )
-    }?;
+    let addr = unsafe { GetProcAddress(module, windows::core::PCSTR(name_c.as_ptr())) }?;
     Some(addr as *const c_void)
 }
 
@@ -82,9 +77,16 @@ pub(crate) unsafe fn resolve_config(param: *const u8) -> Option<Config> {
     // （`get_env`が空文字列全体は既に`None`扱いにするが、"C:\a;;C:\b"のような中間の
     // 空要素を防御的に無視する）。
     let ext_capture_roots: Vec<PathBuf> = get_env("HARNESS_COW_EXT_ROOTS")
-        .map(|v| v.split(';').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
+        .map(|v| {
+            v.split(';')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
         .unwrap_or_default();
-    debug_log(&format!("init: HARNESS_COW_EXT_ROOTS={ext_capture_roots:?}"));
+    debug_log(&format!(
+        "init: HARNESS_COW_EXT_ROOTS={ext_capture_roots:?}"
+    ));
     Some(finalize_config(Config {
         workspace_root,
         upper_dir,
@@ -188,14 +190,13 @@ pub(crate) unsafe fn init(param: *const u8) -> bool {
             return false;
         }
     };
-    let query_full_attr_addr =
-        match unsafe { resolve_ntdll_export("NtQueryFullAttributesFile") } {
-            Some(a) => a,
-            None => {
-                debug_log("init: resolve_ntdll_export(NtQueryFullAttributesFile) failed, bail");
-                return false;
-            }
-        };
+    let query_full_attr_addr = match unsafe { resolve_ntdll_export("NtQueryFullAttributesFile") } {
+        Some(a) => a,
+        None => {
+            debug_log("init: resolve_ntdll_export(NtQueryFullAttributesFile) failed, bail");
+            return false;
+        }
+    };
     let query_attr_addr = match unsafe { resolve_ntdll_export("NtQueryAttributesFile") } {
         Some(a) => a,
         None => {
@@ -220,8 +221,7 @@ pub(crate) unsafe fn init(param: *const u8) -> bool {
     let query_attr_fn: NtQueryAttributesFileFn = unsafe { std::mem::transmute(query_attr_addr) };
     let query_dir_fn: NtQueryDirectoryFileFn = unsafe { std::mem::transmute(query_dir_addr) };
 
-    let create_detour = match unsafe { GenericDetour::new(create_file_fn, hooked_nt_create_file) }
-    {
+    let create_detour = match unsafe { GenericDetour::new(create_file_fn, hooked_nt_create_file) } {
         Ok(d) => d,
         Err(_) => return false,
     };
@@ -431,7 +431,8 @@ pub(crate) fn install_create_process_hooks() {
 /// へ書き込みを試みてしまう。書き終えた直後に自プロセスのenvから消し、子孫プロセスへ伝播しない
 /// ようにする（`HARNESS_COW_WORKSPACE`/`HARNESS_COW_UPPER`は孫にも必要なので残す）。
 pub(crate) fn signal_ready() {
-    let Some(handle_value) = get_env("HARNESS_COW_READY_HANDLE").and_then(|v| v.parse::<isize>().ok())
+    let Some(handle_value) =
+        get_env("HARNESS_COW_READY_HANDLE").and_then(|v| v.parse::<isize>().ok())
     else {
         return;
     };
@@ -494,4 +495,3 @@ extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c_void) 
     }
     1
 }
-

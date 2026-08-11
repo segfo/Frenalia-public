@@ -196,9 +196,9 @@ pub const RESERVED_HTTP_HEADERS: &[&str] = &[
 /// RFC 9110のfield-name（token）として妥当か。
 pub fn is_valid_header_name(name: &str) -> bool {
     !name.is_empty()
-        && name.chars().all(|c| {
-            c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
-        })
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
 }
 
 /// サーバidとして妥当か（AppContainerプロファイル名・ツール名の両方の材料になる）。
@@ -359,10 +359,7 @@ impl McpServerDecl {
     /// `Network`（＝非read）** として扱われ、パーミッションゲートを必ず通る。
     /// サーバ自身の申告（`readOnlyHint`等）は検証できないので参照しない。
     pub fn risk_for_tool(&self, tool: &str) -> RiskClass {
-        self.tools
-            .get(tool)
-            .copied()
-            .unwrap_or(RiskClass::Network)
+        self.tools.get(tool).copied().unwrap_or(RiskClass::Network)
     }
 
     /// 承認台帳と照合するハッシュ（`DESIGN-MCP.md` §4.2）。
@@ -438,8 +435,8 @@ impl McpServerDecl {
         // `to_string`が失敗するのは`Serialize`実装がエラーを返す場合だけで、上の型は
         // すべてinfallible。それでもunwrapは避け、失敗時は決して既存の承認と一致しない
         // 値を返す（fail-closed）。
-        let json = serde_json::to_string(&canonical)
-            .unwrap_or_else(|_| format!("__unserializable__{id}"));
+        let json =
+            serde_json::to_string(&canonical).unwrap_or_else(|_| format!("__unserializable__{id}"));
         let digest = Sha256::digest(json.as_bytes());
         digest.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -760,7 +757,8 @@ mod tests {
         mutations.push(("args", m));
 
         let mut m = base.clone();
-        m.env.insert("NODE_OPTIONS".to_string(), "--require evil".to_string());
+        m.env
+            .insert("NODE_OPTIONS".to_string(), "--require evil".to_string());
         mutations.push(("env", m));
 
         let mut m = base.clone();
@@ -862,7 +860,10 @@ mod tests {
     fn empty_command_is_rejected() {
         let mut decl = sample();
         decl.command = "   ".to_string();
-        assert!(matches!(decl.validate(), Err(DeclError::EmptyCommand { .. })));
+        assert!(matches!(
+            decl.validate(),
+            Err(DeclError::EmptyCommand { .. })
+        ));
     }
 
     // --- M15.6: Streamable HTTP ---
@@ -914,8 +915,14 @@ mod tests {
     fn stdio_only_fields_on_an_http_declaration_are_rejected_rather_than_ignored() {
         type Mutation = (&'static str, Box<dyn Fn(&mut McpServerDecl)>);
         let cases: Vec<Mutation> = vec![
-            ("command", Box::new(|d: &mut McpServerDecl| d.command = "node.exe".to_string())),
-            ("args", Box::new(|d: &mut McpServerDecl| d.args = vec!["x".to_string()])),
+            (
+                "command",
+                Box::new(|d: &mut McpServerDecl| d.command = "node.exe".to_string()),
+            ),
+            (
+                "args",
+                Box::new(|d: &mut McpServerDecl| d.args = vec!["x".to_string()]),
+            ),
             (
                 "env",
                 Box::new(|d: &mut McpServerDecl| {
@@ -1052,9 +1059,15 @@ mod tests {
     fn describe_shows_the_unexpanded_header_value_not_the_secret() {
         let described = http_sample().describe();
         assert!(described.contains("${env:CORP_MCP_TOKEN}"), "{described}");
-        assert!(described.contains("https://mcp.corp.example/mcp"), "{described}");
+        assert!(
+            described.contains("https://mcp.corp.example/mcp"),
+            "{described}"
+        );
         // D-41: この経路がharnessの出口制御の外にあることを承認時に明示する。
-        assert!(described.contains("NOT run in an AppContainer"), "{described}");
+        assert!(
+            described.contains("NOT run in an AppContainer"),
+            "{described}"
+        );
     }
 
     // --- D-52: 証明書ピン ---
@@ -1130,7 +1143,10 @@ mod tests {
         let mut a = http_sample();
         a.tls_pin = Some(PIN.to_string());
         let mut b = http_sample();
-        b.tls_pin = Some("SHA256:9F6AAB9E:A64D8E00:EEFFBC2A:5B57AACF:ECDF7600:0520FCFB:84B0C36D:6D113F0F".to_string());
+        b.tls_pin = Some(
+            "SHA256:9F6AAB9E:A64D8E00:EEFFBC2A:5B57AACF:ECDF7600:0520FCFB:84B0C36D:6D113F0F"
+                .to_string(),
+        );
         assert_eq!(a.approval_hash(), b.approval_hash());
     }
 
@@ -1141,7 +1157,10 @@ mod tests {
         decl.tls_pin = Some(PIN.to_string());
         let described = decl.describe();
         assert!(described.contains("9f6aab9e a64d8e00"), "{described}");
-        assert!(described.contains("REPLACES normal certificate validation"), "{described}");
+        assert!(
+            described.contains("REPLACES normal certificate validation"),
+            "{described}"
+        );
     }
 
     /// ピンが無い宣言は「通常の検証を通る」と明示する（沈黙させない）。
@@ -1164,7 +1183,10 @@ mod tests {
         });
         let gates = parse_mcp_http_gates(Some(&value)).unwrap();
         assert!(gates.allow_streamable_http);
-        assert_eq!(gates.http_allow_domains, vec!["mcp.corp.example".to_string()]);
+        assert_eq!(
+            gates.http_allow_domains,
+            vec!["mcp.corp.example".to_string()]
+        );
         assert_eq!(gates.http_ca_bundle, None);
     }
 

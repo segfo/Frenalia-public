@@ -66,9 +66,12 @@ pub(crate) fn run_mcp(action: McpAction, workspace_root: &Path) -> ExitCode {
     let store = ApprovalStore::in_config_dir();
 
     match action {
-        McpAction::List { output_format } => {
-            list(&decls, &store, &load_http_gates(workspace_root), output_format)
-        }
+        McpAction::List { output_format } => list(
+            &decls,
+            &store,
+            &load_http_gates(workspace_root),
+            output_format,
+        ),
         McpAction::Approve { id, yes } => approve(&decls, &store, &id, yes),
         McpAction::Revoke { id } => revoke(&store, &id),
     }

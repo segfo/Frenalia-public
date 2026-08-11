@@ -30,9 +30,9 @@ use super::*;
 fn resolve_sources(spec: Option<&str>) -> Result<Vec<Source>, String> {
     match spec {
         None | Some("all") => Ok(Source::ALL.to_vec()),
-        Some(other) => Source::parse(other)
-            .map(|s| vec![s])
-            .ok_or_else(|| format!("unknown --source {other:?} (expected all|preflight|net|cow|etw)")),
+        Some(other) => Source::parse(other).map(|s| vec![s]).ok_or_else(|| {
+            format!("unknown --source {other:?} (expected all|preflight|net|cow|etw)")
+        }),
     }
 }
 
@@ -54,13 +54,12 @@ fn collect_input(workspace_root: &Path, session: Option<&str>, sources: &[Source
     for source in sources {
         let report = match source {
             Source::Preflight => collect_preflight(),
-            Source::Network => {
-                collect_jsonl(Source::Network, net_audit_path(workspace_root, session, None))
-            }
+            Source::Network => collect_jsonl(
+                Source::Network,
+                net_audit_path(workspace_root, session, None),
+            ),
             Source::Cow => collect_jsonl(Source::Cow, cow_denied_path(session)),
-            Source::Etw => {
-                collect_jsonl(Source::Etw, fs_audit_path(workspace_root, session, None))
-            }
+            Source::Etw => collect_jsonl(Source::Etw, fs_audit_path(workspace_root, session, None)),
         };
         reports.push(report);
     }
@@ -91,7 +90,10 @@ fn collect_jsonl(source: Source, path: Option<PathBuf>) -> SourceReport {
     let Some(path) = path else {
         return SourceReport::unavailable(
             source,
-            format!("no {} audit log location could be resolved for this session", source.label()),
+            format!(
+                "no {} audit log location could be resolved for this session",
+                source.label()
+            ),
         );
     };
     let text = match std::fs::read_to_string(&path) {
@@ -381,14 +383,16 @@ pub(crate) fn run_policy_subcommand(
             generalize,
             output_format,
         } => {
-            let (sources, generalization) =
-                match (resolve_sources(source.as_deref()), resolve_generalization(generalize.as_deref())) {
-                    (Ok(s), Ok(g)) => (s, g),
-                    (Err(e), _) | (_, Err(e)) => {
-                        eprintln!("{e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
+            let (sources, generalization) = match (
+                resolve_sources(source.as_deref()),
+                resolve_generalization(generalize.as_deref()),
+            ) {
+                (Ok(s), Ok(g)) => (s, g),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let input = collect_input(workspace_root, session.as_deref(), &sources);
             let proposals =
                 input.proposals_with_granted(generalization, &granted_paths(workspace_root));
@@ -430,14 +434,16 @@ pub(crate) fn run_policy_subcommand(
             accept,
             yes,
         } => {
-            let (sources, generalization) =
-                match (resolve_sources(source.as_deref()), resolve_generalization(generalize.as_deref())) {
-                    (Ok(s), Ok(g)) => (s, g),
-                    (Err(e), _) | (_, Err(e)) => {
-                        eprintln!("{e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
+            let (sources, generalization) = match (
+                resolve_sources(source.as_deref()),
+                resolve_generalization(generalize.as_deref()),
+            ) {
+                (Ok(s), Ok(g)) => (s, g),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let input = collect_input(workspace_root, session.as_deref(), &sources);
             let proposals =
                 input.proposals_with_granted(generalization, &granted_paths(workspace_root));

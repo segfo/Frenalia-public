@@ -110,9 +110,9 @@ impl RecallTool {
                 })
             }
         };
-        let index = store.list().map_err(|e| {
-            ToolError::ExecutionFailed(format!("failed to list recall index: {e}"))
-        })?;
+        let index = store
+            .list()
+            .map_err(|e| ToolError::ExecutionFailed(format!("failed to list recall index: {e}")))?;
         let result = search::top_k(query, &index, 5, 0.05);
 
         if result.picks.is_empty() {

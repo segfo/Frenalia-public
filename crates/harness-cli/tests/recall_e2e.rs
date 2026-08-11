@@ -182,7 +182,9 @@ fn hiv_turns() -> Vec<Vec<StreamEvent>> {
 /// 読出しが走る2周目以降の台本。**先頭に`Phase::Recall`の判定コールが1つ増える**
 /// （bigram検索で候補が1件以上あるときだけ打たれる）。
 fn hiv_turns_with_recall(picks: serde_json::Value) -> Vec<Vec<StreamEvent>> {
-    let mut turns = vec![text_turn(&serde_json::json!({ "picks": picks }).to_string())];
+    let mut turns = vec![text_turn(
+        &serde_json::json!({ "picks": picks }).to_string(),
+    )];
     turns.extend(hiv_turns());
     turns
 }
@@ -263,12 +265,7 @@ fn run_harness(spec: RunSpec<'_>) -> HarnessRun {
 }
 
 /// `--cognition always`（HIVループ）で1回起動する既定形。
-fn run_hiv(
-    ws: &Path,
-    data_root: &Path,
-    turns: &[Vec<StreamEvent>],
-    case_name: &str,
-) -> HarnessRun {
+fn run_hiv(ws: &Path, data_root: &Path, turns: &[Vec<StreamEvent>], case_name: &str) -> HarnessRun {
     run_harness(RunSpec {
         ws,
         data_root,
@@ -355,7 +352,8 @@ fn checkpoint_files(mem_dir: &Path) -> Vec<PathBuf> {
 
 /// `harness memory list --all --output-format json`の結果。
 fn list_all(ws: &Path, data_root: &Path) -> Result<Vec<serde_json::Value>, String> {
-    let (ok, stdout, stderr) = memory_cli(ws, data_root, &["list", "--all", "--output-format", "json"]);
+    let (ok, stdout, stderr) =
+        memory_cli(ws, data_root, &["list", "--all", "--output-format", "json"]);
     if !ok {
         return Err(format!("memory list failed: {stderr}"));
     }
@@ -545,7 +543,9 @@ fn case_recall_injection_reaches_the_prompt() -> Result<(), String> {
 
     let evs = events(&second);
     let recalled = events_named(&evs, "MemoryRecalled");
-    let recalled = recalled.first().ok_or("2周目にMemoryRecalledが出ていない")?;
+    let recalled = recalled
+        .first()
+        .ok_or("2周目にMemoryRecalledが出ていない")?;
     if recalled["candidates"] != 1 || recalled["injected"] != 1 {
         return Err(format!("記憶が注入されていない: {recalled}"));
     }
@@ -557,7 +557,10 @@ fn case_recall_injection_reaches_the_prompt() -> Result<(), String> {
     // 載っていなければ、イベント上は「注入した」のにモデルは何も見ていない（空振り）。
     let requests = recorded_requests(&second)?;
     if requests.len() < 2 {
-        return Err(format!("記録されたリクエストが少なすぎる: {}", requests.len()));
+        return Err(format!(
+            "記録されたリクエストが少なすぎる: {}",
+            requests.len()
+        ));
     }
     let hypothesize = &requests[1];
     for needle in [
@@ -671,9 +674,7 @@ fn case_blocked_writes_nothing() -> Result<(), String> {
     }
     let checkpointed = events_named(&evs, "MemoryCheckpointed");
     if !checkpointed.is_empty() {
-        return Err(format!(
-            "Blockedなのに書込みが走った: {checkpointed:?}"
-        ));
+        return Err(format!("Blockedなのに書込みが走った: {checkpointed:?}"));
     }
     // 読出しだけでは記憶ディレクトリを作らない（`open`＝作成は書込み経路にしか無い）ので、
     // 「ディレクトリが無い」か「あってもcheckpointが0件」のどちらかであればよい。
@@ -762,9 +763,11 @@ fn case_remember_with_allowlist_writes_only_inside_checkpoints() -> Result<(), S
     require_success(&run, "R7")?;
 
     let evs = events(&run);
-    let stored = events_named(&evs, "ToolFinished")
-        .iter()
-        .any(|f| f["output"]["content"].as_str().is_some_and(|c| c.contains("記憶した（cp-")));
+    let stored = events_named(&evs, "ToolFinished").iter().any(|f| {
+        f["output"]["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("記憶した（cp-"))
+    });
     if !stored {
         return Err(format!("rememberが許可されなかった: {}", run.stdout));
     }
@@ -848,7 +851,9 @@ fn case_search_distinguishes_empty_from_miss() -> Result<(), String> {
     require_success(&miss, "R8（閾値未満）")?;
     let miss_msg = tool_output(&miss, "recall")?;
     if !miss_msg.contains("1件の記憶を検索したが") {
-        return Err(format!("閾値未満の文言が違う（件数を報告していない）: {miss_msg}"));
+        return Err(format!(
+            "閾値未満の文言が違う（件数を報告していない）: {miss_msg}"
+        ));
     }
     Ok(())
 }
@@ -863,7 +868,11 @@ fn tool_output(run: &HarnessRun, tool: &str) -> Result<String, String> {
         .collect();
     events_named(&evs, "ToolFinished")
         .iter()
-        .find(|f| f["id"].as_str().is_some_and(|id| proposed.iter().any(|p| p == id)))
+        .find(|f| {
+            f["id"]
+                .as_str()
+                .is_some_and(|id| proposed.iter().any(|p| p == id))
+        })
         .and_then(|f| f["output"]["content"].as_str().map(str::to_string))
         .ok_or_else(|| format!("{tool}のToolFinishedが無い: {}", run.stdout))
 }
@@ -874,7 +883,10 @@ fn case_index_self_repair_and_traversal_rejection() -> Result<(), String> {
     let data = case_data_root("index-repair");
     seed_workspace(&ws);
 
-    require_success(&run_hiv(&ws, &data, &hiv_turns(), "index-repair-1"), "R9の準備1")?;
+    require_success(
+        &run_hiv(&ws, &data, &hiv_turns(), "index-repair-1"),
+        "R9の準備1",
+    )?;
     require_success(
         &run_hiv(
             &ws,
@@ -933,7 +945,10 @@ fn case_review_watermark() -> Result<(), String> {
     let data = case_data_root("review-watermark");
     seed_workspace(&ws);
 
-    require_success(&run_hiv(&ws, &data, &hiv_turns(), "watermark-1"), "R11の準備1")?;
+    require_success(
+        &run_hiv(&ws, &data, &hiv_turns(), "watermark-1"),
+        "R11の準備1",
+    )?;
     require_success(
         &run_hiv(
             &ws,
@@ -954,7 +969,9 @@ fn case_review_watermark() -> Result<(), String> {
 
     let (ok, marked, stderr) = memory_cli(&ws, &data, &["review", "--mark-reviewed"]);
     if !ok || !marked.contains("marked 2 checkpoint(s) as reviewed.") {
-        return Err(format!("review --mark-reviewedが効かない: {marked}{stderr}"));
+        return Err(format!(
+            "review --mark-reviewedが効かない: {marked}{stderr}"
+        ));
     }
 
     let (ok, after, _) = memory_cli(&ws, &data, &["list"]);
@@ -998,7 +1015,9 @@ fn case_git_absent_is_reported_and_project_cannot_opt_in() -> Result<(), String>
 
     let evs = events(&run);
     let checkpointed = events_named(&evs, "MemoryCheckpointed");
-    let ev = checkpointed.first().ok_or("MemoryCheckpointedが出ていない（無音）")?;
+    let ev = checkpointed
+        .first()
+        .ok_or("MemoryCheckpointedが出ていない（無音）")?;
     if ev["id"] != serde_json::Value::Null {
         return Err(format!("gitが無いのに書かれた: {ev}"));
     }
@@ -1024,7 +1043,10 @@ fn case_forget_and_gc() -> Result<(), String> {
     let ws = case_dir("forget-and-gc");
     let data = case_data_root("forget-and-gc");
     seed_workspace(&ws);
-    require_success(&run_hiv(&ws, &data, &hiv_turns(), "forget-and-gc"), "R13の準備")?;
+    require_success(
+        &run_hiv(&ws, &data, &hiv_turns(), "forget-and-gc"),
+        "R13の準備",
+    )?;
     let mem_dir = memory_dir(&data)?;
 
     // `gc`は一覧するだけで消さない。
@@ -1046,7 +1068,9 @@ fn case_forget_and_gc() -> Result<(), String> {
         return Err("forgetが--yes無しで成功した".to_string());
     }
     if !stderr.contains("--yes") || !mem_dir.exists() {
-        return Err(format!("forgetが--yes無しで消した/理由を言わない: {stderr}"));
+        return Err(format!(
+            "forgetが--yes無しで消した/理由を言わない: {stderr}"
+        ));
     }
 
     let (ok, out, stderr) = memory_cli(&ws, &data, &["forget", "--yes"]);
@@ -1101,7 +1125,10 @@ fn case_git_hooks_do_not_fire() -> Result<(), String> {
     let ws = case_dir("git-hooks");
     let data = case_data_root("git-hooks");
     seed_workspace(&ws);
-    require_success(&run_hiv(&ws, &data, &hiv_turns(), "git-hooks-1"), "R15の準備")?;
+    require_success(
+        &run_hiv(&ws, &data, &hiv_turns(), "git-hooks-1"),
+        "R15の準備",
+    )?;
 
     let mem_dir = memory_dir(&data)?;
     let hooks_dir = mem_dir.join(".git").join("hooks");
@@ -1144,7 +1171,10 @@ fn case_git_hooks_do_not_fire() -> Result<(), String> {
 fn recall_e2e_matrix() {
     let cases: Vec<(&str, CaseFn)> = vec![
         ("R1-write-on-decide", case_write_on_decide),
-        ("R2-recall-injection", case_recall_injection_reaches_the_prompt),
+        (
+            "R2-recall-injection",
+            case_recall_injection_reaches_the_prompt,
+        ),
         ("R3-off-untouched", case_off_does_not_touch_memory),
         ("R4-blocked-writes-nothing", case_blocked_writes_nothing),
         ("R6-remember-denied", case_remember_is_denied_by_default),
@@ -1152,7 +1182,10 @@ fn recall_e2e_matrix() {
             "R7-remember-allowlisted",
             case_remember_with_allowlist_writes_only_inside_checkpoints,
         ),
-        ("R8-search-messages", case_search_distinguishes_empty_from_miss),
+        (
+            "R8-search-messages",
+            case_search_distinguishes_empty_from_miss,
+        ),
         (
             "R9R10-index-repair-and-traversal",
             case_index_self_repair_and_traversal_rejection,
@@ -1163,7 +1196,10 @@ fn recall_e2e_matrix() {
             case_git_absent_is_reported_and_project_cannot_opt_in,
         ),
         ("R13-forget-and-gc", case_forget_and_gc),
-        ("R14-spelling-variants", case_spelling_variants_share_one_store),
+        (
+            "R14-spelling-variants",
+            case_spelling_variants_share_one_store,
+        ),
         ("R15-git-hooks", case_git_hooks_do_not_fire),
     ];
 
