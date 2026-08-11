@@ -134,3 +134,109 @@ fn an_empty_recording_says_so_instead_of_just_showing_no_candidates() {
         "WFPで落ちている可能性へ誘導しないと、原因に辿り着けない: {text}"
     );
 }
+
+/// **昇格側の制御レコードはネットワークイベントとして数えない**（BUG-093）。
+///
+/// 制御レコードは`allowed:false`かつホスト名を持たないので、素通しすると
+/// 「拒否1件・ホスト名なし1件」として集計され、注記にも嘘が出る。
+/// ただし**黙って捨てもしない**——理由は`control_reasons()`から取れる。
+#[test]
+fn control_records_from_the_elevated_side_are_kept_but_not_counted_as_traffic() {
+    let control = serde_json::json!({
+        "timestamp_unix_ms": 1_786_226_932_961u64,
+        "kind": "wfp",
+        "protocol": "control",
+        "allowed": false,
+        "reason": "policy_learnd_chain_verify_rejected pipe=x env_present=false: nope",
+    });
+
+    let mut aggregate = NetAggregate::new();
+    aggregate.add_event(&control);
+
+    assert_eq!(aggregate.events_seen, 0, "通信の記録ではない");
+    assert_eq!(aggregate.denied, 0);
+    assert_eq!(
+        aggregate.without_host, 0,
+        "ホスト名なしの拒否として数えない"
+    );
+    assert!(aggregate.candidates().is_empty());
+    assert!(aggregate.notes().is_empty(), "{:?}", aggregate.notes());
+    assert_eq!(
+        aggregate.control_reasons(),
+        ["policy_learnd_chain_verify_rejected pipe=x env_present=false: nope"],
+        "理由は捨てない（昇格側の失敗を伝える唯一の経路）"
+    );
+}
+
+/// 対のテスト（B-35）: 制御レコードの除外が**本物の通信まで**落としていないこと。
+/// 同じ`kind:"wfp"`でも`protocol`が`control`でなければ従来どおり数える。
+#[test]
+fn a_real_wfp_drop_is_still_counted_alongside_a_control_record() {
+    let control = serde_json::json!({
+        "kind": "wfp", "protocol": "control", "allowed": false,
+        "reason": "net_event_collection_enable_failed: FwpmEngineSetOption0 returned 0x00000005",
+    });
+    let real_drop = serde_json::json!({
+        "kind": "wfp", "protocol": "tcp", "allowed": false,
+        "remote_addr": "198.18.0.1", "remote_port": 443, "reason": "classify_drop",
+    });
+
+    let mut aggregate = NetAggregate::new();
+    aggregate.add_event(&control);
+    aggregate.add_event(&real_drop);
+
+    assert_eq!(aggregate.events_seen, 1);
+    assert_eq!(aggregate.denied, 1);
+    assert_eq!(
+        aggregate.without_host, 1,
+        "本物のIP-only dropは盲点として数える"
+    );
+    assert_eq!(aggregate.control_reasons().len(), 1);
+}
+
+/// 記録済みのJSONLを読み直す経路（`show`／編集画面）でも制御レコードの理由が取れる
+/// ——ライブ表示を見逃した後でも、`show`で「なぜ収集器が居ないのか」に辿り着ける。
+#[test]
+fn control_reasons_survive_reading_the_log_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("net-audit.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"kind":"wfp","protocol":"control","allowed":false,"reason":"policy_learnd_chain_child_exited code=0x00000065"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let aggregate = from_log(&path);
+
+    assert_eq!(aggregate.events_seen, 0);
+    assert_eq!(
+        aggregate.control_reasons(),
+        ["policy_learnd_chain_child_exited code=0x00000065"]
+    );
+}
+
+/// `show`で記録を開き直したときにも昇格側の報告が出る（FS側の`collector_notes`と対称）。
+/// ライブの警告は流れて消えるので、**後から見返す経路にも同じ事実が要る**。
+#[test]
+fn the_rendered_notes_surface_what_the_elevated_side_reported() {
+    let mut aggregate = NetAggregate::new();
+    aggregate.add_event(&serde_json::json!({
+        "kind": "wfp", "protocol": "control", "allowed": false,
+        "reason": "policy_learnd_chain_verify_rejected pipe=p env_present=false: writable",
+    }));
+
+    let text = render_notes(&aggregate);
+
+    assert!(text.contains("昇格側からの報告"), "{text}");
+    assert!(
+        text.contains("policy_learnd_chain_verify_rejected"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("ホスト名を持たないイベント"),
+        "制御レコードを通信の盲点として数えてはいけない: {text}"
+    );
+}

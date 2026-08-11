@@ -1221,16 +1221,21 @@ name = "harness-policy-editor"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "crossterm",
  "harness-config",
  "harness-core",
+ "harness-grant-ledger",
  "harness-policy",
  "harness-sandbox",
+ "harness-term",
  "harness-tools",
+ "ratatui",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "unicode-width",
  "which",
  "windows",
 ]

@@ -8,9 +8,13 @@
 //! 別々のコマンドで、間の状態はワークスペース上のファイル（`fs-audit.jsonl`・
 //! `net-audit.jsonl`・`record-session.json`・`policy.json`）が持つ。
 //! **順序を強制しない**ため——記録し直す・過去の記録を別の一般化度合いで見直す、を
-//! いつでも行える。
+//! いつでも行える。TUI（`harness_policy_editor::tui`）も同じファイルの上に載るだけで、
+//! 記録の手順を画面ごとに書き直さない。
 //!
-//! 現状の到達点は2パス記録の端から端まで（パス1→承認→パス2）。TUIの3画面は未実装。
+//! # サブコマンド無しの起動はTUI
+//!
+//! 標準入出力が端末なら記録・編集の2画面のTUIを開き、そうでなければ（パイプ・リダイレクト）
+//! 概要を表示する。端末でない相手に端末制御を始めない。
 //!
 //! # 出力の使い分け（B-24）
 //!
@@ -33,13 +37,18 @@ const DEFAULT_LIMIT: usize = 40;
     long_about = None
 )]
 struct Cli {
+    /// TUI（サブコマンド無しで起動したとき）が対象にするworkspaceルート。
+    /// サブコマンド側にも同名の引数があるので、こちらは`global`にしない
+    /// （同じ名前を2つの階層で有効にすると、どちらが効いたのか分からなくなる）。
+    #[arg(long)]
+    workspace: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// コマンドをTier1で実行し、触ったファイルを全部記録する（パス1）。
+    /// コマンドを隔離せず（Tier0）に実行し、触ったファイルを全部記録する（パス1）。
     Record {
         /// 作業ディレクトリ（既定: カレントディレクトリ）。低ILラベルを付ける唯一の場所。
         #[arg(long)]
@@ -133,6 +142,44 @@ enum Command {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// `.harness/policy.json`の承認済み宣言を取り消す（`approve`の対）。
+    ///
+    /// **ACEはここでは剥がさない**——付与がパス2の開始時なのと対称で、撤収も
+    /// 次のパス2の開始時（と、このプロセスの終了時）に走る。名前を`revoke`にしないのは
+    /// そのため（消すのは宣言であって、ACLの変更はこのコマンドの中では起きない）。
+    Unapprove {
+        /// 取り消す宣言があるドメイン名。`--all`と併用すると、そのドメインの宣言を全部消す。
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// 取り消すFS宣言の値（`policy.json`に書かれている綴り）。`--access`と対で指定する。
+        #[arg(long)]
+        fs: Vec<String>,
+        /// `--fs`のaccess種別（`read`/`read_write`/`read_exec`）。
+        #[arg(long)]
+        access: Option<String>,
+        /// 取り消すネットワーク宣言（`net.allow_domains`の値）。
+        #[arg(long)]
+        net: Vec<String>,
+        /// 宣言を全部取り消す（`--domain`があればそのドメインだけ、無ければ全ドメイン）。
+        ///
+        /// **一括承認のショートハンドが無いのに一括取り消しがあるのは意図的**（D-42）。
+        /// 禁じているのは読まずに権限を「与える」ことで、こちらは権限を「減らす」向きである。
+        #[arg(long)]
+        all: bool,
+        /// [BUG-103] **いまの規則なら候補にしなかったFS宣言**を取り消す
+        /// （`.harness`・harness自身のサンドボックスプロファイル・`C:/Windows`等・
+        /// このworkspace配下・`%TEMP%`配下）。
+        ///
+        /// 候補側を直しても既存の宣言は消えないので、その掃除に使う。判定は候補側と
+        /// **同じ関数**を通る（`exclusion::ExclusionRules`）。
+        #[arg(long)]
+        excluded: bool,
+        /// 差分を確認済みとして書き込む（非対話では必須）。
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -154,7 +201,9 @@ fn main() -> ExitCode {
             timeout,
             limit,
             command,
-        }) => run_record_net(&domain, workspace, cwd, generalize, timeout, limit, &command),
+        }) => run_record_net(
+            &domain, workspace, cwd, generalize, timeout, limit, &command,
+        ),
         Some(Command::Show {
             session,
             workspace,
@@ -181,11 +230,59 @@ fn main() -> ExitCode {
             yes,
         ),
         Some(Command::Sessions { workspace }) => run_sessions(workspace),
-        None => {
-            print_overview();
-            ExitCode::SUCCESS
+        Some(Command::Unapprove {
+            domain,
+            workspace,
+            fs,
+            access,
+            net,
+            all,
+            excluded,
+            yes,
+        }) => run_unapprove(
+            UnapproveSelector {
+                domain: domain.as_deref(),
+                fs: &fs,
+                access: access.as_deref(),
+                net: &net,
+                all,
+                excluded,
+            },
+            workspace,
+            yes,
+        ),
+        None => run_tui(cli.workspace),
+    }
+}
+
+/// サブコマンド無しの起動。**端末なら記録・編集の2画面のTUI**、そうでなければ従来の概要表示。
+///
+/// パイプ・リダイレクト越しに呼ばれたときに端末制御（raw mode・オルタネートスクリーン）を
+/// 始めると、相手の出力を壊すうえ操作もできない。`is_terminal`で分けるのは`confirm_write`と
+/// 同じ作法である。
+#[cfg(windows)]
+fn run_tui(workspace: Option<PathBuf>) -> ExitCode {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        print_overview();
+        return ExitCode::SUCCESS;
+    }
+    let workspace_root = resolve_workspace(workspace);
+    match harness_policy_editor::tui::run(workspace_root) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("TUIを起動できませんでした: {e}");
+            ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(not(windows))]
+fn run_tui(_workspace: Option<PathBuf>) -> ExitCode {
+    // 記録がWindows専用（Tier2aのAppContainer・ETW・WFP）なので、TUIもWindowsだけ。
+    print_overview();
+    ExitCode::SUCCESS
 }
 
 #[cfg(windows)]
@@ -211,29 +308,37 @@ fn run_record(
 
     eprintln!("記録するコマンド: {command}");
     eprintln!("作業ディレクトリ: {}", cwd.display());
-    eprintln!(
-        "隔離: Tier1（制限トークン＋低IL）。ETW収集器の起動でUACが1回出ます。\n\
-         収集器が張るETWセッションは管理者権限を要するためです。"
-    );
+    eprintln!("{}", harness_policy_editor::record::ELEVATION_NOTICE);
 
     // キャンセルはまだ配線していない（CLIにはUIイベントが無い）。**「押せば止まる」ように
-    // 見せない**——Ctrl-Cで本プロセスが終われば、ジョブのkill-on-closeでTier1ツリーが
+    // 見せない**——Ctrl-Cで本プロセスが終われば、ジョブのkill-on-closeで記録対象のツリーが
     // 畳まれ、パイプ切断で収集器も自発終了する（寿命がOSハンドルに紐付いている）。
     let never_cancel = || false;
+    // 収集器はこの1回の記録で使い切る（CLIは1プロセス1記録）。**プロセス終了で`Teardown`が
+    // 走る**——TUIと同じ`SharedCollector`を通すことで、寿命の扱いを1つにしている。
+    let collector = harness_policy_editor::record::SharedCollector::hold();
     let request = RecordRequest {
         command: &command,
         cwd: &cwd,
         workspace_root: &workspace_root,
         timeout: timeout.map(std::time::Duration::from_secs),
         cancel: &never_cancel,
+        collector: &collector,
+        // CLIは1コマンド1プロセスなので、常駐netfilterdの恩恵は受けられない
+        // （前回のCLI呼び出しのdaemonはプロセス終了とともに撤収している）。
+        wfp: None,
     };
 
     let mut access_count = 0u64;
     let mut on_event = |event: RecordEvent| match event {
-        RecordEvent::CollectorStarted { etw_available } => {
+        // 文言は実行側（`record`）が1つだけ持つ（規則5）。
+        RecordEvent::CollectorStarted {
+            etw_available,
+            reused,
+        } => {
             eprintln!(
-                "収集器を起動しました（ETWセッション: {}）",
-                if etw_available { "有効" } else { "**張れず**" }
+                "{}",
+                harness_policy_editor::record::collector_started_line(etw_available, reused)
             );
         }
         RecordEvent::CollectorUnavailable(reason) => {
@@ -327,8 +432,19 @@ fn run_record_net(
     limit: Option<usize>,
     command: &[String],
 ) -> ExitCode {
-    use harness_policy_editor::record_net::{NetRecordEvent, RecordNetRequest};
+    use harness_policy_editor::record_net::{
+        NetRecordEvent, RecordNetRequest, SessionGrants, SharedNetfilter,
+    };
 
+    // パス2が開けた穴の寿命は**このプロセスの寿命**（D-37）。早期returnの各点でも必ず撤収が
+    // 走るよう、値として持つ（`Drop`）。
+    let _grants = SessionGrants::hold();
+    // **`_grants`より後**に宣言する（D-56、`SharedNetfilter`のdoc「宣言順」）。CLIは1回の
+    // 起動につき1回しか記録しないので再利用は起きないが、`record_net`が要求する形は同じで、
+    // ここだけ別の持ち方をすると経路ごとに撤収順が違うことになる。
+    let wfp = SharedNetfilter::hold();
+    // 収集器も同じ理由・同じ順序で持つ（`_grants`より後＝`Teardown`がプロファイル削除より先）。
+    let collector = harness_policy_editor::record::SharedCollector::hold();
     let workspace_root = resolve_workspace(workspace);
     let Some(generalization) = resolve_generalization(&generalize) else {
         return ExitCode::FAILURE;
@@ -410,14 +526,16 @@ fn run_record_net(
         workspace_root: &workspace_root,
         timeout: timeout.map(std::time::Duration::from_secs),
         cancel: &never_cancel,
+        wfp: &wfp,
+        collector: &collector,
     };
 
     let mut net_count = 0u64;
     let mut on_event = |event: NetRecordEvent| match event {
         NetRecordEvent::ElevationExpected { max_prompts } => {
             eprintln!(
-                "隔離: Tier2a（AppContainer＋WFP＋Local Proxy）。UACが最大{max_prompts}回出ます\n\
-                 （ACEの付与と、WFPの出口強制daemonの起動が管理者権限を要するためです）。"
+                "{}",
+                harness_policy_editor::record_net::elevation_notice(max_prompts)
             );
         }
         NetRecordEvent::GrantingPassthrough { outside_count } => {
@@ -434,6 +552,12 @@ fn run_record_net(
                 if writable { "rw" } else { "ro" }
             );
         }
+        NetRecordEvent::RevokingUndeclared { total } => {
+            eprintln!("取り消された宣言 {total}件のACEを撤収します（宣言を外した分の後始末）…");
+        }
+        NetRecordEvent::UndeclaredRevoked { path, done, total } => {
+            eprintln!("  撤収 {done}/{total}: {}", path.display());
+        }
         NetRecordEvent::PassthroughDenied {
             path,
             access,
@@ -446,10 +570,41 @@ fn run_record_net(
             );
         }
         NetRecordEvent::Tier2aReady => eprintln!("Tier2aへ着地しました"),
+        // 文言は`ExecReach`が持つ（表示側で書き写さない、規則5）。問題が無ければ黙る。
+        NetRecordEvent::ExecReachability(reach) => {
+            if let Some(message) = reach.message() {
+                eprintln!("警告: {message}");
+            }
+        }
+        NetRecordEvent::CollectorStarted {
+            etw_available,
+            reused,
+        } => eprintln!(
+            "{}",
+            harness_policy_editor::record::collector_started_line(etw_available, reused)
+        ),
+        NetRecordEvent::WarmingUp(duration) => eprintln!(
+            "ETWの配送が始まるのを待っています（{}ms）",
+            duration.as_millis()
+        ),
+        // **拒否だけを出す。** 許可まで流すと、強制下の観測（＝知りたいこと）が埋もれる。
+        NetRecordEvent::FsAccess(event) => {
+            if !event.allowed {
+                if let Some(path) = event.path.as_deref() {
+                    eprintln!("FS拒否: {path}");
+                }
+            }
+        }
+        NetRecordEvent::CollectorStopped { written } => {
+            eprintln!("収集器が畳みました（書込 {written}件）")
+        }
         NetRecordEvent::ProxyStarted(addr) => eprintln!("Local Proxy: {addr}（全許可・記録用）"),
         NetRecordEvent::FakeDnsStarted(addr) => eprintln!("Fake DNS: {addr}"),
-        NetRecordEvent::WfpEnforced => {
-            eprintln!("WFPのdefault-denyを張りました（loopbackの穴は上の2つのポートだけ）");
+        NetRecordEvent::WfpEnforced { reused } => {
+            eprintln!(
+                "{}",
+                harness_policy_editor::record_net::wfp_enforced_line(reused)
+            );
         }
         NetRecordEvent::ChildStarted => eprintln!("--- コマンドを開始しました ---"),
         NetRecordEvent::StartupNoise(line) => eprint!("[シェル起動時ノイズ] {line}"),
@@ -471,7 +626,10 @@ fn run_record_net(
             }
         },
         NetRecordEvent::Draining(d) => {
-            eprintln!("監査ログが書き切られるのを待っています（{}ms）…", d.as_millis());
+            eprintln!(
+                "監査ログが書き切られるのを待っています（{}ms）…",
+                d.as_millis()
+            );
         }
         NetRecordEvent::TearingDown(what) => eprintln!("撤収: {what}"),
         NetRecordEvent::Warning(message) => eprintln!("警告: {message}"),
@@ -490,9 +648,22 @@ fn run_record_net(
         "{}",
         harness_policy_editor::net_aggregate::render(&outcome.aggregate, generalization, limit)
     );
+    // **FSの拒否欄はネットワーク候補とは別枠**（スキーマも意味も違う）。文言は実行側が持つ。
+    print!(
+        "{}",
+        harness_policy_editor::record_net::render_fs_denials(
+            &outcome.fs_aggregate,
+            outcome.collector_started,
+            outcome.etw_available,
+        )
+    );
     println!();
     println!("記録セッション: {}", outcome.session_id);
-    println!("監査ログ: {}", outcome.net_audit_log_path.display());
+    println!(
+        "監査ログ（ネットワーク）: {}",
+        outcome.net_audit_log_path.display()
+    );
+    println!("監査ログ（FS）: {}", outcome.audit_log_path.display());
     if let Some(code) = outcome.exit_code {
         if code != 0 {
             println!(
@@ -570,12 +741,21 @@ fn run_show(
     if let Some(code) = manifest.exit_code {
         eprintln!("終了コード: {code}");
     }
+    // **失敗した記録は、まず理由を出す。** 文言はマニフェスト側が1つだけ持つ（規則5）。
+    if let Some(note) = manifest.failure_note() {
+        eprintln!("{note}");
+    }
     for warning in &manifest.warnings {
         eprintln!("記録時の警告: {warning}");
     }
 
-    // `--net`が無くても、パス2の記録を開いたなら**そちらを見せる**——`fs-audit.jsonl`が
-    // 無いセッションでFSの候補一覧（0件）を出しても、何も伝わらない。
+    // パス2の記録は**ネットワークとFSの両方**を見せる（`--net`はネットワークだけに絞る指定）。
+    //
+    // 以前はパス2ならネットワークだけを出して`return`していた（当時のパス2は
+    // `fs-audit.jsonl`を書かなかったので、FS側は常に0件だった）。段階4でdeny-only収集器を
+    // 配線してからは、**「なぜコマンドが失敗したか」の答えはFS側にある**——
+    // ここで打ち切ると、`Access is denied`で落ちたユーザーが次に何を許可すればよいかを
+    // 見る場所が1つも無くなる（TUIの編集画面も同じ理由で両方を出す）。
     let show_net = net || manifest.pass == 2;
     if show_net {
         let aggregate = harness_policy_editor::net_aggregate::from_log(&dir.net_audit_log_path());
@@ -583,6 +763,38 @@ fn run_show(
             "{}",
             harness_policy_editor::net_aggregate::render(&aggregate, generalization, limit)
         );
+        // `--net`は「ネットワークだけ」の意思表示なので、FS側は出さない。
+        if net {
+            return ExitCode::SUCCESS;
+        }
+        let fs = harness_policy_editor::aggregate::from_session(&dir, &manifest);
+        // **収集器が起きなかったときこそ出す。** 「観測していません」と「拒否は0件でした」は
+        // 別の事実で、区別できなければfail-openは単なる隠蔽になる（D-43）。
+        // `collector_started`で囲むと、起きなかったときだけ何も出ない正反対の挙動になる
+        // ——TUIの編集画面で実際にそうなっていた（BUG-093）。
+        print!(
+            "{}",
+            harness_policy_editor::record_net::render_fs_denials(
+                &fs,
+                manifest.collector_started,
+                manifest.etw_available,
+            )
+        );
+        // **候補一覧は収集器の生死で隠さない。** かつては`collector_started`で囲っていたが、
+        // FS候補は観測だけから作られるものではない——実行前診断が名指しした実行ファイルは
+        // 収集器がまったく起きなくても候補になる（`aggregate`のモジュールdoc）。囲んだままだと
+        // **起動できなかった当のexeが、いちばん知りたい場面でだけ画面から消える**。
+        // 何も観測できていないことは`render_notes`が別に言う（D-43）。
+        print!(
+            "{}",
+            harness_policy_editor::aggregate::render(&fs, generalization, limit)
+        );
+        if tree {
+            print!(
+                "{}",
+                harness_policy_editor::aggregate::render_process_tree(&fs)
+            );
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -592,7 +804,7 @@ fn run_show(
         eprintln!("警告: この記録ではETWセッションが張れていません（何も観測できていません）");
     }
 
-    let aggregate = harness_policy_editor::aggregate::from_log(&dir.audit_log_path());
+    let aggregate = harness_policy_editor::aggregate::from_session(&dir, &manifest);
     print!(
         "{}",
         harness_policy_editor::aggregate::render(&aggregate, generalization, limit)
@@ -642,13 +854,13 @@ fn run_approve(
     };
 
     // idは`--generalize`に依存するので、`show`とまったく同じ経路で作り直す。
-    let aggregate = harness_policy_editor::aggregate::from_log(&dir.audit_log_path());
+    let aggregate = harness_policy_editor::aggregate::from_session(&dir, &manifest);
     let proposals = aggregate.proposals(generalization);
 
     // ドメイン名の既定はコマンドの先頭トークン（`cargo build` → `cargo`）。
-    let domain = domain
-        .map(|d| d.to_string())
-        .unwrap_or_else(|| default_domain_name(&manifest.command));
+    let domain = domain.map(|d| d.to_string()).unwrap_or_else(|| {
+        harness_policy_editor::policy_file::default_domain_name(&manifest.command)
+    });
     if domain.is_empty() {
         eprintln!("ドメイン名を決められませんでした。--domain <name> を指定してください。");
         return ExitCode::FAILURE;
@@ -681,8 +893,18 @@ fn run_approve(
         }
     };
 
-    println!("{}:", harness_policy_editor::policy_file::path(&workspace_root).display());
-    println!("  ドメイン: {domain}{}", if plan.report.created_domain { "（新規）" } else { "" });
+    println!(
+        "{}:",
+        harness_policy_editor::policy_file::path(&workspace_root).display()
+    );
+    println!(
+        "  ドメイン: {domain}{}",
+        if plan.report.created_domain {
+            "（新規）"
+        } else {
+            ""
+        }
+    );
     for (key, value) in &plan.report.added {
         println!("  + {key} = {value}");
     }
@@ -752,16 +974,6 @@ fn run_approve(
     ExitCode::SUCCESS
 }
 
-/// ドメイン名の既定値——コマンドの先頭トークンのbasename（`cargo build` → `cargo`、
-/// `C:\tools\gh.exe pr list` → `gh`）。**実行時マッチャではなく識別子**なので、
-/// 衝突したら`--domain`で明示させる。
-fn default_domain_name(command: &str) -> String {
-    let token = command.split_whitespace().next().unwrap_or("");
-    let token = token.trim_matches(['"', '\'']);
-    let name = token.rsplit(['\\', '/']).next().unwrap_or(token);
-    name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name).to_string()
-}
-
 fn resolve_require_sandbox(raw: Option<&str>) -> Option<harness_core::RequireSandbox> {
     match raw {
         None | Some("none") => Some(harness_core::RequireSandbox::None),
@@ -780,6 +992,244 @@ fn resolve_require_sandbox(raw: Option<&str>) -> Option<harness_core::RequireSan
 /// 書込前の確認。非対話（パイプ・リダイレクト）では`--yes`を必須にする——ヘッドレスは
 /// 対話プロンプトを一切出さない原則に従い、「答えが返ってこないまま既定で進む」形を作らない
 /// （`harness policy apply`と同じ作法）。
+/// `harness-policy-editor unapprove` — 承認済み宣言を取り消す。
+///
+/// 表示の作法は`approve`と同じ2段（差分を見せる→確認→書く）。**消える件数と「元から無かった」
+/// 件数を分けて出す**——分けないと、綴りを間違えた指定が「取り消しました」として通る（B-09）。
+/// `unapprove`の「何を対象にするか」の指定一式。
+///
+/// 選択子は5通り（`--fs`＋`--access` / `--net` / `--all` / `--excluded`）あり、互いに排他である。
+/// 束ねて1つの型で運ぶのは、**組み合わせの検査を1箇所（[`collect_unapprove_targets`]）に
+/// 閉じ込める**ため——引数を平らに並べると、呼び出し側が増えるたびに検査を書き写すことになる。
+struct UnapproveSelector<'a> {
+    domain: Option<&'a str>,
+    fs: &'a [String],
+    access: Option<&'a str>,
+    net: &'a [String],
+    all: bool,
+    excluded: bool,
+}
+
+fn run_unapprove(
+    selector: UnapproveSelector<'_>,
+    workspace: Option<PathBuf>,
+    yes: bool,
+) -> ExitCode {
+    use harness_policy_editor::unapprove;
+
+    let workspace_root = resolve_workspace(workspace);
+    let file = match harness_policy_editor::policy_file::load(&workspace_root) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let targets = match collect_unapprove_targets(&file, &selector, &workspace_root) {
+        Ok(targets) => targets,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if targets.is_empty() {
+        println!("取り消す宣言がありません（policy.jsonは変更していません）");
+        return ExitCode::SUCCESS;
+    }
+
+    let plan = match unapprove::plan(&workspace_root, &targets) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!(
+        "{}:",
+        harness_policy_editor::policy_file::path(&workspace_root).display()
+    );
+    if plan.removed.is_empty() {
+        println!("  取り消せる宣言はありませんでした");
+    } else {
+        println!("  取り消す宣言 {}件:", plan.removed.len());
+        for target in &plan.removed {
+            println!(
+                "    - [{}] {} {}",
+                target.domain,
+                target.key.dotted(),
+                target.value
+            );
+        }
+    }
+    if !plan.not_found.is_empty() {
+        // **「無かった」を黙って成功にしない。** 指定の綴り間違いはここでしか気付けない。
+        println!("  policy.jsonに無かった指定 {}件:", plan.not_found.len());
+        for target in &plan.not_found {
+            println!(
+                "    ? [{}] {} {}",
+                target.domain,
+                target.key.dotted(),
+                target.value
+            );
+        }
+    }
+    if !plan.emptied_domains.is_empty() {
+        println!(
+            "  宣言が空になるドメイン: {}（ドメイン自体は残します——宣言なしでパス2を走らせて\
+             拒否されることを確かめられるようにするため）",
+            plan.emptied_domains.join(", ")
+        );
+    }
+    println!();
+    println!("{}", harness_policy_editor::unapprove::ACE_NOTICE);
+
+    if plan.is_empty() {
+        return if plan.not_found.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            // 1件も消せず、しかも指定が全部見つからなかった＝ユーザーの意図は果たせていない。
+            ExitCode::FAILURE
+        };
+    }
+    if !confirm_write(yes) {
+        println!("何も書いていません");
+        return ExitCode::FAILURE;
+    }
+    match unapprove::commit(&workspace_root, &plan) {
+        Ok(true) => {
+            println!(
+                "policy.jsonを更新しました（{}件を取り消し）",
+                plan.removed.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("変更はありませんでした");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// CLIの引数から取り消し対象を組み立てる。組み立てに失敗した理由は文字列で返す。
+fn collect_unapprove_targets(
+    file: &harness_policy_editor::PolicyFile,
+    selector: &UnapproveSelector<'_>,
+    workspace_root: &std::path::Path,
+) -> Result<Vec<harness_policy_editor::unapprove::UnapproveTarget>, String> {
+    use harness_policy::generalize::SettingsKey;
+    use harness_policy_editor::unapprove::{self, UnapproveTarget};
+
+    let UnapproveSelector {
+        domain,
+        fs,
+        access,
+        net,
+        all,
+        excluded,
+    } = *selector;
+
+    // [BUG-103] いまの規則なら候補にしなかった宣言だけを掃除する。
+    if excluded {
+        if all || !fs.is_empty() || !net.is_empty() {
+            return Err(
+                "--excluded は --all / --fs / --net と同時に指定できません（何を対象に\
+                 するのかをはっきりさせてください）"
+                    .to_string(),
+            );
+        }
+        let rules = harness_policy_editor::exclusion::ExclusionRules::for_session(workspace_root);
+        let mut found = unapprove::excluded_targets(file, &rules);
+        if let Some(name) = domain {
+            found.retain(|(target, _)| target.domain == name);
+        }
+        // **理由の内訳を出す**（B-09/B-32）。「1,644件消します」だけでは、消えるものが
+        // 意図した種類なのかをユーザーが確かめようがない。
+        let mut by_reason: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (_, reason) in &found {
+            *by_reason.entry(format!("{reason:?}")).or_default() += 1;
+        }
+        if !by_reason.is_empty() {
+            println!("いまの規則なら候補にしなかった宣言の内訳:");
+            for (reason, count) in &by_reason {
+                println!("  {reason}: {count}件");
+            }
+            println!();
+        }
+        return Ok(found.into_iter().map(|(target, _)| target).collect());
+    }
+
+    if all {
+        if !fs.is_empty() || !net.is_empty() {
+            return Err(
+                "--all と --fs/--net は同時に指定できません（全部消すのか個別に消すのかを\
+                 はっきりさせてください）"
+                    .to_string(),
+            );
+        }
+        return match domain {
+            Some(name) => match file.domain(name) {
+                Some(d) => Ok(unapprove::domain_targets(d)),
+                None => Err(format!("ドメイン {name} は policy.json にありません")),
+            },
+            None => Ok(unapprove::all_targets(file)),
+        };
+    }
+
+    if fs.is_empty() && net.is_empty() {
+        return Err(
+            "取り消す対象を指定してください（--fs <値> --access <種別> / --net <ドメイン> / --all）"
+                .to_string(),
+        );
+    }
+    let Some(domain) = domain else {
+        return Err("--domain <name> を指定してください".to_string());
+    };
+
+    let mut targets = Vec::new();
+    if !fs.is_empty() {
+        let Some(access) = access else {
+            return Err(
+                "--fs には --access <read|read_write|read_exec> を付けてください\
+                 （同じパスが別のaccessでも宣言され得るため、どちらを消すのかが決まりません）"
+                    .to_string(),
+            );
+        };
+        // 語彙は`SettingsKey`と1:1（新しい綴りを作らない）。
+        let key = match access {
+            "read" => SettingsKey::FsRead,
+            "read_write" => SettingsKey::FsReadWrite,
+            "read_exec" => SettingsKey::FsReadExec,
+            other => {
+                return Err(format!(
+                    "--access は read / read_write / read_exec のいずれかです（指定: {other}）"
+                ))
+            }
+        };
+        for value in fs {
+            targets.push(UnapproveTarget {
+                domain: domain.to_string(),
+                key,
+                value: value.clone(),
+            });
+        }
+    }
+    for value in net {
+        targets.push(UnapproveTarget {
+            domain: domain.to_string(),
+            key: SettingsKey::NetAllowDomains,
+            value: value.clone(),
+        });
+    }
+    Ok(targets)
+}
+
 fn confirm_write(yes: bool) -> bool {
     use std::io::IsTerminal;
 
@@ -822,6 +1272,14 @@ fn run_sessions(workspace: Option<PathBuf>) -> ExitCode {
             truncate(&manifest.command, 40),
             manifest.status.label()
         );
+        // 失敗した行にだけ理由を添える。一覧なので**1行目だけ**——全文は`show`で読める
+        // （出さないと、この一覧から「どれを追えばいいか」が決められない）。
+        if let Some(note) = manifest.failure_note() {
+            println!(
+                "  {}",
+                truncate(note.lines().next().unwrap_or_default(), 100)
+            );
+        }
     }
     ExitCode::SUCCESS
 }
@@ -865,24 +1323,31 @@ fn resolve_limit(limit: Option<usize>) -> usize {
 
 #[cfg(not(windows))]
 const NOT_WINDOWS_MESSAGE: &str = "harness-policy-editor の記録モードはWindows専用です\
-     （Tier1の制限トークン・Tier2aのAppContainer・ETW・WFPに依存しているため）。";
+     （Tier2aのAppContainer・ETW・WFPに依存しているため）。";
 
 fn print_overview() {
     println!("harness-policy-editor — LLMを介さずに「このコマンドに何を許すか」を決める道具");
     println!();
     println!("記録は2パスで行います（FSのpermissiveさとネットワーク強制は同一トークンでは");
     println!("両立しないため、同時にではなく順番に使います）:");
-    println!("  パス1  Tier1（制限トークン＋低IL）で触ったファイルを全部記録");
+    println!("  パス1  隔離なし（Tier0）で触ったファイルを全部記録");
     println!("  中間   FS候補をユーザーが承認して policy.json へ書く");
     println!("  パス2  Tier2a（AppContainer＋WFP＋Proxy）で接続したドメインを記録");
     println!();
+    println!("端末から引数なしで起動すると、記録・編集の2画面のTUIが開きます");
+    println!("（いま概要が出ているのは、標準入出力が端末ではないためです）。");
+    println!();
     println!("使えるコマンド:");
-    println!("  record -- <コマンド>        Tier1で実行し、触ったファイルを記録する（UAC 1回）");
+    println!("  record -- <コマンド>        隔離せずに実行し、触ったファイルを記録する（UAC 1回）");
     println!("  approve --domain <name> --accept <id>...");
     println!("                              候補を承認して .harness/policy.json へ書く");
-    println!("  record-net --domain <name>  Tier2aで実行し、接続したドメインを記録する（UAC 最大2回）");
+    println!(
+        "  record-net --domain <name>  Tier2aで実行し、接続したドメインを記録する（UAC 最大2回）"
+    );
     println!("  sessions                    記録セッションの一覧");
     println!("  show [<id>] [--net]         記録を読み直して候補を表示する（記録し直さない）");
+    println!("  unapprove --domain <name> --fs <値> --access <種別> | --net <ドメイン> | --all");
+    println!("                              承認済み宣言を取り消す（ACLは次のパス2開始時に撤収）");
     println!();
     println!("記録と閲覧は独立したコマンドです。記録し終えてから編集へ進む一方通行ではなく、");
     println!("いつでも記録し直す・別の一般化度合いで見直すことができます。");
@@ -890,5 +1355,6 @@ fn print_overview() {
     println!("ACEが実際に付くのは record-net（パス2）だけです。approve は「次のパス2でこの穴を");
     println!("開ける」という宣言を書くだけで、このマシンには何も残しません。");
     println!();
-    println!("これから実装する部分: 記録／編集／テストの3画面（TUI）。");
+    println!("まだ無いもの: 「テスト」画面（policy.jsonの宣言だけを許可して走らせ、想定外の");
+    println!("拒否を見る＝ポリシー強制モードでの検証）と、policy.jsonの削除・編集操作。");
 }

@@ -109,6 +109,96 @@ fn net_audit_ip_only_denials_are_counted_but_not_proposed() {
     assert!(report.notes[0].contains("IP-only"));
 }
 
+/// **制御レコードはネットワークイベントとして数えない。**
+///
+/// 昇格側（`netfilterd`）が自分の状態を残す行は`protocol:"control"`を持ち、`allowed:false`かつ
+/// ホスト名が無い。素通しすると「ホスト名を持たない拒否」に混ざり、**嘘の注記**が出る
+/// ——BUG-093のセッション`7476-1786226894-1`の実データがまさにこれで、通信は1件も無いのに
+/// 「1件のネットワークイベントがホスト名を持たなかった」と出ていた。
+#[test]
+fn net_audit_control_records_are_not_counted_as_network_events() {
+    // 実データそのまま（`.harness/sandbox/policy-editor-7476-1786226894-1/net-audit.jsonl`）。
+    let jsonl = concat!(
+        r#"{"timestamp_unix_ms":1786226932961,"kind":"wfp","protocol":"control","allowed":false,"#,
+        r#""reason":"net_event_collection_enable_failed","local_addr":null,"local_port":0,"#,
+        r#""remote_addr":null,"remote_host":null,"remote_port":0,"filter_id":null,"layer_id":null}"#,
+        "\n",
+    );
+
+    let report = normalize_net_audit(jsonl);
+
+    assert!(report.available);
+    assert!(report.candidates.is_empty());
+    assert!(
+        report.notes.is_empty(),
+        "a control record must not produce an IP-only note: {:?}",
+        report.notes
+    );
+}
+
+/// 上の対（B-35）: **本物の**ホスト名なし拒否は従来どおり数える。
+/// 制御レコードの除外が「ホスト名なしの拒否を全部黙らせる」形になっていたら、この2つの
+/// テストは同時には通らない。
+#[test]
+fn net_audit_control_records_are_skipped_but_real_ip_only_denials_still_count() {
+    let jsonl = concat!(
+        r#"{"kind":"wfp","protocol":"control","allowed":false,"reason":"net_event_collection_enable_failed"}"#,
+        "\n",
+        r#"{"kind":"wfp","protocol":"tcp","allowed":false,"remote_addr":"198.18.0.1","reason":"classify_drop"}"#,
+        "\n",
+    );
+
+    let report = normalize_net_audit(jsonl);
+
+    assert!(report.candidates.is_empty());
+    assert_eq!(report.notes.len(), 1);
+    assert!(
+        report.notes[0].contains("1 denied network event"),
+        "only the real IP-only drop must be counted: {}",
+        report.notes[0]
+    );
+}
+
+/// 記録モード（`NetIntake::All`）でも制御レコードは候補にならない
+/// ——`All`は`allowed`を見ないので、除外が`allowed`側の分岐に紛れていたら漏れる。
+#[test]
+fn net_audit_control_records_are_skipped_in_record_all_intake_too() {
+    let jsonl = concat!(
+        r#"{"kind":"wfp","protocol":"control","allowed":false,"reason":"policy_learnd_chain_verify_rejected pipe=x env_present=false: nope"}"#,
+        "\n",
+        r#"{"kind":"proxy","protocol":"tcp","allowed":true,"host":"crates.io","reason":"record_all"}"#,
+        "\n",
+    );
+
+    let report = normalize_net_audit_with_mode(jsonl, NetIntake::All);
+
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(
+        report.candidates[0].requested,
+        Requested::Net {
+            domain: "crates.io".to_string()
+        }
+    );
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+}
+
+/// 判定そのもの: `protocol`が`control`のときだけ真。`kind`では判定しない
+/// （`kind:"wfp"`は本物のdropレコードにも付く）。
+#[test]
+fn is_net_control_record_looks_at_protocol_only() {
+    let control: serde_json::Value =
+        serde_json::from_str(r#"{"kind":"wfp","protocol":"control","reason":"x"}"#).unwrap();
+    let drop_event: serde_json::Value =
+        serde_json::from_str(r#"{"kind":"wfp","protocol":"tcp","reason":"classify_drop"}"#)
+            .unwrap();
+    let proxy: serde_json::Value =
+        serde_json::from_str(r#"{"kind":"proxy","host":"a.example"}"#).unwrap();
+
+    assert!(is_net_control_record(&control));
+    assert!(!is_net_control_record(&drop_event));
+    assert!(!is_net_control_record(&proxy), "no protocol key at all");
+}
+
 /// 壊れた行があっても、その行だけ飛ばして残りを読む。
 #[test]
 fn net_audit_skips_malformed_lines_and_keeps_going() {
@@ -241,9 +331,8 @@ fn path_separators_are_normalized_uniformly_across_sources() {
     let preflight = normalize_preflight(
         r#"{"denied_entries":[{"path":"C:\\a\\b","access":"read","reason":"r","last_denied_at_unix_secs":1,"count":1}]}"#,
     );
-    let cow = normalize_cow_denied(
-        r#"{"path":"C:\\a\\b","access_mask":2,"pid":1,"ts_unix_millis":1}"#,
-    );
+    let cow =
+        normalize_cow_denied(r#"{"path":"C:\\a\\b","access_mask":2,"pid":1,"ts_unix_millis":1}"#);
     let audit = normalize_fs_audit(
         r#"{"kind":"etw","path":"C:\\a\\b","access":"read","allowed":false,"reason":"r","timestamp_unix_ms":1}"#,
     );
@@ -265,7 +354,7 @@ fn path_separators_are_normalized_uniformly_across_sources() {
 fn fs_folder_and_fold_fs_agree_on_the_same_input() {
     let input = [
         (r"C:\a\b.txt", FsAccess::Read, 10u64),
-        ("C:/a/b.txt", FsAccess::Read, 20), // 区切り違い＝同一
+        ("C:/a/b.txt", FsAccess::Read, 20),  // 区切り違い＝同一
         (r"C:\A\B.TXT", FsAccess::Read, 15), // 大小違い＝同一
         (r"C:\a\b.txt", FsAccess::ReadWrite, 30), // accessが違えば別候補
         (r"C:\c.txt", FsAccess::Read, 5),
@@ -281,7 +370,10 @@ fn fs_folder_and_fold_fs_agree_on_the_same_input() {
     assert_eq!(folder.into_candidates(), legacy);
     assert_eq!(legacy.len(), 3, "3つの異なる(パス, access)へ畳まれる");
     assert_eq!(legacy[0].count, 3);
-    assert_eq!(legacy[0].last_seen_unix_ms, 20, "最新のタイムスタンプを保つ");
+    assert_eq!(
+        legacy[0].last_seen_unix_ms, 20,
+        "最新のタイムスタンプを保つ"
+    );
 }
 
 /// record-allの主目的: **許可されたアクセスも候補になる**。`FsFolder`は`allowed`を見ない
@@ -290,7 +382,13 @@ fn fs_folder_and_fold_fs_agree_on_the_same_input() {
 fn fs_folder_folds_observed_accesses_regardless_of_the_outcome() {
     let mut folder = FsFolder::new();
     folder.add(Source::Etw, "C:/ok.txt", FsAccess::Read, "observed", 1);
-    folder.add(Source::Etw, "C:/ng.txt", FsAccess::Read, "STATUS_ACCESS_DENIED", 2);
+    folder.add(
+        Source::Etw,
+        "C:/ng.txt",
+        FsAccess::Read,
+        "STATUS_ACCESS_DENIED",
+        2,
+    );
 
     let candidates = folder.into_candidates();
     assert_eq!(candidates.len(), 2);

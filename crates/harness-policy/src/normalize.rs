@@ -295,6 +295,21 @@ pub enum NetIntake {
     All,
 }
 
+/// `net-audit.jsonl`の1行が**ネットワークイベントではなく制御レコード**か。
+///
+/// 制御レコード（`protocol == "control"`）は、昇格側が自分の状態——WFPイベント収集を
+/// 有効化できなかった、収集器を連鎖起動できなかった等——を残すために書く1行である
+/// （`wfp.rs`の`record_control_event`が唯一の書き手）。FS側の[`crate::FsAuditKind::Control`]と
+/// 同じ役割で、**候補には昇格しない**。
+///
+/// この判定が要るのは、制御レコードが`allowed: false`かつホスト名を持たないため、
+/// 素通しすると「拒否されたがホスト名を復元できなかったネットワークイベント」として
+/// 数えられてしまうからである——実データ（BUG-093のセッション`7476-1786226894-1`）で
+/// 「1件のネットワークイベントがホスト名を持たなかった」という**嘘の注記**が出ていた。
+pub fn is_net_control_record(event: &serde_json::Value) -> bool {
+    event.get("protocol").and_then(|v| v.as_str()) == Some("control")
+}
+
 /// [`normalize_net_audit`]の取り込み口を選べる版（[`NetIntake`]参照）。
 pub fn normalize_net_audit_with_mode(jsonl: &str, intake: NetIntake) -> SourceReport {
     let mut notes = Vec::new();
@@ -312,6 +327,11 @@ pub fn normalize_net_audit_with_mode(jsonl: &str, intake: NetIntake) -> SourceRe
                 continue;
             }
         };
+        // 制御レコードは「通信の記録」ではない。ここで落とさないと、ホスト名を持たない
+        // 拒否として`ip_only_denies`に混ざる（`is_net_control_record`のdoc参照）。
+        if is_net_control_record(&event) {
+            continue;
+        }
         if intake == NetIntake::DeniedOnly
             && event.get("allowed").and_then(|v| v.as_bool()) != Some(false)
         {
@@ -366,9 +386,10 @@ pub fn normalize_net_audit_with_mode(jsonl: &str, intake: NetIntake) -> SourceRe
 
 fn fold_net(folded: &mut Vec<DeniedCandidate>, host: &str, reason: String, timestamp: u64) {
     let normalized = host.trim_end_matches('.').to_ascii_lowercase();
-    if let Some(existing) = folded.iter_mut().find(|c| {
-        matches!(&c.requested, Requested::Net { domain } if domain == &normalized)
-    }) {
+    if let Some(existing) = folded
+        .iter_mut()
+        .find(|c| matches!(&c.requested, Requested::Net { domain } if domain == &normalized))
+    {
         existing.count = existing.count.saturating_add(1);
         existing.last_seen_unix_ms = existing.last_seen_unix_ms.max(timestamp);
     } else {

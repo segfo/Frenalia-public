@@ -46,14 +46,14 @@ pub fn check_proposal(proposal: &RuleProposal, require_sandbox: RequireSandbox) 
     match (proposal.key, require_sandbox) {
         (_, RequireSandbox::None) => GateVerdict::Allowed,
 
-        (SettingsKey::FsReadWrite, RequireSandbox::WriteContainment) => GateVerdict::Rejected(
-            format!(
+        (SettingsKey::FsReadWrite, RequireSandbox::WriteContainment) => {
+            GateVerdict::Rejected(format!(
                 "{} would grant write access outside the workspace, which contradicts \
                  --require-sandbox (write containment). Accept it only after dropping that \
                  requirement, or propose fs.read instead.",
                 proposal.value
-            ),
-        ),
+            ))
+        }
         (SettingsKey::FsReadWrite, RequireSandbox::Confidential) => GateVerdict::Rejected(format!(
             "{} would grant write access outside the workspace, which contradicts \
              --require-sandbox=confidential.",
@@ -151,16 +151,20 @@ mod tests {
     /// `write-containment`は`read_write`だけを拒否し、読取系は通す（D7と同じ規則）。
     #[test]
     fn write_containment_rejects_only_read_write() {
-        assert!(
-            check_proposal(&proposal(FsAccess::ReadWrite), RequireSandbox::WriteContainment)
-                .is_rejected()
-        );
+        assert!(check_proposal(
+            &proposal(FsAccess::ReadWrite),
+            RequireSandbox::WriteContainment
+        )
+        .is_rejected());
         assert_eq!(
             check_proposal(&proposal(FsAccess::Read), RequireSandbox::WriteContainment),
             GateVerdict::Allowed
         );
         assert_eq!(
-            check_proposal(&proposal(FsAccess::ReadExec), RequireSandbox::WriteContainment),
+            check_proposal(
+                &proposal(FsAccess::ReadExec),
+                RequireSandbox::WriteContainment
+            ),
             GateVerdict::Allowed
         );
     }
@@ -189,8 +193,10 @@ mod tests {
     /// 拒否メッセージには対象の値が入る（どれが弾かれたか一覧から分かるように）。
     #[test]
     fn rejection_messages_name_the_offending_value() {
-        let verdict =
-            check_proposal(&proposal(FsAccess::ReadWrite), RequireSandbox::WriteContainment);
+        let verdict = check_proposal(
+            &proposal(FsAccess::ReadWrite),
+            RequireSandbox::WriteContainment,
+        );
 
         assert!(verdict.message().unwrap().contains("C:/outside"));
     }

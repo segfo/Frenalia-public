@@ -1,0 +1,1374 @@
+//! 編集画面の状態遷移テスト（端末を使わない）。
+//!
+//! 承認は**実際に`policy.json`へ書くところまで**確かめる。「未選択なら書かない」だけを
+//! 固定すると、承認経路が丸ごと死んでいても緑になる（B-35: 禁止側と許可側は対で書く）。
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::session_dir::{self, RecordManifest, RecordSessionDir, RecordStatus};
+use crate::tui::state::{App, CandidateFilter, Confirm, EditField, Pass, Screen};
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(session_dir::sandbox_root(dir.path())).expect("sandbox root");
+    dir
+}
+
+/// パス1の記録セッションを1件作る（観測したパスは呼び出し側が決める）。
+fn seed_pass1(ws: &tempfile::TempDir, id: &str, command: &str, paths: &[&str]) {
+    let dir = RecordSessionDir::create(ws.path(), id).expect("session dir");
+    let mut manifest = RecordManifest::new(id, command, ws.path(), ws.path(), 100);
+    manifest.status = RecordStatus::Finished;
+    manifest.collector_started = true;
+    manifest.etw_available = true;
+    manifest.exit_code = Some(0);
+    dir.write_manifest(&manifest).expect("manifest");
+
+    let mut log = String::new();
+    for (index, path) in paths.iter().enumerate() {
+        let event = harness_policy::FsAuditEvent::observed(
+            harness_policy::FsAuditKind::Etw,
+            *path,
+            harness_config::FsAccess::Read,
+            true,
+            "record_all",
+            index as u64 + 1,
+        );
+        log.push_str(&event.to_jsonl_line().expect("jsonl"));
+        log.push('\n');
+    }
+    std::fs::write(dir.audit_log_path(), log).expect("audit log");
+}
+
+/// パス2（ドメイン記録）のセッションを1件作る。
+fn seed_pass2(ws: &tempfile::TempDir, id: &str, command: &str, domain: &str, hosts: &[&str]) {
+    let dir = RecordSessionDir::create(ws.path(), id).expect("session dir");
+    let mut manifest = RecordManifest::new(id, command, ws.path(), ws.path(), 200);
+    manifest.pass = 2;
+    manifest.domain = Some(domain.to_string());
+    manifest.status = RecordStatus::Finished;
+    manifest.exit_code = Some(0);
+    dir.write_manifest(&manifest).expect("manifest");
+
+    let mut log = String::new();
+    for host in hosts {
+        log.push_str(&format!(
+            r#"{{"source":"proxy","host":"{host}","allowed":true,"reason":"record_all","timestamp_unix_ms":1}}"#
+        ));
+        log.push('\n');
+    }
+    std::fs::write(dir.net_audit_log_path(), log).expect("net audit log");
+}
+
+fn open_edit(ws: &tempfile::TempDir) -> App {
+    let mut app = App::new(ws.path().to_path_buf());
+    app.on_key(key(KeyCode::F(2)));
+    app
+}
+
+/// 記録を開くと候補が出て、ドメイン名の既定値がコマンドから決まる。
+#[test]
+fn opening_a_recording_shows_candidates_and_a_default_domain_name() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[r"C:\Users\me\.cargo\registry\a.rs"],
+    );
+
+    let app = open_edit(&ws);
+
+    assert_eq!(app.screen, Screen::Edit);
+    let view = app.view.as_ref().expect("記録が開いている");
+    assert!(!view.proposals.is_empty());
+    assert_eq!(app.domain.text(), "cargo");
+    assert!(
+        view.notes.contains("観測"),
+        "注記（観測件数・除外件数）はCLIと同じ文言を出す: {}",
+        view.notes
+    );
+}
+
+/// 一般化の度合いを変えると**選択は破棄される**——idが振り直されるので、残すと
+/// ユーザーが選んだつもりのものと違う候補が承認される。破棄した事実は必ず出す。
+#[test]
+fn changing_the_generalization_drops_the_selection_and_says_so() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[r"C:\Users\me\.cargo\registry\a.rs"],
+    );
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    assert_eq!(app.accepted.len(), 1, "まず1件選んでおく");
+
+    app.on_key(key(KeyCode::Char('g')));
+
+    assert!(app.accepted.is_empty(), "idが変わるので選択は残せない");
+    assert!(
+        app.status.contains("選択は解除"),
+        "黙って捨てると、選んだつもりのものが承認されていないことに気付けない: {}",
+        app.status
+    );
+}
+
+/// 何も選ばずに承認しようとしても、何も起きない（全件受理のショートハンドは無い、D-42）。
+#[test]
+fn approving_without_a_selection_is_refused() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    let mut app = open_edit(&ws);
+
+    app.on_key(key(KeyCode::Char('a')));
+
+    assert!(app.modal.is_none());
+    assert!(app.status.contains("スペースで選んで"), "{}", app.status);
+    assert!(
+        !crate::policy_file::path(ws.path()).exists(),
+        "policy.jsonを作ってはいけない"
+    );
+}
+
+/// 承認は2段。`a`は差分を見せるだけで**まだ書かない**。
+#[test]
+fn pressing_approve_shows_the_diff_without_writing_anything() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+
+    app.on_key(key(KeyCode::Char('a')));
+
+    let modal = app.modal.as_ref().expect("差分のモーダルが出る");
+    assert_eq!(
+        modal.confirm,
+        Confirm::Approval,
+        "y/nを聞く形で、承認を書く確認になっている"
+    );
+    assert!(
+        modal.lines.iter().any(|l| l.contains("＋1件")),
+        "何が増えるのかを見せる: {:?}",
+        modal.lines
+    );
+    assert!(
+        modal.lines.iter().any(|l| l.contains("workspace外")),
+        "マシンに残る変更があるかどうかが承認の判断材料: {:?}",
+        modal.lines
+    );
+    assert!(
+        !crate::policy_file::path(ws.path()).exists(),
+        "確認前に書いてはいけない"
+    );
+}
+
+/// `y`で実際に`policy.json`が増える（許可側。B-35の対）。次はパス2、というガイドまで含めて固定する。
+#[test]
+fn confirming_the_diff_writes_the_policy_file_and_points_at_pass2() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('a')));
+
+    app.on_key(key(KeyCode::Char('y')));
+
+    let policy = crate::policy_file::load(ws.path()).expect("policy.json");
+    let domain = policy.domain("cargo").expect("ドメインが作られている");
+    assert!(
+        !domain.fs.is_empty(),
+        "承認した値が入っていなければ、書けたと言えない"
+    );
+    assert_eq!(domain.commands, vec!["cargo build".to_string()]);
+    assert_eq!(domain.provenance.record_sessions, vec!["s1".to_string()]);
+
+    // ガイド: 次はパス2（ここで初めてACEが付く）。画面と入力欄が埋まっている。
+    assert_eq!(app.screen, Screen::Record);
+    assert_eq!(app.pass, Pass::Two);
+    assert_eq!(app.run_domain.text(), "cargo");
+    assert_eq!(app.command.text(), "cargo build");
+    assert!(app.status.contains("パス2"), "{}", app.status);
+}
+
+/// 差分は**access種別ごとにまとめる**。`+ fs.read = <パス>`を1行ずつ出すと、687件では
+/// 同じ`fs.read =`が687回並び、「どの種別を何件許すのか」が読み取れない。
+#[test]
+fn the_diff_groups_the_paths_under_each_access_kind() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[
+            r"C:\Users\me\.cargo\registry\a.rs",
+            r"C:\Users\me\.cargo\registry\b.rs",
+        ],
+    );
+    let mut app = open_edit(&ws);
+    app.generalization = harness_policy::Generalization::None;
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+
+    app.on_key(key(KeyCode::Char('a')));
+
+    let lines = &app.modal.as_ref().expect("確認が出る").lines;
+    let heading = lines
+        .iter()
+        .position(|l| l.contains("fs.read") && l.contains("＋2件"))
+        .unwrap_or_else(|| panic!("種別の見出しが要る: {lines:#?}"));
+    assert!(
+        lines[heading + 1].trim().starts_with("C:/"),
+        "見出しの下にパスがぶら下がる: {:?}",
+        &lines[heading..]
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("fs.read = C:/")),
+        "パスごとに種別を繰り返さない: {lines:#?}"
+    );
+}
+
+/// **判断材料（マシンに残る変更）は明細より前に置く。** 687件の後ろにあると、承認するか
+/// どうかを決める材料を読むのに延々と送ることになる。
+#[test]
+fn what_stays_on_the_machine_comes_before_the_long_detail() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[r"C:\Users\me\.cargo\registry\a.rs"],
+    );
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('a')));
+
+    let lines = &app.modal.as_ref().expect("確認が出る").lines;
+    let machine = lines
+        .iter()
+        .position(|l| l.contains("workspace外"))
+        .expect("マシンに残る変更の行がある");
+    let detail = lines
+        .iter()
+        .position(|l| l.contains("＋"))
+        .expect("明細の見出しがある");
+
+    assert!(machine < detail, "判断材料が明細より後ろにある: {lines:#?}");
+}
+
+/// **書き込みの確認はEnterでは閉じない。** 「Enterを押したら消えた。書かれたのか？」という
+/// 状態を作らないため、`y`か`n`/`Esc`を選ばせる（実際にこの迷いが報告された）。
+#[test]
+fn enter_does_not_dismiss_the_write_confirmation() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('a')));
+    assert!(app.modal.is_some());
+
+    app.on_key(key(KeyCode::Enter));
+
+    assert!(app.modal.is_some(), "確認が消えてはいけない");
+    assert!(
+        !crate::policy_file::path(ws.path()).exists(),
+        "書いてもいけない"
+    );
+}
+
+/// 読むだけのダイアログ（拒否の理由など）はEnterで閉じてよい。
+#[test]
+fn enter_closes_a_read_only_dialog() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    let mut app = open_edit(&ws);
+    app.modal = Some(crate::tui::state::Modal {
+        title: "報告".to_string(),
+        lines: vec!["読むだけ".to_string()],
+        confirm: Confirm::ReadOnly,
+    });
+
+    app.on_key(key(KeyCode::Enter));
+
+    assert!(app.modal.is_none());
+}
+
+/// **長い差分は最後まで送れる。** 送れないと、確認できないまま`y`を押すことになる。
+#[test]
+fn a_long_diff_can_be_scrolled_to_the_end() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    let mut app = open_edit(&ws);
+    app.modal = Some(crate::tui::state::Modal {
+        title: "承認の確認".to_string(),
+        lines: (0..50).map(|i| format!("  + fs.read = C:/x/{i}")).collect(),
+        confirm: Confirm::Approval,
+    });
+
+    app.on_key(key(KeyCode::Down));
+    assert_eq!(app.modal_scroll, 1);
+    app.on_key(key(KeyCode::PageDown));
+    assert_eq!(app.modal_scroll, 11);
+    app.on_key(key(KeyCode::End));
+    assert_eq!(app.modal_scroll, 49, "末尾まで行ける");
+    app.on_key(key(KeyCode::Down));
+    assert_eq!(app.modal_scroll, 49, "末尾より先へは進まない");
+    app.on_key(key(KeyCode::Home));
+    assert_eq!(app.modal_scroll, 0);
+
+    // 送った状態から閉じても、次に開いたときは先頭から。
+    app.on_key(key(KeyCode::End));
+    app.on_key(key(KeyCode::Esc));
+    assert_eq!(app.modal_scroll, 0);
+}
+
+/// `n`で中止したら何も書かない。**中止したことも伝える**（黙って閉じない）。
+#[test]
+fn declining_the_diff_writes_nothing() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('a')));
+
+    app.on_key(key(KeyCode::Char('n')));
+
+    assert!(app.modal.is_none());
+    assert!(
+        !crate::policy_file::path(ws.path()).exists(),
+        "何も書かない"
+    );
+    assert!(app.status.contains("中止"), "{}", app.status);
+}
+
+/// 広すぎる値（ユーザープロファイル全体）は**選ぶ時点で断る**。
+///
+/// `approve::plan`は広すぎる値が1件でも混ざると**何も書かずに全部を拒否する**ので、選べて
+/// しまうと「10件選んで承認したら全部拒否された」になる。一覧からは消さない——観測した事実は
+/// 隠さない（D-43）。承認経路側の拒否は`approve_tests::one_too_broad_value_refuses_the_whole_batch`
+/// が別に固定している（こちらが緩んでも書かれることはない）。
+#[test]
+fn a_too_broad_candidate_cannot_be_selected_even_when_it_is_shown() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me"]);
+    let mut app = open_edit(&ws);
+    // 一般化すると値が変わるので、観測した値そのままの状況を作る。
+    app.generalization = harness_policy::Generalization::None;
+    app.open_selected_session();
+    app.filter = CandidateFilter::All;
+    app.rebuild_tree();
+    app.edit_focus = EditField::Proposals;
+    assert!(
+        !app.visible_proposals().is_empty(),
+        "候補としては一覧に出る（観測した事実は隠さない）"
+    );
+
+    app.on_key(key(KeyCode::Char(' ')));
+
+    assert!(app.accepted.is_empty(), "選択に入れてはいけない");
+    assert!(
+        app.status.contains("承認できません"),
+        "なぜ選べないのかを出す: {}",
+        app.status
+    );
+    assert!(
+        app.status.contains("too broad"),
+        "理由（幅の判定）が読めなければ直しようがない: {}",
+        app.status
+    );
+    assert!(!crate::policy_file::path(ws.path()).exists());
+}
+
+/// 既定では承認できない候補を**出さない**。ただし件数は数えられる状態にしておく
+/// ——「候補が少ない」のか「隠している」のかが区別できないと、無言で捨てているのと同じ（B-09）。
+#[test]
+fn blocked_candidates_are_hidden_by_default_but_still_counted() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[r"C:\Users\me", r"C:\Users\me\.cargo\registry\a.rs"],
+    );
+    let mut app = open_edit(&ws);
+    app.generalization = harness_policy::Generalization::None;
+    app.open_selected_session();
+
+    assert_eq!(app.filter, CandidateFilter::Approvable, "既定");
+    let view = app.view.as_ref().expect("記録が開いている");
+    assert_eq!(view.proposals.len(), 2);
+    assert_eq!(view.blocked_count(), 1, "C:/Users/me は承認できない");
+    assert_eq!(
+        app.visible_proposals().len(),
+        1,
+        "既定の一覧に出るのは承認できるものだけ"
+    );
+}
+
+/// `f`で一覧の範囲を回せる（承認できるもの → できないもの → 全部）。
+#[test]
+fn the_filter_cycles_through_approvable_blocked_and_all() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[r"C:\Users\me", r"C:\Users\me\.cargo\registry\a.rs"],
+    );
+    let mut app = open_edit(&ws);
+    app.generalization = harness_policy::Generalization::None;
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+
+    app.on_key(key(KeyCode::Char('f')));
+    assert_eq!(app.filter, CandidateFilter::Blocked);
+    assert_eq!(app.visible_proposals().len(), 1);
+    assert!(app.status.contains("承認できないもの"), "{}", app.status);
+
+    app.on_key(key(KeyCode::Char('f')));
+    assert_eq!(app.filter, CandidateFilter::All);
+    assert_eq!(app.visible_proposals().len(), 2);
+
+    app.on_key(key(KeyCode::Char('f')));
+    assert_eq!(app.filter, CandidateFilter::Approvable);
+}
+
+/// **画面で選んだ行と、実際に承認される候補が一致する。** ここが食い違うのは最悪の形なので、
+/// 木の行 → 候補 → `policy.json`まで通しで確かめる（フィルタで隠れている候補が混ざらないことも）。
+#[test]
+fn what_is_written_is_what_was_selected_on_screen() {
+    let ws = workspace();
+    // 承認不可（C:/Users/me）と承認可（.../registry/a.rs）が混在する。
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[r"C:\Users\me", r"C:\Users\me\.cargo\registry\a.rs"],
+    );
+    let mut app = open_edit(&ws);
+    app.generalization = harness_policy::Generalization::None;
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+
+    // 既定（承認できるものだけ）なので、木に出るのは承認できる候補だけ。
+    assert_eq!(app.selected_row, 0);
+    let node = app.selected_node().expect("行がある");
+    assert_eq!(app.tree.node(node).path, "C:/Users/me/.cargo/registry/a.rs");
+
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('a')));
+    app.on_key(key(KeyCode::Char('y')));
+
+    let policy = crate::policy_file::load(ws.path()).expect("policy.json");
+    assert_eq!(
+        policy.domain("cargo").expect("ドメイン").fs.read,
+        vec!["C:/Users/me/.cargo/registry/a.rs".to_string()]
+    );
+}
+
+/// **スペースはその配下をまとめて選ぶ。** 「この下は全部許してよい」という判断をそのまま
+/// 操作にできることが、849件の一覧を扱えるかどうかの分かれ目になる。
+#[test]
+fn space_on_a_directory_selects_everything_under_it() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[
+            r"C:\Users\me\.cargo\registry\a.rs",
+            r"C:\Users\me\.cargo\registry\b.rs",
+            r"C:\Users\me\.rustup\toolchains\x\bin\rustc.exe",
+        ],
+    );
+    let mut app = open_edit(&ws);
+    app.generalization = harness_policy::Generalization::None;
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+
+    // 根（C:/Users/me）を選んでスペース → 3件すべてが選択される。
+    app.on_key(key(KeyCode::Char(' ')));
+
+    assert_eq!(app.accepted.len(), 3, "配下すべて");
+    assert!(app.status.contains("3件を選択"), "{}", app.status);
+
+    // もう一度押すと解除（全部選ばれている状態からのトグル）。
+    app.on_key(key(KeyCode::Char(' ')));
+    assert!(app.accepted.is_empty());
+    assert!(app.status.contains("解除"), "{}", app.status);
+}
+
+/// 一括選択に**承認できない候補は混ぜない**。混ぜると承認が丸ごと拒否されるので、
+/// 除いた件数を必ず伝える。
+#[test]
+fn a_subtree_selection_skips_the_blocked_candidates_and_says_how_many() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[r"C:\Users\me", r"C:\Users\me\.cargo\registry\a.rs"],
+    );
+    let mut app = open_edit(&ws);
+    app.generalization = harness_policy::Generalization::None;
+    app.open_selected_session();
+    app.filter = CandidateFilter::All;
+    app.rebuild_tree();
+    app.edit_focus = EditField::Proposals;
+
+    app.on_key(key(KeyCode::Char(' ')));
+
+    assert_eq!(app.accepted.len(), 1, "承認できるものだけ入る");
+    assert!(
+        app.status.contains("承認できない 1件は除きました"),
+        "除いたことを黙っていると「選んだつもり」との差が見えない: {}",
+        app.status
+    );
+}
+
+/// まとめて選んだあと、配下の1件だけ外せる（そして親は「一部選択」になる）。
+#[test]
+fn an_individual_candidate_can_be_deselected_after_a_bulk_selection() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[
+            r"C:\Users\me\.cargo\registry\a.rs",
+            r"C:\Users\me\.cargo\registry\b.rs",
+        ],
+    );
+    let mut app = open_edit(&ws);
+    app.generalization = harness_policy::Generalization::None;
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+
+    app.on_key(key(KeyCode::Char(' ')));
+    assert_eq!(app.accepted.len(), 2);
+
+    // 根を開いて子（a.rs）へ降り、そこだけ外す。
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Right));
+    let node = app.selected_node().expect("子の行");
+    assert_eq!(app.tree.node(node).label, "a.rs");
+    app.on_key(key(KeyCode::Char(' ')));
+
+    assert_eq!(app.accepted.len(), 1, "1件だけ外れる");
+}
+
+/// `→`で開いて降り、`←`で閉じて戻る（展開状態は木を作り直しても残る）。
+#[test]
+fn right_expands_and_left_collapses_the_tree() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[
+            r"C:\Users\me\.cargo\registry\a.rs",
+            r"C:\Users\me\.cargo\registry\b.rs",
+            r"C:\Users\me\.cargo\bin\cargo.exe",
+        ],
+    );
+    let mut app = open_edit(&ws);
+    app.generalization = harness_policy::Generalization::None;
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+
+    // 既定では根（C:/Users/me/.cargo）だけが開いていて、子は `bin/cargo.exe` と `registry`。
+    let rows_collapsed = app.tree.rows(&app.expanded).len();
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Down));
+    let node = app.selected_node().expect("registry の行");
+    assert_eq!(app.tree.node(node).label, "registry");
+
+    app.on_key(key(KeyCode::Right));
+    assert!(
+        app.tree.rows(&app.expanded).len() > rows_collapsed,
+        "→で子が見える"
+    );
+
+    app.on_key(key(KeyCode::Left));
+    assert_eq!(
+        app.tree.rows(&app.expanded).len(),
+        rows_collapsed,
+        "←で畳む"
+    );
+
+    // 一般化の度合いを変えても、開いていた場所は保つ（比べる作業ができるように）。
+    app.on_key(key(KeyCode::Right));
+    let opened = app.expanded.clone();
+    app.on_key(key(KeyCode::Char('g')));
+    assert!(
+        opened.iter().all(|path| app.expanded.contains(path)),
+        "展開状態が消えている"
+    );
+}
+
+/// **共通の警告は行ごとに繰り返さない。** OS監査由来の注記は全候補に付くので、候補の数だけ
+/// 並べると（実測849件）個別の警告が埋もれる。
+#[test]
+fn a_warning_shared_by_every_candidate_is_hoisted_out_of_the_rows() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[
+            r"C:\Users\me\.cargo\registry\a.rs",
+            r"C:\Users\me\.cargo\registry\b.rs",
+            r"C:\Users\me\.rustup\toolchains\x\bin\rustc.exe",
+        ],
+    );
+    let app = open_edit(&ws);
+
+    let view = app.view.as_ref().expect("記録が開いている");
+    assert!(
+        view.common_warnings
+            .iter()
+            .any(|w| w.contains("OS auditing")),
+        "全候補に付く注記が共通側へ移っている: {:?}",
+        view.common_warnings
+    );
+    for proposal in &view.proposals {
+        assert!(
+            !view
+                .row_warnings(proposal)
+                .any(|w| w.contains("OS auditing")),
+            "行には固有の警告だけを残す: {}",
+            proposal.value
+        );
+    }
+    // 固有の警告（畳み込みの内訳）は行に残る——共通化で消してはいけない。
+    assert!(
+        view.proposals
+            .iter()
+            .any(|p| view.row_warnings(p).any(|w| w.contains("generalized from"))),
+        "畳み込みの内訳はその行にしか当てはまらない: {:?}",
+        view.proposals
+    );
+}
+
+/// パス2の記録を開いたらネットワーク側の候補を見せる（`--net`を指定しなくても、CLIと同じ判断）。
+#[test]
+fn a_pass2_recording_shows_the_domain_candidates() {
+    let ws = workspace();
+    seed_pass2(&ws, "s2", "cargo build", "cargo", &["crates.io"]);
+
+    let app = open_edit(&ws);
+
+    let view = app.view.as_ref().expect("記録が開いている");
+    assert!(
+        view.proposals
+            .iter()
+            .any(|p| p.key == harness_policy::generalize::SettingsKey::NetAllowDomains),
+        "パス2の候補は許可ドメインである: {:?}",
+        view.proposals
+    );
+    assert_eq!(app.domain.text(), "cargo", "記録時のドメインを引き継ぐ");
+}
+
+/// パス2の候補を承認したあとは、**テスト画面が無いことをそのまま言う**（次があるように見せない）。
+#[test]
+fn approving_domains_admits_that_the_test_screen_does_not_exist_yet() {
+    let ws = workspace();
+    seed_pass2(&ws, "s2", "cargo build", "cargo", &["crates.io"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('a')));
+
+    app.on_key(key(KeyCode::Char('y')));
+
+    let policy = crate::policy_file::load(ws.path()).expect("policy.json");
+    assert_eq!(
+        policy.domain("cargo").expect("ドメイン").net.allow_domains,
+        vec!["crates.io".to_string()]
+    );
+    assert_eq!(app.screen, Screen::Edit, "行き先が無いので画面は変えない");
+    assert!(
+        app.status.contains("まだ実装していません"),
+        "無い機能を案内しない: {}",
+        app.status
+    );
+}
+
+/// セッションを移ったら中身も入れ替わる（選択だけ動いて表示が古いまま、にしない）。
+#[test]
+fn moving_between_sessions_reloads_what_is_shown() {
+    let ws = workspace();
+    seed_pass1(&ws, "old", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    seed_pass2(&ws, "new", "gh pr list", "gh", &["api.github.com"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Sessions;
+
+    // 新しい順に並ぶので、先頭はパス2の記録。
+    assert_eq!(app.domain.text(), "gh");
+    app.on_key(key(KeyCode::Down));
+
+    assert_eq!(
+        app.selected_session().map(|s| s.manifest.id.as_str()),
+        Some("old")
+    );
+    assert_eq!(
+        app.domain.text(),
+        "cargo",
+        "開いた記録に合わせて既定も変わる"
+    );
+}
+
+/// ドメイン名の入力中は1文字キーが操作に取られない（`a`が承認になると名前が打てない）。
+#[test]
+fn typing_in_the_domain_field_does_not_trigger_the_action_keys() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Domain;
+    app.domain.set_text("");
+
+    for ch in "agt".chars() {
+        app.on_key(key(KeyCode::Char(ch)));
+    }
+
+    assert_eq!(app.domain.text(), "agt");
+    assert!(app.modal.is_none(), "承認モーダルが開いてはいけない");
+    assert!(!app.show_tree, "ツリー表示が切り替わってはいけない");
+}
+
+/// **パス2の記録を開いたら、FSの拒否候補も出る。**
+///
+/// 実運用で詰まった形の回帰テスト——`cargo test`をパス2で走らせて`Access is denied`で
+/// 落ちたとき、編集画面は**ネットワーク候補（0件）しか読んでいなかった**ので、
+/// 「次に何を許可すればいいのか」を見る場所が1つも無かった。当時のパス2は
+/// `fs-audit.jsonl`を書かなかったので0件表示は妥当だったが、段階4で収集器を配線してからは
+/// **答えはFS側にある**。
+#[test]
+fn a_pass2_recording_shows_the_filesystem_denials_it_observed() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let id = "pass2-with-fs";
+    seed_pass2(&ws, id, "cargo test", "cargo", &["crates.io"]);
+
+    // 収集器が観測したFS拒否を同じセッションdirへ置く（段階4が実際に書く形）。
+    let dir = RecordSessionDir::open(ws.path(), id).expect("session dir");
+    let mut manifest = dir.read_manifest().expect("manifest");
+    manifest.collector_started = true;
+    manifest.etw_available = true;
+    dir.write_manifest(&manifest).expect("manifest");
+    let denial = harness_policy::FsAuditEvent::denied(
+        harness_policy::FsAuditKind::Etw,
+        "C:/Users/me/.cargo/bin/cargo.exe",
+        harness_config::FsAccess::Read,
+        "STATUS_ACCESS_DENIED (0xC0000022)",
+        1,
+    );
+    std::fs::write(
+        dir.audit_log_path(),
+        format!("{}\n", denial.to_jsonl_line().expect("jsonl")),
+    )
+    .expect("fs audit log");
+
+    let app = open_edit(&ws);
+
+    let view = app.view.as_ref().expect("a view for the pass2 session");
+    assert!(
+        view.proposals
+            .iter()
+            .any(|p| p.value == "C:/Users/me/.cargo/bin/cargo.exe"),
+        "the filesystem denial must be proposable from a pass2 recording: {:#?}",
+        view.proposals
+    );
+    assert!(
+        view.notes.contains("ネットワークは全許可"),
+        "the asymmetry has to be stated, or this reads as 'the sandbox allowed everything': {}",
+        view.notes
+    );
+}
+
+/// **対**（B-35）: ネットワーク候補が消えていないこと。FSを足したときに片方が
+/// 落ちていないかを見る（「両方出す」が要件で、「FSに差し替える」ではない）。
+#[test]
+fn a_pass2_recording_still_shows_the_domains_it_reached() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    seed_pass2(&ws, "pass2-net", "cargo test", "cargo", &["crates.io"]);
+
+    let app = open_edit(&ws);
+
+    let view = app.view.as_ref().expect("a view");
+    assert!(
+        view.proposals.iter().any(|p| p.value.contains("crates.io")),
+        "{:#?}",
+        view.proposals
+    );
+}
+
+/// **収集器が起きなかったパス2の記録こそ、その事実を出す。**
+///
+/// 「観測していません」と「拒否は0件でした」は別の事実で、区別できなければfail-openは
+/// 単なる隠蔽になる（D-43）。実運用では**逆になっていた**——`render_fs_denials`の呼び出しを
+/// `collector_started`で囲んでいたため、起きなかったときだけ画面に何も出ず、ユーザーには
+/// 「拒否の一覧が出てこない」としか見えなかった（BUG-093）。
+#[test]
+fn a_pass2_recording_without_a_collector_says_so_instead_of_showing_nothing() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    // `seed_pass2`は`collector_started`を立てない（＝収集器が起きなかった記録）。
+    seed_pass2(&ws, "pass2-no-collector", "cargo test", "cargo", &[]);
+
+    let app = open_edit(&ws);
+
+    let notes = &app.view.as_ref().expect("a view").notes;
+    assert!(
+        notes.contains("観測していません"),
+        "the user must be able to tell 'not observed' from 'zero denials': {notes}"
+    );
+    assert!(
+        notes.contains("ではありません"),
+        "it has to say explicitly that this is not 'zero denials': {notes}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `c`: 候補の access を手で変える
+// ---------------------------------------------------------------------------
+
+/// いま選んでいる行が持つ候補（無ければ`None`）。
+fn selected_proposal(app: &App) -> Option<harness_policy::RuleProposal> {
+    let node = app.selected_node()?;
+    let index = *app.tree.node(node).proposals.first()?;
+    Some(app.view.as_ref()?.proposals[index].clone())
+}
+
+/// **本体**: `read → read_write → read_exec`と巡回する。
+///
+/// これが無いと、OS監査が`fs.read`としか言えない実行ファイル（ETWは読取と実行を区別しない）を
+/// `fs.read_exec`として承認する手段が1つも無い——`fs.read`をいくら足しても実行権は付かない。
+#[test]
+fn pressing_c_cycles_the_access_of_the_selected_candidate() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    assert_eq!(
+        selected_proposal(&app).expect("a candidate row").key,
+        harness_policy::SettingsKey::FsRead
+    );
+
+    app.on_key(key(KeyCode::Char('c')));
+    assert_eq!(
+        selected_proposal(&app).expect("still there").key,
+        harness_policy::SettingsKey::FsReadWrite
+    );
+
+    app.on_key(key(KeyCode::Char('c')));
+    let proposal = selected_proposal(&app).expect("still there");
+    assert_eq!(proposal.key, harness_policy::SettingsKey::FsReadExec);
+    assert_eq!(
+        proposal.value, "C:/tools/bin/thing.exe",
+        "値は動かさない（変えるのは access だけ）"
+    );
+    assert!(
+        app.hand_changed.contains(&proposal.id),
+        "手で変えたことを覚えていないと、承認前に見せられない"
+    );
+    assert!(app.status.contains("fs.read_exec"), "{}", app.status);
+}
+
+/// 警告は`key`に依存するので**作り直す**（表示側で足し引きしない）。
+#[test]
+fn changing_the_access_rebuilds_the_warnings_that_depend_on_it() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    let before = selected_proposal(&app).expect("a candidate");
+    assert!(
+        before
+            .warnings
+            .iter()
+            .any(|w| w.contains("came from OS auditing")),
+        "前提: fs.readには推測である旨が付いている: {before:#?}"
+    );
+
+    app.on_key(key(KeyCode::Char('c')));
+
+    let after = selected_proposal(&app).expect("a candidate");
+    assert!(
+        !after
+            .warnings
+            .iter()
+            .any(|w| w.contains("came from OS auditing")),
+        "fs.read固有の注記は消える: {after:#?}"
+    );
+    assert!(
+        after
+            .warnings
+            .iter()
+            .any(|w| w.contains("weakens write containment")),
+        "fs.read_write固有の注記が付く: {after:#?}"
+    );
+    assert!(
+        after.warnings.iter().any(|w| w.contains("chosen by hand")),
+        "観測ではないことが候補自身から読めること: {after:#?}"
+    );
+}
+
+/// **広すぎて承認できなくなったら、選択から外して理由を出す。**
+/// 1件でも混ざると`approve::plan`は何も書かずに全部を拒否するので、黙って残すと
+/// 承認そのものが通らなくなる。`C:/Program Files`は読みは通るが書きは通らない値である。
+#[test]
+fn an_access_change_that_makes_a_candidate_unapprovable_unselects_it_and_says_so() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Program Files"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    assert_eq!(app.accepted.len(), 1, "前提: fs.readとしては選べる");
+
+    app.on_key(key(KeyCode::Char('c')));
+
+    assert!(
+        app.accepted.is_empty(),
+        "承認できない候補を選択に残さない: {}",
+        app.status
+    );
+    assert!(app.status.contains("広すぎ"), "{}", app.status);
+    assert!(
+        app.status.contains("f で切り替え"),
+        "既定の一覧から消えたことも言う（探しても見つからなくなる）: {}",
+        app.status
+    );
+}
+
+/// ドメインの候補は変えられない。**何も起きない理由を言う**（B-32）。
+#[test]
+fn changing_the_access_of_a_domain_candidate_is_refused_with_a_reason() {
+    let ws = workspace();
+    seed_pass2(&ws, "s1", "curl example.com", "curl", &["example.com"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    let before = selected_proposal(&app).expect("a candidate row");
+    assert_eq!(before.key, harness_policy::SettingsKey::NetAllowDomains);
+
+    app.on_key(key(KeyCode::Char('c')));
+
+    assert_eq!(
+        selected_proposal(&app).expect("unchanged").key,
+        harness_policy::SettingsKey::NetAllowDomains
+    );
+    assert!(app.hand_changed.is_empty());
+    assert!(app.status.contains("FSの候補ではない"), "{}", app.status);
+}
+
+/// 同じ値に移動先のkeyが既にあるなら**作らない**（同じ設定値の候補が2行に割れる）。
+#[test]
+fn an_access_change_that_would_duplicate_an_existing_candidate_is_skipped_with_a_reason() {
+    let ws = workspace();
+    let dir = RecordSessionDir::create(ws.path(), "s1").expect("session dir");
+    let mut manifest = RecordManifest::new("s1", "cargo build", ws.path(), ws.path(), 100);
+    manifest.status = RecordStatus::Finished;
+    manifest.collector_started = true;
+    manifest.etw_available = true;
+    dir.write_manifest(&manifest).expect("manifest");
+    // 同じパスを read と read_write の両方で観測する（1つのノードが候補を2件持つ）。
+    let mut log = String::new();
+    for (index, access) in [
+        harness_config::FsAccess::Read,
+        harness_config::FsAccess::ReadWrite,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let event = harness_policy::FsAuditEvent::observed(
+            harness_policy::FsAuditKind::Etw,
+            r"C:\tools\bin\thing.exe",
+            access,
+            true,
+            "record_all",
+            index as u64 + 1,
+        );
+        log.push_str(&event.to_jsonl_line().expect("jsonl"));
+        log.push('\n');
+    }
+    std::fs::write(dir.audit_log_path(), log).expect("audit log");
+
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    let node = app.selected_node().expect("a row");
+    assert_eq!(
+        app.tree.node(node).proposals.len(),
+        2,
+        "前提: 同じ値に2つの候補がぶら下がっている"
+    );
+
+    app.on_key(key(KeyCode::Char('c')));
+
+    let view = app.view.as_ref().expect("view");
+    let keys: Vec<_> = view.proposals.iter().map(|p| p.key).collect();
+    assert!(
+        keys.contains(&harness_policy::SettingsKey::FsRead),
+        "read→read_write は重複するので据え置き: {keys:?}"
+    );
+    assert!(
+        keys.contains(&harness_policy::SettingsKey::FsReadExec),
+        "read_write→read_exec は通る: {keys:?}"
+    );
+    assert_eq!(
+        keys.iter()
+            .filter(|k| **k == harness_policy::SettingsKey::FsReadWrite)
+            .count(),
+        0,
+        "同じ値の候補が重複していないこと: {keys:?}"
+    );
+    assert!(app.status.contains("既に候補にあります"), "{}", app.status);
+}
+
+/// ディレクトリの行では何も起きない。**なぜ起きないのかを言う**（B-32）。
+#[test]
+fn pressing_c_on_a_directory_row_explains_why_nothing_happened() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[r"C:\tools\bin\a.exe", r"C:\tools\lib\b.dll"],
+    );
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    let node = app.selected_node().expect("a row");
+    assert!(
+        app.tree.node(node).proposals.is_empty(),
+        "前提: 先頭行は候補そのものではない（枝分かれの親）"
+    );
+
+    app.on_key(key(KeyCode::Char('c')));
+
+    assert!(app.hand_changed.is_empty());
+    assert!(app.status.contains("ディレクトリの行"), "{}", app.status);
+}
+
+/// **承認する前に「手で変えた」ことを見せる**（D-42: 何を書くのか読んでから`y`を押せる）。
+#[test]
+fn the_confirmation_shows_which_candidates_had_their_access_changed_by_hand() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char('c')));
+    app.on_key(key(KeyCode::Char('c')));
+    app.on_key(key(KeyCode::Char(' ')));
+
+    app.on_key(key(KeyCode::Char('a')));
+
+    let modal = app.modal.as_ref().expect("確認のモーダル");
+    assert!(
+        modal
+            .lines
+            .iter()
+            .any(|l| l.contains("手で access を変えた候補 1件")),
+        "{:?}",
+        modal.lines
+    );
+    assert!(
+        modal.lines.iter().any(|l| l.contains("観測ではなく")),
+        "観測とユーザーの判断を混ぜない: {:?}",
+        modal.lines
+    );
+}
+
+/// **対（B-35）**: 変えたaccessで実際に`policy.json`が書かれる。
+/// 「モーダルに出る」だけを固定すると、書き込み先が`fs.read`のままでも緑になる。
+#[test]
+fn approving_a_hand_changed_candidate_writes_it_into_the_read_exec_bucket() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char('c')));
+    app.on_key(key(KeyCode::Char('c')));
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('a')));
+
+    app.on_key(key(KeyCode::Char('y')));
+
+    let policy = crate::policy_file::load(ws.path()).expect("policy.json");
+    let domain = policy.domain("cargo").expect("domain cargo");
+    assert_eq!(domain.fs.read_exec, vec!["C:/tools/bin/thing.exe"]);
+    assert!(
+        domain.fs.read.is_empty(),
+        "観測どおりの fs.read で書いてはいけない（実行権が付かない）: {:?}",
+        domain.fs
+    );
+}
+
+/// 読み直すと候補を作り直すので、手で変えたaccessは戻る。**戻ったことを言う**
+/// ——黙って戻ると、変えたつもりのまま承認しに行くことになる。
+#[test]
+fn reloading_discards_hand_made_access_changes_and_says_so() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char('c')));
+    assert!(!app.hand_changed.is_empty());
+
+    app.on_key(key(KeyCode::Char('r')));
+
+    assert!(app.hand_changed.is_empty());
+    assert_eq!(
+        selected_proposal(&app).expect("a candidate").key,
+        harness_policy::SettingsKey::FsRead
+    );
+    assert!(app.status.contains("元に戻りました"), "{}", app.status);
+}
+
+/// **パス2の記録で`g`を押しても、FSの候補が消えないこと。**
+///
+/// 一覧にはFSとネットワークの両方を並べているのに、保持していたのはネットワークだけだった
+/// ——`recompute_proposals`は保持している側からしか作り直せないので、**`g`を1回押すと
+/// FSの候補（＝「次に何を許可すればコマンドが動くのか」の答え）が全部消えていた**。
+#[test]
+fn changing_the_generalization_keeps_the_fs_candidates_of_a_pass2_recording() {
+    let ws = workspace();
+    let dir = RecordSessionDir::create(ws.path(), "p2").expect("session dir");
+    let mut manifest = RecordManifest::new("p2", "cargo test", ws.path(), ws.path(), 300);
+    manifest.pass = 2;
+    manifest.domain = Some("cargo".to_string());
+    manifest.status = RecordStatus::Finished;
+    manifest.collector_started = true;
+    manifest.etw_available = true;
+    // 実行前診断が名指しした実行ファイル（収集器の観測には出てこない側）。
+    manifest.unreachable_exec = Some("C:/tools/bin/thing.exe".to_string());
+    dir.write_manifest(&manifest).expect("manifest");
+    std::fs::write(
+        dir.net_audit_log_path(),
+        "{\"source\":\"proxy\",\"host\":\"example.com\",\"allowed\":true,\"reason\":\"record_all\",\"timestamp_unix_ms\":1}\n",
+    )
+    .expect("net audit log");
+
+    let mut app = open_edit(&ws);
+    let has_exec = |app: &App| {
+        app.view.as_ref().is_some_and(|view| {
+            view.proposals
+                .iter()
+                .any(|p| p.value == "C:/tools/bin/thing.exe")
+        })
+    };
+    assert!(has_exec(&app), "前提: 開いた直後は出ている");
+
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char('g')));
+
+    assert!(
+        has_exec(&app),
+        "一般化の度合いを変えただけでFSの候補が消えてはいけない: {:#?}",
+        app.view.as_ref().map(|v| v.proposals.len())
+    );
+    assert!(
+        app.view
+            .as_ref()
+            .expect("view")
+            .proposals
+            .iter()
+            .any(|p| p.value == "example.com"),
+        "ネットワーク側も残っていること"
+    );
+}
+
+/// 一般化の度合いを変えたときも同じ（候補そのものを作り直すため）。
+#[test]
+fn changing_the_generalization_discards_hand_made_access_changes_and_says_so() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char('c')));
+
+    app.on_key(key(KeyCode::Char('g')));
+
+    assert!(app.hand_changed.is_empty());
+    assert!(app.status.contains("手で変えたaccess"), "{}", app.status);
+}
+
+// --- 宣言済みの重ね（[x]）と、外して取り消す --------------------------------------
+
+/// `policy.json`に宣言を1件書く（重ねのテスト用）。
+fn seed_declaration(
+    ws: &tempfile::TempDir,
+    domain: &str,
+    key: harness_policy::generalize::SettingsKey,
+    value: &str,
+) {
+    let mut file = crate::policy_file::load(ws.path()).expect("load");
+    if file.domain(domain).is_none() {
+        file.domains.push(crate::PolicyDomain::new(domain));
+    }
+    let entry = file
+        .domains
+        .iter_mut()
+        .find(|d| d.name == domain)
+        .expect("just pushed");
+    use harness_policy::generalize::SettingsKey;
+    match key {
+        SettingsKey::FsRead => entry.fs.read.push(value.to_string()),
+        SettingsKey::FsReadWrite => entry.fs.read_write.push(value.to_string()),
+        SettingsKey::FsReadExec => entry.fs.read_exec.push(value.to_string()),
+        SettingsKey::NetAllowDomains => entry.net.allow_domains.push(value.to_string()),
+    }
+    crate::policy_file::save(ws.path(), &file).expect("save");
+}
+
+/// 候補と同じパスが**別のaccessで**宣言されていても`[x]`扱いになる。
+///
+/// ETWは読取と実行を区別しないので、`fs.read_exec`で承認した実行ファイルは次の記録でも
+/// `fs.read`の候補として出てくる。ここで未選択に見えると、同じ場所へ二重にチェックを付ける。
+#[test]
+fn a_candidate_already_declared_under_another_access_is_shown_as_checked() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    // 候補の綴りは一般化（既定はディレクトリ）に依存するので、実際の候補値を使って宣言する。
+    let app = open_edit(&ws);
+    let value = app.view.as_ref().expect("view").proposals[0].value.clone();
+    drop(app);
+    seed_declaration(
+        &ws,
+        "cargo",
+        harness_policy::generalize::SettingsKey::FsReadExec,
+        &value,
+    );
+
+    let app = open_edit(&ws);
+    let proposal = &app.view.as_ref().expect("view").proposals[0];
+    assert!(
+        app.proposal_is_on(proposal),
+        "宣言済み（read_exec）なので候補（read）もチェック済みに見える"
+    );
+}
+
+/// B-35の対。宣言が無ければチェックは入らない——上のテストだけなら
+/// 「常にチェック済みと言う」実装でも緑になる。
+#[test]
+fn a_candidate_with_no_declaration_is_not_checked() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    let app = open_edit(&ws);
+    let proposal = &app.view.as_ref().expect("view").proposals[0];
+    assert!(!app.proposal_is_on(proposal));
+}
+
+/// 宣言済みの行のチェックを外して確定すると、**`policy.json`からその宣言が消える**。
+/// 消す対象は宣言側のキー（`read_exec`）であって候補のキー（`read`）ではない。
+#[test]
+fn unchecking_a_declared_row_removes_the_declaration_on_confirm() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    let app = open_edit(&ws);
+    let value = app.view.as_ref().expect("view").proposals[0].value.clone();
+    drop(app);
+    seed_declaration(
+        &ws,
+        "cargo",
+        harness_policy::generalize::SettingsKey::FsReadExec,
+        &value,
+    );
+
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    // 宣言済みなので`[x]`。Spaceで外す＝取り消しの予約。
+    app.on_key(key(KeyCode::Char(' ')));
+    assert!(
+        !app.unapproved.is_empty(),
+        "外した宣言が取り消し予約に入る: {}",
+        app.status
+    );
+    assert!(
+        app.unapproved
+            .iter()
+            .all(|t| { t.key == harness_policy::generalize::SettingsKey::FsReadExec }),
+        "消す対象は宣言側のキー（read_exec）である"
+    );
+
+    app.on_key(key(KeyCode::Char('a')));
+    assert!(app.modal.is_some(), "確認が出る");
+    app.on_key(key(KeyCode::Char('y')));
+
+    let after = crate::policy_file::load(ws.path()).expect("load");
+    let domain = after.domain("cargo").expect("ドメインは残る");
+    assert!(
+        domain.fs.read_exec.is_empty(),
+        "宣言が消えている: {:?}",
+        domain.fs.read_exec
+    );
+}
+
+/// **取り消しだけの確定も通る。** チェックを外す操作は`accepted`を増やさないので、
+/// 「承認する候補が無い」で弾いてしまうと外したのに確定できない。
+#[test]
+fn a_confirmation_with_only_removals_is_accepted() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    let app = open_edit(&ws);
+    let value = app.view.as_ref().expect("view").proposals[0].value.clone();
+    drop(app);
+    seed_declaration(
+        &ws,
+        "cargo",
+        harness_policy::generalize::SettingsKey::FsRead,
+        &value,
+    );
+
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    assert!(app.accepted.is_empty(), "承認は1件も選んでいない");
+
+    app.on_key(key(KeyCode::Char('a')));
+    let modal = app.modal.as_ref().expect("確認が出る");
+    assert_eq!(modal.confirm, Confirm::Approval);
+    assert!(
+        modal.lines.iter().any(|l| l.contains("取り消す宣言")),
+        "取り消す内容が確認画面に出る: {:?}",
+        modal.lines
+    );
+}
+
+/// ドメイン名を打ち替えたら重ねを作り直し、**取り消しの予約も捨てる**。
+/// 捨てないと、打ち替える前のドメインの宣言を消しに行く。
+#[test]
+fn retyping_the_domain_name_drops_the_removal_reservations() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
+    let app = open_edit(&ws);
+    let value = app.view.as_ref().expect("view").proposals[0].value.clone();
+    drop(app);
+    seed_declaration(
+        &ws,
+        "cargo",
+        harness_policy::generalize::SettingsKey::FsRead,
+        &value,
+    );
+
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    assert!(!app.unapproved.is_empty());
+
+    app.edit_focus = EditField::Domain;
+    app.on_key(key(KeyCode::Char('x')));
+
+    assert!(
+        app.unapproved.is_empty(),
+        "別ドメインを指した状態で古い予約を残さない"
+    );
+}

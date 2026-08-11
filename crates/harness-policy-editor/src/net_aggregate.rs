@@ -34,6 +34,13 @@ pub struct NetAggregate {
     pub unparsable_lines: u64,
     /// ホスト → 観測回数（ライブ表示用の速報。候補の正本ではない）。
     hosts: BTreeMap<String, u64>,
+    /// 昇格側が書いた**制御レコード**の理由（`protocol="control"`）。通信の記録ではないので
+    /// 上のカウンタにも候補にも入れない——入れると「ホスト名を持たない拒否」として数えられ、
+    /// 嘘の注記が出る（BUG-093のセッションで実際に出ていた）。
+    ///
+    /// **黙って捨てもしない。** ここに溜めたものを呼び出し側が警告として見せる
+    /// ——昇格側の失敗は`SW_HIDE`のコンソールへ消えるので、これが唯一の伝達路である。
+    control_reasons: Vec<String>,
 }
 
 impl NetAggregate {
@@ -42,7 +49,17 @@ impl NetAggregate {
     }
 
     /// 監査イベント1件を取り込む。
+    ///
+    /// **制御レコードはネットワークイベントとして数えない**（[`harness_policy::is_net_control_record`]）。
+    /// 判定は`harness_policy`側の1箇所を通す——`normalize`とここで別々に書くと、片方だけ
+    /// 変わったときに集計と候補がずれる。
     pub fn add_event(&mut self, event: &serde_json::Value) {
+        if harness_policy::is_net_control_record(event) {
+            if let Some(reason) = event.get("reason").and_then(|v| v.as_str()) {
+                self.control_reasons.push(reason.to_string());
+            }
+            return;
+        }
         self.events_seen = self.events_seen.saturating_add(1);
         if let Ok(line) = serde_json::to_string(event) {
             self.lines.push(line);
@@ -83,10 +100,18 @@ impl NetAggregate {
         self.hosts.len()
     }
 
+    /// 昇格側が残した制御レコードの理由（観測順）。呼び出し側はこれを警告として見せる。
+    pub fn control_reasons(&self) -> &[String] {
+        &self.control_reasons
+    }
+
     /// 畳み込み後の候補（異なるドメインごとに1件）。
     pub fn candidates(&self) -> Vec<DeniedCandidate> {
-        harness_policy::normalize::normalize_net_audit_with_mode(&self.lines.join("\n"), NetIntake::All)
-            .candidates
+        harness_policy::normalize::normalize_net_audit_with_mode(
+            &self.lines.join("\n"),
+            NetIntake::All,
+        )
+        .candidates
     }
 
     /// 許可ルールの提案。**適用はしない**（D-42: 反映は常にユーザーの明示操作）。
@@ -96,8 +121,11 @@ impl NetAggregate {
 
     /// 正規化が付けた注記（ホスト名を持たなかった件数の説明など）。
     pub fn notes(&self) -> Vec<String> {
-        harness_policy::normalize::normalize_net_audit_with_mode(&self.lines.join("\n"), NetIntake::All)
-            .notes
+        harness_policy::normalize::normalize_net_audit_with_mode(
+            &self.lines.join("\n"),
+            NetIntake::All,
+        )
+        .notes
     }
 }
 
@@ -115,10 +143,11 @@ pub fn from_log(path: &std::path::Path) -> NetAggregate {
     aggregate
 }
 
-/// 記録結果を人が読む形へ整形する。
-pub fn render(aggregate: &NetAggregate, mode: Generalization, limit: usize) -> String {
+/// 候補一覧の**手前**に出す注記（観測件数・ホスト名を持たないイベント・盲点の説明）。
+///
+/// [`render`]（CLI）とTUIの両方が使う。理由は[`crate::aggregate::render_notes`]と同じ。
+pub fn render_notes(aggregate: &NetAggregate) -> String {
     let mut out = String::new();
-    let proposals = aggregate.proposals(mode);
 
     out.push_str(&format!(
         "観測: {}件（許可 {} / 拒否 {}）、異なるホスト {}件\n",
@@ -151,6 +180,12 @@ pub fn render(aggregate: &NetAggregate, mode: Generalization, limit: usize) -> S
     for note in aggregate.notes() {
         out.push_str(&format!("注記: {note}\n"));
     }
+    // 昇格側（netfilterd）が残した制御レコード。FS側の`aggregate::render_notes`が
+    // `collector_notes`を出すのと同じ役割で、**`show`で後から見返す経路**にも要る
+    // ——ライブの警告はその場限りだが、こちらは記録を開き直すたびに出る。
+    for reason in aggregate.control_reasons() {
+        out.push_str(&format!("昇格側からの報告: {reason}\n"));
+    }
 
     out.push_str(
         "\n注意: **ドメイン名を復元できない通信があります。** OSのリゾルバを経由しない自前DNS\n\
@@ -159,9 +194,17 @@ pub fn render(aggregate: &NetAggregate, mode: Generalization, limit: usize) -> S
          **「繋がらない」**——コマンドが失敗していないかを終了コードで確かめてください。\n",
     );
 
+    out
+}
+
+/// 記録結果を人が読む形へ整形する（注記＋候補一覧）。
+pub fn render(aggregate: &NetAggregate, mode: Generalization, limit: usize) -> String {
+    let mut out = render_notes(aggregate);
+    let proposals = aggregate.proposals(mode);
+
     out.push_str(&format!(
         "\n許可ドメインの候補（--generalize {}）:\n",
-        generalization_label(mode)
+        crate::aggregate::generalization_label(mode)
     ));
     if proposals.is_empty() {
         out.push_str("  （候補なし）\n");
@@ -186,14 +229,6 @@ pub fn render(aggregate: &NetAggregate, mode: Generalization, limit: usize) -> S
     }
 
     out
-}
-
-fn generalization_label(mode: Generalization) -> &'static str {
-    match mode {
-        Generalization::None => "none",
-        Generalization::Directory => "dir",
-        Generalization::Auto => "auto",
-    }
 }
 
 #[cfg(test)]

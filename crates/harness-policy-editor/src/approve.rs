@@ -32,7 +32,7 @@ use std::path::Path;
 use harness_core::RequireSandbox;
 use harness_policy::{breadth, gate, generalize::SettingsKey, GateVerdict, RuleProposal};
 
-use crate::policy_file::{self, ApprovalContext, MergeReport, PolicyFile};
+use crate::policy_file::{self, ApprovalContext, MergeReport, PolicyDomain, PolicyFile};
 
 /// 承認の要求。
 pub struct ApproveRequest<'a> {
@@ -171,6 +171,22 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
         },
     );
 
+    // **承認の結果が次のパス2の待ち時間になる、ということをこの瞬間に見せる。**
+    // `preflight`はworkspace外のルートを1件ずつ処理するので、準備時間はこの件数にほぼ比例する。
+    // 件数はマージ**後**のドメイン全体で数える（この承認で足した分だけでなく、次のパス2が
+    // 実際に処理する数そのもの）。一般化して畳めば減らせる、という行動もここで伝える
+    // ——数だけ出して「どうすればいいか」を書かないのは、警告として半分しか役に立たない（B-32）。
+    let grant_roots = file
+        .domain(req.domain)
+        .map(|domain| grant_roots(domain, req.workspace_root).len())
+        .unwrap_or(0);
+    if grant_roots >= MANY_GRANT_ROOTS {
+        warnings.push(format!(
+            "このドメインのworkspace外のルートは{grant_roots}件になります。パス2はこれを1件ずつ\
+             処理するので、準備に時間がかかります（承認前に一般化の度合いを上げて畳むと減ります）"
+        ));
+    }
+
     Ok(ApprovePlan {
         accepted,
         file,
@@ -180,36 +196,50 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
     })
 }
 
+/// 「workspace外のルートが多い」と警告し始める件数。
+///
+/// 根拠は`preflight`の実測——1件あたりのACL読取・付与・台帳更新は数ms程度だが、件数に比例して
+/// 積み上がる。数十件までは体感できないので、**数百件のオーダーに入るところ**で線を引く。
+/// 正確な閾値そのものに意味は無く、「気付かないうちに桁が変わっていた」ことを知らせるのが目的。
+const MANY_GRANT_ROOTS: usize = 100;
+
 /// [`plan`]の結果を実際に書き込む。
 pub fn commit(workspace_root: &Path, plan: &ApprovePlan<'_>) -> Result<(), ApproveError> {
     policy_file::save(workspace_root, &plan.file)?;
     Ok(())
 }
 
-/// 提案の値がworkspaceのどちら側にあるかを判定する。
+/// `value`が`root`自身か、その配下か。**配下判定の規則はこの1関数だけが持つ**（B-05・B-19）。
 ///
 /// 値はワイルドカードを含み得る（`C:/Users/x/.cargo/**`）ので、**最初の`*`より前**の
 /// 確定部分だけで比較する。綴りの正規化は`harness_policy::normalize::normalize_path`を通す
 /// ——提案の値はその関数で揃えられているので、比較する側が別の規則を持つと一致しない（B-19）。
+/// 大小は無視する（Windowsのパスは大小を区別しない）。
+///
+/// [`classify`]（承認時の「ACEを付けに行くのはworkspace外だけ」の判定）と、
+/// [`crate::exclusion::ExclusionRules`]（候補にしない範囲の判定）が**同じ関数を通る**。
+/// 別々に書くと、候補には出さないのに承認側は別の線を引く、という食い違いを作る。
+pub fn is_under(value: &str, root: &Path) -> bool {
+    let value = harness_policy::normalize::normalize_path(value);
+    let literal = value.split('*').next().unwrap_or("");
+    let root = harness_policy::normalize::normalize_path(&root.to_string_lossy());
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return false;
+    }
+    let literal_lower = literal.trim_end_matches('/').to_ascii_lowercase();
+    let root_lower = root.to_ascii_lowercase();
+    // 「root自身」または「root配下」。`C:/ws2`が`C:/ws`の配下と誤判定されないよう、
+    // 直後が区切りであることまで見る。
+    literal_lower == root_lower || literal_lower.starts_with(&format!("{root_lower}/"))
+}
+
+/// 提案の値がworkspaceのどちら側にあるかを判定する。判定の実体は[`is_under`]。
 fn classify(proposal: &RuleProposal, workspace_root: &Path) -> PathClass {
     if proposal.key == SettingsKey::NetAllowDomains {
         return PathClass::NotFilesystem;
     }
-    let value = harness_policy::normalize::normalize_path(&proposal.value);
-    let literal = value.split('*').next().unwrap_or("");
-    let root = harness_policy::normalize::normalize_path(&workspace_root.to_string_lossy());
-    let root = root.trim_end_matches('/');
-
-    if root.is_empty() {
-        return PathClass::OutsideWorkspace;
-    }
-    let literal_lower = literal.to_ascii_lowercase();
-    let root_lower = root.to_ascii_lowercase();
-    // 「workspace自身」または「workspace配下」。`C:/ws2`が`C:/ws`の配下と誤判定されないよう、
-    // 直後が区切りであることまで見る。
-    if literal_lower == root_lower
-        || literal_lower.starts_with(&format!("{root_lower}/"))
-    {
+    if is_under(&proposal.value, workspace_root) {
         PathClass::InsideWorkspace
     } else {
         PathClass::OutsideWorkspace
@@ -258,6 +288,47 @@ pub fn grant_root(value: &str, workspace_root: &Path) -> Option<std::path::PathB
     Some(std::path::PathBuf::from(root))
 }
 
+/// ドメインのFSルールを、`preflight`が**1件ずつ処理するworkspace外のルート**へ畳む。
+///
+/// **この関数が「件数」の唯一の定義である。** パス2の準備時間はこの件数にほぼ比例するので、
+/// 承認時の警告（[`ApprovePlan::grant_root_count`]）と実際に処理される集合
+/// （`record_net::passthrough_for_domain`）が別々に数えていると、警告した数と待たされる数が
+/// 食い違う（B-05: 型で守られない同じ規則を2箇所に持たない）。
+///
+/// workspace配下は含めない——Tier2aのworkspace grantが既に覆っているので、同じツリーへ
+/// 別主体のACEを重ねる意味が無い。
+///
+/// # 同じルートに複数のaccessが宣言されていたら「和」を取る
+///
+/// 1つのオブジェクトのDACLへ同じSID宛のACEを2本張ることはできないので、`fs.read_write`と
+/// `fs.read_exec`が同じルートに立ったら**両方を含む1本**（`ReadWriteExec`）にする。
+/// かつては「`ReadWrite`なら昇格する」という規則だけがあり、`ReadExec`が来たときの規則が
+/// 無かった——先に入った方が残り、**もう片方の権限が黙って消えていた**。`ReadWrite`に
+/// `FILE_GENERIC_EXECUTE`は入っていないので、消えた側は実行時の`Access is denied`として
+/// 現れるのに、`policy.json`には許可が書いてあるように見える。
+/// 合成の規則そのものは`harness_sandbox::FsAccess::wider`が唯一の定義を持つ。
+pub fn grant_roots(
+    domain: &PolicyDomain,
+    workspace_root: &Path,
+) -> Vec<(std::path::PathBuf, harness_sandbox::FsAccess)> {
+    let mut out: Vec<(std::path::PathBuf, harness_sandbox::FsAccess)> = Vec::new();
+    for (value, access) in domain.fs.entries() {
+        let Some(root) = grant_root(value, workspace_root) else {
+            continue;
+        };
+        let access = harness_sandbox::FsAccess::from_settings(access);
+        match out.iter_mut().find(|(path, _)| path == &root) {
+            Some(existing) => existing.1 = existing.1.wider(access),
+            None => out.push((root, access)),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 #[path = "approve_tests.rs"]
 mod approve_tests;
+
+#[cfg(test)]
+#[path = "approve_grant_roots_tests.rs"]
+mod approve_grant_roots_tests;

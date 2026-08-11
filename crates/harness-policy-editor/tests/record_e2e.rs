@@ -1,4 +1,4 @@
-//! パス1（Tier1のrecord-all記録）の実機E2E。**管理者権限が要る**
+//! パス1（Tier0のrecord-all記録）の実機E2E。**管理者権限が要る**
 //! （収集器が張るETWリアルタイムセッションのため）。
 //!
 //! 実行: `dev-elevated-run.exe e2e-policy-editor-record`
@@ -92,7 +92,10 @@ fn recording_a_command_captures_the_files_it_read_and_never_proposes_the_control
 
     // 3. `.harness`配下は候補にしない（**提案の行だけ**を見る。監査ログのパスや除外の
     //    注記にも`.harness`は当然出てくるので、それらを含む範囲で判定すると必ず誤検出する）。
-    let proposal_lines: Vec<&str> = stdout.lines().filter(|line| is_proposal_line(line)).collect();
+    let proposal_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| is_proposal_line(line))
+        .collect();
     assert!(
         !proposal_lines.is_empty(),
         "record-all must produce at least one candidate: {stdout}"

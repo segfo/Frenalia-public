@@ -51,7 +51,10 @@ fn a_policy_file_round_trips_through_disk() {
     assert_eq!(domain.fs.read, vec![r"C:\Users\x\.cargo\**".to_string()]);
     assert_eq!(domain.net.allow_domains, vec!["crates.io".to_string()]);
     assert_eq!(domain.commands, vec!["cargo build".to_string()]);
-    assert_eq!(domain.provenance.record_sessions, vec!["sess-1".to_string()]);
+    assert_eq!(
+        domain.provenance.record_sessions,
+        vec!["sess-1".to_string()]
+    );
 }
 
 /// **存在しないファイルだけ**が空扱い。`load`はそれ以外の理由では空を返さない。
@@ -253,7 +256,38 @@ fn the_policy_file_lives_inside_the_control_directory() {
 
     assert_eq!(p, Path::new(r"C:\ws").join(".harness").join("policy.json"));
     assert!(
-        crate::aggregate::is_harness_control_path(&p.to_string_lossy()),
+        crate::exclusion::is_harness_control_path(&p.to_string_lossy()),
         "policy.json自身が候補として提案されると自己参照ループになる"
     );
+}
+
+/// ドメイン名の既定値は先頭トークンのbasenameから拡張子を落としたもの。
+/// **CLIとTUIが同じ規則を通る**ことに意味がある（別々に持つと、同じコマンドの記録が
+/// 別のドメインへ書き込まれる）。
+#[test]
+fn the_default_domain_name_is_the_basename_of_the_first_token() {
+    assert_eq!(default_domain_name("cargo build --release"), "cargo");
+    assert_eq!(default_domain_name(r"C:\tools\gh.exe pr list"), "gh");
+    assert_eq!(default_domain_name("/usr/bin/rg foo"), "rg");
+}
+
+/// **空白を含む引用符付きパスは正しく切れない**（トークン分割が引用符を解釈しないため、
+/// `"C:\Program Files\git\git.exe"` は `C:\Program` で切れて `Program` になる）。
+/// これは`main.rs`から移す前からの振る舞いで、移動と同時に変えない（`docs/CODE-STRUCTURE-RULES.md`
+/// 規則6）。既定値は識別子の提案でしかなく、CLIは`--domain`、TUIは編集画面の入力欄で
+/// 上書きできる——ここを直すなら、ドメイン名だけでなくコマンド行の語彙解析として別途行う。
+#[test]
+fn a_quoted_path_with_spaces_is_a_known_limitation_of_the_default() {
+    assert_eq!(
+        default_domain_name(r#""C:\Program Files\git\git.exe" status"#),
+        "Program"
+    );
+}
+
+/// 決められない入力では空を返す（呼び出し側が「--domainを指定してください」と言う）。
+/// **勝手に何かへ倒さない**——推測した名前でpolicy.jsonにドメインが増える方が厄介である。
+#[test]
+fn an_empty_command_yields_an_empty_default_domain_name() {
+    assert_eq!(default_domain_name(""), "");
+    assert_eq!(default_domain_name("   "), "");
 }

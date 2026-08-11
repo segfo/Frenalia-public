@@ -45,7 +45,7 @@ pub enum RecordStatus {
     Finished,
     /// ユーザーのキャンセル、またはタイムアウトで打ち切った。
     Canceled,
-    /// 記録を開始できなかった（収集器の起動失敗・Tier1のspawn失敗）。
+    /// 記録を開始できなかった（収集器の起動失敗・記録対象のspawn失敗）。
     Failed,
 }
 
@@ -70,10 +70,23 @@ fn default_pass() -> u8 {
 pub struct RecordManifest {
     pub schema_version: u32,
     pub id: String,
-    /// 2パス記録のどちらか（1=Tier1でのFS記録、2=Tier2aでのドメイン記録）。
+    /// 2パス記録のどちらか（1=FS記録、2=Tier2aでのドメイン記録）。
     /// **旧マニフェスト（このフィールドが無いもの）はパス1として読む**（後方互換）。
     #[serde(default = "default_pass")]
     pub pass: u8,
+    /// **記録対象をどのシェル隔離Tierで走らせたか**（`"tier0"`・`"tier1"`・`"tier2a"`）。
+    ///
+    /// パス1は2026-08-10にTier1からTier0へ移した。Tier1では低ILラベルがcwd 1個にしか
+    /// 付かないため、既存サブディレクトリやcwd外への書込が**Tier1固有の理由で**拒否され、
+    /// それが候補一覧へ流れ込んでいたからである（`tier0`のモジュールdoc参照）。
+    ///
+    /// **したがって、この札が無い／`tier1`である古い記録は、Tier1の実装都合による拒否を
+    /// 含んでいる可能性がある。** 札を持たないと新旧の記録を見分けられず、汚れた候補を
+    /// そのまま承認しかねないので、記録側の事実として残す。
+    /// 旧マニフェストは`None`＝「記録されていない」で、`tier1`と断定はしない
+    /// （観測しなかったことと、値がそうだったことを混ぜない）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_tier: Option<String>,
     /// パス2で使ったポリシードメイン名（パス1では`None`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
@@ -99,6 +112,46 @@ pub struct RecordManifest {
     /// 記録中に起きた、ユーザーへ伝える価値のある事実（低ILラベルの付与失敗等）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// **記録できなかった理由**（`status: Failed`のときだけ入る）。
+    ///
+    /// これが無かった頃、失敗した記録には`status: failed`しか残らず、
+    /// 「WFPのdaemonが拒んだのか」「Tier2aへ着地しなかったのか」「実行ファイルを起こせなかったのか」を
+    /// 後から区別できなかった——**次の一手を決める材料がどこにも無い**状態である（B-09/B-10）。
+    /// 進行ログは末尾しか見せない窓なので、実行が終わった時点で理由は画面からも消える。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 失敗の種別（`no_wfp`・`not_tier2a`・`spawn`…）。**機械可読の安定した札**で、
+    /// 文面（[`Self::error`]）を変えても壊れない。綴りの正本は`RecordNetError::kind`と
+    /// `RecordError::kind`で、どちらもワイルドカード無しの`match`なので
+    /// **variantを足すとビルドが落ちる**（札の付け忘れをコンパイラが捕まえる）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    /// 実行前診断（`exec_reach`）が「このままでは起動できない」と**名指しした実行ファイル**。
+    /// 綴りは設定へそのまま書ける形（パス2だけが書く）。
+    ///
+    /// **観測ではないのでJSONLには書けない。** `fs-audit.jsonl`は昇格した収集器が書く観測の
+    /// 唯一の正本で、非昇格の親が導出値を混ぜると「観測した」と「そう判断した」が
+    /// 区別できなくなる（モジュールdoc）。一方これは**後から計算し直せない事実**
+    /// （そのときのPATHとそのときの宣言で解決した結果）なので、マニフェストが持つ。
+    /// 読む側は[`crate::aggregate::from_session`]が`fs.read_exec`の候補として合流させる。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable_exec: Option<String>,
+    /// **この記録を走らせた時点の**ドメインのFS宣言（パス2だけが書く）。
+    ///
+    /// 候補の昇格（D-46「既に許可済みなのに拒否された＝その許可では足りない」）に使う。
+    /// 現在の`policy.json`を読み直すのでは駄目である——承認して1周した後に古い記録を
+    /// 開き直すと、**当時は成立していなかった診断**が出る（「read_execは許可済みなのに
+    /// 拒否された→書込が要る」）。ここも「後から計算し直せない事実」にあたる。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_fs: Vec<DeclaredFsRule>,
+}
+
+/// 記録時点で宣言されていたFSルール1件（[`RecordManifest::declared_fs`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredFsRule {
+    /// `policy.json`に書かれている綴りそのまま。
+    pub value: String,
+    pub access: harness_config::FsAccess,
 }
 
 impl RecordManifest {
@@ -113,6 +166,9 @@ impl RecordManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             id: id.into(),
             pass: default_pass(),
+            // 実際に着地したTierは記録を始める側（`record`/`record_net`）しか知らないので、
+            // ここでは空にしておき、Tierが確定した時点で代入する。
+            shell_tier: None,
             domain: None,
             command: command.into(),
             cwd: cwd.to_path_buf(),
@@ -125,8 +181,61 @@ impl RecordManifest {
             etw_available: false,
             collector_written: None,
             warnings: Vec::new(),
+            error: None,
+            error_kind: None,
+            unreachable_exec: None,
+            declared_fs: Vec::new(),
         }
     }
+
+    /// 記録を**失敗として閉じる**。`status`・`finished_unix_ms`・`error`・`error_kind`を
+    /// まとめて立てる。
+    ///
+    /// # なぜ個別代入をやめたのか
+    ///
+    /// `status = Failed`だけを書ける形が残っていると、理由の欄はいずれ片方だけ更新されて
+    /// 空のまま残る（B-01: 対の片方だけ書ける形を残さない）。実際、この関数が入る前の
+    /// `Err`経路は`status`と`finished_unix_ms`しか埋めておらず、実マシンの記録3件が
+    /// **理由の無い`failed`**として残っていた。
+    pub fn fail(
+        &mut self,
+        finished_unix_ms: u64,
+        kind: &'static str,
+        error: &dyn std::fmt::Display,
+    ) {
+        self.status = RecordStatus::Failed;
+        self.finished_unix_ms = Some(finished_unix_ms);
+        self.error_kind = Some(kind.to_string());
+        self.error = Some(error.to_string());
+    }
+
+    /// 失敗した記録を見せるときの1件（CLIの`show`/`sessions`・TUIの注記と⚠欄が共有する）。
+    ///
+    /// **文言の持ち主はここ1箇所**（`docs/CODE-STRUCTURE-RULES.md`規則5）。表示側で書き写すと、
+    /// 経路ごとに違う言い方になり、片方だけが更新される。
+    ///
+    /// 理由の欄が入る前に書かれた古いマニフェストは`error`が無い。そのとき
+    /// **「理由が無い」と「理由が空だった」を混ぜない**——後者に見せると、
+    /// 記録側の欠陥が「そういう失敗だった」として読まれる（D-43）。
+    pub fn failure_note(&self) -> Option<String> {
+        if self.status != RecordStatus::Failed {
+            return None;
+        }
+        Some(match (&self.error, &self.error_kind) {
+            (Some(error), Some(kind)) => failure_note_text(kind, error),
+            (Some(error), None) => format!("記録できなかった理由: {error}"),
+            (None, _) => "記録できなかった理由: （記録されていません——この記録は理由の欄が\
+                          入る前のものです）"
+                .to_string(),
+        })
+    }
+}
+
+/// 失敗の文言。**記録した直後（エラー値を持っている側）と、後から読み直した側の両方**が
+/// これを通す——同じ失敗が画面によって別の言い方になると、ユーザーは同じ事実を2つの
+/// 出来事として読む（B-32・規則5）。
+pub fn failure_note_text(kind: &str, error: &dyn std::fmt::Display) -> String {
+    format!("記録できなかった理由（{kind}）: {error}")
 }
 
 /// 記録セッション1回分のディレクトリ。
@@ -197,6 +306,32 @@ pub fn sandbox_root(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".harness").join("sandbox")
 }
 
+/// **記録1回ごとに**新しいディレクトリを使うためのid（`<セッショントークン>-<連番>`）。
+///
+/// # なぜプロセス単位ではいけないのか
+///
+/// かつてidは`session_profile::session_token()`そのものだった。これは**プロセス内で一度だけ
+/// 確定する`OnceLock`**なので、1プロセスで2回記録すると2回目の[`RecordSessionDir::create`]が
+/// 1回目と同じディレクトリを開き、同じ`fs-audit.jsonl`/`net-audit.jsonl`へ追記し、
+/// `AuditTail`はオフセット0から読み直す——つまり**1回目の観測が2回目の候補一覧に混ざり、
+/// マニフェストは上書きされる**。「1プロセス＝1回の記録」という、どこにも書かれていない等価関係に
+/// 依存していた（B-07）。ポリシーエディタは1回の起動で記録を何度も走らせる道具なので、
+/// D-56（昇格daemonの再利用）で繰り返しが「普通の使い方」になった時点で実害の出る位置に来た。
+///
+/// # セッションプロファイル名とは別物である
+///
+/// **ここで返すidをAppContainerのプロファイル名に使ってはいけない。** package SIDの単位は
+/// D-37のとおり「セッション＝プロセスの寿命」のままで、`current_profile_name()`が正本である。
+/// 分けているのは*記録の置き場*だけで、権限の主体は分けていない。
+pub fn next_record_id() -> String {
+    static SERIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    format!(
+        "{}-{serial}",
+        harness_sandbox::tier2a::session_profile::session_token()
+    )
+}
+
 /// 記録セッションを新しい順（`started_unix_ms`の降順）に列挙する。
 ///
 /// マニフェストが読めないディレクトリは飛ばす——記録の途中で電源が落ちた場合など、
@@ -248,6 +383,49 @@ mod tests {
         dir
     }
 
+    /// **Tierの札が無い古いマニフェストは`None`として読む。**
+    ///
+    /// パス1をTier1からTier0へ移した2026-08-10より前の記録には`shell_tier`が無い。
+    /// ここを`tier1`で埋めてしまうと「観測しなかった」と「Tier1だった」が混ざるので、
+    /// 欠落は欠落のまま読む（`RecordManifest::shell_tier`のdoc）。
+    /// 新しい記録が札を持つことも同時に固定する——片方だけだと、
+    /// 「そもそも一度も書かれていない」状態を検出できない（B-35）。
+    #[test]
+    fn a_manifest_without_a_tier_tag_reads_as_unknown_not_as_tier1() {
+        let old = r#"{
+            "schema_version": 1,
+            "id": "old-1",
+            "command": "cargo test",
+            "cwd": "C:/w",
+            "workspace_root": "C:/w",
+            "started_unix_ms": 1,
+            "status": "finished",
+            "collector_started": true,
+            "etw_available": true
+        }"#;
+        let parsed: RecordManifest = serde_json::from_str(old).expect("old manifests must parse");
+        assert_eq!(
+            parsed.shell_tier, None,
+            "a missing tier tag means 'not recorded', which is not the same as 'it was tier1'"
+        );
+
+        let mut fresh = RecordManifest::new(
+            "new-1",
+            "cargo test",
+            Path::new("C:/w"),
+            Path::new("C:/w"),
+            1,
+        );
+        fresh.shell_tier = Some("tier0".to_string());
+        let round_tripped: RecordManifest =
+            serde_json::from_str(&serde_json::to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(
+            round_tripped.shell_tier.as_deref(),
+            Some("tier0"),
+            "a recorded tier tag must survive a write/read round trip"
+        );
+    }
+
     /// 監査ログの置き場は`<workspace>/.harness/sandbox/policy-editor-<id>/`でなければ
     /// 昇格側に拒否される（モジュールdoc）。**その形を固定する。**
     #[test]
@@ -282,6 +460,11 @@ mod tests {
         manifest.etw_available = true;
         manifest.collector_written = Some(42);
         manifest.warnings.push("low-IL label failed".to_string());
+        manifest.unreachable_exec = Some("C:/Users/me/.cargo/bin/cargo.exe".to_string());
+        manifest.declared_fs = vec![DeclaredFsRule {
+            value: "C:/Users/me/.cargo/bin".to_string(),
+            access: harness_config::FsAccess::Read,
+        }];
 
         dir.write_manifest(&manifest).unwrap();
         let read_back = dir.read_manifest().expect("manifest must be readable");
@@ -292,6 +475,13 @@ mod tests {
         assert_eq!(read_back.exit_code, Some(0));
         assert_eq!(read_back.collector_written, Some(42));
         assert_eq!(read_back.warnings, vec!["low-IL label failed".to_string()]);
+        // 観測に現れない事実（実行前診断・記録時点の宣言）も往復すること
+        // ——ここが落ちると、候補の合流と昇格がどちらも黙って無効になる。
+        assert_eq!(
+            read_back.unreachable_exec.as_deref(),
+            Some("C:/Users/me/.cargo/bin/cargo.exe")
+        );
+        assert_eq!(read_back.declared_fs, manifest.declared_fs);
     }
 
     /// **開始時点で`Running`として書く**ので、異常終了したセッションは`Running`のまま残る。
@@ -343,6 +533,147 @@ mod tests {
 
         assert!(list_sessions(ws.path()).is_empty());
         assert!(latest_session(ws.path()).is_none());
+    }
+
+    /// **同じプロセスで2回記録しても、置き場が別になる。**
+    ///
+    /// idが`session_token()`そのものだった頃は2回目が1回目のディレクトリを開き、同じ
+    /// `fs-audit.jsonl`へ追記していた（[`next_record_id`]のdoc）。ここで固定するのは
+    /// 「idが違う」ことではなく**1回目の観測が2回目の監査ログに現れない**ことである
+    /// ——混ざるかどうかが実害の所在で、idの綴りはその手段でしかない。
+    #[test]
+    fn two_recordings_in_one_process_do_not_share_an_audit_log() {
+        let ws = workspace();
+
+        let first = RecordSessionDir::create(ws.path(), &next_record_id()).unwrap();
+        std::fs::write(first.audit_log_path(), "first-run\n").unwrap();
+        let second = RecordSessionDir::create(ws.path(), &next_record_id()).unwrap();
+
+        assert_ne!(first.path(), second.path());
+        assert!(
+            !second.audit_log_path().exists(),
+            "the second recording must start from an empty audit log, not append to the first"
+        );
+        assert_eq!(
+            list_sessions(ws.path()).len(),
+            0,
+            "manifests not written yet"
+        );
+    }
+
+    /// idはセッショントークン（＝package SIDの単位）を**含む**が、それと同一ではない。
+    /// 同一に戻すと上のテストが壊れるので、ここは「何を手段にしているか」の記録である。
+    #[test]
+    fn the_record_id_is_derived_from_the_session_token_but_is_not_it() {
+        let token = harness_sandbox::tier2a::session_profile::session_token();
+
+        let id = next_record_id();
+
+        assert!(id.starts_with(token), "id={id} token={token}");
+        assert_ne!(id, token);
+        assert_ne!(next_record_id(), id, "each recording gets its own id");
+    }
+
+    /// **失敗した記録には理由が必ず入る。**
+    ///
+    /// `fail`を通す形にしたのは、`status = Failed`だけを書ける経路が残っていると
+    /// 理由の欄がいずれ空のまま放置されるから（B-01）。ここで固定するのは
+    /// 「4つが同時に立つ」ことであって、綴りではない。
+    #[test]
+    fn a_failed_recording_always_carries_its_reason() {
+        let mut manifest =
+            RecordManifest::new("f-1", "cargo test", Path::new("C:/w"), Path::new("C:/w"), 1);
+
+        manifest.fail(999, "no_wfp", &"WFPのdaemonを起動できませんでした");
+
+        assert_eq!(manifest.status, RecordStatus::Failed);
+        assert_eq!(manifest.finished_unix_ms, Some(999));
+        assert_eq!(manifest.error_kind.as_deref(), Some("no_wfp"));
+        assert!(manifest
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("WFPのdaemon")));
+        let note = manifest.failure_note().expect("a failed record has a note");
+        assert!(note.contains("no_wfp"), "{note}");
+        assert!(note.contains("WFPのdaemon"), "{note}");
+    }
+
+    /// 対の側: **成功した記録には理由の欄が出ない**（`Failed`以外で`failure_note`は`None`）。
+    ///
+    /// 片側だけ固定すると「常に理由が出る」実装でもテストは緑になる（B-35）。
+    #[test]
+    fn a_successful_recording_has_no_reason_on_disk_or_on_screen() {
+        let ws = workspace();
+        let dir = RecordSessionDir::create(ws.path(), "ok-1").unwrap();
+        let mut manifest = RecordManifest::new("ok-1", "cargo build", ws.path(), ws.path(), 1);
+        manifest.status = RecordStatus::Finished;
+
+        assert!(manifest.failure_note().is_none());
+        dir.write_manifest(&manifest).unwrap();
+        let json = std::fs::read_to_string(dir.manifest_path()).unwrap();
+        assert!(!json.contains("\"error\""), "{json}");
+        assert!(!json.contains("\"error_kind\""), "{json}");
+    }
+
+    /// 失敗した記録では、その2つのキーが**JSONの表に出る**（後から`jq`で拾える）。
+    /// 形式そのものを固定する（B-24）——読む側は`show`だけではない。
+    #[test]
+    fn a_failed_recording_writes_the_reason_into_the_json() {
+        let ws = workspace();
+        let dir = RecordSessionDir::create(ws.path(), "f-2").unwrap();
+        let mut manifest = RecordManifest::new("f-2", "cargo test", ws.path(), ws.path(), 1);
+        manifest.fail(2, "spawn", &"Tier2aでコマンドを起動できませんでした");
+
+        dir.write_manifest(&manifest).unwrap();
+
+        let json = std::fs::read_to_string(dir.manifest_path()).unwrap();
+        assert!(json.contains("\"error_kind\": \"spawn\""), "{json}");
+        assert!(json.contains("\"error\":"), "{json}");
+        let read_back = dir.read_manifest().expect("readable");
+        assert_eq!(read_back.error_kind.as_deref(), Some("spawn"));
+    }
+
+    /// **理由の欄が入る前に書かれたマニフェスト**（実マシンに3件ある）も読めること。
+    /// かつ、そこで「理由が無い」と「理由が空だった」を混ぜないこと（D-43）。
+    #[test]
+    fn a_manifest_written_before_the_reason_field_existed_still_loads_and_says_so() {
+        let ws = workspace();
+        let dir = RecordSessionDir::create(ws.path(), "old-1").unwrap();
+        // 実データ（`policy-editor-7100-1786239920-1`）と同じ形。
+        let legacy = r#"{
+            "schema_version": 1,
+            "id": "old-1",
+            "pass": 2,
+            "domain": "cargo",
+            "command": "cargo test",
+            "cwd": "C:\\w",
+            "workspace_root": "C:\\w",
+            "started_unix_ms": 1786239920284,
+            "status": "failed",
+            "finished_unix_ms": 1786240063296,
+            "collector_started": false,
+            "etw_available": false,
+            "warnings": ["実行前診断"]
+        }"#;
+        std::fs::write(dir.manifest_path(), legacy).unwrap();
+
+        let manifest = dir
+            .read_manifest()
+            .expect("legacy manifests must still load");
+
+        assert_eq!(manifest.status, RecordStatus::Failed);
+        assert!(manifest.error.is_none());
+        let note = manifest
+            .failure_note()
+            .expect("failed records always get a line");
+        assert!(
+            note.contains("記録されていません"),
+            "it must not look like 'the reason was empty': {note}"
+        );
+        // 後から足した欄（実行前診断・記録時点の宣言）も、無い形のJSONで落ちないこと。
+        // 空＝「合流するものが無い」であって、読めないことではない。
+        assert!(manifest.unreachable_exec.is_none());
+        assert!(manifest.declared_fs.is_empty());
     }
 
     /// `open`は作らない（`show`が存在しないidを指定したときに空のディレクトリを

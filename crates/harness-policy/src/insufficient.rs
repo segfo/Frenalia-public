@@ -84,7 +84,11 @@ impl GrantedPaths {
 }
 
 /// `granted`が`path`を覆うか（同一、または`path`が`granted`配下）。
-fn covers(granted: &str, path: &str) -> bool {
+///
+/// **「覆うか」の規則はここだけにある。** ポリシーエディタの実行前診断
+/// （`harness_policy_editor::exec_reach`）も同じ関数を通す——別に書くと、
+/// 「提案が言う覆い方」と「診断が言う覆い方」がずれて、片方だけが正しい状態になる（B-05/B-20）。
+pub fn covers(granted: &str, path: &str) -> bool {
     let granted = granted.trim_end_matches('/');
     if granted.is_empty() {
         return false;
@@ -93,7 +97,13 @@ fn covers(granted: &str, path: &str) -> bool {
         return true;
     }
     // コンポーネント境界を跨いだ前方一致を弾く（`C:/data` vs `C:/database/x`）。
+    // `path`はマルチバイト文字を含み得る（日本語フォルダ名等）ので、バイト単位の
+    // スライスの前に`is_char_boundary`で確認する——確認しないと、`granted.len()`が
+    // マルチバイト文字の途中を指したときにパニックする。境界でなければその位置での
+    // 一致もあり得ない（`granted`はコンポーネント境界のASCII `/`しか末尾に持たない）ので、
+    // falseとして扱ってよい。
     path.len() > granted.len()
+        && path.is_char_boundary(granted.len())
         && path[..granted.len()].eq_ignore_ascii_case(granted)
         && path.as_bytes()[granted.len()] == b'/'
 }
@@ -104,6 +114,28 @@ fn wider(a: FsAccess, b: FsAccess) -> FsAccess {
         (FsAccess::ReadWrite, _) | (_, FsAccess::ReadWrite) => FsAccess::ReadWrite,
         (FsAccess::ReadExec, _) | (_, FsAccess::ReadExec) => FsAccess::ReadExec,
         _ => FsAccess::Read,
+    }
+}
+
+/// `granted`の許可が`requested`を**丸ごと含む**か（＝`requested`を設定へ足しても何も増えないか）。
+///
+/// `read ⊆ read_write`・`read ⊆ read_exec`。**`read_write`と`read_exec`は互いに含まない**
+/// ——`FILE_GENERIC_WRITE`に`FILE_EXECUTE`は入っておらず、その逆も同じである。
+///
+/// # 「広い方」（[`wider`]）とは別の問い
+///
+/// [`wider`]は「複数の許可が覆っているとき、診断の根拠にどれを採るか」を決める全順序もどきで、
+/// こちらは包含という**半順序**そのものを見る。`harness_sandbox::FsAccess::wider`（付与層で
+/// マスクの**和**を取る、D-59）ともまた別である——あちらは1本のACEへ両方の権利を載せる話で、
+/// ここは「足しても意味が無いと言い切れるか」の判定である（B-20: 別の問いに同じ関数を使わない）。
+pub fn includes(granted: FsAccess, requested: FsAccess) -> bool {
+    match (granted, requested) {
+        (FsAccess::Read, FsAccess::Read) => true,
+        (FsAccess::Read, _) => false,
+        (FsAccess::ReadWrite, FsAccess::Read | FsAccess::ReadWrite) => true,
+        (FsAccess::ReadWrite, FsAccess::ReadExec) => false,
+        (FsAccess::ReadExec, FsAccess::Read | FsAccess::ReadExec) => true,
+        (FsAccess::ReadExec, FsAccess::ReadWrite) => false,
     }
 }
 
@@ -122,18 +154,21 @@ impl Insufficient {
     /// 提案へ載せる説明。**何が確定していて何が確定していないか**を書き分ける。
     pub fn explain(&self) -> &'static str {
         match self {
-            Insufficient::ReadWasNotEnough =>
+            Insufficient::ReadWasNotEnough => {
                 "this path is ALREADY allowed as fs.read, and the sandbox still denied it -- so \
                  the request needed more than read (a write, a delete, or an execute). Moving it \
                  to fs.read_write (write/delete) or fs.read_exec (running a program) is what \
-                 will actually fix it; adding fs.read again will not",
-            Insufficient::ReadExecWasNotEnough =>
+                 will actually fix it; adding fs.read again will not"
+            }
+            Insufficient::ReadExecWasNotEnough => {
                 "this path is ALREADY allowed as fs.read_exec, and the sandbox still denied it -- \
-                 so the request needed write or delete access. fs.read_write is what will fix it",
-            Insufficient::ReadWriteWasNotEnough =>
+                 so the request needed write or delete access. fs.read_write is what will fix it"
+            }
+            Insufficient::ReadWriteWasNotEnough => {
                 "this path is ALREADY allowed as fs.read_write, and the sandbox still denied it -- \
                  so the request needed to execute a program there (fs.read_exec), or it needed a \
-                 right this mechanism does not grant at all (taking ownership, changing the ACL)",
+                 right this mechanism does not grant at all (taking ownership, changing the ACL)"
+            }
         }
     }
 }
@@ -161,7 +196,10 @@ mod tests {
         let verdict = diagnose(granted.covering("C:/tools/bin/rustc.exe"));
 
         assert_eq!(verdict, Some(Insufficient::ReadWasNotEnough));
-        assert!(verdict.unwrap().explain().contains("ALREADY allowed as fs.read"));
+        assert!(verdict
+            .unwrap()
+            .explain()
+            .contains("ALREADY allowed as fs.read"));
     }
 
     /// 許可していないパスの拒否からは何も言えない（実測の真理値表の1行目）。
@@ -183,6 +221,29 @@ mod tests {
         assert_eq!(granted.covering("C:/data/file.txt"), Some(FsAccess::Read));
         assert_eq!(granted.covering("C:/data"), Some(FsAccess::Read));
         assert_eq!(granted.covering("C:/database/file.txt"), None);
+    }
+
+    /// `granted.len()`が`path`側のマルチバイト文字の途中を指すとき、パニックせず
+    /// 「覆っていない」を返す（実機の`show`コマンドで実際にクラッシュした形そのもの。
+    /// `C:/Users/segfo/OneDrive/画像 1/desktop.ini`は"C:/Users/segfo/OneDrive/"の
+    /// 24バイトの直後に"画"(3バイト、24..27)が続くため、長さ25の`granted`と比べると
+    /// バイト25が"画"の内部を指してパニックした）。
+    #[test]
+    fn coverage_does_not_panic_when_the_boundary_falls_inside_a_multibyte_character() {
+        let path = "C:/Users/segfo/OneDrive/画像 1/desktop.ini";
+
+        let granted = GrantedPaths::new(vec![(
+            "C:/Users/segfo/OneDrive/x".to_string(), // 25バイト＝"画"(24..27)の内部
+            FsAccess::Read,
+        )]);
+        assert_eq!(granted.covering(path), None);
+
+        // 文字境界ちょうど（24バイト＝"画"の直前）は正しく覆うと判定できる。
+        let granted_at_boundary = GrantedPaths::new(vec![(
+            "C:/Users/segfo/OneDrive".to_string(),
+            FsAccess::Read,
+        )]);
+        assert_eq!(granted_at_boundary.covering(path), Some(FsAccess::Read));
     }
 
     #[test]
@@ -207,6 +268,21 @@ mod tests {
             diagnose(granted.covering("C:/tools/bin/x")),
             Some(Insufficient::ReadWriteWasNotEnough)
         );
+    }
+
+    /// **包含は半順序である。** `read_write`と`read_exec`は互いに含まない——ここを
+    /// 「広い方が含む」と書くと、`fs.read_write`許可下の`fs.read_exec`提案が
+    /// 「足しても意味が無い」と誤判定され、**実行権を得る唯一の道が消える**。
+    #[test]
+    fn read_write_and_read_exec_do_not_include_each_other() {
+        assert!(includes(FsAccess::Read, FsAccess::Read));
+        assert!(includes(FsAccess::ReadWrite, FsAccess::Read));
+        assert!(includes(FsAccess::ReadExec, FsAccess::Read));
+
+        assert!(!includes(FsAccess::ReadWrite, FsAccess::ReadExec));
+        assert!(!includes(FsAccess::ReadExec, FsAccess::ReadWrite));
+        assert!(!includes(FsAccess::Read, FsAccess::ReadWrite));
+        assert!(!includes(FsAccess::Read, FsAccess::ReadExec));
     }
 
     /// `read_write`許可下の拒否は**実行か削除**までしか絞れない。断定しない。

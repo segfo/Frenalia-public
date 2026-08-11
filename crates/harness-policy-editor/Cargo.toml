@@ -20,10 +20,19 @@ path = "src/main.rs"
 harness-config = { version = "0.1.0", path = "../harness-config" }
 harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-policy = { version = "0.1.0", path = "../harness-policy" }
+harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
 harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
 # 記録モードのTier1起動は`run_shell`とまったく同じブートストラップを通す（4経路目、B-05）。
 harness-tools = { version = "0.1.0", path = "../harness-tools" }
 clap = { version = "4.6.1", features = ["derive"] }
+# TUI（記録・編集の2画面）。会話TUI（`harness-tui`）とは別物で、こちらは駆動対象
+# （`record`/`record_net`）が同期ブロッキング関数なのでイベントループも同期にする
+# ——`event-stream` featureは要らない。
+crossterm = "0.29"
+ratatui = "0.30.2"
+# 端末の生モード/オルタネートスクリーン復帰（`harness-tui`と共有、規則5）。
+harness-term = { version = "0.1.0", path = "../harness-term" }
+unicode-width = "0.2.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -38,6 +47,8 @@ windows = { version = "0.58", features = [
     # 記録セッションの同時実行を1本に絞るグローバル名前付きmutex（決定事項13）。
     "Win32_Foundation",
     "Win32_System_Threading",
+    # TUIの間だけ標準エラー出力を預かる（ライブラリの`eprintln!`が画面を壊すため）。
+    "Win32_System_Console",
 ] }
 
 [dev-dependencies]

@@ -79,15 +79,23 @@ fn generalization_never_folds_up_to_a_drive_root() {
     let proposals = generalize(&candidates, Generalization::Directory);
 
     assert_eq!(proposals.len(), 2, "must not collapse into C:/");
-    assert!(proposals.iter().all(|p| p.value != "C:" && p.value != "C:/"));
+    assert!(proposals
+        .iter()
+        .all(|p| p.value != "C:" && p.value != "C:/"));
 }
 
 /// `Auto`はバージョン番号らしい要素をワイルドカード化し、同値になったものを畳む。
 #[test]
 fn generalization_auto_wildcards_version_segments_and_merges_them() {
     let candidates = vec![
-        fs("C:/Users/me/.rustup/toolchains/1.89.0/bin", FsAccess::ReadExec),
-        fs("C:/Users/me/.rustup/toolchains/1.90.0/bin", FsAccess::ReadExec),
+        fs(
+            "C:/Users/me/.rustup/toolchains/1.89.0/bin",
+            FsAccess::ReadExec,
+        ),
+        fs(
+            "C:/Users/me/.rustup/toolchains/1.90.0/bin",
+            FsAccess::ReadExec,
+        ),
     ];
 
     let proposals = generalize(&candidates, Generalization::Auto);
@@ -95,10 +103,7 @@ fn generalization_auto_wildcards_version_segments_and_merges_them() {
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].value, "C:/Users/me/.rustup/toolchains/*/bin");
     assert_eq!(proposals[0].evidence.len(), 2);
-    assert!(proposals[0]
-        .warnings
-        .iter()
-        .any(|w| w.contains("wildcard")));
+    assert!(proposals[0].warnings.iter().any(|w| w.contains("wildcard")));
 }
 
 /// 16進ハッシュらしい要素もワイルドカード化する。
@@ -151,7 +156,10 @@ fn different_access_levels_never_merge_into_the_stronger_one() {
 /// `read_write`の提案には必ずwrite-containmentを弱める旨の警告が付く（D-42）。
 #[test]
 fn read_write_proposals_always_carry_a_write_containment_warning() {
-    let proposals = generalize(&[fs("C:/Users/me/out", FsAccess::ReadWrite)], Generalization::None);
+    let proposals = generalize(
+        &[fs("C:/Users/me/out", FsAccess::ReadWrite)],
+        Generalization::None,
+    );
 
     assert!(proposals[0]
         .warnings
@@ -193,7 +201,10 @@ fn proposal_ids_are_stable_regardless_of_input_order() {
         .map(|p| (p.id.clone(), p.value.clone()))
         .collect();
     assert_eq!(ids_and_values, reversed);
-    assert_eq!(ids_and_values[0], ("fs-1".to_string(), "C:/a/two".to_string()));
+    assert_eq!(
+        ids_and_values[0],
+        ("fs-1".to_string(), "C:/a/two".to_string())
+    );
 }
 
 /// 複数の収集源から同じ対象が来たら1提案に畳み、`sources()`で両方が見える
@@ -234,7 +245,10 @@ fn os_audit_read_proposals_disclose_that_read_is_only_a_guess() {
         .iter()
         .find(|w| w.contains("conservative guess"))
         .expect("the inference must be disclosed");
-    assert!(warning.contains("fs.read_write"), "it must say what to do instead");
+    assert!(
+        warning.contains("fs.read_write"),
+        "it must say what to do instead"
+    );
 }
 
 /// 他の収集源（preflight・CoW）由来の`read`にはこの注記を付けない——あちらは
@@ -291,11 +305,16 @@ fn a_denial_under_an_existing_read_grant_is_replaced_by_both_escalation_targets(
 
     assert_eq!(proposals.len(), 2, "{proposals:#?}");
     assert!(
-        proposals.iter().all(|p| p.value == "C:/tools/bin/rustc.exe"),
+        proposals
+            .iter()
+            .all(|p| p.value == "C:/tools/bin/rustc.exe"),
         "the value is unchanged; only the key escalates: {proposals:#?}"
     );
     let keys: Vec<SettingsKey> = proposals.iter().map(|p| p.key).collect();
-    assert_eq!(keys, vec![SettingsKey::FsReadWrite, SettingsKey::FsReadExec]);
+    assert_eq!(
+        keys,
+        vec![SettingsKey::FsReadWrite, SettingsKey::FsReadExec]
+    );
     assert!(
         !proposals.iter().any(|p| p.key == SettingsKey::FsRead),
         "the redundant fs.read proposal must be gone -- applying it would print (no changes)"
@@ -410,6 +429,106 @@ fn ids_stay_deterministic_when_a_group_expands_into_several_proposals() {
     assert_eq!(a.len(), 3, "2 escalated + 1 untouched: {a:#?}");
 }
 
+/// **ディレクトリ自身への観測と、その配下を畳んだ結果は1件にまとまる。**
+///
+/// `C:/.cargo`を直接開いた観測と、`C:/.cargo/config`・`C:/.cargo/config.toml`を畳んだ結果は
+/// どちらも`fs.read = C:/.cargo`という**同じ設定値**である。別々の提案として並べると、
+/// (a)同じ値がidだけ違う形で2行出る、(b)観測回数が2つに割れてどちらも実数より小さく見える、
+/// (c)片方を承認しても残りが未承認のまま残って見える——実際に記録すると一覧の上位が
+/// この重複で埋まった（`C:/.cargo`と`C:/Program Files`が各2件）。
+#[test]
+fn a_directory_observed_directly_merges_with_the_fold_of_its_children() {
+    let candidates = vec![
+        // ディレクトリ自身への観測（祖先チェーンのオープンで実際に出る形）。
+        fs("C:/Users/me/.cargo/registry", FsAccess::Read),
+        fs("C:/Users/me/.cargo/registry/a.crate", FsAccess::Read),
+        fs("C:/Users/me/.cargo/registry/b.crate", FsAccess::Read),
+    ];
+
+    let proposals = generalize(&candidates, Generalization::Directory);
+
+    let cargo: Vec<&RuleProposal> = proposals
+        .iter()
+        .filter(|p| p.value == "C:/Users/me/.cargo/registry" && p.key == SettingsKey::FsRead)
+        .collect();
+    assert_eq!(
+        cargo.len(),
+        1,
+        "同じ設定値の提案が2件並ぶと、どちらを承認すればよいのか決められない: {proposals:#?}"
+    );
+    assert_eq!(
+        cargo[0].observed_count(),
+        3,
+        "証拠は両方から引き継ぐ（割れた回数は実数より小さく見える）"
+    );
+}
+
+/// **`breadth`が拒否する値へは畳まない。**
+///
+/// `C:/Program Files/Git`と`C:/Program Files/GitHub CLI`を親へ畳むと`C:/Program Files`
+/// （ドライブ直下＝広すぎる）になる。畳んだ結果は`policy apply`も`approve`も受け付けないうえ、
+/// **それぞれ単体なら承認できたはずの子が一覧から消える**ので、使える候補が1件も残らなくなる。
+#[test]
+fn folding_does_not_produce_a_value_the_breadth_guard_would_reject() {
+    // 祖先チェーンのオープンでは、ディレクトリ自身がこの形で観測される（実測の一覧そのまま）。
+    let candidates = vec![
+        fs("C:/Program Files/Git", FsAccess::Read),
+        fs("C:/Program Files/GitHub CLI", FsAccess::Read),
+    ];
+
+    let proposals = generalize(&candidates, Generalization::Directory);
+
+    let values: Vec<&str> = proposals.iter().map(|p| p.value.as_str()).collect();
+    assert!(
+        !values.contains(&"C:/Program Files"),
+        "承認できない親へ畳んではいけない: {values:?}"
+    );
+    assert!(
+        values.contains(&"C:/Program Files/Git") && values.contains(&"C:/Program Files/GitHub CLI"),
+        "畳めない場合は子をそのまま残す（消してしまうと選べる候補が無くなる）: {values:?}"
+    );
+    assert!(
+        proposals
+            .iter()
+            .all(|p| !crate::breadth::check(p).is_too_broad()),
+        "残った候補はどれも承認できる幅であること: {values:?}"
+    );
+}
+
+/// **書きの候補でも同じ**（畳み込みの判定は最も厳しいaccessで見るので、access種別で挙動が
+/// 割れない）。read側だけ直して write側が畳まれ続ける、という非対称を作らない。
+#[test]
+fn the_folding_guard_does_not_depend_on_the_access_kind() {
+    for access in [FsAccess::Read, FsAccess::ReadWrite, FsAccess::ReadExec] {
+        let candidates = vec![
+            fs("C:/Program Files/Git", access),
+            fs("C:/Program Files/GitHub CLI", access),
+        ];
+
+        let proposals = generalize(&candidates, Generalization::Directory);
+
+        let values: Vec<&str> = proposals.iter().map(|p| p.value.as_str()).collect();
+        assert!(
+            !values.contains(&"C:/Program Files"),
+            "{access:?}: 推論でマシン規模のディレクトリを作らない: {values:?}"
+        );
+    }
+}
+
+/// 畳める場合はこれまで通り畳む（上のガードが畳み込みそのものを殺していないこと）。
+#[test]
+fn folding_still_happens_when_the_parent_is_acceptable() {
+    let candidates = vec![
+        fs("C:/Users/me/.cargo/registry/a.crate", FsAccess::Read),
+        fs("C:/Users/me/.cargo/registry/b.crate", FsAccess::Read),
+    ];
+
+    let proposals = generalize(&candidates, Generalization::Directory);
+
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].value, "C:/Users/me/.cargo/registry");
+}
+
 /// ネットワークの提案は昇格の対象外（FSパスの許可状態とは無関係）。
 #[test]
 fn domain_proposals_are_untouched_by_the_escalation_ladder() {
@@ -422,4 +541,205 @@ fn domain_proposals_are_untouched_by_the_escalation_ladder() {
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].key, SettingsKey::NetAllowDomains);
     assert_eq!(proposals[0].id, "net-1");
+}
+
+// ---------------------------------------------------------------------------
+// 昇格の条件と、展開後の畳み込み（ポリシーエディタが実行前診断の結果を合流させるようになって
+// 初めて露出した2つの穴。`plans/PLAN-POLICY-EDITOR-EXEC-DENIAL.md`）
+// ---------------------------------------------------------------------------
+
+/// **`fs.read`許可下の`fs.read_exec`提案は、昇格で置き換えない。**
+///
+/// 置き換えると、実行権を得る唯一の正解が`fs.read_write`と2件に割れる（頼まれていない
+/// 書込穴が並ぶ＝P-03の逆）。D-46が宣言している「置き換えるべき条件＝`apply`が
+/// `(no changes)`になる条件」は、**提案自身のkeyまで覆われているとき**にだけ成立する。
+#[test]
+fn a_read_exec_proposal_is_not_escalated_just_because_read_is_already_granted() {
+    let proposals = generalize_with_granted(
+        &[fs("C:/Users/me/.cargo/bin/cargo.exe", FsAccess::ReadExec)],
+        Generalization::None,
+        &granted(&[("C:/Users/me/.cargo/bin", FsAccess::Read)]),
+    );
+
+    assert_eq!(proposals.len(), 1, "{proposals:#?}");
+    assert_eq!(proposals[0].key, SettingsKey::FsReadExec);
+    assert_eq!(proposals[0].value, "C:/Users/me/.cargo/bin/cargo.exe");
+    assert!(
+        !proposals.iter().any(|p| p.key == SettingsKey::FsReadWrite),
+        "a write hole nobody asked for must not appear: {proposals:#?}"
+    );
+}
+
+/// 対（B-35）: **覆われている側は従来どおり昇格する。** 上のゲートが梯子そのものを
+/// 殺していないことを、同じ許可状態で確かめる。
+#[test]
+fn a_read_proposal_under_the_same_read_grant_still_escalates() {
+    let proposals = generalize_with_granted(
+        &[fs("C:/Users/me/.cargo/bin/cargo.exe", FsAccess::Read)],
+        Generalization::None,
+        &granted(&[("C:/Users/me/.cargo/bin", FsAccess::Read)]),
+    );
+
+    let keys: Vec<SettingsKey> = proposals.iter().map(|p| p.key).collect();
+    assert_eq!(
+        keys,
+        vec![SettingsKey::FsReadWrite, SettingsKey::FsReadExec]
+    );
+}
+
+/// `fs.read_write`許可下の`fs.read_exec`提案も残す（両者は互いに包含しない）。
+#[test]
+fn a_read_exec_proposal_survives_a_read_write_grant() {
+    let proposals = generalize_with_granted(
+        &[fs("C:/data/tool.exe", FsAccess::ReadExec)],
+        Generalization::None,
+        &granted(&[("C:/data", FsAccess::ReadWrite)]),
+    );
+
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].key, SettingsKey::FsReadExec);
+}
+
+/// **別々の出所が同じ`(key, value)`を作ったら1件へ畳む。**
+///
+/// 畳まないと、同じ設定値の提案がidだけ違う形で2行並び、観測回数も割れる（片方を承認しても
+/// もう片方が未承認のまま残って見える）。ここでは「昇格で生まれた`fs.read_exec`」と
+/// 「最初から`fs.read_exec`として導出された候補」が衝突する——展開**後**にしか出会わない組み合わせ。
+#[test]
+fn proposals_from_different_sources_that_land_on_the_same_key_and_value_are_merged() {
+    let candidates = vec![
+        // 観測された拒否（ETWは読取と実行を区別できないので`read`で入る）→ 昇格で read_exec が出る
+        fs("C:/tools/bin/thing.exe", FsAccess::Read),
+        // 別経路（実行像・実行前診断）が直接 read_exec として出した同じ値
+        DeniedCandidate::fs(
+            Source::Preflight,
+            "C:/tools/bin/thing.exe",
+            FsAccess::ReadExec,
+            "named by the pre-run diagnosis",
+            1,
+            0,
+        ),
+    ];
+
+    let proposals = generalize_with_granted(
+        &candidates,
+        Generalization::None,
+        &granted(&[("C:/tools", FsAccess::Read)]),
+    );
+
+    let read_exec: Vec<&RuleProposal> = proposals
+        .iter()
+        .filter(|p| p.key == SettingsKey::FsReadExec)
+        .collect();
+    assert_eq!(read_exec.len(), 1, "{proposals:#?}");
+    assert_eq!(
+        read_exec[0].observed_count(),
+        2,
+        "the evidence of both sources must be summed, not split: {:#?}",
+        read_exec[0]
+    );
+    // 同じ文の警告が2回並ばないこと（行ごとの警告と共通警告の切り分けが濁る）。
+    let mut warnings = read_exec[0].warnings.clone();
+    let total = warnings.len();
+    warnings.sort();
+    warnings.dedup();
+    assert_eq!(warnings.len(), total, "duplicated warnings: {warnings:#?}");
+    // idは連番のまま（畳んだ結果に穴が空かない）。
+    let fs_ids: Vec<&str> = proposals
+        .iter()
+        .filter(|p| p.key != SettingsKey::NetAllowDomains)
+        .map(|p| p.id.as_str())
+        .collect();
+    assert_eq!(fs_ids, vec!["fs-1", "fs-2"], "{proposals:#?}");
+}
+
+/// [`restate_access`]は**keyに依存する警告だけ**を差し替え、値と証拠には触れない。
+#[test]
+fn restating_the_access_swaps_only_the_key_dependent_warnings() {
+    let original = generalize(
+        &[
+            fs("C:/tools/bin/a.exe", FsAccess::Read),
+            fs("C:/tools/bin/b.exe", FsAccess::Read),
+        ],
+        Generalization::Directory,
+    )
+    .remove(0);
+    assert!(
+        original
+            .warnings
+            .iter()
+            .any(|w| w.contains("came from OS auditing")),
+        "precondition: the fs.read guess warning is present: {original:#?}"
+    );
+
+    let restated = restate_access(&original, SettingsKey::FsReadExec);
+
+    assert_eq!(
+        restated.id, original.id,
+        "the id must not move under the user"
+    );
+    assert_eq!(restated.key, SettingsKey::FsReadExec);
+    assert_eq!(restated.value, original.value);
+    assert_eq!(restated.evidence, original.evidence);
+    assert!(
+        !restated
+            .warnings
+            .iter()
+            .any(|w| w.contains("came from OS auditing")),
+        "the fs.read-only guess warning must go: {restated:#?}"
+    );
+    assert!(
+        restated
+            .warnings
+            .iter()
+            .any(|w| w.contains("generalized from")),
+        "warnings that do not depend on the key must stay: {restated:#?}"
+    );
+    assert!(
+        restated
+            .warnings
+            .iter()
+            .any(|w| w.contains("chosen by hand") && w.contains("fs.read")),
+        "the fact that a human picked this access must be visible: {restated:#?}"
+    );
+}
+
+/// 逆向き（B-35の対）: `fs.read_write`へ言い換えたら、その注意書きが**付く**。
+#[test]
+fn restating_to_read_write_adds_the_write_containment_warning() {
+    let original = generalize(
+        &[fs("C:/tools/x.txt", FsAccess::Read)],
+        Generalization::None,
+    )
+    .remove(0);
+
+    let restated = restate_access(&original, SettingsKey::FsReadWrite);
+
+    assert!(restated
+        .warnings
+        .iter()
+        .any(|w| w.contains("weakens write containment")));
+}
+
+/// accessの巡回はこのenumが持つ（表示側で並びを書かない）。ドメインには次が無い。
+#[test]
+fn the_fs_access_cycle_is_owned_by_the_settings_key() {
+    assert_eq!(
+        SettingsKey::FsRead.next_fs_access(),
+        Some(SettingsKey::FsReadWrite)
+    );
+    assert_eq!(
+        SettingsKey::FsReadWrite.next_fs_access(),
+        Some(SettingsKey::FsReadExec)
+    );
+    assert_eq!(
+        SettingsKey::FsReadExec.next_fs_access(),
+        Some(SettingsKey::FsRead)
+    );
+    assert_eq!(SettingsKey::NetAllowDomains.next_fs_access(), None);
+    assert_eq!(SettingsKey::NetAllowDomains.fs_access(), None);
+    assert_eq!(
+        SettingsKey::FsReadExec.fs_access(),
+        Some(FsAccess::ReadExec)
+    );
 }
