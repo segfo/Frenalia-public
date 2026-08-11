@@ -102,8 +102,10 @@ use std::sync::{Mutex, OnceLock};
 use harness_change_ledger::{now_millis, parse_ledger, store, ChangeOp, COW_OPS_LEDGER_FILENAME};
 use retour::GenericDetour;
 use windows::core::{PCSTR, PCWSTR, PSTR, PWSTR};
-use windows::Wdk::Foundation::{OBJECT_ATTRIBUTES, OBJECT_INFORMATION_CLASS, OBJECT_NAME_INFORMATION};
 use windows::Wdk::Foundation::NtQueryObject;
+use windows::Wdk::Foundation::{
+    OBJECT_ATTRIBUTES, OBJECT_INFORMATION_CLASS, OBJECT_NAME_INFORMATION,
+};
 use windows::Wdk::Storage::FileSystem::{
     FileDispositionInformation, FileDispositionInformationEx, FileRenameInformation,
     FileRenameInformationEx, FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE,
@@ -111,16 +113,15 @@ use windows::Wdk::Storage::FileSystem::{
     FILE_RENAME_INFORMATION, NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS,
 };
 use windows::Win32::Foundation::{
-    BOOL, CloseHandle, HANDLE, HMODULE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW,
+    CloseHandle, BOOL, HANDLE, HMODULE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW,
     STATUS_NO_MORE_FILES, STATUS_OBJECT_NAME_NOT_FOUND,
 };
-use windows::Win32::Storage::FileSystem::{
-    FILE_ACCESS_RIGHTS, FILE_APPEND_DATA, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_SHARE_MODE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
-};
 use windows::Win32::Storage::FileSystem::WriteFile;
+use windows::Win32::Storage::FileSystem::{
+    FILE_ACCESS_RIGHTS, FILE_APPEND_DATA, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+};
 use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{
     VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
@@ -133,6 +134,7 @@ use windows::Win32::System::Threading::{
     CreateRemoteThread, CreateThread, GetCurrentProcessId, GetExitCodeThread, ResumeThread,
     WaitForSingleObject, PROCESS_INFORMATION, STARTUPINFOA, THREAD_CREATION_FLAGS,
 };
+use windows::Win32::System::IO::IO_STATUS_BLOCK;
 
 // --- 責務別サブモジュール（docs/CODE-STRUCTURE-RULES.md 規則3） ---
 //
@@ -249,7 +251,10 @@ mod tests {
         assert_eq!(cfg.workspace_root, PathBuf::from("."));
         let text = std::fs::read_to_string(&warnings).expect("warnings ledger must be written");
         assert!(text.contains("config_workspace_not_absolute"), "{text}");
-        assert!(text.contains("BUG-066"), "the warning must point at the writeup: {text}");
+        assert!(
+            text.contains("BUG-066"),
+            "the warning must point at the writeup: {text}"
+        );
 
         // 絶対パスなら1行も増やさない（正常系を騒がせない）。
         let before = std::fs::read_to_string(&warnings).unwrap_or_default();
@@ -258,7 +263,10 @@ mod tests {
             upper_dir: upper.path().to_path_buf(),
             ext_capture_roots: Vec::new(),
         });
-        assert_eq!(std::fs::read_to_string(&warnings).unwrap_or_default(), before);
+        assert_eq!(
+            std::fs::read_to_string(&warnings).unwrap_or_default(),
+            before
+        );
     }
 
     /// 壊れた/不足したブロブは`None`になり、環境変数フォールバックへ落ちること
@@ -268,7 +276,10 @@ mod tests {
         assert!(unsafe { deserialize_config_blob(std::ptr::null()) }.is_none());
         assert!(parse_config_blob("").is_none());
         assert!(parse_config_blob("C:\\ws").is_none(), "upper_dir missing");
-        assert!(parse_config_blob("\nC:\\upper\n").is_none(), "workspace empty");
+        assert!(
+            parse_config_blob("\nC:\\upper\n").is_none(),
+            "workspace empty"
+        );
         assert!(parse_config_blob("C:\\ws\n\n").is_none(), "upper empty");
     }
 
@@ -282,7 +293,10 @@ mod tests {
         const SYNCHRONIZE: u32 = 0x0010_0000;
         const READ_CONTROL: u32 = 0x0002_0000;
         const FILE_OPEN: u32 = 1;
-        assert!(!is_write_intent(FILE_LIST_DIRECTORY | SYNCHRONIZE, Some(FILE_OPEN)));
+        assert!(!is_write_intent(
+            FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            Some(FILE_OPEN)
+        ));
         assert!(!is_write_intent(SYNCHRONIZE | READ_CONTROL, None));
         // `FILE_GENERIC_READ`相当（READ_DATA|READ_ATTRIBUTES|READ_EA|READ_CONTROL|SYNCHRONIZE）。
         const FILE_GENERIC_READ: u32 = 0x0012_0089;
@@ -300,7 +314,10 @@ mod tests {
         assert!(is_write_intent(DELETE, Some(FILE_OPEN_IF)));
         assert!(is_write_intent(FILE_APPEND_DATA, None));
         assert!(is_write_intent(FILE_WRITE_DATA, None));
-        assert!(is_write_intent(0, Some(FILE_OVERWRITE_IF)), "OVERWRITE_IF disposition alone");
+        assert!(
+            is_write_intent(0, Some(FILE_OVERWRITE_IF)),
+            "OVERWRITE_IF disposition alone"
+        );
     }
 
     /// BUG-048 F2回帰: ディレクトリopen（`FILE_DIRECTORY_FILE`）は、書込ビットが立っていても
@@ -319,7 +336,10 @@ mod tests {
         assert!(should_redirect_write(true, dir_flag, Some(FILE_CREATE)));
         // ファイル（ディレクトリフラグ無し）は従来通り。
         assert!(should_redirect_write(true, 0, Some(FILE_OPEN)));
-        assert!(!should_redirect_write(false, 0, Some(FILE_OPEN)), "write_intent=falseなら常にfalse");
+        assert!(
+            !should_redirect_write(false, 0, Some(FILE_OPEN)),
+            "write_intent=falseなら常にfalse"
+        );
     }
 
     /// Q9（増分tail再読込）の回帰テスト。`deleted_paths_state`/`ledger_read_offset`は
@@ -394,7 +414,11 @@ mod tests {
     fn baseline_hash_for_writes_mirror_on_first_access() {
         let workspace = tempfile::tempdir().unwrap();
         let upper = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("baseline_mirror_probe.txt"), "original").unwrap();
+        std::fs::write(
+            workspace.path().join("baseline_mirror_probe.txt"),
+            "original",
+        )
+        .unwrap();
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             upper_dir: upper.path().to_path_buf(),
@@ -449,7 +473,8 @@ mod tests {
 
         let classified = classify_target(&cfg, &target).expect("must classify under capture root");
 
-        let expected_key = store::ext_key(&store::normalize_abs_path(&target.to_string_lossy())).unwrap();
+        let expected_key =
+            store::ext_key(&store::normalize_abs_path(&target.to_string_lossy())).unwrap();
         assert_eq!(classified.rel, Path::new("_ext").join(&expected_key));
         assert_eq!(
             classified.ledger_key,
@@ -480,11 +505,14 @@ mod tests {
                 upper_dir: upper.path().to_path_buf(),
                 ext_capture_roots: Vec::new(),
             };
-            let classified =
-                classify_target(&cfg, &target).unwrap_or_else(|| panic!("must classify with root={root:?}"));
+            let classified = classify_target(&cfg, &target)
+                .unwrap_or_else(|| panic!("must classify with root={root:?}"));
             assert_eq!(classified.kind, TargetKind::Workspace);
             assert_eq!(classified.ledger_key, "sub/merge-demo.txt");
-            assert_eq!(cfg.upper_dir.join(&classified.rel), upper.path().join("sub").join("merge-demo.txt"));
+            assert_eq!(
+                cfg.upper_dir.join(&classified.rel),
+                upper.path().join("sub").join("merge-demo.txt")
+            );
         }
     }
 
@@ -535,10 +563,15 @@ mod tests {
         }
         assert!(classify_target(
             &cfg,
-            &upper.path().join(harness_change_ledger::COW_BASELINE_DIRNAME).join("a.txt")
+            &upper
+                .path()
+                .join(harness_change_ledger::COW_BASELINE_DIRNAME)
+                .join("a.txt")
         )
         .is_none());
-        assert!(classify_target(&cfg, &upper.path().join("_ext").join("c").join("x.txt")).is_none());
+        assert!(
+            classify_target(&cfg, &upper.path().join("_ext").join("c").join("x.txt")).is_none()
+        );
     }
 
     /// capture root配下でもworkspace配下でもないパスは`None`（素通し対象）。
@@ -576,7 +609,10 @@ mod tests {
 
         let hash = baseline_hash_for(&cfg, &original);
 
-        assert_eq!(hash, Some(harness_change_ledger::hash_bytes(b"ext-original")));
+        assert_eq!(
+            hash,
+            Some(harness_change_ledger::hash_bytes(b"ext-original"))
+        );
         let mirror = upper
             .path()
             .join(harness_change_ledger::COW_BASELINE_DIRNAME)
@@ -587,11 +623,17 @@ mod tests {
         // 計算していれば、`PathBuf::join`が絶対パスで丸ごと置き換わり実質`target`と同じパスを
         // 指してしまう——今回は書込先自体が無いためディレクトリの中身が空のままであることで
         // 間接的に確認する）。
-        assert!(std::fs::read_dir(workspace.path()).unwrap().next().is_none());
+        assert!(std::fs::read_dir(workspace.path())
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     fn names(entries: &[crate::MergedEntry]) -> Vec<String> {
-        entries.iter().map(|e| String::from_utf16_lossy(&e.name)).collect()
+        entries
+            .iter()
+            .map(|e| String::from_utf16_lossy(&e.name))
+            .collect()
     }
 
     /// BUG-047 §7.8優先順位: whiteout済みは除外・upper優先・同名upperが無いbaseのみ採用。
@@ -612,8 +654,15 @@ mod tests {
         let mut got = names(&merged);
         got.sort();
         assert_eq!(got, vec!["both.txt", "only_base.txt", "only_upper.txt"]);
-        let both = merged.iter().find(|e| String::from_utf16_lossy(&e.name) == "both.txt").unwrap();
-        assert_eq!(both.end_of_file, "upper-version".len() as i64, "upper must win over same-name base");
+        let both = merged
+            .iter()
+            .find(|e| String::from_utf16_lossy(&e.name) == "both.txt")
+            .unwrap();
+        assert_eq!(
+            both.end_of_file,
+            "upper-version".len() as i64,
+            "upper must win over same-name base"
+        );
     }
 
     /// セッション中に新規作成（baseには無くupperにのみ存在）したファイルがマージ結果に
@@ -645,7 +694,10 @@ mod tests {
         assert!(!crate::wildcard_match("*.txt", "test.ps1"));
         assert!(crate::wildcard_match("te?t.txt", "test.txt"));
         assert!(!crate::wildcard_match("te?t.txt", "teXXt.txt"));
-        assert!(crate::wildcard_match("TEST.TXT", "test.txt"), "case-insensitive");
+        assert!(
+            crate::wildcard_match("TEST.TXT", "test.txt"),
+            "case-insensitive"
+        );
     }
 
     /// マーシャルしたバイト列を`FILE_NAMES_INFORMATION`として読み戻し、`NextEntryOffset`の
@@ -722,11 +774,17 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let (_, consumed_first) =
             crate::marshal_entries(&mut buf, FileNamesInformation, &merged, 0, true);
-        assert_eq!(consumed_first, 1, "return_single_entry must yield exactly one record");
+        assert_eq!(
+            consumed_first, 1,
+            "return_single_entry must yield exactly one record"
+        );
 
         let mut buf2 = vec![0u8; 4096];
         let (_, consumed_rest) =
             crate::marshal_entries(&mut buf2, FileNamesInformation, &merged, 1, false);
-        assert_eq!(consumed_rest, 1, "continuation from start=1 must yield the remaining entry");
+        assert_eq!(
+            consumed_rest, 1,
+            "continuation from start=1 must yield the remaining entry"
+        );
     }
 }

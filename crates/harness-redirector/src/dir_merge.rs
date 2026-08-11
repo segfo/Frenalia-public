@@ -51,7 +51,9 @@ pub(crate) fn read_entries(dir: &Path) -> HashMap<String, std::fs::Metadata> {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
             out.insert(name, meta);
         }
     }
@@ -116,7 +118,10 @@ pub(super) fn merge_dir_entries(
         merged.push((name, meta));
     }
     merged.sort_by_key(|a| a.0.to_ascii_lowercase());
-    merged.iter().map(|(name, meta)| to_merged_entry(name, meta)).collect()
+    merged
+        .iter()
+        .map(|(name, meta)| to_merged_entry(name, meta))
+        .collect()
 }
 
 /// DOSワイルドカード（`*`＝任意長・`?`＝任意1文字）の簡易大小無視マッチ。`NtQueryDirectoryFile`
@@ -132,9 +137,7 @@ pub(super) fn wildcard_match(pattern: &str, name: &str) -> bool {
             (None, None) => true,
             (Some(b'*'), _) => helper(&p[1..], n) || (!n.is_empty() && helper(p, &n[1..])),
             (Some(b'?'), Some(_)) => helper(&p[1..], &n[1..]),
-            (Some(pc), Some(nc)) if pc.eq_ignore_ascii_case(nc) => {
-                helper(&p[1..], &n[1..])
-            }
+            (Some(pc), Some(nc)) if pc.eq_ignore_ascii_case(nc) => helper(&p[1..], &n[1..]),
             _ => false,
         }
     }
@@ -274,8 +277,7 @@ pub(super) fn marshal_entries(
                 (*h).FileId = 0;
             }
         };
-        let Some(record_len) = write_record(buf, cursor, header_offset, entry, write_header)
-        else {
+        let Some(record_len) = write_record(buf, cursor, header_offset, entry, write_header) else {
             break;
         };
         // 直前のレコードのNextEntryOffsetを、いま書いたレコードの開始位置へ設定する
@@ -295,7 +297,6 @@ pub(super) fn marshal_entries(
     }
     (cursor, consumed)
 }
-
 
 /// `NtQueryDirectoryFile`/`NtQueryDirectoryFileEx`（BUG-047/BUG-048）共通のマージ・
 /// マーシャル本体。`handle_paths()`でトラック済みのディレクトリハンドルに対してのみ、
@@ -341,7 +342,11 @@ pub(crate) unsafe fn try_merged_dir_query(
             .collect()
     };
     let mut cursors = dir_query_cursor().lock().unwrap();
-    let start = if restart_scan { 0 } else { *cursors.get(&handle_key).unwrap_or(&0) };
+    let start = if restart_scan {
+        0
+    } else {
+        *cursors.get(&handle_key).unwrap_or(&0)
+    };
     if start >= merged.len() {
         unsafe {
             (*io_status_block).Anonymous.Status = STATUS_NO_MORE_FILES;
@@ -350,8 +355,7 @@ pub(crate) unsafe fn try_merged_dir_query(
         return Some(STATUS_NO_MORE_FILES);
     }
     let buf_len = length as usize;
-    let out_buf =
-        unsafe { std::slice::from_raw_parts_mut(file_information as *mut u8, buf_len) };
+    let out_buf = unsafe { std::slice::from_raw_parts_mut(file_information as *mut u8, buf_len) };
     let (bytes_written, consumed) = dir_merge::marshal_entries(
         out_buf,
         file_information_class,
@@ -473,7 +477,11 @@ pub(crate) fn dir_query_roots(cfg: &Config, rel_str: &str) -> Option<(PathBuf, P
     if Path::new(rel_str).is_absolute() {
         let key = store::ext_key(rel_str).ok()?;
         let upper_dir = cfg.upper_dir.join("_ext").join(&key);
-        Some((PathBuf::from(rel_str), upper_dir, rel_str.replace('\\', "/")))
+        Some((
+            PathBuf::from(rel_str),
+            upper_dir,
+            rel_str.replace('\\', "/"),
+        ))
     } else {
         let base_dir = cfg.workspace_root.join(rel_str);
         let upper_dir = cfg.upper_dir.join(rel_str);
@@ -484,7 +492,9 @@ pub(crate) fn dir_query_roots(cfg: &Config, rel_str: &str) -> Option<(PathBuf, P
 /// `NtQueryDirectoryFile`の`FileName`（ワイルドカードフィルタ、任意）引数をRustの`String`へ。
 /// NULLまたは空なら「フィルタ無し」を表す空文字列を返す（`dir_merge::wildcard_match`は
 /// 空パターンを常に一致として扱う）。
-pub(crate) unsafe fn filename_filter_string(us: *const windows::Win32::Foundation::UNICODE_STRING) -> String {
+pub(crate) unsafe fn filename_filter_string(
+    us: *const windows::Win32::Foundation::UNICODE_STRING,
+) -> String {
     if us.is_null() {
         return String::new();
     }
@@ -518,7 +528,11 @@ pub(crate) fn append_warning_kind(cfg: &Config, kind: &str, message: &str) {
     if let Ok(mut line) = serde_json::to_string(&entry) {
         line.push('\n');
         let path = cfg.upper_dir.join(COW_WARNINGS_LEDGER_FILENAME);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = f.write_all(line.as_bytes());
         }
     }

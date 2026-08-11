@@ -39,7 +39,7 @@ use harness_core::{
 };
 use harness_tools::ToolRegistry;
 
-use crate::degeneracy::{ladder, CallWatch, Degenerate, DegeneracyDetector};
+use crate::degeneracy::{ladder, CallWatch, DegeneracyDetector, Degenerate};
 use crate::permission::{arg_repr, PermissionGate};
 use crate::{emit, sanitize, EventSink};
 use harness_core::text::truncate_head_tail;
@@ -169,7 +169,9 @@ pub enum RawTurnResult {
     /// 回復の梯子（`plans/DESIGN-COGNITION.md` §11.3）を使い切ってなお縮退した。
     /// 部分assistantは破棄済みで、**ツールは1つも実行されていない**。
     /// 呼び出し側は履歴へ何も積まない。
-    Discarded { kind: DegenerateKind },
+    Discarded {
+        kind: DegenerateKind,
+    },
 }
 
 /// 1ステップの失敗。**ストリーム開始前**（プロバイダ呼び出し自体の失敗）と**開始後**
@@ -299,9 +301,7 @@ impl<'a> TurnExecutor<'a> {
                 sanitize::completion_request(&mut req);
             }
 
-            let mut watch = self
-                .degeneracy
-                .map(|d| d.watch(&req.model, req.max_tokens));
+            let mut watch = self.degeneracy.map(|d| d.watch(&req.model, req.max_tokens));
             let stream::StreamOutcome {
                 attempt,
                 emitted_bytes,
@@ -380,7 +380,8 @@ impl<'a> TurnExecutor<'a> {
             ladder::Ladder::new(watch.recovery_budget(), watch.recycle_enabled())
         });
         let mut next = l.advance(watch.elapsed());
-        if next == ladder::Rung::Recycle && !matches!(self.provider.recycle(model).await, Ok(true)) {
+        if next == ladder::Rung::Recycle && !matches!(self.provider.recycle(model).await, Ok(true))
+        {
             next = ladder::Rung::Exhausted;
         }
         next
@@ -462,7 +463,12 @@ impl<'a> TurnExecutor<'a> {
             },
         );
         if retrying {
-            self.emit_marker(on_text_delta, "tool_call_written_as_text", emitted_bytes, visible);
+            self.emit_marker(
+                on_text_delta,
+                "tool_call_written_as_text",
+                emitted_bytes,
+                visible,
+            );
         }
     }
 

@@ -5,7 +5,7 @@
 
 use serde_json::{json, Value};
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
     GetTokenInformation, TokenAppContainerSid, TokenIntegrityLevel, PSID,
@@ -13,9 +13,7 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, IsWow64Process2, OpenProcessToken,
-};
+use windows::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2, OpenProcessToken};
 
 fn sid_to_string(sid: PSID) -> Option<String> {
     if sid.is_invalid() {

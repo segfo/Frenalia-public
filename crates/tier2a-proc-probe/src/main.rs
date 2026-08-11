@@ -25,9 +25,9 @@ use serde_json::{json, Value};
 mod load_library;
 mod spawn_via;
 #[cfg(windows)]
-mod winid;
-#[cfg(windows)]
 mod try_runas;
+#[cfg(windows)]
+mod winid;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_NET_TARGET: &str = "1.1.1.1:443";
@@ -96,7 +96,9 @@ fn parse_args() -> Args {
             "--timeout-secs" => timeout_secs = next().parse().unwrap_or(DEFAULT_TIMEOUT_SECS),
             "--sanitize-env" => sanitize_env = true,
             "--try-runas" => try_runas = Some(next()),
-            "--spawn-via-createprocessa" => spawn_via = Some(("createprocessa".to_string(), next())),
+            "--spawn-via-createprocessa" => {
+                spawn_via = Some(("createprocessa".to_string(), next()))
+            }
             "--spawn-via-winexec" => spawn_via = Some(("winexec".to_string(), next())),
             "--load-library" => load_library = Some(next()),
             _ => {}
@@ -131,7 +133,9 @@ fn compiled_arch() -> &'static str {
 
 fn fs_op(op: &str, path: &Path, result: std::io::Result<()>) -> Value {
     match result {
-        Ok(()) => json!({"op": op, "path": path.display().to_string(), "ok": true, "os_error": null}),
+        Ok(()) => {
+            json!({"op": op, "path": path.display().to_string(), "ok": true, "os_error": null})
+        }
         Err(e) => json!({
             "op": op,
             "path": path.display().to_string(),
@@ -164,11 +168,7 @@ fn run_fs_checks(tag: &str) -> Vec<Value> {
 
     let ren_from = PathBuf::from(format!("{tag}-ren.txt"));
     let ren_to = PathBuf::from(format!("{tag}-ren2.txt"));
-    out.push(fs_op(
-        "rename",
-        &ren_from,
-        fs::rename(&ren_from, &ren_to),
-    ));
+    out.push(fs_op("rename", &ren_from, fs::rename(&ren_from, &ren_to)));
 
     out
 }
@@ -234,8 +234,7 @@ fn run_net_checks(net_target: &str, dns_name: &str) -> Value {
         .and_then(|mut addrs| addrs.next())
         .ok_or_else(|| "could not resolve net-target as socket address".to_string())
         .and_then(|addr| {
-            TcpStream::connect_timeout(&addr, Duration::from_secs(2))
-                .map_err(|e| e.to_string())
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|e| e.to_string())
         });
     let connect_ok = connect_result.is_ok();
     let connect_error = connect_result.err();

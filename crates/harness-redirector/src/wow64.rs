@@ -21,9 +21,10 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessWow64Information};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::System::Diagnostics::Debug::{
-    FlushInstructionCache, ReadProcessMemory, WriteProcessMemory, Wow64GetThreadContext,
+    FlushInstructionCache, ReadProcessMemory, Wow64GetThreadContext, WriteProcessMemory,
     WOW64_CONTEXT, WOW64_CONTEXT_CONTROL,
 };
 use windows::Win32::System::Memory::{
@@ -38,7 +39,6 @@ use windows::Win32::System::Threading::{
     CreateRemoteThread, GetExitCodeThread, IsWow64Process2, ResumeThread, SuspendThread,
     WaitForSingleObject,
 };
-use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessWow64Information};
 
 use super::debug_log;
 
@@ -78,11 +78,15 @@ unsafe fn read_remote_bytes(process: HANDLE, addr: usize, len: usize) -> Option<
 }
 
 fn u32_at(bytes: &[u8], off: usize) -> Option<u32> {
-    bytes.get(off..off + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    bytes
+        .get(off..off + 4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
 fn u16_at(bytes: &[u8], off: usize) -> Option<u16> {
-    bytes.get(off..off + 2).map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+    bytes
+        .get(off..off + 2)
+        .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
 }
 
 /// エクスポート探索の結果。フォワーダ（他DLLへの転送エクスポート）は文字列のまま返し、
@@ -178,9 +182,7 @@ unsafe fn resolve_remote_export(
                 .iter()
                 .find(|(_, name)| name.ends_with(&dll_lower))
                 .map(|(base, _)| *base)?;
-            unsafe {
-                resolve_remote_export(process, target_base, func_part, modules, depth + 1)
-            }
+            unsafe { resolve_remote_export(process, target_base, func_part, modules, depth + 1) }
         }
     }
 }
@@ -276,7 +278,12 @@ fn parse_pe32_file_export_rva(bytes: &[u8], export_name: &str) -> Option<u32> {
         let virtual_address = u32_at(sec, 12)?;
         let size_of_raw_data = u32_at(sec, 16)?;
         let pointer_to_raw_data = u32_at(sec, 20)?;
-        sections.push((virtual_address, virtual_size, pointer_to_raw_data, size_of_raw_data));
+        sections.push((
+            virtual_address,
+            virtual_size,
+            pointer_to_raw_data,
+            size_of_raw_data,
+        ));
     }
 
     let rva_to_offset = |rva: u32| -> Option<usize> {
@@ -326,12 +333,24 @@ unsafe fn patch_entry_trap(process: HANDLE, entry_va: usize) -> Option<[u8; 2]> 
 
     let trap: [u8; 2] = [0xEB, 0xFE];
     let write_ok = unsafe {
-        WriteProcessMemory(process, entry_va as *mut c_void, trap.as_ptr() as *const c_void, 2, None)
+        WriteProcessMemory(
+            process,
+            entry_va as *mut c_void,
+            trap.as_ptr() as *const c_void,
+            2,
+            None,
+        )
     };
     // 保護は元に戻す（成否に関わらずベストエフォート、失敗しても実害は小さい——後続の
     // エントリポイント復元でも同じ保護変更を行うため）。
     unsafe {
-        let _ = VirtualProtectEx(process, entry_va as *const c_void, 2, old_protect, &mut old_protect);
+        let _ = VirtualProtectEx(
+            process,
+            entry_va as *const c_void,
+            2,
+            old_protect,
+            &mut old_protect,
+        );
     }
     if write_ok.is_err() {
         debug_log("wow64: WriteProcessMemory(entry trap) failed");
@@ -367,7 +386,13 @@ unsafe fn restore_entry_trap(process: HANDLE, entry_va: usize, original: [u8; 2]
         )
     };
     unsafe {
-        let _ = VirtualProtectEx(process, entry_va as *const c_void, 2, old_protect, &mut old_protect);
+        let _ = VirtualProtectEx(
+            process,
+            entry_va as *const c_void,
+            2,
+            old_protect,
+            &mut old_protect,
+        );
     }
     let _ = unsafe { FlushInstructionCache(process, Some(entry_va as *const c_void), 2) };
 }
@@ -394,7 +419,10 @@ unsafe fn wait_for_wow64_loader_ready(process: HANDLE, thread: HANDLE, entry_va:
         if let Some(eip) = unsafe { wow64_thread_eip(thread) } {
             if eip as usize == entry_va {
                 let modules = unsafe { enum_remote_modules_32(process) };
-                if modules.iter().any(|(_, name)| name.ends_with("kernel32.dll")) {
+                if modules
+                    .iter()
+                    .any(|(_, name)| name.ends_with("kernel32.dll"))
+                {
                     return true;
                 }
             }
@@ -407,17 +435,33 @@ unsafe fn wait_for_wow64_loader_ready(process: HANDLE, thread: HANDLE, entry_va:
 /// 自DLL（x86版）のパス文字列を孫プロセスへ書き込み、`load_library_addr`を開始アドレスとする
 /// `CreateRemoteThread`でロードさせる（Phase 4aの`inject_grandchild`ステップ①と同型）。
 unsafe fn remote_load_library(process: HANDLE, load_library_addr: usize, dll_path: &Path) -> bool {
-    let path_w: Vec<u16> =
-        dll_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let path_w: Vec<u16> = dll_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let size = path_w.len() * std::mem::size_of::<u16>();
-    let remote_buf =
-        unsafe { VirtualAllocEx(process, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+    let remote_buf = unsafe {
+        VirtualAllocEx(
+            process,
+            None,
+            size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
     if remote_buf.is_null() {
         debug_log("wow64: VirtualAllocEx(dll path) failed");
         return false;
     }
     let write_ok = unsafe {
-        WriteProcessMemory(process, remote_buf, path_w.as_ptr() as *const c_void, size, None)
+        WriteProcessMemory(
+            process,
+            remote_buf,
+            path_w.as_ptr() as *const c_void,
+            size,
+            None,
+        )
     };
     if write_ok.is_err() {
         debug_log("wow64: WriteProcessMemory(dll path) failed");
@@ -432,7 +476,8 @@ unsafe fn remote_load_library(process: HANDLE, load_library_addr: usize, dll_pat
         )
     });
     let mut tid: u32 = 0;
-    let thread = unsafe { CreateRemoteThread(process, None, 0, start, Some(remote_buf), 0, Some(&mut tid)) };
+    let thread =
+        unsafe { CreateRemoteThread(process, None, 0, start, Some(remote_buf), 0, Some(&mut tid)) };
     let Ok(thread) = thread else {
         debug_log(&format!(
             "wow64: CreateRemoteThread(LoadLibraryW) failed, GetLastError={:#x}",
@@ -466,8 +511,8 @@ unsafe fn remote_call_init(process: HANDLE, init_addr: usize, cfg: &super::Confi
     });
     let config_blob = unsafe { super::write_remote_config_blob(process, cfg) };
     let mut tid: u32 = 0;
-    let thread =
-        unsafe { CreateRemoteThread(
+    let thread = unsafe {
+        CreateRemoteThread(
             process,
             None,
             0,
@@ -475,7 +520,8 @@ unsafe fn remote_call_init(process: HANDLE, init_addr: usize, cfg: &super::Confi
             config_blob.map(|p| p as *const c_void),
             0,
             Some(&mut tid),
-        ) };
+        )
+    };
     let Ok(thread) = thread else {
         debug_log(&format!(
             "wow64: CreateRemoteThread(harness_cow_init) failed, GetLastError={:#x}",
@@ -552,8 +598,9 @@ pub(crate) unsafe fn inject_grandchild_wow64(
     // ここから先で失敗しても、必ずエントリポイントを復元してから抜ける（success変数で追跡）。
     let success = (|| -> bool {
         let modules = unsafe { enum_remote_modules_32(process) };
-        let Some(&(kernel32_base, _)) =
-            modules.iter().find(|(_, name)| name.ends_with("kernel32.dll"))
+        let Some(&(kernel32_base, _)) = modules
+            .iter()
+            .find(|(_, name)| name.ends_with("kernel32.dll"))
         else {
             debug_log("wow64: kernel32.dll not found in remote 32bit module list");
             return false;
@@ -581,8 +628,7 @@ pub(crate) unsafe fn inject_grandchild_wow64(
             debug_log("wow64: failed to read x86 redirector dll from disk");
             return false;
         };
-        let Some(init_rva) = parse_pe32_file_export_rva(&x86_dll_bytes, "harness_cow_init")
-        else {
+        let Some(init_rva) = parse_pe32_file_export_rva(&x86_dll_bytes, "harness_cow_init") else {
             debug_log("wow64: parse_pe32_file_export_rva(harness_cow_init) failed");
             return false;
         };

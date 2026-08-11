@@ -7,9 +7,11 @@
 //!
 //! このファイルのコードは**昇格したトークンで動く**。受け付ける相手の判定は`authz`が持つ。
 
-use super::*;
 use super::authz::{authorize_workspace_root, verify_pipe_client_identity};
-use super::client::{create_additional_pipe_instance, create_first_pipe_instance, session_daemon_pipe_name};
+use super::client::{
+    create_additional_pipe_instance, create_first_pipe_instance, session_daemon_pipe_name,
+};
+use super::*;
 
 /// daemon側エントリポイント（`harness-vmsandboxd.exe`のmainから呼ぶ、昇格トークンで実行、
 /// S-2でパイプの向きが反転したため常駐daemon自身がサーバになる）。`owner_sid`/`owner_exe`は
