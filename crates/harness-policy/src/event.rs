@@ -52,8 +52,30 @@ pub struct FsAuditEvent {
     pub parent_process_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
+    /// OSが返したNTSTATUS（record-allの収集器だけが埋める）。
+    ///
+    /// **「開けた」と「探しに行ったが無かった」を区別するために要る。** 記録モードは拒否だけで
+    /// なく成功も採るが、存在しないファイルへのopenは`STATUS_ACCESS_DENIED`ではないので
+    /// `allowed = true`（＝ACLに弾かれてはいない）になる。実測では`cargo test`1回の記録で
+    /// 3,132パス中848パス（27%）がこれで、内訳はDLL検索順の空振り・PATH探索の空振り・
+    /// .NETの任意ファイルの探索だった——**存在しないファイルへの許可には意味が無い**ので
+    /// 候補にしない。この判定はNTSTATUSがここに残っていて初めてできる。
+    ///
+    /// 古い監査ログ（この項目を持たないもの）は`None`で読める。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u32>,
     pub timestamp_unix_ms: u64,
 }
+
+/// 「その名前のものが無かった」ことを表すNTSTATUS。
+///
+/// - `STATUS_NO_SUCH_FILE`（0xC000000F）
+/// - `STATUS_OBJECT_NAME_NOT_FOUND`（0xC0000034）
+/// - `STATUS_OBJECT_PATH_NOT_FOUND`（0xC000003A）
+///
+/// `STATUS_OBJECT_NAME_INVALID`（0xC0000033）は**含めない**——綴りが不正なだけで、
+/// そのパスが存在しないとは限らない（判定を広げると本当に要る候補まで消える）。
+pub const MISSING_TARGET_STATUSES: &[u32] = &[0xC000_000F, 0xC000_0034, 0xC000_003A];
 
 impl FsAuditEvent {
     /// 拒否イベント（収集器が実際に観測した1件）。
@@ -86,6 +108,7 @@ impl FsAuditEvent {
             process_id: None,
             parent_process_id: None,
             image_path: None,
+            status: None,
             timestamp_unix_ms,
         }
     }
@@ -101,6 +124,7 @@ impl FsAuditEvent {
             process_id: None,
             parent_process_id: None,
             image_path: None,
+            status: None,
             timestamp_unix_ms,
         }
     }
@@ -114,6 +138,24 @@ impl FsAuditEvent {
     pub fn with_parent_process(mut self, parent_pid: u32) -> Self {
         self.parent_process_id = Some(parent_pid);
         self
+    }
+
+    /// OSが返したNTSTATUSを添える（record-allの収集器が使う）。
+    pub fn with_status(mut self, status: u32) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    /// **探しに行ったが、そこに無かった**か。
+    ///
+    /// 記録されたNTSTATUSだけで判定する——**実行時のファイルシステムを見に行かない**。
+    /// 記録中に作られて消えた一時ファイルは「あった」ので候補に残すべきで、いま存在するかで
+    /// 判定すると、それらを取りこぼす（`harness-policy`がファイルを読まない契約とも整合する）。
+    ///
+    /// 古い監査ログ（`status`を持たない）は`false`——**分からないものを「無かった」に倒さない**。
+    pub fn target_was_missing(&self) -> bool {
+        self.status
+            .is_some_and(|status| MISSING_TARGET_STATUSES.contains(&status))
     }
 
     /// JSONL 1行へ直列化する（末尾改行は含めない）。
@@ -184,15 +226,10 @@ mod tests {
     /// ポリシーエディタの記録モードがプロセスツリー表示を組み立てる材料。
     #[test]
     fn parent_process_id_round_trips() {
-        let event = FsAuditEvent::denied(
-            FsAuditKind::Etw,
-            r"C:\x.txt",
-            FsAccess::Read,
-            "denied",
-            1,
-        )
-        .with_process(200, Some(r"C:\cargo.exe".to_string()))
-        .with_parent_process(100);
+        let event =
+            FsAuditEvent::denied(FsAuditKind::Etw, r"C:\x.txt", FsAccess::Read, "denied", 1)
+                .with_process(200, Some(r"C:\cargo.exe".to_string()))
+                .with_parent_process(100);
 
         let line = event.to_jsonl_line().unwrap();
         assert!(line.contains(r#""parent_process_id":100"#), "{line}");

@@ -22,12 +22,18 @@ pub struct PreflightOutcome {
     /// `preflight`が特権分離ヘルパーへ`GrantFsAllow`を委譲する経路を実際に通り、その際
     /// `wfp_chain_pipe`が`Some`だったため「処理完了後に`harness-netfilterd`を連鎖起動してほしい」
     /// という指示を実際に添えたかどうか（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D
-    /// シナリオ(A)）。連鎖起動の**成否**までは追跡しない（ヘルパー側はベストエフォートでログのみ、
-    /// `privhelper.rs`の`serve()`参照）——呼び出し元は、この値が`true`ならnetfilterdとの
-    /// ハンドシェイクを試み、タイムアウトすれば「今回は使えなかった」として扱えばよい。
-    /// `false`の場合（`needs_elevation`が空だった、または本体が既に管理者で直接付与した等）は
-    /// 連鎖起動を試みていないため、呼び出し元はシナリオ(B)（`NetfilterHandle::start`直接起動）へ
-    /// フォールバックする必要がある。
+    /// シナリオ(A)）。
+    ///
+    /// **「依頼した」ではなく「実際に起きた」を意味する**（BUG-093で意味を変えた）。かつては
+    /// 依頼した時点で`true`にし、成否は追跡せず「呼び出し元はタイムアウトすれば使えなかったと
+    /// 扱えばよい」としていたが、その「タイムアウト」は30秒の空待ちであり、しかも
+    /// `record_net`の呼び出し元はそれを`NoWfp`＝パス2の中止として扱っていた
+    /// （実機で発生。`privhelper.log`に記録が残っている）。いまは`privhelper`が結末を応答に
+    /// 載せて返すので、ここには**起動が成立したときだけ**`true`が入る。
+    ///
+    /// `false`の場合（依頼しなかった／本体が既に管理者で直接付与した／連鎖起動に失敗した）は、
+    /// 呼び出し元はシナリオ(B)（`NetfilterHandle::start`＝`runas`直接起動）へ**待たずに**
+    /// フォールバックする。失敗した場合の理由は`warnings`に積まれる。
     pub netfilterd_chain_attempted: bool,
 }
 
@@ -128,6 +134,32 @@ pub fn preflight(
     wfp_chain_pipe: Option<String>,
     write_mode: &WorkspaceWriteMode,
 ) -> Result<PreflightOutcome, AppContainerError> {
+    // 常駐daemonからの連鎖起動を使わない既定形（`runas`＝UACが1回）。
+    preflight_with_privhelper_launcher(
+        workspace_root,
+        passthrough,
+        wfp_chain_pipe,
+        write_mode,
+        None,
+    )
+}
+
+/// [`preflight`]の、**`privhelper`の起こし方を差し替えられる**版（D-60）。
+///
+/// `privhelper_launcher`が`Some`なら、常駐している昇格プロセス（`harness-netfilterd`）へ
+/// 連鎖起動を依頼する——**UACが出ない**。起こせなければ`runas`へ落ちる（理由は`warnings`へ）。
+///
+/// **「後から必要になった昇格」をUAC 0回で通すための唯一の入口**である。harness本体は起動時に
+/// 1回しかpreflightを通らないので`None`（＝[`preflight`]）でよく、これを使うのは
+/// 「記録→承認→パス2」を繰り返す`harness-policy-editor`である。
+#[allow(clippy::too_many_arguments)]
+pub fn preflight_with_privhelper_launcher(
+    workspace_root: &Path,
+    passthrough: &[FsPassthrough],
+    wfp_chain_pipe: Option<String>,
+    write_mode: &WorkspaceWriteMode,
+    privhelper_launcher: Option<crate::tier2a::privhelper::ChainLauncher<'_>>,
+) -> Result<PreflightOutcome, AppContainerError> {
     let mut timing = PhaseTiming::start();
     // ACEを1本も付ける前に、そもそもこのworkspaceで子プロセスを起動できるかを確かめる。
     check_workspace_usable_as_child_cwd(workspace_root)?;
@@ -138,11 +170,38 @@ pub fn preflight(
     //
     // 起動のたびに、死んだセッションが残した資源をここで回収する（台帳＋生存マーカー、
     // 台帳が失われていても接頭辞付きプロファイルの列挙で回収できる）。
-    crate::tier2a::session_profile::gc_dead_sessions(&revoke_session_grant);
+    //
+    // **回収の内訳は必ず出す**（B-11）。特に「付与内容を台帳から復元できないので削除を見送った」
+    // 件数は、放っておくと積もる一方なのに無言だと誰も気付けない——見送り自体は
+    // 孤児ACEを作らないための正しい判断だが、増え続けるなら「台帳エントリが失われる経路」が
+    // 別にあるという診断になる（BUG-101）。
+    //
+    // stderrへ出すのは、stdoutが`--output-format json`/`jsonl`の機械可読出力に予約されているため
+    // （B-24、BUG-064が同じ経路で`jq`を壊した）。
+    let reclaim = crate::tier2a::session_profile::gc_dead_sessions_reporting(&revoke_session_grant);
+    if let Some(summary) = reclaim.summary() {
+        eprintln!("note: {summary}");
+    }
     timing.mark("gc_dead_sessions");
-    let profile_name = crate::tier2a::session_profile::begin_session()
-        .map_err(AppContainerError::Preflight)?;
+    let profile_name =
+        crate::tier2a::session_profile::begin_session().map_err(AppContainerError::Preflight)?;
     let sid = ensure_profile(&profile_name)?;
+    // [BUG-101/B-05] 台帳へ「どのSID宛に付与したか」を書くのは**呼び出し元**（`run_agent`と
+    // ポリシーエディタのパス2）で、あちらは`current_session_grant_sid()`から値を取る。
+    // ここで実際に使う主体とずれると、撤収側は「台帳に記録が無いACE」を見ることになり、
+    // 名前を失った時点で剥がせなくなる。**ずれを無言にしない**ため、その場で検算する。
+    if let (Ok(actual), Some(recorded)) = (
+        crate::win_common::sid_to_string(sid.as_psid()),
+        current_session_grant_sid(),
+    ) {
+        if actual != recorded {
+            eprintln!(
+                "warning: the SID this session grants with ({actual}) differs from the one the \
+                 ledger will record ({recorded}); revoking these ACEs by record will not work \
+                 (see docs/bugs/BUG-101.md)"
+            );
+        }
+    }
     timing.mark("begin_session + ensure_profile");
     sweep_stale_redirector_dll_aces();
     timing.mark("sweep_stale_redirector_dll_aces");
@@ -167,9 +226,15 @@ pub fn preflight(
             workspace_root.display()
         ))
     })?;
-    crate::tier2a::workspace_ledger::begin_workspace_mode(&canonical_workspace_root, workspace_mode)
-        .map_err(AppContainerError::Preflight)?;
-    crate::tier2a::workspace_ledger::record_workspace_grant(&canonical_workspace_root, workspace_mode);
+    crate::tier2a::workspace_ledger::begin_workspace_mode(
+        &canonical_workspace_root,
+        workspace_mode,
+    )
+    .map_err(AppContainerError::Preflight)?;
+    crate::tier2a::workspace_ledger::record_workspace_grant(
+        &canonical_workspace_root,
+        workspace_mode,
+    );
 
     // D-54: workspaceツリーへ付けるACEの主体。**セッションのpackage SIDではなく、この
     // workspace＋モードに固有のcapability SID**へ付ける。付与の形（どのツリーへ何を許すか）は
@@ -268,8 +333,11 @@ pub fn preflight(
     // package SID宛の継承ACE（すぐ上で付与済み）が与えるので、共通capability SIDのACEを
     // そこへ要求してはいけない。ここでleafまで含めると、セッションのたびに新しいworkspaceで
     // 「capability SIDのACEが無い」と判定され、毎回昇格を要求してしまう。
-    let mut traverse_targets: Vec<std::path::PathBuf> =
-        workspace_root.parent().map(|p| p.to_path_buf()).into_iter().collect();
+    let mut traverse_targets: Vec<std::path::PathBuf> = workspace_root
+        .parent()
+        .map(|p| p.to_path_buf())
+        .into_iter()
+        .collect();
     if let WorkspaceWriteMode::Cow { upper_dir } = write_mode {
         if let Some(parent) = upper_dir.parent() {
             traverse_targets.push(parent.to_path_buf());
@@ -351,8 +419,29 @@ pub fn preflight(
     // `TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」の決定）。
     let mut needs_elevation: Vec<crate::tier2a::privhelper::FsAllowGrant> = Vec::new();
     let mut netfilterd_chain_attempted = false;
+    // 到達性プローブ（D8）の対象。**ここでは測らず、全ての付与が終わってから1プロセスで
+    // まとめて測る**（`probe_passthrough_batch`）。理由は2つ:
+    //
+    // 1. **速度**: 以前は1件につきAppContainer内でPowerShellを1プロセス起こしていた。
+    //    起動だけで実測182ms/回なので、workspace外の穴が数百件あるドメイン（ポリシー
+    //    エディタの`cargo`ドメインで668件）では数分の無反応になっていた。しかも
+    //    `already_sufficient`でも走るので、付与をスキップする2回目以降も同じ時間を払っていた。
+    // 2. **正しさ**: 下の昇格経路で祖先のtraverseが直ることがある。付与の途中で測ると
+    //    「直る前の状態」を到達不能として報告してしまう。
+    let mut probe_targets: Vec<FsPassthrough> = Vec::new();
+    // session ledgerへ記録するパス。**1件ずつ`update`を呼ばない**——1回の`update`は
+    // 全文読取＋`.bak`への全文コピー＋全文書込であり、この台帳は実測66KBある。
+    // 668件のドメインでは約130MBのI/Oになり、しかも`already_sufficient`（ACEを1件も
+    // 書かない2回目以降）でも同じだけ払う（`record_granted_paths`のdoc）。
+    let mut ledger_paths: Vec<std::path::PathBuf> = Vec::new();
+
+    // 付与フェーズの進捗をUIへ見せる（`passthrough_progress`のdoc参照）。この区間は
+    // 数百件になり得るので、**何件目かが見えないと「固まった」と読まれる**。
+    // ガードなので、この下のどの`?`で抜けてもフェーズは閉じる。
+    let grant_phase = passthrough_progress::begin(passthrough.len());
 
     for requested in passthrough {
+        passthrough_progress::advance();
         if !requested.path.exists() {
             let reason = "path does not exist, skipped".to_string();
             warnings.push(format!("fs-allow {} : {reason}", requested.path.display()));
@@ -381,10 +470,19 @@ pub fn preflight(
         // （BUG-043発見時の実機検証を経てユーザー指摘により追加、2026-08-02）。`requested`
         // （ユーザーが本来要求したアクセス）は`granted_passthrough`の記録に使い、
         // `ext_capture_roots`（`crates/harness-tools/src/shell.rs`）の判定材料として残す。
-        let downgrade_to_ro =
-            matches!(write_mode, WorkspaceWriteMode::Cow { .. }) && requested.access.is_read_write();
+        //
+        // **和（`ReadWriteExec`）が来たときは実行権だけ残す。** ここで落としているのは
+        // 「書込をRedirector DLLのフックへ強制的に通す」ためであって、ユーザーが明示的に
+        // `fs.read_exec`で要求した実行権を取り上げる理由は無い（上の「頼まれてもいない実行権限まで
+        // 付与する理由は無い」の裏返し——頼まれた実行権を消す理由も無い）。
+        let downgrade_to_ro = matches!(write_mode, WorkspaceWriteMode::Cow { .. })
+            && requested.access.is_read_write();
         let effective_access = if downgrade_to_ro {
-            FsAccess::Read
+            if requested.access.is_exec() {
+                FsAccess::ReadExec
+            } else {
+                FsAccess::Read
+            }
         } else {
             requested.access
         };
@@ -401,53 +499,28 @@ pub fn preflight(
         let required = required_passthrough_mask(fp.access);
         let already_sufficient = matches!(sid_ace_mask(&fp.path, sid.as_psid()), Ok(Some(existing)) if existing & required == required);
         if already_sufficient {
+            // **Win32を1回も呼んでいない**ことを数える。ここが2回目以降で総数に一致する
+            // ことが「差分適用になっている」の証拠になる（`passthrough_progress`のdoc）。
+            passthrough_progress::record_already_sufficient();
             granted_passthrough.push((fp.path.clone(), requested_rw));
             // BUG-057: 付与を**スキップした**場合もsession ledgerへ記録する。ACEを実際に
             // 書いたのが前のセッションだったとしても、載っているのは**このセッションのSID宛**
             // であり（D-37でSIDはセッション固有）、撤収責任はこのセッションにある。
             // 記録しないと`end_session`の撤収対象から漏れ、「fs passthroughはセッション終了で
             // 失効する」（D-37の仕様）が破れる。
-            crate::tier2a::session_profile::record_granted_path(&fp.path);
-            if let Some(diagnosis) =
-                probe_passthrough(
-                    sid.as_psid(),
-                    traverse_sid.as_psid(),
-                    workspace_cap_psid,
-                    workspace_root,
-                    fp,
-                )
-            {
-                denied_passthrough.push((
-                    fp.path.clone(),
-                    fp.access.label().to_string(),
-                    diagnosis.clone(),
-                ));
-                warnings.push(diagnosis);
-            }
+            ledger_paths.push(fp.path.clone());
+            probe_targets.push(fp.clone());
             continue;
         }
 
         let grant_result = grant_ace_inheritable_access(&fp.path, sid.as_psid(), fp.access);
         match grant_result {
             Ok(()) => {
+                // 実際にACEを書いた1件。
+                passthrough_progress::record_granted();
                 granted_passthrough.push((fp.path.clone(), requested_rw));
-                crate::tier2a::session_profile::record_granted_path(&fp.path);
-                if let Some(diagnosis) =
-                    probe_passthrough(
-                    sid.as_psid(),
-                    traverse_sid.as_psid(),
-                    workspace_cap_psid,
-                    workspace_root,
-                    fp,
-                )
-                {
-                    denied_passthrough.push((
-                        fp.path.clone(),
-                        fp.access.label().to_string(),
-                        diagnosis.clone(),
-                    ));
-                    warnings.push(diagnosis);
-                }
+                ledger_paths.push(fp.path.clone());
+                probe_targets.push(fp.clone());
             }
             Err(_) => {
                 // forced（--force-system-acl, D-19）は host パスの絶対拒否ゲートを**UACの前に**
@@ -479,81 +552,100 @@ pub fn preflight(
     }
 
     if !missing_traverse.is_empty() || !needs_elevation.is_empty() {
-        let elevated: Result<FsAllowElevationOutcome, String> = if crate::tier2a::privhelper::is_elevated() {
-            // 本体が既に管理者（§5.3、grant-traverseの`*_direct`と同じ考え方）:
-            // ヘルパーを経由せずその場で直接付与する。traverseが不足していれば先に解消する
-            // （workspace_root/upper_dirへ到達できなければfs-allow付与自体が無意味なため）。
-            for target in &missing_traverse {
-                let (granted_nodes, result) = grant_traverse_chain(target, traverse_sid.as_psid());
-                for node in &granted_nodes {
-                    crate::tier2a::traverse_ledger::record_traverse_grant(node);
-                }
-                if let Err(e) = result {
-                    return Err(AppContainerError::Preflight(format!(
-                        "failed to grant traverse ACE (admin, direct) for {}: {e}",
-                        target.display()
-                    )));
-                }
-            }
-            let mut granted = Vec::new();
-            let mut failures = Vec::new();
-            for entry in &needs_elevation {
-                // forcedは書込前に絶対拒否ゲートを通し、通過分のみ`SeRestorePrivilege`下で付与する
-                // （dispatch側と同じ防壁。本体が既に管理者の経路でも同一の不変条件を保つ）。
-                if entry.forced {
-                    if let Some(reason) = is_force_grant_forbidden(&entry.path) {
-                        failures.push((entry.path.clone(), reason));
-                        continue;
-                    }
-                }
-                let do_grant =
-                    || grant_ace_inheritable_access(&entry.path, sid.as_psid(), entry.access);
-                let result = if entry.forced {
-                    with_restore_privilege(do_grant)
-                } else {
-                    do_grant()
-                };
-                match result {
-                    Ok(()) => granted.push(entry.path.clone()),
-                    Err(e) => failures.push((entry.path.clone(), e.to_string())),
-                }
-            }
-            Ok((granted, failures))
-        } else {
-            netfilterd_chain_attempted = wfp_chain_pipe.is_some();
-            match crate::tier2a::privhelper::run_privileged_workspace_access(
-                missing_traverse.clone(),
-                needs_elevation.clone(),
-                wfp_chain_pipe.clone(),
-            ) {
-                Ok((traverse_granted, traverse_error, granted, failures)) => {
-                    for node in &traverse_granted {
+        let elevated: Result<FsAllowElevationOutcome, String> =
+            if crate::tier2a::privhelper::is_elevated() {
+                // 本体が既に管理者（§5.3、grant-traverseの`*_direct`と同じ考え方）:
+                // ヘルパーを経由せずその場で直接付与する。traverseが不足していれば先に解消する
+                // （workspace_root/upper_dirへ到達できなければfs-allow付与自体が無意味なため）。
+                for target in &missing_traverse {
+                    let (granted_nodes, result) =
+                        grant_traverse_chain(target, traverse_sid.as_psid());
+                    for node in &granted_nodes {
                         crate::tier2a::traverse_ledger::record_traverse_grant(node);
                     }
-                    if let Some(reason) = traverse_error {
-                        if !missing_traverse.is_empty() {
-                            return Err(AppContainerError::Preflight(format!(
+                    if let Err(e) = result {
+                        return Err(AppContainerError::Preflight(format!(
+                            "failed to grant traverse ACE (admin, direct) for {}: {e}",
+                            target.display()
+                        )));
+                    }
+                }
+                let mut granted = Vec::new();
+                let mut failures = Vec::new();
+                for entry in &needs_elevation {
+                    // forcedは書込前に絶対拒否ゲートを通し、通過分のみ`SeRestorePrivilege`下で付与する
+                    // （dispatch側と同じ防壁。本体が既に管理者の経路でも同一の不変条件を保つ）。
+                    if entry.forced {
+                        if let Some(reason) = is_force_grant_forbidden(&entry.path) {
+                            failures.push((entry.path.clone(), reason));
+                            continue;
+                        }
+                    }
+                    let do_grant =
+                        || grant_ace_inheritable_access(&entry.path, sid.as_psid(), entry.access);
+                    let result = if entry.forced {
+                        with_restore_privilege(do_grant)
+                    } else {
+                        do_grant()
+                    };
+                    match result {
+                        Ok(()) => granted.push(entry.path.clone()),
+                        Err(e) => failures.push((entry.path.clone(), e.to_string())),
+                    }
+                }
+                Ok((granted, failures))
+            } else {
+                match crate::tier2a::privhelper::run_privileged_workspace_access(
+                    missing_traverse.clone(),
+                    needs_elevation.clone(),
+                    wfp_chain_pipe.clone(),
+                    privhelper_launcher,
+                ) {
+                    Ok((traverse_granted, traverse_error, granted, failures, netfilterd_chain)) => {
+                        // **「依頼した」ではなく「実際に起きた」を返す**（BUG-093）。
+                        // 以前はここで`wfp_chain_pipe.is_some()`を立てていたため、privhelperの
+                        // 連鎖起動が黙って失敗しても呼び出し元はシナリオAを選び、
+                        // `ConnectNamedPipe`が30秒タイムアウトしてから`NoWfp`で落ちていた。
+                        netfilterd_chain_attempted = match netfilterd_chain {
+                            Some(Ok(())) => true,
+                            Some(Err(reason)) => {
+                                warnings.push(format!(
+                                "WFPデーモンをprivhelperから連鎖起動できませんでした（{reason}）。\
+                                 代わりに直接起動します——UACがもう1回出ます。"
+                            ));
+                                false
+                            }
+                            // 依頼していない、または連鎖起動の結末を名乗れない旧ヘルパー。
+                            // どちらも「自前で起こす」（シナリオB）で正しい。
+                            None => false,
+                        };
+                        for node in &traverse_granted {
+                            crate::tier2a::traverse_ledger::record_traverse_grant(node);
+                        }
+                        if let Some(reason) = traverse_error {
+                            if !missing_traverse.is_empty() {
+                                return Err(AppContainerError::Preflight(format!(
                                 "failed to grant traverse ACE via privilege-separation helper: \
                                  {reason}"
                             )));
+                            }
                         }
+                        Ok((granted, failures))
                     }
-                    Ok((granted, failures))
-                }
-                Err(e) => {
-                    // traverseが不足していて、それがprivhelper経由でも解消できなかった場合は
-                    // Tier2a自体が成立しない（fail-close、workspace FS I/Oが動かない）ため即座に
-                    // 打ち切る。UAC拒否（`ElevationDeclined`）もここに含まれる。
-                    if !missing_traverse.is_empty() {
-                        return Err(AppContainerError::Preflight(format!(
-                            "traverse ACE grant via privilege-separation helper failed (UAC \
+                    Err(e) => {
+                        // traverseが不足していて、それがprivhelper経由でも解消できなかった場合は
+                        // Tier2a自体が成立しない（fail-close、workspace FS I/Oが動かない）ため即座に
+                        // 打ち切る。UAC拒否（`ElevationDeclined`）もここに含まれる。
+                        if !missing_traverse.is_empty() {
+                            return Err(AppContainerError::Preflight(format!(
+                                "traverse ACE grant via privilege-separation helper failed (UAC \
                              declined or helper error?): {e}"
-                        )));
+                            )));
+                        }
+                        Err(e.to_string())
                     }
-                    Err(e.to_string())
                 }
-            }
-        };
+            };
 
         match elevated {
             Ok((granted, failures)) => {
@@ -568,22 +660,12 @@ pub fn preflight(
                     // この`granted`へ合流する）の付与もsession ledgerへ記録する。ここが
                     // 抜けていたため、`fs-passthrough-ledger.json`（`harness fs revoke`が見る）
                     // には載るのに`end_session`の自動撤収からは漏れていた。
-                    crate::tier2a::session_profile::record_granted_path(path);
+                    // 昇格経由（privhelper／本体が既に管理者）の付与も「書いた1件」に数える
+                    // ——どの経路で書いたかではなく、**マシンのACLを変えたか**が知りたい事実。
+                    passthrough_progress::record_granted();
+                    ledger_paths.push(path.clone());
                     if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
-                        if let Some(diagnosis) = probe_passthrough(
-                            sid.as_psid(),
-                            traverse_sid.as_psid(),
-                            workspace_cap_psid,
-                            workspace_root,
-                            fp,
-                        ) {
-                            denied_passthrough.push((
-                                fp.path.clone(),
-                                fp.access.label().to_string(),
-                                diagnosis.clone(),
-                            ));
-                            warnings.push(diagnosis);
-                        }
+                        probe_targets.push(fp.clone());
                     }
                 }
                 for (path, reason) in &failures {
@@ -602,7 +684,7 @@ pub fn preflight(
                         granted_passthrough.push((path.clone(), writable));
                         // BUG-057: 部分適用でACEが実在するなら、`end_session`の撤収対象にも入れる
                         // （`fs revoke`だけでなく自動撤収からも漏らさない）。
-                        crate::tier2a::session_profile::record_granted_path(path);
+                        ledger_paths.push(path.clone());
                         warnings.push(format!(
                             "fs-allow {} : partially applied via privilege-separation helper \
                              (D-16) -- some descendant failed ({reason}), but the root itself now \
@@ -631,7 +713,7 @@ pub fn preflight(
                         granted_passthrough
                             .push((entry.path.clone(), entry.access.is_read_write()));
                         // BUG-057: 上と同じ（ヘルパーが完走できなかった場合の部分適用）。
-                        crate::tier2a::session_profile::record_granted_path(&entry.path);
+                        ledger_paths.push(entry.path.clone());
                         warnings.push(format!(
                             "fs-allow {} : partially applied -- the privilege-separation helper \
                              (D-16) could not fully complete ({reason}), but the root itself now \
@@ -659,6 +741,49 @@ pub fn preflight(
         }
     }
 
+    // **撤収責任の記録は、付与が全部終わった直後にここで1回だけ書く**（BUG-057の要件は
+    // 「記録が漏れないこと」であって「1件ずつ書くこと」ではない）。付与とこの書込の間に
+    // プロセスが落ちるとACEが台帳に載らないが、その窓は本体・昇格ヘルパーとも
+    // 付与を終えた直後のミリ秒であり、**子プロセスはまだ1つも起きていない**。
+    // 1件ずつ書くと668件で約130MBのI/Oになり、毎回数秒を確実に失う（`record_granted_paths`）。
+    crate::tier2a::session_profile::record_granted_paths(&ledger_paths);
+
+    // 付与フェーズはここで終わり（以降は到達性プローブとスモークテスト）。明示的に落として、
+    // UIが「ACE付与 N/N」を出し続けないようにする。
+    drop(grant_phase);
+
+    // D8: 到達性プローブは**ここで1回だけ**行う（付与も昇格も全部終わった後）。
+    // 対象が0件なら子プロセスは1つも起こさない。
+    match probe_passthrough_batch(
+        sid.as_psid(),
+        traverse_sid.as_psid(),
+        workspace_cap_psid,
+        workspace_root,
+        &probe_targets,
+    ) {
+        BatchProbeOutcome::Measured(results) => {
+            for (fp, diagnosis) in probe_targets.iter().zip(results) {
+                if let Some(diagnosis) = diagnosis {
+                    denied_passthrough.push((
+                        fp.path.clone(),
+                        fp.access.label().to_string(),
+                        diagnosis.clone(),
+                    ));
+                    warnings.push(diagnosis);
+                }
+            }
+        }
+        // **1つの事実は1回だけ言う。** 全件へ同じ文言を配ると数百件の同一警告になる（B-09）。
+        // 「測れなかった」を「到達可」と混ぜないために、警告としては必ず出す（B-10）。
+        BatchProbeOutcome::NotRun(reason) => warnings.push(format!(
+            "fs-allow: could not verify reachability for {} passthrough root(s) from inside the \
+             sandbox ({reason}). The ACE grants themselves were applied; only the D8 reachability \
+             check was skipped",
+            probe_targets.len()
+        )),
+    }
+    timing.mark("fs-allow reachability probe");
+
     // D-30: `FS_IO_PROBE_COMMAND`はprobe_dirへの書込を試みる。Cowモードではworkspace自体が
     // 意図的にROなので、probe_dirをworkspace配下に置くと「workspaceが書けない」という
     // Cowモードの正しい挙動を誤ってtraverse ACE不足として誤診断してしまう。probe_dirは
@@ -671,7 +796,8 @@ pub fn preflight(
     let tmp_dir = probe_base.join(format!(".harness-tier2a-probe-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| AppContainerError::Preflight(e.to_string()))?;
     timing.mark("traverse/fs-allow/elevation");
-    let smoke_result = smoke_test_spawn(sid.as_psid(), workspace_cap_psid, workspace_root, &tmp_dir);
+    let smoke_result =
+        smoke_test_spawn(sid.as_psid(), workspace_cap_psid, workspace_root, &tmp_dir);
     let _ = std::fs::remove_dir_all(&tmp_dir);
     smoke_result?;
     smoke_test_harness_control_write_denied(sid.as_psid(), workspace_cap_psid, workspace_root)?;

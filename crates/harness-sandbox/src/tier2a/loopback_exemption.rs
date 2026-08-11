@@ -360,8 +360,9 @@ pub(crate) struct LoopbackExemptionGuard {
 pub(crate) fn acquire(
     container_sid: PSID,
 ) -> Result<LoopbackExemptionGuard, LoopbackExemptionError> {
-    let sid_key = sid_to_string(container_sid)
-        .map_err(|e| LoopbackExemptionError::new(format!("failed to stringify package SID: {e}")))?;
+    let sid_key = sid_to_string(container_sid).map_err(|e| {
+        LoopbackExemptionError::new(format!("failed to stringify package SID: {e}"))
+    })?;
     let list = Win32ExemptionList {
         sid: unsafe { OwnedSid::copy_from(container_sid) }
             .map_err(|e| LoopbackExemptionError::new(format!("CopySid failed: {e}")))?,
@@ -370,7 +371,9 @@ pub(crate) fn acquire(
     // 台帳へ載せる**前に**自分の生存マーカーを立てる。逆順にすると、台帳に載った直後・
     // マーカー作成前にクラッシュした場合、生きていない所有者が生きているように見えてしまう。
     hold_mutex_for_process_lifetime(&owner_mutex_name(&owner_id)).map_err(|e| {
-        LoopbackExemptionError::new(format!("failed to create loopback exemption owner marker: {e}"))
+        LoopbackExemptionError::new(format!(
+            "failed to create loopback exemption owner marker: {e}"
+        ))
     })?;
     let ledger = ledger()?;
     with_named_lock(EXEMPTION_LOCK, || {
@@ -590,7 +593,10 @@ mod tests {
             release_in_ledger(SID, "next", &ledger, &liveness(&next_live), &list).unwrap(),
             ReleaseAction::RemoveFromOsList
         );
-        assert!(!*list.present.borrow(), "残留は次セッションの終了時に消える");
+        assert!(
+            !*list.present.borrow(),
+            "残留は次セッションの終了時に消える"
+        );
     }
 
     /// harnessが載せたのではないエントリ（`harness_managed=false`）は、最後の所有者が抜けても

@@ -77,8 +77,14 @@ struct Level {
 }
 
 const LEVELS: [Level; 3] = [
-    Level { name: "none", file_mask: 0 },
-    Level { name: "read", file_mask: FILE_GENERIC_READ.0 },
+    Level {
+        name: "none",
+        file_mask: 0,
+    },
+    Level {
+        name: "read",
+        file_mask: FILE_GENERIC_READ.0,
+    },
     Level {
         name: "read+write",
         file_mask: FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
@@ -417,7 +423,7 @@ fn access_denials_by_granted_level_and_operation() {
          the ladder is in the caller's open sequence rather than in the kernel."
     );
 
-    crate::tier2a::session_profile::end_session(
+    let _ = crate::tier2a::session_profile::end_session(
         &crate::tier2a::win_appcontainer::revoke_session_grant,
     );
     assert!(outcome.seen_events > 0, "no ETW events observed");

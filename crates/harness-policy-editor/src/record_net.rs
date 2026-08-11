@@ -351,6 +351,8 @@ fn run_pass2(
         &passthrough,
         wfp_chain_pipe,
         &WorkspaceWriteMode::DirectRw,
+        // 準備の進捗コールバック。ここへ繋ぐのは記録画面を足すコミット。
+        None,
     )
     .map_err(|e| RecordNetError::NotTier2a {
         tier: "(選択できず)".to_string(),
@@ -381,6 +383,8 @@ fn run_pass2(
             .unwrap_or(false);
         harness_sandbox::tier2a::fs_passthrough_ledger::record_fs_passthrough_grant(
             path, *writable, forced, // policy.json由来はsettings.jsonの参照カウントに載せない
+            None,
+            // [BUG-101] 付与先のSID。パス2側で渡すのは後続のコミット。
             None,
         );
         on_event(NetRecordEvent::PassthroughGranted {

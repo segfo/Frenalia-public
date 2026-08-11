@@ -24,19 +24,42 @@ pub const IDLE_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(30
 pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "e2e-all",
-        &["test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture"],
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ],
     ),
     (
         "e2e-cow-matrix",
         &[
-            "test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture",
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
             "tier2a_cow_commit_matrix",
         ],
     ),
     (
         "e2e-net-matrix",
         &[
-            "test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture",
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
             "tier2a_net_policy_matrix",
         ],
     ),
@@ -47,8 +70,15 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "cow-diagnostics",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "win_appcontainer::cow_containment_tests",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "win_appcontainer::cow_containment_tests",
         ],
     ),
     // ACE付与/撤収（fs passthrough・traverse chain・継承ACE）の実機回帰。BUG-046の修正3で
@@ -58,8 +88,15 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "ace-grant-revoke",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "win_appcontainer::ace_grant_revoke_tests",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "win_appcontainer::ace_grant_revoke_tests",
         ],
     ),
     // M15.7 A-3: ETW実現性スパイク（判定ゲート）。`Microsoft-Windows-Kernel-File`の
@@ -69,8 +106,15 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "etw-audit-scope",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "can_global_object_access_auditing_be_scoped",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "can_global_object_access_auditing_be_scoped",
         ],
     ),
     // M15.7: 許可レベル×操作種別の真理値表（拒否から操作種別を推定できるかの実測）。
@@ -78,23 +122,44 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "etw-delete-denial",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "where_does_a_delete_denial_surface",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "where_does_a_delete_denial_surface",
         ],
     ),
     // M15.7 / 残課題a-2: 「開けるが操作で落ちる」拒否がどのイベント列として現れるか。
     (
         "etw-operation-denial",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "where_does_an_operation_stage_denial_surface",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "where_does_an_operation_stage_denial_surface",
         ],
     ),
     (
         "etw-access-matrix",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "access_denials_by_granted_level_and_operation",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "access_denials_by_granted_level_and_operation",
         ],
     ),
     // M15.7: 既知の未検証項目（EventsLost・変換不能パス・相関取りこぼし・短命プロセス帰属率・
@@ -102,23 +167,44 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "etw-diagnostics",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "policy_learnd::etw::diagnostics_tests",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "policy_learnd::etw::diagnostics_tests",
         ],
     ),
     // M15.7 A-4d: AppContainer子プロセスでのETW実測（拒否の観測・PID帰属・PackageFullNameの有無）。
     (
         "e2e-policy-learn",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "appcontainer_child_denials",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "appcontainer_child_denials",
         ],
     ),
     (
         "spike-etw-fs",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "policy_learnd::etw::spike_tests",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "policy_learnd::etw::spike_tests",
         ],
     ),
     // ポリシー設定モード(Tier1)構想向け: Kernel-Network/DNS-ClientのETW実現性スパイク
@@ -126,8 +212,15 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "spike-etw-net",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "policy_learnd::etw::network_spike_tests",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "policy_learnd::etw::network_spike_tests",
         ],
     ),
     // ポリシー定義モード(Tier1)構想向け: record-allモードで、package SID無しのTier1
@@ -136,8 +229,15 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "spike-etw-tier1-record-all",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "policy_learnd::etw::tier1_record_all_spike_tests",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "policy_learnd::etw::tier1_record_all_spike_tests",
         ],
     ),
     // ポリシーエディタのパス1（Tier1でrecord-all記録）の実機E2E。ビルド済みの
@@ -146,8 +246,15 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "e2e-policy-editor-record",
         &[
-            "test", "-p", "harness-policy-editor", "--test", "record_e2e", "--", "--ignored",
-            "--test-threads=1", "--nocapture",
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "record_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
         ],
     ),
     // ポリシーエディタのパス2（Tier2aでのドメイン記録）の実機E2E。WFPの出口強制daemonを
@@ -157,15 +264,65 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "e2e-policy-editor-pass2",
         &[
-            "test", "-p", "harness-policy-editor", "--test", "record_net_e2e", "--", "--ignored",
-            "--test-threads=1", "--nocapture",
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "record_net_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ],
+    ),
+    // D-56: 昇格daemonの寿命をプロセスへ合わせたときの**機構E2E**。実daemonを
+    // `apply → clear → apply → teardown`と駆動し、各段でWFPフィルタの実件数を数える
+    // （`crates/harness-sandbox/src/tier2a/netfilterd.rs`の`reuse_e2e`）。
+    // 固定するのは「待機中は0件」「畳んだ直後の再適用が通る」「Teardownでdaemonが終わる」。
+    (
+        "netfilterd-reuse",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "netfilterd::reuse_e2e",
+        ],
+    ),
+    // D-56 段階2: 収集器daemonを`StartCollect → StopCollect → StartCollect → Teardown`と
+    // 駆動する。**非昇格でも走る2件**（プロトコルの検出器・拒否後の接続維持）はここに含めず
+    // 通常の`cargo test`で回るので、このターゲットが拾うのは実際にETWセッションを張る分
+    // ——固定するのは「待機中はセッションを持たない」「畳んだ直後の再開が通る」。
+    (
+        "policy-learnd-reuse",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "policy_learnd::reuse_tests",
         ],
     ),
     (
         "e2e-loopback-exemption",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "loopback",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "loopback",
         ],
     ),
     // M15.5: MCPサーバ隔離（D-38）の実機E2E。workspace/`.harness`への到達不可（残課題#4）と、
@@ -174,21 +331,41 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "e2e-mcp",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "win_appcontainer::mcp_e2e_tests",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "win_appcontainer::mcp_e2e_tests",
         ],
     ),
     (
         "e2e-wfp-multisession",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "wfp::tests::e2e_",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "wfp::tests::e2e_",
         ],
     ),
     (
         "e2e-sandbox-vm-ignored",
         &[
-            "test", "-p", "harness-sandbox-vm", "--lib", "--", "--ignored", "--test-threads=1",
+            "test",
+            "-p",
+            "harness-sandbox-vm",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
             "--nocapture",
         ],
     ),
@@ -203,15 +380,29 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "etw-fs-allow-reach",
         &[
-            "test", "-p", "harness-sandbox", "--lib", "--", "--ignored", "--test-threads=1",
-            "--nocapture", "policy_learnd::etw::fs_allow_reach_tests",
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "policy_learnd::etw::fs_allow_reach_tests",
         ],
     ),
     // W6: `--fs-allow`を実CLIフラグ経由で通すout-of-process E2E。
     (
         "e2e-fs-allow",
         &[
-            "test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture",
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
             "tier2a_fs_allow",
         ],
     ),
@@ -219,7 +410,14 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "e2e-chain-launch",
         &[
-            "test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture",
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
             "tier2a_chain_launch",
         ],
     ),
@@ -229,7 +427,14 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "e2e-mcp-corroboration",
         &[
-            "test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture",
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
             "tier2a_mcp_corroboration",
         ],
     ),
@@ -239,7 +444,14 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     (
         "e2e-fs-ledger",
         &[
-            "test", "-p", "harness-cli", "--features", "e2e-mock", "--", "--ignored", "--nocapture",
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
             "tier2a_fs_ledger_lifecycle",
         ],
     ),
@@ -247,12 +459,24 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     // コマンドを実行している間、自分自身の実行ファイルは起動中でロックされておりリンクし
     // 直せない（実機で`error: failed to remove file ...dev-elevated-runnerd.exe: アクセスが
     // 拒否されました`を確認済み）。本セッションで再ビルドが必要な対象はharness本体側だけ。
-    ("workspace-build", &["build", "--workspace", "--exclude", "dev-elevated-runner"]),
+    (
+        "workspace-build",
+        &["build", "--workspace", "--exclude", "dev-elevated-runner"],
+    ),
     (
         "workspace-clippy",
-        &["clippy", "--workspace", "--exclude", "dev-elevated-runner", "--all-targets"],
+        &[
+            "clippy",
+            "--workspace",
+            "--exclude",
+            "dev-elevated-runner",
+            "--all-targets",
+        ],
     ),
-    ("workspace-test", &["test", "--workspace", "--exclude", "dev-elevated-runner"]),
+    (
+        "workspace-test",
+        &["test", "--workspace", "--exclude", "dev-elevated-runner"],
+    ),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,7 +500,9 @@ pub fn validate_target(target: &str) -> Result<(), String> {
         Ok(())
     } else {
         let known: Vec<&str> = KNOWN_TARGETS.iter().map(|(name, _)| *name).collect();
-        Err(format!("unknown target {target:?} (known targets: {known:?})"))
+        Err(format!(
+            "unknown target {target:?} (known targets: {known:?})"
+        ))
     }
 }
 
@@ -320,7 +546,11 @@ pub fn executed_test_count(stdout: &str) -> Option<u64> {
 /// 小文字の`failed`を探せば見出し語の`FAILED.`とは衝突しない。
 fn count_before(summary: &str, label: &str) -> Option<u64> {
     let index = summary.find(label)?;
-    summary[..index].split_whitespace().next_back()?.parse().ok()
+    summary[..index]
+        .split_whitespace()
+        .next_back()?
+        .parse()
+        .ok()
 }
 
 /// テストターゲットなのに1件も走らなかったら、それは「緑」ではなく**壊れたフィルタ**である。
@@ -364,7 +594,8 @@ mod tests {
     /// --nocapture win_appcontainer::cow_diagnostics`（改名前のフィルタ）が実際に印字した出力。
     /// **捏造せず実機から採る**——このクラスを閉じる関数が、想像した書式ではなく
     /// 本物の書式を相手にしていることを固定するため。
-    const ZERO_TESTS: &str = "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; \
+    const ZERO_TESTS: &str =
+        "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; \
                               0 measured; 252 filtered out; finished in 0.00s\n";
 
     #[test]
@@ -412,7 +643,10 @@ mod tests {
     /// テストハーネスが1度も起動しなかった場合は「0件」とは別の失敗として報告する。
     #[test]
     fn output_without_any_harness_summary_is_reported_separately() {
-        assert_eq!(executed_test_count("error: could not compile `harness-cli`"), None);
+        assert_eq!(
+            executed_test_count("error: could not compile `harness-cli`"),
+            None
+        );
         let error = check_tests_actually_ran("cow-diagnostics", "error: could not compile")
             .expect_err("a missing harness summary must not be treated as a pass");
         assert!(error.contains("no test-harness summary"), "{error}");
@@ -569,13 +803,17 @@ pub mod win {
                     let mut transferred = 0u32;
                     let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, true);
                     let _ = CloseHandle(event);
-                    return Err(IpcError::Ipc(format!("{op_name} timed out after {timeout:?}")));
+                    return Err(IpcError::Ipc(format!(
+                        "{op_name} timed out after {timeout:?}"
+                    )));
                 }
             }
             let mut transferred = 0u32;
             let result = GetOverlappedResult(handle, &overlapped, &mut transferred, false);
             let _ = CloseHandle(event);
-            result.map_err(|e| IpcError::Ipc(format!("{op_name}: GetOverlappedResult failed: {e}")))?;
+            result.map_err(|e| {
+                IpcError::Ipc(format!("{op_name}: GetOverlappedResult failed: {e}"))
+            })?;
             Ok(transferred)
         }
     }
@@ -613,7 +851,9 @@ pub mod win {
                 ReadFile(handle, Some(slice), None, Some(ov))
             })?;
             if read == 0 {
-                return Err(IpcError::Ipc("ReadFile read 0 bytes (pipe closed?)".to_string()));
+                return Err(IpcError::Ipc(
+                    "ReadFile read 0 bytes (pipe closed?)".to_string(),
+                ));
             }
             offset += read as usize;
         }
@@ -644,7 +884,10 @@ pub mod win {
         Ok(payload)
     }
 
-    pub fn connect_with_timeout(pipe: HANDLE, timeout: std::time::Duration) -> Result<(), IpcError> {
+    pub fn connect_with_timeout(
+        pipe: HANDLE,
+        timeout: std::time::Duration,
+    ) -> Result<(), IpcError> {
         use windows::Win32::System::Pipes::ConnectNamedPipe;
         run_overlapped(pipe, timeout, "ConnectNamedPipe", |ov| unsafe {
             ConnectNamedPipe(pipe, Some(ov))

@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 
-
+mod progress;
 mod prune;
 mod revoke;
 mod traverse;
@@ -120,14 +120,16 @@ pub fn run_fs_subcommand(action: FsAction) -> ExitCode {
             }
             #[cfg(windows)]
             {
-                let workspace_ledger = harness_sandbox::tier2a::workspace_ledger::load_workspace_ledger();
+                let workspace_ledger =
+                    harness_sandbox::tier2a::workspace_ledger::load_workspace_ledger();
                 println!("=== workspace grants (preflight) ===");
                 if workspace_ledger.entries.is_empty() {
                     println!("(none)");
                 }
                 for e in &workspace_ledger.entries {
-                    let live =
-                        harness_sandbox::tier2a::workspace_ledger::live_modes(&PathBuf::from(&e.path));
+                    let live = harness_sandbox::tier2a::workspace_ledger::live_modes(
+                        &PathBuf::from(&e.path),
+                    );
                     let status = if live.is_empty() {
                         "idle".to_string()
                     } else {

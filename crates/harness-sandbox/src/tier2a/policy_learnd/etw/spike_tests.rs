@@ -258,7 +258,10 @@ fn compare_mof_and_manifest_paths_for_absolute_and_relative_opens() {
     std::thread::sleep(WARMUP);
 
     // (a) 絶対パスでの拒否
-    assert!(std::fs::read(&denied_path).is_err(), "the DENY ACE must take effect");
+    assert!(
+        std::fs::read(&denied_path).is_err(),
+        "the DENY ACE must take effect"
+    );
     // (b) RootDirectory相対のopen（成功する。ここで見たいのは拒否ではなくパスの報告形式）
     let relative_status = open_relative_to_directory(dir.path(), plain_leaf);
 
@@ -335,9 +338,12 @@ fn compare_mof_and_manifest_paths_for_absolute_and_relative_opens() {
 #[test]
 #[ignore = "requires administrator rights (ETW real-time session); run via dev-elevated-run.exe spike-etw-fs"]
 fn kernel_process_rides_along_and_reports_package_identity() {
-    let session = EtwFsSession::start("harness-policy-learn-procscope")
-        .expect("start the manifest session");
-    println!("Kernel-Process enabled on the same session: {}", session.kernel_process_enabled());
+    let session =
+        EtwFsSession::start("harness-policy-learn-procscope").expect("start the manifest session");
+    println!(
+        "Kernel-Process enabled on the same session: {}",
+        session.kernel_process_enabled()
+    );
     std::thread::sleep(WARMUP);
 
     // 通常プロセスを1つ起こす（ProcessStartが確実に流れるように）。
@@ -364,9 +370,16 @@ fn kernel_process_rides_along_and_reports_package_identity() {
     let with_package: Vec<_> = outcome
         .process_starts
         .iter()
-        .filter(|p| p.package_full_name.as_deref().is_some_and(|s| !s.is_empty()))
+        .filter(|p| {
+            p.package_full_name
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+        })
         .collect();
-    println!("process starts carrying a non-empty PackageFullName: {}", with_package.len());
+    println!(
+        "process starts carrying a non-empty PackageFullName: {}",
+        with_package.len()
+    );
     for info in with_package.iter().take(5) {
         println!(
             "  pid={} seq={:?} package={:?} image={:?}",
@@ -421,13 +434,8 @@ fn appcontainer_child_denials_are_observable_and_attributable() {
     let secret = outside.path().join("etw-e2e-secret.txt");
     std::fs::write(&secret, b"top secret").expect("write the secret file");
 
-    let outcome = preflight(
-        workspace.path(),
-        &[],
-        None,
-        &WorkspaceWriteMode::DirectRw,
-    )
-    .expect("Tier2a preflight");
+    let outcome = preflight(workspace.path(), &[], None, &WorkspaceWriteMode::DirectRw)
+        .expect("Tier2a preflight");
     for warning in &outcome.warnings {
         println!("preflight warning: {warning}");
     }
@@ -436,7 +444,10 @@ fn appcontainer_child_denials_are_observable_and_attributable() {
     let sid = crate::tier2a::win_appcontainer::ensure_profile(&profile).expect("profile SID");
 
     let session = EtwFsSession::start("harness-policy-learn-e2e").expect("ETW session");
-    println!("Kernel-Process on the same session: {}", session.kernel_process_enabled());
+    println!(
+        "Kernel-Process on the same session: {}",
+        session.kernel_process_enabled()
+    );
     std::thread::sleep(WARMUP);
 
     // AppContainer子にworkspace外の秘密ファイルを読ませる（ACLで拒否されるはず）。
@@ -565,7 +576,7 @@ fn appcontainer_child_denials_are_observable_and_attributable() {
     );
 
     // 後始末（プロファイルとACEを撤収する）。
-    crate::tier2a::session_profile::end_session(
+    let _ = crate::tier2a::session_profile::end_session(
         &crate::tier2a::win_appcontainer::revoke_session_grant,
     );
 }

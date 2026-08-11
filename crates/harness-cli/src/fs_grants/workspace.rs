@@ -2,55 +2,8 @@
 //! `revoke-workspace-all`）。生存中のセッションが使っているworkspaceは撤収しない
 //! （判定は`workspace_ledger`の名前付きmutex）。
 
+use super::progress::{Spinner, WalkProgress};
 use super::*;
-
-/// [BUG-082フォローアップ] 止めるまで`stderr`へスピナー（TUIと同じ点字フレーム、
-/// `harness-tui`の`SPINNER_FRAMES`と同一）を1行で回し続けるバックグラウンドスレッド。
-///
-/// `fs revoke-workspace`はSID解決や`collect_dirs_and_files`（対象数が定まるまで進捗を
-/// 出せないディレクトリ走査）の間、無反応に見える区間を持つ——ユーザーからの実機報告
-/// （コマンド実行後、最初の1行が出るまで長く待たされる）を受けて追加した。`Drop`で
-/// スレッドを止め、行を空白で上書きしてから`\r`だけ残す（次の出力がスピナーの残骸と
-/// 混ざらないように）。
-struct Spinner {
-    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Spinner {
-    fn start(label: impl Into<String>) -> Self {
-        let label = label.into();
-        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let running_thread = std::sync::Arc::clone(&running);
-        let handle = std::thread::spawn(move || {
-            const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let mut i = 0usize;
-            while running_thread.load(std::sync::atomic::Ordering::Relaxed) {
-                eprint!("\r{} {label}", FRAMES[i % FRAMES.len()]);
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-                i += 1;
-                std::thread::sleep(std::time::Duration::from_millis(80));
-            }
-        });
-        Self {
-            running,
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for Spinner {
-    fn drop(&mut self) {
-        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-        // 直前のスピナー行を空白で上書きしてから復帰する。次にこの行へ書く側
-        // （数値進捗・完了メッセージ）がスピナーの残骸を引きずらないようにするため。
-        eprint!("\r{}\r", " ".repeat(120));
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-    }
-}
 
 /// workspace本体のACE（`preflight`が毎回付与するRWX/RO）を撤収する。名前付きmutexで
 /// 「今もこのworkspaceを使っている他のharnessセッションが無いか」を確認してから撤収する
@@ -102,14 +55,17 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
         else {
             continue;
         };
-        match harness_sandbox::tier2a::win_appcontainer::workspace_capability_sid(&canonical, mode) {
+        match harness_sandbox::tier2a::win_appcontainer::workspace_capability_sid(&canonical, mode)
+        {
             Ok(sid) => capability_targets.push((mode, name, sid)),
             Err(e) => resolve_failures.push(format!("{name} ({mode}): failed to resolve SID: {e}")),
         }
     }
     let mut profile_targets = Vec::new();
     for profile in harness_sandbox::tier2a::session_profile::revocable_profile_names() {
-        match harness_sandbox::tier2a::win_appcontainer::ensure_profile(&profile) {
+        // [BUG-101] 撤収側は`ensure_profile`（存在しなければ作る）を通さない。剥がしに来た
+        // コマンドが削除済みプロファイルを復活させてしまう（`derive_profile_sid`のdoc）。
+        match harness_sandbox::tier2a::win_appcontainer::derive_profile_sid(&profile) {
             Ok(sid) => profile_targets.push((profile, sid)),
             Err(e) => resolve_failures.push(format!("{profile}: failed to resolve SID: {e}")),
         }
@@ -128,10 +84,7 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
         harness_sandbox::tier2a::workspace_ledger::remove_workspace_entry(&canonical);
         // 台帳が空でも、過去のセッションが`.harness/**`へ立てた継承遮断は残り得る。
         report_harness_control_dir_unprotected(&canonical);
-        println!(
-            "(nothing recorded to revoke for {})",
-            canonical.display()
-        );
+        println!("(nothing recorded to revoke for {})", canonical.display());
         return ExitCode::SUCCESS;
     }
 
@@ -151,30 +104,18 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
     );
 
     // `collect_dirs_and_files`（walk本体の中）は対象数が定まるまで進捗を出せない。定まるまでは
-    // スピナー、定まったら同じ行を数値進捗で上書きする（`RefCell`は進捗コールバックが
-    // `&dyn Fn`のため——このプロセスはシングルスレッドで呼ぶので`Mutex`は不要）。
-    let scan_spinner = std::cell::RefCell::new(Some(Spinner::start(
+    // スピナー、定まったら同じ行を数値進捗で上書きする（`progress::WalkProgress`）。
+    let walk_progress = WalkProgress::start(
         "harness: scanning workspace tree...",
-    )));
-    let last_reported = std::cell::Cell::new(0usize);
+        "harness: revoking workspace access",
+    );
     let result = harness_sandbox::tier2a::win_appcontainer::revoke_workspace_sids_recursive(
         &canonical,
         &all_sids,
-        &|done, total| {
-            // 初回呼び出し（`revoke_workspace_sids_recursive`がtotal確定直後に必ず1回
-            // `(0, total)`で呼ぶ）でスキャン用スピナーを止める。2回目以降は既に`None`なので
-            // no-op。
-            drop(scan_spinner.borrow_mut().take());
-            last_reported.set(done);
-            let percent = (done.min(total) * 100).checked_div(total).unwrap_or(0);
-            eprint!(
-                "\rharness: revoking workspace access: {done}/{total} node(s) checked ({percent}%)   "
-            );
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-        },
+        &|done, total| walk_progress.on_progress(done, total),
     );
-    drop(scan_spinner.into_inner());
-    eprintln!();
+    let last_reported = walk_progress.last_reported();
+    walk_progress.finish();
 
     match result {
         Ok(report) => {
@@ -205,7 +146,7 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
                  capability and profile ledger entries were left intact so a retry finds the same \
                  targets)",
                 canonical.display(),
-                last_reported.get()
+                last_reported
             );
             ExitCode::FAILURE
         }

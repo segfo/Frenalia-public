@@ -20,11 +20,20 @@
 //! **例外: WFP連鎖起動**（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）。UAC起動回数を
 //! 最小化するため、`GrantWorkspaceAccess`要求が同時に「処理完了後、指定named pipeで`harness-netfilterd`を
 //! 起動してほしい」という指示（[`PrivilegedRequestEnvelope::chain_netfilterd_pipe`]）を伴うことが
-//! ある。この場合だけ、ヘルパーはACL操作の応答を送った**後**に`CreateProcessW`（`runas`は使わない、
-//! 自分の昇格済みトークンをそのまま子へ継承させる）で`harness-netfilterd.exe`を追加起動してから
-//! 終了する。「1起動=1操作で常駐しない」という原則は、「ACL操作1件＋（指示があれば）子プロセスを
-//! 1つ起動する」までを1操作とみなす形で維持する（ヘルパー自身は常駐しない。常駐するのはあくまで
-//! 子として起動された`harness-netfilterd`側）。
+//! ある。この場合だけ、ヘルパーはACL操作を終えたあと`CreateProcessW`（`runas`は使わない、
+//! 自分の昇格済みトークンをそのまま子へ継承させる）で`harness-netfilterd.exe`を追加起動し、
+//! **その結末を応答に載せてから**終了する。「1起動=1操作で常駐しない」という原則は、
+//! 「ACL操作1件＋（指示があれば）子プロセスを1つ起動する」までを1操作とみなす形で維持する
+//! （ヘルパー自身は常駐しない。常駐するのはあくまで子として起動された`harness-netfilterd`側）。
+//!
+//! **連鎖起動は応答より前に行う**（2026-08-09、BUG-093の修正で順序を変えた）。以前は応答を
+//! 先に送り、連鎖起動の失敗は`log::line`だけで握り潰していたため、失敗しても呼び出し元には
+//! 何も届かず、親は`ConnectNamedPipe`が30秒タイムアウトするまで待ってから`NoWfp`で
+//! fail-closedしていた（この機で実際に発生し、`privhelper.log`にだけ記録が残っていた）。
+//! 結末を[`PrivilegedResponse::WorkspaceAccessResult::netfilterd_chain`]で返せば、親は
+//! 待たずにシナリオ(B)（自前の`runas`起動）へ移れる。**順序を変えても競合は起きない**——
+//! 起こされたnetfilterdが親の`ConnectNamedPipe`より先に接続してくる場合は
+//! `ERROR_PIPE_CONNECTED`として`win_pipe_ipc::run_overlapped`が既に成功扱いにしている。
 
 use std::path::PathBuf;
 
@@ -34,8 +43,10 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, HANDLE, HLOCAL, WAIT_OBJECT_0,
 };
+use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::{
-    GetTokenInformation, TokenElevation, PSID, TOKEN_ELEVATION, TOKEN_QUERY,
+    CheckTokenMembership, GetTokenInformation, TokenElevation, TokenElevationType, PSID,
+    TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
@@ -51,7 +62,7 @@ use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLE
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use crate::shell_tier::FsAccess;
-use crate::tier2a::win_appcontainer::{self, AppContainerError, CONTAINER_NAME};
+use crate::tier2a::win_appcontainer::{self, AppContainerError};
 use crate::win_common::wide;
 
 /// ヘルパーへ委譲する操作。自由形式のコマンド文字列ではなく固定スキーマに限定する（D-16）。
@@ -121,13 +132,21 @@ pub enum PrivilegedRequest {
     RevokeTraverse { path: PathBuf },
     /// `harness fs revoke`/`revoke-all`が本体プロセス内（非管理者）で撤収しきれなかった
     /// パス（`GrantWorkspaceAccess`でシステム保護パスへ付与したACE等）をまとめて1回のUACで
-    /// 撤収する（付与側の裏対称、`BUG-015`参照）。各エントリは`revoke_passthrough`
+    /// 撤収する（付与側の裏対称、`BUG-015`参照）。各エントリは`revoke_harness_subjects`
     /// （ツリー全体を再walk＋root再プローブ）で撤収する。`forced`なパスは`SeRestorePrivilege`下で
     /// 撤収する（grantと対称に`forced`を運び新たな非対称を作らない、`FsAllowRevoke`参照）。
     ///
-    /// **付与側と違い、こちらは旧共有プロファイル（`CONTAINER_NAME`）のSIDを使う。** D-37以前に
-    /// 付けたACEと、既に終了したセッションのACEを掃除するのが役目だからである（生きている
-    /// セッションのSID宛ACEには触らない。判定は非昇格側の`harness fs revoke`が持つ）。
+    /// # [BUG-101] 主体は名前ではなく**対象パスのDACL**から決める
+    ///
+    /// 以前は旧共有プロファイル（`CONTAINER_NAME`）のSID固定で、「D-37以前に付けたACEを
+    /// 掃除するのが役目」と説明していた。しかし実際に載っているのはセッション固有SIDなので、
+    /// **探す相手が違って1件も剥がれない**（実マシンの6箇所で再現）。いまは対象パスのDACLに
+    /// 実在するパッケージSIDを分類して剥がす。生きているセッションのSID宛ACEに触らないのは
+    /// 従来どおり（判定は`revoke_subjects`の規則1が持つ）。
+    ///
+    /// **SIDはIPCで運ばない**（D-16の原則は不変）。昇格側は渡されたパスを自分で読む。
+    /// ただし昇格側では「台帳の記録」と「未登録SIDのマスク指紋」による判定は使わない
+    /// ——`runas`の昇格先が別の管理者アカウントだと`HKCU`が別ハイブになるため（`server.rs`参照）。
     RevokeFsAllow { entries: Vec<FsAllowRevoke> },
     /// **非管理者からのTier2a起動が特権を要するときに通る唯一の要求**。
     /// `win_appcontainer::preflight`が自動検知した、workspace_root/upper_dir祖先チェーンの
@@ -216,7 +235,40 @@ pub enum PrivilegedResponse {
         traverse_error: Option<String>,
         fs_allow_granted: Vec<PathBuf>,
         fs_allow_failures: Vec<(PathBuf, String)>,
+        /// WFP連鎖起動（[`PrivilegedRequestEnvelope::chain_netfilterd_pipe`]）の**結末**。
+        ///
+        /// - `None` — 連鎖起動を依頼されていない
+        /// - `Some(Ok(()))` — 起こした。呼び出し側はそのパイプでハンドシェイクしてよい
+        /// - `Some(Err(reason))` — 起こせなかった。**呼び出し側は待たずにシナリオB
+        ///   （`NetfilterHandle::start`＝`runas`）へ落ちること**
+        ///
+        /// これが無かった頃、失敗は`privhelper.log`にしか残らず、親は`ConnectNamedPipe`が
+        /// 30秒タイムアウトしてから`NoWfp`でfail-closedしていた（BUG-093と同型、実機で発生）。
+        ///
+        /// **追加は必ず末尾へ**。`#[serde(default)]`なので、この項目を持たない旧応答も読める。
+        #[serde(default)]
+        netfilterd_chain: Option<Result<(), String>>,
     },
+}
+
+impl PrivilegedResponse {
+    /// WFP連鎖起動の結末を応答へ添える（`WorkspaceAccessResult`以外は素通し）。
+    ///
+    /// 連鎖起動を依頼できるのは`GrantWorkspaceAccess`だけなので、他のvariantには
+    /// 載せる場所を作らない——**載る余地のある型を作ると、載っていないことの意味が曖昧になる**。
+    pub(crate) fn with_netfilterd_chain_result(
+        mut self,
+        result: Option<Result<(), String>>,
+    ) -> Self {
+        if let PrivilegedResponse::WorkspaceAccessResult {
+            ref mut netfilterd_chain,
+            ..
+        } = self
+        {
+            *netfilterd_chain = result;
+        }
+        self
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -271,6 +323,70 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// このユーザーが**そもそも昇格できるか**（UACに応じれば管理者になれるか）。
+///
+/// [`is_elevated`]（＝いま昇格しているか）とは別の問いである。この2つを混同すると、
+/// **UACを1回キャンセルしただけのユーザーを「管理者権限が無い人」と扱ってしまう**。
+/// Tier選択はこの区別に依存している——昇格できないなら保護の無いTier0へ宣言付きで降格し、
+/// 昇格できるのに今回失敗しただけなら起動時エラーにする（`shell_tier::best_effort_tier`）。
+/// 区別せずに降格させると、UACの押し間違い1回で保護が黙って外れる。
+///
+/// 判定は3つの状態を見る。
+///
+/// 1. 既に昇格済み（`TokenIsElevated`）——当然できる。
+/// 2. **分割トークン**（`TokenElevationTypeLimited`）——UACが有効な管理者。応じれば昇格できる。
+/// 3. UACが無効な管理者（`TokenElevationTypeDefault`かつBUILTIN\Administratorsのメンバー）。
+///
+/// 2の状態では`CheckTokenMembership`はAdministratorsに対して**偽を返す**
+/// （フィルタ済みトークンではDENY_ONLY属性が付く）ので、3の判定だけでは足りない。
+///
+/// 判定に失敗したときは`true`を返す（[`is_elevated`]のfail-safeとは**向きが逆**）。
+/// ここでの安全側は「勝手に保護を外さない」ことなので、分からないなら
+/// 「昇格できるかもしれない」＝降格しない側へ倒す。
+pub fn can_elevate() -> bool {
+    if is_elevated() {
+        return true;
+    }
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return true;
+        }
+        let mut elevation_type = TOKEN_ELEVATION_TYPE::default();
+        let mut ret_len = 0u32;
+        let queried = GetTokenInformation(
+            token,
+            TokenElevationType,
+            Some(&mut elevation_type as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+            &mut ret_len,
+        );
+        let _ = CloseHandle(token);
+        if queried.is_err() {
+            return true;
+        }
+        // TokenElevationTypeLimited == 3（分割トークン＝UACが有効な管理者）。
+        if elevation_type.0 == 3 {
+            return true;
+        }
+
+        // 残るのはTypeDefault。UACを無効にした管理者がここに来るので、素の所属を見る。
+        let sid_w = crate::win_common::wide("S-1-5-32-544"); // BUILTIN\Administrators
+        let mut sid = PSID::default();
+        if ConvertStringSidToSidW(PCWSTR(sid_w.as_ptr()), &mut sid).is_err() {
+            return true;
+        }
+        let mut is_member = windows::Win32::Foundation::BOOL(0);
+        // 第1引数`None`＝呼び出しスレッドの実効トークン。
+        let checked = CheckTokenMembership(None, sid, &mut is_member);
+        let _ = LocalFree(HLOCAL(sid.0));
+        match checked {
+            Ok(()) => is_member.as_bool(),
+            Err(_) => true,
+        }
+    }
+}
+
 // 名前付きパイプIPCの下回り（DACL・オーバーラップドI/O・フレーミング）は
 // `crate::win_pipe_ipc`が持つ。以前はこのファイル・`tier2a/netfilterd.rs`・
 // `tier3/vmsandboxd.rs`の3箇所に同じ一式がコピーされていた（そのうち`run_overlapped`の
@@ -312,11 +428,10 @@ mod client;
 mod server;
 
 pub use client::{
-    run_privileged, run_privileged_revoke_fs_allow, run_privileged_workspace_access,
+    run_privileged, run_privileged_revoke_fs_allow, run_privileged_workspace_access, ChainLauncher,
     FsAllowRevokeOutcome,
 };
 pub use server::serve;
-
 
 /// 名前付きパイプIPC下回りの現行の振る舞いを固定するcharacterization test。
 ///
@@ -487,7 +602,10 @@ mod pipe_ipc_characterization {
                 None,
             )
         };
-        assert!(ok.is_ok(), "ConvertSecurityDescriptorToStringSecurityDescriptorW failed");
+        assert!(
+            ok.is_ok(),
+            "ConvertSecurityDescriptorToStringSecurityDescriptorW failed"
+        );
         let sddl = crate::win_common::pwstr_to_string(out);
         unsafe {
             let _ = LocalFree(HLOCAL(out.0 as *mut _));
@@ -505,7 +623,10 @@ mod pipe_ipc_characterization {
         // 継承元のコンテナを持たないため実効的な差が無く、付与していないのが現行の挙動。
         assert!(!sddl.contains("D:P"), "unexpected protected flag in {sddl}");
         // ハンドル自体は子プロセスへ継承させない。
-        assert_eq!(sa.bInheritHandle.0, 0, "the pipe handle must not be inheritable");
+        assert_eq!(
+            sa.bInheritHandle.0, 0,
+            "the pipe handle must not be inheritable"
+        );
     }
 }
 
@@ -701,6 +822,7 @@ mod tests {
             traverse_error: Some(r"C:\Users\example\workspace: access denied".to_string()),
             fs_allow_granted: vec![PathBuf::from(r"C:\ProgramData\Tool")],
             fs_allow_failures: vec![(PathBuf::from(r"C:\Windows\System32"), "denied".to_string())],
+            netfilterd_chain: Some(Err("refusing to chain-launch the WFP daemon".to_string())),
         };
         let bytes = serde_json::to_vec(&response).unwrap();
         let decoded: PrivilegedResponse = serde_json::from_slice(&bytes).unwrap();
@@ -710,7 +832,14 @@ mod tests {
                 traverse_error,
                 fs_allow_granted,
                 fs_allow_failures,
+                netfilterd_chain,
             } => {
+                // **連鎖起動の結末が往復すること**（BUG-093）。これが落ちると、親は
+                // 「起こせなかった」を知れずに30秒待ってからfail-closedへ倒れる。
+                assert_eq!(
+                    netfilterd_chain,
+                    Some(Err("refusing to chain-launch the WFP daemon".to_string()))
+                );
                 assert_eq!(traverse_granted.len(), 2);
                 assert_eq!(
                     traverse_error,
@@ -721,6 +850,27 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// **和の値（`ReadWriteExec`）がIPCを越える形を固定する。**
+    ///
+    /// `FsAccess`は昇格側（`harness-privhelper.exe`）が別プロセスとして読むJSONに載る。
+    /// variantを足すこと自体は末尾追加で後方互換だが、**古いビルドの昇格側はこの綴りを読めない**
+    /// （`unknown variant`でデシリアライズが落ちる）。綴りをここで固定しておけば、
+    /// 送信側だけ改名して受信側が取り残される事故（B-03）はテストで止まる。
+    #[test]
+    fn the_combined_access_has_a_stable_wire_spelling() {
+        let grant = FsAllowGrant {
+            path: PathBuf::from(r"C:\x"),
+            access: FsAccess::ReadWriteExec,
+            forced: false,
+        };
+
+        let json = serde_json::to_string(&grant).unwrap();
+
+        assert!(json.contains(r#""access":"read_write_exec""#), "{json}");
+        let decoded: FsAllowGrant = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.access, FsAccess::ReadWriteExec);
     }
 
     /// `FsAllowGrant`/`FsAllowRevoke`の`forced`は`#[serde(default)]`なので、フィールドが

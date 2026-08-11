@@ -75,8 +75,14 @@ struct Level {
 /// `delete`列を足したのが§15との違い——**削除権だけを持たせた段**を用意して、
 /// 「開けるが削除できない」と「開けない」を分離する。
 const LEVELS: [Level; 4] = [
-    Level { name: "none", file_mask: 0 },
-    Level { name: "read", file_mask: FILE_GENERIC_READ.0 },
+    Level {
+        name: "none",
+        file_mask: 0,
+    },
+    Level {
+        name: "read",
+        file_mask: FILE_GENERIC_READ.0,
+    },
     Level {
         name: "read+write",
         file_mask: FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
@@ -213,7 +219,10 @@ fn where_does_a_delete_denial_surface() {
         "  unmatched OperationEnd = {} (denials that had no Create to correlate with)",
         outcome.correlator_unmatched_operation_ends
     );
-    println!("  events={} lost={}", outcome.seen_events, outcome.events_lost);
+    println!(
+        "  events={} lost={}",
+        outcome.seen_events, outcome.events_lost
+    );
 
     println!(
         "HOW TO READ: if a level shows 'delete|FAIL' but ZERO Create denials, the denial did NOT \
@@ -223,7 +232,7 @@ fn where_does_a_delete_denial_surface() {
          recorded in RESULTS.md \u{00a7}12.4."
     );
 
-    crate::tier2a::session_profile::end_session(
+    let _ = crate::tier2a::session_profile::end_session(
         &crate::tier2a::win_appcontainer::revoke_session_grant,
     );
     assert!(outcome.seen_events > 0, "no ETW events observed");

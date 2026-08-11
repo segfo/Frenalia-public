@@ -15,7 +15,6 @@
 
 use std::path::Path;
 
-
 /// fs passthrough台帳（D5、ユーザグローバル、`directories`設定ディレクトリ配下）の1エントリ。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FsLedgerEntry {
@@ -36,6 +35,21 @@ pub struct FsLedgerEntry {
     /// 自動撤収対象にしない（D2/D3のsticky挙動を維持する）。
     #[serde(default)]
     pub settings_managed: bool,
+    /// このパスへACEを**実際に付与した主体**（AppContainerパッケージSIDの文字列表現）の集合。
+    ///
+    /// # なぜ記録するのか（[BUG-101](../../../../docs/bugs/BUG-101.md)欠陥②）
+    ///
+    /// SIDはプロファイル名からの**一方向**導出（`DeriveAppContainerSidFromAppContainerName`）
+    /// なので、プロファイルが削除された時点でSID→名前は誰にも引けなくなる。撤収側が
+    /// 「このACEはharnessのものか」を名前から判定しようとすると、そこで手が届かなくなり、
+    /// 実マシンに剥がせないACEが残った。**付与した時点でSIDを書き留めておけば、以後
+    /// 「harness由来」は推論ではなく記録になる**（B-01: 名前を捨てる操作より前に記録を残す）。
+    ///
+    /// 同じパスは複数のセッションが付与し直すので**和で持つ**（上書きしない）。
+    /// 旧台帳（このフィールド欠落）は空扱い——その場合の判定は
+    /// `win_appcontainer::revoke_subjects`の規則0/2/4が受ける。
+    #[serde(default)]
+    pub granted_sids: Vec<String>,
 }
 
 /// 到達不能/付与失敗だったfs passthrough候補。`harness fs list`/`harness fs denied`で表示し、
@@ -68,15 +82,24 @@ pub struct FsLedger {
 impl FsLedger {
     /// `record_fs_passthrough_grant`の中身（同一パスは上書き＝冪等、`settings_workspaces`は
     /// dedup追加、`settings_managed`は一度立ったら降ろさない、拒否記録は消す）。
+    ///
+    /// `granted_sid`（付与した主体のSID文字列）だけは**上書きではなく和**で持つ
+    /// ——同じパスを別のセッションが付与し直すたびに主体が増えるので、上書きすると
+    /// 前のセッションのACEを剥がす手掛かりが消える（[`FsLedgerEntry::granted_sids`]のdoc）。
     pub fn upsert_grant(
         &mut self,
         path_str: String,
         writable: bool,
         forced: bool,
         settings_workspace: Option<&str>,
+        granted_sid: Option<&str>,
         granted_at: u64,
     ) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.path == path_str) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| same_ledger_path(&e.path, &path_str))
+        {
             entry.writable = writable;
             entry.granted_at_unix_secs = granted_at;
             entry.forced = forced;
@@ -85,6 +108,11 @@ impl FsLedger {
                     entry.settings_workspaces.push(ws.to_string());
                 }
                 entry.settings_managed = true;
+            }
+            if let Some(sid) = granted_sid {
+                if !entry.granted_sids.iter().any(|s| s == sid) {
+                    entry.granted_sids.push(sid.to_string());
+                }
             }
         } else {
             self.entries.push(FsLedgerEntry {
@@ -96,25 +124,21 @@ impl FsLedger {
                     .map(|ws| vec![ws.to_string()])
                     .unwrap_or_default(),
                 settings_managed: settings_workspace.is_some(),
+                granted_sids: granted_sid.map(|s| vec![s.to_string()]).unwrap_or_default(),
             });
         }
         // 付与できたパスは「到達不能候補」ではなくなる。両方に載ったままだと
         // `harness fs denied`が既に開いている穴を勧め続ける。
-        self.denied_entries.retain(|e| e.path != path_str);
+        self.denied_entries
+            .retain(|e| !same_ledger_path(&e.path, &path_str));
     }
 
     /// `record_fs_passthrough_denied`の中身（同一`(path, access)`は回数を積む）。
-    pub fn record_denied(
-        &mut self,
-        path_str: String,
-        access: &str,
-        reason: &str,
-        denied_at: u64,
-    ) {
+    pub fn record_denied(&mut self, path_str: String, access: &str, reason: &str, denied_at: u64) {
         if let Some(entry) = self
             .denied_entries
             .iter_mut()
-            .find(|e| e.path == path_str && e.access == access)
+            .find(|e| same_ledger_path(&e.path, &path_str) && e.access == access)
         {
             entry.reason = reason.to_string();
             entry.last_denied_at_unix_secs = denied_at;
@@ -165,11 +189,82 @@ pub fn record_fs_passthrough_grant(
     writable: bool,
     forced: bool,
     settings_workspace: Option<&str>,
+    granted_sid: Option<&str>,
 ) {
     let path_str = path.to_string_lossy().into_owned();
     let granted_at = harness_grant_ledger::now_unix_secs();
     fs_ledger().update(|ledger| {
-        ledger.upsert_grant(path_str, writable, forced, settings_workspace, granted_at)
+        ledger.upsert_grant(
+            path_str,
+            writable,
+            forced,
+            settings_workspace,
+            granted_sid,
+            granted_at,
+        )
+    });
+}
+
+/// 複数の付与を**1回の台帳更新で**記録する（`record_fs_passthrough_grant`のまとめ版）。
+///
+/// # なぜ要るか（実測）
+///
+/// `Ledger::update`は1回ごとに「ロック取得 → 全文読取 → パース → 直列化 → **`.bak`へ全文コピー**
+/// → 読取専用属性を外す → 全文書込 → 読取専用へ戻す」を行います。この台帳はこの開発機で
+/// **185KB**あるので、1件あたり約550KBのファイルI/Oです。ポリシーエディタが
+/// workspace外のルートを668件持つドメイン（`cargo`）でパス2を走らせると、
+/// これだけで**約370MB**のI/Oになり数秒かかります——**1件もACEを書いていない2回目以降でも
+/// 同じだけ払います**（付与の有無に関わらず「このセッションが撤収責任を負う」記録は要るため）。
+///
+/// **ループの中で`update`を呼ばない。** 台帳は「1件足す」ためのAPIに見えますが、
+/// 実体は全文の読み書きです。
+pub fn record_fs_passthrough_grants(grants: &[FsPassthroughGrantRecord]) {
+    if grants.is_empty() {
+        return;
+    }
+    let granted_at = harness_grant_ledger::now_unix_secs();
+    fs_ledger().update(|ledger| {
+        for grant in grants {
+            ledger.upsert_grant(
+                grant.path.to_string_lossy().into_owned(),
+                grant.writable,
+                grant.forced,
+                grant.settings_workspace.as_deref(),
+                grant.granted_sid.as_deref(),
+                granted_at,
+            );
+        }
+    });
+}
+
+/// [`record_fs_passthrough_grants`]の1件ぶん。
+#[derive(Debug, Clone)]
+pub struct FsPassthroughGrantRecord {
+    pub path: std::path::PathBuf,
+    pub writable: bool,
+    pub forced: bool,
+    pub settings_workspace: Option<String>,
+    /// ACEを付与した主体のSID文字列（[`FsLedgerEntry::granted_sids`]）。導出に失敗したら
+    /// `None`——**記録できなかったことを付与の失敗にはしない**が、そのパスは後から
+    /// 「登録簿」と「マスクの指紋」でしか判定できなくなる。
+    pub granted_sid: Option<String>,
+}
+
+/// 複数の拒否を1回の台帳更新で記録する（[`record_fs_passthrough_grants`]と同じ理由）。
+pub fn record_fs_passthrough_denials(denials: &[(std::path::PathBuf, String, String)]) {
+    if denials.is_empty() {
+        return;
+    }
+    let denied_at = harness_grant_ledger::now_unix_secs();
+    fs_ledger().update(|ledger| {
+        for (path, access, reason) in denials {
+            ledger.record_denied(
+                path.to_string_lossy().into_owned(),
+                access,
+                reason,
+                denied_at,
+            );
+        }
     });
 }
 
@@ -179,12 +274,23 @@ pub fn record_fs_passthrough_denied(path: &Path, access: &str, reason: &str) {
     fs_ledger().update(|ledger| ledger.record_denied(path_str, access, reason, denied_at));
 }
 
-pub fn remove_fs_passthrough_grant(path: &Path) {
+pub use harness_grant_ledger::same_ledger_path;
+
+/// 指定パスのエントリを台帳から落とす。**返り値は実際に落とした件数**——
+/// 「呼んだ」と「消えた」は別の事実で、0件を成功として報告すると
+/// 撤収コマンドが嘘をつく（B-09、BUG-101の欠陥②）。
+pub fn remove_fs_passthrough_grant(path: &Path) -> usize {
     fs_ledger().update(|ledger| {
         let path_str = path.to_string_lossy().into_owned();
-        ledger.entries.retain(|e| e.path != path_str);
-        ledger.denied_entries.retain(|e| e.path != path_str);
-    });
+        let before = ledger.entries.len() + ledger.denied_entries.len();
+        ledger
+            .entries
+            .retain(|e| !same_ledger_path(&e.path, &path_str));
+        ledger
+            .denied_entries
+            .retain(|e| !same_ledger_path(&e.path, &path_str));
+        before - (ledger.entries.len() + ledger.denied_entries.len())
+    })
 }
 
 /// `should_remove`がtrueを返したパスのエントリを台帳から落とす（`harness fs prune`、D-53）。
@@ -222,14 +328,75 @@ pub fn prune_fs_ledger_entries(should_remove: impl Fn(&Path) -> bool) -> Vec<Str
 /// 競合で参照者が復活していた場合は台帳エントリを残す（ACEは撤収済みのため、次回起動の
 /// `reconcile_fs_ledger_for_workspace`が再度grantを試みて整合を取り戻す）。
 #[cfg(windows)]
-pub fn remove_fs_passthrough_grant_if_still_orphaned(path: &Path) {
+/// 返り値は[`remove_fs_passthrough_grant`]と同じく**実際に落とした件数**。
+/// 対になる2つの除去関数で戻り値の形を変えない（`CODE-STRUCTURE-RULES`§5.1）。
+pub fn remove_fs_passthrough_grant_if_still_orphaned(path: &Path) -> usize {
     fs_ledger().update(|ledger| {
         let path_str = path.to_string_lossy().into_owned();
+        let before = ledger.entries.len() + ledger.denied_entries.len();
         ledger.entries.retain(|e| {
-            e.path != path_str || (e.settings_managed && !e.settings_workspaces.is_empty())
+            !same_ledger_path(&e.path, &path_str)
+                || (e.settings_managed && !e.settings_workspaces.is_empty())
         });
-        ledger.denied_entries.retain(|e| e.path != path_str);
-    });
+        ledger
+            .denied_entries
+            .retain(|e| !same_ledger_path(&e.path, &path_str));
+        before - (ledger.entries.len() + ledger.denied_entries.len())
+    })
+}
+
+#[cfg(test)]
+mod path_match_tests {
+    use super::same_ledger_path;
+
+    /// **BUG-101の欠陥②の回帰テスト。**
+    ///
+    /// この台帳は書き手によって区切り文字が揃いません——`harness fs revoke`のCLIは引数を
+    /// そのまま（`C:\...`）、ポリシーエディタは設定パス由来のスラッシュ形（`C:/...`）で
+    /// 記録します。実際に`%TEMP%`のエントリがスラッシュ形で入っているところへ
+    /// バックスラッシュ形で`revoke`を掛け、**1件も一致しないまま`revoked:`＋exit 0**が
+    /// 返りました。
+    #[test]
+    fn the_two_separator_spellings_written_by_different_writers_are_the_same_target() {
+        assert!(same_ledger_path(
+            r"C:\Users\segfo\AppData\Local\Temp",
+            "C:/Users/segfo/AppData/Local/Temp"
+        ));
+    }
+
+    /// Windowsのファイルシステムは大小非区別なので、比較もそれに合わせます（B-20）。
+    /// 末尾の区切りも同じ対象を指します。
+    #[test]
+    fn case_and_trailing_separator_do_not_change_the_target() {
+        assert!(same_ledger_path(
+            r"C:\Users\SEGFO\.cargo",
+            r"c:\users\segfo\.cargo"
+        ));
+        assert!(same_ledger_path(
+            r"C:\Users\segfo\.cargo\",
+            r"C:\Users\segfo\.cargo"
+        ));
+    }
+
+    /// **対になる否定側**（B-35）。全部一致させてしまう実装では、上の3つも通ってしまい
+    /// 「正規化が効いている」ことを判定できません。**別の対象は別のままである**ことを固定します。
+    #[test]
+    fn different_targets_are_still_different() {
+        assert!(!same_ledger_path(
+            r"C:\Users\segfo\.cargo",
+            r"C:\Users\segfo\.rustup"
+        ));
+        // 前置詞一致で巻き込まない（`.cargo`の撤収が`.cargo2`を消してはいけない）。
+        assert!(!same_ledger_path(
+            r"C:\Users\segfo\.cargo",
+            r"C:\Users\segfo\.cargo2"
+        ));
+        // 親は子ではない。
+        assert!(!same_ledger_path(
+            r"C:\Users\segfo",
+            r"C:\Users\segfo\.cargo"
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -266,6 +433,7 @@ mod fs_ledger_tests {
                 forced: true,
                 settings_workspaces: Vec::new(),
                 settings_managed: false,
+                granted_sids: Vec::new(),
             }],
             denied_entries: Vec::new(),
         };
@@ -279,8 +447,8 @@ mod fs_ledger_tests {
     #[test]
     fn granting_the_same_path_twice_upserts_instead_of_appending() {
         let mut ledger = FsLedger::default();
-        ledger.upsert_grant(PATH.to_string(), false, false, None, 100);
-        ledger.upsert_grant(PATH.to_string(), true, true, None, 200);
+        ledger.upsert_grant(PATH.to_string(), false, false, None, None, 100);
+        ledger.upsert_grant(PATH.to_string(), true, true, None, None, 200);
 
         assert_eq!(ledger.entries.len(), 1, "the same path must not accumulate");
         assert!(ledger.entries[0].writable, "the newest access wins");
@@ -288,14 +456,48 @@ mod fs_ledger_tests {
         assert_eq!(ledger.entries[0].granted_at_unix_secs, 200);
     }
 
+    /// 付与した主体のSIDは**上書きではなく和**で持つ（重複は足さない）。
+    ///
+    /// [BUG-101] 同じパスは起動のたびに別のセッション（＝別のpackage SID）が付与し直す。
+    /// 上書きにすると、前のセッションが付けたACEを「harnessのものだ」と判定する手掛かりが
+    /// 消え、そのプロファイルが削除された時点で二度と剥がせなくなる。
+    #[test]
+    fn the_granting_sids_accumulate_as_a_set_instead_of_being_overwritten() {
+        const SID_A: &str = "S-1-15-2-1111111111-1-1-1-1-1-1";
+        const SID_B: &str = "S-1-15-2-2222222222-2-2-2-2-2-2";
+        let mut ledger = FsLedger::default();
+        ledger.upsert_grant(PATH.to_string(), false, false, None, Some(SID_A), 100);
+        ledger.upsert_grant(PATH.to_string(), false, false, None, Some(SID_B), 200);
+        ledger.upsert_grant(PATH.to_string(), false, false, None, Some(SID_A), 300);
+        // SIDを導出できなかった起動（`None`）が既存の記録を消さないこと。
+        ledger.upsert_grant(PATH.to_string(), false, false, None, None, 400);
+
+        assert_eq!(
+            ledger.entries[0].granted_sids,
+            vec![SID_A.to_string(), SID_B.to_string()],
+            "every subject that ever granted this path must stay reachable"
+        );
+    }
+
+    /// このフィールドを持たない**旧台帳**がそのまま読めること（`serde(default)`）。
+    /// この台帳は実マシンの唯一の記録なので、スキーマ変更で読めなくなると
+    /// 付与済みACEの撤収経路がまるごと失われる。
+    #[test]
+    fn a_ledger_written_before_granted_sids_existed_still_loads() {
+        let json = r#"{"entries":[{"path":"C:\\x","writable":true,"granted_at_unix_secs":1}]}"#;
+        let ledger: FsLedger = serde_json::from_str(json).expect("old ledger must still parse");
+        assert_eq!(ledger.entries.len(), 1);
+        assert!(ledger.entries[0].granted_sids.is_empty());
+    }
+
     /// `settings.json`由来の宣言者（D-27の参照カウント）は**重複追加しない**。
     /// 同じworkspaceの再起動ごとに積むと、参照者ゼロの判定が永遠に成立しなくなる。
     #[test]
     fn the_declaring_workspaces_are_deduped_and_settings_managed_never_goes_back_down() {
         let mut ledger = FsLedger::default();
-        ledger.upsert_grant(PATH.to_string(), false, false, Some(r"C:\ws"), 100);
-        ledger.upsert_grant(PATH.to_string(), false, false, Some(r"C:\ws"), 200);
-        ledger.upsert_grant(PATH.to_string(), false, false, Some(r"C:\other"), 300);
+        ledger.upsert_grant(PATH.to_string(), false, false, Some(r"C:\ws"), None, 100);
+        ledger.upsert_grant(PATH.to_string(), false, false, Some(r"C:\ws"), None, 200);
+        ledger.upsert_grant(PATH.to_string(), false, false, Some(r"C:\other"), None, 300);
 
         assert_eq!(
             ledger.entries[0].settings_workspaces,
@@ -304,7 +506,7 @@ mod fs_ledger_tests {
         assert!(ledger.entries[0].settings_managed);
 
         // `--fs-allow`だけの再起動（settings_workspace = None）を挟んでも降ろさない。
-        ledger.upsert_grant(PATH.to_string(), false, false, None, 400);
+        ledger.upsert_grant(PATH.to_string(), false, false, None, None, 400);
         assert!(
             ledger.entries[0].settings_managed,
             "settings_managed must stay true once set (D-27: otherwise the entry silently drops \
@@ -321,7 +523,7 @@ mod fs_ledger_tests {
         ledger.record_denied(PATH.to_string(), "read_exec", "ACCESS_DENIED", 100);
         assert_eq!(ledger.denied_entries.len(), 1);
 
-        ledger.upsert_grant(PATH.to_string(), false, false, None, 200);
+        ledger.upsert_grant(PATH.to_string(), false, false, None, None, 200);
 
         assert!(
             ledger.denied_entries.is_empty(),

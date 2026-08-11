@@ -13,7 +13,6 @@
 
 use super::*;
 
-
 /// ヘルパー側のファイルログ（`%APPDATA%\harness\config\privhelper.log`、台帳と同じ`config_dir`）。
 /// ヘルパーは`runas`+`SW_HIDE`（[`launch_helper_elevated`]参照）で起動されるため
 /// `eprintln!`の出力先が無く、UAC/IPCが無応答になった際に「どのノードで何秒かかって
@@ -110,6 +109,49 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
                 )
             }
         };
+    // **応答を送る前に連鎖起動する**（BUG-093の修正）。
+    //
+    // 以前は応答を送り終えた後に起こし、失敗は`log::line`だけで握り潰していた。その結果、
+    // 連鎖起動が落ちても呼び出し元には何も伝わらず、親は`ConnectNamedPipe`が30秒
+    // タイムアウトするまで待ってから`NoWfp`でfail-closedしていた——実際にこの機で
+    // 2026-08-08に起きている（`privhelper.log`に記録が残っていた）。
+    // 結末を応答へ載せれば、親は待たずに自前の`runas`起動（シナリオB）へ移れる
+    // （B-09: 多段の副作用は到達点を返す）。
+    //
+    // **順序を変えても競合は起きない**——起こされたnetfilterdが親の`ConnectNamedPipe`より
+    // 先に接続してくる場合は`ERROR_PIPE_CONNECTED`として`win_pipe_ipc::run_overlapped`が
+    // 既に成功扱いにしている（2026-07-25にこの経路で実際に踏んで対処済み）。
+    //
+    // ACL操作の成否に関わらず試みるのは従来どおり — WFP起動の可否とACL操作の成否は独立した
+    // 関心事であり、ACL側が失敗したからといって呼び出し元が期待しているWFP起動まで
+    // 巻き添えで諦める理由はない。
+    let chain_result = chain_netfilterd_pipe.map(|chain_pipe| {
+        log::line(&format!(
+            "serve: chain-launching netfilterd, pipe={chain_pipe}"
+        ));
+        // **形の検証は受信側で行う**（P-01: 名前を運ぶのは非特権の親で、親は攻撃者と同じ権限で
+        // 動きうる）。起こされたnetfilterdはこの名前を`CreateFileW`で開いて自分の応答を書くので、
+        // 任意の名前を通すと「昇格プロセスが攻撃者の選んだ先へ書き込む」プリミティブになる。
+        // D-60でnetfilterd側に同じ検証を入れたので、**対称に**こちらへも入れる（B-01）。
+        if !crate::win_pipe_ipc::is_harness_pipe_name(&chain_pipe) {
+            let reason = "rejected malformed pipe name (not a harness pipe)".to_string();
+            log::line(&format!("serve: netfilterd chain-launch refused: {reason}"));
+            return Err(reason);
+        }
+        match unsafe { launch_netfilterd_chained(&chain_pipe) } {
+            Ok(()) => {
+                log::line("serve: netfilterd chain-launch succeeded");
+                Ok(())
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                log::line(&format!("serve: netfilterd chain-launch failed: {reason}"));
+                Err(reason)
+            }
+        }
+    });
+    let response = response.with_netfilterd_chain_result(chain_result);
+
     let response_bytes = serde_json::to_vec(&response)
         .map_err(|e| PrivHelperError::Ipc(format!("failed to serialize response: {e}")))?;
     log::line("serve: writing response");
@@ -120,19 +162,6 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
     }
     unsafe {
         let _ = CloseHandle(pipe);
-    }
-
-    // 応答を送り終えた**後**にのみ連鎖起動する（モジュールdoc「例外: WFP連鎖起動」参照）。
-    // ACL操作の成否に関わらず試みる — WFP起動の可否とACL操作の成否は独立した関心事であり、
-    // ACL側が失敗したからといって呼び出し元が期待しているWFP起動まで巻き添えで諦める理由はない。
-    if let Some(chain_pipe) = chain_netfilterd_pipe {
-        log::line(&format!(
-            "serve: chain-launching netfilterd, pipe={chain_pipe}"
-        ));
-        match unsafe { launch_netfilterd_chained(&chain_pipe) } {
-            Ok(()) => log::line("serve: netfilterd chain-launch succeeded"),
-            Err(e) => log::line(&format!("serve: netfilterd chain-launch failed: {e}")),
-        }
     }
 
     write_result.map_err(Into::into)
@@ -229,7 +258,11 @@ fn grant_fs_allow_entries(
                 log::line(&format!(
                     "  entry {} [{}{}] : granted in {}ms",
                     entry.path.display(),
-                    if entry.access.is_read_write() { "rw" } else { "ro" },
+                    if entry.access.is_read_write() {
+                        "rw"
+                    } else {
+                        "ro"
+                    },
                     if entry.forced { ",forced" } else { "" },
                     started.elapsed().as_millis()
                 ));
@@ -239,7 +272,11 @@ fn grant_fs_allow_entries(
                 log::line(&format!(
                     "  entry {} [{}{}] : FAILED after {}ms: {e}",
                     entry.path.display(),
-                    if entry.access.is_read_write() { "rw" } else { "ro" },
+                    if entry.access.is_read_write() {
+                        "rw"
+                    } else {
+                        "ro"
+                    },
                     if entry.forced { ",forced" } else { "" },
                     started.elapsed().as_millis()
                 ));
@@ -257,10 +294,7 @@ fn grant_fs_allow_entries(
 /// エラーのみ`traverse_error`へ載せる（`target: reason`形式でどのターゲットの失敗か分かるようにする）。
 /// いずれの場合も、実際にACEが付与された全ノードを`granted`へ積む（孤立ACE防止、`GrantChain`と
 /// 同じ不変条件）。
-fn grant_traverse_targets(
-    sid: PSID,
-    targets: Vec<PathBuf>,
-) -> (Vec<PathBuf>, Option<String>) {
+fn grant_traverse_targets(sid: PSID, targets: Vec<PathBuf>) -> (Vec<PathBuf>, Option<String>) {
     let mut all_granted = Vec::new();
     let mut first_error: Option<String> = None;
     for target in targets {
@@ -298,20 +332,18 @@ fn grant_traverse_targets(
 /// |---|---|---|
 /// | 祖先チェーンのtraverse（`GrantTraverse`/`RevokeTraverse`/`GrantWorkspaceAccess`のtraverse部分） | capability SID | `traverse_capability_sid()`（固定名`harnessSandboxTraverse`） |
 /// | leafへの読み書きの**付与**（`GrantWorkspaceAccess`のfs-allow部分） | セッションpackage SID | IPCで受けた**形を検証済みの**セッションプロファイル名 |
-/// | leafへの読み書きの**撤収**（`RevokeFsAllow`） | 旧共有package SID | `ensure_profile(CONTAINER_NAME)`（D-37以前のACEを掃除するのが役目） |
+/// | leafへの読み書きの**撤収**（`RevokeFsAllow`） | **対象パスのDACLに実在するpackage SID** | `win_appcontainer::revoke_harness_subjects`（名前からは導出しない） |
 ///
 /// traverse側が`CONTAINER_NAME`のpackage SIDのままD-37から取り残されていたのが
-/// [BUG-061](../../../../docs/bugs/BUG-061.md)である。**この関数の冒頭で導出する`sid`を
-/// 使ってよいのは`RevokeFsAllow`だけ**——新しいアームを足す人は、上表のどの行に属するかを
-/// 決めてから主体を選ぶこと。
+/// [BUG-061](../../../../docs/bugs/BUG-061.md)である。**新しいアームを足す人は、上表のどの行に
+/// 属するかを決めてから主体を選ぶこと。**
+///
+/// [BUG-101] 撤収の行が「旧共有package SID固定」だったのをやめた。プロファイルが削除された
+/// SIDは名前へ逆引きできないので、名前側から探す方式ではそもそも届かない。いまは対象パスの
+/// DACLを読んで、そこに実在する主体だけを分類して剥がす。**この関数はもうpackage SIDを
+/// 冒頭で導出しない**——用途ごとに主体が違うので、共有の`sid`変数を置くこと自体が
+/// 「どの行のつもりか」を曖昧にしていた。
 fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
-    let sid = match win_appcontainer::ensure_profile(CONTAINER_NAME) {
-        Ok(sid) => sid,
-        Err(e) => {
-            log::line(&format!("dispatch: ensure_profile failed: {e}"));
-            return PrivilegedResponse::Err(format!("failed to resolve sandbox SID: {e}"));
-        }
-    };
     match req {
         PrivilegedRequest::GrantTraverse { target } => {
             log::line(&format!(
@@ -415,12 +447,16 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 (Vec::new(), failures)
             } else {
                 match win_appcontainer::ensure_profile(&session_profile) {
-                    Ok(session_sid) => grant_fs_allow_entries(session_sid.as_psid(), fs_allow_entries),
+                    Ok(session_sid) => {
+                        grant_fs_allow_entries(session_sid.as_psid(), fs_allow_entries)
+                    }
                     Err(e) => {
                         log::line(&format!("dispatch: ensure_profile(session) failed: {e}"));
                         let failures = fs_allow_entries
                             .into_iter()
-                            .map(|entry| (entry.path, format!("failed to resolve session SID: {e}")))
+                            .map(|entry| {
+                                (entry.path, format!("failed to resolve session SID: {e}"))
+                            })
                             .collect();
                         (Vec::new(), failures)
                     }
@@ -439,6 +475,9 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 traverse_error,
                 fs_allow_granted,
                 fs_allow_failures,
+                // 連鎖起動は`dispatch`の外（`serve`）で行う。結末は
+                // `with_netfilterd_chain_result`が応答を送る直前に埋める。
+                netfilterd_chain: None,
             }
         }
         PrivilegedRequest::RevokeFsAllow { entries } => {
@@ -447,45 +486,60 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 entries.len()
             ));
             let mut revoked = Vec::new();
-            let mut root_cleared = Vec::new();
+            let root_cleared = Vec::new();
             let mut failures = Vec::new();
             for entry in entries {
                 let path = entry.path;
                 let started = std::time::Instant::now();
-                // forcedなパス（--force-system-aclで付与したACE）は撤収時も`SeRestorePrivilege`が要る。
-                let do_revoke = || win_appcontainer::revoke_passthrough(&path, sid.as_psid());
+                // [BUG-101] 撤収する主体は**このパスのDACLに実在するharness由来のSID**で決める
+                // （旧実装は`ensure_profile(CONTAINER_NAME)`＝旧共有プロファイル固定だった）。
+                //
+                // **昇格側では台帳の記録（規則3）と未登録SIDの指紋（規則4）は使わない。**
+                // `runas`の昇格先が別の管理者アカウントだと`HKCU`が別ハイブになり、分類の
+                // 前提（この機の登録簿を見ている）が崩れる。分類できないものは剥がさず、
+                // 非昇格側が名指しで報告する（fail-closed）。
+                let do_revoke =
+                    || win_appcontainer::revoke_harness_subjects(&path, &[], &|_, _| {});
                 let outcome = if entry.forced {
+                    // forcedなパス（--force-system-aclで付与したACE）は撤収時も
+                    // `SeRestorePrivilege`が要る。
                     win_appcontainer::with_restore_privilege(do_revoke)
                 } else {
                     do_revoke()
                 };
                 match outcome {
-                    win_appcontainer::RevokeOutcome::FullyRevoked => {
+                    Ok(report) if report.unfinished().is_empty() => {
                         log::line(&format!(
-                            "  path {} : revoked in {}ms",
+                            "  path {} : revoked {} subject(s), {} node(s) rewritten in {}ms",
                             path.display(),
+                            report.targeted(),
+                            report.rewritten(),
                             started.elapsed().as_millis()
                         ));
                         revoked.push(path);
                     }
-                    win_appcontainer::RevokeOutcome::RootClearedDescendantsBlocked => {
+                    Ok(report) => {
                         log::line(&format!(
-                            "  path {} : root cleared (descendants blocked) in {}ms",
+                            "  path {} : FAILED after {}ms (still on the root: {})",
                             path.display(),
-                            started.elapsed().as_millis()
-                        ));
-                        root_cleared.push(path);
-                    }
-                    win_appcontainer::RevokeOutcome::Failed => {
-                        log::line(&format!(
-                            "  path {} : FAILED after {}ms (root ACE still present)",
-                            path.display(),
-                            started.elapsed().as_millis()
+                            started.elapsed().as_millis(),
+                            report.unfinished().join(", ")
                         ));
                         failures.push((
                             path,
-                            "root ACE still present after revoke attempt".to_string(),
+                            format!(
+                                "still on the root after an elevated revoke: {}",
+                                report.unfinished().join(", ")
+                            ),
                         ));
+                    }
+                    Err(e) => {
+                        log::line(&format!(
+                            "  path {} : FAILED after {}ms ({e})",
+                            path.display(),
+                            started.elapsed().as_millis()
+                        ));
+                        failures.push((path, e.to_string()));
                     }
                 }
             }

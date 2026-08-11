@@ -21,8 +21,15 @@ pub enum TierError {
         selected: &'static str,
         required: &'static str,
     },
+    // **`--tier1`を勧めない。** Tier1では低ILラベルがcwd 1個にしか付かないため、
+    // ビルド・テスト・`git commit`のいずれも通らない（`tier1::win_restricted`のdocの表）。
+    // 「代替Tierがある」かのような案内は、試して失敗するまでの時間を無駄にさせる（B-32）。
+    // 昇格できないユーザーはそもそもここへ来ない（Tier0へ宣言付きで降格する）ので、
+    // このエラーが出るのは「昇格できるのに今回失敗した」場合だけである。
     #[error(
-        "{attempted} is unavailable: {reason}. Use --tier1 to explicitly opt in to Windows Tier1 fallback."
+        "{attempted} is unavailable: {reason}. This account can elevate, so this is most likely a \
+         declined UAC prompt or a helper failure — retry and accept the prompt. \
+         (--tier1 exists but cannot run builds, tests or git commits, so it is not a substitute.)"
     )]
     Unavailable {
         attempted: &'static str,
@@ -55,7 +62,22 @@ fn require_label(require: RequireSandbox) -> &'static str {
     }
 }
 
-/// Tier2a向けfs passthroughアクセス権。設定上は`fs.read`/`fs.read_write`/`fs.read_exec`に対応する。
+/// Tier2a向けfs passthroughアクセス権（＝**実際に付与するACEマスクの記述**）。
+///
+/// # 設定語彙より1つ多い
+///
+/// 設定ファイルの語彙（[`harness_config::FsAccess`]・`fs.read`/`fs.read_write`/`fs.read_exec`）は
+/// 3値だが、こちらには[`FsAccess::ReadWriteExec`]がある。**同じパスに`fs.read_write`と
+/// `fs.read_exec`の両方が宣言され得る**のに、1つのオブジェクトのDACLへ同じSID宛のACEを
+/// 2本持つことはできない（[`crate::tier2a::win_appcontainer`]の付与は`SetEntriesInAclW`で
+/// 1本にまとまる）ため、**和を表せる値**が要る。
+///
+/// 和が無かった頃は、畳み込みが先に入った方を残して**もう片方の権限が黙って消えていた**
+/// ——`read_exec`と`read_write`が同じルートに立つと、どちらを採っても片方が失われる
+/// （`ReadWrite`に`FILE_GENERIC_EXECUTE`は入っていない）。
+///
+/// **`fs.read_write_exec`という設定キーは作らない。** 提案の語彙（`harness_policy::SettingsKey`）と
+/// 設定スキーマの1:1を崩さないため、和はこの層（付与）にだけ存在する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FsAccess {
@@ -65,11 +87,53 @@ pub enum FsAccess {
     ReadWrite,
     /// 読取・実行。
     ReadExec,
+    /// 読取・書込・実行。**設定語彙には無い**——同じパスへの`fs.read_write`と`fs.read_exec`の
+    /// 宣言を1本のACEへ畳んだときにだけ現れる（[`FsAccess::wider`]）。
+    ReadWriteExec,
 }
 
 impl FsAccess {
+    /// **全variantの列挙。** 「harnessがパッケージSID宛に書き得るACEマスクの集合」を
+    /// `ALL.map(fs_access_mask)`として**導出**するために要る（撤収側が、名前を失った孤児SIDの
+    /// ACEをharnessのものと見分ける指紋に使う。[BUG-101](../../../docs/bugs/BUG-101.md)欠陥②）。
+    ///
+    /// **手書きのリストを別の場所に作らないこと**（B-05）。variantを足したときの追従漏れは
+    /// 下の[`FsAccess::index_in_all`]がコンパイルエラーにする——「剥がせるはずのACEを
+    /// 剥がし損ねる」形の無言失敗は、この配列がずれた瞬間に発生する。
+    pub const ALL: [FsAccess; 4] = [
+        FsAccess::Read,
+        FsAccess::ReadWrite,
+        FsAccess::ReadExec,
+        FsAccess::ReadWriteExec,
+    ];
+
+    /// [`FsAccess::ALL`]の網羅性を**コンパイル時に**強制するためだけの写像。
+    ///
+    /// `_`を持たない`match`なので、variantを1つ足すとここが非網羅でビルドが落ちる。
+    /// 併せて`ALL`の配列長も合わなくなるので、2段で気付ける（`prompt.rs`の
+    /// `EnvironmentFacts`が使っている2段ゲートと同じ考え方）。
+    ///
+    /// 下の`const _`ブロックが`ALL`の各要素を自分の添字と突き合わせるので、**順序を
+    /// 間違えた／同じ値を2回書いた**場合もコンパイルが通らない。
+    const fn index_in_all(self) -> usize {
+        match self {
+            FsAccess::Read => 0,
+            FsAccess::ReadWrite => 1,
+            FsAccess::ReadExec => 2,
+            FsAccess::ReadWriteExec => 3,
+        }
+    }
+
+    /// 書込を含むか。**`ReadWriteExec`も真**——ここが偽だと、和を取った途端に
+    /// 台帳の`writable`が落ち、到達性プローブがread側で測り、`--cow`のcaptureも外れる
+    /// （この1つの述語が3箇所の分岐を決めている）。
     pub fn is_read_write(self) -> bool {
-        self == FsAccess::ReadWrite
+        matches!(self, FsAccess::ReadWrite | FsAccess::ReadWriteExec)
+    }
+
+    /// 実行を含むか（`CreateProcess`できるか）。
+    pub fn is_exec(self) -> bool {
+        matches!(self, FsAccess::ReadExec | FsAccess::ReadWriteExec)
     }
 
     pub fn label(self) -> &'static str {
@@ -77,9 +141,52 @@ impl FsAccess {
             FsAccess::Read => "read",
             FsAccess::ReadWrite => "read_write",
             FsAccess::ReadExec => "read_exec",
+            FsAccess::ReadWriteExec => "read_write_exec",
+        }
+    }
+
+    /// 設定語彙（3値）から付与層の値へ。
+    pub fn from_settings(access: harness_config::FsAccess) -> Self {
+        match access {
+            harness_config::FsAccess::Read => FsAccess::Read,
+            harness_config::FsAccess::ReadWrite => FsAccess::ReadWrite,
+            harness_config::FsAccess::ReadExec => FsAccess::ReadExec,
+        }
+    }
+
+    /// **同じパスに複数の宣言があるときの合成規則（唯一の定義）。**
+    ///
+    /// 「広い方を採る」ではなく**和を取る**。`ReadWrite`と`ReadExec`は互いに包含しないので、
+    /// どちらかを選ぶ規則では必ず片方の権限が消える——消えた側は実行時に
+    /// `Access is denied`として現れるが、宣言は残っているので画面上は許可されて見える。
+    ///
+    /// 呼び出し側は「何をキーに重複と見なすか」（パス文字列／`PathBuf`のルート）が違うので
+    /// 畳み込みのループ自体は各自が持つが、**合成の規則はここだけにある**（B-05）。
+    pub fn wider(self, other: FsAccess) -> FsAccess {
+        let write = self.is_read_write() || other.is_read_write();
+        let exec = self.is_exec() || other.is_exec();
+        match (write, exec) {
+            (true, true) => FsAccess::ReadWriteExec,
+            (true, false) => FsAccess::ReadWrite,
+            (false, true) => FsAccess::ReadExec,
+            (false, false) => FsAccess::Read,
         }
     }
 }
+
+/// [`FsAccess::ALL`]が全variantを過不足なく1回ずつ持つことの**コンパイル時**検算。
+///
+/// テストではなくここに置くのは、`cargo build`の時点で落としたいため——`ALL`がずれると
+/// 「harnessが書いたACEをharnessが自分のものと認識できない」＝
+/// [BUG-101](../../../docs/bugs/BUG-101.md)欠陥②の再発になり、症状は**無言**である
+/// （`fs revoke`が成功を報告しながら剥がさない）。
+const _: () = {
+    let mut i = 0;
+    while i < FsAccess::ALL.len() {
+        assert!(FsAccess::ALL[i].index_in_all() == i);
+        i += 1;
+    }
+};
 
 /// Tier2a向けfs passthrough記述子（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md` §5.1）。
 /// package SIDへ追加ルート（`workspace_root`外）の許可ACEを付与する対象を表す。
@@ -142,6 +249,17 @@ pub struct Probes {
     /// 呼び出し時に`harness-cli`が`VmSandboxHandle::start`で行うため、Tier選択時点では
     /// 「試す価値があるか」の軽量チェックに留める、Phase 1のスコープ）。
     pub tier3_available_override: Option<Result<(), String>>,
+    /// Windowsで**このユーザーがそもそも昇格できるか**をテストから注入する
+    /// （`None`なら本番同様に`privhelper::can_elevate()`を呼ぶ）。
+    ///
+    /// Tier2aはtraverse ACE付与・netfilterd・ETWのいずれでも昇格を要求するので、
+    /// 昇格できないユーザーはTier2aへ到達できない。その人たちに残る選択肢は実質Tier0だけで、
+    /// **Tier1はビルドもテストも`git commit`も通せない**（`tier1::win_restricted`の
+    /// モジュールdocの表）ため代替にならない。
+    ///
+    /// **「昇格できない」と「今回UACを断った」を分けるためのプローブである。**
+    /// 後者で降格させると、押し間違い1回で保護が黙って外れる。
+    pub can_elevate_override: Option<bool>,
 }
 
 impl Probes {
@@ -173,6 +291,7 @@ impl Probes {
 /// Windowsではフラグ無しでもTier2aを常時プローブする（Linuxのbwrapプローブと同じ
 /// 「フラグなし常時プローブ」構造）。Tier2aが使えない場合は、`opt_in_tier1`が
 /// 指定されているときだけTier1へ降格する。`opt_in_tier3`は`--vm-sandbox`の実装。
+#[allow(clippy::too_many_arguments)]
 pub fn select_tier(
     require: RequireSandbox,
     workspace_root: &Path,
@@ -181,6 +300,10 @@ pub fn select_tier(
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
     write_mode: &WorkspaceWriteMode,
+    // D-60: 常駐している昇格プロセスから`privhelper`を起こす手段（`None`なら`runas`＝UAC 1回）。
+    // **「後から必要になった昇格」をUAC 0回で通す唯一の入口**。harness本体は起動時に1回しか
+    // ここを通らず、そのとき連鎖元となるdaemonはまだ居ないので`None`を渡す。
+    privhelper_launcher: Option<crate::tier2a::privhelper::ChainLauncher<'_>>,
 ) -> Result<ShellTierSelection, TierError> {
     select_tier_with_probes(
         require,
@@ -190,6 +313,7 @@ pub fn select_tier(
         passthrough,
         wfp_chain_pipe,
         write_mode,
+        privhelper_launcher,
         &Probes::detect(),
     )
 }
@@ -204,6 +328,7 @@ pub fn select_tier_with_probes(
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
     write_mode: &WorkspaceWriteMode,
+    privhelper_launcher: Option<crate::tier2a::privhelper::ChainLauncher<'_>>,
     probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
     let selection = best_effort_tier(
@@ -213,6 +338,7 @@ pub fn select_tier_with_probes(
         passthrough,
         wfp_chain_pipe,
         write_mode,
+        privhelper_launcher,
         probes,
     )?;
     if satisfies(selection.tier, require) {
@@ -246,11 +372,13 @@ fn probe_tier3_available() -> Result<(), String> {
 /// Tier2aのプローブ本体（成功ならTier2a直接選択のための`ShellTierSelection`、失敗なら理由文字列）。
 /// `best_effort_tier`の2箇所（フラグなしの既定パス、Tier3失敗時のカスケード先）から共有する。
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn try_tier2a(
     workspace_root: &Path,
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
     write_mode: &WorkspaceWriteMode,
+    privhelper_launcher: Option<crate::tier2a::privhelper::ChainLauncher<'_>>,
     probes: &Probes,
 ) -> Result<ShellTierSelection, String> {
     match &probes.tier2a_preflight_override {
@@ -260,11 +388,12 @@ fn try_tier2a(
         // 単体テストでは避ける、既存の分岐と同じ考え方）。D8: passthroughの到達不能は
         // Tier選択自体を左右せず`passthrough_warnings`として運ぶだけ。
         None => {
-            match crate::tier2a::win_appcontainer::preflight(
+            match crate::tier2a::win_appcontainer::preflight_with_privhelper_launcher(
                 workspace_root,
                 passthrough,
                 wfp_chain_pipe,
                 write_mode,
+                privhelper_launcher,
             ) {
                 Ok(outcome) => Ok(ShellTierSelection::direct(ShellTier::Tier2a)
                     .with_passthrough_warnings(outcome.warnings)
@@ -278,6 +407,7 @@ fn try_tier2a(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn best_effort_tier(
     workspace_root: &Path,
     opt_in_tier3: bool,
@@ -285,6 +415,7 @@ fn best_effort_tier(
     passthrough: &[FsPassthrough],
     wfp_chain_pipe: Option<String>,
     write_mode: &WorkspaceWriteMode,
+    privhelper_launcher: Option<crate::tier2a::privhelper::ChainLauncher<'_>>,
     probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
     if opt_in_tier1 {
@@ -306,6 +437,7 @@ fn best_effort_tier(
                 passthrough,
                 wfp_chain_pipe,
                 write_mode,
+                privhelper_launcher,
                 probes,
             ) {
                 Ok(tier2a_selection) => {
@@ -329,23 +461,59 @@ fn best_effort_tier(
     }
 
     // フラグなしの既定パス: Tier2aを無条件にプローブする（Linuxのbwrapプローブと同じ
-    // 「フラグなし常時プローブ」構造）。失敗時はTier1へ暗黙降格せず、起動時エラーにする。
+    // 「フラグなし常時プローブ」構造）。
     match try_tier2a(
         workspace_root,
         passthrough,
         wfp_chain_pipe,
         write_mode,
+        privhelper_launcher,
         probes,
     ) {
         Ok(selection) => Ok(selection),
-        Err(reason) => Err(TierError::Unavailable {
-            attempted: ShellTier::Tier2a.label(),
-            reason,
-        }),
+        // **失敗の理由を2つに分ける。**
+        //
+        // Tier2aはtraverse ACE付与・netfilterd・ETWのどれでも昇格を要求するので、
+        // 昇格**できない**ユーザーはこの先どうやってもTier2aへ到達しない。その人に
+        // 起動時エラーを返し続けるのは「harnessが使えない」と同義で、Tier1も代替に
+        // ならない（ビルド・テスト・`git commit`が通らない）。Linuxが`bwrap`不在時に
+        // Tier0へ**宣言付きで**降格するのと同じ形へ揃える。
+        //
+        // 一方、昇格**できる**のに今回失敗した（UACをキャンセルした・privhelperが
+        // エラーを返した）場合は、これまでどおり起動時エラーにする。ここを降格に
+        // すると、UACの押し間違い1回で保護が黙って外れる——BUG-093では実際に
+        // UACのキャンセルを別の失敗と読み違えており、同じ取り違えをTier選択で
+        // 繰り返さないための分岐である。
+        //
+        // なお降格しても`--require-sandbox`は素通りしない（`satisfies`がTier0を
+        // `write-containment`・`confidential`のどちらでも拒む）。「黙って降格しない」
+        // 原則も守られている——`downgraded_from`と`reason`が`prompt.rs`経由で
+        // モデルへ必ず出る。
+        Err(reason) => {
+            let can_elevate = probes
+                .can_elevate_override
+                .unwrap_or_else(crate::tier2a::privhelper::can_elevate);
+            if can_elevate {
+                Err(TierError::Unavailable {
+                    attempted: ShellTier::Tier2a.label(),
+                    reason,
+                })
+            } else {
+                Ok(ShellTierSelection::downgraded(
+                    ShellTier::Tier2a,
+                    ShellTier::Tier0,
+                    format!(
+                        "{reason} (this account cannot elevate, so Tier2a is out of reach; \
+                         Tier1 is not a substitute because it cannot run builds, tests or git commits)"
+                    ),
+                ))
+            }
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn best_effort_tier(
     _workspace_root: &Path,
     _opt_in_tier3: bool,
@@ -373,6 +541,7 @@ fn best_effort_tier(
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[allow(clippy::too_many_arguments)]
 fn best_effort_tier(
     _workspace_root: &Path,
     _opt_in_tier3: bool,
@@ -397,6 +566,63 @@ mod tests {
         std::env::temp_dir()
     }
 
+    /// [`FsAccess::wider`]の真理値表。**和であって「広い方を選ぶ」ではない。**
+    ///
+    /// `ReadWrite`と`ReadExec`は互いに包含しないので、どちらかを選ぶ規則では必ず片方の
+    /// 権限が落ちる。落ちた側は実行時の`Access is denied`としてしか現れない。
+    #[test]
+    fn wider_takes_the_union_and_is_commutative() {
+        use FsAccess::*;
+        let table = [
+            (Read, Read, Read),
+            (Read, ReadWrite, ReadWrite),
+            (Read, ReadExec, ReadExec),
+            (Read, ReadWriteExec, ReadWriteExec),
+            (ReadWrite, ReadExec, ReadWriteExec),
+            (ReadWrite, ReadWriteExec, ReadWriteExec),
+            (ReadExec, ReadWriteExec, ReadWriteExec),
+            (ReadWrite, ReadWrite, ReadWrite),
+            (ReadExec, ReadExec, ReadExec),
+            (ReadWriteExec, ReadWriteExec, ReadWriteExec),
+        ];
+        for (a, b, expected) in table {
+            assert_eq!(a.wider(b), expected, "{a:?}.wider({b:?})");
+            assert_eq!(b.wider(a), expected, "{b:?}.wider({a:?}) must be the same");
+        }
+    }
+
+    /// 述語は和の値でも成り立つ。`is_read_write`は台帳の`writable`・到達性プローブのモード・
+    /// `--cow`のcapture判定という**3つの分岐**を決めているので、ここが偽だと和を取った途端に
+    /// 書込の扱いが静かに変わる。
+    #[test]
+    fn the_combined_value_reports_both_write_and_exec() {
+        assert!(FsAccess::ReadWriteExec.is_read_write());
+        assert!(FsAccess::ReadWriteExec.is_exec());
+        assert!(FsAccess::ReadWrite.is_read_write());
+        assert!(!FsAccess::ReadWrite.is_exec());
+        assert!(FsAccess::ReadExec.is_exec());
+        assert!(!FsAccess::ReadExec.is_read_write());
+        assert!(!FsAccess::Read.is_read_write());
+        assert!(!FsAccess::Read.is_exec());
+    }
+
+    /// 設定語彙（3値）からの変換は全単射的で、和の値は**設定からは作られない**
+    /// （`fs.read_write_exec`という設定キーは無い）。
+    #[test]
+    fn settings_vocabulary_never_produces_the_combined_value() {
+        for access in [
+            harness_config::FsAccess::Read,
+            harness_config::FsAccess::ReadWrite,
+            harness_config::FsAccess::ReadExec,
+        ] {
+            assert_ne!(
+                FsAccess::from_settings(access),
+                FsAccess::ReadWriteExec,
+                "the union may only come from combining two declarations"
+            );
+        }
+    }
+
     /// Windowsはフラグ無しでもTier2aを常時プローブする（Linuxのbwrapプローブと
     /// 対称的な構造）。preflight成功時はTier2aへ直接着地する。
     #[cfg(target_os = "windows")]
@@ -414,6 +640,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -422,12 +649,19 @@ mod tests {
         assert!(!selection.is_unisolated());
     }
 
-    /// 既定パスではTier2a preflightが失敗してもTier1へ暗黙降格しない。
+    /// 既定パスでTier2a preflightが失敗し、かつ**このユーザーは昇格できる**とき
+    /// （＝UACを断った・privhelperが失敗した等の一時的な失敗）は、起動時エラーにする。
+    /// ここを降格にすると、UACの押し間違い1回で保護が黙って外れる。
+    ///
+    /// `can_elevate_override`を明示するのは、**テストの結果を実行ホストの権限に
+    /// 依存させないため**である。省略すると開発機（管理者）では通り、非管理者の
+    /// CIでは別の分岐に入る、という環境依存のテストになる（B-08）。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_default_errors_when_tier2a_preflight_fails() {
+    fn windows_default_errors_when_tier2a_fails_but_the_user_could_have_elevated() {
         let probes = Probes {
             tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
+            can_elevate_override: Some(true),
             ..Default::default()
         };
         let err = select_tier_with_probes(
@@ -438,10 +672,113 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap_err();
         assert!(matches!(err, TierError::Unavailable { .. }));
+    }
+
+    /// **昇格できないユーザーは、宣言付きでTier0へ降格する。**
+    ///
+    /// Tier2aはtraverse ACE付与・netfilterd・ETWのいずれでも昇格を要求するので、
+    /// 昇格できない人はどうやってもTier2aへ到達しない。Tier1も代替にならない
+    /// （ビルド・テスト・`git commit`が通らない）ため、起動時エラーを返し続けるのは
+    /// 「使えない」と同義になる。Linuxが`bwrap`不在時にTier0へ降格するのと同じ形。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_downgrades_to_tier0_when_the_user_cannot_elevate_at_all() {
+        let probes = Probes {
+            tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
+            can_elevate_override: Some(false),
+            ..Default::default()
+        };
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            false,
+            false,
+            &[],
+            None,
+            &WorkspaceWriteMode::DirectRw,
+            None,
+            &probes,
+        )
+        .expect("a non-elevatable account must still be able to start");
+
+        assert_eq!(selection.tier, ShellTier::Tier0);
+        // **降格は必ず宣言する。** `downgraded_from`と`reason`は`prompt.rs`が
+        // 「本来Tier2aを試したがTier0へ降格した」としてモデルへ出す唯一の材料で、
+        // どちらかが欠けると「黙って保護が外れた」のと区別が付かない（B-11）。
+        assert_eq!(selection.downgraded_from, Some(ShellTier::Tier2a));
+        let reason = selection
+            .reason
+            .as_deref()
+            .expect("a downgrade without a reason is a silent downgrade");
+        assert!(
+            reason.contains("acl grant failed"),
+            "the original preflight failure must survive into the reason: {reason}"
+        );
+        assert!(
+            reason.contains("cannot elevate"),
+            "the reason must say why we stopped trying, not just what failed: {reason}"
+        );
+    }
+
+    /// 降格しても`--require-sandbox`は素通りしない。Tier0は`write-containment`を
+    /// 満たさないので、隔離を要求した起動は依然として失敗する（`satisfies`）。
+    /// **「既定を緩めた」と「要求を無視するようになった」は別**で、後者になっていないことを固定する。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_tier0_downgrade_still_fails_require_sandbox() {
+        let probes = Probes {
+            tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
+            can_elevate_override: Some(false),
+            ..Default::default()
+        };
+        let err = select_tier_with_probes(
+            RequireSandbox::WriteContainment,
+            &empty_root(),
+            false,
+            false,
+            &[],
+            None,
+            &WorkspaceWriteMode::DirectRw,
+            None,
+            &probes,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TierError::Insufficient { .. }),
+            "an explicit sandbox requirement must not be silently downgraded away: {err:?}"
+        );
+    }
+
+    /// 昇格できないユーザーでも、**Tier2aが成功するなら降格しない**。
+    /// 新しい分岐は失敗経路にだけ効くもので、成功経路を触っていないことを固定する
+    /// （B-06: 変更が届く範囲を「効かせたい所だけ」に限定できているか）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_does_not_downgrade_when_tier2a_succeeds_even_if_elevation_is_unavailable() {
+        let probes = Probes {
+            tier2a_preflight_override: Some(Ok(())),
+            can_elevate_override: Some(false),
+            ..Default::default()
+        };
+        let selection = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            false,
+            false,
+            &[],
+            None,
+            &WorkspaceWriteMode::DirectRw,
+            None,
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(selection.tier, ShellTier::Tier2a);
+        assert_eq!(selection.downgraded_from, None);
     }
 
     #[cfg(target_os = "windows")]
@@ -459,6 +796,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -481,6 +819,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap_err();
@@ -502,6 +841,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -523,6 +863,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -550,6 +891,7 @@ mod tests {
             &passthrough,
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -568,6 +910,9 @@ mod tests {
             tier2a_preflight_override: Some(Err(
                 "workspace FS I/O denied inside AppContainer".to_string()
             )),
+            // 昇格できるユーザーを固定する（できない場合はTier0へ降格し、`satisfies`が
+            // `Insufficient`で弾く——それは別のテストが見ている）。
+            can_elevate_override: Some(true),
             ..Default::default()
         };
         let err = select_tier_with_probes(
@@ -578,6 +923,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap_err();
@@ -599,6 +945,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -621,6 +968,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -645,6 +993,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -670,6 +1019,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap_err();
@@ -688,6 +1038,7 @@ mod tests {
         let probes = Probes {
             tier3_available_override: Some(Ok(())),
             tier2a_preflight_override: Some(Err("not tested here".to_string())),
+            can_elevate_override: Some(true),
             ..Default::default()
         };
         let err = select_tier_with_probes(
@@ -698,6 +1049,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap_err();
@@ -720,6 +1072,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -743,6 +1096,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -767,6 +1121,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap();
@@ -789,6 +1144,7 @@ mod tests {
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
+            None,
             &probes,
         )
         .unwrap_err();

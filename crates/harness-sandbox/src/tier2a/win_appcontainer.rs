@@ -44,20 +44,19 @@ use windows::Win32::Security::{
     AclSizeInformation, AddAce, AdjustTokenPrivileges, EqualSid, FreeSid, GetAce,
     GetAclInformation, GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor,
     LookupPrivilegeValueW, SetKernelObjectSecurity, SetSecurityDescriptorControl,
-    SetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE,
-    ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
-    DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, NO_INHERITANCE, OBJECT_INHERIT_ACE,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
-    SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED,
-    SE_RESTORE_NAME,
-    SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
-    TOKEN_PRIVILEGES_ATTRIBUTES, TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    SetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION,
+    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES,
+    NO_INHERITANCE, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    PSID, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL,
+    SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME, SID_AND_ATTRIBUTES,
+    TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_PRIVILEGES_ATTRIBUTES,
+    TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
-    READ_CONTROL, WRITE_DAC,
+    FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, READ_CONTROL,
+    WRITE_DAC,
 };
 use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
@@ -71,9 +70,9 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, GetExitCodeThread, InitializeProcThreadAttributeList, OpenProcessToken,
     ResumeThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
 use crate::shell_tier::{FsAccess, FsPassthrough, WorkspaceWriteMode};
@@ -264,6 +263,43 @@ fn ensure_profile_locked(name: &str) -> Result<OwnedContainerSid, AppContainerEr
     }
 }
 
+/// プロファイル名からSIDを導出する。**[`ensure_profile`]と違い、存在しなければ作らない。**
+///
+/// SIDは名前のハッシュから決定的に導出される（`DeriveAppContainerSidFromAppContainerName`）ので、
+/// 登録の有無に関わらず値は同じである。プロファイルが実在するかを問わない**撤収側**は、
+/// 必ずこちらを使うこと。
+///
+/// # なぜ撤収が`ensure_profile`を呼んではいけないのか（[BUG-101](../../../docs/bugs/BUG-101.md)）
+///
+/// `ensure_profile`は`CreateAppContainerProfile`を呼ぶので、**削除済みのプロファイルを
+/// 作り直す**。`harness fs revoke`は`revocable_profile_names()`（＝死んだセッションを含む）の
+/// 全部に対してこれを呼んでいたため、**ACEを剥がしに行くコマンドがOSの資源を作っていた**。
+/// 撤収は副作用を持たない操作でなければならない（B-01: 撤収は条件付き・作成は無条件、の逆型）。
+pub fn derive_profile_sid(name: &str) -> Result<OwnedContainerSid, AppContainerError> {
+    unsafe {
+        let name_w = wide(name);
+        let sid = DeriveAppContainerSidFromAppContainerName(PCWSTR(name_w.as_ptr()))
+            .map_err(|e| win32_err("DeriveAppContainerSidFromAppContainerName", e))?;
+        Ok(OwnedContainerSid(sid))
+    }
+}
+
+/// このプロセス（＝このセッション）がfs passthroughのACEを付与するときの**主体のSID文字列**。
+///
+/// [BUG-101] 付与した主体を台帳へ記録するため（`fs_passthrough_ledger::FsLedgerEntry::granted_sids`）に
+/// 要る。記録するのは`preflight`の呼び出し元（`harness-cli`の`run_agent`とポリシーエディタの
+/// パス2）だが、**主体を決めているのは`preflight`**なので、両者が同じ値を見ていることを
+/// 保証する必要がある。
+///
+/// ここは`current_profile_name()`からの決定的な導出で、`preflight`が使う
+/// `begin_session()`＋`ensure_profile()`と**同じ名前・同じ導出関数**を通る。ずれていないことは
+/// `preflight`が実行時に検算する（B-05: コンパイラが守らない複製には実行時の検算を置く）。
+/// 導出に失敗したら`None`——記録できなかったことを付与の失敗にはしない。
+pub fn current_session_grant_sid() -> Option<String> {
+    let name = crate::tier2a::session_profile::current_profile_name();
+    let sid = derive_profile_sid(&name).ok()?;
+    crate::win_common::sid_to_string(sid.as_psid()).ok()
+}
 
 // --- 責務別サブモジュール（docs/CODE-STRUCTURE-RULES.md 規則1/3） ---
 //
@@ -272,6 +308,10 @@ fn ensure_profile_locked(name: &str) -> Result<OwnedContainerSid, AppContainerEr
 // 公開項目はここでglob再エクスポートする。
 
 mod acl_grant;
+/// 撤収の**主体**を決める層（[BUG-101](../../../docs/bugs/BUG-101.md)欠陥②）。
+/// 「どのSIDのACEを剥がすか」を、名前から導出したSIDではなく**対象パスのDACLに実在するSID**
+/// から決める。`revoke`（剥がし方）とは責務が別なので分けている。
+mod revoke_subjects;
 /// 初回の救済walkを背景で回すジョブ（D-54）。**globではなく名前空間として公開する**
 /// ——`start`/`progress`/`wait_until_done`という短い名前は、それだけでは何のジョブか
 /// 分からないため（`grant_job::wait_until_done()`と書けば分かる）。
@@ -280,6 +320,8 @@ pub mod grant_job;
 /// ポリシーエディタのパス2が共有する（モジュールdoc参照）。
 mod launch;
 mod mcp_preflight;
+/// fs passthrough付与の進捗（同期区間からUIへ届ける唯一の口、`grant_job`と同じ形）。
+pub mod passthrough_progress;
 mod preflight;
 /// `preflight`が打つ実機プローブ（実際にAppContainer子を起こしてFS I/Oを試す層）。
 /// 決定（どのプローブをどの順で打つか）は`preflight`が持ち、ここは観測だけを持つ。
@@ -295,6 +337,7 @@ pub use mcp_preflight::*;
 pub use preflight::*;
 pub(crate) use preflight_probe::*;
 pub use revoke::*;
+pub use revoke_subjects::*;
 pub use spawn::*;
 pub use spawn_session::*;
 pub use traverse::*;

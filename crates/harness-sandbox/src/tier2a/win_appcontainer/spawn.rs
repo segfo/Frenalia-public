@@ -135,8 +135,10 @@ unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContainerError> {
                 )));
             }
         };
-        let load_library_addr =
-            GetProcAddress(kernel32, windows::core::PCSTR(c"LoadLibraryW".as_ptr() as *const u8));
+        let load_library_addr = GetProcAddress(
+            kernel32,
+            windows::core::PCSTR(c"LoadLibraryW".as_ptr() as *const u8),
+        );
         let Some(load_library_addr) = load_library_addr else {
             let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
             return Err(AppContainerError::Win32(
@@ -206,7 +208,9 @@ fn wait_cow_ready(ready_read: HANDLE, timeout: std::time::Duration) -> Result<()
     });
     match rx.recv_timeout(timeout) {
         Ok(true) => Ok(()),
-        Ok(false) => Err("redirector DLL signaled failure (hook install did not succeed)".to_string()),
+        Ok(false) => {
+            Err("redirector DLL signaled failure (hook install did not succeed)".to_string())
+        }
         Err(_) => Err(format!(
             "timed out after {timeout:?} waiting for redirector DLL ready signal"
         )),
@@ -418,7 +422,17 @@ pub fn spawn(
     net: NetworkCapability,
     cow: Option<CowInject<'_>>,
 ) -> Result<AppContainerChild, AppContainerError> {
-    spawn_with_workspace(exe, args, cwd, env, want_stdin, container_sid, net, cow, None)
+    spawn_with_workspace(
+        exe,
+        args,
+        cwd,
+        env,
+        want_stdin,
+        container_sid,
+        net,
+        cow,
+        None,
+    )
 }
 
 /// [`spawn`]の、**workspaceツリーへのアクセスを与える版**（D-54）。
@@ -463,18 +477,16 @@ pub fn spawn_with_workspace(
     }
 
     match net {
-        NetworkCapability::Deny => {
-            spawn_impl(
-                exe,
-                args,
-                cwd,
-                env,
-                want_stdin,
-                container_sid,
-                &capabilities,
-                cow,
-            )
-        }
+        NetworkCapability::Deny => spawn_impl(
+            exe,
+            args,
+            cwd,
+            env,
+            want_stdin,
+            container_sid,
+            &capabilities,
+            cow,
+        ),
         NetworkCapability::InternetClient => unsafe {
             let mut cap_sid = PSID::default();
             let sid_str = wide("S-1-15-3-1");
@@ -542,8 +554,8 @@ fn spawn_impl(
     // `appcontainer_pipe`は既にpackage SIDへのACL付与を済ませているため、名前付きイベントを
     // 別途ACL構成するより既存の実績あるパイプ生成経路を再利用する（stdio 3本と同じ扱い）。
     let ready_pipe = if cow.is_some() {
-        let (r, w) =
-            appcontainer_pipe(container_sid).map_err(|e| step("appcontainer_pipe(cow-ready)", e))?;
+        let (r, w) = appcontainer_pipe(container_sid)
+            .map_err(|e| step("appcontainer_pipe(cow-ready)", e))?;
         clear_inherit(r);
         Some((r, w))
     } else {
@@ -569,11 +581,15 @@ fn spawn_impl(
         // BUG-066: 綴りを揃えてから渡す（`normalize_cow_root`のdoc参照）。
         env_owned.push((
             "HARNESS_COW_WORKSPACE".to_string(),
-            normalize_cow_root(c.workspace_root).to_string_lossy().into_owned(),
+            normalize_cow_root(c.workspace_root)
+                .to_string_lossy()
+                .into_owned(),
         ));
         env_owned.push((
             "HARNESS_COW_UPPER".to_string(),
-            normalize_cow_root(c.upper_dir).to_string_lossy().into_owned(),
+            normalize_cow_root(c.upper_dir)
+                .to_string_lossy()
+                .into_owned(),
         ));
         env_owned.push((
             "HARNESS_COW_READY_HANDLE".to_string(),
@@ -826,7 +842,10 @@ mod normalize_cow_root_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let real = dir.path();
         let expected = normalize_cow_root(real);
-        assert!(expected.is_absolute(), "canonical form must be absolute: {expected:?}");
+        assert!(
+            expected.is_absolute(),
+            "canonical form must be absolute: {expected:?}"
+        );
         assert!(
             !expected.to_string_lossy().starts_with(r"\\?\"),
             "verbatim prefix must be stripped so nt_path_wide can prepend \\??\\: {expected:?}"

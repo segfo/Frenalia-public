@@ -40,7 +40,10 @@ fn collection_statistics_under_a_heavy_file_workload() {
     // 「`cargo build`級」の負荷にならない（前回の実測で247ファイルだった）。
     let mut touched = 0u64;
     walk_and_read(&repo_root, &mut touched, 60_000);
-    println!("workload: touched {touched} file(s) under {}", repo_root.display());
+    println!(
+        "workload: touched {touched} file(s) under {}",
+        repo_root.display()
+    );
 
     std::thread::sleep(DRAIN);
     let (starts, denials) = session.drain();
@@ -53,7 +56,8 @@ fn collection_statistics_under_a_heavy_file_workload() {
         outcome.events_lost,
         outcome.realtime_buffers_lost,
         if outcome.seen_events > 0 {
-            outcome.events_lost as f64 * 100.0 / (outcome.seen_events + outcome.events_lost as u64) as f64
+            outcome.events_lost as f64 * 100.0
+                / (outcome.seen_events + outcome.events_lost as u64) as f64
         } else {
             0.0
         }
@@ -352,13 +356,16 @@ fn attribution_rate_for_very_short_lived_children() {
         "[#1] of which attributed by parentage (harness is the parent, probe too late): {}",
         tracker.attributed_by_parentage_count()
     );
-    println!("[#1] events={} lost={}", outcome.seen_events, outcome.events_lost);
+    println!(
+        "[#1] events={} lost={}",
+        outcome.seen_events, outcome.events_lost
+    );
     println!(
         "[#1] NOTE: this is the WORST case -- every child had already exited before the drain. \
          In a real session the drain runs every 2s while children are working."
     );
 
-    crate::tier2a::session_profile::end_session(
+    let _ = crate::tier2a::session_profile::end_session(
         &crate::tier2a::win_appcontainer::revoke_session_grant,
     );
 }
@@ -473,7 +480,10 @@ fn can_harness_subscribe_to_the_security_auditing_provider() {
             })
             .take(60)
             .collect();
-        println!("[#c] current audit policy (read-only, {} line(s)):", interesting.len());
+        println!(
+            "[#c] current audit policy (read-only, {} line(s)):",
+            interesting.len()
+        );
         for line in &interesting {
             println!("[#c]   {}", line.trim());
         }

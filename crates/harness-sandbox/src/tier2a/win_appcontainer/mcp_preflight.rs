@@ -76,10 +76,9 @@ pub fn preflight_mcp_server(
                 root.display()
             )),
             None => match grant_ace_inheritable_access(&root, sid.as_psid(), FsAccess::ReadExec) {
-                Ok(()) => crate::tier2a::session_profile::record_mcp_granted_path(
-                    &profile_name,
-                    &root,
-                ),
+                Ok(()) => {
+                    crate::tier2a::session_profile::record_mcp_granted_path(&profile_name, &root)
+                }
                 Err(e) => warnings.push(format!(
                     "mcp {}: could not grant read+execute on {} ({e}). The server may still \
                      start if that path already allows ALL APPLICATION PACKAGES",
@@ -101,7 +100,8 @@ pub fn preflight_mcp_server(
         // capability（D-54）をトークンへ積まない（`spawn`は既定で積まない、D-38 §3.2で
         // workspaceは既定の許可対象ではない）ので、capability宛のACEはここでは主体にならない。
         let harness_dir_exists = workspace_root.join(".harness").exists();
-        let protected = protect_harness_control_dir_from_appcontainer(workspace_root, &[sid.as_psid()])?;
+        let protected =
+            protect_harness_control_dir_from_appcontainer(workspace_root, &[sid.as_psid()])?;
         // [BUG-084] 保護が1件も掛からなかったことを、このサーバの起動前に見せる。
         // ここは**第三者コードへworkspaceのACEを渡した直後**なので、制御面（D-05/D-09の層3、
         // 承認台帳の自己書換防止＝D-39）が実際に閉じたかどうかが最も効く場所である。
@@ -162,10 +162,7 @@ fn read_exec_roots(req: &McpPreflightRequest<'_>) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    fn req<'a>(
-        command: &'a Path,
-        arg_paths: &'a [PathBuf],
-    ) -> McpPreflightRequest<'a> {
+    fn req<'a>(command: &'a Path, arg_paths: &'a [PathBuf]) -> McpPreflightRequest<'a> {
         McpPreflightRequest {
             server_id: "docs",
             command,

@@ -154,32 +154,138 @@ pub(crate) fn smoke_test_harness_control_write_denied(
     )))
 }
 
-/// fs passthrough（D-13）の到達性プローブ用コマンド。`FS_IO_PROBE_COMMAND`と同じ
-/// 「実I/Oを試し終了コードで判定する」設計だが、catchブロックで例外メッセージをstdoutへ
-/// 出す点が異なる（D9: 到達不能時に生エラーを呼び出し元へ返すため）。
-const FS_PASSTHROUGH_RO_PROBE_COMMAND: &str = "\
+/// fs passthrough（D-13）の到達性プローブ用コマンド。**全エントリを1プロセスで測る。**
+///
+/// # なぜ1プロセスなのか（実測に基づく）
+///
+/// 以前はエントリ1件につきAppContainer内でPowerShellを1プロセス起こしていた。素の
+/// PowerShell 5.1の起動だけで**182ms/回**（この機での実測。AppContainer生成・Job Object・
+/// パイプ・実I/Oを含まない下限）なので、ポリシーエディタのように**workspace外の穴が
+/// 数百件**あるドメインでは、それだけで数分の無反応になる（実例: `cargo`ドメインの668件で
+/// 下限2分）。しかも「既に十分」で付与をスキップした2回目以降の実行でも同じ時間を払っていた
+/// ——UACを消しても待ち時間がそのまま残る形だった。
+///
+/// **診断の情報量は落としていない。** 判定は依然として「AppContainerの中から実I/Oを試す」
+/// ことで行い（D8）、失敗したエントリだけが`diagnose_unreachable_passthrough`（D9、
+/// 祖先チェーンのACL読取のみでプロセスを起こさない）へ回る。減ったのはプロセス起動の回数だけ。
+///
+/// # 入出力の形
+///
+/// - 標準入力: 1行1エントリ、`<mode>\t<path>`（`mode`は`ro`または`rw`）。
+///   **envではなくstdinで渡す**——環境変数ブロックには実用上の長さ上限があり、
+///   数百パスは載らない。
+/// - 標準出力: 1行1結果、`<index>\tOK` または `<index>\tERR\t<message>`。
+///   `index`は入力の**空でない行**の0起点連番。メッセージ中の空白は1つへ潰して1行に収める。
+///
+/// 制御文字は`` `t ``のようなバッククォート表記ではなく`[char]9`で書く——この文字列は
+/// Rustのリテラル→コマンドライン→PowerShellパーサと3層を通るので、層ごとの引用規則に
+/// 依存しない書き方にしておく。
+///
+/// # `rw`は対象がファイルかディレクトリかで手段を変える
+///
+/// `Test-Path -PathType Leaf`で判定する。ディレクトリは配下に一時ファイルを作って書込を試す
+/// （元の実装）。**単一の実行ファイル自体へ`fs.read_write`/`fs.read_exec`を宣言できるように
+/// なった**（ポリシーエディタ段階9、D-59のマスクの和）ことで、`granted`がファイルパスそのもの
+/// のケースが実機で初めて出た——`Join-Path <file> <uuid>.tmp`は`<file>`をディレクトリとして
+/// 扱うので「パスの一部が見つかりません」で必ず失敗する。ファイルの場合は
+/// `File.Open(..., FileAccess.ReadWrite, FileShare.ReadWrite)`で開いて即閉じるだけにする
+/// （内容は変更しない。共有モードを緩めるのは、対象が同時に他プロセスから読まれていても
+/// このプローブ自体の目的＝書込アクセス権の有無の確認には影響しないため）。
+const FS_PASSTHROUGH_BATCH_PROBE_COMMAND: &str = "\
     $ErrorActionPreference = 'Stop'; \
-    try { \
-        Get-ChildItem -LiteralPath $env:HARNESS_PASSTHROUGH_DIR -ErrorAction Stop | Out-Null; \
-        exit 0 \
-    } catch { \
-        Write-Output $_.Exception.Message; \
-        exit 3 \
+    $i = -1; \
+    foreach ($raw in [Console]::In.ReadToEnd().Split([char]10)) { \
+        $line = $raw.TrimEnd([char]13); \
+        if ($line.Length -eq 0) { continue }; \
+        $i++; \
+        $t = $line.IndexOf([char]9); \
+        $mode = $line.Substring(0, $t); \
+        $p = $line.Substring($t + 1); \
+        try { \
+            $isLeaf = Test-Path -LiteralPath $p -PathType Leaf; \
+            if ($mode -eq 'rw') { \
+                if ($isLeaf) { \
+                    $stream = [System.IO.File]::Open($p, [System.IO.FileMode]::Open, \
+                        [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite); \
+                    $stream.Close() \
+                } else { \
+                    $tmp = Join-Path $p ([Guid]::NewGuid().ToString() + '.harness-probe.tmp'); \
+                    New-Item -ItemType File -Path $tmp -Force | Out-Null; \
+                    Get-Content -LiteralPath $tmp | Out-Null; \
+                    Remove-Item -LiteralPath $tmp -Force \
+                } \
+            } else { \
+                if ($isLeaf) { \
+                    Get-Item -LiteralPath $p -ErrorAction Stop | Out-Null \
+                } else { \
+                    Get-ChildItem -LiteralPath $p -ErrorAction Stop | Out-Null \
+                } \
+            }; \
+            Write-Output ([string]$i + [char]9 + 'OK') \
+        } catch { \
+            Write-Output ([string]$i + [char]9 + 'ERR' + [char]9 + \
+                ($_.Exception.Message -replace '\\s+', ' ')) \
+        } \
     }";
 
-/// ro版と同じ設計のrw版（一時ファイルの作成→読取→削除まで試す）。
-const FS_PASSTHROUGH_RW_PROBE_COMMAND: &str = "\
-    $ErrorActionPreference = 'Stop'; \
-    try { \
-        $p = Join-Path $env:HARNESS_PASSTHROUGH_DIR ([Guid]::NewGuid().ToString() + '.harness-probe.tmp'); \
-        New-Item -ItemType File -Path $p -Force | Out-Null; \
-        Get-Content -LiteralPath $p | Out-Null; \
-        Remove-Item -LiteralPath $p -Force; \
-        exit 0 \
-    } catch { \
-        Write-Output $_.Exception.Message; \
-        exit 3 \
-    }";
+/// [`probe_passthrough_batch`]の結果。
+///
+/// **「測れなかった」を「到達可」と混ぜない**（B-10）。プローブを起こせなかったときに
+/// 全件`None`（到達可）を返すと、穴が壊れていても黙って通る。逆に全件へ同じ失敗文言を
+/// 詰めると、数百件の同一警告でユーザーの目を潰す（B-09/B-32）——1つの事実は1回だけ言う。
+pub(crate) enum BatchProbeOutcome {
+    /// プローブを実行できた。入力と**同じ順・同じ件数**の結果（`None`＝到達可）。
+    Measured(Vec<Option<String>>),
+    /// プローブ自体を起こせなかった。全件が未測定である、という1つの事実。
+    NotRun(String),
+}
+
+/// 入力行を組み立てる（純粋関数。実機・AppContainerなしで形を固定できる）。
+pub(crate) fn batch_probe_stdin(entries: &[FsPassthrough]) -> String {
+    let mut payload = String::new();
+    for fp in entries {
+        let mode = if fp.access.is_read_write() {
+            "rw"
+        } else {
+            "ro"
+        };
+        payload.push_str(mode);
+        payload.push('\t');
+        // パスに改行が入ることは通常ありえないが、入ったら行の対応がずれる。
+        // 潰さずに**空白へ置換**して、少なくとも件数のずれは起こさない。
+        payload.push_str(&fp.path.to_string_lossy().replace(['\r', '\n'], " "));
+        payload.push('\n');
+    }
+    payload
+}
+
+/// プローブのstdoutを、入力件数ぶんの結果へ写す（純粋関数）。
+///
+/// 行が欠けているエントリは**`None`（到達可）にしない**——測れなかったことをそう言う。
+pub(crate) fn parse_batch_probe_output(stdout: &str, count: usize) -> Vec<Option<String>> {
+    let mut seen: Vec<Option<Option<String>>> = vec![None; count];
+    for line in stdout.lines() {
+        let mut parts = line.split('\t');
+        let Some(index) = parts.next().and_then(|i| i.trim().parse::<usize>().ok()) else {
+            continue;
+        };
+        if index >= count {
+            continue;
+        }
+        seen[index] = Some(match parts.next() {
+            Some("OK") => None,
+            Some("ERR") => Some(parts.next().unwrap_or("(no message)").trim().to_string()),
+            _ => Some("probe returned an unrecognized result line".to_string()),
+        });
+    }
+    seen.into_iter()
+        .map(|result| {
+            result.unwrap_or(Some(
+                "the reachability probe produced no result for this path".to_string(),
+            ))
+        })
+        .collect()
+}
 
 /// D9診断の材料。**Win32の読み取り結果をここへ写してから判定へ渡す**ことで、判定側
 /// （[`describe_passthrough_chain`]）を実機・管理者権限なしに全数テストできる形に保つ
@@ -213,7 +319,9 @@ pub(crate) fn describe_passthrough_chain(
     let missing_ancestors: Vec<String> = facts
         .ancestors
         .iter()
-        .filter(|(_, mask)| !mask.is_some_and(|m| m & TRAVERSE_REQUIRED_MASK == TRAVERSE_REQUIRED_MASK))
+        .filter(|(_, mask)| {
+            !mask.is_some_and(|m| m & TRAVERSE_REQUIRED_MASK == TRAVERSE_REQUIRED_MASK)
+        })
         .map(|(node, mask)| match mask {
             Some(_) => format!(
                 "{} (has a traverse-capability ACE but missing FILE_TRAVERSE|FILE_READ_ATTRIBUTES)",
@@ -308,12 +416,11 @@ fn diagnose_unreachable_passthrough(
     describe_passthrough_chain(path, raw_message, &facts)
 }
 
-/// D8: passthroughルート1件へコンテナ内から実I/Oプローブ（疎通テスト）を行う。到達可なら
-/// `None`、到達不能なら診断メッセージ（D9）を返す。全体のTier選択には影響しない
-/// （`preflight`が結果を警告一覧として集約するだけで、壊れた穴以外は継続する）。
+/// 1件だけ測る版（実機E2Eが「この穴が到達可か」を単体で確かめるために使う）。
 ///
-/// `sid`は子プロセスを起動するセッションpackage SID、`traverse_sid`は祖先チェーンの
-/// 通過権を持つcapability SID。**両方を受けるのはD9診断が2系統を区別するため**（BUG-058）。
+/// **実装は[`probe_passthrough_batch`]ただ1つ**——判定を2つ持つと、片方だけが仕様変更に
+/// 追随しない（`docs/CODE-STRUCTURE-RULES.md`規則5）。本番の`preflight`はこちらを使わない。
+#[cfg(test)]
 pub(crate) fn probe_passthrough(
     sid: PSID,
     traverse_sid: PSID,
@@ -321,56 +428,185 @@ pub(crate) fn probe_passthrough(
     workspace_root: &Path,
     fp: &FsPassthrough,
 ) -> Option<String> {
+    match probe_passthrough_batch(
+        sid,
+        traverse_sid,
+        workspace_cap,
+        workspace_root,
+        std::slice::from_ref(fp),
+    ) {
+        BatchProbeOutcome::Measured(mut results) => results.pop().flatten(),
+        BatchProbeOutcome::NotRun(reason) => {
+            Some(format!("fs-allow {} : {reason}", fp.path.display()))
+        }
+    }
+}
+
+/// D8: passthroughルート**全件**へ、コンテナ内から実I/Oプローブ（疎通テスト）を行う。
+/// 到達可なら`None`、到達不能なら診断メッセージ（D9）を、入力と同じ順で返す。
+/// 全体のTier選択には影響しない（`preflight`が結果を警告一覧として集約するだけで、
+/// 壊れた穴以外は継続する）。
+///
+/// **プロセスは1つしか起こさない**（[`FS_PASSTHROUGH_BATCH_PROBE_COMMAND`]のdoc参照）。
+///
+/// `sid`は子プロセスを起動するセッションpackage SID、`traverse_sid`は祖先チェーンの
+/// 通過権を持つcapability SID。**両方を受けるのはD9診断が2系統を区別するため**（BUG-058）。
+///
+/// **呼ぶのは全ての付与が終わってから**にすること。昇格ヘルパー経由で祖先のtraverseが
+/// 直る場合があるので、付与の途中で測ると「直る前の状態」を到達不能として報告してしまう。
+pub(crate) fn probe_passthrough_batch(
+    sid: PSID,
+    traverse_sid: PSID,
+    workspace_cap: Option<PSID>,
+    workspace_root: &Path,
+    entries: &[FsPassthrough],
+) -> BatchProbeOutcome {
+    if entries.is_empty() {
+        return BatchProbeOutcome::Measured(Vec::new());
+    }
     let (shell, _) = resolve_shell();
-    let mut env = crate::secret_env::build_child_env();
-    env.push((
-        "HARNESS_PASSTHROUGH_DIR".to_string(),
-        fp.path.to_string_lossy().into_owned(),
-    ));
-    let command = if fp.access.is_read_write() {
-        FS_PASSTHROUGH_RW_PROBE_COMMAND
-    } else {
-        FS_PASSTHROUGH_RO_PROBE_COMMAND
-    };
+    let env = crate::secret_env::build_child_env();
     // 子のcwdは`workspace_root`なので、workspace capability（D-54）が無いと**プローブ対象の
     // 手前で**起動に失敗する。穴そのものの到達性を測るために、本番と同じ構成で起動する。
     let child = match spawn_with_workspace(
         &shell,
-        &["-NoProfile", "-NonInteractive", "-Command", command],
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            FS_PASSTHROUGH_BATCH_PROBE_COMMAND,
+        ],
         workspace_root,
         &env,
-        false,
+        // **`want_stdin: true`が要る。** 対象パスの一覧はstdinで渡すので、ここが`false`だと
+        // 子は`[Console]::In.ReadToEnd()`で空文字を読み、`foreach`が1周も回らず**出力が0行**に
+        // なる。他のプローブ（`smoke_test_spawn`等）はstdinを使わないので`false`で、
+        // それを写して1度踏んだ。
+        true,
         sid,
         NetworkCapability::Deny,
         None,
         workspace_cap,
     ) {
         Ok(child) => child,
-        Err(e) => {
-            return Some(format!(
-                "fs-allow {} : probe could not start: {e}",
-                fp.path.display()
-            ));
-        }
+        Err(e) => return BatchProbeOutcome::NotRun(format!("probe could not start: {e}")),
     };
-    match child.write_stdin_read_output_and_wait(None) {
-        Ok((_, _, 0)) => None,
-        Ok((stdout, _, _code)) => Some(diagnose_unreachable_passthrough(
-            sid,
-            traverse_sid,
-            &fp.path,
-            fp.access,
-            stdout.trim(),
-        )),
-        Err(e) => Some(format!(
-            "fs-allow {} : probe failed: {e}",
-            fp.path.display()
-        )),
-    }
+    let payload = batch_probe_stdin(entries);
+    let stdout = match child.write_stdin_read_output_and_wait(Some(payload.as_bytes())) {
+        // 終了コードは見ない——**個々の結果は行で返る**ので、プロセス全体の成否は
+        // 「行が返ったか」でしか意味を持たない（欠けた行は`parse_batch_probe_output`が拾う）。
+        Ok((stdout, _, _code)) => stdout,
+        Err(e) => return BatchProbeOutcome::NotRun(format!("probe failed: {e}")),
+    };
+
+    let raw = parse_batch_probe_output(&stdout, entries.len());
+    // 失敗したエントリだけをD9診断へ回す（祖先チェーンのACL読取のみ。プロセスは起こさない）。
+    BatchProbeOutcome::Measured(
+        entries
+            .iter()
+            .zip(raw)
+            .map(|(fp, message)| {
+                message.map(|message| {
+                    diagnose_unreachable_passthrough(
+                        sid,
+                        traverse_sid,
+                        &fp.path,
+                        fp.access,
+                        message.trim(),
+                    )
+                })
+            })
+            .collect(),
+    )
 }
 /// `fp`が要求するアクセスのうち、`preflight`が「既に十分」と判定するために必要な最小マスク
 /// （`grant_ace`/`grant_ace_ro`が実際に付与するマスクと同じ論理和。継承フラグの相違までは
 /// 見ない、`grant_ace_mask`の冪等スキップと同じ考え方）。
 pub(crate) fn required_passthrough_mask(access: FsAccess) -> u32 {
     fs_access_mask(access)
+}
+
+#[cfg(test)]
+mod batch_probe_tests {
+    use super::*;
+
+    fn entry(path: &str, access: FsAccess) -> FsPassthrough {
+        FsPassthrough {
+            path: std::path::PathBuf::from(path),
+            access,
+            forced: false,
+        }
+    }
+
+    /// 入力の形（1行1エントリ、`<mode>\t<path>`）を固定する。プローブ側のPowerShellが
+    /// この形を前提に`IndexOf([char]9)`で割るので、片方だけ変えると**全件が測れなくなる**
+    /// （しかも「測れなかった」は下の`parse`側で警告に落ちるので、静かには壊れない）。
+    #[test]
+    fn stdin_carries_one_line_per_entry_with_the_mode_first() {
+        let payload = batch_probe_stdin(&[
+            entry(r"C:\a", FsAccess::Read),
+            entry(r"C:\b", FsAccess::ReadWrite),
+            entry(r"C:\c", FsAccess::ReadExec),
+        ]);
+        assert_eq!(payload, "ro\tC:\\a\nrw\tC:\\b\nro\tC:\\c\n");
+    }
+
+    /// 改行を含むパスが来ても**行数はずれない**（ずれると結果が別のパスへ付く）。
+    #[test]
+    fn newlines_in_a_path_do_not_shift_the_line_numbering() {
+        let payload = batch_probe_stdin(&[
+            entry("C:\\a\nb", FsAccess::Read),
+            entry(r"C:\c", FsAccess::Read),
+        ]);
+        assert_eq!(payload.lines().count(), 2);
+        assert!(payload.starts_with("ro\tC:\\a b\n"));
+    }
+
+    #[test]
+    fn ok_and_err_lines_map_back_to_their_entries_in_order() {
+        let stdout = "0\tOK\n1\tERR\tAccess to the path is denied.\n2\tOK\n";
+        assert_eq!(
+            parse_batch_probe_output(stdout, 3),
+            vec![
+                None,
+                Some("Access to the path is denied.".to_string()),
+                None
+            ]
+        );
+    }
+
+    /// 出力の順序に依存しない（PowerShell側は順に出すが、それを前提にしない）。
+    #[test]
+    fn results_are_matched_by_index_not_by_position() {
+        let stdout = "2\tOK\n0\tERR\tboom\n1\tOK\n";
+        let results = parse_batch_probe_output(stdout, 3);
+        assert_eq!(results[0], Some("boom".to_string()));
+        assert_eq!(results[1], None);
+        assert_eq!(results[2], None);
+    }
+
+    /// **行が欠けたエントリを「到達可」にしない**（B-10: 測れなかったことをそう言う）。
+    /// ここが`None`になると、壊れた穴が黙って通る。
+    #[test]
+    fn a_missing_result_line_is_reported_not_treated_as_reachable() {
+        let results = parse_batch_probe_output("0\tOK\n", 3);
+        assert_eq!(results[0], None);
+        for missing in &results[1..] {
+            assert!(
+                missing.as_deref().is_some_and(|m| m.contains("no result")),
+                "a path the probe never answered for must not be reported as reachable: \
+                 {missing:?}"
+            );
+        }
+    }
+
+    /// 範囲外の添字・壊れた行は無視する（プローブの出力は昇格していない子プロセス由来なので、
+    /// 形が崩れていてもパニックしない）。欠けた分は上のルールで「測れなかった」になる。
+    #[test]
+    fn out_of_range_and_garbage_lines_do_not_panic() {
+        let results = parse_batch_probe_output("9\tOK\ngarbage\n\n0\tWAT\n", 1);
+        assert!(results[0]
+            .as_deref()
+            .is_some_and(|m| m.contains("unrecognized")));
+    }
 }

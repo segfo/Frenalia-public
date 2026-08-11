@@ -555,7 +555,10 @@ fn effective_changes(jail: &WorkspaceJail, overlay: &OverlayBackend) -> Vec<Effe
         .collect();
     let mut out: Vec<EffectiveChange> = ledger
         .into_iter()
-        .map(|change| EffectiveChange { change, unledgered: false })
+        .map(|change| EffectiveChange {
+            change,
+            unledgered: false,
+        })
         .collect();
     if !overlay.scan_for_unledgered {
         return out;
@@ -784,9 +787,8 @@ fn apply_ext_entry(
     overlay: &OverlayBackend,
     c: &harness_change_ledger::CowChange,
 ) -> Result<(), SandboxError> {
-    let key = store::ext_key(&c.path).map_err(|e| {
-        SandboxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-    })?;
+    let key = store::ext_key(&c.path)
+        .map_err(|e| SandboxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
     let rel = format!("_ext/{key}");
     let target = Path::new(&c.path);
     match c.op {
@@ -868,7 +870,10 @@ mod tests {
             .join(".harness/sandbox/s1/.harness-cow-baseline/a.txt");
         assert_eq!(std::fs::read_to_string(&baseline_abs).unwrap(), "original");
         // real workspace must stay untouched by staged writes.
-        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "original");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "original"
+        );
     }
 
     #[test]
@@ -935,7 +940,10 @@ mod tests {
         let changes = fs.change_set().unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].op, ChangeOp::Create);
-        assert_eq!(changes[0].path, harness_change_ledger::store::normalize_abs_path(&abs));
+        assert_eq!(
+            changes[0].path,
+            harness_change_ledger::store::normalize_abs_path(&abs)
+        );
     }
 
     /// `apply`はworkspace外エントリを`allow_ext`無しでは`ext_blocked`へ回し、実際には書かない。
@@ -1463,7 +1471,10 @@ mod tests {
         assert_eq!(changes[0].op, ChangeOp::Create);
         assert!(changes[0].unledgered);
         // 列挙（glob/grep）からも見えること＝「read_fileでは読めるのに一覧に出ない」を作らない。
-        assert!(fs.walk_files().unwrap().contains(&PathBuf::from("sub/direct.txt")));
+        assert!(fs
+            .walk_files()
+            .unwrap()
+            .contains(&PathBuf::from("sub/direct.txt")));
     }
 
     /// 実workspace側に実体が無い（＝純粋な新規作成）なら、失うものが無いので既定で適用する。
@@ -1551,7 +1562,8 @@ mod tests {
         let upper = tempfile::tempdir().unwrap();
         let fs = cow_fs(ws.path(), upper.path());
 
-        fs.write_string("Ledgered.txt", "written through the tool").unwrap();
+        fs.write_string("Ledgered.txt", "written through the tool")
+            .unwrap();
 
         let changes = fs.change_set().unwrap();
         assert_eq!(changes.len(), 1, "{changes:?}");

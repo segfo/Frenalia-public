@@ -28,9 +28,7 @@ pub enum ResolveError {
         "git not found in PATH (required for `git merge-file`); resolve these conflicts manually"
     )]
     GitNotFound,
-    #[error(
-        "no editor configured: set $VISUAL or $EDITOR (Windows falls back to notepad.exe)"
-    )]
+    #[error("no editor configured: set $VISUAL or $EDITOR (Windows falls back to notepad.exe)")]
     NoEditor,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -180,7 +178,13 @@ fn build_merge_attempt(
 
 fn sanitize_for_filename(path: &str) -> String {
     path.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -191,7 +195,11 @@ pub fn editor_command() -> Result<Command, ResolveError> {
     let editor = std::env::var("VISUAL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
         .or_else(|| {
             if cfg!(windows) {
                 Some("notepad.exe".to_string())
@@ -252,7 +260,8 @@ mod tests {
         let base = "line1\nline2\nline3\nline4\nline5\n";
         std::fs::write(dir.path().join("a.txt"), base).unwrap();
         let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
-        fs.write_string("a.txt", "line1-mine\nline2\nline3\nline4\nline5\n").unwrap();
+        fs.write_string("a.txt", "line1-mine\nline2\nline3\nline4\nline5\n")
+            .unwrap();
         // 外部から実workspaceを直接編集（apply/resolveが検知するTOCTOU相違）。
         std::fs::write(
             dir.path().join("a.txt"),
@@ -265,7 +274,10 @@ mod tests {
         assert!(prepared.skipped.is_empty());
         assert_eq!(prepared.attempts.len(), 1);
         let attempt = &prepared.attempts[0];
-        assert!(!attempt.needs_edit, "non-overlapping edits should auto-merge");
+        assert!(
+            !attempt.needs_edit,
+            "non-overlapping edits should auto-merge"
+        );
 
         let merged = std::fs::read_to_string(&attempt.merged_path).unwrap();
         assert_eq!(merged, "line1-mine\nline2\nline3\nline4\nline5-theirs\n");
@@ -316,8 +328,11 @@ mod tests {
         let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
         fs.write_string("a.txt", "mine\n").unwrap();
         // 本機能導入前に発生したコンフリクトを模して、baselineミラーだけを消す。
-        std::fs::remove_file(dir.path().join(".harness/sandbox/s1/.harness-cow-baseline/a.txt"))
-            .unwrap();
+        std::fs::remove_file(
+            dir.path()
+                .join(".harness/sandbox/s1/.harness-cow-baseline/a.txt"),
+        )
+        .unwrap();
         std::fs::write(dir.path().join("a.txt"), "theirs\n").unwrap();
 
         let (report, prepared) = prepare_resolve(&fs).unwrap();

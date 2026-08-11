@@ -69,151 +69,208 @@ pub fn serve(pipe_name: &str) -> Result<(), LearnError> {
     result
 }
 
-fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
-    // 1回目: StartCollect を待つ。
-    let request_bytes = read_framed_timeout(pipe, START_TIMEOUT)
-        .map_err(|e| LearnError::Ipc(format!("waiting for StartCollect: {e}")))?;
-    let policy = match serde_json::from_slice::<LearnRequest>(&request_bytes) {
-        Ok(LearnRequest::StartCollect(policy)) => policy,
-        Ok(LearnRequest::Teardown) => {
-            let _ = send(pipe, &LearnResponse::Err("expected StartCollect first".into()));
-            return Err(LearnError::Ipc("protocol violation".into()));
-        }
-        Err(e) => {
-            let _ = send(pipe, &LearnResponse::Err(format!("malformed request: {e}")));
-            return Err(LearnError::Ipc(format!("malformed request: {e}")));
-        }
-    };
+/// 収集**1世代**分の状態。`StartCollect`のたびに作り直す。
+///
+/// # 何ひとつ持ち越さない（D-56 段階2の核心）
+///
+/// netfilterdはフィルタを張り直すだけでよかったが、収集器は**要求ごとに状態を持ち越しては
+/// いけない**。持ち越すと次のように壊れる:
+///
+/// | 持ち越すもの | 何が起きるか |
+/// |---|---|
+/// | ETWセッション | 記録していない時間帯のイベントが次の記録へ混ざる |
+/// | [`ScopeTracker`] | 前の記録で覚えたPIDの帰属が次の記録の判定に使われる（PIDは再利用される） |
+/// | [`ProcessTree`] | 同上。しかも実行像が別プロセスのものとして載る |
+/// | `written` | `Stopped`の件数が累積になり、UIが出す「今回の件数」と食い違う |
+/// | `sink_path` | **前の記録のJSONLへ書き続ける**（記録1回＝1ディレクトリが崩れる） |
+///
+/// だから世代の状態は1つの構造体に閉じ、`StartCollect`で丸ごと作り直す。
+struct Generation {
+    /// `None`ならETWを張れなかった（D-43 fail-open。事実は制御レコードに残る）。
+    session: Option<EtwFsSession>,
+    sink_path: std::path::PathBuf,
+    tracker: ScopeTracker,
+    tree: ProcessTree,
+    dropped: Dropped,
+    written: u64,
+    record_all: bool,
+}
 
-    let sink_path = match validate_request(&policy) {
-        Ok(path) => path,
-        Err(message) => {
-            let _ = send(pipe, &LearnResponse::Err(message.clone()));
-            return Err(LearnError::Rejected(message));
-        }
-    };
-
-    // ETWセッションを張る。失敗しても**止めない**（D-43）——事実を制御レコードへ書いて
-    // 「収集できていない」ことを読む側へ伝えたうえで、Teardownまで待つ。
-    let session_name = format!("harness-policy-learn-{}", policy.session_profile);
-    let start_result = if policy.record_all {
-        EtwFsSession::start_record_all(&session_name)
-    } else {
-        EtwFsSession::start(&session_name)
-    };
-    let session = match start_result {
-        Ok(session) => Some(session),
-        Err(e) => {
-            append_control(&sink_path, &format!("etw_session_start_failed: {e}"));
-            None
-        }
-    };
-    if let Some(session) = session.as_ref() {
-        if !session.kernel_process_enabled() {
-            append_control(
-                &sink_path,
-                "kernel_process_provider_unavailable: scoping falls back to per-PID token \
-                 queries, which cannot resolve processes that already exited",
-            );
-        }
-    }
-    send(
-        pipe,
-        &LearnResponse::Started {
-            etw_available: session.is_some(),
-        },
-    )?;
-
-    // 2回目（Teardown、または親のクラッシュによるパイプ切断）を待ちながら、定期的にドレインする。
-    let mut tracker =
-        ScopeTracker::new(policy.session_profile.clone()).with_harness_pid(policy.harness_pid);
-    let volumes = drive_letter_map();
-    let mut written = 0u64;
-    let mut unconvertible = 0u64;
-    // record-allのツリー表示用。**ループの外**に置く（プロセスはあるバッチで起動し、
-    // 別のバッチでアクセスする）。deny-onlyモードでは使わない。
-    let mut tree = ProcessTree::new();
-
-    let teardown_result = loop {
-        match read_framed_timeout(pipe, DRAIN_INTERVAL) {
-            Ok(bytes) => break Ok(bytes),
+impl Generation {
+    /// 検証済みの要求からETWセッションを張る。**張れなくても`Some`を返す**（fail-open）。
+    fn start(policy: &LearnPolicy, sink_path: std::path::PathBuf) -> Self {
+        let session_name = format!("harness-policy-learn-{}", policy.session_profile);
+        let start_result = if policy.record_all {
+            EtwFsSession::start_record_all(&session_name)
+        } else {
+            EtwFsSession::start(&session_name)
+        };
+        let session = match start_result {
+            Ok(session) => Some(session),
             Err(e) => {
-                let message = e.to_string();
-                // タイムアウトはドレインの合図。それ以外（パイプ切断＝親の死）は撤収へ。
-                if !message.contains("timed out") && !message.contains("timeout") {
-                    break Err(message);
-                }
+                append_control(&sink_path, &format!("etw_session_start_failed: {e}"));
+                None
+            }
+        };
+        if let Some(session) = session.as_ref() {
+            if !session.kernel_process_enabled() {
+                append_control(
+                    &sink_path,
+                    "kernel_process_provider_unavailable: scoping falls back to per-PID token \
+                     queries, which cannot resolve processes that already exited",
+                );
             }
         }
-        if let Some(session) = session.as_ref() {
-            written += if policy.record_all {
-                let (starts, records) = session.drain_records();
-                flush_batch_record_all(
-                    &sink_path,
-                    &mut tracker,
-                    &mut tree,
-                    &volumes,
-                    starts,
-                    records,
-                    &mut unconvertible,
-                )
-            } else {
-                let (starts, denials) = session.drain();
-                flush_batch(
-                    &sink_path,
-                    &mut tracker,
-                    &volumes,
-                    starts,
-                    denials,
-                    &mut unconvertible,
-                )
-            };
+        Self {
+            session,
+            sink_path,
+            tracker: ScopeTracker::new(policy.session_profile.clone())
+                .with_harness_pid(policy.harness_pid),
+            tree: ProcessTree::new(),
+            dropped: Dropped::default(),
+            written: 0,
+            record_all: policy.record_all,
         }
-    };
+    }
 
-    // 最後の取り残しを回収し、統計を制御レコードとして残す。
-    if let Some(session) = session {
-        written += if policy.record_all {
+    fn etw_available(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// 溜まったイベントを1バッチ書き出す。
+    fn drain(&mut self, volumes: &[(String, String)]) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        self.written += if self.record_all {
             let (starts, records) = session.drain_records();
             flush_batch_record_all(
-                &sink_path,
-                &mut tracker,
-                &mut tree,
-                &volumes,
+                &self.sink_path,
+                &mut self.tracker,
+                &mut self.tree,
+                volumes,
                 starts,
                 records,
-                &mut unconvertible,
+                &mut self.dropped,
             )
         } else {
             let (starts, denials) = session.drain();
             flush_batch(
-                &sink_path,
-                &mut tracker,
-                &volumes,
+                &self.sink_path,
+                &mut self.tracker,
+                &mut self.tree,
+                volumes,
                 starts,
                 denials,
-                &mut unconvertible,
+                &mut self.dropped,
             )
         };
-        let outcome = session.stop();
-        record_collection_stats(&sink_path, &outcome, &tracker, unconvertible);
     }
 
-    let is_explicit_teardown = matches!(
-        &teardown_result,
-        Ok(bytes) if matches!(
-            serde_json::from_slice::<LearnRequest>(bytes),
-            Ok(LearnRequest::Teardown)
-        )
-    );
-    if is_explicit_teardown {
-        // 応答送信の失敗はここでは致命的としない（親が既に読み取りを諦めている可能性がある）。
-        let _ = send(
-            pipe,
-            &LearnResponse::TornDown {
-                denials_written: written,
-            },
-        );
+    /// 最後の取り残しを回収し、ETWセッションを止め、統計を制御レコードとして残す。
+    /// **この世代で**書けた件数を返す。
+    fn finish(mut self, volumes: &[(String, String)]) -> u64 {
+        self.drain(volumes);
+        if let Some(session) = self.session.take() {
+            let outcome = session.stop();
+            record_collection_stats(&self.sink_path, &outcome, &self.tracker, &self.dropped);
+        }
+        self.written
+    }
+}
+
+/// 要求の連続を捌く（D-56 段階2）。`Teardown`・パイプ切断・待機タイムアウトで終わる。
+fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
+    let volumes = drive_letter_map();
+    let mut current: Option<Generation> = None;
+
+    loop {
+        // 収集中はドレイン間隔で起き、待機中は長く待つ（エディタを開いたまま考えている
+        // 時間を待つのがD-56の目的そのもの）。
+        let timeout = if current.is_some() {
+            DRAIN_INTERVAL
+        } else {
+            START_TIMEOUT
+        };
+        let request_bytes = match read_framed_timeout(pipe, timeout) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let message = e.to_string();
+                let timed_out = message.contains("timed out") || message.contains("timeout");
+                if timed_out && current.is_some() {
+                    // 収集中のタイムアウトは「ドレインの合図」。
+                    if let Some(generation) = current.as_mut() {
+                        generation.drain(&volumes);
+                    }
+                    continue;
+                }
+                // 待機中のタイムアウト、またはパイプ切断（＝親の死）。**応答は送らない**
+                // ——送り先の親が既に存在しない可能性が高い。
+                break;
+            }
+        };
+
+        match serde_json::from_slice::<LearnRequest>(&request_bytes) {
+            Ok(LearnRequest::StartCollect(policy)) => {
+                if current.is_some() {
+                    // **黙って無視しない。** 無視すると親は「新しい記録が始まった」と思って
+                    // 前の世代の観測を今回の結果として読む（B-32）。
+                    let _ = send(
+                        pipe,
+                        &LearnResponse::Err(
+                            "already collecting; send StopCollect before StartCollect".into(),
+                        ),
+                    );
+                    continue;
+                }
+                // **要求ごとに検証をやり直す**（D-56 不変条件2）。1回目に通ったからといって
+                // 2回目のパスを信用しない——親は非特権で、攻撃者と同じ権限で動きうる（P-01）。
+                let sink_path = match validate_request(&policy) {
+                    Ok(path) => path,
+                    Err(message) => {
+                        let _ = send(pipe, &LearnResponse::Err(message));
+                        continue;
+                    }
+                };
+                let generation = Generation::start(&policy, sink_path);
+                let etw_available = generation.etw_available();
+                current = Some(generation);
+                send(pipe, &LearnResponse::Started { etw_available })?;
+            }
+            Ok(LearnRequest::StopCollect) => {
+                let written = match current.take() {
+                    Some(generation) => generation.finish(&volumes),
+                    None => 0,
+                };
+                send(pipe, &LearnResponse::Stopped { written })?;
+            }
+            Ok(LearnRequest::Teardown) => {
+                let written = match current.take() {
+                    Some(generation) => generation.finish(&volumes),
+                    None => 0,
+                };
+                // 応答送信の失敗はここでは致命的としない（親が既に読み取りを諦めている
+                // 可能性がある）。**収集していない状態でのTeardownも正常な要求**である
+                // ——「何も収集していない世代を畳んで終了する」だけ。
+                let _ = send(
+                    pipe,
+                    &LearnResponse::TornDown {
+                        denials_written: written,
+                    },
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // **接続は維持する。** 壊れた要求1件でdaemonを畳むと、回復可能な失敗が
+                // UACの追加1回になる（netfilterdの`ApplyRules`拒否と同じ扱い）。
+                let _ = send(pipe, &LearnResponse::Err(format!("malformed request: {e}")));
+            }
+        }
+    }
+
+    // 親が消えた経路。収集中なら畳んでから終わる（ETWセッションを残さない）。
+    if let Some(generation) = current.take() {
+        generation.finish(&volumes);
     }
     Ok(())
 }
@@ -234,19 +291,26 @@ fn validate_request(policy: &LearnPolicy) -> Result<std::path::PathBuf, String> 
 ///
 /// `ProcessStart`を**先に**食わせるのは、スコープ判定の「親が対象なら子も対象」が
 /// その情報に依存するため（同じバッチ内で子の拒否が先に来ても解決できるようにする）。
+///
+/// `tree`（プロセスの素性）は**record-all版と共通**である。かつてdeny-only側は
+/// `with_process(pid, None)`で実行像を載せていなかったが、そのままでは
+/// 「どのプロセスが拒否されたのか」がPIDでしか分からない（終了後は誰にも解決できない）。
+/// 片方のモードにだけ素性がある状態は、読む側（`Aggregate`）に2つの分岐を強いる（B-01）。
 fn flush_batch(
     sink_path: &Path,
     tracker: &mut ScopeTracker,
+    tree: &mut ProcessTree,
     volumes: &[(String, String)],
     starts: Vec<super::etw::session::ProcessStartInfo>,
     denials: Vec<Denial>,
-    unconvertible: &mut u64,
+    dropped: &mut Dropped,
 ) -> u64 {
     for start in &starts {
         // **ProcessStart時にprobeする**（拒否イベント時ではなく）。実測でharnessのAppContainerは
         // `PackageFullName`を報告しないと判明したため、第1世代を識別できるのはこのprobeだけで、
         // かつ`ProcessStart`の時点ならそのプロセスはまだ生きている（RESULTS.md §11）。
         tracker.on_process_start_probing(start, probe_pid_in_container);
+        remember_identity(tree, start, volumes, dropped);
     }
 
     let mut written = 0u64;
@@ -257,22 +321,61 @@ fn flush_batch(
         }
         let Some(path) = to_settings_path(&denial.file_name, volumes) else {
             // 設定へ書けない形（名前付きパイプ・未知のボリューム）。件数だけ数えて捨てる。
-            *unconvertible = unconvertible.saturating_add(1);
+            dropped.paths = dropped.paths.saturating_add(1);
             continue;
         };
-        let event = FsAuditEvent::denied(
+        let identity = tree.get(&denial.pid);
+        let mut event = FsAuditEvent::denied(
             FsAuditKind::Etw,
             path,
             denial.access,
             format!("STATUS_ACCESS_DENIED ({:#010X})", denial.status),
             denial.timestamp_unix_ms,
         )
-        .with_process(denial.pid, None);
+        .with_process(denial.pid, identity.and_then(|i| i.image_name.clone()));
+        if let Some(parent_pid) = identity.and_then(|i| i.parent_pid) {
+            event = event.with_parent_process(parent_pid);
+        }
         if append_event(sink_path, &event) {
             written += 1;
         }
     }
     written
+}
+
+/// `ProcessStart`から拾った素性を[`ProcessTree`]へ入れる。**実行像は設定パスへ寄せてから**入れる。
+///
+/// ETWが報告する`ImageName`はNT形式（`\Device\HarddiskVolume3\...`）である。ファイル名側
+/// （`FileName`）は既に[`to_settings_path`]を通しているのに実行像だけ生のままだったため、
+/// 読む側は同じJSONLの中に2種類の綴りを持つことになっていた。**変換はボリューム対応表を
+/// 持っているこちら側（昇格側）でしかできない**——非昇格の読み手は`\Device\HarddiskVolumeN`が
+/// どのドライブかを知らない。
+///
+/// 変換できないもの（未知のボリューム）は`None`にする。**生のNTパスを載せない**のは、
+/// それが読む側で「設定へ書ける値」と誤解され得るからで、代わりに件数を制御レコードへ出す。
+fn remember_identity(
+    tree: &mut ProcessTree,
+    start: &super::etw::session::ProcessStartInfo,
+    volumes: &[(String, String)],
+    dropped: &mut Dropped,
+) {
+    let image_name = match start.image_name.as_deref() {
+        Some(raw) => match to_settings_path(raw, volumes) {
+            Some(path) => Some(path),
+            None => {
+                dropped.images = dropped.images.saturating_add(1);
+                None
+            }
+        },
+        None => None,
+    };
+    tree.insert(
+        start.pid,
+        ProcessIdentity {
+            parent_pid: start.parent_pid,
+            image_name,
+        },
+    );
 }
 
 /// [`flush_batch`]のrecord-all版（`LearnPolicy.record_all`、ポリシー定義モードのTier1パス）。
@@ -295,17 +398,11 @@ fn flush_batch_record_all(
     volumes: &[(String, String)],
     starts: Vec<super::etw::session::ProcessStartInfo>,
     records: Vec<AccessRecord>,
-    unconvertible: &mut u64,
+    dropped: &mut Dropped,
 ) -> u64 {
     for start in &starts {
         tracker.on_process_start_probing(start, |_pid| None);
-        tree.insert(
-            start.pid,
-            ProcessIdentity {
-                parent_pid: start.parent_pid,
-                image_name: start.image_name.clone(),
-            },
-        );
+        remember_identity(tree, start, volumes, dropped);
     }
 
     let mut written = 0u64;
@@ -316,13 +413,18 @@ fn flush_batch_record_all(
         }
         let Some(path) = to_settings_path(&record.file_name, volumes) else {
             // 設定へ書けない形（名前付きパイプ・未知のボリューム）。件数だけ数えて捨てる。
-            *unconvertible = unconvertible.saturating_add(1);
+            dropped.paths = dropped.paths.saturating_add(1);
             continue;
         };
-        let reason = if record.allowed {
-            "observed".to_string()
-        } else {
-            format!("STATUS_ACCESS_DENIED ({:#010X})", record.status)
+        // **statusの名前を決め打ちにしない。** `allowed`が偽なのは`STATUS_ACCESS_DENIED`のときだけ
+        // だが、成功以外のNTSTATUS（`OBJECT_NAME_NOT_FOUND`等）も`allowed=true`として届く。
+        // 名前と実際のコードが食い違う文言を残すと、後から読む側が誤読する（B-32）。
+        let reason = match record.status {
+            0 => "observed".to_string(),
+            super::etw::parse::STATUS_ACCESS_DENIED => {
+                format!("STATUS_ACCESS_DENIED ({:#010X})", record.status)
+            }
+            status => format!("observed (NTSTATUS {status:#010X})"),
         };
         let identity = tree.get(&record.pid);
         let mut event = FsAuditEvent::observed(
@@ -333,10 +435,10 @@ fn flush_batch_record_all(
             reason,
             record.timestamp_unix_ms,
         )
-        .with_process(
-            record.pid,
-            identity.and_then(|i| i.image_name.clone()),
-        );
+        .with_process(record.pid, identity.and_then(|i| i.image_name.clone()))
+        // NTSTATUSを残す。「開けた」と「探しに行ったが無かった」は、これが無いと区別できない
+        // （`FsAuditEvent::target_was_missing`）。
+        .with_status(record.status);
         // 親PIDが分かるのは`ProcessStart`を観測できた世代だけ。分からないものは
         // `None`のまま残す（推測で埋めない——ツリー表示が嘘の親子関係を描くため）。
         if let Some(parent_pid) = identity.and_then(|i| i.parent_pid) {
@@ -360,6 +462,19 @@ struct ProcessIdentity {
     image_name: Option<String>,
 }
 
+/// **設定へ書けなかったので捨てた件数。** 捨てたこと自体は必ず数える（D-43・B-09）——
+/// 「観測できなかった」と「書けない形だったので落とした」は、読む側にとって別の事実である。
+///
+/// 2つを1つの構造体に束ねているのは、[`flush_batch`]系の引数が増えすぎて
+/// 「どちらの`&mut u64`か」が呼び出し側で見分けられなくなったため。
+#[derive(Debug, Default)]
+struct Dropped {
+    /// アクセス先のパス（名前付きパイプ・未知のボリューム）。
+    paths: u64,
+    /// プロセスの実行像（未知のボリューム）。`fs.read_exec`の候補にできない分である。
+    images: u64,
+}
+
 /// PID → 素性。**PID再利用は上書きで扱う**（新しい`ProcessStart`が来たら古い素性を捨てる）。
 /// [`ScopeTracker`]が`ProcessSequenceNumber`で行っている扱いと同じ方針だが、
 /// こちらは表示用なので順序の逆転までは追わない。
@@ -370,8 +485,19 @@ fn record_collection_stats(
     sink_path: &Path,
     outcome: &super::etw::session::EtwFsOutcome,
     tracker: &ScopeTracker,
-    unconvertible: u64,
+    dropped: &Dropped,
 ) {
+    if dropped.images > 0 {
+        append_control(
+            sink_path,
+            &format!(
+                "unconvertible_image_paths: {} process(es) started from an image path that cannot \
+                 be expressed in settings (unmapped volume), so they carry no image_path and \
+                 cannot become fs.read_exec proposals",
+                dropped.images
+            ),
+        );
+    }
     if outcome.events_lost > 0 || outcome.realtime_buffers_lost > 0 {
         append_control(
             sink_path,
@@ -382,12 +508,13 @@ fn record_collection_stats(
             ),
         );
     }
-    if unconvertible > 0 {
+    if dropped.paths > 0 {
         append_control(
             sink_path,
             &format!(
-                "unconvertible_paths: {unconvertible} event(s) had a path that cannot be \
-                 expressed in settings (named pipes, unmapped volumes) and were dropped"
+                "unconvertible_paths: {} event(s) had a path that cannot be expressed in settings \
+                 (named pipes, unmapped volumes) and were dropped",
+                dropped.paths
             ),
         );
     }
@@ -497,8 +624,8 @@ fn send(pipe: HANDLE, response: &LearnResponse) -> Result<(), LearnError> {
 
 #[cfg(test)]
 mod flush_batch_record_all_tests {
-    use super::*;
     use super::super::etw::session::ProcessStartInfo;
+    use super::*;
     use harness_config::FsAccess;
 
     fn read_lines(path: &Path) -> Vec<serde_json::Value> {
@@ -519,7 +646,7 @@ mod flush_batch_record_all_tests {
         let sink_path = dir.path().join("fs-audit.jsonl");
         let mut tracker = ScopeTracker::new("").with_harness_pid(Some(100));
         let volumes = drive_letter_map();
-        let mut unconvertible = 0u64;
+        let mut dropped = Dropped::default();
 
         let starts = vec![ProcessStartInfo {
             pid: 200,
@@ -556,7 +683,7 @@ mod flush_batch_record_all_tests {
             &volumes,
             starts,
             records,
-            &mut unconvertible,
+            &mut dropped,
         );
 
         assert_eq!(written, 2);
@@ -569,7 +696,7 @@ mod flush_batch_record_all_tests {
             .as_str()
             .unwrap()
             .contains("STATUS_ACCESS_DENIED"));
-        assert_eq!(unconvertible, 0);
+        assert_eq!(dropped.paths, 0);
     }
 
     /// `harness_pid`のブートストラップに繋がらないPID（親子関係が一切分からない）は
@@ -581,7 +708,7 @@ mod flush_batch_record_all_tests {
         let sink_path = dir.path().join("fs-audit.jsonl");
         let mut tracker = ScopeTracker::new("");
         let volumes = drive_letter_map();
-        let mut unconvertible = 0u64;
+        let mut dropped = Dropped::default();
 
         let records = vec![AccessRecord {
             file_name: r"C:\work\Cargo.toml".to_string(),
@@ -600,7 +727,7 @@ mod flush_batch_record_all_tests {
             &volumes,
             Vec::new(),
             records,
-            &mut unconvertible,
+            &mut dropped,
         );
 
         assert_eq!(written, 0);
@@ -614,7 +741,7 @@ mod flush_batch_record_all_tests {
         let sink_path = dir.path().join("fs-audit.jsonl");
         let mut tracker = ScopeTracker::new("").with_harness_pid(Some(100));
         let volumes = drive_letter_map();
-        let mut unconvertible = 0u64;
+        let mut dropped = Dropped::default();
 
         let starts = vec![ProcessStartInfo {
             pid: 200,
@@ -640,16 +767,20 @@ mod flush_batch_record_all_tests {
             &volumes,
             starts,
             records,
-            &mut unconvertible,
+            &mut dropped,
         );
 
         assert_eq!(written, 0);
-        assert_eq!(unconvertible, 1);
+        assert_eq!(dropped.paths, 1);
     }
 
     /// **`parent_process_id`/`image_path`に実際に書き手が居ることの回帰テスト。**
     /// この2つはプロセスツリー表示のために足されたが、当初は代入箇所が本番に1つも無く、
     /// 永久に`None`のままだった（B-01「対の片方だけ実装」）。
+    ///
+    /// **`image_path`は設定パスの綴りで載る**（`file_name`側と同じ）。ETWが報告する
+    /// `ImageName`はNT形式なので、載せる前に`to_settings_path`を通す——ここが生のままだと、
+    /// 同じJSONLに2種類の綴りが混在し、読む側が`fs.read_exec`の候補にできない。
     #[test]
     fn records_carry_the_parent_pid_and_image_name_from_process_start() {
         let dir = tempfile::tempdir().unwrap();
@@ -657,12 +788,12 @@ mod flush_batch_record_all_tests {
         let mut tracker = ScopeTracker::new("").with_harness_pid(Some(100));
         let mut tree = ProcessTree::new();
         let volumes = drive_letter_map();
-        let mut unconvertible = 0u64;
+        let mut dropped = Dropped::default();
 
         let starts = vec![ProcessStartInfo {
             pid: 200,
             parent_pid: Some(100),
-            image_name: Some("cargo.exe".to_string()),
+            image_name: Some(r"C:\Users\me\.cargo\bin\cargo.exe".to_string()),
             package_full_name: None,
             process_sequence_number: Some(1),
         }];
@@ -683,13 +814,69 @@ mod flush_batch_record_all_tests {
             &volumes,
             starts,
             records,
-            &mut unconvertible,
+            &mut dropped,
         );
 
         let lines = read_lines(&sink_path);
         assert_eq!(lines[0]["process_id"], 200);
         assert_eq!(lines[0]["parent_process_id"], 100);
-        assert_eq!(lines[0]["image_path"], "cargo.exe");
+        assert_eq!(
+            lines[0]["image_path"], "C:/Users/me/.cargo/bin/cargo.exe",
+            "the image path must be written in the settings spelling, not the raw NT/DOS one"
+        );
+        assert_eq!(dropped.images, 0);
+    }
+
+    /// **設定パスへ寄せられない実行像は載せず、件数だけ数える。**
+    ///
+    /// 載せてしまうと、読む側はそれを`fs.read_exec`の候補値として使い、設定へ書けない
+    /// （あるいは相対パスとして誤解される）値を提案することになる。落としたことは
+    /// 制御レコードに出るので「観測できなかった」とは区別できる（D-43・B-09）。
+    #[test]
+    fn an_image_path_that_cannot_be_expressed_in_settings_is_dropped_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("fs-audit.jsonl");
+        let mut tracker = ScopeTracker::new("").with_harness_pid(Some(100));
+        let mut tree = ProcessTree::new();
+        let volumes = drive_letter_map();
+        let mut dropped = Dropped::default();
+
+        let starts = vec![ProcessStartInfo {
+            pid: 200,
+            parent_pid: Some(100),
+            // ボリュームを解決できない形（実運用では未マップのボリューム）。
+            image_name: Some(r"\Device\HarddiskVolume999\tool.exe".to_string()),
+            package_full_name: None,
+            process_sequence_number: Some(1),
+        }];
+        let records = vec![AccessRecord {
+            file_name: r"C:\work\Cargo.toml".to_string(),
+            pid: 200,
+            access: FsAccess::Read,
+            status: 0,
+            allowed: true,
+            timestamp_unix_ms: 1,
+            create_options: 0,
+        }];
+
+        flush_batch_record_all(
+            &sink_path,
+            &mut tracker,
+            &mut tree,
+            &volumes,
+            starts,
+            records,
+            &mut dropped,
+        );
+
+        let lines = read_lines(&sink_path);
+        assert_eq!(lines.len(), 1, "the access itself is still recorded");
+        assert!(
+            lines[0].get("image_path").is_none(),
+            "a path that cannot be written into settings must not be published as one: {:?}",
+            lines[0]
+        );
+        assert_eq!(dropped.images, 1);
     }
 
     /// **素性はバッチをまたいで生き残る。** プロセスはあるバッチの`ProcessStart`で現れ、
@@ -702,7 +889,7 @@ mod flush_batch_record_all_tests {
         let mut tracker = ScopeTracker::new("").with_harness_pid(Some(100));
         let mut tree = ProcessTree::new();
         let volumes = drive_letter_map();
-        let mut unconvertible = 0u64;
+        let mut dropped = Dropped::default();
 
         // バッチ1: ProcessStartだけが届く（アクセスはまだ無い）。
         flush_batch_record_all(
@@ -713,12 +900,12 @@ mod flush_batch_record_all_tests {
             vec![ProcessStartInfo {
                 pid: 200,
                 parent_pid: Some(100),
-                image_name: Some("rustc.exe".to_string()),
+                image_name: Some(r"C:\tools\rustc.exe".to_string()),
                 package_full_name: None,
                 process_sequence_number: Some(1),
             }],
             Vec::new(),
-            &mut unconvertible,
+            &mut dropped,
         );
 
         // バッチ2: そのプロセスのアクセスだけが届く。
@@ -737,13 +924,60 @@ mod flush_batch_record_all_tests {
                 timestamp_unix_ms: 2,
                 create_options: 0,
             }],
-            &mut unconvertible,
+            &mut dropped,
         );
 
         let lines = read_lines(&sink_path);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["parent_process_id"], 100);
-        assert_eq!(lines[0]["image_path"], "rustc.exe");
+        assert_eq!(lines[0]["image_path"], "C:/tools/rustc.exe");
+    }
+
+    /// **deny-only側の拒否レコードにも実行像が載る。**
+    ///
+    /// かつてこちらは`with_process(pid, None)`で、拒否したプロセスがPIDでしか分からなかった
+    /// （プロセスが終了した後は誰にも解決できない）。record-all側にだけ素性があると、
+    /// 読む側は同じJSONLに2つの形を想定することになる（B-01: 対の片方だけ実装しない）。
+    #[test]
+    fn denial_records_also_carry_the_image_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("fs-audit.jsonl");
+        let mut tracker = ScopeTracker::new("").with_harness_pid(Some(100));
+        let mut tree = ProcessTree::new();
+        let volumes = drive_letter_map();
+        let mut dropped = Dropped::default();
+
+        let starts = vec![ProcessStartInfo {
+            pid: 200,
+            parent_pid: Some(100),
+            image_name: Some(r"C:\Users\me\.cargo\bin\cargo.exe".to_string()),
+            package_full_name: None,
+            process_sequence_number: Some(1),
+        }];
+        let denials = vec![Denial {
+            file_name: r"C:\secret\keys.txt".to_string(),
+            pid: 200,
+            access: FsAccess::Read,
+            status: 0xC000_0022,
+            timestamp_unix_ms: 3,
+            create_options: 0,
+        }];
+
+        let written = flush_batch(
+            &sink_path,
+            &mut tracker,
+            &mut tree,
+            &volumes,
+            starts,
+            denials,
+            &mut dropped,
+        );
+
+        assert_eq!(written, 1);
+        let lines = read_lines(&sink_path);
+        assert_eq!(lines[0]["allowed"], false);
+        assert_eq!(lines[0]["image_path"], "C:/Users/me/.cargo/bin/cargo.exe");
+        assert_eq!(lines[0]["parent_process_id"], 100);
     }
 
     /// 記録モードが実際に送る`session_profile`は、昇格側の`validate_request`が使う

@@ -120,11 +120,21 @@ fn ledger() -> Ledger<SessionLedger> {
 
 // --- 回収判定（純粋関数。Win32もファイルも触らない） ---
 
-/// 回収対象1件。`granted_paths`が空なら「台帳を失ったのでプロファイル削除だけ行う」ケース。
+/// 回収対象1件。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReclaimTarget {
     pub profile_name: String,
     pub granted_paths: Vec<String>,
+    /// **このプロファイルが何を付与したかを台帳から復元できたか。**
+    ///
+    /// `false`＝台帳エントリが失われており、`granted_paths`が空なのは
+    /// 「付与が無かった」ではなく「**分からない**」を意味する。この2つは絶対に混ぜない
+    /// ——混ぜると「剥がすものが無い」と読んでプロファイルを消してしまう。
+    ///
+    /// プロファイル名を失うとSIDが導出できなくなり、そのSID宛のACEは
+    /// **どのコマンドでも剥がせない孤児**になる（BUG-101で`%TEMP%`に1件実在した）。
+    /// したがって`grants_known == false`のものは**削除しない**（名前を残す＝回収可能性を残す）。
+    pub grants_known: bool,
 }
 
 /// harness由来のプロファイル名からセッショントークンを取り出す。
@@ -148,8 +158,9 @@ pub fn token_of_profile(name: &str) -> Option<&str> {
 ///
 /// - 台帳にあり、生存マーカーが無い → そのパスのACEを剥がしてプロファイルを消す
 ///   （`run_shell`用プロファイルと、そのセッションが起動したMCPサーバのプロファイルの両方）
-/// - 台帳に無いが接頭辞付きプロファイルが実在し、生存マーカーも無い → プロファイルだけ消す
-///   （台帳が失われた場合の回収経路。モジュールdoc参照）
+/// - 台帳に無いが接頭辞付きプロファイルが実在し、生存マーカーも無い → `grants_known: false`。
+///   **プロファイルは消さない**（BUG-101。かつては「プロファイルだけ消す」としていたが、
+///   それは付与済みACEを永久に回収不能にする操作だった。詳細は[`ReclaimTarget::grants_known`]）
 /// - 生存マーカーがある → 触らない（実行中の他セッション）
 pub fn plan_reclaim(
     ledger: &SessionLedger,
@@ -164,11 +175,13 @@ pub fn plan_reclaim(
         targets.push(ReclaimTarget {
             profile_name: entry.profile_name.clone(),
             granted_paths: entry.granted_paths.clone(),
+            grants_known: true,
         });
         for mcp in &entry.mcp {
             targets.push(ReclaimTarget {
                 profile_name: mcp.profile_name.clone(),
                 granted_paths: mcp.granted_paths.clone(),
+                grants_known: true,
             });
         }
     }
@@ -191,6 +204,7 @@ pub fn plan_reclaim(
             targets.push(ReclaimTarget {
                 profile_name: name.clone(),
                 granted_paths: Vec::new(),
+                grants_known: false,
             });
         }
     }
@@ -236,12 +250,17 @@ mod win {
             .collect()
     }
 
-    pub(super) fn delete_profile(name: &str) {
+    /// プロファイルを削除する。**戻り値を捨てないこと**——削除に失敗したのに台帳エントリを
+    /// 消すと、そのプロファイルは「台帳に無いが実在する」分類へ落ち、次のGCが
+    /// `grants_known: false`として拾う。そこで削除してしまうとSIDが二度と導出できなくなり、
+    /// **そのSID宛のACEはどのコマンドでも剥がせない孤児になる**（BUG-101）。
+    pub(super) fn delete_profile(name: &str) -> Result<(), String> {
         unsafe {
             let w = crate::win_common::wide(name);
-            let _ = windows::Win32::Security::Isolation::DeleteAppContainerProfile(
-                windows::core::PCWSTR(w.as_ptr()),
-            );
+            windows::Win32::Security::Isolation::DeleteAppContainerProfile(windows::core::PCWSTR(
+                w.as_ptr(),
+            ))
+            .map_err(|e| e.to_string())
         }
     }
 }
@@ -258,7 +277,9 @@ mod win {
     pub(super) fn existing_profiles() -> Vec<String> {
         Vec::new()
     }
-    pub(super) fn delete_profile(_name: &str) {}
+    pub(super) fn delete_profile(_name: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// このセッションの生存マーカーを立て、台帳へ登録する（プロファイル自体の作成は
@@ -284,12 +305,36 @@ pub fn begin_session() -> Result<String, String> {
 
 /// このセッションがACEを付けたパスを台帳へ記録する（撤収時に剥がす対象）。
 pub fn record_granted_path(path: &Path) {
+    record_granted_paths(std::slice::from_ref(&path.to_path_buf()));
+}
+
+/// 複数パスを**1回の台帳更新で**記録する。
+///
+/// # なぜ要るか（実測）
+///
+/// `Ledger::update`は1回ごとに「ロック取得 → 全文読取 → パース → 直列化 →
+/// **`.bak`へ全文コピー** → 読取専用属性を外す → 全文書込 → 読取専用へ戻す」を行います。
+/// この台帳はこの開発機で**66KB**あるので、1件あたり約200KBのファイルI/Oです。
+/// workspace外のルートが668件あるドメインでは**約130MB**になり、数秒かかります。
+///
+/// **1件もACEを書いていない実行でも同じだけ払う**のが特に悪い点でした——
+/// `already_sufficient`（前回の付与が生きているのでWin32を1回も呼ばない経路）でも、
+/// 「このセッションが撤収責任を負う」記録は必要なので毎回呼ばれます（BUG-057）。
+///
+/// **ループの中で`update`を呼ばない。** 台帳のAPIは「1件足す」ように見えますが、
+/// 実体は全文の読み書きです。
+pub fn record_granted_paths(paths: &[std::path::PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
     let token = session_token();
-    let path_str = path.to_string_lossy().into_owned();
     ledger().update(|l| {
         if let Some(entry) = l.sessions.iter_mut().find(|e| e.token == token) {
-            if !entry.granted_paths.contains(&path_str) {
-                entry.granted_paths.push(path_str);
+            for path in paths {
+                let path_str = path.to_string_lossy().into_owned();
+                if !entry.granted_paths.contains(&path_str) {
+                    entry.granted_paths.push(path_str);
+                }
             }
         }
     });
@@ -359,19 +404,142 @@ pub fn record_mcp_granted_path(profile_name: &str, path: &Path) {
 /// 呼び出し元から注入する（このモジュールはACL APIを知らない＝規則3の分割線）。
 ///
 /// **順序が重要**: ACEを剥がしてから最後にプロファイルを削除する（モジュールdoc参照）。
-fn reclaim_targets(targets: &[ReclaimTarget], revoke: &dyn Fn(&Path, &str)) {
+///
+/// # 削除してよい条件（BUG-101）
+///
+/// プロファイル名を消すとSIDが導出できなくなり、そのSID宛に残っているACEは
+/// **どのコマンドでも剥がせない孤児**になります。したがって削除は
+/// **「このプロファイルが何を付与したかを台帳から復元できた」場合に限り**行います
+/// （`grants_known`）。復元できないものは名前を残す——回収可能性を残す方が、
+/// プロファイルが1件積もることよりはるかに安全です。
+///
+/// **台帳エントリを消すのは、プロファイルを実際に削除できたときだけ**です。
+/// 削除に失敗したのにエントリを消すと、次のGCから見て「台帳に無いが実在する」＝
+/// `grants_known: false`へ落ち、以後この関数は二度とそのACEを剥がせなくなります。
+///
+/// 戻り値は[`ReclaimOutcome`]（B-09: 多段の副作用は件数を返す）。
+/// 撤収コールバックの戻り値＝**剥がせなかったノードと理由**（空なら完全に剥がせた）。
+///
+/// [BUG-103] かつてコールバックは`()`を返しており、`revoke_session_grant`の中で
+/// `let _ = revoke_ace_recursive(...)`と捨てられていた。撤収が1件も成功しなくても
+/// 呼び出し側からは成功と区別が付かず、実マシンに`(OI)(CI)(R,W,D)`が残り続けた（B-09）。
+///
+/// このモジュールはACL APIを知らない（規則3の分割線）ので、ACL側の型
+/// （`win_appcontainer::RevokeReport`）ではなく素のデータで受け取る。
+pub type RevokeLeftovers = Vec<(PathBuf, String)>;
+
+fn reclaim_targets(
+    targets: &[ReclaimTarget],
+    revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers,
+) -> ReclaimOutcome {
+    let mut outcome = ReclaimOutcome::default();
+    let mut deleted: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for target in targets {
-        for path in &target.granted_paths {
-            revoke(Path::new(path), &target.profile_name);
+        if !target.grants_known {
+            // 何を付与したか分からない以上、剥がせない。名前を消せば永久に剥がせなくなるので残す。
+            outcome.kept_unknown.push(target.profile_name.clone());
+            continue;
         }
-        win::delete_profile(&target.profile_name);
+        for path in &target.granted_paths {
+            outcome
+                .blocked_paths
+                .extend(revoke(Path::new(path), &target.profile_name));
+            outcome.revoked_paths += 1;
+        }
+        match win::delete_profile(&target.profile_name) {
+            Ok(()) => {
+                outcome.deleted_profiles += 1;
+                deleted.insert(target.profile_name.as_str());
+            }
+            // 削除できなかったので台帳エントリは**残す**（次回のGCが同じ経路で再試行できる）。
+            Err(reason) => outcome
+                .delete_failures
+                .push((target.profile_name.clone(), reason)),
+        }
     }
-    let reclaimed: std::collections::HashSet<&str> =
-        targets.iter().map(|t| t.profile_name.as_str()).collect();
-    ledger().update(|l| {
-        l.sessions
-            .retain(|e| !reclaimed.contains(e.profile_name.as_str()))
-    });
+    if !deleted.is_empty() {
+        ledger().update(|l| {
+            l.sessions
+                .retain(|e| !deleted.contains(e.profile_name.as_str()))
+        });
+    }
+    outcome
+}
+
+/// [`reclaim_targets`]が実際に何をしたか。**「やった」と「うまくいった」は別の事実**なので、
+/// 呼び出し側が区別できる形で返す（B-09）。
+#[derive(Debug, Default, PartialEq)]
+pub struct ReclaimOutcome {
+    /// 実際に削除できたプロファイル数。
+    pub deleted_profiles: usize,
+    /// 撤収を試みたパスの延べ件数。
+    pub revoked_paths: usize,
+    /// 削除に失敗したプロファイルと理由。台帳エントリは残してある（次回再試行される）。
+    pub delete_failures: Vec<(String, String)>,
+    /// **付与内容が分からないので削除を見送ったプロファイル**（`grants_known: false`）。
+    /// ここが増え続けるなら、台帳エントリが失われる経路が別に在るということ（B-11）。
+    pub kept_unknown: Vec<String>,
+    /// [BUG-103] **撤収を試みたが剥がせなかったノードと理由。**
+    ///
+    /// プロファイルは消えても、ここに挙がったノードのACEは実マシンに残っている。
+    /// SIDはプロファイル名から導出するので、プロファイルが消えた後は
+    /// **どのコマンドでも剥がせない孤児**になる——だから件数ではなく**名前**を残す
+    /// （`icacls <path> /remove:g *<SID>`で追える形にする、B-09）。
+    pub blocked_paths: RevokeLeftovers,
+}
+
+impl ReclaimOutcome {
+    /// 人へ見せる要約。何も起きなかったときは`None`（無害な行で画面を埋めない）。
+    pub fn summary(&self) -> Option<String> {
+        if self.deleted_profiles == 0
+            && self.delete_failures.is_empty()
+            && self.kept_unknown.is_empty()
+            && self.blocked_paths.is_empty()
+        {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.deleted_profiles > 0 {
+            parts.push(format!(
+                "回収したセッションプロファイル {} 件（撤収したパス {} 件）",
+                self.deleted_profiles, self.revoked_paths
+            ));
+        }
+        for (name, reason) in &self.delete_failures {
+            parts.push(format!(
+                "{name} の削除に失敗しました（{reason}）。台帳に残したので次回再試行します"
+            ));
+        }
+        if !self.kept_unknown.is_empty() {
+            parts.push(format!(
+                "付与内容を台帳から復元できないプロファイル {} 件は削除を見送りました\
+                 （消すとACEが剥がせなくなるため。`harness fs list`で確認できます）: {}",
+                self.kept_unknown.len(),
+                self.kept_unknown.join(", ")
+            ));
+        }
+        // [BUG-103] **剥がせなかったノードは名前で出す。** 件数だけだと`icacls`で追えず、
+        // プロファイル削除後はSIDを導出できないので二度と剥がせない（B-09）。
+        if !self.blocked_paths.is_empty() {
+            const SHOWN: usize = 5;
+            let head: Vec<String> = self
+                .blocked_paths
+                .iter()
+                .take(SHOWN)
+                .map(|(path, reason)| format!("{} ({reason})", path.display()))
+                .collect();
+            let mut line = format!(
+                "**ACEを剥がせなかったノード {} 件**（このマシンに残ります）: {}",
+                self.blocked_paths.len(),
+                head.join(" / ")
+            );
+            if self.blocked_paths.len() > SHOWN {
+                line.push_str(&format!(" ほか{}件", self.blocked_paths.len() - SHOWN));
+            }
+            parts.push(line);
+        }
+        Some(parts.join(" / "))
+    }
 }
 
 /// D-37以前に使っていた**共有プロファイル**の名前。この名前のプロファイルが付けたACEは、
@@ -435,8 +603,8 @@ pub fn live_profile_names() -> Vec<String> {
         if !win::is_live(&entry.token) {
             continue;
         }
-        for profile in std::iter::once(entry.profile_name)
-            .chain(entry.mcp.into_iter().map(|m| m.profile_name))
+        for profile in
+            std::iter::once(entry.profile_name).chain(entry.mcp.into_iter().map(|m| m.profile_name))
         {
             if !names.contains(&profile) {
                 names.push(profile);
@@ -457,15 +625,30 @@ pub fn live_profile_names() -> Vec<String> {
 }
 
 /// 死んだセッションの資源を回収する（起動時に呼ぶ）。
-pub fn gc_dead_sessions(revoke: &dyn Fn(&Path, &str)) -> usize {
+///
+/// 返り値は**実際に回収できた件数**であって、対象として挙がった件数ではない
+/// （`grants_known: false`のものは意図的に見送るため、両者は一致しない）。
+/// 見送りや削除失敗の内訳は[`ReclaimOutcome`]で受け取る。
+pub fn gc_dead_sessions_reporting(
+    revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers,
+) -> ReclaimOutcome {
     let targets = plan_reclaim(&ledger().load(), &win::existing_profiles(), &win::is_live);
-    reclaim_targets(&targets, revoke);
-    targets.len()
+    reclaim_targets(&targets, revoke)
+}
+
+/// [`gc_dead_sessions_reporting`]の件数だけが要る呼び出し向け。
+pub fn gc_dead_sessions(revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers) -> usize {
+    gc_dead_sessions_reporting(revoke).deleted_profiles
 }
 
 /// このセッションの資源を撤収する（正常終了時に呼ぶ。落ちた場合は次回起動の
 /// [`gc_dead_sessions`]が同じ経路で回収する）。
-pub fn end_session(revoke: &dyn Fn(&Path, &str)) {
+///
+/// [BUG-103] **結果を返す**（`#[must_use]`）。かつては`()`で、剥がせなかったノードが
+/// ここで消えていた——`end_session`はセッション終了時の**唯一の撤収経路**なので、
+/// ここで捨てると孤立ACEは誰の目にも触れずに実マシンへ残る。
+#[must_use]
+pub fn end_session(revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers) -> ReclaimOutcome {
     let token = session_token();
     let Some(entry) = ledger()
         .load()
@@ -473,18 +656,22 @@ pub fn end_session(revoke: &dyn Fn(&Path, &str)) {
         .into_iter()
         .find(|e| e.token == token)
     else {
-        return;
+        return ReclaimOutcome::default();
     };
     // MCPサーバのプロファイルも同じ経路で撤収する（このセッションと同じ寿命、D-38）。
+    // 自セッションは台帳エントリを読めているので`grants_known: true`（付与が0件だったのなら、
+    // それは「分からない」ではなく「無かった」である）。
     let mut targets = vec![ReclaimTarget {
         profile_name: entry.profile_name,
         granted_paths: entry.granted_paths,
+        grants_known: true,
     }];
     targets.extend(entry.mcp.into_iter().map(|m| ReclaimTarget {
         profile_name: m.profile_name,
         granted_paths: m.granted_paths,
+        grants_known: true,
     }));
-    reclaim_targets(&targets, revoke);
+    reclaim_targets(&targets, revoke)
 }
 
 #[cfg(test)]
@@ -554,10 +741,10 @@ mod tests {
         assert_eq!(targets[0].granted_paths, vec!["C:\\other".to_string()]);
     }
 
-    /// 台帳が消えても、接頭辞付きプロファイルの実在から回収できる（パスは分からないので
-    /// プロファイル削除だけに縮退する）。
+    /// 台帳が消えたプロファイルは、接頭辞付きの実在から**見つけられる**。ただし
+    /// 付与内容は分からないので`grants_known: false`が立つ。
     #[test]
-    fn profiles_without_a_ledger_entry_are_reclaimed_by_prefix_alone() {
+    fn profiles_without_a_ledger_entry_are_found_but_marked_unknown() {
         let empty = SessionLedger::default();
         let existing = vec![
             profile_name_for("orphan"),
@@ -571,6 +758,78 @@ mod tests {
         assert_eq!(targets.len(), 1, "{targets:?}");
         assert_eq!(targets[0].profile_name, profile_name_for("orphan"));
         assert!(targets[0].granted_paths.is_empty());
+        assert!(
+            !targets[0].grants_known,
+            "台帳が無いので付与内容は「分からない」であって「無い」ではない（BUG-101）"
+        );
+    }
+
+    /// **BUG-101の回帰テスト（孤児ACE製造機）。**
+    ///
+    /// 台帳エントリを失ったプロファイルを削除してはいけません。削除するとSIDが導出できなくなり、
+    /// そのSID宛に残っているACEは`harness fs revoke`を含めどのコマンドでも剥がせなくなります
+    /// （実際に`%TEMP%`へ1件残り、Tier1の許可側テスト2件が赤になりました）。
+    ///
+    /// **`grants_known: false`のときは削除しない**ことを固定します。
+    #[test]
+    fn a_profile_whose_grants_are_unknown_is_never_deleted() {
+        let targets = vec![ReclaimTarget {
+            profile_name: profile_name_for("lost-ledger"),
+            granted_paths: Vec::new(),
+            grants_known: false,
+        }];
+        let revoked = std::sync::Mutex::new(Vec::new());
+        let outcome = reclaim_targets(&targets, &|path, _profile| {
+            revoked.lock().unwrap().push(path.display().to_string());
+            Vec::new()
+        });
+
+        assert_eq!(
+            outcome.deleted_profiles, 0,
+            "付与内容が分からないプロファイルを消すと、そのACEは永久に剥がせなくなる"
+        );
+        assert_eq!(
+            outcome.kept_unknown,
+            vec![profile_name_for("lost-ledger")],
+            "見送ったことは件数として見えなければならない（B-09/B-11）"
+        );
+        assert!(
+            revoked.lock().unwrap().is_empty(),
+            "剥がす対象が分からないのだから、撤収も呼ばれないのが正しい"
+        );
+    }
+
+    /// **対になる許可側**（B-35）。付与内容が分かっているものは、従来どおり撤収して削除します。
+    /// これが無いと「全部見送る」実装でも上のテストが通ってしまい、GCの生死を判定できません。
+    #[test]
+    fn a_profile_whose_grants_are_known_is_still_revoked_and_deleted() {
+        let targets = vec![ReclaimTarget {
+            profile_name: profile_name_for("known"),
+            granted_paths: vec!["C:\\a".to_string(), "C:\\b".to_string()],
+            grants_known: true,
+        }];
+        let revoked = std::sync::Mutex::new(Vec::new());
+        let outcome = reclaim_targets(&targets, &|path, _profile| {
+            revoked.lock().unwrap().push(path.display().to_string());
+            Vec::new()
+        });
+
+        assert_eq!(outcome.revoked_paths, 2);
+        assert_eq!(
+            revoked.lock().unwrap().clone(),
+            vec!["C:\\a".to_string(), "C:\\b".to_string()]
+        );
+        assert!(
+            outcome.kept_unknown.is_empty(),
+            "分かっているものまで見送ってはいけない: {outcome:?}"
+        );
+        // `delete_profile`は非Windowsでは`Ok`のno-opなので、削除件数はどちらの環境でも1になる
+        // （Windowsでは実在しないプロファイル名の削除が失敗し得るため、そこは件数で断定しない）。
+        assert_eq!(
+            outcome.deleted_profiles + outcome.delete_failures.len(),
+            1,
+            "削除を試みたことは必ず結果として残る（成功か、理由付きの失敗か）"
+        );
     }
 
     /// 台帳にあるものを実在プロファイル側で二重に数えない。
@@ -594,6 +853,7 @@ mod tests {
         let targets = vec![ReclaimTarget {
             profile_name: profile_name_for("t"),
             granted_paths: vec!["C:\\a".to_string(), "C:\\b".to_string()],
+            grants_known: true,
         }];
         // `win::delete_profile`は非Windowsではno-opなので、ここでは撤収側の順序だけを固定する。
         reclaim_targets(&targets, &|path, profile| {
@@ -601,6 +861,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("revoke:{}:{profile}", path.display()));
+            Vec::new()
         });
         let recorded = order.lock().unwrap().clone();
         assert_eq!(

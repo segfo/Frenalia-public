@@ -3,10 +3,10 @@
 //! Local Proxy/Fake DNS起動・WFPシナリオの最終確定・`ToolCtx`構築・`ConversationState`・
 //! TUI/headless分岐と、セッション終了時のnetfilterd teardown。
 
-use super::*;
 use super::sandbox::SandboxPrepared;
 #[cfg(windows)]
 use super::tier3_progress::start_tier3_with_progress;
+use super::*;
 
 /// Local Proxy/Fake DNS起動・`ToolCtx`構築・`ConversationState`・TUI/headless分岐。
 /// 5段の最終段のため`Result`ではなく`ExitCode`を直接返す。
@@ -133,6 +133,14 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     #[cfg(windows)]
     let policy_learn_pipe_name = policy_learn_prelude.as_ref().map(|p| p.name().to_string());
 
+    // 収集器の連鎖起動の結末（BUG-093）。netfilterdが`Applied`の応答で返す。
+    // **これが`Launched`でなければ収集器の接続を待たない**——待つと`ConnectNamedPipe`が
+    // 60秒タイムアウトしてから同じフォールバックへ着くだけで、その60秒は丸ごと無駄になる。
+    #[cfg(windows)]
+    let mut collector_chain_report: Option<
+        harness_sandbox::tier2a::netfilterd::ChainLaunchReport,
+    > = None;
+
     // WFPシナリオ(A)/(B)/(C)の最終確定。`shell_tier`が実際にTier2aへ着地し、かつ
     // 許可ドメインがあるときだけ有効化する。
     #[cfg(windows)]
@@ -177,10 +185,17 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                             chain_launch_policy_learnd: policy_learn_pipe_name.clone(),
                         },
                     ) {
-                        // D-60: 応答は「ハンドル＋収集器の連鎖起動の結末」。結末を使うのは
-                        // ポリシーエディタ側だけなので、本体はここでは捨てる。
-                        Ok((handle, _chain)) => Some(handle),
-                        Err(e) => {
+                        Ok((handle, report)) => {
+                            collector_chain_report = report;
+                            Some(handle)
+                        }
+                        Err(failure) => {
+                            // **daemonが生き残っていても、ここでは捨てる**（`into_error`）。
+                            // harness本体はこの経路を起動シーケンスで1度しか通らない（D-31）ので
+                            // 保持しても使う相手が居ない。捨てるとパイプが閉じ、daemonは
+                            // フェイルセーフ経路で自発撤収する。保持して再利用するのは
+                            // 対話ループを持つポリシーエディタ側（D-56/D-60）だけである。
+                            let e = failure.into_error();
                             eprintln!(
                                 "warning: WFP netfilterd chain-launch handshake failed (network \
                                  egress will only be enforced by the cooperative proxy, Layer1, \
@@ -199,8 +214,8 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
             drop(wfp_prelude);
             match harness_sandbox::tier2a::netfilterd::NetfilterHandle::start(
                 harness_sandbox::tier2a::netfilterd::NetfilterPolicy {
-                    session_profile:
-                        harness_sandbox::tier2a::session_profile::current_profile_name(),
+                    session_profile: harness_sandbox::tier2a::session_profile::current_profile_name(
+                    ),
                     allow_loopback_tcp_ports: net_loopback_ports.tcp.clone(),
                     allow_loopback_udp_ports: net_loopback_ports.udp.clone(),
                     audit_log_path: net_proxy.audit_log_path.clone(),
@@ -210,8 +225,14 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                     chain_launch_policy_learnd: policy_learn_pipe_name.clone(),
                 },
             ) {
-                Ok((handle, _chain)) => Some(handle),
-                Err(e) => {
+                Ok((handle, report)) => {
+                    collector_chain_report = report;
+                    Some(handle)
+                }
+                Err(failure) => {
+                    // 上のシナリオ(A)と同じ理由で、生き残ったdaemonはここで捨てる（1度しか
+                    // 通らない経路なので保持しても使わない）。
+                    let e = failure.into_error();
                     // `should_grant_tier2a_network_capability`（`crates/harness-tools/src/
                     // shell.rs`）は`domain_policy_requested && !enforced_by_wfp`のとき
                     // `NetworkCapability::Deny`を返す。つまりWFP起動失敗時はLayer1協調
@@ -254,6 +275,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // 生んでしまうため（`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」）。到達不能だった穴の診断
     // （D8/D9）は`passthrough_warnings`としてこの下で表示する。
     if shell_tier.tier == harness_core::ShellTier::Tier2a {
+        // [BUG-101] **どのSID宛に付けたか**も記録する。プロファイルが削除されるとSIDから名前は
+        // 引けなくなるので、記録しておかないと撤収側がそのACEを自分のものと判定できない。
+        let granted_sid = harness_sandbox::tier2a::win_appcontainer::current_session_grant_sid();
         for (path, writable) in &shell_tier.granted_passthrough {
             // このエントリが`--force-system-acl`対象だったか（元のfs_passthroughから引く）。
             // forcedなら撤収時も`SeRestorePrivilege`が要るため台帳へ記録しておく。
@@ -271,6 +295,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 *writable,
                 forced,
                 settings_workspace.as_deref(),
+                granted_sid.as_deref(),
             );
             if forced {
                 eprintln!(
@@ -321,7 +346,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // - **(A) 連鎖起動** — netfilterdが自分の昇格トークンのまま起こす。**追加UACなし**
     // - **(B) 直接runas** — netfilterdが居ない/連鎖が失敗したときのフォールバック。UACが1回
     #[cfg(windows)]
-    let policy_learn: Option<harness_sandbox::tier2a::policy_learnd::client::PolicyLearnHandle> = {
+    let policy_learn: Option<
+        harness_sandbox::tier2a::policy_learnd::client::PolicyLearnHandle,
+    > = {
         use harness_sandbox::tier2a::policy_learnd::{client as learn_client, LearnPolicy};
 
         // 収集できない条件を先に潰し、残った場合だけ起動する。潰す条件ごとに理由を出すのは、
@@ -360,8 +387,24 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 record_all: false,
             };
 
-            // (A) netfilterdが起動していて、かつパイプを用意できていれば連鎖起動を試す。
-            let chained = match (policy_learn_prelude, net_wfp.is_some()) {
+            // (A) netfilterdが**実際に収集器を起こせた**ときだけ接続を待つ（BUG-093）。
+            //
+            // 以前は「netfilterdが居る」だけを条件にしていたため、連鎖起動が失敗していても
+            // 60秒待ってからでないと(B)へ移れなかった。昇格側が結末を`Applied`の応答で返す
+            // ようになったので、**起きていないと分かっているものを待たない**。
+            let chain_launched = collector_chain_report
+                .as_ref()
+                .is_some_and(|r| r.launched());
+            if let Some(harness_sandbox::tier2a::netfilterd::ChainLaunchReport::Failed { reason }) =
+                collector_chain_report.as_ref()
+            {
+                // **黙ってフォールバックしない。** UACが1回増える理由をここで言い切る。
+                eprintln!(
+                    "warning: netfilterd could not chain-launch the OS audit collector ({reason}); \
+                     launching it directly instead (one extra UAC prompt)"
+                );
+            }
+            let chained = match (policy_learn_prelude, net_wfp.is_some() && chain_launched) {
                 (Some(prepared), true) => {
                     match learn_client::connect_after_chain_launch(
                         prepared.into_handle(),
@@ -476,7 +519,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // `TurnExecutor`を組まない（`search`は決定的検索のみ、`remember`はファイル書込みのみ）
     // ため、再帰対策（レジストリのスナップショット）は不要。`CognitionLevel`に関わらず常時
     // 登録する（未使用時のコストはゼロ、`Off`の等価性を壊さない）。
-    tools.register(Arc::new(RecallTool::new(cognition.recall_allow_unversioned())));
+    tools.register(Arc::new(RecallTool::new(
+        cognition.recall_allow_unversioned(),
+    )));
 
     // `/workspace`で選ばれた移動先。ここでは**まだ起動しない**——teardownを全部通した後で
     // 起こす（`startup::relaunch`のモジュールdoc「置き場所が末尾でなければならない」）。
@@ -565,9 +610,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                     );
                 }
             }
-            Err(e) => eprintln!(
-                "warning: failed to cleanly tear down the policy-learning collector: {e}"
-            ),
+            Err(e) => {
+                eprintln!("warning: failed to cleanly tear down the policy-learning collector: {e}")
+            }
         }
     }
 
@@ -576,9 +621,17 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // 落ちた場合（クラッシュ・Ctrl+C）は、次回起動時の`preflight`のGCが同じ経路で回収する
     // ——だからこの呼び出しは「速く片付けるための最適化」であって、正しさの要件ではない。
     #[cfg(windows)]
-    harness_sandbox::tier2a::session_profile::end_session(
-        &harness_sandbox::tier2a::win_appcontainer::revoke_session_grant,
-    );
+    {
+        let outcome = harness_sandbox::tier2a::session_profile::end_session(
+            &harness_sandbox::tier2a::win_appcontainer::revoke_session_grant,
+        );
+        // [BUG-103] **剥がせなかったノードは名前で出す。** かつてここは戻り値の無い呼び出しで、
+        // 撤収が1件も成功しなくても何も出なかった——`%LOCALAPPDATA%\Packages`に継承つきRWDが
+        // 残ったまま誰も気付かなかった機序の半分がこれである（B-09）。
+        if let Some(summary) = outcome.summary() {
+            eprintln!("note: {summary}");
+        }
+    }
 
     // `/workspace`: **ここまでの撤収を全部通した後**に起こす（`startup::relaunch`）。
     // 起こせなくても普通に終了するだけ——再起動できないことと端末を壊すことは別である。
@@ -766,4 +819,3 @@ async fn tui_branch(
         }
     }
 }
-

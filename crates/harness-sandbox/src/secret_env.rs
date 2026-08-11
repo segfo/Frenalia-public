@@ -19,6 +19,22 @@ const ALLOWLIST: &[&str] = &[
     "COMSPEC",
     "CARGO_HOME",
     "RUSTUP_HOME",
+    // **`PROGRAMDATA`が無いとMSVCリンカが見つからず、rustcが別物の`link`を掴む。**
+    // rustcはVisual Studioの位置をVS Setup Configuration API経由で解決し、その実体は
+    // `%ProgramData%\Microsoft\VisualStudio\Packages\_Instances`のインスタンスストアを読む。
+    // この変数が無いと列挙が0件になり、rustcはPATHへフォールバックする——そこにGit for
+    // Windows（MSYS）が同梱する**GNU coreutilsの`link`**があると、それを起動して
+    // `link: extra operand ...` で失敗する。エラー文面がMSVCの話をしないので、
+    // 「ビルドツールが入っていない」という誤った結論へ誘導される。
+    //
+    // 実測（2026-08-10、1差分×1ケース）: allowlistのみの環境で`cargo build --release`が失敗し、
+    // `PROGRAMDATA`を1つ足すと成功する。`ProgramFiles`・`ProgramFiles(x86)`・`ProgramW6432`・
+    // `windir`を足しても直らない（＝この変数が原因であって「環境が薄いから」ではない）。
+    // 公開のシステムパスであり秘密を含まないのでallowlistの趣旨（D-07）と矛盾しない。
+    //
+    // AppContainer（Tier2a）で同じ症状が出たのが[BUG-014]で、あちらの原因は同じ検出機構への
+    // **ACL拒否**だった。原因は違うが壊れ方は同一である。
+    "PROGRAMDATA",
     // `PATHEXT`が無いとWindows PowerShell/pwshは外部ネイティブexeの起動に**サイレントに
     // 失敗する**（出力無し・終了コード未設定・エラーも出ない）。既存テストがPowerShell
     // 組み込みコマンドレット（Write-Output等）のみを使っていたため長らく露呈しなかった
@@ -79,6 +95,36 @@ mod tests {
         assert!(!names.contains(&"ANTHROPIC_API_KEY"));
         assert!(!names.contains(&"OPENAI_API_KEY"));
         assert!(!names.contains(&"SOME_RANDOM_VAR"));
+    }
+
+    /// **MSVCツールチェーンの検出に要る変数が落ちていないこと。**
+    ///
+    /// `PROGRAMDATA`が無いとrustcはVisual Studioを見つけられず、PATH上のGNU `link`
+    /// （Git for Windows同梱）を掴んで`link: extra operand ...`で失敗する。
+    /// エラーがMSVCの話をしないため「ビルドツールが未インストール」と誤診されやすい
+    /// （実測とBUG-014との関係はALLOWLIST側のコメント参照）。
+    ///
+    /// **綴りは実際の環境変数名と一致していなければ意味が無い**ので、
+    /// 判定関数`is_allowlisted`を通す（定数配列を直接見ない。大小の扱いまで含めて検証する）。
+    #[test]
+    fn the_msvc_toolchain_lookup_variables_survive_the_allowlist() {
+        for name in ["ProgramData", "PROGRAMDATA", "programdata"] {
+            assert!(
+                is_allowlisted(name),
+                "{name} must pass the allowlist, otherwise rustc cannot locate the MSVC linker \
+                 and silently falls back to an unrelated `link` on PATH"
+            );
+        }
+        // 実際に構築しても残ることを確認する（`looks_secret`に巻き込まれていないこと）。
+        let cleaned = build_child_env_from(vec![(
+            "ProgramData".to_string(),
+            r"C:\ProgramData".to_string(),
+        )]);
+        assert_eq!(
+            cleaned.len(),
+            1,
+            "ProgramData must survive build_child_env_from"
+        );
     }
 
     #[test]

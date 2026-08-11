@@ -3,8 +3,8 @@
 //! staging mode・`sandbox_dir`・`read_scope`・net proxy/app・`require_sandbox`・
 //! fs passthrough・privhelper昇格・WFP連鎖パイプ・`write_mode`・`select_tier`。
 
-use super::*;
 use super::session::SessionOpened;
+use super::*;
 
 /// [`stage_prepare_sandbox`]の出力。Stage5（`stage_run_agent`）が必要とする値を運ぶ。
 pub(super) struct SandboxPrepared {
@@ -50,7 +50,9 @@ pub(super) struct SandboxPrepared {
 
 /// staging mode・`sandbox_dir`・`read_scope`・net proxy/app・`require_sandbox`・
 /// fs passthrough・privhelper昇格・WFP連鎖パイプ・`write_mode`・`select_tier`。
-pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<SandboxPrepared, ExitCode> {
+pub(super) fn stage_prepare_sandbox(
+    session_opened: SessionOpened,
+) -> Result<SandboxPrepared, ExitCode> {
     let SessionOpened {
         cli,
         workspace_root,
@@ -236,7 +238,10 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
             Some(p) => (p.to_string(), harness_config::FsAccess::ReadWrite),
             None => (entry.clone(), harness_config::FsAccess::ReadExec),
         };
-        if !fs_allow_raw.iter().any(|(p, _)| p == &path) {
+        // **同じパスが既にあっても捨てない。** 捨てると、設定に`fs.read`で書いてあるパスへ
+        // `--fs-allow <path>:rw`を足したときに書込要求が黙って消える（先に入った方が残る）。
+        // access種別まで同じものだけを重複と見なし、種別が違うものは下の畳み込みで**和を取る**。
+        if !fs_allow_raw.iter().any(|(p, a)| p == &path && *a == access) {
             fs_allow_raw.push((path, access));
         }
     }
@@ -254,14 +259,22 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
         );
         return Err(ExitCode::FAILURE);
     }
-    let fs_passthrough: Vec<harness_sandbox::FsPassthrough> = fs_allow_raw
-        .into_iter()
-        .map(|(path, access)| harness_sandbox::FsPassthrough {
-            path: workspace_root.join(&path),
-            access: to_sandbox_fs_access(access),
-            forced: cli.force_system_acl,
-        })
-        .collect();
+    // **同じパスへの宣言は1本のACEへ畳む（和を取る）。** 1つのオブジェクトのDACLへ同じSID宛の
+    // ACEを2本持つことはできないので、ここで畳まないと後段のどちらかの付与が上書きになる。
+    // 合成の規則は`harness_sandbox::FsAccess::wider`が唯一の定義を持つ（B-05）。
+    let mut fs_passthrough: Vec<harness_sandbox::FsPassthrough> = Vec::new();
+    for (path, access) in fs_allow_raw {
+        let path = workspace_root.join(&path);
+        let access = harness_sandbox::FsAccess::from_settings(access);
+        match fs_passthrough.iter_mut().find(|fp| fp.path == path) {
+            Some(existing) => existing.access = existing.access.wider(access),
+            None => fs_passthrough.push(harness_sandbox::FsPassthrough {
+                path,
+                access,
+                forced: cli.force_system_acl,
+            }),
+        }
+    }
     if !fs_passthrough.is_empty() && !cfg!(windows) {
         eprintln!(
             "warning: --fs-allow / fs.allow is only supported on Windows (Tier2a); ignored on \
@@ -360,6 +373,11 @@ pub(super) fn stage_prepare_sandbox(session_opened: SessionOpened) -> Result<San
         &fs_passthrough,
         wfp_chain_pipe,
         &write_mode,
+        // D-60: harness本体は起動シーケンスで**1回しか**ここを通らないので、連鎖元になる
+        // 常駐daemonはまだ居ない（netfilterdはこの`select_tier`より後で立つ）。`None`＝自前で
+        // `runas`する。「最大UAC1回」は、この1回で3ヘルパー全部を賄う既存の連鎖
+        // （privhelper → netfilterd → 収集器）で成立している。
+        None,
     ) {
         Ok(selection) => selection,
         Err(e) => {
@@ -439,4 +457,3 @@ fn build_mcp_gates(
         http_ca_bundle: settings.http_ca_bundle.map(PathBuf::from),
     })
 }
-

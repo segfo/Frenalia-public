@@ -58,11 +58,17 @@ impl Drop for AuditPolicyGuard {
     fn drop(&mut self) {
         let user = format!("/user:{}", self.sid);
         let (removed, out) = auditpol(&["/resourceSACL", "/remove", "/type:File", &user]);
-        println!("[#c] cleanup: resourceSACL /remove ok={removed} {}", out.trim());
+        println!(
+            "[#c] cleanup: resourceSACL /remove ok={removed} {}",
+            out.trim()
+        );
         if self.disable_failure_on_drop {
             let subcategory = format!("/subcategory:{SUBCATEGORY_FILE_SYSTEM}");
             let (ok, out) = auditpol(&["/set", &subcategory, "/failure:disable"]);
-            println!("[#c] cleanup: File System failure auditing disabled ok={ok} {}", out.trim());
+            println!(
+                "[#c] cleanup: File System failure auditing disabled ok={ok} {}",
+                out.trim()
+            );
         }
         let (_, view) = auditpol(&["/resourceSACL", "/view", "/type:File"]);
         println!("[#c] cleanup: resourceSACL now = [{}]", view.trim());
@@ -122,7 +128,10 @@ fn can_global_object_access_auditing_be_scoped_to_an_appcontainer_package_sid() 
     let subcategory = format!("/subcategory:{SUBCATEGORY_FILE_SYSTEM}");
     let (_, before_policy) = auditpol(&["/get", &subcategory]);
     println!("[#c] BEFORE resourceSACL = [{}]", before_sacl.trim());
-    println!("[#c] BEFORE File System policy = [{}]", before_policy.trim());
+    println!(
+        "[#c] BEFORE File System policy = [{}]",
+        before_policy.trim()
+    );
 
     // --- 1. AppContainerのpackage SIDを得る ---
     let workspace = tempfile::tempdir().expect("workspace");
@@ -154,9 +163,15 @@ fn can_global_object_access_auditing_be_scoped_to_an_appcontainer_package_sid() 
         &user_arg,
         "/access:FA",
     ]);
-    println!("[#c] Q1 resourceSACL /set with the package SID: ok={set_ok} [{}]", set_out.trim());
+    println!(
+        "[#c] Q1 resourceSACL /set with the package SID: ok={set_ok} [{}]",
+        set_out.trim()
+    );
     let (_, view_after_set) = auditpol(&["/resourceSACL", "/view", "/type:File"]);
-    println!("[#c] Q1 resourceSACL after set = [{}]", view_after_set.trim());
+    println!(
+        "[#c] Q1 resourceSACL after set = [{}]",
+        view_after_set.trim()
+    );
 
     let accepted = set_ok && view_after_set.contains(&sid_string);
     println!("[#c] Q1 RESULT: package SID accepted = {accepted}");
@@ -167,7 +182,7 @@ fn can_global_object_access_auditing_be_scoped_to_an_appcontainer_package_sid() 
              security-relevant records. That settles it -- 4656 is not worth adopting."
         );
         drop(guard);
-        crate::tier2a::session_profile::end_session(
+        let _ = crate::tier2a::session_profile::end_session(
             &crate::tier2a::win_appcontainer::revoke_session_grant,
         );
         return;
@@ -175,7 +190,10 @@ fn can_global_object_access_auditing_be_scoped_to_an_appcontainer_package_sid() 
 
     // --- 3. File System サブカテゴリの失敗監査を有効化 ---
     let (policy_ok, policy_out) = auditpol(&["/set", &subcategory, "/failure:enable"]);
-    println!("[#c] File System failure auditing enabled: ok={policy_ok} [{}]", policy_out.trim());
+    println!(
+        "[#c] File System failure auditing enabled: ok={policy_ok} [{}]",
+        policy_out.trim()
+    );
 
     // --- 4. AppContainer子に拒否を起こさせる（読取と削除の両方） ---
     let mark = std::time::SystemTime::now()
@@ -226,7 +244,7 @@ fn can_global_object_access_auditing_be_scoped_to_an_appcontainer_package_sid() 
     );
 
     drop(guard);
-    crate::tier2a::session_profile::end_session(
+    let _ = crate::tier2a::session_profile::end_session(
         &crate::tier2a::win_appcontainer::revoke_session_grant,
     );
 

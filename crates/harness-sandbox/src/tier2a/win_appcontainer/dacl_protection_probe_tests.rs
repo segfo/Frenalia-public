@@ -372,11 +372,15 @@ fn run_case(index: usize, write: WritePath) -> CaseResult {
         match (write, write.kernel_opts()) {
             // [BUG-084] `Ok(false)`は「触る前に消えていた」。このプローブは自分で作った
             // ツリーを測るので起こり得ないが、起きたなら測定が成立しないので失敗として扱う。
-            (WritePath::Production, _) => match remove_sid_aces_and_protect(target, sid.as_psid()) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err("the probe target vanished before it was protected".to_string()),
-                Err(e) => Err(e.to_string()),
-            },
+            (WritePath::Production, _) => {
+                match remove_sid_aces_and_protect(target, sid.as_psid()) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        Err("the probe target vanished before it was protected".to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
             (WritePath::AclApi, _) => super::test_support::protect_dacl_preserve_inherited(target)
                 .map_err(|e| e.to_string()),
             (_, Some(opts)) => {
@@ -478,11 +482,21 @@ fn dacl_protection_write_path_matrix_probe() {
     println!("probe root: {}", root.display());
     for r in &results {
         println!("\n--- {} ---", r.label);
-        println!("  control before      : {}", describe_control(r.control_before));
-        println!("  control after write : {}", describe_control(r.control_after));
+        println!(
+            "  control before      : {}",
+            describe_control(r.control_before)
+        );
+        println!(
+            "  control after write : {}",
+            describe_control(r.control_after)
+        );
         println!(
             "  SE_DACL_PROTECTED   : {}",
-            if r.protected_after() { "SET" } else { "not set" }
+            if r.protected_after() {
+                "SET"
+            } else {
+                "not set"
+            }
         );
         println!(
             "  inheritance blocked : {} (child {} an ACE after the parent propagated)",

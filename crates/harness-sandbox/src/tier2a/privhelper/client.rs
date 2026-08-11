@@ -8,8 +8,6 @@
 
 use super::*;
 
-
-
 /// ヘルパー実行ファイル（`harness-privhelper.exe`）のパスを、本体exeと同じディレクトリから
 /// 解決する（PATH検索に頼らない固定ロケーション、D-16の「小さく独立にビルド・監査可能な
 /// 別バイナリ」を確実に本体と対で配布する前提）。
@@ -34,7 +32,7 @@ fn helper_exe_path() -> Result<PathBuf, PrivHelperError> {
 /// 成否が独立するため、この関数ではなく[`run_privileged_workspace_access`]を使う。
 pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelperError> {
     let envelope = PrivilegedRequestEnvelope::from(req.clone());
-    match run_privileged_raw(&envelope)? {
+    match run_privileged_raw(&envelope, None)? {
         PrivilegedResponse::Ok => Ok(Vec::new()),
         PrivilegedResponse::GrantChain {
             granted,
@@ -61,8 +59,17 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
 pub type FsAllowRevokeOutcome = (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>);
 
 /// `run_privileged_workspace_access`の成功値（traverse付与ノード一覧・traverse失敗理由・
-/// fs-allow付与一覧・fs-allow失敗一覧）。
-pub type WorkspaceAccessOutcome = (Vec<PathBuf>, Option<String>, Vec<PathBuf>, Vec<(PathBuf, String)>);
+/// fs-allow付与一覧・fs-allow失敗一覧・WFP連鎖起動の結末）。
+///
+/// 最後の要素は`None`＝依頼していない／`Some(Ok(()))`＝起きた／`Some(Err(reason))`＝
+/// 起こせなかった。**呼び出し側はこれを見てシナリオA/Bを決める**（BUG-093）。
+pub type WorkspaceAccessOutcome = (
+    Vec<PathBuf>,
+    Option<String>,
+    Vec<PathBuf>,
+    Vec<(PathBuf, String)>,
+    Option<Result<(), String>>,
+);
 
 /// `GrantWorkspaceAccess`専用の委譲関数。**非管理者からのTier2a起動が特権を要するときは、
 /// traverse付与・fs-allow昇格・WFP連鎖起動のいずれであっても必ずここを通る**
@@ -77,6 +84,9 @@ pub fn run_privileged_workspace_access(
     traverse_targets: Vec<PathBuf>,
     fs_allow_entries: Vec<FsAllowGrant>,
     chain_pipe: Option<String>,
+    // `chain_launcher`（D-60）: 常駐している昇格プロセスからヘルパーを起こす手段。
+    // `None`なら自前で`runas`する（UACが1回）。
+    chain_launcher: Option<ChainLauncher<'_>>,
 ) -> Result<WorkspaceAccessOutcome, PrivHelperError> {
     let envelope = PrivilegedRequestEnvelope {
         request: PrivilegedRequest::GrantWorkspaceAccess {
@@ -87,21 +97,26 @@ pub fn run_privileged_workspace_access(
         },
         chain_netfilterd_pipe: chain_pipe,
     };
-    match run_privileged_raw(&envelope)? {
+    match run_privileged_raw(&envelope, chain_launcher)? {
         PrivilegedResponse::WorkspaceAccessResult {
             traverse_granted,
             traverse_error,
             fs_allow_granted,
             fs_allow_failures,
+            netfilterd_chain,
         } => Ok((
             traverse_granted,
             traverse_error,
             fs_allow_granted,
             fs_allow_failures,
+            netfilterd_chain,
         )),
-        PrivilegedResponse::Ok => Ok((Vec::new(), None, Vec::new(), Vec::new())),
+        // 以下2つは旧ヘルパー（この応答variantを知らない版）との互換経路。連鎖起動の結末を
+        // 名乗れないので`None`＝「依頼していない」と同じ扱いにする。**呼び出し側はシナリオB
+        // （自前の`runas`）へ落ちる**——起きたと誤解して待つより、UACが1回増える方が良い（P-03）。
+        PrivilegedResponse::Ok => Ok((Vec::new(), None, Vec::new(), Vec::new(), None)),
         PrivilegedResponse::GrantChain { granted, error } => {
-            Ok((granted, error, Vec::new(), Vec::new()))
+            Ok((granted, error, Vec::new(), Vec::new(), None))
         }
         PrivilegedResponse::RevokeFsAllowResult { .. } => Err(PrivHelperError::Ipc(
             "unexpected RevokeFsAllowResult response for a GrantWorkspaceAccess request"
@@ -118,7 +133,7 @@ pub fn run_privileged_revoke_fs_allow(
     entries: Vec<FsAllowRevoke>,
 ) -> Result<FsAllowRevokeOutcome, PrivHelperError> {
     let envelope = PrivilegedRequestEnvelope::from(PrivilegedRequest::RevokeFsAllow { entries });
-    match run_privileged_raw(&envelope)? {
+    match run_privileged_raw(&envelope, None)? {
         PrivilegedResponse::RevokeFsAllowResult {
             revoked,
             root_cleared,
@@ -137,8 +152,19 @@ pub fn run_privileged_revoke_fs_allow(
     }
 }
 
+/// **ヘルパーを起こす代わりの手段**（D-60）。パイプ名を受け取り、`Ok(())`なら
+/// 「そのパイプへ接続してくるヘルパーが起きた」ことを意味する。
+///
+/// 実体は「常駐している`harness-netfilterd`へ連鎖起動を依頼する」クロージャで、
+/// **UACが出ない**。`Err(reason)`なら起こせなかったので、呼び出し側は自前の`runas`へ落ちる。
+///
+/// 型を`&dyn Fn`で受けるのは、`harness-sandbox`の下位モジュールである`privhelper`が
+/// `netfilterd`へ依存しないようにするため（依存の向きを一方通行に保つ）。
+pub type ChainLauncher<'a> = &'a dyn Fn(&str) -> Result<(), String>;
+
 fn run_privileged_raw(
     envelope: &PrivilegedRequestEnvelope,
+    chain_launcher: Option<ChainLauncher<'_>>,
 ) -> Result<PrivilegedResponse, PrivHelperError> {
     let pipe_name = unique_pipe_name();
     let sid = current_user_sid_string()?;
@@ -170,13 +196,35 @@ fn run_privileged_raw(
     // 循環待機（デッドロック）に陥る（実機のUACテストで実際に発生を確認、`launch_helper_elevated`
     // 内部で`WaitForSingleObject(INFINITE)`していた旧実装のバグ）。プロセスハンドルは
     // IPC完了後に回収する。
-    let helper_process = match unsafe { launch_helper_elevated(&helper_path, &pipe_name) } {
-        Ok(h) => h,
-        Err(e) => {
-            unsafe {
-                let _ = CloseHandle(pipe);
+    // D-60: 常駐している昇格プロセスから起こせるなら、そちらを使う（**UACが出ない**）。
+    // 起こせなかったら`runas`へ落ちる——「起こせなかった」を黙って成功にしないこと（B-09）。
+    // 連鎖起動で起きた場合、**プロセスハンドルは持たない**（起動者がこちらではないため。
+    // netfilterdのシナリオAと同じ扱いで、撤収はヘルパー自身の終了とパイプ切断に委ねる）。
+    let chained = match chain_launcher {
+        Some(launch) => match launch(&pipe_name) {
+            Ok(()) => true,
+            Err(reason) => {
+                eprintln!(
+                    "warning: could not chain-launch the privilege-separation helper from the \
+                     resident elevated daemon ({reason}); falling back to runas (one UAC prompt)"
+                );
+                false
             }
-            return Err(e);
+        },
+        None => false,
+    };
+
+    let helper_process = if chained {
+        HANDLE::default()
+    } else {
+        match unsafe { launch_helper_elevated(&helper_path, &pipe_name) } {
+            Ok(h) => h,
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(pipe);
+                }
+                return Err(e);
+            }
         }
     };
 
@@ -250,7 +298,9 @@ unsafe fn launch_helper_elevated(
     // 次のUACで管理者実行を取れる（ローカル特権昇格）。既定は拒否、開発機は
     // `HARNESS_ALLOW_USER_WRITABLE_ELEVATED_HELPERS=1`で警告付き続行。
     crate::elevated_launch::verify_elevation_target(helper_path).map_err(|e| {
-        PrivHelperError::Win32(format!("refusing to elevate the privilege-separation helper: {e}"))
+        PrivHelperError::Win32(format!(
+            "refusing to elevate the privilege-separation helper: {e}"
+        ))
     })?;
 
     let verb_w = wide("runas");

@@ -202,7 +202,10 @@ impl TraverseRestore {
         let (granted, result) =
             crate::tier2a::win_appcontainer::grant_traverse_chain(target, self.sid.as_psid());
         if let Err(e) = result {
-            println!("  !! grant_traverse_chain({}) failed: {e}", target.display());
+            println!(
+                "  !! grant_traverse_chain({}) failed: {e}",
+                target.display()
+            );
         }
         // 台帳へ記録するのは**今回新たに付与したノードだけ**にする。`grant_traverse_chain`は
         // 冪等スキップしたノードも戻り値へ含めるため、戻り値をそのまま記録すると
@@ -222,7 +225,11 @@ fn print_chain(label: &str, target: &std::path::Path, sid: windows::Win32::Secur
     for node in preview_traverse_chain(target, sid) {
         println!(
             "  {:<5} mask={:>10} {}",
-            if node.already_sufficient { "OK" } else { "MISS" },
+            if node.already_sufficient {
+                "OK"
+            } else {
+                "MISS"
+            },
             node.existing_mask
                 .map(|m| format!("{m:#010x}"))
                 .unwrap_or_else(|| "(none)".to_string()),
@@ -558,8 +565,13 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
             forced: false,
         },
     ];
-    let outcome = preflight(&workspace, &passthrough, None, &WorkspaceWriteMode::DirectRw)
-        .expect("preflight");
+    let outcome = preflight(
+        &workspace,
+        &passthrough,
+        None,
+        &WorkspaceWriteMode::DirectRw,
+    )
+    .expect("preflight");
     let profile = crate::tier2a::session_profile::current_profile_name();
     let sid = crate::tier2a::win_appcontainer::ensure_profile(&profile).expect("package SID");
 
@@ -699,7 +711,11 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     // --- フェーズB: 条件(b) ---
     let mut cells_b = Vec::new();
     for op in &OPS {
-        let dir = if op.needs_exec { &allow_rx_b } else { &allow_rw_b };
+        let dir = if op.needs_exec {
+            &allow_rx_b
+        } else {
+            &allow_rw_b
+        };
         cells_b.push(Cell {
             condition: "b_traverse",
             op,
@@ -727,7 +743,10 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
 
     // --- 行列 ---
     println!("=== MATRIX (condition x operation) ===");
-    println!("  {:<14} {:<12} {:<12} {:<12} {:<12}", "op", "a_fsallow", "b_traverse", "c_workspace", "d_unallowed");
+    println!(
+        "  {:<14} {:<12} {:<12} {:<12} {:<12}",
+        "op", "a_fsallow", "b_traverse", "c_workspace", "d_unallowed"
+    );
     for op in &OPS {
         let cell = |cond: &str, src: &std::collections::BTreeMap<String, String>| {
             src.get(&format!("{cond}|{}", op.name))
@@ -789,9 +808,18 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     // --- 必須の対照 ---
     // 1) 成功しなければならないセル: workspace内の読み書き・削除・移動。
     //    全滅したら「対象の性質」ではなく測定の不備である。
-    for op_name in ["read_dotnet", "read_netfx", "write_dotnet", "delete", "move"] {
+    for op_name in [
+        "read_dotnet",
+        "read_netfx",
+        "write_dotnet",
+        "delete",
+        "move",
+    ] {
         let key = format!("c_workspace|{op_name}");
-        let value = results_a.get(&key).map(String::as_str).unwrap_or("(missing)");
+        let value = results_a
+            .get(&key)
+            .map(String::as_str)
+            .unwrap_or("(missing)");
         assert!(
             value.starts_with("OK"),
             "control (c) must succeed inside the workspace, but {key} = {value}; the measurement \
@@ -804,7 +832,10 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     //    与えないので、fs-allowしていない兄弟ディレクトリの中身は読めてはいけない。
     //    ここが通り出したらD-45が権限を広げすぎたということである。
     let key = "d_unallowed|read_dotnet".to_string();
-    let value = results_a.get(&key).map(String::as_str).unwrap_or("(missing)");
+    let value = results_a
+        .get(&key)
+        .map(String::as_str)
+        .unwrap_or("(missing)");
     assert!(
         value.starts_with("FAIL"),
         "control (d) must fail on a path that was never granted, but {key} = {value}; something \
@@ -842,7 +873,7 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     // 修正前はここで明示的に剥がしていた——テスト側で手当てしていたということは、製品側では
     // 誰も剥がしていなかったということである（実機に4件残留していた）。
     println!("=== end_session must revoke the redirector DLL ACEs by itself ===");
-    crate::tier2a::session_profile::end_session(
+    let _ = crate::tier2a::session_profile::end_session(
         &crate::tier2a::win_appcontainer::revoke_session_grant,
     );
     for dll in &dlls {
@@ -873,8 +904,13 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     let root_prefix = root.to_string_lossy().to_ascii_lowercase();
     for entry in crate::tier2a::traverse_ledger::load_traverse_ledger().entries {
         if entry.path.to_ascii_lowercase().starts_with(&root_prefix) {
-            println!("  pruning traverse-ledger entry for the deleted probe tree: {}", entry.path);
-            crate::tier2a::traverse_ledger::remove_traverse_grant(std::path::Path::new(&entry.path));
+            println!(
+                "  pruning traverse-ledger entry for the deleted probe tree: {}",
+                entry.path
+            );
+            crate::tier2a::traverse_ledger::remove_traverse_grant(std::path::Path::new(
+                &entry.path,
+            ));
         }
     }
 }

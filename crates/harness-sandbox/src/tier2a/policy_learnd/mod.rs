@@ -28,6 +28,12 @@ pub mod client;
 pub mod etw;
 pub mod server;
 
+/// D-56 段階2（要求の連続を捌くプロトコル）のテスト。実daemonを非昇格で起動して検出する
+/// ものを含む——`cargo test -p harness-sandbox`は別パッケージのdaemonをリビルドしないので、
+/// 「古いビルドを黙って測る」ことの検出器が要る。
+#[cfg(all(windows, test))]
+mod reuse_tests;
+
 /// 収集器へ渡すポリシー一式（`StartCollect`のペイロード）。
 ///
 /// **SIDではなくプロファイル名を運ぶ**（`NetfilterPolicy`と同じ方針、D-37）。昇格側は
@@ -67,10 +73,24 @@ pub struct LearnPolicy {
     pub record_all: bool,
 }
 
-/// 親→収集器。1セッションで`StartCollect`→`Teardown`の順に2回送る。
+/// 親→収集器。**`Teardown`までの要求の連続**（D-56 段階2）。
+///
+/// ```text
+///   StartCollect → StopCollect → StartCollect → … → Teardown
+/// ```
+///
+/// かつては`StartCollect`→`Teardown`の1往復固定で、記録を走らせるたびにdaemonを起こし直して
+/// いた＝**そのたびUACが出ていた**。ポリシーエディタは1回の起動で記録を何度も走らせる道具
+/// なので、これが実運用の主要な摩擦になっていた。1往復はこのループの特殊形なので、
+/// harness本体（`run_agent.rs`の2経路）は無変更で通る。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LearnRequest {
     StartCollect(LearnPolicy),
+    /// 現世代の収集を止める（**daemonは待機を続ける**）。
+    ///
+    /// **「空の`StartCollect`」では代用できない**——次の`StartCollect`が来るまで
+    /// ETWセッションを張ったままにすると、記録していない時間帯のイベントが次の記録へ混ざる。
+    StopCollect,
     Teardown,
 }
 
@@ -78,9 +98,18 @@ pub enum LearnRequest {
 pub enum LearnResponse {
     /// 収集を開始した。`etw_available`が`false`なら、セッションは張れなかったが
     /// **harnessは止めない**（D-43 fail-open）——その事実は`fs-audit.jsonl`の制御レコードにも残る。
-    Started { etw_available: bool },
+    Started {
+        etw_available: bool,
+    },
+    /// 現世代を畳んだ。**この世代で**書けた件数を返す（累積ではない——累積にすると
+    /// UIが「今回の記録で観測した件数」として出す数と食い違う）。
+    Stopped {
+        written: u64,
+    },
     /// 撤収完了。観測できた拒否の件数を返す（呼び出し側の表示用）。
-    TornDown { denials_written: u64 },
+    TornDown {
+        denials_written: u64,
+    },
     Err(String),
 }
 
@@ -170,6 +199,26 @@ mod tests {
         );
     }
 
+    /// **D-56段階2で足した2値のワイヤ形式。** 別プロセスが読むので、綴りが変わると
+    /// 無言で通信不能になる（`StopCollect`が読めなければ、収集器は要求を`malformed`として
+    /// 拒否し、呼び出し側は「畳めたか分からないdaemon」を抱えたまま次の記録へ進む）。
+    #[test]
+    fn stop_collect_and_stopped_have_a_stable_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&LearnRequest::StopCollect).unwrap(),
+            r#""StopCollect""#
+        );
+        assert_eq!(
+            serde_json::to_string(&LearnResponse::Stopped { written: 7 }).unwrap(),
+            r#"{"Stopped":{"written":7}}"#
+        );
+        // 旧バージョンが書いた形（`StopCollect`を知らない側）も読めることを確認する。
+        assert!(matches!(
+            serde_json::from_str::<LearnRequest>(r#""Teardown""#),
+            Ok(LearnRequest::Teardown)
+        ));
+    }
+
     #[test]
     fn teardown_and_responses_have_a_stable_wire_format() {
         assert_eq!(
@@ -184,10 +233,7 @@ mod tests {
             r#"{"Started":{"etw_available":true}}"#
         );
         assert_eq!(
-            serde_json::to_string(&LearnResponse::TornDown {
-                denials_written: 7
-            })
-            .unwrap(),
+            serde_json::to_string(&LearnResponse::TornDown { denials_written: 7 }).unwrap(),
             r#"{"TornDown":{"denials_written":7}}"#
         );
     }

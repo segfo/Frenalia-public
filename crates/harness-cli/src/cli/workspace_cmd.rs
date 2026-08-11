@@ -146,6 +146,8 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
         &[],
         None,
         &WorkspaceWriteMode::DirectRw,
+        // D-60: 単発の`harness workspace`コマンドで、常駐daemonは居ない。
+        None,
     ) {
         Ok(sel) => sel,
         Err(e) => {
@@ -194,14 +196,6 @@ pub(crate) fn shell_sees_staged_writes(shell_tier: &harness_core::ShellTierSelec
     }
 }
 
-pub(crate) fn to_sandbox_fs_access(access: harness_config::FsAccess) -> harness_sandbox::FsAccess {
-    match access {
-        harness_config::FsAccess::Read => harness_sandbox::FsAccess::Read,
-        harness_config::FsAccess::ReadWrite => harness_sandbox::FsAccess::ReadWrite,
-        harness_config::FsAccess::ReadExec => harness_sandbox::FsAccess::ReadExec,
-    }
-}
-
 /// `--session <id>`（省略時は最新）から、そのセッションが使ったオーバーレイ置き場を解決する。
 /// `--staged`置き場（workspace内`.harness/sandbox/<id>`）を先に試し、無ければ`--cow`置き場
 /// （workspace外CoW upperディレクトリ、Windows専用）を試す——1セッションは常にどちらか
@@ -243,8 +237,15 @@ pub(crate) fn cow_upper_dir_checked(_session: Option<&str>) -> Option<PathBuf> {
 /// 組み立てて全サブコマンドで使い回す。
 pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
     let (session, output_format_and_kind) = match &cmd {
-        Commands::Changes { session, output_format } => (session.clone(), Some(*output_format)),
-        Commands::Apply { session, output_format, .. } => (session.clone(), Some(*output_format)),
+        Commands::Changes {
+            session,
+            output_format,
+        } => (session.clone(), Some(*output_format)),
+        Commands::Apply {
+            session,
+            output_format,
+            ..
+        } => (session.clone(), Some(*output_format)),
         Commands::Discard { session } => (session.clone(), None),
         Commands::Resolve { session, .. } => (session.clone(), None),
         // `Fs`/`Tier3`/`Prompt`はmain()側でそれぞれ専用の振り分け先へ処理済みで、ここには
@@ -276,7 +277,8 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         }
     };
 
-    let Some((staging, cow_upper_dir)) = resolve_session_overlay(workspace_root, session.as_deref())
+    let Some((staging, cow_upper_dir)) =
+        resolve_session_overlay(workspace_root, session.as_deref())
     else {
         eprintln!("no staged sandbox or CoW upper directory found (nothing to show)");
         return ExitCode::FAILURE;
@@ -327,9 +329,8 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                         // BUG-066: 台帳に無いオーバーレイ実体も同じ流儀で印を付ける。
                         let mut marks = String::new();
                         if c.unledgered {
-                            marks.push_str(
-                                " [unledgered: present in the overlay but not recorded]",
-                            );
+                            marks
+                                .push_str(" [unledgered: present in the overlay but not recorded]");
                         }
                         if let Some(reason) = &c.rejected {
                             marks.push_str(&format!(" [rejected: {reason}]"));

@@ -76,6 +76,11 @@ pub use win_common::decode_console_bytes;
 // 各`tierN`の`mod.rs`がそのTierのファサード。外部へ見せるモジュールと、Tier内部の
 // 実装詳細（`pub(crate)`）の区別はそこで宣言する。
 
+/// Tier0は「保護なし」の起動経路で、ポリシーエディタのパス1（記録）が使う。
+/// 隔離Tierの一員ではなく、**あえて隔離しない**入口である（`tier0`のモジュールdoc参照）。
+#[cfg(windows)]
+pub mod tier0;
+
 #[cfg(windows)]
 pub mod tier1;
 
@@ -90,10 +95,10 @@ pub mod tier2b;
 pub use manifest::ManifestOp;
 pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};
 pub use overlay_hunks::{FileReview, HunkBlock, HunkSelection};
-pub use textdiff::{DiffHunk, DiffKind, DiffLine};
 pub use read_scope::{ReadScope, ReadScopeError};
 pub use secret_env::{build_child_env, git_hardening_env};
 pub use shell_tier::{select_tier, FsAccess, FsPassthrough, TierError, WorkspaceWriteMode};
+pub use textdiff::{DiffHunk, DiffKind, DiffLine};
 
 use std::path::{Path, PathBuf};
 

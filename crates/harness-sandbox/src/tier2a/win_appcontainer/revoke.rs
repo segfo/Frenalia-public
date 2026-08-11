@@ -261,7 +261,11 @@ fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<bool, AppContai
         )
         .ok()
         {
-            return if is_vanished(&e) { Ok(false) } else { Err(to_err(e)) };
+            return if is_vanished(&e) {
+                Ok(false)
+            } else {
+                Err(to_err(e))
+            };
         }
 
         let mut new_buf: Vec<u8> = Vec::new();
@@ -443,7 +447,11 @@ fn unprotect_dacl_restoring_inheritance(path: &Path) -> Result<bool, AppContaine
         )
         .ok()
         {
-            return if is_vanished(&e) { Ok(false) } else { Err(to_err(e)) };
+            return if is_vanished(&e) {
+                Ok(false)
+            } else {
+                Err(to_err(e))
+            };
         }
 
         // 現在のDACLをそのまま渡し、`UNPROTECTED_…`で「継承を受け付ける状態へ戻せ」とだけ言う。
@@ -487,114 +495,42 @@ fn unprotect_dacl_restoring_inheritance(path: &Path) -> Result<bool, AppContaine
 /// プロファイル名からSIDを導出して剥がし、ついでにworkspace一覧台帳からも消す。
 /// `session_profile`側はACL APIを知らない（規則3の分割線）ので、その具体をここが持つ。
 /// preflightの起動時GCと、CLIのセッション終了時撤収の**両方がこの1本を使う**。
-pub fn revoke_session_grant(path: &Path, profile_name: &str) {
-    let Ok(sid) = ensure_profile(profile_name) else {
-        return;
+///
+/// [BUG-103] **剥がせなかったノードを返す**（`session_profile::RevokeLeftovers`）。かつては
+/// `let _ = revoke_ace_recursive(...)`で捨てており、`%TEMP%`のような共有ツリーで1件も
+/// 剥がせなくても呼び出し側には成功と同じに見えていた。ここはセッション終了時の
+/// **唯一の撤収経路**なので、捨てた瞬間に孤立ACEの発生が観測不能になる（B-09）。
+///
+/// SIDを導出できないとき（プロファイルが既に消えている等）も**空ではなく理由を返す**——
+/// 「剥がすものが無かった」と「剥がしに行けなかった」を同じ値にしない（B-10）。
+pub fn revoke_session_grant(
+    path: &Path,
+    profile_name: &str,
+) -> crate::tier2a::session_profile::RevokeLeftovers {
+    // [BUG-101] 撤収は`ensure_profile`（＝存在しなければ`CreateAppContainerProfile`で作る）を
+    // 呼ばない。剥がしに来た関数がOSの資源を作るのは筋が通らないし、削除済みプロファイルを
+    // 復活させる。SIDの導出は名前のハッシュから決まるので、登録の有無に依らず同じ値になる。
+    let sid = match derive_profile_sid(profile_name) {
+        Ok(sid) => sid,
+        Err(e) => {
+            return vec![(
+                path.to_path_buf(),
+                format!("cannot derive the SID of {profile_name}: {e}"),
+            )]
+        }
     };
-    let _ = revoke_ace_recursive(path, sid.as_psid());
+    let leftovers = match revoke_ace_recursive(path, sid.as_psid()) {
+        Ok(report) => report.blocked,
+        // rootにすら触れなかった＝このツリーからは1件も剥がせていない。
+        Err(e) => vec![(path.to_path_buf(), e.to_string())],
+    };
     crate::tier2a::workspace_ledger::remove_workspace_entry(path);
+    leftovers
 }
 
-/// AppContainer SIDの文字列接頭辞（`S-1-15-2-<hash…>`）。パッケージSID／capability SIDの
-/// うち、`SECURITY_APP_PACKAGE_BASE_RID`(2)で始まるものがAppContainerのパッケージSIDである。
-const APPCONTAINER_SID_PREFIX: &str = "S-1-15-2-";
-
-/// `path`に載っているAppContainerパッケージSID宛の明示ACEのうち、`keep_profiles`のどの
-/// プロファイルのSIDとも一致しないものを剥がし、剥がしたSID文字列を返す。
-///
-/// **なぜ「残す側」を名指しするのか**: プロファイルが削除済みのSIDは名前へ逆引きできない
-/// （`DeriveAppContainerSidFromAppContainerName`は名前→SIDの一方向）ため、「死んだセッションの
-/// SIDを列挙して剥がす」方式は既に残ってしまったACEには効かない。生存しているセッション
-/// （`session_profile::live_profile_names`）のSIDだけを残し、それ以外を剥がす向きにする。
-///
-/// 対象は**呼び出し側が明示した既知パス**に限る（現状はredirector DLL）。マシン全体を
-/// 走査する掃除機にはしない——それはこのプロセスが所有していない変更まで巻き込む。
-///
-/// BUG-059で実マシンに4件残留していた孤立ACEの回収経路。付与側（`preflight`）に保険を
-/// 入れて新規発生は止めたが、**既に残っているものは台帳に無いので`fs revoke`では届かない**。
-pub fn revoke_stale_appcontainer_aces(
-    path: &Path,
-    keep_profiles: &[String],
-) -> Result<Vec<String>, AppContainerError> {
-    let keep: Vec<String> = keep_profiles
-        .iter()
-        .filter_map(|name| ensure_profile(name).ok())
-        .filter_map(|sid| crate::win_common::sid_to_string(sid.as_psid()).ok())
-        .collect();
-
-    let mut removed = Vec::new();
-    for (sid_string, sid) in appcontainer_sid_aces(path)? {
-        if keep.contains(&sid_string) {
-            continue;
-        }
-        revoke_ace(path, sid.as_psid())?;
-        removed.push(sid_string);
-    }
-    Ok(removed)
-}
-
-/// `path`のDACLに明示ACEを持つAppContainerパッケージSIDを列挙する（重複除去）。
-///
-/// `sid_ace_mask`と同じ`GetExplicitEntriesFromAclW`経由で読む（`GetAce`によるACEヘッダの
-/// 直接パースより低リスク、同関数のコメント参照）。SIDはWin32が確保した配列の中を指すため、
-/// 解放前に[`crate::win_common::OwnedSid`]へコピーして所有権を単純化する。
-fn appcontainer_sid_aces(
-    path: &Path,
-) -> Result<Vec<(String, crate::win_common::OwnedSid)>, AppContainerError> {
-    let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
-        path: path.to_path_buf(),
-        reason: e.to_string(),
-    };
-    unsafe {
-        let path_w = long_path_wide(path);
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        GetNamedSecurityInfoW(
-            PCWSTR(path_w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut dacl),
-            None,
-            &mut sd,
-        )
-        .ok()
-        .map_err(to_err)?;
-
-        let mut count: u32 = 0;
-        let mut entries: *mut EXPLICIT_ACCESS_W = std::ptr::null_mut();
-        let err = GetExplicitEntriesFromAclW(dacl as *const _, &mut count, &mut entries);
-        if let Err(e) = err.ok() {
-            let _ = LocalFree(HLOCAL(sd.0));
-            return Err(to_err(e));
-        }
-
-        let mut found: Vec<(String, crate::win_common::OwnedSid)> = Vec::new();
-        if !entries.is_null() {
-            for entry in std::slice::from_raw_parts(entries, count as usize) {
-                if entry.Trustee.TrusteeForm != TRUSTEE_IS_SID {
-                    continue;
-                }
-                let entry_sid = PSID(entry.Trustee.ptstrName.0 as *mut c_void);
-                let Ok(sid_string) = crate::win_common::sid_to_string(entry_sid) else {
-                    continue;
-                };
-                if !sid_string.starts_with(APPCONTAINER_SID_PREFIX)
-                    || found.iter().any(|(s, _)| s == &sid_string)
-                {
-                    continue;
-                }
-                if let Ok(owned) = crate::win_common::OwnedSid::copy_from(entry_sid) {
-                    found.push((sid_string, owned));
-                }
-            }
-            let _ = LocalFree(HLOCAL(entries as *mut _));
-        }
-        let _ = LocalFree(HLOCAL(sd.0));
-        Ok(found)
-    }
-}
+// `appcontainer_sid_aces`（パスのDACLに載っているパッケージSIDの列挙）と
+// `revoke_stale_appcontainer_aces`（残す側を名指しして他を剥がす）は`revoke_subjects`へ移した。
+// 「どのSIDを剥がすか」を決める責務であって「どう剥がすか」ではないため（規則3の分割線）。
 
 /// 祖先traverseの主体（`traverse_capability_sid`）のバイト列を1回だけ導出してキャッシュする。
 ///
@@ -622,7 +558,8 @@ fn is_traverse_capability_sid(sid: PSID) -> bool {
 /// 持たず、誰が付けたACEでも同じように消せる。この非対称のせいで「grantがno-op・revokeだけ
 /// 有効」となり、テストが`C:\`の永続ACEを純減させてマシン全体のTier2a FS I/Oを壊した。
 fn is_protected_traverse_grant(path: &Path, sid: PSID) -> bool {
-    is_traverse_capability_sid(sid) && crate::tier2a::traverse_ledger::is_recorded_traverse_node(path)
+    is_traverse_capability_sid(sid)
+        && crate::tier2a::traverse_ledger::is_recorded_traverse_node(path)
 }
 
 /// `path`のDACLから`sid`宛の明示ACEを取り除く（D-48のガード付き、通常はこちらを使う）。
@@ -632,6 +569,12 @@ fn is_protected_traverse_grant(path: &Path, sid: PSID) -> bool {
 /// 「汎用APIでは触れない／名指しの関数でだけ触れる」という非対称が目的で、悪意ある呼び出しを
 /// 止めるためのものではない——**更新漏れの巻き添えを止める**ためのものである。
 pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    revoke_ace_reporting(path, sid).map(|_rewrote| ())
+}
+
+/// [`revoke_ace`]の実体。**剥がして書き戻したか**を返す（[`RevokeReport`]の`rewritten`が
+/// 「触った数」ではなく「実際に変わった数」であるために要る）。判定と文面は1箇所に保つ。
+fn revoke_ace_reporting(path: &Path, sid: PSID) -> Result<bool, AppContainerError> {
     if is_protected_traverse_grant(path, sid) {
         return Err(AppContainerError::AclRevoke {
             path: path.to_path_buf(),
@@ -645,7 +588,7 @@ pub fn revoke_ace(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
             ),
         });
     }
-    revoke_ace_unguarded(path, sid)
+    revoke_sids_from_node(path, &[sid])
 }
 
 /// [`revoke_ace`]の実体（D-48のガードを通らない）。**このモジュールと
@@ -667,6 +610,12 @@ pub(crate) fn revoke_ace_unguarded(path: &Path, sid: PSID) -> Result<(), AppCont
 /// 戻り値は実際に書込を行ったか（＝1本以上のACEを剥がしたか）。0件なら`false`を返し、
 /// 高価な`CreateFileW(WRITE_DAC)`＋`SetKernelObjectSecurity`を呼ばない
 /// （`copy_dacl_excluding_sids`のdoc参照）。
+///
+/// [BUG-103] **触る前に消えていたノードは`Ok(false)`**（剥がす先が無いので失敗ではない）。
+/// [`remove_sid_aces_and_protect`]が既に同じ判定を持っており、そちらと同じ[`is_vanished`]を
+/// 通す。ここを`Err`にすると、`%TEMP%`のように揺れ動くツリーの撤収で
+/// [`RevokeReport::blocked`]が「消えただけのノード」で埋まり、**本当に剥がせなかったものが
+/// 埋もれる**（B-09: 数える対象を混ぜない）。
 fn revoke_sids_from_node(path: &Path, sids: &[PSID]) -> Result<bool, AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
         path: path.to_path_buf(),
@@ -676,7 +625,7 @@ fn revoke_sids_from_node(path: &Path, sids: &[PSID]) -> Result<bool, AppContaine
         let path_w = long_path_wide(path);
         let mut existing_dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = PSECURITY_DESCRIPTOR::default();
-        GetNamedSecurityInfoW(
+        if let Err(e) = GetNamedSecurityInfoW(
             PCWSTR(path_w.as_ptr()),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
@@ -687,7 +636,9 @@ fn revoke_sids_from_node(path: &Path, sids: &[PSID]) -> Result<bool, AppContaine
             &mut sd,
         )
         .ok()
-        .map_err(to_err)?;
+        {
+            return if is_vanished(&e) { Ok(false) } else { Err(to_err(e)) };
+        }
 
         let mut new_buf: Vec<u8> = Vec::new();
         let (new_dacl, removed) =
@@ -717,6 +668,49 @@ fn revoke_sids_from_node(path: &Path, sids: &[PSID]) -> Result<bool, AppContaine
     Ok(true)
 }
 
+/// [BUG-103] 撤収1回分の結果。**件数と「剥がせなかったノード」を返す**。
+///
+/// 姉妹の[`RevokeWorkspaceReport`]は最初から件数を返していたのに、[`revoke_ace_recursive`]だけが
+/// `Result<(), _>`だった。この非対称のせいで「1件も剥がせなかった」が呼び出し側から見えず
+/// （本体の呼び出し3箇所は全部`let _ =`だった）、実マシンに`(OI)(CI)(R,W,D)`が残り続けた（B-09）。
+#[derive(Debug, Default)]
+#[must_use]
+pub struct RevokeReport {
+    /// 撤収を試みたノード数（rootを含む）。
+    pub checked: usize,
+    /// 実際にACEを1本以上剥がして書き戻したノード数。
+    pub rewritten: usize,
+    /// **剥がせなかったノードと理由。** `WRITE_DAC`が無い（他アカウント所有・保護DACL）、
+    /// D-48で保護されている等。空でなければ、そのノードにはACEが残っている。
+    pub blocked: Vec<(std::path::PathBuf, String)>,
+}
+
+impl RevokeReport {
+    /// 1件でも剥がし残したか。
+    pub fn has_blocked(&self) -> bool {
+        !self.blocked.is_empty()
+    }
+
+    /// 残件の要約（先頭数件を名指しする）。**名前を出さないと`icacls`で追えない**（B-09）。
+    pub fn blocked_summary(&self, limit: usize) -> Option<String> {
+        if self.blocked.is_empty() {
+            return None;
+        }
+        let mut out = format!("{} node(s) still carry the ACE: ", self.blocked.len());
+        let shown: Vec<String> = self
+            .blocked
+            .iter()
+            .take(limit)
+            .map(|(path, reason)| format!("{} ({reason})", path.display()))
+            .collect();
+        out.push_str(&shown.join("; "));
+        if self.blocked.len() > limit {
+            out.push_str(&format!(" ... and {} more", self.blocked.len() - limit));
+        }
+        Some(out)
+    }
+}
+
 /// `root`配下（`root`自身含む）から`sid`のACEを再帰的に取り除く（`grant_ace_recursive`の逆）。
 /// D-13のfs passthrough撤収（`harness fs revoke`）本体。`grant_ace_recursive`と同じ
 /// `collect_dirs_and_files`（symlinkスキップ済み）を使い再walkするため、付与後に増えた
@@ -729,25 +723,130 @@ fn revoke_sids_from_node(path: &Path, sids: &[PSID]) -> Result<bool, AppContaine
 /// **台帳に正しく載っていても剥がれない**。付与側だけを直しても孤立ACEは止まらなかった、
 /// というのが実機E2Eで判明した順序である（付与側=`grant_ace_inheritable_access`、
 /// 記録側=`preflight`、撤収側=ここ、の3つが揃って初めて閉じる）。
-pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    if root.is_file() {
-        return revoke_ace(root, sid);
+///
+/// # [BUG-103] 途中で止まらない・rootを先に剥がす・件数を返す
+///
+/// かつてこの関数は(1)walkを`OnVanished::Abort`で回し、(2)ノードごとの失敗を`?`で伝播し、
+/// (3)`files`ループの後に`dirs`（rootはその先頭）を処理していた。この3つが重なると、
+/// **共有ディレクトリでは1件も剥がれない**——`%TEMP%`は中身が絶えず消えるので(1)で落ち、
+/// 落ちなくても実測で直下6,169件中95件が非昇格ユーザーに`WRITE_DAC`が無いので(2)で落ち、
+/// どちらの場合も(3)のrootへ到達しない。実マシンに`(OI)(CI)(R,W,D)`が残った機序がこれである。
+///
+/// 現在は:
+/// - **rootを最初に剥がす**。継承元を先に断てば、以後に作られるファイルへコピーが増えない。
+///   ただし**それだけでは足りない**——既にコピーを受け取った子孫からは自動では消えないことを
+///   `removing_only_the_root_ace_leaves_inherited_copies_on_descendants`が実測で固定している。
+///   だからwalkは残す。
+/// - walkは`OnVanished::Skip`（[`OnVanished`]自身のdocどおり、**残っているノードへ副作用を
+///   適用することが目的**の経路はこちら。`Abort`は「見えた範囲が完全であること」を結論の
+///   根拠に使う[`assert_no_sid_ace_recursive`]のためのものだった）。
+/// - ノードごとの失敗は`?`せず[`RevokeReport::blocked`]へ集めて**続行する**。
+///   `Err`を返すのは**rootにすら触れなかった**ときだけ。
+pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<RevokeReport, AppContainerError> {
+    revoke_tree(root, &|_, _| {}, &|path| revoke_ace_reporting(path, sid))
+}
+
+/// [`revoke_ace_recursive`]の複数SID版。**1回のツリー走査で`sids`の全部を剥がす。**
+///
+/// [BUG-101] `harness fs revoke`は「撤収し得るプロファイル」をSIDへ導出して**1つずつ**
+/// [`revoke_ace_recursive`]を回していた（この開発機では最大24回のツリー全walk）。実際に
+/// 剥がすべき主体は「そのパスのDACLに載っているSID」なので、まとめて1回で済む——
+/// ノードごとのDACL読取も1回になる（[`revoke_sids_from_node`]、BUG-082と同じ考え方）。
+///
+/// D-48ガードは[`revoke_sids_from_node_guarded`]がノードごとに`sids`側から除いて掛ける。
+/// 単一SID版が`Err`で全体を止めるのと違い、こちらは**保護対象のSIDだけを対象から外して
+/// 残りは撤収する**（バッチ全体を1件の保護で失敗させない）。
+///
+/// `progress`は`(処理済み, 全体)`で1000件ごとに呼ばれる（表示専用、
+/// [`revoke_workspace_sids_recursive`]と同じ間隔）。
+pub fn revoke_sids_recursive(
+    root: &Path,
+    sids: &[PSID],
+    progress: &dyn Fn(usize, usize),
+) -> Result<RevokeReport, AppContainerError> {
+    if sids.is_empty() {
+        // 対象0件。**walkもしない**——「剥がすものが無かった」ことは呼び出し側が
+        // `RevokeReport::checked == 0`で見分けられる（0件と成功を同じ値にしない、B-09）。
+        return Ok(RevokeReport::default());
     }
+    revoke_tree(root, progress, &|path| {
+        revoke_sids_from_node_guarded(path, sids)
+    })
+}
+
+/// [`revoke_ace_recursive`]と[`revoke_sids_recursive`]が共有するwalk本体。
+/// **違うのは「1ノードで何を剥がすか」だけ**なので、そこだけを`revoke_node`で受ける
+/// （`CODE-STRUCTURE-RULES` §5.0: 単一SID版と複数SID版でwalkのコピーを作らない。
+/// コピーを作ると、BUG-103で直した3点——root先頭・`OnVanished::Skip`・非中断——が
+/// 片方にだけ入っている状態が再び生まれる）。
+///
+/// `revoke_node`は「実際に剥がして書き戻したか」を返す。
+fn revoke_tree(
+    root: &Path,
+    progress: &dyn Fn(usize, usize),
+    revoke_node: &dyn Fn(&Path) -> Result<bool, AppContainerError>,
+) -> Result<RevokeReport, AppContainerError> {
+    let mut report = RevokeReport::default();
+    if root.is_file() {
+        fold_node(root, revoke_node, &mut report);
+        progress(1, 1);
+        return Ok(report);
+    }
+
+    // **rootが先**（継承元を断つ）。ここで失敗したら撤収は成立していないので`Err`にする
+    // ——呼び出し側の「rootのACEが消えたか」という権威的判定と同じ基準である。
+    report.checked += 1;
+    if revoke_node(root)? {
+        report.rewritten += 1;
+    }
+
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
+    collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Skip).map_err(|e| {
         AppContainerError::AclRevoke {
             path: root.to_path_buf(),
             reason: e.to_string(),
         }
     })?;
-    for file in &files {
-        revoke_ace(file, sid)?;
+    // totalが定まった時点で1回通知する（呼び出し側がスピナーから数値表示へ切り替えられる、
+    // `revoke_workspace_sids_recursive`と同じ理由）。
+    let total = dirs.len() + files.len();
+    progress(0, total);
+    let mut processed = 0usize;
+    for node in files.iter().chain(dirs.iter()) {
+        processed += 1;
+        if processed.is_multiple_of(1000) || processed == total {
+            progress(processed, total);
+        }
+        // rootは上で処理済み（`collect_dirs_and_files`は`dirs[0]`にrootを入れる）。
+        // **`processed`からは外さない**——進捗の分母は走査したノード数である。
+        if node == root {
+            continue;
+        }
+        fold_node(node, revoke_node, &mut report);
     }
-    for dir in &dirs {
-        revoke_ace(dir, sid)?;
+    Ok(report)
+}
+
+/// 1ノードの撤収結果を[`RevokeReport`]へ畳む。**失敗しても止めない**（呼び出し側のループが
+/// 続行できるように、成否をここで分類する）。
+///
+/// 「walkで見つけてから触るまでの間に消えた」ノードは失敗ではない（剥がす先が無い）。
+/// その判定は[`revoke_sids_from_node`]が[`is_vanished`]で型のまま行い、`Ok`で返す
+/// ——エラー文面の一致で見分けるとロケールで壊れる（B-33）。
+fn fold_node(
+    path: &Path,
+    revoke_node: &dyn Fn(&Path) -> Result<bool, AppContainerError>,
+    report: &mut RevokeReport,
+) {
+    report.checked += 1;
+    match revoke_node(path) {
+        Ok(true) => report.rewritten += 1,
+        // `false`は「このノードには剥がすACEが無かった」か「触る前に消えていた」。
+        // どちらも失敗ではないので数えるのは`checked`だけ。
+        Ok(false) => {}
+        Err(e) => report.blocked.push((path.to_path_buf(), e.to_string())),
     }
-    Ok(())
 }
 
 /// [BUG-082] `fix_descendants_missing_ace`と対称の、workspace撤収専用の1walk一括撤収
@@ -1011,9 +1110,20 @@ pub enum RevokeOutcome {
     /// `root`配下から完全に`sid`のACEを撤収できた。
     FullyRevoked,
     /// `root`自身のACEは撤収できたが、一部の子孫（`NT SERVICE\TrustedInstaller`所有等で
-    /// `WRITE_DAC`不可）にACEが残る。**孤立ACEではない**——grantとrevokeは同じ`WRITE_DAC`を
-    /// 要するため、rootが消えたのにACEが残る子孫は「こちらが書けない＝元々付与もできていない
-    /// ノード」であり、除去残しにはならない。台帳からは除去してよい。
+    /// `WRITE_DAC`不可）にACEが残る。台帳からは除去する（残しても同じ場所で失敗し続けるため）。
+    ///
+    /// # [BUG-103] かつてここに書いていた正当化は**継承ACEには当たらない**
+    ///
+    /// 以前の文面は「grantとrevokeは同じ`WRITE_DAC`を要するため、rootが消えたのにACEが残る
+    /// 子孫は元々付与もできていないノードであり、除去残しにはならない」だった。
+    /// **これは明示ACEにしか成り立たない。** 付与は`(OI)(CI)`の継承ACEをrootへ1本書くだけで
+    /// 済み、子孫のコピーは**Windowsが作成時に自動で載せる**——子孫の`WRITE_DAC`は要らない。
+    /// つまり「こちらが書けないノード」にも実効的なACEは載り得る。
+    /// `removing_only_the_root_ace_leaves_inherited_copies_on_descendants`が実測で固定した。
+    ///
+    /// したがってこの値は「**残っているが、このプロセスの権限では剥がせない**」を意味する。
+    /// 残ったノードは[`revoke_passthrough_reporting`]が名前で返すので、呼び出し側はそれを
+    /// 見せること（昇格経由の`RevokeFsAllow`なら剥がせる場合がある）。
     RootClearedDescendantsBlocked,
     /// `root`自身のACEがまだ残っている（真の失敗、または一過性で再試行の余地あり）。
     /// 台帳には残す。
@@ -1026,21 +1136,40 @@ pub enum RevokeOutcome {
 /// 途中の子孫で`Err`を返しても、それを最終判定に使わず`sid_ace_mask(root)`で判定する点が要。
 /// forced撤収（`SeRestorePrivilege`下）で呼ぶ場合は呼び出し側が`with_restore_privilege`で囲う。
 pub fn revoke_passthrough(root: &Path, sid: PSID) -> RevokeOutcome {
+    revoke_passthrough_reporting(root, sid).0
+}
+
+/// [`revoke_passthrough`]に**剥がせなかったノードの名前**を添えて返す（`gc_dead_sessions`と
+/// `gc_dead_sessions_reporting`の関係と同じ形）。
+///
+/// [BUG-103] 判定基準は変えていない——**rootの権威的な再プローブがそのまま最終判定**である。
+/// 変えたのは「途中で何が起きたかを呼び出し側が見られるようにした」点だけで、
+/// かつては`let _ =`で捨てていた（B-09）。`Err`は「rootにすら触れなかった」ときだけ来るので、
+/// その理由も残件として返す。
+pub fn revoke_passthrough_reporting(root: &Path, sid: PSID) -> (RevokeOutcome, RevokeReport) {
     // rootが既に存在しない（revoke後にユーザが削除した等）場合は、実FS上にACEを載せる
     // オブジェクトが無いので完全撤収扱いとし、台帳エントリを掃除できるようにする。
     if !root.exists() {
-        return RevokeOutcome::FullyRevoked;
+        return (RevokeOutcome::FullyRevoked, RevokeReport::default());
     }
     // 途中の子孫（TrustedInstaller所有等）で失敗しても、後段のroot再プローブで最終判定する。
-    let _ = revoke_ace_recursive(root, sid);
-    match sid_ace_mask(root, sid) {
+    let report = match revoke_ace_recursive(root, sid) {
+        Ok(report) => report,
+        Err(e) => RevokeReport {
+            checked: 1,
+            blocked: vec![(root.to_path_buf(), e.to_string())],
+            ..RevokeReport::default()
+        },
+    };
+    let outcome = match sid_ace_mask(root, sid) {
         Ok(None) => match assert_no_sid_ace_recursive(root, sid) {
             Ok(()) => RevokeOutcome::FullyRevoked,
             Err(_) => RevokeOutcome::RootClearedDescendantsBlocked,
         },
         // ACEが残っている、またはrootをプローブできない（存在しない等）→台帳に残す。
         _ => RevokeOutcome::Failed,
-    }
+    };
+    (outcome, report)
 }
 
 /// `assert_no_sid_ace_recursive`の非再帰版。単一ノード（`path`自身）のみを検証する。

@@ -16,12 +16,10 @@ fn main() -> std::process::ExitCode {
         connect_with_timeout, pipe_name_for_current_user, read_framed_timeout,
         user_only_security_attributes, wide, write_framed_timeout,
     };
-    use dev_elevated_runner::{resolve_target_args, IDLE_SHUTDOWN, RunRequest, RunResponse};
+    use dev_elevated_runner::{resolve_target_args, RunRequest, RunResponse, IDLE_SHUTDOWN};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HLOCAL};
-    use windows::Win32::Storage::FileSystem::{
-        FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
-    };
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
     use windows::Win32::System::Pipes::{
         CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
@@ -103,8 +101,8 @@ fn main() -> std::process::ExitCode {
         let result: Result<(), String> = (|| {
             let request_bytes = read_framed_timeout(pipe, REQUEST_READ_TIMEOUT)
                 .map_err(|e| format!("read request: {e}"))?;
-            let request: RunRequest =
-                serde_json::from_slice(&request_bytes).map_err(|e| format!("parse request: {e}"))?;
+            let request: RunRequest = serde_json::from_slice(&request_bytes)
+                .map_err(|e| format!("parse request: {e}"))?;
 
             eprintln!("dev-elevated-runnerd: request target={:?}", request.target);
 

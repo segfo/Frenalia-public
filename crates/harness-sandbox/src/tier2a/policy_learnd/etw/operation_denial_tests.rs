@@ -250,7 +250,10 @@ fn where_does_an_operation_stage_denial_surface() {
                 .replace("@P@", &path.display().to_string())
                 .replace(
                     "@T@",
-                    &dest.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                    &dest
+                        .as_ref()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default(),
                 ),
         );
         script.push('\n');
@@ -308,7 +311,8 @@ fn where_does_an_operation_stage_denial_surface() {
     // 2. `Irp`で「開始イベント」を保持し、`OperationEnd`(24)で引き当てる（現行のCorrelatorと同型）
     // 3. 拒否だったものについて、開始イベントの`FileName`（Createなら持っている）か、
     //    無ければ`FileObject`/`FileKey`から引く
-    let mut by_file_object: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut by_file_object: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
     let mut by_file_key: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     let mut pending: std::collections::HashMap<u64, RawFsEvent> = std::collections::HashMap::new();
 
@@ -394,7 +398,10 @@ fn where_does_an_operation_stage_denial_surface() {
     }
 
     // --- 出力 ---
-    println!("=== operation results (child pid={child_pid}, family {} pids) ===", family.len());
+    println!(
+        "=== operation results (child pid={child_pid}, family {} pids) ===",
+        family.len()
+    );
     match &output {
         Ok((stdout, stderr, code)) => {
             for line in stdout.lines().filter(|l| l.contains('|')) {
@@ -408,7 +415,10 @@ fn where_does_an_operation_stage_denial_surface() {
         Err(e) => println!("  child failed: {e}"),
     }
 
-    println!("=== raw capture: {} events (dropped {raw_dropped}) ===", raw.len());
+    println!(
+        "=== raw capture: {} events (dropped {raw_dropped}) ===",
+        raw.len()
+    );
     println!("=== event histogram (whole machine) ===");
     for (id, count) in &outcome.event_histogram {
         println!("  id={id:<3} ({:<22}) = {count}", event_name(*id));
@@ -432,19 +442,28 @@ fn where_does_an_operation_stage_denial_surface() {
                 .unwrap_or_else(|| "-".to_string()),
             hit.via,
             hit.pid,
-            if hit.in_family { "" } else { " (OUTSIDE-FAMILY)" }
+            if hit.in_family {
+                ""
+            } else {
+                " (OUTSIDE-FAMILY)"
+            }
         );
     }
     if resolved.is_empty() {
         println!("  (none)");
     }
-    println!("  access-denied OperationEnds whose path could not be resolved: {denials_without_path}");
+    println!(
+        "  access-denied OperationEnds whose path could not be resolved: {denials_without_path}"
+    );
     println!(
         "=== tables built: FileObject->path {} entries, FileKey->path {} entries ===",
         by_file_object.len(),
         by_file_key.len()
     );
-    println!("=== events={} lost={} ===", outcome.seen_events, outcome.events_lost);
+    println!(
+        "=== events={} lost={} ===",
+        outcome.seen_events, outcome.events_lost
+    );
     println!(
         "HOW TO READ: every denial should list 'id=12 (Create)' as its originating event and \
          'via=event's own FileName' as how the path was recovered. If any denial ever originates \
@@ -455,7 +474,7 @@ fn where_does_an_operation_stage_denial_surface() {
          RESULTS.md \u{00a7}18.5)."
     );
 
-    crate::tier2a::session_profile::end_session(
+    let _ = crate::tier2a::session_profile::end_session(
         &crate::tier2a::win_appcontainer::revoke_session_grant,
     );
 

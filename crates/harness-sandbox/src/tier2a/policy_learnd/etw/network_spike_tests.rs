@@ -81,7 +81,10 @@ fn ipv4_from_raw(bytes: &[u8]) -> Option<String> {
     if bytes.len() != 4 {
         return None;
     }
-    Some(format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]))
+    Some(format!(
+        "{}.{}.{}.{}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    ))
 }
 
 /// `dport`はネットワークバイト順(big-endian)の16bit値。`tdh::property_u64`はホスト側の
@@ -293,7 +296,11 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
 
     if record.EventHeader.ProviderId == KERNEL_NETWORK_PROVIDER_GUID {
         if let Ok(mut pids) = sink.kernel_network_event_pids.lock() {
-            pids.push(tdh::property_u64(record, "PID").map(|v| v as u32).unwrap_or(pid));
+            pids.push(
+                tdh::property_u64(record, "PID")
+                    .map(|v| v as u32)
+                    .unwrap_or(pid),
+            );
         }
     }
 
@@ -303,7 +310,9 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
         let event = TcpConnectEvent {
             // `PID`はテンプレートの明示フィールド（`daddr`/`dport`と同じイベントに同居する）。
             // 取れなければ`EventHeader.ProcessId`へフォールバックする。
-            pid: tdh::property_u64(record, "PID").map(|v| v as u32).unwrap_or(pid),
+            pid: tdh::property_u64(record, "PID")
+                .map(|v| v as u32)
+                .unwrap_or(pid),
             daddr: property_raw_bytes(record, "daddr").and_then(|b| ipv4_from_raw(&b)),
             dport: property_raw_bytes(record, "dport").and_then(|b| port_from_raw_be(&b)),
         };
@@ -470,7 +479,10 @@ fn etw_dns_client_observes_pid_and_domain_for_a_query() {
         );
     }
 
-    assert!(outcome.seen_events > 0, "no events reached the callback at all");
+    assert!(
+        outcome.seen_events > 0,
+        "no events reached the callback at all"
+    );
 
     // **実測で判明した罠**: 1回の高レベルなクエリに対し、Id=3008(クエリ完了)は複数回発火する
     // （実行結果ではQueryResults=Noneのものが先に1件、Some(...)が後で1件、pidは同一）。
@@ -478,7 +490,9 @@ fn etw_dns_client_observes_pid_and_domain_for_a_query() {
     let my_pid = std::process::id();
     let matched = outcome.dns_queries.iter().find(|q| {
         q.pid == my_pid
-            && q.query_name.as_deref().is_some_and(|n| n.contains("dns.google"))
+            && q.query_name
+                .as_deref()
+                .is_some_and(|n| n.contains("dns.google"))
             && q.query_results.as_deref().is_some_and(|r| !r.is_empty())
     });
     let matched = matched.unwrap_or_else(|| {
@@ -488,7 +502,10 @@ fn etw_dns_client_observes_pid_and_domain_for_a_query() {
             outcome.dns_queries
         )
     });
-    println!("matched: pid={} query_results={:?}", matched.pid, matched.query_results);
+    println!(
+        "matched: pid={} query_results={:?}",
+        matched.pid, matched.query_results
+    );
 }
 
 /// `QueryResults`は`;`区切りのIPリストで、IPv4は`::ffff:8.8.8.8`のようなIPv4-mapped IPv6表記に
@@ -610,7 +627,12 @@ fn etw_dns_client_on_a_cache_warm_resolution() {
     let matches: Vec<_> = outcome
         .dns_queries
         .iter()
-        .filter(|q| q.pid == my_pid && q.query_name.as_deref().is_some_and(|n| n.contains("dns.google")))
+        .filter(|q| {
+            q.pid == my_pid
+                && q.query_name
+                    .as_deref()
+                    .is_some_and(|n| n.contains("dns.google"))
+        })
         .collect();
     println!(
         "observed {} total events; {} DNS-Client event(s) for this pid+domain during the \
@@ -670,10 +692,12 @@ fn etw_no_dns_event_when_connecting_by_ip_without_resolving_in_window() {
 
     let my_pid = std::process::id();
     let connect_seen = outcome.tcp_connects.iter().any(|c| c.pid == my_pid);
-    let dns_seen = outcome
-        .dns_queries
-        .iter()
-        .any(|q| q.pid == my_pid && q.query_name.as_deref().is_some_and(|n| n.contains("dns.google")));
+    let dns_seen = outcome.dns_queries.iter().any(|q| {
+        q.pid == my_pid
+            && q.query_name
+                .as_deref()
+                .is_some_and(|n| n.contains("dns.google"))
+    });
     println!(
         "observed {} total events; this pid's TCP connect observed={connect_seen}, \
          this pid's DNS-Client event for dns.google observed={dns_seen}",
@@ -717,8 +741,11 @@ fn etw_attributes_events_to_a_child_process_not_the_parent() {
     let outcome = session.stop();
 
     let my_pid = std::process::id();
-    let child_connects: Vec<_> =
-        outcome.tcp_connects.iter().filter(|c| c.pid == child_pid).collect();
+    let child_connects: Vec<_> = outcome
+        .tcp_connects
+        .iter()
+        .filter(|c| c.pid == child_pid)
+        .collect();
     let child_dns: Vec<_> = outcome
         .dns_queries
         .iter()
@@ -742,7 +769,10 @@ fn etw_attributes_events_to_a_child_process_not_the_parent() {
         println!("  child connect: daddr={:?} dport={:?}", c.daddr, c.dport);
     }
     for q in &child_dns {
-        println!("  child dns: query_name={:?} query_results={:?}", q.query_name, q.query_results);
+        println!(
+            "  child dns: query_name={:?} query_results={:?}",
+            q.query_name, q.query_results
+        );
     }
 
     assert!(
@@ -782,12 +812,17 @@ fn etw_dns_client_is_blind_to_a_raw_udp_query_that_bypasses_the_os_resolver() {
     let outcome = session.stop();
 
     let my_pid = std::process::id();
-    let kernel_network_saw_us =
-        outcome.kernel_network_event_pids.iter().filter(|&&p| p == my_pid).count();
-    let dns_client_saw_us = outcome
-        .dns_queries
+    let kernel_network_saw_us = outcome
+        .kernel_network_event_pids
         .iter()
-        .any(|q| q.pid == my_pid && q.query_name.as_deref().is_some_and(|n| n.contains("dns.google")));
+        .filter(|&&p| p == my_pid)
+        .count();
+    let dns_client_saw_us = outcome.dns_queries.iter().any(|q| {
+        q.pid == my_pid
+            && q.query_name
+                .as_deref()
+                .is_some_and(|n| n.contains("dns.google"))
+    });
 
     println!(
         "observed {} total events; Kernel-Network events for this pid={kernel_network_saw_us}, \

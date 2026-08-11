@@ -542,6 +542,10 @@ pub(crate) fn fs_access_mask(access: FsAccess) -> u32 {
         FsAccess::Read => FILE_GENERIC_READ.0,
         FsAccess::ReadWrite => FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | DELETE.0,
         FsAccess::ReadExec => FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0,
+        // 同じパスへの`fs.read_write`と`fs.read_exec`の宣言を1本のACEへ畳んだ形
+        // （[`FsAccess::wider`]）。**workspace本体へ与えるマスクと同じ集合**なので、
+        // 片方だけ直る事故を避けるために[`workspace_rwx_mask`]をそのまま呼ぶ。
+        FsAccess::ReadWriteExec => workspace_rwx_mask(),
     }
 }
 
@@ -861,4 +865,59 @@ pub(crate) fn propagate_workspace_root_grant(
     )?;
     timing.mark("  background: propagating root grant (unconditional)");
     Ok(())
+}
+
+#[cfg(test)]
+mod fs_access_mask_tests {
+    use super::*;
+
+    /// **和のマスクは、書きと実行の両方を実際に含む。**
+    ///
+    /// ビットで確かめるのは、`FsAccess::ReadWriteExec`という名前が付いていることと、
+    /// そのACEで実際に`CreateProcess`できることが別の事実だからである（B-25:
+    /// 「設定した」ではなく実効で見る。ここは実効の手前——マスクそのもの——を固定する）。
+    #[test]
+    fn the_combined_mask_contains_read_write_execute_and_delete() {
+        let mask = fs_access_mask(FsAccess::ReadWriteExec);
+
+        for (bit, name) in [
+            (FILE_GENERIC_READ.0, "read"),
+            (FILE_GENERIC_WRITE.0, "write"),
+            (FILE_GENERIC_EXECUTE.0, "execute"),
+            (DELETE.0, "delete"),
+        ] {
+            assert_eq!(mask & bit, bit, "the combined mask is missing {name}");
+        }
+    }
+
+    /// 和は、畳む前の2つのマスクの**どちらの上位集合でもある**。
+    /// これが崩れると「和を取ったのに片方の権限が減る」という、直したはずの症状に戻る。
+    #[test]
+    fn the_combined_mask_is_a_superset_of_both_sources() {
+        let combined = fs_access_mask(FsAccess::ReadWriteExec);
+
+        for source in [FsAccess::Read, FsAccess::ReadWrite, FsAccess::ReadExec] {
+            let mask = fs_access_mask(source);
+            assert_eq!(
+                combined & mask,
+                mask,
+                "combining must not drop bits from {:?}",
+                source
+            );
+        }
+    }
+
+    /// 単独の`ReadWrite`には実行権が**入っていない**——これがそもそもの発端である
+    /// （`fs.read_write`だけ承認しても`cargo.exe`は起動できない）。
+    /// 対で固定しておかないと、和の側だけ見て「実行権はどこかで付いている」と誤読する（B-35）。
+    #[test]
+    fn read_write_alone_still_carries_no_execute_right() {
+        let mask = fs_access_mask(FsAccess::ReadWrite);
+
+        assert_ne!(
+            mask & FILE_GENERIC_EXECUTE.0,
+            FILE_GENERIC_EXECUTE.0,
+            "if read_write ever includes execute, the whole read_exec distinction is moot"
+        );
+    }
 }

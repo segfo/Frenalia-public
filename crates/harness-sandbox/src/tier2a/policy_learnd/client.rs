@@ -27,8 +27,8 @@ use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use super::{LearnError, LearnPolicy, LearnRequest, LearnResponse};
 use crate::win_common::wide;
 use crate::win_pipe_ipc::{
-    connect_with_timeout, current_user_sid_string, read_framed_timeout,
-    user_only_security_attributes, unique_pipe_name, write_framed_timeout,
+    connect_with_timeout, current_user_sid_string, read_framed_timeout, unique_pipe_name,
+    user_only_security_attributes, write_framed_timeout,
 };
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -44,6 +44,13 @@ pub struct PolicyLearnHandle {
     etw_available: bool,
 }
 
+/// ハンドルは所有権とともにスレッドを移動できる（`NetfilterHandle`と同じ扱い）。
+///
+/// 中身は`HANDLE`（生ポインタ）なので自動では`Send`にならないが、**この構造体は
+/// 同時に2箇所から使われない**——[`CollectorSession`]が`Arc<Mutex<..>>`で包み、
+/// 記録は`session_lock`により同時に1本しか走らない。TUIが記録を専用スレッドで回すために要る。
+unsafe impl Send for PolicyLearnHandle {}
+
 impl PolicyLearnHandle {
     /// ETWセッションが実際に張れたか。呼び出し側はこれが`false`のとき、
     /// 「収集器は起動したが観測できていない」ことをユーザーへ伝える。
@@ -56,6 +63,45 @@ impl PolicyLearnHandle {
         let result = self.teardown();
         self.pipe = HANDLE::default();
         result
+    }
+
+    /// 現世代の収集を止める。**daemonは残す**（D-56 段階2。次の`StartCollect`はUAC無し）。
+    ///
+    /// 失敗したら呼び出し側はこのハンドルを捨てること——「畳めたか分からない収集器」を
+    /// 抱えたまま次の記録へ進むと、前の記録のETWセッションが生きているのか誰も言えなくなる
+    /// （netfilterdの`clear`と同じ扱い）。
+    pub fn stop_collect(&self) -> Result<u64, LearnError> {
+        let bytes = serde_json::to_vec(&LearnRequest::StopCollect)
+            .map_err(|e| LearnError::Ipc(format!("failed to serialize StopCollect: {e}")))?;
+        write_framed_timeout(self.pipe, &bytes, REQUEST_WRITE_TIMEOUT)
+            .map_err(|e| LearnError::Ipc(e.to_string()))?;
+        let response = read_framed_timeout(self.pipe, TEARDOWN_RESPONSE_TIMEOUT)
+            .map_err(|e| LearnError::Ipc(e.to_string()))?;
+        match serde_json::from_slice::<LearnResponse>(&response) {
+            Ok(LearnResponse::Stopped { written }) => Ok(written),
+            Ok(LearnResponse::Err(message)) => Err(LearnError::Rejected(message)),
+            Ok(other) => Err(LearnError::Ipc(format!("unexpected response: {other:?}"))),
+            Err(e) => Err(LearnError::Ipc(format!("malformed response: {e}"))),
+        }
+    }
+
+    /// 生きているdaemonへ次の記録の`StartCollect`を送る（**UACは出ない**）。
+    pub fn start_collect(&mut self, policy: &LearnPolicy) -> Result<(), LearnError> {
+        let bytes = serde_json::to_vec(&LearnRequest::StartCollect(policy.clone()))
+            .map_err(|e| LearnError::Ipc(format!("failed to serialize StartCollect: {e}")))?;
+        write_framed_timeout(self.pipe, &bytes, REQUEST_WRITE_TIMEOUT)
+            .map_err(|e| LearnError::Ipc(e.to_string()))?;
+        let response = read_framed_timeout(self.pipe, START_RESPONSE_TIMEOUT)
+            .map_err(|e| LearnError::Ipc(e.to_string()))?;
+        match serde_json::from_slice::<LearnResponse>(&response) {
+            Ok(LearnResponse::Started { etw_available }) => {
+                self.etw_available = etw_available;
+                Ok(())
+            }
+            Ok(LearnResponse::Err(message)) => Err(LearnError::Rejected(message)),
+            Ok(other) => Err(LearnError::Ipc(format!("unexpected response: {other:?}"))),
+            Err(e) => Err(LearnError::Ipc(format!("malformed response: {e}"))),
+        }
     }
 
     fn teardown(&mut self) -> Result<u64, LearnError> {
@@ -241,6 +287,147 @@ pub fn start(policy: LearnPolicy) -> Result<PolicyLearnHandle, LearnError> {
     }
 }
 
+/// 収集器daemonを**プロセスの寿命で**持つ（D-56 段階2）。netfilterdの`NetfilterSession`と同型。
+///
+/// 「生きているなら`StartCollect`を再送、無ければ起こす」「記録の切れ目で`StopCollect`」
+/// 「`Drop`で`Teardown`」の3つを持つ。**UACが出るのは最初の1回だけ**になる。
+#[derive(Default)]
+pub struct CollectorSession {
+    handle: Option<PolicyLearnHandle>,
+}
+
+/// [`CollectorSession::start`]の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Collecting {
+    /// ETWセッションが実際に張れたか（`false`なら何も観測できない、D-43）。
+    pub etw_available: bool,
+    /// 既存daemonを再利用したか。**表示に出すこと**——UACが出なかったことを
+    /// 「収集器が動いていない」と読み違えられると、この記録の意味が正反対になる（B-32）。
+    pub reused: bool,
+}
+
+impl CollectorSession {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 生きているdaemonを持っているか。**呼び出し側はこれを見て、投機的パイプの用意と
+    /// 連鎖起動の依頼を省く**（B-23(c) 二重起動ガード）。
+    pub fn is_live(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// 収集を開始する。生きているdaemonがあれば`StartCollect`を再送するだけ、無ければ起こす。
+    ///
+    /// `prelude`/`chain_attempted`は**daemonを起こす場合にだけ**使う（netfilterdが連鎖起動を
+    /// 試みたシナリオA／自分で`runas`するシナリオB）。再利用時は`prelude`をdropしてパイプを閉じる。
+    pub fn start(
+        &mut self,
+        prelude: Option<PreparedLearnPipe>,
+        chain_attempted: bool,
+        policy: LearnPolicy,
+    ) -> Result<Collecting, LearnError> {
+        if let Some(mut handle) = self.handle.take() {
+            drop(prelude);
+            match handle.start_collect(&policy) {
+                Ok(()) => {
+                    let etw_available = handle.etw_available();
+                    self.handle = Some(handle);
+                    return Ok(Collecting {
+                        etw_available,
+                        reused: true,
+                    });
+                }
+                // daemonは生きていて要求を拒んだ。起こし直しても同じ拒否になるだけで、
+                // UACを1回増やして同じ場所に着く。**そのまま伝播する。**
+                Err(e) if !daemon_is_dead(&e) => {
+                    self.handle = Some(handle);
+                    return Err(e);
+                }
+                // パイプが壊れた＝daemonが死んでいる。ここで1度だけ起こし直す
+                // （再試行は1回に固定する——起こし直しの失敗は伝播させる）。
+                Err(e) => {
+                    // ハンドルを落とす＝パイプが閉じる＝死にかけのdaemonが残っていても撤収する。
+                    drop(handle);
+                    eprintln!(
+                        "warning: the policy-learning collector stopped answering ({e}); \
+                         restarting it (one UAC prompt)"
+                    );
+                    // 連鎖起動用のパイプはもう無いので、起こし直しは必ずシナリオB。
+                    let handle = start(policy)?;
+                    let etw_available = handle.etw_available();
+                    self.handle = Some(handle);
+                    return Ok(Collecting {
+                        etw_available,
+                        reused: false,
+                    });
+                }
+            }
+        }
+
+        let handle = match (chain_attempted, prelude) {
+            // シナリオA: netfilterdが既に連鎖起動を試みている。同じパイプでハンドシェイクする。
+            (true, Some(prepared)) => connect_after_chain_launch(prepared.into_handle(), policy)?,
+            // シナリオB: 連鎖起動は発生しなかった。投機的パイプは使わない（`start`が自前で
+            // 新規パイプを作る）、dropして自動的に閉じる。
+            (_, prelude) => {
+                drop(prelude);
+                start(policy)?
+            }
+        };
+        let etw_available = handle.etw_available();
+        self.handle = Some(handle);
+        Ok(Collecting {
+            etw_available,
+            reused: false,
+        })
+    }
+
+    /// 現世代を畳む（**daemonは次の記録のために残す**）。書けた件数を返す。
+    ///
+    /// 失敗したらハンドルを捨てる——畳めたか分からない収集器を抱えたまま次の記録へ進むと、
+    /// 「待機中はETWセッションを持たない」という不変条件を誰も言えなくなる。捨てた場合、
+    /// 次の[`Self::start`]はdaemonを起こし直す（UACが1回）。
+    pub fn stop(&mut self) -> Result<Option<u64>, LearnError> {
+        let Some(handle) = self.handle.as_ref() else {
+            return Ok(None);
+        };
+        match handle.stop_collect() {
+            Ok(written) => Ok(Some(written)),
+            Err(e) => {
+                self.handle = None;
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Drop for CollectorSession {
+    /// プロセス終了時に`Teardown`を送る。送れなくても、パイプが閉じることで収集器側の
+    /// `ReadFile`が`ERROR_BROKEN_PIPE`になり自発的に撤収する（最後の砦はOSハンドル）。
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.stop();
+        }
+    }
+}
+
+/// 再利用に失敗したとき、**daemonが死んでいる**と言えるか。
+///
+/// 死んでいるなら1度だけ起こし直す価値があり、生きていて拒んだだけなら起こし直しても
+/// 同じ拒否に着く（UACが1回増えるだけ）。判定を純粋関数にしてあるのは、この表を
+/// 実daemonなしで固定するためである（netfilterdの`daemon_is_dead`と同じ形）。
+pub fn daemon_is_dead(error: &LearnError) -> bool {
+    match error {
+        // 受信側が答えを返した＝生きている。
+        LearnError::Rejected(_) => false,
+        // パイプが壊れた・応答が来ない＝死んでいる可能性が高い。
+        LearnError::Ipc(_) | LearnError::Win32(_) => true,
+        // 起動そのものに失敗した（そもそもdaemonが居ない）。
+        LearnError::ElevationDeclined(_) | LearnError::UnsafeLaunchTarget(_) => true,
+    }
+}
+
 fn handshake(pipe: HANDLE, policy: &LearnPolicy) -> Result<bool, LearnError> {
     connect_with_timeout(pipe, CONNECT_TIMEOUT).map_err(|e| {
         LearnError::Ipc(format!(
@@ -267,9 +454,9 @@ fn handshake(pipe: HANDLE, policy: &LearnPolicy) -> Result<bool, LearnError> {
 fn collector_exe_path() -> Result<PathBuf, LearnError> {
     let current = std::env::current_exe()
         .map_err(|e| LearnError::Win32(format!("failed to resolve current exe path: {e}")))?;
-    let dir = current.parent().ok_or_else(|| {
-        LearnError::Win32("current exe has no parent directory".to_string())
-    })?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| LearnError::Win32("current exe has no parent directory".to_string()))?;
     Ok(dir.join("harness-policy-learnd.exe"))
 }
 
@@ -297,7 +484,9 @@ unsafe fn launch_elevated(path: &std::path::Path, pipe_name: &str) -> Result<HAN
                 "UAC prompt was canceled by the user".to_string(),
             ));
         }
-        return Err(LearnError::Win32(format!("ShellExecuteExW failed: {err:?}")));
+        return Err(LearnError::Win32(format!(
+            "ShellExecuteExW failed: {err:?}"
+        )));
     }
     Ok(info.hProcess)
 }

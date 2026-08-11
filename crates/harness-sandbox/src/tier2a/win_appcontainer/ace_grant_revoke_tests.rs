@@ -49,7 +49,7 @@ fn run_probe(sid: PSID, dir: &Path) {
         false,
         sid,
         NetworkCapability::Deny,
-    None,
+        None,
     )
     .expect("spawn should succeed even if the shell command itself fails inside");
     let (out, err, code) = child
@@ -60,19 +60,11 @@ fn run_probe(sid: PSID, dir: &Path) {
     println!("--- stderr ---\n{err}");
 }
 
-
-
-
-
-
-
-
 /// PowerShellコマンドをtry/catchで包み、成否を終了コードのみで判定するヘルパー
 /// （`$LASTEXITCODE`の文字列パースに頼らない、`smoke_test_spawn`と同じ設計原則）。
 /// 失敗時は詳細を`println!`で焼き付ける（観測目的、アサートしない）。
 fn run_probe_bool(sid: PSID, dir: &Path, command: &str) -> bool {
-    let wrapped =
-        format!("try {{ {command} }} catch {{ Write-Output \"CAUGHT: $_\"; exit 1 }}");
+    let wrapped = format!("try {{ {command} }} catch {{ Write-Output \"CAUGHT: $_\"; exit 1 }}");
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
     let child = spawn(
@@ -83,7 +75,7 @@ fn run_probe_bool(sid: PSID, dir: &Path, command: &str) -> bool {
         false,
         sid,
         NetworkCapability::Deny,
-    None,
+        None,
     )
     .expect("spawn should succeed even if the shell command itself fails inside");
     let (out, err, code) = child
@@ -94,16 +86,6 @@ fn run_probe_bool(sid: PSID, dir: &Path, command: &str) -> bool {
     }
     code == 0
 }
-
-
-
-
-
-
-
-
-
-
 
 /// 未解決事項2: 本番`smoke_test_spawn`（軽量・終了コードのみ判定）と、この診断モジュールの
 /// `run_probe`（詳細・stdout全文を観測するリッチ版）が、この機種で**同じ合否判定**になる
@@ -183,7 +165,7 @@ fn preflight_keeps_harness_control_dir_unwritable_to_appcontainer_child() {
     // `the_background_job_finishes_the_descendant_fix_up_and_records_it`が落ちた）。
     grant_job::wait_until_done().expect("the background workspace grant job must finish");
 
-    revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
+    let _ = revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
 }
 
 /// 特権昇格ヘルパー(D-16)レビュー用の実機検証（`/dig`セッションで検討した「LLMが
@@ -202,7 +184,10 @@ fn preflight_keeps_harness_control_dir_unwritable_to_appcontainer_child() {
 fn appcontainer_child_cannot_reach_uac_elevation_broker() {
     let helper_path = {
         let current = std::env::current_exe().expect("current_exe");
-        let dir = current.parent().expect("current_exe has parent").to_path_buf();
+        let dir = current
+            .parent()
+            .expect("current_exe has parent")
+            .to_path_buf();
         let p = dir.join("harness-privhelper.exe");
         assert!(
             p.exists(),
@@ -214,7 +199,10 @@ fn appcontainer_child_cannot_reach_uac_elevation_broker() {
     };
     let probe_exe = {
         let current = std::env::current_exe().expect("current_exe");
-        let dir = current.parent().expect("current_exe has parent").to_path_buf();
+        let dir = current
+            .parent()
+            .expect("current_exe has parent")
+            .to_path_buf();
         let p = dir.join("tier2a_proc_probe.exe");
         assert!(
             p.exists(),
@@ -263,7 +251,7 @@ fn appcontainer_child_cannot_reach_uac_elevation_broker() {
         .unwrap_or_else(|| panic!("no JSON report line in stdout={stdout} stderr={stderr}"));
     println!("=== try_runas report ===\n{report:#}");
 
-    revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
+    let _ = revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
 
     // 実機確認済み（2026-08-02）: AppContainer内からの`ShellExecuteExW(runas)`は
     // `ERROR_ACCESS_DENIED`(5)で即座に失敗し（0.5秒程度、UACダイアログは画面に一切
@@ -297,7 +285,6 @@ fn appcontainer_child_cannot_reach_uac_elevation_broker() {
          indicate a different failure mode worth re-investigating, report={report:#}"
     );
 }
-
 
 /// D-13（fs passthrough allowlist）実機E2E: 中立な外部ディレクトリ（workspace外、`grant_ace_recursive`
 /// 済みのworkspaceとは別ルート）へ、まずread-only ACEを付与して子プロセスから読取成功・書込拒否を
@@ -400,7 +387,12 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
     );
 
     // 3. 撤収 -> 再walkで0件（D4検証パス）。
-    revoke_ace_recursive(&external, sid.as_psid()).expect("revoke_ace_recursive");
+    let report = revoke_ace_recursive(&external, sid.as_psid()).expect("revoke_ace_recursive");
+    assert!(
+        !report.has_blocked(),
+        "every node must be revocable in this tree: {:?}",
+        report.blocked
+    );
     let remaining = assert_no_sid_ace_recursive(&external, sid.as_psid());
     assert!(
         remaining.is_ok(),
@@ -477,7 +469,12 @@ fn grant_ace_inheritable_access_on_a_file_succeeds_and_leaves_the_ace() {
     // **撤収側も対称でなければ意味が無い。** `end_session`は`revoke_ace_recursive`を通して
     // 剥がすので、そちらがファイルで落ちるなら台帳に正しく載っていても孤立ACEは残り続ける
     // （実機E2Eでこの順序で判明した——付与側だけ直しても`end_session`が剥がせなかった）。
-    revoke_ace_recursive(&file, sid.as_psid()).expect("revoke_ace_recursive on a file");
+    let report = revoke_ace_recursive(&file, sid.as_psid()).expect("revoke_ace_recursive on a file");
+    assert!(
+        !report.has_blocked(),
+        "a single-file revoke must not be blocked: {:?}",
+        report.blocked
+    );
     assert_eq!(
         sid_ace_mask(&file, sid.as_psid()).expect("read back after revoke"),
         None,
@@ -492,8 +489,7 @@ fn grant_ace_inheritable_access_on_a_file_succeeds_and_leaves_the_ace() {
 #[test]
 fn grant_traverse_chain_orders_ancestors_shallow_to_deep() {
     let target = Path::new(r"C:\Users\example\.cargo");
-    let mut chain: Vec<std::path::PathBuf> =
-        target.ancestors().map(|p| p.to_path_buf()).collect();
+    let mut chain: Vec<std::path::PathBuf> = target.ancestors().map(|p| p.to_path_buf()).collect();
     chain.reverse();
     assert_eq!(
         chain,
@@ -587,8 +583,9 @@ fn traverse_chain_grants_every_ancestor_on_a_test_owned_drive_root() {
     for node in granted.iter().rev() {
         revoke_ace(node, sid.as_psid())
             .unwrap_or_else(|e| panic!("revoke_ace on {}: {e}", node.display()));
-        assert_no_sid_ace(node, sid.as_psid())
-            .unwrap_or_else(|e| panic!("ACE still present on {} after revoke: {e}", node.display()));
+        assert_no_sid_ace(node, sid.as_psid()).unwrap_or_else(|e| {
+            panic!("ACE still present on {} after revoke: {e}", node.display())
+        });
     }
     // `drive`のDropが`subst /D`と実体の削除を行う（panic時も同じ）。
 }
@@ -675,9 +672,7 @@ fn grant_traverse_chain_then_revoke_each_node_on_neutral_tree() {
         }
         if let Err(e) = assert_no_sid_ace(node, sid.as_psid()) {
             cleanup();
-            panic!(
-                "sandbox SID ACE must be fully removed from {node:?} after revoke_ace: {e:?}"
-            );
+            panic!("sandbox SID ACE must be fully removed from {node:?} after revoke_ace: {e:?}");
         }
     }
 }
@@ -726,8 +721,7 @@ fn grant_ace_inheritable_ro_falls_back_for_protected_descendant() {
     let protected_deep = protected_dir.join("deep");
     std::fs::create_dir_all(&protected_deep).expect("create protected branch");
     let protected_file = protected_deep.join("blocked.txt");
-    std::fs::write(&protected_file, b"needs fallback explicit grant")
-        .expect("seed protected file");
+    std::fs::write(&protected_file, b"needs fallback explicit grant").expect("seed protected file");
     protect_dacl_preserve_inherited(&protected_dir)
         .expect("protect_dacl_preserve_inherited on protected dir");
 
@@ -765,7 +759,12 @@ fn grant_ace_inheritable_ro_falls_back_for_protected_descendant() {
     );
 
     // 完全撤収の確認（D4）。保護フラグ自体は残るが、sid ACEは全ノードから消えるべき。
-    revoke_ace_recursive(&root, sid.as_psid()).expect("revoke_ace_recursive");
+    let report = revoke_ace_recursive(&root, sid.as_psid()).expect("revoke_ace_recursive");
+    assert!(
+        !report.has_blocked(),
+        "the protected-DACL branch must still be revocable (we own it): {:?}",
+        report.blocked
+    );
     let leftover = assert_no_sid_ace_recursive(&root, sid.as_psid());
     assert!(
         leftover.is_ok(),
@@ -822,7 +821,138 @@ fn an_inherited_ace_reaches_descendants_and_the_effective_probe_sees_it() {
          inheritance -- writing one here is exactly BUG-081 (O(files) grant + residue)"
     );
 
-    revoke_ace_recursive(dir.path(), sid.as_psid()).expect("revoke_ace_recursive");
+    let _ = revoke_ace_recursive(dir.path(), sid.as_psid()).expect("revoke_ace_recursive");
+}
+
+/// [BUG-103] **rootの明示ACEを剥がしただけでは、子孫に載った継承コピーは消えない。**
+///
+/// 撤収（[`revoke_ace_recursive`]）がツリー全walkでなければならない根拠を、推測ではなく
+/// 測って固定する。この事実を測らずに「root先頭にすれば十分」と最適化すると、
+/// 症状（rootのACEが消える）だけが直って機能（子孫からの撤収）が消える——
+/// [BUG-018](../../../../docs/bugs/BUG-018.md)とまったく同じ形になる。
+///
+/// 継承ACEは**物理的なコピー**としてノードのDACLに載る（Windowsは作成時に親の現在のDACLから
+/// 継承ACLを計算する）ので、継承元を断っても既存のコピーは自動では消えない。
+/// [`sid_ace_mask`]（明示のみ）と[`sid_effective_ace_mask`]（継承込み）の差がそのまま
+/// 「rootから剥がせるもの」と「その子に実際に届いているもの」の差になる。
+///
+/// **`#[ignore]`にしない**——自分が所有するtempdirのDACLしか触らず、AppContainerプロファイルも
+/// 管理者権限も要らない（借りるSIDの理由は
+/// `an_inherited_ace_reaches_descendants_and_the_effective_probe_sees_it`と同じ）。
+#[test]
+fn removing_only_the_root_ace_leaves_inherited_copies_on_descendants() {
+    let sid = traverse_capability_sid().expect("traverse_capability_sid");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    // `preflight`と同じ入口（`DaclWrite::SingleObject`。既存子孫へは伝播しない）。
+    grant_workspace_root_rw_fast(root, sid.as_psid()).expect("grant_workspace_root_rw_fast");
+
+    // **付与の後に**子を作る。伝播の有無に関係なく、この子は作成時に継承コピーを受け取る
+    // ——実運用でもパス2の最中に作られるファイルはすべてこの経路で来る。
+    let child_dir = root.join("created-after-grant");
+    std::fs::create_dir(&child_dir).expect("create child dir");
+    let child_file = child_dir.join("f.txt");
+    std::fs::write(&child_file, b"hi").expect("seed file");
+
+    assert!(
+        sid_effective_ace_mask(&child_file, sid.as_psid())
+            .expect("effective probe on the child")
+            .is_some(),
+        "a file created after the inheritable root grant must carry the inherited ACE"
+    );
+
+    // rootの明示ACEだけを剥がす（単一オブジェクト書込。継承元を断つだけ）。
+    revoke_ace(root, sid.as_psid()).expect("revoke_ace on the root");
+    assert_eq!(
+        sid_ace_mask(root, sid.as_psid()).expect("explicit probe on the root"),
+        None,
+        "the root's own explicit ACE must be gone"
+    );
+
+    // **ここが測定の本体**: 継承元を断っても、子に載ったコピーは残る。
+    assert!(
+        sid_effective_ace_mask(&child_file, sid.as_psid())
+            .expect("effective probe on the child after the root was cleared")
+            .is_some(),
+        "removing the inheritance source does NOT remove the physical copies already written to \
+         descendants -- this is why revoke must walk the whole tree (BUG-103)"
+    );
+
+    // 対（B-35）: 全walkの撤収なら消えること。ここが落ちるなら撤収そのものが壊れている。
+    let report = revoke_ace_recursive(root, sid.as_psid()).expect("revoke_ace_recursive");
+    assert!(
+        !report.has_blocked(),
+        "nothing in an owned tempdir may be blocked: {:?}",
+        report.blocked
+    );
+    assert_eq!(
+        sid_effective_ace_mask(&child_file, sid.as_psid())
+            .expect("effective probe on the child after the recursive revoke"),
+        None,
+        "the recursive revoke must clear the inherited copy from the descendant"
+    );
+}
+
+/// [BUG-103] 撤収の**残件は名前で報告する**（件数だけでは`icacls`で追えない、B-09）。
+///
+/// # 「書けないノード」を作るライブfixtureは持てなかった（試した3つと、その結果）
+///
+/// 本当に確かめたいのは「1ノードで失敗しても撤収は止まらず、rootは剥がれ、残件が名前で返る」
+/// である。**決定論的かつ後始末できる形で"書けないノード"を作る方法が無かった**ので、
+/// ここでは報告の契約だけを固定し、実行時の挙動は
+/// [`removing_only_the_root_ace_leaves_inherited_copies_on_descendants`]・
+/// [`revoking_a_node_that_vanished_is_not_a_failure`]・実機の`%TEMP%`観測で担保する。
+/// **「テストがある」と誤解させないため、試して駄目だった方法を残す**（BUG-084と同じ作法）。
+///
+/// | 試した方法 | 結果（実測） |
+/// |---|---|
+/// | `share_mode: 0`の排他ハンドルを握ったまま撤収 | **効かない。** 共有違反は read/write/delete のアクセスにしか掛からず、`WRITE_DAC`/`READ_CONTROL`は共有モードの検査対象外。DACL書込は普通に成功した |
+/// | 自分自身へ`WRITE_DAC`のdeny ACE | **効かない。** オブジェクトの所有者には`WRITE_DAC`が常に暗黙で与えられ、明示のdenyより優先された（`icacls /grant`が成功） |
+/// | OWNER RIGHTS ACE（`*S-1-3-4`）で所有者の暗黙権限を`(R)`へ制限 | **効くが採用しない。** `WRITE_DAC`は確かに拒否されるが、そのノードは非昇格では**二度と削除できない**（ディレクトリなら`rd /s`も通らず、昇格でしか片付かない）。テストが消せないゴミを残すので却下（B-27） |
+#[test]
+fn the_revoke_report_names_the_nodes_it_could_not_clear() {
+    let mut report = RevokeReport {
+        checked: 7,
+        rewritten: 4,
+        blocked: Vec::new(),
+    };
+    assert!(!report.has_blocked());
+    assert_eq!(
+        report.blocked_summary(5),
+        None,
+        "a clean revoke must not produce a warning line"
+    );
+
+    for i in 0..7 {
+        report.blocked.push((
+            std::path::PathBuf::from(format!(r"C:\Users\x\AppData\Local\Temp\stuck-{i}")),
+            "アクセスが拒否されました。 (0x80070005)".to_string(),
+        ));
+    }
+    assert!(report.has_blocked());
+    let summary = report.blocked_summary(5).expect("blocked nodes must be shown");
+    assert!(summary.contains("7 node(s)"), "{summary}");
+    // **名前が出ること**が要点（これが無いと`icacls`で追えない）。
+    assert!(summary.contains("stuck-0"), "{summary}");
+    assert!(summary.contains("0x80070005"), "{summary}");
+    // 打ち切ったら残件数を言う（B-09: 黙って切らない）。
+    assert!(summary.contains("and 2 more"), "{summary}");
+}
+
+/// [BUG-103] **触る前に消えていたノードは失敗ではない。**
+///
+/// `%TEMP%`のような揺れ動くツリーでは、walkが見つけてからDACLを触るまでの間にファイルが
+/// 消えるのが常態である。ここを`Err`にすると[`RevokeReport::blocked`]が「消えただけ」で
+/// 埋まり、**本当に剥がせなかったノードが埋もれる**（B-09: 数える対象を混ぜない）。
+#[test]
+fn revoking_a_node_that_vanished_is_not_a_failure() {
+    let sid = traverse_capability_sid().expect("traverse_capability_sid");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ghost = dir.path().join("already-gone.txt");
+
+    revoke_ace(&ghost, sid.as_psid())
+        .expect("a node that no longer exists must not be reported as a revoke failure");
 }
 
 /// [D-54/[BUG-082](../../../../docs/bugs/BUG-082.md) Part B] 背景ジョブ（`grant_job`）が
@@ -868,7 +998,8 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
     // 伝播＋救済walkは背景ジョブへ。
     grant_workspace_root_rw_fast(&root, sid.as_psid()).expect("grant_workspace_root_rw_fast");
     assert_eq!(
-        sid_effective_ace_mask(&normal_file, sid.as_psid()).expect("probe the normal branch before the job"),
+        sid_effective_ace_mask(&normal_file, sid.as_psid())
+            .expect("probe the normal branch before the job"),
         None,
         "the fast (single-object) root grant must NOT propagate to existing descendants -- if \
          it did, the background job's own propagate step would have nothing left to prove and \
@@ -899,7 +1030,7 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
              test in this process already claimed the single background job slot; run it alone \
              (`cargo test -p harness-sandbox --lib -- --ignored the_background_job_finishes`)"
         );
-        revoke_ace_recursive(&root, sid.as_psid()).expect("revoke_ace_recursive");
+        let _ = revoke_ace_recursive(&root, sid.as_psid()).expect("revoke_ace_recursive");
         crate::tier2a::workspace_capability::forget_capability(&root, "");
         return;
     }
@@ -942,7 +1073,7 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
         "the job must report itself finished after wait_until_done returned"
     );
 
-    revoke_ace_recursive(&root, sid.as_psid()).expect("revoke_ace_recursive");
+    let _ = revoke_ace_recursive(&root, sid.as_psid()).expect("revoke_ace_recursive");
     crate::tier2a::workspace_capability::forget_capability(&root, "");
 }
 
@@ -1076,9 +1207,7 @@ New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -Pas
         grant_ace_inheritable_rw(&small_root, sid_owned)
             .map_err(|e| format!("grant on small tree failed: {e:?}"))?;
         let small_grant_elapsed = t0.elapsed();
-        println!(
-            "=== S1: small tree grant_ace_inheritable_rw took {small_grant_elapsed:?} ==="
-        );
+        println!("=== S1: small tree grant_ace_inheritable_rw took {small_grant_elapsed:?} ===");
         assert!(
             small_grant_elapsed < std::time::Duration::from_secs(2),
             "small-tree grant must finish well under 1-2s, took {small_grant_elapsed:?}"
@@ -1088,9 +1217,7 @@ New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -Pas
         grant_ace_inheritable_rw(&big_root, sid_owned)
             .map_err(|e| format!("grant on big tree (400 files) failed: {e:?}"))?;
         let big_grant_elapsed = t1.elapsed();
-        println!(
-            "=== S1: 400-file tree grant_ace_inheritable_rw took {big_grant_elapsed:?} ==="
-        );
+        println!("=== S1: 400-file tree grant_ace_inheritable_rw took {big_grant_elapsed:?} ===");
         assert!(
             big_grant_elapsed < std::time::Duration::from_secs(5),
             "400-file tree grant must not regress toward BUG-011-style pathological slowness, \
@@ -1100,7 +1227,7 @@ New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -Pas
         // revokeもO(n)（物理コピーされたACEを個別に消す、上記コメント参照）であるため、
         // 400ファイル規模での実測値も取っておく（grant/revoke双方のO(n)係数を見るため）。
         let t_big_revoke = std::time::Instant::now();
-        revoke_ace_recursive(&big_root, sid_owned)
+        let _ = revoke_ace_recursive(&big_root, sid_owned)
             .map_err(|e| format!("revoke_ace_recursive on big tree failed: {e:?}"))?;
         let big_revoke_elapsed = t_big_revoke.elapsed();
         println!("=== S1: 400-file tree revoke_ace_recursive took {big_revoke_elapsed:?} ===");
@@ -1141,7 +1268,7 @@ New-LocalUser -Name '{user}' -Password $securePassword -AccountNeverExpires -Pas
         // ままという実機不具合を引き起こした（本テストで実際に検出・修正）。正しくは
         // `revoke_ace_recursive`（既存の再walk版）を使う。
         let t2 = std::time::Instant::now();
-        revoke_ace_recursive(&small_root, sid_owned)
+        let _ = revoke_ace_recursive(&small_root, sid_owned)
             .map_err(|e| format!("revoke_ace_recursive on small tree failed: {e:?}"))?;
         let revoke_elapsed = t2.elapsed();
         println!(
@@ -1226,7 +1353,9 @@ fn run_powershell_stdin_for_test(script: &str) -> Result<String, String> {
             crate::decode_console_bytes(&output.stderr)
         ));
     }
-    Ok(crate::decode_console_bytes(&output.stdout).trim().to_string())
+    Ok(crate::decode_console_bytes(&output.stdout)
+        .trim()
+        .to_string())
 }
 
 /// `Start-Process -Credential`でSMBの実効アクセスに近い形（実際のログオンセッション、
@@ -1297,8 +1426,10 @@ fn a_sandbox_cannot_reach_another_sessions_workspace() {
     )
     .expect("spawn AppContainer child in session A");
     let (stdout, stderr, _code) = child.write_stdin_read_output_and_wait(None).unwrap();
-    eprintln!("[probe] セッションAの子から セッションBのworkspace を読んだ結果:
-{stdout}{stderr}");
+    eprintln!(
+        "[probe] セッションAの子から セッションBのworkspace を読んだ結果:
+{stdout}{stderr}"
+    );
 
     let leaked = stdout.contains("SECRET_FROM_OTHER_WORKSPACE");
     eprintln!("[probe] 別セッションのworkspaceが読めたか: {leaked}");
@@ -1423,7 +1554,7 @@ fn protect_harness_control_dir_removes_aces_for_every_sid_even_when_some_have_no
          zero-ACE SID was processed earlier in the same call"
     );
 
-    revoke_ace_recursive(root.path(), has_ace.as_psid()).expect("cleanup has_ace's ACE");
+    let _ = revoke_ace_recursive(root.path(), has_ace.as_psid()).expect("cleanup has_ace's ACE");
 }
 
 /// [BUG-083] `.harness/`の継承遮断が**実際にOSに効いている**こと、そして
@@ -1509,7 +1640,7 @@ fn protect_harness_control_dir_actually_blocks_inheritance_and_can_be_rolled_bac
          .harness/**); if this fails, the rollback cleared the flag but left the node cut off"
     );
 
-    revoke_ace_recursive(root.path(), sid.as_psid()).expect("cleanup the probe SID's ACEs");
+    let _ = revoke_ace_recursive(root.path(), sid.as_psid()).expect("cleanup the probe SID's ACEs");
 }
 
 /// [BUG-083] 撤収（`revoke_ace`）は**ノードの保護状態を変えない**。
@@ -1651,4 +1782,222 @@ fn protect_harness_control_dir_reports_how_many_nodes_it_protected() {
         0,
         "'there was nothing to protect' must be reported as 0, not as a silent success"
     );
+}
+
+// --- [BUG-101] 「名前を失ったSID」の撤収（欠陥②の回帰テスト） ---
+
+/// テストが作るAppContainerプロファイルを、失敗しても必ず消すためのガード。
+///
+/// **これはテストの足場であって製品の後始末ではない**（B-27の「後始末をテストが代行しない」
+/// に抵触しない）——製品側の`fs revoke`はプロファイルを作らないし消さない。ここで作るのは
+/// 「削除済みプロファイルのSID宛ACE」という状況を再現するための道具である。
+struct ProbeProfile {
+    name: String,
+    sid: OwnedContainerSid,
+}
+
+impl ProbeProfile {
+    /// harnessのセッションプロファイルと同じ形の名前で1つ作る（`is_session_profile_name`を
+    /// 通る形でないと、撤収側の分類が別の枝へ落ちてテストの意味が変わる）。
+    fn create(tag: &str) -> Self {
+        let name = format!("harness.shell.sandbox.{}-{tag}", std::process::id());
+        assert!(
+            crate::tier2a::session_profile::is_session_profile_name(&name),
+            "the probe profile name must look like a real session profile: {name}"
+        );
+        let sid = ensure_profile(&name).expect("create the probe AppContainer profile");
+        Self { name, sid }
+    }
+
+    /// プロファイルだけを消す（ACEは残す）。**これがBUG-101の状況そのもの**——SIDは
+    /// 名前のハッシュからの一方向導出なので、この瞬間からSID→名前は誰にも引けなくなる。
+    fn delete(&self) {
+        unsafe {
+            let w = crate::win_common::wide(&self.name);
+            let _ = windows::Win32::Security::Isolation::DeleteAppContainerProfile(
+                windows::core::PCWSTR(w.as_ptr()),
+            );
+        }
+    }
+}
+
+impl Drop for ProbeProfile {
+    fn drop(&mut self) {
+        self.delete();
+    }
+}
+
+/// **BUG-101の欠陥②の中核**: プロファイルが削除されて名前を失ったSID宛のACEを、
+/// `fs revoke`が実際に剥がせること。
+///
+/// 実マシンではこの状況で6箇所すべてが「`revoked:`と報告されたのに`icacls`のパッケージSID数は
+/// 1つも減らない」になった。旧実装は撤収対象を**プロファイル名から導出したSID**で決めており、
+/// 名前を失ったSIDはそもそも列挙されなかった。
+///
+/// 対になる禁止側は
+/// [`an_unregistered_sid_whose_ace_does_not_look_like_ours_is_reported_not_stripped`]（B-35）。
+#[test]
+fn an_ace_left_by_a_deleted_profile_is_still_revocable_by_reading_the_dacl() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("orphaned");
+    std::fs::create_dir_all(&dir).expect("create dir");
+
+    let profile = ProbeProfile::create("orphan");
+    // 本番のfs passthroughと同じ形（継承あり・read_write）で付ける。
+    grant_ace_inheritable_access(&dir, profile.sid.as_psid(), FsAccess::ReadWrite)
+        .expect("grant the passthrough ACE");
+    assert!(
+        sid_ace_mask(&dir, profile.sid.as_psid())
+            .expect("probe the granted ACE")
+            .is_some(),
+        "precondition failed: the ACE must be on the directory before we delete the profile"
+    );
+
+    // ここで名前を捨てる。以後このSIDは名前へ逆引きできない。
+    profile.delete();
+
+    let report = revoke_harness_subjects(&dir, &[], &|_, _| {}).expect("revoke_harness_subjects");
+    assert_eq!(
+        report.targeted(),
+        1,
+        "the orphaned SID must be recognised as ours (its mask is exactly one harness grants); \
+         subjects were {:?}",
+        report.subjects
+    );
+    assert!(
+        report.unfinished().is_empty(),
+        "the ACE must actually be gone, not just reported: {:?}",
+        report.unfinished()
+    );
+    assert_eq!(
+        sid_ace_mask(&dir, profile.sid.as_psid()).expect("probe after the revoke"),
+        None,
+        "this is the assertion the old implementation could not make: the ACE is really off the \
+         directory (docs/bugs/BUG-101.md)"
+    );
+    assert!(
+        report.may_remove_ledger_entry(),
+        "with nothing left on the root, the ledger entry may be dropped"
+    );
+}
+
+/// 対になる禁止側（B-35）: 登録簿に無く、**マスクがharnessの形と違う**SIDのACEは
+/// 剥がさず、SIDを名指しして報告するだけであること。
+///
+/// これが無いと、「未登録なら何でも剥がす」へ退化しても上のテストは緑のままになる。
+/// 未登録のAppContainer SIDは、アンインストールされた他アプリのものでもあり得る
+/// （`revoke_subjects`のモジュールdoc）。
+#[test]
+fn an_unregistered_sid_whose_ace_does_not_look_like_ours_is_reported_not_stripped() {
+    use windows::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_TRAVERSE};
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("not-ours");
+    std::fs::create_dir_all(&dir).expect("create dir");
+
+    // **作らずに導出する**——登録簿には最初から載らない。
+    let sid = derive_profile_sid(&format!("some.other.app.{}", std::process::id()))
+        .expect("derive a package SID without creating the profile");
+    // harnessがfs passthroughで書かない形のマスク（祖先traverse用）。
+    grant_ace_mask(
+        &dir,
+        sid.as_psid(),
+        FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
+        NO_INHERITANCE,
+    )
+    .expect("grant a foreign-looking ACE");
+
+    let report = revoke_harness_subjects(&dir, &[], &|_, _| {}).expect("revoke_harness_subjects");
+    assert_eq!(
+        report.targeted(),
+        0,
+        "harness must not claim an ACE it cannot recognise as its own: {:?}",
+        report.subjects
+    );
+    assert!(
+        sid_ace_mask(&dir, sid.as_psid())
+            .expect("probe after the revoke")
+            .is_some(),
+        "the ACE must still be there (stripping it would be touching another app's grant)"
+    );
+    let sid_string = crate::win_common::sid_to_string(sid.as_psid()).expect("sid_to_string");
+    let left_alone = report.left_alone();
+    assert!(
+        left_alone.iter().any(|(reported, _)| *reported == sid_string),
+        "the SID must be named so the user can strip it with icacls; got {left_alone:?}"
+    );
+
+    revoke_ace(&dir, sid.as_psid()).expect("cleanup the probe ACE");
+}
+
+/// 台帳が「このパスへこのSIDで付けた」と記録していれば、マスクの形が違っても撤収できること
+/// （判定規則3）。プロファイルを作り直すたびに主体が変わるので、記録が最も強い証拠になる。
+#[test]
+fn a_sid_recorded_in_the_ledger_is_revoked_even_when_its_mask_is_unfamiliar() {
+    use windows::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_TRAVERSE};
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("recorded");
+    std::fs::create_dir_all(&dir).expect("create dir");
+
+    let sid = derive_profile_sid(&format!("harness.probe.recorded.{}", std::process::id()))
+        .expect("derive a package SID");
+    let sid_string = crate::win_common::sid_to_string(sid.as_psid()).expect("sid_to_string");
+    grant_ace_mask(
+        &dir,
+        sid.as_psid(),
+        FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
+        NO_INHERITANCE,
+    )
+    .expect("grant an ACE with a mask the fingerprint does not match");
+
+    let report = revoke_harness_subjects(&dir, std::slice::from_ref(&sid_string), &|_, _| {})
+        .expect("revoke_harness_subjects");
+    assert_eq!(
+        report.targeted(),
+        1,
+        "a recorded grant is a fact, not an inference: {:?}",
+        report.subjects
+    );
+    assert_eq!(
+        sid_ace_mask(&dir, sid.as_psid()).expect("probe after the revoke"),
+        None,
+        "the recorded SID's ACE must be gone"
+    );
+}
+
+/// 登録簿に`Moniker`が載っていて**生きていない**harnessプロファイルのACEは撤収されること
+/// （判定規則2）。上の「名前を失ったSID」（規則4）とは別の経路で、こちらは名前が残っている。
+///
+/// **生きているセッションを触らないこと（規則1）の実機確認はここではやらない。**
+/// それには`begin_session()`でこのテストプロセス自身をセッションとして登録する必要があるが、
+/// **登録はプロセス寿命の生存マーカーと台帳エントリを作るので、`cargo test`のたびに
+/// AppContainerプロファイルと台帳エントリが1件ずつ実マシンへ残る**（最初に書いた版が実際に
+/// 4件残した。BUG-101が問題にしているまさにその滞留を、テストが自分で作っていた）。
+/// 規則1は純粋関数側の`a_live_harness_session_is_not_revocable_and_holds_the_ledger_entry`が
+/// 固定している。
+#[test]
+fn a_registered_harness_profile_that_is_not_running_is_revoked() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("dead-but-registered");
+    std::fs::create_dir_all(&dir).expect("create dir");
+
+    // 作るだけで生存マーカーは立てない＝登録簿には載るが「生きていない」。
+    let profile = ProbeProfile::create("dead");
+    grant_ace_inheritable_access(&dir, profile.sid.as_psid(), FsAccess::ReadWrite)
+        .expect("grant the passthrough ACE");
+
+    let report = revoke_harness_subjects(&dir, &[], &|_, _| {}).expect("revoke_harness_subjects");
+    assert_eq!(
+        report.targeted(),
+        1,
+        "a registered harness profile that is not running must be revocable: {:?}",
+        report.subjects
+    );
+    assert_eq!(
+        sid_ace_mask(&dir, profile.sid.as_psid()).expect("probe after the revoke"),
+        None,
+        "the ACE must actually be gone"
+    );
+    // `ProbeProfile`の`Drop`がプロファイルを消す（テストが実マシンへ残さない）。
 }

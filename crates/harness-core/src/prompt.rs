@@ -418,7 +418,11 @@ fn render_passthrough(
                 format!(
                     "{}（{}）",
                     path.display(),
-                    if *writable { "読み書き" } else { "読取のみ" }
+                    if *writable {
+                        "読み書き"
+                    } else {
+                        "読取のみ"
+                    }
                 )
             })
             .collect();
@@ -474,8 +478,21 @@ fn tier_line(tier: ShellTier) -> String {
                 .to_string()
         }
         ShellTier::Tier1 => {
-            "シェル隔離: Tier1（Windows制限トークン+低IL）。cwd配下への書込は拘束されますが、\
-             ワークスペース外の読取は拒否されません。networkは遮断されません。"
+            // **「cwd配下への書込は拘束されます」と書いていた頃は、実態より広く宣言していた。**
+            // 「cwd配下なら書ける」と読めるが、実際に書けるのはワークスペース直下と、
+            // シェル自身が新しく作ったディレクトリの中だけである（低ILラベルはcwd 1個にしか
+            // 付かず、既存のサブディレクトリはMediumのまま＝No-Write-Upで拒否される）。
+            // その結果ビルドもテストも`git commit`も通らないのに、モデルには「書ける」と
+            // 伝わっていたため、原因の分からない`Access is denied`で再試行し続けることになる。
+            // 内訳の実測は`harness_sandbox::tier1::win_restricted`のモジュールdocの表。
+            "シェル隔離: Tier1（Windows制限トークン+低IL）。run_shellで起動したプロセスが\
+             書き込めるのは、ワークスペース直下と、そのシェル自身が新しく作った\
+             ディレクトリの中だけです。既存のサブディレクトリ（src/・.git/等）と\
+             ワークスペース外への書込は拒否されます。**このためビルド・テスト・\
+             git commitはTier1では失敗します**——これはコマンドの誤りではなく隔離Tierの\
+             制約なので、書き方を変えて再試行しても通りません。読取は拒否されません。\
+             networkは遮断されません。なおwrite_file/edit_fileはこの制約を受けないため、\
+             ファイルの編集自体は通常どおり行えます。"
                 .to_string()
         }
         ShellTier::Tier0 => {
@@ -560,9 +577,13 @@ mod tests {
         EnvironmentFacts::from_tool_ctx(&ctx)
     }
 
-    /// 全Tier×全StagingModeの組み合わせに対するレンダリング結果をゴールデン固定する。
-    /// 機構を変えるとこのテストが必ず割れ、同一コミット内でプロンプト差分を目視させる
-    /// （モジュールdoc「ゴールデンスナップショット」）。
+    /// 全Tier×全StagingModeの組み合わせで、Tier行が**ちょうど1本**出ることを固定する。
+    ///
+    /// **これは文面を固定するテストではない。** 以前この関数のdocは「機構を変えると必ず割れる」と
+    /// 書いていたが、実際に見ているのは行数と非空だけで、**Tierの説明文を書き換えても素通りする**。
+    /// 実際、Tier1の宣言が実態より広かった（「cwd配下への書込は拘束されます」＝cwd配下なら
+    /// 書けると読める）欠陥は、このテストが緑のまま残っていた。文面の担保は
+    /// [`each_tier_line_states_the_constraint_a_model_would_act_on`]が持つ。
     #[test]
     fn render_is_stable_across_all_tier_and_staging_combinations() {
         let tiers = [
@@ -588,6 +609,65 @@ mod tests {
                 );
                 assert!(!rendered.is_empty());
             }
+        }
+    }
+
+    /// **各Tierの説明が、モデルが実際に行動を変える事実を述べていること。**
+    ///
+    /// システムプロンプトはモデルへ制約を伝える唯一の宣言点なので、ここが実態より広いと
+    /// モデルは「できるはず」と思って失敗し、原因の分からないまま再試行し続ける。
+    /// Tier1がまさにその状態だった——低ILラベルはcwd 1個にしか付かないので
+    /// ビルドもテストも`git commit`も通らないのに、「cwd配下への書込は拘束されます」としか
+    /// 書いておらず、モデルからは「cwd配下なら書ける」と読めた。
+    ///
+    /// 見るのは**言い回し**ではなく**主張の有無**である。文面の推敲でテストが割れると
+    /// 誰も直さなくなるので、載っていないと行動が変わる語だけを固定する。
+    #[test]
+    fn each_tier_line_states_the_constraint_a_model_would_act_on() {
+        let line = |tier| {
+            let rendered = render(&facts_for(tier, StagingMode::Live));
+            rendered
+                .lines()
+                .find(|l| l.starts_with("シェル隔離:"))
+                .expect("every tier renders a tier line")
+                .to_string()
+        };
+
+        // Tier1: **ビルド・テストが通らないことを言う。** これが無いと、モデルは
+        // `Access is denied`をコマンドの誤りだと解釈して書き方を変え続ける。
+        let tier1 = line(ShellTier::Tier1);
+        for claim in ["ビルド", "テスト", "git commit", "失敗"] {
+            assert!(
+                tier1.contains(claim),
+                "the Tier1 line must tell the model that builds/tests cannot run here \
+                 (missing {claim:?}): {tier1}"
+            );
+        }
+        // Tier1では編集自体は通る。ここを言わないと「何もできない」と誤解される。
+        assert!(
+            tier1.contains("write_file") || tier1.contains("edit_file"),
+            "the Tier1 line must say that file edits are unaffected: {tier1}"
+        );
+        // networkが素通しであることは隠さない（Tier1の残存脅威T-10）。
+        assert!(
+            tier1.contains("network"),
+            "the Tier1 line must not hide that network is not contained: {tier1}"
+        );
+
+        // Tier0: 保護が無いことを必ず言う。**降格先になったので、ここの正直さが要る。**
+        let tier0 = line(ShellTier::Tier0);
+        assert!(
+            tier0.contains("物理的に拒否されません"),
+            "the Tier0 line must state plainly that nothing is enforced: {tier0}"
+        );
+
+        // 封じ込めがあるTierは、その旨を述べる（許可側も固定する＝B-35）。
+        for tier in [ShellTier::Tier2a, ShellTier::Tier2b, ShellTier::Tier3] {
+            let rendered = line(tier);
+            assert!(
+                rendered.contains("物理的に拒否されます"),
+                "a containing tier must state that out-of-scope access is denied: {rendered}"
+            );
         }
     }
 
@@ -722,7 +802,10 @@ mod tests {
         assert!(rendered.contains("mcp__company-docs__search"), "{rendered}");
         assert!(rendered.contains("docs.example.com"), "{rendered}");
         assert!(rendered.contains("外向き通信は不可"), "{rendered}");
-        assert!(rendered.contains("ワークスペースは読取のみ可"), "{rendered}");
+        assert!(
+            rendered.contains("ワークスペースは読取のみ可"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("ワークスペースへはアクセス不可"),
             "{rendered}"
@@ -767,13 +850,12 @@ mod tests {
     #[test]
     fn failed_passthrough_grants_are_declared_as_unusable() {
         let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
-        ctx.shell_tier = ShellTierSelection::direct(ShellTier::Tier2a).with_denied_passthrough(
-            vec![(
+        ctx.shell_tier =
+            ShellTierSelection::direct(ShellTier::Tier2a).with_denied_passthrough(vec![(
                 PathBuf::from(r"C:\secrets"),
                 "read".to_string(),
                 "ACE grant failed with ACCESS_DENIED".to_string(),
-            )],
-        );
+            )]);
 
         let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
 
@@ -789,12 +871,11 @@ mod tests {
     #[test]
     fn granted_passthrough_distinguishes_read_only_from_writable() {
         let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
-        ctx.shell_tier = ShellTierSelection::direct(ShellTier::Tier2a).with_granted_passthrough(
-            vec![
+        ctx.shell_tier =
+            ShellTierSelection::direct(ShellTier::Tier2a).with_granted_passthrough(vec![
                 (PathBuf::from(r"C:\tools"), false),
                 (PathBuf::from(r"D:\data"), true),
-            ],
-        );
+            ]);
 
         let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
 
@@ -807,9 +888,10 @@ mod tests {
     #[test]
     fn operator_facing_reachability_diagnostics_stay_out_of_the_prompt() {
         let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
-        ctx.shell_tier = ShellTierSelection::direct(ShellTier::Tier2a).with_passthrough_warnings(
-            vec!["run `harness fs grant-traverse C:/x` to fix this".to_string()],
-        );
+        ctx.shell_tier =
+            ShellTierSelection::direct(ShellTier::Tier2a).with_passthrough_warnings(vec![
+                "run `harness fs grant-traverse C:/x` to fix this".to_string(),
+            ]);
 
         let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
 

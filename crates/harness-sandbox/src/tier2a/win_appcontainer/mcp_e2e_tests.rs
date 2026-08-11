@@ -116,7 +116,7 @@ fn e2e_mcp_server_cannot_read_the_workspace_unless_declared() {
     for name in [&denied.profile_name, &allowed.profile_name] {
         delete_profile(name);
     }
-    crate::tier2a::session_profile::end_session(&revoke_session_grant);
+    let _ = crate::tier2a::session_profile::end_session(&revoke_session_grant);
 
     assert!(
         !out_denied.contains("SECRET_IN_WORKSPACE"),
@@ -253,7 +253,7 @@ fn e2e_mcp_servers_get_independent_egress_allowlists() {
     for name in [&prep_a.profile_name, &prep_b.profile_name] {
         delete_profile(name);
     }
-    crate::tier2a::session_profile::end_session(&revoke_session_grant);
+    let _ = crate::tier2a::session_profile::end_session(&revoke_session_grant);
 
     assert!(
         stdout.contains("own=True"),

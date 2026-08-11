@@ -193,8 +193,12 @@ pub fn prepare_scope(workspace_root: &Path, scope: &SessionScope) -> Result<usiz
     let Some(dir) = scope.overlay_dir(workspace_root) else {
         return Ok(0);
     };
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("could not create the overlay directory {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "could not create the overlay directory {}: {e}",
+            dir.display()
+        )
+    })?;
 
     // `--staged`（workspace内`.harness/sandbox/<id>`）はここで終わり。**ACLは触らない**——
     // このオーバーレイを読み書きするのはharness自身のプロセスだけで、サンドボックスの子から
@@ -438,7 +442,11 @@ mod tests {
         let scope = ScopeTemplate::new(StagingMode::Staged, false).scope_for("session-abc");
         assert_eq!(
             scope.staging.sandbox_dir,
-            Some(PathBuf::from(".harness").join("sandbox").join("session-abc"))
+            Some(
+                PathBuf::from(".harness")
+                    .join("sandbox")
+                    .join("session-abc")
+            )
         );
         assert_eq!(scope.cow_upper_dir, None);
         assert!(!scope.is_live());
@@ -489,6 +497,9 @@ mod tests {
     #[test]
     fn different_sessions_get_different_overlays() {
         let t = ScopeTemplate::new(StagingMode::Staged, false);
-        assert_ne!(t.scope_for("session-a").staging, t.scope_for("session-b").staging);
+        assert_ne!(
+            t.scope_for("session-a").staging,
+            t.scope_for("session-b").staging
+        );
     }
 }

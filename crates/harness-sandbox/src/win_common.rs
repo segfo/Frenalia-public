@@ -19,7 +19,9 @@ use windows::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Pipes::CreatePipe;
-use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, TerminateProcess, WaitForSingleObject, INFINITE,
+};
 
 /// `harness-sandbox-vm`（`smb_share`・`vmsandboxd`）から参照されるため`pub`
 /// （`docs/CODE-STRUCTURE-RULES.md`規則4）。
@@ -37,7 +39,9 @@ pub fn wide(s: &str) -> Vec<u16> {
 /// 依存していないのでここへ置く。
 pub fn wait_for_process_exit(pid: u32, timeout_ms: u32) -> bool {
     use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
-    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
     unsafe {
         let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
             return true;
@@ -91,9 +95,7 @@ pub struct OwnedSid {
 impl OwnedSid {
     /// # Safety
     /// `sid`は有効なSIDを指していること。
-    pub unsafe fn copy_from(
-        sid: windows::Win32::Security::PSID,
-    ) -> windows::core::Result<Self> {
+    pub unsafe fn copy_from(sid: windows::Win32::Security::PSID) -> windows::core::Result<Self> {
         use windows::Win32::Security::{CopySid, GetLengthSid, PSID};
         let len = GetLengthSid(sid);
         if len == 0 {
@@ -432,8 +434,48 @@ pub(crate) fn create_pipe_with_sddl(sddl: &str) -> windows::core::Result<(HANDLE
     Ok((read, write))
 }
 
+/// 既定のセキュリティ記述子で継承可能な匿名パイプを作る（Tier0の起動シーケンス用）。
+///
+/// Tier1/Tier2aが[`create_pipe_with_sddl`]で明示ラベル・package SIDを付けるのは、
+/// **低ILやAppContainerの子がMedium ILのパイプへ書けない**（No-Write-Up）ために
+/// stdout/stderrが消えるという実害があるからで、パイプ一般の要件ではない。
+/// Tier0の子は親と同じMedium ILで走るので、既定の記述子で届く。
+/// 消えた理由が分からなくなると「念のため」で低ILラベルが復活しかねないので明記しておく。
+pub(crate) fn create_inheritable_pipe() -> windows::core::Result<(HANDLE, HANDLE)> {
+    let mut read = HANDLE::default();
+    let mut write = HANDLE::default();
+    unsafe {
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: true.into(),
+        };
+        CreatePipe(&mut read, &mut write, Some(&sa), 0)?;
+    }
+    Ok((read, write))
+}
+
+/// 子プロセスの本体が`spawn_blocking`や別スレッドへ移動した後も、timeout・キャンセルから
+/// 終了させられる軽量ハンドル。**Tier1（`tier1::win_restricted`）とTier0（`tier0::win_plain`）が
+/// 共有する**——`kill`の意味はトークンの種類に依存しないので、Tierごとに書き直すと
+/// 片方だけ直る事故になる（`docs/CODE-STRUCTURE-RULES.md`§5.0）。
+#[derive(Clone, Copy)]
+pub struct KillToken(pub(crate) HANDLE);
+
+// HANDLEはカーネルオブジェクトへのポインタ値で、別スレッドからの`TerminateProcess`は
+// OSレベルで安全（`RestrictedChild`のSend実装と同じ理由）。
+unsafe impl Send for KillToken {}
+
+impl KillToken {
+    pub fn kill(&self) {
+        unsafe {
+            let _ = TerminateProcess(self.0, 1);
+        }
+    }
+}
+
 /// kill-on-close付きJob Objectを作る（breakaway許可フラグは立てないため既定拒否）。
-/// Tier1/Tier2aどちらの起動シーケンスでも同一ロジックを使う（T-13対策）。
+/// Tier0/Tier1/Tier2aどの起動シーケンスでも同一ロジックを使う（T-13対策）。
 pub(crate) fn create_job_object() -> windows::core::Result<HANDLE> {
     unsafe {
         let job = CreateJobObjectW(None, PCWSTR::null())?;

@@ -8,15 +8,35 @@
 //! §4.3「同一信頼ドメイン」の裏返し＝自ドメイン内で絞る分には特権が要らない）。
 //!
 //! **既知の限界（正直に明記する）**: 低ILは既定で中IL（Medium、通常ファイルの既定）オブジェクトを
-//! read可（No-Read-Upは既定でない）＝機密性は守らない（T-04残存、§9-1）。書込は、spawn直前に
-//! 呼び出し側が`cwd`ディレクトリ**1つだけ**へ低ILラベルを明示的に付与するため、
-//! **そのcwd直下に新規作成されるファイル/ディレクトリのみ**書込可能になる
-//! （ラベルは継承させないので、cwd配下に新しく作った**サブディレクトリ**の中は
-//! 再びMedium扱いになる。BUG-018でTier2aの一時ディレクトリを巻き込んだため継承を止めた）。
-//! cwd配下に既にMedium ILで存在する既存ファイル（過去の非隔離buildの成果物等）への上書きは
-//! 失敗し得る（既存ファイルへ遡ってラベルを再帰付与するのは、ユーザの実リポジトリのACLを
-//! 広範囲に変更する破壊的操作になるため意図的に行わない）。cwd外への書込は既定Mediumラベルの
-//! ため一貫して拒否される（範囲外書込拒否＝Tier1の本来の保証、T-05）。
+//! read可（No-Read-Upは既定でない）＝機密性は守らない（T-04残存、§9-1）。
+//! **networkは制御しない**（capabilityゲートが無い＝T-10残存）。
+//!
+//! 書込の届く範囲は、spawn直前に呼び出し側が`cwd`ディレクトリ**1つだけ**へ低ILラベルを
+//! 付与することで決まる。実測した内訳は次のとおり
+//! （回帰テスト`tier1_child_write_reach_under_a_labeled_cwd_is_measured`が固定している）。
+//!
+//! | 対象 | 可否 | 理由 |
+//! |---|---|---|
+//! | ラベルを付けた`cwd`直下 | **書ける** | 明示したLowラベル |
+//! | 子プロセスが**新規作成した**サブディレクトリの中 | **書ける** | ACL継承ではなく、**MICが新規オブジェクトへ作成者のIL（Low）を書く**ため。`icacls`でも`(I)`の付かないLowラベルとして観測できる |
+//! | 既にMedium ILで存在する既存のサブディレクトリ・ファイル（`src/`・`.git/`・過去の非隔離buildの`target/`等） | **書けない** | No-Write-Up。既存ファイルへ遡ってラベルを再帰付与するのは、ユーザの実リポジトリのACLを広範囲に変更する破壊的操作になるため意図的に行わない |
+//! | `cwd`の外 | **書けない** | 既定Mediumラベル（範囲外書込拒否＝Tier1本来の保証、T-05） |
+//!
+//! ラベルを継承させない（フラグ欄を空にする）のはBUG-018でTier2aの一時ディレクトリを
+//! 巻き込んだためだが、**継承させないことと「子ディレクトリの中に書けない」ことは別**である
+//! ——上表2行目のとおり、実際には書ける。この2つを混同した記述が長く残っていたので表にした。
+//!
+//! **したがってTier1では`cargo build`/`cargo test`/`git commit`が通らない。**
+//! 理由は`target/`がサブディレクトリだからではなく（新規作成なら書ける）、
+//! (1) cargoが`cwd`の**外**（`$CARGO_HOME/.package-cache`・`~/.rustup/tmp`）へ書くこと、
+//! (2) 既にMediumで存在する`.git/`や過去のbuild成果物へ書けないこと、の2点による。
+//! **Tier1にはパス単位で許可を開ける機構が無い**——レバーは「cwd 1個にラベルを付けるか否か」
+//! だけで、Tier2aのcapability SID + ACE付与に相当するものを持たない。この非対称が構造的な
+//! 制約であって、実装の未熟さではない。詳細は`plans/PLAN-POLICY-EDITOR-EXEC-DENIAL.md`
+//! 「第11セッション」節。
+//!
+//! なお`edit_file`/`write_file`はharness本体（Medium IL）が実行するのでこの制約を受けない。
+//! Tier1が拘束するのは`run_shell`の子プロセスだけである。
 //!
 //! この機密性・network遮断の欠落を埋める実験的Tier2a（AppContainer）は`win_appcontainer`参照。
 //! 低レベルのパイプ/HANDLE/env補助関数は`win_common`に共通化されている。
@@ -216,18 +236,9 @@ impl RestrictedChild {
 }
 
 /// `RestrictedChild`が`spawn_blocking`へ移動した後もtimeoutからkillできる軽量ハンドル。
-#[derive(Clone, Copy)]
-pub struct KillToken(HANDLE);
-
-unsafe impl Send for KillToken {}
-
-impl KillToken {
-    pub fn kill(&self) {
-        unsafe {
-            let _ = TerminateProcess(self.0, 1);
-        }
-    }
-}
+/// 実体はTier0と共有する[`crate::win_common::KillToken`]で、ここは既存の呼び出し元のための
+/// 再エクスポートである（`OutputEvent`と同じ扱い）。
+pub use crate::win_common::KillToken;
 
 impl Drop for RestrictedChild {
     fn drop(&mut self) {
@@ -465,7 +476,9 @@ mod tests {
         let label_line = text
             .lines()
             .find(|line| line.contains("Mandatory Label"))
-            .unwrap_or_else(|| panic!("a mandatory label must be present on the directory: {text}"));
+            .unwrap_or_else(|| {
+                panic!("a mandatory label must be present on the directory: {text}")
+            });
 
         assert!(
             label_line.contains("Low Mandatory Level"),
@@ -479,6 +492,130 @@ mod tests {
         assert!(
             !label_line.contains("(OI)") && !label_line.contains("(CI)"),
             "the mandatory label must not carry inheritance flags (BUG-018): {label_line}"
+        );
+    }
+
+    /// **モジュールdocの「既知の限界」が実際にそうなっているかを、実機で測って固定する。**
+    ///
+    /// 非継承ラベルが意味するのは「ACL継承で伝播しない」ことだけで、Windows MICには別途
+    /// 「作成者のILがMedium未満なら、新規オブジェクトに作成者のILを明示ラベルとして書く」
+    /// という暗黙規則がある。この2つは別の機構なので、**ラベルを継承させないことが
+    /// 「子ディレクトリの中に書けない」を意味するとは限らない**。docの記述はこの区別を
+    /// 曖昧にしたまま「再びMedium扱いになる」と断言していたので、ここで実測に置き換える。
+    ///
+    /// 測るのは3つで、**対照群（cwd直下への書込が成功すること）を必ず含める**（B-35）。
+    /// 含めないと、ラベルがまったく付いていない＝どこにも書けない状態でも
+    /// 「サブディレクトリへ書けない」は成立してしまい、機構の生死を判定できない
+    /// （BUG-088がまさにその形で数か月見逃された）。
+    #[test]
+    fn tier1_child_write_reach_under_a_labeled_cwd_is_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+
+        // 対象コマンドが動き出す**前に**、Medium ILのまま存在する既存サブディレクトリを
+        // 用意する（実リポジトリの`src/`・`.git/`に相当する。テストプロセスはMedium）。
+        std::fs::create_dir(cwd.join("presub")).unwrap();
+
+        set_low_integrity_label(cwd).expect("label must be applied");
+
+        // 成否は例外の有無ではなく`Test-Path`＝実際にファイルが在るかで判定する（B-25）。
+        let script = concat!(
+            // **失敗の理由を握り潰さない**（B-10）。`Test-Path`が偽だったときに
+            // 「なぜ書けなかったのか」がここに出ていないと、調査がACL探しから始まる。
+            "$ErrorActionPreference='Continue';",
+            "Write-Output \"PWD=$((Get-Location).Path)\";",
+            "Write-Output \"CWD=$([System.IO.Directory]::GetCurrentDirectory())\";",
+            "Set-Content -Path 'root.txt' -Value x;",
+            "Write-Output \"ROOT_WRITE=$(Test-Path 'root.txt')\";",
+            "New-Item -ItemType Directory -Path 'newsub' -Force | Out-Null;",
+            "Write-Output \"NEWSUB_CREATED=$(Test-Path 'newsub')\";",
+            "Set-Content -Path 'newsub/a.txt' -Value x;",
+            "Write-Output \"NEWSUB_WRITE=$(Test-Path 'newsub/a.txt')\";",
+            "Set-Content -Path 'presub/b.txt' -Value x;",
+            "Write-Output \"PRESUB_WRITE=$(Test-Path 'presub/b.txt')\";",
+            "Write-Output 'NEWSUB_LABEL_BEGIN';",
+            "if (Test-Path 'newsub') { icacls 'newsub' };",
+            "Write-Output 'NEWSUB_LABEL_END'",
+        );
+
+        let child = spawn(
+            test_shell(),
+            &["-NoProfile", "-NonInteractive", "-Command", script],
+            cwd,
+            &test_env(),
+            false,
+        )
+        .expect("spawn Tier1 child");
+        let (out, err, code) = child.write_stdin_read_output_and_wait(None).unwrap();
+        assert_eq!(
+            code, 0,
+            "the probe script itself must run: out={out:?} err={err:?}"
+        );
+
+        // 実測値をそのまま残す。将来この結果が変わったときに何が変わったのかを追えるようにする。
+        eprintln!("[tier1-write-reach] out={out}");
+        eprintln!("[tier1-write-reach] err={err}");
+
+        let says = |key: &str, value: &str| out.contains(&format!("{key}={value}"));
+
+        // **対照群**: cwd直下は書ける。ここが偽ならラベルが効いていないので、
+        // 以下の「書けない」は機構の証拠にならない。
+        // **落ちたときはまず`PWD`と`CWD`を見ること。** 2つある理由がここにある——
+        // PowerShellのcmdletが相対パスを解決するのは`$PWD`（プロバイダのロケーション）で、
+        // `CreateProcessAsUserW`が設定するのは`CWD`（プロセスの作業ディレクトリ）である。
+        // 両者が食い違うと、ラベルは正しく付いているのに書込みだけが別の場所へ飛ぶ。
+        // 実際にそうなった実例が[BUG-101](../../../../docs/bugs/BUG-101.md)である。
+        assert!(
+            says("ROOT_WRITE", "True"),
+            "control group: a Tier1 child must be able to write directly in the labeled cwd \
+             (if this fails, either the label is not in effect, or PWD != CWD — check both \
+             lines above before suspecting the label): {out}"
+        );
+
+        // **既存のMediumサブディレクトリへは書けない**——No-Write-Upの帰結で、
+        // ラベルはcwd 1個にしか付いていない。これが「Tier1では`git commit`もビルドも通らない」
+        // の直接の根拠であり、プロジェクトの置き場所に依らない。
+        assert!(
+            says("PRESUB_WRITE", "False"),
+            "a Tier1 child must NOT be able to write into a pre-existing Medium-IL subdirectory \
+             (this is what makes `src/`・`.git/` unwritable in a real repository): {out}"
+        );
+
+        // **新規サブディレクトリの扱いは、上の2つとは別の機構で決まる**（MICの暗黙ラベル）。
+        // 実測した結果をそのまま固定する。ここが将来変わったら、モジュールdocと
+        // `docs/STATUS.md`のTier1の記述を必ず追随させること。
+        assert!(
+            says("NEWSUB_CREATED", "True"),
+            "creating a new subdirectory directly under the labeled cwd must succeed: {out}"
+        );
+        assert!(
+            says("NEWSUB_WRITE", "True"),
+            "a directory created BY the low-IL child inherits the creator's integrity level \
+             (implicit MIC rule), so writing inside it succeeds — this is NOT the same thing as \
+             the mandatory label being inherited via the ACL: {out}"
+        );
+
+        // **機構まで固定する。** 「書けた」だけでは、ラベルが継承されたのか
+        // MICが作成者ILを書いたのかが区別できない。`icacls`の出力では継承ACEに`(I)`が付くので、
+        // ラベル行に`(I)`が**無い**ことが「ACL継承ではない」の直接の証拠になる
+        // （同じ出力中のDACL行はすべて`(I)`付きで、対照になっている）。
+        let label_line = out
+            .lines()
+            .skip_while(|l| !l.contains("NEWSUB_LABEL_BEGIN"))
+            .take_while(|l| !l.contains("NEWSUB_LABEL_END"))
+            .find(|l| l.contains("Mandatory Label"))
+            .unwrap_or_else(|| {
+                panic!("the child-created subdirectory must carry a mandatory label: {out}")
+            });
+        assert!(
+            label_line.contains("Low Mandatory Level"),
+            "the child-created subdirectory must be labeled Low, because its creator was Low: {label_line}"
+        );
+        assert!(
+            !label_line.contains("(I)"),
+            "the label must NOT be an inherited ACE — inheritance is deliberately off (BUG-018). \
+             It is present because Windows MIC writes the creator's integrity level onto new \
+             objects, which is a different mechanism entirely: {label_line}"
         );
     }
 
