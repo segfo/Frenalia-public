@@ -302,3 +302,67 @@ fn being_already_executable_does_not_mean_the_value_is_refused() {
         "the user may still write this by hand; we only decline to propose it"
     );
 }
+
+/// **再帰（`**`）に書込は認めない。**
+///
+/// 再帰宣言は「いま在るもの」ではなく**これから作られるもの**まで覆うので、書込を認めると
+/// サンドボックス内からそのツリーへ新しい実行ファイルを置ける。置かれた`.exe`は、次に
+/// ユーザーがサンドボックスの**外**で実行した瞬間にフル権限で動く——書き込み→待ち受け型の
+/// サンドボックス脱出である。
+///
+/// この論法は本モジュールが`C:/Windows`に対して既に持っていた（「そこへ書ければ、全ユーザーが
+/// 実行するプログラムを差し替えられる」）が、**名指しした数個のルートにしか効いておらず**、
+/// PATH上のユーザーディレクトリ（`.cargo/bin`等）は素通しだった。
+#[test]
+fn a_recursive_value_is_refused_for_write_access() {
+    for path in [
+        "C:/Users/me/.cargo/bin/**",
+        "C:/Users/me/AppData/Local/Programs/MyApp/**",
+        "D:/work/tools/**",
+    ] {
+        let verdict = check_value(SettingsKey::FsReadWrite, path);
+        assert!(
+            verdict.is_too_broad(),
+            "{path} must not be writable recursively -- a new .exe dropped there runs with the \
+             user's full rights outside the sandbox"
+        );
+        assert!(
+            verdict.message().is_some_and(|m| m.contains("recursive")),
+            "the reason must name the recursive scope, not just say it is broad: {verdict:?}"
+        );
+    }
+}
+
+/// **対になる許可側**（B-35）。読み取り・実行の再帰は通す。
+///
+/// これが無いと「再帰を全部拒否する」実装でも上のテストが通り、`R`キー（D-63）そのものが
+/// 死んでいることに気付けない。「将来作られるファイルを読む」にはcargo/rustcのような実需がある。
+#[test]
+fn a_recursive_value_is_still_accepted_for_read_and_exec() {
+    for path in [
+        "C:/Users/me/.cargo/bin/**",
+        "C:/Users/me/.rustup/toolchains/stable-x86_64-pc-windows-msvc/**",
+    ] {
+        for key in [SettingsKey::FsRead, SettingsKey::FsReadExec] {
+            assert!(
+                !check_value(key, path).is_too_broad(),
+                "{path} must stay acceptable for {key:?} -- reading files that do not exist yet is \
+                 exactly what the recursive scope is for"
+            );
+        }
+    }
+}
+
+/// **素のパスへの書込は従来どおり通す。** 拒んでいるのは「再帰」であって「書込」ではない。
+#[test]
+fn a_plain_path_is_still_writable() {
+    for path in [
+        "C:/Users/me/.cargo/registry/cache",
+        "C:/Users/me/AppData/Local/Temp/build-output.txt",
+    ] {
+        assert!(
+            !check_value(SettingsKey::FsReadWrite, path).is_too_broad(),
+            "{path} declares a single object, so the future-files argument does not apply"
+        );
+    }
+}

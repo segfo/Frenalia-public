@@ -657,15 +657,18 @@ impl App {
         }
         // **広すぎる値は印を付ける段階で止める**（承認時に弾くと、選び直しが要ることに
         // その場で気付けない）。判定は`breadth`の同じ関数を通す。
+        //
+        // **承認で作られるのと同じaccess種別で見る。** かつてここは`FsRead`固定で判定して
+        // いたが、`recursive_proposals`は**配下に観測された種別ごとに1本ずつ**作るので、
+        // 書込が観測されたサブツリーでは「印は付くのに、承認では弾かれる`fs.read_write`の
+        // 宣言」が生まれていた（`**`＋書込は`breadth`が拒否する）。判定に使う集合を
+        // `recursive_keys_for`へ寄せ、印を付ける側と作る側が**同じ答え**を見るようにする（B-06）。
         let value = format!("{path}/**");
-        if let Some(reason) = harness_policy::breadth::check_value(
-            harness_policy::generalize::SettingsKey::FsRead,
-            &value,
-        )
-        .message()
-        {
-            self.status = format!("{value} は再帰にできません: {reason}");
-            return;
+        for key in self.recursive_keys_for(node) {
+            if let Some(reason) = harness_policy::breadth::check_value(key, &value).message() {
+                self.status = format!("{value} は再帰にできません（{}）: {reason}", key.dotted());
+                return;
+            }
         }
         self.recursive.insert(path.clone());
         let under = self.tree.subtree_proposals(node).len();
@@ -674,6 +677,32 @@ impl App {
             "{value} を再帰で許可します（いま見えている{under}件だけでなく、\
              このフォルダ配下すべてと今後作られるファイルが対象です）"
         );
+    }
+
+    /// `<path>/**`として合成されるaccess種別（配下に観測された種別の集合）。
+    ///
+    /// **印を付けてよいかの判定（[`Self::toggle_recursive`]）と、実際に合成する側
+    /// （[`Self::recursive_proposals`]）が同じ集合を見るための1箇所。** 別々に数えると、
+    /// 「印は付いたのに承認では弾かれる種別」が生まれる（B-06・`CODE-STRUCTURE-RULES`§5.0）。
+    ///
+    /// 配下に候補が1件も無いノード（全部フィルタで隠れている等）は`fs.read`を既定にする。
+    fn recursive_keys_for(&self, node: usize) -> Vec<harness_policy::generalize::SettingsKey> {
+        let Some(view) = self.view.as_ref() else {
+            return vec![harness_policy::generalize::SettingsKey::FsRead];
+        };
+        let mut keys: Vec<harness_policy::generalize::SettingsKey> = self
+            .tree
+            .subtree_proposals(node)
+            .into_iter()
+            .map(|i| view.proposals[i].key)
+            .filter(|k| *k != harness_policy::generalize::SettingsKey::NetAllowDomains)
+            .collect();
+        keys.sort();
+        keys.dedup();
+        if keys.is_empty() {
+            keys.push(harness_policy::generalize::SettingsKey::FsRead);
+        }
+        keys
     }
 
     /// `R`で印を付けたノードを、承認へ流す**合成された提案**にする（D-63）。
@@ -693,18 +722,7 @@ impl App {
             let Some(node) = (0..self.tree.len()).find(|i| &self.tree.node(*i).path == path) else {
                 continue;
             };
-            let mut keys: Vec<harness_policy::generalize::SettingsKey> = self
-                .tree
-                .subtree_proposals(node)
-                .into_iter()
-                .map(|i| view.proposals[i].key)
-                .filter(|k| *k != harness_policy::generalize::SettingsKey::NetAllowDomains)
-                .collect();
-            keys.sort();
-            keys.dedup();
-            if keys.is_empty() {
-                keys.push(harness_policy::generalize::SettingsKey::FsRead);
-            }
+            let keys = self.recursive_keys_for(node);
             let evidence: Vec<_> = self
                 .tree
                 .subtree_proposals(node)

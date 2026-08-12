@@ -18,8 +18,23 @@ fn workspace() -> tempfile::TempDir {
     dir
 }
 
-/// パス1の記録セッションを1件作る（観測したパスは呼び出し側が決める）。
+/// パス1の記録セッションを1件作る（観測したパスは呼び出し側が決める）。すべて`read`で観測する。
 fn seed_pass1(ws: &tempfile::TempDir, id: &str, command: &str, paths: &[&str]) {
+    let observed: Vec<(&str, harness_config::FsAccess)> = paths
+        .iter()
+        .map(|p| (*p, harness_config::FsAccess::Read))
+        .collect();
+    seed_pass1_with_access(ws, id, command, &observed);
+}
+
+/// [`seed_pass1`]のaccess種別を指定できる版。**書込が観測されたケース**を作るために要る
+/// （`**`＋`fs.read_write`の拒否を測るテストが使う）。
+fn seed_pass1_with_access(
+    ws: &tempfile::TempDir,
+    id: &str,
+    command: &str,
+    observed: &[(&str, harness_config::FsAccess)],
+) {
     let dir = RecordSessionDir::create(ws.path(), id).expect("session dir");
     let mut manifest = RecordManifest::new(id, command, ws.path(), ws.path(), 100);
     manifest.status = RecordStatus::Finished;
@@ -29,11 +44,11 @@ fn seed_pass1(ws: &tempfile::TempDir, id: &str, command: &str, paths: &[&str]) {
     dir.write_manifest(&manifest).expect("manifest");
 
     let mut log = String::new();
-    for (index, path) in paths.iter().enumerate() {
+    for (index, (path, access)) in observed.iter().enumerate() {
         let event = harness_policy::FsAuditEvent::observed(
             harness_policy::FsAuditKind::Etw,
             *path,
-            harness_config::FsAccess::Read,
+            *access,
             true,
             "record_all",
             index as u64 + 1,
@@ -1603,5 +1618,88 @@ fn a_recursive_mark_counts_as_a_selection_even_without_a_checkbox() {
         1,
         "再帰指定は「選んだもの」である——承認はこれで通るのだから、表示も1件と言わなければ\
          ユーザーは承認できないと誤解する"
+    );
+}
+
+/// **配下に書込が観測されているツリーは、`R` を押した時点で拒否する。**
+///
+/// `recursive_proposals`は**配下に観測されたaccess種別ごとに1本ずつ**`<path>/**`を作るので、
+/// 奥の1ファイルが書込として観測されていれば`fs.read_write`の再帰宣言が生まれる。それは
+/// `breadth`が拒否する値（将来そのツリーへ置かれた実行ファイルまで書き換えられるため）なので、
+/// **印を付ける段階で止めなければ「印は付いたのに承認では弾かれる」**という形になる。
+///
+/// かつて`toggle_recursive`は`FsRead`固定で幅を見ており、この経路を素通しさせていた。
+#[test]
+fn marking_a_directory_recursive_is_refused_when_something_under_it_was_written() {
+    let ws = workspace();
+    seed_pass1_with_access(
+        &ws,
+        "s1",
+        "cargo build",
+        &[
+            (
+                r"C:\proj\tc\1.89.0\bin\rustc.exe",
+                harness_config::FsAccess::Read,
+            ),
+            (
+                r"C:\proj\tc\1.89.0\bin\out.tmp",
+                harness_config::FsAccess::ReadWrite,
+            ),
+        ],
+    );
+    let mut app = open_edit(&ws);
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+
+    app.on_key(key(KeyCode::Char('R')));
+
+    assert!(
+        app.recursive.is_empty(),
+        "書込が観測されているツリーに再帰の印を付けてはいけない: {}",
+        app.status
+    );
+    assert!(
+        app.status.contains("再帰にできません"),
+        "なぜ付かなかったのかをその場で言う（B-32）: {}",
+        app.status
+    );
+    assert!(
+        app.status.contains("read_write"),
+        "どのaccess種別が原因かを名指しする: {}",
+        app.status
+    );
+}
+
+/// **対になる許可側**（B-35）。読み取りしか観測されていないツリーは、従来どおり再帰にできる。
+/// これが無いと「常に拒否する」実装でも上のテストが通り、`R`キー（D-63）が死んでいることに
+/// 気付けない。
+#[test]
+fn marking_a_read_only_directory_recursive_is_still_allowed() {
+    let ws = workspace();
+    seed_pass1_with_access(
+        &ws,
+        "s1",
+        "cargo build",
+        &[
+            (
+                r"C:\proj\tc\1.89.0\bin\rustc.exe",
+                harness_config::FsAccess::Read,
+            ),
+            (
+                r"C:\proj\tc\1.90.0\bin\rustc.exe",
+                harness_config::FsAccess::ReadExec,
+            ),
+        ],
+    );
+    let mut app = open_edit(&ws);
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+
+    app.on_key(key(KeyCode::Char('R')));
+
+    assert!(
+        !app.recursive.is_empty(),
+        "read/read_exec だけなら再帰は従来どおり使える: {}",
+        app.status
     );
 }

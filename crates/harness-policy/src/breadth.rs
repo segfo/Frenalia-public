@@ -94,6 +94,32 @@ pub fn check(proposal: &RuleProposal) -> BreadthVerdict {
 pub fn check_value(key: SettingsKey, value: &str) -> BreadthVerdict {
     match key {
         SettingsKey::NetAllowDomains => BreadthVerdict::Acceptable,
+        // **再帰（`**`）に書込を認めない。** 再帰宣言は「いま在るもの」ではなく
+        // **これから作られるものまで**覆うので、書込を認めるとサンドボックス内から
+        // そのツリーへ**新しい実行ファイルを置ける**ようになる。置かれた `.exe` は、
+        // 次にユーザーがサンドボックスの**外**でそれを実行した瞬間にフル権限で動く
+        // ——書き込み→待ち受け型のサンドボックス脱出である。
+        //
+        // この論法は本モジュールが既に持っていた（モジュールdocの表の
+        // 「マシン全体のインストール先」＝`C:/Windows`へ`fs.read_write`だけ拒否する行:
+        // 「そこへ書ければ、全ユーザーが実行するプログラムを差し替えられる」）。
+        // ところがその規則は**名指しした数個のルートにしか効いておらず**、
+        // `C:/Users/<user>/.cargo/bin` のような**PATH上のユーザーディレクトリ**は素通しだった。
+        // 再帰指定は範囲を将来へ広げるぶん、同じ危険を任意のツリーで再現する。
+        //
+        // 読み取り・実行の再帰は従来どおり通す。「将来作られるファイルを**読む**」には
+        // cargo/rustcのような実需があるが、「将来作られるファイルへ**書く**」の実需は
+        // `%TEMP%`とworkspaceに集中しており、どちらも候補から除外済みである
+        // （`harness_policy_editor::exclusion`）。
+        SettingsKey::FsReadWrite if crate::normalize::declared_scope(value).is_recursive() => {
+            BreadthVerdict::TooBroad(format!(
+                "{value} combines recursive scope (`**`) with write access, which is refused: a \
+                 recursive grant covers files that do not exist yet, so anything inside the \
+                 sandbox could drop a new executable into that tree, and it would run with your \
+                 full rights the next time you launch it outside the sandbox. Declare the \
+                 specific paths that need writing instead, or use a read-only recursive grant."
+            ))
+        }
         SettingsKey::FsRead | SettingsKey::FsReadWrite | SettingsKey::FsReadExec => {
             // [D-63] **ワイルドカードは確定部分で判定する。** ACEが付くのはそこだからである
             // （`C:/x/**`への付与は`C:/x`のACE）。値の見た目の深さで測っていた頃は、
