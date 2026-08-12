@@ -29,6 +29,10 @@ pub mod session_profile;
 /// windows専用にしない（名前生成と検証は純粋関数）。
 pub mod mcp_profile;
 
+/// 「付与したACEが台帳に載っているか」の自己検証（BUG-101欠陥①）。突き合わせの判定は
+/// 純粋関数なので、`session_profile`と同じ理由でwindows専用にしない（DACLの実測だけがcfg分岐）。
+pub mod grant_audit;
+
 /// 付与したtraverse ACEの記録。**windows専用ではない**（`harness fs list`のような表示系
 /// コマンドが非Windowsでも空台帳を表示できるよう、全プラットフォームでコンパイルする）。
 /// Tier2a本体（下記）はWin32 API依存のためwindows専用。

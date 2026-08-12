@@ -29,6 +29,37 @@ static TOTAL: AtomicUsize = AtomicUsize::new(0);
 static DONE: AtomicUsize = AtomicUsize::new(0);
 static GRANTED: AtomicUsize = AtomicUsize::new(0);
 static ALREADY: AtomicUsize = AtomicUsize::new(0);
+/// [`Phase`]の判別子。`AtomicBool`ではなく`usize`にしてあるのは、フェーズが3つ目に
+/// なったときに型だけ増やせばよくするため。
+static PHASE: AtomicUsize = AtomicUsize::new(Phase::Grant as usize);
+/// 自己検証フェーズの進捗。**付与フェーズのカウンタとは別に持つ**——同じ変数を使い回すと、
+/// 付与の後に走る自己検証が[`last_totals`]（＝「今回は何件付けて何件飛ばしたか」を
+/// 実行後に表示するための値）を0で塗り潰す。**進捗は消えてよいが、マシンに何をしたかの
+/// 事実は消してはいけない**（この型のdocが元々宣言している不変条件）。
+static AUDIT_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static AUDIT_DONE: AtomicUsize = AtomicUsize::new(0);
+
+/// このセルがいま何の進捗を運んでいるか。
+///
+/// **消費側（TUI）はこれを見て表示を選ぶ。** 以前は「内訳を出すかどうか」から付与か否かを
+/// 推測していたが、フェーズが増えた時点でその推測は成立しない——何のフェーズかは
+/// 生産側だけが知っている事実なので、推測させずに運ぶ（B-32）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// fs passthroughのACE付与。
+    Grant = 0,
+    /// 付与したACEが台帳に載っているかの自己検証（`tier2a::grant_audit`、BUG-101）。
+    Audit = 1,
+}
+
+impl Phase {
+    fn from_usize(value: usize) -> Self {
+        match value {
+            1 => Phase::Audit,
+            _ => Phase::Grant,
+        }
+    }
+}
 
 /// 付与フェーズの進捗。`done`は**判定が終わった件数**（付与した・既に十分だった・
 /// 昇格へ回した、のいずれか）で、成功件数ではない——止まって見える時間の内訳を
@@ -46,11 +77,13 @@ static ALREADY: AtomicUsize = AtomicUsize::new(0);
 /// **この2つの数を並べて初めてどちらなのかが言える**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PassthroughGrantProgress {
+    /// 何の進捗か。**内訳の有無から推測させない**（[`Phase`]のdoc参照）。
+    pub phase: Phase,
     pub done: usize,
     pub total: usize,
-    /// 実際にACEを書いた件数（本体内・昇格経由を問わない）。
+    /// 実際にACEを書いた件数（本体内・昇格経由を問わない）。`Audit`フェーズでは常に0。
     pub granted: usize,
-    /// 既に十分なACEがあったのでWin32を1回も呼ばずに飛ばした件数。
+    /// 既に十分なACEがあったのでWin32を1回も呼ばずに飛ばした件数。`Audit`フェーズでは常に0。
     pub already: usize,
 }
 
@@ -67,10 +100,35 @@ pub struct PassthroughGrantProgress {
 /// 誤って呼ばれても影響は表示カウンタだけで、境界にも権限にも関係しない。
 #[must_use = "the grant phase ends when this guard is dropped"]
 pub fn begin(total: usize) -> GrantPhase {
-    TOTAL.store(total, Ordering::Relaxed);
-    DONE.store(0, Ordering::Relaxed);
-    GRANTED.store(0, Ordering::Relaxed);
-    ALREADY.store(0, Ordering::Relaxed);
+    begin_phase(Phase::Grant, total)
+}
+
+/// 自己検証フェーズ（`tier2a::grant_audit`）を開始する。
+///
+/// **同じセルを使い回す**——待ち時間の見せ方を機構ごとに別設計にしない
+/// （`docs/CODE-STRUCTURE-RULES.md`§5.1。付与にゲージがあるのに検証は無言、を作らない）。
+/// 自己検証は付与の**後**に走るので、付与フェーズと同時に立つことはない。
+#[must_use = "the audit phase ends when this guard is dropped"]
+pub fn begin_audit(total: usize) -> GrantPhase {
+    begin_phase(Phase::Audit, total)
+}
+
+fn begin_phase(phase: Phase, total: usize) -> GrantPhase {
+    match phase {
+        Phase::Grant => {
+            TOTAL.store(total, Ordering::Relaxed);
+            DONE.store(0, Ordering::Relaxed);
+            GRANTED.store(0, Ordering::Relaxed);
+            ALREADY.store(0, Ordering::Relaxed);
+        }
+        // **付与のカウンタには触らない**（`AUDIT_*`のdoc参照）。自己検証は付与の後に走るので、
+        // ここで0を書くと`last_totals`が「今回は0件付けた」と嘘をつく。
+        Phase::Audit => {
+            AUDIT_TOTAL.store(total, Ordering::Relaxed);
+            AUDIT_DONE.store(0, Ordering::Relaxed);
+        }
+    }
+    PHASE.store(phase as usize, Ordering::Relaxed);
     ACTIVE.store(true, Ordering::Relaxed);
     GrantPhase
 }
@@ -84,9 +142,12 @@ impl Drop for GrantPhase {
     }
 }
 
-/// 1件ぶん進める（判定に入った時点で呼ぶ）。
+/// 1件ぶん進める（判定に入った時点で呼ぶ）。**いま立っているフェーズのカウンタを進める。**
 pub fn advance() {
-    DONE.fetch_add(1, Ordering::Relaxed);
+    match Phase::from_usize(PHASE.load(Ordering::Relaxed)) {
+        Phase::Grant => DONE.fetch_add(1, Ordering::Relaxed),
+        Phase::Audit => AUDIT_DONE.fetch_add(1, Ordering::Relaxed),
+    };
 }
 
 /// 実際にACEを書いた1件。
@@ -104,11 +165,17 @@ pub fn snapshot() -> Option<PassthroughGrantProgress> {
     if !ACTIVE.load(Ordering::Relaxed) {
         return None;
     }
-    Some(PassthroughGrantProgress {
-        done: DONE.load(Ordering::Relaxed),
-        total: TOTAL.load(Ordering::Relaxed),
-        granted: GRANTED.load(Ordering::Relaxed),
-        already: ALREADY.load(Ordering::Relaxed),
+    let phase = Phase::from_usize(PHASE.load(Ordering::Relaxed));
+    Some(match phase {
+        Phase::Grant => last_totals(),
+        Phase::Audit => PassthroughGrantProgress {
+            phase,
+            done: AUDIT_DONE.load(Ordering::Relaxed),
+            total: AUDIT_TOTAL.load(Ordering::Relaxed),
+            // 自己検証は1件も付与しない（読むだけ）。内訳を出す相手が無い。
+            granted: 0,
+            already: 0,
+        },
     })
 }
 
@@ -116,8 +183,12 @@ pub fn snapshot() -> Option<PassthroughGrantProgress> {
 ///
 /// 記録が終わってから「今回は何件付けて何件飛ばしたのか」を結果として残すために要る
 /// ——進捗は消えてよいが、**マシンに何をしたかの事実は消してはいけない**。
+///
+/// 返すのは常に**付与フェーズ**の値である（自己検証は1件も付与しないので、ここへ混ぜると
+/// 「マシンに何をしたか」が薄まる）。
 pub fn last_totals() -> PassthroughGrantProgress {
     PassthroughGrantProgress {
+        phase: Phase::Grant,
         done: DONE.load(Ordering::Relaxed),
         total: TOTAL.load(Ordering::Relaxed),
         granted: GRANTED.load(Ordering::Relaxed),
@@ -140,6 +211,7 @@ mod tests {
         assert_eq!(
             snapshot(),
             Some(PassthroughGrantProgress {
+                phase: Phase::Grant,
                 done: 0,
                 total: 3,
                 granted: 0,
@@ -155,6 +227,7 @@ mod tests {
         assert_eq!(
             snapshot(),
             Some(PassthroughGrantProgress {
+                phase: Phase::Grant,
                 done: 2,
                 total: 3,
                 granted: 1,
@@ -171,6 +244,30 @@ mod tests {
             None,
             "after the guard drops, the UI must stop showing a phase that already ended"
         );
+
+        // **自己検証フェーズは付与の後に走る**（BUG-101の計装）。別のフェーズとして見え、
+        // かつ**付与の実績を塗り潰さない**——ここを共有カウンタにすると、実行後の
+        // 「今回は何件付けたか」が0件になる（マシンに何をしたかの事実が消える）。
+        let audit = begin_audit(2);
+        advance();
+        assert_eq!(
+            snapshot(),
+            Some(PassthroughGrantProgress {
+                phase: Phase::Audit,
+                done: 1,
+                total: 2,
+                granted: 0,
+                already: 0
+            })
+        );
+        assert_eq!(
+            last_totals().granted,
+            1,
+            "自己検証が付与の実績を上書きしてはいけない"
+        );
+        assert_eq!(last_totals().phase, Phase::Grant);
+        drop(audit);
+        assert_eq!(snapshot(), None);
 
         // **早期returnでもフェーズは閉じる**——ここがRAIIにしてある理由そのもの
         // （`preflight`は`?`で抜ける経路を複数持つ）。

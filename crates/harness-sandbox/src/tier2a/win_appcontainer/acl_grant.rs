@@ -374,6 +374,7 @@ pub fn is_force_grant_forbidden(path: &Path) -> Option<String> {
     None
 }
 
+#[track_caller]
 pub(crate) fn grant_ace_mask(
     path: &Path,
     sid: PSID,
@@ -387,6 +388,7 @@ pub(crate) fn grant_ace_mask(
 /// `grant_ace_inheritable_*`のroot付与だけ（[`DaclWrite`]のdoc参照）。冪等スキップは常に
 /// 行う（[`IdempotentCheck::SkipIfSufficient`]）——それ以外が要る呼び出しは
 /// [`grant_ace_mask_with_checked`]を直接使う。
+#[track_caller]
 pub(crate) fn grant_ace_mask_with(
     path: &Path,
     sid: PSID,
@@ -407,6 +409,7 @@ pub(crate) fn grant_ace_mask_with(
 /// [`grant_ace_mask_with`]の実体。冪等スキップの有無まで呼び出し側に明示させる版
 /// （[`IdempotentCheck`]のdoc参照）。`SkipIfSufficient`以外を渡すのは
 /// [`propagate_workspace_root_grant`]（`grant_job`の背景フェーズ）だけ。
+#[track_caller]
 pub(crate) fn grant_ace_mask_with_checked(
     path: &Path,
     sid: PSID,
@@ -415,6 +418,12 @@ pub(crate) fn grant_ace_mask_with_checked(
     write: DaclWrite,
     idempotent: IdempotentCheck,
 ) -> Result<(), AppContainerError> {
+    // [BUG-101] 自己検証のために「この主体へこのパスの付与を要求した」ことを残す。
+    // **root付与の内側なら何もしない**——`fix_descendants_missing_ace`が子孫の数だけ
+    // ここを通るため（`grant_audit`のモジュールdoc）。ガードを張らずに直接ここへ来た
+    // 書込（`grant_ace_mask`を直に呼ぶ経路）は記録する: 入口が1つ増えたときに
+    // 黙って計装の対象外にならないようにするため（B-06）。
+    crate::tier2a::grant_audit::note_low_level_grant(path, sid);
     // 冪等スキップ: 既にsid宛の明示ACEが要求マスクの上位集合を持っていれば
     // `SetNamedSecurityInfoW`（プロファイルルート近傍で病的に遅くなりうる、BUG-011）を
     // 呼ばずに済ませる。継承フラグの相違までは見ない（`inheritance`は`grant_ace_mask`の
@@ -478,6 +487,7 @@ pub(crate) fn grant_ace_mask_with_checked(
 /// `mask`を`path`へ付与する（ディレクトリは継承付き、ファイルは非継承）。
 /// [`grant_ace`]（workspaceのRWX）と[`grant_ace_access`]（`FsAccess`）の共通の底で、
 /// [`fix_descendants_missing_ace`]が**マスクの出どころを問わず**同じ形のACEを書けるようにする。
+#[track_caller]
 fn grant_ace_raw(path: &Path, sid: PSID, mask: u32, is_dir: bool) -> Result<(), AppContainerError> {
     let inheritance = if is_dir {
         CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
@@ -490,6 +500,7 @@ fn grant_ace_raw(path: &Path, sid: PSID, mask: u32, is_dir: bool) -> Result<(), 
 /// workspace配下のノードへ read/write/execute/delete を付与する（ディレクトリは継承付き、
 /// ファイルは非継承）。`WRITE_DAC`/`WRITE_OWNER`は含めない（sandboxed子が自分でACLを緩める
 /// ことを防ぐ多層防御）。
+#[track_caller]
 fn grant_ace(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainerError> {
     grant_ace_raw(path, sid, workspace_rwx_mask(), is_dir)
 }
@@ -504,6 +515,7 @@ pub(crate) fn workspace_rwx_mask() -> u32 {
 
 /// [`grant_ace`]のroot専用版（継承あり＋既存子孫への伝播）。理由は
 /// [`grant_ace_access_propagating`]と同じ。
+#[track_caller]
 fn grant_ace_propagating(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     grant_ace_mask_with(
         root,
@@ -519,7 +531,10 @@ fn grant_ace_propagating(root: &Path, sid: PSID) -> Result<(), AppContainerError
 /// 新規作成される子孫にも自動継承されるが、**既存の子孫ファイル/ディレクトリ**には遡って
 /// 効かないため、`root`付与時点で存在する全ノードへも明示的に付与する（`.git`を除外しない、
 /// Tier1の`cwd`全体ラベル付与と整合させる設計判断。理由は`docs/phases/foundation/`参照）。
+#[track_caller]
 pub fn grant_ace_recursive(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    // [BUG-101] 全ノードへ個別に書くので、記録するのはrootだけ（`grant_audit`のdoc）。
+    let _audit = crate::tier2a::grant_audit::note_root_grant(root, sid);
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
@@ -549,6 +564,7 @@ pub(crate) fn fs_access_mask(access: FsAccess) -> u32 {
     }
 }
 
+#[track_caller]
 fn grant_ace_access(
     path: &Path,
     sid: PSID,
@@ -563,6 +579,7 @@ fn grant_ace_access(
 /// これが`grant_ace_inheritable_*`の高速経路の本体である（M12追記14）。ここを
 /// `DaclWrite::SingleObject`で書くと伝播が起きず、後段のフォールバックが全ノードで発火して
 /// 付与がO(ファイル数)になる（[BUG-081](../../../../docs/bugs/BUG-081.md)）。
+#[track_caller]
 fn grant_ace_access_propagating(
     root: &Path,
     sid: PSID,
@@ -580,12 +597,16 @@ fn grant_ace_access_propagating(
 /// workspace配下のノードへ read/execute のみを付与する（`grant_ace`のread-only版、D-13）。
 /// `FILE_GENERIC_WRITE`・`DELETE`を含めないため、package SIDはこのルート配下を読取・実行
 /// できるが書込・削除はできない（D-13「read-onlyを既定とする」）。
+#[track_caller]
 fn grant_ace_ro(path: &Path, sid: PSID, is_dir: bool) -> Result<(), AppContainerError> {
     grant_ace_access(path, sid, is_dir, FsAccess::ReadExec)
 }
 
 /// `grant_ace_recursive`のread-only版（D-13、fs passthroughの既定）。
+#[track_caller]
 pub fn grant_ace_recursive_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    // [BUG-101] `grant_ace_recursive`と同じ（記録するのはrootだけ）。
+    let _audit = crate::tier2a::grant_audit::note_root_grant(root, sid);
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
@@ -626,6 +647,7 @@ pub fn grant_ace_recursive_ro(root: &Path, sid: PSID) -> Result<(), AppContainer
 /// どちらかが欠けるとフォールバックが全ノードで発火し、この関数は`grant_ace_recursive_ro`と
 /// 同じO(n)の明示付与へ退化する（実測: 254,000ファイルのworkspaceで起動が60秒、かつ
 /// セッションのACEがツリー全体へ残留した）。
+#[track_caller]
 pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     grant_ace_inheritable_access(root, sid, FsAccess::ReadExec)
 }
@@ -639,6 +661,7 @@ pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContain
 ///
 /// ファイルに`CONTAINER_INHERIT_ACE|OBJECT_INHERIT_ACE`を立ててもWindowsは受け付けるが
 /// （継承先が無いので実害は無い）、意味が無いので`is_dir: false`で付ける。
+#[track_caller]
 fn grant_ace_access_if_file(
     root: &Path,
     sid: PSID,
@@ -650,11 +673,15 @@ fn grant_ace_access_if_file(
     Some(grant_ace_access(root, sid, false, access))
 }
 
+#[track_caller]
 pub fn grant_ace_inheritable_access(
     root: &Path,
     sid: PSID,
     access: FsAccess,
 ) -> Result<(), AppContainerError> {
+    // [BUG-101] root付与の入口。要求を記録し、この下の子孫救済（`fix_descendants_missing_ace`）が
+    // 個別に書くACEは記録しない（撤収はrootからの再帰で行うので、台帳に載るのはrootだけ）。
+    let _audit = crate::tier2a::grant_audit::note_root_grant(root, sid);
     if let Some(result) = grant_ace_access_if_file(root, sid, access) {
         return result;
     }
@@ -676,6 +703,7 @@ pub fn grant_ace_inheritable_access(
 ///   付けるのは無駄なうえ、**walkを背景化すると剥がした後に付け直す競合**になる（D-05/D-09の
 ///   制御面保護が無言で外れる）。
 /// - `progress`: `(処理済み, 全体)`で呼ばれる。表示のためだけのもので、判定には関与しない。
+#[track_caller]
 pub fn fix_descendants_missing_ace(
     root: &Path,
     sid: PSID,
@@ -683,6 +711,11 @@ pub fn fix_descendants_missing_ace(
     skip: &[std::path::PathBuf],
     progress: &dyn Fn(usize, usize),
 ) -> Result<DescendantFixReport, AppContainerError> {
+    // [BUG-101] ここが書くのは**子孫**のACEで、台帳に載るのはrootである。ガードを張って
+    // 子孫ぶんを記録から外す（26万ノードのworkspaceでは全件が偽の「記録漏れ」になる）。
+    // `grant_ace_inheritable_*`から呼ばれた場合は既に外側のガードが立っているので、
+    // ここは`grant_job`の背景フェーズが直接呼ぶ経路のためのものである。
+    let _audit = crate::tier2a::grant_audit::note_root_grant(root, sid);
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
@@ -758,7 +791,11 @@ pub struct DescendantFixReport {
 /// [`sid_effective_ace_mask`]読取確認）はO(n)のまま。**書込**が伝播1回で済むようになった分だけ
 /// 速くなるのであって、読取確認は依然として全ノードに対して走る（BUG-081の修正後に再測定し、
 /// 必要ならこのwalkを背景スレッドへ回す——判断は`docs/STATUS.md`のTier2a節）。
+#[track_caller]
 pub fn grant_ace_inheritable_rw(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    // [BUG-101] `grant_ace_inheritable_access`と同じ理由でroot付与の入口（下の
+    // `fix_descendants_missing_ace`が子孫ぶんの書込を行う）。
+    let _audit = crate::tier2a::grant_audit::note_root_grant(root, sid);
     grant_workspace_root_rw(root, sid)?;
     let mut timing = PhaseTiming::start();
     let report = fix_descendants_missing_ace(root, sid, workspace_rwx_mask(), &[], &|_, _| {})?;
@@ -781,6 +818,7 @@ pub fn grant_ace_inheritable_rw(root: &Path, sid: PSID) -> Result<(), AppContain
 ///
 /// 確認walk（保護DACLで継承が届かなかったノードの救済）は
 /// [`fix_descendants_missing_ace`]が別に持つ。
+#[track_caller]
 pub fn grant_workspace_root_rw(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     // BUG-059と同じ分岐（`grant_ace_access_if_file`のdoc参照）。現在の呼び出し元は
     // ディレクトリしか渡さないが、**同じクラスの保険は同じクラスの関数すべてに入れる**
@@ -795,6 +833,7 @@ pub fn grant_workspace_root_rw(root: &Path, sid: PSID) -> Result<(), AppContaine
 }
 
 /// [`grant_workspace_root_rw`]のread-only版（`--cow`のworkspace本体、D-30）。
+#[track_caller]
 pub fn grant_workspace_root_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     if let Some(result) = grant_ace_access_if_file(root, sid, FsAccess::ReadExec) {
         return result;
@@ -815,6 +854,7 @@ pub fn grant_workspace_root_ro(root: &Path, sid: PSID) -> Result<(), AppContaine
 /// ACEを継承する。既存子孫への伝播（コストの本体、実測20秒超）は`grant_job`の背景フェーズ
 /// （[`propagate_workspace_root_grant`]）へ委ねる——この関数は常にミリ秒オーダーになる
 /// （`DaclWrite::SingleObject`、[`grant_ace`]と同じ土台）。
+#[track_caller]
 pub fn grant_workspace_root_rw_fast(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     if !root.is_dir() {
         return grant_ace(root, sid, false);
@@ -826,6 +866,7 @@ pub fn grant_workspace_root_rw_fast(root: &Path, sid: PSID) -> Result<(), AppCon
 }
 
 /// [`grant_workspace_root_rw_fast`]のread-only版（`--cow`のworkspace本体、D-30）。
+#[track_caller]
 pub fn grant_workspace_root_ro_fast(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     if let Some(result) = grant_ace_access_if_file(root, sid, FsAccess::ReadExec) {
         return result;
@@ -849,6 +890,7 @@ pub fn grant_workspace_root_ro_fast(root: &Path, sid: PSID) -> Result<(), AppCon
 ///
 /// `mask`は呼び出し側（`preflight`）が`workspace_mask`としてRWX/ROいずれかを渡す
 /// （`grant_job::start`の他の引数と同じ`mask`をそのまま使う）。
+#[track_caller]
 pub(crate) fn propagate_workspace_root_grant(
     root: &Path,
     sid: PSID,

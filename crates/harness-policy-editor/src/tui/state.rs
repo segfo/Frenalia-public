@@ -204,6 +204,21 @@ impl PhaseWork {
         }
     }
 
+    /// [BUG-101] 付与したACEが台帳に載っているかの自己検証（内訳なし——1件も付与しない）。
+    ///
+    /// **付与と同じゲージを通す**。数百件のパスをDACLごとに読む同期区間なので、
+    /// 出さないと「付与が終わったのにまだ固まっている」と読まれる（B-23(a)）。
+    pub fn audit(total: usize) -> Self {
+        Self {
+            label: "自己検証",
+            total,
+            done: 0,
+            breakdown: false,
+            written: 0,
+            skipped: 0,
+        }
+    }
+
     /// ゲージに出す内訳の文言。**付与と撤収で1つの関数**が持つ。
     pub fn detail(&self) -> String {
         if self.breakdown {
@@ -838,14 +853,33 @@ impl App {
         if let Some(progress) =
             harness_sandbox::tier2a::win_appcontainer::passthrough_progress::snapshot()
         {
+            use harness_sandbox::tier2a::win_appcontainer::passthrough_progress::Phase;
             if let Some(run) = self.run.as_mut() {
-                // **付与の進捗だけをここから入れる。** 撤収の`PhaseWork`が立っている間に
-                // このセルで上書きすると、剥がしている最中に付与の件数が出る。
-                let is_grant = run.work.as_ref().is_none_or(|w| w.breakdown);
-                if is_grant {
-                    let work = run
+                // **撤収の`PhaseWork`が立っている間はこのセルで上書きしない**——剥がしている
+                // 最中に付与の件数が出る。撤収はこのセルを使わない（`SessionGrants::release`が
+                // 直接`PhaseWork::revocations`を進める）ので、立っているかどうかで判別する。
+                //
+                // どのフェーズかは**セルが自分で名乗る**。以前は「内訳を出すか」から付与かを
+                // 推測していたが、フェーズが3つ（付与・撤収・自己検証）になった時点で
+                // その推測は成立しない（`Phase`のdoc、B-32）。
+                // **自己検証だけは撤収中でもゲージを取る。** 撤収の最後（プロファイルを
+                // 削除する直前）に走り、付与件数ぶんのDACLを読むので、ここを譲らないと
+                // 「撤収 N/N」で止まったまま数十秒待たされる（B-23(a)）。
+                let revoking = run.work.as_ref().is_some_and(|w| w.label == "撤収");
+                if !revoking || progress.phase == Phase::Audit {
+                    let expected: fn(usize) -> PhaseWork = match progress.phase {
+                        Phase::Grant => PhaseWork::grants,
+                        Phase::Audit => PhaseWork::audit,
+                    };
+                    // フェーズが替わったら作り直す（付与のゲージに検証の件数を流し込まない）。
+                    let stale = run
                         .work
-                        .get_or_insert_with(|| PhaseWork::grants(progress.total));
+                        .as_ref()
+                        .is_none_or(|w| w.label != expected(0).label);
+                    if stale {
+                        run.work = Some(expected(progress.total));
+                    }
+                    let work = run.work.as_mut().expect("just set above");
                     work.total = progress.total;
                     work.done = progress.done;
                     work.written = progress.granted;
@@ -1481,9 +1515,13 @@ impl App {
         let Some(run) = self.run.as_mut() else {
             return;
         };
-        let work = run
-            .work
-            .get_or_insert_with(|| PhaseWork::revocations(total));
+        // **ラベルを撤収へ戻す。** 直前の1件で自己検証（BUG-101）のゲージが立っている場合が
+        // あり、そのまま件数だけ入れると「自己検証 3/768」と出る——数は合っているのに
+        // 何をしているかが嘘になる（B-32）。
+        if run.work.as_ref().is_none_or(|w| w.label != "撤収") {
+            run.work = Some(PhaseWork::revocations(total));
+        }
+        let work = run.work.as_mut().expect("just set above");
         work.done = done;
         work.total = total;
         // **1件ごとの行はログ欄へ入れる**（画面の中の枠なので流れても押し流されない）。

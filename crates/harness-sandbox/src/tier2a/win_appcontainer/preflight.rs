@@ -40,6 +40,60 @@ pub struct PreflightOutcome {
 /// `preflight`のfs-allow昇格結果（`granted`パス一覧、`(path, reason)`失敗一覧）。
 type FsAllowElevationOutcome = (Vec<std::path::PathBuf>, Vec<(std::path::PathBuf, String)>);
 
+/// [BUG-101] **付与したACEが台帳に載っているか**を、`preflight`をどう抜けても必ず測るガード。
+///
+/// `Drop`にしてあるのは`passthrough_progress::begin`と同じ理由——この関数は`?`で抜ける経路を
+/// 複数持ち、**そのうち3つ（traverse付与の失敗、`:566`/`:627`/`:639`）は付与ループの後・
+/// 台帳への記録（`record_granted_paths`）の前にある**。つまり早期returnした実行では、
+/// 既にマシンへ書いたACEが1件も記録されていない。手で閉じる形にすると、脱出経路が
+/// 1つ増えるたびに書き忘れる（B-06）。
+///
+/// 正常に抜けるときは[`Self::finish`]で`warnings`へも積む——stderrの1行はTUIでは
+/// 進行ログに流れて消えるが、`warnings`は「⚠ 対応が要ります」欄とマニフェストに残る
+/// （BUG-096: 「表示した」は「記録した」ではない）。
+struct SessionGrantAudit {
+    profile_name: String,
+    done: bool,
+}
+
+impl SessionGrantAudit {
+    fn arm(profile_name: &str) -> Self {
+        Self {
+            profile_name: profile_name.to_string(),
+            done: false,
+        }
+    }
+
+    fn run(&mut self) -> Option<crate::tier2a::grant_audit::GrantAudit> {
+        if self.done {
+            return None;
+        }
+        self.done = true;
+        let recorded = crate::tier2a::session_profile::granted_paths_for_current_session();
+        let audit = crate::tier2a::grant_audit::audit_profile(
+            crate::tier2a::grant_audit::Stage::Preflight,
+            &self.profile_name,
+            &recorded,
+        )?;
+        crate::tier2a::grant_audit::report(&audit);
+        Some(audit)
+    }
+
+    /// 正常経路。測った結果を`warnings`へも残して閉じる。
+    fn finish(mut self, warnings: &mut Vec<String>) {
+        if let Some(summary) = self.run().and_then(|audit| audit.summary()) {
+            warnings.push(summary);
+        }
+    }
+}
+
+impl Drop for SessionGrantAudit {
+    fn drop(&mut self) {
+        // 早期returnで抜けた経路。`warnings`はもう存在しないのでstderrだけに出す。
+        let _ = self.run();
+    }
+}
+
 /// BUG-059の回収: redirector DLLに残った、**生存していないセッション**宛のACEを剥がす。
 ///
 /// 付与側（下記CoW分岐）に保険を入れて新規発生は止めたが、記録漏れの間に積み上がったACEは
@@ -185,6 +239,10 @@ pub fn preflight_with_privhelper_launcher(
     timing.mark("gc_dead_sessions");
     let profile_name =
         crate::tier2a::session_profile::begin_session().map_err(AppContainerError::Preflight)?;
+    // [BUG-101] **この行より後で付けたACEは、必ず台帳と突き合わせてから抜ける。**
+    // 武装をここに置くのは、この直後の`ensure_profile`以降が「このセッションのSID宛に
+    // ACEを付け得る全区間」だからである（`SessionGrantAudit`のdoc）。
+    let audit_guard = SessionGrantAudit::arm(&profile_name);
     let sid = ensure_profile(&profile_name)?;
     // [BUG-101/B-05] 台帳へ「どのSID宛に付与したか」を書くのは**呼び出し元**（`run_agent`と
     // ポリシーエディタのパス2）で、あちらは`current_session_grant_sid()`から値を取る。
@@ -595,6 +653,12 @@ pub fn preflight_with_privhelper_launcher(
                 }
                 Ok((granted, failures))
             } else {
+                // [BUG-101] **委譲した付与は、このプロセスのDACL書込の絞り口を通らない**
+                // （書くのは昇格側のプロセス）。ここで「依頼した」ことだけを残し、実際に
+                // 載ったかは自己検証のDACL実測が決める——依頼と結果を同じ値にしない（B-09）。
+                for entry in &needs_elevation {
+                    crate::tier2a::grant_audit::note_delegated_grant(&entry.path, sid.as_psid());
+                }
                 match crate::tier2a::privhelper::run_privileged_workspace_access(
                     missing_traverse.clone(),
                     needs_elevation.clone(),
@@ -751,6 +815,12 @@ pub fn preflight_with_privhelper_launcher(
     // 付与フェーズはここで終わり（以降は到達性プローブとスモークテスト）。明示的に落として、
     // UIが「ACE付与 N/N」を出し続けないようにする。
     drop(grant_phase);
+
+    // [BUG-101] **付与直後に、実マシンのDACLと台帳を突き合わせる。**
+    // 記録するつもりだった集合（`ledger_paths`）と台帳を比べても、付与側の思い込みが
+    // 両辺に乗るだけで差は出ない。見るのは実測したACEである（`grant_audit`のdoc）。
+    audit_guard.finish(&mut warnings);
+    timing.mark("grant audit (BUG-101)");
 
     // D8: 到達性プローブは**ここで1回だけ**行う（付与も昇格も全部終わった後）。
     // 対象が0件なら子プロセスは1つも起こさない。

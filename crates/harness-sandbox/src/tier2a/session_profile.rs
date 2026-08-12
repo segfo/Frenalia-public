@@ -328,8 +328,10 @@ pub fn record_granted_paths(paths: &[std::path::PathBuf]) {
         return;
     }
     let token = session_token();
+    let mut recorded = false;
     ledger().update(|l| {
         if let Some(entry) = l.sessions.iter_mut().find(|e| e.token == token) {
+            recorded = true;
             for path in paths {
                 let path_str = path.to_string_lossy().into_owned();
                 if !entry.granted_paths.contains(&path_str) {
@@ -338,6 +340,18 @@ pub fn record_granted_paths(paths: &[std::path::PathBuf]) {
             }
         }
     });
+    // [BUG-101] **無言のno-opをやめる。** 台帳にこのセッションのエントリが無ければ、ここは
+    // 何も書かずに戻る——付与は成功しているので呼び出し側は成功と読み、撤収の対象にも
+    // ならないACEが実マシンに残る（`end_session`はエントリの`granted_paths`しか剥がさない）。
+    // 「記録できなかった」は付与の失敗ではないので**止めはしない**が、黙りもしない（B-10）。
+    if !recorded {
+        eprintln!(
+            "warning: could not record {} granted path(s) for session {token}: the session has no \
+             ledger entry, so these ACEs will not be revoked automatically (see \
+             docs/bugs/BUG-101.md)",
+            paths.len()
+        );
+    }
 }
 
 /// このセッションが撤収責任を負っているパス（[`record_granted_path`]で積んだもの）。
@@ -440,12 +454,37 @@ fn reclaim_targets(
             outcome.kept_unknown.push(target.profile_name.clone());
             continue;
         }
+        let mut blocked_here = Vec::new();
         for path in &target.granted_paths {
-            outcome
-                .blocked_paths
-                .extend(revoke(Path::new(path), &target.profile_name));
+            blocked_here.extend(revoke(Path::new(path), &target.profile_name));
             outcome.revoked_paths += 1;
         }
+        // [BUG-101] **名前を捨てる直前に、この主体のACEが本当に残っていないかを測る。**
+        // ここが最後の分岐点である——`DeleteAppContainerProfile`はSIDの導出元である名前を
+        // 破棄するので、これ以降に残ったACEは`harness fs revoke`を含むどのコマンドでも
+        // 剥がせない（SIDの導出は名前→SIDの一方向）。
+        let audit = crate::tier2a::grant_audit::audit_profile(
+            crate::tier2a::grant_audit::Stage::SessionEnd,
+            &target.profile_name,
+            &target.granted_paths,
+        );
+        if let Some(audit) = &audit {
+            crate::tier2a::grant_audit::report(audit);
+        }
+        let unrecorded = audit.map(|a| a.present_unrecorded.len()).unwrap_or(0);
+        // **剥がし残しがあるなら名前を残す。** 見送りの扱いは`grants_known: false`と同じ
+        // （後から`harness fs revoke <path>`で剥がせる状態のまま置く）。プロファイルが1件
+        // 積むことより、二度と剥がせないACEを作ることの方が重い（B-01の「不可逆な片方」）。
+        if !blocked_here.is_empty() || unrecorded > 0 {
+            outcome.kept_with_leftovers.push((
+                target.profile_name.clone(),
+                blocked_here.len(),
+                unrecorded,
+            ));
+            outcome.blocked_paths.extend(blocked_here);
+            continue;
+        }
+        outcome.blocked_paths.extend(blocked_here);
         match win::delete_profile(&target.profile_name) {
             Ok(()) => {
                 outcome.deleted_profiles += 1;
@@ -479,6 +518,13 @@ pub struct ReclaimOutcome {
     /// **付与内容が分からないので削除を見送ったプロファイル**（`grants_known: false`）。
     /// ここが増え続けるなら、台帳エントリが失われる経路が別に在るということ（B-11）。
     pub kept_unknown: Vec<String>,
+    /// [BUG-101] **剥がし残しがあるので削除を見送ったプロファイル**と、その内訳
+    /// `(プロファイル名, 剥がせなかったノード数, 台帳に無いACEの数)`。
+    ///
+    /// `kept_unknown`（何を付けたか分からない）とは別枠にする——あちらは「記録が無い」、
+    /// こちらは「記録はあるが実体が残っている」で、次に打つ手が違う（こちらは
+    /// `harness fs revoke <path>`で剥がせる）。
+    pub kept_with_leftovers: Vec<(String, usize, usize)>,
     /// [BUG-103] **撤収を試みたが剥がせなかったノードと理由。**
     ///
     /// プロファイルは消えても、ここに挙がったノードのACEは実マシンに残っている。
@@ -494,6 +540,7 @@ impl ReclaimOutcome {
         if self.deleted_profiles == 0
             && self.delete_failures.is_empty()
             && self.kept_unknown.is_empty()
+            && self.kept_with_leftovers.is_empty()
             && self.blocked_paths.is_empty()
         {
             return None;
@@ -516,6 +563,26 @@ impl ReclaimOutcome {
                  （消すとACEが剥がせなくなるため。`harness fs list`で確認できます）: {}",
                 self.kept_unknown.len(),
                 self.kept_unknown.join(", ")
+            ));
+        }
+        // [BUG-101] 「剥がし残しがあるので名前を残した」——`kept_unknown`と混ぜない。
+        // こちらは**まだ剥がせる**状態なので、次に打つ手（`harness fs revoke <path>`）がある。
+        if !self.kept_with_leftovers.is_empty() {
+            let detail: Vec<String> = self
+                .kept_with_leftovers
+                .iter()
+                .map(|(name, blocked, unrecorded)| {
+                    format!(
+                        "{name}（剥がせなかったノード{blocked}件・台帳に無いACE{unrecorded}件）"
+                    )
+                })
+                .collect();
+            parts.push(format!(
+                "ACEが残っているプロファイル {} 件は削除を見送りました（いま名前を捨てると\
+                 SIDを導出できなくなり、二度と剥がせなくなるため）。`harness fs revoke <path>`で\
+                 剥がしてください: {}",
+                self.kept_with_leftovers.len(),
+                detail.join(", ")
             ));
         }
         // [BUG-103] **剥がせなかったノードは名前で出す。** 件数だけだと`icacls`で追えず、

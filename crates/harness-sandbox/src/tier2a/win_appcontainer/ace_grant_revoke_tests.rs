@@ -165,7 +165,8 @@ fn preflight_keeps_harness_control_dir_unwritable_to_appcontainer_child() {
     // `the_background_job_finishes_the_descendant_fix_up_and_records_it`が落ちた）。
     grant_job::wait_until_done().expect("the background workspace grant job must finish");
 
-    let _ = revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
+    let _ =
+        revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
 }
 
 /// 特権昇格ヘルパー(D-16)レビュー用の実機検証（`/dig`セッションで検討した「LLMが
@@ -251,7 +252,8 @@ fn appcontainer_child_cannot_reach_uac_elevation_broker() {
         .unwrap_or_else(|| panic!("no JSON report line in stdout={stdout} stderr={stderr}"));
     println!("=== try_runas report ===\n{report:#}");
 
-    let _ = revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
+    let _ =
+        revoke_ace_recursive(workspace.path(), sid.as_psid()).expect("cleanup AppContainer ACEs");
 
     // 実機確認済み（2026-08-02）: AppContainer内からの`ShellExecuteExW(runas)`は
     // `ERROR_ACCESS_DENIED`(5)で即座に失敗し（0.5秒程度、UACダイアログは画面に一切
@@ -469,7 +471,8 @@ fn grant_ace_inheritable_access_on_a_file_succeeds_and_leaves_the_ace() {
     // **撤収側も対称でなければ意味が無い。** `end_session`は`revoke_ace_recursive`を通して
     // 剥がすので、そちらがファイルで落ちるなら台帳に正しく載っていても孤立ACEは残り続ける
     // （実機E2Eでこの順序で判明した——付与側だけ直しても`end_session`が剥がせなかった）。
-    let report = revoke_ace_recursive(&file, sid.as_psid()).expect("revoke_ace_recursive on a file");
+    let report =
+        revoke_ace_recursive(&file, sid.as_psid()).expect("revoke_ace_recursive on a file");
     assert!(
         !report.has_blocked(),
         "a single-file revoke must not be blocked: {:?}",
@@ -931,7 +934,9 @@ fn the_revoke_report_names_the_nodes_it_could_not_clear() {
         ));
     }
     assert!(report.has_blocked());
-    let summary = report.blocked_summary(5).expect("blocked nodes must be shown");
+    let summary = report
+        .blocked_summary(5)
+        .expect("blocked nodes must be shown");
     assert!(summary.contains("7 node(s)"), "{summary}");
     // **名前が出ること**が要点（これが無いと`icacls`で追えない）。
     assert!(summary.contains("stuck-0"), "{summary}");
@@ -1923,7 +1928,9 @@ fn an_unregistered_sid_whose_ace_does_not_look_like_ours_is_reported_not_strippe
     let sid_string = crate::win_common::sid_to_string(sid.as_psid()).expect("sid_to_string");
     let left_alone = report.left_alone();
     assert!(
-        left_alone.iter().any(|(reported, _)| *reported == sid_string),
+        left_alone
+            .iter()
+            .any(|(reported, _)| *reported == sid_string),
         "the SID must be named so the user can strip it with icacls; got {left_alone:?}"
     );
 
@@ -1964,6 +1971,138 @@ fn a_sid_recorded_in_the_ledger_is_revoked_even_when_its_mask_is_unfamiliar() {
         None,
         "the recorded SID's ACE must be gone"
     );
+}
+
+// --- [BUG-101] 欠陥①: 「付与したACEが台帳に載っているか」の自己検証 ---
+
+/// テスト専用の主体。**プロファイルは作らない**（`derive_profile_sid`は名前のハッシュから
+/// SIDを導出するだけで副作用が無い）ので、実マシンにプロファイルも台帳エントリも残さない。
+/// 第17セッションの禁止事項「`begin_session()`をテストから呼ばない」に抵触しない。
+fn audit_probe_sid(tag: &str) -> OwnedContainerSid {
+    derive_profile_sid(&format!("harness.probe.audit.{}-{tag}", std::process::id()))
+        .expect("derive a package SID without creating the profile")
+}
+
+/// **BUG-101欠陥①の歯**（B-27）: 実際にACEを付けたのに台帳へ記録しなかったパスを、
+/// 自己検証が**そのパスと付与元のコード位置つきで**名指しすること。
+///
+/// コード位置まで見るのは、この計装の目的が「**どの付与経路が記録を落としているか**」の
+/// 特定だからである。件数だけ出しても、5つある付与経路のどれかは分からない。
+#[test]
+fn an_ace_granted_without_a_ledger_entry_is_named_with_its_call_site() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("granted-but-unrecorded");
+    std::fs::create_dir_all(&dir).expect("create dir");
+    let sid = audit_probe_sid("unrecorded");
+
+    // 本番のfs passthroughと同じ入口・同じ形（継承あり・read_write）で付ける。
+    grant_ace_inheritable_access(&dir, sid.as_psid(), FsAccess::ReadWrite).expect("grant");
+
+    // 台帳は空＝「記録し忘れた」状態。
+    let audit = crate::tier2a::grant_audit::audit_subject(
+        crate::tier2a::grant_audit::Stage::Preflight,
+        sid.as_psid(),
+        &[],
+    )
+    .expect("the audit must run when there is something to check");
+
+    assert!(
+        !audit.holds(),
+        "ACEが実在するのに台帳に無い——これを見逃すなら計装の意味が無い: {audit:?}"
+    );
+    let named: Vec<_> = audit
+        .present_unrecorded
+        .iter()
+        .filter(|p| p.path == dir)
+        .collect();
+    assert_eq!(named.len(), 1, "{:?}", audit.present_unrecorded);
+    let origin = named[0].origin.expect("付与元のコード位置");
+    assert!(
+        origin.file.ends_with("ace_grant_revoke_tests.rs"),
+        "報告すべきは**呼び出し元**（どの付与経路か）であって、ACLの低レベル実装の行番号では \
+         ない。`#[track_caller]`の連鎖が切れていると、ここが acl_grant.rs になる: {origin}"
+    );
+
+    revoke_ace(&dir, sid.as_psid()).expect("cleanup the probe ACE");
+}
+
+/// **対になる許可側**（B-35）: 台帳に載っている付与は報告しないこと。
+///
+/// これが無いと「常に差ありと言う」実装でも上のテストが緑になり、計装の生死を判定できない。
+/// 綴りは**わざと台帳側の形**（`/`区切り。policy.json由来のエントリはこの形で入る）にする。
+#[test]
+fn an_ace_recorded_in_the_ledger_is_not_reported_even_with_a_different_spelling() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("granted-and-recorded");
+    std::fs::create_dir_all(&dir).expect("create dir");
+    let sid = audit_probe_sid("recorded");
+
+    grant_ace_inheritable_access(&dir, sid.as_psid(), FsAccess::ReadWrite).expect("grant");
+
+    let recorded = vec![dir.display().to_string().replace('\\', "/")];
+    let audit = crate::tier2a::grant_audit::audit_subject(
+        crate::tier2a::grant_audit::Stage::Preflight,
+        sid.as_psid(),
+        &recorded,
+    )
+    .expect("the audit must run");
+
+    assert!(
+        audit.holds(),
+        "同じ対象を指す綴り違いを「記録漏れ」と言ってはいけない（B-19）: {audit:?}"
+    );
+    assert!(audit.summary().is_none(), "{audit:?}");
+
+    revoke_ace(&dir, sid.as_psid()).expect("cleanup the probe ACE");
+}
+
+/// 子孫の救済付与（`fix_descendants_missing_ace`）が**レジストリを埋め尽くさない**こと。
+///
+/// 台帳に載るのはrootだけで、子孫の明示ACEはrootからの再帰撤収で消える。ここを記録すると
+/// 26万ノードのworkspaceでは全件が偽の「記録漏れ」として報告され、**本物の1件が埋もれる**。
+#[test]
+fn the_descendant_fallback_does_not_flood_the_registry() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("tree");
+    std::fs::create_dir_all(dir.join("sub")).expect("create tree");
+    for name in ["a.txt", "b.txt", "sub/c.txt"] {
+        std::fs::write(dir.join(name), b"x").expect("create file");
+    }
+    let sid = audit_probe_sid("flood");
+
+    // **単一オブジェクト書込**でrootへ継承ACEを付ける＝既存の子孫には物理コピーが載らない。
+    // この状態が`fix_descendants_missing_ace`の対象そのものである。
+    grant_ace_mask(
+        &dir,
+        sid.as_psid(),
+        fs_access_mask(FsAccess::ReadWrite),
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+    )
+    .expect("single-object root grant");
+    let report = fix_descendants_missing_ace(
+        &dir,
+        sid.as_psid(),
+        fs_access_mask(FsAccess::ReadWrite),
+        &[],
+        &|_, _| {},
+    )
+    .expect("fix descendants");
+    assert!(
+        report.granted >= 2,
+        "前提が崩れている: 子孫へ明示付与が起きていないとこのテストは何も測っていない: {report:?}"
+    );
+
+    let attempts = crate::tier2a::grant_audit::attempts_for(
+        &crate::win_common::sid_to_string(sid.as_psid()).expect("sid_to_string"),
+    );
+    assert_eq!(
+        attempts.len(),
+        1,
+        "記録されるのはrootだけ（子孫は撤収の単位ではない）。実際: {attempts:?}"
+    );
+    assert_eq!(attempts[0].path, dir);
+
+    let _ = revoke_ace_recursive(&dir, sid.as_psid());
 }
 
 /// 登録簿に`Moniker`が載っていて**生きていない**harnessプロファイルのACEは撤収されること
