@@ -150,12 +150,10 @@ mod tests {
     use harness_config::FsAccess;
 
     fn proposals() -> Vec<RuleProposal> {
-        generalize(
-            &[
-                DeniedCandidate::fs(Source::Etw, "C:/tools/bin", FsAccess::ReadExec, "d", 1, 0),
-                DeniedCandidate::net(Source::Network, "api.example.com", "d", 1, 0),
-            ],
-        )
+        generalize(&[
+            DeniedCandidate::fs(Source::Etw, "C:/tools/bin", FsAccess::ReadExec, "d", 1, 0),
+            DeniedCandidate::net(Source::Network, "api.example.com", "d", 1, 0),
+        ])
     }
 
     #[test]

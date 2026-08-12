@@ -56,8 +56,7 @@ const APPCONTAINER_SID_PREFIX: &str = "S-1-15-2-";
 ///
 /// この機での実測: 218件登録されており、harness由来24件、残りはStoreアプリだった。
 /// `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppContainer\Mappings`は**存在しない**。
-const APPCONTAINER_MAPPINGS_KEY: &str =
-    r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings";
+const APPCONTAINER_MAPPINGS_KEY: &str = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings";
 
 /// `path`のDACLに明示ACEを持つAppContainerパッケージSID1件ぶん。
 #[derive(Debug)]
@@ -111,9 +110,9 @@ impl SubjectKind {
     /// 撤収対象ではない理由（表示用）。対象のものには`None`。
     pub fn left_alone_reason(&self) -> Option<String> {
         match self {
-            SubjectKind::ForeignRegistered { moniker } => Some(format!(
-                "registered to {moniker}; not ours, left untouched"
-            )),
+            SubjectKind::ForeignRegistered { moniker } => {
+                Some(format!("registered to {moniker}; not ours, left untouched"))
+            }
             SubjectKind::LiveHarness { profile } => Some(format!(
                 "{profile} is still running; refusing to take access from a live session"
             )),
@@ -270,7 +269,11 @@ pub fn appcontainer_sid_aces(path: &Path) -> Result<Vec<PathAceSubject>, AppCont
                 if let Ok(owned) = crate::win_common::OwnedSid::copy_from(entry_sid) {
                     found.push(PathAceSubject {
                         sid: sid_string,
-                        allow_mask: if denied { 0 } else { entry.grfAccessPermissions },
+                        allow_mask: if denied {
+                            0
+                        } else {
+                            entry.grfAccessPermissions
+                        },
                         has_deny: denied,
                         sid_bytes: owned,
                     });
@@ -356,7 +359,10 @@ pub struct HarnessRevokeReport {
 impl HarnessRevokeReport {
     /// 撤収対象と判定した主体の数。**0は「対象が無かった」であって「成功」ではない。**
     pub fn targeted(&self) -> usize {
-        self.subjects.iter().filter(|s| s.kind.is_revocable()).count()
+        self.subjects
+            .iter()
+            .filter(|s| s.kind.is_revocable())
+            .count()
     }
 
     /// 実際にACEを剥がして書き戻したノード数。
@@ -448,8 +454,8 @@ pub fn revoke_harness_subjects(
     };
 
     for (subject, kind) in subjects.iter().zip(kinds) {
-        let still_on_root = kind.is_revocable()
-            && !matches!(sid_ace_mask(root, subject.psid()), Ok(None));
+        let still_on_root =
+            kind.is_revocable() && !matches!(sid_ace_mask(root, subject.psid()), Ok(None));
         report.subjects.push(SubjectOutcome {
             sid: subject.sid.clone(),
             kind,

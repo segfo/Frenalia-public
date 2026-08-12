@@ -172,7 +172,9 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
         lines.push(Line::raw(""));
         lines.push(Line::raw(text));
         frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(block),
             area,
         );
         return app.candidate_list_offset;

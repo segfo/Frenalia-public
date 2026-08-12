@@ -580,7 +580,8 @@ impl App {
         };
         let own = self.tree.node(node).proposals.clone();
         if own.is_empty() {
-            self.status = "この行そのものは候補ではありません（配下を選ぶならスペース）".to_string();
+            self.status =
+                "この行そのものは候補ではありません（配下を選ぶならスペース）".to_string();
             return;
         }
         let approvable: Vec<&harness_policy::RuleProposal> = own
@@ -590,7 +591,10 @@ impl App {
             .collect();
         if approvable.is_empty() {
             self.status = match harness_policy::breadth::check(&view.proposals[own[0]]).message() {
-                Some(reason) => format!("{} は承認できません: {reason}", view.proposals[own[0]].value),
+                Some(reason) => format!(
+                    "{} は承認できません: {reason}",
+                    view.proposals[own[0]].value
+                ),
                 None => "この候補は承認できません".to_string(),
             };
             return;

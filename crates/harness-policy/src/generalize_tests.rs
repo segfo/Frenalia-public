@@ -176,9 +176,7 @@ fn different_access_levels_never_merge_into_the_stronger_one() {
 /// `read_write`の提案には必ずwrite-containmentを弱める旨の警告が付く（D-42）。
 #[test]
 fn read_write_proposals_always_carry_a_write_containment_warning() {
-    let proposals = generalize(
-        &[fs("C:/Users/me/out", FsAccess::ReadWrite)],
-    );
+    let proposals = generalize(&[fs("C:/Users/me/out", FsAccess::ReadWrite)]);
 
     assert!(proposals[0]
         .warnings
@@ -247,16 +245,14 @@ fn evidence_keeps_every_contributing_source() {
 /// 削除・書込が目的なら`read_write`を選ぶよう注記する。
 #[test]
 fn os_audit_read_proposals_disclose_that_read_is_only_a_guess() {
-    let proposals = generalize(
-        &[DeniedCandidate::fs(
-            Source::Etw,
-            "C:/Users/me/notes.txt",
-            FsAccess::Read,
-            "STATUS_ACCESS_DENIED",
-            1,
-            0,
-        )],
-    );
+    let proposals = generalize(&[DeniedCandidate::fs(
+        Source::Etw,
+        "C:/Users/me/notes.txt",
+        FsAccess::Read,
+        "STATUS_ACCESS_DENIED",
+        1,
+        0,
+    )]);
 
     let warning = proposals[0]
         .warnings
@@ -274,16 +270,14 @@ fn os_audit_read_proposals_disclose_that_read_is_only_a_guess() {
 #[test]
 fn non_audit_read_proposals_do_not_carry_the_guess_disclosure() {
     for source in [Source::Preflight, Source::Cow] {
-        let proposals = generalize(
-            &[DeniedCandidate::fs(
-                source,
-                "C:/Users/me/notes.txt",
-                FsAccess::Read,
-                "denied",
-                1,
-                0,
-            )],
-        );
+        let proposals = generalize(&[DeniedCandidate::fs(
+            source,
+            "C:/Users/me/notes.txt",
+            FsAccess::Read,
+            "denied",
+            1,
+            0,
+        )]);
         assert!(
             !proposals[0]
                 .warnings
@@ -398,7 +392,10 @@ fn an_already_granted_sibling_is_annotated_without_widening_the_other() {
         .iter()
         .filter(|p| p.value == "C:/tools/bin/a.exe")
         .collect();
-    assert!(!a.is_empty(), "granted path is still proposed: {proposals:#?}");
+    assert!(
+        !a.is_empty(),
+        "granted path is still proposed: {proposals:#?}"
+    );
     assert!(
         a.iter()
             .any(|p| p.warnings.iter().any(|w| w.contains("ALREADY allowed"))),
@@ -609,10 +606,7 @@ fn proposals_from_different_sources_that_land_on_the_same_key_and_value_are_merg
         ),
     ];
 
-    let proposals = generalize_with_granted(
-        &candidates,
-        &granted(&[("C:/tools", FsAccess::Read)]),
-    );
+    let proposals = generalize_with_granted(&candidates, &granted(&[("C:/tools", FsAccess::Read)]));
 
     let read_exec: Vec<&RuleProposal> = proposals
         .iter()
@@ -691,10 +685,7 @@ fn restating_the_access_swaps_only_the_key_dependent_warnings() {
 /// 逆向き（B-35の対）: `fs.read_write`へ言い換えたら、その注意書きが**付く**。
 #[test]
 fn restating_to_read_write_adds_the_write_containment_warning() {
-    let original = generalize(
-        &[fs("C:/tools/x.txt", FsAccess::Read)],
-    )
-    .remove(0);
+    let original = generalize(&[fs("C:/tools/x.txt", FsAccess::Read)]).remove(0);
 
     let restated = restate_access(&original, SettingsKey::FsReadWrite);
 

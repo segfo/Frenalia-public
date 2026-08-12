@@ -105,29 +105,25 @@ mod tests {
     use harness_config::FsAccess;
 
     fn proposal(access: FsAccess) -> RuleProposal {
-        generalize(
-            &[DeniedCandidate::fs(
-                Source::Etw,
-                "C:/outside",
-                access,
-                "denied",
-                1,
-                0,
-            )],
-        )
+        generalize(&[DeniedCandidate::fs(
+            Source::Etw,
+            "C:/outside",
+            access,
+            "denied",
+            1,
+            0,
+        )])
         .remove(0)
     }
 
     fn net_proposal() -> RuleProposal {
-        generalize(
-            &[DeniedCandidate::net(
-                Source::Network,
-                "api.example.com",
-                "denied",
-                1,
-                0,
-            )],
-        )
+        generalize(&[DeniedCandidate::net(
+            Source::Network,
+            "api.example.com",
+            "denied",
+            1,
+            0,
+        )])
         .remove(0)
     }
 

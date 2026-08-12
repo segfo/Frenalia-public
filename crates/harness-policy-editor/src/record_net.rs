@@ -1688,7 +1688,11 @@ mod fs_denial_panel_tests {
     /// この形のこと）。**両方の文面を対で固定する**（B-35）。
     #[test]
     fn not_observing_is_worded_differently_from_observing_nothing() {
-        let empty = crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(std::path::Path::new("C:/no-such-workspace"), Some(std::path::Path::new("C:/no-such-temp"))));
+        let empty =
+            crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(
+                std::path::Path::new("C:/no-such-workspace"),
+                Some(std::path::Path::new("C:/no-such-temp")),
+            ));
 
         let not_started = render_fs_denials(&empty, false, false);
         let no_etw = render_fs_denials(&empty, true, false);
@@ -1716,7 +1720,11 @@ mod fs_denial_panel_tests {
     /// 中間状態であり、ネットワークの強制はまだ試していない（決定27の範囲）。
     #[test]
     fn the_network_is_all_allowed_and_the_panel_says_so() {
-        let empty = crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(std::path::Path::new("C:/no-such-workspace"), Some(std::path::Path::new("C:/no-such-temp"))));
+        let empty =
+            crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(
+                std::path::Path::new("C:/no-such-workspace"),
+                Some(std::path::Path::new("C:/no-such-temp")),
+            ));
 
         let text = render_fs_denials(&empty, true, true);
 
@@ -1727,7 +1735,11 @@ mod fs_denial_panel_tests {
     /// 観測できたときは件数を出す（数を出さない報告は行動を決められない、B-32）。
     #[test]
     fn observed_denials_are_reported_with_their_count() {
-        let mut aggregate = crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(std::path::Path::new("C:/no-such-workspace"), Some(std::path::Path::new("C:/no-such-temp"))));
+        let mut aggregate =
+            crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(
+                std::path::Path::new("C:/no-such-workspace"),
+                Some(std::path::Path::new("C:/no-such-temp")),
+            ));
         aggregate.add_event(&harness_policy::FsAuditEvent::denied(
             harness_policy::FsAuditKind::Etw,
             "C:/Users/me/.cargo/bin/cargo.exe",

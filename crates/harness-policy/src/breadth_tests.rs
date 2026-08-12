@@ -10,16 +10,14 @@ use crate::normalize::{DeniedCandidate, Source};
 use harness_config::FsAccess;
 
 fn proposal_for(value: &str, access: FsAccess) -> RuleProposal {
-    generalize(
-        &[DeniedCandidate::fs(
-            Source::Etw,
-            value,
-            access,
-            "denied",
-            1,
-            0,
-        )],
-    )
+    generalize(&[DeniedCandidate::fs(
+        Source::Etw,
+        value,
+        access,
+        "denied",
+        1,
+        0,
+    )])
     .remove(0)
 }
 
@@ -200,15 +198,13 @@ fn the_verdict_does_not_depend_on_the_access_kind_for_the_ancestor_chain() {
 /// ドメインの提案は対象外（別の軸の話）。
 #[test]
 fn domain_proposals_are_out_of_scope() {
-    let proposal = generalize(
-        &[DeniedCandidate::net(
-            Source::Network,
-            "api.example.com",
-            "denied",
-            1,
-            0,
-        )],
-    )
+    let proposal = generalize(&[DeniedCandidate::net(
+        Source::Network,
+        "api.example.com",
+        "denied",
+        1,
+        0,
+    )])
     .remove(0);
 
     assert_eq!(check(&proposal), BreadthVerdict::Acceptable);
@@ -228,19 +224,17 @@ fn the_refusal_names_the_value_and_the_manual_escape_hatch() {
 
 #[test]
 fn check_all_pairs_verdicts_with_proposal_ids() {
-    let proposals = generalize(
-        &[
-            DeniedCandidate::fs(Source::Etw, "C:/", FsAccess::Read, "denied", 1, 0),
-            DeniedCandidate::fs(
-                Source::Etw,
-                "C:/Users/segfo/.cargo",
-                FsAccess::Read,
-                "denied",
-                1,
-                0,
-            ),
-        ],
-    );
+    let proposals = generalize(&[
+        DeniedCandidate::fs(Source::Etw, "C:/", FsAccess::Read, "denied", 1, 0),
+        DeniedCandidate::fs(
+            Source::Etw,
+            "C:/Users/segfo/.cargo",
+            FsAccess::Read,
+            "denied",
+            1,
+            0,
+        ),
+    ]);
 
     let verdicts = check_all(&proposals);
 

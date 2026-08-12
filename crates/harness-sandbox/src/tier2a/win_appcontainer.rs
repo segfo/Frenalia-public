@@ -308,10 +308,6 @@ pub fn current_session_grant_sid() -> Option<String> {
 // 公開項目はここでglob再エクスポートする。
 
 mod acl_grant;
-/// 撤収の**主体**を決める層（[BUG-101](../../../docs/bugs/BUG-101.md)欠陥②）。
-/// 「どのSIDのACEを剥がすか」を、名前から導出したSIDではなく**対象パスのDACLに実在するSID**
-/// から決める。`revoke`（剥がし方）とは責務が別なので分けている。
-mod revoke_subjects;
 /// 初回の救済walkを背景で回すジョブ（D-54）。**globではなく名前空間として公開する**
 /// ——`start`/`progress`/`wait_until_done`という短い名前は、それだけでは何のジョブか
 /// 分からないため（`grant_job::wait_until_done()`と書けば分かる）。
@@ -327,6 +323,10 @@ mod preflight;
 /// 決定（どのプローブをどの順で打つか）は`preflight`が持ち、ここは観測だけを持つ。
 mod preflight_probe;
 mod revoke;
+/// 撤収の**主体**を決める層（[BUG-101](../../../docs/bugs/BUG-101.md)欠陥②）。
+/// 「どのSIDのACEを剥がすか」を、名前から導出したSIDではなく**対象パスのDACLに実在するSID**
+/// から決める。`revoke`（剥がし方）とは責務が別なので分けている。
+mod revoke_subjects;
 mod spawn;
 mod spawn_session;
 mod traverse;

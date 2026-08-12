@@ -83,7 +83,12 @@ mod win {
         println!("------  ----------  -----  ----  ----------------------");
 
         row("A", "-", "-", plain("pwsh", &out_dir, "a"));
-        row("A'", "-", "-", token_probe(false, None, "pwsh", &cwd, &out_dir, "aa"));
+        row(
+            "A'",
+            "-",
+            "-",
+            token_probe(false, None, "pwsh", &cwd, &out_dir, "aa"),
+        );
         row(
             "B",
             "-",

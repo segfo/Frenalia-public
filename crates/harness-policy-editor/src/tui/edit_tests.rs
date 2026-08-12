@@ -595,7 +595,10 @@ fn marking_a_directory_recursive_writes_a_double_star_declaration() {
     app.open_selected_session();
     app.edit_focus = EditField::Proposals;
     // 根は `C:/proj/tc`（1本道が畳まれる）。ここ自身は観測されていない構造ノード。
-    assert_eq!(app.tree.node(app.selected_node().expect("行")).path, "C:/proj/tc");
+    assert_eq!(
+        app.tree.node(app.selected_node().expect("行")).path,
+        "C:/proj/tc"
+    );
 
     app.on_key(key(KeyCode::Char('R')));
     assert!(app.recursive.contains("C:/proj/tc"), "印が付く");
@@ -607,7 +610,9 @@ fn marking_a_directory_recursive_writes_a_double_star_declaration() {
 
     app.on_key(key(KeyCode::Char('a')));
     assert!(
-        app.modal.as_ref().is_some_and(|m| m.confirm == Confirm::Approval),
+        app.modal
+            .as_ref()
+            .is_some_and(|m| m.confirm == Confirm::Approval),
         "再帰の指定だけでも承認の確認が出ること（status={} modal={:?}）",
         app.status,
         app.modal.as_ref().map(|m| &m.title)
@@ -616,14 +621,14 @@ fn marking_a_directory_recursive_writes_a_double_star_declaration() {
 
     let raw = std::fs::read_to_string(crate::policy_file::path(ws.path())).unwrap_or_default();
     let policy = crate::policy_file::load(ws.path()).expect("policy.json");
-    let domain = policy
-        .domain("cargo")
-        .unwrap_or_else(|| panic!(
+    let domain = policy.domain("cargo").unwrap_or_else(|| {
+        panic!(
             "domain cargo / ws={:?} / policy_path={:?} / exists={} / file={raw} ",
             ws.path(),
             crate::policy_file::path(ws.path()),
             crate::policy_file::path(ws.path()).exists(),
-        ));
+        )
+    });
     assert!(
         domain.fs.read.contains(&"C:/proj/tc/**".to_string()),
         "再帰の宣言がそのまま書かれること: {:?}",
@@ -654,10 +659,18 @@ fn recursive_is_refused_on_a_leaf_and_on_a_too_broad_directory() {
     app.on_key(key(KeyCode::Right));
     app.on_key(key(KeyCode::Right));
     let leaf = app.selected_node().expect("行");
-    assert!(!app.tree.has_children(leaf), "葉に居ること: {:?}", app.tree.node(leaf).path);
+    assert!(
+        !app.tree.has_children(leaf),
+        "葉に居ること: {:?}",
+        app.tree.node(leaf).path
+    );
     app.on_key(key(KeyCode::Char('R')));
     assert!(app.recursive.is_empty(), "葉は再帰にできない");
-    assert!(app.status.contains("ディレクトリの行だけ"), "{}", app.status);
+    assert!(
+        app.status.contains("ディレクトリの行だけ"),
+        "{}",
+        app.status
+    );
 
     // ユーザープロファイル全体のような広さは、印の段階で拒否される。
     // **2件必要**——1件だと1本道が畳まれて`C:/Users/me/a.rs`という葉1行になり、

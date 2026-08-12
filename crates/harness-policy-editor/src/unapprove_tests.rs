@@ -384,7 +384,9 @@ fn cleaning_excluded_declarations_leaves_the_domain_and_the_rest_intact() {
     assert!(commit(ws.path(), &plan).expect("commit"));
 
     let after = load(ws.path());
-    let domain = after.domain("cargo").expect("the domain itself must survive");
+    let domain = after
+        .domain("cargo")
+        .expect("the domain itself must survive");
     assert!(domain
         .fs
         .read

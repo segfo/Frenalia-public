@@ -20,8 +20,7 @@
 use std::io::IsTerminal;
 
 use harness_policy::{
-    diff, gate, normalize, GateVerdict, PolicyInput, RuleProposal,
-    Source, SourceReport,
+    diff, gate, normalize, GateVerdict, PolicyInput, RuleProposal, Source, SourceReport,
 };
 
 use super::*;
@@ -382,8 +381,7 @@ pub(crate) fn run_policy_subcommand(
                 }
             };
             let input = collect_input(workspace_root, session.as_deref(), &sources);
-            let proposals =
-                input.proposals_with_granted(&granted_paths(workspace_root));
+            let proposals = input.proposals_with_granted(&granted_paths(workspace_root));
             let verdicts = gate::check_all(&proposals, require_sandbox);
             if output_format == OutputFormat::Text {
                 eprint!("{}", render_unavailable(&input));
@@ -396,15 +394,13 @@ pub(crate) fn run_policy_subcommand(
             duration,
             session,
             output_format,
-        } => {
-            run_learn(
-                workspace_root,
-                session.as_deref(),
-                duration,
-                require_sandbox,
-                output_format,
-            )
-        }
+        } => run_learn(
+            workspace_root,
+            session.as_deref(),
+            duration,
+            require_sandbox,
+            output_format,
+        ),
 
         PolicyAction::Apply {
             session,
@@ -420,8 +416,7 @@ pub(crate) fn run_policy_subcommand(
                 }
             };
             let input = collect_input(workspace_root, session.as_deref(), &sources);
-            let proposals =
-                input.proposals_with_granted(&granted_paths(workspace_root));
+            let proposals = input.proposals_with_granted(&granted_paths(workspace_root));
             apply_accepted(workspace_root, &proposals, &accept, yes, require_sandbox)
         }
     }

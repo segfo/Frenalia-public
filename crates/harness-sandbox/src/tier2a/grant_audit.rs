@@ -766,7 +766,10 @@ mod tests {
             audit.recorded_absent.is_empty(),
             "撤収済みを「幻の台帳エントリ」と呼ばない: {audit:?}"
         );
-        assert!(audit.summary().is_none(), "黙るべき場面で黙ること: {audit:?}");
+        assert!(
+            audit.summary().is_none(),
+            "黙るべき場面で黙ること: {audit:?}"
+        );
     }
 
     /// ただし**撤収の直後でも「ACEが残っているのに台帳に無い」は報告する**（B-35の対）。

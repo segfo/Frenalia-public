@@ -159,8 +159,7 @@ fn the_edit_screen_shows_the_workspace_as_a_locked_row() {
     app.screen = Screen::Edit;
     app.open_selected_session();
 
-    let mut terminal =
-        Terminal::new(TestBackend::new(200, 40)).expect("test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("test terminal");
     terminal
         .draw(|frame| {
             draw(frame, &app);

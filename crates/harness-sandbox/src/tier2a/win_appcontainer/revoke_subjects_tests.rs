@@ -140,7 +140,10 @@ fn an_unregistered_sid_whose_mask_is_not_exactly_one_of_ours_is_not_claimed() {
     let f = Fixture::new();
     let cases = [
         // 上位集合: harnessは`WRITE_DAC`を渡さない。
-        ("superset", fs_access_mask(FsAccess::ReadWriteExec) | WRITE_DAC.0),
+        (
+            "superset",
+            fs_access_mask(FsAccess::ReadWriteExec) | WRITE_DAC.0,
+        ),
         // 部分集合: `DELETE`を含まない読み書き（harnessの`ReadWrite`は`DELETE`を含む）。
         ("subset", FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0),
     ];
@@ -332,7 +335,8 @@ fn subjects_left_alone_are_reported_with_their_sid_and_a_reason() {
 /// ——読めなくなれば全主体が「判別不能」へ落ち、`fs revoke`は何も剥がさなくなる。
 #[test]
 fn the_appcontainer_registry_is_readable_on_this_machine() {
-    let map = registered_appcontainer_monikers().expect("HKCU AppContainer Mappings must be readable");
+    let map =
+        registered_appcontainer_monikers().expect("HKCU AppContainer Mappings must be readable");
     assert!(
         !map.is_empty(),
         "the machine has AppContainer profiles registered; an empty map means the key moved"

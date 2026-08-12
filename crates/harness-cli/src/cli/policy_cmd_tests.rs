@@ -392,8 +392,7 @@ fn a_denial_under_an_existing_read_grant_is_reported_as_insufficient() {
     .unwrap();
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
-    let proposals =
-        input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
+    let proposals = input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
 
     let warning = proposals[0]
         .warnings
@@ -429,8 +428,7 @@ fn a_denial_on_an_ungranted_path_carries_no_insufficiency_claim() {
     .unwrap();
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
-    let proposals =
-        input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
+    let proposals = input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
 
     assert!(!proposals[0]
         .warnings
@@ -474,8 +472,7 @@ fn applying_an_escalated_proposal_actually_changes_the_settings() {
     let settings_path = dir.path().join(".harness").join("settings.json");
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
-    let proposals =
-        input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
+    let proposals = input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
     let read_write = proposals
         .iter()
         .find(|p| p.key == harness_policy::SettingsKey::FsReadWrite)
@@ -516,8 +513,7 @@ fn a_denial_on_an_fs_allow_only_path_escalates_via_the_ledger() {
     let ledger = r#"{"entries":[{"path":"C:\\tools","writable":false,"granted_at_unix_secs":1}]}"#;
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
-    let proposals = input.proposals_with_granted(&granted_paths_from(dir.path(), ledger),
-    );
+    let proposals = input.proposals_with_granted(&granted_paths_from(dir.path(), ledger));
 
     assert_eq!(proposals.len(), 1, "{proposals:#?}");
     assert_eq!(proposals[0].key, harness_policy::SettingsKey::FsReadWrite);
@@ -534,8 +530,8 @@ fn a_broken_ledger_degrades_to_no_escalation_instead_of_failing() {
     let dir = workspace_with_one_denial("{}", "C:/tools/bin/rustc.exe");
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
-    let proposals = input.proposals_with_granted(&granted_paths_from(dir.path(), "{ this is not json"),
-    );
+    let proposals =
+        input.proposals_with_granted(&granted_paths_from(dir.path(), "{ this is not json"));
 
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].key, harness_policy::SettingsKey::FsRead);
@@ -568,8 +564,7 @@ fn relative_settings_paths_are_resolved_against_the_workspace_root() {
     .unwrap();
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
-    let proposals =
-        input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
+    let proposals = input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
 
     assert!(
         proposals
@@ -586,26 +581,24 @@ fn relative_settings_paths_are_resolved_against_the_workspace_root() {
 
 /// 祖先チェーンの拒否（`cmd`が祖先をオープンするために出る）から作った提案一式。
 fn ancestor_chain_proposals() -> Vec<harness_policy::RuleProposal> {
-    harness_policy::generalize::generalize(
-        &[
-            harness_policy::DeniedCandidate::fs(
-                Source::Etw,
-                "C:/",
-                harness_config::FsAccess::Read,
-                "STATUS_ACCESS_DENIED",
-                1,
-                0,
-            ),
-            harness_policy::DeniedCandidate::fs(
-                Source::Etw,
-                "C:/Users/me/.cargo/registry",
-                harness_config::FsAccess::Read,
-                "STATUS_ACCESS_DENIED",
-                1,
-                0,
-            ),
-        ],
-    )
+    harness_policy::generalize::generalize(&[
+        harness_policy::DeniedCandidate::fs(
+            Source::Etw,
+            "C:/",
+            harness_config::FsAccess::Read,
+            "STATUS_ACCESS_DENIED",
+            1,
+            0,
+        ),
+        harness_policy::DeniedCandidate::fs(
+            Source::Etw,
+            "C:/Users/me/.cargo/registry",
+            harness_config::FsAccess::Read,
+            "STATUS_ACCESS_DENIED",
+            1,
+            0,
+        ),
+    ])
 }
 
 /// **D-47の本体。** ドライブルートの提案は`--yes`が付いていても書かれない。

@@ -208,7 +208,11 @@ impl Aggregate {
     /// アクセス由来（[`Self::add_event`]）と実行像由来（[`Self::add_exec_candidate`]）が
     /// **同じ規則・同じ数え方**を通る唯一の場所。`kind`を受けるのは、マシン全体の
     /// インストール先だけ「触ったパス」と「起動した像」で説明が違うためである（BUG-099）。
-    fn note_exclusion(&mut self, path: &str, kind: CandidateKind) -> Option<crate::exclusion::Excluded> {
+    fn note_exclusion(
+        &mut self,
+        path: &str,
+        kind: CandidateKind,
+    ) -> Option<crate::exclusion::Excluded> {
         use crate::exclusion::Excluded;
         let reason = self.rules.excluded(path)?;
         let counter = match (reason, kind) {
@@ -346,7 +350,10 @@ impl Aggregate {
         //    1関数**を通す（[`crate::exclusion`]）。マシン全体のインストール先を承認すると
         //    実害がある——`preflight`がそこへACEを付けに行き、TrustedInstaller所有ノードで
         //    失敗し（D-19の限界、BUG-015）、UACを増やし、最悪パス2が丸ごと落ちる。
-        if self.note_exclusion(image, CandidateKind::ExecImage).is_some() {
+        if self
+            .note_exclusion(image, CandidateKind::ExecImage)
+            .is_some()
+        {
             return false;
         }
         self.folder
@@ -369,10 +376,7 @@ impl Aggregate {
     /// 記録時点の宣言（[`Self::granted`]。パス2のみ）を渡すので、**既に許可済みなのに
     /// 拒否された**パスは同じキーの提案を出し直さず昇格候補へ差し替わる（D-46）。
     pub fn proposals(&self) -> Vec<RuleProposal> {
-        harness_policy::generalize::generalize_with_granted(
-            self.folder.candidates(),
-            &self.granted,
-        )
+        harness_policy::generalize::generalize_with_granted(self.folder.candidates(), &self.granted)
     }
 
     /// 観測したプロセスをツリー順（親→子）で並べる。
@@ -692,7 +696,6 @@ pub fn render(aggregate: &Aggregate, limit: usize) -> String {
 
     out
 }
-
 
 /// 観測したプロセスツリーを整形する（記録対象が何を起動したかの俯瞰）。
 pub fn render_process_tree(aggregate: &Aggregate) -> String {

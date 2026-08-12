@@ -221,7 +221,11 @@ fn sandbox_profile_components_come_from_the_sandbox_crate() {
     assert!(is_sandbox_profile_path(
         "C:/x/Packages/harness.shell.sandbox.1-2/AC"
     ));
-    assert!(is_sandbox_profile_path("C:/x/Packages/harness.mcp.1-2.docs"));
-    assert!(!is_sandbox_profile_path("C:/x/Packages/harness.shell.sandbox"));
+    assert!(is_sandbox_profile_path(
+        "C:/x/Packages/harness.mcp.1-2.docs"
+    ));
+    assert!(!is_sandbox_profile_path(
+        "C:/x/Packages/harness.shell.sandbox"
+    ));
     assert!(!is_sandbox_profile_path("C:/x/Packages/other.app_8wekyb"));
 }

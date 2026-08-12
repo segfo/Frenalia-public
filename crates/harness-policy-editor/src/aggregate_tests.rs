@@ -135,14 +135,13 @@ fn accesses_under_a_machine_wide_install_root_are_excluded_and_counted() {
         "approving any of these makes preflight fail on an ancestor it cannot write: {:#?}",
         agg.candidates()
     );
-    assert!(
-        agg.proposals().is_empty(),
-        "{:#?}",
-        agg.proposals()
-    );
+    assert!(agg.proposals().is_empty(), "{:#?}", agg.proposals());
     // 除外は必ず見せる（B-09）。黙って捨てると「観測できなかった」と区別が付かない。
     let text = render(&agg, 10);
-    assert!(text.contains("C:/Program Files 配下へのアクセス 3件"), "{text}");
+    assert!(
+        text.contains("C:/Program Files 配下へのアクセス 3件"),
+        "{text}"
+    );
     // 観測した事実そのものは消さない。
     assert_eq!(agg.events_seen, 3);
     assert_eq!(agg.allowed, 3);
@@ -693,11 +692,7 @@ fn a_pass2_denial_on_an_already_declared_path_is_escalated() {
         &pass2_manifest(None, &[("C:/Users/segfo/.rustup", FsAccess::Read)]),
     );
 
-    let keys: Vec<_> = agg
-        .proposals()
-        .into_iter()
-        .map(|p| p.key)
-        .collect();
+    let keys: Vec<_> = agg.proposals().into_iter().map(|p| p.key).collect();
     assert_eq!(
         keys,
         vec![
@@ -736,11 +731,7 @@ fn declared_paths_are_normalized_before_they_are_matched() {
         &pass2_manifest(None, &[(r"C:\tools", FsAccess::ReadExec)]),
     );
 
-    let keys: Vec<_> = agg
-        .proposals()
-        .into_iter()
-        .map(|p| p.key)
-        .collect();
+    let keys: Vec<_> = agg.proposals().into_iter().map(|p| p.key).collect();
     assert_eq!(keys, vec![harness_policy::SettingsKey::FsReadWrite]);
 }
 
@@ -783,7 +774,10 @@ fn the_three_new_rules_drop_accesses_and_are_counted() {
     let text = render_notes(&agg);
     assert!(text.contains("workspace配下 1件"), "{text}");
     assert!(text.contains("%TEMP% 配下 1件"), "{text}");
-    assert!(text.contains("サンドボックスプロファイル配下 1件"), "{text}");
+    assert!(
+        text.contains("サンドボックスプロファイル配下 1件"),
+        "{text}"
+    );
 }
 
 /// **実行像由来**の候補（`fs.read_exec`）にも同じ3規則が効く。
@@ -837,7 +831,12 @@ fn the_three_new_rules_drop_exec_images_too() {
 fn paths_outside_the_three_new_rules_stay_candidates() {
     let mut agg = bug103_aggregate();
     // 別のリポジトリ（記録対象が走査しただけ）は正当な承認対象。
-    agg.add_event(&observed("C:/other-repo/src/lib.rs", FsAccess::Read, true, 1));
+    agg.add_event(&observed(
+        "C:/other-repo/src/lib.rs",
+        FsAccess::Read,
+        true,
+        1,
+    ));
     // workspace・%TEMP%と前方一致するだけの兄弟。
     agg.add_event(&observed("C:/ws2/src/lib.rs", FsAccess::Read, true, 2));
     agg.add_event(&observed("C:/temp2/a.txt", FsAccess::Read, true, 3));

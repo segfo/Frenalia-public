@@ -637,7 +637,11 @@ fn revoke_sids_from_node(path: &Path, sids: &[PSID]) -> Result<bool, AppContaine
         )
         .ok()
         {
-            return if is_vanished(&e) { Ok(false) } else { Err(to_err(e)) };
+            return if is_vanished(&e) {
+                Ok(false)
+            } else {
+                Err(to_err(e))
+            };
         }
 
         let mut new_buf: Vec<u8> = Vec::new();

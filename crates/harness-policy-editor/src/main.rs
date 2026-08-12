@@ -82,7 +82,7 @@ enum Command {
         #[arg(long)]
         cwd: Option<PathBuf>,
         #[arg(long)]
-            /// この秒数を過ぎたら対象コマンドを打ち切る。
+        /// この秒数を過ぎたら対象コマンドを打ち切る。
         #[arg(long)]
         timeout: Option<u64>,
         #[arg(long)]
@@ -98,7 +98,7 @@ enum Command {
         #[arg(long)]
         workspace: Option<PathBuf>,
         #[arg(long)]
-            #[arg(long)]
+        #[arg(long)]
         limit: Option<usize>,
         /// 観測したプロセスツリーも表示する。
         #[arg(long)]
@@ -124,7 +124,7 @@ enum Command {
         accept: Vec<String>,
         /// `show`に渡したのと同じ値を指定すること（idは一般化の度合いで変わる）。
         #[arg(long)]
-            /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
+        /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
         #[arg(long)]
         require_sandbox: Option<String>,
         /// 差分を確認済みとして書き込む（非対話では必須）。
@@ -193,9 +193,7 @@ fn main() -> ExitCode {
             timeout,
             limit,
             command,
-        }) => run_record_net(
-            &domain, workspace, cwd, timeout, limit, &command,
-        ),
+        }) => run_record_net(&domain, workspace, cwd, timeout, limit, &command),
         Some(Command::Show {
             session,
             workspace,
@@ -760,10 +758,7 @@ fn run_show(
         // 収集器がまったく起きなくても候補になる（`aggregate`のモジュールdoc）。囲んだままだと
         // **起動できなかった当のexeが、いちばん知りたい場面でだけ画面から消える**。
         // 何も観測できていないことは`render_notes`が別に言う（D-43）。
-        print!(
-            "{}",
-            harness_policy_editor::aggregate::render(&fs, limit)
-        );
+        print!("{}", harness_policy_editor::aggregate::render(&fs, limit));
         if tree {
             print!(
                 "{}",

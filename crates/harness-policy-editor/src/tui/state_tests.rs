@@ -242,7 +242,12 @@ fn finishing_pass1_keeps_the_result_on_screen_and_only_suggests_the_edit_screen(
         etw_available: true,
         collector_written: Some(1),
         warnings: Vec::new(),
-        aggregate: crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(std::path::Path::new("C:/no-such-workspace"), Some(std::path::Path::new("C:/no-such-temp")))),
+        aggregate: crate::aggregate::Aggregate::new(
+            crate::exclusion::ExclusionRules::with_temp_root(
+                std::path::Path::new("C:/no-such-workspace"),
+                Some(std::path::Path::new("C:/no-such-temp")),
+            ),
+        ),
     }))));
 
     assert!(!app.is_running());
@@ -307,7 +312,12 @@ fn starting_another_recording_replaces_the_previous_result() {
         etw_available: true,
         collector_written: None,
         warnings: Vec::new(),
-        aggregate: crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(std::path::Path::new("C:/no-such-workspace"), Some(std::path::Path::new("C:/no-such-temp")))),
+        aggregate: crate::aggregate::Aggregate::new(
+            crate::exclusion::ExclusionRules::with_temp_root(
+                std::path::Path::new("C:/no-such-workspace"),
+                Some(std::path::Path::new("C:/no-such-temp")),
+            ),
+        ),
     }))));
     assert!(app.has_finished_run());
 
@@ -335,7 +345,12 @@ fn a_nonzero_exit_code_is_reported_after_the_recording() {
         etw_available: true,
         collector_written: None,
         warnings: Vec::new(),
-        aggregate: crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(std::path::Path::new("C:/no-such-workspace"), Some(std::path::Path::new("C:/no-such-temp")))),
+        aggregate: crate::aggregate::Aggregate::new(
+            crate::exclusion::ExclusionRules::with_temp_root(
+                std::path::Path::new("C:/no-such-workspace"),
+                Some(std::path::Path::new("C:/no-such-temp")),
+            ),
+        ),
     }))));
 
     assert!(app.status.contains("101"), "status: {}", app.status);
@@ -385,7 +400,12 @@ fn a_successful_recording_adds_no_failure_line_to_the_warning_panel() {
         etw_available: true,
         collector_written: Some(0),
         warnings: Vec::new(),
-        aggregate: crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(std::path::Path::new("C:/no-such-workspace"), Some(std::path::Path::new("C:/no-such-temp")))),
+        aggregate: crate::aggregate::Aggregate::new(
+            crate::exclusion::ExclusionRules::with_temp_root(
+                std::path::Path::new("C:/no-such-workspace"),
+                Some(std::path::Path::new("C:/no-such-temp")),
+            ),
+        ),
     }))));
 
     let warnings = &app.run.as_ref().expect("run is kept").warnings;
