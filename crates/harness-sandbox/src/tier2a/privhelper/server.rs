@@ -244,8 +244,10 @@ fn grant_fs_allow_entries(
                 continue;
             }
         }
+        // [D-63] 昇格側も**宣言されたスコープ**で付ける。ここだけ継承ACE固定にすると、
+        // システム保護パスへ回ったエントリだけ従来どおりサブツリー全体が開く（B-02）。
         let do_grant =
-            || win_appcontainer::grant_ace_inheritable_access(&entry.path, sid, entry.access);
+            || win_appcontainer::grant_ace_scoped(&entry.path, sid, entry.access, entry.scope);
         // forcedのみ`SeRestorePrivilege`を有効化して実行する（TrustedInstaller所有ノードへも
         // 所有権を変えずにACEを書ける）。非forcedは従来どおり特権無しで実行する。
         let result = if entry.forced {

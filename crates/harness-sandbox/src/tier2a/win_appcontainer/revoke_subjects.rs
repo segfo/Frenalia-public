@@ -16,6 +16,7 @@
 //!
 //! | 順 | 条件 | 結果 |
 //! |---|---|---|
+//! | -1 | **well-knownのパッケージSID**（`ALL APPLICATION PACKAGES`等） | **絶対に触らない** |
 //! | 0 | レジストリに登録があり`Moniker`がharnessでない | **絶対に触らない** |
 //! | 1 | 登録があり`Moniker`がharnessで、生きている | 触らない（BUG-053） |
 //! | 2 | 登録があり`Moniker`がharnessで、生きていない | 撤収する |
@@ -32,12 +33,19 @@
 //! ものでもあり得る）。確実に言えるのは「名前へ逆引きする手段がこのマシンに存在しない」まで。
 //! だから規則4はマスクの**完全一致**を要求する。加えて未登録は永続でもない——同じ名前で
 //! プロファイルを作り直せば同じSIDが復活し、残っていたACEは再び有効になる。
+//!
+//! **規則-1が全ての先にあるのも同じ理由である**（[`WELL_KNOWN_PACKAGE_SIDS`]）。マスクの
+//! 完全一致は「他に手掛かりが無いときの最後の指紋」であって、**その指紋を持つのがharnessだけ
+//! である保証はどこにも無い**。実際、`ALL APPLICATION PACKAGES`(`S-1-15-2-1`)へ
+//! `icacls /grant "*S-1-15-2-1:(OI)(CI)(RX)"`で付けたACEのマスクは`0x1200A9`で、
+//! `fs_access_mask(FsAccess::ReadExec)`と**1ビット違わず同じ**である。この形のACEは
+//! Edge/Chrome/VS Codeのインストールツリーが標準で持ち、剥がすとそれらのサンドボックスが
+//! 起動できなくなる（`docs/DEV-ENVIRONMENT.md`のVS Code GPUサンドボックスの節）。
 
 use std::collections::BTreeMap;
 
 use super::*;
 
-use windows::Win32::Security::Authorization::DENY_ACCESS;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
     RRF_RT_REG_SZ,
@@ -51,6 +59,31 @@ use windows::Win32::System::Registry::{
 /// 扉が担当する。ここで巻き込むと[BUG-046](../../../../docs/bugs/BUG-046.md)（`C:\`のtraverse ACEを
 /// 純減させてマシン全体のFS I/Oを壊した）を再現する。
 const APPCONTAINER_SID_PREFIX: &str = "S-1-15-2-";
+
+/// **harnessが主体にすることが決して無い、well-knownのパッケージSID。**
+///
+/// [`APPCONTAINER_SID_PREFIX`]は`S-1-15-2-<ハッシュ>`という形のプロファイル固有SIDを拾う
+/// つもりの接頭辞だが、well-knownのグループSIDもこの下にいる（RIDが1つだけの短い形）。
+/// harnessのプロファイルSIDは`DeriveAppContainerSidFromAppContainerName`のハッシュなので
+/// **これらと一致することはない**。
+///
+/// 剥がしてはいけない理由は、これがマシン共有の主体だからである。`ALL APPLICATION PACKAGES`は
+/// 「AppContainerで動く全アプリ」を指し、Edge/Chrome/VS Codeのインストールツリーは自分の
+/// GPU・レンダラサンドボックスを動かすためにこのSID宛のACEを持つ。純減させると、harnessと
+/// 無関係なアプリが起動できなくなる（[BUG-046](../../../../docs/bugs/BUG-046.md)で`C:\`の
+/// traverse ACEを純減させたのと同じ形の事故）。
+const WELL_KNOWN_PACKAGE_SIDS: &[(&str, &str)] = &[
+    ("S-1-15-2-1", "ALL APPLICATION PACKAGES"),
+    ("S-1-15-2-2", "ALL RESTRICTED APPLICATION PACKAGES"),
+];
+
+/// well-knownのパッケージSIDなら、その表示名を返す。
+fn well_known_package_name(sid: &str) -> Option<&'static str> {
+    WELL_KNOWN_PACKAGE_SIDS
+        .iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(sid))
+        .map(|(_, name)| *name)
+}
 
 /// `HKCU`配下のAppContainerプロファイル登録簿。サブキー名がSID、値`Moniker`がプロファイル名。
 ///
@@ -82,6 +115,9 @@ impl PathAceSubject {
 /// ——理由を落とすと「0件だったのか、触らなかったのか」が呼び出し側から見えない（B-09/B-10）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubjectKind {
+    /// 規則-1: well-knownのパッケージSID（[`WELL_KNOWN_PACKAGE_SIDS`]）。マシン共有の主体で、
+    /// harnessが付与先にすることは無い。**登録簿と台帳のどちらが何と言おうと触らない。**
+    WellKnownPackage { name: &'static str },
     /// 規則0: 登録済みで、harnessのものではない。
     ForeignRegistered { moniker: String },
     /// 規則1: 生きているharnessセッション。
@@ -110,6 +146,11 @@ impl SubjectKind {
     /// 撤収対象ではない理由（表示用）。対象のものには`None`。
     pub fn left_alone_reason(&self) -> Option<String> {
         match self {
+            SubjectKind::WellKnownPackage { name } => Some(format!(
+                "{name} is a well-known machine-wide package SID that harness never grants to; \
+                 other applications (Edge/Chrome/VS Code sandboxes) depend on it, so it is left \
+                 untouched no matter what the ledger says"
+            )),
             SubjectKind::ForeignRegistered { moniker } => {
                 Some(format!("registered to {moniker}; not ours, left untouched"))
             }
@@ -147,6 +188,14 @@ pub struct SubjectClassifier<'a> {
 
 impl SubjectClassifier<'_> {
     pub fn classify(&self, sid: &str, allow_mask: u32, has_deny: bool) -> SubjectKind {
+        // 規則-1: **他のどの材料よりも先**（[`WELL_KNOWN_PACKAGE_SIDS`]）。登録簿が読めたか、
+        // 台帳が何と言っているか、マスクが指紋に一致するか——どれとも無関係に決まる。
+        // 台帳より先に置くのは規則0と同じ理由で、台帳はサンドボックスから書ける（BUG-103(d)）。
+        // ここが後ろにあると、「台帳へ`S-1-15-2-1`を書き足す」だけで
+        // **他アプリからALL APPLICATION PACKAGESのACEを剥がさせられる**。
+        if let Some(name) = well_known_package_name(sid) {
+            return SubjectKind::WellKnownPackage { name };
+        }
         let Some(registered) = self.registered else {
             return SubjectKind::Unidentified { classified: false };
         };
@@ -207,83 +256,52 @@ pub fn harness_package_sid_masks() -> Vec<u32> {
 
 /// `path`のDACLに明示ACEを持つAppContainerパッケージSIDを列挙する（SIDごとに1件へ畳む）。
 ///
-/// `sid_ace_mask`と同じ`GetExplicitEntriesFromAclW`経由で読む（`GetAce`によるACEヘッダの
-/// 直接パースより低リスク、同関数のコメント参照）。SIDはWin32が確保した配列の中を指すため、
-/// 解放前に[`crate::win_common::OwnedSid`]へコピーして所有権を単純化する。
+/// 読み取りは[`super::visit_explicit_aces`]（`GetAce`直接列挙）を通す。**`GetExplicitEntriesFromAclW`は
+/// 使わない**——DACLに条件付きACEが1本でもあると`ERROR_INVALID_PARAMETER`で全体が落ち、
+/// そのパスが永久に撤収不能になる（実マシンで`%LOCALAPPDATA%\PowerToys`が該当した。同関数のdoc）。
+/// SIDはWin32が確保したバッファの中を指すため、解放前に[`crate::win_common::OwnedSid`]へ
+/// コピーして所有権を単純化する。
 ///
-/// **継承ACEは含まない**（`GetExplicitEntriesFromAclW`の仕様）。撤収側にとってはこれが正しい
-/// 意味である——継承ACEはそのノードからは剥がせず、継承元でしか取り消せない。
+/// **継承ACEは含まない。** 撤収側にとってはこれが正しい意味である——継承ACEはそのノードからは
+/// 剥がせず、継承元でしか取り消せない。
+///
+/// `has_deny`は「harnessが書かない形のACEが混じっているか」を意味し、**deny ACEだけでなく
+/// 条件付きACEも立てる**（規則4の指紋は「harnessが書いた形」でしか名乗らない、B-25）。
 pub fn appcontainer_sid_aces(path: &Path) -> Result<Vec<PathAceSubject>, AppContainerError> {
-    let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
-        path: path.to_path_buf(),
-        reason: e.to_string(),
-    };
+    let mut found: Vec<PathAceSubject> = Vec::new();
     unsafe {
-        let path_w = long_path_wide(path);
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        GetNamedSecurityInfoW(
-            PCWSTR(path_w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut dacl),
-            None,
-            &mut sd,
-        )
-        .ok()
-        .map_err(to_err)?;
-
-        let mut count: u32 = 0;
-        let mut entries: *mut EXPLICIT_ACCESS_W = std::ptr::null_mut();
-        let err = GetExplicitEntriesFromAclW(dacl as *const _, &mut count, &mut entries);
-        if let Err(e) = err.ok() {
-            let _ = LocalFree(HLOCAL(sd.0));
-            return Err(to_err(e));
-        }
-
-        let mut found: Vec<PathAceSubject> = Vec::new();
-        if !entries.is_null() {
-            for entry in std::slice::from_raw_parts(entries, count as usize) {
-                if entry.Trustee.TrusteeForm != TRUSTEE_IS_SID {
-                    continue;
-                }
-                let entry_sid = PSID(entry.Trustee.ptstrName.0 as *mut c_void);
-                let Ok(sid_string) = crate::win_common::sid_to_string(entry_sid) else {
-                    continue;
-                };
-                if !sid_string.starts_with(APPCONTAINER_SID_PREFIX) {
-                    continue;
-                }
-                let denied = entry.grfAccessMode == DENY_ACCESS;
-                // 同一SIDに複数のACEがあれば1件へ畳む（許可はOR、拒否は有無だけ）。
-                if let Some(existing) = found.iter_mut().find(|s| s.sid == sid_string) {
-                    if denied {
-                        existing.has_deny = true;
-                    } else {
-                        existing.allow_mask |= entry.grfAccessPermissions;
-                    }
-                    continue;
-                }
-                if let Ok(owned) = crate::win_common::OwnedSid::copy_from(entry_sid) {
-                    found.push(PathAceSubject {
-                        sid: sid_string,
-                        allow_mask: if denied {
-                            0
-                        } else {
-                            entry.grfAccessPermissions
-                        },
-                        has_deny: denied,
-                        sid_bytes: owned,
-                    });
-                }
+        super::visit_explicit_aces(path, &mut |entry_sid, ace_type, _flags, mask| {
+            let Ok(sid_string) = crate::win_common::sid_to_string(entry_sid) else {
+                return;
+            };
+            if !sid_string.starts_with(APPCONTAINER_SID_PREFIX) {
+                return;
             }
-            let _ = LocalFree(HLOCAL(entries as *mut _));
-        }
-        let _ = LocalFree(HLOCAL(sd.0));
-        Ok(found)
+            let harness_shape = ace_type == super::ACCESS_ALLOWED_ACE_TYPE;
+            // 同一SIDに複数のACEがあれば1件へ畳む（許可はOR、それ以外は有無だけ）。
+            if let Some(existing) = found.iter_mut().find(|s| s.sid == sid_string) {
+                if harness_shape {
+                    existing.allow_mask |= mask;
+                } else {
+                    existing.has_deny = true;
+                }
+                return;
+            }
+            if let Ok(owned) = crate::win_common::OwnedSid::copy_from(entry_sid) {
+                found.push(PathAceSubject {
+                    sid: sid_string,
+                    allow_mask: if harness_shape { mask } else { 0 },
+                    has_deny: !harness_shape,
+                    sid_bytes: owned,
+                });
+            }
+        })
+        .map_err(|e| AppContainerError::AclRevoke {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
     }
+    Ok(found)
 }
 
 /// `path`に載っているAppContainerパッケージSID宛の明示ACEのうち、`keep_profiles`のどの

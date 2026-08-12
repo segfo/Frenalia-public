@@ -102,10 +102,14 @@ pub fn run_fs_subcommand(action: FsAction) -> ExitCode {
                 println!("(none)");
             }
             for e in &ledger.entries {
+                // [D-63] 範囲を出す。**`ro`/`rw`だけでは「どこまで」が読めない**——同じ`ro`でも
+                // オブジェクト単体とサブツリー全体では意味がまるで違う（そこがD-62/D-63の主題）。
+                // これは台帳の記録であって実DACLではない旨は`FsLedgerEntry::scope`のdocが持つ。
                 println!(
-                    "{}\t{}{}\tgranted_at_unix={}",
+                    "{}\t{}\t{}{}\tgranted_at_unix={}",
                     e.path,
                     if e.writable { "rw" } else { "ro" },
+                    e.scope.label(),
                     if e.forced { " [forced]" } else { "" },
                     e.granted_at_unix_secs
                 );

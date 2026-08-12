@@ -18,10 +18,157 @@ mod dacl_protection_probe_tests;
 
 /// `ACCESS_ALLOWED_ACE_TYPE`（WinNT.h）。`windows`クレートはこの値を定数として公開して
 /// いないため、既知の固定値としてここに置く。
-const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+pub(crate) const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 /// `ACCESS_DENIED_ACE_TYPE`（WinNT.h）。Deny ACEもこのクレートが書くので、revoke時は
 /// Allow ACEと同じSID照合で取り除く。
-const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+pub(crate) const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+/// 条件付きACE（`ACCESS_ALLOWED_CALLBACK_ACE_TYPE`/`ACCESS_DENIED_CALLBACK_ACE_TYPE`、WinNT.h）。
+///
+/// **harnessは書かないが、実マシンに実在する。** この開発機の
+/// `%LOCALAPPDATA%\PowerToys`には
+/// `(XA;OICI;0x1200a9;;;BU;(WIN://SYSAPPID Contains "Microsoft.PowerToys.SparseApp_..."))`が
+/// 載っており、MSIXのSparseパッケージが自分の実行時にだけ効くACEとして置いていく。
+/// 先頭は`ACCESS_ALLOWED_ACE`と同じ`Mask`/`SidStart`配置で、SIDの後ろに条件式が続く。
+pub(crate) const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+pub(crate) const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 10;
+
+/// `path`のDACLに載っている**明示**ACE（継承ACEを除く）を1本ずつ渡す。
+///
+/// # なぜ`GetExplicitEntriesFromAclW`をやめたのか
+///
+/// あちらは**DACLに条件付きACEが1本でも載っていると`ERROR_INVALID_PARAMETER`(0x80070057)で
+/// 全体が失敗する**。実マシンで`harness fs revoke-all`が
+/// `%LOCALAPPDATA%\PowerToys`だけ撤収できず、台帳エントリが永久に残った
+/// （2026-08-12の実測。そのパスにharnessのACEは1本も無く、**走査そのものが落ちていた**）。
+/// 「読めなかった」が「撤収できない」に化ける形なので、読み取りを`GetAce`の直接列挙へ寄せる。
+///
+/// 扱うのは`Mask`/`SidStart`の配置が共通な4種別（allow/deny/条件付きallow/条件付きdeny）だけで、
+/// object ACE（ディレクトリサービス用。ファイルオブジェクトには現れない）は**主体を特定できない
+/// ので飛ばす**——[`copy_dacl_excluding_sids`]が未知種別を保持するのと同じ判断である。
+///
+/// `visit`には`(SID, ACE種別, ACEフラグ, マスク)`を渡す。継承ACEを渡さないのは
+/// [`sid_ace_mask`]の従来の意味（`GetExplicitEntriesFromAclW`の仕様）を保つためで、
+/// 撤収側にとってはこれが正しい——継承ACEはそのノードからは剥がせない。
+pub(crate) unsafe fn visit_explicit_aces(
+    path: &Path,
+    visit: &mut dyn FnMut(PSID, u8, u8, u32),
+) -> windows::core::Result<()> {
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        // NULL DACL（＝誰でもフルアクセス）には明示ACEが1本も無い。`sd`は解放する。
+        if !dacl.is_null() {
+            let count = (*dacl).AceCount as u32;
+            for index in 0..count {
+                let mut ace_ptr: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl, index, &mut ace_ptr).is_err() || ace_ptr.is_null() {
+                    continue;
+                }
+                let header = &*(ace_ptr as *const ACE_HEADER);
+                // 継承ACEは「このノードの明示ACE」ではない。
+                if header.AceFlags & (INHERITED_ACE.0 as u8) != 0 {
+                    continue;
+                }
+                if !matches!(
+                    header.AceType,
+                    ACCESS_ALLOWED_ACE_TYPE
+                        | ACCESS_DENIED_ACE_TYPE
+                        | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+                        | ACCESS_DENIED_CALLBACK_ACE_TYPE
+                ) {
+                    continue;
+                }
+                let ace = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
+                let entry_sid = PSID(&ace.SidStart as *const u32 as *mut c_void);
+                visit(entry_sid, header.AceType, header.AceFlags, ace.Mask);
+            }
+        }
+        let _ = LocalFree(HLOCAL(sd.0));
+        Ok(())
+    }
+}
+
+/// あるSIDについて、そのノードの明示ACEを畳んだもの（[`sid_explicit_ace`]の戻り値）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExplicitAce {
+    /// 明示ACE全種別のマスクの論理和。[`sid_ace_mask`]が返すのはこの値である。
+    pub mask: u32,
+    /// **素のallow ACE**だけのマスクの論理和。撤収側の指紋照合（規則4）はこちらを使う
+    /// ——条件付きACEやdeny ACEは「harnessが書いた形」ではない。
+    pub allow_mask: u32,
+    /// 継承フラグ（`OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`）の論理和。
+    /// [D-63] **付与範囲の実測値**である——台帳の`scope`ではなくこれが根拠になる。
+    pub inherit: u8,
+    /// harnessが書かない形のACE（deny・条件付き）が1本でも混じっているか。
+    pub foreign_shape: bool,
+}
+
+impl ExplicitAce {
+    /// [D-63] このACEが配下へ継承されるか（＝再帰付与の実測）。
+    pub fn is_inheritable(&self) -> bool {
+        self.inherit & ((OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8) != 0
+    }
+
+    /// 要求（マスクと継承）を既に満たしているか。**冪等スキップの唯一の判定**（D-63）。
+    ///
+    /// マスクだけを見ていた頃は、同じパスへ素の宣言（非継承）と`**`宣言（継承）が来たとき、
+    /// 先に付いた非継承ACEでマスクが足りていると**再帰要求が黙って非継承のまま通っていた**
+    /// （B-10: 成功と報告しながら要求どおりになっていない）。
+    pub fn satisfies(&self, required_mask: u32, required_inherit: u8) -> bool {
+        self.mask & required_mask == required_mask
+            && self.inherit & required_inherit == required_inherit
+    }
+}
+
+/// `path`の`sid`宛の明示ACEを畳んで返す。無ければ`None`。
+///
+/// [`sid_ace_mask`]はこの薄い皮である（**同じDACLの読み方を2つ持たない**、B-05）。
+pub(crate) fn sid_explicit_ace(
+    path: &Path,
+    sid: PSID,
+) -> Result<Option<ExplicitAce>, AppContainerError> {
+    let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    };
+    let mut found: Option<ExplicitAce> = None;
+    unsafe {
+        visit_explicit_aces(path, &mut |entry_sid, ace_type, flags, mask| {
+            if EqualSid(entry_sid, sid).is_err() {
+                return;
+            }
+            let plain_allow = ace_type == ACCESS_ALLOWED_ACE_TYPE;
+            let acc = found.get_or_insert(ExplicitAce {
+                mask: 0,
+                allow_mask: 0,
+                inherit: 0,
+                foreign_shape: false,
+            });
+            acc.mask |= mask;
+            if plain_allow {
+                acc.allow_mask |= mask;
+            } else {
+                acc.foreign_shape = true;
+            }
+            acc.inherit |= flags & ((OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8);
+        })
+        .map_err(to_err)?;
+    }
+    Ok(found)
+}
 
 /// [BUG-020の修正] `dacl`から`sids`のいずれかに一致するAllow/Deny ACEを取り除いた新しいDACLを、
 /// 対象外のACEは`GetAce`で読んだ生バイト列のまま`AddAce`でコピーして構築する（trustee・
@@ -747,7 +894,40 @@ impl RevokeReport {
 /// - ノードごとの失敗は`?`せず[`RevokeReport::blocked`]へ集めて**続行する**。
 ///   `Err`を返すのは**rootにすら触れなかった**ときだけ。
 pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<RevokeReport, AppContainerError> {
-    revoke_tree(root, &|_, _| {}, &|path| revoke_ace_reporting(path, sid))
+    let walk = descendants_need_walk(root, std::slice::from_ref(&sid));
+    revoke_tree(root, walk, &|_, _| {}, &|path| {
+        revoke_ace_reporting(path, sid)
+    })
+}
+
+/// [D-63] `root`から剥がすとき、**配下まで歩く必要があるか**を実DACLから決める。
+///
+/// # なぜ台帳の`scope`を根拠にしないのか
+///
+/// 台帳は[BUG-103](../../../../docs/bugs/BUG-103.md)(d)で**サンドボックスから書ける**ことが
+/// 実測されている。`scope: Object`を鵜呑みにすると、「台帳を書き換えて再帰ACEを撤収の対象外に
+/// する」経路になる。D-61（撤収の主体は対象パスのDACLに実在するSIDから決める）とまったく
+/// 同じ原則を、**範囲の軸にも適用する**のがこの関数である。
+///
+/// # 判定
+///
+/// 対象SIDのいずれかがrootに**継承フラグ付きの明示ACE**を持つなら歩く。継承ACEを置いた
+/// 以上、配下にはコピーが降りている（rootのACEを剥がしただけでは消えないことを
+/// `removing_only_the_root_ace_leaves_inherited_copies_on_descendants`が実測で固定している）。
+///
+/// **迷ったら歩く。** DACLを読めなかった・対象SIDの明示ACEが1本も無い（継承で降りてきた
+/// コピーだけがある等）ときは`true`を返す。撤収は「狭めない」側へ倒す——歩いて何も無ければ
+/// 費用を払うだけだが、歩かずに残せば**撤収経路の無いACEが残る**（B-01）。
+fn descendants_need_walk(root: &Path, sids: &[PSID]) -> bool {
+    for &sid in sids {
+        match sid_explicit_ace(root, sid) {
+            Ok(Some(ace)) if ace.is_inheritable() => return true,
+            Ok(Some(_)) => {}
+            // 明示ACEが無い／読めない。**歩く側へ倒す**（上のdoc参照）。
+            Ok(None) | Err(_) => return true,
+        }
+    }
+    false
 }
 
 /// [`revoke_ace_recursive`]の複数SID版。**1回のツリー走査で`sids`の全部を剥がす。**
@@ -773,7 +953,9 @@ pub fn revoke_sids_recursive(
         // `RevokeReport::checked == 0`で見分けられる（0件と成功を同じ値にしない、B-09）。
         return Ok(RevokeReport::default());
     }
-    revoke_tree(root, progress, &|path| {
+    // [D-63] 歩くかどうかは**実DACLの継承フラグ**が決める（[`descendants_need_walk`]）。
+    let walk = descendants_need_walk(root, sids);
+    revoke_tree(root, walk, progress, &|path| {
         revoke_sids_from_node_guarded(path, sids)
     })
 }
@@ -785,8 +967,14 @@ pub fn revoke_sids_recursive(
 /// 片方にだけ入っている状態が再び生まれる）。
 ///
 /// `revoke_node`は「実際に剥がして書き戻したか」を返す。
+///
+/// [D-63] `walk_descendants`が偽なら**rootの1件だけ**を処理して返す（判定は
+/// [`descendants_need_walk`]が持つ）。オブジェクト単体で付与したノードには継承ACEが無く、
+/// 配下にコピーが降りている理由が存在しないためである。**この引数は呼び出し側が必ず渡す**
+/// ——既定値を置くと、片方の入口だけが実DACLを見ない形が生まれる。
 fn revoke_tree(
     root: &Path,
+    walk_descendants: bool,
     progress: &dyn Fn(usize, usize),
     revoke_node: &dyn Fn(&Path) -> Result<bool, AppContainerError>,
 ) -> Result<RevokeReport, AppContainerError> {
@@ -802,6 +990,12 @@ fn revoke_tree(
     report.checked += 1;
     if revoke_node(root)? {
         report.rewritten += 1;
+    }
+
+    // [D-63] 継承していないACEを剥がしたのなら、配下に降りたコピーは存在しない。
+    if !walk_descendants {
+        progress(1, 1);
+        return Ok(report);
     }
 
     let mut dirs = Vec::new();
@@ -961,51 +1155,7 @@ pub struct RevokeWorkspaceReport {
 /// 付与側のフォールバック判定がこちらを使っていたため、継承ACEが見えず全ノードへ明示ACEを
 /// 書いていた）。
 pub(crate) fn sid_ace_mask(path: &Path, sid: PSID) -> Result<Option<u32>, AppContainerError> {
-    let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
-        path: path.to_path_buf(),
-        reason: e.to_string(),
-    };
-    unsafe {
-        let path_w = long_path_wide(path);
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        GetNamedSecurityInfoW(
-            PCWSTR(path_w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut dacl),
-            None,
-            &mut sd,
-        )
-        .ok()
-        .map_err(to_err)?;
-
-        let mut count: u32 = 0;
-        let mut entries: *mut EXPLICIT_ACCESS_W = std::ptr::null_mut();
-        let err = GetExplicitEntriesFromAclW(dacl as *const _, &mut count, &mut entries);
-        if let Err(e) = err.ok() {
-            let _ = LocalFree(HLOCAL(sd.0));
-            return Err(to_err(e));
-        }
-
-        let mut mask: Option<u32> = None;
-        if !entries.is_null() {
-            let slice = std::slice::from_raw_parts(entries, count as usize);
-            for entry in slice {
-                if entry.Trustee.TrusteeForm == TRUSTEE_IS_SID {
-                    let entry_sid = PSID(entry.Trustee.ptstrName.0 as *mut c_void);
-                    if EqualSid(entry_sid, sid).is_ok() {
-                        mask = Some(mask.unwrap_or(0) | entry.grfAccessPermissions);
-                    }
-                }
-            }
-            let _ = LocalFree(HLOCAL(entries as *mut _));
-        }
-        let _ = LocalFree(HLOCAL(sd.0));
-        Ok(mask)
-    }
+    Ok(sid_explicit_ace(path, sid)?.map(|ace| ace.mask))
 }
 
 /// `path`で`sid`に**実効的に**届いている許可アクセスマスク（明示ACE＋継承ACEの論理和）。

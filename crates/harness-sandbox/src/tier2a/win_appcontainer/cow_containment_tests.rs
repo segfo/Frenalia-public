@@ -316,6 +316,7 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
         path: external.clone(),
         access: FsAccess::ReadWrite,
         forced: false,
+        scope: GrantScope::Recursive,
     }];
     let outcome = preflight(workspace.path(), &passthrough, None, &write_mode)
         .expect("preflight (cow + fs-allow rw)");

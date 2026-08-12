@@ -227,10 +227,23 @@ pub(super) fn stage_prepare_sandbox(
         settings.fs.clone().unwrap_or_default().to_fs_passthrough();
     // このワークスペースが現在`.harness/settings.json`経由で宣言しているfs passthroughパスの
     // 絶対パス集合（D-27）。`--fs-allow`由来のパスは含めない（対象は設定ファイル経由の宣言のみ）。
-    // `fs_passthrough`と同じ`workspace_root.join`で絶対化し、台帳に記録される文字列表現と一致させる。
+    //
+    // [D-63] **台帳に載るのと同じ「付与ルート」で集める。** 台帳が記録するのはACEを実際に付けた
+    // オブジェクト（`C:/x/**`なら`C:/x`）なので、宣言文字列のまま集めると`**`付きの宣言が
+    // 台帳のどのエントリとも一致しない。一致しないと、D-27の自動整合が「もう誰も宣言していない」と
+    // 判定して**毎起動で自動撤収**し、次の起動で付け直す往復になる。
+    //
+    // 受け付けない綴り（下の`retain`が弾く中間ワイルドカード）は**ここでも数えない**——
+    // 付与しないパスを「このワークスペースが宣言している」と数えると、他の経路が付けた
+    // 同名の台帳エントリを自動撤収から守ってしまう（参照カウントは付与と対でなければ嘘になる）。
     let settings_fs_paths: std::collections::HashSet<String> = settings_fs_entries
         .iter()
-        .map(|(path, _)| workspace_root.join(path).to_string_lossy().into_owned())
+        .filter(|(path, _)| !harness_policy::normalize::has_unsupported_wildcard(path))
+        .map(|(path, _)| {
+            grant_root_of(&workspace_root, path)
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     let mut fs_allow_raw: Vec<(String, harness_config::FsAccess)> = settings_fs_entries;
     for entry in &cli.fs_allow {
@@ -259,19 +272,48 @@ pub(super) fn stage_prepare_sandbox(
         );
         return Err(ExitCode::FAILURE);
     }
+    // [D-63] **`<path>/**`以外のワイルドカードは受け付けない。** 確定部分が`C:/x`まで戻るため、
+    // 再帰にすれば宣言よりはるかに広く、オブジェクト単体にすれば何も開かない——どちらも宣言と
+    // 一致しない（D-62で`--generalize=auto`を廃した理由そのもの）。**黙って落とさず名指しで
+    // 出す**（B-10）: 設定に書いたものが効いていないことに気付けないと、拒否の原因を別の場所に
+    // 探し続けることになる。起動自体は止めない（既存の「存在しないパスはスキップ」と同じ扱い）。
+    fs_allow_raw.retain(|(path, _)| {
+        if !harness_policy::normalize::has_unsupported_wildcard(path) {
+            return true;
+        }
+        eprintln!(
+            "warning: fs allow entry {path:?} is ignored: only a trailing `/**` is supported as a \
+             wildcard. Write `{}/**` to open the whole subtree, or name the paths you actually \
+             need. (A wildcard in the middle would grant ACEs on `{}` -- everything under it.)",
+            harness_policy::normalize::literal_prefix(path),
+            harness_policy::normalize::literal_prefix(path)
+        );
+        false
+    });
     // **同じパスへの宣言は1本のACEへ畳む（和を取る）。** 1つのオブジェクトのDACLへ同じSID宛の
     // ACEを2本持つことはできないので、ここで畳まないと後段のどちらかの付与が上書きになる。
     // 合成の規則は`harness_sandbox::FsAccess::wider`が唯一の定義を持つ（B-05）。
     let mut fs_passthrough: Vec<harness_sandbox::FsPassthrough> = Vec::new();
     for (path, access) in fs_allow_raw {
-        let path = workspace_root.join(&path);
+        // [D-63] 宣言値から**付与ルートと範囲の両方**を決める。判定は
+        // `harness_policy::normalize`が唯一持つ（`literal_prefix`と`declared_scope`の対）。
+        let scope = harness_policy::normalize::declared_scope(&path);
+        let root = grant_root_of(&workspace_root, &path);
         let access = harness_sandbox::FsAccess::from_settings(access);
-        match fs_passthrough.iter_mut().find(|fp| fp.path == path) {
-            Some(existing) => existing.access = existing.access.wider(access),
+        match fs_passthrough.iter_mut().find(|fp| fp.path == root) {
+            Some(existing) => {
+                existing.access = existing.access.wider(access);
+                // **同じルートに素の宣言と`**`宣言が同居したら再帰を採る。** 1つのオブジェクトの
+                // DACLへ同じSID宛のACEを2本置けないので、accessを和で畳むのと同じ理屈になる。
+                if scope.is_recursive() {
+                    existing.scope = scope;
+                }
+            }
             None => fs_passthrough.push(harness_sandbox::FsPassthrough {
-                path,
+                path: root,
                 access,
                 forced: cli.force_system_acl,
+                scope,
             }),
         }
     }
@@ -417,6 +459,17 @@ pub(super) fn stage_prepare_sandbox(
         mcp_decls,
         mcp_gates,
     })
+}
+
+/// [D-63] 宣言値から**ACEを実際に付けるオブジェクト**を求め、workspace基準で絶対化する。
+///
+/// 切る位置は`harness_policy::normalize::literal_prefix`が唯一の定義を持つ（ポリシーエディタの
+/// `approve::grant_root`・幅の判定`breadth::check`と同じ関数）。ここで別に切ると、**判定した値と
+/// 付与する値が食い違う**（B-05）。
+///
+/// 既に絶対パスなら`Path::join`はそれをそのまま採る（従来どおり）。
+fn grant_root_of(workspace_root: &Path, declared: &str) -> PathBuf {
+    workspace_root.join(harness_policy::normalize::literal_prefix(declared))
 }
 
 /// Streamable HTTPのセッションゲート（D-49）を、ユーザ層設定とCLIフラグから組み立てる。

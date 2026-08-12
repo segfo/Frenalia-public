@@ -338,6 +338,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         path: external.clone(),
         access: FsAccess::ReadExec,
         forced: false,
+        scope: GrantScope::Recursive,
     };
     // D-54: このテストはworkspaceへpackage SID宛のACEを直接付けているので、workspace
     // capability（本番`preflight`が使う主体）は不要。`None`で本番と同じ経路を通す。
@@ -356,6 +357,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         path: external.clone(),
         access: FsAccess::ReadWrite,
         forced: false,
+        scope: GrantScope::Recursive,
     };
     let write_should_fail = probe_passthrough(
         sid.as_psid(),
@@ -375,6 +377,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         path: external.clone(),
         access: FsAccess::ReadWrite,
         forced: false,
+        scope: GrantScope::Recursive,
     };
     let rw_diagnosis = probe_passthrough(
         sid.as_psid(),
@@ -2109,12 +2112,15 @@ fn the_descendant_fallback_does_not_flood_the_registry() {
 /// （判定規則2）。上の「名前を失ったSID」（規則4）とは別の経路で、こちらは名前が残っている。
 ///
 /// **生きているセッションを触らないこと（規則1）の実機確認はここではやらない。**
-/// それには`begin_session()`でこのテストプロセス自身をセッションとして登録する必要があるが、
-/// **登録はプロセス寿命の生存マーカーと台帳エントリを作るので、`cargo test`のたびに
-/// AppContainerプロファイルと台帳エントリが1件ずつ実マシンへ残る**（最初に書いた版が実際に
-/// 4件残した。BUG-101が問題にしているまさにその滞留を、テストが自分で作っていた）。
 /// 規則1は純粋関数側の`a_live_harness_session_is_not_revocable_and_holds_the_ledger_entry`が
 /// 固定している。
+///
+/// [2026-08-12訂正] ここには以前「`begin_session()`を呼ぶと`cargo test`のたびに台帳エントリと
+/// プロファイルが残るから呼ばない」と書いてあった。**その回避は逆効果だった**——記録だけを
+/// 避けてもプロファイル（OSの資源）は`session_sid()`が作り続けるので、出来上がるのは
+/// 「台帳に無い実在プロファイル」＝`grants_known: false`で**永久に回収されない**形である
+/// （実機に66件たまっていた）。記録がある方が回収される。順序はB-01どおり「記録してから作る」で、
+/// `session_sid()`が`begin_session()`を先に呼ぶよう直してある。
 #[test]
 fn a_registered_harness_profile_that_is_not_running_is_revoked() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -2139,4 +2145,453 @@ fn a_registered_harness_profile_that_is_not_running_is_revoked() {
         "the ACE must actually be gone"
     );
     // `ProbeProfile`の`Drop`がプロファイルを消す（テストが実マシンへ残さない）。
+}
+
+// ---------------------------------------------------------------------------
+// [D-63] 付与スコープ（宣言値の書き方が範囲を決める）
+// ---------------------------------------------------------------------------
+
+/// **オブジェクト単体の付与は配下へ届かない。**
+///
+/// D-63の中身そのものである。素のパスの宣言（`C:/x`）で`grant_ace_scoped`を呼んだとき、
+/// ACEが載るのはそのディレクトリだけで、**中のファイルにも、後から作られるファイルにも
+/// 効いてはいけない**。ここが効いていなければ、候補を畳むのをやめても（D-62）
+/// 「観測された1件を承認したらサブツリー全体が開く」ままである。
+///
+/// 到達の判定は`sid_effective_ace_mask`を使う——**継承経由も数える**関数でなければ
+/// 「届いていない」を示したことにならない（`sid_ace_mask`は明示ACEしか見ないので、
+/// 継承で届いていても`None`を返してテストが通ってしまう。BUG-081と同じ罠）。
+///
+/// `grant_ace_inheritable_access_on_a_file_succeeds_and_leaves_the_ace`と同じ理由で
+/// `#[ignore]`にしない: 付与先は`traverse_capability_sid`（純粋な導出、プロファイルを作らない）、
+/// 対象はテストが自分で作った一時ディレクトリで、マシンには何も残らない。
+#[test]
+fn an_object_scoped_grant_covers_the_directory_itself_but_not_its_children() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("declared");
+    std::fs::create_dir(&root).expect("create declared dir");
+    let existing = root.join("existing.txt");
+    std::fs::write(&existing, b"already here").expect("seed a child file");
+    let subdir = root.join("sub");
+    std::fs::create_dir(&subdir).expect("create a child dir");
+
+    let sid = traverse_capability_sid().expect("derive traverse capability SID");
+    grant_ace_scoped(&root, sid.as_psid(), FsAccess::ReadExec, GrantScope::Object)
+        .expect("object-scoped grant");
+
+    // 1. ルート自身には載っている。
+    let ace = sid_explicit_ace(&root, sid.as_psid())
+        .expect("read back the root ACE")
+        .expect("the declared directory itself must carry the ACE");
+    let required = fs_access_mask(FsAccess::ReadExec);
+    assert_eq!(ace.mask & required, required, "mask={:#x}", ace.mask);
+
+    // 2. **継承フラグが立っていない**（＝今後作られるファイルにも降りない）。
+    assert!(
+        !ace.is_inheritable(),
+        "an object-scoped grant must not be inheritable: inherit={:#x}",
+        ace.inherit
+    );
+
+    // 3. 既存の子には**実効的にも**届いていない。
+    for child in [&existing, &subdir] {
+        let reached = sid_effective_ace_mask(child, sid.as_psid()).expect("probe the child");
+        assert!(
+            reached.is_none(),
+            "{} must not be reachable through an object-scoped grant: {reached:?}",
+            child.display()
+        );
+    }
+
+    // 4. 付与**後**に作られたファイルにも届かない（継承ACEなら降りてくる位置）。
+    let created_later = root.join("created-later.txt");
+    std::fs::write(&created_later, b"after the grant").expect("create a file after the grant");
+    let reached = sid_effective_ace_mask(&created_later, sid.as_psid()).expect("probe");
+    assert!(
+        reached.is_none(),
+        "a file created after an object-scoped grant must not inherit it: {reached:?}"
+    );
+}
+
+/// 対の許可側（B-35）: **`<path>/**`の宣言では配下に届く。**
+///
+/// 禁止側（上のテスト）だけだと、`grant_ace_scoped`が全スコープで「何も付けない」に退化しても
+/// 緑のままになる。再帰側が従来どおり効くことを同じ形で押さえる。
+#[test]
+fn a_recursive_grant_still_reaches_children_and_files_created_later() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("declared");
+    std::fs::create_dir(&root).expect("create declared dir");
+    let existing = root.join("existing.txt");
+    std::fs::write(&existing, b"already here").expect("seed a child file");
+
+    let sid = traverse_capability_sid().expect("derive traverse capability SID");
+    grant_ace_scoped(
+        &root,
+        sid.as_psid(),
+        FsAccess::ReadExec,
+        GrantScope::Recursive,
+    )
+    .expect("recursive grant");
+
+    let ace = sid_explicit_ace(&root, sid.as_psid())
+        .expect("read back")
+        .expect("root must carry the ACE");
+    assert!(ace.is_inheritable(), "inherit={:#x}", ace.inherit);
+
+    let required = fs_access_mask(FsAccess::ReadExec);
+    let reached = sid_effective_ace_mask(&existing, sid.as_psid())
+        .expect("probe the child")
+        .expect("an existing child must be reachable through a recursive grant");
+    assert_eq!(reached & required, required, "mask={reached:#x}");
+
+    let created_later = root.join("created-later.txt");
+    std::fs::write(&created_later, b"after the grant").expect("create a file after the grant");
+    let reached = sid_effective_ace_mask(&created_later, sid.as_psid())
+        .expect("probe")
+        .expect("a file created later must inherit a recursive grant");
+    assert_eq!(reached & required, required, "mask={reached:#x}");
+}
+
+/// **冪等スキップは継承フラグを見る。**
+///
+/// 同じパスへ先に素の宣言（非継承）が付いている状態で`<path>/**`を要求したとき、マスクだけを
+/// 比べていると「もう十分」と判定して**再帰要求が黙って非継承のまま通る**（B-10）。
+/// ポリシーエディタのパス2は1プロセスで複数ドメインを回すので、この順序は実際に起こり得る。
+///
+/// ここでは`grant_ace_mask_with_checked`の内部ではなく**外から見える結果**で判定する
+/// ——スキップしたかどうかではなく、「要求どおりの範囲になったか」が知りたい事実である。
+#[test]
+fn a_recursive_request_is_not_skipped_by_an_existing_object_scoped_ace() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("declared");
+    std::fs::create_dir(&root).expect("create declared dir");
+    let child = root.join("child.txt");
+    std::fs::write(&child, b"child").expect("seed a child file");
+
+    let sid = traverse_capability_sid().expect("derive traverse capability SID");
+    // 先に素の宣言（オブジェクト単体・同じアクセス種別＝マスクは既に足りている）。
+    grant_ace_scoped(&root, sid.as_psid(), FsAccess::ReadExec, GrantScope::Object)
+        .expect("object-scoped grant");
+    assert!(
+        sid_effective_ace_mask(&child, sid.as_psid())
+            .expect("probe")
+            .is_none(),
+        "premise: the child is not reachable yet"
+    );
+
+    // 後から`<path>/**`。マスクは同じなので、継承フラグを見なければ丸ごとスキップされる。
+    grant_ace_scoped(
+        &root,
+        sid.as_psid(),
+        FsAccess::ReadExec,
+        GrantScope::Recursive,
+    )
+    .expect("recursive grant on top of an object-scoped one");
+
+    let ace = sid_explicit_ace(&root, sid.as_psid())
+        .expect("read back")
+        .expect("root must carry the ACE");
+    assert!(
+        ace.is_inheritable(),
+        "the recursive request must actually add inheritance: inherit={:#x}",
+        ace.inherit
+    );
+    let required = fs_access_mask(FsAccess::ReadExec);
+    let reached = sid_effective_ace_mask(&child, sid.as_psid())
+        .expect("probe the child")
+        .expect("the child must be reachable after the recursive grant");
+    assert_eq!(reached & required, required, "mask={reached:#x}");
+}
+
+/// [D-63] **撤収の範囲は実DACLの継承フラグが決める（台帳ではない）。**
+///
+/// - オブジェクト単体で付けたACEは、rootの1件を剥がせば終わり（配下にコピーは無い）
+/// - 継承ありで付けたACEは、従来どおり配下まで歩いて剥がす
+///
+/// 判定を台帳の`scope`から採らないのは、台帳が[BUG-103](../../../../docs/bugs/BUG-103.md)(d)で
+/// **サンドボックスから書ける**ためである（`scope: Object`と書き換えるだけで再帰ACEを
+/// 撤収の対象外にできてしまう）。ここでは台帳を一切使わずに正しい範囲が出ることを固定する。
+///
+/// `checked`（walkが見たノード数）で範囲を測る——「剥がせたか」だけを見ると、
+/// **歩かなかったこと**と**歩いて何も無かったこと**が区別できない（B-09）。
+#[test]
+fn revoke_walks_the_tree_only_when_the_root_ace_is_inheritable() {
+    let sid = traverse_capability_sid().expect("derive traverse capability SID");
+
+    // --- オブジェクト単体で付けた場合: rootだけ見る ---
+    let object_dir = tempfile::tempdir().expect("temp dir");
+    let object_root = object_dir.path().join("declared");
+    std::fs::create_dir(&object_root).expect("create dir");
+    for i in 0..3 {
+        std::fs::write(object_root.join(format!("child{i}.txt")), b"x").expect("seed children");
+    }
+    grant_ace_scoped(
+        &object_root,
+        sid.as_psid(),
+        FsAccess::ReadExec,
+        GrantScope::Object,
+    )
+    .expect("object-scoped grant");
+
+    let report = revoke_ace_recursive(&object_root, sid.as_psid()).expect("revoke");
+    assert_eq!(
+        report.checked, 1,
+        "a non-inheritable ACE cannot have propagated, so only the root needs visiting"
+    );
+    assert_eq!(report.rewritten, 1, "the root ACE must actually come off");
+    assert!(
+        sid_ace_mask(&object_root, sid.as_psid())
+            .expect("read back")
+            .is_none(),
+        "the root must carry no ACE for the SID afterwards"
+    );
+
+    // --- 継承ありで付けた場合: 従来どおり配下まで歩く ---
+    let tree_dir = tempfile::tempdir().expect("temp dir");
+    let tree_root = tree_dir.path().join("declared");
+    std::fs::create_dir(&tree_root).expect("create dir");
+    for i in 0..3 {
+        std::fs::write(tree_root.join(format!("child{i}.txt")), b"x").expect("seed children");
+    }
+    grant_ace_scoped(
+        &tree_root,
+        sid.as_psid(),
+        FsAccess::ReadExec,
+        GrantScope::Recursive,
+    )
+    .expect("recursive grant");
+
+    let report = revoke_ace_recursive(&tree_root, sid.as_psid()).expect("revoke");
+    assert!(
+        report.checked >= 4,
+        "an inheritable ACE propagates, so the walk must visit the children too: {report:?}"
+    );
+    // 実効的にも残っていないこと（明示ACEだけを見ると継承コピーを見落とす、BUG-081の罠）。
+    for i in 0..3 {
+        let child = tree_root.join(format!("child{i}.txt"));
+        assert!(
+            sid_effective_ace_mask(&child, sid.as_psid())
+                .expect("probe")
+                .is_none(),
+            "{} still reachable after revoke",
+            child.display()
+        );
+    }
+}
+
+/// [D-63] **本番の`preflight`を通したスコープ別付与の実機E2E**（段階11の使い捨てツリー分）。
+///
+/// 単体テストは`grant_ace_scoped`を直接呼ぶので、次の3つが未検証のまま残る——
+/// この1本がそこだけを狙う。
+///
+/// 1. `preflight`経由でスコープが本当に届くか（宣言→`FsPassthrough::scope`→付与の配線）
+/// 2. **D8プローブの`rw1`モードが実AppContainerの中で通るか**。オブジェクト単体で許可した
+///    書込可ディレクトリを従来の`rw`（配下に作った一時ファイルを**開き直す**）で測ると、
+///    正しく動いている構成が「到達不能」と報告される。`DeleteOnClose`の単一ハンドルで
+///    完結させる形が机上でなく実機で通ることを、ここで初めて確かめる
+/// 3. プローブが**一時ファイルを残さない**こと（`rw`経路はオブジェクト単体だと`Remove-Item`が
+///    拒否されるので、消えない`.harness-probe.tmp`が残る。それが起きていないことを名指しで見る）
+///
+/// 対象は`C:\`直下の使い捨てツリー2本（`TestDirGuard`）。**実アプリのインストール先には触らない**
+/// （`plans/PLAN-POLICY-EDITOR-GRANT-SCOPE.md`「実機E2Eの前に」）。親が`C:\`なので、
+/// 既にtraverse台帳にある`C:\`のACEで足り、**新しい昇格は要らない**。
+#[test]
+#[ignore]
+fn preflight_grants_each_declaration_in_its_declared_scope() {
+    let sid = session_sid();
+
+    let workspace_guard = TestDirGuard::create("d63-ws");
+    let workspace = workspace_guard.path().to_path_buf();
+
+    // オブジェクト単体で許可するディレクトリ（書込可＝`rw1`プローブが走る）。
+    let object_guard = TestDirGuard::create("d63-object");
+    let object_root = object_guard.path().to_path_buf();
+    std::fs::write(object_root.join("child.txt"), "inside").expect("seed the object dir");
+
+    // 再帰で許可するディレクトリ（従来の`rw`プローブ）。
+    let tree_guard = TestDirGuard::create("d63-tree");
+    let tree_root = tree_guard.path().to_path_buf();
+    std::fs::write(tree_root.join("child.txt"), "inside").expect("seed the tree dir");
+
+    let passthrough = [
+        FsPassthrough {
+            path: object_root.clone(),
+            access: FsAccess::ReadWrite,
+            forced: false,
+            scope: GrantScope::Object,
+        },
+        FsPassthrough {
+            path: tree_root.clone(),
+            access: FsAccess::ReadWrite,
+            forced: false,
+            scope: GrantScope::Recursive,
+        },
+    ];
+
+    let outcome = match preflight(
+        &workspace,
+        &passthrough,
+        None,
+        &WorkspaceWriteMode::DirectRw,
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!(
+                "skipping preflight_grants_each_declaration_in_its_declared_scope: Tier2a \
+                 preflight is not available on this machine ({e:?}); run \
+                 `harness fs grant-traverse C:\\` as administrator first (D10)"
+            );
+            return;
+        }
+    };
+
+    // --- 1. 両方とも「付与できた」と報告される ---
+    let granted: Vec<_> = outcome
+        .granted_passthrough
+        .iter()
+        .map(|(p, _)| p.clone())
+        .collect();
+    assert!(
+        granted.contains(&object_root) && granted.contains(&tree_root),
+        "both declarations must be granted: {granted:?}"
+    );
+
+    // --- 2. D8プローブが両方とも到達可と判定する（`rw1`の実機確認） ---
+    //
+    // **まず「測れたこと」を確かめる。** `denied_passthrough`が空になるのは
+    // (a)全件が到達可だったとき と (b)プローブを起こせずそもそも測らなかったとき の**両方**で、
+    // 後者は`BatchProbeOutcome::NotRun`＝警告1行にしかならない。ここを見ずに空だけを見ると、
+    // このテストの主目的（`rw1`が実コンテナ内で通るか）が**測られないまま緑になる**。
+    for warning in &outcome.warnings {
+        println!("preflight warning: {warning}");
+    }
+    assert!(
+        !outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("could not verify reachability")),
+        "the D8 probe must actually have run for this test to mean anything: {:?}",
+        outcome.warnings
+    );
+    assert!(
+        outcome.denied_passthrough.is_empty(),
+        "both roots must be reachable from inside the container. An object-scoped writable \
+         directory measured with the old `rw` mode fails here (the probe reopens the temp file \
+         it created, which a non-inheritable ACE does not cover): {:?}",
+        outcome.denied_passthrough
+    );
+
+    // --- 3. プローブが後始末をしている（消えない一時ファイルを残さない） ---
+    for root in [&object_root, &tree_root] {
+        let leftovers: Vec<_> = std::fs::read_dir(root)
+            .expect("read back the granted root")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|name| name.ends_with(".harness-probe.tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "{} still holds probe temp files: {leftovers:?}",
+            root.display()
+        );
+    }
+
+    // --- 4. 実DACLが宣言どおりの形になっている ---
+    let object_ace = sid_explicit_ace(&object_root, sid.as_psid())
+        .expect("read back the object-scoped ACE")
+        .expect("the object-scoped root must carry an ACE");
+    assert!(
+        !object_ace.is_inheritable(),
+        "a plain declaration must not produce an inheritable ACE: inherit={:#x}",
+        object_ace.inherit
+    );
+    assert!(
+        sid_effective_ace_mask(&object_root.join("child.txt"), sid.as_psid())
+            .expect("probe the child")
+            .is_none(),
+        "a plain declaration must not reach the files inside the directory"
+    );
+
+    let tree_ace = sid_explicit_ace(&tree_root, sid.as_psid())
+        .expect("read back the recursive ACE")
+        .expect("the recursive root must carry an ACE");
+    assert!(
+        tree_ace.is_inheritable(),
+        "a `/**` declaration must produce an inheritable ACE: inherit={:#x}",
+        tree_ace.inherit
+    );
+    assert!(
+        sid_effective_ace_mask(&tree_root.join("child.txt"), sid.as_psid())
+            .expect("probe the child")
+            .is_some(),
+        "a `/**` declaration must reach the files inside the directory"
+    );
+
+    // --- 4b. 対照群: **同じディレクトリ・同じACEを従来の`rw`モードで測ると失敗する** ---
+    //
+    // ここまでの「`rw1`で到達可だった」だけでは、プローブが何かを測った証拠として弱い
+    // （常に成功を返す実装でも同じ結果になる）。モードだけを変えて**結果が反転する**ことを
+    // 見て初めて、`rw1`が効いていると言える。同時にこれは、この修正が無ければ
+    // 正常な構成が「到達不能」と報告されていたことの実測でもある。
+    //
+    // `probe_passthrough`はworkspaceをcwdにして子を起こすので、既存E2Eと同じく
+    // workspaceへセッションSID宛のACEを直接付けてから呼ぶ（`preflight`が付けるのは
+    // workspace capability宛で、そちらは`None`では渡せない）。
+    let traverse_sid = traverse_capability_sid().expect("traverse capability SID");
+    grant_ace_recursive(&workspace, sid.as_psid()).expect("grant workspace to the session SID");
+    let old_mode_probe = FsPassthrough {
+        path: object_root.clone(),
+        access: FsAccess::ReadWrite,
+        forced: false,
+        // `Recursive`にすると`batch_probe_stdin`が従来の`rw`モードを選ぶ（配下に作った
+        // 一時ファイルを**開き直す**）。ACEはオブジェクト単体のままなので開き直せない。
+        scope: GrantScope::Recursive,
+    };
+    let old_mode_diagnosis = probe_passthrough(
+        sid.as_psid(),
+        traverse_sid.as_psid(),
+        None,
+        &workspace,
+        &old_mode_probe,
+    );
+    assert!(
+        old_mode_diagnosis.is_some(),
+        "the old `rw` probe mode must fail on an object-scoped directory -- if this passes, the \
+         control group is not measuring anything and the rw1 result above means nothing"
+    );
+    println!("control group (old rw mode) failed as expected: {old_mode_diagnosis:?}");
+    // 従来モードは**後始末もできない**（`Remove-Item`が拒否される）。D-63でモードを分けた
+    // 実務上の理由がこれで、消えない一時ファイルが宣言先に積もる。
+    let stranded: Vec<_> = std::fs::read_dir(&object_root)
+        .expect("read back the object root")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|name| name.ends_with(".harness-probe.tmp"))
+        .collect();
+    assert!(
+        !stranded.is_empty(),
+        "the old mode should have stranded its temp file here (that is the defect rw1 avoids); \
+         if this is empty the control group did not reach the create step"
+    );
+    for name in &stranded {
+        std::fs::remove_file(object_root.join(name)).expect("clean up the stranded probe file");
+    }
+
+    // --- 5. 撤収の範囲も実DACLに従う（歩く／歩かないの対） ---
+    let object_report = revoke_ace_recursive(&object_root, sid.as_psid()).expect("revoke object");
+    assert_eq!(
+        object_report.checked, 1,
+        "a non-inheritable ACE cannot have propagated, so revoke must not walk: {object_report:?}"
+    );
+    let tree_report = revoke_ace_recursive(&tree_root, sid.as_psid()).expect("revoke tree");
+    assert!(
+        tree_report.checked >= 2,
+        "an inheritable ACE propagates, so revoke must walk the children: {tree_report:?}"
+    );
+    for root in [&object_root, &tree_root] {
+        assert!(
+            assert_no_sid_ace_recursive(root, sid.as_psid()).is_ok(),
+            "{} must carry no session ACE after revoke",
+            root.display()
+        );
+    }
 }

@@ -11,6 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use harness_core::{RequireSandbox, ShellTier, ShellTierSelection};
+// [D-63] 付与範囲の語彙は`harness-policy`が持つ（宣言を読む側と付ける側で1つにする、B-05）。
+pub use harness_policy::normalize::{declared_scope, GrantScope};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TierError {
@@ -195,12 +197,19 @@ const _: () = {
 /// 役割分担が異なる: FSアクセス制御は実FSのACLで完結するため`ToolCtx`を経由しない）。
 #[derive(Debug, Clone)]
 pub struct FsPassthrough {
+    /// **ACEを付ける対象そのもの**（ワイルドカードは含まない）。宣言値が`C:/x/**`なら`C:/x`。
+    /// 変換は`harness_policy::normalize::literal_prefix`が唯一の定義を持つ（D-63）。
     pub path: PathBuf,
     pub access: FsAccess,
     /// `--force-system-acl`（D-19）: `NT SERVICE\TrustedInstaller`所有等で`WRITE_DAC`不可の
     /// システム保護パスへ、特権分離ヘルパーが`SeRestorePrivilege`を有効化して強制付与する。
     /// 既定false。`is_force_grant_forbidden`のゲートを通過したもののみ実際に強制付与される。
     pub forced: bool,
+    /// [D-63] どこまで開くか。**宣言値の書き方**が決める（`declared_scope`）。
+    ///
+    /// `path`と対で初めて付与が定まる——`path`が「どのオブジェクトへ」、これが「そのオブジェクト
+    /// だけか、配下もか」。ここを付与層で推測してはいけない（宣言と付与が食い違う、B-05）。
+    pub scope: GrantScope,
 }
 
 /// Tier2aがworkspaceへ付与するACLの種別（D-30、`plans/DESIGN-SANDBOX.md` §7）。
@@ -882,6 +891,7 @@ mod tests {
             path: PathBuf::from("C:\\dummy"),
             access: FsAccess::ReadExec,
             forced: false,
+            scope: GrantScope::Recursive,
         }];
         let selection = select_tier_with_probes(
             RequireSandbox::None,

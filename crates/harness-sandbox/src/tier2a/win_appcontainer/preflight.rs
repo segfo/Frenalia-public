@@ -548,14 +548,45 @@ pub fn preflight_with_privhelper_launcher(
             path: requested.path.clone(),
             access: effective_access,
             forced: requested.forced,
+            // [D-63] スコープは`--cow`でも変えない。上でRO化しているのは**アクセス種別**であって
+            // 範囲ではない（範囲を狭めると、宣言した配下がRedirector DLL経由でも読めなくなる）。
+            scope: requested.scope,
         };
         let fp = &fp;
         let requested_rw = requested.access.is_read_write();
 
-        // 事前チェック（決定1）: 既にsid宛のACEが要求マスクの上位集合を持っていれば、
-        // 本体内のwalkもprivhelperのUACも一切スキップする（ユーザ所有パスの再実行はUAC無し）。
+        // 事前チェック（決定1）: 既にsid宛のACEが要求を満たしていれば、本体内のwalkも
+        // privhelperのUACも一切スキップする（ユーザ所有パスの再実行はUAC無し）。
+        //
+        // [D-63] **満たしているかの判定にマスクと継承フラグの両方を使う**
+        // （`ExplicitAce::satisfies`）。マスクだけを見ていると、同じパスへ素の宣言（非継承）と
+        // `**`宣言（継承）が来たとき、先に付いた非継承ACEで足りていると判定して**再帰要求が
+        // 黙って非継承のまま通る**（B-10）。1プロセスが複数ドメインを回すポリシーエディタの
+        // パス2では、これは実際に起こり得る組み合わせである。
         let required = required_passthrough_mask(fp.access);
-        let already_sufficient = matches!(sid_ace_mask(&fp.path, sid.as_psid()), Ok(Some(existing)) if existing & required == required);
+        let required_inherit = required_inherit_flags(fp.scope);
+        let existing_ace = sid_explicit_ace(&fp.path, sid.as_psid()).ok().flatten();
+        let already_sufficient =
+            matches!(existing_ace, Some(ace) if ace.satisfies(required, required_inherit));
+        // [D-63] 宣言はオブジェクト単体なのに、実DACLには継承ACEが載っている
+        // （前のセッションが`**`で開いた・ユーザーが手で付けた）。**狭めはしない**——
+        // 継承元を書き換えても既に配下へ降りたコピーは消えず、片手落ちの変更になる。
+        // ただし「宣言より広い状態が現に在る」ことは黙らせない（B-09）。
+        if already_sufficient && !fp.scope.is_recursive() {
+            if let Some(ace) = existing_ace {
+                if ace.is_inheritable() {
+                    warnings.push(format!(
+                        "fs-allow {} : declared as a single object, but an inheritable ACE for this \
+                         session's SID is already on it, so the whole subtree stays open. harness \
+                         does not narrow it here (removing the inheritable ACE would not remove the \
+                         copies already propagated to descendants). Run `harness fs revoke {}` if \
+                         you want it closed.",
+                        fp.path.display(),
+                        fp.path.display()
+                    ));
+                }
+            }
+        }
         if already_sufficient {
             // **Win32を1回も呼んでいない**ことを数える。ここが2回目以降で総数に一致する
             // ことが「差分適用になっている」の証拠になる（`passthrough_progress`のdoc）。
@@ -571,7 +602,10 @@ pub fn preflight_with_privhelper_launcher(
             continue;
         }
 
-        let grant_result = grant_ace_inheritable_access(&fp.path, sid.as_psid(), fp.access);
+        // [D-63] **宣言された範囲でだけ開く。** 素のパスはそのオブジェクト1つ、`<path>/**`は
+        // 継承ACE。ここを`grant_ace_inheritable_access`固定にしていたのが、D-62で候補を畳むのを
+        // やめた後も「観測された2件を承認したらサブツリー全体が開く」状態が残っていた理由である。
+        let grant_result = grant_ace_scoped(&fp.path, sid.as_psid(), fp.access, fp.scope);
         match grant_result {
             Ok(()) => {
                 // 実際にACEを書いた1件。
@@ -604,6 +638,8 @@ pub fn preflight_with_privhelper_launcher(
                     path: fp.path.clone(),
                     access: fp.access,
                     forced: fp.forced,
+                    // [D-63] 昇格へ回しても宣言の範囲は変わらない。
+                    scope: fp.scope,
                 });
             }
         }
@@ -639,8 +675,10 @@ pub fn preflight_with_privhelper_launcher(
                             continue;
                         }
                     }
+                    // [D-63] 本体が既に管理者の直接付与も**同じスコープ分岐を通る**
+                    // （3つの入口のうち1つだけ従わない形を作らない、B-02）。
                     let do_grant =
-                        || grant_ace_inheritable_access(&entry.path, sid.as_psid(), entry.access);
+                        || grant_ace_scoped(&entry.path, sid.as_psid(), entry.access, entry.scope);
                     let result = if entry.forced {
                         with_restore_privilege(do_grant)
                     } else {

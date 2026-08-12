@@ -61,7 +61,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-use crate::shell_tier::FsAccess;
+use crate::shell_tier::{FsAccess, GrantScope};
 use crate::tier2a::win_appcontainer::{self, AppContainerError};
 use crate::win_common::wide;
 
@@ -80,6 +80,22 @@ pub struct FsAllowGrant {
     /// ゲートを通過したもののみ`with_restore_privilege`下で付与する。既定false。
     #[serde(default)]
     pub forced: bool,
+    /// [D-63] 付与範囲。宣言値が`<path>/**`なら`Recursive`、素のパスなら`Object`。
+    ///
+    /// **昇格側も同じ分岐を通らなければ意味が無い。** 非昇格側だけがオブジェクト単体にしても、
+    /// システム保護パスへ回ったエントリだけ従来どおり継承ACEになる——「対の片方だけ実装する」の
+    /// 典型（B-02）。
+    ///
+    /// **欠落時の既定は`Recursive`**（[`default_grant_scope`]）。この形の電文を送ってくるのは
+    /// D-63以前のビルドだけで、**その送り手が意味していたのは再帰**だからである。狭い方へ
+    /// 倒すと「成功と報告しながら宣言どおりに開かない」無言失敗になる（B-10）。
+    #[serde(default = "default_grant_scope")]
+    pub scope: GrantScope,
+}
+
+/// [`FsAllowGrant::scope`]が欠けている電文の既定（D-63以前のビルドの意味＝再帰）。
+fn default_grant_scope() -> GrantScope {
+    GrantScope::Recursive
 }
 
 impl<'de> Deserialize<'de> for FsAllowGrant {
@@ -94,6 +110,11 @@ impl<'de> Deserialize<'de> for FsAllowGrant {
             writable: Option<bool>,
             #[serde(default)]
             forced: bool,
+            // [D-63] **`Raw`にも足すこと。** 手書きの`Deserialize`があるので、`FsAllowGrant`側の
+            // `#[serde(default)]`はこの経路では一切効かない（フィールドを足したのに読まれない、
+            // というプロセス境界の無言失敗になる）。
+            #[serde(default = "default_grant_scope")]
+            scope: GrantScope,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -108,6 +129,7 @@ impl<'de> Deserialize<'de> for FsAllowGrant {
             path: raw.path,
             access,
             forced: raw.forced,
+            scope: raw.scope,
         })
     }
 }
@@ -645,6 +667,7 @@ mod tests {
                     path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
                     access: FsAccess::ReadExec,
                     forced: false,
+                    scope: GrantScope::Recursive,
                 }],
                 session_profile: "harness.shell.sandbox.1234-5678".to_string(),
             },
@@ -721,11 +744,13 @@ mod tests {
                     path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
                     access: FsAccess::ReadExec,
                     forced: false,
+                    scope: GrantScope::Recursive,
                 },
                 FsAllowGrant {
                     path: PathBuf::from(r"C:\Program Files\SomeTool"),
                     access: FsAccess::ReadWrite,
                     forced: true,
+                    scope: GrantScope::Recursive,
                 },
             ],
             session_profile: "harness.shell.sandbox.1234-5678".to_string(),
@@ -763,6 +788,7 @@ mod tests {
                 path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
                 access: FsAccess::ReadExec,
                 forced: false,
+                scope: GrantScope::Recursive,
             }],
             session_profile: "harness.shell.sandbox.1234-5678".to_string(),
         };
@@ -864,6 +890,7 @@ mod tests {
             path: PathBuf::from(r"C:\x"),
             access: FsAccess::ReadWriteExec,
             forced: false,
+            scope: GrantScope::Recursive,
         };
 
         let json = serde_json::to_string(&grant).unwrap();

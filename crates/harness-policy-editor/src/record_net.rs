@@ -1031,6 +1031,12 @@ fn run_pass2<'a>(
                     .find(|fp| &fp.path == path)
                     .map(|fp| fp.forced)
                     .unwrap_or(false),
+                // [D-63] 宣言された範囲を記録する（`forced`と同じ引き方）。
+                scope: passthrough
+                    .iter()
+                    .find(|fp| &fp.path == path)
+                    .map(|fp| fp.scope)
+                    .unwrap_or(harness_policy::GrantScope::Recursive),
                 // policy.json由来はsettings.jsonの参照カウントに載せない。
                 settings_workspace: None,
                 granted_sid: granted_sid.clone(),
@@ -1487,9 +1493,11 @@ fn passthrough_for_domain(domain: &PolicyDomain, workspace_root: &Path) -> Vec<F
     // のと同じ集合でなければ、警告した数と実際に待たされる数が食い違う（B-05）。
     crate::approve::grant_roots(domain, workspace_root)
         .into_iter()
-        .map(|(path, access)| FsPassthrough {
+        .map(|(path, access, scope)| FsPassthrough {
             path,
             access,
+            // [D-63] 宣言値の書き方がそのまま付与範囲になる（`R`で付けた`/**`だけが再帰）。
+            scope,
             // `--force-system-acl`（D-19）はポリシーエディタからは使わせない。
             // システム保護パスへ`SeRestorePrivilege`で強制付与するのは、記録のついでに
             // やってよい操作ではない（`harness fs`から明示的に行う）。
@@ -1546,6 +1554,7 @@ mod stale_roots_tests {
                 path: PathBuf::from(p),
                 access: FsAccess::Read,
                 forced: false,
+                scope: harness_policy::GrantScope::Recursive,
             })
             .collect()
     }

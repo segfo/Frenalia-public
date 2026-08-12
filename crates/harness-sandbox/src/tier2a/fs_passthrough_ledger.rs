@@ -50,6 +50,28 @@ pub struct FsLedgerEntry {
     /// `win_appcontainer::revoke_subjects`の規則0/2/4が受ける。
     #[serde(default)]
     pub granted_sids: Vec<String>,
+    /// [D-63] このパスを**どの範囲で**開いたか（宣言値が`<path>/**`なら`Recursive`）。
+    ///
+    /// # これは「ヒント」であって撤収の根拠ではない
+    ///
+    /// 撤収の範囲は**対象パスのDACLに実在する継承フラグ**から決める
+    /// （`win_appcontainer::revoke`）。この台帳は[BUG-103](../../../../docs/bugs/BUG-103.md)(d)で
+    /// **サンドボックスから書ける**ことが実測されており、`scope: Object`を鵜呑みにすると
+    /// 「台帳を書き換えて再帰ACEを撤収の対象外にする」経路になる。D-61（撤収の主体は対象パスの
+    /// DACLに実在するSIDから決める）とまったく同じ原則である。
+    ///
+    /// 使い道は`harness fs list`の表示と、実DACLとの突き合わせ（付与が宣言どおりだったかの検算）。
+    ///
+    /// 旧台帳（このフィールド欠落）は`Recursive`扱い——D-63以前の付与は全て継承ACEだったので、
+    /// それが**その記録が意味していた範囲**である。狭い方を既定にすると、既に実マシンに在る
+    /// 継承ACEを台帳が「オブジェクト単体」と説明することになる。
+    #[serde(default = "default_ledger_scope")]
+    pub scope: harness_policy::GrantScope,
+}
+
+/// [`FsLedgerEntry::scope`]が欠けている旧エントリの既定（D-63以前の付与＝全て継承ACE）。
+fn default_ledger_scope() -> harness_policy::GrantScope {
+    harness_policy::GrantScope::Recursive
 }
 
 /// 到達不能/付与失敗だったfs passthrough候補。`harness fs list`/`harness fs denied`で表示し、
@@ -86,6 +108,10 @@ impl FsLedger {
     /// `granted_sid`（付与した主体のSID文字列）だけは**上書きではなく和**で持つ
     /// ——同じパスを別のセッションが付与し直すたびに主体が増えるので、上書きすると
     /// 前のセッションのACEを剥がす手掛かりが消える（[`FsLedgerEntry::granted_sids`]のdoc）。
+    // 引数は台帳エントリの列そのものである。まとめるための構造体を新設すると
+    // [`FsPassthroughGrantRecord`]とほぼ同じ型が2つ並ぶだけで、**どちらを更新すべきかが
+    // 分からない形**になる（B-05: 同じ事実を2箇所に持たない）。ここは列挙のままにする。
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_grant(
         &mut self,
         path_str: String,
@@ -93,6 +119,7 @@ impl FsLedger {
         forced: bool,
         settings_workspace: Option<&str>,
         granted_sid: Option<&str>,
+        scope: harness_policy::GrantScope,
         granted_at: u64,
     ) {
         if let Some(entry) = self
@@ -103,6 +130,11 @@ impl FsLedger {
             entry.writable = writable;
             entry.granted_at_unix_secs = granted_at;
             entry.forced = forced;
+            // [D-63] **記録は最後の付与で上書きする**（`writable`と同じ扱い）。ここを
+            // 「広い方を残す」にすると、`**`を外した宣言に直した後も台帳が`Recursive`と
+            // 言い続け、実DACLとの突き合わせが恒久的にずれる。実際に残っている範囲を
+            // 知りたいときの権威はDACLであって、この欄ではない。
+            entry.scope = scope;
             if let Some(ws) = settings_workspace {
                 if !entry.settings_workspaces.iter().any(|w| w == ws) {
                     entry.settings_workspaces.push(ws.to_string());
@@ -125,6 +157,7 @@ impl FsLedger {
                     .unwrap_or_default(),
                 settings_managed: settings_workspace.is_some(),
                 granted_sids: granted_sid.map(|s| vec![s.to_string()]).unwrap_or_default(),
+                scope,
             });
         }
         // 付与できたパスは「到達不能候補」ではなくなる。両方に載ったままだと
@@ -190,6 +223,7 @@ pub fn record_fs_passthrough_grant(
     forced: bool,
     settings_workspace: Option<&str>,
     granted_sid: Option<&str>,
+    scope: harness_policy::GrantScope,
 ) {
     let path_str = path.to_string_lossy().into_owned();
     let granted_at = harness_grant_ledger::now_unix_secs();
@@ -200,6 +234,7 @@ pub fn record_fs_passthrough_grant(
             forced,
             settings_workspace,
             granted_sid,
+            scope,
             granted_at,
         )
     });
@@ -231,6 +266,7 @@ pub fn record_fs_passthrough_grants(grants: &[FsPassthroughGrantRecord]) {
                 grant.forced,
                 grant.settings_workspace.as_deref(),
                 grant.granted_sid.as_deref(),
+                grant.scope,
                 granted_at,
             );
         }
@@ -248,6 +284,8 @@ pub struct FsPassthroughGrantRecord {
     /// `None`——**記録できなかったことを付与の失敗にはしない**が、そのパスは後から
     /// 「登録簿」と「マスクの指紋」でしか判定できなくなる。
     pub granted_sid: Option<String>,
+    /// [D-63] 宣言された付与範囲（[`FsLedgerEntry::scope`]。**ヒントであって撤収の根拠ではない**）。
+    pub scope: harness_policy::GrantScope,
 }
 
 /// 複数の拒否を1回の台帳更新で記録する（[`record_fs_passthrough_grants`]と同じ理由）。
@@ -422,6 +460,61 @@ mod fs_ledger_tests {
         );
     }
 
+    /// [D-63] **D-63以前の台帳は`Recursive`として読む。**
+    ///
+    /// あの頃の付与は例外なく継承ACE（`grant_ace_inheritable_access`固定）だったので、
+    /// それが記録の意味である。ここを`Object`側へ倒すと、実マシンに残っている継承ACEを
+    /// 台帳が「オブジェクト単体」と説明することになり、`fs list`の表示と実DACLが食い違う。
+    ///
+    /// 撤収がこの欄を信用しないこと自体は別に担保されている（範囲は実DACLから決める）。
+    #[test]
+    fn a_ledger_written_before_d63_reads_as_recursive() {
+        let legacy = r#"{"entries":[
+            {"path":"C:\\Users\\me\\.cargo","writable":false,"granted_at_unix_secs":1700000000}
+        ]}"#;
+        let ledger: FsLedger = serde_json::from_str(legacy).expect("legacy ledger must parse");
+        assert_eq!(
+            ledger.entries[0].scope,
+            harness_policy::GrantScope::Recursive,
+            "a missing scope means the entry predates D-63, and those grants were inheritable"
+        );
+    }
+
+    /// [D-63] オブジェクト単体の記録がラウンドトリップする（`forced`と同じ形の固定）。
+    #[test]
+    fn an_object_scoped_entry_roundtrips() {
+        let mut ledger = FsLedger::default();
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            None,
+            None,
+            harness_policy::GrantScope::Object,
+            100,
+        );
+        let json = serde_json::to_string(&ledger).unwrap();
+        let back: FsLedger = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.entries[0].scope, harness_policy::GrantScope::Object);
+
+        // **最後の付与で上書きする。** `**`を外した宣言に直したのに台帳が`Recursive`と
+        // 言い続けると、実DACLとの突き合わせが恒久的にずれる。
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            None,
+            None,
+            harness_policy::GrantScope::Recursive,
+            200,
+        );
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(
+            ledger.entries[0].scope,
+            harness_policy::GrantScope::Recursive
+        );
+    }
+
     /// `forced=true`の台帳が正しくラウンドトリップすることを確認する。
     #[test]
     fn forced_entry_roundtrips() {
@@ -434,6 +527,7 @@ mod fs_ledger_tests {
                 settings_workspaces: Vec::new(),
                 settings_managed: false,
                 granted_sids: Vec::new(),
+                scope: harness_policy::GrantScope::Recursive,
             }],
             denied_entries: Vec::new(),
         };
@@ -447,8 +541,24 @@ mod fs_ledger_tests {
     #[test]
     fn granting_the_same_path_twice_upserts_instead_of_appending() {
         let mut ledger = FsLedger::default();
-        ledger.upsert_grant(PATH.to_string(), false, false, None, None, 100);
-        ledger.upsert_grant(PATH.to_string(), true, true, None, None, 200);
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            None,
+            None,
+            harness_policy::GrantScope::Recursive,
+            100,
+        );
+        ledger.upsert_grant(
+            PATH.to_string(),
+            true,
+            true,
+            None,
+            None,
+            harness_policy::GrantScope::Recursive,
+            200,
+        );
 
         assert_eq!(ledger.entries.len(), 1, "the same path must not accumulate");
         assert!(ledger.entries[0].writable, "the newest access wins");
@@ -466,11 +576,43 @@ mod fs_ledger_tests {
         const SID_A: &str = "S-1-15-2-1111111111-1-1-1-1-1-1";
         const SID_B: &str = "S-1-15-2-2222222222-2-2-2-2-2-2";
         let mut ledger = FsLedger::default();
-        ledger.upsert_grant(PATH.to_string(), false, false, None, Some(SID_A), 100);
-        ledger.upsert_grant(PATH.to_string(), false, false, None, Some(SID_B), 200);
-        ledger.upsert_grant(PATH.to_string(), false, false, None, Some(SID_A), 300);
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            None,
+            Some(SID_A),
+            harness_policy::GrantScope::Recursive,
+            100,
+        );
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            None,
+            Some(SID_B),
+            harness_policy::GrantScope::Recursive,
+            200,
+        );
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            None,
+            Some(SID_A),
+            harness_policy::GrantScope::Recursive,
+            300,
+        );
         // SIDを導出できなかった起動（`None`）が既存の記録を消さないこと。
-        ledger.upsert_grant(PATH.to_string(), false, false, None, None, 400);
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            None,
+            None,
+            harness_policy::GrantScope::Recursive,
+            400,
+        );
 
         assert_eq!(
             ledger.entries[0].granted_sids,
@@ -495,9 +637,33 @@ mod fs_ledger_tests {
     #[test]
     fn the_declaring_workspaces_are_deduped_and_settings_managed_never_goes_back_down() {
         let mut ledger = FsLedger::default();
-        ledger.upsert_grant(PATH.to_string(), false, false, Some(r"C:\ws"), None, 100);
-        ledger.upsert_grant(PATH.to_string(), false, false, Some(r"C:\ws"), None, 200);
-        ledger.upsert_grant(PATH.to_string(), false, false, Some(r"C:\other"), None, 300);
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            Some(r"C:\ws"),
+            None,
+            harness_policy::GrantScope::Recursive,
+            100,
+        );
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            Some(r"C:\ws"),
+            None,
+            harness_policy::GrantScope::Recursive,
+            200,
+        );
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            Some(r"C:\other"),
+            None,
+            harness_policy::GrantScope::Recursive,
+            300,
+        );
 
         assert_eq!(
             ledger.entries[0].settings_workspaces,
@@ -506,7 +672,15 @@ mod fs_ledger_tests {
         assert!(ledger.entries[0].settings_managed);
 
         // `--fs-allow`だけの再起動（settings_workspace = None）を挟んでも降ろさない。
-        ledger.upsert_grant(PATH.to_string(), false, false, None, None, 400);
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            None,
+            None,
+            harness_policy::GrantScope::Recursive,
+            400,
+        );
         assert!(
             ledger.entries[0].settings_managed,
             "settings_managed must stay true once set (D-27: otherwise the entry silently drops \
@@ -523,7 +697,15 @@ mod fs_ledger_tests {
         ledger.record_denied(PATH.to_string(), "read_exec", "ACCESS_DENIED", 100);
         assert_eq!(ledger.denied_entries.len(), 1);
 
-        ledger.upsert_grant(PATH.to_string(), false, false, None, None, 200);
+        ledger.upsert_grant(
+            PATH.to_string(),
+            false,
+            false,
+            None,
+            None,
+            harness_policy::GrantScope::Recursive,
+            200,
+        );
 
         assert!(
             ledger.denied_entries.is_empty(),

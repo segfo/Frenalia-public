@@ -33,9 +33,9 @@ use windows::Win32::Foundation::{
     ERROR_NOT_ALL_ASSIGNED, ERROR_PATH_NOT_FOUND, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LUID,
 };
 use windows::Win32::Security::Authorization::{
-    BuildTrusteeWithSidW, ConvertStringSidToSidW, GetExplicitEntriesFromAclW,
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo,
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, SE_KERNEL_OBJECT, TRUSTEE_IS_SID, TRUSTEE_W,
+    BuildTrusteeWithSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SetEntriesInAclW,
+    SetNamedSecurityInfoW, SetSecurityInfo, EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT,
+    SE_KERNEL_OBJECT, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -45,12 +45,12 @@ use windows::Win32::Security::{
     GetAclInformation, GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor,
     LookupPrivilegeValueW, SetKernelObjectSecurity, SetSecurityDescriptorControl,
     SetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION,
-    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES,
-    NO_INHERITANCE, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    PSID, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL,
-    SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME, SID_AND_ATTRIBUTES,
-    TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_PRIVILEGES_ATTRIBUTES,
-    TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERITED_ACE,
+    LUID_AND_ATTRIBUTES, NO_INHERITANCE, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR,
+    SECURITY_DESCRIPTOR_CONTROL, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME,
+    SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_PRIVILEGES_ATTRIBUTES, TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE,
@@ -75,7 +75,7 @@ use windows::Win32::System::Threading::{
     STARTUPINFOW,
 };
 
-use crate::shell_tier::{FsAccess, FsPassthrough, WorkspaceWriteMode};
+use crate::shell_tier::{FsAccess, FsPassthrough, GrantScope, WorkspaceWriteMode};
 use crate::win_common::{
     build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, long_path_wide,
     read_two_pipes_to_strings, wide, write_all,
@@ -236,6 +236,23 @@ fn win32_err(op: &str, e: windows::core::Error) -> AppContainerError {
 ///
 /// 同一プロファイルへの並行アクセスは[`PROFILE_LOCK`]で直列化する。
 pub fn ensure_profile(name: &str) -> Result<OwnedContainerSid, AppContainerError> {
+    // [B-01] **このセッションのプロファイルを作るなら、先に台帳へ登録する。**
+    //
+    // `CreateAppContainerProfile`はOSに残る資源を作る。台帳エントリの無いプロファイルは
+    // `plan_reclaim`が`grants_known: false`と判定して**永久に削除を見送る**——名前を消すと
+    // SIDが逆引き不能になり、ACEが残っていた場合に二度と剥がせなくなるためである（BUG-101①）。
+    // つまり「記録せずに作る」と、その1件は誰にも回収できないままマシンに残り続ける。
+    // 実際この機には66件たまっていた（2026-08-12に手作業で回収）。
+    //
+    // `preflight`は最初から`begin_session()` → `ensure_profile()`の順で書かれていたが、
+    // **それ以外の経路（テストのヘルパー等）が直接ここへ来ていた**。呼び出し側の規律ではなく
+    // 作成点の不変条件にする（B-06: 入口が増えても守られる形にする）。
+    //
+    // 対象は**このセッションのプロファイル名のときだけ**。MCPサーバのプロファイル（D-38）は
+    // `record_mcp_profile`が別に登録し、旧共有名（`CONTAINER_NAME`）はセッションを持たない。
+    if name == crate::tier2a::session_profile::current_profile_name() {
+        crate::tier2a::session_profile::begin_session().map_err(AppContainerError::Preflight)?;
+    }
     crate::with_named_lock(PROFILE_LOCK, || ensure_profile_locked(name))
 }
 
@@ -360,8 +377,28 @@ pub use traverse::*;
 /// 製品の`--cow`経路は壊れておらず、E2Eだけが実態を測らなくなっていた。
 ///
 /// `session_token`はプロセス内で固定なので、`preflight`の前後どちらで呼んでも同じSIDになる。
+///
+/// # **記録してから作る**（2026-08-12に順序を直した）
+///
+/// `begin_session()`を先に呼ぶ。かつてここは`ensure_profile`だけを呼んでおり、
+/// 「`begin_session()`をテストから呼ぶと`cargo test`のたびに台帳エントリとプロファイルが
+/// 1件ずつ残る」という理由で**意図的に**そうしてあった。
+///
+/// **その理屈は逆だった。** 避けたのは記録の方で、OSのリソース（プロファイル）は作り続けて
+/// いたので、出来上がるのは「台帳に無い実在プロファイル」——`plan_reclaim`が
+/// `grants_known: false`と判定して**永久に削除を見送る**形である（名前を消すとSIDが逆引き
+/// 不能になり、もしACEが残っていたら二度と剥がせないため。BUG-101①）。実機に**66件**
+/// たまっていた。記録があれば次回のGCが監査つきで回収するので、残るのは高々1件（実行中の
+/// 自分のぶん）になる。
+///
+/// 生存マーカーも同時に立つので、**走っている最中のテストのプロファイルを他プロセスのGCが
+/// 消す**競合も閉じる（マーカーはプロセス終了でOSが手放す）。
+///
+/// これはB-01（資源を作る前に記録を残す）そのもので、`preflight`は最初から
+/// `begin_session()` → `ensure_profile`の順で書かれている。テストだけが逆順だった。
 #[cfg(all(windows, test))]
 fn session_sid() -> OwnedContainerSid {
+    // 登録は[`ensure_profile`]が作成点で行う（B-01）。ここが特別扱いをする必要は無い。
     ensure_profile(&crate::tier2a::session_profile::current_profile_name())
         .expect("ensure_profile (this session's profile, D-37)")
 }

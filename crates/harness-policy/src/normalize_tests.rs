@@ -404,3 +404,74 @@ fn fs_folder_starts_empty() {
     assert_eq!(folder.len(), 0);
     assert!(folder.into_candidates().is_empty());
 }
+
+// --- D-63: 宣言値 → (付与ルート, スコープ) ---------------------------------
+
+/// **`literal_prefix`と`declared_scope`は同じ値を見る対である。** 片方だけで判断すると、
+/// 「どのオブジェクトへ付けるか」と「どこまで開くか」が食い違う（B-05）。
+/// ここでは代表的な綴りについて、2つの答えを**並べて**固定する。
+#[test]
+fn a_declaration_maps_to_one_grant_root_and_one_scope() {
+    let cases = [
+        // (宣言値, 付与ルート, 再帰か)
+        ("C:/x/dir", "C:/x/dir", false),
+        // 末尾スラッシュは付与ルートの綴りに残るが、範囲は変えない（旧`dir`畳み込みの出力の形）。
+        ("C:/x/dir/", "C:/x/dir/", false),
+        ("C:/x/dir/**", "C:/x/dir", true),
+        ("C:/x/dir/**/", "C:/x/dir", true),
+        // 区切りが`\`でも同じ（`breadth`は生の宣言値を受ける経路を持つ）。
+        (r"C:\x\dir\**", r"C:\x\dir", true),
+        ("C:/x/file.dll", "C:/x/file.dll", false),
+        // UNC。
+        ("//host/share/dir/**", "//host/share/dir", true),
+    ];
+    for (value, root, recursive) in cases {
+        assert_eq!(literal_prefix(value), root, "grant root of {value}");
+        assert_eq!(
+            declared_scope(value).is_recursive(),
+            recursive,
+            "scope of {value}"
+        );
+        assert!(
+            !has_unsupported_wildcard(value),
+            "{value} is a supported spelling"
+        );
+    }
+}
+
+/// 中間のワイルドカードは**再帰へ格上げしない**（D-62で`--generalize=auto`を廃した理由）。
+///
+/// `C:/x/*/bin`の確定部分は`C:/x`なので、再帰にすると`C:/x`配下すべてが開く——宣言よりはるかに
+/// 広い。オブジェクト単体にすれば逆に何も開かない。どちらも宣言と一致しないので、
+/// **付与層が弾けるように印を付ける**のがここの役目である。
+#[test]
+fn a_wildcard_that_is_not_a_trailing_double_star_is_flagged_as_unsupported() {
+    for value in [
+        "C:/x/*/bin",
+        "C:/x/lib*",
+        "C:/x/*/bin/**",
+        r"C:\x\*\bin",
+        "C:/*",
+    ] {
+        assert!(has_unsupported_wildcard(value), "{value} must be refused");
+        // 格上げされていないこと（`**`で終わる形だけが再帰）。
+        if !value.trim_end_matches('/').ends_with("**") {
+            assert_eq!(declared_scope(value), GrantScope::Object, "{value}");
+        }
+    }
+}
+
+/// 表示・台帳の綴りを固定する（台帳へ載る値なので、変えると過去の記録が読めなくなる）。
+#[test]
+fn the_scope_labels_are_stable() {
+    assert_eq!(GrantScope::Object.label(), "object");
+    assert_eq!(GrantScope::Recursive.label(), "recursive");
+    assert_eq!(
+        serde_json::to_string(&GrantScope::Recursive).unwrap(),
+        "\"Recursive\""
+    );
+    assert_eq!(
+        serde_json::from_str::<GrantScope>("\"Object\"").unwrap(),
+        GrantScope::Object
+    );
+}

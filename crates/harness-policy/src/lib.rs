@@ -39,7 +39,8 @@ pub use gate::{check_proposal, GateVerdict};
 pub use generalize::{RuleProposal, SettingsKey};
 pub use insufficient::{diagnose, GrantedPaths, Insufficient};
 pub use normalize::{
-    is_net_control_record, DeniedCandidate, FsFolder, NetIntake, Requested, Source, SourceReport,
+    is_net_control_record, DeniedCandidate, FsFolder, GrantScope, NetIntake, Requested, Source,
+    SourceReport,
 };
 
 /// 4経路ぶんの[`SourceReport`]をまとめた、提案生成の入力一式。

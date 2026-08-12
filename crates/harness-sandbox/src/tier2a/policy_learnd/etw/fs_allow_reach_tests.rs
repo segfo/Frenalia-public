@@ -53,7 +53,7 @@
 //! **元から付与されていなかったノードだけ**を撤収する（`grant_traverse_chain`は冪等スキップした
 //! ノードも戻り値に含めるため、戻り値をそのまま撤収対象にすると元から在ったACEまで剥がす）。
 
-use crate::shell_tier::{FsAccess, FsPassthrough, WorkspaceWriteMode};
+use crate::shell_tier::{FsAccess, FsPassthrough, GrantScope, WorkspaceWriteMode};
 // D-54: `preflight`が付けるworkspace ACEの主体はworkspace capability SIDなので、子を起こす側は
 // 本番（`run_shell`）と同じくそれをトークンへ積む必要がある。素の`spawn`だとworkspaceが
 // 一切見えず、測定そのものが成立しない（`spawn_in_workspace`のdoc参照）。
@@ -558,11 +558,13 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
             path: allow_rw.clone(),
             access: FsAccess::ReadWrite,
             forced: false,
+            scope: GrantScope::Recursive,
         },
         FsPassthrough {
             path: allow_rx.clone(),
             access: FsAccess::ReadExec,
             forced: false,
+            scope: GrantScope::Recursive,
         },
     ];
     let outcome = preflight(

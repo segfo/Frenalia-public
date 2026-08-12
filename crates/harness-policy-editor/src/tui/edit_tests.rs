@@ -562,11 +562,20 @@ fn the_directory_itself_can_still_be_chosen_deliberately_with_d() {
     );
 
     // `d`でなら入る。**そして何が起きるかを言う。**
+    //
+    // [D-63] 素の宣言が開くのは**そのオブジェクト1つだけ**になった（付与層が非継承ACEを書く）。
+    // ここで「配下すべて」と言っていた頃の文面をそのまま残すと、**実際より広く伝える**
+    // ことになる。範囲を言うこと自体は変えず、言う内容を実装に合わせる（B-32）。
     app.on_key(key(KeyCode::Char('d')));
     assert!(app.accepted.contains(&dir_id), "dで明示的に選べる");
     assert!(
-        app.status.contains("配下すべて"),
+        app.status.contains("この行のパスだけ"),
         "選んだ範囲を言う: {}",
+        app.status
+    );
+    assert!(
+        app.status.contains('R'),
+        "配下も要るときの出口（R）を同時に出す: {}",
         app.status
     );
 

@@ -40,7 +40,7 @@ fn entries_under_the_same_root_collapse_to_one_grant_root() {
     let roots = grant_roots(&domain, ws.path());
     let paths: Vec<String> = roots
         .iter()
-        .map(|(p, _)| p.to_string_lossy().replace('\\', "/"))
+        .map(|(p, _, _)| p.to_string_lossy().replace('\\', "/"))
         .collect();
     assert_eq!(
         paths,

@@ -118,6 +118,74 @@ fn a_registered_foreign_sid_is_never_revocable_even_if_the_ledger_names_it() {
     assert!(matches!(kind, SubjectKind::ForeignRegistered { .. }));
 }
 
+/// **`ALL APPLICATION PACKAGES`(`S-1-15-2-1`)を自分のものと名乗らない**（規則-1）。
+///
+/// このSIDは`S-1-15-2-`で始まるので`appcontainer_sid_aces`に拾われ、登録簿には載っていないので
+/// 規則0/1/2を素通りする。そして`icacls /grant "*S-1-15-2-1:(OI)(CI)(RX)"`が書くマスクは
+/// **`fs_access_mask(FsAccess::ReadExec)`と完全一致する**（このテストが最初にそれを実測する）
+/// ため、規則-1が無ければ規則4が「harnessのものだ」と名乗って剥がしていた。
+///
+/// 剥がすと、そのACEに依存しているアプリのサンドボックスが起動できなくなる
+/// （`docs/DEV-ENVIRONMENT.md`のVS Code GPUサンドボックスの節。この開発機に実在する付与）。
+#[test]
+fn a_well_known_package_sid_is_never_revocable_even_though_its_mask_is_one_of_ours() {
+    use windows::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
+    let f = Fixture::new();
+    // icaclsの`(RX)`＝`FILE_GENERIC_READ | FILE_GENERIC_EXECUTE`。**前提を先に固定する**
+    // ——ここが一致しなくなったら、このテストは規則-1を検証していない。
+    let icacls_rx = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
+    assert_eq!(
+        icacls_rx,
+        fs_access_mask(FsAccess::ReadExec),
+        "test premise: icacls (RX) and harness ReadExec are the same mask"
+    );
+    assert!(
+        f.masks.contains(&icacls_rx),
+        "test premise: it is a fingerprint harness claims"
+    );
+
+    for (sid, name) in [
+        ("S-1-15-2-1", "ALL APPLICATION PACKAGES"),
+        ("S-1-15-2-2", "ALL RESTRICTED APPLICATION PACKAGES"),
+    ] {
+        let kind = f.classify(sid, icacls_rx, false);
+        assert_eq!(kind, SubjectKind::WellKnownPackage { name }, "{sid}");
+        assert!(!kind.is_revocable(), "{sid}: {kind:?}");
+        // **名指しで報告される**こと（B-09: 触らなかったものを黙って落とすと`icacls`で追えない）。
+        assert!(kind.left_alone_reason().is_some(), "{sid}");
+    }
+}
+
+/// 規則-1は**台帳より先**にある（規則0と同じP-01の理屈）。台帳はサンドボックスから
+/// 書ける（[BUG-103](../../../../docs/bugs/BUG-103.md)(d)）ので、そこへ`S-1-15-2-1`を
+/// 書き足すだけで他アプリのACEを剥がさせられてはならない。
+/// 登録簿を読めなかったときも同じ（規則-1はどの材料にも依存しない）。
+#[test]
+fn a_well_known_package_sid_is_protected_from_the_ledger_and_from_a_registry_failure() {
+    let mut f = Fixture::new();
+    f.ledger = vec!["S-1-15-2-1".to_string()];
+    let kind = f.classify("S-1-15-2-1", harness_rw_mask(), false);
+    assert!(
+        !kind.is_revocable(),
+        "ledger must not override rule -1: {kind:?}"
+    );
+
+    let kind = SubjectClassifier {
+        registered: None,
+        live_profiles: &f.live,
+        ledger_sids: &f.ledger,
+        harness_masks: &f.masks,
+    }
+    .classify("S-1-15-2-1", harness_rw_mask(), false);
+    assert_eq!(
+        kind,
+        SubjectKind::WellKnownPackage {
+            name: "ALL APPLICATION PACKAGES"
+        },
+        "rule -1 does not depend on the registry being readable"
+    );
+}
+
 /// 実行中の他セッションから権限を奪わない（BUG-053）。**台帳エントリも残す**
 /// ——ACEは実在するので、記録を消すとharnessが把握しない穴になる。
 #[test]

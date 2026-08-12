@@ -424,13 +424,24 @@ pub(crate) fn grant_ace_mask_with_checked(
     // 書込（`grant_ace_mask`を直に呼ぶ経路）は記録する: 入口が1つ増えたときに
     // 黙って計装の対象外にならないようにするため（B-06）。
     crate::tier2a::grant_audit::note_low_level_grant(path, sid);
-    // 冪等スキップ: 既にsid宛の明示ACEが要求マスクの上位集合を持っていれば
+    // 冪等スキップ: 既にsid宛の明示ACEが要求（マスク**と継承フラグ**）を満たしていれば
     // `SetNamedSecurityInfoW`（プロファイルルート近傍で病的に遅くなりうる、BUG-011）を
-    // 呼ばずに済ませる。継承フラグの相違までは見ない（`inheritance`は`grant_ace_mask`の
-    // 呼び出しパターン上、同一pathへ複数の異なる継承指定で呼ばれることが無いため）。
+    // 呼ばずに済ませる。
+    //
+    // [D-63] **継承フラグまで見る。** かつては「同一pathへ複数の異なる継承指定で呼ばれることが
+    // 無い」という前提でマスクだけを比べていたが、D-63でその前提が崩れた——同じパスへ
+    // 素の宣言（非継承）と`<path>/**`（継承）が来得る。マスクだけを見ていると、先に付いた
+    // 非継承ACEで足りていると判定して**再帰要求が黙って非継承のまま通る**（B-10: 成功と
+    // 報告しながら要求どおりになっていない）。回帰は
+    // `a_recursive_request_is_not_skipped_by_an_existing_object_scoped_ace`が押さえる。
+    //
+    // 逆向き（非継承の要求に対して既存が継承あり）は**満たしているものとしてスキップする**
+    // ——ここは付与の口であって、既にある継承ACEを狭める場所ではない（狭めるには配下へ
+    // 降りたコピーを剥がす必要があり、それは撤収の仕事である）。`preflight`はその状態を
+    // 警告として名指しする。
     if matches!(idempotent, IdempotentCheck::SkipIfSufficient) {
-        if let Ok(Some(existing)) = sid_ace_mask(path, sid) {
-            if existing & access == access {
+        if let Ok(Some(existing)) = sid_explicit_ace(path, sid) {
+            if existing.satisfies(access, inheritance.0 as u8) {
                 return Ok(());
             }
         }
@@ -671,6 +682,61 @@ fn grant_ace_access_if_file(
         return None;
     }
     Some(grant_ace_access(root, sid, false, access))
+}
+
+/// [D-63] **宣言されたスコープで付与する、fs passthroughの唯一の入口。**
+///
+/// 宣言値が`C:/x`なら`C:/x`というオブジェクト1つだけ、`C:/x/**`なら配下すべて。どちらを
+/// 選ぶかは呼び出し側が推測せず、宣言から決まった[`GrantScope`]をそのまま渡す
+/// （`harness_policy::normalize::declared_scope`が唯一の判定）。
+///
+/// # なぜ分岐をここに置くのか
+///
+/// 付与の入口は3つある——本体（非管理者）・本体が既に管理者のときの直接付与・昇格ヘルパー。
+/// 3箇所が別々に「継承ありで付けるか」を決めると、**片方だけがD-63に従う**形になる（B-02:
+/// 対の片方だけ実装する、が最頻の再発パターン）。だから分岐は1つにし、3入口はこれを呼ぶ。
+///
+/// ファイルはどちらのスコープでも単一オブジェクトへの付与1件で終わる
+/// （[`grant_ace_access_if_file`]、BUG-059）——ファイルに子孫は無いので、`Recursive`と
+/// `Object`の区別が意味を持つのはディレクトリだけである。
+#[track_caller]
+pub fn grant_ace_scoped(
+    root: &Path,
+    sid: PSID,
+    access: FsAccess,
+    scope: GrantScope,
+) -> Result<(), AppContainerError> {
+    match scope {
+        GrantScope::Recursive => grant_ace_inheritable_access(root, sid, access),
+        GrantScope::Object => grant_ace_object_access(root, sid, access),
+    }
+}
+
+/// [D-63] `root`**そのものだけ**へ非継承ACEを1本書く（配下へは一切広げない）。
+///
+/// [`grant_ace_inheritable_access`]との違いは2つで、どちらも「観測されていない範囲を開かない」
+/// という同じ理由から来ている:
+///
+/// 1. 継承フラグを立てない（`NO_INHERITANCE`）。立てると**今後そこに作られるファイル**まで
+///    開く——D-62が畳み込みを廃した理由そのもの（ETWは1回の実行で通った経路しか見ていない）。
+/// 2. 子孫救済walk（[`fix_descendants_missing_ace`]）を回さない。継承させないのだから
+///    「継承が届かなかった子孫」は定義上存在せず、走らせれば**ACEを配りに行くだけ**になる。
+///
+/// 副作用として速い（DACL書込1回・walk無し）が、それは目的ではなく結果である。
+#[track_caller]
+fn grant_ace_object_access(
+    root: &Path,
+    sid: PSID,
+    access: FsAccess,
+) -> Result<(), AppContainerError> {
+    // [BUG-101] 継承版と同じく「付与を要求した」ことを記録する。**両分岐に張る**——
+    // 片方だけだと、オブジェクト単体の付与が計装の対象外になり、台帳との突き合わせ
+    // （`grant_audit`）が「記録漏れ」を検出できなくなる（B-06）。
+    let _audit = crate::tier2a::grant_audit::note_root_grant(root, sid);
+    if let Some(result) = grant_ace_access_if_file(root, sid, access) {
+        return result;
+    }
+    grant_ace_mask(root, sid, fs_access_mask(access), NO_INHERITANCE)
 }
 
 #[track_caller]

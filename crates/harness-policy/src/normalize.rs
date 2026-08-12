@@ -176,6 +176,73 @@ pub fn literal_prefix(value: &str) -> &str {
     }
 }
 
+/// 宣言値1件が**どこまでACEを開くか**（D-63）。
+///
+/// [`literal_prefix`]と対になる値である——あちらが「どのオブジェクトへ付けるか」を決め、
+/// こちらが「そのオブジェクトだけか、配下もか」を決める。2つ揃って初めて付与が定まる。
+///
+/// # なぜ宣言の**書き方**で決めるのか
+///
+/// 提案の値は観測されたものそのままで、畳まない（**D-62**）。畳まないなら、付与も観測された
+/// 範囲に留まらなければ意味が無い——「観測された2件を承認したのにサブツリー全体が開く」のが
+/// D-62で塞いだ穴そのものだからである。範囲を広げたいという意思は、値に`/**`と**書く**という
+/// 明示的な操作でしか表せないようにする（ポリシーエディタの`R`キー、または設定の手編集）。
+///
+/// この型は`harness-sandbox`（ACEを実際に付ける側）と`harness-cli`・ポリシーエディタ
+/// （宣言を読む側）の両方が使う。判定を各自が持つと、**書いた値と付く範囲が食い違う**（B-05）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GrantScope {
+    /// そのオブジェクト1つだけ（非継承ACE）。素のパスの宣言はこれ。
+    Object,
+    /// 配下すべてと、今後そこに作られるもの（継承ACE）。`<path>/**`と書いたときだけ。
+    Recursive,
+}
+
+impl GrantScope {
+    pub fn is_recursive(self) -> bool {
+        matches!(self, GrantScope::Recursive)
+    }
+
+    /// 表示・台帳用の短い綴り。
+    pub fn label(self) -> &'static str {
+        match self {
+            GrantScope::Object => "object",
+            GrantScope::Recursive => "recursive",
+        }
+    }
+}
+
+/// 宣言値が要求している範囲（D-63）。**末尾が`**`のときだけ再帰**。
+///
+/// 末尾の区切りは無視する（`C:/x/**/`も再帰）。それ以外のワイルドカード
+/// （`C:/x/*/bin`のような中間の`*`）は**再帰にしない**——[`literal_prefix`]は`C:/x`まで戻るので、
+/// 再帰にすると宣言よりはるかに広い範囲が開く（D-62で`--generalize=auto`を廃した理由そのもの）。
+/// その形の値は付与層が名指しで拒否する（`preflight`）。ここで再帰へ格上げして黙って通さない。
+pub fn declared_scope(value: &str) -> GrantScope {
+    let trimmed = value.trim_end_matches(['/', '\\']);
+    if trimmed.ends_with("**") {
+        GrantScope::Recursive
+    } else {
+        GrantScope::Object
+    }
+}
+
+/// 宣言値に**確定部分より後ろのワイルドカード**が残っているか（＝`<path>/**`でも素のパスでもない形）。
+///
+/// `C:/x/*/bin`・`C:/x/lib*`のような値がこれに当たる。[`literal_prefix`]が`C:/x`まで戻るため、
+/// 付与できるのは「`C:/x`のオブジェクト単体」か「`C:/x`配下すべて」のどちらかしかなく、
+/// **前者は宣言より狭く（何も開かない）、後者は宣言よりはるかに広い**。どちらを選んでも
+/// 宣言と付与が一致しないので、値そのものを受け付けない側に倒す（付与層が理由を添えて弾く）。
+pub fn has_unsupported_wildcard(value: &str) -> bool {
+    let trimmed = value.trim_end_matches(['/', '\\']);
+    let body = match trimmed.strip_suffix("**") {
+        // `<path>/**`の`**`は正規の書き方なので、判定からは外す。
+        Some(head) => head.trim_end_matches(['/', '\\']),
+        None => trimmed,
+    };
+    body.contains('*')
+}
+
 fn parse_access(label: &str) -> Option<FsAccess> {
     match label {
         "read" => Some(FsAccess::Read),

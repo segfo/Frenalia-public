@@ -191,6 +191,20 @@ pub(crate) fn smoke_test_harness_control_write_denied(
 /// `File.Open(..., FileAccess.ReadWrite, FileShare.ReadWrite)`で開いて即閉じるだけにする
 /// （内容は変更しない。共有モードを緩めるのは、対象が同時に他プロセスから読まれていても
 /// このプローブ自体の目的＝書込アクセス権の有無の確認には影響しないため）。
+///
+/// # [D-63] `rw1`——オブジェクト単体で許可されたディレクトリ
+///
+/// **プローブは宣言された範囲を測る。** 範囲を知らずに測ると、正しく動いている構成を
+/// 「到達不能」と報告する（B-10の裏返し——測り方が対象と食い違うと、緑も赤も意味を失う）。
+///
+/// `rw`（従来）は`New-Item`で作った一時ファイルを**開き直して**から消す。ディレクトリ自身にしか
+/// ACEが無い場合、作成は通るが**開き直しと削除は拒否される**——新しいファイルは親から継承する
+/// ACEを持たないためである。結果は「偽の到達不能」＋**消せない`.harness-probe.tmp`が残る**。
+///
+/// `rw1`は`File.Create(..., FileOptions.DeleteOnClose)`で作成ハンドル1つだけを使い、閉じた
+/// 時点でOSに消させる。作成時のアクセス検査は親の`FILE_ADD_FILE`に対して行われ、要求した
+/// アクセス権はそのハンドルに与えられるので、開き直しは発生しない。
+pub(crate) const PROBE_MODE_RW_OBJECT: &str = "rw1";
 const FS_PASSTHROUGH_BATCH_PROBE_COMMAND: &str = "\
     $ErrorActionPreference = 'Stop'; \
     $i = -1; \
@@ -203,10 +217,15 @@ const FS_PASSTHROUGH_BATCH_PROBE_COMMAND: &str = "\
         $p = $line.Substring($t + 1); \
         try { \
             $isLeaf = Test-Path -LiteralPath $p -PathType Leaf; \
-            if ($mode -eq 'rw') { \
+            if ($mode -eq 'rw' -or $mode -eq 'rw1') { \
                 if ($isLeaf) { \
                     $stream = [System.IO.File]::Open($p, [System.IO.FileMode]::Open, \
                         [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite); \
+                    $stream.Close() \
+                } elseif ($mode -eq 'rw1') { \
+                    $tmp = Join-Path $p ([Guid]::NewGuid().ToString() + '.harness-probe.tmp'); \
+                    $stream = [System.IO.File]::Create($tmp, 4096, \
+                        [System.IO.FileOptions]::DeleteOnClose); \
                     $stream.Close() \
                 } else { \
                     $tmp = Join-Path $p ([Guid]::NewGuid().ToString() + '.harness-probe.tmp'); \
@@ -244,10 +263,13 @@ pub(crate) enum BatchProbeOutcome {
 pub(crate) fn batch_probe_stdin(entries: &[FsPassthrough]) -> String {
     let mut payload = String::new();
     for fp in entries {
-        let mode = if fp.access.is_read_write() {
-            "rw"
-        } else {
-            "ro"
+        // [D-63] **宣言された範囲で測る。** オブジェクト単体で許可したディレクトリを従来の`rw`で
+        // 測ると、配下に作った一時ファイルを開き直せず「偽の到達不能」になり、消せない
+        // `.harness-probe.tmp`まで残る（[`PROBE_MODE_RW_OBJECT`]のdoc）。
+        let mode = match (fp.access.is_read_write(), fp.scope) {
+            (false, _) => "ro",
+            (true, GrantScope::Recursive) => "rw",
+            (true, GrantScope::Object) => PROBE_MODE_RW_OBJECT,
         };
         payload.push_str(mode);
         payload.push('\t');
@@ -520,22 +542,57 @@ pub(crate) fn probe_passthrough_batch(
     )
 }
 /// `fp`が要求するアクセスのうち、`preflight`が「既に十分」と判定するために必要な最小マスク
-/// （`grant_ace`/`grant_ace_ro`が実際に付与するマスクと同じ論理和。継承フラグの相違までは
-/// 見ない、`grant_ace_mask`の冪等スキップと同じ考え方）。
+/// （`grant_ace`/`grant_ace_ro`が実際に付与するマスクと同じ論理和）。
 pub(crate) fn required_passthrough_mask(access: FsAccess) -> u32 {
     fs_access_mask(access)
+}
+
+/// [D-63] `scope`が要求する継承フラグ。マスクと対で「既に十分か」を決める
+/// （[`super::ExplicitAce::satisfies`]）。
+///
+/// **`Object`は0を返す**——「継承していないこと」までは要求しない。既にある継承ACEを
+/// 不十分と見なすと、`preflight`が毎回付与し直しに行くだけで**何も狭まらない**
+/// （狭めるにはツリー全体から降りたコピーを剥がす必要があり、それは撤収の仕事である）。
+pub(crate) fn required_inherit_flags(scope: GrantScope) -> u8 {
+    match scope {
+        GrantScope::Object => 0,
+        GrantScope::Recursive => (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8,
+    }
 }
 
 #[cfg(test)]
 mod batch_probe_tests {
     use super::*;
 
+    /// 既定は`Recursive`（D-63以前の全エントリの意味）。スコープを変える検証は
+    /// [`scoped_entry`]を使う。
     fn entry(path: &str, access: FsAccess) -> FsPassthrough {
+        scoped_entry(path, access, GrantScope::Recursive)
+    }
+
+    fn scoped_entry(path: &str, access: FsAccess, scope: GrantScope) -> FsPassthrough {
         FsPassthrough {
             path: std::path::PathBuf::from(path),
             access,
             forced: false,
+            scope,
         }
+    }
+
+    /// [D-63] **オブジェクト単体で許可した書込可ディレクトリは別モードで測る。**
+    ///
+    /// 従来の`rw`は配下に作った一時ファイルを開き直すので、ディレクトリ自身にしかACEが無い
+    /// 構成では必ず失敗する（偽の到達不能＋消えない`.harness-probe.tmp`）。
+    /// **ファイルは`Object`でもモードが変わらない**——ファイルに配下は無く、`rw`の分岐は
+    /// 対象がファイルなら開いて閉じるだけだからである。
+    #[test]
+    fn an_object_scoped_writable_entry_uses_the_single_handle_probe_mode() {
+        let payload = batch_probe_stdin(&[
+            scoped_entry(r"C:\dir", FsAccess::ReadWrite, GrantScope::Object),
+            scoped_entry(r"C:\tree", FsAccess::ReadWrite, GrantScope::Recursive),
+            scoped_entry(r"C:\ro", FsAccess::Read, GrantScope::Object),
+        ]);
+        assert_eq!(payload, "rw1\tC:\\dir\nrw\tC:\\tree\nro\tC:\\ro\n");
     }
 
     /// 入力の形（1行1エントリ、`<mode>\t<path>`）を固定する。プローブ側のPowerShellが

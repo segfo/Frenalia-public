@@ -286,6 +286,13 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 .find(|fp| &fp.path == path)
                 .map(|fp| fp.forced)
                 .unwrap_or(false);
+            // [D-63] どの範囲で開いたかを記録する（`forced`とまったく同じ引き方）。
+            // 既定を`Recursive`にするのは、引けなかった＝D-63以前と同じ意味に倒すため。
+            let scope = fs_passthrough
+                .iter()
+                .find(|fp| &fp.path == path)
+                .map(|fp| fp.scope)
+                .unwrap_or(harness_policy::GrantScope::Recursive);
             let path_str = path.to_string_lossy().into_owned();
             let settings_workspace = settings_fs_paths
                 .contains(&path_str)
@@ -296,6 +303,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 forced,
                 settings_workspace.as_deref(),
                 granted_sid.as_deref(),
+                scope,
             );
             if forced {
                 eprintln!(

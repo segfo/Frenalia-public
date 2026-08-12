@@ -254,14 +254,30 @@ mod win {
     /// 消すと、そのプロファイルは「台帳に無いが実在する」分類へ落ち、次のGCが
     /// `grants_known: false`として拾う。そこで削除してしまうとSIDが二度と導出できなくなり、
     /// **そのSID宛のACEはどのコマンドでも剥がせない孤児になる**（BUG-101）。
+    /// **[2026-08-12] 戻り値だけでは足りない。実際に消えたかを見る。**
+    ///
+    /// `DeleteAppContainerProfile`は**S_OKを返しながら何も消さないことがある**（実測。
+    /// この機で`Storage`にも`Mappings`にもフォルダにも変化が無いまま`hr=0x00000000`が返った）。
+    /// そのまま成功として扱うと、上位の`reclaim_targets`が**台帳エントリだけを落とす**——
+    /// プロファイルは実在するのに記録が消えるので、次のGCからは`grants_known: false`に見え、
+    /// **以後永久に回収されない**。実機に66件たまっていたのはこの形である（B-09/B-33:
+    /// 他人の成功報告を根拠にしない。「呼んだ」と「消えた」は別の事実）。
     pub(super) fn delete_profile(name: &str) -> Result<(), String> {
         unsafe {
             let w = crate::win_common::wide(name);
             windows::Win32::Security::Isolation::DeleteAppContainerProfile(windows::core::PCWSTR(
                 w.as_ptr(),
             ))
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
         }
+        // 検算。ここで`Err`にすれば、呼び出し側は台帳エントリを残す（次回また試せる）。
+        if existing_profiles().iter().any(|p| p == name) {
+            return Err(format!(
+                "DeleteAppContainerProfile reported success but {name} is still registered; \
+                 keeping the ledger entry so it stays reclaimable"
+            ));
+        }
+        Ok(())
     }
 }
 

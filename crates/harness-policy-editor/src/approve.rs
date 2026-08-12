@@ -305,19 +305,40 @@ pub fn grant_root(value: &str, workspace_root: &Path) -> Option<std::path::PathB
 /// `FILE_GENERIC_EXECUTE`は入っていないので、消えた側は実行時の`Access is denied`として
 /// 現れるのに、`policy.json`には許可が書いてあるように見える。
 /// 合成の規則そのものは`harness_sandbox::FsAccess::wider`が唯一の定義を持つ。
+///
+/// # [D-63] 範囲も一緒に返す
+///
+/// 同じルートに素の宣言と`<path>/**`が同居したら**再帰を採る**。accessを和で畳むのと同じ理由で、
+/// 1つのオブジェクトのDACLへ同じSID宛のACEを2本置くことはできないためである。
+/// 逆向き（再帰宣言があるのにオブジェクト単体へ寄せる）にすると、ユーザーが`R`で明示的に
+/// 広げた宣言が**別の行のせいで黙って効かなくなる**。
 pub fn grant_roots(
     domain: &PolicyDomain,
     workspace_root: &Path,
-) -> Vec<(std::path::PathBuf, harness_sandbox::FsAccess)> {
-    let mut out: Vec<(std::path::PathBuf, harness_sandbox::FsAccess)> = Vec::new();
+) -> Vec<(
+    std::path::PathBuf,
+    harness_sandbox::FsAccess,
+    harness_policy::GrantScope,
+)> {
+    let mut out: Vec<(
+        std::path::PathBuf,
+        harness_sandbox::FsAccess,
+        harness_policy::GrantScope,
+    )> = Vec::new();
     for (value, access) in domain.fs.entries() {
         let Some(root) = grant_root(value, workspace_root) else {
             continue;
         };
         let access = harness_sandbox::FsAccess::from_settings(access);
-        match out.iter_mut().find(|(path, _)| path == &root) {
-            Some(existing) => existing.1 = existing.1.wider(access),
-            None => out.push((root, access)),
+        let scope = harness_policy::normalize::declared_scope(value);
+        match out.iter_mut().find(|(path, _, _)| path == &root) {
+            Some(existing) => {
+                existing.1 = existing.1.wider(access);
+                if scope.is_recursive() {
+                    existing.2 = scope;
+                }
+            }
+            None => out.push((root, access, scope)),
         }
     }
     out
