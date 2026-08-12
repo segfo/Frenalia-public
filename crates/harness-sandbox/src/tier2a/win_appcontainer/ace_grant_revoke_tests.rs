@@ -1404,8 +1404,10 @@ fn a_sandbox_cannot_reach_another_sessions_workspace() {
     // 2つの**別セッション**を模す（D-37: プロファイル名がセッションごとに変わる）。
     let name_a = crate::tier2a::session_profile::profile_name_for("test-session-a");
     let name_b = crate::tier2a::session_profile::profile_name_for("test-session-b");
-    let sid_a = ensure_profile(&name_a).expect("session A profile");
-    let sid_b = ensure_profile(&name_b).expect("session B profile");
+    // [BUG-107] 他セッションの名前なので`ensure_profile`は拒む（作成点のfail-closed）。
+    // 「別セッションを実際に作る」ことがこのテストの前提そのものなので、テスト専用の口を使う。
+    let sid_a = ensure_profile_for_test(&name_a).expect("session A profile");
+    let sid_b = ensure_profile_for_test(&name_b).expect("session B profile");
 
     // 各セッションは自分のworkspaceにだけACEを持つ。
     let ws_a = tempfile::tempdir().unwrap();
@@ -1813,7 +1815,10 @@ impl ProbeProfile {
             crate::tier2a::session_profile::is_session_profile_name(&name),
             "the probe profile name must look like a real session profile: {name}"
         );
-        let sid = ensure_profile(&name).expect("create the probe AppContainer profile");
+        // [BUG-107] 自プロセスのpidを含むがトークンは別物（`<pid>-<tag>`）なので、
+        // `ensure_profile`は他セッションのものとして拒む。ここは「削除済みプロファイルの
+        // SID宛ACE」を作るための道具なので、テスト専用の口から作って`delete`で必ず消す。
+        let sid = ensure_profile_for_test(&name).expect("create the probe AppContainer profile");
         Self { name, sid }
     }
 
@@ -2594,4 +2599,44 @@ fn preflight_grants_each_declaration_in_its_declared_scope() {
             root.display()
         );
     }
+}
+
+/// **手動保守用の口**: 死んだセッションのAppContainerプロファイルを、製品と同じ経路で回収する。
+///
+/// 実行: `cargo test -p harness-sandbox --lib -- --ignored --nocapture reclaim_dead_session_profiles_now`
+///
+/// # なぜテストとして置くのか
+///
+/// 回収（`gc_dead_sessions_reporting`）は`preflight`の中でしか走らない——つまり
+/// **harnessを普通に起動する以外に回す手段が無い**。ところが「マシンに溜まった残骸を片付けたい」
+/// のは起動したくない場面（調査中・実機E2Eの前後）で起こる。実際にこれが必要になったのは
+/// [BUG-101](../../../../docs/bugs/BUG-101.md)と[BUG-107](../../../../docs/bugs/BUG-107.md)の
+/// 2回で、どちらも手作業の`DeleteAppContainerProfile`は**S_OKを返して何もしなかった**。
+///
+/// **製品の関数をそのまま呼ぶ**（`preflight`の該当2行と同じ）。ここに回収ロジックを書き写すと、
+/// 「保守用の経路だけが古い判断で消す」という最悪の形になる——削除の可否は
+/// `grant_audit`が実DACLを測って決めるものであり、その判断を迂回する口を作ってはいけない。
+///
+/// 台帳エントリを失ったプロファイルは`grants_known: false`として**見送られる**（消せない）。
+/// それらを回収したいときは、先に`tools/d63-restore-session-ledger.ps1`でエントリを復元し、
+/// **その前に`tools/d63-profile-sweep.ps1`でACEが残っていないことを実測する**こと。
+#[test]
+#[ignore = "maintenance: deletes dead sessions' AppContainer profiles on this real machine"]
+fn reclaim_dead_session_profiles_now() {
+    let before = crate::tier2a::session_profile::existing_profile_names();
+    let outcome = crate::tier2a::session_profile::gc_dead_sessions_reporting(&revoke_session_grant);
+    let after = crate::tier2a::session_profile::existing_profile_names();
+    println!(
+        "profiles: {} -> {} (deleted {}, revoked paths {})",
+        before.len(),
+        after.len(),
+        outcome.deleted_profiles,
+        outcome.revoked_paths
+    );
+    match outcome.summary() {
+        Some(summary) => println!("{summary}"),
+        None => println!("nothing to reclaim"),
+    }
+    // **見送りは失敗ではない**（消せないものを消さないのが正しい）ので、ここでは落とさない。
+    // 何が残ったかは上の要約に名前で出る。
 }

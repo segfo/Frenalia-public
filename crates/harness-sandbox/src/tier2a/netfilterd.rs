@@ -1151,7 +1151,16 @@ fn apply_one(
             target.profile
         )));
     }
-    let sid = win_appcontainer::ensure_profile(&target.profile)
+    // [BUG-107] **導出であって作成ではない。** ここは昇格した別プロセス（`harness-netfilterd`）
+    // なので、`ensure_profile`を呼ぶと**親のセッション名で親の資源を作る**——親のプロセスでは
+    // ないため台帳への登録（`begin_session`）が発火せず、回収できないプロファイルが1件残る
+    // （`cargo test`のたびに1件積まれていた実測値の正体がこれ）。
+    //
+    // WFPのフィルタ条件（`FWPM_CONDITION_ALE_PACKAGE_ID`）が要るのは**SIDの値だけ**で、
+    // プロファイルの実在は要らない。実在させる責任は親の`preflight`／`preflight_mcp_server`にあり、
+    // 本番の順序でも親が先（`select_tier`→`preflight`→ここ）である。
+    // 導出は名前のハッシュからの決定論なので、昇格先が別の管理者アカウント（別HKCU）でも同じ値になる。
+    let sid = win_appcontainer::derive_profile_sid(&target.profile)
         .map_err(|e| NetfilterError::Ipc(format!("failed to resolve sandbox SID: {e}")))?;
 
     // `NetfilterPolicy`はIPCワイヤ形式、`WfpOptions`はWFPエンジンへ渡す層のオプションで、
@@ -3072,5 +3081,68 @@ mod real_daemon_failure_tests {
                  did not happen and this test proves nothing."
             ),
         }
+    }
+
+    /// **[BUG-107](../../../../docs/bugs/BUG-107.md)の回帰テスト（症状そのもの）。**
+    ///
+    /// `ApplyRules`を受けたdaemonは対象プロファイルの**SIDを導出する**だけで、
+    /// `CreateAppContainerProfile`を呼ばない。かつてここは`ensure_profile`だったため、
+    /// **親のセッション名で親の資源を作りながら台帳には載せられず**（`begin_session`が発火するのは
+    /// 持ち主のプロセスだけ）、`cargo test`のたびに回収不能なプロファイルが1件ずつ実マシンへ
+    /// 積まれていた（実測で67件到達）。
+    ///
+    /// この欠陥は戻り値にも応答にも現れず、**実マシンの資源にしか現れない**。測るのは
+    /// **daemonへ送った名前ちょうど1件の実在**で、プロファイル全体の集合ではない
+    /// （`test-logic-rules`「何を測れば壊れたと言えるか」）。
+    ///
+    /// 集合で測ってはいけない理由は実測で分かっている——`existing_profiles()`は
+    /// `%LOCALAPPDATA%\Packages`を**列挙**し、`read_dir`が失敗すると空を返す。同じテストバイナリの
+    /// 別テスト（`ProbeProfile`）が並行でプロファイルを作り消ししているので、この列挙は揺れ、
+    /// **無関係な理由で赤くなる**（集合で書いた初版は6回中2回落ちた）。
+    #[test]
+    fn a_real_daemon_applying_rules_creates_no_appcontainer_profile() {
+        if crate::tier2a::privhelper::is_elevated() {
+            println!(
+                "SKIP: this test must run non-elevated (an elevated daemon would install real \
+                 WFP filters as a side effect)"
+            );
+            return;
+        }
+        let daemon = ensure_daemon_next_to_test_binary();
+        // このプロセスのセッション名。**他のテストは触らない**（作るとしたら持ち主である
+        // このプロセスだけで、通常実行でそれをするテストは無い）。
+        let target = crate::tier2a::session_profile::current_profile_name();
+        let before = crate::tier2a::session_profile::profile_exists(&target);
+
+        let prepared = prepare_pipe().expect("prepare pipe");
+        let pipe_name = prepared.name().to_string();
+        let pipe = prepared.into_handle();
+        let mut child = std::process::Command::new(&daemon)
+            .arg(&pipe_name)
+            .spawn()
+            .expect("spawn the real netfilterd non-elevated");
+
+        // 送る名前は**このプロセスのセッション名**——daemonから見れば他人のセッションであり、
+        // まさにこれを作ってしまっていた。ポートを1つ入れるのは、空だとWFPへ到達する前に
+        // 別の理由で返ってしまい、`apply_one`のSID解決を通らないため（隣のテストの教訓）。
+        let policy = NetfilterPolicy {
+            session_profile: target.clone(),
+            allow_loopback_tcp_ports: vec![18081],
+            ..Default::default()
+        };
+        // 応答の成否は問わない（非昇格なのでWFPは失敗する）。`ensure_profile`はWFPの適用より
+        // **前**に呼ばれていたので、失敗する経路でもプロファイルだけは作られていた。
+        let _ = NetfilterHandle::connect_after_chain_launch(pipe, policy)
+            .map_err(|failure| failure.into_error());
+        let _ = child.wait();
+
+        assert_eq!(
+            crate::tier2a::session_profile::profile_exists(&target),
+            before,
+            "the daemon changed whether {target} exists. It runs in a different process than the \
+             session that owns this name, so anything it creates there carries no session-ledger \
+             entry and can never be reclaimed (BUG-107). It must derive the SID, not ensure the \
+             profile."
+        );
     }
 }

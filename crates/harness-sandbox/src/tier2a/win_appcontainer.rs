@@ -76,6 +76,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::shell_tier::{FsAccess, FsPassthrough, GrantScope, WorkspaceWriteMode};
+use crate::tier2a::session_profile::ProfileOwner;
 use crate::win_common::{
     build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, long_path_wide,
     read_two_pipes_to_strings, wide, write_all,
@@ -105,6 +106,22 @@ pub enum AppContainerError {
     },
     #[error("appcontainer preflight failed: {0}")]
     Preflight(String),
+    /// [BUG-107] **他プロセスのセッションに属するプロファイルを作ろうとした。**
+    ///
+    /// 作成点のfail-closed。ここで作ると台帳エントリを持たないプロファイルになり、
+    /// `plan_reclaim`が`grants_known: false`と判定して永久に回収を見送る。
+    #[error(
+        "refusing to create the AppContainer profile {name}: it belongs to session {owner}, not \
+         this process ({mine}). Only the owning process may create its own session profile -- \
+         others must derive the SID instead (win_appcontainer::derive_profile_sid), because a \
+         profile created here would carry no ledger entry and could never be reclaimed \
+         (docs/bugs/BUG-107.md)"
+    )]
+    ForeignSessionProfile {
+        name: String,
+        owner: String,
+        mine: String,
+    },
 }
 
 impl From<windows::core::Error> for AppContainerError {
@@ -235,6 +252,28 @@ fn win32_err(op: &str, e: windows::core::Error) -> AppContainerError {
 /// capability再指定は不要で副作用が無い）。
 ///
 /// 同一プロファイルへの並行アクセスは[`PROFILE_LOCK`]で直列化する。
+///
+/// # 作れるのは「自分のもの」だけ（[BUG-107](../../../docs/bugs/BUG-107.md)）
+///
+/// 名前からトークンを取り出し（[`session_profile::token_of_profile`]。GCが所有者を決めるのと
+/// **同じ関数**）、次の3通りに分ける。
+///
+/// | 名前 | 扱い |
+/// |---|---|
+/// | このプロセスのセッションのもの（`run_shell`用・MCP用の両方） | `begin_session()`で**記録してから**作る（B-01） |
+/// | **他プロセス**のセッションのもの | `Err`。作らない |
+/// | トークンを持たない名前（旧共有`harness.shell.sandbox`） | 従来どおり作る |
+///
+/// かつてここは「このセッションの名前と一致するときだけ`begin_session()`を呼ぶ」と書いてあった。
+/// **その条件は同一プロセス内でしか成立しない** ——他プロセス（昇格した`harness-netfilterd`や
+/// `harness-privhelper`）が親のセッション名で呼ぶと、一致しないので黙って素通りし、
+/// **台帳エントリを持たないプロファイルだけがOSに残る**。`plan_reclaim`はそれを
+/// `grants_known: false`と判定して永久に回収を見送るので、1実行ごとに1件積み上がっていた
+/// （実測で確認。`cargo test`のたびに`harness-netfilterd.exe`の子が1件作っていた）。
+///
+/// 不変条件を「一致したら記録する」から**「一致しなければ作らせない」**へ裏返したのが上表で、
+/// これで呼び出し側が増えても記録なしの作成経路が生えない（B-06）。他プロセスが要るのは
+/// SIDの値だけなので、[`derive_profile_sid`]（副作用なし・名前からの決定的導出）を使う。
 pub fn ensure_profile(name: &str) -> Result<OwnedContainerSid, AppContainerError> {
     // [B-01] **このセッションのプロファイルを作るなら、先に台帳へ登録する。**
     //
@@ -244,14 +283,28 @@ pub fn ensure_profile(name: &str) -> Result<OwnedContainerSid, AppContainerError
     // つまり「記録せずに作る」と、その1件は誰にも回収できないままマシンに残り続ける。
     // 実際この機には66件たまっていた（2026-08-12に手作業で回収）。
     //
-    // `preflight`は最初から`begin_session()` → `ensure_profile()`の順で書かれていたが、
-    // **それ以外の経路（テストのヘルパー等）が直接ここへ来ていた**。呼び出し側の規律ではなく
-    // 作成点の不変条件にする（B-06: 入口が増えても守られる形にする）。
-    //
-    // 対象は**このセッションのプロファイル名のときだけ**。MCPサーバのプロファイル（D-38）は
-    // `record_mcp_profile`が別に登録し、旧共有名（`CONTAINER_NAME`）はセッションを持たない。
-    if name == crate::tier2a::session_profile::current_profile_name() {
-        crate::tier2a::session_profile::begin_session().map_err(AppContainerError::Preflight)?;
+    // [BUG-107] 所有者で3分岐する（関数docの表）。判定に使うのは`token_of_profile`——
+    // **GCが「誰のものか」を決めるのと同じ関数**なので、作成側と回収側で所有者の定義がずれない。
+    match crate::tier2a::session_profile::owner_of_profile(name) {
+        // このプロセスのセッション（`run_shell`用でもMCP用でも）。記録してから作る。
+        // `begin_session`は生存マーカー（名前付きmutex）も立てるので、作った瞬間から
+        // 他プロセスのGCに「死んだセッションの残骸」と誤認されない。
+        ProfileOwner::ThisSession => {
+            crate::tier2a::session_profile::begin_session()
+                .map_err(AppContainerError::Preflight)?;
+        }
+        // **他プロセスのセッション。作らない。** ここを通していたのがBUG-107の残っていた原因で、
+        // 呼び出し側（昇格側のnetfilterd/privhelper）はSIDの値しか要らない。
+        ProfileOwner::OtherSession(owner) => {
+            return Err(AppContainerError::ForeignSessionProfile {
+                name: name.to_string(),
+                owner: owner.to_string(),
+                mine: crate::tier2a::session_profile::session_token().to_string(),
+            })
+        }
+        // トークンを持たない名前＝旧共有プロファイル（`CONTAINER_NAME`）。セッションを持たない
+        // ので記録する相手も居ない。従来どおり作る。
+        ProfileOwner::Unowned => {}
     }
     crate::with_named_lock(PROFILE_LOCK, || ensure_profile_locked(name))
 }
@@ -428,6 +481,21 @@ mod cow_containment_tests;
 /// MCPサーバ隔離（D-38）の実機E2E。`docs/STATUS.md`「MCPクライアント機構」残課題#3/#4。
 #[cfg(all(windows, test))]
 mod mcp_e2e_tests;
+
+/// **テスト専用**の口。[`ensure_profile`]の所有者チェック（BUG-107）を迂回して、
+/// **他セッションのものに見える名前**のプロファイルを作る。
+///
+/// 「セッションAのサンドボックスからセッションBのworkspaceが読めないこと」や「プロファイルを
+/// 消した後もACEを剥がせること」は、**自分以外のセッションを実際に作らないと測れない**。
+/// 製品コードにはその必要が無い（他人のセッションを作る正当な理由が無いのがBUG-107の結論）ので、
+/// 公開面は広げずここだけ`#[cfg(test)]`で開ける——`grant_ace_mask_for_test`と同じ扱い。
+///
+/// **`begin_session`は呼ばない。** 呼ぶと台帳へ載るのは*このプロセス*のトークンで、名前とは
+/// 対応しないため回収の手掛かりにならない。ここで作ったプロファイルは**テスト自身が消すこと**。
+#[cfg(all(windows, test))]
+pub(crate) fn ensure_profile_for_test(name: &str) -> Result<OwnedContainerSid, AppContainerError> {
+    crate::with_named_lock(PROFILE_LOCK, || ensure_profile_locked(name))
+}
 
 /// **診断テスト専用**の口。任意のマスク・継承指定でACEを付ける。
 ///

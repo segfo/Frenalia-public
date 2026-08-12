@@ -211,6 +211,59 @@ pub fn plan_reclaim(
     targets
 }
 
+/// プロファイル名の**所有者**（[BUG-107](../../../docs/bugs/BUG-107.md)）。
+///
+/// 「誰のものか」の定義を[`token_of_profile`]1本に寄せるための型。GCが回収してよいかを決めるのも、
+/// [`crate::tier2a::win_appcontainer::ensure_profile`]が作ってよいかを決めるのも同じ根拠でなければ
+/// ならない——ずれると「作る側は自分のものと思い、回収する側は他人のものと思う」プロファイルが
+/// でき、それは永久に残る（B-05: コンパイラが守らない一致には唯一の判定点を置く）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileOwner<'a> {
+    /// このプロセスのセッションのもの（`run_shell`用・MCPサーバ用の両方）。
+    ThisSession,
+    /// **他プロセス**のセッションのもの。作ってよいのは持ち主だけ。
+    OtherSession(&'a str),
+    /// トークンを持たない名前＝旧共有プロファイル（[`LEGACY_SHARED_PROFILE`]）。
+    /// セッションに属さないので記録する相手も居ない。
+    Unowned,
+}
+
+/// プロファイル名の所有者を判定する（純粋関数。Win32もファイルも触らない）。
+pub fn owner_of_profile(name: &str) -> ProfileOwner<'_> {
+    match token_of_profile(name) {
+        Some(token) if token == session_token() => ProfileOwner::ThisSession,
+        Some(other) => ProfileOwner::OtherSession(other),
+        None => ProfileOwner::Unowned,
+    }
+}
+
+/// 実在するharness由来のプロファイル名（台帳非依存の列挙）。**テスト専用の口。**
+///
+/// GCの内部で使っているものを、**増減を測るため**にcrate内のテストへ開ける。BUG-107は
+/// 戻り値にも応答にも現れず「1実行あたり1件増える」という**実マシンの資源の数**でしか
+/// 検出できなかった欠陥で、その回帰テストは実行の前後でこの集合を突き合わせる以外に
+/// 書きようが無い。製品側の公開面は広げない（`grant_ace_mask_for_test`と同じ扱い）。
+#[cfg(all(windows, test))]
+pub(crate) fn existing_profile_names() -> Vec<String> {
+    win::existing_profiles()
+}
+
+/// **1つの名前のプロファイルが実在するか。テスト専用の口。**
+///
+/// [`existing_profile_names`]と違い、ディレクトリを**列挙しない**（対象1件を`stat`するだけ）。
+/// 列挙は`read_dir`が失敗すると空を返す設計で、`cargo test`のように**同じバイナリの別テストが
+/// プロファイルを作り消ししている最中**は結果が揺れる。「増えていないこと」を測るテストが
+/// その揺れを拾うと、直したはずの欠陥と無関係に赤くなる（実際に2/6の頻度で踏んだ）。
+///
+/// 測りたいのが**特定の1件**なら、そもそも列挙する必要が無い。
+#[cfg(all(windows, test))]
+pub(crate) fn profile_exists(name: &str) -> bool {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+        return false;
+    };
+    PathBuf::from(local).join("Packages").join(name).is_dir()
+}
+
 // --- Windows依存部（生存マーカー・プロファイル列挙・実際の作成/削除） ---
 
 #[cfg(windows)]
@@ -396,6 +449,17 @@ pub fn record_mcp_profile(server_id: &str) -> String {
     let token = session_token();
     let name = crate::tier2a::mcp_profile::current_mcp_profile_name(server_id);
     let entry_name = name.clone();
+    // [BUG-107] **ぶら下げる先が無ければ作る。** MCPエントリはセッションエントリの子なので、
+    // `begin_session`を通っていないと下の`update`は**黙って何もしない**——直後に
+    // `ensure_profile`が実資源を作るので、記録の無いプロファイルが残る（この欠陥の型そのもの）。
+    // 冪等なので、既に通っていれば何も起きない。
+    if let Err(e) = begin_session() {
+        eprintln!(
+            "warning: could not open a session ledger entry for the MCP profile {name} ({e}); \
+             its AppContainer profile will not be reclaimed automatically \
+             (see docs/bugs/BUG-107.md)"
+        );
+    }
     ledger().update(|l| {
         if let Some(entry) = l.sessions.iter_mut().find(|e| e.token == token) {
             if !entry.mcp.iter().any(|m| m.profile_name == entry_name) {
@@ -1050,5 +1114,54 @@ mod tests {
     fn session_token_is_stable_within_the_process() {
         assert_eq!(session_token(), session_token());
         assert!(current_profile_name().ends_with(session_token()));
+    }
+
+    /// **BUG-107の核心（禁止側）。** 他プロセスのセッションに属する名前は`OtherSession`である。
+    ///
+    /// これを`ensure_profile`が`Err`にすることで、「昇格した別プロセスが親のセッション名で
+    /// プロファイルを作り、しかし親ではないので台帳には載せられない」経路が閉じる。
+    /// 判定はトークンだけで行うので、`run_shell`用（`harness.shell.sandbox.<token>`）でも
+    /// MCPサーバ用（`harness.mcp.<token>.<id>`）でも同じ結論になる。
+    #[test]
+    fn a_profile_belonging_to_another_session_is_not_ours() {
+        assert_eq!(
+            owner_of_profile("harness.shell.sandbox.999999-1"),
+            ProfileOwner::OtherSession("999999-1")
+        );
+        assert_eq!(
+            owner_of_profile("harness.mcp.999999-1.docs"),
+            ProfileOwner::OtherSession("999999-1")
+        );
+    }
+
+    /// **対になる許可側**（B-35）。これが無いと「常に`OtherSession`を返す」実装でも上が通り、
+    /// 自分のプロファイルまで作れなくなったことに気付けない。
+    #[test]
+    fn our_own_session_profiles_are_ours_in_both_families() {
+        assert_eq!(
+            owner_of_profile(&current_profile_name()),
+            ProfileOwner::ThisSession
+        );
+        assert_eq!(
+            owner_of_profile(&crate::tier2a::mcp_profile::current_mcp_profile_name(
+                "docs"
+            )),
+            ProfileOwner::ThisSession
+        );
+    }
+
+    /// 旧共有プロファイルはセッションに属さない（記録する相手が居ないので、従来どおり作れる）。
+    /// **`OtherSession`へ落としてはいけない**——落とすと`harness fs revoke`等が旧共有名を
+    /// 扱えなくなり、実マシンに残っているtraverse ACEを剥がせなくなる（BUG-046/BUG-061）。
+    #[test]
+    fn the_legacy_shared_profile_belongs_to_no_session() {
+        assert_eq!(
+            owner_of_profile(LEGACY_SHARED_PROFILE),
+            ProfileOwner::Unowned
+        );
+        assert_eq!(
+            owner_of_profile("microsoft.windowsterminal"),
+            ProfileOwner::Unowned
+        );
     }
 }

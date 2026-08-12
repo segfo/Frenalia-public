@@ -448,7 +448,12 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                     .collect();
                 (Vec::new(), failures)
             } else {
-                match win_appcontainer::ensure_profile(&session_profile) {
+                // [BUG-107] **導出であって作成ではない。** ここは昇格した別プロセスなので、
+                // `ensure_profile`だと親のセッション名で資源を作りながら台帳には載せられない
+                // （`begin_session`が発火するのは持ち主のプロセスだけ）。しかも`runas`の昇格先が
+                // 別の管理者アカウントだと**別のHKCUハイブ**に作るので、非昇格側からは見えない
+                // プロファイルが増える。ACEを付けるのに要るのはSIDの値だけである。
+                match win_appcontainer::derive_profile_sid(&session_profile) {
                     Ok(session_sid) => {
                         grant_fs_allow_entries(session_sid.as_psid(), fs_allow_entries)
                     }
