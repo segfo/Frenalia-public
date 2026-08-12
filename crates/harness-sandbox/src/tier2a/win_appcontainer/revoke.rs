@@ -499,7 +499,8 @@ pub(crate) fn protect_harness_control_dir_from_appcontainer(
     for node in files.iter().chain(dirs.iter().rev()) {
         let mut node_protected = true;
         for sid in sids {
-            node_protected = remove_sid_aces_and_protect(node, *sid)?;
+            node_protected =
+                remove_sid_aces_and_protect(node, *sid).map_err(explain_control_plane_failure)?;
             // 消えたノードは以降のSIDでも同じなので、残りは試さない。
             if !node_protected {
                 break;
@@ -510,6 +511,33 @@ pub(crate) fn protect_harness_control_dir_from_appcontainer(
         }
     }
     Ok(protected)
+}
+
+/// 制御面の保護に失敗したノードへ、**分かっている原因と回復手段**を添える
+/// （[BUG-109](../../../../docs/bugs/BUG-109.md)）。
+///
+/// この失敗の既知の原因は1つだけである——**そのノードを昇格した収集器
+/// （`harness-policy-learnd.exe`）が作った**場合、所有者が`BUILTIN\Administrators`になり、
+/// 非昇格のharnessは`WRITE_DAC`を持たない（継承ACEが与えるのはModifyまで）。
+/// `.harness/**`は1ノードでも保護できなければ制御面がAppContainerから隔離できず、
+/// Tier2aはfail-closedで中止する。
+///
+/// **原因をエラー文字列の綴りから当てない**（B-33: 他人が出した文言はロケールで変わる）。
+/// ここは「どのノードで失敗したか」という自分の知っている事実だけを足し、
+/// 「UACを断ったのだろう」という**測っていない推測はしない**（B-32）。
+fn explain_control_plane_failure(e: AppContainerError) -> AppContainerError {
+    let AppContainerError::AclGrant { path, reason } = e else {
+        return e;
+    };
+    AppContainerError::AclGrant {
+        path: path.clone(),
+        reason: format!(
+            "{reason} -- this is a control-plane node under .harness/ and it could not be \
+             re-secured. If it was created by the elevated collector it is owned by \
+             Administrators, and this (non-elevated) process cannot write its DACL; delete it \
+             or take ownership of it, then retry (see docs/bugs/BUG-109.md)"
+        ),
+    }
 }
 
 /// [BUG-083] [`protect_harness_control_dir_from_appcontainer`]が立てた継承遮断

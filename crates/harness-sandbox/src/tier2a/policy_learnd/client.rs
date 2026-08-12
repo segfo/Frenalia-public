@@ -87,8 +87,7 @@ impl PolicyLearnHandle {
 
     /// 生きているdaemonへ次の記録の`StartCollect`を送る（**UACは出ない**）。
     pub fn start_collect(&mut self, policy: &LearnPolicy) -> Result<(), LearnError> {
-        let bytes = serde_json::to_vec(&LearnRequest::StartCollect(policy.clone()))
-            .map_err(|e| LearnError::Ipc(format!("failed to serialize StartCollect: {e}")))?;
+        let bytes = start_collect_bytes(policy)?;
         write_framed_timeout(self.pipe, &bytes, REQUEST_WRITE_TIMEOUT)
             .map_err(|e| LearnError::Ipc(e.to_string()))?;
         let response = read_framed_timeout(self.pipe, START_RESPONSE_TIMEOUT)
@@ -428,6 +427,58 @@ pub fn daemon_is_dead(error: &LearnError) -> bool {
     }
 }
 
+/// **監査ログのシンクを、依頼する側（非昇格）が先に作る**
+/// （[BUG-109](../../../../docs/bugs/BUG-109.md)）。
+///
+/// 収集器は`OpenOptions::create(true).append(true)`でこのファイルを開く（`server.rs`）。
+/// **収集器は昇格している**（ETWリアルタイムセッションの開始に管理者権限が要る）ので、
+/// 収集器が先に作ると所有者が`BUILTIN\Administrators`になり、**非昇格のharnessは以後
+/// そのファイルのDACLを書けなくなる**（所有者ではなく、継承ACEが与えるのはModifyまでで
+/// `WRITE_DAC`を含まない）。
+///
+/// これは単なる行儀の問題ではない。シンクは`<workspace>/.harness/sandbox/`配下＝**制御面**に
+/// あり、`preflight`は起動のたびに`.harness/**`の全ノードへ保護DACLを書いて
+/// AppContainerから隔離する（D-05のhard-deny）。1ノードでも書けなければ保護は完成せず、
+/// Tier2aはfail-closedで中止する——つまり**パス1が、パス2にはもう触れないファイルを
+/// 制御面に作る**という形で、同じworkspaceでの記録が二度と成立しなくなっていた。
+///
+/// 先に作っておけば所有者は依頼した側になり、収集器は追記するだけになる。
+/// **失敗しても止めない**——ここで作れないなら収集器も作れない見込みで、その失敗は
+/// 収集器側の応答（`LearnResponse::Err`）として返る方が情報量が多い（B-10: 握り潰さないが、
+/// 判断は理由を持っている側に任せる）。
+/// `StartCollect`のワイヤ表現を作る。
+///
+/// **シンクの先行作成をここに閉じ込める。** 送信点は2つある（生きているdaemonへの再送＝
+/// [`PolicyLearnHandle::start_collect`]と、起こした直後の[`handshake`]）ので、
+/// 「送る前に作る」を各所へ書くと3つ目が生えたときに片方だけ漏れる（B-06: 選ぶ自由を奪う）。
+fn start_collect_bytes(policy: &LearnPolicy) -> Result<Vec<u8>, LearnError> {
+    precreate_audit_sink(policy);
+    serde_json::to_vec(&LearnRequest::StartCollect(policy.clone()))
+        .map_err(|e| LearnError::Ipc(format!("failed to serialize StartCollect: {e}")))
+}
+
+fn precreate_audit_sink(policy: &LearnPolicy) {
+    let path = &policy.fs_audit_log_path;
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        eprintln!(
+            "warning: could not pre-create the policy-learn audit sink {}: {e}. The elevated \
+             collector will create it instead, which leaves it owned by Administrators and \
+             makes the control-plane protection fail on later runs (see docs/bugs/BUG-109.md)",
+            path.display()
+        );
+    }
+}
+
 fn handshake(pipe: HANDLE, policy: &LearnPolicy) -> Result<bool, LearnError> {
     connect_with_timeout(pipe, CONNECT_TIMEOUT).map_err(|e| {
         LearnError::Ipc(format!(
@@ -435,8 +486,7 @@ fn handshake(pipe: HANDLE, policy: &LearnPolicy) -> Result<bool, LearnError> {
              still pending user interaction)"
         ))
     })?;
-    let bytes = serde_json::to_vec(&LearnRequest::StartCollect(policy.clone()))
-        .map_err(|e| LearnError::Ipc(format!("failed to serialize StartCollect: {e}")))?;
+    let bytes = start_collect_bytes(policy)?;
     write_framed_timeout(pipe, &bytes, REQUEST_WRITE_TIMEOUT)
         .map_err(|e| LearnError::Ipc(e.to_string()))?;
     let response = read_framed_timeout(pipe, START_RESPONSE_TIMEOUT)
@@ -489,4 +539,70 @@ unsafe fn launch_elevated(path: &std::path::Path, pipe_name: &str) -> Result<HAN
         )));
     }
     Ok(info.hProcess)
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    fn policy(sink: PathBuf) -> LearnPolicy {
+        LearnPolicy {
+            session_profile: "harness.shell.sandbox.1-2".to_string(),
+            workspace_root: PathBuf::from("C:/work"),
+            fs_audit_log_path: sink,
+            harness_pid: None,
+            record_all: false,
+        }
+    }
+
+    /// **[BUG-109] 監査ログのシンクは、依頼する側（非昇格）が先に作る。**
+    ///
+    /// 昇格した収集器に作らせると所有者が`BUILTIN\Administrators`になり、非昇格のharnessは
+    /// 以後そのファイルのDACLを書けない。シンクは`.harness/`配下＝制御面にあるので、
+    /// 次の`preflight`が`.harness/**`を保護しきれず、Tier2aがfail-closedで中止する
+    /// ——同じworkspaceでパス1を1回でも回すとパス2が二度と成立しなくなっていた。
+    ///
+    /// 所有者そのものはこのプロセスの昇格状態に依存するので断定しない。ここで固定するのは
+    /// **依頼を送る前にファイルが存在すること**（＝収集器の`create(true)`が作成側に
+    /// 回らないこと）である。
+    ///
+    /// **測る対象は`start_collect_bytes`**——送信点2つが実際に通る関数がここだからで、
+    /// `precreate_audit_sink`を直接呼ぶと「配線されていなくても緑」になる。
+    #[test]
+    fn the_audit_sink_exists_before_the_collector_is_asked_to_open_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 親ディレクトリも未作成の状態から始める（実際の記録セッションはこの形）。
+        let sink = tmp
+            .path()
+            .join("sandbox")
+            .join("s-1")
+            .join("fs-audit.jsonl");
+        assert!(!sink.exists());
+
+        let bytes = start_collect_bytes(&policy(sink.clone())).expect("serialize StartCollect");
+
+        assert!(
+            sink.exists(),
+            "収集器へ渡す前にシンクが無ければ、作るのは昇格側になる"
+        );
+        // 依頼そのものが壊れていないことも同時に見る（作るだけになっていないか）。
+        assert!(String::from_utf8_lossy(&bytes).contains("StartCollect"));
+    }
+
+    /// **既にあるシンクの中身を消さない。** 収集器は`append`で開くので、こちらが
+    /// `create(true).truncate(true)`のような開き方をすると、再接続のたびに前の観測が
+    /// 消える（`start_collect`は生きているdaemonへ再送する経路でも通る）。
+    #[test]
+    fn precreating_an_existing_sink_keeps_what_was_already_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = tmp.path().join("fs-audit.jsonl");
+        std::fs::write(&sink, "{\"already\":\"recorded\"}\n").unwrap();
+
+        start_collect_bytes(&policy(sink.clone())).expect("serialize StartCollect");
+
+        assert_eq!(
+            std::fs::read_to_string(&sink).unwrap(),
+            "{\"already\":\"recorded\"}\n"
+        );
+    }
 }

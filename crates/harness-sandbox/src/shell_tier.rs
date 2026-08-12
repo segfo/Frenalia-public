@@ -26,11 +26,16 @@ pub enum TierError {
     // **`--tier1`を勧めない。** Tier1では低ILラベルがcwd 1個にしか付かないため、
     // ビルド・テスト・`git commit`のいずれも通らない（`tier1::win_restricted`のdocの表）。
     // 「代替Tierがある」かのような案内は、試して失敗するまでの時間を無駄にさせる（B-32）。
-    // 昇格できないユーザーはそもそもここへ来ない（Tier0へ宣言付きで降格する）ので、
-    // このエラーが出るのは「昇格できるのに今回失敗した」場合だけである。
+    //
+    // [BUG-109] **「UACを断ったのだろう」と断定しない。** かつてここは
+    // 「昇格できるのに今回失敗したのだから、たぶん断られたUACだ。受け入れて再実行せよ」と
+    // 書いていたが、その推測が外れる経路が実在した——制御面のノードを昇格した収集器が作り、
+    // 非昇格のharnessがそのDACLを書けない場合で、**UACは一度も提示されない**（進捗表示は
+    // 「UACが最大0回出ます」と正しく出していた）。再実行しても同じ場所で永久に止まる。
+    // 原因は`reason`が既に名指ししているので、案内は**それを読ませる**側へ倒す（B-32）。
     #[error(
-        "{attempted} is unavailable: {reason}. This account can elevate, so this is most likely a \
-         declined UAC prompt or a helper failure — retry and accept the prompt. \
+        "{attempted} is unavailable: {reason}. Read that reason first -- if it names a path, that \
+         path is the thing to fix. If a UAC prompt appeared and was declined, accept it and retry. \
          (--tier1 exists but cannot run builds, tests or git commits, so it is not a substitute.)"
     )]
     Unavailable {
