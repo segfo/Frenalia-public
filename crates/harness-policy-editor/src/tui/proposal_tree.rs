@@ -111,6 +111,12 @@ impl ProposalTree {
         &self.nodes[index]
     }
 
+    /// ノードの総数（展開状態に関係なく全部）。パス文字列からノードを引き直す走査に使う
+    /// ——`recursive`の印は木が作り直されても残るよう**パスで**持っているため（D-63）。
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// 展開されているノードだけを、上から見える順に並べる。
     pub fn rows(&self, expanded: &HashSet<String>) -> Vec<Row> {
         let mut out = Vec::new();
@@ -139,6 +145,25 @@ impl ProposalTree {
             stack.extend(self.nodes[node].children.iter().copied());
         }
         out.sort_unstable();
+        out
+    }
+
+    /// **親行の一括選択（スペース）が対象にする候補。** 子を持つノードでは
+    /// **自分自身の候補を含めない**（D-62）。
+    ///
+    /// 祖先チェーンのオープンで、ディレクトリ自身が拒否として観測されることがある。そのとき
+    /// そのノードは「構造」であると同時に「値がディレクトリの候補」でもあり、一括選択へ混ぜると
+    /// **画面に見えている行数と、実際に開く範囲（サブツリー全体）が食い違う**。
+    ///
+    /// **承認側だけの規則である。** 宣言画面の取り消し（`declared`）は[`Self::subtree_proposals`]を
+    /// そのまま使う——あちらは権限を**狭める**操作なので、ディレクトリ自身の宣言こそ
+    /// まとめて外せるべきである。広げる側は保守的に、狭める側は網羅的に。
+    pub fn bulk_selectable_proposals(&self, index: usize) -> Vec<usize> {
+        let mut out = self.subtree_proposals(index);
+        if self.has_children(index) {
+            let own = &self.nodes[index].proposals;
+            out.retain(|i| !own.contains(i));
+        }
         out
     }
 

@@ -56,9 +56,6 @@ enum Command {
         /// workspaceルート（既定: カレントディレクトリ）。記録の置き場の基準。
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// 一般化の度合い（none/dir/auto、既定: dir）。
-        #[arg(long)]
-        generalize: Option<String>,
         /// この秒数を過ぎたら対象コマンドを打ち切る。
         #[arg(long)]
         timeout: Option<u64>,
@@ -85,8 +82,7 @@ enum Command {
         #[arg(long)]
         cwd: Option<PathBuf>,
         #[arg(long)]
-        generalize: Option<String>,
-        /// この秒数を過ぎたら対象コマンドを打ち切る。
+            /// この秒数を過ぎたら対象コマンドを打ち切る。
         #[arg(long)]
         timeout: Option<u64>,
         #[arg(long)]
@@ -102,8 +98,7 @@ enum Command {
         #[arg(long)]
         workspace: Option<PathBuf>,
         #[arg(long)]
-        generalize: Option<String>,
-        #[arg(long)]
+            #[arg(long)]
         limit: Option<usize>,
         /// 観測したプロセスツリーも表示する。
         #[arg(long)]
@@ -129,8 +124,7 @@ enum Command {
         accept: Vec<String>,
         /// `show`に渡したのと同じ値を指定すること（idは一般化の度合いで変わる）。
         #[arg(long)]
-        generalize: Option<String>,
-        /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
+            /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
         #[arg(long)]
         require_sandbox: Option<String>,
         /// 差分を確認済みとして書き込む（非対話では必須）。
@@ -188,36 +182,32 @@ fn main() -> ExitCode {
         Some(Command::Record {
             cwd,
             workspace,
-            generalize,
             timeout,
             limit,
             command,
-        }) => run_record(cwd, workspace, generalize, timeout, limit, &command),
+        }) => run_record(cwd, workspace, timeout, limit, &command),
         Some(Command::RecordNet {
             domain,
             workspace,
             cwd,
-            generalize,
             timeout,
             limit,
             command,
         }) => run_record_net(
-            &domain, workspace, cwd, generalize, timeout, limit, &command,
+            &domain, workspace, cwd, timeout, limit, &command,
         ),
         Some(Command::Show {
             session,
             workspace,
-            generalize,
             limit,
             tree,
             net,
-        }) => run_show(session.as_deref(), workspace, generalize, limit, tree, net),
+        }) => run_show(session.as_deref(), workspace, limit, tree, net),
         Some(Command::Approve {
             session,
             workspace,
             domain,
             accept,
-            generalize,
             require_sandbox,
             yes,
         }) => run_approve(
@@ -225,7 +215,6 @@ fn main() -> ExitCode {
             workspace,
             domain.as_deref(),
             &accept,
-            generalize,
             require_sandbox.as_deref(),
             yes,
         ),
@@ -289,7 +278,6 @@ fn run_tui(_workspace: Option<PathBuf>) -> ExitCode {
 fn run_record(
     cwd: Option<PathBuf>,
     workspace: Option<PathBuf>,
-    generalize: Option<String>,
     timeout: Option<u64>,
     limit: Option<usize>,
     command: &[String],
@@ -300,9 +288,6 @@ fn run_record(
     let cwd = cwd
         .map(|p| harness_sandbox::session_scope::normalize_workspace_root(&p))
         .unwrap_or_else(|| workspace_root.clone());
-    let Some(generalization) = resolve_generalization(&generalize) else {
-        return ExitCode::FAILURE;
-    };
     let limit = resolve_limit(limit);
     let command = command.join(" ");
 
@@ -391,13 +376,13 @@ fn run_record(
     println!();
     print!(
         "{}",
-        harness_policy_editor::aggregate::render(&outcome.aggregate, generalization, limit)
+        harness_policy_editor::aggregate::render(&outcome.aggregate, limit)
     );
     println!();
     println!("記録セッション: {}", outcome.session_id);
     println!("監査ログ: {}", outcome.audit_log_path.display());
     println!(
-        "この記録を見直す: harness-policy-editor show {} --generalize <none|dir|auto>",
+        "この記録を見直す: harness-policy-editor show {}",
         outcome.session_id
     );
     println!(
@@ -412,7 +397,6 @@ fn run_record(
 fn run_record(
     _cwd: Option<PathBuf>,
     _workspace: Option<PathBuf>,
-    _generalize: Option<String>,
     _timeout: Option<u64>,
     _limit: Option<usize>,
     _command: &[String],
@@ -427,7 +411,6 @@ fn run_record_net(
     domain_name: &str,
     workspace: Option<PathBuf>,
     cwd: Option<PathBuf>,
-    generalize: Option<String>,
     timeout: Option<u64>,
     limit: Option<usize>,
     command: &[String],
@@ -446,9 +429,6 @@ fn run_record_net(
     // 収集器も同じ理由・同じ順序で持つ（`_grants`より後＝`Teardown`がプロファイル削除より先）。
     let collector = harness_policy_editor::record::SharedCollector::hold();
     let workspace_root = resolve_workspace(workspace);
-    let Some(generalization) = resolve_generalization(&generalize) else {
-        return ExitCode::FAILURE;
-    };
     let limit = resolve_limit(limit);
 
     let policy = match harness_policy_editor::policy_file::load(&workspace_root) {
@@ -646,7 +626,7 @@ fn run_record_net(
     println!();
     print!(
         "{}",
-        harness_policy_editor::net_aggregate::render(&outcome.aggregate, generalization, limit)
+        harness_policy_editor::net_aggregate::render(&outcome.aggregate, limit)
     );
     // **FSの拒否欄はネットワーク候補とは別枠**（スキーマも意味も違う）。文言は実行側が持つ。
     print!(
@@ -673,7 +653,7 @@ fn run_record_net(
         }
     }
     println!(
-        "この記録を見直す: harness-policy-editor show {} --net --generalize <none|dir|auto>",
+        "この記録を見直す: harness-policy-editor show {} --net",
         outcome.session_id
     );
     println!(
@@ -689,7 +669,6 @@ fn run_record_net(
     _domain_name: &str,
     _workspace: Option<PathBuf>,
     _cwd: Option<PathBuf>,
-    _generalize: Option<String>,
     _timeout: Option<u64>,
     _limit: Option<usize>,
     _command: &[String],
@@ -701,7 +680,6 @@ fn run_record_net(
 fn run_show(
     session: Option<&str>,
     workspace: Option<PathBuf>,
-    generalize: Option<String>,
     limit: Option<usize>,
     tree: bool,
     net: bool,
@@ -709,9 +687,6 @@ fn run_show(
     use harness_policy_editor::session_dir;
 
     let workspace_root = resolve_workspace(workspace);
-    let Some(generalization) = resolve_generalization(&generalize) else {
-        return ExitCode::FAILURE;
-    };
     let limit = resolve_limit(limit);
 
     let found = match session {
@@ -761,7 +736,7 @@ fn run_show(
         let aggregate = harness_policy_editor::net_aggregate::from_log(&dir.net_audit_log_path());
         print!(
             "{}",
-            harness_policy_editor::net_aggregate::render(&aggregate, generalization, limit)
+            harness_policy_editor::net_aggregate::render(&aggregate, limit)
         );
         // `--net`は「ネットワークだけ」の意思表示なので、FS側は出さない。
         if net {
@@ -787,7 +762,7 @@ fn run_show(
         // 何も観測できていないことは`render_notes`が別に言う（D-43）。
         print!(
             "{}",
-            harness_policy_editor::aggregate::render(&fs, generalization, limit)
+            harness_policy_editor::aggregate::render(&fs, limit)
         );
         if tree {
             print!(
@@ -807,7 +782,7 @@ fn run_show(
     let aggregate = harness_policy_editor::aggregate::from_session(&dir, &manifest);
     print!(
         "{}",
-        harness_policy_editor::aggregate::render(&aggregate, generalization, limit)
+        harness_policy_editor::aggregate::render(&aggregate, limit)
     );
     if tree {
         println!();
@@ -825,7 +800,6 @@ fn run_approve(
     workspace: Option<PathBuf>,
     domain: Option<&str>,
     accept: &[String],
-    generalize: Option<String>,
     require_sandbox: Option<&str>,
     yes: bool,
 ) -> ExitCode {
@@ -833,9 +807,6 @@ fn run_approve(
     use harness_policy_editor::session_dir;
 
     let workspace_root = resolve_workspace(workspace);
-    let Some(generalization) = resolve_generalization(&generalize) else {
-        return ExitCode::FAILURE;
-    };
     let Some(require_sandbox) = resolve_require_sandbox(require_sandbox) else {
         return ExitCode::FAILURE;
     };
@@ -853,9 +824,9 @@ fn run_approve(
         return ExitCode::FAILURE;
     };
 
-    // idは`--generalize`に依存するので、`show`とまったく同じ経路で作り直す。
+    // idは候補の並びから決まるので、`show`とまったく同じ経路で作り直す。
     let aggregate = harness_policy_editor::aggregate::from_session(&dir, &manifest);
-    let proposals = aggregate.proposals(generalization);
+    let proposals = aggregate.proposals();
 
     // ドメイン名の既定はコマンドの先頭トークン（`cargo build` → `cargo`）。
     let domain = domain.map(|d| d.to_string()).unwrap_or_else(|| {
@@ -1297,19 +1268,6 @@ fn resolve_workspace(workspace: Option<PathBuf>) -> PathBuf {
     // 綴りを揃えるのは**境界で1度だけ**（B-19）。harness本体の`--cwd`と同じ関数を通す
     // ——規則を2つ持つとBUG-066/BUG-068と同型の穴になる。
     harness_sandbox::session_scope::normalize_workspace_root(&raw)
-}
-
-fn resolve_generalization(raw: &Option<String>) -> Option<harness_policy::Generalization> {
-    match raw {
-        None => Some(harness_policy::Generalization::Directory),
-        Some(value) => match harness_policy::Generalization::parse(value) {
-            Some(mode) => Some(mode),
-            None => {
-                eprintln!("--generalize は none / dir / auto のいずれかです（指定: {value}）");
-                None
-            }
-        },
-    }
 }
 
 /// `0`は「全件」の意味。表示件数の上限として`usize::MAX`へ読み替える。

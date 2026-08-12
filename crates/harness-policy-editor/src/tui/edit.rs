@@ -9,14 +9,19 @@
 //! `plan`をもう一度作り直すのは、差分を見せている間に`policy.json`が別の経路で変わっていた
 //! 場合に、古い読み込み結果で上書きしないため（承認は和集合マージなので作り直しても安全）。
 //!
-//! # idは一般化の度合いで変わる
+//! # 「まとめて選ぶ」と「広げる」を別のキーに分ける（D-62）
 //!
-//! `--generalize`を切り替えると提案idは付け直される（`approve`のエラー文がそう明記している）。
-//! 選択を残したまま度合いだけ変えると、**ユーザーが選んだつもりのものと違う候補が承認される**。
-//! 切り替え時は選択を破棄し、破棄した事実を必ず出す。
+//! 候補は**観測された値そのまま**で、パスの一般化はしない。まとめて選びたいという要求は
+//! 値ではなく**表示**（[`super::proposal_tree::ProposalTree`]）で満たす——親行でスペースを押すと
+//! 配下の候補が個別に選ばれる。値を書き換えないので、選んだ件数と開く範囲が一致する。
+//!
+//! ただし祖先チェーンのオープンで**ディレクトリ自身が拒否として観測される**ことがあり、
+//! その候補だけは値がディレクトリになる（＝承認するとサブツリー全体が開く）。これを
+//! スペースへ混ぜると「画面にはN行しか見えていないのに全部開く」になるので、
+//! スペースの対象から外し、`d`（[`App::toggle_node_itself`]）で明示的に選ばせる。
+//! 外したことも、`d`という出口があることも、その場で必ず出す（B-32）。
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use harness_policy::Generalization;
 
 use crate::approve::{self, ApproveRequest, PathClass};
 use crate::policy_file;
@@ -100,7 +105,7 @@ impl App {
                 fs: Some(Box::new(fs)),
                 net: Some(Box::new(net)),
             };
-            let proposals = data.proposals(self.generalization);
+            let proposals = data.proposals();
             SessionView::new(data, notes, tree, proposals)
         } else {
             let aggregate = crate::aggregate::from_session(&entry.dir, &manifest);
@@ -121,7 +126,7 @@ impl App {
                 fs: Some(Box::new(aggregate)),
                 net: None,
             };
-            let proposals = data.proposals(self.generalization);
+            let proposals = data.proposals();
             SessionView::new(data, notes, tree, proposals)
         };
         self.view = Some(view);
@@ -139,22 +144,6 @@ impl App {
         // その経路だけ古い宣言で判定することになる。
         self.unapproved.clear();
         self.refresh_declared_overlay();
-    }
-
-    fn recompute_proposals(&mut self) {
-        let mode = self.generalization;
-        if let Some(view) = self.view.take() {
-            let proposals = view.data.proposals(mode);
-            // 共通の警告は候補の顔ぶれで変わるので、作り直す（`new`を通す）。
-            self.view = Some(SessionView::new(
-                view.data, view.notes, view.tree, proposals,
-            ));
-        }
-        self.selected_row = 0;
-        // 選択を先頭へ戻すなら**表示位置も戻す**（対の片方だけ書かない）。
-        // 残すと、短い一覧へ切り替えたときに窓だけが下へ取り残される。
-        self.candidate_list_offset = 0;
-        self.rebuild_tree();
     }
 
     pub(crate) fn on_edit_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -219,21 +208,14 @@ impl App {
             KeyCode::Char('c') if self.edit_focus == EditField::Proposals => {
                 self.cycle_selected_access()
             }
-            KeyCode::Char('g') => self.cycle_generalization(),
+            KeyCode::Char('d') if self.edit_focus == EditField::Proposals => {
+                self.toggle_node_itself()
+            }
+            KeyCode::Char('R') if self.edit_focus == EditField::Proposals => {
+                self.toggle_recursive()
+            }
             KeyCode::Char('f') => self.cycle_filter(),
             KeyCode::Char('t') => self.show_tree = !self.show_tree,
-            KeyCode::Char('r') => {
-                // 読み直すと候補を作り直すので、手で変えたaccessは戻る（`open_selected_session`が
-                // 消す）。**戻ったことを言う**——黙って戻ると、変えたつもりのまま承認しに行く。
-                let had_hand_changes = !self.hand_changed.is_empty();
-                self.reload_sessions();
-                self.open_selected_session();
-                self.status = if had_hand_changes {
-                    "記録セッションを読み直しました（手で変えたaccessは元に戻りました）".to_string()
-                } else {
-                    "記録セッションを読み直しました".to_string()
-                };
-            }
             KeyCode::Char('a') => self.request_approval(),
             _ => {}
         }
@@ -341,13 +323,22 @@ impl App {
         }
     }
 
-    /// スペースキー: **選択中のノードの配下（自分を含む）をまとめて**選択／解除する。
+    /// スペースキー: **選択中のノードの配下をまとめて**選択／解除する。
     ///
     /// 葉ならその候補1件、ディレクトリならその下の全部が対象になる。全部が既に選択済みなら
     /// 解除、そうでなければ選択（部分選択の状態から押したら「全部選ぶ」が期待だろう）。
     ///
     /// **広すぎる値は入れない。** `approve::plan`は1件でも混ざると何も書かずに全部を拒否するので、
     /// 一括選択でそれを混ぜると、選び直しが必要になったことすら分かりにくい。
+    ///
+    /// # 子を持つノード自身の候補は**含めない**（D-62）
+    ///
+    /// 祖先チェーンのオープンで**ディレクトリ自身が拒否として観測される**ことがあり、その場合
+    /// そのノードは「構造」であると同時に「値がディレクトリの候補」でもある。これを一括選択へ
+    /// 混ぜると、画面には配下のファイルがN行見えているのに、承認されるのは**サブツリー全体**に
+    /// なる（ディレクトリへの付与は継承ACE）。**見えている行数と実際に開く範囲が食い違う**ので、
+    /// スペースは配下だけを対象にし、ノード自身は`d`（[`Self::toggle_node_itself`]）で
+    /// 明示的に選ばせる。
     fn toggle_selected_subtree(&mut self) {
         let Some(node) = self.selected_node() else {
             return;
@@ -355,7 +346,7 @@ impl App {
         let Some(view) = self.view.as_ref() else {
             return;
         };
-        let under = self.tree.subtree_proposals(node);
+        let under = self.tree.bulk_selectable_proposals(node);
         let approvable: Vec<&harness_policy::RuleProposal> = under
             .iter()
             .filter(|i| !view.too_broad[**i])
@@ -365,11 +356,20 @@ impl App {
 
         if approvable.is_empty() {
             // ここには承認できるものが1件も無い。**なぜ何も起きないのかを言う**（B-32）。
+            // ノード自身が候補（＝ディレクトリ自身が観測された）ときは、`d`という出口も言う
+            // ——出口を言わない警告は半分しか役に立たない。
+            let own_is_a_candidate =
+                self.tree.has_children(node) && !self.tree.node(node).proposals.is_empty();
             self.status = match under.first().map(|i| &view.proposals[*i]) {
                 Some(proposal) => match harness_policy::breadth::check(proposal).message() {
                     Some(reason) => format!("{} は承認できません: {reason}", proposal.value),
                     None => "この配下に承認できる候補はありません".to_string(),
                 },
+                None if own_is_a_candidate => format!(
+                    "{} の配下に候補はありません（このディレクトリ自身は候補ですが、\
+                     承認すると配下すべてが開くので d で明示的に選んでください）",
+                    self.tree.node(node).path
+                ),
                 None => "この配下に候補はありません".to_string(),
             };
             return;
@@ -410,6 +410,14 @@ impl App {
                 self.unapproved.remove(target);
             }
             self.status = format!("{label} の配下 {}件を選択しました", ids.len());
+        }
+        // **このノード自身を外したことも言う**（D-62・B-32）。黙って外すと、承認したつもりの
+        // ディレクトリが入っていないことに最後まで気付けない——「選んだつもり」との差は
+        // 広い方向にも狭い方向にも見えている必要がある。
+        if self.tree.has_children(node) && !self.tree.node(node).proposals.is_empty() {
+            self.status.push_str(&format!(
+                "（{label} 自身は入れていません——承認すると配下すべてが開くので、要るなら d で選んでください）"
+            ));
         }
         if blocked > 0 {
             // 混ぜなかったことを黙っていると、「選んだつもり」との差が最後まで見えない。
@@ -557,40 +565,196 @@ impl App {
         self.status = format!("一覧: {}（{visible}件）", self.filter.label());
     }
 
-    /// 一般化の度合いを回す。**選択は破棄する**（モジュールdoc参照）。
-    fn cycle_generalization(&mut self) {
-        self.generalization = match self.generalization {
-            Generalization::None => Generalization::Directory,
-            Generalization::Directory => Generalization::Auto,
-            Generalization::Auto => Generalization::None,
+    /// `d`キー: **このノード自身の候補だけ**を選択／解除する（D-62）。
+    ///
+    /// スペース（[`Self::toggle_selected_subtree`]）が子を持つノード自身を対象外にするので、
+    /// ディレクトリ自身が観測された候補を選ぶ道はここだけになる。**選ぶと配下すべてが開く**
+    /// ——継承ACEなので、いま見えていないファイルと将来作られるファイルも含む。だから
+    /// 「まとめて選ぶ」とは別のキーに分けてある。
+    fn toggle_node_itself(&mut self) {
+        let Some(node) = self.selected_node() else {
+            return;
         };
-        let had_selection = !self.accepted.is_empty();
-        // 手で変えたaccessも一緒に消える（候補そのものを作り直すため）。**黙って消さない**。
-        let had_hand_changes = !self.hand_changed.is_empty();
-        self.accepted.clear();
-        self.hand_changed.clear();
-        self.recompute_proposals();
-        let label = crate::aggregate::generalization_label(self.generalization);
-        self.status = match (had_selection, had_hand_changes) {
-            (_, true) => format!(
-                "一般化の度合いを {label} にしました（候補を作り直すので、選択と手で変えたaccessは元に戻しました）"
-            ),
-            (true, false) => {
-                format!("一般化の度合いを {label} にしました（idが振り直されるので選択は解除しました）")
+        let Some(view) = self.view.as_ref() else {
+            return;
+        };
+        let own = self.tree.node(node).proposals.clone();
+        if own.is_empty() {
+            self.status = "この行そのものは候補ではありません（配下を選ぶならスペース）".to_string();
+            return;
+        }
+        let approvable: Vec<&harness_policy::RuleProposal> = own
+            .iter()
+            .filter(|i| !view.too_broad[**i])
+            .map(|i| &view.proposals[*i])
+            .collect();
+        if approvable.is_empty() {
+            self.status = match harness_policy::breadth::check(&view.proposals[own[0]]).message() {
+                Some(reason) => format!("{} は承認できません: {reason}", view.proposals[own[0]].value),
+                None => "この候補は承認できません".to_string(),
+            };
+            return;
+        }
+
+        let all_selected = approvable.iter().all(|p| self.proposal_is_on(p));
+        let ids: Vec<String> = approvable.iter().map(|p| p.id.clone()).collect();
+        let declared: Vec<crate::unapprove::UnapproveTarget> = approvable
+            .iter()
+            .flat_map(|p| self.declared_targets_for(&p.value))
+            .collect();
+        let label = self.tree.node(node).path.clone();
+        if all_selected {
+            for id in &ids {
+                self.accepted.remove(id);
             }
-            (false, false) => format!("一般化の度合いを {label} にしました"),
+            for target in declared {
+                self.unapproved.insert(target);
+            }
+            self.status = format!("{label} 自身の選択を解除しました");
+        } else {
+            for id in ids {
+                self.accepted.insert(id);
+            }
+            for target in &declared {
+                self.unapproved.remove(target);
+            }
+            // **何を選んだのかを正確に言う**（B-32）。件数ではなく「範囲」が判断材料である。
+            self.status = format!(
+                "{label} 自身を選びました（このディレクトリ配下すべてと、今後そこに作られる\
+                 ファイルも対象になります）"
+            );
+        }
+    }
+
+    /// `R`キー: このディレクトリを**再帰**で許可する印を付ける／外す（D-63）。
+    ///
+    /// 承認時に`<path>/**`という値の宣言として合成される（[`Self::recursive_proposals`]）。
+    /// **押せるのは子を持つノードだけ**——木の中で確実にディレクトリだと言えるのがそれだからである
+    /// （葉が実体としてディレクトリかどうかは、木の情報だけでは分からない。存在しないパスや
+    /// 消えたパスをstatしに行くと、UIの応答がファイルシステムに引きずられる）。
+    ///
+    /// 構造ノード（そのフォルダ自身は観測されていない）にも付けられる。付けられないと
+    /// `.rustup/toolchains`のように**中のファイルだけが観測された**ケースが救えず、
+    /// ユーザーは数百件を個別に承認するか、サンドボックスを切るかの二択になる。
+    fn toggle_recursive(&mut self) {
+        let Some(node) = self.selected_node() else {
+            return;
         };
+        if !self.tree.has_children(node) {
+            self.status =
+                "再帰にできるのはディレクトリの行だけです（この行自身を許すなら d）".to_string();
+            return;
+        }
+        let path = self.tree.node(node).path.clone();
+        if self.recursive.remove(&path) {
+            self.status = format!("{path} の再帰指定を外しました");
+            return;
+        }
+        // **広すぎる値は印を付ける段階で止める**（承認時に弾くと、選び直しが要ることに
+        // その場で気付けない）。判定は`breadth`の同じ関数を通す。
+        let value = format!("{path}/**");
+        if let Some(reason) = harness_policy::breadth::check_value(
+            harness_policy::generalize::SettingsKey::FsRead,
+            &value,
+        )
+        .message()
+        {
+            self.status = format!("{value} は再帰にできません: {reason}");
+            return;
+        }
+        self.recursive.insert(path.clone());
+        let under = self.tree.subtree_proposals(node).len();
+        // **何を選んだのかを範囲で言う**（B-32）。件数だけでは「見えている分」と読まれる。
+        self.status = format!(
+            "{value} を再帰で許可します（いま見えている{under}件だけでなく、\
+             このフォルダ配下すべてと今後作られるファイルが対象です）"
+        );
+    }
+
+    /// `R`で印を付けたノードを、承認へ流す**合成された提案**にする（D-63）。
+    ///
+    /// 実在の候補ではないのでidは`rec-N`にする（`fs-N`と衝突させない）。access種別は
+    /// **配下に観測された種別ごとに1本ずつ**作る——1本へ寄せると、`read`しか要らなかった経路まで
+    /// 書込可になる（P-03、本モジュールが一般化でしないのと同じ理由）。配下に候補が1件も
+    /// 無いノード（全部フィルタで隠れている等）は`fs.read`を既定にする。
+    pub(crate) fn recursive_proposals(&self) -> Vec<harness_policy::RuleProposal> {
+        let Some(view) = self.view.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut seq = 0usize;
+        // 木のノードを引き直す（`recursive`はパスで持っているので、木が作り直されても残る）。
+        for path in &self.recursive {
+            let Some(node) = (0..self.tree.len()).find(|i| &self.tree.node(*i).path == path) else {
+                continue;
+            };
+            let mut keys: Vec<harness_policy::generalize::SettingsKey> = self
+                .tree
+                .subtree_proposals(node)
+                .into_iter()
+                .map(|i| view.proposals[i].key)
+                .filter(|k| *k != harness_policy::generalize::SettingsKey::NetAllowDomains)
+                .collect();
+            keys.sort();
+            keys.dedup();
+            if keys.is_empty() {
+                keys.push(harness_policy::generalize::SettingsKey::FsRead);
+            }
+            let evidence: Vec<_> = self
+                .tree
+                .subtree_proposals(node)
+                .into_iter()
+                .flat_map(|i| view.proposals[i].evidence.clone())
+                .collect();
+            for key in keys {
+                seq += 1;
+                out.push(harness_policy::RuleProposal {
+                    id: format!("rec-{seq}"),
+                    key,
+                    value: format!("{path}/**"),
+                    evidence: evidence.clone(),
+                    warnings: vec![
+                        "recursive: this covers everything under the folder, including files \
+                         created there later"
+                            .to_string(),
+                    ],
+                });
+            }
+        }
+        out
+    }
+
+    /// 承認へ渡す`(提案一覧, 受理するid)`を組み立てる。**`a`（差分を見せる）と`y`（実際に書く）が
+    /// 同じ関数を通る。**
+    ///
+    /// [D-63] 再帰の宣言を合成で足すようになったとき、`request_approval`にだけ足して
+    /// `commit_approval`に足し忘れ、**確認は出るのに何も書かれない**という形にした（B-06）。
+    /// 組み立てを1箇所に寄せて、次に選択の種類が増えても片方だけになりようがないようにする。
+    fn approval_inputs(&self) -> (Vec<harness_policy::RuleProposal>, Vec<String>) {
+        let mut proposals = self
+            .view
+            .as_ref()
+            .map(|v| v.proposals.clone())
+            .unwrap_or_default();
+        let recursive = self.recursive_proposals();
+        proposals.extend(recursive.iter().cloned());
+        let mut accept_ids: Vec<String> = self.accepted.iter().cloned().collect();
+        accept_ids.extend(recursive.iter().map(|p| p.id.clone()));
+        (proposals, accept_ids)
     }
 
     /// 承認の差分を作ってモーダルで見せる。**ここでは何も書かない。**
     fn request_approval(&mut self) {
-        let Some(view) = self.view.as_ref() else {
+        if self.view.is_none() {
             self.status = "開いている記録がありません".to_string();
             return;
-        };
+        }
         // **取り消しだけの確定も通す。** チェックを外す操作は`accepted`を増やさないので、
         // ここで`accepted`の空だけを見て弾くと「外したのに確定できない」になる。
-        if self.accepted.is_empty() && self.unapproved.is_empty() {
+        // [D-63] `recursive`も「選んだもの」に数える。数え忘れると、再帰だけを指定した確定が
+        // 「何も選んでいない」として弾かれる（選ぶ手段を増やしたら、選択の有無を見る場所も
+        // 全部数える——B-06）。
+        if self.accepted.is_empty() && self.unapproved.is_empty() && self.recursive.is_empty() {
             self.status =
                 "承認する候補をスペースで選んでください（全件受理のショートハンドはありません）"
                     .to_string();
@@ -606,7 +770,8 @@ impl App {
             return;
         }
 
-        let accept_ids: Vec<String> = self.accepted.iter().cloned().collect();
+        // [D-63] `R`で印を付けた再帰の宣言も合成して同じ経路へ流す（組み立ては`approval_inputs`）。
+        let (proposals, accept_ids) = self.approval_inputs();
         // **承認が0件でも進む。** チェックを外しただけの確定（取り消しのみ）では`accepted`が
         // 空で、`approve::plan`は`NoIds`を返す——これをエラーとして扱うと「外したのに確定
         // できない」になる。承認の段はここでは**任意**である。
@@ -615,7 +780,7 @@ impl App {
         } else {
             let request = ApproveRequest {
                 workspace_root: &self.workspace_root,
-                proposals: &view.proposals,
+                proposals: &proposals,
                 accept_ids: &accept_ids,
                 require_sandbox: harness_core::RequireSandbox::None,
                 domain: &domain,
@@ -779,14 +944,15 @@ impl App {
 
     /// モーダルで`y`が押されたときに実際に書く。**planを作り直してから**書く（モジュールdoc）。
     pub(crate) fn commit_approval(&mut self) {
-        let Some(view) = self.view.as_ref() else {
+        if self.view.is_none() {
             return;
-        };
+        }
         let Some(entry) = self.sessions.get(self.selected_session) else {
             return;
         };
         let domain = self.domain.text().trim().to_string();
-        let accept_ids: Vec<String> = self.accepted.iter().cloned().collect();
+        // [D-63] `request_approval`とまったく同じ組み立てを通す（片方だけ再帰を落とさない）。
+        let (proposals, accept_ids) = self.approval_inputs();
         let pass_of_record = entry.manifest.pass;
         let command = entry.manifest.command.clone();
         let cwd = entry.manifest.cwd.clone();
@@ -797,7 +963,7 @@ impl App {
         if !accept_ids.is_empty() {
             let request = ApproveRequest {
                 workspace_root: &self.workspace_root,
-                proposals: &view.proposals,
+                proposals: &proposals,
                 accept_ids: &accept_ids,
                 require_sandbox: harness_core::RequireSandbox::None,
                 domain: &domain,

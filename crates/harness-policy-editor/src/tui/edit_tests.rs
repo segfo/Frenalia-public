@@ -94,32 +94,6 @@ fn opening_a_recording_shows_candidates_and_a_default_domain_name() {
     );
 }
 
-/// 一般化の度合いを変えると**選択は破棄される**——idが振り直されるので、残すと
-/// ユーザーが選んだつもりのものと違う候補が承認される。破棄した事実は必ず出す。
-#[test]
-fn changing_the_generalization_drops_the_selection_and_says_so() {
-    let ws = workspace();
-    seed_pass1(
-        &ws,
-        "s1",
-        "cargo build",
-        &[r"C:\Users\me\.cargo\registry\a.rs"],
-    );
-    let mut app = open_edit(&ws);
-    app.edit_focus = EditField::Proposals;
-    app.on_key(key(KeyCode::Char(' ')));
-    assert_eq!(app.accepted.len(), 1, "まず1件選んでおく");
-
-    app.on_key(key(KeyCode::Char('g')));
-
-    assert!(app.accepted.is_empty(), "idが変わるので選択は残せない");
-    assert!(
-        app.status.contains("選択は解除"),
-        "黙って捨てると、選んだつもりのものが承認されていないことに気付けない: {}",
-        app.status
-    );
-}
-
 /// 何も選ばずに承認しようとしても、何も起きない（全件受理のショートハンドは無い、D-42）。
 #[test]
 fn approving_without_a_selection_is_refused() {
@@ -214,7 +188,6 @@ fn the_diff_groups_the_paths_under_each_access_kind() {
         ],
     );
     let mut app = open_edit(&ws);
-    app.generalization = harness_policy::Generalization::None;
     app.open_selected_session();
     app.edit_focus = EditField::Proposals;
     app.on_key(key(KeyCode::Char(' ')));
@@ -365,7 +338,6 @@ fn a_too_broad_candidate_cannot_be_selected_even_when_it_is_shown() {
     seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me"]);
     let mut app = open_edit(&ws);
     // 一般化すると値が変わるので、観測した値そのままの状況を作る。
-    app.generalization = harness_policy::Generalization::None;
     app.open_selected_session();
     app.filter = CandidateFilter::All;
     app.rebuild_tree();
@@ -403,7 +375,6 @@ fn blocked_candidates_are_hidden_by_default_but_still_counted() {
         &[r"C:\Users\me", r"C:\Users\me\.cargo\registry\a.rs"],
     );
     let mut app = open_edit(&ws);
-    app.generalization = harness_policy::Generalization::None;
     app.open_selected_session();
 
     assert_eq!(app.filter, CandidateFilter::Approvable, "既定");
@@ -428,7 +399,6 @@ fn the_filter_cycles_through_approvable_blocked_and_all() {
         &[r"C:\Users\me", r"C:\Users\me\.cargo\registry\a.rs"],
     );
     let mut app = open_edit(&ws);
-    app.generalization = harness_policy::Generalization::None;
     app.open_selected_session();
     app.edit_focus = EditField::Proposals;
 
@@ -458,7 +428,6 @@ fn what_is_written_is_what_was_selected_on_screen() {
         &[r"C:\Users\me", r"C:\Users\me\.cargo\registry\a.rs"],
     );
     let mut app = open_edit(&ws);
-    app.generalization = harness_policy::Generalization::None;
     app.open_selected_session();
     app.edit_focus = EditField::Proposals;
 
@@ -494,7 +463,6 @@ fn space_on_a_directory_selects_everything_under_it() {
         ],
     );
     let mut app = open_edit(&ws);
-    app.generalization = harness_policy::Generalization::None;
     app.open_selected_session();
     app.edit_focus = EditField::Proposals;
 
@@ -510,10 +478,215 @@ fn space_on_a_directory_selects_everything_under_it() {
     assert!(app.status.contains("解除"), "{}", app.status);
 }
 
-/// 一括選択に**承認できない候補は混ぜない**。混ぜると承認が丸ごと拒否されるので、
-/// 除いた件数を必ず伝える。
+/// [D-62] **入れ子が何段でも、選ばれるのは観測されたファイルだけ**である。
+///
+/// 中間ディレクトリ（`sub1`・`sub1/sub2`）は`ensure_path`が作る**構造ノード**で、候補を持たない
+/// ——だから一括選択で「ディレクトリをルートとして扱う」ことは起きない。画面に見えている
+/// 候補の数と、承認される値の数が一致する。
 #[test]
-fn a_subtree_selection_skips_the_blocked_candidates_and_says_how_many() {
+fn a_deep_bulk_selection_only_picks_the_observed_files_at_every_depth() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[
+            r"C:\proj\sub1\a.rs",
+            r"C:\proj\sub1\sub2\b.rs",
+            r"C:\proj\sub1\sub2\sub3\c.rs",
+        ],
+    );
+    let mut app = open_edit(&ws);
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+
+    app.on_key(key(KeyCode::Char(' ')));
+
+    let view = app.view.as_ref().expect("記録が開いている");
+    let chosen: Vec<&str> = view
+        .proposals
+        .iter()
+        .filter(|p| app.accepted.contains(&p.id))
+        .map(|p| p.value.as_str())
+        .collect();
+    assert_eq!(
+        chosen,
+        vec![
+            "C:/proj/sub1/a.rs",
+            "C:/proj/sub1/sub2/b.rs",
+            "C:/proj/sub1/sub2/sub3/c.rs"
+        ],
+        "深さに関係なく、観測されたファイルだけが選ばれること"
+    );
+    // 中間ディレクトリが値として紛れ込んでいないこと。**ここが破れると、見えている3件のつもりで
+    // サブツリー全体を開くことになる。**
+    assert!(
+        !chosen
+            .iter()
+            .any(|v| *v == "C:/proj/sub1" || *v == "C:/proj/sub1/sub2"),
+        "中間ディレクトリを選んではならない: {chosen:?}"
+    );
+}
+
+/// [D-62] ディレクトリ自身が観測されていたら、`d`で**明示的に**選べる（外した機能を
+/// 取り上げてはいない）。B-35の対: スペースが入れないことと、`d`が入れられることの両方を測る。
+#[test]
+fn the_directory_itself_can_still_be_chosen_deliberately_with_d() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[r"C:\proj\sub1", r"C:\proj\sub1\a.rs"],
+    );
+    let mut app = open_edit(&ws);
+    app.open_selected_session();
+    app.filter = CandidateFilter::All;
+    app.rebuild_tree();
+    app.edit_focus = EditField::Proposals;
+
+    // スペースでは入らない。
+    app.on_key(key(KeyCode::Char(' ')));
+    let dir_id = {
+        let view = app.view.as_ref().expect("記録が開いている");
+        view.proposals
+            .iter()
+            .find(|p| p.value == "C:/proj/sub1")
+            .expect("ディレクトリ自身も候補になっている")
+            .id
+            .clone()
+    };
+    assert!(
+        !app.accepted.contains(&dir_id),
+        "スペースはディレクトリ自身を入れない"
+    );
+
+    // `d`でなら入る。**そして何が起きるかを言う。**
+    app.on_key(key(KeyCode::Char('d')));
+    assert!(app.accepted.contains(&dir_id), "dで明示的に選べる");
+    assert!(
+        app.status.contains("配下すべて"),
+        "選んだ範囲を言う: {}",
+        app.status
+    );
+
+    // もう一度押すと外れる（対の操作）。
+    app.on_key(key(KeyCode::Char('d')));
+    assert!(!app.accepted.contains(&dir_id));
+}
+
+/// [D-63] `R`でディレクトリを再帰指定すると、`<path>/**`が実際に`policy.json`へ書かれる。
+///
+/// **観測されていない構造ノードにも付けられる**ことまで固定する——`.rustup/toolchains`のように
+/// 中のファイルだけが観測されたケースがこの機能の主目的で、そこが押せないと意味が無い。
+#[test]
+fn marking_a_directory_recursive_writes_a_double_star_declaration() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[
+            r"C:\proj\tc\1.89.0\bin\rustc.exe",
+            r"C:\proj\tc\1.90.0\bin\rustc.exe",
+        ],
+    );
+    let mut app = open_edit(&ws);
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+    // 根は `C:/proj/tc`（1本道が畳まれる）。ここ自身は観測されていない構造ノード。
+    assert_eq!(app.tree.node(app.selected_node().expect("行")).path, "C:/proj/tc");
+
+    app.on_key(key(KeyCode::Char('R')));
+    assert!(app.recursive.contains("C:/proj/tc"), "印が付く");
+    assert!(
+        app.status.contains("配下すべて"),
+        "何が対象になるかを言う: {}",
+        app.status
+    );
+
+    app.on_key(key(KeyCode::Char('a')));
+    assert!(
+        app.modal.as_ref().is_some_and(|m| m.confirm == Confirm::Approval),
+        "再帰の指定だけでも承認の確認が出ること（status={} modal={:?}）",
+        app.status,
+        app.modal.as_ref().map(|m| &m.title)
+    );
+    app.on_key(key(KeyCode::Char('y')));
+
+    let raw = std::fs::read_to_string(crate::policy_file::path(ws.path())).unwrap_or_default();
+    let policy = crate::policy_file::load(ws.path()).expect("policy.json");
+    let domain = policy
+        .domain("cargo")
+        .unwrap_or_else(|| panic!(
+            "domain cargo / ws={:?} / policy_path={:?} / exists={} / file={raw} ",
+            ws.path(),
+            crate::policy_file::path(ws.path()),
+            crate::policy_file::path(ws.path()).exists(),
+        ));
+    assert!(
+        domain.fs.read.contains(&"C:/proj/tc/**".to_string()),
+        "再帰の宣言がそのまま書かれること: {:?}",
+        domain.fs
+    );
+
+    // もう一度押せば外れる（対の操作）。
+    let mut app2 = open_edit(&ws);
+    app2.open_selected_session();
+    app2.edit_focus = EditField::Proposals;
+    app2.on_key(key(KeyCode::Char('R')));
+    app2.on_key(key(KeyCode::Char('R')));
+    assert!(app2.recursive.is_empty());
+    assert!(app2.status.contains("外しました"), "{}", app2.status);
+}
+
+/// [D-63] 拒否側（B-35の対）: 葉には付けられず、`breadth`が拒否する広さにも付けられない。
+/// **印を付ける時点で止める**——承認時まで黙っていると、選び直しが要ることに気付くのが遅れる。
+#[test]
+fn recursive_is_refused_on_a_leaf_and_on_a_too_broad_directory() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\proj\sub\a.rs"]);
+    let mut app = open_edit(&ws);
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+
+    // 葉（ファイル）まで降りる。
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Right));
+    let leaf = app.selected_node().expect("行");
+    assert!(!app.tree.has_children(leaf), "葉に居ること: {:?}", app.tree.node(leaf).path);
+    app.on_key(key(KeyCode::Char('R')));
+    assert!(app.recursive.is_empty(), "葉は再帰にできない");
+    assert!(app.status.contains("ディレクトリの行だけ"), "{}", app.status);
+
+    // ユーザープロファイル全体のような広さは、印の段階で拒否される。
+    // **2件必要**——1件だと1本道が畳まれて`C:/Users/me/a.rs`という葉1行になり、
+    // ディレクトリ行が存在しなくなる（そうなると測りたい判定に到達しない）。
+    let ws2 = workspace();
+    seed_pass1(
+        &ws2,
+        "s1",
+        "cargo build",
+        &[r"C:\Users\me\a.rs", r"C:\Users\me\b.rs"],
+    );
+    let mut app2 = open_edit(&ws2);
+    app2.open_selected_session();
+    app2.filter = CandidateFilter::All;
+    app2.rebuild_tree();
+    app2.edit_focus = EditField::Proposals;
+    app2.on_key(key(KeyCode::Char('R')));
+    assert!(app2.recursive.is_empty(), "広すぎる再帰は付けられない");
+    assert!(
+        app2.status.contains("再帰にできません"),
+        "理由を言う: {}",
+        app2.status
+    );
+}
+
+/// [D-62] 一括選択に**そのノード自身のディレクトリ候補は混ぜない**。混ぜると、画面には
+/// 配下のファイルしか見えていないのにサブツリー全体が開く。外したことは必ず伝える（B-32）。
+#[test]
+fn a_subtree_selection_leaves_out_the_directory_itself_and_says_so() {
     let ws = workspace();
     seed_pass1(
         &ws,
@@ -522,7 +695,6 @@ fn a_subtree_selection_skips_the_blocked_candidates_and_says_how_many() {
         &[r"C:\Users\me", r"C:\Users\me\.cargo\registry\a.rs"],
     );
     let mut app = open_edit(&ws);
-    app.generalization = harness_policy::Generalization::None;
     app.open_selected_session();
     app.filter = CandidateFilter::All;
     app.rebuild_tree();
@@ -530,10 +702,14 @@ fn a_subtree_selection_skips_the_blocked_candidates_and_says_how_many() {
 
     app.on_key(key(KeyCode::Char(' ')));
 
-    assert_eq!(app.accepted.len(), 1, "承認できるものだけ入る");
+    assert_eq!(
+        app.accepted.len(),
+        1,
+        "配下のファイルだけが入る（ディレクトリ自身は入らない）"
+    );
     assert!(
-        app.status.contains("承認できない 1件は除きました"),
-        "除いたことを黙っていると「選んだつもり」との差が見えない: {}",
+        app.status.contains("自身は入れていません") && app.status.contains(" d "),
+        "外したことと、要るときの出口の両方を言う: {}",
         app.status
     );
 }
@@ -552,7 +728,6 @@ fn an_individual_candidate_can_be_deselected_after_a_bulk_selection() {
         ],
     );
     let mut app = open_edit(&ws);
-    app.generalization = harness_policy::Generalization::None;
     app.open_selected_session();
     app.edit_focus = EditField::Proposals;
 
@@ -584,7 +759,6 @@ fn right_expands_and_left_collapses_the_tree() {
         ],
     );
     let mut app = open_edit(&ws);
-    app.generalization = harness_policy::Generalization::None;
     app.open_selected_session();
     app.edit_focus = EditField::Proposals;
 
@@ -630,7 +804,9 @@ fn a_warning_shared_by_every_candidate_is_hoisted_out_of_the_rows() {
         &[
             r"C:\Users\me\.cargo\registry\a.rs",
             r"C:\Users\me\.cargo\registry\b.rs",
-            r"C:\Users\me\.rustup\toolchains\x\bin\rustc.exe",
+            // 行に固有の警告を1つ作る。[D-62]で畳み込みを廃止したので「畳み込みの内訳」は
+            // もう出ない——いま残っている行固有の警告はワイルドカード注意である。
+            r"C:\Users\me\.rustup\toolchains\*\bin\rustc.exe",
         ],
     );
     let app = open_edit(&ws);
@@ -652,12 +828,12 @@ fn a_warning_shared_by_every_candidate_is_hoisted_out_of_the_rows() {
             proposal.value
         );
     }
-    // 固有の警告（畳み込みの内訳）は行に残る——共通化で消してはいけない。
+    // 1行にしか当てはまらない警告は行に残る——共通化で消してはいけない。
     assert!(
         view.proposals
             .iter()
-            .any(|p| view.row_warnings(p).any(|w| w.contains("generalized from"))),
-        "畳み込みの内訳はその行にしか当てはまらない: {:?}",
+            .any(|p| view.row_warnings(p).any(|w| w.contains("wildcard"))),
+        "ワイルドカード注意はその行にしか当てはまらない: {:?}",
         view.proposals
     );
 }
@@ -1112,25 +1288,41 @@ fn approving_a_hand_changed_candidate_writes_it_into_the_read_exec_bucket() {
     );
 }
 
-/// 読み直すと候補を作り直すので、手で変えたaccessは戻る。**戻ったことを言う**
-/// ——黙って戻ると、変えたつもりのまま承認しに行くことになる。
+/// [D-63] `r`（読み直し）は廃止した。代わりに**編集画面へ入るたびにセッション一覧を読み直す**
+/// ——「画面を戻って入り直せば読み直される」を本当にするため。
+///
+/// **ただし開いている候補は作り直さない。** 作り直すと選択と手で変えたaccessが黙って消える。
+/// 「新しい記録を拾う」と「いま選んでいるものを壊さない」の両方を1つのテストで固定する
+/// （片方だけだと、もう片方が壊れても緑のままになる）。
 #[test]
-fn reloading_discards_hand_made_access_changes_and_says_so() {
+fn re_entering_the_edit_screen_picks_up_new_sessions_without_discarding_the_selection() {
     let ws = workspace();
     seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
     let mut app = open_edit(&ws);
     app.edit_focus = EditField::Proposals;
     app.on_key(key(KeyCode::Char('c')));
-    assert!(!app.hand_changed.is_empty());
+    app.on_key(key(KeyCode::Char(' ')));
+    let hand_changed = app.hand_changed.clone();
+    let accepted = app.accepted.clone();
+    assert!(!hand_changed.is_empty() && !accepted.is_empty(), "前提");
+    assert_eq!(app.sessions.len(), 1);
 
-    app.on_key(key(KeyCode::Char('r')));
+    // 別プロセスが作った記録を模す（このAppは関与していない）。
+    seed_pass1(&ws, "s2", "cargo test", &[r"C:\tools\bin\other.exe"]);
 
-    assert!(app.hand_changed.is_empty());
+    app.on_key(key(KeyCode::F(1)));
+    app.on_key(key(KeyCode::F(2)));
+
     assert_eq!(
-        selected_proposal(&app).expect("a candidate").key,
-        harness_policy::SettingsKey::FsRead
+        app.sessions.len(),
+        2,
+        "外部で作られた記録も、画面へ入り直せば現れること"
     );
-    assert!(app.status.contains("元に戻りました"), "{}", app.status);
+    assert_eq!(
+        app.hand_changed, hand_changed,
+        "手で変えたaccessを黙って捨ててはいけない"
+    );
+    assert_eq!(app.accepted, accepted, "選択を黙って捨ててはいけない");
 }
 
 /// **パス2の記録で`g`を押しても、FSの候補が消えないこと。**
@@ -1184,21 +1376,6 @@ fn changing_the_generalization_keeps_the_fs_candidates_of_a_pass2_recording() {
             .any(|p| p.value == "example.com"),
         "ネットワーク側も残っていること"
     );
-}
-
-/// 一般化の度合いを変えたときも同じ（候補そのものを作り直すため）。
-#[test]
-fn changing_the_generalization_discards_hand_made_access_changes_and_says_so() {
-    let ws = workspace();
-    seed_pass1(&ws, "s1", "cargo build", &[r"C:\tools\bin\thing.exe"]);
-    let mut app = open_edit(&ws);
-    app.edit_focus = EditField::Proposals;
-    app.on_key(key(KeyCode::Char('c')));
-
-    app.on_key(key(KeyCode::Char('g')));
-
-    assert!(app.hand_changed.is_empty());
-    assert!(app.status.contains("手で変えたaccess"), "{}", app.status);
 }
 
 // --- 宣言済みの重ね（[x]）と、外して取り消す --------------------------------------

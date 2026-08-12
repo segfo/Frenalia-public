@@ -292,9 +292,12 @@ pub(crate) enum MemoryAction {
 
 /// `harness policy`サブコマンドの各操作（M15.7）。
 ///
-/// `--source`/`--generalize`は`suggest`と`apply`の**両方**が受け取る。提案idは
-/// 「どの経路をどの粒度で畳んだか」に依存するため、同じ提案を指すには同じ条件で
-/// 再計算する必要があるからである（idだけを別条件で使い回すと別のものが適用される）。
+/// `--source`は`suggest`と`apply`の**両方**が受け取る。提案idは「どの経路を採ったか」に
+/// 依存するため、同じ提案を指すには同じ条件で再計算する必要があるからである
+/// （idだけを別条件で使い回すと別のものが適用される）。
+///
+/// **一般化（`--generalize`）はD-62で廃止した。** 候補は観測された値そのままで、
+/// ディレクトリやワイルドカードへ畳まない。
 #[derive(Subcommand)]
 pub(crate) enum PolicyAction {
     /// 拒否された資源から許可ルールの候補を生成し、`.harness/settings.json`への差分として
@@ -306,11 +309,6 @@ pub(crate) enum PolicyAction {
         /// 収集源の限定（`all`（既定）/`preflight`/`net`/`cow`/`etw`）。
         #[arg(long)]
         source: Option<String>,
-        /// 一般化の度合い（`none`＝畳まない / `dir`（既定）＝同一ディレクトリ配下を親1本へ /
-        /// `auto`＝加えてバージョン番号・ハッシュを`*`へ）。広げるほど頼んでいない場所まで
-        /// 開くため、選ぶのはユーザーである。
-        #[arg(long)]
-        generalize: Option<String>,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },
@@ -324,8 +322,6 @@ pub(crate) enum PolicyAction {
         session: Option<String>,
         #[arg(long)]
         source: Option<String>,
-        #[arg(long)]
-        generalize: Option<String>,
         /// 受理する提案のid（`fs-1`・`net-2`）。カンマ区切り・繰り返し指定の両方に対応する。
         #[arg(long)]
         accept: Vec<String>,
@@ -358,8 +354,6 @@ pub(crate) enum PolicyAction {
         /// 対象セッションID（省略時は`.harness/sandbox/`内で最も新しいもの）。
         #[arg(long)]
         session: Option<String>,
-        #[arg(long)]
-        generalize: Option<String>,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },

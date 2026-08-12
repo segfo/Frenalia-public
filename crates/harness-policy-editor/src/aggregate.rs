@@ -86,7 +86,7 @@ use harness_config::FsAccess;
 use harness_policy::{
     event::{FsAuditEvent, FsAuditKind},
     normalize::Source,
-    DeniedCandidate, FsFolder, Generalization, GrantedPaths, RuleProposal,
+    DeniedCandidate, FsFolder, GrantedPaths, RuleProposal,
 };
 
 use crate::session_dir::{RecordManifest, RecordSessionDir};
@@ -368,10 +368,9 @@ impl Aggregate {
     ///
     /// 記録時点の宣言（[`Self::granted`]。パス2のみ）を渡すので、**既に許可済みなのに
     /// 拒否された**パスは同じキーの提案を出し直さず昇格候補へ差し替わる（D-46）。
-    pub fn proposals(&self, mode: Generalization) -> Vec<RuleProposal> {
+    pub fn proposals(&self) -> Vec<RuleProposal> {
         harness_policy::generalize::generalize_with_granted(
             self.folder.candidates(),
-            mode,
             &self.granted,
         )
     }
@@ -664,14 +663,11 @@ pub fn render_notes(aggregate: &Aggregate) -> String {
 /// 記録結果を人が読む形へ整形する（注記＋候補一覧）。
 ///
 /// `limit`は提案の表示件数の上限。**打ち切ったら必ずその事実と残件数を出す**（B-09）。
-pub fn render(aggregate: &Aggregate, mode: Generalization, limit: usize) -> String {
+pub fn render(aggregate: &Aggregate, limit: usize) -> String {
     let mut out = render_notes(aggregate);
-    let proposals = aggregate.proposals(mode);
+    let proposals = aggregate.proposals();
 
-    out.push_str(&format!(
-        "\n許可ルールの候補（--generalize {}）:\n",
-        generalization_label(mode)
-    ));
+    out.push_str("\n許可ルールの候補（観測された値そのまま）:\n");
     if proposals.is_empty() {
         out.push_str("  （候補なし）\n");
     }
@@ -697,14 +693,6 @@ pub fn render(aggregate: &Aggregate, mode: Generalization, limit: usize) -> Stri
     out
 }
 
-/// `--generalize`の値の表示名。FS側・net側・TUIが共有する（綴りを3箇所に持たない）。
-pub fn generalization_label(mode: Generalization) -> &'static str {
-    match mode {
-        Generalization::None => "none",
-        Generalization::Directory => "dir",
-        Generalization::Auto => "auto",
-    }
-}
 
 /// 観測したプロセスツリーを整形する（記録対象が何を起動したかの俯瞰）。
 pub fn render_process_tree(aggregate: &Aggregate) -> String {

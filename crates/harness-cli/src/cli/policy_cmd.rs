@@ -20,7 +20,7 @@
 use std::io::IsTerminal;
 
 use harness_policy::{
-    diff, gate, generalize::Generalization, normalize, GateVerdict, PolicyInput, RuleProposal,
+    diff, gate, normalize, GateVerdict, PolicyInput, RuleProposal,
     Source, SourceReport,
 };
 
@@ -33,14 +33,6 @@ fn resolve_sources(spec: Option<&str>) -> Result<Vec<Source>, String> {
         Some(other) => Source::parse(other).map(|s| vec![s]).ok_or_else(|| {
             format!("unknown --source {other:?} (expected all|preflight|net|cow|etw)")
         }),
-    }
-}
-
-fn resolve_generalization(spec: Option<&str>) -> Result<Generalization, String> {
-    match spec {
-        None => Ok(Generalization::default()),
-        Some(other) => Generalization::parse(other)
-            .ok_or_else(|| format!("unknown --generalize {other:?} (expected none|dir|auto)")),
     }
 }
 
@@ -380,22 +372,18 @@ pub(crate) fn run_policy_subcommand(
         PolicyAction::Suggest {
             session,
             source,
-            generalize,
             output_format,
         } => {
-            let (sources, generalization) = match (
-                resolve_sources(source.as_deref()),
-                resolve_generalization(generalize.as_deref()),
-            ) {
-                (Ok(s), Ok(g)) => (s, g),
-                (Err(e), _) | (_, Err(e)) => {
+            let sources = match resolve_sources(source.as_deref()) {
+                Ok(s) => s,
+                Err(e) => {
                     eprintln!("{e}");
                     return ExitCode::FAILURE;
                 }
             };
             let input = collect_input(workspace_root, session.as_deref(), &sources);
             let proposals =
-                input.proposals_with_granted(generalization, &granted_paths(workspace_root));
+                input.proposals_with_granted(&granted_paths(workspace_root));
             let verdicts = gate::check_all(&proposals, require_sandbox);
             if output_format == OutputFormat::Text {
                 eprint!("{}", render_unavailable(&input));
@@ -407,21 +395,12 @@ pub(crate) fn run_policy_subcommand(
         PolicyAction::Learn {
             duration,
             session,
-            generalize,
             output_format,
         } => {
-            let generalization = match resolve_generalization(generalize.as_deref()) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::FAILURE;
-                }
-            };
             run_learn(
                 workspace_root,
                 session.as_deref(),
                 duration,
-                generalization,
                 require_sandbox,
                 output_format,
             )
@@ -430,23 +409,19 @@ pub(crate) fn run_policy_subcommand(
         PolicyAction::Apply {
             session,
             source,
-            generalize,
             accept,
             yes,
         } => {
-            let (sources, generalization) = match (
-                resolve_sources(source.as_deref()),
-                resolve_generalization(generalize.as_deref()),
-            ) {
-                (Ok(s), Ok(g)) => (s, g),
-                (Err(e), _) | (_, Err(e)) => {
+            let sources = match resolve_sources(source.as_deref()) {
+                Ok(s) => s,
+                Err(e) => {
                     eprintln!("{e}");
                     return ExitCode::FAILURE;
                 }
             };
             let input = collect_input(workspace_root, session.as_deref(), &sources);
             let proposals =
-                input.proposals_with_granted(generalization, &granted_paths(workspace_root));
+                input.proposals_with_granted(&granted_paths(workspace_root));
             apply_accepted(workspace_root, &proposals, &accept, yes, require_sandbox)
         }
     }
@@ -462,7 +437,6 @@ fn run_learn(
     workspace_root: &Path,
     session: Option<&str>,
     duration_secs: u64,
-    generalization: Generalization,
     require_sandbox: harness_core::RequireSandbox,
     output_format: OutputFormat,
 ) -> ExitCode {
@@ -520,7 +494,7 @@ fn run_learn(
     }
 
     let input = collect_input(workspace_root, session, &Source::ALL);
-    let proposals = input.proposals_with_granted(generalization, &granted_paths(workspace_root));
+    let proposals = input.proposals_with_granted(&granted_paths(workspace_root));
     let verdicts = gate::check_all(&proposals, require_sandbox);
     if output_format == OutputFormat::Text {
         eprint!("{}", render_unavailable(&input));
@@ -534,7 +508,6 @@ fn run_learn(
     _workspace_root: &Path,
     _session: Option<&str>,
     _duration_secs: u64,
-    _generalization: Generalization,
     _require_sandbox: harness_core::RequireSandbox,
     _output_format: OutputFormat,
 ) -> ExitCode {
@@ -588,7 +561,7 @@ fn apply_accepted(
     if !unknown.is_empty() {
         eprintln!(
             "unknown proposal id(s): {}. Ids come from `harness policy suggest` and depend on \
-             --source/--generalize, so pass the same options to both commands.",
+             --source, so pass the same options to both commands.",
             unknown.join(", ")
         );
         return ExitCode::FAILURE;

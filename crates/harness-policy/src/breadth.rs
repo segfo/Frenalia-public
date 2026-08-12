@@ -95,6 +95,12 @@ pub fn check_value(key: SettingsKey, value: &str) -> BreadthVerdict {
     match key {
         SettingsKey::NetAllowDomains => BreadthVerdict::Acceptable,
         SettingsKey::FsRead | SettingsKey::FsReadWrite | SettingsKey::FsReadExec => {
+            // [D-63] **ワイルドカードは確定部分で判定する。** ACEが付くのはそこだからである
+            // （`C:/x/**`への付与は`C:/x`のACE）。値の見た目の深さで測っていた頃は、
+            // `C:/Users/<誰か>`を「ユーザープロファイル全体」として拒否しながら、
+            // **より広い**`C:/Users/<誰か>/**`を通していた。境目の定義は
+            // `normalize::literal_prefix`が1つだけ持つ（付与ルートの算出と同じ関数）。
+            let value = crate::normalize::literal_prefix(value);
             match classify(key, value) {
                 Some(reason) => BreadthVerdict::TooBroad(format!(
                     "{value} is too broad to accept as a sandbox exception: {reason}. Accepting it \
@@ -109,18 +115,10 @@ pub fn check_value(key: SettingsKey, value: &str) -> BreadthVerdict {
     }
 }
 
-/// **どのaccess種別でも承認できる値か**（＝最も厳しいaccessで見て通るか）。
-///
-/// [`crate::generalize`]の畳み込みが使う。ユーザーが自分で選んだ`fs.read = C:/Program Files`は
-/// 承認してよい（[`MACHINE_WIDE_INSTALL_ROOTS`]は書きだけ拒否する）が、「GitとYarnに触った」から
-/// **推論で**`C:/Program Files`全体へ広げるのは別の話である。畳み込みは利便のための一般化で
-/// あって、マシン規模のディレクトリを勝手に作る仕組みではない。
-///
-/// 直接観測された場合は候補としてそのまま出るので、この値へ到達する道が消えるわけではない。
-pub fn is_too_broad_for_any_access(value: &str) -> bool {
-    // 書き（最も厳しい）で通るなら、読み・実行でも通る。
-    check_value(SettingsKey::FsReadWrite, value).is_too_broad()
-}
+// `is_too_broad_for_any_access`（最も厳しいaccessで見て通るか）はここに在ったが、D-62で削除した。
+// 唯一の呼び出し元が`generalize`のディレクトリ畳み込み——「推論で`C:/Program Files`全体へ
+// 広げない」ためのガード——で、畳み込みごと無くなったため。**残しておくと、在るはずのない
+// 「推論で広げる経路」がまだ在るように読める。**
 
 /// 複数の提案をまとめて判定し、`(提案id, 判定)`を返す（[`crate::gate::check_all`]と同じ形）。
 pub fn check_all<'a>(

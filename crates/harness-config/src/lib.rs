@@ -59,26 +59,31 @@ pub struct Settings {
     /// 設定階層のディープマージ（ユーザ→プロジェクト）はこの`Value`に対して正しく効く。
     pub mcp: Option<serde_json::Value>,
     /// ポリシー学習ヘルパー設定（M15.7、`plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。省略時は
-    /// `PolicySettings::default()`（収集は無効・一般化は`dir`）。
+    /// `PolicySettings::default()`（収集は無効）。
     pub policy: Option<PolicySettings>,
 }
 
 /// `.harness/settings.json`の`policy`キー（M15.7）。
 ///
 /// ```jsonc
-/// "policy": { "learn": false, "generalize": "dir" }
+/// "policy": { "learn": false }
 /// ```
 ///
 /// **`learn`は収集の有効化だけを表し、提案の適用には一切関与しない**（D-42）。
 /// 設定ファイルから許可ルールが自動で増える経路は、この機構のどこにも存在しない。
+///
+/// # 消したキー: `generalize`（D-62）
+///
+/// 一般化そのものを廃止したので消した。**このキーは在った頃から一度も読まれていなかった**
+/// ——`rg`で確認したところ参照は0件で、CLIの`resolve_generalization`は設定を見ずに既定へ
+/// 倒していた。docコメントだけが「CLIの`--generalize`が優先」と書いており、設定した人は
+/// 効いていると読むしかなかった（B-32: 設定したのに効かない状態を作らない、の違反）。
+/// 古い`settings.json`に残っていても、serdeは未知のキーを無視するので害は無い。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PolicySettings {
     /// セッション中にOS監査収集器を起動するか（CLIの`--policy-learn`が優先）。
     /// **有効にするとUACが1回出る**（収集器はETWセッションのため昇格が要る）。
     pub learn: Option<bool>,
-    /// `harness policy suggest`の既定の一般化度合い（`none` | `dir` | `auto`）。
-    /// CLIの`--generalize`が優先。
-    pub generalize: Option<String>,
 }
 
 impl PolicySettings {

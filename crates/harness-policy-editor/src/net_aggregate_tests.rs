@@ -25,7 +25,7 @@ fn allowed_events_from_a_record_all_run_still_produce_candidates() {
     aggregate.add_event(&proxy_event("crates.io", true, "record_all"));
     aggregate.add_event(&proxy_event("static.crates.io", true, "record_all"));
 
-    let proposals = aggregate.proposals(Generalization::None);
+    let proposals = aggregate.proposals();
 
     let values: Vec<&str> = proposals.iter().map(|p| p.value.as_str()).collect();
     assert!(
@@ -65,7 +65,7 @@ fn repeated_hosts_are_folded_with_their_observation_count() {
 
     assert_eq!(aggregate.host_count(), 1);
     assert_eq!(aggregate.hosts(), vec![("crates.io", 3)]);
-    let proposals = aggregate.proposals(Generalization::None);
+    let proposals = aggregate.proposals();
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].observed_count(), 3);
 }
@@ -118,7 +118,7 @@ fn reading_the_log_back_produces_the_same_candidates() {
 
     assert_eq!(aggregate.events_seen, 2);
     assert_eq!(aggregate.host_count(), 2);
-    assert_eq!(aggregate.proposals(Generalization::None).len(), 2);
+    assert_eq!(aggregate.proposals().len(), 2);
 }
 
 /// 何も観測できなかったときは、**候補が空である以上のことを言う**（B-09）。
@@ -126,7 +126,7 @@ fn reading_the_log_back_produces_the_same_candidates() {
 fn an_empty_recording_says_so_instead_of_just_showing_no_candidates() {
     let aggregate = NetAggregate::new();
 
-    let text = render(&aggregate, Generalization::None, 40);
+    let text = render(&aggregate, 40);
 
     assert!(text.contains("1件も観測できませんでした"), "{text}");
     assert!(

@@ -36,7 +36,7 @@ pub use breadth::BreadthVerdict;
 pub use diff::{SettingsDiff, SettingsDiffEntry};
 pub use event::{FsAuditEvent, FsAuditKind};
 pub use gate::{check_proposal, GateVerdict};
-pub use generalize::{Generalization, RuleProposal, SettingsKey};
+pub use generalize::{RuleProposal, SettingsKey};
 pub use insufficient::{diagnose, GrantedPaths, Insufficient};
 pub use normalize::{
     is_net_control_record, DeniedCandidate, FsFolder, NetIntake, Requested, Source, SourceReport,
@@ -83,8 +83,8 @@ impl PolicyInput {
     }
 
     /// 収集源をまたいだ提案生成。
-    pub fn proposals(&self, generalization: Generalization) -> Vec<RuleProposal> {
-        generalize::generalize(&self.candidates(), generalization)
+    pub fn proposals(&self) -> Vec<RuleProposal> {
+        generalize::generalize(&self.candidates())
     }
 
     /// 「既に設定で許可済みのパス」を踏まえた提案生成。
@@ -92,12 +92,8 @@ impl PolicyInput {
     /// **既に許可済みなのに拒否された＝その許可では足りない**が確定するので、その旨が提案へ載る
     /// （`plans/etw-spike/RESULTS.md` §15）。`fs.read`を足したのにまだ失敗する、という
     /// いちばん困る状況で「readでは直らない」と言えるようになる。
-    pub fn proposals_with_granted(
-        &self,
-        generalization: Generalization,
-        granted: &GrantedPaths,
-    ) -> Vec<RuleProposal> {
-        generalize::generalize_with_granted(&self.candidates(), generalization, granted)
+    pub fn proposals_with_granted(&self, granted: &GrantedPaths) -> Vec<RuleProposal> {
+        generalize::generalize_with_granted(&self.candidates(), granted)
     }
 }
 

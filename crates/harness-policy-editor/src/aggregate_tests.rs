@@ -39,7 +39,7 @@ fn allowed_accesses_become_candidates_not_just_denials() {
     assert_eq!(agg.allowed, 2);
     assert_eq!(agg.denied, 0);
     assert_eq!(agg.candidates().len(), 2);
-    assert!(!agg.proposals(Generalization::None).is_empty());
+    assert!(!agg.proposals().is_empty());
 }
 
 /// 同じ`(パス, access)`は畳まれ、件数が積み上がる。
@@ -90,7 +90,7 @@ fn harness_control_directory_paths_are_excluded_and_counted() {
     assert_eq!(agg.events_seen, 3);
     assert_eq!(agg.allowed, 3);
 
-    let text = render(&agg, Generalization::None, 10);
+    let text = render(&agg, 10);
     assert!(text.contains("除外"), "{text}");
     assert!(text.contains("2件"), "{text}");
 }
@@ -136,12 +136,12 @@ fn accesses_under_a_machine_wide_install_root_are_excluded_and_counted() {
         agg.candidates()
     );
     assert!(
-        agg.proposals(Generalization::None).is_empty(),
+        agg.proposals().is_empty(),
         "{:#?}",
-        agg.proposals(Generalization::None)
+        agg.proposals()
     );
     // 除外は必ず見せる（B-09）。黙って捨てると「観測できなかった」と区別が付かない。
-    let text = render(&agg, Generalization::None, 10);
+    let text = render(&agg, 10);
     assert!(text.contains("C:/Program Files 配下へのアクセス 3件"), "{text}");
     // 観測した事実そのものは消さない。
     assert_eq!(agg.events_seen, 3);
@@ -173,12 +173,12 @@ fn accesses_outside_machine_wide_install_roots_stay_proposable() {
 
     assert_eq!(agg.excluded_machine_wide_root, 0);
     assert_eq!(agg.candidates().len(), 5, "{:#?}", agg.candidates());
-    assert!(!agg.proposals(Generalization::None).is_empty());
+    assert!(!agg.proposals().is_empty());
     // 除外0件のときは注記を出さない（出すと「何か捨てられた」と誤読される）。
     assert!(
-        !render(&agg, Generalization::None, 10).contains("配下へのアクセス"),
+        !render(&agg, 10).contains("配下へのアクセス"),
         "{}",
-        render(&agg, Generalization::None, 10)
+        render(&agg, 10)
     );
 }
 
@@ -208,7 +208,7 @@ fn paths_that_did_not_exist_are_excluded_and_counted() {
         agg.candidates()[0]
     );
 
-    let text = render(&agg, Generalization::None, 10);
+    let text = render(&agg, 10);
     assert!(text.contains("存在しなかったパス 1件"), "{text}");
 }
 
@@ -246,7 +246,7 @@ fn collector_control_records_are_surfaced_not_turned_into_candidates() {
 
     assert!(agg.candidates().is_empty());
     assert_eq!(agg.collector_notes.len(), 1);
-    let text = render(&agg, Generalization::None, 10);
+    let text = render(&agg, 10);
     assert!(text.contains("収集器からの報告"), "{text}");
     assert!(text.contains("etw_session_start_failed"), "{text}");
 }
@@ -257,7 +257,7 @@ fn unparsable_lines_are_counted_and_shown() {
     let mut agg = test_aggregate();
     agg.add_unparsable(3);
 
-    let text = render(&agg, Generalization::None, 10);
+    let text = render(&agg, 10);
     assert!(text.contains("解釈できなかった行 3件"), "{text}");
 }
 
@@ -265,7 +265,7 @@ fn unparsable_lines_are_counted_and_shown() {
 #[test]
 fn an_empty_recording_says_so_instead_of_looking_like_a_clean_run() {
     let agg = test_aggregate();
-    let text = render(&agg, Generalization::None, 10);
+    let text = render(&agg, 10);
 
     assert!(text.contains("1件も観測できませんでした"), "{text}");
 }
@@ -282,7 +282,7 @@ fn denials_carry_a_note_that_tier1_denials_differ_from_tier2a_needs() {
         1,
     ));
 
-    let text = render(&agg, Generalization::None, 10);
+    let text = render(&agg, 10);
     assert!(text.contains("通常の権限で拒否された"), "{text}");
 }
 
@@ -299,7 +299,7 @@ fn a_truncated_proposal_list_reports_how_many_were_hidden() {
         ));
     }
 
-    let text = render(&agg, Generalization::None, 3);
+    let text = render(&agg, 3);
     assert!(text.contains("他 7件"), "{text}");
 }
 
@@ -523,7 +523,7 @@ fn the_exec_image_reaches_the_proposal_list_as_fs_read_exec() {
         2,
     ));
 
-    let proposals = agg.proposals(Generalization::Directory);
+    let proposals = agg.proposals();
 
     let exec: Vec<&harness_policy::RuleProposal> = proposals
         .iter()
@@ -563,7 +563,7 @@ fn pass2_manifest(unreachable: Option<&str>, declared: &[(&str, FsAccess)]) -> R
 }
 
 fn has_proposal(agg: &Aggregate, key: harness_policy::SettingsKey, value: &str) -> bool {
-    agg.proposals(Generalization::None)
+    agg.proposals()
         .iter()
         .any(|p| p.key == key && p.value.eq_ignore_ascii_case(value))
 }
@@ -584,7 +584,7 @@ fn the_executable_named_by_the_pre_run_diagnosis_becomes_a_read_exec_candidate()
             "C:/Users/segfo/.cargo/bin/cargo.exe"
         ),
         "{:#?}",
-        agg.proposals(Generalization::None)
+        agg.proposals()
     );
     assert_eq!(
         agg.diagnosed_exec.as_deref(),
@@ -626,7 +626,7 @@ fn a_diagnosed_executable_under_a_default_exec_root_is_never_proposed() {
         &pass2_manifest(Some("C:/Windows/System32/curl.exe"), &[]),
     );
 
-    assert!(agg.proposals(Generalization::None).is_empty());
+    assert!(agg.proposals().is_empty());
     assert_eq!(agg.excluded_default_exec_image, 1);
     assert!(agg.diagnosed_exec.is_none());
     assert!(render_notes(&agg).contains("C:/Windows"));
@@ -642,7 +642,7 @@ fn a_diagnosed_executable_under_the_harness_control_directory_is_never_proposed(
         &pass2_manifest(Some("C:/work/.harness/tools/thing.exe"), &[]),
     );
 
-    assert!(agg.proposals(Generalization::None).is_empty());
+    assert!(agg.proposals().is_empty());
     assert_eq!(agg.excluded_control_dir, 1);
 }
 
@@ -656,7 +656,7 @@ fn a_diagnosed_executable_that_was_also_observed_as_an_image_stays_one_candidate
     apply_session_context(&mut agg, &pass2_manifest(Some(image), &[]));
 
     let exec: Vec<_> = agg
-        .proposals(Generalization::None)
+        .proposals()
         .into_iter()
         .filter(|p| p.key == harness_policy::SettingsKey::FsReadExec)
         .collect();
@@ -671,7 +671,7 @@ fn a_session_without_a_diagnosis_gains_no_candidate() {
 
     apply_session_context(&mut agg, &pass2_manifest(None, &[]));
 
-    assert!(agg.proposals(Generalization::None).is_empty());
+    assert!(agg.proposals().is_empty());
     assert!(agg.diagnosed_exec.is_none());
     assert!(!render_notes(&agg).contains("実行前診断"));
 }
@@ -694,7 +694,7 @@ fn a_pass2_denial_on_an_already_declared_path_is_escalated() {
     );
 
     let keys: Vec<_> = agg
-        .proposals(Generalization::None)
+        .proposals()
         .into_iter()
         .map(|p| p.key)
         .collect();
@@ -719,7 +719,7 @@ fn a_pass1_session_is_never_escalated_even_if_the_manifest_carries_declarations(
 
     apply_session_context(&mut agg, &manifest);
 
-    let proposals = agg.proposals(Generalization::None);
+    let proposals = agg.proposals();
     assert_eq!(proposals.len(), 1, "{proposals:#?}");
     assert_eq!(proposals[0].key, harness_policy::SettingsKey::FsRead);
     assert!(agg.diagnosed_exec.is_none());
@@ -737,7 +737,7 @@ fn declared_paths_are_normalized_before_they_are_matched() {
     );
 
     let keys: Vec<_> = agg
-        .proposals(Generalization::None)
+        .proposals()
         .into_iter()
         .map(|p| p.key)
         .collect();

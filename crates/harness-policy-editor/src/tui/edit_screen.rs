@@ -117,13 +117,12 @@ fn draw_domain(frame: &mut Frame, area: Rect, app: &App) {
 
 /// 戻り値はratatuiが選択を見せるために定めた表示開始位置（呼び出し側が保存する）。
 fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
-    let label = crate::aggregate::generalization_label(app.generalization);
     let visible = app.visible_proposals();
     // **隠している件数を必ず出す**（B-09）。既定のフィルタは承認できるものだけなので、
     // 出していないものがあることが分からないと「候補が少ない」と誤解される。
     let title = match app.view.as_ref() {
         Some(view) => format!(
-            " 候補: {} {}件（全{}件・承認不可 {}件）／--generalize {label}／選択 {}件 ",
+            " 候補: {} {}件（全{}件・承認不可 {}件）／選択 {}件 ",
             app.filter.label(),
             visible.len(),
             view.proposals.len(),
@@ -191,7 +190,12 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
 
             // 配下の選択状況（全部／一部／なし）。一部だけ選ばれている状態が見えないと、
             // 「まとめて選んだあと個別に外す」使い方ができない。
-            let under = app.tree.subtree_proposals(row.node);
+            //
+            // **スペースが実際に触る集合と同じものを数える**（`bulk_selectable_proposals`）。
+            // `subtree_proposals`で数えると、子を持つノード自身の候補（D-62でスペースの
+            // 対象外にしたもの）が分母に入り、**全部選んでも`[x]`にならない**——表示と操作が
+            // 食い違うと、ユーザーは「選べていない」と読んで押し続けることになる。
+            let under = app.tree.bulk_selectable_proposals(row.node);
             let approvable: Vec<&usize> = under.iter().filter(|i| !view.too_broad[**i]).collect();
             // **宣言済みのものも「入っている」側に数える。** 数えないと、承認済みの実行ファイルが
             // 毎回`[ ]`で現れて、同じ場所へ二重にチェックを付けることになる。
@@ -231,6 +235,21 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
                 ),
                 Span::raw(format!(" {}", node.label)),
             ];
+            // [D-63] 再帰指定。**書かれる値そのもの（`/**`）を出す**——「再帰」という語より、
+            // 実際にpolicy.jsonへ入る文字列を見せた方が誤解が無い。色は赤（この1行が他の全部より
+            // 重い操作なので、一覧の中で埋もれてはいけない）。
+            if app.recursive.contains(&node.path) {
+                spans.push(Span::styled(
+                    "/**".to_string(),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    "  ← 配下すべて＋今後の追加分".to_string(),
+                    Style::default().fg(Color::Red),
+                ));
+            }
             if has_children {
                 spans.push(Span::styled(
                     format!("  （配下 {}件", node.total),

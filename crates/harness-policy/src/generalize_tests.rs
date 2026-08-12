@@ -21,7 +21,7 @@ fn generalization_none_keeps_every_path_separate() {
         fs("C:/Users/me/.cargo/registry/b.crate", FsAccess::Read),
     ];
 
-    let proposals = generalize(&candidates, Generalization::None);
+    let proposals = generalize(&candidates);
 
     assert_eq!(proposals.len(), 2);
     assert_eq!(proposals[0].value, "C:/Users/me/.cargo/registry/a.crate");
@@ -33,23 +33,36 @@ fn generalization_none_keeps_every_path_separate() {
         .all(|p| !p.warnings.iter().any(|w| w.contains("generalized from"))));
 }
 
-/// `Directory`は同一親配下の2件以上を親1本へ畳み、証拠は全件を引き継ぐ。
+/// [D-62] **同一親配下に何件あっても親へ畳まない。** 観測された値がそのまま1件1提案になる。
+///
+/// 畳んでいた頃（`--generalize dir`が既定）は、この入力が`C:/Users/me/.cargo/registry`1本に
+/// なっていた。付与は継承ACE（`(OI)(CI)`）なので、**観測していない兄弟ファイルと将来そこに
+/// 作られるファイルまで**読めるようになる。ユーザーに見えるのは「2件をまとめた1行」なのに、
+/// 実際に開くのはディレクトリ全体だった。
 #[test]
-fn generalization_directory_folds_siblings_into_their_parent() {
+fn siblings_in_the_same_directory_are_not_folded_into_their_parent() {
     let candidates = vec![
         fs("C:/Users/me/.cargo/registry/a.crate", FsAccess::Read),
         fs("C:/Users/me/.cargo/registry/b.crate", FsAccess::Read),
     ];
 
-    let proposals = generalize(&candidates, Generalization::Directory);
+    let proposals = generalize(&candidates);
 
-    assert_eq!(proposals.len(), 1);
-    assert_eq!(proposals[0].value, "C:/Users/me/.cargo/registry");
-    assert_eq!(proposals[0].evidence.len(), 2);
-    assert!(proposals[0]
-        .warnings
-        .iter()
-        .any(|w| w.contains("generalized from 2")));
+    assert_eq!(proposals.len(), 2, "2件の観測は2件の提案のままであること");
+    let values: Vec<&str> = proposals.iter().map(|p| p.value.as_str()).collect();
+    assert_eq!(
+        values,
+        vec![
+            "C:/Users/me/.cargo/registry/a.crate",
+            "C:/Users/me/.cargo/registry/b.crate"
+        ]
+    );
+    // 親ディレクトリが提案として現れないこと。**これが本体の主張**——ここが破れると、
+    // 承認1回でサブツリー全体が開く。
+    assert!(
+        !values.contains(&"C:/Users/me/.cargo/registry"),
+        "親ディレクトリを提案してはならない（継承ACEでサブツリー全体が開く）"
+    );
 }
 
 /// 兄弟が1件しか無いディレクトリは畳まない。畳むと「1ファイルの拒否でディレクトリ全体を開く」
@@ -58,7 +71,7 @@ fn generalization_directory_folds_siblings_into_their_parent() {
 fn generalization_directory_does_not_widen_a_lone_path() {
     let candidates = vec![fs("C:/Users/me/.gitconfig", FsAccess::Read)];
 
-    let proposals = generalize(&candidates, Generalization::Directory);
+    let proposals = generalize(&candidates);
 
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].value, "C:/Users/me/.gitconfig");
@@ -76,7 +89,7 @@ fn generalization_never_folds_up_to_a_drive_root() {
         fs("C:/toolsB", FsAccess::ReadExec),
     ];
 
-    let proposals = generalize(&candidates, Generalization::Directory);
+    let proposals = generalize(&candidates);
 
     assert_eq!(proposals.len(), 2, "must not collapse into C:/");
     assert!(proposals
@@ -84,9 +97,14 @@ fn generalization_never_folds_up_to_a_drive_root() {
         .all(|p| p.value != "C:" && p.value != "C:/"));
 }
 
-/// `Auto`はバージョン番号らしい要素をワイルドカード化し、同値になったものを畳む。
+/// [D-62] **バージョン番号らしい要素をワイルドカードにしない。**
+///
+/// ワイルドカードは畳み込みより footprint が広い。`approve::grant_root`は**最初の`*`の手前で
+/// 切る**ので、`.../toolchains/*/bin`という値のACEは`.../toolchains`**全体**に付く
+/// ——観測していない全toolchainバージョンが対象になる。実際この開発機の台帳には、
+/// その結果として`C:/Users/segfo/.rustup/toolchains`が付与ルートとして残っていた。
 #[test]
-fn generalization_auto_wildcards_version_segments_and_merges_them() {
+fn version_segments_are_not_wildcarded() {
     let candidates = vec![
         fs(
             "C:/Users/me/.rustup/toolchains/1.89.0/bin",
@@ -98,26 +116,28 @@ fn generalization_auto_wildcards_version_segments_and_merges_them() {
         ),
     ];
 
-    let proposals = generalize(&candidates, Generalization::Auto);
+    let proposals = generalize(&candidates);
 
-    assert_eq!(proposals.len(), 1);
-    assert_eq!(proposals[0].value, "C:/Users/me/.rustup/toolchains/*/bin");
-    assert_eq!(proposals[0].evidence.len(), 2);
-    assert!(proposals[0].warnings.iter().any(|w| w.contains("wildcard")));
+    assert_eq!(proposals.len(), 2);
+    assert!(
+        proposals.iter().all(|p| !p.value.contains('*')),
+        "ワイルドカードを含む値を提案してはならない: {:?}",
+        proposals.iter().map(|p| &p.value).collect::<Vec<_>>()
+    );
 }
 
-/// 16進ハッシュらしい要素もワイルドカード化する。
+/// [D-62] 16進ハッシュらしい要素もワイルドカードにしない（理由は上と同じ）。
 #[test]
-fn generalization_auto_wildcards_hash_segments() {
+fn hash_segments_are_not_wildcarded() {
     let candidates = vec![
         fs("C:/cache/a1b2c3d4e5f6/pkg", FsAccess::Read),
         fs("C:/cache/9f8e7d6c5b4a/pkg", FsAccess::Read),
     ];
 
-    let proposals = generalize(&candidates, Generalization::Auto);
+    let proposals = generalize(&candidates);
 
-    assert_eq!(proposals.len(), 1);
-    assert_eq!(proposals[0].value, "C:/cache/*/pkg");
+    assert_eq!(proposals.len(), 2);
+    assert!(proposals.iter().all(|p| !p.value.contains('*')));
 }
 
 /// 意味のある名前（英字混じり）はワイルドカードで潰さない。潰すと提案が広がりすぎる。
@@ -128,7 +148,7 @@ fn generalization_auto_leaves_meaningful_segments_alone() {
         FsAccess::ReadExec,
     )];
 
-    let proposals = generalize(&candidates, Generalization::Auto);
+    let proposals = generalize(&candidates);
 
     assert_eq!(
         proposals[0].value,
@@ -145,7 +165,7 @@ fn different_access_levels_never_merge_into_the_stronger_one() {
         fs("C:/Users/me/.cargo", FsAccess::ReadWrite),
     ];
 
-    let proposals = generalize(&candidates, Generalization::Auto);
+    let proposals = generalize(&candidates);
 
     assert_eq!(proposals.len(), 2);
     let keys: Vec<_> = proposals.iter().map(|p| p.key).collect();
@@ -158,7 +178,6 @@ fn different_access_levels_never_merge_into_the_stronger_one() {
 fn read_write_proposals_always_carry_a_write_containment_warning() {
     let proposals = generalize(
         &[fs("C:/Users/me/out", FsAccess::ReadWrite)],
-        Generalization::None,
     );
 
     assert!(proposals[0]
@@ -172,7 +191,7 @@ fn read_write_proposals_always_carry_a_write_containment_warning() {
 fn domains_are_not_subject_to_path_folding() {
     let candidates = vec![net("api.example.com"), net("cdn.example.com")];
 
-    let proposals = generalize(&candidates, Generalization::Auto);
+    let proposals = generalize(&candidates);
 
     assert_eq!(proposals.len(), 2);
     assert!(proposals
@@ -189,8 +208,8 @@ fn proposal_ids_are_stable_regardless_of_input_order() {
     let a = fs("C:/z/one", FsAccess::Read);
     let b = fs("C:/a/two", FsAccess::Read);
 
-    let forward = generalize(&[a.clone(), b.clone()], Generalization::Directory);
-    let backward = generalize(&[b, a], Generalization::Directory);
+    let forward = generalize(&[a.clone(), b.clone()]);
+    let backward = generalize(&[b, a]);
 
     let ids_and_values: Vec<_> = forward
         .iter()
@@ -216,7 +235,7 @@ fn evidence_keeps_every_contributing_source() {
         DeniedCandidate::fs(Source::Etw, "C:/x", FsAccess::Read, "denied", 4, 9),
     ];
 
-    let proposals = generalize(&candidates, Generalization::Directory);
+    let proposals = generalize(&candidates);
 
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].sources(), vec![Source::Preflight, Source::Etw]);
@@ -237,7 +256,6 @@ fn os_audit_read_proposals_disclose_that_read_is_only_a_guess() {
             1,
             0,
         )],
-        Generalization::None,
     );
 
     let warning = proposals[0]
@@ -265,7 +283,6 @@ fn non_audit_read_proposals_do_not_carry_the_guess_disclosure() {
                 1,
                 0,
             )],
-            Generalization::None,
         );
         assert!(
             !proposals[0]
@@ -299,7 +316,6 @@ fn granted(entries: &[(&str, FsAccess)]) -> crate::insufficient::GrantedPaths {
 fn a_denial_under_an_existing_read_grant_is_replaced_by_both_escalation_targets() {
     let proposals = generalize_with_granted(
         &[fs("C:/tools/bin/rustc.exe", FsAccess::Read)],
-        Generalization::None,
         &granted(&[("C:/tools", FsAccess::Read)]),
     );
 
@@ -334,7 +350,6 @@ fn a_denial_under_an_existing_read_grant_is_replaced_by_both_escalation_targets(
 fn a_denial_under_a_read_exec_grant_escalates_only_to_read_write() {
     let proposals = generalize_with_granted(
         &[fs("C:/tools/x.dll", FsAccess::Read)],
-        Generalization::None,
         &granted(&[("C:/tools", FsAccess::ReadExec)]),
     );
 
@@ -349,7 +364,6 @@ fn a_denial_under_a_read_exec_grant_escalates_only_to_read_write() {
 fn a_denial_under_a_read_write_grant_escalates_to_read_exec_and_admits_the_limit() {
     let proposals = generalize_with_granted(
         &[fs("C:/data/tool.exe", FsAccess::Read)],
-        Generalization::None,
         &granted(&[("C:/data", FsAccess::ReadWrite)]),
     );
 
@@ -361,34 +375,45 @@ fn a_denial_under_a_read_write_grant_escalates_to_read_exec_and_admits_the_limit
         .any(|w| w.contains("does not grant at all")));
 }
 
-/// **畳んだ親を、子1件を根拠に昇格させない。** 提案の`value`（＝設定へ書かれる値）が
-/// 許可済みでないなら、それを足すことには意味がある。証拠の一員が許可済みであることは
-/// 判断材料として注記に残すが、keyは動かさない。
+/// **既に許可済みの1件を根拠に、他の候補まで広げない。** [D-62]で畳み込みを廃止したので、
+/// 兄弟は別々の提案として残る——許可済みの側には注記が付き、もう片方は素の候補のままになる。
 #[test]
-fn a_folded_parent_is_annotated_but_not_escalated_when_only_a_child_was_granted() {
+fn an_already_granted_sibling_is_annotated_without_widening_the_other() {
     let proposals = generalize_with_granted(
         &[
             fs("C:/tools/bin/a.exe", FsAccess::Read),
             fs("C:/tools/bin/b.exe", FsAccess::Read),
         ],
-        Generalization::Directory,
         &granted(&[("C:/tools/bin/a.exe", FsAccess::Read)]),
     );
 
-    assert_eq!(proposals.len(), 1);
-    assert_eq!(proposals[0].value, "C:/tools/bin");
-    assert_eq!(
-        proposals[0].key,
-        SettingsKey::FsRead,
-        "adding fs.read for the parent is a real change; do not widen it on one child's behalf"
-    );
+    let values: Vec<&str> = proposals.iter().map(|p| p.value.as_str()).collect();
     assert!(
-        proposals[0]
-            .warnings
-            .iter()
-            .any(|w| w.contains("ALREADY allowed")),
-        "the evidence-level insufficiency is still worth showing: {:#?}",
-        proposals[0].warnings
+        !values.contains(&"C:/tools/bin"),
+        "親ディレクトリを提案してはならない: {values:?}"
+    );
+    // 許可済みの`a.exe`は昇格候補が並ぶ（D-46: 許可済みなのに拒否された＝その許可では足りない）。
+    // **昇格するのは観測されたパス自身のaccessだけ**で、対象パスは広がらない。
+    let a: Vec<&RuleProposal> = proposals
+        .iter()
+        .filter(|p| p.value == "C:/tools/bin/a.exe")
+        .collect();
+    assert!(!a.is_empty(), "granted path is still proposed: {proposals:#?}");
+    assert!(
+        a.iter()
+            .any(|p| p.warnings.iter().any(|w| w.contains("ALREADY allowed"))),
+        "許可済みなのに拒否された＝その許可では足りない、は出す: {a:#?}"
+    );
+    // 未許可の`b.exe`は素の候補のまま（片方の事情がもう片方へ伝染しない）。
+    let b = proposals
+        .iter()
+        .find(|p| p.value == "C:/tools/bin/b.exe")
+        .expect("ungranted sibling is proposed");
+    assert_eq!(b.key, SettingsKey::FsRead);
+    assert!(
+        !b.warnings.iter().any(|w| w.contains("ALREADY allowed")),
+        "許可済みなのは兄弟の方であって、この候補ではない: {:#?}",
+        b.warnings
     );
 }
 
@@ -397,7 +422,6 @@ fn a_folded_parent_is_annotated_but_not_escalated_when_only_a_child_was_granted(
 fn an_ungranted_path_still_yields_exactly_one_proposal() {
     let proposals = generalize_with_granted(
         &[fs("C:/elsewhere/x.txt", FsAccess::Read)],
-        Generalization::None,
         &granted(&[("C:/tools", FsAccess::Read)]),
     );
 
@@ -416,8 +440,8 @@ fn ids_stay_deterministic_when_a_group_expands_into_several_proposals() {
     ];
     let reversed: Vec<DeniedCandidate> = forward.iter().rev().cloned().collect();
 
-    let a = generalize_with_granted(&forward, Generalization::None, &granted);
-    let b = generalize_with_granted(&reversed, Generalization::None, &granted);
+    let a = generalize_with_granted(&forward, &granted);
+    let b = generalize_with_granted(&reversed, &granted);
 
     let ids_and_keys = |proposals: &[RuleProposal]| -> Vec<(String, SettingsKey, String)> {
         proposals
@@ -429,37 +453,39 @@ fn ids_stay_deterministic_when_a_group_expands_into_several_proposals() {
     assert_eq!(a.len(), 3, "2 escalated + 1 untouched: {a:#?}");
 }
 
-/// **ディレクトリ自身への観測と、その配下を畳んだ結果は1件にまとまる。**
+/// **ディレクトリ自身が観測されたときは、それも候補として残る。**
 ///
-/// `C:/.cargo`を直接開いた観測と、`C:/.cargo/config`・`C:/.cargo/config.toml`を畳んだ結果は
-/// どちらも`fs.read = C:/.cargo`という**同じ設定値**である。別々の提案として並べると、
-/// (a)同じ値がidだけ違う形で2行出る、(b)観測回数が2つに割れてどちらも実数より小さく見える、
-/// (c)片方を承認しても残りが未承認のまま残って見える——実際に記録すると一覧の上位が
-/// この重複で埋まった（`C:/.cargo`と`C:/Program Files`が各2件）。
+/// 祖先チェーンのオープン（`cmd`系は祖先を「通過」ではなく**オープン**する）で、ディレクトリ
+/// 自身が拒否として実際に観測される。[D-62]で畳み込みを廃止しても**この経路は残る**——
+/// 観測された事実を捨てるわけにはいかないからである。
+///
+/// つまり「値がディレクトリの候補」は今後も出る。**それを承認すればサブツリー全体が開く**ので、
+/// ポリシーエディタの一括選択（親行のチェック）はこの種の候補を巻き込んではならない。
+/// その保証は`proposal_tree`側のテストが持つ。
 #[test]
-fn a_directory_observed_directly_merges_with_the_fold_of_its_children() {
+fn a_directly_observed_directory_stays_a_candidate_of_its_own() {
     let candidates = vec![
-        // ディレクトリ自身への観測（祖先チェーンのオープンで実際に出る形）。
         fs("C:/Users/me/.cargo/registry", FsAccess::Read),
         fs("C:/Users/me/.cargo/registry/a.crate", FsAccess::Read),
         fs("C:/Users/me/.cargo/registry/b.crate", FsAccess::Read),
     ];
 
-    let proposals = generalize(&candidates, Generalization::Directory);
+    let proposals = generalize(&candidates);
 
-    let cargo: Vec<&RuleProposal> = proposals
+    assert_eq!(proposals.len(), 3, "3件の観測は3件の提案: {proposals:#?}");
+    let dir: Vec<&RuleProposal> = proposals
         .iter()
         .filter(|p| p.value == "C:/Users/me/.cargo/registry" && p.key == SettingsKey::FsRead)
         .collect();
     assert_eq!(
-        cargo.len(),
+        dir.len(),
         1,
         "同じ設定値の提案が2件並ぶと、どちらを承認すればよいのか決められない: {proposals:#?}"
     );
     assert_eq!(
-        cargo[0].observed_count(),
-        3,
-        "証拠は両方から引き継ぐ（割れた回数は実数より小さく見える）"
+        dir[0].observed_count(),
+        1,
+        "ディレクトリ自身の観測回数だけを数える（子の回数を足し込まない）"
     );
 }
 
@@ -476,7 +502,7 @@ fn folding_does_not_produce_a_value_the_breadth_guard_would_reject() {
         fs("C:/Program Files/GitHub CLI", FsAccess::Read),
     ];
 
-    let proposals = generalize(&candidates, Generalization::Directory);
+    let proposals = generalize(&candidates);
 
     let values: Vec<&str> = proposals.iter().map(|p| p.value.as_str()).collect();
     assert!(
@@ -495,46 +521,11 @@ fn folding_does_not_produce_a_value_the_breadth_guard_would_reject() {
     );
 }
 
-/// **書きの候補でも同じ**（畳み込みの判定は最も厳しいaccessで見るので、access種別で挙動が
-/// 割れない）。read側だけ直して write側が畳まれ続ける、という非対称を作らない。
-#[test]
-fn the_folding_guard_does_not_depend_on_the_access_kind() {
-    for access in [FsAccess::Read, FsAccess::ReadWrite, FsAccess::ReadExec] {
-        let candidates = vec![
-            fs("C:/Program Files/Git", access),
-            fs("C:/Program Files/GitHub CLI", access),
-        ];
-
-        let proposals = generalize(&candidates, Generalization::Directory);
-
-        let values: Vec<&str> = proposals.iter().map(|p| p.value.as_str()).collect();
-        assert!(
-            !values.contains(&"C:/Program Files"),
-            "{access:?}: 推論でマシン規模のディレクトリを作らない: {values:?}"
-        );
-    }
-}
-
-/// 畳める場合はこれまで通り畳む（上のガードが畳み込みそのものを殺していないこと）。
-#[test]
-fn folding_still_happens_when_the_parent_is_acceptable() {
-    let candidates = vec![
-        fs("C:/Users/me/.cargo/registry/a.crate", FsAccess::Read),
-        fs("C:/Users/me/.cargo/registry/b.crate", FsAccess::Read),
-    ];
-
-    let proposals = generalize(&candidates, Generalization::Directory);
-
-    assert_eq!(proposals.len(), 1);
-    assert_eq!(proposals[0].value, "C:/Users/me/.cargo/registry");
-}
-
 /// ネットワークの提案は昇格の対象外（FSパスの許可状態とは無関係）。
 #[test]
 fn domain_proposals_are_untouched_by_the_escalation_ladder() {
     let proposals = generalize_with_granted(
         &[net("api.example.com")],
-        Generalization::None,
         &granted(&[("C:/", FsAccess::Read)]),
     );
 
@@ -557,7 +548,6 @@ fn domain_proposals_are_untouched_by_the_escalation_ladder() {
 fn a_read_exec_proposal_is_not_escalated_just_because_read_is_already_granted() {
     let proposals = generalize_with_granted(
         &[fs("C:/Users/me/.cargo/bin/cargo.exe", FsAccess::ReadExec)],
-        Generalization::None,
         &granted(&[("C:/Users/me/.cargo/bin", FsAccess::Read)]),
     );
 
@@ -576,7 +566,6 @@ fn a_read_exec_proposal_is_not_escalated_just_because_read_is_already_granted() 
 fn a_read_proposal_under_the_same_read_grant_still_escalates() {
     let proposals = generalize_with_granted(
         &[fs("C:/Users/me/.cargo/bin/cargo.exe", FsAccess::Read)],
-        Generalization::None,
         &granted(&[("C:/Users/me/.cargo/bin", FsAccess::Read)]),
     );
 
@@ -592,7 +581,6 @@ fn a_read_proposal_under_the_same_read_grant_still_escalates() {
 fn a_read_exec_proposal_survives_a_read_write_grant() {
     let proposals = generalize_with_granted(
         &[fs("C:/data/tool.exe", FsAccess::ReadExec)],
-        Generalization::None,
         &granted(&[("C:/data", FsAccess::ReadWrite)]),
     );
 
@@ -623,7 +611,6 @@ fn proposals_from_different_sources_that_land_on_the_same_key_and_value_are_merg
 
     let proposals = generalize_with_granted(
         &candidates,
-        Generalization::None,
         &granted(&[("C:/tools", FsAccess::Read)]),
     );
 
@@ -656,20 +643,20 @@ fn proposals_from_different_sources_that_land_on_the_same_key_and_value_are_merg
 /// [`restate_access`]は**keyに依存する警告だけ**を差し替え、値と証拠には触れない。
 #[test]
 fn restating_the_access_swaps_only_the_key_dependent_warnings() {
-    let original = generalize(
-        &[
-            fs("C:/tools/bin/a.exe", FsAccess::Read),
-            fs("C:/tools/bin/b.exe", FsAccess::Read),
-        ],
-        Generalization::Directory,
-    )
-    .remove(0);
+    // key非依存の警告の実例には**ワイルドカード注意**を使う。[D-62]で一般化を廃止したので
+    // harnessが`*`を作ることはないが、ユーザーが手で書いた宣言はpreflight由来の候補として
+    // 戻ってくる——その経路でこの警告は今も出る。
+    let original = generalize(&[fs("C:/tools/**", FsAccess::Read)]).remove(0);
     assert!(
         original
             .warnings
             .iter()
             .any(|w| w.contains("came from OS auditing")),
         "precondition: the fs.read guess warning is present: {original:#?}"
+    );
+    assert!(
+        original.warnings.iter().any(|w| w.contains("wildcard")),
+        "precondition: the key-independent wildcard warning is present: {original:#?}"
     );
 
     let restated = restate_access(&original, SettingsKey::FsReadExec);
@@ -689,10 +676,7 @@ fn restating_the_access_swaps_only_the_key_dependent_warnings() {
         "the fs.read-only guess warning must go: {restated:#?}"
     );
     assert!(
-        restated
-            .warnings
-            .iter()
-            .any(|w| w.contains("generalized from")),
+        restated.warnings.iter().any(|w| w.contains("wildcard")),
         "warnings that do not depend on the key must stay: {restated:#?}"
     );
     assert!(
@@ -709,7 +693,6 @@ fn restating_the_access_swaps_only_the_key_dependent_warnings() {
 fn restating_to_read_write_adds_the_write_containment_warning() {
     let original = generalize(
         &[fs("C:/tools/x.txt", FsAccess::Read)],
-        Generalization::None,
     )
     .remove(0);
 

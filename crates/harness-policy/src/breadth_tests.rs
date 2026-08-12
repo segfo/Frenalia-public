@@ -5,7 +5,7 @@
 
 use super::*;
 
-use crate::generalize::{generalize, Generalization};
+use crate::generalize::generalize;
 use crate::normalize::{DeniedCandidate, Source};
 use harness_config::FsAccess;
 
@@ -19,7 +19,6 @@ fn proposal_for(value: &str, access: FsAccess) -> RuleProposal {
             1,
             0,
         )],
-        Generalization::None,
     )
     .remove(0)
 }
@@ -209,7 +208,6 @@ fn domain_proposals_are_out_of_scope() {
             1,
             0,
         )],
-        Generalization::None,
     )
     .remove(0);
 
@@ -242,7 +240,6 @@ fn check_all_pairs_verdicts_with_proposal_ids() {
                 0,
             ),
         ],
-        Generalization::None,
     );
 
     let verdicts = check_all(&proposals);

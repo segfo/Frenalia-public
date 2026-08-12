@@ -31,26 +31,6 @@ fn source_selection_defaults_to_all_and_rejects_unknown_spellings() {
     );
 }
 
-/// `--generalize`の既定は`dir`。未知の値は既定へ倒さずエラーにする——「設定したのに効かない」に
-/// 気付けない状態を作らないため（`harness-config`のフェーズ名typoと同じ方針）。
-#[test]
-fn generalization_selection_defaults_to_directory_and_rejects_unknown_spellings() {
-    assert_eq!(
-        resolve_generalization(None).unwrap(),
-        Generalization::Directory
-    );
-    assert_eq!(
-        resolve_generalization(Some("none")).unwrap(),
-        Generalization::None
-    );
-    assert_eq!(
-        resolve_generalization(Some("auto")).unwrap(),
-        Generalization::Auto
-    );
-
-    assert!(resolve_generalization(Some("aggressive")).is_err());
-}
-
 /// OS監査の出力先は`net-audit.jsonl`と同じセッションディレクトリ（同じセッションで起きたことを
 /// 1箇所へ集める）。`--session`の`session-`接頭辞は有無どちらでも同じ場所を指す。
 #[test]
@@ -119,7 +99,7 @@ fn proposals_still_come_from_readable_sources_when_the_collector_is_absent() {
     // fs-audit.jsonl（OS監査）は意図的に作らない。
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Network, Source::Etw]);
-    let proposals = input.proposals(Generalization::Directory);
+    let proposals = input.proposals();
 
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].value, "blocked.example");
@@ -168,7 +148,7 @@ fn suggesting_never_touches_the_settings_file() {
     .unwrap();
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
-    let proposals = input.proposals(Generalization::Directory);
+    let proposals = input.proposals();
     let verdicts = gate::check_all(&proposals, harness_core::RequireSandbox::None);
     let rendered = render_output(&proposals, &verdicts, OutputFormat::Text);
 
@@ -372,7 +352,7 @@ fn sample_proposals() -> Vec<harness_policy::RuleProposal> {
         ),
         harness_policy::DeniedCandidate::net(Source::Network, "blocked.example", "denied", 1, 0),
     ];
-    harness_policy::generalize::generalize(&candidates, Generalization::None)
+    harness_policy::generalize::generalize(&candidates)
 }
 
 /// 提案が空でも`suggest`は成功し、「提案するものが無い」と明示する。
@@ -413,7 +393,7 @@ fn a_denial_under_an_existing_read_grant_is_reported_as_insufficient() {
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
     let proposals =
-        input.proposals_with_granted(Generalization::None, &granted_paths_from(dir.path(), ""));
+        input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
 
     let warning = proposals[0]
         .warnings
@@ -450,7 +430,7 @@ fn a_denial_on_an_ungranted_path_carries_no_insufficiency_claim() {
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
     let proposals =
-        input.proposals_with_granted(Generalization::None, &granted_paths_from(dir.path(), ""));
+        input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
 
     assert!(!proposals[0]
         .warnings
@@ -495,7 +475,7 @@ fn applying_an_escalated_proposal_actually_changes_the_settings() {
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
     let proposals =
-        input.proposals_with_granted(Generalization::None, &granted_paths_from(dir.path(), ""));
+        input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
     let read_write = proposals
         .iter()
         .find(|p| p.key == harness_policy::SettingsKey::FsReadWrite)
@@ -536,9 +516,7 @@ fn a_denial_on_an_fs_allow_only_path_escalates_via_the_ledger() {
     let ledger = r#"{"entries":[{"path":"C:\\tools","writable":false,"granted_at_unix_secs":1}]}"#;
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
-    let proposals = input.proposals_with_granted(
-        Generalization::None,
-        &granted_paths_from(dir.path(), ledger),
+    let proposals = input.proposals_with_granted(&granted_paths_from(dir.path(), ledger),
     );
 
     assert_eq!(proposals.len(), 1, "{proposals:#?}");
@@ -556,9 +534,7 @@ fn a_broken_ledger_degrades_to_no_escalation_instead_of_failing() {
     let dir = workspace_with_one_denial("{}", "C:/tools/bin/rustc.exe");
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
-    let proposals = input.proposals_with_granted(
-        Generalization::None,
-        &granted_paths_from(dir.path(), "{ this is not json"),
+    let proposals = input.proposals_with_granted(&granted_paths_from(dir.path(), "{ this is not json"),
     );
 
     assert_eq!(proposals.len(), 1);
@@ -593,7 +569,7 @@ fn relative_settings_paths_are_resolved_against_the_workspace_root() {
 
     let input = collect_input(dir.path(), Some("x"), &[Source::Etw]);
     let proposals =
-        input.proposals_with_granted(Generalization::None, &granted_paths_from(dir.path(), ""));
+        input.proposals_with_granted(&granted_paths_from(dir.path(), ""));
 
     assert!(
         proposals
@@ -629,7 +605,6 @@ fn ancestor_chain_proposals() -> Vec<harness_policy::RuleProposal> {
                 0,
             ),
         ],
-        Generalization::None,
     )
 }
 

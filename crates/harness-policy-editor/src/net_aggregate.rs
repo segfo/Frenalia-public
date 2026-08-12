@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use harness_policy::{DeniedCandidate, Generalization, NetIntake, RuleProposal};
+use harness_policy::{DeniedCandidate, NetIntake, RuleProposal};
 
 /// パス2の記録1回分の集計。
 #[derive(Debug, Default)]
@@ -115,8 +115,8 @@ impl NetAggregate {
     }
 
     /// 許可ルールの提案。**適用はしない**（D-42: 反映は常にユーザーの明示操作）。
-    pub fn proposals(&self, mode: Generalization) -> Vec<RuleProposal> {
-        harness_policy::generalize::generalize(&self.candidates(), mode)
+    pub fn proposals(&self) -> Vec<RuleProposal> {
+        harness_policy::generalize::generalize(&self.candidates())
     }
 
     /// 正規化が付けた注記（ホスト名を持たなかった件数の説明など）。
@@ -198,14 +198,11 @@ pub fn render_notes(aggregate: &NetAggregate) -> String {
 }
 
 /// 記録結果を人が読む形へ整形する（注記＋候補一覧）。
-pub fn render(aggregate: &NetAggregate, mode: Generalization, limit: usize) -> String {
+pub fn render(aggregate: &NetAggregate, limit: usize) -> String {
     let mut out = render_notes(aggregate);
-    let proposals = aggregate.proposals(mode);
+    let proposals = aggregate.proposals();
 
-    out.push_str(&format!(
-        "\n許可ドメインの候補（--generalize {}）:\n",
-        crate::aggregate::generalization_label(mode)
-    ));
+    out.push_str("\n許可ドメインの候補（観測された値そのまま）:\n");
     if proposals.is_empty() {
         out.push_str("  （候補なし）\n");
     }

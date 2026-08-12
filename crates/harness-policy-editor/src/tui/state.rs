@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use harness_policy::{Generalization, RuleProposal};
+use harness_policy::RuleProposal;
 
 use crate::child_run::AbortReason;
 use crate::policy_file::{self, PolicyDomain};
@@ -501,14 +501,14 @@ pub struct SessionData {
 impl SessionData {
     /// **FSを先、ネットワークを後**（強制が効いているのはFSだけなので、「宣言を直せば直る」
     /// 情報はこちらにしか無い）。idは衝突しない（`generalize`がFSへ`fs-N`・netへ`net-N`を振る）。
-    pub fn proposals(&self, mode: Generalization) -> Vec<RuleProposal> {
+    pub fn proposals(&self) -> Vec<RuleProposal> {
         let mut proposals = self
             .fs
             .as_ref()
-            .map(|fs| fs.proposals(mode))
+            .map(|fs| fs.proposals())
             .unwrap_or_default();
         if let Some(net) = self.net.as_ref() {
-            proposals.extend(net.proposals(mode));
+            proposals.extend(net.proposals());
         }
         proposals
     }
@@ -679,19 +679,29 @@ pub struct App {
     pub sessions: Vec<SessionEntry>,
     pub selected_session: usize,
     pub view: Option<SessionView>,
-    pub generalization: Generalization,
     pub filter: CandidateFilter,
     pub accepted: BTreeSet<String>,
     /// **`c`でaccessを手で変えた候補のid**（`view.proposals`の中身と対）。
     ///
     /// 承認の確認画面で件数を出すために持つ——観測が言っていることと、ユーザーが判断したことは
     /// 別で、**何を書くのかを読んでから`y`を押せる**必要がある（D-42）。
-    /// 候補を作り直す操作（セッション移動・`r`・`g`）では**必ず空にする**——idの指す先が
+    /// 候補を作り直す操作（セッション移動など）では**必ず空にする**——idの指す先が
     /// 変わるので、残すと無関係な候補に「手で変えた」印が付く。
     pub hand_changed: BTreeSet<String>,
+    /// [D-63] `R`で**再帰**を指定したノードのパス集合（木のノードパスそのもの）。
+    ///
+    /// ここに入っているノードは、承認時に`<path>/**`という値の宣言として合成される
+    /// （[`super::edit::App::recursive_proposals`]）。**候補idではなくノードパスで持つ**のは、
+    /// 印を付けられる対象が候補とは限らないため——`.rustup/toolchains`のように
+    /// 「中のファイルだけが観測されていて、そのフォルダ自身は候補になっていない」構造ノードにも
+    /// 付けられる必要がある（付けられないと、今回いちばん困る形が救えない）。
+    ///
+    /// **再帰は推論では付かない。** D-62でパスの一般化を廃止したので、`**`が現れるのは
+    /// ユーザーがこのキーを押したときと、`settings.json`を手で書いたときだけである。
+    pub recursive: HashSet<String>,
     /// 候補のパス木（フィルタ後の候補から組み立てる）。
     ///
-    /// **`view`・`filter`・`generalization`のどれかを変えたら`rebuild_tree`を呼ぶこと。**
+    /// **`view`・`filter`のどちらかを変えたら`rebuild_tree`を呼ぶこと。**
     /// 呼ばないと、木が古い候補を指したまま操作されることになる。
     pub tree: ProposalTree,
     /// 展開しているノードのパス。**木を作り直しても残す**ので、フィルタや一般化の度合いを
@@ -798,10 +808,10 @@ impl App {
             sessions: Vec::new(),
             selected_session: 0,
             view: None,
-            generalization: Generalization::Directory,
             filter: CandidateFilter::Approvable,
             accepted: BTreeSet::new(),
             hand_changed: BTreeSet::new(),
+            recursive: HashSet::new(),
             tree: ProposalTree::default(),
             expanded: HashSet::new(),
             selected_row: 0,
@@ -1477,6 +1487,14 @@ impl App {
     fn on_enter_screen(&mut self) {
         match self.screen {
             Screen::Edit => {
+                // **画面へ入るたびにセッション一覧を読み直す**（D-63で`r`＝読み直しを廃止した）。
+                // 自分で記録したものは`finish_and_suggest`が拾うが、CLIや別プロセスが作った
+                // 記録はそれでは現れない。「画面を戻って入り直せば読み直される」を本当にする。
+                //
+                // **開いている候補は作り直さない。** ここで`open_selected_session`まで走らせると、
+                // 選択と手で変えたaccessが黙って消える（かつての`r`はそれを明示的に警告していた）。
+                // 一覧だけ更新し、中身は`view`が無いときだけ開く。
+                self.reload_sessions();
                 if self.view.is_none() {
                     self.open_selected_session();
                 }

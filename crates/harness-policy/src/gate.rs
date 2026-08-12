@@ -100,7 +100,7 @@ pub fn check_all<'a>(
 mod tests {
     use super::*;
 
-    use crate::generalize::{generalize, Generalization};
+    use crate::generalize::generalize;
     use crate::normalize::{DeniedCandidate, Source};
     use harness_config::FsAccess;
 
@@ -114,7 +114,6 @@ mod tests {
                 1,
                 0,
             )],
-            Generalization::None,
         )
         .remove(0)
     }
@@ -128,7 +127,6 @@ mod tests {
                 1,
                 0,
             )],
-            Generalization::None,
         )
         .remove(0)
     }

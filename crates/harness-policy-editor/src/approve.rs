@@ -266,13 +266,11 @@ pub fn grant_root(value: &str, workspace_root: &Path) -> Option<std::path::PathB
         return None;
     }
     let normalized = harness_policy::normalize::normalize_path(value);
-    let mut kept: Vec<&str> = Vec::new();
-    for segment in normalized.split('/') {
-        if segment.contains('*') {
-            break;
-        }
-        kept.push(segment);
-    }
+    // [D-63] 切る位置は`normalize::literal_prefix`が1つだけ持つ。**幅の判定（`breadth`）と
+    // 同じ関数を通す**——別々に切ると、承認してよいと判定した値と、実際にACEを付ける値が
+    // 食い違う（B-05）。
+    let literal = harness_policy::normalize::literal_prefix(&normalized);
+    let kept: Vec<&str> = literal.split('/').collect();
     // ドライブ文字だけ（`C:` / `C:/`）しか残らないなら、それは事実上ドライブ全体への付与に
     // なる。`breadth::check`が承認時に止めているはずだが、**変換側でも受け取らない**
     // （空要素も数えないこと——`C:/`は`["C:", ""]`に割れるので、要素数だけ見ると通ってしまう）。

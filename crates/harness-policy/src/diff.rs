@@ -145,7 +145,7 @@ fn existing_values(existing: &Value, key: SettingsKey) -> Vec<String> {
 mod tests {
     use super::*;
 
-    use crate::generalize::{generalize, Generalization};
+    use crate::generalize::generalize;
     use crate::normalize::{DeniedCandidate, Source};
     use harness_config::FsAccess;
 
@@ -155,7 +155,6 @@ mod tests {
                 DeniedCandidate::fs(Source::Etw, "C:/tools/bin", FsAccess::ReadExec, "d", 1, 0),
                 DeniedCandidate::net(Source::Network, "api.example.com", "d", 1, 0),
             ],
-            Generalization::None,
         )
     }
 
