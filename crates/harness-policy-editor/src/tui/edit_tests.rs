@@ -1571,3 +1571,37 @@ fn retyping_the_domain_name_drops_the_removal_reservations() {
         "別ドメインを指した状態で古い予約を残さない"
     );
 }
+
+/// **`R`だけを付けた状態も「選択」に数える**（表示とガードのずれ）。
+///
+/// 実運用で「x（チェック）マークが入っていないけど大丈夫？」と迷わせた——承認は通るのに
+/// 見出しが「選択 0件」と出ていたためである。`request_approval`のガードは最初から
+/// `recursive`を見ており、**表示だけが取り残されていた**（B-06: 選ぶ手段を増やしたら、
+/// 選択の有無を見る場所を全部数える）。
+#[test]
+fn a_recursive_mark_counts_as_a_selection_even_without_a_checkbox() {
+    let ws = workspace();
+    seed_pass1(
+        &ws,
+        "s1",
+        "cargo build",
+        &[
+            r"C:\proj\tc\1.89.0\bin\rustc.exe",
+            r"C:\proj\tc\1.90.0\bin\rustc.exe",
+        ],
+    );
+    let mut app = open_edit(&ws);
+    app.open_selected_session();
+    app.edit_focus = EditField::Proposals;
+    assert_eq!(app.selected_count(), 0, "まだ何も選んでいない");
+
+    app.on_key(key(KeyCode::Char('R')));
+
+    assert!(app.accepted.is_empty(), "チェックは付かない（別の状態）");
+    assert_eq!(
+        app.selected_count(),
+        1,
+        "再帰指定は「選んだもの」である——承認はこれで通るのだから、表示も1件と言わなければ\
+         ユーザーは承認できないと誤解する"
+    );
+}

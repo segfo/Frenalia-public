@@ -127,7 +127,9 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
             visible.len(),
             view.proposals.len(),
             view.blocked_count(),
-            app.accepted.len()
+            // **`R`の再帰指定もここに数える**（`App::selected_count`）。チェックだけを数えると、
+            // 再帰だけを指定したユーザーに「選択 0件」と見えて承認できないと誤解させる。
+            app.selected_count()
         ),
         None => " 許可ルールの候補 ".to_string(),
     };

@@ -748,6 +748,18 @@ impl App {
         (proposals, accept_ids)
     }
 
+    /// いま「選んでいる」ものの件数。**選ぶ手段はチェック（`Space`/`d`）と再帰指定（`R`）の
+    /// 2つある**ので、両方を数える。
+    ///
+    /// 数え漏らすと、`R`だけを付けたユーザーに「選択 0件」と見えて**承認できないと誤解させる**
+    /// （実際には承認される。実運用でこの取り違えが起きた）。`request_approval`のガードは
+    /// 最初から両方を見ているので、**表示だけが取り残されていた**——選ぶ手段を増やしたら、
+    /// 選択の有無を見る場所を全部数える（B-06）。`accepted`は候補id、`recursive`はノードのパスを
+    /// 持つ別々の集合なので、二重に数えることはない。
+    pub(crate) fn selected_count(&self) -> usize {
+        self.accepted.len() + self.recursive.len()
+    }
+
     /// 承認の差分を作ってモーダルで見せる。**ここでは何も書かない。**
     fn request_approval(&mut self) {
         if self.view.is_none() {
