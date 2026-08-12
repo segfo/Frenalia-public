@@ -211,10 +211,47 @@ impl<T: Serialize + DeserializeOwned + Default> Ledger<T> {
     ///
     /// `load`してから`save`するまでの間に他プロセスが書き込むと更新が失われるため、
     /// エントリの追加・削除は必ずこれを通すこと。
+    ///
+    /// # 中身が変わらなければ書かない（[BUG-108](../../../docs/bugs/BUG-108.md)）
+    ///
+    /// `f`が台帳を1バイトも変えなかったときは**ファイルへ触らない**。書けば
+    /// [`write_ledger_file`]が既存内容を`.json.bak`へコピーするので、**無変更の書込は
+    /// 唯一の復旧コピーを「直前の同じ内容」で置き換えて消費する**——`.bak`の復旧価値が
+    /// 静かにゼロになる。実際に`appcontainer-session-ledger.json`と`.bak`が同一ハッシュに
+    /// なっている状態を実機で観測した。
+    ///
+    /// この経路を通る呼び出しは多くが無変更である。`begin_session`は「エントリが既にあれば
+    /// 何もしない」冪等な処理だが`update`は通るし、`record_granted_paths`も記録済みのパスなら
+    /// 何も足さない。1回あたり全文の読取＋`.bak`への全文コピー＋全文書込を払っていた
+    /// （[BUG-092](../../../docs/bugs/BUG-092.md)で測った台帳は66KB・185KB）。
+    ///
+    /// **スキップしてもread-only属性は付け直す。** 誤削除防止の2層（モジュールdoc）のうち
+    /// (2)は書込の副産物なので、書かない経路を作ると黙って落ちる（B-02: 片側に入れた
+    /// 最適化は、それが担っていた副作用ごと消していないかを見る）。
+    ///
+    /// パースできないファイルは`load`が`T::default()`へ倒れるため、`f`が何も変えなければ
+    /// **壊れたファイルはそのまま残る**（既定値で上書きして`.bak`まで潰すより、復旧できる
+    /// 側へ倒す）。同じ理由で、**ファイルがまだ無いときに空の台帳を作ることもしない**
+    /// ——記録すべきものが1件も無いのだから、作る意味が無い。
+    ///
+    /// **[`Ledger::save`]は無条件に書く。** あちらは呼び出し側が値を持って「書く」と決めた
+    /// 経路で、比較のための読取が要る。実運用でこれを直接呼ぶのは`harness-cognition`の
+    /// recall watermarkだけである（`save_traverse_ledger`・`save_workspace_ledger`は
+    /// 呼び出し元が無い）。
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         self.with_lock(|| {
             let mut ledger = self.load_unlocked();
+            let before = serde_json::to_string_pretty(&ledger).ok();
             let result = f(&mut ledger);
+            let after = serde_json::to_string_pretty(&ledger).ok();
+            // 直列化に失敗した場合（`before`か`after`が`None`）は比較できないので、
+            // 従来どおり書きに行く——「比べられなかった」を「同じだった」へ畳まない（B-10）。
+            if before.is_some() && before == after {
+                if let Some(path) = &self.path {
+                    set_file_readonly(path, true);
+                }
+                return result;
+            }
             self.save_unlocked(&ledger);
             result
         })
@@ -424,6 +461,91 @@ mod tests {
         });
         assert_eq!(returned, 2);
         assert_eq!(ledger.load().entries, vec!["first", "second"]);
+    }
+
+    /// **[BUG-108] 何も変わらなかった`update`は、復旧用`.bak`を消費しない。**
+    ///
+    /// 書けば[`write_ledger_file`]が既存内容を`.bak`へコピーするので、無変更の書込は
+    /// 「直前の同じ内容」で唯一の復旧コピーを置き換える＝`.bak`の復旧価値が静かに消える。
+    /// 実機の`appcontainer-session-ledger.json`は、まさに本体と`.bak`が同一ハッシュだった。
+    #[test]
+    fn an_update_that_changes_nothing_leaves_the_file_and_its_backup_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = ledger_at(tmp.path());
+        let path = tmp.path().join("ledger.json");
+        let backup = tmp.path().join("ledger.json.bak");
+
+        ledger.update(|l| l.entries.push("first".to_string()));
+        ledger.update(|l| l.entries.push("second".to_string()));
+        let before = std::fs::read_to_string(&path).unwrap();
+        let backup_before = std::fs::read_to_string(&backup).unwrap();
+
+        // 冪等な更新（既にあるものは足さない）は、この台帳の日常的な呼ばれ方である
+        // （`begin_session`・`record_granted_paths`はどちらもこの形）。
+        ledger.update(|l| {
+            if !l.entries.iter().any(|e| e == "second") {
+                l.entries.push("second".to_string());
+            }
+        });
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            backup_before,
+            "無変更の書込で`.bak`が「直前の同じ内容」に置き換わってはいけない（BUG-108）"
+        );
+        assert_ne!(
+            backup_before, before,
+            "この時点で`.bak`は1つ前の状態を保持しているはず（テスト自身の前提）"
+        );
+    }
+
+    /// **対になる許可側**（B-35）。中身が変われば従来どおり書き、`.bak`も更新する。
+    /// これが無いと「常に書かない」実装でも上のテストが通り、台帳が機能しなくなったことに
+    /// 気付けない。
+    #[test]
+    fn an_update_that_changes_something_still_writes_and_backs_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = ledger_at(tmp.path());
+
+        ledger.update(|l| l.entries.push("first".to_string()));
+        assert_eq!(ledger.load().entries, vec!["first"]);
+        ledger.update(|l| l.entries.push("second".to_string()));
+
+        assert_eq!(ledger.load().entries, vec!["first", "second"]);
+        assert!(
+            std::fs::read_to_string(tmp.path().join("ledger.json.bak"))
+                .unwrap()
+                .contains("first"),
+            "変更を書いたときは、直前の内容が`.bak`へ退避されていなければならない"
+        );
+        // 誤削除防止の2層のうち(2)。スキップ経路を足したときに落ちやすいので対で固定する。
+        #[cfg(windows)]
+        assert!(std::fs::metadata(tmp.path().join("ledger.json"))
+            .unwrap()
+            .permissions()
+            .readonly());
+    }
+
+    /// **スキップしてもread-only属性は付け直す**（誤削除防止の2層のうち(2)）。
+    /// 書込の副産物だった属性復元が、書かない経路を作ったことで黙って落ちないように固定する。
+    #[cfg(windows)]
+    #[test]
+    fn a_skipped_update_still_restores_the_readonly_attribute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = ledger_at(tmp.path());
+        let path = tmp.path().join("ledger.json");
+
+        ledger.update(|l| l.entries.push("x".to_string()));
+        set_file_readonly(&path, false);
+        assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
+
+        ledger.update(|_l| {});
+
+        assert!(
+            std::fs::metadata(&path).unwrap().permissions().readonly(),
+            "書かない経路でも、`-Force`無しの削除を防ぐ読取専用属性は戻す"
+        );
     }
 
     #[test]

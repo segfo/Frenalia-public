@@ -522,10 +522,65 @@ pub fn record_mcp_granted_path(profile_name: &str, path: &Path) {
 /// （`win_appcontainer::RevokeReport`）ではなく素のデータで受け取る。
 pub type RevokeLeftovers = Vec<(PathBuf, String)>;
 
+/// [`reclaim_targets_in`]が触る**実世界**の一式（[BUG-108](../../../docs/bugs/BUG-108.md)）。
+///
+/// かつて注入されていたのは`revoke`だけで、プロファイルの削除・台帳・自己検証は関数の中から
+/// 直接呼んでいた。そのため**純粋な単体テストが実マシンの台帳（と、その唯一の復旧コピーである
+/// `.bak`）を書き換えていた**——テストが渡すのは実在しないプロファイル名だが、
+/// `DeleteAppContainerProfile`は存在しない名前にもS_OKを返すので削除が成功扱いになり、
+/// 後続の`retain`が実台帳まで届いていた。**「テストが渡す名前は実在しない」は隔離の根拠に
+/// ならない。隔離するのは名前ではなく依存の向き先である。**
+///
+/// **副作用はここに全部並べる。** [`reclaim_targets_in`]の中から実マシンを直接触らないこと
+/// ——1つだけ注入可能にすると、残りが直呼びであることが構造から見えなくなる（それが
+/// 今回の欠陥そのものだった）。副作用を増やすときはこの構造体へ足す（B-06）。
+struct ReclaimIo<'a> {
+    /// そのパスから`profile_name`宛のACEを剥がす。戻り値は**剥がせなかったノードと理由**
+    /// （空なら完全に剥がせた）。
+    revoke: &'a dyn Fn(&Path, &str) -> RevokeLeftovers,
+    /// **台帳に記録が無いのに実在するACE**の件数（`grant_audit`の自己検証）。
+    /// 0でなければ名前を捨てない（BUG-101）。人への報告もこの中で行う。
+    unrecorded_aces: &'a dyn Fn(&str, &[String]) -> usize,
+    /// AppContainerプロファイルを削除する。**「呼んだ」と「消えた」は別の事実**なので、
+    /// 実装側（[`win::delete_profile`]）が削除後の実在を検算してから`Ok`を返す。
+    delete_profile: &'a dyn Fn(&str) -> Result<(), String>,
+    /// 回収できたセッションのエントリを落とす先の台帳。
+    ledger: &'a Ledger<SessionLedger>,
+}
+
+/// 製品経路の自己検証（`grant_audit`）。**台帳に無いACEの件数**を返し、報告もここで行う。
+fn report_unrecorded_aces(profile_name: &str, granted_paths: &[String]) -> usize {
+    let Some(audit) = crate::tier2a::grant_audit::audit_profile(
+        crate::tier2a::grant_audit::Stage::SessionEnd,
+        profile_name,
+        granted_paths,
+    ) else {
+        return 0;
+    };
+    crate::tier2a::grant_audit::report(&audit);
+    audit.present_unrecorded.len()
+}
+
+/// 製品経路の[`ReclaimIo`]（実Win32・実台帳）で回収する。
+///
+/// **既存のシグネチャのまま残してある**——呼び出し元（`gc_dead_sessions_reporting`・
+/// `end_session`とその下流13箇所）を1行も変えずに副作用の注入を入れるため。
 fn reclaim_targets(
     targets: &[ReclaimTarget],
     revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers,
 ) -> ReclaimOutcome {
+    reclaim_targets_in(
+        &ReclaimIo {
+            revoke,
+            unrecorded_aces: &report_unrecorded_aces,
+            delete_profile: &win::delete_profile,
+            ledger: &ledger(),
+        },
+        targets,
+    )
+}
+
+fn reclaim_targets_in(io: &ReclaimIo<'_>, targets: &[ReclaimTarget]) -> ReclaimOutcome {
     let mut outcome = ReclaimOutcome::default();
     let mut deleted: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for target in targets {
@@ -536,22 +591,14 @@ fn reclaim_targets(
         }
         let mut blocked_here = Vec::new();
         for path in &target.granted_paths {
-            blocked_here.extend(revoke(Path::new(path), &target.profile_name));
+            blocked_here.extend((io.revoke)(Path::new(path), &target.profile_name));
             outcome.revoked_paths += 1;
         }
         // [BUG-101] **名前を捨てる直前に、この主体のACEが本当に残っていないかを測る。**
         // ここが最後の分岐点である——`DeleteAppContainerProfile`はSIDの導出元である名前を
         // 破棄するので、これ以降に残ったACEは`harness fs revoke`を含むどのコマンドでも
         // 剥がせない（SIDの導出は名前→SIDの一方向）。
-        let audit = crate::tier2a::grant_audit::audit_profile(
-            crate::tier2a::grant_audit::Stage::SessionEnd,
-            &target.profile_name,
-            &target.granted_paths,
-        );
-        if let Some(audit) = &audit {
-            crate::tier2a::grant_audit::report(audit);
-        }
-        let unrecorded = audit.map(|a| a.present_unrecorded.len()).unwrap_or(0);
+        let unrecorded = (io.unrecorded_aces)(&target.profile_name, &target.granted_paths);
         // **剥がし残しがあるなら名前を残す。** 見送りの扱いは`grants_known: false`と同じ
         // （後から`harness fs revoke <path>`で剥がせる状態のまま置く）。プロファイルが1件
         // 積むことより、二度と剥がせないACEを作ることの方が重い（B-01の「不可逆な片方」）。
@@ -565,7 +612,7 @@ fn reclaim_targets(
             continue;
         }
         outcome.blocked_paths.extend(blocked_here);
-        match win::delete_profile(&target.profile_name) {
+        match (io.delete_profile)(&target.profile_name) {
             Ok(()) => {
                 outcome.deleted_profiles += 1;
                 deleted.insert(target.profile_name.as_str());
@@ -577,7 +624,7 @@ fn reclaim_targets(
         }
     }
     if !deleted.is_empty() {
-        ledger().update(|l| {
+        io.ledger.update(|l| {
             l.sessions
                 .retain(|e| !deleted.contains(e.profile_name.as_str()))
         });
@@ -852,6 +899,94 @@ mod tests {
         move |token: &str| live.contains(token)
     }
 
+    /// **実マシンを一切触らない[`ReclaimIo`]**（[BUG-108](../../../docs/bugs/BUG-108.md)）。
+    ///
+    /// 台帳は`Ledger::at_path`の一時ファイルを指し、プロファイル削除と自己検証は
+    /// 「呼ばれたこと」を記録して既定値を返すだけになる。**これが無いと、この単体テストは
+    /// 実マシンの`%APPDATA%\harness\config\appcontainer-session-ledger.json`と、その唯一の
+    /// 復旧コピーである`.bak`を書き換える。**
+    ///
+    /// 撤収と削除は**1本の列（`events`）へ同じ順序で積む**——「ACEを剥がしてから最後に
+    /// プロファイルを削除する」はこのモジュールの不変条件なので、2つを別々に記録すると
+    /// 順序そのものを測れない（実際、以前の回帰テストは撤収しか記録しておらず、削除を
+    /// 先頭へ移動しても緑のままだった）。
+    struct FakeIo {
+        ledger: Ledger<SessionLedger>,
+        events: std::sync::Mutex<Vec<String>>,
+        /// `delete_profile`の戻り値。`Err`にすると「削除できなかった」経路を測れる。
+        delete_result: Result<(), String>,
+        /// `unrecorded_aces`の戻り値。0以外＝台帳に無いACEが実在する（BUG-101の保護）。
+        unrecorded: usize,
+        /// 一時ディレクトリ。`ledger`が指す先なので、テストが終わるまで生かす。
+        _dir: tempfile::TempDir,
+    }
+
+    impl FakeIo {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            Self {
+                ledger: Ledger::at_path(dir.path().join(LEDGER_FILE), None),
+                events: std::sync::Mutex::new(Vec::new()),
+                delete_result: Ok(()),
+                unrecorded: 0,
+                _dir: dir,
+            }
+        }
+
+        /// 一時台帳へエントリを積んでおく（回収が何を落とすかを測るため）。
+        fn with_sessions(self, tokens: &[&str]) -> Self {
+            self.ledger.save(&SessionLedger {
+                sessions: tokens.iter().map(|t| entry(t, &[])).collect(),
+            });
+            self
+        }
+
+        /// 実マシンを触らない[`ReclaimIo`]を組んで回収する。**副作用の注入点はここ1箇所**。
+        fn reclaim(&self, targets: &[ReclaimTarget]) -> ReclaimOutcome {
+            let note = |event: String| self.events.lock().unwrap().push(event);
+            let revoke = |path: &Path, profile: &str| {
+                note(format!("revoke:{}:{profile}", path.display()));
+                RevokeLeftovers::new()
+            };
+            let delete = |profile: &str| {
+                note(format!("delete:{profile}"));
+                self.delete_result.clone()
+            };
+            let unrecorded_aces = |_profile: &str, _recorded: &[String]| self.unrecorded;
+            reclaim_targets_in(
+                &ReclaimIo {
+                    revoke: &revoke,
+                    unrecorded_aces: &unrecorded_aces,
+                    delete_profile: &delete,
+                    ledger: &self.ledger,
+                },
+                targets,
+            )
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+
+        /// 一時台帳に残っているセッションのトークン。
+        fn remaining_tokens(&self) -> Vec<String> {
+            self.ledger
+                .load()
+                .sessions
+                .into_iter()
+                .map(|e| e.token)
+                .collect()
+        }
+    }
+
+    fn known_target(token: &str, paths: &[&str]) -> ReclaimTarget {
+        ReclaimTarget {
+            profile_name: profile_name_for(token),
+            granted_paths: paths.iter().map(|p| p.to_string()).collect(),
+            grants_known: true,
+        }
+    }
+
     #[test]
     fn profile_names_carry_the_prefix_so_gc_can_find_them_without_the_ledger() {
         let name = profile_name_for("1234-99");
@@ -925,11 +1060,8 @@ mod tests {
             granted_paths: Vec::new(),
             grants_known: false,
         }];
-        let revoked = std::sync::Mutex::new(Vec::new());
-        let outcome = reclaim_targets(&targets, &|path, _profile| {
-            revoked.lock().unwrap().push(path.display().to_string());
-            Vec::new()
-        });
+        let io = FakeIo::new();
+        let outcome = io.reclaim(&targets);
 
         assert_eq!(
             outcome.deleted_profiles, 0,
@@ -941,8 +1073,9 @@ mod tests {
             "見送ったことは件数として見えなければならない（B-09/B-11）"
         );
         assert!(
-            revoked.lock().unwrap().is_empty(),
-            "剥がす対象が分からないのだから、撤収も呼ばれないのが正しい"
+            io.events().is_empty(),
+            "剥がす対象が分からないのだから、撤収も削除も呼ばれないのが正しい: {:?}",
+            io.events()
         );
     }
 
@@ -950,33 +1083,92 @@ mod tests {
     /// これが無いと「全部見送る」実装でも上のテストが通ってしまい、GCの生死を判定できません。
     #[test]
     fn a_profile_whose_grants_are_known_is_still_revoked_and_deleted() {
-        let targets = vec![ReclaimTarget {
-            profile_name: profile_name_for("known"),
-            granted_paths: vec!["C:\\a".to_string(), "C:\\b".to_string()],
-            grants_known: true,
-        }];
-        let revoked = std::sync::Mutex::new(Vec::new());
-        let outcome = reclaim_targets(&targets, &|path, _profile| {
-            revoked.lock().unwrap().push(path.display().to_string());
-            Vec::new()
-        });
+        let targets = vec![known_target("known", &["C:\\a", "C:\\b"])];
+        let io = FakeIo::new().with_sessions(&["known"]);
+        let outcome = io.reclaim(&targets);
 
         assert_eq!(outcome.revoked_paths, 2);
         assert_eq!(
-            revoked.lock().unwrap().clone(),
-            vec!["C:\\a".to_string(), "C:\\b".to_string()]
+            io.events(),
+            vec![
+                format!("revoke:C:\\a:{}", profile_name_for("known")),
+                format!("revoke:C:\\b:{}", profile_name_for("known")),
+                format!("delete:{}", profile_name_for("known")),
+            ]
         );
         assert!(
             outcome.kept_unknown.is_empty(),
             "分かっているものまで見送ってはいけない: {outcome:?}"
         );
-        // `delete_profile`は非Windowsでは`Ok`のno-opなので、削除件数はどちらの環境でも1になる
-        // （Windowsでは実在しないプロファイル名の削除が失敗し得るため、そこは件数で断定しない）。
+        // [BUG-108] 削除が注入されたので、実Win32の気まぐれ（実在しない名前にもS_OKを返す）に
+        // 左右されずに件数を断定できる。以前は`deleted + failures == 1`としか書けなかった。
+        assert_eq!(outcome.deleted_profiles, 1);
+        assert!(outcome.delete_failures.is_empty(), "{outcome:?}");
+    }
+
+    /// **[BUG-108] 消えた台帳エントリは、削除できたプロファイルのぶんだけ。**
+    ///
+    /// 台帳の`retain`は`reclaim_targets`の中でしか走らないので、注入前はこの振る舞いを
+    /// 測る手段が無かった（測ろうとすると実マシンの台帳を書き換えることになる）。
+    #[test]
+    fn only_the_deleted_profile_loses_its_ledger_entry() {
+        let io = FakeIo::new().with_sessions(&["dead", "alive"]);
+        let outcome = io.reclaim(&[known_target("dead", &["C:\\ws"])]);
+
+        assert_eq!(outcome.deleted_profiles, 1);
         assert_eq!(
-            outcome.deleted_profiles + outcome.delete_failures.len(),
-            1,
-            "削除を試みたことは必ず結果として残る（成功か、理由付きの失敗か）"
+            io.remaining_tokens(),
+            vec!["alive".to_string()],
+            "回収していないセッションのエントリを巻き込んで消してはいけない"
         );
+    }
+
+    /// **対になる禁止側**（B-35）。削除に失敗したら台帳エントリは**残す**。
+    ///
+    /// 消してしまうと、そのプロファイルは次のGCから「台帳に無いが実在する」＝
+    /// `grants_known: false`へ落ち、以後どのコマンドでもACEを剥がせなくなる（BUG-101）。
+    #[test]
+    fn a_profile_that_could_not_be_deleted_keeps_its_ledger_entry() {
+        let mut io = FakeIo::new().with_sessions(&["dead"]);
+        io.delete_result = Err(
+            "DeleteAppContainerProfile reported success but it is still \
+                                registered"
+                .to_string(),
+        );
+        let outcome = io.reclaim(&[known_target("dead", &["C:\\ws"])]);
+
+        assert_eq!(outcome.deleted_profiles, 0);
+        assert_eq!(outcome.delete_failures.len(), 1, "{outcome:?}");
+        assert_eq!(
+            io.remaining_tokens(),
+            vec!["dead".to_string()],
+            "削除できなかったのにエントリを消すと、次のGCが付与内容不明として永久に見送る"
+        );
+    }
+
+    /// **台帳に無いACEが残っているプロファイルは削除しない**（BUG-101の中心的な保護）。
+    ///
+    /// この分岐は実マシンに実ACEが在るときしか踏めず、[BUG-108](../../../docs/bugs/BUG-108.md)で
+    /// 自己検証を注入するまでテストが1本も無かった。名前を捨てるとSIDを導出できなくなるので、
+    /// **撤収が終わっていない主体の名前は残す**のが正しい。
+    #[test]
+    fn a_profile_with_unrecorded_aces_is_kept_and_keeps_its_ledger_entry() {
+        let mut io = FakeIo::new().with_sessions(&["dead"]);
+        io.unrecorded = 1;
+        let outcome = io.reclaim(&[known_target("dead", &["C:\\ws"])]);
+
+        assert_eq!(outcome.deleted_profiles, 0);
+        assert_eq!(
+            outcome.kept_with_leftovers,
+            vec![(profile_name_for("dead"), 0, 1)],
+            "剥がし残しの内訳（剥がせなかったノード数・台帳に無いACE数）を出す（B-09）"
+        );
+        assert!(
+            !io.events().iter().any(|e| e.starts_with("delete:")),
+            "削除は呼ばれてはいけない: {:?}",
+            io.events()
+        );
+        assert_eq!(io.remaining_tokens(), vec!["dead".to_string()]);
     }
 
     /// 台帳にあるものを実在プロファイル側で二重に数えない。
@@ -994,28 +1186,22 @@ mod tests {
     /// **撤収順序の不変条件**: ACEを剥がしてから最後にプロファイルを削除する。逆順だと、
     /// 途中で落ちたときに「名前が消えてSIDを導出できないのにACEだけ残る」＝台帳が
     /// 失われた場合に回収不能な残骸になる。
+    ///
+    /// [BUG-108] **以前このテストは順序を測っていなかった。** 記録していたのが撤収だけで、
+    /// 削除は`win::delete_profile`の直呼び（非Windowsではno-op）だったため、削除を撤収より
+    /// 先へ移動しても緑のままだった——つまり不変条件そのものには歯が無かった。削除も
+    /// 注入して**同じ列**へ積むことで、初めて順序を固定できる。
     #[test]
     fn revocation_happens_before_the_profile_is_deleted() {
-        let order = std::sync::Mutex::new(Vec::new());
-        let targets = vec![ReclaimTarget {
-            profile_name: profile_name_for("t"),
-            granted_paths: vec!["C:\\a".to_string(), "C:\\b".to_string()],
-            grants_known: true,
-        }];
-        // `win::delete_profile`は非Windowsではno-opなので、ここでは撤収側の順序だけを固定する。
-        reclaim_targets(&targets, &|path, profile| {
-            order
-                .lock()
-                .unwrap()
-                .push(format!("revoke:{}:{profile}", path.display()));
-            Vec::new()
-        });
-        let recorded = order.lock().unwrap().clone();
+        let io = FakeIo::new().with_sessions(&["t"]);
+        io.reclaim(&[known_target("t", &["C:\\a", "C:\\b"])]);
+
         assert_eq!(
-            recorded,
+            io.events(),
             vec![
                 format!("revoke:C:\\a:{}", profile_name_for("t")),
                 format!("revoke:C:\\b:{}", profile_name_for("t")),
+                format!("delete:{}", profile_name_for("t")),
             ]
         );
     }
