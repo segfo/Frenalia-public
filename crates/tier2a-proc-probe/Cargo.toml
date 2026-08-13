@@ -25,4 +25,16 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Registry",
+    # --- MAC/Spawn Daemon設計の実現性スパイク用（plans/mac-spike/RESULTS.md）。
+    # ブローカー生成（WMI・タスクスケジューラ）とオブジェクト到達性の実測に要る。
+    "Win32_System_Com",
+    "Win32_System_Wmi",
+    "Win32_System_Variant",
+    "Win32_System_TaskScheduler",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Rpc",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
 ] }

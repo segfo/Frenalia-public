@@ -29,6 +29,15 @@ mod try_runas;
 #[cfg(windows)]
 mod winid;
 
+// --- MAC/Spawn Daemon設計の実現性スパイク専用モード（`plans/mac-spike/RESULTS.md`）。
+// いずれも通常の検査（FS・脱走・ネット・再帰spawn）を行わない短絡モードで、
+// `try_runas`・`load_library`と同じ位置付け。判定が出たら削除する
+// （`docs/CODE-STRUCTURE-RULES.md`規則2「一回性の調査実験をテストとして残さない」）。
+mod object_reach;
+mod pipe_client;
+mod spawn_matrix;
+mod spike_handles;
+
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_NET_TARGET: &str = "1.1.1.1:443";
 const DEFAULT_DNS_NAME: &str = "example.com";
@@ -59,6 +68,25 @@ struct Args {
     /// DLLを`LoadLibraryW`でロードした結果と`GetLastError`だけをJSONで報告する
     /// （`load_library`モジュールdoc参照）。
     load_library: Option<String>,
+    /// MAC設計§20項目1: プロセス生成の全経路を試し、どれが拒否されるかを報告する
+    /// （`spawn_matrix`モジュールdoc参照）。値はマーカーファイルを書くディレクトリ。
+    spawn_matrix: Option<String>,
+    /// MAC設計§20項目10: 別ドメイン/別プロファイルのオブジェクトへ到達できるかを型ごとに
+    /// 試す（`object_reach`モジュールdoc参照）。1つでも指定されたらこのモードになる。
+    reach: object_reach::ReachSpec,
+    reach_mode: bool,
+    /// MAC設計§22.6.2: 呼び出し元役。ファイルを開いてハンドル値を申告し、生きたまま待つ。
+    hold_file: Option<String>,
+    /// MAC設計§22.6.2: 遷移先の子役。自分のstdoutへ書くだけ。
+    emit: Option<String>,
+    /// MAC設計§20項目3: 渡された（継承した）プロセスハンドル値で待機と終了コード取得を試す。
+    use_process_handle: Option<usize>,
+    /// MAC設計§10.1: 要求受付パイプへクライアントとして接続し1往復する。
+    pipe_client: Option<String>,
+    /// 上記スパイクモードが結果を書き出すファイル（stdoutを読み切れない経路のため）。
+    report_file: Option<String>,
+    /// スパイクモードが「生きたまま待つ」秒数（`hold_file`と単独指定時のアイドル）。
+    idle_secs: Option<u64>,
 }
 
 fn parse_args() -> Args {
@@ -74,6 +102,15 @@ fn parse_args() -> Args {
     let mut try_runas = None;
     let mut spawn_via = None;
     let mut load_library = None;
+    let mut spawn_matrix = None;
+    let mut reach = object_reach::ReachSpec::default();
+    let mut reach_mode = false;
+    let mut hold_file = None;
+    let mut emit = None;
+    let mut use_process_handle = None;
+    let mut pipe_client = None;
+    let mut report_file = None;
+    let mut idle_secs = None;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -101,6 +138,36 @@ fn parse_args() -> Args {
             }
             "--spawn-via-winexec" => spawn_via = Some(("winexec".to_string(), next())),
             "--load-library" => load_library = Some(next()),
+            // --- MACスパイク用（`plans/mac-spike/RESULTS.md`） ---
+            "--spawn-matrix" => spawn_matrix = Some(next()),
+            "--reach-process" => {
+                reach.process = next().parse().ok();
+                reach_mode = true;
+            }
+            "--reach-thread" => {
+                if let Ok(tid) = next().parse() {
+                    reach.threads.push(tid);
+                }
+                reach_mode = true;
+            }
+            "--reach-pipe" => {
+                reach.pipes.push(next());
+                reach_mode = true;
+            }
+            "--reach-create-pipe-instance" => {
+                reach.create_pipe_instances.push(next());
+                reach_mode = true;
+            }
+            "--reach-object" => {
+                reach.objects.push(next());
+                reach_mode = true;
+            }
+            "--hold-file" => hold_file = Some(next()),
+            "--emit" => emit = Some(next()),
+            "--use-process-handle" => use_process_handle = next().parse().ok(),
+            "--pipe-client" => pipe_client = Some(next()),
+            "--report-file" => report_file = Some(next()),
+            "--idle-secs" => idle_secs = next().parse().ok(),
             _ => {}
         }
     }
@@ -118,6 +185,15 @@ fn parse_args() -> Args {
         try_runas,
         spawn_via,
         load_library,
+        spawn_matrix,
+        reach,
+        reach_mode,
+        hold_file,
+        emit,
+        use_process_handle,
+        pipe_client,
+        report_file,
+        idle_secs,
     }
 }
 
@@ -352,6 +428,46 @@ fn spawn_child(args: &Args, tag_prefix_gen: u32) -> Value {
     }
 }
 
+/// アイドルモードで**後から**1本スレッドを作り、そのOSスレッドIDを返す（MACスパイクS2b）。
+/// 起動後に生えるスレッドは`lpThreadAttributes`の対象外なので、既定のDACLを持つ。
+#[cfg(windows)]
+fn spawn_idle_thread(secs: u64) -> u32 {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        let _ = tx.send(id);
+        std::thread::sleep(Duration::from_secs(secs));
+    });
+    rx.recv_timeout(Duration::from_secs(5)).unwrap_or(0)
+}
+
+#[cfg(not(windows))]
+fn spawn_idle_thread(_secs: u64) -> u32 {
+    0
+}
+
+/// アイドルモードで**起動後に**名前付きmutexを1つ作り、その名前を返す（MACスパイクS2c）。
+/// スレッドと同じく、後から作るカーネルオブジェクトのDACLはトークンの既定DACLから来る
+/// ——「既定DACLを差し替えれば後から生えるものにも効く」かを、この的で測る。
+/// ハンドルは意図的に閉じない（プロセスが生きている間、名前を有効に保つため）。
+#[cfg(windows)]
+fn create_idle_mutex() -> String {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Threading::CreateMutexW;
+    let name = format!("harness-mac-spike-idle-{}", std::process::id());
+    let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    match unsafe { CreateMutexW(None, false, PCWSTR(name_w.as_ptr())) } {
+        Ok(_handle) => name,
+        Err(_) => String::new(),
+    }
+}
+
+#[cfg(not(windows))]
+fn create_idle_mutex() -> String {
+    String::new()
+}
+
 fn spawn_watchdog(timeout_secs: u64) {
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(timeout_secs));
@@ -388,6 +504,92 @@ fn main() -> ExitCode {
             "{}",
             serde_json::to_string(&report).expect("spawn_via report must serialize")
         );
+        return ExitCode::SUCCESS;
+    }
+
+    // --- MACスパイク用の短絡モード（`plans/mac-spike/RESULTS.md`） ---
+    if let Some(marker_dir) = &args.spawn_matrix {
+        let report = spawn_matrix::run(marker_dir);
+        if let Some(path) = &args.report_file {
+            let _ = fs::write(path, report.to_string());
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("spawn_matrix report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if args.reach_mode {
+        let report = object_reach::run(&args.reach);
+        if let Some(path) = &args.report_file {
+            let _ = fs::write(path, report.to_string());
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("object_reach report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(path) = &args.hold_file {
+        let _ = spike_handles::hold_file(
+            path,
+            args.report_file.as_deref(),
+            args.idle_secs.unwrap_or(10),
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(text) = &args.emit {
+        let report = spike_handles::emit(text);
+        // stdoutは「Daemon役が絞って渡したハンドル」なので、レポートはstdoutへ**出さない**
+        // （出すと測定対象のファイルに混ざる、B-33）。
+        if let Some(path) = &args.report_file {
+            let _ = fs::write(path, report.to_string());
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    #[cfg(windows)]
+    if let Some(raw) = args.use_process_handle {
+        let report = spike_handles::use_process_handle(raw, args.report_file.as_deref());
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("use_process_handle report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(pipe) = &args.pipe_client {
+        let report = pipe_client::run(pipe, args.report_file.as_deref());
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("pipe_client report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    // 単独の`--idle-secs`は「生きているだけ」の子（§10.1.1のJob試験用）。
+    //
+    // **起動後に自分で作ったスレッドのIDも報告する**（MACスパイクS2b）。
+    // `CreateProcessW`の`lpThreadAttributes`が効くのは**最初のスレッドだけ**なので、
+    // 「プロセスとスレッドのDACLを絞れば相互アクセスを塞げる」という候補機構が、
+    // 後から生えたスレッドにも効くのかはこれを撃たないと分からない。
+    if let Some(secs) = args.idle_secs {
+        let extra_thread_id = spawn_idle_thread(secs);
+        let extra_mutex = create_idle_mutex();
+        let report = json!({
+            "mode": "idle",
+            "pid": std::process::id(),
+            "extra_thread_id": extra_thread_id,
+            "extra_mutex": extra_mutex,
+        });
+        if let Some(path) = &args.report_file {
+            let _ = fs::write(path, report.to_string());
+        }
+        println!("{report}");
+        std::thread::sleep(Duration::from_secs(secs));
         return ExitCode::SUCCESS;
     }
 

@@ -482,6 +482,25 @@ mod cow_containment_tests;
 #[cfg(all(windows, test))]
 mod mcp_e2e_tests;
 
+/// **MAC/Spawn Daemon設計の実現性スパイク**（`plans/mac-spike/RESULTS.md`）。
+/// 設計§20の未実測の前提を、実装に着手する前に確定させるための使い捨て測定。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod mac_spike_tests;
+
+/// 同上（S3・S4: capabilityの差が実効で効くか／1トークンに積める本数の上限）。
+#[cfg(all(windows, test))]
+mod mac_spike_capability_tests;
+
+/// 同上（S5・S6・S7: ハンドル複製と最終パス解決／Jobの封じ込め／要求受付パイプ）。
+#[cfg(all(windows, test))]
+mod mac_spike_daemon_tests;
+
+/// 同上（S1b・S2c・S2d: コンソール構成の実ツール確認／既定DACL差し替え＝案A／
+/// ドメインごとの別package SID＝案Bのプリフェッチ）。
+#[cfg(all(windows, test))]
+mod mac_spike_followup_tests;
+
 /// **テスト専用**の口。[`ensure_profile`]の所有者チェック（BUG-107）を迂回して、
 /// **他セッションのものに見える名前**のプロファイルを作る。
 ///
