@@ -1,6 +1,7 @@
 //! **MAC/Spawn Daemon設計の実現性スパイク（バッチ1のS1・S2）**。結果の正本は
 //! `plans/mac-spike/RESULTS.md`（Journal）で、設計の正本は
-//! `plans/AppContainer上でのMAC・プロセス生成制御設計.md`（§9・§20項目1・§20項目10）である。
+//! `plans/DESIGN-MAC.md`を入口とする`plans/DESIGN-MAC*.md`群である（§9は`-ENFORCEMENT`、
+//! §20項目1・§20項目10は`-POC`。§番号→ファイルの索引は入口にある）。
 //!
 //! ## なぜスパイクなのか
 //!
