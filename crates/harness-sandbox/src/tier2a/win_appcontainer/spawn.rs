@@ -622,11 +622,17 @@ fn spawn_impl(
         Reserved: 0,
     };
 
-    // INV-2（ハンドル継承対策、設計書§23）: `bInheritHandles=true`のまま無制限に継承させず、
+    // INV-2（ハンドル継承対策、設計書§28）: `bInheritHandles=true`のまま無制限に継承させず、
     // `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`でstdioの3本（子側の書込/読取端のみ、いずれも
     // `create_pipe_with_sddl`が既に`bInheritHandle=true`で作成済み・親側端は上で`clear_inherit`
-    // 済み）に限定する。リスト中の全ハンドルが継承可能である必要があるため、この配列は
-    // `STARTUPINFOEXW`のhStdOutput/hStdError/hStdInputと完全に一致させる。
+    // 済み）に限定する。リスト中の全ハンドルが継承可能である必要がある。
+    //
+    // **この配列は`STARTUPINFOEXW`のhStdOutput/hStdError/hStdInputの「上位集合」である**
+    // （一致ではない）。`--cow`時のready pipeの書込端はここに載るが、hStd*のどれでもない
+    // ——子へは環境変数`HARNESS_COW_READY_HANDLE`で数値として渡すためである。
+    // 不変条件は「**継承されるのはこの配列が全て**」の側であり、hStd*はその部分集合。
+    // 継承ハンドルに何らかの検査を掛けるときは、hStd*ではなく**この配列**を対象にすること
+    // （hStd*だけを見るとready pipe型の追加ハンドルが素通りする）。
     let mut inherit_handles: Vec<HANDLE> = vec![stdout_write, stderr_write];
     if let Some(r) = stdin_read {
         inherit_handles.push(r);
