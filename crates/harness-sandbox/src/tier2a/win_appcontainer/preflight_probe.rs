@@ -14,6 +14,18 @@ use super::*;
 /// 区別するためのマーカー。`smoke_test_spawn`と`preflight`の理由文字列組立の両方で使う）。
 const FS_PROBE_DENIED_EXIT_CODE: i32 = 3;
 
+/// プローブ子プロセスのドメイン識別（§22.1.1）。**4本のプローブが共有する**——
+/// 綴りを4箇所に書き分けると、片方だけが仕様変更に追随しない（B-05）。
+///
+/// workspace capabilityを渡された場合はそれがドメインで、`None`（package SID宛ACEを自前で
+/// 付ける実機テスト専用の経路）ではプロファイルそのものがドメインになる。
+fn probe_domain(workspace_cap: Option<PSID>) -> DomainIdentity {
+    match workspace_cap {
+        Some(sid) => DomainIdentity::Capability(sid),
+        None => DomainIdentity::OwnPackage,
+    }
+}
+
 /// **シェルが実際にスクリプトを走らせた**ことだけを示す印。プローブの1文目で出す。
 ///
 /// # なぜ終了コードだけでは足りないか（実測、2026-08-13）
@@ -154,6 +166,7 @@ pub(crate) fn select_shell_by_probe(
             NetworkCapability::Deny,
             None,
             workspace_cap,
+            probe_domain(workspace_cap),
         ) {
             Err(e) => format!("could not start it ({e})"),
             Ok(child) => match child.write_stdin_read_output_and_wait(Some(&stdin_payload)) {
@@ -219,6 +232,7 @@ pub(crate) fn smoke_test_spawn(
         NetworkCapability::Deny,
         None,
         workspace_cap,
+        probe_domain(workspace_cap),
     )
     .map_err(|e| AppContainerError::Preflight(format!("shell could not start: {e}")))?;
     let (stdout, _, code) = child
@@ -280,6 +294,7 @@ pub(crate) fn smoke_test_harness_control_write_denied(
         NetworkCapability::Deny,
         None,
         workspace_cap,
+        probe_domain(workspace_cap),
     )
     .map_err(|e| {
         AppContainerError::Preflight(format!(
@@ -669,6 +684,7 @@ pub(crate) fn probe_passthrough_batch(
         NetworkCapability::Deny,
         None,
         workspace_cap,
+        probe_domain(workspace_cap),
     ) {
         Ok(child) => child,
         Err(e) => return BatchProbeOutcome::NotRun(format!("probe could not start: {e}")),

@@ -482,6 +482,12 @@ mod cow_containment_tests;
 #[cfg(all(windows, test))]
 mod mcp_e2e_tests;
 
+/// **ドメイン分離（§22.1.1・案A）の受け入れ測定**。スパイクと違い**本番の`spawn_with_workspace`
+/// 経由**で、同一package SIDの別ドメインからプロセス／後発スレッドを開けないことを対で測る。
+/// スパイクを消した後もこちらは残す（本番機構の回帰テストであるため）。
+#[cfg(all(windows, test))]
+mod domain_isolation_tests;
+
 /// **MAC/Spawn Daemon設計の実現性スパイク**（`plans/mac-spike/RESULTS.md`）。
 /// 設計§20の未実測の前提を、実装に着手する前に確定させるための使い捨て測定。
 /// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。

@@ -51,6 +51,13 @@ pub(crate) fn spawn_in_workspace(
             crate::tier2a::workspace_capability::lookup_capability_name(&canonical, mode).is_some()
         })
         .and_then(|mode| super::workspace_capability_sid(&canonical, mode).ok());
+    // §22.1.1: workspace capabilityが引けたならそれがドメイン、引けなければプロファイル自身が
+    // ドメイン（package SID宛ACEを自前で付けるテストがこちら）。**本番の`launch.rs`と同じ選び方**に
+    // しておかないと、「本番と同じ形」を名乗るこのヘルパーだけ別の分離状態を測ることになる。
+    let domain = match cap.as_ref() {
+        Some(sid) => super::DomainIdentity::Capability(sid.as_psid()),
+        None => super::DomainIdentity::OwnPackage,
+    };
     super::spawn_with_workspace(
         exe,
         args,
@@ -61,6 +68,7 @@ pub(crate) fn spawn_in_workspace(
         net,
         cow,
         cap.as_ref().map(|s| s.as_psid()),
+        domain,
     )
 }
 

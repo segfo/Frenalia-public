@@ -1319,6 +1319,7 @@ mod tests {
             sid.as_psid(),
             crate::tier2a::win_appcontainer::NetworkCapability::InternetClient,
             None,
+            crate::tier2a::win_appcontainer::DomainIdentity::OwnPackage,
         )
         .expect("spawn AppContainer child");
         let (stdout, stderr, code) = child.write_stdin_read_output_and_wait(None).unwrap();

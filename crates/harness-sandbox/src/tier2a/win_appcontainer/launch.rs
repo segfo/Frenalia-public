@@ -39,7 +39,7 @@ use std::path::PathBuf;
 
 use super::{
     ensure_profile, grant_job, resolve_shell, spawn_with_workspace, AppContainerChild,
-    AppContainerError, CowInject, NetworkCapability,
+    AppContainerError, CowInject, DomainIdentity, NetworkCapability,
 };
 
 /// Tier2aでシェルを起こすための入力一式。
@@ -130,6 +130,9 @@ pub fn spawn_shell_in_workspace(
         req.net_capability,
         cow,
         Some(workspace_cap.as_psid()),
+        // §22.1.1: このシェルのドメインはworkspace＋モード単位のcapability（D-54）。
+        // traverse capabilityは全Tier2a子が共有するので**ドメインの識別子にしてはいけない**。
+        DomainIdentity::Capability(workspace_cap.as_psid()),
     )?;
     Ok((child, shell_label))
 }

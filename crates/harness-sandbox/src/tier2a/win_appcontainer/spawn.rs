@@ -403,6 +403,112 @@ fn normalize_cow_root(path: &Path) -> PathBuf {
     ))
 }
 
+/// 子プロセスが属する**ドメイン**を名指しする主体（設計書§22.1.1）。
+///
+/// 子のプロセス／スレッド／トークン既定DACLを「ユーザーSID＋この主体」だけに絞るために使う。
+/// **同一package SID内では、これが違えば互いに`OpenProcess`できない**——それがこの型の目的で
+/// ある（capability群だけではコード注入を塞げない、[RESULTS.md §S2・§S2c](../../../../plans/mac-spike/RESULTS.md)）。
+///
+/// **`Option`にせず、必ず選ばせる**。既定値があると呼び出し側が黙って落とせてしまい、
+/// 落ちた経路だけが素のDACL（package SID入り）で起動する——それは静かに分離が消える形である。
+/// spawn経路が増えたときにコンパイルで気付かせるために、この列挙を引数で受け取る。
+#[derive(Clone, Copy)]
+pub enum DomainIdentity {
+    /// このドメインを識別するcapability SID（例: D-54のworkspace capability）。
+    ///
+    /// **traverse capabilityを渡してはいけない**——全Tier2a子が共有するので分離にならない。
+    Capability(PSID),
+    /// **自分のpackage SIDそのものがドメイン**である場合（プロファイルが1ドメインに対応する）。
+    /// MCPサーバ（D-38でサーバごとに別プロファイル）とWFPプローブがこれに当たる。
+    OwnPackage,
+}
+
+impl DomainIdentity {
+    /// 子のDACLに載せる主体のSID文字列を返す。`container_sid`は`OwnPackage`のときだけ使う。
+    fn sid_string(&self, container_sid: PSID) -> Result<String, AppContainerError> {
+        let psid = match self {
+            DomainIdentity::Capability(sid) => *sid,
+            DomainIdentity::OwnPackage => container_sid,
+        };
+        crate::win_common::sid_to_string(psid)
+            .map_err(|e| AppContainerError::Win32(format!("sid_to_string(domain identity): {e}")))
+    }
+}
+
+/// SDDL文字列から作ったセキュリティ記述子。**`Drop`で`LocalFree`する**
+/// （`ConvertStringSecurityDescriptorToSecurityDescriptorW`が確保したものを解放する義務がある）。
+///
+/// spawnは`?`で抜ける経路が多いので、手で解放する形にすると経路が増えるたびに漏れる。
+struct SecurityDescriptorBuf(windows::Win32::Security::PSECURITY_DESCRIPTOR);
+
+impl SecurityDescriptorBuf {
+    fn from_sddl(sddl: &str) -> windows::core::Result<Self> {
+        use windows::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        unsafe {
+            let sddl_w = wide(sddl);
+            let mut sd = windows::Win32::Security::PSECURITY_DESCRIPTOR::default();
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl_w.as_ptr()),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )?;
+            Ok(Self(sd))
+        }
+    }
+
+    /// `CreateProcessW`の`lpProcessAttributes`/`lpThreadAttributes`へ渡す形。
+    /// **戻り値はこの`SecurityDescriptorBuf`より長生きさせない**（SDを指しているため）。
+    fn security_attributes(&self) -> windows::Win32::Security::SECURITY_ATTRIBUTES {
+        windows::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.0 .0,
+            bInheritHandle: false.into(),
+        }
+    }
+
+    /// `SetTokenInformation(TokenDefaultDacl)`へ渡すDACLポインタ。
+    fn dacl(&self) -> windows::core::Result<*mut windows::Win32::Security::ACL> {
+        use windows::Win32::Security::GetSecurityDescriptorDacl;
+        let mut dacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+        let mut present = windows::Win32::Foundation::BOOL::from(false);
+        let mut defaulted = windows::Win32::Foundation::BOOL::from(false);
+        unsafe { GetSecurityDescriptorDacl(self.0, &mut present, &mut dacl, &mut defaulted)? };
+        Ok(dacl)
+    }
+}
+
+impl Drop for SecurityDescriptorBuf {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = LocalFree(HLOCAL(self.0 .0));
+        }
+    }
+}
+
+/// 子のプロセス／スレッド／トークン既定DACLへ適用するSDDL（設計書§22.1.1）。
+///
+/// 形は`D:(A;;GA;;;<user sid>)(A;;GA;;;<domain sid>)`の2主体だけである。
+///
+/// - **package SIDは載せない**。載せると同一package SIDの別ドメインから開けてしまい、
+///   この対策の目的そのものが消える（`OwnPackage`のときだけ、package SID＝ドメインなので載る）
+/// - **traverse capabilityは載せない**（全Tier2a子が共有する＝分離にならない）
+/// - **ユーザーSIDは載せる**。AppContainerでない側（harness自身・昇格した収集器）が引き続き
+///   開けるようにするため。**AppContainerの子には効かない**——AppContainerのアクセスチェックは
+///   package SIDかcapabilityを別途要求するので、サンドボックスの子はこのACEでは開けない（§S2cで実測）
+/// - **SYSTEMは足さない**（§S2cの構成で実際に走ることを確認済みで、根拠なく主体を増やさない）
+fn domain_dacl_sddl(
+    domain: DomainIdentity,
+    container_sid: PSID,
+) -> Result<String, AppContainerError> {
+    let user = crate::win_pipe_ipc::current_user_sid_string()
+        .map_err(|e| AppContainerError::Win32(format!("current_user_sid_string: {e}")))?;
+    let domain_sid = domain.sid_string(container_sid)?;
+    Ok(format!("D:(A;;GA;;;{user})(A;;GA;;;{domain_sid})"))
+}
+
 /// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する。
 /// Tier1の`CreateProcessAsUserW`+制限トークンとは別方式: トークンは差し替えず、呼び出し
 /// スレッド自身のトークンのまま拡張属性リストでAppContainerへ閉じ込める。そのため
@@ -421,6 +527,7 @@ pub fn spawn(
     container_sid: PSID,
     net: NetworkCapability,
     cow: Option<CowInject<'_>>,
+    domain: DomainIdentity,
 ) -> Result<AppContainerChild, AppContainerError> {
     spawn_with_workspace(
         exe,
@@ -432,6 +539,7 @@ pub fn spawn(
         net,
         cow,
         None,
+        domain,
     )
 }
 
@@ -456,6 +564,7 @@ pub fn spawn_with_workspace(
     net: NetworkCapability,
     cow: Option<CowInject<'_>>,
     workspace_cap: Option<PSID>,
+    domain: DomainIdentity,
 ) -> Result<AppContainerChild, AppContainerError> {
     const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 
@@ -486,6 +595,7 @@ pub fn spawn_with_workspace(
             container_sid,
             &capabilities,
             cow,
+            domain,
         ),
         NetworkCapability::InternetClient => unsafe {
             let mut cap_sid = PSID::default();
@@ -506,6 +616,7 @@ pub fn spawn_with_workspace(
                 container_sid,
                 &capabilities,
                 cow,
+                domain,
             );
             let _ = LocalFree(HLOCAL(cap_sid.0));
             result
@@ -526,6 +637,7 @@ fn spawn_impl(
     container_sid: PSID,
     capabilities: &[SID_AND_ATTRIBUTES],
     cow: Option<CowInject<'_>>,
+    domain: DomainIdentity,
 ) -> Result<AppContainerChild, AppContainerError> {
     // どのWin32呼び出しが失敗したかをエラー文字列に残す（AppContainerの起動は失敗モードが
     // 多く、0x57 ERROR_INVALID_PARAMETER等がどの段で出たかを区別できないと切り分けられない）。
@@ -641,6 +753,23 @@ fn spawn_impl(
         inherit_handles.push(*ready_write);
     }
 
+    // §22.1.1 挿入点1: プロセスと**最初のスレッド**のオブジェクトDACL。
+    // カーネルオブジェクトのDACLは**生成時**に決まるので、下の`TokenDefaultDacl`差し替えでは
+    // この2つに間に合わない（逆に、ここだけでは起動後に生えたスレッドが素のままになる、§S2b）。
+    // **2つで1つの対策**である。SDは`CreateProcessW`の呼び出し中だけ生きていればよい。
+    let domain_sddl = domain_dacl_sddl(domain, container_sid)?;
+    let domain_sd_for = |what: &'static str| -> Result<SecurityDescriptorBuf, AppContainerError> {
+        SecurityDescriptorBuf::from_sddl(&domain_sddl).map_err(|e| {
+            AppContainerError::Win32(format!(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW({what}): {e}"
+            ))
+        })
+    };
+    let process_sd = domain_sd_for("process")?;
+    let thread_sd = domain_sd_for("thread")?;
+    let process_sa = process_sd.security_attributes();
+    let thread_sa = thread_sd.security_attributes();
+
     let result: Result<PROCESS_INFORMATION, AppContainerError> = unsafe {
         let mut attr_list_size: usize = 0;
         // 1回目は必要サイズ取得のためだけの呼び出しで、バッファ不足エラーになるのが正常
@@ -701,8 +830,9 @@ fn spawn_impl(
                 CreateProcessW(
                     None,
                     PWSTR(cmdline_w.as_mut_ptr()),
-                    None,
-                    None,
+                    // §22.1.1 挿入点1（プロセス／最初のスレッドのDACL）。
+                    Some(&process_sa as *const _),
+                    Some(&thread_sa as *const _),
                     true,
                     EXTENDED_STARTUPINFO_PRESENT
                         | CREATE_NO_WINDOW
@@ -758,6 +888,60 @@ fn spawn_impl(
         if let Err(e) = AssignProcessToJobObject(job, process_info.hProcess)
             .map_err(|e| step("AssignProcessToJobObject", e))
         {
+            let _ = TerminateProcess(process_info.hProcess, 1);
+            let _ = CloseHandle(process_info.hThread);
+            let _ = CloseHandle(process_info.hProcess);
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(stdout_read);
+            let _ = CloseHandle(stderr_read);
+            if let Some(w) = stdin_write {
+                let _ = CloseHandle(w);
+            }
+            if let Some((ready_read, _)) = &ready_pipe {
+                let _ = CloseHandle(*ready_read);
+            }
+            return Err(e);
+        }
+
+        // §22.1.1 挿入点2: **Resumeより前に**トークンの既定DACLを差し替える。
+        //
+        // ここを窓に選ぶ理由は、子がまだ1つもオブジェクトを作っていないからである——起動後に
+        // 差し替えても、それまでに生えたスレッドは古い既定DACL（package SID入り）のまま残る。
+        // これで「起動後に生えたスレッド」の穴（§S2b）が閉じる。
+        //
+        // **失敗はfail-closed**（B-10）。差し替わっていないのに起動を続けると、分離したつもりで
+        // 素の状態が走る——しかも症状は出ないので誰も気付けない。
+        let default_dacl_result = (|| -> Result<(), AppContainerError> {
+            use windows::Win32::Security::{
+                SetTokenInformation, TokenDefaultDacl, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL,
+            };
+            let sd = SecurityDescriptorBuf::from_sddl(&domain_sddl).map_err(|e| {
+                AppContainerError::Win32(format!(
+                    "ConvertStringSecurityDescriptorToSecurityDescriptorW(token default dacl): {e}"
+                ))
+            })?;
+            let dacl = sd
+                .dacl()
+                .map_err(|e| step("GetSecurityDescriptorDacl(token default dacl)", e))?;
+            let mut token = HANDLE::default();
+            OpenProcessToken(
+                process_info.hProcess,
+                TOKEN_ADJUST_DEFAULT | TOKEN_QUERY,
+                &mut token,
+            )
+            .map_err(|e| step("OpenProcessToken(TOKEN_ADJUST_DEFAULT)", e))?;
+            let info = TOKEN_DEFAULT_DACL { DefaultDacl: dacl };
+            let set = SetTokenInformation(
+                token,
+                TokenDefaultDacl,
+                &info as *const _ as *const c_void,
+                std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32,
+            )
+            .map_err(|e| step("SetTokenInformation(TokenDefaultDacl)", e));
+            let _ = CloseHandle(token);
+            set
+        })();
+        if let Err(e) = default_dacl_result {
             let _ = TerminateProcess(process_info.hProcess, 1);
             let _ = CloseHandle(process_info.hThread);
             let _ = CloseHandle(process_info.hProcess);

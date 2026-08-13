@@ -50,6 +50,7 @@ fn run_probe(sid: PSID, dir: &Path) {
         sid,
         NetworkCapability::Deny,
         None,
+        DomainIdentity::OwnPackage,
     )
     .expect("spawn should succeed even if the shell command itself fails inside");
     let (out, err, code) = child
@@ -76,6 +77,7 @@ fn run_probe_bool(sid: PSID, dir: &Path, command: &str) -> bool {
         sid,
         NetworkCapability::Deny,
         None,
+        DomainIdentity::OwnPackage,
     )
     .expect("spawn should succeed even if the shell command itself fails inside");
     let (out, err, code) = child
@@ -1505,6 +1507,7 @@ fn a_sandbox_cannot_reach_another_sessions_workspace() {
         sid_a.as_psid(),
         NetworkCapability::Deny,
         None,
+        DomainIdentity::OwnPackage,
     )
     .expect("spawn AppContainer child in session A");
     let (stdout, stderr, _code) = child.write_stdin_read_output_and_wait(None).unwrap();

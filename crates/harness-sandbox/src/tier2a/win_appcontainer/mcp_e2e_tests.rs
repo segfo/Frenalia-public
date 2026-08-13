@@ -44,6 +44,7 @@ fn read_from_sandbox(sid: PSID, cwd: &Path, path: &Path) -> String {
         sid,
         NetworkCapability::Deny,
         None,
+        DomainIdentity::OwnPackage,
     )
     .expect("spawn AppContainer child");
     let (stdout, stderr, _code) = child.write_stdin_read_output_and_wait(None).unwrap();
@@ -240,6 +241,7 @@ fn e2e_mcp_servers_get_independent_egress_allowlists() {
         // 実運用でnetworkを要求したサーバと同じ条件（capabilityは付くが、宛先はWFPが絞る）。
         NetworkCapability::InternetClient,
         None,
+        DomainIdentity::OwnPackage,
     )
     .expect("spawn AppContainer child for server A");
     let (stdout, stderr, code) = child.write_stdin_read_output_and_wait(None).unwrap();

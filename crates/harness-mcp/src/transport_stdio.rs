@@ -18,7 +18,7 @@
 use std::time::{Duration, Instant};
 
 use harness_sandbox::tier2a::win_appcontainer::{
-    spawn, AppContainerSession, NetworkCapability, SessionError,
+    spawn, AppContainerSession, DomainIdentity, NetworkCapability, SessionError,
 };
 
 use crate::runtime::{PreparedIsolation, PreparedServer, TransportFactory};
@@ -135,6 +135,9 @@ impl TransportFactory for AppContainerTransportFactory {
             sid.as_psid(),
             net,
             None, // `--cow`のRedirector注入はMCPサーバには行わない（workspaceを触らないため）。
+            // §22.1.1: D-38でMCPサーバは**サーバごとに専用プロファイル**なので、package SIDが
+            // そのままドメインになる。capability群は持たない（§22.2.2で対象外と決着済み）。
+            DomainIdentity::OwnPackage,
         )
         .map_err(|e| spawn_error(e.to_string()))?;
 
