@@ -816,24 +816,141 @@ fn spawn_impl(
     })
 }
 
-/// Tier2a（AppContainer）で使うシェルの実行ファイルパスとラベルを解決する。
-/// **ストアアプリの実行エイリアス（`WindowsApps`配下の0バイトreparse point）は
-/// AppContainerから解決できず`CreateProcessW`が`ERROR_INVALID_PARAMETER`で失敗する**ため、
-/// pwshの実体がそこにある場合は使わず、実在の Windows PowerShell 5.1（System32の本物のexe、
-/// 決してエイリアスにならない）へフォールバックする。smoke testと`run_shell`本体の両方で
-/// この同一解決を使い、「smokeが通ったのに本番で別のexeを使って失敗する」ずれを防ぐ。
-pub fn resolve_shell() -> (String, &'static str) {
-    if let Ok(p) = which::which("pwsh") {
-        let s = p.to_string_lossy();
-        if !s.to_ascii_lowercase().contains("windowsapps") {
-            return (s.into_owned(), "pwsh(Tier2a)");
-        }
+/// Tier2aシェルのラベル。`run_shell`の結果末尾（`[shell: ...]`）としてモデルへ出るので、
+/// 語彙を勝手に増やさない（増やすなら`harness-tools`側の表示も対で見ること）。
+pub(crate) const PWSH_LABEL: &str = "pwsh(Tier2a)";
+pub(crate) const POWERSHELL51_LABEL: &str = "powershell5.1(Tier2a)";
+
+/// このプロセスで使うと決まったシェル。[`select_shell_by_probe`]（`preflight_probe`）だけが書き、
+/// [`resolve_shell`]だけが読む。
+///
+/// **workspace単位ではなくプロセス単位で1回**なのは、「どのシェルがこの機のAppContainerで
+/// 動くか」がマシン単位の事実だからである（workspaceごとに答えが変わるものではない）。
+static SELECTED_SHELL: std::sync::OnceLock<(String, &'static str)> = std::sync::OnceLock::new();
+
+/// Tier2aで使うシェルの候補を**優先順**で返す（純粋関数。`which`の結果を引数で受ける）。
+///
+/// 1. `pwsh`（PowerShell 7）。**`WindowsApps`配下の実行エイリアスも候補から外さない。**
+///    2026-08-13の実測では、AppContainer内で`CreateProcessW`が通らなかったのは
+///    MSIXパッケージの**実体**の方で、エイリアスは6通り（コンソール3構成×mitigation有無）
+///    すべてで起動できた（[`plans/mac-spike/RESULTS.md`] §S1b）。
+/// 2. Windows PowerShell 5.1（System32の本物のexe。決してエイリアスにならない）。
+///
+/// MSIXの実体パスは候補に入れない——上の実測で6通りすべて`ERROR_INVALID_PARAMETER`だった。
+fn shell_candidates_from(pwsh: Option<PathBuf>, system_root: &str) -> Vec<(String, &'static str)> {
+    let mut candidates: Vec<(String, &'static str)> = Vec::new();
+    if let Some(pwsh) = pwsh {
+        candidates.push((pwsh.to_string_lossy().into_owned(), PWSH_LABEL));
     }
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    (
+    candidates.push((
         format!("{system_root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
-        "powershell5.1(Tier2a)",
-    )
+        POWERSHELL51_LABEL,
+    ));
+    candidates
+}
+
+/// [`shell_candidates_from`]をこの機の実環境へ当てたもの。**必ず1件以上返る**
+/// （5.1のパスは実在確認をせずに積む——実在しない機ではプローブが落ちて理由が出る方が、
+/// 候補が0件で「なぜ選べなかったか」が消えるより良い）。
+pub(crate) fn shell_candidates() -> Vec<(String, &'static str)> {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    shell_candidates_from(which::which("pwsh").ok(), &system_root)
+}
+
+/// 選択結果をこのプロセスへ固定する。既に固定済みなら**最初の選択が勝つ**（`false`を返す）。
+pub(crate) fn remember_selected_shell(selected: (String, &'static str)) -> bool {
+    SELECTED_SHELL.set(selected).is_ok()
+}
+
+/// Tier2a（AppContainer）で使うシェルの実行ファイルパスとラベルを返す。
+///
+/// **選択は静的な決め打ちではなく、`preflight`が実際にAppContainer内でシェルを起こして
+/// 決める**（`preflight_probe::select_shell_by_probe`）。既定はpwsh 7で、この機で起こせなければ
+/// Windows PowerShell 5.1へ落ちる。落ちたことは`PreflightOutcome::warnings`に載る（B-10/B-11）。
+///
+/// preflightがまだ選んでいない場合は候補の先頭（＝pwsh 7）を返す。**本番でここを通るのは
+/// preflightの後だけ**である——`resolve_shell`の非テスト呼び出しは4箇所
+/// （`launch.rs`／`preflight_probe.rs`の3つ）で、Tier2aの子を起こす2経路（`run_shell`＝
+/// `harness-tools`の`run_windows_tier2a`、ポリシーエディタのパス2＝`record_net`）は
+/// どちらも自プロセスで`select_tier`→`preflight`を先に通る。
+///
+/// smoke testと`run_shell`本体が同じ解決を通るという不変条件は変えていない——読み口が
+/// この関数1つだけであることがそれを保っている（「smokeが通ったのに本番で別のexeを使って
+/// 失敗する」ずれを防ぐ、[BUG-007](docs/bugs/BUG-007.md)）。
+pub fn resolve_shell() -> (String, &'static str) {
+    if let Some(selected) = SELECTED_SHELL.get() {
+        return selected.clone();
+    }
+    shell_candidates()
+        .into_iter()
+        .next()
+        .expect("shell_candidates always yields at least PowerShell 5.1")
+}
+
+#[cfg(test)]
+mod shell_resolution_tests {
+    use super::*;
+
+    /// **Aの回帰ガード**: `WindowsApps`配下の実行エイリアスを候補から**外さない**こと。
+    ///
+    /// 以前はここでパス文字列に`windowsapps`が含まれるかを見て静的に除外していた。
+    /// 根拠は[BUG-007](docs/bugs/BUG-007.md)の「AppContainerからエイリアスを解決できない」
+    /// だったが、2026-08-13の実測（`plans/mac-spike/RESULTS.md` §S1b）ではエイリアスは
+    /// AppContainer内で6通りすべて起動でき、`ERROR_INVALID_PARAMETER`で落ちたのは
+    /// MSIXの実体の方だった。**除外が復活したらここが赤くなる。**
+    #[test]
+    fn the_store_alias_is_a_candidate_not_an_exclusion() {
+        let alias = PathBuf::from(r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\pwsh.exe");
+        let candidates = shell_candidates_from(Some(alias.clone()), r"C:\Windows");
+        assert_eq!(
+            candidates
+                .first()
+                .map(|(path, label)| (path.as_str(), *label)),
+            Some((alias.to_string_lossy().as_ref(), PWSH_LABEL)),
+            "pwshは実行エイリアスであっても第1候補でなければならない（実測§S1b）"
+        );
+    }
+
+    /// 候補は常に「pwsh → 5.1」の順で、5.1は**必ず最後に残る**。
+    /// 5.1が候補から消えると、pwshが起こせない機で落ちる先が無くなる。
+    #[test]
+    fn powershell51_is_always_the_last_resort() {
+        let with_pwsh = shell_candidates_from(
+            Some(PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe")),
+            r"C:\Windows",
+        );
+        assert_eq!(with_pwsh.len(), 2, "pwshがある機では候補は2本");
+        assert_eq!(
+            with_pwsh.last().map(|(path, label)| (path.clone(), *label)),
+            Some((
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                POWERSHELL51_LABEL
+            ))
+        );
+
+        let without_pwsh = shell_candidates_from(None, r"C:\Windows");
+        assert_eq!(
+            without_pwsh.len(),
+            1,
+            "pwshが無い機では候補は5.1だけ（＝プローブを撃つ必要が無い）"
+        );
+        assert_eq!(without_pwsh[0].1, POWERSHELL51_LABEL);
+    }
+
+    /// `SystemRoot`が既定と違う機でも5.1のパスをそこから組み立てる。
+    #[test]
+    fn powershell51_is_built_from_the_given_system_root() {
+        let candidates = shell_candidates_from(None, r"D:\WinNT");
+        assert_eq!(
+            candidates[0].0,
+            r"D:\WinNT\System32\WindowsPowerShell\v1.0\powershell.exe"
+        );
+    }
+
+    // **選択キャッシュ（`SELECTED_SHELL`）はここでは書かない。** `OnceLock`はプロセス単位で、
+    // 単体テストが書くと同じテストバイナリ内の他のテスト（実機テストを含む）が読む
+    // 製品の実行時状態を書き換えることになる（BUG-108と同型、B-27）。ここで測るのは
+    // 純粋関数だけにし、選択の判定そのものは`preflight_probe::judge_probe`側で測る。
 }
 
 #[cfg(test)]

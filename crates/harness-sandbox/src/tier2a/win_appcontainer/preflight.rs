@@ -860,6 +860,16 @@ pub fn preflight_with_privhelper_launcher(
     audit_guard.finish(&mut warnings);
     timing.mark("grant audit (BUG-101)");
 
+    // **この機で使うシェルを、ここで実際に起こして決める**（`select_shell_by_probe`のdoc）。
+    // 以降のプローブ（`probe_passthrough_batch`・2つのsmoke test）と`run_shell`本体は
+    // すべて`resolve_shell()`を読むので、選択はそれらより前で終えていなければならない。
+    warnings.extend(select_shell_by_probe(
+        sid.as_psid(),
+        workspace_cap_psid,
+        workspace_root,
+    ));
+    timing.mark("shell selection");
+
     // D8: 到達性プローブは**ここで1回だけ**行う（付与も昇格も全部終わった後）。
     // 対象が0件なら子プロセスは1つも起こさない。
     match probe_passthrough_batch(

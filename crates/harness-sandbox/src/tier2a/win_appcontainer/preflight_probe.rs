@@ -14,33 +14,177 @@ use super::*;
 /// 区別するためのマーカー。`smoke_test_spawn`と`preflight`の理由文字列組立の両方で使う）。
 const FS_PROBE_DENIED_EXIT_CODE: i32 = 3;
 
+/// **シェルが実際にスクリプトを走らせた**ことだけを示す印。プローブの1文目で出す。
+///
+/// # なぜ終了コードだけでは足りないか（実測、2026-08-13）
+///
+/// PowerShellは**コンソールの与え方によっては、何一つ実行しないまま`exit 0`で終わる**
+/// （`plans/mac-spike/RESULTS.md` §S1・§S1b。5.1・7とも、`DETACHED_PROCESS`で再現。
+/// この性質はAppContainer固有ですらない）。終了コードしか見ないプローブは、この
+/// 「無言のシェル」を**合格として通す**——`exit 0`だからである（B-09/B-10）。
+/// 印を先頭で出させ、印が無い実行を不合格にすることで、その口を塞ぐ。
+///
+/// 印の綴りは**この定数から`format!`でコマンド文字列へ埋め込む**（判定側と2箇所に
+/// 書き分けない、B-05）。
+const PROBE_RAN_MARKER: &str = "HARNESS-PROBE-RAN";
+
+/// プローブの結果を「シェルが走ったか」の軸だけで分類したもの。**終了コードの意味は
+/// プローブごとに違う**ので、その解釈は呼び出し元に残す。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    /// 印があった＝スクリプトは走った。`code`の意味は各プローブが解釈する。
+    Ran { code: i32 },
+    /// 印が無い＝1行も走っていない（無言のシェル）。終了コードは信用できない。
+    SilentShell { code: i32 },
+}
+
+/// プローブのstdoutと終了コードから[`ProbeOutcome`]を決める（純粋関数）。
+pub(crate) fn judge_probe(marker: &str, stdout: &str, code: i32) -> ProbeOutcome {
+    if stdout.contains(marker) {
+        ProbeOutcome::Ran { code }
+    } else {
+        ProbeOutcome::SilentShell { code }
+    }
+}
+
 /// `probe_dir`（preflightが事前に作成・ACL付与済みのワークスペース内一時ディレクトリ）へ
 /// 実際に一時ファイルを作成・読取・削除するPowerShellコマンド。`exit 0`だけを試す旧実装は
 /// FileSystemプロバイダの初期化失敗があってもプロセス自体は正常終了してしまい偽陽性となる
 /// （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3参照）ため、実FS I/Oまで
 /// 一括で試し、成否を終了コードに反映させる。
-const FS_IO_PROBE_COMMAND: &str = "\
-    $ErrorActionPreference = 'Stop'; \
-    try { \
-        $p = Join-Path $env:HARNESS_PROBE_DIR ([Guid]::NewGuid().ToString() + '.tmp'); \
-        New-Item -ItemType File -Path $p -Force | Out-Null; \
-        Get-Content -LiteralPath $p | Out-Null; \
-        Remove-Item -LiteralPath $p -Force; \
-        exit 0 \
-    } catch { \
-        exit 3 \
-    }";
+///
+/// **印は1文目で出す**（[`PROBE_RAN_MARKER`]）。FSの成否より前に出すことで、
+/// 「シェルが走ったか」と「FSが通ったか」を別々に読めるようにする。
+fn fs_io_probe_command() -> String {
+    format!(
+        "Write-Output '{PROBE_RAN_MARKER}'; \
+         $ErrorActionPreference = 'Stop'; \
+         try {{ \
+             $p = Join-Path $env:HARNESS_PROBE_DIR ([Guid]::NewGuid().ToString() + '.tmp'); \
+             New-Item -ItemType File -Path $p -Force | Out-Null; \
+             Get-Content -LiteralPath $p | Out-Null; \
+             Remove-Item -LiteralPath $p -Force; \
+             exit 0 \
+         }} catch {{ \
+             exit {FS_PROBE_DENIED_EXIT_CODE} \
+         }}"
+    )
+}
 
-const CONTROL_DIR_WRITE_DENY_PROBE_COMMAND: &str = "\
-    $ErrorActionPreference = 'Stop'; \
-    $p = Join-Path $env:HARNESS_CONTROL_DIR ([Guid]::NewGuid().ToString() + '.tmp'); \
-    try { \
-        New-Item -ItemType File -Path $p -Force | Out-Null; \
-        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; \
-        exit 4 \
-    } catch { \
-        exit 0 \
-    }";
+fn control_dir_write_deny_probe_command() -> String {
+    format!(
+        "Write-Output '{PROBE_RAN_MARKER}'; \
+         $ErrorActionPreference = 'Stop'; \
+         $p = Join-Path $env:HARNESS_CONTROL_DIR ([Guid]::NewGuid().ToString() + '.tmp'); \
+         try {{ \
+             New-Item -ItemType File -Path $p -Force | Out-Null; \
+             Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; \
+             exit 4 \
+         }} catch {{ \
+             exit 0 \
+         }}"
+    )
+}
+
+/// シェル選択プローブがstdinへ流すスクリプト——**そのシェルがAppContainer内で実際に走るか**
+/// だけを見る最小のもの。FS I/Oを含めない（含めると、traverse ACE不足のような環境側の失敗を
+/// 「このシェルは使えない」と読んでしまう）。
+///
+/// **本番`run_shell`と同じ渡し方（`-Command -`＝stdin経由）で測る。** 他の2プローブは
+/// `-Command <script>`だが、選ばれたシェルが最も多く通るのは`run_shell`の形なので、
+/// 選択の判定はそちらに合わせる（`harness-tools`の`platform_shell_command`・
+/// `run_windows_tier2a`。ブートストラップ本体は依存の向き上ここからは参照できないので、
+/// 形だけを合わせた最小のスクリプトを使う）。
+fn shell_selection_probe_stdin() -> Vec<u8> {
+    format!("Write-Output '{PROBE_RAN_MARKER}'\r\n").into_bytes()
+}
+
+/// このプロセスで使うTier2aシェルを、**実際にAppContainer内で起こして**決める。
+/// 戻り値は警告（第1候補で決まったときは空）。
+///
+/// # 呼ぶ位置（変えるときは必ず読むこと）
+///
+/// **`preflight`がシェルを起こす3つのプローブ（`probe_passthrough_batch` →
+/// `smoke_test_spawn` → `smoke_test_harness_control_write_denied`）より前**で呼ぶ。
+/// 後ろに置くと、最初に走る`probe_passthrough_batch`が未選択のシェルで実行され、
+/// そこで起動に失敗すると**passthroughを一律「到達不能」と誤診断する**。
+/// 呼ぶのは全ACE付与が終わった後——シェルはworkspaceをcwdにして起こすので、
+/// traverse/workspaceのACEが揃う前に測ると環境の問題をシェルの問題として読む。
+///
+/// # 落ち方
+///
+/// 候補が全滅しても**ここではpreflightを止めない**。Tier2aが成立するかの判定は
+/// 後続の`smoke_test_spawn`が持っており、判定点を2つに増やすと「どちらが理由を出すのか」が
+/// ぶれる。ここは最も保守的な候補（PowerShell 5.1）を選んで理由を`warnings`へ残すだけにする。
+pub(crate) fn select_shell_by_probe(
+    sid: PSID,
+    workspace_cap: Option<PSID>,
+    workspace_root: &Path,
+) -> Vec<String> {
+    let candidates = shell_candidates();
+    // 候補が1本しか無い機（pwshが入っていない）では、測る意味が無いのでプロセスを起こさない。
+    if candidates.len() <= 1 {
+        if let Some(only) = candidates.into_iter().next() {
+            remember_selected_shell(only);
+        }
+        return Vec::new();
+    }
+
+    let env = crate::secret_env::build_child_env();
+    let stdin_payload = shell_selection_probe_stdin();
+    let mut warnings: Vec<String> = Vec::new();
+    let last_index = candidates.len() - 1;
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        let (shell, label) = candidate;
+        // 最後の候補は測らずに採る——落ちる先が他に無いので、測って落ちても結論は同じであり、
+        // 起動を1回ぶん余計に払うだけになる。成否は後続のsmoke testが本来の理由付きで出す。
+        if index == last_index {
+            break;
+        }
+        let reason = match spawn_with_workspace(
+            shell,
+            &["-NoProfile", "-NonInteractive", "-Command", "-"],
+            workspace_root,
+            &env,
+            // `-Command -`はstdinからスクリプトを読むので、stdinの口を開けて渡す
+            // （`want_stdin: false`だと子は空を読んで何もせずに終わり、印が出ない）。
+            true,
+            sid,
+            NetworkCapability::Deny,
+            None,
+            workspace_cap,
+        ) {
+            Err(e) => format!("could not start it ({e})"),
+            Ok(child) => match child.write_stdin_read_output_and_wait(Some(&stdin_payload)) {
+                Err(e) => format!("its output could not be read ({e})"),
+                Ok((stdout, _, code)) => match judge_probe(PROBE_RAN_MARKER, &stdout, code) {
+                    ProbeOutcome::Ran { code: 0 } => {
+                        remember_selected_shell(candidate.clone());
+                        return warnings;
+                    }
+                    ProbeOutcome::Ran { code } => {
+                        format!("it ran the probe but exited with code {code}")
+                    }
+                    // §S1b の「無言のシェル」。**ここを合格にすると本番で1行も走らない**。
+                    ProbeOutcome::SilentShell { code } => format!(
+                        "it exited with code {code} without running anything \
+                         (no '{PROBE_RAN_MARKER}' on stdout)"
+                    ),
+                },
+            },
+        };
+        warnings.push(format!(
+            "Tier2a shell: {label} ({shell}) is not usable on this machine — {reason}. \
+             Falling back to the next candidate."
+        ));
+    }
+
+    if let Some(last) = candidates.into_iter().next_back() {
+        remember_selected_shell(last);
+    }
+    warnings
+}
 
 /// `workspace_cap`は、workspaceツリーのACEの主体になったcapability SID（D-54）。本番の
 /// `run_shell`と**同じcapability構成**で起動しないとプローブの意味が無いので、`preflight`は
@@ -66,7 +210,7 @@ pub(crate) fn smoke_test_spawn(
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            FS_IO_PROBE_COMMAND,
+            &fs_io_probe_command(),
         ],
         workspace_root,
         &env,
@@ -77,9 +221,16 @@ pub(crate) fn smoke_test_spawn(
         workspace_cap,
     )
     .map_err(|e| AppContainerError::Preflight(format!("shell could not start: {e}")))?;
-    let (_, _, code) = child
+    let (stdout, _, code) = child
         .write_stdin_read_output_and_wait(None)
         .map_err(|e| AppContainerError::Preflight(format!("shell could not start: {e}")))?;
+    // **印が無い実行は、終了コードが0でも合格にしない**（無言のシェル。`PROBE_RAN_MARKER`のdoc）。
+    if let ProbeOutcome::SilentShell { code } = judge_probe(PROBE_RAN_MARKER, &stdout, code) {
+        return Err(AppContainerError::Preflight(format!(
+            "the shell ({shell}) exited with code {code} without running the probe script at all \
+             (no '{PROBE_RAN_MARKER}' on stdout); its exit code says nothing about workspace FS I/O"
+        )));
+    }
     if code == FS_PROBE_DENIED_EXIT_CODE {
         return Err(AppContainerError::Preflight(
             "workspace FS I/O denied inside AppContainer (likely missing traverse ACE on \
@@ -120,7 +271,7 @@ pub(crate) fn smoke_test_harness_control_write_denied(
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            CONTROL_DIR_WRITE_DENY_PROBE_COMMAND,
+            &control_dir_write_deny_probe_command(),
         ],
         workspace_root,
         &env,
@@ -135,11 +286,20 @@ pub(crate) fn smoke_test_harness_control_write_denied(
             ".harness write-deny probe shell could not start: {e}"
         ))
     })?;
-    let (_, _, code) = child.write_stdin_read_output_and_wait(None).map_err(|e| {
+    let (stdout, _, code) = child.write_stdin_read_output_and_wait(None).map_err(|e| {
         AppContainerError::Preflight(format!(
             ".harness write-deny probe shell could not start: {e}"
         ))
     })?;
+    // **拒否側のプローブこそ印が要る。** このプローブは「書けなかった＝catch枝＝`exit 0`」で
+    // 合格にするので、印が無いと**1行も走らなかったシェル**が最も確実に合格する（B-35の裏返し）。
+    if let ProbeOutcome::SilentShell { code } = judge_probe(PROBE_RAN_MARKER, &stdout, code) {
+        return Err(AppContainerError::Preflight(format!(
+            ".harness write-deny probe: the shell ({shell}) exited with code {code} without \
+             running the probe script at all (no '{PROBE_RAN_MARKER}' on stdout); this is not \
+             evidence that .harness is protected"
+        )));
+    }
     if code == 0 {
         return Ok(());
     }
@@ -561,6 +721,81 @@ pub(crate) fn required_inherit_flags(scope: GrantScope) -> u8 {
 }
 
 #[cfg(test)]
+mod probe_verdict_tests {
+    use super::*;
+
+    /// 印があれば走った——終了コードの意味はプローブごとに違うので、そのまま運ぶ。
+    #[test]
+    fn a_marked_run_is_reported_with_its_exit_code() {
+        assert_eq!(
+            judge_probe(PROBE_RAN_MARKER, &format!("{PROBE_RAN_MARKER}\r\n"), 0),
+            ProbeOutcome::Ran { code: 0 }
+        );
+        // FS I/Oプローブの「シェルは走ったがFSが拒否された」（exit 3）は**シェルの不合格ではない**。
+        // ここを`SilentShell`と混ぜると、環境の問題でシェルを取り替えることになる。
+        assert_eq!(
+            judge_probe(
+                PROBE_RAN_MARKER,
+                &format!("{PROBE_RAN_MARKER}\r\n"),
+                FS_PROBE_DENIED_EXIT_CODE
+            ),
+            ProbeOutcome::Ran {
+                code: FS_PROBE_DENIED_EXIT_CODE
+            }
+        );
+    }
+
+    /// **この判定が本題**（§S1b）。何も実行せずに`exit 0`したシェルは、終了コードだけを
+    /// 見れば合格に見える。印が無い以上、その0は「拒否されなかった」ことすら意味しない。
+    #[test]
+    fn a_shell_that_exits_zero_without_running_anything_is_not_a_pass() {
+        assert_eq!(
+            judge_probe(PROBE_RAN_MARKER, "", 0),
+            ProbeOutcome::SilentShell { code: 0 }
+        );
+        // 起動時ノイズだけを吐いて終わった場合も同じ（他人の出力は印にならない、B-33）。
+        assert_eq!(
+            judge_probe(
+                PROBE_RAN_MARKER,
+                "Attempting to perform the InitializeDefaultDrives operation\r\n",
+                0
+            ),
+            ProbeOutcome::SilentShell { code: 0 }
+        );
+    }
+
+    /// 印が無ければ、終了コードが何であっても不合格側へ倒す（0以外でも同じ扱い）。
+    #[test]
+    fn a_nonzero_exit_without_the_marker_is_also_a_silent_shell() {
+        assert_eq!(
+            judge_probe(PROBE_RAN_MARKER, "some error text", 1),
+            ProbeOutcome::SilentShell { code: 1 }
+        );
+    }
+
+    /// 印は**プローブのコマンド文字列そのもの**へ埋め込まれていること（B-05: 綴りを
+    /// 2箇所に書き分けない）。ここが外れると、判定は永遠に`SilentShell`を返す。
+    #[test]
+    fn every_probe_command_emits_the_marker_it_is_judged_by() {
+        for command in [
+            fs_io_probe_command(),
+            control_dir_write_deny_probe_command(),
+            String::from_utf8(shell_selection_probe_stdin()).expect("probe stdin is utf-8"),
+        ] {
+            assert!(
+                command.contains(PROBE_RAN_MARKER),
+                "プローブのコマンドが印を出していない: {command}"
+            );
+        }
+        // FS I/Oプローブの拒否コードも、コマンド側とRust側で同じ値でなければならない。
+        assert!(
+            fs_io_probe_command().contains(&format!("exit {FS_PROBE_DENIED_EXIT_CODE}")),
+            "拒否コードの綴りがコマンドと定数でずれている"
+        );
+    }
+}
+
+#[cfg(test)]
 mod batch_probe_tests {
     use super::*;
 
@@ -665,5 +900,68 @@ mod batch_probe_tests {
         assert!(results[0]
             .as_deref()
             .is_some_and(|m| m.contains("unrecognized")));
+    }
+}
+
+#[cfg(test)]
+mod shell_selection_real_machine_tests {
+    use super::*;
+
+    /// **実機**: この機のTier2aシェルが、実際にAppContainer内で走るものに決まること。
+    ///
+    /// 単体テストでは「候補の並び」と「判定」しか測れない（どちらもプロセスを起こさない）。
+    /// 決めているのは実プローブなので、選択が実際に成立することはここでしか測れない。
+    ///
+    /// **昇格して走らせないこと**——昇格したテストからAppContainer子を起こすと親トークンが
+    /// 管理者のものになり、実運用とは別の世界を測る（B-08、BUG-109と同型）。
+    ///
+    /// ```text
+    /// cargo test -p harness-sandbox --lib -- --ignored --test-threads=1 --nocapture \
+    ///     shell_selection_real_machine_tests
+    /// ```
+    #[test]
+    #[ignore = "spawns real AppContainer children; run NON-elevated with --test-threads=1"]
+    fn the_selected_shell_is_pwsh7_when_this_machine_has_one() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        preflight(workspace.path(), &[], None, &WorkspaceWriteMode::DirectRw).expect("preflight");
+        grant_job::wait_until_done().expect("background grant job");
+
+        let (shell, label) = resolve_shell();
+        println!("[shell selection] selected {label} ({shell})");
+
+        // **対で見る**（B-35）——pwshがある機では選ばれ、無い機では5.1が選ばれる。
+        // 片側だけを固定すると、選択機構が死んでいても（常に5.1でも）緑になる。
+        match which::which("pwsh") {
+            Ok(pwsh) => assert_eq!(
+                label,
+                PWSH_LABEL,
+                "pwshが{}に在るのに5.1へ落ちた。preflightのwarningsに理由が出ているはず",
+                pwsh.display()
+            ),
+            Err(_) => assert_eq!(
+                label, POWERSHELL51_LABEL,
+                "pwshが無い機では5.1が選ばれなければならない"
+            ),
+        }
+
+        // 選ばれたシェルが**実際にworkspaceのFS I/Oまで通る**こと（preflight本体と同じ判定を、
+        // 選択後の状態でもう一度当てる。ここが通れば`run_shell`も同じexeで走る）。
+        let sid = ensure_profile(&crate::tier2a::session_profile::current_profile_name())
+            .expect("session profile");
+        let workspace_cap = super::super::workspace_capability_sid(
+            &workspace.path().canonicalize().unwrap_or_default(),
+            "rwx",
+        )
+        .expect("workspace capability");
+        let probe_dir = workspace.path().join(".harness-shell-selection-probe");
+        std::fs::create_dir_all(&probe_dir).expect("probe dir");
+        let result = smoke_test_spawn(
+            sid.as_psid(),
+            Some(workspace_cap.as_psid()),
+            workspace.path(),
+            &probe_dir,
+        );
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        result.expect("the selected shell must pass the same FS I/O probe preflight uses");
     }
 }
