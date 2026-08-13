@@ -826,6 +826,49 @@ pub fn fix_descendants_missing_ace(
     Ok(report)
 }
 
+/// `root`の**直下**（深さ1）のうち、`sid`へアクセスが届いていないものを1件だけ返す
+/// （届いていなければ`Some(そのパス)`、全部届いていれば`None`）。
+///
+/// **[BUG-110] 台帳の「検証済み」を実体側から裏取りするための検算である。**
+/// 台帳が答えられるのは「以前このrootを検証し、rootが入れ替わっていない」までで、
+/// 「いま実際にACEが載っているか」は別の事実である（`B-14`: 台帳の存在で実体の存在を
+/// 代替しない）。ここが1件でも見つければ`preflight`は背景ジョブを回し直す。
+///
+/// **判定は救済walkと同じ述語**（[`sid_effective_ace_mask`]）を使う。別の述語で書くと
+/// 「検算は欠けていると言うのに、修正側は足りていると言う」状態になり、**毎起動で
+/// O(ファイル数)のジョブが回り続ける**（`B-05`: コンパイラが守らない複製）。
+///
+/// 深さ1だけを見るのは費用の判断である——rootの継承ACEが届いていない事態は、たいてい
+/// 「ツリーごと入れ替わった」「継承が張られる前に置かれた」のどちらかで、どちらも直下に
+/// 現れる。全走査はジョブ本体（フェーズ1）の仕事で、ここはその起動判定に過ぎない。
+///
+/// `skip`配下は対象外（`preflight`は`.harness/`を渡す——**意図的にACEを剥がしている場所**
+/// なので、ここで数えると毎回ジョブが回る）。DACLを読めなかったノードは
+/// **届いていない側**へ倒す（読めない理由がACL不足のこともある）。
+pub(crate) fn top_level_child_missing_ace(
+    root: &Path,
+    sid: PSID,
+    skip: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if skip.iter().any(|s| path_is_within(&path, s)) {
+            continue;
+        }
+        // symlink/リパースポイントは辿らない（`collect_dirs_and_files`と同じガード）。
+        // 付与側が触らないものを、検算側だけが数えてはいけない。
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+            continue;
+        }
+        match sid_effective_ace_mask(&path, sid) {
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return Some(path),
+        }
+    }
+    None
+}
+
 /// [`fix_descendants_missing_ace`]の結果。件数だけでは追えない事象（「どのノードが継承から
 /// 漏れたのか」）のために`samples`も持つ——BUG-081の調査では、この数件のパスが原因特定の
 /// 決め手だった。

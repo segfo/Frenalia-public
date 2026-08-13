@@ -52,6 +52,51 @@ pub fn wait_for_process_exit(pid: u32, timeout_ms: u32) -> bool {
     }
 }
 
+/// ディレクトリ**そのもの**（パスではなく実体）を一意に指す識別子。
+/// `<ボリュームシリアル>-<ファイルID>`の16進表現。
+///
+/// **なぜ要るか**（[BUG-110](../../docs/bugs/BUG-110.md)）: 台帳が持つ「このツリーについて
+/// 〜を済ませた」という記録は、**その時点のツリー**についての事実である。同じパスでも
+/// 削除して作り直せば別のオブジェクトで、前の記録は当てはまらない。パスだけを鍵にした
+/// 記録は、その瞬間から嘘になる。
+///
+/// **作成時刻では代用できない。** Windowsのfile tunnelingは、同じ名前で15秒以内に
+/// 作り直したファイル/ディレクトリへ元の作成時刻（と8.3短縮名）を引き継がせる。
+/// 一方`nFileIndex`はMFTレコード番号＋シーケンス番号なので、作り直せば必ず変わる。
+///
+/// 開くのは`FILE_READ_ATTRIBUTES`のみ（内容は読まない）で、共有は全許可
+/// ——ここで対象を掴んだまま他の書込を止めると、呼び出し元の意図しない排他になる。
+pub(crate) fn directory_identity(path: &std::path::Path) -> windows::core::Result<String> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let path_w = long_path_wide(path);
+    unsafe {
+        // `FILE_FLAG_BACKUP_SEMANTICS`が無いとディレクトリは開けない（ファイル用の
+        // `CreateFileW`はディレクトリに対して`ERROR_ACCESS_DENIED`を返す）。
+        let handle = CreateFileW(
+            PCWSTR(path_w.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        let result = GetFileInformationByHandle(handle, &mut info);
+        let _ = CloseHandle(handle);
+        result?;
+        let file_id = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+        Ok(format!(
+            "{:08x}-{:016x}",
+            info.dwVolumeSerialNumber, file_id
+        ))
+    }
+}
+
 /// パスをそのまま`wide`へ渡すと、Win32 ACL API（`GetNamedSecurityInfoW`/`SetNamedSecurityInfoW`
 /// 等）は`MAX_PATH`（260文字）を超えるパスを`ERROR_INVALID_NAME`（0x8007007B）で拒否する
 /// （BUG-028）。`\\?\`ロングパス接頭辞（既に付いている場合・UNCパスの場合は付け直さない）を

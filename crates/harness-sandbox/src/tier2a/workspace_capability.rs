@@ -84,14 +84,32 @@ pub struct WorkspaceCapabilityEntry {
     /// ACLに出るSIDと突き合わせられるように保存しておく。
     pub capability_name: String,
     pub granted_at_unix_secs: u64,
-    /// 継承が届かなかった既存子孫の救済walk（`acl_grant::fix_descendants_missing_ace`）を
-    /// **最後まで完走した**時刻。`None`なら未完了で、次の起動がもう一度walkする。
+    /// 背景ジョブ（`win_appcontainer::grant_job`のフェーズ0＝既存子孫への継承ACE伝播、
+    /// 0.5＝`.harness/`再保護、1＝救済walk）を**最後まで完走した**時刻。`None`なら未完了で、
+    /// 次の起動がもう一度回す。
     ///
-    /// **「rootにACEが載っているか」では代用できない。** rootへの付与とwalkは別の段で、
+    /// **「rootにACEが載っているか」では代用できない。** rootへの付与とジョブは別の段で、
     /// 間で落ちる（クラッシュ・強制終了）ことがある。rootだけを見て判断すると、その一度の
     /// 中断で保護DACL配下が永久に到達不能なまま固定される。完走を別に記録するのはそのため。
+    ///
+    /// **[BUG-110] この時刻だけでは足りない**——記録しているのは「**そのとき在ったツリー**を
+    /// 検証した」であって「このパスは以後ずっと検証済み」ではない。対になる
+    /// [`Self::root_file_id`]と**必ず一緒に**読み書きすること。
     #[serde(default)]
     pub tree_verified_at_unix_secs: Option<u64>,
+    /// [BUG-110] [`Self::tree_verified_at_unix_secs`]を立てたとき、rootが**どのオブジェクト
+    /// だったか**（`win_common::directory_identity`）。
+    ///
+    /// workspaceディレクトリを削除して同じパスへ作り直すと、rootは別のオブジェクトになり
+    /// 中身も総入れ替えになる。それでも旧・実装は「パスとモードが同じなら検証済み」と
+    /// 判定し、伝播フェーズごと丸ごと省略していた——その結果、**起動前から在ったファイルが
+    /// サンドボックスから一切見えない**workspaceが出来上がる（拒否ではなく「無い」に見えるので
+    /// 気付けない）。
+    ///
+    /// `None`（この欄が無かった頃の台帳）は**未検証として扱う**。1回だけ余計にジョブが回る
+    /// のに対し、誤って検証済みと信じると到達不能なツリーで走り続ける。
+    #[serde(default)]
+    pub root_file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -209,9 +227,29 @@ fn ensure_capability_name_in(
             capability_name: name.clone(),
             granted_at_unix_secs: now_unix_secs(),
             tree_verified_at_unix_secs: None,
+            root_file_id: None,
         });
         Ok(name)
     })
+}
+
+/// [BUG-110] workspaceのrootディレクトリ**そのもの**の識別子。取得できなければ`None`
+/// （消えている・開けない）で、その場合は常に「未検証」側へ倒れる。
+///
+/// Windows以外はinode＋デバイス番号で同じ意味を作る（この機構自体はWindows専用だが、
+/// 台帳の判定ロジックは全プラットフォームでテストできる状態を保つ）。
+fn root_identity(workspace: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        crate::win_common::directory_identity(workspace).ok()
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(workspace)
+            .ok()
+            .map(|m| format!("{:08x}-{:016x}", m.dev(), m.ino()))
+    }
 }
 
 fn tree_is_verified_in(
@@ -220,16 +258,33 @@ fn tree_is_verified_in(
     mode: &str,
 ) -> bool {
     let key = workspace_key(workspace);
-    ledger
+    let Some(entry) = ledger
         .load()
         .entries
-        .iter()
+        .into_iter()
         .find(|e| workspace_key(Path::new(&e.workspace)) == key && e.mode == mode)
-        .is_some_and(|e| e.tree_verified_at_unix_secs.is_some())
+    else {
+        return false;
+    };
+    if entry.tree_verified_at_unix_secs.is_none() {
+        return false;
+    }
+    // [BUG-110] 記録が指しているのは「**そのとき在ったツリー**」である。rootが別のオブジェクト
+    // に入れ替わっていたら、その記録はこのツリーについて何も言っていない。
+    // 旧台帳（`None`）と、いま識別子を取れない場合（`None`）は、どちらも未検証扱い。
+    match (&entry.root_file_id, root_identity(workspace)) {
+        (Some(recorded), Some(current)) => recorded == &current,
+        _ => false,
+    }
 }
 
-/// 救済walkが完走済みか（[`WorkspaceCapabilityEntry::tree_verified_at_unix_secs`]参照）。
-/// `false`なら呼び出し側（`preflight`）はwalkを回す。
+/// 背景ジョブ（伝播＋救済walk）が完走済みか（[`WorkspaceCapabilityEntry::tree_verified_at_unix_secs`]
+/// と[`WorkspaceCapabilityEntry::root_file_id`]の**両方**を見る）。
+/// `false`なら呼び出し側（`preflight`）はジョブを回す。
+///
+/// **これは「このツリーは到達可能か」の答えではない**——答えているのは「以前このrootを
+/// 検証し、それ以来rootが入れ替わっていない」までである。実際にACEが載っているかは
+/// `acl_grant::top_level_children_missing_ace`が別途測る（`preflight`は両方を見る、BUG-110）。
 pub fn tree_is_verified(workspace: &Path, mode: &str) -> bool {
     tree_is_verified_in(&ledger(), workspace, mode)
 }
@@ -237,6 +292,9 @@ pub fn tree_is_verified(workspace: &Path, mode: &str) -> bool {
 fn mark_tree_verified_in(ledger: &Ledger<WorkspaceCapabilityLedger>, workspace: &Path, mode: &str) {
     let key = workspace_key(workspace);
     let now = now_unix_secs();
+    // [BUG-110] 「いつ」と「何を」は対で書く。片方だけ更新すると、次回の判定が
+    // 古い識別子と新しい時刻を突き合わせることになる。
+    let identity = root_identity(workspace);
     ledger.update(|l| {
         if let Some(entry) = l
             .entries
@@ -244,16 +302,17 @@ fn mark_tree_verified_in(ledger: &Ledger<WorkspaceCapabilityLedger>, workspace: 
             .find(|e| workspace_key(Path::new(&e.workspace)) == key && e.mode == mode)
         {
             entry.tree_verified_at_unix_secs = Some(now);
+            entry.root_file_id = identity.clone();
         }
     });
 }
 
-/// 救済walkの完走を記録する。**walkが`Ok`で終わったときだけ**呼ぶこと——途中で失敗した
-/// のに記録すると、以後どの起動もwalkし直さなくなる。
+/// 背景ジョブの完走を記録する。**ジョブが`Ok`で終わったときだけ**呼ぶこと——途中で失敗した
+/// のに記録すると、以後どの起動もやり直さなくなる。
 ///
 /// 該当エントリが無ければ何もしない。実運用ではあり得ない（付与の主体を得る
 /// [`ensure_capability_name`]が必ず先に走ってエントリを作る）が、順序を逆にした呼び出しは
-/// **黙って記録されない**——つまり次回もwalkする側（安全側）へ倒れる。
+/// **黙って記録されない**——つまり次回もジョブを回す側（安全側）へ倒れる。
 pub fn mark_tree_verified(workspace: &Path, mode: &str) {
     mark_tree_verified_in(&ledger(), workspace, mode);
 }
@@ -499,17 +558,21 @@ mod tests {
     }
 
     /// 新しいエントリは未検証で始まり、明示的に記録するまで`false`のまま。
+    ///
+    /// **workspaceは実在するディレクトリでなければならない**——[BUG-110]以降、検証済みの
+    /// 判定はrootの識別子の一致まで見るためである。
     #[test]
     fn a_new_entry_starts_unverified_and_can_be_marked() {
         let tmp = tempfile::tempdir().unwrap();
         let l = test_ledger(tmp.path());
-        let ws = Path::new("C:\\work\\repo");
-        ensure_capability_name_in(&l, ws, "rwx").unwrap();
-        assert!(!tree_is_verified_in(&l, ws, "rwx"));
-        mark_tree_verified_in(&l, ws, "rwx");
-        assert!(tree_is_verified_in(&l, ws, "rwx"));
+        let ws = tmp.path().join("repo");
+        std::fs::create_dir(&ws).unwrap();
+        ensure_capability_name_in(&l, &ws, "rwx").unwrap();
+        assert!(!tree_is_verified_in(&l, &ws, "rwx"));
+        mark_tree_verified_in(&l, &ws, "rwx");
+        assert!(tree_is_verified_in(&l, &ws, "rwx"));
         // モードが違えば別の検証状態（ROツリーはRWXの完走を借りられない）。
-        assert!(!tree_is_verified_in(&l, ws, "ro"));
+        assert!(!tree_is_verified_in(&l, &ws, "ro"));
     }
 
     /// 台帳を書き直しても検証済みマークが落ちないこと（`ensure`は冪等で、既存エントリを
@@ -518,19 +581,89 @@ mod tests {
     fn re_ensuring_the_name_does_not_clear_the_verified_mark() {
         let tmp = tempfile::tempdir().unwrap();
         let l = test_ledger(tmp.path());
-        let ws = Path::new("C:\\work\\repo");
-        ensure_capability_name_in(&l, ws, "rwx").unwrap();
-        mark_tree_verified_in(&l, ws, "rwx");
-        ensure_capability_name_in(&l, ws, "rwx").unwrap();
-        assert!(tree_is_verified_in(&l, ws, "rwx"));
+        let ws = tmp.path().join("repo");
+        std::fs::create_dir(&ws).unwrap();
+        ensure_capability_name_in(&l, &ws, "rwx").unwrap();
+        mark_tree_verified_in(&l, &ws, "rwx");
+        ensure_capability_name_in(&l, &ws, "rwx").unwrap();
+        assert!(tree_is_verified_in(&l, &ws, "rwx"));
     }
 
-    /// 既存の台帳ファイル（`tree_verified_at_unix_secs`が無い）をそのまま読めること。
+    /// **[BUG-110]の回帰**: 同じパスへ作り直したworkspaceは、もう検証済みではない。
+    ///
+    /// これがE2E（`tier2a_cow_commit_matrix`のN・P〜S）で実際に起きた形をそのまま縮めたもの
+    /// である——テストが`case_dir()`でworkspaceを毎回削除・再作成するため、2回目以降は
+    /// 「検証済み」と判定されて背景ジョブ（＝既存子孫への継承ACE伝播）が丸ごと省略され、
+    /// 起動**前**に置いたファイルがサンドボックスから一切見えなくなっていた。
+    ///
+    /// 判定からroot識別子の比較を外すと、ここが赤くなる。
+    #[test]
+    fn a_workspace_recreated_at_the_same_path_is_no_longer_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = test_ledger(tmp.path());
+        let ws = tmp.path().join("repo");
+        std::fs::create_dir(&ws).unwrap();
+        ensure_capability_name_in(&l, &ws, "rwx").unwrap();
+        mark_tree_verified_in(&l, &ws, "rwx");
+        assert!(tree_is_verified_in(&l, &ws, "rwx"));
+
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::create_dir(&ws).unwrap();
+        assert!(
+            !tree_is_verified_in(&l, &ws, "rwx"),
+            "パスは同じでも別のディレクトリオブジェクトなので、以前の検証は当てはまらない"
+        );
+
+        // 作り直した側で回し直せば、また検証済みになる（片道の劣化にしない）。
+        mark_tree_verified_in(&l, &ws, "rwx");
+        assert!(tree_is_verified_in(&l, &ws, "rwx"));
+    }
+
+    /// workspaceごと消えていれば、記録が何であれ未検証（識別子を取れない＝安全側）。
+    #[test]
+    fn a_vanished_workspace_is_never_reported_as_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = test_ledger(tmp.path());
+        let ws = tmp.path().join("repo");
+        std::fs::create_dir(&ws).unwrap();
+        ensure_capability_name_in(&l, &ws, "rwx").unwrap();
+        mark_tree_verified_in(&l, &ws, "rwx");
+        std::fs::remove_dir_all(&ws).unwrap();
+        assert!(!tree_is_verified_in(&l, &ws, "rwx"));
+    }
+
+    /// 既存の台帳ファイル（`tree_verified_at_unix_secs`・`root_file_id`が無い）を
+    /// そのまま読めること。**読めるだけでなく、検証済みとは扱わない**——[BUG-110]以前の
+    /// 台帳は「どのツリーを検証したか」を持っていないので、その主張は検算できない。
     #[test]
     fn a_ledger_file_without_the_verified_field_still_deserializes() {
         let legacy = r#"{"entries":[{"workspace":"C:\\ws","mode":"rwx","secret_hex":"00","capability_name":"harnessWs00","granted_at_unix_secs":1}]}"#;
         let ledger: WorkspaceCapabilityLedger = serde_json::from_str(legacy).unwrap();
         assert_eq!(ledger.entries[0].tree_verified_at_unix_secs, None);
+        assert_eq!(ledger.entries[0].root_file_id, None);
+    }
+
+    /// [BUG-110] 旧台帳（`tree_verified_at_unix_secs`はあるが`root_file_id`が無い）は
+    /// **未検証**として扱う。1回だけ余計にジョブが回るのに対し、誤って検証済みと信じると
+    /// 到達不能なツリーで走り続ける。
+    #[test]
+    fn an_old_ledger_entry_without_a_root_id_is_treated_as_unverified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("repo");
+        std::fs::create_dir(&ws).unwrap();
+        let l = test_ledger(tmp.path());
+        l.update(|entries| {
+            entries.entries.push(WorkspaceCapabilityEntry {
+                workspace: ws.to_string_lossy().into_owned(),
+                mode: "rwx".to_string(),
+                secret_hex: "00".to_string(),
+                capability_name: "harnessWs00".to_string(),
+                granted_at_unix_secs: 1,
+                tree_verified_at_unix_secs: Some(2),
+                root_file_id: None,
+            });
+        });
+        assert!(!tree_is_verified_in(&l, &ws, "rwx"));
     }
 
     /// 秘密が実際にランダムであること（同じ入力から2つの名前を作って一致しない）。

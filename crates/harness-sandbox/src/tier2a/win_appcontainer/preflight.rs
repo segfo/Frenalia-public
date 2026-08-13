@@ -373,13 +373,40 @@ pub fn preflight_with_privhelper_launcher(
         "protect_harness_control_dir_from_appcontainer ({protected_nodes} nodes)"
     ));
 
-    // 保護DACL（BUG-020の残存損害等）で継承が届かなかった既存子孫の救済が要るか。
-    // **ワークスペースにつき一度きり**で、実行は`preflight`の最後（他のACL作業を全て終えた後）に
-    // 背景スレッドへ委ねる（`grant_job`のdoc「DACL書込の競合を避けるための約束」）。
+    // 既存子孫への継承ACE伝播（フェーズ0）と、保護DACL（BUG-020の残存損害等）で継承が
+    // 届かなかったノードの救済（フェーズ1）が要るか。**ワークスペースにつき一度きり**で、
+    // 実行は`preflight`の最後（他のACL作業を全て終えた後）に背景スレッドへ委ねる
+    // （`grant_job`のdoc「DACL書込の競合を避けるための約束」）。
+    //
+    // [BUG-110] 判定は**2つの向きから**行う。台帳（記録）だけを見ていたために、
+    // workspaceを削除して同じパスへ作り直したツリーが「検証済み」と判定され、伝播が
+    // 丸ごと省略されていた——起動**前**から在ったファイルがサンドボックスから一切見えない
+    // workspaceが出来上がる。
+    //
+    // 1. 記録の側: `tree_is_verified`（完走時刻＋**そのとき検証したrootの識別子**）
+    // 2. 実体の側: root直下に、capability SIDへアクセスが届いていないノードが無いか
+    //
+    // 2はO(root直下の件数)の読取だけで、実測でも数msである。1が通っても2で見つかったら
+    // 回す（`B-14`: 台帳の存在で実体の存在を代替しない）。
+    //
+    // `.harness/`を外す集合は、下の`grant_job::start`へ渡す`skip`と**同じ値**でなければ
+    // ならない——ジョブが意図的にACEを付けない場所を検算側が数えると、毎起動でジョブが
+    // 回り続ける（`B-05`）。だから両者は同じ変数を読む。
+    let job_skip = vec![workspace_root.join(".harness")];
+    let unreachable_child =
+        top_level_child_missing_ace(workspace_root, workspace_cap.as_psid(), &job_skip);
     let needs_descendant_fix = !crate::tier2a::workspace_capability::tree_is_verified(
         &canonical_workspace_root,
         workspace_mode,
-    );
+    ) || unreachable_child.is_some();
+    // 記録は「検証済み」なのに実体が届いていない、は**説明の要る状態**である（B-10:
+    // 無言で直さない）。ジョブを回して直すが、直したこと自体は残す。
+    if let Some(child) = &unreachable_child {
+        timing.mark(&format!(
+            "workspace ACL re-check: {} is not reachable by the workspace capability",
+            child.display()
+        ));
+    }
 
     // workspace_root（Cow時はupper_dirも）の祖先traverseチェーンが不足していないか事前に判定する
     // （読み取り専用、UAC無し）。不足分は下のfs-allow昇格要求と合流させ、1回のprivhelper呼び出し
@@ -951,7 +978,9 @@ pub fn preflight_with_privhelper_launcher(
             workspace_cap,
             workspace_mask,
             harness_protect_sids,
-            vec![workspace_root.join(".harness")],
+            // 上の`top_level_child_missing_ace`と**同じ集合**（`B-05`。ここがずれると、
+            // ジョブが意図的に外した場所を検算側が数えて毎起動でジョブが回る）。
+            job_skip,
             &canonical_workspace_root,
             workspace_mode,
         );

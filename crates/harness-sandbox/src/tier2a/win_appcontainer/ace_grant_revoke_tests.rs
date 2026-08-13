@@ -1085,6 +1085,78 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
     crate::tier2a::workspace_capability::forget_capability(&root, "");
 }
 
+/// [[BUG-110](../../../../docs/bugs/BUG-110.md)の回帰] **起動前から在ったファイルが
+/// サンドボックスから見えているか**を、`preflight`が実体側から検算できること。
+///
+/// これは実際に起きた形そのものである——workspaceを削除して同じパスへ作り直すと、
+/// 台帳の「検証済み」はパスとモードだけを鍵にしていたため成立したままで、既存子孫への
+/// 継承ACE伝播（背景ジョブのフェーズ0）が丸ごと省略されていた。rootにはACEが載るので
+/// tier判定もsmoke testも通り、**起動前に置いたファイルだけがサンドボックスから
+/// `ACCESS_DENIED`になる**（モデルには「無い」に見える）。E2Eの
+/// `tier2a_cow_commit_matrix`のN・P〜Sが2026-08-08以降ずっとこれで落ちていた。
+///
+/// 対で測る（B-35）——伝播**前**は名指しで見つけ、伝播**後**は見つけないこと。
+/// 片側だけだと、常に`Some`を返す実装（＝毎起動で伝播をやり直す）も緑になる。
+///
+/// 台帳には触れない（主体は使い捨てのcapability名から導出する）ので、通常の
+/// `cargo test`で走る常設の網である。
+#[test]
+fn a_file_that_predates_the_root_grant_is_reported_until_the_propagation_reaches_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    // このテスト専用の主体。実マシンの台帳にも他のツリーにも痕跡が無いので、
+    // 「付与前は届いていない」を前提にできる。
+    let sid = capability_sid_from_name(&format!("harnessBug110Probe{}", std::process::id()))
+        .expect("derive a throwaway capability SID");
+
+    // 起動**前**から在るファイル（E2Eの`seed.txt`/`notes.txt`に相当）と、
+    // 意図的にACEを付けない制御面（`.harness/`）。
+    let seed = root.join("seed.txt");
+    std::fs::write(&seed, b"predates the grant").expect("seed file");
+    let control_dir = root.join(".harness");
+    std::fs::create_dir_all(&control_dir).expect("create .harness");
+    std::fs::write(control_dir.join("settings.json"), "{}\n").expect("seed .harness file");
+    let skip = vec![control_dir.clone()];
+
+    // `preflight`の同期区間と同じ: rootへ**伝播なし**の継承ACEを付ける。
+    grant_workspace_root_rw_fast(&root, sid.as_psid()).expect("grant_workspace_root_rw_fast");
+
+    // 伝播前——rootは付いているのに、既存の子は届いていない。**これが検知したい状態**。
+    assert_eq!(
+        top_level_child_missing_ace(&root, sid.as_psid(), &skip).as_deref(),
+        Some(seed.as_path()),
+        "the fast (single-object) root grant does not reach existing descendants, so the \
+         pre-existing file must be named here -- if this is None, preflight has no way to notice \
+         that the workspace is unreachable and will skip the propagation forever (BUG-110)"
+    );
+
+    // 背景ジョブのフェーズ0と同じ呼び出し。
+    propagate_workspace_root_grant(&root, sid.as_psid(), workspace_rwx_mask())
+        .expect("propagate_workspace_root_grant");
+
+    // 伝播後——実効アクセスが届き、検算も何も見つけない（＝次の起動はジョブを回さない）。
+    assert!(
+        sid_effective_ace_mask(&seed, sid.as_psid())
+            .expect("probe the seed file after propagation")
+            .is_some(),
+        "the propagation phase must reach the pre-existing file"
+    );
+    assert_eq!(
+        top_level_child_missing_ace(&root, sid.as_psid(), &skip),
+        None,
+        "once the propagation has run, the check must stop firing -- otherwise every startup \
+         re-runs the O(files) job forever"
+    );
+
+    // `skip`が効いていること: `.harness/`は**意図的に**ACEを剥がす場所なので、ここを
+    // 数えると毎起動でジョブが回る。伝播でACEが届いていても報告しない。
+    assert_eq!(
+        top_level_child_missing_ace(&root, sid.as_psid(), &skip),
+        None,
+        ".harness/ must be excluded from the check by the same skip list the job uses"
+    );
+}
+
 /// [S1スパイク] Tier3のSMB使い捨てワークスペース共有（`crates/harness-sandbox/src/
 /// smb_share.rs`、未コミット作業中）が使い捨てローカルアカウントへNTFSアクセス権を
 /// 付与する手段として`grant_ace_inheritable_rw`/`revoke_ace`を再利用できるかを検証する。
