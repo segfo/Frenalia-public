@@ -152,7 +152,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
     lines.push(render_git_hardening());
     lines.push(render_read_scope(read_scope));
     lines.extend(render_shell_tier(shell_tier));
-    if let Some(line) = render_net_proxy(net_proxy) {
+    if let Some(line) = render_net_proxy(net_proxy, shell_tier.tier) {
         lines.push(line);
     }
     if let Some(line) = render_net_app(net_app) {
@@ -504,7 +504,20 @@ fn tier_line(tier: ShellTier) -> String {
     }
 }
 
-fn render_net_proxy(net_proxy: &NetProxyConfig) -> Option<String> {
+/// ドメインポリシーの実効状態を1文で宣言する。**Tierを引数に取るのは、同じ
+/// `enforced_by_wfp == false`が Tier2a とそれ以外とで正反対の意味になるため**である。
+///
+/// - Tier2a以外（Tier0/Tier1）: 協調プロキシは環境変数ベースの誘導にすぎず、生ソケットを
+///   開く子プロセスは素通りできる（＝「強制ではない」が正しい）。
+/// - Tier2a: `should_grant_tier2a_network_capability`
+///   （`crates/harness-tools/src/shell/net_decision.rs`）が`NetworkCapability::Deny`を選ぶため、
+///   子プロセスはソケットを1つも作れない。素通りできるどころか協調プロキシへのloopback到達
+///   すらできない（＝「強制ではない」は正反対の誤り）。
+///
+/// この区別を落とすと、モデルは「通信はできるが監査されるだけ」と誤解して通信コマンドを
+/// 発行し続け、さらにユーザーへ安全性を実態より弱く報告する。同じ誤りが起動時警告側にも
+/// あった（`crates/harness-cli/src/cli/startup/mod.rs`の`TIER2A_NET_DENIED`）。
+fn render_net_proxy(net_proxy: &NetProxyConfig, tier: ShellTier) -> Option<String> {
     let NetProxyConfig {
         allow_domains,
         domain_policy_enabled,
@@ -520,6 +533,17 @@ fn render_net_proxy(net_proxy: &NetProxyConfig) -> Option<String> {
     } = net_proxy;
     if !*domain_policy_enabled {
         return None;
+    }
+    if !*enforced_by_wfp && tier == ShellTier::Tier2a {
+        return Some(
+            "ネットワーク: ドメイン制御が要求されましたが、WFPによる強制が確立できませんでした。\
+             この場合Tier2aはネットワークcapability自体を付与しないため、run_shellの子プロセスは\
+             外向き通信を一切行えません（許可ドメイン指定の有無に関わらず、ソケットを1つも\
+             作れません。協調プロキシへのloopback到達もできないため、環境変数を無視して生\
+             ソケットを開いても素通りはできません）。通信を伴うコマンドは再試行しても成功\
+             しないので、ネットワークを使わない方法を選ぶか、ユーザーへ相談してください。"
+                .to_string(),
+        );
     }
     if allow_domains.is_empty() {
         if *enforced_by_wfp {
@@ -896,6 +920,55 @@ mod tests {
         let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
 
         assert!(!rendered.contains("grant-traverse"), "{rendered}");
+    }
+
+    fn net_policy_facts(tier: ShellTier, enforced_by_wfp: bool) -> EnvironmentFacts {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.shell_tier = ShellTierSelection::direct(tier);
+        ctx.net_proxy.domain_policy_enabled = true;
+        ctx.net_proxy.allow_domains = vec!["example.com".to_string()];
+        ctx.net_proxy.enforced_by_wfp = enforced_by_wfp;
+        EnvironmentFacts::from_tool_ctx(&ctx)
+    }
+
+    /// `enforced_by_wfp == false`はTierによって正反対の意味になる。Tier2aでは
+    /// `should_grant_tier2a_network_capability`がcapability自体を落として通信が皆無になるので、
+    /// 「協調プロキシ経由で許可されている」「生ソケットなら素通りできる」と宣言してはいけない。
+    #[test]
+    fn tier2a_without_wfp_enforcement_declares_no_network_at_all() {
+        let rendered = render(&net_policy_facts(ShellTier::Tier2a, false));
+
+        assert!(rendered.contains("外向き通信を一切行えません"), "{rendered}");
+        // 消えているべきもの: 「通信はできるが強制ではない」と読める説明。
+        assert!(!rendered.contains("素通りできます"), "{rendered}");
+    }
+
+    /// 上の裏側（残っているべきもの）。Tier2a以外では協調プロキシの説明が正しいままで
+    /// なければならない——禁止側だけを見るテストは、説明が全Tierで壊れても通ってしまう。
+    #[test]
+    fn non_tier2a_without_wfp_enforcement_keeps_cooperative_proxy_wording() {
+        for tier in [ShellTier::Tier0, ShellTier::Tier1] {
+            let rendered = render(&net_policy_facts(tier, false));
+            assert!(rendered.contains("協調プロキシ"), "{tier:?}: {rendered}");
+            assert!(rendered.contains("素通りできます"), "{tier:?}: {rendered}");
+            assert!(
+                !rendered.contains("外向き通信を一切行えません"),
+                "{tier:?}: {rendered}"
+            );
+        }
+    }
+
+    /// WFPが立っているTier2aは従来どおり「強制」と宣言する（拒否側の文言へ倒れない）。
+    #[test]
+    fn tier2a_with_wfp_enforcement_still_declares_enforced_proxy() {
+        let rendered = render(&net_policy_facts(ShellTier::Tier2a, true));
+
+        assert!(rendered.contains("強制ネットワークプロキシ"), "{rendered}");
+        assert!(rendered.contains("example.com"), "{rendered}");
+        assert!(
+            !rendered.contains("外向き通信を一切行えません"),
+            "{rendered}"
+        );
     }
 
     #[test]

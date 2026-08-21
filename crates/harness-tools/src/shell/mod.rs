@@ -305,8 +305,21 @@ impl Tool for RunShellTool {
             );
         }
         if proxy_addr.is_some() {
-            if ctx.net_proxy.enforced_by_wfp && ctx.shell_tier.tier == ShellTier::Tier2a {
-                content.push_str("\n[net-proxy: enforced-by-wfp]");
+            // `proxy_addr`が立っている＝`domain_policy_enabled`である（`spawn_local_proxy`は
+            // 無効なら`Ok(None)`を返す）。その上で「WFP未成立」の意味はTierで正反対になる——
+            // Tier2aでは`should_grant_tier2a_network_capability`がcapability自体を落とすので、
+            // 「audit-only（＝通信はできるが強制されない）」ではなく通信が皆無になる。
+            // 同じ誤りが起動時警告とシステムプロンプトにもあった。
+            if ctx.shell_tier.tier == ShellTier::Tier2a {
+                if ctx.net_proxy.enforced_by_wfp {
+                    content.push_str("\n[net-proxy: enforced-by-wfp]");
+                } else {
+                    content.push_str(
+                        "\n[net-proxy: unreachable (WFP enforcement unavailable, so Tier2a grants \
+                         no network capability at all; the child cannot open any socket, not even \
+                         to this proxy)]",
+                    );
+                }
             } else {
                 content.push_str("\n[net-proxy: audit-only, not enforced against raw sockets, see plans/DESIGN-SANDBOX-PRIVSEP.md §3.1]");
             }
