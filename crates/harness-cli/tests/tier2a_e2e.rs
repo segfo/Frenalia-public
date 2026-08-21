@@ -2952,3 +2952,170 @@ fn tier2a_fs_ledger_lifecycle() {
         "{passed}/{total} fs ledger lifecycle cases passed (see per-case JSON above)"
     );
 }
+
+/// **N8-③-C-WFP**: 生TCPの445が、**本番Tier2aのWFP適用下**でも塞がるか
+/// （`plans/net-spike/RESULTS.md` `N8-③-C`）。
+///
+/// `N8-③-C`は**素のAppContainerトークン**（netfilterd非適用）で測っており、
+/// `internetClient`を積むと**445へのTCPが張れた**。本番ではWFPの既定拒否が
+/// `FWPM_LAYER_ALE_AUTH_CONNECT_V4/V6`に張られ、条件は`FWPM_CONDITION_ALE_PACKAGE_ID`だけ
+/// （`wfp.rs`の`add_default_deny_filter`は`numFilterConditions: 1`）なので**ポートを見ない**
+/// ——したがって445も塞がるはずである。**「はず」を測る。**
+///
+/// case 05（`example-ip`）が既に生TCPの80番を測っているが、**445は測っていない**。
+/// Windowsが445を特別扱いする経路（別のpermit規則等）が無いことを、ポート番号を変えて確かめる。
+///
+/// **ホストは環境依存なのでファイルで渡す**——`dev-elevated-runner`経由の昇格側プロセスへは
+/// **呼び出し元の環境変数が引き継がれる保証が無い**（`CLAUDE.md`。`tier2a-mock-netfilterd`が
+/// `mock-mode`ファイルを使っているのと同じ理由）。
+///
+/// **`tier2a_net_policy_matrix`のcaseにせず独立させているのは意図である**（漏れではない）。
+/// このテストは`C:\harness-e2e\n8-smb-host.txt`と、そこに書かれたホストの445が開いていること、
+/// という**この開発機の外では保証できない前提**を持つ。行列のcaseにすると、前提が無い環境で
+/// 行列**全体**が落ち、他の10ケースの結果まで読めなくなる。**動作を保証できない前提を
+/// 共有の行列へ持ち込まない**、という切り分けである（`plan-review-gates`検問7）。
+/// 起動は専用の`KNOWN_TARGETS`エントリ`n8-smb445-layer2`だけに紐づけてある。
+#[test]
+#[ignore = "実Tier2a・実WFP。dev-elevated-runnerの n8-smb445-layer2 経由で走らせること"]
+fn tier2a_smb445_layer2() {
+    let host_file = Path::new(CASE_ROOT).join("n8-smb-host.txt");
+    let host = std::fs::read_to_string(&host_file)
+        .unwrap_or_else(|e| {
+            panic!("{} が読めない（445が開いている検証用ホストのIPを1行で置くこと）: {e}", host_file.display())
+        })
+        .trim()
+        .to_string();
+    assert!(!host.is_empty(), "{} が空", host_file.display());
+
+    if let Err(e) = liveness_gate() {
+        panic!("liveness gate failed, the result would be indeterminate: {e}");
+    }
+
+    // --- 対照: **コンテナ外から445へ繋がること**を、**測定と同じ計器で**確かめる。
+    //
+    // 別の手段（`TcpStream::connect_timeout`を直に呼ぶ等）で対照を取ると、
+    // 「ホストの445が開いている」ことしか言えない。**この計器が`ok=true`を返し得ること**が
+    // 未検証のまま残り、計器が常に`false`を返す壊れ方をしても本体のassertは緑になる
+    // （`test-logic-rules`問3: 歯があることを確認していないテストは、緑が合格の証拠にならない）。
+    let outside = std::process::Command::new(net_probe_exe())
+        .args(["raw-connect", &host, "445", "--label", "smb445-outside"])
+        .output()
+        .expect("run the probe outside the container");
+    let outside_text = String::from_utf8_lossy(&outside.stdout).to_string();
+    let outside_ok = outside_text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|v| v.get("probe").and_then(|p| p.as_str()) == Some("raw_connect"))
+        .and_then(|v| v["ok"].as_bool());
+    assert_eq!(
+        outside_ok,
+        Some(true),
+        "対照が落ちた＝**同じ計器**でコンテナ外からも {host}:445 へ繋がらない。\
+         以降の`ok=false`は「WFPが塞いだ」の証拠にならない。out={outside_text}"
+    );
+
+    // --- 本番と同じ経路でTier2aを起動する。`--net-allow-domain`を与えるのは、
+    // network capabilityが`Deny`へ落ちる経路（case 07）を避け、**capabilityは在るのに
+    // WFPが塞ぐ**という一番強い形で測るため。case 10のdocが書いているとおり、
+    // 「`--net-allow-domain`を指定した時点でharnessは子へcapabilityを与えざるを得ず、
+    // 子とインターネット全体の間に立っているのはWFPフィルタだけ」になる。
+    let name = "net-11-smb445";
+    let ws = net_case_ws(name);
+    // **同じ実行の中に陽性対照を置く**（B-29・§18.5）。`raw-connect`が失敗しただけでは
+    // 「WFPが落とした」と「そもそも通信路が死んでいた」を区別できない。プロキシ経由の
+    // example.comが**同じセッションで**通ることを先に見る。
+    let script = format!(
+        ".\\tier2a-net-e2e.exe fetch-url https://example.com/ --label example; \
+         .\\tier2a-net-e2e.exe raw-connect {host} 445 --label smb445"
+    );
+    let run = run_harness_with_exe(
+        &harness_exe(),
+        &ws,
+        &run_shell_script_turns(&script),
+        &["--staged", "--net-allow-domain", "example.com"],
+        name,
+    );
+    assert!(
+        run.status.success(),
+        "harness invocation itself failed: {}",
+        run.stderr
+    );
+    let outcome = parse_json_stdout(&run).unwrap_or_else(|e| panic!("{e}"));
+    let result_text = outcome["tool_calls"]
+        .get(0)
+        .and_then(|c| c["result"].as_str())
+        .unwrap_or_else(|| panic!("no tool_calls[0].result: {outcome}"));
+    let json_lines: Vec<serde_json::Value> = result_text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect();
+    let by_label = |label: &str| -> serde_json::Value {
+        json_lines
+            .iter()
+            .rfind(|v| v.get("label").and_then(|p| p.as_str()) == Some(label))
+            .unwrap_or_else(|| panic!("label={label} のJSONが出力に無い: {result_text}"))
+            .clone()
+    };
+
+    // --- 陽性対照: 許可済みドメインはプロキシ経由で通る ---
+    let allowed = by_label("example");
+    assert_eq!(
+        allowed["ok"].as_bool(),
+        Some(true),
+        "陽性対照が落ちた＝許可済みのexample.comすら通っていない。\
+         445の失敗を「WFPが塞いだ」と読んではいけない。probe={allowed}"
+    );
+
+    // --- 本題: 445への生TCP ---
+    let probe = by_label("smb445");
+    let ok = probe["ok"].as_bool().unwrap_or(true);
+    eprintln!("[N8-③-C-WFP] host={host} port=445 in-container ok={ok} probe={probe}");
+    assert!(
+        !ok,
+        "**WFP適用下でもコンテナから445へ繋がった。** 既定拒否がポートを見ない前提が崩れている\
+         （`wfp.rs`の`add_default_deny_filter`）。probe={probe}"
+    );
+
+    // --- `10013`の出どころを分ける。
+    //
+    // **`classify_drop`の記録は使えない。** この構成ではWFPのイベント収集を有効化できず
+    // （`FwpmEngineSetOption0`が`FWP_E_DYNAMIC_SESSION_IN_PROGRESS` 0x8032000b を返す。
+    // 動的セッションからは呼べない）、監査には制御レコードだけが載る。**「dropの記録が無い」を
+    // 「dropしていない」と読まないため、ここで理由まで確かめておく**（B-10: 記録の不在は事実の不在ではない）。
+    let audit_entries = collect_audit_entries(&ws.join(".harness").join("sandbox"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let collection_disabled = audit_entries.iter().any(|e| {
+        e.get("reason")
+            .and_then(|r| r.as_str())
+            .is_some_and(|r| r.starts_with("net_event_collection_enable_failed"))
+    });
+    let has_drop_445 = audit_entries.iter().any(|e| {
+        e.get("reason").and_then(|r| r.as_str()) == Some("classify_drop")
+            && e.get("remote_port").and_then(|p| p.as_u64()) == Some(445)
+    });
+    assert!(
+        has_drop_445 || collection_disabled,
+        "445のdrop記録も、収集が無効だという制御レコードも無い。\
+         **この監査ログは何も言っていない**ので、10013の出どころを主張できない。audit={audit_entries:?}"
+    );
+    eprintln!(
+        "[N8-③-C-WFP] wfp classify_drop記録={has_drop_445} / イベント収集が無効={collection_disabled}"
+    );
+
+    // 代わりに**分岐を固定する**。`10013`は「WFPの既定拒否」でも「network capabilityが無い」でも
+    // 出るので、後者の分岐を通っていないことを、その分岐だけが出す文言の**不在**で押さえる
+    // （case 07・case 10がこの文言の**存在**を要求しているのと対になる）。
+    const CAPABILITY_DENIED_MSG: &str = "Tier2a run_shell network capability will remain denied";
+    assert!(
+        !run.stderr.contains(CAPABILITY_DENIED_MSG),
+        "capabilityがDenyへ落ちる分岐を通っている＝**445の拒否はWFPの手柄ではない**。\
+         stderr={}",
+        run.stderr
+    );
+    assert!(
+        result_text.contains("net-proxy: enforced-by-wfp"),
+        "WFPが効いている宣言がシェルのバナーに無い。この実行でWFPが張られた保証が無い: {result_text}"
+    );
+
+    cleanup_on_success(&ws, &[], name);
+}

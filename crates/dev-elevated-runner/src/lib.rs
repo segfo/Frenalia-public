@@ -63,6 +63,25 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "tier2a_net_policy_matrix",
         ],
     ),
+    // N8-③-C-WFP: 生TCPの445が本番Tier2aのWFP適用下でも塞がるかを測る
+    // （`plans/net-spike/RESULTS.md` N8-③-C）。`e2e-net-matrix`とは別に置くのは、
+    // 行列全体を回さずこの1件だけを撃てるようにするため（1要素＝1測定）。
+    // 検証用ホストのIPは `C:\harness-e2e\n8-smb-host.txt` から読む——昇格側プロセスへ
+    // 呼び出し元の環境変数が引き継がれる保証が無いため（`CLAUDE.md`）。
+    (
+        "n8-smb445-layer2",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "tier2a_smb445_layer2",
+        ],
+    ),
     // フィルタはモジュール名と一致していなければならない。`cow_diagnostics`→
     // `cow_containment_tests`の改名にここが追随しておらず、CoW封じ込めE2E一式が
     // 「0件マッチ＝exit 0」で黙って緑になっていた（`docs/bugs/BUG-056.md`）。
