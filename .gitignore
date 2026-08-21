@@ -14,5 +14,10 @@ tools/flake/*
 
 # Incus spike用のmTLSクライアント秘密鍵（plans/vm-spike/、コミットしない）
 plans/vm-spike/.incus-client-cert/
+
+# N4スパイク（plans/projfs-spike/provider/）のビルド成果物。単独クレートなので
+# ルートの`/target`では覆えない
+plans/projfs-spike/provider/target/
+plans/projfs-spike/provider/Cargo.lock
 __pycache__/tools/flake/logs/
 tools/flake/*.jsonl
