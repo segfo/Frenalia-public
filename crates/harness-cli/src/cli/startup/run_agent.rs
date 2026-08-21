@@ -154,8 +154,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
             if tier2a_domain_policy && !session_proxy_ready {
                 eprintln!(
                     "warning: session-scoped local proxy did not start; WFP domain enforcement \
-                     will not be enabled and Tier2a run_shell network capability will remain \
-                     denied (fail-closed)"
+                     will not be enabled and {TIER2A_NET_DENIED}"
                 );
             }
             // シナリオ(C)、または投機的に作ったパイプが結局不要だった場合。`wfp_prelude`を
@@ -196,16 +195,30 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                             // フェイルセーフ経路で自発撤収する。保持して再利用するのは
                             // 対話ループを持つポリシーエディタ側（D-56/D-60）だけである。
                             let e = failure.into_error();
+                            // 文言は`TIER2A_NET_DENIED`（定数のdoc参照）。ここを「Layer1協調
+                            // プロキシが強制する」と書くと実態と逆になる——capability自体が
+                            // 付かないので、子はそのプロキシへ到達すらできない。
                             eprintln!(
-                                "warning: WFP netfilterd chain-launch handshake failed (network \
-                                 egress will only be enforced by the cooperative proxy, Layer1, \
-                                 this session): {e}"
+                                "warning: WFP netfilterd chain-launch handshake failed; \
+                                 {TIER2A_NET_DENIED}: {e}"
                             );
                             None
                         }
                     }
                 }
-                None => None,
+                None => {
+                    // 現状ここへは到達しない: `netfilterd_chain_attempted`はpreflightへ
+                    // `wfp_chain_pipe`を渡した経路でしか立たず（`win_appcontainer/preflight.rs`）、
+                    // それは`wfp_prelude`が`Some`のときだけである。ただしこの不変条件は型では
+                    // 担保されていないため、崩れたときに無言で`None`（＝capabilityがDenyに
+                    // なるのに理由がどこにも出ない）へ落ちないよう、他の不成立経路と同じ
+                    // 文言を出す。
+                    eprintln!(
+                        "warning: netfilterd chain-launch was requested but the prepared pipe is \
+                         missing (internal inconsistency); {TIER2A_NET_DENIED}"
+                    );
+                    None
+                }
             }
         } else {
             // シナリオ(B): privhelperの連鎖起動は発生しなかった（fs-allowの昇格が不要だった等）。
@@ -233,16 +246,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                     // 上のシナリオ(A)と同じ理由で、生き残ったdaemonはここで捨てる（1度しか
                     // 通らない経路なので保持しても使わない）。
                     let e = failure.into_error();
-                    // `should_grant_tier2a_network_capability`（`crates/harness-tools/src/
-                    // shell.rs`）は`domain_policy_requested && !enforced_by_wfp`のとき
-                    // `NetworkCapability::Deny`を返す。つまりWFP起動失敗時はLayer1協調
-                    // プロキシへの縮退ではなく、AppContainer capability自体が付与されず
-                    // run_shell子プロセスはソケットを一切生成できない（fail-closed）。
-                    eprintln!(
-                        "warning: failed to start WFP netfilterd; Tier2a run_shell network \
-                         capability will remain denied for this session (fail-closed, no \
-                         outbound sockets at all, not merely unenforced): {e}"
-                    );
+                    // 文言の根拠（`should_grant_tier2a_network_capability`がDenyを返すこと）は
+                    // `TIER2A_NET_DENIED`のdocを参照。
+                    eprintln!("warning: failed to start WFP netfilterd; {TIER2A_NET_DENIED}: {e}");
                     None
                 }
             }

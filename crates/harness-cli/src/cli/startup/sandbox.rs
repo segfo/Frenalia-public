@@ -378,10 +378,19 @@ pub(super) fn stage_prepare_sandbox(
             match harness_sandbox::tier2a::netfilterd::prepare_pipe() {
                 Ok(prepared) => Some(prepared),
                 Err(e) => {
+                    // ここでの失敗はシナリオ(A)（privhelperによる連鎖起動）の断念であって、
+                    // Layer2の断念ではない——`wfp_chain_pipe`が`None`になると
+                    // `netfilterd_chain_attempted`が立たず、`run_agent.rs`の`net_wfp`解決は
+                    // シナリオ(B)（`NetfilterHandle::start`が自前でパイプを作り昇格起動する）へ
+                    // 倒れる。そのため「協調プロキシのみへ縮退」と断定しない。拒否が確定するのは
+                    // シナリオ(B)も失敗したときで、その文言（`TIER2A_NET_DENIED`）はそちらが出す。
                     eprintln!(
-                        "warning: failed to prepare WFP netfilterd pipe (Layer2 network \
-                         enforcement will be unavailable this session, falling back to the \
-                         cooperative proxy only): {e}"
+                        "warning: failed to prepare the WFP netfilterd chain-launch pipe; \
+                         netfilterd will not be chain-launched by the privilege-separation \
+                         helper this session and harness will try to start it directly instead \
+                         (Layer2 enforcement is not given up here; if that direct start also \
+                         fails, the warning it prints states the resulting fail-closed \
+                         behavior): {e}"
                     );
                     None
                 }
