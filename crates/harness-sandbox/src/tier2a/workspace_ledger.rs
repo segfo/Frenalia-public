@@ -236,7 +236,7 @@ pub fn read_cow_session_meta(upper_dir: &Path) -> Option<CowSessionMeta> {
     serde_json::from_str(&s).ok()
 }
 
-/// CoW upper_dir群の共通の親ディレクトリ（`%LOCALAPPDATA%\harness\cow`）。
+/// CoW upper_dir群の共通の親ディレクトリ（`%LOCALAPPDATA%\harness\data\cow`）。
 ///
 /// 実体は[`crate::session_scope::cow_upper_root`]（セッションID→置き場の写像の正本）。
 /// ここから再公開しているのは、`harness cow`系サブコマンドがこのモジュール越しに引いて

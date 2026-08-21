@@ -585,7 +585,7 @@ pub(crate) struct Cli {
     /// Tier2a限定のCopy-on-Writeモード（D-30、`plans/AppContainerベース Copy-on-Write
     /// ワークスペース設計書.md`）。指定時、workspaceへのACLをRead/Execute/Traverseのみ
     /// （既定のRead/Write/Execute/DeleteではなくD-13と同じread-onlyマスク）へ切り替え、
-    /// `run_shell`子プロセスの書込をworkspace外のCoW upper（`%LOCALAPPDATA%\harness\cow\
+    /// `run_shell`子プロセスの書込をworkspace外のCoW upper（`%LOCALAPPDATA%\harness\data\cow\
     /// <session-id>\`）へRedirector DLLで誘導する。フックが無効・回避されても、ACLが
     /// RO付与済みである限りworkspace本体への書込は`ACCESS_DENIED`でfail-closeする
     /// （フックは境界にしない、D-01不変）。既定（フラグ無指定）はD-29のまま

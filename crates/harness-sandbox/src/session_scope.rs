@@ -6,7 +6,7 @@
 //! |---|---|
 //! | `--live`（既定） | 無し（オーバーレイを使わない） |
 //! | `--staged` / `--workspace-commit` | workspace内 `.harness/sandbox/<session-id>/` |
-//! | `--cow`（D-30、Windows） | workspace外 `%LOCALAPPDATA%\harness\cow\<session-id>\` |
+//! | `--cow`（D-30、Windows） | workspace外 `%LOCALAPPDATA%\harness\data\cow\<session-id>\` |
 //!
 //! この対応は起動時（`harness-cli`の`startup::sandbox`）だけでなく、**セッション切替
 //! （`/sessions`・`/fork`）のたびにTUIからも引かれる**。以前は`harness-cli`の中にあったため
@@ -51,12 +51,12 @@ pub fn sandbox_dir_for_session(session_id: &str) -> PathBuf {
     PathBuf::from(".harness").join("sandbox").join(session_id)
 }
 
-/// CoW upper群の共通の親（`%LOCALAPPDATA%\harness\cow`）。
+/// CoW upper群の共通の親（`%LOCALAPPDATA%\harness\data\cow`）。
 ///
 /// workspace外に置くのは、再帰的なパスマッピングを防ぎ、`.harness`のPROTECTED DACL
 /// （`protect_harness_control_dir_from_appcontainer`）と衝突させないためである
 /// （`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` §9）。
-/// `data_local_dir()`は`%LOCALAPPDATA%\harness`で、台帳群が使う`config_dir()`
+/// `data_local_dir()`は`%LOCALAPPDATA%\harness\data`で、台帳群が使う`config_dir()`
 /// （`%APPDATA%\harness\config`）とは別系統。
 pub fn cow_upper_root() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "harness").map(|d| d.data_local_dir().join("cow"))
@@ -217,7 +217,7 @@ pub fn prepare_scope(workspace_root: &Path, scope: &SessionScope) -> Result<usiz
 ///
 /// `grant_job`のモジュールdocは「セッション中に**workspaceツリーのどこかへDACLを書きうる
 /// 経路**は先に`wait_until_done`を通す」ことを約束4として要求する（BUG-085）。ここが
-/// 該当しないのは、upper_dirが`%LOCALAPPDATA%\harness\cow\`配下＝**workspaceツリーの外**
+/// 該当しないのは、upper_dirが`%LOCALAPPDATA%\harness\data\cow\`配下＝**workspaceツリーの外**
 /// だからである。`grant_job`のフェーズ0（伝播）・0.5（`.harness/`再保護）・1（救済walk）は
 /// いずれもworkspaceツリーだけを対象にしており、このACE書込とノードが1つも重ならない。
 ///
