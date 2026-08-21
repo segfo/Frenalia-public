@@ -145,25 +145,33 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // 許可ドメインがあるときだけ有効化する。
     #[cfg(windows)]
     let net_wfp: Option<harness_sandbox::tier2a::netfilterd::NetfilterHandle> = {
-        let domain_policy_requested = net_proxy.domain_policy_enabled;
         let tier2a_domain_policy =
-            shell_tier.tier == harness_core::ShellTier::Tier2a && domain_policy_requested;
-        let session_proxy_ready = net_proxy.proxy_addr.is_some();
-        let wfp_needed = tier2a_domain_policy && session_proxy_ready;
-        if !wfp_needed {
-            if tier2a_domain_policy && !session_proxy_ready {
-                eprintln!(
-                    "warning: session-scoped local proxy did not start; WFP domain enforcement \
-                     will not be enabled and {TIER2A_NET_DENIED}"
-                );
+            shell_tier.tier == harness_core::ShellTier::Tier2a && net_proxy.domain_policy_enabled;
+        // 経路選択（`wfp_outcome::plan_wfp`）と文言（`WfpUnavailable::warning`）は副作用を
+        // 持たない側へ切り出して単体テストで固定してある。ここに残すのは実際にパイプを消費し
+        // daemonを起こす部分だけで、**不成立に終わった経路はすべて`Err(WfpUnavailable)`へ
+        // 集まる**——警告を出す`eprintln!`はこのブロックの末尾1箇所しか無い（BUG-111）。
+        let outcome: Result<
+            Option<harness_sandbox::tier2a::netfilterd::NetfilterHandle>,
+            WfpUnavailable,
+        > = match plan_wfp(
+            tier2a_domain_policy,
+            net_proxy.proxy_addr.is_some(),
+            shell_tier.netfilterd_chain_attempted,
+            wfp_prelude.is_some(),
+        ) {
+            WfpPlan::NotNeeded => {
+                // シナリオ(C)、または投機的に作ったパイプが結局不要だった場合。`wfp_prelude`を
+                // dropするだけで`PreparedPipe`が自動的にパイプを閉じる（後始末コード不要）。
+                drop(wfp_prelude);
+                Ok(None)
             }
-            // シナリオ(C)、または投機的に作ったパイプが結局不要だった場合。`wfp_prelude`を
-            // dropするだけで`PreparedPipe`が自動的にパイプを閉じる（後始末コード不要）。
-            drop(wfp_prelude);
-            None
-        } else if shell_tier.netfilterd_chain_attempted {
+            WfpPlan::Denied(path) => {
+                drop(wfp_prelude);
+                Err(path)
+            }
             // シナリオ(A): privhelperが既に連鎖起動を試みている。同じパイプでハンドシェイクする。
-            match wfp_prelude {
+            WfpPlan::ChainHandshake => match wfp_prelude {
                 Some(prepared) => {
                     match harness_sandbox::tier2a::netfilterd::NetfilterHandle::connect_after_chain_launch(
                         prepared.into_handle(),
@@ -186,7 +194,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                     ) {
                         Ok((handle, report)) => {
                             collector_chain_report = report;
-                            Some(handle)
+                            Ok(Some(handle))
                         }
                         Err(failure) => {
                             // **daemonが生き残っていても、ここでは捨てる**（`into_error`）。
@@ -194,63 +202,57 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                             // 保持しても使う相手が居ない。捨てるとパイプが閉じ、daemonは
                             // フェイルセーフ経路で自発撤収する。保持して再利用するのは
                             // 対話ループを持つポリシーエディタ側（D-56/D-60）だけである。
-                            let e = failure.into_error();
-                            // 文言は`TIER2A_NET_DENIED`（定数のdoc参照）。ここを「Layer1協調
-                            // プロキシが強制する」と書くと実態と逆になる——capability自体が
-                            // 付かないので、子はそのプロキシへ到達すらできない。
-                            eprintln!(
-                                "warning: WFP netfilterd chain-launch handshake failed; \
-                                 {TIER2A_NET_DENIED}: {e}"
-                            );
-                            None
+                            Err(WfpUnavailable::ChainLaunchHandshakeFailed(
+                                failure.into_error().to_string(),
+                            ))
                         }
                     }
                 }
-                None => {
-                    // 現状ここへは到達しない: `netfilterd_chain_attempted`はpreflightへ
-                    // `wfp_chain_pipe`を渡した経路でしか立たず（`win_appcontainer/preflight.rs`）、
-                    // それは`wfp_prelude`が`Some`のときだけである。ただしこの不変条件は型では
-                    // 担保されていないため、崩れたときに無言で`None`（＝capabilityがDenyに
-                    // なるのに理由がどこにも出ない）へ落ちないよう、他の不成立経路と同じ
-                    // 文言を出す。
-                    eprintln!(
-                        "warning: netfilterd chain-launch was requested but the prepared pipe is \
-                         missing (internal inconsistency); {TIER2A_NET_DENIED}"
-                    );
-                    None
-                }
-            }
-        } else {
+                // `plan_wfp`はパイプが無い組み合わせでは`Denied(ChainLaunchPipeMissing)`を
+                // 返すのでここへは到達しない。到達したとしても無言で拒否へ落ちないよう、
+                // 同じ経路として説明する（panicさせない側に倒す）。
+                None => Err(WfpUnavailable::ChainLaunchPipeMissing),
+            },
             // シナリオ(B): privhelperの連鎖起動は発生しなかった（fs-allowの昇格が不要だった等）。
             // 投機的パイプは使わない（`NetfilterHandle::start`が自前で新規パイプを作るため）、
-            // dropして自動的に閉じる。
-            drop(wfp_prelude);
-            match harness_sandbox::tier2a::netfilterd::NetfilterHandle::start(
-                harness_sandbox::tier2a::netfilterd::NetfilterPolicy {
-                    session_profile: harness_sandbox::tier2a::session_profile::current_profile_name(
-                    ),
-                    allow_loopback_tcp_ports: net_loopback_ports.tcp.clone(),
-                    allow_loopback_udp_ports: net_loopback_ports.udp.clone(),
-                    audit_log_path: net_proxy.audit_log_path.clone(),
-                    // D-38: 上のシナリオ(A)と同じ理由でMCPサーバ分も一緒に張る。
-                    mcp_profiles: mcp_netfilter_entries.clone(),
-                    workspace_root: Some(workspace_root.clone()),
-                    chain_launch_policy_learnd: policy_learn_pipe_name.clone(),
-                },
-            ) {
-                Ok((handle, report)) => {
-                    collector_chain_report = report;
-                    Some(handle)
+            // dropして自動的に閉じる。**`start`より前にdropすること**——順序を入れ替えると
+            // 使わないパイプを開いたまま新しいパイプを作ることになる。
+            WfpPlan::DirectStart => {
+                drop(wfp_prelude);
+                match harness_sandbox::tier2a::netfilterd::NetfilterHandle::start(
+                    harness_sandbox::tier2a::netfilterd::NetfilterPolicy {
+                        session_profile:
+                            harness_sandbox::tier2a::session_profile::current_profile_name(),
+                        allow_loopback_tcp_ports: net_loopback_ports.tcp.clone(),
+                        allow_loopback_udp_ports: net_loopback_ports.udp.clone(),
+                        audit_log_path: net_proxy.audit_log_path.clone(),
+                        // D-38: 上のシナリオ(A)と同じ理由でMCPサーバ分も一緒に張る。
+                        mcp_profiles: mcp_netfilter_entries.clone(),
+                        workspace_root: Some(workspace_root.clone()),
+                        chain_launch_policy_learnd: policy_learn_pipe_name.clone(),
+                    },
+                ) {
+                    Ok((handle, report)) => {
+                        collector_chain_report = report;
+                        Ok(Some(handle))
+                    }
+                    Err(failure) => {
+                        // 上のシナリオ(A)と同じ理由で、生き残ったdaemonはここで捨てる（1度しか
+                        // 通らない経路なので保持しても使わない）。
+                        Err(WfpUnavailable::DirectStartFailed(
+                            failure.into_error().to_string(),
+                        ))
+                    }
                 }
-                Err(failure) => {
-                    // 上のシナリオ(A)と同じ理由で、生き残ったdaemonはここで捨てる（1度しか
-                    // 通らない経路なので保持しても使わない）。
-                    let e = failure.into_error();
-                    // 文言の根拠（`should_grant_tier2a_network_capability`がDenyを返すこと）は
-                    // `TIER2A_NET_DENIED`のdocを参照。
-                    eprintln!("warning: failed to start WFP netfilterd; {TIER2A_NET_DENIED}: {e}");
-                    None
-                }
+            }
+        };
+        // **WFPが立たなかったことをユーザーへ説明する唯一の場所。** 文言は経路ごとではなく
+        // `WfpUnavailable`が持つ（`wfp_outcome.rs`のモジュールdoc参照）。
+        match outcome {
+            Ok(handle) => handle,
+            Err(path) => {
+                eprintln!("{}", path.warning());
+                None
             }
         }
     };
