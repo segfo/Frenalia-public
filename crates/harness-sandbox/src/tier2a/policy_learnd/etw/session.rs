@@ -90,6 +90,43 @@ pub struct RawFsEvent {
     pub timestamp_unix_ms: u64,
 }
 
+/// **診断専用**: 本番セッションへ**3本目のプロバイダとして**載せる指定（測定M3）。
+///
+/// 問いは「[`EtwFsSession::start_inner`]が張るセッション——`Kernel-File`＋`Kernel-Process`を
+/// 既に載せているもの——へ、`Microsoft-Windows-Security-Mitigations`をもう1本載せられるか」
+/// である（`plans/PLAN-MAC-ARGV-MEASUREMENTS.md` M3、決定17(3)の常駐構成が変わる）。
+///
+/// **等価に組んだ別セッション（[`ProviderProbeSession`]）で測らない。** それは
+/// `plans/etw-spike/RESULTS.md` §21.4が記録した「測ったのは調査に使った側で、実際に使われる側では
+/// なかった」と同じ取り違えになる。ここでは本番の入口そのものへ載せる。
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct ExtraProvider {
+    pub provider: GUID,
+    pub keywords: u64,
+    /// 捕捉時に名前で引く文字列プロパティ。
+    pub string_props: Vec<String>,
+    /// 同・整数プロパティ。
+    pub u64_props: Vec<String>,
+}
+
+/// 本番ビルドでの[`ExtraProvider`]は**構築できない型**である。
+///
+/// `start_inner`の引数の形を両ビルドで揃えるためだけに置いている（値は常に`None`）。
+/// 「診断の器を本番へ持ち込まない」を実行時の約束ではなく**型として**表す
+/// ——[`RawFsEvent`]が`#[cfg(test)]`で同じことをしているのと同じ姿勢である。
+#[cfg(not(test))]
+pub enum ExtraProvider {}
+
+/// [`ExtraProvider`]の捕捉先（[`Sink`]が持つ）。
+#[cfg(test)]
+struct ExtraCapture {
+    provider: GUID,
+    string_props: Vec<String>,
+    u64_props: Vec<String>,
+    events: Mutex<Vec<ProbedEvent>>,
+}
+
 /// 結果待ちにできる`Create`の上限。超えた分は古いものから捨てる（[`Correlator`]）。
 const PENDING_CREATE_CAPACITY: usize = 4096;
 
@@ -99,9 +136,9 @@ pub const KERNEL_PROCESS_PROVIDER_GUID: GUID =
     GUID::from_u128(0x22FB_2CD6_0E7B_422B_A0C7_2FAD_1FD0_E716);
 /// `WINEVENT_KEYWORD_PROCESS`。ProcessStart/ProcessStopだけを開ける
 /// （THREAD・IMAGE・JOB等は要らない）。
-const KERNEL_PROCESS_KEYWORD_PROCESS: u64 = 0x10;
+pub const KERNEL_PROCESS_KEYWORD_PROCESS: u64 = 0x10;
 /// `ProcessStart`のevent id。
-const EVENT_ID_PROCESS_START: u16 = 1;
+pub const EVENT_ID_PROCESS_START: u16 = 1;
 
 /// `ProcessStart`から取り出す、収集器がスコープ判定に使う情報。
 ///
@@ -162,6 +199,17 @@ struct Sink {
     /// 容量超過で捨てた生イベントの数。捕捉が途中で切れたことを隠さないために数える。
     #[cfg(test)]
     raw_dropped: Mutex<u64>,
+    /// **プロバイダ×event idごと**の出現回数（測定M3、診断専用）。
+    ///
+    /// 既存の[`Sink::event_histogram`]は`Kernel-File`専用なので**意味を広げない**
+    /// ——3本目を載せたときに「どのプロバイダが実際に届いているか」は別に数える。
+    /// `EnableTraceEx2`が`ERROR_SUCCESS`でも配送が無いことがあるため、
+    /// 戻り値だけでは相乗りの可否を判定できない（`count_provider_events`のdocと同じ理由）。
+    #[cfg(test)]
+    provider_histogram: Mutex<std::collections::BTreeMap<(u128, u16), u64>>,
+    /// 3本目のプロバイダの捕捉先（[`ExtraProvider`]を指定したときだけ`Some`）。
+    #[cfg(test)]
+    extra: Option<ExtraCapture>,
 }
 
 /// 稼働中のETWセッション。[`EtwFsSession::stop`]（またはDrop）で確実に撤収する。
@@ -175,6 +223,11 @@ pub struct EtwFsSession {
     /// `PackageFullName`によるスコープ判定が使えないので、呼び出し側は
     /// `OpenProcess`+`TokenAppContainerSid`のフォールバックへ回る。
     kernel_process_enabled: bool,
+    /// 3本目のプロバイダ（[`ExtraProvider`]）に対する`EnableTraceEx2`の**生の戻り値**（測定M3）。
+    /// 指定しなかった場合は`ERROR_SUCCESS`のまま。**失敗しても`Err`にしない**
+    /// ——「載らなかった」こと自体が測定結果なので、そこで落とすと何も分からなくなる。
+    #[cfg(test)]
+    extra_provider_status: WIN32_ERROR,
 }
 
 /// 収集の結果。
@@ -200,6 +253,12 @@ pub struct EtwFsOutcome {
     pub correlator_unmatched_operation_ends: u64,
     /// 結果待ちのまま残った`Create`の数（セッション停止時点）。
     pub correlator_pending: usize,
+    /// プロバイダ×event idごとの出現回数（測定M3、診断専用。[`Sink::provider_histogram`]）。
+    #[cfg(test)]
+    pub provider_histogram: std::collections::BTreeMap<(u128, u16), u64>,
+    /// 3本目のプロバイダで捕捉したイベント（測定M3、診断専用）。
+    #[cfg(test)]
+    pub extra_events: Vec<ProbedEvent>,
 }
 
 impl EtwFsSession {
@@ -209,12 +268,31 @@ impl EtwFsSession {
         Self::start_with_extra_keywords(session_name, 0)
     }
 
+    /// **診断専用**（測定M3）: 本番と同じセッションへ**3本目のプロバイダ**を載せて張る。
+    ///
+    /// 通る経路は[`Self::start`]と同一で、違うのは`EnableTraceEx2`がもう1回呼ばれることだけ
+    /// である。3本目の有効化に失敗しても`Err`にはせず、戻り値を
+    /// [`Self::extra_provider_status`]で公開する（[`ExtraProvider`]のdoc参照）。
+    #[cfg(test)]
+    pub fn start_with_extra_provider(
+        session_name: &str,
+        extra: ExtraProvider,
+    ) -> Result<Self, EtwError> {
+        Self::start_inner(session_name, 0, false, false, Some(extra))
+    }
+
+    /// 3本目のプロバイダに対する`EnableTraceEx2`の生の戻り値（測定M3）。
+    #[cfg(test)]
+    pub fn extra_provider_status(&self) -> WIN32_ERROR {
+        self.extra_provider_status
+    }
+
     /// ポリシー定義モード（Tier1、`record_all`）向け: 拒否だけでなく成功も含めて
     /// 全アクセスを記録する。読み出しは[`Self::drain_records`]/[`Self::snapshot_records`]を使う
     /// ——[`Self::drain`]/[`Self::snapshot`]（deny-onlyモード用）は常に空を返す
     /// （`Sink.denials`へは書かないため）。
     pub fn start_record_all(session_name: &str) -> Result<Self, EtwError> {
-        Self::start_inner(session_name, 0, false, true)
+        Self::start_inner(session_name, 0, false, true, None)
     }
 
     /// **診断専用**: 追加キーワードを開けたうえで、生イベント列も捕捉する。
@@ -227,7 +305,7 @@ impl EtwFsSession {
         session_name: &str,
         extra_keywords: u64,
     ) -> Result<Self, EtwError> {
-        Self::start_inner(session_name, extra_keywords, true, false)
+        Self::start_inner(session_name, extra_keywords, true, false, None)
     }
 
     /// 捕捉した生イベント列と、容量超過で捨てた件数。
@@ -250,7 +328,7 @@ impl EtwFsSession {
         session_name: &str,
         extra_keywords: u64,
     ) -> Result<Self, EtwError> {
-        Self::start_inner(session_name, extra_keywords, false, false)
+        Self::start_inner(session_name, extra_keywords, false, false, None)
     }
 
     fn start_inner(
@@ -258,6 +336,7 @@ impl EtwFsSession {
         extra_keywords: u64,
         capture_raw: bool,
         record_all: bool,
+        extra: Option<ExtraProvider>,
     ) -> Result<Self, EtwError> {
         // 生イベント捕捉はテストビルドにしか存在しない（[`RawFsEvent`]のdoc参照）ので、
         // 本番ビルドではこの引数に行き先が無い。関数全体を`allow(unused_variables)`で
@@ -304,6 +383,28 @@ impl EtwFsSession {
         };
         let kernel_process_enabled = process_enable == ERROR_SUCCESS;
 
+        // 3本目のプロバイダ（測定M3）。**同じ`session_handle`へ`EnableTraceEx2`をもう1回**
+        // 呼ぶだけで、セッションは増えない——それが「相乗りできるか」の問いの実体である。
+        // 失敗しても`Err`にしない（[`ExtraProvider`]のdoc）。
+        #[cfg(test)]
+        let extra_provider_status = match extra.as_ref() {
+            Some(extra) => unsafe {
+                EnableTraceEx2(
+                    session_handle,
+                    &extra.provider as *const GUID,
+                    EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
+                    TRACE_LEVEL_INFORMATION as u8,
+                    extra.keywords,
+                    0,
+                    0,
+                    None,
+                )
+            },
+            None => ERROR_SUCCESS,
+        };
+        #[cfg(not(test))]
+        let _ = extra;
+
         let sink = Arc::new(Sink {
             correlator: Mutex::new(Correlator::new(PENDING_CREATE_CAPACITY)),
             denials: Mutex::new(Vec::new()),
@@ -317,6 +418,15 @@ impl EtwFsSession {
             raw_events: capture_raw.then(|| Mutex::new(Vec::new())),
             #[cfg(test)]
             raw_dropped: Mutex::new(0),
+            #[cfg(test)]
+            provider_histogram: Mutex::new(std::collections::BTreeMap::new()),
+            #[cfg(test)]
+            extra: extra.map(|extra| ExtraCapture {
+                provider: extra.provider,
+                string_props: extra.string_props,
+                u64_props: extra.u64_props,
+                events: Mutex::new(Vec::new()),
+            }),
         });
 
         let mut logfile = EVENT_TRACE_LOGFILEW {
@@ -352,6 +462,8 @@ impl EtwFsSession {
             worker: Some(worker),
             sink,
             kernel_process_enabled,
+            #[cfg(test)]
+            extra_provider_status,
         })
     }
 
@@ -427,6 +539,10 @@ impl EtwFsSession {
                 .lock()
                 .map(|h| h.clone())
                 .unwrap_or_default(),
+            #[cfg(test)]
+            provider_histogram: self.provider_histogram_snapshot(),
+            #[cfg(test)]
+            extra_events: self.extra_events_snapshot(),
             correlator_evicted: self
                 .sink
                 .correlator
@@ -458,6 +574,26 @@ impl EtwFsSession {
     /// `Kernel-Process`を同一セッションへ載せられたか（スコープ判定の可否）。
     pub fn kernel_process_enabled(&self) -> bool {
         self.kernel_process_enabled
+    }
+
+    /// プロバイダ×event idごとの出現回数（測定M3）。
+    #[cfg(test)]
+    fn provider_histogram_snapshot(&self) -> std::collections::BTreeMap<(u128, u16), u64> {
+        self.sink
+            .provider_histogram
+            .lock()
+            .map(|h| h.clone())
+            .unwrap_or_default()
+    }
+
+    /// 3本目のプロバイダで捕捉したイベント（測定M3）。
+    #[cfg(test)]
+    fn extra_events_snapshot(&self) -> Vec<ProbedEvent> {
+        self.sink
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.events.lock().ok().map(|e| e.clone()))
+            .unwrap_or_default()
     }
 
     fn shutdown(&mut self) -> EtwFsOutcome {
@@ -507,6 +643,10 @@ impl EtwFsSession {
                 .lock()
                 .map(|h| h.clone())
                 .unwrap_or_default(),
+            #[cfg(test)]
+            provider_histogram: self.provider_histogram_snapshot(),
+            #[cfg(test)]
+            extra_events: self.extra_events_snapshot(),
             correlator_evicted: self
                 .sink
                 .correlator
@@ -629,6 +769,238 @@ pub fn count_provider_events(
     Ok((enable, received))
 }
 
+// ---------------------------------------------------------------------------
+// 診断: 任意のプロバイダのイベント本体を名前で引く（`try_enable_provider`・
+// `count_provider_events`と同じ「採否を論じる前に測る」ための入口）
+// ---------------------------------------------------------------------------
+
+/// [`ProviderProbeSession`]が捕捉したイベント1件。
+///
+/// **`version`を必ず持つ**——マニフェストのイベントはバージョンでフィールドが増減するので、
+/// プロパティが`None`のとき「フィールドが無い版だった」と「あるが空だった」を
+/// 呼び出し側が区別できないと、測定として成立しない。
+#[derive(Debug, Clone)]
+pub struct ProbedEvent {
+    pub event_id: u16,
+    pub version: u8,
+    pub process_id: u32,
+    pub timestamp_unix_ms: u64,
+    /// 要求した文字列プロパティのうち、引けたもの。
+    pub strings: std::collections::BTreeMap<String, String>,
+    /// 要求した整数プロパティのうち、引けたもの。
+    pub numbers: std::collections::BTreeMap<String, u64>,
+}
+
+/// 捕捉の上限。診断でも無制限にメモリを使わない（超過分は数えるだけ）。
+const PROBE_CAPTURE_CAPACITY: usize = 50_000;
+
+struct ProbeSink {
+    string_props: Vec<String>,
+    u64_props: Vec<String>,
+    /// 捕捉対象のevent id。空なら全部。
+    event_ids: Vec<u16>,
+    events: Mutex<Vec<ProbedEvent>>,
+    seen: Mutex<u64>,
+    dropped: Mutex<u64>,
+}
+
+/// **診断専用**: 任意のマニフェストプロバイダを購読し、**イベント本体を名前で引いて**貯める。
+///
+/// [`count_provider_events`]は件数しか返さないので「届いた」までしか言えない。
+/// 「**どのフィールドが埋まるか**」を測るにはこちらが要る（例:
+/// `Microsoft-Windows-Security-Mitigations`の子プロセス生成拒否が、呼び出し元と子の
+/// コマンドラインを運ぶか——`plans/mac-spike/RESULTS.md`・[§20項目1](../../../../../plans/DESIGN-MAC-POC.md)の2）。
+///
+/// マシンの状態は変えない（セッションを張って畳むだけ）。撤収は[`Self::stop`]／`Drop`。
+pub struct ProviderProbeSession {
+    session_handle: CONTROLTRACE_HANDLE,
+    session_name: Vec<u16>,
+    provider: GUID,
+    trace_handle: PROCESSTRACE_HANDLE,
+    worker: Option<std::thread::JoinHandle<()>>,
+    sink: Arc<ProbeSink>,
+}
+
+/// [`ProviderProbeSession::stop`]の結果。
+#[derive(Debug, Clone)]
+pub struct ProviderProbeOutcome {
+    pub events: Vec<ProbedEvent>,
+    /// このセッションへ届いたイベント総数（`event_ids`で絞る前）。
+    /// **0なら「拒否が無かった」ではなく「配送が無かった」**——この区別に要る。
+    pub seen_events: u64,
+    /// 容量超過で捨てた件数。
+    pub dropped: u64,
+    pub events_lost: u32,
+    pub realtime_buffers_lost: u32,
+}
+
+impl ProviderProbeSession {
+    /// `provider`を`keywords`（`u64::MAX`で全部）で有効化し、`event_ids`が空でなければ
+    /// そのidのイベントだけを捕捉する。プロパティは名前で指定する。
+    pub fn start(
+        session_name: &str,
+        provider: GUID,
+        keywords: u64,
+        event_ids: &[u16],
+        string_props: &[&str],
+        u64_props: &[&str],
+    ) -> Result<Self, EtwError> {
+        let name_w = wide(session_name);
+        let (mut properties_buf, session_handle) = start_trace(&name_w)?;
+
+        let enable = unsafe {
+            EnableTraceEx2(
+                session_handle,
+                &provider as *const GUID,
+                EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
+                TRACE_LEVEL_INFORMATION as u8,
+                keywords,
+                0,
+                0,
+                None,
+            )
+        };
+        if enable != ERROR_SUCCESS {
+            stop_trace_for(session_handle, &name_w, &mut properties_buf, provider);
+            return Err(EtwError::EnableProvider(enable));
+        }
+
+        let sink = Arc::new(ProbeSink {
+            string_props: string_props.iter().map(|s| s.to_string()).collect(),
+            u64_props: u64_props.iter().map(|s| s.to_string()).collect(),
+            event_ids: event_ids.to_vec(),
+            events: Mutex::new(Vec::new()),
+            seen: Mutex::new(0),
+            dropped: Mutex::new(0),
+        });
+
+        let mut logfile = EVENT_TRACE_LOGFILEW {
+            LoggerName: PWSTR_from(&name_w),
+            ..Default::default()
+        };
+        logfile.Anonymous1.ProcessTraceMode =
+            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logfile.Anonymous2.EventRecordCallback = Some(probe_callback);
+        logfile.Context = Arc::as_ptr(&sink) as *mut core::ffi::c_void;
+
+        let trace_handle = unsafe { OpenTraceW(&mut logfile) };
+        if trace_handle.Value == u64::MAX {
+            let error = WIN32_ERROR(unsafe { windows::Win32::Foundation::GetLastError().0 });
+            stop_trace_for(session_handle, &name_w, &mut properties_buf, provider);
+            return Err(EtwError::OpenTrace(error));
+        }
+
+        let worker_sink = Arc::clone(&sink);
+        let worker = std::thread::spawn(move || {
+            let _keep_alive = worker_sink;
+            let _ = unsafe { ProcessTrace(&[trace_handle], None, None) };
+        });
+
+        Ok(Self {
+            session_handle,
+            session_name: name_w,
+            provider,
+            trace_handle,
+            worker: Some(worker),
+            sink,
+        })
+    }
+
+    pub fn stop(mut self) -> ProviderProbeOutcome {
+        self.shutdown()
+    }
+
+    fn shutdown(&mut self) -> ProviderProbeOutcome {
+        let mut lost = (0u32, 0u32);
+        if self.worker.is_some() {
+            let mut properties_buf = properties_buffer(&self.session_name);
+            stop_trace_for(
+                self.session_handle,
+                &self.session_name,
+                &mut properties_buf,
+                self.provider,
+            );
+            unsafe {
+                let properties = properties_buf.as_ptr() as *const EVENT_TRACE_PROPERTIES;
+                lost = ((*properties).EventsLost, (*properties).RealTimeBuffersLost);
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            unsafe {
+                let _ = CloseTrace(self.trace_handle);
+            }
+        }
+        ProviderProbeOutcome {
+            events: self
+                .sink
+                .events
+                .lock()
+                .map(|e| e.clone())
+                .unwrap_or_default(),
+            seen_events: self.sink.seen.lock().map(|c| *c).unwrap_or(0),
+            dropped: self.sink.dropped.lock().map(|c| *c).unwrap_or(0),
+            events_lost: lost.0,
+            realtime_buffers_lost: lost.1,
+        }
+    }
+}
+
+impl Drop for ProviderProbeSession {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+unsafe extern "system" fn probe_callback(record: *mut EVENT_RECORD) {
+    if record.is_null() {
+        return;
+    }
+    let record = &*record;
+    let context = record.UserContext as *const ProbeSink;
+    if context.is_null() {
+        return;
+    }
+    let sink = &*context;
+
+    if let Ok(mut seen) = sink.seen.lock() {
+        *seen = seen.saturating_add(1);
+    }
+
+    let event_id = record.EventHeader.EventDescriptor.Id;
+    if !sink.event_ids.is_empty() && !sink.event_ids.contains(&event_id) {
+        return;
+    }
+
+    let mut strings = std::collections::BTreeMap::new();
+    for name in &sink.string_props {
+        if let Some(value) = tdh::property_string(record, name) {
+            strings.insert(name.clone(), value);
+        }
+    }
+    let mut numbers = std::collections::BTreeMap::new();
+    for name in &sink.u64_props {
+        if let Some(value) = tdh::property_u64(record, name) {
+            numbers.insert(name.clone(), value);
+        }
+    }
+
+    if let Ok(mut events) = sink.events.lock() {
+        if events.len() < PROBE_CAPTURE_CAPACITY {
+            events.push(ProbedEvent {
+                event_id,
+                version: record.EventHeader.EventDescriptor.Version,
+                process_id: record.EventHeader.ProcessId,
+                timestamp_unix_ms: filetime_to_unix_ms(record.EventHeader.TimeStamp),
+                strings,
+                numbers,
+            });
+        } else if let Ok(mut dropped) = sink.dropped.lock() {
+            *dropped = dropped.saturating_add(1);
+        }
+    }
+}
+
 unsafe extern "system" fn counting_callback(record: *mut EVENT_RECORD) {
     if record.is_null() {
         return;
@@ -709,12 +1081,23 @@ fn start_trace(name_w: &[u16]) -> Result<(Vec<u8>, CONTROLTRACE_HANDLE), EtwErro
 }
 
 fn stop_trace(handle: CONTROLTRACE_HANDLE, name_w: &[u16], buf: &mut [u8]) {
+    stop_trace_for(handle, name_w, buf, KERNEL_FILE_PROVIDER_GUID);
+}
+
+/// [`stop_trace`]の一般形（無効化するプロバイダを選べる）。**本番経路の挙動は変わらない**
+/// ——`stop_trace`は`KERNEL_FILE_PROVIDER_GUID`を渡して委譲するだけである。
+fn stop_trace_for(
+    handle: CONTROLTRACE_HANDLE,
+    name_w: &[u16],
+    buf: &mut [u8],
+    provider: GUID,
+) {
     unsafe {
         // プロバイダを先に無効化してからセッションを止める（止めた後に残ったイベントが
         // コールバックへ流れてくる窓を短くする）。失敗はベストエフォートで無視する。
         let _ = EnableTraceEx2(
             handle,
-            &KERNEL_FILE_PROVIDER_GUID as *const GUID,
+            &provider as *const GUID,
             EVENT_CONTROL_CODE_DISABLE_PROVIDER.0,
             0,
             0,
@@ -748,6 +1131,51 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
 
     if let Ok(mut count) = sink.seen_events.lock() {
         *count = count.saturating_add(1);
+    }
+
+    // 測定M3（診断専用）: **どのプロバイダが実際に届いているか**を数える。
+    // `EnableTraceEx2`の戻り値だけでは相乗りの可否を判定できない（`count_provider_events`のdoc）。
+    #[cfg(test)]
+    if let Ok(mut histogram) = sink.provider_histogram.lock() {
+        *histogram
+            .entry((
+                record.EventHeader.ProviderId.to_u128(),
+                record.EventHeader.EventDescriptor.Id,
+            ))
+            .or_insert(0) += 1;
+    }
+
+    // 3本目のプロバイダのイベントは、以降のKernel-File向けの処理へ流さずここで畳む
+    // （event idの意味がプロバイダごとに違うため、混ぜると別イベントを`Create`として扱いうる）。
+    #[cfg(test)]
+    if let Some(extra) = sink.extra.as_ref() {
+        if record.EventHeader.ProviderId == extra.provider {
+            let mut strings = std::collections::BTreeMap::new();
+            for name in &extra.string_props {
+                if let Some(value) = tdh::property_string(record, name) {
+                    strings.insert(name.clone(), value);
+                }
+            }
+            let mut numbers = std::collections::BTreeMap::new();
+            for name in &extra.u64_props {
+                if let Some(value) = tdh::property_u64(record, name) {
+                    numbers.insert(name.clone(), value);
+                }
+            }
+            if let Ok(mut events) = extra.events.lock() {
+                if events.len() < PROBE_CAPTURE_CAPACITY {
+                    events.push(ProbedEvent {
+                        event_id: record.EventHeader.EventDescriptor.Id,
+                        version: record.EventHeader.EventDescriptor.Version,
+                        process_id: record.EventHeader.ProcessId,
+                        timestamp_unix_ms: filetime_to_unix_ms(record.EventHeader.TimeStamp),
+                        strings,
+                        numbers,
+                    });
+                }
+            }
+            return;
+        }
     }
 
     let event_id = record.EventHeader.EventDescriptor.Id;

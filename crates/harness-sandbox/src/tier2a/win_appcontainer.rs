@@ -507,6 +507,30 @@ mod mac_spike_daemon_tests;
 #[cfg(all(windows, test))]
 mod mac_spike_followup_tests;
 
+/// 同上（**§20項目1の2**: mitigationによるカーネル拒否をETWで観測できるか）。
+/// `plans/PLAN-MAC-RECURSIVE-DESCENDANTS.md`の未解決#9（通常運用中の監視）の入力になる。
+///
+/// **このファイルだけは昇格して走らせる**（ETWリアルタイムセッションに管理者権限が要る）。
+/// 他のmac_spikeは非昇格で回す約束なので、`KNOWN_TARGETS`のキーも分けてある
+/// （`spike-mac-mitigation-etw`）。**モジュール名はそのフィルタ文字列と一致していること**
+/// （改名するとBUG-056と同じ0件マッチになる）。
+#[cfg(all(windows, test))]
+mod mac_spike_mitigation_etw_tests;
+
+/// **N1: AppContainerごとの証明書ストア（D-65の層1）の実現性スパイク**
+/// （`plans/net-spike/RESULTS.md`・`plans/HANDOFF-N1-CERT-STORE-REDIRECT.md`）。
+/// legacy AppContainerでレジストリのリダイレクトが掛かるか／Schannelがそこを読むかを
+/// 実装の前に確定させる。**非昇格で回す**（昇格すると親トークンが変わり測る世界が変わる）。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod cert_store_spike_tests;
+
+/// **N8 論点③の対策候補B: AppContainerトークンからSMB（UNC）へ届くか**のスパイク
+/// （`plans/net-spike/RESULTS.md` `N8-M1-③`）。**非昇格で回す**。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod unc_reach_spike_tests;
+
 /// **テスト専用**の口。[`ensure_profile`]の所有者チェック（BUG-107）を迂回して、
 /// **他セッションのものに見える名前**のプロファイルを作る。
 ///

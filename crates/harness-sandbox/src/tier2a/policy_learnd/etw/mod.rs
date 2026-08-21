@@ -84,3 +84,23 @@ mod disposition_semantics_tests;
 #[cfg(all(windows, test))]
 #[path = "tier1_record_all_spike_tests.rs"]
 mod tier1_record_all_spike_tests;
+
+/// argv（コマンドライン）を観測できるかの実現性スパイク
+/// （`plans/PLAN-MAC-RECURSIVE-DESCENDANTS.md`決定14・未解決#8）。マニフェスト側には
+/// コマンドラインのフィールドが無いので、MOF側の`Process`クラスで測る。
+///
+/// **モジュール名は`KNOWN_TARGETS`の`spike-etw-argv`のフィルタ文字列と一致していなければ
+/// ならない**（改名するとBUG-056と同じ「0件マッチ」が再発する）。
+#[cfg(all(windows, test))]
+#[path = "argv_capture_spike_tests.rs"]
+mod argv_capture_spike_tests;
+
+/// private system loggerの枠（マシン全体で8本）が埋まったときの`StartTraceW`の挙動
+/// （`plans/PLAN-MAC-ARGV-MEASUREMENTS.md` M4）。**実マシンへの影響が最大の測定**なので、
+/// argvスパイクと同居させず単独のターゲットで回す。
+///
+/// **モジュール名は`KNOWN_TARGETS`の`spike-etw-logger-slots`のフィルタ文字列と一致していなければ
+/// ならない**（改名するとBUG-056と同じ「0件マッチ」が再発する）。
+#[cfg(all(windows, test))]
+#[path = "logger_slot_spike_tests.rs"]
+mod logger_slot_spike_tests;

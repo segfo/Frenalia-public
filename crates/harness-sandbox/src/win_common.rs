@@ -268,7 +268,7 @@ pub fn decode_console_bytes(bytes: &[u8]) -> String {
 /// ベストフィット問題（符号化方向のみ）は存在しない。`MultiByteToWideChar`自体が失敗した
 /// 場合（未知のコードページ等、通常起き得ない）は`from_utf8_lossy`へ更に退避する。
 #[cfg(windows)]
-fn decode_ansi_lossy(bytes: &[u8]) -> String {
+pub(crate) fn decode_ansi_lossy(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::new();
     }

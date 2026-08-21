@@ -53,6 +53,22 @@
 //! 仕組みがあり、これはマニフェスト側に対応が見当たらない。トレース開始前に開かれた
 //! ファイルオブジェクトの名前解決に効く可能性がある。
 //!
+//! # `Process`クラス — こちらにしか無いもの（2026-08-15追記）
+//!
+//! **`Process_V4_TypeGroup1`は`CommandLine`を持つ**。マニフェスト側の
+//! `Microsoft-Windows-Kernel-Process`の`ProcessStart`(Id=1)には**v0〜v4のどれにも
+//! コマンドラインのフィールドが無い**（同プロバイダの全43イベントで0件。実測）。
+//! MAC遷移ポリシーのargv軸（`plans/PLAN-MAC-RECURSIVE-DESCENDANTS.md`決定14）は
+//! 観測側でargvを拾えることを前提にしているので、**それが取れる唯一のETW経路がここ**である。
+//!
+//! 同クラスは`PackageFullName`も持つ。`plans/etw-spike/RESULTS.md` §8.4の採否比較表は
+//! 「MOFの`Process`イベントに同等フィールドが見当たらない」と書いているが、これは誤りである
+//! （§22で訂正）。
+//!
+//! 入口は[`MofFsSession::start_process_only`]（`EnableFlags`は`PROCESS`のみ）。FileIo系の
+//! キーワードを開けないので、§8.4がマニフェストを採った決め手のひとつ「イベント量9倍差」は
+//! **この使い方には当たらない**（あの差は`DISK_FILE_IO`のname系が不可避で付いてくることに由来する）。
+//!
 //! # セッションの張り方
 //!
 //! `KERNEL_LOGGER_NAME`（"NT Kernel Logger"）は**マシン全体で1本**しか張れず、他のツール
@@ -89,7 +105,21 @@ pub const EVENT_TYPE_NAME: u8 = 0;
 pub const EVENT_TYPE_FILE_CREATE: u8 = 32;
 pub const EVENT_TYPE_FILE_RUNDOWN: u8 = 36;
 
+/// `Process` MOFクラスのGUID（`{3D6FA8D0-FE05-11D0-9DDA-00C04FD7BA7C}`）。
+/// **`FileIo`とは別のクラス**なので、同じセッションでも`ProviderId`で振り分ける。
+pub const PROCESS_GUID: GUID = GUID::from_u128(0x3D6F_A8D0_FE05_11D0_9DDA_00C0_4FD7_BA7C);
+
+/// `Process_V4_TypeGroup1`のEventType（実測: このクラスは`1,2,3,4,39`を覆う）。
+/// 1=Start / 2=End / 3=DCStart（セッション開始時に**既存の全プロセス**を列挙するrundown）/
+/// 4=DCEnd / 39=Defunct。
+pub const EVENT_TYPE_PROCESS_START: u8 = 1;
+pub const EVENT_TYPE_PROCESS_DC_START: u8 = 3;
+
 const PENDING_CREATE_CAPACITY: usize = 4096;
+
+/// 捕捉するプロセス生成イベントの上限。DCStartのrundownだけで数百件来るので、
+/// 診断であっても無制限にはしない。超えた分は捨てて**件数を数える**（B-09/B-10）。
+const PROCESS_CAPTURE_CAPACITY: usize = 20_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MofEtwError {
@@ -102,15 +132,85 @@ pub enum MofEtwError {
     OpenTrace(WIN32_ERROR),
 }
 
+/// `Process`クラスのプロセス生成イベント1件。
+///
+/// **`command_line`が本命**（`plans/PLAN-MAC-RECURSIVE-DESCENDANTS.md`決定14のargv軸）。
+/// マニフェスト側の[`super::session::ProcessStartInfo`]には対応するフィールドが**存在しない**
+/// ——同じ`None`でも「プロパティを引けなかった」と「フィールドが無い」は別の事実なので、
+/// どのバージョンのイベントが届いたか（[`Self::version`]）を必ず一緒に持つ。
+#[derive(Debug, Clone)]
+pub struct MofProcessStart {
+    /// `Opcode`として届くMOFの`EventType`（1=Start / 3=DCStart）。
+    pub event_type: u8,
+    /// MOFの`EventVersion`（`Process_V4_TypeGroup1`なら4）。`CommandLine`は
+    /// **V2以降にしかない**ので、`None`の解釈にはこれが要る。
+    pub version: u8,
+    pub pid: Option<u32>,
+    pub parent_pid: Option<u32>,
+    pub session_id: Option<u32>,
+    /// クラス定義にある`Flags`。**切り詰めを示すビットがあるかを確かめるために読む**
+    /// ——無ければ`CommandLine`の切り詰めは呼び出し側から検出できない（無言）。
+    pub flags: Option<u64>,
+    pub image_file_name: Option<String>,
+    /// **未解決#8の測定対象。**
+    pub command_line: Option<String>,
+    /// V4以降。AppContainer/パッケージ化プロセスの識別（`RESULTS.md` §8.4の訂正材料）。
+    pub package_full_name: Option<String>,
+    /// 実体はEPROCESSのポインタ。
+    ///
+    /// **マニフェスト側の`ProcessSequenceNumber`の代わりにはならない**（実測で確定、
+    /// `plans/etw-spike/RESULTS.md` §23.1）。601件の実起動に対して**9種類しか現れず**、
+    /// 1つの値が65個のpidに付いた例がある——短命プロセスを連続で起こすと解放された
+    /// EPROCESSが再利用されるためである。**同じpid・同じこの値で別インスタンス**という
+    /// 実例が観測されており、プロセスの同一性の根拠には使えない。
+    ///
+    /// （この行は当初「`ProcessSequenceNumber`に相当する役割を持つ」と書いていた。
+    /// *相当する*であって*等しい*ではない、という限定詞では足りず、実測では役割自体が
+    /// 相当しなかった。）
+    pub unique_process_key: Option<u64>,
+
+    // --- 以下は測定M1・M2・M5のために足したもの（`PLAN-MAC-ARGV-MEASUREMENTS.md`）---
+    /// イベントヘッダのタイムスタンプ。**マニフェスト側との突合を「pid＋開始時刻の窓」で
+    /// 行う場合の窓幅を実測する**ために要る（M1）。MOF側とマニフェスト側は別セッションなので、
+    /// 同じプロセスでも配送時刻が一致する保証は無い。
+    pub timestamp_unix_ms: u64,
+    /// `CommandLine`の**生のUTF-16単位数**。
+    ///
+    /// **[`Self::command_line`]に`chars().count()`を掛けた値とは別物である**
+    /// （サロゲートペアを含む文字列で分かれる）。§22.3.1が確定した上限「1024」が
+    /// UTF-16単位なのか文字数なのかは、こちらでしか判定できない（M5）。
+    pub command_line_utf16_len: Option<usize>,
+    /// `CommandLine`の**末尾8単位まで**（生のUTF-16）。切り詰めがサロゲートペアの途中で
+    /// 起きたなら、ここに対にならない高位サロゲート（`0xD800..=0xDBFF`）が残る（M5）。
+    /// 全単位を保持しないのは、容量[`PROCESS_CAPTURE_CAPACITY`]件ぶんのメモリを避けるため。
+    pub command_line_tail_units: Option<Vec<u16>>,
+    /// `Process_V4_TypeGroup1`の`ApplicationId`。**UTF-16とANSIの両方で読む**
+    /// ——同じイベントの中で`CommandLine`がUTF-16・`ImageFileName`がANSIという混在が
+    /// 実在し（§22.7）、幅を間違えても誰もエラーを返さないため、どちらが正しいかは
+    /// 両方を出して人が見るまで決められない（M2）。
+    pub application_id_utf16: Option<String>,
+    pub application_id_ansi: Option<String>,
+}
+
 struct MofSink {
     correlator: Mutex<Correlator>,
     denials: Mutex<Vec<Denial>>,
+    /// **`FileIo`クラスのイベント数**。`RESULTS.md` §8.4の比較表（89,850 vs 9,756）が
+    /// 引用している値なので、**意味を広げない**——プロセスイベントは
+    /// [`MofSink::process_events`]で別に数える。
     seen_events: Mutex<u64>,
     /// `FileIo_Create`で観測した`OpenPath`をそのまま貯める（マニフェスト側の`FileName`と
     /// 比較して、相対openで形が違わないかを見るための材料）。
     observed_paths: Mutex<Vec<String>>,
     /// `FileIo_Name`系（0/32/35/36）で観測した`FileName`。rundownがどれだけ拾えるかの材料。
     name_events: Mutex<Vec<String>>,
+    /// `Process`クラスで観測した生成イベント（Start/DCStart）。
+    process_starts: Mutex<Vec<MofProcessStart>>,
+    /// `Process`クラスのイベント総数（Start/DCStart以外＝End等も含む）。
+    /// 「1件も届いていない」と「届いたが生成イベントではなかった」を区別するために数える。
+    process_events: Mutex<u64>,
+    /// 容量超過で捨てたプロセス生成イベントの数。
+    process_dropped: Mutex<u64>,
 }
 
 /// MOF（System Logger）セッション。
@@ -125,9 +225,16 @@ pub struct MofFsSession {
 #[derive(Debug, Clone)]
 pub struct MofFsOutcome {
     pub denials: Vec<Denial>,
+    /// **`FileIo`クラスのイベント数**（[`MofSink::seen_events`]のdoc参照）。
     pub seen_events: u64,
     pub observed_paths: Vec<String>,
     pub name_events: Vec<String>,
+    /// `Process`クラスの生成イベント（Start/DCStart）。
+    pub process_starts: Vec<MofProcessStart>,
+    /// `Process`クラスのイベント総数。
+    pub process_events: u64,
+    /// 容量超過で捨てたプロセス生成イベントの数。
+    pub process_dropped: u64,
 }
 
 impl MofFsSession {
@@ -140,13 +247,33 @@ impl MofFsSession {
     ///   `Create`/`OpEnd`の対を得るには両方立てる）
     /// - `PROCESS` / `IMAGE_LOAD`: プロセス・イメージの文脈（§7の検証用）
     pub fn start(session_name: &str) -> Result<Self, MofEtwError> {
-        let name_w = wide(session_name);
-        let enable_flags = EVENT_TRACE_FLAG_DISK_FILE_IO
-            | EVENT_TRACE_FLAG_FILE_IO
-            | EVENT_TRACE_FLAG_FILE_IO_INIT
-            | EVENT_TRACE_FLAG_PROCESS
-            | EVENT_TRACE_FLAG_IMAGE_LOAD;
+        Self::start_with_flags(
+            session_name,
+            EVENT_TRACE_FLAG_DISK_FILE_IO
+                | EVENT_TRACE_FLAG_FILE_IO
+                | EVENT_TRACE_FLAG_FILE_IO_INIT
+                | EVENT_TRACE_FLAG_PROCESS
+                | EVENT_TRACE_FLAG_IMAGE_LOAD,
+        )
+    }
 
+    /// **プロセス生成イベントだけ**を購読する（`EnableFlags`は`PROCESS`のみ）。
+    ///
+    /// FSのキーワードを開けないので、`RESULTS.md` §8.4がマニフェストを採った決め手の
+    /// 「イベント量9倍差」（＝`DISK_FILE_IO`のname系が不可避で付いてくること）は
+    /// この入口には当たらない。用途は`CommandLine`の観測
+    /// （`plans/PLAN-MAC-RECURSIVE-DESCENDANTS.md`決定14・未解決#8）。
+    ///
+    /// 撤収は[`Self::stop`]／`Drop`——[`Self::start`]とまったく同じ経路を通る。
+    pub fn start_process_only(session_name: &str) -> Result<Self, MofEtwError> {
+        Self::start_with_flags(session_name, EVENT_TRACE_FLAG_PROCESS)
+    }
+
+    fn start_with_flags(
+        session_name: &str,
+        enable_flags: EVENT_TRACE_FLAG,
+    ) -> Result<Self, MofEtwError> {
+        let name_w = wide(session_name);
         let (_props, session_handle) = start_system_trace(&name_w, enable_flags)?;
 
         let sink = Arc::new(MofSink {
@@ -155,6 +282,9 @@ impl MofFsSession {
             seen_events: Mutex::new(0),
             observed_paths: Mutex::new(Vec::new()),
             name_events: Mutex::new(Vec::new()),
+            process_starts: Mutex::new(Vec::new()),
+            process_events: Mutex::new(0),
+            process_dropped: Mutex::new(0),
         });
 
         let mut logfile = EVENT_TRACE_LOGFILEW {
@@ -222,6 +352,14 @@ impl MofFsSession {
                 .lock()
                 .map(|p| p.clone())
                 .unwrap_or_default(),
+            process_starts: self
+                .sink
+                .process_starts
+                .lock()
+                .map(|p| p.clone())
+                .unwrap_or_default(),
+            process_events: self.sink.process_events.lock().map(|c| *c).unwrap_or(0),
+            process_dropped: self.sink.process_dropped.lock().map(|c| *c).unwrap_or(0),
         }
     }
 }
@@ -311,6 +449,56 @@ unsafe extern "system" fn mof_event_callback(record: *mut EVENT_RECORD) {
         return;
     }
     let sink = &*context;
+
+    // `Process`クラス（`FileIo`とは別クラス）。**FileIo側の`seen_events`には数えない**
+    // ——あの数は`RESULTS.md` §8.4の比較値なので意味を変えない。
+    if record.EventHeader.ProviderId == PROCESS_GUID {
+        if let Ok(mut count) = sink.process_events.lock() {
+            *count = count.saturating_add(1);
+        }
+        let opcode = record.EventHeader.EventDescriptor.Opcode;
+        if opcode != EVENT_TYPE_PROCESS_START && opcode != EVENT_TYPE_PROCESS_DC_START {
+            return;
+        }
+        // 生のUTF-16単位で1回だけ引き、そこから文字列・単位数・末尾を作る（M5）。
+        // `property_string`を別途呼ぶとTDHを2回叩くうえ、`from_utf16_lossy`後の値からは
+        // 単位数も切り詰めの痕跡も復元できない。
+        let command_line_units = tdh::property_utf16_units(record, "CommandLine");
+        let info = MofProcessStart {
+            event_type: opcode,
+            version: record.EventHeader.EventDescriptor.Version,
+            pid: tdh::property_u64(record, "ProcessId").map(|v| v as u32),
+            parent_pid: tdh::property_u64(record, "ParentId").map(|v| v as u32),
+            session_id: tdh::property_u64(record, "SessionId").map(|v| v as u32),
+            flags: tdh::property_u64(record, "Flags"),
+            // **ANSIで読む。** このクラスは`CommandLine`がUTF-16・`ImageFileName`がANSIという
+            // 混在である（実測。[`tdh::property_ansi_string`]のdoc参照）。
+            image_file_name: tdh::property_ansi_string(record, "ImageFileName"),
+            // **V2以降にしか無い**。無い版が届いたら`None`になるだけで壊れない
+            // （`version`と併せて読むこと）。
+            command_line: command_line_units
+                .as_ref()
+                .map(|units| String::from_utf16_lossy(units)),
+            // V4以降。
+            package_full_name: tdh::property_string(record, "PackageFullName"),
+            unique_process_key: tdh::property_u64(record, "UniqueProcessKey"),
+            timestamp_unix_ms: filetime_to_unix_ms(record.EventHeader.TimeStamp),
+            command_line_utf16_len: command_line_units.as_ref().map(|units| units.len()),
+            command_line_tail_units: command_line_units
+                .as_ref()
+                .map(|units| units[units.len().saturating_sub(8)..].to_vec()),
+            application_id_utf16: tdh::property_string(record, "ApplicationId"),
+            application_id_ansi: tdh::property_ansi_string(record, "ApplicationId"),
+        };
+        if let Ok(mut starts) = sink.process_starts.lock() {
+            if starts.len() < PROCESS_CAPTURE_CAPACITY {
+                starts.push(info);
+            } else if let Ok(mut dropped) = sink.process_dropped.lock() {
+                *dropped = dropped.saturating_add(1);
+            }
+        }
+        return;
+    }
 
     if record.EventHeader.ProviderId != FILE_IO_GUID {
         return;
@@ -422,6 +610,23 @@ mod tests {
         assert_eq!(EVENT_TYPE_NAME, 0); // FileIo_Name
         assert_eq!(EVENT_TYPE_FILE_CREATE, 32);
         assert_eq!(EVENT_TYPE_FILE_RUNDOWN, 36);
+    }
+
+    /// `Process`クラスのGUIDとEventTypeが、このマシンのMOF定義と一致すること
+    /// （実測: `Get-CimClass -Namespace root/wmi -ClassName Process_V4` の
+    /// `CimClassQualifiers` が `Guid = {3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}`・
+    /// `Process_V4_TypeGroup1` が `EventType = 1,2,3,4,39`）。
+    ///
+    /// GUIDの綴りはコンパイラが検証しないので実行時に検算する（B-05）。ずれていても
+    /// コールバックが「1件も来ない」ように見えるだけで、エラーは1つも出ない。
+    #[test]
+    fn process_class_guid_and_event_types_match_the_mof_definition() {
+        assert_eq!(
+            format!("{PROCESS_GUID:?}").to_uppercase(),
+            "3D6FA8D0-FE05-11D0-9DDA-00C04FD7BA7C"
+        );
+        assert_eq!(EVENT_TYPE_PROCESS_START, 1); // Process_Start
+        assert_eq!(EVENT_TYPE_PROCESS_DC_START, 3); // Process_DCStart（rundown）
     }
 
     /// FileIoクラスGUIDが`{90CBDC39-4A3E-11D1-84F4-0000F80464E3}`であること。

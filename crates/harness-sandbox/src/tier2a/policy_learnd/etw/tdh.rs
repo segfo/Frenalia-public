@@ -67,11 +67,41 @@ pub unsafe fn property_u64(record: &EVENT_RECORD, name: &str) -> Option<u64> {
     }
 }
 
-/// UTF-16文字列プロパティを引く。末尾のNUL以降は落とす。
+/// **ANSIコードページ**の文字列プロパティを引く。末尾のNUL以降は落とす。
+///
+/// **同じETWレコードでもプロパティごとに文字列の幅が違う。** マニフェスト系統
+/// （[`super::session`]）は全てUTF-16だが、MOFの`Process`クラスは
+/// **`CommandLine`がUTF-16・`ImageFileName`がANSI**という混在である（実測: `ImageFileName`を
+/// [`property_string`]で読むと`"cmd.exe"`が`"浣\u{2e64}硥e"`になる。2026-08-15、
+/// `plans/etw-spike/RESULTS.md` §22）。**幅を間違えても誰もエラーを返さない**——
+/// 化けた文字列がそのまま流れるだけなので、プロパティごとにどちらで読むかを明示する。
 ///
 /// # Safety
 /// `record`はETWコールバックが渡した有効な`EVENT_RECORD`でなければならない。
-pub unsafe fn property_string(record: &EVENT_RECORD, name: &str) -> Option<String> {
+pub unsafe fn property_ansi_string(record: &EVENT_RECORD, name: &str) -> Option<String> {
+    let bytes = property_bytes(record, name)?;
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    if end == 0 {
+        return None;
+    }
+    Some(crate::win_common::decode_ansi_lossy(&bytes[..end]))
+}
+
+/// UTF-16文字列プロパティを**生のUTF-16単位のまま**引く。末尾のNUL以降は落とす。
+///
+/// **切り詰めの痕跡を見るときは[`property_string`]を通してはならない。** あちらは
+/// `String::from_utf16_lossy`を掛けるため、対にならないサロゲート（lone surrogate）が
+/// `U+FFFD`へ置換されて**痕跡が消える**。ETWのイベントがUTF-16単位で切られている場合、
+/// サロゲートペアの途中で切れた証拠は末尾の単一の高位サロゲートにしか現れない
+/// （`plans/PLAN-MAC-ARGV-MEASUREMENTS.md` M5）。
+///
+/// 長さの意味も違う——ここが返すのは**UTF-16単位数**であり、
+/// [`property_string`]の結果に`chars().count()`を掛けた値（＝文字数）とは
+/// サロゲートペアを含む文字列で一致しない。
+///
+/// # Safety
+/// `record`はETWコールバックが渡した有効な`EVENT_RECORD`でなければならない。
+pub unsafe fn property_utf16_units(record: &EVENT_RECORD, name: &str) -> Option<Vec<u16>> {
     let bytes = property_bytes(record, name)?;
     let units: Vec<u16> = bytes
         .chunks_exact(2)
@@ -81,5 +111,17 @@ pub unsafe fn property_string(record: &EVENT_RECORD, name: &str) -> Option<Strin
     if end == 0 {
         return None;
     }
-    Some(String::from_utf16_lossy(&units[..end]))
+    Some(units[..end].to_vec())
+}
+
+/// UTF-16文字列プロパティを引く。末尾のNUL以降は落とす。
+///
+/// 生の単位が要るとき（切り詰めの痕跡・単位数）は[`property_utf16_units`]を使う
+/// ——こちらは`from_utf16_lossy`で不正なサロゲートを潰す。
+///
+/// # Safety
+/// `record`はETWコールバックが渡した有効な`EVENT_RECORD`でなければならない。
+pub unsafe fn property_string(record: &EVENT_RECORD, name: &str) -> Option<String> {
+    let units = property_utf16_units(record, name)?;
+    Some(String::from_utf16_lossy(&units))
 }
