@@ -640,6 +640,7 @@ dependencies = [
  "harness-sandbox",
  "serde",
  "serde_json",
+ "tempfile",
  "windows",
 ]
 

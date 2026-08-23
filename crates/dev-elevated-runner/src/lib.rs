@@ -6,6 +6,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// E2E専用のブローカー（[`RunRequest::LaunchPrivhelper`]の実装）。**`KNOWN_TARGETS`とは別の口**で、
+/// 唯一クライアント由来の文字列が起動に影響する経路なので、縛りは全部そちらのモジュールが持つ。
+///
+/// 電文の型（[`PrivhelperLaunchRequest`]）だけは他のワイヤ型と一緒にこのファイルへ置く
+/// ——ブローカーの実装は`harness-sandbox`のWindows専用モジュールに依存するが、
+/// 型はプラットフォームに依らず直列化できる必要がある。
+#[cfg(windows)]
+pub mod privhelper_broker;
+
 pub const PIPE_NAME_PREFIX: &str = r"\\.\pipe\dev-elevated-runner-";
 
 /// 最終要求からこの時間操作が無ければサーバは自動終了する（タイマーではなく、
@@ -19,6 +28,12 @@ pub const IDLE_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(30
 /// （このテーブル）から引く。クライアント由来の文字列が引数配列へ混入する経路が無いため、
 /// 「`&&`/`;`等のシェルメタ文字を拒否する」を個別チェックする必要すらない——キーが完全一致
 /// しない時点で拒否される（ユーザー指示: 「どのテストケースを実行するか」だけを送る設計）。
+///
+/// **例外は`RunRequest::LaunchPrivhelper`ひとつだけ**（E2E専用、[`privhelper_broker`]）。
+/// あちらは実行時にしか決まらないパイプ名を運ぶので固定テーブルでは表せず、代わりに
+/// 「置き場・ファイル名・中身・パイプ名の形」を受信側で検査する。**このテーブルの性質を
+/// 語るときは、その例外も一緒に語ること**（同じ事実を説明する文が2箇所にあると、片方が
+/// 実装に追随せず「もう塞がっている」と誤読される、BUG-111）。
 /// 新しいテストターゲットが必要になったら、このテーブルへ1行追加する（コード変更が要る、
 /// 実行時の任意入力では増やせない）。
 pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
@@ -63,6 +78,25 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "tier2a_net_policy_matrix",
         ],
     ),
+    // CoW既定化の前提測定（`plans/PLAN-COW-AS-DEFAULT.md`検証タスク）: git だけで層3 hard-deny
+    // （設定注入パスの拒否）を迂回できるかを、塞ぐ前に1本だけ撃って観測する。`e2e-cow-matrix`
+    // とは別に置くのは、20件の行列全体を回さずこの1測定だけを撃てるようにするため（1要素＝1測定）。
+    // フィルタ文字列はテスト関数名と一致していなければならない（`check_tests_actually_ran`が
+    // 0件マッチを非0で落とす、BUG-056同型）。
+    (
+        "e2e-cow-git-injection",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "tier2a_cow_git_can_bypass_config_injection_hard_deny",
+        ],
+    ),
     // N8-③-C-WFP: 生TCPの445が本番Tier2aのWFP適用下でも塞がるかを測る
     // （`plans/net-spike/RESULTS.md` N8-③-C）。`e2e-net-matrix`とは別に置くのは、
     // 行列全体を回さずこの1件だけを撃てるようにするため（1要素＝1測定）。
@@ -80,6 +114,25 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--ignored",
             "--nocapture",
             "tier2a_smb445_layer2",
+        ],
+    ),
+    // W7: ワークスペース**内**の実行が、そのファイルのACEで制御されるかの実測
+    // （D-79の前提測定。`plans/DESIGN-SANDBOX-APPPOLICY.md` D-79の「限界」節が
+    // 「スクリプトは止まらない」と書いているのを、実機で確かめる側）。
+    // 行列全体（`e2e-all`）とは別に置くのは、2ラウンド×8経路のこの測定だけを
+    // 撃てるようにするため（1要素＝1測定）。
+    (
+        "e2e-exec-ace",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "tier2a_workspace_exec_ace_matrix",
         ],
     ),
     // フィルタはモジュール名と一致していなければならない。`cow_diagnostics`→
@@ -210,6 +263,24 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--test-threads=1",
             "--nocapture",
             "appcontainer_child_denials",
+        ],
+    ),
+    // BUG-111の残り（シナリオ(A)のE2Eが成立するかの前提）: 昇格したこのデーモン配下から
+    // **非昇格（`is_elevated()`が偽）の子プロセス**を起こせるかを測る。
+    // **このデーモン経由でしか意味を持たない測定である**——非昇格のシェルから走らせると
+    // どの手法も成功して見える（テスト自身が冒頭で昇格を確認して落とす）。
+    (
+        "spike-deelevation",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "tier2a::deelevation_spike_tests",
         ],
     ),
     (
@@ -498,10 +569,36 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// クライアント→デーモンの要求。
+///
+/// **`kind`タグ付きで直列化する。** タグの無い構造体のままフィールドを足すと、古いデーモンが
+/// 新しい要求を「知らないフィールドは無視」して**別の要求として実行**し得る。タグを必須に
+/// すれば、古い個体は解釈できずに落ちる（無言の取り違えより、はっきり落ちる方を選ぶ）。
+/// 電文の型を変えたので、**動いているデーモンは先に止めてから再ビルドする**
+/// （`docs/DEV-ENVIRONMENT.md`の`KNOWN_TARGETS`変更手順と同じ）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunRequest {
-    /// `KNOWN_TARGETS`のキーのいずれかと完全一致する必要がある。
-    pub target: String,
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RunRequest {
+    /// 固定テーブルから`cargo`引数列を引いて実行する（`dev-elevated-run.exe <target>`）。
+    Target {
+        /// `KNOWN_TARGETS`のキーのいずれかと完全一致する必要がある。
+        target: String,
+    },
+    /// **E2E専用**: `harness-privhelper.exe`を昇格したまま起こす（`privhelper_broker`）。
+    LaunchPrivhelper(PrivhelperLaunchRequest),
+}
+
+/// クライアント（非昇格のharness本体）→デーモンの、privhelper起動要求の中身。
+///
+/// **パイプ名は実行時に決まる**ので`KNOWN_TARGETS`の固定テーブルでは表せない。これが
+/// このデーモンで唯一「クライアント由来の文字列が起動に影響する」経路であり、だからこそ
+/// 受信側（`privhelper_broker`）が置き場・ファイル名・中身・パイプ名の形を検査する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivhelperLaunchRequest {
+    /// 非昇格側が作って待っている名前付きパイプ（`\\.\pipe\harness-privhelper-...`）。
+    pub pipe_name: String,
+    /// `harness-privhelper.exe`が置いてあるディレクトリ（`C:\harness-e2e\`配下）。
+    pub launcher_dir: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -679,6 +776,36 @@ mod tests {
         // 入力検証は`validate_target`の責務なので、未知のキーはここでは判定しない。
         assert!(check_tests_actually_ran("no-such-target", ZERO_TESTS).is_ok());
         assert!(validate_target("no-such-target").is_err());
+    }
+
+    /// 2種類の要求が、どちらも自分の`kind`として往復すること（**送る側と受け取る側で
+    /// 閉じているかを両方向で見る**、B-03）。
+    #[test]
+    fn both_request_kinds_round_trip() {
+        let target = RunRequest::Target {
+            target: "e2e-net-matrix".to_string(),
+        };
+        let launch = RunRequest::LaunchPrivhelper(PrivhelperLaunchRequest {
+            pipe_name: r"\\.\pipe\harness-privhelper-1-0-2".to_string(),
+            launcher_dir: std::path::PathBuf::from(r"C:\harness-e2e\scenarioA"),
+        });
+
+        for request in [target, launch] {
+            let bytes = serde_json::to_vec(&request).unwrap();
+            let parsed: RunRequest = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(format!("{parsed:?}"), format!("{request:?}"));
+        }
+    }
+
+    /// タグの無い**旧形式**は受け付けない。ここが通ってしまうと、要求の種類を取り違えた
+    /// まま昇格側が動く（古いクライアントが生きていたときに、無言で別の意味になる）。
+    #[test]
+    fn a_request_without_a_kind_tag_is_rejected() {
+        let legacy = br#"{"target":"e2e-net-matrix"}"#;
+
+        let parsed: Result<RunRequest, _> = serde_json::from_slice(legacy);
+
+        assert!(parsed.is_err(), "an untagged legacy request must not parse");
     }
 
     /// `KNOWN_TARGETS`の中で`cargo test`を走らせる全ターゲットが、この検知の対象に入ること。

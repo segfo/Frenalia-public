@@ -6,6 +6,10 @@
 //! 実行する`cargo`引数列はこのバイナリにハードコードされた固定テーブルから引く
 //! （`resolve_target_args`）。クライアント由来の文字列が引数配列へ混入する経路は無い。
 //!
+//! **例外が1つある**——`RunRequest::LaunchPrivhelper`（E2E専用、`privhelper_broker`）だけは
+//! クライアントがパイプ名とディレクトリを運ぶ。実行時にしか決まらない値だからで、代わりに
+//! 「置き場・ファイル名・中身のバイト一致・パイプ名の形」を**このプロセス側で**検査する。
+//!
 //! 最終要求から`IDLE_SHUTDOWN`（30分）操作が無ければ自動終了する。この判定は「次の
 //! クライアント接続を待つ`ConnectNamedPipe`のタイムアウト」として実装し、タイマー
 //! スレッドは使わない（退役した%TEMP%キューデーモンの教訓、`docs/bugs/BUG-046.md`）。
@@ -16,7 +20,7 @@ fn main() -> std::process::ExitCode {
         connect_with_timeout, pipe_name_for_current_user, read_framed_timeout,
         user_only_security_attributes, wide, write_framed_timeout,
     };
-    use dev_elevated_runner::{resolve_target_args, RunRequest, RunResponse, IDLE_SHUTDOWN};
+    use dev_elevated_runner::{RunRequest, RunResponse, IDLE_SHUTDOWN};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HLOCAL};
     use windows::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
@@ -104,44 +108,36 @@ fn main() -> std::process::ExitCode {
             let request: RunRequest = serde_json::from_slice(&request_bytes)
                 .map_err(|e| format!("parse request: {e}"))?;
 
-            eprintln!("dev-elevated-runnerd: request target={:?}", request.target);
-
-            let response = match resolve_target_args(&request.target) {
-                None => RunResponse {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: format!(
-                        "unknown target {:?} (this daemon only runs a fixed, hardcoded set of \
-                         cargo invocations, see KNOWN_TARGETS in crates/dev-elevated-runner/src/lib.rs)",
-                        request.target
-                    ),
-                },
-                Some(args) => {
-                    eprintln!("dev-elevated-runnerd: running `cargo {}`", args.join(" "));
-                    match std::process::Command::new("cargo")
-                        .args(args)
-                        // M15.7 / D-44: 昇格ヘルパーの起動時DACLゲートは既定で拒否だが、
-                        // 開発ビルドは`target\debug`が必ずユーザー書込可なので必ず引っ掛かる。
-                        // ここで逃がし弁を注入しないと、E2Eが1本も走らなくなる。
-                        // **ゲート自体の検証は`elevated_launch`の専用テストが担う**ので、
-                        // ここで通してもゲートが未検証になることは無い。
-                        .env(
-                            harness_sandbox::elevated_launch::ALLOW_USER_WRITABLE_HELPERS_ENV,
-                            "1",
-                        )
-                        .current_dir(&repo_root)
-                        .output()
-                    {
-                        Ok(output) => RunResponse {
-                            exit_code: output.status.code().unwrap_or(-1),
-                            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                        },
-                        Err(e) => RunResponse {
-                            exit_code: -1,
-                            stdout: String::new(),
-                            stderr: format!("failed to spawn cargo: {e}"),
-                        },
+            let response = match request {
+                RunRequest::Target { target } => {
+                    eprintln!("dev-elevated-runnerd: request target={target:?}");
+                    run_cargo_target(&target, &repo_root)
+                }
+                RunRequest::LaunchPrivhelper(launch) => {
+                    eprintln!(
+                        "dev-elevated-runnerd: request launch-privhelper pipe={:?} dir={}",
+                        launch.pipe_name,
+                        launch.launcher_dir.display()
+                    );
+                    // 検査は`privhelper_broker::launch`が全部持つ（縛り3つ＋逃がし弁の注入）。
+                    // ここで別の判定を足さない——同じ判定が2箇所にあると、片方だけ緩む。
+                    match dev_elevated_runner::privhelper_broker::launch(&launch, &repo_root) {
+                        Ok(pid) => {
+                            eprintln!("dev-elevated-runnerd: privhelper launched (pid {pid})");
+                            RunResponse {
+                                exit_code: 0,
+                                stdout: format!("launched harness-privhelper.exe (pid {pid})\n"),
+                                stderr: String::new(),
+                            }
+                        }
+                        Err(reason) => {
+                            eprintln!("dev-elevated-runnerd: privhelper launch refused: {reason}");
+                            RunResponse {
+                                exit_code: -1,
+                                stdout: String::new(),
+                                stderr: reason,
+                            }
+                        }
                     }
                 }
             };
@@ -168,6 +164,51 @@ fn main() -> std::process::ExitCode {
             let _ = DisconnectNamedPipe(pipe);
             let _ = CloseHandle(pipe);
         }
+    }
+}
+
+/// `KNOWN_TARGETS`の固定引数列で`cargo`を回す（従来からの要求）。
+#[cfg(windows)]
+fn run_cargo_target(
+    target: &str,
+    repo_root: &std::path::Path,
+) -> dev_elevated_runner::RunResponse {
+    use dev_elevated_runner::{resolve_target_args, RunResponse};
+
+    let Some(args) = resolve_target_args(target) else {
+        return RunResponse {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: format!(
+                "unknown target {target:?} (this daemon only runs a fixed, hardcoded set of \
+                 cargo invocations, see KNOWN_TARGETS in crates/dev-elevated-runner/src/lib.rs)"
+            ),
+        };
+    };
+    eprintln!("dev-elevated-runnerd: running `cargo {}`", args.join(" "));
+    match std::process::Command::new("cargo")
+        .args(args)
+        // M15.7 / D-44: 昇格ヘルパーの起動時DACLゲートは既定で拒否だが、開発ビルドは
+        // `target\debug`が必ずユーザー書込可なので必ず引っ掛かる。ここで逃がし弁を注入しないと、
+        // E2Eが1本も走らなくなる。**ゲート自体の検証は`elevated_launch`の専用テストが担う**ので、
+        // ここで通してもゲートが未検証になることは無い。
+        .env(
+            harness_sandbox::elevated_launch::ALLOW_USER_WRITABLE_HELPERS_ENV,
+            "1",
+        )
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(output) => RunResponse {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        },
+        Err(e) => RunResponse {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: format!("failed to spawn cargo: {e}"),
+        },
     }
 }
 

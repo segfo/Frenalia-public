@@ -8,6 +8,10 @@
 
 use super::*;
 
+/// ヘルパー実行ファイルの名前。**この綴りの正本**——起こす側（開発用の`dev-elevated-runner`の
+/// ブローカー等）が同じ名前を持つ必要があるので、文字列を各所へ複製せずここを参照する（B-05）。
+pub const HELPER_EXE_NAME: &str = "harness-privhelper.exe";
+
 /// ヘルパー実行ファイル（`harness-privhelper.exe`）のパスを、本体exeと同じディレクトリから
 /// 解決する（PATH検索に頼らない固定ロケーション、D-16の「小さく独立にビルド・監査可能な
 /// 別バイナリ」を確実に本体と対で配布する前提）。
@@ -17,7 +21,7 @@ fn helper_exe_path() -> Result<PathBuf, PrivHelperError> {
     let dir = current
         .parent()
         .ok_or_else(|| PrivHelperError::Ipc("current exe has no parent directory".to_string()))?;
-    Ok(dir.join("harness-privhelper.exe"))
+    Ok(dir.join(HELPER_EXE_NAME))
 }
 
 /// 特権操作をヘルパーへ委譲し、完了まで待つ（client側、非管理者本体から呼ぶ）。
@@ -160,7 +164,12 @@ pub fn run_privileged_revoke_fs_allow(
 ///
 /// 型を`&dyn Fn`で受けるのは、`harness-sandbox`の下位モジュールである`privhelper`が
 /// `netfilterd`へ依存しないようにするため（依存の向きを一方通行に保つ）。
-pub type ChainLauncher<'a> = &'a dyn Fn(&str) -> Result<(), String>;
+///
+/// **定義本体は`crate::tier2a`（OS非依存の位置）にある。** ここは従来の綴り
+/// `privhelper::ChainLauncher`で到達できるようにするための再輸出である——本体をこの
+/// Windows専用モジュールに置いていたため、`shell_tier::select_tier`のシグネチャが
+/// 非Windowsで解決できず、クレート全体がビルドできなかった。
+pub use crate::tier2a::ChainLauncher;
 
 fn run_privileged_raw(
     envelope: &PrivilegedRequestEnvelope,

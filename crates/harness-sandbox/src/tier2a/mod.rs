@@ -2,7 +2,7 @@
 //!
 //! **境界はACL**（D-01）。AppContainerのpackage SIDに対して、許可したいパスへ明示的に
 //! ACEを付ける以外に子プロセスがファイルへ到達する経路が無い、というOS側のdefault-denyに
-//! 全面的に乗る。フックは境界にしない（`harness-redirector`のRedirector DLLは`--cow`の
+//! 全面的に乗る。フックは境界にしない（`harness-redirector`のRedirector DLLは`--sandbox tier2a-cow`の
 //! 透過性のためだけに存在し、境界としては数えない）。
 //!
 //! | モジュール | 役割 |
@@ -54,6 +54,18 @@ pub mod netfilterd;
 pub mod policy_learnd;
 #[cfg(windows)]
 pub mod privhelper;
+
+/// **ヘルパーを起こす代わりの手段**（D-60）。パイプ名を受け取り、`Ok(())`なら
+/// 「そのパイプへ接続してくるヘルパーが起きた」ことを意味する。意味と使い方は
+/// [`privhelper::client`]のdocが持つ（あちらはこの別名を再輸出しているだけ）。
+///
+/// **なぜWindows専用モジュールの外に置くのか。** 実体は関数ポインタの別名にすぎず
+/// OSに依存しないが、これを`privhelper`（`#[cfg(windows)]`）の中に置くと、
+/// この型を引数に取る[`crate::shell_tier::select_tier`]の**シグネチャ自体**が
+/// 非Windowsで解決できなくなる。実際にそうなっており、`harness-sandbox`は
+/// Linux/macOS向けに`cargo check`が通らない状態が続いていた（`E0433`）。
+/// **型の置き場が、その型を1度も使わないOSのビルドを落とす**という形である。
+pub type ChainLauncher<'a> = &'a dyn Fn(&str) -> Result<(), String>;
 #[cfg(windows)]
 pub mod win_appcontainer;
 /// workspace本体/CoW upper_dirの生存管理（名前付きmutex）はWin32 API依存。
@@ -68,3 +80,12 @@ pub(crate) mod wfp;
 /// loopback exemptionの所有権管理（D-36）。`wfp`と同じく昇格プロセス内でのみ意味を持つ。
 #[cfg(windows)]
 pub(crate) mod loopback_exemption;
+
+/// **測定専用スパイク**（BUG-111の残り: シナリオ(A)のE2Eが成立するかの前提を測る）。
+/// 昇格した`dev-elevated-runner`配下から非昇格の子を起こせるか。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+///
+/// **モジュール名は`KNOWN_TARGETS`の`spike-deelevation`のフィルタ文字列と一致していること**
+/// （改名すると0件マッチで黙って緑になる。BUG-056）。
+#[cfg(all(windows, test))]
+mod deelevation_spike_tests;

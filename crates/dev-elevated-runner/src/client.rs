@@ -124,7 +124,9 @@ fn main() -> std::process::ExitCode {
     // クライアント側の診断用）。
     let _ = current_user_sid_string();
 
-    let request = RunRequest {
+    // このCLIが送れるのは`Target`だけである。もう1つの要求（`LaunchPrivhelper`）は
+    // 非昇格のharness本体が直接送るもので、人間が撃つ口を持たない（`privhelper_broker`）。
+    let request = RunRequest::Target {
         target: target.clone(),
     };
     let request_bytes = serde_json::to_vec(&request).expect("serialize request");
@@ -138,7 +140,13 @@ fn main() -> std::process::ExitCode {
     let response_bytes = match read_framed_timeout(pipe, RESPONSE_READ_TIMEOUT) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("dev-elevated-run: failed to read response: {e}");
+            // 電文の型が変わった後に**古いデーモンが生きている**と、要求が解釈されずに
+            // ここへ落ちる。次に踏む人が原因へ最短で行けるように名指しする。
+            eprintln!(
+                "dev-elevated-run: failed to read response: {e}\n  \
+                 If a dev-elevated-runnerd from an older build is still running, it cannot parse \
+                 this request. Stop it (see docs/DEV-ENVIRONMENT.md) and retry."
+            );
             unsafe {
                 let _ = CloseHandle(pipe);
             }

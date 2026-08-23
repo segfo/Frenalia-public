@@ -13,7 +13,12 @@ edition.workspace = true
 # 一切送らない——送るのは`KNOWN_TARGETS`（`src/lib.rs`）のキー名1つだけで、実際に実行される
 # `cargo`引数列はサーバ側にハードコードされた固定テーブルから引く。クライアント由来の
 # 文字列が引数配列へ混入する経路が無いため、`&&`/`;`等のシェルメタ文字を弾く個別チェックは
-# 不要（キーが完全一致しない時点で拒否される）。最終要求から30分操作が無ければ自動終了する
+# 不要（キーが完全一致しない時点で拒否される）。
+#
+# 例外が1つだけある: `RunRequest::LaunchPrivhelper`（E2E専用、`src/privhelper_broker.rs`）は
+# 実行時にしか決まらないパイプ名と置き場を運ぶ。固定テーブルでは表せないので、代わりに
+# 「`C:\harness-e2e\`配下・ファイル名は固定・中身が`target\debug`のビルドとバイト一致・
+# パイプ名は`harness-privhelper-*`の形」の4点をサーバ側で検査する。最終要求から30分操作が無ければ自動終了する
 # （タイマーではなく次接続待ちのタイムアウト、`docs/bugs/BUG-046.md`・退役した
 # %TEMP%キューデーモンの教訓を踏まえた設計）。
 
@@ -31,6 +36,10 @@ path = "src/client.rs"
 harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# ブローカーの禁止側テスト（`C:\harness-e2e\`の外を指す実在ディレクトリ）で使う。
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
