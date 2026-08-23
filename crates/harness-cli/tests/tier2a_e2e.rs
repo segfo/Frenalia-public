@@ -324,6 +324,31 @@ fn apply_cow(ws: &Path, session_id: &str, only: Option<&str>) -> Result<serde_js
     })
 }
 
+/// `harness changes --session <id> --output-format json`を呼び、変更一覧(apply前の見え方)を
+/// JSON配列で返す。各要素は`{op, path, unledgered, rejected, ...}`
+/// (`workspace_cmd.rs`の`fs.change_set()`直列化)。CoW既定化の検証(`PLAN-COW-AS-DEFAULT.md`
+/// 検証タスク手順3「`harness changes`に何がどう出るか」)で、`.git/objects/**`が何件出るかを
+/// 数えるために使う。
+fn list_changes_json(ws: &Path, session_id: &str) -> Result<serde_json::Value, String> {
+    let output = Command::new(harness_exe())
+        .args([
+            "--cwd",
+            ws.to_str().unwrap(),
+            "changes",
+            "--session",
+            session_id,
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .map_err(|e| format!("failed to spawn harness changes: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    serde_json::from_str(stdout.trim()).map_err(|e| {
+        format!("changes stdout is not valid JSON: {e} (stdout={stdout}, stderr={stderr})")
+    })
+}
+
 fn read_file(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))
 }
@@ -382,7 +407,7 @@ fn setup_baseline(ws: &Path, case_name: &str) -> Result<String, String> {
     let run = run_harness(
         ws,
         &run_shell_script_turns(ROUND1_SCRIPT),
-        &["--cow"],
+        &["--sandbox", "tier2a-cow"],
         &format!("{case_name}-r1"),
     );
     if !run.status.success() {
@@ -419,7 +444,12 @@ fn run_round2(
     case_name: &str,
 ) -> Result<(String, HashSet<String>), String> {
     let before = list_cow_sessions();
-    let run = run_harness(ws, &run_shell_script_turns(script), &["--cow"], case_name);
+    let run = run_harness(
+        ws,
+        &run_shell_script_turns(script),
+        &["--sandbox", "tier2a-cow"],
+        case_name,
+    );
     if !run.status.success() {
         return Err(format!("round2 harness invocation failed: {}", run.stderr));
     }
@@ -609,7 +639,12 @@ fn case_g_hard_deny_config_injection() -> Result<(), String> {
     let before = list_cow_sessions();
     let script = "New-Item -ItemType Directory -Force .git | Out-Null; \
 Set-Content .git/config 'evil-injected' -NoNewline";
-    let run = run_harness(&ws, &run_shell_script_turns(script), &["--cow"], "cow-g-r2");
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(script),
+        &["--sandbox", "tier2a-cow"],
+        "cow-g-r2",
+    );
     if !run.status.success() {
         return Err(format!("round2 harness invocation failed: {}", run.stderr));
     }
@@ -645,7 +680,12 @@ fn case_h_toctou_conflict() -> Result<(), String> {
     let session1 = setup_baseline(&ws, "cow-h")?;
     let before = list_cow_sessions();
     let script = "Set-Content test.txt 'modified-by-session' -NoNewline";
-    let run = run_harness(&ws, &run_shell_script_turns(script), &["--cow"], "cow-h-r2");
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(script),
+        &["--sandbox", "tier2a-cow"],
+        "cow-h-r2",
+    );
     if !run.status.success() {
         return Err(format!("round2 harness invocation failed: {}", run.stderr));
     }
@@ -686,7 +726,7 @@ fn case_h_toctou_conflict() -> Result<(), String> {
     Ok(())
 }
 
-/// I: host内蔵`write_file`ツール自身が`--cow`時にCoW保護を経由すること（2026-08-01実機ドライ
+/// I: host内蔵`write_file`ツール自身が`--sandbox tier2a-cow`時にCoW保護を経由すること（2026-08-01実機ドライ
 /// ランで発見したバグの回帰確認、Phase 1修正）。`run_shell`経由（PowerShellの`Set-Content`）
 /// ではなく`write_file`ツールを直接呼ぶ台本で、(a) workspace本体がwrite_file実行直後は
 /// 無傷、(b) 新規CoWセッションが記録され、(c) `apply`で反映される、ことを検証する。
@@ -696,7 +736,7 @@ fn case_i_write_file_tool_is_captured_by_cow() -> Result<(), String> {
     let run = run_harness(
         &ws,
         &write_file_tool_turns("notes.txt", "written via write_file tool"),
-        &["--cow"],
+        &["--sandbox", "tier2a-cow"],
         "cow-i",
     );
     if !run.status.success() {
@@ -706,7 +746,7 @@ fn case_i_write_file_tool_is_captured_by_cow() -> Result<(), String> {
 
     if ws.join("notes.txt").exists() {
         return Err(
-            "write_file must not touch the real workspace directly under --cow (regression)"
+            "write_file must not touch the real workspace directly under --sandbox tier2a-cow (regression)"
                 .to_string(),
         );
     }
@@ -795,7 +835,7 @@ fn case_k_resolve_auto_merges_non_overlapping_conflict() -> Result<(), String> {
     let run1 = run_harness(
         &ws,
         &run_shell_script_turns(baseline_script),
-        &["--cow"],
+        &["--sandbox", "tier2a-cow"],
         "cow-k-r1",
     );
     if !run1.status.success() {
@@ -861,9 +901,9 @@ fn case_k_resolve_auto_merges_non_overlapping_conflict() -> Result<(), String> {
     Ok(())
 }
 
-/// L: `--resume <id> --cow`によるセッション再開（設計書§19.11、仕様確定: 同一upper_dirを
-/// 再利用し同一セッションIDで継続キャプチャする）。1つの`--cow`セッションで変更を行い
-/// （discardせず）プロセスを終了し、同じセッションIDで`--resume --cow`により再開して
+/// L: `--resume <id> --sandbox tier2a-cow`によるセッション再開（設計書§19.11、仕様確定: 同一upper_dirを
+/// 再利用し同一セッションIDで継続キャプチャする）。1つの`--sandbox tier2a-cow`セッションで変更を行い
+/// （discardせず）プロセスを終了し、同じセッションIDで`--resume --sandbox tier2a-cow`により再開して
 /// 追加の変更を行い、`apply`で両方の変更が反映されることを確認する。
 fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
     let ws = case_dir("cow-l-resume");
@@ -871,7 +911,7 @@ fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
     let run1 = run_harness(
         &ws,
         &write_file_tool_turns("first.txt", "written in round 1"),
-        &["--cow"],
+        &["--sandbox", "tier2a-cow"],
         "cow-l-r1",
     );
     if !run1.status.success() {
@@ -887,12 +927,12 @@ fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
         ));
     }
 
-    // 同一session_idで--resume --cowにより再開し、2つ目のファイルを追加する。
+    // 同一session_idで--resume --sandbox tier2a-cowにより再開し、2つ目のファイルを追加する。
     let run2 = run_harness_with_exe(
         &harness_exe(),
         &ws,
         &write_file_tool_turns("second.txt", "written in round 2 after resume"),
-        &["--cow", "--resume", &session_id],
+        &["--sandbox", "tier2a-cow", "--resume", &session_id],
         "cow-l-r2",
     );
     if !run2.status.success() {
@@ -967,7 +1007,12 @@ catch { $deleted = $false; $err = $_.Exception.Message }; \
 $existsAfterDelete = Test-Path newfile.txt; \
 [pscustomobject]@{ createdBefore = $created; existsAfterCreate = $existsAfterCreate; \
 deleted = $deleted; err = $err; existsAfterDelete = $existsAfterDelete } | ConvertTo-Json -Compress";
-    let run = run_harness(&ws, &run_shell_script_turns(script), &["--cow"], "cow-m");
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(script),
+        &["--sandbox", "tier2a-cow"],
+        "cow-m",
+    );
     if !run.status.success() {
         return Err(format!("harness invocation failed: {}", run.stderr));
     }
@@ -1049,7 +1094,12 @@ $subNames = (Get-ChildItem -Force -Name sub) -join ','; \
 $seedContent = [string](Get-Content seed.txt -Raw); \
 [pscustomobject]@{ names = $names; subNames = $subNames; seedContent = $seedContent } \
 | ConvertTo-Json -Compress";
-    let run = run_harness(&ws, &run_shell_script_turns(script), &["--cow"], "cow-n");
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(script),
+        &["--sandbox", "tier2a-cow"],
+        "cow-n",
+    );
     if !run.status.success() {
         return Err(format!("harness invocation failed: {}", run.stderr));
     }
@@ -1128,7 +1178,12 @@ fn case_o_direct_write_into_the_upper_dir_is_recorded() -> Result<(), String> {
     let before = list_cow_sessions();
     const SCRIPT: &str = "Set-Content (Join-Path $env:HARNESS_COW_UPPER 'direct.txt') \
                           'written straight into the upper dir' -NoNewline";
-    let run = run_harness(&ws, &run_shell_script_turns(SCRIPT), &["--cow"], "cow-o");
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(SCRIPT),
+        &["--sandbox", "tier2a-cow"],
+        "cow-o",
+    );
     if !run.status.success() {
         return Err(format!("harness invocation failed: {}", run.stderr));
     }
@@ -1224,7 +1279,7 @@ fn assert_cow_redirect_through_cwd(
         cwd_arg,
         use_process_cwd.then_some(real.as_path()),
         &run_shell_script_turns(&script),
-        &["--cow"],
+        &["--sandbox", "tier2a-cow"],
         case_name,
     );
     if !run.status.success() {
@@ -1238,7 +1293,7 @@ fn assert_cow_redirect_through_cwd(
 
     // 1. 境界: workspace本体は不変。
     expect_eq(
-        "workspace body must stay untouched under --cow",
+        "workspace body must stay untouched under --sandbox tier2a-cow",
         &read_file(&real.join("notes.txt"))?,
         "original",
     )?;
@@ -1354,7 +1409,7 @@ fn case_t_workspace_path_longer_than_max_path() -> Result<(), String> {
         &deep.to_string_lossy(),
         None,
         &run_shell_script_turns("Write-Output 'unreachable'"),
-        &["--cow"],
+        &["--sandbox", "tier2a-cow"],
         CASE,
     );
     if run.status.success() {
@@ -1469,6 +1524,267 @@ fn tier2a_cow_commit_matrix() {
         passed, total,
         "{passed}/{total} CoW commit matrix cases passed (see per-case JSON above for details)"
     );
+}
+
+// ============================================================================
+// 検証: git だけで層3 hard-deny（設定注入パスの拒否）を迂回できるか
+// （`plans/PLAN-COW-AS-DEFAULT.md`「検証タスク」。CoW既定化の決める4つの2の前提）
+// ============================================================================
+
+/// サンドボックス外（このテストプロセス自身、昇格済み）で回す素の`git`。種付けと最後の
+/// `checkout`に使う。ハードニングenv（`harness-core::git::hardening_env`）は**わざと通さない**
+/// ——ここはサンドボックス内でモデルが起動する git ではなく、テスト足場の git だから。
+/// `-c safe.directory=*`と作者identityだけ固定する（AppContainerが書いた upper 由来の
+/// オブジェクトを apply で受けた実リポジトリを、別条件で触っても「dubious ownership」等で
+/// 落ちないように）。
+fn plain_git(ws: &Path, args: &[&str]) -> Result<String, String> {
+    let mut full = vec![
+        "-c".to_string(),
+        "safe.directory=*".to_string(),
+        "-c".to_string(),
+        "user.name=e2e".to_string(),
+        "-c".to_string(),
+        "user.email=e2e@example.com".to_string(),
+    ];
+    full.extend(args.iter().map(|s| s.to_string()));
+    let output = Command::new("git")
+        .current_dir(ws)
+        .args(&full)
+        .output()
+        .map_err(|e| format!("failed to spawn git {args:?}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// 実workspaceに正当な git リポジトリを1つ種付けする（`master`＝README1件のコミット）。
+/// **サンドボックスの外**で作るので、以後の CoW セッション内 git はこの`.git`を読む
+/// （RO読取は read scope 内、書込は upper へリダイレクト）。
+fn git_seed_repo(ws: &Path) -> Result<(), String> {
+    std::fs::write(ws.join("README.md"), "seed\n")
+        .map_err(|e| format!("seed README: {e}"))?;
+    plain_git(ws, &["init", "-q"])?;
+    plain_git(ws, &["add", "README.md"])?;
+    plain_git(ws, &["commit", "-q", "-m", "seed"])?;
+    Ok(())
+}
+
+/// `ws/.git/objects/xx/....`のルース・オブジェクト数（`pack`/`info`は除く）。迂回で
+/// 実リポジトリのオブジェクトが増えたことの傍証に使う。
+fn count_loose_git_objects(ws: &Path) -> usize {
+    let objects = ws.join(".git").join("objects");
+    let mut n = 0;
+    let Ok(top) = std::fs::read_dir(&objects) else {
+        return 0;
+    };
+    for e in top.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        // ルースは2桁hexのファンアウトディレクトリ配下にある。
+        if name.len() == 2 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+            if let Ok(inner) = std::fs::read_dir(e.path()) {
+                n += inner.flatten().count();
+            }
+        }
+    }
+    n
+}
+
+/// CoWセッション内で **git だけ** を使い、hard-deny 対象パス(`.github/workflows/x.yml`)を
+/// 「ワークツリー実体」ではなく「コミット・オブジェクト＋ブランチ移動」として運ぶ台本。
+///
+/// 全 git 出力を`_git-log.txt`（ワークツリー、＝upperへ捕捉される）へ落とし、セッション後に
+/// テスト側が読んで診断できるようにする（run_shellの出力はモックへ返るだけで harness の
+/// stdout には出ないため）。`$env:GIT_*`で作者identityを固定し、ハードニングenvの
+/// `GIT_CONFIG_COUNT`とは衝突しない別チャネルで author を与える。
+const GIT_INJECTION_SCRIPT: &str = r#"$ErrorActionPreference = 'Continue'
+$env:GIT_AUTHOR_NAME = 'e2e'
+$env:GIT_AUTHOR_EMAIL = 'e2e@example.com'
+$env:GIT_COMMITTER_NAME = 'e2e'
+$env:GIT_COMMITTER_EMAIL = 'e2e@example.com'
+'=== git --version ===' | Out-File -FilePath _git-log.txt -Encoding utf8
+git -c safe.directory=* --version *>> _git-log.txt
+New-Item -ItemType Directory -Force .github/workflows | Out-Null
+Set-Content -LiteralPath .github/workflows/x.yml -Value 'name: evil-injected-via-git' -NoNewline
+'=== git add (config-injection path, tracked) ===' | Out-File -FilePath _git-log.txt -Append -Encoding utf8
+git -c safe.directory=* add .github/workflows/x.yml *>> _git-log.txt
+"add exit=$LASTEXITCODE" | Out-File -FilePath _git-log.txt -Append -Encoding utf8
+'=== git commit ===' | Out-File -FilePath _git-log.txt -Append -Encoding utf8
+git -c safe.directory=* commit -m 'inject ci workflow via tracked object' *>> _git-log.txt
+"commit exit=$LASTEXITCODE" | Out-File -FilePath _git-log.txt -Append -Encoding utf8
+'=== git update-ref (move master to the injected commit) ===' | Out-File -FilePath _git-log.txt -Append -Encoding utf8
+git -c safe.directory=* update-ref refs/heads/master HEAD *>> _git-log.txt
+"update-ref exit=$LASTEXITCODE" | Out-File -FilePath _git-log.txt -Append -Encoding utf8
+'=== git rev-parse HEAD ===' | Out-File -FilePath _git-log.txt -Append -Encoding utf8
+git -c safe.directory=* rev-parse HEAD *>> _git-log.txt
+"rev-parse exit=$LASTEXITCODE" | Out-File -FilePath _git-log.txt -Append -Encoding utf8"#;
+
+/// **検証タスク本体**（`plans/PLAN-COW-AS-DEFAULT.md`）。「塞ぐ前に、止まらないことを先に
+/// 観測する」測定である（`test-logic-rules`：順序を逆にすると「元から塞がっていた」のか
+/// 「塞いだから止まった」のか区別できない）。
+///
+/// **仮説**: 層3 hard-deny は書込先パスの前方一致で判定する(`is_config_injection_path`)。
+/// git オブジェクトは内容ハッシュを名前にするので`.git/objects/ab/cdef…`というパスには
+/// 設定注入の情報が無い。「`.github/workflows/x.yml`へ直接書く」は止まるが、「それを含む
+/// オブジェクトを書いてブランチを動かす」は判定の外を通る、という読み。
+///
+/// **対照（B-35：許可側と拒否側を対にする）を1ケース内に持つ**。同じ`.github/workflows/x.yml`の——
+///  - ワークツリー実体（直接パス）は apply で`hard_denied`される（＝拒否機構は生きている）
+///  - git オブジェクト経由は`applied`される（＝それでも運べる）
+/// の両方を観測する。verdict＝BYPASSED は「拒否機構が生きているのに、迂回が成立した」ときだけ。
+///
+/// **成立/不成立**（plan「何が『成立』か」）:
+///  - 成立: apply 後にサンドボックス外で`git checkout`すると`.github/workflows/x.yml`が
+///    実体化する → 現在の hard-deny は追跡ファイル経由の設定注入を止めていない。
+///  - 不成立: どこかで止まる → 返す`Err`に全証跡（changes/apply レポート・git ログ）を載せ、
+///    どの層が止めたかを file:line で辿れるようにする。
+#[test]
+#[ignore]
+fn tier2a_cow_git_can_bypass_config_injection_hard_deny() {
+    // 成功時の証跡は probe が println! 済み。失敗時は全証跡を載せた Err で落とす。
+    if let Err(e) = git_config_injection_bypass_probe() {
+        panic!("{e}");
+    }
+}
+
+fn git_config_injection_bypass_probe() -> Result<(), String> {
+    let ws = case_dir("cow-git-injection");
+    let wt_file = ws.join(".github").join("workflows").join("x.yml");
+    const INJECTED: &str = "name: evil-injected-via-git";
+
+    // Phase 0: サンドボックス外で正当なリポジトリを種付け。
+    git_seed_repo(&ws)?;
+    let objects_before = count_loose_git_objects(&ws);
+
+    // Phase 1: CoW セッションで git だけを使い、設定注入ファイルをコミット＋ref移動。
+    let before = list_cow_sessions();
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(GIT_INJECTION_SCRIPT),
+        &["--sandbox", "tier2a-cow"],
+        "cow-git-injection-r2",
+    );
+    if !run.status.success() {
+        return Err(format!(
+            "harness invocation failed (stdout={} stderr={})",
+            run.stdout, run.stderr
+        ));
+    }
+    let session = new_cow_session(&before)?;
+    let upper = cow_upper_dir(&session);
+    let git_log = std::fs::read_to_string(upper.join("_git-log.txt")).unwrap_or_else(|e| {
+        format!("(could not read upper/_git-log.txt: {e})")
+    });
+
+    // Phase 2: apply 前の changes 一覧（plan 手順3：何がどう出るか）。
+    let changes = list_changes_json(&ws, &session)?;
+    let change_paths: Vec<String> = changes
+        .as_array()
+        .ok_or("changes json is not an array")?
+        .iter()
+        .filter_map(|c| c["path"].as_str().map(|p| p.replace('\\', "/")))
+        .collect();
+    let object_entries: Vec<&String> = change_paths
+        .iter()
+        .filter(|p| p.starts_with(".git/objects/"))
+        .collect();
+    let working_tree_entry_present = change_paths.iter().any(|p| p == ".github/workflows/x.yml");
+
+    if object_entries.is_empty() {
+        return Err(format!(
+            "git wrote NO objects into the CoW ledger — git likely failed inside the session, so \
+             the bypass could not even be attempted. Investigate before drawing any conclusion.\n\
+             changes.paths={change_paths:?}\n--- upper/_git-log.txt ---\n{git_log}"
+        ));
+    }
+    if !working_tree_entry_present {
+        return Err(format!(
+            "the working-tree copy of .github/workflows/x.yml is missing from the ledger; the \
+             deny-side control cannot be established.\nchanges.paths={change_paths:?}\n\
+             --- upper/_git-log.txt ---\n{git_log}"
+        ));
+    }
+
+    // Phase 3: apply。拒否側(ワークツリー実体)と許可側(オブジェクト)を同じレポートで観測する。
+    let report = apply_cow(&ws, &session, None)?;
+    let as_paths = |key: &str| -> Vec<String> {
+        report[key]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|p| p.replace('\\', "/")))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let hard_denied = as_paths("hard_denied");
+    let applied = as_paths("applied");
+
+    // 拒否側（機構が生きている証拠）: ワークツリーの設定注入パスは hard_denied。
+    let wt_hard_denied = hard_denied.iter().any(|p| p == ".github/workflows/x.yml");
+    // 許可側（迂回）: オブジェクトは applied されており、hard_denied されていない。
+    let objects_applied = applied
+        .iter()
+        .filter(|p| p.starts_with(".git/objects/"))
+        .count();
+    let objects_hard_denied = hard_denied.iter().any(|p| p.starts_with(".git/objects/"));
+    // ブランチ参照も運ばれたか。
+    let ref_applied = applied.iter().any(|p| p == ".git/refs/heads/master");
+
+    // apply 直後、ワークツリーのファイルはまだ実体化していないはず（hard_denied されたので）。
+    let present_right_after_apply = wt_file.exists();
+
+    // Phase 4: サンドボックス外で checkout → 迂回で運んだオブジェクトから実体化するか。
+    let checkout = plain_git(&ws, &["checkout", "HEAD", "--", ".github/workflows/x.yml"]);
+    let materialized = wt_file.exists();
+    let content = if materialized {
+        std::fs::read_to_string(&wt_file).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let objects_after = count_loose_git_objects(&ws);
+
+    let bypassed = wt_hard_denied
+        && objects_applied > 0
+        && !objects_hard_denied
+        && materialized
+        && content == INJECTED;
+
+    let evidence = serde_json::json!({
+        "verdict": if bypassed { "BYPASSED" } else { "BLOCKED_OR_INCONCLUSIVE" },
+        "control_working_tree_path_hard_denied": wt_hard_denied,
+        "objects_applied_count": objects_applied,
+        "objects_hard_denied": objects_hard_denied,
+        "ref_master_applied": ref_applied,
+        "ledger_object_entries": object_entries.len(),
+        "loose_objects_before": objects_before,
+        "loose_objects_after_apply": objects_after,
+        "working_tree_file_present_right_after_apply": present_right_after_apply,
+        "materialized_by_outside_sandbox_checkout": materialized,
+        "materialized_content": content,
+        "checkout_result": checkout.err(),
+        "apply_hard_denied": hard_denied,
+        "apply_applied_sample": applied.iter().take(20).collect::<Vec<_>>(),
+        "changes_paths_sample": change_paths.iter().take(30).collect::<Vec<_>>(),
+    });
+
+    if !bypassed {
+        // 不成立: 後始末しない（調査のため残す）。どの層が止めたかを証跡から辿る。
+        return Err(format!(
+            "expected the git-object route to bypass the layer-3 hard-deny, but the reproduction \
+             did NOT complete a clean bypass. Full evidence follows.\n{evidence:#}\n\
+             --- upper/_git-log.txt ---\n{git_log}"
+        ));
+    }
+
+    println!("{evidence:#}");
+    cleanup_on_success(&ws, &[&session], "cow-git-injection");
+    Ok(())
 }
 
 // ============================================================================
@@ -2981,7 +3297,10 @@ fn tier2a_smb445_layer2() {
     let host_file = Path::new(CASE_ROOT).join("n8-smb-host.txt");
     let host = std::fs::read_to_string(&host_file)
         .unwrap_or_else(|e| {
-            panic!("{} が読めない（445が開いている検証用ホストのIPを1行で置くこと）: {e}", host_file.display())
+            panic!(
+                "{} が読めない（445が開いている検証用ホストのIPを1行で置くこと）: {e}",
+                host_file.display()
+            )
         })
         .trim()
         .to_string();
@@ -3118,4 +3437,625 @@ fn tier2a_smb445_layer2() {
     );
 
     cleanup_on_success(&ws, &[], name);
+}
+
+// ============================================================================
+// W7: ワークスペース**内**の実行が、そのファイルのACEで制御されるか（D-79の前提測定）
+//
+// 問い（`test-logic-rules`問1を一文で）: **「ワークスペース内のファイルを起動できるか
+// どうかは、そのファイルのDACLが持つ実行権（`FILE_EXECUTE`）で決まるか」**。
+//
+// なぜ測るか: `acl_grant.rs`の`workspace_rwx_mask()`は
+// `FILE_GENERIC_READ|FILE_GENERIC_WRITE|FILE_GENERIC_EXECUTE|DELETE`を、workspace rootへ
+// `CONTAINER_INHERIT_ACE|OBJECT_INHERIT_ACE`の**1本のACE**で付ける。つまりツリー内の
+// 全ファイルが実行可で、`cargo build`が吐いたexeもそのまま走る。D-79
+// （`plans/DESIGN-SANDBOX-APPPOLICY.md`）はこれを宣言制へ変える決定だが**未実装**であり、
+// D-79自身が「スクリプトは本決定では止まらない」と限界を書いている。その2つ——
+// 「いまは止まらない」と「ACEを変えれば止まる／スクリプトは止まらない」——を実測する。
+//
+// 2ラウンドで測る（`test-logic-rules`問2: 禁止側だけでは機構の生死を判定できない）。
+//   ラウンドA（既定のACEのまま）: 全経路が**走る**こと。ここが緑でなければ、ラウンドBの
+//     「走らない」は「ACEが効いた」の証拠にならない（計器が死んでいるだけかもしれない）。
+//   ラウンドB（対象ファイルへ明示DENYを1本足す）: PEだけが止まり、スクリプトは止まらないこと。
+//
+// **これはD-79の実装のテストではない。** D-79は継承ACEを2本に割る形
+// （`OBJECT_INHERIT_ACE`側から実行権を落とす）を要求しており、本測定が使う明示DENYとは
+// ACEの形が違う。本測定が答えるのはその手前の命題（実行可否はEXECUTE権で決まるのか）だけで、
+// D-79の付与コスト・2本割りの成否は`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`のM2が持つ。
+//
+// `dev-elevated-run.exe e2e-exec-ace`（フィルタ`tier2a_workspace_exec_ace_matrix`）。
+
+/// 実行経路1つ。`token`が`run_shell`の出力に現れたら「起動できた」。
+///
+/// ラウンドごとの**期待値**を持つ。`b`（明示DENY）と`c`（ALLOWから権利を落とす）を
+/// 分けているのは、**AppContainerではこの2つが同じ結果にならない**ためで、
+/// それ自体が本測定で分かったことである（下の`EXEC_PROBES`の`why`を参照）。
+struct ExecProbe {
+    name: &'static str,
+    token: &'static str,
+    /// ラウンドB（対象ファイルへ明示DENY ACEを足す）で走るか。
+    runs_in_b: bool,
+    /// ラウンドC（対象ファイルのcapability SID宛ALLOWから権利を落とす＝D-79の形）で走るか。
+    runs_in_c: bool,
+    why: &'static str,
+}
+
+/// トークンは**互いに接頭辞にならない**ようにしてある。`HP_EXE`と`HP_EXE_COPY`のような
+/// 組にすると`contains`が前者で後者に当たり、片方しか走っていなくても両方緑になる。
+///
+/// **JScript（`cscript.exe`）の経路は落とした。** ラウンドAで
+/// `CScript Error: Loading your settings failed. (Access is denied.)`となり、
+/// スクリプトのDACLとは無関係な理由（cscriptが自分の設定をHKCUから読めない）で起動しない。
+/// **計器として使えないものを行列に残すと、Bの「走らなかった」がACEの手柄に見える。**
+const EXEC_PROBES: &[ExecProbe] = &[
+    ExecProbe {
+        name: "pe-placed-before-launch",
+        token: "HP_A_EXE",
+        runs_in_b: true,
+        runs_in_c: false,
+        why: "PEの起動はイメージを実行権で開くので、capability SID宛ALLOWから実行権を\
+              落とせば止まる（C）。**明示DENYでは止まらない**（B）——AppContainerの\
+              アクセスチェックはcapability SIDを許可の側でしか見ていない",
+    },
+    ExecProbe {
+        name: "pe-copied-inside-the-session",
+        token: "HP_B_EXECOPY",
+        runs_in_b: true,
+        runs_in_c: true,
+        why: "手術は元のファイルにしか掛かっていない。読取は残っているので複製が作れ、\
+              複製はworkspace rootの継承ALLOW（実行権つき）を受け取る。\
+              **D-79が継承ACEを2本に割るのはここを塞ぐため**で、ファイル単位の手当てでは閉じない",
+    },
+    ExecProbe {
+        name: "ps1-invoked-directly",
+        token: "HP_C_PS1",
+        runs_in_b: true,
+        runs_in_c: true,
+        why: "pwshはスクリプトを読むだけ。実行権を落としてもREADがあれば走る（D-79の限界節）",
+    },
+    ExecProbe {
+        name: "ps1-via-scriptblock",
+        token: "HP_D_IEX",
+        runs_in_b: true,
+        runs_in_c: true,
+        why: "同上。読取と実行の区別がそもそも無い経路",
+    },
+    ExecProbe {
+        name: "cmd-batch-invoked-directly",
+        token: "HP_E_CMD",
+        runs_in_b: true,
+        runs_in_c: false,
+        why: "**実測で分かったこと**: pwshが`.\\x.cmd`を直に起動する経路は`CreateProcess`を通り、\
+              バッチファイル自身の実行権が見られる。スクリプトでも**この呼び方なら**止まる",
+    },
+    ExecProbe {
+        name: "cmd-batch-handed-to-the-interpreter",
+        token: "HP_I_CMDX",
+        runs_in_b: true,
+        runs_in_c: true,
+        why: "同じバッチを`%ComSpec% /c <path>`として渡すと、cmd.exeが**読むだけ**になるので\
+              実行権を落としても走る。**呼び方を変えるだけで直上のケースの拒否が外れる**\
+              ——これがパスベースの実行制御とインタプリタの関係そのものである",
+    },
+    ExecProbe {
+        name: "python-script",
+        token: "HP_G_PY",
+        runs_in_b: true,
+        runs_in_c: true,
+        why: "python.exeがスクリプトを読むだけ（ユーザーが名指しした`evil.py`の形）",
+    },
+    ExecProbe {
+        name: "ps1-with-read-removed",
+        token: "HP_H_RDENY",
+        runs_in_b: true,
+        runs_in_c: false,
+        why: "スクリプトに効く唯一のレバーはREADで、しかもALLOWから落とす形でしか効かない。\
+              **ただしワークスペース内で読取を落とすことは実運用では選べない**\
+              ——作業場そのものが読めなくなる",
+    },
+];
+
+/// プローブ本体。ラウンドA・Bで**同じ文字列**を使う（計器を変えると差分が読めない）。
+/// `@PY@`だけは、この機にPythonが無いときに空へ差し替える。
+///
+/// **T-09の危険構文マーカーを踏まないように書いてある**（`harness-engine/src/permission.rs`の
+/// `looks_like_allowlist_bypass`）。`Invoke-Expression`と`cmd.exe /c`は`accept-all`下でも
+/// 強制Promptへ落ち、ヘッドレスでは自動拒否になる——最初の実測はこれで`run_shell`ごと
+/// 拒否された。ここで測りたいのは**ACLの層**なので、同じ意味の別の綴り
+/// （`[scriptblock]::Create`・`.cmd`の直接起動）へ置き換えてある。
+/// **この置き換えが成立すること自体が、T-09が境界ではないこと**（`DESIGN.md`が
+/// 「明白物の追加ブロックであり安全の根拠にしない」と書いているとおり）**の実例**である。
+const EXEC_PROBE_SCRIPT: &str = "\
+$ErrorActionPreference='SilentlyContinue'; \
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force } catch { }; \
+Remove-Item -LiteralPath '.\\copied.exe' -Force -ErrorAction SilentlyContinue; \
+try { & '.\\evil.exe' /c echo HP_A_EXE } catch { }; \
+try { Copy-Item -LiteralPath '.\\evil.exe' -Destination '.\\copied.exe' -Force -ErrorAction Stop; \
+      & '.\\copied.exe' /c echo HP_B_EXECOPY } catch { }; \
+try { & '.\\evil.ps1' } catch { }; \
+try { & ([scriptblock]::Create((Get-Content -LiteralPath '.\\evil_iex.ps1' -Raw))) } catch { }; \
+try { & '.\\evil.cmd' } catch { }; \
+try { & $env:ComSpec '/c' '.\\evil2.cmd' } catch { }; \
+try { & '.\\evil_readdeny.ps1' } catch { }; \
+@PY@\
+Write-Output 'HP_PROBE_DONE'";
+
+const EXEC_PROBE_PY_LINE: &str = "try { & '.\\py\\python.exe' '.\\evil.py' } catch { }; ";
+
+/// PowerShellを1本走らせて標準出力を返す。ACEの読み書きに使う。
+fn powershell(script: &str) -> Result<String, String> {
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| format!("failed to spawn powershell: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "powershell failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// このワークスペースへ付いている **workspace capability SID**（D-54）を読む。
+///
+/// DENYの宛先はこれでなければならない——workspaceツリーのACEはセッションのpackage SIDではなく
+/// **workspace＋モード単位のcapability SID**宛に付く（`tier2a/workspace_capability.rs`）。
+/// package SID宛にDENYを置いても当たらないので、間違えると「DENYを置いたのに走った」という
+/// 誤った結論になる。継承あり（`ObjectInherit`=2）かつ実行権（`FILE_EXECUTE`=0x20）を持つ
+/// ものだけを採る——`rwx`モードのworkspaceには1本しか無い。
+fn workspace_capability_sid(ws: &Path) -> Result<String, String> {
+    let script = WS_CAP_SID_SCRIPT.replace("@WS@", &ws.display().to_string());
+    let found = powershell(&script)?;
+    let sids: Vec<&str> = found.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
+    match sids.as_slice() {
+        [one] => Ok((*one).to_string()),
+        [] => Err(format!(
+            "{} に継承ありのworkspace capability ACE（S-1-15-3-*）が1本も無い。\
+             preflightが付与に失敗しているか、SIDの選び方が実装とずれている（D-54）",
+            ws.display()
+        )),
+        many => Err(format!(
+            "workspace capability ACEが{}本あり、どれを止めるべきか決められない: {many:?}",
+            many.len()
+        )),
+    }
+}
+
+const WS_CAP_SID_SCRIPT: &str = "\
+@((Get-Acl -LiteralPath '@WS@').Access | \
+  Where-Object { $_.IdentityReference.Value -like 'S-1-15-3-*' -and \
+                 (([int]$_.InheritanceFlags -band 2) -eq 2) -and \
+                 (([int]$_.FileSystemRights -band 0x20) -eq 0x20) -and \
+                 ($_.AccessControlType -eq 'Allow') } | \
+  ForEach-Object { $_.IdentityReference.Value }) -join \"`n\"";
+
+/// `file`へ`sid`宛の**明示DENY** ACEを1本足し、**読み返して載ったことを確かめる**
+/// （`test-logic-rules`型A: 「設定した」と「効いている」は別の事実）。
+/// `rights`は`FileSystemRights`の数値（`0x20`=`ExecuteFile`、`0x1`=`ReadData`）。
+fn add_deny_ace(file: &Path, sid: &str, rights: u32) -> Result<(), String> {
+    let script = DENY_ACE_SCRIPT
+        .replace("@FILE@", &file.display().to_string())
+        .replace("@SID@", sid)
+        .replace("@RIGHTS@", &format!("{rights}"));
+    let echoed = powershell(&script)?;
+    if !echoed.contains("DENY_VERIFIED") {
+        return Err(format!(
+            "{} へのDENY ACE（rights=0x{rights:x}）が読み返しで確認できなかった: {echoed}",
+            file.display()
+        ));
+    }
+    Ok(())
+}
+
+const DENY_ACE_SCRIPT: &str = "\
+$f='@FILE@'; \
+$acl = Get-Acl -LiteralPath $f; \
+$id = New-Object System.Security.Principal.SecurityIdentifier('@SID@'); \
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule(\
+  $id, [System.Security.AccessControl.FileSystemRights]@RIGHTS@, 'None', 'None', 'Deny'); \
+$acl.AddAccessRule($rule); \
+Set-Acl -LiteralPath $f -AclObject $acl; \
+$back = (Get-Acl -LiteralPath $f).Access | Where-Object { \
+  $_.AccessControlType -eq 'Deny' -and $_.IdentityReference.Value -eq '@SID@' -and \
+  (([int]$_.FileSystemRights -band @RIGHTS@) -eq @RIGHTS@) }; \
+if ($back) { 'DENY_VERIFIED' } else { 'DENY_MISSING' }";
+
+/// `file`のcapability SID宛**ALLOW**を`rights`へ張り替える（D-79が採る形）。
+///
+/// 明示DENYを足す[`add_deny_ace`]との違いが本測定の核心である——AppContainerの
+/// アクセスチェックはcapability SIDを**許可の側でしか見ない**ので、DENYは素通りする。
+/// 止めたければ「許可しない」しかない。
+///
+/// 手順は2段。(1) そのファイルの継承を切って継承ACEを明示コピーへ移し
+/// （切らないとworkspace rootの継承ALLOWが実行権を運び続ける）、(2) capability SID宛の
+/// ルールを全消しして`rights`のALLOWを1本だけ置く。`PurgeAccessRules`はDENYも消すので、
+/// ラウンドBで置いたDENYはここで無くなる（ラウンドCを単独の条件として測るため）。
+fn strip_capability_right(file: &Path, sid: &str, rights: u32) -> Result<(), String> {
+    let script = STRIP_ACE_SCRIPT
+        .replace("@FILE@", &file.display().to_string())
+        .replace("@SID@", sid)
+        .replace("@RIGHTS@", &format!("{rights}"));
+    let echoed = powershell(&script)?;
+    if !echoed.contains("STRIP_VERIFIED") {
+        return Err(format!(
+            "{} のcapability ALLOWを0x{rights:x}へ張り替えられなかった: {echoed}",
+            file.display()
+        ));
+    }
+    Ok(())
+}
+
+const STRIP_ACE_SCRIPT: &str = "\
+$f='@FILE@'; \
+$acl = Get-Acl -LiteralPath $f; \
+$acl.SetAccessRuleProtection($true, $true); \
+Set-Acl -LiteralPath $f -AclObject $acl; \
+$acl = Get-Acl -LiteralPath $f; \
+$id = New-Object System.Security.Principal.SecurityIdentifier('@SID@'); \
+[void]$acl.PurgeAccessRules($id); \
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule(\
+  $id, [System.Security.AccessControl.FileSystemRights]@RIGHTS@, 'None', 'None', 'Allow'); \
+$acl.AddAccessRule($rule); \
+Set-Acl -LiteralPath $f -AclObject $acl; \
+$back = @((Get-Acl -LiteralPath $f).Access | \
+  Where-Object { $_.IdentityReference.Value -eq '@SID@' }); \
+if ($back.Count -eq 1 -and $back[0].AccessControlType -eq 'Allow' -and \
+    [int]$back[0].FileSystemRights -eq @RIGHTS@) { 'STRIP_VERIFIED' } \
+else { 'STRIP_UNEXPECTED:' + (($back | ForEach-Object { \
+  $_.AccessControlType.ToString() + ':' + [int]$_.FileSystemRights }) -join ',') }";
+
+/// `file`のDACLを全件、`種別 0xマスク 継承 主体`の形で返す（記録用）。
+fn full_dacl(file: &Path) -> Result<String, String> {
+    let script = FULL_DACL_SCRIPT.replace("@FILE@", &file.display().to_string());
+    powershell(&script)
+}
+
+const FULL_DACL_SCRIPT: &str = "\
+(Get-Acl -LiteralPath '@FILE@').Access | ForEach-Object { \
+  '{0,-5} 0x{1:x8} inherited={2,-5} {3}' -f $_.AccessControlType, \
+  ([int]$_.FileSystemRights), $_.IsInherited, $_.IdentityReference.Value }";
+
+/// `file`に載っているcapability SID宛の**ALLOW**が1本だけであることを確かめ、そのマスクを返す。
+/// 2本以上あると「どれを落とせばよいか」が決まらないので、黙って先頭を採らずエラーにする。
+fn capability_allow_mask(file: &Path, sid: &str) -> Result<u32, String> {
+    let listed = capability_aces_on(file, sid)?;
+    let masks: Vec<u32> = listed
+        .split(',')
+        .filter_map(|e| e.trim().strip_prefix("Allow:"))
+        .filter_map(|m| m.trim().parse::<u32>().ok())
+        .collect();
+    match masks.as_slice() {
+        [one] => Ok(*one),
+        _ => Err(format!(
+            "{} のcapability ALLOWが1本に決まらない: {listed:?}",
+            file.display()
+        )),
+    }
+}
+
+/// `file`に載っているcapability SID宛のACEを`種別:マスク`の一覧で返す。
+/// ラウンドCの**後**にもう一度読むために要る——preflightが再付与していたら、
+/// 「走らなかった」も「走った」も手術の結果として読めない（`test-logic-rules`型A）。
+fn capability_aces_on(file: &Path, sid: &str) -> Result<String, String> {
+    let script = READ_CAP_ACE_SCRIPT
+        .replace("@FILE@", &file.display().to_string())
+        .replace("@SID@", sid);
+    powershell(&script)
+}
+
+const READ_CAP_ACE_SCRIPT: &str = "\
+(@((Get-Acl -LiteralPath '@FILE@').Access | \
+  Where-Object { $_.IdentityReference.Value -eq '@SID@' } | \
+  ForEach-Object { $_.AccessControlType.ToString() + ':' + [int]$_.FileSystemRights }) \
+  -join ',')";
+
+/// この機のPython（uv管理）の在処。無ければ`None`——**黙って飛ばさず**、呼び出し側が
+/// 「測っていない」と印字する（`test-logic-rules`型B: 0件と未実行を区別する）。
+fn uv_python_dir() -> Option<PathBuf> {
+    let out = Command::new("uv").args(["python", "find"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let exe = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let dir = exe.parent()?.to_path_buf();
+    dir.is_dir().then_some(dir)
+}
+
+/// ワークスペースへ、実行を試みる対象を並べる。PEは`cmd.exe`の複製を使う——
+/// `/c echo <token>`で「起動できた」ことが出力に出るうえ、この測定のために新しい
+/// バイナリを作らずに済む（対象がcmdであること自体には意味が無い。**workspace内に在る
+/// PEである**ことだけが効く）。
+fn plant_exec_artifacts(ws: &Path, python_dir: Option<&Path>) -> Result<(), String> {
+    let sys32 = PathBuf::from(r"C:\Windows\System32");
+    std::fs::copy(sys32.join("cmd.exe"), ws.join("evil.exe"))
+        .map_err(|e| format!("copy cmd.exe -> evil.exe: {e}"))?;
+    let files: &[(&str, &str)] = &[
+        ("evil.ps1", "Write-Output 'HP_C_PS1'\r\n"),
+        ("evil_iex.ps1", "Write-Output 'HP_D_IEX'\r\n"),
+        ("evil.cmd", "@echo off\r\n@echo HP_E_CMD\r\n"),
+        ("evil2.cmd", "@echo off\r\n@echo HP_I_CMDX\r\n"),
+        ("evil_readdeny.ps1", "Write-Output 'HP_H_RDENY'\r\n"),
+        ("evil.py", "print(\"HP_G_PY\")\r\n"),
+    ];
+    for (name, body) in files {
+        std::fs::write(ws.join(name), body).map_err(|e| format!("write {name}: {e}"))?;
+    }
+    if let Some(src) = python_dir {
+        let script = COPY_PY_SCRIPT
+            .replace("@SRC@", &src.display().to_string())
+            .replace("@DST@", &ws.join("py").display().to_string());
+        powershell(&script)?;
+        if !ws.join("py").join("python.exe").is_file() {
+            return Err("pythonの複製に失敗した（py\\python.exe が無い）".to_string());
+        }
+    }
+    Ok(())
+}
+
+const COPY_PY_SCRIPT: &str =
+    "Copy-Item -LiteralPath '@SRC@' -Destination '@DST@' -Recurse -Force; 'copied'";
+
+/// 1ラウンド走らせて、どのトークンが出力に現れたかを返す。
+fn run_exec_probe(ws: &Path, case_name: &str, with_python: bool) -> Result<Vec<String>, String> {
+    let script = EXEC_PROBE_SCRIPT.replace(
+        "@PY@",
+        if with_python { EXEC_PROBE_PY_LINE } else { "" },
+    );
+    let run = run_harness(
+        ws,
+        &run_shell_script_turns(&script),
+        &["--sandbox", "tier2a"],
+        case_name,
+    );
+    if !run.status.success() {
+        return Err(format!(
+            "harness invocation itself failed ({}): {}",
+            run.status, run.stderr
+        ));
+    }
+    let outcome = parse_json_stdout(&run)?;
+    let text = outcome["tool_calls"]
+        .get(0)
+        .and_then(|c| c["result"].as_str())
+        .ok_or_else(|| format!("no tool_calls[0].result: {outcome}"))?
+        .to_string();
+    // B-12型の穴を塞ぐ: 「トークンが無い」を「起動できなかった」と読む前に、
+    // **スクリプトが最後まで走ったこと**を確かめる。途中で死んでいれば以降は全部
+    // 「起動できなかった」に見える。
+    if !text.contains("HP_PROBE_DONE") {
+        let hint = if text.contains("permission denied by policy") {
+            "（run_shellがツール層で拒否されている。プローブ文字列がT-09の危険構文マーカー\
+             〔`permission.rs`の`looks_like_allowlist_bypass`〕を踏んでいないか見ること）"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "プローブスクリプトが最後まで走っていない（HP_PROBE_DONEが無い）。\
+             以降のトークンの不在は「起動を拒否された」の証拠にならない{hint}: {text}"
+        ));
+    }
+    eprintln!("[exec-ace] --- round {case_name} raw output ---\n{text}\n[exec-ace] --- end ---");
+    Ok(EXEC_PROBES
+        .iter()
+        .filter(|p| text.contains(p.token))
+        .map(|p| p.name.to_string())
+        .collect())
+}
+
+/// 撤収（`bug-pattern-rules` B-01）。workspace capability ACEは**セッションを跨いで残る**
+/// 設計（D-54）なので、ディレクトリを消すだけでは台帳にエントリが残る。
+fn exec_ace_teardown(ws: &Path) {
+    let out = Command::new(harness_exe())
+        .args(["fs", "revoke-workspace"])
+        .arg(ws)
+        .output();
+    match out {
+        Ok(o) => eprintln!(
+            "[exec-ace] fs revoke-workspace -> {} {}",
+            o.status,
+            String::from_utf8_lossy(&o.stdout).trim()
+        ),
+        Err(e) => eprintln!("[exec-ace] fs revoke-workspace failed to spawn: {e}"),
+    }
+    let _ = std::fs::remove_dir_all(ws);
+}
+
+#[test]
+#[ignore = "実Tier2a。dev-elevated-runnerの e2e-exec-ace 経由で走らせること"]
+fn tier2a_workspace_exec_ace_matrix() {
+    let _guard = CROSS_MATRIX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ws = case_dir("exec-ace");
+    let python_dir = uv_python_dir();
+    if python_dir.is_none() {
+        eprintln!(
+            "[exec-ace] このマシンで`uv python find`が解決しなかったので、`evil.py`の経路は\
+             **測っていない**（結果表では skipped と表示する）"
+        );
+    }
+    let with_python = python_dir.is_some();
+
+    if let Err(e) = plant_exec_artifacts(&ws, python_dir.as_deref()) {
+        exec_ace_teardown(&ws);
+        panic!("測定対象を置けなかった: {e}");
+    }
+
+    // --- ラウンドA: 既定のACEのまま。全経路が走ることを確かめる ---
+    let ran_a = match run_exec_probe(&ws, "exec-ace-round-a", with_python) {
+        Ok(v) => v,
+        Err(e) => {
+            exec_ace_teardown(&ws);
+            panic!("round A: {e}");
+        }
+    };
+
+    // --- 手術の宛先を決める ---
+    let sid = match workspace_capability_sid(&ws) {
+        Ok(s) => s,
+        Err(e) => {
+            exec_ace_teardown(&ws);
+            panic!("workspace capability SIDが引けない: {e}");
+        }
+    };
+    eprintln!("[exec-ace] workspace capability SID = {sid}");
+
+    // 落とす前のマスクは**実物から読む**（`workspace_rwx_mask()`の値をテストへ書き写すと、
+    // 製品側が変わったときにテストだけが古い値を測り続ける。B-05）。
+    let granted = match capability_allow_mask(&ws.join("evil.exe"), &sid) {
+        Ok(m) => m,
+        Err(e) => {
+            exec_ace_teardown(&ws);
+            panic!("付与済みマスクが読めない: {e}");
+        }
+    };
+    eprintln!("[exec-ace] workspace配下へ実際に付いているマスク = 0x{granted:x}");
+
+    const EXECUTE_FILE: u32 = 0x20;
+    const READ_DATA: u32 = 0x1;
+    let mut targets: Vec<(&str, u32)> = vec![
+        ("evil.exe", EXECUTE_FILE),
+        ("evil.ps1", EXECUTE_FILE),
+        ("evil_iex.ps1", EXECUTE_FILE),
+        ("evil.cmd", EXECUTE_FILE),
+        ("evil2.cmd", EXECUTE_FILE),
+        ("evil_readdeny.ps1", READ_DATA),
+    ];
+    if with_python {
+        targets.push(("evil.py", EXECUTE_FILE));
+    }
+
+    // --- ラウンドB: 対象ファイルへ**明示DENY**を1本足す ---
+    for (name, right) in &targets {
+        if let Err(e) = add_deny_ace(&ws.join(name), &sid, *right) {
+            exec_ace_teardown(&ws);
+            panic!("DENY ACEを置けなかった: {e}");
+        }
+    }
+    eprintln!("[exec-ace] {} 件のDENY ACEを置いた", targets.len());
+    let ran_b = match run_exec_probe(&ws, "exec-ace-round-b", with_python) {
+        Ok(v) => v,
+        Err(e) => {
+            exec_ace_teardown(&ws);
+            panic!("round B: {e}");
+        }
+    };
+
+    // --- ラウンドC: capability SID宛**ALLOWから権利を落とす**（D-79が採る形） ---
+    for (name, right) in &targets {
+        let want = granted & !right;
+        if let Err(e) = strip_capability_right(&ws.join(name), &sid, want) {
+            exec_ace_teardown(&ws);
+            panic!("ALLOWの張り替えに失敗した: {e}");
+        }
+    }
+    eprintln!("[exec-ace] {} 件のALLOWから権利を落とした", targets.len());
+    // 手術後のDACLを**丸ごと**残す。ラウンドCの結論（「capability SIDのALLOWが決め手」）は、
+    // 「同じファイルがAdministratorsやAuthenticated Usersには依然フルに許可されている」
+    // ことと対にして初めて言える。推論ではなく記録にしておく。
+    match full_dacl(&ws.join("evil.exe")) {
+        Ok(d) => eprintln!("[exec-ace] evil.exe のDACL（手術後）:\n{d}"),
+        Err(e) => eprintln!("[exec-ace] evil.exe のDACLを読めなかった: {e}"),
+    }
+    let ran_c = match run_exec_probe(&ws, "exec-ace-round-c", with_python) {
+        Ok(v) => v,
+        Err(e) => {
+            exec_ace_teardown(&ws);
+            panic!("round C: {e}");
+        }
+    };
+
+    // --- ラウンドCの手術が生き残ったかを読み返す ---
+    //
+    // preflightが再付与していたら、Cの結果は「手術の効果」として読めない
+    // （`test-logic-rules`型A: 設定したことと効いていることは別の事実）。
+    let mut surgery_lost: Vec<String> = Vec::new();
+    for (name, right) in &targets {
+        let want = granted & !right;
+        match capability_aces_on(&ws.join(name), &sid) {
+            Ok(actual) => {
+                let expected = format!("Allow:{want}");
+                if actual.trim() != expected {
+                    surgery_lost.push(format!(
+                        "{name}: ラウンドCの後にcapability ACEが {actual:?} になっている\
+                         （期待 {expected:?}）。preflightの再付与に上書きされた疑いがあり、\
+                         このファイルのCの結果は読めない"
+                    ));
+                }
+            }
+            Err(e) => surgery_lost.push(format!("{name}: 読み返せない: {e}")),
+        }
+    }
+
+    // --- 判定 ---
+    let mut failures: Vec<String> = surgery_lost;
+    for probe in EXEC_PROBES {
+        let skipped = probe.name == "python-script" && !with_python;
+        let a = ran_a.iter().any(|n| n == probe.name);
+        let b = ran_b.iter().any(|n| n == probe.name);
+        let c = ran_c.iter().any(|n| n == probe.name);
+        let word = |x: bool| if x { "ran" } else { "blocked" };
+        println!(
+            "{}",
+            serde_json::json!({
+                "probe": probe.name,
+                "token": probe.token,
+                "round_a_default": if skipped { serde_json::Value::Null } else { a.into() },
+                "round_b_explicit_deny": if skipped { serde_json::Value::Null } else { b.into() },
+                "round_c_allow_without_the_right":
+                    if skipped { serde_json::Value::Null } else { c.into() },
+                "expected_b": probe.runs_in_b,
+                "expected_c": probe.runs_in_c,
+                "why": probe.why,
+                "verdict": if skipped {
+                    "skipped".to_string()
+                } else {
+                    format!("A={} B={} C={}", word(a), word(b), word(c))
+                },
+            })
+        );
+        if skipped {
+            continue;
+        }
+        if !a {
+            failures.push(format!(
+                "{}: ラウンドA（既定のACE）で走らなかった。この経路は計器として使えないので、\
+                 B・Cの結果も読めない",
+                probe.name
+            ));
+            continue;
+        }
+        if b != probe.runs_in_b {
+            failures.push(format!(
+                "{}: ラウンドB（明示DENY）の期待は{}だが実際は{}（想定: {}）",
+                probe.name,
+                word(probe.runs_in_b),
+                word(b),
+                probe.why
+            ));
+        }
+        if c != probe.runs_in_c {
+            failures.push(format!(
+                "{}: ラウンドC（ALLOWから権利を落とす）の期待は{}だが実際は{}（想定: {}）",
+                probe.name,
+                word(probe.runs_in_c),
+                word(c),
+                probe.why
+            ));
+        }
+    }
+
+    if failures.is_empty() {
+        exec_ace_teardown(&ws);
+    } else {
+        eprintln!(
+            "[exec-ace] 失敗したのでワークスペースを {} に残す（調査用）",
+            ws.display()
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "workspace exec ACE matrix:\n{}",
+        failures.join("\n")
+    );
 }
