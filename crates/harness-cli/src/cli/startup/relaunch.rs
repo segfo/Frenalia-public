@@ -134,8 +134,9 @@ const WAIT_TIMEOUT_MS: u32 = 10_000;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::Cli;
+    use crate::cli::{Cli, SandboxChoiceArg};
     use clap::Parser;
+    use harness_core::SandboxChoice;
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
@@ -190,13 +191,17 @@ mod tests {
     /// それを「`--resume`の値」とみなして落としてはいけない。
     #[test]
     fn a_valueless_resume_does_not_swallow_the_next_flag() {
-        let out = relaunch_args(&os(&["--resume", "--cow"]), Path::new(r"C:\ws\next"), 7);
+        let out = relaunch_args(
+            &os(&["--resume", "--sandbox", "tier2a-cow"]),
+            Path::new(r"C:\ws\next"),
+            7,
+        );
         assert!(
-            strings(&out).contains(&"--cow".to_string()),
+            strings(&out).contains(&"--sandbox".to_string()),
             "{:?}",
             strings(&out)
         );
-        assert!(parsed(&out).cow);
+        assert_eq!(parsed(&out).sandbox, SandboxChoiceArg::Tier2aCow);
     }
 
     #[test]
@@ -206,7 +211,7 @@ mod tests {
                 r"--cwd=C:\ws\old",
                 "--continue",
                 "--fork-session",
-                "--tier1",
+                "--sandbox=tier1",
             ]),
             Path::new(r"C:\ws\next"),
             7,
@@ -215,10 +220,58 @@ mod tests {
         assert!(!text.iter().any(|a| a.contains(r"C:\ws\old")), "{text:?}");
         assert!(!text.contains(&"--continue".to_string()), "{text:?}");
         assert!(!text.contains(&"--fork-session".to_string()), "{text:?}");
-        assert!(text.contains(&"--tier1".to_string()), "{text:?}");
+        assert!(text.contains(&"--sandbox=tier1".to_string()), "{text:?}");
         let cli = parsed(&out);
         assert!(!cli.continue_session);
-        assert!(cli.tier1);
+        assert_eq!(cli.sandbox, SandboxChoiceArg::Tier1);
+    }
+
+    /// **`--sandbox`の綴りと値の集合を、実物のパーサで固定する。**
+    ///
+    /// `harness_core::SandboxChoice`の全variantが`--sandbox <値>`として通ること、
+    /// その値が`value_label()`と**同じ綴り**であること、`vm`が`tier3`の別名であること、
+    /// そして**未知の値がパースエラーになる**ことを対で測る。
+    ///
+    /// 綴りは`harness-core`側（エラーメッセージ用）と`SandboxChoiceArg`側（CLI表面）の
+    /// 2箇所にあり、コンパイラは結び付けてくれない（`bug-pattern-rules` B-05）。
+    /// 未知値の側を測るのは、`--require-sandbox`が打ち間違いを黙って`write-containment`へ
+    /// 落としていた欠陥（BUG-114）と同じ轍を踏まないためである——「全部受理する」実装でも
+    /// 許可側のテストだけなら緑になる。
+    #[test]
+    fn every_sandbox_choice_has_a_cli_spelling_and_unknown_values_are_rejected() {
+        for choice in SandboxChoice::ALL {
+            let argv = os(&["--sandbox", choice.value_label()]);
+            let mut full = vec![OsString::from("harness")];
+            full.extend(argv);
+            let cli = Cli::try_parse_from(full).unwrap_or_else(|e| {
+                panic!(
+                    "--sandbox {} must parse (value_label and the ValueEnum spelling drifted): {e}",
+                    choice.value_label()
+                )
+            });
+            assert_eq!(
+                SandboxChoice::from(cli.sandbox),
+                choice,
+                "--sandbox {} parsed into a different choice",
+                choice.value_label()
+            );
+        }
+
+        // `vm`は旧`--vm-sandbox`からの別名。
+        let cli = Cli::try_parse_from(os(&["harness", "--sandbox", "vm"])).unwrap();
+        assert_eq!(SandboxChoice::from(cli.sandbox), SandboxChoice::Tier3);
+
+        // 既定は`auto`（フラグ無指定＝従来のフラグ3本とも無指定と同じ意味）。
+        let cli = Cli::try_parse_from(os(&["harness"])).unwrap();
+        assert_eq!(SandboxChoice::from(cli.sandbox), SandboxChoice::Auto);
+
+        // **禁止側**: 打ち間違いは黙って既定へ落ちず、パースエラーになる。
+        for bogus in ["tier2", "cow", "tier2a_cow", "TIER1x"] {
+            assert!(
+                Cli::try_parse_from(os(&["harness", "--sandbox", bogus])).is_err(),
+                "--sandbox {bogus} must be a parse error, not a silent fallback"
+            );
+        }
     }
 
     /// 2回続けて`/workspace`しても`--wait-for-pid`が積み上がらない。

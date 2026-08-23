@@ -14,7 +14,7 @@
 //! **実測の結果、実質的にはsignal 3が起点である**（RESULTS.md §11）。signal 1は harness のコンテナでは
 //! 空振りし、signal 2も第1世代をブートストラップできない——`run_shell`の直接の子の親は harness 自身で、
 //! それは対象外だからである。signal 2が効くのは「第1世代がsignal 3で確定した後の子孫」に対してで、
-//! そこでは`--cow`のRedirector DLL経由で起こる孫・ひ孫まで確実に拾える（T-15の継承が根拠）。
+//! そこでは`--sandbox tier2a-cow`のRedirector DLL経由で起こる孫・ひ孫まで確実に拾える（T-15の継承が根拠）。
 //!
 //! そのためprobeは**拒否イベント時ではなく`ProcessStart`時に行う**（[`ScopeTracker::on_process_start_probing`]）。
 //! 拒否は対象プロセスの一生のどこで起きるか分からないが、`ProcessStart`の時点ならまだ生きている。

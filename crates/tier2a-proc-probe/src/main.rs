@@ -1,4 +1,4 @@
-//! Tier2a `--cow`（D-30）の子・孫・ひ孫プロセス封じ込めE2Eテスト用プローブ。
+//! Tier2a `--sandbox tier2a-cow`（D-30）の子・孫・ひ孫プロセス封じ込めE2Eテスト用プローブ。
 //!
 //! 自分自身の世代番号（`--gen`）とビット幅チェーンの残り（`--chain`）を引数で受け取り、
 //! (1) FS検査（workspace内のcreate/modify/delete/rename）・(2) 脱走試行

@@ -443,7 +443,7 @@ fn grant_traverse_then_revoke_traverse_on_neutral_dir() {
 /// **後**に`collect_dirs_and_files`の`read_dir`が`ERROR_DIRECTORY`(267)で落ちるため、
 /// **ACEは載っているのに`Err`が返る**。呼び出し側（`preflight`のredirector DLL分岐）は
 /// `Err`を「何も起きなかった」と解釈して台帳へ記録せず、撤収経路の無い孤立ACEが
-/// `--cow`起動のたびに1件ずつ実マシンに積み上がっていた（実機に4件残留）。
+/// `--sandbox tier2a-cow`起動のたびに1件ずつ実マシンに積み上がっていた（実機に4件残留）。
 ///
 /// 管理者権限もAppContainerプロファイル作成も要らない——付与先には
 /// `traverse_capability_sid`（`DeriveCapabilitySidsFromName`による純粋な導出。プロファイルを

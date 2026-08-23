@@ -6,7 +6,7 @@
 //! |---|---|
 //! | `--live`（既定） | 無し（オーバーレイを使わない） |
 //! | `--staged` / `--workspace-commit` | workspace内 `.harness/sandbox/<session-id>/` |
-//! | `--cow`（D-30、Windows） | workspace外 `%LOCALAPPDATA%\harness\data\cow\<session-id>\` |
+//! | `--sandbox tier2a-cow`（D-30、Windows） | workspace外 `%LOCALAPPDATA%\harness\data\cow\<session-id>\` |
 //!
 //! この対応は起動時（`harness-cli`の`startup::sandbox`）だけでなく、**セッション切替
 //! （`/sessions`・`/fork`）のたびにTUIからも引かれる**。以前は`harness-cli`の中にあったため
@@ -62,19 +62,29 @@ pub fn cow_upper_root() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "harness").map(|d| d.data_local_dir().join("cow"))
 }
 
-/// `--cow`（D-30）のCoW upper実体を置く場所。
+/// `--sandbox tier2a-cow`（D-30）のCoW upper実体を置く場所。
 pub fn cow_upper_dir_for_session(session_id: &str) -> Option<PathBuf> {
     cow_upper_root().map(|root| root.join(session_id))
 }
 
 /// このプロセスがどのオーバーレイ機構で動いているか。**プロセス寿命で不変**（モジュールdoc参照）。
+///
+/// # なぜ列挙なのか（`cow: bool`と`staging_mode`の2フィールドではない）
+///
+/// マニフェスト方式（`--staged`/`--workspace-commit`）とCoW方式（`--sandbox tier2a-cow`）は
+/// **別々の書込捕捉機構**で、同時には立たない。以前は`{ staging_mode, cow: bool }`という
+/// 積の形で持ち、「両方立つことはない」根拠を**clapの`conflicts_with_all`**に置いていた。
+/// その根拠はもう無い——`--sandbox`は値フラグなので「特定の値のときだけ排他」をclapで
+/// 宣言できず、拒否は実行時（`harness-cli`の`resolve_staging_and_write_mode`）へ移った。
+///
+/// 遠くの実行時判定に不変条件を預けるのをやめ、**そもそも書けない形**にしてある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScopeTemplate {
-    pub staging_mode: StagingMode,
-    /// `--cow`が指定されているか。`--cow`は`--staged`/`--workspace-commit`と排他
-    /// （`harness-cli`のPhase 0 `conflicts_with_all`）なので、`true`のとき`staging_mode`は
-    /// `Live`である。
-    pub cow: bool,
+pub enum ScopeTemplate {
+    /// マニフェスト方式。[`StagingMode::Live`]（オーバーレイ無し）もここに含む。
+    Staging(StagingMode),
+    /// CoW方式（D-30）。**`StagingMode`を持たない**——CoWのときステージングモードは必ず
+    /// `Live`だからで、持たせないことが「CoWかつ`--staged`」を書けなくしている。
+    Cow,
 }
 
 /// あるセッションのオーバーレイの置き場。`ToolCtx`の該当2フィールドと1:1に対応する。
@@ -108,40 +118,51 @@ impl SessionScope {
 }
 
 impl ScopeTemplate {
-    /// `harness-cli`の起動パイプラインが確定した値から作る。
-    pub fn new(staging_mode: StagingMode, cow: bool) -> Self {
-        Self { staging_mode, cow }
+    /// `harness-cli`の起動パイプラインが確定した2値から作る。
+    ///
+    /// **`WorkspaceWriteMode`を先に見る。** `Cow`ならステージングモードは`Live`のはずで、
+    /// そのことは`resolve_staging_and_write_mode`が保証している（`--staged`との併用を拒否する）。
+    pub fn new(
+        write_mode: &crate::shell_tier::WorkspaceWriteMode,
+        staging_mode: StagingMode,
+    ) -> Self {
+        match write_mode {
+            crate::shell_tier::WorkspaceWriteMode::Cow { .. } => ScopeTemplate::Cow,
+            crate::shell_tier::WorkspaceWriteMode::DirectRw => ScopeTemplate::Staging(staging_mode),
+        }
     }
 
     /// セッションIDからそのセッションのオーバーレイ位置を引く。
     ///
-    /// `--cow`で`%LOCALAPPDATA%`が解決できない異常環境では`cow_upper_dir`が`None`になるが、
-    /// **起動時に`resolve_write_mode`が同じ条件で起動を拒否している**ので、ここへ到達する
-    /// 時点では解決できることが保証されている（できなければ`is_live()`が真になり、切替は
-    /// 「オーバーレイを使わない」として断られる＝安全側）。
+    /// CoWで`%LOCALAPPDATA%`が解決できない異常環境では`cow_upper_dir`が`None`になるが、
+    /// **起動時に`resolve_staging_and_write_mode`が同じ条件で起動を拒否している**ので、
+    /// ここへ到達する時点では解決できることが保証されている（できなければ`is_live()`が真になり、
+    /// 切替は「オーバーレイを使わない」として断られる＝安全側）。
     pub fn scope_for(&self, session_id: &str) -> SessionScope {
-        let (staging, cow_upper_dir) = if self.cow {
-            (
+        let (staging, cow_upper_dir) = match self {
+            ScopeTemplate::Cow => (
                 StagingConfig {
-                    mode: self.staging_mode,
+                    // CoWのステージングモードは常に`Live`（マニフェスト方式との併用は拒否済み）。
+                    mode: StagingMode::Live,
                     sandbox_dir: None,
                 },
                 cow_upper_dir_for_session(session_id),
-            )
-        } else {
-            let sandbox_dir = match self.staging_mode {
-                StagingMode::Live => None,
-                StagingMode::Staged | StagingMode::WorkspaceCommit => {
-                    Some(sandbox_dir_for_session(session_id))
-                }
-            };
-            (
-                StagingConfig {
-                    mode: self.staging_mode,
-                    sandbox_dir,
-                },
-                None,
-            )
+            ),
+            ScopeTemplate::Staging(mode) => {
+                let sandbox_dir = match mode {
+                    StagingMode::Live => None,
+                    StagingMode::Staged | StagingMode::WorkspaceCommit => {
+                        Some(sandbox_dir_for_session(session_id))
+                    }
+                };
+                (
+                    StagingConfig {
+                        mode: *mode,
+                        sandbox_dir,
+                    },
+                    None,
+                )
+            }
         };
         SessionScope {
             session_id: session_id.to_string(),
@@ -211,7 +232,7 @@ pub fn prepare_scope(workspace_root: &Path, scope: &SessionScope) -> Result<usiz
     Ok(1)
 }
 
-/// `--cow`のupper_dirを、このセッションのAppContainerから書ける状態にする（Windows専用）。
+/// `--sandbox tier2a-cow`のupper_dirを、このセッションのAppContainerから書ける状態にする（Windows専用）。
 ///
 /// # なぜ`grant_job::wait_until_done`を通さないのか
 ///
@@ -402,7 +423,7 @@ mod tests {
     #[test]
     fn preparing_a_live_scope_does_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let scope = ScopeTemplate::new(StagingMode::Live, false).scope_for("session-x");
+        let scope = ScopeTemplate::Staging(StagingMode::Live).scope_for("session-x");
         assert_eq!(prepare_scope(tmp.path(), &scope).unwrap(), 0);
         assert!(!tmp.path().join(".harness").exists());
     }
@@ -411,7 +432,7 @@ mod tests {
     #[test]
     fn preparing_a_staged_scope_creates_the_overlay_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let scope = ScopeTemplate::new(StagingMode::Staged, false).scope_for("session-x");
+        let scope = ScopeTemplate::Staging(StagingMode::Staged).scope_for("session-x");
         assert_eq!(prepare_scope(tmp.path(), &scope).unwrap(), 1);
         assert!(tmp.path().join(".harness/sandbox/session-x").is_dir());
     }
@@ -420,7 +441,7 @@ mod tests {
     #[test]
     fn forking_prepares_the_destination_then_copies_into_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let t = ScopeTemplate::new(StagingMode::Staged, false);
+        let t = ScopeTemplate::Staging(StagingMode::Staged);
         let (src, dst) = (t.scope_for("session-src"), t.scope_for("session-dst"));
         prepare_scope(tmp.path(), &src).unwrap();
         std::fs::write(
@@ -439,7 +460,7 @@ mod tests {
 
     #[test]
     fn staged_puts_the_overlay_under_the_workspace() {
-        let scope = ScopeTemplate::new(StagingMode::Staged, false).scope_for("session-abc");
+        let scope = ScopeTemplate::Staging(StagingMode::Staged).scope_for("session-abc");
         assert_eq!(
             scope.staging.sandbox_dir,
             Some(
@@ -458,8 +479,7 @@ mod tests {
 
     #[test]
     fn workspace_commit_uses_the_same_layout_as_staged() {
-        let scope =
-            ScopeTemplate::new(StagingMode::WorkspaceCommit, false).scope_for("session-abc");
+        let scope = ScopeTemplate::Staging(StagingMode::WorkspaceCommit).scope_for("session-abc");
         assert_eq!(
             scope.staging.sandbox_dir,
             Some(sandbox_dir_for_session("session-abc"))
@@ -470,18 +490,18 @@ mod tests {
     /// 呼び出し側が`is_live()`1つで判定できること。
     #[test]
     fn live_has_no_overlay_at_all() {
-        let scope = ScopeTemplate::new(StagingMode::Live, false).scope_for("session-abc");
+        let scope = ScopeTemplate::Staging(StagingMode::Live).scope_for("session-abc");
         assert_eq!(scope.staging.sandbox_dir, None);
         assert_eq!(scope.cow_upper_dir, None);
         assert!(scope.is_live());
         assert_eq!(scope.overlay_dir(Path::new("C:/ws")), None);
     }
 
-    /// `--cow`はworkspace**外**へ置く。ここがworkspace内へ戻ると、再帰的なパスマッピングと
+    /// `--sandbox tier2a-cow`はworkspace**外**へ置く。ここがworkspace内へ戻ると、再帰的なパスマッピングと
     /// `.harness`のPROTECTED DACLとの衝突が復活する。
     #[test]
     fn cow_puts_the_overlay_outside_the_workspace() {
-        let scope = ScopeTemplate::new(StagingMode::Live, true).scope_for("session-abc");
+        let scope = ScopeTemplate::Cow.scope_for("session-abc");
         assert_eq!(scope.staging.sandbox_dir, None);
         let Some(upper) = &scope.cow_upper_dir else {
             // `%LOCALAPPDATA%`が解決できない環境ではNone（起動時に弾かれている）。
@@ -496,7 +516,7 @@ mod tests {
     /// セッションが違えば置き場も違う（切替が意味を持つための前提）。
     #[test]
     fn different_sessions_get_different_overlays() {
-        let t = ScopeTemplate::new(StagingMode::Staged, false);
+        let t = ScopeTemplate::Staging(StagingMode::Staged);
         assert_ne!(
             t.scope_for("session-a").staging,
             t.scope_for("session-b").staging

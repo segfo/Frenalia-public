@@ -7,7 +7,7 @@
 //! `OpenMutexW`で聞くだけでliveness確認ができ、PID生存確認のような手作業のロジックが要らない。
 //!
 //! workspaceには、アクセスモード別に名前を分けたmutexを用意する（`KNOWN_MODES`）。同じ
-//! workspaceに対して異なるモード（例: 通常起動のRWXと`--cow`のRO）を同時に動かすと、
+//! workspaceに対して異なるモード（例: 通常起動のRWXと`--sandbox tier2a-cow`のRO）を同時に動かすと、
 //! ACE（ファイルに1つしか付けられない）の意味がセッション間で食い違うため、`begin_workspace_mode`
 //! が起動時に他モードの生存を確認し、生きていれば起動そのものを拒否する。
 //!
@@ -95,7 +95,7 @@ fn cow_session_mutex_name(session_id: &str) -> String {
     format!("Local\\harness-cow-{session_id}")
 }
 
-/// `--cow`起動時に呼ぶ。セッション専用mutexを作ってプロセス終了まで保持する。
+/// `--sandbox tier2a-cow`起動時に呼ぶ。セッション専用mutexを作ってプロセス終了まで保持する。
 pub fn hold_cow_session_marker(session_id: &str) -> windows::core::Result<()> {
     hold_mutex_for_process_lifetime(&cow_session_mutex_name(session_id))
 }
@@ -216,7 +216,7 @@ pub struct CowSessionMeta {
     pub created_at_unix_secs: u64,
 }
 
-/// `preflight`が`--cow`のupper_dir作成直後に呼ぶ。
+/// `preflight`が`--sandbox tier2a-cow`のupper_dir作成直後に呼ぶ。
 pub fn write_cow_session_meta(upper_dir: &Path, workspace_root: &Path, session_id: &str) {
     let meta = CowSessionMeta {
         session_id: session_id.to_string(),

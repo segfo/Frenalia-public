@@ -426,7 +426,7 @@ mod tests {
         let before = (ctx.workspace_root.clone(), ctx.shell_tier.tier);
         apply_scope(
             &mut ctx,
-            harness_sandbox::session_scope::ScopeTemplate::new(StagingMode::Staged, false)
+            harness_sandbox::session_scope::ScopeTemplate::Staging(StagingMode::Staged)
                 .scope_for("session-new"),
         );
         assert_eq!(
@@ -440,7 +440,7 @@ mod tests {
     }
 
     /// `CLAUDE.md`の`EnvironmentFacts`規約: モデルへ送る環境事実は`ToolCtx`から毎回組み直す。
-    /// `--cow`のupperパスはプロンプトに載る（`prompt::render_cow`）ので、切替後の会話が
+    /// `--sandbox tier2a-cow`のupperパスはプロンプトに載る（`prompt::render_cow`）ので、切替後の会話が
     /// **古いオーバーレイの説明を持ったまま**にならないことをここで固定する。
     #[test]
     fn switching_the_cow_overlay_is_reflected_in_the_system_prompt() {

@@ -125,16 +125,16 @@ Frenaliaでは、サンドボックスを単一機能ではなく、複数の保
 
 | Tier | 隔離方式 | 状態 | 選択方法 |
 |---|---|---|---|
-| **Tier 3** | Hyper-V VMとIncusコンテナによる隔離 | 完了（実機E2E確認済み） | `--vm-sandbox` |
-| **Tier 2a** | Windows AppContainer、明示ACL、Capabilityによるネットワーク制御 | 完了 | Windows既定（フラグ不要） |
+| **Tier 3** | Hyper-V VMとIncusコンテナによる隔離 | 完了（実機E2E確認済み） | `--sandbox tier3`（別名`vm`） |
+| **Tier 2a** | Windows AppContainer、明示ACL、Capabilityによるネットワーク制御 | 完了 | Windows既定（`--sandbox auto`）。必須にするなら`--sandbox tier2a` |
 | **Tier 2b** | Linux namespace、Bubblewrap、OverlayFS、Landlock、ネットワーク制限 | 完了（この開発機では実機Linux未検証） | Linux既定 |
-| **Tier 1** | Restricted Token、Low Integrity、Job Object | 完了 | Windowsで`--tier1`明示時 |
+| **Tier 1** | Restricted Token、Low Integrity、Job Object | 完了 | Windowsで`--sandbox tier1`明示時 |
 | **Tier 1'（VHDX）** | VHDXベースの追加隔離 | 意図的に未実装（対応しないと決定済み） | — |
 | **Tier 0** | ツール側制限のみを用いるベストエフォート実行 | 完了（保険） | Tier2a/1が明示的に使えない場合 |
 
-Windowsでは、Tier2a上でさらにCopy-on-Write（`--cow`）モードを選択できます。子プロセスの書き込みをRedirector DLLで上位レイヤーへ透過的にリダイレクトし、ワークスペース本体は読み取り専用ACLで保護したまま、レビュー可能な差分として扱います（孫プロセス・32bit(WOW64)プロセスへの伝播、削除/リネームの検知まで実装済み）。
+Windowsでは、Tier2a上でさらにCopy-on-Write（`--sandbox tier2a-cow`）モードを選択できます。子プロセスの書き込みをRedirector DLLで上位レイヤーへ透過的にリダイレクトし、ワークスペース本体は読み取り専用ACLで保護したまま、レビュー可能な差分として扱います（孫プロセス・32bit(WOW64)プロセスへの伝播、削除/リネームの検知まで実装済み）。この値はTier2aを要求するため、Tier2aへ届かない環境では弱いTierへ降りずに起動を拒否します。
 
-Windows既定パスでは、Tier2aが利用できない場合は弱いTierへ暗黙に降格せず、起動エラーとして拒否します。Tier1で実行するには`--tier1`を明示する必要があります。厳格なサンドボックスが必要な実行では、要求したTierが使えないことを明示し、弱いTierへ降格しない設計です。
+Windows既定パスでは、Tier2aが利用できない場合は弱いTierへ暗黙に降格せず、起動エラーとして拒否します。Tier1で実行するには`--sandbox tier1`を明示する必要があります。厳格なサンドボックスが必要な実行では、要求したTierが使えないことを明示し、弱いTierへ降格しない設計です。
 
 ### ファイルのステージングとレビュー
 
@@ -149,7 +149,7 @@ Windows既定パスでは、Tier2aが利用できない場合は弱いTierへ暗
 - **Workspace Commit**（`--workspace-commit`）  
   ワークスペース内の変更はステージングし、ワークスペース外への操作はサンドボックスで隔離した上で、後からまとめてレビューして適用します。
 
-Windows Tier2aの`--cow`は、独立した4つ目のモードではなく、`Staged`と同じ統合バックエンド（`SandboxFs`）を使い、Redirector DLLによるOS強制の透過リダイレクトを追加したものです。
+Windows Tier2aの`--sandbox tier2a-cow`は、独立した4つ目のモードではなく、`Staged`と同じ統合バックエンド（`SandboxFs`）を使い、Redirector DLLによるOS強制の透過リダイレクトを追加したものです。
 
 ステージングされた操作はマニフェスト（変更台帳）へ記録し、ユーザーが変更単位で確認、許可、拒否、適用できます。
 

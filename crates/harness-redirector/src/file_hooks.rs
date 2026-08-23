@@ -1,7 +1,7 @@
 //! ファイル系NTフック本体（`NtCreateFile`・`NtOpenFile`・`NtSetInformationFile`・
 //! `NtClose`・`NtQuery*AttributesFile`）。
 //!
-//! **ここは境界ではない**（D-01）。境界はACLであり、このフック群は`--cow`の透過性
+//! **ここは境界ではない**（D-01）。境界はACLであり、このフック群は`--sandbox tier2a-cow`の透過性
 //! （workspaceがRO化されていてもツールがそのまま書けるように見せる）のためだけに存在する。
 //! フックが素通りしてもACLがfail-closeするので、失われるのは透過性だけである。
 

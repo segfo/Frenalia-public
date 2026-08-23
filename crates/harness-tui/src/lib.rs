@@ -90,7 +90,7 @@ pub fn init_file_logging(log_dir: &std::path::Path) -> tracing_appender::non_blo
 }
 
 /// 変更パネル（M10）を開く際、`SandboxFs::change_set()`の各エントリをレビュー行
-/// （[`ReviewRow`]）へ変換する。CoW一本化（Phase 2）により`--staged`/`--cow`は同じ
+/// （[`ReviewRow`]）へ変換する。CoW一本化（Phase 2）により`--staged`/`--sandbox tier2a-cow`は同じ
 /// `SandboxFs`バックエンドを使うため、この1関数だけで両方をカバーする（以前あった
 /// `build_cow_change_rows`との重複は解消済み）。
 ///
@@ -146,7 +146,7 @@ fn apply_commit_selection(
 }
 
 /// 変更パネル（`/fsstage`系Action）が使う`SandboxFs`を開く。CoW一本化（Phase 2）により、
-/// `--staged`/`--cow`いずれもこの1関数・1つの`SandboxFs`インスタンスで扱える
+/// `--staged`/`--sandbox tier2a-cow`いずれもこの1関数・1つの`SandboxFs`インスタンスで扱える
 /// （以前あったAction毎のstaged/CoW分岐は解消済み）。
 fn open_panel_fs(
     workspace_root: &std::path::Path,
@@ -469,14 +469,17 @@ pub async fn run(
     // `SandboxFs`を直接この描画ループから同期的に叩く。ピッカーが`session`を直接触るのと
     // 同じアーキテクチャ上の位置付け）。
     let workspace_root_for_panel = ctx.workspace_root.clone();
-    // このプロセスのオーバーレイ機構（`--live`/`--staged`/`--cow`）。**セッションを切り替えても
-    // 変わらない**——workspaceツリーのアクセス形状は起動時の`preflight`が確定し、capability・
-    // ACE・モードmutexがそれに紐付いているため（D-54）。切替で動くのは「どのセッションの
-    // オーバーレイか」だけで、それを`scope_for`が引く。
-    let scope_template = harness_sandbox::session_scope::ScopeTemplate::new(
-        ctx.staging.mode,
-        ctx.cow_upper_dir.is_some(),
-    );
+    // このプロセスのオーバーレイ機構（`--live`/`--staged`/`--sandbox tier2a-cow`）。
+    // **セッションを切り替えても変わらない**——workspaceツリーのアクセス形状は起動時の
+    // `preflight`が確定し、capability・ACE・モードmutexがそれに紐付いているため（D-54）。
+    // 切替で動くのは「どのセッションのオーバーレイか」だけで、それを`scope_for`が引く。
+    //
+    // **CLIのフラグではなく、いま走っている`ToolCtx`の実際の値から作る**（TUIは
+    // `harness-cli`へ依存できないうえ、ここで欲しいのは「要求」ではなく「成立した形」である）。
+    let scope_template = match &ctx.cow_upper_dir {
+        Some(_) => harness_sandbox::session_scope::ScopeTemplate::Cow,
+        None => harness_sandbox::session_scope::ScopeTemplate::Staging(ctx.staging.mode),
+    };
     // **いま見ている／書いているオーバーレイ**。`/sessions`・`/fork`で差し替わり、engine側の
     // `ToolCtx`とこの値は常に同じものを指す（engineの確認イベントを受けてから更新するため、
     // ずれる窓が無い）。パネルの開閉・apply/discardはengineタスクを介さず、

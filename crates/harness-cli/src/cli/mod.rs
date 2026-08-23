@@ -26,7 +26,7 @@ use crate::{run_headless, OutputFormat};
 use harness_cognition::{CensusTool, CognitiveOrchestrator, RecallTool};
 use harness_core::{
     normalize_domain_pattern, CognitionLevel, LlmProvider, NetProxyConfig, RequireSandbox,
-    StagingConfig, StagingMode, ToolCtx,
+    SandboxChoice, StagingConfig, StagingMode, ToolCtx,
 };
 use harness_engine::{
     parse_allowlist_rule, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionGate,
@@ -84,6 +84,64 @@ pub(crate) enum CognitionLevelArg {
     Census,
 }
 
+/// `--sandbox auto|tier1|tier2a|tier2a-cow|tier3`（`vm`は`tier3`の別名）。
+/// `harness_core::SandboxChoice`と1対1で、`CognitionLevelArg`と同じく
+/// **clapの`ValueEnum`をcoreへ持ち込まないための橋**である。
+///
+/// 綴りを`#[value(name = ...)]`で明示しているのは、derive既定のkebab化に頼ると
+/// `Tier2aCow`が何になるかがclapの実装詳細で決まってしまうためである。この綴りが
+/// [`harness_core::SandboxChoice::value_label`]（エラーメッセージ側の綴り）と一致することは
+/// `startup::relaunch`の`every_sandbox_choice_has_a_cli_spelling_and_unknown_values_are_rejected`
+/// が実パーサへ食わせて検算する（`bug-pattern-rules` B-05）。**置き場が再起動argvのモジュールに
+/// なっているのは、`Cli::try_parse_from`を使うテストがそこにしか無いためである。**
+///
+/// **`--require-sandbox`と違い、未知の値はパースエラーになる。** あちらは
+/// `Option<String>`を自前で`match`しているため、`--require-sandbox=confidentail`のような
+/// 打ち間違いが黙って`write-containment`へ落ちる（BUG-114）。同じ轍を踏まないよう、
+/// ここは`ValueEnum`で値の集合をclapに知らせる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub(crate) enum SandboxChoiceArg {
+    #[default]
+    #[value(name = "auto")]
+    Auto,
+    #[value(name = "tier1")]
+    Tier1,
+    #[value(name = "tier2a")]
+    Tier2a,
+    #[value(name = "tier2a-cow")]
+    Tier2aCow,
+    /// `vm`でも指定できる（旧`--vm-sandbox`からの別名）。
+    #[value(name = "tier3", alias = "vm")]
+    Tier3,
+}
+
+impl From<SandboxChoiceArg> for SandboxChoice {
+    fn from(v: SandboxChoiceArg) -> Self {
+        match v {
+            SandboxChoiceArg::Auto => SandboxChoice::Auto,
+            SandboxChoiceArg::Tier1 => SandboxChoice::Tier1,
+            SandboxChoiceArg::Tier2a => SandboxChoice::Tier2a,
+            SandboxChoiceArg::Tier2aCow => SandboxChoice::Tier2aCow,
+            SandboxChoiceArg::Tier3 => SandboxChoice::Tier3,
+        }
+    }
+}
+
+/// 逆向きの写像。**使うのはテストだけだが、置いてあるのは検問のためである**——
+/// `SandboxChoice`にvariantを足したときにこの`match`が非網羅になり、
+/// 「coreには在るのにCLIから選べない値」を無言で作れなくする（B-06）。
+impl From<SandboxChoice> for SandboxChoiceArg {
+    fn from(v: SandboxChoice) -> Self {
+        match v {
+            SandboxChoice::Auto => SandboxChoiceArg::Auto,
+            SandboxChoice::Tier1 => SandboxChoiceArg::Tier1,
+            SandboxChoice::Tier2a => SandboxChoiceArg::Tier2a,
+            SandboxChoice::Tier2aCow => SandboxChoiceArg::Tier2aCow,
+            SandboxChoice::Tier3 => SandboxChoiceArg::Tier3,
+        }
+    }
+}
+
 impl From<CognitionLevelArg> for CognitionLevel {
     fn from(v: CognitionLevelArg) -> Self {
         match v {
@@ -109,10 +167,11 @@ impl From<PermissionModeArg> for PermissionMode {
 
 /// ステージ済み変更（`harness_sandbox::SandboxFs`のオーバーレイ）・CoW操作台帳を操作する
 /// サブコマンド（§オーバーレイFS「レビュー＆コミット」、M10）。CoW一本化（Phase 2）により
-/// `--staged`/`--cow`は同じ`SandboxFs`バックエンドを使うため、以前あった`--source
+/// `--staged`/`--sandbox tier2a-cow`は同じ`SandboxFs`バックエンドを使うため、以前あった`--source
 /// staged|cow|all`は廃止した——`--session <id>`（省略時は最新）が指すセッションを
-/// `--staged`用の置き場・`--cow`用の置き場の順で自動的に探す（1セッションは常にどちらか
-/// 一方でしか起動されない、Phase 0の`conflicts_with_all`）。
+/// `--staged`用の置き場・`--sandbox tier2a-cow`用の置き場の順で自動的に探す（1セッションは常にどちらか
+/// 一方でしか起動されない——**根拠はclapの`conflicts_with_all`ではなく**、
+/// `setup::resolve_staging_mode_checked`の実行時拒否である。値依存の排他はclapでは宣言できない）。
 #[derive(Subcommand)]
 pub(crate) enum Commands {
     /// 変更を一覧表示する。
@@ -174,10 +233,10 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: Tier3Action,
     },
-    /// `--cow`のupper置き場（`%LOCALAPPDATA%\harness\data\cow\<session-id>`）を確認・
+    /// `--sandbox tier2a-cow`のupper置き場（`%LOCALAPPDATA%\harness\data\cow\<session-id>`）を確認・
     /// workspace本体へ反映・破棄するサブコマンド。upper置き場はセッション終了時に
     /// 自動削除されない（エージェントの作業内容そのものが入っているため）ので、
-    /// クラッシュ・強制終了で中断したセッションも`--resume <id> --cow`で再開して
+    /// クラッシュ・強制終了で中断したセッションも`--resume <id> --sandbox tier2a-cow`で再開して
     /// 中身を確認できる。
     Cow {
         #[command(subcommand)]
@@ -359,7 +418,7 @@ pub(crate) enum PolicyAction {
     },
 }
 
-/// `harness cow`サブコマンドの各操作。Windows Tier2a `--cow`固有機能のため、Windows以外は
+/// `harness cow`サブコマンドの各操作。Windows Tier2a `--sandbox tier2a-cow`固有機能のため、Windows以外は
 /// エラーで終了する。単一セッション向けの一覧・適用・破棄は`harness changes`/`apply`/
 /// `discard`（`--session`で対象のCoWセッションを自動的に見つける）へ統合済み（Phase 2）
 /// ——`list`だけは全workspace横断の棚卸し用として引き続きここに残す。
@@ -490,20 +549,24 @@ pub(crate) struct Cli {
 
     /// 即実FS（オーバーレイ無し）。省略時の既定と同じ動作（D-29）。`--staged`/
     /// `--workspace-commit`と併用不可（§書込ステージング3モード、M10）。
+    /// `--sandbox tier2a-cow`とは意味的に矛盾しないため排他にしない。
     #[arg(long = "live", conflicts_with_all = ["staged", "workspace_commit"])]
     live: bool,
 
     /// 全書込をステージングし、実FSは`harness apply`まで不変にする。明示指定時のみ
     /// 有効なオプトイン機能で、既定の安全策ではない（§書込ステージング3モード、D-29）。
-    /// `--cow`とは互いに排他（マニフェスト方式とCoW方式という別々の書込捕捉機構を
-    /// 同時に有効化しない）。
-    #[arg(long = "staged", conflicts_with_all = ["live", "workspace_commit", "cow"])]
+    /// `--sandbox tier2a-cow`とは互いに排他（マニフェスト方式とCoW方式という別々の書込捕捉
+    /// 機構を同時に有効化しない）。**この排他だけはclapでは宣言できない**——「`--sandbox`が
+    /// 特定の値のときだけ排他」は`conflicts_with`で表せないため、実行時判定
+    /// （`setup::resolve_staging_and_write_mode`）が拒否する。
+    #[arg(long = "staged", conflicts_with_all = ["live", "workspace_commit"])]
     staged: bool,
 
     /// workspace内はステージング→レビュー＆コミット、workspace外は常にsandbox隔離。
     /// 明示指定時のみ有効なオプトイン機能で、既定の安全策ではない
-    /// （§書込ステージング3モード、D-29）。`--cow`とは互いに排他（`staged`と同じ理由）。
-    #[arg(long = "workspace-commit", conflicts_with_all = ["live", "staged", "cow"])]
+    /// （§書込ステージング3モード、D-29）。`--sandbox tier2a-cow`とは互いに排他
+    /// （`staged`と同じ理由・同じ拒否点）。
+    #[arg(long = "workspace-commit", conflicts_with_all = ["live", "staged"])]
     workspace_commit: bool,
 
     /// シェル隔離Tierの最低要求（M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。指定時は
@@ -514,21 +577,36 @@ pub(crate) struct Cli {
     #[arg(long = "require-sandbox", num_args = 0..=1, default_missing_value = "write-containment")]
     require_sandbox: Option<String>,
 
-    /// Windows専用のTier3（Hyper-V外層AlmaLinux VM + Incus内層コンテナ）を明示的に使う。
-    /// VM起動オーバーヘッドが高いため既定では試さない。ゴールデン像VHDXが無い等で起動
-    /// できない場合はTier2aへカスケードするが、Tier2aも使えない場合は起動を拒否する。
-    #[arg(long = "vm-sandbox", default_value_t = false, conflicts_with = "tier1")]
-    vm_sandbox: bool,
-
-    /// Windows Tier1（Restricted Token + 低Integrity Level + Job Object）を明示的に使う。
-    /// Tier2aの機密性/network遮断を諦めるオプトインであり、Tier2a preflight失敗時の
-    /// 逃がし弁として使う。
-    #[arg(long = "tier1", default_value_t = false, conflicts_with = "vm_sandbox")]
-    tier1: bool,
+    /// **どの形の隔離で走るか**（M12、`plans/DESIGN-SANDBOX.md` §6/§7）。既定`auto`。
+    ///
+    /// - `auto`: Tier2aを常時プローブする。昇格**できない**アカウントでだけTier0へ宣言付きで
+    ///   降格する（それ以外の失敗は起動を拒否する）
+    /// - `tier1`: Windows Tier1（Restricted Token + 低Integrity Level + Job Object）へ固定する。
+    ///   preflightを通さない逃がし弁で、Tier2aの機密性/network遮断は諦める
+    /// - `tier2a`: Tier2a（AppContainer）を**要求**する。届かなければ起動を拒否する
+    /// - `tier2a-cow`: Tier2a + Copy-on-Write（D-30、`plans/AppContainerベース Copy-on-Write
+    ///   ワークスペース設計書.md`）。workspaceへのACLをRead/Execute/Traverseのみ（既定の
+    ///   Read/Write/Execute/DeleteではなくD-13と同じread-onlyマスク）へ切り替え、`run_shell`
+    ///   子プロセスの書込をworkspace外のCoW upper（`%LOCALAPPDATA%\harness\data\cow\
+    ///   <session-id>\`）へRedirector DLLで誘導する。フックが無効・回避されても、ACLが
+    ///   RO付与済みである限りworkspace本体への書込は`ACCESS_DENIED`でfail-closeする
+    ///   （フックは境界にしない、D-01不変）。**Tier2a以外では起動を拒否する**
+    /// - `tier3`（別名`vm`）: Windows専用のTier3（Hyper-V外層AlmaLinux VM + Incus内層
+    ///   コンテナ）を優先する。VM起動オーバーヘッドが高いため既定では試さない。ゴールデン像
+    ///   VHDXが無い等で起動できない場合はTier2aへカスケードし、Tier2aも使えない場合は拒否する
+    ///
+    /// **かつては`--tier1`/`--vm-sandbox`/`--cow`という3本の真偽フラグだった。** 値1本へ
+    /// 畳んだのは、`--tier1 --cow`のような「Tier2a以外でのCoW」が受理され、ACLを一度も
+    /// 触らないまま「workspaceはread-only」とモデルへ宣言していたためである（BUG-113）。
+    /// `tier2a-cow`は`--staged`/`--workspace-commit`と併用不可（マニフェスト方式とCoW方式と
+    /// いう別々の書込捕捉機構を同時に有効化しない）。この1組だけは値依存の排他なのでclapでは
+    /// 宣言できず、`setup::resolve_staging_and_write_mode`が実行時に拒否する。
+    #[arg(long = "sandbox", value_enum, default_value_t = SandboxChoiceArg::Auto)]
+    sandbox: SandboxChoiceArg,
 
     /// Tier3起動をウォームスタート（production checkpointからの`Restore-VMSnapshot`）で行う
     /// （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.1、既定はfalse=毎回コールドブート）。
-    /// `--vm-sandbox`と併用が前提（Tier3自体が無効なら無視される）。初回はテンプレート
+    /// `--sandbox tier3`と併用が前提（Tier3自体が無効なら無視される）。初回はテンプレート
     /// provisioningのため通常のコールドブート並みの時間がかかるが、2回目以降のセッションは
     /// 起動レイテンシが大幅に短縮される。固定静的IPの制約上Tier3は元々同時1セッションのみが
     /// 前提のため、ウォームVMはマシン全体で1つに固定され、直列化ロックで排他される。
@@ -581,19 +659,6 @@ pub(crate) struct Cli {
     /// `harness fs revoke`で撤収すること。
     #[arg(long = "force-system-acl")]
     force_system_acl: bool,
-
-    /// Tier2a限定のCopy-on-Writeモード（D-30、`plans/AppContainerベース Copy-on-Write
-    /// ワークスペース設計書.md`）。指定時、workspaceへのACLをRead/Execute/Traverseのみ
-    /// （既定のRead/Write/Execute/DeleteではなくD-13と同じread-onlyマスク）へ切り替え、
-    /// `run_shell`子プロセスの書込をworkspace外のCoW upper（`%LOCALAPPDATA%\harness\data\cow\
-    /// <session-id>\`）へRedirector DLLで誘導する。フックが無効・回避されても、ACLが
-    /// RO付与済みである限りworkspace本体への書込は`ACCESS_DENIED`でfail-closeする
-    /// （フックは境界にしない、D-01不変）。既定（フラグ無指定）はD-29のまま
-    /// `Live`＋workspace RWを維持する完全なオプトイン。Tier2a以外では起動を拒否する。
-    /// `--staged`/`--workspace-commit`とは互いに排他（マニフェスト方式とCoW方式という
-    /// 別々の書込捕捉機構を同時に有効化しない。`--live`とは意味的に矛盾しないため排他にしない）。
-    #[arg(long = "cow", default_value_t = false, conflicts_with_all = ["staged", "workspace_commit"])]
-    cow: bool,
 
     /// セッション中、OS監査によるFSアクセス拒否の収集を有効にする（M15.7、
     /// `plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。**指定するとUACが1回出る**——ETWリアルタイム

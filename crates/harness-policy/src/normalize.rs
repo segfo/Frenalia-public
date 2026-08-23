@@ -8,7 +8,7 @@
 //! |---|---|---|
 //! | [`Source::Preflight`] | `fs-passthrough-ledger.json`（JSON） | 設定済みpassthroughのpath不在・ACE付与失敗・付与後probe失敗 |
 //! | [`Source::Network`] | `net-audit.jsonl`（JSONL） | 協調プロキシ/Fake DNS/WFPが拒否したドメイン |
-//! | [`Source::Cow`] | `.harness-cow-denied.jsonl`（JSONL） | `--cow`時のworkspace外書込のACL拒否 |
+//! | [`Source::Cow`] | `.harness-cow-denied.jsonl`（JSONL） | `--sandbox tier2a-cow`時のworkspace外書込のACL拒否 |
 //! | [`Source::Etw`] | `fs-audit.jsonl`（JSONL） | 実行中にOSが拒否した任意のFSアクセス |
 //!
 //! **壊れた行・読めなかったファイルはエラーにしない**（D-43）。[`SourceReport::notes`]へ
@@ -338,9 +338,9 @@ pub fn normalize_preflight(ledger_json: &str) -> SourceReport {
 /// | `true` | `ReadWrite` | `--fs-allow <path>:rw` |
 /// | `false` | `ReadExec` | **`--fs-allow <path>`の既定は`Read`ではなく`ReadExec`**（`harness-cli`の`--fs-allow`解釈） |
 ///
-/// **既知の不正確さ**: `--cow`下では`:rw`の実ACLが`Read`へ降格される（P-03、BUG-044）のに、
+/// **既知の不正確さ**: `--sandbox tier2a-cow`下では`:rw`の実ACLが`Read`へ降格される（P-03、BUG-044）のに、
 /// 台帳へはユーザーが要求した`writable=true`が記録される。この場合ここは`ReadWrite`と見なすので
-/// 過大評価になる。ただし`--cow`下のworkspace外書込はRedirector DLLがupperへ捕捉するため、
+/// 過大評価になる。ただし`--sandbox tier2a-cow`下のworkspace外書込はRedirector DLLがupperへ捕捉するため、
 /// `:rw`パスのACL拒否が提案経路まで来ること自体が稀であり、追跡はしない。
 ///
 /// 壊れた台帳は**空として扱う**（D-43。読めないことを理由に提案そのものを止めない）。

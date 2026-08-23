@@ -18,7 +18,7 @@ fn code(c: KeyCode) -> KeyEvent {
 }
 
 fn staging(session_id: &str) -> SessionScope {
-    ScopeTemplate::new(StagingMode::Staged, false).scope_for(session_id)
+    ScopeTemplate::Staging(StagingMode::Staged).scope_for(session_id)
 }
 
 fn numbered(range: std::ops::Range<usize>) -> String {
@@ -215,7 +215,7 @@ fn forking_copies_the_overlay_so_both_branches_have_the_change() {
     std::fs::write(ws.path().join("a.txt"), "old\n").unwrap();
     let src = seed_session(ws.path(), "session-src", "a.txt", "new\n");
 
-    let template = ScopeTemplate::new(StagingMode::Staged, false);
+    let template = ScopeTemplate::Staging(StagingMode::Staged);
     let mut app = AppState::new("mock".into(), "mock-model".into());
     let mut review_scope = src.clone();
     app.note_scope(overlay_label(&review_scope), "session-src");
@@ -247,7 +247,7 @@ fn applying_one_forked_branch_makes_the_other_conflict_instead_of_applying_twice
     std::fs::write(ws.path().join("a.txt"), "old\n").unwrap();
     let src = seed_session(ws.path(), "session-src", "a.txt", "new\n");
 
-    let dst = ScopeTemplate::new(StagingMode::Staged, false).scope_for("session-fork");
+    let dst = ScopeTemplate::Staging(StagingMode::Staged).scope_for("session-fork");
     harness_sandbox::session_scope::prepare_scope(ws.path(), &dst).unwrap();
     harness_sandbox::session_scope::copy_overlay(
         &src.overlay_dir(ws.path()).unwrap(),
@@ -290,7 +290,7 @@ fn applying_one_forked_branch_makes_the_other_conflict_instead_of_applying_twice
 #[test]
 fn switching_sessions_in_live_mode_is_a_no_op() {
     let ws = tempfile::tempdir().unwrap();
-    let template = ScopeTemplate::new(StagingMode::Live, false);
+    let template = ScopeTemplate::Staging(StagingMode::Live);
     let scope = template.scope_for("session-x");
     assert!(scope.is_live());
     assert_eq!(overlay_label(&scope), "");

@@ -22,10 +22,10 @@ mod tests {
         // `ToolCtx::new`はテスト既定でTier0（プレースホルダ）を積む。実行時は
         // `harness-cli`が起動時に`select_tier`で解決した値を積むため、ここでも
         // 実際のOS隔離Tier選択を再現する（さもないとTier1経路が単体テストで一切通らない）。
-        // WindowsではTier2aがフラグ無しで既定プローブされるため、`--tier1`相当の
-        // `opt_in_tier1=true`を指定してTier1へ直接降ろし、
+        // WindowsではTier2aが既定（`SandboxChoice::Auto`）で常時プローブされるため、
+        // `--sandbox tier1`相当の`SandboxChoice::Tier1`を指定してTier1へ直接降ろし、
         // 決定論的にする（実Win32 preflightを単体テストで走らせない、既存Tier1テストの
-        // 挙動を変えないため）。`opt_in_tier3=false`固定。
+        // 挙動を変えないため）。
         let probes = harness_sandbox::shell_tier::Probes {
             tier2a_preflight_override: Some(Err("test fixture: force Tier1".to_string())),
             ..Default::default()
@@ -33,8 +33,7 @@ mod tests {
         ctx.shell_tier = harness_sandbox::shell_tier::select_tier_with_probes(
             harness_core::RequireSandbox::None,
             &root,
-            false,
-            true,
+            harness_core::SandboxChoice::Tier1,
             &[],
             None,
             &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
@@ -801,8 +800,7 @@ mod tests {
         let selection = harness_sandbox::select_tier(
             RequireSandbox::None,
             dir.path(),
-            false,
-            false,
+            harness_core::SandboxChoice::Auto,
             &[],
             None,
             &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
@@ -908,8 +906,7 @@ mod tests {
         let selection = harness_sandbox::select_tier(
             RequireSandbox::None,
             dir.path(),
-            false,
-            false,
+            harness_core::SandboxChoice::Auto,
             &[],
             None,
             &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,

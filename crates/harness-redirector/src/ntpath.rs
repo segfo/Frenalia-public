@@ -85,7 +85,7 @@ pub(crate) unsafe fn resolve_relative_object_attributes_path(
     // `HKLM\...\ProfileList`の`ProgramData`が`%SystemDrive%\ProgramData`というREG_EXPAND_SZで、
     // 子のenvに`SystemDrive`が無いと`ExpandEnvironmentStringsW`が未展開のまま返すため。
     // なお**このガードが守っているのは台帳であって、実体の作成ではない**: BUG-104の現物は
-    // `--cow`ではないセッション（Redirector未ロード）で作られており、原因はenv allowlistの
+    // `--sandbox tier2a-cow`ではないセッション（Redirector未ロード）で作られており、原因はenv allowlistの
     // 欠落側にあった。そちらは`harness-sandbox`の`secret_env.rs`で修正済み。
     if raw_name.contains('%') {
         return None;

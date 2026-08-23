@@ -52,11 +52,11 @@ pub struct WorkspaceSpawn {
     pub env: Vec<(String, String)>,
     /// workspaceルート。ACEを付けた主体（capability SID）の導出に使う。
     pub workspace_root: PathBuf,
-    /// `--cow`（D-30）のupper_dir。`Some`のときだけRedirector DLLを注入し、
+    /// `--sandbox tier2a-cow`（D-30）のupper_dir。`Some`のときだけRedirector DLLを注入し、
     /// workspaceモードは`"ro"`になる。
     pub cow_upper_dir: Option<PathBuf>,
     /// `preflight`が**実際にACEを付けられた**passthroughルート（`(path, writable)`）。
-    /// `--cow`時、このうち書込可のものがRedirector DLLのext capture対象になる（設計書§19.8）。
+    /// `--sandbox tier2a-cow`時、このうち書込可のものがRedirector DLLのext capture対象になる（設計書§19.8）。
     /// 境界＝ACLはfs-allowが既に張っているので、ここは変更の可視化のためのcaptureである。
     pub granted_passthrough: Vec<(PathBuf, bool)>,
     /// 子へ与えるnetwork capability。**判断は呼び出し元が行う**（モジュールdoc参照）。
@@ -169,7 +169,7 @@ mod tests {
         assert_eq!(
             cow.workspace_mode(),
             "ro",
-            "--cow = WorkspaceWriteMode::Cow"
+            "--sandbox tier2a-cow = WorkspaceWriteMode::Cow"
         );
     }
 

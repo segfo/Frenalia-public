@@ -85,7 +85,29 @@ pub(super) fn stage_prepare_sandbox(
     // ため、ここで`ToolCtx`を構築する。既定（フラグ無指定）を含め`Live`実効時はオーバーレイ
     // 自体を使わない（`sandbox_dir: None`、M9までの直接実FSアクセスとバイト等価・監査ログも
     // 作らない）。書込/読取の実防御はシェル隔離Tier（既定Tier2a=AppContainer）に委ねる。
-    let staging_mode = resolve_staging_mode(cli.live, cli.staged, cli.workspace_commit);
+    //
+    // **`--sandbox`と`--live`/`--staged`/`--workspace-commit`は1本の関数で一緒に解く**
+    // （`setup::resolve_staging_and_write_mode`）。`tier2a-cow`×`--staged`の排他は値依存で
+    // clapが表せないため、拒否はその関数が持つ——`harness prompt`も同じ関数を通るので、
+    // 片方の入口だけ守られる形にはならない（B-06）。
+    let sandbox_choice: SandboxChoice = cli.sandbox.into();
+    if let Err(e) = check_sandbox_choice_supported(sandbox_choice) {
+        eprintln!("error: {e}");
+        return Err(ExitCode::FAILURE);
+    }
+    let (staging_mode, write_mode) = match resolve_staging_and_write_mode(
+        sandbox_choice,
+        cli.live,
+        cli.staged,
+        cli.workspace_commit,
+        &session.id(),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
     let sandbox_dir = if staging_mode == StagingMode::Live {
         None
     } else {
@@ -114,10 +136,11 @@ pub(super) fn stage_prepare_sandbox(
     // `--fork-session`: 元セッションの未適用変更も分岐先へ持っていく。TUIの`/fork`と同じ
     // `session_scope::fork_overlay`を通す——**同じ状態（forkされたセッション）を作り得る経路が
     // 2つある**ので、片方だけ実装すると「CLIでforkしたときだけ変更が見えない」形の穴になる
-    // （`bug-pattern-rules` B-06）。`--cow`のACE付与は`preflight`が後で行うため、ここでは
+    // （`bug-pattern-rules` B-06）。CoWのACE付与は`preflight`が後で行うため、ここでは
     // まだ`prepare_scope`のWindows分岐へ入らない`--staged`系だけが対象になる。
     if let Some(source_id) = &forked_from_session_id {
-        let template = harness_sandbox::session_scope::ScopeTemplate::new(staging_mode, cli.cow);
+        let template =
+            harness_sandbox::session_scope::ScopeTemplate::new(&write_mode, staging_mode);
         let (from, to) = (
             template.scope_for(source_id),
             template.scope_for(&session.id()),
@@ -358,11 +381,6 @@ pub(super) fn stage_prepare_sandbox(
         _ => {}
     }
 
-    if cli.tier1 && !cfg!(windows) {
-        eprintln!("error: --tier1 is only supported on Windows");
-        return Err(ExitCode::FAILURE);
-    }
-
     // WFP 出口強制（Layer2、`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）の
     // named pipeを、`select_tier`（内部で`preflight`を呼ぶ）より前に用意しておく。
     // Tier2aはフラグ無しで既定プローブされるため、ドメインポリシー監査が有効な場合は常に投機的に用意しておく
@@ -405,22 +423,10 @@ pub(super) fn stage_prepare_sandbox(
     #[cfg(not(windows))]
     let wfp_chain_pipe: Option<String> = None;
 
-    if cli.cow && !cfg!(windows) {
-        eprintln!("error: --cow is only supported on Windows (Tier2a/AppContainer)");
-        return Err(ExitCode::FAILURE);
-    }
-    let write_mode = match resolve_write_mode(cli.cow, &session.id()) {
-        Ok(mode) => mode,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return Err(ExitCode::FAILURE);
-        }
-    };
     let shell_tier = match select_tier(
         require_sandbox,
         &workspace_root,
-        cli.vm_sandbox,
-        cli.tier1,
+        sandbox_choice,
         &fs_passthrough,
         wfp_chain_pipe,
         &write_mode,

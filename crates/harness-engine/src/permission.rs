@@ -423,7 +423,7 @@ mod tests {
     /// - `.GIT/config` — 判定が大小を区別するのにNTFS/APFSは区別しない
     /// - `././.git/config` — `strip_prefix("./")`が1回しか剥がさない
     ///
-    /// どちらも`--cow`とは無関係に、Liveワークスペースへ`write_file`1回で届く。
+    /// どちらも`--sandbox tier2a-cow`とは無関係に、Liveワークスペースへ`write_file`1回で届く。
     #[test]
     fn config_injection_hard_deny_is_not_bypassable_by_path_spelling() {
         let arbiter = PermissionArbiter::new(

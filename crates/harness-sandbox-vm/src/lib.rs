@@ -1,5 +1,5 @@
 //! harness-sandbox-vm: Tier3（Hyper-V外層VM + Incusコンテナによる二層分離）。
-//! `--vm-sandbox`で明示的に選ぶ。`harness-sandbox`の**上**に載るクレートで、
+//! `--sandbox tier3`で明示的に選ぶ。`harness-sandbox`の**上**に載るクレートで、
 //! `harness_sandbox::tier2a::win_appcontainer`のACL関数（`smb_share`が使う）と
 //! `harness_sandbox::tier2a::privhelper::is_elevated`（`vmsandboxd`が使う）にのみ依存する
 //! （逆方向の依存＝`harness-sandbox`が本クレートを知ることは無い、`plans/DESIGN.md`

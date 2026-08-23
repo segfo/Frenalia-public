@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(read_out.content, "     1\thi");
     }
 
-    /// 回帰テスト（2026-08-01実機ドライランで発見）: `--cow`時に`write_file`/`edit_file`が
+    /// 回帰テスト（2026-08-01実機ドライランで発見）: `--sandbox tier2a-cow`時に`write_file`/`edit_file`が
     /// CoW保護を経由せずworkspace本体を直接上書きしていたバグの修正確認。`ctx.cow_upper_dir`が
     /// `Some`のとき、`write_file`はworkspace本体に触れず、CoW upperディレクトリと操作台帳
     /// （`.harness-cow-ops.jsonl`、Redirector DLLと共有する形式）へ記録され、直後の`read_file`が

@@ -898,7 +898,7 @@ impl RevokeReport {
 /// **`root`がファイルのときは単一オブジェクトの撤収1件で終える**（BUG-059の撤収側）。
 /// この分岐が無かった頃、`collect_dirs_and_files`の`read_dir`が`ERROR_DIRECTORY`(267)で落ちて
 /// **1件も剥がさずに`Err`を返していた**。`end_session`はこの関数を通して撤収するので、
-/// ファイルへ付けたACE（`--cow`のredirector DLL・ファイル1件を指す`--fs-allow`）は
+/// ファイルへ付けたACE（`--sandbox tier2a-cow`のredirector DLL・ファイル1件を指す`--fs-allow`）は
 /// **台帳に正しく載っていても剥がれない**。付与側だけを直しても孤立ACEは止まらなかった、
 /// というのが実機E2Eで判明した順序である（付与側=`grant_ace_inheritable_access`、
 /// 記録側=`preflight`、撤収側=ここ、の3つが揃って初めて閉じる）。

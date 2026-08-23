@@ -665,7 +665,7 @@ pub fn grant_ace_inheritable_ro(root: &Path, sid: PSID) -> Result<(), AppContain
 
 /// `root`がファイルのときは、継承ACE＋ツリーwalkではなく**単一オブジェクトへの付与1件**で終える。
 ///
-/// BUG-059: この分岐が無かった頃、`root`がファイル（`--cow`のredirector DLL・ファイル1件を指す
+/// BUG-059: この分岐が無かった頃、`root`がファイル（`--sandbox tier2a-cow`のredirector DLL・ファイル1件を指す
 /// `--fs-allow`）だと`grant_ace_access`でACEを付けた**後**に`collect_dirs_and_files`の`read_dir`が
 /// `ERROR_DIRECTORY`(267)で落ち、**ACEは載っているのに`Err`が返っていた**。呼び出し側は`Err`を
 /// 「何も起きなかった」と解釈して台帳へ記録しないため、撤収経路の無い孤立ACEが残っていた。
@@ -941,7 +941,7 @@ pub fn grant_workspace_root_rw(root: &Path, sid: PSID) -> Result<(), AppContaine
     Ok(())
 }
 
-/// [`grant_workspace_root_rw`]のread-only版（`--cow`のworkspace本体、D-30）。
+/// [`grant_workspace_root_rw`]のread-only版（`--sandbox tier2a-cow`のworkspace本体、D-30）。
 #[track_caller]
 pub fn grant_workspace_root_ro(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     if let Some(result) = grant_ace_access_if_file(root, sid, FsAccess::ReadExec) {
@@ -974,7 +974,7 @@ pub fn grant_workspace_root_rw_fast(root: &Path, sid: PSID) -> Result<(), AppCon
     Ok(())
 }
 
-/// [`grant_workspace_root_rw_fast`]のread-only版（`--cow`のworkspace本体、D-30）。
+/// [`grant_workspace_root_rw_fast`]のread-only版（`--sandbox tier2a-cow`のworkspace本体、D-30）。
 #[track_caller]
 pub fn grant_workspace_root_ro_fast(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     if let Some(result) = grant_ace_access_if_file(root, sid, FsAccess::ReadExec) {

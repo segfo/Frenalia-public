@@ -49,7 +49,7 @@ pub(crate) async fn run_isolated(
     // Tier2a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
     // 「このTierでは無効」と明記する、`call`参照）。
     let _ = &net;
-    // `workspace_root`/`cow_upper_dir`（D-30、`--cow`）はWindows Tier2a経路でのみ使う
+    // `workspace_root`/`cow_upper_dir`（D-30、`--sandbox tier2a-cow`）はWindows Tier2a経路でのみ使う
     // （Redirector DLL注入用のenv注入先パス）。
     #[cfg(not(windows))]
     let _ = (workspace_root, cow_upper_dir, granted_passthrough);

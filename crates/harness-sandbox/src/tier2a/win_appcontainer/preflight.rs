@@ -163,7 +163,8 @@ fn check_workspace_usable_as_child_cwd(workspace_root: &Path) -> Result<(), AppC
          {MAX_CHILD_CWD_LEN} characters as a process working directory (the limit is MAX_PATH \
          including a trailing separator and the NUL terminator, and it is lifted by neither \
          LongPathsEnabled nor a \\\\?\\ prefix). Every shell isolation tier hits this at spawn \
-         time, so `--tier1`/`--tier0` will not help either. Move the workspace somewhere shorter, \
+         time, so `--sandbox tier1` will not help either (and there is no --sandbox value that \
+         skips process creation). Move the workspace somewhere shorter, \
          or map it to a drive letter (`subst X: \"<workspace>\"`). Read-only commands \
          (`harness changes`/`apply`) are unaffected: {}",
         workspace_root.display()
@@ -266,7 +267,7 @@ pub fn preflight_with_privhelper_launcher(
     // 祖先traverseの付与先（D-37）。package SIDと違いセッションを跨いで永続する。
     let traverse_sid = traverse_capability_sid()?;
 
-    // workspaceのアクセスモード（通常起動=RWX / `--cow`=RO、将来`--cow_exec`=RXを追加予定）は
+    // workspaceのアクセスモード（通常起動=RWX / `--sandbox tier2a-cow`=RO、将来`--cow_exec`=RXを追加予定）は
     // 同じworkspaceに対して混在させてはいけない——ACEはファイルに1つしか付けられないため、
     // モードが違うセッションが同時に動くと片方の前提を裏切る（例: ROのはずが後から来た
     // RWXセッションのせいで書けてしまう）。ACE付与の前に、名前付きmutexで他モードが
@@ -321,7 +322,7 @@ pub fn preflight_with_privhelper_launcher(
             workspace_rwx_mask()
         }
         WorkspaceWriteMode::Cow { upper_dir } => {
-            // `--cow`（D-30）。workspaceはRead/Execute/Traverseのみ（D-13と同じ関数）。
+            // `--sandbox tier2a-cow`（D-30）。workspaceはRead/Execute/Traverseのみ（D-13と同じ関数）。
             // Redirector DLLが無効・回避されても、この時点でACLがROである限り
             // workspace本体への書込は`ACCESS_DENIED`でfail-closeする。
             grant_workspace_root_ro_fast(workspace_root, workspace_cap.as_psid())?;
@@ -464,7 +465,7 @@ pub fn preflight_with_privhelper_launcher(
 
     let mut warnings = Vec::new();
 
-    // D-37: Redirector DLL（`--cow`の透過性）はworkspaceの外＝harness.exeの隣にあるため、
+    // D-37: Redirector DLL（`--sandbox tier2a-cow`の透過性）はworkspaceの外＝harness.exeの隣にあるため、
     // workspaceへの継承ACEでは覆えない。共有package SIDだった頃はリポジトリrootへの継承ACEが
     // たまたま`target/debug/*.dll`まで届いていたが、セッションごとにSIDが変わる今は明示的に
     // 読取+実行を与える必要がある（無ければ注入が失敗し、境界＝ACLは効いたまま透過性だけが失われる）。
@@ -538,15 +539,15 @@ pub fn preflight_with_privhelper_launcher(
             continue;
         }
 
-        // D-30（`--cow`）: fs-allowの`:rw`要求は、実際にOSへ付与するACLではRead止まりにする
+        // D-30（`--sandbox tier2a-cow`）: fs-allowの`:rw`要求は、実際にOSへ付与するACLではRead止まりにする
         // （実行権限は与えない、`FsAccess::Read`。`FsAccess::ReadExec`ではない点に注意）。
-        // `--cow`が存在する理由は「変更のあったファイルだけを単位としてレビュー・ロールバック
+        // `--sandbox tier2a-cow`が存在する理由は「変更のあったファイルだけを単位としてレビュー・ロールバック
         // できること」（CoW＝ファイル単位の巻き戻し可能性が本質、スナップショット全体コピー
         // 方式ではない）であり、明示的にRO/ReadExecなfs-allowエントリはそもそも書込の余地が
         // 無いので対象外——ここで動的にRWをRO化しているのは、あくまで「元々RWだったものへ
         // 強制的にRedirector DLLのフックを通す書込経路」を作るための道具であって、頼まれても
         // いない実行権限まで付与する理由は無い（ユーザー指摘により`ReadExec`から`Read`へ訂正、
-        // 2026-08-02）。workspace本体が`--cow`下で`grant_ace_inheritable_ro`
+        // 2026-08-02）。workspace本体が`--sandbox tier2a-cow`下で`grant_ace_inheritable_ro`
         // （`FsAccess::ReadExec`）を使うのは、workspace内のツール・スクリプトを実行できる
         // 必要があるというworkspace固有の事情であり、任意の外部fs-allowパスには適用されない。
         // 書込境界はACLであり、Redirector DLLの`_ext` captureはあくまで透過性のための利便性
@@ -575,7 +576,7 @@ pub fn preflight_with_privhelper_launcher(
             path: requested.path.clone(),
             access: effective_access,
             forced: requested.forced,
-            // [D-63] スコープは`--cow`でも変えない。上でRO化しているのは**アクセス種別**であって
+            // [D-63] スコープは`--sandbox tier2a-cow`でも変えない。上でRO化しているのは**アクセス種別**であって
             // 範囲ではない（範囲を狭めると、宣言した配下がRedirector DLL経由でも読めなくなる）。
             scope: requested.scope,
         };

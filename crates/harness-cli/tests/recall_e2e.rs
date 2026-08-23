@@ -244,7 +244,8 @@ fn run_harness(spec: RunSpec<'_>) -> HarnessRun {
         // プローブは新しいワークスペース木に対して祖先traverse ACEの付与（＝privhelperの
         // 昇格＝UAC）を要求し、無人実行できないうえ、記憶とは関係のないACEを実マシンへ
         // 残す（D-31/D-44）。ここで測りたいのは記憶の配線であって隔離ではない。
-        "--tier1",
+        "--sandbox",
+        "tier1",
         "--output-format",
         "jsonl",
         "-p",

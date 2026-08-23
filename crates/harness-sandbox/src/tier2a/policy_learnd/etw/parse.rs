@@ -67,7 +67,7 @@
 //! ことが確定するので、提案そのものを`fs.read_write`/`fs.read_exec`へ差し替える
 //! （`harness_policy::insufficient`・`harness_policy::generalize`、D-46）。
 //!
-//! なお`--cow`セッションではRedirector DLLが`NtCreateFile`の生の`DesiredAccess`を
+//! なお`--sandbox tier2a-cow`セッションではRedirector DLLが`NtCreateFile`の生の`DesiredAccess`を
 //! `.harness-cow-denied.jsonl`へ記録しており、そちらは正確である。2つの収集源は補完関係にある
 //! ——フックは精度を持つが境界にならず（P-02）、ETWは網羅性を持つが精度が落ちる。
 

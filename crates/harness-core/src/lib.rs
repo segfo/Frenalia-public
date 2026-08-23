@@ -37,7 +37,7 @@ pub use schema::{apply_schema_strategy, unwrap_forced_tool_stream, SchemaStrateg
 pub use text::truncate_head_tail;
 pub use tool::{
     McpServerFact, NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, RequireSandbox,
-    RiskClass, ShellTier, ShellTierSelection, StagingConfig, StagingMode, TlsInspection, Tool,
-    ToolCtx, ToolError, ToolOutput, ToolResult, ToolSpec, ToolUse, VmShellExecutor, WaitReason,
-    WaitReasons, WaitState,
+    RiskClass, SandboxChoice, ShellTier, ShellTierSelection, StagingConfig, StagingMode,
+    TlsInspection, Tool, ToolCtx, ToolError, ToolOutput, ToolResult, ToolSpec, ToolUse,
+    VmShellExecutor, WaitReason, WaitReasons, WaitState,
 };

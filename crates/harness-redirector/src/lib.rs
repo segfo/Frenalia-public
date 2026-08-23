@@ -1,4 +1,4 @@
-//! Tier2a `--cow`（D-30）のRedirector DLL。x64専用・最小スコープ。
+//! Tier2a `--sandbox tier2a-cow`（D-30）のRedirector DLL。x64専用・最小スコープ。
 //!
 //! `plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` §13-§19。
 //! `ntdll.dll`の`NtCreateFile`/`NtOpenFile`/`NtSetInformationFile`/`NtClose`/
@@ -140,7 +140,7 @@ use windows::Win32::System::IO::IO_STATUS_BLOCK;
 //
 // 分割線は「どのOS機構を触るか」と「フックか否か」で引いている。フック本体
 // （`file_hooks`・`dir_merge`・`process_hooks`）は**境界ではない**（D-01）——境界はACLであり、
-// これらは`--cow`の透過性のためだけに存在する。素通りしてもACLがfail-closeするので、
+// これらは`--sandbox tier2a-cow`の透過性のためだけに存在する。素通りしてもACLがfail-closeするので、
 // 失われるのは透過性だけである。
 //
 // | モジュール | 役割 |
@@ -489,7 +489,7 @@ mod tests {
     /// **BUG-066の回帰テスト（B-1）**: workspace_rootの綴りが実際に渡されるパスと大小・
     /// 末尾区切りで食い違っていても、workspace内と判定し**相対パスまで返し切る**こと。
     /// 旧実装はここで`None`を返し、呼び出し側が「workspace外」と誤認して素通し→ACL拒否に
-    /// なっていた（`--cow`セッションで書込が1件もリダイレクトされない状態）。
+    /// なっていた（`--sandbox tier2a-cow`セッションで書込が1件もリダイレクトされない状態）。
     #[test]
     fn classify_target_matches_workspace_paths_whose_spelling_differs_in_case_or_trailing_sep() {
         let workspace = tempfile::tempdir().unwrap();

@@ -249,7 +249,7 @@ fn a_first_generation_child_is_identified_by_probing_at_process_start() {
 }
 
 /// 第1世代がprobeで確定したあとは、子孫がsignal 2（継承）で拾える——
-/// `--cow`のRedirector DLL経由で起こる孫・ひ孫はこの経路で入る。
+/// `--sandbox tier2a-cow`のRedirector DLL経由で起こる孫・ひ孫はこの経路で入る。
 #[test]
 fn descendants_are_covered_by_inheritance_once_the_first_generation_is_probed() {
     let mut tracker = ScopeTracker::new(PROFILE);

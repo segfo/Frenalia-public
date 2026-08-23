@@ -11,7 +11,7 @@
 //! # 置き場所（設計書からの変更点）
 //!
 //! 設計書§5は「オーバーレイFSのセッションディレクトリ配下」と書くが、そのディレクトリ
-//! （`StagingConfig.sandbox_dir`）は`--staged`/`--cow`指定時にしか存在せず、既定の`--live`では
+//! （`StagingConfig.sandbox_dir`）は`--staged`/`--sandbox tier2a-cow`指定時にしか存在せず、既定の`--live`では
 //! `None`である。認知レイヤーがステージングモードに依存してしまうため、既存のセッション
 //! 永続化（`.harness/sessions/session-<id>.jsonl`）と同系統の独立ディレクトリ
 //! `.harness/cognition/<session-id>/` を使う。M20の`ledger.jsonl`も同じ場所へ置く。
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn session_directory_is_independent_of_the_staging_mode() {
         let dir = ScratchStore::dir_for_session(Path::new("C:/ws"), "session-42");
-        // `.harness/sandbox/`（`--staged`/`--cow`でしか存在しない）ではなく専用ディレクトリ。
+        // `.harness/sandbox/`（`--staged`/`--sandbox tier2a-cow`でしか存在しない）ではなく専用ディレクトリ。
         assert!(dir.ends_with("session-42"));
         assert_eq!(
             dir,

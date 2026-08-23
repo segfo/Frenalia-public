@@ -7,12 +7,12 @@
 //!
 //! **CoW一本化（Phase 2、`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`
 //! §19）**: `--staged`/`--workspace-commit`（オーバーレイあり・強制力なし・レビュー用）と
-//! `--cow`（オーバーレイあり・workspace本体RO ACLで強制・Tier2a限定）は、以前は別々の
+//! `--sandbox tier2a-cow`（オーバーレイあり・workspace本体RO ACLで強制・Tier2a限定）は、以前は別々の
 //! 保存形式（`tree/`・`_ext/`・`manifest.jsonl` vs `.harness-cow-ops.jsonl`操作台帳）を
 //! 持っていたが、今は**単一のオーバーレイディレクトリ + 操作台帳
 //! （`harness_change_ledger::store`、Redirector DLLと共有）**という同じ表現に統一されている。
-//! 違いは「オーバーレイディレクトリがworkspace内（`--staged`）かworkspace外（`--cow`）か」と
-//! 「ACLによる強制があるか（Tier2a `--cow`のみ）」だけであり、`SandboxFs`自身はその区別を
+//! 違いは「オーバーレイディレクトリがworkspace内（`--staged`）かworkspace外（`--sandbox tier2a-cow`）か」と
+//! 「ACLによる強制があるか（Tier2a `--sandbox tier2a-cow`のみ）」だけであり、`SandboxFs`自身はその区別を
 //! 一切気にしない——両モードとも`overlay: Option<OverlayBackend>`という同じフィールドで
 //! 表現され、書込・読取・削除・列挙・commit（apply）・破棄（discard）は完全に同一のコードで
 //! 処理される。
@@ -83,15 +83,15 @@ pub(crate) fn simple_glob_match(pattern: &str, text: &str) -> bool {
     true
 }
 
-/// `--staged`/`--cow`いずれかが有効なときの唯一のオーバーレイ実体。`dir`は絶対パス
-/// （`--staged`ならworkspace内`<workspace_root>/<sandbox_dir>`、`--cow`ならworkspace外の
+/// `--staged`/`--sandbox tier2a-cow`いずれかが有効なときの唯一のオーバーレイ実体。`dir`は絶対パス
+/// （`--staged`ならworkspace内`<workspace_root>/<sandbox_dir>`、`--sandbox tier2a-cow`ならworkspace外の
 /// CoW upperディレクトリ）。
 pub(crate) struct OverlayBackend {
     pub(crate) dir: PathBuf,
     pub(crate) jail: WorkspaceJail,
     /// 台帳に無い実体がオーバーレイに現れ得るか（[`effective_changes`]が走査するか）。
     ///
-    /// `true`になるのは**オーバーレイがworkspaceの外にある場合＝`--cow`のupper**だけである。
+    /// `true`になるのは**オーバーレイがworkspaceの外にある場合＝`--sandbox tier2a-cow`のupper**だけである。
     /// そこはサンドボックス子へRW付与されていて、しかもworkspaceのビューからは見えないので、
     /// 子が直接置いたファイルを取りこぼすと黙って失われる（[BUG-066](../../docs/bugs/BUG-066.md)）。
     ///
@@ -208,7 +208,7 @@ impl SandboxFs {
     }
 
     /// `read.allow`/`read.allow_descend`/`read.deny`/`read.deny_descend`（M11）を
-    /// 反映した`SandboxFs`を開く。`--cow`のCoWオーバーレイは使わない（`cow_upper_dir=None`
+    /// 反映した`SandboxFs`を開く。`--sandbox tier2a-cow`のCoWオーバーレイは使わない（`cow_upper_dir=None`
     /// 相当）、`ToolCtx.cow_upper_dir`を運べる呼び出し元は`open_with_cow`を使うこと。
     pub fn open_with_read_scope(
         workspace_root: &Path,
@@ -223,8 +223,9 @@ impl SandboxFs {
     /// 書込/読取/削除/列挙はRedirector DLLと同じupperディレクトリ・同じ操作台帳
     /// （`.harness-cow-ops.jsonl`）を経由する。`None`かつ`staging.mode`が`Staged`/
     /// `WorkspaceCommit`なら、`staging.sandbox_dir`（workspace相対）をworkspace内オーバーレイ
-    /// として同じ経路で使う（`--cow`と`--staged`はCLI起動時に排他化されているため、両方
-    /// 有効になることは実運用上ない、Phase 0の`conflicts_with_all`）。
+    /// として同じ経路で使う（`--sandbox tier2a-cow`と`--staged`はCLI起動時に排他化されているため、両方
+    /// 有効になることは実運用上ない。**排他はclapの宣言ではなく**`harness-cli`の
+    /// `setup::resolve_staging_mode_checked`が実行時に拒否する形で成立している）。
     pub fn open_with_cow(
         workspace_root: &Path,
         staging: &StagingConfig,
@@ -266,7 +267,7 @@ impl SandboxFs {
         })
     }
 
-    /// レビュー対象の変更一覧（`--staged`/`--cow`いずれも同じ形。オーバーレイ無効なら空）。
+    /// レビュー対象の変更一覧（`--staged`/`--sandbox tier2a-cow`いずれも同じ形。オーバーレイ無効なら空）。
     pub fn change_set(&self) -> Result<Vec<ChangeEntry>, SandboxError> {
         let Some(overlay) = &self.overlay else {
             return Ok(Vec::new());
@@ -468,7 +469,7 @@ impl SandboxFs {
         }
     }
 
-    /// オーバーレイ済み変更を実FSへ選択適用する（`--staged`/`--cow`共通、
+    /// オーバーレイ済み変更を実FSへ選択適用する（`--staged`/`--sandbox tier2a-cow`共通、
     /// §オーバーレイFS「apply は live 書込と同一の…ゲートを必ず通す」）。
     pub fn apply(&self, opts: &ApplyOptions) -> Result<ApplyReport, SandboxError> {
         let Some(overlay) = &self.overlay else {
@@ -532,7 +533,7 @@ struct EffectiveChange {
 /// `apply_overlay_changes`（反映する）・`walk_files`（列挙する）が同じ答えを使う。
 ///
 /// 内訳は「操作台帳の再生」∪「オーバーレイ実体の走査のうち台帳に無いもの」である
-/// （走査するのは`--cow`のupperだけ。理由は[`OverlayBackend::scan_for_unledgered`]）。
+/// （走査するのは`--sandbox tier2a-cow`のupperだけ。理由は[`OverlayBackend::scan_for_unledgered`]）。
 /// **なぜ台帳だけでは足りないか**（[BUG-066](../../docs/bugs/BUG-066.md)）: オーバーレイ
 /// ディレクトリはサンドボックス子へRW付与されているので、子は`copy_up`もフックも経由せず
 /// 直接ファイルを置ける。台帳だけを正本にすると、そうして置かれたファイルは
@@ -604,7 +605,7 @@ fn effective_changes(jail: &WorkspaceJail, overlay: &OverlayBackend) -> Vec<Effe
     out
 }
 
-/// `apply()`の実体。`--staged`/`--cow`で別々に実装していたロジック（旧`SandboxFs::apply`・
+/// `apply()`の実体。`--staged`/`--sandbox tier2a-cow`で別々に実装していたロジック（旧`SandboxFs::apply`・
 /// `changes.rs::apply_cow_changes`）をここへ一本化した（Phase 2）。
 ///
 /// **workspace側・overlay側とも、必ず`WorkspaceJail`（cap-stdの`Dir`からの相対open＝
@@ -926,7 +927,7 @@ mod tests {
     }
 
     /// Phase 3: `--staged`でもworkspace外絶対パスへの書込は`_ext/<key>`へ記録され、実FSには
-    /// 触れない（`--cow`の`_ext`扱いと同じ経路、設計書§19.8）。
+    /// 触れない（`--sandbox tier2a-cow`の`_ext`扱いと同じ経路、設計書§19.8）。
     #[test]
     fn staged_mode_redirects_absolute_path_writes_to_ext() {
         let dir = tempfile::tempdir().unwrap();

@@ -33,7 +33,7 @@ struct ApplyReportJson {
 }
 
 /// CoWセッションの由来（`.harness-cow-session.json`のworkspace_root）。upper_dir自身に
-/// 書かれているので、`--cwd`の綴りに依存せずに引ける（Windows専用の`--cow`機構なので
+/// 書かれているので、`--cwd`の綴りに依存せずに引ける（Windows専用の`--sandbox tier2a-cow`機構なので
 /// 他プラットフォームでは常に`None`）。
 pub(crate) fn cow_session_workspace_root(upper_dir: &Path) -> Option<String> {
     #[cfg(windows)]
@@ -100,7 +100,30 @@ pub(crate) fn print_denied_summary(upper_dir: &Path) {
 pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCode {
     let settings = harness_config::Settings::load(workspace_root);
 
-    let staging_mode = resolve_staging_mode(cli.live, cli.staged, cli.workspace_commit);
+    // **起動パイプラインと同じ関数を通す**（`setup::resolve_staging_and_write_mode`）。
+    // `--sandbox tier2a-cow`×`--staged`の拒否はその関数が持つので、`harness prompt`だけが
+    // 素通りする形にはならない（B-06）。ここで受け取った`write_mode`は下で**使わない**——
+    // その理由は下の`note`で本人へも説明している。
+    let sandbox_choice: SandboxChoice = cli.sandbox.into();
+    if let Err(e) = check_sandbox_choice_supported(sandbox_choice) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    // **排他判定だけ**を通す。`harness prompt`はセッションを開かないので CoW upper を必要とせず、
+    // 資源の解決まで含む`resolve_staging_and_write_mode`を呼ぶと、使わない`%LOCALAPPDATA%`の
+    // 解決失敗でこの読み取り専用コマンドが落ちる。判定は起動パイプラインと同じ関数を通る（B-06）。
+    let staging_mode = match resolve_staging_mode_checked(
+        sandbox_choice,
+        cli.live,
+        cli.staged,
+        cli.workspace_commit,
+    ) {
+        Ok(staging_mode) => staging_mode,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let read_scope = settings
         .read
         .clone()
@@ -124,25 +147,30 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
     }
     let run_shell_path_extra = settings.run_shell.clone().unwrap_or_default().path_extra();
 
-    if !cli.fs_allow.is_empty() || cli.force_system_acl || cli.cow {
+    // **何が効いて何が効かないかを、混ぜずに言う。**
+    //
+    // `--sandbox`のTier要求（どのTierへ着地するか）は`harness prompt`でも**そのまま効く**
+    // ——下の`select_tier`へ渡しており、`tier2a`/`tier2a-cow`はTier2aへ届かなければここでも
+    // 起動を拒否する。効かないのは`tier2a-cow`の**CoW部分**（workspaceのRO化とupperへの誘導）
+    // と、fs passthrough（`--fs-allow`/`--force-system-acl`）である。この診断コマンドは
+    // ACLモードの張り替えとUAC連鎖・台帳記録を伴う経路を通さないため、`WorkspaceWriteMode`は
+    // `DirectRw`のまま実プローブを行う。
+    //
+    // つまり印字されるプロンプトは、**CoWの記述だけが実セッションと食い違う**。
+    if !cli.fs_allow.is_empty() || cli.force_system_acl || sandbox_choice.wants_cow() {
         eprintln!(
-            "note: --fs-allow/--force-system-acl/--cow are ignored by `harness prompt` (fs \
-             passthrough and ACL mode are not probed by this diagnostic command); the printed \
-             prompt reflects read-scope/net settings only."
+            "note: `harness prompt` does not apply fs passthrough (--fs-allow / \
+             --force-system-acl) nor the Copy-on-Write half of `--sandbox tier2a-cow`; the tier \
+             requirement itself is honoured, but the printed prompt describes a directly writable \
+             workspace and no passthrough roots."
         );
-    }
-
-    if cli.tier1 && !cfg!(windows) {
-        eprintln!("error: --tier1 is only supported on Windows");
-        return ExitCode::FAILURE;
     }
 
     let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
     let shell_tier = match select_tier(
         require_sandbox,
         workspace_root,
-        cli.vm_sandbox,
-        cli.tier1,
+        sandbox_choice,
         &[],
         None,
         &WorkspaceWriteMode::DirectRw,
@@ -197,9 +225,11 @@ pub(crate) fn shell_sees_staged_writes(shell_tier: &harness_core::ShellTierSelec
 }
 
 /// `--session <id>`（省略時は最新）から、そのセッションが使ったオーバーレイ置き場を解決する。
-/// `--staged`置き場（workspace内`.harness/sandbox/<id>`）を先に試し、無ければ`--cow`置き場
+/// `--staged`置き場（workspace内`.harness/sandbox/<id>`）を先に試し、無ければ`--sandbox tier2a-cow`置き場
 /// （workspace外CoW upperディレクトリ、Windows専用）を試す——1セッションは常にどちらか
-/// 一方でしか起動されない（Phase 0の`conflicts_with_all`）ため、両方見つかることはない。
+/// 一方でしか起動されないため、両方見つかることはない。**その保証はclapの`conflicts_with_all`
+/// ではなく`setup::resolve_staging_mode_checked`の実行時拒否が持つ**（値依存の排他はclapでは
+/// 宣言できないので実行時へ移した）。正しさの論証を、もう存在しない宣言に預けないこと。
 /// どちらも見つからなければ`None`。
 pub(crate) fn resolve_session_overlay(
     workspace_root: &Path,
@@ -233,7 +263,7 @@ pub(crate) fn cow_upper_dir_checked(_session: Option<&str>) -> Option<PathBuf> {
 
 /// `apply`/`changes`/`discard`/`resolve`サブコマンドを処理する。プロバイダ資格情報を
 /// 一切必要としない（§非対話モード、プロンプトは一切送らない）。CoW一本化（Phase 2）に
-/// より`--staged`/`--cow`は同じ`SandboxFs`バックエンドを使うため、単一の`SandboxFs`だけを
+/// より`--staged`/`--sandbox tier2a-cow`は同じ`SandboxFs`バックエンドを使うため、単一の`SandboxFs`だけを
 /// 組み立てて全サブコマンドで使い回す。
 pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
     let (session, output_format_and_kind) = match &cmd {
@@ -342,7 +372,7 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                         );
                     }
                     // Phase 4（設計書§19.8）: CoWセッションなら拒否監査ログの件数もフッタに
-                    // 出す（`--cow`の書込境界自体はACLが保証しているので、これは可視性のみ）。
+                    // 出す（`--sandbox tier2a-cow`の書込境界自体はACLが保証しているので、これは可視性のみ）。
                     if let Some(dir) = &cow_upper_dir {
                         print_denied_summary(dir);
                     }

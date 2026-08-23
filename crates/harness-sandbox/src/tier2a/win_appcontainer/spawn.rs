@@ -1,5 +1,5 @@
 //! AppContainer子プロセスの起動（`CreateProcessW` + `SECURITY_CAPABILITIES`）と、
-//! `--cow`時のRedirector DLL注入。
+//! `--sandbox tier2a-cow`時のRedirector DLL注入。
 //!
 //! 話す相手はWin32のプロセス/パイプAPI。ACLは触らない（付与は`acl_grant`、'撤収は`revoke`）。
 
@@ -58,7 +58,7 @@ pub(crate) fn redirector_dll_path() -> Result<PathBuf, AppContainerError> {
 ///
 /// 共有package SIDだった頃は、リポジトリroot（＝workspace）への継承ACEがたまたま
 /// `target/debug/*.dll`まで覆っていたため明示的な付与が不要だった。セッションごとにSIDが
-/// 変わる今は、そのセッションのSIDへ読取+実行を明示的に与えないと注入が失敗し、`--cow`の
+/// 変わる今は、そのセッションのSIDへ読取+実行を明示的に与えないと注入が失敗し、`--sandbox tier2a-cow`の
 /// 書込が（境界＝ACLは効いたまま）透過的にupperへ落ちなくなる。
 pub(crate) fn redirector_dll_paths() -> Vec<PathBuf> {
     let Ok(x64) = redirector_dll_path() else {
@@ -369,7 +369,7 @@ pub enum NetworkCapability {
     InternetClient,
 }
 
-/// `--cow`（D-30）時にRedirector DLLを注入するための設定。`spawn`/`spawn_impl`は`Some`の
+/// `--sandbox tier2a-cow`（D-30）時にRedirector DLLを注入するための設定。`spawn`/`spawn_impl`は`Some`の
 /// ときのみ、`CREATE_SUSPENDED`起動窓（§10.2）でDLLを注入し、初期化完了イベントを待って
 /// から`ResumeThread`する。`None`（既定・D-29）ではこの一連の処理を一切行わない。
 #[derive(Debug, Clone, Copy)]
@@ -378,7 +378,7 @@ pub struct CowInject<'a> {
     pub upper_dir: &'a Path,
     /// Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴。
     /// Redirector DLLへ`HARNESS_COW_EXT_ROOTS`として渡し、これら配下への書込も`_ext/<key>`
-    /// 経由で操作台帳へcaptureする。空なら`--cow`単体（workspace内のみcapture、既存挙動）。
+    /// 経由で操作台帳へcaptureする。空なら`--sandbox tier2a-cow`単体（workspace内のみcapture、既存挙動）。
     pub ext_capture_roots: &'a [PathBuf],
 }
 
@@ -386,7 +386,7 @@ pub struct CowInject<'a> {
 ///
 /// DLLは受け取った文字列で「このパスはworkspace配下か」を判定するため、`--cwd`の綴りが
 /// そのまま届くと表記ゆれで照合が外れる。外れると**workspace内への書込が1件残らずACL拒否**に
-/// なり（＝`--cow`の透過性が全滅し）、しかもそれが「workspace外への書込が拒否された」ように
+/// なり（＝`--sandbox tier2a-cow`の透過性が全滅し）、しかもそれが「workspace外への書込が拒否された」ように
 /// 見える。ここが`CowInject`を使う唯一の絞り（env・注入blobの両方がこの値から作られる）
 /// なので、渡す前に一度だけ揃える:
 ///
@@ -662,7 +662,7 @@ fn spawn_impl(
         (None, None)
     };
 
-    // D-30（`--cow`）: Redirector DLL初期化完了をLauncherへ知らせるための子側書込端。
+    // D-30（`--sandbox tier2a-cow`）: Redirector DLL初期化完了をLauncherへ知らせるための子側書込端。
     // `appcontainer_pipe`は既にpackage SIDへのACL付与を済ませているため、名前付きイベントを
     // 別途ACL構成するより既存の実績あるパイプ生成経路を再利用する（stdio 3本と同じ扱い）。
     let ready_pipe = if cow.is_some() {
@@ -740,7 +740,7 @@ fn spawn_impl(
     // 済み）に限定する。リスト中の全ハンドルが継承可能である必要がある。
     //
     // **この配列は`STARTUPINFOEXW`のhStdOutput/hStdError/hStdInputの「上位集合」である**
-    // （一致ではない）。`--cow`時のready pipeの書込端はここに載るが、hStd*のどれでもない
+    // （一致ではない）。`--sandbox tier2a-cow`時のready pipeの書込端はここに載るが、hStd*のどれでもない
     // ——子へは環境変数`HARNESS_COW_READY_HANDLE`で数値として渡すためである。
     // 不変条件は「**継承されるのはこの配列が全て**」の側であり、hStd*はその部分集合。
     // 継承ハンドルに何らかの検査を掛けるときは、hStd*ではなく**この配列**を対象にすること
@@ -957,7 +957,7 @@ fn spawn_impl(
             return Err(e);
         }
 
-        // D-30（`--cow`）: suspended窓でRedirector DLLを注入する（設計書§10.2手順8-10）。
+        // D-30（`--sandbox tier2a-cow`）: suspended窓でRedirector DLLを注入する（設計書§10.2手順8-10）。
         // 注入または初期化確認に失敗した場合、対象プロセスを終了する（fail-close、
         // §10.2既定・§25.1）。workspace本体はACLで既にRO付与済みのため、この失敗パスは
         // 「透過リダイレクトが効かないまま起動を許す」ことはない——単に起動自体を拒否する。

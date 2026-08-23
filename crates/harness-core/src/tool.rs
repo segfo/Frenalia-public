@@ -98,7 +98,7 @@ pub struct ReadScopeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellTier {
     /// Windows: Hyper-V外層VM（AlmaLinux）+ Incus内層コンテナ（`plans/DESIGN-SANDBOX-VMISOLATION.md`）。
-    /// vNIC単位で出口を強制できる唯一のTier。VM起動オーバーヘッドが高いため`--vm-sandbox`
+    /// vNIC単位で出口を強制できる唯一のTier。VM起動オーバーヘッドが高いため`--sandbox tier3`
     /// で明示オプトインする。`run_shell`は`ToolCtx.vm_sandbox`経由でコンテナ内実行に
     /// 委譲する（他Tierと異なり実プロセスをホスト側にspawnしない）。
     Tier3,
@@ -136,6 +136,111 @@ pub enum RequireSandbox {
     /// `harness-sandbox::shell_tier::satisfies`（§8-2の判定表）。
     Confidential,
 }
+
+/// `--sandbox <auto|tier1|tier2a|tier2a-cow|tier3>`——**ユーザーが選んだ隔離の形**。
+///
+/// # なぜ1本の値フラグなのか
+///
+/// かつては`--tier1`・`--vm-sandbox`・`--cow`という3本の独立した真偽フラグで、
+/// **不正な組合せが型として表現できてしまっていた**。
+///
+/// - `opt_in_tier1: bool`と`opt_in_tier3: bool`の2引数は「両方真」という到達不能で
+///   あるべき状態を持てた。それを防いでいたのは`shell_tier.rs`の分岐の**順序だけ**である
+///   （clapの`conflicts_with`は本番のargvしか見ないので、ライブラリ呼び出しには効かない）。
+/// - `--cow`はTierを要求できない独立の真偽フラグだったため、`--tier1 --cow`のような
+///   「Tier2a以外でのCoW」が受理された。ACLを一度も触らないまま「workspaceはread-only」と
+///   モデルへ宣言する経路で、[BUG-113](../../../docs/bugs/BUG-113.md)として記録されている。
+///
+/// **不正な組合せを表現できないことがこの型の役目である。** 値は排他なので、
+/// 「Tier1なのにCoW」も「Tier1かつTier3」も書けない。
+///
+/// **ただし、この型だけでBUG-113の形が消えるわけではない。** `select_tier`は
+/// `choice`と`write_mode`を**独立した2引数**で受けるので、ライブラリ境界では
+/// `select_tier(Tier1, Cow{..})`が今も書ける。CLIから作れないのは、両方が
+/// `harness-cli`の`setup::resolve_staging_and_write_mode`という**1回の呼び出しから出る**
+/// ためであって、型が禁じているからではない。保証の在り処を取り違えないこと——
+/// 対を1つの値へ畳むまでは、ここは「CLIの配線が守っている」段階である。
+///
+/// clapの`ValueEnum`はここには付けない（`harness-core`はCLIフレームワークに依存しない）。
+/// CLI表面の綴りは`harness-cli`の`SandboxChoiceArg`が持ち、[`SandboxChoice::value_label`]と
+/// 綴りが一致することを同クレートのテストが検算する（`bug-pattern-rules` B-05）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxChoice {
+    /// 既定。Tier2aを常時プローブし、届かなければ昇格可否で分岐する（従来のフラグ無指定）。
+    /// 昇格**できない**アカウントだけがTier0へ宣言付きで降格する。
+    #[default]
+    Auto,
+    /// preflightを通さずTier1へ固定する逃がし弁（従来の`--tier1`）。
+    Tier1,
+    /// Tier2aを要求する。届かなければ起動を拒否する（**新設**。従来は表現できなかった）。
+    Tier2a,
+    /// Tier2a + Copy-on-Write（D-30）を要求する。Tier2aへ届かなければ起動を拒否する
+    /// （従来の`--cow`）。**「届かなければ拒否」が従来との差**で、旧`--cow`は
+    /// Tier1/Tier3/Tier0へ着地してもCoWを名乗り続けていた（BUG-113）。
+    Tier2aCow,
+    /// Tier3を優先し、不成立ならTier2aへカスケードする（従来の`--vm-sandbox`）。
+    Tier3,
+}
+
+impl SandboxChoice {
+    /// **全variantの列挙。** CLI表面の綴り（`harness-cli`の`SandboxChoiceArg`）が
+    /// この型の全variantを覆っていることを、あちら側のテストが本配列で確かめる
+    /// ——覆えていないvariantは「CLIから選べない値」で、無言で存在しないのと同じになる。
+    ///
+    /// **手書きのリストを別の場所に作らないこと**（B-05）。下の[`SandboxChoice::index_in_all`]と
+    /// `const _`ブロックが、variantの追加・順序違い・重複をコンパイル時に落とす
+    /// （`harness_sandbox::FsAccess::ALL`と同じ2段ゲート）。
+    pub const ALL: [SandboxChoice; 5] = [
+        SandboxChoice::Auto,
+        SandboxChoice::Tier1,
+        SandboxChoice::Tier2a,
+        SandboxChoice::Tier2aCow,
+        SandboxChoice::Tier3,
+    ];
+
+    /// [`SandboxChoice::ALL`]の網羅性を**コンパイル時に**強制するためだけの写像。
+    const fn index_in_all(self) -> usize {
+        match self {
+            SandboxChoice::Auto => 0,
+            SandboxChoice::Tier1 => 1,
+            SandboxChoice::Tier2a => 2,
+            SandboxChoice::Tier2aCow => 3,
+            SandboxChoice::Tier3 => 4,
+        }
+    }
+
+    /// `--sandbox`へ渡す値の綴り。**エラーメッセージが「何を指定したせいでこうなったか」を
+    /// 名指しするために要る**（`--sandbox tier2a`は降格しない、と言うために）。
+    pub fn value_label(self) -> &'static str {
+        match self {
+            SandboxChoice::Auto => "auto",
+            SandboxChoice::Tier1 => "tier1",
+            SandboxChoice::Tier2a => "tier2a",
+            SandboxChoice::Tier2aCow => "tier2a-cow",
+            SandboxChoice::Tier3 => "tier3",
+        }
+    }
+
+    /// Copy-on-Write（D-30）を要求する指定か。
+    ///
+    /// 「Tier2aへ**必ず**着地しなければならないか」（`Tier2a`と`Tier2aCow`）を判定する述語は
+    /// **あえて置いていない**。それを判定している場所は
+    /// `harness_sandbox::shell_tier::best_effort_tier`のOSごとの`match`ただ1つで、そこは
+    /// `_`を持たない網羅マッチである——述語へ逃がすと、variantを足したときに
+    /// 「どちらに倒すか」を決め忘れてもコンパイルが通ってしまう（`bug-pattern-rules` B-06）。
+    pub fn wants_cow(self) -> bool {
+        matches!(self, SandboxChoice::Tier2aCow)
+    }
+}
+
+/// [`SandboxChoice::ALL`]が全variantを過不足なく1回ずつ持つことの**コンパイル時**検算。
+const _: () = {
+    let mut i = 0;
+    while i < SandboxChoice::ALL.len() {
+        assert!(SandboxChoice::ALL[i].index_in_all() == i);
+        i += 1;
+    }
+};
 
 /// `harness-sandbox::shell_tier::select_tier`の結果。`ToolCtx`が運ぶ「値」であり、
 /// 判定ロジックの実体（OS能力プローブ）は`harness-sandbox`側にある
@@ -417,7 +522,7 @@ pub struct ToolCtx {
     /// `ToolCtx`を経由させる。`Arc`は`ToolCtx`が`Clone`である前提（既存フィールドと同様、
     /// 生ハンドルではなく共有可能な参照を運ぶ）。
     pub vm_sandbox: Option<std::sync::Arc<dyn VmShellExecutor>>,
-    /// `--cow`（D-30）指定時のCoW upperディレクトリ（workspace外）。`Some`はTier2aで
+    /// `--sandbox tier2a-cow`（D-30）指定時のCoW upperディレクトリ（workspace外）。`Some`はTier2aで
     /// workspaceがRead/Execute/Traverseのみ（RO）で付与されており、`run_shell`子プロセスの
     /// 書込はRedirector DLLによりこのディレクトリへ誘導される（フック失敗時はACLにより
     /// `ACCESS_DENIED`でfail-close、`plans/DESIGN-SANDBOX.md §7 D-30`）。`None`は既定

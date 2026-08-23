@@ -81,7 +81,7 @@ pub enum FsAction {
     /// traverse台帳の全エントリを撤収する。`grant-traverse`で付与した箇所を手打ちで覚える
     /// 必要がなく、記録済みの箇所だけを自動で対象にする。
     RevokeTraverseAll,
-    /// `preflight`が起動のたびに付与するworkspace本体のACE（通常起動=RWX、`--cow`=RO）を
+    /// `preflight`が起動のたびに付与するworkspace本体のACE（通常起動=RWX、`--sandbox tier2a-cow`=RO）を
     /// 撤収する。同じworkspaceを今も使っている他のharnessセッションが無いことを名前付き
     /// mutexで確認し、あれば「使用中」として拒否する（`harness_sandbox::tier2a::workspace_ledger`
     /// 参照）。CoWのupper_dirには一切触れない（別コマンド`harness cow discard`が担当）。

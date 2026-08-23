@@ -44,7 +44,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use harness_core::{DomainPolicy, NetProxyConfig, RequireSandbox, ShellTier};
+use harness_core::{DomainPolicy, NetProxyConfig, RequireSandbox, SandboxChoice, ShellTier};
 use harness_sandbox::tier2a::win_appcontainer::{NetworkCapability, WorkspaceSpawn};
 use harness_sandbox::{FsPassthrough, WorkspaceWriteMode};
 
@@ -977,11 +977,18 @@ fn run_pass2<'a>(
     // 1回目はdaemonがまだ居ないので`chain_launch_privhelper`が`Err`を返し、`preflight`が
     // `runas`へ落ちる（UAC 1回）——これが「セッション全体でUAC 1回」の内訳である。
     let privhelper_launcher = |pipe_name: &str| request.wfp.chain_launch_privhelper(pipe_name);
+    // **`Auto`ではなく`Tier2a`を渡す。** この経路はモジュールdocの表のとおり
+    // 「着地したTierがTier2aでなければ中止」であり、Tier2aは選好ではなく**要件**である
+    // ——Tier1にWFPは効かず素通しなので、そこで記録しても「何も拒否されなかった」以上のことは
+    // 言えない。`Auto`のままだと、昇格できないアカウントでTier0へ降格し、
+    // すぐ下の`selection.tier != ShellTier::Tier2a`で結局中止する（同じ結末を2段階で出す）。
+    // 要求を引数で言えば、拒否の理由が`select_tier`の側で「tier2aを要求したが届かなかった」
+    // として1つに定まる。下の分岐は残す——`Tier2a`指定なら`Ok`はTier2aだけのはずだという
+    // 不変条件の検算として安い（B-06: 前提が変わったときに黙って通らない）。
     let selection = harness_sandbox::select_tier(
         RequireSandbox::None,
         request.workspace_root,
-        /* opt_in_tier3 */ false,
-        /* opt_in_tier1 */ false,
+        SandboxChoice::Tier2a,
         &passthrough,
         wfp_chain_pipe,
         &WorkspaceWriteMode::DirectRw,

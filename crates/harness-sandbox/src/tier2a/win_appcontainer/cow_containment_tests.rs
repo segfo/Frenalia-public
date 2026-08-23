@@ -1,4 +1,4 @@
-//! D-30（Tier2a `--cow`）の封じ込め・操作台帳の実機E2E。
+//! D-30（Tier2a `--sandbox tier2a-cow`）の封じ込め・操作台帳の実機E2E。
 //!
 //! **旧称`cow_diagnostics`**（`docs/bugs/BUG-033.md`・`BUG-035`・`BUG-037`・`BUG-041`〜`BUG-043`
 //! 等の過去の記録と再現コマンドはこの名前で参照している。対応表は
@@ -19,7 +19,7 @@ use crate::manifest::ManifestOp;
 use crate::overlay::{ApplyOptions, ApplyReport, SandboxError, SandboxFs};
 use harness_core::{ReadScopeConfig, StagingConfig};
 
-/// CoW一本化（Phase 2）後の`--cow` apply呼び出しヘルパー。`changes::apply_unified_changes`
+/// CoW一本化（Phase 2）後の`--sandbox tier2a-cow` apply呼び出しヘルパー。`changes::apply_unified_changes`
 /// （Phase 2で削除、`SandboxFs`自身が唯一のapply実装になった）の実機E2Eテストからの
 /// 呼び出しをこの薄いラッパへ置き換えている。
 fn apply_cow(
@@ -321,7 +321,7 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
     let outcome = preflight(workspace.path(), &passthrough, None, &write_mode)
         .expect("preflight (cow + fs-allow rw)");
 
-    // D-01/D-30: `--cow`下では`--fs-allow <path>:rw`要求でも実ACLは読取のみに留め、
+    // D-01/D-30: `--sandbox tier2a-cow`下では`--fs-allow <path>:rw`要求でも実ACLは読取のみに留め、
     // 頼まれていない実行権限も付与しない（境界はACLのまま、DLLの`_ext` captureは
     // あくまで透過性。CoWの本質は「変更のあったファイル単位でレビュー・ロールバック
     // できること」であり、明示的にRO/ReadExecなエントリはそもそも書込の余地が無いので
@@ -336,7 +336,7 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
     assert_eq!(
         actual_mask,
         fs_access_mask(FsAccess::Read),
-        "--cow下ではfs-allow:rwでも実ACLはFsAccess::Read相当ちょうどでなければならない\
+        "--sandbox tier2a-cow下ではfs-allow:rwでも実ACLはFsAccess::Read相当ちょうどでなければならない\
          （書込/削除はもちろん、頼まれていない実行権限も含まれてはいけない。境界はACL、\
          _ext captureは透過性のみ）: actual_mask={actual_mask:#x}"
     );
@@ -966,7 +966,7 @@ fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
     assert_eq!(important.op, ManifestOp::Modify);
 }
 
-/// シナリオ1+3: 単発`--cow`セッションで上書き・新規作成を行い、操作台帳（`.harness-cow-ops.jsonl`）
+/// シナリオ1+3: 単発`--sandbox tier2a-cow`セッションで上書き・新規作成を行い、操作台帳（`.harness-cow-ops.jsonl`）
 /// の記録内容と、`changes::apply_unified_changes`によるworkspace本体への反映・台帳のprune
 /// までを一気通貫で確認する（`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`
 /// §19、Phase 1/2の実機E2E）。
@@ -1081,7 +1081,7 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
     );
 }
 
-/// シナリオ2+3: 同一workspaceに対する2つの`--cow`セッション（別々のupper）を並行実行し、
+/// シナリオ2+3: 同一workspaceに対する2つの`--sandbox tier2a-cow`セッション（別々のupper）を並行実行し、
 /// 互いのupperが混ざらないこと・workspace本体が両方から不変であることを確認したうえで、
 /// 片方を先にapplyしもう片方を後からapplyすると、baseline hash不一致でconflictとして
 /// 検知される（TOCTOU防止、`overlay.rs::apply()`と同じ意味論）ことを確認する。

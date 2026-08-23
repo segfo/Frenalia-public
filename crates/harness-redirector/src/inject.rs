@@ -1,6 +1,6 @@
 //! 子プロセスへのDLL注入。
 //!
-//! `--cow`の封じ込めは子孫プロセスにも及ぶ必要があるため、`CreateProcess*`フックが
+//! `--sandbox tier2a-cow`の封じ込めは子孫プロセスにも及ぶ必要があるため、`CreateProcess*`フックが
 //! `CREATE_SUSPENDED`で起動した子へ本DLLを`CreateRemoteThread`で注入してから再開させる。
 //! x86子プロセスにはx86版DLLを注入する（`wow64`参照）。
 

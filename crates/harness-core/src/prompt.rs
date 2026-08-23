@@ -73,7 +73,7 @@ pub struct EnvironmentFacts {
     pub net_proxy: NetProxyConfig,
     pub net_app: NetAppPolicy,
     pub shell_sees_staged_writes: bool,
-    /// `--cow`（D-30）のCoW upperディレクトリ。`Some`ならworkspaceはRead/Execute/Traverseのみ
+    /// `--sandbox tier2a-cow`（D-30）のCoW upperディレクトリ。`Some`ならworkspaceはRead/Execute/Traverseのみ
     /// （RO）で付与されており、`run_shell`子プロセスの書込は透過的にこの外部ディレクトリへ
     /// 誘導される（Redirector DLL経由、フック失敗時はACLによりfail-close）。
     pub cow_upper_dir: Option<PathBuf>,
@@ -287,7 +287,7 @@ fn render_staging(staging: &StagingConfig, shell_sees_staged_writes: bool) -> St
     }
 }
 
-/// D-30: `--cow`時、workspaceはRead/Execute/Traverseのみで付与されている。モデルへは
+/// D-30: `--sandbox tier2a-cow`時、workspaceはRead/Execute/Traverseのみで付与されている。モデルへは
 /// 「run_shell内の直接書込は成功しない前提で組み立てよ」という事実を明示する
 /// （Redirector DLLが実際に誘導できるかはベストエフォートで、モデルの計画自体はACLの
 /// 保証だけを頼りにすべきという意図、フックは境界にしない=D-01）。
@@ -400,7 +400,7 @@ fn render_shell_tier(shell_tier: &ShellTierSelection) -> Vec<String> {
 /// どちらも空なら1行も出さない（`render_mcp_servers`・`render_net_app`と同じ方針。宣言して
 /// いないユーザーのプロンプトを無意味に伸ばさない）。
 ///
-/// `--cow`下では`:rw`の実ACLが`Read`へ降格される（P-03、BUG-044）が、その事実は
+/// `--sandbox tier2a-cow`下では`:rw`の実ACLが`Read`へ降格される（P-03、BUG-044）が、その事実は
 /// [`render_cow`]が「ワークスペース本体はread-only、書込は透過リダイレクト、境界はACL」として
 /// 既に述べているので、ここで重複させない。
 fn render_passthrough(

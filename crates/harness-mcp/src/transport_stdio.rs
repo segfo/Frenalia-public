@@ -134,7 +134,7 @@ impl TransportFactory for AppContainerTransportFactory {
             true, // MCPは双方向なのでstdinが必須。
             sid.as_psid(),
             net,
-            None, // `--cow`のRedirector注入はMCPサーバには行わない（workspaceを触らないため）。
+            None, // `--sandbox tier2a-cow`のRedirector注入はMCPサーバには行わない（workspaceを触らないため）。
             // §22.1.1: D-38でMCPサーバは**サーバごとに専用プロファイル**なので、package SIDが
             // そのままドメインになる。capability群は持たない（§22.2.2で対象外と決着済み）。
             DomainIdentity::OwnPackage,

@@ -5,7 +5,7 @@
 //! 箇所には標準的なconflict markerが残るので、それをユーザーのエディタで開いて手で解消させる。
 //! `plans/e2e-1-2-async-harp.md`「コンフリクト解消コマンド」設計方針参照。
 //!
-//! CoW一本化（Phase 2）以降、`--staged`/`--cow`は同じ`SandboxFs`バックエンドを使うため、
+//! CoW一本化（Phase 2）以降、`--staged`/`--sandbox tier2a-cow`は同じ`SandboxFs`バックエンドを使うため、
 //! このモジュールは`staged_fs: Option<&SandboxFs>`/`cow: Option<(&Path, &Path)>`という
 //! 2系統の引数ではなく、単一の`fs: &SandboxFs`だけを受け取る。
 //!

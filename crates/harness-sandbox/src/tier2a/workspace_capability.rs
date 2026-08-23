@@ -44,7 +44,7 @@
 //!
 //! ## モードごとに別の秘密を持つ
 //!
-//! `rwx`（通常起動）と`ro`（`--cow`）で別のcapabilityにする。同じworkspaceを日を変えて
+//! `rwx`（通常起動）と`ro`（`--sandbox tier2a-cow`）で別のcapabilityにする。同じworkspaceを日を変えて
 //! 両モードで使うと両方のACEがツリーへ載るが、子トークンへ積むのは**そのセッションのモードの
 //! capabilityだけ**なので、ROセッションが過去のRWX用ACEで書けてしまうことはない。
 //!
@@ -75,7 +75,7 @@ const LEDGER_LOCK: &str = r"Local\harness-workspace-capability-ledger";
 pub struct WorkspaceCapabilityEntry {
     /// canonicalize済みworkspaceパス（表示用にそのまま持つ。突合は[`workspace_key`]で行う）。
     pub workspace: String,
-    /// `rwx`（通常起動）/`ro`（`--cow`）。`workspace_ledger::KNOWN_MODES`と同じ語彙。
+    /// `rwx`（通常起動）/`ro`（`--sandbox tier2a-cow`）。`workspace_ledger::KNOWN_MODES`と同じ語彙。
     pub mode: String,
     /// 128bit乱数の16進表現。**これが漏れるとcapability名が導出できる**ので、台帳ファイルの
     /// 置き場（`%APPDATA%\harness\config\`＝サンドボックスから読めない、P-01）が防御になる。
@@ -487,7 +487,7 @@ mod tests {
         );
     }
 
-    /// モードが違えば別の主体になる（`--cow`のROセッションが、過去のRWX用ACEを使えない）。
+    /// モードが違えば別の主体になる（`--sandbox tier2a-cow`のROセッションが、過去のRWX用ACEを使えない）。
     #[test]
     fn different_modes_get_different_capabilities() {
         let tmp = tempfile::tempdir().unwrap();

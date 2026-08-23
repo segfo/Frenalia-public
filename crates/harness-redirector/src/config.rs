@@ -93,7 +93,7 @@ pub(crate) fn parse_config_blob(text: &str) -> Option<Config> {
 /// 箇所は、この理由で不成立だった可能性が高い——同ファイルに追記済み）。`CONFIG`が既に設定済み
 /// なら`upper_dir`（子・孫とも書込可能、`append_ledger_entry`/`append_warning_entry`と同じ場所）
 /// へ書き、未設定（`init()`より前、または`CONFIG`取得に失敗する異常系）なら従来通り`%TEMP%`へ
-/// フォールバックする。`--cow`のフック呼び出し頻度は対話セッションのシェルコマンド数程度で
+/// フォールバックする。`--sandbox tier2a-cow`のフック呼び出し頻度は対話セッションのシェルコマンド数程度で
 /// 済むため、ログ肥大やI/O再入（`copy_up`同様に自分自身のフックへ戻ってくる可能性はあるが、
 /// いずれの出力先も`workspace_relative`が`None`を返す経路なので無限ループにはならない）の
 /// 実害は無い想定。
