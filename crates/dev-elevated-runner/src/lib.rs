@@ -132,7 +132,11 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--",
             "--ignored",
             "--nocapture",
-            "tier2a_workspace_exec_ace_matrix",
+            // 前方一致で2本を拾う——`..._ace_matrix`（実行はACEで制御できるか）と
+            // `..._runs_but_cannot_reach_the_network`（走っても外へは出られない）。
+            // **この2本は必ず一緒に走らせる**: 前者だけを見ると「止まらない＝何でもできる」と
+            // 読める（実際にそう読まれた）。フィルタで対にしてある。
+            "tier2a_workspace_exec",
         ],
     ),
     // フィルタはモジュール名と一致していなければならない。`cow_diagnostics`→

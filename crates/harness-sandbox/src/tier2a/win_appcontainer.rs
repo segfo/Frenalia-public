@@ -523,6 +523,14 @@ mod mac_spike_capability_tests;
 #[cfg(all(windows, test))]
 mod mac_spike_daemon_tests;
 
+/// **D-79の受け入れ測定（M2）**: ワークスペース内の実行を宣言制にする実装を入れたら本当に
+/// 止まるのか（継承ACEの2本割りが「ディレクトリは辿れる／ファイルは実行できない」を
+/// 表現できるか）と、その実行時コスト。計画は`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` M2、
+/// 結果は`plans/mac-spike/RESULTS.md`。**D-79が実装された時点で、本モジュールの真偽側は
+/// 本体の回帰テストへ書き直して消す**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod d79_exec_split_tests;
+
 /// 同上（S1b・S2c・S2d: コンソール構成の実ツール確認／既定DACL差し替え＝案A／
 /// ドメインごとの別package SID＝案Bのプリフェッチ）。
 #[cfg(all(windows, test))]

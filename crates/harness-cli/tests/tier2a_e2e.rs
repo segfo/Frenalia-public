@@ -3862,6 +3862,110 @@ fn exec_ace_teardown(ws: &Path) {
     let _ = std::fs::remove_dir_all(ws);
 }
 
+/// **「止まらない」と「出られない」は別の軸である**、を1回の測定で示す。
+///
+/// §S8が確定させたのは前者（ワークスペース内のexeは走る）だけで、そこから
+/// 「だから外へも出られる」と読めてしまう。**読めてしまうのは、2つの軸を別々に測って
+/// 別々に報告したからである**（`premise-first-explanation`型7: 機構を説明したら限界を
+/// 同じ場所で言う——逆に、限界を言うときは**守れている方も同じ場所で**言う）。
+///
+/// ここでは**同じ実行の同じ出力**が両方を示す。ワークスペース内へ置いたプローブexeが
+///
+/// - **起動できたこと**（JSON行が出る＝走った）
+/// - **外へ出られないこと**（その行の`ok`が偽）
+///
+/// を同時に語る。片方だけを別のテストで測ると、また離れて読まれる。
+///
+/// D-14（`DESIGN-SANDBOX-APPPOLICY.md`）が「起動そのものは止めない。封じ込めで実害を止める」と
+/// 決めている以上、**受容している残存リスクの実体を固定するのはこのテストである。**
+#[test]
+#[ignore = "実Tier2a。dev-elevated-runnerの e2e-exec-ace 経由で走らせること"]
+fn tier2a_workspace_exec_runs_but_cannot_reach_the_network() {
+    let _guard = CROSS_MATRIX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 宛先はTLSの443を開けている外部ホスト。**中身は取りに行かない**（TCPの接続可否だけを見る）。
+    const HOST: &str = "1.1.1.1";
+    const PORT: &str = "443";
+
+    // --- 陽性対照: **同じ計器**でコンテナ外からは繋がること。
+    // これが落ちたら、中からの失敗を「封じ込めのおかげ」と読んではいけない（B-29）。
+    let outside = Command::new(net_probe_exe())
+        .args(["raw-connect", HOST, PORT, "--label", "outside"])
+        .output()
+        .expect("run the probe outside the container");
+    let outside_text = String::from_utf8_lossy(&outside.stdout).to_string();
+    let outside_ok = outside_text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|v| v.get("probe").and_then(|p| p.as_str()) == Some("raw_connect"))
+        .and_then(|v| v["ok"].as_bool());
+    assert_eq!(
+        outside_ok,
+        Some(true),
+        "対照が落ちた＝コンテナ外からも {HOST}:{PORT} へ繋がらない。\
+         この機に外向きの経路が無いので、中からの失敗は何も証明しない。out={outside_text}"
+    );
+
+    // --- 本題: ワークスペース**内**へ置いたexeを、サンドボックスから起動する ---
+    let name = "exec-ace-net";
+    let ws = case_dir("exec-ace-net");
+    std::fs::copy(net_probe_exe(), ws.join("netprobe.exe")).expect("copy the probe into the workspace");
+
+    let script = format!(".\\netprobe.exe raw-connect {HOST} {PORT} --label inside");
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(&script),
+        &["--sandbox", "tier2a"],
+        name,
+    );
+    let outcome = match parse_json_stdout(&run) {
+        Ok(v) => v,
+        Err(e) => {
+            exec_ace_teardown(&ws);
+            panic!("{e}");
+        }
+    };
+    let result_text = outcome["tool_calls"]
+        .get(0)
+        .and_then(|c| c["result"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let inside = result_text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|v| v.get("probe").and_then(|p| p.as_str()) == Some("raw_connect"));
+
+    let verdict = serde_json::json!({
+        "workspace_exe_started": inside.is_some(),
+        "workspace_exe_reached_the_network": inside.as_ref().and_then(|v| v["ok"].as_bool()),
+        "probe": inside,
+    });
+    println!("{verdict}");
+
+    let mut failures: Vec<String> = Vec::new();
+    // (1) 走ったこと。走っていなければ「出られない」は封じ込めの手柄ではない。
+    let Some(probe) = inside else {
+        exec_ace_teardown(&ws);
+        panic!(
+            "ワークスペース内のexeがそもそも起動していない（JSON行が無い）。\
+             **このテストが測りたい状況が成立していない**: {result_text}"
+        );
+    };
+    // (2) 出られないこと。
+    if probe["ok"].as_bool() != Some(false) {
+        failures.push(format!(
+            "**ワークスペース内のexeが外部へ到達した。** D-14が受容している残存リスクの前提\
+             （起動は止めないが封じ込めで実害を止める）が崩れている: {probe}"
+        ));
+    }
+
+    if failures.is_empty() {
+        exec_ace_teardown(&ws);
+    } else {
+        eprintln!("[exec-ace-net] 失敗したのでワークスペースを {} に残す", ws.display());
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 #[ignore = "実Tier2a。dev-elevated-runnerの e2e-exec-ace 経由で走らせること"]
 fn tier2a_workspace_exec_ace_matrix() {
