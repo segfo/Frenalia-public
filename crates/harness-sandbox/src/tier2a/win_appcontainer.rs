@@ -122,6 +122,27 @@ pub enum AppContainerError {
         owner: String,
         mine: String,
     },
+    /// [D-48] **走行中の他セッションがあるうちは祖先traverse ACEを剥がさない。**
+    ///
+    /// 文面が長いのは、拒否を無言にしないためである（D-48が問題視しているのは
+    /// 「剥がす操作が無言で成功する」ことなので、拒否も「使用中です」で終わらせない）。
+    /// **どのセッションが生きているかを名指しする**——名前が出れば「閉じる」という出口が
+    /// その場で見えるので、`--force`のような逃がし弁を置かずに済む（2026-08-21の決定）。
+    #[error(
+        "refusing to revoke the traverse ACE on {path}: {} harness session(s) are still running \
+         ({}). The ancestor traverse ACE belongs to a capability SID shared by every session \
+         (D-37), so revoking it now would strip filesystem access from those running sandboxes -- \
+         the kernel re-checks the ACL on every open, so it takes effect immediately. Close them \
+         and run this again. There is deliberately no --force: the liveness marker is a kernel \
+         mutex held for the owning process's lifetime, so it cannot go stale \
+         (plans/DESIGN-SANDBOX-PRIVSEP.md D-48)",
+        sessions.len(),
+        sessions.join(", ")
+    )]
+    TraverseRevokeWhileSessionsLive {
+        path: std::path::PathBuf,
+        sessions: Vec<String>,
+    },
 }
 
 impl From<windows::core::Error> for AppContainerError {
@@ -427,7 +448,7 @@ pub use traverse::*;
 /// `CONTAINER_NAME`のまま取り残されると、**`preflight`は正しくACEを付けるのに子はそのACEを
 /// 持たない別のSIDで動く**——redirector DLLを読めず`LoadLibraryW`がNULLを返す。
 /// これが`docs/STATUS.md`旧Tier2a残課題#7（CoW封じ込めE2E 16/17赤）の正体だった。
-/// 製品の`--cow`経路は壊れておらず、E2Eだけが実態を測らなくなっていた。
+/// 製品の`--sandbox tier2a-cow`経路は壊れておらず、E2Eだけが実態を測らなくなっていた。
 ///
 /// `session_token`はプロセス内で固定なので、`preflight`の前後どちらで呼んでも同じSIDになる。
 ///

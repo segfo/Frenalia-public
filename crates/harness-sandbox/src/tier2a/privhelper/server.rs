@@ -57,6 +57,14 @@ mod log {
 /// （1起動=1操作、常駐しない）。
 pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
     log::line(&format!("serve: starting, pipe={pipe_name}"));
+    // D-48「走行中のセッションからは剥がさない」のガードは、**この昇格プロセスの中**から
+    // 生存判定できることを前提にする。前提が成り立たないと判定は静かに0件へ倒れ、
+    // fail-openの穴になる（`plans/HANDOFF-TRAVERSE-REVOKE-GUARD.md`）。
+    // 毎回残しておけば、後から「あのとき何件見えていたか」を事後に確かめられる。
+    log::line(&format!(
+        "serve: session liveness probe: {}",
+        crate::tier2a::session_profile::live_probe_report()
+    ));
     // FILE_FLAG_OVERLAPPED: 親と同じくオーバーラップドI/Oで受信・送信を有限時間化する
     // （§1c、親が既に諦めて`CloseHandle`した後もこちら側が無期限に`ReadFile`し続けて
     // stale化する事故を防ぐ、常駐しない原則の徹底）。
@@ -289,7 +297,7 @@ fn grant_fs_allow_entries(
     (granted, failures)
 }
 
-/// `GrantWorkspaceAccess`用: 複数のtraverseターゲット（`--cow`ならworkspace_root・upper_dirの
+/// `GrantWorkspaceAccess`用: 複数のtraverseターゲット（`--sandbox tier2a-cow`ならworkspace_root・upper_dirの
 /// 2つ）を独立に処理する。`GrantTraverse`（単一target）と異なり、1ターゲットのチェーンが
 /// 途中で失敗しても他のターゲットの処理は続行する（workspace_rootとupper_dirは別の祖先
 /// チェーンであり、片方の失敗がもう片方を無意味にするとは限らないため）。最初に発生した

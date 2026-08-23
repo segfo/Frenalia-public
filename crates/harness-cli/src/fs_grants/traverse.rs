@@ -206,6 +206,14 @@ pub(crate) fn fs_grant_traverse(_target: &Path) -> ExitCode {
 /// 本体が既に昇格済みなら直接、それ以外は特権分離ヘルパー（D-16）経由で実行する。
 #[cfg(windows)]
 pub(crate) fn fs_revoke_traverse_one(path: &Path) -> ExitCode {
+    // D-48: 走行中の他セッションがあるなら剥がさない。**委譲より前に**見るのは、UACを1回
+    // 払わせてから拒否しても払わせた意味が無いためで、`revoke-traverse-all`では台帳に載った
+    // 件数だけUACが出る。判定は昇格側と同じ関数（`traverse_revoke_guard`）を通し、
+    // 昇格側は昇格側でもう一度自分で見る（D-16。ここを通ったことを昇格側は信用しない）。
+    if let Err(e) = harness_sandbox::tier2a::win_appcontainer::traverse_revoke_guard(path) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     if harness_sandbox::tier2a::privhelper::is_elevated() {
         return fs_revoke_traverse_one_direct(path);
     }

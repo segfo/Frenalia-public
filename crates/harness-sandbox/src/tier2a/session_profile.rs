@@ -818,6 +818,78 @@ pub fn live_profile_names() -> Vec<String> {
     names
 }
 
+/// 走行中の**他の**セッション（このプロセス自身のものを除く）のプロファイル名。
+///
+/// D-48のガード（走行中のセッションからtraverse ACEを剥がさない）が使う唯一の入口。
+/// [`live_profile_names`]との違いは**自分を数えない**ことだけである。
+///
+/// **なぜ自分を除くのか。** D-48が守っているのは「頼んでいないセッションを巻き込むこと」で、
+/// 剥がすと決めたプロセス自身は巻き添えではない。除かないと、自分でセッションを開いてから
+/// 自分が付けたACEを`Drop`で剥がす測定用テスト（`policy_learnd::etw::fs_allow_reach_tests`）が
+/// **自分のガードに掛かって撤収できなくなる**——製品側に撤収経路が無いのと同じ状態になり、
+/// 永続capability SID ACEが実マシンへ残る（B-27）。
+///
+/// 判定は**トークン**で行う（プロファイル名の一致ではない）。同じセッションはMCPサーバ用の
+/// プロファイル（`harness.mcp.<token>.<server-id>`、D-38）も持ち得るので、名前で比べると
+/// 自分のMCPプロファイルだけが「他人」として残る。
+pub fn other_live_profile_names() -> Vec<String> {
+    without_session(live_profile_names(), session_token())
+}
+
+/// [`other_live_profile_names`]の判定部分（**純粋関数**）。
+///
+/// Win32もファイルも触らないので、単体テストは`#[ignore]`を付けず通常の`cargo test`で走らせる
+/// ——ガードの判定が腐ったら実機E2Eを待たずに落ちるべきものだからである（D-48不変条件1と同じ規律）。
+pub(crate) fn without_session(live: Vec<String>, own_token: &str) -> Vec<String> {
+    live.into_iter()
+        .filter(|name| token_of_profile(name) != Some(own_token))
+        .collect()
+}
+
+/// [`live_profile_names`]が**どの材料から何を見たか**の内訳を1行で返す（診断専用）。
+///
+/// 件数だけでは「0件」の意味が2つに割れる——本当に走行中セッションが無いのか、
+/// 材料（台帳ファイル・`%LOCALAPPDATA%\Packages`・名前付きmutex）が見えていないのか。
+/// 前者と後者は、D-48のガード（走行中セッションからtraverse ACEを剥がさない）にとって
+/// **正反対の意味**を持つ（後者はfail-openの穴）ので、区別できる形で残す。
+///
+/// 2段構えのどちらが落ちたかが分かるよう、段ごとに出す。
+/// 1. 台帳（`%APPDATA%`配下。**昇格側で別ハイブになると空に見える**、`privhelper.rs`参照）
+/// 2. トークンごとの名前付きmutex（`Local\`名前空間。ログオンセッションと整合性レベルの論点）
+pub fn live_probe_report() -> String {
+    let ledger_path = ledger()
+        .path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unresolved>".to_string());
+    let ledger_bytes = ledger()
+        .path()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len().to_string())
+        .unwrap_or_else(|| "<absent>".to_string());
+    let entries: Vec<String> = ledger()
+        .load()
+        .sessions
+        .into_iter()
+        .map(|e| format!("{}:live={}", e.token, win::is_live(&e.token)))
+        .collect();
+    let profiles = win::existing_profiles();
+    // 実機には死んだプロファイルが数十件たまる（BUG-101）ので、全件ではなく件数と
+    // 「生きていると判定された分」だけを出す。
+    let live_profiles: Vec<&String> = profiles
+        .iter()
+        .filter(|p| token_of_profile(p).is_some_and(win::is_live))
+        .collect();
+    format!(
+        "APPDATA={:?} LOCALAPPDATA={:?} ledger={ledger_path} ({ledger_bytes} bytes) \
+         ledger_entries=[{}] existing_profiles={} (live={live_profiles:?}) live_profile_names={:?}",
+        std::env::var("APPDATA").unwrap_or_default(),
+        std::env::var("LOCALAPPDATA").unwrap_or_default(),
+        entries.join(", "),
+        profiles.len(),
+        live_profile_names(),
+    )
+}
+
 /// 死んだセッションの資源を回収する（起動時に呼ぶ）。
 ///
 /// 返り値は**実際に回収できた件数**であって、対象として挙がった件数ではない
@@ -897,6 +969,62 @@ mod tests {
 
     fn liveness(live: &HashSet<String>) -> impl Fn(&str) -> bool + '_ {
         move |token: &str| live.contains(token)
+    }
+
+    // --- D-48のガードが使う生存判定（`without_session`） ---
+    //
+    // **禁止側と許可側を必ず対で置く**（B-35）。拒否側のassertだけだと、判定が
+    // 「常に他セッションが居る」に壊れても「常に居ない」に壊れても片方は緑のままになる。
+
+    /// 禁止側: 他のセッションが走っているなら、その名前が残る（＝撤収は拒否される）。
+    #[test]
+    fn another_running_session_is_reported_so_the_revoke_is_refused() {
+        let live = vec![profile_name_for("999-1"), profile_name_for("888-2")];
+        let others = without_session(live.clone(), "1234-5");
+        assert_eq!(others, live);
+    }
+
+    /// 許可側: 走っているのが自分だけなら空になる（＝撤収は通る）。
+    ///
+    /// これが無いと、判定が「常に拒否」へ壊れたことを検出できない——そして
+    /// 測定用テストの`Drop`が自分のガードに掛かり、永続ACEが実マシンに残る。
+    #[test]
+    fn the_calling_process_does_not_block_its_own_revoke() {
+        let own = "1234-5";
+        let others = without_session(vec![profile_name_for(own)], own);
+        assert!(others.is_empty(), "{others:?}");
+    }
+
+    /// 自分のMCPサーバプロファイル（D-38）も自分の一部として除く。
+    ///
+    /// 判定を**トークン**で行う理由がここにある——プロファイル名の一致で比べると、
+    /// `harness.mcp.<token>.<server-id>`だけが「他人」として残り、自分自身が
+    /// 自分の撤収を止める。
+    #[test]
+    fn the_callers_own_mcp_profiles_are_part_of_itself() {
+        let own = "1234-5";
+        let live = vec![
+            profile_name_for(own),
+            crate::tier2a::mcp_profile::mcp_profile_name_for(own, "company-docs"),
+        ];
+        assert!(without_session(live, own).is_empty());
+    }
+
+    /// 他セッションのMCPプロファイルは他人として残る（上の裏）。
+    #[test]
+    fn another_sessions_mcp_profile_still_blocks() {
+        let other = crate::tier2a::mcp_profile::mcp_profile_name_for("999-1", "company-docs");
+        assert_eq!(
+            without_session(vec![other.clone()], "1234-5"),
+            vec![other]
+        );
+    }
+
+    /// 生存しているものが1つも無ければ空（判定材料が無いときに撤収を止めない、
+    /// D-48不変条件3と同じ向き）。
+    #[test]
+    fn nothing_running_means_nothing_blocks() {
+        assert!(without_session(Vec::new(), "1234-5").is_empty());
     }
 
     /// **実マシンを一切触らない[`ReclaimIo`]**（[BUG-108](../../../docs/bugs/BUG-108.md)）。

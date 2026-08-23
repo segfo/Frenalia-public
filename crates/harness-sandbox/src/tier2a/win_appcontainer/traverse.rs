@@ -32,10 +32,46 @@ pub fn grant_traverse_drive_root(drive: &Path, sid: PSID) -> Result<(), AppConta
 /// **台帳エントリの除去はここでは行わない。** 昇格ヘルパー（`privhelper`）と本体では
 /// `%APPDATA%`が同じとは限らないため、台帳の書き込みは非昇格側の呼び出し元に寄せる既存の
 /// 分担をそのまま維持する。
+///
+/// # 走行中の他セッションがあるなら剥がさない（2026-08-21）
+///
+/// 祖先traverse ACEの主体は**セッションを跨ぐcapability SID**（D-37）なので、剥がした瞬間に
+/// 走行中の全Tier2aセッションがサンドボックス内のFS I/Oを失う。対になる
+/// `harness fs revoke-workspace`には同じ守りが既にある（`workspace_ledger::live_modes`。
+/// 「実行中の他セッションから権限を奪わない」＝BUG-053と同じ原則）。
+///
+/// **ガードをここへ置くのは、呼び出し元3経路すべてがここを通るからである**
+/// （既に昇格した本体からの直接・昇格ヘルパーの中・測定用テストからの直接）。
+/// 昇格ヘルパーの中からでも生存判定が成立することは実測で確かめてある
+/// （`plans/e2e/RESULTS.md`。台帳・名前付きmutexの2段とも昇格側から見える）。
+///
+/// **判定できないときは通す。** 生存判定に失敗したときに撤収を止めると、正当な
+/// `harness fs revoke-traverse`が理由の分からない失敗をする。これは信頼境界ではないので
+/// fail-closedにしない（D-48不変条件3と同じ向き）。
 pub fn revoke_traverse_grant(path: &Path) -> Result<(), AppContainerError> {
+    traverse_revoke_guard(path)?;
     let sid = traverse_capability_sid()?;
     revoke_ace_unguarded(path, sid.as_psid())?;
     assert_no_sid_ace(path, sid.as_psid())
+}
+
+/// [D-48] [`revoke_traverse_grant`]が撤収を拒む条件——**走行中の他セッションが1つでもあるか**。
+///
+/// **この判定を持つのはこの関数だけである。** 非昇格のCLI（`harness fs revoke-traverse`）は
+/// privhelperへ委譲する**前**にここを見て早期に断る。UACを1回払わせてから拒否するのは
+/// 払わせた意味が無く、`revoke-traverse-all`では台帳に載った件数だけUACが出るためである。
+/// **ただし昇格側は非昇格側の判断を信用しない**——[`revoke_traverse_grant`]は昇格側でも
+/// もう一度ここを通る（D-16「昇格側は渡された値を自分で検証する」）。判定を2箇所へ書き写すと
+/// 片方だけ変わったときに答えがずれるので、関数は1つに保つ（B-13）。
+pub fn traverse_revoke_guard(path: &Path) -> Result<(), AppContainerError> {
+    let sessions = crate::tier2a::session_profile::other_live_profile_names();
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    Err(AppContainerError::TraverseRevokeWhileSessionsLive {
+        path: path.to_path_buf(),
+        sessions,
+    })
 }
 
 /// `target`とその全祖先（ドライブルートまで）へ、`sid`の`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を
@@ -135,4 +171,42 @@ pub fn traverse_chain_sufficient(target: &Path, sid: PSID) -> bool {
     preview_traverse_chain(target, sid)
         .iter()
         .all(|node| node.already_sufficient)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D-48の拒否は**無言にしない**。文言そのものを読む（B-32）——「拒否した」だけでは、
+    /// 受け取った側が次に何をすればよいか分からず、逃がし弁を欲しがることになる。
+    /// 逃がし弁を置かないと決めた（2026-08-21）ぶん、**この文面が出口の案内を担う**。
+    #[test]
+    fn the_refusal_names_the_live_sessions_and_the_way_out() {
+        let message = AppContainerError::TraverseRevokeWhileSessionsLive {
+            path: std::path::PathBuf::from(r"C:\harness-e2e\probe"),
+            sessions: vec!["harness.shell.sandbox.999-1".to_string()],
+        }
+        .to_string();
+
+        // 何を拒んだか（対象パス）。
+        assert!(message.contains(r"C:\harness-e2e\probe"), "{message}");
+        // 誰が生きているか。名前が出ないと閉じる相手を特定できない。
+        assert!(message.contains("harness.shell.sandbox.999-1"), "{message}");
+        assert!(message.contains("1 harness session(s)"), "{message}");
+        // 出口の案内と、逃がし弁が「無い」ではなく「意図的に置いていない」ことの明示。
+        assert!(message.contains("Close them"), "{message}");
+        assert!(message.contains("no --force"), "{message}");
+    }
+
+    /// 複数生きているときは全部名指しする（1件だけ出して残りを隠さない）。
+    #[test]
+    fn every_live_session_is_listed() {
+        let message = AppContainerError::TraverseRevokeWhileSessionsLive {
+            path: std::path::PathBuf::from(r"C:\x"),
+            sessions: vec!["a".to_string(), "b".to_string()],
+        }
+        .to_string();
+        assert!(message.contains("2 harness session(s)"), "{message}");
+        assert!(message.contains("a, b"), "{message}");
+    }
 }
