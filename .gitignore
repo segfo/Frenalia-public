@@ -1,5 +1,9 @@
 /target
-/.harness
+# harnessは起動のたびに作業ディレクトリへ`.harness/settings.json`の雛形を置く
+# （`ensure_project_settings_file`、`parse_args.rs`がサブコマンド分岐より前で呼ぶ）。
+# 先頭スラッシュ付きだとルート直下しか覆えず、`crates/<crate>/`でテストやツールを
+# 走らせるたびに未追跡の空設定が生えるので、階層を問わず無視する。
+.harness/
 /.env
 tools/procmon/*.PML
 tools/flake/*
