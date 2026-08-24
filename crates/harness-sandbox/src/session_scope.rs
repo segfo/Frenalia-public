@@ -1036,3 +1036,45 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, windows))]
+mod volume_diagnostics {
+    use super::*;
+
+    /// **この実マシンの全ドライブを、本番と同じ経路で判定して並べる診断。**
+    ///
+    /// `#[ignore]`にしてあるのはマシン固有の結果を返すためで、CIの合否には使えない。
+    /// それでも置いてあるのは、`cow_volume_gate`が「机上の規則」ではなく
+    /// **実際にこの機のボリュームをどう分類するか**を、いつでも測り直せるようにするため。
+    ///
+    /// この機での実測（2026-08-24）:
+    ///
+    /// | ドライブ | 種別 | FS | `FILE_PERSISTENT_ACLS` | 判定 |
+    /// |---|---|---|---|---|
+    /// | `C:\` | 固定 | NTFS | あり | 通す |
+    /// | `E:\` | 固定 | cryptoFs | あり | 通す（**AppContainerのACEが実際に効くかは未確認**） |
+    /// | `G:\` | 固定 | FAT32 | **無し** | 拒否 |
+    /// | `X:\` | **ネットワーク** | NTFS | **あり** | 拒否 |
+    /// | `Z:\` | **ネットワーク** | NTFS | **あり** | 拒否 |
+    ///
+    /// **`X:`/`Z:`がこの機構の要点そのものである**——ネットワーク共有なのに
+    /// `FILE_PERSISTENT_ACLS`を**立てて返す**。ACLのフラグだけを見ていたら通していた。
+    /// 実行: `cargo test -p harness-sandbox --lib volume_diagnostics -- --ignored --nocapture`
+    #[test]
+    #[ignore = "machine-specific diagnostic; prints the verdict for every drive on this machine"]
+    fn print_cow_volume_verdict_for_every_drive() {
+        for root in crate::win_common::logical_drive_roots() {
+            let cap = crate::win_common::volume_capability(&root);
+            let verdict = cow_volume_gate("workspace", &root, cap.clone());
+            println!(
+                "{:<5} cap={:<70} -> {}",
+                root.display(),
+                format!("{cap:?}"),
+                match &verdict {
+                    Ok(()) => "ACCEPT".to_string(),
+                    Err(e) => format!("REFUSE: {}", e.split(". ").next().unwrap_or(e)),
+                }
+            );
+        }
+    }
+}
