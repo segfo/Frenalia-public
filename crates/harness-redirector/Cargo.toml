@@ -5,7 +5,7 @@ edition.workspace = true
 
 # x64専用の最小Redirector DLL（Phase 2、`plans/AppContainerベース Copy-on-Write ワークスペース
 # 設計書.md` §13）。対象プロセス（AppContainer子、workspace ROが前提）へ注入され、
-# `NtCreateFile`/`NtOpenFile`をフックしてWorkspaceへの書込操作をCoW upperへ誘導する。
+# `NtCreateFile`/`NtOpenFile`をフックしてWorkspaceへの書込操作をCoWの差分層へ誘導する。
 # フックは境界ではなく誘導（`plans/DESIGN-SANDBOX.md` D-01/D-30）——このクレート自体が
 # harness-sandbox/harness-coreに依存しないのは、注入先の非信頼プロセス内で動く別アドレス
 # 空間のコードであり、境界を構成する側（`win_appcontainer.rs`）とは信頼レベルが異なるため。
