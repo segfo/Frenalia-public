@@ -30,14 +30,17 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
                 kind,
             }) = classify_target(cfg, &path)
             {
-                let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
-                    || rel_str.to_ascii_lowercase().contains("grandchild");
+                let rel_lower = rel_str.to_ascii_lowercase();
+                let is_probe =
+                    rel_lower.contains("test.txt") || rel_lower.contains("grandchild");
                 if is_probe {
                     debug_log(&format!(
                         "hooked_nt_create_file: rel={rel_str:?} kind={kind:?} desired_access={:#x} \
-                         disposition={:#x} write_intent={} upper_exists={}",
+                         disposition={:#x} options={:#x} is_dir={} write_intent={} upper_exists={}",
                         desired_access.0,
                         create_disposition.0,
+                        create_options.0,
+                        create_options.0 & 0x0000_0001 != 0, // FILE_DIRECTORY_FILE
                         is_write_intent(desired_access.0, Some(create_disposition.0)),
                         cfg.upper_dir.join(&rel).is_file(),
                     ));
@@ -151,6 +154,47 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
                     if is_probe {
                         debug_log(&format!(
                             "hooked_nt_create_file: rel={rel_str:?} branch=read-through \
+                             upper_path={upper_path:?} status={status:?}"
+                        ));
+                    }
+                    track_new_handle(file_handle, status, &rel_str, create_options.0);
+                    return status;
+                }
+                // ディレクトリ read-through（BUG-128）: upper にしか無いディレクトリを開くときは
+                // upper へ誘導する。無いと read-only の workspace 側を開こうとして ACCESS_DENIED／
+                // OBJECT_NAME_NOT_FOUND になり、git の pathspec 解決・列挙が壊れる
+                // （`upper_only_dir_path` のdoc参照）。
+                //
+                // **`FILE_DIRECTORY_FILE` フラグでは絞らない**——git/Cygwin の `lstat` は、対象が
+                // ファイルかディレクトリか未確定のまま `FILE_OPEN_FOR_BACKUP_INTENT`（フラグ無し）で
+                // 開いて存在と種別を確かめる。フラグで絞ると、この lstat が upper のみのディレクトリを
+                // 「存在しない」と誤認し、`git add <path>` が対象を見つけられず何もステージしない
+                // （実機ログで確認）。ファイルの read-through（`upper_version_path`）は上で済んでいるので、
+                // ここに来る時点で対象はファイルではない＝ディレクトリ判定と衝突しない。
+                if let Some(upper_path) = upper_only_dir_path(cfg, &rel) {
+                    let upper_wide: Vec<u16> = nt_path_wide(&upper_path);
+                    let (mut redirected_oa, mut redirected_name) =
+                        unsafe { build_redirected_oa(object_attributes, &upper_wide) };
+                    redirected_oa.ObjectName = &mut redirected_name;
+                    let hook = CREATE_FILE_HOOK.get().expect("hook installed");
+                    let status = unsafe {
+                        hook.call(
+                            file_handle,
+                            desired_access,
+                            &redirected_oa,
+                            io_status_block,
+                            allocation_size,
+                            file_attributes,
+                            share_access,
+                            create_disposition,
+                            create_options,
+                            ea_buffer,
+                            ea_length,
+                        )
+                    };
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_create_file: rel={rel_str:?} branch=dir-read-through \
                              upper_path={upper_path:?} status={status:?}"
                         ));
                     }
@@ -274,12 +318,15 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
                 kind,
             }) = classify_target(cfg, &path)
             {
-                let is_probe = rel_str.to_ascii_lowercase().contains("test.txt")
-                    || rel_str.to_ascii_lowercase().contains("grandchild");
+                let rel_lower = rel_str.to_ascii_lowercase();
+                let is_probe =
+                    rel_lower.contains("test.txt") || rel_lower.contains("grandchild");
                 if is_probe {
                     debug_log(&format!(
                         "hooked_nt_open_file: rel={rel_str:?} kind={kind:?} \
-                         desired_access={desired_access:#x} write_intent={} upper_exists={}",
+                         desired_access={desired_access:#x} options={open_options:#x} is_dir={} \
+                         write_intent={} upper_exists={}",
+                        open_options & 0x0000_0001 != 0, // FILE_DIRECTORY_FILE
                         is_write_intent(desired_access, None),
                         cfg.upper_dir.join(&rel).is_file(),
                     ));
@@ -365,6 +412,33 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
                     if is_probe {
                         debug_log(&format!(
                             "hooked_nt_open_file: rel={rel_str:?} branch=read-through \
+                             upper_path={upper_path:?} status={status:?}"
+                        ));
+                    }
+                    track_new_handle(file_handle, status, &rel_str, open_options);
+                    return status;
+                }
+                // ディレクトリ read-through（BUG-128、`hooked_nt_create_file`と同じ理由。
+                // `FILE_DIRECTORY_FILE` では絞らない＝git の lstat に追随する）。
+                if let Some(upper_path) = upper_only_dir_path(cfg, &rel) {
+                    let upper_wide: Vec<u16> = nt_path_wide(&upper_path);
+                    let (mut redirected_oa, mut redirected_name) =
+                        unsafe { build_redirected_oa(object_attributes, &upper_wide) };
+                    redirected_oa.ObjectName = &mut redirected_name;
+                    let hook = OPEN_FILE_HOOK.get().expect("hook installed");
+                    let status = unsafe {
+                        hook.call(
+                            file_handle,
+                            desired_access,
+                            &redirected_oa,
+                            io_status_block,
+                            share_access,
+                            open_options,
+                        )
+                    };
+                    if is_probe {
+                        debug_log(&format!(
+                            "hooked_nt_open_file: rel={rel_str:?} branch=dir-read-through \
                              upper_path={upper_path:?} status={status:?}"
                         ));
                     }

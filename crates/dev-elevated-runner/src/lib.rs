@@ -78,9 +78,10 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "tier2a_net_policy_matrix",
         ],
     ),
-    // CoW既定化の前提測定（`plans/PLAN-COW-AS-DEFAULT.md`検証タスク）: git だけで層3 hard-deny
-    // （設定注入パスの拒否）を迂回できるかを、塞ぐ前に1本だけ撃って観測する。`e2e-cow-matrix`
-    // とは別に置くのは、20件の行列全体を回さずこの1測定だけを撃てるようにするため（1要素＝1測定）。
+    // BUG-128 の回帰テスト（`docs/bugs/BUG-128.md`）: CoW（`--sandbox tier2a-cow`）下で git が
+    // オブジェクトを書き `git commit` が完走することを実機で確かめる。修正前は透過層(Redirector)で
+    // 完走しなかった（`.git/objects/pack: Function not implemented`）。`e2e-cow-matrix`とは別に
+    // 置くのは、20件の行列全体を回さずこの1測定だけを撃てるようにするため（1要素＝1測定）。
     // フィルタ文字列はテスト関数名と一致していなければならない（`check_tests_actually_ran`が
     // 0件マッチを非0で落とす、BUG-056同型）。
     (
@@ -94,7 +95,7 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--",
             "--ignored",
             "--nocapture",
-            "tier2a_cow_git_can_bypass_config_injection_hard_deny",
+            "tier2a_cow_git_commit_writes_objects_under_the_redirector",
         ],
     ),
     // N8-③-C-WFP: 生TCPの445が本番Tier2aのWFP適用下でも塞がるかを測る

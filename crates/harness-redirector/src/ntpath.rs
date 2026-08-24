@@ -92,8 +92,14 @@ pub(crate) unsafe fn resolve_relative_object_attributes_path(
     }
     let cfg = CONFIG.get()?;
     let Some(nt_device_path) = (unsafe { query_object_name(root) }) else {
-        debug_log("resolve_relative_object_attributes_path: NtQueryObject failed");
-        return None;
+        // **AppContainer内では「ハンドルの名前を引くOS API」が当てにならない**（BUG-128）。
+        // `GetFinalPathNameByHandleW`・`QueryDosDeviceW`（このモジュール冒頭のdoc）に続いて、
+        // `NtQueryObject`もパッケージSIDから見えないハンドルに対して失敗する。OSに後から聞く
+        // 代わりに、**このDLL自身が開いた瞬間に記録したハンドル→パス対応表**（`handle_paths()`）を
+        // 引く。git/MSYSはオブジェクトストアをopenat方式（`RootDirectory`＋相対名）で開くため、
+        // これが無いと`.git/objects/pack`の解決に失敗し、`git commit`が
+        // `.git/objects/pack: Function not implemented`で完走しなかった（BUG-128の症状）。
+        return resolve_relative_via_handle_map(cfg, root, raw_name);
     };
     let Some(root_path) = nt_device_path_to_known_root(cfg, &nt_device_path) else {
         debug_log(&format!(
@@ -107,6 +113,55 @@ pub(crate) unsafe fn resolve_relative_object_attributes_path(
         Some(root_path)
     } else {
         Some(root_path.join(rel.replace('/', "\\")))
+    }
+}
+
+/// `NtQueryObject`が失敗したときのフォールバック（BUG-128）。`root`ハンドルを、フックが
+/// 開いた瞬間に登録した対応表（`handle_paths()`：ハンドル→`Classified::ledger_key`）から引き、
+/// 親ディレクトリの実体パスへ復元して相対名を連結する。
+///
+/// **ledger_keyの解釈は`dir_query_roots`と同じ規約**にそろえる——絶対パスなら`_ext` capture
+/// root、そうでなければworkspace相対（`docs/CODE-STRUCTURE-RULES.md`規則5：同じ判定を2箇所で
+/// 別々に育てない）。返すのは絶対パスで、呼び出し側の`classify_target`が通常どおり再分類・
+/// リダイレクトする（＝親ハンドルがworkspace側かupper側かを問わず、子openは論理パスとして
+/// 扱われ、書込は改めてupperへ誘導される）。
+///
+/// **対応表に無いハンドルは`None`**（安全側の素通し）。境界はACLなので、透過が効かなければ
+/// 失敗が見えるだけで穴は開かない（D-01）。
+fn resolve_relative_via_handle_map(cfg: &Config, root: HANDLE, raw_name: &str) -> Option<PathBuf> {
+    let key = root.0 as isize;
+    // 対応表に無いハンドルは `None`（安全側の素通し）。ここへ来る大半は、プロセス生成の
+    // 内部で開かれる（このDLLが分類していない）ハンドルへの空名 open で、解決できなくても
+    // 透過が効かないだけ＝境界はACLが守る（D-01）。ログは解決できたときだけ出す（ミスは多い）。
+    let parent_rel = handle_paths().lock().unwrap().get(&key).cloned()?;
+    let resolved = reconstruct_handle_relative_path(&cfg.workspace_root, &parent_rel, raw_name);
+    debug_log(&format!(
+        "resolve_relative_via_handle_map: root {key:#x} -> parent_rel={parent_rel:?} \
+         raw_name={raw_name:?} resolved={resolved:?}"
+    ));
+    Some(resolved)
+}
+
+/// 親ディレクトリの`ledger_key`（対応表の値）と相対名から、子の実体パスを組み立てる純関数。
+/// グローバル状態に触れないので単体テストできる（`resolve_relative_via_handle_map`から切り出し）。
+///
+/// 規約は`dir_query_roots`と同じ: `parent_rel`が絶対パスなら`_ext` capture root としてそのまま、
+/// そうでなければworkspace相対。相対名は先頭の`\`を落とし`/`→`\`へ正規化して連結する。
+fn reconstruct_handle_relative_path(
+    workspace_root: &Path,
+    parent_rel: &str,
+    raw_name: &str,
+) -> PathBuf {
+    let base = if Path::new(parent_rel).is_absolute() {
+        PathBuf::from(parent_rel)
+    } else {
+        workspace_root.join(parent_rel)
+    };
+    let child = raw_name.trim_start_matches('\\').replace('/', "\\");
+    if child.is_empty() {
+        base
+    } else {
+        base.join(child)
     }
 }
 
@@ -198,4 +253,52 @@ pub(crate) fn strip_nt_prefix(raw: &str) -> Option<PathBuf> {
         .or_else(|| raw.strip_prefix(r"\\?\"))
         .unwrap_or(raw);
     Some(PathBuf::from(stripped))
+}
+
+#[cfg(test)]
+mod handle_map_reconstruction_tests {
+    use super::reconstruct_handle_relative_path;
+    use std::path::{Path, PathBuf};
+
+    /// git のオブジェクトストアは openat 方式（親ディレクトリのハンドル + 相対名）で開く。
+    /// 親 `.git/objects` のハンドルから子 `pack` を解決する典型ケース（BUG-128 の中心）。
+    #[test]
+    fn joins_workspace_relative_parent_with_child() {
+        let ws = Path::new(r"C:\ws");
+        assert_eq!(
+            reconstruct_handle_relative_path(ws, ".git/objects", "pack"),
+            PathBuf::from(r"C:\ws\.git/objects\pack")
+        );
+    }
+
+    /// 相対名の先頭 `\` は落とし、`/` は `\` へ正規化する（多段の相対名も連結できる）。
+    #[test]
+    fn strips_leading_backslash_and_normalizes_slashes() {
+        let ws = Path::new(r"C:\ws");
+        assert_eq!(
+            reconstruct_handle_relative_path(ws, ".git", r"\objects/ab/cdef"),
+            PathBuf::from(r"C:\ws\.git\objects\ab\cdef")
+        );
+    }
+
+    /// 相対名が空（ハンドルそのものを指す open）のときは親をそのまま返す。
+    #[test]
+    fn empty_child_returns_the_parent_itself() {
+        let ws = Path::new(r"C:\ws");
+        assert_eq!(
+            reconstruct_handle_relative_path(ws, ".git/objects", ""),
+            PathBuf::from(r"C:\ws\.git/objects")
+        );
+    }
+
+    /// 親が絶対パス（`_ext` capture root の実体パス）なら workspace は前置しない
+    /// （`dir_query_roots` と同じ規約）。
+    #[test]
+    fn absolute_parent_is_used_verbatim_like_ext_capture_root() {
+        let ws = Path::new(r"C:\ws");
+        assert_eq!(
+            reconstruct_handle_relative_path(ws, r"D:\shared\tools", "x.dll"),
+            PathBuf::from(r"D:\shared\tools\x.dll")
+        );
+    }
 }

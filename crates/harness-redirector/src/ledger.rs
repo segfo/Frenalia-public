@@ -190,6 +190,27 @@ pub(crate) fn upper_version_path(cfg: &Config, rel: &Path) -> Option<PathBuf> {
     }
 }
 
+/// ディレクトリの読み取りopen向けの read-through（BUG-128）。upper 側に**ディレクトリとして**
+/// 実体があり、かつ workspace 側に無いとき、その upper ディレクトリのパスを返す。
+///
+/// **なぜ要るか**: git/MSYS は、このセッションで新規作成した upper だけに在るディレクトリ
+/// （例: `.github`・`.github/workflows`）を open して pathspec を解決したり中身を列挙したりする。
+/// これをリダイレクトしないと、読取専用の workspace 側（そこには存在しない）を開こうとして
+/// `STATUS_ACCESS_DENIED`／`OBJECT_PATH_NOT_FOUND` になり、`git add` が対象を見つけられず何も
+/// ステージしない（実機ログで確認、`docs/bugs/BUG-128.md`）。
+///
+/// **workspace 側にも在るディレクトリは対象外（`None`）＝従来どおり素通し**。素通しでも open は
+/// 成功し、列挙は `try_merged_dir_query` が upper をマージするので、見え方は変わらない。ここで
+/// upper へ誘導するのは「upper にしか無い」場合だけに限る（既存挙動を変えないため）。
+pub(crate) fn upper_only_dir_path(cfg: &Config, rel: &Path) -> Option<PathBuf> {
+    let upper_path = cfg.upper_dir.join(rel);
+    if upper_path.is_dir() && !cfg.workspace_root.join(rel).is_dir() {
+        Some(upper_path)
+    } else {
+        None
+    }
+}
+
 /// 台帳ファイルの、前回同期以降に追記された**完全な行だけ**を取り込み、`deleted_paths_state`
 /// を増分更新する（設計書§19.2）。`FILE_APPEND_DATA`による1行1書込みという既存の追記規律
 /// （書く側、本ファイル`append_ledger_entry`）により、途中まで書かれた行（末尾に`\n`が無い）は

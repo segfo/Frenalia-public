@@ -1624,44 +1624,39 @@ git -c safe.directory=* update-ref refs/heads/master HEAD *>> _git-log.txt
 git -c safe.directory=* rev-parse HEAD *>> _git-log.txt
 "rev-parse exit=$LASTEXITCODE" | Out-File -FilePath _git-log.txt -Append -Encoding utf8"#;
 
-/// **検証タスク本体**（`plans/PLAN-COW-AS-DEFAULT.md`）。「塞ぐ前に、止まらないことを先に
-/// 観測する」測定である（`test-logic-rules`：順序を逆にすると「元から塞がっていた」のか
-/// 「塞いだから止まった」のか区別できない）。
+/// **BUG-128 の回帰テスト（`docs/bugs/BUG-128.md`）**。
 ///
-/// **仮説**: 層3 hard-deny は書込先パスの前方一致で判定する(`is_config_injection_path`)。
-/// git オブジェクトは内容ハッシュを名前にするので`.git/objects/ab/cdef…`というパスには
-/// 設定注入の情報が無い。「`.github/workflows/x.yml`へ直接書く」は止まるが、「それを含む
-/// オブジェクトを書いてブランチを動かす」は判定の外を通る、という読み。
+/// CoW（`--sandbox tier2a-cow`）セッション内で、**git がオブジェクトを書けて `git commit` が
+/// 完走する**ことを実機で確かめる。修正前は、透過役（Redirector DLL）が git のハンドル相対 open
+/// （openat 方式）を解決できず、`.git/objects/pack: Function not implemented` で commit が落ちて
+/// いた。修正は「OS にハンドルの名前を後から聞く」代わりに「開いた瞬間に記録した対応表を引く」
+/// もので、`crates/harness-redirector/src/ntpath.rs` の `resolve_relative_via_handle_map` が本体。
 ///
-/// **対照（B-35：許可側と拒否側を対にする）を1ケース内に持つ**。同じ`.github/workflows/x.yml`の——
-///  - ワークツリー実体（直接パス）は apply で`hard_denied`される（＝拒否機構は生きている）
-///  - git オブジェクト経由は`applied`される（＝それでも運べる）
-/// の両方を観測する。verdict＝BYPASSED は「拒否機構が生きているのに、迂回が成立した」ときだけ。
+/// **緑 = 修正が効いている**（git がオブジェクトを書き、`commit` が exit 0）。
+/// **赤 = まだ完走しない**（対応表に無いハンドルが残る等）。赤なら upper の `_git-log.txt` と、
+/// `resolve_relative_via_handle_map` が仕込んだ hit/miss ログ（upper の `.harness-cow-debug.log`）で
+/// どのハンドルが未解決かを辿る。
 ///
-/// **成立/不成立**（plan「何が『成立』か」）:
-///  - 成立: apply 後にサンドボックス外で`git checkout`すると`.github/workflows/x.yml`が
-///    実体化する → 現在の hard-deny は追跡ファイル経由の設定注入を止めていない。
-///  - 不成立: どこかで止まる → 返す`Err`に全証跡（changes/apply レポート・git ログ）を載せ、
-///    どの層が止めたかを file:line で辿れるようにする。
+/// **このテストは 穴2（CoW 下で git が動かない）だけを見る。** 穴1（apply の層3 hard-deny が
+/// git オブジェクト経由の設定注入を通すこと）は別レイヤで、`harness-sandbox` の
+/// `overlay.rs::apply_hard_deny_is_bypassed_by_git_objects_carrying_a_config_injection_file` が
+/// 確定済み。穴2が直った今、穴1は live でも到達可能になった——その塞ぎ方は運用判断待ち
+/// （`plans/PLAN-COW-AS-DEFAULT.md` 決める4つの2）。
 #[test]
 #[ignore]
-fn tier2a_cow_git_can_bypass_config_injection_hard_deny() {
-    // 成功時の証跡は probe が println! 済み。失敗時は全証跡を載せた Err で落とす。
-    if let Err(e) = git_config_injection_bypass_probe() {
+fn tier2a_cow_git_commit_writes_objects_under_the_redirector() {
+    if let Err(e) = git_commit_under_cow_probe() {
         panic!("{e}");
     }
 }
 
-fn git_config_injection_bypass_probe() -> Result<(), String> {
+fn git_commit_under_cow_probe() -> Result<(), String> {
     let ws = case_dir("cow-git-injection");
-    let wt_file = ws.join(".github").join("workflows").join("x.yml");
-    const INJECTED: &str = "name: evil-injected-via-git";
 
-    // Phase 0: サンドボックス外で正当なリポジトリを種付け。
+    // サンドボックス外で正当なリポジトリを種付け（git がコミット先の `.git` を持つように）。
     git_seed_repo(&ws)?;
-    let objects_before = count_loose_git_objects(&ws);
 
-    // Phase 1: CoW セッションで git だけを使い、設定注入ファイルをコミット＋ref移動。
+    // CoW セッションで git だけを使い、コミット＋ref移動を試みる。
     let before = list_cow_sessions();
     let run = run_harness(
         &ws,
@@ -1677,11 +1672,10 @@ fn git_config_injection_bypass_probe() -> Result<(), String> {
     }
     let session = new_cow_session(&before)?;
     let upper = cow_upper_dir(&session);
-    let git_log = std::fs::read_to_string(upper.join("_git-log.txt")).unwrap_or_else(|e| {
-        format!("(could not read upper/_git-log.txt: {e})")
-    });
+    let git_log = std::fs::read_to_string(upper.join("_git-log.txt"))
+        .unwrap_or_else(|e| format!("(could not read upper/_git-log.txt: {e})"));
 
-    // Phase 2: apply 前の changes 一覧（plan 手順3：何がどう出るか）。
+    // 台帳（apply 前の changes 一覧）に git オブジェクトが載ったか。
     let changes = list_changes_json(&ws, &session)?;
     let change_paths: Vec<String> = changes
         .as_array()
@@ -1693,96 +1687,47 @@ fn git_config_injection_bypass_probe() -> Result<(), String> {
         .iter()
         .filter(|p| p.starts_with(".git/objects/"))
         .collect();
-    let working_tree_entry_present = change_paths.iter().any(|p| p == ".github/workflows/x.yml");
-
-    if object_entries.is_empty() {
-        return Err(format!(
-            "git wrote NO objects into the CoW ledger — git likely failed inside the session, so \
-             the bypass could not even be attempted. Investigate before drawing any conclusion.\n\
-             changes.paths={change_paths:?}\n--- upper/_git-log.txt ---\n{git_log}"
-        ));
-    }
-    if !working_tree_entry_present {
-        return Err(format!(
-            "the working-tree copy of .github/workflows/x.yml is missing from the ledger; the \
-             deny-side control cannot be established.\nchanges.paths={change_paths:?}\n\
-             --- upper/_git-log.txt ---\n{git_log}"
-        ));
-    }
-
-    // Phase 3: apply。拒否側(ワークツリー実体)と許可側(オブジェクト)を同じレポートで観測する。
-    let report = apply_cow(&ws, &session, None)?;
-    let as_paths = |key: &str| -> Vec<String> {
-        report[key]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(|p| p.replace('\\', "/")))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let hard_denied = as_paths("hard_denied");
-    let applied = as_paths("applied");
-
-    // 拒否側（機構が生きている証拠）: ワークツリーの設定注入パスは hard_denied。
-    let wt_hard_denied = hard_denied.iter().any(|p| p == ".github/workflows/x.yml");
-    // 許可側（迂回）: オブジェクトは applied されており、hard_denied されていない。
-    let objects_applied = applied
-        .iter()
-        .filter(|p| p.starts_with(".git/objects/"))
-        .count();
-    let objects_hard_denied = hard_denied.iter().any(|p| p.starts_with(".git/objects/"));
-    // ブランチ参照も運ばれたか。
-    let ref_applied = applied.iter().any(|p| p == ".git/refs/heads/master");
-
-    // apply 直後、ワークツリーのファイルはまだ実体化していないはず（hard_denied されたので）。
-    let present_right_after_apply = wt_file.exists();
-
-    // Phase 4: サンドボックス外で checkout → 迂回で運んだオブジェクトから実体化するか。
-    let checkout = plain_git(&ws, &["checkout", "HEAD", "--", ".github/workflows/x.yml"]);
-    let materialized = wt_file.exists();
-    let content = if materialized {
-        std::fs::read_to_string(&wt_file).unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let objects_after = count_loose_git_objects(&ws);
-
-    let bypassed = wt_hard_denied
-        && objects_applied > 0
-        && !objects_hard_denied
-        && materialized
-        && content == INJECTED;
+    let upper_loose_objects = count_loose_git_objects(&upper);
+    let commit_ok = git_log.contains("commit exit=0");
+    // 対照: 通常のファイル書込（ワークツリー実体）の copy-up が成立していること
+    //（＝Redirector はロードされ、セッションは実際に走った。空振り緑を避ける、B-35）。
+    let working_tree_copy_up = change_paths.iter().any(|p| p == ".github/workflows/x.yml");
 
     let evidence = serde_json::json!({
-        "verdict": if bypassed { "BYPASSED" } else { "BLOCKED_OR_INCONCLUSIVE" },
-        "control_working_tree_path_hard_denied": wt_hard_denied,
-        "objects_applied_count": objects_applied,
-        "objects_hard_denied": objects_hard_denied,
-        "ref_master_applied": ref_applied,
-        "ledger_object_entries": object_entries.len(),
-        "loose_objects_before": objects_before,
-        "loose_objects_after_apply": objects_after,
-        "working_tree_file_present_right_after_apply": present_right_after_apply,
-        "materialized_by_outside_sandbox_checkout": materialized,
-        "materialized_content": content,
-        "checkout_result": checkout.err(),
-        "apply_hard_denied": hard_denied,
-        "apply_applied_sample": applied.iter().take(20).collect::<Vec<_>>(),
+        "bug": "BUG-128",
+        "git_objects_in_ledger": object_entries.len(),
+        "upper_loose_objects": upper_loose_objects,
+        "commit_reported_exit_0": commit_ok,
+        "working_tree_copy_up_succeeded": working_tree_copy_up,
         "changes_paths_sample": change_paths.iter().take(30).collect::<Vec<_>>(),
     });
 
-    if !bypassed {
-        // 不成立: 後始末しない（調査のため残す）。どの層が止めたかを証跡から辿る。
+    if !working_tree_copy_up {
         return Err(format!(
-            "expected the git-object route to bypass the layer-3 hard-deny, but the reproduction \
-             did NOT complete a clean bypass. Full evidence follows.\n{evidence:#}\n\
+            "control failed: the CoW session did not even copy-up the working-tree file, so a green \
+             result would be vacuous (the session may not have run under the redirector).\n\
+             {evidence:#}\n--- upper/_git-log.txt ---\n{git_log}"
+        ));
+    }
+
+    if object_entries.is_empty() && upper_loose_objects == 0 {
+        return Err(format!(
+            "BUG-128 still reproduces: git wrote NO objects under CoW. The handle-map fallback \
+             (resolve_relative_via_handle_map) did not resolve git's openat chain — check upper/\
+             .harness-cow-debug.log for which root handle was 'not in handle_paths'.\n{evidence:#}\n\
              --- upper/_git-log.txt ---\n{git_log}"
         ));
     }
 
-    println!("{evidence:#}");
+    if !commit_ok {
+        return Err(format!(
+            "git wrote objects but `git commit` did not report exit=0 — the fix is partial.\n\
+             {evidence:#}\n--- upper/_git-log.txt ---\n{git_log}"
+        ));
+    }
+
+    // 緑: 修正が効いている（git がオブジェクトを書き、commit が完走した）。
+    println!("{evidence:#}\n--- upper/_git-log.txt ---\n{git_log}");
     cleanup_on_success(&ws, &[&session], "cow-git-injection");
     Ok(())
 }

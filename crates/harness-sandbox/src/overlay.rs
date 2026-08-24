@@ -1391,6 +1391,224 @@ mod tests {
         );
     }
 
+    /// **`plans/PLAN-COW-AS-DEFAULT.md`検証タスクの本体（判定層だけを切り出した版）**。
+    ///
+    /// 問い: 追跡ファイル（`.github/workflows/x.yml`）を「ワークツリー実体」ではなく
+    /// 「コミット・オブジェクト＋ブランチ移動」として運ぶと、apply の層3 hard-deny
+    /// （`is_config_injection_path`の前置詞一致）を迂回できるか。
+    ///
+    /// **なぜ透過層を切り離すのか（2026-08-23の実機測定）**: 生の git は CoW の透過層
+    /// （Redirector DLL）で完走しない——`resolve_relative_object_attributes_path`
+    /// （`crates/harness-redirector/src/ntpath.rs:71`）が git のハンドル相対 open を解決できず
+    /// `.git/objects/pack: Function not implemented` となり、git はオブジェクトを1つも書けない
+    /// （`dev-elevated-run e2e-cow-git-injection` の観測）。よって「生 git で迂回」は
+    /// **透過層で先に落ちて** end-to-end では観測できない。ここでは透過層を外し、
+    /// **判定層（apply）だけ**を測る: git が書いたであろうオブジェクト＋ref移動を**本物の git**で
+    /// 作って台帳へ載せ、apply の非対称——オブジェクト/refは通し、同内容のワークツリー実体は
+    /// hard-deny する——を確かめる（1差分×1ケース `B-29` / 許可側と拒否側の対 `B-35`）。
+    ///
+    /// **成立の定義**（plan「何が『成立』か」）: apply 後、サンドボックス外の
+    /// `git checkout HEAD -- .github/workflows/x.yml` で拒否対象ファイルが実体化する
+    /// → 現在の hard-deny は追跡ファイル経由の設定注入を止めていない。
+    ///
+    /// 昇格は不要（AppContainer も Redirector も使わない）。外部の`git`に依存し実FS I/Oを行う
+    /// ため`#[ignore]`とし、`cargo test -p harness-sandbox --lib -- --ignored <name>`で回す。
+    #[test]
+    #[ignore]
+    fn apply_hard_deny_is_bypassed_by_git_objects_carrying_a_config_injection_file() {
+        const INJECTED: &str = "name: evil-injected-via-git";
+
+        // ハードニングなしの素の git（テスト足場。サンドボックス内でモデルが起動する git とは別）。
+        fn git(dir: &std::path::Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args([
+                    "-c",
+                    "safe.directory=*",
+                    "-c",
+                    "user.name=e2e",
+                    "-c",
+                    "user.email=e2e@example.com",
+                ])
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?}: {e} (is git installed and on PATH?)"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        // `.git/objects/xx/<rest>` のルース・オブジェクト集合（`xx/rest`形で返す。pack/infoは除く）。
+        fn loose_objects(objects_dir: &std::path::Path) -> std::collections::HashSet<String> {
+            let mut set = std::collections::HashSet::new();
+            let Ok(top) = std::fs::read_dir(objects_dir) else {
+                return set;
+            };
+            for e in top.flatten() {
+                let fan = e.file_name();
+                let fan = fan.to_string_lossy().to_string();
+                if fan.len() == 2 && fan.chars().all(|c| c.is_ascii_hexdigit()) {
+                    if let Ok(inner) = std::fs::read_dir(e.path()) {
+                        for f in inner.flatten() {
+                            set.insert(format!("{fan}/{}", f.file_name().to_string_lossy()));
+                        }
+                    }
+                }
+            }
+            set
+        }
+
+        fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for entry in std::fs::read_dir(src).unwrap().flatten() {
+                let from = entry.path();
+                let to = dst.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_dir_all(&from, &to);
+                } else {
+                    std::fs::copy(&from, &to).unwrap();
+                }
+            }
+        }
+
+        let (_ws_tmp, upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
+
+        // 1) 実workspaceに正当なリポジトリ（master@c0＝READMEのみ）を種付け。
+        std::fs::write(workspace_root.join("README.md"), "seed\n").unwrap();
+        git(&workspace_root, &["init", "-q"]);
+        git(&workspace_root, &["add", "README.md"]);
+        git(&workspace_root, &["commit", "-q", "-m", "seed"]);
+        let master_ref = workspace_root.join(".git").join("refs").join("heads").join("master");
+        assert!(
+            master_ref.exists(),
+            "seed must leave a loose master ref (not packed); found none at {master_ref:?}"
+        );
+        let c0_ref_bytes = std::fs::read(&master_ref).unwrap();
+        let loose_before = loose_objects(&workspace_root.join(".git").join("objects"));
+
+        // 2) workspaceのコピー側で注入コミットを作る（本物の git、サンドボックス外）。
+        //    実workspaceの`.git`は一切触らない——迂回ペイロードは「外から台帳経由で運ぶ」。
+        let build = upper_tmp.path().join("build");
+        copy_dir_all(&workspace_root, &build);
+        std::fs::create_dir_all(build.join(".github").join("workflows")).unwrap();
+        std::fs::write(build.join(".github").join("workflows").join("x.yml"), INJECTED).unwrap();
+        git(&build, &["add", ".github/workflows/x.yml"]);
+        git(&build, &["commit", "-q", "-m", "inject ci workflow via tracked object"]);
+        let c1 = git(&build, &["rev-parse", "HEAD"]);
+        let build_ref_bytes =
+            std::fs::read(build.join(".git").join("refs").join("heads").join("master")).unwrap();
+
+        // 3) 差分オブジェクト＋ref移動＋ワークツリー実体を upper へ置き、台帳へ載せる
+        //    （Redirector の copy-up が記録したであろう形を、本物のオブジェクトで再現する）。
+        let loose_after = loose_objects(&build.join(".git").join("objects"));
+        let new_objects: Vec<String> =
+            loose_after.difference(&loose_before).cloned().collect();
+        assert!(
+            !new_objects.is_empty(),
+            "the injected commit must create new loose objects (blob/tree/commit)"
+        );
+        for rel in &new_objects {
+            let src = build.join(".git").join("objects").join(rel);
+            let dst = upper_dir.join(".git").join("objects").join(rel);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::copy(&src, &dst).unwrap();
+            store::append_entry(&upper_dir, ChangeOp::Create, &format!(".git/objects/{rel}"), None);
+        }
+        // ブランチ移動（Modify。baseline＝実workspaceの現在の master 内容＝c0）。
+        std::fs::create_dir_all(upper_dir.join(".git").join("refs").join("heads")).unwrap();
+        std::fs::write(
+            upper_dir.join(".git").join("refs").join("heads").join("master"),
+            &build_ref_bytes,
+        )
+        .unwrap();
+        store::append_entry(
+            &upper_dir,
+            ChangeOp::Modify,
+            ".git/refs/heads/master",
+            Some(harness_change_ledger::hash_bytes(&c0_ref_bytes)),
+        );
+        // ワークツリー実体（Create。これが拒否側の対照——apply で hard-deny されねばならない）。
+        std::fs::create_dir_all(upper_dir.join(".github").join("workflows")).unwrap();
+        std::fs::write(
+            upper_dir.join(".github").join("workflows").join("x.yml"),
+            INJECTED,
+        )
+        .unwrap();
+        store::append_entry(&upper_dir, ChangeOp::Create, ".github/workflows/x.yml", None);
+
+        // 4) apply。
+        let fs = SandboxFs::open_with_cow(
+            &workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(&upper_dir),
+        )
+        .unwrap();
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+                adopt_unledgered: false,
+            })
+            .unwrap();
+        let applied: Vec<String> = report.applied.iter().map(|p| p.replace('\\', "/")).collect();
+        let hard_denied: Vec<String> =
+            report.hard_denied.iter().map(|p| p.replace('\\', "/")).collect();
+
+        // 拒否側（機構が生きている証拠）: ワークツリーの設定注入パスは hard_denied。
+        assert!(
+            hard_denied.iter().any(|p| p == ".github/workflows/x.yml"),
+            "control: the working-tree config-injection path must be hard-denied, otherwise this \
+             test cannot distinguish a live deny mechanism from a dead one (B-35). report={report:?}"
+        );
+        // 許可側（迂回）: オブジェクトは全件 applied、hard_denied されていない。
+        let objects_applied = applied.iter().filter(|p| p.starts_with(".git/objects/")).count();
+        assert_eq!(
+            objects_applied,
+            new_objects.len(),
+            "every injected git object must be applied (they carry the payload): report={report:?}"
+        );
+        assert!(
+            !hard_denied.iter().any(|p| p.starts_with(".git/objects/")),
+            "git objects must NOT be hard-denied — their content-hash paths carry no config-\
+             injection signal: report={report:?}"
+        );
+        assert!(
+            applied.iter().any(|p| p == ".git/refs/heads/master"),
+            "the moved branch ref must be applied: report={report:?}"
+        );
+
+        // 実FS: apply 直後はワークツリー実体はまだ無い（hard_denied されたので）。
+        let wt = workspace_root.join(".github").join("workflows").join("x.yml");
+        assert!(
+            !wt.exists(),
+            "the working-tree file must NOT be materialized by apply itself (it was hard-denied)"
+        );
+
+        // 5) サンドボックス外で checkout → 迂回で運んだオブジェクトから拒否対象が実体化する。
+        git(&workspace_root, &["checkout", "HEAD", "--", ".github/workflows/x.yml"]);
+        assert!(
+            wt.exists(),
+            "BYPASS成立: サンドボックス外の`git checkout`が、密輸したオブジェクトから hard-deny \
+             対象ファイルを実体化させた"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&wt).unwrap(),
+            INJECTED,
+            "materialized content must be the injected payload"
+        );
+        assert_eq!(
+            git(&workspace_root, &["rev-parse", "HEAD"]),
+            c1,
+            "実HEADが注入コミットを指していること（refも運ばれた）"
+        );
+    }
+
     /// W1-4: applyが拒否する形のエントリは、一覧（`harness changes`・TUI変更パネル）から
     /// **消えてはいけない**。理由付きで見せる（D-43「失敗を隠さない」）。
     #[test]

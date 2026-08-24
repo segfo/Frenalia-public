@@ -332,6 +332,19 @@ pub(crate) unsafe fn try_merged_dir_query(
     refresh_deleted_set(cfg);
     let deleted = deleted_paths_state().lock().unwrap().clone();
     let merged = dir_merge::merge_dir_entries(&base_dir, &upper_dir, &deleted, &rel_prefix);
+    // BUG-128: マージ結果が空で、base 側にも実体が無い（＝本当に空のディレクトリで、削除隠し
+    // でもない）ときは、自前で `STATUS_NO_MORE_FILES` を先頭から返さず、OS 本来の列挙へ素通しする。
+    //
+    // **なぜ**: 実の `NtQueryDirectoryFile` は空ディレクトリでも先頭で `.`/`..` を返してから
+    // `STATUS_NO_MORE_FILES` を返す。我々が先頭で `STATUS_NO_MORE_FILES` を返すと、Cygwin/MSYS の
+    // `opendir` が `.`/`..` を1つも得られず `ENOSYS`（Function not implemented）で失敗する
+    // （git の空の `.git/objects/pack` で実機再現、`docs/bugs/BUG-128.md`）。空ディレクトリには
+    // マージで足すべき upper エントリも隠すべき削除エントリも無いので、素通しは意味論的に等価で
+    // 安全。**base 側に実体がある場合（＝全エントリを削除で隠している whiteout）は素通ししない**
+    // ——そちらは隠し続ける必要があるため、従来どおり空を返す。
+    if merged.is_empty() && dir_merge::read_entries(&base_dir).is_empty() {
+        return None;
+    }
     let pattern = unsafe { filename_filter_string(file_name) };
     let merged: Vec<dir_merge::MergedEntry> = if pattern.is_empty() {
         merged
