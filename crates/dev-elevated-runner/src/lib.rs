@@ -554,6 +554,38 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     // コマンドを実行している間、自分自身の実行ファイルは起動中でロックされておりリンクし
     // 直せない（実機で`error: failed to remove file ...dev-elevated-runnerd.exe: アクセスが
     // 拒否されました`を確認済み）。本セッションで再ビルドが必要な対象はharness本体側だけ。
+    // D-81の検証用NTFSボリューム（VHD）。**作成と撤収を別ターゲットにしてある**——
+    // 昇格側プロセスへ呼び出し元の環境変数が引き継がれる保証が無いので、1つのターゲットに
+    // 引数で向きを渡すと「撤収したつもりで作成していた」という無言の取り違えになる
+    // （`n2-loopback-exemption-add`／`-remove`と同じ理由）。
+    (
+        "vhd-ntfs-create",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "vhd_ntfs_create",
+        ],
+    ),
+    (
+        "vhd-ntfs-remove",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "vhd_ntfs_remove",
+        ],
+    ),
     (
         "workspace-build",
         &["build", "--workspace", "--exclude", "dev-elevated-runner"],

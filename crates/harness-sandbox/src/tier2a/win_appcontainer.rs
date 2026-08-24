@@ -499,6 +499,12 @@ mod passthrough_diagnosis_tests;
 #[cfg(all(windows, test))]
 mod cow_containment_tests;
 
+/// D-81（差分層はワークスペースと同じボリュームへ置く）を、検証用のNTFSボリューム
+/// （VHD）で実際に通す。作成・撤収は要管理者で、`dev-elevated-run.exe vhd-ntfs-create`／
+/// `-remove`から回す（対で分けてある理由はモジュールdoc）。
+#[cfg(all(windows, test))]
+mod vhd_volume_tests;
+
 /// MCPサーバ隔離（D-38）の実機E2E。`docs/STATUS.md`「MCPクライアント機構」残課題#3/#4。
 #[cfg(all(windows, test))]
 mod mcp_e2e_tests;

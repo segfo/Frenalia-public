@@ -594,6 +594,10 @@ pub(crate) fn hold_mutex_for_process_lifetime(name: &str) -> windows::core::Resu
 /// 解決できなければ`None`を返す。**呼び出し側は`None`を「同じボリューム」と読まないこと。**
 pub fn volume_mount_point_of(path: &std::path::Path) -> Option<std::path::PathBuf> {
     use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
+    // `subst`のドライブ文字は**ボリュームではなくディレクトリへの別名**なので、先に実体へ
+    // 直す（下記）。直さないと`GetVolumePathNameW`が壊れた答えを返す。
+    let path = resolve_subst_drive(path);
+    let path = path.as_path();
     let wide_path = wide(&path.to_string_lossy());
     // MAX_PATHで足りない長いパスもあるので、NTの上限に合わせて広めに取る。
     let mut buf = vec![0u16; 32768];
@@ -649,6 +653,60 @@ pub fn volume_capability(
         filesystem: String::from_utf16_lossy(&fs_name[..len]),
         is_remote: drive_type == DRIVE_REMOTE,
     })
+}
+
+/// `subst`で作ったドライブ文字を、指している実体のパスへ直す（`subst`でなければそのまま返す）。
+///
+/// # なぜ要るのか
+///
+/// `subst X: C:\some\dir` はボリュームを作らない——**ディレクトリへの別名**をDOSデバイス名前空間
+/// に置くだけである。ところが`GetVolumePathNameW`はこれを普通のボリュームのように扱おうとして
+/// 壊れた答えを返す（実測: `N:\proj` に対して `N:\proj\` 自身を「マウント先」として返し、
+/// 続く`GetVolumeInformationW`が`ERROR_DIRECTORY_NOT_SUPPORTED`で失敗する。`N:\`を直接聞くと
+/// それも失敗する）。その結果、ボリュームの素性が「判定不能」になり、CoWの関所は
+/// **拒否側へ倒れて起動できなくなる**。
+///
+/// **これは実際に踏む配置である。** `preflight`のワークスペース長チェックは、パスが長すぎる
+/// ときの回避策として`subst`を**自分から勧めている**——勧めたとおりにすると CoW が起動できない、
+/// という噛み合わせになっていた。実体（多くはNTFSのC:）では境界を張れるので、拒否は過剰である。
+///
+/// 判定は`QueryDosDeviceW`が返す文字列で行う。`subst`のときだけ`\??\`＋実パスの形になり、
+/// 本物のボリュームは`\Device\HarddiskVolume3`・`\Device\Volume{GUID}`、ネットワークドライブは
+/// `\Device\LanmanRedirector\...`になる（この機で全ドライブを実測して確認した）。
+fn resolve_subst_drive(path: &std::path::Path) -> std::path::PathBuf {
+    use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+
+    let text = path.to_string_lossy().into_owned();
+    // `X:`で始まるものだけが対象（UNCパスやverbatimは`subst`ではない）。
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return path.to_path_buf();
+    }
+    let drive = &text[..2];
+    let wide_drive = wide(drive);
+    let mut buffer = vec![0u16; 4096];
+    let len = unsafe { QueryDosDeviceW(PCWSTR(wide_drive.as_ptr()), Some(&mut buffer)) };
+    if len == 0 {
+        return path.to_path_buf();
+    }
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    let target = String::from_utf16_lossy(&buffer[..end]);
+    match apply_dos_device_target(&text, &target) {
+        Some(resolved) => std::path::PathBuf::from(resolved),
+        None => path.to_path_buf(),
+    }
+}
+
+/// [`resolve_subst_drive`]の**規則だけ**（純関数。Win32を触らないので`cargo test`で検算できる）。
+///
+/// `device_target`は`QueryDosDeviceW`の戻り値。`subst`のときだけ`\??\`＋実パスの形になり、
+/// そのときだけ`Some`を返す。本物のボリューム（`\Device\HarddiskVolume3`・
+/// `\Device\Volume{GUID}`）とネットワークドライブ（`\Device\LanmanRedirector\...`）は
+/// `None`＝そのまま扱う。
+fn apply_dos_device_target(path_text: &str, device_target: &str) -> Option<String> {
+    let real = device_target.strip_prefix(r"\??\")?;
+    // 残り（`X:`を除いた部分）を実体へ継ぎ足す。`X:`だけならその実体そのもの。
+    Some(format!("{real}{}", &path_text[2..]))
 }
 
 /// `path`のDACL（アクセス権の一覧）を**実際に書けるか**を、副作用なしで確かめる。
@@ -899,5 +957,43 @@ mod tests {
         assert!(written > 0, "WideCharToMultiByte(write) failed for {s:?}");
         buf.truncate(written as usize);
         buf
+    }
+}
+
+#[cfg(test)]
+mod subst_resolution_tests {
+    use super::apply_dos_device_target;
+
+    /// `subst`で作った別名は、指している実体へ直す。**直さないと`GetVolumePathNameW`が
+    /// 壊れた答えを返し、ボリュームの素性が判定不能になってCoWが起動できない**——
+    /// しかも`preflight`は長いパスの回避策として`subst`を自分から勧めている。
+    #[test]
+    fn a_subst_drive_is_rewritten_onto_its_target() {
+        assert_eq!(
+            apply_dos_device_target(r"N:\proj\src", r"\??\C:\work\area").as_deref(),
+            Some(r"C:\work\area\proj\src")
+        );
+        // ドライブ文字だけのときは実体そのもの。
+        assert_eq!(
+            apply_dos_device_target("N:", r"\??\C:\work\area").as_deref(),
+            Some(r"C:\work\area")
+        );
+    }
+
+    /// **本物のボリュームは書き換えない**（許可側と拒否側を対で測る）。ここが`Some`を返すと、
+    /// 実在しないパスを作ってしまい、まともなドライブまで判定不能になる。
+    #[test]
+    fn real_volumes_and_network_drives_are_left_alone() {
+        for device in [
+            r"\Device\HarddiskVolume3",
+            r"\Device\Volume{1d778159-9d29-11f1-8838-acf23c3508a0}",
+            r"\Device\LanmanRedirector\;X:000000000004107c\server\share",
+        ] {
+            assert_eq!(
+                apply_dos_device_target(r"X:\proj", device),
+                None,
+                "本物のボリュームを書き換えてはいけない: {device}"
+            );
+        }
     }
 }
