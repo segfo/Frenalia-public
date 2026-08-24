@@ -64,7 +64,7 @@ pub use decl::{
     McpNetworkDecl, McpServerDecl, McpSettings, McpTransportKind, McpWorkspaceAccess,
 };
 pub use harness_core::McpServerFact;
-pub use http_wire::{CertPin, Endpoint, EndpointGates};
+pub use http_wire::{parse_http_allow_value, CertPin, Endpoint, EndpointGates};
 pub use runtime::{
     DefaultTransportFactory, McpGates, McpRuntime, McpStartupPlan, PreparedIsolation,
     PreparedServer, SkipReason, SkippedServer,

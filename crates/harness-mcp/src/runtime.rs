@@ -561,13 +561,18 @@ mod tests {
     }
 
     fn http_gates(domains: &[&str], plaintext: bool) -> McpGates {
+        let list: Vec<String> = domains.iter().map(|d| d.to_string()).collect();
         McpGates {
             streamable_http_enabled: true,
             http_endpoints: EndpointGates {
-                allow_domains: harness_core::DomainPolicy::new(
-                    domains.iter().map(|d| d.to_string()).collect(),
-                ),
-                plaintext_allowed: plaintext,
+                allow_domains: harness_core::DomainPolicy::new(list.clone()),
+                // `plaintext = true`は「許可した全ドメインを平文でも」＝各ドメインを
+                // `--mcp-http-allow http://<host>`で書いた構成と同じ。
+                plaintext_domains: harness_core::DomainPolicy::new(if plaintext {
+                    list
+                } else {
+                    Vec::new()
+                }),
             },
             http_ca_bundle: None,
         }

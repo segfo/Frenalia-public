@@ -557,7 +557,6 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 degeneracy,
                 cli.output_format,
                 cli.tier3_warm,
-                cli.tier3_max_sessions.max(1),
                 &mut state,
                 &mut session,
             )
@@ -581,7 +580,6 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 enter_submits,
                 resume_wants_picker,
                 cli.tier3_warm,
-                cli.tier3_max_sessions.max(1),
                 &mut relaunch_into,
             )
             .await
@@ -677,7 +675,6 @@ async fn headless_branch(
     degeneracy: Option<harness_engine::degeneracy::DegeneracyDetector>,
     output_format: OutputFormat,
     tier3_warm: bool,
-    tier3_max_sessions: u8,
     state: &mut ConversationState,
     session: &mut harness_engine::SessionStore,
 ) -> ExitCode {
@@ -714,7 +711,6 @@ async fn headless_branch(
             &tool_ctx.workspace_root,
             &tool_ctx.net_proxy.allow_domains,
             tier3_warm,
-            tier3_max_sessions,
         )
         .await
     } else {
@@ -786,7 +782,6 @@ async fn tui_branch(
     enter_submits: bool,
     resume_wants_picker: bool,
     tier3_warm: bool,
-    tier3_max_sessions: u8,
     // `/workspace`の移動先。TUIが自分でプロセスを起こすと、呼び出し元（`stage_run_agent`）の
     // teardown順序（MCP停止→WFP撤収→policy-learn撤収→`end_session`）を迂回することになるので、
     // 「どこへ移りたいか」だけを持ち帰らせる。
@@ -819,7 +814,6 @@ async fn tui_branch(
         enter_submits,
         resume_wants_picker,
         tier3_warm,
-        tier3_max_sessions,
     )
     .await;
 

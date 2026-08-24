@@ -139,8 +139,15 @@ pub struct ApplyOptions<'a> {
     /// 選択適用フィルタ（完全一致のパス集合）。TUI変更パネルのファイル毎accept/reject向け
     /// （globでは非連続な複数ファイルの選択を表現しづらいため）。`only_glob`と併用時はAND。
     pub only_paths: Option<&'a [String]>,
-    /// workspace外ターゲットを実際に適用してよいか（`--dangerously-allow`相当）。Phase 2時点では
-    /// workspace外書込自体を`write_string`が受け付けないため常に無効（Phase 3で復活予定）。
+    /// workspace外ターゲットを実際に適用してよいか（`harness apply --dangerously-allow`相当）。
+    ///
+    /// **`false`が既定で、`true`はワークスペース外の実FSへ書く唯一の経路を開ける。**
+    /// 絶対パスの書込は`write_string`が`_ext/<key>`へ記録するので（同ファイルの該当分岐）、
+    /// `apply`まで実FSは無傷のまま溜まる。ここを`true`にすると`apply_ext_entry`が
+    /// `std::fs::write`まで進む。
+    ///
+    /// **本番で`true`になるのはCLIの`apply`だけ**である——TUIの変更パネルと`harness resolve`は
+    /// `false`を直書きしており、ハンク単位の適用は`canonical_ledger_path`が絶対パスを弾く。
     pub allow_ext: bool,
     /// 台帳に記録が無いオーバーレイ実体（[`ChangeEntry::unledgered`]）のうち、**実workspace側に
     /// 既に別内容のファイルがあるもの**を適用してよいか（CLIの`--adopt-unledgered`）。
@@ -157,8 +164,11 @@ pub struct ApplyReport {
     pub applied: Vec<String>,
     /// baseline照合の相違により拒否されたパス（DESIGN「相違なら適用拒否→再レビュー要求」）。
     pub conflicts: Vec<String>,
-    /// workspace外ターゲットだが`allow_ext`が無かったため拒否されたパス。Phase 2時点では
-    /// workspace外書込自体が無いため常に空（Phase 3で復活予定）。
+    /// workspace外ターゲットだが`allow_ext`が無かったため拒否されたパス。
+    ///
+    /// **空でないことは普通に起こる**——モデルが絶対パスへ書けば`_ext/<key>`として溜まり、
+    /// `allow_ext`無しの`apply`はここへ回す。空かどうかは「外向きの書込が溜まっているか」の
+    /// 指標であって、機構が無効である証拠ではない。
     pub ext_blocked: Vec<String>,
     /// D-09（`plans/DESIGN-SANDBOX.md` §7）: 設定注入パス（`.git/config`・`.harness/**`等）への
     /// 変更のため層3 hard-denyで拒否されたパス。overlay経由の`.git/config`/`.harness/**`

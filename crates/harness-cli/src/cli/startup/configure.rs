@@ -45,7 +45,7 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
     // このフォールバックの対象外、CLI値をそのまま使う）。
     let settings = harness_config::Settings::load(&workspace_root);
 
-    let early_require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
+    let early_require_sandbox = parse_require_sandbox(cli.require_sandbox);
     if early_require_sandbox == RequireSandbox::Confidential {
         let mut early_net_proxy = settings
             .net

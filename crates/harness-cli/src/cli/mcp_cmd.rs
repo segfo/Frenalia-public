@@ -182,9 +182,10 @@ fn print_http_gate_status(gates: &harness_mcp::McpHttpSettings) {
         println!(
             "streamable http: DISABLED. Servers using it will not start even once approved. \
              Enable it in your *user* settings.json with \"mcp\": {{ \"allow_streamable_http\": \
-             true, \"http_allow_domains\": [\"...\"] }}, or pass --allow-mcp-http (plus \
-             --allow-mcp-http-domain) for a single run. A project's .harness/settings.json cannot \
-             enable it."
+             true, \"http_allow_domains\": [\"...\"] }}, or pass \
+             --mcp-http-allow <domain> for a single run (naming a destination is what enables it; \
+             write http://<domain> to also allow plaintext for that one host). A project's \
+             .harness/settings.json cannot enable it."
         );
     }
 }

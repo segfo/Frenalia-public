@@ -196,7 +196,8 @@ use client::{connect_to_pipe_as_client, create_first_pipe_instance, session_daem
 mod daemon;
 
 pub use client::{
-    prepare_pipe, run_gc_only, stop_resident_daemon_if_idle, PreparedPipe, VmSandboxHandle,
+    max_sessions, prepare_pipe, run_gc_only, set_max_sessions, stop_resident_daemon_if_idle,
+    PreparedPipe, VmSandboxHandle,
 };
 pub use daemon::{serve_gc, serve_resident};
 

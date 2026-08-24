@@ -274,6 +274,84 @@ mod tests {
         }
     }
 
+    /// **`--require-sandbox`の綴りと値の集合を、実物のパーサで固定する**（BUG-114の修正）。
+    ///
+    /// 打ち間違い（`confidentail`）が**パースエラーになる**側と、正しい3通り（フラグ無し・
+    /// 値省略・`=confidential`）が**通る**側を対で測る。禁止側だけを測ると「全部拒否する」
+    /// 実装でも緑になり、許可側だけを測ると**元の欠陥そのもの**（全部受理して弱い方へ落とす）が
+    /// 緑になる（`test-logic-rules`「禁止側と許可側を対にする」）。
+    ///
+    /// `match`を`RequireSandbox`の全variantに対して書いてあるのは検問である——variantを
+    /// 足したら、ここが非網羅になってコンパイルが落ちる（`bug-pattern-rules` B-05）。
+    #[test]
+    fn every_require_sandbox_level_has_a_cli_spelling_and_typos_are_rejected() {
+        use harness_core::RequireSandbox;
+
+        for level in [
+            RequireSandbox::None,
+            RequireSandbox::WriteContainment,
+            RequireSandbox::Confidential,
+        ] {
+            // **綴りが無いのは「フラグを打たない」ことで表す段だけ**である。
+            let spelling: Option<&str> = match level {
+                RequireSandbox::None => None,
+                RequireSandbox::WriteContainment => Some("write-containment"),
+                RequireSandbox::Confidential => Some("confidential"),
+            };
+            let argv = match spelling {
+                None => vec![OsString::from("harness")],
+                Some(value) => os(&["harness", "--require-sandbox", value]),
+            };
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| {
+                panic!("--require-sandbox {spelling:?} must parse: {e}")
+            });
+            assert_eq!(
+                crate::cli::setup::parse_require_sandbox(cli.require_sandbox),
+                level,
+                "--require-sandbox {spelling:?} resolved to a different level"
+            );
+        }
+
+        // 値省略（`--require-sandbox`単体）は「書込拘束以上」（`default_missing_value`）。
+        let cli = Cli::try_parse_from(os(&["harness", "--require-sandbox"])).unwrap();
+        assert_eq!(
+            crate::cli::setup::parse_require_sandbox(cli.require_sandbox),
+            RequireSandbox::WriteContainment
+        );
+
+        // **禁止側**: 打ち間違いは黙って`write-containment`へ落ちず、パースエラーになる。
+        // かつてはこれが全部通り、**要求より弱い保証で起動していた**（BUG-114）。
+        for bogus in ["confidentail", "write_containment", "none", "tier2a"] {
+            assert!(
+                Cli::try_parse_from(os(&["harness", "--require-sandbox", bogus])).is_err(),
+                "--require-sandbox {bogus} must be a parse error, not a silent downgrade"
+            );
+        }
+    }
+
+    /// **`--policy-learn`は裸で打てて、`=false`で打ち消せる**（§4.9 対象3）。
+    ///
+    /// 3つの状態を区別する必要がある——「打たなかった」（設定へフォールバック）・
+    /// 「打った」（有効）・「偽で打った」（設定が有効でもこの実行だけ無効）。
+    /// 裸の形は**docが以前から案内していたのに必ずclapエラーになっていた**ので、
+    /// 実物のパーサで固定する。
+    #[test]
+    fn policy_learn_can_be_bare_or_explicitly_false() {
+        let cli = Cli::try_parse_from(os(&["harness"])).unwrap();
+        assert_eq!(cli.policy_learn, None, "打たなければ設定側へ委ねる");
+
+        let cli = Cli::try_parse_from(os(&["harness", "--policy-learn"])).unwrap();
+        assert_eq!(cli.policy_learn, Some(true), "裸で打てること");
+
+        let cli = Cli::try_parse_from(os(&["harness", "--policy-learn=false"])).unwrap();
+        assert_eq!(cli.policy_learn, Some(false), "明示的に無効化できること");
+
+        // 裸の`--policy-learn`が次のフラグを値として吸わないこと（`--resume`と同じ論点）。
+        let cli = Cli::try_parse_from(os(&["harness", "--policy-learn", "--staged"])).unwrap();
+        assert_eq!(cli.policy_learn, Some(true));
+        assert!(cli.staged);
+    }
+
     /// 2回続けて`/workspace`しても`--wait-for-pid`が積み上がらない。
     #[test]
     fn wait_for_pid_is_replaced_not_appended() {

@@ -93,6 +93,40 @@ pub struct VmLedger {
     pub vm_host: Option<VmHostEntry>,
     #[serde(default)]
     pub workspace_resources: Vec<WorkspaceResourceEntry>,
+    /// `harness tier3 set-max-sessions <n>`で置かれた同時セッション数の上限。
+    /// **`None`は「置かれていない」**で、[`DEFAULT_MAX_SESSIONS`]が使われる。
+    ///
+    /// **ここに置くのは、値の寿命がマシン側だからである。** 掛かる先（`--sandbox tier3`）は
+    /// CLI限定の選択なので`settings.json`にキーを作らない（`plans/DESIGN-CLI-OPTIONS.md`
+    /// §3.2・§4.9 対象1）。一方この値は**daemonの起動引数**としてしか使われないので、
+    /// セッションをまたいで残る置き場が要る。
+    #[serde(default)]
+    pub max_sessions: Option<u8>,
+}
+
+/// `--max-sessions`を置いていないときの上限（`DESIGN-SANDBOX-VMISOLATION.md`「実装確定
+/// サマリー」項目6-a）。
+pub const DEFAULT_MAX_SESSIONS: u8 = 4;
+
+/// `harness tier3 set-max-sessions <n>`。**次にdaemonを起こすときから効く。**
+///
+/// 走っているdaemonには効かない——上限はdaemonプロセスの起動引数であり、後から接続する
+/// 2本目以降のセッションが書き換えられては意味が無いためである（同項目6-a）。
+/// 呼び出し側（CLI）はこの限界を必ず出力へ書くこと（B-11: 効かない条件を黙らせない）。
+pub fn set_max_sessions(n: u8) {
+    ledger().update(|l| l.max_sessions = Some(n.max(1)));
+}
+
+/// daemonを起こすときに渡す上限。置かれていなければ[`DEFAULT_MAX_SESSIONS`]。
+pub fn max_sessions() -> u8 {
+    effective_max_sessions(load().max_sessions)
+}
+
+/// [`max_sessions`]の判定部分（**純粋関数**）。台帳ファイルを触らずに測れるようにしてある
+/// ——`set_max_sessions`→`max_sessions`を実際に往復させるテストは、この開発機の
+/// `%APPDATA%`の台帳を書き換えてしまう。
+fn effective_max_sessions(stored: Option<u8>) -> u8 {
+    stored.unwrap_or(DEFAULT_MAX_SESSIONS).max(1)
 }
 
 /// 台帳ファイル（`%APPDATA%\harness\config\tier3-vm-ledger.json`）。ファイル入出力
@@ -271,9 +305,34 @@ mod tests {
         assert!(ledger.workspace_resources.is_empty());
     }
 
+    /// `harness tier3 set-max-sessions`が置く値の解釈（`plans/DESIGN-CLI-OPTIONS.md` §4.9 対象1）。
+    ///
+    /// **「置いていない」と「0を置いた」を区別する。** 前者は既定値、後者は1へ丸める
+    /// ——`SessionRegistry::new(max.max(1))`が同じ丸めをしているので、**台帳側で丸めておかないと
+    /// 「置いた値」と「効く値」が食い違ったまま表示される**（CLIは置いた直後に実効値を出す）。
+    #[test]
+    fn a_stored_max_session_limit_is_clamped_but_an_absent_one_falls_back_to_the_default() {
+        assert_eq!(effective_max_sessions(None), DEFAULT_MAX_SESSIONS);
+        assert_eq!(effective_max_sessions(Some(0)), 1, "0は1へ丸める");
+        assert_eq!(effective_max_sessions(Some(1)), 1);
+        assert_eq!(effective_max_sessions(Some(7)), 7);
+    }
+
+    /// **`max_sessions`が無い旧ファイルは既定として読める**（`#[serde(default)]`）。
+    /// 台帳はマシン側の運用状態なので移行コードを書かない方針だが、**黙って空扱いになると
+    /// VM_hostの記録ごと失われる**ので、追加したフィールドが既存ファイルを壊さないことは測る。
+    #[test]
+    fn a_ledger_written_before_max_sessions_existed_still_parses() {
+        let older = r#"{"vm_host":null,"workspace_resources":[]}"#;
+        let ledger: VmLedger = serde_json::from_str(older).expect("既存の形は読めること");
+        assert_eq!(ledger.max_sessions, None);
+        assert_eq!(effective_max_sessions(ledger.max_sessions), DEFAULT_MAX_SESSIONS);
+    }
+
     #[test]
     fn ledger_roundtrips_through_json() {
         let ledger = VmLedger {
+            max_sessions: Some(2),
             vm_host: Some(VmHostEntry {
                 vm_name: "harness-tier3-resident".to_string(),
                 diff_vhdx: r"C:\ProgramData\harness\vm-sessions\resident.diff.vhdx".to_string(),
@@ -392,6 +451,7 @@ mod tests {
         let ledger = VmLedger {
             vm_host: Some(vm_host_entry("harness-tier3-resident")),
             workspace_resources: vec![],
+            max_sessions: None,
         };
         let orphans = select_orphan_vm_names(&ledger, &[]);
         assert_eq!(orphans, vec!["harness-tier3-resident".to_string()]);
@@ -410,6 +470,7 @@ mod tests {
         let ledger = VmLedger {
             vm_host: Some(vm_host_entry("harness-tier3-resident")),
             workspace_resources: vec![],
+            max_sessions: None,
         };
         let existing = vec!["harness-tier3-resident".to_string()];
         let orphans = select_orphan_vm_names(&ledger, &existing);
@@ -419,6 +480,7 @@ mod tests {
     #[test]
     fn select_all_workspace_resources_returns_every_entry() {
         let ledger = VmLedger {
+            max_sessions: None,
             vm_host: None,
             workspace_resources: vec![
                 WorkspaceResourceEntry {

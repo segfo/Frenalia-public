@@ -84,6 +84,34 @@ pub(crate) enum CognitionLevelArg {
     Census,
 }
 
+/// `--require-sandbox[=<write-containment|confidential>]`——**最低要求の保証**（M12、
+/// `plans/DESIGN-SANDBOX.md` §7 D-03）。
+///
+/// **`ValueEnum`にしてあるのは、打ち間違いを黙って吸わないためである。** かつては
+/// `Option<String>`を`setup::parse_require_sandbox`が自前で`match`しており、未知の値は
+/// すべて`write-containment`へ落ちていた——`--require-sandbox=confidentail`と打った人は
+/// **読取の機密性を要求したつもりで、それを守らないTierで起動する**（[BUG-114](../../../docs/bugs/BUG-114.md)）。
+/// 値の集合をclapへ知らせれば、同じ打ち間違いは起動前のパースエラーになる。
+///
+/// 綴りを`#[value(name = ...)]`で明示する理由は[`SandboxChoiceArg`]と同じ（derive既定の
+/// kebab化に頼ると、綴りがclapの実装詳細で決まってしまう）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RequireSandboxArg {
+    #[value(name = "write-containment")]
+    WriteContainment,
+    #[value(name = "confidential")]
+    Confidential,
+}
+
+impl From<RequireSandboxArg> for RequireSandbox {
+    fn from(v: RequireSandboxArg) -> Self {
+        match v {
+            RequireSandboxArg::WriteContainment => RequireSandbox::WriteContainment,
+            RequireSandboxArg::Confidential => RequireSandbox::Confidential,
+        }
+    }
+}
+
 /// `--sandbox auto|tier1|tier2a|tier2a-cow|tier3`（`vm`は`tier3`の別名）。
 /// `harness_core::SandboxChoice`と1対1で、`CognitionLevelArg`と同じく
 /// **clapの`ValueEnum`をcoreへ持ち込まないための橋**である。
@@ -95,10 +123,10 @@ pub(crate) enum CognitionLevelArg {
 /// が実パーサへ食わせて検算する（`bug-pattern-rules` B-05）。**置き場が再起動argvのモジュールに
 /// なっているのは、`Cli::try_parse_from`を使うテストがそこにしか無いためである。**
 ///
-/// **`--require-sandbox`と違い、未知の値はパースエラーになる。** あちらは
-/// `Option<String>`を自前で`match`しているため、`--require-sandbox=confidentail`のような
-/// 打ち間違いが黙って`write-containment`へ落ちる（BUG-114）。同じ轍を踏まないよう、
-/// ここは`ValueEnum`で値の集合をclapに知らせる。
+/// **未知の値はパースエラーになる。** 値の集合を`ValueEnum`でclapに知らせているためで、
+/// 打ち間違いが黙って別の値へ落ちることがない。`--require-sandbox`も同じ理由で
+/// [`RequireSandboxArg`]へ移した（かつては`Option<String>`を自前で`match`しており、
+/// `--require-sandbox=confidentail`が`write-containment`へ落ちていた＝BUG-114）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub(crate) enum SandboxChoiceArg {
     #[default]
@@ -189,8 +217,16 @@ pub(crate) enum Commands {
         /// 選択適用フィルタ（`*`ワイルドカード対応、例 `src/*`）。省略時は全件対象。
         #[arg(long)]
         only: Option<String>,
-        /// workspace外ターゲット（例 `C:\Windows\x`）の適用を許可する。Phase 2時点では
-        /// workspace外書込自体を記録しないため常に無関係（Phase 3で復活予定）。
+        /// workspace外ターゲット（例 `C:\Windows\x`）の適用を許可する。
+        ///
+        /// **これはオーバーレイに溜まった変更をワークスペースの外の実FSへ出す唯一の門である。**
+        /// モデルが`write_file`/`edit_file`に絶対パスを渡すと、その書込は`_ext/<key>`として
+        /// オーバーレイに記録される（この時点で実FSは無傷）。`harness apply`はフラグ無しなら
+        /// `blocked (out-of-workspace, needs --dangerously-allow)`と出して拒否し、
+        /// **このフラグを付けたときだけ実FSへ書き込む**。
+        ///
+        /// `run_shell`の子プロセスはそもそも`SandboxFs`を通らないので、そちらを押さえるのは
+        /// Tierの隔離である（このフラグの守備範囲ではない）。
         #[arg(long = "dangerously-allow", default_value_t = false)]
         dangerously_allow: bool,
         /// オーバーレイに実体はあるが操作台帳に記録が無い変更（`changes`で`[unledgered]`と
@@ -226,6 +262,13 @@ pub(crate) enum Commands {
     Fs {
         #[command(subcommand)]
         action: crate::fs_grants::FsAction,
+    },
+    /// Tier2a（AppContainer）の運用保守サブコマンド（`plans/DESIGN-CLI-OPTIONS.md` §3.3）。
+    /// 死んだセッションが残したプロファイルの回収と、生存判定の内訳表示。
+    /// `harness tier3 gc`と対になる口で、**回収の実装は元から在り、ここは配線だけ**である。
+    Tier2a {
+        #[command(subcommand)]
+        action: Tier2aAction,
     },
     /// Tier3（Hyper-V外層VM + Incusコンテナ）の運用保守サブコマンド
     /// （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.6 D-24）。
@@ -279,6 +322,24 @@ pub(crate) enum Commands {
     Prompt,
 }
 
+/// `harness tier2a`サブコマンドの各操作。Windows専用機能（AppContainer）のため、
+/// Windows以外ではエラーで終了する（`harness tier3`と同じ扱い）。
+#[derive(Subcommand)]
+pub(crate) enum Tier2aAction {
+    /// 死んだセッションが残したAppContainerプロファイルとACEを回収する。
+    ///
+    /// 通常はharnessの起動時（preflight）に同じ処理が走るが、**harnessを起動せずに
+    /// 片付けたい**ときの明示コマンド。`harness fs revoke-workspace*`とは守備範囲が
+    /// 一部重なる——あちらは**指定したパス／台帳エントリ**、こちらは**死んだセッション**が対象。
+    Gc,
+    /// 走行中セッションの判定材料（台帳・`%LOCALAPPDATA%\Packages`・名前付きmutex）の
+    /// 内訳を出す。
+    ///
+    /// **「0件」の意味が2つに割れる**ため段ごとに出す——本当に走行中セッションが無いのか、
+    /// 材料が見えていないのか。後者はGCのガードにとってfail-openの穴になる。
+    List,
+}
+
 /// `harness tier3`サブコマンドの各操作。Windows専用機能のため、Windows以外では
 /// エラーで終了する（`harness fs`の非Windows時挙動と同じ、Tier3自体がWindows専用）。
 #[derive(Subcommand)]
@@ -289,6 +350,21 @@ pub(crate) enum Tier3Action {
     Gc,
     /// アクティブセッションが無い場合だけ常駐Tier3 daemonを終了する。
     StopDaemon,
+    /// 常駐daemonが同時に受け付けるセッション数の上限を置く（既定4、
+    /// `DESIGN-SANDBOX-VMISOLATION.md`「実装確定サマリー」項目6-a）。
+    ///
+    /// **限界: 走っているdaemonには効かない。** 上限はdaemonプロセスの起動引数としてのみ
+    /// 受け付ける（後から接続する2本目以降のセッションが書き換えられては意味が無いため）。
+    /// 既に常駐daemonが居るなら、先に`harness tier3 stop-daemon`で落とすこと。
+    ///
+    /// カウント対象はTier3セッションだけで、Tier0/Tier2a/Tier1/Tier2bはこのdaemonへ
+    /// 接続しないため対象外。**かつてはルートフラグ`--tier3-max-sessions`だった**が、
+    /// 値を伴う修飾は値へ畳めず、掛かる先（`--sandbox tier3`）の名前空間へ寄せた
+    /// （`plans/DESIGN-CLI-OPTIONS.md` §3.3・§5.1）。
+    SetMaxSessions {
+        /// 上限（1以上。0を書いても1として扱う）。
+        n: u8,
+    },
 }
 
 /// `harness net`サブコマンドの各操作。
@@ -549,7 +625,13 @@ pub(crate) struct Cli {
 
     /// 即実FS（オーバーレイ無し）。省略時の既定と同じ動作（D-29）。`--staged`/
     /// `--workspace-commit`と併用不可（§書込ステージング3モード、M10）。
-    /// `--sandbox tier2a-cow`とは意味的に矛盾しないため排他にしない。
+    ///
+    /// **`--sandbox tier2a-cow`とも併用不可**（§5.2 A10）。CoWのupperは`harness apply`まで
+    /// 書込を実FSへ通さないので、「即実FS」と同時には成立しない。**かつては「意味的に
+    /// 矛盾しない」として排他にしておらず、`--live`が黙って無視されていた**——その状態では
+    /// モデルへ「即座に実FSへ反映されます」と「ワークスペース本体はread-only」が同時に
+    /// 届いていた。この排他だけは値依存なのでclapでは宣言できず、
+    /// `setup::resolve_staging_mode_checked`が実行時に拒否する。
     #[arg(long = "live", conflicts_with_all = ["staged", "workspace_commit"])]
     live: bool,
 
@@ -574,8 +656,13 @@ pub(crate) struct Cli {
     /// 「書込拘束以上」（Tier3/Tier2a/Tier1/Tier2bでpass、Tier0で拒否）、
     /// `=confidential`は「機密性も要求」（Tier3/Tier2a/Tier2bのみpass）。省略時は
     /// 制約無し（Tier0への自動降格も許容）。
-    #[arg(long = "require-sandbox", num_args = 0..=1, default_missing_value = "write-containment")]
-    require_sandbox: Option<String>,
+    #[arg(
+        long = "require-sandbox",
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "write-containment"
+    )]
+    require_sandbox: Option<RequireSandboxArg>,
 
     /// **どの形の隔離で走るか**（M12、`plans/DESIGN-SANDBOX.md` §6/§7）。既定`auto`。
     ///
@@ -599,8 +686,9 @@ pub(crate) struct Cli {
     /// 畳んだのは、`--tier1 --cow`のような「Tier2a以外でのCoW」が受理され、ACLを一度も
     /// 触らないまま「workspaceはread-only」とモデルへ宣言していたためである（BUG-113）。
     /// `tier2a-cow`は`--staged`/`--workspace-commit`と併用不可（マニフェスト方式とCoW方式と
-    /// いう別々の書込捕捉機構を同時に有効化しない）。この1組だけは値依存の排他なのでclapでは
-    /// 宣言できず、`setup::resolve_staging_and_write_mode`が実行時に拒否する。
+    /// いう別々の書込捕捉機構を同時に有効化しない）。**`--live`とも併用不可**（書込が実FSへ
+    /// 即座に届かないため。§5.2 A10）。これらは値依存の排他なのでclapでは宣言できず、
+    /// `setup::resolve_staging_and_write_mode`が実行時に拒否する。
     #[arg(long = "sandbox", value_enum, default_value_t = SandboxChoiceArg::Auto)]
     sandbox: SandboxChoiceArg,
 
@@ -612,15 +700,6 @@ pub(crate) struct Cli {
     /// 前提のため、ウォームVMはマシン全体で1つに固定され、直列化ロックで排他される。
     #[arg(long = "tier3-warm", default_value_t = false)]
     tier3_warm: bool,
-
-    /// Tier3常駐daemonが同時に受け付けるセッション数の上限（`DESIGN-SANDBOX-VMISOLATION.md`
-    /// 「実装確定サマリー」項目6-a）。既定4。**daemon起動時にのみ渡す値**——後から接続する
-    /// 2本目以降のセッションがこの上限を書き換えられると意味が無いため、`StartSession`の
-    /// ペイロードではなくdaemonプロセスの起動引数として渡す（daemonが既に起動済みの場合、
-    /// この値は無視される）。カウント対象はTier3セッション（daemon内の登録簿）のみで、
-    /// Tier0/Tier2a/Tier1/Tier2bはこのdaemonへ接続しないため対象外。
-    #[arg(long = "tier3-max-sessions", default_value_t = 4)]
-    tier3_max_sessions: u8,
 
     /// ドメイン単位network制御の許可ドメインを追加する（繰り返し指定可、
     /// `*.example.com`形式のサフィックスワイルドカード対応）。
@@ -671,35 +750,39 @@ pub(crate) struct Cli {
     /// 収集器が起動できなくてもharnessは止まらない（D-43 fail-open）。その場合は
     /// 「収集できていない」ことが`fs-audit.jsonl`の制御レコードとして残る。
     /// 省略時は`settings.json`の`policy.learn`→既定(false)の順にフォールバックする。
-    #[arg(long = "policy-learn")]
+    ///
+    /// **裸で打てる**（`--policy-learn`＝有効化）。`--policy-learn=false`と書けば、設定側で
+    /// 有効になっていてもこの実行だけ無効にできる——だから真偽フラグではなく`Option<bool>`の
+    /// ままである（「打たなかった」と「打って偽にした」を区別する必要がある）。
+    /// かつては値が必須で、**docが案内していた裸の形が必ずclapエラーになっていた**
+    /// （`plans/DESIGN-CLI-OPTIONS.md` §4.9 対象3）。
+    #[arg(long = "policy-learn", num_args = 0..=1, default_missing_value = "true")]
     policy_learn: Option<bool>,
 
-    /// MCPのStreamable HTTPトランスポートをこの実行に限り有効にする（M15.6、D-41/D-49）。
+    /// Streamable HTTPのMCPサーバとして接続してよい宛先を足す（繰り返し指定可、M15.6、D-41/D-49）。
     ///
-    /// **既定は無効。** stdioのMCPサーバと違い、この経路はharness本体が直接HTTPで喋るため、
-    /// AppContainer・WFPの出口強制・協調プロキシのいずれも掛からない（`plans/DESIGN-MCP.md` §6.2）。
-    /// 恒久的に有効化するなら、**ユーザ設定**の`settings.json`へ
-    /// `"mcp": { "allow_streamable_http": true }`と書く（プロジェクトの
-    /// `.harness/settings.json`からは有効化できない）。
-    #[arg(long = "allow-mcp-http", default_value_t = false)]
-    allow_mcp_http: bool,
-
-    /// Streamable HTTPのMCPサーバとして接続してよいドメインを追加する（繰り返し指定可、
-    /// `*.example.com`形式のサフィックスワイルドカード対応）。
+    /// **この指定自体が、この実行でのStreamable HTTPの有効化である。** 宛先を1つも書かなければ
+    /// 1つも起動しない（closed-by-default）——「有効化したのに宛先が無くて何も起きない」と
+    /// 「宛先を書いたのに有効化フラグが無くて無視された」という2つの空振りを、
+    /// 口を1つにすることで消してある（`plans/DESIGN-CLI-OPTIONS.md` §5.6 B1-3）。
     ///
-    /// ユーザ設定の`mcp.http_allow_domains`と合算する（和集合）。**空なら1つも起動しない**
-    /// （closed-by-default）。宣言のURLはリポジトリ側が書けるので、承認プロンプトでの目視だけを
-    /// 唯一のゲートにしないための独立した層である（D-49）。loopbackは免除される。
-    #[arg(long = "allow-mcp-http-domain")]
-    allow_mcp_http_domain: Vec<String>,
-
-    /// Streamable HTTPで、**リモートホストへの平文http接続**をこの実行に限り許す（D-49）。
+    /// 値の書式が緩和の内容を決める（`harness_mcp::parse_http_allow_value`）。
     ///
-    /// 既定ではhttpsだけを許す（loopbackは常に平文可）。平文でリモートへ繋ぐと、宣言した
-    /// ヘッダ（認証トークンを含む）が暗号化されずに流れる。設定ファイルにも宣言側にも
-    /// 同等のスイッチは**用意しない**——セッション限りの明示操作に留めるため。
-    #[arg(long = "allow-mcp-http-plaintext", default_value_t = false)]
-    allow_mcp_http_plaintext: bool,
+    /// - `mcp.corp.example` / `https://mcp.corp.example` — httpsのみ
+    /// - `http://legacy.corp.example` — **そのドメインだけ**平文httpも許す（他へは広がらない）
+    /// - `*.corp.example` — サフィックスワイルドカード
+    ///
+    /// ユーザ設定の`mcp.http_allow_domains`と合算する（和集合。設定側は常にhttpsのみ）。
+    /// 恒久的に有効化するなら**ユーザ設定**の`settings.json`へ書く（プロジェクトの
+    /// `.harness/settings.json`からは有効化できない）。stdioのMCPサーバと違い、この経路は
+    /// harness本体が直接HTTPで喋るため、AppContainer・WFPの出口強制・協調プロキシの
+    /// いずれも掛からない（`plans/DESIGN-MCP.md` §6.2）。loopbackは免除される。
+    ///
+    /// **かつては3本に分かれていた**（`--allow-mcp-http`・`--allow-mcp-http-domain`・
+    /// `--allow-mcp-http-plaintext`）。平文が単一の真偽フラグだったため、1ホストのために
+    /// 打つと許可リスト全体が平文可になっていた。
+    #[arg(long = "mcp-http-allow")]
+    mcp_http_allow: Vec<String>,
 
     /// `--provider mock`用の台本ファイル（`Vec<Vec<StreamEvent>>`のJSON）。
     /// out-of-processのTier2a E2Eテスト専用（`e2e-mock` feature必須）。
@@ -721,6 +804,7 @@ pub mod net_cmd;
 pub mod policy_cmd;
 pub mod setup;
 pub mod startup;
+pub mod tier2a_cmd;
 pub mod tier3_cmd;
 pub mod workspace_cmd;
 
@@ -730,6 +814,7 @@ pub(crate) use memory_cmd::*;
 pub(crate) use net_cmd::*;
 pub(crate) use policy_cmd::*;
 pub(crate) use setup::*;
+pub(crate) use tier2a_cmd::*;
 pub(crate) use tier3_cmd::*;
 pub(crate) use workspace_cmd::*;
 

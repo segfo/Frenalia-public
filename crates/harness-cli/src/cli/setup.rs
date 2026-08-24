@@ -3,14 +3,18 @@
 
 use super::*;
 
-/// `--require-sandbox[=confidential]`の文字列表現を`RequireSandbox`へ変換する
-/// （M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。未知の値は`write-containment`扱いにする
-/// （clapの`default_missing_value`と揃える安全側フォールバック）。
-pub(crate) fn parse_require_sandbox(value: Option<&str>) -> RequireSandbox {
+/// `--require-sandbox[=confidential]`の指定を`RequireSandbox`へ写す
+/// （M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。**フラグを打たなかった**（`None`）ときだけ
+/// `RequireSandbox::None`で、値の解釈は[`RequireSandboxArg`]（`ValueEnum`）が持つ。
+///
+/// **かつてはここが`Option<&str>`を受け、未知の値を`write-containment`へ落としていた**
+/// ——安全側フォールバックのつもりだったが、`--require-sandbox=confidentail`と打った人は
+/// **要求したより弱い保証で、しかも成功して**起動していた（[BUG-114](../../../docs/bugs/BUG-114.md)）。
+/// 未知の値はclapのパースで落ちるようになったので、ここに落とす分岐そのものが無い。
+pub(crate) fn parse_require_sandbox(value: Option<RequireSandboxArg>) -> RequireSandbox {
     match value {
         None => RequireSandbox::None,
-        Some("confidential") => RequireSandbox::Confidential,
-        Some(_) => RequireSandbox::WriteContainment,
+        Some(arg) => arg.into(),
     }
 }
 
@@ -145,6 +149,22 @@ pub(crate) fn resolve_staging_mode_checked(
              capture mechanisms (a staging manifest vs. a Copy-on-Write upper layer) and only one \
              can be in effect. Pick the one you want to review changes through."
         ));
+    }
+
+    // **`--live`は同じ軸の3つ目の値である。** かつてここが抜けており、`--live`が黙って
+    // 無視されていた（`plans/DESIGN-CLI-OPTIONS.md` §5.2 A10）。CoWのとき
+    // `SandboxFs::open_with_cow`はupperを`staging.mode`より優先するので、書込は実FSへ
+    // 行かない——にもかかわらず`prompt.rs`は`render_staging`と`render_cow`を無条件に
+    // 両方積むため、モデルへは「即座に実ファイルシステムへ反映されます」と
+    // 「ワークスペース本体はread-only」が**同時に**届いていた。前者は事実として誤りである。
+    if live {
+        return Err(
+            "--sandbox tier2a-cow cannot be combined with --live: a Copy-on-Write upper layer \
+             holds every write until `harness apply`, so writes do not reach the real workspace \
+             immediately. Drop --live if you want CoW, or drop --sandbox tier2a-cow if you want \
+             writes to land directly."
+                .to_string(),
+        );
     }
 
     Ok(staging_mode)
@@ -459,29 +479,37 @@ mod staging_mode_tests {
         }
     }
 
-    /// **許可側**（禁止側と対で測る、`test-logic-rules`）。`--sandbox tier2a-cow`単体は通り、
-    /// `--live`との併用も通る（`--live`はCoWと意味的に矛盾しないので排他にしていない）。
+    /// **禁止側**（A10）: `--live`はこの軸の3つ目の値なので、CoWとは同時に成立しない。
+    ///
+    /// **かつてはここが「許可側」のテストだった**——`--live`はCoWと矛盾しないという判断で
+    /// 排他にしていなかった（`docs/bugs/BUG-039.md`）。実際には両方の宣言が同じ
+    /// システムプロンプトへ並び、「即座に実FSへ反映されます」という**誤った事実**が
+    /// モデルへ届いていた（§5.2 A10）。
+    #[test]
+    fn cow_is_rejected_together_with_live() {
+        let err = resolve_staging_and_write_mode(SandboxChoice::Tier2aCow, true, false, false, SESSION)
+            .expect_err("--live and a CoW upper cannot both describe where writes land");
+        assert!(
+            err.contains("--live") && err.contains("tier2a-cow"),
+            "the rejection must name both flags so the user knows what to drop: {err}"
+        );
+    }
+
+    /// **許可側**（禁止側と対で測る、`test-logic-rules`）。`--sandbox tier2a-cow`単体は通る。
     /// 禁止側だけを固定すると「全部拒否する」実装でもテストが緑になる。
     #[test]
-    fn cow_alone_and_cow_with_live_are_accepted() {
-        for live in [false, true] {
-            let (staging, write_mode) = resolve_staging_and_write_mode(
-                SandboxChoice::Tier2aCow,
-                live,
-                false,
-                false,
-                SESSION,
-            )
-            .expect("--sandbox tier2a-cow on its own must start");
-            assert_eq!(staging, StagingMode::Live);
-            let upper = write_mode
-                .upper_dir()
-                .expect("tier2a-cow must carry a CoW upper directory");
-            assert!(
-                upper.ends_with(SESSION),
-                "the upper directory must be numbered by session id: {}",
-                upper.display()
-            );
-        }
+    fn cow_alone_is_accepted() {
+        let (staging, write_mode) =
+            resolve_staging_and_write_mode(SandboxChoice::Tier2aCow, false, false, false, SESSION)
+                .expect("--sandbox tier2a-cow on its own must start");
+        assert_eq!(staging, StagingMode::Live);
+        let upper = write_mode
+            .upper_dir()
+            .expect("tier2a-cow must carry a CoW upper directory");
+        assert!(
+            upper.ends_with(SESSION),
+            "the upper directory must be numbered by session id: {}",
+            upper.display()
+        );
     }
 }
