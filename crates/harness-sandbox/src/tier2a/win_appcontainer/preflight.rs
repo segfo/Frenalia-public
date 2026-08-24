@@ -1031,7 +1031,6 @@ pub fn preflight_with_privhelper_launcher(
 /// 検算できるようにするためである。
 fn require_persistent_acl_volume(what: &str, path: &Path) -> Result<(), AppContainerError> {
     let probe = crate::win_common::volume_mount_point_of(path)
-        .and_then(|mount| crate::win_common::volume_persistent_acl_support(&mount));
-    crate::session_scope::persistent_acl_gate(what, path, probe)
-        .map_err(AppContainerError::Preflight)
+        .and_then(|mount| crate::win_common::volume_capability(&mount));
+    crate::session_scope::cow_volume_gate(what, path, probe).map_err(AppContainerError::Preflight)
 }

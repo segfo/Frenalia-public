@@ -50,6 +50,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Pipes",
     "Win32_System_Memory",
     "Win32_Storage_FileSystem",
+    # `DRIVE_REMOTE`（`GetDriveTypeW`の戻り値）だけのために有効化している。
+    # 数値リテラルで書かないのは、OSのABI定数を手で写すと綴りをコンパイラが守れないため。
+    "Win32_System_WindowsProgramming",
     "Win32_System_IO",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

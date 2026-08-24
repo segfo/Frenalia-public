@@ -77,6 +77,8 @@ pub enum CowUpperRootPlan {
     Profile,
     /// ワークスペースが別のボリュームにある。そのボリュームのルート直下へ置く。
     PerVolume(PathBuf),
+    /// 別ボリュームだが、そこに根を置くべきではない。`%LOCALAPPDATA%`へ戻す（理由付き）。
+    ProfileFallback(String),
 }
 
 /// 2つのボリュームのマウントポイントが同じものを指すか。
@@ -103,6 +105,15 @@ fn same_volume(a: &Path, b: &Path) -> bool {
 /// | プロファイルと同じ | [`CowUpperRootPlan::Profile`]（＝いままでと同じ場所） |
 /// | それ以外 | [`CowUpperRootPlan::PerVolume`] |
 ///
+/// **比べる相手は「システムドライブ」でも「`C:`」でもなく、`%LOCALAPPDATA%`が実際に
+/// 載っているボリュームである。** ドライブ文字はこの関数のどこにも現れない——WindowsはD:や
+/// Z:にも入るし、プロファイルだけ別ドライブへリダイレクトしている環境もあるので、
+/// `C:`を特別扱いした瞬間にそれらの環境で置き場が狂う。
+/// **「プロファイルのボリューム」を基準にするのは、そこが降格先の根が実際に在る場所だから**
+/// である（システムドライブを基準にすると、プロファイルがD:でワークスペースもD:のとき
+/// 「別ボリューム」と誤判定して、同じボリューム上に根を2つ作ってしまう）。
+/// 採取は呼び出し側が`GetVolumePathNameW`で行う。
+///
 /// **ワークスペースがボリュームのルート自身なら`Err`**。その場合だけは差分層が
 /// ワークスペースの**中**に入ってしまい、書込がまた差分層へ誘導される再帰と、
 /// 読取専用にしたツリーの中に書込可能な穴を開けることの両方が起きる（§9が避けた形）。
@@ -110,6 +121,7 @@ pub fn plan_cow_upper_root(
     workspace_root: &Path,
     workspace_volume: &Path,
     profile_volume: &Path,
+    workspace_volume_is_remote: bool,
 ) -> Result<CowUpperRootPlan, String> {
     if same_volume(workspace_root, workspace_volume) {
         return Err(format!(
@@ -120,6 +132,16 @@ pub fn plan_cow_upper_root(
     }
     if same_volume(workspace_volume, profile_volume) {
         return Ok(CowUpperRootPlan::Profile);
+    }
+    // **ネットワーク共有のルートに根を掘らない。** そこは他人と共有している場所であり、
+    // そもそもCoWはリモートのボリューム上では成立しない（[`cow_volume_gate`]が後で拒否する）。
+    // ここで作ってしまうと、**起動を拒否する直前に共有のルートへディレクトリを1つ残す**
+    // ——置き場を決める側と境界を検算する側で順序が逆なので、ここでも止める必要がある。
+    if workspace_volume_is_remote {
+        return Ok(CowUpperRootPlan::ProfileFallback(format!(
+            "{} is on a network location, so no diff area root is created there",
+            workspace_volume.display()
+        )));
     }
     Ok(CowUpperRootPlan::PerVolume(
         workspace_volume.join(PER_VOLUME_COW_DIRNAME),
@@ -187,10 +209,24 @@ pub fn cow_upper_root_for_workspace(workspace_root: &Path) -> Result<CowUpperRoo
                 ),
             });
         };
-        match plan_cow_upper_root(workspace_root, &workspace_volume, &profile_volume)? {
+        // ネットワーク越しかどうかは**置き場を決める前**に要る（`plan_cow_upper_root`のdoc）。
+        // 採れなかったときは「リモートかもしれない」側＝根を作らない側へ倒す。
+        let workspace_is_remote = crate::win_common::volume_capability(&workspace_volume)
+            .map(|c| c.is_remote)
+            .unwrap_or(true);
+        match plan_cow_upper_root(
+            workspace_root,
+            &workspace_volume,
+            &profile_volume,
+            workspace_is_remote,
+        )? {
             CowUpperRootPlan::Profile => Ok(CowUpperRoot {
                 root: profile_root,
                 fell_back: None,
+            }),
+            CowUpperRootPlan::ProfileFallback(reason) => Ok(CowUpperRoot {
+                root: profile_root,
+                fell_back: Some(reason),
             }),
             CowUpperRootPlan::PerVolume(root) => match std::fs::create_dir_all(&root) {
                 Ok(()) => Ok(CowUpperRoot {
@@ -256,47 +292,80 @@ pub fn cow_upper_dir_in(root: &Path, session_id: &str) -> PathBuf {
     root.join(session_id)
 }
 
-/// ボリュームがACLを保持できるかの検算（D-81）。**判定だけの純関数。**
+/// CoWの境界を張れるボリュームかを判定するための、そのボリュームの素の事実。
+///
+/// 採取は`crate::win_common::volume_capability`（Win32）、判定は[`cow_volume_gate`]（純関数）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeCapability {
+    /// `FILE_PERSISTENT_ACLS`。ACLを永続化できるか。
+    pub persistent_acls: bool,
+    /// ファイルシステム名（`NTFS`・`exFAT`等）。拒否理由を人に名指しするために持つ。
+    pub filesystem: String,
+    /// ネットワーク越し（SMB等）か。
+    pub is_remote: bool,
+}
+
+/// そのボリュームでCoWの境界を張れるかの検算（D-81）。**判定だけの純関数。**
 ///
 /// # なぜ要るのか
 ///
 /// CoWの境界はACLそのものである（D-30）——ワークスペースへ読取専用ACEを付け、差分層へ
 /// 書込ACEを付ける。この2つが成立して初めて「フックが無効化されても書込は`ACCESS_DENIED`で
 /// 止まる」（D-01: 境界はカーネル強制側に置き、Redirector DLLは境界にしない）が言える。
-/// FAT32・exFAT——USBメモリやSDカードの既定——にはACLが無いので、**そこでは境界を張れない**。
-/// にもかかわらず検査が無かったため、隔離されていない状態で「隔離されている」とモデルへ
-/// 宣言し得た。同じ形の穴をD-72が[BUG-113]で塞いでいる。
+/// 検査が無かったため、隔離されていない状態で「隔離されている」とモデルへ宣言し得た
+/// （[BUG-129](../../../docs/bugs/BUG-129.md)）。同じ形の穴をD-72が[BUG-113]で塞いでいる。
+///
+/// # 通さないものが2つある
+///
+/// 1. **ACLを保持できないボリューム**——FAT32・exFAT（USBメモリ・SDカードの既定）。
+///    ACEを付ける先が無いので境界がゼロになる。
+/// 2. **ネットワーク越しのボリューム**——SMB共有。こちらは**サーバ側がNTFSなら
+///    `FILE_PERSISTENT_ACLS`を立てて返す**ので、ACLの有無だけを見ると通ってしまう。
+///    しかしAppContainerのpackage SIDは**このマシンのローカルな主体**であり、
+///    共有越しの相手にそのSIDを解決させることはできない。**ACEは書けたように見えて
+///    何も強制しない。** 「立っているフラグ」ではなく「境界が実際に効くか」で判定する。
 ///
 /// # 判定できないときは拒否へ倒す
 ///
-/// `probe`が`None`（`GetVolumeInformationW`が失敗した）なら**拒否する**。ここは
-/// セキュリティ境界そのものなので、`shared-state-exclusion` 問5の分岐は「閉じる」側である
-/// ——境界が張れるか分からないまま張ったことにする方が危険で、能力が無いときは降格ではなく
-/// 拒否するという上位原則（`docs/SECURITY-PRINCIPLES.md` P-05）にも従う。
-///
-/// `probe`は`(FILE_PERSISTENT_ACLSが立っているか, ファイルシステム名)`。
-pub fn persistent_acl_gate(
+/// `probe`が`None`（問い合わせ自体が失敗した）なら**拒否する**。ここはセキュリティ境界
+/// そのものなので、`shared-state-exclusion` 問5の分岐は「閉じる」側である——境界が張れるか
+/// 分からないまま張ったことにする方が危険で、能力が無いときは降格ではなく拒否するという
+/// 上位原則（`docs/SECURITY-PRINCIPLES.md` P-05）にも従う。
+pub fn cow_volume_gate(
     what: &str,
     path: &Path,
-    probe: Option<(bool, String)>,
+    probe: Option<VolumeCapability>,
 ) -> Result<(), String> {
-    match probe {
-        Some((true, _)) => Ok(()),
-        Some((false, fs_name)) => Err(format!(
-            "--sandbox tier2a-cow: the volume holding the {what} ({}) uses {fs_name}, which \
-             cannot store ACLs. Copy-on-write isolation is enforced by ACLs (a read-only \
-             workspace plus a writable diff area), so on this volume the boundary cannot be \
-             established at all. Move the workspace to an NTFS volume, or pick a weaker \
-             isolation explicitly with --sandbox.",
-            path.display()
-        )),
-        None => Err(format!(
+    let Some(cap) = probe else {
+        return Err(format!(
             "--sandbox tier2a-cow: could not determine whether the volume holding the {what} \
-             ({}) can store ACLs. Refusing to start rather than claim an isolation boundary \
-             that may not exist.",
+             ({}) can enforce an isolation boundary. Refusing to start rather than claim a \
+             boundary that may not exist.",
             path.display()
-        )),
+        ));
+    };
+    if cap.is_remote {
+        return Err(format!(
+            "--sandbox tier2a-cow: the {what} ({}) is on a network location. Copy-on-write \
+             isolation is enforced by ACLs granted to this machine's AppContainer package SID, \
+             and a remote server cannot resolve that SID -- the ACEs would appear to be written \
+             while enforcing nothing. Use a local volume, or pick a weaker isolation explicitly \
+             with --sandbox.",
+            path.display()
+        ));
     }
+    if !cap.persistent_acls {
+        return Err(format!(
+            "--sandbox tier2a-cow: the volume holding the {what} ({}) uses {}, which cannot \
+             store ACLs. Copy-on-write isolation is enforced by ACLs (a read-only workspace \
+             plus a writable diff area), so on this volume the boundary cannot be established \
+             at all. Move the workspace to an NTFS volume, or pick a weaker isolation \
+             explicitly with --sandbox.",
+            path.display(),
+            cap.filesystem
+        ));
+    }
+    Ok(())
 }
 
 /// このプロセスがどのオーバーレイ機構で動いているか。**プロセス寿命で不変**（モジュールdoc参照）。
@@ -811,7 +880,7 @@ mod tests {
     #[test]
     fn same_volume_as_the_profile_keeps_the_diff_area_where_it_was() {
         assert_eq!(
-            plan_cow_upper_root(Path::new(r"C:\work\proj"), &vol(r"C:\"), &vol(r"C:\")).unwrap(),
+            plan_cow_upper_root(Path::new(r"C:\work\proj"), &vol(r"C:\"), &vol(r"C:\"), false).unwrap(),
             CowUpperRootPlan::Profile
         );
     }
@@ -820,7 +889,7 @@ mod tests {
     #[test]
     fn a_different_volume_gets_its_own_root_outside_the_workspace() {
         let plan =
-            plan_cow_upper_root(Path::new(r"D:\work\proj"), &vol(r"D:\"), &vol(r"C:\")).unwrap();
+            plan_cow_upper_root(Path::new(r"D:\work\proj"), &vol(r"D:\"), &vol(r"C:\"), false).unwrap();
         assert_eq!(
             plan,
             CowUpperRootPlan::PerVolume(vol(r"D:\").join(PER_VOLUME_COW_DIRNAME))
@@ -842,6 +911,7 @@ mod tests {
             Path::new(r"C:\mnt\data\proj"),
             &vol(r"C:\mnt\data\"),
             &vol(r"C:\"),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -850,11 +920,34 @@ mod tests {
         );
     }
 
+    /// **システムドライブを`C:`と決めつけない。** プロファイルがD:にある環境では、
+    /// D:のワークスペースが「同じボリューム」側になる。Windowsは`D:`や`Z:`にも入るし、
+    /// プロファイルだけを別ドライブへリダイレクトしている環境もある。
+    #[test]
+    fn the_profile_volume_is_whatever_the_api_says_it_is_not_c() {
+        // プロファイルがD:、ワークスペースもD: → 従来の置き場（プロファイル側）。
+        assert_eq!(
+            plan_cow_upper_root(Path::new(r"D:\work\proj"), &vol(r"D:\"), &vol(r"D:\"), false).unwrap(),
+            CowUpperRootPlan::Profile
+        );
+        // プロファイルがD:、ワークスペースがC: → **C:の方が「別ボリューム」側になる。**
+        // ここが`Profile`になる実装は、システムドライブをC:と決め打っている証拠である。
+        assert_eq!(
+            plan_cow_upper_root(Path::new(r"C:\work\proj"), &vol(r"C:\"), &vol(r"D:\"), false).unwrap(),
+            CowUpperRootPlan::PerVolume(vol(r"C:\").join(PER_VOLUME_COW_DIRNAME))
+        );
+        // プロファイルがZ:でも同じ規則が効く（ドライブ文字に意味を持たせていないこと）。
+        assert_eq!(
+            plan_cow_upper_root(Path::new(r"Z:\work\proj"), &vol(r"Z:\"), &vol(r"Z:\"), false).unwrap(),
+            CowUpperRootPlan::Profile
+        );
+    }
+
     /// 末尾の区切りと大小文字の揺れで「別ボリューム」と誤判定しない（B-19）。
     #[test]
     fn volume_comparison_ignores_case_and_a_trailing_separator() {
         assert_eq!(
-            plan_cow_upper_root(Path::new(r"c:\work\proj"), &vol(r"c:"), &vol(r"C:\")).unwrap(),
+            plan_cow_upper_root(Path::new(r"c:\work\proj"), &vol(r"c:"), &vol(r"C:\"), false).unwrap(),
             CowUpperRootPlan::Profile
         );
     }
@@ -863,20 +956,28 @@ mod tests {
     /// ここを通すと差分層がワークスペースの中に入り、再帰と読取専用ツリーの穴が同時に生じる。
     #[test]
     fn a_workspace_that_is_a_volume_root_is_rejected() {
-        let err = plan_cow_upper_root(Path::new(r"D:\"), &vol(r"D:\"), &vol(r"C:\"))
+        let err = plan_cow_upper_root(Path::new(r"D:\"), &vol(r"D:\"), &vol(r"C:\"), false)
             .expect_err("the diff area would have to live inside the workspace");
         assert!(err.contains("volume root"), "理由を名指しすること: {err}");
     }
 
     // --- ボリュームがACLを保持できるかの検問（D-81 / Part B） ---
 
-    /// **許可側**（拒否側と対で測る、`test-logic-rules`）。NTFSは通る。
+    fn cap(persistent_acls: bool, filesystem: &str, is_remote: bool) -> VolumeCapability {
+        VolumeCapability {
+            persistent_acls,
+            filesystem: filesystem.to_string(),
+            is_remote,
+        }
+    }
+
+    /// **許可側**（拒否側と対で測る、`test-logic-rules`）。ローカルのNTFSは通る。
     #[test]
-    fn a_volume_that_stores_acls_passes_the_gate() {
-        assert!(persistent_acl_gate(
+    fn a_local_volume_that_stores_acls_passes_the_gate() {
+        assert!(cow_volume_gate(
             "workspace",
             Path::new(r"C:\ws"),
-            Some((true, "NTFS".to_string()))
+            Some(cap(true, "NTFS", false))
         )
         .is_ok());
     }
@@ -884,19 +985,54 @@ mod tests {
     /// **拒否側**: ACLを持てないボリュームでは境界そのものが張れないので起動を拒否する。
     #[test]
     fn a_volume_without_acls_is_refused_and_the_filesystem_is_named() {
-        let err = persistent_acl_gate(
+        let err = cow_volume_gate(
             "workspace",
             Path::new(r"X:\ws"),
-            Some((false, "exFAT".to_string())),
+            Some(cap(false, "exFAT", false)),
         )
         .expect_err("copy-on-write isolation is enforced by ACLs");
         assert!(err.contains("exFAT"), "打つ手が分かるように名指しする: {err}");
+    }
+
+    /// **拒否側（ACLは在るのに拒否する唯一のケース）**: ネットワーク共有は
+    /// サーバがNTFSなら`FILE_PERSISTENT_ACLS`を立てて返すが、AppContainerのpackage SIDは
+    /// ローカルの主体なので**ACEは書けたように見えて何も強制しない**。
+    /// ACLフラグだけを見る実装だとここが通ってしまう。
+    #[test]
+    fn a_network_volume_is_refused_even_though_it_reports_persistent_acls() {
+        let err = cow_volume_gate(
+            "workspace",
+            Path::new(r"\server\share\ws"),
+            Some(cap(true, "NTFS", true)),
+        )
+        .expect_err("a remote server cannot resolve this machine's AppContainer SID");
+        assert!(
+            err.contains("network"),
+            "なぜ通らないのかが分かる文言にする: {err}"
+        );
     }
 
     /// **判定不能はセキュリティ境界なので閉じる側へ倒す**（`shared-state-exclusion` 問5）。
     /// ここが`Ok`へ倒れると、境界が張れているか分からないまま「隔離した」と宣言してしまう。
     #[test]
     fn an_unprobeable_volume_is_refused_rather_than_assumed_capable() {
-        assert!(persistent_acl_gate("workspace", Path::new(r"X:\ws"), None).is_err());
+        assert!(cow_volume_gate("workspace", Path::new(r"X:\ws"), None).is_err());
+    }
+
+    /// ネットワーク共有のルートに差分層の根を掘らない。**起動を拒否する直前に
+    /// 共有のルートへディレクトリを1つ残す**のを防ぐ（置き場を決める側と検算側で順序が逆）。
+    #[test]
+    fn a_network_workspace_never_gets_a_diff_area_root_on_the_share() {
+        let plan = plan_cow_upper_root(
+            Path::new(r"\server\share\proj"),
+            &vol(r"\server\share\"),
+            &vol(r"C:\"),
+            true,
+        )
+        .unwrap();
+        assert!(
+            matches!(plan, CowUpperRootPlan::ProfileFallback(_)),
+            "共有のルートに根を作ってはいけない: {plan:?}"
+        );
     }
 }

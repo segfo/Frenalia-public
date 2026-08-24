@@ -607,22 +607,23 @@ pub fn volume_mount_point_of(path: &std::path::Path) -> Option<std::path::PathBu
     )))
 }
 
-/// `mount_point`（[`volume_mount_point_of`]の戻り値）のファイルシステムが
-/// **ACLを永続化できるか**と、そのファイルシステム名。
+/// `mount_point`（[`volume_mount_point_of`]の戻り値）が、CoWの境界を張れるボリュームかを
+/// 判定するための素の事実を集める。
 ///
-/// CoWの境界はACLそのもの（D-30。ワークスペースへ読取専用ACEを付け、差分層へ書込ACEを付ける）
-/// なので、`FILE_PERSISTENT_ACLS`が立たないボリューム——FAT32・exFAT・多くのUSBメモリ——では
-/// **境界を張れない**。張れないまま起動すると「隔離されている」と宣言しながら実際には
-/// 素通しになるので、呼び出し側は拒否へ倒す（P-05）。
+/// **2つを一度に採るのが要点である。** 「ACLを保持できるか」だけでは足りない——
+/// ネットワーク共有（SMB）はサーバ側がNTFSなら`FILE_PERSISTENT_ACLS`を**立てて返す**が、
+/// AppContainerのpackage SIDは**ローカルの主体**なので共有越しには意味を持たない。
+/// ACLの有無だけを見ると「張れる」と誤読する。
 ///
-/// 問い合わせ自体に失敗したら`None`。**`None`を「持っている」と読まないこと**——
-/// 判定できないなら境界の有無が分からないのだから、拒否側へ倒すのが安全である。
-pub fn volume_persistent_acl_support(
+/// 問い合わせ自体に失敗したら`None`。**`None`を「使える」と読まないこと**——
+/// 判定できないなら境界を張れるか分からないのだから、拒否側へ倒すのが安全である。
+pub fn volume_capability(
     mount_point: &std::path::Path,
-) -> Option<(bool, String)> {
-    use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
+) -> Option<crate::session_scope::VolumeCapability> {
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
     use windows::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
-    // `GetVolumeInformationW`はルートパスに末尾の区切りを要求する。
+    use windows::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+    // `GetVolumeInformationW`/`GetDriveTypeW`はルートパスに末尾の区切りを要求する。
     let mut root = mount_point.to_string_lossy().into_owned();
     if !root.ends_with('\\') {
         root.push('\\');
@@ -642,10 +643,12 @@ pub fn volume_persistent_acl_support(
         .ok()?
     };
     let len = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
-    Some((
-        flags & FILE_PERSISTENT_ACLS != 0,
-        String::from_utf16_lossy(&fs_name[..len]),
-    ))
+    let drive_type = unsafe { GetDriveTypeW(PCWSTR(wide_root.as_ptr())) };
+    Some(crate::session_scope::VolumeCapability {
+        persistent_acls: flags & FILE_PERSISTENT_ACLS != 0,
+        filesystem: String::from_utf16_lossy(&fs_name[..len]),
+        is_remote: drive_type == DRIVE_REMOTE,
+    })
 }
 
 /// いま到達できるドライブ文字のルート（`C:\`・`D:\`…）を列挙する。
