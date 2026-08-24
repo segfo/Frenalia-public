@@ -112,9 +112,13 @@ impl From<RequireSandboxArg> for RequireSandbox {
     }
 }
 
-/// `--sandbox auto|tier1|tier2a|tier2a-cow|tier3`（`vm`は`tier3`の別名）。
-/// `harness_core::SandboxChoice`と1対1で、`CognitionLevelArg`と同じく
+/// `--sandbox tier0|tier1|tier2a|tier2a-cow|tier2b|tier3|tier3-warm`（`vm`は`tier3`の別名）。
+/// `harness_core::SandboxChoice`と**「値を書いたとき」だけ**1対1で、`CognitionLevelArg`と同じく
 /// **clapの`ValueEnum`をcoreへ持ち込まないための橋**である。
+///
+/// **`SandboxChoice::OsDefault`に対応する綴りは無い**——あれは*フラグを書かなかった*状態で、
+/// CLI側では`Option<SandboxChoiceArg>`の`None`が担う。旧`auto`はその状態に綴りを与えていた
+/// だけの値で、D-75で降格が消えたときにWindows上の`tier2a`と区別が付かなくなり廃止した（D-72）。
 ///
 /// 綴りを`#[value(name = ...)]`で明示しているのは、derive既定のkebab化に頼ると
 /// `Tier2aCow`が何になるかがclapの実装詳細で決まってしまうためである。この綴りが
@@ -127,45 +131,70 @@ impl From<RequireSandboxArg> for RequireSandbox {
 /// 打ち間違いが黙って別の値へ落ちることがない。`--require-sandbox`も同じ理由で
 /// [`RequireSandboxArg`]へ移した（かつては`Option<String>`を自前で`match`しており、
 /// `--require-sandbox=confidentail`が`write-containment`へ落ちていた＝BUG-114）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum SandboxChoiceArg {
-    #[default]
-    #[value(name = "auto")]
-    Auto,
+    #[value(name = "tier0")]
+    Tier0,
     #[value(name = "tier1")]
     Tier1,
     #[value(name = "tier2a")]
     Tier2a,
     #[value(name = "tier2a-cow")]
     Tier2aCow,
+    #[value(name = "tier2b")]
+    Tier2b,
     /// `vm`でも指定できる（旧`--vm-sandbox`からの別名）。
     #[value(name = "tier3", alias = "vm")]
     Tier3,
+    #[value(name = "tier3-warm")]
+    Tier3Warm,
 }
 
 impl From<SandboxChoiceArg> for SandboxChoice {
     fn from(v: SandboxChoiceArg) -> Self {
         match v {
-            SandboxChoiceArg::Auto => SandboxChoice::Auto,
+            SandboxChoiceArg::Tier0 => SandboxChoice::Tier0,
             SandboxChoiceArg::Tier1 => SandboxChoice::Tier1,
             SandboxChoiceArg::Tier2a => SandboxChoice::Tier2a,
             SandboxChoiceArg::Tier2aCow => SandboxChoice::Tier2aCow,
+            SandboxChoiceArg::Tier2b => SandboxChoice::Tier2b,
             SandboxChoiceArg::Tier3 => SandboxChoice::Tier3,
+            SandboxChoiceArg::Tier3Warm => SandboxChoice::Tier3Warm,
         }
     }
 }
 
-/// 逆向きの写像。**使うのはテストだけだが、置いてあるのは検問のためである**——
-/// `SandboxChoice`にvariantを足したときにこの`match`が非網羅になり、
-/// 「coreには在るのにCLIから選べない値」を無言で作れなくする（B-06）。
-impl From<SandboxChoice> for SandboxChoiceArg {
-    fn from(v: SandboxChoice) -> Self {
+/// **`--sandbox`を書かなかったときを`OsDefault`へ写す唯一の場所。**
+///
+/// `Option`のまま持ち回すと、受け取った側が`unwrap_or_default()`で好きな既定を当てられて
+/// しまう——「値を書かなかった」の意味を決めてよいのはここだけである。
+pub(crate) fn sandbox_choice_of(arg: Option<SandboxChoiceArg>) -> SandboxChoice {
+    match arg {
+        None => SandboxChoice::OsDefault,
+        Some(v) => v.into(),
+    }
+}
+
+#[cfg(test)]
+impl SandboxChoiceArg {
+    /// 逆向きの写像。**使うのはテストだけだが、置いてあるのは検問のためである**——
+    /// `SandboxChoice`にvariantを足したときにこの`match`が非網羅になり、
+    /// 「coreには在るのにCLIから選べない値」を無言で作れなくする（B-06）。
+    /// **検問は`cargo test`で発火する**（本番ビルドから見ると未使用なので`cfg(test)`にしてある）。
+    ///
+    /// `OsDefault`だけは`None`（＝綴りが無い＝フラグを書かない）へ写る。
+    /// （孤児則のため`From`ではなく関連関数にしてある——`SandboxChoice`も`Option`も
+    /// このクレートの型ではない。）
+    pub(crate) fn spelling_of(v: SandboxChoice) -> Option<SandboxChoiceArg> {
         match v {
-            SandboxChoice::Auto => SandboxChoiceArg::Auto,
-            SandboxChoice::Tier1 => SandboxChoiceArg::Tier1,
-            SandboxChoice::Tier2a => SandboxChoiceArg::Tier2a,
-            SandboxChoice::Tier2aCow => SandboxChoiceArg::Tier2aCow,
-            SandboxChoice::Tier3 => SandboxChoiceArg::Tier3,
+            SandboxChoice::OsDefault => None,
+            SandboxChoice::Tier0 => Some(SandboxChoiceArg::Tier0),
+            SandboxChoice::Tier1 => Some(SandboxChoiceArg::Tier1),
+            SandboxChoice::Tier2a => Some(SandboxChoiceArg::Tier2a),
+            SandboxChoice::Tier2aCow => Some(SandboxChoiceArg::Tier2aCow),
+            SandboxChoice::Tier2b => Some(SandboxChoiceArg::Tier2b),
+            SandboxChoice::Tier3 => Some(SandboxChoiceArg::Tier3),
+            SandboxChoice::Tier3Warm => Some(SandboxChoiceArg::Tier3Warm),
         }
     }
 }
@@ -651,11 +680,17 @@ pub(crate) struct Cli {
     #[arg(long = "workspace-commit", conflicts_with_all = ["live", "staged"])]
     workspace_commit: bool,
 
-    /// シェル隔離Tierの最低要求（M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。指定時は
-    /// 自動降格せず、要求を満たせない場合に起動を拒否する。値省略（`--require-sandbox`単体）は
-    /// 「書込拘束以上」（Tier3/Tier2a/Tier1/Tier2bでpass、Tier0で拒否）、
-    /// `=confidential`は「機密性も要求」（Tier3/Tier2a/Tier2bのみpass）。省略時は
-    /// 制約無し（Tier0への自動降格も許容）。
+    /// シェル隔離Tierの**最低要求**（M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。着地したTierが
+    /// 要求を満たさなければ起動を拒否する。
+    ///
+    /// - 値省略（`--require-sandbox`単体）＝`write-containment`: 書込拘束以上
+    ///   （Tier3/Tier2a/Tier1/Tier2bでpass、Tier0で拒否）
+    /// - `=confidential`: 機密性も要求（Tier3/Tier2a/Tier2bのみpass。Tier1も拒否）
+    ///
+    /// **D-75以後、下の段（`write-containment`）は既定と同じ意味になった。** 自動降格が
+    /// 無くなり、Tier0で走るのは`--sandbox tier0`と明示したときだけなので、「Tier0を除く」は
+    /// 既定で成り立つ。**実質的な意味を持つのは`=confidential`（Tier1も除く）だけ**である。
+    /// 綴りとしては両方残してある（`plans/DESIGN-CLI-OPTIONS.md` §4.9）。
     #[arg(
         long = "require-sandbox",
         value_enum,
@@ -664,42 +699,46 @@ pub(crate) struct Cli {
     )]
     require_sandbox: Option<RequireSandboxArg>,
 
-    /// **どの形の隔離で走るか**（M12、`plans/DESIGN-SANDBOX.md` §6/§7）。既定`auto`。
+    /// **どの形の隔離で走るか**（M12、`plans/DESIGN-SANDBOX.md` §6/§7、D-72）。
     ///
-    /// - `auto`: Tier2aを常時プローブする。昇格**できない**アカウントでだけTier0へ宣言付きで
-    ///   降格する（それ以外の失敗は起動を拒否する）
+    /// **値を書かなければ、そのOSの既定Tierを「要求」する**（Windows=Tier2a、Linux=Tier2b、
+    /// その他OS=既定なし＝起動拒否）。**「既定」は委任ではない**——取れなければ起動を拒否する
+    /// （D-75）。**どの値でも、要求したTierへ届かなければ弱いTierへ落ちずに止まる。**
+    ///
+    /// - `tier0`: **隔離なしで走ることを明示的に選ぶ。** `run_shell`の子はharness本体と同じ
+    ///   権限で動く。昇格できないアカウント・bwrapが無いLinux・macOSでharnessを使うときの
+    ///   逃がし弁で、**機械が勝手にここへ落とすことはもう無い**
     /// - `tier1`: Windows Tier1（Restricted Token + 低Integrity Level + Job Object）へ固定する。
     ///   preflightを通さない逃がし弁で、Tier2aの機密性/network遮断は諦める
-    /// - `tier2a`: Tier2a（AppContainer）を**要求**する。届かなければ起動を拒否する
+    /// - `tier2a`: Tier2a（AppContainer）を要求する
     /// - `tier2a-cow`: Tier2a + Copy-on-Write（D-30、`plans/AppContainerベース Copy-on-Write
     ///   ワークスペース設計書.md`）。workspaceへのACLをRead/Execute/Traverseのみ（既定の
     ///   Read/Write/Execute/DeleteではなくD-13と同じread-onlyマスク）へ切り替え、`run_shell`
     ///   子プロセスの書込をworkspace外のCoW upper（`%LOCALAPPDATA%\harness\data\cow\
     ///   <session-id>\`）へRedirector DLLで誘導する。フックが無効・回避されても、ACLが
     ///   RO付与済みである限りworkspace本体への書込は`ACCESS_DENIED`でfail-closeする
-    ///   （フックは境界にしない、D-01不変）。**Tier2a以外では起動を拒否する**
+    ///   （フックは境界にしない、D-01不変）
+    /// - `tier2b`: Linuxのbubblewrapを要求する。**Linux以外では起動を拒否する**
     /// - `tier3`（別名`vm`）: Windows専用のTier3（Hyper-V外層AlmaLinux VM + Incus内層
-    ///   コンテナ）を優先する。VM起動オーバーヘッドが高いため既定では試さない。ゴールデン像
-    ///   VHDXが無い等で起動できない場合はTier2aへカスケードし、Tier2aも使えない場合は拒否する
+    ///   コンテナ）を要求する。VM起動オーバーヘッドが高いため既定では試さない。ゴールデン像
+    ///   VHDXが無い等で起動できない場合は**Tier2aへカスケードせず拒否する**（D-75）——Tier3は
+    ///   vNIC単位で出口を強制できる唯一のTierなので、Tier2aは要求より弱い実態になる
+    /// - `tier3-warm`: `tier3`をウォームスタート（production checkpointからの
+    ///   `Restore-VMSnapshot`）で起こす（`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.1）。初回は
+    ///   テンプレートprovisioningのためコールドブート並みだが、2回目以降は起動が大幅に短い。
+    ///   ウォームVMはマシン全体で1つに固定され、直列化ロックで排他される
     ///
     /// **かつては`--tier1`/`--vm-sandbox`/`--cow`という3本の真偽フラグだった。** 値1本へ
     /// 畳んだのは、`--tier1 --cow`のような「Tier2a以外でのCoW」が受理され、ACLを一度も
     /// 触らないまま「workspaceはread-only」とモデルへ宣言していたためである（BUG-113）。
+    /// **`auto`と`--tier3-warm`も同じ理由でこの値集合へ畳んだ**（D-72、2026-08-24）。
+    ///
     /// `tier2a-cow`は`--staged`/`--workspace-commit`と併用不可（マニフェスト方式とCoW方式と
     /// いう別々の書込捕捉機構を同時に有効化しない）。**`--live`とも併用不可**（書込が実FSへ
     /// 即座に届かないため。§5.2 A10）。これらは値依存の排他なのでclapでは宣言できず、
     /// `setup::resolve_staging_and_write_mode`が実行時に拒否する。
-    #[arg(long = "sandbox", value_enum, default_value_t = SandboxChoiceArg::Auto)]
-    sandbox: SandboxChoiceArg,
-
-    /// Tier3起動をウォームスタート（production checkpointからの`Restore-VMSnapshot`）で行う
-    /// （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.1、既定はfalse=毎回コールドブート）。
-    /// `--sandbox tier3`と併用が前提（Tier3自体が無効なら無視される）。初回はテンプレート
-    /// provisioningのため通常のコールドブート並みの時間がかかるが、2回目以降のセッションは
-    /// 起動レイテンシが大幅に短縮される。固定静的IPの制約上Tier3は元々同時1セッションのみが
-    /// 前提のため、ウォームVMはマシン全体で1つに固定され、直列化ロックで排他される。
-    #[arg(long = "tier3-warm", default_value_t = false)]
-    tier3_warm: bool,
+    #[arg(long = "sandbox", value_enum)]
+    sandbox: Option<SandboxChoiceArg>,
 
     /// ドメイン単位network制御の許可ドメインを追加する（繰り返し指定可、
     /// `*.example.com`形式のサフィックスワイルドカード対応）。

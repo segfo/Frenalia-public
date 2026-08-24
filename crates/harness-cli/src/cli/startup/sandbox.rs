@@ -90,7 +90,7 @@ pub(super) fn stage_prepare_sandbox(
     // （`setup::resolve_staging_and_write_mode`）。`tier2a-cow`×`--staged`の排他は値依存で
     // clapが表せないため、拒否はその関数が持つ——`harness prompt`も同じ関数を通るので、
     // 片方の入口だけ守られる形にはならない（B-06）。
-    let sandbox_choice: SandboxChoice = cli.sandbox.into();
+    let sandbox_choice: SandboxChoice = sandbox_choice_of(cli.sandbox);
     if let Err(e) = check_sandbox_choice_supported(sandbox_choice) {
         eprintln!("error: {e}");
         return Err(ExitCode::FAILURE);

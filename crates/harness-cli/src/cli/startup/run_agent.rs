@@ -258,21 +258,26 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     };
     #[cfg(not(windows))]
     let _net_wfp: Option<()> = None;
-    if let Some(reason) = &shell_tier.reason {
-        eprintln!(
-            "warning: shell isolation downgraded to {} (from {}): {reason}",
-            shell_tier.tier.label(),
-            shell_tier.downgraded_from.map(|t| t.label()).unwrap_or("?")
-        );
-    }
+    // **「降格しました」という警告はもう出ない**（D-75）。降格が起きないので、ここに到達した
+    // 時点で要求どおりのTierに居る。弱いTierに居るのはユーザーがそう選んだときだけなので、
+    // 告知は「選んだものが何を守らないか」を言う下の2つになった。
     if shell_tier.tier == harness_core::ShellTier::Tier1 {
         eprintln!(
-            "note: shell isolation tier is Tier1; Tier2a (AppContainer) was attempted \
-             automatically but unavailable this session (see the warning above for the reason). \
-             Tier1 does not protect against reading confidential files outside the workspace \
-             or outbound network exfiltration from run_shell child processes \
-             (plans/DESIGN-SANDBOX.md §9-1). --require-sandbox=confidential refuses to start \
-             at Tier1 rather than silently weakening this guarantee."
+            "note: shell isolation tier is Tier1 because it was requested explicitly \
+             (--sandbox tier1). Tier1 does not protect against reading confidential files \
+             outside the workspace or outbound network exfiltration from run_shell child \
+             processes (plans/DESIGN-SANDBOX.md §9-1). --require-sandbox=confidential refuses \
+             to start at Tier1 rather than silently weakening this guarantee."
+        );
+    }
+    if shell_tier.tier == harness_core::ShellTier::Tier0 {
+        // **Tier0はもう「落ちる先」ではなく「選ぶ値」である**（D-75）。選んだ本人にだけ出る
+        // 告知なので、驚きではなく確認として書く。
+        eprintln!(
+            "note: shell isolation is disabled because it was requested explicitly \
+             (--sandbox tier0). run_shell child processes run with the same privileges as \
+             harness itself: they can read and write anywhere your account can, and reach the \
+             network. Nothing below the workspace level is enforced this session."
         );
     }
     // fs passthrough（D2/D-13）: ACE付与自体は「付けっぱなし」（撤収はユーザ操作
@@ -556,7 +561,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 compaction,
                 degeneracy,
                 cli.output_format,
-                cli.tier3_warm,
+                sandbox_choice_of(cli.sandbox).wants_warm_tier3(),
                 &mut state,
                 &mut session,
             )
@@ -579,7 +584,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 sessions_dir,
                 enter_submits,
                 resume_wants_picker,
-                cli.tier3_warm,
+                sandbox_choice_of(cli.sandbox).wants_warm_tier3(),
                 &mut relaunch_into,
             )
             .await

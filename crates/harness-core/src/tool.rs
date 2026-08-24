@@ -137,7 +137,8 @@ pub enum RequireSandbox {
     Confidential,
 }
 
-/// `--sandbox <auto|tier1|tier2a|tier2a-cow|tier3>`——**ユーザーが選んだ隔離の形**。
+/// `--sandbox <tier0|tier1|tier2a|tier2a-cow|tier2b|tier3|tier3-warm>`——**ユーザーが選んだ隔離の形**。
+/// 値を書かなければ[`SandboxChoice::OsDefault`]（そのOSの既定Tierを要求する）。
 ///
 /// # なぜ1本の値フラグなのか
 ///
@@ -166,20 +167,39 @@ pub enum RequireSandbox {
 /// 綴りが一致することを同クレートのテストが検算する（`bug-pattern-rules` B-05）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxChoice {
-    /// 既定。Tier2aを常時プローブし、届かなければ昇格可否で分岐する（従来のフラグ無指定）。
-    /// 昇格**できない**アカウントだけがTier0へ宣言付きで降格する。
+    /// **`--sandbox`を書かなかったとき。** そのOSの既定Tierを**要求する**
+    /// （Windows=Tier2a、Linux=Tier2b、その他OS=既定なし＝拒否）。
+    ///
+    /// **「既定」は委任ではなく要求である**（D-72・D-75）——取れなければ起動を拒否する。
+    /// **この値だけCLIの綴りを持たない**（[`SandboxChoice::value_label`]が`None`を返す）。
+    /// 旧`auto`はこの位置に綴りを与えていただけの値で、固有に持っていた意味は
+    /// 「昇格できないときTier0へ降格する」ことだけだった。**D-75がその降格を廃したので、
+    /// Windows上で`tier2a`と区別が付かなくなり、綴りごと廃止した。**
     #[default]
-    Auto,
+    OsDefault,
+    /// **隔離なしを明示的に選ぶ**（`--sandbox tier0`）。D-75で「落ちる先」から「選ぶ値」になった。
+    ///
+    /// `run_shell`の子はharness本体と同じ権限で動く。**弱い器で走ると決めるのはユーザーであって、
+    /// 機械が代わりに決めない**というのがD-75の要点で、そのために綴りが要る。
+    Tier0,
     /// preflightを通さずTier1へ固定する逃がし弁（従来の`--tier1`）。
     Tier1,
-    /// Tier2aを要求する。届かなければ起動を拒否する（**新設**。従来は表現できなかった）。
+    /// Tier2aを要求する。届かなければ起動を拒否する。
     Tier2a,
     /// Tier2a + Copy-on-Write（D-30）を要求する。Tier2aへ届かなければ起動を拒否する
     /// （従来の`--cow`）。**「届かなければ拒否」が従来との差**で、旧`--cow`は
     /// Tier1/Tier3/Tier0へ着地してもCoWを名乗り続けていた（BUG-113）。
     Tier2aCow,
-    /// Tier3を優先し、不成立ならTier2aへカスケードする（従来の`--vm-sandbox`）。
+    /// Linuxのbubblewrap（Tier2b）を要求する。**Linux以外では起動を拒否する。**
+    /// 非Windowsで`tier0`以外に打てる唯一の値で、旧`auto`の「非Windowsでも打てる」役割を継ぐ。
+    Tier2b,
+    /// Tier3（Hyper-V外層VM + Incusコンテナ）を要求する。**不成立ならTier2aへカスケードせず
+    /// 拒否する**（D-75で改訂）——Tier3はvNIC単位で出口を強制できる唯一のTierなので、
+    /// カスケードは要求より弱い実態になる。
     Tier3,
+    /// Tier3をウォームスタート（production checkpointからの`Restore-VMSnapshot`）で要求する
+    /// （旧`--tier3-warm`）。`tier3`でしか成立しない修飾なので値へ畳んだ（D-72・D-73 §3.1）。
+    Tier3Warm,
 }
 
 impl SandboxChoice {
@@ -190,35 +210,54 @@ impl SandboxChoice {
     /// **手書きのリストを別の場所に作らないこと**（B-05）。下の[`SandboxChoice::index_in_all`]と
     /// `const _`ブロックが、variantの追加・順序違い・重複をコンパイル時に落とす
     /// （`harness_sandbox::FsAccess::ALL`と同じ2段ゲート）。
-    pub const ALL: [SandboxChoice; 5] = [
-        SandboxChoice::Auto,
+    pub const ALL: [SandboxChoice; 8] = [
+        SandboxChoice::OsDefault,
+        SandboxChoice::Tier0,
         SandboxChoice::Tier1,
         SandboxChoice::Tier2a,
         SandboxChoice::Tier2aCow,
+        SandboxChoice::Tier2b,
         SandboxChoice::Tier3,
+        SandboxChoice::Tier3Warm,
     ];
 
     /// [`SandboxChoice::ALL`]の網羅性を**コンパイル時に**強制するためだけの写像。
     const fn index_in_all(self) -> usize {
         match self {
-            SandboxChoice::Auto => 0,
-            SandboxChoice::Tier1 => 1,
-            SandboxChoice::Tier2a => 2,
-            SandboxChoice::Tier2aCow => 3,
-            SandboxChoice::Tier3 => 4,
+            SandboxChoice::OsDefault => 0,
+            SandboxChoice::Tier0 => 1,
+            SandboxChoice::Tier1 => 2,
+            SandboxChoice::Tier2a => 3,
+            SandboxChoice::Tier2aCow => 4,
+            SandboxChoice::Tier2b => 5,
+            SandboxChoice::Tier3 => 6,
+            SandboxChoice::Tier3Warm => 7,
         }
     }
 
     /// `--sandbox`へ渡す値の綴り。**エラーメッセージが「何を指定したせいでこうなったか」を
     /// 名指しするために要る**（`--sandbox tier2a`は降格しない、と言うために）。
-    pub fn value_label(self) -> &'static str {
+    ///
+    /// **`None`は「綴りが無い」**——[`SandboxChoice::OsDefault`]は*フラグを書かなかった*状態
+    /// なので、名指しできる綴りが存在しない。`Option`にしてあるのは、呼び出し側に
+    /// 「指定された値」と「既定」を**別の文で説明させる**ためである（`'(default)'`のような
+    /// 偽の綴りを返すと、そのまま「`--sandbox (default)`を外せ」と案内しかねない）。
+    pub fn value_label(self) -> Option<&'static str> {
         match self {
-            SandboxChoice::Auto => "auto",
-            SandboxChoice::Tier1 => "tier1",
-            SandboxChoice::Tier2a => "tier2a",
-            SandboxChoice::Tier2aCow => "tier2a-cow",
-            SandboxChoice::Tier3 => "tier3",
+            SandboxChoice::OsDefault => None,
+            SandboxChoice::Tier0 => Some("tier0"),
+            SandboxChoice::Tier1 => Some("tier1"),
+            SandboxChoice::Tier2a => Some("tier2a"),
+            SandboxChoice::Tier2aCow => Some("tier2a-cow"),
+            SandboxChoice::Tier2b => Some("tier2b"),
+            SandboxChoice::Tier3 => Some("tier3"),
+            SandboxChoice::Tier3Warm => Some("tier3-warm"),
         }
+    }
+
+    /// Tier3をウォームスタートで起こす指定か（旧`--tier3-warm`）。
+    pub fn wants_warm_tier3(self) -> bool {
+        matches!(self, SandboxChoice::Tier3Warm)
     }
 
     /// Copy-on-Write（D-30）を要求する指定か。
@@ -248,11 +287,9 @@ const _: () = {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellTierSelection {
     pub tier: ShellTier,
-    pub downgraded_from: Option<ShellTier>,
-    pub reason: Option<String>,
     /// D8（`plans/DESIGN-SANDBOX-APPPOLICY.md`補遺・fs passthrough）: 到達不能だった
-    /// `--fs-allow`穴の診断メッセージ一覧。空なら全穴到達可、または該当なし。Tier選択自体
-    /// （`tier`/`downgraded_from`）には影響しない（壊れた穴があってもTier2a・workspaceは継続）。
+    /// `--fs-allow`穴の診断メッセージ一覧。空なら全穴到達可、または該当なし。**Tier選択自体には
+    /// 影響しない**（壊れた穴があってもTier2a・workspaceは継続）。
     pub passthrough_warnings: Vec<String>,
     /// D8: 到達不能/付与失敗だったfs passthroughの構造化リスト。
     /// `harness-cli`はこれをユーザグローバル台帳へ記録し、後から`.harness/settings.json`の
@@ -272,23 +309,17 @@ pub struct ShellTierSelection {
 }
 
 impl ShellTierSelection {
+    /// **着地したTierを1つだけ持つ。** かつては`downgraded_from`と`reason`があり、
+    /// 「本当はTier2aを狙ったがTier0で走っている」という状態を表せた。**D-75でその状態が
+    /// 消えた**——隔離が取れないときは降格せず起動を拒否するので、`select_tier`が`Ok`を返した
+    /// なら**要求どおりのTierに居る**。
+    ///
+    /// フィールドを残さないのは、**常に`None`の値は「降格はあり得る」と読ませる**からである。
+    /// 弱い器で走るなら`--sandbox tier0`のようにユーザーが明示的に選び、その選択が
+    /// `tier`にそのまま出る。
     pub fn direct(tier: ShellTier) -> Self {
         Self {
             tier,
-            downgraded_from: None,
-            reason: None,
-            passthrough_warnings: Vec::new(),
-            denied_passthrough: Vec::new(),
-            granted_passthrough: Vec::new(),
-            netfilterd_chain_attempted: false,
-        }
-    }
-
-    pub fn downgraded(from: ShellTier, to: ShellTier, reason: impl Into<String>) -> Self {
-        Self {
-            tier: to,
-            downgraded_from: Some(from),
-            reason: Some(reason.into()),
             passthrough_warnings: Vec::new(),
             denied_passthrough: Vec::new(),
             granted_passthrough: Vec::new(),

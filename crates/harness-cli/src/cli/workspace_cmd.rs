@@ -104,7 +104,7 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
     // `--sandbox tier2a-cow`×`--staged`の拒否はその関数が持つので、`harness prompt`だけが
     // 素通りする形にはならない（B-06）。ここで受け取った`write_mode`は下で**使わない**——
     // その理由は下の`note`で本人へも説明している。
-    let sandbox_choice: SandboxChoice = cli.sandbox.into();
+    let sandbox_choice: SandboxChoice = sandbox_choice_of(cli.sandbox);
     if let Err(e) = check_sandbox_choice_supported(sandbox_choice) {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;

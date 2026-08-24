@@ -134,7 +134,7 @@ const WAIT_TIMEOUT_MS: u32 = 10_000;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Cli, SandboxChoiceArg};
+    use crate::cli::{sandbox_choice_of, Cli, SandboxChoiceArg};
     use clap::Parser;
     use harness_core::SandboxChoice;
 
@@ -201,7 +201,7 @@ mod tests {
             "{:?}",
             strings(&out)
         );
-        assert_eq!(parsed(&out).sandbox, SandboxChoiceArg::Tier2aCow);
+        assert_eq!(parsed(&out).sandbox, Some(SandboxChoiceArg::Tier2aCow));
     }
 
     #[test]
@@ -223,50 +223,62 @@ mod tests {
         assert!(text.contains(&"--sandbox=tier1".to_string()), "{text:?}");
         let cli = parsed(&out);
         assert!(!cli.continue_session);
-        assert_eq!(cli.sandbox, SandboxChoiceArg::Tier1);
+        assert_eq!(cli.sandbox, Some(SandboxChoiceArg::Tier1));
     }
 
     /// **`--sandbox`の綴りと値の集合を、実物のパーサで固定する。**
     ///
-    /// `harness_core::SandboxChoice`の全variantが`--sandbox <値>`として通ること、
+    /// `harness_core::SandboxChoice`の各variantが`--sandbox <値>`として通ること、
     /// その値が`value_label()`と**同じ綴り**であること、`vm`が`tier3`の別名であること、
-    /// そして**未知の値がパースエラーになる**ことを対で測る。
+    /// **値を書かなければ`OsDefault`になる**こと、そして**未知の値がパースエラーになる**ことを
+    /// まとめて測る。
     ///
     /// 綴りは`harness-core`側（エラーメッセージ用）と`SandboxChoiceArg`側（CLI表面）の
     /// 2箇所にあり、コンパイラは結び付けてくれない（`bug-pattern-rules` B-05）。
     /// 未知値の側を測るのは、`--require-sandbox`が打ち間違いを黙って`write-containment`へ
     /// 落としていた欠陥（BUG-114）と同じ轍を踏まないためである——「全部受理する」実装でも
     /// 許可側のテストだけなら緑になる。
+    ///
+    /// **`auto`が禁止側に入っているのが今回の改訂点**（D-72）。廃止した綴りが黙って
+    /// 受理され続けると、打った人は「既定に戻した」つもりで別の意味になる。
     #[test]
     fn every_sandbox_choice_has_a_cli_spelling_and_unknown_values_are_rejected() {
         for choice in SandboxChoice::ALL {
-            let argv = os(&["--sandbox", choice.value_label()]);
+            let Some(label) = choice.value_label() else {
+                // **綴りが無いのは`OsDefault`だけ**——`--sandbox`を書かなかった状態で、
+                // 下で別に測る。`spelling_of`が`None`を返すことと突き合わせておく。
+                assert_eq!(choice, SandboxChoice::OsDefault);
+                assert_eq!(SandboxChoiceArg::spelling_of(choice), None);
+                continue;
+            };
             let mut full = vec![OsString::from("harness")];
-            full.extend(argv);
+            full.extend(os(&["--sandbox", label]));
             let cli = Cli::try_parse_from(full).unwrap_or_else(|e| {
-                panic!(
-                    "--sandbox {} must parse (value_label and the ValueEnum spelling drifted): {e}",
-                    choice.value_label()
-                )
+                panic!("--sandbox {label} must parse (value_label and the ValueEnum spelling drifted): {e}")
             });
             assert_eq!(
-                SandboxChoice::from(cli.sandbox),
+                sandbox_choice_of(cli.sandbox),
                 choice,
-                "--sandbox {} parsed into a different choice",
-                choice.value_label()
+                "--sandbox {label} parsed into a different choice"
+            );
+            assert_eq!(
+                SandboxChoiceArg::spelling_of(choice),
+                cli.sandbox,
+                "--sandbox {label} does not round-trip through spelling_of"
             );
         }
 
         // `vm`は旧`--vm-sandbox`からの別名。
         let cli = Cli::try_parse_from(os(&["harness", "--sandbox", "vm"])).unwrap();
-        assert_eq!(SandboxChoice::from(cli.sandbox), SandboxChoice::Tier3);
+        assert_eq!(sandbox_choice_of(cli.sandbox), SandboxChoice::Tier3);
 
-        // 既定は`auto`（フラグ無指定＝従来のフラグ3本とも無指定と同じ意味）。
+        // **値を書かなければ「そのOSの既定Tierを要求する」**（D-72。旧`auto`の位置）。
         let cli = Cli::try_parse_from(os(&["harness"])).unwrap();
-        assert_eq!(SandboxChoice::from(cli.sandbox), SandboxChoice::Auto);
+        assert_eq!(cli.sandbox, None);
+        assert_eq!(sandbox_choice_of(cli.sandbox), SandboxChoice::OsDefault);
 
-        // **禁止側**: 打ち間違いは黙って既定へ落ちず、パースエラーになる。
-        for bogus in ["tier2", "cow", "tier2a_cow", "TIER1x"] {
+        // **禁止側**: 打ち間違いも、**廃止した綴り**も、黙って既定へ落ちずパースエラーになる。
+        for bogus in ["auto", "tier2", "cow", "tier2a_cow", "TIER1x", "warm"] {
             assert!(
                 Cli::try_parse_from(os(&["harness", "--sandbox", bogus])).is_err(),
                 "--sandbox {bogus} must be a parse error, not a silent fallback"

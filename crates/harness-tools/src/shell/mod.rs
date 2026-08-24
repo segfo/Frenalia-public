@@ -239,16 +239,9 @@ impl Tool for RunShellTool {
                 truncate_to_limit(noise).replace('\n', " / ")
             ));
         }
+        // 着地したTierだけを出す。**「(downgraded from ...)」はもう付かない**——D-75で
+        // 降格が消え、`select_tier`が返した時点で要求どおりのTierに居るためである。
         content.push_str(&format!("\n[tier: {}]", ctx.shell_tier.tier.label()));
-        if let Some(reason) = &ctx.shell_tier.reason {
-            content.push_str(&format!(
-                " (downgraded from {}: {reason})",
-                ctx.shell_tier
-                    .downgraded_from
-                    .map(|t| t.label())
-                    .unwrap_or("?")
-            ));
-        }
         if !ctx.net_app.allow_apps.is_empty() {
             match (
                 net_domain_policy_requested,

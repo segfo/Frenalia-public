@@ -797,24 +797,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // 実Tier2a preflightを走らせる（`opt_in_Tier2a=true`）。AppContainer不可の環境では
         // Tier1へ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
-        let selection = harness_sandbox::select_tier(
+        // **Tier2aが取れない環境ではskipする。** D-75以後、取れないことは`Err`として返る
+        // （かつては`Auto`が黙ってTier0/Tier1へ降格し、`selection.tier`を見て判定していた）。
+        let selection = match harness_sandbox::select_tier(
             RequireSandbox::None,
             dir.path(),
-            harness_core::SandboxChoice::Auto,
+            harness_core::SandboxChoice::Tier2a,
             &[],
             None,
             &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
             None,
-        )
-        .unwrap();
-        if selection.tier != ShellTier::Tier2a {
-            eprintln!(
-                "skipping Tier2a test: preflight downgraded to {} ({:?})",
-                selection.tier.label(),
-                selection.reason
-            );
-            return;
-        }
+        ) {
+            Ok(selection) => selection,
+            Err(e) => {
+                eprintln!("skipping Tier2a test: Tier2a is unavailable here ({e})");
+                return;
+            }
+        };
+        assert_eq!(
+            selection.tier,
+            ShellTier::Tier2a,
+            "requesting Tier2a must land on Tier2a or fail"
+        );
 
         let mut ctx = ToolCtx::new(dir.path().to_path_buf());
         ctx.shell_tier = selection;
@@ -903,24 +907,27 @@ mod tests {
         use harness_core::{NetAppPolicy, RequireSandbox, ShellTier};
 
         let dir = tempfile::tempdir().unwrap();
-        let selection = harness_sandbox::select_tier(
+        // Tier2aが取れない環境ではskipする（上のE2Eと同じ理由・同じ形）。
+        let selection = match harness_sandbox::select_tier(
             RequireSandbox::None,
             dir.path(),
-            harness_core::SandboxChoice::Auto,
+            harness_core::SandboxChoice::Tier2a,
             &[],
             None,
             &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
             None,
-        )
-        .unwrap();
-        if selection.tier != ShellTier::Tier2a {
-            eprintln!(
-                "skipping Tier2a net-allow-app test: preflight downgraded to {} ({:?})",
-                selection.tier.label(),
-                selection.reason
-            );
-            return;
-        }
+        ) {
+            Ok(selection) => selection,
+            Err(e) => {
+                eprintln!("skipping Tier2a net-allow-app test: Tier2a is unavailable here ({e})");
+                return;
+            }
+        };
+        assert_eq!(
+            selection.tier,
+            ShellTier::Tier2a,
+            "requesting Tier2a must land on Tier2a or fail"
+        );
 
         let mut ctx = ToolCtx::new(dir.path().to_path_buf());
         ctx.shell_tier = selection;
