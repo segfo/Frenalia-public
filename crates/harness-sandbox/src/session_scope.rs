@@ -340,11 +340,14 @@ pub struct VolumeCapability {
 /// そのものなので、`shared-state-exclusion` 問5の分岐は「閉じる」側である——境界が張れるか
 /// 分からないまま張ったことにする方が危険で、能力が無いときは降格ではなく拒否するという
 /// 上位原則（`docs/SECURITY-PRINCIPLES.md` P-05）にも従う。
+/// `dacl_writable`が**関数**なのは、安い判定を先に通して**拒否すると決まった相手には
+/// 触らないため**である。実測は対象への書込操作なので、ネットワーク共有のように
+/// 「見に行くこと自体に費用と副作用がある」相手に、拒否する直前で撃つ理由が無い。
 pub fn cow_volume_gate(
     what: &str,
     path: &Path,
     probe: Option<VolumeCapability>,
-    dacl_writable: Option<bool>,
+    dacl_writable: &dyn Fn() -> Option<bool>,
 ) -> Result<(), String> {
     let Some(cap) = probe else {
         return Err(format!(
@@ -377,7 +380,7 @@ pub fn cow_volume_gate(
     }
     // **申告の最後は実測で裏を取る**（上のdoc「3」）。ここへ来た時点で
     // 「ACLを持てると言っていて、ローカルで」ある。それでも書けないことがある。
-    if dacl_writable != Some(true) {
+    if dacl_writable() != Some(true) {
         return Err(format!(
             "--sandbox tier2a-cow: the {what} ({}) is on a {} volume that reports it can store              ACLs, but it rejected a no-op DACL write. Copy-on-write isolation cannot be              enforced where access rights cannot be written. Move the workspace to an NTFS              volume, or pick a weaker isolation explicitly with --sandbox.",
             path.display(),
@@ -997,7 +1000,7 @@ mod tests {
             "workspace",
             Path::new(r"C:\ws"),
             Some(cap(true, "NTFS", false)),
-            Some(true)
+            &|| Some(true)
         )
         .is_ok());
     }
@@ -1009,7 +1012,7 @@ mod tests {
             "workspace",
             Path::new(r"X:\ws"),
             Some(cap(false, "exFAT", false)),
-            Some(true),
+            &|| Some(true),
         )
         .expect_err("copy-on-write isolation is enforced by ACLs");
         assert!(err.contains("exFAT"), "打つ手が分かるように名指しする: {err}");
@@ -1025,7 +1028,7 @@ mod tests {
             "workspace",
             Path::new(r"\server\share\ws"),
             Some(cap(true, "NTFS", true)),
-            Some(true),
+            &|| Some(true),
         )
         .expect_err("a remote server cannot resolve this machine's AppContainer SID");
         assert!(
@@ -1038,7 +1041,7 @@ mod tests {
     /// ここが`Ok`へ倒れると、境界が張れているか分からないまま「隔離した」と宣言してしまう。
     #[test]
     fn an_unprobeable_volume_is_refused_rather_than_assumed_capable() {
-        assert!(cow_volume_gate("workspace", Path::new(r"X:\ws"), None, Some(true)).is_err());
+        assert!(cow_volume_gate("workspace", Path::new(r"X:\ws"), None, &|| Some(true)).is_err());
     }
 
     /// **申告どおりでないボリュームを実測で弾く。** この開発機の`E:`（`cryptoFs`）が実例で、
@@ -1050,7 +1053,7 @@ mod tests {
             "workspace",
             Path::new(r"E:\ws"),
             Some(cap(true, "cryptoFs", false)),
-            Some(false),
+            &|| Some(false),
         )
         .expect_err("a volume that cannot accept a DACL write cannot enforce the boundary");
         assert!(
@@ -1066,7 +1069,7 @@ mod tests {
             "workspace",
             Path::new(r"E:\ws"),
             Some(cap(true, "NTFS", false)),
-            None
+            &|| None
         )
         .is_err());
     }
@@ -1126,7 +1129,7 @@ mod volume_diagnostics {
             let dacl_writable = root
                 .exists()
                 .then(|| crate::win_common::can_write_dacl(&root));
-            let verdict = cow_volume_gate("workspace", &root, cap.clone(), dacl_writable);
+            let verdict = cow_volume_gate("workspace", &root, cap.clone(), &|| dacl_writable);
             println!(
                 "{:<5} dacl_writable={:<12} cap={:<70} -> {}",
                 root.display(),
@@ -1166,7 +1169,7 @@ mod path_gate_diagnostics {
             let cap = crate::win_common::volume_mount_point_of(path)
                 .and_then(|m| crate::win_common::volume_capability(&m));
             let dacl_writable = path.exists().then(|| crate::win_common::can_write_dacl(path));
-            let verdict = cow_volume_gate("workspace", path, cap.clone(), dacl_writable);
+            let verdict = cow_volume_gate("workspace", path, cap.clone(), &|| dacl_writable);
             println!(
                 "{:<45} exists={:<5} dacl_writable={:<12} fs={:<10} remote={:<5} -> {}",
                 raw,
@@ -1179,6 +1182,80 @@ mod path_gate_diagnostics {
                     Err(e) => format!("REFUSE: {}", e.split(". ").next().unwrap_or(e)),
                 }
             );
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod appcontainer_ace_diagnostics {
+    use super::*;
+
+    /// **「ネットワーク共有ではAppContainerのACEが効かない」を、推論ではなく実測で確かめる診断。**
+    ///
+    /// `cow_volume_gate`がネットワーク越しのボリュームを拒否する理由は、
+    /// 「AppContainerのpackage SIDはこのマシンのローカルな主体なので、リモートのサーバは
+    /// 解決できず、ACEは書けたように見えて何も強制しない」というものである。
+    /// **その理由自体は当初測っていなかった**——ネットワークかどうかを見て拒否していただけで、
+    /// 「だから効かない」は推論だった。この作業では推論が2回外れている
+    /// （共有はACLのフラグを立てないだろう→立てた／`E:`は通るだろう→通らなかった）ので、
+    /// ここも測る。
+    ///
+    /// 各パスの下に使い捨てのディレクトリを作り、**プロファイルを新規作成せずに導出した**
+    /// package SID（`derive_profile_sid`。作る側の`ensure_profile`を使うと実マシンに
+    /// 後始末の要る資源が増える、BUG-101）宛の継承ACEを付け、読み返して消す。
+    ///
+    /// 実行:
+    /// `HARNESS_ACE_PROBE_PATHS='X:\;Z:\;C:\Users\me' cargo test -p harness-sandbox --lib appcontainer_ace_diagnostics -- --ignored --nocapture`
+    #[test]
+    #[ignore = "machine-specific diagnostic; writes a throwaway directory under each given path"]
+    fn probe_whether_an_appcontainer_ace_sticks_on_given_paths() {
+        let Ok(list) = std::env::var("HARNESS_ACE_PROBE_PATHS") else {
+            println!("set HARNESS_ACE_PROBE_PATHS to a ';'-separated list of directories");
+            return;
+        };
+        // 実在しない名前でよい——SIDは名前のハッシュから決定的に導出され、登録の有無に
+        // 関わらず同じ値になる。**登録しない**ので実マシンにプロファイルは増えない。
+        let profile = "harness.acl-probe.diagnostic";
+        let sid = match crate::tier2a::win_appcontainer::derive_profile_sid(profile) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("could not derive a package SID: {e}");
+                return;
+            }
+        };
+        let sid_text = crate::win_common::sid_to_string(sid.as_psid())
+            .unwrap_or_else(|_| "<unprintable>".to_string());
+        println!("derived package SID for {profile}: {sid_text}\n");
+
+        for raw in list.split(';').filter(|s| !s.is_empty()) {
+            let dir = Path::new(raw).join("harness-ace-probe");
+            println!("=== {} ===", dir.display());
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                println!("  ディレクトリを作れなかった: {e}");
+                continue;
+            }
+            match crate::tier2a::win_appcontainer::grant_ace_inheritable_rw(&dir, sid.as_psid()) {
+                Ok(()) => println!("  ACEの付与       -> 成功"),
+                Err(e) => println!("  ACEの付与       -> 失敗: {e}"),
+            }
+            // **付けたものを読み返す。** 「付与が成功した」は「そのACEが実際に載っている」を
+            // 意味しない——共有越しだと主体を解決できずに落ちる、という筋を測りたい。
+            let readback = std::process::Command::new("icacls")
+                .arg(&dir)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_else(|e| format!("icacls failed: {e}"));
+            let found = readback.contains(sid_text.trim_start_matches('*'));
+            println!("  読み返しで見つかるか -> {}", if found { "見つかった" } else { "**見つからない**" });
+            for line in readback.lines().take(6) {
+                println!("    | {line}");
+            }
+            // 後始末: ディレクトリごと消せばACEも道連れになる（オブジェクトに載っているため）。
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => println!("  後始末          -> 削除した"),
+                Err(e) => println!("  後始末          -> **削除できなかった**: {e}"),
+            }
+            println!();
         }
     }
 }
