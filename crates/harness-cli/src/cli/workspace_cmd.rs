@@ -628,7 +628,15 @@ fn finish_cow_upper_after_apply(cow_upper_dir: Option<&Path>) {
     let Some(fact) = facts.iter().find(|f| f.session_id == session_id) else {
         return;
     };
-    let verdicts = wl::plan_cow_gc(std::slice::from_ref(fact), harness_grant_ledger::now_unix_secs(), 0);
+    // 方針は既定（ネットワーク上は保護）。`apply`は人が明示的に打つ操作だが、
+    // **保護の判断まで手動操作で飛ばさない**——飛ばしてよいかを決めるのは設定であって、
+    // どのコマンドから来たかではない。
+    let verdicts = wl::plan_cow_gc(
+        std::slice::from_ref(fact),
+        harness_grant_ledger::now_unix_secs(),
+        0,
+        wl::CowGcPolicy::default(),
+    );
     let Some((_, verdict)) = verdicts.first() else {
         return;
     };

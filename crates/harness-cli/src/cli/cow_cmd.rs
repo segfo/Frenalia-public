@@ -115,6 +115,7 @@ pub(crate) fn cow_list() -> ExitCode {
         &facts,
         harness_grant_ledger::now_unix_secs(),
         wl::COW_GC_DEFAULT_GRACE_SECS,
+        cow_gc_policy(),
     );
     for (fact, (_, verdict)) in facts.iter().zip(verdicts) {
         println!(
@@ -138,6 +139,7 @@ fn state_label(verdict: harness_sandbox::tier2a::workspace_ledger::CowGcVerdict)
     use harness_sandbox::tier2a::workspace_ledger::CowGcVerdict as V;
     match verdict {
         V::KeepRunning => "live",
+        V::KeepProtected => "protected",
         V::KeepReviewPending => "review-pending",
         V::KeepUndecidable => "undecidable",
         V::KeepHasChanges => "has-changes",
@@ -156,6 +158,17 @@ fn report_unreachable_volumes(unreachable: usize) {
              unplugged, or an offline network drive). CoW diff areas on them are neither listed \
              nor collected."
         );
+    }
+}
+
+/// 回収の方針を**ユーザ層の設定だけ**から作る（D-82）。`cow list`の状態表示と
+/// `cow gc`の回収が**同じ方針**を見る——ここが分かれると、一覧で「回収予定」と出たものを
+/// `gc`が消さない（またはその逆）という食い違いになる。
+#[cfg(windows)]
+fn cow_gc_policy() -> harness_sandbox::tier2a::workspace_ledger::CowGcPolicy {
+    let settings = harness_config::user_cow_gc_settings();
+    harness_sandbox::tier2a::workspace_ledger::CowGcPolicy {
+        protect_network_volumes: settings.protect_network_volumes(),
     }
 }
 
@@ -184,7 +197,12 @@ pub(crate) fn cow_gc(dry_run: bool, with_changes: bool, older_than_days: u64) ->
             && now.saturating_sub(fact.created_at_unix_secs) >= older_than_secs
     };
 
-    let outcome = wl::run_cow_gc(dry_run, wl::COW_GC_DEFAULT_GRACE_SECS, &also_collect);
+    let outcome = wl::run_cow_gc(
+        dry_run,
+        wl::COW_GC_DEFAULT_GRACE_SECS,
+        cow_gc_policy(),
+        &also_collect,
+    );
 
     let verb = if dry_run { "would collect" } else { "collected" };
     println!("{verb} {} CoW diff area(s)", outcome.collected.len());

@@ -664,6 +664,59 @@ fn user_settings_path() -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from("", "", "harness").map(|d| d.config_dir().join("settings.json"))
 }
 
+/// CoW差分層の自動回収（D-82）で「これは消さない」を宣言する設定。
+///
+/// # なぜ[`Settings`]のフィールドにしないのか
+///
+/// **プロジェクト層（`.harness/settings.json`）から触れる場所に置かないためである。**
+/// これは「何を削除してよいか」を決める設定で、リポジトリに同梱された設定が
+/// 「消してよい」と言えると、**リポジトリが他のセッションの未適用の作業を消させられる**。
+/// ユーザ層でしか効かないキーを[`Settings`]へ載せてクランプで守る方法もある
+/// （`mcp`のHTTPゲートがそれ、[`clamp_project_mcp_http_gates`]）が、こちらは
+/// **そもそも載せない**——プロジェクト層に現れる余地が無ければ、クランプを掛け忘れる経路も無い。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CowGcSettings {
+    /// ネットワーク上のボリュームにある差分層を自動回収から外す。**既定は`true`（外す）。**
+    ///
+    /// 差分層の置き場を全ボリューム走査で棚卸しする都合上、割り当て済みのネットワークドライブ
+    /// も対象に入る。そこにあるものは**他のマシンが作った可能性がある**うえ、常時接続が普通なので
+    /// 「到達できない＝判定不能」という安全網も働かない。既定で消さない側へ倒す。
+    pub protect_network_volumes: Option<bool>,
+}
+
+impl Default for CowGcSettings {
+    fn default() -> Self {
+        Self {
+            protect_network_volumes: Some(true),
+        }
+    }
+}
+
+impl CowGcSettings {
+    pub fn protect_network_volumes(&self) -> bool {
+        self.protect_network_volumes.unwrap_or(true)
+    }
+}
+
+/// ユーザ層の`settings.json`だけを読んで[`CowGcSettings`]を返す（プロジェクト層は**見ない**）。
+///
+/// 読めない・書かれていない場合は既定（ネットワーク上は保護する）。
+/// **設定ファイルが壊れていても保護が外れないこと**が要点で、`unwrap_or_default`が
+/// 常に安全側を返す。
+pub fn user_cow_gc_settings() -> CowGcSettings {
+    let Some(path) = user_settings_path() else {
+        return CowGcSettings::default();
+    };
+    let Some(value) = read_json(&path) else {
+        return CowGcSettings::default();
+    };
+    value
+        .get("cow")
+        .and_then(|c| c.get("gc"))
+        .and_then(|gc| serde_json::from_value::<CowGcSettings>(gc.clone()).ok())
+        .unwrap_or_default()
+}
+
 /// ファイルを読みJSONとしてパースする。存在しない場合は`Ok(None)`、存在するが読めない/
 /// パースできない場合は警告をstderrへ出し`Ok(None)`として扱う（設定ファイルの欠如・破損で
 /// 起動自体を止めない）。

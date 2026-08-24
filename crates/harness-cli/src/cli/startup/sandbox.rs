@@ -558,7 +558,12 @@ fn build_mcp_gates(
 fn sweep_empty_cow_diff_areas() {
     use harness_sandbox::tier2a::workspace_ledger as wl;
 
-    let outcome = wl::run_cow_gc(false, wl::COW_GC_DEFAULT_GRACE_SECS, &|_, _| false);
+    let outcome = wl::run_cow_gc(
+        false,
+        wl::COW_GC_DEFAULT_GRACE_SECS,
+        cow_gc_policy(),
+        &|_, _| false,
+    );
     if !outcome.collected.is_empty() {
         eprintln!(
             "note: collected {} empty copy-on-write diff area(s) left by finished sessions \
@@ -574,3 +579,16 @@ fn sweep_empty_cow_diff_areas() {
 
 #[cfg(not(windows))]
 fn sweep_empty_cow_diff_areas() {}
+
+/// 回収の方針を**ユーザ層の設定だけ**から作る（D-82）。
+///
+/// プロジェクト層（`.harness/settings.json`）を見ないのは、これが「何を削除してよいか」の
+/// 設定だからである——リポジトリ同梱の設定が「消してよい」と言えると、リポジトリが
+/// 他のセッションの未適用の作業を消させられる（`harness_config::CowGcSettings`のdoc）。
+#[cfg(windows)]
+fn cow_gc_policy() -> harness_sandbox::tier2a::workspace_ledger::CowGcPolicy {
+    let settings = harness_config::user_cow_gc_settings();
+    harness_sandbox::tier2a::workspace_ledger::CowGcPolicy {
+        protect_network_volumes: settings.protect_network_volumes(),
+    }
+}

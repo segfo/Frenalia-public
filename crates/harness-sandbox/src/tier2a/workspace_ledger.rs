@@ -438,6 +438,27 @@ pub struct CowSessionFacts {
     pub created_at_unix_secs: u64,
     /// 元のワークスペース（表示用。判定には使わない）。
     pub workspace_root: Option<String>,
+    /// この差分層が**ネットワーク上のボリューム**に載っているか。
+    ///
+    /// 判定そのものは[`plan_cow_gc`]が設定（[`CowGcPolicy`]）と突き合わせて行う。ここは
+    /// **観測された事実だけ**を持つ——事実の採取と規則の適用を混ぜないための分け方である。
+    pub volume_is_remote: bool,
+}
+
+/// 回収の方針。**既定が安全側**であることが要点で、設定を読まない呼び出し元でも
+/// ネットワーク上の差分層は保護される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CowGcPolicy {
+    /// ネットワーク上のボリュームにある差分層を自動回収から外す。
+    pub protect_network_volumes: bool,
+}
+
+impl Default for CowGcPolicy {
+    fn default() -> Self {
+        Self {
+            protect_network_volumes: true,
+        }
+    }
 }
 
 /// 差分層1つに対する判定。**回収してよいのは[`CowGcVerdict::Collect`]だけ**で、
@@ -448,6 +469,11 @@ pub enum CowGcVerdict {
     Collect,
     /// そのセッションがまだ動いている。
     KeepRunning,
+    /// **設定で「消さない」と宣言されている置き場にある。**
+    ///
+    /// 例外の分岐ではなく、他の状態と同じ1本の判定として通る——回収を呼ぶ側が
+    /// 「ここだけ特別に飛ばす」を書かずに済み、経路が増えても掛け忘れが起きない。
+    KeepProtected,
     /// D-80のレビュー待ち。**人がまだ見ていない。**
     KeepReviewPending,
     /// メタが読めない＝中身の意味が分からない。
@@ -473,6 +499,9 @@ impl CowGcVerdict {
         match self {
             CowGcVerdict::Collect => "nothing left in it",
             CowGcVerdict::KeepRunning => "that session is still running",
+            CowGcVerdict::KeepProtected => {
+                "it is on a network volume, which is protected from automatic collection by                  default (set cow.gc.protect_network_volumes=false in your user settings.json                  to allow it)"
+            }
             CowGcVerdict::KeepReviewPending => {
                 "waiting for review (D-80); nobody has looked at it yet"
             }
@@ -500,12 +529,15 @@ pub fn plan_cow_gc(
     facts: &[CowSessionFacts],
     now_unix_secs: u64,
     grace_secs: u64,
+    policy: CowGcPolicy,
 ) -> Vec<(String, CowGcVerdict)> {
     facts
         .iter()
         .map(|f| {
             let verdict = if f.is_live {
                 CowGcVerdict::KeepRunning
+            } else if policy.protect_network_volumes && f.volume_is_remote {
+                CowGcVerdict::KeepProtected
             } else if f.review_pending {
                 CowGcVerdict::KeepReviewPending
             } else if f.meta_unreadable {
@@ -525,9 +557,33 @@ pub fn plan_cow_gc(
 /// 実在する全差分層について、判定に要る事実を集める（採取側。Win32とFSに触る）。
 pub fn collect_cow_session_facts() -> (Vec<CowSessionFacts>, usize) {
     let (dirs, unreachable) = list_cow_sessions();
+    // ボリューム種別の問い合わせは**根ごとに1回**。セッション数ぶん撃つと、
+    // 差分層が数百件ある環境で起動時スイープが目に見えて重くなる。
+    let mut volume_is_remote: std::collections::HashMap<PathBuf, bool> =
+        std::collections::HashMap::new();
     let facts = dirs
         .into_iter()
         .map(|d| {
+            let root = d
+                .upper_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| d.upper_dir.clone());
+            let is_remote = *volume_is_remote.entry(root.clone()).or_insert_with(|| {
+                #[cfg(windows)]
+                {
+                    // **採れなければ「リモートかもしれない」側へ倒す。** ここで守っているのは
+                    // 削除しないことなので、分からないなら保護する方が安全である。
+                    crate::win_common::volume_mount_point_of(&root)
+                        .and_then(|m| crate::win_common::volume_capability(&m))
+                        .map(|c| c.is_remote)
+                        .unwrap_or(true)
+                }
+                #[cfg(not(windows))]
+                {
+                    false
+                }
+            });
             let meta = read_cow_session_meta(&d.upper_dir);
             let dir_mtime = std::fs::metadata(&d.upper_dir)
                 .and_then(|m| m.modified())
@@ -552,6 +608,7 @@ pub fn collect_cow_session_facts() -> (Vec<CowSessionFacts>, usize) {
                     .filter(|t| *t > 0)
                     .unwrap_or(dir_mtime),
                 workspace_root: meta.ok().map(|m| m.workspace_root.clone()),
+                volume_is_remote: is_remote,
                 session_id: d.session_id,
                 upper_dir: d.upper_dir,
             }
@@ -579,12 +636,13 @@ pub struct CowGcOutcome {
 pub fn run_cow_gc(
     dry_run: bool,
     grace_secs: u64,
+    policy: CowGcPolicy,
     also_collect: &dyn Fn(&CowSessionFacts, CowGcVerdict) -> bool,
 ) -> CowGcOutcome {
     harness_grant_ledger::with_named_lock(COW_GC_LOCK_NAME, || {
         let (facts, unreachable_volumes) = collect_cow_session_facts();
         let now = harness_grant_ledger::now_unix_secs();
-        let verdicts = plan_cow_gc(&facts, now, grace_secs);
+        let verdicts = plan_cow_gc(&facts, now, grace_secs, policy);
         let mut outcome = CowGcOutcome {
             collected: Vec::new(),
             kept: Vec::new(),
@@ -630,11 +688,12 @@ mod cow_gc_tests {
             content_files: 0,
             created_at_unix_secs: NOW - GRACE * 24,
             workspace_root: Some("C:/ws".into()),
+            volume_is_remote: false,
         }
     }
 
     fn verdict(f: CowSessionFacts) -> CowGcVerdict {
-        plan_cow_gc(&[f], NOW, GRACE)[0].1
+        plan_cow_gc(&[f], NOW, GRACE, CowGcPolicy::default())[0].1
     }
 
     /// **許可側**。ここが動かないとGCは何もしない機能になる（拒否側だけのテストでは
@@ -704,11 +763,61 @@ mod cow_gc_tests {
         assert_eq!(verdict(f), CowGcVerdict::KeepTooYoung);
     }
 
+
+    /// **既定でネットワーク上の差分層を回収しない。** 常時接続が普通なので「到達できない＝
+    /// 判定不能」の安全網が働かず、しかも他のマシンが作ったものが混じり得る。
+    #[test]
+    fn a_diff_area_on_a_network_volume_is_protected_by_default() {
+        let mut f = empty_and_old();
+        f.volume_is_remote = true;
+        assert_eq!(verdict(f), CowGcVerdict::KeepProtected);
+    }
+
+    /// **許可側と対で測る**。設定で保護を外せば、他の状態と同じ扱いに戻る
+    /// ——保護は例外の分岐ではなく、1本の判定に載った1つの状態である。
+    #[test]
+    fn turning_the_protection_off_puts_a_network_volume_back_on_the_normal_path() {
+        let mut f = empty_and_old();
+        f.volume_is_remote = true;
+        let policy = CowGcPolicy {
+            protect_network_volumes: false,
+        };
+        assert_eq!(
+            plan_cow_gc(&[f], NOW, GRACE, policy)[0].1,
+            CowGcVerdict::Collect
+        );
+    }
+
+    /// 保護は`--with-changes`では外れない。あの指定が広げるのは「変更を抱えているだけ」の
+    /// ものだけで、**保護を外す唯一の口は設定である**（口を2つ持つと、片方だけ直る）。
+    #[test]
+    fn the_protection_is_not_reachable_through_the_with_changes_escape_hatch() {
+        let mut f = empty_and_old();
+        f.volume_is_remote = true;
+        f.pending_changes = 1;
+        let v = verdict(f);
+        assert_eq!(v, CowGcVerdict::KeepProtected);
+        assert!(
+            !v.is_only_holding_changes(),
+            "--with-changes が拾う集合に入ってはいけない"
+        );
+    }
+
+    /// 実行中は保護より先に報告する（人が次に取る手が違う——待てばよいのか、設定の話なのか）。
+    #[test]
+    fn a_running_session_is_reported_as_running_even_on_a_protected_volume() {
+        let mut f = empty_and_old();
+        f.volume_is_remote = true;
+        f.is_live = true;
+        assert_eq!(verdict(f), CowGcVerdict::KeepRunning);
+    }
+
     /// 回収しないと判定したものは**必ず理由を持つ**（`shared-state-exclusion` 問6）。
     #[test]
     fn every_kept_verdict_can_explain_itself() {
         for v in [
             CowGcVerdict::KeepRunning,
+            CowGcVerdict::KeepProtected,
             CowGcVerdict::KeepReviewPending,
             CowGcVerdict::KeepUndecidable,
             CowGcVerdict::KeepHasChanges,
