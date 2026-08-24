@@ -238,6 +238,13 @@ pub fn preflight_with_privhelper_launcher(
         eprintln!("note: {summary}");
     }
     timing.mark("gc_dead_sessions");
+    // **D-82のCoW差分層の掃除をここへ置かないこと。** 一度置いて実害が出た——
+    // `preflight`は`harness-sandbox`の実機テストが直接呼ぶ関数であり、それらのテストは
+    // workspaceだけをtempdirにして`%LOCALAPPDATA%`は実物を使う。結果、`cargo test`が
+    // 開発機の差分層を70件消した（中身のあるものは残ったが、それは規則が正しかっただけで、
+    // テストが実マシンのユーザーデータを消してよい理由にはならない）。
+    // 掃除は`harness-cli`の起動経路（`startup::sandbox`）が持つ——TUIもheadlessもそこを通り、
+    // テストは通らない。
     let profile_name =
         crate::tier2a::session_profile::begin_session().map_err(AppContainerError::Preflight)?;
     // [BUG-101] **この行より後で付けたACEは、必ず台帳と突き合わせてから抜ける。**
@@ -322,6 +329,12 @@ pub fn preflight_with_privhelper_launcher(
             workspace_rwx_mask()
         }
         WorkspaceWriteMode::Cow { upper_dir } => {
+            // **ACLを保持できないボリュームでは、そもそも境界を張れない**（D-81）。
+            // 下の`grant_*`は失敗しないまま何も強制しないことがあり得るので、付ける前に
+            // 検算して拒否する。ワークスペース側（読取専用ACEが乗る）と差分層側
+            // （書込ACEが乗る）の**両方**を見る——D-81で両者は別ボリュームになり得る。
+            require_persistent_acl_volume("workspace", workspace_root)?;
+            require_persistent_acl_volume("copy-on-write diff area", upper_dir)?;
             // `--sandbox tier2a-cow`（D-30）。workspaceはRead/Execute/Traverseのみ（D-13と同じ関数）。
             // Redirector DLLが無効・回避されても、この時点でACLがROである限り
             // workspace本体への書込は`ACCESS_DENIED`でfail-closeする。
@@ -329,35 +342,47 @@ pub fn preflight_with_privhelper_launcher(
             // upper_dirは**セッション専有**（他セッションと共有しない）なので、主体は
             // 従来どおりセッションのpackage SIDのままにする。D-54が置き換えるのは
             // 「ワークスペースにつき一度きりで済むはずの付与」だけで、こちらは該当しない。
-            std::fs::create_dir_all(upper_dir)
-                .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
-            grant_ace_inheritable_rw(upper_dir, sid.as_psid())?;
-            crate::tier2a::session_profile::record_granted_path(upper_dir);
-            // `harness cow status`/`apply`/`list`がworkspace_rootを引けるよう、upper_dir自身に
-            // 由来を記録する（`workspace_ledger::write_cow_session_meta`のdoc参照）。
-            crate::tier2a::workspace_ledger::write_cow_session_meta(
-                upper_dir,
-                &canonical_workspace_root,
-                upper_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown-session"),
-            );
-            // CoWのupper_dirはセッション専有（他セッションと共有しない）なので、他モードとの
-            // 衝突チェックは不要。セッションID（upper_dirの最終パス要素、
-            // `cow_upper_dir_for_session`参照）で名前を付けた生存マーカーだけを確保し、
-            // `harness cow discard`等が「まだこのセッションが動いているか」を判定できるように
-            // する（`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`Phase 6の
-            // 前段）。
+            //
+            // **ここから生存マーカーの確保までをGCのロックで囲む**（D-82）。この区間は
+            // 「ディレクトリは在るが生存マーカーはまだ無い」状態で、並行して走る別の
+            // `harness.exe`のGCから見ると**空の殻**と区別が付かない。囲まないと、
+            // 起動しかけのセッションの差分層が他プロセスに消される
+            // （`workspace_ledger::COW_GC_LOCK_NAME`のdoc、`shared-state-exclusion` 問1）。
             let session_id = upper_dir
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown-session");
-            crate::tier2a::workspace_ledger::hold_cow_session_marker(session_id).map_err(|e| {
-                AppContainerError::Preflight(format!(
-                    "failed to create CoW session marker for {session_id}: {e}"
-                ))
-            })?;
+            harness_grant_ledger::with_named_lock(
+                crate::tier2a::workspace_ledger::COW_GC_LOCK_NAME,
+                || -> Result<(), AppContainerError> {
+                    std::fs::create_dir_all(upper_dir)
+                        .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
+                    grant_ace_inheritable_rw(upper_dir, sid.as_psid())?;
+                    crate::tier2a::session_profile::record_granted_path(upper_dir);
+                    // `harness cow status`/`apply`/`list`がworkspace_rootを引けるよう、
+                    // upper_dir自身に由来を記録する
+                    // （`workspace_ledger::write_cow_session_meta`のdoc参照）。
+                    crate::tier2a::workspace_ledger::write_cow_session_meta(
+                        upper_dir,
+                        &canonical_workspace_root,
+                        session_id,
+                    );
+                    // CoWのupper_dirはセッション専有（他セッションと共有しない）なので、
+                    // 他モードとの衝突チェックは不要。セッションID（upper_dirの最終パス要素、
+                    // `session_scope::cow_upper_dir_in`参照）で名前を付けた生存マーカーだけを
+                    // 確保し、`harness cow discard`等が「まだこのセッションが動いているか」を
+                    // 判定できるようにする
+                    // （`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`
+                    // Phase 6の前段）。
+                    crate::tier2a::workspace_ledger::hold_cow_session_marker(session_id).map_err(
+                        |e| {
+                            AppContainerError::Preflight(format!(
+                                "failed to create CoW session marker for {session_id}: {e}"
+                            ))
+                        },
+                    )
+                },
+            )?;
             fs_access_mask(FsAccess::ReadExec)
         }
     };
@@ -996,4 +1021,17 @@ pub fn preflight_with_privhelper_launcher(
         granted_passthrough,
         netfilterd_chain_attempted,
     })
+}
+
+/// `path`が載っているボリュームがACLを保持できることを確かめ、できなければ起動を拒否する（D-81）。
+///
+/// 規則そのもの（判定・文言・判定不能時に倒す向き）は
+/// [`crate::session_scope::persistent_acl_gate`]が持つ純関数で、ここはボリュームの採取と
+/// エラー型への変換だけを行う。**採取と判定を分ける**のは、判定側を`cargo test`で
+/// 検算できるようにするためである。
+fn require_persistent_acl_volume(what: &str, path: &Path) -> Result<(), AppContainerError> {
+    let probe = crate::win_common::volume_mount_point_of(path)
+        .and_then(|mount| crate::win_common::volume_persistent_acl_support(&mount));
+    crate::session_scope::persistent_acl_gate(what, path, probe)
+        .map_err(AppContainerError::Preflight)
 }

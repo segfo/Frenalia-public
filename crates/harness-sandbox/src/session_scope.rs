@@ -51,20 +51,252 @@ pub fn sandbox_dir_for_session(session_id: &str) -> PathBuf {
     PathBuf::from(".harness").join("sandbox").join(session_id)
 }
 
-/// CoW upper群の共通の親（`%LOCALAPPDATA%\harness\data\cow`）。
+/// ワークスペースと同じボリュームへ差分層を置くときの、そのボリューム上の根の名前（D-81）。
 ///
-/// workspace外に置くのは、再帰的なパスマッピングを防ぎ、`.harness`のPROTECTED DACL
-/// （`protect_harness_control_dir_from_appcontainer`）と衝突させないためである
-/// （`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` §9）。
+/// ボリュームのルート直下に置く（`D:\.harness-cow\<session-id>`）。**ワークスペースの中では
+/// ないことが要点**で、`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` §9 が
+/// 外配置を選んだ理由（再帰的なパスマッピングの防止・列挙から隠せる・Commit対象と差分領域の
+/// 分離・相対パス衝突の回避・ACLの独立管理）は、この配置でも全部そのまま保たれる。
+pub const PER_VOLUME_COW_DIRNAME: &str = ".harness-cow";
+
+/// ユーザープロファイルのボリューム上にあるCoW差分層の根（`%LOCALAPPDATA%\harness\data\cow`）。
+///
 /// `data_local_dir()`は`%LOCALAPPDATA%\harness\data`で、台帳群が使う`config_dir()`
 /// （`%APPDATA%\harness\config`）とは別系統。
-pub fn cow_upper_root() -> Option<PathBuf> {
+///
+/// **これは「唯一の根」ではない**（D-81）。ワークスペースが別のボリュームにあれば、差分層は
+/// そちらの[`PER_VOLUME_COW_DIRNAME`]へ置かれる。棚卸しは[`cow_upper_roots`]で全部を掃くこと。
+pub fn cow_profile_upper_root() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "harness").map(|d| d.data_local_dir().join("cow"))
 }
 
-/// `--sandbox tier2a-cow`（D-30）のCoW upper実体を置く場所。
-pub fn cow_upper_dir_for_session(session_id: &str) -> Option<PathBuf> {
-    cow_upper_root().map(|root| root.join(session_id))
+/// 差分層の根をどこに取るかの計画（[`plan_cow_upper_root`]の答え）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CowUpperRootPlan {
+    /// ワークスペースがプロファイルと同じボリュームにある。従来どおり`%LOCALAPPDATA%`。
+    Profile,
+    /// ワークスペースが別のボリュームにある。そのボリュームのルート直下へ置く。
+    PerVolume(PathBuf),
+}
+
+/// 2つのボリュームのマウントポイントが同じものを指すか。
+///
+/// **ボリュームの同一判定はこの1関数だけが持つ**（`bug-pattern-rules` B-19: 同じ判断に
+/// 規則が2つあると、片方だけ直って静かにずれる）。末尾の区切りの有無と大小文字を吸収する
+/// ——`GetVolumePathNameW`は入力の綴りを引き継ぐので`d:\`と`D:\`が同じ実行の中で混ざり得る。
+fn same_volume(a: &Path, b: &Path) -> bool {
+    fn key(p: &Path) -> String {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    }
+    key(a) == key(b)
+}
+
+/// 差分層の根を決める**規則そのもの**（純関数。Win32もFSも触らない）。
+///
+/// ボリュームの採取は呼び出し側（[`cow_upper_root_for_workspace`]）が行う——採取と判定を
+/// 分けてあるので、この規則は`cargo test`で普通に検算できる。
+///
+/// | ワークスペースのボリューム | 根 |
+/// |---|---|
+/// | プロファイルと同じ | [`CowUpperRootPlan::Profile`]（＝いままでと同じ場所） |
+/// | それ以外 | [`CowUpperRootPlan::PerVolume`] |
+///
+/// **ワークスペースがボリュームのルート自身なら`Err`**。その場合だけは差分層が
+/// ワークスペースの**中**に入ってしまい、書込がまた差分層へ誘導される再帰と、
+/// 読取専用にしたツリーの中に書込可能な穴を開けることの両方が起きる（§9が避けた形）。
+pub fn plan_cow_upper_root(
+    workspace_root: &Path,
+    workspace_volume: &Path,
+    profile_volume: &Path,
+) -> Result<CowUpperRootPlan, String> {
+    if same_volume(workspace_root, workspace_volume) {
+        return Err(format!(
+            "--sandbox tier2a-cow: the workspace is a volume root ({}); the copy-on-write diff \
+             area would have to live inside the workspace itself. Point --cwd at a subdirectory.",
+            workspace_root.display()
+        ));
+    }
+    if same_volume(workspace_volume, profile_volume) {
+        return Ok(CowUpperRootPlan::Profile);
+    }
+    Ok(CowUpperRootPlan::PerVolume(
+        workspace_volume.join(PER_VOLUME_COW_DIRNAME),
+    ))
+}
+
+/// [`cow_upper_root_for_workspace`]の答え。**降格したことを黙らせないために2値で返す**。
+#[derive(Debug, Clone)]
+pub struct CowUpperRoot {
+    pub root: PathBuf,
+    /// ワークスペースのボリューム上に根を作れず`%LOCALAPPDATA%`へ戻した理由。
+    /// `Some`なら**呼び出し側は必ず表示する**（`bug-pattern-rules` B-09）。
+    pub fell_back: Option<String>,
+}
+
+/// このワークスペース向けの差分層の根を決めて、使える状態にする（D-81）。
+///
+/// # なぜワークスペースのボリュームへ置くのか
+///
+/// 差分層はセッションが終わっても自動では消えない。ワークスペースが取り外せる媒体
+/// （USB・外付け）にあると、媒体を抜いた時点でワークスペースは到達不能になる一方、
+/// 差分層がプロファイル側（通常C:）に残る。台帳の掃除判定
+/// （[`harness_grant_ledger::prune`]）は「本当に消えた」と「ボリュームへ到達できないだけ」を
+/// 区別して後者は必ず残す側へ倒すので、**この形の差分層は永久に判定できず溜まり続ける**。
+/// 同じボリュームに置けば媒体ごと消え、判定する対象がそもそも生まれない。
+/// 容量も、ワークスペースを置いているデータ用ドライブの側へ付いていく。
+///
+/// # 根が作れないときは拒否ではなく降格する
+///
+/// ボリュームのルートへ書けない（権限が無い等）場合は`%LOCALAPPDATA%`へ戻し、理由を
+/// [`CowUpperRoot::fell_back`]で返す。**これは境界の降格ではなく後片付けの降格**である
+/// ——CoWの隔離（ワークスペースを読取専用にするACL）はどちらの置き場でも同じように張れて、
+/// 失われるのは「媒体と一緒に消える」性質だけなので、隔離が取れないときは降格せず拒否する
+/// というD-75の射程には入らない。
+pub fn cow_upper_root_for_workspace(workspace_root: &Path) -> Result<CowUpperRoot, String> {
+    let profile_root = cow_profile_upper_root().ok_or_else(|| {
+        "--sandbox tier2a-cow: could not resolve %LOCALAPPDATA% for the CoW upper directory (is \
+         HOME/USERPROFILE set?)"
+            .to_string()
+    })?;
+
+    #[cfg(windows)]
+    {
+        let Some(workspace_volume) = crate::win_common::volume_mount_point_of(workspace_root)
+        else {
+            // どのボリュームか分からないなら、従来の置き場のままにする。**「同じボリューム」と
+            // 決めつけない**——決めつけるとワークスペース側のルートに根を作ろうとして、
+            // 見当違いの場所へディレクトリを生やす。
+            return Ok(CowUpperRoot {
+                root: profile_root,
+                fell_back: Some(format!(
+                    "could not determine which volume {} lives on; keeping the CoW diff area \
+                     under %LOCALAPPDATA%",
+                    workspace_root.display()
+                )),
+            });
+        };
+        let Some(profile_volume) = crate::win_common::volume_mount_point_of(&profile_root) else {
+            return Ok(CowUpperRoot {
+                root: profile_root,
+                fell_back: Some(
+                    "could not determine which volume %LOCALAPPDATA% lives on; keeping the CoW \
+                     diff area there"
+                        .to_string(),
+                ),
+            });
+        };
+        match plan_cow_upper_root(workspace_root, &workspace_volume, &profile_volume)? {
+            CowUpperRootPlan::Profile => Ok(CowUpperRoot {
+                root: profile_root,
+                fell_back: None,
+            }),
+            CowUpperRootPlan::PerVolume(root) => match std::fs::create_dir_all(&root) {
+                Ok(()) => Ok(CowUpperRoot {
+                    root,
+                    fell_back: None,
+                }),
+                Err(e) => Ok(CowUpperRoot {
+                    root: profile_root,
+                    fell_back: Some(format!(
+                        "could not create {} ({e}); keeping the CoW diff area under \
+                         %LOCALAPPDATA%, which means it will NOT go away with the volume",
+                        root.display()
+                    )),
+                }),
+            },
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = workspace_root;
+        Ok(CowUpperRoot {
+            root: profile_root,
+            fell_back: None,
+        })
+    }
+}
+
+/// いま差分層が置かれ得る根を全部返す（棚卸し用。`harness cow list`/`gc`）。
+///
+/// D-81で根が1つではなくなったので、**列挙は必ずここを通す**——`%LOCALAPPDATA%`だけを見ると
+/// 別ボリュームのセッションが「無いもの」として扱われ、`cow list`から消え、GCの対象にも
+/// ならない（`bug-pattern-rules` B-05: 綴りを他所で組み立て直さない）。
+///
+/// 到達できないボリュームは黙って飛ばすのではなく、返り値の2つ目（件数）で数える。
+/// 「0件だった」と「材料が見えていなかった」を呼び出し側が区別できるようにするため。
+pub fn cow_upper_roots() -> (Vec<PathBuf>, usize) {
+    let mut roots = Vec::new();
+    let mut unreachable = 0usize;
+    if let Some(profile) = cow_profile_upper_root() {
+        roots.push(profile);
+    }
+    #[cfg(windows)]
+    for drive in crate::win_common::logical_drive_roots() {
+        let candidate = drive.join(PER_VOLUME_COW_DIRNAME);
+        match std::fs::metadata(&candidate) {
+            Ok(m) if m.is_dir() => {
+                if !roots.iter().any(|r| same_volume(r, &candidate)) {
+                    roots.push(candidate);
+                }
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // 媒体が抜かれている・オフラインのネットワークドライブ。**在るとも無いとも言えない。**
+            Err(_) => unreachable += 1,
+        }
+    }
+    (roots, unreachable)
+}
+
+/// `root`（[`cow_upper_root_for_workspace`]や[`cow_upper_roots`]が返したもの）の下での、
+/// あるセッションの差分層の位置。**この結合を他所で書かない**（B-05）。
+pub fn cow_upper_dir_in(root: &Path, session_id: &str) -> PathBuf {
+    root.join(session_id)
+}
+
+/// ボリュームがACLを保持できるかの検算（D-81）。**判定だけの純関数。**
+///
+/// # なぜ要るのか
+///
+/// CoWの境界はACLそのものである（D-30）——ワークスペースへ読取専用ACEを付け、差分層へ
+/// 書込ACEを付ける。この2つが成立して初めて「フックが無効化されても書込は`ACCESS_DENIED`で
+/// 止まる」（D-01: 境界はカーネル強制側に置き、Redirector DLLは境界にしない）が言える。
+/// FAT32・exFAT——USBメモリやSDカードの既定——にはACLが無いので、**そこでは境界を張れない**。
+/// にもかかわらず検査が無かったため、隔離されていない状態で「隔離されている」とモデルへ
+/// 宣言し得た。同じ形の穴をD-72が[BUG-113]で塞いでいる。
+///
+/// # 判定できないときは拒否へ倒す
+///
+/// `probe`が`None`（`GetVolumeInformationW`が失敗した）なら**拒否する**。ここは
+/// セキュリティ境界そのものなので、`shared-state-exclusion` 問5の分岐は「閉じる」側である
+/// ——境界が張れるか分からないまま張ったことにする方が危険で、能力が無いときは降格ではなく
+/// 拒否するという上位原則（`docs/SECURITY-PRINCIPLES.md` P-05）にも従う。
+///
+/// `probe`は`(FILE_PERSISTENT_ACLSが立っているか, ファイルシステム名)`。
+pub fn persistent_acl_gate(
+    what: &str,
+    path: &Path,
+    probe: Option<(bool, String)>,
+) -> Result<(), String> {
+    match probe {
+        Some((true, _)) => Ok(()),
+        Some((false, fs_name)) => Err(format!(
+            "--sandbox tier2a-cow: the volume holding the {what} ({}) uses {fs_name}, which \
+             cannot store ACLs. Copy-on-write isolation is enforced by ACLs (a read-only \
+             workspace plus a writable diff area), so on this volume the boundary cannot be \
+             established at all. Move the workspace to an NTFS volume, or pick a weaker \
+             isolation explicitly with --sandbox.",
+            path.display()
+        )),
+        None => Err(format!(
+            "--sandbox tier2a-cow: could not determine whether the volume holding the {what} \
+             ({}) can store ACLs. Refusing to start rather than claim an isolation boundary \
+             that may not exist.",
+            path.display()
+        )),
+    }
 }
 
 /// このプロセスがどのオーバーレイ機構で動いているか。**プロセス寿命で不変**（モジュールdoc参照）。
@@ -78,13 +310,20 @@ pub fn cow_upper_dir_for_session(session_id: &str) -> Option<PathBuf> {
 /// 宣言できず、拒否は実行時（`harness-cli`の`resolve_staging_and_write_mode`）へ移った。
 ///
 /// 遠くの実行時判定に不変条件を預けるのをやめ、**そもそも書けない形**にしてある。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeTemplate {
     /// マニフェスト方式。[`StagingMode::Live`]（オーバーレイ無し）もここに含む。
     Staging(StagingMode),
     /// CoW方式（D-30）。**`StagingMode`を持たない**——CoWのときステージングモードは必ず
     /// `Live`だからで、持たせないことが「CoWかつ`--staged`」を書けなくしている。
-    Cow,
+    ///
+    /// **差分層の根を値として持つ**（D-81）。根はワークスペースのボリュームで決まるので
+    /// もはや定数ではないが、ワークスペースはプロセス寿命で不変（起動時に1度だけ完全修飾化
+    /// する、BUG-068）なので**根もプロセス寿命で不変**であり、モードと同じ場所に置ける。
+    /// ここに持たせず`scope_for`が毎回ワークスペースから引き直す形にすると、
+    /// **同じ根を2箇所で導出する**ことになり、片方だけ規則が変わったときに静かにずれる
+    /// （`bug-pattern-rules` B-05）。
+    Cow { upper_root: PathBuf },
 }
 
 /// あるセッションのオーバーレイの置き場。`ToolCtx`の該当2フィールドと1:1に対応する。
@@ -127,26 +366,32 @@ impl ScopeTemplate {
         staging_mode: StagingMode,
     ) -> Self {
         match write_mode {
-            crate::shell_tier::WorkspaceWriteMode::Cow { .. } => ScopeTemplate::Cow,
+            // 根は**起動時に実際に決まった差分層の親**から取る（D-81）。ワークスペースから
+            // 導出し直さないのは、導出規則を2箇所に持たないためである（B-05）。
+            crate::shell_tier::WorkspaceWriteMode::Cow { upper_dir } => ScopeTemplate::Cow {
+                upper_root: upper_dir
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| upper_dir.clone()),
+            },
             crate::shell_tier::WorkspaceWriteMode::DirectRw => ScopeTemplate::Staging(staging_mode),
         }
     }
 
     /// セッションIDからそのセッションのオーバーレイ位置を引く。
     ///
-    /// CoWで`%LOCALAPPDATA%`が解決できない異常環境では`cow_upper_dir`が`None`になるが、
-    /// **起動時に`resolve_staging_and_write_mode`が同じ条件で起動を拒否している**ので、
-    /// ここへ到達する時点では解決できることが保証されている（できなければ`is_live()`が真になり、
-    /// 切替は「オーバーレイを使わない」として断られる＝安全側）。
+    /// CoWの根は[`ScopeTemplate::Cow`]が値として持っている（D-81）ので、ここでは結合するだけ
+    /// ——`%LOCALAPPDATA%`が解決できない異常環境は**起動時に`resolve_staging_and_write_mode`が
+    /// 拒否している**ため、テンプレートが`Cow`である時点で根は確定している。
     pub fn scope_for(&self, session_id: &str) -> SessionScope {
         let (staging, cow_upper_dir) = match self {
-            ScopeTemplate::Cow => (
+            ScopeTemplate::Cow { upper_root } => (
                 StagingConfig {
                     // CoWのステージングモードは常に`Live`（マニフェスト方式との併用は拒否済み）。
                     mode: StagingMode::Live,
                     sandbox_dir: None,
                 },
-                cow_upper_dir_for_session(session_id),
+                Some(cow_upper_dir_in(upper_root, session_id)),
             ),
             ScopeTemplate::Staging(mode) => {
                 let sandbox_dir = match mode {
@@ -173,6 +418,24 @@ impl ScopeTemplate {
 }
 
 // ------------------------------------------------- 置き場を用意する／中身を持っていく
+
+/// オーバーレイの実体を消す。**片付けの唯一の実行点**（[`prepare_scope`]の対）。
+///
+/// 呼ぶのは2箇所——`harness discard`（`SandboxFs::discard`）と、差分層のGC
+/// （`tier2a::workspace_ledger::run_cow_gc`）。どちらも「もう要らないオーバーレイを消す」
+/// という同じ操作なので、**削除経路を2つ持たない**（`bug-pattern-rules` B-05）。
+///
+/// GC側が`SandboxFs::discard`をそのまま呼べない理由も、ここへ集約する動機である——
+/// あちらは`SandboxFs`を開く必要があり、**元のワークスペースが既に消えている差分層**
+/// （実測で106件中59件）では開けない。回収の対象はまさにそういうものなので、
+/// ワークスペースを要求しない形の入口が要る。
+pub fn remove_overlay_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        // 既に無いのは目的が達成されている状態。呼び出し側に失敗として見せない。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
 
 /// オーバーレイのコピー（fork）で**持っていってはいけない**ファイル名。
 ///
@@ -214,22 +477,36 @@ pub fn prepare_scope(workspace_root: &Path, scope: &SessionScope) -> Result<usiz
     let Some(dir) = scope.overlay_dir(workspace_root) else {
         return Ok(0);
     };
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        format!(
-            "could not create the overlay directory {}: {e}",
-            dir.display()
-        )
-    })?;
 
-    // `--staged`（workspace内`.harness/sandbox/<id>`）はここで終わり。**ACLは触らない**——
+    // `--staged`（workspace内`.harness/sandbox/<id>`）は作るだけで終わり。**ACLは触らない**——
     // このオーバーレイを読み書きするのはharness自身のプロセスだけで、サンドボックスの子から
     // 見せる必要が無い（むしろ`.harness/`はD-05/D-09で子から隔離してある）。新しく作った
     // ディレクトリは保護済みの`.harness/`から継承するのでAppContainer宛ACEを持たない。
     #[cfg(windows)]
     if scope.cow_upper_dir.is_some() {
-        return prepare_cow_upper(workspace_root, scope, &dir);
+        // D-82: **実体を作ってから生存マーカーを確保するまでをGCのロックで囲む。**
+        // この区間の差分層は「在るのに生きている印が無い」ので、並行して走る別の
+        // `harness.exe`のGCからは空の殻に見える。`preflight`の起動経路にも同じ囲いがあり、
+        // **両方に入れて初めて直列化が成立する**（片側だけでは何も守らない）。
+        return harness_grant_ledger::with_named_lock(
+            crate::tier2a::workspace_ledger::COW_GC_LOCK_NAME,
+            || {
+                create_overlay_dir(&dir)?;
+                prepare_cow_upper(workspace_root, scope, &dir)
+            },
+        );
     }
+    create_overlay_dir(&dir)?;
     Ok(1)
+}
+
+fn create_overlay_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "could not create the overlay directory {}: {e}",
+            dir.display()
+        )
+    })
 }
 
 /// `--sandbox tier2a-cow`のupper_dirを、このセッションのAppContainerから書ける状態にする（Windows専用）。
@@ -501,14 +778,15 @@ mod tests {
     /// `.harness`のPROTECTED DACLとの衝突が復活する。
     #[test]
     fn cow_puts_the_overlay_outside_the_workspace() {
-        let scope = ScopeTemplate::Cow.scope_for("session-abc");
+        let root = cow_profile_upper_root().unwrap();
+        let scope = ScopeTemplate::Cow {
+            upper_root: root.clone(),
+        }
+        .scope_for("session-abc");
         assert_eq!(scope.staging.sandbox_dir, None);
-        let Some(upper) = &scope.cow_upper_dir else {
-            // `%LOCALAPPDATA%`が解決できない環境ではNone（起動時に弾かれている）。
-            return;
-        };
+        let upper = scope.cow_upper_dir.as_ref().unwrap();
         assert!(upper.ends_with("session-abc"), "{}", upper.display());
-        assert!(upper.starts_with(cow_upper_root().unwrap()));
+        assert!(upper.starts_with(&root));
         assert!(!scope.is_live());
         assert_eq!(scope.overlay_dir(Path::new("C:/ws")).as_ref(), Some(upper));
     }
@@ -521,5 +799,104 @@ mod tests {
             t.scope_for("session-a").staging,
             t.scope_for("session-b").staging
         );
+    }
+
+    // --- 差分層の置き場の規則（D-81） ---
+
+    fn vol(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// ワークスペースがプロファイルと同じボリュームなら、置き場は従来どおり。
+    #[test]
+    fn same_volume_as_the_profile_keeps_the_diff_area_where_it_was() {
+        assert_eq!(
+            plan_cow_upper_root(Path::new(r"C:\work\proj"), &vol(r"C:\"), &vol(r"C:\")).unwrap(),
+            CowUpperRootPlan::Profile
+        );
+    }
+
+    /// 別ボリュームなら、そのボリュームのルート直下へ置く。**ワークスペースの中ではない。**
+    #[test]
+    fn a_different_volume_gets_its_own_root_outside_the_workspace() {
+        let plan =
+            plan_cow_upper_root(Path::new(r"D:\work\proj"), &vol(r"D:\"), &vol(r"C:\")).unwrap();
+        assert_eq!(
+            plan,
+            CowUpperRootPlan::PerVolume(vol(r"D:\").join(PER_VOLUME_COW_DIRNAME))
+        );
+        let CowUpperRootPlan::PerVolume(root) = plan else {
+            unreachable!()
+        };
+        assert!(
+            !root.starts_with(r"D:\work\proj"),
+            "§9の外配置を崩してはいけない: {}",
+            root.display()
+        );
+    }
+
+    /// ドライブ文字を持たないマウント先でも同じ規則が効く（先頭2文字での判定にしていない）。
+    #[test]
+    fn a_volume_mounted_on_a_directory_is_treated_as_its_own_volume() {
+        let plan = plan_cow_upper_root(
+            Path::new(r"C:\mnt\data\proj"),
+            &vol(r"C:\mnt\data\"),
+            &vol(r"C:\"),
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            CowUpperRootPlan::PerVolume(vol(r"C:\mnt\data\").join(PER_VOLUME_COW_DIRNAME))
+        );
+    }
+
+    /// 末尾の区切りと大小文字の揺れで「別ボリューム」と誤判定しない（B-19）。
+    #[test]
+    fn volume_comparison_ignores_case_and_a_trailing_separator() {
+        assert_eq!(
+            plan_cow_upper_root(Path::new(r"c:\work\proj"), &vol(r"c:"), &vol(r"C:\")).unwrap(),
+            CowUpperRootPlan::Profile
+        );
+    }
+
+    /// **拒否側**: ワークスペースがボリュームのルート自身なら起動できない。
+    /// ここを通すと差分層がワークスペースの中に入り、再帰と読取専用ツリーの穴が同時に生じる。
+    #[test]
+    fn a_workspace_that_is_a_volume_root_is_rejected() {
+        let err = plan_cow_upper_root(Path::new(r"D:\"), &vol(r"D:\"), &vol(r"C:\"))
+            .expect_err("the diff area would have to live inside the workspace");
+        assert!(err.contains("volume root"), "理由を名指しすること: {err}");
+    }
+
+    // --- ボリュームがACLを保持できるかの検問（D-81 / Part B） ---
+
+    /// **許可側**（拒否側と対で測る、`test-logic-rules`）。NTFSは通る。
+    #[test]
+    fn a_volume_that_stores_acls_passes_the_gate() {
+        assert!(persistent_acl_gate(
+            "workspace",
+            Path::new(r"C:\ws"),
+            Some((true, "NTFS".to_string()))
+        )
+        .is_ok());
+    }
+
+    /// **拒否側**: ACLを持てないボリュームでは境界そのものが張れないので起動を拒否する。
+    #[test]
+    fn a_volume_without_acls_is_refused_and_the_filesystem_is_named() {
+        let err = persistent_acl_gate(
+            "workspace",
+            Path::new(r"X:\ws"),
+            Some((false, "exFAT".to_string())),
+        )
+        .expect_err("copy-on-write isolation is enforced by ACLs");
+        assert!(err.contains("exFAT"), "打つ手が分かるように名指しする: {err}");
+    }
+
+    /// **判定不能はセキュリティ境界なので閉じる側へ倒す**（`shared-state-exclusion` 問5）。
+    /// ここが`Ok`へ倒れると、境界が張れているか分からないまま「隔離した」と宣言してしまう。
+    #[test]
+    fn an_unprobeable_volume_is_refused_rather_than_assumed_capable() {
+        assert!(persistent_acl_gate("workspace", Path::new(r"X:\ws"), None).is_err());
     }
 }

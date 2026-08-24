@@ -575,6 +575,92 @@ pub(crate) fn hold_mutex_for_process_lifetime(name: &str) -> windows::core::Resu
     Ok(())
 }
 
+// --- ボリュームの素性（どのボリュームに載っているか・ACLを保持できるか） ---
+//
+// CoWの差分層はワークスペースと同じボリュームへ置く（D-81）ので「このパスはどのボリュームか」
+// が要り、CoWの境界はACL（ワークスペースを読取専用にする）なので「そのボリュームはACLを
+// 保持できるか」が要る。どちらもWin32の生の問い合わせなのでここに置き、**規則の側は
+// `session_scope`が持つ**（採取と判定を分ける）。
+
+/// `path`が載っているボリュームのマウントポイント（`D:\`、あるいは
+/// `C:\mnt\data\`のようなドライブ文字を持たないマウント先）を返す。
+///
+/// **先頭2文字を切り出す方式にしない。** ボリュームはドライブ文字を持たずに
+/// ディレクトリへマウントできるので、`C:\mnt\data\proj`の実体が`C:`とは別ボリュームである
+/// ことがある。そこを取り違えると「同じボリュームのつもりで別ボリューム」になり、
+/// D-81が消しに行く相手（媒体ごと消える差分層）が成立しなくなる。
+///
+/// `path`は存在しなくてよい（`GetVolumePathNameW`は綴りだけで解決する）が、
+/// 解決できなければ`None`を返す。**呼び出し側は`None`を「同じボリューム」と読まないこと。**
+pub fn volume_mount_point_of(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
+    let wide_path = wide(&path.to_string_lossy());
+    // MAX_PATHで足りない長いパスもあるので、NTの上限に合わせて広めに取る。
+    let mut buf = vec![0u16; 32768];
+    unsafe { GetVolumePathNameW(PCWSTR(wide_path.as_ptr()), &mut buf).ok()? };
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    if len == 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &buf[..len],
+    )))
+}
+
+/// `mount_point`（[`volume_mount_point_of`]の戻り値）のファイルシステムが
+/// **ACLを永続化できるか**と、そのファイルシステム名。
+///
+/// CoWの境界はACLそのもの（D-30。ワークスペースへ読取専用ACEを付け、差分層へ書込ACEを付ける）
+/// なので、`FILE_PERSISTENT_ACLS`が立たないボリューム——FAT32・exFAT・多くのUSBメモリ——では
+/// **境界を張れない**。張れないまま起動すると「隔離されている」と宣言しながら実際には
+/// 素通しになるので、呼び出し側は拒否へ倒す（P-05）。
+///
+/// 問い合わせ自体に失敗したら`None`。**`None`を「持っている」と読まないこと**——
+/// 判定できないなら境界の有無が分からないのだから、拒否側へ倒すのが安全である。
+pub fn volume_persistent_acl_support(
+    mount_point: &std::path::Path,
+) -> Option<(bool, String)> {
+    use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
+    use windows::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
+    // `GetVolumeInformationW`はルートパスに末尾の区切りを要求する。
+    let mut root = mount_point.to_string_lossy().into_owned();
+    if !root.ends_with('\\') {
+        root.push('\\');
+    }
+    let wide_root = wide(&root);
+    let mut fs_name = vec![0u16; 256];
+    let mut flags = 0u32;
+    unsafe {
+        GetVolumeInformationW(
+            PCWSTR(wide_root.as_ptr()),
+            None,
+            None,
+            None,
+            Some(&mut flags),
+            Some(&mut fs_name),
+        )
+        .ok()?
+    };
+    let len = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
+    Some((
+        flags & FILE_PERSISTENT_ACLS != 0,
+        String::from_utf16_lossy(&fs_name[..len]),
+    ))
+}
+
+/// いま到達できるドライブ文字のルート（`C:\`・`D:\`…）を列挙する。
+///
+/// CoWの差分層がボリュームごとに散る（D-81）ため、棚卸し（`harness cow list`/`gc`）は
+/// 1つの根ではなく**全ボリュームの根**を掃く必要がある。
+pub fn logical_drive_roots() -> Vec<std::path::PathBuf> {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u32)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| std::path::PathBuf::from(format!("{}:\\", (b'A' + i as u8) as char)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

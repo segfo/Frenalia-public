@@ -95,19 +95,26 @@ pub(super) fn stage_prepare_sandbox(
         eprintln!("error: {e}");
         return Err(ExitCode::FAILURE);
     }
-    let (staging_mode, write_mode) = match resolve_staging_and_write_mode(
+    let (staging_mode, write_mode, upper_root_fell_back) = match resolve_staging_and_write_mode(
         sandbox_choice,
         cli.live,
         cli.staged,
         cli.workspace_commit,
         &session.id(),
+        &workspace_root,
     ) {
-        Ok(pair) => pair,
+        Ok(triple) => triple,
         Err(e) => {
             eprintln!("error: {e}");
             return Err(ExitCode::FAILURE);
         }
     };
+    // D-81: 差分層をワークスペースと同じボリュームへ置けなかった。隔離は同じように張れるので
+    // 続行するが、**「媒体と一緒に消える」性質が失われたことは黙らせない**——これを黙ると、
+    // ボリュームを外した後に回収できない差分層が残る理由が誰にも分からなくなる。
+    if let Some(reason) = upper_root_fell_back {
+        eprintln!("warning: {reason}");
+    }
     let sandbox_dir = if staging_mode == StagingMode::Live {
         None
     } else {
@@ -443,6 +450,8 @@ pub(super) fn stage_prepare_sandbox(
         }
     };
 
+    sweep_empty_cow_diff_areas();
+
     Ok(SandboxPrepared {
         cli,
         workspace_root,
@@ -525,3 +534,43 @@ fn build_mcp_gates(
         http_ca_bundle: settings.http_ca_bundle.map(PathBuf::from),
     })
 }
+
+/// 何も残っていないCoW差分層を回収する（D-82の回収点2）。
+///
+/// # なぜ`preflight`ではなくここなのか
+///
+/// 最初は`preflight`の`gc_dead_sessions`の隣へ置いた。**それは実害を出した**——`preflight`は
+/// `harness-sandbox`の実機テストが直接呼ぶ関数で、それらはworkspaceだけをtempdirにし、
+/// 差分層の置き場（`%LOCALAPPDATA%`）は実物を使う。結果、`cargo test --workspace`が
+/// 開発機の差分層を70件消した。規則自体は正しく動いて中身のあるものは残ったが、
+/// **テストが実マシンのユーザーデータを消してよい理由にはならない**。
+///
+/// `harness-cli`の起動経路に置けば、TUIもheadlessも通り（B-06: 入口を片方だけ掃除しない）、
+/// テストは通らない。
+///
+/// # ここで消さないもの
+///
+/// 消すのは「操作台帳を再生しても変更が無く、実体ファイルも無い」ものだけ。**実ワークスペース
+/// とは突き合わせない**——起動のたびに全セッション×実ワークスペースを読むと、いま開いてすら
+/// いない他のワークスペースまで触ることになる。`apply`を通さずに終わった差分層や、適用済みで
+/// 実体だけが残ったものは「変更を抱えている」と判定されて残るので、`harness cow gc`が受け持つ。
+#[cfg(windows)]
+fn sweep_empty_cow_diff_areas() {
+    use harness_sandbox::tier2a::workspace_ledger as wl;
+
+    let outcome = wl::run_cow_gc(false, wl::COW_GC_DEFAULT_GRACE_SECS, &|_, _| false);
+    if !outcome.collected.is_empty() {
+        eprintln!(
+            "note: collected {} empty copy-on-write diff area(s) left by finished sessions \
+             (`harness cow list` shows what is left)",
+            outcome.collected.len()
+        );
+    }
+    // 失敗は黙らせない。消せない差分層が積もる理由は、ここでしか分からない。
+    for (session_id, e) in &outcome.failures {
+        eprintln!("warning: could not remove the CoW diff area for {session_id}: {e}");
+    }
+}
+
+#[cfg(not(windows))]
+fn sweep_empty_cow_diff_areas() {}

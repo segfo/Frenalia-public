@@ -517,7 +517,8 @@ impl SandboxFs {
             return Ok(());
         };
         drop(overlay.jail);
-        std::fs::remove_dir_all(&overlay.dir)?;
+        // 削除の実行点は`session_scope`が1つだけ持つ（GCも同じ関数を通る）。
+        crate::session_scope::remove_overlay_dir(&overlay.dir)?;
         Ok(())
     }
 }

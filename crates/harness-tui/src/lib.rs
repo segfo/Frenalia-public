@@ -476,8 +476,16 @@ pub async fn run(
     //
     // **CLIのフラグではなく、いま走っている`ToolCtx`の実際の値から作る**（TUIは
     // `harness-cli`へ依存できないうえ、ここで欲しいのは「要求」ではなく「成立した形」である）。
+    // D-81で差分層の根はワークスペースのボリュームで決まるようになったが、ここでも
+    // **ワークスペースから導出し直さない**——いま実際に使っている差分層の親をそのまま採る。
+    // 導出規則を2箇所に持つと、片方だけ変わったときに切替先だけ別の根を指す（B-05）。
     let scope_template = match &ctx.cow_upper_dir {
-        Some(_) => harness_sandbox::session_scope::ScopeTemplate::Cow,
+        Some(dir) => harness_sandbox::session_scope::ScopeTemplate::Cow {
+            upper_root: dir
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| dir.clone()),
+        },
         None => harness_sandbox::session_scope::ScopeTemplate::Staging(ctx.staging.mode),
     };
     // **いま見ている／書いているオーバーレイ**。`/sessions`・`/fork`で差し替わり、engine側の

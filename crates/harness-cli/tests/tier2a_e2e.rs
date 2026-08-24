@@ -272,9 +272,10 @@ fn parse_json_stdout(run: &HarnessRun) -> Result<serde_json::Value, String> {
 }
 
 fn list_cow_sessions() -> HashSet<String> {
-    harness_sandbox::tier2a::workspace_ledger::list_cow_sessions()
-        .into_iter()
-        .collect()
+    // D-81で根が複数になり、返り値は`(一覧, 到達できなかったボリューム数)`になった。
+    // このテストは同じマシン上の差分ID差分を見るだけなので、到達不能数は使わない。
+    let (dirs, _unreachable) = harness_sandbox::tier2a::workspace_ledger::list_cow_sessions();
+    dirs.into_iter().map(|d| d.session_id).collect()
 }
 
 /// `before`との差分から、このケースで新規に作られたCoWセッションIDを1つ特定する。
@@ -290,10 +291,22 @@ fn new_cow_session(before: &HashSet<String>) -> Result<String, String> {
     }
 }
 
+/// D-81で差分層の根が複数になったので、**全部の根を探す**。
+/// ここでプロファイル側の根だけを見ると、別ボリュームのワークスペースで走らせたときだけ
+/// 「セッションが見つからない」という無関係な失敗になる。
 fn cow_upper_dir(session_id: &str) -> PathBuf {
-    harness_sandbox::tier2a::workspace_ledger::cow_upper_root()
-        .expect("resolve %LOCALAPPDATA%\\harness\\cow")
-        .join(session_id)
+    let (roots, _unreachable) = harness_sandbox::session_scope::cow_upper_roots();
+    roots
+        .iter()
+        .map(|root| harness_sandbox::session_scope::cow_upper_dir_in(root, session_id))
+        .find(|dir| dir.is_dir())
+        .unwrap_or_else(|| {
+            // まだ作られていない場合は、プロファイル側の根の下を指す（従来の挙動）。
+            harness_sandbox::session_scope::cow_upper_dir_in(
+                roots.first().expect("at least the profile root must resolve"),
+                session_id,
+            )
+        })
 }
 
 /// `--cwd`はclapのトップレベル引数であり、サブコマンド名(`apply`)より前に置かないと

@@ -17,9 +17,7 @@ pub(crate) fn parse_require_sandbox(value: Option<&str>) -> RequireSandbox {
 // `session_id` → オーバーレイの置き場、の写像は`harness_sandbox::session_scope`が正本
 // （起動時のここと、セッション切替時の`harness-tui`の両方から引かれるため。以前は本ファイルと
 // `tier2a::workspace_ledger`に同じ`ProjectDirs::…join("cow")`が複製されていた）。
-pub(crate) use harness_sandbox::session_scope::{
-    cow_upper_dir_for_session, sandbox_dir_for_session,
-};
+pub(crate) use harness_sandbox::session_scope::sandbox_dir_for_session;
 
 /// `--sandbox`の値がこのOSで通るか。**通らないものは黙って無視せず起動を拒否する。**
 ///
@@ -84,26 +82,32 @@ pub(crate) fn sandbox_choice_supported_on(
 /// - `WorkspaceWriteMode`: `--sandbox tier2a-cow`のときだけ`Cow`。`session_id`はCoW upperの
 ///   採番に使う（`sandbox_dir_for_session`と同じ採番元）。`ProjectDirs`が解決できない
 ///   （HOME未設定等の異常環境）場合は起動を拒否する（安全側: upperが無いままRW付与へ
-///   フォールバックしない）。
+///   フォールバックしない）。**置き場はワークスペースのボリュームで決まる**（D-81）ので
+///   `workspace_root`を受ける。
+///
+/// 3つ目の返り値は「置き場を`%LOCALAPPDATA%`へ降格した理由」で、`Some`なら
+/// **呼び出し側が必ず表示する**（`bug-pattern-rules` B-09: 黙って弱い形に落ちない）。
 pub(crate) fn resolve_staging_and_write_mode(
     choice: SandboxChoice,
     live: bool,
     staged: bool,
     workspace_commit: bool,
     session_id: &str,
-) -> Result<(StagingMode, WorkspaceWriteMode), String> {
+    workspace_root: &std::path::Path,
+) -> Result<(StagingMode, WorkspaceWriteMode, Option<String>), String> {
     let staging_mode = resolve_staging_mode_checked(choice, live, staged, workspace_commit)?;
 
     if !choice.wants_cow() {
-        return Ok((staging_mode, WorkspaceWriteMode::DirectRw));
+        return Ok((staging_mode, WorkspaceWriteMode::DirectRw, None));
     }
 
-    let upper_dir = cow_upper_dir_for_session(session_id).ok_or_else(|| {
-        "--sandbox tier2a-cow: could not resolve %LOCALAPPDATA% for the CoW upper directory (is \
-         HOME/USERPROFILE set?)"
-            .to_string()
-    })?;
-    Ok((staging_mode, WorkspaceWriteMode::Cow { upper_dir }))
+    let chosen = harness_sandbox::session_scope::cow_upper_root_for_workspace(workspace_root)?;
+    let upper_dir = harness_sandbox::session_scope::cow_upper_dir_in(&chosen.root, session_id);
+    Ok((
+        staging_mode,
+        WorkspaceWriteMode::Cow { upper_dir },
+        chosen.fell_back,
+    ))
 }
 
 /// 書込捕捉の**組合せの妥当性だけ**を判定して`StagingMode`を返す（資源を1つも解決しない）。
@@ -374,11 +378,27 @@ mod staging_mode_tests {
         }
     }
 
+    /// 差分層の置き場の規則（D-81）はここでの主題ではないので、**プロファイルと必ず同じ
+    /// ボリュームになるパス**を使う。別ボリュームのパスを渡すとそちらのルートへ
+    /// `.harness-cow`を作りに行き、単体テストが実マシンに副作用を残す。
+    fn test_workspace() -> std::path::PathBuf {
+        harness_sandbox::session_scope::cow_profile_upper_root()
+            .expect("%LOCALAPPDATA% must resolve for these tests")
+            .join("test-workspace")
+    }
+
     /// staging側だけを見るヘルパ（`--sandbox`は既定`auto`）。
     fn staging(live: bool, staged: bool, workspace_commit: bool) -> StagingMode {
-        resolve_staging_and_write_mode(SandboxChoice::Auto, live, staged, workspace_commit, SESSION)
-            .expect("auto never conflicts with the staging flags")
-            .0
+        resolve_staging_and_write_mode(
+            SandboxChoice::Auto,
+            live,
+            staged,
+            workspace_commit,
+            SESSION,
+            &test_workspace(),
+        )
+        .expect("auto never conflicts with the staging flags")
+        .0
     }
 
     /// D-29: フラグ無指定時は常にLive（オプトイン、既定の安全策ではない）。
@@ -410,8 +430,8 @@ mod staging_mode_tests {
     #[test]
     fn every_sandbox_choice_maps_to_the_expected_write_mode() {
         for choice in SandboxChoice::ALL {
-            let (staging, write_mode) =
-                resolve_staging_and_write_mode(choice, false, false, false, SESSION)
+            let (staging, write_mode, _fell_back) =
+                resolve_staging_and_write_mode(choice, false, false, false, SESSION, &test_workspace())
                     .expect("no staging flag is set, so nothing can conflict");
             assert_eq!(
                 staging,
@@ -450,6 +470,7 @@ mod staging_mode_tests {
                 staged,
                 workspace_commit,
                 SESSION,
+                &test_workspace(),
             )
             .expect_err("two write capture mechanisms must not both be armed");
             assert!(
@@ -465,12 +486,13 @@ mod staging_mode_tests {
     #[test]
     fn cow_alone_and_cow_with_live_are_accepted() {
         for live in [false, true] {
-            let (staging, write_mode) = resolve_staging_and_write_mode(
+            let (staging, write_mode, _fell_back) = resolve_staging_and_write_mode(
                 SandboxChoice::Tier2aCow,
                 live,
                 false,
                 false,
                 SESSION,
+                &test_workspace(),
             )
             .expect("--sandbox tier2a-cow on its own must start");
             assert_eq!(staging, StagingMode::Live);

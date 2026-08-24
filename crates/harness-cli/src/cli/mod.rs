@@ -200,6 +200,13 @@ pub(crate) enum Commands {
         /// 適用される。
         #[arg(long = "adopt-unledgered", default_value_t = false)]
         adopt_unledgered: bool,
+        /// 完全に適用し切った後もCoW差分層を消さずに残す（D-82）。
+        ///
+        /// 既定では、1件も残さず適用できた差分層はその場で畳む——作る側と消す側を対にして
+        /// おかないと、セッションのたびに置き場が1つずつ積もるためである。中身をもう一度
+        /// 見たい・別のツールで調べたい場合にこれを指定する。
+        #[arg(long = "keep-upper", default_value_t = false)]
+        keep_upper: bool,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },
@@ -424,7 +431,8 @@ pub(crate) enum PolicyAction {
 /// ——`list`だけは全workspace横断の棚卸し用として引き続きここに残す。
 #[derive(Subcommand)]
 pub(crate) enum CowAction {
-    /// `%LOCALAPPDATA%\harness\data\cow\`配下にある全upper置き場を一覧表示する。
+    /// 全ボリュームの差分層を一覧表示する（D-81で置き場はワークスペースのボリュームごとになった）。
+    /// 各行の状態は`gc`が使うのと同じ判定から引く。
     List,
     /// ACLで実際に拒否された（`STATUS_ACCESS_DENIED`）workspace外書込試行の監査ログ
     /// （`.harness-cow-denied.jsonl`、Phase 4・設計書§19.8）を表示する。境界自体はACLが
@@ -435,6 +443,22 @@ pub(crate) enum CowAction {
         session: Option<String>,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
+    },
+    /// 何も残っていない差分層を回収する（D-82）。
+    ///
+    /// **既定では「空」のものしか消さない。** 実行中のセッション・D-80のレビュー待ち・
+    /// メタが読めないもの・未適用の変更を抱えたものは残し、**残した理由を必ず表示する**。
+    Gc {
+        /// 判定だけ行い、1件も削除しない。
+        #[arg(long)]
+        dry_run: bool,
+        /// **未適用の変更を抱えた差分層も回収対象に含める**（`--older-than`と併用）。
+        /// 実行中・レビュー待ち・判定不能なものは、この指定でも回収しない。
+        #[arg(long)]
+        with_changes: bool,
+        /// `--with-changes`が対象にする最小の経過日数。既定30日。
+        #[arg(long = "older-than", default_value_t = 30)]
+        older_than_days: u64,
     },
 }
 

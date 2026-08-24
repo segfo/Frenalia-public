@@ -38,8 +38,12 @@ struct ApplyReportJson {
 pub(crate) fn cow_session_workspace_root(upper_dir: &Path) -> Option<String> {
     #[cfg(windows)]
     {
+        // 表示・照合用なので`Ok`だけを見る。**GCはこの形で読まないこと**——
+        // 「無い」と「読めない」が潰れると、読めないものを回収してよいと誤判定する
+        // （`workspace_ledger::CowMetaRead`のdoc）。
         harness_sandbox::tier2a::workspace_ledger::read_cow_session_meta(upper_dir)
-            .map(|m| m.workspace_root)
+            .ok()
+            .map(|m| m.workspace_root.clone())
     }
     #[cfg(not(windows))]
     {
@@ -384,6 +388,7 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
             only,
             dangerously_allow,
             adopt_unledgered,
+            keep_upper,
             ..
         } => {
             let report = match fs.apply(&ApplyOptions {
@@ -452,6 +457,19 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
             if has_conflicts_or_blocked {
                 ExitCode::from(4)
             } else {
+                // D-82: **完全に適用し切ったCoW差分層はここで畳む。** 作る側（起動時）と
+                // 消す側が対になっていないと、CoWを既定にしたときの**最も多い終わり方**
+                // （applyして終わる）が1つずつ置き場を残し続ける。台帳は`apply`が
+                // `prune_cow_ledger`で空にするが、実体ファイルは残るため、起動時スイープの
+                // 安価な空判定（台帳も実体も0）には永久に引っかからない。
+                //
+                // 条件は上の`has_conflicts_or_blocked`が偽であること——`unledgered`も
+                // 含まれるので、「upperに実体があるのに適用されなかった」ものが1件でも
+                // あれば畳まない（BUG-066が守っているもの）。加えて実行中でないこと・
+                // D-80のレビュー待ちでないことを`plan_cow_gc`と同じ判定で見る。
+                if !keep_upper {
+                    finish_cow_upper_after_apply(cow_upper_dir.as_deref());
+                }
                 ExitCode::SUCCESS
             }
         }
@@ -585,3 +603,52 @@ pub(crate) fn cow_session_is_live_checked(session_id: &str) -> bool {
 pub(crate) fn cow_session_is_live_checked(_session_id: &str) -> bool {
     false
 }
+
+/// `apply`が1件も残さず適用し切ったCoW差分層を畳む（D-82の回収点1）。
+///
+/// **回収してよいかの判定は`plan_cow_gc`と同じものを使う**——ここで「実行中でないか」
+/// 「レビュー待ちでないか」を書き直すと、条件が2箇所に分かれて片方だけ古くなる
+/// （`bug-pattern-rules` B-13/B-06）。GCが集めた事実の中から、いま適用したセッションの
+/// 1件だけを取り出して同じ規則へ通す。
+///
+/// grace（作りたては見送る）は**ここでは0にする**。人が明示的に`apply`を打った直後であり、
+/// あの猶予が守っている「起動しかけとの競合」はこの経路には無い（実行中かどうかは
+/// 生存マーカーが直接答える）。
+#[cfg(windows)]
+fn finish_cow_upper_after_apply(cow_upper_dir: Option<&Path>) {
+    use harness_sandbox::tier2a::workspace_ledger as wl;
+
+    let Some(upper_dir) = cow_upper_dir else {
+        return;
+    };
+    let Some(session_id) = upper_dir.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let (facts, _unreachable) = wl::collect_cow_session_facts();
+    let Some(fact) = facts.iter().find(|f| f.session_id == session_id) else {
+        return;
+    };
+    let verdicts = wl::plan_cow_gc(std::slice::from_ref(fact), harness_grant_ledger::now_unix_secs(), 0);
+    let Some((_, verdict)) = verdicts.first() else {
+        return;
+    };
+    // 適用直後なので、残す理由は「実行中」「レビュー待ち」「メタが読めない」のいずれか。
+    // **どれも黙って消してよいものではない**ので、理由を出してそのまま残す。
+    if !verdict.collects() {
+        println!(
+            "note: keeping the CoW diff area for {session_id} because {}",
+            verdict.reason()
+        );
+        return;
+    }
+    match harness_sandbox::session_scope::remove_overlay_dir(upper_dir) {
+        Ok(()) => println!("removed the CoW diff area for {session_id} (nothing left in it)"),
+        Err(e) => eprintln!(
+            "warning: applied everything, but could not remove the CoW diff area for \
+             {session_id}: {e}"
+        ),
+    }
+}
+
+#[cfg(not(windows))]
+fn finish_cow_upper_after_apply(_cow_upper_dir: Option<&Path>) {}
