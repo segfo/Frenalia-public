@@ -1,6 +1,6 @@
 //! CoW操作台帳への追記・copy-up・リダイレクト先`OBJECT_ATTRIBUTES`の組み立て。
 //!
-//! upper_dirに版が無いファイルへの書込は、まずworkspaceから copy-up してから
+//! diff_layer_dirに版が無いファイルへの書込は、まずworkspaceから copy-up してから
 //! リダイレクトする。論理削除（tombstone）の集合もここで管理する。
 
 use super::*;
@@ -22,15 +22,15 @@ pub(crate) fn baseline_hash_for(cfg: &Config, ledger_key: &str) -> Option<String
     let hash = if Path::new(ledger_key).is_absolute() {
         store::ext_key(ledger_key)
             .ok()
-            .and_then(|key| store::baseline_hash_and_mirror_ext(&cfg.upper_dir, ledger_key, &key))
+            .and_then(|key| store::baseline_hash_and_mirror_ext(&cfg.diff_layer_dir, ledger_key, &key))
     } else {
-        store::baseline_hash_and_mirror(&cfg.upper_dir, &cfg.workspace_root, ledger_key)
+        store::baseline_hash_and_mirror(&cfg.diff_layer_dir, &cfg.workspace_root, ledger_key)
     };
     guard.insert(ledger_key.to_string(), hash.clone());
     hash
 }
 
-/// 台帳（`<upper_dir>/.harness-cow-ops.jsonl`）へ1エントリを追記し、メモリ上の削除済み集合も
+/// 台帳（`<diff_layer_dir>/.harness-cow-ops.jsonl`）へ1エントリを追記し、メモリ上の削除済み集合も
 /// 更新する。追記の実体は`store::append_entry`（host側と共有、設計書§19.2「追記の並行性」）。
 pub(crate) fn append_ledger_entry(
     cfg: &Config,
@@ -38,7 +38,7 @@ pub(crate) fn append_ledger_entry(
     rel: &str,
     baseline_hash: Option<String>,
 ) {
-    store::append_entry(&cfg.upper_dir, op, rel, baseline_hash);
+    store::append_entry(&cfg.diff_layer_dir, op, rel, baseline_hash);
     let deleted = deleted_paths_state();
     let mut g = deleted.lock().unwrap();
     match op {
@@ -53,18 +53,18 @@ pub(crate) fn append_ledger_entry(
 
 /// copy-up（設計書§18の最小サブセット、一時ファイル+原子renameは省略——初期実装として
 /// 単純上書きコピーを採用する。並行copy-upの競合は許容し、後勝ちで構わない
-/// スコープに留める）。実際にupperへコピー/新規作成した瞬間（冪等チェックを通過して実際に
+/// スコープに留める）。実際に差分層へコピー/新規作成した瞬間（冪等チェックを通過して実際に
 /// 作業した瞬間）にCreate/Modifyを1件台帳へ追記する（設計書§19.6）。
-pub(crate) fn copy_up(cfg: &Config, rel: &str, workspace_path: &Path, upper_path: &Path) {
-    if upper_path.exists() {
+pub(crate) fn copy_up(cfg: &Config, rel: &str, workspace_path: &Path, diff_layer_path: &Path) {
+    if diff_layer_path.exists() {
         return;
     }
     let baseline_hash = baseline_hash_for(cfg, rel);
-    if let Some(parent) = upper_path.parent() {
+    if let Some(parent) = diff_layer_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if workspace_path.is_file() {
-        let _ = std::fs::copy(workspace_path, upper_path);
+        let _ = std::fs::copy(workspace_path, diff_layer_path);
     }
     let op = if baseline_hash.is_some() {
         ChangeOp::Modify
@@ -74,21 +74,21 @@ pub(crate) fn copy_up(cfg: &Config, rel: &str, workspace_path: &Path, upper_path
     append_ledger_entry(cfg, op, rel, baseline_hash);
 }
 
-/// upper配下の実体へ**直接**書かれた1件（＝`copy_up`を経由しない書込）を、workspace側と
+/// 差分層配下の実体へ**直接**書かれた1件（＝`copy_up`を経由しない書込）を、workspace側と
 /// 同じ台帳キーで記録する（[BUG-066](../../../docs/bugs/BUG-066.md)）。
 ///
-/// upper_dirはサンドボックス子へRW付与されており、`<upper>\<rel>`という綴りで書けば
-/// ACLも通るしフックの誘導も要らない。実際にモデルが`Set-Content <upper>\merge-demo.txt`を
-/// 実行し、upperには編集後の内容があるのに台帳が空＝`changes`/`apply`から見えない状態になった。
+/// diff_layer_dirはサンドボックス子へRW付与されており、`<差分層>\<rel>`という綴りで書けば
+/// ACLも通るしフックの誘導も要らない。実際にモデルが`Set-Content <差分層>\merge-demo.txt`を
+/// 実行し、差分層には編集後の内容があるのに台帳が空＝`changes`/`apply`から見えない状態になった。
 /// 同じ実ファイルを指す2通りの綴りなのだから、**同じ台帳キーの操作として記録する**。
 /// baselineは`baseline_hash_for`が解決する（台帳に既存エントリがあればそれ、無ければ
 /// 実workspace側の現在内容＝セッション開始時点の姿。workspaceはROなので後から変わらない）。
 ///
-/// 同一パスの2回目以降はプロセス内の集合で抑止する（`copy_up`の`upper_path.exists()`と同じ
+/// 同一パスの2回目以降はプロセス内の集合で抑止する（`copy_up`の`diff_layer_path.exists()`と同じ
 /// 役割）。兄弟プロセスや`copy_up`との重複追記は起こり得るが、`replay`はパス単位で畳むので
 /// 実害は無い（初回のbaselineが権威という規律も`baseline_hash_for`側で保たれる）。
-pub(crate) fn record_upper_alias_write(cfg: &Config, rel: &str) {
-    if !upper_alias_first_touch(rel) {
+pub(crate) fn record_diff_layer_alias_write(cfg: &Config, rel: &str) {
+    if !diff_layer_alias_first_touch(rel) {
         return;
     }
     let baseline_hash = baseline_hash_for(cfg, rel);
@@ -103,7 +103,7 @@ pub(crate) fn record_upper_alias_write(cfg: &Config, rel: &str) {
 // `copy_up`（`std::fs::copy`/`create_dir_all`）はWin32のCreateFileW等を経由するため、
 // パッチ済みの`ntdll!NtCreateFile`/`NtOpenFile`を通って自分自身のフック関数へ再入する
 // （このDLLだけでなくプロセス内の全呼び出し元がパッチ済みの実体を叩くため、フック関数の内部から
-// 発行したファイルI/Oも同じフック関数へ戻ってくる）。`classify`はupper_dir配下を除外するため
+// 発行したファイルI/Oも同じフック関数へ戻ってくる）。`classify`はdiff_layer_dir配下を除外するため
 // 単純な無限ループにはならない設計だったが、実機検証でスタックオーバーフローを確認した
 // （再帰の呼び出し系列は未特定）。分類・copy-upロジックはスレッドごとに一度だけ働けばよく、
 // 再入時は素通し（元のcopy-up呼び出しが要求した実パスをそのまま使わせる）が正しい振る舞いのため、
@@ -134,7 +134,7 @@ impl Drop for ReentryGuard {
     }
 }
 
-/// `upper_path`（DOS形式の絶対パス）を、NT名前空間で有効な`\??\`プレフィックス付きUTF-16
+/// `diff_layer_path`（DOS形式の絶対パス）を、NT名前空間で有効な`\??\`プレフィックス付きUTF-16
 /// （NUL終端込み）へ変換する。`object_attributes_path`は読み取り時に`\??\`/`\\?\`を剥がして
 /// DOS形式へ正規化するが、書き戻すNT-levelの`ObjectName`は逆にNTデバイス名前空間の完全パス
 /// （`\??\`プレフィックス）が必須——プレフィックス無しのDOSパスをそのまま渡すと
@@ -150,62 +150,62 @@ impl Drop for ReentryGuard {
 /// （`NtCreateFile`が見るのはこちら）は`/`を区切りとして認識せず不正な名前として拒否する
 /// （実機E2Eで`STATUS_OBJECT_NAME_INVALID`を確認）。ここで一括正規化することで、
 /// 呼び出し元がどう`PathBuf`を組み立てても安全にする。
-pub(crate) fn nt_path_wide(upper_path: &Path) -> Vec<u16> {
-    let normalized = upper_path.to_string_lossy().replace('/', "\\");
+pub(crate) fn nt_path_wide(diff_layer_path: &Path) -> Vec<u16> {
+    let normalized = diff_layer_path.to_string_lossy().replace('/', "\\");
     let nt_path = format!(r"\??\{normalized}");
     nt_path.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// `object_attributes`をupper側の完全パス（`upper_wide`、`nt_path_wide`済み）へ向け直した
+/// `object_attributes`を差分層側の完全パス（`diff_layer_wide`、`nt_path_wide`済み）へ向け直した
 /// `OBJECT_ATTRIBUTES`/`UNICODE_STRING`のペアを組み立てる。呼び出し元は両方を同じスコープで
-/// 保持し（`UNICODE_STRING.Buffer`が`upper_wide`を指すため`upper_wide`自体も生存させること）、
+/// 保持し（`UNICODE_STRING.Buffer`が`diff_layer_wide`を指すため`diff_layer_wide`自体も生存させること）、
 /// `oa.ObjectName = &mut name;`してから使うこと（Rustの借用は関数境界を越えて返せないため）。
 /// 書込リダイレクト・読み取りリダイレクト（read-through）・属性照会リダイレクトの4箇所で
 /// 同じ組み立てが必要なため一本化した（設計書§19.6/§19.7）。
 pub(crate) unsafe fn build_redirected_oa(
     object_attributes: *const OBJECT_ATTRIBUTES,
-    upper_wide: &[u16],
+    diff_layer_wide: &[u16],
 ) -> (
     OBJECT_ATTRIBUTES,
     windows::Win32::Foundation::UNICODE_STRING,
 ) {
     let mut redirected_oa = unsafe { *object_attributes };
     let redirected_name = windows::Win32::Foundation::UNICODE_STRING {
-        Length: ((upper_wide.len() - 1) * 2) as u16,
-        MaximumLength: (upper_wide.len() * 2) as u16,
-        Buffer: windows::core::PWSTR(upper_wide.as_ptr() as *mut u16),
+        Length: ((diff_layer_wide.len() - 1) * 2) as u16,
+        MaximumLength: (diff_layer_wide.len() * 2) as u16,
+        Buffer: windows::core::PWSTR(diff_layer_wide.as_ptr() as *mut u16),
     };
     redirected_oa.RootDirectory = HANDLE::default();
     (redirected_oa, redirected_name)
 }
 
-/// `rel`（workspace相対）のupper側実体パスを返す（存在すれば）。読み取りread-through判定
-/// （設計書§19.3/§19.7「削除済み＞upper＞workspace」の中間段）に使う。
-pub(crate) fn upper_version_path(cfg: &Config, rel: &Path) -> Option<PathBuf> {
-    let upper_path = cfg.upper_dir.join(rel);
-    if upper_path.is_file() {
-        Some(upper_path)
+/// `rel`（workspace相対）の差分層側実体パスを返す（存在すれば）。読み取りread-through判定
+/// （設計書§19.3/§19.7「削除済み＞差分層＞workspace」の中間段）に使う。
+pub(crate) fn diff_layer_version_path(cfg: &Config, rel: &Path) -> Option<PathBuf> {
+    let diff_layer_path = cfg.diff_layer_dir.join(rel);
+    if diff_layer_path.is_file() {
+        Some(diff_layer_path)
     } else {
         None
     }
 }
 
-/// ディレクトリの読み取りopen向けの read-through（BUG-128）。upper 側に**ディレクトリとして**
-/// 実体があり、かつ workspace 側に無いとき、その upper ディレクトリのパスを返す。
+/// ディレクトリの読み取りopen向けの read-through（BUG-128）。差分層 側に**ディレクトリとして**
+/// 実体があり、かつ workspace 側に無いとき、その 差分層 ディレクトリのパスを返す。
 ///
-/// **なぜ要るか**: git/MSYS は、このセッションで新規作成した upper だけに在るディレクトリ
+/// **なぜ要るか**: git/MSYS は、このセッションで新規作成した 差分層 だけに在るディレクトリ
 /// （例: `.github`・`.github/workflows`）を open して pathspec を解決したり中身を列挙したりする。
 /// これをリダイレクトしないと、読取専用の workspace 側（そこには存在しない）を開こうとして
 /// `STATUS_ACCESS_DENIED`／`OBJECT_PATH_NOT_FOUND` になり、`git add` が対象を見つけられず何も
 /// ステージしない（実機ログで確認、`docs/bugs/BUG-128.md`）。
 ///
 /// **workspace 側にも在るディレクトリは対象外（`None`）＝従来どおり素通し**。素通しでも open は
-/// 成功し、列挙は `try_merged_dir_query` が upper をマージするので、見え方は変わらない。ここで
-/// upper へ誘導するのは「upper にしか無い」場合だけに限る（既存挙動を変えないため）。
-pub(crate) fn upper_only_dir_path(cfg: &Config, rel: &Path) -> Option<PathBuf> {
-    let upper_path = cfg.upper_dir.join(rel);
-    if upper_path.is_dir() && !cfg.workspace_root.join(rel).is_dir() {
-        Some(upper_path)
+/// 成功し、列挙は `try_merged_dir_query` が 差分層 をマージするので、見え方は変わらない。ここで
+/// 差分層 へ誘導するのは「差分層 にしか無い」場合だけに限る（既存挙動を変えないため）。
+pub(crate) fn diff_layer_only_dir_path(cfg: &Config, rel: &Path) -> Option<PathBuf> {
+    let diff_layer_path = cfg.diff_layer_dir.join(rel);
+    if diff_layer_path.is_dir() && !cfg.workspace_root.join(rel).is_dir() {
+        Some(diff_layer_path)
     } else {
         None
     }
@@ -217,7 +217,7 @@ pub(crate) fn upper_only_dir_path(cfg: &Config, rel: &Path) -> Option<PathBuf> {
 /// 次回の呼び出しまで無視して安全に据え置ける——サイズが前回と変わっていなければファイルI/O
 /// すらしないため、フックのホットパスでのコストは兄弟プロセスが実際に書いた場合のみ発生する。
 pub(crate) fn refresh_deleted_set(cfg: &Config) {
-    let ledger_path = cfg.upper_dir.join(COW_OPS_LEDGER_FILENAME);
+    let ledger_path = cfg.diff_layer_dir.join(COW_OPS_LEDGER_FILENAME);
     let mut offset_guard = ledger_read_offset().lock().unwrap();
     let Ok(contents) = std::fs::read(&ledger_path) else {
         return;

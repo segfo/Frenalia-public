@@ -85,13 +85,13 @@ pub(crate) fn simple_glob_match(pattern: &str, text: &str) -> bool {
 
 /// `--staged`/`--sandbox tier2a-cow`いずれかが有効なときの唯一のオーバーレイ実体。`dir`は絶対パス
 /// （`--staged`ならworkspace内`<workspace_root>/<sandbox_dir>`、`--sandbox tier2a-cow`ならworkspace外の
-/// CoW upperディレクトリ）。
+/// CoW 差分層ディレクトリ）。
 pub(crate) struct OverlayBackend {
     pub(crate) dir: PathBuf,
     pub(crate) jail: WorkspaceJail,
     /// 台帳に無い実体がオーバーレイに現れ得るか（[`effective_changes`]が走査するか）。
     ///
-    /// `true`になるのは**オーバーレイがworkspaceの外にある場合＝`--sandbox tier2a-cow`のupper**だけである。
+    /// `true`になるのは**オーバーレイがworkspaceの外にある場合＝`--sandbox tier2a-cow`の差分層**だけである。
     /// そこはサンドボックス子へRW付与されていて、しかもworkspaceのビューからは見えないので、
     /// 子が直接置いたファイルを取りこぼすと黙って失われる（[BUG-066](../../docs/bugs/BUG-066.md)）。
     ///
@@ -121,9 +121,9 @@ pub struct ChangeEntry {
     /// **オーバーレイに実体はあるが操作台帳に記録が無い**エントリ
     /// （[BUG-066](../../docs/bugs/BUG-066.md)）。
     ///
-    /// CoW upperディレクトリはサンドボックス子へRW付与されているので、子は台帳を経由せずに
-    /// 直接ファイルを置ける（実際モデルが`run_shell`から`Set-Content <upper>\merge-demo.txt`と
-    /// 書いた）。台帳だけを見ていると**upperに存在する変更が`changes`から消え、`discard`で
+    /// CoW 差分層ディレクトリはサンドボックス子へRW付与されているので、子は台帳を経由せずに
+    /// 直接ファイルを置ける（実際モデルが`run_shell`から`Set-Content <差分層>\merge-demo.txt`と
+    /// 書いた）。台帳だけを見ていると**差分層に存在する変更が`changes`から消え、`discard`で
     /// 黙って失われる**ため、実体の走査結果と突き合わせてここに立てる。
     ///
     /// `baseline_hash`は`op`が`Modify`のとき**不明**である（セッション開始時点の姿を記録した
@@ -193,7 +193,7 @@ impl ApplyReport {
 }
 
 /// 書込リダイレクト・read-through・操作台帳・tombstoneを仲介するオーバーレイFS。
-/// `overlay`が`None`（純live、`StagingConfig::default()`かつ`cow_upper_dir=None`）なら、
+/// `overlay`が`None`（純live、`StagingConfig::default()`かつ`cow_diff_layer_dir=None`）なら、
 /// 内部の`WorkspaceJail`をそのまま素通しする（M9までの既存挙動と等価）。
 pub struct SandboxFs {
     pub(crate) jail: WorkspaceJail,
@@ -208,8 +208,8 @@ impl SandboxFs {
     }
 
     /// `read.allow`/`read.allow_descend`/`read.deny`/`read.deny_descend`（M11）を
-    /// 反映した`SandboxFs`を開く。`--sandbox tier2a-cow`のCoWオーバーレイは使わない（`cow_upper_dir=None`
-    /// 相当）、`ToolCtx.cow_upper_dir`を運べる呼び出し元は`open_with_cow`を使うこと。
+    /// 反映した`SandboxFs`を開く。`--sandbox tier2a-cow`のCoWオーバーレイは使わない（`cow_diff_layer_dir=None`
+    /// 相当）、`ToolCtx.cow_diff_layer_dir`を運べる呼び出し元は`open_with_cow`を使うこと。
     pub fn open_with_read_scope(
         workspace_root: &Path,
         staging: &StagingConfig,
@@ -218,9 +218,9 @@ impl SandboxFs {
         Self::open_with_cow(workspace_root, staging, read_scope_config, None)
     }
 
-    /// `ToolCtx.cow_upper_dir`をそのまま渡して`SandboxFs`を開く（host内蔵ツール
+    /// `ToolCtx.cow_diff_layer_dir`をそのまま渡して`SandboxFs`を開く（host内蔵ツール
     /// write_file/edit_file/read_file/grep/glob向け）。`Some`なら、workspace内相対パスへの
-    /// 書込/読取/削除/列挙はRedirector DLLと同じupperディレクトリ・同じ操作台帳
+    /// 書込/読取/削除/列挙はRedirector DLLと同じ差分層ディレクトリ・同じ操作台帳
     /// （`.harness-cow-ops.jsonl`）を経由する。`None`かつ`staging.mode`が`Staged`/
     /// `WorkspaceCommit`なら、`staging.sandbox_dir`（workspace相対）をworkspace内オーバーレイ
     /// として同じ経路で使う（`--sandbox tier2a-cow`と`--staged`はCLI起動時に排他化されているため、両方
@@ -230,10 +230,10 @@ impl SandboxFs {
         workspace_root: &Path,
         staging: &StagingConfig,
         read_scope_config: &ReadScopeConfig,
-        cow_upper_dir: Option<&Path>,
+        cow_diff_layer_dir: Option<&Path>,
     ) -> Result<Self, SandboxError> {
         let jail = WorkspaceJail::open(workspace_root)?;
-        let overlay_dir: Option<PathBuf> = match cow_upper_dir {
+        let overlay_dir: Option<PathBuf> = match cow_diff_layer_dir {
             Some(dir) => Some(dir.to_path_buf()),
             None => match staging.mode {
                 StagingMode::Live => None,
@@ -411,7 +411,7 @@ impl SandboxFs {
             .collect();
         if let Some(overlay) = &self.overlay {
             // 台帳に載っていないオーバーレイ実体もここへ含める（BUG-066）。`read_to_string`は
-            // 元々「upperに実体があればそちら」を返すので、列挙にだけ出てこないと
+            // 元々「差分層に実体があればそちら」を返すので、列挙にだけ出てこないと
             // 「grepでは見つからないのにread_fileでは読める」というちぐはぐが残る。
             for e in effective_changes(&self.jail, overlay) {
                 let c = e.change;
@@ -500,7 +500,7 @@ impl SandboxFs {
     pub fn finalize_resolved(&self, path: &str, content: &str) -> Result<(), SandboxError> {
         self.jail.write_string(path, content)?;
         if let Some(overlay) = &self.overlay {
-            let overlay_abs = store::upper_path_for(&overlay.dir, path);
+            let overlay_abs = store::diff_layer_path_for(&overlay.dir, path);
             let _ = std::fs::remove_file(&overlay_abs);
             store::prune_ledger(&overlay.dir, std::slice::from_ref(&path.to_string()));
         }
@@ -534,7 +534,7 @@ struct EffectiveChange {
 /// `apply_overlay_changes`（反映する）・`walk_files`（列挙する）が同じ答えを使う。
 ///
 /// 内訳は「操作台帳の再生」∪「オーバーレイ実体の走査のうち台帳に無いもの」である
-/// （走査するのは`--sandbox tier2a-cow`のupperだけ。理由は[`OverlayBackend::scan_for_unledgered`]）。
+/// （走査するのは`--sandbox tier2a-cow`の差分層だけ。理由は[`OverlayBackend::scan_for_unledgered`]）。
 /// **なぜ台帳だけでは足りないか**（[BUG-066](../../docs/bugs/BUG-066.md)）: オーバーレイ
 /// ディレクトリはサンドボックス子へRW付与されているので、子は`copy_up`もフックも経由せず
 /// 直接ファイルを置ける。台帳だけを正本にすると、そうして置かれたファイルは
@@ -566,7 +566,7 @@ fn effective_changes(jail: &WorkspaceJail, overlay: &OverlayBackend) -> Vec<Effe
         return out;
     }
 
-    for key in store::scan_upper_content_files(&overlay.dir) {
+    for key in store::scan_diff_layer_content_files(&overlay.dir) {
         if known.contains(&store::ledger_key_match_form(&key)) {
             continue;
         }
@@ -611,7 +611,7 @@ fn effective_changes(jail: &WorkspaceJail, overlay: &OverlayBackend) -> Vec<Effe
 ///
 /// **workspace側・overlay側とも、必ず`WorkspaceJail`（cap-stdの`Dir`からの相対open＝
 /// openat相当）を経由する。** 生の`std::fs`とパス結合でこれを行っていたのが
-/// [BUG-062](../../docs/bugs/BUG-062.md)——操作台帳`.harness-cow-ops.jsonl`はupper_dir配下に
+/// [BUG-062](../../docs/bugs/BUG-062.md)——操作台帳`.harness-cow-ops.jsonl`はdiff_layer_dir配下に
 /// あってサンドボックス子へ書込可能なので、`c.path`は**敵対者が任意に決められる文字列**である。
 /// 検証せずに`workspace_root.join(&c.path)`すると、`..`ひとつでworkspace外へユーザ権限で
 /// 書けてしまい、`is_config_injection_path`（前置詞一致）も`x/../.git/config`で素通りした。
@@ -771,7 +771,7 @@ fn apply_workspace_entry(
             }
             let content = overlay.jail.read_bytes(rel)?;
             jail.write_bytes(rel, &content)?;
-            // overlay側の実体を消しておかないと、Redirectorのcopy_upが「既にupperにある＝
+            // overlay側の実体を消しておかないと、Redirectorのcopy_upが「既に差分層にある＝
             // このセッションで一度触った」と誤認して、次の変更を台帳へ記録しなくなる
             // （BUG-034）。ベストエフォート、失敗してもcommit自体は成功扱いにする。
             let _ = overlay.jail.remove_file(rel);
@@ -1144,20 +1144,20 @@ mod tests {
         );
     }
 
-    /// BUG-062の再現用: 「サンドボックス子が`<upper>/.harness-cow-ops.jsonl`へ直接書いた」
-    /// 状況を作る。upper_dirはAppContainer子へ`grant_ace_inheritable_rw`で渡っているので
+    /// BUG-062の再現用: 「サンドボックス子が`<差分層>/.harness-cow-ops.jsonl`へ直接書いた」
+    /// 状況を作る。diff_layer_dirはAppContainer子へ`grant_ace_inheritable_rw`で渡っているので
     /// （`win_appcontainer/preflight.rs`）、台帳の内容はP-01上ハーネスが信用してよい入力ではない。
     ///
     /// workspace_rootを`<tempdir>/root`に置くのは、`..`による脱出先を**同じtempdir内**に
     /// 収めるため（%TEMP%直下へ書き出すテストにしない）。
     fn tampered_ledger_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
         let ws = tempfile::tempdir().unwrap();
-        let upper_tmp = tempfile::tempdir().unwrap();
+        let diff_layer_tmp = tempfile::tempdir().unwrap();
         let workspace_root = ws.path().join("root");
-        let upper_dir = upper_tmp.path().join("upper");
+        let diff_layer_dir = diff_layer_tmp.path().join("diff_layer");
         std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&upper_dir).unwrap();
-        (ws, upper_tmp, workspace_root, upper_dir)
+        std::fs::create_dir_all(&diff_layer_dir).unwrap();
+        (ws, diff_layer_tmp, workspace_root, diff_layer_dir)
     }
 
     /// **BUG-062 (a)**: 台帳の相対パスに`..`が入っていると、`apply`がworkspace_rootの外へ
@@ -1165,16 +1165,16 @@ mod tests {
     /// 通らなければならない。
     #[test]
     fn apply_refuses_ledger_paths_that_escape_the_workspace_root() {
-        let (ws, upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
-        // 敵対者がupper側に置いた実体。`upper_dir.join("../escape.txt")`がこれを指す。
-        std::fs::write(upper_tmp.path().join("escape.txt"), "pwned").unwrap();
-        store::append_entry(&upper_dir, ChangeOp::Create, "../escape.txt", None);
+        let (ws, diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
+        // 敵対者が差分層側に置いた実体。`diff_layer_dir.join("../escape.txt")`がこれを指す。
+        std::fs::write(diff_layer_tmp.path().join("escape.txt"), "pwned").unwrap();
+        store::append_entry(&diff_layer_dir, ChangeOp::Create, "../escape.txt", None);
 
         let fs = SandboxFs::open_with_cow(
             &workspace_root,
             &StagingConfig::default(),
             &ReadScopeConfig::default(),
-            Some(&upper_dir),
+            Some(&diff_layer_dir),
         )
         .unwrap();
         let report = fs
@@ -1201,21 +1201,21 @@ mod tests {
     /// 素通りする。実FS上は`.git/config`へ着地するので、設定注入がapply経路から通る。
     #[test]
     fn apply_hard_deny_is_not_bypassable_by_a_parent_dir_segment() {
-        let (_ws, _upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
-        // `upper_dir.join("x/../.git/config")`＝`<upper>/.git/config`。
-        std::fs::create_dir_all(upper_dir.join(".git")).unwrap();
+        let (_ws, _diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
+        // `diff_layer_dir.join("x/../.git/config")`＝`<diff_layer>/.git/config`。
+        std::fs::create_dir_all(diff_layer_dir.join(".git")).unwrap();
         std::fs::write(
-            upper_dir.join(".git/config"),
+            diff_layer_dir.join(".git/config"),
             "[core]\n\thooksPath = /tmp/evil\n",
         )
         .unwrap();
-        store::append_entry(&upper_dir, ChangeOp::Create, "x/../.git/config", None);
+        store::append_entry(&diff_layer_dir, ChangeOp::Create, "x/../.git/config", None);
 
         let fs = SandboxFs::open_with_cow(
             &workspace_root,
             &StagingConfig::default(),
             &ReadScopeConfig::default(),
-            Some(&upper_dir),
+            Some(&diff_layer_dir),
         )
         .unwrap();
         let report = fs
@@ -1237,8 +1237,8 @@ mod tests {
         );
     }
 
-    /// **BUG-062 (c) / 設計書§17（Reparse Point対策）**: upper側に置かれたjunctionを
-    /// `apply`が辿ってはいけない。辿ると、ユーザ権限で走る信頼側が**upperの外の任意の
+    /// **BUG-062 (c) / 設計書§17（Reparse Point対策）**: 差分層側に置かれたjunctionを
+    /// `apply`が辿ってはいけない。辿ると、ユーザ権限で走る信頼側が**差分層の外の任意の
     /// ファイル**を読み、その内容をworkspace（＝サンドボックスから読める場所）へ落とす。
     ///
     /// junctionの作成には管理者権限もdeveloper modeも要らない（symlinkと違い
@@ -1247,13 +1247,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn apply_does_not_follow_a_junction_planted_in_the_overlay() {
-        let (_ws, upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
-        let secret_dir = upper_tmp.path().join("secrets");
+        let (_ws, diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
+        let secret_dir = diff_layer_tmp.path().join("secrets");
         std::fs::create_dir_all(&secret_dir).unwrap();
         std::fs::write(secret_dir.join("id_rsa"), "TOP-SECRET-KEY").unwrap();
 
-        // upper_dir/link -> upper_tmp/secrets（upperの外）へのjunction。
-        let link = upper_dir.join("link");
+        // diff_layer_dir/link -> diff_layer_tmp/secrets（差分層の外）へのjunction。
+        let link = diff_layer_dir.join("link");
         let status = std::process::Command::new("cmd")
             .args([
                 "/c",
@@ -1278,13 +1278,13 @@ mod tests {
             "the junction itself must resolve, otherwise this test proves nothing"
         );
 
-        store::append_entry(&upper_dir, ChangeOp::Create, "link/id_rsa", None);
+        store::append_entry(&diff_layer_dir, ChangeOp::Create, "link/id_rsa", None);
 
         let fs = SandboxFs::open_with_cow(
             &workspace_root,
             &StagingConfig::default(),
             &ReadScopeConfig::default(),
-            Some(&upper_dir),
+            Some(&diff_layer_dir),
         )
         .unwrap();
         let report = fs
@@ -1342,10 +1342,10 @@ mod tests {
         let mut landed: Vec<(&str, String)> = Vec::new();
 
         for form in forms {
-            let (_ws, _upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
-            // upper側に実体を置く。置けない表記（OSが受け付けない名前）はその時点で
+            let (_ws, _diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
+            // 差分層側に実体を置く。置けない表記（OSが受け付けない名前）はその時点で
             // 迂回にならないので、作れなかったことを記録して次へ進む。
-            let src = upper_dir.join(form);
+            let src = diff_layer_dir.join(form);
             if let Some(parent) = src.parent() {
                 if std::fs::create_dir_all(parent).is_err() {
                     println!("MEASUREMENT: {form:<20} -> could not create the overlay source");
@@ -1356,13 +1356,13 @@ mod tests {
                 println!("MEASUREMENT: {form:<20} -> could not write the overlay source");
                 continue;
             }
-            store::append_entry(&upper_dir, ChangeOp::Create, form, None);
+            store::append_entry(&diff_layer_dir, ChangeOp::Create, form, None);
 
             let fs = SandboxFs::open_with_cow(
                 &workspace_root,
                 &StagingConfig::default(),
                 &ReadScopeConfig::default(),
-                Some(&upper_dir),
+                Some(&diff_layer_dir),
             )
             .unwrap();
             let report = fs
@@ -1476,7 +1476,7 @@ mod tests {
             }
         }
 
-        let (_ws_tmp, upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
+        let (_ws_tmp, diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
 
         // 1) 実workspaceに正当なリポジトリ（master@c0＝READMEのみ）を種付け。
         std::fs::write(workspace_root.join("README.md"), "seed\n").unwrap();
@@ -1493,7 +1493,7 @@ mod tests {
 
         // 2) workspaceのコピー側で注入コミットを作る（本物の git、サンドボックス外）。
         //    実workspaceの`.git`は一切触らない——迂回ペイロードは「外から台帳経由で運ぶ」。
-        let build = upper_tmp.path().join("build");
+        let build = diff_layer_tmp.path().join("build");
         copy_dir_all(&workspace_root, &build);
         std::fs::create_dir_all(build.join(".github").join("workflows")).unwrap();
         std::fs::write(build.join(".github").join("workflows").join("x.yml"), INJECTED).unwrap();
@@ -1503,7 +1503,7 @@ mod tests {
         let build_ref_bytes =
             std::fs::read(build.join(".git").join("refs").join("heads").join("master")).unwrap();
 
-        // 3) 差分オブジェクト＋ref移動＋ワークツリー実体を upper へ置き、台帳へ載せる
+        // 3) 差分オブジェクト＋ref移動＋ワークツリー実体を 差分層 へ置き、台帳へ載せる
         //    （Redirector の copy-up が記録したであろう形を、本物のオブジェクトで再現する）。
         let loose_after = loose_objects(&build.join(".git").join("objects"));
         let new_objects: Vec<String> =
@@ -1514,39 +1514,39 @@ mod tests {
         );
         for rel in &new_objects {
             let src = build.join(".git").join("objects").join(rel);
-            let dst = upper_dir.join(".git").join("objects").join(rel);
+            let dst = diff_layer_dir.join(".git").join("objects").join(rel);
             std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
             std::fs::copy(&src, &dst).unwrap();
-            store::append_entry(&upper_dir, ChangeOp::Create, &format!(".git/objects/{rel}"), None);
+            store::append_entry(&diff_layer_dir, ChangeOp::Create, &format!(".git/objects/{rel}"), None);
         }
         // ブランチ移動（Modify。baseline＝実workspaceの現在の master 内容＝c0）。
-        std::fs::create_dir_all(upper_dir.join(".git").join("refs").join("heads")).unwrap();
+        std::fs::create_dir_all(diff_layer_dir.join(".git").join("refs").join("heads")).unwrap();
         std::fs::write(
-            upper_dir.join(".git").join("refs").join("heads").join("master"),
+            diff_layer_dir.join(".git").join("refs").join("heads").join("master"),
             &build_ref_bytes,
         )
         .unwrap();
         store::append_entry(
-            &upper_dir,
+            &diff_layer_dir,
             ChangeOp::Modify,
             ".git/refs/heads/master",
             Some(harness_change_ledger::hash_bytes(&c0_ref_bytes)),
         );
         // ワークツリー実体（Create。これが拒否側の対照——apply で hard-deny されねばならない）。
-        std::fs::create_dir_all(upper_dir.join(".github").join("workflows")).unwrap();
+        std::fs::create_dir_all(diff_layer_dir.join(".github").join("workflows")).unwrap();
         std::fs::write(
-            upper_dir.join(".github").join("workflows").join("x.yml"),
+            diff_layer_dir.join(".github").join("workflows").join("x.yml"),
             INJECTED,
         )
         .unwrap();
-        store::append_entry(&upper_dir, ChangeOp::Create, ".github/workflows/x.yml", None);
+        store::append_entry(&diff_layer_dir, ChangeOp::Create, ".github/workflows/x.yml", None);
 
         // 4) apply。
         let fs = SandboxFs::open_with_cow(
             &workspace_root,
             &StagingConfig::default(),
             &ReadScopeConfig::default(),
-            Some(&upper_dir),
+            Some(&diff_layer_dir),
         )
         .unwrap();
         let report = fs
@@ -1614,15 +1614,15 @@ mod tests {
     /// **消えてはいけない**。理由付きで見せる（D-43「失敗を隠さない」）。
     #[test]
     fn change_set_marks_malformed_paths_instead_of_hiding_them() {
-        let (_ws, _upper_tmp, workspace_root, upper_dir) = tampered_ledger_fixture();
-        store::append_entry(&upper_dir, ChangeOp::Create, "../escape.txt", None);
-        store::append_entry(&upper_dir, ChangeOp::Create, "ok.txt", None);
+        let (_ws, _diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
+        store::append_entry(&diff_layer_dir, ChangeOp::Create, "../escape.txt", None);
+        store::append_entry(&diff_layer_dir, ChangeOp::Create, "ok.txt", None);
 
         let fs = SandboxFs::open_with_cow(
             &workspace_root,
             &StagingConfig::default(),
             &ReadScopeConfig::default(),
-            Some(&upper_dir),
+            Some(&diff_layer_dir),
         )
         .unwrap();
         let changes = fs.change_set().unwrap();
@@ -1652,37 +1652,37 @@ mod tests {
         assert!(!dir.path().join(".harness/sandbox/s1").exists());
     }
 
-    fn cow_fs(workspace_root: &Path, upper_dir: &Path) -> SandboxFs {
+    fn cow_fs(workspace_root: &Path, diff_layer_dir: &Path) -> SandboxFs {
         SandboxFs::open_with_cow(
             workspace_root,
             &StagingConfig::default(),
             &ReadScopeConfig::default(),
-            Some(upper_dir),
+            Some(diff_layer_dir),
         )
         .unwrap()
     }
 
-    // ---- BUG-066: 操作台帳を経由せずupperへ直接置かれたファイル ----
+    // ---- BUG-066: 操作台帳を経由せず差分層へ直接置かれたファイル ----
     //
-    // 実機ではサンドボックス子プロセスが`Set-Content <upper>\x.txt`で作る状況（モデルが実際に
-    // やったのがこれ）。ここでは「台帳を通らずにupperへ実体が現れた」という**結果だけ**を
+    // 実機ではサンドボックス子プロセスが`Set-Content <差分層>\x.txt`で作る状況（モデルが実際に
+    // やったのがこれ）。ここでは「台帳を通らずに差分層へ実体が現れた」という**結果だけ**を
     // `std::fs::write`で再現する——Redirector DLLが注入されていようが回避されていようが、
     // **host側の突き合わせだけで成立する**ことを固定したいため。
 
-    fn write_directly_into_upper(upper: &Path, rel: &str, content: &str) {
-        let target = upper.join(rel);
+    fn write_directly_into_diff_layer(diff_layer: &Path, rel: &str, content: &str) {
+        let target = diff_layer.join(rel);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(target, content).unwrap();
     }
 
-    /// 台帳に記録が無いupper実体も`changes`に現れる（`unledgered`印付き）。これが無いと、
-    /// upperには在るのに「変更なし」と表示され`discard`で黙って消える。
+    /// 台帳に記録が無い差分層実体も`changes`に現れる（`unledgered`印付き）。これが無いと、
+    /// 差分層には在るのに「変更なし」と表示され`discard`で黙って消える。
     #[test]
-    fn unledgered_upper_files_show_up_in_the_change_set() {
+    fn unledgered_diff_layer_files_show_up_in_the_change_set() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
-        write_directly_into_upper(upper.path(), "sub/direct.txt", "by the agent");
+        let diff_layer = tempfile::tempdir().unwrap();
+        let fs = cow_fs(ws.path(), diff_layer.path());
+        write_directly_into_diff_layer(diff_layer.path(), "sub/direct.txt", "by the agent");
 
         let changes = fs.change_set().unwrap();
 
@@ -1701,9 +1701,9 @@ mod tests {
     #[test]
     fn unledgered_new_file_is_applied_without_an_extra_flag() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
-        write_directly_into_upper(upper.path(), "direct.txt", "by the agent");
+        let diff_layer = tempfile::tempdir().unwrap();
+        let fs = cow_fs(ws.path(), diff_layer.path());
+        write_directly_into_diff_layer(diff_layer.path(), "direct.txt", "by the agent");
 
         let report = fs
             .apply(&ApplyOptions {
@@ -1727,10 +1727,10 @@ mod tests {
     #[test]
     fn unledgered_modification_needs_adopt_because_its_baseline_is_unknown() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("notes.txt"), "original").unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
-        write_directly_into_upper(upper.path(), "notes.txt", "edited by the agent");
+        let fs = cow_fs(ws.path(), diff_layer.path());
+        write_directly_into_diff_layer(diff_layer.path(), "notes.txt", "edited by the agent");
 
         let report = fs
             .apply(&ApplyOptions {
@@ -1767,20 +1767,20 @@ mod tests {
     #[test]
     fn unledgered_file_identical_to_the_workspace_is_not_a_change() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("same.txt"), "same bytes").unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
-        write_directly_into_upper(upper.path(), "same.txt", "same bytes");
+        let fs = cow_fs(ws.path(), diff_layer.path());
+        write_directly_into_diff_layer(diff_layer.path(), "same.txt", "same bytes");
 
         assert!(fs.change_set().unwrap().is_empty());
     }
 
     /// 台帳に載っているパスは走査で二重に数えない（綴りの大小差があっても同一視する）。
     #[test]
-    fn a_ledgered_path_is_not_reported_twice_by_the_upper_scan() {
+    fn a_ledgered_path_is_not_reported_twice_by_the_diff_layer_scan() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
+        let diff_layer = tempfile::tempdir().unwrap();
+        let fs = cow_fs(ws.path(), diff_layer.path());
 
         fs.write_string("Ledgered.txt", "written through the tool")
             .unwrap();
@@ -1790,14 +1790,14 @@ mod tests {
         assert!(!changes[0].unledgered);
     }
 
-    /// 台帳を経由しなくてもD-09のhard-denyは効く（`.git/config`をupperへ直接置いてもapplyは
+    /// 台帳を経由しなくてもD-09のhard-denyは効く（`.git/config`を差分層へ直接置いてもapplyは
     /// 拒否する）。走査由来のエントリが台帳由来と同じゲートを通ることの確認。
     #[test]
     fn unledgered_config_injection_paths_are_still_hard_denied() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
-        write_directly_into_upper(upper.path(), ".git/config", "[core]\n");
+        let diff_layer = tempfile::tempdir().unwrap();
+        let fs = cow_fs(ws.path(), diff_layer.path());
+        write_directly_into_diff_layer(diff_layer.path(), ".git/config", "[core]\n");
 
         let report = fs
             .apply(&ApplyOptions {
@@ -1829,50 +1829,50 @@ mod tests {
         assert!(fs.change_set().unwrap().is_empty());
     }
 
-    /// CoW一本化の核心（Phase 1/2）: `write_string`はworkspace本体へ一切触れず、upper側の
+    /// CoW一本化の核心（Phase 1/2）: `write_string`はworkspace本体へ一切触れず、差分層側の
     /// 実体・Redirector DLLと共有する操作台帳の両方へ記録される。
     #[test]
-    fn cow_write_redirects_to_upper_and_leaves_workspace_untouched() {
+    fn cow_write_redirects_to_diff_layer_and_leaves_workspace_untouched() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
+        let diff_layer = tempfile::tempdir().unwrap();
+        let fs = cow_fs(ws.path(), diff_layer.path());
 
         fs.write_string("notes.txt", "hello").unwrap();
 
         assert!(!ws.path().join("notes.txt").exists());
         assert_eq!(
-            std::fs::read_to_string(upper.path().join("notes.txt")).unwrap(),
+            std::fs::read_to_string(diff_layer.path().join("notes.txt")).unwrap(),
             "hello"
         );
-        let changes = store::replay_ledger(upper.path());
+        let changes = store::replay_ledger(diff_layer.path());
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "notes.txt");
         assert_eq!(changes[0].op, ChangeOp::Create);
     }
 
-    /// `write_file`→`read_file`のread-through整合: run_shellが書いた（＝upperに載った）
-    /// 内容も含め、CoW時の`read_to_string`は「upper優先、無ければworkspace」の順で読める。
+    /// `write_file`→`read_file`のread-through整合: run_shellが書いた（＝差分層に載った）
+    /// 内容も含め、CoW時の`read_to_string`は「差分層優先、無ければworkspace」の順で読める。
     #[test]
-    fn cow_read_prefers_upper_over_workspace() {
+    fn cow_read_prefers_diff_layer_over_workspace() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("a.txt"), "workspace-content").unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
+        let fs = cow_fs(ws.path(), diff_layer.path());
 
         assert_eq!(fs.read_to_string("a.txt").unwrap(), "workspace-content");
 
-        fs.write_string("a.txt", "upper-content").unwrap();
-        assert_eq!(fs.read_to_string("a.txt").unwrap(), "upper-content");
+        fs.write_string("a.txt", "diff-layer-content").unwrap();
+        assert_eq!(fs.read_to_string("a.txt").unwrap(), "diff-layer-content");
     }
 
     /// 論理削除（`remove`）は台帳へDeleteを記録するだけで、`read_to_string`はNotFoundを返す
-    /// （設計書§19.7「削除済み＞upper＞workspace」）。
+    /// （設計書§19.7「削除済み＞差分層＞workspace」）。
     #[test]
     fn cow_remove_marks_deleted_and_read_returns_not_found() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("existing.txt"), "orig").unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
+        let fs = cow_fs(ws.path(), diff_layer.path());
 
         fs.remove("existing.txt").unwrap();
 
@@ -1884,13 +1884,13 @@ mod tests {
         assert!(matches!(err, SandboxError::NotFound(_)));
     }
 
-    /// `walk_files`はupper側の新規作成・削除を実workspaceの一覧へ反映する（grep/glob用）。
+    /// `walk_files`は差分層側の新規作成・削除を実workspaceの一覧へ反映する（grep/glob用）。
     #[test]
-    fn cow_walk_files_reflects_upper_changes() {
+    fn cow_walk_files_reflects_diff_layer_changes() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("real.txt"), "r").unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
+        let fs = cow_fs(ws.path(), diff_layer.path());
         fs.write_string("staged_new.txt", "n").unwrap();
         fs.remove("real.txt").unwrap();
 
@@ -1911,14 +1911,14 @@ mod tests {
     #[test]
     fn cow_second_write_reuses_recorded_baseline_not_current_workspace_content() {
         let ws = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("a.txt"), "original").unwrap();
-        let fs = cow_fs(ws.path(), upper.path());
+        let fs = cow_fs(ws.path(), diff_layer.path());
 
         fs.write_string("a.txt", "first-edit").unwrap();
         fs.write_string("a.txt", "second-edit").unwrap();
 
-        let changes = store::replay_ledger(upper.path());
+        let changes = store::replay_ledger(diff_layer.path());
         assert_eq!(changes.len(), 1);
         assert_eq!(
             changes[0].baseline_hash,

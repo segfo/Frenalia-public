@@ -23,7 +23,7 @@ use harness_core::{ReadScopeConfig, StagingConfig};
 /// （Phase 2で削除、`SandboxFs`自身が唯一のapply実装になった）の実機E2Eテストからの
 /// 呼び出しをこの薄いラッパへ置き換えている。
 fn apply_cow(
-    upper_dir: &std::path::Path,
+    diff_layer_dir: &std::path::Path,
     workspace_root: &std::path::Path,
     opts: &ApplyOptions,
 ) -> Result<ApplyReport, SandboxError> {
@@ -31,13 +31,13 @@ fn apply_cow(
         workspace_root,
         &StagingConfig::default(),
         &ReadScopeConfig::default(),
-        Some(upper_dir),
+        Some(diff_layer_dir),
     )?;
     fs.apply(opts)
 }
 use std::sync::Mutex;
 
-/// `cow_write_from_wow64_grandchild_process_is_redirected_to_upper`と
+/// `cow_write_from_wow64_grandchild_process_is_redirected_to_diff_layer`と
 /// `cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning`は、テストバイナリの
 ///隣にある`harness_redirector_x86.dll`という単一の共有ファイルを読む/一時的にリネームする。
 /// `cargo test`は既定で`#[test]`関数を並行実行するため、この2つを直列化しないと片方が
@@ -58,17 +58,17 @@ const COW_WRITE_PROBE_COMMAND: &str = "\
 
 /// 境界（Phase 1）+ 透過（Phase 2）を通しで確認する。workspaceをROで付与し、Redirector DLLを
 /// 注入したAppContainer子から`important.txt`を上書き・`new.txt`を新規作成させる。
-/// 期待結果: 子は成功（exit 0）、workspace本体は不変、upperへ変更が反映される。
+/// 期待結果: 子は成功（exit 0）、workspace本体は不変、差分層へ変更が反映される。
 #[test]
 #[ignore]
-fn cow_write_is_redirected_to_upper_and_workspace_stays_unchanged() {
+fn cow_write_is_redirected_to_diff_layer_and_workspace_stays_unchanged() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
     std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -89,7 +89,7 @@ fn cow_write_is_redirected_to_upper_and_workspace_stays_unchanged() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -114,12 +114,12 @@ fn cow_write_is_redirected_to_upper_and_workspace_stays_unchanged() {
         "new file must not appear in workspace"
     );
 
-    let upper_content = std::fs::read_to_string(upper.path().join("important.txt"))
-        .expect("upper important.txt must exist after copy-up + redirected write");
-    assert_eq!(upper_content, "modified-by-child");
-    let upper_new_content =
-        std::fs::read_to_string(upper.path().join("new.txt")).expect("upper new.txt must exist");
-    assert_eq!(upper_new_content, "created-by-child");
+    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("important.txt"))
+        .expect("diff layer important.txt must exist after copy-up + redirected write");
+    assert_eq!(diff_layer_content, "modified-by-child");
+    let diff_layer_new_content =
+        std::fs::read_to_string(diff_layer.path().join("new.txt")).expect("diff layer new.txt must exist");
+    assert_eq!(diff_layer_new_content, "created-by-child");
 }
 
 /// **BUG-066の追加検証（2026-08-06）**: `HARNESS_COW_WORKSPACE`の綴りが揺れても、DLL単体で
@@ -164,13 +164,13 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
 
     for (label, make_spelling, expect_redirect) in spellings {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let upper = tempfile::tempdir().expect("upper tempdir");
+        let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
         std::fs::write(workspace.path().join("important.txt"), "original")
             .expect("seed important.txt");
 
         let sid = session_sid();
         let write_mode = WorkspaceWriteMode::Cow {
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
         };
         // ACL付与は常に**実パス**で行う（実験対象はDLLが受け取る文字列だけに絞る）。
         preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
@@ -201,7 +201,7 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
             NetworkCapability::Deny,
             Some(CowInject {
                 workspace_root: workspace.path(),
-                upper_dir: upper.path(),
+                diff_layer_dir: diff_layer.path(),
                 ext_capture_roots: &[],
             }),
         )
@@ -217,9 +217,9 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
              expected COWWS={raw_spelling}, stdout={stdout} stderr={stderr}"
         );
 
-        let upper_file = upper.path().join("important.txt");
-        let ops = harness_change_ledger::store::read_ledger_entries(upper.path());
-        let denied = harness_change_ledger::store::read_denied_log(upper.path());
+        let diff_layer_file = diff_layer.path().join("important.txt");
+        let ops = harness_change_ledger::store::read_ledger_entries(diff_layer.path());
+        let denied = harness_change_ledger::store::read_denied_log(diff_layer.path());
         let denied_inside: Vec<&str> = denied
             .iter()
             .filter(|e| {
@@ -238,9 +238,9 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
                 "[{label}] the write must succeed through the redirector: stdout={stdout}"
             );
             assert_eq!(
-                std::fs::read_to_string(&upper_file).ok().as_deref(),
+                std::fs::read_to_string(&diff_layer_file).ok().as_deref(),
                 Some("modified-by-child"),
-                "[{label}] the write must land in the upper dir"
+                "[{label}] the write must land in the diff layer dir"
             );
             assert!(
                 ops.iter().any(|e| e.path == "important.txt"),
@@ -257,8 +257,8 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
                 "[{label}] the write is expected to be denied by the read-only ACL: stdout={stdout}"
             );
             assert!(
-                !upper_file.exists(),
-                "[{label}] nothing may reach the upper dir"
+                !diff_layer_file.exists(),
+                "[{label}] nothing may reach the diff layer dir"
             );
             assert!(
                 ops.is_empty(),
@@ -272,7 +272,7 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
             // 警告台帳のファイル名はRedirector DLL側（`state.rs`）の定数だが、このクレートは
             // DLLへ依存しないので他の警告系テストと同じくリテラルで書く。
             let warnings =
-                std::fs::read_to_string(upper.path().join(".harness-cow-warnings.jsonl"))
+                std::fs::read_to_string(diff_layer.path().join(".harness-cow-warnings.jsonl"))
                     .unwrap_or_default();
             assert!(
                 warnings.contains("config_workspace_not_absolute"),
@@ -296,12 +296,12 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
 
 /// Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴
 /// （`preflight`の`granted_passthrough`）への子プロセスの書込が、Redirector DLLにより
-/// `_ext/<key>`経由でupperへcaptureされ、実ターゲットには一切触れないことを確認する。
+/// `_ext/<key>`経由で差分層へcaptureされ、実ターゲットには一切触れないことを確認する。
 #[test]
 #[ignore]
-fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_untouched() {
+fn cow_ext_capture_redirects_fs_allow_rw_write_to_diff_layer_and_leaves_real_target_untouched() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
     // `fs_passthrough_ro_then_rw_then_revoke_cycle`と同じ理由（コメント参照）で
     // `C:\`直下1階層に置く（中間祖先のtraverse ACE不足による未解決rw書込を避ける）。
     let external =
@@ -310,7 +310,7 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     let passthrough = [FsPassthrough {
         path: external.clone(),
@@ -371,7 +371,7 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &ext_capture_roots,
         }),
     )
@@ -383,17 +383,17 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
 
     assert!(
         !probe_path.exists(),
-        "real external target must stay untouched (captured into upper's _ext instead)"
+        "real external target must stay untouched (captured into diff layer's _ext instead)"
     );
     let original = harness_change_ledger::store::normalize_abs_path(&probe_path.to_string_lossy());
     let key = harness_change_ledger::store::ext_key(&original).expect("ext_key");
-    let upper_ext_path = upper.path().join("_ext").join(&key);
+    let diff_layer_ext_path = diff_layer.path().join("_ext").join(&key);
     assert_eq!(
-        std::fs::read_to_string(&upper_ext_path).expect("upper _ext copy must exist"),
+        std::fs::read_to_string(&diff_layer_ext_path).expect("diff layer _ext copy must exist"),
         "ext-write"
     );
 
-    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(diff_layer.path());
     let entry = ledger
         .iter()
         .find(|c| c.path == original)
@@ -411,7 +411,7 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_upper_and_leaves_real_target_u
 #[ignore]
 fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
     let outside = std::path::PathBuf::from(format!(
         "C:\\harness-Tier2a-cow-denied-{}",
         std::process::id()
@@ -420,7 +420,7 @@ fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -443,7 +443,7 @@ fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -457,7 +457,7 @@ fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
     );
     assert!(!probe_path.exists());
 
-    let denied = harness_change_ledger::store::read_denied_log(upper.path());
+    let denied = harness_change_ledger::store::read_denied_log(diff_layer.path());
     let original = harness_change_ledger::store::normalize_abs_path(&probe_path.to_string_lossy());
     assert!(
         denied.iter().any(|e| e.path == original),
@@ -474,12 +474,12 @@ fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
 #[ignore]
 fn workspace_write_fails_closed_without_redirector_injection() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
     std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -517,17 +517,17 @@ fn workspace_write_fails_closed_without_redirector_injection() {
 }
 
 /// Phase 4a: Redirector DLLが`run_shell`の直接の子（powershell）だけでなく、その子がさらに
-/// 起動する孫プロセス（cmd.exe）にも再注入され、孫からの書込みもupperへ透過リダイレクトされる
+/// 起動する孫プロセス（cmd.exe）にも再注入され、孫からの書込みも差分層へ透過リダイレクトされる
 /// ことを確認する（設計書§19.2/§22/§32 Phase 4a、`/dig`2026-08-01決定）。
 #[test]
 #[ignore]
-fn cow_write_from_grandchild_process_is_redirected_to_upper() {
+fn cow_write_from_grandchild_process_is_redirected_to_diff_layer() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -550,7 +550,7 @@ fn cow_write_from_grandchild_process_is_redirected_to_upper() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -565,16 +565,16 @@ fn cow_write_from_grandchild_process_is_redirected_to_upper() {
         !workspace.path().join("new_by_grandchild.txt").exists(),
         "grandchild's write must not appear in the read-only workspace"
     );
-    let upper_content = std::fs::read_to_string(upper.path().join("new_by_grandchild.txt")).expect(
-        "upper must contain the grandchild's write \
+    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("new_by_grandchild.txt")).expect(
+        "diff_layer must contain the grandchild's write \
              (redirector DLL must have been re-injected into the grandchild, Phase 4a)",
     );
     assert!(
-        upper_content.trim().contains("created-by-grandchild"),
-        "unexpected upper content: {upper_content:?}"
+        diff_layer_content.trim().contains("created-by-grandchild"),
+        "unexpected diff layer content: {diff_layer_content:?}"
     );
 
-    let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+    let warnings_path = diff_layer.path().join(".harness-cow-warnings.jsonl");
     assert!(
         !warnings_path.exists(),
         "grandchild injection should not have failed in this environment: {:?}",
@@ -604,17 +604,17 @@ fn tier2a_proc_probe_x64_exe() -> PathBuf {
 /// 残課題#5: `CreateProcessA`は`CreateProcessW`を経由せず直接`CreateProcessInternalW`を
 /// 呼ぶため、以前は既存フック（`CreateProcessW`/`CreateProcessAsUserW`のみ）を完全に
 /// 素通ししていた。`tier2a-proc-probe`（Redirector DLL注入済みの直接の子）が自身の中で
-/// `CreateProcessA`を呼んで起動した孫プロセスの書込みも、CoW upperへ透過リダイレクト
+/// `CreateProcessA`を呼んで起動した孫プロセスの書込みも、CoW 差分層へ透過リダイレクト
 /// されることを確認する（`crates/harness-redirector/src/lib.rs`の`hooked_create_process_a`）。
 #[test]
 #[ignore]
-fn cow_write_via_createprocessa_grandchild_is_redirected_to_upper() {
+fn cow_write_via_createprocessa_grandchild_is_redirected_to_diff_layer() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -633,7 +633,7 @@ fn cow_write_via_createprocessa_grandchild_is_redirected_to_upper() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -647,17 +647,17 @@ fn cow_write_via_createprocessa_grandchild_is_redirected_to_upper() {
         !workspace.path().join("new_by_createprocessa.txt").exists(),
         "grandchild's write must not appear in the read-only workspace"
     );
-    let upper_content = std::fs::read_to_string(upper.path().join("new_by_createprocessa.txt"))
+    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("new_by_createprocessa.txt"))
         .expect(
-            "upper must contain the grandchild's write (CreateProcessA hook must have \
+            "diff_layer must contain the grandchild's write (CreateProcessA hook must have \
              re-injected the redirector DLL, residual issue #5)",
         );
     assert!(
-        upper_content.trim().contains("created-by-createprocessa"),
-        "unexpected upper content: {upper_content:?}"
+        diff_layer_content.trim().contains("created-by-createprocessa"),
+        "unexpected diff layer content: {diff_layer_content:?}"
     );
 
-    let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+    let warnings_path = diff_layer.path().join(".harness-cow-warnings.jsonl");
     assert!(
         !warnings_path.exists(),
         "grandchild injection via CreateProcessA should not have failed in this \
@@ -669,17 +669,17 @@ fn cow_write_via_createprocessa_grandchild_is_redirected_to_upper() {
 /// 残課題#5: `WinExec`は`dwCreationFlags`も`lpProcessInformation`も呼び出し元へ公開しない
 /// ため、`hooked_win_exec`（`crates/harness-redirector/src/lib.rs`）は本物の`WinExec`を
 /// 呼ばず内部で`CreateProcessA`相当の経路へ委譲して注入する設計になっている。その経路が
-/// 実際に機能し、`WinExec`で起動した孫プロセスの書込みもCoW upperへ透過リダイレクトされる
+/// 実際に機能し、`WinExec`で起動した孫プロセスの書込みもCoW 差分層へ透過リダイレクトされる
 /// ことを確認する。
 #[test]
 #[ignore]
-fn cow_write_via_winexec_grandchild_is_redirected_to_upper() {
+fn cow_write_via_winexec_grandchild_is_redirected_to_diff_layer() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -698,7 +698,7 @@ fn cow_write_via_winexec_grandchild_is_redirected_to_upper() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -712,17 +712,17 @@ fn cow_write_via_winexec_grandchild_is_redirected_to_upper() {
         !workspace.path().join("new_by_winexec.txt").exists(),
         "grandchild's write must not appear in the read-only workspace"
     );
-    let upper_content = std::fs::read_to_string(upper.path().join("new_by_winexec.txt")).expect(
-        "upper must contain the grandchild's write (WinExec hook must have re-injected \
+    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("new_by_winexec.txt")).expect(
+        "diff_layer must contain the grandchild's write (WinExec hook must have re-injected \
              the redirector DLL via its CreateProcessA-based reimplementation, residual \
              issue #5)",
     );
     assert!(
-        upper_content.trim().contains("created-by-winexec"),
-        "unexpected upper content: {upper_content:?}"
+        diff_layer_content.trim().contains("created-by-winexec"),
+        "unexpected diff layer content: {diff_layer_content:?}"
     );
 
-    let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+    let warnings_path = diff_layer.path().join(".harness-cow-warnings.jsonl");
     assert!(
         !warnings_path.exists(),
         "grandchild injection via WinExec should not have failed in this environment: {:?}",
@@ -731,7 +731,7 @@ fn cow_write_via_winexec_grandchild_is_redirected_to_upper() {
 }
 
 /// Phase 4b: 32bit（WOW64）孫プロセス（`C:\Windows\SysWOW64\cmd.exe`）にもRedirector DLLが
-/// 再注入され、書込みがupperへ透過リダイレクトされることを確認する（設計書§32 Phase 4b、
+/// 再注入され、書込みが差分層へ透過リダイレクトされることを確認する（設計書§32 Phase 4b、
 /// `/dig`2026-08-02決定「エントリポイントtrap方式」）。直接の子（powershell、x64）から
 /// SysWOW64のcmd.exeを明示パスで起動する（64bitプロセスがSysWOW64を直接指定すればWOW64
 /// ファイルシステムリダイレクトの影響を受けない）。x86 Redirector DLL
@@ -741,16 +741,16 @@ fn cow_write_via_winexec_grandchild_is_redirected_to_upper() {
 /// `x86_sibling_dll_path`参照）。
 #[test]
 #[ignore]
-fn cow_write_from_wow64_grandchild_process_is_redirected_to_upper() {
+fn cow_write_from_wow64_grandchild_process_is_redirected_to_diff_layer() {
     let _lock = WOW64_DLL_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -769,7 +769,7 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_upper() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -784,16 +784,16 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_upper() {
         !workspace.path().join("new_by_wow64.txt").exists(),
         "wow64 grandchild's write must not appear in the read-only workspace"
     );
-    let upper_content = std::fs::read_to_string(upper.path().join("new_by_wow64.txt")).expect(
-        "upper must contain the wow64 grandchild's write \
+    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("new_by_wow64.txt")).expect(
+        "diff_layer must contain the wow64 grandchild's write \
              (redirector DLL must have been re-injected via the entry-point trap, Phase 4b)",
     );
     assert!(
-        upper_content.trim().contains("created-by-wow64-grandchild"),
-        "unexpected upper content: {upper_content:?}"
+        diff_layer_content.trim().contains("created-by-wow64-grandchild"),
+        "unexpected diff layer content: {diff_layer_content:?}"
     );
 
-    let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+    let warnings_path = diff_layer.path().join(".harness-cow-warnings.jsonl");
     assert!(
         !warnings_path.exists(),
         "wow64 grandchild injection should not have failed in this environment: {:?}",
@@ -812,7 +812,7 @@ fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
 
     let current = std::env::current_exe().expect("current_exe");
     let dir = current.parent().expect("current_exe has parent");
@@ -831,12 +831,12 @@ fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
     const CMD: &str = "\
-        C:\\Windows\\SysWOW64\\cmd.exe /c \"echo should-not-appear-in-upper>should_not_exist.txt\"; \
+        C:\\Windows\\SysWOW64\\cmd.exe /c \"echo should-not-appear-in-diff_layer>should_not_exist.txt\"; \
         exit 0";
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
@@ -850,7 +850,7 @@ fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -867,11 +867,11 @@ fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
         "workspace must stay unchanged regardless of injection outcome"
     );
     assert!(
-        !upper.path().join("should_not_exist.txt").exists(),
+        !diff_layer.path().join("should_not_exist.txt").exists(),
         "without the x86 redirector dll, the write must fail closed (workspace ACL denies \
          it) rather than silently succeed via a stale/mismatched injection"
     );
-    let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+    let warnings_path = diff_layer.path().join(".harness-cow-warnings.jsonl");
     let warnings = std::fs::read_to_string(&warnings_path).expect(
         "warning ledger must record the injection failure when the x86 redirector dll is \
          missing (Q6: grandchild creation itself must not be refused)",
@@ -889,14 +889,14 @@ fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
 /// として残り、`NtCreateSection`フックの追加実装は不要と判断する。
 #[test]
 #[ignore]
-fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
+fn cow_writable_memory_mapped_file_is_redirected_to_diff_layer() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
     std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -935,7 +935,7 @@ fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -952,13 +952,13 @@ fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
         "workspace must stay unchanged (mmap write must not bypass the ACL boundary)"
     );
 
-    let upper_content = std::fs::read_to_string(upper.path().join("important.txt")).expect(
-        "upper must contain the mmap write (open-time redirection must have copy-up'd the \
+    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("important.txt")).expect(
+        "diff_layer must contain the mmap write (open-time redirection must have copy-up'd the \
          file before the writable view was created)",
     );
-    assert_eq!(upper_content, "mmapwrt!");
+    assert_eq!(diff_layer_content, "mmapwrt!");
 
-    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(diff_layer.path());
     let important = ledger
         .iter()
         .find(|c| c.path == "important.txt")
@@ -974,12 +974,12 @@ fn cow_writable_memory_mapped_file_is_redirected_to_upper() {
 #[ignore]
 fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
     std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -1006,7 +1006,7 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -1016,7 +1016,7 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
         .expect("child should run to completion");
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
 
-    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(diff_layer.path());
     let important = ledger
         .iter()
         .find(|c| c.path == "important.txt")
@@ -1034,7 +1034,7 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
     assert_eq!(new.baseline_hash, None);
 
     let report = apply_cow(
-        upper.path(),
+        diff_layer.path(),
         workspace.path(),
         &ApplyOptions {
             only_glob: None,
@@ -1074,50 +1074,50 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
         "created-single"
     );
 
-    let ledger_after = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger_after = crate::tier2a::workspace_ledger::read_cow_ledger(diff_layer.path());
     assert!(
         ledger_after.is_empty(),
         "applied entries must be pruned from the ledger: {ledger_after:?}"
     );
 }
 
-/// シナリオ2+3: 同一workspaceに対する2つの`--sandbox tier2a-cow`セッション（別々のupper）を並行実行し、
-/// 互いのupperが混ざらないこと・workspace本体が両方から不変であることを確認したうえで、
+/// シナリオ2+3: 同一workspaceに対する2つの`--sandbox tier2a-cow`セッション（別々の差分層）を並行実行し、
+/// 互いの差分層が混ざらないこと・workspace本体が両方から不変であることを確認したうえで、
 /// 片方を先にapplyしもう片方を後からapplyすると、baseline hash不一致でconflictとして
 /// 検知される（TOCTOU防止、`overlay.rs::apply()`と同じ意味論）ことを確認する。
 #[test]
 #[ignore]
 fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper_a = tempfile::tempdir().expect("upper_a tempdir");
-    let upper_b = tempfile::tempdir().expect("upper_b tempdir");
+    let diff_layer_a = tempfile::tempdir().expect("diff_layer_a tempdir");
+    let diff_layer_b = tempfile::tempdir().expect("diff_layer_b tempdir");
     std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
 
     let sid = session_sid();
     // workspace本体へのRO ACEはworkspace単位で共有されるモードのため、同じ"ro"モードの
     // 複数セッションに対して複数回`preflight`を呼んでも（`workspace_ledger::begin_workspace_mode`
-    // は他モードとの排他しか見ないため）衝突しない。**ただし各upper_dirへのRW ACEは
-    // upper_dirごとに個別に付与される**（`preflight`のCowブランチの`grant_ace_inheritable_rw(upper_dir, ..)`
-    // 参照）ため、upper_a・upper_bそれぞれについて`preflight`を呼ぶ必要がある
+    // は他モードとの排他しか見ないため）衝突しない。**ただし各diff_layer_dirへのRW ACEは
+    // diff_layer_dirごとに個別に付与される**（`preflight`のCowブランチの`grant_ace_inheritable_rw(diff_layer_dir, ..)`
+    // 参照）ため、diff_layer_a・diff_layer_bそれぞれについて`preflight`を呼ぶ必要がある
     // （実機E2Eで発見: 1回しか呼ばないとpreflightされなかった側の子がACCESS_DENIEDで失敗する）。
     preflight(
         workspace.path(),
         &[],
         None,
         &WorkspaceWriteMode::Cow {
-            upper_dir: upper_a.path().to_path_buf(),
+            diff_layer_dir: diff_layer_a.path().to_path_buf(),
         },
     )
-    .expect("preflight (cow, upper_a)");
+    .expect("preflight (cow, diff_layer_a)");
     preflight(
         workspace.path(),
         &[],
         None,
         &WorkspaceWriteMode::Cow {
-            upper_dir: upper_b.path().to_path_buf(),
+            diff_layer_dir: diff_layer_b.path().to_path_buf(),
         },
     )
-    .expect("preflight (cow, upper_b)");
+    .expect("preflight (cow, diff_layer_b)");
 
     fn probe_cmd(suffix: &str) -> String {
         format!(
@@ -1149,7 +1149,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper_a.path(),
+            diff_layer_dir: diff_layer_a.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -1164,7 +1164,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper_b.path(),
+            diff_layer_dir: diff_layer_b.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -1179,7 +1179,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
         .expect("child B should run to completion");
     assert_eq!(code_b, 0, "stdout={stdout_b} stderr={stderr_b}");
 
-    let ledger_a = crate::tier2a::workspace_ledger::read_cow_ledger(upper_a.path());
+    let ledger_a = crate::tier2a::workspace_ledger::read_cow_ledger(diff_layer_a.path());
     assert_eq!(
         ledger_a
             .iter()
@@ -1189,14 +1189,14 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
         ManifestOp::Modify
     );
     assert_eq!(
-        std::fs::read_to_string(upper_a.path().join("important.txt")).unwrap(),
+        std::fs::read_to_string(diff_layer_a.path().join("important.txt")).unwrap(),
         "overwritten-by-a"
     );
     assert_eq!(
-        std::fs::read_to_string(upper_a.path().join("new.txt")).unwrap(),
+        std::fs::read_to_string(diff_layer_a.path().join("new.txt")).unwrap(),
         "created-by-a"
     );
-    let ledger_b = crate::tier2a::workspace_ledger::read_cow_ledger(upper_b.path());
+    let ledger_b = crate::tier2a::workspace_ledger::read_cow_ledger(diff_layer_b.path());
     assert_eq!(
         ledger_b
             .iter()
@@ -1206,11 +1206,11 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
         ManifestOp::Modify
     );
     assert_eq!(
-        std::fs::read_to_string(upper_b.path().join("important.txt")).unwrap(),
+        std::fs::read_to_string(diff_layer_b.path().join("important.txt")).unwrap(),
         "overwritten-by-b"
     );
     assert_eq!(
-        std::fs::read_to_string(upper_b.path().join("new.txt")).unwrap(),
+        std::fs::read_to_string(diff_layer_b.path().join("new.txt")).unwrap(),
         "created-by-b"
     );
 
@@ -1223,7 +1223,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
 
     // セッションAを先に適用する。
     let report_a = apply_cow(
-        upper_a.path(),
+        diff_layer_a.path(),
         workspace.path(),
         &ApplyOptions {
             only_glob: None,
@@ -1253,7 +1253,7 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
     // （important.txt="original"、new.txt=None＝新規作成想定）はどちらも現在値と食い違い、
     // TOCTOU競合として拒否されるはず（`report.applied`は空、両方`conflicts`に入る）。
     let report_b = apply_cow(
-        upper_b.path(),
+        diff_layer_b.path(),
         workspace.path(),
         &ApplyOptions {
             only_glob: None,
@@ -1285,18 +1285,18 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
 /// リネームE2E: `NtSetInformationFile`の`FileRenameInformation`フック
 /// （`rewrite_rename_target`）が実際にWindowsから渡される移動先パスを正しく解釈できるかを
 /// 確認する探索的テスト。旧パスの`Delete`＋新パスの`Create`の2レコードに分解されること
-/// （設計書§19.4）・upper側で実際にリネームが再現されること・applyでworkspace本体に
+/// （設計書§19.4）・差分層側で実際にリネームが再現されること・applyでworkspace本体に
 /// 反映されることを確認する。
 #[test]
 #[ignore]
 fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
     std::fs::write(workspace.path().join("old.txt"), "original-content").expect("seed old.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -1321,7 +1321,7 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -1331,7 +1331,7 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
         .expect("child should run to completion");
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
 
-    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(diff_layer.path());
     let old_entry = ledger
         .iter()
         .find(|c| c.path == "old.txt")
@@ -1348,9 +1348,9 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
     assert_eq!(new_entry.op, ManifestOp::Create);
     assert_eq!(new_entry.baseline_hash, None);
 
-    assert!(!upper.path().join("old.txt").exists());
+    assert!(!diff_layer.path().join("old.txt").exists());
     assert_eq!(
-        std::fs::read_to_string(upper.path().join("new.txt")).unwrap(),
+        std::fs::read_to_string(diff_layer.path().join("new.txt")).unwrap(),
         "original-content"
     );
     assert_eq!(
@@ -1360,7 +1360,7 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
     assert!(!workspace.path().join("new.txt").exists());
 
     let report = apply_cow(
-        upper.path(),
+        diff_layer.path(),
         workspace.path(),
         &ApplyOptions {
             only_glob: None,
@@ -1396,12 +1396,12 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
 #[ignore]
 fn cow_ledger_records_delete_persists_across_processes_and_applies() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
     std::fs::write(workspace.path().join("doomed.txt"), "to-be-deleted").expect("seed doomed.txt");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -1427,7 +1427,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -1437,7 +1437,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
         .expect("child should run to completion");
     assert_eq!(code1, 0, "stdout={stdout1} stderr={stderr1}");
 
-    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
+    let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(diff_layer.path());
     let entry = ledger
         .iter()
         .find(|c| c.path == "doomed.txt")
@@ -1447,7 +1447,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
         entry.baseline_hash,
         Some(harness_change_ledger::hash_bytes(b"to-be-deleted"))
     );
-    assert!(!upper.path().join("doomed.txt").exists());
+    assert!(!diff_layer.path().join("doomed.txt").exists());
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("doomed.txt")).unwrap(),
         "to-be-deleted",
@@ -1469,7 +1469,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -1485,7 +1485,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
     );
 
     let report = apply_cow(
-        upper.path(),
+        diff_layer.path(),
         workspace.path(),
         &ApplyOptions {
             only_glob: None,
@@ -1624,45 +1624,48 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
         );
     }
 
-    fn assert_upper_reflects_tag(upper: &Path, tag: &str, injected: bool) {
-        let new_path = upper.join(format!("{tag}-new.txt"));
-        let seed_path = upper.join(format!("{tag}-seed.txt"));
-        let del_path = upper.join(format!("{tag}-del.txt"));
-        let ren_path = upper.join(format!("{tag}-ren.txt"));
-        let ren2_path = upper.join(format!("{tag}-ren2.txt"));
+    fn assert_diff_layer_reflects_tag(diff_layer: &Path, tag: &str, injected: bool) {
+        let new_path = diff_layer.join(format!("{tag}-new.txt"));
+        let seed_path = diff_layer.join(format!("{tag}-seed.txt"));
+        let del_path = diff_layer.join(format!("{tag}-del.txt"));
+        let ren_path = diff_layer.join(format!("{tag}-ren.txt"));
+        let ren2_path = diff_layer.join(format!("{tag}-ren2.txt"));
         if injected {
             assert_eq!(
                 std::fs::read_to_string(&new_path)
-                    .unwrap_or_else(|e| panic!("upper must contain {tag}-new.txt: {e}")),
+                    .unwrap_or_else(|e| panic!("diff layer must contain {tag}-new.txt: {e}")),
                 format!("created-by-{tag}")
             );
             assert_eq!(
                 std::fs::read_to_string(&seed_path)
-                    .unwrap_or_else(|e| panic!("upper must contain {tag}-seed.txt: {e}")),
+                    .unwrap_or_else(|e| panic!("diff layer must contain {tag}-seed.txt: {e}")),
                 format!("modified-by-{tag}")
             );
             assert!(
                 !del_path.exists(),
-                "{tag}-del.txt must not be copied up to upper"
+                "{tag}-del.txt must not be copied up to the diff layer"
             );
-            assert!(!ren_path.exists(), "{tag}-ren.txt must not remain in upper");
+            assert!(
+                !ren_path.exists(),
+                "{tag}-ren.txt must not remain in the diff layer"
+            );
             assert_eq!(
                 std::fs::read_to_string(&ren2_path)
-                    .unwrap_or_else(|e| panic!("upper must contain {tag}-ren2.txt: {e}")),
+                    .unwrap_or_else(|e| panic!("diff layer must contain {tag}-ren2.txt: {e}")),
                 seed_rename_content(tag)
             );
         } else {
             assert!(
                 !new_path.exists(),
-                "{tag} was not injected: upper must not see the new file"
+                "{tag} was not injected: diff layer must not see the new file"
             );
             assert!(
                 !seed_path.exists(),
-                "{tag} was not injected: upper must not see the modified file"
+                "{tag} was not injected: diff layer must not see the modified file"
             );
             assert!(
                 !ren2_path.exists(),
-                "{tag} was not injected: upper must not see the rename target"
+                "{tag} was not injected: diff layer must not see the rename target"
             );
         }
     }
@@ -1766,7 +1769,7 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
 
     for chain in chains {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let upper = tempfile::tempdir().expect("upper tempdir");
+        let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
 
         let tags: Vec<String> = (0..chain.len()).map(|i| gen_tag(i, chain[i])).collect();
         for tag in &tags {
@@ -1774,7 +1777,7 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
         }
 
         let write_mode = WorkspaceWriteMode::Cow {
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
         };
         preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
@@ -1820,7 +1823,7 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
             NetworkCapability::Deny,
             Some(CowInject {
                 workspace_root: workspace.path(),
-                upper_dir: upper.path(),
+                diff_layer_dir: diff_layer.path(),
                 ext_capture_roots: &[],
             }),
         );
@@ -1835,7 +1838,7 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
             );
             for tag in &tags {
                 assert_workspace_untouched_for_tag(workspace.path(), tag);
-                assert_upper_reflects_tag(upper.path(), tag, false);
+                assert_diff_layer_reflects_tag(diff_layer.path(), tag, false);
             }
             continue;
         }
@@ -1909,7 +1912,7 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
             // からでも読める）と確定的だったため、単なる記録確認ではなく積極的な
             // assertへ格上げする。workspace外の`escape-read-outside`（常にdeny）との
             // 対比で、封じ込め境界が「AppContainerだから何も読めない」ではなく
-            // 「ACLが付与されたworkspace/upper以外は読めない」ことを示す対照実験になる。
+            // 「ACLが付与されたworkspace/差分層以外は読めない」ことを示す対照実験になる。
             let baseline = report["escape"]
                 .as_array()
                 .and_then(|arr| arr.iter().find(|e| e["op"] == "escape-read-baseline"));
@@ -1924,10 +1927,10 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
 
         for (i, tag) in tags.iter().enumerate() {
             assert_workspace_untouched_for_tag(workspace.path(), tag);
-            assert_upper_reflects_tag(upper.path(), tag, injected[i]);
+            assert_diff_layer_reflects_tag(diff_layer.path(), tag, injected[i]);
         }
 
-        let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(upper.path());
+        let ledger = crate::tier2a::workspace_ledger::read_cow_ledger(diff_layer.path());
         for (i, tag) in tags.iter().enumerate() {
             assert_ledger_for_tag(&ledger, tag, injected[i]);
         }
@@ -1936,7 +1939,7 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
         // 何らかの理由が記録されているはず（Q6、内容までは固定しない）。BUG-045のF1修正で
         // 「注入は成功したがフック設置に失敗した」ケースもここに落ちるようになった。
         if injected.iter().any(|&v| !v) && injected[0] {
-            let warnings_path = upper.path().join(".harness-cow-warnings.jsonl");
+            let warnings_path = diff_layer.path().join(".harness-cow-warnings.jsonl");
             let warnings = std::fs::read_to_string(&warnings_path).unwrap_or_default();
             assert!(
                 !warnings.trim().is_empty(),
@@ -2002,7 +2005,7 @@ fn cow_containment_is_recursive_beyond_three_generations() {
 /// BUG-045のF2の回帰テスト: **途中の世代が自前のenv blockを組み立てて次世代を起動しても**
 /// CoWリダイレクトが途切れないこと。プローブが`--sanitize-env`で`HARNESS_COW_*`を全て
 /// 落として子を起動するため、Redirector DLLの設定が環境変数依存のままなら
-/// gen2以降は`init()`が設定を取れずフック未設置になり、upper/操作台帳にgen2・gen3の
+/// gen2以降は`init()`が設定を取れずフック未設置になり、差分層/操作台帳にgen2・gen3の
 /// 変更が現れなくなる（＝このテストが落ちる）。設定を`harness_cow_init`の
 /// スレッドパラメータで渡す修正が入っているため、期待値は通常チェーンと同じ全世代注入。
 #[test]
@@ -2015,7 +2018,7 @@ fn cow_containment_survives_env_block_sanitized_by_intermediate_generation() {
 ///
 /// 2つのことを1度に確かめます。
 ///
-/// 1. **到達性の実測**: AppContainer子は、書込可能なCoW upper_dir内に junction（mount point）を
+/// 1. **到達性の実測**: AppContainer子は、書込可能なCoW diff_layer_dir内に junction（mount point）を
 ///    作れるのか。junctionはsymlinkと違い`SeCreateSymbolicLinkPrivilege`を必要としないため、
 ///    「作れて当然」と思いがちですが、AppContainerトークン下で実際にどうなるかは測らないと
 ///    分かりません（`plans/etw-spike/RESULTS.md` §18.5の教訓——推測で結論を書かない）。
@@ -2029,26 +2032,26 @@ fn cow_containment_survives_env_block_sanitized_by_intermediate_generation() {
 /// （こちらはユーザ権限でjunctionを植えるので、サンドボックス子にできることの上位集合を試します）。
 #[test]
 #[ignore]
-fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_upper() {
+fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_diff_layer() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let upper = tempfile::tempdir().expect("upper tempdir");
-    // 「サンドボックスの外にある機密」の代役。upperの外・workspaceの外に置く。
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
+    // 「サンドボックスの外にある機密」の代役。差分層の外・workspaceの外に置く。
     let secret_root = tempfile::tempdir().expect("secret tempdir");
     std::fs::write(secret_root.path().join("id_rsa"), "TOP-SECRET-KEY").expect("seed secret");
 
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
-        upper_dir: upper.path().to_path_buf(),
+        diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 
-    // 子はupper_dir配下へ直接junctionを張ろうとする（upper_dirはRWで付与済み、
-    // かつRedirector DLLの`classify`はupper_dir配下をリダイレクト対象外にしている）。
+    // 子はdiff_layer_dir配下へ直接junctionを張ろうとする（diff_layer_dirはRWで付与済み、
+    // かつRedirector DLLの`classify`はdiff_layer_dir配下をリダイレクト対象外にしている）。
     //
     // **2つの標的で測るのは交絡を切り分けるため**（`plans/etw-spike/RESULTS.md` §18.5）。
     // 「機密ディレクトリ宛のjunctionが作れなかった」だけでは、*junctionが作れない*のか
     // *その標的が見えないだけ*なのかが区別できない。子が確実に読み書きできる標的
-    // （upper配下に自分で作ったディレクトリ）でも失敗するなら、原因は標的ではなく
+    // （差分層配下に自分で作ったディレクトリ）でも失敗するなら、原因は標的ではなく
     // junction作成そのものだと確定する。
     let probe = format!(
         "$ErrorActionPreference = 'Stop'; \
@@ -2067,9 +2070,9 @@ fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_upper
              Write-Output ('secret-target: failed: ' + $_.Exception.Message); \
              exit 7 \
          }}",
-        reachable = upper.path().join("inside").display(),
-        link_reachable = upper.path().join("link-inside").display(),
-        link_secret = upper.path().join("link").display(),
+        reachable = diff_layer.path().join("inside").display(),
+        link_reachable = diff_layer.path().join("link-inside").display(),
+        link_secret = diff_layer.path().join("link").display(),
         secret = secret_root.path().display()
     );
 
@@ -2085,7 +2088,7 @@ fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_upper
         NetworkCapability::Deny,
         Some(CowInject {
             workspace_root: workspace.path(),
-            upper_dir: upper.path(),
+            diff_layer_dir: diff_layer.path(),
             ext_capture_roots: &[],
         }),
     )
@@ -2096,24 +2099,24 @@ fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_upper
 
     // 到達性の実測結果は成否どちらでも残す（これがこのテストの測定としての産物）。
     println!(
-        "MEASUREMENT: AppContainer child planting a junction in the CoW upper dir -> \
+        "MEASUREMENT: AppContainer child planting a junction in the CoW diff_layer dir -> \
          exit={code} stdout={} stderr={}",
         stdout.trim(),
         stderr.trim()
     );
-    let junction_created = code == 0 && upper.path().join("link").join("id_rsa").exists();
+    let junction_created = code == 0 && diff_layer.path().join("link").join("id_rsa").exists();
 
     // 台帳へ「junction越しのパス」を1件積む。junctionが作れていれば、素の`std::fs::copy`は
     // これを辿ってworkspaceへ機密を落とす（＝BUG-062以前の挙動）。
     harness_change_ledger::store::append_entry(
-        upper.path(),
+        diff_layer.path(),
         ManifestOp::Create,
         "link/id_rsa",
         None,
     );
 
     let report = apply_cow(
-        upper.path(),
+        diff_layer.path(),
         workspace.path(),
         &ApplyOptions {
             only_glob: None,
@@ -2127,7 +2130,7 @@ fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_upper
     let landed = workspace.path().join("link").join("id_rsa");
     assert!(
         !landed.exists(),
-        "apply followed a junction out of the CoW upper dir and copied the secret into the \
+        "apply followed a junction out of the CoW diff_layer dir and copied the secret into the \
          workspace (junction_created={junction_created}, report={report:?})"
     );
     assert!(

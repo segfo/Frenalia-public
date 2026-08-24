@@ -17,7 +17,7 @@ pub(crate) const CONFIG_BLOB_MAX_LEN: usize = 64 * 1024;
 /// 注入パラメータで運ぶ設定のシリアライズ（BUG-045のF2）。`\n`区切り3行・NUL終端のUTF-8:
 ///
 /// ```text
-/// <workspace_root>\n<upper_dir>\n<ext_capture_roots を ';' で連結>\0
+/// <workspace_root>\n<diff_layer_dir>\n<ext_capture_roots を ';' で連結>\0
 /// ```
 ///
 /// 環境変数（`HARNESS_COW_*`）と等価な情報を、**子孫プロセスのenv blockに依存せずに**
@@ -33,7 +33,7 @@ pub(crate) fn serialize_config_blob(cfg: &Config) -> Vec<u8> {
     let mut bytes = format!(
         "{}\n{}\n{}",
         cfg.workspace_root.to_string_lossy(),
-        cfg.upper_dir.to_string_lossy(),
+        cfg.diff_layer_dir.to_string_lossy(),
         ext
     )
     .into_bytes();
@@ -68,7 +68,7 @@ pub(crate) unsafe fn deserialize_config_blob(param: *const u8) -> Option<Config>
 pub(crate) fn parse_config_blob(text: &str) -> Option<Config> {
     let mut lines = text.split('\n');
     let workspace_root = lines.next().filter(|s| !s.is_empty())?;
-    let upper_dir = lines.next().filter(|s| !s.is_empty())?;
+    let diff_layer_dir = lines.next().filter(|s| !s.is_empty())?;
     let ext_capture_roots = lines
         .next()
         .unwrap_or("")
@@ -78,7 +78,7 @@ pub(crate) fn parse_config_blob(text: &str) -> Option<Config> {
         .collect();
     Some(Config {
         workspace_root: PathBuf::from(workspace_root),
-        upper_dir: PathBuf::from(upper_dir),
+        diff_layer_dir: PathBuf::from(diff_layer_dir),
         ext_capture_roots,
     })
 }
@@ -87,11 +87,11 @@ pub(crate) fn parse_config_blob(text: &str) -> Option<Config> {
 /// releaseビルドでは`cfg!(debug_assertions)`により本体が定数畳み込みで消えるため、配布
 /// バイナリには影響しない。
 ///
-/// BUG-041調査で判明: AppContainer子/孫プロセスに付与しているACLはworkspace（RO）とupper_dir（RW）
+/// BUG-041調査で判明: AppContainer子/孫プロセスに付与しているACLはworkspace（RO）とdiff_layer_dir（RW）
 /// のみで、`%TEMP%`直下への書込権は無い。そのため`%TEMP%`へ書く実装は**サンドボックス内から
 /// 常に無音**だった（BUG-033で「ログが生成されなかった＝該当パスを通っていない」と解釈した
 /// 箇所は、この理由で不成立だった可能性が高い——同ファイルに追記済み）。`CONFIG`が既に設定済み
-/// なら`upper_dir`（子・孫とも書込可能、`append_ledger_entry`/`append_warning_entry`と同じ場所）
+/// なら`diff_layer_dir`（子・孫とも書込可能、`append_ledger_entry`/`append_warning_entry`と同じ場所）
 /// へ書き、未設定（`init()`より前、または`CONFIG`取得に失敗する異常系）なら従来通り`%TEMP%`へ
 /// フォールバックする。`--sandbox tier2a-cow`のフック呼び出し頻度は対話セッションのシェルコマンド数程度で
 /// 済むため、ログ肥大やI/O再入（`copy_up`同様に自分自身のフックへ戻ってくる可能性はあるが、
@@ -102,7 +102,7 @@ pub(crate) fn debug_log(msg: &str) {
         return;
     }
     let path = match CONFIG.get() {
-        Some(cfg) => cfg.upper_dir.join(".harness-cow-debug.log"),
+        Some(cfg) => cfg.diff_layer_dir.join(".harness-cow-debug.log"),
         None => std::env::temp_dir().join("harness-cow-debug.log"),
     };
     if let Ok(mut f) = std::fs::OpenOptions::new()

@@ -26,7 +26,7 @@ pub(crate) unsafe fn resolve_module_export(module: &str, name: &str) -> Option<*
 /// `run_shell`呼び出しのたびに別プロセスへ再ロードされ得るため、台帳ファイルを唯一の正本に
 /// して起動のたびに再生する。
 pub(crate) fn load_deleted_set(cfg: &Config) {
-    let ledger_path = cfg.upper_dir.join(COW_OPS_LEDGER_FILENAME);
+    let ledger_path = cfg.diff_layer_dir.join(COW_OPS_LEDGER_FILENAME);
     let Ok(contents) = std::fs::read(&ledger_path) else {
         return;
     };
@@ -49,15 +49,15 @@ pub(crate) fn load_deleted_set(cfg: &Config) {
 pub(crate) unsafe fn resolve_config(param: *const u8) -> Option<Config> {
     if let Some(cfg) = unsafe { deserialize_config_blob(param) } {
         debug_log(&format!(
-            "init: config from injection parameter workspace={:?} upper={:?} ext_roots={:?}",
-            cfg.workspace_root, cfg.upper_dir, cfg.ext_capture_roots
+            "init: config from injection parameter workspace={:?} diff_layer={:?} ext_roots={:?}",
+            cfg.workspace_root, cfg.diff_layer_dir, cfg.ext_capture_roots
         ));
         return Some(finalize_config(cfg));
     }
     debug_log(&format!(
-        "init: config from env, HARNESS_COW_WORKSPACE={:?} HARNESS_COW_UPPER={:?}",
+        "init: config from env, HARNESS_COW_WORKSPACE={:?} HARNESS_COW_DIFF_LAYER={:?}",
         get_env("HARNESS_COW_WORKSPACE"),
-        get_env("HARNESS_COW_UPPER")
+        get_env("HARNESS_COW_DIFF_LAYER")
     ));
     let workspace_root = match get_env("HARNESS_COW_WORKSPACE") {
         Some(v) => PathBuf::from(v),
@@ -66,10 +66,10 @@ pub(crate) unsafe fn resolve_config(param: *const u8) -> Option<Config> {
             return None;
         }
     };
-    let upper_dir = match get_env("HARNESS_COW_UPPER") {
+    let diff_layer_dir = match get_env("HARNESS_COW_DIFF_LAYER") {
         Some(v) => PathBuf::from(v),
         None => {
-            debug_log("init: HARNESS_COW_UPPER not set, bail");
+            debug_log("init: HARNESS_COW_DIFF_LAYER not set, bail");
             return None;
         }
     };
@@ -89,7 +89,7 @@ pub(crate) unsafe fn resolve_config(param: *const u8) -> Option<Config> {
     ));
     Some(finalize_config(Config {
         workspace_root,
-        upper_dir,
+        diff_layer_dir,
         ext_capture_roots,
     }))
 }
@@ -108,7 +108,7 @@ pub(crate) fn finalize_config(cfg: Config) -> Config {
     let normalize = |p: &Path| PathBuf::from(normalize_root_spelling(&p.to_string_lossy()));
     let cfg = Config {
         workspace_root: normalize(&cfg.workspace_root),
-        upper_dir: normalize(&cfg.upper_dir),
+        diff_layer_dir: normalize(&cfg.diff_layer_dir),
         ext_capture_roots: cfg.ext_capture_roots.iter().map(|p| normalize(p)).collect(),
     };
     if !cfg.workspace_root.is_absolute() {
@@ -118,7 +118,7 @@ pub(crate) fn finalize_config(cfg: Config) -> Config {
             &format!(
                 "HARNESS_COW_WORKSPACE is not an absolute path ({}); every absolute-path write \
                  into the workspace will fail to classify and be denied by the read-only ACL \
-                 instead of being redirected to the CoW upper directory (see docs/bugs/BUG-066.md)",
+                 instead of being redirected to the CoW diff_layer directory (see docs/bugs/BUG-066.md)",
                 cfg.workspace_root.display()
             ),
         );
@@ -429,7 +429,7 @@ pub(crate) fn install_create_process_hooks() {
 /// パイプハンドル値であり、その子だけに意味を持つ。しかしenv変数はPhase 4aの孫プロセスにも
 /// そのまま継承されるため、孫の`init()`が**孫プロセス内では無関係な（あるいは無効な）ハンドル値**
 /// へ書き込みを試みてしまう。書き終えた直後に自プロセスのenvから消し、子孫プロセスへ伝播しない
-/// ようにする（`HARNESS_COW_WORKSPACE`/`HARNESS_COW_UPPER`は孫にも必要なので残す）。
+/// ようにする（`HARNESS_COW_WORKSPACE`/`HARNESS_COW_DIFF_LAYER`は孫にも必要なので残す）。
 pub(crate) fn signal_ready() {
     let Some(handle_value) =
         get_env("HARNESS_COW_READY_HANDLE").and_then(|v| v.parse::<isize>().ok())

@@ -497,7 +497,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         net_app,
         run_shell_path_extra,
         vm_sandbox: None,
-        cow_upper_dir: write_mode.upper_dir().map(|p| p.to_path_buf()),
+        cow_diff_layer_dir: write_mode.diff_layer_dir().map(|p| p.to_path_buf()),
         mcp_servers: mcp_facts,
     };
 

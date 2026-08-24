@@ -1,6 +1,6 @@
-//! workspace本体（`preflight`が毎回付与するRW/RO継承ACE）とCoW upper_dirの生存管理。
+//! workspace本体（`preflight`が毎回付与するRW/RO継承ACE）とCoW diff_layer_dirの生存管理。
 //!
-//! 「今このworkspace/upper_dirを使っている他のharnessセッションが生きているか」の判定に、
+//! 「今このworkspace/diff_layer_dirを使っている他のharnessセッションが生きているか」の判定に、
 //! プロセスIDを台帳へ書いて自分でliveness確認する方式ではなく、Windowsの**名前付きmutex**を
 //! 使う。名前付きmutexは、作成したプロセスが（正常終了でもクラッシュでも）いなくなると
 //! Windows自身が自動的にオブジェクトを破棄するため、「まだ誰かが開いているか」を
@@ -11,7 +11,7 @@
 //! ACE（ファイルに1つしか付けられない）の意味がセッション間で食い違うため、`begin_workspace_mode`
 //! が起動時に他モードの生存を確認し、生きていれば起動そのものを拒否する。
 //!
-//! CoW upper_dirはセッション専有なので、セッションIDを名前に含めたmutexを1つ持つだけでよい
+//! CoW diff_layer_dirはセッション専有なので、セッションIDを名前に含めたmutexを1つ持つだけでよい
 //! （他モードとの衝突チェックは不要、生きているかどうかの確認にのみ使う）。
 //!
 //! この生存確認とは別に、`workspace-grant-ledger.json`へ「これまで許可を付けたことがある
@@ -90,7 +90,7 @@ pub fn live_modes(path: &Path) -> Vec<&'static str> {
         .collect()
 }
 
-/// CoW upper_dirはセッション専有のため、セッションIDだけで名前が決まる。
+/// CoW diff_layer_dirはセッション専有のため、セッションIDだけで名前が決まる。
 fn cow_session_mutex_name(session_id: &str) -> String {
     format!("Local\\harness-cow-{session_id}")
 }
@@ -100,7 +100,7 @@ pub fn hold_cow_session_marker(session_id: &str) -> windows::core::Result<()> {
     hold_mutex_for_process_lifetime(&cow_session_mutex_name(session_id))
 }
 
-/// そのセッションのCoW upper_dirがまだ使用中（＝そのセッションのharnessプロセスが
+/// そのセッションのCoW diff_layer_dirがまだ使用中（＝そのセッションのharnessプロセスが
 /// 生きている）かどうか。
 pub fn cow_session_is_live(session_id: &str) -> bool {
     mutex_exists(&cow_session_mutex_name(session_id))
@@ -202,11 +202,11 @@ pub fn prune_workspace_entries(should_remove: impl Fn(&Path) -> bool) -> Vec<Str
     })
 }
 
-// --- CoW upper_dirのセッションメタデータ・列挙（`harness cow`サブコマンド用） ---
+// --- CoW diff_layer_dirのセッションメタデータ・列挙（`harness cow`サブコマンド用） ---
 
-/// upper_dir直下に置く、セッションの由来（どのworkspaceのものか）を記録する小さなマーカー
-/// ファイル。upper_dirがどこにあっても自己完結して読めるように、グローバル台帳ではなく
-/// upper_dir自身の中に置く（台帳が壊れる/消えても`workspace_root`が分からなくならないため）。
+/// diff_layer_dir直下に置く、セッションの由来（どのworkspaceのものか）を記録する小さなマーカー
+/// ファイル。diff_layer_dirがどこにあっても自己完結して読めるように、グローバル台帳ではなく
+/// diff_layer_dir自身の中に置く（台帳が壊れる/消えても`workspace_root`が分からなくならないため）。
 pub const COW_SESSION_META_FILENAME: &str = ".harness-cow-session.json";
 
 /// D-80のレビュー・ライフサイクル上の位置。**GCが「回収してはいけない」を知る唯一の材料**。
@@ -228,7 +228,7 @@ pub enum CowReviewState {
     Settled { settled_at_unix_secs: u64 },
 }
 
-/// upper_dir直下のセッションメタ。
+/// diff_layer_dir直下のセッションメタ。
 ///
 /// **`deny_unknown_fields`が効いている理由を消さないこと。** 新しいharnessが書いたmetaを
 /// 古いharnessが読むと、知らない欄があるだけで**パースが失敗する**。失敗は
@@ -248,7 +248,7 @@ pub struct CowSessionMeta {
     /// D-81で差分層をワークスペースのボリュームへ置けず`%LOCALAPPDATA%`へ戻した理由。
     /// 後から「なぜこの差分層だけ別ボリュームに居るのか」を追えるようにするために残す。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upper_root_fell_back: Option<String>,
+    pub diff_layer_root_fell_back: Option<String>,
 }
 
 /// [`read_cow_session_meta`]の結果。**3値であることが要点。**
@@ -277,13 +277,13 @@ impl CowMetaRead {
     }
 }
 
-/// `preflight`が`--sandbox tier2a-cow`のupper_dir作成直後に呼ぶ。
+/// `preflight`が`--sandbox tier2a-cow`のdiff_layer_dir作成直後に呼ぶ。
 ///
 /// **既にレビュー状態が書かれていたら消さない。** 同じセッションIDで再開（`--resume`）すると
 /// ここがもう一度走るので、素直に上書きするとD-80のレビュー待ちが**起動しただけで消える**
 /// ——次のGCがその差分層を回収してよいものと判定する。既存を読んで引き継ぐ。
-pub fn write_cow_session_meta(upper_dir: &Path, workspace_root: &Path, session_id: &str) {
-    let existing = read_cow_session_meta(upper_dir);
+pub fn write_cow_session_meta(diff_layer_dir: &Path, workspace_root: &Path, session_id: &str) {
+    let existing = read_cow_session_meta(diff_layer_dir);
     // 読めないmetaは**上書きしない**。中身が分からないものを、分かっているつもりの値で
     // 潰すと、判定不能（＝回収しない）だったものが判定可能（＝回収してよい）へ変わる。
     if matches!(existing, CowMetaRead::Unreadable(_)) {
@@ -298,16 +298,16 @@ pub fn write_cow_session_meta(upper_dir: &Path, workspace_root: &Path, session_i
             .map(|p| p.created_at_unix_secs)
             .unwrap_or_else(harness_grant_ledger::now_unix_secs),
         review: previous.as_ref().and_then(|p| p.review.clone()),
-        upper_root_fell_back: previous.and_then(|p| p.upper_root_fell_back),
+        diff_layer_root_fell_back: previous.and_then(|p| p.diff_layer_root_fell_back),
     };
     if let Ok(json) = serde_json::to_string_pretty(&meta) {
-        let _ = std::fs::write(upper_dir.join(COW_SESSION_META_FILENAME), json);
+        let _ = std::fs::write(diff_layer_dir.join(COW_SESSION_META_FILENAME), json);
     }
 }
 
 /// セッションメタを読む。**`Absent`と`Unreadable`を区別して返す**（[`CowMetaRead`]のdoc参照）。
-pub fn read_cow_session_meta(upper_dir: &Path) -> CowMetaRead {
-    let path = upper_dir.join(COW_SESSION_META_FILENAME);
+pub fn read_cow_session_meta(diff_layer_dir: &Path) -> CowMetaRead {
+    let path = diff_layer_dir.join(COW_SESSION_META_FILENAME);
     match std::fs::read_to_string(&path) {
         Ok(s) => match serde_json::from_str::<CowSessionMeta>(&s) {
             Ok(meta) => CowMetaRead::Ok(Box::new(meta)),
@@ -322,7 +322,7 @@ pub fn read_cow_session_meta(upper_dir: &Path) -> CowMetaRead {
 /// [`crate::session_scope`]が正本である。ここから再公開しているのは、`harness cow`系
 /// サブコマンドがこのモジュール越しに引いているためで、**定義を2つ持たないことが目的**
 /// （`bug-pattern-rules` B-05）。
-pub use crate::session_scope::{cow_profile_upper_root, cow_upper_dir_in, cow_upper_roots};
+pub use crate::session_scope::{cow_profile_diff_layer_root, cow_diff_layer_dir_in, cow_diff_layer_roots};
 
 /// 見つかった差分層1件（棚卸しの単位）。
 ///
@@ -332,7 +332,7 @@ pub use crate::session_scope::{cow_profile_upper_root, cow_upper_dir_in, cow_upp
 #[derive(Debug, Clone)]
 pub struct CowSessionDir {
     pub session_id: String,
-    pub upper_dir: PathBuf,
+    pub diff_layer_dir: PathBuf,
 }
 
 /// これまでに作られた全セッションの差分層を、**全部の根**から列挙する。
@@ -341,7 +341,7 @@ pub struct CowSessionDir {
 /// 「本当に無い」のか「材料が見えていない」のかを呼び出し側が区別できるようにするため、
 /// **黙って飛ばさない**（`shared-state-exclusion` 問6）。
 pub fn list_cow_sessions() -> (Vec<CowSessionDir>, usize) {
-    let (roots, unreachable) = cow_upper_roots();
+    let (roots, unreachable) = cow_diff_layer_roots();
     let mut found = Vec::new();
     for root in roots {
         let Ok(entries) = std::fs::read_dir(&root) else {
@@ -355,7 +355,7 @@ pub fn list_cow_sessions() -> (Vec<CowSessionDir>, usize) {
                 continue;
             };
             found.push(CowSessionDir {
-                upper_dir: entry.path(),
+                diff_layer_dir: entry.path(),
                 session_id,
             });
         }
@@ -363,33 +363,33 @@ pub fn list_cow_sessions() -> (Vec<CowSessionDir>, usize) {
     (found, unreachable)
 }
 
-/// `upper_dir`配下にあるファイルの相対パス一覧を返す（CoW自身の帳簿は除外する）。
-/// upper_dirには実際に触られたファイルしか存在しないため、この一覧がそのままworkspace本体
+/// `diff_layer_dir`配下にあるファイルの相対パス一覧を返す（CoW自身の帳簿は除外する）。
+/// diff_layer_dirには実際に触られたファイルしか存在しないため、この一覧がそのままworkspace本体
 /// に対する変更点になる。
 ///
-/// 走査規則は`harness_change_ledger::store::scan_upper_content_files`が唯一の実装
+/// 走査規則は`harness_change_ledger::store::scan_diff_layer_content_files`が唯一の実装
 /// （`docs/CODE-STRUCTURE-RULES.md`規則5）。以前はここに独自の走査があり、除外していたのが
 /// セッションメタと操作台帳の2つだけだったため、denied/warnings台帳やbaselineミラーまで
 /// 「変更されたファイル」として数えていた（`harness cow list`の`changed_files=`が過大）。
-pub fn list_cow_upper_files(upper_dir: &Path) -> Vec<PathBuf> {
-    harness_change_ledger::store::scan_upper_content_files(upper_dir)
+pub fn list_cow_diff_layer_files(diff_layer_dir: &Path) -> Vec<PathBuf> {
+    harness_change_ledger::store::scan_diff_layer_content_files(diff_layer_dir)
         .into_iter()
         .map(PathBuf::from)
         .collect()
 }
 
-/// `upper_dir`直下の操作台帳（`.harness-cow-ops.jsonl`）を読み、現在の論理的な変更一覧を返す
+/// `diff_layer_dir`直下の操作台帳（`.harness-cow-ops.jsonl`）を読み、現在の論理的な変更一覧を返す
 /// （`harness changes`・apply/discardの入力）。CoW一本化（Phase 2）により、実体は
 /// `harness_change_ledger::store::replay_ledger`（`--staged`のオーバーレイディレクトリにも
 /// 同じ関数を使う、`SandboxFs::change_set`参照）そのもの。台帳が無ければ空（変更なし）を返す。
-pub fn read_cow_ledger(upper_dir: &Path) -> Vec<harness_change_ledger::CowChange> {
-    harness_change_ledger::store::replay_ledger(upper_dir)
+pub fn read_cow_ledger(diff_layer_dir: &Path) -> Vec<harness_change_ledger::CowChange> {
+    harness_change_ledger::store::replay_ledger(diff_layer_dir)
 }
 
 /// `apply`が実際にworkspace本体へ反映した`applied_paths`を台帳から取り除く（適用済みの
 /// 変更が`harness changes`に永続的に残り続けるのを防ぐ）。実体は`store::prune_ledger`。
-pub fn prune_cow_ledger(upper_dir: &Path, applied_paths: &[String]) -> std::io::Result<()> {
-    harness_change_ledger::store::prune_ledger(upper_dir, applied_paths);
+pub fn prune_cow_ledger(diff_layer_dir: &Path, applied_paths: &[String]) -> std::io::Result<()> {
+    harness_change_ledger::store::prune_ledger(diff_layer_dir, applied_paths);
     Ok(())
 }
 
@@ -398,7 +398,7 @@ pub fn prune_cow_ledger(upper_dir: &Path, applied_paths: &[String]) -> std::io::
 /// 「差分層を作る」と「差分層を掃く」を直列化するロックの名前。
 ///
 /// **両側で取らなければ意味が無い。** `preflight`（と`session_scope`の切替経路）は
-/// `create_dir_all(upper)` → ACE付与 → メタ書込 → **最後に**生存マーカー、の順で進むので、
+/// `create_dir_all(差分層)` → ACE付与 → メタ書込 → **最後に**生存マーカー、の順で進むので、
 /// その間ずっと「ディレクトリは在るが生存マーカーはまだ無い」窓が開いている。並行して走る
 /// 別の`harness.exe`のGCがこの窓を覗くと**起動しかけのセッションが空の殻に見える**。
 /// 掃く側だけがロックを取っても、何も直列化されない（`bug-pattern-rules` B-18・
@@ -421,7 +421,7 @@ pub const COW_GC_DEFAULT_GRACE_SECS: u64 = 60 * 60;
 #[derive(Debug, Clone)]
 pub struct CowSessionFacts {
     pub session_id: String,
-    pub upper_dir: PathBuf,
+    pub diff_layer_dir: PathBuf,
     /// 生存マーカー（名前付きmutex）が在る＝そのセッションのharnessがまだ動いている。
     pub is_live: bool,
     /// メタが壊れている、または**このバイナリが知らない形**をしている。
@@ -430,7 +430,7 @@ pub struct CowSessionFacts {
     pub review_pending: bool,
     /// 操作台帳を再生して残る変更の件数。
     pub pending_changes: usize,
-    /// upper配下に実在する内容ファイルの件数（台帳に記録されていない直書きも含む）。
+    /// 差分層配下に実在する内容ファイルの件数（台帳に記録されていない直書きも含む）。
     pub content_files: usize,
     /// メタの作成時刻。メタが無い／読めない場合は**ディレクトリの更新時刻で代用する**
     /// （採取側の責務）。起動しかけの差分層はまだメタを持たないので、ここが埋まらないと
@@ -565,10 +565,10 @@ pub fn collect_cow_session_facts() -> (Vec<CowSessionFacts>, usize) {
         .into_iter()
         .map(|d| {
             let root = d
-                .upper_dir
+                .diff_layer_dir
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| d.upper_dir.clone());
+                .unwrap_or_else(|| d.diff_layer_dir.clone());
             let is_remote = *volume_is_remote.entry(root.clone()).or_insert_with(|| {
                 #[cfg(windows)]
                 {
@@ -584,8 +584,8 @@ pub fn collect_cow_session_facts() -> (Vec<CowSessionFacts>, usize) {
                     false
                 }
             });
-            let meta = read_cow_session_meta(&d.upper_dir);
-            let dir_mtime = std::fs::metadata(&d.upper_dir)
+            let meta = read_cow_session_meta(&d.diff_layer_dir);
+            let dir_mtime = std::fs::metadata(&d.diff_layer_dir)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -598,8 +598,8 @@ pub fn collect_cow_session_facts() -> (Vec<CowSessionFacts>, usize) {
                     meta.ok().and_then(|m| m.review.as_ref()),
                     Some(CowReviewState::Pending { .. })
                 ),
-                pending_changes: read_cow_ledger(&d.upper_dir).len(),
-                content_files: list_cow_upper_files(&d.upper_dir).len(),
+                pending_changes: read_cow_ledger(&d.diff_layer_dir).len(),
+                content_files: list_cow_diff_layer_files(&d.diff_layer_dir).len(),
                 // メタが無い／読めないときはディレクトリの更新時刻で代用する。ここを
                 // 0のままにすると、**メタを書く前の起動しかけ**が常にgraceの外になる。
                 created_at_unix_secs: meta
@@ -610,7 +610,7 @@ pub fn collect_cow_session_facts() -> (Vec<CowSessionFacts>, usize) {
                 workspace_root: meta.ok().map(|m| m.workspace_root.clone()),
                 volume_is_remote: is_remote,
                 session_id: d.session_id,
-                upper_dir: d.upper_dir,
+                diff_layer_dir: d.diff_layer_dir,
             }
         })
         .collect();
@@ -659,7 +659,7 @@ pub fn run_cow_gc(
                 outcome.collected.push(session_id);
                 continue;
             }
-            match crate::session_scope::remove_overlay_dir(&fact.upper_dir) {
+            match crate::session_scope::remove_overlay_dir(&fact.diff_layer_dir) {
                 Ok(()) => outcome.collected.push(session_id),
                 Err(e) => outcome.failures.push((session_id, e.to_string())),
             }
@@ -680,7 +680,7 @@ mod cow_gc_tests {
     fn empty_and_old() -> CowSessionFacts {
         CowSessionFacts {
             session_id: "session-1".into(),
-            upper_dir: PathBuf::from("C:/x/session-1"),
+            diff_layer_dir: PathBuf::from("C:/x/session-1"),
             is_live: false,
             meta_unreadable: false,
             review_pending: false,
@@ -849,7 +849,7 @@ mod cow_gc_tests {
                 review_ref: "refs/harness/review/s".into(),
                 fetched_at_unix_secs: 2,
             }),
-            upper_root_fell_back: None,
+            diff_layer_root_fell_back: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: CowSessionMeta = serde_json::from_str(&json).unwrap();

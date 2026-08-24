@@ -5,7 +5,7 @@
 //!
 //! `cow_diagnostics`（`crates/harness-sandbox/src/win_appcontainer.rs`）が、このプローブ自身を
 //! Redirector DLL注入済みの孫プロセスとして起動し、このプローブが`CreateProcessA`/`WinExec`
-//! 経由でひ孫プロセスを起動したときにもDLLが再注入され、ひ孫の書込がCoW upperへ透過
+//! 経由でひ孫プロセスを起動したときにもDLLが再注入され、ひ孫の書込がCoW 差分層へ透過
 //! リダイレクトされることを確認するために使う。
 
 use serde_json::{json, Value};

@@ -171,8 +171,8 @@ pub enum PrivilegedRequest {
     /// ——`runas`の昇格先が別の管理者アカウントだと`HKCU`が別ハイブになるため（`server.rs`参照）。
     RevokeFsAllow { entries: Vec<FsAllowRevoke> },
     /// **非管理者からのTier2a起動が特権を要するときに通る唯一の要求**。
-    /// `win_appcontainer::preflight`が自動検知した、workspace_root/upper_dir祖先チェーンの
-    /// traverse不足（複数ターゲットあり得る、`--sandbox tier2a-cow`ではworkspace_rootとupper_dirの2つ）と
+    /// `win_appcontainer::preflight`が自動検知した、workspace_root/diff_layer_dir祖先チェーンの
+    /// traverse不足（複数ターゲットあり得る、`--sandbox tier2a-cow`ではworkspace_rootとdiff_layer_dirの2つ）と
     /// `--fs-allow`昇格要求を、1回のUACへまとめて処理する（起動あたりUAC最大1回の原則、
     /// `plans/DESIGN-SANDBOX-PRIVSEP.md` D-16/D-31「特権昇格デーモンを使う際の注意点」参照）。
     /// `preflight`はtraverse不足の有無で分岐せず、常にこの1本へ束ねる。

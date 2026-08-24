@@ -212,7 +212,7 @@ impl Tool for RunShellTool {
             net_domain_policy_requested,
             ctx.vm_sandbox.as_ref(),
             &ctx.workspace_root,
-            ctx.cow_upper_dir.as_deref(),
+            ctx.cow_diff_layer_dir.as_deref(),
             &ctx.shell_tier.granted_passthrough,
         )
         .await?;

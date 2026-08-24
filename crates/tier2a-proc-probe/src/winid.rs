@@ -118,6 +118,6 @@ pub fn collect_identity() -> Value {
         "redirector_x64_loaded": module_loaded("harness_redirector.dll"),
         "redirector_x86_loaded": module_loaded("harness_redirector_x86.dll"),
         "env_cow_workspace": std::env::var("HARNESS_COW_WORKSPACE").ok(),
-        "env_cow_upper": std::env::var("HARNESS_COW_UPPER").ok(),
+        "env_cow_diff_layer": std::env::var("HARNESS_COW_DIFF_LAYER").ok(),
     })
 }

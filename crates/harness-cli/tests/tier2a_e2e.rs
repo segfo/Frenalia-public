@@ -4,14 +4,14 @@
 //! 台本化された`run_shell`呼び出しを返す）。
 //!
 //! 実行方法・前提条件は`docs/DEV-ENVIRONMENT.md`「Tier2a E2Eテストの実行方法」参照。
-//! 実AppContainer・実CoW upperディレクトリ・（ネット側は）実インターネット到達性を使う
+//! 実AppContainer・実CoW 差分層ディレクトリ・（ネット側は）実インターネット到達性を使う
 //! 重い/副作用ありのテストのため、既定の`cargo test`では走らない（`#[ignore]`、
 //! `crates/harness-sandbox/src/win_appcontainer.rs`の既存規約と同じ）。
 //!
 //! ワークスペースは`C:\harness-e2e\<case>\`固定（`%TEMP%`を使うと`preflight`がプロファイル
 //! 全階層のtraverse ACEを恒久付与し、保護対象の`traverse-grant-ledger.json`を汚すため、
 //! `docs/STATUS.md`「Tier2a起動時のtraverse ACE自動付与（D-31）」参照）。成功したケースは
-//! ワークスペース・CoW upperセッション・スクラッチファイルを削除する。失敗したケースは
+//! ワークスペース・CoW 差分層セッション・スクラッチファイルを削除する。失敗したケースは
 //! 調査のため残す。
 
 #![cfg(all(windows, feature = "e2e-mock"))]
@@ -101,7 +101,7 @@ fn end_turn(text: &str) -> Vec<StreamEvent> {
 }
 
 /// host内蔵`write_file`ツールを1回だけ呼ぶ台本（CoW一本化: run_shellではなくwrite_file自身が
-/// CoW upperへ捕まることを確認するための対照ケース）。
+/// CoW 差分層へ捕まることを確認するための対照ケース）。
 fn write_file_tool_turns(path: &str, content: &str) -> Vec<Vec<StreamEvent>> {
     vec![
         tool_use_turn(
@@ -294,15 +294,15 @@ fn new_cow_session(before: &HashSet<String>) -> Result<String, String> {
 /// D-81で差分層の根が複数になったので、**全部の根を探す**。
 /// ここでプロファイル側の根だけを見ると、別ボリュームのワークスペースで走らせたときだけ
 /// 「セッションが見つからない」という無関係な失敗になる。
-fn cow_upper_dir(session_id: &str) -> PathBuf {
-    let (roots, _unreachable) = harness_sandbox::session_scope::cow_upper_roots();
+fn cow_diff_layer_dir(session_id: &str) -> PathBuf {
+    let (roots, _unreachable) = harness_sandbox::session_scope::cow_diff_layer_roots();
     roots
         .iter()
-        .map(|root| harness_sandbox::session_scope::cow_upper_dir_in(root, session_id))
+        .map(|root| harness_sandbox::session_scope::cow_diff_layer_dir_in(root, session_id))
         .find(|dir| dir.is_dir())
         .unwrap_or_else(|| {
             // まだ作られていない場合は、プロファイル側の根の下を指す（従来の挙動）。
-            harness_sandbox::session_scope::cow_upper_dir_in(
+            harness_sandbox::session_scope::cow_diff_layer_dir_in(
                 roots.first().expect("at least the profile root must resolve"),
                 session_id,
             )
@@ -374,10 +374,10 @@ fn expect_eq(what: &str, actual: &str, expected: &str) -> Result<(), String> {
     }
 }
 
-/// 成功時のみワークスペース・CoW upperセッション・スクラッチを削除する（Q10）。
+/// 成功時のみワークスペース・CoW 差分層セッション・スクラッチを削除する（Q10）。
 fn cleanup_on_success(ws: &Path, sessions: &[&str], case_name: &str) {
     for session_id in sessions {
-        let _ = std::fs::remove_dir_all(cow_upper_dir(session_id));
+        let _ = std::fs::remove_dir_all(cow_diff_layer_dir(session_id));
     }
     let _ = std::fs::remove_dir_all(ws);
     let scratch = scratch_dir();
@@ -645,7 +645,7 @@ fn case_f_partial_then_rest_matches_commit_all() -> Result<(), String> {
     Ok(())
 }
 
-/// G: D-05ハードデニー。`.git/config`をupperへ書いてもapplyで実workspaceへ書き戻せないこと。
+/// G: D-05ハードデニー。`.git/config`を差分層へ書いてもapplyで実workspaceへ書き戻せないこと。
 fn case_g_hard_deny_config_injection() -> Result<(), String> {
     let ws = case_dir("cow-g-hard-deny");
     let session1 = setup_baseline(&ws, "cow-g")?;
@@ -787,7 +787,7 @@ fn case_i_write_file_tool_is_captured_by_cow() -> Result<(), String> {
     Ok(())
 }
 
-/// J: `discard`（upper丸ごと破棄）。`--output-format`が無くテキスト出力のみ（`Discard`は
+/// J: `discard`（差分層丸ごと破棄）。`--output-format`が無くテキスト出力のみ（`Discard`は
 /// JSON化されていない）ため、既存`case_h_toctou_conflict`が後始末目的で同コマンドを呼ぶ
 /// 前例に倣い、終了コードと文字列マッチで検証する。
 fn case_j_discard_removes_all_changes() -> Result<(), String> {
@@ -914,7 +914,7 @@ fn case_k_resolve_auto_merges_non_overlapping_conflict() -> Result<(), String> {
     Ok(())
 }
 
-/// L: `--resume <id> --sandbox tier2a-cow`によるセッション再開（設計書§19.11、仕様確定: 同一upper_dirを
+/// L: `--resume <id> --sandbox tier2a-cow`によるセッション再開（設計書§19.11、仕様確定: 同一diff_layer_dirを
 /// 再利用し同一セッションIDで継続キャプチャする）。1つの`--sandbox tier2a-cow`セッションで変更を行い
 /// （discardせず）プロセスを終了し、同じセッションIDで`--resume --sandbox tier2a-cow`により再開して
 /// 追加の変更を行い、`apply`で両方の変更が反映されることを確認する。
@@ -954,7 +954,7 @@ fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
             run2.stderr
         ));
     }
-    // resumeは新しいCoWセッションを作らず、同じsession_idのupper_dirを再利用しているはず。
+    // resumeは新しいCoWセッションを作らず、同じsession_idのdiff_layer_dirを再利用しているはず。
     let after_resume = list_cow_sessions();
     if !after_resume.contains(&session_id) {
         return Err(format!(
@@ -1003,7 +1003,7 @@ fn cow_session_is_live(session_id: &str) -> bool {
 /// M（BUG-047回帰）: `ROUND1_SCRIPT`/`ROUND2_SCRIPT`ベースのA〜L系ケースは、いずれもラウンド間で
 /// `apply_cow`（コミット）を挟むため、「セッション中に新規作成したファイルをそのセッション内で
 /// 削除する」経路を一度も通らない。BUG-047はまさにその経路（`NtQueryDirectoryFile`未フックにより
-/// ディレクトリ列挙がupper側だけの新規ファイルを見落とし、`Remove-Item`が「存在しない」と誤判定
+/// ディレクトリ列挙が差分層側だけの新規ファイルを見落とし、`Remove-Item`が「存在しない」と誤判定
 /// する）で発生したため、既存マトリクスでは検出できなかった（ユーザー報告: ハーネス起動後に
 /// 新規作成したファイルを削除しようとすると失敗する。ハーネス起動前から存在するファイルの削除は
 /// 問題なかった——後者は個別パス指定のオープンだけで完結し列挙を経由しないため）。
@@ -1063,7 +1063,7 @@ deleted = $deleted; err = $err; existsAfterDelete = $existsAfterDelete } | Conve
         return Err(format!(
             "Remove-Item on the session-created file must succeed \
              (BUG-047: it previously failed as ItemNotFoundException because directory \
-             enumeration never saw the upper-only file): {report}"
+             enumeration never saw the diff-layer-only file): {report}"
         ));
     }
     if !report["err"].is_null() {
@@ -1083,7 +1083,7 @@ deleted = $deleted; err = $err; existsAfterDelete = $existsAfterDelete } | Conve
 /// で判定していたため、`Get-ChildItem`のディレクトリopenや`Get-Content`の読み取りopenまで
 /// 「書込意図あり」と誤判定し、以下のユーザー報告そのものの症状を起こしていた
 /// （`docs/CowIssueSummary.md`）:
-/// - `Get-ChildItem`がworkspace本体ではなくCoW upperの中身だけを返す
+/// - `Get-ChildItem`がworkspace本体ではなくCoW 差分層の中身だけを返す
 /// - 既存ファイルの読み取り（`Get-Content`）だけで`.harness-cow-ops.jsonl`へ偽の`modify`が
 ///   積まれる
 ///
@@ -1157,7 +1157,7 @@ $seedContent = [string](Get-Content seed.txt -Raw); \
         ));
     }
 
-    let ops_path = cow_upper_dir(&session).join(".harness-cow-ops.jsonl");
+    let ops_path = cow_diff_layer_dir(&session).join(".harness-cow-ops.jsonl");
     if ops_path.exists() {
         let ops_text = std::fs::read_to_string(&ops_path).unwrap_or_default();
         if ops_text.contains("seed.txt") {
@@ -1172,25 +1172,25 @@ $seedContent = [string](Get-Content seed.txt -Raw); \
     Ok(())
 }
 
-/// O（[BUG-066](../../../docs/bugs/BUG-066.md)の回帰）: `run_shell`から**CoW upperの絶対パスを
+/// O（[BUG-066](../../../docs/bugs/BUG-066.md)の回帰）: `run_shell`から**CoW 差分層の絶対パスを
 /// 直接指定して**書いたファイルが、操作台帳に載り`changes`に現れ`apply`で実workspaceへ反映される。
 ///
 /// 実際にモデルがやったのはこれである——workspace内への`Set-Content`が拒否され続けたので、
-/// システムプロンプトに書かれていたupperのパスへ直接書いた。upperはサンドボックス子へRW付与
+/// システムプロンプトに書かれていた差分層のパスへ直接書いた。差分層はサンドボックス子へRW付与
 /// されているので書込自体は成功し、しかし`copy_up`を経由しないので台帳には何も残らず、
 /// `harness changes`は「変更なし」と答え、`discard`すれば作業ごと消える状態になっていた。
 ///
-/// upperのパスは子プロセスから`$env:HARNESS_COW_UPPER`で引ける（Redirector DLLへ設定を渡す
+/// 差分層のパスは子プロセスから`$env:HARNESS_COW_DIFF_LAYER`で引ける（Redirector DLLへ設定を渡す
 /// ための環境変数。モデルにはシステムプロンプトでも見えている）。
 ///
 /// なお**DLLが注入されなかった/回避された場合**（台帳へ何も書かれない場合）の受け皿は
 /// host側の実体走査であり、そちらは`overlay.rs`のユニットテスト
 /// （`unledgered_*`）が固定している。ここで見るのはDLLが生きている経路の方。
-fn case_o_direct_write_into_the_upper_dir_is_recorded() -> Result<(), String> {
-    let ws = case_dir("cow-o-direct-upper-write");
+fn case_o_direct_write_into_the_diff_layer_dir_is_recorded() -> Result<(), String> {
+    let ws = case_dir("cow-o-direct-diff-layer-write");
     let before = list_cow_sessions();
-    const SCRIPT: &str = "Set-Content (Join-Path $env:HARNESS_COW_UPPER 'direct.txt') \
-                          'written straight into the upper dir' -NoNewline";
+    const SCRIPT: &str = "Set-Content (Join-Path $env:HARNESS_COW_DIFF_LAYER 'direct.txt') \
+                          'written straight into the diff_layer dir' -NoNewline";
     let run = run_harness(
         &ws,
         &run_shell_script_turns(SCRIPT),
@@ -1202,18 +1202,18 @@ fn case_o_direct_write_into_the_upper_dir_is_recorded() -> Result<(), String> {
     }
     let session = new_cow_session(&before)?;
 
-    let upper_file = cow_upper_dir(&session).join("direct.txt");
-    if !upper_file.exists() {
+    let diff_layer_file = cow_diff_layer_dir(&session).join("direct.txt");
+    if !diff_layer_file.exists() {
         return Err(format!(
             "the script must have created {} (if this fails the test setup is wrong, not the fix)",
-            upper_file.display()
+            diff_layer_file.display()
         ));
     }
-    let ops_text = std::fs::read_to_string(cow_upper_dir(&session).join(".harness-cow-ops.jsonl"))
+    let ops_text = std::fs::read_to_string(cow_diff_layer_dir(&session).join(".harness-cow-ops.jsonl"))
         .unwrap_or_default();
     if !ops_text.contains("direct.txt") {
         return Err(format!(
-            "BUG-066: a direct write into the upper dir must be recorded in the operations \
+            "BUG-066: a direct write into the diff_layer dir must be recorded in the operations \
              ledger, but the ledger is {ops_text:?}"
         ));
     }
@@ -1233,7 +1233,7 @@ fn case_o_direct_write_into_the_upper_dir_is_recorded() -> Result<(), String> {
     expect_eq(
         "direct.txt",
         &read_file(&ws.join("direct.txt"))?,
-        "written straight into the upper dir",
+        "written straight into the diff layer dir",
     )?;
 
     cleanup_on_success(&ws, &[&session], "cow-o");
@@ -1302,7 +1302,7 @@ fn assert_cow_redirect_through_cwd(
         ));
     }
     let session = new_cow_session(&before)?;
-    let upper = cow_upper_dir(&session);
+    let diff_layer = cow_diff_layer_dir(&session);
 
     // 1. 境界: workspace本体は不変。
     expect_eq(
@@ -1310,14 +1310,14 @@ fn assert_cow_redirect_through_cwd(
         &read_file(&real.join("notes.txt"))?,
         "original",
     )?;
-    // 2. 透過性: upperへリダイレクトされている。
-    let upper_content = read_file(&upper.join("notes.txt")).map_err(|e| {
+    // 2. 透過性: 差分層へリダイレクトされている。
+    let diff_layer_content = read_file(&diff_layer.join("notes.txt")).map_err(|e| {
         format!(
-            "--cwd {cwd_arg:?}: the write was not redirected to the upper dir ({e}); \
+            "--cwd {cwd_arg:?}: the write was not redirected to the diff_layer dir ({e}); \
                  this is exactly the BUG-066 symptom"
         )
     })?;
-    expect_eq("upper content", &upper_content, "modified-by-agent")?;
+    expect_eq("diff layer content", &diff_layer_content, "modified-by-agent")?;
     // 3. 可視性: 操作台帳に載り、`apply`で実workspaceへ反映される。
     let report = apply_cow(&real, &session, None)?;
     let applied: Vec<String> = report["applied"]
@@ -1337,7 +1337,7 @@ fn assert_cow_redirect_through_cwd(
         "modified-by-agent",
     )?;
     // 4. 自己診断: workspace**内**への拒否が1件も無いこと（あればリダイレクトが働いていない）。
-    let denied = harness_change_ledger::store::read_denied_log(&upper);
+    let denied = harness_change_ledger::store::read_denied_log(&diff_layer);
     let inside: Vec<&str> = denied
         .iter()
         .filter(|e| {
@@ -1512,8 +1512,8 @@ fn tier2a_cow_commit_matrix() {
             case_n_ls_merges_preexisting_and_new_files_read_does_not_dirty_ledger,
         ),
         (
-            "O-direct-upper-write-is-recorded",
-            case_o_direct_write_into_the_upper_dir_is_recorded,
+            "O-direct-diff-layer-write-is-recorded",
+            case_o_direct_write_into_the_diff_layer_dir_is_recorded,
         ),
         // P〜S: BUG-066追加検証。`--cwd`の綴り4形（相対・大小差・末尾区切り・`\\?\`）を
         // 製品通しで測る（`run_cwd_spelling_case`のdoc参照）。
@@ -1547,7 +1547,7 @@ fn tier2a_cow_commit_matrix() {
 /// サンドボックス外（このテストプロセス自身、昇格済み）で回す素の`git`。種付けと最後の
 /// `checkout`に使う。ハードニングenv（`harness-core::git::hardening_env`）は**わざと通さない**
 /// ——ここはサンドボックス内でモデルが起動する git ではなく、テスト足場の git だから。
-/// `-c safe.directory=*`と作者identityだけ固定する（AppContainerが書いた upper 由来の
+/// `-c safe.directory=*`と作者identityだけ固定する（AppContainerが書いた 差分層 由来の
 /// オブジェクトを apply で受けた実リポジトリを、別条件で触っても「dubious ownership」等で
 /// 落ちないように）。
 fn plain_git(ws: &Path, args: &[&str]) -> Result<String, String> {
@@ -1577,7 +1577,7 @@ fn plain_git(ws: &Path, args: &[&str]) -> Result<String, String> {
 
 /// 実workspaceに正当な git リポジトリを1つ種付けする（`master`＝README1件のコミット）。
 /// **サンドボックスの外**で作るので、以後の CoW セッション内 git はこの`.git`を読む
-/// （RO読取は read scope 内、書込は upper へリダイレクト）。
+/// （RO読取は read scope 内、書込は 差分層 へリダイレクト）。
 fn git_seed_repo(ws: &Path) -> Result<(), String> {
     std::fs::write(ws.join("README.md"), "seed\n")
         .map_err(|e| format!("seed README: {e}"))?;
@@ -1611,7 +1611,7 @@ fn count_loose_git_objects(ws: &Path) -> usize {
 /// CoWセッション内で **git だけ** を使い、hard-deny 対象パス(`.github/workflows/x.yml`)を
 /// 「ワークツリー実体」ではなく「コミット・オブジェクト＋ブランチ移動」として運ぶ台本。
 ///
-/// 全 git 出力を`_git-log.txt`（ワークツリー、＝upperへ捕捉される）へ落とし、セッション後に
+/// 全 git 出力を`_git-log.txt`（ワークツリー、＝差分層へ捕捉される）へ落とし、セッション後に
 /// テスト側が読んで診断できるようにする（run_shellの出力はモックへ返るだけで harness の
 /// stdout には出ないため）。`$env:GIT_*`で作者identityを固定し、ハードニングenvの
 /// `GIT_CONFIG_COUNT`とは衝突しない別チャネルで author を与える。
@@ -1646,8 +1646,8 @@ git -c safe.directory=* rev-parse HEAD *>> _git-log.txt
 /// もので、`crates/harness-redirector/src/ntpath.rs` の `resolve_relative_via_handle_map` が本体。
 ///
 /// **緑 = 修正が効いている**（git がオブジェクトを書き、`commit` が exit 0）。
-/// **赤 = まだ完走しない**（対応表に無いハンドルが残る等）。赤なら upper の `_git-log.txt` と、
-/// `resolve_relative_via_handle_map` が仕込んだ hit/miss ログ（upper の `.harness-cow-debug.log`）で
+/// **赤 = まだ完走しない**（対応表に無いハンドルが残る等）。赤なら 差分層 の `_git-log.txt` と、
+/// `resolve_relative_via_handle_map` が仕込んだ hit/miss ログ（差分層 の `.harness-cow-debug.log`）で
 /// どのハンドルが未解決かを辿る。
 ///
 /// **このテストは 穴2（CoW 下で git が動かない）だけを見る。** 穴1（apply の層3 hard-deny が
@@ -1684,9 +1684,9 @@ fn git_commit_under_cow_probe() -> Result<(), String> {
         ));
     }
     let session = new_cow_session(&before)?;
-    let upper = cow_upper_dir(&session);
-    let git_log = std::fs::read_to_string(upper.join("_git-log.txt"))
-        .unwrap_or_else(|e| format!("(could not read upper/_git-log.txt: {e})"));
+    let diff_layer = cow_diff_layer_dir(&session);
+    let git_log = std::fs::read_to_string(diff_layer.join("_git-log.txt"))
+        .unwrap_or_else(|e| format!("(could not read diff_layer/_git-log.txt: {e})"));
 
     // 台帳（apply 前の changes 一覧）に git オブジェクトが載ったか。
     let changes = list_changes_json(&ws, &session)?;
@@ -1700,7 +1700,7 @@ fn git_commit_under_cow_probe() -> Result<(), String> {
         .iter()
         .filter(|p| p.starts_with(".git/objects/"))
         .collect();
-    let upper_loose_objects = count_loose_git_objects(&upper);
+    let diff_layer_loose_objects = count_loose_git_objects(&diff_layer);
     let commit_ok = git_log.contains("commit exit=0");
     // 対照: 通常のファイル書込（ワークツリー実体）の copy-up が成立していること
     //（＝Redirector はロードされ、セッションは実際に走った。空振り緑を避ける、B-35）。
@@ -1709,7 +1709,7 @@ fn git_commit_under_cow_probe() -> Result<(), String> {
     let evidence = serde_json::json!({
         "bug": "BUG-128",
         "git_objects_in_ledger": object_entries.len(),
-        "upper_loose_objects": upper_loose_objects,
+        "diff_layer_loose_objects": diff_layer_loose_objects,
         "commit_reported_exit_0": commit_ok,
         "working_tree_copy_up_succeeded": working_tree_copy_up,
         "changes_paths_sample": change_paths.iter().take(30).collect::<Vec<_>>(),
@@ -1719,28 +1719,28 @@ fn git_commit_under_cow_probe() -> Result<(), String> {
         return Err(format!(
             "control failed: the CoW session did not even copy-up the working-tree file, so a green \
              result would be vacuous (the session may not have run under the redirector).\n\
-             {evidence:#}\n--- upper/_git-log.txt ---\n{git_log}"
+             {evidence:#}\n--- diff_layer/_git-log.txt ---\n{git_log}"
         ));
     }
 
-    if object_entries.is_empty() && upper_loose_objects == 0 {
+    if object_entries.is_empty() && diff_layer_loose_objects == 0 {
         return Err(format!(
             "BUG-128 still reproduces: git wrote NO objects under CoW. The handle-map fallback \
-             (resolve_relative_via_handle_map) did not resolve git's openat chain — check upper/\
+             (resolve_relative_via_handle_map) did not resolve git's openat chain — check diff_layer/\
              .harness-cow-debug.log for which root handle was 'not in handle_paths'.\n{evidence:#}\n\
-             --- upper/_git-log.txt ---\n{git_log}"
+             --- diff_layer/_git-log.txt ---\n{git_log}"
         ));
     }
 
     if !commit_ok {
         return Err(format!(
             "git wrote objects but `git commit` did not report exit=0 — the fix is partial.\n\
-             {evidence:#}\n--- upper/_git-log.txt ---\n{git_log}"
+             {evidence:#}\n--- diff_layer/_git-log.txt ---\n{git_log}"
         ));
     }
 
     // 緑: 修正が効いている（git がオブジェクトを書き、commit が完走した）。
-    println!("{evidence:#}\n--- upper/_git-log.txt ---\n{git_log}");
+    println!("{evidence:#}\n--- diff_layer/_git-log.txt ---\n{git_log}");
     cleanup_on_success(&ws, &[&session], "cow-git-injection");
     Ok(())
 }

@@ -59,7 +59,7 @@ pub(crate) fn redirector_dll_path() -> Result<PathBuf, AppContainerError> {
 /// 共有package SIDだった頃は、リポジトリroot（＝workspace）への継承ACEがたまたま
 /// `target/debug/*.dll`まで覆っていたため明示的な付与が不要だった。セッションごとにSIDが
 /// 変わる今は、そのセッションのSIDへ読取+実行を明示的に与えないと注入が失敗し、`--sandbox tier2a-cow`の
-/// 書込が（境界＝ACLは効いたまま）透過的にupperへ落ちなくなる。
+/// 書込が（境界＝ACLは効いたまま）透過的に差分層へ落ちなくなる。
 pub(crate) fn redirector_dll_paths() -> Vec<PathBuf> {
     let Ok(x64) = redirector_dll_path() else {
         return Vec::new();
@@ -375,7 +375,7 @@ pub enum NetworkCapability {
 #[derive(Debug, Clone, Copy)]
 pub struct CowInject<'a> {
     pub workspace_root: &'a Path,
-    pub upper_dir: &'a Path,
+    pub diff_layer_dir: &'a Path,
     /// Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴。
     /// Redirector DLLへ`HARNESS_COW_EXT_ROOTS`として渡し、これら配下への書込も`_ext/<key>`
     /// 経由で操作台帳へcaptureする。空なら`--sandbox tier2a-cow`単体（workspace内のみcapture、既存挙動）。
@@ -683,7 +683,7 @@ fn spawn_impl(
     }
     let mut cmdline_w = wide(&cmdline);
     let cwd_w = wide(&cwd.to_string_lossy());
-    // D-30: CoW有効時、Redirector DLL（`harness-redirector`）へworkspace/upperのパスと
+    // D-30: CoW有効時、Redirector DLL（`harness-redirector`）へworkspace/差分層のパスと
     // 準備完了通知用パイプの生ハンドル値を環境変数経由で渡す。ハンドル値はプロセス作成時に
     // `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`（下記）で継承させるため、子プロセス内でも
     // 同一の数値のまま有効である（Windowsのハンドル継承の仕様）。
@@ -698,8 +698,8 @@ fn spawn_impl(
                 .into_owned(),
         ));
         env_owned.push((
-            "HARNESS_COW_UPPER".to_string(),
-            normalize_cow_root(c.upper_dir)
+            "HARNESS_COW_DIFF_LAYER".to_string(),
+            normalize_cow_root(c.diff_layer_dir)
                 .to_string_lossy()
                 .into_owned(),
         ));

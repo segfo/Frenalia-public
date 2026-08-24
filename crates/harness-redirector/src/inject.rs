@@ -331,12 +331,12 @@ pub(crate) unsafe fn inject_grandchild_and_maybe_resume(
         if !injected {
             let message = if is_wow64 {
                 "grandchild redirector re-injection failed or timed out (32bit/WOW64 target, \
-                 Phase 4b); writes from this process will not be redirected to the CoW upper \
+                 Phase 4b); writes from this process will not be redirected to the CoW diff_layer \
                  directory (workspace stays read-only ACL, so writes fail closed rather than \
                  silently missing the ledger)"
             } else {
                 "grandchild redirector re-injection failed or timed out; writes from this \
-                 process will not be redirected to the CoW upper directory (workspace stays \
+                 process will not be redirected to the CoW diff_layer directory (workspace stays \
                  read-only ACL, so writes fail closed rather than silently missing the ledger)"
             };
             append_warning_entry(cfg, message);

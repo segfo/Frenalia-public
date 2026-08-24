@@ -91,14 +91,14 @@ impl Tool for GrepTool {
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
         let read_scope = ctx.read_scope.clone();
-        let cow_upper_dir = ctx.cow_upper_dir.clone();
+        let cow_diff_layer_dir = ctx.cow_diff_layer_dir.clone();
 
         tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
             let fs = SandboxFs::open_with_cow(
                 &workspace_root,
                 &staging,
                 &read_scope,
-                cow_upper_dir.as_deref(),
+                cow_diff_layer_dir.as_deref(),
             )
             .map_err(|e| sandbox_error_to_tool_error("", e))?;
 
@@ -308,14 +308,14 @@ impl Tool for GlobTool {
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
         let read_scope = ctx.read_scope.clone();
-        let cow_upper_dir = ctx.cow_upper_dir.clone();
+        let cow_diff_layer_dir = ctx.cow_diff_layer_dir.clone();
 
         tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
             let fs = SandboxFs::open_with_cow(
                 &workspace_root,
                 &staging,
                 &read_scope,
-                cow_upper_dir.as_deref(),
+                cow_diff_layer_dir.as_deref(),
             )
             .map_err(|e| sandbox_error_to_tool_error("", e))?;
 

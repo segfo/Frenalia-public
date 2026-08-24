@@ -89,7 +89,7 @@ pub struct SessionLedger {
 pub struct SessionEntry {
     pub token: String,
     pub profile_name: String,
-    /// このセッションがACEを付けたパス（workspace root・CoW upper_dir・`--fs-allow`の穴）。
+    /// このセッションがACEを付けたパス（workspace root・CoW diff_layer_dir・`--fs-allow`の穴）。
     /// 撤収はここを順に剥がす。台帳が失われた場合はプロファイル削除だけに縮退する。
     #[serde(default)]
     pub granted_paths: Vec<String>,

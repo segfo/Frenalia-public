@@ -62,9 +62,9 @@ pub(crate) type NtQueryAttributesFileFn = unsafe extern "system" fn(
 
 /// ディレクトリ列挙（`FindFirstFile`/`FindNextFile`、.NETの`Directory.EnumerateFileSystemEntries`、
 /// PowerShellの`Remove-Item`/`Test-Path`のパス解決層が最終的にたどり着く経路）。BUG-047:
-/// このAPIだけ未フックだったため、セッション中にupper側だけへ新規作成されたファイルが
+/// このAPIだけ未フックだったため、セッション中に差分層側だけへ新規作成されたファイルが
 /// ディレクトリ列挙結果に現れず、`Remove-Item`等が「存在しない」と誤判定していた
-/// （個別パス指定の`NtCreateFile`/`NtQueryAttributesFile`等は元々正しくupper優先だった）。
+/// （個別パス指定の`NtCreateFile`/`NtQueryAttributesFile`等は元々正しく差分層優先だった）。
 pub(crate) type NtQueryDirectoryFileFn = unsafe extern "system" fn(
     HANDLE,
     HANDLE,
@@ -168,7 +168,7 @@ pub(crate) const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;
 
 pub(crate) struct Config {
     pub(crate) workspace_root: PathBuf,
-    pub(crate) upper_dir: PathBuf,
+    pub(crate) diff_layer_dir: PathBuf,
     /// Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴の
     /// ルート一覧（DOS形式、正規化前）。ここに含まれるパスへの書込は、workspace内と同じ
     /// `_ext/<key>`経由の操作台帳captureの対象になる（境界＝ACLはfs-allowが既に張っている、
@@ -177,7 +177,7 @@ pub(crate) struct Config {
 }
 
 /// 孫プロセスへの再注入が失敗した/初期化未完了だった場合の警告台帳ファイル名
-/// （`<upper_dir>/.harness-cow-warnings.jsonl`、Q6）。操作台帳（`COW_OPS_LEDGER_FILENAME`）とは
+/// （`<diff_layer_dir>/.harness-cow-warnings.jsonl`、Q6）。操作台帳（`COW_OPS_LEDGER_FILENAME`）とは
 /// 別ファイルにする——こちらは「透過性が欠けている」という注意喚起であり、`ChangeOp`の
 /// 型を汚さないため。
 pub(crate) const COW_WARNINGS_LEDGER_FILENAME: &str = ".harness-cow-warnings.jsonl";
@@ -286,7 +286,7 @@ pub(crate) fn denied_paths_state() -> &'static Mutex<HashSet<String>> {
 }
 
 /// ACLで実際に拒否された（`STATUS_ACCESS_DENIED`）workspace外書込試行を
-/// `<upper_dir>/.harness-cow-denied.jsonl`へ1行追記する（Phase 4、設計書§19.8）。
+/// `<diff_layer_dir>/.harness-cow-denied.jsonl`へ1行追記する（Phase 4、設計書§19.8）。
 /// 同一パスは初回のみ記録する。追記の実体は`store::append_denied_entry`
 /// （`harness cow audit`の読み側と型を共有、host側で拒否を検知する経路が将来できても
 /// 同じ形式で書けるようにするため）。
@@ -299,12 +299,12 @@ pub(crate) fn record_denied_attempt(cfg: &Config, path: &Path, access_mask: u32)
         }
     }
     let pid = unsafe { GetCurrentProcessId() };
-    store::append_denied_entry(&cfg.upper_dir, &path_str, access_mask, pid);
+    store::append_denied_entry(&cfg.diff_layer_dir, &path_str, access_mask, pid);
 }
 
-/// BUG-066: upper配下の実体へ直接書かれたパスのうち、既にこのプロセスが台帳へ記録済みの集合
-/// （`record_upper_alias_write`の冪等化。`copy_up`の`upper_path.exists()`と同じ役割を果たす）。
-pub(crate) fn upper_alias_first_touch(rel: &str) -> bool {
+/// BUG-066: 差分層配下の実体へ直接書かれたパスのうち、既にこのプロセスが台帳へ記録済みの集合
+/// （`record_diff_layer_alias_write`の冪等化。`copy_up`の`diff_layer_path.exists()`と同じ役割を果たす）。
+pub(crate) fn diff_layer_alias_first_touch(rel: &str) -> bool {
     static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashSet::new()))
         .lock()

@@ -61,14 +61,14 @@ impl Tool for ReadFileTool {
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
         let read_scope = ctx.read_scope.clone();
-        let cow_upper_dir = ctx.cow_upper_dir.clone();
+        let cow_diff_layer_dir = ctx.cow_diff_layer_dir.clone();
         let path_for_err = input.path.clone();
         let content = tokio::task::spawn_blocking(move || -> Result<String, ToolError> {
             let fs = SandboxFs::open_with_cow(
                 &workspace_root,
                 &staging,
                 &read_scope,
-                cow_upper_dir.as_deref(),
+                cow_diff_layer_dir.as_deref(),
             )
             .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
             fs.read_to_string(&path_for_err)
@@ -136,7 +136,7 @@ impl Tool for WriteFileTool {
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
         let read_scope = ctx.read_scope.clone();
-        let cow_upper_dir = ctx.cow_upper_dir.clone();
+        let cow_diff_layer_dir = ctx.cow_diff_layer_dir.clone();
         let path_for_err = input.path.clone();
         let path_for_output = input.path.clone();
         let bytes_written = input.content.len();
@@ -145,7 +145,7 @@ impl Tool for WriteFileTool {
                 &workspace_root,
                 &staging,
                 &read_scope,
-                cow_upper_dir.as_deref(),
+                cow_diff_layer_dir.as_deref(),
             )
             .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
             fs.write_string(&path_for_err, &input.content)
@@ -210,14 +210,14 @@ impl Tool for EditFileTool {
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
         let read_scope = ctx.read_scope.clone();
-        let cow_upper_dir = ctx.cow_upper_dir.clone();
+        let cow_diff_layer_dir = ctx.cow_diff_layer_dir.clone();
         let path_for_err = input.path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), ToolError> {
             let fs = SandboxFs::open_with_cow(
                 &workspace_root,
                 &staging,
                 &read_scope,
-                cow_upper_dir.as_deref(),
+                cow_diff_layer_dir.as_deref(),
             )
             .map_err(|e| sandbox_error_to_tool_error(&path_for_err, e))?;
             let content = fs
@@ -414,7 +414,7 @@ mod tests {
             run_shell_path_extra: Vec::new(),
             shell_sees_staged_writes: false,
             vm_sandbox: None,
-            cow_upper_dir: None,
+            cow_diff_layer_dir: None,
             mcp_servers: Vec::new(),
         };
 
@@ -438,15 +438,15 @@ mod tests {
     }
 
     /// 回帰テスト（2026-08-01実機ドライランで発見）: `--sandbox tier2a-cow`時に`write_file`/`edit_file`が
-    /// CoW保護を経由せずworkspace本体を直接上書きしていたバグの修正確認。`ctx.cow_upper_dir`が
-    /// `Some`のとき、`write_file`はworkspace本体に触れず、CoW upperディレクトリと操作台帳
+    /// CoW保護を経由せずworkspace本体を直接上書きしていたバグの修正確認。`ctx.cow_diff_layer_dir`が
+    /// `Some`のとき、`write_file`はworkspace本体に触れず、CoW 差分層ディレクトリと操作台帳
     /// （`.harness-cow-ops.jsonl`、Redirector DLLと共有する形式）へ記録され、直後の`read_file`が
     /// read-throughで自分の書込を読める。
     #[tokio::test]
-    async fn write_file_redirects_to_cow_upper_without_touching_workspace_when_cow_active() {
+    async fn write_file_redirects_to_cow_diff_layer_without_touching_workspace_when_cow_active() {
         let dir = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
-        let upper_path = upper.path().to_path_buf();
+        let diff_layer = tempfile::tempdir().unwrap();
+        let diff_layer_path = diff_layer.path().to_path_buf();
         let ctx = ToolCtx {
             workspace_root: dir.path().to_path_buf(),
             staging: Default::default(),
@@ -457,7 +457,7 @@ mod tests {
             run_shell_path_extra: Vec::new(),
             shell_sees_staged_writes: false,
             vm_sandbox: None,
-            cow_upper_dir: Some(upper_path.clone()),
+            cow_diff_layer_dir: Some(diff_layer_path.clone()),
             mcp_servers: Vec::new(),
         };
 
@@ -472,12 +472,12 @@ mod tests {
             "workspace本体はCoW時にwrite_fileから直接汚染されてはならない"
         );
         assert_eq!(
-            std::fs::read_to_string(upper_path.join("notes.txt")).unwrap(),
+            std::fs::read_to_string(diff_layer_path.join("notes.txt")).unwrap(),
             "hello",
-            "CoW upperディレクトリへ実体が書かれているべき"
+            "CoW 差分層ディレクトリへ実体が書かれているべき"
         );
         let ledger = std::fs::read_to_string(
-            upper_path.join(harness_change_ledger::COW_OPS_LEDGER_FILENAME),
+            diff_layer_path.join(harness_change_ledger::COW_OPS_LEDGER_FILENAME),
         )
         .unwrap();
         assert!(

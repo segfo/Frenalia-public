@@ -10,7 +10,7 @@
 //!
 //! `--fs-allow <path>`は`path`自身へセッションpackage SIDのACEを付けるが、
 //! **`path`の祖先には何も付けない**（`preflight.rs`の`traverse_targets`は
-//! workspace／CoW upperの親だけから作られる）。一方`plans/etw-spike/RESULTS.md` §17.6・§18.1で
+//! workspace／CoW 差分層の親だけから作られる）。一方`plans/etw-spike/RESULTS.md` §17.6・§18.1で
 //! 判明したとおり、`Remove-Item`/`Move-Item`/`cmd`は祖先ディレクトリを「通過」ではなく
 //! **オープン**する。したがって次が起こり得る。
 //!

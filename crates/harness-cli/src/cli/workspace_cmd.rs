@@ -1,5 +1,5 @@
 //! ワークスペース系サブコマンド（`changes`/`apply`/`discard`/`resolve`）と`prompt`、
-//! およびオーバーレイ/CoW upper_dirの解決。
+//! およびオーバーレイ/CoW diff_layer_dirの解決。
 
 use super::*;
 
@@ -32,22 +32,22 @@ struct ApplyReportJson {
     unledgered: Vec<String>,
 }
 
-/// CoWセッションの由来（`.harness-cow-session.json`のworkspace_root）。upper_dir自身に
+/// CoWセッションの由来（`.harness-cow-session.json`のworkspace_root）。diff_layer_dir自身に
 /// 書かれているので、`--cwd`の綴りに依存せずに引ける（Windows専用の`--sandbox tier2a-cow`機構なので
 /// 他プラットフォームでは常に`None`）。
-pub(crate) fn cow_session_workspace_root(upper_dir: &Path) -> Option<String> {
+pub(crate) fn cow_session_workspace_root(diff_layer_dir: &Path) -> Option<String> {
     #[cfg(windows)]
     {
         // 表示・照合用なので`Ok`だけを見る。**GCはこの形で読まないこと**——
         // 「無い」と「読めない」が潰れると、読めないものを回収してよいと誤判定する
         // （`workspace_ledger::CowMetaRead`のdoc）。
-        harness_sandbox::tier2a::workspace_ledger::read_cow_session_meta(upper_dir)
+        harness_sandbox::tier2a::workspace_ledger::read_cow_session_meta(diff_layer_dir)
             .ok()
             .map(|m| m.workspace_root.clone())
     }
     #[cfg(not(windows))]
     {
-        let _ = upper_dir;
+        let _ = diff_layer_dir;
         None
     }
 }
@@ -63,12 +63,12 @@ pub(crate) fn cow_session_workspace_root(upper_dir: &Path) -> Option<String> {
 ///
 /// 実際BUG-066のセッションでは、workspace内への書込4件が拒否されていたのに
 /// 「14 workspace-external write attempt(s)」と表示され、事実と逆の案内になっていた。
-pub(crate) fn print_denied_summary(upper_dir: &Path) {
-    let denied = harness_change_ledger::store::read_denied_log(upper_dir);
+pub(crate) fn print_denied_summary(diff_layer_dir: &Path) {
+    let denied = harness_change_ledger::store::read_denied_log(diff_layer_dir);
     if denied.is_empty() {
         return;
     }
-    let workspace_root = cow_session_workspace_root(upper_dir);
+    let workspace_root = cow_session_workspace_root(diff_layer_dir);
     let (inside, outside): (Vec<_>, Vec<_>) = denied.iter().partition(|e| {
         workspace_root.as_deref().is_some_and(|root| {
             harness_change_ledger::path_rules::relative_under_root(&e.path, root).is_some()
@@ -113,7 +113,7 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
-    // **排他判定だけ**を通す。`harness prompt`はセッションを開かないので CoW upper を必要とせず、
+    // **排他判定だけ**を通す。`harness prompt`はセッションを開かないので CoW 差分層 を必要とせず、
     // 資源の解決まで含む`resolve_staging_and_write_mode`を呼ぶと、使わない`%LOCALAPPDATA%`の
     // 解決失敗でこの読み取り専用コマンドが落ちる。判定は起動パイプラインと同じ関数を通る（B-06）。
     let staging_mode = match resolve_staging_mode_checked(
@@ -155,7 +155,7 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
     //
     // `--sandbox`のTier要求（どのTierへ着地するか）は`harness prompt`でも**そのまま効く**
     // ——下の`select_tier`へ渡しており、`tier2a`/`tier2a-cow`はTier2aへ届かなければここでも
-    // 起動を拒否する。効かないのは`tier2a-cow`の**CoW部分**（workspaceのRO化とupperへの誘導）
+    // 起動を拒否する。効かないのは`tier2a-cow`の**CoW部分**（workspaceのRO化と差分層への誘導）
     // と、fs passthrough（`--fs-allow`/`--force-system-acl`）である。この診断コマンドは
     // ACLモードの張り替えとUAC連鎖・台帳記録を伴う経路を通さないため、`WorkspaceWriteMode`は
     // `DirectRw`のまま実プローブを行う。
@@ -201,7 +201,7 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
         net_app,
         run_shell_path_extra,
         vm_sandbox: None,
-        cow_upper_dir: None,
+        cow_diff_layer_dir: None,
         // `harness prompt`はMCPサーバを起動しない（診断用の読み取り専用コマンドであり、
         // 第三者プロセスを起こす副作用を持たせない）。実行時に何が載るかは`harness mcp list`
         // で確認する。
@@ -230,7 +230,7 @@ pub(crate) fn shell_sees_staged_writes(shell_tier: &harness_core::ShellTierSelec
 
 /// `--session <id>`（省略時は最新）から、そのセッションが使ったオーバーレイ置き場を解決する。
 /// `--staged`置き場（workspace内`.harness/sandbox/<id>`）を先に試し、無ければ`--sandbox tier2a-cow`置き場
-/// （workspace外CoW upperディレクトリ、Windows専用）を試す——1セッションは常にどちらか
+/// （workspace外CoW 差分層ディレクトリ、Windows専用）を試す——1セッションは常にどちらか
 /// 一方でしか起動されないため、両方見つかることはない。**その保証はclapの`conflicts_with_all`
 /// ではなく`setup::resolve_staging_mode_checked`の実行時拒否が持つ**（値依存の排他はclapでは
 /// 宣言できないので実行時へ移した）。正しさの論証を、もう存在しない宣言に預けないこと。
@@ -250,18 +250,18 @@ pub(crate) fn resolve_session_overlay(
             ));
         }
     }
-    if let Some(dir) = cow_upper_dir_checked(session) {
+    if let Some(dir) = cow_diff_layer_dir_checked(session) {
         return Some((StagingConfig::default(), Some(dir)));
     }
     None
 }
 
 #[cfg(windows)]
-pub(crate) fn cow_upper_dir_checked(session: Option<&str>) -> Option<PathBuf> {
-    resolve_cow_upper_dir(session)
+pub(crate) fn cow_diff_layer_dir_checked(session: Option<&str>) -> Option<PathBuf> {
+    resolve_cow_diff_layer_dir(session)
 }
 #[cfg(not(windows))]
-pub(crate) fn cow_upper_dir_checked(_session: Option<&str>) -> Option<PathBuf> {
+pub(crate) fn cow_diff_layer_dir_checked(_session: Option<&str>) -> Option<PathBuf> {
     None
 }
 
@@ -311,17 +311,17 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         }
     };
 
-    let Some((staging, cow_upper_dir)) =
+    let Some((staging, cow_diff_layer_dir)) =
         resolve_session_overlay(workspace_root, session.as_deref())
     else {
-        eprintln!("no staged sandbox or CoW upper directory found (nothing to show)");
+        eprintln!("no staged sandbox or CoW diff layer directory found (nothing to show)");
         return ExitCode::FAILURE;
     };
     let fs = match SandboxFs::open_with_cow(
         workspace_root,
         &staging,
         &harness_core::ReadScopeConfig::default(),
-        cow_upper_dir.as_deref(),
+        cow_diff_layer_dir.as_deref(),
     ) {
         Ok(fs) => fs,
         Err(e) => {
@@ -377,7 +377,7 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                     }
                     // Phase 4（設計書§19.8）: CoWセッションなら拒否監査ログの件数もフッタに
                     // 出す（`--sandbox tier2a-cow`の書込境界自体はACLが保証しているので、これは可視性のみ）。
-                    if let Some(dir) = &cow_upper_dir {
+                    if let Some(dir) = &cow_diff_layer_dir {
                         print_denied_summary(dir);
                     }
                 }
@@ -388,7 +388,7 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
             only,
             dangerously_allow,
             adopt_unledgered,
-            keep_upper,
+            keep_diff_layer,
             ..
         } => {
             let report = match fs.apply(&ApplyOptions {
@@ -409,7 +409,7 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                 || !report.ext_blocked.is_empty()
                 || !report.hard_denied.is_empty()
                 || !report.rejected.is_empty()
-                // BUG-066: 「upperに実体があるのに適用されなかった」は、黙って成功扱いに
+                // BUG-066: 「差分層に実体があるのに適用されなかった」は、黙って成功扱いに
                 // してはいけない代表例（そのまま`discard`されると作業が消える）。
                 || !report.unledgered.is_empty();
             match output_format_and_kind.unwrap_or_default() {
@@ -464,11 +464,11 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                 // 安価な空判定（台帳も実体も0）には永久に引っかからない。
                 //
                 // 条件は上の`has_conflicts_or_blocked`が偽であること——`unledgered`も
-                // 含まれるので、「upperに実体があるのに適用されなかった」ものが1件でも
+                // 含まれるので、「差分層に実体があるのに適用されなかった」ものが1件でも
                 // あれば畳まない（BUG-066が守っているもの）。加えて実行中でないこと・
                 // D-80のレビュー待ちでないことを`plan_cow_gc`と同じ判定で見る。
-                if !keep_upper {
-                    finish_cow_upper_after_apply(cow_upper_dir.as_deref());
+                if !keep_diff_layer {
+                    finish_cow_diff_layer_after_apply(cow_diff_layer_dir.as_deref());
                 }
                 ExitCode::SUCCESS
             }
@@ -546,7 +546,7 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
             }
         }
         Commands::Discard { .. } => {
-            if let Some(dir) = &cow_upper_dir {
+            if let Some(dir) = &cow_diff_layer_dir {
                 if let Some(session_id) = dir.file_name().and_then(|n| n.to_str()) {
                     if cow_session_is_live_checked(session_id) {
                         eprintln!(
@@ -615,13 +615,13 @@ pub(crate) fn cow_session_is_live_checked(_session_id: &str) -> bool {
 /// あの猶予が守っている「起動しかけとの競合」はこの経路には無い（実行中かどうかは
 /// 生存マーカーが直接答える）。
 #[cfg(windows)]
-fn finish_cow_upper_after_apply(cow_upper_dir: Option<&Path>) {
+fn finish_cow_diff_layer_after_apply(cow_diff_layer_dir: Option<&Path>) {
     use harness_sandbox::tier2a::workspace_ledger as wl;
 
-    let Some(upper_dir) = cow_upper_dir else {
+    let Some(diff_layer_dir) = cow_diff_layer_dir else {
         return;
     };
-    let Some(session_id) = upper_dir.file_name().and_then(|n| n.to_str()) else {
+    let Some(session_id) = diff_layer_dir.file_name().and_then(|n| n.to_str()) else {
         return;
     };
     let (facts, _unreachable) = wl::collect_cow_session_facts();
@@ -649,7 +649,7 @@ fn finish_cow_upper_after_apply(cow_upper_dir: Option<&Path>) {
         );
         return;
     }
-    match harness_sandbox::session_scope::remove_overlay_dir(upper_dir) {
+    match harness_sandbox::session_scope::remove_overlay_dir(diff_layer_dir) {
         Ok(()) => println!("removed the CoW diff area for {session_id} (nothing left in it)"),
         Err(e) => eprintln!(
             "warning: applied everything, but could not remove the CoW diff area for \
@@ -659,4 +659,4 @@ fn finish_cow_upper_after_apply(cow_upper_dir: Option<&Path>) {
 }
 
 #[cfg(not(windows))]
-fn finish_cow_upper_after_apply(_cow_upper_dir: Option<&Path>) {}
+fn finish_cow_diff_layer_after_apply(_cow_diff_layer_dir: Option<&Path>) {}

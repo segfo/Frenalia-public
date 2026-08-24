@@ -74,13 +74,13 @@ const ALLOWLIST: &[&str] = &[
 const SECRET_PATTERNS: &[&str] = &["KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL"];
 
 fn looks_secret(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    SECRET_PATTERNS.iter().any(|p| upper.contains(p))
+    let uppercased = name.to_ascii_uppercase();
+    SECRET_PATTERNS.iter().any(|p| uppercased.contains(p))
 }
 
 fn is_allowlisted(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    ALLOWLIST.iter().any(|a| *a == upper)
+    let uppercased = name.to_ascii_uppercase();
+    ALLOWLIST.iter().any(|a| *a == uppercased)
 }
 
 /// 子プロセスへ渡すクリーンなenvを、現在プロセスの環境から構築する。

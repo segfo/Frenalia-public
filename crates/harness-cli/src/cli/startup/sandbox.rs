@@ -95,7 +95,7 @@ pub(super) fn stage_prepare_sandbox(
         eprintln!("error: {e}");
         return Err(ExitCode::FAILURE);
     }
-    let (staging_mode, write_mode, upper_root_fell_back) = match resolve_staging_and_write_mode(
+    let (staging_mode, write_mode, diff_layer_root_fell_back) = match resolve_staging_and_write_mode(
         sandbox_choice,
         cli.live,
         cli.staged,
@@ -112,7 +112,7 @@ pub(super) fn stage_prepare_sandbox(
     // D-81: 差分層をワークスペースと同じボリュームへ置けなかった。隔離は同じように張れるので
     // 続行するが、**「媒体と一緒に消える」性質が失われたことは黙らせない**——これを黙ると、
     // ボリュームを外した後に回収できない差分層が残る理由が誰にも分からなくなる。
-    if let Some(reason) = upper_root_fell_back {
+    if let Some(reason) = diff_layer_root_fell_back {
         eprintln!("warning: {reason}");
     }
     let sandbox_dir = if staging_mode == StagingMode::Live {

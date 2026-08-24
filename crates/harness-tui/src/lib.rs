@@ -156,7 +156,7 @@ fn open_panel_fs(
         workspace_root,
         &scope.staging,
         &ReadScopeConfig::default(),
-        scope.cow_upper_dir.as_deref(),
+        scope.cow_diff_layer_dir.as_deref(),
     )
 }
 
@@ -255,7 +255,7 @@ fn push_apply_report(app: &mut AppState, report: &harness_sandbox::ApplyReport) 
         }
     )));
     // BUG-066: 台帳に無いオーバーレイ実体は**件数だけでは足りない**——「適用されなかった変更が
-    // upperに残っている」という復旧手段そのものなので、パスを1件ずつ見せる。
+    // 差分層に残っている」という復旧手段そのものなので、パスを1件ずつ見せる。
     for path in &report.unledgered {
         app.transcript.push(app::TranscriptItem::Info(format!(
             "unledgered (in the overlay but not recorded; baseline unknown, not applied): {path} \
@@ -479,9 +479,9 @@ pub async fn run(
     // D-81で差分層の根はワークスペースのボリュームで決まるようになったが、ここでも
     // **ワークスペースから導出し直さない**——いま実際に使っている差分層の親をそのまま採る。
     // 導出規則を2箇所に持つと、片方だけ変わったときに切替先だけ別の根を指す（B-05）。
-    let scope_template = match &ctx.cow_upper_dir {
+    let scope_template = match &ctx.cow_diff_layer_dir {
         Some(dir) => harness_sandbox::session_scope::ScopeTemplate::Cow {
-            upper_root: dir
+            diff_layer_root: dir
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| dir.clone()),
@@ -500,7 +500,7 @@ pub async fn run(
     // 組んだ`ctx`は**ピッカーより前の使い捨てセッション**のオーバーレイを指したままである
     // （`sandbox_dir`はセッションID確定時に決まるが、確定はピッカーの後になる）。ここで
     // 選ばれたセッションのものへ揃える。`ctx`をまだ手放していないこの一点でしか直せない。
-    if ctx.staging != review_scope.staging || ctx.cow_upper_dir != review_scope.cow_upper_dir {
+    if ctx.staging != review_scope.staging || ctx.cow_diff_layer_dir != review_scope.cow_diff_layer_dir {
         // ピッカーで`f`（fork）を選んだ場合は、元セッションの未適用変更も分岐先へ持っていく
         // （`--fork-session`・`/fork`と同じ意味論。`bug-pattern-rules` B-06）。
         let prepared = match &forked_from {
@@ -531,10 +531,10 @@ pub async fn run(
             ));
             review_scope = scope_template.scope_for(&new_session_id);
             review_scope.staging = ctx.staging.clone();
-            review_scope.cow_upper_dir = ctx.cow_upper_dir.clone();
+            review_scope.cow_diff_layer_dir = ctx.cow_diff_layer_dir.clone();
         } else {
             ctx.staging = review_scope.staging.clone();
-            ctx.cow_upper_dir = review_scope.cow_upper_dir.clone();
+            ctx.cow_diff_layer_dir = review_scope.cow_diff_layer_dir.clone();
         }
     }
     let mut engine = spawn_engine(

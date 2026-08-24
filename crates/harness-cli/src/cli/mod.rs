@@ -13,7 +13,7 @@
 //! | [`workspace_cmd`] | `changes`/`apply`/`discard`/`resolve`/`prompt` |
 //! | [`net_cmd`] | `net`（監査ログ表示）とloopback許可ポート算出 |
 //! | [`tier3_cmd`] | `tier3`（常駐daemonの状態確認とGC） |
-//! | [`cow_cmd`] | `cow`（upper_dir一覧・拒否監査） |
+//! | [`cow_cmd`] | `cow`（diff_layer_dir一覧・拒否監査） |
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -205,8 +205,8 @@ pub(crate) enum Commands {
         /// 既定では、1件も残さず適用できた差分層はその場で畳む——作る側と消す側を対にして
         /// おかないと、セッションのたびに置き場が1つずつ積もるためである。中身をもう一度
         /// 見たい・別のツールで調べたい場合にこれを指定する。
-        #[arg(long = "keep-upper", default_value_t = false)]
-        keep_upper: bool,
+        #[arg(long = "keep-diff-layer", default_value_t = false)]
+        keep_diff_layer: bool,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
         output_format: OutputFormat,
     },
@@ -240,8 +240,8 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: Tier3Action,
     },
-    /// `--sandbox tier2a-cow`のupper置き場（`%LOCALAPPDATA%\harness\data\cow\<session-id>`）を確認・
-    /// workspace本体へ反映・破棄するサブコマンド。upper置き場はセッション終了時に
+    /// `--sandbox tier2a-cow`の差分層置き場（`%LOCALAPPDATA%\harness\data\cow\<session-id>`）を確認・
+    /// workspace本体へ反映・破棄するサブコマンド。差分層置き場はセッション終了時に
     /// 自動削除されない（エージェントの作業内容そのものが入っているため）ので、
     /// クラッシュ・強制終了で中断したセッションも`--resume <id> --sandbox tier2a-cow`で再開して
     /// 中身を確認できる。
@@ -611,7 +611,7 @@ pub(crate) struct Cli {
     /// - `tier2a-cow`: Tier2a + Copy-on-Write（D-30、`plans/AppContainerベース Copy-on-Write
     ///   ワークスペース設計書.md`）。workspaceへのACLをRead/Execute/Traverseのみ（既定の
     ///   Read/Write/Execute/DeleteではなくD-13と同じread-onlyマスク）へ切り替え、`run_shell`
-    ///   子プロセスの書込をworkspace外のCoW upper（`%LOCALAPPDATA%\harness\data\cow\
+    ///   子プロセスの書込をworkspace外のCoW 差分層（`%LOCALAPPDATA%\harness\data\cow\
     ///   <session-id>\`）へRedirector DLLで誘導する。フックが無効・回避されても、ACLが
     ///   RO付与済みである限りworkspace本体への書込は`ACCESS_DENIED`でfail-closeする
     ///   （フックは境界にしない、D-01不変）。**Tier2a以外では起動を拒否する**

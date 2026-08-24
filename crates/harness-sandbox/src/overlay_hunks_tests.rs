@@ -21,12 +21,12 @@ fn staged_fs(workspace_root: &Path) -> SandboxFs {
     .unwrap()
 }
 
-fn cow_fs(workspace_root: &Path, upper_dir: &Path) -> SandboxFs {
+fn cow_fs(workspace_root: &Path, diff_layer_dir: &Path) -> SandboxFs {
     SandboxFs::open_with_cow(
         workspace_root,
         &StagingConfig::default(),
         &ReadScopeConfig::default(),
-        Some(upper_dir),
+        Some(diff_layer_dir),
     )
     .unwrap()
 }
@@ -281,10 +281,10 @@ fn hunk_apply_still_hits_the_d09_hard_deny_gate() {
 fn hunk_apply_refuses_a_ledger_path_that_escapes_the_workspace() {
     // BUG-062形（台帳のpathが敵対的な綴り）。`apply`と同じく実FSへ触る前に弾く。
     let ws = tempfile::tempdir().unwrap();
-    let upper = tempfile::tempdir().unwrap();
-    let fs = cow_fs(ws.path(), upper.path());
+    let diff_layer = tempfile::tempdir().unwrap();
+    let fs = cow_fs(ws.path(), diff_layer.path());
     store::append_entry(
-        upper.path(),
+        diff_layer.path(),
         ChangeOp::Modify,
         "x/../../escape.txt",
         Some("deadbeef".to_string()),
@@ -362,15 +362,15 @@ fn create_and_delete_are_whole_file_only() {
 #[test]
 fn unledgered_overlay_files_are_whole_file_only() {
     let ws = tempfile::tempdir().unwrap();
-    let upper = tempfile::tempdir().unwrap();
+    let diff_layer = tempfile::tempdir().unwrap();
     std::fs::write(ws.path().join("a.txt"), numbered(0..10)).unwrap();
-    // 台帳を経由せずupperへ直接置かれた版（BUG-066の状況）。
+    // 台帳を経由せず差分層へ直接置かれた版（BUG-066の状況）。
     std::fs::write(
-        upper.path().join("a.txt"),
+        diff_layer.path().join("a.txt"),
         numbered(0..10).replace("line2\n", "X\n"),
     )
     .unwrap();
-    let fs = cow_fs(ws.path(), upper.path());
+    let fs = cow_fs(ws.path(), diff_layer.path());
 
     let entry = entry_for(&fs, "a.txt");
     assert!(entry.unledgered);

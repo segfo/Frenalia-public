@@ -30,22 +30,22 @@ pub(crate) fn run_cow_subcommand(_action: CowAction) -> ExitCode {
 
 /// セッションIDから差分層の位置を引く。**全部の根を探す**（D-81で根が複数になった）。
 #[cfg(windows)]
-pub(crate) fn cow_upper_dir_for(session_id: &str) -> Option<PathBuf> {
-    let (roots, _unreachable) = harness_sandbox::session_scope::cow_upper_roots();
+pub(crate) fn cow_diff_layer_dir_for(session_id: &str) -> Option<PathBuf> {
+    let (roots, _unreachable) = harness_sandbox::session_scope::cow_diff_layer_roots();
     roots
         .into_iter()
-        .map(|root| harness_sandbox::session_scope::cow_upper_dir_in(&root, session_id))
+        .map(|root| harness_sandbox::session_scope::cow_diff_layer_dir_in(&root, session_id))
         .find(|dir| dir.is_dir())
 }
 
 /// `harness cow audit`: `.harness-cow-denied.jsonl`（Phase 4、設計書§19.8）を表示する。
 #[cfg(windows)]
 pub(crate) fn cow_audit(session: Option<&str>, output_format: OutputFormat) -> ExitCode {
-    let Some(upper_dir) = resolve_cow_upper_dir(session) else {
-        eprintln!("no CoW upper directory found (nothing to show)");
+    let Some(diff_layer_dir) = resolve_cow_diff_layer_dir(session) else {
+        eprintln!("no CoW diff layer directory found (nothing to show)");
         return ExitCode::FAILURE;
     };
-    let entries = harness_change_ledger::store::read_denied_log(&upper_dir);
+    let entries = harness_change_ledger::store::read_denied_log(&diff_layer_dir);
     match output_format {
         OutputFormat::Json => {
             if let Ok(s) = serde_json::to_string(&entries) {
@@ -65,7 +65,7 @@ pub(crate) fn cow_audit(session: Option<&str>, output_format: OutputFormat) -> E
             }
             // BUG-066: workspace内への拒否は意味が正反対（封じ込めではなく**透過性の失敗**＝
             // その変更は失われている）なので、1件ずつ区別して見せる。
-            let workspace_root = crate::cli::workspace_cmd::cow_session_workspace_root(&upper_dir);
+            let workspace_root = crate::cli::workspace_cmd::cow_session_workspace_root(&diff_layer_dir);
             let mut inside = 0usize;
             for e in &entries {
                 let is_inside = workspace_root.as_deref().is_some_and(|root| {
@@ -89,7 +89,7 @@ pub(crate) fn cow_audit(session: Option<&str>, output_format: OutputFormat) -> E
             if inside > 0 {
                 println!(
                     "WARNING: {inside} of {} denied attempt(s) targeted the workspace itself. \
-                     Those writes should have been redirected to the CoW upper directory; see \
+                     Those writes should have been redirected to the CoW diff_layer directory; see \
                      docs/bugs/BUG-066.md.",
                     entries.len()
                 );
@@ -105,7 +105,7 @@ pub(crate) fn cow_list() -> ExitCode {
 
     let (facts, unreachable) = wl::collect_cow_session_facts();
     if facts.is_empty() {
-        println!("(no CoW upper directories found)");
+        println!("(no CoW diff layer directories found)");
         report_unreachable_volumes(unreachable);
         return ExitCode::SUCCESS;
     }
@@ -119,14 +119,14 @@ pub(crate) fn cow_list() -> ExitCode {
     );
     for (fact, (_, verdict)) in facts.iter().zip(verdicts) {
         println!(
-            "{}\tworkspace={}\t{}\tchanged_files={}\tupper={}",
+            "{}\tworkspace={}\t{}\tchanged_files={}\tdiff_layer={}",
             fact.session_id,
             fact.workspace_root
                 .as_deref()
                 .unwrap_or("(unknown, no readable session metadata)"),
             state_label(verdict),
             fact.content_files,
-            fact.upper_dir.display()
+            fact.diff_layer_dir.display()
         );
     }
     report_unreachable_volumes(unreachable);
@@ -256,16 +256,16 @@ pub(crate) fn cow_gc(dry_run: bool, with_changes: bool, older_than_days: u64) ->
 }
 
 /// `resolve_session_overlay`のCoW側解決に使う。セッションIDまたは「最も新しいCoW
-/// 置き場」からupper_dirを解決する。`resolve_sandbox_dir`のstaged版と同じ
+/// 置き場」からdiff_layer_dirを解決する。`resolve_sandbox_dir`のstaged版と同じ
 /// 「最新セッションを選ぶ」考え方をCoW側にも適用する。
 #[cfg(windows)]
-pub(crate) fn resolve_cow_upper_dir(session: Option<&str>) -> Option<PathBuf> {
+pub(crate) fn resolve_cow_diff_layer_dir(session: Option<&str>) -> Option<PathBuf> {
     if let Some(id) = session {
-        return cow_upper_dir_for(id);
+        return cow_diff_layer_dir_for(id);
     }
     // D-81で根が複数になったので、**全部の根を横断して**最新を選ぶ。1つの根だけを見ると、
     // 別ボリュームのワークスペースで作った差分層が「無い」ことにされる。
-    let (roots, _unreachable) = harness_sandbox::session_scope::cow_upper_roots();
+    let (roots, _unreachable) = harness_sandbox::session_scope::cow_diff_layer_roots();
     let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
     for root in roots {
         let Ok(entries) = std::fs::read_dir(&root) else {

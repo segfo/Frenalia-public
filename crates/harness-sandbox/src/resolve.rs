@@ -70,7 +70,7 @@ pub fn prepare_resolve(fs: &SandboxFs) -> Result<(ApplyReport, PreparedResolve),
         allow_ext: false,
         // 台帳に無いオーバーレイ実体（BUG-066）はbaselineミラーも無いので3-way mergeの材料が
         // 揃わない。`resolve`の対象にはせず`report.unledgered`のまま呼び出し側へ返す
-        // （`harness apply --adopt-unledgered`で取り込むか、upperの実体を直接見てもらう）。
+        // （`harness apply --adopt-unledgered`で取り込むか、差分層の実体を直接見てもらう）。
         adopt_unledgered: false,
     })?;
     if report.conflicts.is_empty() {

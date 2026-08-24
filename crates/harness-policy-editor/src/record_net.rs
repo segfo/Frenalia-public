@@ -1340,7 +1340,7 @@ fn run_pass2<'a>(
             cwd: request.cwd.to_path_buf(),
             env,
             workspace_root: request.workspace_root.to_path_buf(),
-            cow_upper_dir: None,
+            cow_diff_layer_dir: None,
             granted_passthrough: selection.granted_passthrough.clone(),
             net_capability,
         })

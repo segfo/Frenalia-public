@@ -297,9 +297,9 @@ fn grant_fs_allow_entries(
     (granted, failures)
 }
 
-/// `GrantWorkspaceAccess`用: 複数のtraverseターゲット（`--sandbox tier2a-cow`ならworkspace_root・upper_dirの
+/// `GrantWorkspaceAccess`用: 複数のtraverseターゲット（`--sandbox tier2a-cow`ならworkspace_root・diff_layer_dirの
 /// 2つ）を独立に処理する。`GrantTraverse`（単一target）と異なり、1ターゲットのチェーンが
-/// 途中で失敗しても他のターゲットの処理は続行する（workspace_rootとupper_dirは別の祖先
+/// 途中で失敗しても他のターゲットの処理は続行する（workspace_rootとdiff_layer_dirは別の祖先
 /// チェーンであり、片方の失敗がもう片方を無意味にするとは限らないため）。最初に発生した
 /// エラーのみ`traverse_error`へ載せる（`target: reason`形式でどのターゲットの失敗か分かるようにする）。
 /// いずれの場合も、実際にACEが付与された全ノードを`granted`へ積む（孤立ACE防止、`GrantChain`と

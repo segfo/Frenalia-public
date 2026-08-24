@@ -8,7 +8,7 @@
 //! その子のstdout（同形式のJSON）を自分の結果へネストして最後にJSONを1行だけ標準出力へ出す。
 //!
 //! `cargo test`側（`crates/harness-sandbox/src/win_appcontainer.rs`の`cow_diagnostics`）が
-//! 実FS（workspace本体・CoW upperディレクトリ・警告台帳）を直接調べて封じ込めの成否を判定する
+//! 実FS（workspace本体・CoW 差分層ディレクトリ・警告台帳）を直接調べて封じ込めの成否を判定する
 //! ため、このJSONはあくまで二次的な説明用（どの世代でどの操作がどう失敗したか）。i686
 //! （WOW64孫世代）でもビルドできることが必須要件のため、依存はwindows/serde_json最小限に
 //! 絞ってあり、CLI引数パースも手書き（clap等は使わない）。
@@ -390,7 +390,7 @@ fn spawn_child(args: &Args, tag_prefix_gen: u32) -> Value {
         // リダイレクトが失われる。
         for key in [
             "HARNESS_COW_WORKSPACE",
-            "HARNESS_COW_UPPER",
+            "HARNESS_COW_DIFF_LAYER",
             "HARNESS_COW_EXT_ROOTS",
             "HARNESS_COW_READY_HANDLE",
         ] {

@@ -43,16 +43,16 @@ pub(crate) async fn run_isolated(
     net_domain_policy_requested: bool,
     vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
     workspace_root: &Path,
-    cow_upper_dir: Option<&Path>,
+    cow_diff_layer_dir: Option<&Path>,
     granted_passthrough: &[(std::path::PathBuf, bool)],
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     // Tier2a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
     // 「このTierでは無効」と明記する、`call`参照）。
     let _ = &net;
-    // `workspace_root`/`cow_upper_dir`（D-30、`--sandbox tier2a-cow`）はWindows Tier2a経路でのみ使う
+    // `workspace_root`/`cow_diff_layer_dir`（D-30、`--sandbox tier2a-cow`）はWindows Tier2a経路でのみ使う
     // （Redirector DLL注入用のenv注入先パス）。
     #[cfg(not(windows))]
-    let _ = (workspace_root, cow_upper_dir, granted_passthrough);
+    let _ = (workspace_root, cow_diff_layer_dir, granted_passthrough);
     if tier == ShellTier::Tier3 {
         return run_tier3(command, cwd, env, dur, vm_sandbox).await;
     }
@@ -68,7 +68,7 @@ pub(crate) async fn run_isolated(
                 net_proxy_enforced,
                 net_domain_policy_requested,
                 workspace_root,
-                cow_upper_dir,
+                cow_diff_layer_dir,
                 granted_passthrough,
             )
             .await;
@@ -207,7 +207,7 @@ async fn run_windows_tier2a(
     net_proxy_enforced: bool,
     net_domain_policy_requested: bool,
     workspace_root: &Path,
-    cow_upper_dir: Option<&Path>,
+    cow_diff_layer_dir: Option<&Path>,
     granted_passthrough: &[(std::path::PathBuf, bool)],
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let mut env_owned = env.to_vec();
@@ -233,7 +233,7 @@ async fn run_windows_tier2a(
         cwd: cwd.to_path_buf(),
         env: env_owned,
         workspace_root: workspace_root.to_path_buf(),
-        cow_upper_dir: cow_upper_dir.map(|p| p.to_path_buf()),
+        cow_diff_layer_dir: cow_diff_layer_dir.map(|p| p.to_path_buf()),
         granted_passthrough: granted_passthrough.to_vec(),
         net_capability,
     };

@@ -4,18 +4,18 @@
 //! `ntdll.dll`の`NtCreateFile`/`NtOpenFile`/`NtSetInformationFile`/`NtClose`/
 //! `NtQueryFullAttributesFile`/`NtQueryAttributesFile`/`NtQueryDirectoryFile`をinline hook
 //! （`retour`クレート、フックの実装品質はセキュリティ保証に影響しない——§13.1の実装方針参照）し、
-//! workspace配下への書込操作をCoW upperディレクトリへ誘導しつつ、作成・変更・削除・リネームを
+//! workspace配下への書込操作をCoW 差分層ディレクトリへ誘導しつつ、作成・変更・削除・リネームを
 //! 操作台帳（`.harness-cow-ops.jsonl`、`crates/harness-change-ledger`）へ記録する。
 //! `NtQueryDirectoryFile`（ディレクトリ列挙）は、セッション中に新規作成したファイルが
 //! `Remove-Item`等から「存在しない」と誤認されるバグ（BUG-047）の修正として追加された——
-//! 他のフックがworkspaceとupperを個別パス指定で正しく振り分けていても、ディレクトリを
-//! **列挙**する経路だけは別物であり、upper側だけに存在するファイルはこれをフックしない限り
+//! 他のフックがworkspaceと差分層を個別パス指定で正しく振り分けていても、ディレクトリを
+//! **列挙**する経路だけは別物であり、差分層側だけに存在するファイルはこれをフックしない限り
 //! 一覧に現れない（§7.8「ディレクトリ列挙」参照）。
 //!
 //! **境界ではなく誘導**（`plans/DESIGN-SANDBOX.md` D-01/D-30）: このDLLが無効化・回避・
 //! アンロードされても、workspace本体はAppContainerのACLでread-only付与済みのため、書込は
 //! `STATUS_ACCESS_DENIED`でfail-closeする。このDLLの役割は、フックが機能する場合に
-//! `ACCESS_DENIED`を回避してCoW upperへ書けるようにする「利便性」のみ。
+//! `ACCESS_DENIED`を回避してCoW 差分層へ書けるようにする「利便性」のみ。
 //!
 //! ## 設定の伝播（2経路、BUG-045のF2以降）
 //!
@@ -31,7 +31,7 @@
 //! メインスレッド再開前でも`GetEnvironmentVariableW`で読める）。
 //!
 //! * `HARNESS_COW_WORKSPACE`: workspaceルート（NTパス正規化前、DOS形式）。
-//! * `HARNESS_COW_UPPER`: CoW upperディレクトリ（DOS形式）。
+//! * `HARNESS_COW_DIFF_LAYER`: CoW 差分層ディレクトリ（DOS形式）。
 //! * `HARNESS_COW_READY_HANDLE`: 初期化完了を知らせるパイプ書込端の継承ハンドル値（10進文字列）。
 //!   Launcherが`CREATE_SUSPENDED`起動直後に`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`で子へ継承させ、
 //!   `ReadFile`でこのDLLが1バイト書き込むのを待ってから`ResumeThread`する（設計書§10.2、
@@ -75,7 +75,7 @@
 //! 吸収する（どちらが先に走っても安全、後者は即noop）。
 //!
 //! 注入・初期化のいずれかに失敗しても、孫プロセスの生成自体は拒否しない（Q6）。かわりに
-//! `<upper_dir>/.harness-cow-warnings.jsonl`へ理由を追記する（`append_warning_entry`）。
+//! `<diff_layer_dir>/.harness-cow-warnings.jsonl`へ理由を追記する（`append_warning_entry`）。
 //!
 //! ## Phase 4b: 32bit（WOW64）ターゲットへの再注入
 //!
@@ -192,19 +192,19 @@ mod tests {
     fn config_blob_round_trips_through_serialize_and_parse() {
         let cfg = Config {
             workspace_root: PathBuf::from(r"C:\ws\project"),
-            upper_dir: PathBuf::from(r"C:\upper\abc"),
+            diff_layer_dir: PathBuf::from(r"C:\diff_layer\abc"),
             ext_capture_roots: vec![PathBuf::from(r"C:\ext one"), PathBuf::from(r"D:\ext2")],
         };
         let blob = serialize_config_blob(&cfg);
         assert_eq!(blob.last(), Some(&0u8), "blob must be NUL-terminated");
         let parsed = unsafe { deserialize_config_blob(blob.as_ptr()) }.expect("parse");
         assert_eq!(parsed.workspace_root, cfg.workspace_root);
-        assert_eq!(parsed.upper_dir, cfg.upper_dir);
+        assert_eq!(parsed.diff_layer_dir, cfg.diff_layer_dir);
         assert_eq!(parsed.ext_capture_roots, cfg.ext_capture_roots);
 
         let empty_ext = Config {
             workspace_root: PathBuf::from(r"C:\ws"),
-            upper_dir: PathBuf::from(r"C:\upper"),
+            diff_layer_dir: PathBuf::from(r"C:\diff_layer"),
             ext_capture_roots: Vec::new(),
         };
         let parsed = unsafe { deserialize_config_blob(serialize_config_blob(&empty_ext).as_ptr()) }
@@ -217,7 +217,7 @@ mod tests {
     /// 独立に揃えるのは、注入blob経由の孫世代や、将来別経路から設定が来た場合の保険である。
     #[test]
     fn finalize_config_folds_every_root_spelling() {
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         for root in [
             PathBuf::from(r"C:\ws\"),
             PathBuf::from(r"\\?\C:\ws"),
@@ -225,11 +225,11 @@ mod tests {
         ] {
             let cfg = finalize_config(Config {
                 workspace_root: root.clone(),
-                upper_dir: PathBuf::from(format!(r"\\?\{}\", upper.path().to_string_lossy())),
+                diff_layer_dir: PathBuf::from(format!(r"\\?\{}\", diff_layer.path().to_string_lossy())),
                 ext_capture_roots: vec![PathBuf::from(r"\\?\D:\ext\")],
             });
             assert_eq!(cfg.workspace_root, PathBuf::from(r"C:\ws"), "root={root:?}");
-            assert_eq!(cfg.upper_dir, upper.path());
+            assert_eq!(cfg.diff_layer_dir, diff_layer.path());
             assert_eq!(cfg.ext_capture_roots, vec![PathBuf::from(r"D:\ext")]);
         }
     }
@@ -240,12 +240,12 @@ mod tests {
     /// 唯一の防御になる。2026-08-05のセッションにはこの痕跡がどこにも無かった。
     #[test]
     fn finalize_config_warns_when_the_workspace_root_is_not_absolute() {
-        let upper = tempfile::tempdir().unwrap();
-        let warnings = upper.path().join(COW_WARNINGS_LEDGER_FILENAME);
+        let diff_layer = tempfile::tempdir().unwrap();
+        let warnings = diff_layer.path().join(COW_WARNINGS_LEDGER_FILENAME);
 
         let cfg = finalize_config(Config {
             workspace_root: PathBuf::from("."),
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
             ext_capture_roots: Vec::new(),
         });
         assert_eq!(cfg.workspace_root, PathBuf::from("."));
@@ -260,7 +260,7 @@ mod tests {
         let before = std::fs::read_to_string(&warnings).unwrap_or_default();
         finalize_config(Config {
             workspace_root: PathBuf::from(r"C:\ws"),
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
             ext_capture_roots: Vec::new(),
         });
         assert_eq!(
@@ -275,12 +275,12 @@ mod tests {
     fn config_blob_parse_rejects_incomplete_input() {
         assert!(unsafe { deserialize_config_blob(std::ptr::null()) }.is_none());
         assert!(parse_config_blob("").is_none());
-        assert!(parse_config_blob("C:\\ws").is_none(), "upper_dir missing");
+        assert!(parse_config_blob("C:\\ws").is_none(), "diff_layer_dir missing");
         assert!(
-            parse_config_blob("\nC:\\upper\n").is_none(),
+            parse_config_blob("\nC:\\diff_layer\n").is_none(),
             "workspace empty"
         );
-        assert!(parse_config_blob("C:\\ws\n\n").is_none(), "upper empty");
+        assert!(parse_config_blob("C:\\ws\n\n").is_none(), "diff layer empty");
     }
 
     /// BUG-048 F1回帰: `FILE_GENERIC_WRITE`ベースの旧実装は`SYNCHRONIZE`/`READ_CONTROL`を
@@ -349,13 +349,13 @@ mod tests {
     #[test]
     fn check_deleted_picks_up_incremental_ledger_appends_from_sibling_process() {
         let workspace = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
             ext_capture_roots: Vec::new(),
         };
-        let ledger_path = upper.path().join(COW_OPS_LEDGER_FILENAME);
+        let ledger_path = diff_layer.path().join(COW_OPS_LEDGER_FILENAME);
 
         // 初期状態: まだ何も削除されていない。
         load_deleted_set(&cfg);
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn baseline_hash_for_writes_mirror_on_first_access() {
         let workspace = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         std::fs::write(
             workspace.path().join("baseline_mirror_probe.txt"),
             "original",
@@ -421,14 +421,14 @@ mod tests {
         .unwrap();
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
             ext_capture_roots: Vec::new(),
         };
 
         let hash = baseline_hash_for(&cfg, "baseline_mirror_probe.txt");
 
         assert!(hash.is_some());
-        let mirror = upper
+        let mirror = diff_layer
             .path()
             .join(harness_change_ledger::COW_BASELINE_DIRNAME)
             .join("baseline_mirror_probe.txt");
@@ -439,17 +439,17 @@ mod tests {
     #[test]
     fn baseline_hash_for_writes_no_mirror_when_path_does_not_exist() {
         let workspace = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
             ext_capture_roots: Vec::new(),
         };
 
         let hash = baseline_hash_for(&cfg, "does_not_exist_probe.txt");
 
         assert!(hash.is_none());
-        assert!(!upper
+        assert!(!diff_layer
             .path()
             .join(harness_change_ledger::COW_BASELINE_DIRNAME)
             .join("does_not_exist_probe.txt")
@@ -457,17 +457,17 @@ mod tests {
     }
 
     /// Phase 3（設計書§19.8）: `ext_capture_roots`配下の絶対パスは`ext_relative`が
-    /// `(ext_key, 正規化済み絶対パス)`を返し、`classify_target`は`_ext/<key>`へのupper
+    /// `(ext_key, 正規化済み絶対パス)`を返し、`classify_target`は`_ext/<key>`への差分層
     /// マッピングを返す。
     #[test]
     fn classify_target_maps_ext_capture_root_path_to_ext_prefixed_rel() {
         let workspace = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         let capture_root = tempfile::tempdir().unwrap();
         let target = capture_root.path().join("cache").join("probe.txt");
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
             ext_capture_roots: vec![capture_root.path().to_path_buf()],
         };
 
@@ -481,8 +481,8 @@ mod tests {
             store::normalize_abs_path(&target.to_string_lossy())
         );
         assert_eq!(
-            cfg.upper_dir.join(&classified.rel),
-            upper.path().join("_ext").join(&expected_key)
+            cfg.diff_layer_dir.join(&classified.rel),
+            diff_layer.path().join("_ext").join(&expected_key)
         );
     }
 
@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn classify_target_matches_workspace_paths_whose_spelling_differs_in_case_or_trailing_sep() {
         let workspace = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         let target = workspace.path().join("sub").join("merge-demo.txt");
         for root in [
             PathBuf::from(workspace.path().to_string_lossy().to_uppercase()),
@@ -502,7 +502,7 @@ mod tests {
         ] {
             let cfg = Config {
                 workspace_root: root.clone(),
-                upper_dir: upper.path().to_path_buf(),
+                diff_layer_dir: diff_layer.path().to_path_buf(),
                 ext_capture_roots: Vec::new(),
             };
             let classified = classify_target(&cfg, &target)
@@ -510,45 +510,45 @@ mod tests {
             assert_eq!(classified.kind, TargetKind::Workspace);
             assert_eq!(classified.ledger_key, "sub/merge-demo.txt");
             assert_eq!(
-                cfg.upper_dir.join(&classified.rel),
-                upper.path().join("sub").join("merge-demo.txt")
+                cfg.diff_layer_dir.join(&classified.rel),
+                diff_layer.path().join("sub").join("merge-demo.txt")
             );
         }
     }
 
-    /// **BUG-066の回帰テスト（B-2）**: upper配下の実体を直接指すパスは、同じファイルの
+    /// **BUG-066の回帰テスト（B-2）**: 差分層配下の実体を直接指すパスは、同じファイルの
     /// 別の綴りとして**workspaceと同じ台帳キー**へ写る（リダイレクトはしない）。
     #[test]
-    fn classify_target_treats_a_path_inside_the_upper_dir_as_an_alias_with_the_same_ledger_key() {
+    fn classify_target_treats_a_path_inside_the_diff_layer_dir_as_an_alias_with_the_same_ledger_key() {
         let workspace = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
             ext_capture_roots: Vec::new(),
         };
 
-        let classified = classify_target(&cfg, &upper.path().join("merge-demo.txt"))
-            .expect("a direct write into the upper dir must classify");
+        let classified = classify_target(&cfg, &diff_layer.path().join("merge-demo.txt"))
+            .expect("a direct write into the diff layer dir must classify");
 
-        assert_eq!(classified.kind, TargetKind::UpperAlias);
+        assert_eq!(classified.kind, TargetKind::DiffLayerAlias);
         assert_eq!(classified.ledger_key, "merge-demo.txt");
-        // 誘導先は自分自身（＝「upperのupper」は作らない）。
+        // 誘導先は自分自身（＝「差分層の差分層」は作らない）。
         assert_eq!(
-            cfg.upper_dir.join(&classified.rel),
-            upper.path().join("merge-demo.txt")
+            cfg.diff_layer_dir.join(&classified.rel),
+            diff_layer.path().join("merge-demo.txt")
         );
     }
 
     /// CoW自身の帳簿（`.harness-cow-*`）と`_ext`配下は別名として扱わない
     /// （前者は変更ではない、後者はhost側の実体走査が拾う）。
     #[test]
-    fn classify_target_ignores_cow_bookkeeping_and_ext_entries_inside_the_upper_dir() {
+    fn classify_target_ignores_cow_bookkeeping_and_ext_entries_inside_the_diff_layer_dir() {
         let workspace = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
             ext_capture_roots: Vec::new(),
         };
         for name in [
@@ -557,20 +557,20 @@ mod tests {
             ".harness-cow-session.json",
         ] {
             assert!(
-                classify_target(&cfg, &upper.path().join(name)).is_none(),
+                classify_target(&cfg, &diff_layer.path().join(name)).is_none(),
                 "{name} must not be recorded as a change"
             );
         }
         assert!(classify_target(
             &cfg,
-            &upper
+            &diff_layer
                 .path()
                 .join(harness_change_ledger::COW_BASELINE_DIRNAME)
                 .join("a.txt")
         )
         .is_none());
         assert!(
-            classify_target(&cfg, &upper.path().join("_ext").join("c").join("x.txt")).is_none()
+            classify_target(&cfg, &diff_layer.path().join("_ext").join("c").join("x.txt")).is_none()
         );
     }
 
@@ -578,11 +578,11 @@ mod tests {
     #[test]
     fn classify_target_returns_none_outside_workspace_and_capture_roots() {
         let workspace = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
             ext_capture_roots: Vec::new(),
         };
 
@@ -595,13 +595,13 @@ mod tests {
     #[test]
     fn baseline_hash_for_routes_absolute_ledger_key_through_ext_mirror() {
         let workspace = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let target = outside.path().join("probe.txt");
         std::fs::write(&target, b"ext-original").unwrap();
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
-            upper_dir: upper.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
             ext_capture_roots: vec![outside.path().to_path_buf()],
         };
         let original = store::normalize_abs_path(&target.to_string_lossy());
@@ -613,7 +613,7 @@ mod tests {
             hash,
             Some(harness_change_ledger::hash_bytes(b"ext-original"))
         );
-        let mirror = upper
+        let mirror = diff_layer
             .path()
             .join(harness_change_ledger::COW_BASELINE_DIRNAME)
             .join("_ext")
@@ -636,44 +636,44 @@ mod tests {
             .collect()
     }
 
-    /// BUG-047 §7.8優先順位: whiteout済みは除外・upper優先・同名upperが無いbaseのみ採用。
+    /// BUG-047 §7.8優先順位: whiteout済みは除外・差分層優先・同名差分層が無いbaseのみ採用。
     #[test]
-    fn merge_dir_entries_applies_whiteout_and_upper_priority() {
+    fn merge_dir_entries_applies_whiteout_and_diff_layer_priority() {
         let base = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         std::fs::write(base.path().join("only_base.txt"), "b").unwrap();
         std::fs::write(base.path().join("both.txt"), "base-version").unwrap();
         std::fs::write(base.path().join("deleted.txt"), "b").unwrap();
-        std::fs::write(upper.path().join("only_upper.txt"), "u").unwrap();
-        std::fs::write(upper.path().join("both.txt"), "upper-version").unwrap();
+        std::fs::write(diff_layer.path().join("only_diff_layer.txt"), "u").unwrap();
+        std::fs::write(diff_layer.path().join("both.txt"), "diff-layer-version").unwrap();
 
         let mut deleted = HashSet::new();
         deleted.insert("deleted.txt".to_string());
 
-        let merged = crate::merge_dir_entries(base.path(), upper.path(), &deleted, "");
+        let merged = crate::merge_dir_entries(base.path(), diff_layer.path(), &deleted, "");
         let mut got = names(&merged);
         got.sort();
-        assert_eq!(got, vec!["both.txt", "only_base.txt", "only_upper.txt"]);
+        assert_eq!(got, vec!["both.txt", "only_base.txt", "only_diff_layer.txt"]);
         let both = merged
             .iter()
             .find(|e| String::from_utf16_lossy(&e.name) == "both.txt")
             .unwrap();
         assert_eq!(
             both.end_of_file,
-            "upper-version".len() as i64,
-            "upper must win over same-name base"
+            "diff-layer-version".len() as i64,
+            "diff layer must win over same-name base"
         );
     }
 
-    /// セッション中に新規作成（baseには無くupperにのみ存在）したファイルがマージ結果に
+    /// セッション中に新規作成（baseには無く差分層にのみ存在）したファイルがマージ結果に
     /// 現れること（BUG-047のユーザー報告シナリオそのもの）。
     #[test]
     fn merge_dir_entries_surfaces_session_created_file_missing_from_base() {
         let base = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
-        std::fs::write(upper.path().join("test.txt"), "new").unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
+        std::fs::write(diff_layer.path().join("test.txt"), "new").unwrap();
 
-        let merged = crate::merge_dir_entries(base.path(), upper.path(), &HashSet::new(), "");
+        let merged = crate::merge_dir_entries(base.path(), diff_layer.path(), &HashSet::new(), "");
 
         assert_eq!(names(&merged), vec!["test.txt"]);
     }
@@ -681,8 +681,8 @@ mod tests {
     #[test]
     fn merge_dir_entries_empty_directories_yield_empty_result() {
         let base = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
-        let merged = crate::merge_dir_entries(base.path(), upper.path(), &HashSet::new(), "");
+        let diff_layer = tempfile::tempdir().unwrap();
+        let merged = crate::merge_dir_entries(base.path(), diff_layer.path(), &HashSet::new(), "");
         assert!(merged.is_empty());
     }
 
@@ -706,11 +706,11 @@ mod tests {
     fn marshal_entries_round_trips_file_names_information() {
         use windows::Wdk::Storage::FileSystem::{FileNamesInformation, FILE_NAMES_INFORMATION};
         let base = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         for n in ["a.txt", "b.txt", "c.txt"] {
-            std::fs::write(upper.path().join(n), "x").unwrap();
+            std::fs::write(diff_layer.path().join(n), "x").unwrap();
         }
-        let merged = crate::merge_dir_entries(base.path(), upper.path(), &HashSet::new(), "");
+        let merged = crate::merge_dir_entries(base.path(), diff_layer.path(), &HashSet::new(), "");
         assert_eq!(merged.len(), 3);
 
         let mut buf = vec![0u8; 4096];
@@ -748,9 +748,9 @@ mod tests {
     fn marshal_entries_reports_zero_consumed_when_buffer_too_small() {
         use windows::Wdk::Storage::FileSystem::FileNamesInformation;
         let base = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
-        std::fs::write(upper.path().join("longer-file-name.txt"), "x").unwrap();
-        let merged = crate::merge_dir_entries(base.path(), upper.path(), &HashSet::new(), "");
+        let diff_layer = tempfile::tempdir().unwrap();
+        std::fs::write(diff_layer.path().join("longer-file-name.txt"), "x").unwrap();
+        let merged = crate::merge_dir_entries(base.path(), diff_layer.path(), &HashSet::new(), "");
 
         let mut tiny_buf = vec![0u8; 4];
         let (bytes_written, consumed) =
@@ -765,11 +765,11 @@ mod tests {
     fn marshal_entries_return_single_entry_and_pagination() {
         use windows::Wdk::Storage::FileSystem::FileNamesInformation;
         let base = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
         for n in ["a.txt", "b.txt"] {
-            std::fs::write(upper.path().join(n), "x").unwrap();
+            std::fs::write(diff_layer.path().join(n), "x").unwrap();
         }
-        let merged = crate::merge_dir_entries(base.path(), upper.path(), &HashSet::new(), "");
+        let merged = crate::merge_dir_entries(base.path(), diff_layer.path(), &HashSet::new(), "");
 
         let mut buf = vec![0u8; 4096];
         let (_, consumed_first) =

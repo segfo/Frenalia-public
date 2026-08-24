@@ -120,7 +120,7 @@ pub(crate) fn fs_audit_path(
 
 #[cfg(windows)]
 fn cow_denied_path(session: Option<&str>) -> Option<PathBuf> {
-    resolve_cow_upper_dir(session)
+    resolve_cow_diff_layer_dir(session)
         .map(|dir| dir.join(harness_change_ledger::COW_DENIED_LEDGER_FILENAME))
 }
 

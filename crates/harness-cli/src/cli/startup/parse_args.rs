@@ -178,9 +178,9 @@ mod tests {
     /// も同じ性質から従う。
     #[test]
     fn normalization_does_not_touch_the_filesystem_so_case_and_links_are_preserved() {
-        let upper = PathBuf::from(r"C:\WS\Sub");
+        let diff_layer = PathBuf::from(r"C:\WS\Sub");
         assert_eq!(
-            normalize_workspace_root(&upper),
+            normalize_workspace_root(&diff_layer),
             PathBuf::from(r"C:\WS\Sub")
         );
     }

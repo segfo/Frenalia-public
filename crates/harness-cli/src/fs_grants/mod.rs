@@ -84,7 +84,7 @@ pub enum FsAction {
     /// `preflight`が起動のたびに付与するworkspace本体のACE（通常起動=RWX、`--sandbox tier2a-cow`=RO）を
     /// 撤収する。同じworkspaceを今も使っている他のharnessセッションが無いことを名前付き
     /// mutexで確認し、あれば「使用中」として拒否する（`harness_sandbox::tier2a::workspace_ledger`
-    /// 参照）。CoWのupper_dirには一切触れない（別コマンド`harness cow discard`が担当）。
+    /// 参照）。CoWのdiff_layer_dirには一切触れない（別コマンド`harness cow discard`が担当）。
     RevokeWorkspace { path: PathBuf },
     /// これまで許可を付けたことがある全workspaceに対して`revoke-workspace`と同じ処理をする。
     /// 使用中のworkspaceは自動的にスキップされる（一覧に表示のみ）。

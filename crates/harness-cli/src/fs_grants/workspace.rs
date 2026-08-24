@@ -7,7 +7,7 @@ use super::*;
 
 /// workspace本体のACE（`preflight`が毎回付与するRWX/RO）を撤収する。名前付きmutexで
 /// 「今もこのworkspaceを使っている他のharnessセッションが無いか」を確認してから撤収する
-/// （`harness_sandbox::tier2a::workspace_ledger`参照）。CoWのupper_dirには一切触れない。
+/// （`harness_sandbox::tier2a::workspace_ledger`参照）。CoWのdiff_layer_dirには一切触れない。
 ///
 /// [BUG-082] 撤収対象のSID（workspace capability最大2＋撤収可能なharnessプロファイル）を
 /// 先に全て解決し、`revoke_workspace_sids_recursive`で**1回のツリー走査**に一括する。

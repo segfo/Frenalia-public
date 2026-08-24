@@ -73,10 +73,10 @@ pub struct EnvironmentFacts {
     pub net_proxy: NetProxyConfig,
     pub net_app: NetAppPolicy,
     pub shell_sees_staged_writes: bool,
-    /// `--sandbox tier2a-cow`（D-30）のCoW upperディレクトリ。`Some`ならworkspaceはRead/Execute/Traverseのみ
+    /// `--sandbox tier2a-cow`（D-30）のCoW 差分層ディレクトリ。`Some`ならworkspaceはRead/Execute/Traverseのみ
     /// （RO）で付与されており、`run_shell`子プロセスの書込は透過的にこの外部ディレクトリへ
     /// 誘導される（Redirector DLL経由、フック失敗時はACLによりfail-close）。
-    pub cow_upper_dir: Option<PathBuf>,
+    pub cow_diff_layer_dir: Option<PathBuf>,
     /// 起動中のMCPサーバ（M15.5）。
     pub mcp_servers: Vec<McpServerFact>,
 }
@@ -94,7 +94,7 @@ impl EnvironmentFacts {
             run_shell_path_extra,
             shell_sees_staged_writes,
             vm_sandbox,
-            cow_upper_dir,
+            cow_diff_layer_dir,
             mcp_servers,
         } = ctx;
         let _ = run_shell_path_extra;
@@ -110,7 +110,7 @@ impl EnvironmentFacts {
             net_proxy: net_proxy.clone(),
             net_app: net_app.clone(),
             shell_sees_staged_writes: *shell_sees_staged_writes,
-            cow_upper_dir: cow_upper_dir.clone(),
+            cow_diff_layer_dir: cow_diff_layer_dir.clone(),
             mcp_servers: mcp_servers.clone(),
         }
     }
@@ -127,7 +127,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
         net_proxy,
         net_app,
         shell_sees_staged_writes,
-        cow_upper_dir,
+        cow_diff_layer_dir,
         mcp_servers,
     } = facts;
 
@@ -146,7 +146,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
         visible_workspace_root
     ));
     lines.push(render_staging(staging, *shell_sees_staged_writes));
-    if let Some(line) = render_cow(cow_upper_dir) {
+    if let Some(line) = render_cow(cow_diff_layer_dir) {
         lines.push(line);
     }
     lines.push(render_git_hardening());
@@ -291,8 +291,8 @@ fn render_staging(staging: &StagingConfig, shell_sees_staged_writes: bool) -> St
 /// 「run_shell内の直接書込は成功しない前提で組み立てよ」という事実を明示する
 /// （Redirector DLLが実際に誘導できるかはベストエフォートで、モデルの計画自体はACLの
 /// 保証だけを頼りにすべきという意図、フックは境界にしない=D-01）。
-fn render_cow(cow_upper_dir: &Option<PathBuf>) -> Option<String> {
-    cow_upper_dir.as_ref().map(|upper| {
+fn render_cow(cow_diff_layer_dir: &Option<PathBuf>) -> Option<String> {
+    cow_diff_layer_dir.as_ref().map(|diff_layer| {
         format!(
             "Copy-on-Writeモード: 有効。ワークスペース本体はread-onlyで付与されており、\
              run_shellが起動するプロセスから直接書込むと失敗します（Access Denied）。書込は\
@@ -302,7 +302,7 @@ fn render_cow(cow_upper_dir: &Option<PathBuf>) -> Option<String> {
              使ってください（これらはリダイレクト機構に依存せず常に反映されます）。なお、\
              上記ディレクトリへ直接書いた場合も、ワークスペース内の同じ相対パスに対する変更\
              として記録されます。",
-            upper.display()
+            diff_layer.display()
         )
     })
 }

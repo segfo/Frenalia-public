@@ -180,10 +180,10 @@ fn d81_per_volume_placement() {
     assert!(gate.is_ok(), "検証用NTFSボリュームが関所を通らない: {gate:?}");
 
     // (2) 差分層の根が**そのボリュームの直下**になること（D-81の本体）。
-    let chosen = crate::session_scope::cow_upper_root_for_workspace(&workspace)
+    let chosen = crate::session_scope::cow_diff_layer_root_for_workspace(&workspace)
         .expect("置き場を決められること");
     println!(
-        "cow_upper_root_for_workspace -> {} (fell_back={:?})",
+        "cow_diff_layer_root_for_workspace -> {} (fell_back={:?})",
         chosen.root.display(),
         chosen.fell_back
     );
@@ -204,23 +204,23 @@ fn d81_per_volume_placement() {
     );
 
     // (3) セッションの置き場がその下に来ること。
-    let upper = crate::session_scope::cow_upper_dir_in(&chosen.root, "session-d81-probe");
-    assert!(upper.starts_with(&expected), "{}", upper.display());
-    println!("session upper -> {}", upper.display());
+    let diff_layer = crate::session_scope::cow_diff_layer_dir_in(&chosen.root, "session-d81-probe");
+    assert!(diff_layer.starts_with(&expected), "{}", diff_layer.display());
+    println!("session diff layer -> {}", diff_layer.display());
 
     // (4) **AppContainerのACEが実際に載ること**（C:と同じ挙動か。共有では載らなかった）。
-    std::fs::create_dir_all(&upper).expect("差分層を作れること");
+    std::fs::create_dir_all(&diff_layer).expect("差分層を作れること");
     let sid = crate::tier2a::win_appcontainer::derive_profile_sid("harness.acl-probe.diagnostic")
         .expect("package SIDを導出できること");
-    crate::tier2a::win_appcontainer::grant_ace_inheritable_rw(&upper, sid.as_psid())
+    crate::tier2a::win_appcontainer::grant_ace_inheritable_rw(&diff_layer, sid.as_psid())
         .expect("差分層へACEを付けられること");
     let sid_text = crate::win_common::sid_to_string(sid.as_psid()).unwrap_or_default();
     let readback = std::process::Command::new("icacls")
-        .arg(&upper)
+        .arg(&diff_layer)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    println!("--- icacls {} ---\n{readback}", upper.display());
+    println!("--- icacls {} ---\n{readback}", diff_layer.display());
     assert!(
         readback.contains(sid_text.trim_start_matches('*')),
         "ACEを付けたのに読み返しで見つからない（共有と同じ無言の失敗）"

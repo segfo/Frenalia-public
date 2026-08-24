@@ -16,26 +16,26 @@ pub mod store;
 
 pub use path_rules::{validate_relative_path, PathRejection};
 
-/// 台帳ファイル名。`<upper_dir>/.harness-cow-ops.jsonl`に置く
+/// 台帳ファイル名。`<diff_layer_dir>/.harness-cow-ops.jsonl`に置く
 /// （`.harness-cow-session.json`と同じ階層、命名も揃える）。
 pub const COW_OPS_LEDGER_FILENAME: &str = ".harness-cow-ops.jsonl";
 
-/// baseline内容ミラーのディレクトリ名。`<upper_dir>/.harness-cow-baseline/<rel>`に
+/// baseline内容ミラーのディレクトリ名。`<diff_layer_dir>/.harness-cow-baseline/<rel>`に
 /// セッションが最初に触った瞬間の実workspace内容を保存する（3-way merge用の材料、
 /// `harness resolve`が読む。台帳の`baseline_hash`はハッシュ値のみでmerge材料にならない）。
 pub const COW_BASELINE_DIRNAME: &str = ".harness-cow-baseline";
 
-/// upper_dir直下に置かれるCoW自身のメタデータファイル／ディレクトリに共通する接頭辞。
+/// diff_layer_dir直下に置かれるCoW自身のメタデータファイル／ディレクトリに共通する接頭辞。
 /// 操作台帳・denied監査・警告・baselineミラー・デバッグログ・セッションメタ
 /// （`.harness-cow-session.json`、命名だけharness-sandbox側にある）が全てこれで始まる。
 ///
-/// [`store::scan_upper_content_files`]が「セッションの中身」と「CoW自身の帳簿」を分ける唯一の
-/// 規則である。新しいメタデータをupper直下へ足すときは**必ずこの接頭辞で命名する**こと
+/// [`store::scan_diff_layer_content_files`]が「セッションの中身」と「CoW自身の帳簿」を分ける唯一の
+/// 規則である。新しいメタデータを差分層直下へ足すときは**必ずこの接頭辞で命名する**こと
 /// （さもないと変更一覧へ混入する）。
 pub const COW_METADATA_PREFIX: &str = ".harness-cow-";
 
 /// Phase 4（設計書§19.8）: ACLで実際に拒否された（`STATUS_ACCESS_DENIED`）workspace外書込
-/// 試行の監査台帳ファイル名（`<upper_dir>/.harness-cow-denied.jsonl`）。境界自体はACLが
+/// 試行の監査台帳ファイル名（`<diff_layer_dir>/.harness-cow-denied.jsonl`）。境界自体はACLが
 /// 既に保証しているため、この台帳は可視性・監査目的のみ（無くても安全性は変わらない）。
 /// `.harness-cow-warnings.jsonl`（DLL注入失敗の警告、`crates/harness-redirector`内で
 /// 完結する別台帳）とは用途が異なるため分離する。

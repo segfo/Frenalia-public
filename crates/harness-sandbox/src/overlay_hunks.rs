@@ -250,7 +250,7 @@ impl SandboxFs {
 
         if composed == new {
             // 全ハンクを採ったのと同じ結果になった＝通常の`apply`と同じ後始末をする。
-            // オーバーレイ実体を残すと、Redirectorのcopy_upが「既にupperにある＝このセッションで
+            // オーバーレイ実体を残すと、Redirectorのcopy_upが「既に差分層にある＝このセッションで
             // 一度触った」と誤認して次の変更を台帳へ記録しなくなる（BUG-034）。
             let _ = overlay.jail.remove_file(&canonical);
             store::prune_ledger(&overlay.dir, std::slice::from_ref(&path));

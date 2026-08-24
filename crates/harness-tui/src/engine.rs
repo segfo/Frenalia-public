@@ -112,7 +112,7 @@ impl EngineHandle {
 pub fn spawn_engine(
     provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
-    // セッション切替（`/sessions`・`/fork`）でオーバーレイの置き場（`staging`・`cow_upper_dir`）
+    // セッション切替（`/sessions`・`/fork`）でオーバーレイの置き場（`staging`・`cow_diff_layer_dir`）
     // だけが差し替わる（[`apply_scope`]）。他のフィールドはプロセス寿命で不変。
     mut ctx: ToolCtx,
     arbiter: PermissionArbiter,
@@ -278,7 +278,7 @@ pub fn spawn_engine(
                             let new_id = new_session.id();
                             let message_count = messages.len();
                             // オーバーレイの置き場を**会話より先に**差し替える。直後の
-                            // `system_blocks_for(&ctx)`が新しい`staging`/`cow_upper_dir`を読むので、
+                            // `system_blocks_for(&ctx)`が新しい`staging`/`cow_diff_layer_dir`を読むので、
                             // モデルへ送る環境事実（`EnvironmentFacts`、`CLAUDE.md`の規約）が
                             // 追加コード無しで張り直る。順序を逆にすると、この会話の最初の
                             // ターンだけが古いオーバーレイの説明を持つ。
@@ -320,7 +320,7 @@ fn refresh_system_for_ctx(state: &mut ConversationState, ctx: &ToolCtx) {
 /// この2フィールドだけ**であり、それを1箇所に閉じ込めるための関数である。
 ///
 /// これで全経路が追随する理由: fsツールは呼び出しのたびに`ctx`から`SandboxFs`を開き直し
-/// （`harness_tools::fs_tools`）、`run_shell`はCoW upperを呼び出しのたびに`ctx.cow_upper_dir`から
+/// （`harness_tools::fs_tools`）、`run_shell`はCoW 差分層を呼び出しのたびに`ctx.cow_diff_layer_dir`から
 /// 子プロセスのenvへ注入する（`harness_tools::shell`）。どちらも起動時の値を握らないので、
 /// ここを書き換えるだけで次の呼び出しから新しいオーバーレイを見る。
 ///
@@ -329,7 +329,7 @@ fn refresh_system_for_ctx(state: &mut ConversationState, ctx: &ToolCtx) {
 /// 動くのは「どのセッションのオーバーレイへ書くか」だけである。
 fn apply_scope(ctx: &mut ToolCtx, scope: SessionScope) {
     ctx.staging = scope.staging;
-    ctx.cow_upper_dir = scope.cow_upper_dir;
+    ctx.cow_diff_layer_dir = scope.cow_diff_layer_dir;
 }
 
 #[cfg(test)]
@@ -372,7 +372,7 @@ mod tests {
             net_app: NetAppPolicy::default(),
             run_shell_path_extra: Vec::new(),
             vm_sandbox: None,
-            cow_upper_dir: None,
+            cow_diff_layer_dir: None,
             mcp_servers: Vec::new(),
         };
         let mut state = ConversationState::new(harness_engine::system_blocks_for(&stale_ctx));
@@ -413,7 +413,7 @@ mod tests {
             net_app: NetAppPolicy::default(),
             run_shell_path_extra: Vec::new(),
             vm_sandbox: None,
-            cow_upper_dir: Some(PathBuf::from(r"C:\cow\session-old")),
+            cow_diff_layer_dir: Some(PathBuf::from(r"C:\cow\session-old")),
             mcp_servers: Vec::new(),
         }
     }
@@ -435,12 +435,12 @@ mod tests {
                 "session-new"
             ))
         );
-        assert_eq!(ctx.cow_upper_dir, None);
+        assert_eq!(ctx.cow_diff_layer_dir, None);
         assert_eq!((ctx.workspace_root.clone(), ctx.shell_tier.tier), before);
     }
 
     /// `CLAUDE.md`の`EnvironmentFacts`規約: モデルへ送る環境事実は`ToolCtx`から毎回組み直す。
-    /// `--sandbox tier2a-cow`のupperパスはプロンプトに載る（`prompt::render_cow`）ので、切替後の会話が
+    /// `--sandbox tier2a-cow`の差分層パスはプロンプトに載る（`prompt::render_cow`）ので、切替後の会話が
     /// **古いオーバーレイの説明を持ったまま**にならないことをここで固定する。
     #[test]
     fn switching_the_cow_overlay_is_reflected_in_the_system_prompt() {
@@ -462,7 +462,7 @@ mod tests {
             SessionScope {
                 session_id: "session-new".to_string(),
                 staging,
-                cow_upper_dir: Some(PathBuf::from(r"C:\cow\session-new")),
+                cow_diff_layer_dir: Some(PathBuf::from(r"C:\cow\session-new")),
             },
         );
         refresh_system_for_ctx(&mut state, &ctx);

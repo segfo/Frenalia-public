@@ -1,6 +1,6 @@
 //! NTパス（`\??\C:\...`・`\Device\HarddiskVolume3\...`）と Win32 パスの相互変換。
 //!
-//! フックが受け取る`OBJECT_ATTRIBUTES`はNT名前空間のパスを持つため、workspace/upper_dirの
+//! フックが受け取る`OBJECT_ATTRIBUTES`はNT名前空間のパスを持つため、workspace/diff_layer_dirの
 //! 判定に使えるWin32パスへ直す必要がある。相対オープン（`RootDirectory`ハンドル + 相対名）は
 //! ハンドルからNTデバイスパスを引いて解決する。
 
@@ -57,15 +57,15 @@ pub(crate) unsafe fn object_attributes_path(oa: *const OBJECT_ATTRIBUTES) -> Opt
 /// **`GetFinalPathNameByHandleW`/`QueryDosDeviceW`は使わない**: 当初`GetFinalPathNameByHandleW`
 /// で`root`をDOS絶対パスへ解決しようとしたが、実機でAppContainer内から呼ぶと常に
 /// `ERROR_ACCESS_DENIED`になった（内部で生のボリュームデバイス`\\.\C:`相当を開くため、
-/// workspace/upperのACLだけを許可されたパッケージSIDには許可されない）。次に
+/// workspace/差分層のACLだけを許可されたパッケージSIDには許可されない）。次に
 /// `ntdll!NtQueryObject`でNTデバイスパス（例: `\Device\HarddiskVolume3\Users\...`、ドライブ
 /// 文字なし）を得た上で、ドライブ文字→NTデバイス名の対応を`QueryDosDeviceW`のシステム全体
 /// 列挙で作ろうとしたが、これもAppContainerからは1件も返らない（実機で確認、`\??\`
 /// シンボリックリンク名前空間そのものがパッケージSIDから見えない）。
 ///
 /// かわりに、**このDLLが最初から知っている2つのDOS絶対パス（`cfg.workspace_root`・
-/// `cfg.upper_dir`）自身を自分で開いてNTデバイスプレフィックスを逆算**する
-/// （`known_root_nt_prefixes`）。システム全体のドライブ列挙が不要になり、workspace/upper
+/// `cfg.diff_layer_dir`）自身を自分で開いてNTデバイスプレフィックスを逆算**する
+/// （`known_root_nt_prefixes`）。システム全体のドライブ列挙が不要になり、workspace/差分層
 /// 配下だけを解決できれば十分というこのDLLのスコープ（workspace外は既存の設計通り
 /// 安全側で素通し）とも一致する。
 pub(crate) unsafe fn resolve_relative_object_attributes_path(
@@ -123,8 +123,8 @@ pub(crate) unsafe fn resolve_relative_object_attributes_path(
 /// **ledger_keyの解釈は`dir_query_roots`と同じ規約**にそろえる——絶対パスなら`_ext` capture
 /// root、そうでなければworkspace相対（`docs/CODE-STRUCTURE-RULES.md`規則5：同じ判定を2箇所で
 /// 別々に育てない）。返すのは絶対パスで、呼び出し側の`classify_target`が通常どおり再分類・
-/// リダイレクトする（＝親ハンドルがworkspace側かupper側かを問わず、子openは論理パスとして
-/// 扱われ、書込は改めてupperへ誘導される）。
+/// リダイレクトする（＝親ハンドルがworkspace側か差分層側かを問わず、子openは論理パスとして
+/// 扱われ、書込は改めて差分層へ誘導される）。
 ///
 /// **対応表に無いハンドルは`None`**（安全側の素通し）。境界はACLなので、透過が効かなければ
 /// 失敗が見えるだけで穴は開かない（D-01）。
@@ -196,7 +196,7 @@ pub(crate) unsafe fn query_object_name(handle: HANDLE) -> Option<String> {
     Some(String::from_utf16_lossy(slice))
 }
 
-/// `cfg.workspace_root`・`cfg.upper_dir`それぞれについて、自分でその絶対パスを開き
+/// `cfg.workspace_root`・`cfg.diff_layer_dir`それぞれについて、自分でその絶対パスを開き
 /// `query_object_name`でNTデバイスパス（例: `\Device\HarddiskVolume3\Users\...\workspace`、
 /// ルート自身の完全パス）を取得してキャッシュする。プロセス生存中にドライブ構成が変わる
 /// ことは無い想定で1度だけ計算する（BUG-033修正）。
@@ -204,7 +204,7 @@ pub(crate) fn known_root_nt_paths(cfg: &'static Config) -> &'static [(String, Pa
     static CACHE: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let mut out = Vec::new();
-        for root in [cfg.workspace_root.clone(), cfg.upper_dir.clone()] {
+        for root in [cfg.workspace_root.clone(), cfg.diff_layer_dir.clone()] {
             if let Some(nt_name) = query_own_nt_device_path(&root) {
                 out.push((nt_name, root));
             }
@@ -228,7 +228,7 @@ pub(crate) fn query_own_nt_device_path(root: &Path) -> Option<String> {
 }
 
 /// NTデバイスパス（例: `\Device\HarddiskVolume3\Users\...`）を、`known_root_nt_paths`の
-/// 対応表と比較し、既知ルート（`workspace_root`または`upper_dir`）自身か、その配下かを
+/// 対応表と比較し、既知ルート（`workspace_root`または`diff_layer_dir`）自身か、その配下かを
 /// 判定してDOS絶対パスへ変換する（BUG-033修正）。
 pub(crate) fn nt_device_path_to_known_root(cfg: &'static Config, nt_path: &str) -> Option<PathBuf> {
     let nt_lc = nt_path.to_ascii_lowercase();

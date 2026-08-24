@@ -150,7 +150,7 @@ impl WorkspaceJail {
     }
 
     /// [`Self::write_string`]のバイト列版。CoWのapplyは任意のバイナリ（画像・実行ファイル等）を
-    /// upperからworkspaceへ移すため、`&str`では表せない（`write_string`はこれを呼ぶ）。
+    /// 差分層からworkspaceへ移すため、`&str`では表せない（`write_string`はこれを呼ぶ）。
     pub fn write_bytes(&self, rel_path: &str, content: &[u8]) -> Result<(), JailError> {
         use std::io::Write as _;
 
@@ -165,7 +165,7 @@ impl WorkspaceJail {
         Ok(())
     }
 
-    /// ジェイル内のファイルをバイト列として読む（applyのbaseline照合・upper側実体の読み出し用。
+    /// ジェイル内のファイルをバイト列として読む（applyのbaseline照合・差分層側実体の読み出し用。
     /// テキストとは限らないので[`Self::read_to_string`]では代用できない）。
     pub fn read_bytes(&self, rel_path: &str) -> Result<Vec<u8>, JailError> {
         use std::io::Read as _;

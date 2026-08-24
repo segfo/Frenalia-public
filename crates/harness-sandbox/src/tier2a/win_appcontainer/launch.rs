@@ -52,9 +52,9 @@ pub struct WorkspaceSpawn {
     pub env: Vec<(String, String)>,
     /// workspaceルート。ACEを付けた主体（capability SID）の導出に使う。
     pub workspace_root: PathBuf,
-    /// `--sandbox tier2a-cow`（D-30）のupper_dir。`Some`のときだけRedirector DLLを注入し、
+    /// `--sandbox tier2a-cow`（D-30）のdiff_layer_dir。`Some`のときだけRedirector DLLを注入し、
     /// workspaceモードは`"ro"`になる。
-    pub cow_upper_dir: Option<PathBuf>,
+    pub cow_diff_layer_dir: Option<PathBuf>,
     /// `preflight`が**実際にACEを付けられた**passthroughルート（`(path, writable)`）。
     /// `--sandbox tier2a-cow`時、このうち書込可のものがRedirector DLLのext capture対象になる（設計書§19.8）。
     /// 境界＝ACLはfs-allowが既に張っているので、ここは変更の可視化のためのcaptureである。
@@ -67,7 +67,7 @@ impl WorkspaceSpawn {
     /// workspaceのアクセスモード。`preflight`の`workspace_mode`と**同じ語彙**でなければならない
     /// ——ずれると別のcapability SIDを導出する（モジュールdoc）。
     fn workspace_mode(&self) -> &'static str {
-        if self.cow_upper_dir.is_some() {
+        if self.cow_diff_layer_dir.is_some() {
             "ro"
         } else {
             "rwx"
@@ -98,9 +98,9 @@ pub fn spawn_shell_in_workspace(
         .filter(|(_, writable)| *writable)
         .map(|(path, _)| path.clone())
         .collect();
-    let cow = req.cow_upper_dir.as_ref().map(|upper_dir| CowInject {
+    let cow = req.cow_diff_layer_dir.as_ref().map(|diff_layer_dir| CowInject {
         workspace_root: &req.workspace_root,
-        upper_dir,
+        diff_layer_dir,
         ext_capture_roots: ext_capture_roots.as_slice(),
     });
 
@@ -152,7 +152,7 @@ mod tests {
             cwd: PathBuf::from(r"C:\ws"),
             env: Vec::new(),
             workspace_root: PathBuf::from(r"C:\ws"),
-            cow_upper_dir: None,
+            cow_diff_layer_dir: None,
             granted_passthrough: Vec::new(),
             net_capability: NetworkCapability::Deny,
         };
@@ -163,7 +163,7 @@ mod tests {
         );
 
         let cow = WorkspaceSpawn {
-            cow_upper_dir: Some(PathBuf::from(r"C:\ws\.harness\upper")),
+            cow_diff_layer_dir: Some(PathBuf::from(r"C:\ws\.harness\diff_layer")),
             ..base
         };
         assert_eq!(
@@ -180,7 +180,7 @@ mod tests {
             cwd: PathBuf::from(r"C:\ws"),
             env: Vec::new(),
             workspace_root: PathBuf::from(r"C:\ws"),
-            cow_upper_dir: None,
+            cow_diff_layer_dir: None,
             granted_passthrough: vec![
                 (PathBuf::from(r"C:\ro"), false),
                 (PathBuf::from(r"C:\rw"), true),

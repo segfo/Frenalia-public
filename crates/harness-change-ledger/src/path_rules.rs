@@ -5,8 +5,8 @@
 //! 1. `harness_sandbox::check_relative_path`（cap-stdジェイルの早期リジェクト）
 //! 2. `SandboxFs::apply`（CoW操作台帳のエントリを実FSへ反映する直前）
 //!
-//! そして2の入力である`.harness-cow-ops.jsonl`は**upper_dir配下にあり、サンドボックス子へ
-//! 書込可能として渡されている**（`preflight`の`grant_ace_inheritable_rw(upper_dir, sid)`）。
+//! そして2の入力である`.harness-cow-ops.jsonl`は**diff_layer_dir配下にあり、サンドボックス子へ
+//! 書込可能として渡されている**（`preflight`の`grant_ace_inheritable_rw(diff_layer_dir, sid)`）。
 //! [P-01](../../../docs/SECURITY-PRINCIPLES.md)の下では、台帳の内容はharnessが信用してよい
 //! 入力ではない——子はRedirector DLLのフックを経由せず、直接好きなJSON行を追記できる。
 //! したがって信頼側の`apply`は、jailと**同じ判定**を通さなければならない
@@ -132,11 +132,11 @@ pub fn strip_verbatim_prefix(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// CoWのルート（workspace_root・upper_dir）の綴りを揃える: `\??\`/`\\?\`前置を落とし、
+/// CoWのルート（workspace_root・diff_layer_dir）の綴りを揃える: `\??\`/`\\?\`前置を落とし、
 /// 末尾の余分な区切りを落とす（`C:\`のようなドライブルートは保つ）。
 ///
 /// [`relative_under_root`]は照合時にこれらの揺れを吸収するが、**綴りは揃えておかないと
-/// 別の場所で壊れる**——例えば`\\?\`付きのupper_dirを`nt_path_wide`が組み立てると
+/// 別の場所で壊れる**——例えば`\\?\`付きのdiff_layer_dirを`nt_path_wide`が組み立てると
 /// `\??\\\?\C:\...`という不正なNTパスになる。設定を渡す側（`spawn`のenv/blob）と受け取る側
 /// （Redirector DLLの`resolve_config`）が同じ関数で揃える（[BUG-066](../../../docs/bugs/BUG-066.md)）。
 pub fn normalize_root_spelling(root: &str) -> String {

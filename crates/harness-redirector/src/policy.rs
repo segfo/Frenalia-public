@@ -55,7 +55,7 @@ pub(crate) fn is_create_capable_disposition(create_disposition: u32) -> bool {
 /// 付いた**ディレクトリのopen**は、新規作成dispositionでない限りcopy-up/リダイレクト対象から
 /// 除外する。`Remove-Item`のパス解決やcwdの保持等、既存ディレクトリを`DELETE`/
 /// `WRITE_ATTRIBUTES`アクセス込みで開くケースがあり、これをリダイレクトすると
-/// `upper_dir`側に実体の無いディレクトリを開こうとして失敗したり、`copy_up`が
+/// `diff_layer_dir`側に実体の無いディレクトリを開こうとして失敗したり、`copy_up`が
 /// （ファイルではないため中身を伴わない）偽の`create`/`modify`エントリを台帳へ積んだりする
 /// （実機で`ls .harness`後に`.harness-cow-ops.jsonl`へ`create .harness`が誤記録されるのを確認）。
 /// `NtOpenFile`は`create_disposition`を持たない（常に`FILE_OPEN`相当）ため`None`を渡すと
@@ -75,11 +75,11 @@ pub(crate) fn should_redirect_write(
     matches!(create_disposition, Some(d) if is_create_capable_disposition(d))
 }
 
-/// `path`が`upper_dir`配下でなくworkspace配下であれば、workspaceルートからの相対パスを返す。
-/// upper_dir配下は絶対に対象外とする（誤ってupperをworkspaceとして再変換すると無限
+/// `path`が`diff_layer_dir`配下でなくworkspace配下であれば、workspaceルートからの相対パスを返す。
+/// diff_layer_dir配下は絶対に対象外とする（誤って差分層をworkspaceとして再変換すると無限
 /// リダイレクトになる、設計書§9）。
 pub(crate) fn workspace_relative(cfg: &Config, path: &Path) -> Option<PathBuf> {
-    if relative_under(&cfg.upper_dir, path).is_some() {
+    if relative_under(&cfg.diff_layer_dir, path).is_some() {
         return None;
     }
     relative_under(&cfg.workspace_root, path).map(|rel| rel_path_buf(&rel))
@@ -101,16 +101,16 @@ fn relative_under(root: &Path, path: &Path) -> Option<String> {
     )
 }
 
-/// `/`区切りの相対パス文字列を、`upper_dir.join()`で使える`PathBuf`（`\`区切り）へ。
+/// `/`区切りの相対パス文字列を、`diff_layer_dir.join()`で使える`PathBuf`（`\`区切り）へ。
 fn rel_path_buf(rel: &str) -> PathBuf {
     PathBuf::from(rel.replace('/', "\\"))
 }
 
-/// `path`が`upper_dir`配下（＝**既にCoWの行き先そのもの**）であれば、upperルートからの
-/// 相対パス（`/`区切り）を返す。CoW自身の帳簿（`.harness-cow-*`、upper直下）は`None`＝
+/// `path`が`diff_layer_dir`配下（＝**既にCoWの行き先そのもの**）であれば、差分層ルートからの
+/// 相対パス（`/`区切り）を返す。CoW自身の帳簿（`.harness-cow-*`、差分層直下）は`None`＝
 /// 完全に対象外にする（台帳・監査ログ自身の読み書きを「変更」として記録しないため）。
-pub(crate) fn upper_relative(cfg: &Config, path: &Path) -> Option<String> {
-    let rel = relative_under(&cfg.upper_dir, path)?;
+pub(crate) fn diff_layer_relative(cfg: &Config, path: &Path) -> Option<String> {
+    let rel = relative_under(&cfg.diff_layer_dir, path)?;
     if rel.is_empty() {
         return None;
     }
@@ -138,8 +138,8 @@ pub(crate) fn ext_relative(cfg: &Config, path: &Path) -> Option<(String, String)
     None
 }
 
-/// `workspace_relative`/`ext_relative`の判定結果を統一する。`rel`は`cfg.upper_dir.join(&rel)`で
-/// 常に正しいupper側実体パスになる（workspace内なら`<rel>`そのまま、`_ext`ならcapture root配下
+/// `workspace_relative`/`ext_relative`の判定結果を統一する。`rel`は`cfg.diff_layer_dir.join(&rel)`で
+/// 常に正しい差分層側実体パスになる（workspace内なら`<rel>`そのまま、`_ext`ならcapture root配下
 /// への写像`_ext/<key>`）。`ledger_key`は操作台帳・`check_deleted`・ハンドル対応表で使う識別子
 /// （workspace内ならworkspace相対パス、`_ext`なら正規化済み絶対パス文字列——host側`apply()`が
 /// `workspace_root.join(&path)`でそのまま実ターゲットを求められる形、設計書§19.8）。
@@ -149,36 +149,36 @@ pub(crate) struct Classified {
     pub(crate) kind: TargetKind,
 }
 
-/// 対象パスの種別。`UpperAlias`だけリダイレクトの扱いが違う（既に行き先に居るので
+/// 対象パスの種別。`DiffLayerAlias`だけリダイレクトの扱いが違う（既に行き先に居るので
 /// 誘導しない＝記録だけする）ため、呼び出し側が分岐できるよう明示的に持つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TargetKind {
-    /// workspace配下。upperへ誘導する（従来どおり）。
+    /// workspace配下。差分層へ誘導する（従来どおり）。
     Workspace,
     /// `--fs-allow`のext capture root配下。`_ext/<key>`へ誘導する（Phase 3）。
     Ext,
-    /// **upper_dir配下＝workspaceパスの別名**（[BUG-066](../../../docs/bugs/BUG-066.md)）。
+    /// **diff_layer_dir配下＝workspaceパスの別名**（[BUG-066](../../../docs/bugs/BUG-066.md)）。
     ///
-    /// upper_dirはサンドボックス子へRW付与されているので、子は`<upper>\<rel>`を直接指定して
-    /// 書ける（実際にモデルが`Set-Content <upper>\merge-demo.txt`をやった）。同じ実ファイルを
+    /// diff_layer_dirはサンドボックス子へRW付与されているので、子は`<差分層>\<rel>`を直接指定して
+    /// 書ける（実際にモデルが`Set-Content <差分層>\merge-demo.txt`をやった）。同じ実ファイルを
     /// 指す2通りの綴りなのだから、**同じ台帳キーの操作として同一視する**のが一貫している。
-    /// 誘導先を作り直す（＝upperのupper）必要は無い——既に行き先だからである。
-    UpperAlias,
+    /// 誘導先を作り直す（＝差分層の差分層）必要は無い——既に行き先だからである。
+    DiffLayerAlias,
 }
 
 pub(crate) fn classify_target(cfg: &Config, path: &Path) -> Option<Classified> {
-    // upperを最初に見る（workspace配下にupperを置く構成でも、行き先側の解釈を優先する）。
-    if let Some(rel) = upper_relative(cfg, path) {
+    // 差分層を最初に見る（workspace配下に差分層を置く構成でも、行き先側の解釈を優先する）。
+    if let Some(rel) = diff_layer_relative(cfg, path) {
         // `_ext/<key>`配下の別名は対象外にする。`ext_key`はドライブ文字を小文字化するため
         // 絶対パスへ逆写像すると台帳の綴りと食い違い、同じファイルが2エントリに割れる。
-        // こちらはhost側の実体走査（`store::scan_upper_content_files`）が拾う。
+        // こちらはhost側の実体走査（`store::scan_diff_layer_content_files`）が拾う。
         if rel.starts_with("_ext/") {
             return None;
         }
         return Some(Classified {
             rel: rel_path_buf(&rel),
             ledger_key: rel,
-            kind: TargetKind::UpperAlias,
+            kind: TargetKind::DiffLayerAlias,
         });
     }
     if let Some(rel) = workspace_relative(cfg, path) {

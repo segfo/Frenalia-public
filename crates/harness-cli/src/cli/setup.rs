@@ -79,9 +79,9 @@ pub(crate) fn sandbox_choice_supported_on(
 /// - `StagingMode`: 明示指定が無ければ常に`Live`（オプトイン。書込/読取の防御はシェル隔離Tierに
 ///   委ねる、D-29）。`live`分岐は他の2フラグが立っていなければ既定でも同じ結果になるため
 ///   論理的には冗長だが、`cli.live`を読む唯一の箇所なのでdead-code警告を避けるために明示する。
-/// - `WorkspaceWriteMode`: `--sandbox tier2a-cow`のときだけ`Cow`。`session_id`はCoW upperの
+/// - `WorkspaceWriteMode`: `--sandbox tier2a-cow`のときだけ`Cow`。`session_id`はCoW 差分層の
 ///   採番に使う（`sandbox_dir_for_session`と同じ採番元）。`ProjectDirs`が解決できない
-///   （HOME未設定等の異常環境）場合は起動を拒否する（安全側: upperが無いままRW付与へ
+///   （HOME未設定等の異常環境）場合は起動を拒否する（安全側: 差分層が無いままRW付与へ
 ///   フォールバックしない）。**置き場はワークスペースのボリュームで決まる**（D-81）ので
 ///   `workspace_root`を受ける。
 ///
@@ -101,11 +101,11 @@ pub(crate) fn resolve_staging_and_write_mode(
         return Ok((staging_mode, WorkspaceWriteMode::DirectRw, None));
     }
 
-    let chosen = harness_sandbox::session_scope::cow_upper_root_for_workspace(workspace_root)?;
-    let upper_dir = harness_sandbox::session_scope::cow_upper_dir_in(&chosen.root, session_id);
+    let chosen = harness_sandbox::session_scope::cow_diff_layer_root_for_workspace(workspace_root)?;
+    let diff_layer_dir = harness_sandbox::session_scope::cow_diff_layer_dir_in(&chosen.root, session_id);
     Ok((
         staging_mode,
-        WorkspaceWriteMode::Cow { upper_dir },
+        WorkspaceWriteMode::Cow { diff_layer_dir },
         chosen.fell_back,
     ))
 }
@@ -114,7 +114,7 @@ pub(crate) fn resolve_staging_and_write_mode(
 ///
 /// [`resolve_staging_and_write_mode`]から切り出してあるのは、`harness prompt`のためである。
 /// あちらは診断用の読み取り専用コマンドで`WorkspaceWriteMode`を捨てるのに、畳んだ関数を
-/// そのまま呼ぶと**使わないCoW upperの解決失敗で落ちる**（`%LOCALAPPDATA%`が引けない環境）。
+/// そのまま呼ぶと**使わないCoW 差分層の解決失敗で落ちる**（`%LOCALAPPDATA%`が引けない環境）。
 /// 排他判定は両方の入口が通す必要がある（B-06）が、資源の解決は起動側だけの都合なので分ける。
 pub(crate) fn resolve_staging_mode_checked(
     choice: SandboxChoice,
@@ -146,7 +146,7 @@ pub(crate) fn resolve_staging_mode_checked(
         };
         return Err(format!(
             "--sandbox tier2a-cow cannot be combined with {other}: they are two different write \
-             capture mechanisms (a staging manifest vs. a Copy-on-Write upper layer) and only one \
+             capture mechanisms (a staging manifest vs. a Copy-on-Write diff_layer layer) and only one \
              can be in effect. Pick the one you want to review changes through."
         ));
     }
@@ -382,7 +382,7 @@ mod staging_mode_tests {
     /// ボリュームになるパス**を使う。別ボリュームのパスを渡すとそちらのルートへ
     /// `.harness-cow`を作りに行き、単体テストが実マシンに副作用を残す。
     fn test_workspace() -> std::path::PathBuf {
-        harness_sandbox::session_scope::cow_profile_upper_root()
+        harness_sandbox::session_scope::cow_profile_diff_layer_root()
             .expect("%LOCALAPPDATA% must resolve for these tests")
             .join("test-workspace")
     }
@@ -442,7 +442,7 @@ mod staging_mode_tests {
             match choice {
                 SandboxChoice::Tier2aCow => assert!(
                     matches!(write_mode, WorkspaceWriteMode::Cow { .. }),
-                    "tier2a-cow must produce a CoW upper, got {write_mode:?}"
+                    "tier2a-cow must produce a CoW diff layer, got {write_mode:?}"
                 ),
                 SandboxChoice::Auto
                 | SandboxChoice::Tier1
@@ -496,13 +496,13 @@ mod staging_mode_tests {
             )
             .expect("--sandbox tier2a-cow on its own must start");
             assert_eq!(staging, StagingMode::Live);
-            let upper = write_mode
-                .upper_dir()
-                .expect("tier2a-cow must carry a CoW upper directory");
+            let diff_layer = write_mode
+                .diff_layer_dir()
+                .expect("tier2a-cow must carry a CoW diff layer directory");
             assert!(
-                upper.ends_with(SESSION),
-                "the upper directory must be numbered by session id: {}",
-                upper.display()
+                diff_layer.ends_with(SESSION),
+                "the diff layer directory must be numbered by session id: {}",
+                diff_layer.display()
             );
         }
     }

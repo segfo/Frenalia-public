@@ -227,21 +227,21 @@ pub struct FsPassthrough {
 #[derive(Debug, Clone)]
 pub enum WorkspaceWriteMode {
     /// 既定（D-29）。workspaceへ`grant_ace_inheritable_rw`でRead/Write/Execute/Deleteを
-    /// 直接付与する。CoW upperは存在しない。
+    /// 直接付与する。CoW 差分層は存在しない。
     DirectRw,
     /// `--sandbox tier2a-cow`（D-30）。workspaceへは`grant_ace_inheritable_ro`でRead/Execute/Traverseのみ
-    /// 付与し、`upper_dir`（workspace外、`--sandbox tier2a-cow`時に確保される）へ`grant_ace_inheritable_rw`を
+    /// 付与し、`diff_layer_dir`（workspace外、`--sandbox tier2a-cow`時に確保される）へ`grant_ace_inheritable_rw`を
     /// 付与する。透過的なリダイレクトはRedirector DLL（Phase 2）が担い、フックが無効・回避・
     /// 未対応APIで通過された場合もworkspace本体への書込はACLにより`ACCESS_DENIED`で
     /// fail-closeする（フックは境界にしない、D-01/D-30）。
-    Cow { upper_dir: PathBuf },
+    Cow { diff_layer_dir: PathBuf },
 }
 
 impl WorkspaceWriteMode {
-    pub fn upper_dir(&self) -> Option<&Path> {
+    pub fn diff_layer_dir(&self) -> Option<&Path> {
         match self {
             WorkspaceWriteMode::DirectRw => None,
-            WorkspaceWriteMode::Cow { upper_dir } => Some(upper_dir),
+            WorkspaceWriteMode::Cow { diff_layer_dir } => Some(diff_layer_dir),
         }
     }
 }

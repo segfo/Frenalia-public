@@ -522,12 +522,12 @@ pub struct ToolCtx {
     /// `ToolCtx`を経由させる。`Arc`は`ToolCtx`が`Clone`である前提（既存フィールドと同様、
     /// 生ハンドルではなく共有可能な参照を運ぶ）。
     pub vm_sandbox: Option<std::sync::Arc<dyn VmShellExecutor>>,
-    /// `--sandbox tier2a-cow`（D-30）指定時のCoW upperディレクトリ（workspace外）。`Some`はTier2aで
+    /// `--sandbox tier2a-cow`（D-30）指定時のCoW 差分層ディレクトリ（workspace外）。`Some`はTier2aで
     /// workspaceがRead/Execute/Traverseのみ（RO）で付与されており、`run_shell`子プロセスの
     /// 書込はRedirector DLLによりこのディレクトリへ誘導される（フック失敗時はACLにより
     /// `ACCESS_DENIED`でfail-close、`plans/DESIGN-SANDBOX.md §7 D-30`）。`None`は既定
     /// （D-29、workspace RW直接）。
-    pub cow_upper_dir: Option<std::path::PathBuf>,
+    pub cow_diff_layer_dir: Option<std::path::PathBuf>,
     /// 起動中のMCPサーバ（M15.5、`plans/DESIGN-MCP.md`）。空なら宣言が無いか、いずれも
     /// 承認されていないか、このOSでは起動しない（P-05）。
     pub mcp_servers: Vec<McpServerFact>,
@@ -547,7 +547,7 @@ impl ToolCtx {
             run_shell_path_extra: Vec::new(),
             shell_sees_staged_writes: false,
             vm_sandbox: None,
-            cow_upper_dir: None,
+            cow_diff_layer_dir: None,
             mcp_servers: Vec::new(),
         }
     }

@@ -340,7 +340,7 @@ pub fn normalize_preflight(ledger_json: &str) -> SourceReport {
 ///
 /// **既知の不正確さ**: `--sandbox tier2a-cow`下では`:rw`の実ACLが`Read`へ降格される（P-03、BUG-044）のに、
 /// 台帳へはユーザーが要求した`writable=true`が記録される。この場合ここは`ReadWrite`と見なすので
-/// 過大評価になる。ただし`--sandbox tier2a-cow`下のworkspace外書込はRedirector DLLがupperへ捕捉するため、
+/// 過大評価になる。ただし`--sandbox tier2a-cow`下のworkspace外書込はRedirector DLLが差分層へ捕捉するため、
 /// `:rw`パスのACL拒否が提案経路まで来ること自体が稀であり、追跡はしない。
 ///
 /// 壊れた台帳は**空として扱う**（D-43。読めないことを理由に提案そのものを止めない）。

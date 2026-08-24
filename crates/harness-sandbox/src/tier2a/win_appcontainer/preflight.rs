@@ -219,7 +219,7 @@ pub fn preflight_with_privhelper_launcher(
     // ACEを1本も付ける前に、そもそもこのworkspaceで子プロセスを起動できるかを確かめる。
     check_workspace_usable_as_child_cwd(workspace_root)?;
     timing.mark("check_workspace_usable_as_child_cwd");
-    // D-37: プロファイルはセッション単位。共有package SIDをやめ、workspace・CoW upper_dir・
+    // D-37: プロファイルはセッション単位。共有package SIDをやめ、workspace・CoW diff_layer_dir・
     // fs-allowの穴はこのセッションのSIDにだけ紐付ける（別セッション・別workspaceから到達
     // できないようにする）。祖先のtraverseだけはharness共通のcapability SIDが持つ（下記）。
     //
@@ -328,18 +328,18 @@ pub fn preflight_with_privhelper_launcher(
             timing.mark("grant_workspace_root_rw_fast(workspace_root)");
             workspace_rwx_mask()
         }
-        WorkspaceWriteMode::Cow { upper_dir } => {
+        WorkspaceWriteMode::Cow { diff_layer_dir } => {
             // **ACLを保持できないボリュームでは、そもそも境界を張れない**（D-81）。
             // 下の`grant_*`は失敗しないまま何も強制しないことがあり得るので、付ける前に
             // 検算して拒否する。ワークスペース側（読取専用ACEが乗る）と差分層側
             // （書込ACEが乗る）の**両方**を見る——D-81で両者は別ボリュームになり得る。
             require_persistent_acl_volume("workspace", workspace_root)?;
-            require_persistent_acl_volume("copy-on-write diff area", upper_dir)?;
+            require_persistent_acl_volume("copy-on-write diff area", diff_layer_dir)?;
             // `--sandbox tier2a-cow`（D-30）。workspaceはRead/Execute/Traverseのみ（D-13と同じ関数）。
             // Redirector DLLが無効・回避されても、この時点でACLがROである限り
             // workspace本体への書込は`ACCESS_DENIED`でfail-closeする。
             grant_workspace_root_ro_fast(workspace_root, workspace_cap.as_psid())?;
-            // upper_dirは**セッション専有**（他セッションと共有しない）なので、主体は
+            // diff_layer_dirは**セッション専有**（他セッションと共有しない）なので、主体は
             // 従来どおりセッションのpackage SIDのままにする。D-54が置き換えるのは
             // 「ワークスペースにつき一度きりで済むはずの付与」だけで、こちらは該当しない。
             //
@@ -348,28 +348,28 @@ pub fn preflight_with_privhelper_launcher(
             // `harness.exe`のGCから見ると**空の殻**と区別が付かない。囲まないと、
             // 起動しかけのセッションの差分層が他プロセスに消される
             // （`workspace_ledger::COW_GC_LOCK_NAME`のdoc、`shared-state-exclusion` 問1）。
-            let session_id = upper_dir
+            let session_id = diff_layer_dir
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown-session");
             harness_grant_ledger::with_named_lock(
                 crate::tier2a::workspace_ledger::COW_GC_LOCK_NAME,
                 || -> Result<(), AppContainerError> {
-                    std::fs::create_dir_all(upper_dir)
+                    std::fs::create_dir_all(diff_layer_dir)
                         .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
-                    grant_ace_inheritable_rw(upper_dir, sid.as_psid())?;
-                    crate::tier2a::session_profile::record_granted_path(upper_dir);
+                    grant_ace_inheritable_rw(diff_layer_dir, sid.as_psid())?;
+                    crate::tier2a::session_profile::record_granted_path(diff_layer_dir);
                     // `harness cow status`/`apply`/`list`がworkspace_rootを引けるよう、
-                    // upper_dir自身に由来を記録する
+                    // diff_layer_dir自身に由来を記録する
                     // （`workspace_ledger::write_cow_session_meta`のdoc参照）。
                     crate::tier2a::workspace_ledger::write_cow_session_meta(
-                        upper_dir,
+                        diff_layer_dir,
                         &canonical_workspace_root,
                         session_id,
                     );
-                    // CoWのupper_dirはセッション専有（他セッションと共有しない）なので、
-                    // 他モードとの衝突チェックは不要。セッションID（upper_dirの最終パス要素、
-                    // `session_scope::cow_upper_dir_in`参照）で名前を付けた生存マーカーだけを
+                    // CoWのdiff_layer_dirはセッション専有（他セッションと共有しない）なので、
+                    // 他モードとの衝突チェックは不要。セッションID（diff_layer_dirの最終パス要素、
+                    // `session_scope::cow_diff_layer_dir_in`参照）で名前を付けた生存マーカーだけを
                     // 確保し、`harness cow discard`等が「まだこのセッションが動いているか」を
                     // 判定できるようにする
                     // （`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`
@@ -434,13 +434,13 @@ pub fn preflight_with_privhelper_launcher(
         ));
     }
 
-    // workspace_root（Cow時はupper_dirも）の祖先traverseチェーンが不足していないか事前に判定する
+    // workspace_root（Cow時はdiff_layer_dirも）の祖先traverseチェーンが不足していないか事前に判定する
     // （読み取り専用、UAC無し）。不足分は下のfs-allow昇格要求と合流させ、1回のprivhelper呼び出し
     // （起動あたりUAC最大1回）で解消する。以前はtraverse不足を`smoke_test_spawn`（下記）が
     // リアクティブに検知してTier1bへ静かに降格するだけだったが、privhelper経由で自動付与できる
     // 経路（`GrantWorkspaceAccess`）が整ったため、ここで先回りして解消する
     // （`plans/DESIGN-SANDBOX-PRIVSEP.md` D-16「特権昇格デーモンを使う際の注意点」参照）。
-    // D-37: 見るのは**祖先だけ**。workspace_root/upper_dir自身への到達権はセッション固有の
+    // D-37: 見るのは**祖先だけ**。workspace_root/diff_layer_dir自身への到達権はセッション固有の
     // package SID宛の継承ACE（すぐ上で付与済み）が与えるので、共通capability SIDのACEを
     // そこへ要求してはいけない。ここでleafまで含めると、セッションのたびに新しいworkspaceで
     // 「capability SIDのACEが無い」と判定され、毎回昇格を要求してしまう。
@@ -449,8 +449,8 @@ pub fn preflight_with_privhelper_launcher(
         .map(|p| p.to_path_buf())
         .into_iter()
         .collect();
-    if let WorkspaceWriteMode::Cow { upper_dir } = write_mode {
-        if let Some(parent) = upper_dir.parent() {
+    if let WorkspaceWriteMode::Cow { diff_layer_dir } = write_mode {
+        if let Some(parent) = diff_layer_dir.parent() {
             traverse_targets.push(parent.to_path_buf());
         }
     }
@@ -703,7 +703,7 @@ pub fn preflight_with_privhelper_launcher(
             if crate::tier2a::privhelper::is_elevated() {
                 // 本体が既に管理者（§5.3、grant-traverseの`*_direct`と同じ考え方）:
                 // ヘルパーを経由せずその場で直接付与する。traverseが不足していれば先に解消する
-                // （workspace_root/upper_dirへ到達できなければfs-allow付与自体が無意味なため）。
+                // （workspace_root/diff_layer_dirへ到達できなければfs-allow付与自体が無意味なため）。
                 for target in &missing_traverse {
                     let (granted_nodes, result) =
                         grant_traverse_chain(target, traverse_sid.as_psid());
@@ -958,11 +958,11 @@ pub fn preflight_with_privhelper_launcher(
     // D-30: `FS_IO_PROBE_COMMAND`はprobe_dirへの書込を試みる。Cowモードではworkspace自体が
     // 意図的にROなので、probe_dirをworkspace配下に置くと「workspaceが書けない」という
     // Cowモードの正しい挙動を誤ってtraverse ACE不足として誤診断してしまう。probe_dirは
-    // 書込可能であるべき場所（DirectRw時はworkspace、Cow時はupper_dir）に置く。上のtraverse
+    // 書込可能であるべき場所（DirectRw時はworkspace、Cow時はdiff_layer_dir）に置く。上のtraverse
     // 自動付与を経た後の保険として、未知の原因によるFS I/O拒否をここで最終確認する。
     let probe_base = match write_mode {
         WorkspaceWriteMode::DirectRw => workspace_root,
-        WorkspaceWriteMode::Cow { upper_dir } => upper_dir.as_path(),
+        WorkspaceWriteMode::Cow { diff_layer_dir } => diff_layer_dir.as_path(),
     };
     let tmp_dir = probe_base.join(format!(".harness-tier2a-probe-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| AppContainerError::Preflight(e.to_string()))?;
