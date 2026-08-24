@@ -1032,5 +1032,9 @@ pub fn preflight_with_privhelper_launcher(
 fn require_persistent_acl_volume(what: &str, path: &Path) -> Result<(), AppContainerError> {
     let probe = crate::win_common::volume_mount_point_of(path)
         .and_then(|mount| crate::win_common::volume_capability(&mount));
-    crate::session_scope::cow_volume_gate(what, path, probe).map_err(AppContainerError::Preflight)
+    // 申告（上）だけでなく、**この対象に実際にDACLを書けるか**も測る。書き戻しは恒等なので
+    // 副作用は無い。存在しないパスには測れないので`None`＝拒否側へ倒れる（判定不能は閉じる）。
+    let dacl_writable = path.exists().then(|| crate::win_common::can_write_dacl(path));
+    crate::session_scope::cow_volume_gate(what, path, probe, dacl_writable)
+        .map_err(AppContainerError::Preflight)
 }

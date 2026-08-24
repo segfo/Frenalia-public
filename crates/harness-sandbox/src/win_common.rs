@@ -651,6 +651,73 @@ pub fn volume_capability(
     })
 }
 
+/// `path`のDACL（アクセス権の一覧）を**実際に書けるか**を、副作用なしで確かめる。
+///
+/// # なぜ申告を信じないのか
+///
+/// `FILE_PERSISTENT_ACLS`は「このファイルシステムはACLを永続化できます」という**申告**であって、
+/// 書けることの保証ではない。この開発機の`E:`（第三者製の暗号化ファイルシステム`cryptoFs`）は
+/// **申告を立てて返すのに、DACLの書込を一律で拒否する**（実測、2026-08-24）——
+/// しかも`WRITE_DAC`付きのハンドルは普通に開けるので、**開けるかどうかでは見抜けない**。
+/// 拒否されるのは書き込む瞬間だけである。
+///
+/// # なぜ「同じ内容を書き戻す」のか
+///
+/// 読んだDACLをそのまま書き戻すので、**成功しても対象は1ビットも変わらない**。
+/// 権限を試しに足して消す形にすると、途中で落ちたときに足したものが残る（B-01の非対称）。
+/// 測りたいのは「この対象へDACLを書く操作が通るか」だけなので、恒等な書込で足りる。
+pub fn can_write_dacl(path: &std::path::Path) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetKernelObjectSecurity, SetKernelObjectSecurity, DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    };
+
+    let wide_path = wide(&path.to_string_lossy());
+    unsafe {
+        let Ok(handle) = CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            READ_CONTROL.0 | WRITE_DAC.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            // ディレクトリも同じ関数で開くために要る。
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        ) else {
+            return false;
+        };
+        let mut needed = 0u32;
+        // 1回目は必要な大きさを聞くだけ（必ず失敗する）。
+        let _ = GetKernelObjectSecurity(
+            handle,
+            DACL_SECURITY_INFORMATION.0,
+            PSECURITY_DESCRIPTOR::default(),
+            0,
+            &mut needed,
+        );
+        let mut buffer = vec![0u8; needed.max(4096) as usize];
+        let descriptor = PSECURITY_DESCRIPTOR(buffer.as_mut_ptr().cast());
+        let read = GetKernelObjectSecurity(
+            handle,
+            DACL_SECURITY_INFORMATION.0,
+            descriptor,
+            buffer.len() as u32,
+            &mut needed,
+        )
+        .is_ok();
+        // **読めた内容をそのまま書き戻す。** 成功しても対象は変わらない。
+        let written =
+            read && SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, descriptor).is_ok();
+        let _ = CloseHandle(handle);
+        written
+    }
+}
+
 /// いま到達できるドライブ文字のルート（`C:\`・`D:\`…）を列挙する。
 ///
 /// CoWの差分層がボリュームごとに散る（D-81）ため、棚卸し（`harness cow list`/`gc`）は

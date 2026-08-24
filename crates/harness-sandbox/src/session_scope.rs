@@ -315,7 +315,7 @@ pub struct VolumeCapability {
 /// 検査が無かったため、隔離されていない状態で「隔離されている」とモデルへ宣言し得た
 /// （[BUG-129](../../../docs/bugs/BUG-129.md)）。同じ形の穴をD-72が[BUG-113]で塞いでいる。
 ///
-/// # 通さないものが2つある
+/// # 通さないものが3つある
 ///
 /// 1. **ACLを保持できないボリューム**——FAT32・exFAT（USBメモリ・SDカードの既定）。
 ///    ACEを付ける先が無いので境界がゼロになる。
@@ -323,7 +323,16 @@ pub struct VolumeCapability {
 ///    `FILE_PERSISTENT_ACLS`を立てて返す**ので、ACLの有無だけを見ると通ってしまう。
 ///    しかしAppContainerのpackage SIDは**このマシンのローカルな主体**であり、
 ///    共有越しの相手にそのSIDを解決させることはできない。**ACEは書けたように見えて
-///    何も強制しない。** 「立っているフラグ」ではなく「境界が実際に効くか」で判定する。
+///    何も強制しない。**
+/// 3. **DACLの書込を実際には拒否するボリューム**——この開発機の`E:`（第三者製の暗号化
+///    ファイルシステム`cryptoFs`）が実例。`FILE_PERSISTENT_ACLS`を立てて返し、ローカルで、
+///    `WRITE_DAC`付きのハンドルも普通に開けるのに、**書き込む瞬間だけ`ACCESS_DENIED`を返す**
+///    （実測、2026-08-24。内容を1ビットも変えない書き戻しすら通らない）。
+///
+/// **1と2はファイルシステムの自己申告に基づく判定である。** 申告どおりでない実装が現実に
+/// 在る以上、最後は[`crate::win_common::can_write_dacl`]で**実際に書けることを確かめる**。
+/// 3件とも別々の嘘だった、というのがこの関所の形である——「その機構が在るか」を問うAPIの
+/// 答えは、「その機構が自分の使い方で効くか」を意味しない。
 ///
 /// # 判定できないときは拒否へ倒す
 ///
@@ -335,6 +344,7 @@ pub fn cow_volume_gate(
     what: &str,
     path: &Path,
     probe: Option<VolumeCapability>,
+    dacl_writable: Option<bool>,
 ) -> Result<(), String> {
     let Some(cap) = probe else {
         return Err(format!(
@@ -361,6 +371,15 @@ pub fn cow_volume_gate(
              plus a writable diff area), so on this volume the boundary cannot be established \
              at all. Move the workspace to an NTFS volume, or pick a weaker isolation \
              explicitly with --sandbox.",
+            path.display(),
+            cap.filesystem
+        ));
+    }
+    // **申告の最後は実測で裏を取る**（上のdoc「3」）。ここへ来た時点で
+    // 「ACLを持てると言っていて、ローカルで」ある。それでも書けないことがある。
+    if dacl_writable != Some(true) {
+        return Err(format!(
+            "--sandbox tier2a-cow: the {what} ({}) is on a {} volume that reports it can store              ACLs, but it rejected a no-op DACL write. Copy-on-write isolation cannot be              enforced where access rights cannot be written. Move the workspace to an NTFS              volume, or pick a weaker isolation explicitly with --sandbox.",
             path.display(),
             cap.filesystem
         ));
@@ -977,7 +996,8 @@ mod tests {
         assert!(cow_volume_gate(
             "workspace",
             Path::new(r"C:\ws"),
-            Some(cap(true, "NTFS", false))
+            Some(cap(true, "NTFS", false)),
+            Some(true)
         )
         .is_ok());
     }
@@ -989,6 +1009,7 @@ mod tests {
             "workspace",
             Path::new(r"X:\ws"),
             Some(cap(false, "exFAT", false)),
+            Some(true),
         )
         .expect_err("copy-on-write isolation is enforced by ACLs");
         assert!(err.contains("exFAT"), "打つ手が分かるように名指しする: {err}");
@@ -1004,6 +1025,7 @@ mod tests {
             "workspace",
             Path::new(r"\server\share\ws"),
             Some(cap(true, "NTFS", true)),
+            Some(true),
         )
         .expect_err("a remote server cannot resolve this machine's AppContainer SID");
         assert!(
@@ -1016,7 +1038,37 @@ mod tests {
     /// ここが`Ok`へ倒れると、境界が張れているか分からないまま「隔離した」と宣言してしまう。
     #[test]
     fn an_unprobeable_volume_is_refused_rather_than_assumed_capable() {
-        assert!(cow_volume_gate("workspace", Path::new(r"X:\ws"), None).is_err());
+        assert!(cow_volume_gate("workspace", Path::new(r"X:\ws"), None, Some(true)).is_err());
+    }
+
+    /// **申告どおりでないボリュームを実測で弾く。** この開発機の`E:`（`cryptoFs`）が実例で、
+    /// ACLを保持できると申告し、ローカルで、`WRITE_DAC`付きのハンドルも開けるのに、
+    /// **DACLを書き込む瞬間だけ拒否する**。ここが無いと境界ゼロのまま起動を試みる。
+    #[test]
+    fn a_volume_that_reports_acls_but_rejects_dacl_writes_is_refused() {
+        let err = cow_volume_gate(
+            "workspace",
+            Path::new(r"E:\ws"),
+            Some(cap(true, "cryptoFs", false)),
+            Some(false),
+        )
+        .expect_err("a volume that cannot accept a DACL write cannot enforce the boundary");
+        assert!(
+            err.contains("cryptoFs") && err.contains("DACL"),
+            "何が起きたかが分かる文言にする: {err}"
+        );
+    }
+
+    /// 実測そのものができなかった場合も拒否側へ倒す（判定不能は閉じる）。
+    #[test]
+    fn an_unprobeable_dacl_write_is_refused_too() {
+        assert!(cow_volume_gate(
+            "workspace",
+            Path::new(r"E:\ws"),
+            Some(cap(true, "NTFS", false)),
+            None
+        )
+        .is_err());
     }
 
     /// ネットワーク共有のルートに差分層の根を掘らない。**起動を拒否する直前に
@@ -1059,17 +1111,69 @@ mod volume_diagnostics {
     ///
     /// **`X:`/`Z:`がこの機構の要点そのものである**——ネットワーク共有なのに
     /// `FILE_PERSISTENT_ACLS`を**立てて返す**。ACLのフラグだけを見ていたら通していた。
+    ///
+    /// **この診断が測るのはドライブ直下（`C:\`等）であって、本番が測る対象ではない。**
+    /// 本番はワークスペースと差分層の**パス**を測る。ドライブ直下は一般ユーザーがDACLを
+    /// 書けないので、この診断では`C:\`も「拒否」と出る——**それは正常**で、
+    /// 「C:ではCoWが動かない」ことを意味しない。本番と同じパスで測るのは
+    /// [`super::path_gate_diagnostics`]の方である。
     /// 実行: `cargo test -p harness-sandbox --lib volume_diagnostics -- --ignored --nocapture`
     #[test]
     #[ignore = "machine-specific diagnostic; prints the verdict for every drive on this machine"]
     fn print_cow_volume_verdict_for_every_drive() {
         for root in crate::win_common::logical_drive_roots() {
             let cap = crate::win_common::volume_capability(&root);
-            let verdict = cow_volume_gate("workspace", &root, cap.clone());
+            let dacl_writable = root
+                .exists()
+                .then(|| crate::win_common::can_write_dacl(&root));
+            let verdict = cow_volume_gate("workspace", &root, cap.clone(), dacl_writable);
             println!(
-                "{:<5} cap={:<70} -> {}",
+                "{:<5} dacl_writable={:<12} cap={:<70} -> {}",
                 root.display(),
+                format!("{dacl_writable:?}"),
                 format!("{cap:?}"),
+                match &verdict {
+                    Ok(()) => "ACCEPT".to_string(),
+                    Err(e) => format!("REFUSE: {}", e.split(". ").next().unwrap_or(e)),
+                }
+            );
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod path_gate_diagnostics {
+    use super::*;
+
+    /// **本番が実際に測るのと同じ「パス」で関所を通す診断。**
+    ///
+    /// `volume_diagnostics`はドライブ直下（`C:\`等）を測るが、そこは一般ユーザーが
+    /// DACLを書けないので必ず拒否になる——**本番が測るのはワークスペースと差分層のパス**で
+    /// あって、ドライブ直下ではない。両者を取り違えると「C:でもCoWが動かない」と誤読する。
+    ///
+    /// 対象は`HARNESS_GATE_PROBE_PATHS`（`;`区切り）で渡す。
+    /// 実行例:
+    /// `HARNESS_GATE_PROBE_PATHS='C:\repo;E:\harness_cow\proj' cargo test -p harness-sandbox --lib path_gate_diagnostics -- --ignored --nocapture`
+    #[test]
+    #[ignore = "machine-specific diagnostic; pass paths via HARNESS_GATE_PROBE_PATHS"]
+    fn print_cow_volume_verdict_for_given_paths() {
+        let Ok(list) = std::env::var("HARNESS_GATE_PROBE_PATHS") else {
+            println!("set HARNESS_GATE_PROBE_PATHS to a ';'-separated list of paths");
+            return;
+        };
+        for raw in list.split(';').filter(|s| !s.is_empty()) {
+            let path = Path::new(raw);
+            let cap = crate::win_common::volume_mount_point_of(path)
+                .and_then(|m| crate::win_common::volume_capability(&m));
+            let dacl_writable = path.exists().then(|| crate::win_common::can_write_dacl(path));
+            let verdict = cow_volume_gate("workspace", path, cap.clone(), dacl_writable);
+            println!(
+                "{:<45} exists={:<5} dacl_writable={:<12} fs={:<10} remote={:<5} -> {}",
+                raw,
+                path.exists(),
+                format!("{dacl_writable:?}"),
+                cap.as_ref().map(|c| c.filesystem.as_str()).unwrap_or("?"),
+                cap.as_ref().map(|c| c.is_remote).unwrap_or(false),
                 match &verdict {
                     Ok(()) => "ACCEPT".to_string(),
                     Err(e) => format!("REFUSE: {}", e.split(". ").next().unwrap_or(e)),
