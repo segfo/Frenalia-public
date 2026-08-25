@@ -188,6 +188,32 @@ impl Drop for TestDirGuard {
     }
 }
 
+/// `count`個のファイルを`root`直下の`fanout`個のサブディレクトリへ均等に撒く。
+/// 実ノード数（ディレクトリ＋ファイル＋root）を返す。
+///
+/// **ACLのコスト測定が共有する土台である。** `d79_exec_split_tests`（D-79の2本割りのコスト、
+/// `plans/mac-spike/RESULTS.md` §S9）と`acl_baseline_cost_tests`（現状1主体の基準線、§S10）が
+/// 使う。**同じ形でなければ2つの測定の数字を並べられない**ので、ここに1つだけ置く
+/// （`docs/CODE-STRUCTURE-RULES.md`規則5）。**片方のスパイクを消しても残る場所**に
+/// 置いてあるのはそのためで、元は`d79_exec_split_tests`のprivate関数だった。
+///
+/// **形は「浅く広い」**——深さは2段（root → `dNNN/` → ファイル）で固定である。継承ACEの
+/// 伝播コストが深さに依存するかは**この関数では測れない**。§S9も§S10もこの形の数字なので、
+/// 深さの効果を知りたくなったら別の形を足すこと（**外挿しない**）。
+pub(super) fn build_wide_tree(root: &std::path::Path, count: usize, fanout: usize) -> usize {
+    std::fs::create_dir_all(root).expect("create tree root");
+    for d in 0..fanout {
+        std::fs::create_dir_all(root.join(format!("d{d:03}"))).expect("create tree subdir");
+    }
+    for i in 0..count {
+        let path = root
+            .join(format!("d{:03}", i % fanout))
+            .join(format!("f{i:06}.txt"));
+        std::fs::write(&path, b"x").expect("write tree file");
+    }
+    1 + fanout + count
+}
+
 /// `subst`で作る**テストが所有する仮想ドライブ**。Dropで`subst /D`と実体の削除まで行う。
 ///
 /// traverse機構の検証に要るのは「まだ誰もACEを付けていないドライブルート」である。`C:\`実体で

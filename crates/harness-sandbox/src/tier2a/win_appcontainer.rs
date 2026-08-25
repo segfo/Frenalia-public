@@ -566,6 +566,15 @@ mod cert_store_spike_tests;
 #[cfg(all(windows, test))]
 mod unc_reach_spike_tests;
 
+/// **現状1主体でのACL付与コストの基準線**（`plans/mac-spike/RESULTS.md` §S10、
+/// `plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`のM1）。`docs/STATUS.md`残課題#20
+/// （ドメイン遷移の足回り）に書かれた「重い」という**推定を実測へ置き換える**ためのもので、
+/// あわせて残課題#32（伝播が既存子孫へ届かない疑い）を確定/否定する。
+/// **非昇格で回す**（ACEを書くのはテスト自身が作ったツリーだけ）。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod acl_baseline_cost_tests;
+
 /// **テスト専用**の口。[`ensure_profile`]の所有者チェック（BUG-107）を迂回して、
 /// **他セッションのものに見える名前**のプロファイルを作る。
 ///

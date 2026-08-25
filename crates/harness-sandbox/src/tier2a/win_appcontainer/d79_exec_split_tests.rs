@@ -400,19 +400,9 @@ fn place_then_force_propagate_versus_a_single_propagating_write() {
     );
 }
 
-/// `count`個のファイルを`root`直下の`fanout`個のサブディレクトリへ均等に撒く。
-/// 実ノード数（ディレクトリ＋ファイル＋root）を返す。
-fn build_wide_tree(root: &Path, count: usize, fanout: usize) -> usize {
-    std::fs::create_dir_all(root).expect("create tree root");
-    for d in 0..fanout {
-        std::fs::create_dir_all(root.join(format!("d{d:03}"))).expect("create tree subdir");
-    }
-    for i in 0..count {
-        let path = root.join(format!("d{:03}", i % fanout)).join(format!("f{i:06}.txt"));
-        std::fs::write(&path, b"x").expect("write tree file");
-    }
-    1 + fanout + count
-}
+// `build_wide_tree`は`test_support`が持つ（§S10の基準線測定と**同じ形のツリー**でなければ
+// 2つの測定の数字を並べられないため、共有の置き場へ移した）。
+use super::test_support::build_wide_tree;
 
 fn ms(d: Duration) -> u128 {
     d.as_millis()
