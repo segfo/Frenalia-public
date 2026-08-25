@@ -534,6 +534,12 @@ mod mac_spike_capability_tests;
 #[cfg(all(windows, test))]
 mod mac_spike_daemon_tests;
 
+/// **T4（残課題#20の分流）**: サンドボックスの子が、本番が今まさに開いている
+/// privhelperの要求受付パイプへ届くかを測る。結果は`plans/handoff-issue-20/T4.md`。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod t4_privhelper_pipe_reach_tests;
+
 /// **D-79の受け入れ測定（M2）**: ワークスペース内の実行を宣言制にする実装を入れたら本当に
 /// 止まるのか（継承ACEの2本割りが「ディレクトリは辿れる／ファイルは実行できない」を
 /// 表現できるか）と、その実行時コスト。計画は`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` M2、

@@ -158,6 +158,16 @@ fn parse_args() -> Args {
                 reach.create_pipe_instances.push(next());
                 reach_mode = true;
             }
+            // --- T4（`plans/handoff-issue-20/T4.md`）: 名前が秘密として成立するか・
+            // 名前を先取りできるか。どちらも「開けるか」とは別の問いなので別の的にする。
+            "--reach-pipe-enumerate" => {
+                reach.enumerate_pipes = true;
+                reach_mode = true;
+            }
+            "--reach-create-pipe-new" => {
+                reach.create_new_pipes.push(next());
+                reach_mode = true;
+            }
             "--reach-object" => {
                 reach.objects.push(next());
                 reach_mode = true;
