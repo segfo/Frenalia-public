@@ -679,7 +679,7 @@ pub(crate) struct Cli {
     /// 即実FS（オーバーレイ無し）。省略時の既定と同じ動作（D-29）。`--staged`/
     /// `--workspace-commit`と併用不可（§書込ステージング3モード、M10）。
     ///
-    /// **`--sandbox tier2a-cow`とも併用不可**（§5.2 A10）。CoWのupperは`harness apply`まで
+    /// **`--sandbox tier2a-cow`とも併用不可**（§5.2 A10）。CoWの差分層は`harness apply`まで
     /// 書込を実FSへ通さないので、「即実FS」と同時には成立しない。**かつては「意味的に
     /// 矛盾しない」として排他にしておらず、`--live`が黙って無視されていた**——その状態では
     /// モデルへ「即座に実FSへ反映されます」と「ワークスペース本体はread-only」が同時に

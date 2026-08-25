@@ -55,7 +55,7 @@ pub fn sandbox_dir_for_session(session_id: &str) -> PathBuf {
 ///
 /// ボリュームのルート直下に置く（`D:\.harness-cow\<session-id>`）。**ワークスペースの中では
 /// ないことが要点**で、`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` §9 が
-/// 外配置を選んだ理由（再帰的なパスマッピングの防止・列挙から隠せる・Commit対象と差分領域の
+/// 外配置を選んだ理由（再帰的なパスマッピングの防止・列挙から隠せる・Commit対象と差分層の
 /// 分離・相対パス衝突の回避・ACLの独立管理）は、この配置でも全部そのまま保たれる。
 pub const PER_VOLUME_COW_DIRNAME: &str = ".harness-cow";
 
