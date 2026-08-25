@@ -258,6 +258,23 @@ pub fn fs_allow_capability_sids(
         .collect()
 }
 
+/// [§22.3.1] **昇格側が、受け取った秘密から自分で導出した名前**をSIDへ写す。
+///
+/// 名前は`declaration_capability_name`が`(秘密, 畳み込み済みパス, access級)`から作ったもので、
+/// **IPCで名前やSIDを受け取っているのではない**（`privhelper`モジュールdocの「SIDはIPCで
+/// 受け取らず、受信側が自ら導出する」を字義どおり保つ）。形の検証をここでも行うのは、
+/// 呼び出し順を間違えて別種の名前が来たときに黙って通さないためである。
+pub fn capability_sid_from_declaration_name(
+    name: &str,
+) -> Result<crate::win_common::OwnedSid, AppContainerError> {
+    if !crate::tier2a::workspace_capability::is_declaration_capability_name(name) {
+        return Err(AppContainerError::Preflight(format!(
+            "refusing to derive a SID from {name:?}: it is not a declaration capability name"
+        )));
+    }
+    capability_sid_from_name(name)
+}
+
 /// 名前からcapability SIDを導出する（`DeriveCapabilitySidsFromName`）。
 ///
 /// **名前を知っている者は誰でもこれを呼べる**（特権不要）。したがって、この関数で導出した

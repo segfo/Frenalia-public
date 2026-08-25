@@ -13,9 +13,21 @@
 //! 他ユーザのプロセスからは接続できない。
 //!
 //! **SIDは受け渡さない**: 要求スキーマにPSIDを含めない。ヘルパー自身が安定定数
-//! （`CONTAINER_NAME`・`TRAVERSE_CAPABILITY_NAME`）またはIPCで受けた**形を検証済みの**
-//! プロファイル名からSIDを導出する。生ポインタをプロセス境界・特権境界を越えて
-//! IPCで渡す必要自体を無くす設計判断。
+//! （`CONTAINER_NAME`・`TRAVERSE_CAPABILITY_NAME`）またはIPCで受けた入力からSIDを
+//! **自ら導出する**。生ポインタをプロセス境界・特権境界を越えてIPCで渡す必要自体を無くす
+//! 設計判断。
+//!
+//! **[§22.3.1] `--fs-allow`の主体は「秘密」から導出する**（2026-08-25）。以前はセッションの
+//! プロファイル**名**を受け取り、形を検証してからpackage SIDを導出していた。付与先が
+//! 宣言ごとのcapability SIDへ移ったので、いま受け取るのは
+//! [`FsAllowGrant::secret_hex`]（導出の前像）で、ヘルパーは
+//! `(その秘密, **自分で畳み込んだ書込先のパス**, access級)`から主体を導出する。
+//! **「SIDはIPCで受け取らず、受信側が自ら導出する」は字義どおり保たれている**——加えて、
+//! 導出入力に書込先のパスが入るぶん**現行より束縛が強い**（宣言Aの秘密で別のパスBへ
+//! Aの主体を付けさせられない）。
+//!
+//! **秘密をログへ出さないこと。** このモジュールの`log::line`はユーザーのプロファイル配下の
+//! 平文ファイルへ追記する。要求の中身を素直に書くと秘密がそこへ落ちる（実装制約、§22.3.1）。
 //!
 //! **例外: WFP連鎖起動**（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）。UAC起動回数を
 //! 最小化するため、`GrantWorkspaceAccess`要求が同時に「処理完了後、指定named pipeで`harness-netfilterd`を
@@ -91,6 +103,27 @@ pub struct FsAllowGrant {
     /// 倒すと「成功と報告しながら宣言どおりに開かない」無言失敗になる（B-10）。
     #[serde(default = "default_grant_scope")]
     pub scope: GrantScope,
+    /// [§22.3.1] この宣言のcapabilityの**導出の前像**（16進の秘密）。
+    ///
+    /// # なぜSIDでも名前でもなく秘密なのか
+    ///
+    /// 昇格側は`(この秘密, **自分で畳み込んだ`path`**, `access`の級)`から主体を導出する。
+    /// パスが導出入力に入っているので、**宣言Aの秘密を使って別のパスBへAの主体を
+    /// 付けさせることができない**（現行のpackage SID方式には無かった束縛）。
+    ///
+    /// SID値を渡す案は却下されている——「形」で分かるのはcapability SIDであることまでで、
+    /// **その主体を呼び出し元が正当に持つか**は判定できない。台帳を昇格側に読ませる案も
+    /// 却下——`%APPDATA%`はアカウントごとで、`runas`の昇格先が別の管理者アカウントなら
+    /// 別物を指すため、秘密の置き場の移設を要求してしまう（§22.3.1の却下表）。
+    ///
+    /// **空文字は「移行前のビルドからの電文」を意味する。** 受信側はそれを
+    /// **拒否する**（fail-closed）——空を許すと、秘密を持たない要求が
+    /// package SID宛の旧挙動へ黙って落ちる。
+    ///
+    /// **この値をログへ出さないこと**（§22.3.1の実装制約1）。受信側は要求内容を
+    /// 詳細に記録するので、素直に足すと`privhelper.log`へ秘密が落ちる。
+    #[serde(default)]
+    pub secret_hex: String,
 }
 
 /// [`FsAllowGrant::scope`]が欠けている電文の既定（D-63以前のビルドの意味＝再帰）。
@@ -115,6 +148,11 @@ impl<'de> Deserialize<'de> for FsAllowGrant {
             // というプロセス境界の無言失敗になる）。
             #[serde(default = "default_grant_scope")]
             scope: GrantScope,
+            // [§22.3.1] 同上。ここへ足し忘れると、秘密は**送られているのに読まれず**、
+            // 受信側は空文字を見て全エントリを拒否する（幸い fail-closed 側だが、
+            // 症状は「昇格経由の穴だけが全部失敗する」になる）。
+            #[serde(default)]
+            secret_hex: String,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -130,6 +168,7 @@ impl<'de> Deserialize<'de> for FsAllowGrant {
             access,
             forced: raw.forced,
             scope: raw.scope,
+            secret_hex: raw.secret_hex,
         })
     }
 }
@@ -179,19 +218,19 @@ pub enum PrivilegedRequest {
     ///
     /// 残る`GrantTraverse`/`RevokeTraverse`は`harness fs grant-traverse`/`revoke-traverse`
     /// （単一target、起動とは独立した手動コマンド）専用である。
+    /// # [§22.3.1] `session_profile`は無くなった
+    ///
+    /// D-37の頃、この要求は`fs_allow_entries`の付与先を決めるために**セッションプロファイル名**を
+    /// 運んでいた（受信側が形を検証してからpackage SIDを導出する形）。`--fs-allow`の主体が
+    /// 宣言ごとのcapability SIDへ移ったので、その名前はもう何も決めない——**残しておくと
+    /// 「これが付与先を決めている」という誤読を招く**ので落とした。付与先を決めるのは
+    /// いま各[`FsAllowGrant::secret_hex`]と、受信側が畳み込む`path`である。
+    ///
+    /// `traverse_targets`側は従来どおり名前に依存しない（祖先traverseはharness共通の
+    /// capability SID宛で、昇格側が固定名から自ら導出する）。
     GrantWorkspaceAccess {
         traverse_targets: Vec<PathBuf>,
         fs_allow_entries: Vec<FsAllowGrant>,
-        /// D-37: `fs_allow_entries`の付与先package SIDを決めるセッションプロファイル名。
-        ///
-        /// **SIDそのものではなく名前を運ぶ**（生ポインタを特権境界へ渡さないという既存方針の
-        /// 維持）。受信側は`session_profile::is_session_profile_name`で形を検証してから
-        /// `ensure_profile`で導出するので、任意のAppContainerへACEを付けさせることはできない。
-        /// `traverse_targets`側は名前に依存しない——祖先traverseはharness共通のcapability SID
-        /// （固定名から昇格側が自ら導出する）宛に付与するため、こちらは従来どおりIPCで
-        /// SID識別子を一切受け取らない。
-        #[serde(default)]
-        session_profile: String,
     },
 }
 
@@ -668,8 +707,8 @@ mod tests {
                     access: FsAccess::ReadExec,
                     forced: false,
                     scope: GrantScope::Recursive,
+                    secret_hex: "00112233445566778899aabbccddeeff".to_string(),
                 }],
-                session_profile: "harness.shell.sandbox.1234-5678".to_string(),
             },
             chain_netfilterd_pipe: Some(r"\\.\pipe\harness-netfilterd-1234-0".to_string()),
         };
@@ -745,15 +784,16 @@ mod tests {
                     access: FsAccess::ReadExec,
                     forced: false,
                     scope: GrantScope::Recursive,
+                    secret_hex: "00112233445566778899aabbccddeeff".to_string(),
                 },
                 FsAllowGrant {
                     path: PathBuf::from(r"C:\Program Files\SomeTool"),
                     access: FsAccess::ReadWrite,
                     forced: true,
                     scope: GrantScope::Recursive,
+                    secret_hex: "00112233445566778899aabbccddeeff".to_string(),
                 },
             ],
-            session_profile: "harness.shell.sandbox.1234-5678".to_string(),
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: PrivilegedRequest = serde_json::from_slice(&bytes).unwrap();
@@ -789,8 +829,8 @@ mod tests {
                 access: FsAccess::ReadExec,
                 forced: false,
                 scope: GrantScope::Recursive,
+                secret_hex: "00112233445566778899aabbccddeeff".to_string(),
             }],
-            session_profile: "harness.shell.sandbox.1234-5678".to_string(),
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let decoded: PrivilegedRequest = serde_json::from_slice(&bytes).unwrap();
@@ -798,45 +838,58 @@ mod tests {
             PrivilegedRequest::GrantWorkspaceAccess {
                 traverse_targets,
                 fs_allow_entries,
-                session_profile,
             } => {
-                assert_eq!(session_profile, "harness.shell.sandbox.1234-5678");
                 assert_eq!(traverse_targets.len(), 2);
                 assert_eq!(
                     traverse_targets[1],
                     PathBuf::from(r"C:\Users\example\AppData\Local\harness\cow\session-1")
                 );
                 assert_eq!(fs_allow_entries.len(), 1);
+                // [§22.3.1] **秘密がプロセス境界を越えて生き残ること。** ここが落ちると
+                // 昇格側は主体を導出できず、システム保護パスの穴が全部失敗する。
+                assert_eq!(
+                    fs_allow_entries[0].secret_hex,
+                    "00112233445566778899aabbccddeeff"
+                );
             }
             other => panic!("unexpected variant: {other:?}"),
         }
     }
 
-    /// D-34: プロセス境界を越える形はバイト列そのものを固定する。D-37で`session_profile`を
-    /// 足したので、その位置と名前もここで固定される（昇格側は受け取った名前を
-    /// `is_session_profile_name`で検証してから使うため、形が変わったら気付ける必要がある）。
+    /// D-34: プロセス境界を越える形はバイト列そのものを固定する。
+    ///
+    /// [§22.3.1] **`session_profile`は消え、`secret_hex`が載った。** 付与先を決めるものが
+    /// 「セッションのプロファイル名」から「宣言の秘密＋受信側が畳み込む書込先のパス」へ
+    /// 変わったので、綴りごとここで固定し直す。この行が黙って変わったら、
+    /// **昇格側と非昇格側のどちらかだけが移行している**ことを意味する。
     #[test]
     fn grant_workspace_access_request_json_wire_format_is_stable() {
         let req = PrivilegedRequest::GrantWorkspaceAccess {
             traverse_targets: vec![PathBuf::from("C:/ws")],
-            fs_allow_entries: Vec::new(),
-            session_profile: "harness.shell.sandbox.1-2".to_string(),
+            fs_allow_entries: vec![FsAllowGrant {
+                path: PathBuf::from("C:/x"),
+                access: FsAccess::Read,
+                forced: false,
+                scope: GrantScope::Object,
+                secret_hex: "00112233445566778899aabbccddeeff".to_string(),
+            }],
         };
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
-            r#"{"GrantWorkspaceAccess":{"traverse_targets":["C:/ws"],"fs_allow_entries":[],"session_profile":"harness.shell.sandbox.1-2"}}"#
+            r#"{"GrantWorkspaceAccess":{"traverse_targets":["C:/ws"],"fs_allow_entries":[{"path":"C:/x","access":"read","forced":false,"scope":"Object","secret_hex":"00112233445566778899aabbccddeeff"}]}}"#
         );
     }
 
-    /// 昇格側が受け取るプロファイル名は検証される（任意のAppContainerへACEを付けさせない）。
+    /// [§22.3.1] **秘密を持たない電文は拒否される**（fail-closed）。
+    ///
+    /// 移行前のビルドが送ってくる形がこれで、通すと「主体を決められないまま何かへ付与する」
+    /// ことになる。受信側の判定は`grant_fs_allow_entries`が持つので、ここでは
+    /// **その判定材料が電文から復元できること**（空文字として読めること）を固定する。
     #[test]
-    fn only_session_profile_names_are_accepted_by_the_elevated_side() {
-        use crate::tier2a::session_profile::is_session_profile_name;
-        assert!(is_session_profile_name("harness.shell.sandbox.1-2"));
-        assert!(!is_session_profile_name(
-            "Microsoft.WindowsTerminal_8wekyb3d8bbwe"
-        ));
-        assert!(!is_session_profile_name("harness.shell.sandbox"));
+    fn a_pre_migration_entry_arrives_without_a_secret() {
+        let grant: FsAllowGrant =
+            serde_json::from_str(r#"{"path":"C:/x","access":"read","scope":"Object"}"#).unwrap();
+        assert_eq!(grant.secret_hex, "");
     }
 
     /// `WorkspaceAccessResult`応答が、traverse側のエラーとfs-allow側の成否混在の両方を
@@ -891,6 +944,7 @@ mod tests {
             access: FsAccess::ReadWriteExec,
             forced: false,
             scope: GrantScope::Recursive,
+            secret_hex: "00112233445566778899aabbccddeeff".to_string(),
         };
 
         let json = serde_json::to_string(&grant).unwrap();

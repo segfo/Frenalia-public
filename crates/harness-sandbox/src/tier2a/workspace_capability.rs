@@ -792,10 +792,6 @@ mod tests {
         assert!(l.load().entries.is_empty());
     }
 
-    /// 新しいエントリは未検証で始まり、明示的に記録するまで`false`のまま。
-    ///
-    /// **workspaceは実在するディレクトリでなければならない**——[BUG-110]以降、検証済みの
-    /// 判定はrootの識別子の一致まで見るためである。
     // --- 宣言（`--fs-allow`）の主体、§22.2.0「群 = 宣言1件」 ---
 
     /// **§22.3.1が昇格側に要求する束縛そのもの。** 同じ秘密でも、書込先のパスや access級が
@@ -977,6 +973,10 @@ mod tests {
         assert!(tree_is_verified_in(&l, &ws, "rwx"));
     }
 
+    /// 新しいエントリは未検証で始まり、明示的に記録するまで`false`のまま。
+    ///
+    /// **workspaceは実在するディレクトリでなければならない**——[BUG-110]以降、検証済みの
+    /// 判定はrootの識別子の一致まで見るためである。
     #[test]
     fn a_new_entry_starts_unverified_and_can_be_marked() {
         let tmp = tempfile::tempdir().unwrap();

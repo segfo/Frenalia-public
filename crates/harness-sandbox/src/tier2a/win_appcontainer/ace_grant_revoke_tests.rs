@@ -105,7 +105,7 @@ fn parity_production_probe_matches_diagnostic_probe() {
     std::fs::create_dir_all(&dir).expect("create neutral dir");
     grant_ace_recursive(&dir, sid.as_psid()).expect("grant_ace_recursive on neutral dir");
 
-    let production_result = smoke_test_spawn(sid.as_psid(), None, &dir, &dir);
+    let production_result = smoke_test_spawn(sid.as_psid(), None, &[], &dir, &dir);
     println!("=== production probe (smoke_test_spawn) result: {production_result:?} ===");
 
     run_probe(sid.as_psid(), &dir);
@@ -316,7 +316,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         .join("sandbox")
         .join("Tier2a-tmp");
     std::fs::create_dir_all(&probe_dir).expect("create probe dir");
-    if let Err(e) = smoke_test_spawn(sid.as_psid(), None, &workspace, &probe_dir) {
+    if let Err(e) = smoke_test_spawn(sid.as_psid(), None, &[], &workspace, &probe_dir) {
         eprintln!(
             "skipping fs_passthrough_ro_then_rw_then_revoke_cycle: workspace FS I/O gate \
              failed on this machine ({e:?}); run `harness fs grant-traverse C:\\` as \
@@ -348,6 +348,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         sid.as_psid(),
         traverse_sid.as_psid(),
         None,
+        &[],
         &workspace,
         &ro_probe,
     );
@@ -365,6 +366,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         sid.as_psid(),
         traverse_sid.as_psid(),
         None,
+        &[],
         &workspace,
         &rw_probe_against_ro_grant,
     );
@@ -385,6 +387,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         sid.as_psid(),
         traverse_sid.as_psid(),
         None,
+        &[],
         &workspace,
         &rw_probe,
     );
@@ -706,7 +709,7 @@ fn grant_ace_inheritable_ro_falls_back_for_protected_descendant() {
         .join("sandbox")
         .join("Tier2a-tmp");
     std::fs::create_dir_all(&probe_dir).expect("create probe dir");
-    if let Err(e) = smoke_test_spawn(sid.as_psid(), None, &workspace, &probe_dir) {
+    if let Err(e) = smoke_test_spawn(sid.as_psid(), None, &[], &workspace, &probe_dir) {
         eprintln!(
             "skipping grant_ace_inheritable_ro_falls_back_for_protected_descendant: \
              workspace FS I/O gate failed on this machine ({e:?}); run `harness fs \
@@ -2631,6 +2634,7 @@ fn preflight_grants_each_declaration_in_its_declared_scope() {
         sid.as_psid(),
         traverse_sid.as_psid(),
         None,
+        &[],
         &workspace,
         &old_mode_probe,
     );

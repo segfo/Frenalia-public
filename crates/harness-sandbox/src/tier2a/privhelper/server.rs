@@ -232,14 +232,52 @@ unsafe fn launch_netfilterd_chained(pipe_name: &str) -> Result<(), PrivHelperErr
 
 /// `GrantWorkspaceAccess`のfs-allow部分の実処理。エントリごとに成否が独立する
 /// （`GrantTraverse`のような連鎖ではないため、1エントリの失敗が他エントリを止めない）。
-fn grant_fs_allow_entries(
-    sid: PSID,
-    entries: Vec<FsAllowGrant>,
-) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+///
+/// [§22.3.1] **主体はエントリごとに、この関数の中で導出する。** 呼び出し元から1つのSIDを
+/// 受け取る形をやめたのは、`--fs-allow`の主体が**宣言ごと**になったからである。導出入力は
+/// `(受け取った秘密, **この関数がこれから書き込む当のパス**, access級)`で、パスを
+/// 呼び出し元の申告ではなく`entry.path`——実際の書込先——から取るのが要点である
+/// （申告されたパスから導出して別のパスへ書くと、束縛が名目だけになる）。
+fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
     let mut granted = Vec::new();
     let mut failures = Vec::new();
     for entry in entries {
         let started = std::time::Instant::now();
+        // **秘密の無い電文は拒否する**（fail-closed）。移行前のビルドが送ってくる形で、
+        // 通すと「主体を決められないまま何かへ付与する」ことになる。
+        if entry.secret_hex.is_empty() {
+            log::line(&format!(
+                "  entry {} : REFUSED (no capability secret on the wire; the caller is from before \
+                 the capability-SID migration)",
+                entry.path.display()
+            ));
+            failures.push((
+                entry.path,
+                "no capability secret on the wire (caller predates the capability-SID migration)"
+                    .to_string(),
+            ));
+            continue;
+        }
+        // **導出は必ずこの側で行う**（`privhelper`モジュールdocの「SIDはIPCで受け取らず、
+        // 受信側が自ら導出する」を字義どおり保つ）。畳み込みも受信側の関数を通すので、
+        // 呼び出し元が綴りを細工して別の主体を作らせることはできない。
+        let name = crate::tier2a::workspace_capability::declaration_capability_name(
+            &entry.secret_hex,
+            &crate::tier2a::workspace_capability::declaration_key(&entry.path),
+            entry.access.label(),
+        );
+        let sid_owned = match win_appcontainer::capability_sid_from_declaration_name(&name) {
+            Ok(sid) => sid,
+            Err(e) => {
+                log::line(&format!(
+                    "  entry {} : FAILED to derive the declaration capability: {e}",
+                    entry.path.display()
+                ));
+                failures.push((entry.path, format!("could not derive the capability SID: {e}")));
+                continue;
+            }
+        };
+        let sid = sid_owned.as_psid();
         // forced（--force-system-acl, D-19）は`SeRestorePrivilege`で全DACLをバイパスして
         // 書くため、書込前に必ず host パスの絶対拒否ゲートを通す（唯一の防壁）。
         if entry.forced {
@@ -341,8 +379,14 @@ fn grant_traverse_targets(sid: PSID, targets: Vec<PathBuf>) -> (Vec<PathBuf>, Op
 /// | 用途 | 主体 | 導出元 |
 /// |---|---|---|
 /// | 祖先チェーンのtraverse（`GrantTraverse`/`RevokeTraverse`/`GrantWorkspaceAccess`のtraverse部分） | capability SID | `traverse_capability_sid()`（固定名`harnessSandboxTraverse`） |
-/// | leafへの読み書きの**付与**（`GrantWorkspaceAccess`のfs-allow部分） | セッションpackage SID | IPCで受けた**形を検証済みの**セッションプロファイル名 |
+/// | leafへの読み書きの**付与**（`GrantWorkspaceAccess`のfs-allow部分） | **宣言ごとのcapability SID**（§22.3） | IPCで受けた**秘密**＋**この側が畳み込んだ書込先のパス**＋access級（`grant_fs_allow_entries`） |
 /// | leafへの読み書きの**撤収**（`RevokeFsAllow`） | **対象パスのDACLに実在するpackage SID** | `win_appcontainer::revoke_harness_subjects`（名前からは導出しない） |
+///
+/// **[T1 未完] 撤収の行がまだ移行していない。** 付与が宣言capability宛になった一方、
+/// `RevokeFsAllow`は依然としてpackage SIDの分類器しか通らないので、**昇格が要るパスの
+/// capability宛ACEはこの経路では剥がれない**。剥がす主体は宣言から一意に導出できる
+/// （§22.2.1「分類器を使わず、宣言から導出したSIDを名指しで剥がす」）ので、
+/// 秘密を`FsAllowRevoke`にも載せて同じ導出を通すのが対の残り半分である。
 ///
 /// traverse側が`CONTAINER_NAME`のpackage SIDのままD-37から取り残されていたのが
 /// [BUG-061](../../../../docs/bugs/BUG-061.md)である。**新しいアームを足す人は、上表のどの行に
@@ -415,16 +459,19 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
         PrivilegedRequest::GrantWorkspaceAccess {
             traverse_targets,
             fs_allow_entries,
-            session_profile,
         } => {
+            // [§22.3.1] **要求の中身を素直に書かない。** この要求は宣言capabilityの秘密を
+            // 運ぶので、`{req:?}`や個々のフィールドを並べると`privhelper.log`へ秘密が落ちる
+            // （このログはユーザーのプロファイル配下に平文で残り続ける）。ここで出すのは
+            // **件数だけ**にする。
             log::line(&format!(
-                "dispatch: GrantWorkspaceAccess {} traverse target(s), {} fs-allow entrie(s),                  session_profile={session_profile}",
+                "dispatch: GrantWorkspaceAccess {} traverse target(s), {} fs-allow entrie(s)",
                 traverse_targets.len(),
                 fs_allow_entries.len()
             ));
             // D-37: 祖先traverseはharness共通のcapability SID宛（固定名から自ら導出、IPC入力に
-            // 依存しない）。fs-allowはセッション固有のpackage SID宛で、その名前だけをIPCで
-            // 受け取る——**形を検証してから**導出し、任意のAppContainerへACEを付けさせない。
+            // 依存しない）。fs-allowは§22.3.1により宣言ごとのcapability SID宛で、その主体は
+            // `grant_fs_allow_entries`が受け取った秘密と書込先のパスから自ら導出する。
             let traverse_cap = match win_appcontainer::traverse_capability_sid() {
                 Ok(cap) => cap,
                 Err(e) => {
@@ -437,46 +484,10 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
             let (traverse_granted, traverse_error) =
                 grant_traverse_targets(traverse_cap.as_psid(), traverse_targets);
 
-            let (fs_allow_granted, fs_allow_failures) = if fs_allow_entries.is_empty() {
-                (Vec::new(), Vec::new())
-            // D-38: MCPサーバのプロファイル（`harness.mcp.<token>.<id>`）も、実行ファイルが
-            // システム保護パスにある場合（`C:\Program Files\nodejs`等）にここへ来る。
-            // 検証は`is_harness_profile_name`1本に統一する——2つの述語を呼び分ける形にすると、
-            // 片方の呼び出しを足し忘れたときに検証をすり抜ける経路が生まれる。
-            } else if !crate::tier2a::mcp_profile::is_harness_profile_name(&session_profile) {
-                log::line("dispatch: rejected a malformed appcontainer profile name");
-                let failures = fs_allow_entries
-                    .into_iter()
-                    .map(|e| {
-                        (
-                            e.path,
-                            "rejected: malformed session profile name".to_string(),
-                        )
-                    })
-                    .collect();
-                (Vec::new(), failures)
-            } else {
-                // [BUG-107] **導出であって作成ではない。** ここは昇格した別プロセスなので、
-                // `ensure_profile`だと親のセッション名で資源を作りながら台帳には載せられない
-                // （`begin_session`が発火するのは持ち主のプロセスだけ）。しかも`runas`の昇格先が
-                // 別の管理者アカウントだと**別のHKCUハイブ**に作るので、非昇格側からは見えない
-                // プロファイルが増える。ACEを付けるのに要るのはSIDの値だけである。
-                match win_appcontainer::derive_profile_sid(&session_profile) {
-                    Ok(session_sid) => {
-                        grant_fs_allow_entries(session_sid.as_psid(), fs_allow_entries)
-                    }
-                    Err(e) => {
-                        log::line(&format!("dispatch: ensure_profile(session) failed: {e}"));
-                        let failures = fs_allow_entries
-                            .into_iter()
-                            .map(|entry| {
-                                (entry.path, format!("failed to resolve session SID: {e}"))
-                            })
-                            .collect();
-                        (Vec::new(), failures)
-                    }
-                }
-            };
+            // [§22.3.1] **fs-allowの主体はもうセッションプロファイル名から導出しない。**
+            // 宣言ごとのcapability SIDへ移したので、名前を受け取って検証する段はここには無く、
+            // 導出はエントリごとに`grant_fs_allow_entries`の中で行う（同関数のdoc）。
+            let (fs_allow_granted, fs_allow_failures) = grant_fs_allow_entries(fs_allow_entries);
             log::line(&format!(
                 "dispatch: GrantWorkspaceAccess done, {} traverse node(s) granted (error={:?}), \
                  {} fs-allow granted, {} fs-allow failed",

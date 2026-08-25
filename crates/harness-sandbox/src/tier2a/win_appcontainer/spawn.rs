@@ -538,21 +538,27 @@ pub fn spawn(
         container_sid,
         net,
         cow,
-        None,
+        &[],
         domain,
     )
 }
 
-/// [`spawn`]の、**workspaceツリーへのアクセスを与える版**（D-54）。
+/// [`spawn`]の、**このドメインのFS到達範囲をトークンへ積む版**（D-54・§22.3）。
 ///
-/// workspace本体のACEはworkspace＋モード単位のcapability SID宛に付いている
-/// （[`crate::tier2a::workspace_capability`]）ので、workspaceを読み書きする子には
-/// そのcapabilityをトークンへ積まないと何も見えない。
+/// FSのACEはもう「セッションのpackage SID」宛ではない。workspace本体はworkspace＋モード単位の
+/// capability SID宛（D-54）、`--fs-allow`の穴は**宣言ごと**のcapability SID宛（§22.3）である。
+/// したがって**そのcapabilityをトークンへ積まない子は、ACEが正しく付いていても1バイトも
+/// 読めない**。`domain_caps`はその集合で、§22.1の「ドメイン = (package SID, capabilityの組)」を
+/// そのまま表している。
 ///
-/// **既定（[`spawn`]）は積まない側**である。積まないと起こるのは`ACCESS_DENIED`＝
-/// fail-closedであり、逆向き（うっかり積む）だと境界が黙って消える。実際、MCPサーバは
-/// 専用プロファイルで起動し**workspaceを既定で持たない**（D-38 §3.2）——ここが既定で
-/// 積む設計だったら、MCPサーバがworkspace全体へ到達していた。
+/// **既定（[`spawn`]）は空**である。積まないと起こるのは`ACCESS_DENIED`＝fail-closedであり、
+/// 逆向き（うっかり積む）だと境界が黙って消える。実際、MCPサーバは専用プロファイルで起動し
+/// **workspaceを既定で持たない**（D-38 §3.2）——ここが既定で積む設計だったら、MCPサーバが
+/// workspace全体へ到達していた。
+///
+/// **順序と重複は問わない**（`SECURITY_CAPABILITIES`は集合として扱われる）が、呼び出し側は
+/// 「このドメインが宣言したもの」だけを渡すこと。宣言していないcapabilityを混ぜると、
+/// §22.3.0.2の受け入れ条件（宣言したドメインだけがパスを見る）がその子について偽になる。
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_with_workspace(
     exe: &str,
@@ -563,7 +569,7 @@ pub fn spawn_with_workspace(
     container_sid: PSID,
     net: NetworkCapability,
     cow: Option<CowInject<'_>>,
-    workspace_cap: Option<PSID>,
+    domain_caps: &[PSID],
     domain: DomainIdentity,
 ) -> Result<AppContainerChild, AppContainerError> {
     const SE_GROUP_ENABLED: u32 = 0x0000_0004;
@@ -577,10 +583,10 @@ pub fn spawn_with_workspace(
         Sid: traverse_cap.as_psid(),
         Attributes: SE_GROUP_ENABLED,
     }];
-    // D-54: workspaceツリーのACEの主体。呼び出し側が明示したときだけ積む（上記doc）。
-    if let Some(sid) = workspace_cap {
+    // D-54・§22.3: このドメインのFS到達範囲。呼び出し側が明示したものだけを積む（上記doc）。
+    for sid in domain_caps {
         capabilities.push(SID_AND_ATTRIBUTES {
-            Sid: sid,
+            Sid: *sid,
             Attributes: SE_GROUP_ENABLED,
         });
     }

@@ -704,7 +704,7 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     // 「祖先が無い」と言い続けるなら診断はまだ壊れている。
     println!("=== D8/D9 re-probed after the traverse grant (condition b) ===");
     for fp in &passthrough {
-        match probe_passthrough(sid.as_psid(), restore.sid.as_psid(), None, &workspace, fp) {
+        match probe_passthrough(sid.as_psid(), restore.sid.as_psid(), None, &[], &workspace, fp) {
             None => println!("  {} : reachable (D8 passed)", fp.path.display()),
             Some(diagnosis) => println!("  {} : {diagnosis}", fp.path.display()),
         }

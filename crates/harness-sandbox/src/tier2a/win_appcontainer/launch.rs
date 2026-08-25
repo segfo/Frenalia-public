@@ -114,6 +114,44 @@ pub fn spawn_shell_in_workspace(
     let workspace_cap =
         super::workspace_capability_sid(&canonical_workspace, req.workspace_mode())?;
 
+    // [§22.3] `--fs-allow`で開いた穴の主体も積む。**穴のACEはもうこのセッションのpackage SID
+    // 宛ではなく、宣言ごとのcapability SID宛である**——積まなければ、preflightが正しく
+    // 付与していても子からは1バイトも読めない（`ACCESS_DENIED`）。
+    //
+    // 主体は`preflight`が付与に使ったのと**同じ導出**（`fs_allow_capability_sid`）から
+    // 引き直す。モジュールdocが「主体の導出規則を`preflight`と共有していなければならない」と
+    // 言っているのは、まさにこの種のずれが「付与されていない主体で起動して全アクセスが
+    // 拒否される」形で出るからである。
+    //
+    // 引くのは**実際にACEが付いた穴**（`granted_passthrough`）だけにする。付けられなかった
+    // パスの主体まで積むと、宣言していないものをトークンへ載せる形になる。
+    //
+    // # ここは近似である（T1-cで厳密化する）
+    //
+    // 主体は`(秘密, 畳み込み済みパス, access級)`から決まるのに、`granted_passthrough`が
+    // 運んでいるのは`writable`という**2値**でしかない。`FsAccess`は4値（`read`/`read_write`/
+    // `read_exec`/`read_write_exec`）あるので、**boolからaccess級を復元すると別の主体を
+    // 導出し得る**——そして外れたときの症状は「ACEは正しいのに子から一切読めない」という
+    // 最も分かりにくい形になる。だから**復元しない**。
+    //
+    // 代わりに台帳の索引を引く（`declaration_capability_names`）。これは
+    // 「**このworkspaceがこのパスに対して発行した主体**」を返すので、access級を推測せずに
+    // 済む。近似なのは、同じパスへ複数のaccess級を発行済みのとき全部を積む点である
+    // （このworkspace自身が宣言したものに限られるので他所へは広がらないが、
+    // §22.3.0.2の条件2をこの子について厳密にはしていない）。
+    //
+    // 厳密化には`preflight`が返す`granted_subjects`（`(path, SID文字列)`）を
+    // `ShellTierSelection`経由でここまで運ぶ必要があり、それはT1-cの担当である。
+    let fs_allow_caps: Vec<crate::win_common::OwnedSid> = req
+        .granted_passthrough
+        .iter()
+        .flat_map(|(path, _)| {
+            super::fs_allow_capability_sids(path, Some(&canonical_workspace))
+        })
+        .collect();
+    let mut domain_caps = vec![workspace_cap.as_psid()];
+    domain_caps.extend(fs_allow_caps.iter().map(|cap| cap.as_psid()));
+
     // D-54: 初回起動では、保護DACL配下を救済するwalkが背景で走っていることがある。終わる前に
     // コマンドを走らせると、その配下がモデルには「存在しない/読めない」と見え、原因不明の
     // 失敗になる。完了を待ち、walkが失敗していたら断る（fail-closed、`grant_job`のdoc）。
@@ -129,7 +167,7 @@ pub fn spawn_shell_in_workspace(
         sid.as_psid(),
         req.net_capability,
         cow,
-        Some(workspace_cap.as_psid()),
+        &domain_caps,
         // §22.1.1: このシェルのドメインはworkspace＋モード単位のcapability（D-54）。
         // traverse capabilityは全Tier2a子が共有するので**ドメインの識別子にしてはいけない**。
         DomainIdentity::Capability(workspace_cap.as_psid()),
