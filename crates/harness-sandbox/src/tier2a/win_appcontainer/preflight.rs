@@ -1030,15 +1030,52 @@ pub fn preflight_with_privhelper_launcher(
 /// エラー型への変換だけを行う。**採取と判定を分ける**のは、判定側を`cargo test`で
 /// 検算できるようにするためである。
 fn require_persistent_acl_volume(what: &str, path: &Path) -> Result<(), AppContainerError> {
-    let probe = crate::win_common::volume_mount_point_of(path)
-        .and_then(|mount| crate::win_common::volume_capability(&mount));
-    // 申告（上）だけでなく、**この対象に実際にDACLを書けるか**も測る。書き戻しは恒等なので
-    // 副作用は無い。存在しないパスには測れないので`None`＝拒否側へ倒れる（判定不能は閉じる）。
+    let mount = crate::win_common::volume_mount_point_of(path);
+    let probe = mount
+        .as_deref()
+        .and_then(crate::win_common::volume_capability);
+    // 申告（上）だけでなく、**このボリュームが実際にDACLを受け付けるか**も測る。書き戻しは
+    // 恒等なので副作用は無い。
+    //
+    // **測る先は`path`そのものではなく、同じボリューム上で実在する最も近い祖先である。**
+    // 差分層は「点検してから作る」順序なので点検の時点では必ず存在せず、`path`を直接測ると
+    // 毎回「測れなかった」になってCoWの起動そのものが塞がる（[BUG-130]）。見たいのは
+    // ボリュームの性質なので、同じボリューム上の実在する祖先で足りる。
     //
     // **関数で渡すのは、安い判定で拒否が決まった相手に触らないため。** 実測は書込操作なので、
     // ネットワーク共有のように見に行くこと自体に費用が掛かる相手へ、拒否する直前に撃つ
     // 理由が無い（`cow_volume_gate`のdoc）。
-    let dacl_writable = || path.exists().then(|| crate::win_common::can_write_dacl(path));
+    let dacl_writable = || {
+        crate::session_scope::nearest_existing_ancestor(path, mount.as_deref(), &|p| p.exists())
+            .map(|target| crate::win_common::can_write_dacl(&target))
+    };
     crate::session_scope::cow_volume_gate(what, path, probe, &dacl_writable)
         .map_err(AppContainerError::Preflight)
+}
+
+#[cfg(test)]
+mod acl_volume_gate_tests {
+    use super::*;
+
+    /// **[BUG-130](../../../../../docs/bugs/BUG-130.md)の回帰テスト。**
+    ///
+    /// 差分層は「点検してから作る」順序なので、点検の時点では**必ず**存在しない。
+    /// 存在しないパスを直接測ると毎回「測れなかった」になり、判定不能を閉じる規則が
+    /// CoWの起動そのものを塞ぐ（実際に`--sandbox tier2a-cow`が1つも起動できなくなった）。
+    ///
+    /// **判定側の単体テストではこれを捕まえられない。** `cow_volume_gate`へは
+    /// `Some(true)`/`Some(false)`/`None`を直接渡しており、「**呼び出し側が`None`を
+    /// 渡してしまう**」経路を再現していないからである。だから値を作るこちら側で測る。
+    ///
+    /// 拒否側は判定側（`session_scope`の`cow_volume_gate`まわり4件）が持つ。
+    #[test]
+    fn a_diff_layer_that_does_not_exist_yet_still_passes_the_acl_volume_gate() {
+        let tmp = tempfile::tempdir().expect("一時ディレクトリを作れること");
+        let not_yet = tmp.path().join("cow").join("session-does-not-exist-yet");
+        assert!(!not_yet.exists(), "前提が崩れている: このパスは存在しないはず");
+
+        require_persistent_acl_volume("copy-on-write diff area", &not_yet).expect(
+            "まだ作られていない差分層でも、同じボリューム上の実在する祖先で性質を測れる",
+        );
+    }
 }

@@ -305,6 +305,50 @@ pub struct VolumeCapability {
     pub is_remote: bool,
 }
 
+/// `path`から上へ辿って、**実在する最も近い祖先**を返す（`stop_at`より上へは行かない）。
+///
+/// # なぜ要るのか
+///
+/// [`cow_volume_gate`]の最後の実測（DACLを書き戻せるか）は**書込操作なので対象が実在しないと
+/// 撃てない**。ところが差分層は「点検してから作る」順序なので、点検の時点では必ず存在しない
+/// ——そのまま渡すと毎回「測れなかった」になり、判定不能を閉じる規則がCoWの起動そのものを
+/// 塞ぐ（[BUG-130](../../../docs/bugs/BUG-130.md)）。
+///
+/// **見たいのはボリュームの性質**（このボリュームはACEを実際に受け付けるか）であって、
+/// その1つのディレクトリの事情ではない。だから同じボリューム上の実在する祖先で測れば足りる。
+/// D-81が関所を新設したときの元の意図もボリューム単位だった。
+///
+/// `stop_at`（そのパスのマウント点）**より上へは行かない**——マウント点をまたぐと別のボリューム
+/// を測ることになり、答えの意味が変わる。存在判定を関数で受け取るのは、判定側を`cargo test`で
+/// 検算できるようにするため（このファイルが採っている「採取と判定を分ける」形）。
+pub fn nearest_existing_ancestor(
+    path: &Path,
+    stop_at: Option<&Path>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let stop_key = stop_at.map(|s| {
+        s.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    });
+    for candidate in path.ancestors() {
+        if exists(candidate) {
+            return Some(candidate.to_path_buf());
+        }
+        // マウント点そのものも見たうえで、そこから上へは進まない。
+        if let Some(stop) = stop_key.as_deref() {
+            let here = candidate
+                .to_string_lossy()
+                .trim_end_matches(['\\', '/'])
+                .to_lowercase();
+            if here == stop {
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// そのボリュームでCoWの境界を張れるかの検算（D-81）。**判定だけの純関数。**
 ///
 /// # なぜ要るのか
@@ -380,14 +424,28 @@ pub fn cow_volume_gate(
     }
     // **申告の最後は実測で裏を取る**（上のdoc「3」）。ここへ来た時点で
     // 「ACLを持てると言っていて、ローカルで」ある。それでも書けないことがある。
-    if dacl_writable() != Some(true) {
-        return Err(format!(
-            "--sandbox tier2a-cow: the {what} ({}) is on a {} volume that reports it can store              ACLs, but it rejected a no-op DACL write. Copy-on-write isolation cannot be              enforced where access rights cannot be written. Move the workspace to an NTFS              volume, or pick a weaker isolation explicitly with --sandbox.",
+    //
+    // **「測って断られた」と「そもそも測れなかった」を同じ文言にしない**——どちらも拒否側へ
+    // 倒すのは変わらないが、混ぜると原因が読めなくなる。実際に[BUG-130]では、こちら側の
+    // 順序のせいで測れていないだけなのに「ボリュームが書込を拒否した」と読める文言が出て、
+    // ボリュームの問題を疑わせた。
+    match dacl_writable() {
+        Some(true) => Ok(()),
+        Some(false) => Err(format!(
+            "--sandbox tier2a-cow: the {what} ({}) is on a {} volume that reports it can store \
+             ACLs, but it rejected a no-op DACL write. Copy-on-write isolation cannot be \
+             enforced where access rights cannot be written. Move the workspace to an NTFS \
+             volume, or pick a weaker isolation explicitly with --sandbox.",
             path.display(),
             cap.filesystem
-        ));
+        )),
+        None => Err(format!(
+            "--sandbox tier2a-cow: could not test whether access rights can actually be written \
+             for the {what} ({}). Refusing to start rather than claim a boundary that may not \
+             exist. This is not a statement about the volume -- nothing on it was measured.",
+            path.display()
+        )),
     }
-    Ok(())
 }
 
 /// このプロセスがどのオーバーレイ機構で動いているか。**プロセス寿命で不変**（モジュールdoc参照）。
@@ -1072,6 +1130,67 @@ mod tests {
             &|| None
         )
         .is_err());
+    }
+
+    /// **「測って断られた」と「そもそも測れなかった」を混ぜない**（[BUG-130]）。
+    /// どちらも拒否だが、前者はボリュームの性質、後者はこちら側の事情である。
+    /// 混ぜると、こちらが早すぎるだけのときに「ボリュームが書込を拒否した」と読ませてしまう。
+    #[test]
+    fn a_refused_dacl_write_and_an_unmeasured_one_say_different_things() {
+        let refused = cow_volume_gate("workspace", Path::new(r"E:\ws"), Some(cap(true, "cryptoFs", false)), &|| Some(false))
+            .expect_err("measured and refused");
+        let unmeasured = cow_volume_gate("workspace", Path::new(r"E:\ws"), Some(cap(true, "NTFS", false)), &|| None)
+            .expect_err("could not measure");
+        assert!(
+            refused.contains("rejected a no-op DACL write"),
+            "断られた側はボリュームの挙動を名指しする: {refused}"
+        );
+        assert!(
+            unmeasured.contains("nothing on it was measured"),
+            "測れなかった側はボリュームのせいにしない: {unmeasured}"
+        );
+        assert_ne!(refused, unmeasured);
+    }
+
+    /// **許可側**: 実在する最も近い祖先を返す（[BUG-130]の修正の要）。
+    #[test]
+    fn the_nearest_existing_ancestor_is_found_for_a_path_that_does_not_exist_yet() {
+        let existing = Path::new(r"C:\Users\u\AppData\Local\harness\data\cow");
+        let target = existing.join("session-1").join("deep");
+        let found = nearest_existing_ancestor(&target, Some(Path::new(r"C:\")), &|p| p == existing);
+        assert_eq!(found.as_deref(), Some(existing));
+    }
+
+    /// **禁止側**: 1つも実在しないなら`None`（＝拒否側へ倒れる）。
+    #[test]
+    fn no_existing_ancestor_yields_none() {
+        let target = Path::new(r"C:\nope\nothing\here");
+        assert_eq!(
+            nearest_existing_ancestor(target, Some(Path::new(r"C:\")), &|_| false),
+            None
+        );
+    }
+
+    /// **マウント点より上へは行かない。** またぐと別のボリュームを測ることになり、
+    /// 「このボリュームはACEを受け付けるか」という問いの答えが別物にすり替わる。
+    #[test]
+    fn the_walk_stops_at_the_mount_point_instead_of_measuring_another_volume() {
+        let mount = Path::new(r"C:\mnt\data");
+        let target = mount.join("harness").join("session-1");
+        // マウント点の外側（`C:\mnt`・`C:\`）だけが実在する状況。
+        let found = nearest_existing_ancestor(&target, Some(mount), &|p| {
+            p == Path::new(r"C:\mnt") || p == Path::new(r"C:\")
+        });
+        assert_eq!(found, None, "マウント点の外を測ってはいけない");
+    }
+
+    /// マウント点そのものは測ってよい（境界は「またぐこと」であって「触れること」ではない）。
+    #[test]
+    fn the_mount_point_itself_is_a_valid_place_to_measure() {
+        let mount = Path::new(r"C:\mnt\data");
+        let target = mount.join("harness").join("session-1");
+        let found = nearest_existing_ancestor(&target, Some(mount), &|p| p == mount);
+        assert_eq!(found.as_deref(), Some(mount));
     }
 
     /// ネットワーク共有のルートに差分層の根を掘らない。**起動を拒否する直前に

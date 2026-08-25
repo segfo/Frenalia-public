@@ -642,15 +642,20 @@ fn finish_cow_diff_layer_after_apply(cow_diff_layer_dir: Option<&Path>) {
     };
     // 適用直後なので、残す理由は「実行中」「レビュー待ち」「メタが読めない」のいずれか。
     // **どれも黙って消してよいものではない**ので、理由を出してそのまま残す。
+    //
+    // **後片付けの報告はstderrへ出す。** `apply`の結果はstdoutで、`--output-format json`の
+    // ときはそこがJSONそのものになる。ここは結果ではなく副次的な後片付けの報告なので、
+    // stdoutへ書くと機械可読な出力の末尾に人間向けの行が付いて**パースが壊れる**
+    // （[BUG-131](../../../../docs/bugs/BUG-131.md)。下のエラー側は元からstderrだった）。
     if !verdict.collects() {
-        println!(
+        eprintln!(
             "note: keeping the CoW diff area for {session_id} because {}",
             verdict.reason()
         );
         return;
     }
     match harness_sandbox::session_scope::remove_overlay_dir(diff_layer_dir) {
-        Ok(()) => println!("removed the CoW diff area for {session_id} (nothing left in it)"),
+        Ok(()) => eprintln!("removed the CoW diff area for {session_id} (nothing left in it)"),
         Err(e) => eprintln!(
             "warning: applied everything, but could not remove the CoW diff area for \
              {session_id}: {e}"

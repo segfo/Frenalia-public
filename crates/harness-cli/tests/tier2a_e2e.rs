@@ -1190,7 +1190,7 @@ fn case_o_direct_write_into_the_diff_layer_dir_is_recorded() -> Result<(), Strin
     let ws = case_dir("cow-o-direct-diff-layer-write");
     let before = list_cow_sessions();
     const SCRIPT: &str = "Set-Content (Join-Path $env:HARNESS_COW_DIFF_LAYER 'direct.txt') \
-                          'written straight into the diff_layer dir' -NoNewline";
+                          'written straight into the diff layer dir' -NoNewline";
     let run = run_harness(
         &ws,
         &run_shell_script_turns(SCRIPT),
