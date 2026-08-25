@@ -91,9 +91,17 @@ pub(crate) fn collect_dirs_and_files(
 }
 
 /// `path`のDACLへ、既存ACEを保持したまま`sid`へ`access`の許可ACEを`inheritance`付きで
-/// マージする。`SetEntriesInAclW`は同一trusteeの既存ACEを置換する仕様のため冪等
-/// （再実行しても重複ACEが増えない、`win_restricted::set_low_integrity_label`の冪等性と
-/// 同じ性質をDACL版でも担保する）。
+/// マージする。`SetEntriesInAclW`は**`(trustee, 継承フラグ)`が一致する**既存ACEを置換する
+/// 仕様のため冪等（同じ継承指定で再実行しても重複ACEが増えない、
+/// `win_restricted::set_low_integrity_label`の冪等性と同じ性質をDACL版でも担保する）。
+///
+/// **鍵はtrusteeだけではない**（2026-08-25の実測で限定詞を補った。回帰は
+/// `win_appcontainer::ace_grant_revoke_tests`の
+/// `aces_for_one_sid_fold_by_inheritance_flags_and_the_folded_mask_is_a_union`）。
+/// 継承フラグが違えば同じSID宛のACEが**2本のまま共存し**、継承ACEを
+/// 「ディレクトリへ降りる1本（traverse込み）」と「ファイルへ降りる1本（execute抜き）」へ
+/// 割る形が成立する（`plans/mac-spike/RESULTS.md` §S9-1）。
+/// 畳むときのマスクは**和**であって後勝ちではない。
 /// `new_dacl`を`path`（ファイル/ディレクトリいずれも可）へ、**そのオブジェクト単体にのみ**設定する。
 /// `SetNamedSecurityInfoW`（aclapi）は、コンテナのDACLを設定すると子孫全体へauto-inherit再伝播を
 /// 走らせる（procmon実測で`SetSecurityFile`が子孫の数だけ発生、実行中プロファイルルート近傍では

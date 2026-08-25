@@ -80,13 +80,30 @@ fn require_label(require: RequireSandbox) -> &'static str {
 ///
 /// 設定ファイルの語彙（[`harness_config::FsAccess`]・`fs.read`/`fs.read_write`/`fs.read_exec`）は
 /// 3値だが、こちらには[`FsAccess::ReadWriteExec`]がある。**同じパスに`fs.read_write`と
-/// `fs.read_exec`の両方が宣言され得る**のに、1つのオブジェクトのDACLへ同じSID宛のACEを
-/// 2本持つことはできない（[`crate::tier2a::win_appcontainer`]の付与は`SetEntriesInAclW`で
-/// 1本にまとまる）ため、**和を表せる値**が要る。
+/// `fs.read_exec`の両方が宣言され得る**のに、[`FsPassthrough`]は1パスにつき`access`を
+/// **1つしか持てない**ため、**和を表せる値**が要る。
 ///
 /// 和が無かった頃は、畳み込みが先に入った方を残して**もう片方の権限が黙って消えていた**
 /// ——`read_exec`と`read_write`が同じルートに立つと、どちらを採っても片方が失われる
-/// （`ReadWrite`に`FILE_GENERIC_EXECUTE`は入っていない）。
+/// （`ReadWrite`に`FILE_GENERIC_EXECUTE`は入っていない）。**失っていたのはこの層**であって、
+/// 下のACE層ではない（次項）。
+///
+/// # 限定詞（2026-08-25の実測で補った）
+///
+/// ここにはかつて「1つのオブジェクトのDACLへ同じSID宛のACEを2本持つことはできない
+/// （`SetEntriesInAclW`で1本にまとまる）」と書いてあった。**限定詞が2つ落ちていた。**
+/// 実測は`win_appcontainer::ace_grant_revoke_tests`の
+/// `aces_for_one_sid_fold_by_inheritance_flags_and_the_folded_mask_is_a_union`:
+///
+/// - 畳み込みの鍵は trustee **だけではなく`(trustee, 継承フラグ)`の組**である。
+///   継承フラグが違えば**2本のまま共存する**（継承ACEを「ディレクトリへ降りる1本」と
+///   「ファイルへ降りる1本」へ割る形が成立するのはこのため。実測は
+///   `plans/mac-spike/RESULTS.md` §S9-1）。
+/// - 畳むときの結果は**和**であって後勝ちではない（`GRANT_ACCESS`の仕様）。
+///
+/// したがって本値が要る理由は**ACE層の制約ではなく、この層が1パス1値である**ことに尽きる。
+/// **`FsAccess::ReadWriteExec`自体は引き続き要る**——ACE層が和を取ってくれるとしても、
+/// そこへ渡すより前に`FsPassthrough`が1つへ畳む必要があるからである。
 ///
 /// **`fs.read_write_exec`という設定キーは作らない。** 提案の語彙（`harness_policy::SettingsKey`）と
 /// 設定スキーマの1:1を崩さないため、和はこの層（付与）にだけ存在する。

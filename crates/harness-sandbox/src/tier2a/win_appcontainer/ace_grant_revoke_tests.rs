@@ -2715,3 +2715,107 @@ fn reclaim_dead_session_profiles_now() {
     // **見送りは失敗ではない**（消せないものを消さないのが正しい）ので、ここでは落とさない。
     // 何が残ったかは上の要約に名前で出る。
 }
+
+// ---------------------------------------------------------------------------
+// `SetEntriesInAclW`のマージ規則（`grant_ace_mask`の契約そのもの）
+// ---------------------------------------------------------------------------
+
+/// **同じSID宛でも、継承フラグが違えばACEは2本のまま残る。畳むときのマスクは和である。**
+///
+/// # なぜこれを固定するのか
+///
+/// `crate::shell_tier::FsAccess`のdocは、かつて「1つのオブジェクトのDACLへ同じSID宛のACEを
+/// **2本持つことはできない**（`SetEntriesInAclW`で1本にまとまる）」と**限定詞なしで**
+/// 書いており、それが`FsAccess::ReadWriteExec`（和の値）の存在理由とされていた。
+/// **どちらの限定詞も落ちていた**（2026-08-25の実測で補った）:
+///
+/// - 畳み込みの鍵は trustee **だけではなく`(trustee, 継承フラグ)`の組**である。
+/// - 畳むときのマスクは**和**であって後勝ちではない。
+///
+/// この2つは`grant_ace_mask`の契約であり、上に立つ機構（継承ACEを
+/// 「ディレクトリへ降りる1本」と「ファイルへ降りる1本」へ割る形）がそこへ乗っている。
+/// **doc（散文）だけが根拠だと、次にAPIを差し替えたとき無言で崩れる**ので、実測で留める。
+///
+/// `#[ignore]`にしないのはD-63のスコープ検証群と同じ理由——付与先は
+/// [`traverse_capability_sid`]（純粋な導出。プロファイルも台帳も作らない）、
+/// 対象はテストが自分で作る一時ディレクトリで、マシンには何も残らない。
+#[test]
+fn aces_for_one_sid_fold_by_inheritance_flags_and_the_folded_mask_is_a_union() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let sid = traverse_capability_sid().expect("derive the traverse capability SID");
+
+    // 明示ACEを継承フラグ付きで1本ずつ数える。`sid_explicit_ace`はharness側で畳んでしまうので
+    // **本数を数えるここでは使えない**（畳んだ後では1本だったのか2本だったのか分からない）。
+    let count_aces = |path: &std::path::Path| -> Vec<(u8, u32)> {
+        let mut out = Vec::new();
+        unsafe {
+            visit_explicit_aces(path, &mut |entry_sid, _ty, flags, mask| {
+                if EqualSid(entry_sid, sid.as_psid()).is_ok() {
+                    out.push((flags, mask));
+                }
+            })
+            .expect("enumerate explicit ACEs");
+        }
+        out
+    };
+
+    // (1) 継承フラグが**違う**2本は共存する。
+    let split = dir.path().join("split");
+    std::fs::create_dir(&split).expect("create the split-case dir");
+    let with_traverse = workspace_rwx_mask();
+    let without_traverse = workspace_rwx_mask() & !FILE_TRAVERSE.0;
+    grant_ace_mask_for_test(&split, sid.as_psid(), with_traverse, CONTAINER_INHERIT_ACE)
+        .expect("grant the container-inherit ACE");
+    grant_ace_mask_for_test(&split, sid.as_psid(), without_traverse, OBJECT_INHERIT_ACE)
+        .expect("grant the object-inherit ACE");
+    let aces = count_aces(&split);
+    assert_eq!(
+        aces.len(),
+        2,
+        "different inheritance flags must keep the ACEs apart: {aces:#x?}"
+    );
+    // 中身が取り違わっていないこと（本数だけでは、両方が同じマスクになっていても通る）。
+    let ci = CONTAINER_INHERIT_ACE.0 as u8;
+    let oi = OBJECT_INHERIT_ACE.0 as u8;
+    let container = aces
+        .iter()
+        .find(|(f, _)| f & ci != 0)
+        .expect("the container-inherit ACE must be there");
+    let object = aces
+        .iter()
+        .find(|(f, _)| f & oi != 0)
+        .expect("the object-inherit ACE must be there");
+    assert_eq!(
+        container.1 & FILE_TRAVERSE.0,
+        FILE_TRAVERSE.0,
+        "the container side must keep the traverse bit: {aces:#x?}"
+    );
+    assert_eq!(
+        object.1 & FILE_TRAVERSE.0,
+        0,
+        "the object side must not carry the traverse(=execute) bit: {aces:#x?}"
+    );
+
+    // (2) 継承フラグが**同じ**2本は1本へ畳まれ、マスクは和になる。
+    //     `fs.read_write`と`fs.read_exec`が同じパスへ宣言された状況そのもの。
+    let folded = dir.path().join("folded");
+    std::fs::create_dir(&folded).expect("create the folded-case dir");
+    let rw = fs_access_mask(FsAccess::ReadWrite);
+    let rx = fs_access_mask(FsAccess::ReadExec);
+    grant_ace_mask_for_test(&folded, sid.as_psid(), rw, NO_INHERITANCE)
+        .expect("grant the read_write ACE");
+    grant_ace_mask_for_test(&folded, sid.as_psid(), rx, NO_INHERITANCE)
+        .expect("grant the read_exec ACE");
+    let aces = count_aces(&folded);
+    assert_eq!(
+        aces.len(),
+        1,
+        "identical inheritance flags must fold into one ACE: {aces:#x?}"
+    );
+    assert_eq!(
+        aces[0].1 & (rw | rx),
+        rw | rx,
+        "the fold must be a union, not last-writer-wins — if this ever fails, a grant can \
+         silently drop rights that an earlier grant had already given: {aces:#x?}"
+    );
+}
