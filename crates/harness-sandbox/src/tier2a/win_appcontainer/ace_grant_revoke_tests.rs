@@ -1102,6 +1102,25 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
 ///
 /// 台帳には触れない（主体は使い捨てのcapability名から導出する）ので、通常の
 /// `cargo test`で走る常設の網である。
+///
+/// # [残課題#32] **この網は「伝播が届くこと」の回帰には*なっていない***
+///
+/// 下の「伝播後」の3つのassertは、まさに #32 の症状（伝播が既存の子孫へ届かない）を
+/// 捕まえる形をしている。**ところが2026-08-25に確かめたところ、#32 の修正を外しても
+/// このテストは緑のままだった。**
+///
+/// 理由は**測っている場所**である。`tempfile::tempdir()`は`%TEMP%`
+/// （`C:\Users\…\AppData\Local\Temp\…`）に作るが、**#32 はそこでは再現しない**——
+/// 同じ書込列でも`C:\`直下のツリーでは 208/209 が届かず、ユーザープロファイル配下では
+/// 全部届く（実測は[`super::acl_dacl_write`]のモジュールdoc）。
+///
+/// **ここを直して「#32の回帰」にはしない。** このテストはBUG-110（台帳の「検証済み」が
+/// 実体とずれる）の網であって、置き場所を変えるとそちらの意味が変わる。
+/// #32 の回帰は`acl_dacl_write_tests`と`acl_baseline_cost_tests`が**`C:\`直下**で持っている
+/// （どちらも修正を外すと赤くなることを確認済み）。
+///
+/// **教訓**: 「その症状を捕まえる形のassert」があることと、「その症状が起きる条件で
+/// 走っている」ことは別である（`B-08`）。
 #[test]
 fn a_file_that_predates_the_root_grant_is_reported_until_the_propagation_reaches_it() {
     let dir = tempfile::tempdir().expect("tempdir");

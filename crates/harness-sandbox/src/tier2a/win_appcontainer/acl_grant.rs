@@ -167,9 +167,18 @@ impl PhaseTiming {
 pub(crate) enum DaclWrite {
     /// このオブジェクトのDACLだけを差し替える（[`set_dacl_single_object`]）。
     /// 子孫は一切触らない＝**継承ACEを足しても既存の子孫へは届かない**。
+    ///
+    /// [残課題#32] **届かないだけでなく、あとから撃つ[`Self::Propagate`]まで効かなくする**
+    /// ——同じ主体・同じ継承フラグのACEがこの口で置かれていると、次の伝播書込が既存の子孫へ
+    /// 1件も届かないことがある（条件と実測は[`super::acl_dacl_write`]のモジュールdoc）。
+    /// **その手当ては`Propagate`側が持っている**ので、ここを使う側が意識する必要は無い。
     SingleObject,
-    /// 子孫へのauto-inherit再伝播を伴う（[`set_dacl_propagating`]）。
+    /// 子孫へのauto-inherit再伝播を伴う（[`super::acl_dacl_write::propagate_merged_dacl`]）。
     /// 継承ありACEを既存ツリー全体へ行き渡らせたいときだけ使う。
+    ///
+    /// [残課題#32] **素の`SetNamedSecurityInfoW`ではない。** 書く直前に対象主体のACEを
+    /// そのノードから外す手当てが入っている（入れないと、上の`SingleObject`で先に置かれた
+    /// 場合に伝播が黙って空振りする）。
     Propagate,
 }
 
@@ -184,6 +193,11 @@ pub(crate) enum DaclWrite {
 /// 同じ内容を`DaclWrite::Propagate`で書こうとしても、既定の冪等スキップに引っかかって
 /// **伝播そのものが黙って起きない**——BUG-081層1（伝播を使う高速経路が、伝播しない書込APIへ
 /// 差し替えられていたのに機能は壊れず気付かれなかった）と同型の罠。
+///
+/// [残課題#32] **`Always`は必要だが十分ではなかった。** これで伝播は「呼ばれる」ように
+/// なったが、**呼ばれても既存の子孫へ届いていなかった**（2026-08-25に実測で確定。
+/// 26万ノードで260,032/260,033が救済walk送り）。十分にする側——伝播書込の直前に対象主体の
+/// ACEを外す——は[`super::acl_dacl_write`]が持つ。**両方要るので、どちらも外さないこと。**
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IdempotentCheck {
     /// 既存ACEが要求マスクを満たしていれば書込を省く（既定の挙動、全既存呼び出しはこちら）。
@@ -199,7 +213,10 @@ pub(crate) enum IdempotentCheck {
 /// ため、**ツリー全体へ継承ACEを行き渡らせたい`grant_ace_inheritable_*`のroot付与だけ**が使う。
 /// traverse chain（祖先への非継承ACE付与）は伝播の必要が無く、かつ対象がプロファイルルート
 /// 近傍になりうるので、必ず`SingleObject`のままにすること。
-unsafe fn set_dacl_propagating(path: &Path, new_dacl: *mut ACL) -> windows::core::Result<()> {
+pub(crate) unsafe fn set_dacl_propagating(
+    path: &Path,
+    new_dacl: *mut ACL,
+) -> windows::core::Result<()> {
     let path_w = long_path_wide(path);
     SetNamedSecurityInfoW(
         PCWSTR(path_w.as_ptr()),
@@ -492,13 +509,18 @@ pub(crate) fn grant_ace_mask_with_checked(
         }
 
         let set_result = match write {
-            DaclWrite::SingleObject => set_dacl_single_object(path, new_dacl),
-            DaclWrite::Propagate => set_dacl_propagating(path, new_dacl),
+            DaclWrite::SingleObject => set_dacl_single_object(path, new_dacl).map_err(to_err),
+            // [残課題#32] **素の`set_dacl_propagating`を直接呼ばない。** 同じ主体のACEが
+            // 既にこのノードに在ると、この書込は既存の子孫へ1件も届かない——部品側が
+            // 書く直前に外す（`acl_dacl_write`のモジュールdocに実測表がある）。
+            DaclWrite::Propagate => {
+                super::acl_dacl_write::propagate_merged_dacl(path, &[sid], new_dacl)
+            }
         };
 
         let _ = LocalFree(HLOCAL(new_dacl as *mut _));
         let _ = LocalFree(HLOCAL(sd.0));
-        set_result.map_err(to_err)?;
+        set_result?;
     }
     Ok(())
 }
@@ -655,15 +677,21 @@ pub fn grant_ace_recursive_ro(root: &Path, sid: PSID) -> Result<(), AppContainer
 /// （[`sid_effective_ace_mask`]で検出、**継承経由・明示ACE経由を問わない**）を確認し、
 /// **届いていないノードだけ**`grant_ace_ro`で個別に明示付与するフォールバックを行う。
 ///
-/// **この2点はどちらも欠けると意味を失う**（[BUG-081](../../../../docs/bugs/BUG-081.md)）:
+/// **この3点はどれが欠けても意味を失う**（[BUG-081](../../../../docs/bugs/BUG-081.md)、
+/// 3点目は`docs/STATUS.md`残課題#32）:
 ///
 /// 1. rootへの付与は[`DaclWrite::Propagate`]でなければならない。`SingleObject`（BUG-011/013の
 ///    ハング対策で導入した単一オブジェクト書込）だと**伝播そのものが起きない**。
 /// 2. 到達確認は継承ACEを数える`sid_effective_ace_mask`でなければならない。
 ///    `sid_ace_mask`（`GetExplicitEntriesFromAclW`）は継承ACEを拾わないので、伝播していても
 ///    「届いていない」と判定してしまう。
+/// 3. **伝播書込の直前に、その主体のACEをrootから外さなければならない。** 同じ主体・同じ
+///    継承フラグのACEが`SingleObject`で先に置かれていると、伝播は**呼ばれても既存の子孫へ
+///    届かない**（[`super::acl_dacl_write`]のモジュールdocに実測表がある）。
+///    1と2が揃っていても、これが欠けると同じ症状になる——**実際にそうなっていた**のが#32で、
+///    「1を守っているのだから伝播は効いている」という読みがそのまま通っていた。
 ///
-/// どちらかが欠けるとフォールバックが全ノードで発火し、この関数は`grant_ace_recursive_ro`と
+/// どれかが欠けるとフォールバックが全ノードで発火し、この関数は`grant_ace_recursive_ro`と
 /// 同じO(n)の明示付与へ退化する（実測: 254,000ファイルのworkspaceで起動が60秒、かつ
 /// セッションのACEがツリー全体へ残留した）。
 #[track_caller]
@@ -971,6 +999,10 @@ pub fn grant_workspace_root_ro(root: &Path, sid: PSID) -> Result<(), AppContaine
 /// ACEを継承する。既存子孫への伝播（コストの本体、実測20秒超）は`grant_job`の背景フェーズ
 /// （[`propagate_workspace_root_grant`]）へ委ねる——この関数は常にミリ秒オーダーになる
 /// （`DaclWrite::SingleObject`、[`grant_ace`]と同じ土台）。
+///
+/// [残課題#32] **この関数がrootへ置くACEが、背景フェーズの伝播を空振りさせていた。**
+/// ここを消せば直る——が、消すと`smoke_test_spawn`が使うprobe_dirがACEを継承しなくなるので
+/// **消さない**。手当ては伝播する側（[`super::acl_dacl_write`]）が、書く直前に外す形で持つ。
 #[track_caller]
 pub fn grant_workspace_root_rw_fast(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     if !root.is_dir() {
@@ -1007,6 +1039,11 @@ pub fn grant_workspace_root_ro_fast(root: &Path, sid: PSID) -> Result<(), AppCon
 ///
 /// `mask`は呼び出し側（`preflight`）が`workspace_mask`としてRWX/ROいずれかを渡す
 /// （`grant_job::start`の他の引数と同じ`mask`をそのまま使う）。
+///
+/// [残課題#32] **配るのは[`super::acl_dacl_write::grant_aces_propagating`]（M本を1つのDACLへ
+/// 畳んで1回だけ書く部品）である。** `IdempotentCheck::Always`は「冪等スキップで伝播が
+/// *呼ばれない*」を防ぐもので、**必要だが十分ではなかった**——呼ばれても届いていなかった。
+/// 十分にする側は部品が持つ（同モジュールのdocに実測表がある）。**両方要るので、どちらも外さない。**
 #[track_caller]
 pub(crate) fn propagate_workspace_root_grant(
     root: &Path,
@@ -1014,12 +1051,13 @@ pub(crate) fn propagate_workspace_root_grant(
     mask: u32,
 ) -> Result<(), AppContainerError> {
     let mut timing = PhaseTiming::start();
-    grant_ace_mask_with_checked(
+    super::acl_dacl_write::grant_aces_propagating(
         root,
-        sid,
-        mask,
-        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
-        DaclWrite::Propagate,
+        &[super::acl_dacl_write::InheritableGrant {
+            sid,
+            mask,
+            inheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+        }],
         IdempotentCheck::Always,
     )?;
     timing.mark("  background: propagating root grant (unconditional)");

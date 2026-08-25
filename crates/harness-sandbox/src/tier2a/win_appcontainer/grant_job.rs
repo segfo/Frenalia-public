@@ -22,6 +22,13 @@
 //!   届かない。その救済（[`super::fix_descendants_missing_ace`]）はO(ファイル数)の読取確認で、
 //!   この開発機のリポジトリでは28万ノード・実測18.5秒かかる。
 //!
+//!   [残課題#32] **「保護DACL配下だけ」は長らく事実ではなかった。** フェーズ0の伝播が
+//!   既存の子孫へ1件も届いておらず、このwalkが**全ノードへ明示ACEを書いて**いた
+//!   （2026-08-25にツリーによって最大 260,032/260,033 で確定）。2026-08-25の修正で
+//!   doc本来の姿へ戻したが、**戻ったことは`granted`を見ないと分からない**——
+//!   walkが全部救うので機能は壊れず、遅いだけで無症状である。だから
+//!   [`WorkspaceGrantProgress::rescue_granted`]で値を出している。
+//!
 //! これはワークスペースにつき一度きりだが、その一度はrun_shellの初回呼び出しを
 //! （フェーズ0＋1合計で）数十秒止める。preflight自体は同期区間が軽くなったぶん即座に戻り、
 //! TUIを先に出せる（[`WorkspaceGrantProgress`]の`phase`で今どちらのフェーズかを表示できる）。
@@ -86,6 +93,22 @@ pub struct WorkspaceGrantProgress {
     /// ノード数。表示用ではなく**事後確認用**——`0`のまま`finished`になったら、制御面の
     /// 保護が1件も掛かっていない（BUG-083がこの実機で恒常的にそうなっていた）。
     pub protected_nodes: usize,
+    /// [残課題#32] フェーズ1（救済walk）が**明示ACEを書いたノード数**。`protected_nodes`と
+    /// 同じく表示用ではなく**事後確認用**である。
+    ///
+    /// **`0`が健全な状態**（[`super::DescendantFixReport::granted`]のdoc）。0でなければ
+    /// フェーズ0の伝播が既存の子孫へ届いていない——つまり「書込1回で済むはずの段」が
+    /// 何もしておらず、O(ノード数)の明示書込を毎回払っている。
+    ///
+    /// **この値がどこにも出ていなかったこと自体が残課題#32の見つけにくさの本体である**
+    /// （フェーズ1が全部救うので機能は壊れず、遅いだけで無症状。`B-10`: 無言失敗を作らない）。
+    /// 直った後も残す——ここが再び0でなくなったら、それは伝播の退化の再発である。
+    pub rescue_granted: usize,
+    /// フェーズ1が見たノード数（`skip`配下を含む）。`rescue_granted`だけでは
+    /// 「届いたから0」と「1件も歩かなかったから0」を区別できないので対で持つ（`B-35`）。
+    pub rescue_checked: usize,
+    /// フェーズ1がDACLを読めなかったノード数（判定不能なので付与側へ倒した数）。
+    pub rescue_probe_errors: usize,
     pub finished: bool,
     /// 完了していて、かつ失敗していた場合の理由。
     pub error: Option<String>,
@@ -162,6 +185,10 @@ struct JobState {
     total: AtomicUsize,
     /// フェーズ0.5が`.harness/**`へ保護を掛けられたノード数（BUG-084）。
     protected_nodes: AtomicUsize,
+    /// フェーズ1の[`super::DescendantFixReport`]（残課題#32の事後確認用）。
+    rescue_granted: AtomicUsize,
+    rescue_checked: AtomicUsize,
+    rescue_probe_errors: AtomicUsize,
     finished: AtomicBool,
     error: Mutex<Option<String>>,
 }
@@ -284,7 +311,29 @@ pub fn start(
             },
         );
         match result {
-            Ok(_) => {
+            Ok(report) => {
+                // [残課題#32] **報告を捨てない。** ここが`Ok(_)`で握り潰されていたために、
+                // 「フェーズ0が17秒かけて何も配っておらず、実際に配っているのはこのwalkだけ」
+                // という状態が実運用で一度も可視化されなかった（`B-10`）。
+                state
+                    .rescue_granted
+                    .store(report.granted, Ordering::Relaxed);
+                state
+                    .rescue_checked
+                    .store(report.checked, Ordering::Relaxed);
+                state
+                    .rescue_probe_errors
+                    .store(report.probe_errors, Ordering::Relaxed);
+                // 文面は`grant_ace_inheritable_rw`が出しているものに揃える（同じ事実を
+                // 2つの綴りで出さない）。既定では何も出ない＝`HARNESS_PREFLIGHT_TIMING=1`のときだけ。
+                let mut timing = super::PhaseTiming::start();
+                timing.mark(&format!(
+                    "  background: rescue walk ({} checked, {} explicit grants, {} probe errors)",
+                    report.checked, report.granted, report.probe_errors
+                ));
+                if !report.samples.is_empty() {
+                    timing.mark_lines("  background: not reached by inheritance", &report.samples);
+                }
                 crate::tier2a::workspace_capability::mark_tree_verified(&workspace, &mode);
             }
             Err(e) => {
@@ -310,6 +359,9 @@ fn snapshot_progress(state: &JobState) -> WorkspaceGrantProgress {
         done: state.done.load(Ordering::Relaxed),
         total: state.total.load(Ordering::Relaxed),
         protected_nodes: state.protected_nodes.load(Ordering::Relaxed),
+        rescue_granted: state.rescue_granted.load(Ordering::Relaxed),
+        rescue_checked: state.rescue_checked.load(Ordering::Relaxed),
+        rescue_probe_errors: state.rescue_probe_errors.load(Ordering::Relaxed),
         finished,
         error: if finished {
             state.error.lock().unwrap().clone()
@@ -400,6 +452,9 @@ mod tests {
             done,
             total,
             protected_nodes: 0,
+            rescue_granted: 0,
+            rescue_checked: 0,
+            rescue_probe_errors: 0,
             finished: false,
             error: None,
         };

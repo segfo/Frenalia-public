@@ -399,6 +399,11 @@ pub fn current_session_grant_sid() -> Option<String> {
 // 公開項目はここでglob再エクスポートする。
 
 mod acl_grant;
+/// [残課題#32] **DACLを組んで書く低レベルの口**のうち、「M本のACEを1つのDACLへ畳んで
+/// ノードあたり1回だけ書き、既存の子孫まで届かせる」側。`acl_grant`（何をどの主体へ許すかの
+/// 決定）とは触るものが違うので分けてある。**globで出さない**——`propagate_merged_dacl`という
+/// 名前は、それだけでは`set_dacl_propagating`との違いが分からないため。
+mod acl_dacl_write;
 /// 初回の救済walkを背景で回すジョブ（D-54）。**globではなく名前空間として公開する**
 /// ——`start`/`progress`/`wait_until_done`という短い名前は、それだけでは何のジョブか
 /// 分からないため（`grant_job::wait_until_done()`と書けば分かる）。
@@ -574,6 +579,18 @@ mod unc_reach_spike_tests;
 /// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
 #[cfg(all(windows, test))]
 mod acl_baseline_cost_tests;
+
+/// **残課題#32の機序を1回で決めるプローブ**（使い捨て）。`acl_baseline_cost_tests`が
+/// 「届いていない」を確定させたのに対し、こちらは**なぜ届かないのか**を候補を並べて測る
+/// ——直し方が機序で変わるため（モジュールdoc）。**非昇格**。
+/// **確定したら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod acl_propagation_probe_tests;
+
+/// [`acl_dacl_write`]（1ノードあたりDACL書込1回でM本のACEを配る部品）の受け入れ。
+/// **こちらは残す**——残課題#32が再発したら赤くなる回帰である。**非昇格**。
+#[cfg(all(windows, test))]
+mod acl_dacl_write_tests;
 
 /// **テスト専用**の口。[`ensure_profile`]の所有者チェック（BUG-107）を迂回して、
 /// **他セッションのものに見える名前**のプロファイルを作る。
