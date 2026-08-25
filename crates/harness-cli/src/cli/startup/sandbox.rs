@@ -90,7 +90,7 @@ pub(super) fn stage_prepare_sandbox(
     // （`setup::resolve_staging_and_write_mode`）。`tier2a-cow`×`--staged`の排他は値依存で
     // clapが表せないため、拒否はその関数が持つ——`harness prompt`も同じ関数を通るので、
     // 片方の入口だけ守られる形にはならない（B-06）。
-    let sandbox_choice: SandboxChoice = cli.sandbox.into();
+    let sandbox_choice: SandboxChoice = sandbox_choice_of(cli.sandbox);
     if let Err(e) = check_sandbox_choice_supported(sandbox_choice) {
         eprintln!("error: {e}");
         return Err(ExitCode::FAILURE);
@@ -232,7 +232,7 @@ pub(super) fn stage_prepare_sandbox(
 
     // シェル隔離Tier選択（M12、`plans/DESIGN-SANDBOX.md` §6/§7 D-03）。`--require-sandbox`指定時は
     // 自動降格せず起動を拒否する（既存の`--dangerously-allow`と同じfail-fastパターン）。
-    let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
+    let require_sandbox = parse_require_sandbox(cli.require_sandbox);
 
     // confidential（外部持出し経路を作らない明示拒否モード＝通信許可リストを無効化する上位モード）
     // と net-allow-domain/net-allow-app（通信を開く）は意味的に矛盾するため、黙って無視/弱めず起動を拒否する
@@ -498,38 +498,49 @@ fn grant_root_of(workspace_root: &Path, declared: &str) -> PathBuf {
 
 /// Streamable HTTPのセッションゲート（D-49）を、ユーザ層設定とCLIフラグから組み立てる。
 ///
-/// - 有効化: どちらか一方で足りる（`net_proxy`/`net_app`と同じ「CLIが上乗せ」の形）
 /// - 宛先allowlist: 両者の**和集合**。CLIで足せるが、設定から取り除くことはできない
-/// - 平文: **CLIだけ**。設定ファイルにも宣言にも同等のスイッチを置かない
+/// - 有効化: **宛先が1つでもあれば有効**。設定の`allow_streamable_http`も引き続き読むが、
+///   宛先が空なら結局1つも起動しない（closed-by-default）ので、有効化の口を分けても
+///   「有効なのに何も起きない」と「宛先はあるのに無効」という空振りが増えるだけだった
+///   （`plans/DESIGN-CLI-OPTIONS.md` §5.6 B1-3）
+/// - 平文: **CLIだけ**、しかも**書いたドメインに限って**許す。設定ファイルにも宣言にも
+///   同等のスイッチを置かない
 fn build_mcp_gates(
     cli: &Cli,
     mcp_settings: Option<&serde_json::Value>,
 ) -> Result<harness_mcp::McpGates, String> {
     let settings = harness_mcp::parse_mcp_http_gates(mcp_settings)?;
 
-    let mut domains = settings.http_allow_domains;
-    for domain in &cli.allow_mcp_http_domain {
-        // 構文は`--net-allow-domain`と同一（`normalize_domain_pattern`）。
-        let domain = normalize_domain_pattern(domain)?;
+    // 設定側の宛先は常にhttpsのみ（平文はCLIでしか開けられない）。
+    let mut domains = Vec::new();
+    for domain in settings.http_allow_domains {
+        let domain = normalize_domain_pattern(&domain)?;
         if !domains.contains(&domain) {
             domains.push(domain);
         }
     }
 
-    let enabled = settings.allow_streamable_http || cli.allow_mcp_http;
-    if !enabled && (!cli.allow_mcp_http_domain.is_empty() || cli.allow_mcp_http_plaintext) {
-        eprintln!(
-            "warning: --allow-mcp-http-domain/--allow-mcp-http-plaintext have no effect without \
-             --allow-mcp-http (or \"mcp\": {{ \"allow_streamable_http\": true }} in your user \
-             settings.json)"
-        );
+    let mut plaintext_domains = Vec::new();
+    for value in &cli.mcp_http_allow {
+        let (domain, plaintext) = harness_mcp::parse_http_allow_value(value)?;
+        if !domains.contains(&domain) {
+            domains.push(domain.clone());
+        }
+        if plaintext && !plaintext_domains.contains(&domain) {
+            plaintext_domains.push(domain);
+        }
     }
+
+    // **宛先が空でも設定が有効化していれば「有効」と答える。** 起動できる宣言は結局0件だが、
+    // `harness mcp list`が「HTTPは無効」ではなく「有効・宛先0件」と出せる方が、
+    // 何が足りないかを言い当てられる（B-11: 効かなかった理由を黙らせない）。
+    let enabled = settings.allow_streamable_http || !domains.is_empty();
 
     Ok(harness_mcp::McpGates {
         streamable_http_enabled: enabled,
         http_endpoints: harness_mcp::EndpointGates {
             allow_domains: harness_core::DomainPolicy::new(domains),
-            plaintext_allowed: cli.allow_mcp_http_plaintext,
+            plaintext_domains: harness_core::DomainPolicy::new(plaintext_domains),
         },
         http_ca_bundle: settings.http_ca_bundle.map(PathBuf::from),
     })

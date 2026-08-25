@@ -1,11 +1,15 @@
 //! シェル隔離Tier検知・選択（M12）。`plans/DESIGN-SANDBOX.md` §6/§7 D-02/D-03参照。
 //!
-//! 起動時にOS能力をプローブし最上位Tierを選択する。不可なら自動降格+警告
-//! （`ShellTierSelection.downgraded_from`/`reason`、値そのものは`harness_core`が定義する
-//! 「`ToolCtx`が運ぶ値」。ここは選択ロジックの実体のみ）。`--require-sandbox[=confidential]`
-//! 指定時は降格せず`TierError`で実行拒否する（§8-2の判定表）。
+//! 起動時にOS能力をプローブし、`--sandbox`が要求したTierを用意する。**取れなければ
+//! 自動降格せず`TierError`を返す**（D-75。旧実装は「自動降格＋警告」で、
+//! `ShellTierSelection.downgraded_from`/`reason`がその告知を運んでいた——**フィールドごと
+//! 廃止した**）。`--require-sandbox[=confidential]`はその上に重なる最低要求で、
+//! 満たさなければ同じく`TierError`（§8-2の判定表）。
 //!
-//! Windows/Linux以外（macOS等）はTier0固定（Seatbelt枠は本フェーズの対象外、
+//! 値そのものは`harness_core`が定義する「`ToolCtx`が運ぶ値」で、ここは選択ロジックの実体のみ。
+//!
+//! Windows/Linux以外（macOS等）には隔離機構が無いので**起動を拒否する**——弱い器で走るなら
+//! `--sandbox tier0`と明示する（Seatbelt枠は本フェーズの対象外、
 //! `plans/DESIGN-SANDBOX.md` §6.6は将来拡張として明記のみ）。
 
 use std::path::{Path, PathBuf};
@@ -306,7 +310,7 @@ impl Probes {
     }
 }
 
-/// 現在のOSでの最上位Tierを選択する（`require`違反時は降格せず`TierError`）。
+/// 現在のOSでの隔離を用意する。**取れなければ降格せず`TierError`を返す**（D-75）。
 ///
 /// **どのTierを狙うかは[`SandboxChoice`]の1引数だけが決める**（`--sandbox`のCLI表面と1:1）。
 /// かつては`opt_in_tier3: bool`と`opt_in_tier1: bool`の2引数で、「両方真」という
@@ -314,10 +318,16 @@ impl Probes {
 ///
 /// | `choice` | 挙動 |
 /// |---|---|
-/// | [`SandboxChoice::Auto`] | Tier2aを常時プローブする（Linuxのbwrapプローブと同じ「フラグなし常時プローブ」構造）。失敗し、かつ**昇格できない**アカウントのときだけTier0へ宣言付きで降格する |
+/// | [`SandboxChoice::OsDefault`] | そのOSの既定Tier（Windows=Tier2a・Linux=Tier2b・その他=無し）を**要求する**。取れなければ拒否 |
+/// | [`SandboxChoice::Tier0`] | 隔離なしで走る。**ユーザーが明示的に選んだときだけ**ここへ来る |
 /// | [`SandboxChoice::Tier1`] | preflightを通さずTier1へ固定する |
-/// | [`SandboxChoice::Tier2a`] / [`SandboxChoice::Tier2aCow`] | Tier2aをプローブし、**届かなければ拒否する**（Tier0へ降格しない） |
-/// | [`SandboxChoice::Tier3`] | Tier3を優先し、不成立ならTier2aへカスケードする。それも駄目なら拒否 |
+/// | [`SandboxChoice::Tier2a`] / [`SandboxChoice::Tier2aCow`] | Tier2aをプローブし、届かなければ拒否 |
+/// | [`SandboxChoice::Tier2b`] | Linuxのbwrapを要求する。他OSでは拒否 |
+/// | [`SandboxChoice::Tier3`] / [`SandboxChoice::Tier3Warm`] | Tier3を要求する。**不成立でもTier2aへカスケードしない** |
+///
+/// **戻り値は「降格した」を表せない**（[`ShellTierSelection`]のdoc）。`Ok`なら要求どおりの
+/// Tierに居る、という不変条件がD-75の実体である。弱い器で走りたい人は`tier0`・`tier1`を
+/// **自分で選ぶ**——どの器で走るかを機械が代わりに決めない。
 #[allow(clippy::too_many_arguments)]
 pub fn select_tier(
     require: RequireSandbox,
@@ -441,183 +451,177 @@ fn best_effort_tier(
     probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
     match choice {
+        // **隔離なしを明示的に選んだ場合。** ここへ来る唯一の道は`--sandbox tier0`である
+        // （D-75で「落ちる先」から「選ぶ値」になった）。
+        SandboxChoice::Tier0 => Ok(ShellTierSelection::direct(ShellTier::Tier0)),
+
         // preflightを通さない逃がし弁。Tier2aが壊れている機械でも起動だけはできる。
         SandboxChoice::Tier1 => Ok(ShellTierSelection::direct(ShellTier::Tier1)),
 
-        // Tier3は指定時に最優先で試す（Tier3が唯一vNIC単位で出口を強制できるTierのため、
-        // 成立するなら常に最良）。不成立の場合はTier2aへカスケードする。Tier2aも不成立なら、
-        // 暗黙にはTier1へ降格しない。
-        SandboxChoice::Tier3 => {
+        // このOSに対応物が無い値。**打てた時点で構成が矛盾している**ので拒否する
+        // （CLIの`sandbox_choice_supported_on`が先に弾くが、ライブラリ呼び出しはそこを
+        // 通らないので、ここでも対にして拒む——B-01）。
+        SandboxChoice::Tier2b => Err(TierError::Unavailable {
+            attempted: ShellTier::Tier2b.label(),
+            reason: "Tier2b (bubblewrap) is a Linux mechanism and does not exist on Windows"
+                .to_string(),
+        }),
+
+        // **Tier3は不成立なら拒否する。Tier2aへカスケードしない**（D-75、2026-08-23に射程拡張）。
+        //
+        // かつてはTier2aへ落として`downgraded_from`で告知していた。Tier3は**vNIC単位で出口を
+        // 強制できる唯一のTier**なので、Tier2aへ落ちた時点で要求より弱い実態になる——
+        // 告知しているから許される、という説明はP-07（監査は境界ではない）と同じ理由で
+        // 成立しない。Tier2aで走りたい人は`--sandbox tier2a`と打つ。
+        SandboxChoice::Tier3 | SandboxChoice::Tier3Warm => {
             let probe_result = match &probes.tier3_available_override {
                 Some(r) => r.clone(),
                 None => probe_tier3_available(),
             };
             match probe_result {
                 Ok(()) => Ok(ShellTierSelection::direct(ShellTier::Tier3)),
-                Err(tier3_reason) => match try_tier2a(
-                    workspace_root,
-                    passthrough,
-                    wfp_chain_pipe,
-                    write_mode,
-                    privhelper_launcher,
-                    probes,
-                ) {
-                    Ok(tier2a_selection) => {
-                        // Tier2aへ実際に着地するので、「なぜTier3ではないか」を理由として持たせる
-                        // （既存の単発降格の形をそのまま踏襲、Tier2a到達自体は成功のため
-                        // `tier2a_selection`が運ぶpassthrough_warnings等のビルダ値は保持する）。
-                        Ok(ShellTierSelection {
-                            downgraded_from: Some(ShellTier::Tier3),
-                            reason: Some(tier3_reason),
-                            ..tier2a_selection
-                        })
-                    }
-                    Err(tier2a_reason) => Err(TierError::Unavailable {
-                        attempted: ShellTier::Tier2a.label(),
-                        reason: format!(
-                            "Tier3 unavailable ({tier3_reason}); Tier2a preflight also failed ({tier2a_reason})"
-                        ),
-                    }),
-                },
+                Err(tier3_reason) => Err(TierError::Unavailable {
+                    attempted: ShellTier::Tier3.label(),
+                    reason: format!(
+                        "{tier3_reason} (a requested tier never falls back to a weaker one;                          Tier3 is the only tier that enforces egress per vNIC, so landing on                          Tier2a would be weaker than what was asked for)"
+                    ),
+                }),
             }
         }
 
-        // **Tier2aを「要求」した場合は、届かなければ拒否する。**
+        // **Tier2aを要求した場合（明示・既定のいずれも）は、届かなければ拒否する。**
         //
-        // `Auto`との唯一の差はここで、下の`can_elevate()`による Tier0 降格を**通さない**。
-        // 降格を通すと、`--sandbox tier2a-cow`を指定したのにTier0で走り、ACLを一度も
-        // 触らないまま「workspaceはread-only」と宣言する——それがBUG-113そのものである。
-        // 「隔離が要る」と明示した人には、黙って弱い形で走るより起動を止める方が正しい
-        // （`--require-sandbox`のfail-fastと同じ思想）。
-        SandboxChoice::Tier2a | SandboxChoice::Tier2aCow => match try_tier2a(
-            workspace_root,
-            passthrough,
-            wfp_chain_pipe,
-            write_mode,
-            privhelper_launcher,
-            probes,
-        ) {
-            Ok(selection) => Ok(selection),
-            Err(reason) => Err(TierError::Unavailable {
-                attempted: ShellTier::Tier2a.label(),
-                reason: format!(
-                    // **CLIフラグの綴りをここへ書かない。** この関数はライブラリの入口で、
-                    // `harness-policy-editor`の記録経路のように**ユーザーが`--sandbox`を
-                    // 一度も打っていない**呼び出し元がある。「指定を外せ」と案内すると、
-                    // 存在しない操作を勧めることになる（`bug-pattern-rules` B-32）。
-                    "{reason} (the requested isolation '{}' requires Tier2a, and a requested \
-                     tier never falls back to a weaker one)",
-                    choice.value_label()
-                ),
-            }),
-        },
-
-        // 既定パス: Tier2aを無条件にプローブする（Linuxのbwrapプローブと同じ
-        // 「フラグなし常時プローブ」構造）。
-        SandboxChoice::Auto => match try_tier2a(
-            workspace_root,
-            passthrough,
-            wfp_chain_pipe,
-            write_mode,
-            privhelper_launcher,
-            probes,
-        ) {
-            Ok(selection) => Ok(selection),
-            // **失敗の理由を2つに分ける。**
-            //
-            // Tier2aはtraverse ACE付与・netfilterd・ETWのどれでも昇格を要求するので、
-            // 昇格**できない**ユーザーはこの先どうやってもTier2aへ到達しない。その人に
-            // 起動時エラーを返し続けるのは「harnessが使えない」と同義で、Tier1も代替に
-            // ならない（ビルド・テスト・`git commit`が通らない）。Linuxが`bwrap`不在時に
-            // Tier0へ**宣言付きで**降格するのと同じ形へ揃える。
-            //
-            // 一方、昇格**できる**のに今回失敗した（UACをキャンセルした・privhelperが
-            // エラーを返した）場合は、これまでどおり起動時エラーにする。ここを降格に
-            // すると、UACの押し間違い1回で保護が黙って外れる——BUG-093では実際に
-            // UACのキャンセルを別の失敗と読み違えており、同じ取り違えをTier選択で
-            // 繰り返さないための分岐である。
-            //
-            // **この降格は`Auto`にしか無い。** 明示的にTier2aを要求した指定
-            // （`tier2a`/`tier2a-cow`）は上の分岐で拒否済みで、ここへは来ない。
-            //
-            // なお降格しても`--require-sandbox`は素通りしない（`satisfies`がTier0を
-            // `write-containment`・`confidential`のどちらでも拒む）。「黙って降格しない」
-            // 原則も守られている——`downgraded_from`と`reason`が`prompt.rs`経由で
-            // モデルへ必ず出る。
-            Err(reason) => {
-                let can_elevate = probes
-                    .can_elevate_override
-                    .unwrap_or_else(crate::tier2a::privhelper::can_elevate);
-                if can_elevate {
-                    Err(TierError::Unavailable {
-                        attempted: ShellTier::Tier2a.label(),
-                        reason,
-                    })
-                } else {
-                    Ok(ShellTierSelection::downgraded(
-                        ShellTier::Tier2a,
-                        ShellTier::Tier0,
-                        format!(
-                            "{reason} (this account cannot elevate, so Tier2a is out of reach; \
-                             Tier1 is not a substitute because it cannot run builds, tests or git commits)"
-                        ),
-                    ))
-                }
+        // `OsDefault`がここに同居しているのがD-75の帰結である。かつて既定だけは
+        // 「昇格できないアカウントならTier0へ降格する」という抜け道を持っていたが、
+        // **降格が既定で拒否がopt-inという向きはP-05と逆**だった。いまは
+        // 「そのOSの既定Tierを要求する」であり、取れなければ止まる。
+        //
+        // 昇格できないアカウントでもharnessを使いたい場合は、**弱い器を自分で選ぶ**
+        // （`--sandbox tier0`、または`--sandbox tier1`）。コマンドラインに残るぶん、
+        // 「宣言がモデルにしか出ない」旧実装より追跡できる。
+        SandboxChoice::OsDefault | SandboxChoice::Tier2a | SandboxChoice::Tier2aCow => {
+            match try_tier2a(
+                workspace_root,
+                passthrough,
+                wfp_chain_pipe,
+                write_mode,
+                privhelper_launcher,
+                probes,
+            ) {
+                Ok(selection) => Ok(selection),
+                Err(reason) => Err(TierError::Unavailable {
+                    attempted: ShellTier::Tier2a.label(),
+                    reason: tier2a_required_reason(choice, &reason),
+                }),
             }
-        },
+        }
     }
 }
 
-/// Linux版。`choice`は運ぶだけで使わない——Tier1/Tier2a/Tier3はいずれもWindows専用機構で、
-/// このOSにはbubblewrap（Tier2b）しか無い。**引数の形はWindows版と揃える**（揃っていないと
-/// `select_tier_with_probes`が渡す引数の数が合わず、Windows以外でビルドが通らなくなる。
-/// 実際に`privhelper_launcher`を受けていない期間があり、現HEADはWindows以外で
-/// コンパイルできなかった）。
+/// Tier2aが取れなかったときの理由文。**指定した値と既定とで文を分ける。**
+///
+/// **CLIフラグの綴りを埋め込むのは`value_label`が`Some`のときだけ**である。この関数は
+/// ライブラリの入口から呼ばれ、`harness-policy-editor`の記録経路のように**ユーザーが
+/// `--sandbox`を一度も打っていない**呼び出し元がある——「指定を外せ」と案内すると、
+/// 存在しない操作を勧めることになる（`bug-pattern-rules` B-32）。
+#[cfg(target_os = "windows")]
+fn tier2a_required_reason(choice: SandboxChoice, reason: &str) -> String {
+    match choice.value_label() {
+        Some(label) => format!(
+            "{reason} (the requested isolation '{label}' requires Tier2a, and a requested tier              never falls back to a weaker one)"
+        ),
+        None => format!(
+            "{reason} (Tier2a is the default isolation on Windows and it is required, not              preferred: harness does not silently run in a weaker container. To run without              it, ask for the weaker tier explicitly)"
+        ),
+    }
+}
+
+/// Linux版。**引数の形はWindows版と揃える**（揃っていないと`select_tier_with_probes`が渡す
+/// 引数の数が合わず、Windows以外でビルドが通らなくなる。実際に`privhelper_launcher`を
+/// 受けていない期間があり、現HEADはWindows以外でコンパイルできなかった）。
+///
+/// このOSにあるのはbubblewrap（Tier2b）だけなので、`choice`は「Tier2bを要求しているか、
+/// Tier0を選んだか、Windows専用の値を打ったか」の3通りにしか分かれない。
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn best_effort_tier(
     _workspace_root: &Path,
-    _choice: SandboxChoice,
+    choice: SandboxChoice,
     _passthrough: &[FsPassthrough],
     _wfp_chain_pipe: Option<String>,
     _write_mode: &WorkspaceWriteMode,
     _privhelper_launcher: Option<crate::tier2a::ChainLauncher<'_>>,
     probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
-    if probes.linux_tier2b_available() {
-        Ok(ShellTierSelection::direct(ShellTier::Tier2b))
-    } else {
-        let reason = if probes.bwrap_path.is_none() {
-            "bwrap not found on PATH".to_string()
-        } else {
-            "unprivileged user namespaces are disabled (/proc/sys/kernel/unprivileged_userns_clone=0)"
-                .to_string()
-        };
-        Ok(ShellTierSelection::downgraded(
-            ShellTier::Tier2b,
-            ShellTier::Tier0,
-            reason,
-        ))
+    match choice {
+        // 隔離なしを明示的に選んだ場合（D-75）。
+        SandboxChoice::Tier0 => Ok(ShellTierSelection::direct(ShellTier::Tier0)),
+
+        // Windows専用の機構。**打てた時点で構成が矛盾している**ので拒否する（B-01の対）。
+        SandboxChoice::Tier1
+        | SandboxChoice::Tier2a
+        | SandboxChoice::Tier2aCow
+        | SandboxChoice::Tier3
+        | SandboxChoice::Tier3Warm => Err(TierError::Unavailable {
+            attempted: ShellTier::Tier2b.label(),
+            reason: format!(
+                "{} is a Windows-only mechanism and does not exist on Linux",
+                choice.value_label().unwrap_or("the requested tier")
+            ),
+        }),
+
+        // 既定（値なし）とTier2bの明示指定は同じ意味になる——このOSの既定Tierが
+        // Tier2bだからである。**取れなければ拒否する**（D-75。かつてはTier0へ
+        // 宣言付きで降格していた）。
+        SandboxChoice::OsDefault | SandboxChoice::Tier2b => {
+            if probes.linux_tier2b_available() {
+                Ok(ShellTierSelection::direct(ShellTier::Tier2b))
+            } else {
+                let reason = if probes.bwrap_path.is_none() {
+                    "bwrap not found on PATH"
+                } else {
+                    "unprivileged user namespaces are disabled (/proc/sys/kernel/unprivileged_userns_clone=0)"
+                };
+                Err(TierError::Unavailable {
+                    attempted: ShellTier::Tier2b.label(),
+                    reason: format!(
+                        "{reason} (Tier2b is required, not preferred: harness does not silently \
+                         run without isolation. Install bubblewrap, or ask for the weaker tier \
+                         explicitly)"
+                    ),
+                })
+            }
+        }
     }
 }
 
 /// その他のOS（macOS等）版。Linux版と同じ理由で、引数の形をWindows版へ揃えてある。
+///
+/// **このOSには隔離機構が1つも実装されていない。** かつては無条件にTier0へ降格していた
+/// ——つまり**何も指定せずに起動すると、境界がまったく無い状態で走っていた**。D-75で
+/// 拒否へ変えた。macOS向けに分岐を増やさないのは意図的で（同決定）、倒れ方が「起動しない」
+/// なので、実機検証していなくても静かに壊れることはない。
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 #[allow(clippy::too_many_arguments)]
 fn best_effort_tier(
     _workspace_root: &Path,
-    _choice: SandboxChoice,
+    choice: SandboxChoice,
     _passthrough: &[FsPassthrough],
     _wfp_chain_pipe: Option<String>,
     _write_mode: &WorkspaceWriteMode,
     _privhelper_launcher: Option<crate::tier2a::ChainLauncher<'_>>,
     _probes: &Probes,
 ) -> Result<ShellTierSelection, TierError> {
-    Ok(ShellTierSelection::downgraded(
-        ShellTier::Tier2b,
-        ShellTier::Tier0,
-        "no native shell isolation tier implemented for this OS (macOS Seatbelt is future work, see plans/DESIGN-SANDBOX.md §6.6)",
-    ))
+    match choice {
+        SandboxChoice::Tier0 => Ok(ShellTierSelection::direct(ShellTier::Tier0)),
+        _ => Err(TierError::Unavailable {
+            attempted: ShellTier::Tier0.label(),
+            reason: "no native shell isolation tier is implemented for this OS (macOS Seatbelt \
+                     is future work, see plans/DESIGN-SANDBOX.md §6.6). Pass --sandbox tier0 to \
+                     run without isolation on purpose"
+                .to_string(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -697,7 +701,7 @@ mod tests {
         let selection = select_tier_with_probes(
             RequireSandbox::None,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::OsDefault,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
@@ -706,7 +710,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier2a);
-        assert!(selection.downgraded_from.is_none());
         assert!(!selection.is_unisolated());
     }
 
@@ -728,7 +731,7 @@ mod tests {
         let err = select_tier_with_probes(
             RequireSandbox::None,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::OsDefault,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
@@ -739,15 +742,57 @@ mod tests {
         assert!(matches!(err, TierError::Unavailable { .. }));
     }
 
-    /// **昇格できないユーザーは、宣言付きでTier0へ降格する。**
+    /// **昇格できないユーザーでも降格しない。起動を拒否する**（D-75）。
     ///
-    /// Tier2aはtraverse ACE付与・netfilterd・ETWのいずれでも昇格を要求するので、
-    /// 昇格できない人はどうやってもTier2aへ到達しない。Tier1も代替にならない
-    /// （ビルド・テスト・`git commit`が通らない）ため、起動時エラーを返し続けるのは
-    /// 「使えない」と同義になる。Linuxが`bwrap`不在時にTier0へ降格するのと同じ形。
+    /// **かつてはここがTier0への降格だった**（テスト名も
+    /// `windows_downgrades_to_tier0_when_the_user_cannot_elevate_at_all`）。「昇格できない人は
+    /// どうやってもTier2aへ到達しないのだから、宣言付きでTier0へ降ろすのが親切」という
+    /// 理屈だったが、**降格が既定で拒否がopt-inという向きはP-05と逆**である。宣言は誤解を
+    /// 減らすだけで、境界の不在は埋めない（P-07と同じ理由）。
+    ///
+    /// 逃げ道は消していない——**ユーザーが`--sandbox tier0`と明示すれば起動する**
+    /// （下の対照テスト）。違いは「機械が決めるか、人が決めるか」だけである。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_downgrades_to_tier0_when_the_user_cannot_elevate_at_all() {
+    fn windows_refuses_instead_of_downgrading_when_the_user_cannot_elevate_at_all() {
+        let probes = Probes {
+            tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
+            can_elevate_override: Some(false),
+            ..Default::default()
+        };
+        let err = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            SandboxChoice::OsDefault,
+            &[],
+            None,
+            &WorkspaceWriteMode::DirectRw,
+            None,
+            &probes,
+        )
+        .expect_err("D-75: an unavailable default tier must stop the launch, not weaken it");
+
+        let TierError::Unavailable { attempted, reason } = err else {
+            panic!("the refusal must say which tier was attempted: {err:?}");
+        };
+        assert_eq!(attempted, ShellTier::Tier2a.label());
+        assert!(
+            reason.contains("acl grant failed"),
+            "the original preflight failure must survive into the reason: {reason}"
+        );
+        // **「既定＝要求」であることを理由に書く。** ここが無いと、読み手は
+        // 「指定していないのに落ちた」としか読めない（B-32）。
+        assert!(
+            reason.contains("required, not"),
+            "the reason must say the default tier is required, not preferred: {reason}"
+        );
+    }
+
+    /// 上の対照（**許可側**）。同じプローブでも、**ユーザーが明示的にTier0を選べば起動する**。
+    /// これが無いと、上のテストは「常に拒否する」実装でも緑になる。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_starts_at_tier0_when_the_user_asks_for_it_explicitly() {
         let probes = Probes {
             tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
             can_elevate_override: Some(false),
@@ -756,68 +801,47 @@ mod tests {
         let selection = select_tier_with_probes(
             RequireSandbox::None,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::Tier0,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
             None,
             &probes,
         )
-        .expect("a non-elevatable account must still be able to start");
-
+        .expect("--sandbox tier0 is an explicit choice and must start");
         assert_eq!(selection.tier, ShellTier::Tier0);
-        // **降格は必ず宣言する。** `downgraded_from`と`reason`は`prompt.rs`が
-        // 「本来Tier2aを試したがTier0へ降格した」としてモデルへ出す唯一の材料で、
-        // どちらかが欠けると「黙って保護が外れた」のと区別が付かない（B-11）。
-        assert_eq!(selection.downgraded_from, Some(ShellTier::Tier2a));
-        let reason = selection
-            .reason
-            .as_deref()
-            .expect("a downgrade without a reason is a silent downgrade");
-        assert!(
-            reason.contains("acl grant failed"),
-            "the original preflight failure must survive into the reason: {reason}"
-        );
-        assert!(
-            reason.contains("cannot elevate"),
-            "the reason must say why we stopped trying, not just what failed: {reason}"
-        );
+        assert!(selection.is_unisolated());
     }
 
-    /// 降格しても`--require-sandbox`は素通りしない。Tier0は`write-containment`を
-    /// 満たさないので、隔離を要求した起動は依然として失敗する（`satisfies`）。
-    /// **「既定を緩めた」と「要求を無視するようになった」は別**で、後者になっていないことを固定する。
+    /// **明示的にTier0を選んでも`--require-sandbox`は素通りしない。** Tier0は
+    /// `write-containment`を満たさないので、隔離を要求した起動は依然として失敗する
+    /// （`satisfies`）。**「弱い器を選べる」と「要求を無視する」は別**である。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_tier0_downgrade_still_fails_require_sandbox() {
-        let probes = Probes {
-            tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
-            can_elevate_override: Some(false),
-            ..Default::default()
-        };
+    fn windows_explicit_tier0_still_fails_require_sandbox() {
         let err = select_tier_with_probes(
             RequireSandbox::WriteContainment,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::Tier0,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
             None,
-            &probes,
+            &Probes::default(),
         )
         .unwrap_err();
         assert!(
             matches!(err, TierError::Insufficient { .. }),
-            "an explicit sandbox requirement must not be silently downgraded away: {err:?}"
+            "an explicit sandbox requirement must not be satisfiable by picking tier0: {err:?}"
         );
     }
 
-    /// 昇格できないユーザーでも、**Tier2aが成功するなら降格しない**。
-    /// 新しい分岐は失敗経路にだけ効くもので、成功経路を触っていないことを固定する
+    /// 昇格できないユーザーでも、**Tier2aが成功するなら止まらない**。
+    /// 拒否の分岐は失敗経路にだけ効くもので、成功経路を触っていないことを固定する
     /// （B-06: 変更が届く範囲を「効かせたい所だけ」に限定できているか）。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_does_not_downgrade_when_tier2a_succeeds_even_if_elevation_is_unavailable() {
+    fn windows_default_starts_when_tier2a_succeeds_even_if_elevation_is_unavailable() {
         let probes = Probes {
             tier2a_preflight_override: Some(Ok(())),
             can_elevate_override: Some(false),
@@ -826,7 +850,7 @@ mod tests {
         let selection = select_tier_with_probes(
             RequireSandbox::None,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::OsDefault,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
@@ -835,25 +859,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier2a);
-        assert_eq!(selection.downgraded_from, None);
     }
 
-    /// **`tier2a`/`tier2a-cow`は、昇格できないアカウントでもTier0へ降格しない。**
+    /// **Tier2aを要求する3通り（既定・`tier2a`・`tier2a-cow`）は、どれも降格しない。**
     ///
-    /// この2値の存在理由がここである。`Auto`は「昇格できないなら仕方ない」とTier0へ
-    /// 宣言付きで降ろすが、Tier2aを**明示的に要求した**人にその逃げ道を通すと、
-    /// `--sandbox tier2a-cow`と打ったのにACLを一度も触らないまま
-    /// 「workspaceはread-only」とモデルへ宣言することになる（BUG-113）。
+    /// **かつてはここが2通りだった**——既定（旧`auto`）だけが「昇格できないなら仕方ない」と
+    /// Tier0へ降りる抜け道を持っており、明示指定の2値との差がこのテストの主題だった。
+    /// D-75で抜け道が消えたので、**3通りが同じ倒れ方をすること**を固定する。
     ///
-    /// `can_elevate_override: Some(false)`を明示して**`Auto`が降格する条件をそのまま**
-    /// 与えているのが肝で、これを`true`にすると`Auto`でも`Err`になるので何も測れない。
+    /// `can_elevate_override: Some(false)`を明示しているのは、**かつて降格していた条件**を
+    /// そのまま与えるためである（`true`にすると別の分岐で`Err`になり、何も測れない）。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_required_tier2a_refuses_instead_of_downgrading_when_elevation_is_impossible() {
-        for choice in [SandboxChoice::Tier2a, SandboxChoice::Tier2aCow] {
+    fn windows_every_tier2a_request_refuses_instead_of_downgrading() {
+        for choice in [
+            SandboxChoice::OsDefault,
+            SandboxChoice::Tier2a,
+            SandboxChoice::Tier2aCow,
+        ] {
             let probes = Probes {
                 tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
-                // **`Auto`ならTier0へ降格する条件**（下の対照テストがそれを固定している）。
                 can_elevate_override: Some(false),
                 ..Default::default()
             };
@@ -870,7 +895,7 @@ mod tests {
             .unwrap_err();
             let TierError::Unavailable { attempted, reason } = err else {
                 panic!(
-                    "--sandbox {} must refuse to start, not downgrade",
+                    "--sandbox {:?} must refuse to start, not downgrade",
                     choice.value_label()
                 );
             };
@@ -879,47 +904,32 @@ mod tests {
                 reason.contains("acl grant failed"),
                 "the original preflight failure must survive into the reason: {reason}"
             );
-            // **何を指定したせいで降格しなかったのかを名指しする。** ここが無いと、
-            // 同じ状況で`Auto`なら起動できることに気付けない（B-32: 理由を読ませる）。
-            assert!(
-                reason.contains(choice.value_label()),
-                "the reason must name the --sandbox value that forbade the fallback: {reason}"
-            );
+            // **何のせいで弱いTierへ落ちなかったのかを名指しする**（B-32: 理由を読ませる）。
+            // 指定した値には綴りがあり、既定には無いので、文の作り方が分かれる。
+            match choice.value_label() {
+                Some(label) => assert!(
+                    reason.contains(label),
+                    "the reason must name the --sandbox value that forbade the fallback: {reason}"
+                ),
+                None => assert!(
+                    reason.contains("default isolation"),
+                    "for the default, the reason must say it is the OS default that was required: \
+                     {reason}"
+                ),
+            }
         }
     }
 
-    /// 上の対照。**同じプローブ**（preflight失敗＋昇格不可）で`Auto`はTier0へ降格する
-    /// ——差が`choice`だけであることを固定しないと、上のテストは「preflightが失敗すれば
-    /// 常に`Err`」でも緑になる（`test-logic-rules`: 禁止側と許可側を対にする）。
+    /// 許可側: preflightが通るなら3通りともTier2aへそのまま着地する
+    /// （拒否の分岐が成功経路を巻き込んでいないこと、B-06）。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_auto_still_downgrades_under_the_very_probes_that_make_tier2a_refuse() {
-        let probes = Probes {
-            tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
-            can_elevate_override: Some(false),
-            ..Default::default()
-        };
-        let selection = select_tier_with_probes(
-            RequireSandbox::None,
-            &empty_root(),
-            SandboxChoice::Auto,
-            &[],
-            None,
-            &WorkspaceWriteMode::DirectRw,
-            None,
-            &probes,
-        )
-        .expect("auto must keep the Tier0 escape hatch for accounts that cannot elevate");
-        assert_eq!(selection.tier, ShellTier::Tier0);
-        assert_eq!(selection.downgraded_from, Some(ShellTier::Tier2a));
-    }
-
-    /// 許可側: preflightが通るなら`tier2a`/`tier2a-cow`はTier2aへそのまま着地する
-    /// （新しい拒否分岐が成功経路を巻き込んでいないこと、B-06）。
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_required_tier2a_lands_on_tier2a_when_preflight_succeeds() {
-        for choice in [SandboxChoice::Tier2a, SandboxChoice::Tier2aCow] {
+    fn windows_every_tier2a_request_lands_on_tier2a_when_preflight_succeeds() {
+        for choice in [
+            SandboxChoice::OsDefault,
+            SandboxChoice::Tier2a,
+            SandboxChoice::Tier2aCow,
+        ] {
             let probes = Probes {
                 tier2a_preflight_override: Some(Ok(())),
                 can_elevate_override: Some(false),
@@ -935,9 +945,8 @@ mod tests {
                 None,
                 &probes,
             )
-            .unwrap_or_else(|e| panic!("--sandbox {} must start: {e}", choice.value_label()));
+            .unwrap_or_else(|e| panic!("--sandbox {:?} must start: {e}", choice.value_label()));
             assert_eq!(selection.tier, ShellTier::Tier2a);
-            assert_eq!(selection.downgraded_from, None);
         }
     }
 
@@ -985,7 +994,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier1);
-        assert_eq!(selection.downgraded_from, None);
     }
 
     #[cfg(target_os = "windows")]
@@ -1040,7 +1048,7 @@ mod tests {
         let selection = select_tier_with_probes(
             RequireSandbox::Confidential,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::OsDefault,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
@@ -1068,7 +1076,7 @@ mod tests {
         let selection = select_tier_with_probes(
             RequireSandbox::None,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::OsDefault,
             &passthrough,
             None,
             &WorkspaceWriteMode::DirectRw,
@@ -1099,7 +1107,7 @@ mod tests {
         let err = select_tier_with_probes(
             RequireSandbox::Confidential,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::OsDefault,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
@@ -1129,7 +1137,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier3);
-        assert!(selection.downgraded_from.is_none());
     }
 
     #[cfg(target_os = "windows")]
@@ -1153,36 +1160,59 @@ mod tests {
         assert_eq!(selection.tier, ShellTier::Tier3);
     }
 
-    /// `--sandbox tier3`でTier3が不成立でもTier2aへカスケードする。Tier2a preflightが
-    /// 成功する状況を注入し、Tier2aへ着地すること・`downgraded_from`がTier3のままであることを確認する。
+    /// **Tier3が不成立ならTier2aへカスケードせず拒否する**（D-75、4つ目の降格経路）。
+    ///
+    /// **かつてはここがカスケードだった**（テスト名も
+    /// `windows_opt_in_tier3_unavailable_cascades_to_tier2a`）。Tier2a preflightが**成功する**
+    /// 状況を注入しているのが肝で、「Tier2aへ行けたのに行かない」ことを測っている——
+    /// Tier3はvNIC単位で出口を強制できる唯一のTierなので、Tier2aは**要求より弱い実態**になる。
+    ///
+    /// `tier3-warm`も同じ倒れ方をすることを同時に測る（値を足したときに片方だけ直すのを防ぐ）。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_opt_in_tier3_unavailable_cascades_to_tier2a() {
-        let probes = Probes {
-            tier3_available_override: Some(Err("golden image not found".to_string())),
-            tier2a_preflight_override: Some(Ok(())),
-            ..Default::default()
-        };
-        let selection = select_tier_with_probes(
-            RequireSandbox::None,
-            &empty_root(),
-            SandboxChoice::Tier3,
-            &[],
-            None,
-            &WorkspaceWriteMode::DirectRw,
-            None,
-            &probes,
-        )
-        .unwrap();
-        assert_eq!(selection.tier, ShellTier::Tier2a);
-        assert_eq!(selection.downgraded_from, Some(ShellTier::Tier3));
-        assert!(selection.reason.is_some());
+    fn windows_tier3_refuses_instead_of_cascading_to_tier2a() {
+        for choice in [SandboxChoice::Tier3, SandboxChoice::Tier3Warm] {
+            let probes = Probes {
+                tier3_available_override: Some(Err("golden image not found".to_string())),
+                // **Tier2aは取れる。** それでもTier2aへは行かない。
+                tier2a_preflight_override: Some(Ok(())),
+                ..Default::default()
+            };
+            let err = select_tier_with_probes(
+                RequireSandbox::None,
+                &empty_root(),
+                choice,
+                &[],
+                None,
+                &WorkspaceWriteMode::DirectRw,
+                None,
+                &probes,
+            )
+            .expect_err("D-75: a requested tier never falls back to a weaker one");
+            let TierError::Unavailable { attempted, reason } = err else {
+                panic!("the refusal must say which tier was attempted: {err:?}");
+            };
+            assert_eq!(attempted, ShellTier::Tier3.label());
+            assert!(
+                reason.contains("golden image not found"),
+                "the original probe failure must survive into the reason: {reason}"
+            );
+            assert!(
+                reason.contains("weaker"),
+                "the reason must say why Tier2a is not offered as a substitute: {reason}"
+            );
+        }
     }
 
-    /// Tier3・Tier2aの両方が不成立の場合は、Tier1へ暗黙降格せず起動時エラーにする。
+    /// Tier3が不成立なら、**Tier2aを見に行きもしない**。
+    ///
+    /// かつてはここが「両方の理由を1つのメッセージに載せる」テストだった——カスケードして
+    /// Tier2aも試し、その失敗も添えていたためである（`..._and_tier2a_both_unavailable_errors`）。
+    /// D-75でカスケードを廃したので、**Tier2aの失敗理由は出てこない**ことを固定する
+    /// ——出てくるなら、まだTier2aへ行こうとしている。
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_opt_in_tier3_and_tier2a_both_unavailable_errors() {
+    fn windows_tier3_failure_does_not_even_consult_tier2a() {
         let probes = Probes {
             tier3_available_override: Some(Err("golden image not found".to_string())),
             tier2a_preflight_override: Some(Err("acl grant failed".to_string())),
@@ -1199,11 +1229,15 @@ mod tests {
             &probes,
         )
         .unwrap_err();
-        let TierError::Unavailable { reason, .. } = err else {
+        let TierError::Unavailable { attempted, reason } = err else {
             panic!("expected unavailable error");
         };
-        assert!(reason.contains("golden image not found"));
-        assert!(reason.contains("acl grant failed"));
+        assert_eq!(attempted, ShellTier::Tier3.label());
+        assert!(reason.contains("golden image not found"), "{reason}");
+        assert!(
+            !reason.contains("acl grant failed"),
+            "Tier2a must not be probed at all when Tier3 was the request: {reason}"
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -1220,7 +1254,7 @@ mod tests {
         let err = select_tier_with_probes(
             RequireSandbox::None,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::OsDefault,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
@@ -1242,7 +1276,7 @@ mod tests {
         let selection = select_tier_with_probes(
             RequireSandbox::None,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::OsDefault,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
@@ -1251,12 +1285,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selection.tier, ShellTier::Tier2b);
-        assert!(selection.downgraded_from.is_none());
     }
 
+    /// **bwrapが無ければ起動を拒否する**（D-75、2つ目の降格経路）。
+    /// かつてはTier0へ宣言付きで降格していた（`linux_downgrades_to_tier0_when_bwrap_missing`）。
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_downgrades_to_tier0_when_bwrap_missing() {
+    fn linux_refuses_when_bwrap_missing() {
+        let probes = Probes {
+            bwrap_path: None,
+            unprivileged_userns_enabled: Some(true),
+            ..Default::default()
+        };
+        let err = select_tier_with_probes(
+            RequireSandbox::None,
+            &empty_root(),
+            SandboxChoice::OsDefault,
+            &[],
+            None,
+            &WorkspaceWriteMode::DirectRw,
+            None,
+            &probes,
+        )
+        .expect_err("D-75: a missing bwrap must stop the launch, not weaken it");
+        let TierError::Unavailable { attempted, reason } = err else {
+            panic!("the refusal must say which tier was attempted: {err:?}");
+        };
+        assert_eq!(attempted, ShellTier::Tier2b.label());
+        assert!(reason.contains("bwrap not found"), "{reason}");
+        assert!(reason.contains("required, not"), "{reason}");
+    }
+
+    /// **許可側**（禁止側と対にする）: 同じ状況でも`--sandbox tier0`を明示すれば起動する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_starts_at_tier0_when_the_user_asks_for_it_explicitly() {
         let probes = Probes {
             bwrap_path: None,
             unprivileged_userns_enabled: Some(true),
@@ -1265,58 +1328,54 @@ mod tests {
         let selection = select_tier_with_probes(
             RequireSandbox::None,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::Tier0,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
             None,
             &probes,
         )
-        .unwrap();
+        .expect("--sandbox tier0 is an explicit choice and must start");
         assert_eq!(selection.tier, ShellTier::Tier0);
-        assert_eq!(selection.downgraded_from, Some(ShellTier::Tier2b));
         assert!(selection.is_unisolated());
     }
 
+    /// userns無効も同じ倒れ方をする（bwrapの有無だけを見て早合点しないこと）。
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_downgrades_to_tier0_when_userns_disabled() {
+    fn linux_refuses_when_userns_disabled() {
         let probes = Probes {
             bwrap_path: Some(PathBuf::from("/usr/bin/bwrap")),
             unprivileged_userns_enabled: Some(false),
             ..Default::default()
         };
-        let selection = select_tier_with_probes(
+        let err = select_tier_with_probes(
             RequireSandbox::None,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::OsDefault,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
             None,
             &probes,
         )
-        .unwrap();
-        assert_eq!(selection.tier, ShellTier::Tier0);
+        .expect_err("D-75: disabled user namespaces must stop the launch");
+        assert!(matches!(err, TierError::Unavailable { .. }));
     }
 
+    /// **明示的にTier0を選んでも`--require-sandbox`は素通りしない**（Windows側と同じ規律）。
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_require_sandbox_rejects_tier0_downgrade() {
-        let probes = Probes {
-            bwrap_path: None,
-            unprivileged_userns_enabled: None,
-            ..Default::default()
-        };
+    fn linux_explicit_tier0_still_fails_require_sandbox() {
         let err = select_tier_with_probes(
             RequireSandbox::WriteContainment,
             &empty_root(),
-            SandboxChoice::Auto,
+            SandboxChoice::Tier0,
             &[],
             None,
             &WorkspaceWriteMode::DirectRw,
             None,
-            &probes,
+            &Probes::default(),
         )
         .unwrap_err();
         assert!(matches!(err, TierError::Insufficient { .. }));

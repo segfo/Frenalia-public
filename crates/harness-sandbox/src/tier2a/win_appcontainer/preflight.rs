@@ -172,9 +172,10 @@ fn check_workspace_usable_as_child_cwd(workspace_root: &Path) -> Result<(), AppC
 }
 
 /// harness起動時に1回だけ呼ぶ。プロファイル作成→ACL付与→起動smokeテストの一連を行い、
-/// いずれか失敗したら理由文字列を返す（`shell_tier::best_effort_tier`がTier1への降格理由
-/// としてそのまま使う）。判断は実行前に完結させ、`run_shell`個々の呼び出し中には降格ロジックを
-/// 一切持たせない（非冪等コマンドの二重実行を避けるための意図的判断）。
+/// いずれか失敗したら理由文字列を返す（`shell_tier::best_effort_tier`が**起動を拒否する理由**
+/// としてそのまま使う——D-75以降、Tier2aが取れなくても弱いTierへは落とさない）。判断は実行前に
+/// 完結させ、`run_shell`個々の呼び出し中にはTier選択のロジックを一切持たせない（非冪等コマンドの
+/// 二重実行を避けるための意図的判断）。
 ///
 /// `passthrough`（D-13、fs passthrough allowlist）は各ルートへACEを付与したうえで到達性を
 /// プローブする（D8）。到達不能な穴は`preflight`全体を失敗させず、戻り値の警告一覧に

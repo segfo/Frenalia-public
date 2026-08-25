@@ -320,16 +320,23 @@ impl VmSandboxHandle {
     /// 常駐daemonの固定パイプへ接続し、（未起動なら昇格起動してから）`StartSession`を送って
     /// 応答を待つ（親側、非管理者本体から呼ぶ、S-2でパイプの向きが反転）。`allow_domains`は
     /// 既存の`net_proxy.allow_domains`（`--net-allow-domain`+`.harness/settings.json`
-    /// 統合済み、WFPが既に使っているのと同じ値）をそのまま渡す。`warm`は`--tier3-warm`
-    /// （フェーズB）の値をそのまま渡す。`max_sessions`は**daemon未起動時の昇格起動にのみ
-    /// 使われる**（`DESIGN-SANDBOX-VMISOLATION.md`項目6-a）——既に常駐daemonが生きている
-    /// 場合、この値は無視される（後から接続する2本目以降が上限を書き換えられては意味が
-    /// 無いため、daemon起動時の引数としてのみ受け付ける設計）。
+    /// 統合済み、WFPが既に使っているのと同じ値）をそのまま渡す。`warm`は`--sandbox tier3-warm`
+    /// の値をそのまま渡す。
+    ///
+    /// 同時セッション数の上限は**引数では受けず、台帳から読む**
+    /// （[`crate::vm_ledger::max_sessions`]、`harness tier3 set-max-sessions`が置く値）。
+    /// **呼び出し元を1つも経由させないのは、経路が2本あるからである**——ヘッドレス
+    /// （`tier3_progress`）とTUI（`harness_tui::sandbox_prep`）の両方がここへ来るので、
+    /// 引数で運ぶと同じ値を2経路に通す必要があり、片方だけ古くなり得る（B-06）。
+    ///
+    /// 上限が使われるのは**daemon未起動時の昇格起動だけ**である
+    /// （`DESIGN-SANDBOX-VMISOLATION.md`項目6-a）——既に常駐daemonが生きている場合、
+    /// この値は無視される（後から接続する2本目以降が上限を書き換えられては意味が無いため、
+    /// daemon起動時の引数としてのみ受け付ける設計）。
     pub fn start(
         workspace_root: &std::path::Path,
         allow_domains: &[String],
         warm: bool,
-        max_sessions: u8,
     ) -> Result<Self, VmSandboxIpcError> {
         let owner_sid = current_user_sid_string().map_err(|e| {
             VmSandboxIpcError::Ipc(format!("failed to resolve current user SID: {e}"))
@@ -349,6 +356,9 @@ impl VmSandboxHandle {
         ) {
             Ok(pipe) => (pipe, None),
             Err(_) => {
+                // 台帳を読むのは**ここ**——起動しないと決まった後（＝上限が実際に効く瞬間）に
+                // 読むので、置いた値と使う値の間に別のセッションが割り込む余地が小さい。
+                let max_sessions = crate::vm_ledger::max_sessions();
                 let params = format!(
                         "{pipe_name} --owner-sid {owner_sid} --owner-exe \"{}\" --max-sessions {max_sessions}",
                         owner_exe.display()
@@ -571,6 +581,23 @@ fn query_active_sessions(pipe: HANDLE) -> Result<usize, VmSandboxIpcError> {
 /// 運用下で常に真になり、GCが恒久的に拒否される欠陥になっていた（`docs/bugs/BUG-029.md`）。
 /// 接続できた場合は`VmRequest::QueryActiveSessions`を送り、実際のアクティブセッション数を
 /// 問い合わせてから判定する（0件なら続行、1件以上なら拒否）。
+/// `harness tier3 set-max-sessions <n>`の実体。**次にdaemonを起こすときから効く。**
+///
+/// 置き場（Tier3台帳）は`vm_ledger`が持つ。ここに口を置くのは、`run_gc_only`・
+/// `stop_resident_daemon_if_idle`と**同じ公開面に揃える**ためである——`harness tier3`の
+/// 3操作が別々の深さのモジュールを覗きに行くと、どれがクレートの契約なのかが読めなくなる。
+///
+/// 戻り値は**実際に置かれた値**（1未満は1へ丸める）。
+pub fn set_max_sessions(n: u8) -> u8 {
+    crate::vm_ledger::set_max_sessions(n);
+    crate::vm_ledger::max_sessions()
+}
+
+/// 次のdaemon起動で使われる同時セッション数の上限（置かれていなければ既定値）。
+pub fn max_sessions() -> u8 {
+    crate::vm_ledger::max_sessions()
+}
+
 pub fn run_gc_only() -> Result<Vec<String>, VmSandboxIpcError> {
     if let Ok(query_pipe) = connect_to_pipe_as_client(
         session_daemon_pipe_name(),

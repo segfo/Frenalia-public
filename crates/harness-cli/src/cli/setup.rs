@@ -3,14 +3,18 @@
 
 use super::*;
 
-/// `--require-sandbox[=confidential]`の文字列表現を`RequireSandbox`へ変換する
-/// （M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。未知の値は`write-containment`扱いにする
-/// （clapの`default_missing_value`と揃える安全側フォールバック）。
-pub(crate) fn parse_require_sandbox(value: Option<&str>) -> RequireSandbox {
+/// `--require-sandbox[=confidential]`の指定を`RequireSandbox`へ写す
+/// （M12、`plans/DESIGN-SANDBOX.md` §7 D-03）。**フラグを打たなかった**（`None`）ときだけ
+/// `RequireSandbox::None`で、値の解釈は[`RequireSandboxArg`]（`ValueEnum`）が持つ。
+///
+/// **かつてはここが`Option<&str>`を受け、未知の値を`write-containment`へ落としていた**
+/// ——安全側フォールバックのつもりだったが、`--require-sandbox=confidentail`と打った人は
+/// **要求したより弱い保証で、しかも成功して**起動していた（[BUG-114](../../../docs/bugs/BUG-114.md)）。
+/// 未知の値はclapのパースで落ちるようになったので、ここに落とす分岐そのものが無い。
+pub(crate) fn parse_require_sandbox(value: Option<RequireSandboxArg>) -> RequireSandbox {
     match value {
         None => RequireSandbox::None,
-        Some("confidential") => RequireSandbox::Confidential,
-        Some(_) => RequireSandbox::WriteContainment,
+        Some(arg) => arg.into(),
     }
 }
 
@@ -28,8 +32,12 @@ pub(crate) use harness_sandbox::session_scope::sandbox_dir_for_session;
 /// **`harness prompt`と起動パイプラインの両方がここを通る**（同じ判定を2箇所に書くと、
 /// 片方だけ直った状態が無言で残る。B-05/B-06）。
 ///
-/// `tier3`をここで弾かないのは、従来の`--vm-sandbox`が非Windowsで単に無視されていた挙動を
-/// そのまま残すためである（Tierの選択自体は`best_effort_tier`のOSごとの実装が決める）。
+/// **`tier3`も非Windowsで拒否する**（2026-08-24）。かつては素通りさせていた——旧`--vm-sandbox`が
+/// 非Windowsで黙って無視されていた挙動をそのまま残していたためだが、**「指定したのに無視される」は
+/// この関数が塞ごうとしているものそのもの**である。D-72の値集合の表も`tier3`をWindows専用と書いている。
+///
+/// **「このOSには無い値」はパースでは弾けない**（`ValueEnum`はOSを知らない）ので、拒否は
+/// ここ＝実行時になる。`tier2b`を足すときにWindows側の拒否も対で足したのは同じ理由（B-01）。
 pub(crate) fn check_sandbox_choice_supported(choice: SandboxChoice) -> Result<(), String> {
     sandbox_choice_supported_on(choice, cfg!(windows))
 }
@@ -44,17 +52,37 @@ pub(crate) fn sandbox_choice_supported_on(
     choice: SandboxChoice,
     is_windows: bool,
 ) -> Result<(), String> {
-    if is_windows {
+    // **どのOSでも通る2つ。** 値なし（そのOSの既定Tierを要求する）と、隔離なしの明示選択。
+    if matches!(choice, SandboxChoice::OsDefault | SandboxChoice::Tier0) {
         return Ok(());
     }
-    match choice {
-        SandboxChoice::Auto | SandboxChoice::Tier3 => Ok(()),
-        SandboxChoice::Tier1 | SandboxChoice::Tier2a | SandboxChoice::Tier2aCow => Err(format!(
-            "--sandbox {} is only supported on Windows (Tier1 = Restricted Token + low IL, \
-             Tier2a = AppContainer; neither exists on this OS). Leave --sandbox at its default \
-             (auto) here.",
-            choice.value_label()
+
+    // **対で書く**（B-01）。片側だけ足すと、新しい値が反対のOSで黙って受理される。
+    let windows_only = matches!(
+        choice,
+        SandboxChoice::Tier1
+            | SandboxChoice::Tier2a
+            | SandboxChoice::Tier2aCow
+            | SandboxChoice::Tier3
+            | SandboxChoice::Tier3Warm
+    );
+    let linux_only = matches!(choice, SandboxChoice::Tier2b);
+
+    // 綴りが無いのは`OsDefault`だけで、それは上で返している。
+    let label = choice.value_label().unwrap_or("(default)");
+    match (is_windows, windows_only, linux_only) {
+        (true, _, true) => Err(format!(
+            "--sandbox {label} is a Linux mechanism (bubblewrap) and does not exist on Windows. \
+             Omit --sandbox to require this OS's default tier, or pass --sandbox tier0 to run \
+             without isolation on purpose."
         )),
+        (false, true, _) => Err(format!(
+            "--sandbox {label} is only supported on Windows (Tier1 = Restricted Token + low IL, \
+             Tier2a = AppContainer, Tier3 = Hyper-V VM; none of them exist on this OS). Omit \
+             --sandbox to require this OS's default tier, or pass --sandbox tier0 to run without \
+             isolation on purpose."
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -146,9 +174,25 @@ pub(crate) fn resolve_staging_mode_checked(
         };
         return Err(format!(
             "--sandbox tier2a-cow cannot be combined with {other}: they are two different write \
-             capture mechanisms (a staging manifest vs. a Copy-on-Write diff_layer layer) and only one \
+             capture mechanisms (a staging manifest vs. a Copy-on-Write diff layer) and only one \
              can be in effect. Pick the one you want to review changes through."
         ));
+    }
+
+    // **`--live`は同じ軸の3つ目の値である。** かつてここが抜けており、`--live`が黙って
+    // 無視されていた（`plans/DESIGN-CLI-OPTIONS.md` §5.2 A10）。CoWのとき
+    // `SandboxFs::open_with_cow`は差分層を`staging.mode`より優先するので、書込は実FSへ
+    // 行かない——にもかかわらず`prompt.rs`は`render_staging`と`render_cow`を無条件に
+    // 両方積むため、モデルへは「即座に実ファイルシステムへ反映されます」と
+    // 「ワークスペース本体はread-only」が**同時に**届いていた。前者は事実として誤りである。
+    if live {
+        return Err(
+            "--sandbox tier2a-cow cannot be combined with --live: a Copy-on-Write diff layer \
+             holds every write until `harness apply`, so writes do not reach the real workspace \
+             immediately. Drop --live if you want CoW, or drop --sandbox tier2a-cow if you want \
+             writes to land directly."
+                .to_string(),
+        );
     }
 
     Ok(staging_mode)
@@ -347,30 +391,51 @@ mod staging_mode_tests {
     /// OS依存の受理判定を**両側**測る。`cfg!(windows)`を関数の中で読んでいた頃は、
     /// テストを回せる唯一の機械（Windows）で拒否側が一度も実行されず、
     /// 壊しても緑のままだった（`test-logic-rules`「禁止側と許可側を対にする」）。
+    ///
+    /// **`SandboxChoice::ALL`を回す**ので、値を足したらこの表に無い値として落ちる。
+    /// `match`を`_`無しで書いてあるのが検問の本体である（B-06）。
     #[test]
-    fn windows_accepts_every_sandbox_choice() {
+    fn each_sandbox_value_is_accepted_on_exactly_the_platforms_that_have_it() {
         for choice in SandboxChoice::ALL {
-            assert!(
-                sandbox_choice_supported_on(choice, true).is_ok(),
-                "{choice:?} should be accepted on Windows"
-            );
-        }
-    }
-
-    #[test]
-    fn non_windows_rejects_only_the_windows_only_tiers() {
-        for choice in SandboxChoice::ALL {
-            let verdict = sandbox_choice_supported_on(choice, false);
+            let on_windows = sandbox_choice_supported_on(choice, true);
+            let off_windows = sandbox_choice_supported_on(choice, false);
             match choice {
-                // 許可側: 従来の`--vm-sandbox`が非Windowsで無視されていた挙動を保つ。
-                SandboxChoice::Auto | SandboxChoice::Tier3 => {
-                    assert!(verdict.is_ok(), "{choice:?} should be accepted off Windows");
-                }
-                // 禁止側: Tier1もTier2aもWindows専用の機構で、他OSに対応物が無い。
-                SandboxChoice::Tier1 | SandboxChoice::Tier2a | SandboxChoice::Tier2aCow => {
-                    let message = verdict.expect_err("{choice:?} should be rejected off Windows");
+                // どのOSでも打てる2つ。値なし（そのOSの既定Tierを要求）と、隔離なしの明示選択。
+                SandboxChoice::OsDefault | SandboxChoice::Tier0 => {
+                    assert!(on_windows.is_ok(), "{choice:?} should be accepted on Windows");
                     assert!(
-                        message.contains(choice.value_label()),
+                        off_windows.is_ok(),
+                        "{choice:?} should be accepted off Windows"
+                    );
+                }
+                // Windows専用。**`tier3`も含む**——かつては非Windowsで素通りしていた
+                // （旧`--vm-sandbox`が黙って無視されていた挙動の名残）。
+                SandboxChoice::Tier1
+                | SandboxChoice::Tier2a
+                | SandboxChoice::Tier2aCow
+                | SandboxChoice::Tier3
+                | SandboxChoice::Tier3Warm => {
+                    assert!(on_windows.is_ok(), "{choice:?} should be accepted on Windows");
+                    let message = off_windows.expect_err("must be rejected off Windows");
+                    assert!(
+                        choice
+                            .value_label()
+                            .is_some_and(|label| message.contains(label)),
+                        "拒否理由は打った綴りを名指しすること: {message}"
+                    );
+                }
+                // Linux専用。**Windows側の拒否を対で持つ**（B-01）——片側だけ足すと、
+                // 新しい値が反対のOSで黙って受理される。
+                SandboxChoice::Tier2b => {
+                    assert!(
+                        off_windows.is_ok(),
+                        "{choice:?} should be accepted off Windows"
+                    );
+                    let message = on_windows.expect_err("must be rejected on Windows");
+                    assert!(
+                        choice
+                            .value_label()
+                            .is_some_and(|label| message.contains(label)),
                         "拒否理由は打った綴りを名指しすること: {message}"
                     );
                 }
@@ -387,17 +452,17 @@ mod staging_mode_tests {
             .join("test-workspace")
     }
 
-    /// staging側だけを見るヘルパ（`--sandbox`は既定`auto`）。
+    /// staging側だけを見るヘルパ（`--sandbox`は値なし＝そのOSの既定Tier）。
     fn staging(live: bool, staged: bool, workspace_commit: bool) -> StagingMode {
         resolve_staging_and_write_mode(
-            SandboxChoice::Auto,
+            SandboxChoice::OsDefault,
             live,
             staged,
             workspace_commit,
             SESSION,
             &test_workspace(),
         )
-        .expect("auto never conflicts with the staging flags")
+        .expect("the default choice never conflicts with the staging flags")
         .0
     }
 
@@ -436,7 +501,7 @@ mod staging_mode_tests {
             assert_eq!(
                 staging,
                 StagingMode::Live,
-                "{}: --sandbox must not change the staging mode by itself",
+                "{:?}: --sandbox must not change the staging mode by itself",
                 choice.value_label()
             );
             match choice {
@@ -444,12 +509,15 @@ mod staging_mode_tests {
                     matches!(write_mode, WorkspaceWriteMode::Cow { .. }),
                     "tier2a-cow must produce a CoW diff layer, got {write_mode:?}"
                 ),
-                SandboxChoice::Auto
+                SandboxChoice::OsDefault
+                | SandboxChoice::Tier0
                 | SandboxChoice::Tier1
                 | SandboxChoice::Tier2a
-                | SandboxChoice::Tier3 => assert!(
+                | SandboxChoice::Tier2b
+                | SandboxChoice::Tier3
+                | SandboxChoice::Tier3Warm => assert!(
                     matches!(write_mode, WorkspaceWriteMode::DirectRw),
-                    "{} must stay on the direct-RW workspace, got {write_mode:?}",
+                    "{:?} must stay on the direct-RW workspace, got {write_mode:?}",
                     choice.value_label()
                 ),
             }
@@ -480,30 +548,50 @@ mod staging_mode_tests {
         }
     }
 
-    /// **許可側**（禁止側と対で測る、`test-logic-rules`）。`--sandbox tier2a-cow`単体は通り、
-    /// `--live`との併用も通る（`--live`はCoWと意味的に矛盾しないので排他にしていない）。
+    /// **禁止側**（A10）: `--live`はこの軸の3つ目の値なので、CoWとは同時に成立しない。
+    ///
+    /// **かつてはここが「許可側」のテストだった**——`--live`はCoWと矛盾しないという判断で
+    /// 排他にしていなかった（`docs/bugs/BUG-039.md`）。実際には両方の宣言が同じ
+    /// システムプロンプトへ並び、「即座に実FSへ反映されます」という**誤った事実**が
+    /// モデルへ届いていた（§5.2 A10）。
+    #[test]
+    fn cow_is_rejected_together_with_live() {
+        let err = resolve_staging_and_write_mode(
+            SandboxChoice::Tier2aCow,
+            true,
+            false,
+            false,
+            SESSION,
+            &test_workspace(),
+        )
+        .expect_err("--live and a CoW diff layer cannot both describe where writes land");
+        assert!(
+            err.contains("--live") && err.contains("tier2a-cow"),
+            "the rejection must name both flags so the user knows what to drop: {err}"
+        );
+    }
+
+    /// **許可側**（禁止側と対で測る、`test-logic-rules`）。`--sandbox tier2a-cow`単体は通る。
     /// 禁止側だけを固定すると「全部拒否する」実装でもテストが緑になる。
     #[test]
-    fn cow_alone_and_cow_with_live_are_accepted() {
-        for live in [false, true] {
-            let (staging, write_mode, _fell_back) = resolve_staging_and_write_mode(
-                SandboxChoice::Tier2aCow,
-                live,
-                false,
-                false,
-                SESSION,
-                &test_workspace(),
-            )
-            .expect("--sandbox tier2a-cow on its own must start");
-            assert_eq!(staging, StagingMode::Live);
-            let diff_layer = write_mode
-                .diff_layer_dir()
-                .expect("tier2a-cow must carry a CoW diff layer directory");
-            assert!(
-                diff_layer.ends_with(SESSION),
-                "the diff layer directory must be numbered by session id: {}",
-                diff_layer.display()
-            );
-        }
+    fn cow_alone_is_accepted() {
+        let (staging, write_mode, _fell_back) = resolve_staging_and_write_mode(
+            SandboxChoice::Tier2aCow,
+            false,
+            false,
+            false,
+            SESSION,
+            &test_workspace(),
+        )
+        .expect("--sandbox tier2a-cow on its own must start");
+        assert_eq!(staging, StagingMode::Live);
+        let diff_layer = write_mode
+            .diff_layer_dir()
+            .expect("tier2a-cow must carry a CoW diff layer directory");
+        assert!(
+            diff_layer.ends_with(SESSION),
+            "the diff layer directory must be numbered by session id: {}",
+            diff_layer.display()
+        );
     }
 }

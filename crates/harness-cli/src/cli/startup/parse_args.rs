@@ -85,6 +85,7 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
     if let Some(cmd) = cli.command.take() {
         return Err(match cmd {
             Commands::Fs { action } => crate::fs_grants::run_fs_subcommand(action),
+            Commands::Tier2a { action } => run_tier2a_subcommand(action),
             Commands::Tier3 { action } => run_tier3_subcommand(action),
             Commands::Cow { action } => run_cow_subcommand(action),
             Commands::Net { action } => run_net_subcommand(action, &workspace_root),

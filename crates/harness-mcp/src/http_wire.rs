@@ -27,20 +27,68 @@ use harness_core::net_policy::DomainPolicy;
 /// **`Default`は「何も許さない」**（allowlist空・平文不可）。
 #[derive(Debug, Clone)]
 pub struct EndpointGates {
-    /// ユーザ層設定`mcp.http_allow_domains`＋CLI `--allow-mcp-http-domain`の和集合。
+    /// ユーザ層設定`mcp.http_allow_domains`＋CLI `--mcp-http-allow`の和集合。
     /// **空なら何も通さない**（closed-by-default）。
     pub allow_domains: DomainPolicy,
-    /// CLI `--allow-mcp-http-plaintext`。設定ファイル・宣言側からは立てられない。
-    pub plaintext_allowed: bool,
+    /// **平文httpを許すドメイン**（CLIで`--mcp-http-allow http://<host>`と書いたものだけ）。
+    /// 設定ファイル・宣言側からは立てられない。
+    ///
+    /// **全体の真偽値ではなくドメインの集合なのは、緩和を書いた先だけに効かせるためである。**
+    /// かつては`--allow-mcp-http-plaintext`という単一の真偽フラグで、1つのホストを平文で
+    /// 使いたいだけでも**許可リスト全体**の平文が開いた。緩和の綴りが指しているものより
+    /// 広い範囲へ効くのは、`bug-pattern-rules` B-01の「対の片側だけが広い」型である。
+    pub plaintext_domains: DomainPolicy,
 }
 
 impl Default for EndpointGates {
     fn default() -> Self {
         Self {
             allow_domains: DomainPolicy::new(Vec::new()),
-            plaintext_allowed: false,
+            plaintext_domains: DomainPolicy::new(Vec::new()),
         }
     }
+}
+
+/// `--mcp-http-allow <値>`の値1件を「ドメインパターン」と「平文を許すか」へ分解する。
+///
+/// **値の書式がそのまま緩和の内容になる**（`plans/DESIGN-CLI-OPTIONS.md` §4.9 対象6）。
+///
+/// | 書き方 | 意味 |
+/// |---|---|
+/// | `mcp.corp.example` | httpsのみ |
+/// | `https://mcp.corp.example` | 同上（スキームを書いても同じ） |
+/// | `http://mcp.corp.example` | **そのドメインだけ**平文httpも許す |
+/// | `*.corp.example` | サフィックスワイルドカード（`http://*.corp.example`も書ける） |
+///
+/// **パス・ポート・認証情報が付いていたら拒否する。** ここが受け取るのは宛先の
+/// ドメインパターンであってURLではない——`https://mcp.corp.example/mcp`を黙って
+/// ドメインだけ取り出すと、「パスまで絞ったつもり」の指定が**ホスト全体の許可**として
+/// 通ってしまう（宣言より広い実態になる向きの取り違え）。
+pub fn parse_http_allow_value(raw: &str) -> Result<(String, bool), String> {
+    let trimmed = raw.trim();
+    let (rest, plaintext) = match trimmed
+        .split_once("://")
+        .map(|(scheme, rest)| (scheme.to_ascii_lowercase(), rest))
+    {
+        Some((scheme, rest)) if scheme == "http" => (rest, true),
+        Some((scheme, rest)) if scheme == "https" => (rest, false),
+        Some((scheme, _)) => {
+            return Err(format!(
+                "--mcp-http-allow {raw:?}: unsupported scheme {scheme:?} (write a domain, or \
+                 prefix it with http:// or https://)"
+            ))
+        }
+        None => (trimmed, false),
+    };
+    if rest.contains('/') || rest.contains(':') || rest.contains('@') || rest.contains('?') {
+        return Err(format!(
+            "--mcp-http-allow {raw:?}: this flag takes a domain pattern, not a URL (drop the \
+             path/port/credentials; URL-granularity allowlisting is a separate mechanism)"
+        ));
+    }
+    let domain = harness_core::normalize_domain_pattern(rest)
+        .map_err(|e| format!("--mcp-http-allow {raw:?}: {e}"))?;
+    Ok((domain, plaintext))
 }
 
 /// 検証済みのエンドポイント。**この型は[`validate_endpoint`]からしか作れない**ので、
@@ -183,7 +231,8 @@ pub fn validate_endpoint(url: &str, gates: &EndpointGates) -> Result<Endpoint, H
         });
     }
 
-    if !parsed.is_tls && !gates.plaintext_allowed {
+    // 平文は**そのドメインについて**許されているときだけ通す（`http://`付きで書いた分）。
+    if !parsed.is_tls && !gates.plaintext_domains.evaluate_host(&parsed.host).allowed {
         return Err(HttpWireError::PlaintextNotAllowed);
     }
 
@@ -502,10 +551,14 @@ impl SseAccumulator {
 mod tests {
     use super::*;
 
+    /// `plaintext = true`は「許可した全ドメインを平文でも許す」構成（旧
+    /// `--allow-mcp-http-plaintext`と同じ広さ）。ドメインごとに分ける側は
+    /// [`plaintext_is_scoped_to_the_domains_written_with_http`]が測る。
     fn gates(domains: &[&str], plaintext: bool) -> EndpointGates {
+        let list: Vec<String> = domains.iter().map(|d| d.to_string()).collect();
         EndpointGates {
-            allow_domains: DomainPolicy::new(domains.iter().map(|d| d.to_string()).collect()),
-            plaintext_allowed: plaintext,
+            allow_domains: DomainPolicy::new(list.clone()),
+            plaintext_domains: DomainPolicy::new(if plaintext { list } else { Vec::new() }),
         }
     }
 
@@ -572,8 +625,77 @@ mod tests {
                 &gates(&["mcp.corp.example"], true)
             )
             .is_ok(),
-            "--allow-mcp-http-plaintext should open exactly this case"
+            "--mcp-http-allow http://mcp.corp.example should open exactly this case"
         );
+    }
+
+    /// **平文の緩和は、それを書いたドメインの外へ広がらない。**
+    ///
+    /// `--mcp-http-allow http://legacy.corp.example --mcp-http-allow mcp.corp.example`と
+    /// 打ったとき、平文で通ってよいのは前者だけである。かつての
+    /// `--allow-mcp-http-plaintext`は単一の真偽フラグで、1件のために打つと
+    /// **許可リスト全体**が平文可になっていた。
+    #[test]
+    fn plaintext_is_scoped_to_the_domains_written_with_http() {
+        let gates = EndpointGates {
+            allow_domains: DomainPolicy::new(vec![
+                "legacy.corp.example".to_string(),
+                "mcp.corp.example".to_string(),
+            ]),
+            plaintext_domains: DomainPolicy::new(vec!["legacy.corp.example".to_string()]),
+        };
+
+        // 許可側: `http://`付きで書いたドメインは平文で通る。
+        assert!(validate_endpoint("http://legacy.corp.example/mcp", &gates).is_ok());
+
+        // 禁止側: 同じ許可リストに載っていても、平文を書いていないドメインは通らない。
+        assert_eq!(
+            validate_endpoint("http://mcp.corp.example/mcp", &gates),
+            Err(HttpWireError::PlaintextNotAllowed)
+        );
+
+        // httpsは両方とも通る（平文の指定はhttpsを狭めない）。
+        assert!(validate_endpoint("https://mcp.corp.example/mcp", &gates).is_ok());
+        assert!(validate_endpoint("https://legacy.corp.example/mcp", &gates).is_ok());
+    }
+
+    /// `--mcp-http-allow`の値の書式（§4.9 対象6）。**許可側と禁止側を対で測る。**
+    #[test]
+    fn the_allow_value_grammar_accepts_domains_and_rejects_urls() {
+        // 許可側。
+        assert_eq!(
+            parse_http_allow_value("mcp.corp.example"),
+            Ok(("mcp.corp.example".to_string(), false))
+        );
+        assert_eq!(
+            parse_http_allow_value("https://mcp.corp.example"),
+            Ok(("mcp.corp.example".to_string(), false))
+        );
+        assert_eq!(
+            parse_http_allow_value("http://legacy.corp.example"),
+            Ok(("legacy.corp.example".to_string(), true))
+        );
+        assert_eq!(
+            parse_http_allow_value("HTTP://*.Corp.Example"),
+            Ok(("*.corp.example".to_string(), true)),
+            "スキームもホストも大文字小文字を問わない"
+        );
+
+        // 禁止側。**URLを書いたら黙ってホストだけ取り出さない**——「パスまで絞った」と
+        // 読める指定が、実態としてホスト全体の許可になるのを防ぐ。
+        for bogus in [
+            "https://mcp.corp.example/mcp",
+            "mcp.corp.example:8443",
+            "https://user:pw@mcp.corp.example",
+            "ftp://mcp.corp.example",
+            "https://203.0.113.10",
+            "",
+        ] {
+            assert!(
+                parse_http_allow_value(bogus).is_err(),
+                "--mcp-http-allow {bogus:?} must be rejected, not silently narrowed"
+            );
+        }
     }
 
     /// loopbackはallowlistにも平文ゲートにも掛からない（モジュールdoc参照）。

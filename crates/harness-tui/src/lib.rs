@@ -396,7 +396,6 @@ pub async fn run(
     enter_submits: bool,
     start_with_picker: bool,
     tier3_warm: bool,
-    tier3_max_sessions: u8,
 ) -> io::Result<RunOutcome> {
     let guard = harness_term::TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -419,7 +418,6 @@ pub async fn run(
             &ctx.workspace_root,
             &ctx.net_proxy.allow_domains,
             tier3_warm,
-            tier3_max_sessions,
         )
         .await?
     } else {

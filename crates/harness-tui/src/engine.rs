@@ -361,8 +361,6 @@ mod tests {
             shell_sees_staged_writes: true,
             shell_tier: ShellTierSelection {
                 tier: ShellTier::Tier0,
-                reason: None,
-                downgraded_from: None,
                 granted_passthrough: Vec::new(),
                 denied_passthrough: Vec::new(),
                 passthrough_warnings: Vec::new(),

@@ -1000,12 +1000,14 @@ fn run_pass2<'a>(
     })?;
 
     if selection.tier != ShellTier::Tier2a {
+        // **到達しないはずの分岐**（`Tier2a`を要求しているので`Ok`ならTier2aである）。
+        // 残してあるのは不変条件の検算のためで、D-75後は「降格した理由」という概念が無い
+        // ので、理由の欄には**何が起きたか**をそのまま書く。
         return Err(RecordNetError::NotTier2a {
             tier: selection.tier.label().to_string(),
-            reason: selection
-                .reason
-                .clone()
-                .unwrap_or_else(|| "理由は報告されていません".to_string()),
+            reason: "select_tier(Tier2a)がTier2a以外を返しました（要求したTierに着地しない\
+                     経路は存在しないはずです）"
+                .to_string(),
         });
     }
     // ここへ来た＝**実際にTier2aへ着地した**（直前の分岐が他のTierを弾いている）。

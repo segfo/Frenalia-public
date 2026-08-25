@@ -359,7 +359,7 @@ pub(crate) fn run_policy_subcommand(
     workspace_root: &Path,
     cli: &Cli,
 ) -> ExitCode {
-    let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
+    let require_sandbox = parse_require_sandbox(cli.require_sandbox);
 
     match action {
         PolicyAction::Audit {

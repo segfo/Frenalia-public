@@ -353,11 +353,16 @@ fn render_read_scope(read_scope: &ReadScopeConfig) -> String {
     }
 }
 
+/// 着地したTierと、`--fs-allow`が開けた穴をモデルへ伝える。
+///
+/// **「降格しました」という段はもう無い**（D-75）。隔離が取れないときは起動そのものを拒否する
+/// ので、ここに到達している時点で**要求どおりのTierに居る**。かつては
+/// 「本来Tier2aを試みましたがTier0へ降格されました」という注意書きを出していたが、
+/// **その文が出る状況自体を無くした**——宣言は誤解を減らすだけで、境界の不在は埋めない
+/// （P-07と同じ理由。`plans/DESIGN-SANDBOX.md` D-75）。
 fn render_shell_tier(shell_tier: &ShellTierSelection) -> Vec<String> {
     let ShellTierSelection {
         tier,
-        downgraded_from,
-        reason,
         passthrough_warnings,
         denied_passthrough,
         granted_passthrough,
@@ -370,18 +375,6 @@ fn render_shell_tier(shell_tier: &ShellTierSelection) -> Vec<String> {
     let _ = passthrough_warnings;
 
     let mut out = vec![tier_line(*tier)];
-    if let Some(from) = downgraded_from {
-        let from_label = tier_display_label(*from);
-        let tier_label = tier_display_label(*tier);
-        out.push(format!(
-            "注意: 本来{}での実行を試みましたが{}へ降格されました（理由: {}）。上記{}の説明が\
-             現在有効な制約です。",
-            from_label,
-            tier_label,
-            reason.clone().unwrap_or_default(),
-            tier_label,
-        ));
-    }
     out.extend(render_passthrough(granted_passthrough, denied_passthrough));
     out
 }
@@ -444,16 +437,6 @@ fn render_passthrough(
         ));
     }
     lines
-}
-
-fn tier_display_label(tier: ShellTier) -> &'static str {
-    match tier {
-        ShellTier::Tier3 => "Tier3",
-        ShellTier::Tier2b => "Tier2b",
-        ShellTier::Tier2a => "Tier2a",
-        ShellTier::Tier1 => "Tier1",
-        ShellTier::Tier0 => "Tier0",
-    }
 }
 
 /// `ShellTier`の各バリアントが実際に物理的に何を強制するかの1文。`ShellTier`はここで
@@ -708,16 +691,28 @@ mod tests {
         assert_eq!(tier_mentions, 1, "{rendered}");
     }
 
+    /// **降格の告知はもう出ない**（D-75）。
+    ///
+    /// かつては`downgraded_tier_mentions_both_tiers_and_reason`という名前で、
+    /// 「本来Tier2aを試みましたがTier1へ降格されました（理由: …）」が出ることを固定していた。
+    /// **降格そのものを廃したので、その文が出ないことを固定し直す**——弱いTierに居るのは
+    /// ユーザーがそう選んだときだけで、モデルには**いま有効な制約**（Tier1の行）だけが要る。
+    ///
+    /// 禁止側だけでは「何も出ない」実装でも緑になるので、**許可側**（そのTierの説明が
+    /// ちゃんと1行出ること）と対で測る。
     #[test]
-    fn downgraded_tier_mentions_both_tiers_and_reason() {
+    fn a_weak_tier_is_described_but_never_announced_as_a_downgrade() {
         let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
-        ctx.shell_tier =
-            ShellTierSelection::downgraded(ShellTier::Tier2a, ShellTier::Tier1, "test reason");
+        ctx.shell_tier = ShellTierSelection::direct(ShellTier::Tier1);
         let facts = EnvironmentFacts::from_tool_ctx(&ctx);
         let rendered = render(&facts);
-        assert!(rendered.contains("Tier2a"));
-        assert!(rendered.contains("Tier1"));
-        assert!(rendered.contains("test reason"));
+
+        // 許可側: 着地したTierの説明は出る。
+        assert_eq!(rendered.matches("シェル隔離:").count(), 1, "{rendered}");
+        assert!(rendered.contains("Tier1"), "{rendered}");
+
+        // 禁止側: 「降格」という説明は出ない（そういう状態を作れない）。
+        assert!(!rendered.contains("降格"), "{rendered}");
     }
 
     #[test]

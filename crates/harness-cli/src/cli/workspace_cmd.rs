@@ -126,7 +126,7 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
     // `--sandbox tier2a-cow`×`--staged`の拒否はその関数が持つので、`harness prompt`だけが
     // 素通りする形にはならない（B-06）。ここで受け取った`write_mode`は下で**使わない**——
     // その理由は下の`note`で本人へも説明している。
-    let sandbox_choice: SandboxChoice = cli.sandbox.into();
+    let sandbox_choice: SandboxChoice = sandbox_choice_of(cli.sandbox);
     if let Err(e) = check_sandbox_choice_supported(sandbox_choice) {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
@@ -188,7 +188,7 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
         );
     }
 
-    let require_sandbox = parse_require_sandbox(cli.require_sandbox.as_deref());
+    let require_sandbox = parse_require_sandbox(cli.require_sandbox);
     let shell_tier = match select_tier(
         require_sandbox,
         workspace_root,
@@ -305,6 +305,9 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         // このパスとは責務が別）。
         Commands::Fs { .. } => {
             unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Tier2a { .. } => {
+            unreachable!("Commands::Tier2a is dispatched before run_sandbox_subcommand")
         }
         Commands::Tier3 { .. } => {
             unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")
@@ -621,6 +624,9 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         }
         Commands::Fs { .. } => {
             unreachable!("Commands::Fs is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Tier2a { .. } => {
+            unreachable!("Commands::Tier2a is dispatched before run_sandbox_subcommand")
         }
         Commands::Tier3 { .. } => {
             unreachable!("Commands::Tier3 is dispatched before run_sandbox_subcommand")

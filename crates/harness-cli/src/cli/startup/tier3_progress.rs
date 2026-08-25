@@ -12,7 +12,6 @@ pub(super) async fn start_tier3_with_progress(
     workspace_root: &std::path::Path,
     allow_domains: &[String],
     tier3_warm: bool,
-    tier3_max_sessions: u8,
 ) -> Option<std::sync::Arc<harness_sandbox_vm::vmsandboxd::VmSandboxHandle>> {
     use harness_sandbox_vm::vmsandboxd::VmSandboxHandle;
     use harness_sandbox_vm::vmsandboxd_progress::{run_synthetic_ticker, SandboxPrepEvent};
@@ -27,7 +26,6 @@ pub(super) async fn start_tier3_with_progress(
             &workspace_root,
             &allow_domains,
             tier3_warm,
-            tier3_max_sessions,
         )
     });
     tokio::pin!(start_task);

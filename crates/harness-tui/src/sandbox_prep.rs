@@ -25,7 +25,6 @@ pub async fn run_prep_screen(
     workspace_root: &Path,
     allow_domains: &[String],
     tier3_warm: bool,
-    tier3_max_sessions: u8,
 ) -> io::Result<Option<Arc<VmSandboxHandle>>> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SandboxPrepEvent>();
     let ticker = tokio::spawn(run_synthetic_ticker(tx, tier3_warm));
@@ -37,7 +36,6 @@ pub async fn run_prep_screen(
             &workspace_root,
             &allow_domains,
             tier3_warm,
-            tier3_max_sessions,
         )
     });
     tokio::pin!(start_task);
