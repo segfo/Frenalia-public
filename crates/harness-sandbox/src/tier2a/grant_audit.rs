@@ -477,12 +477,14 @@ mod win {
         sid: PSID,
         candidates: Vec<(PathBuf, Option<Origin>)>,
     ) -> Vec<ProbedPath> {
-        let phase =
-            crate::tier2a::win_appcontainer::passthrough_progress::begin_audit(candidates.len());
+        // **共有セルを名指しするのはここを含めて製品の3箇所だけ**（BUG-138。他は
+        // `preflight`とポリシーエディタの`RunState::new`）。
+        let progress = crate::tier2a::win_appcontainer::passthrough_progress::global();
+        let phase = progress.begin_audit(candidates.len());
         let probed = candidates
             .into_iter()
             .map(|(path, origin)| {
-                crate::tier2a::win_appcontainer::passthrough_progress::advance();
+                progress.advance();
                 let probe = match crate::tier2a::win_appcontainer::sid_ace_mask(&path, sid) {
                     Ok(Some(mask)) => Probe::Present(mask),
                     Ok(None) => Probe::Absent,

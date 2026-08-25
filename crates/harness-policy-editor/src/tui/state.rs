@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use harness_policy::RuleProposal;
+use harness_sandbox::tier2a::win_appcontainer::passthrough_progress::ProgressCell as PassthroughProgressCell;
 
 use crate::child_run::AbortReason;
 use crate::policy_file::{self, PolicyDomain};
@@ -273,10 +274,30 @@ pub struct RunState {
     /// 記録に要した時間（`finished`のときに固定する）。**終了後も`started.elapsed()`を
     /// 出すと、終わった記録の経過時間が増え続けて「まだ動いている」ように見える。**
     pub total_elapsed: Option<Duration>,
+    /// ACE付与・自己検証の進捗を読むセル。既定は製品共有の1つ（[`RunState::new`]）。
+    ///
+    /// **フィールドで持つ理由**（[BUG-138](../../../../docs/bugs/BUG-138.md)）: 以前は
+    /// `drain_worker`と[`RunState::finish`]がそれぞれプロセスグローバルなセルを直に読んでいた。
+    /// 製品では書き手も読み手も1つずつなので正しく動くが、**テストバイナリは同じプロセスで
+    /// 複数のテストを並行に走らせる**ので、共有セルを読んで断言するテストが2本目になった
+    /// 瞬間に互いを踏む。ここを差し替え可能にしておくと、断言するテストは自分のセルを持てる。
+    ///
+    /// `App`ではなく`RunState`が持つ——読むのは`drain_worker`（`App`側）と`finish`
+    /// （`RunState`側）の**両方**で、`App`に置くと後者へ届かない。
+    pub progress: &'static PassthroughProgressCell,
 }
 
 impl RunState {
     pub(crate) fn new(pass: Pass) -> Self {
+        Self::with_progress(
+            pass,
+            harness_sandbox::tier2a::win_appcontainer::passthrough_progress::global(),
+        )
+    }
+
+    /// 進捗セルを指定して作る。**テスト専用の入口ではない**が、実際に別のセルを渡すのは
+    /// 進捗表示を断言する回帰テストだけである（[`RunState::progress`]のdoc）。
+    pub(crate) fn with_progress(pass: Pass, progress: &'static PassthroughProgressCell) -> Self {
         let now = Instant::now();
         Self {
             pass,
@@ -300,6 +321,7 @@ impl RunState {
             aborted: None,
             finished: false,
             total_elapsed: None,
+            progress,
         }
     }
 
@@ -311,8 +333,7 @@ impl RunState {
         // 事実は残す**——「今回ACEを何件書いたか」は結果として読めなければ意味が無い。
         // 内訳を持つ作業（＝付与）だけが対象。撤収は「剥がしたか」しかないので内訳は無い。
         if self.pass == Pass::Two && self.work.as_ref().is_some_and(|w| w.breakdown) {
-            let totals =
-                harness_sandbox::tier2a::win_appcontainer::passthrough_progress::last_totals();
+            let totals = self.progress.last_totals();
             if let Some(work) = self.work.as_mut() {
                 work.written = totals.granted;
                 work.skipped = totals.already;
@@ -856,15 +877,16 @@ impl App {
 
     /// workerから届いた分を引き取る（イベントループが毎フレーム呼ぶ）。
     pub fn drain_worker(&mut self) {
-        // 付与フェーズの進捗は**イベントではなくプロセスグローバルなセルから**引く。
+        // 付与フェーズの進捗は**イベントではなく進捗セルから**引く。
         // `preflight`はイベントを流せない位置（`select_tier`の中の同期区間）で回っており、
         // `PassthroughGranted`が届くのは全件終わってからなので、これを読まないと
         // 「ACE付与 0/668」が最後まで0のまま張り付く（`passthrough_progress`のdoc）。
-        if let Some(progress) =
-            harness_sandbox::tier2a::win_appcontainer::passthrough_progress::snapshot()
-        {
+        //
+        // **どのセルを読むかは`RunState`が持つ**（`RunState::progress`のdoc、BUG-138）。
+        // `run`が無ければどのみち何もしないので、先に`run`を取り出してから読む。
+        if let Some(run) = self.run.as_mut() {
             use harness_sandbox::tier2a::win_appcontainer::passthrough_progress::Phase;
-            if let Some(run) = self.run.as_mut() {
+            if let Some(progress) = run.progress.snapshot() {
                 // **撤収の`PhaseWork`が立っている間はこのセルで上書きしない**——剥がしている
                 // 最中に付与の件数が出る。撤収はこのセルを使わない（`SessionGrants::release`が
                 // 直接`PhaseWork::revocations`を進める）ので、立っているかどうかで判別する。

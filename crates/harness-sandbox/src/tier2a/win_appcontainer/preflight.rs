@@ -549,10 +549,15 @@ pub fn preflight_with_privhelper_launcher(
     // 付与フェーズの進捗をUIへ見せる（`passthrough_progress`のdoc参照）。この区間は
     // 数百件になり得るので、**何件目かが見えないと「固まった」と読まれる**。
     // ガードなので、この下のどの`?`で抜けてもフェーズは閉じる。
-    let grant_phase = passthrough_progress::begin(passthrough.len());
+    //
+    // **共有セルを名指しするのはここを含めて製品の3箇所だけ**（BUG-138。他は
+    // `grant_audit::probe_all`とポリシーエディタの`RunState::new`）。この関数の中の
+    // 進捗はすべてこの束縛を通す——各所で`global()`と書くと、数える対象が増える。
+    let progress = passthrough_progress::global();
+    let grant_phase = progress.begin(passthrough.len());
 
     for requested in passthrough {
-        passthrough_progress::advance();
+        progress.advance();
         if !requested.path.exists() {
             let reason = "path does not exist, skipped".to_string();
             warnings.push(format!("fs-allow {} : {reason}", requested.path.display()));
@@ -643,7 +648,7 @@ pub fn preflight_with_privhelper_launcher(
         if already_sufficient {
             // **Win32を1回も呼んでいない**ことを数える。ここが2回目以降で総数に一致する
             // ことが「差分適用になっている」の証拠になる（`passthrough_progress`のdoc）。
-            passthrough_progress::record_already_sufficient();
+            progress.record_already_sufficient();
             granted_passthrough.push((fp.path.clone(), requested_rw));
             // BUG-057: 付与を**スキップした**場合もsession ledgerへ記録する。ACEを実際に
             // 書いたのが前のセッションだったとしても、載っているのは**このセッションのSID宛**
@@ -662,7 +667,7 @@ pub fn preflight_with_privhelper_launcher(
         match grant_result {
             Ok(()) => {
                 // 実際にACEを書いた1件。
-                passthrough_progress::record_granted();
+                progress.record_granted();
                 granted_passthrough.push((fp.path.clone(), requested_rw));
                 ledger_paths.push(fp.path.clone());
                 probe_targets.push(fp.clone());
@@ -817,7 +822,7 @@ pub fn preflight_with_privhelper_launcher(
                     // には載るのに`end_session`の自動撤収からは漏れていた。
                     // 昇格経由（privhelper／本体が既に管理者）の付与も「書いた1件」に数える
                     // ——どの経路で書いたかではなく、**マシンのACLを変えたか**が知りたい事実。
-                    passthrough_progress::record_granted();
+                    progress.record_granted();
                     ledger_paths.push(path.clone());
                     if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
                         probe_targets.push(fp.clone());

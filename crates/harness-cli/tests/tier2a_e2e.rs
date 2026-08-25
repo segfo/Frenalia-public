@@ -26,6 +26,13 @@ const CASE_ROOT: &str = r"C:\harness-e2e";
 
 type CaseFn = fn() -> Result<(), String>;
 
+/// CoWセッションを作る／読むケース専用。**排他の証（[`CowExclusive`]）を引数で要求する**
+/// ので、札を取らずに書くことができない（BUG-135）。
+///
+/// [`CaseFn`]を替えずに別の型を立てているのは、あちらを6つの行列が共有していて、
+/// 替えるとCoWと無関係なケースまで巻き込むため。
+type CowCaseFn = fn(&CowExclusive) -> Result<(), String>;
+
 fn harness_exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_harness"))
 }
@@ -180,6 +187,15 @@ fn run_harness_full(
     extra_args: &[&str],
     case_name: &str,
 ) -> HarnessRun {
+    // **CoWセッションを作る唯一の入口**（BUG-135）。この関数が唯一であることは数えてある
+    // ——このファイルで`--sandbox`を渡すのは16箇所で、16箇所すべてが`run_harness`／
+    // `run_harness_with_exe`経由でここへ来る。`harness.exe`を直に起動している他の箇所は
+    // 既存セッションを操作するサブコマンド（`apply`・`changes`・`discard`等）で、
+    // `--sandbox`を渡さない＝差分層を新規に作らない。
+    if extra_args.iter().any(|a| a.contains("tier2a-cow")) {
+        assert_cow_exclusive_held("CoWセッションを作る（--sandbox tier2a-cow）");
+    }
+
     let scratch = scratch_dir();
     let turns_path = scratch.join(format!("{case_name}-turns.json"));
     let record_path = scratch.join(format!("{case_name}-requests.jsonl"));
@@ -271,24 +287,132 @@ fn parse_json_stdout(run: &HarnessRun) -> Result<serde_json::Value, String> {
     })
 }
 
-fn list_cow_sessions() -> HashSet<String> {
-    // D-81で根が複数になり、返り値は`(一覧, 到達できなかったボリューム数)`になった。
-    // このテストは同じマシン上の差分ID差分を見るだけなので、到達不能数は使わない。
-    let (dirs, _unreachable) = harness_sandbox::tier2a::workspace_ledger::list_cow_sessions();
-    dirs.into_iter().map(|d| d.session_id).collect()
+// --- 共有資源の排他（[BUG-135](../../../docs/bugs/BUG-135.md)） ---------------------------
+//
+// 同じテストバイナリの`#[test]`は既定で別スレッドに並行実行される。このE2Eには
+// **プロセスをまたいで共有されるもの**が3種類あり、同時に触ると互いを壊す。
+//
+//   1. 共有WFPエンジンとnetfilterdの単一インスタンス（ネットワーク行列）
+//   2. ワークスペースの置き場 `C:\harness-e2e`
+//   3. **このマシン上のCoWセッション（差分層）の一覧**
+//
+// 3番目が、長らく説明書きに**書かれていなかった**もの。各ケースは「起動の前後で一覧を
+// 見比べて、増えた1件が自分のもの」という方法で自分のセッションを特定する
+// （[`CowExclusive::new_cow_session`]）ので、隣が同時にセッションを作ると増えた件数が2に
+// なって特定できない。理由が書かれていなかったため、
+// `tier2a_cow_git_commit_writes_objects_under_the_redirector`はこのロックを取らないまま
+// 追加され、全件を並行実行する`e2e-all`でだけ2本とも落ちた。
+// **書いていない理由は次の人に伝わらない。**
+//
+// 対策は「触るテストを全部数えてロックを配る」ではなく、**数えなくてよくすること**。
+//   (a) 一覧を読む側は[`CowExclusive`]のメソッドにした——札が無いと**そもそも書けない**
+//   (b) 一覧を読まずにセッションを`作るだけ`の側は型で縛れないので、作る唯一の入口
+//       （[`run_harness_full`]）に[`assert_cow_exclusive_held`]を置いた
+
+/// 上記3種類の共有資源を直列化するロック。実機検証で、並行実行時にネットワーク行列が
+/// `net_event_collection_enable_failed`等で不安定になることを確認している。
+static CROSS_MATRIX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// いま[`CowExclusive`]を持っているスレッド。
+///
+/// **`AtomicBool`にしないこと。** 「誰かが持っている」と「自分が持っている」は別の事実で、
+/// 前者で代用すると、札を持たないテストが**隣のテストの保持を自分の保持と読み違えて**
+/// 関所を素通りする。
+static COW_EXCLUSIVE_OWNER: std::sync::Mutex<Option<std::thread::ThreadId>> =
+    std::sync::Mutex::new(None);
+
+/// 共有資源を触ってよいことの証。**取得手段はこの関数だけ**である。
+fn cow_exclusive() -> CowExclusive {
+    let guard = CROSS_MATRIX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    *COW_EXCLUSIVE_OWNER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
+    CowExclusive { _guard: guard }
 }
 
-/// `before`との差分から、このケースで新規に作られたCoWセッションIDを1つ特定する。
-fn new_cow_session(before: &HashSet<String>) -> Result<String, String> {
-    let after = list_cow_sessions();
-    let mut new_ones: Vec<&String> = after.difference(before).collect();
-    match new_ones.len() {
-        1 => Ok(new_ones.remove(0).clone()),
-        0 => Err("CoWセッションが新規作成されなかった".to_string()),
-        n => Err(format!(
-            "CoWセッションが{n}件同時に新規作成された（並行実行を疑う）"
-        )),
+struct CowExclusive {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for CowExclusive {
+    fn drop(&mut self) {
+        // 登録と抹消は対で置く（`bug-pattern-rules` B-01）。フィールドより先にこの本体が
+        // 走るので、「ロックは手放したのに所有者は自分のまま」という窓は開かない。
+        *COW_EXCLUSIVE_OWNER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
+}
+
+/// 札を持たずに共有資源へ触ろうとしたら、その場で止める。
+///
+/// **型で縛れない側の関所**——一覧を読まずにCoWセッションを**作るだけ**のテストは
+/// [`CowExclusive`]を要求されないが、それでも隣の見比べを狂わせる。
+fn assert_cow_exclusive_held(what: &str) {
+    let owner = *COW_EXCLUSIVE_OWNER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        owner,
+        Some(std::thread::current().id()),
+        "BUG-135: 「{what}」は排他ロックを取ってから行うこと。テスト関数の先頭で \
+         `let ex = cow_exclusive();` を取る（取らないと、同時に走る別のテストと \
+         CoWセッションを取り違えて両方が落ちる）"
+    );
+}
+
+impl CowExclusive {
+    fn list_cow_sessions(&self) -> HashSet<String> {
+        // D-81で根が複数になり、返り値は`(一覧, 到達できなかったボリューム数)`になった。
+        // このテストは同じマシン上の差分ID差分を見るだけなので、到達不能数は使わない。
+        let (dirs, _unreachable) = harness_sandbox::tier2a::workspace_ledger::list_cow_sessions();
+        dirs.into_iter().map(|d| d.session_id).collect()
+    }
+
+    /// `before`との差分から、このケースで新規に作られたCoWセッションIDを1つ特定する。
+    fn new_cow_session(&self, before: &HashSet<String>) -> Result<String, String> {
+        let after = self.list_cow_sessions();
+        let mut new_ones: Vec<&String> = after.difference(before).collect();
+        match new_ones.len() {
+            1 => Ok(new_ones.remove(0).clone()),
+            0 => Err("CoWセッションが新規作成されなかった".to_string()),
+            n => Err(format!(
+                "CoWセッションが{n}件同時に新規作成された（並行実行を疑う）"
+            )),
+        }
+    }
+}
+
+/// **BUG-135の歯**（B-27）: 札を持たずに触ったら、不定期な赤ではなく**その場で**落ちること。
+///
+/// このファイルの他のテストはすべて`#[ignore]`（実機・管理者権限が要る）なので、
+/// 関所の生死を確かめるにはこれが唯一の軽い経路である
+/// （`cargo test -p harness-cli --features e2e-mock` で走る。管理者権限は不要）。
+#[test]
+#[should_panic(expected = "BUG-135")]
+fn touching_a_cow_session_without_the_exclusive_guard_fails_loudly() {
+    assert_cow_exclusive_held("この検査自体の歯の確認");
+}
+
+/// **関所が実際に配線されていることの歯**（B-27・B-06）。
+///
+/// 上のテストは検査関数が動くことしか見ていない。**検査が存在することと、
+/// CoWセッションを作る入口から呼ばれていることは別の事実**で、後者が抜けていたのが
+/// BUG-135 そのものだった。だから入口（[`run_harness_full`]）を札無しで叩いて確かめる。
+///
+/// **`harness.exe`は起動しない**——検査は関数の先頭、スクラッチ用ファイルを作るより前に
+/// あるので、パニックが先に出る。実機も管理者権限も要らない。
+#[test]
+#[should_panic(expected = "BUG-135")]
+fn starting_a_cow_session_without_the_exclusive_guard_fails_before_spawning() {
+    let _ = run_harness_full(
+        &harness_exe(),
+        CASE_ROOT,
+        None,
+        &[],
+        &["--sandbox", "tier2a-cow"],
+        "guard-probe-must-never-spawn",
+    );
 }
 
 /// D-81で差分層の根が複数になったので、**全部の根を探す**。
@@ -415,8 +539,8 @@ Rename-Item test4.txt test5.txt";
 
 /// ラウンド1（ベースライン4ファイル作成）を実行し全コミットする。以後の各ケースは
 /// このベースラインの上にラウンド2を重ねる。
-fn setup_baseline(ws: &Path, case_name: &str) -> Result<String, String> {
-    let before = list_cow_sessions();
+fn setup_baseline(ex: &CowExclusive, ws: &Path, case_name: &str) -> Result<String, String> {
+    let before = ex.list_cow_sessions();
     let run = run_harness(
         ws,
         &run_shell_script_turns(ROUND1_SCRIPT),
@@ -427,7 +551,7 @@ fn setup_baseline(ws: &Path, case_name: &str) -> Result<String, String> {
         return Err(format!("round1 harness invocation failed: {}", run.stderr));
     }
     assert_prompt_sane(&run, &["run_shell"])?;
-    let session1 = new_cow_session(&before)?;
+    let session1 = ex.new_cow_session(&before)?;
     let report = apply_cow(ws, &session1, None)?;
     let applied = report["applied"]
         .as_array()
@@ -452,11 +576,12 @@ fn setup_baseline(ws: &Path, case_name: &str) -> Result<String, String> {
 }
 
 fn run_round2(
+    ex: &CowExclusive,
     ws: &Path,
     script: &str,
     case_name: &str,
 ) -> Result<(String, HashSet<String>), String> {
-    let before = list_cow_sessions();
+    let before = ex.list_cow_sessions();
     let run = run_harness(
         ws,
         &run_shell_script_turns(script),
@@ -466,15 +591,15 @@ fn run_round2(
     if !run.status.success() {
         return Err(format!("round2 harness invocation failed: {}", run.stderr));
     }
-    let session2 = new_cow_session(&before)?;
+    let session2 = ex.new_cow_session(&before)?;
     Ok((session2, before))
 }
 
 /// A: 新規作成のみコミット。他の4件は未コミットのまま残ること。
-fn case_a_commit_only_new_file() -> Result<(), String> {
+fn case_a_commit_only_new_file(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-a-new-only");
-    let session1 = setup_baseline(&ws, "cow-a")?;
-    let (session2, _) = run_round2(&ws, ROUND2_SCRIPT, "cow-a-r2")?;
+    let session1 = setup_baseline(ex, &ws, "cow-a")?;
+    let (session2, _) = run_round2(ex, &ws, ROUND2_SCRIPT, "cow-a-r2")?;
 
     let report = apply_cow(&ws, &session2, Some("test2.txt"))?;
     let applied: Vec<String> = report["applied"]
@@ -514,10 +639,10 @@ fn case_a_commit_only_new_file() -> Result<(), String> {
 }
 
 /// B: 修正のみコミット。
-fn case_b_commit_only_modifications() -> Result<(), String> {
+fn case_b_commit_only_modifications(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-b-modify-only");
-    let session1 = setup_baseline(&ws, "cow-b")?;
-    let (session2, _) = run_round2(&ws, ROUND2_SCRIPT, "cow-b-r2")?;
+    let session1 = setup_baseline(ex, &ws, "cow-b")?;
+    let (session2, _) = run_round2(ex, &ws, ROUND2_SCRIPT, "cow-b-r2")?;
 
     apply_cow(&ws, &session2, Some("test.txt"))?;
     let report = apply_cow(&ws, &session2, Some("test1.txt"))?;
@@ -544,10 +669,10 @@ fn case_b_commit_only_modifications() -> Result<(), String> {
 }
 
 /// C: 削除のみコミット。
-fn case_c_commit_only_deletion() -> Result<(), String> {
+fn case_c_commit_only_deletion(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-c-delete-only");
-    let session1 = setup_baseline(&ws, "cow-c")?;
-    let (session2, _) = run_round2(&ws, ROUND2_SCRIPT, "cow-c-r2")?;
+    let session1 = setup_baseline(ex, &ws, "cow-c")?;
+    let (session2, _) = run_round2(ex, &ws, ROUND2_SCRIPT, "cow-c-r2")?;
 
     apply_cow(&ws, &session2, Some("test3.txt"))?;
     if ws.join("test3.txt").exists() {
@@ -564,10 +689,10 @@ fn case_c_commit_only_deletion() -> Result<(), String> {
 }
 
 /// D: 移動のみコミット（Delete test4.txt + Create test5.txtの2エントリ）。
-fn case_d_commit_only_rename() -> Result<(), String> {
+fn case_d_commit_only_rename(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-d-rename-only");
-    let session1 = setup_baseline(&ws, "cow-d")?;
-    let (session2, _) = run_round2(&ws, ROUND2_SCRIPT, "cow-d-r2")?;
+    let session1 = setup_baseline(ex, &ws, "cow-d")?;
+    let (session2, _) = run_round2(ex, &ws, ROUND2_SCRIPT, "cow-d-r2")?;
 
     apply_cow(&ws, &session2, Some("test4.txt"))?;
     apply_cow(&ws, &session2, Some("test5.txt"))?;
@@ -581,10 +706,10 @@ fn case_d_commit_only_rename() -> Result<(), String> {
 }
 
 /// E: 全部コミット。
-fn case_e_commit_all_at_once() -> Result<(), String> {
+fn case_e_commit_all_at_once(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-e-commit-all");
-    let session1 = setup_baseline(&ws, "cow-e")?;
-    let (session2, _) = run_round2(&ws, ROUND2_SCRIPT, "cow-e-r2")?;
+    let session1 = setup_baseline(ex, &ws, "cow-e")?;
+    let (session2, _) = run_round2(ex, &ws, ROUND2_SCRIPT, "cow-e-r2")?;
 
     let report = apply_cow(&ws, &session2, None)?;
     let applied = report["applied"].as_array().ok_or("missing applied[]")?;
@@ -615,10 +740,10 @@ fn case_e_commit_all_at_once() -> Result<(), String> {
 
 /// F: 部分コミット→残りを追いコミットした最終状態が、Eの全コミット結果とバイト一致すること
 /// （データが飛ばない不変条件、当初の要求の核心）。
-fn case_f_partial_then_rest_matches_commit_all() -> Result<(), String> {
+fn case_f_partial_then_rest_matches_commit_all(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-f-partial-then-rest");
-    let session1 = setup_baseline(&ws, "cow-f")?;
-    let (session2, _) = run_round2(&ws, ROUND2_SCRIPT, "cow-f-r2")?;
+    let session1 = setup_baseline(ex, &ws, "cow-f")?;
+    let (session2, _) = run_round2(ex, &ws, ROUND2_SCRIPT, "cow-f-r2")?;
 
     apply_cow(&ws, &session2, Some("test2.txt"))?;
     apply_cow(&ws, &session2, Some("test.txt"))?;
@@ -646,10 +771,10 @@ fn case_f_partial_then_rest_matches_commit_all() -> Result<(), String> {
 }
 
 /// G: D-05ハードデニー。`.git/config`を差分層へ書いてもapplyで実workspaceへ書き戻せないこと。
-fn case_g_hard_deny_config_injection() -> Result<(), String> {
+fn case_g_hard_deny_config_injection(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-g-hard-deny");
-    let session1 = setup_baseline(&ws, "cow-g")?;
-    let before = list_cow_sessions();
+    let session1 = setup_baseline(ex, &ws, "cow-g")?;
+    let before = ex.list_cow_sessions();
     let script = "New-Item -ItemType Directory -Force .git | Out-Null; \
 Set-Content .git/config 'evil-injected' -NoNewline";
     let run = run_harness(
@@ -661,7 +786,7 @@ Set-Content .git/config 'evil-injected' -NoNewline";
     if !run.status.success() {
         return Err(format!("round2 harness invocation failed: {}", run.stderr));
     }
-    let session2 = new_cow_session(&before)?;
+    let session2 = ex.new_cow_session(&before)?;
 
     let report = apply_cow(&ws, &session2, None)?;
     let hard_denied: Vec<String> = report["hard_denied"]
@@ -688,10 +813,10 @@ Set-Content .git/config 'evil-injected' -NoNewline";
 
 /// H: TOCTOU。セッション中に実workspace側を外から書き換えると、conflictとして扱われ
 /// CoW側の内容で黙って上書きされないこと。
-fn case_h_toctou_conflict() -> Result<(), String> {
+fn case_h_toctou_conflict(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-h-toctou");
-    let session1 = setup_baseline(&ws, "cow-h")?;
-    let before = list_cow_sessions();
+    let session1 = setup_baseline(ex, &ws, "cow-h")?;
+    let before = ex.list_cow_sessions();
     let script = "Set-Content test.txt 'modified-by-session' -NoNewline";
     let run = run_harness(
         &ws,
@@ -702,7 +827,7 @@ fn case_h_toctou_conflict() -> Result<(), String> {
     if !run.status.success() {
         return Err(format!("round2 harness invocation failed: {}", run.stderr));
     }
-    let session2 = new_cow_session(&before)?;
+    let session2 = ex.new_cow_session(&before)?;
 
     // セッション外からの書き換え(TOCTOU)をシミュレートする。
     std::fs::write(ws.join("test.txt"), "tampered-externally")
@@ -743,9 +868,9 @@ fn case_h_toctou_conflict() -> Result<(), String> {
 /// ランで発見したバグの回帰確認、Phase 1修正）。`run_shell`経由（PowerShellの`Set-Content`）
 /// ではなく`write_file`ツールを直接呼ぶ台本で、(a) workspace本体がwrite_file実行直後は
 /// 無傷、(b) 新規CoWセッションが記録され、(c) `apply`で反映される、ことを検証する。
-fn case_i_write_file_tool_is_captured_by_cow() -> Result<(), String> {
+fn case_i_write_file_tool_is_captured_by_cow(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-i-write-file-tool");
-    let before = list_cow_sessions();
+    let before = ex.list_cow_sessions();
     let run = run_harness(
         &ws,
         &write_file_tool_turns("notes.txt", "written via write_file tool"),
@@ -763,7 +888,7 @@ fn case_i_write_file_tool_is_captured_by_cow() -> Result<(), String> {
                 .to_string(),
         );
     }
-    let session = new_cow_session(&before)?;
+    let session = ex.new_cow_session(&before)?;
 
     let report = apply_cow(&ws, &session, None)?;
     let applied: Vec<String> = report["applied"]
@@ -790,10 +915,10 @@ fn case_i_write_file_tool_is_captured_by_cow() -> Result<(), String> {
 /// J: `discard`（差分層丸ごと破棄）。`--output-format`が無くテキスト出力のみ（`Discard`は
 /// JSON化されていない）ため、既存`case_h_toctou_conflict`が後始末目的で同コマンドを呼ぶ
 /// 前例に倣い、終了コードと文字列マッチで検証する。
-fn case_j_discard_removes_all_changes() -> Result<(), String> {
+fn case_j_discard_removes_all_changes(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-j-discard");
-    let session1 = setup_baseline(&ws, "cow-j")?;
-    let (session2, _) = run_round2(&ws, ROUND2_SCRIPT, "cow-j-r2")?;
+    let session1 = setup_baseline(ex, &ws, "cow-j")?;
+    let (session2, _) = run_round2(ex, &ws, ROUND2_SCRIPT, "cow-j-r2")?;
 
     let output = Command::new(harness_exe())
         .args([
@@ -824,7 +949,7 @@ fn case_j_discard_removes_all_changes() -> Result<(), String> {
         &read_file(&ws.join("test.txt"))?,
         "helloworld",
     )?;
-    let after = list_cow_sessions();
+    let after = ex.list_cow_sessions();
     if after.contains(&session2) {
         return Err(format!(
             "session {session2} must be gone from list_cow_sessions() after discard"
@@ -841,9 +966,9 @@ fn case_j_discard_removes_all_changes() -> Result<(), String> {
 /// （既定）でもエディタを起動せず即座に解消される——エディタが起動する分岐（コンフリクトが
 /// 真に重なる場合）はここでは検証しない（Windowsで`notepad.exe`が起動しテストがハングする
 /// リスクを避けるため、既存E2Eの注意事項どおり自動マージ可能なケースに限定する）。
-fn case_k_resolve_auto_merges_non_overlapping_conflict() -> Result<(), String> {
+fn case_k_resolve_auto_merges_non_overlapping_conflict(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-k-resolve");
-    let before = list_cow_sessions();
+    let before = ex.list_cow_sessions();
     let baseline_script = "Set-Content test.txt \"line1`nline2`nline3\" -NoNewline";
     let run1 = run_harness(
         &ws,
@@ -857,7 +982,7 @@ fn case_k_resolve_auto_merges_non_overlapping_conflict() -> Result<(), String> {
             run1.stderr
         ));
     }
-    let session1 = new_cow_session(&before)?;
+    let session1 = ex.new_cow_session(&before)?;
     let report1 = apply_cow(&ws, &session1, None)?;
     if report1["applied"].as_array().map(|a| a.len()).unwrap_or(0) != 1 {
         return Err(format!(
@@ -871,6 +996,7 @@ fn case_k_resolve_auto_merges_non_overlapping_conflict() -> Result<(), String> {
     )?;
 
     let (session2, _) = run_round2(
+        ex,
         &ws,
         "Set-Content test.txt \"line1-cow`nline2`nline3\" -NoNewline",
         "cow-k-r2",
@@ -918,9 +1044,9 @@ fn case_k_resolve_auto_merges_non_overlapping_conflict() -> Result<(), String> {
 /// 再利用し同一セッションIDで継続キャプチャする）。1つの`--sandbox tier2a-cow`セッションで変更を行い
 /// （discardせず）プロセスを終了し、同じセッションIDで`--resume --sandbox tier2a-cow`により再開して
 /// 追加の変更を行い、`apply`で両方の変更が反映されることを確認する。
-fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
+fn case_l_resume_continues_same_cow_session(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-l-resume");
-    let before = list_cow_sessions();
+    let before = ex.list_cow_sessions();
     let run1 = run_harness(
         &ws,
         &write_file_tool_turns("first.txt", "written in round 1"),
@@ -930,7 +1056,7 @@ fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
     if !run1.status.success() {
         return Err(format!("round1 harness invocation failed: {}", run1.stderr));
     }
-    let session_id = new_cow_session(&before)?;
+    let session_id = ex.new_cow_session(&before)?;
     // round1のプロセスは正常終了しdiscardしていない前提（liveness mutexは名前付きmutexで、
     // 所有プロセスの終了とともにOSが解放するため、再開時に「まだliveと誤認識される」ことは
     // 無い、設計書§19.11参照）。
@@ -955,7 +1081,7 @@ fn case_l_resume_continues_same_cow_session() -> Result<(), String> {
         ));
     }
     // resumeは新しいCoWセッションを作らず、同じsession_idのdiff_layer_dirを再利用しているはず。
-    let after_resume = list_cow_sessions();
+    let after_resume = ex.list_cow_sessions();
     if !after_resume.contains(&session_id) {
         return Err(format!(
             "session {session_id} should still exist after resume"
@@ -1009,9 +1135,9 @@ fn cow_session_is_live(session_id: &str) -> bool {
 /// 問題なかった——後者は個別パス指定のオープンだけで完結し列挙を経由しないため）。
 /// この1回の`run_shell`セッション内でNew-Item→Test-Path→Remove-Item→Test-Pathまで完結させ、
 /// commit/discardを一切挟まない。
-fn case_m_new_file_created_and_deleted_within_same_cow_session() -> Result<(), String> {
+fn case_m_new_file_created_and_deleted_within_same_cow_session(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-m-create-delete-same-session");
-    let before = list_cow_sessions();
+    let before = ex.list_cow_sessions();
     let script = "$created = Test-Path newfile.txt; \
 New-Item newfile.txt -ItemType File | Out-Null; \
 $existsAfterCreate = Test-Path newfile.txt; \
@@ -1029,7 +1155,7 @@ deleted = $deleted; err = $err; existsAfterDelete = $existsAfterDelete } | Conve
     if !run.status.success() {
         return Err(format!("harness invocation failed: {}", run.stderr));
     }
-    let session = new_cow_session(&before)?;
+    let session = ex.new_cow_session(&before)?;
     assert_prompt_sane(&run, &["run_shell"])?;
 
     let outcome = parse_json_stdout(&run)?;
@@ -1090,13 +1216,13 @@ deleted = $deleted; err = $err; existsAfterDelete = $existsAfterDelete } | Conve
 /// このケースは1セッション内で、事前に存在するファイル/サブディレクトリとセッション中に
 /// 新規作成したファイルが同じ`Get-ChildItem`結果に揃って現れること・サブディレクトリの列挙も
 /// 動くこと・純粋な読み取りが台帳を汚さないことを検証する。
-fn case_n_ls_merges_preexisting_and_new_files_read_does_not_dirty_ledger() -> Result<(), String> {
+fn case_n_ls_merges_preexisting_and_new_files_read_does_not_dirty_ledger(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-n-ls-merge-and-clean-read");
     std::fs::write(ws.join("seed.txt"), "seed-content").map_err(|e| e.to_string())?;
     std::fs::create_dir(ws.join("sub")).map_err(|e| e.to_string())?;
     std::fs::write(ws.join("sub").join("inner.txt"), "inner-content").map_err(|e| e.to_string())?;
 
-    let before = list_cow_sessions();
+    let before = ex.list_cow_sessions();
     // `Get-Content`の戻り値はPSPath/PSParentPath等のETS(拡張型システム)ノートプロパティ付きの
     // Stringで、そのままpscustomobjectのプロパティへ入れると`ConvertTo-Json`がノートプロパティ
     // ごとシリアライズしてしまう（実行して発見したPowerShellの既知の挙動）。`[string]`へ
@@ -1116,7 +1242,7 @@ $seedContent = [string](Get-Content seed.txt -Raw); \
     if !run.status.success() {
         return Err(format!("harness invocation failed: {}", run.stderr));
     }
-    let session = new_cow_session(&before)?;
+    let session = ex.new_cow_session(&before)?;
     assert_prompt_sane(&run, &["run_shell"])?;
 
     let outcome = parse_json_stdout(&run)?;
@@ -1186,9 +1312,9 @@ $seedContent = [string](Get-Content seed.txt -Raw); \
 /// なお**DLLが注入されなかった/回避された場合**（台帳へ何も書かれない場合）の受け皿は
 /// host側の実体走査であり、そちらは`overlay.rs`のユニットテスト
 /// （`unledgered_*`）が固定している。ここで見るのはDLLが生きている経路の方。
-fn case_o_direct_write_into_the_diff_layer_dir_is_recorded() -> Result<(), String> {
+fn case_o_direct_write_into_the_diff_layer_dir_is_recorded(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-o-direct-diff-layer-write");
-    let before = list_cow_sessions();
+    let before = ex.list_cow_sessions();
     const SCRIPT: &str = "Set-Content (Join-Path $env:HARNESS_COW_DIFF_LAYER 'direct.txt') \
                           'written straight into the diff layer dir' -NoNewline";
     let run = run_harness(
@@ -1200,7 +1326,7 @@ fn case_o_direct_write_into_the_diff_layer_dir_is_recorded() -> Result<(), Strin
     if !run.status.success() {
         return Err(format!("harness invocation failed: {}", run.stderr));
     }
-    let session = new_cow_session(&before)?;
+    let session = ex.new_cow_session(&before)?;
 
     let diff_layer_file = cow_diff_layer_dir(&session).join("direct.txt");
     if !diff_layer_file.exists() {
@@ -1251,6 +1377,7 @@ fn case_o_direct_write_into_the_diff_layer_dir_is_recorded() -> Result<(), Strin
 /// 子には**絶対パス指定の書込**をさせる（当時失敗したのがこの形。cwd相対のopenは別経路を通り、
 /// 綴りが揺れていても成立し得るため、綴りの影響を見るには絶対パスでなければならない）。
 fn run_cwd_spelling_case(
+    ex: &CowExclusive,
     case_name: &str,
     make_cwd_arg: fn(&Path) -> String,
     use_process_cwd: bool,
@@ -1266,12 +1393,13 @@ fn run_cwd_spelling_case(
         .map(PathBuf::from)
         .unwrap_or(real.clone());
     let cwd_arg = make_cwd_arg(&real);
-    assert_cow_redirect_through_cwd(case_name, &real, &cwd_arg, use_process_cwd, &ws)
+    assert_cow_redirect_through_cwd(ex, case_name, &real, &cwd_arg, use_process_cwd, &ws)
 }
 
 /// ケースP〜Tの本体。`ws_root`（実在する実パス）をworkspaceとして`--cwd <cwd_arg>`で
 /// harnessを起動し、境界・透過性・可視性・自己診断の4点を確認する。
 fn assert_cow_redirect_through_cwd(
+    ex: &CowExclusive,
     case_name: &str,
     real: &Path,
     cwd_arg: &str,
@@ -1286,7 +1414,7 @@ fn assert_cow_redirect_through_cwd(
         "Set-Content -LiteralPath '{}' -Value 'modified-by-agent' -NoNewline",
         real.join("notes.txt").display()
     );
-    let before = list_cow_sessions();
+    let before = ex.list_cow_sessions();
     let run = run_harness_full(
         &harness_exe(),
         cwd_arg,
@@ -1301,7 +1429,7 @@ fn assert_cow_redirect_through_cwd(
             run.stdout, run.stderr
         ));
     }
-    let session = new_cow_session(&before)?;
+    let session = ex.new_cow_session(&before)?;
     let diff_layer = cow_diff_layer_dir(&session);
 
     // 1. 境界: workspace本体は不変。
@@ -1356,28 +1484,31 @@ fn assert_cow_redirect_through_cwd(
     Ok(())
 }
 
-fn case_p_cwd_relative() -> Result<(), String> {
-    run_cwd_spelling_case("cow-p-cwd-relative", |_| ".".to_string(), true)
+fn case_p_cwd_relative(ex: &CowExclusive) -> Result<(), String> {
+    run_cwd_spelling_case(ex, "cow-p-cwd-relative", |_| ".".to_string(), true)
 }
 
-fn case_q_cwd_uppercased() -> Result<(), String> {
+fn case_q_cwd_uppercased(ex: &CowExclusive) -> Result<(), String> {
     run_cwd_spelling_case(
+        ex,
         "cow-q-cwd-uppercased",
         |p| p.to_string_lossy().to_uppercase(),
         false,
     )
 }
 
-fn case_r_cwd_trailing_separator() -> Result<(), String> {
+fn case_r_cwd_trailing_separator(ex: &CowExclusive) -> Result<(), String> {
     run_cwd_spelling_case(
+        ex,
         "cow-r-cwd-trailing-sep",
         |p| format!("{}\\", p.to_string_lossy()),
         false,
     )
 }
 
-fn case_s_cwd_verbatim_prefix() -> Result<(), String> {
+fn case_s_cwd_verbatim_prefix(ex: &CowExclusive) -> Result<(), String> {
     run_cwd_spelling_case(
+        ex,
         "cow-s-cwd-verbatim",
         |p| format!(r"\\?\{}", p.to_string_lossy()),
         false,
@@ -1398,7 +1529,7 @@ fn case_s_cwd_verbatim_prefix() -> Result<(), String> {
 /// `CreateProcessW: ディレクトリ名が無効です (0x8007010B)`は、存在する正しいディレクトリを
 /// 指して「無効」と言うため原因に辿り着けません。`preflight`がACEを1本も付ける前に、
 /// 文字数・平台の制限・回避策（`subst`）を名指しして止めることを確認します。
-fn case_t_workspace_path_longer_than_max_path() -> Result<(), String> {
+fn case_t_workspace_path_longer_than_max_path(ex: &CowExclusive) -> Result<(), String> {
     const CASE: &str = "cow-t-longpath";
     let case_root = case_dir(CASE);
     // `C:\harness-e2e\cow-t-longpath` + 41文字×6階層 ＝ 281文字。
@@ -1416,7 +1547,7 @@ fn case_t_workspace_path_longer_than_max_path() -> Result<(), String> {
     }
     println!("MEASUREMENT: long workspace path is {len} chars");
 
-    let before = list_cow_sessions();
+    let before = ex.list_cow_sessions();
     let run = run_harness_full(
         &harness_exe(),
         &deep.to_string_lossy(),
@@ -1447,7 +1578,7 @@ fn case_t_workspace_path_longer_than_max_path() -> Result<(), String> {
         }
     }
     // ACEを付ける前に断っているので、CoWセッションも作られていないこと。
-    let after = list_cow_sessions();
+    let after = ex.list_cow_sessions();
     let leaked: Vec<&String> = after.difference(&before).collect();
     if !leaked.is_empty() {
         return Err(format!(
@@ -1462,20 +1593,11 @@ fn case_t_workspace_path_longer_than_max_path() -> Result<(), String> {
     Ok(())
 }
 
-/// `tier2a_cow_commit_matrix`と`tier2a_net_policy_matrix`は同じテストバイナリ内の別々の
-/// `#[test]`関数であり、既定では別スレッドで並行実行される。両者は共有WFPエンジン・
-/// netfilterdの単一インスタンス・`C:\harness-e2e`を奪い合うため、Q5(機構ごとに1テストで
-/// 直列実行)は各マトリクス内部だけでなくこの2関数間でも保証する必要がある。プロセス内の
-/// 全スレッドが共有する`static Mutex`でロックし、`--test-threads`の指定に関わらず
-/// 直列化する(実機検証で、並行実行時にネットワークマトリクスがWFPの
-/// net_event_collection_enable_failed等で不安定になることを確認した)。
-static CROSS_MATRIX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 #[ignore]
 fn tier2a_cow_commit_matrix() {
-    let _guard = CROSS_MATRIX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let cases: Vec<(&str, CaseFn)> = vec![
+    let ex = cow_exclusive();
+    let cases: Vec<(&str, CowCaseFn)> = vec![
         ("A-new-only", case_a_commit_only_new_file),
         ("B-modify-only", case_b_commit_only_modifications),
         ("C-delete-only", case_c_commit_only_deletion),
@@ -1529,7 +1651,7 @@ fn tier2a_cow_commit_matrix() {
     let mut passed = 0;
     let total = cases.len();
     for (name, f) in cases {
-        if run_named_case(name, f) {
+        if run_named_case(name, || f(&ex)) {
             passed += 1;
         }
     }
@@ -1658,19 +1780,23 @@ git -c safe.directory=* rev-parse HEAD *>> _git-log.txt
 #[test]
 #[ignore]
 fn tier2a_cow_git_commit_writes_objects_under_the_redirector() {
-    if let Err(e) = git_commit_under_cow_probe() {
+    // **BUG-135の修正はこの1行。** CoWセッションを作るテストなのに排他ロックを取っておらず、
+    // `e2e-all`（全件を並行実行）では`tier2a_cow_commit_matrix`と互いのセッションを拾って
+    // 両方落ちていた。単独実行では2本とも緑なので、個別ターゲットだけ回していると見えない。
+    let ex = cow_exclusive();
+    if let Err(e) = git_commit_under_cow_probe(&ex) {
         panic!("{e}");
     }
 }
 
-fn git_commit_under_cow_probe() -> Result<(), String> {
+fn git_commit_under_cow_probe(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-git-injection");
 
     // サンドボックス外で正当なリポジトリを種付け（git がコミット先の `.git` を持つように）。
     git_seed_repo(&ws)?;
 
     // CoW セッションで git だけを使い、コミット＋ref移動を試みる。
-    let before = list_cow_sessions();
+    let before = ex.list_cow_sessions();
     let run = run_harness(
         &ws,
         &run_shell_script_turns(GIT_INJECTION_SCRIPT),
@@ -1683,7 +1809,7 @@ fn git_commit_under_cow_probe() -> Result<(), String> {
             run.stdout, run.stderr
         ));
     }
-    let session = new_cow_session(&before)?;
+    let session = ex.new_cow_session(&before)?;
     let diff_layer = cow_diff_layer_dir(&session);
     let git_log = std::fs::read_to_string(diff_layer.join("_git-log.txt"))
         .unwrap_or_else(|e| format!("(could not read diff_layer/_git-log.txt: {e})"));
@@ -2187,7 +2313,7 @@ fn net_case_09_connect_sni_denied_closes_tunnel() -> Result<(), String> {
 #[test]
 #[ignore]
 fn tier2a_net_policy_matrix() {
-    let _guard = CROSS_MATRIX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ex = cow_exclusive();
     if let Err(e) = liveness_gate() {
         panic!("liveness gate failed, all subsequent cases are indeterminate: {e}");
     }
@@ -3839,7 +3965,7 @@ fn exec_ace_teardown(ws: &Path) {
 #[test]
 #[ignore = "実Tier2a。dev-elevated-runnerの e2e-exec-ace 経由で走らせること"]
 fn tier2a_workspace_exec_runs_but_cannot_reach_the_network() {
-    let _guard = CROSS_MATRIX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ex = cow_exclusive();
     // 宛先はTLSの443を開けている外部ホスト。**中身は取りに行かない**（TCPの接続可否だけを見る）。
     const HOST: &str = "1.1.1.1";
     const PORT: &str = "443";
@@ -3927,7 +4053,7 @@ fn tier2a_workspace_exec_runs_but_cannot_reach_the_network() {
 #[test]
 #[ignore = "実Tier2a。dev-elevated-runnerの e2e-exec-ace 経由で走らせること"]
 fn tier2a_workspace_exec_ace_matrix() {
-    let _guard = CROSS_MATRIX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ex = cow_exclusive();
     let ws = case_dir("exec-ace");
     let python_dir = uv_python_dir();
     if python_dir.is_none() {

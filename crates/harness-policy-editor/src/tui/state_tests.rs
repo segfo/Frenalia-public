@@ -694,15 +694,23 @@ fn progress_is_shown_only_where_it_can_be_measured() {
 /// まとめて届くので、**カウンタをそちらで数えると付与中はずっと0のまま**張り付く
 /// ——実際にそうなっていて、ユーザーに「1件目で固まった」と読まれた。
 /// このテストは「付与の**最中に**カウンタが動く」ことを固定する。
+///
+/// **このテストは自分専用の進捗セルを使う**（[BUG-138](../../../../docs/bugs/BUG-138.md)）。
+/// 製品共有のセルを読んで断言すると、同じテストバイナリの別のテストが並行に書いた値を
+/// 拾って不定期に落ちる。いまは共有セルを読むテストがこの1本しかないので当たっていないが、
+/// **2本目が書かれた日に黙って壊れる**形だった。
 #[test]
 fn the_ace_grant_phase_reports_how_many_of_how_many() {
     use crate::record_net::NetRecordEvent;
-    use harness_sandbox::tier2a::win_appcontainer::passthrough_progress;
+    use harness_sandbox::tier2a::win_appcontainer::passthrough_progress::ProgressCell;
+
+    // 関数内`static`にできるのは`ProgressCell::new()`が`const fn`だから（leakも`Arc`も要らない）。
+    static CELL: ProgressCell = ProgressCell::new();
 
     let ws = workspace();
     let mut app = app_with(&ws);
     app.pass = Pass::Two;
-    app.run = Some(super::RunState::new(Pass::Two));
+    app.run = Some(super::RunState::with_progress(Pass::Two, &CELL));
 
     app.on_worker(WorkerMsg::Pass2(NetRecordEvent::GrantingPassthrough {
         outside_count: 3,
@@ -710,9 +718,9 @@ fn the_ace_grant_phase_reports_how_many_of_how_many() {
 
     // `preflight`が付与フェーズに入り、1件**実際に付与**したところ。
     // **まだ何のイベントも届いていない。**
-    let phase = passthrough_progress::begin(3);
-    passthrough_progress::advance();
-    passthrough_progress::record_granted();
+    let phase = CELL.begin(3);
+    CELL.advance();
+    CELL.record_granted();
     app.drain_worker();
 
     let run = app.run.as_ref().unwrap();
@@ -726,8 +734,8 @@ fn the_ace_grant_phase_reports_how_many_of_how_many() {
 
     // 2件目は既に十分だったので**Win32を1回も呼んでいない**。ここが1件目と区別されて
     // 見えることが、「毎回付け直している」という誤読を防ぐ唯一の手段である。
-    passthrough_progress::advance();
-    passthrough_progress::record_already_sufficient();
+    CELL.advance();
+    CELL.record_already_sufficient();
     app.drain_worker();
     assert_eq!(
         app.run.as_ref().unwrap().phase_detail().as_deref(),
