@@ -29,6 +29,11 @@ pub mod session_profile;
 /// windows専用にしない（名前生成と検証は純粋関数）。
 pub mod mcp_profile;
 
+/// CoWセッションを起こす前に、Redirector DLL 2本（x64・WOW64用x86）の**版がそろっているか**を
+/// 検算する。`session_profile`と同じ理由でwindows専用にしない（走査と突き合わせは純粋関数で、
+/// 他プラットフォームでもコンパイル・テストできる）。
+pub mod redirector_identity;
+
 /// 「付与したACEが台帳に載っているか」の自己検証（BUG-101欠陥①）。突き合わせの判定は
 /// 純粋関数なので、`session_profile`と同じ理由でwindows専用にしない（DACLの実測だけがcfg分岐）。
 pub mod grant_audit;

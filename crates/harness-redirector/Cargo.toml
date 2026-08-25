@@ -12,6 +12,11 @@ edition.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+# D-NN（T-B）: 版の刻印を焼くため。ハッシュ対象のリストは`harness-build-id`が唯一持ち、
+# `harness-sandbox`の build script も同じ関数を呼んで同じ値を期待値として持つ。
+[build-dependencies]
+harness-build-id = { path = "../harness-build-id" }
+
 [target.'cfg(windows)'.dependencies]
 # `retour`はi686（x86、Phase 4b WOW64再注入向け）で0.3系がビルド不能（クレート自体の
 # `impl_hookable!`マクロが`extern "win64"`を`target_arch`ゲート無しで全ターゲットへ展開しようと

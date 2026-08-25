@@ -1074,6 +1074,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-build-id"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "harness-change-ledger"
 version = "0.1.0"
 dependencies = [
@@ -1275,6 +1282,7 @@ dependencies = [
 name = "harness-redirector"
 version = "0.1.0"
 dependencies = [
+ "harness-build-id",
  "harness-change-ledger",
  "retour",
  "serde",
@@ -1289,6 +1297,7 @@ version = "0.1.0"
 dependencies = [
  "cap-std",
  "directories",
+ "harness-build-id",
  "harness-change-ledger",
  "harness-config",
  "harness-core",

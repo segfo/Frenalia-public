@@ -246,6 +246,29 @@ pub fn preflight_with_privhelper_launcher(
     // テストが実マシンのユーザーデータを消してよい理由にはならない）。
     // 掃除は`harness-cli`の起動経路（`startup::sandbox`）が持つ——TUIもheadlessもそこを通り、
     // テストは通らない。
+
+    // [T-B] CoWのときだけ、注入され得るRedirector DLL 2本（x64・WOW64用x86）の版がそろって
+    // いるかを検算する。**そろっていなければセッションを起こさない**（D-75: 隔離が取れないとき
+    // 自動降格せず拒否する。弱い器が要るなら`--sandbox`の値で明示選択する）。
+    //
+    // **位置がこの行である理由**は2つある。
+    //
+    // - `gc_dead_sessions`の**後**: 落ちる機でも死んだセッションの後片付けは進むべきで、
+    //   検算の失敗が回収を止める理由にはならない。
+    // - `begin_session()`の**前**: ここから先はプロファイル作成とACE付与が始まる区間で、
+    //   途中で落ちると撤収経路の無い孤立ACEを残す（BUG-101/B-05と同型）。**副作用を1つも
+    //   起こしていない地点で落とす。**
+    //
+    // CoW以外（`DirectRw`）では検算しない——x86 DLLは32bit孫への透過注入にしか使わないので、
+    // CoWでないセッションの起動条件にすると、無関係な理由でTier2aが使えなくなる。
+    if matches!(write_mode, WorkspaceWriteMode::Cow { .. }) {
+        let x64 = super::redirector_dll_path()?;
+        let x86 = x64.with_file_name(crate::tier2a::redirector_identity::X86_DLL_FILENAME);
+        crate::tier2a::redirector_identity::verify_redirector_set(&x64, &x86)
+            .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
+    }
+    timing.mark("verify_redirector_set");
+
     let profile_name =
         crate::tier2a::session_profile::begin_session().map_err(AppContainerError::Preflight)?;
     // [BUG-101] **この行より後で付けたACEは、必ず台帳と突き合わせてから抜ける。**

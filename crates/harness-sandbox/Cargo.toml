@@ -14,6 +14,10 @@ harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-policy = { version = "0.1.0", path = "../harness-policy" }
 harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
+# D-NN（T-B）: Redirector DLL の版の刻印。build script が期待値を焼くのに使い、
+# 実行時は目印の綴り（`BUILD_ID_MARKER`）と桁数だけを使う。**目印を2箇所で綴らない**
+# ——綴りがずれると走査side が何も見つけられなくなる。
+harness-build-id = { version = "0.1.0", path = "../harness-build-id" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `textdiff`（レビュー面のdiffエンジン）。行単位diffとハンク分割（`grouped_ops`）を提供する。
@@ -23,6 +27,9 @@ serde_json = "1"
 similar = { version = "2", default-features = false, features = ["text"] }
 thiserror = "2.0.18"
 tempfile = "3.27.0"
+
+[build-dependencies]
+harness-build-id = { version = "0.1.0", path = "../harness-build-id" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 which = "7"

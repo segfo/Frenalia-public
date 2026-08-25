@@ -1,0 +1,16 @@
+[package]
+name = "harness-build-id"
+version.workspace = true
+edition.workspace = true
+
+# Redirector DLL（x64 / WOW64向けx86）が「同じソースから作られた組」かを判定するための
+# 版の刻印を計算する。**build script専用**——`[build-dependencies]`として
+# `harness-redirector`（DLLへ刻む側）と`harness-sandbox`（起動時に照合する側）の
+# 両方から使う。
+#
+# 実装を1本にしてあるのは、同じハッシュ対象リストを2つの`build.rs`へ書き写すと
+# 片方だけ更新されて必ずずれるため（`bug-pattern-rules` B-01「対の片方だけ実装する」）。
+# ここが唯一の正本で、どちらのbuild scriptもリストを持たない。
+
+[dependencies]
+sha2 = "0.10"

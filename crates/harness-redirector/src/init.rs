@@ -475,6 +475,27 @@ pub unsafe extern "system" fn harness_cow_init(param: *mut c_void) -> u32 {
     }
 }
 
+/// この DLL が**どのソースから作られたか**を示す刻印。`HRBUILDID:` + 64 桁の 16 進 + NUL。
+///
+/// 値は build script が `harness-build-id` に計算させたもので、**x64 と x86 で同じソースなら
+/// 同じ値**になる（アーキテクチャを混ぜていない）。起動側（`harness-sandbox`）は 2 本の DLL の
+/// ファイルを読んでこの目印を走査し、互いに、そして harness 本体に焼いた期待値と一致するかを
+/// 見る。一致しなければ CoW セッションを起こさない。
+///
+/// **PE を解析せずバイト走査で拾える形**にしてあるのは、照合側が x64 と x86 の両方を同じ
+/// コードで扱えるようにするため（エクスポートテーブルの構造は 32/64 で違う）。
+const BUILD_ID_BLOB: &str = concat!("HRBUILDID:", env!("HARNESS_REDIRECTOR_BUILD_ID"), "\0");
+
+/// [`BUILD_ID_BLOB`] を**エクスポート関数から参照させる**ためだけの関数。
+///
+/// 参照が無いと、定数はどこからも使われない文字列として最適化で消え得る。消えると走査側は
+/// 「刻印が無い」と判断して fail-closed する——安全側ではあるが、正しくビルドした DLL が
+/// 常に弾かれることになるので、ここで参照を固定しておく。
+#[unsafe(no_mangle)]
+pub extern "system" fn harness_cow_build_id() -> *const u8 {
+    BUILD_ID_BLOB.as_ptr()
+}
+
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
 extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c_void) -> i32 {

@@ -38,10 +38,15 @@ fn apply_cow(
 use std::sync::Mutex;
 
 /// `cow_write_from_wow64_grandchild_process_is_redirected_to_diff_layer`と
-/// `cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning`は、テストバイナリの
-///隣にある`harness_redirector_x86.dll`という単一の共有ファイルを読む/一時的にリネームする。
+/// `cow_wow64_grandchild_without_x86_dll_at_injection_time_fails_closed_with_warning`は、
+/// テストバイナリの隣にある`harness_redirector_x86.dll`という単一の共有ファイルを読む/
+/// 一時的にリネームする。
 /// `cargo test`は既定で`#[test]`関数を並行実行するため、この2つを直列化しないと片方が
 /// リネーム中にもう片方が「ファイルが見つからない」で誤って失敗し得る（実機で確認済み）。
+///
+/// **[T-B] リネームはCoWセッションの開始判定にも影響する。** 版の検算
+/// （`crate::tier2a::redirector_identity`）は`preflight`の中で走るので、退避中に別のテストが
+/// `preflight`を呼ぶと「x86が無い」で拒否される。この直列化はその取り合いも同時に防いでいる。
 static WOW64_DLL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 const COW_WRITE_PROBE_COMMAND: &str = "\
@@ -801,39 +806,49 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_diff_layer() {
     );
 }
 
-/// Phase 4b失敗系: x86版Redirector DLL（`harness_redirector_x86.dll`）が存在しない場合、
-/// WOW64孫プロセスへの注入は失敗するが、孫プロセスの生成自体は拒否されず（Q6）、書込みは
-/// workspaceのACLでfail-closeし（transparent性の欠如のみ）、警告台帳に理由が記録されること。
-/// このテストは`harness_redirector_x86.dll`を一時的にリネームして実行する。
+/// Phase 4b失敗系: x86版Redirector DLL（`harness_redirector_x86.dll`）が**注入の時点で**
+/// 存在しない場合、WOW64孫プロセスへの注入は失敗するが、孫プロセスの生成自体は拒否されず（Q6）、
+/// 書込みはworkspaceのACLでfail-closeし（transparent性の欠如のみ）、警告台帳に理由が記録されること。
+///
+/// **[T-B] リネームの窓は`preflight`より後**である。CoWセッションの開始時に2本の版がそろって
+/// いるかを検算する関所が入ったため（`crate::tier2a::redirector_identity`）、開始前に退避すると
+/// `preflight`自身が拒否してこのテストの本題（孫の注入が失敗したときの振る舞い）まで到達しない。
+///
+/// **つまりこのテストが測るのは「セッション開始後に透過役が使えなくなった場合」**であり、
+/// 「x86 DLLを一度も作っていない場合」ではない。後者は関所が起動ごと拒否するので、そちらの
+/// 判定は`redirector_identity`の単体テストが持つ。2つは別の事象で、片方は他方を含まない。
 #[test]
 #[ignore]
-fn cow_wow64_grandchild_without_x86_dll_fails_closed_with_warning() {
+fn cow_wow64_grandchild_without_x86_dll_at_injection_time_fails_closed_with_warning() {
     let _lock = WOW64_DLL_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
 
-    let current = std::env::current_exe().expect("current_exe");
-    let dir = current.parent().expect("current_exe has parent");
-    let x86_dll = dir.join("harness_redirector_x86.dll");
-    let x86_dll_backup = dir.join("harness_redirector_x86.dll.disabled-for-test");
-    let had_x86_dll = x86_dll.exists();
-    if had_x86_dll {
-        std::fs::rename(&x86_dll, &x86_dll_backup).expect("temporarily rename x86 dll");
-    }
-    // パニックしても必ずリネームを戻す。
-    let restore = scopeguard(|| {
-        if had_x86_dll {
-            let _ = std::fs::rename(&x86_dll_backup, &x86_dll);
-        }
-    });
-
     let sid = session_sid();
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
+    // 関所を通す側。ここではまだ2本そろっている（そろっていなければ、そのこと自体が
+    // このテストの前提を満たさないので`expect`で落ちるのが正しい）。
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+
+    let current = std::env::current_exe().expect("current_exe");
+    let dir = current.parent().expect("current_exe has parent");
+    let x86_dll = dir.join(crate::tier2a::redirector_identity::X86_DLL_FILENAME);
+    let x86_dll_backup = dir.join("harness_redirector_x86.dll.disabled-for-test");
+    let had_x86_dll = x86_dll.exists();
+    assert!(
+        had_x86_dll,
+        "this test needs the x86 redirector DLL to exist so it can take it away *after* the \
+         session starts; build it with tools/build-redirector-x86.ps1"
+    );
+    std::fs::rename(&x86_dll, &x86_dll_backup).expect("temporarily rename x86 dll");
+    // パニックしても必ずリネームを戻す。
+    let restore = scopeguard(|| {
+        let _ = std::fs::rename(&x86_dll_backup, &x86_dll);
+    });
 
     const CMD: &str = "\
         C:\\Windows\\SysWOW64\\cmd.exe /c \"echo should-not-appear-in-diff_layer>should_not_exist.txt\"; \
