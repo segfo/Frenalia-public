@@ -32,6 +32,9 @@ type CaseFn = fn() -> Result<(), String>;
 /// [`CaseFn`]を替えずに別の型を立てているのは、あちらを6つの行列が共有していて、
 /// 替えるとCoWと無関係なケースまで巻き込むため。
 type CowCaseFn = fn(&CowExclusive) -> Result<(), String>;
+/// fs passthrough台帳を触るケース。**札を引数で受け取る**——受け取れない形にすると、
+/// 呼ぶ側が札を取り忘れても書けてしまう（[`CowCaseFn`]と同じ理由、BUG-135）。
+type FsLedgerCaseFn = fn(&FsLedgerExclusive) -> Result<(), String>;
 
 fn harness_exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_harness"))
@@ -278,23 +281,62 @@ fn assert_prompt_sane(run: &HarnessRun, must_contain: &[&str]) -> Result<(), Str
     Ok(())
 }
 
-fn parse_json_stdout(run: &HarnessRun) -> Result<serde_json::Value, String> {
-    serde_json::from_str(run.stdout.trim()).map_err(|e| {
-        format!(
-            "stdout is not valid JSON: {e}\nstdout={}\nstderr={}",
-            run.stdout, run.stderr
-        )
-    })
+/// `harness.exe --output-format json`の標準出力（`JsonOutcome`、`harness-cli/src/lib.rs`）。
+///
+/// **`Display`・`to_string`を意図的に実装していない**（[BUG-137](../../../docs/bugs/BUG-137.md)）。
+/// このJSONには、子プロセスが**返した**結果（`tool_calls[].result`）と、子プロセスへ
+/// **渡した**入力（`tool_calls[].input.command`＝実行したスクリプト本文）が**同居している**。
+/// JSON全体を文字列にして`contains`に掛けると、探している語がスクリプト本文の側に当たり、
+/// **子が何をしようと必ず真**になる。実際`WRITE=DENIED`・`DELETE=OK`・`MOVE=OK`の3判定が
+/// 長期間そうなっており、`--fs-allow`の回帰（BUG-136）が2週間気付かれなかった一因になった。
+///
+/// 対策は「`contains`の前に一度考える」という規律ではなく、**探す先を選べなくすること**
+/// （BUG-135の[`CowExclusive`]と同じ形）。見てよい場所は下の2つだけである。
+struct Outcome(serde_json::Value);
+
+impl Outcome {
+    /// 子プロセスが返したstdout（`tool_calls[0].result`）。**振る舞いのassertはここに当てる。**
+    ///
+    /// 呼び出し側が`?`でも`panic!`でも受けられるよう`Result`を返す。エラー文言をここが
+    /// 1つだけ持つので、生JSONを各呼び出し側でフォーマットする必要は無い。
+    fn first_tool_result(&self) -> Result<&str, String> {
+        self.0["tool_calls"]
+            .get(0)
+            .and_then(|c| c["result"].as_str())
+            .ok_or_else(|| format!("no tool_calls[0].result in outcome: {}", self.0))
+    }
+
+    /// モデルの最終応答文（トップレベルの`result`）。認知レイヤーが組み立てた回答文を
+    /// 見たいときはこちら——子プロセスのstdoutとは別物である。
+    fn answer(&self) -> &str {
+        self.0["result"].as_str().unwrap_or_default()
+    }
+
+    // 生JSONを返すメソッドは**置かない**。いま誰も要らないうえ、置けば
+    // `raw().to_string().contains(..)`でBUG-137がそのまま復活する口になる。
+    // 必要になった時点で、用途を限定した名前のメソッドとして足すこと。
+}
+
+fn parse_json_stdout(run: &HarnessRun) -> Result<Outcome, String> {
+    serde_json::from_str(run.stdout.trim())
+        .map(Outcome)
+        .map_err(|e| {
+            format!(
+                "stdout is not valid JSON: {e}\nstdout={}\nstderr={}",
+                run.stdout, run.stderr
+            )
+        })
 }
 
 // --- 共有資源の排他（[BUG-135](../../../docs/bugs/BUG-135.md)） ---------------------------
 //
 // 同じテストバイナリの`#[test]`は既定で別スレッドに並行実行される。このE2Eには
-// **プロセスをまたいで共有されるもの**が3種類あり、同時に触ると互いを壊す。
+// **プロセスをまたいで共有されるもの**が4種類あり、同時に触ると互いを壊す。
 //
 //   1. 共有WFPエンジンとnetfilterdの単一インスタンス（ネットワーク行列）
 //   2. ワークスペースの置き場 `C:\harness-e2e`
 //   3. **このマシン上のCoWセッション（差分層）の一覧**
+//   4. **`%APPDATA%\harness\config\fs-passthrough-ledger.json`**（[`FsLedgerExclusive`]が守る）
 //
 // 3番目が、長らく説明書きに**書かれていなかった**もの。各ケースは「起動の前後で一覧を
 // 見比べて、増えた1件が自分のもの」という方法で自分のセッションを特定する
@@ -308,10 +350,27 @@ fn parse_json_stdout(run: &HarnessRun) -> Result<serde_json::Value, String> {
 //   (a) 一覧を読む側は[`CowExclusive`]のメソッドにした——札が無いと**そもそも書けない**
 //   (b) 一覧を読まずにセッションを`作るだけ`の側は型で縛れないので、作る唯一の入口
 //       （[`run_harness_full`]）に[`assert_cow_exclusive_held`]を置いた
+//
+// 4番目（台帳）は、**規約は書かれていたが機構が無かった**もの。`KNOWN_TARGETS`の
+// `e2e-fs-ledger`には「保護対象の`fs-passthrough-ledger.json`を触るため、他のE2Eと同時に
+// 走らせない」と書いてあるが、`e2e-all`は全件を既定の並列度で回すので**その規約は
+// 誰にも守られていなかった**。`tier2a_fs_allow_matrix`と`tier2a_fs_ledger_lifecycle`が
+// 同じ1ファイルへ無ロックのread-modify-writeを撃ち合い、(i) read-only属性の解除と再付与が
+// 交差して書込が失敗する、(ii) 片方が読んだ古い内容を書き戻して相手のタグを復活させる、
+// の2つが起きる。**規約を機構へ変える**のが[`FsLedgerExclusive`]で、台帳を読む/書く手段を
+// その札のメソッドだけにしてある（(a)と同じ形）。
+//
+// **[`CowExclusive`]とは別のロックにしてある。** 守っている資源が違い、いま台帳を触る
+// 2本はどちらもCoWセッションを作らないので、両方を同時に取るテストは存在しない
+// （＝ロック順序による相互待ちが起きない）。両方が要るテストを書くときは、
+// **必ず`cow_exclusive()`→`fs_ledger_exclusive()`の順**で取ること。
 
-/// 上記3種類の共有資源を直列化するロック。実機検証で、並行実行時にネットワーク行列が
+/// 上記1〜3の共有資源を直列化するロック。実機検証で、並行実行時にネットワーク行列が
 /// `net_event_collection_enable_failed`等で不安定になることを確認している。
 static CROSS_MATRIX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 上記4（fs passthrough台帳）を直列化するロック。
+static FS_LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// いま[`CowExclusive`]を持っているスレッド。
 ///
@@ -1159,10 +1218,7 @@ deleted = $deleted; err = $err; existsAfterDelete = $existsAfterDelete } | Conve
     assert_prompt_sane(&run, &["run_shell"])?;
 
     let outcome = parse_json_stdout(&run)?;
-    let result_text = outcome["tool_calls"]
-        .get(0)
-        .and_then(|c| c["result"].as_str())
-        .ok_or_else(|| format!("no tool_calls[0].result in outcome: {outcome}"))?;
+    let result_text = outcome.first_tool_result()?;
     // ネットワーク診断ログ等、無関係な行がstdoutへ混入し得る（実機確認: fake DNSの
     // 診断行）ため、他ケース（`net_case_matrix`系）と同じく「JSONとして解釈できて
     // 目的のキーを持つ最後の行」を探す（単純な「最後の非空行」だと診断行を誤って
@@ -1246,10 +1302,7 @@ $seedContent = [string](Get-Content seed.txt -Raw); \
     assert_prompt_sane(&run, &["run_shell"])?;
 
     let outcome = parse_json_stdout(&run)?;
-    let result_text = outcome["tool_calls"]
-        .get(0)
-        .and_then(|c| c["result"].as_str())
-        .ok_or_else(|| format!("no tool_calls[0].result in outcome: {outcome}"))?;
+    let result_text = outcome.first_tool_result()?;
     let report: serde_json::Value = result_text
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -1989,10 +2042,7 @@ fn run_net_case_with_exe_and_stderr_check(
     let outcome = parse_json_stdout(&run)?;
     // `outcome["result"]`はモデルの最終応答文（このテストではend_turnの固定文字列"done"）で、
     // run_shellの実際のstdoutは`tool_calls[0].result`にある(`JsonToolCall`、`harness-cli/src/lib.rs`)。
-    let result_text = outcome["tool_calls"]
-        .get(0)
-        .and_then(|c| c["result"].as_str())
-        .ok_or_else(|| format!("no tool_calls[0].result in outcome: {outcome}"))?;
+    let result_text = outcome.first_tool_result()?;
 
     // case-matrixバイナリ自身が最終行で{"passed":true/false,...}を出す(expect_ok一致判定)。
     let case_matrix_passed = result_text
@@ -2227,10 +2277,7 @@ fn run_net_probe_script(
     }
     assert_prompt_sane(&run, &["run_shell"])?;
     let outcome = parse_json_stdout(&run)?;
-    let result_text = outcome["tool_calls"]
-        .get(0)
-        .and_then(|c| c["result"].as_str())
-        .ok_or_else(|| format!("no tool_calls[0].result in outcome: {outcome}"))?;
+    let result_text = outcome.first_tool_result()?;
     let last_json = result_text
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -2379,12 +2426,18 @@ fn fs_allow_case_dir(name: &str) -> PathBuf {
 
 /// ROで許可したエントリは**読めて書けない**。境界はACLなので、書込は子プロセスの側で
 /// `ACCESS_DENIED`にならなければならない。
-fn fs_allow_case_ro_reads_but_cannot_write() -> Result<(), String> {
+///
+/// **宣言は`<path>\**`（配下まで）である**——D-63で「素のパスはそのオブジェクト1個だけ」に
+/// 変わったため、配下の`secret.txt`を開くには`**`が要る（[BUG-136](../../../docs/bugs/BUG-136.md)）。
+/// **この追随だけでは足りない**: `**`付きに揃えると、D-63の本体（素のパス＝オブジェクト単体）を
+/// 誰も測らなくなり、スコープ判定が全部再帰へ退化しても緑のままになる。対になる
+/// [`fs_allow_case_bare_path_grants_the_object_only`]が素のパスの側を固定している。
+fn fs_allow_case_ro_reads_but_cannot_write(ledger: &FsLedgerExclusive) -> Result<(), String> {
     let ws = case_dir("fs-allow-ro");
     let target = fs_allow_case_dir("ro");
     std::fs::write(target.join("secret.txt"), "readable").map_err(|e| e.to_string())?;
 
-    let allow = format!("{}", target.display());
+    let allow = format!(r"{}\**", target.display());
     // PowerShellはパス区切りに`/`を受け付ける。Rustの文字列・シェル・PowerShellの3段で
     // バックスラッシュを重ねるとエスケープ事故になるので、スクリプト内では`/`で書く。
     let t = target.display().to_string().replace('\\', "/");
@@ -2401,7 +2454,9 @@ fn fs_allow_case_ro_reads_but_cannot_write() -> Result<(), String> {
         "fs-allow-ro",
     );
     let json = parse_json_stdout(&run)?;
-    let text = json.to_string();
+    // 子が**返した**stdoutだけを見る。JSON全体を見ると、子へ**渡した**スクリプト本文
+    // （`WRITE=DENIED`をリテラルで含む）にも当たって判定が素通しになる（BUG-137）。
+    let text = json.first_tool_result()?;
     if !text.contains("READ=readable") {
         return Err(format!("read-only fs-allow entry was not readable: {text}"));
     }
@@ -2418,7 +2473,7 @@ fn fs_allow_case_ro_reads_but_cannot_write() -> Result<(), String> {
     // 台帳から自分のエントリを落としてから消す。`--fs-allow`由来のエントリは
     // `settings_managed`が立たずD-27の自動撤収対象にならないので、放っておくと
     // 実在しないパスを指す残骸が保護対象の台帳へ溜まり続ける（実機で21件溜まっていた）。
-    purge_fs_ledger_entries(&[&target]);
+    ledger.purge_entries(&[&target]);
     let _ = std::fs::remove_dir_all(&target);
     cleanup_on_success(&ws, &[], "fs-allow-ro");
     Ok(())
@@ -2429,14 +2484,19 @@ fn fs_allow_case_ro_reads_but_cannot_write() -> Result<(), String> {
 /// 削除と移動はD-45（`--fs-allow`の祖先へtraverseを付与する）が入るまで失敗していた
 /// （RESULTS.md §19.2）。この2操作は祖先ディレクトリを通過ではなく**オープン**するため、
 /// 対象自身へのACEだけでは足りない。**このケースがD-45の製品経路での回帰テストである。**
-fn fs_allow_case_rw_can_write_delete_and_move() -> Result<(), String> {
+///
+/// 宣言が`<path>\**:rw`である理由と、それだけでは足りない理由は
+/// [`fs_allow_case_ro_reads_but_cannot_write`]と同じ（D-63／BUG-136）。
+/// パーサは`strip_suffix(":rw")`（`cli/startup/sandbox.rs`）なので、
+/// `<path>\**:rw`は`path=<path>\**`＋ReadWriteに割れる。
+fn fs_allow_case_rw_can_write_delete_and_move(ledger: &FsLedgerExclusive) -> Result<(), String> {
     let ws = case_dir("fs-allow-rw");
     let target = fs_allow_case_dir("rw");
     std::fs::write(target.join("to-delete.txt"), "bye").map_err(|e| e.to_string())?;
     std::fs::write(target.join("to-move.txt"), "move me").map_err(|e| e.to_string())?;
     std::fs::create_dir_all(target.join("dest")).map_err(|e| e.to_string())?;
 
-    let allow = format!("{}:rw", target.display());
+    let allow = format!(r"{}\**:rw", target.display());
     let t = target.display().to_string().replace('\\', "/");
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
@@ -2454,7 +2514,9 @@ fn fs_allow_case_rw_can_write_delete_and_move() -> Result<(), String> {
         "fs-allow-rw",
     );
     let json = parse_json_stdout(&run)?;
-    let text = json.to_string();
+    // 子が**返した**stdoutだけを見る（BUG-137）。JSON全体だと、子へ**渡した**スクリプト本文が
+    // `DELETE=OK`・`MOVE=OK`をリテラルで含むので、この3判定は子が何をしても真になっていた。
+    let text = json.first_tool_result()?;
     for expected in ["WRITE=OK", "DELETE=OK", "MOVE=OK"] {
         if !text.contains(expected) {
             return Err(format!(
@@ -2473,9 +2535,88 @@ fn fs_allow_case_rw_can_write_delete_and_move() -> Result<(), String> {
     // 台帳から自分のエントリを落としてから消す。`--fs-allow`由来のエントリは
     // `settings_managed`が立たずD-27の自動撤収対象にならないので、放っておくと
     // 実在しないパスを指す残骸が保護対象の台帳へ溜まり続ける（実機で21件溜まっていた）。
-    purge_fs_ledger_entries(&[&target]);
+    ledger.purge_entries(&[&target]);
     let _ = std::fs::remove_dir_all(&target);
     cleanup_on_success(&ws, &[], "fs-allow-rw");
+    Ok(())
+}
+
+/// **素のパス（`**`無し）は、そのオブジェクト1個だけを開く**（D-63、
+/// `plans/DESIGN-SANDBOX-APPPOLICY.md`）。上の2ケースを`**`付きへ揃えたことで空いた穴を
+/// 埋めるのがこのケースである（[BUG-136](../../../docs/bugs/BUG-136.md)のC2）。
+///
+/// **これが無いと、スコープ判定が全部`Recursive`へ退化しても行列は緑のまま**になる——
+/// 「赤いテストを、確かめている中身を減らすことで緑にする」型（[BUG-088]）そのもの。
+///
+/// 許可側と禁止側を対で固定する（`B-35`）。**両方とも実測に基づく**——BUG-136が残した証跡で、
+/// ディレクトリ1個への非継承ACEでは「新規ファイルは作れるが、既存の子ファイルは開けない」
+/// ことが確認されている（`fs_access_mask`の`ReadWrite`は`FILE_DELETE_CHILD`を含まない）。
+///
+/// | 見るもの | 期待 | これが崩れると何が壊れたと言えるか |
+/// |---|---|---|
+/// | 子が`new.txt`を作れる | できる | 素のパスの付与自体が効いていない（機構が死んでいる） |
+/// | 子が`existing.txt`の中身を得られない | 得られない | スコープが再帰へ退化し、宣言より広く開いている |
+fn fs_allow_case_bare_path_grants_the_object_only(ledger: &FsLedgerExclusive) -> Result<(), String> {
+    let ws = case_dir("fs-allow-bare");
+    let target = fs_allow_case_dir("bare");
+    // 中身は子の出力に現れてはならない印。ラベルではなく**中身そのもの**を探すことで、
+    // 「拒否された」と「空を読めた」を区別せずに『子へ渡っていない』だけを固定できる。
+    std::fs::write(target.join("existing.txt"), "keepme").map_err(|e| e.to_string())?;
+
+    // `**`を**付けない**のがこのケースの主題。`:rw`だけを付ける。
+    let allow = format!("{}:rw", target.display());
+    let t = target.display().to_string().replace('\\', "/");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         try {{ Set-Content -LiteralPath '{t}/new.txt' -Value 'created' -ErrorAction Stop; \
+           Write-Output 'CREATE=OK' }} catch {{ Write-Output 'CREATE=FAIL' }}; \
+         try {{ $r = Get-Content -LiteralPath '{t}/existing.txt' -Raw -ErrorAction Stop; \
+           Write-Output ('READCHILD=OK:' + $r) }} catch {{ Write-Output 'READCHILD=DENIED' }}"
+    );
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(&script),
+        &["--fs-allow", &allow],
+        "fs-allow-bare",
+    );
+    let json = parse_json_stdout(&run)?;
+    let text = json.first_tool_result()?;
+
+    // 許可側: ディレクトリ自身への非継承ACEは効いている。
+    if !text.contains("CREATE=OK") {
+        return Err(format!(
+            "a bare `--fs-allow <dir>:rw` must still grant the directory object itself \
+             (new files can be created in it): {text}"
+        ));
+    }
+    // `B-12`型の穴を塞ぐ: 2文目まで到達したことを確かめてから「読めなかった」を主張する。
+    // 途中でスクリプトが死んでいれば、以降は何でも「拒否された」に見える。
+    if !text.contains("READCHILD=") {
+        return Err(format!(
+            "the probe script did not reach the read step, so 'the child could not read it' \
+             cannot be concluded: {text}"
+        ));
+    }
+    // 禁止側（D-63の本体）: 配下の中身は子へ渡らない。
+    if text.contains("keepme") {
+        return Err(format!(
+            "D-63 violated: a bare `--fs-allow <dir>` must grant the object only, but the child \
+             read the contents of a file *under* it -- the declared scope has degraded to \
+             recursive: {text}"
+        ));
+    }
+    if !target.join("new.txt").exists() {
+        return Err("the child reported CREATE=OK but new.txt is not on disk".to_string());
+    }
+    // 子が書き換えていないことも見る（読めなかったのであって、壊したのではない）。
+    let still = std::fs::read_to_string(target.join("existing.txt")).map_err(|e| e.to_string())?;
+    if still != "keepme" {
+        return Err(format!("existing.txt was modified by the child: {still:?}"));
+    }
+
+    ledger.purge_entries(&[&target]);
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup_on_success(&ws, &[], "fs-allow-bare");
     Ok(())
 }
 
@@ -2483,7 +2624,7 @@ fn fs_allow_case_rw_can_write_delete_and_move() -> Result<(), String> {
 /// 不変条件として明記）。BUG-057は「昇格経由の付与がsession ledgerに載らず、
 /// `end_session`の自動撤収から漏れる」欠陥だった——`harness fs revoke`は効くので気付きにくい。
 /// harnessプロセスが終了した後に対象へAppContainer SIDのACEが残っていないことを確かめる。
-fn fs_allow_case_ace_is_revoked_when_the_session_ends() -> Result<(), String> {
+fn fs_allow_case_ace_is_revoked_when_the_session_ends(ledger: &FsLedgerExclusive) -> Result<(), String> {
     let ws = case_dir("fs-allow-revoke");
     let target = fs_allow_case_dir("revoke");
     std::fs::write(target.join("f.txt"), "x").map_err(|e| e.to_string())?;
@@ -2521,7 +2662,7 @@ fn fs_allow_case_ace_is_revoked_when_the_session_ends() -> Result<(), String> {
     // 台帳から自分のエントリを落としてから消す。`--fs-allow`由来のエントリは
     // `settings_managed`が立たずD-27の自動撤収対象にならないので、放っておくと
     // 実在しないパスを指す残骸が保護対象の台帳へ溜まり続ける（実機で21件溜まっていた）。
-    purge_fs_ledger_entries(&[&target]);
+    ledger.purge_entries(&[&target]);
     let _ = std::fs::remove_dir_all(&target);
     cleanup_on_success(&ws, &[], "fs-allow-revoke");
     Ok(())
@@ -2530,7 +2671,11 @@ fn fs_allow_case_ace_is_revoked_when_the_session_ends() -> Result<(), String> {
 #[test]
 #[ignore]
 fn tier2a_fs_allow_matrix() {
-    let cases: Vec<(&str, CaseFn)> = vec![
+    // `--fs-allow`は`fs-passthrough-ledger.json`へエントリを足し、各ケースは後始末で
+    // そこから自分の分を落とす。**札はテスト関数の全体で持つ**——ケース単位に縮めると、
+    // ケースとケースの間に隣（`tier2a_fs_ledger_lifecycle`）が割り込める。
+    let ledger = fs_ledger_exclusive();
+    let cases: Vec<(&str, FsLedgerCaseFn)> = vec![
         (
             "ro-reads-but-cannot-write",
             fs_allow_case_ro_reads_but_cannot_write,
@@ -2538,6 +2683,13 @@ fn tier2a_fs_allow_matrix() {
         (
             "rw-write-delete-move",
             fs_allow_case_rw_can_write_delete_and_move,
+        ),
+        // 上2本は`<path>\**`（配下まで）を宣言する。この1本だけが**素のパス**を宣言し、
+        // D-63の本体（オブジェクト単体）を測る。対で置かないと、上2本を`**`付きに
+        // 追随させた時点でD-63を誰も測らなくなる（BUG-136）。
+        (
+            "bare-path-grants-the-object-only",
+            fs_allow_case_bare_path_grants_the_object_only,
         ),
         (
             "ace-revoked-at-session-end",
@@ -2547,7 +2699,7 @@ fn tier2a_fs_allow_matrix() {
     let mut passed = 0;
     let total = cases.len();
     for (name, f) in cases {
-        if run_named_case(name, f) {
+        if run_named_case(name, || f(&ledger)) {
             passed += 1;
         }
     }
@@ -2892,7 +3044,10 @@ fn mcp_case_real_server_corroborates_a_local_observation() -> Result<(), String>
     let revoked = mcp_approval(&ws, "revoke");
 
     let json = parse_json_stdout(&run)?;
-    let text = json.to_string();
+    // 探す語はどちらも**最終応答文**に着地する（`corroborated`は`Grade::Corroborated`のラベル、
+    // 「MCP裏取り不可」は`hiv/answer.rs`が本文へ書く注記）。JSON全体を見ると、無関係な
+    // ツール入力にも当たり得る（BUG-137）。
+    let text = json.answer();
     revoked?;
 
     if !recorded_requests_offer_tool(&run, MCP_SEARCH_TOOL)? {
@@ -2927,7 +3082,8 @@ fn mcp_case_without_the_declaration_it_stays_single_source() -> Result<(), Strin
     let run = run_cognition_harness(&ws, "mcp-single-source");
 
     let json = parse_json_stdout(&run)?;
-    let text = json.to_string();
+    // 上のケースと対称に、最終応答文だけを見る（BUG-137）。
+    let text = json.answer();
 
     if recorded_requests_offer_tool(&run, MCP_SEARCH_TOOL)? {
         return Err(format!(
@@ -3010,7 +3166,78 @@ fn fs_passthrough_ledger_path() -> PathBuf {
         .join("fs-passthrough-ledger.json")
 }
 
+/// マシン全体で1つしか無いfs passthrough台帳を触ってよいことの証。
+/// **取得手段は[`fs_ledger_exclusive`]だけ**で、台帳を読む／書く手段はこの型のメソッドだけ。
+///
+/// 札を持たないと呼べない形にしてあるのは、`e2e-all`が全件を並行実行するため
+/// （上の「共有資源の排他」節の4番）。札は**ケース単位ではなくテスト関数の全体**で持つ——
+/// [`FsLedgerExclusive::entry_for`]で観測した状態は次の`harness.exe`起動まで保たれている
+/// 必要があり、1呼び出しだけを直列化しても意味が無い。
+struct FsLedgerExclusive {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+/// 台帳を触ってよいことの証を取る。**取得手段はこの関数だけ**である。
+fn fs_ledger_exclusive() -> FsLedgerExclusive {
+    FsLedgerExclusive {
+        _guard: FS_LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+    }
+}
+
+impl FsLedgerExclusive {
+    /// 台帳から`target`のエントリを引く。無ければ`None`。
+    fn entry_for(&self, target: &Path) -> Result<Option<(bool, Vec<String>)>, String> {
+        let key = target.to_string_lossy().to_string();
+        Ok(read_fs_ledger_entries()?
+            .into_iter()
+            .find(|(p, _, _)| *p == key)
+            .map(|(_, managed, ws)| (managed, ws)))
+    }
+
+    /// 台帳を汚したまま終わらないための後始末。`harness fs revoke <path>`は撤収できたときだけ
+    /// エントリを消すので、ディレクトリを消した後だと残ることがある。テストが足したエントリは
+    /// テストが責任を持って落とす。
+    ///
+    /// **台帳ファイルはread-only属性付きで書かれている**（`harness-grant-ledger`の
+    /// 「誤削除防止の2層」）。素の`std::fs::write`は黙って失敗するので、本体と同じく
+    /// 解除→書込→再付与の順で触る。この3手が**分割できない**ことが、札を要求する直接の理由——
+    /// 隣が同時に再付与すると、こちらの`write`が「アクセスが拒否されました」で落ちる。
+    fn purge_entries(&self, targets: &[&Path]) {
+        let path = fs_passthrough_ledger_path();
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&data) else {
+            return;
+        };
+        let keys: HashSet<String> = targets
+            .iter()
+            .map(|t| t.to_string_lossy().to_string())
+            .collect();
+        if let Some(entries) = json.get_mut("entries").and_then(|v| v.as_array_mut()) {
+            entries.retain(|e| {
+                !e.get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| keys.contains(p))
+                    .unwrap_or(false)
+            });
+        }
+        let Ok(text) = serde_json::to_string_pretty(&json) else {
+            return;
+        };
+        set_ledger_readonly(&path, false);
+        let wrote = std::fs::write(&path, text).is_ok();
+        set_ledger_readonly(&path, true);
+        assert!(
+            wrote,
+            "failed to purge test entries from {}",
+            path.display()
+        );
+    }
+}
+
 /// 台帳の`entries`を`(path, settings_managed, settings_workspaces)`で読み出す。
+/// **[`FsLedgerExclusive`]のメソッドからのみ呼ぶこと**（札の外から呼べる自由関数にしない）。
 fn read_fs_ledger_entries() -> Result<Vec<(String, bool, Vec<String>)>, String> {
     let path = fs_passthrough_ledger_path();
     let data = std::fs::read_to_string(&path)
@@ -3047,14 +3274,6 @@ fn read_fs_ledger_entries() -> Result<Vec<(String, bool, Vec<String>)>, String> 
         .collect())
 }
 
-/// 台帳から`target`のエントリを引く。無ければ`None`。
-fn fs_ledger_entry_for(target: &Path) -> Result<Option<(bool, Vec<String>)>, String> {
-    let key = target.to_string_lossy().to_string();
-    Ok(read_fs_ledger_entries()?
-        .into_iter()
-        .find(|(p, _, _)| *p == key)
-        .map(|(_, managed, ws)| (managed, ws)))
-}
 
 /// `<ws>/.harness/settings.json`へ`fs.read`宣言を書く（`paths`が空なら`fs`キーごと落とす）。
 fn write_fs_settings(ws: &Path, paths: &[&Path]) -> Result<(), String> {
@@ -3074,45 +3293,6 @@ fn write_fs_settings(ws: &Path, paths: &[&Path]) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-/// 台帳を汚したまま終わらないための後始末。`harness fs revoke <path>`は撤収できたときだけ
-/// エントリを消すので、ディレクトリを消した後だと残ることがある。テストが足したエントリは
-/// テストが責任を持って落とす。
-///
-/// **台帳ファイルはread-only属性付きで書かれている**（`harness-grant-ledger`の「誤削除防止の2層」）。
-/// 素の`std::fs::write`は黙って失敗するので、本体と同じく解除→書込→再付与の順で触る。
-fn purge_fs_ledger_entries(targets: &[&Path]) {
-    let path = fs_passthrough_ledger_path();
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&data) else {
-        return;
-    };
-    let keys: HashSet<String> = targets
-        .iter()
-        .map(|t| t.to_string_lossy().to_string())
-        .collect();
-    if let Some(entries) = json.get_mut("entries").and_then(|v| v.as_array_mut()) {
-        entries.retain(|e| {
-            !e.get("path")
-                .and_then(|v| v.as_str())
-                .map(|p| keys.contains(p))
-                .unwrap_or(false)
-        });
-    }
-    let Ok(text) = serde_json::to_string_pretty(&json) else {
-        return;
-    };
-    set_ledger_readonly(&path, false);
-    let wrote = std::fs::write(&path, text).is_ok();
-    set_ledger_readonly(&path, true);
-    assert!(
-        wrote,
-        "failed to purge test entries from {}",
-        path.display()
-    );
-}
-
 fn set_ledger_readonly(path: &Path, readonly: bool) {
     if let Ok(metadata) = std::fs::metadata(path) {
         let mut perms = metadata.permissions();
@@ -3123,7 +3303,7 @@ fn set_ledger_readonly(path: &Path, readonly: bool) {
 
 /// 2つのワークスペースが同じパスを宣言している間はエントリが生き、両方が宣言を外して初めて
 /// 撤収される（D-27の参照カウント）。
-fn fs_ledger_case_shared_declaration_is_refcounted() -> Result<(), String> {
+fn fs_ledger_case_shared_declaration_is_refcounted(ledger: &FsLedgerExclusive) -> Result<(), String> {
     let ws1 = case_dir("fs-ledger-ws1");
     let ws2 = case_dir("fs-ledger-ws2");
     let target = fs_allow_case_dir("ledger-shared");
@@ -3133,7 +3313,7 @@ fn fs_ledger_case_shared_declaration_is_refcounted() -> Result<(), String> {
     let script = "Write-Output 'ran'";
 
     let finish = |e: String| -> String {
-        purge_fs_ledger_entries(&[&target]);
+        ledger.purge_entries(&[&target]);
         let _ = std::fs::remove_dir_all(&target);
         e
     };
@@ -3142,7 +3322,7 @@ fn fs_ledger_case_shared_declaration_is_refcounted() -> Result<(), String> {
     write_fs_settings(&ws1, &[&target])?;
     let run = run_harness(&ws1, &run_shell_script_turns(script), &[], "fs-ledger-1");
     parse_json_stdout(&run).map_err(&finish)?;
-    match fs_ledger_entry_for(&target).map_err(&finish)? {
+    match ledger.entry_for(&target).map_err(&finish)? {
         Some((true, ws)) if ws == vec![ws1_key.clone()] => {}
         other => {
             return Err(finish(format!(
@@ -3156,7 +3336,7 @@ fn fs_ledger_case_shared_declaration_is_refcounted() -> Result<(), String> {
     write_fs_settings(&ws2, &[&target])?;
     let run = run_harness(&ws2, &run_shell_script_turns(script), &[], "fs-ledger-2");
     parse_json_stdout(&run).map_err(&finish)?;
-    match fs_ledger_entry_for(&target).map_err(&finish)? {
+    match ledger.entry_for(&target).map_err(&finish)? {
         Some((true, ws)) if ws.contains(&ws1_key) && ws.contains(&ws2_key) && ws.len() == 2 => {}
         other => {
             return Err(finish(format!(
@@ -3169,7 +3349,7 @@ fn fs_ledger_case_shared_declaration_is_refcounted() -> Result<(), String> {
     write_fs_settings(&ws1, &[])?;
     let run = run_harness(&ws1, &run_shell_script_turns(script), &[], "fs-ledger-3");
     parse_json_stdout(&run).map_err(&finish)?;
-    match fs_ledger_entry_for(&target).map_err(&finish)? {
+    match ledger.entry_for(&target).map_err(&finish)? {
         Some((true, ws)) if ws == vec![ws2_key.clone()] => {}
         None => {
             return Err(finish(
@@ -3190,7 +3370,7 @@ fn fs_ledger_case_shared_declaration_is_refcounted() -> Result<(), String> {
     write_fs_settings(&ws2, &[])?;
     let run = run_harness(&ws2, &run_shell_script_turns(script), &[], "fs-ledger-4");
     parse_json_stdout(&run).map_err(&finish)?;
-    if let Some(entry) = fs_ledger_entry_for(&target).map_err(&finish)? {
+    if let Some(entry) = ledger.entry_for(&target).map_err(&finish)? {
         return Err(finish(format!(
             "the entry must be auto-revoked once no workspace declares it; it is still there as \
              {entry:?}"
@@ -3204,7 +3384,7 @@ fn fs_ledger_case_shared_declaration_is_refcounted() -> Result<(), String> {
         )));
     }
 
-    purge_fs_ledger_entries(&[&target]);
+    ledger.purge_entries(&[&target]);
     let _ = std::fs::remove_dir_all(&target);
     cleanup_on_success(&ws1, &[], "fs-ledger-1");
     cleanup_on_success(&ws2, &[], "fs-ledger-3");
@@ -3215,7 +3395,7 @@ fn fs_ledger_case_shared_declaration_is_refcounted() -> Result<(), String> {
 
 /// 複数の`harness.exe`を**同時に**起動しても、各ワークスペースの宣言が台帳へ揃って残る
 /// （read-modify-writeが`with_named_lock`で直列化され、lost updateが起きない）。
-fn fs_ledger_case_concurrent_startups_do_not_lose_updates() -> Result<(), String> {
+fn fs_ledger_case_concurrent_startups_do_not_lose_updates(ledger: &FsLedgerExclusive) -> Result<(), String> {
     const N: usize = 4;
     let shared = fs_allow_case_dir("ledger-concurrent-shared");
     std::fs::write(shared.join("f.txt"), "x").map_err(|e| e.to_string())?;
@@ -3234,7 +3414,7 @@ fn fs_ledger_case_concurrent_startups_do_not_lose_updates() -> Result<(), String
         .chain(owned.iter().map(|p| p.as_path()))
         .collect();
     let finish = |e: String| -> String {
-        purge_fs_ledger_entries(&all_targets);
+        ledger.purge_entries(&all_targets);
         for t in &all_targets {
             let _ = std::fs::remove_dir_all(t);
         }
@@ -3290,7 +3470,7 @@ fn fs_ledger_case_concurrent_startups_do_not_lose_updates() -> Result<(), String
 
     // 共有パスは**全ワークスペース**からタグされていなければならない（1件でも欠けたら
     // それが lost update そのもの）。各ワークスペース専用のパスも同様に残っている必要がある。
-    let shared_entry = fs_ledger_entry_for(&shared)
+    let shared_entry = ledger.entry_for(&shared)
         .map_err(&finish)?
         .ok_or_else(|| finish("the shared path has no ledger entry at all".to_string()))?;
     let tagged: HashSet<String> = shared_entry.1.into_iter().collect();
@@ -3307,7 +3487,7 @@ fn fs_ledger_case_concurrent_startups_do_not_lose_updates() -> Result<(), String
         )));
     }
     for (i, mine) in owned.iter().enumerate() {
-        match fs_ledger_entry_for(mine).map_err(&finish)? {
+        match ledger.entry_for(mine).map_err(&finish)? {
             Some((true, ws)) if ws.len() == 1 => {}
             other => {
                 return Err(finish(format!(
@@ -3317,7 +3497,7 @@ fn fs_ledger_case_concurrent_startups_do_not_lose_updates() -> Result<(), String
         }
     }
 
-    purge_fs_ledger_entries(&all_targets);
+    ledger.purge_entries(&all_targets);
     for t in &all_targets {
         let _ = std::fs::remove_dir_all(t);
     }
@@ -3330,7 +3510,11 @@ fn fs_ledger_case_concurrent_startups_do_not_lose_updates() -> Result<(), String
 #[test]
 #[ignore]
 fn tier2a_fs_ledger_lifecycle() {
-    let cases: Vec<(&str, CaseFn)> = vec![
+    // `KNOWN_TARGETS`の`e2e-fs-ledger`は「保護対象の`fs-passthrough-ledger.json`を触るため、
+    // 他のE2Eと同時に走らせない」と書いているが、`e2e-all`は全件を並列で回すので**その規約は
+    // 誰にも守られていなかった**。札を取ることで規約を機構にする。
+    let ledger = fs_ledger_exclusive();
+    let cases: Vec<(&str, FsLedgerCaseFn)> = vec![
         (
             "shared-declaration-is-refcounted",
             fs_ledger_case_shared_declaration_is_refcounted,
@@ -3343,7 +3527,7 @@ fn tier2a_fs_ledger_lifecycle() {
     let mut passed = 0;
     let total = cases.len();
     for (name, f) in cases {
-        if run_named_case(name, f) {
+        if run_named_case(name, || f(&ledger)) {
             passed += 1;
         }
     }
@@ -3444,10 +3628,9 @@ fn tier2a_smb445_layer2() {
         run.stderr
     );
     let outcome = parse_json_stdout(&run).unwrap_or_else(|e| panic!("{e}"));
-    let result_text = outcome["tool_calls"]
-        .get(0)
-        .and_then(|c| c["result"].as_str())
-        .unwrap_or_else(|| panic!("no tool_calls[0].result: {outcome}"));
+    let result_text = outcome
+        .first_tool_result()
+        .unwrap_or_else(|e| panic!("{e}"));
     let json_lines: Vec<serde_json::Value> = result_text
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -3900,11 +4083,7 @@ fn run_exec_probe(ws: &Path, case_name: &str, with_python: bool) -> Result<Vec<S
         ));
     }
     let outcome = parse_json_stdout(&run)?;
-    let text = outcome["tool_calls"]
-        .get(0)
-        .and_then(|c| c["result"].as_str())
-        .ok_or_else(|| format!("no tool_calls[0].result: {outcome}"))?
-        .to_string();
+    let text = outcome.first_tool_result()?.to_string();
     // B-12型の穴を塞ぐ: 「トークンが無い」を「起動できなかった」と読む前に、
     // **スクリプトが最後まで走ったこと**を確かめる。途中で死んでいれば以降は全部
     // 「起動できなかった」に見える。
@@ -4008,11 +4187,7 @@ fn tier2a_workspace_exec_runs_but_cannot_reach_the_network() {
             panic!("{e}");
         }
     };
-    let result_text = outcome["tool_calls"]
-        .get(0)
-        .and_then(|c| c["result"].as_str())
-        .unwrap_or("")
-        .to_string();
+    let result_text = outcome.first_tool_result().unwrap_or("").to_string();
     let inside = result_text
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
