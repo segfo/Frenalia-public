@@ -26,9 +26,9 @@ fn ephemeral_temp_paths_are_excluded() {
     for path in [
         "C:/Users/segfo/AppData/Local/Temp/.tmpX3JiLI/ledger.json",
         "C:/Users/segfo/AppData/Local/Temp/__PSScriptPolicyTest_putqt4hm.545.ps1",
-        // `upper`のままなのは、これが**そのとき実際に観測された綴り**だからである
-        // （差分層の呼び名はD-83で`diff_layer`へ改めたが、記録済みの実データは書き換えない）。
-        r"C:\Users\segfo\AppData\Local\Temp\.tmpzs5yPG\upper\.git",
+        // **区切りがバックスラッシュの形**（上の2件はスラッシュ）。判定は`is_under`だけなので
+        // 綴りの揺れを吸収できていないと、ここだけ候補として残る。
+        r"C:\Users\segfo\AppData\Local\Temp\.tmpzs5yPG\diff_layer\.git",
         // `%TEMP%`そのもの（fs.read_writeで宣言され、`(OI)(CI)(R,W,D)`の出所になっていた）
         "C:/Users/segfo/AppData/Local/Temp",
         "C:/Users/segfo/AppData/Local/Temp/",
