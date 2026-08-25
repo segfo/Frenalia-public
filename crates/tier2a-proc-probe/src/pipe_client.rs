@@ -1,9 +1,15 @@
 //! **MAC/Spawn Daemon設計 §10.1（要求受付パイプ）の実現性スパイク専用モード**
 //! （`plans/mac-spike/RESULTS.md`）。
 //!
-//! 既存のtier2aのIPC（netfilterd・privhelper・policy_learnd）は「ユーザー専有DACL＋一意名＝
+//! 既存のtier2aのIPC（netfilterd・privhelper・policy_learnd）は「**ユーザー専有DACL**＝
 //! サンドボックスから到達不能」を前提にしている。Spawn Daemonの**要求受付パイプは、その前提を
 //! 初めて意図的に破る**（spawn要求用capability SID宛ACEで到達可能にする）。
+//!
+//! **一意名は防御に数えない**（2026-08-26の実測で訂正。当初この行は「ユーザー専有DACL＋一意名」と
+//! 書いていた）。AppContainerの子から`\\.\pipe\`の一覧は取れ、**生きたprivhelperのパイプ名が
+//! その中に見える**。到達不能という結論は変わらない——DACLだけで足りている
+//! （同じ子からの`CreateFileW`はアクセス拒否）。`unique_pipe_name`の一意性は衝突回避が目的で、
+//! 秘匿ではない。測定は`plans/handoff-issue-20/T4.md`。
 //!
 //! このモードはAppContainerの中からクライアントとして接続し、
 //! `crates/harness-sandbox/src/win_pipe_ipc.rs`と**同じフレーム形式**
