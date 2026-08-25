@@ -26,6 +26,10 @@ serde_json = "1"
 # （`plans/PLAN-VSCODE-REVIEW.md`「ハンク計算は表示側と適用側で同一実装を使う」）。
 similar = { version = "2", default-features = false, features = ["text"] }
 thiserror = "2.0.18"
+# §22.2.0の導出鍵`(秘密, 畳み込み済みパス, access級)`を1つのcapability名へ畳む
+# （`tier2a::workspace_capability::declaration_capability_name`）。**畳む必要があるのは
+# 見た目の都合ではなく、昇格側が「この秘密はこのパス宛」と検証できるようにするため**である。
+sha2 = "0.10"
 tempfile = "3.27.0"
 
 [build-dependencies]
