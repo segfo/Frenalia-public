@@ -176,10 +176,10 @@ async fn run_linux_tier2b(
     let session_dir = cwd.join(".harness").join("sandbox").join("tier2b");
     let config = harness_sandbox::tier2b::linux_bwrap::BwrapConfig {
         workspace_root: cwd.to_path_buf(),
-        upper_dir: session_dir.join("upper"),
+        diff_layer_dir: session_dir.join("diff-layer"),
         work_dir: session_dir.join("work"),
     };
-    let _ = std::fs::create_dir_all(&config.upper_dir);
+    let _ = std::fs::create_dir_all(&config.diff_layer_dir);
     let _ = std::fs::create_dir_all(&config.work_dir);
     let bwrap_args = harness_sandbox::tier2b::linux_bwrap::build_args(&config);
 

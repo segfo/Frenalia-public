@@ -33,7 +33,7 @@ pub(super) fn is_supported_class(class: FILE_INFORMATION_CLASS) -> bool {
     )
 }
 
-/// base（実workspace/`_ext`実体）側と差分層（CoW）側のディレクトリ実体1件分のメタデータ。
+/// 本体層（実workspace/`_ext`実体）側と差分層（CoW）側のディレクトリ実体1件分のメタデータ。
 #[derive(Clone)]
 pub(super) struct MergedEntry {
     pub name: Vec<u16>,
@@ -79,18 +79,18 @@ pub(crate) fn to_merged_entry(name: &str, meta: &std::fs::Metadata) -> MergedEnt
 }
 
 /// `rel_prefix`（`/`区切りのworkspace相対、ルート自身なら空文字列）配下の1階層について、
-/// 差分層側とbase側をマージした一覧を、設計書§7.8の優先順位
-/// （1. whiteout済みは除外 2. 差分層優先 3. 同名差分層が無いbaseのみ採用）で返す。
+/// 差分層側と本体層側をマージした一覧を、設計書§7.8の優先順位
+/// （1. whiteout済みは除外 2. 差分層優先 3. 同名差分層が無い本体層のみ採用）で返す。
 /// 名前の大小無視での重複排除・昇順ソート済み（呼び出し元の複数回呼び出しをまたぐカーソルが
 /// 安定した順序を前提にできるようにするため）。
 pub(super) fn merge_dir_entries(
-    base_dir: &Path,
+    base_layer_dir: &Path,
     diff_layer_dir: &Path,
     deleted: &HashSet<String>,
     rel_prefix: &str,
 ) -> Vec<MergedEntry> {
     let diff_layer_entries = read_entries(diff_layer_dir);
-    let base_entries = read_entries(base_dir);
+    let base_layer_entries = read_entries(base_layer_dir);
     let mut seen_lc: HashSet<String> = HashSet::new();
     let mut merged: Vec<(String, std::fs::Metadata)> = Vec::new();
 
@@ -109,7 +109,7 @@ pub(super) fn merge_dir_entries(
         seen_lc.insert(name.to_ascii_lowercase());
         merged.push((name, meta));
     }
-    for (name, meta) in base_entries {
+    for (name, meta) in base_layer_entries {
         let lc = name.to_ascii_lowercase();
         if seen_lc.contains(&lc) || deleted.contains(&child_rel(&name)) {
             continue;
@@ -300,7 +300,7 @@ pub(super) fn marshal_entries(
 
 /// `NtQueryDirectoryFile`/`NtQueryDirectoryFileEx`（BUG-047/BUG-048）共通のマージ・
 /// マーシャル本体。`handle_paths()`でトラック済みのディレクトリハンドルに対してのみ、
-/// 差分層/base両方をマージした列挙結果を自前で構築して返す（`Some(status)`）。それ以外
+/// 差分層/本体層の両方をマージした列挙結果を自前で構築して返す（`Some(status)`）。それ以外
 /// （未トラックのハンドル・非対応`FileInformationClass`）は`None`を返し、呼び出し元が
 /// 元の関数へ完全に素通しする。
 ///
@@ -328,11 +328,11 @@ pub(crate) unsafe fn try_merged_dir_query(
     if !dir_merge::is_supported_class(file_information_class) {
         return None;
     }
-    let (base_dir, diff_layer_dir, rel_prefix) = dir_query_roots(cfg, &rel_str)?;
+    let (base_layer_dir, diff_layer_dir, rel_prefix) = dir_query_roots(cfg, &rel_str)?;
     refresh_deleted_set(cfg);
     let deleted = deleted_paths_state().lock().unwrap().clone();
-    let merged = dir_merge::merge_dir_entries(&base_dir, &diff_layer_dir, &deleted, &rel_prefix);
-    // BUG-128: マージ結果が空で、base 側にも実体が無い（＝本当に空のディレクトリで、削除隠し
+    let merged = dir_merge::merge_dir_entries(&base_layer_dir, &diff_layer_dir, &deleted, &rel_prefix);
+    // BUG-128: マージ結果が空で、本体層側にも実体が無い（＝本当に空のディレクトリで、削除隠し
     // でもない）ときは、自前で `STATUS_NO_MORE_FILES` を先頭から返さず、OS 本来の列挙へ素通しする。
     //
     // **なぜ**: 実の `NtQueryDirectoryFile` は空ディレクトリでも先頭で `.`/`..` を返してから
@@ -340,9 +340,9 @@ pub(crate) unsafe fn try_merged_dir_query(
     // `opendir` が `.`/`..` を1つも得られず `ENOSYS`（Function not implemented）で失敗する
     // （git の空の `.git/objects/pack` で実機再現、`docs/bugs/BUG-128.md`）。空ディレクトリには
     // マージで足すべき 差分層 エントリも隠すべき削除エントリも無いので、素通しは意味論的に等価で
-    // 安全。**base 側に実体がある場合（＝全エントリを削除で隠している whiteout）は素通ししない**
+    // 安全。**本体層側に実体がある場合（＝全エントリを削除で隠している whiteout）は素通ししない**
     // ——そちらは隠し続ける必要があるため、従来どおり空を返す。
-    if merged.is_empty() && dir_merge::read_entries(&base_dir).is_empty() {
+    if merged.is_empty() && dir_merge::read_entries(&base_layer_dir).is_empty() {
         return None;
     }
     let pattern = unsafe { filename_filter_string(file_name) };
@@ -482,7 +482,7 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_directory_file_ex(
 }
 
 /// `handle_key`（`handle_paths()`のディレクトリハンドル用エントリ、`Classified.ledger_key`）から
-/// `(base_dir実体パス, diff_layer_dir実体パス, whiteout集合キーのprefix)`を求める。`baseline_hash_for`
+/// `(base_layer_dir実体パス, diff_layer_dir実体パス, whiteout集合キーのprefix)`を求める。`baseline_hash_for`
 /// と同じく、絶対パスなら`_ext`capture root、そうでなければworkspace相対として扱う
 /// （設計書§19.8、Stage 2）。ディレクトリ自体が両側どちらにも存在しない場合は`None`
 /// （通常起き得ないが、フックの再入・競合等の異常系での安全側フォールバック用）。
@@ -496,9 +496,9 @@ pub(crate) fn dir_query_roots(cfg: &Config, rel_str: &str) -> Option<(PathBuf, P
             rel_str.replace('\\', "/"),
         ))
     } else {
-        let base_dir = cfg.workspace_root.join(rel_str);
+        let base_layer_dir = cfg.workspace_root.join(rel_str);
         let diff_layer_dir = cfg.diff_layer_dir.join(rel_str);
-        Some((base_dir, diff_layer_dir, rel_str.to_string()))
+        Some((base_layer_dir, diff_layer_dir, rel_str.to_string()))
     }
 }
 

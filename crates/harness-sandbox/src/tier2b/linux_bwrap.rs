@@ -9,20 +9,22 @@
 //! そのまま流用できる、Windows Tier1のような独自FFIが不要）、既存の非同期I/O構造を変えずに
 //! 済む。
 //!
-//! 【T1】lowerを実FS全体にしない: workspace + ツールチェーン必須パスのみ`--ro-bind`し、
-//! `$HOME`は`--tmpfs`でマスクする（機密パスを空に見せる）。workspace自体は
-//! `--overlay-src`でCOW upperへ（`SandboxFs`のsandbox_dir配下にupper/workを置き、
-//! `overlay.rs`のapply経路と合流できる置き場所にする）。
+//! 【T1】読み取り専用で見せる範囲を実FS全体にしない: workspace + ツールチェーン必須パスのみ
+//! `--ro-bind`し、`$HOME`は`--tmpfs`でマスクする（機密パスを空に見せる）。workspace自体は
+//! `--overlay-src`でCoWの**本体層**にし、書込は**差分層**が受ける（`SandboxFs`のsandbox_dir
+//! 配下に`diff-layer`/`work`を置き、`overlay.rs`のapply経路と合流できる置き場所にする）。
+//! **ツールチェーンの`--ro-bind`は重ね合わせに参加しないので本体層ではない**（D-83）。
 
 use std::path::{Path, PathBuf};
 
 /// bwrap起動引数を組み立てる。`command`はハードニング済みの`sh -c <command>`実行を想定
 /// （呼び出し側=`harness-tools::shell`が`sh -c`分を付与する）。
 pub struct BwrapConfig {
+    /// 重ね合わせの**本体層**（読み取り専用の元）。`--overlay-src`でbwrapへ渡す。
     pub workspace_root: PathBuf,
-    /// COW upperの置き場所（`.harness/sandbox/<session>/Tier2b-upper`等、workspace内相対推奨）。
-    pub upper_dir: PathBuf,
-    /// bwrapの作業用ディレクトリ（overlay workdir、upperと同階層に置く）。
+    /// **差分層**の置き場所（`<workspace>/.harness/sandbox/tier2b/diff-layer`。`runner.rs`が作る）。
+    pub diff_layer_dir: PathBuf,
+    /// bwrapの作業用ディレクトリ（OverlayFSのworkdir、差分層と同階層に置く）。
     pub work_dir: PathBuf,
 }
 
@@ -67,12 +69,13 @@ pub fn build_args(config: &BwrapConfig) -> Vec<String> {
         args.push(home);
     }
 
-    // workspaceはCOW upperへ（D-08: 子から見た直前の書込の可視性をOverlayFSで自動充足）。
+    // workspaceを本体層にし、書込は差分層が受ける（D-08: 子から見た直前の書込の可視性を
+    // OverlayFSで自動充足）。
     let ws = config.workspace_root.to_string_lossy().into_owned();
     args.push("--overlay-src".to_string());
     args.push(ws.clone());
     args.push("--overlay".to_string());
-    args.push(config.upper_dir.to_string_lossy().into_owned());
+    args.push(config.diff_layer_dir.to_string_lossy().into_owned());
     args.push(config.work_dir.to_string_lossy().into_owned());
     args.push(ws.clone());
 
@@ -90,8 +93,8 @@ mod tests {
     fn build_args_includes_overlay_and_namespace_flags() {
         let config = BwrapConfig {
             workspace_root: PathBuf::from("/home/u/project"),
-            upper_dir: PathBuf::from("/home/u/project/.harness/sandbox/s1/Tier2b-upper"),
-            work_dir: PathBuf::from("/home/u/project/.harness/sandbox/s1/Tier2b-work"),
+            diff_layer_dir: PathBuf::from("/home/u/project/.harness/sandbox/tier2b/diff-layer"),
+            work_dir: PathBuf::from("/home/u/project/.harness/sandbox/tier2b/work"),
         };
         let args = build_args(&config);
         assert!(args.contains(&"--unshare-net".to_string()));
