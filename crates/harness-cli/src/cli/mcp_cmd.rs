@@ -124,7 +124,7 @@ fn list(
         .collect();
 
     match output_format {
-        OutputFormat::Json | OutputFormat::Jsonl => {
+        OutputFormat::Json => {
             let out = serde_json::json!({
                 "ledger_path": store.path().map(|p| p.display().to_string()),
                 "streamable_http_enabled": gates.allow_streamable_http,
@@ -132,6 +132,21 @@ fn list(
                 "servers": rows,
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        }
+        // **1行1サーバ。** [BUG-133](../../../../docs/bugs/BUG-133.md): ここは`Json`と同じ
+        // アームに畳まれていて`to_string_pretty`（＝**複数行**）を出しており、1行1JSONという
+        // JSONLの約束を最初から満たしていなかった。
+        //
+        // セッション全体にかかる値（承認台帳の場所・Streamable HTTPのゲート）はここには
+        // 載らない——JSONLの行は同じ形のレコードの並びで、そこへ性質の違う1行を混ぜると
+        // 読む側が行ごとに種別を判定する羽目になる。**その3つが要るときは`json`を使う**
+        // （`status`が`http-not-enabled`になる形で、ゲートの効き自体は各行に現れる）。
+        OutputFormat::Jsonl => {
+            for row in &rows {
+                if let Ok(s) = serde_json::to_string(row) {
+                    println!("{s}");
+                }
+            }
         }
         OutputFormat::Text => {
             if decls.is_empty() {

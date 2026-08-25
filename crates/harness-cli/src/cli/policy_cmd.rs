@@ -198,6 +198,20 @@ fn read_settings_value(workspace_root: &Path) -> serde_json::Value {
 // 表示
 // ---------------------------------------------------------------------------
 
+/// 読めなかった経路の注記（D-43）。**出力形式に関わらず必ず標準エラー出力へ出す。**
+///
+/// [BUG-134](../../../../docs/bugs/BUG-134.md): ここは3つの呼び出し元がそれぞれ
+/// `if output_format == OutputFormat::Text`で囲っており、`json`/`jsonl`のときは
+/// **標準エラー出力にすら出さず丸ごと捨てていた**。stdoutを汚さないことと黙ることは別で、
+/// 「ファイルが無い」と「拒否が0件だった」を混ぜるなという規則（このファイルの
+/// [`collect_input`]のdoc）が、機械可読モードでだけ無効になっていた。
+///
+/// 標準エラー出力は`--output-format`の契約の一部ではないので、ここへ書いても
+/// [BUG-131](../../../../docs/bugs/BUG-131.md)の再発にはならない。
+fn eprint_unavailable(input: &PolicyInput) {
+    eprint!("{}", render_unavailable(input));
+}
+
 fn render_unavailable(input: &PolicyInput) -> String {
     let unavailable = input.unavailable();
     if unavailable.is_empty() {
@@ -361,9 +375,7 @@ pub(crate) fn run_policy_subcommand(
                 }
             };
             let input = collect_input(workspace_root, session.as_deref(), &sources);
-            if output_format == OutputFormat::Text {
-                eprint!("{}", render_unavailable(&input));
-            }
+            eprint_unavailable(&input);
             print!("{}", render_candidates(&input, output_format));
             ExitCode::SUCCESS
         }
@@ -383,9 +395,7 @@ pub(crate) fn run_policy_subcommand(
             let input = collect_input(workspace_root, session.as_deref(), &sources);
             let proposals = input.proposals_with_granted(&granted_paths(workspace_root));
             let verdicts = gate::check_all(&proposals, require_sandbox);
-            if output_format == OutputFormat::Text {
-                eprint!("{}", render_unavailable(&input));
-            }
+            eprint_unavailable(&input);
             print!("{}", render_output(&proposals, &verdicts, output_format));
             ExitCode::SUCCESS
         }
@@ -491,9 +501,7 @@ fn run_learn(
     let input = collect_input(workspace_root, session, &Source::ALL);
     let proposals = input.proposals_with_granted(&granted_paths(workspace_root));
     let verdicts = gate::check_all(&proposals, require_sandbox);
-    if output_format == OutputFormat::Text {
-        eprint!("{}", render_unavailable(&input));
-    }
+    eprint_unavailable(&input);
     print!("{}", render_output(&proposals, &verdicts, output_format));
     ExitCode::SUCCESS
 }

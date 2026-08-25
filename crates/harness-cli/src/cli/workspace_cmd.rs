@@ -32,6 +32,24 @@ struct ApplyReportJson {
     unledgered: Vec<String>,
 }
 
+/// `harness apply --output-format jsonl`の1行（1件1行）。
+///
+/// **`kind`の綴りは[`ApplyReportJson`]のフィールド名と同じにする。** 同じ`apply`の結果を
+/// `json`と`jsonl`で別の語で呼ぶと、片方だけを見て書いたスクリプトがもう片方で動かない。
+///
+/// [BUG-132](../../../../docs/bugs/BUG-132.md): 元は`Jsonl`が`Text`と同じアームに畳まれていて、
+/// `applied: <path>`のような人間向けの行がそのまま機械可読な契約の中身になっていた。
+/// 同じファイルの`changes`は最初から`Jsonl`を分けていたので、**1つのファイルの中で非対称**だった。
+#[derive(serde::Serialize)]
+struct ApplyLineJson<'a> {
+    kind: &'a str,
+    path: &'a str,
+    /// `rejected`だけが理由を持つ（台帳のパスの形が不正だった理由、BUG-062）。
+    /// 他の区分では欄ごと出さない——常に`null`が並ぶと「理由があるはずのもの」に見える。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+}
+
 /// CoWセッションの由来（`.harness-cow-session.json`のworkspace_root）。diff_layer_dir自身に
 /// 書かれているので、`--cwd`の綴りに依存せずに引ける（Windows専用の`--sandbox tier2a-cow`機構なので
 /// 他プラットフォームでは常に`None`）。
@@ -426,7 +444,40 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                         println!("{s}");
                     }
                 }
-                OutputFormat::Jsonl | OutputFormat::Text => {
+                // 1件1行。`changes`（同じ`match`の上）と同じ形にしてある（BUG-132）。
+                OutputFormat::Jsonl => {
+                    let mut lines: Vec<ApplyLineJson> = Vec::new();
+                    // **6区分すべてを並べる。** 1つでも落とすと、`json`では見えるものが
+                    // `jsonl`では黙って消える（`--output-format`を変えただけで結果が変わる）。
+                    for (kind, paths) in [
+                        ("applied", &report.applied),
+                        ("conflicts", &report.conflicts),
+                        ("ext_blocked", &report.ext_blocked),
+                        ("hard_denied", &report.hard_denied),
+                        ("unledgered", &report.unledgered),
+                    ] {
+                        for p in paths {
+                            lines.push(ApplyLineJson {
+                                kind,
+                                path: p,
+                                reason: None,
+                            });
+                        }
+                    }
+                    for (p, reason) in &report.rejected {
+                        lines.push(ApplyLineJson {
+                            kind: "rejected",
+                            path: p,
+                            reason: Some(reason),
+                        });
+                    }
+                    for line in &lines {
+                        if let Ok(s) = serde_json::to_string(line) {
+                            println!("{s}");
+                        }
+                    }
+                }
+                OutputFormat::Text => {
                     for p in &report.applied {
                         println!("applied: {p}");
                     }
