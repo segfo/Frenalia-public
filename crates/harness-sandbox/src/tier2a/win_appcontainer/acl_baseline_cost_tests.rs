@@ -92,7 +92,7 @@ fn progress_to_stderr(label: &'static str) -> impl Fn(usize, usize) {
 ///
 /// 「撤収したと報告されたのに ACE が減っていなかった」実例（BUG-101）があるので、
 /// `revoke`の戻り値ではなく[`super::assert_no_sid_ace_recursive`]で裏を取る（B-25）。
-fn revoke_and_verify(root: &Path, sid: PSID) {
+fn revoke_and_verify(root: &Path, sid: PSID) -> u128 {
     let started = Instant::now();
     let report = revoke_ace_recursive(root, sid).expect("revoke the measurement ACEs");
     let elapsed = started.elapsed().as_millis();
@@ -104,6 +104,35 @@ fn revoke_and_verify(root: &Path, sid: PSID) {
             leftovers.iter().take(5).collect::<Vec<_>>()
         );
     }
+    elapsed
+}
+
+/// 製品の初回経路と同じ3段（同期区間のroot付与 → 背景フェーズ0の伝播 → フェーズ1の救済walk）を
+/// 1回ぶん実行し、段ごとの所要時間と救済walkの結果を返す。
+///
+/// **`acl_baseline_cost_first_and_second_pass`と同じ並びをここに1つ置いている**のは、
+/// 一巡（付与→撤収→付与）を測るには**同じ形を2回**回す必要があるためである
+/// （`docs/CODE-STRUCTURE-RULES.md`規則5: コピーを作らない）。
+fn product_shaped_first_pass(
+    root: &Path,
+    sid: PSID,
+    mask: u32,
+    label: &'static str,
+) -> (u128, u128, u128, super::DescendantFixReport) {
+    let t = Instant::now();
+    grant_workspace_root_rw_fast(root, sid).expect("fast (single-object) root grant");
+    let fast_ms = t.elapsed().as_millis();
+
+    let t = Instant::now();
+    propagate_workspace_root_grant(root, sid, mask).expect("background propagate");
+    let propagate_ms = t.elapsed().as_millis();
+
+    let t = Instant::now();
+    let walk = fix_descendants_missing_ace(root, sid, mask, &[], &progress_to_stderr(label))
+        .expect("rescue walk");
+    let walk_ms = t.elapsed().as_millis();
+
+    (fast_ms, propagate_ms, walk_ms, walk)
 }
 
 /// **S10-3（先に置く）: 製品と同じ順序で、伝播は既存の子孫へ届くのか。**
@@ -351,4 +380,122 @@ fn acl_baseline_cost_first_and_second_pass() {
         "second pass: the rescue walk must not write a single explicit ACE — if it does, the \
          per-startup cost never drops and D-54's whole point (pay once per workspace) is lost"
     );
+}
+
+/// **付与 → 撤収 → 付与の一巡は、いくらか。**
+///
+/// # なぜこれを測るのか（`acl_baseline_cost_first_and_second_pass`では答えられない）
+///
+/// あちらの「2回目のWin32書込は0回」は、**ACEが載ったままもう一度付けた**ときの数字である。
+/// そこから「ワークスペースにつき一度きり」と読むには、**剥がす経路が存在しない**ことが
+/// 前提になる。**その前提は成り立たない**——剥がす経路は少なくとも3つある。
+///
+/// | 剥がれる経路 | いつ起きるか |
+/// |---|---|
+/// | `harness fs revoke-workspace` | ユーザーが明示的に撤収したとき |
+/// | 書込モードの切替（`Live` ⇄ `--sandbox tier2a-cow`） | capability SIDは**ワークスペース＋モード単位**なので、モードが変わると別のSIDになり、そちらのACEは1本も載っていない（**D-54**） |
+/// | capability台帳（`workspace-capability-ledger.json`）の剪定・喪失 | 名前の素になる秘密が消えると、次回は**別のSIDが導出される** |
+///
+/// **どの経路でも、次の付与は初回と同じ状態から始まる。** したがって「一度きり」は
+/// ワークスペース単位ではなく **(ワークスペース × モード × capabilityの世代) 単位**である。
+///
+/// # 何を主張するか（時間はassertしない）
+///
+/// 所要時間はマシンの状態に揺れるので**判定には使わず、値として出すだけ**にする。
+/// assertするのは揺れない構造の側だけ:
+///
+/// 1. 撤収後、rootに明示ACEが**残っていない**こと（＝冪等スキップの前提が消えている）
+/// 2. 2周目の伝播が既存の子孫へ**届く**こと（残課題#32の回帰を一巡側でも押さえる）
+///
+/// **時間の比（2周目 ÷ 初回）はJSONに出す。** 1.0に近ければ「撤収したら全額もう一度」で、
+/// 「一度きり」という説明が条件付きであることの直接の証拠になる。
+#[test]
+#[ignore = "creates tens of thousands of files and writes DACLs; run NON-elevated"]
+fn acl_baseline_cost_regrant_after_revoke_pays_again() {
+    let count = file_count();
+    let mask = workspace_rwx_mask();
+    let dir = TestDirGuard::create("aclbase-cycle");
+    let root = dir.path();
+
+    let nodes = build_wide_tree(root, count, FANOUT);
+    let sid = measure_capability("cycle");
+
+    // --- 1周目（まっさらなツリーへの初回付与＝製品の初回起動と同じ形） ---
+    let (first_fast_ms, first_propagate_ms, first_walk_ms, first_walk) =
+        product_shaped_first_pass(root, sid.as_psid(), mask, "1st");
+    let first_total_ms = first_fast_ms + first_propagate_ms + first_walk_ms;
+
+    // --- 撤収（`harness fs revoke-workspace`が通る経路と同じ再帰撤収） ---
+    let revoke_ms = revoke_and_verify(root, sid.as_psid());
+
+    // **撤収後にrootの明示ACEが消えていることを、伝播の前に確かめる。**
+    // これが残っていると2周目の`grant_ace_mask_with`が冪等スキップし、
+    // 「安かった」のではなく「撤収できていなかった」を測ることになる（B-25）。
+    let root_ace_after_revoke = sid_explicit_ace(root, sid.as_psid()).expect("read back root ACE");
+
+    // --- 2周目（撤収済みのツリーへ、まったく同じ形でもう一度） ---
+    let (second_fast_ms, second_propagate_ms, second_walk_ms, second_walk) =
+        product_shaped_first_pass(root, sid.as_psid(), mask, "2nd");
+    let second_total_ms = second_fast_ms + second_propagate_ms + second_walk_ms;
+
+    let ratio = if first_total_ms == 0 {
+        f64::NAN
+    } else {
+        (second_total_ms as f64) / (first_total_ms as f64)
+    };
+    let per_node_us = |ms: u128| (ms as f64) * 1000.0 / (nodes as f64);
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "measurement": "grant -> revoke -> grant costs the full price again",
+            "nodes": nodes,
+            "file_count": count,
+            "fanout": FANOUT,
+            "first_grant": {
+                "startup_side_fast_root_grant_ms": first_fast_ms,
+                "propagate_ms": first_propagate_ms,
+                "rescue_walk_ms": first_walk_ms,
+                "total_ms": first_total_ms,
+                "us_per_node": per_node_us(first_total_ms),
+                "walk_checked": first_walk.checked,
+                "walk_granted": first_walk.granted,
+            },
+            "revoke": {
+                "ms": revoke_ms,
+                "us_per_node": per_node_us(revoke_ms),
+                "root_explicit_ace_left": root_ace_after_revoke.is_some(),
+            },
+            "second_grant_after_revoke": {
+                "startup_side_fast_root_grant_ms": second_fast_ms,
+                "propagate_ms": second_propagate_ms,
+                "rescue_walk_ms": second_walk_ms,
+                "total_ms": second_total_ms,
+                "us_per_node": per_node_us(second_total_ms),
+                "walk_checked": second_walk.checked,
+                "walk_granted": second_walk.granted,
+            },
+            "second_over_first": ratio,
+            "full_cycle_ms": first_total_ms + revoke_ms + second_total_ms,
+        })
+    );
+
+    revoke_and_verify(root, sid.as_psid());
+
+    assert_eq!(
+        root_ace_after_revoke, None,
+        "the revoke must leave no explicit ACE on the root — otherwise the second grant is \
+         measuring an idempotent skip, not a real re-grant"
+    );
+    for (label, walk) in [("first", &first_walk), ("second", &second_walk)] {
+        assert_eq!(
+            walk.checked, nodes,
+            "{label} grant: the walk must have visited every node before its `granted` is read"
+        );
+        assert_eq!(
+            walk.granted, 0,
+            "{label} grant: the propagating write must reach every existing descendant \
+             (STATUS #32 regression, now measured on the revoke-and-regrant path too)"
+        );
+    }
 }
