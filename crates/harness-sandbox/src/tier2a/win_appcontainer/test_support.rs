@@ -67,7 +67,13 @@ pub(crate) fn spawn_in_workspace(
         container_sid,
         net,
         cow,
-        cap.as_ref().map(|s| s.as_psid()),
+        // [§22.3] このヘルパーはworkspace本体だけを見て起こす。`--fs-allow`の宣言capabilityを
+        // 積まないので、**このヘルパー経由の子は宣言した穴へ届かない**——穴の到達性を測る
+        // テストは`probe_passthrough`（主体を明示的に渡せる）を使うこと。
+        cap.as_ref()
+            .map(|s| vec![s.as_psid()])
+            .unwrap_or_default()
+            .as_slice(),
         domain,
     )
 }

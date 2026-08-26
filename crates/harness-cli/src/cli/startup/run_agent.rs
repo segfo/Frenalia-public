@@ -329,9 +329,16 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                     path.display()
                 );
             } else {
+                // [§22.2.1] **この行が言う「終了後も残る」は仕様である。** 主体が宣言ごとの
+                // capability SIDへ移り、共有され得る宣言のACEは永続になった（セッション終了時に
+                // 剥がすと、同じワークスペースの並行セッションが互いの許可を落とす）。
+                // 消える道は2本しかないので、両方名指しする——片方だけ書くと、
+                // `.harness/settings.json`で宣言した人は「消し方が`fs revoke`しか無い」と読む。
                 eprintln!(
-                    "note: fs-allow granted: {} [{}] (this ACE persists after harness exits; use \
-                     `harness fs revoke {}` to undo)",
+                    "note: fs-allow granted: {} [{}] (this ACE persists after harness exits by \
+                     design; it goes away when the declaration disappears from \
+                     .harness/settings.json and harness starts again, or when you run \
+                     `harness fs revoke {}`)",
                     path.display(),
                     if *writable { "rw" } else { "ro" },
                     path.display()

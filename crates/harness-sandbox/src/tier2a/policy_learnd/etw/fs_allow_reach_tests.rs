@@ -589,22 +589,47 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
         println!("  denied: {} [{access}] {reason}", path.display());
     }
 
-    // [BUG-057の回帰] `--fs-allow`で付与したパスは**session ledgerに載っていなければならない**。
-    // 載っていないと`end_session`の自動撤収から漏れ、「fs passthroughはセッション終了で失効する」
-    // （D-37の仕様、`docs/STATUS.md`が不変条件として明記）が破れる。
-    // `fs-passthrough-ledger.json`（`harness fs revoke`が見る方）には載るので、手動撤収だけは
-    // 効く——**自動撤収だけが静かに漏れる**という気付きにくい形の欠陥だった。
+    // [§22.3] **`--fs-allow`のパスはセッション台帳に載ってはならない。**
+    //
+    // BUG-057の頃は逆で、「載っていないと`end_session`の自動撤収から漏れる」ことを固定して
+    // いた。主体が宣言ごとのcapability SIDへ移った後は、`end_session`は**そのACEを剥がせない**
+    // （package SIDを導出して探すので相手が違う）のに台帳エントリだけを回収済みとして落とす。
+    // つまり載せておくと、ACEは実マシンに残るのに**それを覚えている記録だけが消える**。
+    //
+    // 撤収の索引はここではなく`workspace-capability-ledger.json`の宣言エントリが持つ
+    // （§22.2.1「撤収すべきSIDは宣言から一意に計算できる」）ので、**両方**を測る——
+    // 「載っていない」だけを測ると、索引ごと消えた場合も緑になる。
     let recorded = crate::tier2a::session_profile::granted_paths_for_current_session();
     println!("=== session ledger after preflight: {recorded:?} ===");
+    let canonical_ws = workspace.canonicalize().unwrap_or_else(|_| workspace.clone());
     for fp in &passthrough {
         let path_str = fp.path.to_string_lossy().into_owned();
         assert!(
-            recorded.contains(&path_str),
-            "BUG-057: {} was granted by preflight but is not in the session ledger, so \
-             `end_session` will not revoke it (recorded = {recorded:?})",
+            !recorded.contains(&path_str),
+            "§22.3: {} is owned by a declaration capability SID, so it must NOT be in the session \
+             ledger -- `end_session` cannot strip it and would drop the record while the ACE stays \
+             on the machine (recorded = {recorded:?})",
             fp.path.display()
         );
+        let names = crate::tier2a::workspace_capability::declaration_capability_names(
+            &fp.path,
+            Some(&canonical_ws),
+        );
+        assert!(
+            !names.is_empty(),
+            "§22.2.1: {} was granted by preflight but the workspace capability ledger has no \
+             declaration entry for it, so nothing can derive the SID to revoke it later",
+            fp.path.display()
+        );
+        println!("  declaration capability for {}: {names:?}", fp.path.display());
     }
+
+    // **許可側はここでは測れていない**（B-35。書いておかないと「対で固定した」と読まれる）。
+    // セッション台帳へ載り続けなければならないのはCoW Redirector DLLの記録
+    // （主体がセッションのpackage SIDのままなので`end_session`が正しく剥がせる）だが、
+    // このテストは`WorkspaceWriteMode::DirectRw`で走るのでその分岐を1度も通らない。
+    // 「fs-allowを外す」変更が「セッション台帳への記録そのものを外す」まで広がっていないことは、
+    // いまはコードを読むことでしか確かめられない（`preflight`のCoW分岐の`record_granted_path`）。
 
     // 条件(d)のプローブツリーへは何も与えない。`never_allowed`はfs-allowにも入れていない。
 
@@ -704,7 +729,7 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     // 「祖先が無い」と言い続けるなら診断はまだ壊れている。
     println!("=== D8/D9 re-probed after the traverse grant (condition b) ===");
     for fp in &passthrough {
-        match probe_passthrough(sid.as_psid(), restore.sid.as_psid(), None, &workspace, fp) {
+        match probe_passthrough(sid.as_psid(), restore.sid.as_psid(), None, &[], &workspace, fp) {
             None => println!("  {} : reachable (D8 passed)", fp.path.display()),
             Some(diagnosis) => println!("  {} : {diagnosis}", fp.path.display()),
         }

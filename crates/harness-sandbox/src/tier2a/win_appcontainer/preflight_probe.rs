@@ -26,6 +26,21 @@ fn probe_domain(workspace_cap: Option<PSID>) -> DomainIdentity {
     }
 }
 
+/// [§22.3] プローブ子のトークンへ積むcapabilityの集合（workspace本体＋`--fs-allow`の宣言）。
+///
+/// **`--fs-allow`の穴は宣言ごとのcapability SID宛になった**ので、その主体を積まない子からは
+/// 到達できない。積み忘れると、付与は正しく効いているのに到達性プローブが**全件を
+/// 「到達不能」と報告する**——`preflight`から見ると穴が全部壊れているように見えるが、
+/// 実際には測る側が権限を持っていないだけである。
+///
+/// 4本のプローブが同じ組み立てを通るように、綴りはここ1箇所に置く（`probe_domain`と同じ理由）。
+fn probe_capabilities(workspace_cap: Option<PSID>, fs_allow_caps: &[PSID]) -> Vec<PSID> {
+    workspace_cap
+        .into_iter()
+        .chain(fs_allow_caps.iter().copied())
+        .collect()
+}
+
 /// **シェルが実際にスクリプトを走らせた**ことだけを示す印。プローブの1文目で出す。
 ///
 /// # なぜ終了コードだけでは足りないか（実測、2026-08-13）
@@ -165,7 +180,10 @@ pub(crate) fn select_shell_by_probe(
             sid,
             NetworkCapability::Deny,
             None,
-            workspace_cap,
+            // [§22.3] シェルを選ぶだけのプローブなので`--fs-allow`の主体は積まない
+            // ——測っているのは「このシェルはAppContainerで起動して1行走るか」だけで、
+            // 宣言したパスへ届くかは後段の`probe_passthrough_batch`が測る。
+            &probe_capabilities(workspace_cap, &[]),
             probe_domain(workspace_cap),
         ) {
             Err(e) => format!("could not start it ({e})"),
@@ -205,6 +223,7 @@ pub(crate) fn select_shell_by_probe(
 pub(crate) fn smoke_test_spawn(
     sid: PSID,
     workspace_cap: Option<PSID>,
+    fs_allow_caps: &[PSID],
     workspace_root: &Path,
     probe_dir: &Path,
 ) -> Result<(), AppContainerError> {
@@ -231,7 +250,7 @@ pub(crate) fn smoke_test_spawn(
         sid,
         NetworkCapability::Deny,
         None,
-        workspace_cap,
+        &probe_capabilities(workspace_cap, fs_allow_caps),
         probe_domain(workspace_cap),
     )
     .map_err(|e| AppContainerError::Preflight(format!("shell could not start: {e}")))?;
@@ -264,6 +283,7 @@ pub(crate) fn smoke_test_spawn(
 pub(crate) fn smoke_test_harness_control_write_denied(
     sid: PSID,
     workspace_cap: Option<PSID>,
+    fs_allow_caps: &[PSID],
     workspace_root: &Path,
 ) -> Result<(), AppContainerError> {
     let control_dir = workspace_root.join(".harness");
@@ -293,7 +313,11 @@ pub(crate) fn smoke_test_harness_control_write_denied(
         sid,
         NetworkCapability::Deny,
         None,
-        workspace_cap,
+        // [§22.3] **拒否側のプローブこそ、実際の子が持つ主体を全部積んで試す。**
+        // 積まずに拒否されても「`.harness/`の保護が効いた」ことの証明にならないのは
+        // workspace capabilityと同じ理屈で、宣言capabilityにもそのまま当てはまる
+        // （`--fs-allow`が`.harness/`を覆う宣言をしていれば、それは実際に穴である）。
+        &probe_capabilities(workspace_cap, fs_allow_caps),
         probe_domain(workspace_cap),
     )
     .map_err(|e| {
@@ -622,6 +646,7 @@ pub(crate) fn probe_passthrough(
     sid: PSID,
     traverse_sid: PSID,
     workspace_cap: Option<PSID>,
+    fs_allow_caps: &[PSID],
     workspace_root: &Path,
     fp: &FsPassthrough,
 ) -> Option<String> {
@@ -629,6 +654,7 @@ pub(crate) fn probe_passthrough(
         sid,
         traverse_sid,
         workspace_cap,
+        fs_allow_caps,
         workspace_root,
         std::slice::from_ref(fp),
     ) {
@@ -655,6 +681,7 @@ pub(crate) fn probe_passthrough_batch(
     sid: PSID,
     traverse_sid: PSID,
     workspace_cap: Option<PSID>,
+    fs_allow_caps: &[PSID],
     workspace_root: &Path,
     entries: &[FsPassthrough],
 ) -> BatchProbeOutcome {
@@ -683,7 +710,9 @@ pub(crate) fn probe_passthrough_batch(
         sid,
         NetworkCapability::Deny,
         None,
-        workspace_cap,
+        // [§22.3] **穴の主体を積まないと、この測定は全件「到達不能」になる。**
+        // 付与が正しく効いていても、測る側がcapabilityを持っていなければ届かない。
+        &probe_capabilities(workspace_cap, fs_allow_caps),
         probe_domain(workspace_cap),
     ) {
         Ok(child) => child,
@@ -974,6 +1003,7 @@ mod shell_selection_real_machine_tests {
         let result = smoke_test_spawn(
             sid.as_psid(),
             Some(workspace_cap.as_psid()),
+            &[],
             workspace.path(),
             &probe_dir,
         );

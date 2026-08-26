@@ -232,14 +232,52 @@ unsafe fn launch_netfilterd_chained(pipe_name: &str) -> Result<(), PrivHelperErr
 
 /// `GrantWorkspaceAccess`のfs-allow部分の実処理。エントリごとに成否が独立する
 /// （`GrantTraverse`のような連鎖ではないため、1エントリの失敗が他エントリを止めない）。
-fn grant_fs_allow_entries(
-    sid: PSID,
-    entries: Vec<FsAllowGrant>,
-) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+///
+/// [§22.3.1] **主体はエントリごとに、この関数の中で導出する。** 呼び出し元から1つのSIDを
+/// 受け取る形をやめたのは、`--fs-allow`の主体が**宣言ごと**になったからである。導出入力は
+/// `(受け取った秘密, **この関数がこれから書き込む当のパス**, access級)`で、パスを
+/// 呼び出し元の申告ではなく`entry.path`——実際の書込先——から取るのが要点である
+/// （申告されたパスから導出して別のパスへ書くと、束縛が名目だけになる）。
+fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
     let mut granted = Vec::new();
     let mut failures = Vec::new();
     for entry in entries {
         let started = std::time::Instant::now();
+        // **秘密の無い電文は拒否する**（fail-closed）。移行前のビルドが送ってくる形で、
+        // 通すと「主体を決められないまま何かへ付与する」ことになる。
+        if entry.secret_hex.is_empty() {
+            log::line(&format!(
+                "  entry {} : REFUSED (no capability secret on the wire; the caller is from before \
+                 the capability-SID migration)",
+                entry.path.display()
+            ));
+            failures.push((
+                entry.path,
+                "no capability secret on the wire (caller predates the capability-SID migration)"
+                    .to_string(),
+            ));
+            continue;
+        }
+        // **導出は必ずこの側で行う**（`privhelper`モジュールdocの「SIDはIPCで受け取らず、
+        // 受信側が自ら導出する」を字義どおり保つ）。畳み込みも受信側の関数を通すので、
+        // 呼び出し元が綴りを細工して別の主体を作らせることはできない。
+        let name = crate::tier2a::workspace_capability::declaration_capability_name(
+            &entry.secret_hex,
+            &crate::tier2a::workspace_capability::declaration_key(&entry.path),
+            entry.access.label(),
+        );
+        let sid_owned = match win_appcontainer::capability_sid_from_declaration_name(&name) {
+            Ok(sid) => sid,
+            Err(e) => {
+                log::line(&format!(
+                    "  entry {} : FAILED to derive the declaration capability: {e}",
+                    entry.path.display()
+                ));
+                failures.push((entry.path, format!("could not derive the capability SID: {e}")));
+                continue;
+            }
+        };
+        let sid = sid_owned.as_psid();
         // forced（--force-system-acl, D-19）は`SeRestorePrivilege`で全DACLをバイパスして
         // 書くため、書込前に必ず host パスの絶対拒否ゲートを通す（唯一の防壁）。
         if entry.forced {
@@ -341,8 +379,13 @@ fn grant_traverse_targets(sid: PSID, targets: Vec<PathBuf>) -> (Vec<PathBuf>, Op
 /// | 用途 | 主体 | 導出元 |
 /// |---|---|---|
 /// | 祖先チェーンのtraverse（`GrantTraverse`/`RevokeTraverse`/`GrantWorkspaceAccess`のtraverse部分） | capability SID | `traverse_capability_sid()`（固定名`harnessSandboxTraverse`） |
-/// | leafへの読み書きの**付与**（`GrantWorkspaceAccess`のfs-allow部分） | セッションpackage SID | IPCで受けた**形を検証済みの**セッションプロファイル名 |
-/// | leafへの読み書きの**撤収**（`RevokeFsAllow`） | **対象パスのDACLに実在するpackage SID** | `win_appcontainer::revoke_harness_subjects`（名前からは導出しない） |
+/// | leafへの読み書きの**付与**（`GrantWorkspaceAccess`のfs-allow部分） | **宣言ごとのcapability SID**（§22.3） | IPCで受けた**秘密**＋**この側が畳み込んだ書込先のパス**＋access級（`grant_fs_allow_entries`） |
+/// | leafへの読み書きの**撤収**（`RevokeFsAllow`） | **2系統を順に**——(1) **宣言ごとのcapability SID**（§22.2.1）、(2) 対象パスのDACLに実在するpackage SID | (1) IPCで受けた**秘密**＋**この側が畳み込んだ対象パス**＋access級、(2) `win_appcontainer::revoke_harness_subjects`（名前からは導出しない） |
+///
+/// **撤収が2系統あるのは、移行の途中に両方が実在し得るからである。** 新しい主体
+/// （capability SID）は宣言から一意に導出でき、旧い主体（package SID）は導出できないので
+/// DACLから分類するしかない——**探し方が違うので同じ関数にはならない**。どちらか片方でも
+/// rootに残っていれば、このパスは「撤収できた」と応答しない。
 ///
 /// traverse側が`CONTAINER_NAME`のpackage SIDのままD-37から取り残されていたのが
 /// [BUG-061](../../../../docs/bugs/BUG-061.md)である。**新しいアームを足す人は、上表のどの行に
@@ -415,16 +458,19 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
         PrivilegedRequest::GrantWorkspaceAccess {
             traverse_targets,
             fs_allow_entries,
-            session_profile,
         } => {
+            // [§22.3.1] **要求の中身を素直に書かない。** この要求は宣言capabilityの秘密を
+            // 運ぶので、`{req:?}`や個々のフィールドを並べると`privhelper.log`へ秘密が落ちる
+            // （このログはユーザーのプロファイル配下に平文で残り続ける）。ここで出すのは
+            // **件数だけ**にする。
             log::line(&format!(
-                "dispatch: GrantWorkspaceAccess {} traverse target(s), {} fs-allow entrie(s),                  session_profile={session_profile}",
+                "dispatch: GrantWorkspaceAccess {} traverse target(s), {} fs-allow entrie(s)",
                 traverse_targets.len(),
                 fs_allow_entries.len()
             ));
             // D-37: 祖先traverseはharness共通のcapability SID宛（固定名から自ら導出、IPC入力に
-            // 依存しない）。fs-allowはセッション固有のpackage SID宛で、その名前だけをIPCで
-            // 受け取る——**形を検証してから**導出し、任意のAppContainerへACEを付けさせない。
+            // 依存しない）。fs-allowは§22.3.1により宣言ごとのcapability SID宛で、その主体は
+            // `grant_fs_allow_entries`が受け取った秘密と書込先のパスから自ら導出する。
             let traverse_cap = match win_appcontainer::traverse_capability_sid() {
                 Ok(cap) => cap,
                 Err(e) => {
@@ -437,46 +483,10 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
             let (traverse_granted, traverse_error) =
                 grant_traverse_targets(traverse_cap.as_psid(), traverse_targets);
 
-            let (fs_allow_granted, fs_allow_failures) = if fs_allow_entries.is_empty() {
-                (Vec::new(), Vec::new())
-            // D-38: MCPサーバのプロファイル（`harness.mcp.<token>.<id>`）も、実行ファイルが
-            // システム保護パスにある場合（`C:\Program Files\nodejs`等）にここへ来る。
-            // 検証は`is_harness_profile_name`1本に統一する——2つの述語を呼び分ける形にすると、
-            // 片方の呼び出しを足し忘れたときに検証をすり抜ける経路が生まれる。
-            } else if !crate::tier2a::mcp_profile::is_harness_profile_name(&session_profile) {
-                log::line("dispatch: rejected a malformed appcontainer profile name");
-                let failures = fs_allow_entries
-                    .into_iter()
-                    .map(|e| {
-                        (
-                            e.path,
-                            "rejected: malformed session profile name".to_string(),
-                        )
-                    })
-                    .collect();
-                (Vec::new(), failures)
-            } else {
-                // [BUG-107] **導出であって作成ではない。** ここは昇格した別プロセスなので、
-                // `ensure_profile`だと親のセッション名で資源を作りながら台帳には載せられない
-                // （`begin_session`が発火するのは持ち主のプロセスだけ）。しかも`runas`の昇格先が
-                // 別の管理者アカウントだと**別のHKCUハイブ**に作るので、非昇格側からは見えない
-                // プロファイルが増える。ACEを付けるのに要るのはSIDの値だけである。
-                match win_appcontainer::derive_profile_sid(&session_profile) {
-                    Ok(session_sid) => {
-                        grant_fs_allow_entries(session_sid.as_psid(), fs_allow_entries)
-                    }
-                    Err(e) => {
-                        log::line(&format!("dispatch: ensure_profile(session) failed: {e}"));
-                        let failures = fs_allow_entries
-                            .into_iter()
-                            .map(|entry| {
-                                (entry.path, format!("failed to resolve session SID: {e}"))
-                            })
-                            .collect();
-                        (Vec::new(), failures)
-                    }
-                }
-            };
+            // [§22.3.1] **fs-allowの主体はもうセッションプロファイル名から導出しない。**
+            // 宣言ごとのcapability SIDへ移したので、名前を受け取って検証する段はここには無く、
+            // 導出はエントリごとに`grant_fs_allow_entries`の中で行う（同関数のdoc）。
+            let (fs_allow_granted, fs_allow_failures) = grant_fs_allow_entries(fs_allow_entries);
             log::line(&format!(
                 "dispatch: GrantWorkspaceAccess done, {} traverse node(s) granted (error={:?}), \
                  {} fs-allow granted, {} fs-allow failed",
@@ -506,24 +516,86 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
             for entry in entries {
                 let path = entry.path;
                 let started = std::time::Instant::now();
-                // [BUG-101] 撤収する主体は**このパスのDACLに実在するharness由来のSID**で決める
-                // （旧実装は`ensure_profile(CONTAINER_NAME)`＝旧共有プロファイル固定だった）。
+                // [§22.2.1] **宣言capabilityは、受け取った秘密からこの側で導出して名指しで剥がす。**
+                // 付与（`grant_fs_allow_entries`）とまったく同じ導出を通す——ここだけ別の決め方に
+                // すると、同じ宣言なのに付与と撤収で違う主体を見ることになる（B-02）。
+                //
+                // **空は拒否しない。** 付与側は秘密の無い電文をfail-closedで拒むが、撤収で
+                // 止めると剥がせないACEが実マシンに残る。剥がせた／見ていないの区別は、
+                // 非昇格側が自分の台帳で実DACLを検算して付ける。
+                let declaration_subjects: Vec<crate::win_common::OwnedSid> = entry
+                    .subjects
+                    .iter()
+                    .filter(|s| !s.secret_hex.is_empty())
+                    .filter_map(|s| {
+                        let name = crate::tier2a::workspace_capability::declaration_capability_name(
+                            &s.secret_hex,
+                            &crate::tier2a::workspace_capability::declaration_key(&path),
+                            s.access.label(),
+                        );
+                        match win_appcontainer::capability_sid_from_declaration_name(&name) {
+                            Ok(sid) => Some(sid),
+                            Err(e) => {
+                                log::line(&format!(
+                                    "  path {} : could not derive a declaration capability: {e}",
+                                    path.display()
+                                ));
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                // [BUG-101] package SID側の撤収する主体は**このパスのDACLに実在するharness由来の
+                // SID**で決める（旧実装は`ensure_profile(CONTAINER_NAME)`＝旧共有プロファイル固定だった）。
                 //
                 // **昇格側では台帳の記録（規則3）と未登録SIDの指紋（規則4）は使わない。**
                 // `runas`の昇格先が別の管理者アカウントだと`HKCU`が別ハイブになり、分類の
                 // 前提（この機の登録簿を見ている）が崩れる。分類できないものは剥がさず、
                 // 非昇格側が名指しで報告する（fail-closed）。
-                let do_revoke =
-                    || win_appcontainer::revoke_harness_subjects(&path, &[], &|_, _| {});
-                let outcome = if entry.forced {
+                let do_revoke = || {
+                    // 宣言capabilityを先に剥がす。どちらの順でも最終状態は同じだが、
+                    // 失敗したときに「新しい主体は落ちたのに旧い主体が残った」より
+                    // 「旧い主体は落ちたが新しい主体が残った」の方が、次の起動の検算
+                    // （§22.3.0の不変条件＝package SID宛が0本）で見つかる側に倒れる。
+                    let decl = win_appcontainer::revoke_capability_subjects(
+                        &path,
+                        &declaration_subjects,
+                        &|_, _| {},
+                    );
+                    let subjects = win_appcontainer::revoke_harness_subjects(&path, &[], &|_, _| {});
+                    (decl, subjects)
+                };
+                let (decl_outcome, outcome) = if entry.forced {
                     // forcedなパス（--force-system-aclで付与したACE）は撤収時も
                     // `SeRestorePrivilege`が要る。
                     win_appcontainer::with_restore_privilege(do_revoke)
                 } else {
                     do_revoke()
                 };
+                // 宣言側の結末は**件数だけ**ログへ出す（秘密を持つ要求なので中身を書かない）。
+                match &decl_outcome {
+                    Ok(report) => log::line(&format!(
+                        "  path {} : declaration capabilities: {} targeted, {} node(s) rewritten, \
+                         {} still on the root",
+                        path.display(),
+                        report.targeted.len(),
+                        report.rewritten,
+                        report.still_on_root.len()
+                    )),
+                    Err(e) => log::line(&format!(
+                        "  path {} : declaration capability revoke FAILED: {e}",
+                        path.display()
+                    )),
+                }
+                // **宣言側が終わっていなければ、このパスは「撤収できた」ではない。**
+                // package側だけを見て`revoked`へ積むと、非昇格側は「ヘルパーが片付けた」と
+                // 読み、capability宛ACEが残ったまま台帳の記録を捨てにいく（B-09）。
+                let decl_left: Vec<String> = match &decl_outcome {
+                    Ok(report) => report.still_on_root.clone(),
+                    Err(e) => vec![format!("declaration capability revoke failed: {e}")],
+                };
                 match outcome {
-                    Ok(report) if report.unfinished().is_empty() => {
+                    Ok(report) if report.unfinished().is_empty() && decl_left.is_empty() => {
                         log::line(&format!(
                             "  path {} : revoked {} subject(s), {} node(s) rewritten in {}ms",
                             path.display(),
@@ -534,17 +606,23 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                         revoked.push(path);
                     }
                     Ok(report) => {
+                        let left: Vec<String> = report
+                            .unfinished()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .chain(decl_left)
+                            .collect();
                         log::line(&format!(
                             "  path {} : FAILED after {}ms (still on the root: {})",
                             path.display(),
                             started.elapsed().as_millis(),
-                            report.unfinished().join(", ")
+                            left.join(", ")
                         ));
                         failures.push((
                             path,
                             format!(
                                 "still on the root after an elevated revoke: {}",
-                                report.unfinished().join(", ")
+                                left.join(", ")
                             ),
                         ));
                     }

@@ -134,23 +134,44 @@ pub(crate) fn fs_prune(dry_run: bool) -> ExitCode {
         report.print("workspace-grant-ledger.json", dry_run);
     }
 
-    // --- workspace capability（D-54） ---
+    // --- workspace capability（D-54・§22.2.1） ---
     //
     // 使い捨てworkspace（テストのtempdir等）を開くたびに1件増えるので、掃かないと
-    // **秘密の記録が際限なく積もる**。消えたツリーのACEを撤収できなくなる心配は無い
-    // ——ツリーが無いので撤収すべきものが存在しない。
+    // **秘密の記録が際限なく積もる**。
+    //
+    // **エントリの種類で見る対象が違う。**
+    //
+    // | エントリ | ACEが載っている場所 | 「消えた」と言える条件 |
+    // |---|---|---|
+    // | workspace本体（`declaration`が無い） | workspaceツリーそのもの | workspaceが実在しない |
+    // | 宣言（`--fs-allow`、§22.2.1） | **workspaceの外の宣言パス** | **宣言パス**が実在しない |
+    //
+    // 宣言エントリをworkspaceの実在で判定すると、使い捨てworkspaceが消えて宣言先
+    // （`C:\tools\node`のような常設のパス）が残っている場合に、**剥がすための名前だけが
+    // 先に消える**——その主体のACEはどのコマンドでも剥がせない孤児になる（`B-01`の
+    // 「名前を捨てる操作を最後に置く」に反する）。この機能はACEを一切撤収しないので、
+    // **名前を捨ててよいのは、そのACEが載る先ごと消えているときだけ**である。
     #[cfg(windows)]
     {
         let entries = harness_sandbox::tier2a::workspace_capability::all_entries();
-        let paths: Vec<String> = entries.iter().map(|e| e.workspace.clone()).collect();
-        let (mut report, gone) = classify_all(&paths);
+        // 判定対象のパス（本体＝workspace、宣言＝宣言パス）をエントリと同じ順で並べる。
+        // **どちらを見るかを決めるのは`prune_target`ただ1つ**にする——測る側と落とす側で
+        // 別々に書くと、片方だけ更新されて静かにずれる。
+        let targets: Vec<String> = entries.iter().map(|e| e.prune_target()).collect();
+        let (mut report, gone) = classify_all(&targets);
         if !dry_run && !gone.is_empty() {
             report.removed =
-                harness_sandbox::tier2a::workspace_capability::prune_capability_entries(|p| {
-                    gone.contains(&p.to_string_lossy().to_string())
+                harness_sandbox::tier2a::workspace_capability::prune_capability_entries(|entry| {
+                    gone.contains(&entry.prune_target())
                 });
         } else {
-            report.removed = gone;
+            // **dry-runと本番で同じ名札を出す。** 判定対象（畳み込み済みのパス）をそのまま
+            // 出すと綴りが本番の報告と食い違い、「予告と違うものが消えた」と読まれる。
+            report.removed = entries
+                .iter()
+                .filter(|e| gone.contains(&e.prune_target()))
+                .map(|e| e.display_label())
+                .collect();
         }
         total_removed += report.removed.len();
         total_unreachable += report.unreachable.len();

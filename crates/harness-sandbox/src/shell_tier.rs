@@ -174,6 +174,17 @@ impl FsAccess {
         }
     }
 
+    /// [`Self::label`]の逆。**綴りは`label`を回して突き合わせる**——2つ目の対応表を書くと、
+    /// variantを足したときに片方だけ更新されて静かにずれる（`B-05`）。ここは
+    /// `workspace-capability-ledger`が`mode`欄へ保存した級を読み戻すために要る
+    /// （台帳は文字列で持つので、型へ戻す口がどこかに1つ要る）。
+    ///
+    /// 知らない綴りは`None`。**既定値へ倒さない**——級が違えば主体そのものが別になるので、
+    /// 「たぶんこれだろう」で埋めると存在しないSIDを剥がしに行くことになる（`B-10`）。
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.label() == label)
+    }
+
     /// 設定語彙（3値）から付与層の値へ。
     pub fn from_settings(access: harness_config::FsAccess) -> Self {
         match access {

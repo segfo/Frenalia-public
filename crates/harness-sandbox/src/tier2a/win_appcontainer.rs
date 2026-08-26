@@ -209,6 +209,72 @@ pub fn workspace_capability_sid(
     capability_sid_from_name(&name)
 }
 
+/// `--fs-allow`の**宣言1件**のFS付与の主体（§22.3）。
+///
+/// D-54がworkspaceツリーに対してやったことを、宣言されたパスに対して行う。以前この穴は
+/// **セッションのpackage SID**宛だった——package SIDはAppContainer全体で共有されるので、
+/// そのACEは同一セッションの**全ドメイン**に効いてしまい、per-domainのFS制御は原理的に
+/// 作れなかった（§22.3）。
+///
+/// 主体は§22.2.0の導出鍵`(秘密, 畳み込み済みパス, access級)`から決まる。したがって
+/// **同じ宣言をするドメインは何もしなくても同じSIDを共有し**、1つの宣言パスに載るACEは
+/// access級の数（最大3本）で止まる（§22.3.3）。
+///
+/// **`workspace`はcanonicalize済みを渡すこと**（[`workspace_capability_sid`]と同じ理由）。
+/// `declared_path`側の綴りは`declaration_key`が畳むので、呼び出し側で正規化しなくてよい。
+///
+/// **`access`は実際に付けるアクセスを渡すこと。** CoWでRO降格した場合は降格後の値である
+/// ——導出に使った級と実際に書いたマスクがずれると、撤収側は別の主体を探しに行く。
+pub fn fs_allow_capability_sid(
+    workspace: &Path,
+    declared_path: &Path,
+    access: FsAccess,
+) -> Result<crate::win_common::OwnedSid, AppContainerError> {
+    let name = crate::tier2a::workspace_capability::ensure_declaration_capability_name(
+        workspace,
+        declared_path,
+        access.label(),
+    )
+    .map_err(AppContainerError::Preflight)?;
+    capability_sid_from_name(&name)
+}
+
+/// `declared_path`宛に**既に発行済み**の宣言capability SIDを引く（発行はしない）。
+///
+/// 撤収側（`harness fs revoke <path>`・セッション終了時の自動撤収）が使う。
+/// §22.2.1の doctrine どおり、ACLを列挙して主体を推定するのではなく**宣言から導出した
+/// SIDを名指しで**剥がすための入口である（`revoke_subjects.rs`の分類器は使わない。
+/// あちらはpackage SID専用で、capability SIDを混ぜないことが意図である）。
+///
+/// `workspace`が`Some`ならそのworkspaceが発行したものだけに絞る（絞らない側の注意は
+/// [`crate::tier2a::workspace_capability::declaration_capability_names`]のdoc）。
+pub fn fs_allow_capability_sids(
+    declared_path: &Path,
+    workspace: Option<&Path>,
+) -> Vec<crate::win_common::OwnedSid> {
+    crate::tier2a::workspace_capability::declaration_capability_names(declared_path, workspace)
+        .iter()
+        .filter_map(|name| capability_sid_from_name(name).ok())
+        .collect()
+}
+
+/// [§22.3.1] **昇格側が、受け取った秘密から自分で導出した名前**をSIDへ写す。
+///
+/// 名前は`declaration_capability_name`が`(秘密, 畳み込み済みパス, access級)`から作ったもので、
+/// **IPCで名前やSIDを受け取っているのではない**（`privhelper`モジュールdocの「SIDはIPCで
+/// 受け取らず、受信側が自ら導出する」を字義どおり保つ）。形の検証をここでも行うのは、
+/// 呼び出し順を間違えて別種の名前が来たときに黙って通さないためである。
+pub fn capability_sid_from_declaration_name(
+    name: &str,
+) -> Result<crate::win_common::OwnedSid, AppContainerError> {
+    if !crate::tier2a::workspace_capability::is_declaration_capability_name(name) {
+        return Err(AppContainerError::Preflight(format!(
+            "refusing to derive a SID from {name:?}: it is not a declaration capability name"
+        )));
+    }
+    capability_sid_from_name(name)
+}
+
 /// 名前からcapability SIDを導出する（`DeriveCapabilitySidsFromName`）。
 ///
 /// **名前を知っている者は誰でもこれを呼べる**（特権不要）。したがって、この関数で導出した
@@ -419,6 +485,9 @@ mod preflight;
 /// 決定（どのプローブをどの順で打つか）は`preflight`が持ち、ここは観測だけを持つ。
 mod preflight_probe;
 mod revoke;
+/// 撤収の主体のうち、**宣言（`--fs-allow`）から一意に導出できるもの**を決める層（§22.2.1）。
+/// `revoke_subjects`（DACLに実在するpackage SIDを分類する）とは探し方が違うので分けている。
+mod revoke_declarations;
 /// 撤収の**主体**を決める層（[BUG-101](../../../docs/bugs/BUG-101.md)欠陥②）。
 /// 「どのSIDのACEを剥がすか」を、名前から導出したSIDではなく**対象パスのDACLに実在するSID**
 /// から決める。`revoke`（剥がし方）とは責務が別なので分けている。
@@ -433,6 +502,7 @@ pub use mcp_preflight::*;
 pub use preflight::*;
 pub(crate) use preflight_probe::*;
 pub use revoke::*;
+pub use revoke_declarations::*;
 pub use revoke_subjects::*;
 pub use spawn::*;
 pub use spawn_session::*;

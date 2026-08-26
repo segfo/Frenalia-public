@@ -157,7 +157,7 @@ fn the_production_spawn_path_closes_cross_domain_process_and_thread_access() {
         sid.as_psid(),
         NetworkCapability::Deny,
         None,
-        Some(cap_a.as_psid()),
+        &[cap_a.as_psid()],
         DomainIdentity::Capability(cap_a.as_psid()),
     )
     .expect("spawn the domain-A target through the production path");
@@ -219,7 +219,7 @@ fn the_production_spawn_path_closes_cross_domain_process_and_thread_access() {
             sid.as_psid(),
             NetworkCapability::Deny,
             None,
-            Some(cap.as_psid()),
+            &[cap.as_psid()],
             DomainIdentity::Capability(cap.as_psid()),
         )
         .unwrap_or_else(|e| panic!("spawn the {label} attacker: {e}"));
