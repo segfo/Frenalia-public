@@ -2620,11 +2620,47 @@ fn fs_allow_case_bare_path_grants_the_object_only(ledger: &FsLedgerExclusive) ->
     Ok(())
 }
 
-/// `--fs-allow`が付けたACEは**セッション終了で失効する**（D-37の仕様、`docs/STATUS.md`が
-/// 不変条件として明記）。BUG-057は「昇格経由の付与がsession ledgerに載らず、
-/// `end_session`の自動撤収から漏れる」欠陥だった——`harness fs revoke`は効くので気付きにくい。
-/// harnessプロセスが終了した後に対象へAppContainer SIDのACEが残っていないことを確かめる。
-fn fs_allow_case_ace_is_revoked_when_the_session_ends(ledger: &FsLedgerExclusive) -> Result<(), String> {
+/// `path`のDACLに載っている、接頭辞`prefix`のSIDのACE本数（実DACLを`Get-Acl`で読む）。
+///
+/// **台帳ではなく実体を見る**（`B-14`）。`S-1-15-2-`はAppContainerのpackage SID、
+/// `S-1-15-3-`はcapability SIDで、`--fs-allow`の主体は前者から後者へ移った（§22.3）。
+fn count_sid_aces(path: &Path, prefix: &str) -> Result<usize, String> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "@((Get-Acl '{}').Access | Where-Object {{ $_.IdentityReference -like '{prefix}*' }}).Count",
+                path.display()
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("failed to run Get-Acl: {e}"))?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<usize>()
+        .map_err(|e| format!("could not read the ACE count for {}: {e}", path.display()))
+}
+
+/// [§22.2.1] **`--fs-allow`のACEはharnessの終了後も残り、`harness fs revoke`で消える。**
+///
+/// # このテストは意味を変えてある（旧名 `..._is_revoked_when_the_session_ends`）
+///
+/// 旧版は「セッション終了でACEが失効する」（D-37の仕様）を測っており、その手段として
+/// **`S-1-15-2-*`（package SID）の本数が0になること**だけを見ていた。主体が宣言ごとの
+/// capability SID（`S-1-15-3-*`）へ移った後もこのassertはそのまま通る——**測る相手が
+/// 変わっただけで、テストは緑のまま意味だけが嘘になる**（`B-08`）。
+///
+/// いま固定するのは3つ。
+///
+/// 1. 終了後、**package SID宛は0本**（§22.3.0の移行の不変条件。1本でも残っていれば、
+///    その1本が同一セッションの全ドメインへ許可を出し続ける）
+/// 2. 終了後、**宣言capability宛は残っている**（§22.2.1の寿命そのもの。セッション終了時に
+///    剥がすと、同じワークスペースの並行セッションが互いの許可を落とす）
+/// 3. `harness fs revoke <path>`の後、**どちらも0本**（T1-cの受け入れ条件1）
+fn fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it(
+    ledger: &FsLedgerExclusive,
+) -> Result<(), String> {
     let ws = case_dir("fs-allow-revoke");
     let target = fs_allow_case_dir("revoke");
     std::fs::write(target.join("f.txt"), "x").map_err(|e| e.to_string())?;
@@ -2638,25 +2674,65 @@ fn fs_allow_case_ace_is_revoked_when_the_session_ends(ledger: &FsLedgerExclusive
     );
     parse_json_stdout(&run)?;
 
-    // harnessは既に終了している。ACEが残っていれば、それは撤収経路から漏れたということ。
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "@((Get-Acl '{}').Access | Where-Object {{ $_.IdentityReference -like 'S-1-15-2-*' }}).Count",
-                target.display()
-            ),
-        ])
-        .output()
-        .map_err(|e| format!("failed to run Get-Acl: {e}"))?;
-    let count = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if count != "0" {
+    // (1) 移行の不変条件。**capability宛を足しただけでは1ミリも成立しない**ので、
+    // 「新しい主体が付いたか」ではなく「**旧い主体が消えたか**」を測る（§22.3.0）。
+    let package = count_sid_aces(&target, "S-1-15-2-")?;
+    if package != 0 {
         return Err(format!(
-            "BUG-057: {} still carries {count} AppContainer ACE(s) after the harness session ended; \
-             `--fs-allow` grants must expire with the session (D-37)",
+            "§22.3.0: {} still carries {package} package-SID ACE(s) after the harness session \
+             ended; that one ACE keeps the path open to every domain in the session",
             target.display()
         ));
+    }
+
+    // (2) 新しい寿命。**この行が旧版には無かった**——無いと、付与そのものが壊れて
+    // 「1本も付かなかった」場合も(1)は緑になる（0件と成功を同じ値にしない、`B-09`）。
+    let subjects = harness_sandbox::tier2a::win_appcontainer::fs_allow_capability_sids(&target, None);
+    if subjects.is_empty() {
+        return Err(format!(
+            "§22.2.1: the capability ledger has no declaration subject for {}, so the grant path \
+             never minted one (nothing could revoke it later either)",
+            target.display()
+        ));
+    }
+    let capability = count_sid_aces(&target, "S-1-15-3-")?;
+    if capability == 0 {
+        return Err(format!(
+            "§22.2.1: {} carries no declaration capability ACE after the session ended; \
+             `--fs-allow` grants are persistent by design and the named door is the way to \
+             remove them",
+            target.display()
+        ));
+    }
+
+    // (3) 名前の付いた扉で両方が消えること（T1-cの受け入れ条件1）。
+    let revoke = Command::new(harness_exe())
+        .args(["fs", "revoke"])
+        .arg(&target)
+        .output()
+        .map_err(|e| format!("failed to run `harness fs revoke`: {e}"))?;
+    eprintln!(
+        "[fs-allow-revoke] fs revoke -> {} {}",
+        revoke.status,
+        String::from_utf8_lossy(&revoke.stdout).trim()
+    );
+    if !revoke.status.success() {
+        return Err(format!(
+            "`harness fs revoke {}` failed: {}{}",
+            target.display(),
+            String::from_utf8_lossy(&revoke.stdout),
+            String::from_utf8_lossy(&revoke.stderr)
+        ));
+    }
+    for prefix in ["S-1-15-2-", "S-1-15-3-"] {
+        let left = count_sid_aces(&target, prefix)?;
+        if left != 0 {
+            return Err(format!(
+                "{} still carries {left} {prefix}* ACE(s) after `harness fs revoke`; the named \
+                 door must leave zero of both subjects (T1-cの受け入れ条件1)",
+                target.display()
+            ));
+        }
     }
 
     // 台帳から自分のエントリを落としてから消す。`--fs-allow`由来のエントリは
@@ -2692,8 +2768,8 @@ fn tier2a_fs_allow_matrix() {
             fs_allow_case_bare_path_grants_the_object_only,
         ),
         (
-            "ace-revoked-at-session-end",
-            fs_allow_case_ace_is_revoked_when_the_session_ends,
+            "ace-persists-after-exit-and-the-named-door-removes-it",
+            fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it,
         ),
     ];
     let mut passed = 0;
@@ -3148,11 +3224,13 @@ fn tier2a_mcp_corroboration() {
 //     （`crates/harness-sandbox/src/lib.rs`）で直列化される。複数の`harness.exe`を同時に
 //     起動しても、あるプロセスのタグ付けが別のプロセスの書込に踏み潰されてはならない。
 //
-// **ACEの寿命はここでは測らない。** D-37でAppContainerプロファイルがセッション単位になった結果、
-// fs passthroughのACEはセッション固有SID宛に付き`end_session`が撤収する（＝harnessが終了した
-// 時点で必ず0本になる。その事実は`fs_allow_case_ace_is_revoked_when_the_session_ends`が固定して
-// いる）。したがって「他のワークスペースが参照しているからACEが残る」という測り方は**現在の設計
-// では成立しない**——残るのは台帳エントリの方であり、D-27が今守っているのは帳簿の側である。
+// **ACEの寿命はここでは測らない。** [§22.2.1] `--fs-allow`の主体は宣言ごとのcapability SIDへ
+// 移り、そのACEは**harnessの終了後も残る**（共有され得る宣言をセッション終了時に剥がすと、
+// 同じワークスペースの並行セッションが互いの許可を落とすため）。寿命そのものと、名前の付いた扉
+// （`harness fs revoke`）で消えることは
+// `fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it`が固定している。
+// ここで測るのは帳簿の側——D-27が守っているのは「誰も宣言しなくなったら撤収対象にする」という
+// 参照カウントの契約である。
 //
 // `dev-elevated-run.exe e2e-fs-ledger`（フィルタ`tier2a_fs_ledger_lifecycle`）。
 
