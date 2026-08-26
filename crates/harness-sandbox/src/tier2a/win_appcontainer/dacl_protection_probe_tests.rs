@@ -188,50 +188,14 @@ fn probe_root() -> std::path::PathBuf {
     std::env::temp_dir().join("harness-bug083-probe")
 }
 
-/// `path`のDACLのACEを1件ずつ「種別;フラグ;マスク;SID」の文字列にして返す。
-///
-/// 耐久確認（[`CaseResult::aces_after_propagate`]）のために、件数だけでなく**trusteeと
-/// マスクまで**比較できる形にする——件数が同じでも中身が入れ替わっていれば、
-/// 「Administratorsを失っていない」とは言えないため。
-fn describe_dacl_aces(path: &Path) -> windows::core::Result<Vec<String>> {
-    unsafe {
-        let path_w = long_path_wide(path);
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        GetNamedSecurityInfoW(
-            PCWSTR(path_w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut dacl),
-            None,
-            &mut sd,
-        )
-        .ok()?;
-
-        let mut out = Vec::new();
-        if !dacl.is_null() {
-            for index in 0..(*dacl).AceCount as u32 {
-                let mut ace_ptr: *mut c_void = std::ptr::null_mut();
-                if GetAce(dacl, index, &mut ace_ptr).is_err() || ace_ptr.is_null() {
-                    continue;
-                }
-                let header = &*(ace_ptr as *const ACE_HEADER);
-                let ace = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
-                let ace_sid = PSID(&ace.SidStart as *const u32 as *mut c_void);
-                let sid_string = crate::win_common::sid_to_string(ace_sid)
-                    .unwrap_or_else(|_| "<unreadable>".to_string());
-                out.push(format!(
-                    "type={:#04x};flags={:#04x};mask={:#010x};{sid_string}",
-                    header.AceType, header.AceFlags, ace.Mask
-                ));
-            }
-        }
-        let _ = LocalFree(HLOCAL(sd.0));
-        Ok(out)
-    }
-}
+// `path`のDACLのACEを1件ずつ「種別;フラグ;マスク;SID」の文字列にして返す部品。
+// 耐久確認（`CaseResult::aces_after_propagate`）のために、件数だけでなくtrusteeとマスクまで
+// 比較できる形にしてある——件数が同じでも中身が入れ替わっていれば、
+// 「Administratorsを失っていない」とは言えないため。
+//
+// **実体は`test_support`へ移した**——`acl_dacl_size_limit_tests`（DACLの上限に当たったとき
+// 無言で切り捨てられるか）が2箇所目の利用者になったため（`docs/CODE-STRUCTURE-RULES.md`規則5）。
+use super::test_support::describe_dacl_aces;
 
 /// `dacl`（自前バッファ上のコピー）の全ACEから`INHERITED_ACE`を落とす（候補C）。
 ///

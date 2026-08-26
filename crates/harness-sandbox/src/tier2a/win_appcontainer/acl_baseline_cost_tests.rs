@@ -1,5 +1,31 @@
-//! **現状1主体でのACL付与コストの基準線**（`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` のM1）。
-//! 結果の正本は `plans/mac-spike/RESULTS.md` §S10。
+//! **ACL付与コストの測定**（`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`）。
+//! 結果の正本は `plans/mac-spike/RESULTS.md`——M1が §S10、M3が §S12。
+//!
+//! # 2つの寿命が同居している
+//!
+//! | 何 | テスト名の接頭辞 | 寿命 |
+//! |---|---|---|
+//! | M1 | `acl_baseline_cost_*` | **残す。**うち2本は残課題#32の回帰になった（`granted == 0`のassert） |
+//! | **M3** | `acl_ace_count_cost_*` | **残課題#20の実装が終わったら消す**（下記） |
+//!
+//! 接頭辞が分けてあるので、`cargo test -- acl_ace_count_cost`でM3だけを回せる。
+//!
+//! ## M3を「§S12を書いたら消す」にしなかった理由（`docs/CODE-STRUCTURE-RULES.md`規則2の例外）
+//!
+//! 規則2は一回性の調査実験をテストとして残すなと言う。**M3の問いは§S12で閉じている**ので、
+//! 本来はここで消える。**残してあるのは、#20の実装がいま進行中で、この測定が
+//! その実装の判断に直接効くからである**——§S12が出した答えは
+//! 「**部品を使えば0倍、主体ごとに伝播を呼ぶと約2.9倍**」で、**どちらに転ぶかは実装の書き方
+//! だけで決まる**。実装しながら「いま書いた形はどちらか」を測り直せる状態にしておく。
+//!
+//! **したがって消す条件は日付ではなく出来事である**——`docs/STATUS.md`残課題#20 が
+//! 実装完了になったら、`acl_ace_count_cost_*` の2本と、それだけが使っている
+//! `test_support::build_chain_tree`をまとめて消すこと。**引き継ぎ側にも同じことを書いてある**
+//! （`plans/HANDOFF-ISSUE-20-SUBJECT-MIGRATION.md`）。
+//!
+//! **同じファイルに置いてあるのは、ツリーの形と計器を共有するためである。**
+//! `FANOUT`・`file_count()`・`measure_capability`・`progress_to_stderr`・`revoke_and_verify`が
+//! 共通で、**形が違うと §S9／§S10 の数字と並べられない**。
 //!
 //! # なぜ測るのか
 //!
@@ -496,6 +522,429 @@ fn acl_baseline_cost_regrant_after_revoke_pays_again() {
             walk.granted, 0,
             "{label} grant: the propagating write must reach every existing descendant \
              (STATUS #32 regression, now measured on the revoke-and-regrant path too)"
+        );
+    }
+}
+
+// ===========================================================================
+// M3 — 残課題#20 の費用（`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` のM3、結果は §S12）
+//
+// **§S12を書いたらこのブロックごと消すこと**（規則2）。ただし`build_chain_tree`は
+// `test_support`に残す——`build_wide_tree`と対になる形の部品で、深さを測り直すときに要る。
+// ===========================================================================
+
+/// 1腕ぶんの書込の形。**これが M3-a の測る当のものである。**
+#[derive(Clone, Copy, Debug)]
+enum WriteShape {
+    /// M本を1つのDACLへ畳んで**ノードあたり1回**書く（[`super::acl_dacl_write`]の本来の使い方）。
+    Merged,
+    /// 主体ごとに1回ずつ伝播させる＝**ノードあたりM回**。§S9-3が「約2倍」を出した素朴な形で、
+    /// **対照としてしか使わない**——これが無いと「平坦」を「今日はマシンが速い」と
+    /// 区別できない（B-35）。
+    OnePerSubject,
+}
+
+/// M本ぶんの主体を作る。**マスクを主体ごとに変えてあるのが要点**——全部同じにすると、
+/// 1本しか配れていなくても「どれかのACEが届いている」で緑になる（B-35）。
+/// 順番は固定で、Mを増やしても前のM本の意味が変わらないようにしてある。
+fn m_subjects(label: &str, m: usize) -> Vec<(crate::win_common::OwnedSid, u32)> {
+    let masks = [
+        workspace_rwx_mask(),
+        fs_access_mask(FsAccess::Read),
+        fs_access_mask(FsAccess::ReadExec),
+    ];
+    assert!(
+        m >= 1 && m <= masks.len(),
+        "M is bounded by the design at 3 (one declared path yields ro/rw/rx at most)"
+    );
+    (0..m)
+        .map(|i| (measure_capability(&format!("{label}-s{i}")), masks[i]))
+        .collect()
+}
+
+/// 1腕を測って結果をJSONで返す。**時間を読む前に必ず検算を通す**——§S9-4は
+/// 「1.01倍と出たが、それは何もしていないから速かった」を実際に踏んでいる。
+///
+/// 検算は3つとも既存部品で行い、**新しい検算を足さない**
+/// （[`super::acl_dacl_write`]のdocが「同じ事実を2箇所で判定しない」と定めている、B-05）。
+///
+/// 1. 葉（ファイルとディレクトリの両方）の実効マスクが**その主体自身のマスク**と一致する
+/// 2. 救済walkが全ノードを歩き（`checked == nodes`）、**1件も書いていない**（`granted == 0`）
+/// 3. 撤収後に対象SIDのACEが1本も残っていない（BUG-101）
+///
+/// `leaf_dir`/`leaf_file`は**そのツリーで最も深い**ものを渡すこと——浅いところだけ届いて
+/// 深いところが落ちる形を拾うため（深い腕でこれを外すと測定の意味が消える）。
+fn measure_arm(
+    label: &str,
+    root: &Path,
+    nodes: usize,
+    subjects: &[(crate::win_common::OwnedSid, u32)],
+    leaf_dir: &Path,
+    leaf_file: &Path,
+    shape: WriteShape,
+) -> serde_json::Value {
+    use super::acl_dacl_write::{grant_aces_propagating, InheritableGrant};
+
+    let both = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    let grants: Vec<InheritableGrant> = subjects
+        .iter()
+        .map(|(sid, mask)| InheritableGrant {
+            sid: sid.as_psid(),
+            mask: *mask,
+            inheritance: both,
+        })
+        .collect();
+
+    // --- 測る区間はここだけ ---
+    let started = Instant::now();
+    match shape {
+        WriteShape::Merged => {
+            grant_aces_propagating(root, &grants, IdempotentCheck::Always).unwrap_or_else(|e| {
+                panic!(
+                    "{label}: one propagating write for {} subjects: {e}",
+                    grants.len()
+                )
+            })
+        }
+        WriteShape::OnePerSubject => {
+            for (i, grant) in grants.iter().enumerate() {
+                grant_aces_propagating(root, std::slice::from_ref(grant), IdempotentCheck::Always)
+                    .unwrap_or_else(|e| panic!("{label}: propagating write #{i}: {e}"));
+            }
+        }
+    }
+    let propagate_ms = started.elapsed().as_millis();
+
+    // --- 検算1: 最深部の葉が、主体ごとに違う正しいマスクを持っているか ---
+    for (i, (sid, mask)) in subjects.iter().enumerate() {
+        for leaf in [leaf_file, leaf_dir] {
+            let effective = sid_effective_ace_mask(leaf, sid.as_psid()).unwrap_or_else(|e| {
+                panic!("{label}: read the effective mask of {}: {e}", leaf.display())
+            });
+            assert_eq!(
+                effective,
+                Some(*mask),
+                "{label}: subject #{i} must carry exactly its own mask on the deepest leaf {} — \
+                 if this is None the write reached nothing and the timing above is meaningless",
+                leaf.display()
+            );
+        }
+    }
+
+    // --- 検算2: 救済walkに仕事が残っていない＝伝播が全ノードへ届いた ---
+    let walk_started = Instant::now();
+    for (i, (sid, mask)) in subjects.iter().enumerate() {
+        let report = fix_descendants_missing_ace(root, sid.as_psid(), *mask, &[], &|_, _| {})
+            .unwrap_or_else(|e| panic!("{label}: rescue walk for subject #{i}: {e}"));
+        assert_eq!(
+            report.checked, nodes,
+            "{label}: subject #{i}: the walk must visit every node before its `granted` is read"
+        );
+        assert_eq!(
+            report.probe_errors, 0,
+            "{label}: subject #{i}: a node whose DACL could not be read is counted as granted, so \
+             a non-zero value here makes the comparison meaningless"
+        );
+        assert_eq!(
+            report.granted, 0,
+            "{label}: subject #{i}: the propagating write must reach every existing descendant, \
+             but {} of {} nodes still needed an explicit grant",
+            report.granted, report.checked
+        );
+    }
+    let verify_walk_ms = walk_started.elapsed().as_millis();
+
+    // --- 撤収（M本を1回のwalkで剥がす既存部品。SIDごとに舐め直さない） ---
+    let psids: Vec<PSID> = subjects.iter().map(|(sid, _)| sid.as_psid()).collect();
+    let revoke_started = Instant::now();
+    let revoke_report = revoke_workspace_sids_recursive(root, &psids, &progress_to_stderr("revoke"))
+        .unwrap_or_else(|e| panic!("{label}: revoke every measurement subject: {e}"));
+    let revoke_ms = revoke_started.elapsed().as_millis();
+
+    // --- 検算3: 剥がれたことを戻り値ではなく読み直しで確かめる（BUG-101） ---
+    for (i, (sid, _)) in subjects.iter().enumerate() {
+        if let Err(leftovers) = assert_no_sid_ace_recursive(root, sid.as_psid()) {
+            panic!(
+                "{label}: subject #{i} still has ACEs on {} node(s) after revoke; first few: {:?}",
+                leftovers.len(),
+                leftovers.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    serde_json::json!({
+        "arm": label,
+        "subjects": subjects.len(),
+        "shape": format!("{shape:?}"),
+        "nodes": nodes,
+        "propagate_ms": propagate_ms,
+        "propagate_us_per_node": (propagate_ms as f64) * 1000.0 / (nodes as f64),
+        "verify_walk_ms": verify_walk_ms,
+        "revoke_ms": revoke_ms,
+        "revoke_checked": revoke_report.checked,
+        "revoke_rewritten": revoke_report.rewritten,
+    })
+}
+
+/// 平らなツリー（[`build_wide_tree`]）の最深部。深さは2段で固定なので`d000/f000000.txt`。
+fn wide_tree_leaves(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = root.join("d000");
+    let file = dir.join("f000000.txt");
+    (dir, file)
+}
+
+/// 鎖ツリー（`test_support::build_chain_tree`）の**最深部**。
+///
+/// ファイルは`i % depth`段目へ撒かれるので、最深段（`depth-1`）に載る最初のファイルは
+/// `f{depth-1}.txt`である。**ここを外して浅い葉を見ると、深い側が落ちていても緑になる。**
+fn chain_tree_leaves(root: &Path, depth: usize) -> (std::path::PathBuf, std::path::PathBuf) {
+    let mut dir = root.to_path_buf();
+    for _ in 0..depth {
+        dir = dir.join("d");
+    }
+    let file = dir.join(format!("f{:06}.txt", depth - 1));
+    (dir, file)
+}
+
+/// `root`から`depth`段の鎖を掘り、**最深段でファイルを1つ作って読んで消せるか**を確かめる。
+///
+/// 2万個を撒く前の関所である。深さ128の鎖はパス長がMAX_PATH(260)を越えるので、
+/// **作れるかどうかがそもそも不明**——そして作れてしまってから消せないと、
+/// `TestDirGuard`のDropが黙って失敗して実マシンに残骸が残る（Dropは`Result`を捨てる）。
+///
+/// 掘った鎖はそのまま残す（この後の`build_chain_tree`が同じ段を使う）。
+fn probe_chain_depth(root: &Path, depth: usize) -> Result<(), String> {
+    let mut cursor = root.to_path_buf();
+    for level in 0..depth {
+        cursor = cursor.join("d");
+        std::fs::create_dir_all(&cursor)
+            .map_err(|e| format!("cannot create level {level} of {depth}: {e}"))?;
+    }
+    let probe = cursor.join("probe.txt");
+    std::fs::write(&probe, b"x")
+        .map_err(|e| format!("cannot write a file at depth {depth}: {e}"))?;
+    std::fs::read(&probe).map_err(|e| format!("cannot read the file at depth {depth}: {e}"))?;
+    std::fs::remove_file(&probe)
+        .map_err(|e| format!("cannot remove the file at depth {depth}: {e}"))?;
+    Ok(())
+}
+
+/// **M3-a: 同一ノードのACE本数 M を 1・2・3 と振ったときの、初回伝播の時間。**
+///
+/// # 何が分かれば答えになるのか
+///
+/// HANDOFFは仮説を2つ立てている。**支配項がどちらかで結論が正反対になる。**
+///
+/// | 仮説 | 支配項 | Mを増やしたときの予測 |
+/// |---|---|---|
+/// | A | ツリーを歩くこと | 各ノードでDACLを1回書けば済むので **Mにほとんど依存しない** |
+/// | B | ノードごとの書込回数 | ACEごとに1回ずつ書くと **M倍** |
+///
+/// §S9-3 は素朴な実装（＝[`WriteShape::OnePerSubject`]）で 1.77〜2.03倍を出しており、
+/// **仮説Bの側**である。本測定が問うのは「**1回にまとめれば平坦になるか**」だけで、
+/// その部品は2026-08-26に本流へ入った（`acl_dacl_write::grant_aces_propagating`）。
+///
+/// **部品が在ることと、大きいツリーで平坦であることは別の事実である。**
+/// 部品の受け入れテスト（`acl_dacl_write_tests`）が確かめたのは真偽（届くか）だけで、
+/// **時間は1点も測っていない**（FANOUT=4・FILES=24）。それが本測定の存在理由。
+///
+/// # M=1 も新部品で測る理由
+///
+/// §S10-1（1,200 ms／59.9 µs per node）は`grant_workspace_root_rw`＝
+/// `grant_ace_mask_with(Propagate)`で測っており、**この部品を通らない別経路**である。
+/// そのまま並べると「Mが効いたのか経路が違うのか」が分からないので、M=1もここで測り直す。
+/// §S10-1と並べるときは**別経路の値である**と断ること。
+#[test]
+#[ignore = "creates tens of thousands of files and writes DACLs; run NON-elevated"]
+fn acl_ace_count_cost_of_folding_m_subjects_into_one_write() {
+    let count = file_count();
+    let mut arms = Vec::new();
+
+    // **腕ごとにツリーを作って壊す。** 4つ同時に置くとピークのディスクが4倍になるうえ、
+    // 「前の腕が残したACE」が次の腕の初期状態を変える（初回を測れなくなる）。
+    for (label, m, shape) in [
+        ("merged_m1", 1usize, WriteShape::Merged),
+        ("merged_m2", 2, WriteShape::Merged),
+        ("merged_m3", 3, WriteShape::Merged),
+        ("naive_m3", 3, WriteShape::OnePerSubject),
+    ] {
+        let dir = TestDirGuard::create(&format!("aclm-{label}"));
+        let root = dir.path();
+        let nodes = build_wide_tree(root, count, FANOUT);
+        let subjects = m_subjects(label, m);
+        let (leaf_dir, leaf_file) = wide_tree_leaves(root);
+        arms.push(measure_arm(
+            label, root, nodes, &subjects, &leaf_dir, &leaf_file, shape,
+        ));
+        eprintln!("  [{label}] done");
+    }
+
+    let ms = |i: usize| {
+        arms[i]["propagate_ms"]
+            .as_u64()
+            .expect("propagate_ms is a number")
+    };
+    let (m1, m2, m3, naive3) = (ms(0), ms(1), ms(2), ms(3));
+    let ratio = |a: u64, b: u64| {
+        if b == 0 {
+            f64::NAN
+        } else {
+            (a as f64) / (b as f64)
+        }
+    };
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "measurement": "S12 M3-a cost of folding M subjects into one propagating write",
+            "file_count": count,
+            "fanout": FANOUT,
+            "tree_shape": "wide (depth 2)",
+            "arms": arms,
+            "merged_m2_over_m1": ratio(m2, m1),
+            "merged_m3_over_m1": ratio(m3, m1),
+            "naive_m3_over_merged_m3": ratio(naive3, m3),
+            "naive_m3_over_m1": ratio(naive3, m1),
+        })
+    );
+
+    // **対照が効いていることだけをassertする。** M軸の比は測る当のものなので固定しない。
+    // 1.5倍は「3回書きが1回書きより明確に遅い」を言える最小の線で、§S9-3の実測
+    // （ACE2本で1.77〜2.03倍）より緩く取ってある——閾値を実測値ぎりぎりに置くと、
+    // 測定ではなくマシンのノイズを判定することになる。
+    assert!(
+        ratio(naive3, m3) >= 1.5,
+        "the control arm is not separating: writing three ACEs one-at-a-time ({naive3} ms) must \
+         be clearly slower than folding them into one write ({m3} ms). If these are the same, \
+         the merged path is not actually folding — read the arm JSON above before trusting any \
+         of these numbers."
+    );
+}
+
+/// **M3-c: 伝播のコストは、ツリーの深さで変わるのか。**
+///
+/// # なぜこれが要るのか
+///
+/// §S9・§S10 の数字はすべて[`build_wide_tree`]＝**深さ2段固定**のツリーで取られている。
+/// `plans/mac-spike/RESULTS.md` は3箇所で「深さの効果は測っていない」と明記しており、
+/// **実ワークスペース（`node_modules`・`target`）は平気で深くなる**ので、
+/// 「ノード数に線形」という結論がその形でも成り立つかは別の事実である。
+///
+/// # 一変数だけ動かす
+///
+/// `build_chain_tree(root, F, 32)` と `build_wide_tree(root, F, 32)` は
+/// **ノード数・ディレクトリ数・ファイル数が完全に一致**し、違うのは並べ方だけである
+/// （前者は一列、後者は1段）。**だから`chain_d33`と`flat_d2`の差は、まるごと深さの効果になる。**
+/// テストの中でノード数の一致をassertしてあるのはそのため——ここがずれたら比較が成立しない。
+///
+/// # 深さ129の腕だけは変数が2つ動く（**限界。外挿しないこと**）
+///
+/// 段名を1文字にしてあるので深さ`N`のパス長は`2N`文字ぶんしか伸びず、
+/// **`chain_d65`まではWindowsの伝統的なパス長上限（MAX_PATH=260）の内側**に収まる。
+/// `chain_d129`はその外側で、**深さとパス長が同時に動く**——差が出てもどちらのせいかは言えない。
+///
+/// **それでもこの腕を置くのは、時間ではなく真偽を測るためである。**
+/// ACL側は`long_path_wide`が長いパス用の接頭辞を付けるので書けるはずだが、
+/// 救済walkのディレクトリ走査と撤収が同じように通るかは確かめられていない。
+/// **ここで「深いところだけACEが付かないのに成功と報告される」なら、それは実ワークスペースで
+/// 現に起きうる無言失敗である**（このリポジトリが繰り返し踏んでいる形）。
+///
+/// 最後の腕（`chain_d33_m3`）は**2つの軸が独立か**を見る。M3-aの `merged_m3 / merged_m1` と
+/// ここの `chain_d33_m3 / chain_d33` がずれたら、深さとMは掛け算にならない。
+#[test]
+#[ignore = "creates tens of thousands of files at up to 129 levels deep; run NON-elevated"]
+fn acl_ace_count_cost_of_tree_depth() {
+    let count = file_count();
+    let mut arms = Vec::new();
+    let mut node_counts: Vec<(&str, usize)> = Vec::new();
+
+    // 平らな基準。M3-aの`merged_m1`と同じ形・同じ主体数で、**この測定の中でも取り直す**
+    // （別々の実行の数字を混ぜないため）。
+    {
+        let dir = TestDirGuard::create("acld-flat");
+        let root = dir.path();
+        let nodes = build_wide_tree(root, count, FANOUT);
+        let subjects = m_subjects("flat", 1);
+        let (leaf_dir, leaf_file) = wide_tree_leaves(root);
+        node_counts.push(("flat_d2", nodes));
+        arms.push(measure_arm(
+            "flat_d2",
+            root,
+            nodes,
+            &subjects,
+            &leaf_dir,
+            &leaf_file,
+            WriteShape::Merged,
+        ));
+        eprintln!("  [flat_d2] done");
+    }
+
+    for (label, depth, m) in [
+        ("chain_d33", 32usize, 1usize),
+        ("chain_d65", 64, 1),
+        ("chain_d129", 128, 1),
+        ("chain_d33_m3", 32, 3),
+    ] {
+        let dir = TestDirGuard::create(&format!("acld-{label}"));
+        let root = dir.path();
+
+        // **ファイルを2万個撒く前に、その深さが本当に使えるかを1個で確かめる。**
+        // 使えないまま突っ込むと、後始末（`remove_dir_all`）も同じ上限に当たって
+        // **実マシンに残骸が残る**（B-01: 付けたものを剥がせるかを先に見る）。
+        if let Err(reason) = probe_chain_depth(root, depth) {
+            eprintln!("  [{label}] SKIPPED: {reason}");
+            arms.push(serde_json::json!({
+                "arm": label,
+                "depth": depth + 1,
+                "usable": false,
+                "reason": reason,
+            }));
+            continue;
+        }
+
+        let nodes = super::test_support::build_chain_tree(root, count, depth);
+        let subjects = m_subjects(label, m);
+        let (leaf_dir, leaf_file) = chain_tree_leaves(root, depth);
+        node_counts.push((label, nodes));
+        let mut arm = measure_arm(
+            label,
+            root,
+            nodes,
+            &subjects,
+            &leaf_dir,
+            &leaf_file,
+            WriteShape::Merged,
+        );
+        arm["depth"] = serde_json::json!(depth + 1);
+        arm["usable"] = serde_json::json!(true);
+        arm["deepest_leaf_path_len"] =
+            serde_json::json!(leaf_file.to_string_lossy().chars().count());
+        arms.push(arm);
+        eprintln!("  [{label}] done");
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "measurement": "S12 M3-c does the propagation cost depend on tree depth",
+            "file_count": count,
+            "arms": arms,
+        })
+    );
+
+    // **深さの比較が成立する前提を固定する。** `flat_d2`と`chain_d33`はノード数まで
+    // 同じでなければならない——ずれていたら、差を「深さのせい」と読めない。
+    let find = |want: &str| {
+        node_counts
+            .iter()
+            .find(|(l, _)| *l == want)
+            .map(|(_, n)| *n)
+    };
+    if let (Some(flat), Some(chain)) = (find("flat_d2"), find("chain_d33")) {
+        assert_eq!(
+            flat, chain,
+            "the flat and the 33-deep arm must contain exactly the same number of nodes, \
+             otherwise their timings differ for a reason other than depth"
         );
     }
 }

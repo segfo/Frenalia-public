@@ -214,6 +214,146 @@ pub(super) fn build_wide_tree(root: &std::path::Path, count: usize, fanout: usiz
     1 + fanout + count
 }
 
+/// `count`個のファイルを、`root`から**一列にネストした**`depth`段のディレクトリへ均等に撒く。
+/// 実ノード数（ディレクトリ＋ファイル＋root）を返す。
+///
+/// **[`build_wide_tree`]と対になる形である。** あちらは`fanout`個のディレクトリを**1段に並べ**、
+/// こちらは同じ個数を**一列に重ねる**。`build_chain_tree(root, F, N)`と
+/// `build_wide_tree(root, F, N)`は**ノード数・ディレクトリ数・ファイル数が完全に一致**し、
+/// 違うのは深さだけになる——**そうしておかないと、伝播コストの差を「深さのせい」と言えない**
+/// （ノード数が違えば、それだけで時間は動く）。
+///
+/// **段の名前を1文字固定にしてあるのは、深さと一緒にパス文字列長が動かないようにするため。**
+/// 深さ`N`のパス長は`2N`文字ぶんしか伸びないので、`C:\harness-Tier2a-verify-*`を起点にすると
+/// **N=64まではWindowsの伝統的なパス長上限（MAX_PATH=260）の内側**に収まる。
+/// N=128はその外側へ出る——**そこでは深さとパス長という2つの変数が同時に動く**ので、
+/// 差が出てもどちらのせいかは言えない（結果を書くときに限定詞を落とさないこと）。
+///
+/// ACL側は[`crate::win_common::long_path_wide`]が`\\?\`を付けるので上限の外でも書けるが、
+/// **救済walkが使うディレクトリ走査（`collect_dirs_and_files`）と撤収が同じように通るかは
+/// 別の事実**である。深い腕を測るときは、時間だけでなく「届いたか」「剥がせたか」も見ること。
+pub(super) fn build_chain_tree(root: &std::path::Path, count: usize, depth: usize) -> usize {
+    assert!(depth >= 1, "a chain needs at least one directory level");
+    std::fs::create_dir_all(root).expect("create tree root");
+    let mut levels = Vec::with_capacity(depth);
+    let mut cursor = root.to_path_buf();
+    for _ in 0..depth {
+        cursor = cursor.join("d");
+        std::fs::create_dir_all(&cursor).expect("create chain level");
+        levels.push(cursor.clone());
+    }
+    for i in 0..count {
+        let path = levels[i % depth].join(format!("f{i:06}.txt"));
+        std::fs::write(&path, b"x").expect("write tree file");
+    }
+    1 + depth + count
+}
+
+/// `path`のDACLのACEを1件ずつ「種別;フラグ;マスク;SID」の文字列にして返す。
+///
+/// **件数だけでなくtrusteeとマスクまで**比較できる形にしてある——件数が同じでも中身が
+/// 入れ替わっていれば「元の許可を失っていない」とは言えないため。
+///
+/// `docs/CODE-STRUCTURE-RULES.md`規則5により、`dacl_protection_probe_tests`（保護DACLの
+/// 耐久確認）と`acl_dacl_size_limit_tests`（DACLの上限で無言の切り捨てが起きるか）の
+/// 2箇所から使うのでここ1箇所に置く。元は前者のprivate定義だった。
+pub(super) fn describe_dacl_aces(path: &std::path::Path) -> windows::core::Result<Vec<String>> {
+    use std::ffi::c_void;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID,
+    };
+    unsafe {
+        let path_w = crate::win_common::long_path_wide(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        let mut out = Vec::new();
+        if !dacl.is_null() {
+            for index in 0..(*dacl).AceCount as u32 {
+                let mut ace_ptr: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl, index, &mut ace_ptr).is_err() || ace_ptr.is_null() {
+                    continue;
+                }
+                let header = &*(ace_ptr as *const ACE_HEADER);
+                let ace = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
+                let ace_sid = PSID(&ace.SidStart as *const u32 as *mut c_void);
+                let sid_string = crate::win_common::sid_to_string(ace_sid)
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                out.push(format!(
+                    "type={:#04x};flags={:#04x};mask={:#010x};{sid_string}",
+                    header.AceType, header.AceFlags, ace.Mask
+                ));
+            }
+        }
+        let _ = LocalFree(HLOCAL(sd.0));
+        Ok(out)
+    }
+}
+
+/// `path`のDACLが**実際に使っているバイト数**とACE本数を返す。
+///
+/// ACLのサイズ欄は16ビットなので構造上65,535バイトが上限になる——**が、それは「どこで
+/// 何が起きるか」を言っていない**。実際に何本入るか、上限に当たったときエラーになるのか
+/// 黙って切り捨てられるのかは測らないと分からないので、その測定のためにここに置く。
+/// **既存にACLの実バイト数を返す部品は無い**（`revoke.rs`の`copy_dacl_excluding_sids`は
+/// 内部でバッファ容量を決めるために読んでいるだけで、値を外へ出さない）。
+pub(super) fn dacl_size_info(path: &std::path::Path) -> windows::core::Result<(u32, u32)> {
+    use std::ffi::c_void;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        AclSizeInformation, GetAclInformation, ACL, ACL_SIZE_INFORMATION,
+        DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    unsafe {
+        let path_w = crate::win_common::long_path_wide(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        let result = if dacl.is_null() {
+            Ok((0, 0))
+        } else {
+            let mut size_info = ACL_SIZE_INFORMATION::default();
+            GetAclInformation(
+                dacl as *const ACL,
+                &mut size_info as *mut _ as *mut c_void,
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+            .map(|()| (size_info.AclBytesInUse, size_info.AceCount))
+        };
+        let _ = LocalFree(HLOCAL(sd.0));
+        result
+    }
+}
+
 /// `subst`で作る**テストが所有する仮想ドライブ**。Dropで`subst /D`と実体の削除まで行う。
 ///
 /// traverse機構の検証に要るのは「まだ誰もACEを付けていないドライブルート」である。`C:\`実体で

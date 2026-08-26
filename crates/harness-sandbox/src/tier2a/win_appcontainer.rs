@@ -614,6 +614,12 @@ mod acl_propagation_probe_tests;
 #[cfg(all(windows, test))]
 mod acl_dacl_write_tests;
 
+/// **DACLに載るACEの本数の上限**（残課題#20の費用測定M3-b）。1ノードに何本まで入るかと、
+/// 当たったときエラーになるのか**黙って切り捨てられるのか**を測る。**非昇格**。
+/// 寿命は結果次第——無言の切り捨てが起きるなら常設の回帰へ昇格させる（同ファイルのdoc）。
+#[cfg(all(windows, test))]
+mod acl_dacl_size_limit_tests;
+
 /// **テスト専用**の口。[`ensure_profile`]の所有者チェック（BUG-107）を迂回して、
 /// **他セッションのものに見える名前**のプロファイルを作る。
 ///
