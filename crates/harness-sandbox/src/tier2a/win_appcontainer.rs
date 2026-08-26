@@ -602,6 +602,14 @@ mod jit_grant_cost_tests;
 #[cfg(all(windows, test))]
 mod restricted_sid_probe_tests;
 
+/// **両モードのバッジ（capability SID）宛ACEを1回で同時に配ったとき、`ro`側の子から
+/// 書けてしまわないか**（分流`plans/handoff/fs-boundary-cost/T-1.md`）。
+/// 費用側は§S15-1が「1回にまとめれば無料」と実測済みなので、残る問いは安全性だけである。
+/// **非昇格で回す**（昇格すると親トークンが管理者になり、測る世界が実運用とずれる）。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod dual_badge_mode_switch_tests;
+
 /// **残課題#32の機序を1回で決めるプローブ**（使い捨て）。`acl_baseline_cost_tests`が
 /// 「届いていない」を確定させたのに対し、こちらは**なぜ届かないのか**を候補を並べて測る
 /// ——直し方が機序で変わるため（モジュールdoc）。**非昇格**。
