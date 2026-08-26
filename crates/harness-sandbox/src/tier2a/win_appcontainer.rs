@@ -594,6 +594,13 @@ mod acl_baseline_cost_tests;
 #[cfg(all(windows, test))]
 mod jit_grant_cost_tests;
 
+/// **作成時継承（空のルートへ札を1本置いてから中身を作る）の限界費用と、既存ツリーを
+/// 運ぶ費用**（`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「Bの内訳 — 名前空間を変える」、
+/// 分流T-3）。結果は`plans/handoff/fs-boundary-cost/T-3.md`。**非昇格で回す**。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod fs_creation_inheritance_cost_tests;
+
 /// **制限SID（`SidsToRestrict`）を指定したトークンで非管理者のまま子を起こせるか**
 /// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」5番＝案A-3の前提）。
 /// BUG-003が確かめた特権免除の特例は制限SIDが`None`のときの実測なので、非空でも
