@@ -704,7 +704,12 @@ fn stale_roots(held: &[PathBuf], wanted: &[FsPassthrough]) -> Vec<PathBuf> {
 /// 差分が空なら追加コストは0である。`teardown`が実行1回ごとの撤収を**しない**理由
 /// （同一プロセスの2回目で付け直す無駄を避ける）はここでも守られる——剥がすのは
 /// 「今回の宣言に含まれないもの」だけなので、次の実行で付け直す対象にはならない。
-fn reconcile_undeclared_roots(wanted: &[FsPassthrough], on_event: &mut dyn FnMut(NetRecordEvent)) {
+fn reconcile_undeclared_roots(
+    wanted: &[FsPassthrough],
+    workspace_root: &Path,
+    warnings: &mut Vec<String>,
+    on_event: &mut dyn FnMut(NetRecordEvent),
+) {
     let mut held = GRANTED_PASSTHROUGH_ROOTS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -717,8 +722,41 @@ fn reconcile_undeclared_roots(wanted: &[FsPassthrough], on_event: &mut dyn FnMut
     // 大きなツリーでは時間がかかる（`.cargo`への付与は実測142.6s）。
     on_event(NetRecordEvent::RevokingUndeclared { total: stale.len() });
     let profile = harness_sandbox::tier2a::session_profile::current_profile_name();
+    // [§22.2.1] 宣言capabilityの索引は**canonicalize済みのworkspace**で引く。付与側
+    // （`preflight`）が台帳へ書くときに使うのがその形なので、生のパスで絞ると
+    // **1件も一致せず、黙って何も剥がさない**（この経路の失敗は無症状になる）。
+    let canonical_ws = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
     for (index, path) in stale.iter().enumerate() {
-        // 撤収は`end_session`が使うのと**同じ関数**を通す（撤収経路を2つ持たない、B-05）。
+        // [§22.2.1] **`--fs-allow`の主体は宣言ごとのcapability SIDへ移った。**
+        // package SIDの撤収（下）だけでは、宣言を取り消しても穴が閉じない。
+        // 絞り込みは自分のworkspaceに限る——このプロセスが開けた穴だけが対象で、
+        // 同じパスを宣言している他のworkspaceの主体には触らない（BUG-046と同型）。
+        match harness_sandbox::tier2a::win_appcontainer::revoke_declaration_capabilities(
+            path,
+            Some(&canonical_ws),
+            &|_, _| {},
+        ) {
+            Ok(report) if report.is_clean() => {}
+            // **黙って飛ばさない**（B-10）。剥がせなかった穴は開いたままなので、
+            // 「宣言を取り消したのにまだ通る」が起きる。昇格が要る場合もここへ来る。
+            Ok(report) => warnings.push(format!(
+                "fs-allow {} : the declaration capability ACE is still on the path after the \
+                 revoke ({}); run `harness fs revoke {}` to close it",
+                path.display(),
+                report.still_on_root.join(", "),
+                path.display()
+            )),
+            Err(e) => warnings.push(format!(
+                "fs-allow {} : could not revoke the declaration capability ACE ({e}); run \
+                 `harness fs revoke {}` to close it",
+                path.display(),
+                path.display()
+            )),
+        }
+        // D-37時代の残骸（package SID宛）も同じ機会に剥がす。撤収は`end_session`が使うのと
+        // **同じ関数**を通す（撤収経路を2つ持たない、B-05）。
         harness_sandbox::tier2a::win_appcontainer::revoke_session_grant(path, &profile);
         on_event(NetRecordEvent::UndeclaredRevoked {
             path: path.clone(),
@@ -888,7 +926,7 @@ fn run_pass2<'a>(
     // このプロセスが既に開けたACEは残っており、同じプロセスで次のパス2を走らせると
     // 「取り消したのにまだ通る」ことになる（付与は`preflight`が宣言から毎回計算するので
     // 付け直しはされないが、剥がす側の経路が無かった）。
-    reconcile_undeclared_roots(&passthrough, on_event);
+    reconcile_undeclared_roots(&passthrough, request.workspace_root, warnings, on_event);
     on_event(NetRecordEvent::ElevationExpected {
         // **出ない見込みのUACを予告しない**——出なかったことが「何か起きなかった」に見える。
         max_prompts: if request.wfp.is_live() {
