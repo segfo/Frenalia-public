@@ -770,7 +770,7 @@ pub fn reconcile_fs_ledger_for_workspace(
     let canonical = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let (_, failures) = revoke_fs_ledger_entries(
+    let (revoked, failures) = revoke_fs_ledger_entries(
         &orphan_candidates,
         "auto-revoked",
         remove_fs_passthrough_grant_if_still_orphaned,
@@ -784,5 +784,41 @@ pub fn reconcile_fs_ledger_for_workspace(
             "warning: auto-revoke failed for {} : {reason}",
             path.display()
         );
+    }
+    prune_declaration_entries_for(&canonical, &revoked);
+}
+
+/// 撤収し終えた宣言について、capability台帳の**このworkspaceの**エントリを落とす。
+///
+/// # 順序が不変条件である
+///
+/// **ACEを剥がし終えてから呼ぶ。** 先に記録を捨てると主体を導出できなくなり、
+/// 撤収経路の無い孤児ACEがそのパスに残る（`forget_capability`のdocと同じ不変条件、`B-01`）。
+/// 呼び出し元は`revoke_fs_ledger_entries`が**実DACLを読んで**「残っていない」と判定した
+/// パスだけを`revoked`に入れている。
+///
+/// 落とすのは`workspace`が発行したエントリだけである。同じパスを別のworkspaceが宣言して
+/// いればその主体は生きているので、記録も残す。
+#[cfg(windows)]
+fn prune_declaration_entries_for(workspace: &Path, revoked: &[PathBuf]) {
+    if revoked.is_empty() {
+        return;
+    }
+    let ws_key = harness_sandbox::tier2a::workspace_capability::workspace_key(workspace);
+    let revoked_keys: Vec<String> = revoked
+        .iter()
+        .map(|p| harness_sandbox::tier2a::workspace_capability::declaration_key(p))
+        .collect();
+    let dropped = harness_sandbox::tier2a::workspace_capability::prune_capability_entries(|entry| {
+        let Some(declared) = entry.declaration.as_deref() else {
+            // workspace本体の主体はここでは扱わない（撤収の扉は`fs revoke-workspace`）。
+            return false;
+        };
+        harness_sandbox::tier2a::workspace_capability::workspace_key(Path::new(&entry.workspace))
+            == ws_key
+            && revoked_keys.iter().any(|k| k == declared)
+    });
+    for label in &dropped {
+        eprintln!("  forgot the declaration capability for {label}");
     }
 }

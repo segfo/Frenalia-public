@@ -648,15 +648,54 @@ pub fn forget_capability(workspace: &Path, mode: &str) -> Vec<String> {
     forget_capability_in(&ledger(), workspace, mode)
 }
 
+impl WorkspaceCapabilityEntry {
+    /// 人へ見せる1行の名札。**秘密も名前も含めない**——この文字列は
+    /// [`prune_capability_entries`]の戻り値としてCLIの報告へそのまま出る。
+    ///
+    /// workspace本体は従来どおりworkspaceのパスだけ。宣言エントリは**どのパスの許可か**が
+    /// 主語なので、宣言パスを先に置いて発行元のworkspaceを添える（workspaceだけを出すと、
+    /// 「消えた記録が何の許可だったか」が報告から分からない）。
+    pub fn display_label(&self) -> String {
+        match &self.declaration {
+            None => self.workspace.clone(),
+            Some(declared) => format!("{declared} (declared by {})", self.workspace),
+        }
+    }
+
+    /// **このエントリの記録を捨ててよいかを判定するとき、実在を測るべきパス。**
+    ///
+    /// workspace本体の主体のACEはworkspaceツリーそのものに載るが、宣言（`--fs-allow`）の
+    /// 主体のACEは**workspaceの外の宣言パス**に載る。したがって「もう撤収すべきものが無い」と
+    /// 言える条件はエントリの種類で違い、**workspaceの実在で一律に判定すると、
+    /// 宣言先が生きているのに剥がすための名前だけを捨てることになる**（`B-01`）。
+    ///
+    /// 判定そのもの（実在するか・ボリュームへ到達できるか）は呼び出し側が持つ。ここは
+    /// **どのパスを見るか**だけを1箇所で決める——測る側と落とす側で別々に書くと、
+    /// 片方だけ更新されて静かにずれる（`B-05`）。
+    ///
+    /// **綴りは必ず畳んで返す**（[`workspace_key`]/[`declaration_key`]と同じ規則）。
+    /// 台帳の中では`workspace`が生のパス・`declaration`が畳み込み済みキーという非対称が
+    /// あり、素のまま返すと**エントリの種類によって綴りの規則が違う文字列**が出てくる。
+    /// 突き合わせに使う値なので、ここで揃えておかないと「同じパスなのに一致しない」形の
+    /// 取り違えが呼び出し側に生まれる（`B-19`: 畳み込みは境界で1度だけ）。
+    /// 人へ見せる綴りが要るときは[`Self::display_label`]を使うこと。
+    pub fn prune_target(&self) -> String {
+        match &self.declaration {
+            Some(declared) => declared.clone(),
+            None => workspace_key(Path::new(&self.workspace)),
+        }
+    }
+}
+
 fn prune_capability_entries_in(
     ledger: &Ledger<WorkspaceCapabilityLedger>,
-    should_remove: &dyn Fn(&Path) -> bool,
+    should_remove: &dyn Fn(&WorkspaceCapabilityEntry) -> bool,
 ) -> Vec<String> {
     ledger.update(|l| {
         let mut removed = Vec::new();
         l.entries.retain(|e| {
-            if should_remove(Path::new(&e.workspace)) {
-                removed.push(e.workspace.clone());
+            if should_remove(e) {
+                removed.push(e.display_label());
                 false
             } else {
                 true
@@ -666,13 +705,22 @@ fn prune_capability_entries_in(
     })
 }
 
-/// `should_remove`がtrueを返したworkspaceのエントリを落とす（`harness fs prune`、D-53）。
+/// `should_remove`がtrueを返したエントリを落とす（`harness fs prune`、D-53、および
+/// §22.2.1の「宣言が消えたときの差分撤収」の後始末）。
 ///
-/// 実在しないworkspaceのエントリだけが対象になる（判定は呼び出し側が持つ）。**消えたツリーの
-/// ACEを撤収できなくなる心配は無い**——ツリー自体が無いので撤収すべきものが存在しない。
-/// 使い捨てのワークスペース（テストのtempdir等）を開くたびに1件増えるので、これが無いと
-/// 秘密の記録が際限なく積もる。
-pub fn prune_capability_entries(should_remove: impl Fn(&Path) -> bool) -> Vec<String> {
+/// # 述語がエントリ全体を受け取る理由
+///
+/// **workspaceのパスだけでは、本体エントリと宣言エントリを呼び出し側で区別できない。**
+/// 宣言エントリ（`declaration`が`Some`）が指すACEは**workspaceの外の宣言パス**に載っている
+/// ので、判定に使うべき対象がそもそも違う——workspaceが消えたことは、そのACEが消えたことを
+/// 意味しない。ここを`&Path`（workspace）のままにしておくと、**剥がすための名前だけが先に
+/// 消える**＝孤児ACEが確定する。
+///
+/// **記録を捨ててよいのは、それが指すACEがもう無いと確かめられたときだけである**
+/// （`B-01`「名前で到達する設計では、名前を捨てる操作を最後に置く」）。判定は呼び出し側が持つ。
+pub fn prune_capability_entries(
+    should_remove: impl Fn(&WorkspaceCapabilityEntry) -> bool,
+) -> Vec<String> {
     prune_capability_entries_in(&ledger(), &should_remove)
 }
 
@@ -997,6 +1045,54 @@ mod tests {
         // 空モードは全部（宣言も）。
         assert_eq!(forget_capability_in(&l, ws, ""), vec![decl]);
         assert!(l.load().entries.is_empty());
+    }
+
+    /// **記録を捨ててよいかを測る対象は、エントリの種類で違う**（`B-01`/`B-14`）。
+    ///
+    /// 宣言（`--fs-allow`）の主体のACEは**workspaceの外の宣言パス**に載る。使い捨ての
+    /// workspaceが消えても、宣言先（`C:\tools\node`のような常設のパス）にはACEが残るので、
+    /// workspaceの実在だけで判定すると**剥がすための名前だけが先に消える**——その主体は
+    /// どのコマンドでも剥がせない孤児になる。
+    ///
+    /// 許可側と禁止側を対で置く（`B-35`）: 宣言先が生きていれば残す／両方消えていれば落とす。
+    #[test]
+    fn a_declaration_entry_is_pruned_by_its_declared_path_not_by_its_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = test_ledger(tmp.path());
+        let ws = Path::new("C:\\work\\throwaway");
+        let alive = Path::new("C:\\tools\\node");
+        let dead = Path::new("C:\\tools\\removed");
+        ensure_capability_name_in(&l, ws, "rwx").unwrap();
+        ensure_declaration_capability_name_in(&l, ws, alive, "read").unwrap();
+        ensure_declaration_capability_name_in(&l, ws, dead, "read").unwrap();
+
+        // 「見るべきパス」がエントリの種類で切り替わること（判定そのものは呼び出し側）。
+        // 綴りはどちらも畳み込み済みで揃っている（台帳の中では`workspace`だけ生のパス）。
+        let entries = l.load().entries;
+        assert_eq!(entries[0].prune_target(), workspace_key(ws));
+        assert_eq!(entries[1].prune_target(), declaration_key(alive));
+
+        // workspaceが消えた、という判定でエントリを落とす（＝`fs prune`が旧実装でやっていた形）。
+        // 宣言先が生きているエントリは**残らなければならない**。
+        let ws_key = workspace_key(ws);
+        let dead_key = declaration_key(dead);
+        let removed = prune_capability_entries_in(&l, &|e| {
+            // 「workspaceが消えた」と「宣言先が消えた」の両方を渡す実際の形。
+            e.prune_target() == ws_key || e.prune_target() == dead_key
+        });
+        assert_eq!(removed.len(), 2, "{removed:?}");
+        let left = l.load().entries;
+        assert_eq!(left.len(), 1, "the still-declared path must keep its subject: {left:?}");
+        assert_eq!(left[0].declaration.as_deref(), Some(declaration_key(alive).as_str()));
+
+        // 名札は「何の許可の記録が消えたか」を出す（workspaceだけでは読み手に分からない）。
+        // 突合に使う`prune_target`と違い、**人へ見せる綴りは台帳に入っているまま**である。
+        assert!(
+            removed
+                .iter()
+                .any(|r| r.contains("c:\\tools\\removed") && r.contains("C:\\work\\throwaway")),
+            "{removed:?}"
+        );
     }
 
     /// 宣言エントリが混ざっても、workspace本体の「検証済み」判定は影響を受けない
