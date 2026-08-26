@@ -1,5 +1,5 @@
 //! **ACL付与コストの測定**（`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`）。
-//! 結果の正本は `plans/mac-spike/RESULTS.md`——M1が §S10、M3が §S12。
+//! 結果の正本は `plans/mac-spike/RESULTS.md`——M1が §S10、M3が §S15。
 //!
 //! # 2つの寿命が同居している
 //!
@@ -10,11 +10,11 @@
 //!
 //! 接頭辞が分けてあるので、`cargo test -- acl_ace_count_cost`でM3だけを回せる。
 //!
-//! ## M3を「§S12を書いたら消す」にしなかった理由（`docs/CODE-STRUCTURE-RULES.md`規則2の例外）
+//! ## M3を「§S15を書いたら消す」にしなかった理由（`docs/CODE-STRUCTURE-RULES.md`規則2の例外）
 //!
-//! 規則2は一回性の調査実験をテストとして残すなと言う。**M3の問いは§S12で閉じている**ので、
+//! 規則2は一回性の調査実験をテストとして残すなと言う。**M3の問いは§S15で閉じている**ので、
 //! 本来はここで消える。**残してあるのは、#20の実装がいま進行中で、この測定が
-//! その実装の判断に直接効くからである**——§S12が出した答えは
+//! その実装の判断に直接効くからである**——§S15が出した答えは
 //! 「**部品を使えば0倍、主体ごとに伝播を呼ぶと約2.9倍**」で、**どちらに転ぶかは実装の書き方
 //! だけで決まる**。実装しながら「いま書いた形はどちらか」を測り直せる状態にしておく。
 //!
@@ -527,9 +527,9 @@ fn acl_baseline_cost_regrant_after_revoke_pays_again() {
 }
 
 // ===========================================================================
-// M3 — 残課題#20 の費用（`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` のM3、結果は §S12）
+// M3 — 残課題#20 の費用（`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` のM3、結果は §S15）
 //
-// **§S12を書いたらこのブロックごと消すこと**（規則2）。ただし`build_chain_tree`は
+// **§S15を書いたらこのブロックごと消すこと**（規則2）。ただし`build_chain_tree`は
 // `test_support`に残す——`build_wide_tree`と対になる形の部品で、深さを測り直すときに要る。
 // ===========================================================================
 
@@ -796,7 +796,7 @@ fn acl_ace_count_cost_of_folding_m_subjects_into_one_write() {
     println!(
         "{}",
         serde_json::json!({
-            "measurement": "S12 M3-a cost of folding M subjects into one propagating write",
+            "measurement": "S15 M3-a cost of folding M subjects into one propagating write",
             "file_count": count,
             "fanout": FANOUT,
             "tree_shape": "wide (depth 2)",
@@ -926,7 +926,7 @@ fn acl_ace_count_cost_of_tree_depth() {
     println!(
         "{}",
         serde_json::json!({
-            "measurement": "S12 M3-c does the propagation cost depend on tree depth",
+            "measurement": "S15 M3-c does the propagation cost depend on tree depth",
             "file_count": count,
             "arms": arms,
         })

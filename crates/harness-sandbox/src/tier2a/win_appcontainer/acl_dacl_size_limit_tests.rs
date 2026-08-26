@@ -1,5 +1,5 @@
 //! **DACLに載るACEの本数には上限がある。どこで当たり、当たったときどう失敗するのか。**
-//! （`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` のM3-b、結果の正本は `plans/mac-spike/RESULTS.md` §S12）
+//! （`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` のM3-b、結果の正本は `plans/mac-spike/RESULTS.md` §S15）
 //!
 //! # なぜ測るのか
 //!
@@ -36,7 +36,7 @@
 //!     --ignored --test-threads=1 --nocapture acl_dacl_size_limit
 //! ```
 //!
-//! # 測って分かったこと（詳細は §S12-3）
+//! # 測って分かったこと（詳細は §S15-3）
 //!
 //! **上限は1,168本／65,524バイトで、超えるとエラーで止まる。無言の切り捨ては
 //! 16段測って1度も観測されなかった。** 設計上の上限3に対して約390倍の余裕がある。
@@ -50,7 +50,7 @@
 //! # このファイルの寿命
 //!
 //! **残課題#20の実装が終わったら消す**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
-//! 問い自体は§S12-3で閉じているが、#20の実装は「同一ノードに何本載せるか」を決める作業
+//! 問い自体は§S15-3で閉じているが、#20の実装は「同一ノードに何本載せるか」を決める作業
 //! なので、その間だけ手元に置いておく。
 //!
 //! **無言の切り捨てが観測されていたら常設の回帰へ昇格させる予定だったが、
@@ -297,7 +297,7 @@ fn acl_dacl_size_limit_where_it_breaks_and_how_it_fails() {
     println!(
         "{}",
         serde_json::json!({
-            "measurement": "S12 M3-b how many capability ACEs fit on one node, and how it fails",
+            "measurement": "S15 M3-b how many capability ACEs fit on one node, and how it fails",
             "baseline_without_our_aces": { "acl_bytes": bytes_0, "ace_count": aces_0 },
             "bytes_per_capability_ace": bytes_per_ace,
             "design_limit_m3": step_json(&at_design_limit),
@@ -454,7 +454,7 @@ fn acl_dacl_size_limit_when_ancestors_stack_inherited_aces() {
     println!(
         "{}",
         serde_json::json!({
-            "measurement": "S12 M3-b what a deep node inherits when every ancestor declares",
+            "measurement": "S15 M3-b what a deep node inherits when every ancestor declares",
             "single_node_ceiling": ceiling.max_ok,
             "arms": results,
         })
