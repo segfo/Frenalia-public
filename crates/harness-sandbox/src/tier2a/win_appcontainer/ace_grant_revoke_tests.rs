@@ -1027,8 +1027,10 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
     // 「フォールバックが効いた」と主張してしまうため（実際にこれで誤検知した）。
     let started = grant_job::start(
         &root,
-        sid.clone(),
-        workspace_rwx_mask(),
+        vec![OwnedBadgeGrant {
+            sid: sid.clone(),
+            mask: workspace_rwx_mask(),
+        }],
         vec![sid.clone()],
         vec![root.join(".harness")],
         &root,

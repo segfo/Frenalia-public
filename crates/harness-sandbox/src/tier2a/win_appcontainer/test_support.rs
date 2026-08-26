@@ -8,6 +8,8 @@
 //! `docs/CODE-STRUCTURE-RULES.md`規則5により、同じ`ScopeGuard`を各テストファイルへ複製せず
 //! ここ1箇所に置く（元は`cow_containment_tests.rs`のprivate定義だった）。
 
+use crate::tier2a::workspace_ledger::WorkspaceMode;
+
 /// **本番の`run_shell`と同じ形で**AppContainer子を起こす（D-54）。
 ///
 /// `preflight`はworkspaceツリーのACEを、セッションのpackage SIDではなく
@@ -16,9 +18,20 @@
 /// フォールバックする（実測: `preflight`を呼ぶ実機テスト12件がこれで落ちた）。
 ///
 /// `cwd`が**workspace rootそのもの**であることを前提にしている（`preflight`へ渡したのと同じ
-/// パス）。モードは台帳を引いて判定する——このテスト群のworkspaceは毎回新しい一時ディレクトリ
-/// で、`preflight`が登録するモードはちょうど1つなので曖昧さが無い。台帳に無ければ`None`を
-/// 積む（＝素の[`super::spawn`]と同じ）。
+/// パス）。台帳に無ければ`None`を積む（＝素の[`super::spawn`]と同じ）。
+///
+/// # モードの決め方（**[D-83]で台帳引きをやめた**）
+///
+/// かつてここは「台帳に載っているモードを探して、見つかった方」を使っていた。当時は
+/// `preflight`が登録するモードがちょうど1つだったので曖昧さが無かった——**その前提が
+/// D-83で崩れた**。両モードのバッジを常に配るようになったため、台帳には必ず2件載る。
+/// 探索順で先に来る`rwx`が常に選ばれ、**CoWのテストの子が`rwx`のバッジを積んで起動する**
+/// ——workspace本体へ直接書けてしまい、封じ込めを測っているはずのテストが
+/// 「封じ込めが無い世界」を測ることになる。
+///
+/// そこで本番の`launch.rs`とまったく同じ決め方にする: **`cow`が`Some`なら`ro`、
+/// そうでなければ`rwx`**。「本番と同じ形」を名乗るヘルパーが本番と違う主体を積んでいたら、
+/// 測っているものが違う（`B-08`）。
 ///
 /// **`spawn`のシグネチャをそのまま写している**ので、テストの呼び出し側は関数名を差し替える
 /// だけでよい。引数を1本足す形にしなかったのは、19箇所の呼び出しを機械的に置換できる方が
@@ -45,12 +58,16 @@ pub(crate) fn spawn_in_workspace(
     crate::tier2a::win_appcontainer::grant_job::wait_until_done()
         .map_err(super::AppContainerError::Preflight)?;
     let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let cap = crate::tier2a::workspace_ledger::KNOWN_MODES
-        .iter()
-        .find(|mode| {
-            crate::tier2a::workspace_capability::lookup_capability_name(&canonical, mode).is_some()
-        })
-        .and_then(|mode| super::workspace_capability_sid(&canonical, mode).ok());
+    // [D-83] **走っているモードのバッジだけ**を積む（本番の`launch.rs`と同じ）。
+    // `lookup_`（発行しない側）を通すのは、`preflight`を経ていないworkspaceで
+    // 台帳エントリを作らないため——テストが`%APPDATA%`へ記録を積み増さない。
+    let mode = if cow.is_some() {
+        WorkspaceMode::Ro
+    } else {
+        WorkspaceMode::Rwx
+    };
+    let cap = crate::tier2a::workspace_capability::lookup_capability_name(&canonical, mode.as_str())
+        .and_then(|_| super::workspace_capability_sid(&canonical, mode.as_str()).ok());
     // §22.1.1: workspace capabilityが引けたならそれがドメイン、引けなければプロファイル自身が
     // ドメイン（package SID宛ACEを自前で付けるテストがこちら）。**本番の`launch.rs`と同じ選び方**に
     // しておかないと、「本番と同じ形」を名乗るこのヘルパーだけ別の分離状態を測ることになる。

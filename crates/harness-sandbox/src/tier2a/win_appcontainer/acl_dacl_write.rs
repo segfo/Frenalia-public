@@ -116,6 +116,36 @@ pub(crate) fn grant_aces_propagating(
     grants: &[InheritableGrant],
     idempotent: IdempotentCheck,
 ) -> Result<(), AppContainerError> {
+    grant_aces(root, grants, idempotent, DaclWrite::Propagate)
+}
+
+/// [`grant_aces_propagating`]の**このオブジェクトだけ**版（[`DaclWrite::SingleObject`]）。
+///
+/// M本を1つのDACLへ畳んで1回で書くところは同じで、違うのは**子孫へ配らない**ことだけである。
+/// [D-83]で「両モードのバッジを同時に置く」ようになったあと、これが要る場所は2つある——
+/// `preflight`の同期区間（rootへの高速付与）と、救済walk（継承が届かなかったノードへの
+/// 個別付与）。**どちらもノードあたりの書込を1回に保つためにここを通る**
+/// （主体ごとに`grant_ace_mask`を呼び直すと、`plans/mac-spike/RESULTS.md` §S15-1が測った
+/// 「素朴な実装は約2.9倍」をそのまま払う）。
+pub(crate) fn grant_aces_single_object(
+    path: &Path,
+    grants: &[InheritableGrant],
+    idempotent: IdempotentCheck,
+) -> Result<(), AppContainerError> {
+    grant_aces(path, grants, idempotent, DaclWrite::SingleObject)
+}
+
+/// [`grant_aces_propagating`]／[`grant_aces_single_object`]の共通の実体。
+///
+/// **書込の口だけが違う**ので1つにしてある（`docs/CODE-STRUCTURE-RULES.md` §5.0）。
+/// 冪等判定・DACLの畳み方・計装はどちらの口でも同じでなければならない——分けて書くと、
+/// 片方にだけ入れた手当てがもう片方から抜ける（`B-02`）。
+fn grant_aces(
+    root: &Path,
+    grants: &[InheritableGrant],
+    idempotent: IdempotentCheck,
+    write: DaclWrite,
+) -> Result<(), AppContainerError> {
     if grants.is_empty() {
         return Ok(());
     }
@@ -180,8 +210,21 @@ pub(crate) fn grant_aces_propagating(
         let _ = LocalFree(HLOCAL(sd.0));
         merged.map_err(to_err)?;
 
-        let sids: Vec<PSID> = grants.iter().map(|g| g.sid).collect();
-        let result = propagate_merged_dacl(root, &sids, new_dacl);
+        let result = match write {
+            DaclWrite::Propagate => {
+                let sids: Vec<PSID> = grants.iter().map(|g| g.sid).collect();
+                propagate_merged_dacl(root, &sids, new_dacl)
+            }
+            // **こちらは剥がさない。** 剥がすのは「伝播が既存の子孫へ届かない」ための手当てで
+            // （モジュールdocの表）、子孫へ配らないこの口では要らない。ここで剥がすと、
+            // 書込の直前にrootの許可が一瞬消える窓を、必要も無いのに作ることになる。
+            DaclWrite::SingleObject => super::set_dacl_single_object(root, new_dacl).map_err(|e| {
+                AppContainerError::AclGrant {
+                    path: root.to_path_buf(),
+                    reason: e.to_string(),
+                }
+            }),
+        };
         let _ = LocalFree(HLOCAL(new_dacl as *mut _));
         result
     }

@@ -488,16 +488,19 @@ pub(super) fn probe_exe() -> PathBuf {
 
 /// このworkspaceのcapability SID（`test_support::spawn_in_workspace`と同じ引き方）。
 /// `preflight`が張ったworkspaceツリーのACEの主体で、これを積まないと子はworkspaceを見られない。
+///
+/// **[D-83] モードを`rwx`に固定してある。** 以前は「台帳に載っている方」を探していたが、
+/// D-83で両モードのバッジが常に載るようになり、探索は意味を失った（必ず先頭が当たる）。
+/// このスパイク群のworkspaceは全て`WorkspaceWriteMode::DirectRw`で`preflight`しているので
+/// `rwx`が正しい——**CoWのスパイクをここへ足すときは`ro`を選ぶこと**（`rwx`のバッジを
+/// 積んだ子はworkspace本体へ直接書けてしまい、測っている隔離が別物になる）。
 pub(super) fn workspace_capability_for(workspace: &Path) -> Option<crate::win_common::OwnedSid> {
     let canonical = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
-    crate::tier2a::workspace_ledger::KNOWN_MODES
-        .iter()
-        .find(|mode| {
-            crate::tier2a::workspace_capability::lookup_capability_name(&canonical, mode).is_some()
-        })
-        .and_then(|mode| workspace_capability_sid(&canonical, mode).ok())
+    let mode = crate::tier2a::workspace_ledger::WorkspaceMode::Rwx;
+    crate::tier2a::workspace_capability::lookup_capability_name(&canonical, mode.as_str())
+        .and_then(|_| workspace_capability_sid(&canonical, mode.as_str()).ok())
 }
 
 /// スパイクが作ったworkspace capabilityの台帳エントリを落とす（使い捨てworkspaceの記録が

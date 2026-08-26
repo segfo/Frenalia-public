@@ -426,6 +426,10 @@ mod revoke_subjects;
 mod spawn;
 mod spawn_session;
 mod traverse;
+/// [D-83] workspaceツリーへ配る**バッジの集合**（モード×主体×マスク）と、それを1回の書込で
+/// 置く口。`acl_grant`（何をどの主体へ許すかの決定）から分けてあるのは、こちらが扱うのが
+/// 「**どのバッジを何本配るか**」という別の軸だからである（`docs/CODE-STRUCTURE-RULES.md`規則3）。
+mod workspace_badges;
 
 pub use acl_grant::*;
 pub use launch::*;
@@ -437,6 +441,7 @@ pub use revoke_subjects::*;
 pub use spawn::*;
 pub use spawn_session::*;
 pub use traverse::*;
+pub use workspace_badges::*;
 
 // --- テスト群（実Win32・実AppContainerを使う重い回帰テストのため別ファイル） ---
 //

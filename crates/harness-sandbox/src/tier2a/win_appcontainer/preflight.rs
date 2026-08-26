@@ -6,6 +6,8 @@
 
 use super::*;
 
+use crate::tier2a::workspace_ledger::WorkspaceMode;
+
 /// `preflight`の戻り値。`warnings`はD8の到達不能診断（従来どおり）、`granted_passthrough`は
 /// **実際にACEが付与された（既存で十分だった場合・部分的にしか適用できなかった場合を含む）**
 /// passthroughルートの一覧（`(path, writable)`）。呼び出し側（`harness-cli`の台帳記録）は
@@ -298,17 +300,18 @@ pub fn preflight_with_privhelper_launcher(
     // 祖先traverseの付与先（D-37）。package SIDと違いセッションを跨いで永続する。
     let traverse_sid = traverse_capability_sid()?;
 
-    // workspaceのアクセスモード（通常起動=RWX / `--sandbox tier2a-cow`=RO、将来`--cow_exec`=RXを追加予定）は
-    // 同じworkspaceに対して混在させてはいけない——ACEはファイルに1つしか付けられないため、
-    // モードが違うセッションが同時に動くと片方の前提を裏切る（例: ROのはずが後から来た
-    // RWXセッションのせいで書けてしまう）。ACE付与の前に、名前付きmutexで他モードが
-    // 使用中でないか確認し、自モードの生存マーカーを確保する
-    // （`crate::tier2a::workspace_ledger::begin_workspace_mode`のdoc参照、モード衝突チェックと
-    // マーカー作成は内部で`with_named_lock`により直列化されるため、2プロセスがほぼ同時に
-    // 別モードで起動しても早い者勝ちの事故にはならない）。
+    // workspaceのアクセスモード（通常起動=RWX / `--sandbox tier2a-cow`=RO、将来`--cow_exec`=RXを
+    // 追加予定）は、同じworkspaceに対して混在させてはいけない——CoWセッションは「本体は動かない」
+    // を前提に差分層を積むので、並走するRWXセッションが本体を書き換えると差分が**動く土台の上に
+    // 積まれた**ものになる（根拠の全文は`workspace_ledger`のモジュールdoc。**「ACEはファイルに
+    // 1つしか付けられない」という旧・根拠は事実ではない**——D-83はまさに2本同時に載せている）。
+    // ACE付与の前に、名前付きmutexで他モードが使用中でないか確認し、自モードの生存マーカーを
+    // 確保する（`begin_workspace_mode`のdoc参照。モード衝突チェックとマーカー作成は内部で
+    // `with_named_lock`により直列化されるため、2プロセスがほぼ同時に別モードで起動しても
+    // 早い者勝ちの事故にはならない）。
     let workspace_mode = match write_mode {
-        WorkspaceWriteMode::DirectRw => "rwx",
-        WorkspaceWriteMode::Cow { .. } => "ro",
+        WorkspaceWriteMode::DirectRw => WorkspaceMode::Rwx,
+        WorkspaceWriteMode::Cow { .. } => WorkspaceMode::Ro,
     };
     let canonical_workspace_root = workspace_root.canonicalize().map_err(|e| {
         AppContainerError::Preflight(format!(
@@ -318,12 +321,12 @@ pub fn preflight_with_privhelper_launcher(
     })?;
     crate::tier2a::workspace_ledger::begin_workspace_mode(
         &canonical_workspace_root,
-        workspace_mode,
+        workspace_mode.as_str(),
     )
     .map_err(AppContainerError::Preflight)?;
     crate::tier2a::workspace_ledger::record_workspace_grant(
         &canonical_workspace_root,
-        workspace_mode,
+        workspace_mode.as_str(),
     );
 
     // D-54: workspaceツリーへ付けるACEの主体。**セッションのpackage SIDではなく、この
@@ -333,36 +336,88 @@ pub fn preflight_with_privhelper_launcher(
     // （毎起動で払っていた実測60秒が消える、BUG-081）。名前はワークスペースごとのランダム
     // 秘密から導出され、サンドボックスから読めない台帳にだけ存在する
     // （`crate::tier2a::workspace_capability`のdoc）。
-    let workspace_cap = workspace_capability_sid(&canonical_workspace_root, workspace_mode)?;
+    //
+    // [D-83] **導出するのは自分のモードのバッジ1本ではなく、全モードのバッジである。**
+    // バッジは(パス, モード)から決まるので、モードを切り替えると主体ごと変わり、既に配った
+    // 26万件のACEが一斉に無効になって全額を払い直していた（一巡61.4秒、§S12）。両方を
+    // **1回の書込で**置けばその払い直しが消える——費用はゼロ（§S15-1）、安全性も実測済み
+    // （`ro`のバッジしか持たない子は、隣に`rwx`のACEが載っていても作成・追記・削除が
+    // すべて`ERROR_ACCESS_DENIED`。`plans/handoff/fs-boundary-cost/T-1.md`）。
+    //
+    // **ここで台帳エントリも両モードぶん作られる**（`ensure_capability_name`）。撤収
+    // （`harness fs revoke-workspace`）は台帳を索引にして剥がすので、**配った本数と
+    // 引ける本数が同じ**になっていなければならない（`B-01`／BUG-101: 記録の無いACEは
+    // どのコマンドでも剥がせない）。
+    let workspace_badges: Vec<(WorkspaceMode, crate::win_common::OwnedSid)> = WorkspaceMode::ALL
+        .iter()
+        .map(|mode| {
+            workspace_capability_sid(&canonical_workspace_root, mode.as_str())
+                .map(|sid| (*mode, sid))
+        })
+        .collect::<Result<_, _>>()?;
+    let badge_grants: Vec<BadgeGrant> = workspace_badges
+        .iter()
+        .map(|(mode, sid)| BadgeGrant {
+            sid: sid.as_psid(),
+            mask: workspace_mode_mask(*mode),
+        })
+        .collect();
+    // このセッションが子のトークンへ積むバッジは**自分のモードのぶんだけ**（ここが
+    // D-83の安全性の全て——2本配っても、子が名乗れるのは1本である）。
+    let workspace_cap = workspace_badges
+        .iter()
+        .find(|(mode, _)| *mode == workspace_mode)
+        .map(|(_, sid)| sid.clone())
+        .ok_or_else(|| {
+            AppContainerError::Preflight(format!(
+                "internal: no badge was derived for workspace mode '{}' (WorkspaceMode::ALL and \
+                 the running mode disagree)",
+                workspace_mode.as_str()
+            ))
+        })?;
     let workspace_cap_psid = Some(workspace_cap.as_psid());
 
-    // D-30: `write_mode`がACL付与方針を唯一決める。`match`を全分岐（`..`無し）にすることで、
-    // `WorkspaceWriteMode`へバリアントを追加した際にACL決定漏れをコンパイルエラーにする。
+    // D-30: `write_mode`がACL付与方針を唯一決める。**`match`は全分岐（`..`無し）に保つ**
+    // ——`WorkspaceWriteMode`へバリアントを追加した際にACL決定漏れをコンパイルエラーに
+    // するためで、D-83で付与そのものがモード非依存になった後もこのゲートは外さない。
+    // matchが2つに割れているのは、**付与の前に置く段**（ボリュームの検算）と**後に置く段**
+    // （差分層の用意）で順序の要求が逆だからである。
+    //
+    // **ACLを保持できないボリュームでは、そもそも境界を張れない**（D-81）。下の`grant_*`は
+    // 失敗しないまま何も強制しないことがあり得るので、**付ける前に**検算して拒否する。
+    // ワークスペース側（読取専用ACEが乗る）と差分層側（書込ACEが乗る）の**両方**を見る
+    // ——D-81で両者は別ボリュームになり得る。
+    match write_mode {
+        WorkspaceWriteMode::DirectRw => {}
+        WorkspaceWriteMode::Cow { diff_layer_dir } => {
+            require_persistent_acl_volume("workspace", workspace_root)?;
+            require_persistent_acl_volume("copy-on-write diff area", diff_layer_dir)?;
+        }
+    }
+
+    // [D-83/BUG-082 Part B] rootへ継承ACEを**全モードぶん1回の書込で**、**伝播なし**で置く
+    // （`grant_workspace_root_badges_fast`のdoc）——既存子孫への伝播は`grant_job`の背景
+    // フェーズへ委ねる。2回目以降の起動は冪等スキップでWin32書込0回。
+    //
+    // マスクはバッジのモードが決める（`workspace_mode_mask`）。`--sandbox tier2a-cow`で
+    // 走っていても`rwx`バッジ宛のACEはRWXのままで、**それでもこのセッションの子は書けない**
+    // ——子のトークンに`rwx`バッジが入っていないためである。Redirector DLLが無効・回避
+    // されてもworkspace本体への書込が`ACCESS_DENIED`でfail-closeする、というD-30の性質は
+    // 変わらない（D-01「フックは境界にしない」）。
     //
     // **workspace本体は`record_granted_path`しない**（D-54）。あれは「このセッションが撤収
     // 責任を負う」という表明で、記録すると`end_session`/`gc_dead_sessions`がツリー全体の
     // `revoke_ace_recursive`（実測30.8秒）を回してしまう。capability宛のACEはセッションより
     // 長生きするのが仕様であり、撤収は`harness fs revoke-workspace`が明示的に行う。
-    let workspace_mask = match write_mode {
-        WorkspaceWriteMode::DirectRw => {
-            // 既定（D-29）。[BUG-082 Part B] rootへ継承ACEを1件、**伝播なし**で付けるだけ
-            // （`grant_workspace_root_rw_fast`のdoc）——既存子孫への伝播は`grant_job`の
-            // 背景フェーズへ委ねる。2回目以降の起動は冪等スキップでWin32書込0回。
-            grant_workspace_root_rw_fast(workspace_root, workspace_cap.as_psid())?;
-            timing.mark("grant_workspace_root_rw_fast(workspace_root)");
-            workspace_rwx_mask()
-        }
+    grant_workspace_root_badges_fast(workspace_root, &badge_grants)?;
+    timing.mark(&format!(
+        "grant_workspace_root_badges_fast(workspace_root, {} badges)",
+        badge_grants.len()
+    ));
+
+    match write_mode {
+        WorkspaceWriteMode::DirectRw => {}
         WorkspaceWriteMode::Cow { diff_layer_dir } => {
-            // **ACLを保持できないボリュームでは、そもそも境界を張れない**（D-81）。
-            // 下の`grant_*`は失敗しないまま何も強制しないことがあり得るので、付ける前に
-            // 検算して拒否する。ワークスペース側（読取専用ACEが乗る）と差分層側
-            // （書込ACEが乗る）の**両方**を見る——D-81で両者は別ボリュームになり得る。
-            require_persistent_acl_volume("workspace", workspace_root)?;
-            require_persistent_acl_volume("copy-on-write diff area", diff_layer_dir)?;
-            // `--sandbox tier2a-cow`（D-30）。workspaceはRead/Execute/Traverseのみ（D-13と同じ関数）。
-            // Redirector DLLが無効・回避されても、この時点でACLがROである限り
-            // workspace本体への書込は`ACCESS_DENIED`でfail-closeする。
-            grant_workspace_root_ro_fast(workspace_root, workspace_cap.as_psid())?;
             // diff_layer_dirは**セッション専有**（他セッションと共有しない）なので、主体は
             // 従来どおりセッションのpackage SIDのままにする。D-54が置き換えるのは
             // 「ワークスペースにつき一度きりで済むはずの付与」だけで、こちらは該当しない。
@@ -407,15 +462,20 @@ pub fn preflight_with_privhelper_launcher(
                     )
                 },
             )?;
-            fs_access_mask(FsAccess::ReadExec)
         }
-    };
-    // D-05/D-09の層3。剥がす主体は**capability SID（今の継承元）とpackage SID（D-37時代の
-    // 残骸）の両方**——片方だけだと剥がし残した側から制御面が書ける（`revoke.rs`のdoc参照）。
-    let protected_nodes = protect_harness_control_dir_from_appcontainer(
-        workspace_root,
-        &[workspace_cap.as_psid(), sid.as_psid()],
-    )?;
+    }
+    // D-05/D-09の層3。剥がす主体は**全モードのバッジ（今の継承元）とpackage SID（D-37時代の
+    // 残骸）**——片方だけだと剥がし残した側から制御面が書ける（`revoke.rs`のdoc参照）。
+    //
+    // [D-83] **「今の継承元」が2本になった。** ここが自モードのバッジだけを剥がしていると、
+    // `.harness/`配下に**もう一方のモードのバッジ宛ACEだけが残る**——次にそのモードで
+    // 起動したセッションから制御面が書けてしまい、D-05/D-09が片方のモードでだけ成立する
+    // という無言の穴になる（`B-01`の非対称そのもの）。
+    let mut control_dir_subjects: Vec<PSID> =
+        workspace_badges.iter().map(|(_, s)| s.as_psid()).collect();
+    control_dir_subjects.push(sid.as_psid());
+    let protected_nodes =
+        protect_harness_control_dir_from_appcontainer(workspace_root, &control_dir_subjects)?;
     // [BUG-084] 件数を出す。層3のhard-denyは「1件も掛かっていない」が症状として現れない
     // （BUG-083はそれが恒常的に起きていた）ので、`HARNESS_PREFLIGHT_TIMING=1`で事後確認
     // できる形にしておく。
@@ -434,20 +494,26 @@ pub fn preflight_with_privhelper_launcher(
     // workspaceが出来上がる。
     //
     // 1. 記録の側: `tree_is_verified`（完走時刻＋**そのとき検証したrootの識別子**）
-    // 2. 実体の側: root直下に、capability SIDへアクセスが届いていないノードが無いか
+    // 2. 実体の側: root直下に、**どれかのバッジ**へアクセスが届いていないノードが無いか
     //
     // 2はO(root直下の件数)の読取だけで、実測でも数msである。1が通っても2で見つかったら
     // 回す（`B-14`: 台帳の存在で実体の存在を代替しない）。
+    //
+    // [D-83] **2が「全バッジ」を見るのは、既存ワークスペースの移行がここに掛かっているから
+    // である。** D-83より前に配ったツリーには`rwx`側のバッジしか載っていないが、台帳の
+    // 検証済みは立っている。1だけを見ると`ro`のバッジは1件も配られないままになり、
+    // 次に`--sandbox tier2a-cow`で起動したセッションからworkspaceが一切見えなくなる
+    // （BUG-110とまったく同じ症状——拒否ではなく「無い」に見えるので気付けない）。
     //
     // `.harness/`を外す集合は、下の`grant_job::start`へ渡す`skip`と**同じ値**でなければ
     // ならない——ジョブが意図的にACEを付けない場所を検算側が数えると、毎起動でジョブが
     // 回り続ける（`B-05`）。だから両者は同じ変数を読む。
     let job_skip = vec![workspace_root.join(".harness")];
-    let unreachable_child =
-        top_level_child_missing_ace(workspace_root, workspace_cap.as_psid(), &job_skip);
+    let badge_psids: Vec<PSID> = badge_grants.iter().map(|b| b.sid).collect();
+    let unreachable_child = top_level_child_missing_aces(workspace_root, &badge_psids, &job_skip);
     let needs_descendant_fix = !crate::tier2a::workspace_capability::tree_is_verified(
         &canonical_workspace_root,
-        workspace_mode,
+        workspace_mode.as_str(),
     ) || unreachable_child.is_some();
     // 記録は「検証済み」なのに実体が届いていない、は**説明の要る状態**である（B-10:
     // 無言で直さない）。ジョブを回して直すが、直したこと自体は残す。
@@ -1015,29 +1081,42 @@ pub fn preflight_with_privhelper_launcher(
         // ACEやD-37時代のpackage SID残骸に備えて背景側でも剥がし直す（第2の防御）。ここで渡す
         // `.harness/`再保護用のSIDは、上の
         // 同期`protect_harness_control_dir_from_appcontainer`呼び出しと**同じ集合**
-        // （workspace capability＋セッションSID）にする——片方だけだと剥がし残した側から
-        // 制御面が書けるのは同期区間と同じ理屈（`revoke.rs`のdoc参照）。`workspace_cap`は
-        // このすぐ後で`grant_job::start`へ移動するため、先にコピーを取っておく。
+        // （**全モードのバッジ**＋セッションSID）にする——片方だけだと剥がし残した側から
+        // 制御面が書けるのは同期区間と同じ理屈（`revoke.rs`のdoc参照）。
         let session_sid_copy = unsafe { crate::win_common::OwnedSid::copy_from(sid.as_psid()) }
             .map_err(|e| {
                 AppContainerError::Preflight(format!(
                     "failed to copy the session SID for background .harness re-protection: {e}"
                 ))
             })?;
-        let harness_protect_sids = vec![workspace_cap.clone(), session_sid_copy];
+        let mut harness_protect_sids: Vec<crate::win_common::OwnedSid> = workspace_badges
+            .iter()
+            .map(|(_, sid)| sid.clone())
+            .collect();
+        harness_protect_sids.push(session_sid_copy);
+
+        // [D-83] 背景ジョブへも**全モードのバッジ**を渡す。同期区間はrootへ2本置いたのに
+        // 背景の伝播が1本だけだと、既存の子孫には片方しか届かない——次にモードを切り替えた
+        // セッションが26万件を払い直す状態へ戻る（`B-01`: 同じ決定を全経路へ届ける）。
+        let owned_badges: Vec<OwnedBadgeGrant> = workspace_badges
+            .into_iter()
+            .map(|(mode, sid)| OwnedBadgeGrant {
+                sid,
+                mask: workspace_mode_mask(mode),
+            })
+            .collect();
 
         // 戻り値の`false`は「このプロセスでは既に別のジョブが走っている」＝`preflight`が2回
         // 呼ばれた場合だけで、製品では起こらない（実機テストが同居するときだけ）。
         let started = grant_job::start(
             workspace_root,
-            workspace_cap,
-            workspace_mask,
+            owned_badges,
             harness_protect_sids,
-            // 上の`top_level_child_missing_ace`と**同じ集合**（`B-05`。ここがずれると、
+            // 上の`top_level_child_missing_aces`と**同じ集合**（`B-05`。ここがずれると、
             // ジョブが意図的に外した場所を検算側が数えて毎起動でジョブが回る）。
             job_skip,
             &canonical_workspace_root,
-            workspace_mode,
+            workspace_mode.as_str(),
         );
         timing.mark(&format!(
             "grant_job::start (background propagate + descendant fix-up, started={started})"

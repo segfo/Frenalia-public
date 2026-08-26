@@ -5,6 +5,8 @@
 
 use super::*;
 
+use crate::tier2a::workspace_ledger::WorkspaceMode;
+
 /// walk中に対象ノードが消えていた（TOCTOU）ときの扱い。[`collect_dirs_and_files`]の呼び出し
 /// 側が**必ず選ぶ**——既定を置かないのは、この選択が経路ごとに正反対だからである。
 ///
@@ -230,7 +232,15 @@ pub(crate) unsafe fn set_dacl_propagating(
     .ok()
 }
 
-unsafe fn set_dacl_single_object(path: &Path, new_dacl: *mut ACL) -> windows::core::Result<()> {
+/// `new_dacl`を`path`**そのものだけ**へ設定する（子孫へは配らない）。
+///
+/// `pub(crate)`なのは[`super::acl_dacl_write`]が「M本を1つのDACLへ畳んで1回で書く」側の
+/// 単一オブジェクト版で使うため（[D-83]で両モードのバッジを同時に置くようになり、
+/// 主体ごとに1回ずつ書く形だと書込回数が本数に比例する）。
+pub(crate) unsafe fn set_dacl_single_object(
+    path: &Path,
+    new_dacl: *mut ACL,
+) -> windows::core::Result<()> {
     let path_w = long_path_wide(path);
     let handle = CreateFileW(
         PCWSTR(path_w.as_ptr()),
@@ -813,11 +823,42 @@ pub fn fix_descendants_missing_ace(
     skip: &[std::path::PathBuf],
     progress: &dyn Fn(usize, usize),
 ) -> Result<DescendantFixReport, AppContainerError> {
+    fix_descendants_missing_aces(root, &[BadgeGrant { sid, mask }], skip, progress)
+}
+
+/// [D-83] [`fix_descendants_missing_ace`]の多本版。**ノードあたりDACLの読取1回・書込は
+/// 多くとも1回**で、届いていないバッジだけをまとめて書く。
+///
+/// # なぜ「バッジごとにwalkを1周」ではないのか
+///
+/// この救済walkの費用は**書込ではなく読取**である（26万ノードで実測18.5秒、ほぼ全ノードが
+/// 「もう届いている」で終わる）。バッジごとに1周すると、その読取をバッジの本数だけ払う——
+/// [D-83]の前提（「バッジを増やしても無料」、`plans/mac-spike/RESULTS.md` §S15-1）は
+/// **1回の書込にまとめた場合の話**であって、walkを2周する形には効かない。
+/// だから1ノードにつきDACLを1回読み（[`sid_effective_ace_masks`]）、
+/// 足りないバッジがあればそのぶんを1回の書込で置く。
+///
+/// [`DescendantFixReport::granted`]は**ノード数**であってACEの本数ではない
+/// （1ノードで2本書いても1と数える）。`0`が健全、の読み方は単数版と同じ。
+#[track_caller]
+pub fn fix_descendants_missing_aces(
+    root: &Path,
+    badges: &[BadgeGrant],
+    skip: &[std::path::PathBuf],
+    progress: &dyn Fn(usize, usize),
+) -> Result<DescendantFixReport, AppContainerError> {
     // [BUG-101] ここが書くのは**子孫**のACEで、台帳に載るのはrootである。ガードを張って
     // 子孫ぶんを記録から外す（26万ノードのworkspaceでは全件が偽の「記録漏れ」になる）。
     // `grant_ace_inheritable_*`から呼ばれた場合は既に外側のガードが立っているので、
     // ここは`grant_job`の背景フェーズが直接呼ぶ経路のためのものである。
-    let _audit = crate::tier2a::grant_audit::note_root_grant(root, sid);
+    //
+    // **バッジの本数ぶんガードを張る**——1本目だけ張って2本目を素通しにすると、
+    // 2本目の子孫ぶんが全件「記録漏れ」として上がる（`B-06`: 主体を増やしたら計装も数える）。
+    let _audits: Vec<_> = badges
+        .iter()
+        .map(|badge| crate::tier2a::grant_audit::note_root_grant(root, badge.sid))
+        .collect();
+    let sids: Vec<PSID> = badges.iter().map(|b| b.sid).collect();
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
@@ -848,15 +889,36 @@ pub fn fix_descendants_missing_ace(
             report.skipped += 1;
             continue;
         }
-        match sid_effective_ace_mask(node, sid) {
-            Ok(Some(_)) => continue,
-            Ok(None) => {}
-            Err(_) => report.probe_errors += 1,
+        // **DACLの読取は1ノードにつき1回**（バッジごとに読み直すと、この walk の費用が
+        // 本数に比例する）。読めなければ**届いていない側へ倒す**——単数版のときと同じ規則で、
+        // 読めない理由がACL不足のこともあるため。
+        let reached = match sid_effective_ace_masks(node, &sids) {
+            Ok(masks) => masks,
+            Err(_) => {
+                report.probe_errors += 1;
+                vec![None; sids.len()]
+            }
+        };
+        let missing: Vec<BadgeGrant> = badges
+            .iter()
+            .zip(reached)
+            .filter(|(_, mask)| mask.is_none())
+            .map(|(badge, _)| *badge)
+            .collect();
+        if missing.is_empty() {
+            continue;
         }
         if report.samples.len() < 8 {
             report.samples.push(node.display().to_string());
         }
-        grant_ace_raw(node, sid, mask, is_dir)?;
+        // 足りないぶんを**1回の書込で**置く。ここで`IdempotentCheck::Always`にするのは、
+        // 冪等判定を既に上の実効マスク読取で済ませているためである（明示ACEだけを見る
+        // `SkipIfSufficient`とは判定の基準が違うので、二重に掛けると噛み合わない）。
+        super::acl_dacl_write::grant_aces_single_object(
+            node,
+            &inheritable_grants(&missing, is_dir),
+            IdempotentCheck::Always,
+        )?;
         report.granted += 1;
     }
     Ok(report)
@@ -881,9 +943,30 @@ pub fn fix_descendants_missing_ace(
 /// `skip`配下は対象外（`preflight`は`.harness/`を渡す——**意図的にACEを剥がしている場所**
 /// なので、ここで数えると毎回ジョブが回る）。DACLを読めなかったノードは
 /// **届いていない側**へ倒す（読めない理由がACL不足のこともある）。
+///
+/// **[D-83] 製品はもうここを通らない**（バッジが2本になったため）。1主体で測る回帰テストの
+/// ために残してある薄い包みで、判定規則は[`top_level_child_missing_aces`]と同一である。
+#[cfg(test)]
 pub(crate) fn top_level_child_missing_ace(
     root: &Path,
     sid: PSID,
+    skip: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    top_level_child_missing_aces(root, &[sid], skip)
+}
+
+/// [D-83] [`top_level_child_missing_ace`]の多本版。**バッジのうち1本でも届いていなければ
+/// 見つけたことにする。**
+///
+/// **1本でも、である理由**は移行にある。[D-83]より前に付与されたworkspaceは`rwx`側の
+/// バッジしか載っていないが、台帳の「検証済み」は立っている。ここが全バッジを見ていないと、
+/// **`ro`のバッジが1件も配られていないのに検証済みのまま**になり、次に
+/// `--sandbox tier2a-cow`で起動したセッションからworkspaceが一切見えない（`B-14`:
+/// 台帳の存在で実体の存在を代替しない、の実例そのもの）。ここが見つけることで、
+/// 移行は**次の起動で背景ジョブが1回回る**という形になる。
+pub(crate) fn top_level_child_missing_aces(
+    root: &Path,
+    sids: &[PSID],
     skip: &[std::path::PathBuf],
 ) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(root).ok()?;
@@ -897,9 +980,9 @@ pub(crate) fn top_level_child_missing_ace(
         if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
             continue;
         }
-        match sid_effective_ace_mask(&path, sid) {
-            Ok(Some(_)) => continue,
-            Ok(None) | Err(_) => return Some(path),
+        match sid_effective_ace_masks(&path, sids) {
+            Ok(masks) if masks.iter().all(Option::is_some) => continue,
+            _ => return Some(path),
         }
     }
     None
@@ -1005,63 +1088,25 @@ pub fn grant_workspace_root_ro(root: &Path, sid: PSID) -> Result<(), AppContaine
 /// **消さない**。手当ては伝播する側（[`super::acl_dacl_write`]）が、書く直前に外す形で持つ。
 #[track_caller]
 pub fn grant_workspace_root_rw_fast(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    if !root.is_dir() {
-        return grant_ace(root, sid, false);
-    }
-    let mut timing = PhaseTiming::start();
-    grant_ace(root, sid, true)?;
-    timing.mark("  rw: fast (single-object) root grant");
-    Ok(())
+    grant_workspace_root_badges_fast(
+        root,
+        &[BadgeGrant {
+            sid,
+            mask: workspace_mode_mask(WorkspaceMode::Rwx),
+        }],
+    )
 }
 
 /// [`grant_workspace_root_rw_fast`]のread-only版（`--sandbox tier2a-cow`のworkspace本体、D-30）。
 #[track_caller]
 pub fn grant_workspace_root_ro_fast(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    if let Some(result) = grant_ace_access_if_file(root, sid, FsAccess::ReadExec) {
-        return result;
-    }
-    let mut timing = PhaseTiming::start();
-    grant_ace_ro(root, sid, true)?;
-    timing.mark("  ro: fast (single-object) root grant");
-    Ok(())
-}
-
-/// [BUG-082 Part B] rootへの継承ACE伝播を**冪等チェック無しで無条件に**行う。`grant_job`の
-/// 背景フェーズだけが使う。
-///
-/// **`IdempotentCheck::Always`が必須の理由**: `preflight`の同期区間で先に
-/// `grant_workspace_root_rw_fast`/`_ro_fast`（`DaclWrite::SingleObject`）を通しているため、
-/// この時点でrootは既に「sid宛のACEが要求マスクを満たしている」ように見える。通常の
-/// `grant_ace_mask_with`（`IdempotentCheck::SkipIfSufficient`）を使うと、この冪等スキップが
-/// 効いて**伝播そのものが呼ばれない**——[BUG-081](../../../../docs/bugs/BUG-081.md)層1
-/// （伝播を使う高速経路が、伝播しない書込APIへ差し替えられ、機能は壊れないまま無症状に
-/// 退化していた）とまったく同じ形の罠なので、ここは意図を明示する専用関数にする。
-///
-/// `mask`は呼び出し側（`preflight`）が`workspace_mask`としてRWX/ROいずれかを渡す
-/// （`grant_job::start`の他の引数と同じ`mask`をそのまま使う）。
-///
-/// [残課題#32] **配るのは[`super::acl_dacl_write::grant_aces_propagating`]（M本を1つのDACLへ
-/// 畳んで1回だけ書く部品）である。** `IdempotentCheck::Always`は「冪等スキップで伝播が
-/// *呼ばれない*」を防ぐもので、**必要だが十分ではなかった**——呼ばれても届いていなかった。
-/// 十分にする側は部品が持つ（同モジュールのdocに実測表がある）。**両方要るので、どちらも外さない。**
-#[track_caller]
-pub(crate) fn propagate_workspace_root_grant(
-    root: &Path,
-    sid: PSID,
-    mask: u32,
-) -> Result<(), AppContainerError> {
-    let mut timing = PhaseTiming::start();
-    super::acl_dacl_write::grant_aces_propagating(
+    grant_workspace_root_badges_fast(
         root,
-        &[super::acl_dacl_write::InheritableGrant {
+        &[BadgeGrant {
             sid,
-            mask,
-            inheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+            mask: workspace_mode_mask(WorkspaceMode::Ro),
         }],
-        IdempotentCheck::Always,
-    )?;
-    timing.mark("  background: propagating root grant (unconditional)");
-    Ok(())
+    )
 }
 
 #[cfg(test)]
