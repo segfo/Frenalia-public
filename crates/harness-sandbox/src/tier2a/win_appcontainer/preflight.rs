@@ -52,10 +52,16 @@ type FsAllowElevationOutcome = (Vec<std::path::PathBuf>, Vec<(std::path::PathBuf
 /// [BUG-101] **付与したACEが台帳に載っているか**を、`preflight`をどう抜けても必ず測るガード。
 ///
 /// `Drop`にしてあるのは`passthrough_progress::begin`と同じ理由——この関数は`?`で抜ける経路を
-/// 複数持ち、**そのうち3つ（traverse付与の失敗、`:566`/`:627`/`:639`）は付与ループの後・
-/// 台帳への記録（`record_granted_paths`）の前にある**。つまり早期returnした実行では、
-/// 既にマシンへ書いたACEが1件も記録されていない。手で閉じる形にすると、脱出経路が
-/// 1つ増えるたびに書き忘れる（B-06）。
+/// 複数持ち、そのいくつかは**セッション台帳へ記録する経路（CoW Redirector DLLの
+/// `record_granted_path`）より後**にある。つまり早期returnした実行でも、既にマシンへ書いた
+/// ACEを測る機会が要る。手で閉じる形にすると、脱出経路が1つ増えるたびに書き忘れる（B-06）。
+///
+/// **測る対象はセッションのpackage SIDだけである**（`grant_audit`のモジュールdocの既定方針）。
+/// [§22.3] `--fs-allow`の穴は宣言ごとのcapability SID宛へ移り、**セッション台帳へは
+/// 記録しなくなった**（同じセッションでは開かれっぱなしで、撤収は
+/// `workspace-capability-ledger.json`を索引に名前の付いた扉が行う）。したがって
+/// ここで除外リストを持つ必要はもう無い——除外は「記録しているのに主体が違う」ときに
+/// 要ったもので、記録そのものをやめた時点で対象に入らない。
 ///
 /// 正常に抜けるときは[`Self::finish`]で`warnings`へも積む——stderrの1行はTUIでは
 /// 進行ログに流れて消えるが、`warnings`は「⚠ 対応が要ります」欄とマニフェストに残る
@@ -63,16 +69,6 @@ type FsAllowElevationOutcome = (Vec<std::path::PathBuf>, Vec<(std::path::PathBuf
 struct SessionGrantAudit {
     profile_name: String,
     done: bool,
-    /// [§22.3] このセッションが**package SID以外の主体**（宣言ごとのcapability SID）で
-    /// 開いたパス。**この自己検証の対象から外す。**
-    ///
-    /// 外さないと、`--fs-allow`のパスは「セッション台帳には載っているのに、セッションの
-    /// package SID宛ACEは無い」と判定され、**毎起動で「幻の台帳エントリ N件」という警告が
-    /// 出続ける**——移行によって測る相手が変わっただけで、実際には何も壊れていない
-    /// （§22.3.0が「検算を追随させないと常時警告か沈黙のどちらかになる」と言っているのが
-    /// これである）。capability SIDを対象にしないのは`grant_audit`のモジュールdocの
-    /// 既定方針そのままで、あちらは「ここで測ると全件が偽陽性になる」と書いている。
-    capability_owned: Vec<String>,
 }
 
 impl SessionGrantAudit {
@@ -80,19 +76,7 @@ impl SessionGrantAudit {
         Self {
             profile_name: profile_name.to_string(),
             done: false,
-            capability_owned: Vec::new(),
         }
-    }
-
-    /// 宣言capabilityで開いたパスを対象外として登録する。
-    ///
-    /// **早期returnで抜ける経路には届かない**（`Drop`が走る時点ではまだ空のことがある）。
-    /// その場合に出るのは上記の偽陽性警告だけで、しかも既に別の失敗で抜けている経路なので、
-    /// 診断が1行増える側へ倒してある——逆に「登録されるまで測らない」にすると、
-    /// 早期returnした実行の孤児ACEを1件も見つけられなくなる。
-    fn note_capability_owned<'a>(&mut self, paths: impl Iterator<Item = &'a std::path::PathBuf>) {
-        self.capability_owned
-            .extend(paths.map(|p| p.to_string_lossy().into_owned()));
     }
 
     fn run(&mut self) -> Option<crate::tier2a::grant_audit::GrantAudit> {
@@ -100,15 +84,8 @@ impl SessionGrantAudit {
             return None;
         }
         self.done = true;
-        let recorded: Vec<String> = crate::tier2a::session_profile::granted_paths_for_current_session()
-            .into_iter()
-            .filter(|path| {
-                !self
-                    .capability_owned
-                    .iter()
-                    .any(|owned| harness_grant_ledger::same_ledger_path(owned, path))
-            })
-            .collect();
+        let recorded: Vec<String> =
+            crate::tier2a::session_profile::granted_paths_for_current_session();
         let audit = crate::tier2a::grant_audit::audit_profile(
             crate::tier2a::grant_audit::Stage::Preflight,
             &self.profile_name,
@@ -313,7 +290,7 @@ pub fn preflight_with_privhelper_launcher(
     // [BUG-101] **この行より後で付けたACEは、必ず台帳と突き合わせてから抜ける。**
     // 武装をここに置くのは、この直後の`ensure_profile`以降が「このセッションのSID宛に
     // ACEを付け得る全区間」だからである（`SessionGrantAudit`のdoc）。
-    let mut audit_guard = SessionGrantAudit::arm(&profile_name);
+    let audit_guard = SessionGrantAudit::arm(&profile_name);
     let sid = ensure_profile(&profile_name)?;
     // [BUG-101/B-05] 台帳へ「どのSID宛に付与したか」を書くのは**呼び出し元**（`run_agent`と
     // ポリシーエディタのパス2）で、あちらは`current_session_grant_sid()`から値を取る。
@@ -603,11 +580,17 @@ pub fn preflight_with_privhelper_launcher(
     // 2. **正しさ**: 下の昇格経路で祖先のtraverseが直ることがある。付与の途中で測ると
     //    「直る前の状態」を到達不能として報告してしまう。
     let mut probe_targets: Vec<FsPassthrough> = Vec::new();
-    // session ledgerへ記録するパス。**1件ずつ`update`を呼ばない**——1回の`update`は
-    // 全文読取＋`.bak`への全文コピー＋全文書込であり、この台帳は実測66KBある。
-    // 668件のドメインでは約130MBのI/Oになり、しかも`already_sufficient`（ACEを1件も
-    // 書かない2回目以降）でも同じだけ払う（`record_granted_paths`のdoc）。
-    let mut ledger_paths: Vec<std::path::PathBuf> = Vec::new();
+    // [§22.3] **この実行で実際に開いた穴**（既に足りていた・いま書いた・昇格側が書いた・
+    // 部分適用で残った、のすべてを含む）。
+    //
+    // **セッション台帳へは記録しない。** 宣言はworkspaceの性質であってセッションの性質では
+    // なく、その主体（宣言ごとのcapability SID）は§22.2.1により**永続**である。記録すると
+    // `end_session`がそのエントリを「回収済み」として落とすので、ACEは実マシンに残るのに
+    // **それを覚えている記録だけが消える**（撤収に使える索引は
+    // `workspace-capability-ledger.json`の宣言エントリで、付与時に必ず作られている）。
+    //
+    // ここで集めるのは§22.3.0の不変条件の検算（この関数の末尾）に使うためである。
+    let mut fs_allow_opened_paths: Vec<std::path::PathBuf> = Vec::new();
     // [§22.3] **この穴の主体**（宣言ごとのcapability SID）。2つの用途で持ち回る。
     //
     // 1. **子のトークンへ積む**——ACEを付けても、子がそのcapabilityを持っていなければ
@@ -791,13 +774,11 @@ pub fn preflight_with_privhelper_launcher(
             // ことが「差分適用になっている」の証拠になる（`passthrough_progress`のdoc）。
             progress.record_already_sufficient();
             granted_passthrough.push((fp.path.clone(), requested_rw));
-            // BUG-057: 付与を**スキップした**場合もsession ledgerへ記録する。ACEを実際に
-            // 書いたのが前のセッションだったとしても、撤収責任はこのセッションにある。
-            // 記録しないと`end_session`の撤収対象から漏れる。
-            //
-            // [§22.3] 主体はもうセッション固有ではない（宣言ごとのcapability）。**どのSID宛に
-            // 付いているか**は`granted_subjects`が運び、撤収側はそれを名指しで剥がす。
-            ledger_paths.push(fp.path.clone());
+            // [§22.3] 付与を**スキップした**場合も「開いた穴」として数える——ACEを実際に
+            // 書いたのが前のセッションでも、いまこの穴は開いている（BUG-057が
+            // session ledgerについて言っていたのと同じ理由で、検算の対象から外さない）。
+            // どのSID宛に付いているかは`granted_subjects`が運ぶ。
+            fs_allow_opened_paths.push(fp.path.clone());
             remember_subject(&mut fs_allow_caps, &mut granted_subjects);
             probe_targets.push(fp.clone());
             continue;
@@ -812,7 +793,7 @@ pub fn preflight_with_privhelper_launcher(
                 // 実際にACEを書いた1件。
                 progress.record_granted();
                 granted_passthrough.push((fp.path.clone(), requested_rw));
-                ledger_paths.push(fp.path.clone());
+                fs_allow_opened_paths.push(fp.path.clone());
                 remember_subject(&mut fs_allow_caps, &mut granted_subjects);
                 probe_targets.push(fp.clone());
             }
@@ -1035,14 +1016,12 @@ pub fn preflight_with_privhelper_launcher(
                         fs_allow_caps.push(cap);
                     }
                     granted_passthrough.push((path.clone(), writable));
-                    // BUG-057: 昇格経由（privhelper / 本体が既に管理者の直接付与、どちらも
-                    // この`granted`へ合流する）の付与もsession ledgerへ記録する。ここが
-                    // 抜けていたため、`fs-passthrough-ledger.json`（`harness fs revoke`が見る）
-                    // には載るのに`end_session`の自動撤収からは漏れていた。
                     // 昇格経由（privhelper／本体が既に管理者）の付与も「書いた1件」に数える
                     // ——どの経路で書いたかではなく、**マシンのACLを変えたか**が知りたい事実。
+                    // 開いた穴の集合にも同じ理由で入れる（BUG-057が「昇格経由だけが記録から
+                    // 漏れる」形を踏んでいるので、経路ごとに数え方を変えない）。
                     progress.record_granted();
-                    ledger_paths.push(path.clone());
+                    fs_allow_opened_paths.push(path.clone());
                     if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
                         probe_targets.push(fp.clone());
                     }
@@ -1056,9 +1035,10 @@ pub fn preflight_with_privhelper_launcher(
                     let writable = access.is_read_write();
                     // BUG-017: grant_ace_recursive/grant_ace_inheritable_roはroot(先頭ノード)から
                     // 順に付与するため、途中の子孫(TrustedInstaller所有等)で失敗しても、rootには
-                    // 既にACEが載っている場合がある。「失敗」扱いで台帳へ記録しないと、実FS上には
-                    // ACEが残るのに撤収経路が無い孤立ACEになる。rootを権威的にプローブし、ACEが
-                    // 実在すれば台帳へ記録して`fs revoke`で後から掃除できるようにする。
+                    // 既にACEが載っている場合がある。「失敗」扱いにして`granted_passthrough`から
+                    // 落とすと、実FS上にはACEが残るのに呼び出し元（`fs-passthrough-ledger`への
+                    // 記録）から漏れ、撤収経路の無い孤立ACEになる。rootを権威的にプローブし、
+                    // ACEが実在すれば記録して`fs revoke`で後から掃除できるようにする。
                     let subject = elevated_subject(path);
                     if matches!(
                         subject
@@ -1067,9 +1047,9 @@ pub fn preflight_with_privhelper_launcher(
                         Some(Ok(Some(_)))
                     ) {
                         granted_passthrough.push((path.clone(), writable));
-                        // BUG-057: 部分適用でACEが実在するなら、`end_session`の撤収対象にも入れる
-                        // （`fs revoke`だけでなく自動撤収からも漏らさない）。
-                        ledger_paths.push(path.clone());
+                        // 部分適用でACEが実在するなら、それは「開いた穴」である
+                        // （§22.3.0の検算からも外さない）。
+                        fs_allow_opened_paths.push(path.clone());
                         if let Some(cap) = subject {
                             if let Ok(text) = crate::win_common::sid_to_string(cap.as_psid()) {
                                 granted_subjects.push((path.clone(), text));
@@ -1109,8 +1089,8 @@ pub fn preflight_with_privhelper_launcher(
                     ) {
                         granted_passthrough
                             .push((entry.path.clone(), entry.access.is_read_write()));
-                        // BUG-057: 上と同じ（ヘルパーが完走できなかった場合の部分適用）。
-                        ledger_paths.push(entry.path.clone());
+                        // 上と同じ（ヘルパーが完走できなかった場合の部分適用）。
+                        fs_allow_opened_paths.push(entry.path.clone());
                         if let Some(cap) = subject {
                             if let Ok(text) = crate::win_common::sid_to_string(cap.as_psid()) {
                                 granted_subjects.push((entry.path.clone(), text));
@@ -1144,16 +1124,18 @@ pub fn preflight_with_privhelper_launcher(
         }
     }
 
-    // **撤収責任の記録は、付与が全部終わった直後にここで1回だけ書く**（BUG-057の要件は
-    // 「記録が漏れないこと」であって「1件ずつ書くこと」ではない）。付与とこの書込の間に
-    // プロセスが落ちるとACEが台帳に載らないが、その窓は本体・昇格ヘルパーとも
-    // 付与を終えた直後のミリ秒であり、**子プロセスはまだ1つも起きていない**。
-    // 1件ずつ書くと668件で約130MBのI/Oになり、毎回数秒を確実に失う（`record_granted_paths`）。
-    crate::tier2a::session_profile::record_granted_paths(&ledger_paths);
-
-    // [§22.3] 自己検証（BUG-101）が測る主体は**このセッションのpackage SID**なので、
-    // capabilityで開いた穴をその物差しで測らせない（`note_capability_owned`のdoc）。
-    audit_guard.note_capability_owned(granted_subjects.iter().map(|(path, _)| path));
+    // [§22.3] **`--fs-allow`の穴はセッション台帳へ記録しない。** かつてはここで
+    // `record_granted_paths`を呼び、`end_session`が同じパスからセッションのpackage SID宛ACEを
+    // 剥がしていた（BUG-057）。主体が宣言ごとのcapability SIDへ移った後は、その撤収は
+    // **何も剥がさないのに台帳エントリだけを「回収済み」として落とす**——ACEは実マシンに
+    // 残るのに、それを覚えている記録が消える形になる。
+    //
+    // 撤収の索引は`workspace-capability-ledger.json`の宣言エントリで、付与時に
+    // `fs_allow_capability_sid`が必ず作っている（§22.2.1「撤収すべきSIDは宣言から一意に
+    // 計算できる」）。剥がすのは名前の付いた扉と、宣言が消えたときの起動時の差分である。
+    //
+    // **CoW Redirector DLL（このセッションのpackage SID宛）は従来どおり記録する**——
+    // あちらは主体もセッションと同じ寿命なので、`end_session`が正しく剥がせる。
 
     // 付与フェーズはここで終わり（以降は到達性プローブとスモークテスト）。明示的に落として、
     // UIが「ACE付与 N/N」を出し続けないようにする。
@@ -1172,8 +1154,9 @@ pub fn preflight_with_privhelper_launcher(
     // `audit_guard`＝BUG-101の自己検証）と同じ場所・同じ`warnings`へ寄せる。ここを
     // 別の仕組みにすると、移行後に「常時警告」か「沈黙」のどちらかへ倒れる。
     //
-    // 測るのは`ledger_paths`（＝実際に開いた穴）だけで、rootへの明示ACEを1件読むだけである。
-    let unmigrated: Vec<&std::path::PathBuf> = ledger_paths
+    // 測るのは`fs_allow_opened_paths`（＝実際に開いた穴）だけで、rootへの明示ACEを1件読む
+    // だけである。
+    let unmigrated: Vec<&std::path::PathBuf> = fs_allow_opened_paths
         .iter()
         .filter(|path| matches!(sid_explicit_ace(path, sid.as_psid()), Ok(Some(_))))
         .collect();
@@ -1201,8 +1184,8 @@ pub fn preflight_with_privhelper_launcher(
     timing.mark("§22.3.0 migration invariant (no session package-SID ACE left)");
 
     // [BUG-101] **付与直後に、実マシンのDACLと台帳を突き合わせる。**
-    // 記録するつもりだった集合（`ledger_paths`）と台帳を比べても、付与側の思い込みが
-    // 両辺に乗るだけで差は出ない。見るのは実測したACEである（`grant_audit`のdoc）。
+    // 記録するつもりだった集合と台帳を比べても、付与側の思い込みが両辺に乗るだけで
+    // 差は出ない。見るのは実測したACEである（`grant_audit`のdoc）。
     audit_guard.finish(&mut warnings);
     timing.mark("grant audit (BUG-101)");
 
