@@ -380,13 +380,12 @@ fn grant_traverse_targets(sid: PSID, targets: Vec<PathBuf>) -> (Vec<PathBuf>, Op
 /// |---|---|---|
 /// | 祖先チェーンのtraverse（`GrantTraverse`/`RevokeTraverse`/`GrantWorkspaceAccess`のtraverse部分） | capability SID | `traverse_capability_sid()`（固定名`harnessSandboxTraverse`） |
 /// | leafへの読み書きの**付与**（`GrantWorkspaceAccess`のfs-allow部分） | **宣言ごとのcapability SID**（§22.3） | IPCで受けた**秘密**＋**この側が畳み込んだ書込先のパス**＋access級（`grant_fs_allow_entries`） |
-/// | leafへの読み書きの**撤収**（`RevokeFsAllow`） | **対象パスのDACLに実在するpackage SID** | `win_appcontainer::revoke_harness_subjects`（名前からは導出しない） |
+/// | leafへの読み書きの**撤収**（`RevokeFsAllow`） | **2系統を順に**——(1) **宣言ごとのcapability SID**（§22.2.1）、(2) 対象パスのDACLに実在するpackage SID | (1) IPCで受けた**秘密**＋**この側が畳み込んだ対象パス**＋access級、(2) `win_appcontainer::revoke_harness_subjects`（名前からは導出しない） |
 ///
-/// **[T1 未完] 撤収の行がまだ移行していない。** 付与が宣言capability宛になった一方、
-/// `RevokeFsAllow`は依然としてpackage SIDの分類器しか通らないので、**昇格が要るパスの
-/// capability宛ACEはこの経路では剥がれない**。剥がす主体は宣言から一意に導出できる
-/// （§22.2.1「分類器を使わず、宣言から導出したSIDを名指しで剥がす」）ので、
-/// 秘密を`FsAllowRevoke`にも載せて同じ導出を通すのが対の残り半分である。
+/// **撤収が2系統あるのは、移行の途中に両方が実在し得るからである。** 新しい主体
+/// （capability SID）は宣言から一意に導出でき、旧い主体（package SID）は導出できないので
+/// DACLから分類するしかない——**探し方が違うので同じ関数にはならない**。どちらか片方でも
+/// rootに残っていれば、このパスは「撤収できた」と応答しない。
 ///
 /// traverse側が`CONTAINER_NAME`のpackage SIDのままD-37から取り残されていたのが
 /// [BUG-061](../../../../docs/bugs/BUG-061.md)である。**新しいアームを足す人は、上表のどの行に
@@ -517,24 +516,86 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
             for entry in entries {
                 let path = entry.path;
                 let started = std::time::Instant::now();
-                // [BUG-101] 撤収する主体は**このパスのDACLに実在するharness由来のSID**で決める
-                // （旧実装は`ensure_profile(CONTAINER_NAME)`＝旧共有プロファイル固定だった）。
+                // [§22.2.1] **宣言capabilityは、受け取った秘密からこの側で導出して名指しで剥がす。**
+                // 付与（`grant_fs_allow_entries`）とまったく同じ導出を通す——ここだけ別の決め方に
+                // すると、同じ宣言なのに付与と撤収で違う主体を見ることになる（B-02）。
+                //
+                // **空は拒否しない。** 付与側は秘密の無い電文をfail-closedで拒むが、撤収で
+                // 止めると剥がせないACEが実マシンに残る。剥がせた／見ていないの区別は、
+                // 非昇格側が自分の台帳で実DACLを検算して付ける。
+                let declaration_subjects: Vec<crate::win_common::OwnedSid> = entry
+                    .subjects
+                    .iter()
+                    .filter(|s| !s.secret_hex.is_empty())
+                    .filter_map(|s| {
+                        let name = crate::tier2a::workspace_capability::declaration_capability_name(
+                            &s.secret_hex,
+                            &crate::tier2a::workspace_capability::declaration_key(&path),
+                            s.access.label(),
+                        );
+                        match win_appcontainer::capability_sid_from_declaration_name(&name) {
+                            Ok(sid) => Some(sid),
+                            Err(e) => {
+                                log::line(&format!(
+                                    "  path {} : could not derive a declaration capability: {e}",
+                                    path.display()
+                                ));
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                // [BUG-101] package SID側の撤収する主体は**このパスのDACLに実在するharness由来の
+                // SID**で決める（旧実装は`ensure_profile(CONTAINER_NAME)`＝旧共有プロファイル固定だった）。
                 //
                 // **昇格側では台帳の記録（規則3）と未登録SIDの指紋（規則4）は使わない。**
                 // `runas`の昇格先が別の管理者アカウントだと`HKCU`が別ハイブになり、分類の
                 // 前提（この機の登録簿を見ている）が崩れる。分類できないものは剥がさず、
                 // 非昇格側が名指しで報告する（fail-closed）。
-                let do_revoke =
-                    || win_appcontainer::revoke_harness_subjects(&path, &[], &|_, _| {});
-                let outcome = if entry.forced {
+                let do_revoke = || {
+                    // 宣言capabilityを先に剥がす。どちらの順でも最終状態は同じだが、
+                    // 失敗したときに「新しい主体は落ちたのに旧い主体が残った」より
+                    // 「旧い主体は落ちたが新しい主体が残った」の方が、次の起動の検算
+                    // （§22.3.0の不変条件＝package SID宛が0本）で見つかる側に倒れる。
+                    let decl = win_appcontainer::revoke_capability_subjects(
+                        &path,
+                        &declaration_subjects,
+                        &|_, _| {},
+                    );
+                    let subjects = win_appcontainer::revoke_harness_subjects(&path, &[], &|_, _| {});
+                    (decl, subjects)
+                };
+                let (decl_outcome, outcome) = if entry.forced {
                     // forcedなパス（--force-system-aclで付与したACE）は撤収時も
                     // `SeRestorePrivilege`が要る。
                     win_appcontainer::with_restore_privilege(do_revoke)
                 } else {
                     do_revoke()
                 };
+                // 宣言側の結末は**件数だけ**ログへ出す（秘密を持つ要求なので中身を書かない）。
+                match &decl_outcome {
+                    Ok(report) => log::line(&format!(
+                        "  path {} : declaration capabilities: {} targeted, {} node(s) rewritten, \
+                         {} still on the root",
+                        path.display(),
+                        report.targeted.len(),
+                        report.rewritten,
+                        report.still_on_root.len()
+                    )),
+                    Err(e) => log::line(&format!(
+                        "  path {} : declaration capability revoke FAILED: {e}",
+                        path.display()
+                    )),
+                }
+                // **宣言側が終わっていなければ、このパスは「撤収できた」ではない。**
+                // package側だけを見て`revoked`へ積むと、非昇格側は「ヘルパーが片付けた」と
+                // 読み、capability宛ACEが残ったまま台帳の記録を捨てにいく（B-09）。
+                let decl_left: Vec<String> = match &decl_outcome {
+                    Ok(report) => report.still_on_root.clone(),
+                    Err(e) => vec![format!("declaration capability revoke failed: {e}")],
+                };
                 match outcome {
-                    Ok(report) if report.unfinished().is_empty() => {
+                    Ok(report) if report.unfinished().is_empty() && decl_left.is_empty() => {
                         log::line(&format!(
                             "  path {} : revoked {} subject(s), {} node(s) rewritten in {}ms",
                             path.display(),
@@ -545,17 +606,23 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                         revoked.push(path);
                     }
                     Ok(report) => {
+                        let left: Vec<String> = report
+                            .unfinished()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .chain(decl_left)
+                            .collect();
                         log::line(&format!(
                             "  path {} : FAILED after {}ms (still on the root: {})",
                             path.display(),
                             started.elapsed().as_millis(),
-                            report.unfinished().join(", ")
+                            left.join(", ")
                         ));
                         failures.push((
                             path,
                             format!(
                                 "still on the root after an elevated revoke: {}",
-                                report.unfinished().join(", ")
+                                left.join(", ")
                             ),
                         ));
                     }

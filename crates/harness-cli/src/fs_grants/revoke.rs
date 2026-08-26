@@ -237,6 +237,33 @@ fn revoke_subjects_with_progress(
     result
 }
 
+/// [§22.3.1] 昇格側へ渡す**宣言capabilityの前像**（`(秘密, access級)`）を組み立てる。
+///
+/// **SIDも名前も渡さない。** 受信側が`(この秘密, 自分で畳み込んだ対象パス, access級)`から
+/// 導出するので、宣言Aの秘密で別のパスBへAの主体を付けさせることができない（§22.3.1の表3行目）。
+///
+/// **秘密を引くのはこの関数だけにしてある**（付与側`preflight`が昇格分岐だけで引いているのと
+/// 同じ方針）。持ち回る場所が増えると、ログやエラー文へ載る面が増える。
+///
+/// 台帳の`mode`欄が知らない綴りだったエントリは**落とす**——級が違えば主体が別になるので、
+/// 既定値で埋めると存在しないSIDを剥がしに行くことになる。落ちた分は昇格後の検算
+/// （`declaration_capabilities_on_root`）が「まだ載っている」として拾う。
+#[cfg(windows)]
+fn declaration_subjects_for(
+    path: &Path,
+    workspace: Option<&Path>,
+) -> Vec<harness_sandbox::tier2a::privhelper::FsAllowRevokeSubject> {
+    harness_sandbox::tier2a::workspace_capability::declaration_capability_preimages(
+        path, workspace,
+    )
+    .into_iter()
+    .filter_map(|(secret_hex, mode)| {
+        let access = harness_sandbox::FsAccess::from_label(&mode)?;
+        Some(harness_sandbox::tier2a::privhelper::FsAllowRevokeSubject { secret_hex, access })
+    })
+    .collect()
+}
+
 /// [§22.2.1] `path`から**宣言capability**（`--fs-allow`の主体）のACEを名指しで撤収する
 /// （進捗表示つき。`forced`なら`SeRestorePrivilege`下で走る）。
 ///
@@ -381,6 +408,8 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
     let revoke_entry = harness_sandbox::tier2a::privhelper::FsAllowRevoke {
         path: path.to_path_buf(),
         forced,
+        // 明示コマンドなので全workspaceの宣言主体を渡す（絞り込みの意味は`None`と同じ規則）。
+        subjects: declaration_subjects_for(path, None),
     };
     match harness_sandbox::tier2a::privhelper::run_privileged_revoke_fs_allow(vec![revoke_entry]) {
         Ok((_revoked, _root_cleared, failures)) => {
@@ -516,6 +545,7 @@ pub(crate) fn revoke_fs_ledger_entries(
                 ));
             }
             remaining.push(harness_sandbox::tier2a::privhelper::FsAllowRevoke {
+                subjects: declaration_subjects_for(&path, workspace_scope),
                 path,
                 forced: entry.forced,
             });

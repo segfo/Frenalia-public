@@ -83,7 +83,10 @@ use crate::win_common::wide;
 /// `--fs-allow`の1エントリ（`GrantWorkspaceAccess`要求のペイロード）。`shell_tier::FsPassthrough`と
 /// 同形だが、IPCでシリアライズする要求スキーマとして独立させる（`shell_tier::FsPassthrough`は
 /// IPCを経由しない本体内部の値であり、両者の変更を意図せず連動させないため）。
-#[derive(Debug, Clone, Serialize)]
+///
+/// **`Debug`は手書きである**（[`FsAllowGrant::secret_hex`]の理由）。`derive`のままだと
+/// `{:?}`を書いた瞬間に秘密がログへ落ちる。
+#[derive(Clone, Serialize)]
 pub struct FsAllowGrant {
     pub path: PathBuf,
     pub access: FsAccess,
@@ -131,6 +134,34 @@ fn default_grant_scope() -> GrantScope {
     GrantScope::Recursive
 }
 
+/// [§22.3.1] **秘密を持つ要求型の`Debug`は手書きにして、秘密の欄そのものを落とす。**
+///
+/// 整形の呼び出し側で伏字化する形にすると、`{:?}`を使う経路が1つ増えるたびに漏れが復活する
+/// ——**書き手が気をつける形にしない**（設計側の決定そのもの）。ここでは「有無」だけを出す:
+/// 移行前ビルドの電文（秘密なし）を診断できる必要があり、そこは秘密の中身を要さない。
+///
+/// `harness-engine`の`sanitize`は流用しない。あれはプロバイダへ送るリクエスト全体から
+/// Windowsの絶対パスを消す層で、対象も入力も別物である。
+fn fmt_secret_presence(secret_hex: &str) -> &'static str {
+    if secret_hex.is_empty() {
+        "<none>"
+    } else {
+        "<redacted>"
+    }
+}
+
+impl std::fmt::Debug for FsAllowGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsAllowGrant")
+            .field("path", &self.path)
+            .field("access", &self.access)
+            .field("forced", &self.forced)
+            .field("scope", &self.scope)
+            .field("secret_hex", &fmt_secret_presence(&self.secret_hex))
+            .finish()
+    }
+}
+
 impl<'de> Deserialize<'de> for FsAllowGrant {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -173,6 +204,34 @@ impl<'de> Deserialize<'de> for FsAllowGrant {
     }
 }
 
+/// [§22.3.1] `RevokeFsAllow`が剥がす**宣言capabilityの主体1件**。
+///
+/// 付与（[`FsAllowGrant`]）とまったく同じ形で渡す——**SIDも名前も送らず、秘密とaccess級だけ**を
+/// 送り、受信側が`(この秘密, 自分で畳み込んだ対象パス, access級)`から導出する。撤収でだけ
+/// SIDを受け取る形にすると、「導出はこの側で行う」という`privhelper`の原則が撤収側にだけ
+/// 無いことになる（対の片方だけ別の作りにしない、B-02）。
+///
+/// 1つの宣言パスに対して複数のaccess級が発行され得る（§22.3.3）ので、エントリは配列で運ぶ。
+///
+/// **`Debug`は手書きである**（[`fmt_secret_presence`]）。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FsAllowRevokeSubject {
+    /// 宣言capabilityの導出の前像（16進の秘密）。**ログへ出さない。**
+    pub secret_hex: String,
+    /// 導出鍵のaccess級。**付与したときと同じ値**でなければ別の主体になる
+    /// （CoWでRO降格した宣言は降格後の級で発行されている）。
+    pub access: FsAccess,
+}
+
+impl std::fmt::Debug for FsAllowRevokeSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsAllowRevokeSubject")
+            .field("secret_hex", &fmt_secret_presence(&self.secret_hex))
+            .field("access", &self.access)
+            .finish()
+    }
+}
+
 /// `RevokeFsAllow`要求の1エントリ。`forced`なパス（`--force-system-acl`で付与したもの）は
 /// 撤収時も`SeRestorePrivilege`が要るため、grantと対称に`forced`を運ぶ（新たな非対称を作らない）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +239,15 @@ pub struct FsAllowRevoke {
     pub path: PathBuf,
     #[serde(default)]
     pub forced: bool,
+    /// [§22.2.1] このパスへ発行済みの**宣言capability**の前像一覧。
+    ///
+    /// **空は「移行前ビルドからの電文」か「宣言capabilityが1件も無いパス」を意味する。**
+    /// 付与側と違い、ここでは**空を拒否しない**——撤収を止めると、剥がせないACEが実マシンに
+    /// 残ったままになる（fail-closedが逆に働く唯一の場所）。代わりに受信側は
+    /// 「package SIDの分は剥がしたが、宣言capabilityは1件も見ていない」と応答で区別できる形にし、
+    /// **非昇格側が自分の台帳で実DACLを検算する**（`declaration_capabilities_on_root`）。
+    #[serde(default)]
+    pub subjects: Vec<FsAllowRevokeSubject>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -880,6 +948,29 @@ mod tests {
         );
     }
 
+    /// D-34: 撤収要求も**バイト列そのものを固定する**（付与側と対称。B-02）。
+    ///
+    /// [§22.2.1] `subjects`が載ったことで、昇格が要るパスからも宣言capabilityを剥がせるように
+    /// なった。この行が黙って変わったら、**昇格側と非昇格側のどちらかだけが移行している**
+    /// ことを意味する——付与だけを固定して撤収を固定しないと、その非対称が検出できない。
+    #[test]
+    fn revoke_fs_allow_request_json_wire_format_is_stable() {
+        let req = PrivilegedRequest::RevokeFsAllow {
+            entries: vec![FsAllowRevoke {
+                path: PathBuf::from("C:/x"),
+                forced: false,
+                subjects: vec![FsAllowRevokeSubject {
+                    secret_hex: "00112233445566778899aabbccddeeff".to_string(),
+                    access: FsAccess::Read,
+                }],
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"RevokeFsAllow":{"entries":[{"path":"C:/x","forced":false,"subjects":[{"secret_hex":"00112233445566778899aabbccddeeff","access":"read"}]}]}}"#
+        );
+    }
+
     /// [§22.3.1] **秘密を持たない電文は拒否される**（fail-closed）。
     ///
     /// 移行前のビルドが送ってくる形がこれで、通すと「主体を決められないまま何かへ付与する」
@@ -976,10 +1067,15 @@ mod tests {
                 FsAllowRevoke {
                     path: PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
                     forced: false,
+                    subjects: vec![FsAllowRevokeSubject {
+                        secret_hex: "00112233445566778899aabbccddeeff".to_string(),
+                        access: FsAccess::Read,
+                    }],
                 },
                 FsAllowRevoke {
                     path: PathBuf::from(r"C:\Program Files\SomeTool"),
                     forced: true,
+                    subjects: Vec::new(),
                 },
             ],
         };
@@ -994,9 +1090,96 @@ mod tests {
                 );
                 assert!(!entries[0].forced);
                 assert!(entries[1].forced);
+                // [§22.3.1] **秘密が境界を越えて生き残ること**が撤収側の成立条件そのもの
+                // （受信側はこれとパスから主体を導出する。落ちれば1本も剥がれない）。
+                assert_eq!(
+                    entries[0].subjects[0].secret_hex,
+                    "00112233445566778899aabbccddeeff"
+                );
+                assert_eq!(entries[0].subjects[0].access, FsAccess::Read);
+                assert!(entries[1].subjects.is_empty());
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// [§22.3.1] **移行前のビルドが送ってくる撤収要求**（`subjects`が無い）を、受信側が
+    /// 電文として読めること。
+    ///
+    /// **付与側と倒す向きが逆である**——あちらは秘密の無い電文を拒否する（主体を決められない
+    /// まま何かへ付与するのを止める）。撤収でそれをやると、剥がせないACEが実マシンに残る。
+    /// ここは読めた上で「宣言capabilityは1件も見ていない」として通し、実際に剥がれたかは
+    /// **非昇格側が自分の台帳で実DACLを検算する**（`declaration_capabilities_on_root`）。
+    #[test]
+    fn a_pre_migration_revoke_entry_arrives_without_subjects() {
+        let revoke: FsAllowRevoke =
+            serde_json::from_str(r#"{"path":"C:\\x","forced":false}"#).unwrap();
+        assert!(
+            revoke.subjects.is_empty(),
+            "a wire form without `subjects` must read as 'no declaration subject supplied', not \
+             fail to parse -- refusing here would leave the ACE unremovable"
+        );
+    }
+
+    /// **秘密は`{:?}`から落ちる**（§22.3.1の実装制約1。伏字化ではなく出力しない）。
+    ///
+    /// 受信側は要求内容をログへ書くので、`Debug`が素通しだと`privhelper.log`へ平文の秘密が
+    /// 残り続ける。**整形の呼び出し側で伏字化する形にしない**——`{:?}`を使う経路が1つ増える
+    /// たびに漏れが復活するためで、型の側で落とせば増えた経路も自動的に安全になる。
+    #[test]
+    fn the_capability_secret_never_appears_in_debug_output() {
+        let secret = "00112233445566778899aabbccddeeff";
+        let grant = FsAllowGrant {
+            path: PathBuf::from(r"C:\x"),
+            access: FsAccess::Read,
+            forced: false,
+            scope: GrantScope::Recursive,
+            secret_hex: secret.to_string(),
+        };
+        let subject = FsAllowRevokeSubject {
+            secret_hex: secret.to_string(),
+            access: FsAccess::Read,
+        };
+        let revoke = FsAllowRevoke {
+            path: PathBuf::from(r"C:\x"),
+            forced: false,
+            subjects: vec![subject],
+        };
+
+        for rendered in [
+            format!("{grant:?}"),
+            format!("{revoke:?}"),
+            // 要求ごと丸ごと出す形（実際にヘルパーがやりがちな`{req:?}`）も塞がっていること。
+            format!(
+                "{:?}",
+                PrivilegedRequest::RevokeFsAllow {
+                    entries: vec![revoke.clone()]
+                }
+            ),
+            format!(
+                "{:?}",
+                PrivilegedRequest::GrantWorkspaceAccess {
+                    traverse_targets: Vec::new(),
+                    fs_allow_entries: vec![grant.clone()],
+                }
+            ),
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "the capability secret leaked into Debug output: {rendered}"
+            );
+            assert!(
+                rendered.contains("<redacted>"),
+                "the field must still be visible as present/absent for diagnosis: {rendered}"
+            );
+        }
+
+        // 「無い」と「伏せた」を区別できること（移行前ビルドの電文を診断するのに要る）。
+        let empty = FsAllowRevokeSubject {
+            secret_hex: String::new(),
+            access: FsAccess::Read,
+        };
+        assert!(format!("{empty:?}").contains("<none>"));
     }
 
     /// `RevokeFsAllowResult`応答も`FsAllowResult`と同じく、成功パスと失敗パスが混在する状態で

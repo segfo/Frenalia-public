@@ -459,6 +459,47 @@ pub fn declaration_capability_names(
     declaration_capability_names_in(&ledger(), declared_path, workspace)
 }
 
+/// `declared_path`宛に発行済みの宣言capabilityの**導出の前像**（`(秘密, access級)`）。
+///
+/// # ここだけが秘密を台帳の外へ出す（撤収側）
+///
+/// **昇格側へ委譲する撤収経路のためだけに在る。** §22.3.1が「SIDでも名前でもなく秘密を渡し、
+/// 受信側が自分で畳み込んだパスから導出する」と決めたので、撤収も付与と同じものを渡す必要が
+/// ある。付与側の入口は[`ensure_declaration_capability`]で、そちらは**発行もする**——
+/// 撤収で発行してしまうと「剥がしに来た関数が資源を作る」ことになる（`B-01`）ので、
+/// こちらは引くだけである。
+///
+/// **呼ぶ場所を増やさないこと。** 秘密は持ち回った先ぶんだけログ・エラー文へ載る面が増える。
+/// 名前だけで足りる経路（本体プロセス内の撤収）は[`declaration_capability_names`]を使う。
+///
+/// `workspace`の絞り込みの意味は[`declaration_capability_names`]と同じ。
+pub fn declaration_capability_preimages(
+    declared_path: &Path,
+    workspace: Option<&Path>,
+) -> Vec<(String, String)> {
+    declaration_capability_preimages_in(&ledger(), declared_path, workspace)
+}
+
+fn declaration_capability_preimages_in(
+    ledger: &Ledger<WorkspaceCapabilityLedger>,
+    declared_path: &Path,
+    workspace: Option<&Path>,
+) -> Vec<(String, String)> {
+    let declaration = declaration_key(declared_path);
+    let workspace_filter = workspace.map(workspace_key);
+    ledger
+        .load()
+        .entries
+        .into_iter()
+        .filter(|e| e.declaration.as_deref() == Some(declaration.as_str()))
+        .filter(|e| match &workspace_filter {
+            Some(key) => &workspace_key(Path::new(&e.workspace)) == key,
+            None => true,
+        })
+        .map(|e| (e.secret_hex, e.mode))
+        .collect()
+}
+
 /// [BUG-110] workspaceのrootディレクトリ**そのもの**の識別子。取得できなければ`None`
 /// （消えている・開けない）で、その場合は常に「未検証」側へ倒れる。
 ///
