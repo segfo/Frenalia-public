@@ -3462,6 +3462,22 @@ fn fs_ledger_case_shared_declaration_is_refcounted(ledger: &FsLedgerExclusive) -
         )));
     }
 
+    // (5) [§22.2.1] **実ACLを見る。** ここまでは台帳の側しか測っていない——
+    // 台帳エントリが消えたことは、そのパスのACEが消えたことを意味しない（`B-14`）。
+    // `--fs-allow`の主体が宣言ごとのcapability SID（`S-1-15-3-*`）へ移った後は、
+    // **これが「宣言が消えた次の起動で剥がれる」の唯一の証拠**になる（T1-cの受け入れ条件3）。
+    // 主体が移る前は同じ経路がpackage SID（`S-1-15-2-*`）宛を剥がしていたので、両方を数える。
+    for prefix in ["S-1-15-2-", "S-1-15-3-"] {
+        let left = count_sid_aces(&target, prefix).map_err(&finish)?;
+        if left != 0 {
+            return Err(finish(format!(
+                "§22.2.1: {} still carries {left} {prefix}* ACE(s) after the last declaring \
+                 workspace dropped it; the ledger entry is gone but the hole is still open",
+                target.display()
+            )));
+        }
+    }
+
     ledger.purge_entries(&[&target]);
     let _ = std::fs::remove_dir_all(&target);
     cleanup_on_success(&ws1, &[], "fs-ledger-1");

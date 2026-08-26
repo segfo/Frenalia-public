@@ -195,6 +195,12 @@ fn report_revoke_result(
     for (sid, reason) in &left_alone {
         println!("  left alone: {sid} ({reason})");
     }
+    // [§22.2.1] **意図的に残した宣言主体も必ず出す。** 走っているワークスペースから
+    // アクセスを奪わないための判断だが、黙っていると「全部剥がした」と読まれる（`B-09`）
+    // ——そのパスはまだ開いており、台帳エントリも残してある。
+    for (name, reason) in &decl.left_alone {
+        println!("  left alone: {name} ({reason})");
+    }
     if let Some(e) = &report.classification_error {
         println!("  note   : {e}");
     }
@@ -253,15 +259,33 @@ fn declaration_subjects_for(
     path: &Path,
     workspace: Option<&Path>,
 ) -> Vec<harness_sandbox::tier2a::privhelper::FsAllowRevokeSubject> {
-    harness_sandbox::tier2a::workspace_capability::declaration_capability_preimages(
-        path, workspace,
-    )
-    .into_iter()
-    .filter_map(|(secret_hex, mode)| {
-        let access = harness_sandbox::FsAccess::from_label(&mode)?;
-        Some(harness_sandbox::tier2a::privhelper::FsAllowRevokeSubject { secret_hex, access })
-    })
-    .collect()
+    // **昇格側へ渡す集合は、本体内で剥がそうとした集合と同じでなければならない**（`B-02`）。
+    // `None`（全workspace）のときは生きているworkspaceの主体を外す規則が掛かるので、
+    // ここでも同じ判定（`revocable_declaration_issuers`）を通す——別々に書くと、
+    // 本体内では守った「生きている相手から奪わない」を昇格側だけが破る。
+    let workspaces: Vec<Option<std::path::PathBuf>> = match workspace {
+        Some(ws) => vec![Some(ws.to_path_buf())],
+        None => {
+            harness_sandbox::tier2a::win_appcontainer::revocable_declaration_issuers(path)
+                .eligible
+                .into_iter()
+                .map(|(ws, _name)| Some(std::path::PathBuf::from(ws)))
+                .collect()
+        }
+    };
+    workspaces
+        .into_iter()
+        .flat_map(|ws| {
+            harness_sandbox::tier2a::workspace_capability::declaration_capability_preimages(
+                path,
+                ws.as_deref(),
+            )
+        })
+        .filter_map(|(secret_hex, mode)| {
+            let access = harness_sandbox::FsAccess::from_label(&mode)?;
+            Some(harness_sandbox::tier2a::privhelper::FsAllowRevokeSubject { secret_hex, access })
+        })
+        .collect()
 }
 
 /// [§22.2.1] `path`から**宣言capability**（`--fs-allow`の主体）のACEを名指しで撤収する
@@ -363,7 +387,9 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
     if report.unfinished().is_empty() && decl.is_clean() {
         // **台帳を落としてよいのは、剥がすべきものが残っていないときだけ**（B-01: 資源へ
         // 到達する手段を捨てる操作は最後）。生きているセッションがACEを持っている場合も残す。
-        let removed = if report.may_remove_ledger_entry() {
+        // **意図的に残した主体（走っているworkspaceのもの）があるなら記録も残す**
+        // （`decl.may_forget()`。そのACEは実在するので、記録を消すと孤児になる、`B-01`）。
+        let removed = if report.may_remove_ledger_entry() && decl.may_forget() {
             remove_fs_passthrough_grant(path)
         } else {
             0
@@ -391,7 +417,7 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let removed = if retry.may_remove_ledger_entry() && retry_decl.is_clean() {
+        let removed = if retry.may_remove_ledger_entry() && retry_decl.may_forget() {
             remove_fs_passthrough_grant(path)
         } else {
             0
@@ -441,7 +467,7 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
             for (p, reason) in &failures {
                 eprintln!("  helper could not revoke {} : {reason}", p.display());
             }
-            let removed = if after.may_remove_ledger_entry() && decl.is_clean() {
+            let removed = if after.may_remove_ledger_entry() && decl.may_forget() {
                 remove_fs_passthrough_grant(path)
             } else {
                 0
@@ -552,18 +578,18 @@ pub(crate) fn revoke_fs_ledger_entries(
             continue;
         }
         let decl = decl.unwrap_or_default();
-        if !report.may_remove_ledger_entry() {
+        if !report.may_remove_ledger_entry() || !decl.may_forget() {
             // 生きているセッションがまだACEを持っている。剥がさないし記録も消さない
             // （BUG-053）。**黙って飛ばさない**——`revoke-all`が「全部消した」と読まれるため。
-            announce.say(&format!(
-                "skipped: {} ({})",
-                path.display(),
-                report
-                    .left_alone()
-                    .first()
-                    .map(|(_, reason)| reason.clone())
-                    .unwrap_or_else(|| "still in use by a running session".to_string())
-            ));
+            // 理由はpackage側・宣言側のどちらから来ることもあるので、**在る方を出す**
+            // （片方だけ見ると「使用中」と分かっているのに既定の文言へ落ちる）。
+            let reason = report
+                .left_alone()
+                .first()
+                .map(|(_, reason)| reason.clone())
+                .or_else(|| decl.left_alone.first().map(|(_, reason)| reason.clone()))
+                .unwrap_or_else(|| "still in use by a running session".to_string());
+            announce.say(&format!("skipped: {} ({reason})", path.display()));
             continue;
         }
         on_revoked(&path);
@@ -763,10 +789,14 @@ pub fn reconcile_fs_ledger_for_workspace(
     for entry in &orphan_candidates {
         eprintln!("  {}", entry.path);
     }
-    // [§22.2.1] **暗黙の経路なので、宣言capabilityはこのワークスペースのものだけに絞る。**
-    // 絞らないと、同じパスを宣言している別ワークスペースの主体まで剥がす（BUG-046と同型）。
-    // 台帳の突合は`workspace_key`が綴りを畳むが、`..`や8.3短縮名までは畳まないので
-    // canonicalizeしてから渡す（付与側の`preflight`が使っているのと同じ形）。
+    // [§22.2.1] **対象はこのワークスペースの主体だけではない。** ここへ来たエントリは
+    // 「**もうどのワークスペースも宣言していない**」ことが確定したものなので、そのパスへ
+    // 発行された宣言主体は全部が撤収対象である。自分のワークスペースだけに絞ると、
+    // 2つのワークスペースが同じパスを宣言して両方とも宣言を外したとき、**最後に起動した側の
+    // 主体しか剥がれない**（実機E2Eで「台帳エントリは消えたのにACEが1本残る」として出た）。
+    //
+    // 走っているワークスペースの主体を巻き込まないための判定は`revoke_declaration_capabilities`
+    // が内側で持つ（分類器側の規則1と同じ、BUG-046の形を作らないための門）。
     let canonical = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
@@ -777,7 +807,7 @@ pub fn reconcile_fs_ledger_for_workspace(
         // BUG-064: この経路はエージェント起動の途中で走る。stdoutは`--output-format json`/`jsonl`
         // の機械可読出力に予約されているので、1行たりとも混ぜない。
         RevokeAnnounce::Stderr,
-        Some(&canonical),
+        None,
     );
     for (path, reason) in &failures {
         eprintln!(
@@ -785,38 +815,44 @@ pub fn reconcile_fs_ledger_for_workspace(
             path.display()
         );
     }
-    prune_declaration_entries_for(&canonical, &revoked);
+    let _ = canonical;
+    prune_declaration_entries_for(&revoked);
 }
 
-/// 撤収し終えた宣言について、capability台帳の**このworkspaceの**エントリを落とす。
+/// 撤収し終えた宣言について、capability台帳のエントリを落とす。
 ///
-/// # 順序が不変条件である
+/// # 落としてよいのは「実DACLからもう消えている」ものだけである
 ///
-/// **ACEを剥がし終えてから呼ぶ。** 先に記録を捨てると主体を導出できなくなり、
-/// 撤収経路の無い孤児ACEがそのパスに残る（`forget_capability`のdocと同じ不変条件、`B-01`）。
-/// 呼び出し元は`revoke_fs_ledger_entries`が**実DACLを読んで**「残っていない」と判定した
-/// パスだけを`revoked`に入れている。
-///
-/// 落とすのは`workspace`が発行したエントリだけである。同じパスを別のworkspaceが宣言して
-/// いればその主体は生きているので、記録も残す。
+/// **ACEを剥がし終えてから呼ぶ**だけでは足りない。撤収は**走っているworkspaceの主体を
+/// 意図的に残す**（`revocable_declaration_issuers`）ので、「撤収を呼んだパス」の中には
+/// **まだACEが載っている主体**が混じる。それを台帳から落とすと主体を二度と導出できなくなり、
+/// 撤収経路の無い孤児ACEになる（`forget_capability`のdocと同じ不変条件、`B-01`/`B-14`）。
+/// だから捨てる前に**実体を見る**。
 #[cfg(windows)]
-fn prune_declaration_entries_for(workspace: &Path, revoked: &[PathBuf]) {
+fn prune_declaration_entries_for(revoked: &[PathBuf]) {
     if revoked.is_empty() {
         return;
     }
-    let ws_key = harness_sandbox::tier2a::workspace_capability::workspace_key(workspace);
-    let revoked_keys: Vec<String> = revoked
+    // `(宣言パスの畳み込み鍵, もう載っていないcapability名)`の対応表を先に作る。
+    let gone: Vec<(String, Vec<String>)> = revoked
         .iter()
-        .map(|p| harness_sandbox::tier2a::workspace_capability::declaration_key(p))
+        .map(|p| {
+            (
+                harness_sandbox::tier2a::workspace_capability::declaration_key(p),
+                harness_sandbox::tier2a::win_appcontainer::declaration_capabilities_gone_from_root(
+                    p,
+                ),
+            )
+        })
         .collect();
     let dropped = harness_sandbox::tier2a::workspace_capability::prune_capability_entries(|entry| {
         let Some(declared) = entry.declaration.as_deref() else {
             // workspace本体の主体はここでは扱わない（撤収の扉は`fs revoke-workspace`）。
             return false;
         };
-        harness_sandbox::tier2a::workspace_capability::workspace_key(Path::new(&entry.workspace))
-            == ws_key
-            && revoked_keys.iter().any(|k| k == declared)
+        gone.iter().any(|(key, names)| {
+            key == declared && names.iter().any(|n| n == &entry.capability_name)
+        })
     });
     for label in &dropped {
         eprintln!("  forgot the declaration capability for {label}");

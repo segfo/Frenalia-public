@@ -2960,3 +2960,74 @@ fn scoping_the_named_door_to_one_workspace_leaves_the_other_workspaces_subject_a
     crate::tier2a::workspace_capability::forget_capability(&ws_a, "");
     crate::tier2a::workspace_capability::forget_capability(&ws_b, "");
 }
+
+/// **走っているワークスペースからは奪わない**（分類器側の規則1と同じ判断を、宣言capabilityにも）。
+///
+/// 主体は**ワークスペース単位で共有される**ので、同じパスを2つのワークスペースが宣言すると
+/// 主体は2本になる。そのうち片方でharnessが走っている状態で、パスを名指しした撤収
+/// （`workspace = None`）が走っても、**走っている側の主体は剥がしてはいけない**——剥がすと
+/// その瞬間にアクセスが落ちる（[BUG-046](../../../../docs/bugs/BUG-046.md)の形）。
+///
+/// 許可側と禁止側を対で置く（`B-35`）: 走っていない側は剥がれる／走っている側は残り、
+/// **理由つきで報告される**（黙って飛ばすと「全部剥がした」と読まれる）。
+#[test]
+fn the_named_door_refuses_to_take_access_from_a_live_workspace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws_live = dir.path().join("ws-live");
+    let ws_idle = dir.path().join("ws-idle");
+    let target = dir.path().join("shared");
+    for p in [&ws_live, &ws_idle, &target] {
+        std::fs::create_dir_all(p).expect("create the test dirs");
+    }
+    let ws_live = ws_live.canonicalize().expect("canonicalize ws-live");
+    let ws_idle = ws_idle.canonicalize().expect("canonicalize ws-idle");
+    let target = target.canonicalize().expect("canonicalize the shared path");
+
+    let cap_live =
+        fs_allow_capability_sid(&ws_live, &target, FsAccess::Read).expect("mint ws-live's subject");
+    let cap_idle =
+        fs_allow_capability_sid(&ws_idle, &target, FsAccess::Read).expect("mint ws-idle's subject");
+    for cap in [&cap_live, &cap_idle] {
+        grant_ace_scoped(&target, cap.as_psid(), FsAccess::Read, GrantScope::Recursive)
+            .expect("grant both declaration ACEs");
+    }
+
+    // **生存判定は既存の門をそのまま使う**（新しい仕組みを作らない）。この札はプロセスの
+    // 寿命で握られるので、tempdir固有のパスにしてある（他のテストと踏み合わない）。
+    crate::tier2a::workspace_ledger::begin_workspace_mode(&ws_live, "rwx")
+        .expect("hold the live marker for ws-live");
+
+    let report = revoke_declaration_capabilities(&target, None, &|_, _| {})
+        .expect("the named door must not fail here");
+
+    // 許可側: 走っていないワークスペースの主体は消える。
+    assert!(
+        matches!(sid_ace_mask(&target, cap_idle.as_psid()), Ok(None)),
+        "the idle workspace's subject must be stripped: {report:?}"
+    );
+    // 禁止側: 走っているワークスペースの主体は残る。
+    assert!(
+        matches!(sid_ace_mask(&target, cap_live.as_psid()), Ok(Some(_))),
+        "the live workspace's subject must survive: {report:?}"
+    );
+    // **「剥がせなかった」ではなく「剥がさないと決めた」として報告される**（B-09/B-10）。
+    assert!(
+        report.is_clean(),
+        "a subject we deliberately left alone must not be reported as unfinished work: {report:?}"
+    );
+    assert!(
+        !report.may_forget(),
+        "the ledger entry must be kept while that ACE is still on the path: {report:?}"
+    );
+    assert_eq!(report.left_alone.len(), 1, "{report:?}");
+    assert!(
+        report.left_alone[0].1.contains("still in use"),
+        "the reason must name why it was left alone: {report:?}"
+    );
+
+    // 後始末: 残した1本はここで剥がす（テストが実マシンにACEを置いたまま終わらない）。
+    let subjects = [cap_live];
+    revoke_capability_subjects(&target, &subjects, &|_, _| {}).expect("clean up the live subject");
+    crate::tier2a::workspace_capability::forget_capability(&ws_live, "");
+    crate::tier2a::workspace_capability::forget_capability(&ws_idle, "");
+}

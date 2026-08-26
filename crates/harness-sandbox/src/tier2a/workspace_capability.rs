@@ -459,6 +459,25 @@ pub fn declaration_capability_names(
     declaration_capability_names_in(&ledger(), declared_path, workspace)
 }
 
+/// `declared_path`宛に発行済みの宣言capabilityを、**発行元のworkspaceつきで**引く
+/// （`(workspaceのパス, capability名)`）。
+///
+/// [`declaration_capability_names`]との違いは発行元が付くことだけである。撤収側が
+/// 「この主体を**まだ使っているharnessが走っていないか**」を問うのに要る——主体は
+/// workspace単位で共有されるので、判定の単位もworkspaceになる
+/// （生存判定そのものは[`crate::tier2a::workspace_ledger::live_modes`]が持つ既存の門で、
+/// ここでは持たない）。
+pub fn declaration_capability_issuers(declared_path: &Path) -> Vec<(String, String)> {
+    let declaration = declaration_key(declared_path);
+    ledger()
+        .load()
+        .entries
+        .into_iter()
+        .filter(|e| e.declaration.as_deref() == Some(declaration.as_str()))
+        .map(|e| (e.workspace, e.capability_name))
+        .collect()
+}
+
 /// `declared_path`宛に発行済みの宣言capabilityの**導出の前像**（`(秘密, access級)`）。
 ///
 /// # ここだけが秘密を台帳の外へ出す（撤収側）
