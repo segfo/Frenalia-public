@@ -485,6 +485,9 @@ mod preflight;
 /// 決定（どのプローブをどの順で打つか）は`preflight`が持ち、ここは観測だけを持つ。
 mod preflight_probe;
 mod revoke;
+/// 撤収の主体のうち、**宣言（`--fs-allow`）から一意に導出できるもの**を決める層（§22.2.1）。
+/// `revoke_subjects`（DACLに実在するpackage SIDを分類する）とは探し方が違うので分けている。
+mod revoke_declarations;
 /// 撤収の**主体**を決める層（[BUG-101](../../../docs/bugs/BUG-101.md)欠陥②）。
 /// 「どのSIDのACEを剥がすか」を、名前から導出したSIDではなく**対象パスのDACLに実在するSID**
 /// から決める。`revoke`（剥がし方）とは責務が別なので分けている。
@@ -499,6 +502,7 @@ pub use mcp_preflight::*;
 pub use preflight::*;
 pub(crate) use preflight_probe::*;
 pub use revoke::*;
+pub use revoke_declarations::*;
 pub use revoke_subjects::*;
 pub use spawn::*;
 pub use spawn_session::*;

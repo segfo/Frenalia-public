@@ -42,7 +42,15 @@ pub(crate) fn ledger_forced_flag(path: &Path) -> bool {
 /// 「`revoked: … (1 ledger entry removed)`と報告されたのに`icacls`のパッケージSID数は
 /// 1つも減らない」が再現しています（B-09: 「やった」と「うまくいった」は別の事実）。
 ///
-/// 終了コードの規則:
+/// # [§22.3] 主体が2系統になったので、数え方も2系統ある
+///
+/// `report`は**package SIDの分類器**（パスのDACLに実在する主体を分類して剥がす）、
+/// `decl`は**宣言capabilityの名指し撤収**（台帳の索引から導出したSIDを剥がす）です。
+/// 片方が0件でももう片方が剥がしていれば撤収は成立しているので、**両方を足して判定します**
+/// ——`--fs-allow`の移行後は前者が常に0件になるため、package側だけで判定すると
+/// 正常系が全部「何も一致しなかった」（exit 1）に見えます。
+///
+/// 終了コードの規則（「剥がした」はpackage側・宣言側のどちらでもよい）:
 ///
 /// | ACE側 | 対象 | 台帳 | 判定 | exit |
 /// |---|---|---|---|---|
@@ -54,6 +62,7 @@ pub(crate) fn ledger_forced_flag(path: &Path) -> bool {
 fn report_revoke_result(
     path: &Path,
     report: &harness_sandbox::tier2a::win_appcontainer::HarnessRevokeReport,
+    decl: &harness_sandbox::tier2a::win_appcontainer::DeclarationRevokeReport,
     removed: usize,
     note: Option<&str>,
 ) -> ExitCode {
@@ -77,25 +86,56 @@ fn report_revoke_result(
                 report.rewritten()
             )
         };
+        // [§22.3] 宣言capability側は**別の行で数える**。package側と足して1つの数字にすると、
+        // 「どちらの探し方で見つけた0件なのか」が読めなくなる。
+        let decl_line = if decl.targeted.is_empty() {
+            "  decls  : no declaration capability is recorded for this path".to_string()
+        } else if decl.root_missing {
+            format!(
+                "  decls  : {} subject(s) known, but the path no longer exists",
+                decl.targeted.len()
+            )
+        } else if decl.cleared_elsewhere > 0 {
+            format!(
+                "  decls  : {} subject(s) cleared by the privilege-separation helper; {} still \
+                 targeted here",
+                decl.cleared_elsewhere,
+                decl.still_on_root.len()
+            )
+        } else {
+            format!(
+                "  decls  : {} subject(s) targeted, {} node(s) checked, {} rewritten",
+                decl.targeted.len(),
+                decl.checked,
+                decl.rewritten
+            )
+        };
         let ledger_line = format!(
             "  ledger : {removed} entr{} removed",
             if removed == 1 { "y" } else { "ies" }
         );
         if stream_err {
             eprintln!("{ace_line}");
+            eprintln!("{decl_line}");
             eprintln!("{ledger_line}");
         } else {
             println!("{ace_line}");
+            println!("{decl_line}");
             println!("{ledger_line}");
         }
     };
 
     // 剥がせなかった対象が残っている＝**撤収は成立していない**。台帳エントリは呼び出し側が
     // 残しているので、そのことも言う（次回`fs revoke`が同じ対象を見つけられる）。
-    if !unfinished.is_empty() {
+    let still: Vec<&str> = unfinished
+        .iter()
+        .copied()
+        .chain(decl.still_on_root.iter().map(|s| s.as_str()))
+        .collect();
+    if !still.is_empty() {
         eprintln!("revoke incomplete for {}", path.display());
         say_details(true);
-        for sid in &unfinished {
+        for sid in &still {
             eprintln!("  still on the root: {sid}");
         }
         eprintln!(
@@ -103,14 +143,19 @@ fn report_revoke_result(
              cannot be removed by harness at all, strip it directly: \
              icacls \"{}\" /remove:g *{}",
             path.display(),
-            unfinished[0]
+            still[0]
         );
         return ExitCode::FAILURE;
     }
 
+    // [§22.3] **宣言capabilityを1本でも剥がしたなら「何も一致しなかった」ではない。**
+    // 移行後のfs-allowパスはpackage側が常に0件になるので、ここへpackage側だけの条件を
+    // 残すと正常系がすべて失敗として報告される。
     if targeted == 0
         && report.rewritten() == 0
         && report.cleared_elsewhere == 0
+        && decl.rewritten == 0
+        && decl.cleared_elsewhere == 0
         && removed == 0
         && !report.root_missing
     {
@@ -125,6 +170,14 @@ fn report_revoke_result(
         }
         if let Some(e) = &report.classification_error {
             eprintln!("  note: {e}");
+        }
+        if !decl.targeted.is_empty() {
+            // 「索引は引けたが、そのACEはもう載っていなかった」を黙って0件と混ぜない（B-10）。
+            eprintln!(
+                "  note: {} declaration capability subject(s) are recorded for this path, but \
+                 none of their ACEs were on it (already revoked?)",
+                decl.targeted.len()
+            );
         }
         eprintln!(
             "  note: an ACE granted by a session whose AppContainer profile has since been \
@@ -184,6 +237,47 @@ fn revoke_subjects_with_progress(
     result
 }
 
+/// [§22.2.1] `path`から**宣言capability**（`--fs-allow`の主体）のACEを名指しで撤収する
+/// （進捗表示つき。`forced`なら`SeRestorePrivilege`下で走る）。
+///
+/// 上の`revoke_subjects_with_progress`（package SIDの分類器）と**対で呼ぶ**。主体が2系統
+/// あるので撤収も2段になり、どちらか片方だけでは「対象パスにharnessのACEが0本」を名乗れない。
+///
+/// `workspace`が`None`＝そのパスへ発行された全workspaceの主体。**明示コマンド専用**で、
+/// 暗黙の経路は必ず`Some`で絞る（`revoke_declaration_capabilities`のdoc）。
+///
+/// **進捗の文言を分けてある**——`--fs-allow`の移行後は撤収の実体がこちら側なので、
+/// 「何を剥がしている最中なのか」が package 側と区別できないと、数分かかるwalkが
+/// 「同じ処理を2回やっている」ように見える（B-23(a)）。
+#[cfg(windows)]
+fn revoke_declarations_with_progress(
+    path: &Path,
+    workspace: Option<&Path>,
+    forced: bool,
+) -> Result<
+    harness_sandbox::tier2a::win_appcontainer::DeclarationRevokeReport,
+    harness_sandbox::tier2a::win_appcontainer::AppContainerError,
+> {
+    let walk_progress = WalkProgress::start(
+        "harness: scanning for declaration capability ACEs...",
+        "harness: revoking declared fs-allow access",
+    );
+    let run = || {
+        harness_sandbox::tier2a::win_appcontainer::revoke_declaration_capabilities(
+            path,
+            workspace,
+            &|done, total| walk_progress.on_progress(done, total),
+        )
+    };
+    let result = if forced {
+        harness_sandbox::tier2a::win_appcontainer::with_restore_privilege(run)
+    } else {
+        run()
+    };
+    walk_progress.finish();
+    result
+}
+
 /// 指定パスのfs passthrough ACEを撤収する（`BUG-015`の裏対称: grant側と同じく
 /// 「本体内試行→ヘルパーへエスカレーション」の2段構え）。撤収できた場合のみ台帳から除去する
 /// （残件がある場合は台帳に残し、次回再試行できるようにする）。
@@ -200,6 +294,16 @@ fn revoke_subjects_with_progress(
 ///
 /// いまは`revoke_harness_subjects`が対象パスのDACLを読み、そこに実在するパッケージSIDだけを
 /// 分類して**1回のwalk**で剥がす（死んだプロファイルの数だけwalkを回すこともしない）。
+///
+/// # [§22.2.1] 主体が2系統あるので、撤収も2段である
+///
+/// 上の分類器は`S-1-15-2-`（package SID）しか列挙しない。`--fs-allow`の主体は
+/// **宣言ごとのcapability SID**（`S-1-15-3-`）へ移ったので、分類器だけでは1本も剥がれない
+/// ——**このコマンドが「名前の付いた扉」である**（分類器へcapability SIDを混ぜると
+/// [BUG-046](../../../../docs/bugs/BUG-046.md)の再現になるので、混ぜずに段を足す）。
+///
+/// **どちらか片方の失敗でも昇格へ回す。** capability側もシステム保護パスでは`ACCESS_DENIED`に
+/// なるので、package側だけを見て「本体内で完結した」と判定すると、そこで静かに終わる。
 #[cfg(windows)]
 pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
     let forced = ledger_forced_flag(path);
@@ -212,7 +316,24 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if report.unfinished().is_empty() {
+    // [§22.2.1] 宣言capabilityは**名指しで**剥がす（明示コマンドなので全workspace＝`None`）。
+    // walkが`Err`で返るのは「昇格が要る」の主症状なので、ここでコマンドを失敗させず
+    // 下のエスカレーションへ落とす（理由は`decl_error`として持ち回り、最後まで黙らせない）。
+    let (mut decl, decl_error) = match revoke_declarations_with_progress(path, None, forced) {
+        Ok(decl) => (decl, None),
+        Err(e) => (
+            harness_sandbox::tier2a::win_appcontainer::DeclarationRevokeReport {
+                // **失敗を「対象0件」と同じ値にしない**（B-10）。索引は引けているので、
+                // 残存として名指ししたうえで昇格へ回す。
+                still_on_root: harness_sandbox::tier2a::win_appcontainer::declaration_capabilities_on_root(
+                    path, None,
+                ),
+                ..Default::default()
+            },
+            Some(e.to_string()),
+        ),
+    };
+    if report.unfinished().is_empty() && decl.is_clean() {
         // **台帳を落としてよいのは、剥がすべきものが残っていないときだけ**（B-01: 資源へ
         // 到達する手段を捨てる操作は最後）。生きているセッションがACEを持っている場合も残す。
         let removed = if report.may_remove_ledger_entry() {
@@ -220,7 +341,10 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
         } else {
             0
         };
-        return report_revoke_result(path, &report, removed, None);
+        return report_revoke_result(path, &report, &decl, removed, None);
+    }
+    if let Some(reason) = &decl_error {
+        eprintln!("  note: in-process declaration revoke could not finish: {reason}");
     }
 
     // 本体内で完結しなかった（システム保護パスの可能性）→特権分離ヘルパーへ委譲する。
@@ -233,12 +357,25 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let removed = if retry.may_remove_ledger_entry() {
+        let retry_decl = match revoke_declarations_with_progress(path, None, forced) {
+            Ok(decl) => decl,
+            Err(e) => {
+                eprintln!("revoke failed for {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let removed = if retry.may_remove_ledger_entry() && retry_decl.is_clean() {
             remove_fs_passthrough_grant(path)
         } else {
             0
         };
-        return report_revoke_result(path, &retry, removed, Some("already running elevated"));
+        return report_revoke_result(
+            path,
+            &retry,
+            &retry_decl,
+            removed,
+            Some("already running elevated"),
+        );
     }
 
     let revoke_entry = harness_sandbox::tier2a::privhelper::FsAllowRevoke {
@@ -264,10 +401,18 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
             // エスカレーション前に対象だった数を持ち込む。持ち込まないと、ヘルパーが全部
             // 剥がした結果「対象0件」に見えて「何も一致しなかった」と報告してしまう（B-09）。
             after.cleared_elsewhere = report.targeted().saturating_sub(after.targeted());
+            // 宣言capability側も**同じ形で**検算する（ヘルパーの応答を根拠にしない）。
+            // 読むのはrootの明示ACEだけなので、ここでツリーを再walkはしない。
+            let still_decl =
+                harness_sandbox::tier2a::win_appcontainer::declaration_capabilities_on_root(
+                    path, None,
+                );
+            decl.cleared_elsewhere = decl.still_on_root.len().saturating_sub(still_decl.len());
+            decl.still_on_root = still_decl;
             for (p, reason) in &failures {
                 eprintln!("  helper could not revoke {} : {reason}", p.display());
             }
-            let removed = if after.may_remove_ledger_entry() {
+            let removed = if after.may_remove_ledger_entry() && decl.is_clean() {
                 remove_fs_passthrough_grant(path)
             } else {
                 0
@@ -275,6 +420,7 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
             report_revoke_result(
                 path,
                 &after,
+                &decl,
                 removed,
                 Some("via privilege-separation helper (UAC, one-time)"),
             )
@@ -330,12 +476,21 @@ impl RevokeAnnounce {
 /// そのため`fs revoke-all`は**台帳からエントリを消すだけで実体のACEは残していた**。
 /// いまは両方が同じ`revoke_harness_subjects`（パスのDACLに実在する主体を剥がす）を通るので、
 /// 片方にだけ対応が入る形が構造的に無くなった（B-06）。
+///
+/// # [§22.2.1] `workspace_scope`——宣言capabilityをどの範囲で剥がすか
+///
+/// `None`は「そのパスへ発行された**全workspace**の主体」で、**そのパスを名指しした明示操作**
+/// （`harness fs revoke` / `revoke-all`）だけが使ってよい。起動時の自動整合（D-27）のような
+/// 暗黙の経路は必ず`Some(workspace)`で絞ること——絞らないと、同じパスを宣言している別の
+/// ワークスペースの主体まで剥がすことになり、[BUG-046](../../../../docs/bugs/BUG-046.md)
+/// （他人が使っているACEを純減させる）と同じ形になる。
 #[cfg(windows)]
 pub(crate) fn revoke_fs_ledger_entries(
     entries: &[FsLedgerEntry],
     note: &str,
     on_revoked: fn(&Path) -> usize,
     announce: RevokeAnnounce,
+    workspace_scope: Option<&Path>,
 ) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
     let mut remaining: Vec<harness_sandbox::tier2a::privhelper::FsAllowRevoke> = Vec::new();
     let mut revoked_paths: Vec<PathBuf> = Vec::new();
@@ -349,13 +504,24 @@ pub(crate) fn revoke_fs_ledger_entries(
                 continue;
             }
         };
-        if !report.unfinished().is_empty() {
+        // [§22.2.1] 宣言capabilityの段。package側と**同じ判定**（残っていれば昇格へ回す）を
+        // 通すので、片方だけが静かに残ることが無い。
+        let decl = revoke_declarations_with_progress(&path, workspace_scope, entry.forced);
+        let decl_clean = decl.as_ref().map(|d| d.is_clean()).unwrap_or(false);
+        if !report.unfinished().is_empty() || !decl_clean {
+            if let Err(e) = &decl {
+                announce.say(&format!(
+                    "escalating: {} (in-process declaration revoke could not finish: {e})",
+                    path.display()
+                ));
+            }
             remaining.push(harness_sandbox::tier2a::privhelper::FsAllowRevoke {
                 path,
                 forced: entry.forced,
             });
             continue;
         }
+        let decl = decl.unwrap_or_default();
         if !report.may_remove_ledger_entry() {
             // 生きているセッションがまだACEを持っている。剥がさないし記録も消さない
             // （BUG-053）。**黙って飛ばさない**——`revoke-all`が「全部消した」と読まれるため。
@@ -372,10 +538,11 @@ pub(crate) fn revoke_fs_ledger_entries(
         }
         on_revoked(&path);
         announce.say(&format!(
-            "{note}: {} ({} subject(s), {} node(s) rewritten)",
+            "{note}: {} ({} package subject(s), {} declaration subject(s), {} node(s) rewritten)",
             path.display(),
             report.targeted(),
-            report.rewritten()
+            decl.targeted.len(),
+            report.rewritten() + decl.rewritten
         ));
         revoked_paths.push(path);
     }
@@ -391,15 +558,28 @@ pub(crate) fn revoke_fs_ledger_entries(
             let mut elevated_failures = Vec::new();
             for entry in &remaining {
                 let sids = ledger_granted_sids(&entry.path);
+                // 宣言capability側も昇格下で再試行する（片方だけ昇格させない、B-02）。
+                let decl =
+                    revoke_declarations_with_progress(&entry.path, workspace_scope, entry.forced);
+                let decl_left = match &decl {
+                    Ok(d) => d.still_on_root.clone(),
+                    Err(e) => vec![format!("declaration revoke failed: {e}")],
+                };
                 match revoke_subjects_with_progress(&entry.path, &sids, entry.forced) {
-                    Ok(report) if report.unfinished().is_empty() => {
+                    Ok(report) if report.unfinished().is_empty() && decl_left.is_empty() => {
                         revoked.push(entry.path.clone())
                     }
                     Ok(report) => elevated_failures.push((
                         entry.path.clone(),
                         format!(
                             "still on the root after an elevated retry: {}",
-                            report.unfinished().join(", ")
+                            report
+                                .unfinished()
+                                .iter()
+                                .map(|s| s.to_string())
+                                .chain(decl_left)
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                     )),
                     Err(e) => elevated_failures.push((entry.path.clone(), e.to_string())),
@@ -417,10 +597,16 @@ pub(crate) fn revoke_fs_ledger_entries(
                 // **ヘルパーの応答だけを根拠に台帳を落とさない**（B-25）。rootのDACLを読み
                 // 直して、剥がすべき主体が残っていないことを確かめてから記録を捨てる。
                 let sids = ledger_granted_sids(path);
+                // 宣言capability側も同じ根拠（実DACL）で確かめる。読むのはrootの明示ACEだけ。
+                let decl_left =
+                    harness_sandbox::tier2a::win_appcontainer::declaration_capabilities_on_root(
+                        path,
+                        workspace_scope,
+                    );
                 match harness_sandbox::tier2a::win_appcontainer::classify_subjects_on_root(
                     path, &sids,
                 ) {
-                    Ok(after) if after.may_remove_ledger_entry() => {
+                    Ok(after) if after.may_remove_ledger_entry() && decl_left.is_empty() => {
                         on_revoked(path);
                         announce.say(&format!(
                             "{note} via privilege-separation helper (UAC, one-time): {}",
@@ -432,7 +618,13 @@ pub(crate) fn revoke_fs_ledger_entries(
                         path.clone(),
                         format!(
                             "the helper reported success but ACEs are still on the root: {}",
-                            after.unfinished().join(", ")
+                            after
+                                .unfinished()
+                                .iter()
+                                .map(|s| s.to_string())
+                                .chain(decl_left)
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                     )),
                     Err(e) => failures.push((path.clone(), e.to_string())),
@@ -465,6 +657,8 @@ pub(crate) fn fs_revoke_all() -> ExitCode {
         "revoked",
         remove_fs_passthrough_grant,
         RevokeAnnounce::Stdout,
+        // 明示コマンドなので全workspaceの宣言主体が対象（`revoke_fs_ledger_entries`のdoc）。
+        None,
     );
     if failures.is_empty() {
         ExitCode::SUCCESS
@@ -489,6 +683,21 @@ pub(crate) fn fs_revoke_all() -> ExitCode {
 /// `settings_managed`エントリだけをACE撤収対象にする（`--fs-allow`専用のエントリは
 /// `settings_managed`が立たないため対象外＝既存のsticky挙動を維持）。
 /// Tier2aが実際に選択されるかどうかとは独立に、`select_tier`（preflight）より前に毎回呼ぶ。
+///
+/// # [§22.2.1] これが「宣言が消えた次セッション開始時の差分」である
+///
+/// `--fs-allow`の主体が宣言ごとのcapability SIDへ移り、そのACEは**永続**になった
+/// （セッション終了時に剥がすと、同じワークスペースの並行セッションが互いの許可を落とす）。
+/// 通常の撤収経路は「宣言が消えたら次の起動で剥がす」差分で、その差分を既に計算しているのが
+/// この関数である——**新しい差分機構は作らない**（検問7/8）。足りないのは
+/// 「消えた宣言の主体を実ACLから剥がす」段だけで、それは`revoke_fs_ledger_entries`が持つ。
+///
+/// **対象は`.harness/settings.json`の宣言だけ**である。`--fs-allow`のCLI宣言を差分の材料に
+/// しないのは、宣言集合が**起動ごとに違い得る**ためで、材料にすると
+/// (a) 同じワークスペースを別の`--fs-allow`で開いた2セッションのうち後発が先発の穴を剥がし、
+/// (b) ドメインごとに`preflight`を回すポリシーエディタのパス2が互いの宣言を剥がす。
+/// どちらも生存判定を足さないと塞げず、それは§22.2.1が明示的に避けた道である。
+/// CLI宣言のACEは従来どおり`harness fs revoke <path>`（名前の付いた扉）で消す。
 #[cfg(windows)]
 pub fn reconcile_fs_ledger_for_workspace(
     workspace_root: &Path,
@@ -524,6 +733,13 @@ pub fn reconcile_fs_ledger_for_workspace(
     for entry in &orphan_candidates {
         eprintln!("  {}", entry.path);
     }
+    // [§22.2.1] **暗黙の経路なので、宣言capabilityはこのワークスペースのものだけに絞る。**
+    // 絞らないと、同じパスを宣言している別ワークスペースの主体まで剥がす（BUG-046と同型）。
+    // 台帳の突合は`workspace_key`が綴りを畳むが、`..`や8.3短縮名までは畳まないので
+    // canonicalizeしてから渡す（付与側の`preflight`が使っているのと同じ形）。
+    let canonical = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
     let (_, failures) = revoke_fs_ledger_entries(
         &orphan_candidates,
         "auto-revoked",
@@ -531,6 +747,7 @@ pub fn reconcile_fs_ledger_for_workspace(
         // BUG-064: この経路はエージェント起動の途中で走る。stdoutは`--output-format json`/`jsonl`
         // の機械可読出力に予約されているので、1行たりとも混ぜない。
         RevokeAnnounce::Stderr,
+        Some(&canonical),
     );
     for (path, reason) in &failures {
         eprintln!(

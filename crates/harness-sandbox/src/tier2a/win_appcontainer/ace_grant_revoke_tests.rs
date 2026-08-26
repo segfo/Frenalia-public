@@ -2842,3 +2842,121 @@ fn aces_for_one_sid_fold_by_inheritance_flags_and_the_folded_mask_is_a_union() {
          silently drop rights that an earlier grant had already given: {aces:#x?}"
     );
 }
+
+/// [§22.2.1] **名前の付いた扉が、宣言capability宛のACEを実際に剥がす。**
+///
+/// `--fs-allow`の主体はpackage SID（`S-1-15-2-`）から宣言ごとのcapability SID（`S-1-15-3-`）へ
+/// 移った。撤収の分類器は前者しか列挙しないので、**この扉が無ければ剥がす経路が1本も無い**
+/// ——「開くが二度と閉じられない許可」がそのまま残る。
+///
+/// 実DACLを読んで確かめる（台帳ではなく実体を見る、`B-14`）。
+#[test]
+fn the_named_door_strips_a_declaration_capability_ace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path().join("ws");
+    let target = dir.path().join("declared");
+    std::fs::create_dir_all(&ws).expect("create the workspace");
+    std::fs::create_dir_all(&target).expect("create the declared path");
+    let ws = ws.canonicalize().expect("canonicalize the workspace");
+    let target = target.canonicalize().expect("canonicalize the declared path");
+
+    let cap = fs_allow_capability_sid(&ws, &target, FsAccess::Read)
+        .expect("mint the declaration capability");
+    grant_ace_scoped(&target, cap.as_psid(), FsAccess::Read, GrantScope::Recursive)
+        .expect("grant the declaration ACE");
+    assert!(
+        matches!(sid_ace_mask(&target, cap.as_psid()), Ok(Some(_))),
+        "the test is not measuring anything unless the ACE is actually on the path first"
+    );
+
+    let report = revoke_declaration_capabilities(&target, Some(&ws), &|_, _| {})
+        .expect("the named door must not fail on a user-owned path");
+    assert_eq!(
+        report.targeted.len(),
+        1,
+        "the ledger index must name exactly the one subject this workspace declared: {report:?}"
+    );
+    assert!(
+        report.rewritten >= 1,
+        "the door must actually rewrite the DACL, not just report success: {report:?}"
+    );
+    assert!(
+        report.is_clean(),
+        "nothing may be left on the root after the door ran: {report:?}"
+    );
+    assert!(
+        matches!(sid_ace_mask(&target, cap.as_psid()), Ok(None)),
+        "the real DACL must no longer carry the declaration capability ACE"
+    );
+    assert!(
+        declaration_capabilities_on_root(&target, None).is_empty(),
+        "the read-only checker (used to verify the elevated path) must agree with the DACL"
+    );
+
+    crate::tier2a::workspace_capability::forget_capability(&ws, "");
+}
+
+/// **絞り込みの禁止側と許可側を対で固定する**（`B-35`）。
+///
+/// 同じパスを2つのworkspaceが宣言すると、主体は**別のSIDが2本**になる（秘密がworkspaceごと
+/// だから）。暗黙の撤収経路（起動時の自動整合）は必ず自分のworkspaceで絞る——絞らないと
+/// 他人が使っているACEを純減させる（[BUG-046](../../../../docs/bugs/BUG-046.md)と同型）。
+/// 逆に、パスを名指しした明示操作（`harness fs revoke <path>`）は絞らない側が正しい。
+#[test]
+fn scoping_the_named_door_to_one_workspace_leaves_the_other_workspaces_subject_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws_a = dir.path().join("ws-a");
+    let ws_b = dir.path().join("ws-b");
+    let target = dir.path().join("shared");
+    for p in [&ws_a, &ws_b, &target] {
+        std::fs::create_dir_all(p).expect("create the test dirs");
+    }
+    let ws_a = ws_a.canonicalize().expect("canonicalize ws-a");
+    let ws_b = ws_b.canonicalize().expect("canonicalize ws-b");
+    let target = target.canonicalize().expect("canonicalize the shared path");
+
+    let cap_a =
+        fs_allow_capability_sid(&ws_a, &target, FsAccess::Read).expect("mint ws-a's capability");
+    let cap_b =
+        fs_allow_capability_sid(&ws_b, &target, FsAccess::Read).expect("mint ws-b's capability");
+    assert_ne!(
+        crate::win_common::sid_to_string(cap_a.as_psid()).ok(),
+        crate::win_common::sid_to_string(cap_b.as_psid()).ok(),
+        "two workspaces declaring the same path must not share a subject"
+    );
+    for cap in [&cap_a, &cap_b] {
+        grant_ace_scoped(&target, cap.as_psid(), FsAccess::Read, GrantScope::Recursive)
+            .expect("grant both declaration ACEs");
+    }
+
+    // 禁止側: ws-aで絞ったのだから、ws-bの主体には触らない。
+    let scoped = revoke_declaration_capabilities(&target, Some(&ws_a), &|_, _| {})
+        .expect("scoped revoke");
+    assert_eq!(scoped.targeted.len(), 1, "scoped revoke targets one subject: {scoped:?}");
+    assert!(
+        matches!(sid_ace_mask(&target, cap_a.as_psid()), Ok(None)),
+        "ws-a's subject must be gone"
+    );
+    assert!(
+        matches!(sid_ace_mask(&target, cap_b.as_psid()), Ok(Some(_))),
+        "ws-b's subject must survive a revoke scoped to ws-a -- stripping it would take access \
+         away from a workspace that still declares this path (BUG-046の形)"
+    );
+
+    // 許可側: 名指しの明示操作（絞らない）なら残りも落ちる。
+    let unscoped =
+        revoke_declaration_capabilities(&target, None, &|_, _| {}).expect("unscoped revoke");
+    assert_eq!(
+        unscoped.targeted.len(),
+        2,
+        "the explicit door sees both workspaces' subjects: {unscoped:?}"
+    );
+    assert!(unscoped.is_clean(), "nothing may be left: {unscoped:?}");
+    assert!(
+        matches!(sid_ace_mask(&target, cap_b.as_psid()), Ok(None)),
+        "ws-b's subject must be gone after the unscoped door ran"
+    );
+
+    crate::tier2a::workspace_capability::forget_capability(&ws_a, "");
+    crate::tier2a::workspace_capability::forget_capability(&ws_b, "");
+}
