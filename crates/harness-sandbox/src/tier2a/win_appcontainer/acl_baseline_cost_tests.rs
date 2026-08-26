@@ -119,6 +119,15 @@ fn revoke_and_verify(root: &Path, sid: PSID) {
 ///
 /// **対照を必ず取る**（B-35）——`Propagate`を1回だけ打つ腕を並べる。それが無いと、
 /// `granted`が大きくても「経路の性質」なのか「このツリーの性質」なのかを言えない。
+///
+/// # [2026-08-25] 残課題#32は修正された。**このテストは回帰になった**
+///
+/// 修正前、腕Bは 2,032/2,033（20,033・100,033・260,033でも同じ割合）で、その値を
+/// 「現状」として留めるassertが置いてあった。修正後は**両方の腕が0**である。
+/// **したがって2つの腕は同じことを主張するようになった**が、統合せずに残してある——
+/// 腕Aは「伝播そのものが健全か」（計器の検算）、腕Bは「製品の順序でも届くか」（#32の回帰）で、
+/// **同じ数字が別の理由で0になっている**。片方が赤くなったときに、どちらの話かが分かる。
+/// 修正の本体は[`super::acl_dacl_write`]（モジュールdocに8通りの実測表がある）。
 #[test]
 #[ignore = "creates tens of thousands of files and writes DACLs; run NON-elevated"]
 fn acl_baseline_cost_propagation_reaches_existing_descendants() {
@@ -187,10 +196,44 @@ fn acl_baseline_cost_propagation_reaches_existing_descendants() {
 
     assert_eq!(nodes, nodes_b, "the two arms must use identical trees");
 
+    // **0を読む前に、歩いたことを確かめる**（B-35）。`granted == 0`は「全部届いた」でも
+    // 「1件も歩かなかった」でも成り立つので、これが無いと空ツリーでも緑になる。
+    for (label, report) in [("control", &report_a), ("product-shaped", &report_b)] {
+        assert_eq!(
+            report.checked, nodes,
+            "{label} arm: the walk must have visited every node before its `granted` can be read"
+        );
+        assert_eq!(
+            report.skipped, 0,
+            "{label} arm: nothing was passed as `skip`, so nothing may be skipped"
+        );
+        assert_eq!(
+            report.probe_errors, 0,
+            "{label} arm: a node whose DACL could not be read is counted as granted, so a \
+             non-zero value here makes the comparison meaningless"
+        );
+    }
+    // **届いた側の実効マスクまで見る**（B-25: 「設定した」ではなく実効で検証する）。
+    // `granted == 0`はACEの**有無**しか言っておらず、権限が意図どおりかは別の事実である。
+    for (label, root, sid) in [
+        ("control", root_a, sid_a.as_psid()),
+        ("product-shaped", root_b, sid_b.as_psid()),
+    ] {
+        let leaf = root.join("d000").join("f000000.txt");
+        let effective = sid_effective_ace_mask(&leaf, sid)
+            .unwrap_or_else(|e| panic!("{label} arm: read the leaf's effective mask: {e}"));
+        assert_eq!(
+            effective,
+            Some(mask),
+            "{label} arm: the leaf {} must carry exactly the mask that was propagated",
+            leaf.display()
+        );
+    }
+
     revoke_and_verify(root_a, sid_a.as_psid());
     revoke_and_verify(root_b, sid_b.as_psid());
 
-    // 対照が壊れていたら、腕Bの結果は読めない（この腕は「届く」はずの形である）。
+    // 対照。**伝播そのものが健全か**を測る腕で、ここが赤いなら計器が壊れている。
     assert_eq!(
         report_a.granted, 0,
         "control arm: a single Propagate write must reach every existing descendant, so the \
@@ -198,20 +241,15 @@ fn acl_baseline_cost_propagation_reaches_existing_descendants() {
          itself is wrong — do not read the product arm."
     );
 
-    // ここが残課題#32の判定。**2026-08-25の実測で確定した**（20,033ノード中20,032へ届かず）。
-    //
-    // **このassertは「あるべき姿」ではなく「現状」を留めている。** #32を直したら
-    // `granted`は対照と同じ0になるので、そのときこのassertは落ちる——落ちたら直った合図で、
-    // `assert_eq!(report_b.granted, 0)`へ反転させて対照の腕と統合すること。
-    //
-    // 帰結: 製品はワークスペース初回に**ノード数ぶんの明示DACL書込**を払っている。
-    // D-54が「ワークスペースにつき一度きり」にしたかった当のもの（BUG-081の26万ノード）が、
-    // BUG-082 Part Bの高速パス導入で**伝播1回から全ノード書込へ戻っている**。
-    assert!(
-        report_b.granted * 10 > report_b.checked * 9,
-        "STATUS #32: expected the product-shaped sequence to still be broken (the inheritance \
-         reaching almost nothing), but only {} of {} nodes needed an explicit grant. If this is \
-         now near zero, #32 has been fixed — flip this assertion to assert_eq!(granted, 0).",
+    // **残課題#32の回帰**（2026-08-25に修正）。修正前はここが 2,032/2,033 だった
+    // ——「速いはずの経路が無症状で死んでいて、O(ノード数)の明示書込を毎回払っている」状態。
+    // 直し方の実測表は[`super::acl_dacl_write`]のモジュールdocが持つ。
+    assert_eq!(
+        report_b.granted, 0,
+        "STATUS #32 regression: the product-shaped sequence (single-object root write, then a \
+         propagating write) must reach every existing descendant. {} of {} nodes needed an \
+         explicit grant, which means the propagation is silently doing nothing again and the \
+         first pass has gone back to paying O(nodes) DACL writes.",
         report_b.granted,
         report_b.checked
     );

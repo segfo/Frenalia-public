@@ -319,7 +319,7 @@ unsafe fn set_dacl_single_object_with_protection(
 /// [`dacl_is_protected`]・[`unprotect_harness_control_dir`]・BUG-083のプローブが共有する。
 /// `revoke_sids_from_node`だけは既に`GetNamedSecurityInfoW`のSDを手元に持っているので、
 /// 読取を二重にしないため`GetSecurityDescriptorControl`を直接呼んでいる。
-fn dacl_control(path: &Path) -> windows::core::Result<u16> {
+pub(crate) fn dacl_control(path: &Path) -> windows::core::Result<u16> {
     unsafe {
         let path_w = long_path_wide(path);
         let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -782,6 +782,12 @@ pub(crate) fn revoke_ace_unguarded(path: &Path, sid: PSID) -> Result<(), AppCont
 /// D-48ガードは持たない生のプリミティブ（呼び出し側がガードするかを決める、
 /// [`revoke_ace_unguarded`]のdoc参照）。
 ///
+/// [残課題#32] **付与側（[`super::acl_dacl_write::propagate_merged_dacl`]）もここを使う。**
+/// 伝播する書込は「その主体のACEが既にそのノードに在る」と既存の子孫へ届かないので、
+/// 書く直前に同じ主体を外す必要がある。撤収のための関数を付与側が呼ぶのは一見ちぐはぐだが、
+/// **同じ「1ノードから指定主体のACEを外す」操作を2つ実装しない**ためである
+/// （`docs/CODE-STRUCTURE-RULES.md`規則5）。
+///
 /// 戻り値は実際に書込を行ったか（＝1本以上のACEを剥がしたか）。0件なら`false`を返し、
 /// 高価な`CreateFileW(WRITE_DAC)`＋`SetKernelObjectSecurity`を呼ばない
 /// （`copy_dacl_excluding_sids`のdoc参照）。
@@ -791,7 +797,10 @@ pub(crate) fn revoke_ace_unguarded(path: &Path, sid: PSID) -> Result<(), AppCont
 /// 通す。ここを`Err`にすると、`%TEMP%`のように揺れ動くツリーの撤収で
 /// [`RevokeReport::blocked`]が「消えただけのノード」で埋まり、**本当に剥がせなかったものが
 /// 埋もれる**（B-09: 数える対象を混ぜない）。
-fn revoke_sids_from_node(path: &Path, sids: &[PSID]) -> Result<bool, AppContainerError> {
+pub(crate) fn revoke_sids_from_node(
+    path: &Path,
+    sids: &[PSID],
+) -> Result<bool, AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
         path: path.to_path_buf(),
         reason: e.to_string(),
