@@ -609,6 +609,17 @@ mod fs_creation_inheritance_cost_tests;
 #[cfg(all(windows, test))]
 mod broker_handoff_cost_tests;
 
+/// **部分木を覆う対象から外すと、その費用は本当に消えるのか**
+/// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の逃げ道E「覆う範囲を狭める」）。
+/// このリポジトリはファイルの96.1%が`target/`なので、そこを外せるかで初回費用が決まる。
+/// **非昇格で回す**。**判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+///
+/// **判定は出ている**（T-2＝§S17。浮きより代償が4.4倍大きく、Eは閉じた）。
+/// 本モジュールが測ったのは**浮く側だけ**（§S22）で、**採否の根拠には使えない**。
+/// 段階6の掃除で削除する。
+#[cfg(all(windows, test))]
+mod subtree_exclusion_cost_tests;
+
 /// **制限SID（`SidsToRestrict`）を指定したトークンで非管理者のまま子を起こせるか**
 /// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」5番＝案A-3の前提）。
 /// BUG-003が確かめた特権免除の特例は制限SIDが`None`のときの実測なので、非空でも
