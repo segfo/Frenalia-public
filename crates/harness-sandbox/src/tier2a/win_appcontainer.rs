@@ -669,31 +669,10 @@ mod acl_baseline_cost_tests;
 #[cfg(all(windows, test))]
 mod jit_grant_cost_tests;
 
-/// **作成時継承（空のルートへ札を1本置いてから中身を作る）の限界費用と、既存ツリーを
-/// 運ぶ費用**（`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「Bの内訳 — 名前空間を変える」、
-/// 分流T-3）。結果は`plans/handoff/fs-boundary-cost/T-3.md`。**非昇格で回す**。
-/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
-#[cfg(all(windows, test))]
-mod fs_creation_inheritance_cost_tests;
-
-/// **T-5: ブローカーが「開いたハンドル」を手渡す形の1件あたり費用**
-/// （`plans/handoff/fs-boundary-cost/T-5.md`）。ACEを書く代わりに、親が`CreateFileW`して
-/// `DuplicateHandle`で子へ渡す案の値段を、**AppContainerの子から親への本物のプロセス境界**で
-/// 測る。あわせて§S13の腕B・腕C（同一プロセス内スレッド間＝過小評価）を跨ぎで測り直す。
-/// **非昇格で回す**。**判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
-#[cfg(all(windows, test))]
-mod broker_handoff_cost_tests;
-
-/// **部分木を覆う対象から外すと、その費用は本当に消えるのか**
-/// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の逃げ道E「覆う範囲を狭める」）。
-/// このリポジトリはファイルの96.1%が`target/`なので、そこを外せるかで初回費用が決まる。
-/// **非昇格で回す**。**判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
-///
-/// **判定は出ている**（T-2＝§S17。浮きより代償が4.4倍大きく、Eは閉じた）。
-/// 本モジュールが測ったのは**浮く側だけ**（§S22）で、**採否の根拠には使えない**。
-/// 段階6の掃除で削除する。
-#[cfg(all(windows, test))]
-mod subtree_exclusion_cost_tests;
+// **削除済み（2026-08-27）**: 一回性の費用測定3本（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+// どれも判定が出たので消した。**測り方と数字は`plans/mac-spike/RESULTS.md`が持つ**——
+// 作成時継承の限界費用（T-3＝§S18）・ハンドル手渡しの1件あたり（T-5＝§S20）・
+// 部分木を外したときの浮き（§S22）。復元が要るならこのコミットの親から取る。
 
 /// **制限SID（`SidsToRestrict`）を指定したトークンで非管理者のまま子を起こせるか**
 /// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」5番＝案A-3の前提）。
@@ -704,10 +683,16 @@ mod subtree_exclusion_cost_tests;
 mod restricted_sid_probe_tests;
 
 /// **両モードのバッジ（capability SID）宛ACEを1回で同時に配ったとき、`ro`側の子から
-/// 書けてしまわないか**（分流`plans/handoff/fs-boundary-cost/T-1.md`）。
+/// 書けてしまわないか**（分流`plans/handoff/fs-boundary-cost/T-1.md`、実測は§S16）。
 /// 費用側は§S15-1が「1回にまとめれば無料」と実測済みなので、残る問いは安全性だけである。
 /// **非昇格で回す**（昇格すると親トークンが管理者になり、測る世界が実運用とずれる）。
-/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+///
+/// **一回性の測定だったが、残す**（2026-08-27。`docs/CODE-STRUCTURE-RULES.md`規則2の例外）。
+/// 判定が **D-84 という拘束的決定になり、その安全性の不変条件**——「`ro`のバッジしか持たない子は
+/// 書けない」——**を実子プロセスで測っているのは本モジュールだけ**だからである。
+/// `ace_grant_revoke_tests`の対応するテストはDACLの中身までしか見ておらず、
+/// **そこから「だから書けない」を導いてはいけない**（同テストのdocが自分でそう書いている）。
+/// **D-84を変更するときは、まずここを回すこと。**
 #[cfg(all(windows, test))]
 mod dual_badge_mode_switch_tests;
 

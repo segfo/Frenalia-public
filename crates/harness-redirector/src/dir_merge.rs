@@ -321,11 +321,6 @@ pub(crate) unsafe fn try_merged_dir_query(
     file_name: *const windows::Win32::Foundation::UNICODE_STRING,
     restart_scan: bool,
 ) -> Option<NTSTATUS> {
-    // 分流 U-1 の計装: 観測モードでは列挙のマージを自前で組み立てない（素通し）。
-    // 数えたいのは「素のツールの挙動」で、CoWが挟まった後の列挙ではない。
-    if fscost::count_only() {
-        return None;
-    }
     let _guard = ReentryGuard::try_acquire()?;
     let cfg = CONFIG.get()?;
     let handle_key = file_handle.0 as isize;

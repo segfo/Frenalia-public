@@ -328,10 +328,6 @@ pub(crate) unsafe fn inject_grandchild_and_maybe_resume(
         debug_log(&format!(
             "{caller}: injection (wow64={is_wow64}) returned {injected}"
         ));
-        // 分流 U-1 の計装: 被覆率の分母を後から数えるため、生成した子を1行ずつ残す
-        // （既定では `record_child` が即座に戻る）。**注入に失敗した子は数えられない側**なので、
-        // 成否も一緒に残さないと「何%を数えたか」が言えなくなる。
-        fscost::record_child(pi.dwProcessId, injected, caller);
         if !injected {
             let message = if is_wow64 {
                 "grandchild redirector re-injection failed or timed out (32bit/WOW64 target, \
