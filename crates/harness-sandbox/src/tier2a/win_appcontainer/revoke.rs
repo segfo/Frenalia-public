@@ -387,7 +387,15 @@ fn is_vanished(e: &windows::core::Error) -> bool {
 ///
 /// 戻り値は**このノードが保護された状態になったか**。`false`は「walkで見つけてから触るまでの
 /// 間に消えた」ことだけを意味する（[`is_vanished`]）。エラーは`Err`のままで、握り潰さない。
-fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<bool, AppContainerError> {
+///
+/// **`pub(super)`なのは`subtree_exclusion_cost_tests`（部分木を除外したときに費用が本当に
+/// 消えるかの測定）が単一ノードの保護を必要とするためである。** 姉妹の
+/// [`protect_harness_control_dir_from_appcontainer`]は部分木を再帰的に保護するので、
+/// **「継承を止めるだけ」を測る用途には使えない**（O(ノード数)の保護そのものを測ってしまう）。
+pub(super) fn remove_sid_aces_and_protect(
+    path: &Path,
+    sid: PSID,
+) -> Result<bool, AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
         path: path.to_path_buf(),
         reason: e.to_string(),
