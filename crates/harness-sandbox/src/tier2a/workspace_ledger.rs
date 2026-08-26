@@ -6,10 +6,27 @@
 //! Windows自身が自動的にオブジェクトを破棄するため、「まだ誰かが開いているか」を
 //! `OpenMutexW`で聞くだけでliveness確認ができ、PID生存確認のような手作業のロジックが要らない。
 //!
-//! workspaceには、アクセスモード別に名前を分けたmutexを用意する（`KNOWN_MODES`）。同じ
-//! workspaceに対して異なるモード（例: 通常起動のRWXと`--sandbox tier2a-cow`のRO）を同時に動かすと、
-//! ACE（ファイルに1つしか付けられない）の意味がセッション間で食い違うため、`begin_workspace_mode`
-//! が起動時に他モードの生存を確認し、生きていれば起動そのものを拒否する。
+//! workspaceには、アクセスモード別に名前を分けたmutexを用意する（[`KNOWN_MODES`]）。同じ
+//! workspaceに対して異なるモード（例: 通常起動のRWXと`--sandbox tier2a-cow`のRO）を同時に
+//! 動かすことは、[`begin_workspace_mode`]が起動時に他モードの生存を確認して拒否している。
+//!
+//! ## 拒否の根拠（**2026-08-26に事実へ合わせて書き直した**）
+//!
+//! **旧・記述は「ACE（ファイルに1つしか付けられない）の意味がセッション間で食い違うため」
+//! だったが、括弧の中が事実と違う。** DACLには同じファイルへ複数の主体宛ACEが同時に載り、
+//! 互いに干渉せず独立に効く（`plans/handoff/fs-boundary-cost/T-1.md`が実測。同一ノードで
+//! 上限1,168本まで載ることも`plans/mac-spike/RESULTS.md` §S15-3が測っている）。
+//! 実際、[D-84](../../../../plans/DESIGN-SANDBOX-APPPOLICY.md)以降は**両モードのバッジ宛ACEが
+//! 常に同時に載っている**——それでも`ro`のバッジしか持たない子は書けない（トークンに無い主体宛の
+//! ACEはアクセス判定で読み飛ばされる）。
+//!
+//! **残る根拠はACLではなく一貫性である。** `--sandbox tier2a-cow`のセッションは
+//! 「workspace本体は動かない」を前提に差分層を積む。同じworkspaceで並走するRWXセッションが
+//! 本体を書き換えると、その差分は**動く土台の上に積まれた**ものになり、`harness cow apply`が
+//! 何へ適用されるのかを言えなくなる。
+//!
+//! **規則そのものを残すか撤廃するかは、ここでは決めていない**（`plans/handoff/fs-boundary-cost/U-2.md`
+//! 「本流が決めること」）。この節が直したのは**根拠の文**だけである。
 //!
 //! CoW diff_layer_dirはセッション専有なので、セッションIDを名前に含めたmutexを1つ持つだけでよい
 //! （他モードとの衝突チェックは不要、生きているかどうかの確認にのみ使う）。
@@ -25,9 +42,92 @@ use std::path::{Path, PathBuf};
 // `loopback_exemption`と共有するため`crate::win_common`が持つ（規則5・コピーを作らない）。
 use crate::win_common::{hold_mutex_for_process_lifetime, mutex_exists};
 
-/// 現在サポートするworkspaceアクセスモード。将来`--cow_exec`（RX、読取+実行のみ許可）を
-/// 追加する場合はここに`"rx"`を足すだけでよい（mutex名の分岐だけで衝突チェックが機能する）。
+/// workspaceのアクセスモード。**「このworkspaceへ何を許すか」の語彙**であって、
+/// 「いまどのモードで走っているか」ではない——[D-84]以降、`preflight`は**全モードのバッジ宛
+/// ACEを毎回まとめて配る**ので、走っているモードと配るモードは別の話になった。
+///
+/// # なぜ文字列ではなく型なのか
+///
+/// モードごとに決まる事実が2つある——**mutexの名前**（ここ）と**ツリーへ配るアクセスマスク**
+/// （`win_appcontainer::workspace_mode_mask`）。文字列で持つと、モードを1つ足したときに
+/// **どちらか片方だけ追随する**（`B-06`: 不変条件を変えたら全経路を数えたか）。
+/// 列挙にしておけば、バリアントを足した瞬間にマスク側の`match`が非網羅になって
+/// **コンパイルが落ちる**——数え上げを人間の記憶から外すのがここの目的である。
+///
+/// 台帳（`workspace_capability`）とmutex名には[`Self::as_str`]の値がそのまま載るので、
+/// **綴りを変えると既存の台帳エントリと突き合わなくなる**（変えないこと）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkspaceMode {
+    /// 通常起動。workspace本体へ直接書ける（`WorkspaceWriteMode::DirectRw`）。
+    Rwx,
+    /// `--sandbox tier2a-cow`。workspace本体は読取専用で、書込はCoW差分層へ逃がす。
+    Ro,
+}
+
+impl WorkspaceMode {
+    /// **全モード**。[D-84]で両モードのバッジを配る側と、`harness fs revoke-workspace`が
+    /// 剥がす側の**両方**がここを回る（`B-01`: 付与と撤収を同じ一覧から引く）。
+    pub const ALL: [WorkspaceMode; 2] = [Self::Rwx, Self::Ro];
+
+    /// 台帳・mutex名に載る綴り。**既存の台帳と突き合うので変えないこと。**
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rwx => "rwx",
+            Self::Ro => "ro",
+        }
+    }
+
+    /// 台帳から読み出した綴りを型へ戻す。知らない綴り（将来の版が書いた・手で壊された）は
+    /// `None`——**勝手にどれかへ倒さない**（倒すと、知らないモードのACEを別モードのマスクで
+    /// 上書きし得る）。
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.as_str() == s)
+    }
+}
+
+/// 現在サポートするworkspaceアクセスモードの**綴りの一覧**（[`WorkspaceMode::ALL`]の文字列版）。
+///
+/// 型が使える場所では[`WorkspaceMode`]を使うこと。ここが残っているのは、台帳の欄が
+/// `String`で、綴りの側で突き合わせる呼び出しがあるためである。**2つが食い違わないことは
+/// `the_string_vocabulary_matches_the_enum`が固定する。**
 pub const KNOWN_MODES: &[&str] = &["rwx", "ro"];
+
+#[cfg(test)]
+mod mode_vocabulary_tests {
+    use super::*;
+
+    /// [`KNOWN_MODES`]と[`WorkspaceMode::ALL`]は**同じ集合を同じ順で**表す。
+    ///
+    /// 2つある理由は台帳の欄が`String`だからで、**同じ事実の綴りが2箇所にある**（`B-05`）。
+    /// 片方だけにモードを足すと、たとえば`fs revoke-workspace`は新しいモードのバッジを
+    /// 引かないまま「全部剥がした」と報告する——**剥がせないACEが残る**（BUG-101と同型）。
+    /// コンパイラはここを守らないので、テストで固定する。
+    #[test]
+    fn the_string_vocabulary_matches_the_enum() {
+        let from_enum: Vec<&str> = WorkspaceMode::ALL.iter().map(|m| m.as_str()).collect();
+        assert_eq!(
+            from_enum, KNOWN_MODES,
+            "KNOWN_MODESとWorkspaceMode::ALLがずれている。モードを足すときは両方に足すこと"
+        );
+    }
+
+    /// 往復する（許可側）。**`parse`が常に`None`を返す実装でも上のテストは緑になる**ので
+    /// 対で置く（`B-35`）。
+    #[test]
+    fn every_mode_round_trips_through_its_spelling() {
+        for mode in WorkspaceMode::ALL {
+            assert_eq!(WorkspaceMode::parse(mode.as_str()), Some(mode));
+        }
+    }
+
+    /// 拒否側。知らない綴りはどれにも倒さない。
+    #[test]
+    fn an_unknown_spelling_does_not_fall_back_to_a_mode() {
+        assert_eq!(WorkspaceMode::parse("rx"), None);
+        assert_eq!(WorkspaceMode::parse("RWX"), None);
+        assert_eq!(WorkspaceMode::parse(""), None);
+    }
+}
 
 /// パスをWindowsカーネルオブジェクト名として安全に使える文字列へ変換する（英数字以外は`_`）。
 /// 呼び出し元は事前にcanonicalizeしたパスを渡すこと（大文字小文字・相対/絶対の違いによる

@@ -1215,10 +1215,34 @@ pub(crate) fn sid_ace_mask(path: &Path, sid: PSID) -> Result<Option<u32>, AppCon
 /// 実装は`GetExplicitEntriesFromAclW`ではなく`GetAce`でDACLを直接列挙する
 /// （[`crate::elevated_launch`]の`read_allow_aces`と同じ理由・同じ形）。**Allow ACEだけを数える**
 /// ——Deny ACEは「届いている」の根拠にならない。
+///
+/// **[D-84] 製品はもうここを通らない**——両モードのバッジを配るようになったので、
+/// 問いは常に「この複数の主体のうちどれが届いているか」になり、実装は
+/// [`sid_effective_ace_masks`]へ移った。単数版が残っているのは、1主体だけを測る
+/// 回帰テスト・コスト測定（`acl_dacl_write_tests`・`acl_baseline_cost_tests`等）が
+/// 読みやすいままであるためで、**判定規則は多本版と同一**（同じ関数を1本で呼ぶだけ）。
+#[cfg(test)]
 pub(crate) fn sid_effective_ace_mask(
     path: &Path,
     sid: PSID,
 ) -> Result<Option<u32>, AppContainerError> {
+    Ok(sid_effective_ace_masks(path, &[sid])?[0])
+}
+
+/// [D-84] [`sid_effective_ace_mask`]の多主体版。**DACLの読取は1回**で、`sids`と同じ並び・
+/// 同じ長さの結果を返す。
+///
+/// これが要るのは、両モードのバッジを配るようになって「このノードに届いているか」を
+/// **1ノードあたり2回**問うようになったためである。単数版を2回呼ぶと
+/// `GetNamedSecurityInfoW`も2回走り、26万ノードの救済walk（実測18.5秒）がそのまま倍になる
+/// ——[D-84]が「バッジを増やしても無料」と言えるのは1回の書込にまとめた場合の話で
+/// （`plans/mac-spike/RESULTS.md` §S15-1）、**読取の側は自分でまとめないと倍を払う。**
+///
+/// 判定規則は単数版と完全に同じ（Allow ACEだけを数える／NULL DACLは全員に届いている）。
+pub(crate) fn sid_effective_ace_masks(
+    path: &Path,
+    sids: &[PSID],
+) -> Result<Vec<Option<u32>>, AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -1244,10 +1268,10 @@ pub(crate) fn sid_effective_ace_mask(
         // （ここでACEを書き足しても実効アクセスは変わらない）。
         if dacl.is_null() {
             let _ = LocalFree(HLOCAL(sd.0));
-            return Ok(Some(u32::MAX));
+            return Ok(vec![Some(u32::MAX); sids.len()]);
         }
 
-        let mut mask: Option<u32> = None;
+        let mut masks: Vec<Option<u32>> = vec![None; sids.len()];
         let count = (*dacl).AceCount as u32;
         for index in 0..count {
             let mut ace_ptr: *mut c_void = std::ptr::null_mut();
@@ -1260,12 +1284,14 @@ pub(crate) fn sid_effective_ace_mask(
             }
             let ace = ace_ptr as *const ACCESS_ALLOWED_ACE;
             let ace_sid = PSID(&(*ace).SidStart as *const u32 as *mut c_void);
-            if EqualSid(ace_sid, sid).is_ok() {
-                mask = Some(mask.unwrap_or(0) | (*ace).Mask);
+            for (slot, &sid) in masks.iter_mut().zip(sids) {
+                if EqualSid(ace_sid, sid).is_ok() {
+                    *slot = Some(slot.unwrap_or(0) | (*ace).Mask);
+                }
             }
         }
         let _ = LocalFree(HLOCAL(sd.0));
-        Ok(mask)
+        Ok(masks)
     }
 }
 

@@ -1030,8 +1030,10 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
     // 「フォールバックが効いた」と主張してしまうため（実際にこれで誤検知した）。
     let started = grant_job::start(
         &root,
-        sid.clone(),
-        workspace_rwx_mask(),
+        vec![OwnedBadgeGrant {
+            sid: sid.clone(),
+            mask: workspace_rwx_mask(),
+        }],
         vec![sid.clone()],
         vec![root.join(".harness")],
         &root,
@@ -3030,4 +3032,149 @@ fn the_named_door_refuses_to_take_access_from_a_live_workspace() {
     revoke_capability_subjects(&target, &subjects, &|_, _| {}).expect("clean up the live subject");
     crate::tier2a::workspace_capability::forget_capability(&ws_live, "");
     crate::tier2a::workspace_capability::forget_capability(&ws_idle, "");
+}
+
+/// [D-84] **2本置いたら2本読め、2本消したら0本になる。**
+///
+/// # なぜこのテストが要るのか
+///
+/// D-84は「両モードのバッジ宛ACEを1回の書込で同時に置く」という変更で、成立の根拠は
+/// 2つある——費用が動かないこと（`plans/mac-spike/RESULTS.md` §S15-1）と、`ro`のバッジ
+/// しか持たない子が書けないこと（`plans/handoff/fs-boundary-cost/T-1.md`が実子プロセスで
+/// 実測）。**このテストはそのどちらでもない**。ここが測るのは、その手前にある
+/// 「**そもそも意図した2本が本当にDACLへ載り、撤収で本当に両方消えるのか**」である。
+///
+/// 分けてあるのは、これが別の壊れ方だからである。`grant_*`が`Ok(())`を返しても、
+/// 冪等スキップが誤って効けば**2本目は1本も書かれない**——そして機能テストは緑のままになる
+/// （1本目のバッジで動くセッションは何も困らないので、症状は「モードを切り替えたときだけ
+/// 26万件を払い直す」という、まさにD-84が消したはずの形で戻ってくる）。
+/// **「ACEを付けた」と「載っている」は別の事実**なので、付与のあとに読み返す（`B-25`）。
+///
+/// # 対で見ているもの（`B-35`）
+///
+/// - **許可側**: `rwx`バッジのマスクに書込・削除ビットが載っている。
+/// - **拒否側**: `ro`バッジのマスクにそれが載っていない（**原子ビットで測る**。
+///   複合マスクで測ると読取専用でも0にならない——[BUG-048]、`workspace_badges`のテスト参照）。
+/// - **陰性対照**: 一度も渡していない第3のSIDは、どのノードにも現れない
+///   （「全員に配ってしまった」実装でも緑にならないようにする）。
+/// - **撤収側**: 2本とも消える。片方だけ消えると、残った側は台帳を消した瞬間に
+///   主体を導出できなくなり**どのコマンドでも剥がせないACE**になる（`B-01`／BUG-101）。
+///
+/// # このテストが測っていないもの（限界）
+///
+/// **アクセス判定そのものは測っていない。** 「`ro`のバッジを積んだ子が実際に書けない」は
+/// 子プロセスを起こさないと分からず、それはT-1が実測済みである。ここが答えるのは
+/// ACLの中身までで、**そこから「だから書けない」を導いてはいけない**。
+///
+/// 管理者権限もAppContainerプロファイルの作成も要らない（SIDは
+/// [`super::capability_sid_from_name`]の純粋導出で台帳を触らず、DACLを書き換えるのは
+/// 自分が所有するtempdirだけ）ため`#[ignore]`にしない。
+///
+/// [BUG-048]: ../../../../docs/bugs/BUG-048.md
+#[test]
+fn both_workspace_badges_land_in_one_write_and_both_come_off_again() {
+    use crate::tier2a::workspace_ledger::WorkspaceMode;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let nested = root.join("sub");
+    std::fs::create_dir_all(&nested).expect("create nested dir");
+    let leaf = nested.join("f.txt");
+    std::fs::write(&leaf, b"hi").expect("seed file");
+
+    // 本番と同じ「(パス, モード)ごとに別主体」を、台帳を経由せず名前だけで作る。
+    let rwx_sid = capability_sid_from_name("harnessD83TestBadgeRwx").expect("derive the rwx badge");
+    let ro_sid = capability_sid_from_name("harnessD83TestBadgeRo").expect("derive the ro badge");
+    // 陰性対照。どの呼び出しにも渡さない。
+    let never = capability_sid_from_name("harnessD83TestBadgeNever").expect("derive the control");
+    let badges = [
+        BadgeGrant {
+            sid: rwx_sid.as_psid(),
+            mask: workspace_mode_mask(WorkspaceMode::Rwx),
+        },
+        BadgeGrant {
+            sid: ro_sid.as_psid(),
+            mask: workspace_mode_mask(WorkspaceMode::Ro),
+        },
+    ];
+
+    // --- 付与（1回の書込でM本） ---
+    grant_workspace_root_badges_fast(root, &badges).expect("grant both badges to the root");
+
+    // --- 読み返し: rootに2本、しかも継承あり ---
+    for (sid, label) in [(rwx_sid.as_psid(), "rwx"), (ro_sid.as_psid(), "ro")] {
+        let ace = sid_explicit_ace(root, sid)
+            .expect("probe the root DACL")
+            .unwrap_or_else(|| {
+                panic!("the {label} badge must carry an explicit ACE on the workspace root")
+            });
+        assert!(
+            ace.is_inheritable(),
+            "the {label} badge's root ACE must be inheritable, otherwise descendants never \
+             receive it: {ace:#x?}"
+        );
+    }
+
+    // 許可側と拒否側を**同じ読み返しの中で**対にする。原子ビットで測る（BUG-048）。
+    const WRITE_DATA: u32 = 0x0000_0002;
+    let rwx_mask = sid_ace_mask(root, rwx_sid.as_psid())
+        .expect("probe the rwx badge")
+        .expect("the rwx badge must be present");
+    let ro_mask = sid_ace_mask(root, ro_sid.as_psid())
+        .expect("probe the ro badge")
+        .expect("the ro badge must be present");
+    assert_eq!(
+        rwx_mask & (WRITE_DATA | DELETE.0),
+        WRITE_DATA | DELETE.0,
+        "the rwx badge must be able to write and delete: {rwx_mask:#x}"
+    );
+    assert_eq!(
+        ro_mask & (WRITE_DATA | DELETE.0),
+        0,
+        "the ro badge must not be able to write or delete, even though it sits in the same \
+         DACL as the rwx badge: {ro_mask:#x}"
+    );
+    assert_eq!(
+        sid_ace_mask(root, never.as_psid()).expect("probe the control SID"),
+        None,
+        "a SID that was never granted must not appear on the root"
+    );
+
+    // --- 救済walk: 既存の子孫へも2本届く ---
+    // `grant_workspace_root_badges_fast`は`SingleObject`（伝播しない）なので、この時点で
+    // 既存の子孫にはまだ届いていない。届けるのは背景ジョブと同じ多本版の救済walkである。
+    let report = fix_descendants_missing_aces(root, &badges, &[], &|_, _| {})
+        .expect("run the multi-badge rescue walk");
+    assert!(
+        report.granted > 0,
+        "the rescue walk must have granted at least the pre-existing descendants: {report:#?}"
+    );
+    for (sid, label) in [(rwx_sid.as_psid(), "rwx"), (ro_sid.as_psid(), "ro")] {
+        assert!(
+            sid_effective_ace_masks(&leaf, &[sid]).expect("probe the leaf")[0].is_some(),
+            "the {label} badge must reach the pre-existing leaf after the rescue walk"
+        );
+    }
+    assert_eq!(
+        sid_effective_ace_masks(&leaf, &[never.as_psid()]).expect("probe the control on the leaf")
+            [0],
+        None,
+        "the rescue walk must not hand the leaf to a SID it was never given"
+    );
+
+    // --- 撤収: 2本渡して2本とも消える ---
+    let removed =
+        revoke_workspace_sids_recursive(root, &[rwx_sid.as_psid(), ro_sid.as_psid()], &|_, _| {})
+            .expect("revoke both badges in one walk");
+    assert!(
+        removed.rewritten > 0,
+        "the revoke walk must have rewritten the nodes that carried the badges: {removed:#?}"
+    );
+    for (sid, label) in [(rwx_sid.as_psid(), "rwx"), (ro_sid.as_psid(), "ro")] {
+        assert!(
+            assert_no_sid_ace_recursive(root, sid).is_ok(),
+            "the {label} badge must be gone from every node after revoke — a badge left behind \
+             here is unreachable once the ledger entry is dropped (BUG-101)"
+        );
+    }
 }

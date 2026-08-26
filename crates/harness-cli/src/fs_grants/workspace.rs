@@ -47,9 +47,19 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
     // 唯一の撤収経路になる。D-37時代の残骸（package SID宛のACE）も同じ機会に剥がす。撤収対象は
     // 「旧共有プロファイル」＋「生きていないセッションのプロファイル」で、実行中のセッションの
     // ぶんは触らない（実行中の他セッションから権限を奪わない、BUG-053と同じ原則）。
+    //
+    // [D-84] **付与が2本なら撤収も2本である。** `preflight`は起動のたびに全モードのバッジ宛
+    // ACEを配るので、ここが自モードのぶんだけを剥がすと**もう一方のバッジ宛ACEがツリーに
+    // 残る**——しかもその主体は台帳を消した瞬間に導出できなくなり、どのコマンドでも剥がせない
+    // （[BUG-101](../../../docs/bugs/BUG-101.md)と同型）。だから回すのは
+    // `WorkspaceMode::ALL`であって「いま走っているモード」ではない（`B-01`）。
+    //
+    // **秘密から導出し直すのではなく、台帳に載っている名前を索引にする。** 台帳に無い＝
+    // 一度も配っていないので、`lookup_`（発行しない側）で足りる。
     let mut resolve_failures = Vec::new();
     let mut capability_targets = Vec::new();
-    for mode in harness_sandbox::tier2a::workspace_ledger::KNOWN_MODES {
+    for mode in harness_sandbox::tier2a::workspace_ledger::WorkspaceMode::ALL {
+        let mode = mode.as_str();
         let Some(name) =
             harness_sandbox::tier2a::workspace_capability::lookup_capability_name(&canonical, mode)
         else {
