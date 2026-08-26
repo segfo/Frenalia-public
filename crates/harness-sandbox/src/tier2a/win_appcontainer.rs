@@ -594,6 +594,14 @@ mod acl_baseline_cost_tests;
 #[cfg(all(windows, test))]
 mod jit_grant_cost_tests;
 
+/// **制限SID（`SidsToRestrict`）を指定したトークンで非管理者のまま子を起こせるか**
+/// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」5番＝案A-3の前提）。
+/// BUG-003が確かめた特権免除の特例は制限SIDが`None`のときの実測なので、非空でも
+/// 効くかを対照つきで測る。**非昇格で回す**（昇格すると特権を持ってしまい区別が付かない）。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod restricted_sid_probe_tests;
+
 /// **残課題#32の機序を1回で決めるプローブ**（使い捨て）。`acl_baseline_cost_tests`が
 /// 「届いていない」を確定させたのに対し、こちらは**なぜ届かないのか**を候補を並べて測る
 /// ——直し方が機序で変わるため（モジュールdoc）。**非昇格**。
