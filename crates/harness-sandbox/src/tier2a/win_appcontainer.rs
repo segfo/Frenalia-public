@@ -586,6 +586,14 @@ mod unc_reach_spike_tests;
 #[cfg(all(windows, test))]
 mod acl_baseline_cost_tests;
 
+/// **遅延実体化（JIT）でACEを1件ずつ配るときの1件あたり費用**
+/// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」1番）。
+/// 事前配布（§S12-1の86.5 µs/ノード）に対する損益分岐——「触る割合が何%を切れば
+/// JITのほうが安いか」——を出すためのもの。**非昇格で回す**。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod jit_grant_cost_tests;
+
 /// **残課題#32の機序を1回で決めるプローブ**（使い捨て）。`acl_baseline_cost_tests`が
 /// 「届いていない」を確定させたのに対し、こちらは**なぜ届かないのか**を候補を並べて測る
 /// ——直し方が機序で変わるため（モジュールdoc）。**非昇格**。
