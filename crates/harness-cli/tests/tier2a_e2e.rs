@@ -3865,13 +3865,32 @@ fn powershell(script: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// このワークスペースへ付いている **workspace capability SID**（D-54）を読む。
+/// このワークスペースへ付いている **`rwx`モードのworkspace capability SID**（D-54）を読む。
 ///
 /// DENYの宛先はこれでなければならない——workspaceツリーのACEはセッションのpackage SIDではなく
 /// **workspace＋モード単位のcapability SID**宛に付く（`tier2a/workspace_capability.rs`）。
 /// package SID宛にDENYを置いても当たらないので、間違えると「DENYを置いたのに走った」という
-/// 誤った結論になる。継承あり（`ObjectInherit`=2）かつ実行権（`FILE_EXECUTE`=0x20）を持つ
-/// ものだけを採る——`rwx`モードのworkspaceには1本しか無い。
+/// 誤った結論になる。
+///
+/// # **[D-83] ここは1本ではなく2本になった**
+///
+/// 以前は「継承あり かつ 実行権（`FILE_EXECUTE`=0x20）」で絞れば1本だけ当たった。
+/// D-83で`preflight`が**両モード（`rwx`/`ro`）のバッジ宛ACEを毎回まとめて配る**ように
+/// なったため、この条件では**2本**当たる——`ro`のマスク（`FILE_GENERIC_READ |
+/// FILE_GENERIC_EXECUTE`）にも`FILE_EXECUTE`が入っているからである。
+///
+/// この測定が止めたいのは**プローブの子が実際に名乗っているバッジ**で、
+/// この経路は通常起動（`WorkspaceWriteMode::DirectRw`）なので`rwx`側である。
+/// **書込権（`FILE_WRITE_DATA`=0x2）の有無で選ぶ**——`rwx`のマスクだけがこれを持ち、
+/// `ro`のマスクは持たない（`win_appcontainer::workspace_mode_mask`が唯一の対応表）。
+///
+/// **複合マスクで絞らないこと**（BUG-048）。`FileSystemRights`を`Write`のような
+/// 複合値と比べると`READ_CONTROL`/`SYNCHRONIZE`を共有する読取専用ACEまで当たり、
+/// **`ro`のバッジを`rwx`と誤認して**「DENYを置いたのに走った」に戻る。原子ビットで見る。
+///
+/// 2本という本数そのものは[`WS_CAP_SID_SCRIPT`]の絞り込みが正しいかの検算でもあるので、
+/// **0本と複数本を別のメッセージで落とす**（どちらも「絞り方が実装とずれた」の症状だが、
+/// ずれ方が逆であり、混ぜると次に読む人が原因を取り違える）。
 fn workspace_capability_sid(ws: &Path) -> Result<String, String> {
     let script = WS_CAP_SID_SCRIPT.replace("@WS@", &ws.display().to_string());
     let found = powershell(&script)?;
@@ -3879,22 +3898,28 @@ fn workspace_capability_sid(ws: &Path) -> Result<String, String> {
     match sids.as_slice() {
         [one] => Ok((*one).to_string()),
         [] => Err(format!(
-            "{} に継承ありのworkspace capability ACE（S-1-15-3-*）が1本も無い。\
-             preflightが付与に失敗しているか、SIDの選び方が実装とずれている（D-54）",
+            "{} に継承あり＋書込権を持つworkspace capability ACE（S-1-15-3-*）が1本も無い。\
+             preflightが付与に失敗しているか、SIDの選び方が実装とずれている（D-54/D-83）",
             ws.display()
         )),
         many => Err(format!(
-            "workspace capability ACEが{}本あり、どれを止めるべきか決められない: {many:?}",
+            "書込権を持つworkspace capability ACEが{}本あり、どれを止めるべきか決められない: \
+             {many:?}（D-83で配るのは`rwx`と`ro`の2本だが、書込権を持つのは`rwx`の1本だけの\
+             はずである。2本以上当たるなら絞り込みが実装とずれている）",
             many.len()
         )),
     }
 }
 
+/// [D-83] `0x20`（`FILE_EXECUTE`）**と**`0x2`（`FILE_WRITE_DATA`）の両方を持つ継承ACEだけを
+/// 拾う。前者だけだと`ro`のバッジまで当たる（`workspace_capability_sid`のdoc）。
+/// どちらも**原子ビット**であって複合マスクではない（BUG-048）。
 const WS_CAP_SID_SCRIPT: &str = "\
 @((Get-Acl -LiteralPath '@WS@').Access | \
   Where-Object { $_.IdentityReference.Value -like 'S-1-15-3-*' -and \
                  (([int]$_.InheritanceFlags -band 2) -eq 2) -and \
                  (([int]$_.FileSystemRights -band 0x20) -eq 0x20) -and \
+                 (([int]$_.FileSystemRights -band 0x2) -eq 0x2) -and \
                  ($_.AccessControlType -eq 'Allow') } | \
   ForEach-Object { $_.IdentityReference.Value }) -join \"`n\"";
 
