@@ -326,16 +326,6 @@ pub fn preflight_with_privhelper_launcher(
         workspace_mode,
     );
 
-    // D-54: workspaceツリーへ付けるACEの主体。**セッションのpackage SIDではなく、この
-    // workspace＋モードに固有のcapability SID**へ付ける。付与の形（どのツリーへ何を許すか）は
-    // workspaceとモードで決まるものであって、セッションの属性ではない——主体をその形に
-    // 合わせることで、26万ノードへの継承ACEの伝播を**ワークスペースにつき一度きり**にする
-    // （毎起動で払っていた実測60秒が消える、BUG-081）。名前はワークスペースごとのランダム
-    // 秘密から導出され、サンドボックスから読めない台帳にだけ存在する
-    // （`crate::tier2a::workspace_capability`のdoc）。
-    let workspace_cap = workspace_capability_sid(&canonical_workspace_root, workspace_mode)?;
-    let workspace_cap_psid = Some(workspace_cap.as_psid());
-
     // D-30: `write_mode`がACL付与方針を唯一決める。`match`を全分岐（`..`無し）にすることで、
     // `WorkspaceWriteMode`へバリアントを追加した際にACL決定漏れをコンパイルエラーにする。
     //
@@ -343,15 +333,8 @@ pub fn preflight_with_privhelper_launcher(
     // 責任を負う」という表明で、記録すると`end_session`/`gc_dead_sessions`がツリー全体の
     // `revoke_ace_recursive`（実測30.8秒）を回してしまう。capability宛のACEはセッションより
     // 長生きするのが仕様であり、撤収は`harness fs revoke-workspace`が明示的に行う。
-    let workspace_mask = match write_mode {
-        WorkspaceWriteMode::DirectRw => {
-            // 既定（D-29）。[BUG-082 Part B] rootへ継承ACEを1件、**伝播なし**で付けるだけ
-            // （`grant_workspace_root_rw_fast`のdoc）——既存子孫への伝播は`grant_job`の
-            // 背景フェーズへ委ねる。2回目以降の起動は冪等スキップでWin32書込0回。
-            grant_workspace_root_rw_fast(workspace_root, workspace_cap.as_psid())?;
-            timing.mark("grant_workspace_root_rw_fast(workspace_root)");
-            workspace_rwx_mask()
-        }
+    let workspace_acl_mode = match write_mode {
+        WorkspaceWriteMode::DirectRw => WorkspaceAclMode::Rwx,
         WorkspaceWriteMode::Cow { diff_layer_dir } => {
             // **ACLを保持できないボリュームでは、そもそも境界を張れない**（D-81）。
             // 下の`grant_*`は失敗しないまま何も強制しないことがあり得るので、付ける前に
@@ -362,7 +345,6 @@ pub fn preflight_with_privhelper_launcher(
             // `--sandbox tier2a-cow`（D-30）。workspaceはRead/Execute/Traverseのみ（D-13と同じ関数）。
             // Redirector DLLが無効・回避されても、この時点でACLがROである限り
             // workspace本体への書込は`ACCESS_DENIED`でfail-closeする。
-            grant_workspace_root_ro_fast(workspace_root, workspace_cap.as_psid())?;
             // diff_layer_dirは**セッション専有**（他セッションと共有しない）なので、主体は
             // 従来どおりセッションのpackage SIDのままにする。D-54が置き換えるのは
             // 「ワークスペースにつき一度きりで済むはずの付与」だけで、こちらは該当しない。
@@ -407,15 +389,25 @@ pub fn preflight_with_privhelper_launcher(
                     )
                 },
             )?;
-            fs_access_mask(FsAccess::ReadExec)
+            WorkspaceAclMode::ReadOnly
         }
     };
-    // D-05/D-09の層3。剥がす主体は**capability SID（今の継承元）とpackage SID（D-37時代の
-    // 残骸）の両方**——片方だけだと剥がし残した側から制御面が書ける（`revoke.rs`のdoc参照）。
-    let protected_nodes = protect_harness_control_dir_from_appcontainer(
-        workspace_root,
-        &[workspace_cap.as_psid(), sid.as_psid()],
+    // 通常起動と`harness fs prepare-workspace`が、root付与・制御面保護・完走判定を同じ
+    // 実装で行う。package SIDはD-37時代の残骸も`.harness/**`から剥がすため追加する。
+    let session_sid_copy = unsafe { crate::win_common::OwnedSid::copy_from(sid.as_psid()) }
+        .map_err(|e| {
+            AppContainerError::Preflight(format!(
+                "failed to copy the session SID for workspace preparation: {e}"
+            ))
+        })?;
+    let workspace_preparation = workspace_prepare::plan_workspace_preparation(
+        &canonical_workspace_root,
+        workspace_acl_mode,
+        vec![session_sid_copy],
     )?;
+    let workspace_cap_psid = Some(workspace_preparation.capability_sid());
+    let needs_descendant_fix = workspace_preparation.needs_descendant_fix();
+    let protected_nodes = workspace_preparation.protected_nodes();
     // [BUG-084] 件数を出す。層3のhard-denyは「1件も掛かっていない」が症状として現れない
     // （BUG-083はそれが恒常的に起きていた）ので、`HARNESS_PREFLIGHT_TIMING=1`で事後確認
     // できる形にしておく。
@@ -442,22 +434,6 @@ pub fn preflight_with_privhelper_launcher(
     // `.harness/`を外す集合は、下の`grant_job::start`へ渡す`skip`と**同じ値**でなければ
     // ならない——ジョブが意図的にACEを付けない場所を検算側が数えると、毎起動でジョブが
     // 回り続ける（`B-05`）。だから両者は同じ変数を読む。
-    let job_skip = vec![workspace_root.join(".harness")];
-    let unreachable_child =
-        top_level_child_missing_ace(workspace_root, workspace_cap.as_psid(), &job_skip);
-    let needs_descendant_fix = !crate::tier2a::workspace_capability::tree_is_verified(
-        &canonical_workspace_root,
-        workspace_mode,
-    ) || unreachable_child.is_some();
-    // 記録は「検証済み」なのに実体が届いていない、は**説明の要る状態**である（B-10:
-    // 無言で直さない）。ジョブを回して直すが、直したこと自体は残す。
-    if let Some(child) = &unreachable_child {
-        timing.mark(&format!(
-            "workspace ACL re-check: {} is not reachable by the workspace capability",
-            child.display()
-        ));
-    }
-
     // workspace_root（Cow時はdiff_layer_dirも）の祖先traverseチェーンが不足していないか事前に判定する
     // （読み取り専用、UAC無し）。不足分は下のfs-allow昇格要求と合流させ、1回のprivhelper呼び出し
     // （起動あたりUAC最大1回）で解消する。以前はtraverse不足を`smoke_test_spawn`（下記）が
@@ -1009,36 +985,7 @@ pub fn preflight_with_privhelper_launcher(
     // 保護DACL配下だけである。子プロセスを起動する経路は`grant_job::wait_until_done`で
     // 完了を待つ（待たずに走らせると、モデルには「そのファイルは無い」と見える）。
     if needs_descendant_fix {
-        // [BUG-082 Part B] 背景フェーズが行う伝播はrootへの継承ACE伝播である。BUG-083の修正で
-        // `.harness/`の保護が実際に効くようになり、この伝播はOS側で`.harness/`の手前で止まるが、
-        // 保護が止められるのは**継承経由の伝播だけ**なので、保護前から物理コピーとして乗っていた
-        // ACEやD-37時代のpackage SID残骸に備えて背景側でも剥がし直す（第2の防御）。ここで渡す
-        // `.harness/`再保護用のSIDは、上の
-        // 同期`protect_harness_control_dir_from_appcontainer`呼び出しと**同じ集合**
-        // （workspace capability＋セッションSID）にする——片方だけだと剥がし残した側から
-        // 制御面が書けるのは同期区間と同じ理屈（`revoke.rs`のdoc参照）。`workspace_cap`は
-        // このすぐ後で`grant_job::start`へ移動するため、先にコピーを取っておく。
-        let session_sid_copy = unsafe { crate::win_common::OwnedSid::copy_from(sid.as_psid()) }
-            .map_err(|e| {
-                AppContainerError::Preflight(format!(
-                    "failed to copy the session SID for background .harness re-protection: {e}"
-                ))
-            })?;
-        let harness_protect_sids = vec![workspace_cap.clone(), session_sid_copy];
-
-        // 戻り値の`false`は「このプロセスでは既に別のジョブが走っている」＝`preflight`が2回
-        // 呼ばれた場合だけで、製品では起こらない（実機テストが同居するときだけ）。
-        let started = grant_job::start(
-            workspace_root,
-            workspace_cap,
-            workspace_mask,
-            harness_protect_sids,
-            // 上の`top_level_child_missing_ace`と**同じ集合**（`B-05`。ここがずれると、
-            // ジョブが意図的に外した場所を検算側が数えて毎起動でジョブが回る）。
-            job_skip,
-            &canonical_workspace_root,
-            workspace_mode,
-        );
+        let started = workspace_preparation.start();
         timing.mark(&format!(
             "grant_job::start (background propagate + descendant fix-up, started={started})"
         ));
@@ -1058,7 +1005,10 @@ pub fn preflight_with_privhelper_launcher(
 /// [`crate::session_scope::persistent_acl_gate`]が持つ純関数で、ここはボリュームの採取と
 /// エラー型への変換だけを行う。**採取と判定を分ける**のは、判定側を`cargo test`で
 /// 検算できるようにするためである。
-fn require_persistent_acl_volume(what: &str, path: &Path) -> Result<(), AppContainerError> {
+pub(super) fn require_persistent_acl_volume(
+    what: &str,
+    path: &Path,
+) -> Result<(), AppContainerError> {
     let mount = crate::win_common::volume_mount_point_of(path);
     let probe = mount
         .as_deref()

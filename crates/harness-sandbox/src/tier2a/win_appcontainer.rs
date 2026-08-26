@@ -408,10 +408,13 @@ mod acl_dacl_write;
 /// ——`start`/`progress`/`wait_until_done`という短い名前は、それだけでは何のジョブか
 /// 分からないため（`grant_job::wait_until_done()`と書けば分かる）。
 pub mod grant_job;
+/// workspace capability ACE の準備本体。通常preflightと明示的な前払いCLIが共有する。
+mod workspace_prepare;
 /// Tier2a子を起こすまでの前口上（主体の導出・背景walkの待ち・spawn）。`run_shell`と
 /// ポリシーエディタのパス2が共有する（モジュールdoc参照）。
 mod launch;
 mod mcp_preflight;
+mod native_path_policy;
 /// fs passthrough付与の進捗（同期区間からUIへ届ける唯一の口、`grant_job`と同じ形）。
 pub mod passthrough_progress;
 mod preflight;
@@ -430,6 +433,7 @@ mod traverse;
 pub use acl_grant::*;
 pub use launch::*;
 pub use mcp_preflight::*;
+pub use native_path_policy::*;
 pub use preflight::*;
 pub(crate) use preflight_probe::*;
 pub use revoke::*;
@@ -437,6 +441,10 @@ pub use revoke_subjects::*;
 pub use spawn::*;
 pub use spawn_session::*;
 pub use traverse::*;
+pub use workspace_prepare::{
+    start_workspace_preparation, workspace_preparation_state, WorkspaceAclMode,
+    WorkspacePreparationLaunch, WorkspacePreparationState,
+};
 
 // --- テスト群（実Win32・実AppContainerを使う重い回帰テストのため別ファイル） ---
 //
@@ -585,6 +593,20 @@ mod unc_reach_spike_tests;
 /// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
 #[cfg(all(windows, test))]
 mod acl_baseline_cost_tests;
+
+/// workspace ACLの支払時点を比べる継続測定。作成時継承を無料と仮定せず、生成基準線・
+/// root ACE設置後の生成・完成後伝播をランダム順に反復する。**非昇格**。
+#[cfg(all(windows, test))]
+mod acl_payment_model_tests;
+
+/// 作成時継承案の適用範囲を、実git worktree・build生成物・move-in・保護DACL・reparse pointで
+/// 確認する真偽テスト。**非昇格**。
+#[cfg(all(windows, test))]
+mod acl_creation_inheritance_eligibility_tests;
+
+/// `harness fs prepare-workspace`が使う共有準備本体の実Win32回帰。**非昇格**。
+#[cfg(all(windows, test))]
+mod workspace_prepare_tests;
 
 /// **遅延実体化（JIT）でACEを1件ずつ配るときの1件あたり費用**
 /// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」1番）。

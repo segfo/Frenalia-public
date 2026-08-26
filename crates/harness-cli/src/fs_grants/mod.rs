@@ -6,8 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 
+mod prepare;
 mod progress;
 mod prune;
 mod revoke;
@@ -25,6 +26,7 @@ pub(crate) use harness_sandbox::tier2a::fs_passthrough_ledger::*;
 pub use harness_sandbox::tier2a::fs_passthrough_ledger::{
     record_fs_passthrough_denied, record_fs_passthrough_grant,
 };
+pub(crate) use prepare::fs_prepare_workspace;
 pub(crate) use prune::fs_prune;
 pub use revoke::reconcile_fs_ledger_for_workspace;
 pub(crate) use revoke::*;
@@ -40,6 +42,14 @@ pub enum FsAction {
     List,
     /// 到達不能/付与失敗だったfs passthrough候補だけを一覧表示する。
     Denied,
+    /// workspaceのAppContainer用ACEを作業開始前に準備する。通常起動と同じ永続capability・
+    /// 伝播・救済walkを使い、完了まで進捗を表示する。
+    PrepareWorkspace {
+        path: PathBuf,
+        /// `rwx`は通常Tier2a、`ro`はTier2a CoWの実workspaceと同じ権限。
+        #[arg(long, value_enum)]
+        mode: WorkspacePrepareMode,
+    },
     /// 指定ルートのfs passthroughを撤収する（再walk revoke + 検証パス + 台帳から除去、D3/D4）。
     Revoke { path: PathBuf },
     /// 台帳の全エントリを撤収する。
@@ -131,17 +141,37 @@ pub fn run_fs_subcommand(action: FsAction) -> ExitCode {
                     println!("(none)");
                 }
                 for e in &workspace_ledger.entries {
+                    use harness_sandbox::tier2a::win_appcontainer::{
+                        workspace_preparation_state, WorkspaceAclMode, WorkspacePreparationState,
+                    };
                     let live = harness_sandbox::tier2a::workspace_ledger::live_modes(
                         &PathBuf::from(&e.path),
                     );
-                    let status = if live.is_empty() {
+                    let use_status = if live.is_empty() {
                         "idle".to_string()
                     } else {
                         format!("in use: {}", live.join(", "))
                     };
+                    let preparation = match e.mode.as_str() {
+                        "rwx" => Some(WorkspaceAclMode::Rwx),
+                        "ro" => Some(WorkspaceAclMode::ReadOnly),
+                        _ => None,
+                    }
+                    .map(|mode| workspace_preparation_state(&PathBuf::from(&e.path), mode));
+                    let preparation_status = match preparation {
+                        Some(Ok(WorkspacePreparationState::Unprepared)) => "unprepared".to_string(),
+                        Some(Ok(WorkspacePreparationState::Preparing)) => "preparing".to_string(),
+                        Some(Ok(WorkspacePreparationState::Ready)) => "ready".to_string(),
+                        Some(Ok(WorkspacePreparationState::Stale)) => "stale".to_string(),
+                        Some(Ok(WorkspacePreparationState::Failed(reason))) => {
+                            format!("failed: {reason}")
+                        }
+                        Some(Err(reason)) => format!("stale: {reason}"),
+                        None => "stale: unknown mode".to_string(),
+                    };
                     println!(
-                        "{}\tmode={}\tgranted_at_unix={}\t{status}",
-                        e.path, e.mode, e.granted_at_unix_secs
+                        "{}\tmode={}\tgranted_at_unix={}\tpreparation={}\t{use_status}",
+                        e.path, e.mode, e.granted_at_unix_secs, preparation_status
                     );
                 }
             }
@@ -170,6 +200,7 @@ pub fn run_fs_subcommand(action: FsAction) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        FsAction::PrepareWorkspace { path, mode } => fs_prepare_workspace(&path, mode),
         FsAction::Revoke { path } => fs_revoke_one(&path),
         FsAction::RevokeAll => fs_revoke_all(),
         FsAction::Prune { dry_run } => fs_prune(dry_run),
@@ -201,5 +232,58 @@ pub fn run_fs_subcommand(action: FsAction) -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WorkspacePrepareMode {
+    Rwx,
+    Ro,
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn workspace_prepare_modes_use_the_public_rwx_and_ro_vocabulary() {
+        assert_eq!(WorkspacePrepareMode::value_variants().len(), 2);
+        assert_eq!(
+            WorkspacePrepareMode::Rwx
+                .to_possible_value()
+                .unwrap()
+                .get_name(),
+            "rwx"
+        );
+        assert_eq!(
+            WorkspacePrepareMode::Ro
+                .to_possible_value()
+                .unwrap()
+                .get_name(),
+            "ro"
+        );
+    }
+
+    #[test]
+    fn prepare_workspace_is_wired_into_the_real_cli_and_unknown_modes_are_rejected() {
+        crate::cli::Cli::try_parse_from([
+            "harness",
+            "fs",
+            "prepare-workspace",
+            r"C:\work",
+            "--mode",
+            "ro",
+        ])
+        .expect("public prepare-workspace spelling must parse");
+        assert!(crate::cli::Cli::try_parse_from([
+            "harness",
+            "fs",
+            "prepare-workspace",
+            r"C:\work",
+            "--mode",
+            "rw",
+        ])
+        .is_err());
     }
 }

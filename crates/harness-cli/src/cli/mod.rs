@@ -362,6 +362,9 @@ pub(crate) enum Commands {
 /// Windows以外ではエラーで終了する（`harness tier3`と同じ扱い）。
 #[derive(Subcommand)]
 pub(crate) enum Tier2aAction {
+    /// OSネイティブ・パス制御の実験contractを副作用無しでprobeする。exportの有無だけでなく、
+    /// runtime capability query（無い過渡期buildでは失敗専用create call）まで行う。
+    NativePathSupport,
     /// 死んだセッションが残したAppContainerプロファイルとACEを回収する。
     ///
     /// 通常はharnessの起動時（preflight）に同じ処理が走るが、**harnessを起動せずに

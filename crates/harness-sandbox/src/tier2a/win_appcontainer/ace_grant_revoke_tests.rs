@@ -1033,6 +1033,7 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
         vec![root.join(".harness")],
         &root,
         "rwx",
+        "test-generation",
     );
     if !started {
         eprintln!(
