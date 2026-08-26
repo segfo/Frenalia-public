@@ -210,15 +210,47 @@ mod workspace_mode_mask_tests {
     ///
     /// 対で見る（`B-35`）——`ro`に書込ビットが無いことだけを測ると、**両方のマスクが
     /// 読取専用になった実装**でも緑になる（そのときworkspaceは誰からも書けなくなる）。
+    ///
+    /// # **複合マスクで測らない**（[BUG-048]と同じ罠）
+    ///
+    /// この検査を`ro & FILE_GENERIC_WRITE.0 == 0`と書くと**実装が正しくても落ちる**。
+    /// `FILE_GENERIC_WRITE`と`FILE_GENERIC_READ`は`READ_CONTROL`(`0x0002_0000`)と
+    /// `SYNCHRONIZE`(`0x0010_0000`)を**共有している**ので、読取専用のマスクと
+    /// ANDを取っても`0x0012_0000`が残る。「読めるだけのACEを書込扱いする」この誤判定は
+    /// [BUG-048]で実際に踏んでおり、`elevated_launch`の`DANGEROUS_WRITE_BITS`が
+    /// 同じ理由で個別ビットを明示列挙している。**だからここも原子ビットで測る。**
+    ///
+    /// [BUG-048]: ../../../../docs/bugs/BUG-048.md
     #[test]
     fn only_the_rwx_badge_carries_the_write_and_delete_bits() {
         let rwx = workspace_mode_mask(WorkspaceMode::Rwx);
         let ro = workspace_mode_mask(WorkspaceMode::Ro);
 
-        for (bit, name) in [(FILE_GENERIC_WRITE.0, "write"), (DELETE.0, "delete")] {
+        // `elevated_launch::DANGEROUS_WRITE_BITS`と同じ列挙（あちらは「非管理者が差し替え
+        // られるか」を測る別の問いなので、定数は共有せず綴りだけ揃える）。
+        for (bit, name) in [
+            (0x0000_0002u32, "FILE_WRITE_DATA"),
+            (0x0000_0004, "FILE_APPEND_DATA"),
+            (0x0000_0010, "FILE_WRITE_EA"),
+            (0x0000_0100, "FILE_WRITE_ATTRIBUTES"),
+            (DELETE.0, "DELETE"),
+        ] {
             assert_eq!(rwx & bit, bit, "the rwx badge must carry {name}");
-            assert_eq!(ro & bit, 0, "the ro badge must not carry any {name} bit");
+            assert_eq!(ro & bit, 0, "the ro badge must not carry {name}");
         }
+    }
+
+    /// 上のテストが**複合マスクで書かれていたら落ちる**ことを、その場で示す。
+    ///
+    /// これは実装ではなく**測り方**を固定するテストである（[BUG-048]の再発防止）。
+    /// 「読取専用マスクと`FILE_GENERIC_WRITE`のANDは0ではない」を明示的に記録しておくと、
+    /// 次に誰かが「素直に複合マスクで測ればいいのでは」と書き直したときに、ここが
+    /// **なぜそうしないのか**を答える。
+    #[test]
+    fn a_read_only_mask_still_shares_bits_with_the_composite_write_mask() {
+        let ro = workspace_mode_mask(WorkspaceMode::Ro);
+        // READ_CONTROL | SYNCHRONIZE。これが「roは書ける」の誤読を生む。
+        assert_eq!(ro & FILE_GENERIC_WRITE.0, 0x0012_0000);
     }
 
     /// 読める・実行できるのは**両方**。`ro`のバッジで読めなくなると、CoWセッションから
