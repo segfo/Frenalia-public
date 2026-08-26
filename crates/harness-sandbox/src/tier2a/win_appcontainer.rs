@@ -601,6 +601,14 @@ mod jit_grant_cost_tests;
 #[cfg(all(windows, test))]
 mod fs_creation_inheritance_cost_tests;
 
+/// **T-5: ブローカーが「開いたハンドル」を手渡す形の1件あたり費用**
+/// （`plans/handoff/fs-boundary-cost/T-5.md`）。ACEを書く代わりに、親が`CreateFileW`して
+/// `DuplicateHandle`で子へ渡す案の値段を、**AppContainerの子から親への本物のプロセス境界**で
+/// 測る。あわせて§S13の腕B・腕C（同一プロセス内スレッド間＝過小評価）を跨ぎで測り直す。
+/// **非昇格で回す**。**判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod broker_handoff_cost_tests;
+
 /// **制限SID（`SidsToRestrict`）を指定したトークンで非管理者のまま子を起こせるか**
 /// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」5番＝案A-3の前提）。
 /// BUG-003が確かめた特権免除の特例は制限SIDが`None`のときの実測なので、非空でも

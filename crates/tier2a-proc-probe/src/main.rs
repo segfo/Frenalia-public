@@ -33,6 +33,7 @@ mod winid;
 // いずれも通常の検査（FS・脱走・ネット・再帰spawn）を行わない短絡モードで、
 // `try_runas`・`load_library`と同じ位置付け。判定が出たら削除する
 // （`docs/CODE-STRUCTURE-RULES.md`規則2「一回性の調査実験をテストとして残さない」）。
+mod broker_bench;
 mod object_reach;
 mod pipe_client;
 mod spawn_matrix;
@@ -83,6 +84,10 @@ struct Args {
     use_process_handle: Option<usize>,
     /// MAC設計§10.1: 要求受付パイプへクライアントとして接続し1往復する。
     pipe_client: Option<String>,
+    /// **T-5**（`plans/handoff/fs-boundary-cost/T-5.md`）: 要求受付パイプへ接続し、
+    /// 計画ファイルに書かれた腕を順に回して1件あたりの費用を測る。
+    /// `(パイプ名, 計画ファイルのパス)`。
+    broker_bench: Option<(String, String)>,
     /// 上記スパイクモードが結果を書き出すファイル（stdoutを読み切れない経路のため）。
     report_file: Option<String>,
     /// スパイクモードが「生きたまま待つ」秒数（`hold_file`と単独指定時のアイドル）。
@@ -109,6 +114,7 @@ fn parse_args() -> Args {
     let mut emit = None;
     let mut use_process_handle = None;
     let mut pipe_client = None;
+    let mut broker_bench = None;
     let mut report_file = None;
     let mut idle_secs = None;
 
@@ -176,6 +182,18 @@ fn parse_args() -> Args {
             "--emit" => emit = Some(next()),
             "--use-process-handle" => use_process_handle = next().parse().ok(),
             "--pipe-client" => pipe_client = Some(next()),
+            // T-5: `--broker-bench <パイプ名> --broker-plan <計画ファイル>`。
+            // 2つ揃って初めてモードが立つ（片方だけでは腕が決まらない）。
+            "--broker-bench" => {
+                let pipe = next();
+                broker_bench = Some((pipe, String::new()));
+            }
+            "--broker-plan" => {
+                let plan = next();
+                if let Some((pipe, _)) = broker_bench.take() {
+                    broker_bench = Some((pipe, plan));
+                }
+            }
             "--report-file" => report_file = Some(next()),
             "--idle-secs" => idle_secs = next().parse().ok(),
             _ => {}
@@ -202,6 +220,7 @@ fn parse_args() -> Args {
         emit,
         use_process_handle,
         pipe_client,
+        broker_bench,
         report_file,
         idle_secs,
     }
@@ -567,6 +586,15 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("use_process_handle report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some((pipe, plan)) = &args.broker_bench {
+        let report = broker_bench::run(pipe, plan, args.report_file.as_deref());
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("broker_bench report must serialize")
         );
         return ExitCode::SUCCESS;
     }
