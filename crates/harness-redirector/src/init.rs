@@ -499,6 +499,11 @@ pub extern "system" fn harness_cow_build_id() -> *const u8 {
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
 extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c_void) -> i32 {
+    // 分流 U-1 の計装（`fscost`）: プロセスが終わる瞬間に、このプロセスが数えたぶんを書き出す。
+    // 既定（環境変数が無い）では `dump` が即座に戻るので、製品の終了経路には何も足さない。
+    if reason == DLL_PROCESS_DETACH && fscost::count_only() {
+        fscost::dump("detach");
+    }
     if reason == DLL_PROCESS_ATTACH {
         let _ = SELF_MODULE.set(_hinst.0 as usize);
         // Loader Lock回避（設計書§13.4）: `DllMain`内でフック設置を完結させず、専用スレッドへ

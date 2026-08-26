@@ -129,7 +129,7 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::ProcessStatus::{
     EnumProcessModulesEx, GetModuleFileNameExW, LIST_MODULES_ALL,
 };
-use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
+use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
 use windows::Win32::System::Threading::{
     CreateRemoteThread, CreateThread, GetCurrentProcessId, GetExitCodeThread, ResumeThread,
     WaitForSingleObject, PROCESS_INFORMATION, STARTUPINFOA, THREAD_CREATION_FLAGS,
@@ -159,6 +159,10 @@ use windows::Win32::System::IO::IO_STATUS_BLOCK;
 mod config;
 mod dir_merge;
 mod file_hooks;
+// **分流 U-1 の使い捨て計装**（`plans/handoff/fs-boundary-cost/U-1.md`、合流時に消す）。
+// `HARNESS_FSCOST_COUNT_DIR` が設定されたときだけ動く観測モードで、既定では
+// `fscost::count_only()` が `false` を返すだけ＝製品の挙動に影響しない。
+mod fscost;
 mod init;
 mod inject;
 mod ledger;

@@ -30,6 +30,30 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
                 kind,
             }) = classify_target(cfg, &path)
             {
+                // 分流 U-1 の計装: 数えるだけで誘導しない（`fscost` モジュールdoc）。
+                if fscost::count_only() {
+                    fscost::record(kind, &rel_str, fscost::Op::Open);
+                    let hook = CREATE_FILE_HOOK.get().expect("hook installed");
+                    let status = unsafe {
+                        hook.call(
+                            file_handle,
+                            desired_access,
+                            object_attributes,
+                            io_status_block,
+                            allocation_size,
+                            file_attributes,
+                            share_access,
+                            create_disposition,
+                            create_options,
+                            ea_buffer,
+                            ea_length,
+                        )
+                    };
+                    // 対応表だけは維持する——`RootDirectory`相対（openat方式）のパス解決が
+                    // これを引くので、切ると相対オープンを1件も数えられなくなる。
+                    track_new_handle(file_handle, status, &rel_str, create_options.0);
+                    return status;
+                }
                 let rel_lower = rel_str.to_ascii_lowercase();
                 let is_probe =
                     rel_lower.contains("test.txt") || rel_lower.contains("grandchild");
@@ -318,6 +342,23 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
                 kind,
             }) = classify_target(cfg, &path)
             {
+                // 分流 U-1 の計装（`hooked_nt_create_file` と同じ理由）。
+                if fscost::count_only() {
+                    fscost::record(kind, &rel_str, fscost::Op::Open);
+                    let hook = OPEN_FILE_HOOK.get().expect("hook installed");
+                    let status = unsafe {
+                        hook.call(
+                            file_handle,
+                            desired_access,
+                            object_attributes,
+                            io_status_block,
+                            share_access,
+                            open_options,
+                        )
+                    };
+                    track_new_handle(file_handle, status, &rel_str, open_options);
+                    return status;
+                }
                 let rel_lower = rel_str.to_ascii_lowercase();
                 let is_probe =
                     rel_lower.contains("test.txt") || rel_lower.contains("grandchild");
@@ -610,6 +651,19 @@ pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
     length: u32,
     file_information_class: FILE_INFORMATION_CLASS,
 ) -> NTSTATUS {
+    // 分流 U-1 の計装: 観測モードでは削除予約もリネーム書換も行わない（素通し）。
+    if fscost::count_only() {
+        let hook = SET_INFO_HOOK.get().expect("hook installed");
+        return unsafe {
+            hook.call(
+                file_handle,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+            )
+        };
+    }
     if let Some(_guard) = ReentryGuard::try_acquire() {
         if let Some(cfg) = CONFIG.get() {
             let handle_key = file_handle.0 as isize;
@@ -660,6 +714,18 @@ pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
 }
 
 pub(crate) unsafe extern "system" fn hooked_nt_close(handle: HANDLE) -> NTSTATUS {
+    // 分流 U-1 の計装: 台帳へは書かないが、対応表からの取り除きだけは続ける
+    // （やめると `handle_paths` が際限なく膨らみ、ハンドル値の再利用で誤解決する）。
+    if fscost::count_only() {
+        if let Some(_guard) = ReentryGuard::try_acquire() {
+            let key = handle.0 as isize;
+            handle_paths().lock().unwrap().remove(&key);
+            delete_pending().lock().unwrap().remove(&key);
+            dir_query_cursor().lock().unwrap().remove(&key);
+        }
+        let hook = CLOSE_HOOK.get().expect("hook installed");
+        return unsafe { hook.call(handle) };
+    }
     if let Some(_guard) = ReentryGuard::try_acquire() {
         if let Some(cfg) = CONFIG.get() {
             let key = handle.0 as isize;
@@ -692,6 +758,14 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_full_attributes_file(
                 kind,
             }) = classify_target(cfg, &path)
             {
+                // 分流 U-1 の計装。**この2本（`NtQueryAttributesFile`・
+                // `NtQueryFullAttributesFile`）はハンドル手渡しでは埋まらない側**（T-5 §3-5）
+                // なので、開く操作とは別に数える。
+                if fscost::count_only() {
+                    fscost::record(kind, &rel_str, fscost::Op::Attr);
+                    let hook = QUERY_FULL_ATTR_HOOK.get().expect("hook installed");
+                    return unsafe { hook.call(object_attributes, file_information) };
+                }
                 // 差分層配下の実体そのものへの照会は、見せ方を変えない（素通し）。
                 if kind == TargetKind::DiffLayerAlias {
                     let hook = QUERY_FULL_ATTR_HOOK.get().expect("hook installed");
@@ -758,6 +832,12 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_attributes_file(
                 kind,
             }) = classify_target(cfg, &path)
             {
+                // 分流 U-1 の計装（`hooked_nt_query_full_attributes_file` と同じ理由）。
+                if fscost::count_only() {
+                    fscost::record(kind, &rel_str, fscost::Op::Attr);
+                    let hook = QUERY_ATTR_HOOK.get().expect("hook installed");
+                    return unsafe { hook.call(object_attributes, file_information) };
+                }
                 // 差分層配下の実体そのものへの照会は、見せ方を変えない（素通し）。
                 if kind == TargetKind::DiffLayerAlias {
                     let hook = QUERY_ATTR_HOOK.get().expect("hook installed");
