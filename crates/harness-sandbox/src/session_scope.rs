@@ -633,17 +633,18 @@ pub fn prepare_scope(workspace_root: &Path, scope: &SessionScope) -> Result<usiz
     // ディレクトリは保護済みの`.harness/`から継承するのでAppContainer宛ACEを持たない。
     #[cfg(windows)]
     if scope.cow_diff_layer_dir.is_some() {
-        // D-82: **実体を作ってから生存マーカーを確保するまでをGCのロックで囲む。**
-        // この区間の差分層は「在るのに生きている印が無い」ので、並行して走る別の
-        // `harness.exe`のGCからは空の殻に見える。`preflight`の起動経路にも同じ囲いがあり、
-        // **両方に入れて初めて直列化が成立する**（片側だけでは何も守らない）。
-        return harness_grant_ledger::with_named_lock(
-            crate::tier2a::workspace_ledger::COW_GC_LOCK_NAME,
-            || {
-                create_overlay_dir(&dir)?;
-                prepare_cow_diff_layer(workspace_root, scope, &dir)
-            },
-        );
+        // [D-82] **生存マーカーを、差分層の実体より先に握る。**
+        //
+        // 逆順（実体→マーカー）だと「フォルダは在るが生きている印がまだ無い」区間ができ、
+        // 並行して走る別の`harness.exe`のGCからは**空の殻と区別が付かない**。かつては
+        // その区間をGCのロックで囲み、さらに「作りたては回収しない」猶予を二重の網として
+        // 置いていたが、**順序を入れ替えれば守るべき区間そのものが存在しない**ので
+        // どちらも撤去した（`workspace_ledger::cow_session_is_live`のdoc）。
+        //
+        // **作る側は2経路ある**（ここと`win_appcontainer::preflight`）。順序を各経路が自前で
+        // 書くと片方だけ直って窓が残るので、**順序は`claim_cow_diff_layer`が1つだけ持つ**。
+        crate::tier2a::workspace_ledger::claim_cow_diff_layer(&scope.session_id, &dir)?;
+        return prepare_cow_diff_layer(workspace_root, scope, &dir);
     }
     create_overlay_dir(&dir)?;
     Ok(1)
@@ -701,11 +702,12 @@ fn prepare_cow_diff_layer(
     // （`preflight`が起動時に書くのと同じもの。切替後の差分層にも要る）。
     workspace_ledger::write_cow_session_meta(diff_layer_dir, workspace_root, &scope.session_id);
 
-    // 生存マーカー。切替**前**のセッションのマーカーはプロセス終了まで保持したままにする
-    // ——`harness cow discard`等が「まだ使われているか」を判定する材料であり、切り戻す
+    // 生存マーカーは**呼び出し元`prepare_scope`が実体より先に握っている**（D-82）。ここへ
+    // 戻さないこと——順序が逆になった瞬間、他プロセスのGCから見える無主物の区間が復活する。
+    //
+    // 切替**前**のセッションのマーカーはプロセス終了まで保持したままにする——
+    // `harness cow discard`等が「まだ使われているか」を判定する材料であり、切り戻す
     // 可能性のあるオーバーレイを回収可能に見せない方が安全側（B-16）。
-    workspace_ledger::hold_cow_session_marker(&scope.session_id)
-        .map_err(|e| format!("could not create the CoW session marker: {e}"))?;
     Ok(1)
 }
 

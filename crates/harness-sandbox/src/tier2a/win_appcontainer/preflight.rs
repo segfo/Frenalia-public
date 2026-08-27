@@ -438,46 +438,48 @@ pub fn preflight_with_privhelper_launcher(
             // 従来どおりセッションのpackage SIDのままにする。D-54が置き換えるのは
             // 「ワークスペースにつき一度きりで済むはずの付与」だけで、こちらは該当しない。
             //
-            // **ここから生存マーカーの確保までをGCのロックで囲む**（D-82）。この区間は
-            // 「ディレクトリは在るが生存マーカーはまだ無い」状態で、並行して走る別の
-            // `harness.exe`のGCから見ると**空の殻**と区別が付かない。囲まないと、
-            // 起動しかけのセッションの差分層が他プロセスに消される
-            // （`workspace_ledger::COW_GC_LOCK_NAME`のdoc、`shared-state-exclusion` 問1）。
+            // [D-82] **生存マーカーを、差分層の実体より先に握る。**
+            //
+            // 逆順（実体→マーカー）だと「ディレクトリは在るが生存マーカーはまだ無い」区間が
+            // でき、並行して走る別の`harness.exe`のGCから見ると**空の殻**と区別が付かない。
+            // かつてはその区間をGCのロックで囲み、さらに「作りたては回収しない」猶予を
+            // 二重の網として置いていたが、**順序を入れ替えれば守るべき区間そのものが存在しない**
+            // ので、どちらも撤去した（`workspace_ledger::cow_session_is_live`のdoc）。
+            //
+            // **作る側は2経路ある**（ここと`session_scope::prepare_scope`）。片方だけ直しても
+            // もう片方の窓が残るので、順序を変えるときは必ず両方を見ること。
+            //
+            // CoWのdiff_layer_dirはセッション専有（他セッションと共有しない）なので、他モードとの
+            // 衝突チェックは不要。セッションID（diff_layer_dirの最終パス要素、
+            // `session_scope::cow_diff_layer_dir_in`参照）で名前を付けた生存マーカーだけを確保し、
+            // `harness cow discard`等が「まだこのセッションが動いているか」を判定できるようにする
+            // （`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md` Phase 6の前段）。
+            //
+            // **セッションIDが読めなければ失敗させる**（fail-closed）。既定値で代用すると
+            // 別々のセッションが**同じ名前のマーカーを共有**し、一方が生きているあいだ他方の
+            // 差分層まで「使用中」に見える（逆向きには、取り違えたまま回収されうる）。
             let session_id = diff_layer_dir
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("unknown-session");
-            harness_grant_ledger::with_named_lock(
-                crate::tier2a::workspace_ledger::COW_GC_LOCK_NAME,
-                || -> Result<(), AppContainerError> {
-                    std::fs::create_dir_all(diff_layer_dir)
-                        .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
-                    grant_ace_inheritable_rw(diff_layer_dir, sid.as_psid())?;
-                    crate::tier2a::session_profile::record_granted_path(diff_layer_dir);
-                    // `harness cow status`/`apply`/`list`がworkspace_rootを引けるよう、
-                    // diff_layer_dir自身に由来を記録する
-                    // （`workspace_ledger::write_cow_session_meta`のdoc参照）。
-                    crate::tier2a::workspace_ledger::write_cow_session_meta(
-                        diff_layer_dir,
-                        &canonical_workspace_root,
-                        session_id,
-                    );
-                    // CoWのdiff_layer_dirはセッション専有（他セッションと共有しない）なので、
-                    // 他モードとの衝突チェックは不要。セッションID（diff_layer_dirの最終パス要素、
-                    // `session_scope::cow_diff_layer_dir_in`参照）で名前を付けた生存マーカーだけを
-                    // 確保し、`harness cow discard`等が「まだこのセッションが動いているか」を
-                    // 判定できるようにする
-                    // （`plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`
-                    // Phase 6の前段）。
-                    crate::tier2a::workspace_ledger::hold_cow_session_marker(session_id).map_err(
-                        |e| {
-                            AppContainerError::Preflight(format!(
-                                "failed to create CoW session marker for {session_id}: {e}"
-                            ))
-                        },
-                    )
-                },
-            )?;
+                .ok_or_else(|| {
+                    AppContainerError::Preflight(format!(
+                        "cannot derive the CoW session id from {}: the diff layer directory has \
+                         no usable final path component, so its liveness marker cannot be named",
+                        diff_layer_dir.display()
+                    ))
+                })?;
+            crate::tier2a::workspace_ledger::claim_cow_diff_layer(session_id, diff_layer_dir)
+                .map_err(AppContainerError::Preflight)?;
+            grant_ace_inheritable_rw(diff_layer_dir, sid.as_psid())?;
+            crate::tier2a::session_profile::record_granted_path(diff_layer_dir);
+            // `harness cow status`/`apply`/`list`がworkspace_rootを引けるよう、
+            // diff_layer_dir自身に由来を記録する
+            // （`workspace_ledger::write_cow_session_meta`のdoc参照）。
+            crate::tier2a::workspace_ledger::write_cow_session_meta(
+                diff_layer_dir,
+                &canonical_workspace_root,
+                session_id,
+            );
         }
     }
     // D-05/D-09の層3。剥がす主体は**全モードのcapability SID（今の継承元）とpackage SID

@@ -200,8 +200,56 @@ pub fn hold_cow_session_marker(session_id: &str) -> windows::core::Result<()> {
     hold_mutex_for_process_lifetime(&cow_session_mutex_name(session_id))
 }
 
+/// [D-82] 差分層の置き場を、**このセッションのものとして確保してから作る**。
+///
+/// # 順序がこの関数の存在理由である
+///
+/// 生存マーカーを先に握り、**その後で**ディレクトリを作る。逆順だと「ディレクトリは在るが
+/// 生存マーカーはまだ無い」区間ができ、並行して走る別の`harness.exe`のGCからは
+/// **空の殻と区別が付かない**——起動しかけのセッションの差分層が消される。
+///
+/// # なぜ順序を各経路に書かせないのか
+///
+/// **作る側は2経路ある**（`win_appcontainer::preflight`の通常起動と、
+/// `session_scope::prepare_scope`のセッション切替・fork）。順序を各経路が自前で書くと、
+/// 片方だけ直って**もう片方に窓が残る**——実際、かつてはその窓を塞ぐためにGCのロックと
+/// 「作りたては見送る」猶予が足されていた。**順序はここが1つだけ持つ**（`B-06`）。
+///
+/// マーカーを握れなければディレクトリを作らずに戻る（fail-closed）。握らずに実体を作ると、
+/// その差分層は他プロセスから見て**持ち主のいない空フォルダ**になる。
+///
+/// ディレクトリ作成に失敗しても、握ったマーカーは解放しない。GCは**実在するフォルダを
+/// 列挙してから**判定するので、フォルダの無いマーカーは視界に入らない（プロセス終了で
+/// OSが解放する）。
+pub fn claim_cow_diff_layer(session_id: &str, diff_layer_dir: &Path) -> Result<(), String> {
+    hold_cow_session_marker(session_id)
+        .map_err(|e| format!("failed to create CoW session marker for {session_id}: {e}"))?;
+    std::fs::create_dir_all(diff_layer_dir).map_err(|e| {
+        format!(
+            "could not create the CoW diff layer directory {}: {e}",
+            diff_layer_dir.display()
+        )
+    })
+}
+
 /// そのセッションのCoW diff_layer_dirがまだ使用中（＝そのセッションのharnessプロセスが
 /// 生きている）かどうか。
+///
+/// # [D-82] これが「起動しかけを消さない」を単独で成立させている
+///
+/// **差分層の実体より先にマーカーを握る**ので（[`hold_cow_session_marker`]の呼び出し元:
+/// `win_appcontainer::preflight`と`session_scope::prepare_scope`の2経路）、
+/// **他プロセスのGCから差分層が見えた時点では必ずマーカーが立っている**。
+/// だから「マーカーが無い＝もう誰も使っていない」を、窓を気にせず信用してよい。
+///
+/// マーカーはプロセス終了で**OSが解放する**ので、クラッシュ・強制終了でも嘘をつかない
+/// （`shared-state-exclusion` 問2の原則: 生存判定は持ち主が消えたら自動で解放されるものへ預ける）。
+///
+/// **これが置き換えたのは「作りかけとの競合」だけである。** 回収してよいかの判定は
+/// [`plan_cow_gc`]が5段で持っており、マーカーはその1段目にすぎない。
+/// **マーカーの生死だけで回収すると、落ちたセッションの未適用の変更が消える**
+/// ——クラッシュしたセッションはマーカーが消えているので1段目を必ず通るが、
+/// 差分層には適用前の作業が丸ごと残っている。
 pub fn cow_session_is_live(session_id: &str) -> bool {
     mutex_exists(&cow_session_mutex_name(session_id))
 }
@@ -495,23 +543,19 @@ pub fn prune_cow_ledger(diff_layer_dir: &Path, applied_paths: &[String]) -> std:
 
 // --- 差分層の回収（GC、D-82） -----------------------------------------------------------
 
-/// 「差分層を作る」と「差分層を掃く」を直列化するロックの名前。
-///
-/// **両側で取らなければ意味が無い。** `preflight`（と`session_scope`の切替経路）は
-/// `create_dir_all(差分層)` → ACE付与 → メタ書込 → **最後に**生存マーカー、の順で進むので、
-/// その間ずっと「ディレクトリは在るが生存マーカーはまだ無い」窓が開いている。並行して走る
-/// 別の`harness.exe`のGCがこの窓を覗くと**起動しかけのセッションが空の殻に見える**。
-/// 掃く側だけがロックを取っても、何も直列化されない（`bug-pattern-rules` B-18・
-/// `shared-state-exclusion` 問1）。
-pub const COW_GC_LOCK_NAME: &str = "Local\\harness-cow-gc";
+// [D-82] **かつてここに「GCのロック」と「作りたては見送る猶予」の2つが在った。撤去した。**
+//
+// どちらも「差分層のディレクトリは在るが生存マーカーはまだ無い」区間——作る側が
+// `create_dir_all` → ACE付与 → メタ書込 → **最後に**マーカー、の順で進んでいたために
+// 開いていた窓——を守るためのものだった。ロックが主で、猶予は`with_named_lock`が
+// **ロックを取れなければロック無しで実行する**（fail-open）ことへの二重の網である。
+//
+// **作る側がマーカーを実体より先に握るようにしたので、その窓自体が存在しない**
+// （`preflight`と`session_scope::prepare_scope`の両方。[`cow_session_is_live`]のdoc参照）。
+// 守る対象が無くなった網を残すと、次に読む人が「まだ窓がある」と読む。
+//
+// **順序を戻すなら、この2つも一緒に戻すこと。** 順序だけ戻すと、窓が開いたまま網も無い。
 
-/// 作成からこの秒数が経つまでは回収しない（既定1時間）。
-///
-/// **これは主たる機構ではなく保険である。** 起動しかけとの競合を本当に止めているのは
-/// [`COW_GC_LOCK_NAME`]の方で、こちらは`with_named_lock`が**ロックを取れなかったときに
-/// ロック無しで処理を実行する**（fail-open、`harness-grant-ledger`のdoc）ことへの二重の網。
-/// ロックだけに預けると、その fail-open の日に起動しかけの差分層が消える。
-pub const COW_GC_DEFAULT_GRACE_SECS: u64 = 60 * 60;
 
 /// 差分層1つについて、判定に要る事実だけを集めたもの。
 ///
@@ -580,8 +624,9 @@ pub enum CowGcVerdict {
     KeepUndecidable,
     /// 未適用の変更を抱えている。自動では消さない（明示指定でのみ回収対象になる）。
     KeepHasChanges,
-    /// 作ったばかり。起動しかけとの競合を避けるため見送る。
-    KeepTooYoung,
+    // [D-82] `KeepTooYoung`（作ったばかりなので見送る）は撤去した。起動しかけとの競合は
+    // 「実体より先に生存マーカーを握る」で消えており、[`CowGcVerdict::KeepRunning`]が拾う。
+    // 詳細は[`cow_session_is_live`]のdoc。
 }
 
 impl CowGcVerdict {
@@ -609,7 +654,6 @@ impl CowGcVerdict {
                 "its session metadata cannot be read, so what it holds is unknown"
             }
             CowGcVerdict::KeepHasChanges => "it still holds unapplied changes",
-            CowGcVerdict::KeepTooYoung => "it was created just now (a session may be starting up)",
         }
     }
 }
@@ -625,12 +669,16 @@ impl CowGcVerdict {
 /// 判定の順序は「残す理由が強いものから」。同じ差分層が複数の理由に当たることは普通にあり、
 /// 報告に出るのは最初に当たった1つなので、**人が次に取る手が変わる順**に並べてある
 /// （動いている→待てばよい／レビュー待ち→見ればよい／読めない→調べる／変更あり→applyするか捨てる）。
-pub fn plan_cow_gc(
-    facts: &[CowSessionFacts],
-    now_unix_secs: u64,
-    grace_secs: u64,
-    policy: CowGcPolicy,
-) -> Vec<(String, CowGcVerdict)> {
+///
+/// # [D-82] 「作りたては見送る」猶予はもう無い
+///
+/// かつて最終段に「作成からN秒経つまでは回収しない」があった。守っていたのは
+/// **起動しかけのセッション**——差分層のディレクトリを作った後、生存マーカーを立てるまでの
+/// 区間で、その間は「空で持ち主のいない殻」に見える——だけである。
+/// **作る側がマーカーを実体より先に握るようになったので、その状態は生まれない**
+/// （[`cow_session_is_live`]のdoc）。いまここへ到達する「空で持ち主のいない差分層」は
+/// 本当に終わったセッションの残骸なので、若さを理由に残す意味が無い。
+pub fn plan_cow_gc(facts: &[CowSessionFacts], policy: CowGcPolicy) -> Vec<(String, CowGcVerdict)> {
     facts
         .iter()
         .map(|f| {
@@ -644,8 +692,6 @@ pub fn plan_cow_gc(
                 CowGcVerdict::KeepUndecidable
             } else if f.pending_changes > 0 || f.content_files > 0 {
                 CowGcVerdict::KeepHasChanges
-            } else if now_unix_secs.saturating_sub(f.created_at_unix_secs) < grace_secs {
-                CowGcVerdict::KeepTooYoung
             } else {
                 CowGcVerdict::Collect
             };
@@ -733,39 +779,45 @@ pub struct CowGcOutcome {
 /// `also_collect`は「規則の上では残すが、人が明示的に回収を指示したもの」を通す述語
 /// （`harness cow gc --with-changes`）。**規則そのものは変えない**——例外は呼び出し側の
 /// 意思として外から渡し、`plan_cow_gc`が「安全に回収してよい」と言う範囲は不変に保つ。
+///
+/// # [D-82] ここはもうロックを取らない
+///
+/// かつては全体を「差分層を作る／掃く」を直列化する名前付きロックで囲んでいた。守っていたのは
+/// **作る側がディレクトリを作ってから生存マーカーを立てるまでの区間**だけで、
+/// **作る側がマーカーを先に握るようになったのでその区間は存在しない**
+/// （[`cow_session_is_live`]のdoc）。
+///
+/// GC同士が競っても害は無い——同じ差分層を2つのGCが消しにいっても、
+/// [`crate::session_scope::remove_overlay_dir`]は「既に無い」を成功として返す。
 pub fn run_cow_gc(
     dry_run: bool,
-    grace_secs: u64,
     policy: CowGcPolicy,
     also_collect: &dyn Fn(&CowSessionFacts, CowGcVerdict) -> bool,
 ) -> CowGcOutcome {
-    harness_grant_ledger::with_named_lock(COW_GC_LOCK_NAME, || {
-        let (facts, unreachable_volumes) = collect_cow_session_facts();
-        let now = harness_grant_ledger::now_unix_secs();
-        let verdicts = plan_cow_gc(&facts, now, grace_secs, policy);
-        let mut outcome = CowGcOutcome {
-            collected: Vec::new(),
-            kept: Vec::new(),
-            failures: Vec::new(),
-            unreachable_volumes,
-        };
-        for (fact, (session_id, verdict)) in facts.iter().zip(verdicts) {
-            debug_assert_eq!(fact.session_id, session_id);
-            if !verdict.collects() && !also_collect(fact, verdict) {
-                outcome.kept.push((session_id, verdict));
-                continue;
-            }
-            if dry_run {
-                outcome.collected.push(session_id);
-                continue;
-            }
-            match crate::session_scope::remove_overlay_dir(&fact.diff_layer_dir) {
-                Ok(()) => outcome.collected.push(session_id),
-                Err(e) => outcome.failures.push((session_id, e.to_string())),
-            }
+    let (facts, unreachable_volumes) = collect_cow_session_facts();
+    let verdicts = plan_cow_gc(&facts, policy);
+    let mut outcome = CowGcOutcome {
+        collected: Vec::new(),
+        kept: Vec::new(),
+        failures: Vec::new(),
+        unreachable_volumes,
+    };
+    for (fact, (session_id, verdict)) in facts.iter().zip(verdicts) {
+        debug_assert_eq!(fact.session_id, session_id);
+        if !verdict.collects() && !also_collect(fact, verdict) {
+            outcome.kept.push((session_id, verdict));
+            continue;
         }
-        outcome
-    })
+        if dry_run {
+            outcome.collected.push(session_id);
+            continue;
+        }
+        match crate::session_scope::remove_overlay_dir(&fact.diff_layer_dir) {
+            Ok(()) => outcome.collected.push(session_id),
+            Err(e) => outcome.failures.push((session_id, e.to_string())),
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -773,10 +825,13 @@ mod cow_gc_tests {
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
-    const GRACE: u64 = 3600;
 
-    /// 「何も残っていない・実行中でない・作りたてでもない」差分層の素の事実。
+    /// 「何も残っていない・実行中でない」差分層の素の事実。
     /// 各テストは**1つだけ**を動かして、その1つが判定を変えることを測る。
+    ///
+    /// [D-82] `created_at_unix_secs`は**もう判定に効かない**（猶予を撤去したため）。
+    /// 欄が残っているのは`harness cow gc --with-changes --older-than`が使うからで、
+    /// そちらは`plan_cow_gc`の外側の述語である。
     fn empty_and_old() -> CowSessionFacts {
         CowSessionFacts {
             session_id: "session-1".into(),
@@ -786,14 +841,14 @@ mod cow_gc_tests {
             review_pending: false,
             pending_changes: 0,
             content_files: 0,
-            created_at_unix_secs: NOW - GRACE * 24,
+            created_at_unix_secs: NOW - 86_400,
             workspace_root: Some("C:/ws".into()),
             volume_is_remote: false,
         }
     }
 
     fn verdict(f: CowSessionFacts) -> CowGcVerdict {
-        plan_cow_gc(&[f], NOW, GRACE, CowGcPolicy::default())[0].1
+        plan_cow_gc(&[f], CowGcPolicy::default())[0].1
     }
 
     /// **許可側**。ここが動かないとGCは何もしない機能になる（拒否側だけのテストでは
@@ -854,13 +909,32 @@ mod cow_gc_tests {
         assert_eq!(verdict(f), CowGcVerdict::KeepHasChanges);
     }
 
-    /// 作りたては見送る。**起動しかけのセッション**は「ディレクトリは在るが生存マーカーは
-    /// まだ無い」状態を通るので、空の殻と見分けが付かない。
+    /// [D-82] **作りたてかどうかは、もう判定を変えない。**
+    ///
+    /// かつては「作成からN秒経つまで見送る」猶予があり、**起動しかけのセッション**——
+    /// 「ディレクトリは在るが生存マーカーはまだ無い」状態を通るので空の殻と見分けが付かない
+    /// ——を守る保険だった。作る側がマーカーを実体より先に握るようになってその状態は
+    /// 生まれなくなり、猶予は撤去した（[`cow_session_is_live`]のdoc）。
+    ///
+    /// **いま「作りたてで空」に見えるものは、本当に終わった残骸である**ので回収してよい。
     #[test]
-    fn a_freshly_created_diff_area_is_left_alone() {
+    fn age_no_longer_changes_the_verdict() {
         let mut f = empty_and_old();
         f.created_at_unix_secs = NOW - 1;
-        assert_eq!(verdict(f), CowGcVerdict::KeepTooYoung);
+        assert_eq!(verdict(f), CowGcVerdict::Collect);
+    }
+
+    /// **上の対になる側**（`test-logic-rules`: 禁止側だけ書くと許可側が壊れても気付けない、
+    /// ここでは逆に「消してよい」側だけ書くと守りが消えても気付けない）。
+    ///
+    /// 上のテストだけだと「起動しかけを消してよい」と読める。**起動しかけを守っている根拠が
+    /// どこにあるかを同じ場所で固定する**——守っているのは若さではなく**生存マーカー**である。
+    #[test]
+    fn a_starting_session_is_protected_by_its_marker_not_by_its_age() {
+        let mut f = empty_and_old();
+        f.created_at_unix_secs = NOW - 1;
+        f.is_live = true;
+        assert_eq!(verdict(f), CowGcVerdict::KeepRunning);
     }
 
 
@@ -882,10 +956,7 @@ mod cow_gc_tests {
         let policy = CowGcPolicy {
             protect_network_volumes: false,
         };
-        assert_eq!(
-            plan_cow_gc(&[f], NOW, GRACE, policy)[0].1,
-            CowGcVerdict::Collect
-        );
+        assert_eq!(plan_cow_gc(&[f], policy)[0].1, CowGcVerdict::Collect);
     }
 
     /// 保護は`--with-changes`では外れない。あの指定が広げるのは「変更を抱えているだけ」の
@@ -912,6 +983,47 @@ mod cow_gc_tests {
         assert_eq!(verdict(f), CowGcVerdict::KeepRunning);
     }
 
+    /// [D-82] **生存マーカーが、差分層の実体より先に握られていること。**
+    ///
+    /// これが本機構の要である。逆順だと「ディレクトリは在るが印がまだ無い」区間ができ、
+    /// 並行して走る別の`harness.exe`のGCから空の殻に見えて消される——かつてGCのロックと
+    /// 「作りたては見送る」猶予の2枚を足して守っていたのがこの区間で、順序を直したので
+    /// どちらも撤去した。**順序が戻ると、網が無いぶん以前より悪くなる。**
+    ///
+    /// # 測り方
+    ///
+    /// 「印が先か」は成功経路からは見分けられない（どちらの順でも最後には両方揃う）ので、
+    /// **ディレクトリ作成を確実に失敗させて**、その時点で印が立っているかを見る。
+    /// 置き場になるはずのパスに**ファイル**を置けば`create_dir_all`は必ず失敗する。
+    ///
+    /// 管理者権限もAppContainerプロファイルも要らない（触るのは自分のtempdirと、
+    /// このテスト専用の名前の名前付きmutexだけ）ので`#[ignore]`にしない。
+    #[test]
+    fn the_liveness_marker_is_held_before_the_diff_layer_directory_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // **このテスト専用のセッションID。** マーカーはプロセス終了まで解放されない仕様なので、
+        // 他のテストと名前が衝突すると、そちらの生存判定を汚す。
+        let session_id = "harness-test-marker-order-probe";
+        let blocked = dir.path().join(session_id);
+        std::fs::write(&blocked, b"a file, not a directory").expect("seed a file in the way");
+
+        assert!(
+            !cow_session_is_live(session_id),
+            "前提が崩れている: このセッションIDのマーカーが既に立っている"
+        );
+
+        let err = claim_cow_diff_layer(session_id, &blocked)
+            .expect_err("create_dir_all must fail when a file occupies the path");
+
+        // **失敗したのに印は立っている**——これが「印が先」の直接の証拠。
+        // 順序を逆に戻すと、ここで印は立たないので落ちる。
+        assert!(
+            cow_session_is_live(session_id),
+            "claim が失敗しても生存マーカーは先に握られているはず（順序が逆になると落ちる）。\
+             ディレクトリ作成のエラー: {err}"
+        );
+    }
+
     /// 回収しないと判定したものは**必ず理由を持つ**（`shared-state-exclusion` 問6）。
     #[test]
     fn every_kept_verdict_can_explain_itself() {
@@ -921,7 +1033,6 @@ mod cow_gc_tests {
             CowGcVerdict::KeepReviewPending,
             CowGcVerdict::KeepUndecidable,
             CowGcVerdict::KeepHasChanges,
-            CowGcVerdict::KeepTooYoung,
         ] {
             assert!(!v.collects());
             assert!(!v.reason().is_empty());

@@ -668,9 +668,13 @@ pub(crate) fn cow_session_is_live_checked(_session_id: &str) -> bool {
 /// （`bug-pattern-rules` B-13/B-06）。GCが集めた事実の中から、いま適用したセッションの
 /// 1件だけを取り出して同じ規則へ通す。
 ///
-/// grace（作りたては見送る）は**ここでは0にする**。人が明示的に`apply`を打った直後であり、
-/// あの猶予が守っている「起動しかけとの競合」はこの経路には無い（実行中かどうかは
-/// 生存マーカーが直接答える）。
+/// # [D-82] この経路だけ猶予を0にする、という例外はもう無い
+///
+/// かつてここは「作りたては見送る」猶予を0に落として呼んでいた（既定の1時間を持ち込むと、
+/// 短いセッションでは適用直後にいつまでも片付かないため）。**その猶予は全経路から撤去された**
+/// ——守っていた「起動しかけとの競合」は、作る側が生存マーカーを実体より先に握るように
+/// なったことで消えている（`workspace_ledger::cow_session_is_live`のdoc）。
+/// **この経路と他の2経路（起動時スイープ・`harness cow gc`）が、同じ引数で同じ規則を通る。**
 #[cfg(windows)]
 fn finish_cow_diff_layer_after_apply(cow_diff_layer_dir: Option<&Path>) {
     use harness_sandbox::tier2a::workspace_ledger as wl;
@@ -688,12 +692,7 @@ fn finish_cow_diff_layer_after_apply(cow_diff_layer_dir: Option<&Path>) {
     // 方針は既定（ネットワーク上は保護）。`apply`は人が明示的に打つ操作だが、
     // **保護の判断まで手動操作で飛ばさない**——飛ばしてよいかを決めるのは設定であって、
     // どのコマンドから来たかではない。
-    let verdicts = wl::plan_cow_gc(
-        std::slice::from_ref(fact),
-        harness_grant_ledger::now_unix_secs(),
-        0,
-        wl::CowGcPolicy::default(),
-    );
+    let verdicts = wl::plan_cow_gc(std::slice::from_ref(fact), wl::CowGcPolicy::default());
     let Some((_, verdict)) = verdicts.first() else {
         return;
     };

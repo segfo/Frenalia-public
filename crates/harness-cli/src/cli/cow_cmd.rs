@@ -111,12 +111,7 @@ pub(crate) fn cow_list() -> ExitCode {
     }
     // 表示する状態は**GCが使うのと同じ判定**から引く（`bug-pattern-rules` B-13: 同じ事実の
     // 正本を2つ持たない）。一覧が「空」と言うのにGCが回収しない、という食い違いが起きない。
-    let verdicts = wl::plan_cow_gc(
-        &facts,
-        harness_grant_ledger::now_unix_secs(),
-        wl::COW_GC_DEFAULT_GRACE_SECS,
-        cow_gc_policy(),
-    );
+    let verdicts = wl::plan_cow_gc(&facts, cow_gc_policy());
     for (fact, (_, verdict)) in facts.iter().zip(verdicts) {
         println!(
             "{}\tworkspace={}\t{}\tchanged_files={}\tdiff_layer={}",
@@ -143,7 +138,8 @@ fn state_label(verdict: harness_sandbox::tier2a::workspace_ledger::CowGcVerdict)
         V::KeepReviewPending => "review-pending",
         V::KeepUndecidable => "undecidable",
         V::KeepHasChanges => "has-changes",
-        V::KeepTooYoung => "just-created",
+        // [D-82] `just-created`（作りたてなので見送る）は消えた。起動しかけとの競合は
+        // 「実体より先に生存マーカーを握る」で無くなり、そちらは`live`として出る。
         V::Collect => "collectable",
     }
 }
@@ -197,12 +193,7 @@ pub(crate) fn cow_gc(dry_run: bool, with_changes: bool, older_than_days: u64) ->
             && now.saturating_sub(fact.created_at_unix_secs) >= older_than_secs
     };
 
-    let outcome = wl::run_cow_gc(
-        dry_run,
-        wl::COW_GC_DEFAULT_GRACE_SECS,
-        cow_gc_policy(),
-        &also_collect,
-    );
+    let outcome = wl::run_cow_gc(dry_run, cow_gc_policy(), &also_collect);
 
     let verb = if dry_run { "would collect" } else { "collected" };
     println!("{verb} {} CoW diff area(s)", outcome.collected.len());

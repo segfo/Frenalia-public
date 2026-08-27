@@ -569,12 +569,7 @@ fn build_mcp_gates(
 fn sweep_empty_cow_diff_areas() {
     use harness_sandbox::tier2a::workspace_ledger as wl;
 
-    let outcome = wl::run_cow_gc(
-        false,
-        wl::COW_GC_DEFAULT_GRACE_SECS,
-        cow_gc_policy(),
-        &|_, _| false,
-    );
+    let outcome = wl::run_cow_gc(false, cow_gc_policy(), &|_, _| false);
     if !outcome.collected.is_empty() {
         eprintln!(
             "note: collected {} empty copy-on-write diff area(s) left by finished sessions \
