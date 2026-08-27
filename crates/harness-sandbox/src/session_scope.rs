@@ -1273,14 +1273,14 @@ mod path_gate_diagnostics {
     /// DACLを書けないので必ず拒否になる——**本番が測るのはワークスペースと差分層のパス**で
     /// あって、ドライブ直下ではない。両者を取り違えると「C:でもCoWが動かない」と誤読する。
     ///
-    /// 対象は`HARNESS_GATE_PROBE_PATHS`（`;`区切り）で渡す。
+    /// 対象は`HARNESS_TEST_GATE_PROBE_PATHS`（`;`区切り）で渡す。
     /// 実行例:
-    /// `HARNESS_GATE_PROBE_PATHS='C:\repo;E:\harness_cow\proj' cargo test -p harness-sandbox --lib path_gate_diagnostics -- --ignored --nocapture`
+    /// `HARNESS_TEST_GATE_PROBE_PATHS='C:\repo;E:\harness_cow\proj' cargo test -p harness-sandbox --lib path_gate_diagnostics -- --ignored --nocapture`
     #[test]
-    #[ignore = "machine-specific diagnostic; pass paths via HARNESS_GATE_PROBE_PATHS"]
+    #[ignore = "machine-specific diagnostic; pass paths via HARNESS_TEST_GATE_PROBE_PATHS"]
     fn print_cow_volume_verdict_for_given_paths() {
-        let Ok(list) = std::env::var("HARNESS_GATE_PROBE_PATHS") else {
-            println!("set HARNESS_GATE_PROBE_PATHS to a ';'-separated list of paths");
+        let Ok(list) = std::env::var("HARNESS_TEST_GATE_PROBE_PATHS") else {
+            println!("set HARNESS_TEST_GATE_PROBE_PATHS to a ';'-separated list of paths");
             return;
         };
         for raw in list.split(';').filter(|s| !s.is_empty()) {
@@ -1324,12 +1324,12 @@ mod appcontainer_ace_diagnostics {
     /// 後始末の要る資源が増える、BUG-101）宛の継承ACEを付け、読み返して消す。
     ///
     /// 実行:
-    /// `HARNESS_ACE_PROBE_PATHS='X:\;Z:\;C:\Users\me' cargo test -p harness-sandbox --lib appcontainer_ace_diagnostics -- --ignored --nocapture`
+    /// `HARNESS_TEST_ACE_PROBE_PATHS='X:\;Z:\;C:\Users\me' cargo test -p harness-sandbox --lib appcontainer_ace_diagnostics -- --ignored --nocapture`
     #[test]
     #[ignore = "machine-specific diagnostic; writes a throwaway directory under each given path"]
     fn probe_whether_an_appcontainer_ace_sticks_on_given_paths() {
-        let Ok(list) = std::env::var("HARNESS_ACE_PROBE_PATHS") else {
-            println!("set HARNESS_ACE_PROBE_PATHS to a ';'-separated list of directories");
+        let Ok(list) = std::env::var("HARNESS_TEST_ACE_PROBE_PATHS") else {
+            println!("set HARNESS_TEST_ACE_PROBE_PATHS to a ';'-separated list of directories");
             return;
         };
         // 実在しない名前でよい——SIDは名前のハッシュから決定的に導出され、登録の有無に

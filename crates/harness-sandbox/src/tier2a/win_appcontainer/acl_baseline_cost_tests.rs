@@ -68,7 +68,7 @@
 //! あちらは台帳とプロファイルを作り、祖先の通過許可で昇格を誘発し得る。
 //!
 //! ```text
-//! HARNESS_ACL_COST_NODES=20000 cargo test -p harness-sandbox --lib -- \
+//! HARNESS_TEST_ACL_COST_NODES=20000 cargo test -p harness-sandbox --lib -- \
 //!     --ignored --test-threads=1 --nocapture acl_baseline_cost
 //! ```
 //!
@@ -85,7 +85,7 @@ use super::*;
 /// ——§S9の「5,033／20,033ノード」は`1 + 32 + count`から出ている。
 const FANOUT: usize = 32;
 
-/// 測定するファイル数。`HARNESS_ACL_COST_NODES`で上書きできる（再ビルド無しでサイズを振る）。
+/// 測定するファイル数。`HARNESS_TEST_ACL_COST_NODES`で上書きできる（再ビルド無しでサイズを振る）。
 /// 既定は§S9との突き合わせ点。
 const DEFAULT_FILE_COUNT: usize = 20_000;
 
@@ -98,7 +98,7 @@ fn measure_capability(label: &str) -> crate::win_common::OwnedSid {
 }
 
 fn file_count() -> usize {
-    std::env::var("HARNESS_ACL_COST_NODES")
+    std::env::var("HARNESS_TEST_ACL_COST_NODES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_FILE_COUNT)

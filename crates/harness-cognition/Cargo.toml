@@ -6,7 +6,7 @@ edition.workspace = true
 [features]
 # out-of-processのRecall E2Eテスト（`harness-cli`の`tests/recall_e2e.rs`）専用。既定オフ、
 # リリースビルドに一切露出しない。有効時のみ`RecallStore::data_root`が環境変数
-# `HARNESS_RECALL_DATA_ROOT`を読み、記憶の置き場を差し替えられるようにする
+# `HARNESS_TEST_RECALL_DATA_ROOT`を読み、記憶の置き場を差し替えられるようにする
 # （`harness-cli`の`e2e-mock` featureから伝播する。`docs/DEV-ENVIRONMENT.md`参照）。
 e2e-test-hooks = []
 

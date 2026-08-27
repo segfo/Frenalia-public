@@ -16,7 +16,7 @@ path = "src/main.rs"
 # リリースビルドに一切露出しない（`--provider mock`はテストフックのため、`docs/DEV-ENVIRONMENT.md`
 # 「Tier2a E2Eテストの実行方法」参照）。`harness-cognition/e2e-test-hooks`を連れてくるのは、
 # Recall E2Eが記憶の置き場を実`%APPDATA%`から一時ディレクトリへ逃がすため
-# （`HARNESS_RECALL_DATA_ROOT`）。
+# （`HARNESS_TEST_RECALL_DATA_ROOT`）。
 e2e-mock = ["harness-cognition/e2e-test-hooks"]
 
 [dependencies]

@@ -53,12 +53,12 @@ mod win {
 
     /// 子で走らせるプローブ。**二重引用符を含めない**（コマンドラインの引用を単純に保つため）。
     const PROBE: &str = "$m = [string]$ExecutionContext.SessionState.LanguageMode; \
-         $o = $env:HARNESS_LANGMODE_OUT; \
+         $o = $env:HARNESS_TEST_LANGMODE_OUT; \
          if ($o) { Set-Content -LiteralPath $o -Value $m -Encoding ascii }; \
          if ($m -eq 'FullLanguage') { exit 10 } \
          elseif ($m -eq 'ConstrainedLanguage') { exit 20 } else { exit 99 }";
 
-    const OUT_ENV: &str = "HARNESS_LANGMODE_OUT";
+    const OUT_ENV: &str = "HARNESS_TEST_LANGMODE_OUT";
     const LOW_IL_SDDL: &str = "S-1-16-4096";
     const MEDIUM_IL_SDDL: &str = "S-1-16-8192";
 

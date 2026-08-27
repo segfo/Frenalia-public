@@ -15,7 +15,7 @@
 //! [`SpikeSpawn`]を使うのは、**SMBは`internetClient`ではなく`privateNetworkClientServer`の
 //! 側だと予想される**ためで、2択では「どちらでも塞がった」の理由が確定しない。
 //!
-//! **共有パスは環境依存なので`N8_UNC_PROBE`で渡す**（リポジトリへ他人のホスト名を埋めない）。
+//! **共有パスは環境依存なので`HARNESS_TEST_UNC_PROBE`で渡す**（リポジトリへ他人のホスト名を埋めない）。
 //!
 //! **§18.5の規律**: 対照C1（コンテナ**外**から読める）が落ちたらテストごと落とす。
 //! 「共有が落ちていた」を「AppContainerが塞いだ」と読み違えるのが一番ありそうな失敗だからである。
@@ -201,9 +201,9 @@ fn unc_host(unc: &str) -> String {
 /// （capability 4通りで届かない）を測り直すことになるため。ここが見るのは
 /// **なぜ届かないか**だけである。
 #[test]
-#[ignore = "実AppContainerと実SMB共有を使う。**非昇格**・--test-threads=1・N8_UNC_PROBE必須"]
+#[ignore = "実AppContainerと実SMB共有を使う。**非昇格**・--test-threads=1・HARNESS_TEST_UNC_PROBE必須"]
 fn n8_why_cant_an_appcontainer_child_reach_an_smb_share() {
-    let base = std::env::var("N8_UNC_PROBE").expect("N8_UNC_PROBE に検証用UNCディレクトリを渡すこと");
+    let base = std::env::var("HARNESS_TEST_UNC_PROBE").expect("HARNESS_TEST_UNC_PROBE に検証用UNCディレクトリを渡すこと");
     let unc_file = format!(r"{base}\marker.txt");
     let host = unc_host(&base);
     assert!(!host.is_empty(), "UNCからホスト名を取れない: {base}");
@@ -297,10 +297,10 @@ fn n8_why_cant_an_appcontainer_child_reach_an_smb_share() {
 /// 分けないのは、共有の到達性・コンテナの生死・capabilityの3つが**同じ実行の中で**
 /// 揃っていないと失敗の原因を1つに絞れないためである（B-29）。
 #[test]
-#[ignore = "実AppContainerと実SMB共有を使う。**非昇格**・--test-threads=1・N8_UNC_PROBE必須"]
+#[ignore = "実AppContainerと実SMB共有を使う。**非昇格**・--test-threads=1・HARNESS_TEST_UNC_PROBE必須"]
 fn n8_can_an_appcontainer_child_reach_an_smb_share() {
-    let base = std::env::var("N8_UNC_PROBE").expect(
-        "N8_UNC_PROBE に検証用UNCディレクトリを渡すこと。\
+    let base = std::env::var("HARNESS_TEST_UNC_PROBE").expect(
+        "HARNESS_TEST_UNC_PROBE に検証用UNCディレクトリを渡すこと。\
          リポジトリへホスト名を埋めないため必須にしてある",
     );
     let unc_file = format!(r"{base}\marker.txt");

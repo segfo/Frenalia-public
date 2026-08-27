@@ -122,7 +122,7 @@ fn vhd_ntfs_create() {
         "作った検証用ボリュームがローカルNTFSとして見えていない: {cap:?}"
     );
     println!(
-        "\n次はこれを非昇格で回す:\n  HARNESS_D81_PROBE_DRIVE={letter} cargo test -p harness-sandbox \
+        "\n次はこれを非昇格で回す:\n  HARNESS_TEST_D81_PROBE_DRIVE={letter} cargo test -p harness-sandbox \
          --lib d81_per_volume_placement -- --ignored --nocapture\n終わったら必ず \
          `dev-elevated-run.exe vhd-ntfs-remove` を打つこと。"
     );
@@ -153,12 +153,12 @@ fn vhd_ntfs_remove() {
 
 /// **D-81 の per-volume 配置を、本物の別ボリュームで通す**（昇格不要）。
 ///
-/// `HARNESS_D81_PROBE_DRIVE`（1文字）で対象ドライブを渡す。`vhd-ntfs-create`が印字する。
+/// `HARNESS_TEST_D81_PROBE_DRIVE`（1文字）で対象ドライブを渡す。`vhd-ntfs-create`が印字する。
 #[test]
 #[ignore = "検証用ボリュームが要る。先に `dev-elevated-run.exe vhd-ntfs-create` を回すこと"]
 fn d81_per_volume_placement() {
-    let Ok(letter) = std::env::var("HARNESS_D81_PROBE_DRIVE") else {
-        println!("set HARNESS_D81_PROBE_DRIVE to the drive letter printed by vhd-ntfs-create");
+    let Ok(letter) = std::env::var("HARNESS_TEST_D81_PROBE_DRIVE") else {
+        println!("set HARNESS_TEST_D81_PROBE_DRIVE to the drive letter printed by vhd-ntfs-create");
         return;
     };
     let letter = letter.trim().to_ascii_uppercase();

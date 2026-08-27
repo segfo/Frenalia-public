@@ -21,7 +21,7 @@
 //! | `create_issue` | 宣言しない想定。パーミッションゲートに掛かる経路の確認 |
 //! | `claims_read_only` | `annotations.readOnlyHint: true`を**自称する**。それでも非read扱いになることの確認 |
 //!
-//! 環境変数`MCP_MOCK_FAIL_INITIALIZE=1`で`initialize`にエラーを返す（起動失敗時に他のサーバが
+//! 環境変数`HARNESS_TEST_MCP_FAIL_INITIALIZE=1`で`initialize`にエラーを返す（起動失敗時に他のサーバが
 //! 巻き込まれないことの確認用）。
 
 use std::io::{BufRead, Write};
@@ -50,7 +50,7 @@ fn main() {
 
         let response = match method {
             "initialize" => {
-                if std::env::var("MCP_MOCK_FAIL_INITIALIZE").is_ok() {
+                if std::env::var("HARNESS_TEST_MCP_FAIL_INITIALIZE").is_ok() {
                     error_response(id, -32000, "mock server was told to fail initialize")
                 } else {
                     ok_response(

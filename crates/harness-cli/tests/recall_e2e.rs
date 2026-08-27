@@ -12,7 +12,7 @@
 //!    ここが空振りしても既存テストは全部緑のままになる。
 //! 3. **CLI（`harness memory *`）のレビュー運用** — 自動テストが1件も無かった。
 //!
-//! **記憶の置き場は`HARNESS_RECALL_DATA_ROOT`でケースごとの一時ディレクトリへ逃がす**
+//! **記憶の置き場は`HARNESS_TEST_RECALL_DATA_ROOT`でケースごとの一時ディレクトリへ逃がす**
 //! （`e2e-mock` featureが連れてくる`harness-cognition/e2e-test-hooks`。既定ビルドには
 //! コンパイルされない）。実`%APPDATA%\harness\data\memory\`は一切触らない。
 //!
@@ -252,7 +252,7 @@ fn run_harness(spec: RunSpec<'_>) -> HarnessRun {
         "run_shellがどのシェルを使うか、根拠を挙げて答えて",
     ]);
     cmd.args(spec.extra_args);
-    cmd.env("HARNESS_RECALL_DATA_ROOT", spec.data_root);
+    cmd.env("HARNESS_TEST_RECALL_DATA_ROOT", spec.data_root);
     if let Some(path) = spec.path_override {
         cmd.env("PATH", path);
     }
@@ -283,7 +283,7 @@ fn run_hiv(ws: &Path, data_root: &Path, turns: &[Vec<StreamEvent>], case_name: &
 fn memory_cli(ws: &Path, data_root: &Path, args: &[&str]) -> (bool, String, String) {
     let mut cmd = Command::new(harness_exe());
     cmd.arg("--cwd").arg(ws).arg("memory").args(args);
-    cmd.env("HARNESS_RECALL_DATA_ROOT", data_root);
+    cmd.env("HARNESS_TEST_RECALL_DATA_ROOT", data_root);
     let out = cmd.output().expect("failed to spawn harness.exe memory");
     (
         out.status.success(),
@@ -1100,7 +1100,7 @@ fn case_spelling_variants_share_one_store() -> Result<(), String> {
     cmd.arg("--cwd")
         .arg(&variant)
         .args(["memory", "list", "--all", "--output-format", "json"]);
-    cmd.env("HARNESS_RECALL_DATA_ROOT", &data);
+    cmd.env("HARNESS_TEST_RECALL_DATA_ROOT", &data);
     let out = cmd.output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!(

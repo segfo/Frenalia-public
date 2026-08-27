@@ -40,7 +40,7 @@
 //! `capability_sid_from_name`（純粋導出）＝**台帳にもプロファイルにも何も残さない**。
 //!
 //! ```text
-//! HARNESS_JIT_COST_NODES=10000 cargo test -p harness-sandbox --lib -- \
+//! HARNESS_TEST_JIT_COST_NODES=10000 cargo test -p harness-sandbox --lib -- \
 //!     --ignored --test-threads=1 --nocapture jit_grant_cost
 //! ```
 //!
@@ -90,7 +90,7 @@ const PIPE_TIMEOUT: Duration = Duration::from_secs(30);
 const NAIVE_ARM_CAP: usize = 2_000;
 
 fn file_count() -> usize {
-    std::env::var("HARNESS_JIT_COST_NODES")
+    std::env::var("HARNESS_TEST_JIT_COST_NODES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_FILE_COUNT)

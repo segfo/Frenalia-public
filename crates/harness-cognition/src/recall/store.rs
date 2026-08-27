@@ -68,7 +68,7 @@ impl RecallStore {
         // 同じ「既定オフのテストフック」の前例に乗せる）。実`%APPDATA%`を汚さずに、
         // 記憶ディレクトリの中身をテストから直接assertするために要る。
         #[cfg(feature = "e2e-test-hooks")]
-        if let Some(root) = std::env::var_os("HARNESS_RECALL_DATA_ROOT") {
+        if let Some(root) = std::env::var_os("HARNESS_TEST_RECALL_DATA_ROOT") {
             return Ok(PathBuf::from(root));
         }
         directories::ProjectDirs::from("", "", "harness")

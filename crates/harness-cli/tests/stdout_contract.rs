@@ -36,7 +36,7 @@
 //! |---|---|
 //! | `harness policy learn` | ETW収集器を昇格で起こすため **UACが1回出る**。加えて既定60秒スリープする |
 //! | `harness cow audit` | 実 `%LOCALAPPDATA%\harness\data\cow\` を走査し、`--session` 省略時は「最新」を拾うので**他の実セッションと干渉する** |
-//! | `harness memory list` | `store.open()` が実 `%APPDATA%` を作る。隔離には `e2e-test-hooks` feature と `HARNESS_RECALL_DATA_ROOT` が要る |
+//! | `harness memory list` | `store.open()` が実 `%APPDATA%` を作る。隔離には `e2e-test-hooks` feature と `HARNESS_TEST_RECALL_DATA_ROOT` が要る |
 //! | ヘッドレス `-p` 経路 | `--provider mock` に `e2e-mock` feature が要る。加えて BUG-064 が住む `reconcile_fs_ledger_for_workspace` は、1行でも出力させるには**実マシン共有の `%APPDATA%\harness\config\fs-passthrough-ledger.json` に孤児エントリが必要**で、この台帳には注入口が一つも無い（`Ledger::in_config_dir` が `directories::ProjectDirs` 直結） |
 //!
 //! `policy learn` は D-43 の注記を出す3箇所目でもあるので、[BUG-134](../../../docs/bugs/BUG-134.md)

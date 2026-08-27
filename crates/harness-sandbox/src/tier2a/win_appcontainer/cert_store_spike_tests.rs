@@ -2398,10 +2398,10 @@ fn n2_loopback_exemption_remove() {
 ///
 /// | 環境変数 | 中身 |
 /// |---|---|
-/// | `HARNESS_N2_CA_B64` | 本命CAのDER（base64）。コンテナ専用ストアへ置く |
-/// | `HARNESS_N2_CA_THUMB` | 同CAのSHA1拇印（区切り無し） |
-/// | `HARNESS_N2_URL` | 本命サーバのURL（そのCAで署名した証明書を出す） |
-/// | `HARNESS_N2_URL_CONTROL` | 対照サーバのURL（**別CA**で署名した証明書を出す） |
+/// | `HARNESS_TEST_N2_CA_B64` | 本命CAのDER（base64）。コンテナ専用ストアへ置く |
+/// | `HARNESS_TEST_N2_CA_THUMB` | 同CAのSHA1拇印（区切り無し） |
+/// | `HARNESS_TEST_N2_URL` | 本命サーバのURL（そのCAで署名した証明書を出す） |
+/// | `HARNESS_TEST_N2_URL_CONTROL` | 対照サーバのURL（**別CA**で署名した証明書を出す） |
 ///
 /// 証明書生成とTLSサーバを外へ出したのは、`New-SelfSignedCertificate`のリーフでは
 /// `SAN=IP:127.0.0.1`のサーバ証明書を作る手間が測定の本筋から外れるためである
@@ -2421,13 +2421,13 @@ fn n2_loopback_exemption_remove() {
 #[test]
 #[ignore = "実AppContainer＋loopback exemption＋外で立てたTLSサーバが要る。非昇格・--test-threads=1で走らせること"]
 fn n2_do_real_runtimes_trust_the_per_container_store() {
-    let ca_b64 = std::env::var("HARNESS_N2_CA_B64").expect("HARNESS_N2_CA_B64（本命CAのDER base64）");
-    let ca_thumb = std::env::var("HARNESS_N2_CA_THUMB")
-        .expect("HARNESS_N2_CA_THUMB")
+    let ca_b64 = std::env::var("HARNESS_TEST_N2_CA_B64").expect("HARNESS_TEST_N2_CA_B64（本命CAのDER base64）");
+    let ca_thumb = std::env::var("HARNESS_TEST_N2_CA_THUMB")
+        .expect("HARNESS_TEST_N2_CA_THUMB")
         .trim()
         .to_uppercase();
-    let url = std::env::var("HARNESS_N2_URL").expect("HARNESS_N2_URL");
-    let url_ctrl = std::env::var("HARNESS_N2_URL_CONTROL").expect("HARNESS_N2_URL_CONTROL");
+    let url = std::env::var("HARNESS_TEST_N2_URL").expect("HARNESS_TEST_N2_URL");
+    let url_ctrl = std::env::var("HARNESS_TEST_N2_URL_CONTROL").expect("HARNESS_TEST_N2_URL_CONTROL");
     let hostport = |u: &str| {
         u.trim_start_matches("https://")
             .trim_end_matches('/')
@@ -2518,7 +2518,7 @@ Write-Output ("CAFILE=" + (Test-Path '{cafile}'))"#
     // N7-dのCRL配布URL。未設定でも測定が成立するよう、**置換だけは必ず行う**
     // ——未置換のまま`%%CRLURL%%`が子へ届くと、curlが意味不明なURLで落ちて
     // 「コンテナからCRLサーバへ届かない」と読めてしまう（無言の取り違え）。
-    let crl_url = std::env::var("HARNESS_N2_CRL_URL").unwrap_or_default();
+    let crl_url = std::env::var("HARNESS_TEST_N2_CRL_URL").unwrap_or_default();
     let crl_probe_url = if crl_url.is_empty() {
         "http://127.0.0.1:1/none".to_string() // 明示的に届かない先＝「未設定」と読める
     } else {
@@ -2567,7 +2567,7 @@ Write-Output ("CAFILE=" + (Test-Path '{cafile}'))"#
         kv(&inside, "IWR_CONTROL").unwrap_or_default(),
         kv(&inside, "GH_CONTROL").unwrap_or_default(),
         if crl_url.is_empty() {
-            "(HARNESS_N2_CRL_URL 未設定——下2行はN7-dの結果として読まないこと)"
+            "(HARNESS_TEST_N2_CRL_URL 未設定——下2行はN7-dの結果として読まないこと)"
         } else {
             &crl_url
         },
@@ -2889,7 +2889,7 @@ fn n6_set_flag(sync: &Path, name: &str) {
 ///
 /// # 時間差の刻み
 ///
-/// 既定は「直後・+30秒・+120秒」。`HARNESS_N6_WAITS`（カンマ区切りの秒数）で上書きできる
+/// 既定は「直後・+30秒・+120秒」。`HARNESS_TEST_N6_WAITS`（カンマ区切りの秒数）で上書きできる
 /// ——**設計判断に要るのは「即座に失効するか否か」の二値**で、そこは直後の1点で決まる。
 /// 寿命の上限を詰めたくなったときに、器を書き換えずに刻みだけ延ばせるようにしてある。
 #[test]
@@ -2923,12 +2923,12 @@ fn n6_does_deleting_the_blob_revoke_trust() {
     ));
     std::fs::create_dir_all(&sync_dir).expect("create the sync directory under AC\\Temp");
 
-    let waits: Vec<u64> = std::env::var("HARNESS_N6_WAITS")
+    let waits: Vec<u64> = std::env::var("HARNESS_TEST_N6_WAITS")
         .unwrap_or_else(|_| "0,30,120".to_string())
         .split(',')
         .filter_map(|s| s.trim().parse::<u64>().ok())
         .collect();
-    assert!(!waits.is_empty(), "HARNESS_N6_WAITSが空。刻みが1つも無い");
+    assert!(!waits.is_empty(), "HARNESS_TEST_N6_WAITSが空。刻みが1つも無い");
     let steps: Vec<String> = (0..waits.len()).map(|i| format!("s{i}")).collect();
     let steps_ps = format!(
         "@({})",
@@ -3621,10 +3621,10 @@ for name in ('ROOT', 'CA'):
 ///
 /// | 環境変数 | 中身 |
 /// |---|---|
-/// | `HARNESS_N2_CA_B64` | 本命CAのDER（base64）。コンテナ専用ストアへ置く |
-/// | `HARNESS_N2_CA_THUMB` | 同CAのSHA1拇印（区切り無し） |
-/// | `HARNESS_N2_URL` | 本命サーバのURL（そのCAで署名した証明書を出す） |
-/// | `HARNESS_N2_URL_CONTROL` | 対照サーバのURL（**別CA**で署名した証明書を出す） |
+/// | `HARNESS_TEST_N2_CA_B64` | 本命CAのDER（base64）。コンテナ専用ストアへ置く |
+/// | `HARNESS_TEST_N2_CA_THUMB` | 同CAのSHA1拇印（区切り無し） |
+/// | `HARNESS_TEST_N2_URL` | 本命サーバのURL（そのCAで署名した証明書を出す） |
+/// | `HARNESS_TEST_N2_URL_CONTROL` | 対照サーバのURL（**別CA**で署名した証明書を出す） |
 ///
 /// プロファイル名も[`N2_PROFILE`]をそのまま使う——loopback exemptionは*package SID*に対して
 /// 足すもので、SIDはプロファイル名から決定的に導出される。名前を変えると
@@ -3640,13 +3640,13 @@ for name in ('ROOT', 'CA'):
 #[test]
 #[ignore = "実AppContainer＋loopback exemption＋外で立てたTLSサーバが要る。非昇格・--test-threads=1で走らせること"]
 fn n6_do_the_remaining_six_runtimes_trust_the_per_container_store() {
-    let ca_b64 = std::env::var("HARNESS_N2_CA_B64").expect("HARNESS_N2_CA_B64（本命CAのDER base64）");
-    let ca_thumb = std::env::var("HARNESS_N2_CA_THUMB")
-        .expect("HARNESS_N2_CA_THUMB")
+    let ca_b64 = std::env::var("HARNESS_TEST_N2_CA_B64").expect("HARNESS_TEST_N2_CA_B64（本命CAのDER base64）");
+    let ca_thumb = std::env::var("HARNESS_TEST_N2_CA_THUMB")
+        .expect("HARNESS_TEST_N2_CA_THUMB")
         .trim()
         .to_uppercase();
-    let url = std::env::var("HARNESS_N2_URL").expect("HARNESS_N2_URL");
-    let url_ctrl = std::env::var("HARNESS_N2_URL_CONTROL").expect("HARNESS_N2_URL_CONTROL");
+    let url = std::env::var("HARNESS_TEST_N2_URL").expect("HARNESS_TEST_N2_URL");
+    let url_ctrl = std::env::var("HARNESS_TEST_N2_URL_CONTROL").expect("HARNESS_TEST_N2_URL_CONTROL");
 
     let sid = ensure_profile_for_test(N2_PROFILE).expect("create the N2 AppContainer profile");
     let pkg_sid = crate::win_common::sid_to_string(sid.as_psid()).expect("package SID string");

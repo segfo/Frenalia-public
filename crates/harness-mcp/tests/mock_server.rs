@@ -279,7 +279,7 @@ fn undeclared_and_self_declared_read_only_tools_both_stay_non_read() {
 fn a_server_that_fails_to_initialize_is_reported_and_registers_nothing() {
     let (runtime, skipped) = start(
         decl_with(&[]),
-        vec![("MCP_MOCK_FAIL_INITIALIZE".to_string(), "1".to_string())],
+        vec![("HARNESS_TEST_MCP_FAIL_INITIALIZE".to_string(), "1".to_string())],
     );
     assert!(runtime.tools().is_empty());
     assert_eq!(skipped.len(), 1);

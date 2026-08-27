@@ -1308,7 +1308,7 @@ mod tests {
              try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('127.0.0.1', {allowed_port}); $c.Close(); $ok = $true }} catch {{ }}; \
              $blocked = $false; \
              try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('8.8.8.8', 53); $c.Close() }} catch {{ $blocked = $true }}; \
-             if ($ok -and $blocked) {{ Write-Output 'HARNESS_WFP_E2E_OK'; exit 0 }} else {{ Write-Output \"ok=$ok blocked=$blocked\"; exit 7 }}"
+             if ($ok -and $blocked) {{ Write-Output 'harness-wfp-e2e-ok'; exit 0 }} else {{ Write-Output \"ok=$ok blocked=$blocked\"; exit 7 }}"
         );
         let child = crate::tier2a::win_appcontainer::spawn(
             &shell,
@@ -1326,7 +1326,7 @@ mod tests {
         let _ = accept_thread.join();
         assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
         assert!(
-            stdout.contains("HARNESS_WFP_E2E_OK"),
+            stdout.contains("harness-wfp-e2e-ok"),
             "stdout={stdout}\nstderr={stderr}"
         );
 

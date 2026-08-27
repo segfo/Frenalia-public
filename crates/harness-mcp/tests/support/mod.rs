@@ -32,7 +32,7 @@ pub struct MockServer {
 impl MockServer {
     pub fn start(mode: &str) -> Self {
         let mut child = Command::new(MOCK_SERVER)
-            .env("MCP_MOCK_HTTP_MODE", mode)
+            .env("HARNESS_TEST_MCP_HTTP_MODE", mode)
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn mock http mcp server");

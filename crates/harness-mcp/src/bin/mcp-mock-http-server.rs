@@ -15,7 +15,7 @@
 //!
 //! ## 挙動の切り替え
 //!
-//! 環境変数`MCP_MOCK_HTTP_MODE`で応答の形を変える（stdio版の`MCP_MOCK_FAIL_INITIALIZE`と
+//! 環境変数`HARNESS_TEST_MCP_HTTP_MODE`で応答の形を変える（stdio版の`HARNESS_TEST_MCP_FAIL_INITIALIZE`と
 //! 同じ手口）。ツール構成はstdio版と同じ3種で、D-40の確認がトランスポート非依存であることを示す。
 //!
 //! | モード | 挙動 |
@@ -36,7 +36,7 @@ use std::net::{TcpListener, TcpStream};
 const SESSION_ID: &str = "mock-session-1";
 
 fn main() {
-    let mode = std::env::var("MCP_MOCK_HTTP_MODE").unwrap_or_else(|_| "json".to_string());
+    let mode = std::env::var("HARNESS_TEST_MCP_HTTP_MODE").unwrap_or_else(|_| "json".to_string());
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
     println!("listening on {addr}");

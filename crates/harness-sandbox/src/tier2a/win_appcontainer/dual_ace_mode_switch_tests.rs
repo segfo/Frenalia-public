@@ -63,11 +63,11 @@ use super::*;
 const FANOUT: usize = 32;
 
 /// 撒くファイル数。**この測定は費用ではなく真偽を測る**ので、既定は小さくてよい
-/// （§S15が費用側を26万ノード近傍まで押さえている）。`HARNESS_DUAL_ACE_NODES`で振れる。
+/// （§S15が費用側を26万ノード近傍まで押さえている）。`HARNESS_TEST_DUAL_ACE_NODES`で振れる。
 const DEFAULT_FILE_COUNT: usize = 256;
 
 fn file_count() -> usize {
-    std::env::var("HARNESS_DUAL_ACE_NODES")
+    std::env::var("HARNESS_TEST_DUAL_ACE_NODES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_FILE_COUNT)

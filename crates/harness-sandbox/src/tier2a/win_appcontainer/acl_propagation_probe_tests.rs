@@ -419,14 +419,14 @@ fn acl_propagation_mechanism_probe() {
 /// 伝播が届く**ことが実測で出た（1,174ノードで 1,173/1,174 対 0/1,174）。
 /// つまり**「届かない」は書込列だけでは決まらない**——効いている変数がもう1つある。
 ///
-/// ここはその変数を、`HARNESS_ACL_PROBE_BASES`（`;`区切りの親ディレクトリ）を振って挟み撃ちする。
+/// ここはその変数を、`HARNESS_TEST_ACL_PROBE_BASES`（`;`区切りの親ディレクトリ）を振って挟み撃ちする。
 /// 既定は`C:\`とユーザープロファイル配下の2点。**各腕でrootのSDDLも出す**——DACLの中身が
 /// どう違うかを見ないと、位置そのものが効いているのか、位置に伴うDACLの形が効いているのかを
 /// 言い分けられない。
 #[test]
 #[ignore = "creates a few hundred files under two parents and writes DACLs; run NON-elevated"]
 fn acl_propagation_mechanism_depends_on_where_the_tree_sits() {
-    let bases: Vec<std::path::PathBuf> = std::env::var("HARNESS_ACL_PROBE_BASES")
+    let bases: Vec<std::path::PathBuf> = std::env::var("HARNESS_TEST_ACL_PROBE_BASES")
         .unwrap_or_else(|_| {
             format!(
                 "C:\\;{}",
@@ -529,7 +529,7 @@ fn acl_propagation_mechanism_depends_on_where_the_tree_sits() {
 ///
 /// # 対象の選び方（**本体リポジトリを指してはいけない**）
 ///
-/// `HARNESS_ACL_REAL_WORKSPACE`が指すパス。既定は**このワークツリー自身**（`CARGO_MANIFEST_DIR`
+/// `HARNESS_TEST_ACL_REAL_WORKSPACE`が指すパス。既定は**このワークツリー自身**（`CARGO_MANIFEST_DIR`
 /// から2つ上）。
 ///
 /// **本体リポジトリ（`...\AI\harness`）を指すと測れない**——`workspace-capability-ledger.json`に
@@ -546,7 +546,7 @@ fn acl_propagation_mechanism_depends_on_where_the_tree_sits() {
 #[test]
 #[ignore = "runs the real preflight against a real workspace; leaves ledger entries — NON-elevated"]
 fn acl_propagation_real_workspace_rescue_walk_size() {
-    let workspace = std::env::var("HARNESS_ACL_REAL_WORKSPACE")
+    let workspace = std::env::var("HARNESS_TEST_ACL_REAL_WORKSPACE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
             Path::new(env!("CARGO_MANIFEST_DIR"))

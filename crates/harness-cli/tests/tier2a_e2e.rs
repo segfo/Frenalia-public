@@ -56,7 +56,7 @@ fn scratch_dir() -> PathBuf {
     dir
 }
 
-/// ケース専用のRecall記憶データルート（`HARNESS_RECALL_DATA_ROOT`）。書込み先を決める側と
+/// ケース専用のRecall記憶データルート（`HARNESS_TEST_RECALL_DATA_ROOT`）。書込み先を決める側と
 /// 後始末する側が同じ式を使うための1関数（`bug-pattern-rules` B-01: 副作用を作ったら
 /// 撤収も同じ変更で書く／B-05: 同じパスを2箇所に別々に書かない）。
 fn recall_data_root(scratch: &Path, case_name: &str) -> PathBuf {
@@ -230,7 +230,7 @@ fn run_harness_full(
     // 残骸が溜まり続ける（`e2e-mock` featureが連れてくる`e2e-test-hooks`の逃がし口）。
     // ケース単位にするのは`cleanup_on_success`が他ケースの分を巻き込まず消せるようにするため。
     cmd.env(
-        "HARNESS_RECALL_DATA_ROOT",
+        "HARNESS_TEST_RECALL_DATA_ROOT",
         recall_data_root(&scratch, case_name),
     );
     if let Some(dir) = cwd_for_process {
