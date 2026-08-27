@@ -5,32 +5,32 @@
 //! # 何が困っているのか
 //!
 //! Tier2a のファイルシステム境界は「許可したい各ノードのDACLへ、サンドボックス主体宛のACEを
-//! 事前に書く」方式で、その主体（capability SID。以下**バッジ**）は
+//! 事前に書く」方式で、その主体（capability SID）は
 //! **(ワークスペースのパス, 書込モード)** から導出される（[`super::workspace_capability_sid`]）。
 //! モードは2つある（[`crate::tier2a::workspace_ledger::KNOWN_MODES`] ＝ `rwx` / `ro`）。
-//! **モードを切り替えるとバッジが変わるので、既に配った26万件のACEが全部無効になり、全額を
+//! **モードを切り替えるとcapability SIDが変わるので、既に配った26万件のACEが全部無効になり、全額を
 //! もう一度払う**（26万ノードで一巡61.4秒、`plans/mac-spike/RESULTS.md` §S12）。
 //!
 //! 逃げ道は2つで、片方（CoWに絞ってモードを1つにする）は別の分流が持つ。ここで測るのは
-//! **もう片方——両モードのバッジ宛ACEを、最初の1回で同時に配る**である。
+//! **もう片方——両モードのcapability SID宛ACEを、最初の1回で同時に配る**である。
 //!
 //! # 費用ではなく安全性を測る
 //!
 //! **同時配布の費用は既に「無料」だと実測されている**（§S15-1: 同一ノードのACEを3本まで
 //! 1回の書込にまとめれば時間は1.0倍±3%）。したがって残っている問いは1つだけ:
 //!
-//! > **`ro` バッジしか持たない子から、同じツリーへ書けてしまわないか。**
+//! > **`ro` のcapability SIDしか持たない子から、同じツリーへ書けてしまわないか。**
 //!
 //! 書けてしまうならCoWの境界が消えるので、この案はその場で閉じる。書けなければ
 //! **費用ゼロでモード切替の払い直しが消える**。
 //!
 //! # 3腕で測る理由（片側だけのテストにしない）
 //!
-//! | 腕 | トークンに積むバッジ | 期待 | 何のために在るか |
+//! | 腕 | トークンに積むcapability SID | 期待 | 何のために在るか |
 //! |---|---|---|---|
 //! | `none` | 通過用のcapabilityだけ | **何もできない** | 陰性対照。ここで書けたら、それは`ALL APPLICATION PACKAGES`等の**別の理由**で書けているので、以降の判定は読めない |
-//! | `ro` | `ro`バッジ | 読める・辿れる・**書けない** | **本題** |
-//! | `rwx` | `rwx`バッジ | 全部できる | 陽性対照。ここで書けないなら計器が壊れている（「書けなかった」を`ro`の手柄と読めない） |
+//! | `ro` | `ro`のcapability SID | 読める・辿れる・**書けない** | **本題** |
+//! | `rwx` | `rwx`のcapability SID | 全部できる | 陽性対照。ここで書けないなら計器が壊れている（「書けなかった」を`ro`の手柄と読めない） |
 //!
 //! **3腕とも、ACEが2本とも載った同一のツリーを見る。** 腕ごとに別のツリーを作ると、
 //! 「同居しているACEが漏れるか」という当の問いを測っていないことになる。
@@ -39,7 +39,7 @@
 //!
 //! ```text
 //! cargo test -p harness-sandbox --lib -- \
-//!     --ignored --test-threads=1 --nocapture dual_badge
+//!     --ignored --test-threads=1 --nocapture dual_ace
 //! ```
 //!
 //! 昇格するとAppContainer子の親トークンが管理者のものになり、測っている世界が実運用と
@@ -63,20 +63,20 @@ use super::*;
 const FANOUT: usize = 32;
 
 /// 撒くファイル数。**この測定は費用ではなく真偽を測る**ので、既定は小さくてよい
-/// （§S15が費用側を26万ノード近傍まで押さえている）。`HARNESS_DUAL_BADGE_NODES`で振れる。
+/// （§S15が費用側を26万ノード近傍まで押さえている）。`HARNESS_DUAL_ACE_NODES`で振れる。
 const DEFAULT_FILE_COUNT: usize = 256;
 
 fn file_count() -> usize {
-    std::env::var("HARNESS_DUAL_BADGE_NODES")
+    std::env::var("HARNESS_DUAL_ACE_NODES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_FILE_COUNT)
 }
 
-/// 測定用のバッジを**名前から導出**する。`workspace_capability_sid`は使わない
+/// 測定用のcapability SIDを**名前から導出**する。`workspace_capability_sid`は使わない
 /// （モジュールdocの「実行」節）。
-fn measure_badge(mode: &str) -> crate::win_common::OwnedSid {
-    let name = format!("harness-t1-dualbadge-{}-{mode}", std::process::id());
+fn measure_cap_sid(mode: &str) -> crate::win_common::OwnedSid {
+    let name = format!("harness-t1-dualcapsid-{}-{mode}", std::process::id());
     super::capability_sid_from_name(&name).expect("derive capability sid")
 }
 
@@ -101,11 +101,11 @@ const PROBE_ITEMS: &[(&str, &str)] = &[
 /// 「消せなかった」が「もう無かった」と混ざる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arm {
-    /// バッジ無し（通過用capabilityのみ）。陰性対照。
+    /// workspaceのcapability SID無し（通過用capabilityのみ）。陰性対照。
     None_,
-    /// `ro`バッジのみ。**本題**。
+    /// `ro`のcapability SIDのみ。**本題**。
     Ro,
-    /// `rwx`バッジのみ。陽性対照。
+    /// `rwx`のcapability SIDのみ。陽性対照。
     Rwx,
 }
 
@@ -228,7 +228,7 @@ fn probe(
 ) -> (Vec<String>, String) {
     let out = run_in_sandbox(container_sid, capabilities, &probe_script(root, arm, ledger));
     eprintln!(
-        "[dual-badge] --- arm {} raw ---\n{out}\n[dual-badge] --- end ---",
+        "[dual-ace] --- arm {} raw ---\n{out}\n[dual-ace] --- end ---",
         arm.label()
     );
     assert!(
@@ -257,7 +257,7 @@ fn error_code(out: &str, prefix: &str) -> Option<String> {
 }
 
 /// capability台帳の実パス。**サンドボックスの中から読めるか**を測るために子へ渡す
-/// （副題: バッジの名前を知った者は誰でも[`super::capability_sid_from_name`]を呼べるので、
+/// （副題: capability SIDの名前を知った者は誰でも[`super::capability_sid_from_name`]を呼べるので、
 /// 名前が漏れる経路そのものが境界の一部になる）。
 ///
 /// AppContainer子の`%APPDATA%`はパッケージ側へ向き得るので、**親側で解決した絶対パスを
@@ -271,8 +271,8 @@ fn capability_ledger_path() -> PathBuf {
         .join("workspace-capability-ledger.json")
 }
 
-/// **本題**: `ro`と`rwx`の2つのバッジ宛ACEを1回の書込で同時に配ったとき、
-/// `ro`バッジしか持たない子はそのツリーへ書けないか。
+/// **本題**: `ro`と`rwx`の2つのcapability SID宛ACEを1回の書込で同時に配ったとき、
+/// `ro`のcapability SIDしか持たない子はそのツリーへ書けないか。
 ///
 /// # 判定線
 ///
@@ -285,19 +285,19 @@ fn capability_ledger_path() -> PathBuf {
 /// `rwx`（全部できる）を同じツリー・同じプローブで挟み、**3腕の差だけ**を結論に使う。
 #[test]
 #[ignore = "spawns real AppContainer children and writes real DACLs; run NON-elevated with --test-threads=1"]
-fn dual_badge_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
+fn dual_ace_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
     let traverse = traverse_capability_sid().expect("traverse capability");
     let container = session_sid();
     let ledger = capability_ledger_path();
     let count = file_count();
 
-    let dir = TestDirGuard::create("t1-dualbadge");
+    let dir = TestDirGuard::create("t1-dual-ace");
     let root = dir.path();
     let nodes = build_wide_tree(root, count, FANOUT);
     seed_probe_targets(root);
 
-    let ro_badge = measure_badge("ro");
-    let rwx_badge = measure_badge("rwx");
+    let ro_cap_sid = measure_cap_sid("ro");
+    let rwx_cap_sid = measure_cap_sid("rwx");
     let ro_mask = fs_access_mask(FsAccess::ReadExec);
     let rwx_mask = workspace_rwx_mask();
     let both = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
@@ -305,19 +305,19 @@ fn dual_badge_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
     // --- 2本を1回の書込で配る（§S15-1が「1回にまとめれば無料」と測った当の部品） ---
     let grants = [
         InheritableGrant {
-            sid: ro_badge.as_psid(),
+            sid: ro_cap_sid.as_psid(),
             mask: ro_mask,
             inheritance: both,
         },
         InheritableGrant {
-            sid: rwx_badge.as_psid(),
+            sid: rwx_cap_sid.as_psid(),
             mask: rwx_mask,
             inheritance: both,
         },
     ];
     let started = Instant::now();
     grant_aces_propagating(root, &grants, IdempotentCheck::Always)
-        .expect("one propagating write carrying both badges");
+        .expect("one propagating write carrying both ACEs");
     let grant_ms = started.elapsed().as_millis();
 
     // --- 「付けた」と「効いている」は別の事実なので、子を起こす前に読み返す（B-25） ---
@@ -326,19 +326,21 @@ fn dual_badge_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
     // 既存の子孫へ届いたことにならない（残課題#32がまさにその形だった）。
     let mut readback = Vec::new();
     for (label, sid, want) in [
-        ("ro", ro_badge.as_psid(), ro_mask),
-        ("rwx", rwx_badge.as_psid(), rwx_mask),
+        ("ro", ro_cap_sid.as_psid(), ro_mask),
+        ("rwx", rwx_cap_sid.as_psid(), rwx_mask),
     ] {
         let folded = sid_explicit_ace(root, sid)
             .expect("read back the root ACE")
-            .unwrap_or_else(|| panic!("{label}: the root carries no explicit ACE for this badge"));
+            .unwrap_or_else(|| {
+                panic!("{label}: the root carries no explicit ACE for this capability SID")
+            });
         let leaf_file = root.join("d000").join("f000000.txt");
         let leaf_dir = root.join("d000");
         let effective_file = sid_effective_ace_mask(&leaf_file, sid).expect("read leaf file mask");
         let effective_dir = sid_effective_ace_mask(&leaf_dir, sid).expect("read leaf dir mask");
         let note = sid_effective_ace_mask(&root.join("note.txt"), sid).expect("read note.txt mask");
         readback.push(serde_json::json!({
-            "badge": label,
+            "cap_sid": label,
             "sid": crate::win_common::sid_to_string(sid).unwrap_or_default(),
             "requested_mask": format!("0x{want:08x}"),
             "root_folded_mask": format!("0x{:08x}", folded.mask),
@@ -371,8 +373,8 @@ fn dual_badge_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
     for &arm in ARMS {
         let caps: Vec<PSID> = match arm {
             Arm::None_ => vec![traverse.as_psid()],
-            Arm::Ro => vec![traverse.as_psid(), ro_badge.as_psid()],
-            Arm::Rwx => vec![traverse.as_psid(), rwx_badge.as_psid()],
+            Arm::Ro => vec![traverse.as_psid(), ro_cap_sid.as_psid()],
+            Arm::Rwx => vec![traverse.as_psid(), rwx_cap_sid.as_psid()],
         };
         let (ran, raw) = probe(container.as_psid(), &caps, root, arm, &ledger);
         rows.push(serde_json::json!({
@@ -401,16 +403,16 @@ fn dual_badge_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
     }
 
     // --- 撤収（付与と撤収は対、B-01）。**戻り値ではなく読み直しで**確かめる（BUG-101） ---
-    let psids = [ro_badge.as_psid(), rwx_badge.as_psid()];
+    let psids = [ro_cap_sid.as_psid(), rwx_cap_sid.as_psid()];
     let started = Instant::now();
     let revoke_report = revoke_workspace_sids_recursive(root, &psids, &|_, _| {})
-        .expect("revoke both measurement badges");
+        .expect("revoke both measurement capability SIDs");
     let revoke_ms = started.elapsed().as_millis();
     let mut leftovers_seen = Vec::new();
-    for (label, sid) in [("ro", ro_badge.as_psid()), ("rwx", rwx_badge.as_psid())] {
+    for (label, sid) in [("ro", ro_cap_sid.as_psid()), ("rwx", rwx_cap_sid.as_psid())] {
         if let Err(leftovers) = assert_no_sid_ace_recursive(root, sid) {
             leftovers_seen.push(format!(
-                "{label}: {} node(s) still carry the badge; first few: {:?}",
+                "{label}: {} node(s) still carry the ACE; first few: {:?}",
                 leftovers.len(),
                 leftovers.iter().take(5).collect::<Vec<_>>()
             ));
@@ -425,7 +427,7 @@ fn dual_badge_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
             "nodes": nodes,
             "file_count": count,
             "fanout": FANOUT,
-            "one_write_carrying_both_badges_ms": grant_ms,
+            "one_write_carrying_both_aces_ms": grant_ms,
             "revoke_both_ms": revoke_ms,
             "revoke_checked": revoke_report.checked,
             "revoke_rewritten": revoke_report.rewritten,
@@ -437,7 +439,7 @@ fn dual_badge_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
 
     assert!(
         leftovers_seen.is_empty(),
-        "the revoke left badges behind:\n{}",
+        "the revoke left ACEs behind:\n{}",
         leftovers_seen.join("\n")
     );
 
@@ -447,9 +449,10 @@ fn dual_badge_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
     // （台帳が読めることは②の可否を決めない。決めるのは書込である）。したがって
     // ここでは期待値を置かず、JSONに残すだけにする。
     //
-    // `rewrite-the-dacl`は**両方のバッジで拒否**が期待値である。`workspace_rwx_mask`は
+    // `rewrite-the-dacl`は**両方のcapability SIDで拒否**が期待値である。`workspace_rwx_mask`は
     // `WRITE_DAC`/`WRITE_OWNER`を意図的に外しており（`acl_grant.rs`のdoc）、
-    // ここが通ると**`rwx`側の子が自分でACEを足せる**＝バッジの分割そのものが無意味になる。
+    // ここが通ると**`rwx`側の子が自分でACEを足せる**＝モードごとにcapability SIDを分けたこと
+    // そのものが無意味になる。
     let expect: &[(Arm, &[(&str, bool)])] = &[
         (
             Arm::None_,

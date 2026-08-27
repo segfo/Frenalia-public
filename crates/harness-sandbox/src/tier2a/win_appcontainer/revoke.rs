@@ -1209,7 +1209,7 @@ pub(crate) fn sid_ace_mask(path: &Path, sid: PSID) -> Result<Option<u32>, AppCon
 /// （[`crate::elevated_launch`]の`read_allow_aces`と同じ理由・同じ形）。**Allow ACEだけを数える**
 /// ——Deny ACEは「届いている」の根拠にならない。
 ///
-/// **[D-84] 製品はもうここを通らない**——両モードのバッジを配るようになったので、
+/// **[D-84] 製品はもうここを通らない**——両モードのcapability SID宛ACEを配るようになったので、
 /// 問いは常に「この複数の主体のうちどれが届いているか」になり、実装は
 /// [`sid_effective_ace_masks`]へ移った。単数版が残っているのは、1主体だけを測る
 /// 回帰テスト・コスト測定（`acl_dacl_write_tests`・`acl_baseline_cost_tests`等）が
@@ -1225,10 +1225,10 @@ pub(crate) fn sid_effective_ace_mask(
 /// [D-84] [`sid_effective_ace_mask`]の多主体版。**DACLの読取は1回**で、`sids`と同じ並び・
 /// 同じ長さの結果を返す。
 ///
-/// これが要るのは、両モードのバッジを配るようになって「このノードに届いているか」を
+/// これが要るのは、両モードのcapability SID宛ACEを配るようになって「このノードに届いているか」を
 /// **1ノードあたり2回**問うようになったためである。単数版を2回呼ぶと
 /// `GetNamedSecurityInfoW`も2回走り、26万ノードの救済walk（実測18.5秒）がそのまま倍になる
-/// ——[D-84]が「バッジを増やしても無料」と言えるのは1回の書込にまとめた場合の話で
+/// ——[D-84]が「ACEを増やしても無料」と言えるのは1回の書込にまとめた場合の話で
 /// （`plans/mac-spike/RESULTS.md` §S15-1）、**読取の側は自分でまとめないと倍を払う。**
 ///
 /// 判定規則は単数版と完全に同じ（Allow ACEだけを数える／NULL DACLは全員に届いている）。

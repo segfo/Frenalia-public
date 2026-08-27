@@ -122,7 +122,7 @@ pub(crate) fn grant_aces_propagating(
 /// [`grant_aces_propagating`]の**このオブジェクトだけ**版（[`DaclWrite::SingleObject`]）。
 ///
 /// M本を1つのDACLへ畳んで1回で書くところは同じで、違うのは**子孫へ配らない**ことだけである。
-/// [D-84]で「両モードのバッジを同時に置く」ようになったあと、これが要る場所は2つある——
+/// [D-84]で「両モードのcapability SID宛ACEを同時に置く」ようになったあと、これが要る場所は2つある——
 /// `preflight`の同期区間（rootへの高速付与）と、救済walk（継承が届かなかったノードへの
 /// 個別付与）。**どちらもノードあたりの書込を1回に保つためにここを通る**
 /// （主体ごとに`grant_ace_mask`を呼び直すと、`plans/mac-spike/RESULTS.md` §S15-1が測った

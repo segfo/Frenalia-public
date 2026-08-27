@@ -1,11 +1,11 @@
 //! workspaceの伝播＋救済walkを背景で回すジョブ（D-54、[BUG-082](../../../../docs/bugs/BUG-082.md) Part Bで拡張）。
 //!
 //! `preflight`の同期区間はrootへ継承ACEを、**伝播なし**（`DaclWrite::SingleObject`、
-//! [`super::grant_workspace_root_badges_fast`]）で付けるだけにしてある——tier判定
+//! [`super::grant_workspace_root_aces_fast`]）で付けるだけにしてある——tier判定
 //! （`smoke_test_spawn`）にはrootのDACL自体で足り、既存子孫への伝播は不要だからである。
 //! このジョブはその**残り**を2フェーズで背景に引き受ける。
 //!
-//! [D-84] **配る主体は1つではなく全モードのバッジである。** 2フェーズとも「M本を1回の書込に
+//! [D-84] **配る主体は1つではなく全モードのcapability SIDである。** 2フェーズとも「M本を1回の書込に
 //! まとめる」形で書かれていて、これは費用の要求から来ている——同一ノードのACEを増やしても
 //! 1回の書込にまとめる限り時間は動かないが（`plans/mac-spike/RESULTS.md` §S15-1）、
 //! 主体ごとに書くと約2.9倍、主体ごとにwalkを1周すると読取が本数倍になる。
@@ -242,7 +242,7 @@ fn job_key(workspace: &Path, mode: &str) -> String {
 /// 完走したら[`crate::tier2a::workspace_capability::mark_tree_verified`]を立てるので、
 /// 次回起動はwalk自体をしない。
 ///
-/// [BUG-082 Part B] `preflight`の同期区間はroot付与を[`super::grant_workspace_root_badges_fast`]
+/// [BUG-082 Part B] `preflight`の同期区間はroot付与を[`super::grant_workspace_root_aces_fast`]
 /// （`DaclWrite::SingleObject`、伝播なし）にしたため、既存子孫への伝播そのものをこのジョブの
 /// **最初のフェーズ**として引き受ける（[`super::propagate_workspace_root_grants`]、冪等チェックを
 /// バイパスして無条件に呼ぶ——理由は同関数のdoc参照）。
@@ -256,14 +256,14 @@ fn job_key(workspace: &Path, mode: &str) -> String {
 /// D-05/D-09の不変条件（サンドボックスから制御面が書けない）を背景フェーズでも維持するための
 /// 第2の防御である。`protect_sids`は`preflight`が渡すのと同じ集合
 /// （workspace capability＋セッションのSID）。
-/// **`badges`は全モードのバッジ**（[D-84]）。ここが1本だと、そのモードのセッションからしか
-/// workspaceが見えないツリーが出来上がり、モードを切り替えた瞬間に26万件を払い直す——
-/// それを消すのがD-84である。フェーズ0（伝播）もフェーズ1（救済walk）も、**多本を1回の
+/// **`ace_grants`は全モードのcapability SID宛ACE**（[D-84]）。ここが1本だと、そのモードの
+/// セッションからしかworkspaceが見えないツリーが出来上がり、モードを切り替えた瞬間に26万件を
+/// 払い直す——それを消すのがD-84である。フェーズ0（伝播）もフェーズ1（救済walk）も、**多本を1回の
 /// 書込にまとめる形**でここから下へ降りる（`plans/mac-spike/RESULTS.md` §S15-1）。
 #[must_use = "false means the job was not started (another one already claimed this process)"]
 pub fn start(
     root: &Path,
-    badges: Vec<super::OwnedBadgeGrant>,
+    ace_grants: Vec<super::OwnedAceGrant>,
     protect_sids: Vec<OwnedSid>,
     skip: Vec<PathBuf>,
     workspace: &Path,
@@ -283,10 +283,10 @@ pub fn start(
     let mode = mode.to_string();
     std::thread::spawn(move || {
         // 借用版へ落とすのは**この1箇所**（フェーズ0とフェーズ1が同じ値を見ることを、
-        // 変数1つで保証する。別々に作ると片方だけバッジが欠けても気付けない）。
-        let badge_refs = super::OwnedBadgeGrant::borrow_all(&badges);
-        // フェーズ0: rootへの継承ACE伝播（冪等チェック無し、必ず呼ぶ）。全バッジを1回で。
-        if let Err(e) = super::propagate_workspace_root_grants(&root, &badge_refs) {
+        // 変数1つで保証する。別々に作ると片方だけACEが欠けても気付けない）。
+        let ace_grant_refs = super::OwnedAceGrant::borrow_all(&ace_grants);
+        // フェーズ0: rootへの継承ACE伝播（冪等チェック無し、必ず呼ぶ）。全ACEを1回で。
+        if let Err(e) = super::propagate_workspace_root_grants(&root, &ace_grant_refs) {
             *state.error.lock().unwrap() = Some(e.to_string());
             state.finished.store(true, Ordering::Release);
             return;
@@ -313,7 +313,7 @@ pub fn start(
         let progress_state = Arc::clone(&state);
         let result = super::fix_descendants_missing_aces(
             &root,
-            &badge_refs,
+            &ace_grant_refs,
             &skip,
             &move |done, total| {
                 progress_state.done.store(done, Ordering::Relaxed);

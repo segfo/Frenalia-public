@@ -353,41 +353,41 @@ pub fn preflight_with_privhelper_launcher(
     // 秘密から導出され、サンドボックスから読めない台帳にだけ存在する
     // （`crate::tier2a::workspace_capability`のdoc）。
     //
-    // [D-84] **導出するのは自分のモードのバッジ1本ではなく、全モードのバッジである。**
-    // バッジは(パス, モード)から決まるので、モードを切り替えると主体ごと変わり、既に配った
+    // [D-84] **導出するのは自分のモードのcapability SID 1本ではなく、全モードのcapability SIDである。**
+    // capability SIDは(パス, モード)から決まるので、モードを切り替えると主体ごと変わり、既に配った
     // 26万件のACEが一斉に無効になって全額を払い直していた（一巡61.4秒、§S12）。両方を
     // **1回の書込で**置けばその払い直しが消える——費用はゼロ（§S15-1）、安全性も実測済み
-    // （`ro`のバッジしか持たない子は、隣に`rwx`のACEが載っていても作成・追記・削除が
+    // （`ro`のcapability SIDしか持たない子は、隣に`rwx`宛のACEが載っていても作成・追記・削除が
     // すべて`ERROR_ACCESS_DENIED`。`plans/handoff/fs-boundary-cost/T-1.md`）。
     //
     // **ここで台帳エントリも両モードぶん作られる**（`ensure_capability_name`）。撤収
     // （`harness fs revoke-workspace`）は台帳を索引にして剥がすので、**配った本数と
     // 引ける本数が同じ**になっていなければならない（`B-01`／BUG-101: 記録の無いACEは
     // どのコマンドでも剥がせない）。
-    let workspace_badges: Vec<(WorkspaceMode, crate::win_common::OwnedSid)> = WorkspaceMode::ALL
+    let workspace_cap_sids: Vec<(WorkspaceMode, crate::win_common::OwnedSid)> = WorkspaceMode::ALL
         .iter()
         .map(|mode| {
             workspace_capability_sid(&canonical_workspace_root, mode.as_str())
                 .map(|sid| (*mode, sid))
         })
         .collect::<Result<_, _>>()?;
-    let badge_grants: Vec<BadgeGrant> = workspace_badges
+    let ace_grants: Vec<AceGrant> = workspace_cap_sids
         .iter()
-        .map(|(mode, sid)| BadgeGrant {
+        .map(|(mode, sid)| AceGrant {
             sid: sid.as_psid(),
             mask: workspace_mode_mask(*mode),
         })
         .collect();
-    // このセッションが子のトークンへ積むバッジは**自分のモードのぶんだけ**（ここが
-    // D-84の安全性の全て——2本配っても、子が名乗れるのは1本である）。
-    let workspace_cap = workspace_badges
+    // このセッションが子のトークンへ積むcapability SIDは**自分のモードのぶんだけ**（ここが
+    // D-84の安全性の全て——ACEを2本配っても、子が名乗れるのは1本である）。
+    let workspace_cap = workspace_cap_sids
         .iter()
         .find(|(mode, _)| *mode == workspace_mode)
         .map(|(_, sid)| sid.clone())
         .ok_or_else(|| {
             AppContainerError::Preflight(format!(
-                "internal: no badge was derived for workspace mode '{}' (WorkspaceMode::ALL and \
-                 the running mode disagree)",
+                "internal: no capability SID was derived for workspace mode '{}' \
+                 (WorkspaceMode::ALL and the running mode disagree)",
                 workspace_mode.as_str()
             ))
         })?;
@@ -412,12 +412,12 @@ pub fn preflight_with_privhelper_launcher(
     }
 
     // [D-84/BUG-082 Part B] rootへ継承ACEを**全モードぶん1回の書込で**、**伝播なし**で置く
-    // （`grant_workspace_root_badges_fast`のdoc）——既存子孫への伝播は`grant_job`の背景
+    // （`grant_workspace_root_aces_fast`のdoc）——既存子孫への伝播は`grant_job`の背景
     // フェーズへ委ねる。2回目以降の起動は冪等スキップでWin32書込0回。
     //
-    // マスクはバッジのモードが決める（`workspace_mode_mask`）。`--sandbox tier2a-cow`で
-    // 走っていても`rwx`バッジ宛のACEはRWXのままで、**それでもこのセッションの子は書けない**
-    // ——子のトークンに`rwx`バッジが入っていないためである。Redirector DLLが無効・回避
+    // マスクはACEの宛先のモードが決める（`workspace_mode_mask`）。`--sandbox tier2a-cow`で
+    // 走っていても`rwx`のcapability SID宛ACEはRWXのままで、**それでもこのセッションの子は
+    // 書けない**——子のトークンに`rwx`のcapability SIDが入っていないためである。Redirector DLLが無効・回避
     // されてもworkspace本体への書込が`ACCESS_DENIED`でfail-closeする、というD-30の性質は
     // 変わらない（D-01「フックは境界にしない」）。
     //
@@ -425,10 +425,10 @@ pub fn preflight_with_privhelper_launcher(
     // 責任を負う」という表明で、記録すると`end_session`/`gc_dead_sessions`がツリー全体の
     // `revoke_ace_recursive`（実測30.8秒）を回してしまう。capability宛のACEはセッションより
     // 長生きするのが仕様であり、撤収は`harness fs revoke-workspace`が明示的に行う。
-    grant_workspace_root_badges_fast(workspace_root, &badge_grants)?;
+    grant_workspace_root_aces_fast(workspace_root, &ace_grants)?;
     timing.mark(&format!(
-        "grant_workspace_root_badges_fast(workspace_root, {} badges)",
-        badge_grants.len()
+        "grant_workspace_root_aces_fast(workspace_root, {} ACEs)",
+        ace_grants.len()
     ));
 
     match write_mode {
@@ -480,15 +480,17 @@ pub fn preflight_with_privhelper_launcher(
             )?;
         }
     }
-    // D-05/D-09の層3。剥がす主体は**全モードのバッジ（今の継承元）とpackage SID（D-37時代の
-    // 残骸）**——片方だけだと剥がし残した側から制御面が書ける（`revoke.rs`のdoc参照）。
+    // D-05/D-09の層3。剥がす主体は**全モードのcapability SID（今の継承元）とpackage SID
+    // （D-37時代の残骸）**——片方だけだと剥がし残した側から制御面が書ける（`revoke.rs`のdoc参照）。
     //
-    // [D-84] **「今の継承元」が2本になった。** ここが自モードのバッジだけを剥がしていると、
-    // `.harness/`配下に**もう一方のモードのバッジ宛ACEだけが残る**——次にそのモードで
-    // 起動したセッションから制御面が書けてしまい、D-05/D-09が片方のモードでだけ成立する
-    // という無言の穴になる（`B-01`の非対称そのもの）。
-    let mut control_dir_subjects: Vec<PSID> =
-        workspace_badges.iter().map(|(_, s)| s.as_psid()).collect();
+    // [D-84] **「今の継承元」が2本になった。** ここが自モードのcapability SID宛ACEだけを
+    // 剥がしていると、`.harness/`配下に**もう一方のモードのcapability SID宛ACEだけが残る**——
+    // 次にそのモードで起動したセッションから制御面が書けてしまい、D-05/D-09が片方のモードでだけ
+    // 成立するという無言の穴になる（`B-01`の非対称そのもの）。
+    let mut control_dir_subjects: Vec<PSID> = workspace_cap_sids
+        .iter()
+        .map(|(_, s)| s.as_psid())
+        .collect();
     control_dir_subjects.push(sid.as_psid());
     let protected_nodes =
         protect_harness_control_dir_from_appcontainer(workspace_root, &control_dir_subjects)?;
@@ -510,14 +512,14 @@ pub fn preflight_with_privhelper_launcher(
     // workspaceが出来上がる。
     //
     // 1. 記録の側: `tree_is_verified`（完走時刻＋**そのとき検証したrootの識別子**）
-    // 2. 実体の側: root直下に、**どれかのバッジ**へアクセスが届いていないノードが無いか
+    // 2. 実体の側: root直下に、**どれかのcapability SID**からアクセスが届いていないノードが無いか
     //
     // 2はO(root直下の件数)の読取だけで、実測でも数msである。1が通っても2で見つかったら
     // 回す（`B-14`: 台帳の存在で実体の存在を代替しない）。
     //
-    // [D-84] **2が「全バッジ」を見るのは、既存ワークスペースの移行がここに掛かっているから
-    // である。** D-84より前に配ったツリーには`rwx`側のバッジしか載っていないが、台帳の
-    // 検証済みは立っている。1だけを見ると`ro`のバッジは1件も配られないままになり、
+    // [D-84] **2が「全capability SID」を見るのは、既存ワークスペースの移行がここに掛かって
+    // いるからである。** D-84より前に配ったツリーには`rwx`側のACEしか載っていないが、台帳の
+    // 検証済みは立っている。1だけを見ると`ro`宛のACEは1件も配られないままになり、
     // 次に`--sandbox tier2a-cow`で起動したセッションからworkspaceが一切見えなくなる
     // （BUG-110とまったく同じ症状——拒否ではなく「無い」に見えるので気付けない）。
     //
@@ -525,8 +527,8 @@ pub fn preflight_with_privhelper_launcher(
     // ならない——ジョブが意図的にACEを付けない場所を検算側が数えると、毎起動でジョブが
     // 回り続ける（`B-05`）。だから両者は同じ変数を読む。
     let job_skip = vec![workspace_root.join(".harness")];
-    let badge_psids: Vec<PSID> = badge_grants.iter().map(|b| b.sid).collect();
-    let unreachable_child = top_level_child_missing_aces(workspace_root, &badge_psids, &job_skip);
+    let cap_sid_psids: Vec<PSID> = ace_grants.iter().map(|g| g.sid).collect();
+    let unreachable_child = top_level_child_missing_aces(workspace_root, &cap_sid_psids, &job_skip);
     let needs_descendant_fix = !crate::tier2a::workspace_capability::tree_is_verified(
         &canonical_workspace_root,
         workspace_mode.as_str(),
@@ -1344,7 +1346,7 @@ pub fn preflight_with_privhelper_launcher(
         // ACEやD-37時代のpackage SID残骸に備えて背景側でも剥がし直す（第2の防御）。ここで渡す
         // `.harness/`再保護用のSIDは、上の
         // 同期`protect_harness_control_dir_from_appcontainer`呼び出しと**同じ集合**
-        // （**全モードのバッジ**＋セッションSID）にする——片方だけだと剥がし残した側から
+        // （**全モードのcapability SID**＋セッションSID）にする——片方だけだと剥がし残した側から
         // 制御面が書けるのは同期区間と同じ理屈（`revoke.rs`のdoc参照）。
         let session_sid_copy = unsafe { crate::win_common::OwnedSid::copy_from(sid.as_psid()) }
             .map_err(|e| {
@@ -1352,18 +1354,18 @@ pub fn preflight_with_privhelper_launcher(
                     "failed to copy the session SID for background .harness re-protection: {e}"
                 ))
             })?;
-        let mut harness_protect_sids: Vec<crate::win_common::OwnedSid> = workspace_badges
+        let mut harness_protect_sids: Vec<crate::win_common::OwnedSid> = workspace_cap_sids
             .iter()
             .map(|(_, sid)| sid.clone())
             .collect();
         harness_protect_sids.push(session_sid_copy);
 
-        // [D-84] 背景ジョブへも**全モードのバッジ**を渡す。同期区間はrootへ2本置いたのに
+        // [D-84] 背景ジョブへも**全モードのcapability SID**を渡す。同期区間はrootへ2本置いたのに
         // 背景の伝播が1本だけだと、既存の子孫には片方しか届かない——次にモードを切り替えた
         // セッションが26万件を払い直す状態へ戻る（`B-01`: 同じ決定を全経路へ届ける）。
-        let owned_badges: Vec<OwnedBadgeGrant> = workspace_badges
+        let owned_ace_grants: Vec<OwnedAceGrant> = workspace_cap_sids
             .into_iter()
-            .map(|(mode, sid)| OwnedBadgeGrant {
+            .map(|(mode, sid)| OwnedAceGrant {
                 sid,
                 mask: workspace_mode_mask(mode),
             })
@@ -1373,7 +1375,7 @@ pub fn preflight_with_privhelper_launcher(
         // 呼ばれた場合だけで、製品では起こらない（実機テストが同居するときだけ）。
         let started = grant_job::start(
             workspace_root,
-            owned_badges,
+            owned_ace_grants,
             harness_protect_sids,
             // 上の`top_level_child_missing_aces`と**同じ集合**（`B-05`。ここがずれると、
             // ジョブが意図的に外した場所を検算側が数えて毎起動でジョブが回る）。

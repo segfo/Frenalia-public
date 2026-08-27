@@ -490,10 +490,11 @@ pub(super) fn probe_exe() -> PathBuf {
 /// `preflight`が張ったworkspaceツリーのACEの主体で、これを積まないと子はworkspaceを見られない。
 ///
 /// **[D-84] モードを`rwx`に固定してある。** 以前は「台帳に載っている方」を探していたが、
-/// D-84で両モードのバッジが常に載るようになり、探索は意味を失った（必ず先頭が当たる）。
-/// このスパイク群のworkspaceは全て`WorkspaceWriteMode::DirectRw`で`preflight`しているので
-/// `rwx`が正しい——**CoWのスパイクをここへ足すときは`ro`を選ぶこと**（`rwx`のバッジを
-/// 積んだ子はworkspace本体へ直接書けてしまい、測っている隔離が別物になる）。
+/// D-84で両モードのcapability SIDが常に台帳に載るようになり、探索は意味を失った
+/// （必ず先頭が当たる）。このスパイク群のworkspaceは全て`WorkspaceWriteMode::DirectRw`で
+/// `preflight`しているので`rwx`が正しい——**CoWのスパイクをここへ足すときは`ro`を選ぶこと**
+/// （`rwx`のcapability SIDを積んだ子はworkspace本体へ直接書けてしまい、測っている隔離が
+/// 別物になる）。
 pub(super) fn workspace_capability_for(workspace: &Path) -> Option<crate::win_common::OwnedSid> {
     let canonical = workspace
         .canonicalize()

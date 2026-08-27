@@ -24,8 +24,8 @@ use crate::tier2a::workspace_ledger::WorkspaceMode;
 ///
 /// かつてここは「台帳に載っているモードを探して、見つかった方」を使っていた。当時は
 /// `preflight`が登録するモードがちょうど1つだったので曖昧さが無かった——**その前提が
-/// D-84で崩れた**。両モードのバッジを常に配るようになったため、台帳には必ず2件載る。
-/// 探索順で先に来る`rwx`が常に選ばれ、**CoWのテストの子が`rwx`のバッジを積んで起動する**
+/// D-84で崩れた**。両モードのcapability SID宛ACEを常に配るようになったため、台帳には必ず2件載る。
+/// 探索順で先に来る`rwx`が常に選ばれ、**CoWのテストの子が`rwx`のcapability SIDを積んで起動する**
 /// ——workspace本体へ直接書けてしまい、封じ込めを測っているはずのテストが
 /// 「封じ込めが無い世界」を測ることになる。
 ///
@@ -58,7 +58,7 @@ pub(crate) fn spawn_in_workspace(
     crate::tier2a::win_appcontainer::grant_job::wait_until_done()
         .map_err(super::AppContainerError::Preflight)?;
     let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    // [D-84] **走っているモードのバッジだけ**を積む（本番の`launch.rs`と同じ）。
+    // [D-84] **走っているモードのcapability SIDだけ**を積む（本番の`launch.rs`と同じ）。
     // `lookup_`（発行しない側）を通すのは、`preflight`を経ていないworkspaceで
     // 台帳エントリを作らないため——テストが`%APPDATA%`へ記録を積み増さない。
     let mode = if cow.is_some() {

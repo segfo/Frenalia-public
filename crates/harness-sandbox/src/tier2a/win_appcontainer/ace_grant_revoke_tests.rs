@@ -1030,7 +1030,7 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
     // 「フォールバックが効いた」と主張してしまうため（実際にこれで誤検知した）。
     let started = grant_job::start(
         &root,
-        vec![OwnedBadgeGrant {
+        vec![OwnedAceGrant {
             sid: sid.clone(),
             mask: workspace_rwx_mask(),
         }],
@@ -3038,23 +3038,23 @@ fn the_named_door_refuses_to_take_access_from_a_live_workspace() {
 ///
 /// # なぜこのテストが要るのか
 ///
-/// D-84は「両モードのバッジ宛ACEを1回の書込で同時に置く」という変更で、成立の根拠は
-/// 2つある——費用が動かないこと（`plans/mac-spike/RESULTS.md` §S15-1）と、`ro`のバッジ
+/// D-84は「両モードのcapability SID宛ACEを1回の書込で同時に置く」という変更で、成立の根拠は
+/// 2つある——費用が動かないこと（`plans/mac-spike/RESULTS.md` §S15-1）と、`ro`のcapability SID
 /// しか持たない子が書けないこと（`plans/handoff/fs-boundary-cost/T-1.md`が実子プロセスで
 /// 実測）。**このテストはそのどちらでもない**。ここが測るのは、その手前にある
 /// 「**そもそも意図した2本が本当にDACLへ載り、撤収で本当に両方消えるのか**」である。
 ///
 /// 分けてあるのは、これが別の壊れ方だからである。`grant_*`が`Ok(())`を返しても、
 /// 冪等スキップが誤って効けば**2本目は1本も書かれない**——そして機能テストは緑のままになる
-/// （1本目のバッジで動くセッションは何も困らないので、症状は「モードを切り替えたときだけ
+/// （1本目のACEで動くセッションは何も困らないので、症状は「モードを切り替えたときだけ
 /// 26万件を払い直す」という、まさにD-84が消したはずの形で戻ってくる）。
 /// **「ACEを付けた」と「載っている」は別の事実**なので、付与のあとに読み返す（`B-25`）。
 ///
 /// # 対で見ているもの（`B-35`）
 ///
-/// - **許可側**: `rwx`バッジのマスクに書込・削除ビットが載っている。
-/// - **拒否側**: `ro`バッジのマスクにそれが載っていない（**原子ビットで測る**。
-///   複合マスクで測ると読取専用でも0にならない——[BUG-048]、`workspace_badges`のテスト参照）。
+/// - **許可側**: `rwx`宛ACEのマスクに書込・削除ビットが載っている。
+/// - **拒否側**: `ro`宛ACEのマスクにそれが載っていない（**原子ビットで測る**。
+///   複合マスクで測ると読取専用でも0にならない——[BUG-048]、`workspace_aces`のテスト参照）。
 /// - **陰性対照**: 一度も渡していない第3のSIDは、どのノードにも現れない
 ///   （「全員に配ってしまった」実装でも緑にならないようにする）。
 /// - **撤収側**: 2本とも消える。片方だけ消えると、残った側は台帳を消した瞬間に
@@ -3062,7 +3062,7 @@ fn the_named_door_refuses_to_take_access_from_a_live_workspace() {
 ///
 /// # このテストが測っていないもの（限界）
 ///
-/// **アクセス判定そのものは測っていない。** 「`ro`のバッジを積んだ子が実際に書けない」は
+/// **アクセス判定そのものは測っていない。** 「`ro`のcapability SIDを積んだ子が実際に書けない」は
 /// 子プロセスを起こさないと分からず、それはT-1が実測済みである。ここが答えるのは
 /// ACLの中身までで、**そこから「だから書けない」を導いてはいけない**。
 ///
@@ -3072,7 +3072,7 @@ fn the_named_door_refuses_to_take_access_from_a_live_workspace() {
 ///
 /// [BUG-048]: ../../../../docs/bugs/BUG-048.md
 #[test]
-fn both_workspace_badges_land_in_one_write_and_both_come_off_again() {
+fn both_workspace_aces_land_in_one_write_and_both_come_off_again() {
     use crate::tier2a::workspace_ledger::WorkspaceMode;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -3083,34 +3083,38 @@ fn both_workspace_badges_land_in_one_write_and_both_come_off_again() {
     std::fs::write(&leaf, b"hi").expect("seed file");
 
     // 本番と同じ「(パス, モード)ごとに別主体」を、台帳を経由せず名前だけで作る。
-    let rwx_sid = capability_sid_from_name("harnessD83TestBadgeRwx").expect("derive the rwx badge");
-    let ro_sid = capability_sid_from_name("harnessD83TestBadgeRo").expect("derive the ro badge");
+    let rwx_sid =
+        capability_sid_from_name("harnessD83TestCapSidRwx").expect("derive the rwx capability SID");
+    let ro_sid =
+        capability_sid_from_name("harnessD83TestCapSidRo").expect("derive the ro capability SID");
     // 陰性対照。どの呼び出しにも渡さない。
-    let never = capability_sid_from_name("harnessD83TestBadgeNever").expect("derive the control");
-    let badges = [
-        BadgeGrant {
+    let never = capability_sid_from_name("harnessD83TestCapSidNever").expect("derive the control");
+    let ace_grants = [
+        AceGrant {
             sid: rwx_sid.as_psid(),
             mask: workspace_mode_mask(WorkspaceMode::Rwx),
         },
-        BadgeGrant {
+        AceGrant {
             sid: ro_sid.as_psid(),
             mask: workspace_mode_mask(WorkspaceMode::Ro),
         },
     ];
 
     // --- 付与（1回の書込でM本） ---
-    grant_workspace_root_badges_fast(root, &badges).expect("grant both badges to the root");
+    grant_workspace_root_aces_fast(root, &ace_grants).expect("grant both ACEs to the root");
 
     // --- 読み返し: rootに2本、しかも継承あり ---
     for (sid, label) in [(rwx_sid.as_psid(), "rwx"), (ro_sid.as_psid(), "ro")] {
         let ace = sid_explicit_ace(root, sid)
             .expect("probe the root DACL")
             .unwrap_or_else(|| {
-                panic!("the {label} badge must carry an explicit ACE on the workspace root")
+                panic!(
+                    "the {label} capability SID must carry an explicit ACE on the workspace root"
+                )
             });
         assert!(
             ace.is_inheritable(),
-            "the {label} badge's root ACE must be inheritable, otherwise descendants never \
+            "the {label} ACE on the root must be inheritable, otherwise descendants never \
              receive it: {ace:#x?}"
         );
     }
@@ -3118,21 +3122,21 @@ fn both_workspace_badges_land_in_one_write_and_both_come_off_again() {
     // 許可側と拒否側を**同じ読み返しの中で**対にする。原子ビットで測る（BUG-048）。
     const WRITE_DATA: u32 = 0x0000_0002;
     let rwx_mask = sid_ace_mask(root, rwx_sid.as_psid())
-        .expect("probe the rwx badge")
-        .expect("the rwx badge must be present");
+        .expect("probe the rwx ACE")
+        .expect("the rwx ACE must be present");
     let ro_mask = sid_ace_mask(root, ro_sid.as_psid())
-        .expect("probe the ro badge")
-        .expect("the ro badge must be present");
+        .expect("probe the ro ACE")
+        .expect("the ro ACE must be present");
     assert_eq!(
         rwx_mask & (WRITE_DATA | DELETE.0),
         WRITE_DATA | DELETE.0,
-        "the rwx badge must be able to write and delete: {rwx_mask:#x}"
+        "the rwx capability SID must be able to write and delete: {rwx_mask:#x}"
     );
     assert_eq!(
         ro_mask & (WRITE_DATA | DELETE.0),
         0,
-        "the ro badge must not be able to write or delete, even though it sits in the same \
-         DACL as the rwx badge: {ro_mask:#x}"
+        "the ro capability SID must not be able to write or delete, even though its ACE sits in \
+         the same DACL as the rwx one: {ro_mask:#x}"
     );
     assert_eq!(
         sid_ace_mask(root, never.as_psid()).expect("probe the control SID"),
@@ -3141,10 +3145,10 @@ fn both_workspace_badges_land_in_one_write_and_both_come_off_again() {
     );
 
     // --- 救済walk: 既存の子孫へも2本届く ---
-    // `grant_workspace_root_badges_fast`は`SingleObject`（伝播しない）なので、この時点で
+    // `grant_workspace_root_aces_fast`は`SingleObject`（伝播しない）なので、この時点で
     // 既存の子孫にはまだ届いていない。届けるのは背景ジョブと同じ多本版の救済walkである。
-    let report = fix_descendants_missing_aces(root, &badges, &[], &|_, _| {})
-        .expect("run the multi-badge rescue walk");
+    let report = fix_descendants_missing_aces(root, &ace_grants, &[], &|_, _| {})
+        .expect("run the multi-ACE rescue walk");
     assert!(
         report.granted > 0,
         "the rescue walk must have granted at least the pre-existing descendants: {report:#?}"
@@ -3152,7 +3156,7 @@ fn both_workspace_badges_land_in_one_write_and_both_come_off_again() {
     for (sid, label) in [(rwx_sid.as_psid(), "rwx"), (ro_sid.as_psid(), "ro")] {
         assert!(
             sid_effective_ace_masks(&leaf, &[sid]).expect("probe the leaf")[0].is_some(),
-            "the {label} badge must reach the pre-existing leaf after the rescue walk"
+            "the {label} ACE must reach the pre-existing leaf after the rescue walk"
         );
     }
     assert_eq!(
@@ -3165,15 +3169,15 @@ fn both_workspace_badges_land_in_one_write_and_both_come_off_again() {
     // --- 撤収: 2本渡して2本とも消える ---
     let removed =
         revoke_workspace_sids_recursive(root, &[rwx_sid.as_psid(), ro_sid.as_psid()], &|_, _| {})
-            .expect("revoke both badges in one walk");
+            .expect("revoke both capability SIDs in one walk");
     assert!(
         removed.rewritten > 0,
-        "the revoke walk must have rewritten the nodes that carried the badges: {removed:#?}"
+        "the revoke walk must have rewritten the nodes that carried the ACEs: {removed:#?}"
     );
     for (sid, label) in [(rwx_sid.as_psid(), "rwx"), (ro_sid.as_psid(), "ro")] {
         assert!(
             assert_no_sid_ace_recursive(root, sid).is_ok(),
-            "the {label} badge must be gone from every node after revoke — a badge left behind \
+            "the {label} ACE must be gone from every node after revoke — an ACE left behind \
              here is unreachable once the ledger entry is dropped (BUG-101)"
         );
     }

@@ -16,8 +16,8 @@
 //! だったが、括弧の中が事実と違う。** DACLには同じファイルへ複数の主体宛ACEが同時に載り、
 //! 互いに干渉せず独立に効く（`plans/handoff/fs-boundary-cost/T-1.md`が実測。同一ノードで
 //! 上限1,168本まで載ることも`plans/mac-spike/RESULTS.md` §S15-3が測っている）。
-//! 実際、[D-84](../../../../plans/DESIGN-SANDBOX-APPPOLICY.md)以降は**両モードのバッジ宛ACEが
-//! 常に同時に載っている**——それでも`ro`のバッジしか持たない子は書けない（トークンに無い主体宛の
+//! 実際、[D-84](../../../../plans/DESIGN-SANDBOX-APPPOLICY.md)以降は**両モードのcapability SID宛ACEが
+//! 常に同時に載っている**——それでも`ro`のcapability SIDしか持たない子は書けない（トークンに無い主体宛の
 //! ACEはアクセス判定で読み飛ばされる）。
 //!
 //! **残る根拠はACLではなく一貫性である。** `--sandbox tier2a-cow`のセッションは
@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use crate::win_common::{hold_mutex_for_process_lifetime, mutex_exists};
 
 /// workspaceのアクセスモード。**「このworkspaceへ何を許すか」の語彙**であって、
-/// 「いまどのモードで走っているか」ではない——[D-84]以降、`preflight`は**全モードのバッジ宛
+/// 「いまどのモードで走っているか」ではない——[D-84]以降、`preflight`は**全モードのcapability SID宛
 /// ACEを毎回まとめて配る**ので、走っているモードと配るモードは別の話になった。
 ///
 /// # なぜ文字列ではなく型なのか
@@ -65,7 +65,7 @@ pub enum WorkspaceMode {
 }
 
 impl WorkspaceMode {
-    /// **全モード**。[D-84]で両モードのバッジを配る側と、`harness fs revoke-workspace`が
+    /// **全モード**。[D-84]で両モードのcapability SID宛ACEを配る側と、`harness fs revoke-workspace`が
     /// 剥がす側の**両方**がここを回る（`B-01`: 付与と撤収を同じ一覧から引く）。
     pub const ALL: [WorkspaceMode; 2] = [Self::Rwx, Self::Ro];
 
@@ -99,7 +99,7 @@ mod mode_vocabulary_tests {
     /// [`KNOWN_MODES`]と[`WorkspaceMode::ALL`]は**同じ集合を同じ順で**表す。
     ///
     /// 2つある理由は台帳の欄が`String`だからで、**同じ事実の綴りが2箇所にある**（`B-05`）。
-    /// 片方だけにモードを足すと、たとえば`fs revoke-workspace`は新しいモードのバッジを
+    /// 片方だけにモードを足すと、たとえば`fs revoke-workspace`は新しいモードのcapability SIDを
     /// 引かないまま「全部剥がした」と報告する——**剥がせないACEが残る**（BUG-101と同型）。
     /// コンパイラはここを守らないので、テストで固定する。
     #[test]

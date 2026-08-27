@@ -495,10 +495,11 @@ mod revoke_subjects;
 mod spawn;
 mod spawn_session;
 mod traverse;
-/// [D-84] workspaceツリーへ配る**バッジの集合**（モード×主体×マスク）と、それを1回の書込で
+/// [D-84] workspaceツリーへ配る**ACEの集合**（モード×主体×マスク）と、それを1回の書込で
 /// 置く口。`acl_grant`（何をどの主体へ許すかの決定）から分けてあるのは、こちらが扱うのが
-/// 「**どのバッジを何本配るか**」という別の軸だからである（`docs/CODE-STRUCTURE-RULES.md`規則3）。
-mod workspace_badges;
+/// 「**どのcapability SID宛のACEを何本配るか**」という別の軸だからである
+/// （`docs/CODE-STRUCTURE-RULES.md`規則3）。
+mod workspace_aces;
 
 pub use acl_grant::*;
 pub use launch::*;
@@ -511,7 +512,7 @@ pub use revoke_subjects::*;
 pub use spawn::*;
 pub use spawn_session::*;
 pub use traverse::*;
-pub use workspace_badges::*;
+pub use workspace_aces::*;
 
 // --- テスト群（実Win32・実AppContainerを使う重い回帰テストのため別ファイル） ---
 //
@@ -682,19 +683,19 @@ mod jit_grant_cost_tests;
 #[cfg(all(windows, test))]
 mod restricted_sid_probe_tests;
 
-/// **両モードのバッジ（capability SID）宛ACEを1回で同時に配ったとき、`ro`側の子から
+/// **両モードのcapability SID宛ACEを1回で同時に配ったとき、`ro`側の子から
 /// 書けてしまわないか**（分流`plans/handoff/fs-boundary-cost/T-1.md`、実測は§S16）。
 /// 費用側は§S15-1が「1回にまとめれば無料」と実測済みなので、残る問いは安全性だけである。
 /// **非昇格で回す**（昇格すると親トークンが管理者になり、測る世界が実運用とずれる）。
 ///
 /// **一回性の測定だったが、残す**（2026-08-27。`docs/CODE-STRUCTURE-RULES.md`規則2の例外）。
-/// 判定が **D-84 という拘束的決定になり、その安全性の不変条件**——「`ro`のバッジしか持たない子は
-/// 書けない」——**を実子プロセスで測っているのは本モジュールだけ**だからである。
+/// 判定が **D-84 という拘束的決定になり、その安全性の不変条件**——「`ro`のcapability SIDしか
+/// 持たない子は書けない」——**を実子プロセスで測っているのは本モジュールだけ**だからである。
 /// `ace_grant_revoke_tests`の対応するテストはDACLの中身までしか見ておらず、
 /// **そこから「だから書けない」を導いてはいけない**（同テストのdocが自分でそう書いている）。
 /// **D-84を変更するときは、まずここを回すこと。**
 #[cfg(all(windows, test))]
-mod dual_badge_mode_switch_tests;
+mod dual_ace_mode_switch_tests;
 
 /// **残課題#32の機序を1回で決めるプローブ**（使い捨て）。`acl_baseline_cost_tests`が
 /// 「届いていない」を確定させたのに対し、こちらは**なぜ届かないのか**を候補を並べて測る

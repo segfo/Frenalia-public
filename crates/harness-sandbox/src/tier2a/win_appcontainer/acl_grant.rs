@@ -235,7 +235,7 @@ pub(crate) unsafe fn set_dacl_propagating(
 /// `new_dacl`を`path`**そのものだけ**へ設定する（子孫へは配らない）。
 ///
 /// `pub(crate)`なのは[`super::acl_dacl_write`]が「M本を1つのDACLへ畳んで1回で書く」側の
-/// 単一オブジェクト版で使うため（[D-84]で両モードのバッジを同時に置くようになり、
+/// 単一オブジェクト版で使うため（[D-84]で両モードのcapability SID宛ACEを同時に置くようになり、
 /// 主体ごとに1回ずつ書く形だと書込回数が本数に比例する）。
 pub(crate) unsafe fn set_dacl_single_object(
     path: &Path,
@@ -823,27 +823,27 @@ pub fn fix_descendants_missing_ace(
     skip: &[std::path::PathBuf],
     progress: &dyn Fn(usize, usize),
 ) -> Result<DescendantFixReport, AppContainerError> {
-    fix_descendants_missing_aces(root, &[BadgeGrant { sid, mask }], skip, progress)
+    fix_descendants_missing_aces(root, &[AceGrant { sid, mask }], skip, progress)
 }
 
 /// [D-84] [`fix_descendants_missing_ace`]の多本版。**ノードあたりDACLの読取1回・書込は
-/// 多くとも1回**で、届いていないバッジだけをまとめて書く。
+/// 多くとも1回**で、届いていないACEだけをまとめて書く。
 ///
-/// # なぜ「バッジごとにwalkを1周」ではないのか
+/// # なぜ「capability SIDごとにwalkを1周」ではないのか
 ///
 /// この救済walkの費用は**書込ではなく読取**である（26万ノードで実測18.5秒、ほぼ全ノードが
-/// 「もう届いている」で終わる）。バッジごとに1周すると、その読取をバッジの本数だけ払う——
-/// [D-84]の前提（「バッジを増やしても無料」、`plans/mac-spike/RESULTS.md` §S15-1）は
+/// 「もう届いている」で終わる）。主体ごとに1周すると、その読取を主体の数だけ払う——
+/// [D-84]の前提（「ACEを増やしても無料」、`plans/mac-spike/RESULTS.md` §S15-1）は
 /// **1回の書込にまとめた場合の話**であって、walkを2周する形には効かない。
 /// だから1ノードにつきDACLを1回読み（[`sid_effective_ace_masks`]）、
-/// 足りないバッジがあればそのぶんを1回の書込で置く。
+/// 足りないACEがあればそのぶんを1回の書込で置く。
 ///
 /// [`DescendantFixReport::granted`]は**ノード数**であってACEの本数ではない
 /// （1ノードで2本書いても1と数える）。`0`が健全、の読み方は単数版と同じ。
 #[track_caller]
 pub fn fix_descendants_missing_aces(
     root: &Path,
-    badges: &[BadgeGrant],
+    ace_grants: &[AceGrant],
     skip: &[std::path::PathBuf],
     progress: &dyn Fn(usize, usize),
 ) -> Result<DescendantFixReport, AppContainerError> {
@@ -852,13 +852,13 @@ pub fn fix_descendants_missing_aces(
     // `grant_ace_inheritable_*`から呼ばれた場合は既に外側のガードが立っているので、
     // ここは`grant_job`の背景フェーズが直接呼ぶ経路のためのものである。
     //
-    // **バッジの本数ぶんガードを張る**——1本目だけ張って2本目を素通しにすると、
+    // **ACEの本数ぶんガードを張る**——1本目だけ張って2本目を素通しにすると、
     // 2本目の子孫ぶんが全件「記録漏れ」として上がる（`B-06`: 主体を増やしたら計装も数える）。
-    let _audits: Vec<_> = badges
+    let _audits: Vec<_> = ace_grants
         .iter()
-        .map(|badge| crate::tier2a::grant_audit::note_root_grant(root, badge.sid))
+        .map(|grant| crate::tier2a::grant_audit::note_root_grant(root, grant.sid))
         .collect();
-    let sids: Vec<PSID> = badges.iter().map(|b| b.sid).collect();
+    let sids: Vec<PSID> = ace_grants.iter().map(|g| g.sid).collect();
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
@@ -889,7 +889,7 @@ pub fn fix_descendants_missing_aces(
             report.skipped += 1;
             continue;
         }
-        // **DACLの読取は1ノードにつき1回**（バッジごとに読み直すと、この walk の費用が
+        // **DACLの読取は1ノードにつき1回**（capability SIDごとに読み直すと、この walk の費用が
         // 本数に比例する）。読めなければ**届いていない側へ倒す**——単数版のときと同じ規則で、
         // 読めない理由がACL不足のこともあるため。
         let reached = match sid_effective_ace_masks(node, &sids) {
@@ -899,11 +899,11 @@ pub fn fix_descendants_missing_aces(
                 vec![None; sids.len()]
             }
         };
-        let missing: Vec<BadgeGrant> = badges
+        let missing: Vec<AceGrant> = ace_grants
             .iter()
             .zip(reached)
             .filter(|(_, mask)| mask.is_none())
-            .map(|(badge, _)| *badge)
+            .map(|(grant, _)| *grant)
             .collect();
         if missing.is_empty() {
             continue;
@@ -944,7 +944,7 @@ pub fn fix_descendants_missing_aces(
 /// なので、ここで数えると毎回ジョブが回る）。DACLを読めなかったノードは
 /// **届いていない側**へ倒す（読めない理由がACL不足のこともある）。
 ///
-/// **[D-84] 製品はもうここを通らない**（バッジが2本になったため）。1主体で測る回帰テストの
+/// **[D-84] 製品はもうここを通らない**（capability SIDが2本になったため）。1主体で測る回帰テストの
 /// ために残してある薄い包みで、判定規則は[`top_level_child_missing_aces`]と同一である。
 #[cfg(test)]
 pub(crate) fn top_level_child_missing_ace(
@@ -955,12 +955,12 @@ pub(crate) fn top_level_child_missing_ace(
     top_level_child_missing_aces(root, &[sid], skip)
 }
 
-/// [D-84] [`top_level_child_missing_ace`]の多本版。**バッジのうち1本でも届いていなければ
+/// [D-84] [`top_level_child_missing_ace`]の多本版。**capability SIDのうち1つでも届いていなければ
 /// 見つけたことにする。**
 ///
-/// **1本でも、である理由**は移行にある。[D-84]より前に付与されたworkspaceは`rwx`側の
-/// バッジしか載っていないが、台帳の「検証済み」は立っている。ここが全バッジを見ていないと、
-/// **`ro`のバッジが1件も配られていないのに検証済みのまま**になり、次に
+/// **1つでも、である理由**は移行にある。[D-84]より前に付与されたworkspaceは`rwx`側の
+/// ACEしか載っていないが、台帳の「検証済み」は立っている。ここが全capability SIDを見ていないと、
+/// **`ro`宛のACEが1件も配られていないのに検証済みのまま**になり、次に
 /// `--sandbox tier2a-cow`で起動したセッションからworkspaceが一切見えない（`B-14`:
 /// 台帳の存在で実体の存在を代替しない、の実例そのもの）。ここが見つけることで、
 /// 移行は**次の起動で背景ジョブが1回回る**という形になる。
@@ -1088,9 +1088,9 @@ pub fn grant_workspace_root_ro(root: &Path, sid: PSID) -> Result<(), AppContaine
 /// **消さない**。手当ては伝播する側（[`super::acl_dacl_write`]）が、書く直前に外す形で持つ。
 #[track_caller]
 pub fn grant_workspace_root_rw_fast(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    grant_workspace_root_badges_fast(
+    grant_workspace_root_aces_fast(
         root,
-        &[BadgeGrant {
+        &[AceGrant {
             sid,
             mask: workspace_mode_mask(WorkspaceMode::Rwx),
         }],
@@ -1100,9 +1100,9 @@ pub fn grant_workspace_root_rw_fast(root: &Path, sid: PSID) -> Result<(), AppCon
 /// [`grant_workspace_root_rw_fast`]のread-only版（`--sandbox tier2a-cow`のworkspace本体、D-30）。
 #[track_caller]
 pub fn grant_workspace_root_ro_fast(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    grant_workspace_root_badges_fast(
+    grant_workspace_root_aces_fast(
         root,
-        &[BadgeGrant {
+        &[AceGrant {
             sid,
             mask: workspace_mode_mask(WorkspaceMode::Ro),
         }],
