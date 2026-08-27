@@ -2,8 +2,13 @@
 //! （`--resume`/`--continue`）」）。`harness-cli`（ヘッドレス）と`harness-tui`（対話）の
 //! 両方から使う共有ロジックのため、両方が既に依存している`harness-engine`に置く。
 //!
-//! 1ファイル1セッション、1行1レコードのJSONL。ファイル名は生成時刻ベース
-//! （`session-{unix_millis}.jsonl`）で、`--resume <id>`はこの`{unix_millis}`部分を指定する。
+//! 1ファイル1セッション、1行1レコードのJSONL。ファイル名は`session-{id}.jsonl`で、
+//! `--resume <id>`はこの`{id}`部分（接頭辞ごとでも可）を指定する。
+//!
+//! `{id}`は**UUIDv7**（[`new_session_id`]）。先頭が生成時刻なので文字列のまま生成順に並び、
+//! 残りの乱数で一意になる。**セキュリティIDではない**——理由と限界は[`new_session_id`]のdocが持つ。
+//! **旧形式（`session-<unixミリ秒>.jsonl`）はそのまま読める。** IDから時刻を数値として
+//! 取り出している箇所は無く、一覧と`--continue`の並べ替えはファイルの更新時刻で行っている。
 //!
 //! # レコードは2種類（[`Line`]）
 //!
@@ -18,11 +23,51 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
 use harness_core::{ContentBlock, Message, Role};
+
+/// 新規セッションIDを何回まで振り直すか。
+///
+/// **衝突は現実には起きない**（UUIDv7は先頭48ビットが生成時刻で、残りに74ビットの乱数が入る）。
+/// この上限は「起きないはずのことが起きたときに黙って回り続けない」ためのもので、
+/// ここに当たるのは採番器そのものが壊れているときだけである。
+const MAX_SESSION_ID_ATTEMPTS: usize = 10;
+
+/// 新しいセッションIDを1つ作る（UUIDv7）。
+///
+/// # なぜUUIDv7か
+///
+/// 満たしたい性質が2つある——**生成時刻の順に並べられる**ことと、**一意である**こと。
+/// UUIDv7は先頭48ビットがunixミリ秒なので、文字列のまま並べれば生成順になる（従来の
+/// `session-<ミリ秒>`が持っていた性質を保つ）。残りが乱数なので、**時刻を捏造せずに**
+/// 一意にできる——旧実装は衝突を`millis += 1`で避けており、IDが名乗る時刻が実際とずれていた。
+///
+/// # **これはセキュリティIDではない。予測不能性が要る判断に使わないこと。**
+///
+/// UUIDv7は**生成時刻をそのまま含む**ため、いつ作られたかが値から読め、当てにいく範囲も狭い。
+/// 識別と順序づけのためのIDであって、秘密ではない。
+///
+/// このIDを消費しているのは4つで、いずれも**当てられて困らない**用途である。
+///
+/// 1. セッションファイル名（`session-<id>.jsonl`）
+/// 2. `--resume <id>` / `--continue` の指定
+/// 3. CoW差分層のフォルダ名
+/// 4. CoW生存マーカー（名前付きmutex）の名前
+///
+/// **4だけは限界がある。** IDを当てられる同一マシンのプロセスは、先回りしてその名前の
+/// mutexを作れる。すると死んだセッションが「生きている」と誤判定され、差分層が回収され
+/// なくなる（**掃除の妨害**であって、権限が広がる方向ではない）。UUIDv7で当てるのは
+/// 現実的でなくなるが、**原理的に塞がるわけではない**——塞ぐならマーカー名を秘密から
+/// 導出することになる。
+///
+/// 予測不能性が本当に要る場所は**別系統**になっている。workspace capabilityの秘密は
+/// OSの暗号乱数（`BCryptGenRandom`）から作られる。**そちらへこのIDを混ぜないこと。**
+fn new_session_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
 
 pub struct SessionStore {
     path: PathBuf,
@@ -78,20 +123,38 @@ impl SessionStore {
     /// 終了しただけ、といった操作で空ファイルが積もらなくなる（空セッションは復元しても何も
     /// 得られないので、取っておく理由が無い）。
     ///
-    /// 同一ミリ秒に別プロセスが作った実体があれば番号を進めて避ける。遅延生成では名前を
-    /// 予約できないが、**既存の会話へ追記してしまう**ことだけは防げる（従来の`File::create`は
-    /// 同名を切り詰めていたので、この点はむしろ良くなる）。
+    /// 既に実体があるIDは避ける。遅延生成では名前を予約できないが、**既存の会話へ追記して
+    /// しまう**ことだけは防げる（従来の`File::create`は同名を切り詰めていたので、この点は
+    /// むしろ良くなる）。
+    ///
+    /// **衝突したら振り直す。時刻を進めない。** かつては同一ミリ秒の衝突を`millis += 1`で
+    /// 避けていたが、それは**IDが名乗る生成時刻を実際とずらす**うえ、再試行に上限が無かった。
+    /// いまは[`new_session_id`]（UUIDv7）で振り直し、[`MAX_SESSION_ID_ATTEMPTS`]回で
+    /// 打ち切って失敗する。
     pub fn create_new(dir: &Path) -> io::Result<Self> {
-        let mut millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let mut path = dir.join(format!("session-{millis}.jsonl"));
-        while path.exists() {
-            millis += 1;
-            path = dir.join(format!("session-{millis}.jsonl"));
+        Self::create_new_with(dir, new_session_id)
+    }
+
+    /// [`create_new`]の本体。**採番器を差し替えられる形にしてあるのはテストのため**——
+    /// 「衝突したら振り直す」「N回で諦める」は、実際に衝突するIDを注入しないと測れない
+    /// （UUIDv7の自然な衝突を待つことはできない）。
+    fn create_new_with(dir: &Path, mut mint: impl FnMut() -> String) -> io::Result<Self> {
+        for _ in 0..MAX_SESSION_ID_ATTEMPTS {
+            let path = dir.join(format!("session-{}.jsonl", mint()));
+            if !path.exists() {
+                return Ok(Self { path });
+            }
         }
-        Ok(Self { path })
+        // **黙って回り続けない。** 上限に当たるのは採番器が壊れているときだけなので、
+        // 使い回して既存の会話を壊すより、ここで止まる方が良い（fail-closed）。
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "could not mint an unused session id in {} attempts under {}",
+                MAX_SESSION_ID_ATTEMPTS,
+                dir.display()
+            ),
+        ))
     }
 
     /// 既存のセッションファイルを明示パスで開く（`--resume <id>`用、`id`から組み立てた
@@ -458,6 +521,78 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
         assert!(SessionStore::list(&missing).unwrap().is_empty());
+    }
+
+    // --- セッションIDの採番（UUIDv7・衝突したら振り直す・上限で諦める） ---
+
+    /// **許可側。** 詰まったIDを返し続ける採番器でも、上限の**手前**で空きが出れば通る。
+    /// 禁止側（下）だけ書くと「常に失敗する」実装でも緑になる（`test-logic-rules`）。
+    #[test]
+    fn a_colliding_id_is_reminted_until_a_free_one_comes_up() {
+        let dir = tempfile::tempdir().unwrap();
+        // 先に「埋まっている」名前を作っておく。
+        for taken in ["taken-1", "taken-2"] {
+            std::fs::write(dir.path().join(format!("session-{taken}.jsonl")), b"x").unwrap();
+        }
+        let mut minted = vec!["free", "taken-2", "taken-1"];
+        let store =
+            SessionStore::create_new_with(dir.path(), || minted.pop().unwrap().to_string()).unwrap();
+        assert_eq!(store.id(), "session-free");
+    }
+
+    /// **禁止側。** 常に同じIDを返す壊れた採番器では、上限で諦めて失敗する
+    /// ——旧実装はここが上限の無い`while`で、黙って回り続けた。
+    #[test]
+    fn minting_gives_up_after_the_attempt_limit_instead_of_looping_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("session-stuck.jsonl"), b"x").unwrap();
+
+        let mut calls = 0usize;
+        // `expect_err`を使わないのは、`SessionStore`に`Debug`を実装させないため
+        // （テストの都合で製品側の型に derive を足さない）。
+        let result = SessionStore::create_new_with(dir.path(), || {
+            calls += 1;
+            "stuck".to_string()
+        });
+        let Err(err) = result else {
+            panic!("a minter that never yields a free id must fail, not spin");
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // **回数まで測る。** 「失敗した」だけだと、1回で諦めても上限まで粘っても緑になる。
+        assert_eq!(calls, MAX_SESSION_ID_ATTEMPTS);
+    }
+
+    /// 採番したIDは**生成順に文字列として並ぶ**（UUIDv7の先頭が生成時刻であることに依存する
+    /// 唯一の性質。旧`session-<ミリ秒>`が持っていたものを保つ）。
+    #[test]
+    fn minted_ids_sort_in_creation_order() {
+        let ids: Vec<String> = (0..8).map(|_| new_session_id()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "UUIDv7は生成順に並ぶはず: {ids:?}");
+        // 一意でもあること（順序だけ見ると、同じ値を返す実装でも上が通る）。
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "採番が重複した: {ids:?}");
+    }
+
+    /// **旧形式のセッションが読めなくなっていないこと。** IDの形を変えたので、
+    /// 既にディスクにある`session-<unixミリ秒>.jsonl`が置き去りになると被害が大きい。
+    #[test]
+    fn a_legacy_millisecond_session_is_still_resolvable_listable_and_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = SessionStore::open(SessionStore::resolve_path(dir.path(), "1700000000000"));
+        legacy.append_messages(&[msg("old")]).unwrap();
+
+        // `--resume`（接頭辞あり・なしの両形）
+        for id in ["1700000000000", "session-1700000000000"] {
+            let reopened = SessionStore::open(SessionStore::resolve_path(dir.path(), id));
+            assert_eq!(reopened.load_messages().unwrap(), vec![msg("old")], "id={id}");
+        }
+        // 一覧と`--continue`
+        assert_eq!(SessionStore::list(dir.path()).unwrap().len(), 1);
+        let latest = SessionStore::resume_latest(dir.path()).unwrap().unwrap();
+        assert_eq!(latest.load_messages().unwrap(), vec![msg("old")]);
     }
 
     // --- コンテキスト圧縮のチェックポイント（`--resume`が圧縮後から始まる） ---
