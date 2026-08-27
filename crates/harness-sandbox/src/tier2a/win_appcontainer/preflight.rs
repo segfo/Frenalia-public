@@ -1051,10 +1051,12 @@ mod acl_volume_gate_tests {
     fn a_diff_layer_that_does_not_exist_yet_still_passes_the_acl_volume_gate() {
         let tmp = tempfile::tempdir().expect("一時ディレクトリを作れること");
         let not_yet = tmp.path().join("cow").join("session-does-not-exist-yet");
-        assert!(!not_yet.exists(), "前提が崩れている: このパスは存在しないはず");
-
-        require_persistent_acl_volume("copy-on-write diff area", &not_yet).expect(
-            "まだ作られていない差分層でも、同じボリューム上の実在する祖先で性質を測れる",
+        assert!(
+            !not_yet.exists(),
+            "前提が崩れている: このパスは存在しないはず"
         );
+
+        require_persistent_acl_volume("copy-on-write diff area", &not_yet)
+            .expect("まだ作られていない差分層でも、同じボリューム上の実在する祖先で性質を測れる");
     }
 }

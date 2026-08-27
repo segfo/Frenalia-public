@@ -8,9 +8,7 @@
 use std::ffi::c_void;
 
 use windows::core::{PCSTR, PCWSTR};
-use windows::Win32::Foundation::{
-    GetLastError, ERROR_CALL_NOT_IMPLEMENTED, E_NOTIMPL, HMODULE,
-};
+use windows::Win32::Foundation::{GetLastError, ERROR_CALL_NOT_IMPLEMENTED, E_NOTIMPL, HMODULE};
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
@@ -159,8 +157,8 @@ fn probe_legacy_create(
         )
     };
     let error = unsafe { GetLastError() }.0;
-    let disabled = result == 0
-        && (error == ERROR_CALL_NOT_IMPLEMENTED.0 || error == E_NOTIMPL.0 as u32);
+    let disabled =
+        result == 0 && (error == ERROR_CALL_NOT_IMPLEMENTED.0 || error == E_NOTIMPL.0 as u32);
     (
         if disabled {
             NativePathPolicyVerdict::RuntimeContractDisabled
@@ -169,20 +167,15 @@ fn probe_legacy_create(
         },
         false,
         None,
-        format!("{detail_prefix}side-effect-free create probe returned BOOL={result}, error={error}"),
+        format!(
+            "{detail_prefix}side-effect-free create probe returned BOOL={result}, error={error}"
+        ),
     )
 }
 
 fn load_system32_dll(name: &str) -> Option<HMODULE> {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        LoadLibraryExW(
-            PCWSTR(wide.as_ptr()),
-            None,
-            LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
-        .ok()
-    }
+    unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_SEARCH_SYSTEM32).ok() }
 }
 
 type RawProc = unsafe extern "system" fn() -> isize;

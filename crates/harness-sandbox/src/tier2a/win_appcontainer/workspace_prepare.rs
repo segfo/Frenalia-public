@@ -94,16 +94,16 @@ impl WorkspacePreparationPlan {
         if !self.needs_descendant_fix {
             return false;
         }
-        super::grant_job::start(
-            &self.canonical_workspace,
-            self.capability,
-            self.mode.mask(),
-            self.protect_sids,
-            self.skip,
-            &self.canonical_workspace,
-            self.mode.as_str(),
-            &self.capability_generation,
-        )
+        super::grant_job::start(super::grant_job::GrantJobRequest {
+            root: &self.canonical_workspace,
+            sid: self.capability,
+            mask: self.mode.mask(),
+            protect_sids: self.protect_sids,
+            skip: self.skip,
+            workspace: &self.canonical_workspace,
+            mode: self.mode.as_str(),
+            capability_generation: &self.capability_generation,
+        })
     }
 }
 

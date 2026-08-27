@@ -259,17 +259,29 @@ fn job_key(workspace: &Path, mode: &str, capability_generation: &str) -> String 
 /// D-05/D-09の不変条件（サンドボックスから制御面が書けない）を背景フェーズでも維持するための
 /// 第2の防御である。`protect_sids`は`preflight`が渡すのと同じ集合
 /// （workspace capability＋セッションのSID）。
+pub(crate) struct GrantJobRequest<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) sid: OwnedSid,
+    pub(crate) mask: u32,
+    pub(crate) protect_sids: Vec<OwnedSid>,
+    pub(crate) skip: Vec<PathBuf>,
+    pub(crate) workspace: &'a Path,
+    pub(crate) mode: &'a str,
+    pub(crate) capability_generation: &'a str,
+}
+
 #[must_use = "false means the job was not started (another one already claimed this process)"]
-pub fn start(
-    root: &Path,
-    sid: OwnedSid,
-    mask: u32,
-    protect_sids: Vec<OwnedSid>,
-    skip: Vec<PathBuf>,
-    workspace: &Path,
-    mode: &str,
-    capability_generation: &str,
-) -> bool {
+pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
+    let GrantJobRequest {
+        root,
+        sid,
+        mask,
+        protect_sids,
+        skip,
+        workspace,
+        mode,
+        capability_generation,
+    } = request;
     let key = job_key(workspace, mode, capability_generation);
     let state = Arc::new(JobState::default());
     {

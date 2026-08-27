@@ -21,21 +21,13 @@ fn run(program: &str, args: &[&str], cwd: &Path) {
     );
 }
 
-fn has_complete_mask(
-    path: &Path,
-    sid: windows::Win32::Security::PSID,
-    required: u32,
-) -> bool {
+fn has_complete_mask(path: &Path, sid: windows::Win32::Security::PSID, required: u32) -> bool {
     sid_effective_ace_mask(path, sid)
         .expect("read effective ACE")
         .is_some_and(|mask| mask & required == required)
 }
 
-fn assert_tree_reached(
-    root: &Path,
-    sid: windows::Win32::Security::PSID,
-    required: u32,
-) -> usize {
+fn assert_tree_reached(root: &Path, sid: windows::Win32::Security::PSID, required: u32) -> usize {
     let mut pending = vec![root.to_path_buf()];
     let mut checked = 0usize;
     while let Some(path) = pending.pop() {
@@ -74,7 +66,11 @@ fn acl_creation_inheritance_handles_generated_worktrees_but_not_move_in() {
     let mask = workspace_rwx_mask();
 
     run("git", &["init", "--quiet"], source_root);
-    run("git", &["config", "user.email", "harness-test@example.invalid"], source_root);
+    run(
+        "git",
+        &["config", "user.email", "harness-test@example.invalid"],
+        source_root,
+    );
     run("git", &["config", "user.name", "Harness Test"], source_root);
     std::fs::create_dir_all(source_root.join("src")).expect("create source dir");
     std::fs::write(
@@ -82,8 +78,7 @@ fn acl_creation_inheritance_handles_generated_worktrees_but_not_move_in() {
         "[package]\nname='acl-inheritance-probe'\nversion='0.0.0'\nedition='2021'\n",
     )
     .expect("write Cargo.toml");
-    std::fs::write(source_root.join("src/main.rs"), "fn main() {}\n")
-        .expect("write main.rs");
+    std::fs::write(source_root.join("src/main.rs"), "fn main() {}\n").expect("write main.rs");
     for index in 0..128 {
         std::fs::write(source_root.join(format!("fixture-{index:03}.txt")), b"x")
             .expect("write fixture");
@@ -140,7 +135,10 @@ fn acl_creation_inheritance_handles_generated_worktrees_but_not_move_in() {
         &worktree,
     );
     let after_build_nodes = assert_tree_reached(&worktree, sid.as_psid(), mask);
-    assert!(after_build_nodes > worktree_nodes, "cargo must create build artifacts");
+    assert!(
+        after_build_nodes > worktree_nodes,
+        "cargo must create build artifacts"
+    );
 
     let protected = worktree.join("protected-after-grant");
     std::fs::create_dir_all(&protected).expect("create protected branch");
@@ -166,10 +164,8 @@ fn acl_creation_inheritance_handles_generated_worktrees_but_not_move_in() {
     let outside_target = outside.path().join("reparse-target");
     std::fs::create_dir_all(&outside_target).expect("create reparse target");
     std::fs::write(outside_target.join("secret.txt"), b"outside").expect("write outside target");
-    let reparse_result = std::os::windows::fs::symlink_dir(
-        &outside_target,
-        worktree.join("outside-link"),
-    );
+    let reparse_result =
+        std::os::windows::fs::symlink_dir(&outside_target, worktree.join("outside-link"));
     if reparse_result.is_ok() {
         assert!(
             !has_complete_mask(&outside_target.join("secret.txt"), sid.as_psid(), mask),

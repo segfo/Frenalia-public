@@ -1025,16 +1025,16 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
     // 1プロセス1ジョブなので、同じテストバイナリで先に`preflight`を通ったテストが居ると
     // 開始できない。**その場合は黙って緑にせずskipする**——`start`が何もしていないのに
     // 「フォールバックが効いた」と主張してしまうため（実際にこれで誤検知した）。
-    let started = grant_job::start(
-        &root,
-        sid.clone(),
-        workspace_rwx_mask(),
-        vec![sid.clone()],
-        vec![root.join(".harness")],
-        &root,
-        "rwx",
-        "test-generation",
-    );
+    let started = grant_job::start(grant_job::GrantJobRequest {
+        root: &root,
+        sid: sid.clone(),
+        mask: workspace_rwx_mask(),
+        protect_sids: vec![sid.clone()],
+        skip: vec![root.join(".harness")],
+        workspace: &root,
+        mode: "rwx",
+        capability_generation: "test-generation",
+    });
     if !started {
         eprintln!(
             "skipping the_background_job_finishes_the_descendant_fix_up_and_records_it: another \

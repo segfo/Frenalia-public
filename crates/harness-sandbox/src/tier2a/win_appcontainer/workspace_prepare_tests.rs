@@ -19,7 +19,10 @@ fn exercise(mode: WorkspaceAclMode, label: &str) {
     );
     let first = start_workspace_preparation(&root, mode).expect("start first preparation");
     assert_eq!(first.state_before, WorkspacePreparationState::Unprepared);
-    assert!(first.job_started, "fresh workspace must start one background job");
+    assert!(
+        first.job_started,
+        "fresh workspace must start one background job"
+    );
     grant_job::wait_for_workspace(&root, mode.as_str()).expect("wait first preparation");
 
     let cap = workspace_capability_sid(&root, mode.as_str()).expect("resolve prepared capability");
@@ -43,10 +46,18 @@ fn exercise(mode: WorkspaceAclMode, label: &str) {
         WorkspaceAclMode::Rwx => workspace_rwx_mask(),
         WorkspaceAclMode::ReadOnly => fs_access_mask(FsAccess::ReadExec),
     };
-    assert_eq!(actual & required, required, "the declared access must be present");
+    assert_eq!(
+        actual & required,
+        required,
+        "the declared access must be present"
+    );
     if mode == WorkspaceAclMode::ReadOnly {
         let write_only_bits = workspace_rwx_mask() & !required;
-        assert_eq!(actual & write_only_bits, 0, "RO preparation must not grant write bits");
+        assert_eq!(
+            actual & write_only_bits,
+            0,
+            "RO preparation must not grant write bits"
+        );
     }
     assert_eq!(
         sid_effective_ace_mask(&control, cap.as_psid()).expect("read control DACL"),
@@ -57,7 +68,10 @@ fn exercise(mode: WorkspaceAclMode, label: &str) {
     let second = start_workspace_preparation(&root, mode).expect("repeat preparation");
     assert_eq!(second.state_before, WorkspacePreparationState::Ready);
     assert_eq!(second.state, WorkspacePreparationState::Ready);
-    assert!(!second.job_started, "ready workspace must not start a second tree walk");
+    assert!(
+        !second.job_started,
+        "ready workspace must not start a second tree walk"
+    );
 }
 
 #[test]

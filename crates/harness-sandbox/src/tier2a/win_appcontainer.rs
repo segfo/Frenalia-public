@@ -398,18 +398,16 @@ pub fn current_session_grant_sid() -> Option<String> {
 // （`harness_sandbox::tier2a::win_appcontainer::preflight` 等）を変えないため、各モジュールの
 // 公開項目はここでglob再エクスポートする。
 
-mod acl_grant;
 /// [残課題#32] **DACLを組んで書く低レベルの口**のうち、「M本のACEを1つのDACLへ畳んで
 /// ノードあたり1回だけ書き、既存の子孫まで届かせる」側。`acl_grant`（何をどの主体へ許すかの
 /// 決定）とは触るものが違うので分けてある。**globで出さない**——`propagate_merged_dacl`という
 /// 名前は、それだけでは`set_dacl_propagating`との違いが分からないため。
 mod acl_dacl_write;
+mod acl_grant;
 /// 初回の救済walkを背景で回すジョブ（D-54）。**globではなく名前空間として公開する**
 /// ——`start`/`progress`/`wait_until_done`という短い名前は、それだけでは何のジョブか
 /// 分からないため（`grant_job::wait_until_done()`と書けば分かる）。
 pub mod grant_job;
-/// workspace capability ACE の準備本体。通常preflightと明示的な前払いCLIが共有する。
-mod workspace_prepare;
 /// Tier2a子を起こすまでの前口上（主体の導出・背景walkの待ち・spawn）。`run_shell`と
 /// ポリシーエディタのパス2が共有する（モジュールdoc参照）。
 mod launch;
@@ -429,6 +427,8 @@ mod revoke_subjects;
 mod spawn;
 mod spawn_session;
 mod traverse;
+/// workspace capability ACE の準備本体。通常preflightと明示的な前払いCLIが共有する。
+mod workspace_prepare;
 
 pub use acl_grant::*;
 pub use launch::*;
