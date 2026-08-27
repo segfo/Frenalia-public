@@ -207,9 +207,12 @@ pub(crate) fn fs_grant_traverse(_target: &Path) -> ExitCode {
 #[cfg(windows)]
 pub(crate) fn fs_revoke_traverse_one(path: &Path) -> ExitCode {
     // D-48: 走行中の他セッションがあるなら剥がさない。**委譲より前に**見るのは、UACを1回
-    // 払わせてから拒否しても払わせた意味が無いためで、`revoke-traverse-all`では台帳に載った
-    // 件数だけUACが出る。判定は昇格側と同じ関数（`traverse_revoke_guard`）を通し、
-    // 昇格側は昇格側でもう一度自分で見る（D-16。ここを通ったことを昇格側は信用しない）。
+    // 払わせてから拒否しても払わせた意味が無いためである。判定は昇格側と同じ関数
+    // （`traverse_revoke_guard`）を通し、昇格側は昇格側でもう一度自分で見る
+    // （D-16。ここを通ったことを昇格側は信用しない）。
+    //
+    // **一括撤収はここを通らない。** 台帳の全件をこの関数でループすると件数ぶんUACが出る
+    // ので、`fs_revoke_traverse_all`が要求を1本へ束ねる（`B-02`）。
     if let Err(e) = harness_sandbox::tier2a::win_appcontainer::traverse_revoke_guard(path) {
         eprintln!("{e}");
         return ExitCode::FAILURE;
@@ -255,8 +258,84 @@ pub(crate) fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
     }
 }
 
+/// 台帳に載った traverse ACE を**まとめて撤収する**（`harness fs revoke-traverse-all`）。
+///
+/// # なぜ単発版のループではないのか（`B-02`）
+///
+/// 付与側は既に束ねてある——`grant-traverse`は祖先チェーン全部を "UAC, one-time" で付与し、
+/// 起動時の付与（`GrantWorkspaceAccess`）も複数targetを1回で処理する。
+/// 撤収側だけが単発しか持っておらず、以前のこの関数は
+/// [`fs_revoke_traverse_one`]を台帳の件数だけ呼んでいた——**実機の563件で563回UACが出た**。
+///
+/// # 台帳から落とすのは「剥がせたもの」だけ
+///
+/// 失敗した分の記録を消すと、実マシンに残ったACEの在り処が分からなくなる（`B-01`）。
+/// 昇格側の応答は撤収できたパスと失敗を分けて返すので、前者だけを台帳から除去する。
+#[cfg(windows)]
+pub(crate) fn fs_revoke_traverse_all() -> ExitCode {
+    let ledger = harness_sandbox::tier2a::traverse_ledger::load_traverse_ledger();
+    if ledger.entries.is_empty() {
+        println!("(no traverse grants recorded)");
+        return ExitCode::SUCCESS;
+    }
+    let paths: Vec<PathBuf> = ledger.entries.iter().map(|e| PathBuf::from(&e.path)).collect();
+
+    // 昇格済みならヘルパーを起こす理由が無い（UAC 0回）。単発版と同じ関数を通す。
+    if harness_sandbox::tier2a::privhelper::is_elevated() {
+        let mut any_failed = false;
+        for path in &paths {
+            if fs_revoke_traverse_one_direct(path) != ExitCode::SUCCESS {
+                any_failed = true;
+            }
+        }
+        return if any_failed {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+
+    println!(
+        "revoking {} traverse ACE(s) through the privilege-separation helper (one UAC prompt)...",
+        paths.len()
+    );
+    match harness_sandbox::tier2a::privhelper::run_privileged_revoke_traverse_batch(paths.clone()) {
+        Ok((revoked, failures)) => {
+            for path in &revoked {
+                harness_sandbox::tier2a::traverse_ledger::remove_traverse_grant(path);
+            }
+            println!("revoked traverse ACE on {} node(s)", revoked.len());
+            if failures.is_empty() {
+                return ExitCode::SUCCESS;
+            }
+            // **残した理由を黙らせない。** 件数だけだと「なぜ残ったか」が追えず、
+            // 走行中セッションによる正当な拒否（D-48）と本物の失敗が混ざる。
+            eprintln!(
+                "{} node(s) were left in place (ledger entries kept so a retry finds them):",
+                failures.len()
+            );
+            for (path, reason) in &failures {
+                eprintln!("  {} : {reason}", path.display());
+            }
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            // **1件も台帳から落とさない。** 要求ごと失敗しているので、どのACEが
+            // 剥がれたかを名乗れる情報が無い（部分適用を勝手に仮定しない）。
+            eprintln!("revoke-traverse-all failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(not(windows))]
 pub(crate) fn fs_revoke_traverse_one(_path: &Path) -> ExitCode {
     eprintln!("error: fs revoke-traverse is Windows-only (Tier2a specific)");
+    ExitCode::FAILURE
+}
+
+#[cfg(not(windows))]
+pub(crate) fn fs_revoke_traverse_all() -> ExitCode {
+    eprintln!("error: fs revoke-traverse-all is Windows-only (Tier2a specific)");
     ExitCode::FAILURE
 }

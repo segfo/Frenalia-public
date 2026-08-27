@@ -259,6 +259,23 @@ pub enum PrivilegedRequest {
     GrantTraverse { target: PathBuf },
     /// `GrantTraverse`で付与したACEを1件撤収する（`harness fs revoke-traverse`）。
     RevokeTraverse { path: PathBuf },
+    /// `GrantTraverse`で付与したACEを**まとめて1回のUACで**撤収する
+    /// （`harness fs revoke-traverse-all`）。
+    ///
+    /// # なぜ単発版と別に要るのか（`B-02`: 片側に入れた変更は逆操作へ波及させる）
+    ///
+    /// **付与側は既に束ねてある**——[`PrivilegedRequest::GrantWorkspaceAccess`]の
+    /// `traverse_targets`は複数targetを1回のUACで処理し、[`PrivilegedRequest::GrantTraverse`]
+    /// 自身も祖先チェーン全部を1回で付与する（コマンドの説明文も "UAC, one-time" と名乗る）。
+    /// ところが撤収側は単発の[`PrivilegedRequest::RevokeTraverse`]しか無く、
+    /// `revoke-traverse-all`は**それを台帳の件数だけループする**実装だった
+    /// ——実機の563件で563回UACが出て、操作そのものが成立しなかった。
+    ///
+    /// **エントリごとに成否は独立する**（`RevokeFsAllow`と同じで、`GrantTraverse`のような
+    /// 連鎖ではない）。走行中セッションによる撤収拒否（D-48）も1件の失敗として扱い、
+    /// 他のエントリを止めない——1件で打ち切ると、残りのACEが実マシンに残ったまま
+    /// 「撤収した」と読める終わり方になる。
+    RevokeTraverseBatch { paths: Vec<PathBuf> },
     /// `harness fs revoke`/`revoke-all`が本体プロセス内（非管理者）で撤収しきれなかった
     /// パス（`GrantWorkspaceAccess`でシステム保護パスへ付与したACE等）をまとめて1回のUACで
     /// 撤収する（付与側の裏対称、`BUG-015`参照）。各エントリは`revoke_harness_subjects`
@@ -347,6 +364,17 @@ pub enum PrivilegedResponse {
     RevokeFsAllowResult {
         revoked: Vec<PathBuf>,
         root_cleared: Vec<PathBuf>,
+        failures: Vec<(PathBuf, String)>,
+    },
+    /// `RevokeTraverseBatch`の結果。エントリごとに成否が独立する（連鎖ではない）。
+    ///
+    /// **呼び出し側が台帳から除去してよいのは`revoked`だけである。**
+    /// `failures`の分まで消すと、実マシンに残ったACEへ**二度と到達できなくなる**
+    /// ——traverse ACEの主体は固定名から導出されるので名前は失われないが、
+    /// 「どのパスに付けたか」は台帳にしか無い（`B-01`「名前を捨てる操作は最後に置き、
+    /// 剥がせたことを確認できたときだけ捨てる」）。
+    RevokeTraverseBatchResult {
+        revoked: Vec<PathBuf>,
         failures: Vec<(PathBuf, String)>,
     },
     /// 要求全体を拒否した場合の単純な失敗（スキーマ不一致等、部分適用の概念が無い操作）。
@@ -557,8 +585,9 @@ mod client;
 mod server;
 
 pub use client::{
-    run_privileged, run_privileged_revoke_fs_allow, run_privileged_workspace_access, ChainLauncher,
-    FsAllowRevokeOutcome, HELPER_EXE_NAME,
+    run_privileged, run_privileged_revoke_fs_allow, run_privileged_revoke_traverse_batch,
+    run_privileged_workspace_access, ChainLauncher, FsAllowRevokeOutcome, HELPER_EXE_NAME,
+    TraverseRevokeBatchOutcome,
 };
 pub use server::serve;
 
@@ -968,6 +997,31 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
             r#"{"RevokeFsAllow":{"entries":[{"path":"C:/x","forced":false,"subjects":[{"secret_hex":"00112233445566778899aabbccddeeff","access":"read"}]}]}}"#
+        );
+    }
+
+    /// `revoke-traverse-all`が**1回のUAC**で撤収するための要求と応答の形を固定する（`B-02`）。
+    ///
+    /// **単発の`RevokeTraverse`と別の形であることに意味がある**——応答がパスごとの成否を
+    /// 運べないと、呼び出し側は「どれを台帳から落としてよいか」を決められず、
+    /// 剥がせていないACEの記録まで消してしまう（`B-01`）。
+    #[test]
+    fn revoke_traverse_batch_request_and_result_json_wire_format_is_stable() {
+        let req = PrivilegedRequest::RevokeTraverseBatch {
+            paths: vec![PathBuf::from("C:/x"), PathBuf::from("C:/y")],
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"RevokeTraverseBatch":{"paths":["C:/x","C:/y"]}}"#
+        );
+
+        let res = PrivilegedResponse::RevokeTraverseBatchResult {
+            revoked: vec![PathBuf::from("C:/x")],
+            failures: vec![(PathBuf::from("C:/y"), "in use".to_string())],
+        };
+        assert_eq!(
+            serde_json::to_string(&res).unwrap(),
+            r#"{"RevokeTraverseBatchResult":{"revoked":["C:/x"],"failures":[["C:/y","in use"]]}}"#
         );
     }
 

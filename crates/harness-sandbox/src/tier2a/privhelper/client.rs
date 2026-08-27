@@ -53,6 +53,10 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
             "unexpected WorkspaceAccessResult response for a non-GrantWorkspaceAccess request"
                 .to_string(),
         )),
+        PrivilegedResponse::RevokeTraverseBatchResult { .. } => Err(PrivHelperError::Ipc(
+            "unexpected RevokeTraverseBatchResult response for a non-RevokeTraverseBatch request"
+                .to_string(),
+        )),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }
 }
@@ -95,7 +99,7 @@ pub fn run_privileged_workspace_access(
     let envelope = PrivilegedRequestEnvelope {
         request: PrivilegedRequest::GrantWorkspaceAccess {
             traverse_targets,
-            fs_allow_entries,
+            fs_allow_entries,
         },
         chain_netfilterd_pipe: chain_pipe,
     };
@@ -124,6 +128,10 @@ pub fn run_privileged_workspace_access(
             "unexpected RevokeFsAllowResult response for a GrantWorkspaceAccess request"
                 .to_string(),
         )),
+        PrivilegedResponse::RevokeTraverseBatchResult { .. } => Err(PrivHelperError::Ipc(
+            "unexpected RevokeTraverseBatchResult response for a GrantWorkspaceAccess request"
+                .to_string(),
+        )),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }
 }
@@ -149,6 +157,54 @@ pub fn run_privileged_revoke_fs_allow(
         )),
         PrivilegedResponse::WorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
             "unexpected WorkspaceAccessResult response for a RevokeFsAllow request".to_string(),
+        )),
+        PrivilegedResponse::RevokeTraverseBatchResult { .. } => Err(PrivHelperError::Ipc(
+            "unexpected RevokeTraverseBatchResult response for a RevokeFsAllow request".to_string(),
+        )),
+        PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
+    }
+}
+
+/// `run_privileged_revoke_traverse_batch`の成功値（撤収できたパス一覧、`(path, reason)`失敗一覧）。
+///
+/// **台帳から落としてよいのは第1要素だけ**（[`PrivilegedResponse::RevokeTraverseBatchResult`]）。
+pub type TraverseRevokeBatchOutcome = (Vec<PathBuf>, Vec<(PathBuf, String)>);
+
+/// `RevokeTraverseBatch`専用の委譲関数——**`harness fs revoke-traverse-all`のUACを1回にする**。
+///
+/// 付与側（`GrantWorkspaceAccess`の`traverse_targets`）の裏対称である。これが無かった頃、
+/// `revoke-traverse-all`は単発の`RevokeTraverse`を台帳の件数だけ呼んでおり、
+/// **1エントリにつき1回UACが出た**（`B-02`）。
+///
+/// 昇格済みで走っているなら**この関数を通さないこと**——呼び出し側が
+/// `fs_revoke_traverse_one_direct`を直接ループすればUACは0回で済む。
+pub fn run_privileged_revoke_traverse_batch(
+    paths: Vec<PathBuf>,
+) -> Result<TraverseRevokeBatchOutcome, PrivHelperError> {
+    let envelope =
+        PrivilegedRequestEnvelope::from(PrivilegedRequest::RevokeTraverseBatch { paths });
+    match run_privileged_raw(&envelope, None)? {
+        PrivilegedResponse::RevokeTraverseBatchResult { revoked, failures } => {
+            Ok((revoked, failures))
+        }
+        // 旧ヘルパー（この要求を知らない版）は要求そのものを拒むので`Err`で返る。
+        // ここへ来る`Ok`は「何もしていない」を意味するので、**空の成功にしない**
+        // ——空を返すと呼び出し側は「0件撤収できた」と読み、台帳を1件も落とさないまま
+        // 成功を報告する（`B-09`: 失敗を成功に見せない）。
+        PrivilegedResponse::Ok => Err(PrivHelperError::Ipc(
+            "helper answered RevokeTraverseBatch with a bare Ok (no per-path outcome); \
+             it is probably an older build that does not know this request"
+                .to_string(),
+        )),
+        PrivilegedResponse::GrantChain { .. } => Err(PrivHelperError::Ipc(
+            "unexpected GrantChain response for a RevokeTraverseBatch request".to_string(),
+        )),
+        PrivilegedResponse::RevokeFsAllowResult { .. } => Err(PrivHelperError::Ipc(
+            "unexpected RevokeFsAllowResult response for a RevokeTraverseBatch request".to_string(),
+        )),
+        PrivilegedResponse::WorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
+            "unexpected WorkspaceAccessResult response for a RevokeTraverseBatch request"
+                .to_string(),
         )),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }

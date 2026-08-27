@@ -455,6 +455,35 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 Err(e) => PrivilegedResponse::Err(e.to_string()),
             }
         }
+        PrivilegedRequest::RevokeTraverseBatch { paths } => {
+            // **件数だけ出す。** パスを1行ずつ落とすと、台帳の規模（実機で500件超）が
+            // そのまま`privhelper.log`へ積まれる。個々の失敗理由は応答で返るので、
+            // 呼び出し側が人へ見せる（`GrantWorkspaceAccess`と同じ方針）。
+            log::line(&format!(
+                "dispatch: RevokeTraverseBatch {} path(s)",
+                paths.len()
+            ));
+            // 単発の`RevokeTraverse`と**同じ関数**を通す（`code-structure-rules` §5.1: 対の
+            // 操作は同じ実装を通る）。`revoke_traverse_grant`は主体のcapability SIDを自ら
+            // 導出し、走行中セッションの検査（D-48の`traverse_revoke_guard`）と撤収済み検証を
+            // 一体で行う——**非昇格側が同じ検査を通していても、ここでもう一度見る**（D-16）。
+            let mut revoked: Vec<PathBuf> = Vec::new();
+            let mut failures: Vec<(PathBuf, String)> = Vec::new();
+            for path in paths {
+                match win_appcontainer::revoke_traverse_grant(&path) {
+                    // 1件の失敗で打ち切らない。打ち切ると残りのACEが実マシンに残ったまま
+                    // 「撤収した」と読める終わり方になる（`RevokeFsAllow`と同じ理由）。
+                    Ok(()) => revoked.push(path),
+                    Err(e) => failures.push((path, e.to_string())),
+                }
+            }
+            log::line(&format!(
+                "dispatch: RevokeTraverseBatch done, revoked={} failed={}",
+                revoked.len(),
+                failures.len()
+            ));
+            PrivilegedResponse::RevokeTraverseBatchResult { revoked, failures }
+        }
         PrivilegedRequest::GrantWorkspaceAccess {
             traverse_targets,
             fs_allow_entries,

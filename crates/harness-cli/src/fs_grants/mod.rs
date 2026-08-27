@@ -183,23 +183,7 @@ pub fn run_fs_subcommand(action: FsAction) -> ExitCode {
         FsAction::RevokeWorkspace { path } => fs_revoke_workspace(&path),
         FsAction::RevokeWorkspaceAll => fs_revoke_workspace_all(),
         FsAction::RevokeTraverse { path } => fs_revoke_traverse_one(&path),
-        FsAction::RevokeTraverseAll => {
-            let ledger = harness_sandbox::tier2a::traverse_ledger::load_traverse_ledger();
-            if ledger.entries.is_empty() {
-                println!("(no traverse grants recorded)");
-                return ExitCode::SUCCESS;
-            }
-            let mut any_failed = false;
-            for entry in ledger.entries.clone() {
-                if fs_revoke_traverse_one(&PathBuf::from(&entry.path)) != ExitCode::SUCCESS {
-                    any_failed = true;
-                }
-            }
-            if any_failed {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            }
-        }
+        // **単発版をループしないこと。** 台帳の件数だけUACが出る（`B-02`、実機563件で操作不能）。
+        FsAction::RevokeTraverseAll => fs_revoke_traverse_all(),
     }
 }
