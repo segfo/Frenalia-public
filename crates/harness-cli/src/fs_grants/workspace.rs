@@ -5,6 +5,59 @@
 use super::progress::{Spinner, WalkProgress};
 use super::*;
 
+/// [B-01] **撤収が終わったworkspaceについて、台帳から落としてよい記録の鍵。**
+///
+/// 台帳の記録は「そのACEの主体をもう一度導出するための唯一の名前」なので、
+/// これを作ってよいのは**ACEを剥がし終えたあと**だけである（順序が逆だと、
+/// 撤収経路の無い孤立ACEがツリーに残る。`forget_capability`のdoc、BUG-017/BUG-059）。
+///
+/// 値として持ち回るのは`revoke-workspace-all`のためである——N件を1件ずつ落とすと
+/// 台帳の全文読み書きがN×3回走る（[`forget_revoked_ledger_records`]のdoc）。
+#[cfg(windows)]
+struct ForgettableWorkspace {
+    /// canonicalize済みのworkspaceパス（`workspace_ledger`側の鍵）。
+    path: PathBuf,
+    /// capability台帳から落としてよいモードの綴り（`rwx`/`ro`）。**撤収の対象にしたものだけ**。
+    modes: Vec<&'static str>,
+}
+
+/// 1つのworkspaceに対する撤収の結末。**台帳を触ってよいかどうかだけを呼び出し側へ伝える。**
+#[cfg(windows)]
+enum WorkspaceRevokeOutcome {
+    /// 剥がし終えた。記録を落としてよい。
+    Revoked(ForgettableWorkspace),
+    /// 本体プロセス内（非管理者）では剥がしきれなかった。**特権分離ヘルパーへ委譲する材料**
+    /// を持つ。台帳の記録は、昇格後に剥がせたことを検算してから落とす（B-01）。
+    NeedsElevation(WorkspaceEscalation),
+    /// 撤収が完了しておらず、昇格しても変わらない（使用中・SID解決に失敗・既に管理者で
+    /// 走っていた）。**台帳の記録は残す**（B-01）。理由は既にこの関数が印字している。
+    Incomplete,
+}
+
+/// [D-84の裏対称] 昇格側へ委譲する1件分の材料。
+///
+/// # なぜ「要求」と「検算の材料」を両方持つのか
+///
+/// ヘルパーの応答は`(撤収できたworkspace, 失敗)`しか返さない。**その応答だけを根拠に
+/// 台帳を落としてはならない**（`B-25`/`B-33`: 他人の成功報告を自分の結論にしない）ので、
+/// 呼び出し側はrootのDACLを読み直して主体が残っていないことを確かめる。その照合に要る
+/// SIDは**非昇格側が既に解決済み**なので、もう一度引き直さずここへ持ち回す
+/// ——引き直すと`workspace_capability_sid`（無ければ発行する側）を撤収経路で呼ぶことになる。
+#[cfg(windows)]
+struct WorkspaceEscalation {
+    /// 昇格側へ送る封筒の1エントリ。**秘密の前像だけ**が載る（SIDも名前も送らない）。
+    request: harness_sandbox::tier2a::privhelper::WorkspaceRevoke,
+    /// 撤収し終えたことを検算できたときに、台帳から落としてよい記録。
+    forgettable: ForgettableWorkspace,
+    /// 検算に使うworkspace capabilityの主体（`(表示名, SID)`）。
+    capability_sids: Vec<(String, harness_sandbox::win_common::OwnedSid)>,
+    /// 検算に使うharnessプロファイルの主体（`(プロファイル名, SID)`）。
+    profile_sids: Vec<(
+        String,
+        harness_sandbox::tier2a::win_appcontainer::OwnedContainerSid,
+    )>,
+}
+
 /// workspace本体のACE（`preflight`が毎回付与するRWX/RO）を撤収する。名前付きmutexで
 /// 「今もこのworkspaceを使っている他のharnessセッションが無いか」を確認してから撤収する
 /// （`harness_sandbox::tier2a::workspace_ledger`参照）。CoWのdiff_layer_dirには一切触れない。
@@ -14,8 +67,36 @@ use super::*;
 /// 旧実装はSIDごとに`revoke_ace_recursive`を呼び直しており、D-54以降ツリーのACEは
 /// capability SID宛（プロファイルSID宛ではない）なので、プロファイルSIDでの撤収walkは
 /// 全ノードが空振りの読取+書込になっていた（docs/bugs/BUG-082.md）。
+/// [D-84の裏対称] **単発コマンドも一括コマンドと同じ経路を通る。** `entries`が1件の
+/// 昇格要求として撃つので、入口が2つに割れない（`code-structure-rules` §5.1）。
 #[cfg(windows)]
 pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
+    match revoke_one_workspace(path) {
+        WorkspaceRevokeOutcome::Revoked(forgettable) => {
+            forget_revoked_ledger_records(std::slice::from_ref(&forgettable));
+            ExitCode::SUCCESS
+        }
+        WorkspaceRevokeOutcome::NeedsElevation(escalation) => {
+            let (forgettable, any_failed) = escalate_workspace_revokes(vec![escalation]);
+            forget_revoked_ledger_records(&forgettable);
+            if any_failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        WorkspaceRevokeOutcome::Incomplete => ExitCode::FAILURE,
+    }
+}
+
+/// [`fs_revoke_workspace`]の本体から**台帳の書換だけを外したもの**。
+///
+/// 分けてあるのは`revoke-workspace-all`のためである。あちらはN件を回すので、
+/// 台帳の書換を1件ずつ行うと全文の読み書きがN×3回走る（[`forget_revoked_ledger_records`]）。
+/// **判定と印字はここ、記録を落とすのは呼び出し側**、という分け方にしてあり、
+/// 「剥がせたか」の判定を2箇所へ書かない（B-05）。
+#[cfg(windows)]
+fn revoke_one_workspace(path: &Path) -> WorkspaceRevokeOutcome {
     // [BUG-082フォローアップ] canonicalize〜SID解決は通常ミリ秒オーダーだが、ユーザーからの
     // 実機報告により「最初の1行が出るまで無反応に見える」区間がある以上、ここも空で待たせない。
     let mut spinner = Some(Spinner::start(
@@ -27,7 +108,7 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
         Err(e) => {
             drop(spinner.take());
             eprintln!("failed to canonicalize {}: {e}", path.display());
-            return ExitCode::FAILURE;
+            return WorkspaceRevokeOutcome::Incomplete;
         }
     };
     let live = harness_sandbox::tier2a::workspace_ledger::live_modes(&canonical);
@@ -39,7 +120,7 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
             canonical.display(),
             live.join(", ")
         );
-        return ExitCode::FAILURE;
+        return WorkspaceRevokeOutcome::Incomplete;
     }
 
     // D-54: workspaceツリーのACEの**現在の主体**は、workspace＋モード単位のcapability SIDで
@@ -88,15 +169,19 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
             canonical.display(),
             resolve_failures.join("; ")
         );
-        return ExitCode::FAILURE;
+        return WorkspaceRevokeOutcome::Incomplete;
     }
     if capability_targets.is_empty() && profile_targets.is_empty() {
         drop(spinner.take());
-        harness_sandbox::tier2a::workspace_ledger::remove_workspace_entry(&canonical);
         // 台帳が空でも、過去のセッションが`.harness/**`へ立てた継承遮断は残り得る。
         report_harness_control_dir_unprotected(&canonical);
         println!("(nothing recorded to revoke for {})", canonical.display());
-        return ExitCode::SUCCESS;
+        // 剥がす主体が1つも無い＝ツリーに残せるACEも無いので、workspace一覧の記録は落としてよい。
+        // capability台帳には元から何も無いので`modes`は空。
+        return WorkspaceRevokeOutcome::Revoked(ForgettableWorkspace {
+            path: canonical,
+            modes: Vec::new(),
+        });
     }
 
     let all_sids: Vec<_> = capability_targets
@@ -129,39 +214,344 @@ pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
     walk_progress.finish();
 
     match result {
-        Ok(report) => {
-            // ACEを剥がし終えてから台帳を落とす——順序が逆だと主体を引けなくなり、撤収経路の
-            // 無い孤立ACEがツリーに残る（`forget_capability`のdoc、BUG-017/BUG-059と同じ不変条件）。
-            for (mode, _, _) in &capability_targets {
-                harness_sandbox::tier2a::workspace_capability::forget_capability(&canonical, mode);
+        // [BUG-103] walkは1ノードの失敗では止まらなくなったので、**「剥がせなかったノードが
+        // 在るか」は`Err`ではなく`report.blocked`が持つ**。`Err`が来るのはrootにすら触れなかった
+        // ときだけである。ここで`blocked`を無視して成功扱いにすると、剥がし残しがあるのに
+        // 台帳を落とす形になり、直した`?`中断より悪い状態（主体を導出できない孤立ACE）になる。
+        Ok(report) => match report.blocked_summary(5) {
+            // --- 完全撤収 ---
+            None => {
+                // ACEを剥がし終えてから台帳を落とす——順序が逆だと主体を引けなくなり、撤収経路の
+                // 無い孤立ACEがツリーに残る（`forget_capability`のdoc、BUG-017/BUG-059と同じ
+                // 不変条件）。実際に落とすのは呼び出し側で、ここは「落としてよい」だけを返す。
+                report_harness_control_dir_unprotected(&canonical);
+                println!(
+                    "revoked workspace access for {}: checked {} node(s), rewrote {} node(s) \
+                     ({} workspace capability/capabilities, {} harness profile(s))",
+                    canonical.display(),
+                    report.checked,
+                    report.rewritten,
+                    capability_targets.len(),
+                    profile_targets.len()
+                );
+                WorkspaceRevokeOutcome::Revoked(ForgettableWorkspace {
+                    modes: capability_targets.iter().map(|(mode, _, _)| *mode).collect(),
+                    path: canonical,
+                })
             }
-            harness_sandbox::tier2a::workspace_ledger::remove_workspace_entry(&canonical);
-            report_harness_control_dir_unprotected(&canonical);
-            println!(
-                "revoked workspace access for {}: checked {} node(s), rewrote {} node(s) \
-                 ({} workspace capability/capabilities, {} harness profile(s))",
-                canonical.display(),
-                report.checked,
-                report.rewritten,
-                capability_targets.len(),
-                profile_targets.len()
-            );
-            ExitCode::SUCCESS
-        }
+            // --- 部分完了: ツリーの大半は剥がれたが、剥がせないノードが残った ---
+            Some(summary) => {
+                // **件数ではなく名前を出す**（B-09）。`0x80070005`（アクセス拒否）で残った
+                // ノードは`icacls <path> /remove:g *<SID>`でしか片付かず、名前が無いと
+                // どこを叩けばよいのか分からない。文面の作法（先頭5件＋残件数）は
+                // `RevokeReport::blocked_summary`と`ReclaimOutcome::summary`に揃えてある。
+                unfinished_workspace(
+                    canonical,
+                    capability_targets,
+                    profile_targets,
+                    format!(
+                        "{summary} (checked {} node(s), rewrote {} node(s))",
+                        report.checked, report.rewritten
+                    ),
+                )
+            }
+        },
         Err(e) => {
-            // 台帳エントリは意図的に残す——どのノードまで剥がせたか（＝どのSIDが本当に
-            // 消えたか）が分からない部分完了なので、ここで`forget_capability`すると
-            // 撤収経路の無い孤立ACEを作りかねない。再実行すれば同じ対象を再度解決できる。
-            eprintln!(
-                "failed to revoke workspace access for {}: {e} (checked up to node {}; workspace \
-                 capability and profile ledger entries were left intact so a retry finds the same \
-                 targets)",
-                canonical.display(),
-                last_reported
-            );
-            ExitCode::FAILURE
+            // rootにすら触れなかった（あるいはツリーを列挙できなかった）。1ノードも剥がせて
+            // いない。
+            unfinished_workspace(
+                canonical,
+                capability_targets,
+                profile_targets,
+                format!("{e} (checked up to node {last_reported})"),
+            )
         }
     }
+}
+
+/// 本体プロセス内（非管理者）で剥がしきれなかったときの振り分け。
+///
+/// # なぜここで分岐が要るのか（この機構が無かったころ）
+///
+/// `harness fs revoke-workspace(-all)`には**昇格へ委譲する分岐が1つも無かった**——
+/// `run_privileged*`も`is_elevated()`も現れず、台帳がN件でも特権の往復は0回だった。
+/// `BUILTIN\Administrators`所有のノードは非昇格のままではDACLを書けないので、
+/// 実機では14ノード中2ノードが`0x80070005`（アクセス拒否）で残り、**そこで終わっていた**。
+/// 付与側（`preflight`）は同じ状況を`GrantWorkspaceAccess`で1回のUACへ束ねていたので、
+/// 付与と撤収で経路の数が違っていたことになる（`B-02`）。
+///
+/// # 台帳エントリは、どちらへ倒れても残す
+///
+/// 台帳に載っている名前は、そのACEの主体（capability SID）を導出するための**唯一の索引**
+/// である。先に捨てると、残ったACEはどのコマンドでも剥がせない孤児になる
+/// （`B-01`: 名前で到達する設計では、名前を捨てる操作を最後に置く）。
+#[cfg(windows)]
+fn unfinished_workspace(
+    canonical: PathBuf,
+    capability_targets: Vec<(
+        &'static str,
+        String,
+        harness_sandbox::win_common::OwnedSid,
+    )>,
+    profile_targets: Vec<(
+        String,
+        harness_sandbox::tier2a::win_appcontainer::OwnedContainerSid,
+    )>,
+    reason: String,
+) -> WorkspaceRevokeOutcome {
+    if harness_sandbox::tier2a::privhelper::is_elevated() {
+        // 既に管理者トークンで走っている＝**いま回したwalkが「直接実行」そのもの**である
+        // （`fs_grant_traverse`/`fs_revoke_one`の2段構えで言えば、1段目と2段目が同じ）。
+        // ヘルパーを起こす理由が無い（UACは0回）うえ、同じトークンで再walkしても結果は
+        // 変わらない——実機で26万ノード級のツリーをもう一度歩くだけになる。
+        eprintln!(
+            "failed to revoke workspace access for {}: {reason} (already running elevated, so \
+             the helper would use the same token; workspace capability and profile ledger \
+             entries were left intact so a retry finds the same targets)",
+            canonical.display()
+        );
+        return WorkspaceRevokeOutcome::Incomplete;
+    }
+
+    let modes: Vec<&'static str> = capability_targets.iter().map(|(mode, _, _)| *mode).collect();
+    // [§22.3.1と同じ規律] **昇格側へ渡すのは秘密の前像だけ**（SIDも名前も渡さない）。
+    let subjects = workspace_subjects_for(&canonical, &modes);
+    let profiles: Vec<String> = profile_targets.iter().map(|(name, _)| name.clone()).collect();
+    if subjects.len() != modes.len() {
+        // 索引は引けたのに前像が引けない＝台帳が壊れている。**黙って少ない集合を送らない**
+        // （送ると、剥がせなかった主体があるのに応答は成功で返り得る、`B-09`）。
+        eprintln!(
+            "  note: only {} of {} workspace capability preimage(s) could be read from the \
+             ledger; the helper cannot strip the rest",
+            subjects.len(),
+            modes.len()
+        );
+    }
+    eprintln!(
+        "escalating {}: {reason} -- retrying through the privilege-separation helper",
+        canonical.display()
+    );
+
+    WorkspaceRevokeOutcome::NeedsElevation(WorkspaceEscalation {
+        request: harness_sandbox::tier2a::privhelper::WorkspaceRevoke {
+            workspace: canonical.clone(),
+            subjects,
+            profiles,
+        },
+        forgettable: ForgettableWorkspace {
+            path: canonical,
+            modes,
+        },
+        capability_sids: capability_targets
+            .into_iter()
+            .map(|(mode, name, sid)| (format!("{name} ({mode})"), sid))
+            .collect(),
+        profile_sids: profile_targets,
+    })
+}
+
+/// [§22.3.1と同じ規律] 昇格側へ渡す**workspace capabilityの前像**（`(秘密, mode)`）を組み立てる。
+///
+/// **SIDも名前も渡さない。** 受信側が秘密から名前を畳んで導出する（`privhelper`モジュールdoc）。
+///
+/// **秘密を引くのはこの関数だけにしてある**（宣言側の`declaration_subjects_for`と同じ方針）。
+/// 持ち回る場所が増えると、ログやエラー文へ載る面が増える。
+///
+/// 引くのは**撤収の対象にしたモードだけ**である。台帳の全エントリを渡すと、宣言
+/// （`declaration`が`Some`＝`--fs-allow`の主体）の秘密まで昇格側へ流れる——あれは
+/// workspaceの外の宣言パスに載っているACEの主体で、workspace撤収とは別の扉が持つ。
+#[cfg(windows)]
+fn workspace_subjects_for(
+    canonical: &Path,
+    modes: &[&'static str],
+) -> Vec<harness_sandbox::tier2a::privhelper::WorkspaceRevokeSubject> {
+    // 突合の綴りは台帳側の畳み込み規則（`workspace_key`）をそのまま借りる（`B-19`/§22.5）。
+    let key = harness_sandbox::tier2a::workspace_capability::workspace_key(canonical);
+    harness_sandbox::tier2a::workspace_capability::all_entries()
+        .into_iter()
+        .filter(|entry| {
+            entry.declaration.is_none()
+                && modes.contains(&entry.mode.as_str())
+                && harness_sandbox::tier2a::workspace_capability::workspace_key(Path::new(
+                    &entry.workspace,
+                )) == key
+        })
+        .map(
+            |entry| harness_sandbox::tier2a::privhelper::WorkspaceRevokeSubject {
+                secret_hex: entry.secret_hex,
+                mode: entry.mode,
+            },
+        )
+        .collect()
+}
+
+/// [D-84の裏対称] 剥がしきれなかったworkspaceを、**N件を1本の封筒で**特権分離ヘルパーへ渡す
+/// （UACは1回）。返り値は`(台帳から落としてよい記録, 1件でも失敗したか)`。
+///
+/// # ヘルパーの応答だけを根拠に成功を名乗らない
+///
+/// 応答で`revoked`に載っていても、そのworkspaceのrootのDACLを**読み直して**主体が
+/// 残っていないことを確かめてから台帳を落とす（`B-25`/`B-33`）。読むのはroot 1ノードの
+/// 明示ACEだけなので、ツリーを再walkはしない（`fs revoke`の昇格後検算と同じ形）。
+#[cfg(windows)]
+fn escalate_workspace_revokes(
+    escalations: Vec<WorkspaceEscalation>,
+) -> (Vec<ForgettableWorkspace>, bool) {
+    if escalations.is_empty() {
+        return (Vec::new(), false);
+    }
+    println!(
+        "revoking workspace access for {} workspace(s) through the privilege-separation helper \
+         (one UAC prompt)...",
+        escalations.len()
+    );
+    let entries: Vec<_> = escalations.iter().map(|e| e.request.clone()).collect();
+    let (revoked, failures) =
+        match harness_sandbox::tier2a::privhelper::run_privileged_revoke_workspace_access(entries) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // **1件も台帳から落とさない。** 要求ごと失敗しているので、どのACEが
+                // 剥がれたかを名乗れる情報が無い（部分適用を勝手に仮定しない）。
+                eprintln!("revoke-workspace via the privilege-separation helper failed: {e}");
+                return (Vec::new(), true);
+            }
+        };
+
+    let mut forgettable = Vec::new();
+    let mut any_failed = false;
+    for escalation in escalations {
+        let workspace = escalation.request.workspace.clone();
+        if !revoked.iter().any(|p| p == &workspace) {
+            any_failed = true;
+            let reason = failures
+                .iter()
+                .find(|(p, _)| p == &workspace)
+                .map(|(_, reason)| reason.clone())
+                .unwrap_or_else(|| {
+                    "the helper returned no outcome for this workspace".to_string()
+                });
+            eprintln!(
+                "failed to revoke workspace access for {}: {reason} (ledger entries were left \
+                 intact so a retry finds the same targets)",
+                workspace.display()
+            );
+            continue;
+        }
+        // ヘルパーは「剥がした」と言っている。実DACLで確かめる。
+        let still = workspace_root_still_carrying(&escalation);
+        if !still.is_empty() {
+            any_failed = true;
+            eprintln!(
+                "the helper reported success for {} but ACEs are still on the root: {} (ledger \
+                 entries were left intact)",
+                workspace.display(),
+                still.join(", ")
+            );
+            continue;
+        }
+        // ACEが落ちたことを確かめた後で`.harness/**`の継承遮断を戻す——順序が逆だと、
+        // まだrootに残っているACEが継承で降りてくる（`report_harness_control_dir_unprotected`）。
+        report_harness_control_dir_unprotected(&workspace);
+        println!(
+            "revoked workspace access for {} via privilege-separation helper (UAC, one-time)",
+            workspace.display()
+        );
+        forgettable.push(escalation.forgettable);
+    }
+    (forgettable, any_failed)
+}
+
+/// 昇格後の検算——workspaceのrootに、撤収対象の主体の明示ACEがまだ載っていないか。
+///
+/// 戻り値は**残っていた主体の説明**（空なら剥がし終えている）。プローブ自体に失敗した場合も
+/// 残存として扱う——「確かめられなかった」を「消えていた」と読み替えると、剥がせていない
+/// ACEの索引を台帳から捨てて孤児にする（`B-01`/`B-10`）。
+#[cfg(windows)]
+fn workspace_root_still_carrying(escalation: &WorkspaceEscalation) -> Vec<String> {
+    let root = escalation.request.workspace.as_path();
+    let mut still = Vec::new();
+    for (label, sid) in &escalation.capability_sids {
+        if let Err(e) =
+            harness_sandbox::tier2a::win_appcontainer::assert_no_sid_ace(root, sid.as_psid())
+        {
+            still.push(format!("{label}: {e}"));
+        }
+    }
+    for (label, sid) in &escalation.profile_sids {
+        if let Err(e) =
+            harness_sandbox::tier2a::win_appcontainer::assert_no_sid_ace(root, sid.as_psid())
+        {
+            still.push(format!("{label}: {e}"));
+        }
+    }
+    still
+}
+
+/// [B-01] 撤収が終わったworkspaceの台帳記録を、**2つの台帳それぞれ1回のupdateで**まとめて落とす。
+///
+/// # なぜ1件ずつ落とさないのか
+///
+/// `Ledger::update`は1回ごとに「ロック→全文読み→直列化→`.bak`へ全文コピー→全文書き」を行う
+/// （`harness-grant-ledger/src/lib.rs`）。1件ずつだと`forget_capability`が2回＋
+/// `remove_workspace_entry`が1回、つまり**1エントリあたり台帳の全文読み書きが3回**走る。
+/// `revoke-workspace-all`は台帳のN件を回すので、そのままN倍になる。
+/// **述語を受けてまとめて落とす部品は既にある**ので、そこへ繋ぐだけでよい
+/// （`prune_capability_entries`・`prune_workspace_entries`。どちらも`harness fs prune`が使う）。
+///
+/// # 渡してよいのは「撤収に成功した集合」だけである
+///
+/// 剥がせなかったエントリを混ぜてはならない。台帳に載っている名前は、そのACEの主体
+/// （capability SID）を導出するための**唯一の索引**であり、先に捨てると残ったACEは
+/// どのコマンドでも剥がせない孤児になる。呼び出し側は[`WorkspaceRevokeOutcome::Revoked`]
+/// だけをここへ集めること。
+///
+/// # 途中で落ちたらどうなるか
+///
+/// `revoke-workspace-all`はN件のACEを剥がし終えてから台帳を1回書く。途中でプロセスが死ぬと、
+/// **既に剥がしたworkspaceの記録が残る**——再実行すると同じ対象を解決し、ACEが無いツリーを
+/// もう一度歩いて（`revoke_sids_from_node`が0件なら書込を省くので読取だけで）記録を落とす。
+/// 逆向き（記録を先に落として途中で死ぬ）は孤立ACEを作るので、倒す方向はこちらで正しい。
+#[cfg(windows)]
+fn forget_revoked_ledger_records(revoked: &[ForgettableWorkspace]) {
+    if revoked.is_empty() {
+        return;
+    }
+    // 突合の綴りは台帳側の畳み込み規則（`workspace_key`）をそのまま借りる。ここで自前に
+    // 小文字化や区切りの正規化を書くと、FS軸の畳み込みが2つになって`C:/x`と`c:\x`が
+    // 別物になる（`B-19`/§22.5）。
+    let keys: Vec<(String, &[&'static str])> = revoked
+        .iter()
+        .map(|w| {
+            (
+                harness_sandbox::tier2a::workspace_capability::workspace_key(&w.path),
+                w.modes.as_slice(),
+            )
+        })
+        .collect();
+
+    // capability台帳。**`declaration`が`Some`のエントリは落とさない**——あれが指すACEは
+    // workspaceの外の宣言パスに載っているので、workspaceを撤収したことはそのACEが消えたことを
+    // 意味しない（`WorkspaceCapabilityEntry::declaration`のdoc、`B-01`）。1件ずつ呼んでいた
+    // `forget_capability(ws, mode)`と同じ突合（workspace・declaration無し・mode一致）である。
+    harness_sandbox::tier2a::workspace_capability::prune_capability_entries(|entry| {
+        entry.declaration.is_none()
+            && keys.iter().any(|(key, modes)| {
+                modes.contains(&entry.mode.as_str())
+                    && harness_sandbox::tier2a::workspace_capability::workspace_key(Path::new(
+                        &entry.workspace,
+                    )) == *key
+            })
+    });
+
+    // workspace一覧台帳。突合は`remove_workspace_entry`と同じ`same_ledger_path`を使う
+    // （こちらの台帳は末尾の`\`まで畳む別の規則を持っているので、capability側の鍵で
+    // 代用しない）。
+    harness_sandbox::tier2a::workspace_ledger::prune_workspace_entries(|entry_path| {
+        let entry_path = entry_path.to_string_lossy();
+        revoked.iter().any(|w| {
+            harness_grant_ledger::same_ledger_path(&entry_path, &w.path.to_string_lossy())
+        })
+    });
 }
 
 /// [BUG-083] `.harness/**`に立てた継承遮断（`SE_DACL_PROTECTED`）を落として報告する。
@@ -196,8 +586,11 @@ pub(crate) fn fs_revoke_workspace(_path: &Path) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// 記録済みの全workspaceに対して`fs_revoke_workspace`を試みる。使用中のworkspaceは
-/// スキップし、それ以外を撤収する。
+/// 記録済みの全workspaceに対して撤収を試みる。使用中のworkspaceはスキップし、それ以外を撤収する。
+///
+/// **台帳の書換はループの外で1回だけ行う**（[`forget_revoked_ledger_records`]）。1件ずつ
+/// 落としていたころは、`Ledger::update`が毎回台帳の全文を読み書きするうえに1エントリあたり
+/// 3回呼ばれるので、記録が積もった実機（実測1,043件・155KB）では書換だけで時間を食っていた。
 #[cfg(windows)]
 pub(crate) fn fs_revoke_workspace_all() -> ExitCode {
     let ledger = harness_sandbox::tier2a::workspace_ledger::load_workspace_ledger();
@@ -206,6 +599,13 @@ pub(crate) fn fs_revoke_workspace_all() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let mut any_failed = false;
+    // [B-01] **撤収に成功したものだけ**を集める。剥がせなかったエントリを混ぜると、
+    // 残ったACEの主体を導出する索引ごと消えて孤児になる。
+    let mut forgettable = Vec::new();
+    // [D-84の裏対称] 本体内で剥がしきれなかったぶんは**貯めておいて1回の要求で送る**。
+    // 1件ずつ`run_privileged_*`を呼ぶと、台帳の件数だけUACが出る（`revoke-traverse-all`が
+    // 実機の563件で563回出したのと同じ形、`B-02`）。
+    let mut escalations = Vec::new();
     for entry in &ledger.entries {
         let path = PathBuf::from(&entry.path);
         let live = harness_sandbox::tier2a::workspace_ledger::live_modes(&path);
@@ -217,10 +617,16 @@ pub(crate) fn fs_revoke_workspace_all() -> ExitCode {
             );
             continue;
         }
-        if fs_revoke_workspace(&path) != ExitCode::SUCCESS {
-            any_failed = true;
+        match revoke_one_workspace(&path) {
+            WorkspaceRevokeOutcome::Revoked(w) => forgettable.push(w),
+            WorkspaceRevokeOutcome::NeedsElevation(escalation) => escalations.push(escalation),
+            WorkspaceRevokeOutcome::Incomplete => any_failed = true,
         }
     }
+    let (escalated, escalation_failed) = escalate_workspace_revokes(escalations);
+    forgettable.extend(escalated);
+    any_failed |= escalation_failed;
+    forget_revoked_ledger_records(&forgettable);
     if any_failed {
         ExitCode::FAILURE
     } else {

@@ -668,9 +668,26 @@ fn unprotect_dacl_restoring_inheritance(path: &Path) -> Result<bool, AppContaine
 /// 設定した保護状態を巻き込んで変更しない）。
 /// D-37: セッションが付けたACEを1件撤収する（`session_profile`の回収経路が注入する処理）。
 ///
-/// プロファイル名からSIDを導出して剥がし、ついでにworkspace一覧台帳からも消す。
+/// プロファイル名からSIDを導出して、そのツリーから剥がす。
 /// `session_profile`側はACL APIを知らない（規則3の分割線）ので、その具体をここが持つ。
 /// preflightの起動時GCと、CLIのセッション終了時撤収の**両方がこの1本を使う**。
+///
+/// # workspace一覧台帳はここでは触らない（B-01・BUG-057と同型）
+///
+/// かつてここは末尾で`workspace_ledger::remove_workspace_entry(path)`を呼んでいた。
+/// **それはパスごとに台帳の全文読み書きを起こす**——`Ledger::update`は1回ごとに
+/// 「ロック→全文読み→パース→直列化→（変化があれば）`.bak`へ全文コピー→全文書き」で、
+/// この開発機の台帳は数十KBある。呼び出し側の`session_profile::reclaim_targets_in`は
+/// `granted_paths`をループで回すので、そのまま**パス数倍**のI/Oになっていた。
+///
+/// 付与側（`session_profile::record_granted_paths`）は同じ理由で既にループの外へ
+/// 出してあり、撤収側だけがその未修正版として残っていた。いまは**剥がし終えたパスを
+/// 呼び出し側が集め、`workspace_ledger::prune_workspace_entries`（述語を受けて1回の
+/// updateで落とす）で畳む**。ここへ戻さないこと。
+///
+/// 一覧台帳を落とす条件も同時に変わった。以前は`revoke_ace_recursive`が失敗しても
+/// 無条件に消していたが、いまは**1ノードも残さず剥がせたパスだけ**が対象である
+/// （記録を先に捨てて実体が残る向きの失敗を作らない、B-01）。
 ///
 /// [BUG-103] **剥がせなかったノードを返す**（`session_profile::RevokeLeftovers`）。かつては
 /// `let _ = revoke_ace_recursive(...)`で捨てており、`%TEMP%`のような共有ツリーで1件も
@@ -695,13 +712,11 @@ pub fn revoke_session_grant(
             )]
         }
     };
-    let leftovers = match revoke_ace_recursive(path, sid.as_psid()) {
+    match revoke_ace_recursive(path, sid.as_psid()) {
         Ok(report) => report.blocked,
         // rootにすら触れなかった＝このツリーからは1件も剥がせていない。
         Err(e) => vec![(path.to_path_buf(), e.to_string())],
-    };
-    crate::tier2a::workspace_ledger::remove_workspace_entry(path);
-    leftovers
+    }
 }
 
 // `appcontainer_sid_aces`（パスのDACLに載っているパッケージSIDの列挙）と
@@ -859,9 +874,14 @@ pub(crate) fn revoke_sids_from_node(
 
 /// [BUG-103] 撤収1回分の結果。**件数と「剥がせなかったノード」を返す**。
 ///
-/// 姉妹の[`RevokeWorkspaceReport`]は最初から件数を返していたのに、[`revoke_ace_recursive`]だけが
-/// `Result<(), _>`だった。この非対称のせいで「1件も剥がせなかった」が呼び出し側から見えず
-/// （本体の呼び出し3箇所は全部`let _ =`だった）、実マシンに`(OI)(CI)(R,W,D)`が残り続けた（B-09）。
+/// かつて姉妹の`RevokeWorkspaceReport`（workspace撤収専用の件数だけの型）は最初から件数を
+/// 返していたのに、[`revoke_ace_recursive`]だけが`Result<(), _>`だった。この非対称のせいで
+/// 「1件も剥がせなかった」が呼び出し側から見えず（本体の呼び出し3箇所は全部`let _ =`だった）、
+/// 実マシンに`(OI)(CI)(R,W,D)`が残り続けた（B-09）。
+///
+/// **姉妹の型はもう無い。** walkが1本に畳まれた（[`revoke_workspace_sids_recursive`]）ので、
+/// 撤収の結果を表す型もこれ1つである——2つ持っていたころ、`blocked`が片方にしか無かった
+/// ために`fs revoke-workspace`は「何ノードで失敗したか」すら言えなかった。
 #[derive(Debug, Default)]
 #[must_use]
 pub struct RevokeReport {
@@ -979,8 +999,10 @@ fn descendants_need_walk(root: &Path, sids: &[PSID]) -> bool {
 /// 単一SID版が`Err`で全体を止めるのと違い、こちらは**保護対象のSIDだけを対象から外して
 /// 残りは撤収する**（バッチ全体を1件の保護で失敗させない）。
 ///
-/// `progress`は`(処理済み, 全体)`で1000件ごとに呼ばれる（表示専用、
-/// [`revoke_workspace_sids_recursive`]と同じ間隔）。
+/// `progress`は`(処理済み, 全体)`で1000件ごとに呼ばれる（表示専用。1件ごとだと通知自体が
+/// walkより重くなる）。総数が定まった時点で1回`(0, total)`を呼ぶ約束も[`revoke_tree`]が
+/// 持つ——CLI側がスピナーから数値表示へ切り替える合図に使っている
+/// （`harness-cli/src/fs_grants/progress.rs`の`WalkProgress`）。
 pub fn revoke_sids_recursive(
     root: &Path,
     sids: &[PSID],
@@ -998,11 +1020,15 @@ pub fn revoke_sids_recursive(
     })
 }
 
-/// [`revoke_ace_recursive`]と[`revoke_sids_recursive`]が共有するwalk本体。
+/// 撤収のwalk本体。**このリポジトリで撤収のためにツリーを歩くのはここ1箇所だけである。**
+/// 入口は[`revoke_ace_recursive`]（単一SID）・[`revoke_sids_recursive`]（複数SID）・
+/// [`revoke_workspace_sids_recursive`]（workspace撤収。後者への転送）の3つで、
 /// **違うのは「1ノードで何を剥がすか」だけ**なので、そこだけを`revoke_node`で受ける
-/// （`CODE-STRUCTURE-RULES` §5.0: 単一SID版と複数SID版でwalkのコピーを作らない。
-/// コピーを作ると、BUG-103で直した3点——root先頭・`OnVanished::Skip`・非中断——が
-/// 片方にだけ入っている状態が再び生まれる）。
+/// （`CODE-STRUCTURE-RULES` §5.0: walkのコピーを作らない。コピーを作ると、BUG-103で直した
+/// 3点——root先頭・`OnVanished::Skip`・非中断——が片方にだけ入っている状態が再び生まれる）。
+///
+/// **この警告は空論ではない。** `revoke_workspace_sids_recursive`が実際にコピーを持っており、
+/// 3点とも入っていなかった（同関数のdocの表）。畳んだのはその発見のあとである。
 ///
 /// `revoke_node`は「実際に剥がして書き戻したか」を返す。
 ///
@@ -1064,6 +1090,24 @@ fn revoke_tree(
     Ok(report)
 }
 
+/// [`revoke_tree`]をテストから呼ぶための扉。**`revoke_node`を差し替えられることが要点**で、
+/// 「1ノードが剥がせなくてもツリーの残りは剥がれる」を**実FSの細工なしに**測れる。
+///
+/// 本物の「剥がせないノード」は非昇格では作れないことが実測で分かっている
+/// （`the_revoke_report_names_the_nodes_it_could_not_clear`のdocの表——排他ハンドルも自分宛の
+/// deny ACEも効かず、唯一効く`OWNER RIGHTS`はそのノードが二度と削除できなくなるのでB-27で
+/// 却下した）。だからあの回帰テストは[`RevokeReport`]を手で組み立てて**報告の文面だけ**を
+/// 見ている。walk側の不変条件（止まらないこと）はここを通して測る。
+#[cfg(test)]
+pub(crate) fn revoke_tree_for_tests(
+    root: &Path,
+    walk_descendants: bool,
+    progress: &dyn Fn(usize, usize),
+    revoke_node: &dyn Fn(&Path) -> Result<bool, AppContainerError>,
+) -> Result<RevokeReport, AppContainerError> {
+    revoke_tree(root, walk_descendants, progress, revoke_node)
+}
+
 /// 1ノードの撤収結果を[`RevokeReport`]へ畳む。**失敗しても止めない**（呼び出し側のループが
 /// 続行できるように、成否をここで分類する）。
 ///
@@ -1085,71 +1129,62 @@ fn fold_node(
     }
 }
 
-/// [BUG-082] `fix_descendants_missing_ace`と対称の、workspace撤収専用の1walk一括撤収
-/// （`harness fs revoke-workspace`本体）。
+/// [BUG-082] workspace撤収の入口（`harness fs revoke-workspace`と、宣言capabilityの撤収）。
+/// **1回のツリー走査で`sids`の全部を剥がす。**
 ///
 /// [`revoke_ace_recursive`]はSIDごとに1回ツリー全体を舐め直す。`fs revoke-workspace`は
 /// workspace capability（最大2＝rwx/ro）＋撤収可能なharnessプロファイル（複数）を同じツリーから
-/// 一括で剥がすため、SIDの数だけ再walkするのは無駄である。**ここではノードごとにDACLを
+/// 一括で剥がすため、SIDの数だけ再walkするのは無駄である。**ノードごとにDACLを
 /// 1回だけ読み、対象の全SIDを1回の走査で除去し、変更があった場合だけ1回書き戻す。**
 ///
-/// D-48ガード（[`is_protected_traverse_grant`]）はノードごとに`sids`側から事前に除いてから
-/// [`revoke_sids_from_node`]（生のプリミティブ、ガード無し）へ渡す。実運用では
-/// `fs_revoke_workspace`がtraverse capability SIDをここへ渡すことは無いが、コストは
-/// `EqualSid`比較（`is_traverse_capability_sid`）が数回増えるだけで無視できるため、将来の
-/// 呼び出し元が誤って含めても保護対象が守られるよう常にかけておく。
+/// # ここには実装が無い——[`revoke_sids_recursive`]へそのまま渡す
 ///
-/// `progress`は`(処理済み, 全体)`で1000件ごとに呼ばれる（表示専用、`fix_descendants_missing_ace`
-/// と同じ間隔）。
+/// かつてこの関数は**walkの2本目のコピー**を持っていた。[`revoke_tree`]のdocが
+/// 「コピーを作ると、BUG-103で直した3点が片方にだけ入っている状態が再び生まれる」と
+/// 書いているとおりのことが実際に起きており、こちらは**3点とも入っていない側**だった。
+///
+/// | 直し | [`revoke_tree`]（共有walk） | かつてのこちら |
+/// |---|---|---|
+/// | 配下を歩く要否を実DACLで決める（D-63） | [`descendants_need_walk`]を通す | 無し。**常に全ノード歩く** |
+/// | walk中に消えたノード | `OnVanished::Skip`（残りを処理） | `OnVanished::Abort`（列挙ごと中止） |
+/// | 1ノードの撤収失敗 | [`fold_node`]が[`RevokeReport::blocked`]へ集めて**続行** | `?`でwalk全体を中止 |
+///
+/// 3点目は実機の症状に直結していた——`harness fs revoke-workspace`が14ノード中2ノードで
+/// `0x80070005`（アクセス拒否＝そのノードの`WRITE_DAC`が無い）に当たると、`?`で中断するため
+/// **そのツリーの残り全部が未処理のまま**`Err`で返っていた。
+///
+/// **ノードを処理する順序が変わった**（旧: `dirs`→`files`、現: root→`files`→`dirs`）。
+/// 順序に意味があるのはrootを先に剥がすこと（継承元を断つ、[`revoke_tree`]のdoc）だけで、
+/// これは旧実装でも`dirs[0]`＝rootだったので保たれている。残りの`files`と`dirs`の前後は
+/// どちらのdocも意味を与えていない——順序に意味を持たせているのは制御面の保護／解除の対
+/// （[`protect_harness_control_dir_from_appcontainer`]と[`unprotect_harness_control_dir`]）で、
+/// あちらは継承の計算し直しが絡むので葉から根／根から葉が決まっている。
+///
+/// D-48ガード（[`is_protected_traverse_grant`]）はノードごとに`sids`側から事前に除いてから
+/// [`revoke_sids_from_node`]（生のプリミティブ、ガード無し）へ渡す
+/// （[`revoke_sids_from_node_guarded`]）。実運用では`fs_revoke_workspace`がtraverse
+/// capability SIDをここへ渡すことは無いが、コストは`EqualSid`比較が数回増えるだけで
+/// 無視できるため、将来の呼び出し元が誤って含めても保護対象が守られるよう常にかけておく。
+///
+/// # まだ名前が2つ在る（畳み残し）
+///
+/// 中身は[`revoke_sids_recursive`]と1文字も違わない。名前が残っているのは呼び出し元
+/// （`revoke_declarations.rs`と`win_appcontainer`のテスト4本）を書き換えていないからで、
+/// **次にここへ触る人はこの転送を畳んで呼び出し元を向け直すこと。**
+///
+/// # 呼び出し元へ効く挙動の変化（未追随）
+///
+/// `revoke_capability_subjects`（`revoke_declarations.rs`）のdocは「walkはノード1件の失敗で
+/// `Err`になる」と書き、呼び出し元（`fs_revoke_one`）はその`Err`を**「昇格が要る」の合図**として
+/// 使っている。剥がせなかった子孫が[`RevokeReport::blocked`]へ回るようになったので、
+/// いま昇格へ回る条件は**rootに主体が残っているか**だけである。合図を戻すには
+/// `DeclarationRevokeReport`へ`blocked`の欄を足して`is_clean`が見る必要があり、**未着手**。
 pub fn revoke_workspace_sids_recursive(
     root: &Path,
     sids: &[PSID],
     progress: &dyn Fn(usize, usize),
-) -> Result<RevokeWorkspaceReport, AppContainerError> {
-    if sids.is_empty() {
-        return Ok(RevokeWorkspaceReport::default());
-    }
-    if root.is_file() {
-        let rewritten = revoke_sids_from_node_guarded(root, sids)?;
-        return Ok(RevokeWorkspaceReport {
-            checked: 1,
-            rewritten: usize::from(rewritten),
-        });
-    }
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-    collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort).map_err(|e| {
-        AppContainerError::AclRevoke {
-            path: root.to_path_buf(),
-            reason: e.to_string(),
-        }
-    })?;
-
-    let total = dirs.len() + files.len();
-    let mut report = RevokeWorkspaceReport {
-        checked: total,
-        ..Default::default()
-    };
-    // `collect_dirs_and_files`（このwalk）自体はtotalが定まるまで進捗を出せない
-    // （呼び出し側はここまで「不定長の作業中」としか示せない）。totalが分かった時点で
-    // すぐ1回`(0, total)`を通知する——1000件未満の小さいツリーだと以後
-    // `processed == total`の最後の1回しか呼ばれず、呼び出し側が「合計が分かった」ことを
-    // 知る機会が完走時まで無くなるため（`harness fs revoke-workspace`のCLI進捗表示が、
-    // 走査完了までスピナーから数値表示へ切り替えられない）。
-    progress(0, total);
-    let mut processed = 0usize;
-    for node in dirs.iter().chain(files.iter()) {
-        processed += 1;
-        // 進捗は1000件ごと（`fix_descendants_missing_ace`と同じ間隔。1件ごとだと通知自体が
-        // walkより重くなる）。
-        if processed.is_multiple_of(1000) || processed == total {
-            progress(processed, total);
-        }
-        if revoke_sids_from_node_guarded(node, sids)? {
-            report.rewritten += 1;
-        }
-    }
-    Ok(report)
+) -> Result<RevokeReport, AppContainerError> {
+    revoke_sids_recursive(root, sids, progress)
 }
 
 /// [`revoke_sids_from_node`]にD-48ガードをかけた版。このノードで「保護された永続traverse付与」
@@ -1165,17 +1200,6 @@ fn revoke_sids_from_node_guarded(path: &Path, sids: &[PSID]) -> Result<bool, App
         return Ok(false);
     }
     revoke_sids_from_node(path, &effective)
-}
-
-/// [`revoke_workspace_sids_recursive`]の結果。件数だけでは「本当に走査したのか」が分からない
-/// ため、`checked`（読取だけ含む全ノード数）と`rewritten`（実際にDACLを書き換えた数）を分ける
-/// （`fix_descendants_missing_ace`の`DescendantFixReport`と対称）。
-#[derive(Debug, Default)]
-pub struct RevokeWorkspaceReport {
-    /// walkが見たノード数。
-    pub checked: usize,
-    /// 実際にACEを1本以上剥がして書き戻した数。
-    pub rewritten: usize,
 }
 
 /// `path`のDACLに`sid`（trustee）への**明示**ACEが残っていれば、その許可アクセスマスクの

@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
-use harness_grant_ledger::{now_unix_secs, Ledger};
+use harness_grant_ledger::{now_unix_secs, same_ledger_path, Ledger};
 use serde::{Deserialize, Serialize};
 
 /// セッションプロファイル名の接頭辞。**GCがこの接頭辞だけを頼りに孤児を列挙する**ため、
@@ -332,6 +332,24 @@ mod win {
         }
         Ok(())
     }
+
+    /// 剥がし終えたパスをworkspace一覧台帳（`harness fs list`が読む一覧）から落とす。
+    ///
+    /// **1回の`update`で全件落とす。** かつてこの掃除は撤収の実体
+    /// （`win_appcontainer::revoke_session_grant`）の中にあり、パスごとに
+    /// `remove_workspace_entry`を呼んでいた——つまり[`super::reclaim_targets_in`]の
+    /// ループの中で台帳の全文読み書きが走っていた（付与側[`super::record_granted_paths`]の
+    /// docが書いている実測と同じ形）。述語を受けてまとめて落とす部品は既にあるので、
+    /// 新しく書かずにそこへ繋ぐ。
+    ///
+    /// 突合は`same_ledger_path`（台帳側が`remove_workspace_entry`で使っているのと同じ規則）。
+    /// ここで自前に小文字化や区切りの正規化を書くと、パスの畳み込み規則が2つになる。
+    pub(super) fn prune_workspace_paths(cleared: &[&str]) {
+        crate::tier2a::workspace_ledger::prune_workspace_entries(|entry_path| {
+            let entry_path = entry_path.to_string_lossy();
+            cleared.iter().any(|p| same_ledger_path(&entry_path, p))
+        });
+    }
 }
 
 #[cfg(not(windows))]
@@ -349,6 +367,9 @@ mod win {
     pub(super) fn delete_profile(_name: &str) -> Result<(), String> {
         Ok(())
     }
+    /// workspace一覧台帳（`tier2a::workspace_ledger`）はwindows専用モジュールなので、
+    /// 非Windowsでは掃除するものが無い。
+    pub(super) fn prune_workspace_paths(_cleared: &[&str]) {}
 }
 
 /// このセッションの生存マーカーを立て、台帳へ登録する（プロファイル自体の作成は
@@ -537,6 +558,26 @@ pub type RevokeLeftovers = Vec<(PathBuf, String)>;
 struct ReclaimIo<'a> {
     /// そのパスから`profile_name`宛のACEを剥がす。戻り値は**剥がせなかったノードと理由**
     /// （空なら完全に剥がせた）。
+    ///
+    /// # 主体が単数なので、同じツリーをプロファイルの数だけ歩き直す（未解消）
+    ///
+    /// 実体（`win_appcontainer::revoke_session_grant`）は単一SID版の`revoke_ace_recursive`を
+    /// 使う。同じパスを複数のプロファイルが付与していると、**そのツリーをプロファイルの数だけ
+    /// 舐め直す**。複数SIDを1周で剥がす`revoke_sids_recursive`は既にあるので、
+    /// [`reclaim_targets_in`]が`ReclaimTarget`（プロファイル単位）を**パス→SID群へ転置**
+    /// すれば1周に畳める。
+    ///
+    /// **畳んでいないのはこのコールバックの主体が単数だからである。** 複数にするには
+    /// [`gc_dead_sessions_reporting`]・[`gc_dead_sessions`]・[`end_session`]の公開シグネチャを
+    /// 変えることになり、渡す側は13ファイル（`harness-cli`・`harness-policy-editor`・
+    /// このクレートの`preflight`とETWテスト群）に散っている。1周に畳めるかどうかは
+    /// **その全部を同時に書き換えられるときに決めること。**
+    ///
+    /// 転置そのものに危険は無い——`revoke_sids_from_node`は1ノードのDACLを1回書き直して
+    /// 全SIDを外すので、そのノードが剥がせなければ**載っていた全プロファイルが等しく
+    /// 剥がせない**。剥がせなかったノードを共有する全プロファイルへ配ることは、意味の
+    /// 歪みではなく事実である（`grants_known`・`blocked_here`・`unrecorded`の
+    /// プロファイル単位の意味は保てる）。
     revoke: &'a dyn Fn(&Path, &str) -> RevokeLeftovers,
     /// **台帳に記録が無いのに実在するACE**の件数（`grant_audit`の自己検証）。
     /// 0でなければ名前を捨てない（BUG-101）。人への報告もこの中で行う。
@@ -546,6 +587,13 @@ struct ReclaimIo<'a> {
     delete_profile: &'a dyn Fn(&str) -> Result<(), String>,
     /// 回収できたセッションのエントリを落とす先の台帳。
     ledger: &'a Ledger<SessionLedger>,
+    /// **1ノードも残さず剥がし終えたパス**をworkspace一覧台帳から落とす。
+    ///
+    /// 引数が単数ではなく集合なのは意図的である——この掃除はかつて撤収の実体
+    /// （`win_appcontainer::revoke_session_grant`）の中にあり、パスごとに台帳の全文を
+    /// 読み書きしていた。集合で受ける形にすると、呼び出しを**ループの外へ出す以外に
+    /// 書きようが無くなる**（[`record_granted_paths`]のdocの実測と同じ理由）。
+    prune_workspace_paths: &'a dyn Fn(&[&str]),
 }
 
 /// 製品経路の自己検証（`grant_audit`）。**台帳に無いACEの件数**を返し、報告もここで行う。
@@ -575,14 +623,29 @@ fn reclaim_targets(
             unrecorded_aces: &report_unrecorded_aces,
             delete_profile: &win::delete_profile,
             ledger: &ledger(),
+            prune_workspace_paths: &win::prune_workspace_paths,
         },
         targets,
     )
 }
 
+/// [`reclaim_targets`]の本体（[`ReclaimIo`]で実世界を注入した形）。
+///
+/// # 台帳の更新は、どちらもループの外で1回だけ（B-01・BUG-057と同型）
+///
+/// この関数は「プロファイル×そのプロファイルが付与したパス」の二重ループを回す。
+/// `Ledger::update`は1回ごとに台帳の全文を読み書きするので、**ループの中で台帳へ触ると
+/// 対象の数だけ全文I/Oが積む**（付与側[`record_granted_paths`]のdocに実測がある）。
+/// したがってこの関数がループの中でやるのは集合へ積むことだけで、実際の更新は末尾で
+/// セッション台帳に1回・workspace一覧台帳に1回である。
 fn reclaim_targets_in(io: &ReclaimIo<'_>, targets: &[ReclaimTarget]) -> ReclaimOutcome {
     let mut outcome = ReclaimOutcome::default();
     let mut deleted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // workspace一覧台帳から落とす候補（そのツリーから1本残らず剥がせたパス）と、
+    // 1ノードでも剥がし残したパス。**同じパスを複数のプロファイルが付与していることがある**
+    // ので、ここでは両方へ積んでおき、差し引きは末尾でまとめて行う。
+    let mut cleared: Vec<&str> = Vec::new();
+    let mut still_held: Vec<&str> = Vec::new();
     for target in targets {
         if !target.grants_known {
             // 何を付与したか分からない以上、剥がせない。名前を消せば永久に剥がせなくなるので残す。
@@ -591,7 +654,16 @@ fn reclaim_targets_in(io: &ReclaimIo<'_>, targets: &[ReclaimTarget]) -> ReclaimO
         }
         let mut blocked_here = Vec::new();
         for path in &target.granted_paths {
-            blocked_here.extend((io.revoke)(Path::new(path), &target.profile_name));
+            let leftovers = (io.revoke)(Path::new(path), &target.profile_name);
+            // **一覧から記録を落としてよいのは、剥がし終えたパスだけ。** 記録を先に捨てて
+            // 実体が残る向きの失敗を作らない（B-01の「対の片方だけ」）。プロファイル名の方は
+            // 下の`kept_with_leftovers`が同じ理由で残す——両者は同じ判断の表と裏である。
+            if leftovers.is_empty() {
+                cleared.push(path.as_str());
+            } else {
+                still_held.push(path.as_str());
+            }
+            blocked_here.extend(leftovers);
             outcome.revoked_paths += 1;
         }
         // [BUG-101] **名前を捨てる直前に、この主体のACEが本当に残っていないかを測る。**
@@ -622,6 +694,17 @@ fn reclaim_targets_in(io: &ReclaimIo<'_>, targets: &[ReclaimTarget]) -> ReclaimO
                 .delete_failures
                 .push((target.profile_name.clone(), reason)),
         }
+    }
+    // 1ノードでも剥がし残したパスは、**別のプロファイルが剥がし終えていても**落とさない。
+    // 突合は台帳側と同じ`same_ledger_path`を借りる（ここで自前に小文字化や区切りの正規化を
+    // 書くと、パスの畳み込み規則が2つになる）。
+    cleared.retain(|p| !still_held.iter().any(|held| same_ledger_path(held, p)));
+    // 同じパスを複数のプロファイルが剥がし終えていることがあるので畳む（述語が短くなるだけで、
+    // 重複していても結果は変わらない）。
+    cleared.sort_unstable();
+    cleared.dedup();
+    if !cleared.is_empty() {
+        (io.prune_workspace_paths)(&cleared);
     }
     if !deleted.is_empty() {
         io.ledger.update(|l| {
@@ -1041,10 +1124,20 @@ mod tests {
     struct FakeIo {
         ledger: Ledger<SessionLedger>,
         events: std::sync::Mutex<Vec<String>>,
+        /// **workspace一覧台帳の掃除が何回・どの集合で呼ばれたか**（1要素＝1回の`update`）。
+        ///
+        /// `events`へ混ぜない。あちらが測っているのは「撤収→削除」の**順序**で、こちらが
+        /// 測りたいのは**呼ばれた回数**である——落ちる記録は同じなので、回数を測らないと
+        /// 「パスごとに1回」へ戻ったことに気付けない。
+        workspace_prunes: std::sync::Mutex<Vec<Vec<String>>>,
         /// `delete_profile`の戻り値。`Err`にすると「削除できなかった」経路を測れる。
         delete_result: Result<(), String>,
         /// `unrecorded_aces`の戻り値。0以外＝台帳に無いACEが実在する（BUG-101の保護）。
         unrecorded: usize,
+        /// 撤収が**剥がし残す**`(パス, プロファイル名)`の組。実FSでは「剥がせないノード」を
+        /// 非昇格で作れない（`revoke.rs`の`revoke_tree_for_tests`のdoc）ので、剥がし残しが
+        /// 一覧台帳の掃除へどう効くかはここで作る。
+        blocked: Vec<(String, String)>,
         /// 一時ディレクトリ。`ledger`が指す先なので、テストが終わるまで生かす。
         _dir: tempfile::TempDir,
     }
@@ -1055,8 +1148,10 @@ mod tests {
             Self {
                 ledger: Ledger::at_path(dir.path().join(LEDGER_FILE), None),
                 events: std::sync::Mutex::new(Vec::new()),
+                workspace_prunes: std::sync::Mutex::new(Vec::new()),
                 delete_result: Ok(()),
                 unrecorded: 0,
+                blocked: Vec::new(),
                 _dir: dir,
             }
         }
@@ -1074,6 +1169,14 @@ mod tests {
             let note = |event: String| self.events.lock().unwrap().push(event);
             let revoke = |path: &Path, profile: &str| {
                 note(format!("revoke:{}:{profile}", path.display()));
+                let path_str = path.to_string_lossy();
+                if self
+                    .blocked
+                    .iter()
+                    .any(|(p, prof)| *p == *path_str && prof == profile)
+                {
+                    return vec![(path.to_path_buf(), "blocked by the fake".to_string())];
+                }
                 RevokeLeftovers::new()
             };
             let delete = |profile: &str| {
@@ -1081,12 +1184,19 @@ mod tests {
                 self.delete_result.clone()
             };
             let unrecorded_aces = |_profile: &str, _recorded: &[String]| self.unrecorded;
+            let prune_workspace_paths = |cleared: &[&str]| {
+                self.workspace_prunes
+                    .lock()
+                    .unwrap()
+                    .push(cleared.iter().map(|p| (*p).to_string()).collect());
+            };
             reclaim_targets_in(
                 &ReclaimIo {
                     revoke: &revoke,
                     unrecorded_aces: &unrecorded_aces,
                     delete_profile: &delete,
                     ledger: &self.ledger,
+                    prune_workspace_paths: &prune_workspace_paths,
                 },
                 targets,
             )
@@ -1094,6 +1204,11 @@ mod tests {
 
         fn events(&self) -> Vec<String> {
             self.events.lock().unwrap().clone()
+        }
+
+        /// workspace一覧台帳の掃除の呼び出し履歴（1要素＝1回の`update`）。
+        fn workspace_prunes(&self) -> Vec<Vec<String>> {
+            self.workspace_prunes.lock().unwrap().clone()
         }
 
         /// 一時台帳に残っているセッションのトークン。
@@ -1297,6 +1412,120 @@ mod tests {
             io.events()
         );
         assert_eq!(io.remaining_tokens(), vec!["dead".to_string()]);
+    }
+
+    /// **workspace一覧台帳の掃除はパスごとではなく、バッチ全体で1回。**
+    ///
+    /// `Ledger::update`は1回ごとに台帳の全文を読み書きする（`record_granted_paths`のdocに
+    /// 実測がある）。かつて撤収側は`revoke_session_grant`の中から`remove_workspace_entry(path)`を
+    /// パスごとに呼んでおり、**付与側が既に直した形の未修正版**として残っていた。
+    ///
+    /// 落ちる記録は1件ずつでも同じなので、**回数を測らないと直ったことを固定できない**。
+    #[test]
+    fn the_workspace_ledger_is_pruned_once_for_the_whole_batch() {
+        let io = FakeIo::new().with_sessions(&["a", "b"]);
+        io.reclaim(&[
+            known_target("a", &["C:\\ws1", "C:\\ws2"]),
+            known_target("b", &["C:\\ws3"]),
+        ]);
+
+        let prunes = io.workspace_prunes();
+        assert_eq!(
+            prunes.len(),
+            1,
+            "3パスで3回台帳を書き直してはいけない: {prunes:?}"
+        );
+        assert_eq!(
+            prunes[0],
+            vec![
+                "C:\\ws1".to_string(),
+                "C:\\ws2".to_string(),
+                "C:\\ws3".to_string()
+            ],
+            "剥がし終えた3パスが1回の述語で落ちること"
+        );
+    }
+
+    /// **対になる禁止側**（B-35）。剥がし残したパスの記録は落とさない。
+    ///
+    /// 一覧台帳は`harness fs list`が読む索引で、記録を先に捨てると「ACEは残っているのに
+    /// 一覧に出てこない」状態になる（B-01の「対の片方だけ」）。許可側だけだと
+    /// 「常に全部落とす」実装でも緑のままになる。
+    #[test]
+    fn a_path_that_still_holds_an_ace_keeps_its_workspace_ledger_entry() {
+        let mut io = FakeIo::new().with_sessions(&["a"]);
+        io.blocked = vec![("C:\\stuck".to_string(), profile_name_for("a"))];
+        let outcome = io.reclaim(&[known_target("a", &["C:\\clean", "C:\\stuck"])]);
+
+        assert_eq!(
+            io.workspace_prunes(),
+            vec![vec!["C:\\clean".to_string()]],
+            "剥がせたパスだけを落とす: {:?}",
+            io.workspace_prunes()
+        );
+        assert_eq!(outcome.blocked_paths.len(), 1, "{outcome:?}");
+        assert_eq!(
+            outcome.kept_with_leftovers.len(),
+            1,
+            "剥がし残しがあるならプロファイル名も残る（記録を落とす判断は表と裏）: {outcome:?}"
+        );
+        assert_eq!(io.remaining_tokens(), vec!["a".to_string()]);
+    }
+
+    /// **同じパスを2つのプロファイルが付与していて、片方が剥がし残したら落とさない。**
+    ///
+    /// 掃除をループの外へ出すと、判定の単位が「このプロファイルの撤収が終わったか」から
+    /// **「そのパスに載っていた全プロファイル分が終わったか」**へ変わる。1件ずつ落として
+    /// いたころは、先に終わった方が記録を落としてしまう向きの取りこぼしがあった。
+    #[test]
+    fn a_path_shared_by_two_profiles_is_forgotten_only_when_both_are_clean() {
+        let mut io = FakeIo::new().with_sessions(&["a", "b"]);
+        io.blocked = vec![("C:\\shared".to_string(), profile_name_for("b"))];
+        io.reclaim(&[
+            known_target("a", &["C:\\shared"]),
+            known_target("b", &["C:\\shared"]),
+        ]);
+
+        assert!(
+            io.workspace_prunes().is_empty(),
+            "aが剥がし終えても、bのACEが残っているうちは一覧から消さない: {:?}",
+            io.workspace_prunes()
+        );
+    }
+
+    /// **対になる許可側**（B-35）。両方が剥がし終えたら落とす——ただし2プロファイル分で
+    /// 2回書き直さない。
+    #[test]
+    fn a_path_shared_by_two_clean_profiles_is_forgotten_once() {
+        let io = FakeIo::new().with_sessions(&["a", "b"]);
+        io.reclaim(&[
+            known_target("a", &["C:\\shared"]),
+            known_target("b", &["C:\\shared"]),
+        ]);
+
+        assert_eq!(
+            io.workspace_prunes(),
+            vec![vec!["C:\\shared".to_string()]],
+            "同じパスを2度述語へ渡す必要は無い: {:?}",
+            io.workspace_prunes()
+        );
+    }
+
+    /// 剥がしたパスが1つも無ければ、台帳へは一度も触らない（無害な全文書き直しを起こさない）。
+    #[test]
+    fn nothing_to_forget_means_the_workspace_ledger_is_never_opened() {
+        let io = FakeIo::new();
+        io.reclaim(&[ReclaimTarget {
+            profile_name: profile_name_for("lost-ledger"),
+            granted_paths: Vec::new(),
+            grants_known: false,
+        }]);
+
+        assert!(
+            io.workspace_prunes().is_empty(),
+            "{:?}",
+            io.workspace_prunes()
+        );
     }
 
     /// 台帳にあるものを実在プロファイル側で二重に数えない。

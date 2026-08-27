@@ -953,6 +953,92 @@ fn the_revoke_report_names_the_nodes_it_could_not_clear() {
     assert!(summary.contains("and 2 more"), "{summary}");
 }
 
+/// [BUG-103] **1ノードが剥がせなくても、ツリーの残りは剥がれる。**
+///
+/// 実機の`harness fs revoke-workspace`は14ノード中2ノードで`0x80070005`（アクセス拒否＝
+/// そのノードの`WRITE_DAC`が無い）に当たる。かつて`revoke_workspace_sids_recursive`は
+/// walkのコピーを持っていて、ノード1件の失敗を`?`で伝播していた——**そのツリーの残り全部が
+/// 未処理のまま`Err`で返っていた**。いまは撤収のwalkが`revoke_tree`1本に畳まれ、
+/// 1ノードの失敗は[`RevokeReport::blocked`]へ集めて続行する。
+///
+/// # なぜ本物の「剥がせないノード」を作らないのか
+///
+/// 非昇格では作れないことが実測で分かっている（姉妹の
+/// [`the_revoke_report_names_the_nodes_it_could_not_clear`]のdocの表——排他ハンドルも自分宛の
+/// deny ACEも効かず、唯一効く`OWNER RIGHTS`はそのノードが二度と削除できなくなるのでB-27で
+/// 却下した）。walk本体は「1ノードで何を剥がすか」を関数で受けるので、**そこへ失敗を注入すれば
+/// 同じ不変条件を実FSの細工なしに測れる**（`revoke_tree_for_tests`）。
+///
+/// # 何を測るか（`test-logic-rules`の4問）
+///
+/// 壊れ方は「`?`が戻ってくる」である。それを捕まえるには次の3つを同時に見る必要がある——
+/// (1)戻り値が`Err`にならない、(2)失敗したノード**以外の全部**が処理される
+/// （`checked`だけでなく実際に踏んだパスを数える。`checked`は数え方を間違えても増える）、
+/// (3)失敗したノードが`blocked`に**名前と理由つき**で載る。
+/// (2)を落とすと「`Err`にならないが実は途中で抜けている」形をそのまま通す。
+#[test]
+fn one_unrevokable_node_does_not_stop_the_rest_of_the_tree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).expect("create sub");
+    for i in 0..3 {
+        std::fs::write(sub.join(format!("f{i}.txt")), b"x").expect("seed a file");
+    }
+    // root + sub + f0..f2 = 5ノード。
+    let expected_nodes = 5usize;
+    let stuck = sub.join("f1.txt");
+
+    // 実際に踏んだパス（`checked`とは別に数える。上のdoc(2)）。
+    let visited = std::cell::RefCell::new(Vec::new());
+    let report = revoke_tree_for_tests(
+        root,
+        true,
+        &|_, _| {},
+        &|path: &Path| -> Result<bool, AppContainerError> {
+            visited.borrow_mut().push(path.to_path_buf());
+            if path == stuck {
+                // 実機で出るのと同じ形（ロケール依存の文面をそのまま運ぶ、B-33）。
+                return Err(AppContainerError::AclRevoke {
+                    path: path.to_path_buf(),
+                    reason: "アクセスが拒否されました。 (0x80070005)".to_string(),
+                });
+            }
+            Ok(true)
+        },
+    )
+    .expect("a single blocked node must not turn the whole walk into an Err");
+
+    let visited = visited.into_inner();
+    assert_eq!(
+        visited.len(),
+        expected_nodes,
+        "every node must be visited even though one of them failed: {visited:?}"
+    );
+    for node in [root, sub.as_path(), stuck.as_path()] {
+        assert!(
+            visited.iter().any(|v| v == node),
+            "{} was never visited: {visited:?}",
+            node.display()
+        );
+    }
+    assert_eq!(report.checked, expected_nodes, "{report:#?}");
+    assert_eq!(
+        report.rewritten,
+        expected_nodes - 1,
+        "every node but the blocked one must be counted as rewritten: {report:#?}"
+    );
+
+    // 剥がせなかったノードは**名前と理由つき**で1件だけ載る。
+    assert_eq!(report.blocked.len(), 1, "{report:#?}");
+    assert_eq!(report.blocked[0].0, stuck);
+    let summary = report
+        .blocked_summary(5)
+        .expect("a blocked node must produce a warning line");
+    assert!(summary.contains("f1.txt"), "{summary}");
+    assert!(summary.contains("0x80070005"), "{summary}");
+}
+
 /// [BUG-103] **触る前に消えていたノードは失敗ではない。**
 ///
 /// `%TEMP%`のような揺れ動くツリーでは、walkが見つけてからDACLを触るまでの間にファイルが

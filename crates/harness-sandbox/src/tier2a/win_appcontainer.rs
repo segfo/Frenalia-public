@@ -275,6 +275,31 @@ pub fn capability_sid_from_declaration_name(
     capability_sid_from_name(name)
 }
 
+/// [D-84の裏対称] **昇格側が、受け取った秘密から自分で導出したworkspace capability名**を
+/// SIDへ写す（[`capability_sid_from_declaration_name`]のworkspace本体版）。
+///
+/// `harness fs revoke-workspace(-all)`の昇格経路（`privhelper::PrivilegedRequest::
+/// RevokeWorkspaceAccess`）が使う。名前は`capability_name_from_secret`が**秘密だけ**から
+/// 作ったもので、**IPCで名前やSIDを受け取っているのではない**（`privhelper`モジュールdocの
+/// 「SIDはIPCで受け取らず、受信側が自ら導出する」）。
+///
+/// **宣言版と違い、導出にパスは入らない**（D-54の名前は秘密だけで決まる）。この要求は
+/// 「剥がす」方向にしか使えないので、別のworkspaceを指しても一致するACEが無く何も起きない
+/// ——限界は`WorkspaceRevokeSubject`のdocに書いてある。
+///
+/// 形の検証をここでも行うのは、呼び出し順を間違えて別種の名前（宣言capability・
+/// テスト用の任意名）が来たときに黙って通さないためである。
+pub fn capability_sid_from_workspace_name(
+    name: &str,
+) -> Result<crate::win_common::OwnedSid, AppContainerError> {
+    if !crate::tier2a::workspace_capability::is_workspace_capability_name(name) {
+        return Err(AppContainerError::Preflight(format!(
+            "refusing to derive a SID from {name:?}: it is not a workspace capability name"
+        )));
+    }
+    capability_sid_from_name(name)
+}
+
 /// 名前からcapability SIDを導出する（`DeriveCapabilitySidsFromName`）。
 ///
 /// **名前を知っている者は誰でもこれを呼べる**（特権不要）。したがって、この関数で導出した

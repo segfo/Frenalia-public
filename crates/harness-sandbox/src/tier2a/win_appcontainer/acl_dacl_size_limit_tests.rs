@@ -440,7 +440,16 @@ fn acl_dacl_size_limit_when_ancestors_stack_inherited_aces() {
 
         // 撤収（B-01）。段ごとに剥がして、残っていないことを読み直しで確かめる。
         let psids: Vec<PSID> = expected.iter().map(|s| s.as_psid()).collect();
-        revoke_workspace_sids_recursive(root, &psids, &|_, _| {}).expect("revoke every subject");
+        let report =
+            revoke_workspace_sids_recursive(root, &psids, &|_, _| {}).expect("revoke every subject");
+        // 撤収walkは1ノードの失敗で全体を止めず、剥がせなかったノードを`blocked`へ集めて
+        // 続行する形になった。**集めた側を見ないと、剥がし残しが黙って測定結果に混じる**（B-09）。
+        assert!(
+            report.blocked.is_empty(),
+            "{label}: could not strip the measurement ACEs from {} node(s): {:?}",
+            report.blocked.len(),
+            report.blocked
+        );
         for node in [&leaf_file, &fresh, root] {
             let left = count_own_aces(node, &wanted);
             assert_eq!(
