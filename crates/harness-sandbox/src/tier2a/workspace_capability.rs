@@ -400,6 +400,37 @@ pub fn ensure_declaration_capability(
     ensure_declaration_capability_in(&ledger(), workspace, declared_path, access_class)
 }
 
+/// [`ensure_declaration_capability_name`]の**発行しない版**（workspace本体に対する
+/// [`lookup_capability_name`]と同じ関係）。まだ発行されていなければ`None`。
+///
+/// **3つの軸（workspace・宣言パス・access級）で絞る。** パスだけで引く
+/// [`declaration_capability_names`]と使い分けること——あちらは「このパスへ発行した主体を
+/// **全部**」剥がす撤収の索引で、こちらは「**この級の**主体1つ」を名指しする用である。
+/// 級を落として引くと、子のトークンへ**宣言より広い主体**を積む形になる。
+pub fn lookup_declaration_capability_name(
+    workspace: &Path,
+    declared_path: &Path,
+    access_class: &str,
+) -> Option<String> {
+    lookup_declaration_capability_name_in(&ledger(), workspace, declared_path, access_class)
+}
+
+fn lookup_declaration_capability_name_in(
+    ledger: &Ledger<WorkspaceCapabilityLedger>,
+    workspace: &Path,
+    declared_path: &Path,
+    access_class: &str,
+) -> Option<String> {
+    let key = workspace_key(workspace);
+    let declaration = declaration_key(declared_path);
+    ledger
+        .load()
+        .entries
+        .into_iter()
+        .find(|e| matches(e, &key, Some(declaration.as_str()), access_class))
+        .map(|e| e.capability_name)
+}
+
 /// 名前だけが要る呼び出し（本体プロセス内での付与・撤収）用。
 pub fn ensure_declaration_capability_name(
     workspace: &Path,

@@ -672,31 +672,66 @@ fn create_overlay_dir(dir: &Path) -> Result<(), String> {
 /// # なぜUACが出ないのか
 ///
 /// 親（[`cow_diff_layer_root`]）までの祖先traverseチェーンは起動時の`preflight`が既に解決している。
-/// 新しいleafに増えるのはこのセッションのpackage SID宛の継承ACE1件だけで、所有者は自分
+/// 新しいleafに増えるのはこの差分層のcapability SID宛の継承ACE1件だけで、所有者は自分
 /// （同一ユーザー）なのでprivhelper（昇格）を通らない。
+///
+/// # [§22.3.2] ここは差分層へACEを付ける**2つ目**の経路である
+///
+/// もう1つは`win_appcontainer::preflight`のCoW分岐（起動時）で、こちらはセッション切替・fork
+/// （`/sessions`・`/fork`・`--fork-session`）が通る。**片方だけを移すと、もう片方が
+/// package SID宛のまま残る**——そしてその状態は**成功に見える**（新しいACEは正しく付き、
+/// アクセスも通る）。主体の導出は`win_appcontainer::cow_diff_layer_capability_sid`ただ1本が
+/// 持つので、規則がずれることはない。
 #[cfg(windows)]
 fn prepare_cow_diff_layer(
     workspace_root: &Path,
     scope: &SessionScope,
     diff_layer_dir: &Path,
 ) -> Result<usize, String> {
-    use crate::tier2a::{session_profile, win_appcontainer, workspace_ledger};
+    use crate::tier2a::{session_profile, win_appcontainer, workspace_capability, workspace_ledger};
 
-    let sid = win_appcontainer::ensure_profile(&session_profile::current_profile_name())
-        .map_err(|e| format!("could not resolve this session's AppContainer profile: {e}"))?;
+    // 主体の導出鍵に入るworkspaceは**canonicalize済み**でなければならない（`preflight`が
+    // 渡すのと同じ値にする）。綴りが違うと別の台帳エントリ＝別のSIDになり、付けた主体と
+    // 積む主体が食い違って「ACEは正しいのに子から一切見えない」形で出る。
+    let canonical_workspace = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
 
     // 順序が本質: 実体を作る → ACEを付ける → **台帳へ記録する**（B-01/B-15）。記録を落とすと
     // `end_session`/`gc_dead_sessions`がこのACEを引けず、切替のたびに撤収経路の無い孤立ACEが
-    // 1件ずつ実マシンへ残る（BUG-038・BUG-059で実際に8件残留した形）。`record_granted_path`は
-    // ACE付与が成功した後にだけ呼ぶ——先に記録すると「台帳にあるのに実体が無い」逆向きの
+    // 1件ずつ実マシンへ残る（BUG-038・BUG-059で実際に8件残留した形）。記録は
+    // ACE付与が成功した後にだけ行う——先に記録すると「台帳にあるのに実体が無い」逆向きの
     // 孤立になる。
-    win_appcontainer::grant_ace_inheritable_rw(diff_layer_dir, sid.as_psid()).map_err(|e| {
-        format!(
-            "could not grant this session access to {}: {e}",
+    let diff_layer_cap =
+        win_appcontainer::cow_diff_layer_capability_sid(&canonical_workspace, diff_layer_dir)
+            .map_err(|e| {
+                format!(
+                    "could not derive the capability for {}: {e}",
+                    diff_layer_dir.display()
+                )
+            })?;
+    win_appcontainer::grant_ace_inheritable_rw(diff_layer_dir, diff_layer_cap.as_psid()).map_err(
+        |e| {
+            format!(
+                "could not grant this session access to {}: {e}",
+                diff_layer_dir.display()
+            )
+        },
+    )?;
+    // 記録するのは**導出済みの名前**（§22.3.2の「2つで1つ」）。秘密から導出し直す形にすると、
+    // `fs revoke-workspace`／`fs prune`が秘密を消した後に剥がせなくなる（BUG-101と同型）。
+    match workspace_capability::lookup_declaration_capability_name(
+        &canonical_workspace,
+        diff_layer_dir,
+        win_appcontainer::COW_DIFF_LAYER_ACCESS.label(),
+    ) {
+        Some(name) => session_profile::record_granted_capability(diff_layer_dir, &name),
+        None => eprintln!(
+            "warning: could not look up the capability name just issued for {}; this ACE will \
+             not be revoked automatically (see docs/bugs/BUG-101.md)",
             diff_layer_dir.display()
-        )
-    })?;
-    session_profile::record_granted_path(diff_layer_dir);
+        ),
+    }
 
     // `harness cow status`/`apply`/`list`がdiff_layer_dirから元のworkspaceを引けるようにする
     // （`preflight`が起動時に書くのと同じもの。切替後の差分層にも要る）。

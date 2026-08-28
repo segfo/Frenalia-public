@@ -75,6 +75,25 @@ pub(crate) fn spawn_in_workspace(
         Some(sid) => super::DomainIdentity::Capability(sid.as_psid()),
         None => super::DomainIdentity::OwnPackage,
     };
+    // [§22.3.2] CoWのときは**差分層の主体も積む**（本番の`launch.rs`と同じ）。差分層のACEは
+    // package SID宛から差分層ごとのcapability SID宛へ移ったので、これを積まない子は
+    // Redirector DLLの退避先へ書けず、CoWのテストが「透過が壊れている」ように見える。
+    // ここが本番と食い違うと、「本番と同じ形」を名乗るこのヘルパーだけ別の世界を測ることになる
+    // （モジュールdocのD-84のときとまったく同じ理由）。
+    let cow_cap = cow.as_ref().and_then(|inject| {
+        let ws = inject
+            .workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| inject.workspace_root.to_path_buf());
+        super::lookup_cow_diff_layer_capability_sid(&ws, inject.diff_layer_dir)
+    });
+    // [§22.3] このヘルパーはworkspace本体とCoWの差分層だけを見て起こす。`--fs-allow`の宣言
+    // capabilityは積まないので、**このヘルパー経由の子は宣言した穴へ届かない**——穴の到達性を
+    // 測るテストは`probe_passthrough`（主体を明示的に渡せる）を使うこと。
+    let mut domain_caps: Vec<windows::Win32::Security::PSID> = Vec::new();
+    domain_caps.extend(cap.iter().map(|s| s.as_psid()));
+    domain_caps.extend(cow_cap.iter().map(|s| s.as_psid()));
+
     super::spawn_with_workspace(
         exe,
         args,
@@ -84,13 +103,7 @@ pub(crate) fn spawn_in_workspace(
         container_sid,
         net,
         cow,
-        // [§22.3] このヘルパーはworkspace本体だけを見て起こす。`--fs-allow`の宣言capabilityを
-        // 積まないので、**このヘルパー経由の子は宣言した穴へ届かない**——穴の到達性を測る
-        // テストは`probe_passthrough`（主体を明示的に渡せる）を使うこと。
-        cap.as_ref()
-            .map(|s| vec![s.as_psid()])
-            .unwrap_or_default()
-            .as_slice(),
+        &domain_caps,
         domain,
     )
 }

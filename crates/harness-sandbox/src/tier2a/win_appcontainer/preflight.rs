@@ -431,12 +431,25 @@ pub fn preflight_with_privhelper_launcher(
         ace_grants.len()
     ));
 
+    // [§22.3.2] 差分層の主体は、付与した後も**プローブと子の起動まで**運ぶ必要がある
+    // （`probe_capabilities`のdoc: CoWのプローブは`probe_dir`を差分層の中に作る）。
+    // CoWでなければ`None`のまま。
+    let mut cow_diff_layer_cap: Option<crate::win_common::OwnedSid> = None;
     match write_mode {
         WorkspaceWriteMode::DirectRw => {}
         WorkspaceWriteMode::Cow { diff_layer_dir } => {
-            // diff_layer_dirは**セッション専有**（他セッションと共有しない）なので、主体は
-            // 従来どおりセッションのpackage SIDのままにする。D-54が置き換えるのは
-            // 「ワークスペースにつき一度きりで済むはずの付与」だけで、こちらは該当しない。
+            // [§22.3.2] **主体はセッションのpackage SIDではなく、差分層ごとのcapability SIDである。**
+            //
+            // ここには以前「diff_layer_dirはセッション専有なので主体は従来どおりpackage SIDの
+            // ままにする」と書いてあった。**その理由は§22.3の移行で失効している**——
+            // 「宛先が共有であること」と「対象がセッション専有であること」は別の話で、
+            // ドメインを分けると前者が穴になる。package SIDはAppContainer全体で共有されるので、
+            // そこへ付けたACEは同一セッションの**全ドメイン**へ効き続ける（§22.3.0:
+            // DACLは「このpackage SIDかつこのcapability SID」を表現できず、並べたALLOWは
+            // どれか1つ満たせば通る）。
+            //
+            // 主体がセッション固有になることは自動的に成立する——導出鍵に入る差分層のパスが
+            // セッションIDを含むためで、「セッション限定capability」という別種のSIDは足さない。
             //
             // [D-82] **生存マーカーを、差分層の実体より先に握る。**
             //
@@ -470,8 +483,53 @@ pub fn preflight_with_privhelper_launcher(
                 })?;
             crate::tier2a::workspace_ledger::claim_cow_diff_layer(session_id, diff_layer_dir)
                 .map_err(AppContainerError::Preflight)?;
-            grant_ace_inheritable_rw(diff_layer_dir, sid.as_psid())?;
-            crate::tier2a::session_profile::record_granted_path(diff_layer_dir);
+            // 順序は既存のまま**実体 → ACE → 記録**（`claim_cow_diff_layer`がディレクトリを
+            // 作った直後にrootへ継承ACEを1本置く）。§22.3.2が「中身を作る前にrootへ付ける」と
+            // 要求しているのはこの形で、あとから巨大ツリーへ配る形（BUG-081）を作り直さない。
+            let diff_layer_cap =
+                cow_diff_layer_capability_sid(&canonical_workspace_root, diff_layer_dir)?;
+            grant_ace_inheritable_rw(diff_layer_dir, diff_layer_cap.as_psid())?;
+            // [§22.3.2/B-01] **記録するのは「導出済みの名前」であって秘密ではない。**
+            // 撤収時に秘密から導出し直す形にすると、差分層が使う秘密（ワークスペース側のもの）を
+            // `fs revoke-workspace`／`fs prune`が**他人の都合で**消した後に名前を作れなくなり、
+            // そのACEはどのコマンドでも剥がせなくなる（BUG-101と同型）。
+            //
+            // **`granted_paths`とは別の欄へ入れる。** 同じ欄に入れると、package SID宛の
+            // 自己検証がこのパスを「台帳にあるのにACEが無い」＝幻の台帳エントリとして
+            // 毎回のCoW起動で警告に出す（`grant_audit::classify`は`Stage::Preflight`で
+            // `recorded_absent`を報告する）。
+            let diff_layer_cap_name =
+                crate::tier2a::workspace_capability::lookup_declaration_capability_name(
+                    &canonical_workspace_root,
+                    diff_layer_dir,
+                    COW_DIFF_LAYER_ACCESS.label(),
+                );
+            match diff_layer_cap_name {
+                Some(name) => crate::tier2a::session_profile::record_granted_capability(
+                    diff_layer_dir,
+                    &name,
+                ),
+                // 直前に発行したものが引けないのは起こり得ないが、**起きたら黙らない**（B-10）。
+                // 記録できないことは付与の失敗ではないので止めはしないが、このACEは自動撤収の
+                // 対象から外れる。
+                None => eprintln!(
+                    "warning: could not look up the capability name just issued for {}; this \
+                     ACE will not be revoked automatically (see docs/bugs/BUG-101.md)",
+                    diff_layer_dir.display()
+                ),
+            }
+            // [§22.3.2] **自己検証の射程が黙って狭まらないようにする。** `grant_audit`は
+            // capability SIDを既定で対象外にしているが、その理由はワークスペースツリーで
+            // 全件が偽陽性になることであって、差分層について検討した結果ではない。主体を
+            // 移した以上、ここで明示的に測らないと差分層が静かに自己検証から外れる。
+            if let Some(audit) = crate::tier2a::grant_audit::audit_subject(
+                crate::tier2a::grant_audit::Stage::Preflight,
+                diff_layer_cap.as_psid(),
+                &crate::tier2a::session_profile::granted_capability_paths_for_current_session(),
+            ) {
+                crate::tier2a::grant_audit::report(&audit);
+            }
+            cow_diff_layer_cap = Some(diff_layer_cap);
             // `harness cow status`/`apply`/`list`がworkspace_rootを引けるよう、
             // diff_layer_dir自身に由来を記録する
             // （`workspace_ledger::write_cow_session_meta`のdoc参照）。
@@ -1271,8 +1329,13 @@ pub fn preflight_with_privhelper_launcher(
 
     // [§22.3] プローブと本番の子が積むcapability。**穴の主体を積まないと、付与が正しくても
     // 到達性プローブは全件「到達不能」になる**（`probe_capabilities`のdoc）。
-    let fs_allow_cap_psids: Vec<windows::Win32::Security::PSID> =
+    //
+    // [§22.3.2] **差分層の主体もここに入る。** CoWのsmoke testは`probe_dir`を差分層の中に
+    // 作って書込を試すので、積まないと「workspace FS I/Oが拒否された」と誤診断して
+    // `preflight`が起動そのものを拒否する（移行の最中に実際に踏んだ）。
+    let mut fs_allow_cap_psids: Vec<windows::Win32::Security::PSID> =
         fs_allow_caps.iter().map(|cap| cap.as_psid()).collect();
+    fs_allow_cap_psids.extend(cow_diff_layer_cap.iter().map(|cap| cap.as_psid()));
 
     // D8: 到達性プローブは**ここで1回だけ**行う（付与も昇格も全部終わった後）。
     // 対象が0件なら子プロセスは1つも起こさない。

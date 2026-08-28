@@ -34,10 +34,22 @@ fn probe_domain(workspace_cap: Option<PSID>) -> DomainIdentity {
 /// 実際には測る側が権限を持っていないだけである。
 ///
 /// 4本のプローブが同じ組み立てを通るように、綴りはここ1箇所に置く（`probe_domain`と同じ理由）。
-fn probe_capabilities(workspace_cap: Option<PSID>, fs_allow_caps: &[PSID]) -> Vec<PSID> {
+/// プローブの子へ積むcapabilityの集合。
+///
+/// **本番の子と同じ集合でなければ、プローブは別の世界を測る**（`B-08`）。`workspace_cap`を
+/// 独立の引数にしてあるのは、それが[`probe_domain`]（ドメインの識別子）も決めるからで、
+/// 意味の違いであって重要度の違いではない。
+///
+/// [§22.3.2] `extra_domain_caps`は「このドメインがFSへ届くために要る、workspace本体以外の
+/// capability」である——`--fs-allow`の宣言ぶんと、**CoWの差分層**。かつてこの引数は
+/// `fs_allow_caps`という名前だったが、差分層の主体がcapabilityへ移った時点でその名前は
+/// 実態より狭くなった（`preflight`のCoW分岐は`probe_dir`を**差分層の中**に作るので、
+/// 積まないとプローブの書込が拒否され、`preflight`が「workspace FS I/Oが拒否された」と
+/// **誤診断して起動を拒否する**——実際にこの移行で1度踏んだ）。
+fn probe_capabilities(workspace_cap: Option<PSID>, extra_domain_caps: &[PSID]) -> Vec<PSID> {
     workspace_cap
         .into_iter()
-        .chain(fs_allow_caps.iter().copied())
+        .chain(extra_domain_caps.iter().copied())
         .collect()
 }
 
@@ -223,7 +235,7 @@ pub(crate) fn select_shell_by_probe(
 pub(crate) fn smoke_test_spawn(
     sid: PSID,
     workspace_cap: Option<PSID>,
-    fs_allow_caps: &[PSID],
+    extra_domain_caps: &[PSID],
     workspace_root: &Path,
     probe_dir: &Path,
 ) -> Result<(), AppContainerError> {
@@ -250,7 +262,7 @@ pub(crate) fn smoke_test_spawn(
         sid,
         NetworkCapability::Deny,
         None,
-        &probe_capabilities(workspace_cap, fs_allow_caps),
+        &probe_capabilities(workspace_cap, extra_domain_caps),
         probe_domain(workspace_cap),
     )
     .map_err(|e| AppContainerError::Preflight(format!("shell could not start: {e}")))?;
@@ -283,7 +295,7 @@ pub(crate) fn smoke_test_spawn(
 pub(crate) fn smoke_test_harness_control_write_denied(
     sid: PSID,
     workspace_cap: Option<PSID>,
-    fs_allow_caps: &[PSID],
+    extra_domain_caps: &[PSID],
     workspace_root: &Path,
 ) -> Result<(), AppContainerError> {
     let control_dir = workspace_root.join(".harness");
@@ -317,7 +329,7 @@ pub(crate) fn smoke_test_harness_control_write_denied(
         // 積まずに拒否されても「`.harness/`の保護が効いた」ことの証明にならないのは
         // workspace capabilityと同じ理屈で、宣言capabilityにもそのまま当てはまる
         // （`--fs-allow`が`.harness/`を覆う宣言をしていれば、それは実際に穴である）。
-        &probe_capabilities(workspace_cap, fs_allow_caps),
+        &probe_capabilities(workspace_cap, extra_domain_caps),
         probe_domain(workspace_cap),
     )
     .map_err(|e| {
@@ -646,7 +658,7 @@ pub(crate) fn probe_passthrough(
     sid: PSID,
     traverse_sid: PSID,
     workspace_cap: Option<PSID>,
-    fs_allow_caps: &[PSID],
+    extra_domain_caps: &[PSID],
     workspace_root: &Path,
     fp: &FsPassthrough,
 ) -> Option<String> {
@@ -654,7 +666,7 @@ pub(crate) fn probe_passthrough(
         sid,
         traverse_sid,
         workspace_cap,
-        fs_allow_caps,
+        extra_domain_caps,
         workspace_root,
         std::slice::from_ref(fp),
     ) {
@@ -681,7 +693,7 @@ pub(crate) fn probe_passthrough_batch(
     sid: PSID,
     traverse_sid: PSID,
     workspace_cap: Option<PSID>,
-    fs_allow_caps: &[PSID],
+    extra_domain_caps: &[PSID],
     workspace_root: &Path,
     entries: &[FsPassthrough],
 ) -> BatchProbeOutcome {
@@ -712,7 +724,7 @@ pub(crate) fn probe_passthrough_batch(
         None,
         // [§22.3] **穴の主体を積まないと、この測定は全件「到達不能」になる。**
         // 付与が正しく効いていても、測る側がcapabilityを持っていなければ届かない。
-        &probe_capabilities(workspace_cap, fs_allow_caps),
+        &probe_capabilities(workspace_cap, extra_domain_caps),
         probe_domain(workspace_cap),
     ) {
         Ok(child) => child,

@@ -149,8 +149,21 @@ pub fn spawn_shell_in_workspace(
             super::fs_allow_capability_sids(path, Some(&canonical_workspace))
         })
         .collect();
+    // [§22.3.2] CoWの差分層の主体も積む。**差分層のACEはもうこのセッションのpackage SID宛では
+    // なく、差分層ごとのcapability SID宛である**——積まなければ、Redirector DLLが退避しようと
+    // した書込がすべて`ACCESS_DENIED`になり、CoWが丸ごと機能しない（DLLは子の中で動くので、
+    // 使えるのは子のトークンが持つ主体だけである）。
+    //
+    // **引くだけで発行しない**（`lookup_`側）。ここで発行すると「起こす側」が台帳エントリを
+    // 作ることになり、`preflight`を経ていない差分層に対して記録だけが増える。引けないときは
+    // 積まない——症状は`ACCESS_DENIED`＝fail-closedで、無言で広がる向きには倒れない。
+    let cow_diff_layer_cap = req.cow_diff_layer_dir.as_ref().and_then(|diff_layer_dir| {
+        super::lookup_cow_diff_layer_capability_sid(&canonical_workspace, diff_layer_dir)
+    });
+
     let mut domain_caps = vec![workspace_cap.as_psid()];
     domain_caps.extend(fs_allow_caps.iter().map(|cap| cap.as_psid()));
+    domain_caps.extend(cow_diff_layer_cap.iter().map(|cap| cap.as_psid()));
 
     // D-54: 初回起動では、保護DACL配下を救済するwalkが背景で走っていることがある。終わる前に
     // コマンドを走らせると、その配下がモデルには「存在しない/読めない」と見え、原因不明の

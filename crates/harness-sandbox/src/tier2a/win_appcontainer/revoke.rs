@@ -719,6 +719,51 @@ pub fn revoke_session_grant(
     }
 }
 
+/// [§22.3.2] 記録された**capability名**宛のACEを1件撤収する（`session_profile`の回収経路が注入する処理）。
+///
+/// [`revoke_session_grant`]と対になる関数で、違いは**主体の導出だけ**である。
+///
+/// | | 名前 | 導出 |
+/// |---|---|---|
+/// | [`revoke_session_grant`] | AppContainerプロファイル名 | `DeriveAppContainerSidFromAppContainerName` |
+/// | ここ | capability名（`harnessDecl…`） | `DeriveCapabilitySidsFromName` |
+///
+/// 名前は`session_profile`の台帳が持っている（付与した時点で記録した「導出済みの名前」）。
+/// **秘密から導出し直さない**——差分層が使う秘密はワークスペース側の台帳にあり、
+/// `harness fs revoke-workspace`／`fs prune`が他人の都合で消せるので、導出し直す形だと
+/// **どのコマンドでも剥がせないACE**が残る（§22.3.2、BUG-101と同型）。
+///
+/// **`revoke_subjects.rs`の分類器は使わない。** あちらは「このSIDは何者か」をDACLから推定する
+/// package SID専用の機構で、capability SIDは**名前の付いた扉が名指しで剥がす**という方針
+/// （BUG-046の再発防止としてそのファイルのdocが宣言している）に従う。ここは台帳に記録した
+/// 名前で名指ししているので、その方針のとおりである。
+///
+/// [BUG-103と同じ扱い] 導出できないときも**空ではなく理由を返す**。空は「剥がすものが
+/// 無かった」を意味し、呼び出し側はそれを見て名前の記録を捨てる——「剥がしに行けなかった」を
+/// 同じ値で表すと、その瞬間にACEが回収不能になる（B-10）。
+///
+/// 既に消えているノード（差分層ごと削除された後のGC等）は**失敗ではない**——
+/// `revoke_sids_from_node`が`is_vanished`で`Ok`に倒すので、記録は正しく捨てられる。
+pub fn revoke_capability_grant(
+    path: &Path,
+    capability_name: &str,
+) -> crate::tier2a::session_profile::RevokeLeftovers {
+    let sid = match capability_sid_from_declaration_name(capability_name) {
+        Ok(sid) => sid,
+        Err(e) => {
+            return vec![(
+                path.to_path_buf(),
+                format!("cannot derive the SID of capability {capability_name}: {e}"),
+            )]
+        }
+    };
+    match revoke_ace_recursive(path, sid.as_psid()) {
+        Ok(report) => report.blocked,
+        // rootにすら触れなかった＝このツリーからは1件も剥がせていない。
+        Err(e) => vec![(path.to_path_buf(), e.to_string())],
+    }
+}
+
 // `appcontainer_sid_aces`（パスのDACLに載っているパッケージSIDの列挙）と
 // `revoke_stale_appcontainer_aces`（残す側を名指しして他を剥がす）は`revoke_subjects`へ移した。
 // 「どのSIDを剥がすか」を決める責務であって「どう剥がすか」ではないため（規則3の分割線）。

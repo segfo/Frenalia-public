@@ -94,6 +94,23 @@ pub struct SessionEntry {
     #[serde(default)]
     pub granted_paths: Vec<String>,
     pub created_at_unix_secs: u64,
+    /// [§22.3.2] このセッションが**capability SID宛**に付けたACE（現状はCoWの差分層のみ）。
+    ///
+    /// # なぜ`granted_paths`と別の欄なのか
+    ///
+    /// 撤収に要る情報が違う。`granted_paths`の主体は**プロファイル名から導出**できるので
+    /// パスだけで足りるが、capability SIDの名前は**乱数の秘密から導出**されるため、
+    /// 名前そのものを持っていないと二度と主体へ到達できない（BUG-101と同型）。
+    ///
+    /// 混ぜてはいけない理由がもう1つある。preflightの自己検証（`grant_audit`）は
+    /// `granted_paths`を「このセッションのpackage SID宛に付けたはずのパス」として読むので、
+    /// 差分層をそこへ入れると**毎回のCoW起動で「台帳にあるのにACEが無い」**（幻の台帳エントリ）
+    /// として報告される——主体が違うのだから、package SID宛のACEが無いのは正しい状態である。
+    ///
+    /// **既存の台帳ファイルとの後方互換のため`#[serde(default)]`**（実マシンに既に在る
+    /// `appcontainer-session-ledger.json`はこの欄を持たない）。
+    #[serde(default)]
+    pub granted_capabilities: Vec<CapabilityGrant>,
     /// このセッションが起動したMCPサーバのプロファイル（D-38、`plans/DESIGN-MCP.md` §3.1）。
     ///
     /// **既存の台帳ファイルとの後方互換のため`#[serde(default)]`で後付けする**（実マシンに
@@ -102,6 +119,21 @@ pub struct SessionEntry {
     /// ——セッションが死ねば`plan_reclaim`が同じ判定で一緒に回収する。
     #[serde(default)]
     pub mcp: Vec<McpProfileEntry>,
+}
+
+/// [§22.3.2] capability SID宛に付けたACE1件（`(パス, 導出済みのcapability名)`）。
+///
+/// **名前を持つことがこの型の全てである。** capability SIDは名前の一方向ハッシュ
+/// （`DeriveCapabilitySidsFromName`）なので、名前さえあれば秘密が無くても主体を再構成でき、
+/// 撤収できる。逆に名前を失うと**どのコマンドでも剥がせないACE**になる——差分層が使う秘密は
+/// ワークスペース側の台帳にあり、`harness fs revoke-workspace`／`fs prune`が**他人の都合で**
+/// 消せるので、「撤収時に秘密から導出し直す」形は成立しない（§22.3.2の「2つで1つ」）。
+///
+/// 記録するのは名前であって秘密ではないので、この台帳の機密性の要求は上がらない。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityGrant {
+    pub path: String,
+    pub capability_name: String,
 }
 
 /// セッション配下のMCPサーバプロファイル1件。
@@ -125,6 +157,14 @@ fn ledger() -> Ledger<SessionLedger> {
 pub struct ReclaimTarget {
     pub profile_name: String,
     pub granted_paths: Vec<String>,
+    /// [§22.3.2] このセッションがcapability SID宛に付けたACE（`(パス, capability名)`）。
+    ///
+    /// **`granted_paths`と違い、プロファイル名からは主体を導出できない**（capability SIDは
+    /// 名前から導出され、その名前は乱数の秘密由来である）。だから撤収はここに記録された
+    /// **名前**を使う。空であることは「capability宛の付与が無かった」を意味する
+    /// ——`grants_known`が偽なら`granted_paths`と同じく「分からない」側なので、
+    /// **2つを混ぜて読まないこと**。
+    pub granted_capabilities: Vec<CapabilityGrant>,
     /// **このプロファイルが何を付与したかを台帳から復元できたか。**
     ///
     /// `false`＝台帳エントリが失われており、`granted_paths`が空なのは
@@ -175,12 +215,16 @@ pub fn plan_reclaim(
         targets.push(ReclaimTarget {
             profile_name: entry.profile_name.clone(),
             granted_paths: entry.granted_paths.clone(),
+            granted_capabilities: entry.granted_capabilities.clone(),
             grants_known: true,
         });
         for mcp in &entry.mcp {
             targets.push(ReclaimTarget {
                 profile_name: mcp.profile_name.clone(),
                 granted_paths: mcp.granted_paths.clone(),
+                // MCPサーバはcapability群の対象外（§22.2.2。分離はD-38のプロファイル分離が
+                // 担う）ので、capability宛の付与は持たない。
+                granted_capabilities: Vec::new(),
                 grants_known: true,
             });
         }
@@ -204,6 +248,9 @@ pub fn plan_reclaim(
             targets.push(ReclaimTarget {
                 profile_name: name.clone(),
                 granted_paths: Vec::new(),
+                // 台帳エントリが無い＝**何を付けたか分からない**。capability側も同じく
+                // 空だが、それは「無かった」ではない（`grants_known: false`が両方に掛かる）。
+                granted_capabilities: Vec::new(),
                 grants_known: false,
             });
         }
@@ -350,6 +397,40 @@ mod win {
             cleared.iter().any(|p| same_ledger_path(&entry_path, p))
         });
     }
+
+    /// [§22.3.2] 記録された**capability名**から主体を導出して、そのツリーから剥がす。
+    ///
+    /// [`super::ReclaimIo::revoke_capability`]の実体。`revoke_session_grant`と対になるが、
+    /// 導出が違う（あちらはプロファイル名→package SID、こちらはcapability名→capability SID）。
+    /// 名前の**形の検証**は`capability_sid_from_declaration_name`が行う——別種の名前が
+    /// 渡されたときに黙って通さないため。
+    ///
+    /// SIDを導出できないときは**空ではなく理由を返す**（B-10:「剥がすものが無かった」と
+    /// 「剥がしに行けなかった」を同じ値にしない）。空を返すと呼び出し側が名前を捨ててよいと
+    /// 判断し、そのACEは二度と剥がせなくなる。
+    pub(super) fn revoke_capability_grant(path: &Path, capability_name: &str) -> RevokeLeftovers {
+        crate::tier2a::win_appcontainer::revoke_capability_grant(path, capability_name)
+    }
+
+    /// [§22.3.2] 剥がし終えたcapabilityの記録を`workspace-capability-ledger.json`から落とす。
+    ///
+    /// **述語を受けて1回の`update`で落とす既存の部品**（`prune_capability_entries`）へ繋ぐだけで、
+    /// 新しい撤収の扉は作らない。`fs revoke-workspace`を拡張しないという§22.3.2の決定は
+    /// 「差分層の後片付けの責任者は`session_profile`である」という意味なので、責任者側が
+    /// 既存の部品を呼ぶこの形はその決定のとおりである。
+    pub(super) fn forget_capability_entries(names: &[&str]) {
+        let dropped = crate::tier2a::workspace_capability::prune_capability_entries(|entry| {
+            names.contains(&entry.capability_name.as_str())
+        });
+        // 黙って消さない（B-11）。実マシンの記録を減らす操作なので、件数は残す。
+        if !dropped.is_empty() {
+            eprintln!(
+                "note: dropped {} capability ledger entr(ies) whose ACEs were fully revoked: {}",
+                dropped.len(),
+                dropped.join(", ")
+            );
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -370,6 +451,11 @@ mod win {
     /// workspace一覧台帳（`tier2a::workspace_ledger`）はwindows専用モジュールなので、
     /// 非Windowsでは掃除するものが無い。
     pub(super) fn prune_workspace_paths(_cleared: &[&str]) {}
+    /// ACL（capability SID）はWindows専用の機構なので、非Windowsでは剥がすものが無い。
+    pub(super) fn revoke_capability_grant(_path: &Path, _capability_name: &str) -> RevokeLeftovers {
+        Vec::new()
+    }
+    pub(super) fn forget_capability_entries(_names: &[&str]) {}
 }
 
 /// このセッションの生存マーカーを立て、台帳へ登録する（プロファイル自体の作成は
@@ -385,6 +471,7 @@ pub fn begin_session() -> Result<String, String> {
                 token: token.to_string(),
                 profile_name: entry_name,
                 granted_paths: Vec::new(),
+                granted_capabilities: Vec::new(),
                 created_at_unix_secs: now_unix_secs(),
                 mcp: Vec::new(),
             });
@@ -442,6 +529,104 @@ pub fn record_granted_paths(paths: &[std::path::PathBuf]) {
             paths.len()
         );
     }
+}
+
+/// [§22.3.2] capability SID宛に付けたACEを台帳へ記録する（撤収時に剥がす対象）。
+///
+/// [`record_granted_path`]のcapability版。**付与が成功した後にだけ呼ぶこと**——先に記録すると
+/// 「台帳にあるのに実体が無い」逆向きの孤立になる（B-15）。
+///
+/// [BUG-101と同じ理由] **無言のno-opにしない。** このセッションの台帳エントリが無ければ
+/// 何も書かずに戻るが、付与は成功しているので呼び出し側は成功と読む——そして撤収の対象にも
+/// ならないACEが実マシンに残る。「記録できなかった」は付与の失敗ではないので**止めはしない**が、
+/// **黙りもしない**（B-10）。
+pub fn record_granted_capability(path: &Path, capability_name: &str) {
+    let token = session_token();
+    let path_str = path.to_string_lossy().into_owned();
+    let mut recorded = false;
+    ledger().update(|l| {
+        if let Some(entry) = l.sessions.iter_mut().find(|e| e.token == token) {
+            recorded = true;
+            if !entry
+                .granted_capabilities
+                .iter()
+                .any(|g| g.path == path_str && g.capability_name == capability_name)
+            {
+                entry.granted_capabilities.push(CapabilityGrant {
+                    path: path_str.clone(),
+                    capability_name: capability_name.to_string(),
+                });
+            }
+        }
+    });
+    if !recorded {
+        eprintln!(
+            "warning: could not record the capability grant on {path_str} for session {token}: \
+             the session has no ledger entry, so this ACE will not be revoked automatically \
+             (see docs/bugs/BUG-101.md)"
+        );
+    }
+}
+
+/// [§22.3.2] capability SID宛に付けたACEのパス一覧（自己検証`grant_audit`が読む「記録」側）。
+///
+/// [`granted_paths_for_current_session`]のcapability版で、**別の集合である**ことが要点である
+/// ——package SID宛の自己検証にこのパスを混ぜると、主体が違うのだからACEが無いのは当然なのに
+/// 「幻の台帳エントリ」として毎回報告される。
+pub fn granted_capability_paths_for_current_session() -> Vec<String> {
+    let token = session_token();
+    ledger()
+        .load()
+        .sessions
+        .into_iter()
+        .find(|e| e.token == token)
+        .map(|e| {
+            e.granted_capabilities
+                .into_iter()
+                .map(|g| g.path)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// **「死んだセッションがこのcapabilityを付けた」という台帳エントリを1件足す。テスト専用の口。**
+///
+/// GC（`gc_dead_sessions`）の経路を実機で測るために要る。実行中のプロセスは自分の生存マーカーを
+/// 握っているので、**自分自身はどうやってもGCの対象にならない**——`is_live`が真を返すためで、
+/// これは正しい動作である（実行中の他セッションから権限を奪わない、BUG-053）。
+/// だから「GCが差分層のACEを剥がすか」を測るには、死んだセッションを1つ用意するしかない。
+///
+/// # なぜ現行セッションのエントリを「付け替え」ないのか
+///
+/// 付け替える形も書けるが、**実マシンに回収不能なプロファイルを1件残す**——現行セッションの
+/// AppContainerプロファイルは実在するのに台帳エントリが消えるので、以後のGCからは
+/// 「台帳に無いが実在する」＝`grants_known: false`に見え、**二度と削除されない**
+/// （BUG-107で67件積み上がったのと同じ形）。テストが実マシンへ残骸を積む理由は無い。
+///
+/// **足す側なら残骸は生まれない。** ここで作る名前のプロファイルは実在しないので、
+/// `DeleteAppContainerProfile`は成功し（存在しない名前にもS_OKを返す）、検算も
+/// 「実在しない」で通り、エントリはGCが自分で片付ける。現行セッションのエントリは無傷である。
+///
+/// **製品から呼ばないこと。** このエントリは「回収してよい」と宣言したのと同じ意味を持つ。
+#[cfg(all(windows, test))]
+pub(crate) fn add_dead_session_with_capability_for_test(path: &Path, capability_name: &str) {
+    // 生存マーカーを握っていないトークン。接頭辞は保つ（GCが`token_of_profile`で拾えるように）。
+    let dead = format!("{}-dead-for-test", session_token());
+    let entry = SessionEntry {
+        token: dead.clone(),
+        profile_name: profile_name_for(&dead),
+        granted_paths: Vec::new(),
+        granted_capabilities: vec![CapabilityGrant {
+            path: path.to_string_lossy().into_owned(),
+            capability_name: capability_name.to_string(),
+        }],
+        created_at_unix_secs: now_unix_secs(),
+        mcp: Vec::new(),
+    };
+    ledger().update(|l| {
+        l.sessions.retain(|e| e.token != dead);
+        l.sessions.push(entry.clone());
+    });
 }
 
 /// このセッションが撤収責任を負っているパス（[`record_granted_path`]で積んだもの）。
@@ -579,6 +764,24 @@ struct ReclaimIo<'a> {
     /// 歪みではなく事実である（`grants_known`・`blocked_here`・`unrecorded`の
     /// プロファイル単位の意味は保てる）。
     revoke: &'a dyn Fn(&Path, &str) -> RevokeLeftovers,
+    /// [§22.3.2] **capability SID宛**のACEを、記録された名前から剥がす。
+    ///
+    /// [`Self::revoke`]と形は同じだが、第2引数の意味が違う——あちらは**プロファイル名**
+    /// （`DeriveAppContainerSidFromAppContainerName`で導出）、こちらは**capability名**
+    /// （`DeriveCapabilitySidsFromName`で導出）である。同じ関数では剥がせないので別の口にする。
+    ///
+    /// **公開シグネチャ（[`end_session`]・[`gc_dead_sessions`]）には出さない。** あちらの
+    /// コールバックを増やすと呼び出し側13箇所（`harness-cli`・`harness-policy-editor`・
+    /// このクレートのETWテスト群）を全部書き換えることになり、そのどれか1つが古い形のまま
+    /// 残れば「片方の経路だけ撤収しない」という最も気付きにくい欠陥になる。ここは製品用の
+    /// 組み立て（[`reclaim_targets`]）が差すだけの内部の口である。
+    revoke_capability: &'a dyn Fn(&Path, &str) -> RevokeLeftovers,
+    /// [§22.3.2] 剥がし終えたcapabilityの**台帳エントリ**（`workspace-capability-ledger.json`）を
+    /// 落とす。**ACEを剥がし終えたときだけ呼ぶこと**（`B-01`「名前を捨てる操作を最後に置く」）。
+    ///
+    /// 差分層のcapabilityは**CoWセッションごとに1件増える**ので、これを呼ばないと記録が
+    /// 際限なく積もる（§22.3.2が「撤収とGCを対で設計する」と言っている当のもの）。
+    forget_capabilities: &'a dyn Fn(&[&str]),
     /// **台帳に記録が無いのに実在するACE**の件数（`grant_audit`の自己検証）。
     /// 0でなければ名前を捨てない（BUG-101）。人への報告もこの中で行う。
     unrecorded_aces: &'a dyn Fn(&str, &[String]) -> usize,
@@ -620,6 +823,8 @@ fn reclaim_targets(
     reclaim_targets_in(
         &ReclaimIo {
             revoke,
+            revoke_capability: &win::revoke_capability_grant,
+            forget_capabilities: &win::forget_capability_entries,
             unrecorded_aces: &report_unrecorded_aces,
             delete_profile: &win::delete_profile,
             ledger: &ledger(),
@@ -646,6 +851,9 @@ fn reclaim_targets_in(io: &ReclaimIo<'_>, targets: &[ReclaimTarget]) -> ReclaimO
     // ので、ここでは両方へ積んでおき、差し引きは末尾でまとめて行う。
     let mut cleared: Vec<&str> = Vec::new();
     let mut still_held: Vec<&str> = Vec::new();
+    // [§22.3.2] 1本残らず剥がせたcapabilityの名前。台帳から落とすのは**末尾で1回**
+    // （台帳の更新をループの中でやらない、というこの関数の既存の約束と同じ理由）。
+    let mut forgettable_capabilities: Vec<&str> = Vec::new();
     for target in targets {
         if !target.grants_known {
             // 何を付与したか分からない以上、剥がせない。名前を消せば永久に剥がせなくなるので残す。
@@ -662,6 +870,20 @@ fn reclaim_targets_in(io: &ReclaimIo<'_>, targets: &[ReclaimTarget]) -> ReclaimO
                 cleared.push(path.as_str());
             } else {
                 still_held.push(path.as_str());
+            }
+            blocked_here.extend(leftovers);
+            outcome.revoked_paths += 1;
+        }
+        // [§22.3.2] capability SID宛のACE（CoWの差分層）。**主体の導出が違うので別の口を通す**
+        // （`ReclaimIo::revoke_capability`のdoc）。剥がし残しは`blocked_here`へ**同じ形で**
+        // 積む——ここを別枠にすると、剥がせていないのにプロファイル名と台帳エントリを
+        // 捨てる経路ができ、名前を失って二度と剥がせなくなる（BUG-101と同型）。
+        for grant in &target.granted_capabilities {
+            let leftovers =
+                (io.revoke_capability)(Path::new(&grant.path), &grant.capability_name);
+            if leftovers.is_empty() {
+                // **剥がし終えたものだけ**、名前の記録を捨てる候補にする（`B-01`）。
+                forgettable_capabilities.push(grant.capability_name.as_str());
             }
             blocked_here.extend(leftovers);
             outcome.revoked_paths += 1;
@@ -705,6 +927,13 @@ fn reclaim_targets_in(io: &ReclaimIo<'_>, targets: &[ReclaimTarget]) -> ReclaimO
     cleared.dedup();
     if !cleared.is_empty() {
         (io.prune_workspace_paths)(&cleared);
+    }
+    // [§22.3.2/B-01] **名前を捨てるのは、そのACEがもう無いと確かめられたときだけ。**
+    // 剥がし残しがあった名前はここに入っていないので、次のGCがもう一度引ける。
+    forgettable_capabilities.sort_unstable();
+    forgettable_capabilities.dedup();
+    if !forgettable_capabilities.is_empty() {
+        (io.forget_capabilities)(&forgettable_capabilities);
     }
     if !deleted.is_empty() {
         io.ledger.update(|l| {
@@ -1013,11 +1242,14 @@ pub fn end_session(revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers) -> ReclaimOu
     let mut targets = vec![ReclaimTarget {
         profile_name: entry.profile_name,
         granted_paths: entry.granted_paths,
+        granted_capabilities: entry.granted_capabilities,
         grants_known: true,
     }];
     targets.extend(entry.mcp.into_iter().map(|m| ReclaimTarget {
         profile_name: m.profile_name,
         granted_paths: m.granted_paths,
+        // MCPサーバはcapability群の対象外（§22.2.2）。`plan_reclaim`側と同じ理由。
+        granted_capabilities: Vec::new(),
         grants_known: true,
     }));
     reclaim_targets(&targets, revoke)
@@ -1033,9 +1265,23 @@ mod tests {
             token: token.to_string(),
             profile_name: profile_name_for(token),
             granted_paths: paths.iter().map(|p| p.to_string()).collect(),
+            granted_capabilities: Vec::new(),
             created_at_unix_secs: 0,
             mcp: Vec::new(),
         }
+    }
+
+    /// capability SID宛の付与を持つセッション（§22.3.2のCoW差分層）。
+    fn entry_with_capabilities(token: &str, grants: &[(&str, &str)]) -> SessionEntry {
+        let mut e = entry(token, &[]);
+        e.granted_capabilities = grants
+            .iter()
+            .map(|(path, name)| CapabilityGrant {
+                path: (*path).to_string(),
+                capability_name: (*name).to_string(),
+            })
+            .collect();
+        e
     }
 
     fn entry_with_mcp(token: &str, servers: &[(&str, &[&str])]) -> SessionEntry {
@@ -1130,6 +1376,13 @@ mod tests {
         /// 測りたいのは**呼ばれた回数**である——落ちる記録は同じなので、回数を測らないと
         /// 「パスごとに1回」へ戻ったことに気付けない。
         workspace_prunes: std::sync::Mutex<Vec<Vec<String>>>,
+        /// [§22.3.2] **capability台帳から名前を捨てた回数と集合**（1要素＝1回の`update`）。
+        ///
+        /// `workspace_prunes`と分けるのは、落とす先の台帳が別だからである
+        /// （あちらは`workspace-grant-ledger`、こちらは`workspace-capability-ledger`）。
+        /// **名前を捨てる操作なので、剥がし残しがあったときに呼ばれていないことを測る**
+        /// のがこの欄の主目的である（`B-01`の「名前を捨てる操作を最後に置く」）。
+        capability_forgets: std::sync::Mutex<Vec<Vec<String>>>,
         /// `delete_profile`の戻り値。`Err`にすると「削除できなかった」経路を測れる。
         delete_result: Result<(), String>,
         /// `unrecorded_aces`の戻り値。0以外＝台帳に無いACEが実在する（BUG-101の保護）。
@@ -1149,6 +1402,7 @@ mod tests {
                 ledger: Ledger::at_path(dir.path().join(LEDGER_FILE), None),
                 events: std::sync::Mutex::new(Vec::new()),
                 workspace_prunes: std::sync::Mutex::new(Vec::new()),
+                capability_forgets: std::sync::Mutex::new(Vec::new()),
                 delete_result: Ok(()),
                 unrecorded: 0,
                 blocked: Vec::new(),
@@ -1183,6 +1437,27 @@ mod tests {
                 note(format!("delete:{profile}"));
                 self.delete_result.clone()
             };
+            // [§22.3.2] capability宛の撤収。`blocked`の突合は`revoke`と同じ形にしてある
+            // ——テスト側で別の判定を書くと、製品側で2つの経路が同じ扱いになっているか
+            // どうかをこのフェイクが測れなくなる。
+            let revoke_capability = |path: &Path, capability: &str| {
+                note(format!("revoke_cap:{}:{capability}", path.display()));
+                let path_str = path.to_string_lossy();
+                if self
+                    .blocked
+                    .iter()
+                    .any(|(p, name)| *p == *path_str && name == capability)
+                {
+                    return vec![(path.to_path_buf(), "blocked by the fake".to_string())];
+                }
+                RevokeLeftovers::new()
+            };
+            let forget_capabilities = |names: &[&str]| {
+                self.capability_forgets
+                    .lock()
+                    .unwrap()
+                    .push(names.iter().map(|n| (*n).to_string()).collect());
+            };
             let unrecorded_aces = |_profile: &str, _recorded: &[String]| self.unrecorded;
             let prune_workspace_paths = |cleared: &[&str]| {
                 self.workspace_prunes
@@ -1193,6 +1468,8 @@ mod tests {
             reclaim_targets_in(
                 &ReclaimIo {
                     revoke: &revoke,
+                    revoke_capability: &revoke_capability,
+                    forget_capabilities: &forget_capabilities,
                     unrecorded_aces: &unrecorded_aces,
                     delete_profile: &delete,
                     ledger: &self.ledger,
@@ -1211,6 +1488,11 @@ mod tests {
             self.workspace_prunes.lock().unwrap().clone()
         }
 
+        /// capability台帳から名前を捨てた履歴（1要素＝1回の`update`）。
+        fn capability_forgets(&self) -> Vec<Vec<String>> {
+            self.capability_forgets.lock().unwrap().clone()
+        }
+
         /// 一時台帳に残っているセッションのトークン。
         fn remaining_tokens(&self) -> Vec<String> {
             self.ledger
@@ -1226,7 +1508,22 @@ mod tests {
         ReclaimTarget {
             profile_name: profile_name_for(token),
             granted_paths: paths.iter().map(|p| p.to_string()).collect(),
+            granted_capabilities: Vec::new(),
             grants_known: true,
+        }
+    }
+
+    /// [§22.3.2] capability SID宛の付与を持つ回収対象（CoWの差分層）。
+    fn known_target_with_capabilities(token: &str, grants: &[(&str, &str)]) -> ReclaimTarget {
+        ReclaimTarget {
+            granted_capabilities: grants
+                .iter()
+                .map(|(path, name)| CapabilityGrant {
+                    path: (*path).to_string(),
+                    capability_name: (*name).to_string(),
+                })
+                .collect(),
+            ..known_target(token, &[])
         }
     }
 
@@ -1301,6 +1598,8 @@ mod tests {
         let targets = vec![ReclaimTarget {
             profile_name: profile_name_for("lost-ledger"),
             granted_paths: Vec::new(),
+            // 空でも「無かった」ではなく「**分からない**」（`grants_known: false`）。
+            granted_capabilities: Vec::new(),
             grants_known: false,
         }];
         let io = FakeIo::new();
@@ -1518,6 +1817,8 @@ mod tests {
         io.reclaim(&[ReclaimTarget {
             profile_name: profile_name_for("lost-ledger"),
             granted_paths: Vec::new(),
+            // 空でも「無かった」ではなく「**分からない**」（`grants_known: false`）。
+            granted_capabilities: Vec::new(),
             grants_known: false,
         }]);
 
@@ -1560,6 +1861,116 @@ mod tests {
                 format!("revoke:C:\\b:{}", profile_name_for("t")),
                 format!("delete:{}", profile_name_for("t")),
             ]
+        );
+    }
+
+    // --- [§22.3.2] CoW差分層のcapability SID宛ACEの撤収 ---
+    //
+    // **禁止側と許可側を対で置く**（`B-35`）。「剥がせたら名前を捨てる」だけを測ると、
+    // 判定が「常に捨てる」に壊れても緑のままになる——そして常に捨てる側へ壊れることは、
+    // **剥がせていないACEの名前を失う**という最悪の形（BUG-101と同型）である。
+
+    /// 許可側: 1本残らず剥がせたら、capability台帳から名前を捨てる。
+    ///
+    /// 捨てないとCoWセッションごとに記録が1件積もる（§22.3.2が「撤収とGCを対で設計する」と
+    /// 言っている当のもの）。
+    #[test]
+    fn a_fully_revoked_capability_grant_has_its_name_dropped() {
+        let io = FakeIo::new().with_sessions(&["t"]);
+        let outcome = io.reclaim(&[known_target_with_capabilities(
+            "t",
+            &[(r"C:\cow\sess-1", "harnessDecl00112233445566778899aabbccddeeff")],
+        )]);
+
+        assert_eq!(
+            io.capability_forgets(),
+            vec![vec!["harnessDecl00112233445566778899aabbccddeeff".to_string()]],
+            "剥がし終えた名前は捨てられていなければならない"
+        );
+        assert_eq!(outcome.deleted_profiles, 1);
+        assert!(outcome.kept_with_leftovers.is_empty());
+    }
+
+    /// 禁止側: 1本でも剥がし残したら、名前を**捨てない**しプロファイルも消さない。
+    ///
+    /// capability SIDは名前の一方向導出なので、名前を捨てた瞬間にそのACEは
+    /// **どのコマンドでも剥がせなくなる**（`B-01`の「不可逆な片方」）。
+    #[test]
+    fn a_blocked_capability_grant_keeps_its_name_and_its_profile() {
+        let io = FakeIo {
+            blocked: vec![(
+                r"C:\cow\sess-1".to_string(),
+                "harnessDecl00112233445566778899aabbccddeeff".to_string(),
+            )],
+            ..FakeIo::new()
+        }
+        .with_sessions(&["t"]);
+        let outcome = io.reclaim(&[known_target_with_capabilities(
+            "t",
+            &[(r"C:\cow\sess-1", "harnessDecl00112233445566778899aabbccddeeff")],
+        )]);
+
+        assert!(
+            io.capability_forgets().is_empty(),
+            "剥がせていない名前を捨ててはいけない: {:?}",
+            io.capability_forgets()
+        );
+        assert_eq!(
+            outcome.deleted_profiles, 0,
+            "剥がし残しがあるならプロファイルも残す"
+        );
+        assert_eq!(outcome.kept_with_leftovers.len(), 1);
+        // 台帳エントリも残る（次回のGCがもう一度引ける）。
+        assert_eq!(io.remaining_tokens(), vec!["t".to_string()]);
+    }
+
+    /// capability宛の撤収も**プロファイル削除より先**である（package SID宛と同じ不変条件）。
+    ///
+    /// 順序が逆だと、セッション台帳のエントリが先に消えて`granted_capabilities`ごと失われる
+    /// ——名前を失ったACEは二度と剥がせない。
+    #[test]
+    fn capability_revocation_also_happens_before_the_profile_is_deleted() {
+        let io = FakeIo::new().with_sessions(&["t"]);
+        io.reclaim(&[ReclaimTarget {
+            granted_paths: vec![r"C:\ws".to_string()],
+            ..known_target_with_capabilities(
+                "t",
+                &[(r"C:\cow\sess-1", "harnessDecl00112233445566778899aabbccddeeff")],
+            )
+        }]);
+
+        assert_eq!(
+            io.events(),
+            vec![
+                format!("revoke:C:\\ws:{}", profile_name_for("t")),
+                "revoke_cap:C:\\cow\\sess-1:harnessDecl00112233445566778899aabbccddeeff"
+                    .to_string(),
+                format!("delete:{}", profile_name_for("t")),
+            ]
+        );
+    }
+
+    /// 台帳から回収対象を組み立てるとき、capability宛の付与も一緒に運ばれる。
+    ///
+    /// [BUG-057と同型] ここが落ちると、撤収の**実装は正しいのに対象が空**になり、
+    /// 「撤収が走ったのに何も剥がれない」という無言の失敗になる。
+    #[test]
+    fn capability_grants_are_carried_from_the_ledger_into_the_reclaim_plan() {
+        let ledger = SessionLedger {
+            sessions: vec![entry_with_capabilities(
+                "dead",
+                &[(r"C:\cow\sess-1", "harnessDecl00112233445566778899aabbccddeeff")],
+            )],
+        };
+        let targets = plan_reclaim(&ledger, &[], &liveness(&HashSet::new()));
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].granted_capabilities,
+            vec![CapabilityGrant {
+                path: r"C:\cow\sess-1".to_string(),
+                capability_name: "harnessDecl00112233445566778899aabbccddeeff".to_string(),
+            }]
         );
     }
 

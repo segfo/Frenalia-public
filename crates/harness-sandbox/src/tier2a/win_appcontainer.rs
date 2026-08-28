@@ -258,6 +258,79 @@ pub fn fs_allow_capability_sids(
         .collect()
 }
 
+/// CoW差分層（`--sandbox tier2a-cow`の`diff_layer_dir`）のACEを付ける先の access級。
+///
+/// **`grant_ace_inheritable_rw`が実際に書くマスクと同じ級でなければならない。** あちらは
+/// `workspace_rwx_mask()`を書き、それは`fs_access_mask(FsAccess::ReadWriteExec)`と同値である
+/// （`acl_grant`の`fs_access_mask`にその旨のコメントがある）。導出に使った級と実際に書いた
+/// マスクがずれると、撤収側は**別の主体**を探しに行って何も剥がせない。
+pub const COW_DIFF_LAYER_ACCESS: FsAccess = FsAccess::ReadWriteExec;
+
+/// [§22.3.2] CoW差分層のFS付与の主体。**発行する側**（付与経路が使う）。
+///
+/// # なぜ差分層に専用の仕組みが要らないのか
+///
+/// 差分層はセッション専有なので、そこへ付ける許可もセッションと同じ寿命でよい。これは
+/// 新しい概念を要さない——§22.2.0の導出鍵は`(秘密, 畳み込み済みパス, access級)`であり、
+/// **差分層のパスにセッションIDが入っている以上、導出されるcapabilityも自動的にセッション固有に
+/// なる**。「セッション限定capability」という別種のSIDを設計に足さないこと（§22.3.2）。
+///
+/// 実体は`--fs-allow`の宣言1件とまったく同じ扱いである（台帳の`declaration`欄に
+/// 畳み込んだ差分層のパスが入る）。**新しい台帳もSIDの新種別も作らない。**
+///
+/// # 呼び出し元は4つあり、全員が同じ規則を共有していなければならない
+///
+/// | 何をする側 | どこ | 発行するか |
+/// |---|---|---|
+/// | 起動時に付ける | `win_appcontainer/preflight.rs`のCoW分岐 | **する**（この関数） |
+/// | セッション切替・forkで付ける | `session_scope::prepare_cow_diff_layer` | **する**（この関数） |
+/// | 子のトークンへ積む（製品） | `win_appcontainer/launch.rs` | しない（[`lookup_cow_diff_layer_capability_sid`]） |
+/// | 子のトークンへ積む（実機テスト） | `win_appcontainer/test_support.rs` | しない（同上） |
+///
+/// ずれたときの症状は**「ACEは正しく付いているのに子から一切読めない」**で、`ACCESS_DENIED`は
+/// 出るが原因はACL側ではなくトークン側にある——最も原因を追いにくい形である（`launch.rs`の
+/// モジュールdocが同じことを言っている）。だから導出はこの2本だけが持つ。
+///
+/// **`workspace`はcanonicalize済みを渡すこと**（[`workspace_capability_sid`]と同じ理由。
+/// `workspace_key`は大小・区切り・`\\?\`前置を畳むが、`..`や8.3短縮名は解かない）。
+/// `diff_layer_dir`側の綴りは`declaration_key`が畳むので、呼び出し側で正規化しなくてよい。
+pub fn cow_diff_layer_capability_sid(
+    workspace: &Path,
+    diff_layer_dir: &Path,
+) -> Result<crate::win_common::OwnedSid, AppContainerError> {
+    let name = crate::tier2a::workspace_capability::ensure_declaration_capability_name(
+        workspace,
+        diff_layer_dir,
+        COW_DIFF_LAYER_ACCESS.label(),
+    )
+    .map_err(AppContainerError::Preflight)?;
+    capability_sid_from_name(&name)
+}
+
+/// [§22.3.2] CoW差分層の主体を**引くだけ**（発行しない）。子のトークンへ積む経路が使う。
+///
+/// [`cow_diff_layer_capability_sid`]との違いは発行の有無だけである。**積む側が発行してしまうと、
+/// `preflight`を経ていない差分層に対して台帳エントリが増える**——「読むだけのつもりの呼び出しが
+/// 作用を持つ」形で、`B-01`が名指ししている誤りそのものである（`test_support`が
+/// workspace本体について`lookup_capability_name`を通しているのと同じ理由）。
+///
+/// まだ発行されていなければ`None`。呼び出し側は**積まない**——積めないことは
+/// `ACCESS_DENIED`＝fail-closedで出るので、無言で広がる向きには倒れない。
+/// **access級で絞って引く**（`declaration_capability_names`のようにパスだけで引かない）——
+/// 積むべきなのは**付与に使ったのと同じ級の主体**ただ1つだからである。級を無視して引くと、
+/// 同じ差分層へ別の級が発行されていた場合に宣言より広い主体を積むことになる。
+pub fn lookup_cow_diff_layer_capability_sid(
+    workspace: &Path,
+    diff_layer_dir: &Path,
+) -> Option<crate::win_common::OwnedSid> {
+    let name = crate::tier2a::workspace_capability::lookup_declaration_capability_name(
+        workspace,
+        diff_layer_dir,
+        COW_DIFF_LAYER_ACCESS.label(),
+    )?;
+    capability_sid_from_name(&name).ok()
+}
+
 /// [§22.3.1] **昇格側が、受け取った秘密から自分で導出した名前**をSIDへ写す。
 ///
 /// 名前は`declaration_capability_name`が`(秘密, 畳み込み済みパス, access級)`から作ったもので、
@@ -602,6 +675,13 @@ mod domain_isolation_tests;
 /// `ace_grant_revoke_tests`とは測る層が違う（あちらはDACL、こちらは子から見た実I/O）。
 #[cfg(all(windows, test))]
 mod fs_allow_domain_acceptance_tests;
+
+/// **CoW差分層の主体移行（§22.3.2）の受け入れ測定**（`docs/STATUS.md`残課題#20の残り1件）。
+/// 差分層のrootにpackage SID宛ACEが0本・capability宛が1本であることと、セッション終了と
+/// GCの**両方**でそれが0本へ戻ることを、**実DACLで**測る。子から見た実I/Oは測らない
+/// （そちらは`cow_containment_tests`と実機E2E`tier2a_cow_commit_matrix`）。
+#[cfg(all(windows, test))]
+mod cow_diff_layer_subject_tests;
 
 /// **MAC/Spawn Daemon設計の実現性スパイク**（`plans/mac-spike/RESULTS.md`）。
 /// 設計§20の未実測の前提を、実装に着手する前に確定させるための使い捨て測定。
