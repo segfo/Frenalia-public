@@ -616,6 +616,14 @@ mod workspace_prepare_tests;
 #[cfg(all(windows, test))]
 mod jit_grant_cost_tests;
 
+/// **Redirector DLLのフックが、成功するopen 1回へ上乗せする時間**（D-86の着手条件）。
+/// Lazy ACE fault-inはフックの無いDirectRwへフックを新設するので、払う相手は
+/// 「faultした回数」（§S21の実測で503件）ではなく**成功も含めた全openの回数**
+/// （同じく144,967〜218,841回）である。**非昇格で回し、ACEも台帳も1バイトも触らない**。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod lazy_hook_overhead_tests;
+
 /// **制限SID（`SidsToRestrict`）を指定したトークンで非管理者のまま子を起こせるか**
 /// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」5番＝案A-3の前提）。
 /// BUG-003が確かめた特権免除の特例は制限SIDが`None`のときの実測なので、非空でも
