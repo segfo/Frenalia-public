@@ -210,3 +210,90 @@ mod tests {
         assert!(message.contains("a, b"), "{message}");
     }
 }
+
+/// **「昇格を要求するかどうか」の判定を、実マシンに対して測る**（読み取り専用・非昇格）。
+///
+/// # なぜこれが要るのか（測り方の失敗から来ている）
+///
+/// §22.3.2の移行の実機E2Eで、通過許可の台帳が7→10件へ増えた。その理由を
+/// 「実際に走らせて記録の増減を見る」形で調べようとしたが、**一度ACEが付くと冪等スキップで
+/// 二度と差が出ない**ので、事後には決着させられなかった——**測ると答えが消える測り方**だった。
+///
+/// 抜け道は単純で、**測るたびに新しいディレクトリを切ればよい**。まだ誰も許可を付けていない
+/// 場所なら、判定は何度でも同じ答えを返す。ここが書込を一切しない
+/// （[`preview_traverse_chain`]は`sid_ace_mask`で読むだけ）ので、測っても状態は変わらない。
+///
+/// # 何が言えて、何が言えないか
+///
+/// 言えるのは「**新しい場所は不足と判定され、付与済みの場所は充足と判定される**」までである。
+/// 「どのパスについてこれを聞くか」は別の関数（`preflight`の`traverse_targets_for`）が決めており、
+/// そちらは実マシンを読まない純粋関数として別に固定してある。**2つ揃って初めて
+/// 「何が要求されるか」が言える**ので、片方だけを根拠にしないこと。
+#[cfg(all(windows, test))]
+mod machine_probe_tests {
+    use super::*;
+
+    /// **対で測る**（`B-35`）——「新しい場所は不足」だけだと、判定が**常に不足**へ壊れても緑になる。
+    /// そして常に不足へ壊れると、**起動のたびにUACが出る**（D-37がleafを対象外にした理由そのもの）。
+    /// だから「付与済みの場所は充足」を同じテストで測る。
+    ///
+    /// 実行:
+    /// `cargo test -p harness-sandbox --lib -- --ignored --nocapture a_never_granted_directory`
+    #[test]
+    #[ignore = "real machine: reads DACLs under C:\\ (read-only, no elevation)"]
+    fn a_never_granted_directory_is_judged_insufficient_and_a_granted_one_is_not() {
+        let sid = match crate::tier2a::win_appcontainer::traverse_capability_sid() {
+            Ok(sid) => sid,
+            Err(e) => panic!("traverse capability SID must be derivable: {e}"),
+        };
+
+        // 禁止側: いま切ったばかりの場所。**測るたびに新しい名前**にするので、
+        // 前の実行の結果を引き継がない。
+        let fresh = std::path::PathBuf::from(format!(
+            r"C:\harness-traverse-probe-{}-{}",
+            std::process::id(),
+            harness_grant_ledger::now_unix_secs()
+        ));
+        std::fs::create_dir_all(&fresh).expect("probe dir");
+        // 書込は一切しないが、パニックしても残さない（`B-27`）。
+        let _guard = super::super::test_support::scopeguard(|| {
+            let _ = std::fs::remove_dir_all(&fresh);
+        });
+
+        let chain = preview_traverse_chain(&fresh, sid.as_psid());
+        for node in &chain {
+            println!(
+                "  {:<60} mask={:?} sufficient={}",
+                node.path.display(),
+                node.existing_mask,
+                node.already_sufficient
+            );
+        }
+        assert!(
+            !traverse_chain_sufficient(&fresh, sid.as_psid()),
+            "a directory created seconds ago must be reported as needing a traverse grant; \
+             if this is already 'sufficient', the judgment cannot distinguish granted from \
+             ungranted and nothing would ever be requested"
+        );
+        // **その不足が「この新しいノードだけ」であることまで見る。** ここを見ないと、
+        // ドライブルートごと不足に壊れていても同じく緑になる。
+        let insufficient: Vec<&std::path::PathBuf> = chain
+            .iter()
+            .filter(|n| !n.already_sufficient)
+            .map(|n| &n.path)
+            .collect();
+        assert_eq!(
+            insufficient,
+            vec![&fresh],
+            "only the brand-new node should be missing the grant"
+        );
+
+        // 許可側: 既に付与済みのドライブルート。**これが充足でなければ、上の「不足」は
+        // 移行の話ではなく単に何も付いていないマシンを見ているだけになる。**
+        assert!(
+            traverse_chain_sufficient(std::path::Path::new(r"C:\"), sid.as_psid()),
+            "C:\\ has been granted on this machine (traverse ledger), so it must read as \
+             sufficient; if not, the measurement above says nothing about the migration"
+        );
+    }
+}
