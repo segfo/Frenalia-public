@@ -968,3 +968,79 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
         println!("  pruned workspace-capability entry: {label}");
     }
 }
+
+/// **中断された過去の測定が残したプローブツリーを掃く**（`dev-elevated-run.exe etw-fs-allow-sweep`）。
+///
+/// # なぜ「後片付けを直した」だけでは足りないのか
+///
+/// 上の測定は自分でプローブツリーを消すが、**その後片付けは`Ctrl+C`・クラッシュ・
+/// テストのpanicでは走らない**。走らなかった回の残骸は、測定が`dev-elevated-runner`配下で
+/// **昇格して**走る以上 `BUILTIN\Administrators` 所有になり、**非昇格では消せない**。
+/// だから「昇格して掃く口」が別に要る（実際に2件が実マシンへ残った。`docs/bugs/BUG-140.md` 層4）。
+///
+/// # 消す範囲を名前で固定する
+///
+/// 対象は**ドライブルート直下の `harness-fsallow-` で始まるディレクトリだけ**である。
+/// 消す操作なので、範囲は広げず、綴りもここで1箇所に持つ（[`PROBE_ROOT_PREFIX`]）。
+/// 台帳の記録には触れない——実体が消えた後に `harness fs prune`（非昇格でよい）が
+/// 4台帳から落とす。**順序を逆にすると剥がす手掛かりを失う**ので、この分担にしてある。
+///
+/// # 何も無ければ成功する
+///
+/// 残骸が0件でも失敗にしない（掃除は冪等であるべきで、「消すものが無い」は正常な状態である）。
+/// ただし**消せなかったものがあれば失敗させる**——黙って残すと、次に走らせた人が
+/// 「掃除した」と読む（`B-09`）。
+#[test]
+#[ignore = "requires administrator rights (deletes Administrators-owned probe trees left by \
+            interrupted runs); run via dev-elevated-run.exe etw-fs-allow-sweep"]
+fn sweep_probe_trees_left_by_interrupted_runs() {
+    /// プローブツリーの綴りの正本。作る側（`C:\\harness-fsallow-<pid>`）と同じ形。
+    const PROBE_ROOT_PREFIX: &str = "harness-fsallow-";
+
+    assert!(
+        crate::tier2a::privhelper::is_elevated(),
+        "この掃除は昇格していないと成立しない（対象は BUILTIN\\Administrators 所有）。\
+         dev-elevated-run.exe etw-fs-allow-sweep で走らせること"
+    );
+
+    let drive_root = std::path::PathBuf::from("C:\\");
+    let entries = std::fs::read_dir(&drive_root).expect("read C:\\");
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(PROBE_ROOT_PREFIX) {
+            continue;
+        }
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                println!("  removed probe tree: {}", path.display());
+                removed.push(path);
+            }
+            Err(e) => {
+                eprintln!("  !! could not remove {}: {e}", path.display());
+                failed.push((path, e.to_string()));
+            }
+        }
+    }
+
+    println!(
+        "=== swept {} probe tree(s); {} could not be removed ===",
+        removed.len(),
+        failed.len()
+    );
+    if removed.is_empty() && failed.is_empty() {
+        println!("  (nothing left behind -- this is the normal state)");
+    }
+    if !removed.is_empty() {
+        println!("  next: run `harness fs prune` (no elevation needed) to drop the now-dangling ledger records");
+    }
+    assert!(
+        failed.is_empty(),
+        "消せなかったプローブツリーがある: {failed:?}"
+    );
+}

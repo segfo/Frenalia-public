@@ -420,6 +420,26 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "loopback",
         ],
     ),
+    // 中断された`etw-fs-allow-reach`が残したプローブツリー（`C:\harness-fsallow-<pid>`）を掃く。
+    // 後片付けは`Ctrl+C`・クラッシュでは走らず、残骸は**昇格して作られたので非昇格では消せない**
+    // ——だから昇格して掃く口が別に要る（`docs/bugs/BUG-140.md`層4）。**台帳には触れない**ので、
+    // 実体を消した後に`harness fs prune`（非昇格でよい）を撃つこと。
+    // フィルタ文字列はテスト関数名と一致していなければならない（`check_tests_actually_ran`が
+    // 0件マッチを非0で落とす、BUG-056同型）。
+    (
+        "etw-fs-allow-sweep",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "sweep_probe_trees_left_by_interrupted_runs",
+        ],
+    ),
     // M15.5: MCPサーバ隔離（D-38）の実機E2E。workspace/`.harness`への到達不可（残課題#4）と、
     // サーバ別の出口allowlist（残課題#3）。`--test-threads=1`はAppContainerプロファイル・
     // WFPというマシン全体の共有状態を触るため（Tier2a残課題#4と同じ理由）。
