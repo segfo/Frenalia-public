@@ -189,6 +189,70 @@ fn check_workspace_usable_as_child_cwd(workspace_root: &Path) -> Result<(), AppC
     )))
 }
 
+/// **祖先traverseを要求する対象を決める純粋関数**（実マシンを一切読まない）。
+///
+/// # なぜ切り出してあるのか
+///
+/// ここが返す集合は「**このマシンに恒久的なACEを付けに行く先**」であり、しかも不足していれば
+/// **昇格（UAC）を要求する**。つまり1件増えると、実マシンに残る変更が1つ増える。にもかかわらず、
+/// 元は1,400行の関数の途中のローカル変数だったので、**何を要求するのかを測る手段が
+/// 「実際に走らせて実マシンの記録の増減を見る」しか無かった**——そして一度付けてしまうと
+/// 冪等スキップで二度と差が出ないので、後から「これは誰のせいで増えたのか」を測れない
+/// （§22.3.2の移行でまさにこれを踏み、traverse台帳が7→10件に増えた理由を事後に決着できなかった）。
+///
+/// 純粋関数にすると、**まだACEが付いていない架空のパス**を渡して要求内容だけを測れる。
+/// 実マシンの状態にも昇格にも依存しないので、何度でも同じ答えが出る。
+///
+/// # 何を入れて、何を入れないか
+///
+/// **入れるのは親（祖先）だけで、leaf自身は入れない。** leafへの到達権はそのツリーへ付けた
+/// 継承ACEが与える。ここでleafまで要求すると、**新しいパスを指定するたびに「ACEが無い」と
+/// 判定されて毎回昇格を求める**ことになる（D-37）。この規則は3種類すべてに掛かる——
+/// workspace・CoWの差分層・`--fs-allow`の宣言。
+///
+/// D-45（`plans/etw-spike/RESULTS.md` §19の実測）で`--fs-allow`の**親**が入った。対象自身への
+/// 継承ACEだけでは削除（`Remove-Item`）と移動（`Move-Item`）が失敗する——この2つは祖先を
+/// 「通過」ではなく**オープン**するため、対象へ到達する前に祖先で拒否される（拒否は対象ではなく
+/// 祖先に出るので、対象パスだけを見ていると「失敗しているのに拒否0件」に見える）。読取・書込・
+/// 実行・`cmd /c type`はフルパスのファイルopenなので祖先未付与でも通る。
+///
+/// マスクを広げないこと（`FILE_TRAVERSE|FILE_READ_ATTRIBUTES`のまま）。§19.2で7操作すべてが
+/// これで通ることを実測しており、`SYNCHRONIZE`・`FILE_LIST_DIRECTORY`まで広げると
+/// `C:\`・`C:\Users`が列挙可能になり機密性の実害が出る。
+///
+/// **存在しないパスは入れない**——後段が`path does not exist, skipped`として弾くものへ、
+/// 先回りしてマシンのACLを書き換える理由が無い。これだけは実FSを見る（`Path::exists`）ので、
+/// テストは実在するディレクトリを渡すこと。
+fn traverse_targets_for(
+    workspace_root: &Path,
+    write_mode: &WorkspaceWriteMode,
+    passthrough: &[FsPassthrough],
+) -> Vec<std::path::PathBuf> {
+    let mut targets: Vec<std::path::PathBuf> = workspace_root
+        .parent()
+        .map(|p| p.to_path_buf())
+        .into_iter()
+        .collect();
+    if let WorkspaceWriteMode::Cow { diff_layer_dir } = write_mode {
+        if let Some(parent) = diff_layer_dir.parent() {
+            targets.push(parent.to_path_buf());
+        }
+    }
+    for requested in passthrough {
+        if !requested.path.exists() {
+            continue;
+        }
+        let Some(parent) = requested.path.parent() else {
+            continue;
+        };
+        let parent = parent.to_path_buf();
+        if !targets.contains(&parent) {
+            targets.push(parent);
+        }
+    }
+    targets
+}
+
 /// harness起動時に1回だけ呼ぶ。プロファイル作成→ACL付与→起動smokeテストの一連を行い、
 /// いずれか失敗したら理由文字列を返す（`shell_tier::best_effort_tier`が**起動を拒否する理由**
 /// としてそのまま使う——D-75以降、Tier2aが取れなくても弱いTierへは落とさない）。判断は実行前に
@@ -612,50 +676,11 @@ pub fn preflight_with_privhelper_launcher(
     // package SID宛の継承ACE（すぐ上で付与済み）が与えるので、共通capability SIDのACEを
     // そこへ要求してはいけない。ここでleafまで含めると、セッションのたびに新しいworkspaceで
     // 「capability SIDのACEが無い」と判定され、毎回昇格を要求してしまう。
-    let mut traverse_targets: Vec<std::path::PathBuf> = workspace_root
-        .parent()
-        .map(|p| p.to_path_buf())
-        .into_iter()
-        .collect();
-    if let WorkspaceWriteMode::Cow { diff_layer_dir } = write_mode {
-        if let Some(parent) = diff_layer_dir.parent() {
-            traverse_targets.push(parent.to_path_buf());
-        }
-    }
-    // D-45（W1の実測から確定、`plans/etw-spike/RESULTS.md` §19）: `--fs-allow`で許可した
-    // パスの**親**もここへ入れる。対象自身への継承ACEだけでは、削除（`Remove-Item`）と
-    // 移動（`Move-Item`）が失敗する——この2つは祖先ディレクトリを「通過」ではなく
-    // **オープン**するため、対象へ到達する前に祖先で拒否される（拒否は対象ファイルではなく
-    // 祖先に出るので、対象パスだけを見ていると「失敗しているのに拒否0件」に見える）。
-    // 読取・書込・実行・`cmd /c type`はフルパスのファイルopenなので祖先未付与でも通る。
-    //
-    // マスクは現行の`FILE_TRAVERSE|FILE_READ_ATTRIBUTES`のままでよい（§19.2で7操作すべてが
-    // これで通ることを実測した）。`SYNCHRONIZE`・`FILE_LIST_DIRECTORY`まで広げると
-    // `C:\`・`C:\Users`が列挙可能になり機密性の実害が出るので広げない。
-    //
-    // **親を入れる（leafは入れない）**。leafへの到達権はこのセッション固有のpackage SIDが
-    // 継承ACEで与える（上のfs-allowループ）。ここでcapability SIDのACEをleafへ要求すると、
-    // 新しいパスを指定するたびに「capability SIDのACEが無い」と判定され毎回昇格を求めてしまう。
-    //
-    // 存在しないパスは入れない——後段のループが`path does not exist, skipped`として弾く
-    // ものへ、先回りしてマシンのACLを書き換える理由が無い。
-    for requested in passthrough {
-        if !requested.path.exists() {
-            continue;
-        }
-        let Some(parent) = requested.path.parent() else {
-            continue;
-        };
-        let parent = parent.to_path_buf();
-        if !traverse_targets.contains(&parent) {
-            traverse_targets.push(parent);
-        }
-    }
+    let traverse_targets = traverse_targets_for(workspace_root, write_mode, passthrough);
     let missing_traverse: Vec<std::path::PathBuf> = traverse_targets
         .into_iter()
         .filter(|target| !traverse_chain_sufficient(target, traverse_sid.as_psid()))
         .collect();
-
     let mut warnings = Vec::new();
 
     // D-37: Redirector DLL（`--sandbox tier2a-cow`の透過性）はworkspaceの外＝harness.exeの隣にあるため、
@@ -1516,5 +1541,125 @@ mod acl_volume_gate_tests {
         require_persistent_acl_volume("copy-on-write diff area", &not_yet).expect(
             "まだ作られていない差分層でも、同じボリューム上の実在する祖先で性質を測れる",
         );
+    }
+}
+
+/// **祖先traverseを要求する対象**（[`traverse_targets_for`]）のテスト。実マシンを読まない。
+#[cfg(test)]
+mod traverse_target_tests {
+    use super::*;
+
+    //
+    // **ここが増えると、実マシンに恒久的なACEが増え、昇格（UAC）が要求される。**
+    // だから「何を要求するか」は、実際に走らせて記録の増減を見るのではなく、
+    // ここで直接測る——**まだACEが付いていない架空のパス**を渡せば、実マシンの状態にも
+    // 昇格にも依存せず、何度でも同じ答えが出る。
+    //
+    // 走らせて測る形の限界は実際に踏んだ: §22.3.2の移行でtraverse台帳が7→10件へ増えたとき、
+    // ACEは既に付いてしまっており、**変更前のコードで撃ち直しても冪等スキップで差が出ない**
+    // ため、増えた理由を事後に決着できなかった。
+
+    /// 通常起動（CoWでない）で要求するのは**workspaceの親だけ**。
+    #[test]
+    fn a_plain_session_only_asks_for_the_workspace_parent() {
+        let targets = traverse_targets_for(
+            Path::new(r"C:\work\repo"),
+            &WorkspaceWriteMode::DirectRw,
+            &[],
+        );
+        assert_eq!(targets, vec![std::path::PathBuf::from(r"C:\work")]);
+    }
+
+    /// CoWでは**差分層の親が1つ増えるだけ**。
+    ///
+    /// これが、移行の前後で変わっていないことを固定する当のものである——`traverse_targets_for`は
+    /// **パスと書込モードだけ**から決まり、ACEの宛先（package SIDかcapability SIDか）を
+    /// 一切見ない。したがって§22.3.2の主体の移行は、要求する祖先を1つも増やさない。
+    #[test]
+    fn a_cow_session_asks_for_the_diff_layer_parent_and_nothing_else() {
+        let targets = traverse_targets_for(
+            Path::new(r"C:\work\repo"),
+            &WorkspaceWriteMode::Cow {
+                diff_layer_dir: std::path::PathBuf::from(r"C:\layers\cow\session-42"),
+            },
+            &[],
+        );
+        assert_eq!(
+            targets,
+            vec![
+                std::path::PathBuf::from(r"C:\work"),
+                std::path::PathBuf::from(r"C:\layers\cow"),
+            ]
+        );
+    }
+
+    /// **leafは要求しない**（D-37）。要求すると、新しいパスを指定するたびに「ACEが無い」と
+    /// 判定されて**毎回昇格を求める**——症状は「起動のたびにUACが出る」で、原因がここだと
+    /// 分かりにくい。workspace・差分層の**どちらについても**入っていないことを見る。
+    #[test]
+    fn the_leaves_themselves_are_never_asked_for() {
+        let workspace = Path::new(r"C:\work\repo");
+        let diff_layer = std::path::PathBuf::from(r"C:\layers\cow\session-42");
+        let targets = traverse_targets_for(
+            workspace,
+            &WorkspaceWriteMode::Cow {
+                diff_layer_dir: diff_layer.clone(),
+            },
+            &[],
+        );
+        assert!(
+            !targets.contains(&workspace.to_path_buf()),
+            "workspace自身を要求している: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&diff_layer),
+            "差分層自身を要求している: {targets:?}"
+        );
+    }
+
+    /// `--fs-allow`は**親だけ**が入り、leafは入らない（D-45）。
+    /// 実在するパスでなければ入らないので、一時ディレクトリを使う。
+    #[test]
+    fn a_declared_path_contributes_its_parent_but_not_itself() {
+        let tmp = tempfile::tempdir().expect("一時ディレクトリ");
+        let declared = tmp.path().join("tool");
+        std::fs::create_dir_all(&declared).expect("宣言先を作る");
+
+        let targets = traverse_targets_for(
+            Path::new(r"C:\work\repo"),
+            &WorkspaceWriteMode::DirectRw,
+            &[FsPassthrough {
+                path: declared.clone(),
+                access: FsAccess::Read,
+                forced: false,
+                scope: GrantScope::Recursive,
+            }],
+        );
+
+        assert!(
+            targets.contains(&tmp.path().to_path_buf()),
+            "宣言先の親が入っていない: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&declared),
+            "宣言先自身を要求している（毎回昇格を求める形）: {targets:?}"
+        );
+    }
+
+    /// **存在しない宣言先は、祖先のACLを書き換える理由にならない。**
+    /// 後段が`path does not exist, skipped`として弾くものへ先回りしない。
+    #[test]
+    fn a_declared_path_that_does_not_exist_asks_for_nothing() {
+        let targets = traverse_targets_for(
+            Path::new(r"C:\work\repo"),
+            &WorkspaceWriteMode::DirectRw,
+            &[FsPassthrough {
+                path: std::path::PathBuf::from(r"C:\definitely\not\here\at\all"),
+                access: FsAccess::Read,
+                forced: false,
+                scope: GrantScope::Recursive,
+            }],
+        );
+        assert_eq!(targets, vec![std::path::PathBuf::from(r"C:\work")]);
     }
 }
