@@ -15,13 +15,17 @@
 //! 6. **1プロセスで2回走らせると、2回目はdaemonを再利用する**（D-56）——かつ
 //!    **再利用したdaemonでも強制は本物のまま**（生ソケットは落ちる）。
 //!    「2回目が速かったのは強制が消えたからではない」ことを区別する対（B-35）
+//! 7. **承認したFS宣言が実DACLへ届き、その主体がcapability SIDである**（残課題#20の
+//!    移行の不変条件＝package SID宛が0本）。**取り消したあとに何が残るか**も同じ実行で測る
+//!    ——[`an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_runs`]
 //!
 //! # このテストが触らないもの（正直に書く）
 //!
-//! `policy.json`の`fs`は**空**にしてある。workspace外のFSルールを入れるとこのマシンの実ACLと
-//! `fs-passthrough-ledger.json`を書き換えることになり、テストの副作用としては重すぎる
-//! （その経路は`--fs-allow`側の既存E2Eが通している）。ここで確かめるのはネットワーク側と、
-//! 「Tier2aへ着地してWFPが立った」という土台の部分である。
+//! ネットワーク側の3本は`policy.json`の`fs`を**空**にしてある。workspace外のFSルールを
+//! 入れるとこのマシンの実ACLと`fs-passthrough-ledger.json`を書き換えることになり、
+//! ネットワークを測るテストの副作用としては重すぎる。**FS側を測るのは7番の1本だけ**で、
+//! そちらは`%TEMP%`配下の一時ディレクトリに閉じている（`--fs-allow`経由の同じ機構は
+//! CLI側の既存E2Eが別に通している）。
 
 #![cfg(windows)]
 
@@ -139,6 +143,90 @@ fn run_show(workspace_root: &Path) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// 対象パスのDACLをSDDL（セキュリティ記述子の文字列表現）で読む。
+///
+/// # なぜharnessの関数で数えないのか
+///
+/// ACEを**付ける**のも**数える**のも同じ関数だと、その関数が同じ向きに間違えていても
+/// 緑になる。ここは「実マシンに何が残ったか」を測るところなので、**別の道具**（`Get-Acl`）で
+/// 読み直す。同じ形の裏取りをD-84の実装でも行っている。
+///
+/// **限界**: SDDLは継承ACEと明示ACEを1つの文字列に並べる。ここで測る対象は
+/// **新しく作った一時ディレクトリの中のファイル**で、capability SID（`S-1-15-3-`）や
+/// AppContainerのpackage SID（`S-1-15-2-`）が最初から載っていることは無いため、
+/// **測定前後の差**を見れば継承分と混ざらない。だから基準線を必ず先に取る。
+fn acl_sddl(path: &Path) -> String {
+    let script = format!(
+        "(Get-Acl -LiteralPath '{}').Sddl",
+        path.display().to_string().replace('\'', "''")
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("powershell.exe should run");
+    assert!(
+        output.status.success(),
+        "Get-Acl failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// SDDLの中に現れる、指定した接頭辞を持つSIDの件数。
+///
+/// `S-1-15-3-`＝capability SID（宣言ごとの主体、残課題#20の移行先）、
+/// `S-1-15-2-`＝AppContainerのpackage SID（移行元。**移行後は0本でなければならない**）。
+fn count_sid_prefix(sddl: &str, prefix: &str) -> usize {
+    sddl.match_indices(prefix).count()
+}
+
+/// 実行像の診断に使うexeの置き場（**`%TEMP%`の外**）。
+///
+/// # なぜ`tempfile::tempdir()`を使えないのか（**これで1本壊れていた**）
+///
+/// 候補除外の規則（[BUG-103](../../../docs/bugs/BUG-103.md)）は**`%TEMP%`配下を候補にしない**
+/// ——刹那的なパスの巣であり、一時ディレクトリ全体への継承つきRWDはP-01違反だからである。
+/// `tempfile::tempdir()`はその`%TEMP%`の下に作る。したがって、そこへ置いたexeは
+/// **診断では名指しされるのに候補一覧には出てこない**。
+///
+/// この食い違いのせいで、下のテストは2026-08-11に除外規則が入った時点から
+/// 「候補が見つからない」で落ちるようになっていた。**`#[ignore]`が付いているため
+/// `cargo test --workspace`では一度も現れず、昇格して撃つまで分からなかった。**
+///
+/// 置き場は他のE2Eと同じ`C:\harness-e2e\`配下にする（workspaceの外・`%TEMP%`の外・
+/// `C:/Windows`と`C:/Program Files`の外、という3条件を全部満たす）。
+struct ProbeDir(std::path::PathBuf);
+
+impl ProbeDir {
+    fn new() -> Self {
+        let dir =
+            std::path::PathBuf::from(r"C:\harness-e2e").join(format!("exec-ace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+            panic!("could not create the probe directory {} ({e}). This test needs a place \
+                    outside %TEMP% because %TEMP% is excluded from candidates.", dir.display())
+        });
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ProbeDir {
+    /// **後片付けはここが持つ。** `tempfile`と違って自動では消えないので、
+    /// パニックで抜けても消えるように`Drop`へ置く（測定は`Drop`より前に済んでいる）。
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            eprintln!(
+                "warning: could not remove the probe directory {} ({e}); remove it by hand",
+                self.0.display()
+            );
+        }
+    }
 }
 
 fn net_audit_of_latest_session(workspace_root: &Path) -> String {
@@ -391,9 +479,22 @@ fn a_second_pass2_in_the_same_process_reuses_the_daemon_and_still_enforces() {
 /// # 置き場
 ///
 /// workspace外・かつ`C:/Windows`と`C:/Program Files`の外（＝AppContainerに既定の実行権が
-/// 無い場所、D-58）でなければ、そもそも診断が「起動できない」と言わない。`%TEMP%`配下の
-/// 一時ディレクトリがその条件を満たす。**このテストが実マシンへ残す変更はここへのACE1件**で、
-/// tempdirごと消える。
+/// 無い場所、D-58）でなければ、そもそも診断が「起動できない」と言わない。**さらに`%TEMP%`の
+/// 外**である必要がある（あそこは候補除外の対象。[`ProbeDir`]のdoc）。
+/// **このテストが実マシンへ残す変更はここへのACE1件**で、`ProbeDir`のDropごと消える。
+///
+/// # 後半で測るもの（残課題#20の受け入れ条件と、エディタの後片付け）
+///
+/// 承認して起動できるようになった時点で、**実マシンのDACLを別の道具で読み返す**。
+/// 見るのは3つで、どれも「付与後 → 撤収後」の対で測る（片側だけ緑にしない、B-35）。
+///
+/// 1. **capability SID（`S-1-15-3-`）宛のACEが付いている**——承認が実ACLへ届いた証拠。
+/// 2. **package SID（`S-1-15-2-`）宛のACEが0本**——残課題#20の移行の不変条件そのもの。
+///    1本でも残っていると同一セッションの全ドメインが素通りし、**しかも成功に見える**。
+///    この不変条件を**実機で**測るのはここが初めてである。
+/// 3. **宣言を取り消して次のパス2を回したあとに何本残るか**——エディタの後片付けが
+///    どこまで効くか。`reconcile_undeclared_roots`が担当する経路で、**実機で1度も
+///    通っていない**。値はまず観測して記録する（期待値を先に決め打たない）。
 #[test]
 #[ignore = "requires administrator rights (WFP netfilterd, ACE grant via privhelper)"]
 fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_runs() {
@@ -402,13 +503,27 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
     let workspace = tempfile::tempdir().expect("tempdir");
     let workspace_root = workspace.path();
     // **workspaceの外**に置く（中に置くとworkspace grantが覆ってしまい、診断は何も言わない）。
-    let toolbox = tempfile::tempdir().expect("tempdir");
+    // **かつ`%TEMP%`の外**（あそこは候補除外の対象。[`ProbeDir`]のdocを読むこと）。
+    let toolbox = ProbeDir::new();
     let probe = toolbox.path().join("e2e-exec-probe.exe");
     std::fs::copy(r"C:\Windows\System32\cmd.exe", &probe).expect("copy the probe executable");
     // 引用符を付けない（付けるとPowerShellが文字列として評価する。パスに空白が無いことは
     // tempdirの形から保証される）。
     let command = format!("{} /c echo {MARKER}", probe.display());
     let declared = probe.display().to_string().replace('\\', "/");
+
+    // 基準線。**ここを取らないと、あとで数えた本数が「元から在った分」と区別できない。**
+    let baseline = acl_sddl(&probe);
+    assert_eq!(
+        count_sid_prefix(&baseline, "S-1-15-3-"),
+        0,
+        "precondition: a freshly copied probe must not carry any capability SID ACE: {baseline}"
+    );
+    assert_eq!(
+        count_sid_prefix(&baseline, "S-1-15-2-"),
+        0,
+        "precondition: a freshly copied probe must not carry any package SID ACE: {baseline}"
+    );
 
     write_policy(workspace_root, "e2e-exec", &command);
 
@@ -437,9 +552,16 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
 
     // 候補一覧（`show`）に`fs.read_exec`として並ぶこと。**ここがこの変更の本体**である。
     let show = run_show(workspace_root);
+    // **候補表の行だけを見る。** 「fs.read_exec と対象パスを両方含む行」で拾うと、
+    // 診断の説明行（`候補に足した: …`）が先に当たり、その行頭の語をidとして`approve`へ
+    // 渡してしまう（実機で `知らない提案id: 候補に足した:` として出た）。
+    // 候補表の行は必ず`fs-<番号>`で始まるので、そこまで含めて絞る。
     let id = show
         .lines()
-        .find(|line| line.contains("fs.read_exec") && line.contains(&declared))
+        .map(str::trim_start)
+        .find(|line| {
+            line.starts_with("fs-") && line.contains("fs.read_exec") && line.contains(&declared)
+        })
         .and_then(|line| line.split_whitespace().next())
         .unwrap_or_else(|| {
             panic!("the diagnosed executable must appear as an fs.read_exec candidate:\n{show}")
@@ -483,6 +605,80 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
         "after approving fs.read_exec the sandbox must be able to start it \
          (this is the whole point: the candidate list told the user what to approve, \
           and doing it has to actually work): {second_stdout}\n{second_stderr}"
+    );
+
+    // --- 付与後の実DACL: 主体は移ったか（残課題#20の受け入れ条件） --------------------
+    let after_grant = acl_sddl(&probe);
+    eprintln!("--- SDDL after grant ---\n{after_grant}");
+    assert!(
+        count_sid_prefix(&after_grant, "S-1-15-3-") >= 1,
+        "the approved fs.read_exec must land as a capability SID ACE on the real DACL \
+         (if this is 0 the exe ran for some other reason and the assertion above proves \
+          nothing): {after_grant}"
+    );
+    assert_eq!(
+        count_sid_prefix(&after_grant, "S-1-15-2-"),
+        0,
+        "[#20] the migration invariant: no session package SID ACE may remain on a declared \
+         path. A single one lets every domain in the session through, and it looks like \
+         success: {after_grant}"
+    );
+
+    // --- 宣言を取り消して次のパス2を回す: 後片付けはどこまで効くか --------------------
+    let unapprove = Command::new(editor_exe())
+        .args([
+            "unapprove",
+            "--workspace",
+            &workspace_root.to_string_lossy(),
+            "--domain",
+            "e2e-exec",
+            "--all",
+            "--yes",
+        ])
+        .output()
+        .expect("unapprove should run");
+    assert!(
+        unapprove.status.success(),
+        "unapprove failed: {}\n{}",
+        String::from_utf8_lossy(&unapprove.stdout),
+        String::from_utf8_lossy(&unapprove.stderr)
+    );
+    let policy_after_unapprove =
+        std::fs::read_to_string(workspace_root.join(".harness").join("policy.json"))
+            .expect("policy.json");
+    assert!(
+        !policy_after_unapprove.contains(&declared),
+        "precondition for the cleanup measurement: the declaration must be gone from \
+         policy.json, otherwise nothing is expected to be revoked: {policy_after_unapprove}"
+    );
+
+    let third = run_record_net(workspace_root, "e2e-exec", &command);
+    eprintln!(
+        "--- 3rd stderr ---\n{}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+
+    let after_unapprove = acl_sddl(&probe);
+    let capability_left = count_sid_prefix(&after_unapprove, "S-1-15-3-");
+    eprintln!(
+        "MEASURED: capability SID ACEs left after unapprove + next pass2 = {capability_left}\n\
+         --- SDDL after unapprove ---\n{after_unapprove}"
+    );
+    // **観測値をそのまま固定する。** 「0本のはず」と書くと、剥がれないことが分かったときに
+    // このテストが赤いまま残るか、期待値を書き換えて赤を消す圧力になる。ここで固定するのは
+    // 「測った」という事実の側で、剥がれるべきかどうかの判断は本流が持つ
+    // （`plans/DESIGN-MAC-DOMAIN.md` §22.2.1 の撤収条件＝「もう誰も宣言していないこと」）。
+    assert!(
+        capability_left <= 1,
+        "unexpected: more capability SID ACEs than were ever granted; the revoke path is \
+         adding subjects instead of removing them: {after_unapprove}"
+    );
+    // package SID宛は、宣言を外した後も0本のままでなければならない（撤収が主体を
+    // **取り違えて**古い形で付け直していないこと）。
+    assert_eq!(
+        count_sid_prefix(&after_unapprove, "S-1-15-2-"),
+        0,
+        "[#20] a package SID ACE appeared during the revoke path: {after_unapprove}"
     );
 }
 

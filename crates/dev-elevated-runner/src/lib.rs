@@ -370,6 +370,27 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture",
         ],
     ),
+    // 上の`e2e-policy-editor-pass2`のうち**FS側の1本だけ**を撃つ。承認したFS宣言が実DACLへ
+    // 届くか・主体がcapability SIDか（残課題#20の不変条件）・取り消し後に何が残るかを測る。
+    // 別の口にするのは`e2e-cow-git-injection`と同じ理由で、**1要素＝1測定**にしたいため
+    // ——4本まとめて回すとネットワーク3本の所要時間と外部到達性に測定が引きずられる。
+    // フィルタ文字列はテスト関数名と一致していなければならない（0件マッチを`check_tests_actually_ran`が
+    // 非0で落とす、BUG-056同型）。
+    (
+        "e2e-policy-editor-exec-ace",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "record_net_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_runs",
+        ],
+    ),
     // D-56: 昇格daemonの寿命をプロセスへ合わせたときの**機構E2E**。実daemonを
     // `apply → clear → apply → teardown`と駆動し、各段でWFPフィルタの実件数を数える
     // （`crates/harness-sandbox/src/tier2a/netfilterd.rs`の`reuse_e2e`）。
