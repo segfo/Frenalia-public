@@ -596,6 +596,13 @@ mod mcp_e2e_tests;
 #[cfg(all(windows, test))]
 mod domain_isolation_tests;
 
+/// **`--fs-allow`の主体移行（§22.3）の受け入れ測定**（`docs/STATUS.md`残課題#20、§22.3.0.2の2条件）。
+/// 同じセッションの中で、宣言capabilityを積んだ子だけが宣言パスへ届き・そこにある
+/// スクリプトを実行できることを、**積まない子と対で**測る。ACLだけを見る
+/// `ace_grant_revoke_tests`とは測る層が違う（あちらはDACL、こちらは子から見た実I/O）。
+#[cfg(all(windows, test))]
+mod fs_allow_domain_acceptance_tests;
+
 /// **MAC/Spawn Daemon設計の実現性スパイク**（`plans/mac-spike/RESULTS.md`）。
 /// 設計§20の未実測の前提を、実装に着手する前に確定させるための使い捨て測定。
 /// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
