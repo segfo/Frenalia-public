@@ -568,6 +568,34 @@ pub fn record_granted_capability(path: &Path, capability_name: &str) {
     }
 }
 
+/// **このセッションが撤収しなければならないものの件数**（パス＋capability宛の合計）。
+///
+/// # なぜ足し算をここに置くのか
+///
+/// 呼び出し側（ポリシーエディタの撤収）は「対象が0件なら[`end_session`]を呼ばない」という
+/// 早期returnを持つ。その判定を`granted_paths`の件数だけで書くと、**capability宛しか
+/// 付けていないセッションで撤収が丸ごと飛ぶ**——差分層のACEはそのセッションでは剥がされず、
+/// 次の起動のGCまで残る。[§22.3.2]で「このセッションが付けたもの」の意味が2つの欄に
+/// 割れた時点で、件数を数える場所も追随しなければならなかった（`B-06`）。
+///
+/// **足し算を呼び出し側に書かせない。** 2箇所が別々に足すと、欄が3つ目に増えたとき
+/// 片方だけ更新されて静かにずれる（`B-05`）。数える場所はここ1つにする。
+pub fn pending_revocation_count() -> usize {
+    pending_revocation_count_in(&ledger(), session_token())
+}
+
+/// [`pending_revocation_count`]の判定部分（台帳を注入する）。**テストが実マシンの台帳を
+/// 触らないための口**（`Ledger::at_path`を渡す。BUG-108と同じ理由）。
+fn pending_revocation_count_in(ledger: &Ledger<SessionLedger>, token: &str) -> usize {
+    ledger
+        .load()
+        .sessions
+        .into_iter()
+        .find(|e| e.token == token)
+        .map(|e| e.granted_paths.len() + e.granted_capabilities.len())
+        .unwrap_or(0)
+}
+
 /// [§22.3.2] capability SID宛に付けたACEのパス一覧（自己検証`grant_audit`が読む「記録」側）。
 ///
 /// [`granted_paths_for_current_session`]のcapability版で、**別の集合である**ことが要点である
@@ -1972,6 +2000,57 @@ mod tests {
                 capability_name: "harnessDecl00112233445566778899aabbccddeeff".to_string(),
             }]
         );
+    }
+
+    /// **capability宛しか付けていないセッションを「撤収するものが無い」と数えない。**
+    ///
+    /// ポリシーエディタの撤収は「対象0件なら`end_session`を呼ばずに戻る」という早期returnを
+    /// 持つ。その判定が`granted_paths`だけを数えていたため、差分層しか付けていないセッションで
+    /// **撤収が丸ごと飛んでいた**（`B-06`: 「このセッションが付けたもの」の意味が2つの欄に
+    /// 割れたのに、数える側が追随していなかった）。
+    #[test]
+    fn a_session_with_only_capability_grants_is_not_counted_as_nothing_to_revoke() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger: Ledger<SessionLedger> = Ledger::at_path(dir.path().join(LEDGER_FILE), None);
+        ledger.save(&SessionLedger {
+            sessions: vec![entry_with_capabilities(
+                "t",
+                &[(r"C:\cow\sess-1", "harnessDecl00112233445566778899aabbccddeeff")],
+            )],
+        });
+
+        assert_eq!(
+            pending_revocation_count_in(&ledger, "t"),
+            1,
+            "capability宛の付与を数えないと、撤収そのものが呼ばれない"
+        );
+    }
+
+    /// 両方あれば合計する（片方だけ数える形へ戻っていないか）。
+    #[test]
+    fn both_kinds_of_grant_are_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger: Ledger<SessionLedger> = Ledger::at_path(dir.path().join(LEDGER_FILE), None);
+        let mut e = entry("t", &[r"C:\ws", r"C:\other"]);
+        e.granted_capabilities = vec![CapabilityGrant {
+            path: r"C:\cow\sess-1".to_string(),
+            capability_name: "harnessDecl00112233445566778899aabbccddeeff".to_string(),
+        }];
+        ledger.save(&SessionLedger { sessions: vec![e] });
+
+        assert_eq!(pending_revocation_count_in(&ledger, "t"), 3);
+    }
+
+    /// 何も付けていないセッションは0（早期returnが正しく効く側も測る、`B-35`）。
+    #[test]
+    fn a_session_that_granted_nothing_counts_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger: Ledger<SessionLedger> = Ledger::at_path(dir.path().join(LEDGER_FILE), None);
+        ledger.save(&SessionLedger {
+            sessions: vec![entry("t", &[])],
+        });
+
+        assert_eq!(pending_revocation_count_in(&ledger, "t"), 0);
     }
 
     /// D-38: MCPサーバのプロファイルはセッションと同じ寿命で、セッションが死ねば

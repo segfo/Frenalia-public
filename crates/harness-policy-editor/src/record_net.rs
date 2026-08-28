@@ -572,8 +572,10 @@ impl SessionGrants {
     /// `std::process::exit`で`Drop`ごと飛んだ場合も、正しさは次回起動時の
     /// `gc_dead_sessions`が担保する（型のdocを参照）。
     pub fn release(&self, on_progress: &mut dyn FnMut(usize, usize, &Path)) -> usize {
-        let total =
-            harness_sandbox::tier2a::session_profile::granted_paths_for_current_session().len();
+        // [§22.3.2] **capability SID宛の付与も数える。** `granted_paths`だけを見ると、
+        // 差分層しか付けていないセッションで撤収が丸ごと飛ぶ（`end_session`を呼ばずに戻る）。
+        // 足し算は`session_profile`側の唯一の場所が持つ（`B-05`: 2箇所で別々に足さない）。
+        let total = harness_sandbox::tier2a::session_profile::pending_revocation_count();
         if total == 0 {
             return 0;
         }
@@ -619,8 +621,10 @@ impl Drop for SessionGrants {
         // ここは**保険**として、まだ残っていたぶんだけを黙って畳み、結果を1行で報告する。
         // 撤収済み（`release`を通った）なら対象は0件なので、何も出さない——
         // 「撤収しました」が2回出ると、2回撤収したように読める。
-        let total =
-            harness_sandbox::tier2a::session_profile::granted_paths_for_current_session().len();
+        // [§22.3.2] **capability SID宛の付与も数える。** `granted_paths`だけを見ると、
+        // 差分層しか付けていないセッションで撤収が丸ごと飛ぶ（`end_session`を呼ばずに戻る）。
+        // 足し算は`session_profile`側の唯一の場所が持つ（`B-05`: 2箇所で別々に足さない）。
+        let total = harness_sandbox::tier2a::session_profile::pending_revocation_count();
         if total == 0 {
             return;
         }
