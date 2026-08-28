@@ -29,15 +29,6 @@
 //! **秘密をログへ出さないこと。** このモジュールの`log::line`はユーザーのプロファイル配下の
 //! 平文ファイルへ追記する。要求の中身を素直に書くと秘密がそこへ落ちる（実装制約、§22.3.1）。
 //!
-//! **[D-84の裏対称] 例外が1つある: AppContainerプロファイル**（[`WorkspaceRevoke::profiles`]）。
-//! `--fs-allow`の主体が秘密から導出できるようになった一方、**プロファイル名は誰の秘密からも
-//! 導出できない**——「どのセッションのプロファイルが在って、どれが生きていないか」は
-//! セッション台帳（`%APPDATA%`）とプロファイルの列挙（`%LOCALAPPDATA%\Packages`）にしか
-//! 無く、そのどちらも`runas`の昇格先が別の管理者アカウントだと別物を指す。だから
-//! **「剥がしてよい名前」は非昇格側が決めて名前で運び、昇格側は受け取った名前を検証する**。
-//! **SIDそのものは依然として運ばない**（形を検証してから`derive_profile_sid`で導出する）
-//! ——検証の2段と、その2段目が空振りし得る限界は同フィールドのdocに書いてある。
-//!
 //! **例外: WFP連鎖起動**（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D）。UAC起動回数を
 //! 最小化するため、`GrantWorkspaceAccess`要求が同時に「処理完了後、指定named pipeで`harness-netfilterd`を
 //! 起動してほしい」という指示（[`PrivilegedRequestEnvelope::chain_netfilterd_pipe`]）を伴うことが
@@ -259,90 +250,6 @@ pub struct FsAllowRevoke {
     pub subjects: Vec<FsAllowRevokeSubject>,
 }
 
-/// [D-84の裏対称] `RevokeWorkspaceAccess`が剥がす**workspaceツリー本体のcapability**1件の前像。
-///
-/// 撤収側でも**SIDも名前も送らない**——[`FsAllowRevokeSubject`]とまったく同じ形にしてある。
-/// 送るのは導出の前像だけで、受信側が自ら名前へ畳んでSIDを導出する
-/// （モジュールdoc「SIDは受け渡さない」）。
-///
-/// # 宣言側（[`FsAllowRevokeSubject`]）との違い——**パスは導出に入らない**
-///
-/// 宣言capabilityの名前は`(秘密, 畳み込み済みパス, access級)`から決まるので、受信側が
-/// 書込先のパスを自分で畳むことが「宣言Aの秘密で別のパスBへAの主体を付けさせない」という
-/// 束縛になっていた（§22.3.1）。**workspace本体の名前はそうではない**——
-/// `workspace_capability::capability_name_from_secret`は**秘密だけ**から名前を決める（D-54）。
-/// したがってここに同じ束縛は無い。
-///
-/// **それでも安全側に倒れているのは、この要求が「剥がす」方向にしか使えないからである。**
-/// workspace Aの秘密を添えてworkspace Bのツリーを指しても、Bに載っているのはBの主体なので
-/// 1本も一致せず、**何も起きない**（付与の方向であれば「Bのツリーへ Aの主体を撒く」に
-/// なるが、その経路はこの要求には無い）。
-///
-/// **`Debug`は手書きである**（[`fmt_secret_presence`]）。
-#[derive(Clone, Serialize, Deserialize)]
-pub struct WorkspaceRevokeSubject {
-    /// workspace capabilityの導出の前像（16進の秘密）。**ログへ出さない。**
-    pub secret_hex: String,
-    /// 台帳上のモードの綴り（`rwx`/`ro`。`workspace_ledger::WorkspaceMode::as_str`）。
-    ///
-    /// **導出には入らない**（上記のとおりworkspace本体の名前は秘密だけで決まる）。
-    /// 載せてあるのは受信側のログに「どの級の主体を狙ったか」を秘密抜きで残すためで、
-    /// これを主体の決定に使わないこと——使えば同じ秘密に2つの意味を持たせることになる。
-    pub mode: String,
-}
-
-impl std::fmt::Debug for WorkspaceRevokeSubject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkspaceRevokeSubject")
-            .field("secret_hex", &fmt_secret_presence(&self.secret_hex))
-            .field("mode", &self.mode)
-            .finish()
-    }
-}
-
-/// `RevokeWorkspaceAccess`要求の1エントリ（workspace 1つ分）。
-///
-/// 撤収の対象は**2系統**ある。どちらも「非昇格側が決め、昇格側が検証する」形で運ぶ。
-///
-/// | 系統 | 何が載っているか | 昇格側が何をするか |
-/// |---|---|---|
-/// | workspace capability（D-54、最大2＝`rwx`/`ro`） | [`Self::subjects`]（秘密の前像） | 秘密から名前を畳んでSIDを導出する |
-/// | harnessのAppContainerプロファイル（旧共有＋生きていないセッション） | [`Self::profiles`]（名前） | 形を検証し、生存しているものを外してからSIDを導出する |
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceRevoke {
-    /// canonicalize済みのworkspaceルート。昇格側はここを起点にツリーを走査する。
-    pub workspace: PathBuf,
-    /// このworkspaceツリー本体のcapabilityの前像一覧（最大2件）。
-    ///
-    /// **空を拒否しない。** [`FsAllowRevoke::subjects`]と同じ理由で、撤収を止めると
-    /// 剥がせないACEが実マシンに残る。剥がせたかどうかは**非昇格側がrootのDACLを
-    /// 読み直して検算する**。
-    #[serde(default)]
-    pub subjects: Vec<WorkspaceRevokeSubject>,
-    /// **非昇格側が「剥がしてよい」と判定した**harnessプロファイル名の一覧
-    /// （`session_profile::revocable_profile_names`）。
-    ///
-    /// # なぜ名前を運ぶのか（昇格側で数え直さないのか）
-    ///
-    /// 「生きていないセッションか」の判定材料は、**セッション台帳（`%APPDATA%`）**と
-    /// **`%LOCALAPPDATA%\Packages`のプロファイル列挙**と**名前付きmutex**の3つである。
-    /// このうち前2つは`runas`の昇格先が別の管理者アカウントだと別ハイブ／別ディレクトリを
-    /// 指す（[`PrivilegedRequest::RevokeFsAllow`]のdocが同じ理由で台帳判定を禁じている）。
-    /// 昇格側で数え直すと、その場合に**列挙が空になり、旧共有プロファイル以外は
-    /// 1件も剥がれない**——「撤収したつもりで何も剥がしていない」に静かに倒れる。
-    ///
-    /// だから判定は材料が揃っている非昇格側で行い、**昇格側は受け取った名前を検証する**。
-    /// 検証は2段で、どちらも**対象を減らす方向にしか働かない**（B-01の向き）。
-    ///
-    /// 1. 名前の形（`mcp_profile::is_harness_profile_name`、または旧共有プロファイル名）。
-    ///    非特権の親は攻撃者と同じ権限で動きうるので、任意の名前からSIDを導出させない（P-01）。
-    /// 2. 生存の再確認（`session_profile::live_profile_names`）。**mutexだけで判定できる分**は
-    ///    昇格側でも見て、生きているものは剥がさない（D-48/BUG-053の不変条件）。
-    ///    見えなければ何も減らさない——判定できないことを「生きていない」と読み替えない。
-    #[serde(default)]
-    pub profiles: Vec<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrivilegedRequest {
     /// `target`とその全祖先（ドライブルートまで）へ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を
@@ -410,31 +317,6 @@ pub enum PrivilegedRequest {
         traverse_targets: Vec<PathBuf>,
         fs_allow_entries: Vec<FsAllowGrant>,
     },
-    /// `harness fs revoke-workspace` / `revoke-workspace-all`が本体プロセス内（非管理者）で
-    /// 剥がしきれなかったworkspaceを、**N件まとめて1回のUACで**撤収する。
-    ///
-    /// # なぜこれが要るのか（`B-02`: 付与側に在るものは撤収側にも要る）
-    ///
-    /// 付与側は[`PrivilegedRequest::GrantWorkspaceAccess`]が最初から在り、traverseとfs-allowを
-    /// 1回のUACへ束ねている。ところが**workspace本体のACEには撤収側の昇格経路が1本も無かった**
-    /// ——`fs_revoke_workspace*`には`run_privileged*`も`is_elevated()`も存在せず、台帳がN件でも
-    /// 特権の往復は**0回**だった。`BUILTIN\Administrators`所有のノードは非昇格のままでは
-    /// DACLを書けないので、実機では14ノード中2ノードが`0x80070005`（アクセス拒否）で残り、
-    /// **再試行する経路が無いのでそこで終わっていた**。
-    ///
-    /// [BUG-082]は同じ関数のwalk回数（SIDごとに1周していたのを1周へ畳んだ）を直したもので、
-    /// **昇格の軸には触れていない**。この要求はその軸を埋める。
-    ///
-    /// # 単発コマンドも同じ経路を通る
-    ///
-    /// `harness fs revoke-workspace <path>`は`entries`が1件のものとしてここへ来る。
-    /// 入口を2つ作らない（`code-structure-rules` §5.1: 対の操作は同じ実装を通る）。
-    ///
-    /// # エントリごとに成否は独立する
-    ///
-    /// [`PrivilegedRequest::RevokeFsAllow`]と同じで連鎖ではない。1件の失敗で打ち切ると、
-    /// 残りのworkspaceのACEが実マシンに残ったまま「撤収した」と読める終わり方になる。
-    RevokeWorkspaceAccess { entries: Vec<WorkspaceRevoke> },
 }
 
 /// IPCワイヤ上のトップレベル型。`PrivilegedRequest`本体を薄く包み、WFP連鎖起動の指示
@@ -523,22 +405,6 @@ pub enum PrivilegedResponse {
         /// **追加は必ず末尾へ**。`#[serde(default)]`なので、この項目を持たない旧応答も読める。
         #[serde(default)]
         netfilterd_chain: Option<Result<(), String>>,
-    },
-    /// `RevokeWorkspaceAccess`の結果。エントリごとに成否が独立する（連鎖ではない）。
-    ///
-    /// **呼び出し側が台帳から落としてよいのは`revoked`だけである**——しかも、
-    /// `revoked`に載っていること自体を根拠にしない。workspace capabilityの名前は台帳にしか
-    /// 無く（秘密→名前の一方向）、剥がせていないACEの記録を先に捨てると
-    /// **主体を二度と導出できない孤児**になる（`B-01`）。だから呼び出し側は
-    /// rootのDACLを読み直して検算してから記録を落とす（`B-25`/`B-33`: ヘルパーの
-    /// 成功報告を自分の結論にしない）。
-    ///
-    /// `RevokeFsAllowResult`と違って`root_cleared`が無いのは、workspace撤収の
-    /// 「rootは剥がれたが子孫が残った」がヘルパー側の`RevokeReport::blocked`として
-    /// `failures`の理由文へ入るためである（載る場所を2つ作らない）。
-    RevokeWorkspaceAccessResult {
-        revoked: Vec<PathBuf>,
-        failures: Vec<(PathBuf, String)>,
     },
 }
 
@@ -720,8 +586,8 @@ mod server;
 
 pub use client::{
     run_privileged, run_privileged_revoke_fs_allow, run_privileged_revoke_traverse_batch,
-    run_privileged_revoke_workspace_access, run_privileged_workspace_access, ChainLauncher,
-    FsAllowRevokeOutcome, HELPER_EXE_NAME, TraverseRevokeBatchOutcome, WorkspaceRevokeBatchOutcome,
+    run_privileged_workspace_access, ChainLauncher, FsAllowRevokeOutcome, HELPER_EXE_NAME,
+    TraverseRevokeBatchOutcome,
 };
 pub use server::serve;
 
@@ -1159,114 +1025,6 @@ mod tests {
         );
     }
 
-    /// [D-84の裏対称] workspace撤収の要求と応答の**バイト列そのものを固定する**（`B-03`）。
-    ///
-    /// **付与側（`GrantWorkspaceAccess`）だけを固定して撤収側を固定しないと、その非対称が
-    /// 検出できない**——`revoke_fs_allow_request_json_wire_format_is_stable`と同じ理由である。
-    /// この行が黙って変わったら、**昇格側と非昇格側のどちらかだけが移行している**ことを意味する
-    /// （綴りが1文字違えば、昇格側は要求を`unknown variant`で丸ごと拒み、
-    /// workspace撤収は「昇格経路が無かった頃」へ静かに戻る）。
-    #[test]
-    fn revoke_workspace_access_request_and_result_json_wire_format_is_stable() {
-        let req = PrivilegedRequest::RevokeWorkspaceAccess {
-            entries: vec![WorkspaceRevoke {
-                workspace: PathBuf::from("C:/ws"),
-                subjects: vec![WorkspaceRevokeSubject {
-                    secret_hex: "00112233445566778899aabbccddeeff".to_string(),
-                    mode: "rwx".to_string(),
-                }],
-                profiles: vec!["harness.shell.sandbox".to_string()],
-            }],
-        };
-        assert_eq!(
-            serde_json::to_string(&req).unwrap(),
-            r#"{"RevokeWorkspaceAccess":{"entries":[{"workspace":"C:/ws","subjects":[{"secret_hex":"00112233445566778899aabbccddeeff","mode":"rwx"}],"profiles":["harness.shell.sandbox"]}]}}"#
-        );
-
-        let res = PrivilegedResponse::RevokeWorkspaceAccessResult {
-            revoked: vec![PathBuf::from("C:/x")],
-            failures: vec![(PathBuf::from("C:/y"), "access denied".to_string())],
-        };
-        assert_eq!(
-            serde_json::to_string(&res).unwrap(),
-            r#"{"RevokeWorkspaceAccessResult":{"revoked":["C:/x"],"failures":[["C:/y","access denied"]]}}"#
-        );
-    }
-
-    /// workspace撤収の要求が、**複数workspace・複数主体**を保ったまま往復すること。
-    ///
-    /// **秘密が境界を越えて生き残ることが撤収側の成立条件そのものである**（受信側はこれから
-    /// 主体を導出する。落ちれば1本も剥がれないのに、応答は「対象0件」として返り得る）。
-    #[test]
-    fn revoke_workspace_access_request_roundtrips_through_json() {
-        let req = PrivilegedRequest::RevokeWorkspaceAccess {
-            entries: vec![
-                WorkspaceRevoke {
-                    workspace: PathBuf::from(r"C:\Users\example\workspace"),
-                    subjects: vec![
-                        WorkspaceRevokeSubject {
-                            secret_hex: "00112233445566778899aabbccddeeff".to_string(),
-                            mode: "rwx".to_string(),
-                        },
-                        WorkspaceRevokeSubject {
-                            secret_hex: "ffeeddccbbaa99887766554433221100".to_string(),
-                            mode: "ro".to_string(),
-                        },
-                    ],
-                    profiles: vec![
-                        "harness.shell.sandbox".to_string(),
-                        "harness.shell.sandbox.1234-5678".to_string(),
-                    ],
-                },
-                WorkspaceRevoke {
-                    workspace: PathBuf::from(r"C:\Users\example\other"),
-                    subjects: Vec::new(),
-                    profiles: Vec::new(),
-                },
-            ],
-        };
-        let bytes = serde_json::to_vec(&req).unwrap();
-        let decoded: PrivilegedRequest = serde_json::from_slice(&bytes).unwrap();
-        match decoded {
-            PrivilegedRequest::RevokeWorkspaceAccess { entries } => {
-                assert_eq!(entries.len(), 2);
-                assert_eq!(
-                    entries[0].workspace,
-                    PathBuf::from(r"C:\Users\example\workspace")
-                );
-                assert_eq!(entries[0].subjects.len(), 2);
-                assert_eq!(
-                    entries[0].subjects[0].secret_hex,
-                    "00112233445566778899aabbccddeeff"
-                );
-                assert_eq!(entries[0].subjects[0].mode, "rwx");
-                assert_eq!(
-                    entries[0].subjects[1].secret_hex,
-                    "ffeeddccbbaa99887766554433221100"
-                );
-                assert_eq!(entries[0].subjects[1].mode, "ro");
-                assert_eq!(entries[0].profiles.len(), 2);
-                // **2件目が空のまま届くこと。** 空を「省略」と読んで1件目の値で埋めるような
-                // 実装差があると、別のworkspaceの主体をそのツリーで剥がしに行くことになる。
-                assert!(entries[1].subjects.is_empty());
-                assert!(entries[1].profiles.is_empty());
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    /// `subjects`/`profiles`を持たない電文も**読める**（`#[serde(default)]`）。
-    ///
-    /// 倒す向きは`FsAllowRevoke`と同じで、**拒否しない**——撤収を止めると剥がせないACEが
-    /// 実マシンに残る。剥がせたかどうかは非昇格側が実DACLで検算する。
-    #[test]
-    fn a_workspace_revoke_entry_without_subjects_or_profiles_still_parses() {
-        let entry: WorkspaceRevoke =
-            serde_json::from_str(r#"{"workspace":"C:\\ws"}"#).unwrap();
-        assert!(entry.subjects.is_empty());
-        assert!(entry.profiles.is_empty());
-    }
-
     /// [§22.3.1] **秘密を持たない電文は拒否される**（fail-closed）。
     ///
     /// 移行前のビルドが送ってくる形がこれで、通すと「主体を決められないまま何かへ付与する」
@@ -1441,27 +1199,10 @@ mod tests {
             forced: false,
             subjects: vec![subject],
         };
-        // [D-84の裏対称] **workspace撤収の要求も同じ秘密を運ぶ**ので、同じ検査に掛ける。
-        // 型を足すたびにここへ足さないと、新しい要求だけが`privhelper.log`へ平文を落とす。
-        let workspace_revoke = WorkspaceRevoke {
-            workspace: PathBuf::from(r"C:\ws"),
-            subjects: vec![WorkspaceRevokeSubject {
-                secret_hex: secret.to_string(),
-                mode: "rwx".to_string(),
-            }],
-            profiles: vec!["harness.shell.sandbox".to_string()],
-        };
 
         for rendered in [
             format!("{grant:?}"),
             format!("{revoke:?}"),
-            format!("{workspace_revoke:?}"),
-            format!(
-                "{:?}",
-                PrivilegedRequest::RevokeWorkspaceAccess {
-                    entries: vec![workspace_revoke.clone()]
-                }
-            ),
             // 要求ごと丸ごと出す形（実際にヘルパーがやりがちな`{req:?}`）も塞がっていること。
             format!(
                 "{:?}",

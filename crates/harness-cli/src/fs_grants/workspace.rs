@@ -26,36 +26,12 @@ struct ForgettableWorkspace {
 enum WorkspaceRevokeOutcome {
     /// 剥がし終えた。記録を落としてよい。
     Revoked(ForgettableWorkspace),
-    /// 本体プロセス内（非管理者）では剥がしきれなかった。**特権分離ヘルパーへ委譲する材料**
-    /// を持つ。台帳の記録は、昇格後に剥がせたことを検算してから落とす（B-01）。
-    NeedsElevation(WorkspaceEscalation),
-    /// 撤収が完了しておらず、昇格しても変わらない（使用中・SID解決に失敗・既に管理者で
-    /// 走っていた）。**台帳の記録は残す**（B-01）。理由は既にこの関数が印字している。
+    /// 撤収が完了しなかった（使用中・SID解決に失敗・剥がせないノードが残った）。
+    /// **台帳の記録は残す**（B-01）。理由は既に[`unfinished_workspace`]が印字している。
+    ///
+    /// **昇格へ委譲する結末は無い。** 一度は足したが製品から取り除いた——理由は
+    /// [`unfinished_workspace`]のdocが持つ。
     Incomplete,
-}
-
-/// [D-84の裏対称] 昇格側へ委譲する1件分の材料。
-///
-/// # なぜ「要求」と「検算の材料」を両方持つのか
-///
-/// ヘルパーの応答は`(撤収できたworkspace, 失敗)`しか返さない。**その応答だけを根拠に
-/// 台帳を落としてはならない**（`B-25`/`B-33`: 他人の成功報告を自分の結論にしない）ので、
-/// 呼び出し側はrootのDACLを読み直して主体が残っていないことを確かめる。その照合に要る
-/// SIDは**非昇格側が既に解決済み**なので、もう一度引き直さずここへ持ち回す
-/// ——引き直すと`workspace_capability_sid`（無ければ発行する側）を撤収経路で呼ぶことになる。
-#[cfg(windows)]
-struct WorkspaceEscalation {
-    /// 昇格側へ送る封筒の1エントリ。**秘密の前像だけ**が載る（SIDも名前も送らない）。
-    request: harness_sandbox::tier2a::privhelper::WorkspaceRevoke,
-    /// 撤収し終えたことを検算できたときに、台帳から落としてよい記録。
-    forgettable: ForgettableWorkspace,
-    /// 検算に使うworkspace capabilityの主体（`(表示名, SID)`）。
-    capability_sids: Vec<(String, harness_sandbox::win_common::OwnedSid)>,
-    /// 検算に使うharnessプロファイルの主体（`(プロファイル名, SID)`）。
-    profile_sids: Vec<(
-        String,
-        harness_sandbox::tier2a::win_appcontainer::OwnedContainerSid,
-    )>,
 }
 
 /// workspace本体のACE（`preflight`が毎回付与するRWX/RO）を撤収する。名前付きmutexで
@@ -67,23 +43,12 @@ struct WorkspaceEscalation {
 /// 旧実装はSIDごとに`revoke_ace_recursive`を呼び直しており、D-54以降ツリーのACEは
 /// capability SID宛（プロファイルSID宛ではない）なので、プロファイルSIDでの撤収walkは
 /// 全ノードが空振りの読取+書込になっていた（docs/bugs/BUG-082.md）。
-/// [D-84の裏対称] **単発コマンドも一括コマンドと同じ経路を通る。** `entries`が1件の
-/// 昇格要求として撃つので、入口が2つに割れない（`code-structure-rules` §5.1）。
 #[cfg(windows)]
 pub(crate) fn fs_revoke_workspace(path: &Path) -> ExitCode {
     match revoke_one_workspace(path) {
         WorkspaceRevokeOutcome::Revoked(forgettable) => {
             forget_revoked_ledger_records(std::slice::from_ref(&forgettable));
             ExitCode::SUCCESS
-        }
-        WorkspaceRevokeOutcome::NeedsElevation(escalation) => {
-            let (forgettable, any_failed) = escalate_workspace_revokes(vec![escalation]);
-            forget_revoked_ledger_records(&forgettable);
-            if any_failed {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            }
         }
         WorkspaceRevokeOutcome::Incomplete => ExitCode::FAILURE,
     }
@@ -247,8 +212,6 @@ fn revoke_one_workspace(path: &Path) -> WorkspaceRevokeOutcome {
                 // `RevokeReport::blocked_summary`と`ReclaimOutcome::summary`に揃えてある。
                 unfinished_workspace(
                     canonical,
-                    capability_targets,
-                    profile_targets,
                     format!(
                         "{summary} (checked {} node(s), rewrote {} node(s))",
                         report.checked, report.rewritten
@@ -259,232 +222,51 @@ fn revoke_one_workspace(path: &Path) -> WorkspaceRevokeOutcome {
         Err(e) => {
             // rootにすら触れなかった（あるいはツリーを列挙できなかった）。1ノードも剥がせて
             // いない。
-            unfinished_workspace(
-                canonical,
-                capability_targets,
-                profile_targets,
-                format!("{e} (checked up to node {last_reported})"),
-            )
+            unfinished_workspace(canonical, format!("{e} (checked up to node {last_reported})"))
         }
     }
 }
 
-/// 本体プロセス内（非管理者）で剥がしきれなかったときの振り分け。
+/// 本体プロセス内で剥がしきれなかったときの報告。
 ///
-/// # なぜここで分岐が要るのか（この機構が無かったころ）
+/// # ここから昇格へ委譲しない（拘束的決定。`plans/DESIGN-SANDBOX-PRIVSEP.md` D-16の系列）
 ///
-/// `harness fs revoke-workspace(-all)`には**昇格へ委譲する分岐が1つも無かった**——
-/// `run_privileged*`も`is_elevated()`も現れず、台帳がN件でも特権の往復は0回だった。
-/// `BUILTIN\Administrators`所有のノードは非昇格のままではDACLを書けないので、
-/// 実機では14ノード中2ノードが`0x80070005`（アクセス拒否）で残り、**そこで終わっていた**。
-/// 付与側（`preflight`）は同じ状況を`GrantWorkspaceAccess`で1回のUACへ束ねていたので、
-/// 付与と撤収で経路の数が違っていたことになる（`B-02`）。
+/// 一度は「剥がせなかったら特権分離ヘルパーへ委譲する」経路を足したが、**製品から取り除いた**。
+/// 理由は、実運用でそれが要る場面を**1つも数えられなかった**ことである——実機で
+/// `revoke-workspace-all`を撃つと14件中12件は非昇格のまま剥がせ、残る2件は**デバッグで昇格して
+/// 走らせたテストが作った残骸**だった（本番のworkspaceはユーザー自身のリポジトリで、
+/// 所有者はユーザーである）。
 ///
-/// # 台帳エントリは、どちらへ倒れても残す
+/// 委譲を足す先（`privhelper/server.rs`）は「レビュー時はここだけを見れば**管理者権限で何が
+/// 実行されうるか**が尽きる」ための総目録なので、**必要が示せないものを載せない**。
+/// 「付与側が昇格できるのだから撤収側も」という対称性は、必要の証明ではない。
+///
+/// 覆すとしたら、**テスト以外で**「非昇格では剥がせないノード」の実例を1つ数えてからにすること。
+///
+/// # 黙って終わらせない
+///
+/// 委譲しない代わりに、**剥がせなかったノードを名前で出して次の一手を書く**（`B-09`）。
+/// `0x80070005`（アクセス拒否）で残ったノードは名前が無いとどこを叩けばよいのか分からない。
+///
+/// # 台帳エントリは残す
 ///
 /// 台帳に載っている名前は、そのACEの主体（capability SID）を導出するための**唯一の索引**
 /// である。先に捨てると、残ったACEはどのコマンドでも剥がせない孤児になる
 /// （`B-01`: 名前で到達する設計では、名前を捨てる操作を最後に置く）。
 #[cfg(windows)]
-fn unfinished_workspace(
-    canonical: PathBuf,
-    capability_targets: Vec<(
-        &'static str,
-        String,
-        harness_sandbox::win_common::OwnedSid,
-    )>,
-    profile_targets: Vec<(
-        String,
-        harness_sandbox::tier2a::win_appcontainer::OwnedContainerSid,
-    )>,
-    reason: String,
-) -> WorkspaceRevokeOutcome {
-    if harness_sandbox::tier2a::privhelper::is_elevated() {
-        // 既に管理者トークンで走っている＝**いま回したwalkが「直接実行」そのもの**である
-        // （`fs_grant_traverse`/`fs_revoke_one`の2段構えで言えば、1段目と2段目が同じ）。
-        // ヘルパーを起こす理由が無い（UACは0回）うえ、同じトークンで再walkしても結果は
-        // 変わらない——実機で26万ノード級のツリーをもう一度歩くだけになる。
-        eprintln!(
-            "failed to revoke workspace access for {}: {reason} (already running elevated, so \
-             the helper would use the same token; workspace capability and profile ledger \
-             entries were left intact so a retry finds the same targets)",
-            canonical.display()
-        );
-        return WorkspaceRevokeOutcome::Incomplete;
-    }
-
-    let modes: Vec<&'static str> = capability_targets.iter().map(|(mode, _, _)| *mode).collect();
-    // [§22.3.1と同じ規律] **昇格側へ渡すのは秘密の前像だけ**（SIDも名前も渡さない）。
-    let subjects = workspace_subjects_for(&canonical, &modes);
-    let profiles: Vec<String> = profile_targets.iter().map(|(name, _)| name.clone()).collect();
-    if subjects.len() != modes.len() {
-        // 索引は引けたのに前像が引けない＝台帳が壊れている。**黙って少ない集合を送らない**
-        // （送ると、剥がせなかった主体があるのに応答は成功で返り得る、`B-09`）。
-        eprintln!(
-            "  note: only {} of {} workspace capability preimage(s) could be read from the \
-             ledger; the helper cannot strip the rest",
-            subjects.len(),
-            modes.len()
-        );
-    }
+fn unfinished_workspace(canonical: PathBuf, reason: String) -> WorkspaceRevokeOutcome {
     eprintln!(
-        "escalating {}: {reason} -- retrying through the privilege-separation helper",
+        "failed to revoke workspace access for {}: {reason}",
         canonical.display()
     );
-
-    WorkspaceRevokeOutcome::NeedsElevation(WorkspaceEscalation {
-        request: harness_sandbox::tier2a::privhelper::WorkspaceRevoke {
-            workspace: canonical.clone(),
-            subjects,
-            profiles,
-        },
-        forgettable: ForgettableWorkspace {
-            path: canonical,
-            modes,
-        },
-        capability_sids: capability_targets
-            .into_iter()
-            .map(|(mode, name, sid)| (format!("{name} ({mode})"), sid))
-            .collect(),
-        profile_sids: profile_targets,
-    })
-}
-
-/// [§22.3.1と同じ規律] 昇格側へ渡す**workspace capabilityの前像**（`(秘密, mode)`）を組み立てる。
-///
-/// **SIDも名前も渡さない。** 受信側が秘密から名前を畳んで導出する（`privhelper`モジュールdoc）。
-///
-/// **秘密を引くのはこの関数だけにしてある**（宣言側の`declaration_subjects_for`と同じ方針）。
-/// 持ち回る場所が増えると、ログやエラー文へ載る面が増える。
-///
-/// 引くのは**撤収の対象にしたモードだけ**である。台帳の全エントリを渡すと、宣言
-/// （`declaration`が`Some`＝`--fs-allow`の主体）の秘密まで昇格側へ流れる——あれは
-/// workspaceの外の宣言パスに載っているACEの主体で、workspace撤収とは別の扉が持つ。
-#[cfg(windows)]
-fn workspace_subjects_for(
-    canonical: &Path,
-    modes: &[&'static str],
-) -> Vec<harness_sandbox::tier2a::privhelper::WorkspaceRevokeSubject> {
-    // 突合の綴りは台帳側の畳み込み規則（`workspace_key`）をそのまま借りる（`B-19`/§22.5）。
-    let key = harness_sandbox::tier2a::workspace_capability::workspace_key(canonical);
-    harness_sandbox::tier2a::workspace_capability::all_entries()
-        .into_iter()
-        .filter(|entry| {
-            entry.declaration.is_none()
-                && modes.contains(&entry.mode.as_str())
-                && harness_sandbox::tier2a::workspace_capability::workspace_key(Path::new(
-                    &entry.workspace,
-                )) == key
-        })
-        .map(
-            |entry| harness_sandbox::tier2a::privhelper::WorkspaceRevokeSubject {
-                secret_hex: entry.secret_hex,
-                mode: entry.mode,
-            },
-        )
-        .collect()
-}
-
-/// [D-84の裏対称] 剥がしきれなかったworkspaceを、**N件を1本の封筒で**特権分離ヘルパーへ渡す
-/// （UACは1回）。返り値は`(台帳から落としてよい記録, 1件でも失敗したか)`。
-///
-/// # ヘルパーの応答だけを根拠に成功を名乗らない
-///
-/// 応答で`revoked`に載っていても、そのworkspaceのrootのDACLを**読み直して**主体が
-/// 残っていないことを確かめてから台帳を落とす（`B-25`/`B-33`）。読むのはroot 1ノードの
-/// 明示ACEだけなので、ツリーを再walkはしない（`fs revoke`の昇格後検算と同じ形）。
-#[cfg(windows)]
-fn escalate_workspace_revokes(
-    escalations: Vec<WorkspaceEscalation>,
-) -> (Vec<ForgettableWorkspace>, bool) {
-    if escalations.is_empty() {
-        return (Vec::new(), false);
-    }
-    println!(
-        "revoking workspace access for {} workspace(s) through the privilege-separation helper \
-         (one UAC prompt)...",
-        escalations.len()
+    eprintln!(
+        "  the workspace capability and profile ledger entries were left intact so a retry finds \
+         the same targets. If these nodes cannot be rewritten as this user (they are usually owned \
+         by another account), re-run this command from an elevated shell, or strip the ACE \
+         directly with `icacls \"{}\" /remove:g *<SID>`.",
+        canonical.display()
     );
-    let entries: Vec<_> = escalations.iter().map(|e| e.request.clone()).collect();
-    let (revoked, failures) =
-        match harness_sandbox::tier2a::privhelper::run_privileged_revoke_workspace_access(entries) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // **1件も台帳から落とさない。** 要求ごと失敗しているので、どのACEが
-                // 剥がれたかを名乗れる情報が無い（部分適用を勝手に仮定しない）。
-                eprintln!("revoke-workspace via the privilege-separation helper failed: {e}");
-                return (Vec::new(), true);
-            }
-        };
-
-    let mut forgettable = Vec::new();
-    let mut any_failed = false;
-    for escalation in escalations {
-        let workspace = escalation.request.workspace.clone();
-        if !revoked.iter().any(|p| p == &workspace) {
-            any_failed = true;
-            let reason = failures
-                .iter()
-                .find(|(p, _)| p == &workspace)
-                .map(|(_, reason)| reason.clone())
-                .unwrap_or_else(|| {
-                    "the helper returned no outcome for this workspace".to_string()
-                });
-            eprintln!(
-                "failed to revoke workspace access for {}: {reason} (ledger entries were left \
-                 intact so a retry finds the same targets)",
-                workspace.display()
-            );
-            continue;
-        }
-        // ヘルパーは「剥がした」と言っている。実DACLで確かめる。
-        let still = workspace_root_still_carrying(&escalation);
-        if !still.is_empty() {
-            any_failed = true;
-            eprintln!(
-                "the helper reported success for {} but ACEs are still on the root: {} (ledger \
-                 entries were left intact)",
-                workspace.display(),
-                still.join(", ")
-            );
-            continue;
-        }
-        // ACEが落ちたことを確かめた後で`.harness/**`の継承遮断を戻す——順序が逆だと、
-        // まだrootに残っているACEが継承で降りてくる（`report_harness_control_dir_unprotected`）。
-        report_harness_control_dir_unprotected(&workspace);
-        println!(
-            "revoked workspace access for {} via privilege-separation helper (UAC, one-time)",
-            workspace.display()
-        );
-        forgettable.push(escalation.forgettable);
-    }
-    (forgettable, any_failed)
-}
-
-/// 昇格後の検算——workspaceのrootに、撤収対象の主体の明示ACEがまだ載っていないか。
-///
-/// 戻り値は**残っていた主体の説明**（空なら剥がし終えている）。プローブ自体に失敗した場合も
-/// 残存として扱う——「確かめられなかった」を「消えていた」と読み替えると、剥がせていない
-/// ACEの索引を台帳から捨てて孤児にする（`B-01`/`B-10`）。
-#[cfg(windows)]
-fn workspace_root_still_carrying(escalation: &WorkspaceEscalation) -> Vec<String> {
-    let root = escalation.request.workspace.as_path();
-    let mut still = Vec::new();
-    for (label, sid) in &escalation.capability_sids {
-        if let Err(e) =
-            harness_sandbox::tier2a::win_appcontainer::assert_no_sid_ace(root, sid.as_psid())
-        {
-            still.push(format!("{label}: {e}"));
-        }
-    }
-    for (label, sid) in &escalation.profile_sids {
-        if let Err(e) =
-            harness_sandbox::tier2a::win_appcontainer::assert_no_sid_ace(root, sid.as_psid())
-        {
-            still.push(format!("{label}: {e}"));
-        }
-    }
-    still
+    WorkspaceRevokeOutcome::Incomplete
 }
 
 /// [B-01] 撤収が終わったworkspaceの台帳記録を、**2つの台帳それぞれ1回のupdateで**まとめて落とす。
@@ -602,10 +384,6 @@ pub(crate) fn fs_revoke_workspace_all() -> ExitCode {
     // [B-01] **撤収に成功したものだけ**を集める。剥がせなかったエントリを混ぜると、
     // 残ったACEの主体を導出する索引ごと消えて孤児になる。
     let mut forgettable = Vec::new();
-    // [D-84の裏対称] 本体内で剥がしきれなかったぶんは**貯めておいて1回の要求で送る**。
-    // 1件ずつ`run_privileged_*`を呼ぶと、台帳の件数だけUACが出る（`revoke-traverse-all`が
-    // 実機の563件で563回出したのと同じ形、`B-02`）。
-    let mut escalations = Vec::new();
     for entry in &ledger.entries {
         let path = PathBuf::from(&entry.path);
         let live = harness_sandbox::tier2a::workspace_ledger::live_modes(&path);
@@ -619,13 +397,9 @@ pub(crate) fn fs_revoke_workspace_all() -> ExitCode {
         }
         match revoke_one_workspace(&path) {
             WorkspaceRevokeOutcome::Revoked(w) => forgettable.push(w),
-            WorkspaceRevokeOutcome::NeedsElevation(escalation) => escalations.push(escalation),
             WorkspaceRevokeOutcome::Incomplete => any_failed = true,
         }
     }
-    let (escalated, escalation_failed) = escalate_workspace_revokes(escalations);
-    forgettable.extend(escalated);
-    any_failed |= escalation_failed;
     forget_revoked_ledger_records(&forgettable);
     if any_failed {
         ExitCode::FAILURE

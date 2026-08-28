@@ -1075,6 +1075,42 @@ mod tests {
     ///
     /// 許可側と禁止側を対で置く（`B-35`）: 宣言先が生きていれば残す／両方消えていれば落とす。
     #[test]
+    /// **台帳ごとに保存されている綴りが違うので、比べる前に必ず畳む。**
+    ///
+    /// workspace台帳と通行台帳は`\\?\C:\...`の**生のパス**を持ち、capability台帳は
+    /// **畳み込み済みの鍵**を持つ。「このツリー配下か」を素の前方一致で書くと、`\\?\`が
+    /// 付いている側だけ一致せず——**掃除したつもりで1件も落ちない**。
+    ///
+    /// 実際に[`docs/bugs/BUG-140.md`]の残骸を片付けるコードを書いたときこの形を踏みかけた
+    /// （`docs/bugs/BUG-141.md`と同じ「黙って何もしない」）。片方向だけでなく**両方の綴りが
+    /// 同じ鍵へ落ちること**を固定する。
+    ///
+    /// [`docs/bugs/BUG-140.md`]: ../../../../docs/bugs/BUG-140.md
+    #[test]
+    fn every_spelling_of_the_same_path_folds_to_one_key() {
+        let folded = workspace_key(Path::new(r"C:\harness-fsallow-1\ws"));
+        for spelling in [
+            r"C:\harness-fsallow-1\ws",
+            r"\\?\C:\harness-fsallow-1\ws",
+            r"c:\HARNESS-fsallow-1\WS",
+            "C:/harness-fsallow-1/ws",
+            r"\\?\c:/harness-fsallow-1\ws",
+        ] {
+            assert_eq!(
+                workspace_key(Path::new(spelling)),
+                folded,
+                "綴り {spelling:?} が別の鍵へ落ちた。前方一致で突き合わせる呼び出し側が黙って外れる"
+            );
+        }
+        // **前方一致が成立すること**まで測る（鍵が揃うだけでは、根で絞る判定は守れない）。
+        let root_key = workspace_key(Path::new(r"C:\harness-fsallow-1"));
+        assert!(
+            workspace_key(Path::new(r"\\?\C:\harness-fsallow-1\ws")).starts_with(&root_key),
+            "生のパスを持つ台帳のエントリが、畳んだ根の前方一致に掛からない"
+        );
+    }
+
+    #[test]
     fn a_declaration_entry_is_pruned_by_its_declared_path_not_by_its_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let l = test_ledger(tmp.path());

@@ -57,11 +57,6 @@ pub fn run_privileged(req: &PrivilegedRequest) -> Result<Vec<PathBuf>, PrivHelpe
             "unexpected RevokeTraverseBatchResult response for a non-RevokeTraverseBatch request"
                 .to_string(),
         )),
-        PrivilegedResponse::RevokeWorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
-            "unexpected RevokeWorkspaceAccessResult response for a non-RevokeWorkspaceAccess \
-             request"
-                .to_string(),
-        )),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }
 }
@@ -137,10 +132,6 @@ pub fn run_privileged_workspace_access(
             "unexpected RevokeTraverseBatchResult response for a GrantWorkspaceAccess request"
                 .to_string(),
         )),
-        PrivilegedResponse::RevokeWorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
-            "unexpected RevokeWorkspaceAccessResult response for a GrantWorkspaceAccess request"
-                .to_string(),
-        )),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }
 }
@@ -169,10 +160,6 @@ pub fn run_privileged_revoke_fs_allow(
         )),
         PrivilegedResponse::RevokeTraverseBatchResult { .. } => Err(PrivHelperError::Ipc(
             "unexpected RevokeTraverseBatchResult response for a RevokeFsAllow request".to_string(),
-        )),
-        PrivilegedResponse::RevokeWorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
-            "unexpected RevokeWorkspaceAccessResult response for a RevokeFsAllow request"
-                .to_string(),
         )),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
     }
@@ -217,64 +204,6 @@ pub fn run_privileged_revoke_traverse_batch(
         )),
         PrivilegedResponse::WorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
             "unexpected WorkspaceAccessResult response for a RevokeTraverseBatch request"
-                .to_string(),
-        )),
-        PrivilegedResponse::RevokeWorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
-            "unexpected RevokeWorkspaceAccessResult response for a RevokeTraverseBatch request"
-                .to_string(),
-        )),
-        PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),
-    }
-}
-
-/// `run_privileged_revoke_workspace_access`の成功値（撤収できたworkspace一覧、
-/// `(workspace, reason)`失敗一覧）。
-///
-/// **どちらの一覧も、それ自体では台帳を落とす根拠にならない**
-/// （[`PrivilegedResponse::RevokeWorkspaceAccessResult`]）。呼び出し側はrootのDACLを
-/// 読み直してから記録を捨てる。
-pub type WorkspaceRevokeBatchOutcome = (Vec<PathBuf>, Vec<(PathBuf, String)>);
-
-/// `RevokeWorkspaceAccess`専用の委譲関数——**`harness fs revoke-workspace(-all)`の
-/// 昇格経路そのもの**。
-///
-/// 付与側（[`run_privileged_workspace_access`]）の裏対称である。これが無かった頃、
-/// workspace撤収には昇格へ委譲する分岐が**1つも無く**、`BUILTIN\Administrators`所有の
-/// ノードでDACLを書けずに終わっていた（[`PrivilegedRequest::RevokeWorkspaceAccess`]のdoc）。
-///
-/// **昇格済みで走っているならこの関数を通さないこと**——呼び出し側が本体プロセス内で
-/// walkすれば、それが既に「管理者としての実行」であり、UACは0回で済む
-/// （`run_privileged_revoke_traverse_batch`と同じ規律）。
-pub fn run_privileged_revoke_workspace_access(
-    entries: Vec<WorkspaceRevoke>,
-) -> Result<WorkspaceRevokeBatchOutcome, PrivHelperError> {
-    let envelope =
-        PrivilegedRequestEnvelope::from(PrivilegedRequest::RevokeWorkspaceAccess { entries });
-    match run_privileged_raw(&envelope, None)? {
-        PrivilegedResponse::RevokeWorkspaceAccessResult { revoked, failures } => {
-            Ok((revoked, failures))
-        }
-        // 旧ヘルパー（この要求を知らない版）は要求そのものを拒むので`Err`で返る。
-        // ここへ来る`Ok`は「何もしていない」を意味するので、**空の成功にしない**
-        // ——空を返すと呼び出し側は「0件撤収できた」と読む（`B-09`: 失敗を成功に見せない）。
-        PrivilegedResponse::Ok => Err(PrivHelperError::Ipc(
-            "helper answered RevokeWorkspaceAccess with a bare Ok (no per-workspace outcome); \
-             it is probably an older build that does not know this request"
-                .to_string(),
-        )),
-        PrivilegedResponse::GrantChain { .. } => Err(PrivHelperError::Ipc(
-            "unexpected GrantChain response for a RevokeWorkspaceAccess request".to_string(),
-        )),
-        PrivilegedResponse::RevokeFsAllowResult { .. } => Err(PrivHelperError::Ipc(
-            "unexpected RevokeFsAllowResult response for a RevokeWorkspaceAccess request"
-                .to_string(),
-        )),
-        PrivilegedResponse::RevokeTraverseBatchResult { .. } => Err(PrivHelperError::Ipc(
-            "unexpected RevokeTraverseBatchResult response for a RevokeWorkspaceAccess request"
-                .to_string(),
-        )),
-        PrivilegedResponse::WorkspaceAccessResult { .. } => Err(PrivHelperError::Ipc(
-            "unexpected WorkspaceAccessResult response for a RevokeWorkspaceAccess request"
                 .to_string(),
         )),
         PrivilegedResponse::Err(msg) => Err(PrivHelperError::Rejected(msg)),

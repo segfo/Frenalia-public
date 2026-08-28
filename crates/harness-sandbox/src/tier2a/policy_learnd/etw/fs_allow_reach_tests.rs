@@ -922,22 +922,49 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
             capability_check.as_psid(),
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
+    // **削除の失敗を握り潰さない**（`B-09`: 「やった」と「うまくいった」は別の事実）。
+    // かつてここは`let _ =`で、**失敗しても誰にも見えなかった**——このテストは
+    // `dev-elevated-runner`配下で昇格して走るので、作られたツリーは`BUILTIN\Administrators`
+    // 所有になる。残ると非昇格では消せず、実際に2件が実マシンへ残った
+    // （`docs/bugs/BUG-140.md`）。**テストを落とすことはしない**（ここまでの測定結果まで
+    // 失うため）が、次に何を撃てばよいかまで書く。
+    if let Err(e) = std::fs::remove_dir_all(&root) {
+        eprintln!(
+            "!! FAILED to remove the probe tree {} : {e}\n\
+             !! it was created by an ELEVATED test run, so it is owned by BUILTIN\\Administrators \
+             and cannot be removed as a normal user. Remove it from an elevated shell, then run \
+             `harness fs prune` to drop the now-dangling ledger records.",
+            root.display()
+        );
+    }
+
+    // **自分が汚した台帳を全部数える。** `preflight`を通すと記録は3箇所に載る——
+    // 通行（traverse）・workspace一覧・workspace capability である。かつてここは通行だけを
+    // 掃除しており、**残る2つに2件の孤児が積もった**（`B-01`の「対の片方だけ」そのもの。
+    // 経緯は`docs/bugs/BUG-140.md`）。
+    //
+    // 判定はどれも「このプローブツリー配下か」だが、**比べる前に必ず綴りを畳む**。
+    // 台帳ごとに保存されている綴りが違う——workspace台帳と通行台帳は`\\?\C:\...`の生のパス、
+    // capability台帳は畳み込み済みの鍵である。素の前方一致で書くと`\\?\`が付いている側だけ
+    // 一致せず、**掃除したつもりで1件も落ちない**（`B-19`: 畳み込みは境界で1度だけ）。
+    let root_key = crate::tier2a::workspace_capability::workspace_key(&root);
+    let under_probe_tree = |path: &std::path::Path| {
+        crate::tier2a::workspace_capability::workspace_key(path).starts_with(&root_key)
+    };
 
     // **D-45以降、祖先traverseを付けるのは`preflight`自身**（`TraverseRestore`ではない）。
     // その付与は`traverse_ledger`へ永続記録されるが、プローブツリーはたった今消したので、
     // 残せば「実在しないパスを指すエントリ」＝phantomになる（実際にW1の測定は2件残した）。
     // 台帳は「harnessがACEを付けた場所」の記録なので、対象が消えた時点で記録も消す。
-    let root_prefix = root.to_string_lossy().to_ascii_lowercase();
-    for entry in crate::tier2a::traverse_ledger::load_traverse_ledger().entries {
-        if entry.path.to_ascii_lowercase().starts_with(&root_prefix) {
-            println!(
-                "  pruning traverse-ledger entry for the deleted probe tree: {}",
-                entry.path
-            );
-            crate::tier2a::traverse_ledger::remove_traverse_grant(std::path::Path::new(
-                &entry.path,
-            ));
-        }
+    for path in crate::tier2a::traverse_ledger::prune_traverse_entries(under_probe_tree) {
+        println!("  pruned traverse-ledger entry: {path}");
+    }
+    for path in crate::tier2a::workspace_ledger::prune_workspace_entries(under_probe_tree) {
+        println!("  pruned workspace-ledger entry: {path}");
+    }
+    for label in crate::tier2a::workspace_capability::prune_capability_entries(|entry| {
+        under_probe_tree(std::path::Path::new(&entry.prune_target()))
+    }) {
+        println!("  pruned workspace-capability entry: {label}");
     }
 }
