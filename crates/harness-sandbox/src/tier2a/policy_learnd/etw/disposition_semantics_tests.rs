@@ -162,9 +162,26 @@ fn permissive_file(dir: &Path, name: &str) -> std::path::PathBuf {
 
 /// 現在のユーザーへ**読取だけ**を許すDACLに置き換えたファイルを作る。
 ///
-/// `icacls <path> /inheritance:r /grant <user>:(R)`。継承ACEを落として読取1本だけにするので、
-/// 所有者として残るのは`READ_CONTROL`/`WRITE_DAC`（所有者に常に与えられる）であって
-/// `FILE_WRITE_DATA`ではない。**`fs.read`だけを許可した状態**の忠実な再現になる。
+/// `icacls <path> /inheritance:r /grant:r <user>:(R)`。**`fs.read`だけを許可した状態**の
+/// 忠実な再現で、所有者として残るのは`READ_CONTROL`/`WRITE_DAC`（所有者に常に与えられる）
+/// であって`FILE_WRITE_DATA`ではない。
+///
+/// # `/grant`（マージ）ではこの状態を作れない（2026-08-28、実測で判明）
+///
+/// **`/inheritance:r`は継承ACEを削除するとは限らない。** この開発機で1差分ずつ測ると、
+/// `%TEMP%`配下のファイルでは継承ACE6本が**削除されずに明示ACEへ写された**
+/// （`Get-Acl`の`IsInherited`が`True`→`False`に変わるだけで、本数も権限も同じ）。
+/// ユーザーのフルコントロールがそのまま残るため、**`/grant`（既存ACEへのマージ）では
+/// 読取専用にならない**——`F ∪ R = F`である。`/grant:r`（そのユーザーのACEを置換）にすると
+/// `Read, Synchronize`だけが残り、書込は拒否される（実測）。
+///
+/// # icaclsの終了コードを合否に使わない
+///
+/// 上の状態でも`icacls`は終了コード0で「1個のファイルが正常に処理されました」と報告する。
+/// **設定が効いたことは、設定した本人ではなく実物で確かめる**——ここでは書込を1回試みて、
+/// 通ってしまったら即座に落とす。これが無いと、DACLが変わっていないまま
+/// 「read許可では書けない」を測ったことになり、**Part 1の全assertが意味を失ったまま
+/// 別の顔（「前提が偽だった」）で赤くなる**（実際に3件がその形で落ちていた）。
 ///
 /// 後始末: `tempdir`のDropはこのファイルを削除するが、削除に要る`FILE_DELETE_CHILD`は
 /// 親（無加工の一時ディレクトリ）が持っているので通る。
@@ -174,7 +191,8 @@ fn read_only_file(dir: &Path, name: &str) -> std::path::PathBuf {
     let output = std::process::Command::new("icacls")
         .arg(&path)
         .arg("/inheritance:r")
-        .arg("/grant")
+        // **`/grant`ではなく`/grant:r`**（マージではなく置換）。理由は上のdoc。
+        .arg("/grant:r")
         .arg(format!("{user}:(R)"))
         .output()
         .expect("run icacls");
@@ -183,6 +201,18 @@ fn read_only_file(dir: &Path, name: &str) -> std::path::PathBuf {
         "icacls failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // **自己検証**: icaclsの報告ではなく実物で確かめる（上のdoc）。
+    if let Ok(handle) = std::fs::OpenOptions::new().write(true).open(&path) {
+        drop(handle);
+        panic!(
+            "the read-only DACL did not take effect on {} although icacls reported success. \
+             Every assertion in Part 1 would then be measuring a file we can still write to. \
+             Check the DACL with `Get-Acl` (icacls' own output is not evidence): the user's ACE \
+             must be Read only, and `/inheritance:r` may have converted the inherited ACEs into \
+             explicit ones instead of removing them",
+            path.display()
+        );
+    }
     path
 }
 
