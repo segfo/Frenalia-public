@@ -122,6 +122,20 @@ pub const RUN_SHELL_COMMAND_ENV_VAR: &str = "HARNESS_RUN_SHELL_COMMAND";
 /// （Phase5-H実測）。末尾の`$LASTEXITCODE`/`$?`判定で、bashの`sh -c`と同じ「最後のコマンドの
 /// 終了状態」意味論に揃える。
 ///
+/// # 判定は`Invoke-Expression`の**内側**で行う（[BUG-095](../../../../docs/bugs/BUG-095.md)）
+///
+/// **この判定を`Invoke-Expression`の外に置くと機能しない。** 外側の`$?`が答えるのは
+/// 「**評価そのもの**が成功したか」であって「コマンドが成功したか」ではなく、
+/// 評価は常に成功するので`$True`になる。`$LASTEXITCODE`のほうは**ネイティブプロセスが
+/// 起動して終了したときにしか設定されない**ので、起動できなかった場合・cmdletが失敗した
+/// 場合は前の値のままである。結果としてどちらの枝も通らず、**失敗が終了コード0で報告される**
+/// （実測: 存在しないコマンド・起動できないEXE・失敗したcmdletの3つが全て0だった）。
+///
+/// 評価する文字列の末尾へ同じ判定を足すと、`$?`はコマンドの成否を指すようになる。
+/// **区切りは`;`ではなく改行（`` `n ``）でなければならない**——末尾にコメント（`# ...`）が
+/// 付いたコマンドだと、`;`で足した判定はコメントに飲まれて消える（実測）。
+/// 文字列連結しか増やしていないのでConstrainedLanguage（BUG-102）でも通る。
+///
 /// Tier0（本関数の呼び出し元`platform_shell_command`）・Tier2a（`run_windows_tier2a`）・
 /// Tier1（`run_windows_tier1`）・ポリシーエディタのパス1
 /// （`harness_policy_editor::record`、**Tier0**の`tier0::win_plain::spawn`で走らせる。
@@ -143,8 +157,7 @@ Write-Output '<<<harness-run-shell-begin>>>'; \
 if ($__harness_full) { [Console]::Error.WriteLine('<<<harness-run-shell-begin>>>') }; \
 $__harness_cmd = $env:HARNESS_RUN_SHELL_COMMAND; \
 Remove-Item Env:HARNESS_RUN_SHELL_COMMAND -ErrorAction SilentlyContinue; \
-Invoke-Expression $__harness_cmd; \
-if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif (-not $?) { exit 1 }
+Invoke-Expression ($__harness_cmd + \"`n\" + 'if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif (-not $?) { exit 1 }')
 ";
 
 /// BUG-102: ConstrainedLanguageで走っていることを宣言する通知の識別部分。

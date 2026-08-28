@@ -377,6 +377,93 @@ mod tests {
         assert!(out.content.contains("[exit code: 0]"), "{}", out.content);
     }
 
+    /// [BUG-095](../../../../docs/bugs/BUG-095.md)回帰テスト:
+    /// **走らせることすらできなかったコマンドが、終了コード0（成功）で報告されない**こと。
+    ///
+    /// 修正前は3つの形が全て`0`だった——判定（`$LASTEXITCODE`/`$?`）を
+    /// `Invoke-Expression`の**外**で行っており、外側の`$?`は「評価が成功したか」しか
+    /// 答えないためである。**情報は失われておらず、読む場所が外側だった。**
+    ///
+    /// **嘘だった側だけをテストしない**（`test-logic-rules`）——正しく動いていた側は
+    /// 直下の`..._does_not_break_success_shapes`が対で固定する。片方だけだと、
+    /// 「常に非0を返す」実装でも合格してしまう。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_reports_nonzero_when_the_command_could_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        // 起動できないEXE（PEではないファイル）。ACLで拒否されるEXEと同じ`NativeCommandFailed`。
+        let fake_exe = dir.path().join("not-a-real.exe");
+        std::fs::write(&fake_exe, b"not a real PE").unwrap();
+
+        for (command, why) in [
+            (
+                "harness-definitely-not-a-command-xyz".to_string(),
+                "存在しないコマンド（CommandNotFoundException）",
+            ),
+            (
+                format!("& '{}'", fake_exe.display()),
+                "見つかったが起動できないEXE（NativeCommandFailed）",
+            ),
+            (
+                "Get-Item C:\\harness-definitely-missing-file-xyz.txt".to_string(),
+                "失敗したcmdlet",
+            ),
+        ] {
+            let tool = RunShellTool;
+            let out = tool
+                .call(
+                    json!({ "command": command }),
+                    &ctx(dir.path().to_path_buf()),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !out.content.contains("[exit code: 0]"),
+                "{why}: 走らせられなかったコマンドが成功として報告された（BUG-095）: {}",
+                out.content
+            );
+            assert!(
+                out.is_error,
+                "{why}: 終了コードが非0ならツール結果もエラーでなければならない: {}",
+                out.content
+            );
+        }
+    }
+
+    /// [BUG-095](../../../../docs/bugs/BUG-095.md)回帰テストの**対**:
+    /// 正しく動いていた2つの形が、上の修正で壊れていないこと。
+    ///
+    /// これを置かないと「常に非0を返す」実装が上のテストを通ってしまう。**成功が失敗に
+    /// 見える**のはBUG-086で実際に起きた事故で、モデルがリトライループへ入った。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_exit_code_fix_does_not_break_success_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        for (command, expected, why) in [
+            ("cmd /c exit 3", "[exit code: 3]", "ネイティブの終了コードはそのまま伝わる"),
+            ("Write-Output ok", "[exit code: 0]", "正常終了は0のまま"),
+            (
+                "Write-Output ok # trailing comment",
+                "[exit code: 0]",
+                "末尾コメント付きでも判定が飲まれない（区切りが改行である根拠）",
+            ),
+        ] {
+            let tool = RunShellTool;
+            let out = tool
+                .call(
+                    json!({ "command": command }),
+                    &ctx(dir.path().to_path_buf()),
+                )
+                .await
+                .unwrap();
+            assert!(
+                out.content.contains(expected),
+                "{why}: {command} は {expected} を返すべき: {}",
+                out.content
+            );
+        }
+    }
+
     /// Phase5-G回帰テスト: 日本語（非ASCII）を含む既存ファイルの内容を読み出す出力が文字化け
     /// （U+FFFD等）せずそのまま返ること。修正前はコンソール既定コードページ（CP932想定）と
     /// われわれの`from_utf8_lossy`読取りが食い違い、非ASCII出力が破壊されていた。
@@ -637,7 +724,17 @@ mod tests {
             !RUN_SHELL_BOOTSTRAP_SCRIPT.contains("scriptblock]::Create"),
             "コマンド実行に.NETの静的メソッドを使うとConstrainedLanguageで1行も走らない"
         );
-        assert!(RUN_SHELL_BOOTSTRAP_SCRIPT.contains("Invoke-Expression $__harness_cmd"));
+        assert!(
+            RUN_SHELL_BOOTSTRAP_SCRIPT.contains("Invoke-Expression ($__harness_cmd +"),
+            "コマンドは`Invoke-Expression`で実行し、終了コードの判定はその評価文字列の内側へ\
+             足す（BUG-095。外側の`$?`は評価自体の成否しか答えない）"
+        );
+        // BUG-095: 判定を足す区切りは改行でなければならない。`;`だと、末尾にコメントの付いた
+        // コマンドで判定がコメントに飲まれて消える（実測）。
+        assert!(
+            RUN_SHELL_BOOTSTRAP_SCRIPT.contains("+ \"`n\" +"),
+            "判定の区切りが改行でなくなっている（`;`では末尾コメント付きコマンドで消える）"
+        );
 
         // `[Console]::`に触る文は全てFullLanguageガードの内側にあること。ガードの外に1つでも
         // あると、その`InvalidOperation`がコマンドの出力に見える（BUG-086と同型）。
