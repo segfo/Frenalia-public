@@ -1461,18 +1461,28 @@ pub fn preflight_with_privhelper_launcher(
             })
             .collect();
 
-        // 戻り値の`false`は「このプロセスでは既に別のジョブが走っている」＝`preflight`が2回
-        // 呼ばれた場合だけで、製品では起こらない（実機テストが同居するときだけ）。
-        let started = grant_job::start(
-            workspace_root,
-            owned_ace_grants,
-            harness_protect_sids,
-            // 上の`top_level_child_missing_aces`と**同じ集合**（`B-05`。ここがずれると、
-            // ジョブが意図的に外した場所を検算側が数えて毎起動でジョブが回る）。
-            job_skip,
+        // [D-85] ジョブの同一性は (workspace, mode, capabilityの世代) で決まる。世代を落とすと、
+        // 秘密が入れ替わって**主体が別のSIDになった**あとも「同じジョブが走っている」と誤判定し、
+        // 新しい世代の準備が始まらない。
+        let capability_generation = crate::tier2a::workspace_capability::ensure_capability_name(
             &canonical_workspace_root,
             workspace_mode.as_str(),
-        );
+        )
+        .map_err(AppContainerError::Preflight)?;
+
+        // 戻り値の`false`は「このプロセスでは既に別のジョブが走っている」＝`preflight`が2回
+        // 呼ばれた場合だけで、製品では起こらない（実機テストが同居するときだけ）。
+        let started = grant_job::start(grant_job::GrantJobRequest {
+            root: workspace_root,
+            ace_grants: owned_ace_grants,
+            protect_sids: harness_protect_sids,
+            // 上の`top_level_child_missing_aces`と**同じ集合**（`B-05`。ここがずれると、
+            // ジョブが意図的に外した場所を検算側が数えて毎起動でジョブが回る）。
+            skip: job_skip,
+            workspace: &canonical_workspace_root,
+            mode: workspace_mode.as_str(),
+            capability_generation: &capability_generation,
+        });
         timing.mark(&format!(
             "grant_job::start (background propagate + descendant fix-up, started={started})"
         ));
@@ -1493,7 +1503,7 @@ pub fn preflight_with_privhelper_launcher(
 /// [`crate::session_scope::persistent_acl_gate`]が持つ純関数で、ここはボリュームの採取と
 /// エラー型への変換だけを行う。**採取と判定を分ける**のは、判定側を`cargo test`で
 /// 検算できるようにするためである。
-fn require_persistent_acl_volume(what: &str, path: &Path) -> Result<(), AppContainerError> {
+pub(crate) fn require_persistent_acl_volume(what: &str, path: &Path) -> Result<(), AppContainerError> {
     let mount = crate::win_common::volume_mount_point_of(path);
     let probe = mount
         .as_deref()

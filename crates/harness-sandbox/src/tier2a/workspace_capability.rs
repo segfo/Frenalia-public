@@ -132,6 +132,27 @@ pub struct WorkspaceCapabilityEntry {
     /// のに対し、誤って検証済みと信じると到達不能なツリーで走り続ける。
     #[serde(default)]
     pub root_file_id: Option<String>,
+    /// 背景準備を開始した時刻。別プロセスの`harness fs list`も`preparing`を表示できるよう、
+    /// プロセス内のジョブ状態だけに置かずこの台帳へ残す。
+    #[serde(default)]
+    pub preparation_started_at_unix_secs: Option<u64>,
+    /// 準備を開始したrootの識別子。同じパスへ別のworkspaceが作り直されたとき、古い
+    /// `preparing`/`failed`を新しいrootへ適用しないための対になる値。
+    #[serde(default)]
+    pub preparation_root_file_id: Option<String>,
+    /// 最後の背景準備が失敗した時刻と理由。次の準備開始で消し、成功時にも消す。
+    #[serde(default)]
+    pub preparation_failed_at_unix_secs: Option<u64>,
+    #[serde(default)]
+    pub preparation_error: Option<String>,
+}
+
+/// capability台帳に永続化された、現在のrootに対する準備ジョブの状態。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedWorkspacePreparation {
+    None,
+    Preparing,
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -353,6 +374,10 @@ fn ensure_name_in(
             // workspaceのような26万ノードの木ではない）ので、この2欄は`None`のまま使わない。
             tree_verified_at_unix_secs: None,
             root_file_id: None,
+            preparation_started_at_unix_secs: None,
+            preparation_root_file_id: None,
+            preparation_failed_at_unix_secs: None,
+            preparation_error: None,
         });
         Ok(DeclarationCapability {
             secret_hex,
@@ -620,6 +645,10 @@ fn mark_tree_verified_in(ledger: &Ledger<WorkspaceCapabilityLedger>, workspace: 
         {
             entry.tree_verified_at_unix_secs = Some(now);
             entry.root_file_id = identity.clone();
+            entry.preparation_started_at_unix_secs = None;
+            entry.preparation_root_file_id = None;
+            entry.preparation_failed_at_unix_secs = None;
+            entry.preparation_error = None;
         }
     });
 }
@@ -632,6 +661,92 @@ fn mark_tree_verified_in(ledger: &Ledger<WorkspaceCapabilityLedger>, workspace: 
 /// **黙って記録されない**——つまり次回もジョブを回す側（安全側）へ倒れる。
 pub fn mark_tree_verified(workspace: &Path, mode: &str) {
     mark_tree_verified_in(&ledger(), workspace, mode);
+}
+
+fn mark_tree_preparing_in(
+    ledger: &Ledger<WorkspaceCapabilityLedger>,
+    workspace: &Path,
+    mode: &str,
+) {
+    let key = workspace_key(workspace);
+    let identity = root_identity(workspace);
+    let now = now_unix_secs();
+    ledger.update(|l| {
+        if let Some(entry) = l
+            .entries
+            .iter_mut()
+            .find(|e| workspace_key(Path::new(&e.workspace)) == key && e.mode == mode)
+        {
+            entry.preparation_started_at_unix_secs = Some(now);
+            entry.preparation_root_file_id = identity.clone();
+            entry.preparation_failed_at_unix_secs = None;
+            entry.preparation_error = None;
+        }
+    });
+}
+
+/// 背景ジョブを登録した直後に`preparing`を永続化する。
+pub fn mark_tree_preparing(workspace: &Path, mode: &str) {
+    mark_tree_preparing_in(&ledger(), workspace, mode);
+}
+
+fn mark_tree_preparation_failed_in(
+    ledger: &Ledger<WorkspaceCapabilityLedger>,
+    workspace: &Path,
+    mode: &str,
+    error: &str,
+) {
+    let key = workspace_key(workspace);
+    let now = now_unix_secs();
+    ledger.update(|l| {
+        if let Some(entry) = l
+            .entries
+            .iter_mut()
+            .find(|e| workspace_key(Path::new(&e.workspace)) == key && e.mode == mode)
+        {
+            entry.preparation_failed_at_unix_secs = Some(now);
+            entry.preparation_error = Some(error.to_string());
+        }
+    });
+}
+
+/// 背景ジョブの失敗理由を、次回の準備開始まで表示できるよう永続化する。
+pub fn mark_tree_preparation_failed(workspace: &Path, mode: &str, error: &str) {
+    mark_tree_preparation_failed_in(&ledger(), workspace, mode, error);
+}
+
+fn recorded_workspace_preparation_in(
+    ledger: &Ledger<WorkspaceCapabilityLedger>,
+    workspace: &Path,
+    mode: &str,
+) -> RecordedWorkspacePreparation {
+    let key = workspace_key(workspace);
+    let current_identity = root_identity(workspace);
+    let Some(entry) = ledger
+        .load()
+        .entries
+        .into_iter()
+        .find(|e| workspace_key(Path::new(&e.workspace)) == key && e.mode == mode)
+    else {
+        return RecordedWorkspacePreparation::None;
+    };
+    if entry.preparation_started_at_unix_secs.is_none()
+        || entry.preparation_root_file_id != current_identity
+    {
+        return RecordedWorkspacePreparation::None;
+    }
+    match entry.preparation_error {
+        Some(error) => RecordedWorkspacePreparation::Failed(error),
+        None => RecordedWorkspacePreparation::Preparing,
+    }
+}
+
+/// 現在のrootに対して台帳へ記録された準備状態。生存判定は呼び出し側がmode mutexで行う。
+pub fn recorded_workspace_preparation(
+    workspace: &Path,
+    mode: &str,
+) -> RecordedWorkspacePreparation {
+    recorded_workspace_preparation_in(&ledger(), workspace, mode)
 }
 
 /// `workspace`（canonicalize済み）＋`mode`のcapability名を返す。初回は秘密を生成して台帳へ
@@ -1298,6 +1413,10 @@ mod tests {
                 granted_at_unix_secs: 1,
                 tree_verified_at_unix_secs: Some(2),
                 root_file_id: None,
+                preparation_started_at_unix_secs: None,
+                preparation_root_file_id: None,
+                preparation_failed_at_unix_secs: None,
+                preparation_error: None,
             });
         });
         assert!(!tree_is_verified_in(&l, &ws, "rwx"));
@@ -1311,5 +1430,46 @@ mod tests {
         let b = generate_secret().expect("CSPRNG");
         assert_ne!(a, b);
         assert_ne!(a, [0u8; SECRET_LEN]);
+    }
+
+    #[test]
+    fn preparation_state_is_persistent_and_scoped_to_the_root_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = test_ledger(tmp.path());
+        let ws = tmp.path().join("repo");
+        std::fs::create_dir(&ws).unwrap();
+        ensure_capability_name_in(&l, &ws, "rwx").unwrap();
+
+        assert_eq!(
+            recorded_workspace_preparation_in(&l, &ws, "rwx"),
+            RecordedWorkspacePreparation::None
+        );
+        mark_tree_preparing_in(&l, &ws, "rwx");
+        assert_eq!(
+            recorded_workspace_preparation_in(&l, &ws, "rwx"),
+            RecordedWorkspacePreparation::Preparing
+        );
+        mark_tree_preparation_failed_in(&l, &ws, "rwx", "propagation failed");
+        assert_eq!(
+            recorded_workspace_preparation_in(&l, &ws, "rwx"),
+            RecordedWorkspacePreparation::Failed("propagation failed".to_string())
+        );
+
+        std::fs::remove_dir(&ws).unwrap();
+        std::fs::create_dir(&ws).unwrap();
+        assert_eq!(
+            recorded_workspace_preparation_in(&l, &ws, "rwx"),
+            RecordedWorkspacePreparation::None,
+            "an old failure must not describe a replacement root"
+        );
+
+        mark_tree_preparing_in(&l, &ws, "rwx");
+        mark_tree_verified_in(&l, &ws, "rwx");
+        assert!(tree_is_verified_in(&l, &ws, "rwx"));
+        assert_eq!(
+            recorded_workspace_preparation_in(&l, &ws, "rwx"),
+            RecordedWorkspacePreparation::None,
+            "successful verification clears the transient preparation state"
+        );
     }
 }

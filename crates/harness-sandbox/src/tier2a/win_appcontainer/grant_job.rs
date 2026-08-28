@@ -203,8 +203,9 @@ const PHASE_WALKING: u8 = 1;
 /// [`JOBS`]の1エントリ（ジョブの鍵と状態）。
 type JobEntry = (String, Arc<JobState>);
 
-/// このプロセスで動いている/動いたジョブの一覧。**workspace＋モードごとに1本**（キーは
-/// [`job_key`]）。
+/// このプロセスで動いている/動いたジョブの一覧。**workspace＋モード＋capability generation
+/// ごとに1本**（キーは [`job_key`]）。明示 revoke 後に同じプロセスで再準備した場合は主体が
+/// 変わるため、新しいジョブとして扱う。
 ///
 /// [BUG-082] 当初は「1プロセス＝1workspace＝1モードなので1本で足りる」という前提の
 /// `OnceLock<Arc<JobState>>`（プロセス全体で1本きり）だった。製品の`harness.exe`はこの前提が
@@ -224,10 +225,17 @@ fn jobs() -> &'static Mutex<Vec<JobEntry>> {
 /// [`JOBS`]の鍵。`workspace_capability::workspace_key`と同じ正規化（大文字小文字・区切り・
 /// `\\?\`前置の揺れを吸収）にモードを連結する——揺れで別キーになると、同じworkspaceへ
 /// 2本のジョブが並行して同じツリーへDACL書込を行いかねない（モジュールdocの「約束」）。
-fn job_key(workspace: &Path, mode: &str) -> String {
+fn job_key_prefix(workspace: &Path, mode: &str) -> String {
     format!(
         "{}\u{0}{mode}",
         crate::tier2a::workspace_capability::workspace_key(workspace)
+    )
+}
+
+fn job_key(workspace: &Path, mode: &str, capability_generation: &str) -> String {
+    format!(
+        "{}\u{0}{capability_generation}",
+        job_key_prefix(workspace, mode)
     )
 }
 
@@ -260,16 +268,32 @@ fn job_key(workspace: &Path, mode: &str) -> String {
 /// セッションからしかworkspaceが見えないツリーが出来上がり、モードを切り替えた瞬間に26万件を
 /// 払い直す——それを消すのがD-84である。フェーズ0（伝播）もフェーズ1（救済walk）も、**多本を1回の
 /// 書込にまとめる形**でここから下へ降りる（`plans/mac-spike/RESULTS.md` §S15-1）。
+///
+/// **`capability_generation`は合流の鍵である**（D-85）。同じworkspace＋モードでも、capabilityの
+/// 世代が変われば主体そのものが別のSIDになるので、**前の世代のジョブが走っていることを理由に
+/// 新しい世代の準備を飛ばしてはならない**。[`job_key`]がこの3つ組で1本を決める。
+pub(crate) struct GrantJobRequest<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) ace_grants: Vec<super::OwnedAceGrant>,
+    pub(crate) protect_sids: Vec<OwnedSid>,
+    pub(crate) skip: Vec<PathBuf>,
+    pub(crate) workspace: &'a Path,
+    pub(crate) mode: &'a str,
+    pub(crate) capability_generation: &'a str,
+}
+
 #[must_use = "false means the job was not started (another one already claimed this process)"]
-pub fn start(
-    root: &Path,
-    ace_grants: Vec<super::OwnedAceGrant>,
-    protect_sids: Vec<OwnedSid>,
-    skip: Vec<PathBuf>,
-    workspace: &Path,
-    mode: &str,
-) -> bool {
-    let key = job_key(workspace, mode);
+pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
+    let GrantJobRequest {
+        root,
+        ace_grants,
+        protect_sids,
+        skip,
+        workspace,
+        mode,
+        capability_generation,
+    } = request;
+    let key = job_key(workspace, mode, capability_generation);
     let state = Arc::new(JobState::default());
     {
         let mut list = jobs().lock().unwrap();
@@ -278,6 +302,7 @@ pub fn start(
         }
         list.push((key, Arc::clone(&state)));
     }
+    crate::tier2a::workspace_capability::mark_tree_preparing(workspace, mode);
     let root = root.to_path_buf();
     let workspace = workspace.to_path_buf();
     let mode = mode.to_string();
@@ -287,7 +312,13 @@ pub fn start(
         let ace_grant_refs = super::OwnedAceGrant::borrow_all(&ace_grants);
         // フェーズ0: rootへの継承ACE伝播（冪等チェック無し、必ず呼ぶ）。全ACEを1回で。
         if let Err(e) = super::propagate_workspace_root_grants(&root, &ace_grant_refs) {
-            *state.error.lock().unwrap() = Some(e.to_string());
+            // **失敗を台帳へ残す**（D-85）。ここで残さないと、次回の起動は
+            // 「準備中のまま終わった」と「そもそも始めていない」を区別できない。
+            let error = e.to_string();
+            crate::tier2a::workspace_capability::mark_tree_preparation_failed(
+                &workspace, &mode, &error,
+            );
+            *state.error.lock().unwrap() = Some(error);
             state.finished.store(true, Ordering::Release);
             return;
         }
@@ -302,7 +333,11 @@ pub fn start(
             // 記録しないと「D-05/D-09の層3が1件も掛からなかった」ことを事後に知る手段が無い。
             Ok(nodes) => state.protected_nodes.store(nodes, Ordering::Relaxed),
             Err(e) => {
-                *state.error.lock().unwrap() = Some(e.to_string());
+                let error = e.to_string();
+                crate::tier2a::workspace_capability::mark_tree_preparation_failed(
+                    &workspace, &mode, &error,
+                );
+                *state.error.lock().unwrap() = Some(error);
                 state.finished.store(true, Ordering::Release);
                 return;
             }
@@ -347,7 +382,11 @@ pub fn start(
                 crate::tier2a::workspace_capability::mark_tree_verified(&workspace, &mode);
             }
             Err(e) => {
-                *state.error.lock().unwrap() = Some(e.to_string());
+                let error = e.to_string();
+                crate::tier2a::workspace_capability::mark_tree_preparation_failed(
+                    &workspace, &mode, &error,
+                );
+                *state.error.lock().unwrap() = Some(error);
             }
         }
         // `finished`は最後に立てる。先に立てると、待ち手が`error`を読む前に「成功で終わった」と
@@ -393,6 +432,20 @@ pub fn progress() -> Option<WorkspaceGrantProgress> {
     Some(snapshot_progress(state))
 }
 
+/// 指定した `(workspace, mode)` の最新generationの状態。
+///
+/// 通常製品は1 workspaceだけだが、`harness fs prepare-workspace`と実機テストは対象を明示して
+/// 進捗を待つため、プロセス全体の「最後の1本」ではなくこの入口を使う。
+pub fn progress_for(workspace: &Path, mode: &str) -> Option<WorkspaceGrantProgress> {
+    let prefix = format!("{}\u{0}", job_key_prefix(workspace, mode));
+    let list = jobs().lock().unwrap();
+    let (_, state) = list
+        .iter()
+        .rev()
+        .find(|(key, _)| key.starts_with(&prefix))?;
+    Some(snapshot_progress(state))
+}
+
 /// このプロセスで開始された**全ての**ジョブの完了を待つ。1本も無ければ即座に`Ok`。
 ///
 /// [BUG-082] 呼び出し側（`run_shell`等）は「自分がこれから触るworkspaceのジョブ」だけを
@@ -419,9 +472,43 @@ pub fn wait_until_done() -> Result<(), String> {
     Ok(())
 }
 
+/// 指定した `(workspace, mode)` の最新generationだけを待つ。ジョブが無ければ即座に成功する。
+pub fn wait_for_workspace(workspace: &Path, mode: &str) -> Result<(), String> {
+    wait_for_workspace_reporting(workspace, mode, |_| {})
+}
+
+/// [`wait_for_workspace`] と同じ待機を行い、待機中のスナップショットを表示層へ渡す。
+/// タイムアウト値と成否判定はこのモジュールだけが持ち、CLI側には複製しない。
+pub fn wait_for_workspace_reporting(
+    workspace: &Path,
+    mode: &str,
+    mut report: impl FnMut(&WorkspaceGrantProgress),
+) -> Result<(), String> {
+    let prefix = format!("{}\u{0}", job_key_prefix(workspace, mode));
+    let state = {
+        let list = jobs().lock().unwrap();
+        list.iter()
+            .rev()
+            .find(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, state)| Arc::clone(state))
+    };
+    match state {
+        Some(state) => wait_for_job_reporting(&state, &mut report),
+        None => Ok(()),
+    }
+}
+
 fn wait_for_job(state: &JobState) -> Result<(), String> {
+    wait_for_job_reporting(state, &mut |_| {})
+}
+
+fn wait_for_job_reporting(
+    state: &JobState,
+    report: &mut dyn FnMut(&WorkspaceGrantProgress),
+) -> Result<(), String> {
     let deadline = Instant::now() + WAIT_TIMEOUT;
     while !state.finished.load(Ordering::Acquire) {
+        report(&snapshot_progress(state));
         if Instant::now() >= deadline {
             let done = state.done.load(Ordering::Relaxed);
             let total = state.total.load(Ordering::Relaxed);
@@ -434,6 +521,7 @@ fn wait_for_job(state: &JobState) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    report(&snapshot_progress(state));
     match state.error.lock().unwrap().clone() {
         Some(e) => Err(format!(
             "the workspace ACL repair pass failed ({e}); part of the workspace may be unreachable \

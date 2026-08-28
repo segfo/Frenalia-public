@@ -34,6 +34,7 @@ mod winid;
 // `try_runas`・`load_library`と同じ位置付け。判定が出たら削除する
 // （`docs/CODE-STRUCTURE-RULES.md`規則2「一回性の調査実験をテストとして残さない」）。
 mod object_reach;
+mod open_bench;
 mod pipe_client;
 mod spawn_matrix;
 mod spike_handles;
@@ -83,6 +84,9 @@ struct Args {
     use_process_handle: Option<usize>,
     /// MAC設計§10.1: 要求受付パイプへクライアントとして接続し1往復する。
     pipe_client: Option<String>,
+    /// D-88（Lazy ACE fault-in）の着手条件: Redirector DLLのフックが**成功するopen**へ
+    /// 上乗せする時間を、同一プロセスの「載せる前／載せた後」で測る（`open_bench`モジュールdoc）。
+    open_bench: Option<open_bench::Spec>,
     /// 上記スパイクモードが結果を書き出すファイル（stdoutを読み切れない経路のため）。
     report_file: Option<String>,
     /// スパイクモードが「生きたまま待つ」秒数（`hold_file`と単独指定時のアイドル）。
@@ -111,6 +115,10 @@ fn parse_args() -> Args {
     let mut pipe_client = None;
     let mut report_file = None;
     let mut idle_secs = None;
+    let mut bench_inside: Option<String> = None;
+    let mut bench_outside: Option<String> = None;
+    let mut bench_dll: Option<String> = None;
+    let mut bench_iters: usize = 20_000;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -178,9 +186,24 @@ fn parse_args() -> Args {
             "--pipe-client" => pipe_client = Some(next()),
             "--report-file" => report_file = Some(next()),
             "--idle-secs" => idle_secs = next().parse().ok(),
+            "--open-bench" => bench_inside = Some(next()),
+            "--open-bench-outside" => bench_outside = Some(next()),
+            "--open-bench-dll" => bench_dll = Some(next()),
+            "--open-bench-iters" => {
+                if let Ok(v) = next().parse::<usize>() {
+                    bench_iters = v.max(1);
+                }
+            }
             _ => {}
         }
     }
+
+    let open_bench = bench_inside.map(|inside| open_bench::Spec {
+        inside,
+        outside: bench_outside,
+        iters: bench_iters,
+        dll: bench_dll,
+    });
 
     Args {
         gen,
@@ -202,6 +225,7 @@ fn parse_args() -> Args {
         emit,
         use_process_handle,
         pipe_client,
+        open_bench,
         report_file,
         idle_secs,
     }
@@ -567,6 +591,18 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("use_process_handle report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(spec) = &args.open_bench {
+        let report = open_bench::run(spec);
+        if let Some(path) = &args.report_file {
+            let _ = fs::write(path, report.to_string());
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("open_bench report must serialize")
         );
         return ExitCode::SUCCESS;
     }

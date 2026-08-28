@@ -19,6 +19,22 @@ pub(crate) fn run_tier2a_subcommand(action: Tier2aAction) -> ExitCode {
     use harness_sandbox::tier2a::win_appcontainer::revoke_session_grant;
 
     match action {
+        Tier2aAction::NativePathSupport => {
+            use harness_sandbox::tier2a::win_appcontainer::probe_native_path_policy;
+            let probe = probe_native_path_policy();
+            println!("windows_build={:?}", probe.windows_build);
+            println!("verdict={:?}", probe.verdict);
+            println!("create_export_present={}", probe.create_export_present);
+            println!("query_export_present={}", probe.query_export_present);
+            println!("query_succeeded={}", probe.query_succeeded);
+            println!("sandbox_capabilities={:?}", probe.sandbox_capabilities);
+            println!("psec_exports_complete={}", probe.psec_exports_complete);
+            println!("detail={}", probe.detail);
+            println!(
+                "production_eligible=false (experimental API; RO/RW, child process, stdio, Job, WFP, .harness denial, and host-DACL invariance E2E are still required)"
+            );
+            ExitCode::SUCCESS
+        }
         Tier2aAction::Gc => {
             // preflightの起動時GCと**同じ関数・同じ内訳**を通す（判定を2箇所に書かない）。
             let outcome = session_profile::gc_dead_sessions_reporting(&revoke_session_grant);

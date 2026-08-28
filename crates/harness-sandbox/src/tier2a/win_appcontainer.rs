@@ -537,12 +537,12 @@ pub fn current_session_grant_sid() -> Option<String> {
 // （`harness_sandbox::tier2a::win_appcontainer::preflight` 等）を変えないため、各モジュールの
 // 公開項目はここでglob再エクスポートする。
 
-mod acl_grant;
 /// [残課題#32] **DACLを組んで書く低レベルの口**のうち、「M本のACEを1つのDACLへ畳んで
 /// ノードあたり1回だけ書き、既存の子孫まで届かせる」側。`acl_grant`（何をどの主体へ許すかの
 /// 決定）とは触るものが違うので分けてある。**globで出さない**——`propagate_merged_dacl`という
 /// 名前は、それだけでは`set_dacl_propagating`との違いが分からないため。
 mod acl_dacl_write;
+mod acl_grant;
 /// 初回の救済walkを背景で回すジョブ（D-54）。**globではなく名前空間として公開する**
 /// ——`start`/`progress`/`wait_until_done`という短い名前は、それだけでは何のジョブか
 /// 分からないため（`grant_job::wait_until_done()`と書けば分かる）。
@@ -551,6 +551,7 @@ pub mod grant_job;
 /// ポリシーエディタのパス2が共有する（モジュールdoc参照）。
 mod launch;
 mod mcp_preflight;
+mod native_path_policy;
 /// fs passthrough付与の進捗（同期区間からUIへ届ける唯一の口、`grant_job`と同じ形）。
 pub mod passthrough_progress;
 mod preflight;
@@ -573,10 +574,13 @@ mod traverse;
 /// 「**どのcapability SID宛のACEを何本配るか**」という別の軸だからである
 /// （`docs/CODE-STRUCTURE-RULES.md`規則3）。
 mod workspace_aces;
+/// workspace capability ACE の準備本体。通常preflightと明示的な前払いCLIが共有する。
+mod workspace_prepare;
 
 pub use acl_grant::*;
 pub use launch::*;
 pub use mcp_preflight::*;
+pub use native_path_policy::*;
 pub use preflight::*;
 pub(crate) use preflight_probe::*;
 pub use revoke::*;
@@ -586,6 +590,10 @@ pub use spawn::*;
 pub use spawn_session::*;
 pub use traverse::*;
 pub use workspace_aces::*;
+pub use workspace_prepare::{
+    start_workspace_preparation, workspace_preparation_state, WorkspacePreparationLaunch,
+    WorkspacePreparationState,
+};
 
 // --- テスト群（実Win32・実AppContainerを使う重い回帰テストのため別ファイル） ---
 //
@@ -749,6 +757,20 @@ mod unc_reach_spike_tests;
 #[cfg(all(windows, test))]
 mod acl_baseline_cost_tests;
 
+/// workspace ACLの支払時点を比べる継続測定。作成時継承を無料と仮定せず、生成基準線・
+/// root ACE設置後の生成・完成後伝播をランダム順に反復する。**非昇格**。
+#[cfg(all(windows, test))]
+mod acl_payment_model_tests;
+
+/// 作成時継承案の適用範囲を、実git worktree・build生成物・move-in・保護DACL・reparse pointで
+/// 確認する真偽テスト。**非昇格**。
+#[cfg(all(windows, test))]
+mod acl_creation_inheritance_eligibility_tests;
+
+/// `harness fs prepare-workspace`が使う共有準備本体の実Win32回帰。**非昇格**。
+#[cfg(all(windows, test))]
+mod workspace_prepare_tests;
+
 /// **遅延実体化（JIT）でACEを1件ずつ配るときの1件あたり費用**
 /// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」1番）。
 /// 事前配布（§S12-1の86.5 µs/ノード）に対する損益分岐——「触る割合が何%を切れば
@@ -761,6 +783,13 @@ mod jit_grant_cost_tests;
 // どれも判定が出たので消した。**測り方と数字は`plans/mac-spike/RESULTS.md`が持つ**——
 // 作成時継承の限界費用（T-3＝§S18）・ハンドル手渡しの1件あたり（T-5＝§S20）・
 // 部分木を外したときの浮き（§S22）。復元が要るならこのコミットの親から取る。
+/// **Redirector DLLのフックが、成功するopen 1回へ上乗せする時間**（D-88の着手条件）。
+/// Lazy ACE fault-inはフックの無いDirectRwへフックを新設するので、払う相手は
+/// 「faultした回数」（§S21の実測で503件）ではなく**成功も含めた全openの回数**
+/// （同じく144,967〜218,841回）である。**非昇格で回し、ACEも台帳も1バイトも触らない**。
+/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+#[cfg(all(windows, test))]
+mod lazy_hook_overhead_tests;
 
 /// **制限SID（`SidsToRestrict`）を指定したトークンで非管理者のまま子を起こせるか**
 /// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」5番＝案A-3の前提）。
