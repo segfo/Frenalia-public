@@ -43,7 +43,7 @@ fn read_from_sandbox(sid: PSID, cwd: &Path, path: &Path) -> String {
         false,
         sid,
         NetworkCapability::Deny,
-        None,
+        super::RedirectorInject::default(),
         DomainIdentity::OwnPackage,
     )
     .expect("spawn AppContainer child");
@@ -240,7 +240,7 @@ fn e2e_mcp_servers_get_independent_egress_allowlists() {
         sid_a.as_psid(),
         // 実運用でnetworkを要求したサーバと同じ条件（capabilityは付くが、宛先はWFPが絞る）。
         NetworkCapability::InternetClient,
-        None,
+        super::RedirectorInject::default(),
         DomainIdentity::OwnPackage,
     )
     .expect("spawn AppContainer child for server A");

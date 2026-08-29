@@ -4,8 +4,80 @@
 //! **ここは境界ではない**（D-01）。境界はACLであり、このフック群は`--sandbox tier2a-cow`の透過性
 //! （workspaceがRO化されていてもツールがそのまま書けるように見せる）のためだけに存在する。
 //! フックが素通りしてもACLがfail-closeするので、失われるのは透過性だけである。
+//!
+//! # 2つのモードがある（[D-88（`plans/DESIGN-SANDBOX-APPPOLICY.md`）]）
+//!
+//! | モード | `cow_enabled` | openの前に何をするか |
+//! |---|---|---|
+//! | CoW（`--sandbox tier2a-cow`） | 真 | 分類して、書込は差分層へ誘導する |
+//! | DirectRw + lazy fault-in | 偽 | **何もしない。** 本来のopenを先に呼ぶ |
+//!
+//! **後者で分類を前に置いてはいけない。** `plans/mac-spike/RESULTS.md` §S25が実測した
+//! とおり、差分層の有無を見に行く分類は1 openあたり+28.3 µs（後ろに置けば+1.4 µs）で、
+//! §S21の回数（14.5万〜21.9万回）を掛けると**毎セッション4〜6秒**になる。消せるのは
+//! 初回の待ち（26万ノードで22.5秒）**だけ**なので、数セッションで元本を割る。
+//!
+//! fault-inの引き金は`NtCreateFile`・`NtOpenFile`・`NtQuery*AttributesFile`の**3つ**。
+//! `NtSetInformationFile`（rename/delete）と`NtClose`を引き金にしないのは、どちらも
+//! 「**既に開けたhandle**に対する操作」であって、開く前に割り込む余地が無いからである。
 
 use super::*;
+
+/// 拒否された1回のopenを、受付へ問い合わせて**1回だけ**やり直す。
+///
+/// # 「1回だけ」を型ではなくこの関数の形で固定している
+///
+/// `retry`は引数として渡された「もう一度呼ぶ手順」を**高々1回**しか呼ばない。再試行が
+/// 再び拒否されても、ここから再帰しない——設計書§5.1.3が
+/// 「1 openにつきbroker要求最大1回・元open再試行最大1回」を求めているのがこの形である。
+///
+/// 呼び出し側は**本来のopenを済ませてから**ここへ来ること（成功経路で呼ばない）。
+fn retry_once_after_fault_in<F>(cfg: &Config, oa: *const OBJECT_ATTRIBUTES, retry: F) -> Option<NTSTATUS>
+where
+    F: FnOnce() -> NTSTATUS,
+{
+    cfg.broker_pipe.as_ref()?;
+    // **ここで初めてパスを組む。** 成功経路には1バイトも載らない（§S25）。
+    let path = unsafe { object_attributes_path(oa) }?;
+    // **明らかにworkspace外なら往復しない。**
+    //
+    // PowerShellは起動の途中でSystem32やプロファイル配下を大量に開き、拒否されたものが
+    // ここへ来る（受入E2Eの実測で**1回の起動あたり92件**）。どれも受付が`Denied`を返すだけの
+    // 往復で、受付の行列と要求数の上限を無駄に食う。
+    //
+    // **これは最適化であって判定ではない。** 受付は届いた要求を必ず自分で検証し直す
+    // （`broker`のモジュールdoc「子の言うことを信じない」）ので、ここが緩くても厳しくても
+    // 権限は変わらない——**この枝が誤って弾いても、増えるのは1件の拒否であって権限ではない**。
+    // 判定が要る側ではないので、綴りの一致だけを見る粗い比較で足りる。
+    //
+    // 置き場所は**拒否された後**なので、§S25が禁じている「成功経路での分類」には当たらない。
+    if !is_inside(&path, &cfg.workspace_root) {
+        return None;
+    }
+    match request_fault_in(cfg, &path) {
+        // **`match`を`..`無しで全分岐書く。** 応答の種類が増えたときに、ここが
+        // コンパイルエラーになって「やり直すのか諦めるのか」を必ず決めさせる（`B-06`）。
+        FaultOutcome::Retry | FaultOutcome::RetryAnyway => Some(retry()),
+        FaultOutcome::GiveUp => None,
+    }
+}
+
+/// `path`が`root`配下（`root`自身を含む）か。**成分単位で、大文字小文字を無視して**比べる。
+///
+/// 文字列の`starts_with`だと`C:\ws`が`C:\ws-backup`に誤マッチする。ここは往復を省くための
+/// 粗い篩なので**誤って通す側は無害**（受付が断る）だが、**誤って弾く側は fault-in が
+/// 効かなくなる**ので、そちらへ倒れない書き方を選ぶ。
+fn is_inside(path: &Path, root: &Path) -> bool {
+    let comps = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    let path = comps(path);
+    let root = comps(root);
+    // rootが空（設定が壊れている）なら篩をかけない——**弾く側へ倒さない**。
+    root.is_empty() || (root.len() <= path.len() && root.iter().zip(&path).all(|(a, b)| a == b))
+}
 
 pub(crate) unsafe extern "system" fn hooked_nt_create_file(
     file_handle: *mut HANDLE,
@@ -21,6 +93,31 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
     ea_length: u32,
 ) -> NTSTATUS {
     if let Some(_guard) = ReentryGuard::try_acquire() {
+        // [D-88] DirectRwのlazyレーン: **本来のopenを先に呼び、拒否されてから初めて分類する。**
+        // 分類を前に置くと1 openあたり+28.3 µs（§S25、モジュールdoc）。
+        if let Some(cfg) = CONFIG.get().filter(|cfg| !cfg.cow_enabled) {
+            let hook = CREATE_FILE_HOOK.get().expect("hook installed");
+            let call = || unsafe {
+                hook.call(
+                    file_handle,
+                    desired_access,
+                    object_attributes,
+                    io_status_block,
+                    allocation_size,
+                    file_attributes,
+                    share_access,
+                    create_disposition,
+                    create_options,
+                    ea_buffer,
+                    ea_length,
+                )
+            };
+            let status = call();
+            if status != STATUS_ACCESS_DENIED {
+                return status;
+            }
+            return retry_once_after_fault_in(cfg, object_attributes, call).unwrap_or(status);
+        }
         if let (Some(cfg), Some(path)) = (CONFIG.get(), unsafe {
             object_attributes_path(object_attributes)
         }) {
@@ -309,6 +406,25 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
     // `NtOpenFile`はcreate dispositionを取らない（常に`FILE_OPEN`相当）ため、write intentは
     // desired_accessのみで判定する。既存ファイルの書込open（copy-up要）が主な対象。
     if let Some(_guard) = ReentryGuard::try_acquire() {
+        // [D-88] DirectRwのlazyレーン（`hooked_nt_create_file`と同じ形・同じ理由）。
+        if let Some(cfg) = CONFIG.get().filter(|cfg| !cfg.cow_enabled) {
+            let hook = OPEN_FILE_HOOK.get().expect("hook installed");
+            let call = || unsafe {
+                hook.call(
+                    file_handle,
+                    desired_access,
+                    object_attributes,
+                    io_status_block,
+                    share_access,
+                    open_options,
+                )
+            };
+            let status = call();
+            if status != STATUS_ACCESS_DENIED {
+                return status;
+            }
+            return retry_once_after_fault_in(cfg, object_attributes, call).unwrap_or(status);
+        }
         if let (Some(cfg), Some(path)) = (CONFIG.get(), unsafe {
             object_attributes_path(object_attributes)
         }) {
@@ -611,7 +727,11 @@ pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
     file_information_class: FILE_INFORMATION_CLASS,
 ) -> NTSTATUS {
     if let Some(_guard) = ReentryGuard::try_acquire() {
-        if let Some(cfg) = CONFIG.get() {
+        // [D-88] **DirectRwのlazyレーンでは何もしない。** ここはCoWの削除追跡と
+        // rename誘導だけで、差分層が無ければ行き先が無い。**fault-inの引き金にもしない**
+        // ——rename/deleteは「既に開けたhandleへの操作」で、開く前に割り込む余地が無い
+        // （モジュールdocの引き金の表）。
+        if let Some(cfg) = CONFIG.get().filter(|cfg| cfg.cow_enabled) {
             let handle_key = file_handle.0 as isize;
             if !file_information.is_null()
                 && (file_information_class == FileDispositionInformation
@@ -661,7 +781,9 @@ pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
 
 pub(crate) unsafe extern "system" fn hooked_nt_close(handle: HANDLE) -> NTSTATUS {
     if let Some(_guard) = ReentryGuard::try_acquire() {
-        if let Some(cfg) = CONFIG.get() {
+        // [D-88] CoWの台帳記録だけなので、lazyレーンでは何もしない
+        // （`hooked_nt_set_information_file`と同じ理由）。
+        if let Some(cfg) = CONFIG.get().filter(|cfg| cfg.cow_enabled) {
             let key = handle.0 as isize;
             let rel_opt = handle_paths().lock().unwrap().remove(&key);
             let was_pending = delete_pending().lock().unwrap().remove(&key);
@@ -683,6 +805,24 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_full_attributes_file(
     file_information: *mut windows::Wdk::Storage::FileSystem::FILE_NETWORK_OPEN_INFORMATION,
 ) -> NTSTATUS {
     if let Some(_guard) = ReentryGuard::try_acquire() {
+        // [D-88] **属性照会も引き金に含める**（着手条件6）。増分ビルドはここから始まる
+        // ——`cargo`・MSBuildは「入力は出力より新しいか」を全ファイルについて先に調べ、
+        // **そのあとで必要なものだけを開く**。含めないと最初の接触が拒否されたまま要求が
+        // 飛ばず、コマンドは再試行のないまま失敗する。
+        //
+        // **限界（設計書§5.1.3の着手条件6が挙げている2つ）**: (a) 祖先を通過できない場合など、
+        // 拒否が`ACCESS_DENIED`以外で返る経路がある。(b) 親ディレクトリの一覧権限で子の属性を
+        // 得る聞き方（`FindFirstFile`系）は子のDACLを見ないので、そもそもここへ来ない。
+        // **どちらも「効き目の大きさ」の話で、含める判断は変わらない。**
+        if let Some(cfg) = CONFIG.get().filter(|cfg| !cfg.cow_enabled) {
+            let hook = QUERY_FULL_ATTR_HOOK.get().expect("hook installed");
+            let call = || unsafe { hook.call(object_attributes, file_information) };
+            let status = call();
+            if status != STATUS_ACCESS_DENIED {
+                return status;
+            }
+            return retry_once_after_fault_in(cfg, object_attributes, call).unwrap_or(status);
+        }
         if let (Some(cfg), Some(path)) = (CONFIG.get(), unsafe {
             object_attributes_path(object_attributes)
         }) {
@@ -749,6 +889,18 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_attributes_file(
     file_information: *mut windows::Wdk::Storage::FileSystem::FILE_BASIC_INFORMATION,
 ) -> NTSTATUS {
     if let Some(_guard) = ReentryGuard::try_acquire() {
+        // [D-88] 属性照会の引き金（`hooked_nt_query_full_attributes_file`と同じ形・同じ理由）。
+        // **2つとも引き金にする**——`Test-Path`と`File.Exists`で降りる先が違うので、
+        // 片方だけだと片方のツールでfault-inが効かない（`B-01`: 対の片方だけにしない）。
+        if let Some(cfg) = CONFIG.get().filter(|cfg| !cfg.cow_enabled) {
+            let hook = QUERY_ATTR_HOOK.get().expect("hook installed");
+            let call = || unsafe { hook.call(object_attributes, file_information) };
+            let status = call();
+            if status != STATUS_ACCESS_DENIED {
+                return status;
+            }
+            return retry_once_after_fault_in(cfg, object_attributes, call).unwrap_or(status);
+        }
         if let (Some(cfg), Some(path)) = (CONFIG.get(), unsafe {
             object_attributes_path(object_attributes)
         }) {

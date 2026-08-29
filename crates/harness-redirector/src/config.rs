@@ -14,15 +14,27 @@ pub(crate) fn get_env(name: &str) -> Option<String> {
 /// 無限に読み進めない」ための安全弁。
 pub(crate) const CONFIG_BLOB_MAX_LEN: usize = 64 * 1024;
 
-/// 注入パラメータで運ぶ設定のシリアライズ（BUG-045のF2）。`\n`区切り3行・NUL終端のUTF-8:
+/// 注入パラメータで運ぶ設定のシリアライズ（BUG-045のF2）。`\n`区切り4行・NUL終端のUTF-8:
 ///
 /// ```text
-/// <workspace_root>\n<diff_layer_dir>\n<ext_capture_roots を ';' で連結>\0
+/// <workspace_root>\n<diff_layer_dir>\n<ext_capture_roots を ';' で連結>\n<broker_pipe>\0
 /// ```
 ///
-/// 環境変数（`HARNESS_COW_*`）と等価な情報を、**子孫プロセスのenv blockに依存せずに**
-/// 渡すための唯一の形式。途中の世代が自前のenv blockを組み立てて子を起動しても設定が
-/// 途切れないようにする（モジュールdoc「設定の伝播」参照）。
+/// 環境変数（`HARNESS_COW_*`・`HARNESS_LAZY_BROKER_PIPE`）と等価な情報を、
+/// **子孫プロセスのenv blockに依存せずに**渡すための唯一の形式。途中の世代が自前の
+/// env blockを組み立てて子を起動しても設定が途切れないようにする
+/// （モジュールdoc「設定の伝播」参照）。
+///
+/// # `cow_enabled`を載せない理由
+///
+/// **`diff_layer_dir`が空かどうかで決まる**ので、独立した値として運ぶと**2つの真実**に
+/// なる（`B-13`）。片方だけ書き換わった blob は「CoWを名乗るのに差分層が無い」という
+/// 復元不能な状態になり得るので、導出できるものは導出する。
+///
+/// # 4行目を足したときの後方互換
+///
+/// 3行しか無い blob（[D-88]より前の世代のDLLが作ったもの）は、4行目を空として読む
+/// ＝fault-in無しになる。**壊れるのではなく、機能が1つ無いだけ**に倒してある。
 pub(crate) fn serialize_config_blob(cfg: &Config) -> Vec<u8> {
     let ext = cfg
         .ext_capture_roots
@@ -31,10 +43,11 @@ pub(crate) fn serialize_config_blob(cfg: &Config) -> Vec<u8> {
         .collect::<Vec<_>>()
         .join(";");
     let mut bytes = format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}",
         cfg.workspace_root.to_string_lossy(),
         cfg.diff_layer_dir.to_string_lossy(),
-        ext
+        ext,
+        cfg.broker_pipe.as_deref().unwrap_or("")
     )
     .into_bytes();
     bytes.push(0);
@@ -68,7 +81,9 @@ pub(crate) unsafe fn deserialize_config_blob(param: *const u8) -> Option<Config>
 pub(crate) fn parse_config_blob(text: &str) -> Option<Config> {
     let mut lines = text.split('\n');
     let workspace_root = lines.next().filter(|s| !s.is_empty())?;
-    let diff_layer_dir = lines.next().filter(|s| !s.is_empty())?;
+    // [D-88] **差分層は空でもよい**（DirectRwのlazyレーンには差分層が無い）。
+    // 空なら`cow_enabled`が偽になり、誘導の枝は1つも通らない。
+    let diff_layer_dir = lines.next().unwrap_or("");
     let ext_capture_roots = lines
         .next()
         .unwrap_or("")
@@ -76,9 +91,18 @@ pub(crate) fn parse_config_blob(text: &str) -> Option<Config> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .collect();
+    let broker_pipe = lines.next().unwrap_or("").trim_end_matches('\0');
+    let cow_enabled = !diff_layer_dir.is_empty();
+    // CoWでもなく受付も無いなら、このDLLがやることは1つも無い。**成功したことにしない**
+    // ——フックだけ設置されて何もしない状態は、原因のたどりにくい遅さとして残る。
+    if !cow_enabled && broker_pipe.is_empty() {
+        return None;
+    }
     Some(Config {
         workspace_root: PathBuf::from(workspace_root),
         diff_layer_dir: PathBuf::from(diff_layer_dir),
+        cow_enabled,
+        broker_pipe: (!broker_pipe.is_empty()).then(|| broker_pipe.to_string()),
         ext_capture_roots,
     })
 }

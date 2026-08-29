@@ -158,6 +158,7 @@ use windows::Win32::System::IO::IO_STATUS_BLOCK;
 
 mod config;
 mod dir_merge;
+mod fault_in;
 mod file_hooks;
 mod init;
 mod inject;
@@ -169,6 +170,7 @@ mod state;
 
 use config::*;
 use dir_merge::*;
+use fault_in::*;
 use file_hooks::*;
 use inject::*;
 use ledger::*;
@@ -188,11 +190,55 @@ mod tests {
 
     /// BUG-045のF2: 注入パラメータで運ぶ設定ブロブが往復すること（env非依存の設定伝播）。
     /// ext_capture_rootsが空の場合・複数ある場合の両方を1関数で見る。
+    /// [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] **差分層が無く受付だけがある設定**が往復すること。
+    ///
+    /// これがDirectRwのlazyレーンの形で、`cow_enabled`が偽になることが要点である
+    /// ——ここが真になると、差分層の無い状態でCoWの誘導へ入り、workspace内のopenが
+    /// 全部おかしくなる。
+    #[test]
+    fn a_lazy_only_config_round_trips_and_reports_that_cow_is_off() {
+        let cfg = Config {
+            workspace_root: PathBuf::from(r"C:\ws\project"),
+            diff_layer_dir: PathBuf::new(),
+            cow_enabled: false,
+            broker_pipe: Some(r"\\.\pipe\harness-lazy-ace-broker-1-0-2".to_string()),
+            ext_capture_roots: Vec::new(),
+        };
+        let blob = serialize_config_blob(&cfg);
+        let parsed = unsafe { deserialize_config_blob(blob.as_ptr()) }.expect("parse");
+        assert_eq!(parsed.workspace_root, cfg.workspace_root);
+        assert!(!parsed.cow_enabled, "no diff layer means no CoW redirection");
+        assert_eq!(parsed.broker_pipe, cfg.broker_pipe);
+    }
+
+    /// **CoWでもなく受付も無い設定は受け取らない。**
+    ///
+    /// 受け取ってしまうと、フックだけ設置されて何もしないDLLが子の中で動く——
+    /// 原因のたどりにくい遅さとして残るだけである（`B-10`: 無言失敗を作らない）。
+    #[test]
+    fn a_config_with_neither_a_diff_layer_nor_a_broker_is_refused() {
+        assert!(
+            parse_config_blob("C:\\ws\n\n\n").is_none(),
+            "a config that asks for nothing must not be accepted as valid"
+        );
+    }
+
+    /// **[D-88]より前の3行blobは、fault-in無しとして読める**（後方互換）。
+    /// 壊れるのではなく機能が1つ無いだけ、に倒してある。
+    #[test]
+    fn a_three_line_blob_from_an_older_generation_still_parses_as_cow_without_fault_in() {
+        let parsed = parse_config_blob("C:\\ws\nC:\\diff\n").expect("an older blob must parse");
+        assert!(parsed.cow_enabled);
+        assert_eq!(parsed.broker_pipe, None);
+    }
+
     #[test]
     fn config_blob_round_trips_through_serialize_and_parse() {
         let cfg = Config {
             workspace_root: PathBuf::from(r"C:\ws\project"),
             diff_layer_dir: PathBuf::from(r"C:\diff_layer\abc"),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: vec![PathBuf::from(r"C:\ext one"), PathBuf::from(r"D:\ext2")],
         };
         let blob = serialize_config_blob(&cfg);
@@ -205,6 +251,8 @@ mod tests {
         let empty_ext = Config {
             workspace_root: PathBuf::from(r"C:\ws"),
             diff_layer_dir: PathBuf::from(r"C:\diff_layer"),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: Vec::new(),
         };
         let parsed = unsafe { deserialize_config_blob(serialize_config_blob(&empty_ext).as_ptr()) }
@@ -226,6 +274,8 @@ mod tests {
             let cfg = finalize_config(Config {
                 workspace_root: root.clone(),
                 diff_layer_dir: PathBuf::from(format!(r"\\?\{}\", diff_layer.path().to_string_lossy())),
+                cow_enabled: true,
+                broker_pipe: None,
                 ext_capture_roots: vec![PathBuf::from(r"\\?\D:\ext\")],
             });
             assert_eq!(cfg.workspace_root, PathBuf::from(r"C:\ws"), "root={root:?}");
@@ -246,6 +296,8 @@ mod tests {
         let cfg = finalize_config(Config {
             workspace_root: PathBuf::from("."),
             diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: Vec::new(),
         });
         assert_eq!(cfg.workspace_root, PathBuf::from("."));
@@ -261,6 +313,8 @@ mod tests {
         finalize_config(Config {
             workspace_root: PathBuf::from(r"C:\ws"),
             diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: Vec::new(),
         });
         assert_eq!(
@@ -353,6 +407,8 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: Vec::new(),
         };
         let ledger_path = diff_layer.path().join(COW_OPS_LEDGER_FILENAME);
@@ -422,6 +478,8 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: Vec::new(),
         };
 
@@ -443,6 +501,8 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: Vec::new(),
         };
 
@@ -468,6 +528,8 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: vec![capture_root.path().to_path_buf()],
         };
 
@@ -503,6 +565,8 @@ mod tests {
             let cfg = Config {
                 workspace_root: root.clone(),
                 diff_layer_dir: diff_layer.path().to_path_buf(),
+                cow_enabled: true,
+                broker_pipe: None,
                 ext_capture_roots: Vec::new(),
             };
             let classified = classify_target(&cfg, &target)
@@ -525,6 +589,8 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: Vec::new(),
         };
 
@@ -549,6 +615,8 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: Vec::new(),
         };
         for name in [
@@ -583,6 +651,8 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: Vec::new(),
         };
 
@@ -602,6 +672,8 @@ mod tests {
         let cfg = Config {
             workspace_root: workspace.path().to_path_buf(),
             diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
             ext_capture_roots: vec![outside.path().to_path_buf()],
         };
         let original = store::normalize_abs_path(&target.to_string_lossy());

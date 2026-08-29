@@ -106,6 +106,16 @@ pub enum AppContainerError {
     },
     #[error("appcontainer preflight failed: {0}")]
     Preflight(String),
+    /// [D-88（`plans/DESIGN-SANDBOX-APPPOLICY.md`）] Redirector DLLの注入か、resume前の
+    /// ハンドシェイクが失敗した。
+    ///
+    /// **`Win32`と分けているのは、呼び出し側の打つ手が違うからである。** この失敗は
+    /// **子がユーザーコードを1行も実行する前**に起きるので、子を捨てて作り直しても
+    /// 副作用が二重にならない——lazyレーンはこれを見て「全walkを待ってから**1回だけ**
+    /// 通常起動する」へ落ちる（設計書§5.1.3「起動と自動fallback」の3）。
+    /// 他の`Win32`失敗と混ぜると、その判定が文字列一致になる（`B-32`: 文言で分岐しない）。
+    #[error("redirector injection failed: {0}")]
+    RedirectorInjection(String),
     /// [BUG-107] **他プロセスのセッションに属するプロファイルを作ろうとした。**
     ///
     /// 作成点のfail-closed。ここで作ると台帳エントリを持たないプロファイルになり、
@@ -649,6 +659,11 @@ fn session_sid() -> OwnedContainerSid {
 /// （`docs/CODE-STRUCTURE-RULES.md`規則5: 同じヘルパーの写しを作らない）。
 #[cfg(all(windows, test))]
 pub(crate) mod test_support;
+
+/// [D-88（`plans/DESIGN-SANDBOX-APPPOLICY.md` §5.1.3）] Lazy ACE fault-inの**受入**。
+/// 「準備が届いていないファイルを、子が待たずに開けるか」を実子プロセスで測る。
+#[cfg(all(windows, test))]
+mod lazy_fault_in_acceptance_tests;
 
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;

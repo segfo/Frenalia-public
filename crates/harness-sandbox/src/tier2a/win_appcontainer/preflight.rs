@@ -687,7 +687,17 @@ pub fn preflight_with_privhelper_launcher(
     // workspaceへの継承ACEでは覆えない。共有package SIDだった頃はリポジトリrootへの継承ACEが
     // たまたま`target/debug/*.dll`まで届いていたが、セッションごとにSIDが変わる今は明示的に
     // 読取+実行を与える必要がある（無ければ注入が失敗し、境界＝ACLは効いたまま透過性だけが失われる）。
-    if matches!(write_mode, WorkspaceWriteMode::Cow { .. }) {
+    //
+    // [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] **条件は「CoWか」ではなく「DLLを注入するか」である。**
+    // lazyレーンはDirectRwの子にも同じDLLを注入するので、ここがCoW限定のままだと
+    // `LoadLibraryW`が対象プロセスでNULLを返し、**注入が必ず失敗する**——受入E2Eが実際に
+    // これで落ちた（`B-06`: 前提を変えたら、それを実現している経路を全部数える）。
+    let injects_redirector = matches!(write_mode, WorkspaceWriteMode::Cow { .. })
+        || matches!(
+            super::lazy_grant::lane(),
+            grant_job::PreparationLane::Lazy
+        );
+    if injects_redirector {
         for dll in redirector_dll_paths() {
             match grant_ace_inheritable_access(&dll, sid.as_psid(), FsAccess::ReadExec) {
                 Ok(()) => crate::tier2a::session_profile::record_granted_path(&dll),
@@ -1482,10 +1492,11 @@ pub fn preflight_with_privhelper_launcher(
             workspace: &canonical_workspace_root,
             mode: workspace_mode.as_str(),
             capability_generation: &capability_generation,
-            // [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] **既定のまま**。lazyレーンを選ぶ判定は
-            // 起動側（`launch`）が持つ——レーンを分けるかどうかは「この子を待たせるか」の
-            // 決定と同じものなので、決める場所を2つにしない。
-            lane: grant_job::PreparationLane::FullWalk,
+            // [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] レーンの選択は実験的probeが決める
+            // （既定は今日と同じ`FullWalk`）。**選ぶ場所はここ1つ**——`start`の時点で
+            // 決まらないと、走査器とfault受付を用意する側が間に合わない。
+            // 起動側（`launch`）は「受付が開いているか」だけを見て、決め直さない。
+            lane: super::lazy_grant::lane(),
         });
         timing.mark(&format!(
             "grant_job::start (background propagate + descendant fix-up, started={started})"

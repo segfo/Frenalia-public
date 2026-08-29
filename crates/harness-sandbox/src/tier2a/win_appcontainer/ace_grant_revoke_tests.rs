@@ -49,7 +49,7 @@ fn run_probe(sid: PSID, dir: &Path) {
         false,
         sid,
         NetworkCapability::Deny,
-        None,
+        super::RedirectorInject::default(),
         DomainIdentity::OwnPackage,
     )
     .expect("spawn should succeed even if the shell command itself fails inside");
@@ -76,7 +76,7 @@ fn run_probe_bool(sid: PSID, dir: &Path, command: &str) -> bool {
         false,
         sid,
         NetworkCapability::Deny,
-        None,
+        super::RedirectorInject::default(),
         DomainIdentity::OwnPackage,
     )
     .expect("spawn should succeed even if the shell command itself fails inside");
@@ -1620,7 +1620,7 @@ fn a_sandbox_cannot_reach_another_sessions_workspace() {
         false,
         sid_a.as_psid(),
         NetworkCapability::Deny,
-        None,
+        super::RedirectorInject::default(),
         DomainIdentity::OwnPackage,
     )
     .expect("spawn AppContainer child in session A");

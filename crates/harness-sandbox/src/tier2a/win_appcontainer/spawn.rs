@@ -382,6 +382,67 @@ pub struct CowInject<'a> {
     pub ext_capture_roots: &'a [PathBuf],
 }
 
+/// Redirector DLLを注入するかどうかと、注入するなら何を渡すか。
+///
+/// # なぜ`CowInject`と別に要るのか（[D-88（`plans/DESIGN-SANDBOX-APPPOLICY.md`）]）
+///
+/// **DLLの注入は長らく`--sandbox tier2a-cow`の専用機構だった**——注入するかどうかが
+/// 「CoWか」と同義だったので、`CowInject`が`Some`かどうかがそのまま注入の可否だった。
+/// D-88でDirectRw（`run_shell`の既定）にも注入する理由ができたため、
+/// **「注入するか」と「CoWか」を別の問いに割る**必要が出た。
+///
+/// ここが中立な名前なのはそのためで、CoWは**その中の1つの用途**に降りた。
+///
+/// # 既存の呼び出しを書き換えずに済ませてある
+///
+/// [`spawn_with_workspace`]は`impl Into<RedirectorInject>`を受けるので、
+/// これまでどおり`Option<CowInject>`を渡す呼び出し（実機テスト19箇所）はそのまま通る。
+/// **型を広げるために全呼び出しを書き換えると、書き換えの過程で意味が変わった箇所を
+/// 見落とす**（`safe-refactoring`の「無言で消えるもの」）ので、変換を1本置いて逃がしてある。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RedirectorInject<'a> {
+    /// DLLへ渡すworkspace root。**両モードで要る**——DLLはこれで「workspace内か」を
+    /// 判定する。`CowInject`も同じ値を持つが、**読むのはここ1つだけ**にしてある
+    /// （2箇所から読めると、CoWとlazyで違う綴りが届く形を作れてしまう、`B-13`）。
+    /// 変換（[`From`]）がCoW側から埋めるので、呼び出し側が二重に指定する余地は無い。
+    pub workspace_root: Option<&'a Path>,
+    /// CoWの誘導設定。`None`ならDirectRw（誘導しない＝フックは成功経路で何も判定しない）。
+    pub cow: Option<CowInject<'a>>,
+    /// [D-88] fault要求の受付パイプ名。`None`ならfault-inしない（今日と同じ挙動）。
+    pub broker_pipe: Option<&'a str>,
+}
+
+impl<'a> RedirectorInject<'a> {
+    /// [D-88] DirectRwのlazyレーン向けの構築。
+    pub fn lazy(workspace_root: &'a Path, broker_pipe: &'a str) -> Self {
+        Self {
+            workspace_root: Some(workspace_root),
+            cow: None,
+            broker_pipe: Some(broker_pipe),
+        }
+    }
+
+    /// 何か1つでも渡すものがあるか。**偽ならDLLを注入しない**——注入だけして何もしない
+    /// 状態を作らない（子の中で動くコードは、要らないなら存在しないのが最も安全である）。
+    ///
+    /// **workspace rootが無ければ注入しない。** DLLは何がworkspaceか分からないまま動けず、
+    /// 分からないまま動かすと「workspace外への書込が拒否された」ように見える形で
+    /// 全部が壊れる（BUG-066が実際にそう見えた）。
+    fn wanted(&self) -> bool {
+        self.workspace_root.is_some() && (self.cow.is_some() || self.broker_pipe.is_some())
+    }
+}
+
+impl<'a> From<Option<CowInject<'a>>> for RedirectorInject<'a> {
+    fn from(cow: Option<CowInject<'a>>) -> Self {
+        Self {
+            workspace_root: cow.map(|c| c.workspace_root),
+            cow,
+            broker_pipe: None,
+        }
+    }
+}
+
 /// Redirector DLLへ渡すルートパスの綴りを揃える（[BUG-066](../../../../docs/bugs/BUG-066.md)）。
 ///
 /// DLLは受け取った文字列で「このパスはworkspace配下か」を判定するため、`--cwd`の綴りが
@@ -526,7 +587,7 @@ pub fn spawn(
     want_stdin: bool,
     container_sid: PSID,
     net: NetworkCapability,
-    cow: Option<CowInject<'_>>,
+    cow: RedirectorInject<'_>,
     domain: DomainIdentity,
 ) -> Result<AppContainerChild, AppContainerError> {
     spawn_with_workspace(
@@ -560,7 +621,7 @@ pub fn spawn(
 /// 「このドメインが宣言したもの」だけを渡すこと。宣言していないcapabilityを混ぜると、
 /// §22.3.0.2の受け入れ条件（宣言したドメインだけがパスを見る）がその子について偽になる。
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_with_workspace(
+pub fn spawn_with_workspace<'a>(
     exe: &str,
     args: &[&str],
     cwd: &Path,
@@ -568,10 +629,12 @@ pub fn spawn_with_workspace(
     want_stdin: bool,
     container_sid: PSID,
     net: NetworkCapability,
-    cow: Option<CowInject<'_>>,
+    // [D-88] `Option<CowInject>`のままでも通る（[`RedirectorInject`]のdoc）。
+    inject: impl Into<RedirectorInject<'a>>,
     domain_caps: &[PSID],
     domain: DomainIdentity,
 ) -> Result<AppContainerChild, AppContainerError> {
+    let cow = inject.into();
     const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 
     // D-37: package SIDはセッションごとに変わるが、祖先ディレクトリのtraverse ACEは
@@ -642,7 +705,7 @@ fn spawn_impl(
     want_stdin: bool,
     container_sid: PSID,
     capabilities: &[SID_AND_ATTRIBUTES],
-    cow: Option<CowInject<'_>>,
+    cow: RedirectorInject<'_>,
     domain: DomainIdentity,
 ) -> Result<AppContainerChild, AppContainerError> {
     // どのWin32呼び出しが失敗したかをエラー文字列に残す（AppContainerの起動は失敗モードが
@@ -671,9 +734,11 @@ fn spawn_impl(
     // D-30（`--sandbox tier2a-cow`）: Redirector DLL初期化完了をLauncherへ知らせるための子側書込端。
     // `appcontainer_pipe`は既にpackage SIDへのACL付与を済ませているため、名前付きイベントを
     // 別途ACL構成するより既存の実績あるパイプ生成経路を再利用する（stdio 3本と同じ扱い）。
-    let ready_pipe = if cow.is_some() {
+    // [D-88] 条件は「CoWか」ではなく「**DLLを注入するか**」になった。DirectRwのlazyレーンも
+    // 同じresume前ハンドシェイクを通る（設計書§5.1.3「起動と自動fallback」の2）。
+    let ready_pipe = if cow.wanted() {
         let (r, w) = appcontainer_pipe(container_sid)
-            .map_err(|e| step("appcontainer_pipe(cow-ready)", e))?;
+            .map_err(|e| step("appcontainer_pipe(redirector-ready)", e))?;
         clear_inherit(r);
         Some((r, w))
     } else {
@@ -694,34 +759,44 @@ fn spawn_impl(
     // `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`（下記）で継承させるため、子プロセス内でも
     // 同一の数値のまま有効である（Windowsのハンドル継承の仕様）。
     let mut env_owned;
-    let env = if let (Some(c), Some((_, ready_write))) = (cow, &ready_pipe) {
+    let env = if let Some((_, ready_write)) = &ready_pipe {
         env_owned = env.to_vec();
+        // **workspaceの綴りは両モードで要る**（DLLはこれで「workspace内か」を判定する）。
         // BUG-066: 綴りを揃えてから渡す（`normalize_cow_root`のdoc参照）。
+        // `wanted()`が偽なら`ready_pipe`は`None`なのでここへ来ない＝必ず`Some`である。
+        let workspace = cow
+            .workspace_root
+            .expect("wanted() already required a workspace root");
         env_owned.push((
             "HARNESS_COW_WORKSPACE".to_string(),
-            normalize_cow_root(c.workspace_root)
-                .to_string_lossy()
-                .into_owned(),
+            normalize_cow_root(workspace).to_string_lossy().into_owned(),
         ));
-        env_owned.push((
-            "HARNESS_COW_DIFF_LAYER".to_string(),
-            normalize_cow_root(c.diff_layer_dir)
-                .to_string_lossy()
-                .into_owned(),
-        ));
+        // [D-88] **差分層はCoWのときだけ渡す。** 渡さないことが、DLL側で
+        // 「`cow_enabled`が偽」＝成功経路で何も判定しない、の根拠になる（§S25）。
+        if let Some(c) = cow.cow {
+            env_owned.push((
+                "HARNESS_COW_DIFF_LAYER".to_string(),
+                normalize_cow_root(c.diff_layer_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+            if !c.ext_capture_roots.is_empty() {
+                let joined = c
+                    .ext_capture_roots
+                    .iter()
+                    .map(|p| normalize_cow_root(p).to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(";");
+                env_owned.push(("HARNESS_COW_EXT_ROOTS".to_string(), joined));
+            }
+        }
+        if let Some(pipe) = cow.broker_pipe {
+            env_owned.push(("HARNESS_LAZY_BROKER_PIPE".to_string(), pipe.to_string()));
+        }
         env_owned.push((
             "HARNESS_COW_READY_HANDLE".to_string(),
             (ready_write.0 as usize).to_string(),
         ));
-        if !c.ext_capture_roots.is_empty() {
-            let joined = c
-                .ext_capture_roots
-                .iter()
-                .map(|p| normalize_cow_root(p).to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(";");
-            env_owned.push(("HARNESS_COW_EXT_ROOTS".to_string(), joined));
-        }
         &env_owned
     } else {
         env
@@ -967,7 +1042,16 @@ fn spawn_impl(
         // 注入または初期化確認に失敗した場合、対象プロセスを終了する（fail-close、
         // §10.2既定・§25.1）。workspace本体はACLで既にRO付与済みのため、この失敗パスは
         // 「透過リダイレクトが効かないまま起動を許す」ことはない——単に起動自体を拒否する。
-        if let Some(c) = cow {
+        //
+        // [D-88] **DirectRwのlazyレーンも同じ窓を通る。** ただし失敗の意味が違う——
+        // CoWでは透過が丸ごと壊れるので起動を拒む必要があるが、lazyでは失われるのは
+        // 速さだけである。**そのぶんの判断は呼び出し側（`launch`）が持つ**：ここは
+        // どちらでも「子を殺してErrを返す」に統一し、lazyの呼び出し側がそのErrを見て
+        // 全walkを待ってから通常起動へ落とす（設計書§5.1.3「起動と自動fallback」の3。
+        // resume前なので子はユーザーコードを1行も実行しておらず、作り直しても副作用が
+        // 二重にならない）。
+        {
+            let workspace_for_error = cow.workspace_root;
             if let Some((ready_read, _)) = ready_pipe {
                 let inject_result: Result<(), AppContainerError> =
                     inject_redirector(process_info.hProcess).and_then(|()| {
@@ -985,9 +1069,9 @@ fn spawn_impl(
                     if let Some(w) = stdin_write {
                         let _ = CloseHandle(w);
                     }
-                    return Err(AppContainerError::Win32(format!(
-                        "cow redirector injection failed for workspace {}: {e}",
-                        c.workspace_root.display()
+                    return Err(AppContainerError::RedirectorInjection(format!(
+                        "redirector injection failed for workspace {}: {e}",
+                        workspace_for_error.unwrap_or(Path::new("<unknown>")).display()
                     )));
                 }
             }

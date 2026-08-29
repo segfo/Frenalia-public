@@ -184,7 +184,7 @@ fn ps_in_container_with_net(
         false,
         container_sid,
         net,
-        None,
+        super::RedirectorInject::default(),
         DomainIdentity::OwnPackage,
     )
     .expect("spawn powershell inside the spike AppContainer");
@@ -1248,7 +1248,7 @@ Write-Output 'DONE=1'
         false,
         sid.as_psid(),
         NetworkCapability::Deny,
-        None,
+        super::RedirectorInject::default(),
         DomainIdentity::OwnPackage,
     )
     .expect("spawn powershell inside the spike AppContainer");
@@ -2959,7 +2959,7 @@ fn n6_does_deleting_the_blob_revoke_trust() {
         false,
         sid.as_psid(),
         NetworkCapability::Deny,
-        None,
+        super::RedirectorInject::default(),
         DomainIdentity::OwnPackage,
     )
     .expect("spawn the long-lived probe inside the spike AppContainer");

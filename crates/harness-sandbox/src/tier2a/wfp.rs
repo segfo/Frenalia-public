@@ -1318,7 +1318,7 @@ mod tests {
             false,
             sid.as_psid(),
             crate::tier2a::win_appcontainer::NetworkCapability::InternetClient,
-            None,
+            crate::tier2a::win_appcontainer::RedirectorInject::default(),
             crate::tier2a::win_appcontainer::DomainIdentity::OwnPackage,
         )
         .expect("spawn AppContainer child");

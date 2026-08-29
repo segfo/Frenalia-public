@@ -66,13 +66,19 @@ pub(crate) unsafe fn resolve_config(param: *const u8) -> Option<Config> {
             return None;
         }
     };
-    let diff_layer_dir = match get_env("HARNESS_COW_DIFF_LAYER") {
-        Some(v) => PathBuf::from(v),
-        None => {
-            debug_log("init: HARNESS_COW_DIFF_LAYER not set, bail");
-            return None;
-        }
-    };
+    // [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] **差分層は必須ではなくなった。**
+    // DirectRwのlazyレーンには差分層が無く、受付パイプだけがある。
+    let diff_layer_dir = get_env("HARNESS_COW_DIFF_LAYER")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let broker_pipe = get_env("HARNESS_LAZY_BROKER_PIPE");
+    let cow_enabled = !diff_layer_dir.as_os_str().is_empty();
+    if !cow_enabled && broker_pipe.is_none() {
+        // CoWでもなく受付も無い＝このDLLがやることは無い。**成功にしない**
+        // （`parse_config_blob`と同じ判断。理由はあちらのコメント）。
+        debug_log("init: neither a diff layer nor a fault broker was given, bail");
+        return None;
+    }
     // Phase 3（設計書§19.8）: `;`区切りのDOS形式絶対パス一覧。空文字列要素は無視する
     // （`get_env`が空文字列全体は既に`None`扱いにするが、"C:\a;;C:\b"のような中間の
     // 空要素を防御的に無視する）。
@@ -90,6 +96,8 @@ pub(crate) unsafe fn resolve_config(param: *const u8) -> Option<Config> {
     Some(finalize_config(Config {
         workspace_root,
         diff_layer_dir,
+        cow_enabled,
+        broker_pipe,
         ext_capture_roots,
     }))
 }
@@ -108,7 +116,15 @@ pub(crate) fn finalize_config(cfg: Config) -> Config {
     let normalize = |p: &Path| PathBuf::from(normalize_root_spelling(&p.to_string_lossy()));
     let cfg = Config {
         workspace_root: normalize(&cfg.workspace_root),
-        diff_layer_dir: normalize(&cfg.diff_layer_dir),
+        // 空の差分層を`normalize`へ通すと空でなくなり得るので、空はそのまま空にする
+        // （空であることが`cow_enabled`の根拠なので、綴りの正規化で崩してはいけない）。
+        diff_layer_dir: if cfg.diff_layer_dir.as_os_str().is_empty() {
+            PathBuf::new()
+        } else {
+            normalize(&cfg.diff_layer_dir)
+        },
+        cow_enabled: cfg.cow_enabled,
+        broker_pipe: cfg.broker_pipe,
         ext_capture_roots: cfg.ext_capture_roots.iter().map(|p| normalize(p)).collect(),
     };
     if !cfg.workspace_root.is_absolute() {

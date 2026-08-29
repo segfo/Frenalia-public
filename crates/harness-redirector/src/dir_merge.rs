@@ -322,7 +322,9 @@ pub(crate) unsafe fn try_merged_dir_query(
     restart_scan: bool,
 ) -> Option<NTSTATUS> {
     let _guard = ReentryGuard::try_acquire()?;
-    let cfg = CONFIG.get()?;
+    // [D-88] ディレクトリのマージはCoW専用（差分層と本体層の2つを重ねて見せる処理）。
+    // DirectRwのlazyレーンには重ねる相手が無いので、素通しする。
+    let cfg = CONFIG.get().filter(|cfg| cfg.cow_enabled)?;
     let handle_key = file_handle.0 as isize;
     let rel_str = handle_paths().lock().unwrap().get(&handle_key).cloned()?;
     if !dir_merge::is_supported_class(file_information_class) {

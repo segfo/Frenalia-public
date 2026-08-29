@@ -39,7 +39,7 @@ use std::path::PathBuf;
 
 use super::{
     ensure_profile, grant_job, resolve_shell, spawn_with_workspace, AppContainerChild,
-    AppContainerError, CowInject, DomainIdentity, NetworkCapability,
+    AppContainerError, CowInject, DomainIdentity, NetworkCapability, RedirectorInject,
 };
 
 /// Tier2aでシェルを起こすための入力一式。
@@ -165,27 +165,73 @@ pub fn spawn_shell_in_workspace(
     domain_caps.extend(fs_allow_caps.iter().map(|cap| cap.as_psid()));
     domain_caps.extend(cow_diff_layer_cap.iter().map(|cap| cap.as_psid()));
 
+    // 起こす手順は**注入するものを除いて同一**なので、1つのクロージャに畳む。2回書くと、
+    // 片方だけ引数が変わっても誰も気付けない（`B-05`: コンパイラが守らない複製）。
+    let spawn = |inject: RedirectorInject<'_>| {
+        spawn_with_workspace(
+            &bin,
+            &args,
+            &req.cwd,
+            &req.env,
+            true,
+            sid.as_psid(),
+            req.net_capability,
+            inject,
+            &domain_caps,
+            // §22.1.1: このシェルのドメインはworkspace＋モード単位のcapability（D-54）。
+            // traverse capabilityは全Tier2a子が共有するので**ドメインの識別子にしてはいけない**。
+            DomainIdentity::Capability(workspace_cap.as_psid()),
+        )
+    };
+
+    // [D-88（`plans/DESIGN-SANDBOX-APPPOLICY.md` §5.1.3）] **ここが「待つ条件」である。**
+    //
+    // これまでは無条件に「背景ジョブが最後まで終わったか」を待っていた。それは
+    // 「**このコマンドが要るものが開けるか**」ではないので、要るファイルへ先に許可を
+    // 付けても解放されない——だから待ちを足すのではなく、**待つ条件そのものを外す**。
+    //
+    // 外してよいのは、外した先に**要るものが要った瞬間に開く**仕掛けがあるときだけである。
+    // その仕掛け＝fault受付が今このworkspaceに開いているかを、`lazy_broker_pipe_for`が答える
+    // （`None`なら開いていない＝今日と同じく待つ）。
+    if let Some(pipe) = lazy_lane_pipe(&req, &canonical_workspace) {
+        match spawn(RedirectorInject::lazy(&canonical_workspace, &pipe)) {
+            Ok(child) => return Ok((child, shell_label)),
+            // resume**前**の失敗（注入・ハンドシェイク）。子はユーザーコードを1行も
+            // 実行していないので、破棄して**1回だけ**通常起動へ落ちる（設計書
+            // 「起動と自動fallback」の3）。ここで諦めると、レーンの不調が
+            // **コマンドの失敗**に化ける——lazyで失われるのは速さだけのはずである。
+            Err(AppContainerError::RedirectorInjection(_)) => {}
+            // それ以外（起動そのものの失敗）は再試行しない。作り直しても同じである。
+            Err(e) => return Err(e),
+        }
+    }
+
     // D-54: 初回起動では、保護DACL配下を救済するwalkが背景で走っていることがある。終わる前に
     // コマンドを走らせると、その配下がモデルには「存在しない/読めない」と見え、原因不明の
     // 失敗になる。完了を待ち、walkが失敗していたら断る（fail-closed、`grant_job`のdoc）。
     // 走っていなければ即座に返るので、2回目以降の起動では何のコストも無い。
     grant_job::wait_until_done().map_err(AppContainerError::Preflight)?;
 
-    let child = spawn_with_workspace(
-        &bin,
-        &args,
-        &req.cwd,
-        &req.env,
-        true,
-        sid.as_psid(),
-        req.net_capability,
-        cow,
-        &domain_caps,
-        // §22.1.1: このシェルのドメインはworkspace＋モード単位のcapability（D-54）。
-        // traverse capabilityは全Tier2a子が共有するので**ドメインの識別子にしてはいけない**。
-        DomainIdentity::Capability(workspace_cap.as_psid()),
-    )?;
+    let child = spawn(cow.into())?;
     Ok((child, shell_label))
+}
+
+/// [D-88] このコマンドをlazyレーンで起こしてよいなら、fault受付パイプの名前を返す。
+///
+/// # 条件は2つだけである
+///
+/// 1. **`--sandbox tier2a-cow`ではない。** CoWとの合成（workspaceへのread/execだけを
+///    fault-inし、write/deleteは差分層へ向ける）は設計にあるが**まだ実装していない**——
+///    CoWのフックは成功経路で差分層を見に行く形のままなので、受付だけ渡しても使われない。
+///    **渡さないことで、使われない設定が子へ届くのを防ぐ**（`B-14`と同じ姿勢: 記録の存在で
+///    実体の存在を代替しない）。
+/// 2. **このworkspaceにfault受付が今開いている。** 開いているのは準備中の間だけなので、
+///    2回目以降の起動（`ready`）や既定レーンでは`None`になり、従来の経路へ落ちる。
+fn lazy_lane_pipe(req: &WorkspaceSpawn, canonical_workspace: &std::path::Path) -> Option<String> {
+    if req.cow_diff_layer_dir.is_some() {
+        return None;
+    }
+    grant_job::lazy_broker_pipe_for(canonical_workspace, req.workspace_mode())
 }
 
 #[cfg(test)]

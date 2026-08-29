@@ -78,6 +78,14 @@ const PRODUCTION_ENV_VARS: &[(&str, &str)] = &[
         "起動側 → Redirector DLL: 準備完了を知らせるイベントのハンドル",
     ),
     (
+        "HARNESS_LAZY_BROKER_PIPE",
+        "起動側 → Redirector DLL: 拒否されたopenを問い合わせるfault受付パイプの名前（D-88）",
+    ),
+    (
+        "HARNESS_TIER2A_LAZY_ACE",
+        "Lazy ACE fault-inレーンを有効にする実験的スイッチ（D-88。既定は無効で、受入を満たして既定へ上げたら消す）",
+    ),
+    (
         "HARNESS_PROBE_DIR",
         "preflight → プローブ子プロセス: 実FS I/Oを試す作業ディレクトリ",
     ),

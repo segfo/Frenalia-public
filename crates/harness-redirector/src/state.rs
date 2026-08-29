@@ -168,7 +168,24 @@ pub(crate) const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;
 
 pub(crate) struct Config {
     pub(crate) workspace_root: PathBuf,
+    /// CoWの差分層。**`cow_enabled`が偽のときは空**（[D-88（`DESIGN-SANDBOX-APPPOLICY.md`）]の
+    /// DirectRwレーンには差分層が無い）。空のまま誘導へ使わないよう、参照する箇所は
+    /// すべて`cow_enabled`の内側に置くこと。
     pub(crate) diff_layer_dir: PathBuf,
+    /// CoWの誘導（書込のcopy-up・読取のread-through・ディレクトリのマージ）を行うか。
+    ///
+    /// **偽のとき、フックは成功経路で何も判定しない。** これは費用の要求である
+    /// （`plans/mac-spike/RESULTS.md` §S25の実測: 差分層の有無を見に行く分類を
+    /// openの前に置くと1回あたり+28.3 µs、後ろに置けば+1.4 µs。§S21の回数を掛けると
+    /// **毎セッション4〜6秒 対 0.2〜0.3秒**で、消せるのは初回の待ちだけなので
+    /// 前者だと数セッションで元本を割る）。**CoWの分類をDirectRwへ持ち込まないこと。**
+    pub(crate) cow_enabled: bool,
+    /// [D-88] fault要求の受付パイプ名。`Some`のとき、`ACCESS_DENIED`で返ったopenを
+    /// **1回だけ**やり直す（`fault_in`）。`None`なら何もしない（今日と同じ挙動）。
+    ///
+    /// **名前は秘密ではない**（子から`\\.\pipe\`の一覧は取れる）。守るのはパイプのDACLで、
+    /// これを知っていても capability SID を積んでいない子は接続すらできない。
+    pub(crate) broker_pipe: Option<String>,
     /// Phase 3（設計書§19.8）: `--fs-allow <path>:rw`で実際にACE付与できたworkspace外RW穴の
     /// ルート一覧（DOS形式、正規化前）。ここに含まれるパスへの書込は、workspace内と同じ
     /// `_ext/<key>`経由の操作台帳captureの対象になる（境界＝ACLはfs-allowが既に張っている、

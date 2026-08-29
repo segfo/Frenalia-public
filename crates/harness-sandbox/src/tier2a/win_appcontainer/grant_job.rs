@@ -366,17 +366,25 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
         list.push((key, Arc::clone(&state)));
     }
     crate::tier2a::workspace_capability::mark_tree_preparing(workspace, mode);
+
+    // [D-88] **lazyレーンの受付は`start`が返る前に開く。**
+    //
+    // 背景スレッドの中で開くと、`preflight`（＝`start`の呼び出し元）が返った直後に
+    // `run_shell`が来たとき、`lazy_broker_pipe_for`がまだ`None`を返す窓ができる。その窓に
+    // 入ったコマンドは**レーンがあるのに従来どおり待つ**——受入E2Eが実際にこれで落ちた
+    // （`B-18`: 確認と作成を不可分にする）。
+    let lazy = match lane {
+        PreparationLane::Lazy => Some(LazyLanePrep::open(root, &ace_grants, &skip, &state)),
+        PreparationLane::FullWalk => None,
+    };
+
     let root = root.to_path_buf();
     let workspace = workspace.to_path_buf();
     let mode = mode.to_string();
     std::thread::spawn(move || {
-        let result = match lane {
-            PreparationLane::FullWalk => {
-                run_full_walk_lane(&root, &ace_grants, &protect_sids, &skip, &state)
-            }
-            PreparationLane::Lazy => {
-                run_lazy_lane(&root, &ace_grants, &protect_sids, &skip, &state)
-            }
+        let result = match lazy {
+            None => run_full_walk_lane(&root, &ace_grants, &protect_sids, &skip, &state),
+            Some(lazy) => run_lazy_lane(&root, lazy, &protect_sids, &skip, &state),
         };
         // **成否の記録はここ1箇所**（`B-02`: 2つのレーンで書き方が割れると、片方だけ
         // 台帳へ残らない形になる）。**失敗を台帳へ残す**理由はD-85——残さないと次回の起動は
@@ -496,34 +504,15 @@ fn run_full_walk_lane(
 /// 同じ数字を同じ意味で読むと、健全な状態を退化と読み違える。
 fn run_lazy_lane(
     root: &Path,
-    ace_grants: &[super::OwnedAceGrant],
+    lazy: LazyLanePrep,
     protect_sids: &[OwnedSid],
     skip: &[PathBuf],
     state: &Arc<JobState>,
 ) -> Result<(), String> {
+    let LazyLanePrep { mut writer, broker } = lazy;
     protect_control_dir(root, protect_sids, state)?;
 
     state.phase.store(PHASE_SCANNING, Ordering::Relaxed);
-    let mut writer =
-        super::lazy_grant::writer::AclWriter::start(root.to_path_buf(), ace_grants.to_vec());
-
-    // fault受付を開く。**走査より先に開く**——走査の1件目より前に子が奥のファイルを
-    // 開くことは普通に起こるので、受付が後だとその窓のfaultが取りこぼされる。
-    //
-    // **開けなくてもレーンは続ける。** 受付が無ければ子は割り込めないが、走査は進むので
-    // 準備は完了する（遅いだけで壊れない）。ここで`Err`にすると、faultの受付が
-    // 作れないという可用性の問題が**ツリー全体の準備失敗**に化ける。
-    let broker = match open_broker(root, ace_grants, skip, writer.handle()) {
-        Ok(broker) => {
-            *state.broker_pipe.lock().unwrap() = Some(broker.pipe_name().to_string());
-            // **開いた時点で`Some(0)`にする。** 完了時にまとめて入れると、走査中はずっと
-            // `None`＝「受付が無い」に見え、`None`と`Some(0)`の区別（`B-35`）が
-            // 肝心の走査中だけ効かない。
-            *state.broker_faults_served.lock().unwrap() = Some(0);
-            Some(broker)
-        }
-        Err(_) => None,
-    };
 
     let control = ScanProgress {
         state: Arc::clone(state),
@@ -588,6 +577,41 @@ fn run_lazy_lane(
         ));
     }
     Ok(())
+}
+
+/// [D-88] lazyレーンの道具立て。**`start`が同期的に組んで、背景スレッドへ渡す。**
+///
+/// スレッドの中で組むと、受付の名前が公開されるまでの窓ができる（[`start`]のコメント）。
+struct LazyLanePrep {
+    writer: super::lazy_grant::writer::AclWriter,
+    /// 受付。**開けなくてもレーンは続ける**——受付が無ければ子は割り込めないが、走査は
+    /// 進むので準備は完了する（遅いだけで壊れない）。ここを`Err`で止めると、
+    /// 受付を作れないという可用性の問題が**ツリー全体の準備失敗**に化ける。
+    broker: Option<super::lazy_grant::broker::Broker>,
+}
+
+impl LazyLanePrep {
+    fn open(
+        root: &Path,
+        ace_grants: &[super::OwnedAceGrant],
+        skip: &[PathBuf],
+        state: &Arc<JobState>,
+    ) -> Self {
+        let writer =
+            super::lazy_grant::writer::AclWriter::start(root.to_path_buf(), ace_grants.to_vec());
+        let broker = match open_broker(root, ace_grants, skip, writer.handle()) {
+            Ok(broker) => {
+                *state.broker_pipe.lock().unwrap() = Some(broker.pipe_name().to_string());
+                // **開いた時点で`Some(0)`にする。** 完了時にまとめて入れると、走査中はずっと
+                // `None`＝「受付が無い」に見え、`None`と`Some(0)`の区別（`B-35`）が
+                // 肝心の走査中だけ効かない。
+                *state.broker_faults_served.lock().unwrap() = Some(0);
+                Some(broker)
+            }
+            Err(_) => None,
+        };
+        Self { writer, broker }
+    }
 }
 
 /// lazyレーンのfault受付を開く。**受け付ける範囲は走査と同じ集合から作る**
