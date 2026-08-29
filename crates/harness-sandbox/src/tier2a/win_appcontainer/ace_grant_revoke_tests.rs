@@ -1125,6 +1125,9 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
         workspace: &root,
         mode: "rwx",
         capability_generation: "test-generation",
+        // このテストが測っているのは**既定レーン**の完了待ちである（D-88のlazyレーンは
+        // `grant_job_lane_tests`が別に測る）。
+        lane: grant_job::PreparationLane::FullWalk,
     });
     if !started {
         eprintln!(

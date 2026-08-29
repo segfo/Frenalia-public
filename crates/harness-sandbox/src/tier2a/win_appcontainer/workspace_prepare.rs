@@ -91,6 +91,11 @@ impl WorkspacePreparationPlan {
             workspace: &self.canonical_workspace,
             mode: self.mode.as_str(),
             capability_generation: &self.capability_generation,
+            // [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] 明示準備CLI（`harness fs
+            // prepare-workspace`）は**常に既定のレーン**である。lazyレーンが在る理由は
+            // 「コマンドを待たせないこと」で、ここには待たせる相手が居ない——待つのが
+            // 目的の入口なので、総処理量が増えるレーンを選ぶ理由が無い。
+            lane: super::grant_job::PreparationLane::FullWalk,
         })
     }
 }

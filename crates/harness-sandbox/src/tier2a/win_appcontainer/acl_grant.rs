@@ -343,7 +343,7 @@ pub fn with_restore_privilege<T>(f: impl FnOnce() -> T) -> T {
 /// `a`（対象パス）が`base`配下（`base`自身を含む）かを大文字小文字無視で判定する。
 /// 双方canonicalize済みを前提とし、パス成分単位で比較する（文字列の`starts_with`だと
 /// `C:\Windows`が`C:\WindowsApps`に誤マッチするため成分比較にする）。
-fn path_is_within(a: &Path, base: &Path) -> bool {
+pub(crate) fn path_is_within(a: &Path, base: &Path) -> bool {
     let comps = |p: &Path| -> Vec<String> {
         p.components()
             .map(|c| c.as_os_str().to_string_lossy().to_lowercase())

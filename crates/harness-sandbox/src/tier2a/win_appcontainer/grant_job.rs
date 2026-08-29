@@ -83,10 +83,36 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 /// 再保護）なので中間進捗が取れず、`done`/`total`は0のまま——TUIステータスバーは既に
 /// `total==0`を「準備中」と表示する分岐を持つため、フェーズ名だけをここへ足す。
 /// `Walking`は既存の`fix_descendants_missing_ace`の進捗（`done`/`total`）をそのまま使う。
+///
+/// [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] `Scanning`はlazyレーンの走査器
+/// （[`super::lazy_grant`]）。**母数を先に数えないので`total`は0のまま**進む
+/// ——streaming列挙が「全部数え終わってから配り始める」のをやめた段そのものなので、
+/// ここで母数を出すには走査を2周することになる。`total==0`の表示分岐は既にある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobPhase {
     Propagating,
     Walking,
+    Scanning,
+}
+
+/// この背景ジョブがどちらの形でツリーを準備するか。
+///
+/// **既定は[`Self::FullWalk`]（今日と同じ挙動）。** lazyレーンは実験的probeの内側にあり、
+/// 不成立なら自動でこちらへ戻る（設計書§5.1.3「検証と昇格条件」）。
+///
+/// # なぜ2つ在るのか（どちらかに寄せない理由）
+///
+/// [`Self::FullWalk`]は**1回のOS呼び出しで既存の子孫へ配る**ので総処理量が小さい。
+/// [`Self::Lazy`]はノードごとに明示ACEを書くので**総処理量は増える**が、
+/// **途中に割り込みを入れられる**（単一のOS伝播は中断も優先度変更もできない）。
+/// 設計はこの交換を承知のうえで「総完了時間は悪化を許容し、記録だけ残す」と決めている
+/// ——利用者が待つのは自分が要求したものが開くまでの時間だけになるからである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparationLane {
+    /// 伝播（フェーズ0）→ `.harness/`再保護（0.5）→ 救済walk（1）。**既定。**
+    FullWalk,
+    /// `.harness/`再保護 → 走査器＋単一writer（[`super::lazy_grant`]）。
+    Lazy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +179,13 @@ impl harness_core::tool::WaitReason for WorkspaceAclWaitReason {
         // `total == 0`（母数が未確定・伝播段のように中間進捗が無い）で件数を出さない判定は
         // **この1箇所だけ**が持つ。表示面ごとに`> 0`のガードを書かせない（B-02）。
         let (description, label) = match p.phase {
+            // [D-88] lazyレーンの走査は**背景**である。ここが`Blocking`と同じ文面で出ると、
+            // 「待たされている」と読める——待っていないことがレーンの目的なので、文面を分ける。
+            JobPhase::Scanning => (
+                "ワークスペースへSandbox用ACLを背景で適用中（コマンドは待っていません）"
+                    .to_string(),
+                format!("workspace ACL 準備中 (背景 {} ノード)", p.done),
+            ),
             JobPhase::Propagating => (
                 "実行ブロック中: 初回起動時中のため、ワークスペースへSandbox用ACLの適用中"
                     .to_string(),
@@ -199,6 +232,8 @@ struct JobState {
 }
 
 const PHASE_WALKING: u8 = 1;
+/// [D-88] lazyレーンの走査段。
+const PHASE_SCANNING: u8 = 2;
 
 /// [`JOBS`]の1エントリ（ジョブの鍵と状態）。
 type JobEntry = (String, Arc<JobState>);
@@ -272,6 +307,10 @@ fn job_key(workspace: &Path, mode: &str, capability_generation: &str) -> String 
 /// **`capability_generation`は合流の鍵である**（D-85）。同じworkspace＋モードでも、capabilityの
 /// 世代が変われば主体そのものが別のSIDになるので、**前の世代のジョブが走っていることを理由に
 /// 新しい世代の準備を飛ばしてはならない**。[`job_key`]がこの3つ組で1本を決める。
+///
+/// **`lane`は既定で[`PreparationLane::FullWalk`]**（今日と同じ挙動）。[`PreparationLane::Lazy`]は
+/// [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）]のレーンで、走査の途中に割り込みを入れられる形
+/// である代わりに総処理量が増える。
 pub(crate) struct GrantJobRequest<'a> {
     pub(crate) root: &'a Path,
     pub(crate) ace_grants: Vec<super::OwnedAceGrant>,
@@ -280,6 +319,7 @@ pub(crate) struct GrantJobRequest<'a> {
     pub(crate) workspace: &'a Path,
     pub(crate) mode: &'a str,
     pub(crate) capability_generation: &'a str,
+    pub(crate) lane: PreparationLane,
 }
 
 #[must_use = "false means the job was not started (another one already claimed this process)"]
@@ -292,6 +332,7 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
         workspace,
         mode,
         capability_generation,
+        lane,
     } = request;
     let key = job_key(workspace, mode, capability_generation);
     let state = Arc::new(JobState::default());
@@ -307,82 +348,20 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
     let workspace = workspace.to_path_buf();
     let mode = mode.to_string();
     std::thread::spawn(move || {
-        // 借用版へ落とすのは**この1箇所**（フェーズ0とフェーズ1が同じ値を見ることを、
-        // 変数1つで保証する。別々に作ると片方だけACEが欠けても気付けない）。
-        let ace_grant_refs = super::OwnedAceGrant::borrow_all(&ace_grants);
-        // フェーズ0: rootへの継承ACE伝播（冪等チェック無し、必ず呼ぶ）。全ACEを1回で。
-        if let Err(e) = super::propagate_workspace_root_grants(&root, &ace_grant_refs) {
-            // **失敗を台帳へ残す**（D-85）。ここで残さないと、次回の起動は
-            // 「準備中のまま終わった」と「そもそも始めていない」を区別できない。
-            let error = e.to_string();
-            crate::tier2a::workspace_capability::mark_tree_preparation_failed(
-                &workspace, &mode, &error,
-            );
-            *state.error.lock().unwrap() = Some(error);
-            state.finished.store(true, Ordering::Release);
-            return;
-        }
-
-        // フェーズ0.5（BUG-083対策）: 伝播が`.harness/`の子孫へも物理コピーを届けた可能性が
-        // あるため、直後にもう一度剥がし直す。`.harness/`が存在しなければ
-        // `protect_harness_control_dir_from_appcontainer`は無害な早期returnになる。
-        let protect_psids: Vec<windows::Win32::Security::PSID> =
-            protect_sids.iter().map(|s| s.as_psid()).collect();
-        match super::protect_harness_control_dir_from_appcontainer(&root, &protect_psids) {
-            // [BUG-084] 件数を残す。この背景フェーズはユーザーに何も見せずに終わるので、
-            // 記録しないと「D-05/D-09の層3が1件も掛からなかった」ことを事後に知る手段が無い。
-            Ok(nodes) => state.protected_nodes.store(nodes, Ordering::Relaxed),
-            Err(e) => {
-                let error = e.to_string();
-                crate::tier2a::workspace_capability::mark_tree_preparation_failed(
-                    &workspace, &mode, &error,
-                );
-                *state.error.lock().unwrap() = Some(error);
-                state.finished.store(true, Ordering::Release);
-                return;
+        let result = match lane {
+            PreparationLane::FullWalk => {
+                run_full_walk_lane(&root, &ace_grants, &protect_sids, &skip, &state)
             }
-        }
-
-        // フェーズ1: 保護DACL配下の救済walk（既存）。
-        state.phase.store(PHASE_WALKING, Ordering::Relaxed);
-        let progress_state = Arc::clone(&state);
-        let result = super::fix_descendants_missing_aces(
-            &root,
-            &ace_grant_refs,
-            &skip,
-            &move |done, total| {
-                progress_state.done.store(done, Ordering::Relaxed);
-                progress_state.total.store(total, Ordering::Relaxed);
-            },
-        );
+            PreparationLane::Lazy => {
+                run_lazy_lane(&root, &ace_grants, &protect_sids, &skip, &state)
+            }
+        };
+        // **成否の記録はここ1箇所**（`B-02`: 2つのレーンで書き方が割れると、片方だけ
+        // 台帳へ残らない形になる）。**失敗を台帳へ残す**理由はD-85——残さないと次回の起動は
+        // 「準備中のまま終わった」と「そもそも始めていない」を区別できない。
         match result {
-            Ok(report) => {
-                // [残課題#32] **報告を捨てない。** ここが`Ok(_)`で握り潰されていたために、
-                // 「フェーズ0が17秒かけて何も配っておらず、実際に配っているのはこのwalkだけ」
-                // という状態が実運用で一度も可視化されなかった（`B-10`）。
-                state
-                    .rescue_granted
-                    .store(report.granted, Ordering::Relaxed);
-                state
-                    .rescue_checked
-                    .store(report.checked, Ordering::Relaxed);
-                state
-                    .rescue_probe_errors
-                    .store(report.probe_errors, Ordering::Relaxed);
-                // 文面は`grant_ace_inheritable_rw`が出しているものに揃える（同じ事実を
-                // 2つの綴りで出さない）。既定では何も出ない＝`HARNESS_PREFLIGHT_TIMING=1`のときだけ。
-                let mut timing = super::PhaseTiming::start();
-                timing.mark(&format!(
-                    "  background: rescue walk ({} checked, {} explicit grants, {} probe errors)",
-                    report.checked, report.granted, report.probe_errors
-                ));
-                if !report.samples.is_empty() {
-                    timing.mark_lines("  background: not reached by inheritance", &report.samples);
-                }
-                crate::tier2a::workspace_capability::mark_tree_verified(&workspace, &mode);
-            }
-            Err(e) => {
-                let error = e.to_string();
+            Ok(()) => crate::tier2a::workspace_capability::mark_tree_verified(&workspace, &mode),
+            Err(error) => {
                 crate::tier2a::workspace_capability::mark_tree_preparation_failed(
                     &workspace, &mode, &error,
                 );
@@ -396,12 +375,181 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
     true
 }
 
+/// フェーズ0.5（[BUG-083](../../../../docs/bugs/BUG-083.md)対策）: `.harness/`を再保護する。
+///
+/// **両レーンが通る**。`.harness/`が存在しなければ
+/// `protect_harness_control_dir_from_appcontainer`は無害な早期returnになる。
+fn protect_control_dir(
+    root: &Path,
+    protect_sids: &[OwnedSid],
+    state: &JobState,
+) -> Result<(), String> {
+    let protect_psids: Vec<windows::Win32::Security::PSID> =
+        protect_sids.iter().map(|s| s.as_psid()).collect();
+    // [BUG-084] 件数を残す。この背景フェーズはユーザーに何も見せずに終わるので、
+    // 記録しないと「D-05/D-09の層3が1件も掛からなかった」ことを事後に知る手段が無い。
+    let nodes = super::protect_harness_control_dir_from_appcontainer(root, &protect_psids)
+        .map_err(|e| e.to_string())?;
+    state.protected_nodes.store(nodes, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 既定のレーン: 伝播（0）→ `.harness/`再保護（0.5）→ 救済walk（1）。
+fn run_full_walk_lane(
+    root: &Path,
+    ace_grants: &[super::OwnedAceGrant],
+    protect_sids: &[OwnedSid],
+    skip: &[PathBuf],
+    state: &Arc<JobState>,
+) -> Result<(), String> {
+    // 借用版へ落とすのは**この1箇所**（フェーズ0とフェーズ1が同じ値を見ることを、
+    // 変数1つで保証する。別々に作ると片方だけACEが欠けても気付けない）。
+    let ace_grant_refs = super::OwnedAceGrant::borrow_all(ace_grants);
+    // フェーズ0: rootへの継承ACE伝播（冪等チェック無し、必ず呼ぶ）。全ACEを1回で。
+    super::propagate_workspace_root_grants(root, &ace_grant_refs).map_err(|e| e.to_string())?;
+
+    // フェーズ0.5: 伝播が`.harness/`の子孫へも物理コピーを届けた可能性があるため、直後に
+    // もう一度剥がし直す（**この順序が要るのは伝播があるレーンだけ**、`run_lazy_lane`参照）。
+    protect_control_dir(root, protect_sids, state)?;
+
+    // フェーズ1: 保護DACL配下の救済walk（既存）。
+    state.phase.store(PHASE_WALKING, Ordering::Relaxed);
+    let progress_state = Arc::clone(state);
+    let report = super::fix_descendants_missing_aces(root, &ace_grant_refs, skip, &move |
+        done,
+        total,
+    | {
+        progress_state.done.store(done, Ordering::Relaxed);
+        progress_state.total.store(total, Ordering::Relaxed);
+    })
+    .map_err(|e| e.to_string())?;
+
+    // [残課題#32] **報告を捨てない。** ここが`Ok(_)`で握り潰されていたために、
+    // 「フェーズ0が17秒かけて何も配っておらず、実際に配っているのはこのwalkだけ」
+    // という状態が実運用で一度も可視化されなかった（`B-10`）。
+    state.rescue_granted.store(report.granted, Ordering::Relaxed);
+    state.rescue_checked.store(report.checked, Ordering::Relaxed);
+    state
+        .rescue_probe_errors
+        .store(report.probe_errors, Ordering::Relaxed);
+    // 文面は`grant_ace_inheritable_rw`が出しているものに揃える（同じ事実を2つの綴りで
+    // 出さない）。既定では何も出ない＝`HARNESS_PREFLIGHT_TIMING=1`のときだけ。
+    let mut timing = super::PhaseTiming::start();
+    timing.mark(&format!(
+        "  background: rescue walk ({} checked, {} explicit grants, {} probe errors)",
+        report.checked, report.granted, report.probe_errors
+    ));
+    if !report.samples.is_empty() {
+        timing.mark_lines("  background: not reached by inheritance", &report.samples);
+    }
+    Ok(())
+}
+
+/// [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] lazyレーン: `.harness/`再保護 → 走査器＋単一writer。
+///
+/// # **伝播（フェーズ0）を使わない。速さの話ではなく、安全性の話である**
+///
+/// 伝播する書込は、**書込の直前にその主体のACEをrootから外す**
+/// （[`super::acl_dacl_write`]のモジュールdoc「だからこの部品は何をするか」）。
+/// あちらは「一瞬だけ、rootにその主体のACEが無い状態が生まれる」ことを認めたうえで、
+/// **その窓が踏まれない根拠を「子プロセスは`wait_until_done`で完了を待つから」に置いている。**
+///
+/// **lazyレーンはその待ちを外すレーンである。** つまり根拠が成立しない——走っている子が
+/// その瞬間にworkspaceを開くと、**ツリー全体が一瞬見えなくなる**。だからこのレーンは
+/// 伝播する口を一度も呼ばず、[`super::lazy_grant::writer`]の単一オブジェクト書込
+/// （剥がさない口）だけでツリーを埋める。**fallbackでも呼ばない**（下記）。
+///
+/// # `.harness/`の再保護を**先**に置く理由
+///
+/// 既定レーンで再保護が伝播の**後**に居るのは、伝播が`.harness/`配下へ物理コピーを
+/// 届け得るからである。このレーンには伝播が無く、走査器は`skip`（`.harness/`）へ
+/// 降りない。**したがって後ろに置く理由が無く、前に置くと制御面の保護が最初に立つ**
+/// ——`preflight`の同期区間が終わってから保護が掛かるまでの時間が、既定レーンの
+/// 「伝播1回ぶん」から「ゼロ」になる。
+///
+/// # このレーンでの`rescue_granted`の読み方が変わる（**既存の読み方を持ち込まない**）
+///
+/// 既定レーンでは`rescue_granted != 0`が「伝播が届いていない」＝退化の兆候だった。
+/// **このレーンでは伝播が無いので、走査器が全ノードへ明示ACEを書くのが正常**である。
+/// 同じ数字を同じ意味で読むと、健全な状態を退化と読み違える。
+fn run_lazy_lane(
+    root: &Path,
+    ace_grants: &[super::OwnedAceGrant],
+    protect_sids: &[OwnedSid],
+    skip: &[PathBuf],
+    state: &Arc<JobState>,
+) -> Result<(), String> {
+    protect_control_dir(root, protect_sids, state)?;
+
+    state.phase.store(PHASE_SCANNING, Ordering::Relaxed);
+    let mut writer =
+        super::lazy_grant::writer::AclWriter::start(root.to_path_buf(), ace_grants.to_vec());
+    let control = ScanProgress {
+        state: Arc::clone(state),
+    };
+    let scan = super::lazy_grant::scanner::scan(root, skip, &writer.handle(), &control);
+    // **走査の成否に関わらずwriterは畳む**（安全点で1件を完了させてから止まる）。
+    // ここを早期returnで飛ばすと、スレッドとACL書込の主体が残る（`B-01`）。
+    let stats = writer.stop_at_safe_point();
+
+    // [残課題#32と対をなす記録] このレーンでは**書いた数が正常に0でない**（上のdoc）。
+    // 走査が1件も歩かなかった場合と区別できるよう、見た数と対で残す（`B-35`）。
+    state.rescue_granted.store(stats.granted, Ordering::Relaxed);
+    state.rescue_checked.store(stats.processed, Ordering::Relaxed);
+    state
+        .rescue_probe_errors
+        .store(stats.probe_errors, Ordering::Relaxed);
+
+    let report = scan.map_err(|_| {
+        "the lazy ACL writer stopped before the scan finished; \
+         part of the workspace may still be unreachable from the sandbox (D-88)"
+            .to_string()
+    })?;
+    if report.stopped_early {
+        return Err(
+            "the lazy workspace scan was stopped before it finished; \
+             part of the workspace may still be unreachable from the sandbox (D-88)"
+                .to_string(),
+        );
+    }
+    let mut timing = super::PhaseTiming::start();
+    timing.mark(&format!(
+        "  background: lazy scan ({} submitted, {} explicit grants, {} skipped, \
+         {} probe errors, {} vanished, {} faults served)",
+        report.submitted,
+        stats.granted,
+        report.skipped,
+        stats.probe_errors,
+        stats.vanished,
+        stats.faults_served
+    ));
+    Ok(())
+}
+
+/// 走査の進捗を[`JobState`]へ流す。**止める口はまだ繋がっていない**——
+/// fallback controllerとツールのキャンセルは段2以降で繋ぐ。
+struct ScanProgress {
+    state: Arc<JobState>,
+}
+
+impl super::lazy_grant::scanner::ScanControl for ScanProgress {
+    fn should_stop(&self) -> bool {
+        false
+    }
+
+    fn progress(&self, submitted: usize) {
+        // `total`は据え置き（0＝母数未確定）。streaming列挙は母数を先に数えない
+        // ——数えるには走査を2周することになる（[`JobPhase::Scanning`]のdoc）。
+        self.state.done.store(submitted, Ordering::Relaxed);
+    }
+}
+
 fn snapshot_progress(state: &JobState) -> WorkspaceGrantProgress {
     let finished = state.finished.load(Ordering::Acquire);
-    let phase = if state.phase.load(Ordering::Relaxed) == PHASE_WALKING {
-        JobPhase::Walking
-    } else {
-        JobPhase::Propagating
+    let phase = match state.phase.load(Ordering::Relaxed) {
+        PHASE_WALKING => JobPhase::Walking,
+        PHASE_SCANNING => JobPhase::Scanning,
+        _ => JobPhase::Propagating,
     };
     WorkspaceGrantProgress {
         phase,
@@ -530,6 +678,12 @@ fn wait_for_job_reporting(
         None => Ok(()),
     }
 }
+
+/// 2つのレーンが同じ到達状態を作ることの回帰。**`grant_job`の子モジュールとして置く**
+/// ——レーン関数を`pub(super)`へ広げずにテストするため（可視性はテストの都合で広げない）。
+#[cfg(all(windows, test))]
+#[path = "grant_job_lane_tests.rs"]
+mod grant_job_lane_tests;
 
 #[cfg(test)]
 mod tests {

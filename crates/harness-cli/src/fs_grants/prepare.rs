@@ -65,6 +65,19 @@ use harness_sandbox::tier2a::win_appcontainer::{
                         waiting_since.elapsed().as_secs()
                     )
                 }
+                // [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] このCLIは常に既定のレーンで走る
+                // （`workspace_prepare.rs`が`FullWalk`を渡す）ので、通常ここへは来ない。
+                // **それでも`unreachable!`にはしない**——レーンの選び方が変わったときに
+                // 落ちるのではなく、正しい行が出るほうがよい。母数は出ない（走査器は
+                // 母数を先に数えない、`JobPhase::Scanning`のdoc）。
+                JobPhase::Scanning => {
+                    format!(
+                        "harness: granting the workspace tree node by node: {} done \
+                         (total not known yet; {}s elapsed)",
+                        progress.done,
+                        waiting_since.elapsed().as_secs()
+                    )
+                }
             };
             if line != last_line {
                 eprint!("\r{line}   ");

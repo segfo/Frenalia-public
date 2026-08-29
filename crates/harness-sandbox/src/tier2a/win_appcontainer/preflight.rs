@@ -1482,6 +1482,10 @@ pub fn preflight_with_privhelper_launcher(
             workspace: &canonical_workspace_root,
             mode: workspace_mode.as_str(),
             capability_generation: &capability_generation,
+            // [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] **既定のまま**。lazyレーンを選ぶ判定は
+            // 起動側（`launch`）が持つ——レーンを分けるかどうかは「この子を待たせるか」の
+            // 決定と同じものなので、決める場所を2つにしない。
+            lane: grant_job::PreparationLane::FullWalk,
         });
         timing.mark(&format!(
             "grant_job::start (background propagate + descendant fix-up, started={started})"

@@ -550,6 +550,9 @@ pub mod grant_job;
 /// Tier2a子を起こすまでの前口上（主体の導出・背景walkの待ち・spawn）。`run_shell`と
 /// ポリシーエディタのパス2が共有する（モジュールdoc参照）。
 mod launch;
+/// [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] Lazy ACE fault-inの準備器（走査器と単一writer）。
+/// **globで出さない**——`scan`/`start`のような短い名前は、それだけでは何の走査か分からない。
+mod lazy_grant;
 mod mcp_preflight;
 mod native_path_policy;
 /// fs passthrough付与の進捗（同期区間からUIへ届ける唯一の口、`grant_job`と同じ形）。
