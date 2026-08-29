@@ -242,6 +242,12 @@ fn lazy_lane_pipe(
     if super::lazy_grant::injection_is_excluded_for(std::path::Path::new(shell)) {
         return None;
     }
+    // **一度でも許可を付けられなかったworkspaceでは、もうレーンを使わない。**
+    // ここで`None`を返すと下の`wait_until_done`へ落ちる——つまり
+    // 「次のコマンドは背景の準備が終わるまで待つ」が成立する。モデルがやり直せば必ず通る。
+    if super::lazy_grant::lane_is_distrusted(canonical_workspace, req.workspace_mode()) {
+        return None;
+    }
     grant_job::lazy_broker_pipe_for(canonical_workspace, req.workspace_mode())
 }
 

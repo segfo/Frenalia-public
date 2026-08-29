@@ -80,15 +80,15 @@ pub(crate) const LAZY_LANE_ENV: &str = "HARNESS_TIER2A_LAZY_ACE";
 ///    注入できない状態を**意図的に作れる**必要がある（設計書§5.1.3の受入1が求める
 ///    fault injection）。実測は`lazy_uninjectable_tests`が持つ。
 ///
-/// # 外したときに何が起きるかは、**最上位か子孫かで違う**
+/// # 外したプロセスは、待たされるだけで失敗しない
 ///
 /// - **最上位のシェル**を外すと、`launch`はlazyレーンを選ばず**全walkを待って**起動する。
-///   遅くなるだけで、コマンドは成功する。
-/// - **子孫**を外すと、その子孫にはフックが無いので**未準備のファイルへのアクセスは
-///   拒否される**（待たされるのではなく失敗する）。
+/// - **子孫**を外すと、`CREATE_SUSPENDED`のまま**準備の完了を待ってから**動かす
+///   （`harness-redirector`の`wait_then_resume`）。
 ///
-/// この非対称は機構から来ている——待つかどうかを決めるのは起動側であり、
-/// **子孫が起きる頃には起動側の判断はもう終わっている**。
+/// 待たせ方が違うのは、**待てるのがまだ1行も実行していないプロセスだけ**だからである。
+/// どちらもその条件を満たしている（起こす前／作られた直後）。
+/// 実測は`lazy_uninjectable_tests`が対で持つ。
 pub(crate) const NO_INJECT_ENV: &str = "HARNESS_REDIRECTOR_NO_INJECT";
 
 /// [`NO_INJECT_ENV`]の一覧に`exe`（ファイル名でもフルパスでもよい）が入っているか。
@@ -105,6 +105,54 @@ pub(crate) fn injection_is_excluded_for(exe: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// **一度でも「許可を付けられなかった」ワークスペースの一覧**（掛け金）。
+///
+/// # なぜ要るのか
+///
+/// 走っている最中に許可を付けられなかった場合、そのコマンドはもう巻き戻せない
+/// （[`super::launch`]の分岐図）。**次のコマンドまで同じ目に遭わせない**ために、
+/// そのワークスペースではレーンを使うのをやめ、背景の準備が終わるまで従来どおり待つ。
+///
+/// これで「モデルがやり直せば必ず通る」が成り立つ。**ハーネスが勝手に実行し直すのではない**
+/// ——設計書§5.1.3の「採らない方式」が、既に起きた書込や外部作用の二重化を理由に
+/// 自動再実行を退けている。やり直すかどうかを決めるのはモデルで、こちらが用意するのは
+/// 「次は必ず通る」という保証だけである。
+///
+/// # 掛け金は下ろしたら上げない
+///
+/// 一度失敗したレーンをそのセッションで信用し直す根拠が無い。プロセスが終われば消える
+/// （次回起動では準備済みなのでそもそもレーンが要らない）。
+static DISTRUSTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn distrusted() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    DISTRUSTED.get_or_init(Default::default)
+}
+
+/// 掛け金の鍵。`grant_job`のジョブ鍵と**同じ正規化**を使う（綴りの揺れで別物にならないように）。
+fn latch_key(workspace: &std::path::Path, mode: &str) -> String {
+    format!(
+        "{}\u{0}{mode}",
+        crate::tier2a::workspace_capability::workspace_key(workspace)
+    )
+}
+
+/// このワークスペースでレーンを信用するのをやめる。**冪等**。
+pub(crate) fn distrust_lane(workspace: &std::path::Path, mode: &str) {
+    distrusted()
+        .lock()
+        .unwrap()
+        .insert(latch_key(workspace, mode));
+}
+
+/// 掛け金が下りているか（下りていれば、起動側はレーンを選ばず従来どおり待つ）。
+pub(crate) fn lane_is_distrusted(workspace: &std::path::Path, mode: &str) -> bool {
+    distrusted()
+        .lock()
+        .unwrap()
+        .contains(&latch_key(workspace, mode))
+}
+
 /// このプロセスでlazyレーンを使ってよいか。**既定は使う。**
 ///
 /// # 何を確かめているのか（**性能ではなく成立性**）
@@ -117,9 +165,8 @@ pub(crate) fn injection_is_excluded_for(exe: &std::path::Path) -> bool {
 /// # ここで確かめて**いない**こと（限界を同じ場所に書く）
 ///
 /// - **子孫のうち注入できないものがあるか。** ここはプロセスを起こす前の判定なので
-///   分からない。**最上位のシェルに注入できなければ`launch`が全walkを待って
-///   起動し直す**ので安全側だが、**子孫が注入できない場合はその限りではない**
-///   （その子孫の未準備アクセスは拒否される。`lazy_uninjectable_tests`が実測を持つ）。
+///   分からない。**分からなくてよい**——注入できなかった子孫は、その場で
+///   準備の完了を待ってから動き出す（`lazy_uninjectable_tests`が実測を持つ）。
 /// - **受付パイプが実際に開けるか。** 開くのは背景ジョブ側で、probeの時点ではまだ動いていない。
 pub(crate) fn lane() -> super::grant_job::PreparationLane {
     let disabled = std::env::var(LAZY_LANE_ENV)

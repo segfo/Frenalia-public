@@ -47,6 +47,14 @@ use super::*;
 /// （呼び出し側がbarrierへ倒す判断を持つ）。
 const ROUNDTRIP_TIMEOUT_MS: u32 = 5_000;
 
+/// [D-88] 「準備が終わるまで待つ」要求の上限。**待つのが目的なので長い。**
+///
+/// 5秒で切ると「フックも無く、準備も終わっていない」という最悪の組み合わせで走り出す。
+/// 数字は起動側の準備待ちの上限（`grant_job::WAIT_TIMEOUT`＝300秒）に合わせてある
+/// ——**待ち先が同じなら上限も同じであるべき**で、こちらだけ短いと、
+/// 起動側がまだ待つ気でいるのに子だけ先に諦めることになる。
+const WAIT_PREPARED_TIMEOUT_MS: u32 = 300_000;
+
 /// 受付への接続。**1本を張りっぱなしにする**——1 openごとに接続し直すと、
 /// §S20が測った往復29.2 µsに接続の費用が毎回乗る。
 static CONNECTION: Mutex<Option<isize>> = Mutex::new(None);
@@ -78,20 +86,50 @@ pub(crate) enum FaultOutcome {
     GiveUp,
 }
 
+/// [D-88] **フックを入れられなかった子を、動かす前に待たせる。**
+///
+/// 準備が終わるまで受付が返事をしないので、この呼び出しはそのぶんブロックする。
+/// 返ってから一時停止を解けば、その子はフックが無くても**配り終わったツリー**を見る。
+///
+/// # なぜ「待つ」がここでしか選べないのか
+///
+/// 走り出した後は巻き戻せない——`ls`が半分読んだところで「やっぱり最初から待とう」には
+/// できない。**一時停止中の子だけが、まだ何も起きていないので待てる。**
+///
+/// 受付へ届かなければ`false`を返す。呼び出し側は**それでも動かす**こと——
+/// 動かさないと一時停止のまま残る（`B-01`: 止めたものを動かす対を必ず書く）。
+pub(crate) fn wait_until_workspace_prepared(cfg: &Config) -> bool {
+    if cfg.broker_pipe.is_none() {
+        return false;
+    }
+    matches!(
+        roundtrip_request(cfg, "{\"kind\":\"wait_prepared\"}", WAIT_PREPARED_TIMEOUT_MS),
+        FaultOutcome::Retry
+    )
+}
+
 /// 拒否されたパスを受付へ伝え、やり直してよいかを返す。
 ///
 /// **呼び出し側は`ReentryGuard`を握っていること**（モジュールdoc）。
 pub(crate) fn request_fault_in(cfg: &Config, path: &Path) -> FaultOutcome {
-    let Some(pipe_name) = cfg.broker_pipe.as_deref() else {
-        return FaultOutcome::GiveUp;
-    };
     // 以降、**受付へ届かなかった場合はすべて`RetryAnyway`**（[`FaultOutcome::RetryAnyway`]のdoc）。
     // `GiveUp`を返すのは受付が明示的に拒否したときだけである。
     let request = format!(
         "{{\"kind\":\"grant\",\"path\":{}}}",
         json_string(&path.to_string_lossy())
     );
+    roundtrip_request(cfg, &request, ROUNDTRIP_TIMEOUT_MS)
+}
 
+/// 受付へ1件送って答えを待つ。接続は張りっぱなしにし、切れていたら**1度だけ**張り直す。
+///
+/// `timeout_ms`を引数にしてあるのは、**待つのが目的の要求**（[`wait_until_workspace_prepared`]）と
+/// **速さが目的の要求**（fault）で上限が違うからである——前者を5秒で切ると、
+/// 「フックも無く準備も終わっていない」という最悪の組み合わせで走り出す。
+fn roundtrip_request(cfg: &Config, request: &str, timeout_ms: u32) -> FaultOutcome {
+    let Some(pipe_name) = cfg.broker_pipe.as_deref() else {
+        return FaultOutcome::GiveUp;
+    };
     let mut guard = CONNECTION.lock().unwrap_or_else(|e| e.into_inner());
     // 1回だけ張り直す。**張り直しを繰り返さない**のは、受付が閉じた後
     // （＝準備が完走した後）に毎回の失敗openが接続を試みるのを避けるため。
@@ -104,7 +142,7 @@ pub(crate) fn request_fault_in(cfg: &Config, path: &Path) -> FaultOutcome {
             }
         }
         let handle = HANDLE(guard.unwrap() as *mut _);
-        match roundtrip(handle, request.as_bytes()) {
+        match roundtrip(handle, request.as_bytes(), timeout_ms) {
             Some(reply) => return parse_outcome(&reply),
             None => {
                 // 切れていた。ハンドルを捨てて、**1度だけ**張り直す。
@@ -180,12 +218,12 @@ fn connect(pipe_name: &str) -> Option<HANDLE> {
 }
 
 /// 1フレーム書いて1フレーム読む。`None`は「この接続はもう使えない」。
-fn roundtrip(pipe: HANDLE, payload: &[u8]) -> Option<Vec<u8>> {
+fn roundtrip(pipe: HANDLE, payload: &[u8], timeout_ms: u32) -> Option<Vec<u8>> {
     let len = (payload.len() as u32).to_le_bytes();
-    write_all(pipe, &len)?;
-    write_all(pipe, payload)?;
+    write_all(pipe, &len, timeout_ms)?;
+    write_all(pipe, payload, timeout_ms)?;
     let mut len_buf = [0u8; 4];
-    read_exact(pipe, &mut len_buf)?;
+    read_exact(pipe, &mut len_buf, timeout_ms)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     // 受付の応答は短い。**上限を置く**のは、壊れた長さで巨大な確保をしないため。
     if len > 64 * 1024 {
@@ -193,16 +231,16 @@ fn roundtrip(pipe: HANDLE, payload: &[u8]) -> Option<Vec<u8>> {
     }
     let mut reply = vec![0u8; len];
     if len > 0 {
-        read_exact(pipe, &mut reply)?;
+        read_exact(pipe, &mut reply, timeout_ms)?;
     }
     Some(reply)
 }
 
-fn write_all(pipe: HANDLE, buf: &[u8]) -> Option<()> {
+fn write_all(pipe: HANDLE, buf: &[u8], timeout_ms: u32) -> Option<()> {
     let mut done = 0usize;
     while done < buf.len() {
         let chunk = &buf[done..];
-        let n = overlapped(pipe, |ov| unsafe { WriteFile(pipe, Some(chunk), None, Some(ov)) })?;
+        let n = overlapped(pipe, timeout_ms, |ov| unsafe { WriteFile(pipe, Some(chunk), None, Some(ov)) })?;
         if n == 0 {
             return None;
         }
@@ -211,11 +249,11 @@ fn write_all(pipe: HANDLE, buf: &[u8]) -> Option<()> {
     Some(())
 }
 
-fn read_exact(pipe: HANDLE, buf: &mut [u8]) -> Option<()> {
+fn read_exact(pipe: HANDLE, buf: &mut [u8], timeout_ms: u32) -> Option<()> {
     let mut done = 0usize;
     while done < buf.len() {
         let chunk = &mut buf[done..];
-        let n = overlapped(pipe, |ov| unsafe { ReadFile(pipe, Some(chunk), None, Some(ov)) })?;
+        let n = overlapped(pipe, timeout_ms, |ov| unsafe { ReadFile(pipe, Some(chunk), None, Some(ov)) })?;
         if n == 0 {
             return None;
         }
@@ -230,7 +268,7 @@ fn read_exact(pipe: HANDLE, buf: &mut [u8]) -> Option<()> {
 /// （`bWait=true`）——待たずに返ると、この関数のスタックにある`OVERLAPPED`をカーネルが
 /// まだ見ている状態でスタックが巻き戻る。`harness-sandbox`の`run_overlapped`が
 /// 同じ理由で同じことをしている。
-fn overlapped<F>(pipe: HANDLE, start: F) -> Option<u32>
+fn overlapped<F>(pipe: HANDLE, timeout_ms: u32, start: F) -> Option<u32>
 where
     F: FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
 {
@@ -249,7 +287,7 @@ where
                 return None;
             }
         };
-        if pending && WaitForSingleObject(event, ROUNDTRIP_TIMEOUT_MS) != WAIT_OBJECT_0 {
+        if pending && WaitForSingleObject(event, timeout_ms) != WAIT_OBJECT_0 {
             let _ = CancelIoEx(pipe, Some(&ov as *const _));
             let mut discarded = 0u32;
             let _ = GetOverlappedResult(pipe, &ov, &mut discarded, true);

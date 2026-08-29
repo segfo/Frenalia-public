@@ -31,9 +31,12 @@ fn shared_for(root: &Path, skip: Vec<PathBuf>, writer: WriterHandle) -> Shared {
         policy: FaultPolicy {
             canonical_workspace: root.canonicalize().expect("canonicalize the workspace"),
             skip,
+            mode: "rwx".to_string(),
         },
         writer,
         stopping: AtomicBool::new(false),
+        prepared: Mutex::new(None),
+        prepared_changed: std::sync::Condvar::new(),
         served: AtomicUsize::new(0),
         denied: AtomicUsize::new(0),
         unavailable: AtomicUsize::new(0),
@@ -46,6 +49,7 @@ fn policy_for(root: &Path, skip: Vec<PathBuf>) -> FaultPolicy {
     FaultPolicy {
         canonical_workspace: root.canonicalize().expect("canonicalize the workspace"),
         skip,
+        mode: "rwx".to_string(),
     }
 }
 
@@ -237,6 +241,66 @@ fn a_granted_path_is_materialised_once_and_merged_afterwards() {
             node.display()
         );
     }
+}
+
+/// **掛け金は「こちら側の失敗」でだけ下ろす。ポリシー拒否では下ろさない。**
+///
+/// 下ろすと、そのworkspaceでは以降レーンを使わなくなる（起動側が従来の待ちへ落ちる）。
+/// **範囲外を叩かれただけで下ろすと、敵対的な子が`.harness/`を1回叩くだけでレーンを殺せる**
+/// ——だから引き金は「付与できなかった」に限る。
+///
+/// 対で見る（`B-35`）——下りる側だけを測ると「常に下ろす」実装でも緑になる。
+#[test]
+fn only_our_own_failure_trips_the_latch_never_a_policy_denial() {
+    let guard = TestDirGuard::create("broker-latch");
+    let root = guard.path().join("ws");
+    let control = root.join(".harness");
+    std::fs::create_dir_all(&control).expect("create the control dir");
+    std::fs::write(control.join("state.json"), b"{}").expect("write control state");
+    let file = root.join("f.txt");
+    std::fs::write(&file, b"x").expect("create a file");
+
+    let grants = test_grants("latch");
+    let mut writer = super::super::writer::AclWriter::start(root.clone(), grants);
+    let canonical = root.canonicalize().expect("canonicalize");
+    let mode = format!("latch-{}", std::process::id());
+    let shared = Shared {
+        policy: FaultPolicy {
+            canonical_workspace: canonical.clone(),
+            skip: vec![canonical.join(".harness")],
+            mode: mode.clone(),
+        },
+        writer: writer.handle(),
+        stopping: AtomicBool::new(false),
+        prepared: Mutex::new(None),
+        prepared_changed: std::sync::Condvar::new(),
+        served: AtomicUsize::new(0),
+        denied: AtomicUsize::new(0),
+        unavailable: AtomicUsize::new(0),
+        rejected_clients: AtomicUsize::new(0),
+        granted: Mutex::new(HashSet::new()),
+    };
+
+    // ポリシー拒否（制御ディレクトリ）。**掛け金は下りない。**
+    let denied = handle_grant(&shared, &control.join("state.json").to_string_lossy());
+    assert!(matches!(denied, FaultResponse::Denied { .. }), "{denied:?}");
+    assert!(
+        !super::super::lane_is_distrusted(&canonical, &mode),
+        "a policy denial must not disable the lane; otherwise one out-of-scope open kills it"
+    );
+
+    // こちら側の失敗（writerが畳まれている）。**ここで初めて下りる。**
+    let _ = writer.stop_at_safe_point();
+    let unavailable = handle_grant(&shared, &file.to_string_lossy());
+    assert!(
+        matches!(unavailable, FaultResponse::Unavailable { .. }),
+        "{unavailable:?}"
+    );
+    assert!(
+        super::super::lane_is_distrusted(&canonical, &mode),
+        "failing to place an ace is our own failure, so the lane must stop being used \
+         for this workspace -- that is what makes the next command wait and succeed"
+    );
 }
 
 /// [着手条件5] **writerが居ないことは「拒否」ではない。**

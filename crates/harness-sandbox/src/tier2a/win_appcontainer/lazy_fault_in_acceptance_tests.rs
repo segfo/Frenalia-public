@@ -206,6 +206,7 @@ fn an_unprepared_file_opens_through_the_interrupt_instead_of_waiting() {
         lazy_grant::broker::FaultPolicy {
             canonical_workspace: canonical_ws.clone(),
             skip: vec![canonical_ws.join(".harness")],
+            mode: "rwx".to_string(),
         },
         writer.handle(),
         &capabilities,

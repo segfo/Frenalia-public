@@ -335,6 +335,41 @@ unsafe fn grandchild_injection_is_excluded(process: HANDLE) -> bool {
         .any(|entry| !entry.is_empty() && entry == name)
 }
 
+/// [D-88] **フックを入れられなかった子を、準備が終わるまで待たせてから動かす。**
+///
+/// # なぜここで待てるのか（そして走り出したら待てないのか）
+///
+/// この時点の子は`CREATE_SUSPENDED`で作られたまま**1行も実行していない**。だから
+/// 「準備が終わってから始める」に切り替えても、二重に起きる副作用が無い。
+/// 走り出した後の失敗（開こうとして拒否された）は巻き戻せないので、そちらは
+/// 別の手当て（受付側の掛け金）になる。
+///
+/// **待てなくても必ず動かす。** 受付へ届かない・準備が配り切れなかった等で待ちが
+/// 成立しなくても、一時停止のまま置き去りにはしない（`B-01`: 止めたものを動かす対を書く）。
+/// その場合その子はフック無しで走り、未準備のファイルは拒否される——**安全側**である。
+///
+/// # Safety
+/// `pi`は有効な`PROCESS_INFORMATION`を指していること。
+unsafe fn wait_then_resume(
+    pi: &PROCESS_INFORMATION,
+    caller_wanted_suspended: bool,
+    caller: &str,
+) {
+    if let Some(cfg) = CONFIG.get() {
+        let prepared = wait_until_workspace_prepared(cfg);
+        debug_log(&format!(
+            "{caller}: waited for the workspace preparation before resuming, prepared={prepared}"
+        ));
+    }
+    // **呼び出し元が一時停止を望んでいたなら動かさない**——それはこのフックの都合ではなく
+    // アプリの意図なので、勝手に動かすと`CREATE_SUSPENDED`の意味が壊れる。
+    if !caller_wanted_suspended {
+        unsafe {
+            let _ = windows::Win32::System::Threading::ResumeThread(pi.hThread);
+        }
+    }
+}
+
 pub(crate) unsafe fn inject_grandchild_and_maybe_resume(
     process_information: *mut c_void,
     caller_wanted_suspended: bool,
@@ -357,11 +392,7 @@ pub(crate) unsafe fn inject_grandchild_and_maybe_resume(
         debug_log(&format!(
             "{caller}: skipping injection because the image is on {NO_INJECT_ENV}"
         ));
-        if !caller_wanted_suspended {
-            unsafe {
-                let _ = windows::Win32::System::Threading::ResumeThread(pi.hThread);
-            }
-        }
+        unsafe { wait_then_resume(pi, caller_wanted_suspended, caller) };
         return;
     }
     debug_log(&format!(
@@ -400,6 +431,11 @@ pub(crate) unsafe fn inject_grandchild_and_maybe_resume(
                  read-only ACL, so writes fail closed rather than silently missing the ledger)"
             };
             append_warning_entry(cfg, message);
+            // [D-88] **注入できなかった子は、準備が終わるまで動かさない。**
+            // フック無しで走ると、未準備のファイルへのアクセスが拒否されて
+            // コマンドが失敗する。まだ1行も動いていない今なら待てる（`wait_then_resume`）。
+            unsafe { wait_then_resume(pi, caller_wanted_suspended, caller) };
+            return;
         }
     } else {
         // このプロセス自体がまだ設定未完了（フック設置競合等の異常系）。孫は素通し。

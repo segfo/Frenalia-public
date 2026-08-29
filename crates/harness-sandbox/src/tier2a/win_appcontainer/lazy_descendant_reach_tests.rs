@@ -226,6 +226,7 @@ fn the_hooks_reach_children_and_grandchildren_and_fault_in_still_works() {
         lazy_grant::broker::FaultPolicy {
             canonical_workspace: canonical_ws.clone(),
             skip: vec![canonical_ws.join(".harness")],
+            mode: "rwx".to_string(),
         },
         writer.handle(),
         &capabilities,

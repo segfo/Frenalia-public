@@ -92,6 +92,14 @@ const MAX_FAULTS: usize = 200_000;
 pub(crate) enum FaultRequest {
     /// このパスを開こうとして拒否された。許可済みなら実体化してほしい。
     Grant { path: String },
+    /// **フックを入れられなかった子を、動かす前に待たせたい。**
+    ///
+    /// 準備が終わるまで返事をしない。返事が来たらその子を動かす——フックが無くても
+    /// ツリーはもう配り終わっているので、拒否されない。
+    ///
+    /// これが在るのは、**一時停止中の子だけが「待つ」を選べる**からである
+    /// （走り出した後は巻き戻せない）。
+    WaitPrepared,
 }
 
 /// broker → 子。**3つを混ぜないことが要点**である（設計書の着手条件5）。
@@ -117,6 +125,10 @@ pub(crate) struct FaultPolicy {
     /// 触ってはいけない範囲（`.harness/`等）。準備ジョブの`skip`と**同じ集合**を渡すこと
     /// ——ずれると、走査が意図的に外した場所をbrokerが付け直す（`B-05`）。
     pub(crate) skip: Vec<PathBuf>,
+    /// 掛け金を下ろすときの鍵になるモード（`"rwx"`/`"ro"`）。
+    /// 付与に失敗したらこのworkspace＋modeでレーンを信用しなくなる
+    /// （[`super::lane_is_distrusted`]）。
+    pub(crate) mode: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -135,6 +147,12 @@ struct Shared {
     policy: FaultPolicy,
     writer: WriterHandle,
     stopping: AtomicBool,
+    /// 準備が終わったか。[`FaultRequest::WaitPrepared`]の待ち手はここで起こされる。
+    ///
+    /// **`stop`ではなく専用の合図にしてある。** `stop`で起こすと、走査が失敗して畳んだ場合と
+    /// 完走して畳んだ場合の区別が待ち手へ届かない（`bool`が示すのはまさにその区別である）。
+    prepared: Mutex<Option<bool>>,
+    prepared_changed: std::sync::Condvar,
     served: AtomicUsize,
     denied: AtomicUsize,
     unavailable: AtomicUsize,
@@ -167,6 +185,8 @@ impl Broker {
             policy,
             writer,
             stopping: AtomicBool::new(false),
+            prepared: Mutex::new(None),
+            prepared_changed: std::sync::Condvar::new(),
             served: AtomicUsize::new(0),
             denied: AtomicUsize::new(0),
             unavailable: AtomicUsize::new(0),
@@ -213,6 +233,16 @@ impl Broker {
         }
     }
 
+    /// 走査が終わったことを、待っている子へ知らせる。**`stop`の前に呼ぶこと。**
+    ///
+    /// `ok`が偽なら「終わったが配り切れていない」——待っていた子は動き出すが、
+    /// 未準備のものは拒否される。**それでも起こす**——起こさないとその子は永久に
+    /// 一時停止のまま残る（`B-01`: 止めたものは必ず動かす対を書く）。
+    pub(crate) fn release_waiters(&self, ok: bool) {
+        *self.shared.prepared.lock().unwrap() = Some(ok);
+        self.shared.prepared_changed.notify_all();
+    }
+
     /// 受付を閉じ、acceptスレッドを畳む。
     ///
     /// **自分のパイプへ1回繋いで起こす。** 接続待ちは長いタイムアウトで止まっているので、
@@ -221,6 +251,16 @@ impl Broker {
     /// `Unavailable`になり、barrier送りの原因が追えなくなる）。
     pub(crate) fn stop(&mut self) -> BrokerStats {
         self.shared.stopping.store(true, Ordering::Release);
+        // **待ち手を必ず起こしてから畳む。** 起こさずに`join`すると、
+        // `WaitPrepared`で待っているハンドラが返らずここが返らない（自分で作ったデッドロック）。
+        // `release_waiters`が既に呼ばれていれば上書きしない。
+        {
+            let mut prepared = self.shared.prepared.lock().unwrap();
+            if prepared.is_none() {
+                *prepared = Some(false);
+            }
+        }
+        self.shared.prepared_changed.notify_all();
         wake_acceptor(&self.pipe_name);
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
@@ -377,6 +417,7 @@ fn serve_connection(pipe: HANDLE, shared: &Shared) {
         };
         let response = match serde_json::from_slice::<FaultRequest>(&bytes) {
             Ok(FaultRequest::Grant { path }) => handle_grant(shared, &path),
+            Ok(FaultRequest::WaitPrepared) => handle_wait_prepared(shared),
             // **黙って無視しない**（`B-32`）。無視すると子は返事を待ち続ける。
             Err(e) => FaultResponse::Denied {
                 reason: format!("malformed fault request: {e}"),
@@ -398,6 +439,26 @@ fn serve_connection(pipe: HANDLE, shared: &Shared) {
 fn send(pipe: HANDLE, response: &FaultResponse) -> Result<(), String> {
     let bytes = serde_json::to_vec(response).map_err(|e| e.to_string())?;
     write_framed_timeout(pipe, &bytes, IO_TIMEOUT).map_err(|e| e.into_message())
+}
+
+/// 一時停止中の子を、準備が終わるまで待たせる。
+///
+/// **ここだけは`IO_TIMEOUT`で切らない。** 待たせるのが目的であり、5秒で諦めて動かすと
+/// 「フックも無く準備も終わっていない」という最悪の組み合わせで走り出す。
+/// 上限は準備そのものの上限（[`super::super::grant_job`]の待ち合わせ）に委ねる——
+/// ジョブが終われば[`Broker::release_waiters`]か[`Broker::stop`]が必ず起こす。
+fn handle_wait_prepared(shared: &Shared) -> FaultResponse {
+    let mut prepared = shared.prepared.lock().unwrap();
+    while prepared.is_none() {
+        prepared = shared.prepared_changed.wait(prepared).unwrap();
+    }
+    match *prepared {
+        Some(true) => FaultResponse::Retry,
+        // 準備が配り切れずに終わった。**動かしてよいが、拒否され得ることは隠さない。**
+        _ => FaultResponse::Unavailable {
+            reason: "the workspace preparation finished without covering everything".to_string(),
+        },
+    }
 }
 
 /// 1件のfault要求を処理する。**ここが判定の全てである。**
@@ -427,13 +488,24 @@ fn handle_grant(shared: &Shared, requested: &str) -> FaultResponse {
             shared.granted.lock().unwrap().insert(key);
             FaultResponse::Retry
         }
-        // 書けなかった（共有違反等）。**拒否ではない**——全walkでもう一度試す価値がある。
-        Ok(Err(e)) => FaultResponse::Unavailable {
-            reason: format!("the workspace ACL writer could not materialise the ace: {e}"),
-        },
-        Err(WriterUnavailable) => FaultResponse::Unavailable {
-            reason: "the workspace ACL writer is not accepting requests".to_string(),
-        },
+        // **付与できなかった。ここが「走っている最中に許可を付けられなかった」場所である。**
+        //
+        // そのコマンドはもう巻き戻せないので、せめて**次のコマンドを同じ目に遭わせない**
+        // ——このworkspaceではレーンを信用するのをやめ、以降は従来どおり全walkを待つ。
+        // 掛け金を下ろすのは**こちら側の失敗**のときだけで、ポリシー拒否では下ろさない
+        // （範囲外を叩かれただけでレーンを畳むと、敵対的な子が簡単にレーンを殺せる）。
+        Ok(Err(e)) => {
+            super::distrust_lane(&shared.policy.canonical_workspace, &shared.policy.mode);
+            FaultResponse::Unavailable {
+                reason: format!("the workspace ACL writer could not materialise the ace: {e}"),
+            }
+        }
+        Err(WriterUnavailable) => {
+            super::distrust_lane(&shared.policy.canonical_workspace, &shared.policy.mode);
+            FaultResponse::Unavailable {
+                reason: "the workspace ACL writer is not accepting requests".to_string(),
+            }
+        }
     }
 }
 

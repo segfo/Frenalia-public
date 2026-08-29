@@ -3,17 +3,22 @@
 //!
 //! # なぜこれを測るのか
 //!
-//! レーンを既定に上げてよい理由として「注入できないプロセスは待たされるだけだから安全」と
-//! 言えるかどうかが、ここで決まる。**言えるのは半分だけ**である——起動側で決まる話と、
-//! 子孫で起きる話が別だからで、それを2本のテストに分けて固定する。
+//! レーンを既定に上げてよい理由が「注入できないプロセスは待たされるだけだから安全」だからで、
+//! **それが本当に全部のプロセスで成り立つか**をここで測る。場所は2つあり、
+//! 待たせ方が違うので2本に分けてある。
 //!
 //! ```text
-//! 起動側（最上位のシェル）を外す  → レーンに乗せない → 全walkを待って起動 → 成功
-//! 子孫を外す                      → その子孫にはフックが無い → 未準備アクセスは拒否
+//! 起動側（最上位のシェル）を外す → レーンに乗せない → 全walkを待って起動 → 成功
+//! 子孫を外す                     → 一時停止のまま準備の完了を待ってから動かす → 成功
 //! ```
 //!
-//! **この非対称は機構から来ている。** 待つかどうかを決めるのは起動側であり、
-//! **子孫が起きる頃には起動側の判断はもう終わっている**。あとから「やっぱり待つ」へは戻れない。
+//! # なぜ場所によって待たせ方が違うのか
+//!
+//! **待てるのは、まだ1行も実行していないプロセスだけ**である。最上位は起こす前に判断でき、
+//! 子孫は`CREATE_SUSPENDED`で作られた直後に判断できる——どちらもまだ何も起きていない。
+//! **走り出した後は待てない**（`ls`が半分読んだところで巻き戻せない）ので、そこで
+//! 許可を付けられなかった場合だけは別の手当てになる（受付側の掛け金。
+//! `lazy_grant::lane_is_distrusted`）。
 //!
 //! # どちらも境界の穴ではない（D-01）
 //!
@@ -140,6 +145,7 @@ fn an_uninjectable_top_level_shell_waits_for_the_full_walk_instead_of_faulting()
 
     // **シェルそのものを注入の対象外にする。** これが「注入できないプロセス」の作り方。
     let (shell, _) = resolve_shell();
+    let shell = shell.to_string();
     let shell_name = std::path::Path::new(&shell)
         .file_name()
         .expect("the shell has a file name")
@@ -180,38 +186,49 @@ fn an_uninjectable_top_level_shell_waits_for_the_full_walk_instead_of_faulting()
     );
 }
 
-/// **子孫に注入できないときは、待たされるのではなく拒否される。**
+/// **子孫に注入できないときも、待ってから動くので失敗しない。**
 ///
-/// これは欠陥ではなく機構の帰結で、**既定へ上げる判断のときに知っておくべき限界**である
-/// （モジュールdocの非対称）。ここを「いつか直す」と書かずに固定しておくのは、
-/// 直っていないことを緑のテストで隠さないためである。
+/// # ここで「待った」と言い切れる理由（時間を測っていないのに）
 ///
-/// 対で見る（`B-35`）——同じ子孫を**注入の対象外にしなければ読める**ことを先に確かめる。
-/// そうしないと、「そもそも読めないツリーだった」場合と区別できない。
+/// 注入されなかった子孫は**フックを持たない**。フックが無ければ受付へ要求を出す手段が
+/// 無いので、**割り込みで許可を付けてもらうことは原理的にできない**。それでも
+/// ファイルが読めたなら、読めた理由は1つしかない——**動き出す前にツリーが配り終わっていた**、
+/// つまり待ったからである。
+///
+/// 対で見る（`B-35`）——同じ子孫を**注入の対象外にしなければ読める**ことも確かめる。
+/// そうしないと「そもそも読めないツリーだった」場合と区別できない。
 #[test]
 #[ignore = "spawns real AppContainer children and changes real ACLs; run NON-elevated with --test-threads=1"]
-fn an_uninjectable_descendant_is_denied_rather_than_made_to_wait() {
+fn an_uninjectable_descendant_waits_for_the_preparation_instead_of_being_denied() {
     let (_guard, workspace, canonical, grants, _cleanup) =
         prepared_workspace_with_one_unreachable_file("lazy-noinject-desc");
 
-    let started = grant_job::start(grant_job::GrantJobRequest {
-        root: &canonical,
-        ace_grants: grants.clone(),
-        protect_sids: Vec::new(),
-        skip: vec![canonical.join(".harness")],
-        workspace: &canonical,
-        mode: "rwx",
-        capability_generation: "noinject-desc-generation",
-        lane: grant_job::PreparationLane::Lazy,
-    });
-    assert!(started, "the lazy job must start");
-    let pipe = grant_job::lazy_broker_pipe_for(&canonical, "rwx").expect("the receiver must open");
+    // **受付とwriterを自分で持つ。** 背景ジョブに任せると走査が数ミリ秒で終わってしまい、
+    // 子が「待つ」ところへ来る前に受付が閉じる——それでは**待ちを測れない**
+    // （最初にこの形で書いて、実際に測れていなかった）。
+    let mut writer = lazy_grant::writer::AclWriter::start(canonical.clone(), grants.clone());
+    let capabilities: Vec<String> = grants
+        .iter()
+        .filter_map(|g| crate::win_common::sid_to_string(g.sid.as_psid()).ok())
+        .collect();
+    let mut broker = lazy_grant::broker::Broker::start(
+        lazy_grant::broker::FaultPolicy {
+            canonical_workspace: canonical.clone(),
+            skip: vec![canonical.join(".harness")],
+            mode: "rwx".to_string(),
+        },
+        writer.handle(),
+        &capabilities,
+    )
+    .expect("the receiver must open");
+    let pipe = broker.pipe_name().to_string();
 
     let session = ensure_profile(&crate::tier2a::session_profile::current_profile_name())
         .expect("the session profile must exist");
     let workspace_cap =
         workspace_capability_sid(&canonical, "rwx").expect("the rwx capability must exist");
     let (shell, _) = resolve_shell();
+    let shell = shell.to_string();
 
     // 子孫（cmd.exe）に未準備のファイルを読ませる。親は注入されている。
     let script = format!(
@@ -256,11 +273,68 @@ if ("$out" -match '{MARKER}') {{ Write-Output 'descendant=ok' }} else {{ Write-O
     // 対象の1件はもう付与されてしまったので、測り直すために剥がし直す。
     make_unreachable(&workspace.join(TARGET_REL), &grants);
 
-    let excluded = run(Some("cmd.exe"));
+    // --- 本題: 外した子孫が「待つ」こと ---
+    //
+    // **順序が測定そのものである。** 子を起こしてから十分に待ち、その間に
+    // 対象へACEを付ける。**待たない実装なら、付ける前に読んで拒否される。**
+    // 待つ実装なら、`release_waiters`まで動き出さないので、付いた後に読んで成功する。
+    std::env::set_var(lazy_grant::NO_INJECT_ENV, "cmd.exe");
+    let probe = {
+        let script = script.clone();
+        let workspace = workspace.clone();
+        let canonical = canonical.clone();
+        let pipe = pipe.clone();
+        let shell = shell.clone();
+        let session = session.as_psid();
+        let cap = workspace_cap.as_psid();
+        // `PSID`は`Send`ではないが、値は単なるポインタで、指す先はこの関数のスコープが
+        // 生かしている。スレッドはこの関数を出る前にjoinする。
+        let session = crate::win_common::SendHandle(windows::Win32::Foundation::HANDLE(session.0));
+        let cap = crate::win_common::SendHandle(windows::Win32::Foundation::HANDLE(cap.0));
+        std::thread::spawn(move || {
+            let session = session;
+            let cap = cap;
+            let child = spawn_with_workspace(
+                &shell,
+                &["-NoProfile", "-NonInteractive", "-Command", &script],
+                &workspace,
+                &crate::secret_env::build_child_env(),
+                false,
+                PSID(session.0 .0),
+                NetworkCapability::Deny,
+                RedirectorInject::lazy(&canonical, &pipe),
+                &[PSID(cap.0 .0)],
+                DomainIdentity::Capability(PSID(cap.0 .0)),
+            )
+            .expect("spawn the excluded probe");
+            child
+                .write_stdin_read_output_and_wait(None)
+                .map(|(stdout, _, _)| stdout)
+                .unwrap_or_default()
+        })
+    };
+
+    // **待たない実装なら、この間に読み終えて拒否されている。**
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    // 走査が対象へ到達したのと同じことを手で行い、待ち手を起こす。
+    writer
+        .handle()
+        .grant_now(vec![lazy_grant::writer::Node::file(
+            workspace.join(TARGET_REL),
+        )])
+        .expect("the writer is available")
+        .expect("the target must be granted");
+    broker.release_waiters(true);
+
+    let excluded = probe.join().expect("the probe thread must not panic");
     std::env::remove_var(lazy_grant::NO_INJECT_ENV);
+    let _ = broker.stop();
+    let _ = writer.stop_at_safe_point();
+
     assert!(
-        excluded.contains("descendant=denied"),
-        "an excluded descendant has no hook, so its unprepared access must be DENIED \
-         -- it is not made to wait. This is the documented asymmetry, not a bug:\n{excluded}"
+        excluded.contains("descendant=ok"),
+        "an excluded descendant has no hook, so it cannot fault anything in. It only reads the \
+         file if it was still suspended when we granted it -- that is, if it waited. \
+         A denial means it was resumed too early:\n{excluded}"
     );
 }

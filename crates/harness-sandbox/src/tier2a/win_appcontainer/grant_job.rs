@@ -374,7 +374,7 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
     // 入ったコマンドは**レーンがあるのに従来どおり待つ**——受入E2Eが実際にこれで落ちた
     // （`B-18`: 確認と作成を不可分にする）。
     let lazy = match lane {
-        PreparationLane::Lazy => Some(LazyLanePrep::open(root, &ace_grants, &skip, &state)),
+        PreparationLane::Lazy => Some(LazyLanePrep::open(root, &ace_grants, &skip, mode, &state)),
         PreparationLane::FullWalk => None,
     };
 
@@ -523,6 +523,14 @@ fn run_lazy_lane(
     // 子は「もう準備は終わっているのに barrier で待つ」という無駄な待ちへ入る。
     // 閉じたら名前も消す——残すと、起動側が既に無い受付へ子を向ける（`B-14`:
     // 記録の存在で実体の存在を代替しない）。
+    //
+    // **閉じる前に、待っている子を起こす。** フックを入れられずに一時停止したまま
+    // 待っている子が居るので、走査の成否を伝えてから畳む（伝えずに畳むと、その子は
+    // 「配り切れなかった」扱いで動き出す——安全側だが、完走したのに損をする）。
+    let scan_covered_everything = matches!(&scan, Ok(report) if !report.stopped_early);
+    if let Some(broker) = &broker {
+        broker.release_waiters(scan_covered_everything);
+    }
     let broker_stats = broker.map(|mut broker| broker.stop());
     *state.broker_pipe.lock().unwrap() = None;
     if let Some(stats) = broker_stats {
@@ -595,11 +603,12 @@ impl LazyLanePrep {
         root: &Path,
         ace_grants: &[super::OwnedAceGrant],
         skip: &[PathBuf],
+        mode: &str,
         state: &Arc<JobState>,
     ) -> Self {
         let writer =
             super::lazy_grant::writer::AclWriter::start(root.to_path_buf(), ace_grants.to_vec());
-        let broker = match open_broker(root, ace_grants, skip, writer.handle()) {
+        let broker = match open_broker(root, ace_grants, skip, mode, writer.handle()) {
             Ok(broker) => {
                 *state.broker_pipe.lock().unwrap() = Some(broker.pipe_name().to_string());
                 // **開いた時点で`Some(0)`にする。** 完了時にまとめて入れると、走査中はずっと
@@ -620,6 +629,7 @@ fn open_broker(
     root: &Path,
     ace_grants: &[super::OwnedAceGrant],
     skip: &[PathBuf],
+    mode: &str,
     writer: super::lazy_grant::writer::WriterHandle,
 ) -> Result<super::lazy_grant::broker::Broker, String> {
     // [D-84] **全モードのcapability SIDをパイプへ載せる。** 片方だけだと、もう片方の
@@ -638,6 +648,7 @@ fn open_broker(
         super::lazy_grant::broker::FaultPolicy {
             canonical_workspace,
             skip: skip.to_vec(),
+            mode: mode.to_string(),
         },
         writer,
         &capabilities,
