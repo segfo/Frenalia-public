@@ -206,6 +206,91 @@ fn the_default_lane_reports_no_fault_receiver_at_all() {
     assert!(state.broker_pipe.lock().unwrap().is_none());
 }
 
+/// [D-88] **札は1枚しか取れず、取れなかった側は1バイトも書かずに待つ。**
+///
+/// これが「別の`harness.exe`と交差してDACLの書込が消える」を止める仕組みである。
+/// 普段の消え方は拒否側＝安全側だが、`.harness/`の再保護だけは
+/// 「読む→**外す**→書き戻す」なので、交差すると**外したはずの許可が戻る**——
+/// そちらは安全側ではないので、札で止める。
+///
+/// **別スレッドから測る。** Windowsのミューテックスは所有者スレッドに対して再入可能なので、
+/// 同じスレッドで2回取ると成功してしまう（実際にそう書いて、このテストに捕まった）。
+/// 止めたいのは**別プロセス**との交差で、その性質はスレッドをまたいだときに現れる。
+///
+/// 対で見る（`B-35`）——取れる側だけを測ると「常に取れる」実装でも緑になる。
+#[test]
+fn the_preparation_lock_is_held_by_exactly_one_holder_at_a_time() {
+    let name = format!(
+        "Local\\harness-ws-prepare-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+
+    let first = crate::try_acquire_named_lock(&name).expect("nobody holds it yet");
+    let taken_by_other_thread = {
+        let name = name.clone();
+        std::thread::spawn(move || crate::try_acquire_named_lock(&name).is_some())
+            .join()
+            .expect("the probe thread must not panic")
+    };
+    assert!(
+        !taken_by_other_thread,
+        "a second holder must not get the lock while the first still holds it -- \
+         otherwise two processes would write the same DACLs concurrently"
+    );
+
+    drop(first);
+    let taken_after_release = {
+        let name = name.clone();
+        std::thread::spawn(move || crate::try_acquire_named_lock(&name).is_some())
+            .join()
+            .expect("the probe thread must not panic")
+    };
+    assert!(
+        taken_after_release,
+        "the lock must be free again once the holder drops it; otherwise one crashed \
+         preparation would block this workspace forever"
+    );
+}
+
+/// 札の名前は**workspaceとmodeで分かれ、綴りの揺れでは分かれない**。
+///
+/// 分かれすぎると別のworkspaceを不必要に待たせ、**分かれなさすぎると札が2枚あるのと
+/// 同じ**になる（＝止めたかった交差が止まらない）。
+#[test]
+fn the_lock_name_separates_workspaces_and_modes_but_not_spellings() {
+    use super::prepare_lock_name;
+    let a = std::path::Path::new(r"C:\ws\project");
+    let b = std::path::Path::new(r"c:/WS/project/");
+
+    assert_eq!(
+        prepare_lock_name(a, "rwx"),
+        prepare_lock_name(b, "rwx"),
+        "the same workspace spelled differently must map to the same lock"
+    );
+    assert_ne!(
+        prepare_lock_name(a, "rwx"),
+        prepare_lock_name(a, "ro"),
+        "different modes prepare different subjects, so they may run at the same time"
+    );
+    assert_ne!(
+        prepare_lock_name(a, "rwx"),
+        prepare_lock_name(std::path::Path::new(r"C:\ws\other"), "rwx"),
+        "different workspaces must not wait for each other"
+    );
+    // カーネルオブジェクト名に使えない文字が残っていないこと（残ると札が作れず、
+    // **排他が黙って無くなる**、`B-10`）。
+    let name = prepare_lock_name(a, "rwx");
+    assert!(name.starts_with("Local\\"), "{name}");
+    assert!(
+        !name["Local\\".len()..].contains('\\'),
+        "the name after the prefix must not contain another separator: {name}"
+    );
+}
+
 /// lazyレーンは**走査した数と書いた数の両方**を残す。
 ///
 /// 既定レーンでは「書いた数(`rescue_granted`)が0でない」が退化の兆候だったが、

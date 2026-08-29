@@ -367,24 +367,59 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
     }
     crate::tier2a::workspace_capability::mark_tree_preparing(workspace, mode);
 
+    // [D-88] **このworkspaceを準備してよいのは、いつでも1プロセスだけである。**
+    //
+    // DACLの付与は「読む→足す→書き戻す」なので、別の`harness.exe`と交差すると片方の
+    // 書込が消える（lost update）。消えるのは**こちらが足そうとした許可**なので普段は
+    // 拒否側＝安全側へ倒れるが、`.harness/`の再保護だけは「読む→**外す**→書き戻す」で、
+    // 交差すると**外したはずの許可が戻る**——そちらは安全側ではない。
+    //
+    // だから札を1枚だけ置き、**取れたプロセスだけが書く**。取れなければ相手に任せて待つ
+    // （`follow_the_leader`）。設計書§5.1.3の writer-leader mutex がこれである。
+    let leader = crate::try_acquire_named_lock(&prepare_lock_name(workspace, mode));
+
     // [D-88] **lazyレーンの受付は`start`が返る前に開く。**
     //
     // 背景スレッドの中で開くと、`preflight`（＝`start`の呼び出し元）が返った直後に
     // `run_shell`が来たとき、`lazy_broker_pipe_for`がまだ`None`を返す窓ができる。その窓に
     // 入ったコマンドは**レーンがあるのに従来どおり待つ**——受入E2Eが実際にこれで落ちた
     // （`B-18`: 確認と作成を不可分にする）。
-    let lazy = match lane {
-        PreparationLane::Lazy => Some(LazyLanePrep::open(root, &ace_grants, &skip, mode, &state)),
-        PreparationLane::FullWalk => None,
+    //
+    // **札を取れなかったプロセスは受付を開かない。** 開くと、書く権利が無いのに
+    // 割り込みでDACLを書くことになり、札の意味が無くなる。
+    let lazy = match (lane, &leader) {
+        (PreparationLane::Lazy, Some(_)) => {
+            Some(LazyLanePrep::open(root, &ace_grants, &skip, mode, &state))
+        }
+        _ => None,
     };
 
     let root = root.to_path_buf();
     let workspace = workspace.to_path_buf();
     let mode = mode.to_string();
+    let lock_name = prepare_lock_name(&workspace, &mode);
     std::thread::spawn(move || {
-        let result = match lazy {
-            None => run_full_walk_lane(&root, &ace_grants, &protect_sids, &skip, &state),
-            Some(lazy) => run_lazy_lane(&root, lazy, &protect_sids, &skip, &state),
+        let result = match (leader, lazy) {
+            // 札を持っている＝自分が書く。持ったまま最後まで走る。
+            (Some(guard), Some(lazy)) => {
+                let r = run_lazy_lane(&root, lazy, &protect_sids, &skip, &state);
+                drop(guard);
+                r
+            }
+            (Some(guard), None) => {
+                let r = run_full_walk_lane(&root, &ace_grants, &protect_sids, &skip, &state);
+                drop(guard);
+                r
+            }
+            // 札を持っていない＝別のプロセスが準備中。**1バイトも書かずに待つ。**
+            (None, _) => follow_the_leader(
+                &lock_name,
+                &root,
+                &ace_grants,
+                &protect_sids,
+                &skip,
+                &state,
+            ),
         };
         // **成否の記録はここ1箇所**（`B-02`: 2つのレーンで書き方が割れると、片方だけ
         // 台帳へ残らない形になる）。**失敗を台帳へ残す**理由はD-85——残さないと次回の起動は
@@ -403,6 +438,56 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
         state.finished.store(true, Ordering::Release);
     });
     true
+}
+
+/// [D-88] このworkspace＋modeを準備する権利を表す札の名前（writer-leader mutex）。
+///
+/// **`Local\`接頭辞を付ける**——このセッション（ログオンセッション）の中だけで一意なら
+/// 十分で、`Global\`にすると別ユーザーのharnessまで巻き込む。鍵の正規化はジョブ鍵と
+/// 同じものを使う（綴りの揺れで別の札になると、札が2枚あるのと同じになる）。
+fn prepare_lock_name(workspace: &Path, mode: &str) -> String {
+    // **末尾の区切りを先に落とす。** `workspace_key`は綴りの揺れを畳むが、末尾の`\`は
+    // 残す——残ったまま名前にすると`C:\ws`と`C:\ws\`が**別の札**になり、2つのプロセスが
+    // それぞれ別の札を取って「両方が leader」になる。排他が黙って消える形なので、
+    // 自分のテストで見つかるまで気付けなかった（`B-10`）。
+    let folded = crate::tier2a::workspace_capability::workspace_key(workspace);
+    let folded = folded.trim_end_matches(['\\', '/']);
+    format!(
+        "Local\\harness-ws-prepare-{}-{mode}",
+        // カーネルオブジェクト名に使えない文字を潰す。**潰し方が違うと別の札になる**ので、
+        // ここ1箇所だけが決める。
+        folded.replace(['\\', ':', '/'], "_")
+    )
+}
+
+/// [D-88] **別のプロセスが準備している間、1バイトも書かずに待つ。**
+///
+/// 札が空くまで待ち、空いたら**本当に終わっているかを実体で確かめる**。終わっていれば
+/// 何もしない（相手が全部やってくれた）。終わっていなければ自分で全walkをやる——
+/// 相手が途中で落ちた場合（札が放棄された場合）がこれに当たる。
+///
+/// **台帳の「検証済み」だけを根拠にしない**（`B-14`: 記録の存在で実体の存在を代替しない）。
+/// 実DACLを浅く見て、届いていなければやり直す。
+fn follow_the_leader(
+    lock_name: &str,
+    root: &Path,
+    ace_grants: &[super::OwnedAceGrant],
+    protect_sids: &[OwnedSid],
+    skip: &[PathBuf],
+    state: &Arc<JobState>,
+) -> Result<(), String> {
+    crate::with_named_lock(lock_name, || {
+        let sids: Vec<windows::Win32::Security::PSID> =
+            ace_grants.iter().map(|g| g.sid.as_psid()).collect();
+        if super::top_level_child_missing_aces(root, &sids, skip).is_none() {
+            // 相手が配り終えていた。**こちらは何も書かない。**
+            let mut timing = super::PhaseTiming::start();
+            timing.mark("  background: another process prepared this workspace; nothing to do");
+            return Ok(());
+        }
+        // 相手が途中で終わった（落ちた等）。自分が引き継ぐ。
+        run_full_walk_lane(root, ace_grants, protect_sids, skip, state)
+    })
 }
 
 /// フェーズ0.5（[BUG-083](../../../../docs/bugs/BUG-083.md)対策）: `.harness/`を再保護する。

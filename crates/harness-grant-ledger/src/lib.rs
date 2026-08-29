@@ -94,6 +94,80 @@ pub fn with_named_lock<R>(_name: &str, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// [`try_acquire_named_lock`]が返す保持券。**落とすと手放す。**
+///
+/// `Send`にしてあるのは、取ってから別スレッドで仕事をする使い方
+/// （`harness-sandbox`の背景準備ジョブ）のためである。ハンドルは単なる数値で、
+/// 取った側だけが解放する。
+#[cfg(windows)]
+pub struct NamedLock {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for NamedLock {}
+
+#[cfg(windows)]
+impl Drop for NamedLock {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::ReleaseMutex;
+        unsafe {
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+/// 名前付きOSミューテックスを**待たずに**取る。取れなければ`None`。
+///
+/// # [`with_named_lock`]と何が違うのか
+///
+/// あちらは取れるまで待ってからクロージャを走らせる。こちらは**取れたかどうかで
+/// 進路を変えたいとき**に使う——「取れたら自分が仕事をする、取れなければ相手に任せて
+/// 別の道を行く」という分岐は、待ってしまうと書けない。
+///
+/// # 限界: **同じスレッドからは何度でも取れる**（Windowsのミューテックスは再入可能）
+///
+/// 所有者スレッドが同じなら`WaitForSingleObject`は即座に成功する。したがってこれは
+/// **スレッドをまたぐ／プロセスをまたぐ排他**であって、同一スレッド内の二重取得は防がない。
+/// 用途（別の`harness.exe`同士の leader 選出）には十分だが、**同一プロセス内の二重起動を
+/// これで止めようとしないこと**——そちらは別の仕組みが要る
+/// （`harness-sandbox`のジョブ一覧がその役をしている）。
+///
+/// # 前の持ち主が死んでいた場合（`WAIT_ABANDONED`）は**取れた**として扱う
+///
+/// プロセスが解放せずに落ちるとミューテックスは放棄状態になる。Windowsはそれを
+/// 次の待ち手へ`WAIT_ABANDONED`で渡す——**所有権は移っている**ので、`None`を返すと
+/// 「誰も持っていないのに誰も取れない」状態が永久に続く。守られていたはずの状態が
+/// 途中で壊れている可能性は呼び出し側が確かめること。
+#[cfg(windows)]
+pub fn try_acquire_named_lock(name: &str) -> Option<NamedLock> {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+
+    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle =
+        unsafe { CreateMutexW(None, false, windows::core::PCWSTR(wide_name.as_ptr())) }.ok()?;
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+        return Some(NamedLock { handle });
+    }
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    None
+}
+
+/// 非Windowsでは排他しない（このリポジトリの対象機構はWindows専用）。
+#[cfg(not(windows))]
+pub struct NamedLock;
+
+#[cfg(not(windows))]
+pub fn try_acquire_named_lock(_name: &str) -> Option<NamedLock> {
+    Some(NamedLock)
+}
+
 /// `path`のread-only属性を切り替える（Windowsの`attrib +R`/`-R`相当）。
 /// 非Windowsでは何もしない（モジュールdoc「誤削除防止の2層」参照）。
 #[cfg(windows)]
