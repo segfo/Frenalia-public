@@ -675,6 +675,11 @@ mod lazy_descendant_reach_tests;
 #[cfg(all(windows, test))]
 mod lazy_uninjectable_tests;
 
+/// [D-88] 検証6「UX」。**昇格の主条件であるfirst-command-outputのp95**を、現行の全walk待機と
+/// ランダム順で比較して測る。**測ったツリーの構成を同じレポートへ併記する**（同ファイルのdoc）。
+#[cfg(all(windows, test))]
+mod lazy_ux_latency_tests;
+
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;
 

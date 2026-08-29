@@ -19,7 +19,7 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, GetProcessIoCounters, GetProcessTimes, IO_COUNTERS,
 };
 
-use super::test_support::{build_wide_tree, TestDirGuard};
+use super::test_support::{build_wide_tree, percentile, TestDirGuard};
 use super::*;
 
 const FANOUT: usize = 32;
@@ -210,19 +210,10 @@ fn shuffled_arms(state: &mut u64) -> [Arm; 3] {
         Arm::InheritWhileCreating,
         Arm::PropagateAfterCreating,
     ];
-    for i in (1..arms.len()).rev() {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        arms.swap(i, (*state as usize) % (i + 1));
-    }
+    // 乱数の作り方と百分位の取り方は`lazy_ux_latency_tests`（D-88の受入測定6）と共有する
+    // ——**同じ順序の作り方でないと、2つの測定の数字を並べられない**（規則5）。
+    super::test_support::shuffle_in_place(&mut arms, state);
     arms
-}
-
-fn percentile(mut values: Vec<u128>, percentile: usize) -> u128 {
-    values.sort_unstable();
-    let index = ((values.len() - 1) * percentile).div_ceil(100);
-    values[index]
 }
 
 #[test]

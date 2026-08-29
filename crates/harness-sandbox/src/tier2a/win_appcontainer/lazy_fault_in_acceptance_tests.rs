@@ -24,9 +24,10 @@
 //! cargo test -p harness-sandbox --lib -- --ignored --test-threads=1 lazy_fault_in_acceptance
 //! ```
 
-use super::test_support::{protect_dacl_preserve_inherited, scopeguard, TestDirGuard};
+use super::test_support::{
+    cleanup_workspace, make_unreachable, scopeguard, workspace_grants, TestDirGuard,
+};
 use super::*;
-use crate::tier2a::workspace_ledger::WorkspaceMode;
 
 /// 子へ読ませる対象。**深い位置に置く**——祖先も含めて未準備の状態を作り、
 /// 「対象と未準備の祖先だけを割り込みで付与する」経路を通すため。
@@ -48,65 +49,6 @@ fn enable_the_lane_like_production_does() {
         "the probe must select the lazy lane; if the redirector DLL is missing next to the \
          test binary, copy target/debug/harness_redirector.dll into target/debug/deps/"
     );
-}
-
-/// このworkspaceへ配る全モードぶんのACE（D-84。本番の`preflight`と同じ集合）。
-fn workspace_grants(canonical_ws: &std::path::Path) -> Vec<OwnedAceGrant> {
-    WorkspaceMode::ALL
-        .iter()
-        .map(|mode| {
-            let sid = workspace_capability_sid(canonical_ws, mode.as_str())
-                .expect("the workspace capability must exist after preflight (D-54)");
-            OwnedAceGrant {
-                sid,
-                mask: workspace_mode_mask(*mode),
-            }
-        })
-        .collect()
-}
-
-/// `path`を**どのcapability SIDからも届かない状態**にする。
-///
-/// 走査器がまだそのノードへ到達していない状態を、**決定的に**作るための細工である
-/// （本物の「まだ到達していない」はツリーの列挙順に依存し、テストで固定できない）。
-///
-/// 継承ACEはそのままでは剥がせないので、**先にDACLを保護して継承を切り**（そのとき現在の
-/// 実効ACEは明示ACEとして凍結される）、そのうえで対象SIDのACEを落とす。
-fn make_unreachable(path: &std::path::Path, grants: &[OwnedAceGrant]) {
-    protect_dacl_preserve_inherited(path).expect("protect the node's dacl");
-    let sids: Vec<PSID> = grants.iter().map(|g| g.sid.as_psid()).collect();
-    revoke::revoke_sids_from_node(path, &sids).expect("strip the capability aces from the node");
-    assert!(
-        revoke::sid_effective_ace_masks(path, &sids)
-            .expect("read back the dacl")
-            .iter()
-            .all(Option::is_none),
-        "the setup must actually make {} unreachable, otherwise the measurement means nothing",
-        path.display()
-    );
-}
-
-/// 実マシンに残るものを戻す。**ACEを剥がしてから台帳を落とす**——逆にすると主体を引けなくなり、
-/// 撤収経路の無いACEが残る（`workspace_capability::forget_capability`のdocが定める不変条件）。
-///
-/// ツリー自体は`TestDirGuard`が消すが、**台帳エントリは消えない**ので明示的に落とす
-/// （`B-01`: 付けたものを剥がす経路を同時に作る）。
-fn cleanup_workspace(canonical_ws: &std::path::Path) {
-    let sids: Vec<crate::win_common::OwnedSid> = WorkspaceMode::ALL
-        .iter()
-        .filter_map(|mode| workspace_capability_sid(canonical_ws, mode.as_str()).ok())
-        .collect();
-    if canonical_ws.exists() {
-        let psids: Vec<PSID> = sids.iter().map(|s| s.as_psid()).collect();
-        match revoke::revoke_workspace_sids_recursive(canonical_ws, &psids, &|_, _| {}) {
-            Ok(report) => eprintln!("cleanup: workspace aces revoked: {report:?}"),
-            Err(e) => eprintln!("cleanup: workspace revoke failed: {e}"),
-        }
-    }
-    // **台帳は2つある**（下の`remove_workspace_entry`の理由は`lazy_uninjectable_tests`と同じ）。
-    let forgotten = crate::tier2a::workspace_capability::forget_capability(canonical_ws, "");
-    crate::tier2a::workspace_ledger::remove_workspace_entry(canonical_ws);
-    eprintln!("cleanup: ledger entries dropped: {forgotten:?}");
 }
 
 /// 同じ子を同じ形で起こし、**注入するものだけを変えて**対象を読ませる。

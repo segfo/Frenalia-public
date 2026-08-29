@@ -29,53 +29,13 @@
 //! cargo test -p harness-sandbox --lib -- --ignored --test-threads=1 lazy_uninjectable
 //! ```
 
-use super::test_support::{scopeguard, TestDirGuard};
+use super::test_support::{
+    cleanup_workspace, make_unreachable, scopeguard, workspace_grants, TestDirGuard,
+};
 use super::*;
-use crate::tier2a::workspace_ledger::WorkspaceMode;
 
 const TARGET_REL: &str = r"late\deep\target.txt";
 const MARKER: &str = "lazy-uninjectable-marker";
-
-fn workspace_grants(canonical_ws: &std::path::Path) -> Vec<OwnedAceGrant> {
-    WorkspaceMode::ALL
-        .iter()
-        .map(|mode| OwnedAceGrant {
-            sid: workspace_capability_sid(canonical_ws, mode.as_str())
-                .expect("the workspace capability must exist after preflight"),
-            mask: workspace_mode_mask(*mode),
-        })
-        .collect()
-}
-
-fn make_unreachable(path: &std::path::Path, grants: &[OwnedAceGrant]) {
-    super::test_support::protect_dacl_preserve_inherited(path).expect("protect the node's dacl");
-    let sids: Vec<PSID> = grants.iter().map(|g| g.sid.as_psid()).collect();
-    revoke::revoke_sids_from_node(path, &sids).expect("strip the capability aces");
-    assert!(
-        revoke::sid_effective_ace_masks(path, &sids)
-            .expect("read back the dacl")
-            .iter()
-            .all(Option::is_none),
-        "the setup must actually make {} unreachable",
-        path.display()
-    );
-}
-
-fn cleanup_workspace(canonical_ws: &std::path::Path) {
-    let sids: Vec<crate::win_common::OwnedSid> = WorkspaceMode::ALL
-        .iter()
-        .filter_map(|mode| workspace_capability_sid(canonical_ws, mode.as_str()).ok())
-        .collect();
-    if canonical_ws.exists() {
-        let psids: Vec<PSID> = sids.iter().map(|s| s.as_psid()).collect();
-        let _ = revoke::revoke_workspace_sids_recursive(canonical_ws, &psids, &|_, _| {});
-    }
-    // **台帳は2つある。** capability台帳だけ落として workspace台帳を残すと、
-    // `harness fs list` に実体の無いエントリが積み上がる（実際に26件積んだ）。
-    // `B-01`: 付けたものを剥がす対は、**付けた先の数だけ**要る。
-    let _ = crate::tier2a::workspace_capability::forget_capability(canonical_ws, "");
-    crate::tier2a::workspace_ledger::remove_workspace_entry(canonical_ws);
-}
 
 /// `label`のworkspaceを作り、`preflight`まで通して「対象1件だけが未準備」の状態にする。
 ///

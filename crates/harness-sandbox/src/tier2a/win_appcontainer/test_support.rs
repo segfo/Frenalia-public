@@ -441,3 +441,96 @@ impl Drop for SubstDrive {
         let _ = std::fs::remove_dir_all(&self.backing);
     }
 }
+
+/// このworkspaceへ配る**全モードぶん**のACE（D-84。本番の`preflight`と同じ集合）。
+///
+/// `docs/CODE-STRUCTURE-RULES.md`規則5によりここ1箇所に置く。元は
+/// `lazy_fault_in_acceptance_tests`と`lazy_descendant_reach_tests`に**同じものが2つ**あり、
+/// 3つ目（UX測定）を作る前にここへ畳んだ。
+pub(super) fn workspace_grants(canonical_ws: &std::path::Path) -> Vec<super::OwnedAceGrant> {
+    WorkspaceMode::ALL
+        .iter()
+        .map(|mode| super::OwnedAceGrant {
+            sid: super::workspace_capability_sid(canonical_ws, mode.as_str())
+                .expect("the workspace capability must exist after preflight (D-54)"),
+            mask: super::workspace_mode_mask(*mode),
+        })
+        .collect()
+}
+
+/// `path`を**どのcapability SIDからも届かない状態**にする。
+///
+/// 走査器がまだそのノードへ到達していない状態を、**決定的に**作るための細工である
+/// （本物の「まだ到達していない」はツリーの列挙順に依存し、テストで固定できない）。
+///
+/// 継承ACEはそのままでは剥がせないので、**先にDACLを保護して継承を切り**（そのとき現在の
+/// 実効ACEは明示ACEとして凍結される）、そのうえで対象SIDのACEを落とす。
+///
+/// 元はD-88の実機テスト3本に**同じものが3つ**あった（規則5でここへ畳んだ）。
+pub(super) fn make_unreachable(path: &std::path::Path, grants: &[super::OwnedAceGrant]) {
+    use windows::Win32::Security::PSID;
+    protect_dacl_preserve_inherited(path).expect("protect the node's dacl");
+    let sids: Vec<PSID> = grants.iter().map(|g| g.sid.as_psid()).collect();
+    super::revoke::revoke_sids_from_node(path, &sids)
+        .expect("strip the capability aces from the node");
+    assert!(
+        super::revoke::sid_effective_ace_masks(path, &sids)
+            .expect("read back the dacl")
+            .iter()
+            .all(Option::is_none),
+        "the setup must actually make {} unreachable, otherwise the measurement means nothing",
+        path.display()
+    );
+}
+
+/// 実マシンに残るものを戻す。**ACEを剥がしてから台帳を落とす**——逆にすると主体を引けなくなり、
+/// 撤収経路の無いACEが残る（`workspace_capability::forget_capability`のdocが定める不変条件）。
+///
+/// # 台帳は2つある（`B-01`）
+///
+/// capability台帳（`forget_capability`）だけ落として**workspace台帳を残すと**、実体の無い
+/// エントリが`harness fs list`に積み上がる——実際に26件積んだ。付けた先の数だけ剥がす。
+///
+/// ツリー本体は呼び出し側（`TestDirGuard`など）が消す。ここが消すのは
+/// **ACEと台帳エントリだけ**である。
+pub(super) fn cleanup_workspace(canonical_ws: &std::path::Path) {
+    let sids: Vec<crate::win_common::OwnedSid> = WorkspaceMode::ALL
+        .iter()
+        .filter_map(|mode| super::workspace_capability_sid(canonical_ws, mode.as_str()).ok())
+        .collect();
+    if canonical_ws.exists() {
+        let psids: Vec<windows::Win32::Security::PSID> = sids.iter().map(|s| s.as_psid()).collect();
+        match super::revoke::revoke_workspace_sids_recursive(canonical_ws, &psids, &|_, _| {}) {
+            Ok(report) => eprintln!("cleanup: workspace aces revoked: {report:?}"),
+            Err(e) => eprintln!("cleanup: workspace revoke failed: {e}"),
+        }
+    }
+    let forgotten = crate::tier2a::workspace_capability::forget_capability(canonical_ws, "");
+    crate::tier2a::workspace_ledger::remove_workspace_entry(canonical_ws);
+    eprintln!("cleanup: ledger entries dropped: {forgotten:?}");
+}
+
+/// 昇順に並べたときの`percentile`番目の値（0〜100）。**標本数が少ないとp95は最悪値そのもの**
+/// になる（n=20なら20回中の最悪値）——結果を書くときはその解釈を添えること。
+///
+/// 元は`acl_payment_model_tests`のprivate定義。UX測定（`lazy_ux_latency_tests`）が
+/// 同じものを要るので、写さずここへ移した（規則5）。
+pub(super) fn percentile(mut values: Vec<u128>, percentile: usize) -> u128 {
+    values.sort_unstable();
+    let index = ((values.len() - 1) * percentile).div_ceil(100);
+    values[index]
+}
+
+/// xorshiftで`items`をその場でシャッフルする（**腕の実行順をランダムにする**ため）。
+///
+/// 順序を固定すると、キャッシュの温まりやディスクの状態といった**時間とともに動くもの**が
+/// 特定の腕へ偏って乗る。乱数源を`state`として外へ出してあるので、呼び出し側は種を
+/// 結果へ記録でき、同じ順序を再現できる。
+pub(super) fn shuffle_in_place<T>(items: &mut [T], state: &mut u64) {
+    for i in (1..items.len()).rev() {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        items.swap(i, (*state as usize) % (i + 1));
+    }
+}
