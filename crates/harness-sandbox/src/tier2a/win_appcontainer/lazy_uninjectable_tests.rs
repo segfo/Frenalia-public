@@ -70,7 +70,11 @@ fn cleanup_workspace(canonical_ws: &std::path::Path) {
         let psids: Vec<PSID> = sids.iter().map(|s| s.as_psid()).collect();
         let _ = revoke::revoke_workspace_sids_recursive(canonical_ws, &psids, &|_, _| {});
     }
+    // **台帳は2つある。** capability台帳だけ落として workspace台帳を残すと、
+    // `harness fs list` に実体の無いエントリが積み上がる（実際に26件積んだ）。
+    // `B-01`: 付けたものを剥がす対は、**付けた先の数だけ**要る。
     let _ = crate::tier2a::workspace_capability::forget_capability(canonical_ws, "");
+    crate::tier2a::workspace_ledger::remove_workspace_entry(canonical_ws);
 }
 
 /// `label`のworkspaceを作り、`preflight`まで通して「対象1件だけが未準備」の状態にする。

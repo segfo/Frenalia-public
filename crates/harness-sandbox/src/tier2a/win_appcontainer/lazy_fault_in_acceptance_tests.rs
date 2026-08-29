@@ -103,7 +103,9 @@ fn cleanup_workspace(canonical_ws: &std::path::Path) {
             Err(e) => eprintln!("cleanup: workspace revoke failed: {e}"),
         }
     }
+    // **台帳は2つある**（下の`remove_workspace_entry`の理由は`lazy_uninjectable_tests`と同じ）。
     let forgotten = crate::tier2a::workspace_capability::forget_capability(canonical_ws, "");
+    crate::tier2a::workspace_ledger::remove_workspace_entry(canonical_ws);
     eprintln!("cleanup: ledger entries dropped: {forgotten:?}");
 }
 
