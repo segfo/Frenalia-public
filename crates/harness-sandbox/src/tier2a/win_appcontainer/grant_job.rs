@@ -920,6 +920,12 @@ fn wait_for_job_reporting(
 #[path = "grant_job_lane_tests.rs"]
 mod grant_job_lane_tests;
 
+/// [D-88] 受入4「競合」——**別プロセスとの交差**。ここも`grant_job`の子モジュールに置く
+/// （[`prepare_lock_name`]が要り、**可視性をテストの都合で広げない**ため。上と同じ理由）。
+#[cfg(all(windows, test))]
+#[path = "grant_job_contention_tests.rs"]
+mod grant_job_contention_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

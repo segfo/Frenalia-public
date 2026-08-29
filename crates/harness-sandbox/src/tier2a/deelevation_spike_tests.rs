@@ -62,12 +62,11 @@ const ELEVATED_MARKER: &str = "running with an elevated (administrator) token";
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// `target/debug/deps/harness_sandbox-<hash>.exe` → `target/debug/harness.exe`。
+///
+/// **実体は`win_appcontainer::test_support`が持つ**——D-88の受入4「競合」が同じ解決を要り、
+/// このファイルは判定が出たら消えるスパイクなので、**消えても残る場所**へ移した（規則5）。
 fn harness_exe() -> PathBuf {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop(); // deps/
-    p.pop(); // debug/
-    p.push("harness.exe");
-    p
+    crate::tier2a::win_appcontainer::test_support::harness_exe()
 }
 
 fn windir() -> String {

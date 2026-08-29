@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use super::{run_full_walk_lane, run_lazy_lane, JobState, LazyLanePrep};
 use crate::tier2a::win_appcontainer as wac;
-use wac::test_support::TestDirGuard;
+use wac::test_support::{reachability, TestDirGuard};
 use wac::{capability_sid_from_name, workspace_rwx_mask, OwnedAceGrant};
 
 fn lane_grants(label: &str) -> Vec<OwnedAceGrant> {
@@ -27,32 +27,6 @@ fn lane_grants(label: &str) -> Vec<OwnedAceGrant> {
         sid,
         mask: workspace_rwx_mask(),
     }]
-}
-
-/// ツリーの全ノードについて「この主体へ届いているか」を集めた一覧を返す。
-/// **rootからの相対パスで持つ**ので、2つのレーンを別々のディレクトリで走らせても比較できる。
-fn reachability(root: &std::path::Path, grants: &[OwnedAceGrant]) -> Vec<(String, bool)> {
-    let sids: Vec<_> = grants.iter().map(|g| g.sid.as_psid()).collect();
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-    wac::acl_grant::collect_dirs_and_files(root, &mut dirs, &mut files, wac::OnVanished::Abort)
-        .expect("enumerate the tree");
-    let mut out: Vec<(String, bool)> = dirs
-        .into_iter()
-        .chain(files)
-        .map(|node| {
-            let rel = node
-                .strip_prefix(root)
-                .map(|p| p.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            let reached = wac::revoke::sid_effective_ace_masks(&node, &sids)
-                .map(|masks| masks.iter().all(Option::is_some))
-                .unwrap_or(false);
-            (rel, reached)
-        })
-        .collect();
-    out.sort();
-    out
 }
 
 /// 比較用に**同じ形**のツリーを作る。**ノード数は11**——ディレクトリ4

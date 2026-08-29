@@ -458,6 +458,58 @@ pub(super) fn workspace_grants(canonical_ws: &std::path::Path) -> Vec<super::Own
         .collect()
 }
 
+/// テストバイナリの隣（`target/debug/deps/`）から2つ上がった`target/debug/harness.exe`。
+///
+/// **「もう1つのharness」を起こす測定が共有する**（`docs/CODE-STRUCTURE-RULES.md`規則5）。
+/// 元は`tier2a::deelevation_spike_tests`のprivate定義で、そちらは判定が出たら消える
+/// スパイクなので、**消えても残る場所**へ移した。
+///
+/// 存在確認はしない——呼び出し側が「無ければビルド手順を添えて落とす」を自分の文面で
+/// 書けるようにするためである（`mac_spike_tests::probe_exe`は逆に確認まで持っている）。
+pub(crate) fn harness_exe() -> std::path::PathBuf {
+    let mut p = std::env::current_exe().expect("current_exe");
+    p.pop(); // deps/
+    p.pop(); // debug/
+    p.push("harness.exe");
+    p
+}
+
+/// ツリーの全ノードについて「この主体たちへ届いているか」を集めた一覧を返す。
+/// **rootからの相対パス（小文字）**で持つので、別々のディレクトリの結果でも比較できる。
+///
+/// **「届いているか」なので継承ACEを数える**（`sid_effective_ace_masks`）。明示ACEだけを
+/// 見る口（`sid_ace_mask`）と取り違えると、継承で届いているノードを「届いていない」と読む
+/// （[BUG-081](../../../../docs/bugs/BUG-081.md)がその形）。
+///
+/// 元は`grant_job_lane_tests`のprivate定義。3つ目の利用者（受入4「競合」の取りこぼし検算）が
+/// 要るので写さずここへ移した（規則5）。
+pub(super) fn reachability(
+    root: &std::path::Path,
+    grants: &[super::OwnedAceGrant],
+) -> Vec<(String, bool)> {
+    let sids: Vec<_> = grants.iter().map(|g| g.sid.as_psid()).collect();
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    super::acl_grant::collect_dirs_and_files(root, &mut dirs, &mut files, super::OnVanished::Abort)
+        .expect("enumerate the tree");
+    let mut out: Vec<(String, bool)> = dirs
+        .into_iter()
+        .chain(files)
+        .map(|node| {
+            let rel = node
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let reached = super::revoke::sid_effective_ace_masks(&node, &sids)
+                .map(|masks| masks.iter().all(Option::is_some))
+                .unwrap_or(false);
+            (rel, reached)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// `path`を**どのcapability SIDからも届かない状態**にする。
 ///
 /// 走査器がまだそのノードへ到達していない状態を、**決定的に**作るための細工である
