@@ -670,6 +670,11 @@ mod lazy_fault_in_acceptance_tests;
 #[cfg(all(windows, test))]
 mod lazy_descendant_reach_tests;
 
+/// [D-88] **注入できないプロセスがどうなるか**を、注入を意図的に外して測る。
+/// 最上位は待つ／子孫は拒否される、という非対称を固定する（同ファイルのモジュールdoc）。
+#[cfg(all(windows, test))]
+mod lazy_uninjectable_tests;
+
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;
 

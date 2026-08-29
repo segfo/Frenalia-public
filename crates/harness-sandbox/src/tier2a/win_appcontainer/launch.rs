@@ -193,7 +193,7 @@ pub fn spawn_shell_in_workspace(
     // 外してよいのは、外した先に**要るものが要った瞬間に開く**仕掛けがあるときだけである。
     // その仕掛け＝fault受付が今このworkspaceに開いているかを、`lazy_broker_pipe_for`が答える
     // （`None`なら開いていない＝今日と同じく待つ）。
-    if let Some(pipe) = lazy_lane_pipe(&req, &canonical_workspace) {
+    if let Some(pipe) = lazy_lane_pipe(&req, &canonical_workspace, &bin) {
         match spawn(RedirectorInject::lazy(&canonical_workspace, &pipe)) {
             Ok(child) => return Ok((child, shell_label)),
             // resume**前**の失敗（注入・ハンドシェイク）。子はユーザーコードを1行も
@@ -227,8 +227,19 @@ pub fn spawn_shell_in_workspace(
 ///    実体の存在を代替しない）。
 /// 2. **このworkspaceにfault受付が今開いている。** 開いているのは準備中の間だけなので、
 ///    2回目以降の起動（`ready`）や既定レーンでは`None`になり、従来の経路へ落ちる。
-fn lazy_lane_pipe(req: &WorkspaceSpawn, canonical_workspace: &std::path::Path) -> Option<String> {
+/// 3. **このシェルが注入の対象外に指定されていない。** 指定されているなら、注入しても
+///    フックが無い状態で走ることになるので、**最初からレーンに乗せず全walkを待つ**
+///    （`lazy_grant::NO_INJECT_ENV`）。ここで弾くと、下の`wait_until_done`へそのまま落ちる
+///    ——**これが「注入できないプロセスは待たされる」の実装である。**
+fn lazy_lane_pipe(
+    req: &WorkspaceSpawn,
+    canonical_workspace: &std::path::Path,
+    shell: &str,
+) -> Option<String> {
     if req.cow_diff_layer_dir.is_some() {
+        return None;
+    }
+    if super::lazy_grant::injection_is_excluded_for(std::path::Path::new(shell)) {
         return None;
     }
     grant_job::lazy_broker_pipe_for(canonical_workspace, req.workspace_mode())

@@ -292,6 +292,49 @@ pub(crate) unsafe fn inject_grandchild(process: HANDLE, cfg: &Config) -> bool {
 /// `hThread`を読み、孫プロセスへ`inject_grandchild`し、呼び出し元が元々`CREATE_SUSPENDED`を
 /// 要求していなければ`ResumeThread`する（Q6: 生成自体は拒否しない）。`CreateProcessW`/
 /// `CreateProcessAsUserW`の両フックから共有する（BUG-041修正、モジュールdoc参照）。
+/// [D-88] 注入しないプロセス名の一覧を運ぶ環境変数。**起動側が積んだものをそのまま読む**
+/// （`win_appcontainer::lazy_grant::NO_INJECT_ENV`と同じ綴り。両端で別々に決めない）。
+pub(crate) const NO_INJECT_ENV: &str = "HARNESS_REDIRECTOR_NO_INJECT";
+
+/// `process`の実行像が[`NO_INJECT_ENV`]の一覧に入っているか。
+///
+/// **判定できなければ「入っていない」＝注入する側へ倒す。** 外し損ねても失われるのは
+/// 透過性だけだが、外しすぎるとレーンが黙って効かなくなる（`B-10`）。
+///
+/// # Safety
+/// `process`は`PROCESS_QUERY_LIMITED_INFORMATION`相当を持つ有効なハンドルであること。
+unsafe fn grandchild_injection_is_excluded(process: HANDLE) -> bool {
+    let Ok(list) = std::env::var(NO_INJECT_ENV) else {
+        return false;
+    };
+    if list.trim().is_empty() {
+        return false;
+    }
+    let mut buf = [0u16; 260];
+    let mut len = buf.len() as u32;
+    let ok = unsafe {
+        windows::Win32::System::Threading::QueryFullProcessImageNameW(
+            process,
+            windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    if ok.is_err() || len == 0 {
+        return false;
+    }
+    let full = String::from_utf16_lossy(&buf[..len as usize]);
+    let Some(name) = std::path::Path::new(&full)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+    else {
+        return false;
+    };
+    list.split(';')
+        .map(|entry| entry.trim().to_lowercase())
+        .any(|entry| !entry.is_empty() && entry == name)
+}
+
 pub(crate) unsafe fn inject_grandchild_and_maybe_resume(
     process_information: *mut c_void,
     caller_wanted_suspended: bool,
@@ -304,6 +347,23 @@ pub(crate) unsafe fn inject_grandchild_and_maybe_resume(
         return;
     }
     let pi = unsafe { &*(process_information as *const PROCESS_INFORMATION) };
+    // [D-88] **注入の対象外に指定された像なら、ここで降りる。**
+    //
+    // 判定を4つのプロセス生成フックそれぞれではなくここへ置くのは、**全部がここを通る**
+    // からである（`B-06`: 決定は経路の共通点へ置く）。外した子孫はフックを持たないので、
+    // 未準備のファイルへのアクセスは**待たされるのではなく拒否される**——
+    // 起動側の「待つ／待たない」の判断は、子孫が起きる頃にはもう終わっている。
+    if unsafe { grandchild_injection_is_excluded(pi.hProcess) } {
+        debug_log(&format!(
+            "{caller}: skipping injection because the image is on {NO_INJECT_ENV}"
+        ));
+        if !caller_wanted_suspended {
+            unsafe {
+                let _ = windows::Win32::System::Threading::ResumeThread(pi.hThread);
+            }
+        }
+        return;
+    }
     debug_log(&format!(
         "{caller}: process_handle={:#x} thread_handle={:#x} caller_wanted_suspended={caller_wanted_suspended}, calling inject_grandchild",
         pi.hProcess.0 as usize, pi.hThread.0 as usize

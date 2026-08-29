@@ -83,7 +83,11 @@ const PRODUCTION_ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "HARNESS_TIER2A_LAZY_ACE",
-        "Lazy ACE fault-inレーンを有効にする実験的スイッチ（D-88。既定は無効で、受入を満たして既定へ上げたら消す）",
+        "Lazy ACE fault-inレーンを**切る**逃がし弁（D-88。既定は有効。注入と相性の悪い場面で従来の全walk待機へ戻す）",
+    ),
+    (
+        "HARNESS_REDIRECTOR_NO_INJECT",
+        "Redirector DLLを注入しないプロセス名の一覧（`;`区切り。相性の悪いツールの緊急回避と、フォールバックの検証に使う）",
     ),
     (
         "HARNESS_PROBE_DIR",

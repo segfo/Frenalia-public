@@ -793,6 +793,14 @@ fn spawn_impl(
         if let Some(pipe) = cow.broker_pipe {
             env_owned.push(("HARNESS_LAZY_BROKER_PIPE".to_string(), pipe.to_string()));
         }
+        // [D-88] 注入の対象外一覧を子へも渡す。**親と子孫が同じ一覧を見る**ようにしないと、
+        // 「外したつもりのプロセスが孫では注入される」というちぐはぐな状態になる
+        // （`B-05`: 同じ決定を2つの綴りで持たない）。子は環境を継承しないので明示的に積む。
+        if let Ok(list) = std::env::var(super::lazy_grant::NO_INJECT_ENV) {
+            if !list.trim().is_empty() {
+                env_owned.push((super::lazy_grant::NO_INJECT_ENV.to_string(), list));
+            }
+        }
         env_owned.push((
             "HARNESS_COW_READY_HANDLE".to_string(),
             (ready_write.0 as usize).to_string(),
