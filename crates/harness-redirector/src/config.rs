@@ -125,9 +125,18 @@ pub(crate) fn debug_log(msg: &str) {
     if !cfg!(debug_assertions) {
         return;
     }
+    // [D-88] **差分層が空のときは`%TEMP%`へ落とす。**
+    //
+    // `PathBuf::new().join("x")`は`"x"`——つまり**相対パス**になり、子のカレント
+    // ディレクトリ（＝ワークスペースのroot）へログが落ちる。DirectRwのlazyレーンには
+    // 差分層が無いので、この分岐が無いと**利用者のリポジトリに`.harness-cow-debug.log`が
+    // 生える**（実際に生やした）。デバッグビルドだけとはいえ、フックが自分の作業物を
+    // 相手の作業場へ置くのは筋が悪い。
     let path = match CONFIG.get() {
-        Some(cfg) => cfg.diff_layer_dir.join(".harness-cow-debug.log"),
-        None => std::env::temp_dir().join("harness-cow-debug.log"),
+        Some(cfg) if !cfg.diff_layer_dir.as_os_str().is_empty() => {
+            cfg.diff_layer_dir.join(".harness-cow-debug.log")
+        }
+        _ => std::env::temp_dir().join("harness-cow-debug.log"),
     };
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)

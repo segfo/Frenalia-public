@@ -665,6 +665,11 @@ pub(crate) mod test_support;
 #[cfg(all(windows, test))]
 mod lazy_fault_in_acceptance_tests;
 
+/// [D-88] 検証3「子孫到達」。**`cargo build`では測れない**ので、ワークスペースの中と
+/// OS標準のものだけで多段のプロセスを起こす代用で測る（同ファイルのモジュールdoc）。
+#[cfg(all(windows, test))]
+mod lazy_descendant_reach_tests;
+
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;
 
