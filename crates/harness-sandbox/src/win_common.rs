@@ -301,9 +301,14 @@ pub(crate) fn decode_ansi_lossy(bytes: &[u8]) -> String {
 }
 
 /// `HANDLE`は`windows`クレートで`Send`を実装しない（生ポインタ相当のため）。
-/// `read_two_pipes_to_strings`がスレッド間で1回だけ受け渡すための最小限のラッパ
-/// （`win_appcontainer::KillToken`と同じ「単純な数値ハンドルなので実際には安全」という判断）。
-struct SendHandle(HANDLE);
+/// スレッド間で受け渡すための最小限のラッパ（`win_appcontainer::KillToken`と同じ
+/// 「単純な数値ハンドルなので実際には安全」という判断）。
+///
+/// **`docs/CODE-STRUCTURE-RULES.md`規則5により写しを作らない。** 使うのは
+/// [`read_two_pipes_to_strings`]（stdout/stderrを2スレッドで読む）と、
+/// `tier2a::win_appcontainer::lazy_grant::broker`（接続ごとのハンドラスレッドへ
+/// パイプを渡す、D-88）の2箇所である。
+pub(crate) struct SendHandle(pub(crate) HANDLE);
 unsafe impl Send for SendHandle {}
 
 /// stdout/stderrを2スレッドで並行に読み切る（Phase5-E、`run_shell`不安定性調査）。

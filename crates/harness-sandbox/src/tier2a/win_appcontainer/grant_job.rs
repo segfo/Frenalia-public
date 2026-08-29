@@ -140,6 +140,19 @@ pub struct WorkspaceGrantProgress {
     pub rescue_checked: usize,
     /// フェーズ1がDACLを読めなかったノード数（判定不能なので付与側へ倒した数）。
     pub rescue_probe_errors: usize,
+    /// [D-88] lazyレーンのfault受付が**何件の割り込みを通したか**。
+    ///
+    /// **3つの状態を1つの値で区別する**（`B-35`: 対で見ないと読み違える）。
+    ///
+    /// - `None` — 受付が開いていない。既定レーンで走っているか、lazyレーンだが受付を
+    ///   開けなかった（その場合は準備は進むが、子は割り込めない）。
+    /// - `Some(0)` — 受付は開いたが、**割り込みは1件も来なかった**。
+    /// - `Some(n)` — n件の割り込みが成立した。
+    ///
+    /// **`Some(0)`と`None`を混ぜてはいけない。** 前者は「効く用意はできていた」、後者は
+    /// 「そもそも用意が無かった」で、受入（設計書§5.1.3の検証6「割り込みが成立したことを
+    /// 直接測る」）はこの区別の上に立っている。
+    pub broker_faults_served: Option<usize>,
     pub finished: bool,
     /// 完了していて、かつ失敗していた場合の理由。
     pub error: Option<String>,
@@ -229,6 +242,15 @@ struct JobState {
     rescue_probe_errors: AtomicUsize,
     finished: AtomicBool,
     error: Mutex<Option<String>>,
+    /// [D-88] lazyレーンのfault受付パイプの名前。子へ渡すために起動側が引く
+    /// （[`lazy_broker_pipe_for`]）。**既定レーンでは`None`のまま**で、それが
+    /// 「このworkspaceはlazyで準備していない」の判定そのものになる。
+    ///
+    /// **名前は秘密ではない**（子から`\\.\pipe\`の一覧は取れる）。守るのはパイプのDACLだけ。
+    broker_pipe: Mutex<Option<String>>,
+    /// [D-88] 受付が開いたか、開いたなら何件通したか
+    /// （[`WorkspaceGrantProgress::broker_faults_served`]の実体）。
+    broker_faults_served: Mutex<Option<usize>>,
 }
 
 const PHASE_WALKING: u8 = 1;
@@ -484,10 +506,42 @@ fn run_lazy_lane(
     state.phase.store(PHASE_SCANNING, Ordering::Relaxed);
     let mut writer =
         super::lazy_grant::writer::AclWriter::start(root.to_path_buf(), ace_grants.to_vec());
+
+    // fault受付を開く。**走査より先に開く**——走査の1件目より前に子が奥のファイルを
+    // 開くことは普通に起こるので、受付が後だとその窓のfaultが取りこぼされる。
+    //
+    // **開けなくてもレーンは続ける。** 受付が無ければ子は割り込めないが、走査は進むので
+    // 準備は完了する（遅いだけで壊れない）。ここで`Err`にすると、faultの受付が
+    // 作れないという可用性の問題が**ツリー全体の準備失敗**に化ける。
+    let broker = match open_broker(root, ace_grants, skip, writer.handle()) {
+        Ok(broker) => {
+            *state.broker_pipe.lock().unwrap() = Some(broker.pipe_name().to_string());
+            // **開いた時点で`Some(0)`にする。** 完了時にまとめて入れると、走査中はずっと
+            // `None`＝「受付が無い」に見え、`None`と`Some(0)`の区別（`B-35`）が
+            // 肝心の走査中だけ効かない。
+            *state.broker_faults_served.lock().unwrap() = Some(0);
+            Some(broker)
+        }
+        Err(_) => None,
+    };
+
     let control = ScanProgress {
         state: Arc::clone(state),
     };
     let scan = super::lazy_grant::scanner::scan(root, skip, &writer.handle(), &control);
+
+    // **受付を先に閉じる。** writerを先に畳むと、その後に来たfaultが`Unavailable`になり、
+    // 子は「もう準備は終わっているのに barrier で待つ」という無駄な待ちへ入る。
+    // 閉じたら名前も消す——残すと、起動側が既に無い受付へ子を向ける（`B-14`:
+    // 記録の存在で実体の存在を代替しない）。
+    let broker_stats = broker.map(|mut broker| broker.stop());
+    *state.broker_pipe.lock().unwrap() = None;
+    if let Some(stats) = broker_stats {
+        // **受付が閉じても件数は残す。** 消すと「割り込みが成立したか」を事後に測れない
+        // （設計書§5.1.3の検証6が要求している唯一の数字）。
+        *state.broker_faults_served.lock().unwrap() = Some(stats.served);
+    }
+
     // **走査の成否に関わらずwriterは畳む**（安全点で1件を完了させてから止まる）。
     // ここを早期returnで飛ばすと、スレッドとACL書込の主体が残る（`B-01`）。
     let stats = writer.stop_at_safe_point();
@@ -523,7 +577,67 @@ fn run_lazy_lane(
         stats.vanished,
         stats.faults_served
     ));
+    // **受付の内訳も残す。** `served`だけでは「割り込みが効いた」と「そもそも1件も
+    // 来なかった」を区別できず、`denied`と`unavailable`を分けないと
+    // 「境界が働いた」と「こちらが不調だった」が混ざる（`B-35`・`B-10`）。
+    if let Some(broker) = broker_stats {
+        timing.mark(&format!(
+            "  background: lazy broker ({} served, {} denied, {} unavailable, \
+             {} non-appcontainer clients refused)",
+            broker.served, broker.denied, broker.unavailable, broker.rejected_clients
+        ));
+    }
     Ok(())
+}
+
+/// lazyレーンのfault受付を開く。**受け付ける範囲は走査と同じ集合から作る**
+/// （`skip`をそのまま渡す。ここがずれると、走査が意図的に外した場所をbrokerが付け直す、`B-05`）。
+fn open_broker(
+    root: &Path,
+    ace_grants: &[super::OwnedAceGrant],
+    skip: &[PathBuf],
+    writer: super::lazy_grant::writer::WriterHandle,
+) -> Result<super::lazy_grant::broker::Broker, String> {
+    // [D-84] **全モードのcapability SIDをパイプへ載せる。** 片方だけだと、もう片方の
+    // モードのセッションでは子がパイプを開けず、fault-inが**静かに**一度も効かなくなる。
+    let capabilities: Vec<String> = ace_grants
+        .iter()
+        .filter_map(|grant| crate::win_common::sid_to_string(grant.sid.as_psid()).ok())
+        .collect();
+    if capabilities.is_empty() {
+        return Err("no capability sid could be rendered for the broker pipe".to_string());
+    }
+    let canonical_workspace = root
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize the workspace root: {e}"))?;
+    super::lazy_grant::broker::Broker::start(
+        super::lazy_grant::broker::FaultPolicy {
+            canonical_workspace,
+            skip: skip.to_vec(),
+        },
+        writer,
+        &capabilities,
+    )
+}
+
+/// [D-88] 指定した`(workspace, mode)`がlazyレーンで準備中なら、fault受付パイプの名前を返す。
+///
+/// **`None`は「lazyで準備していない」**——既定レーンで走っている、まだ始まっていない、
+/// あるいは既に終わった、のいずれかである。起動側はこの3つを区別する必要が無い
+/// （どれも「今日と同じく待つ」に落ちる）。
+pub fn lazy_broker_pipe_for(workspace: &Path, mode: &str) -> Option<String> {
+    let prefix = format!("{}\u{0}", job_key_prefix(workspace, mode));
+    // 状態を`Arc`で取り出してからジョブ一覧のロックを手放す（一覧のロックを握ったまま
+    // 状態のロックを取ると、2つのロックの順序が経路ごとに変わり得る）。
+    let state = {
+        let list = jobs().lock().unwrap();
+        list.iter()
+            .rev()
+            .find(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, state)| Arc::clone(state))
+    }?;
+    let pipe = state.broker_pipe.lock().unwrap().clone();
+    pipe
 }
 
 /// 走査の進捗を[`JobState`]へ流す。**止める口はまだ繋がっていない**——
@@ -559,6 +673,7 @@ fn snapshot_progress(state: &JobState) -> WorkspaceGrantProgress {
         rescue_granted: state.rescue_granted.load(Ordering::Relaxed),
         rescue_checked: state.rescue_checked.load(Ordering::Relaxed),
         rescue_probe_errors: state.rescue_probe_errors.load(Ordering::Relaxed),
+        broker_faults_served: *state.broker_faults_served.lock().unwrap(),
         finished,
         error: if finished {
             state.error.lock().unwrap().clone()
@@ -707,6 +822,7 @@ mod tests {
             rescue_granted: 0,
             rescue_checked: 0,
             rescue_probe_errors: 0,
+            broker_faults_served: None,
             finished: false,
             error: None,
         };

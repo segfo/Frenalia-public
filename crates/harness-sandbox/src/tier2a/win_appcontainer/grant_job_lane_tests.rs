@@ -157,6 +157,54 @@ fn the_lazy_lane_does_not_grant_inside_the_control_directory() {
     );
 }
 
+/// lazyレーンは**fault受付を開き、終わったら名前を消して件数だけ残す**。
+///
+/// 名前を残すと、起動側が**既に無い受付**へ子を向ける（`B-14`: 記録の存在で実体の存在を
+/// 代替しない）。件数を消すと、「割り込みが成立したか」を事後に測れない
+/// （設計書§5.1.3の検証6が要求する唯一の数字）。**対で見ないと、どちらの間違いも無症状である。**
+#[test]
+fn the_lazy_lane_opens_a_fault_receiver_and_retires_its_name_but_keeps_the_count() {
+    let guard = TestDirGuard::create("lane-broker");
+    let root = guard.path().join("ws");
+    build_tree(&root);
+
+    let grants = lane_grants("broker");
+    let state = Arc::new(JobState::default());
+    assert!(
+        state.broker_pipe.lock().unwrap().is_none(),
+        "nothing is published before the lane runs"
+    );
+
+    run_lazy_lane(&root, &grants, &[], &[], &state).expect("the lazy lane must succeed");
+
+    assert!(
+        state.broker_pipe.lock().unwrap().is_none(),
+        "the pipe name must be retired once the receiver is closed"
+    );
+    assert_eq!(
+        *state.broker_faults_served.lock().unwrap(),
+        Some(0),
+        "Some(0) means the receiver was open and no interrupt arrived; None would mean \
+         it was never opened at all, and those two must never be confused"
+    );
+}
+
+/// 既定レーンは受付を開かない。**`None`のままである**ことを固定する
+/// ——ここが`Some(0)`になると、「受付があったのに1件も来なかった」と読めてしまう。
+#[test]
+fn the_default_lane_reports_no_fault_receiver_at_all() {
+    let guard = TestDirGuard::create("lane-nobroker");
+    let root = guard.path().join("ws");
+    build_tree(&root);
+
+    let state = Arc::new(JobState::default());
+    run_full_walk_lane(&root, &lane_grants("nobroker"), &[], &[], &state)
+        .expect("the default lane must succeed");
+
+    assert_eq!(*state.broker_faults_served.lock().unwrap(), None);
+    assert!(state.broker_pipe.lock().unwrap().is_none());
+}
+
 /// lazyレーンは**走査した数と書いた数の両方**を残す。
 ///
 /// 既定レーンでは「書いた数(`rescue_granted`)が0でない」が退化の兆候だったが、

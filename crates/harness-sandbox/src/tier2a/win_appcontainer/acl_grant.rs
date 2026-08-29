@@ -343,6 +343,26 @@ pub fn with_restore_privilege<T>(f: impl FnOnce() -> T) -> T {
 /// `a`（対象パス）が`base`配下（`base`自身を含む）かを大文字小文字無視で判定する。
 /// 双方canonicalize済みを前提とし、パス成分単位で比較する（文字列の`starts_with`だと
 /// `C:\Windows`が`C:\WindowsApps`に誤マッチするため成分比較にする）。
+/// [`path_is_within`]の**両辺を先に畳んでから**比べる版。
+///
+/// # なぜ2つあるのか（実際に踏んだ穴）
+///
+/// [`path_is_within`]は成分をそのまま比べるので、片側だけが`canonicalize`由来の`\\?\`前置を
+/// 持っていると**一致しない**。`\\?\C:`と`C:`は別の成分だからである。D-88のbrokerで
+/// 実際にこれを踏み、`.harness/`を`skip`に入れているのに一致せず**制御面へACEを付けかけた**
+/// （回帰は`lazy_grant::broker::broker_tests::out_of_scope_requests_are_denied_not_deferred`）。
+///
+/// **片側だけを正規化する経路があるなら、必ずこちらを使う。** 畳み込みは
+/// [`crate::tier2a::workspace_capability::workspace_key`]で、**FS軸の畳み込みは
+/// このリポジトリに1つしか無い**（§22.5・`B-20`。2つ目を書くと`C:/x`と`c:\x`が別物になる）。
+/// 成分比較のほうは残す——文字列の`starts_with`だと`C:\Windows`が`C:\WindowsApps`に誤マッチする。
+pub(crate) fn path_is_within_normalized(a: &Path, base: &Path) -> bool {
+    let fold = |p: &Path| {
+        std::path::PathBuf::from(crate::tier2a::workspace_capability::workspace_key(p))
+    };
+    path_is_within(&fold(a), &fold(base))
+}
+
 pub(crate) fn path_is_within(a: &Path, base: &Path) -> bool {
     let comps = |p: &Path| -> Vec<String> {
         p.components()
@@ -395,8 +415,13 @@ pub fn is_force_grant_forbidden(path: &Path) -> Option<String> {
         .map(std::path::PathBuf::from)
     {
         // windir自体をcanonicalizeして比較する（8.3名やcase差を吸収）。
+        //
+        // **畳んでから比べる**（`path_is_within_normalized`）。`canonicalize`が失敗した
+        // ときだけ生の綴りへフォールバックするので、**片側だけ`\\?\`が付いた状態**が
+        // 起こり得る——素の成分比較だとそこで一致せず、**この拒否が無言で効かなくなる**
+        // （`B-10`: 保険が外れても症状が出ない形。D-88のbrokerで同型を実際に踏んだ）。
         let windir_canon = std::fs::canonicalize(&windir).unwrap_or(windir);
-        if path_is_within(&canon, &windir_canon) {
+        if path_is_within_normalized(&canon, &windir_canon) {
             return Some(format!(
                 "{} is inside the Windows system directory ({}); refusing forced system-ACL grant \
                  (contains registry hives and OS-critical objects)",

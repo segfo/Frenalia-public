@@ -122,6 +122,58 @@ pub fn user_only_security_attributes(sid: &str) -> windows::core::Result<SECURIT
     }
 }
 
+/// [D-88（`plans/DESIGN-SANDBOX-APPPOLICY.md`）] `sid`（呼び出しユーザー）にはフルアクセスを、
+/// `capabilities`（サンドボックスの子が名乗り得るcapability SID）には`access`だけを許す
+/// 記述子を作る。
+///
+/// # なぜ`capabilities`が複数なのか（[D-84]）
+///
+/// workspaceツリーへ配るACEは**全モードぶん**であり、どのモードのcapability SIDを積んだ子が
+/// 接続してくるかは、そのセッションが`rwx`か`ro`かで決まる。**片方しか載せないと、
+/// もう片方のモードのセッションでは子がパイプを開けない**——症状は「fault-inが一度も
+/// 効かない」で、拒否ではないので静かである（`B-10`）。**モードを増やしたらここも増える。**
+///
+/// # [`user_only_security_attributes`]と何が違うのか——**DACLだけ**である
+///
+/// あちらはユーザー専有なので、AppContainerの子は**接続すらできない**
+/// （`plans/handoff-issue-20/T4.md`の実測。privhelperがこの形）。こちらは
+/// **サンドボックスの子から意図的に到達可能にする**形で、MAC設計§10.1が同じものを既に採り、
+/// `plans/mac-spike/RESULTS.md` §S7が「capabilityを積んだ子は往復でき、積まない子は接続すら
+/// できない」を対で実測している。作り方も置き場も同じで、**分けているのはDACLだけ**である。
+///
+/// # パイプ名は秘密に数えない
+///
+/// 子から`\\.\pipe\`の一覧は取れるので、名前を知られないことを前提にしてはならない。
+/// **守るのはこの記述子だけ**である。
+///
+/// `access`はSDDLのアクセス権を16進で埋め込む。呼び出し側は使用後に
+/// `LocalFree(lpSecurityDescriptor)`する責任を持つ（[`user_only_security_attributes`]と同じ）。
+pub fn capability_reachable_security_attributes(
+    sid: &str,
+    capabilities: &[String],
+    access: u32,
+) -> windows::core::Result<SECURITY_ATTRIBUTES> {
+    let mut sddl = format!("D:(A;;GA;;;{sid})");
+    for capability in capabilities {
+        sddl.push_str(&format!("(A;;0x{access:x};;;{capability})"));
+    }
+    unsafe {
+        let sddl_w = wide(&sddl);
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_w.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )?;
+        Ok(SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: false.into(),
+        })
+    }
+}
+
 /// パイプ名の接頭辞。[`unique_pipe_name`]が作り、[`is_harness_pipe_name`]が検証する。
 /// **両者が同じ定数を見ることがこの検証の前提**なので、綴りを2箇所に持たない。
 pub const HARNESS_PIPE_PREFIX: &str = r"\\.\pipe\harness-";
