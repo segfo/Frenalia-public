@@ -893,7 +893,8 @@ fn a_waiting_harness_starts_moving_once_the_leader_finishes_preparing() {
 /// 仕方を持つ。設計（§5.1.3）はそれを、名前付きミューテックスの**放棄状態**
 /// （所有者が解放せずに死ぬとWindowsが次の待ち手へ`WAIT_ABANDONED`で所有権を渡す）で
 /// 受け止めると決めている。ここはその引き継ぎを**初めて実測する**——
-/// [`plans/HANDOFF-BUG-146-LEADER-LOCK.md`]が「測っていないこと」として挙げていた項目である。
+/// 受入4の残り1行でもあり（`plans/HANDOFF-LAZY-ACE-FAULT-IN.md`の表）、実測は
+/// `plans/mac-spike/RESULTS.md` §S29-3にある。
 ///
 /// BUG-146の修正は`with_named_lock`（＝待つ側が通る口）の`WAIT_ABANDONED`の扱いを変えた。
 /// 変える前は「取れなかった」と読んで**排他せずに先へ進み、受け取った所有権も解放しないまま
