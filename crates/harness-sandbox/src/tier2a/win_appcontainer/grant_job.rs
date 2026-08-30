@@ -367,6 +367,11 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
     }
     crate::tier2a::workspace_capability::mark_tree_preparing(workspace, mode);
 
+    let root = root.to_path_buf();
+    let workspace = workspace.to_path_buf();
+    let mode = mode.to_string();
+    let lock_name = prepare_lock_name(&workspace, &mode);
+
     // [D-88] **このworkspaceを準備してよいのは、いつでも1プロセスだけである。**
     //
     // DACLの付与は「読む→足す→書き戻す」なので、別の`harness.exe`と交差すると片方の
@@ -374,33 +379,42 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
     // 拒否側＝安全側へ倒れるが、`.harness/`の再保護だけは「読む→**外す**→書き戻す」で、
     // 交差すると**外したはずの許可が戻る**——そちらは安全側ではない。
     //
-    // だから札を1枚だけ置き、**取れたプロセスだけが書く**。取れなければ相手に任せて待つ
-    // （`follow_the_leader`）。設計書§5.1.3の writer-leader mutex がこれである。
-    let leader = crate::try_acquire_named_lock(&prepare_lock_name(workspace, mode));
-
-    // [D-88] **lazyレーンの受付は`start`が返る前に開く。**
+    // だから名前付きミューテックスを1つだけ置き、**取れたプロセスだけが書く**。取れなければ
+    // 相手に任せて待つ（`follow_the_leader`）。設計書§5.1.3の writer-leader mutex がこれである。
     //
-    // 背景スレッドの中で開くと、`preflight`（＝`start`の呼び出し元）が返った直後に
-    // `run_shell`が来たとき、`lazy_broker_pipe_for`がまだ`None`を返す窓ができる。その窓に
-    // 入ったコマンドは**レーンがあるのに従来どおり待つ**——受入E2Eが実際にこれで落ちた
-    // （`B-18`: 確認と作成を不可分にする）。
+    // [BUG-146] **取得はこのスレッドではなく背景スレッドで行う。** Windowsの名前付き
+    // ミューテックスは所有権が取得したスレッドに紐づくので、ここで取って背景スレッドで
+    // 解放すると`ReleaseMutex`が失敗する。失敗しても`CloseHandle`は成功するため、
+    // 待っている別の`harness.exe`は**leaderのプロセスが終了するまで**動き出せなくなる
+    // （対話セッションは終了しないので、そのworkspaceが実質使えなくなる）。
     //
-    // **札を取れなかったプロセスは受付を開かない。** 開くと、書く権利が無いのに
-    // 割り込みでDACLを書くことになり、札の意味が無くなる。
-    let lazy = match (lane, &leader) {
-        (PreparationLane::Lazy, Some(_)) => {
-            Some(LazyLanePrep::open(root, &ace_grants, &skip, mode, &state))
-        }
-        _ => None,
-    };
-
-    let root = root.to_path_buf();
-    let workspace = workspace.to_path_buf();
-    let mode = mode.to_string();
-    let lock_name = prepare_lock_name(&workspace, &mode);
+    // ただし`start`は、次の2つが済むまでは返れない（下の`ready_rx.recv()`）。
+    //
+    // 1. leaderかどうかが決まること。
+    // 2. [D-88] **lazyレーンの受付の名前が公開されていること。** `preflight`（＝`start`の
+    //    呼び出し元）が返った直後に`run_shell`が来たとき、`lazy_broker_pipe_for`がまだ
+    //    `None`を返す窓ができると、そのコマンドは**レーンがあるのに従来どおり待つ**
+    //    ——受入E2Eが実際にこれで落ちた（`B-18`: 確認と作成を不可分にする）。
+    //
+    // 待ち時間は移す前と同じである（取得は待たない`try_`で、受付の開設はもともと`start`が
+    // 同期的に払っていた）。
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
+        let leader = crate::try_acquire_named_lock(&lock_name);
+
+        // **ミューテックスを取れなかったプロセスは受付を開かない。** 開くと、書く権利が
+        // 無いのに割り込みでDACLを書くことになり、排他の意味が無くなる。
+        let lazy = match (lane, &leader) {
+            (PreparationLane::Lazy, Some(_)) => {
+                Some(LazyLanePrep::open(&root, &ace_grants, &skip, &mode, &state))
+            }
+            _ => None,
+        };
+        // ここまでで上の1と2は済んでいる。`start`を返してよい。
+        let _ = ready_tx.send(());
+
         let result = match (leader, lazy) {
-            // 札を持っている＝自分が書く。持ったまま最後まで走る。
+            // 取れている＝自分が書く。持ったまま最後まで走る。
             (Some(guard), Some(lazy)) => {
                 let r = run_lazy_lane(&root, lazy, &protect_sids, &skip, &state);
                 drop(guard);
@@ -411,7 +425,7 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
                 drop(guard);
                 r
             }
-            // 札を持っていない＝別のプロセスが準備中。**1バイトも書かずに待つ。**
+            // 取れていない＝別のプロセスが準備中。**1バイトも書かずに待つ。**
             (None, _) => follow_the_leader(
                 &lock_name,
                 &root,
@@ -437,24 +451,27 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
         // 判断してしまう（`Ordering::Release`と対の`Acquire`で読む）。
         state.finished.store(true, Ordering::Release);
     });
+    // [BUG-146] 背景スレッドがleaderを決め、（lazyレーンなら）受付を開くまで待つ。
+    // **送り手が落ちた場合も`Err`で戻る**ので、スレッドがpanicしてもここで固まらない。
+    let _ = ready_rx.recv();
     true
 }
 
-/// [D-88] このworkspace＋modeを準備する権利を表す札の名前（writer-leader mutex）。
+/// [D-88] このworkspace＋modeを準備する権利を表すミューテックスの名前（writer-leader mutex）。
 ///
 /// **`Local\`接頭辞を付ける**——このセッション（ログオンセッション）の中だけで一意なら
 /// 十分で、`Global\`にすると別ユーザーのharnessまで巻き込む。鍵の正規化はジョブ鍵と
-/// 同じものを使う（綴りの揺れで別の札になると、札が2枚あるのと同じになる）。
+/// 同じものを使う（綴りの揺れで別のミューテックスになると、ミューテックスが2つあるのと同じになる）。
 fn prepare_lock_name(workspace: &Path, mode: &str) -> String {
     // **末尾の区切りを先に落とす。** `workspace_key`は綴りの揺れを畳むが、末尾の`\`は
-    // 残す——残ったまま名前にすると`C:\ws`と`C:\ws\`が**別の札**になり、2つのプロセスが
-    // それぞれ別の札を取って「両方が leader」になる。排他が黙って消える形なので、
+    // 残す——残ったまま名前にすると`C:\ws`と`C:\ws\`が**別のミューテックス**になり、2つのプロセスが
+    // それぞれ別のミューテックスを取って「両方が leader」になる。排他が黙って消える形なので、
     // 自分のテストで見つかるまで気付けなかった（`B-10`）。
     let folded = crate::tier2a::workspace_capability::workspace_key(workspace);
     let folded = folded.trim_end_matches(['\\', '/']);
     format!(
         "Local\\harness-ws-prepare-{}-{mode}",
-        // カーネルオブジェクト名に使えない文字を潰す。**潰し方が違うと別の札になる**ので、
+        // カーネルオブジェクト名に使えない文字を潰す。**潰し方が違うと別のミューテックスになる**ので、
         // ここ1箇所だけが決める。
         folded.replace(['\\', ':', '/'], "_")
     )
@@ -462,9 +479,9 @@ fn prepare_lock_name(workspace: &Path, mode: &str) -> String {
 
 /// [D-88] **別のプロセスが準備している間、1バイトも書かずに待つ。**
 ///
-/// 札が空くまで待ち、空いたら**本当に終わっているかを実体で確かめる**。終わっていれば
+/// ミューテックスが空くまで待ち、空いたら**本当に終わっているかを実体で確かめる**。終わっていれば
 /// 何もしない（相手が全部やってくれた）。終わっていなければ自分で全walkをやる——
-/// 相手が途中で落ちた場合（札が放棄された場合）がこれに当たる。
+/// 相手が途中で落ちた場合（ミューテックスが放棄状態になった場合）がこれに当たる。
 ///
 /// **台帳の「検証済み」だけを根拠にしない**（`B-14`: 記録の存在で実体の存在を代替しない）。
 /// 実DACLを浅く見て、届いていなければやり直す。

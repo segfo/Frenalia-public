@@ -42,6 +42,11 @@
 //! 読取（[`Ledger::load`]）は、ファイルが無い・読めない・パースできないいずれの場合も
 //! `T::default()`を返す。台帳の不在で起動を止めない（`harness-config`の設定読み込みと
 //! 同じ方針）。書込の失敗も無視する。
+//!
+//! [`with_named_lock`]も、名前付きミューテックスを**作れなかった**ときはロック無しで
+//! クロージャを走らせる。**「作れなかった」だけがfail-openの対象である**——前の持ち主が
+//! 解放せずに死んだ状態（`WAIT_ABANDONED`）は所有権がこちらへ移っているので、
+//! ここには含めない（[BUG-146](../../../docs/bugs/BUG-146.md)）。
 
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -62,9 +67,21 @@ pub mod prune;
 ///
 /// 台帳以外にも使える汎用ヘルパーで、`harness-sandbox`はworkspaceのモード別mutexの
 /// セットアップ（`workspace_ledger::begin_workspace_mode`）でもこれを使う。
+///
+/// # `WAIT_ABANDONED`は「取れなかった」ではない（[BUG-146](../../../docs/bugs/BUG-146.md)）
+///
+/// 前の持ち主が解放しないまま死ぬと、Windowsは次の待ち手へ`WAIT_ABANDONED`を返す。
+/// これは失敗ではなく、**所有権がこちらへ移った**という通知である。以前ここは
+/// `WAIT_OBJECT_0`以外をすべて失敗として扱っており、その結果 (1) 排他しないまま`f`を走らせ、
+/// (2) 手に入れた所有権を解放しないままハンドルを閉じる、の2つを同時に起こしていた。
+/// [`try_acquire_named_lock`]は最初から`WAIT_ABANDONED`を「取れた」と扱っており、
+/// **同じ状態の扱いが2つの入口で割れていた**。
+///
+/// 守られていたはずの状態が途中で壊れている可能性は、`f`の側が確かめること
+/// （`harness-sandbox`の`follow_the_leader`は実DACLを見てやり直す）。
 #[cfg(windows)]
 pub fn with_named_lock<R>(name: &str, f: impl FnOnce() -> R) -> R {
-    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{
         CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
     };
@@ -75,7 +92,7 @@ pub fn with_named_lock<R>(name: &str, f: impl FnOnce() -> R) -> R {
         return f();
     };
     let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-    if wait != WAIT_OBJECT_0 {
+    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
         unsafe {
             let _ = CloseHandle(handle);
         }
@@ -94,18 +111,26 @@ pub fn with_named_lock<R>(_name: &str, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// [`try_acquire_named_lock`]が返す保持券。**落とすと手放す。**
+/// [`try_acquire_named_lock`]が返す値。**落とすと手放す。**
 ///
-/// `Send`にしてあるのは、取ってから別スレッドで仕事をする使い方
-/// （`harness-sandbox`の背景準備ジョブ）のためである。ハンドルは単なる数値で、
-/// 取った側だけが解放する。
+/// # **スレッドを跨げない**（[BUG-146](../../../docs/bugs/BUG-146.md)）
+///
+/// Windowsの名前付きミューテックスは**所有権が取得したスレッドに紐づく**ので、
+/// 所有していないスレッドからの`ReleaseMutex`は`ERROR_NOT_OWNER`で失敗する。
+/// つまりこの値は、**取ったスレッドで落とさなければ機能しない**。
+///
+/// 以前ここは`unsafe impl Send`が付いており、docに「取った側だけが解放する」と
+/// **前提として書いてあった**。その前提は唯一の呼び出し側（`harness-sandbox`の背景準備
+/// ジョブ）で破れていた——呼び出し元のスレッドで取り、背景スレッドで落としていた。
+/// **前提を書くだけでは守られない**ので、`Send`を外して**コンパイラが止める**形にしてある。
+/// 内部の`HANDLE`が`Send`でないため、この型も自動的に`Send`ではない。
+///
+/// 取ってから別スレッドで仕事をしたい場合は、**そのスレッド自身に取らせる**こと
+/// （取得も解放も同じスレッドに閉じる）。
 #[cfg(windows)]
 pub struct NamedLock {
     handle: windows::Win32::Foundation::HANDLE,
 }
-
-#[cfg(windows)]
-unsafe impl Send for NamedLock {}
 
 #[cfg(windows)]
 impl Drop for NamedLock {
@@ -113,7 +138,17 @@ impl Drop for NamedLock {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Threading::ReleaseMutex;
         unsafe {
-            let _ = ReleaseMutex(self.handle);
+            // **戻り値を捨てない。** 解放の失敗は、それ自体が「次の人が詰まる」という形で
+            // 遅れて現れる——`ReleaseMutex`が失敗しても`CloseHandle`は成功するので、
+            // 捨てると**何も起きていないように見える**（BUG-146の見つけにくさの本体、`B-10`）。
+            // `Send`を外した今、安全なコードからは起こせないはずの事象である。
+            // `Drop`中のpanicは巻き戻し中にプロセスを落とすので、報告だけにとどめる。
+            if ReleaseMutex(self.handle).is_err() {
+                eprintln!(
+                    "harness: failed to release a named mutex; it must be released on the \
+                     thread that acquired it (BUG-146)"
+                );
+            }
             let _ = CloseHandle(self.handle);
         }
     }
@@ -704,5 +739,154 @@ mod tests {
             }
         });
         assert!(ledger.load().entries.len() <= thread_count);
+    }
+
+    // --- ここから3件は [BUG-146]。名前付きミューテックスの所有権がスレッドに紐づくこと、
+    //     およびその帰結を固定する。**実プロセスもACLも触らないので`#[ignore]`にしない。**
+
+    /// テスト同士がぶつからない名前を作る（同一プロセスで並行に走るため）。
+    #[cfg(windows)]
+    fn unique_test_lock_name(label: &str) -> String {
+        format!(
+            "Local\\harness-grant-ledger-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    }
+
+    /// **[BUG-146] `NamedLock`はスレッドを跨げない。これをコンパイラに保証させる。**
+    ///
+    /// 以前は`unsafe impl Send`が付いており、「取った側だけが解放する」という前提を
+    /// docに**書いてあるだけ**だった。その前提は唯一の呼び出し側で破れていて、
+    /// 待っている別プロセスがleaderのプロセス終了まで動き出せなくなっていた。
+    /// **前提は書くだけでは守られない**ので、型で禁止したことをここで固定する。
+    ///
+    /// 負のトレイト境界は安定版Rustに無いので、**固有implがトレイトimplより優先して
+    /// 解決される**性質を使う（`T: Send`のときだけ固有implの`true`が選ばれる）。
+    /// 対で`Send`な型も見る（`B-35`）——この仕掛け自体が壊れると、何もかもが
+    /// 「`Send`でない」と読めてしまい、上の判定が意味を失う。
+    #[cfg(windows)]
+    #[test]
+    // **定数であること自体がこのテストの主張である。** `SEND`はコンパイル時に解決され、
+    // どちらのimplが選ばれたかがそのまま`Send`かどうかを表す——clippyの
+    // 「assertionが定数」は、ここでは指摘ではなく期待どおりの状態を指している。
+    #[allow(clippy::assertions_on_constants)]
+    fn the_lock_guard_cannot_move_between_threads() {
+        struct IsSend<T>(PhantomData<T>);
+        trait MaybeSend {
+            const SEND: bool = false;
+        }
+        impl<T> MaybeSend for IsSend<T> {}
+        impl<T: Send> IsSend<T> {
+            const SEND: bool = true;
+        }
+
+        assert!(
+            IsSend::<i32>::SEND,
+            "この判定の仕掛けが壊れている（`Send`な型まで「`Send`でない」と出ている）"
+        );
+        assert!(
+            !IsSend::<NamedLock>::SEND,
+            "NamedLockに`Send`を付け直してはいけない。Windowsの名前付きミューテックスは \
+             所有権が取得したスレッドに紐づき、別スレッドからの解放は失敗する。 \
+             取ってから別スレッドで仕事をしたいなら、そのスレッド自身に取らせること（BUG-146）"
+        );
+    }
+
+    /// **[BUG-146] 取ったスレッドで落とせば、待っている相手は動き出す。**
+    ///
+    /// 上の1件と対で見る（`B-35`）——「跨げない」だけを固定すると、**解放そのものが
+    /// 壊れていても緑になる**。待ち手を実際に立ててから測るのは、誰も待っていない場合に
+    /// 症状が出ないためである（`ReleaseMutex`が失敗しても`CloseHandle`は成功し、
+    /// 他にハンドルが無ければオブジェクトごと消えて次の取得が成功してしまう）。
+    #[cfg(windows)]
+    #[test]
+    fn a_waiter_is_released_when_the_guard_is_dropped_on_the_acquiring_thread() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let name = unique_test_lock_name("release-same-thread");
+        let guard = try_acquire_named_lock(&name).expect("nobody holds it yet");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                let _ = entered_tx.send(());
+                with_named_lock(&name, || {
+                    let _ = done_tx.send(());
+                });
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the waiter thread must start");
+        // 待ち手が実際に待ちへ入るまでの猶予（入る前に解放すると、測りたい状況にならない）。
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the waiter must still be blocked while the lock is held; otherwise this \
+             measurement is not measuring a waiter at all"
+        );
+
+        drop(guard);
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "the waiter must be released as soon as the holder drops the guard on the thread \
+             that acquired it"
+        );
+        waiter.join().expect("the waiter thread must not panic");
+    }
+
+    /// **[BUG-146] 前の持ち主が解放せずに死んだミューテックスは、引き継いで解放する。**
+    ///
+    /// `WAIT_ABANDONED`は「取れなかった」ではなく「所有権がこちらへ移った」である。
+    /// [`with_named_lock`]はこれを失敗として扱っており、(1)排他せずにクロージャを走らせ、
+    /// (2)受け取った所有権を解放しないまま閉じる、の2つを同時に起こしていた。
+    ///
+    /// **確認は必ず別スレッドから行う。** 名前付きミューテックスは所有者スレッドに対して
+    /// 再入可能なので、同じスレッドから取り直すと**直っていない実装でも成功する**。
+    #[cfg(windows)]
+    #[test]
+    fn a_lock_abandoned_by_a_dead_thread_is_taken_over_and_released() {
+        let name = unique_test_lock_name("abandoned");
+
+        // 所有者スレッドを立て、**解放せずに**終わらせる（＝放棄状態を作る）。
+        // `forget`はハンドルも残すので、カーネルオブジェクトはこのプロセスが終わるまで
+        // 生きる——全ハンドルが閉じてオブジェクトごと消えると、次の`CreateMutexW`が
+        // **新品を作ってしまい**、放棄状態ではないものを測ることになる。
+        {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                let guard = try_acquire_named_lock(&name).expect("nobody holds it yet");
+                std::mem::forget(guard);
+            })
+            .join()
+            .expect("the owner thread must not panic");
+        }
+
+        assert_eq!(
+            with_named_lock(&name, || 42),
+            42,
+            "the closure must run either way; what differs is whether it ran under the lock"
+        );
+
+        let taken_by_another_thread = {
+            let name = name.clone();
+            std::thread::spawn(move || try_acquire_named_lock(&name).is_some())
+                .join()
+                .expect("the probe thread must not panic")
+        };
+        assert!(
+            taken_by_another_thread,
+            "after taking over an abandoned lock, `with_named_lock` must release it. \
+             Treating WAIT_ABANDONED as a failure leaves the ownership stranded on the \
+             waiting thread, and nobody else can ever take it (BUG-146)"
+        );
     }
 }

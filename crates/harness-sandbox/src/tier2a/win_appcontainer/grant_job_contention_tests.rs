@@ -8,7 +8,7 @@
 //! writer-leader mutex（`Local\harness-ws-prepare-<畳んだパス>-<mode>`）は実装済みだが、
 //! **確かめてあるのは同一プロセス内のスレッド跨ぎまで**である
 //! （[`super::grant_job_lane_tests`]の`the_preparation_lock_is_held_by_exactly_one_holder_at_a_time`）。
-//! ここが測るのは、その札が**プロセスの境界を越えて**効いているかである。
+//! ここが測るのは、そのミューテックスが**プロセスの境界を越えて**効いているかである。
 //!
 //! # なぜ要るのか（速さの話ではない）
 //!
@@ -28,9 +28,9 @@
 //! | 出る行 | 意味 |
 //! |---|---|
 //! | `background: rescue walk (N checked, ...)` | このプロセスがツリーを歩いた＝**書いた側** |
-//! | `another process prepared this workspace; nothing to do` | 札を取れず、**1バイトも書かずに待った側** |
+//! | `another process prepared this workspace; nothing to do` | ミューテックスを取れず、**1バイトも書かずに待った側** |
 //!
-//! # この測定が答えないこと（**同期区間は札の外側にある**）
+//! # この測定が答えないこと（**同期区間はミューテックスの外側にある**）
 //!
 //! `plan_workspace_preparation`はrootへのACE付与と`.harness/`の再保護を、**leader選出より前**に
 //! 行う（[`super::super::workspace_prepare`]）。つまり「1バイトも書かない」と言えるのは
@@ -69,7 +69,7 @@ const FOLLOWER_MARK: &str = "another process prepared this workspace; nothing to
 /// 罠「準備が終わった後の状態で測ると、待ちも割り込みも観測できない」がこれである。
 const READY_WITHOUT_WALK: &str = "reused persistent capability, no tree walk";
 
-/// 測るツリーの大きさ。**leaderが札を握っている時間が、もう1つの`harness.exe`の起動時間より
+/// 測るツリーの大きさ。**leaderがミューテックスを握っている時間が、もう1つの`harness.exe`の起動時間より
 /// 十分長くなければ交差そのものが起きない。** 既定40,000ノードはこの開発機で数秒。
 ///
 /// 短く回したいときだけ下げること——下げすぎると「交差しなかった」で落ちる（黙って緑には
@@ -119,7 +119,7 @@ impl ChildRun {
 
 /// `harness.exe fs prepare-workspace <ws> --mode rwx`を**2本同時に**起こし、両方の出力を返す。
 ///
-/// **新しい道具を作らない**——このCLIがそのまま「もう1つのharness」になる。同じ札
+/// **新しい道具を作らない**——このCLIがそのまま「もう1つのharness」になる。同じミューテックス
 /// （[`super::prepare_lock_name`]）を取りに行くためである。
 ///
 /// 出力は**別スレッドで並行に読む**。順に`wait_with_output`すると、待っていない側の
@@ -307,7 +307,7 @@ fn two_harness_processes_racing_the_same_workspace_leave_exactly_one_writer() {
     );
 }
 
-// --- 同期区間（札の外側）の交差を狙い撃つ ---------------------------------------
+// --- 同期区間（ミューテックスの外側）の交差を狙い撃つ ---------------------------------------
 
 /// 1回の標本。**「読めなかった」を「届いていない」へ畳まない**（`B-10`）ので`Option`で持つ。
 struct Sample {
@@ -365,9 +365,9 @@ fn reached_by_all(path: &Path, sids: &[windows::Win32::Security::PSID]) -> Optio
 ///
 /// # なぜこれを測るのか（上の1本で見つかったことの続き）
 ///
-/// 上の測定で、**同期区間は札の外側にある**ことが実測で分かった——待つ側も
+/// 上の測定で、**同期区間はミューテックスの外側にある**ことが実測で分かった——待つ側も
 /// 「rootへの高速付与」を通っている（両方のstderrに`fast (single-object) root grant`が出る）。
-/// 札が守っているのは背景ジョブだけである。
+/// ミューテックスが守っているのは背景ジョブだけである。
 ///
 /// そこで問うのは「両方が書いたか」ではなく、**その交差が実害を生むか**である。
 /// 見るべき向きは2つあり、**意味が正反対**なので分けて測る。
@@ -779,15 +779,27 @@ fn a_sandboxed_child_cannot_write_the_control_plane_during_the_preparation_windo
 /// 対話セッションのharnessは**終了しない**。だからここでは、**leaderをこのテストプロセスにして
 /// 生かしたまま**、準備の完了後に待ち手が動き出すかを測る。
 ///
-/// [`super::grant_job_lane_tests`]の`the_preparation_lock_is_released_for_a_waiter_even_when_the_guard_moves_threads`が
-/// **プリミティブの側**（別スレッドで落とすと解放されない）を固定している。ここが測るのは
-/// **製品の経路でも同じことが起きるか**である。
+/// # このテストが捕まえた欠陥（[BUG-146](../../../../docs/bugs/BUG-146.md)）
+///
+/// [`super::start`]は名前付きミューテックスを**呼び出し元のスレッド**で取り、背景スレッドで
+/// 解放していた。Windowsの名前付きミューテックスは所有権が取得したスレッドに紐づくので、
+/// `ReleaseMutex`は`ERROR_NOT_OWNER`で失敗する——**しかも`CloseHandle`は成功するので、
+/// 戻り値を見ない限り何も起きていないように見える**。待っている側は1つ目の**プロセスが
+/// 終了する**まで動けず、そのworkspaceでコマンドを1本も実行できなくなっていた。
+///
+/// 修正は取得を背景スレッドへ移し、**取得と解放を同じスレッドへ閉じた**。あわせて
+/// `NamedLock`から`Send`を外し、同じ間違いをコンパイラが止めるようにしてある
+/// （プリミティブ側の回帰網は`harness-grant-ledger`の
+/// `the_lock_guard_cannot_move_between_threads`とその対）。
+///
+/// **`#[ignore]`は外さない。** 理由は「実`harness.exe`を起こし実マシンのACLを変える」で、
+/// このファイルの他の全テストと同じ分類である（赤かったから隠していたのではない）。
 #[test]
 #[ignore = "spawns a real harness.exe that may block; run NON-elevated with --test-threads=1"]
 fn a_waiting_harness_starts_moving_once_the_leader_finishes_preparing() {
     let guard = TestDirGuard::create("leader-alive");
     let workspace = guard.path().to_path_buf();
-    // leaderが札を握っている時間だけあればよいので、小さめでよい。
+    // leaderがミューテックスを握っている時間だけあればよいので、小さめでよい。
     build_wide_tree(&workspace, tree_nodes() / 5, 200);
     let control = workspace.join(".harness");
     std::fs::create_dir_all(&control).expect("create the control dir");
@@ -806,8 +818,9 @@ fn a_waiting_harness_starts_moving_once_the_leader_finishes_preparing() {
     }
     let grants = workspace_grants(&canonical_ws);
 
-    // **このスレッドがleaderになる。** 製品の`start`と同じで、札はこのスレッドで取られ、
-    // 背景スレッドへ渡って**そちらで落とされる**。
+    // **このプロセスがleaderになる。** 製品の`start`とまったく同じ経路を通す——
+    // ミューテックスは`start`が起こす背景スレッドで取られ、同じスレッドで解放される。
+    // **このテストプロセスは終了しない**ので、放棄状態による解放は起きない。
     let started = super::start(super::GrantJobRequest {
         root: &canonical_ws,
         ace_grants: grants.clone(),
@@ -868,4 +881,201 @@ fn a_waiting_harness_starts_moving_once_the_leader_finishes_preparing() {
          ownership to the acquiring thread. The waiter is freed only when the leader PROCESS \
          exits, and its own wait gives up after 300s and fails the command fail-closed"
     );
+}
+
+// --- leaderが途中で死んだとき、待っていた側が引き継ぐか ---------------------------
+
+/// **leaderのプロセスが準備の最中に死んだら、待っていた`harness.exe`が引き継いで完走するか。**
+///
+/// # なぜ要るのか（[BUG-146](../../../../docs/bugs/BUG-146.md)の「壊してはいけないもの」2番目）
+///
+/// 準備を1プロセスに絞る仕組みは、**leaderが死んだときに誰も再開できなくなる**という失敗の
+/// 仕方を持つ。設計（§5.1.3）はそれを、名前付きミューテックスの**放棄状態**
+/// （所有者が解放せずに死ぬとWindowsが次の待ち手へ`WAIT_ABANDONED`で所有権を渡す）で
+/// 受け止めると決めている。ここはその引き継ぎを**初めて実測する**——
+/// [`plans/HANDOFF-BUG-146-LEADER-LOCK.md`]が「測っていないこと」として挙げていた項目である。
+///
+/// BUG-146の修正は`with_named_lock`（＝待つ側が通る口）の`WAIT_ABANDONED`の扱いを変えた。
+/// 変える前は「取れなかった」と読んで**排他せずに先へ進み、受け取った所有権も解放しないまま
+/// ハンドルを閉じて**いた。**振る舞いを変えた経路は測らずに済ませない。**
+///
+/// # 何を合格とするか（**どちらが歩いたかでは判定しない**）
+///
+/// leaderがどこまで進んで死んだかで、引き継いだ側が「全walkをやり直す」か
+/// 「もう届いていたので何もしない」かが変わる。**どちらも正しい。** だから判定するのは
+/// 結果の側——引き継いだ側が成功で終わり、ツリーが全件届き、制御ディレクトリが保護された
+/// ままであること——にする。どちらを通ったかは診断として出す。
+///
+/// # この測定が答えないこと（**2つあり、どちらも実測で確かめた**）
+///
+/// 1. **待ち手が本当に待ちへ入っていたことは、直接は観測していない。** 「leaderが
+///    ミューテックスを握っている」ことと「待ち手がまだ終わっていない」ことの2つから
+///    間接的に置いている。
+/// 2. **`WAIT_ABANDONED`の扱いが直ったことは、ここでは測れない。** 直す前の
+///    `with_named_lock`は放棄状態を「取れなかった」と読んで**排他せずに先へ進んで**いた
+///    ——先へ進めば`follow_the_leader`のクロージャは走るので、**引き継ぎ自体は成功する**。
+///    実際、修正を戻してもこのテストは緑のままだった（2026-08-30に実測）。失っていたのは
+///    引き継ぎの成否ではなく**その間の排他**であり、それを捕まえるのは
+///    `harness-grant-ledger`の`a_lock_abandoned_by_a_dead_thread_is_taken_over_and_released`
+///    である。**「緑だから直っている」と読まないこと。**
+#[test]
+#[ignore = "spawns two real harness.exe processes and kills one; changes real ACLs; run NON-elevated with --test-threads=1"]
+fn a_second_harness_takes_over_when_the_leader_process_is_killed_mid_preparation() {
+    let guard = TestDirGuard::create("leader-killed");
+    let workspace = guard.path().to_path_buf();
+    // leaderが握っている間に待ち手を立て、さらに殺すまでの時間が要るので大きめにする。
+    let built = build_wide_tree(&workspace, tree_nodes(), 200);
+    let control = workspace.join(".harness");
+    std::fs::create_dir_all(&control).expect("create the control dir");
+    std::fs::write(control.join("state.json"), b"{}").expect("write control state");
+
+    let canonical_ws = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+    let _cleanup = scopeguard({
+        let canonical_ws = canonical_ws.clone();
+        move || cleanup_workspace(&canonical_ws)
+    });
+
+    let exe = harness_exe();
+    assert!(
+        exe.exists(),
+        "harness.exe が {} に無い。先に `cargo build --workspace` を打つこと",
+        exe.display()
+    );
+    let spawn_one = |label: &str| {
+        Command::new(&exe)
+            .arg("fs")
+            .arg("prepare-workspace")
+            .arg(&workspace)
+            .arg("--mode")
+            .arg("rwx")
+            .env("HARNESS_PREFLIGHT_TIMING", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn harness.exe {label}: {e}"))
+    };
+
+    let lock_name = super::prepare_lock_name(&canonical_ws, "rwx");
+    let mut leader = spawn_one("leader");
+
+    // **leaderがミューテックスを握るまで待つ。** 握る前に待ち手を立てると、待ち手の方が
+    // leaderになってしまい、測りたい形にならない。取れてしまったら即座に手放す
+    // （握ったままだと今度はこちらがleaderになる）。
+    let waiting_since = Instant::now();
+    let mut held_at = None;
+    while waiting_since.elapsed() < Duration::from_secs(60) {
+        match crate::try_acquire_named_lock(&lock_name) {
+            Some(taken) => {
+                drop(taken);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None => {
+                held_at = Some(waiting_since.elapsed());
+                break;
+            }
+        }
+    }
+    let held_at = match held_at {
+        Some(at) => at,
+        None => {
+            let _ = leader.kill();
+            let _ = leader.wait();
+            panic!("the leader never took the preparation mutex, so nothing was measured");
+        }
+    };
+
+    // 待ち手を立て、待ちへ入るだけの猶予を与える。
+    let mut follower = spawn_one("follower");
+    std::thread::sleep(Duration::from_secs(2));
+    let follower_still_running = follower
+        .try_wait()
+        .expect("poll the follower")
+        .is_none();
+
+    // **leaderを殺す。** これが放棄状態を作る唯一の方法である（正常終了させると
+    // 解放されてしまい、測りたい経路を通らない）。
+    let _ = leader.kill();
+    let leader_out = leader.wait_with_output().expect("reap the killed leader");
+    let killed_at = Instant::now();
+
+    // 引き継いだ側を待つ。**`WAIT_TIMEOUT`（300秒）よりずっと手前で切る**——
+    // そこまで待つと「引き継げなかった」と「遅い」の区別が付かなくなる。
+    let mut finished_after = None;
+    while killed_at.elapsed() < Duration::from_secs(180) {
+        match follower.try_wait().expect("poll the follower") {
+            Some(_) => {
+                finished_after = Some(killed_at.elapsed());
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    if finished_after.is_none() {
+        let _ = follower.kill();
+    }
+    let follower_out = follower
+        .wait_with_output()
+        .expect("reap the taking-over harness.exe");
+    let follower_stderr = String::from_utf8_lossy(&follower_out.stderr).into_owned();
+    let follower_stdout = String::from_utf8_lossy(&follower_out.stdout).into_owned();
+
+    println!(
+        "leader-killed: mutex held at {:.2}s (leader exit={:?}); follower finished {:?} after \
+         the kill; follower walked={} / reported-nothing-to-do={}",
+        held_at.as_secs_f32(),
+        leader_out.status.code(),
+        finished_after,
+        follower_stderr.contains(LEADER_MARK),
+        follower_stderr.contains(FOLLOWER_MARK),
+    );
+
+    assert!(
+        follower_still_running,
+        "the second harness.exe had already finished before the leader was killed, so it never \
+         waited on the abandoned mutex and nothing was measured:\nstdout:\n{follower_stdout}\n\
+         stderr:\n{follower_stderr}"
+    );
+    assert!(
+        finished_after.is_some(),
+        "the second harness.exe never finished within 180s after the leader was killed. \
+         The preparation mutex was abandoned by the dead leader, and taking it over is the \
+         only way this workspace ever becomes usable again (D-88 §5.1.3)\nstdout:\n\
+         {follower_stdout}\nstderr:\n{follower_stderr}"
+    );
+    assert_eq!(
+        follower_out.status.code(),
+        Some(0),
+        "the harness.exe that took over must succeed:\nstdout:\n{follower_stdout}\nstderr:\n\
+         {follower_stderr}"
+    );
+
+    // --- 結果で判定する（許可側と制御ディレクトリ側を**対で**見る、`B-35`） ---
+    let grants = workspace_grants(&canonical_ws);
+    let map = reachability(&canonical_ws, &grants);
+    assert!(
+        map.len() >= built,
+        "the verification must see the whole tree ({} seen, {built} built)",
+        map.len()
+    );
+    let unreached: Vec<&String> = map
+        .iter()
+        .filter(|(rel, reached)| !*reached && !rel.starts_with(".harness"))
+        .map(|(rel, _)| rel)
+        .take(10)
+        .collect();
+    assert!(
+        unreached.is_empty(),
+        "every node must be reachable after the survivor took over; these are not: {unreached:?}"
+    );
+    for rel in [".harness", ".harness\\state.json"] {
+        let entry = map.iter().find(|(candidate, _)| candidate == rel);
+        assert_eq!(
+            entry.map(|(_, reached)| *reached),
+            Some(false),
+            "the control directory must stay protected through the takeover ({rel})"
+        );
+    }
 }
