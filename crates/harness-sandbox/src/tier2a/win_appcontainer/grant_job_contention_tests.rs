@@ -583,3 +583,185 @@ fn the_control_directory_never_becomes_reachable_during_preparation() {
         }
     }
 }
+
+// --- 「機会」を「事実」へ変える -------------------------------------------------
+
+/// 窓の最中にサンドボックスの子が作ろうとするファイル。**制御ディレクトリの中**である。
+const BREACH_REL: &str = r".harness\breach.txt";
+/// 準備が終わったあとに同じ子が同じことを試す先（**拒否されるはずの対照**）。
+const DENIED_REL: &str = r".harness\denied.txt";
+/// 子の仕掛けが生きていることの対照（workspace本体なら書けるはず）。
+const ALIVE_REL: &str = "ok.txt";
+
+/// サンドボックスの子に`path`を作らせ、**実際に出来たか**を返す。
+///
+/// **判定はファイルの有無で行う**——`copy`の文言はロケールで変わるので、他人が出した綴りを
+/// 根拠にしない（`B-33`）。終了コードは診断として添えるだけ。
+fn sandboxed_child_creates(
+    workspace: &Path,
+    session: &super::super::OwnedContainerSid,
+    workspace_cap: windows::Win32::Security::PSID,
+    rel: &str,
+) -> (bool, i32, String) {
+    let target = workspace.join(rel);
+    // **`cmd.exe`は使えない。** 起動側は引数を1つずつ引用符で囲むので`cmd.exe "/c" "..."`に
+    // なり、`cmd`は引用符付きの`"/c"`をスイッチと認識せず**実行するプログラム名**として扱う
+    // （実測: 「ファイル名、ディレクトリ名…の構文が間違っています」）。PowerShellは
+    // 引数を通常どおり解釈するので、他の実機テストと同じくこちらを使う。
+    let (shell, _) = super::super::resolve_shell();
+    let script = format!(
+        "New-Item -ItemType File -Force -Path '{}' | Out-Null",
+        target.to_string_lossy()
+    );
+    let child = super::super::spawn_with_workspace(
+        &shell,
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
+        workspace,
+        &crate::secret_env::build_child_env(),
+        false,
+        session.as_psid(),
+        super::super::NetworkCapability::Deny,
+        super::super::RedirectorInject::default(),
+        &[workspace_cap],
+        super::super::DomainIdentity::Capability(workspace_cap),
+    )
+    .expect("spawn the sandboxed child through the production path");
+    let (stdout, stderr, code) = child
+        .write_stdin_read_output_and_wait(None)
+        .expect("read the child output");
+    (
+        target.exists(),
+        code,
+        format!("{}|{}", stdout.trim(), stderr.trim()),
+    )
+}
+
+/// **窓の最中に、サンドボックスの子が制御ディレクトリへ書けるか。**
+///
+/// # なぜ別の測定として要るのか
+///
+/// 上の標本器が示したのは「DACL上そう見える」ことまでで、それは*機会*であって*事実*ではない。
+/// **書けることまで見ないと深刻度が決まらない。**
+///
+/// # 待ちを意図的に外す（**それがこの測定の要点である**）
+///
+/// 既定では子は`grant_job::wait_until_done`で準備の完了を待つので、この窓を踏まない。
+/// [`super::super::acl_dacl_write`]のモジュールdocも、rootが一瞬見えなくなる窓について
+/// 「子は待つので踏まない」を根拠にしている。**しかしD-88はその待ちを外す機構である。**
+/// だからここでは待たずに子を起こす——安全性の根拠が「待ち」に置かれているとき、
+/// その待ちが無い世界で何が起きるかを測らなければ、根拠が生きているかは分からない。
+///
+/// # 対で見る（`B-35`）
+///
+/// 窓の外で同じ子が同じことをして**拒否される**ことと、workspace本体になら**書ける**ことを
+/// 並べる。前者が無いと「そもそも境界が無い」を見ているだけかもしれず、後者が無いと
+/// 「子が壊れていて何も書けない」を「拒否された」と読む。
+#[test]
+#[ignore = "spawns a real AppContainer child during the preparation window and changes real ACLs; run NON-elevated with --test-threads=1"]
+fn a_sandboxed_child_cannot_write_the_control_plane_during_the_preparation_window() {
+    // **全walkレーンを選ぶ。** lazyレーンは伝播を一度も呼ばないので、この窓自体が無い。
+    let previous = std::env::var(super::super::lazy_grant::LAZY_LANE_ENV).ok();
+    std::env::set_var(super::super::lazy_grant::LAZY_LANE_ENV, "0");
+    let _restore = scopeguard(move || match &previous {
+        Some(v) => std::env::set_var(super::super::lazy_grant::LAZY_LANE_ENV, v),
+        None => std::env::remove_var(super::super::lazy_grant::LAZY_LANE_ENV),
+    });
+    assert!(
+        matches!(
+            super::super::lazy_grant::lane(),
+            super::PreparationLane::FullWalk
+        ),
+        "this measurement needs the propagating lane; the lazy lane never propagates"
+    );
+
+    let guard = TestDirGuard::create("breach");
+    let workspace = guard.path().to_path_buf();
+    // 窓の長さは伝播の長さである。子の起動（約0.3秒）が収まるだけの幅を取る。
+    build_wide_tree(&workspace, tree_nodes() * 2, 200);
+    let control = workspace.join(".harness");
+    std::fs::create_dir_all(&control).expect("create the control dir");
+    std::fs::write(control.join("state.json"), b"{}").expect("write control state");
+
+    let canonical_ws = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+    let _cleanup = scopeguard({
+        let canonical_ws = canonical_ws.clone();
+        move || cleanup_workspace(&canonical_ws)
+    });
+
+    let outcome = super::super::preflight(
+        &workspace,
+        &[],
+        None,
+        &super::super::WorkspaceWriteMode::DirectRw,
+    )
+    .unwrap_or_else(|e| panic!("preflight must succeed before this means anything ({e:?})"));
+    for warning in &outcome.warnings {
+        eprintln!("preflight warning: {warning}");
+    }
+
+    let session =
+        super::super::ensure_profile(&crate::tier2a::session_profile::current_profile_name())
+            .expect("the session profile must exist after preflight");
+    let workspace_cap = super::super::workspace_capability_sid(&canonical_ws, "rwx")
+        .expect("the rwx capability must exist after preflight");
+    let grants = workspace_grants(&canonical_ws);
+    let sids: Vec<windows::Win32::Security::PSID> = grants.iter().map(|g| g.sid.as_psid()).collect();
+
+    // **窓が開くのを待つ。** 「保護が外れている」だけでは足りない——準備が始まる前も
+    // 外れているので、そこで撃つと別のものを測る。開いた状態＝**許可が届いている**こと。
+    let waiting_since = Instant::now();
+    let mut opened_at = None;
+    while waiting_since.elapsed() < Duration::from_secs(60) {
+        if reached_by_all(&control, &sids) == Some(true) {
+            opened_at = Some(waiting_since.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let opened_at = opened_at.expect(
+        "the control directory never became reachable during preparation; \
+         the sampling measurement says it should (grant_job_contention_tests)",
+    );
+
+    let (breached, code, output) =
+        sandboxed_child_creates(&workspace, &session, workspace_cap.as_psid(), BREACH_REL);
+    let still_open = reached_by_all(&control, &sids);
+    println!(
+        "breach probe: window opened at {:.2}s; child exit={code} created={breached}; \
+         window still open when the child finished: {still_open:?}; output={output}",
+        opened_at.as_secs_f32()
+    );
+
+    super::super::grant_job::wait_until_done().expect("the preparation must finish");
+
+    // --- 対: 窓の外では拒否される / workspace本体になら書ける ---
+    let (denied_created, denied_code, _) =
+        sandboxed_child_creates(&workspace, &session, workspace_cap.as_psid(), DENIED_REL);
+    let (alive_created, alive_code, alive_out) =
+        sandboxed_child_creates(&workspace, &session, workspace_cap.as_psid(), ALIVE_REL);
+    println!(
+        "controls: after ready -> control plane created={denied_created} (exit={denied_code}); \
+         workspace created={alive_created} (exit={alive_code}, {alive_out})"
+    );
+    assert!(
+        alive_created,
+        "the child machinery must work at all, otherwise 'denied' proves nothing \
+         (exit={alive_code}, {alive_out})"
+    );
+    assert!(
+        !denied_created,
+        "once preparation finished, the sandbox must not be able to write the control plane; \
+         if it can, the finding is not about the window at all (D-05/D-09)"
+    );
+
+    assert!(
+        !breached,
+        "a sandboxed child created {BREACH_REL} while the preparation window was open \
+         (opened at {:.2}s, child exit={code}). The control plane (D-05/D-09) is writable \
+         from inside the sandbox for the duration of the propagating write, and the only \
+         thing that normally keeps a child out of that window is the very wait that D-88 removes",
+        opened_at.as_secs_f32()
+    );
+}
