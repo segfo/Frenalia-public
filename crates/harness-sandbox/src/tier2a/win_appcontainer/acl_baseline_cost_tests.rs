@@ -542,6 +542,18 @@ enum WriteShape {
     /// **対照としてしか使わない**——これが無いと「平坦」を「今日はマシンが速い」と
     /// 区別できない（B-35）。
     OnePerSubject,
+    /// [BUG-145の案A] rootへは**配布しない口**で継承ACEを置き、**root直下の子ごとに**
+    /// 配布書込を掛ける＝書込が1回から**K回**（Kは直下の子の数）。
+    ///
+    /// **制御ディレクトリ`.harness/`を配布の対象から外すには、この形にするしかない。**
+    /// 「OSが歩くファイル数は同じなので所要時間はほぼ変わらない」という主張が
+    /// 未測定のまま残っていたので、[`WriteShape::Merged`]と対で測る
+    /// （`plans/mac-spike/RESULTS.md` §S31）。
+    ///
+    /// **rootへの単一オブジェクト書込を省かないこと。** これが無いと、準備の後に
+    /// root直下へ作られる新しいファイルが継承ACEを受け取れない——製品の`preflight`が
+    /// `grant_workspace_root_aces_fast`で置いているのと同じものである。
+    SplitPerTopLevelChild,
 }
 
 /// M本ぶんの主体を作る。**マスクを主体ごとに変えてあるのが要点**——全部同じにすると、
@@ -611,6 +623,36 @@ fn measure_arm(
                 grant_aces_propagating(root, std::slice::from_ref(grant), IdempotentCheck::Always)
                     .unwrap_or_else(|e| panic!("{label}: propagating write #{i}: {e}"));
             }
+        }
+        WriteShape::SplitPerTopLevelChild => {
+            // root へは配布しない口で置くだけ（製品の`grant_workspace_root_aces_fast`と同じ）。
+            super::acl_dacl_write::grant_aces_single_object(
+                root,
+                &grants,
+                IdempotentCheck::Always,
+            )
+            .unwrap_or_else(|e| panic!("{label}: single-object write on the root: {e}"));
+
+            // 直下の子ごとに配布。**シンボリックリンクは飛ばす**——`top_level_child_missing_aces`と
+            // 同じ判断で、付与側が触らないものを検算側だけが数えるずれを作らないため。
+            let entries = std::fs::read_dir(root)
+                .unwrap_or_else(|e| panic!("{label}: read the top-level children: {e}"));
+            let mut children = 0usize;
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+                    continue;
+                }
+                let child = entry.path();
+                grant_aces_propagating(&child, &grants, IdempotentCheck::Always).unwrap_or_else(
+                    |e| panic!("{label}: propagating write on {}: {e}", child.display()),
+                );
+                children += 1;
+            }
+            assert!(
+                children > 0,
+                "{label}: the split shape wrote to no child at all, so the timing below is \
+                 meaningless"
+            );
         }
     }
     let propagate_ms = started.elapsed().as_millis();
@@ -819,6 +861,138 @@ fn acl_ace_count_cost_of_folding_m_subjects_into_one_write() {
          the merged path is not actually folding — read the arm JSON above before trusting any \
          of these numbers."
     );
+}
+
+/// **[BUG-145の案A] 配布を「root直下の子ごと」に分割すると遅くなるのか。**
+///
+/// # なぜこれが要るのか
+///
+/// 制御ディレクトリ`.harness/`が準備中だけサンドボックスから書ける欠陥
+/// （[BUG-145](../../../../docs/bugs/BUG-145.md)）の直し方の第一候補が、
+/// **配布の対象から制御ディレクトリを外す**——つまりrootへ1回ではなく直下の子ごとに
+/// 配布を掛ける形である。実測で成立は確かめてある（`plans/mac-spike/RESULTS.md` §S30 ケース4）が、
+/// **「OSが歩くファイル数は同じなので所要時間はほぼ変わらない」は理屈であって測っていない。**
+/// 後戻りしにくい決定を未検証の費用見積りの上で下さないために、ここで測る。
+///
+/// # 2つの軸
+///
+/// **軸1はK（root直下の子の数）。** 総ファイル数を固定してKだけを振る——**K=1なら分割しても
+/// 書込は1回**で、Kが増えるほど1回あたりの固定費が効いてくる。振らないと「変わらない」と
+/// 言えない。このリポジトリの直下は20件なので、その前後を挟む。
+///
+/// **軸2は置き場。** `acl_dacl_write`のモジュールdocが「**同じ書込列でもツリーの置き場所で
+/// 伝播の挙動が反転した**」実測を持っており、§S30でも同じ軸で結果が完全に割れた。
+/// **実ワークスペースはユーザープロファイル配下にあるのに、既存の費用測定はすべて`C:\`直下**
+/// なので、答えを使う場所の数字が無い。だから両方測る。
+///
+/// # 読むのは絶対値ではなく比（**限界**）
+///
+/// 12腕を回すので1腕あたりのファイル数を既定の半分にしてある。**既存の§S15とは絶対値で
+/// 比べられない**——読むのは同じ置き場・同じKでの「分割 / まとめて」の比だけである。
+///
+/// **深さは振らない。** 浅く広いツリー（root → `dNNN/` → ファイルの2段）だけで測る。
+/// 深さは2つの形へ同じだけ効くはずだが、**それは測っていない**（鎖ツリーの道具は
+/// 下の`acl_ace_count_cost_of_tree_depth`が持っているので、必要になったら足せる）。
+///
+/// # 数字を読む前に3つの検算が通る
+///
+/// [`measure_arm`]の検算がそのまま効く。とくに2つ目——救済walkが全ノードを歩いて
+/// **1件も書いていない**——が要で、これが「速かったのは何もしていなかったから」を弾く。
+/// 分割の形では配布が届かない可能性が実際にある（§S30-6: 中間にカーネル口の書込があると
+/// 配布がそこで止まる）ので、**届かなければ数字を読む前に落ちる。**
+#[test]
+#[ignore = "creates tens of thousands of files across 12 arms and writes DACLs; run NON-elevated"]
+fn acl_ace_count_cost_of_splitting_the_propagating_write_per_top_level_child() {
+    // 12腕あるので1腕あたりは既定の半分にする（`HARNESS_TEST_ACL_COST_NODES`で上書き可）。
+    let count = file_count() / 2;
+    // **Kはroot直下の子の数**で、`build_wide_tree`の`fanout`がそのまま対応する
+    // （ファイルは`dNNN/`の下へ撒かれるので、rootの直下はそのK個のディレクトリだけ）。
+    const K_VALUES: [usize; 3] = [1, 20, 200];
+
+    let placements: [(&str, std::path::PathBuf); 2] = [
+        ("drive-root", std::path::PathBuf::from("C:\\")),
+        ("user-temp", std::env::temp_dir()),
+    ];
+
+    let mut arms = Vec::new();
+    for (place_label, base) in &placements {
+        for k in K_VALUES {
+            for (shape_label, shape) in [
+                ("merged", WriteShape::Merged),
+                ("split", WriteShape::SplitPerTopLevelChild),
+            ] {
+                let label = format!("{place_label}-k{k}-{shape_label}");
+                // **腕ごとにツリーを作って壊す。** 同時に置くとピークのディスクが12倍になり、
+                // 前の腕が残したACEが次の腕の初期状態を変える（初回を測れなくなる）。
+                let dir = TestDirGuard::create_in(base, &format!("aclsplit-{label}"));
+                let root = dir.path();
+                let nodes = build_wide_tree(root, count, k);
+                let subjects = m_subjects(&label, 1);
+                let (leaf_dir, leaf_file) = wide_tree_leaves(root);
+                let mut arm = measure_arm(
+                    &label, root, nodes, &subjects, &leaf_dir, &leaf_file, shape,
+                );
+                arm["placement"] = serde_json::json!(place_label);
+                arm["k_top_level_children"] = serde_json::json!(k);
+                arms.push(arm);
+                eprintln!("  [{label}] done");
+            }
+        }
+    }
+
+    let ms = |i: usize| {
+        arms[i]["propagate_ms"]
+            .as_u64()
+            .expect("propagate_ms is a number")
+    };
+    let ratio = |a: u64, b: u64| {
+        if b == 0 {
+            f64::NAN
+        } else {
+            (a as f64) / (b as f64)
+        }
+    };
+    // 腕は (置き場, K) ごとに merged→split の順で積んである。
+    let mut split_over_merged = serde_json::Map::new();
+    for (index, (place_label, _)) in placements.iter().enumerate() {
+        for (j, k) in K_VALUES.iter().enumerate() {
+            let base = (index * K_VALUES.len() + j) * 2;
+            split_over_merged.insert(
+                format!("{place_label}-k{k}"),
+                serde_json::json!(ratio(ms(base + 1), ms(base))),
+            );
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "measurement": "S31 cost of splitting the propagating write per top-level child (BUG-145 案A)",
+            "file_count_per_arm": count,
+            "k_values": K_VALUES,
+            "tree_shape": "wide (depth 2)",
+            "arms": arms,
+            "split_over_merged": split_over_merged,
+        })
+    );
+
+    // **合否は判定しない。** 比そのものが測る当のもので、閾値を置くと
+    // 「マシンのノイズ」を判定することになる（上の`..._folding_...`が対照を持つのは、
+    // あちらには「素朴な形は明確に遅い」という既知の下限があるからである）。
+    // ここでassertするのは**実験の前提だけ**——`measure_arm`の3検算が既に効いており、
+    // 配布が届いていない腕はそこで落ちる。加えて、Kが実際に振れていることを見る。
+    for (index, (place_label, _)) in placements.iter().enumerate() {
+        for (j, k) in K_VALUES.iter().enumerate() {
+            let base = (index * K_VALUES.len() + j) * 2;
+            for offset in [0usize, 1] {
+                assert_eq!(
+                    arms[base + offset]["k_top_level_children"],
+                    serde_json::json!(*k),
+                    "[{place_label}] 腕の並びとKの対応がずれている。比の計算が別の腕を指している"
+                );
+            }
+        }
+    }
 }
 
 /// **M3-c: 伝播のコストは、ツリーの深さで変わるのか。**

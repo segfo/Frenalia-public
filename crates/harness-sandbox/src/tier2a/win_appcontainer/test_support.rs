@@ -204,8 +204,28 @@ pub(super) struct TestDirGuard {
 impl TestDirGuard {
     /// 作成に失敗したらpanicする（テストの前提が崩れているので続行しても意味が無い）。
     pub(super) fn create(label: &str) -> Self {
-        let path = std::path::PathBuf::from(format!(
-            "C:\\harness-Tier2a-verify-{label}-{}",
+        Self::create_in(std::path::Path::new("C:\\"), label)
+    }
+
+    /// [`Self::create`]の置き場を選べる版。**`create`はこれを`C:\`で呼ぶ薄い包みである**
+    /// （同じ組み立てを2箇所に書かない、`docs/CODE-STRUCTURE-RULES.md`規則5）。
+    ///
+    /// # **`C:\`以外を渡してよいのは、祖先を触らない測定だけである**
+    ///
+    /// 上のdocのとおり、`%TEMP%`は本物のユーザープロファイルの奥にある。
+    /// `grant_traverse_chain`のように`Path::ancestors()`で祖先まで辿る口を通す測定へ
+    /// ここを渡すと、**実行中プロファイルルートのDACLを書きに行く**（BUG-011）。
+    ///
+    /// 渡してよいのは、対象とその配下しか触らない口だけである——
+    /// `grant_aces_propagating`・`grant_aces_single_object`・`fix_descendants_missing_ace`・
+    /// `revoke_workspace_sids_recursive`はいずれもそれに当たる。
+    ///
+    /// **置き場を軸にする測定のために足した入口である**（`acl_dacl_write`のモジュールdocが
+    /// 「同じ書込列でもツリーの置き場所で伝播の挙動が反転した」実測を持っており、
+    /// `C:\`直下だけで測ると実ワークスペース側の数字が取れない）。
+    pub(super) fn create_in(base: &std::path::Path, label: &str) -> Self {
+        let path = base.join(format!(
+            "harness-Tier2a-verify-{label}-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&path)
