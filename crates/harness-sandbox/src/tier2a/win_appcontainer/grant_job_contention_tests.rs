@@ -124,7 +124,7 @@ impl ChildRun {
 ///
 /// 出力は**別スレッドで並行に読む**。順に`wait_with_output`すると、待っていない側の
 /// パイプが埋まって子が止まる（CLIは進捗行をstderrへ出し続ける）。
-fn race_two_prepare_workspace(ws: &Path) -> Vec<ChildRun> {
+fn race_prepare_workspace(ws: &Path, labels: &[&'static str]) -> Vec<ChildRun> {
     let exe = harness_exe();
     assert!(
         exe.exists(),
@@ -134,7 +134,7 @@ fn race_two_prepare_workspace(ws: &Path) -> Vec<ChildRun> {
 
     let t0 = Instant::now();
     let mut spawned = Vec::new();
-    for label in ["A", "B"] {
+    for &label in labels {
         let child = Command::new(&exe)
             .arg("fs")
             .arg("prepare-workspace")
@@ -199,7 +199,7 @@ fn two_harness_processes_racing_the_same_workspace_leave_exactly_one_writer() {
         move || cleanup_workspace(&canonical_ws)
     });
 
-    let runs = race_two_prepare_workspace(&workspace);
+    let runs = race_prepare_workspace(&workspace, &["A", "B"]);
     for run in &runs {
         eprintln!("{}", run.dump());
     }
@@ -305,4 +305,281 @@ fn two_harness_processes_racing_the_same_workspace_leave_exactly_one_writer() {
         runs[1].started.as_secs_f32(),
         runs[1].finished.as_secs_f32(),
     );
+}
+
+// --- 同期区間（札の外側）の交差を狙い撃つ ---------------------------------------
+
+/// 1回の標本。**「読めなかった」を「届いていない」へ畳まない**（`B-10`）ので`Option`で持つ。
+struct Sample {
+    at: Duration,
+    /// 見た順に `root` / `.harness` / `.harness\state.json` / 深いファイル。
+    reached: [Option<bool>; 4],
+    /// `.harness`のDACLに`SE_DACL_PROTECTED`が立っているか。
+    ///
+    /// **届いてしまう窓の原因を2つに割るために要る**——「保護が最初から立っていない」のか、
+    /// 「保護は立っているのに伝播が通り抜けた」のかで、直す場所がまったく変わる。
+    control_protected: Option<bool>,
+}
+
+/// `pick`が真の標本の**連続した区間**を`(開始秒, 終了秒, 標本数)`で返す。
+///
+/// 最初と最後だけを見ると、**間に挟まった正常な期間が消える**——「0.0秒から2.4秒まで
+/// ずっと開いていた」と「0.0秒に一瞬、2.4秒に一瞬」が同じ表示になる。
+fn runs_of(samples: &[Sample], pick: impl Fn(&Sample) -> bool) -> Vec<(f32, f32, usize)> {
+    let mut out: Vec<(f32, f32, usize)> = Vec::new();
+    for sample in samples {
+        let at = sample.at.as_secs_f32();
+        if !pick(sample) {
+            continue;
+        }
+        match out.last_mut() {
+            // 直前の標本から続いているか（標本間隔2msに対して10msの猶予で判定する）。
+            Some(last) if at - last.1 <= 0.010 => {
+                last.1 = at;
+                last.2 += 1;
+            }
+            _ => out.push((at, at, 1)),
+        }
+    }
+    out
+}
+
+fn format_runs(runs: &[(f32, f32, usize)]) -> String {
+    if runs.is_empty() {
+        return "-".to_string();
+    }
+    runs.iter()
+        .map(|(a, b, n)| format!("{a:.2}s..{b:.2}s({n})"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `path`がこの主体たち**全員**から届くか。読めなければ`None`。
+fn reached_by_all(path: &Path, sids: &[windows::Win32::Security::PSID]) -> Option<bool> {
+    super::super::revoke::sid_effective_ace_masks(path, sids)
+        .ok()
+        .map(|masks| masks.iter().all(Option::is_some))
+}
+
+/// **交差の最中に、一瞬だけどう見えるかを外から標本する。**
+///
+/// # なぜこれを測るのか（上の1本で見つかったことの続き）
+///
+/// 上の測定で、**同期区間は札の外側にある**ことが実測で分かった——待つ側も
+/// 「rootへの高速付与」を通っている（両方のstderrに`fast (single-object) root grant`が出る）。
+/// 札が守っているのは背景ジョブだけである。
+///
+/// そこで問うのは「両方が書いたか」ではなく、**その交差が実害を生むか**である。
+/// 見るべき向きは2つあり、**意味が正反対**なので分けて測る。
+///
+/// | 見るもの | 一瞬でも崩れると何が起きるか |
+/// |---|---|
+/// | **制御ディレクトリ（`.harness/`）が届いてしまう窓** | サンドボックスの中の子が制御面へ書ける。**安全側ではない** |
+/// | **workspace root が届かなくなる窓** | 走っている子からツリー全体が消える。拒否側＝安全側だが、コマンドは壊れる |
+///
+/// 後者は伝播する書込が**書込の直前に主体のACEをrootから外す**ために起きる既知の窓で、
+/// [`super::super::acl_dacl_write`]のモジュールdocが
+/// 「子プロセスは`wait_until_done`で完了を待つので踏まない」と根拠を書いている。
+/// **ここではその窓が実際に何秒開くかを、外から見た値として記録する**（`wait_until_done`が
+/// 本当に覆っているかは別の測定で、ここでは判定しない）。
+///
+/// # **対照を置く**（これが無いと原因を交差のせいにできない）
+///
+/// 同じ標本を**1プロセスだけ**の腕でも取る。腕の違いは`harness.exe`の本数だけで、
+/// ツリーの形も主体も標本器も同じにしてある。**窓が両方の腕で開くなら、それは交差の話ではなく
+/// 準備そのものの性質である**——原因の名前が変わると、直す場所も変わる。
+///
+/// # この標本が答えないこと
+///
+/// - **標本間隔より短い窓は見えない。** 2ミリ秒ごとなので、それより短い交差は落ちる。
+/// - **DACLが「届く」ことと、子が実際に書けたことは別**である。ここはサンドボックスの子を
+///   起こしていないので、測っているのは*機会*であって*事実*ではない。
+struct WindowReport {
+    arm: &'static str,
+    samples: usize,
+    span: f32,
+    /// `.harness` / `.harness\state.json` が**届いてしまった**連続区間。
+    control_exposed: [Vec<(f32, f32, usize)>; 2],
+    /// `.harness`の保護が**外れていた**連続区間。
+    control_unprotected: Vec<(f32, f32, usize)>,
+    /// workspace root が**届かなくなった**連続区間。
+    root_invisible: Vec<(f32, f32, usize)>,
+    root_unreadable: usize,
+    deep_visible_at: Option<f32>,
+    /// 最初に届いてしまった瞬間の`.harness`のACE一覧（**継承由来かどうかが分かる**）。
+    control_aces_when_exposed: Option<Vec<String>>,
+}
+
+impl WindowReport {
+    fn line(&self) -> String {
+        format!(
+            "[{}] {} samples over {:.2}s | .harness exposed {} | state.json exposed {} \
+             | .harness unprotected {} | root invisible {} | root unreadable {} \
+             | deep visible at {:?}",
+            self.arm,
+            self.samples,
+            self.span,
+            format_runs(&self.control_exposed[0]),
+            format_runs(&self.control_exposed[1]),
+            format_runs(&self.control_unprotected),
+            format_runs(&self.root_invisible),
+            self.root_unreadable,
+            self.deep_visible_at,
+        )
+    }
+}
+
+/// 1つの腕を測る。`labels`の本数が`harness.exe`の本数（対照は1本、処置は2本）。
+fn sample_one_arm(arm: &'static str, dir_label: &str, labels: &[&'static str]) -> WindowReport {
+    let guard = TestDirGuard::create(dir_label);
+    let workspace = guard.path().to_path_buf();
+    build_wide_tree(&workspace, tree_nodes(), 200);
+    let control = workspace.join(".harness");
+    std::fs::create_dir_all(&control).expect("create the control dir");
+    std::fs::write(control.join("state.json"), b"{}").expect("write control state");
+    let deep = workspace.join("d100").join("f000100.txt");
+    assert!(
+        deep.exists(),
+        "the sampled deep file must exist: {}",
+        deep.display()
+    );
+
+    let canonical_ws = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+    let _cleanup = scopeguard({
+        let canonical_ws = canonical_ws.clone();
+        move || cleanup_workspace(&canonical_ws)
+    });
+
+    // **主体を先に発行しておく。** そうしないと標本器が誰を見ればよいか分からない
+    // （名前は台帳に載るので、あとから来る子はこれを再利用する＝測る構成は変わらない）。
+    for mode in crate::tier2a::workspace_ledger::WorkspaceMode::ALL {
+        crate::tier2a::workspace_capability::ensure_capability_name(&canonical_ws, mode.as_str())
+            .expect("issue the workspace capability name before sampling");
+    }
+    let grants = workspace_grants(&canonical_ws);
+    let owned_sids: Vec<crate::win_common::OwnedSid> =
+        grants.iter().map(|g| g.sid.clone()).collect();
+
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (samples, control_aces_when_exposed): (Vec<Sample>, Option<Vec<String>>) = std::thread::scope(|scope| {
+        let sampler = {
+            let stop = &stop;
+            let watched = [
+                canonical_ws.clone(),
+                canonical_ws.join(".harness"),
+                canonical_ws.join(".harness").join("state.json"),
+                canonical_ws.join("d100").join("f000100.txt"),
+            ];
+            let owned_sids = &owned_sids;
+            scope.spawn(move || {
+                let sids: Vec<windows::Win32::Security::PSID> =
+                    owned_sids.iter().map(|s| s.as_psid()).collect();
+                let t0 = Instant::now();
+                let mut out: Vec<Sample> = Vec::new();
+                let mut aces_when_exposed = None;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let at = t0.elapsed();
+                    let mut reached = [None; 4];
+                    for (slot, path) in reached.iter_mut().zip(watched.iter()) {
+                        *slot = reached_by_all(path, &sids);
+                    }
+                    // **届いてしまった最初の1回だけ、現物のACEを控える。**
+                    // 件数だけでは「継承で降ってきた」と「誰かが明示的に書いた」を区別できない。
+                    if reached[1] == Some(true) && aces_when_exposed.is_none() {
+                        aces_when_exposed =
+                            super::super::test_support::describe_dacl_aces(&watched[1]).ok();
+                    }
+                    let control_protected =
+                        super::super::revoke::dacl_is_protected(&watched[1]).ok();
+                    out.push(Sample {
+                        at,
+                        reached,
+                        control_protected,
+                    });
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                (out, aces_when_exposed)
+            })
+        };
+
+        let runs = race_prepare_workspace(&workspace, labels);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for run in &runs {
+            assert_eq!(
+                run.code,
+                Some(0),
+                "harness.exe must succeed for this measurement to mean anything:\n{}",
+                run.dump()
+            );
+        }
+        // **腕が意図どおりの形だったか。** 2本の腕なら書き手はちょうど1つ、
+        // 1本の腕ならその1つが書き手である（＝準備が実際に走った）。
+        assert_eq!(
+            runs.iter().filter(|r| r.wrote()).count(),
+            1,
+            "[{arm}] exactly one process must have walked the tree:\n{}",
+            runs.iter().map(ChildRun::dump).collect::<Vec<_>>().join("\n")
+        );
+        sampler.join().expect("the sampler thread must not panic")
+    });
+
+    assert!(
+        samples.len() > 100,
+        "[{arm}] the sampler barely ran ({} samples), so nothing was observed",
+        samples.len()
+    );
+
+    WindowReport {
+        arm,
+        samples: samples.len(),
+        span: samples.last().map(|s| s.at.as_secs_f32()).unwrap_or(0.0),
+        control_exposed: [
+            runs_of(&samples, |s| s.reached[1] == Some(true)),
+            runs_of(&samples, |s| s.reached[2] == Some(true)),
+        ],
+        control_unprotected: runs_of(&samples, |s| s.control_protected == Some(false)),
+        root_invisible: runs_of(&samples, |s| s.reached[0] == Some(false)),
+        root_unreadable: samples.iter().filter(|s| s.reached[0].is_none()).count(),
+        deep_visible_at: samples
+            .iter()
+            .find(|s| s.reached[3] == Some(true))
+            .map(|s| s.at.as_secs_f32()),
+        control_aces_when_exposed,
+    }
+}
+
+/// **制御ディレクトリが一瞬でも届くようになるか**を、1プロセスと2プロセスで対にして測る。
+#[test]
+#[ignore = "spawns real harness.exe processes and changes real ACLs; run NON-elevated with --test-threads=1"]
+fn the_control_directory_never_becomes_reachable_during_preparation() {
+    let alone = sample_one_arm("1 process", "window-alone", &["A"]);
+    let crossing = sample_one_arm("2 processes", "window-crossing", &["A", "B"]);
+    for report in [&alone, &crossing] {
+        println!("{}", report.line());
+        if let Some(aces) = &report.control_aces_when_exposed {
+            println!("[{}] .harness DACL when first exposed:", report.arm);
+            for ace in aces {
+                println!("[{}]   {ace}", report.arm);
+            }
+        }
+    }
+
+    for report in [&alone, &crossing] {
+        for (index, label) in [(0usize, ".harness"), (1usize, ".harness\\state.json")] {
+            let exposed = &report.control_exposed[index];
+            assert!(
+                exposed.is_empty(),
+                "[{}] the control directory ({label}) became reachable from the workspace \
+                 capability during preparation ({}). This is the direction that is NOT the safe \
+                 side: while that window is open, a sandboxed child can write to the control \
+                 plane (D-05/D-09).\n{}\n{}",
+                report.arm,
+                format_runs(exposed),
+                alone.line(),
+                crossing.line(),
+            );
+        }
+    }
 }
