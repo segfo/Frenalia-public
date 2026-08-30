@@ -184,7 +184,8 @@ pub fn read_denied_log(diff_layer_dir: &Path) -> Vec<CowDeniedEntry> {
 ///
 /// **なぜ台帳を読むだけで済ませないのか**（[BUG-066](../../../docs/bugs/BUG-066.md)）:
 /// diff_layer_dirはサンドボックス子プロセスへRW付与されている（`preflight`の
-/// `grant_ace_inheritable_rw(diff_layer_dir, sid)`）ので、子は`copy_up`もフックも経由せず、
+/// `grant_ace_inheritable_rw(diff_layer_dir, diff_layer_cap)`。宛先は差分層ごとの
+/// capability SIDだが、**子から書けるという事実はどちらでも変わらない**）ので、子は`copy_up`もフックも経由せず、
 /// 差分層の絶対パスを直接指定してファイルを置ける。実際BUG-066では、モデルが`run_shell`から
 /// `Set-Content <差分層>\merge-demo.txt`と書いたために差分層には編集後の内容があるのに台帳が
 /// 空で、`harness changes`が「変更なし」と答え、`discard`すれば作業ごと消える状態になっていた。
