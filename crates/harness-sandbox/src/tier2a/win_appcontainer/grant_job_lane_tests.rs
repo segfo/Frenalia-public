@@ -230,6 +230,86 @@ fn the_preparation_lock_is_held_by_exactly_one_holder_at_a_time() {
     );
 }
 
+/// **取ったスレッドと落とすスレッドが違っても、待っている相手は解放されるか。**
+///
+/// # なぜこれを測るのか（製品がその形になっている）
+///
+/// [`super::start`]は名前付きミューテックスを**呼び出し元のスレッド**で取り、その保持券を
+/// `std::thread::spawn`した背景スレッドへ渡して**そちらで落とす**。Windowsのミューテックスは
+/// **所有者スレッドに紐づく**ので、所有していないスレッドからの`ReleaseMutex`は失敗する。
+///
+/// 失敗しても`CloseHandle`は成功するため、**他に誰もハンドルを開いていなければ
+/// オブジェクトごと消えて、次の`CreateMutexW`が新品を作る**——つまり誰も待っていない場合は
+/// 症状が出ない。**症状が出るのは、待ち手がハンドルを開いたままのとき**（`follow_the_leader`が
+/// `with_named_lock`で無限に待っている状態）である。だからここでは**待ち手を実際に立ててから**測る。
+///
+/// **いまは赤い。** [BUG-146](../../../../docs/bugs/BUG-146.md)の再現そのものなので、
+/// 修正が入るまで通らない。`#[ignore]`にしてあるのは**隠すためではなく**、
+/// 常時赤い1本が`cargo test --workspace`の基準値を潰して他の赤を見えなくするためである
+/// （所在は`docs/STATUS.md`とバグカタログが持つ）。**修正時にこの`#[ignore]`を外すこと。**
+#[test]
+#[ignore = "BUG-146の再現。修正が入るまで赤い（隠さず、STATUS.mdとバグカタログに載せてある）"]
+fn the_preparation_lock_is_released_for_a_waiter_even_when_the_guard_moves_threads() {
+    use std::sync::mpsc;
+
+    let name = format!(
+        "Local\\harness-ws-prepare-test-crossthread-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+
+    // 所有者は**このスレッド**（製品では`preflight`を呼んだスレッド）。
+    let guard = crate::try_acquire_named_lock(&name).expect("nobody holds it yet");
+
+    // 待ち手を立てる。**ハンドルを開いたまま待つ**ので、オブジェクトは消えない。
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let waiter = {
+        let name = name.clone();
+        std::thread::spawn(move || {
+            let _ = entered_tx.send(());
+            crate::with_named_lock(&name, || {
+                let _ = done_tx.send(());
+            });
+        })
+    };
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the waiter thread must start");
+    // 待ち手が実際に待ちへ入るまでの猶予（入る前に解放すると、測りたい状況にならない）。
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err(),
+        "the waiter must still be blocked while the lock is held; otherwise this measurement \
+         is not measuring a waiter at all"
+    );
+
+    // **別のスレッドで落とす**（製品の`start`と同じ形）。
+    std::thread::spawn(move || drop(guard))
+        .join()
+        .expect("the dropping thread must not panic");
+
+    let released = done_rx.recv_timeout(std::time::Duration::from_secs(3));
+    // **解放されなかった場合は`join`しない。** 待ち手は無限に待っているので、
+    // ここで待ち合わせると**このテスト自身が固まる**（実際に固まって気づいた）。
+    // 解放されなければスレッドは残るが、テストバイナリの終了で回収される。
+    if released.is_ok() {
+        let _ = waiter.join();
+    }
+    assert!(
+        released.is_ok(),
+        "the waiter was NOT released when the guard was dropped on a different thread. \
+         Windows ties mutex ownership to the acquiring thread, so ReleaseMutex from another \
+         thread fails and the waiter stays blocked until the owning thread exits -- in the \
+         product that is the whole harness process, not the end of the preparation"
+    );
+}
+
 /// 札の名前は**workspaceとmodeで分かれ、綴りの揺れでは分かれない**。
 ///
 /// 分かれすぎると別のworkspaceを不必要に待たせ、**分かれなさすぎると札が2枚あるのと

@@ -765,3 +765,107 @@ fn a_sandboxed_child_cannot_write_the_control_plane_during_the_preparation_windo
         opened_at.as_secs_f32()
     );
 }
+
+// --- leaderが生き続けるときに、待っている側は解放されるか -------------------------
+
+/// **準備が終わったら、待っている`harness.exe`は動き出せるか。**
+///
+/// # なぜ`harness fs prepare-workspace`を2本ぶつけるだけでは足りないのか
+///
+/// あちらは**leaderがすぐ終了する**。名前付きミューテックスは所有者スレッドが消えた時点で
+/// 放棄状態になり、待ち手はそれで解放される——だから**解放が正しく行われたかどうかに関係なく
+/// 緑になる**（実測でも待ち手はleaderの終了の0.04〜0.10秒後に終わっていた）。
+///
+/// 対話セッションのharnessは**終了しない**。だからここでは、**leaderをこのテストプロセスにして
+/// 生かしたまま**、準備の完了後に待ち手が動き出すかを測る。
+///
+/// [`super::grant_job_lane_tests`]の`the_preparation_lock_is_released_for_a_waiter_even_when_the_guard_moves_threads`が
+/// **プリミティブの側**（別スレッドで落とすと解放されない）を固定している。ここが測るのは
+/// **製品の経路でも同じことが起きるか**である。
+#[test]
+#[ignore = "spawns a real harness.exe that may block; run NON-elevated with --test-threads=1"]
+fn a_waiting_harness_starts_moving_once_the_leader_finishes_preparing() {
+    let guard = TestDirGuard::create("leader-alive");
+    let workspace = guard.path().to_path_buf();
+    // leaderが札を握っている時間だけあればよいので、小さめでよい。
+    build_wide_tree(&workspace, tree_nodes() / 5, 200);
+    let control = workspace.join(".harness");
+    std::fs::create_dir_all(&control).expect("create the control dir");
+
+    let canonical_ws = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+    let _cleanup = scopeguard({
+        let canonical_ws = canonical_ws.clone();
+        move || cleanup_workspace(&canonical_ws)
+    });
+
+    for mode in crate::tier2a::workspace_ledger::WorkspaceMode::ALL {
+        crate::tier2a::workspace_capability::ensure_capability_name(&canonical_ws, mode.as_str())
+            .expect("issue the workspace capability name");
+    }
+    let grants = workspace_grants(&canonical_ws);
+
+    // **このスレッドがleaderになる。** 製品の`start`と同じで、札はこのスレッドで取られ、
+    // 背景スレッドへ渡って**そちらで落とされる**。
+    let started = super::start(super::GrantJobRequest {
+        root: &canonical_ws,
+        ace_grants: grants.clone(),
+        protect_sids: Vec::new(),
+        skip: vec![canonical_ws.join(".harness")],
+        workspace: &canonical_ws,
+        mode: "rwx",
+        capability_generation: "leader-alive-generation",
+        lane: super::PreparationLane::FullWalk,
+    });
+    assert!(started, "the leader job must start for this to mean anything");
+
+    // 待ち手を1本立てる。**このプロセスは終了しない**ので、放棄状態では解放されない。
+    let exe = harness_exe();
+    let mut follower = Command::new(&exe)
+        .arg("fs")
+        .arg("prepare-workspace")
+        .arg(&workspace)
+        .arg("--mode")
+        .arg("rwx")
+        .env("HARNESS_PREFLIGHT_TIMING", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the waiting harness.exe");
+
+    super::wait_until_done().expect("the leader preparation must finish");
+    let finished_at = Instant::now();
+
+    // 準備は終わった。待ち手はここから動き出せるはずである。
+    let mut exited_after = None;
+    while finished_at.elapsed() < Duration::from_secs(15) {
+        match follower.try_wait().expect("poll the follower") {
+            Some(_) => {
+                exited_after = Some(finished_at.elapsed());
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    if exited_after.is_none() {
+        // **必ず落とす。** 残すとこのテストバイナリが終わるまで待ち続ける。
+        let _ = follower.kill();
+    }
+    // どちらの道でも刈り取る（`try_wait`が`Some`を返した場合も含めて1箇所で）。
+    let _ = follower.wait();
+    println!(
+        "waiting harness: exited {:?} after the leader finished preparing",
+        exited_after
+    );
+
+    assert!(
+        exited_after.is_some(),
+        "the waiting harness.exe was still blocked 15s after the leader finished preparing. \
+         The leader is still alive (an interactive session does not exit), so the named mutex \
+         was never released -- it is dropped on the background thread, but Windows ties mutex \
+         ownership to the acquiring thread. The waiter is freed only when the leader PROCESS \
+         exits, and its own wait gives up after 300s and fails the command fail-closed"
+    );
+}
