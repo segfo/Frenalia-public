@@ -124,11 +124,23 @@ impl ChildRun {
 ///
 /// 出力は**別スレッドで並行に読む**。順に`wait_with_output`すると、待っていない側の
 /// パイプが埋まって子が止まる（CLIは進捗行をstderrへ出し続ける）。
+///
+/// # **測る対象は`harness.exe`であって、いま再ビルドされたテストバイナリではない**
+///
+/// `cargo test -p harness-sandbox`は`harness-sandbox`のテストバイナリだけを作り直す。
+/// **`harness.exe`（`harness-cli`）は作り直さない**ので、製品コードを直した直後に
+/// このテストだけを走らせると、**1つ前のビルドの挙動を測って結論を出す**。
+///
+/// 2026-08-30に実際に踏んだ: BUG-145の修正を一時的に戻して歯を確かめたあと`git checkout`で
+/// 戻し、`cargo test -p harness-sandbox`だけで再測したら**窓が開いたまま**だった。
+/// 原因は`harness.exe`が戻す前のビルドのままだったことで、`cargo build --workspace`を
+/// 挟んだら`.harness exposed -`（窓なし）になった。**必ず先に`cargo build --workspace`を打つこと。**
 fn race_prepare_workspace(ws: &Path, labels: &[&'static str]) -> Vec<ChildRun> {
     let exe = harness_exe();
     assert!(
         exe.exists(),
-        "harness.exe が {} に無い。先に `cargo build --workspace` を打つこと",
+        "harness.exe が {} に無い。先に `cargo build --workspace` を打つこと。\
+         **このテストが測るのは harness.exe であって、いま再ビルドされたテストバイナリではない**",
         exe.display()
     );
 
@@ -656,6 +668,20 @@ fn sandboxed_child_creates(
 /// 窓の外で同じ子が同じことをして**拒否される**ことと、workspace本体になら**書ける**ことを
 /// 並べる。前者が無いと「そもそも境界が無い」を見ているだけかもしれず、後者が無いと
 /// 「子が壊れていて何も書けない」を「拒否された」と読む。
+///
+/// # 実証から回帰へ反転させた（[BUG-145](../../../../docs/bugs/BUG-145.md)の修正後、2026-08-30）
+///
+/// **書かれた当初、これは欠陥が在ることを実証するテストだった。** だから「窓が開くのを待ち、
+/// 開かなければ`expect`で落ちる」形になっていた——窓が在ることが前提だったからである。
+/// 修正で窓が閉じた瞬間、**この形は「直したこと」を理由に赤くなった**
+/// （実測: `the control directory never became reachable during preparation`で停止）。
+///
+/// いまは**開かないことが合格**で、開いてしまった場合だけ子を撃つ。あわせて
+/// **計器の対照**を1本足してある——「届かなかった」を結論に使う以上、同じ計器が
+/// 「届く」を言えることを見せないと、`reached_by_all`が壊れただけでも緑になる。
+///
+/// **欠陥を実証するテストは、修正されると必ずこの反転が要る。** 実証テストは
+/// 「壊れていること」を不変条件にしているので、直した側が赤の理由になる。
 #[test]
 #[ignore = "spawns a real AppContainer child during the preparation window and changes real ACLs; run NON-elevated with --test-threads=1"]
 fn a_sandboxed_child_cannot_write_the_control_plane_during_the_preparation_window() {
@@ -711,30 +737,68 @@ fn a_sandboxed_child_cannot_write_the_control_plane_during_the_preparation_windo
 
     // **窓が開くのを待つ。** 「保護が外れている」だけでは足りない——準備が始まる前も
     // 外れているので、そこで撃つと別のものを測る。開いた状態＝**許可が届いている**こと。
-    let waiting_since = Instant::now();
-    let mut opened_at = None;
-    while waiting_since.elapsed() < Duration::from_secs(60) {
-        if reached_by_all(&control, &sids) == Some(true) {
-            opened_at = Some(waiting_since.elapsed());
-            break;
+    //
+    // [BUG-145の修正後] **開かないのが正解になった。** かつてここは「開かなければ`expect`で
+    // 落ちる」形だった——欠陥を実証するテストだったので、窓が在ることが前提だったからである。
+    // 修正で窓が閉じた以上、その形のままでは**直したことを理由に赤くなる**。いまは
+    // 「準備が終わるまでに一度も開かなければ合格」へ反転させ、**開いてしまった場合は
+    // 子を撃って、それでも書けないことまで見る**（開いた事実だけで結論を出さない）。
+    let prepared = std::sync::atomic::AtomicBool::new(false);
+    let opened_at = std::thread::scope(|scope| {
+        let waiter = {
+            let prepared = &prepared;
+            scope.spawn(move || {
+                super::super::grant_job::wait_until_done().expect("the preparation must finish");
+                prepared.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        let waiting_since = Instant::now();
+        let mut opened_at = None;
+        while waiting_since.elapsed() < Duration::from_secs(120) {
+            if reached_by_all(&control, &sids) == Some(true) {
+                opened_at = Some(waiting_since.elapsed());
+                break;
+            }
+            // **準備が終わったらそこで待つのをやめる。** 60秒待ち切っていたのは
+            // 欠陥が在った頃の名残で、いまは「終わったのに開かなかった」が答えである。
+            if prepared.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        std::thread::sleep(Duration::from_millis(1));
+        waiter.join().expect("the waiter thread must not panic");
+        opened_at
+    });
+
+    // **計器の対照（`B-35`）。** 「届かなかった」を結論に使うなら、**同じ計器が「届く」を
+    // 言えること**を見せなければならない。見せないと、壊れた計器で無罪を宣告しているのと
+    // 区別が付かない——`reached_by_all`が常に`Some(false)`を返すようになっただけでも、
+    // このテストは緑になってしまう。
+    assert_eq!(
+        reached_by_all(&canonical_ws, &sids),
+        Some(true),
+        "the instrument itself must be able to say 'reachable': the workspace root belongs to \
+         these very subjects and must be reachable once preparation finished. If this is not \
+         Some(true), the 'the control directory was never reachable' result above means nothing"
+    );
+
+    let breach = opened_at.map(|opened| {
+        let (breached, code, output) =
+            sandboxed_child_creates(&workspace, &session, workspace_cap.as_psid(), BREACH_REL);
+        let still_open = reached_by_all(&control, &sids);
+        println!(
+            "breach probe: window opened at {:.2}s; child exit={code} created={breached}; \
+             window still open when the child finished: {still_open:?}; output={output}",
+            opened.as_secs_f32()
+        );
+        (opened, breached, code, still_open)
+    });
+    if breach.is_none() {
+        println!(
+            "breach probe: the preparation window never opened — the control directory stayed \
+             unreachable for the whole propagation (BUG-145 fixed)"
+        );
     }
-    let opened_at = opened_at.expect(
-        "the control directory never became reachable during preparation; \
-         the sampling measurement says it should (grant_job_contention_tests)",
-    );
-
-    let (breached, code, output) =
-        sandboxed_child_creates(&workspace, &session, workspace_cap.as_psid(), BREACH_REL);
-    let still_open = reached_by_all(&control, &sids);
-    println!(
-        "breach probe: window opened at {:.2}s; child exit={code} created={breached}; \
-         window still open when the child finished: {still_open:?}; output={output}",
-        opened_at.as_secs_f32()
-    );
-
-    super::super::grant_job::wait_until_done().expect("the preparation must finish");
 
     // --- 対: 窓の外では拒否される / workspace本体になら書ける ---
     let (denied_created, denied_code, _) =
@@ -756,14 +820,29 @@ fn a_sandboxed_child_cannot_write_the_control_plane_during_the_preparation_windo
          if it can, the finding is not about the window at all (D-05/D-09)"
     );
 
-    assert!(
-        !breached,
-        "a sandboxed child created {BREACH_REL} while the preparation window was open \
-         (opened at {:.2}s, child exit={code}). The control plane (D-05/D-09) is writable \
-         from inside the sandbox for the duration of the propagating write, and the only \
-         thing that normally keeps a child out of that window is the very wait that D-88 removes",
-        opened_at.as_secs_f32()
-    );
+    if let Some((opened, breached, code, still_open)) = breach {
+        assert!(
+            !breached,
+            "a sandboxed child created {BREACH_REL} while the preparation window was open \
+             (opened at {:.2}s, child exit={code}). The control plane (D-05/D-09) is writable \
+             from inside the sandbox for the duration of the propagating write, and the only \
+             thing that normally keeps a child out of that window is the very wait that D-88 \
+             removes (BUG-145)",
+            opened.as_secs_f32()
+        );
+        // **窓が開いた時点で回帰である。子が書けなかったことを免罪符にしない。**
+        // 子の側は`AppContainer`＋PowerShellの起動を挟むので、**窓が2秒開いていても
+        // 入れないことがある**（修正を一時的に戻して実測した: 標本器は2.2秒の露出を
+        // 記録したのに、この子は拒否された）。つまり**「書けなかった」は「窓が無かった」
+        // ではない**——歯は窓の側にある。
+        panic!(
+            "the control directory became reachable {:.2}s into the preparation (still open when \
+             the child finished: {still_open:?}). The child did not manage to write this time, \
+             but that is a timing accident, not a boundary: the window itself is the defect \
+             (BUG-145). The protection write is being skipped again",
+            opened.as_secs_f32()
+        );
+    }
 }
 
 // --- leaderが生き続けるときに、待っている側は解放されるか -------------------------
