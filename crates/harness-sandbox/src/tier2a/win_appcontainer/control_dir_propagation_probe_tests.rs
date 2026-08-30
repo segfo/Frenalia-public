@@ -17,11 +17,22 @@
 //!
 //! # 3つの軸で振る
 //!
-//! **軸1（手順）**は13ケース。**軸3（深さ）は配布の対象が保護ノードの親か祖父か**で、
-//! 後者は`--fs-allow <祖先>/**`が実際に使う形である（ケース9・10）。**軸2（置き場）は2水準で、これを外すと再現しない可能性がある**
-//! ——[`super::super::acl_dacl_write`]のモジュールdocは「同じ書込列でもツリーの置き場所で
-//! 伝播の挙動が反転した」実測を持っており、BUG-145の実測は`C:\`直下
-//! （`C:\harness-Tier2a-verify-*`）だった。**`%TEMP%`だけで測ると取り逃す。**
+//! **軸1（手順）**は15ケース。**軸3（深さ）は配布の対象が保護ノードの親か祖父か**で、
+//! 後者は`--fs-allow <祖先>/**`が実際に使う形である（ケース9・10）。**軸2（置き場）は6水準で、
+//! これを外すと再現しない可能性がある**——[`super::super::acl_dacl_write`]のモジュールdocは
+//! 「同じ書込列でもツリーの置き場所で伝播の挙動が反転した」実測を持っており、BUG-145の実測は
+//! `C:\`直下（`C:\harness-Tier2a-verify-*`）だった。**`%TEMP%`だけで測ると取り逃す。**
+//!
+//! # 原因は特定済みである（**このプローブが何を確定させたか**）
+//!
+//! **保護の書込が冪等スキップで丸ごと省かれていた。** [`super::remove_sid_aces_and_protect`]は
+//! 「剥がすACEが1本も無く、かつ既に保護済みなら書かずに戻る」——そして`C:\`から降りるツリーでは
+//! **新しく作ったディレクトリが最初から`SE_DACL_PROTECTED`付きで生まれる**ので、この条件が
+//! 成立して**一度も書かない**。親からの配布はその「書いていない保護」を消す。
+//!
+//! 確定させたのは**ケース14**である——製品と同じ剥がし方・同じ書込で、
+//! **中身を1バイトも変えずにスキップだけ外す**と、落ちていた4水準すべてで無傷になる。
+//! ケース11・12も無傷だが、あちらは書くDACLの中身も変えているので原因を1点に絞れない。
 //!
 //! # 判定に使わない値を1つ必ず読む（**対照**）
 //!
@@ -37,11 +48,23 @@
 //! - **合否を判定しない観測用テスト**である（BUG-083のプローブと同じ思想）。アサートするのは
 //!   実験の前提が崩れていないかだけで、`panic!`させるとどのケースがどう出たかが出力に残らない。
 //! - 実験ツリーは**消さない**（PowerShellの`Get-Acl`で独立に確かめられるようにするため）。
-//!   毎回先頭で作り直す。後始末:
+//!   毎回先頭で作り直す。**置き場を6水準へ広げたので後始末も6箇所ある**
+//!   （`subst`の仮想ドライブだけはDropで自動的に消える）:
 //!
 //! ```powershell
-//! Remove-Item -Recurse -Force C:\harness-bug145-probe, "$env:TEMP\harness-bug145-probe"
+//! Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+//!   C:\harness-bug145-probe, C:\harness-bug145-deep, `
+//!   "$env:USERPROFILE\harness-bug145-probe", `
+//!   "$env:TEMP\harness-bug145-probe", `
+//!   (Join-Path (Split-Path -Parent $PWD) 'harness-bug145-probe')
 //! ```
+//!
+//!   最後の1つは**このリポジトリの親ディレクトリ**（実ワークスペースの隣）で、
+//!   リポジトリの中には入らないので`git status`には出ない。
+//!
+//! - **費用の測定も同じファイルにある**（[`control_dir_protect_skip_cost_probe`]）。
+//!   原因が「スキップ」に確定したので、**その直し方の費用**がここで要るためである。
+//!   あちらのツリーは`TestDirGuard`がDropで消す。
 
 use super::*;
 
@@ -51,32 +74,113 @@ use windows::Win32::Security::Authorization::DENY_ACCESS;
 // **同じものを使う**——同じDACLを2つの実装で読むと、どちらが正しいかを別途決めることになる。
 use super::test_support::describe_dacl_aces;
 
-/// 実験用ツリーの置き場。**2水準あるのがこのプローブの要点の1つ**（モジュールdoc参照）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Placement {
-    /// BUG-145の実測と同じ置き場。
-    DriveRoot,
-    /// ユーザープロファイル配下。既存のBUG-083プローブはここだけで測っている。
-    UserTemp,
+/// 実験用ツリーの置き場。
+///
+/// # 「置き場」という1語に**3つの変数**が畳まれていた
+///
+/// 最初の版は2水準（`C:\`直下と`%TEMP%`配下）で、片方だけ落ちた。**しかしこの2つは
+/// 3つの点で違う**——ドライブ直下からの段数・ユーザープロファイル配下かどうか・
+/// 構文上ドライブ直下かどうか。**どれが効いているのかを1差分で分けるために6水準へ広げた。**
+///
+/// | 水準 | 段数 | プロファイル配下 | 構文上ドライブ直下 |
+/// |---|---:|---|---|
+/// | `drive-root` | 1 | ✗ | ✓ |
+/// | `drive-root-deep` | 6 | ✗ | ✗ |
+/// | `user-profile-root` | 3 | ✓ | ✗ |
+/// | `real-workspace-parent` | 実ワークスペースと同じ | ✓ | ✗ |
+/// | `user-temp` | 6 | ✓ | ✗ |
+/// | `subst-drive-root` | 1 | ✓（実体） | ✓ |
+///
+/// `drive-root-deep`と`user-temp`は**段数を揃えてある**ので、この2つの差は
+/// 「プロファイル配下かどうか」だけになる。`subst-drive-root`は実体が`%TEMP%`配下なので、
+/// `user-temp`との差は「構文上ドライブ直下かどうか」だけになる。
+///
+/// # なぜ`real-workspace-parent`が要るのか（**この水準が本命**）
+///
+/// **実ワークスペースはユーザープロファイル配下にある**（このリポジトリ自身がそう）のに、
+/// この欠陥を実証したテストはワークスペースを**ドライブ直下**に作っている
+/// （[`super::grant_job_contention_tests`]が`TestDirGuard::create`を使う）。
+/// **実運用の場所で再現するのかを一度も測っていない。**
+struct Placement {
+    label: &'static str,
+    root: PathBuf,
+    /// この置き場を成立させている資源。**Dropで撤収する**ので測定が終わるまで生かす。
+    _drive: Option<super::test_support::SubstDrive>,
 }
 
-impl Placement {
-    fn label(self) -> &'static str {
-        match self {
-            Self::DriveRoot => "C-drive-root",
-            Self::UserTemp => "user-temp",
-        }
+/// 6水準を組み立てる。**パスを直書きしない**——実ワークスペースの親はテストバイナリの
+/// 位置から導出する（[`super::test_support::harness_exe`]と同じやり方）ので、
+/// このリポジトリを別の場所へ置いても水準の意味が変わらない。
+///
+/// `subst`の仮想ドライブが取れなければ、その水準だけ落として続ける（**黙って落とさず**、
+/// 呼び出し側が水準の数を印字する）。
+fn placements() -> Vec<Placement> {
+    const LEAF: &str = "harness-bug145-probe";
+    let mut out = vec![
+        Placement {
+            label: "drive-root",
+            root: PathBuf::from("C:\\").join(LEAF),
+            _drive: None,
+        },
+        Placement {
+            // `%TEMP%`と**段数を揃えてある**（どちらもドライブ直下から6段目）。
+            label: "drive-root-deep",
+            root: PathBuf::from("C:\\harness-bug145-deep")
+                .join("a")
+                .join("b")
+                .join("c")
+                .join("d")
+                .join(LEAF),
+            _drive: None,
+        },
+        Placement {
+            label: "user-profile-root",
+            root: user_profile_root().join(LEAF),
+            _drive: None,
+        },
+        Placement {
+            label: "real-workspace-parent",
+            root: real_workspace_parent().join(LEAF),
+            _drive: None,
+        },
+        Placement {
+            label: "user-temp",
+            root: std::env::temp_dir().join(LEAF),
+            _drive: None,
+        },
+    ];
+    if let Some(drive) = super::test_support::SubstDrive::create() {
+        out.push(Placement {
+            label: "subst-drive-root",
+            root: drive.root().join(LEAF),
+            _drive: Some(drive),
+        });
     }
-
-    fn root(self) -> PathBuf {
-        match self {
-            Self::DriveRoot => PathBuf::from("C:\\harness-bug145-probe"),
-            Self::UserTemp => std::env::temp_dir().join("harness-bug145-probe"),
-        }
-    }
+    out
 }
 
-const PLACEMENTS: &[Placement] = &[Placement::DriveRoot, Placement::UserTemp];
+/// ユーザープロファイルのルート。`%TEMP%`から`AppData\Local\Temp`の3段を戻して求める
+/// ——`%USERPROFILE%`が設定されていない実行環境でも同じ場所を指すようにするため。
+fn user_profile_root() -> PathBuf {
+    let mut p = std::env::temp_dir();
+    for _ in 0..3 {
+        p.pop();
+    }
+    p
+}
+
+/// このリポジトリの**親ディレクトリ**＝実ワークスペースが置かれている場所。
+///
+/// テストバイナリは`<repo>/target/debug/deps/`配下にあるので、そこから5つ戻る。
+fn real_workspace_parent() -> PathBuf {
+    let mut p = std::env::current_exe().expect("current_exe");
+    p.pop(); // 実行ファイル名
+    p.pop(); // deps/
+    p.pop(); // debug/
+    p.pop(); // target/
+    p.pop(); // <repo>/
+    p
+}
 
 /// 伝播書込をどこへ撃つか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +256,33 @@ enum Case {
     ///
     /// **無傷の形を並べるだけでは原因を特定できない**——狙って壊せて初めて確定する。
     ForceInheritedProtect,
+    /// 製品とまったく同じ剥がし方・同じ書込で、**冪等スキップだけを外す**。
+    ///
+    /// # これが原因を1点に絞る唯一のケースである
+    ///
+    /// 製品の[`remove_sid_aces_and_protect`]は「剥がすACEが1本も無く、かつ既に保護済みなら
+    /// 書かずに戻る」という冪等スキップを持つ（`revoke.rs`）。**`C:\`から降りるツリーでは、
+    /// 新しく作ったディレクトリが最初から`SE_DACL_PROTECTED`付きで生まれる**ので、
+    /// この条件が成立して**保護の書込が1回も走らない**。
+    ///
+    /// ケース11・12も無傷だが、あちらは**書くDACLの中身も変えている**（フラグを落とす／
+    /// 組み直す）ので、「書いたこと」と「中身を変えたこと」のどちらが効いたのか分からない。
+    /// **このケースは中身を1バイトも変えずに書くだけ**なので、無傷になれば
+    /// **原因はスキップそのもの**に確定する。
+    ForcedWriteProtect,
+    /// 剥がしたうえで**拒否ACEを足し、保護は立てずに**1回で書く → 親へ配布。
+    ///
+    /// # 「拒否ACEは保護が落ちても残るのか」を測れる唯一の形
+    ///
+    /// 記録が「拒否ACEを置いた2ケース（5・7）はどちらも保護が落ちなかったので、
+    /// 拒否が最後の砦として働く場面が一度も発生していない」と書いたまま残っていた。
+    /// **原因が分かったいま、その理由も分かる**——どちらも「書いた」ので保護が確立し、
+    /// 落ちようがなかった。
+    ///
+    /// **書けば保護が立ってしまうなら、最初から保護を立てずに書けばよい。** そうすれば
+    /// 「保護が無い状態で親から配布を受けた拒否ACE」が観測できる。
+    /// これは製品に入れる形ではなく、**問いに答えるためだけの形**である。
+    DenyWithoutProtection,
 }
 
 const CASES: &[Case] = &[
@@ -168,6 +299,8 @@ const CASES: &[Case] = &[
     Case::StripInheritedProtect,
     Case::CanonicalizeProtect,
     Case::ForceInheritedProtect,
+    Case::ForcedWriteProtect,
+    Case::DenyWithoutProtection,
 ];
 
 impl Case {
@@ -186,6 +319,8 @@ impl Case {
             Self::StripInheritedProtect => "11-strip-inherited-protect",
             Self::CanonicalizeProtect => "12-canonicalize-protect",
             Self::ForceInheritedProtect => "13-force-inherited-protect",
+            Self::ForcedWriteProtect => "14-forced-write-protect",
+            Self::DenyWithoutProtection => "15-deny-without-protection",
         }
     }
 
@@ -224,14 +359,17 @@ impl Case {
             | Self::AncestorWrittenHolder
             | Self::StripInheritedProtect
             | Self::CanonicalizeProtect
-            | Self::ForceInheritedProtect => PropagateTo::CaseRoot,
+            | Self::ForceInheritedProtect
+            | Self::ForcedWriteProtect
+            | Self::DenyWithoutProtection => PropagateTo::CaseRoot,
         }
     }
 
     /// 製品の保護（[`remove_sid_aces_and_protect`]）を通すか。
     ///
-    /// 通さないのは、**保護の書き方そのものを差し替えて測る3ケース**だけである
-    /// （7は拒否ACEを1回で、11は継承由来フラグを落として、12は組み直してから書く）。
+    /// 通さないのは、**保護の書き方そのものを差し替えて測るケース**だけである
+    /// （7は拒否ACEを1回で、11は継承由来フラグを落として、12は組み直して、13は立て直して、
+    /// **14は中身を変えずに書くだけ**）。
     fn uses_production_protect(self) -> bool {
         !matches!(
             self,
@@ -239,6 +377,8 @@ impl Case {
                 | Self::StripInheritedProtect
                 | Self::CanonicalizeProtect
                 | Self::ForceInheritedProtect
+                | Self::ForcedWriteProtect
+                | Self::DenyWithoutProtection
         )
     }
 
@@ -284,6 +424,23 @@ struct CaseResult {
     /// 落ちるケースと無傷のケースでフラグ構成が違うのかを見るには**現物が要る**
     /// （`B-10`: 集めたのに出していない値は、無いのと同じ）。
     aces_after_protect: Vec<String>,
+    /// **保護をかける「直前」のACE一覧と制御ビット。**
+    ///
+    /// ここが空白だったせいで前回の調査は行き止まりになった。**保護の書込が何を入力に
+    /// 受け取ったのかを見ずに、出力だけを比べていた**——出力が同じでも入力が違えば、
+    /// 「同じ状態から違う結果が出る」という読みは成り立たない（`B-29`: 前提を1つ測る）。
+    aces_before_protect: Vec<String>,
+    control_before_protect: u16,
+    size_before_protect: super::test_support::DaclSizeInfo,
+    /// 保護直後のACLの**ヘッダ**（使用バイト数・空き・ACE数・リビジョン）。
+    ///
+    /// **ACE一覧が同じでも、ここが違えば「同じ状態」ではない。** 前回の調査は
+    /// 「落ちるケース2と無傷のケース11・12でACE一覧が完全に同一」で行き止まりになったが、
+    /// **確保容量とリビジョンを一度も読んでいなかった**——剥がす側は元のACLと同じ容量で
+    /// 確保するので**空きが残り**、組み直す口は詰めて確保する。その差が保存後にも
+    /// 現れるなら、行き止まりではない。
+    size_after_protect: super::test_support::DaclSizeInfo,
+    size_after_propagate: super::test_support::DaclSizeInfo,
     /// 保護直後には無く、伝播後に増えたACE。**BUG-145の現象そのもの。**
     added_aces: Vec<String>,
     /// 保護直後にはあったのに、伝播後に消えたACE。
@@ -403,6 +560,92 @@ unsafe fn protect_stripping_inherited_flags(path: &Path, sid: PSID) -> windows::
         let _ = LocalFree(HLOCAL(sd.0));
         let (dacl, _removed) = copied?;
         super::test_support::strip_inherited_ace_flags(dacl)?;
+        set_dacl_single_object_with_protection(path, dacl, true)
+    }
+}
+
+/// 剥がして拒否ACEを足し、**保護を立てずに**1回で書く（ケース15専用）。
+///
+/// [`protect_with_deny_in_one_write`]との差は最後の引数（`protected`）だけである。
+/// **拒否ACEが「保護の無い状態で親からの配布を受けても残るか」を測れる唯一の形**で、
+/// 製品に入れる形ではない。
+///
+/// # 安全性
+///
+/// `sid`は有効なSIDを指していること。
+unsafe fn deny_without_protection(path: &Path, sid: PSID, mask: u32) -> windows::core::Result<()> {
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut existing: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        let mut stripped_buf: Vec<u8> = Vec::new();
+        let stripped = copy_dacl_excluding_sids(existing as *const _, &[sid], &mut stripped_buf);
+        let mut trustee = TRUSTEE_W::default();
+        BuildTrusteeWithSidW(&mut trustee, sid);
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: mask,
+            grfAccessMode: DENY_ACCESS,
+            grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+            Trustee: trustee,
+        };
+        let mut merged: *mut ACL = std::ptr::null_mut();
+        let merge_result = match stripped {
+            Ok((dacl, _removed)) => {
+                SetEntriesInAclW(Some(&[entry]), Some(dacl as *const _), &mut merged).ok()
+            }
+            Err(e) => Err(e),
+        };
+        let _ = LocalFree(HLOCAL(sd.0));
+        merge_result?;
+
+        // **ここだけが`protect_with_deny_in_one_write`と違う**——保護を立てない。
+        let result = set_dacl_single_object_with_protection(path, merged, false);
+        let _ = LocalFree(HLOCAL(merged as *mut _));
+        result
+    }
+}
+
+/// 製品とまったく同じ剥がし方・同じ書込を、**冪等スキップだけ外して**行う（ケース14専用）。
+///
+/// [`remove_sid_aces_and_protect`]から**スキップの3行を抜いただけ**である。剥がすACEが1本も無く
+/// 既に保護済みなら製品は書かずに戻るが、ここは必ず書く。**書くDACLは1バイトも変えない。**
+///
+/// # 安全性
+///
+/// `sid`は有効なSIDを指していること。
+unsafe fn protect_forcing_the_write(path: &Path, sid: PSID) -> windows::core::Result<()> {
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut existing: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        let mut buf: Vec<u8> = Vec::new();
+        let copied = copy_dacl_excluding_sids(existing as *const _, &[sid], &mut buf);
+        let _ = LocalFree(HLOCAL(sd.0));
+        let (dacl, _removed) = copied?;
         set_dacl_single_object_with_protection(path, dacl, true)
     }
 }
@@ -587,9 +830,9 @@ unsafe fn add_explicit_deny(path: &Path, sid: PSID, mask: u32) -> windows::core:
 /// `holder`は「保護ノードと対照を直接ぶら下げているディレクトリ」で、深さ1では`case_root`
 /// そのもの、深さ2では中間の`ws`である。**高速付与は常に`holder`へ掛ける**——製品で
 /// カーネル口の書込を受けているのはworkspace rootであり、深さ2ではそれが中間に当たるためである。
-fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
+fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
     let mut errors = Vec::new();
-    let case_root = placement.root().join(case.label());
+    let case_root = placement.root.join(case.label());
     let holder = if case.propagates_from_ancestor() {
         case_root.join("ws")
     } else {
@@ -656,6 +899,14 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
         .propagates_from_ancestor()
         .then(|| dacl_control(&holder).expect("read the holder control bits before propagate"));
 
+    // **保護の書込が受け取る入力**。出力（保護直後）だけを比べていたのが前回の行き止まりだった。
+    let control_before_protect =
+        dacl_control(&guarded).expect("read the control bits before protect");
+    let aces_before_protect =
+        describe_dacl_aces(&guarded).expect("list the ACEs before protect");
+    let size_before_protect =
+        super::test_support::dacl_size_info(&guarded).expect("read the ACL header before protect");
+
     if case.uses_production_protect() {
         // **保護の相手は中間側の主体である。** 製品でも`.harness`が守られているのは
         // workspaceのcapability SIDに対してであって、`--fs-allow`の主体に対してではない。
@@ -684,6 +935,12 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
             Case::ForceInheritedProtect => unsafe {
                 protect_forcing_inherited_flags(&guarded, holder_subject.as_psid())
             },
+            Case::ForcedWriteProtect => unsafe {
+                protect_forcing_the_write(&guarded, holder_subject.as_psid())
+            },
+            Case::DenyWithoutProtection => unsafe {
+                deny_without_protection(&guarded, sid.as_psid(), mask)
+            },
             other => unreachable!("{other:?} は製品の保護を通すはずのケースである"),
         };
         if let Err(e) = replaced {
@@ -704,6 +961,8 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
     let control_after_protect = dacl_control(&guarded).expect("read the control bits after protect");
     let aces_after_protect =
         describe_dacl_aces(&guarded).expect("list the ACEs after protect");
+    let size_after_protect =
+        super::test_support::dacl_size_info(&guarded).expect("read the ACL header after protect");
     let guarded_allow_after_protect = match sid_effective_ace_mask(&guarded, sid.as_psid()) {
         Ok(m) => m,
         Err(e) => {
@@ -730,6 +989,8 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
         dacl_control(&guarded).expect("read the control bits after propagate");
     let aces_after_propagate =
         describe_dacl_aces(&guarded).expect("list the ACEs after propagate");
+    let size_after_propagate =
+        super::test_support::dacl_size_info(&guarded).expect("read the ACL header after propagate");
     let read_mask = |path: &Path, what: &str, errors: &mut Vec<String>| -> Option<u32> {
         match sid_effective_ace_mask(path, sid.as_psid()) {
             Ok(m) => m,
@@ -758,7 +1019,7 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
         dacl_control(&case_root).expect("read the case root control bits after propagate");
 
     CaseResult {
-        placement: placement.label(),
+        placement: placement.label,
         case: case.label(),
         root_control_initial,
         root_control_before_propagate,
@@ -771,7 +1032,12 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
         inner_allow_after,
         open_allow_after,
         deny_aces_after_protect: count_deny_aces(&aces_after_protect, &sid_text),
+        aces_before_protect,
+        control_before_protect,
+        size_before_protect,
         aces_after_protect,
+        size_after_protect,
+        size_after_propagate,
         deny_aces_after_propagate: count_deny_aces(&aces_after_propagate, &sid_text),
         added_aces,
         lost_aces,
@@ -810,16 +1076,21 @@ fn describe_mask(mask: Option<u32>) -> String {
 #[test]
 #[ignore = "実FSのDACLを書き換える観測用プローブ（C:\\harness-bug145-probe と %TEMP% のみ、管理者権限不要）。結果はdocs/bugs/BUG-145.mdへ転記する"]
 fn control_dir_propagation_matrix_probe() {
+    let placements = placements();
+    println!("=== placements ({}) ===", placements.len());
+    for p in &placements {
+        println!("  {:<22}: {}", p.label, p.root.display());
+    }
+
     let mut results = Vec::new();
     let mut index = 0usize;
-    for placement in PLACEMENTS {
-        let root = placement.root();
+    for placement in &placements {
         // 前回の残骸が結果を汚さないよう毎回作り直す（残すのは実行「後」だけ）。
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create the probe root");
+        let _ = std::fs::remove_dir_all(&placement.root);
+        std::fs::create_dir_all(&placement.root).expect("create the probe root");
         for case in CASES {
             index += 1;
-            results.push(run_case(*placement, *case, index));
+            results.push(run_case(placement, *case, index));
         }
     }
 
@@ -837,6 +1108,10 @@ fn control_dir_propagation_matrix_probe() {
                 describe_control(holder)
             );
         }
+        println!(
+            "  control before protect  : {}   <- 保護の書込が受け取る入力",
+            describe_control(r.control_before_protect)
+        );
         println!(
             "  control after protect   : {}",
             describe_control(r.control_after_protect)
@@ -862,6 +1137,30 @@ fn control_dir_propagation_matrix_probe() {
             "  open/f.txt allow        : {}   <- 対照（伝播が走ったか）",
             describe_mask(r.open_allow_after)
         );
+        // **ACLのヘッダ。** ACE一覧が同じでもここが違えば「同じ状態」ではない。
+        // 空き容量は、剥がす側が元のACLと同じ容量で確保する（＝空きが残る）のに対し、
+        // 組み直す口は詰めて確保する——その差が保存後にも残るのかを見る。
+        println!(
+            "  ACL header before       : in_use={} free={} aces={} rev={}",
+            r.size_before_protect.bytes_in_use,
+            r.size_before_protect.bytes_free,
+            r.size_before_protect.ace_count,
+            r.size_before_protect.revision,
+        );
+        for ace in &r.aces_before_protect {
+            println!("  * ACE before protect    : {ace}");
+        }
+        println!(
+            "  ACL header              : in_use={} free={} aces={} rev={}  ->  in_use={} free={} aces={} rev={}   (protect -> propagate)",
+            r.size_after_protect.bytes_in_use,
+            r.size_after_protect.bytes_free,
+            r.size_after_protect.ace_count,
+            r.size_after_protect.revision,
+            r.size_after_propagate.bytes_in_use,
+            r.size_after_propagate.bytes_free,
+            r.size_after_propagate.ace_count,
+            r.size_after_propagate.revision,
+        );
         for ace in &r.aces_after_protect {
             println!("  = ACE after protect     : {ace}");
         }
@@ -877,8 +1176,8 @@ fn control_dir_propagation_matrix_probe() {
     }
 
     println!("=== verdict ===");
-    for placement in PLACEMENTS {
-        let label = placement.label();
+    for placement in &placements {
+        let label = placement.label;
         let mine: Vec<&CaseResult> = results.iter().filter(|r| r.placement == label).collect();
         let lost_protection: Vec<&str> = mine
             .iter()
@@ -912,8 +1211,30 @@ fn control_dir_propagation_matrix_probe() {
         println!("  [{label}] 深さ2で配布が届かず測定不成立: {ancestor_unreached:?}");
     }
 
+    // 拒否ACEが**保護の無い状態で**配布を生き延びたか（ケース15。`deny_survived`は
+    // 保護のあるケースと混ざるので別に出す）。
+    let deny_no_protect: Vec<(&str, bool, bool)> = results
+        .iter()
+        .filter(|r| r.case == Case::DenyWithoutProtection.label())
+        .map(|r| {
+            (
+                r.placement,
+                r.deny_aces_after_protect > 0,
+                r.deny_aces_after_propagate > 0,
+            )
+        })
+        .collect();
+    println!("  [15-deny-without-protection] (置き場, 書けたか, 配布後も残ったか): {deny_no_protect:?}");
+
     // --- ここから下は「実験の前提が崩れていないか」だけを見る（合否は判定しない） ---
-    for r in &results {
+    //
+    // **ケース15は除く。** あちらは保護を立てないことが手順そのものなので、
+    // 「保護が立った」を要求すると測定の意図と衝突する（`B-35`: 禁止側と許可側で
+    // 見るべき前提が違う）。代わりに「拒否ACEが実際に書けたか」を下で見る。
+    for r in results
+        .iter()
+        .filter(|r| r.case != Case::DenyWithoutProtection.label())
+    {
         assert!(
             r.protected_after_protect(),
             "[{}] {}: 保護が立たなかったので、以降の観測は別のものを測っている（control={}）",
@@ -940,6 +1261,33 @@ fn control_dir_propagation_matrix_probe() {
             r.case
         );
     }
+    // ケース15の前提——**拒否ACEが実際に書けていること**。書けていなければ
+    // 「配布後も残った／消えた」のどちらを読んでも意味が無い（`B-10`）。
+    for r in results
+        .iter()
+        .filter(|r| r.case == Case::DenyWithoutProtection.label())
+    {
+        assert!(
+            r.deny_aces_after_protect > 0,
+            "[{}] {}: 拒否ACEが1本も書けていない。このケースは何も測っていない",
+            r.placement,
+            r.case
+        );
+        // **保護が「立っていないこと」はassertできない。** `C:\`から降りるツリーでは
+        // 新しく作ったディレクトリが最初から`SE_DACL_PROTECTED`付きで生まれ、
+        // `protected=false`で書いてもその既存の保護は消えない（実測）。
+        // **その置き場では代わりに「配布で保護が落ちた状態」が手に入る**——
+        // つまり測りたかった状況そのものなので、どちらに転んでも問いには答えられる。
+        // 立っていたか／落ちたかは上の一覧に出す（`B-10`: 分岐を黙って畳まない）。
+        assert!(
+            !(r.protected_after_protect() && r.protected_after_propagate()),
+            "[{}] {}: 保護が最後まで立ったままなので、拒否ACEは一度も『最後の砦』に \
+             なっていない。この腕は問いに答えていない",
+            r.placement,
+            r.case
+        );
+    }
+
     // 対照の対（`B-35`）——伝播しないケースでは兄弟にも届かないこと。届いていたら、
     // 高速付与が伝播していることになり、このプローブの前提そのものが崩れる。
     for r in results.iter().filter(|r| r.case == Case::NoPropagate.label()) {
@@ -949,6 +1297,133 @@ fn control_dir_propagation_matrix_probe() {
              という前提が崩れている",
             r.placement,
             r.case
+        );
+    }
+}
+
+/// **[BUG-145] 冪等スキップを外すと、いくら高くつくのか。**
+///
+/// 上のプローブが原因を「保護の書込が冪等スキップで丸ごと省かれること」に確定させた
+/// （ケース14＝**中身を1バイトも変えずに書くだけ**で無傷になる）。**その直し方の費用が
+///ここで要る**——スキップは`revoke.rs`が「高価な`CreateFileW(WRITE_DAC)`＋
+/// `SetKernelObjectSecurity`を避ける」ために置いたもので、**効きは大きいと書いてあるが
+/// 測った値は無い**。
+///
+/// # 2つの軸
+///
+/// **軸1は置き場。** スキップが発火するのは「作った直後から保護済みで生まれる」ツリー
+/// ——つまり`C:\`から降りる側だけで、`%TEMP%`配下では初回から書いている。
+/// **だから製品側の費用は置き場で変わる**（そこが測る当のもの）。
+///
+/// **軸2は規模。** このリポジトリの`.harness/`は344ノードなので、その値とその約7倍を測る。
+///
+/// # 2回呼ぶ理由
+///
+/// 保護は`preflight`の同期区間と`grant_job`のフェーズ0.5の**2回**掛かる（スキップのdoc）。
+/// 1回だけ測ると、スキップが効くはずの2回目を測り落とす。
+#[test]
+#[ignore = "実FSのDACLを書き換える費用測定（管理者権限不要）。結果はplans/mac-spike/RESULTS.mdへ転記する"]
+fn control_dir_protect_skip_cost_probe() {
+    use std::time::Instant;
+
+    // このリポジトリの`.harness/`は245ファイル・99ディレクトリの344ノード。
+    // `build_forest_tree(dir, 245, 14, 7)` が 1 + 98 + 245 = 344 で一致する。
+    const SIZES: [(usize, usize, usize); 2] = [(245, 14, 7), (1715, 14, 7)];
+
+    let bases: [(&str, PathBuf); 2] = [
+        ("drive-root", PathBuf::from("C:\\")),
+        ("user-temp", std::env::temp_dir()),
+    ];
+
+    let mut arms = Vec::new();
+    for (place_label, base) in &bases {
+        for (index, (files, k, depth)) in SIZES.iter().enumerate() {
+            // 主体は純粋導出。**腕ごとに別のSIDにして干渉を断つ。**
+            let sid = capability_sid_from_name(&format!(
+                "harnessBug145SkipCost{place_label}{index}{}",
+                std::process::id()
+            ))
+            .expect("derive a probe capability SID");
+
+            // --- 腕A: 製品の保護関数を2回 ---
+            let dir_a = super::test_support::TestDirGuard::create_in(
+                base,
+                &format!("bug145skip-prod-{place_label}-{index}"),
+            );
+            let harness_a = dir_a.path().join(".harness");
+            let nodes = super::test_support::build_forest_tree(&harness_a, *files, *k, *depth);
+            let t = Instant::now();
+            let first_a = super::protect_harness_control_dir_from_appcontainer(
+                dir_a.path(),
+                &[sid.as_psid()],
+            )
+            .expect("product protect, first pass");
+            let first_a_ms = t.elapsed().as_millis();
+            let t = Instant::now();
+            let second_a = super::protect_harness_control_dir_from_appcontainer(
+                dir_a.path(),
+                &[sid.as_psid()],
+            )
+            .expect("product protect, second pass");
+            let second_a_ms = t.elapsed().as_millis();
+
+            // --- 腕B: スキップ無しで、同じノードへ同じ書込を2回 ---
+            let dir_b = super::test_support::TestDirGuard::create_in(
+                base,
+                &format!("bug145skip-forced-{place_label}-{index}"),
+            );
+            let harness_b = dir_b.path().join(".harness");
+            let nodes_b = super::test_support::build_forest_tree(&harness_b, *files, *k, *depth);
+            let forced_pass = |root: &Path| -> u128 {
+                let mut dirs = Vec::new();
+                let mut files = Vec::new();
+                super::acl_grant::collect_dirs_and_files(
+                    root,
+                    &mut dirs,
+                    &mut files,
+                    OnVanished::Skip,
+                )
+                .expect("enumerate the control dir");
+                let t = Instant::now();
+                for node in files.iter().chain(dirs.iter().rev()) {
+                    unsafe { protect_forcing_the_write(node, sid.as_psid()) }
+                        .expect("forced protect write");
+                }
+                t.elapsed().as_millis()
+            };
+            let first_b_ms = forced_pass(&harness_b);
+            let second_b_ms = forced_pass(&harness_b);
+
+            assert_eq!(nodes, nodes_b, "2つの腕は同じ形のツリーでなければならない");
+            arms.push(serde_json::json!({
+                "placement": place_label,
+                "nodes": nodes,
+                "product_protected_first": first_a,
+                "product_protected_second": second_a,
+                "product_first_ms": first_a_ms,
+                "product_second_ms": second_a_ms,
+                "forced_first_ms": first_b_ms,
+                "forced_second_ms": second_b_ms,
+                "extra_ms_for_two_passes":
+                    (first_b_ms + second_b_ms) as i128 - (first_a_ms + second_a_ms) as i128,
+            }));
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "measurement": "S34 cost of dropping the idempotent skip in remove_sid_aces_and_protect (BUG-145)",
+            "arms": arms,
+        })
+    );
+
+    // **合否は判定しない**（時間が測る当のもの）。実験の前提だけを見る——製品の保護関数が
+    // 全ノードを「保護済み」と数えていること。ここが欠けると、比べているのが別の仕事になる。
+    for arm in &arms {
+        assert_eq!(
+            arm["product_protected_first"], arm["nodes"],
+            "製品の保護関数が全ノードを数えていない。腕Bと同じ仕事を測っていない: {arm}"
         );
     }
 }

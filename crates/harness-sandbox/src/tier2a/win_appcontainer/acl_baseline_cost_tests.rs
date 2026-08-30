@@ -1035,9 +1035,10 @@ fn acl_ace_count_cost_of_splitting_the_propagating_write_per_top_level_child() {
 /// **どの測定でも同じ2水準**なのでここに固定してある。
 fn measure_split_vs_merged_cells(
     count: usize,
-    k: usize,
+    ks: &[usize],
     depths: &[usize],
     subject_counts: &[usize],
+    tree: TreeShape,
 ) -> (Vec<serde_json::Value>, serde_json::Map<String, serde_json::Value>) {
     let placements: [(&str, std::path::PathBuf); 2] = [
         ("drive-root", std::path::PathBuf::from("C:\\")),
@@ -1047,47 +1048,118 @@ fn measure_split_vs_merged_cells(
     let mut arms = Vec::new();
     let mut ratios = serde_json::Map::new();
     for (place_label, base) in &placements {
-        for &depth in depths {
-            for &m in subject_counts {
-                let cell = format!("{place_label}-d{depth}-m{m}");
-                let mut cell_ms = [0u64; 2];
-                for (slot, (shape_label, shape)) in [
-                    ("merged", WriteShape::Merged),
-                    ("split", WriteShape::SplitPerTopLevelChild),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let label = format!("{cell}-{shape_label}");
-                    // **腕ごとにツリーを作って壊す。** 同時に置くとピークのディスクが腕数倍になり、
-                    // 前の腕が残したACEが次の腕の初期状態を変える（初回を測れなくなる）。
-                    let dir = TestDirGuard::create_in(base, &format!("aclfor-{label}"));
-                    let root = dir.path();
-                    let nodes = super::test_support::build_forest_tree(root, count, k, depth);
-                    let subjects = m_subjects(&label, m);
-                    let (leaf_dir, leaf_file) = forest_tree_leaves(root, depth);
-                    let mut arm = measure_arm(
-                        &label, root, nodes, &subjects, &leaf_dir, &leaf_file, shape,
-                    );
-                    arm["placement"] = serde_json::json!(place_label);
-                    arm["k_top_level_children"] = serde_json::json!(k);
-                    arm["depth"] = serde_json::json!(depth);
-                    cell_ms[slot] = arm["propagate_ms"]
-                        .as_u64()
-                        .expect("propagate_ms is a number");
-                    arms.push(arm);
-                    eprintln!("  [{label}] done");
+        for &k in ks {
+            for &depth in depths {
+                for &m in subject_counts {
+                    let cell = format!("{place_label}-k{k}-d{depth}-m{m}-{}", tree.label());
+                    let mut cell_ms = [0u64; 2];
+                    for (slot, (shape_label, shape)) in [
+                        ("merged", WriteShape::Merged),
+                        ("split", WriteShape::SplitPerTopLevelChild),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let label = format!("{cell}-{shape_label}");
+                        // **腕ごとにツリーを作って壊す。** 同時に置くとピークのディスクが
+                        // 腕数倍になり、前の腕が残したACEが次の腕の初期状態を変える
+                        // （初回を測れなくなる）。
+                        let dir = TestDirGuard::create_in(base, &format!("aclfor-{label}"));
+                        let root = dir.path();
+                        let nodes = tree.build(root, count, k, depth);
+                        let subjects = m_subjects(&label, m);
+                        let (leaf_dir, leaf_file) = tree.leaves(root, depth);
+                        let mut arm = measure_arm(
+                            &label, root, nodes, &subjects, &leaf_dir, &leaf_file, shape,
+                        );
+                        arm["placement"] = serde_json::json!(place_label);
+                        arm["k_top_level_children"] = serde_json::json!(k);
+                        arm["depth"] = serde_json::json!(depth);
+                        arm["tree"] = serde_json::json!(tree.label());
+                        cell_ms[slot] = arm["propagate_ms"]
+                            .as_u64()
+                            .expect("propagate_ms is a number");
+                        arms.push(arm);
+                        eprintln!("  [{label}] done");
+                    }
+                    let ratio = if cell_ms[0] == 0 {
+                        f64::NAN
+                    } else {
+                        (cell_ms[1] as f64) / (cell_ms[0] as f64)
+                    };
+                    ratios.insert(cell, serde_json::json!(ratio));
                 }
-                let ratio = if cell_ms[0] == 0 {
-                    f64::NAN
-                } else {
-                    (cell_ms[1] as f64) / (cell_ms[0] as f64)
-                };
-                ratios.insert(cell, serde_json::json!(ratio));
             }
         }
     }
     (arms, ratios)
+}
+
+/// ツリーの中身の**偏り方**。
+///
+/// **実ワークスペースは一様ではない**——このリポジトリならファイルの大半が`target/`に集まる。
+/// 分割の形はroot直下の子ごとに書込を掛けるので、**1本に集中していると「Kが実質1本」に
+/// 近づく**。それが比を動かすのかを見るための軸である。
+#[derive(Clone, Copy, Debug)]
+enum TreeShape {
+    /// `k`本の枝へ均等に撒く（これまでの全測定の形）。
+    Uniform,
+    /// **1本目の枝へ8割**、残り2割を他の`k-1`本へ撒く。
+    SkewedOneBranch,
+}
+
+impl TreeShape {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::SkewedOneBranch => "skewed",
+        }
+    }
+
+    /// 期待ノード数。**偏った形は一様な形より1ノードだけ多い**（重い枝の付け根`dbig`のぶん）。
+    /// ファイル数もディレクトリ数も他は同じなので、比の読みには影響しない。
+    /// **ここを書いておくのは、腕が注文どおりの形を受け取ったかを機械で見るためである。**
+    fn expected_nodes(self, count: usize, k: usize, depth: usize) -> usize {
+        match self {
+            Self::Uniform => 1 + k * depth + count,
+            Self::SkewedOneBranch => 2 + k * depth + count,
+        }
+    }
+
+    /// 検算に使う**最深部の葉**。偏った形では**重い枝の側**を見る
+    /// ——ファイルの8割がそこにあるので、そこへ届いていないのに緑になっては意味が無い。
+    fn leaves(self, root: &Path, depth: usize) -> (std::path::PathBuf, std::path::PathBuf) {
+        match self {
+            Self::Uniform => forest_tree_leaves(root, depth),
+            // 重い枝は`build_forest_tree(root/dbig, …, k=1, depth)`で掘ってあるので、
+            // **その`dbig`を起点にした同じ計算**がそのまま使える（規則5: 数え方を2つ持たない）。
+            Self::SkewedOneBranch => forest_tree_leaves(&root.join("dbig"), depth),
+        }
+    }
+
+    /// ツリーを作ってノード数を返す。
+    ///
+    /// 偏った形は[`super::test_support::build_forest_tree`]を**2回呼んで**作る
+    /// （新しい生成器を作らない、`docs/CODE-STRUCTURE-RULES.md`規則5）。
+    fn build(self, root: &Path, count: usize, k: usize, depth: usize) -> usize {
+        match self {
+            Self::Uniform => super::test_support::build_forest_tree(root, count, k, depth),
+            Self::SkewedOneBranch => {
+                assert!(k >= 2, "偏らせるには枝が2本以上要る");
+                let heavy = count * 8 / 10;
+                let rest = count - heavy;
+                // 残り2割を`k-1`本の一様な森へ。枝の名前は`d000..d{k-2}`になる。
+                let light_nodes =
+                    super::test_support::build_forest_tree(root, rest, k - 1, depth);
+                // 8割を`k`本目の枝（`dbig`）へ。**1本の枝＝`k=1`の森**として掘る。
+                let heavy_root = root.join("dbig");
+                let heavy_nodes =
+                    super::test_support::build_forest_tree(&heavy_root, heavy, 1, depth);
+                // `heavy_root`自身が1ノード、その配下は`heavy_nodes`（rootぶんの1を含む）。
+                light_nodes + heavy_nodes
+            }
+        }
+    }
 }
 
 /// 各腕が**注文どおりの形のツリー**を受け取ったかを見る。
@@ -1099,16 +1171,19 @@ fn measure_split_vs_merged_cells(
 /// **深さを振ったつもりで振れていない測定**は、そのまま結果として記録されてしまう。
 fn assert_arms_got_the_tree_they_asked_for(
     arms: &[serde_json::Value],
-    k: usize,
+    tree: TreeShape,
     count: usize,
 ) {
     for arm in arms {
         let depth = arm["depth"].as_u64().expect("depth is a number") as usize;
+        let k = arm["k_top_level_children"]
+            .as_u64()
+            .expect("k is a number") as usize;
         let nodes = arm["nodes"].as_u64().expect("nodes is a number") as usize;
         assert_eq!(
             nodes,
-            1 + k * depth + count,
-            "腕 {} のノード数が注文と違う。深さの軸が実際には振れていない",
+            tree.expected_nodes(count, k, depth),
+            "腕 {} のノード数が注文と違う。K・深さ・偏りのどれかが実際には振れていない",
             arm["arm"]
         );
     }
@@ -1155,7 +1230,8 @@ fn acl_ace_count_cost_of_splitting_across_depth_and_subject_count() {
     const DEPTHS: [usize; 2] = [1, 8];
     const SUBJECT_COUNTS: [usize; 2] = [1, 2];
 
-    let (arms, ratios) = measure_split_vs_merged_cells(count, K, &DEPTHS, &SUBJECT_COUNTS);
+    let (arms, ratios) =
+        measure_split_vs_merged_cells(count, &[K], &DEPTHS, &SUBJECT_COUNTS, TreeShape::Uniform);
 
     println!(
         "{}",
@@ -1183,7 +1259,7 @@ fn acl_ace_count_cost_of_splitting_across_depth_and_subject_count() {
         2 * DEPTHS.len() * SUBJECT_COUNTS.len(),
         "セルの数と比の数が合わない"
     );
-    assert_arms_got_the_tree_they_asked_for(&arms, K, count);
+    assert_arms_got_the_tree_they_asked_for(&arms, TreeShape::Uniform, count);
 }
 
 /// **[BUG-145の案A] 製品と同じ26万ノード規模で、分割はいくら高くつくのか。**
@@ -1215,7 +1291,8 @@ fn acl_ace_count_cost_of_splitting_at_production_scale() {
     const DEPTHS: [usize; 1] = [8];
     const SUBJECT_COUNTS: [usize; 1] = [2];
 
-    let (arms, ratios) = measure_split_vs_merged_cells(count, K, &DEPTHS, &SUBJECT_COUNTS);
+    let (arms, ratios) =
+        measure_split_vs_merged_cells(count, &[K], &DEPTHS, &SUBJECT_COUNTS, TreeShape::Uniform);
 
     println!(
         "{}",
@@ -1231,7 +1308,76 @@ fn acl_ace_count_cost_of_splitting_at_production_scale() {
     );
 
     assert_eq!(arms.len(), 4, "腕が欠けている");
-    assert_arms_got_the_tree_they_asked_for(&arms, K, count);
+    assert_arms_got_the_tree_they_asked_for(&arms, TreeShape::Uniform, count);
+}
+
+/// **[BUG-145の案A] 残った2軸——Kとの交互作用、そして偏ったツリー。**
+///
+/// これが分割の費用について**最後に残っていた「測っていないこと」**である。
+///
+/// | 軸 | これまで | ここで埋めるもの |
+/// |---|---|---|
+/// | K × 深さ × 主体 | Kは「10,000ファイル・深さ1・主体1本」でしか振っていない | 3つを**同時に**振る |
+/// | ツリーの偏り | 一様な森だけ（全枝が同じ深さ・ファイルが均等） | **1本の枝へ8割**を集める |
+///
+/// # 偏りが比を動かし得る理由（**なぜこの軸が要るのか**）
+///
+/// 分割はroot直下の子ごとに配布書込を掛けるので、**1本の枝へ集中していると
+/// 「Kが実質1本」に近づく**。実ワークスペースはまさにそうで、このリポジトリなら
+/// ファイルの大半が`target/`に入る。**一様な森だけで測って「変わらない」と言うのは、
+/// 実物と違う形で測っている**。
+///
+/// # 読むのはセルの中の比だけである（**限界**）
+///
+/// Kも深さも偏りもノード数を変えるので、**セルをまたいだ絶対値の比較はできない**。
+#[test]
+#[ignore = "creates tens of thousands of files across 28 arms and writes DACLs; run NON-elevated"]
+fn acl_ace_count_cost_of_splitting_across_k_and_tree_skew() {
+    let count = file_count() / 2;
+    const KS: [usize; 3] = [1, 20, 200];
+    const DEPTHS: [usize; 2] = [1, 8];
+    const SUBJECT_COUNTS: [usize; 1] = [2];
+
+    // 軸1: K × 深さ（主体は製品と同じ2本に固定）。K=1は**分割しても書込1回**の対照。
+    let (mut arms, mut ratios) =
+        measure_split_vs_merged_cells(count, &KS, &DEPTHS, &SUBJECT_COUNTS, TreeShape::Uniform);
+    assert_arms_got_the_tree_they_asked_for(&arms, TreeShape::Uniform, count);
+
+    // 軸2: 偏り。**K=20・深さ8**（このリポジトリと同じ形）でだけ振る——偏りとKを
+    // 同時に振ると、比が動いたときにどちらのせいか言えなくなる。
+    let (skewed_arms, skewed_ratios) = measure_split_vs_merged_cells(
+        count,
+        &[20],
+        &[8],
+        &SUBJECT_COUNTS,
+        TreeShape::SkewedOneBranch,
+    );
+    assert_arms_got_the_tree_they_asked_for(&skewed_arms, TreeShape::SkewedOneBranch, count);
+
+    arms.extend(skewed_arms);
+    for (k, v) in skewed_ratios {
+        ratios.insert(k, v);
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "measurement": "S35 cost of splitting across K and tree skew (BUG-145 案A、最後の2軸)",
+            "file_count_per_arm": count,
+            "k_values": KS,
+            "depths": DEPTHS,
+            "subject_counts": SUBJECT_COUNTS,
+            "arms": arms,
+            "split_over_merged": ratios,
+        })
+    );
+
+    // **合否は判定しない**（比そのものが測る当のもの）。腕が欠けていないことだけを見る。
+    assert_eq!(
+        arms.len(),
+        2 * KS.len() * DEPTHS.len() * SUBJECT_COUNTS.len() * 2 + 2 * 2,
+        "腕が欠けている。比の一覧が全セルを覆っていない"
+    );
 }
 
 /// [`super::test_support::build_forest_tree`]の`depth = 1`が

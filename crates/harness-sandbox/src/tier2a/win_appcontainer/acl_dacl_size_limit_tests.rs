@@ -162,7 +162,8 @@ fn try_n_aces(parent: &Path, tag: &str, n: usize, pool: &[crate::win_common::Own
 
     let wanted = sid_strings(&pool[..n]);
     let present = count_own_aces(&node, &wanted);
-    let (acl_bytes, total_aces) = dacl_size_info(&node).expect("read the DACL size");
+    let size = dacl_size_info(&node).expect("read the DACL size");
+    let (acl_bytes, total_aces) = (size.bytes_in_use, size.ace_count);
 
     // **剥がしてから戻る**（B-01）。ツリーごと消えるとはいえ、撤収が通ることを
     // 段ごとに確かめておかないと「付けられたが剥がせない」を見逃す。
@@ -284,7 +285,8 @@ fn acl_dacl_size_limit_where_it_breaks_and_how_it_fails() {
     // --- 1. 1本あたりのバイト数を実測する ---
     let empty = root.join("bytes-0");
     std::fs::create_dir_all(&empty).expect("create the byte-probe node");
-    let (bytes_0, aces_0) = dacl_size_info(&empty).expect("read the baseline DACL size");
+    let baseline = dacl_size_info(&empty).expect("read the baseline DACL size");
+    let (bytes_0, aces_0) = (baseline.bytes_in_use, baseline.ace_count);
     let one = try_n_aces(root, "bytes1", 1, &pool);
     let bytes_per_ace = one.acl_bytes as i64 - bytes_0 as i64;
 
@@ -417,7 +419,8 @@ fn acl_dacl_size_limit_when_ancestors_stack_inherited_aces() {
             per_level_subjects.iter().flatten().cloned().collect();
         let wanted = sid_strings(&expected);
         let present_on_leaf = count_own_aces(&leaf_file, &wanted);
-        let (leaf_bytes, leaf_total) = dacl_size_info(&leaf_file).expect("read the leaf DACL size");
+        let leaf_size = dacl_size_info(&leaf_file).expect("read the leaf DACL size");
+        let (leaf_bytes, leaf_total) = (leaf_size.bytes_in_use, leaf_size.ace_count);
 
         // **新規作成したファイルが継承する数**は別経路なので別に数える。
         let fresh = cursor.join("fresh.txt");

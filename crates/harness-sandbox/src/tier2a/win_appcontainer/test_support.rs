@@ -433,14 +433,34 @@ pub(super) fn describe_dacl_aces(path: &std::path::Path) -> windows::core::Resul
     }
 }
 
-/// `path`のDACLが**実際に使っているバイト数**とACE本数を返す。
+/// `path`のDACLの**ヘッダの実測値**（[`dacl_size_info`]が返すもの）。
+///
+/// **ACEの一覧が同じでも、ここが違えば「同じ状態」ではない。** BUG-145の調査は
+/// 「落ちるケースと無傷のケースでACE一覧が完全に同一」までしか見ておらず、
+/// **ACLの確保容量とリビジョンを一度も読んでいなかった**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DaclSizeInfo {
+    /// 実際に使っているバイト数。
+    pub(super) bytes_in_use: u32,
+    /// 確保済みだが空いているバイト数。**書込側が確保した容量がそのまま保存されるか**を見る値。
+    pub(super) bytes_free: u32,
+    pub(super) ace_count: u32,
+    /// ACLのリビジョン（`ACL_REVISION`＝2、`ACL_REVISION_DS`＝4）。
+    pub(super) revision: u8,
+}
+
+/// `path`のDACLのヘッダを読む（使用バイト数・空きバイト数・ACE本数・リビジョン）。
 ///
 /// ACLのサイズ欄は16ビットなので構造上65,535バイトが上限になる——**が、それは「どこで
 /// 何が起きるか」を言っていない**。実際に何本入るか、上限に当たったときエラーになるのか
 /// 黙って切り捨てられるのかは測らないと分からないので、その測定のためにここに置く。
 /// **既存にACLの実バイト数を返す部品は無い**（`revoke.rs`の`copy_dacl_excluding_sids`は
 /// 内部でバッファ容量を決めるために読んでいるだけで、値を外へ出さない）。
-pub(super) fn dacl_size_info(path: &std::path::Path) -> windows::core::Result<(u32, u32)> {
+///
+/// **空きバイト数とリビジョンは[BUG-145](../../../../docs/bugs/BUG-145.md)の調査で足した。**
+/// 剥がす側は元のACLと同じ容量で確保するので**空きが残り**、組み直す口は詰めて確保する
+/// ——その差が保存後にも現れるのかを見るには、使用バイト数だけでは足りない。
+pub(super) fn dacl_size_info(path: &std::path::Path) -> windows::core::Result<DaclSizeInfo> {
     use std::ffi::c_void;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
@@ -466,7 +486,12 @@ pub(super) fn dacl_size_info(path: &std::path::Path) -> windows::core::Result<(u
         .ok()?;
 
         let result = if dacl.is_null() {
-            Ok((0, 0))
+            Ok(DaclSizeInfo {
+                bytes_in_use: 0,
+                bytes_free: 0,
+                ace_count: 0,
+                revision: 0,
+            })
         } else {
             let mut size_info = ACL_SIZE_INFORMATION::default();
             GetAclInformation(
@@ -475,7 +500,12 @@ pub(super) fn dacl_size_info(path: &std::path::Path) -> windows::core::Result<(u
                 std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
                 AclSizeInformation,
             )
-            .map(|()| (size_info.AclBytesInUse, size_info.AceCount))
+            .map(|()| DaclSizeInfo {
+                bytes_in_use: size_info.AclBytesInUse,
+                bytes_free: size_info.AclBytesFree,
+                ace_count: size_info.AceCount,
+                revision: (*dacl).AclRevision,
+            })
         };
         let _ = LocalFree(HLOCAL(sd.0));
         result
