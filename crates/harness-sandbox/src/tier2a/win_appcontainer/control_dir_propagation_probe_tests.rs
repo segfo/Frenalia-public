@@ -15,9 +15,10 @@
 //! BUG-145で観測されたのは**保護ノード自身**が保護を失い、継承由来の許可ACEを載せる現象なので、
 //! どちらの計器にも写らない。
 //!
-//! # 2つの軸で振る
+//! # 3つの軸で振る
 //!
-//! **軸1（手順）**は5ケース。**軸2（置き場）は2水準で、これを外すと再現しない可能性がある**
+//! **軸1（手順）**は10ケース。**軸3（深さ）は配布の対象が保護ノードの親か祖父か**で、
+//! 後者は`--fs-allow <祖先>/**`が実際に使う形である（ケース9・10）。**軸2（置き場）は2水準で、これを外すと再現しない可能性がある**
 //! ——[`super::super::acl_dacl_write`]のモジュールdocは「同じ書込列でもツリーの置き場所で
 //! 伝播の挙動が反転した」実測を持っており、BUG-145の実測は`C:\`直下
 //! （`C:\harness-Tier2a-verify-*`）だった。**`%TEMP%`だけで測ると取り逃す。**
@@ -117,6 +118,17 @@ enum Case {
     /// ケース2と同じ手順を行列の最後に置く。**ここが2と食い違ったら、読んでいるのは手順ではなく
     /// 実行順である**（`B-28`: 1回のテストは反復を保証しない）。
     ProductionRepeat,
+    /// `ws/guarded`を保護 → **祖先**へ配布。**中間`ws`には何も書かない。**
+    ///
+    /// `--fs-allow` が祖先を指したときの形で、深さ1のケース1〜8は「親から配る」までしか
+    /// 見ていない。**まず「深さ2へ配布が届くのか」から確かめる**——届かなければ、
+    /// 保護が落ちるかどうか以前に測定が成立しない。
+    AncestorCleanHolder,
+    /// ケース9に**中間`ws`への高速付与**（別主体、カーネル口）を足してから祖先へ配布する。
+    ///
+    /// 製品ではここがworkspace rootに当たり、preflightのカーネル口の書込を受けている。
+    /// **9との差はその1点だけ**で、深さ1でケース2と3を分けた変数と同じものである。
+    AncestorWrittenHolder,
 }
 
 const CASES: &[Case] = &[
@@ -128,6 +140,8 @@ const CASES: &[Case] = &[
     Case::ReprotectNoDeny,
     Case::DenyInOneWrite,
     Case::ProductionRepeat,
+    Case::AncestorCleanHolder,
+    Case::AncestorWrittenHolder,
 ];
 
 impl Case {
@@ -141,12 +155,30 @@ impl Case {
             Self::ReprotectNoDeny => "6-reprotect-no-deny",
             Self::DenyInOneWrite => "7-deny-in-one-write",
             Self::ProductionRepeat => "8-production-repeat",
+            Self::AncestorCleanHolder => "9-ancestor-clean-holder",
+            Self::AncestorWrittenHolder => "10-ancestor-written-holder",
         }
     }
 
-    /// 保護の前にケースrootへ高速付与（伝播しない口）を通すか。
-    fn fast_grants_root(self) -> bool {
-        !matches!(self, Self::NoPriorRootWrite)
+    /// 保護の前に`holder`（保護ノードの親）へ高速付与（伝播しない口）を通すか。
+    ///
+    /// **深さ2ではここが唯一の差分である**（ケース9は掛けない・10は掛ける）。
+    fn fast_grants_holder(self) -> bool {
+        !matches!(self, Self::NoPriorRootWrite | Self::AncestorCleanHolder)
+    }
+
+    /// 配布の対象（ケースroot）が保護ノードの**祖父以上**か。真ならツリーが1段深くなる。
+    fn propagates_from_ancestor(self) -> bool {
+        matches!(self, Self::AncestorCleanHolder | Self::AncestorWrittenHolder)
+    }
+
+    /// 祖先（＝配布の対象）にも先行の高速付与を掛けるか。
+    ///
+    /// **いまは常に偽である。** 深さ2で先に確かめるべきは「配布が届くのか」で、
+    /// 祖先への先行書込は**それが届くと分かってから**振る変数である（振る軸を増やすと、
+    /// 対照が落ちたときにどれのせいか分からなくなる）。
+    fn fast_grants_ancestor(self) -> bool {
+        false
     }
 
     fn propagate_to(self) -> PropagateTo {
@@ -158,7 +190,9 @@ impl Case {
             | Self::ExplicitDeny
             | Self::ReprotectNoDeny
             | Self::DenyInOneWrite
-            | Self::ProductionRepeat => PropagateTo::CaseRoot,
+            | Self::ProductionRepeat
+            | Self::AncestorCleanHolder
+            | Self::AncestorWrittenHolder => PropagateTo::CaseRoot,
         }
     }
 
@@ -189,6 +223,8 @@ struct CaseResult {
     root_control_before_propagate: u16,
     /// 伝播書込のあと。
     root_control_after_propagate: u16,
+    /// 中間ディレクトリ（深さ2のケースだけ）の制御ビット。深さ1では`None`。
+    holder_control_before_propagate: Option<u16>,
     /// 保護直後のDACL制御ビット。**ここで`SE_DACL_PROTECTED`が立っていなければ測定は不成立。**
     control_after_protect: u16,
     /// 伝播直後の同じ値。伝播しないケースでは同じ時点をもう一度読む。
@@ -368,21 +404,32 @@ unsafe fn add_explicit_deny(path: &Path, sid: PSID, mask: u32) -> windows::core:
     }
 }
 
-/// 1ケースを走らせる。ツリーの形は全ケースで同じ。
+/// 1ケースを走らせる。ツリーの形は**深さの軸**（[`Case::propagates_from_ancestor`]）で2通り。
 ///
 /// ```text
-/// <case_root>/
-///   ├─ guarded/          ← `.harness` 相当。ここを保護する
-///   │    └─ inner.txt
-///   └─ open/             ← 兄弟。伝播が届くべき対照
-///        └─ f.txt
+/// 深さ1（ケース1〜8）              深さ2（ケース9・10。`--fs-allow <祖先>/**`の形）
+/// <case_root>/  ← 配布の対象        <case_root>/  ← 配布の対象（祖先）
+///   ├─ guarded/ ← 保護                └─ ws/      ← 中間。高速付与で書込済み
+///   │    └─ inner.txt                      ├─ guarded/ ← 保護
+///   └─ open/    ← 対照                     │    └─ inner.txt
+///        └─ f.txt                          └─ open/    ← 対照
+///                                               └─ f.txt
 /// ```
+///
+/// `holder`は「保護ノードと対照を直接ぶら下げているディレクトリ」で、深さ1では`case_root`
+/// そのもの、深さ2では中間の`ws`である。**高速付与は常に`holder`へ掛ける**——製品で
+/// カーネル口の書込を受けているのはworkspace rootであり、深さ2ではそれが中間に当たるためである。
 fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
     let mut errors = Vec::new();
     let case_root = placement.root().join(case.label());
-    let guarded = case_root.join("guarded");
+    let holder = if case.propagates_from_ancestor() {
+        case_root.join("ws")
+    } else {
+        case_root.clone()
+    };
+    let guarded = holder.join("guarded");
     let inner = guarded.join("inner.txt");
-    let open = case_root.join("open");
+    let open = holder.join("open");
     let open_file = open.join("f.txt");
     std::fs::create_dir_all(&guarded).expect("create the guarded dir");
     std::fs::create_dir_all(&open).expect("create the open dir");
@@ -390,8 +437,22 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
     std::fs::write(&open_file, b"bug-145 probe\n").expect("seed the open file");
 
     // ケースごとに別のSIDにして、ケース間の干渉を断つ（台帳は経由しない純粋導出）。
+    //
+    // **深さ2のケースは主体を2つ使う。** 製品では、中間（workspace root）へカーネル口で
+    // 書かれているのは**workspaceのcapability SID**で、祖先から配るのは
+    // **`--fs-allow`のcapability SID**という**別の主体**である。1つのSIDで両方をやると、
+    // 「同じ主体のACEが既に在ると配布が既存の子孫へ届かない」という既知の性質
+    // （[`super::super::acl_dacl_write`]のモジュールdocの実測表）を自分で踏みに行くことになり、
+    // 測りたいものと違うものを測る。**最初にそう書いて対照が落ちた。**
     let sid = capability_sid_from_name(&format!("harnessBug145Probe{index}"))
         .expect("derive a probe capability SID");
+    // 中間へ先に書かれている主体（深さ2のケースだけ）。深さ1では`sid`がその役も兼ねる。
+    let holder_sid = case.propagates_from_ancestor().then(|| {
+        capability_sid_from_name(&format!("harnessBug145Holder{index}"))
+            .expect("derive the holder capability SID")
+    });
+    // 保護と高速付与の相手。深さ2では中間側の主体、深さ1では`sid`。
+    let holder_subject = holder_sid.as_ref().unwrap_or(&sid);
     let sid_text = crate::win_common::sid_to_string(sid.as_psid())
         .expect("render the probe SID as a string");
     let mask = workspace_rwx_mask();
@@ -400,20 +461,37 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
         mask,
     }];
 
-    // **親（ケースroot）の制御ビットも読む。** 置き場で結果が割れたとき、親の側に何の差が
-    // あるのかを見ないと原因の名前を付けられない。
+    // **配布の対象（ケースroot）の制御ビットも読む。** 置き場で結果が割れたとき、
+    // 対象の側に何の差があるのかを見ないと原因の名前を付けられない。
     let root_control_initial = dacl_control(&case_root).expect("read the case root control bits");
 
-    if case.fast_grants_root() {
+    // 深さ2のケースだけ、**祖先にも**先行の高速付与を掛ける（ケース10）。
+    // ケース2と3の差（配布の対象への先行書込の有無）を、深さが増えても再現するかを見る。
+    if case.fast_grants_ancestor() {
         if let Err(e) = grant_workspace_root_aces_fast(&case_root, &grants) {
+            errors.push(format!("fast ancestor grant: {e}"));
+        }
+    }
+    if case.fast_grants_holder() {
+        let holder_grants = [AceGrant {
+            sid: holder_subject.as_psid(),
+            mask,
+        }];
+        if let Err(e) = grant_workspace_root_aces_fast(&holder, &holder_grants) {
             errors.push(format!("fast root grant: {e}"));
         }
     }
     let root_control_before_propagate =
         dacl_control(&case_root).expect("read the case root control bits before propagate");
+    // 中間ディレクトリの制御ビット。深さ1では`case_root`と同じものなので出さない。
+    let holder_control_before_propagate = case
+        .propagates_from_ancestor()
+        .then(|| dacl_control(&holder).expect("read the holder control bits before propagate"));
 
     if case.uses_production_protect() {
-        match remove_sid_aces_and_protect(&guarded, sid.as_psid()) {
+        // **保護の相手は中間側の主体である。** 製品でも`.harness`が守られているのは
+        // workspaceのcapability SIDに対してであって、`--fs-allow`の主体に対してではない。
+        match remove_sid_aces_and_protect(&guarded, holder_subject.as_psid()) {
             Ok(true) => {}
             // [BUG-084] `Ok(false)`は「触る前に消えていた」。自分で作ったツリーなので起こり得ないが、
             // 起きたなら測定が成立しない。
@@ -498,6 +576,7 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
         root_control_initial,
         root_control_before_propagate,
         root_control_after_propagate,
+        holder_control_before_propagate,
         control_after_protect,
         control_after_propagate,
         guarded_allow_after_protect,
@@ -564,6 +643,12 @@ fn control_dir_propagation_matrix_probe() {
             describe_control(r.root_control_before_propagate),
             describe_control(r.root_control_after_propagate)
         );
+        if let Some(holder) = r.holder_control_before_propagate {
+            println!(
+                "  HOLDER control (中間)   : {}   (高速付与後、配布の直前)",
+                describe_control(holder)
+            );
+        }
         println!(
             "  control after protect   : {}",
             describe_control(r.control_after_protect)
@@ -622,6 +707,18 @@ fn control_dir_propagation_matrix_probe() {
         println!("  [{label}] lost SE_DACL_PROTECTED : {lost_protection:?}");
         println!("  [{label}] guarded became reachable: {became_reachable:?}");
         println!("  [{label}] explicit deny survived  : {deny_survived:?}");
+        // 深さ2で配布が届かなかったケース。**「保護が無傷だった」とは読めない**——
+        // 配布がそこまで到達していないので、保護の話をする前提が無い。
+        let ancestor_unreached: Vec<&str> = mine
+            .iter()
+            .filter(|r| {
+                (r.case == Case::AncestorCleanHolder.label()
+                    || r.case == Case::AncestorWrittenHolder.label())
+                    && r.open_allow_after.is_none()
+            })
+            .map(|r| r.case)
+            .collect();
+        println!("  [{label}] 深さ2で配布が届かず測定不成立: {ancestor_unreached:?}");
     }
 
     // --- ここから下は「実験の前提が崩れていないか」だけを見る（合否は判定しない） ---
@@ -634,7 +731,16 @@ fn control_dir_propagation_matrix_probe() {
             describe_control(r.control_after_protect)
         );
     }
-    for r in results.iter().filter(|r| r.case != Case::NoPropagate.label()) {
+    // **深さ1のケースだけ**。届いていなければ実験の組み方が壊れている。
+    //
+    // **深さ2はassertしない**——届くかどうかがそこでは観測対象そのものだからである。
+    // 届かなかったケースは「保護が無傷だった」と主張できない（配布がそこまで来ていない）ので、
+    // 上のverdictで**測定不成立として名指しする**。黙って無傷の側へ数えない（`B-10`）。
+    for r in results.iter().filter(|r| {
+        r.case != Case::NoPropagate.label()
+            && r.case != Case::AncestorCleanHolder.label()
+            && r.case != Case::AncestorWrittenHolder.label()
+    }) {
         assert!(
             r.open_allow_after.is_some(),
             "[{}] {}: 対照の open/f.txt へ伝播が届いていない。このケースは『保護が効いた』ではなく \
