@@ -255,19 +255,59 @@ impl Drop for TestDirGuard {
 ///
 /// **形は「浅く広い」**——深さは2段（root → `dNNN/` → ファイル）で固定である。継承ACEの
 /// 伝播コストが深さに依存するかは**この関数では測れない**。§S9も§S10もこの形の数字なので、
-/// 深さの効果を知りたくなったら別の形を足すこと（**外挿しない**）。
+/// 深さの効果を知りたくなったら[`build_forest_tree`]（本関数を含む一般形）を使うこと。
+///
+/// **本体は[`build_forest_tree`]の`depth = 1`である。** 同じ組み立てを2つ持たない
+/// （`docs/CODE-STRUCTURE-RULES.md`規則5）。等価であることは実際に両方を作って
+/// 突き合わせてある（`acl_baseline_cost_tests::forest_tree_with_depth_one_is_the_wide_tree`）
+/// ——ここが1バイトでもずれると、§S9・§S10・§S15の過去の数字と並べられなくなる。
 pub(super) fn build_wide_tree(root: &std::path::Path, count: usize, fanout: usize) -> usize {
+    build_forest_tree(root, count, fanout, 1)
+}
+
+/// `count`個のファイルを、`root`直下の`k`本の枝それぞれを`depth`段に重ねた**森**へ均等に撒く。
+/// 実ノード数（ディレクトリ＋ファイル＋root）を返す。
+///
+/// **[`build_wide_tree`]と[`build_chain_tree`]の両方を含む一般形である。** 前者は`depth = 1`
+/// （k本の枝が1段に並ぶ）、後者は`k = 1`（1本の枝がdepth段に重なる）に当たる。
+/// **両方の軸を同時に動かしたい測定のために足した**——BUG-145の案A（配布をroot直下の子ごとに
+/// 分割する）の費用は「直下の子の数」と「深さ」の両方に依存し得るのに、
+/// 既存の2つはどちらか片方しか振れない。
+///
+/// 枝の1段目だけ`d{j:03}`で名前を分け、2段目以降は`d`で重ねる。ファイルは
+/// **`k * depth`個のディレクトリ全部へ順に**撒くので、最深段にも必ずファイルが載る
+/// （浅いところだけ届いて深いところが落ちる形を拾えるようにするため）。
+///
+/// # [`build_chain_tree`]は委譲していない（**意図的**）
+///
+/// あちらは全段の名前が1文字で、**深さとパス長の関係そのものが測定の前提**である
+/// （深さ`N`でパス長が`2N`しか伸びない＝N=64まではMAX_PATHの内側、という腕の組み方）。
+/// この関数へ委譲すると1段目が`d000`になってその関係が崩れるので、別のまま残す。
+pub(super) fn build_forest_tree(
+    root: &std::path::Path,
+    count: usize,
+    k: usize,
+    depth: usize,
+) -> usize {
+    assert!(k >= 1, "a forest needs at least one branch");
+    assert!(depth >= 1, "a branch needs at least one directory level");
     std::fs::create_dir_all(root).expect("create tree root");
-    for d in 0..fanout {
-        std::fs::create_dir_all(root.join(format!("d{d:03}"))).expect("create tree subdir");
+    let mut dirs = Vec::with_capacity(k * depth);
+    for j in 0..k {
+        let mut cursor = root.join(format!("d{j:03}"));
+        std::fs::create_dir_all(&cursor).expect("create forest branch");
+        dirs.push(cursor.clone());
+        for _ in 1..depth {
+            cursor = cursor.join("d");
+            std::fs::create_dir_all(&cursor).expect("create forest level");
+            dirs.push(cursor.clone());
+        }
     }
     for i in 0..count {
-        let path = root
-            .join(format!("d{:03}", i % fanout))
-            .join(format!("f{i:06}.txt"));
+        let path = dirs[i % dirs.len()].join(format!("f{i:06}.txt"));
         std::fs::write(&path, b"x").expect("write tree file");
     }
-    1 + fanout + count
+    1 + k * depth + count
 }
 
 /// `count`個のファイルを、`root`から**一列にネストした**`depth`段のディレクトリへ均等に撒く。

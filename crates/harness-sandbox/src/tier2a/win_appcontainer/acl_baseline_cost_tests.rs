@@ -104,6 +104,17 @@ fn file_count() -> usize {
         .unwrap_or(DEFAULT_FILE_COUNT)
 }
 
+/// 製品規模の腕のファイル数。**このリポジトリの実測が248,766ノード**なので26万を既定にする。
+///
+/// **`file_count`とは別の環境変数にしてある。** 同じ変数を別の既定値で2度読むと、
+/// どちらの既定が効いているのかがコードから読めなくなる（`B-05`: 複製した綴りは静かにずれる）。
+fn production_file_count() -> usize {
+    std::env::var("HARNESS_TEST_ACL_PRODUCTION_NODES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(260_000)
+}
+
 /// walkの進捗をstderrへ出す。**「止まっているのか遅いのか」を判別できるようにするため**で、
 /// 判定には一切関与しない（26万ノードのwalkは数十秒沈黙するので、無いと失敗と遅さを取り違える）。
 fn progress_to_stderr(label: &'static str) -> impl Fn(usize, usize) {
@@ -729,9 +740,24 @@ fn measure_arm(
 }
 
 /// 平らなツリー（[`build_wide_tree`]）の最深部。深さは2段で固定なので`d000/f000000.txt`。
+///
+/// **本体は[`forest_tree_leaves`]の`depth = 1`である**（規則5: 同じ組み立てを2つ持たない）。
 fn wide_tree_leaves(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let dir = root.join("d000");
-    let file = dir.join("f000000.txt");
+    forest_tree_leaves(root, 1)
+}
+
+/// 森ツリー（[`super::test_support::build_forest_tree`]）の**最深部**——1本目の枝の一番下の
+/// ディレクトリと、そこに最初に載るファイル。
+///
+/// ファイルは`k * depth`個のディレクトリへ順に撒かれるので、1本目の枝の最深段
+/// （並びの`depth - 1`番目）に最初に載るのは`f{depth-1:06}.txt`である。
+/// **ここを外して浅い葉を見ると、深い側へ配布が届いていなくても緑になる。**
+fn forest_tree_leaves(root: &Path, depth: usize) -> (std::path::PathBuf, std::path::PathBuf) {
+    let mut dir = root.join("d000");
+    for _ in 1..depth {
+        dir = dir.join("d");
+    }
+    let file = dir.join(format!("f{:06}.txt", depth - 1));
     (dir, file)
 }
 
@@ -993,6 +1019,283 @@ fn acl_ace_count_cost_of_splitting_the_propagating_write_per_top_level_child() {
             }
         }
     }
+}
+
+/// 「置き場 × 深さ × 主体の本数」の各セルで、**まとめて／分割を対で**測る。
+/// 腕のJSONと、セルごとの `分割 ÷ まとめて` を返す。
+///
+/// **まとめて→分割は必ず隣り合わせに積む。** 時間とともに動くもの（ディスクの状態・
+/// キャッシュの温まり）を、比の分子と分母へほぼ等しく乗せるためである。
+///
+/// **比はセルの中で作る**（腕の並びから添字で拾い直さない）。§S31のテストは後者の形なので、
+/// 「腕の並びと K の対応がずれていないか」を確かめるassertを別に置く必要があった——
+/// **ずれ得る書き方をやめれば、その検算ごと要らなくなる。**
+///
+/// `count`・`k`・`depths`・`subject_counts`だけを呼び出し側が決める。置き場と形は
+/// **どの測定でも同じ2水準**なのでここに固定してある。
+fn measure_split_vs_merged_cells(
+    count: usize,
+    k: usize,
+    depths: &[usize],
+    subject_counts: &[usize],
+) -> (Vec<serde_json::Value>, serde_json::Map<String, serde_json::Value>) {
+    let placements: [(&str, std::path::PathBuf); 2] = [
+        ("drive-root", std::path::PathBuf::from("C:\\")),
+        ("user-temp", std::env::temp_dir()),
+    ];
+
+    let mut arms = Vec::new();
+    let mut ratios = serde_json::Map::new();
+    for (place_label, base) in &placements {
+        for &depth in depths {
+            for &m in subject_counts {
+                let cell = format!("{place_label}-d{depth}-m{m}");
+                let mut cell_ms = [0u64; 2];
+                for (slot, (shape_label, shape)) in [
+                    ("merged", WriteShape::Merged),
+                    ("split", WriteShape::SplitPerTopLevelChild),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let label = format!("{cell}-{shape_label}");
+                    // **腕ごとにツリーを作って壊す。** 同時に置くとピークのディスクが腕数倍になり、
+                    // 前の腕が残したACEが次の腕の初期状態を変える（初回を測れなくなる）。
+                    let dir = TestDirGuard::create_in(base, &format!("aclfor-{label}"));
+                    let root = dir.path();
+                    let nodes = super::test_support::build_forest_tree(root, count, k, depth);
+                    let subjects = m_subjects(&label, m);
+                    let (leaf_dir, leaf_file) = forest_tree_leaves(root, depth);
+                    let mut arm = measure_arm(
+                        &label, root, nodes, &subjects, &leaf_dir, &leaf_file, shape,
+                    );
+                    arm["placement"] = serde_json::json!(place_label);
+                    arm["k_top_level_children"] = serde_json::json!(k);
+                    arm["depth"] = serde_json::json!(depth);
+                    cell_ms[slot] = arm["propagate_ms"]
+                        .as_u64()
+                        .expect("propagate_ms is a number");
+                    arms.push(arm);
+                    eprintln!("  [{label}] done");
+                }
+                let ratio = if cell_ms[0] == 0 {
+                    f64::NAN
+                } else {
+                    (cell_ms[1] as f64) / (cell_ms[0] as f64)
+                };
+                ratios.insert(cell, serde_json::json!(ratio));
+            }
+        }
+    }
+    (arms, ratios)
+}
+
+/// 各腕が**注文どおりの形のツリー**を受け取ったかを見る。
+///
+/// [`measure_arm`]の3検算は「配布が届いたか」を見るが、**ツリーがそもそも注文した深さで
+/// 作られたか**は見ていない。`build_forest_tree`が深さを無視しても、
+/// `k * depth`個ではなく`k`個のディレクトリができるだけで配布は全部届き、
+/// **3検算は全部通ってしまう**（`f{depth-1}.txt`が1本目の枝に載るので葉の検算も通る）。
+/// **深さを振ったつもりで振れていない測定**は、そのまま結果として記録されてしまう。
+fn assert_arms_got_the_tree_they_asked_for(
+    arms: &[serde_json::Value],
+    k: usize,
+    count: usize,
+) {
+    for arm in arms {
+        let depth = arm["depth"].as_u64().expect("depth is a number") as usize;
+        let nodes = arm["nodes"].as_u64().expect("nodes is a number") as usize;
+        assert_eq!(
+            nodes,
+            1 + k * depth + count,
+            "腕 {} のノード数が注文と違う。深さの軸が実際には振れていない",
+            arm["arm"]
+        );
+    }
+}
+
+/// **[BUG-145の案A] 分割の費用は、ツリーの深さと主体の本数で変わるのか。**
+///
+/// # なぜこれが要るのか
+///
+/// §S31は分割の費用を12腕で測ったうえで、**3つの軸を振っていない**と自分で書いた——
+/// 深さ・主体の本数・製品の規模である。案Aを採るかは後戻りしにくい決定なので、
+/// **「振っていない」と書いたまま決めない。**
+///
+/// 本テストはそのうち**2つ**（深さと主体）を、§S31と同じ10,000ファイル／腕で埋める。
+/// 3つ目（26万ノード）は[`acl_ace_count_cost_of_splitting_at_production_scale`]が
+/// **同じ形のまま規模だけを変えて**測る。
+///
+/// # 軸の値はこのリポジトリの実測から取っている（**思いつきの値を振らない**）
+///
+/// | 軸 | 値 | 根拠 |
+/// |---|---|---|
+/// | K（root直下の子の数） | **20**で固定 | このリポジトリの直下が20件 |
+/// | 深さ | 1 と **8** | このリポジトリのディレクトリの最大深さが8 |
+/// | 主体 | 1 と **2** | 製品は`WorkspaceMode::ALL`＝2モードぶんのcapability SIDを配る（D-84） |
+/// | 置き場 | `C:\`直下 と `%TEMP%`配下 | §S30では置き場で結果が完全に反転した |
+///
+/// # 読むのは「セルの中の比」だけである（**限界**）
+///
+/// 深さを変えるとディレクトリの数が変わる（K=20・深さ8なら160個）ので、
+/// **深さの違う腕どうしを絶対値で比べてはいけない**。読むのは各セルの
+/// `分割 ÷ まとめて` で、その比を深さ軸・主体軸に沿って並べる。
+///
+/// # 寿命（**M3とは別である**）
+///
+/// このファイルのM3ブロックは`docs/STATUS.md`残課題#20が終わったら消す約束だが、
+/// 本テストと§S31のテストは**BUG-145の案Aの採否**が決まったら消す。接頭辞を共有している
+/// だけで、**消す条件が違う**。
+#[test]
+#[ignore = "creates tens of thousands of files across 16 arms and writes DACLs; run NON-elevated"]
+fn acl_ace_count_cost_of_splitting_across_depth_and_subject_count() {
+    // §S31と同じ規模にする（あちらのK=20・深さ1・主体1本のセルと直接並べられるように）。
+    let count = file_count() / 2;
+    const K: usize = 20;
+    const DEPTHS: [usize; 2] = [1, 8];
+    const SUBJECT_COUNTS: [usize; 2] = [1, 2];
+
+    let (arms, ratios) = measure_split_vs_merged_cells(count, K, &DEPTHS, &SUBJECT_COUNTS);
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "measurement": "S33 cost of splitting per top-level child, across depth and subject count (BUG-145 案A)",
+            "file_count_per_arm": count,
+            "k_top_level_children": K,
+            "depths": DEPTHS,
+            "subject_counts": SUBJECT_COUNTS,
+            "arms": arms,
+            "split_over_merged": ratios,
+        })
+    );
+
+    // **合否は判定しない**（比そのものが測る当のもので、閾値を置くとマシンのノイズを判定する）。
+    // assertするのは実験の前提だけ——`measure_arm`の3検算に加えて、
+    // **注文した形のツリーで測ったこと**を見る。
+    assert_eq!(
+        arms.len(),
+        2 * DEPTHS.len() * SUBJECT_COUNTS.len() * 2,
+        "腕が欠けている。比の一覧が全セルを覆っていない"
+    );
+    assert_eq!(
+        ratios.len(),
+        2 * DEPTHS.len() * SUBJECT_COUNTS.len(),
+        "セルの数と比の数が合わない"
+    );
+    assert_arms_got_the_tree_they_asked_for(&arms, K, count);
+}
+
+/// **[BUG-145の案A] 製品と同じ26万ノード規模で、分割はいくら高くつくのか。**
+///
+/// §S31-3は「固定費の割合はツリーが大きくなるほど小さくなる」を500と10,000の2点で示し、
+/// **26万への外挿は理屈であって測っていない**と書いた。ここがその1点である。
+///
+/// # 上の`..._across_depth_and_subject_count`と**1つしか違わない**
+///
+/// K=20・深さ8・主体2本・置き場2水準・形2水準まで同じで、変えるのは**ファイル数だけ**
+/// （10,000 → 260,000）。だから2つの結果の比を並べれば、差はまるごと規模の効果になる。
+/// ほかも一緒に変えると「規模のせいか形のせいか」が言えなくなる。
+///
+/// # 26万という値の根拠
+///
+/// **このリポジトリの実測が248,766ノード**（`find | wc -l`）で、§S10-1が基準線を取ったのも
+/// 260,033ノードである。既定値を`HARNESS_TEST_ACL_PRODUCTION_NODES`で落とせる。
+///
+/// # 所要時間とディスク（**先に言っておく**）
+///
+/// §S10-1の実測から、26万ノードでは1腕あたり配布16秒・救済walk27秒×主体数・撤収19秒に
+/// ツリーの生成と撤収後の読み直しが乗る。**4腕で20分前後**を見込むこと。
+/// ツリーは腕ごとに作って壊すのでピークは1本ぶん（26万ファイル×クラスタで約1GB）である。
+#[test]
+#[ignore = "creates 260,000 files per arm across 4 arms (~20 min, ~1GB peak); run NON-elevated"]
+fn acl_ace_count_cost_of_splitting_at_production_scale() {
+    let count = production_file_count();
+    const K: usize = 20;
+    const DEPTHS: [usize; 1] = [8];
+    const SUBJECT_COUNTS: [usize; 1] = [2];
+
+    let (arms, ratios) = measure_split_vs_merged_cells(count, K, &DEPTHS, &SUBJECT_COUNTS);
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "measurement": "S33 cost of splitting per top-level child at production scale (BUG-145 案A)",
+            "file_count_per_arm": count,
+            "k_top_level_children": K,
+            "depths": DEPTHS,
+            "subject_counts": SUBJECT_COUNTS,
+            "arms": arms,
+            "split_over_merged": ratios,
+        })
+    );
+
+    assert_eq!(arms.len(), 4, "腕が欠けている");
+    assert_arms_got_the_tree_they_asked_for(&arms, K, count);
+}
+
+/// [`super::test_support::build_forest_tree`]の`depth = 1`が
+/// [`build_wide_tree`]と**同じツリーである**こと。
+///
+/// `build_wide_tree`は§S9・§S10・§S15と、このファイルの既存の測定すべての土台である。
+/// 深さを振れるようにするため`build_forest_tree`へ委譲させたので、**形が変わっていたら
+/// 過去の数字と並べられなくなる**。委譲した瞬間だけでなく、以後どちらかを触ったときにも
+/// 落ちるように、**両方を実際に作って相対パスの集合を突き合わせる**。
+///
+/// **`#[ignore]`を付けない。** 作るのは十数ノードでDACLを一切書かないので通常のテスト実行で
+/// 走る——`#[ignore]`の側に置くと、委譲が壊れても誰も気付かないまま過去の数字と
+/// 並べ続けることになる（この検算はそのためだけに在る）。
+///
+/// 置き場は`%TEMP%`にする。祖先を辿る口を一切通さないので[`TestDirGuard::create_in`]の
+/// 条件を満たしており、`C:\`直下に置くと**通常のテスト実行がドライブルートへ書く**ことになる。
+#[test]
+fn forest_tree_with_depth_one_is_the_wide_tree() {
+    const FILES: usize = 11;
+    const K: usize = 3;
+
+    let base = std::env::temp_dir();
+    let wide = TestDirGuard::create_in(&base, "forest-eq-wide");
+    let forest = TestDirGuard::create_in(&base, "forest-eq-forest");
+
+    let wide_nodes = build_wide_tree(wide.path(), FILES, K);
+    let forest_nodes = super::test_support::build_forest_tree(forest.path(), FILES, K, 1);
+
+    let list = |root: &Path| -> Vec<String> {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        super::acl_grant::collect_dirs_and_files(root, &mut dirs, &mut files, OnVanished::Abort)
+            .expect("enumerate the tree");
+        let mut out: Vec<String> = dirs
+            .into_iter()
+            .chain(files)
+            .map(|p| {
+                p.strip_prefix(root)
+                    .map(|r| r.to_string_lossy().to_lowercase())
+                    .unwrap_or_default()
+            })
+            .collect();
+        out.sort();
+        out
+    };
+
+    assert_eq!(
+        wide_nodes, forest_nodes,
+        "ノード数が違う。`build_wide_tree`の数え方が変わっている"
+    );
+    assert_eq!(
+        list(wide.path()),
+        list(forest.path()),
+        "ディレクトリ名かファイルの配置が違う。§S9・§S10・§S15の数字と並べられない形になっている"
+    );
+    // **対の検算**（`B-35`）——上のassertは「同じなら緑」なので、比較器が常に等しいと
+    // 言っているだけでも通る。深さを変えれば**違うと言えること**まで見る。
+    let deeper = TestDirGuard::create_in(&base, "forest-eq-deep");
+    super::test_support::build_forest_tree(deeper.path(), FILES, K, 2);
+    assert_ne!(
+        list(wide.path()),
+        list(deeper.path()),
+        "深さ2の森が深さ1と同じ形に見えている。この比較器は差を検出できていない"
+    );
 }
 
 /// **M3-c: 伝播のコストは、ツリーの深さで変わるのか。**
