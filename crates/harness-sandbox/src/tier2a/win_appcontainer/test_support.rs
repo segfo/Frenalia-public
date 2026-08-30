@@ -305,6 +305,38 @@ pub(super) fn build_chain_tree(root: &std::path::Path, count: usize, depth: usiz
     1 + depth + count
 }
 
+/// `dacl`（自前バッファ上のコピー）の全ACEから継承由来のフラグ（`INHERITED_ACE`）を落とす。
+///
+/// 保護DACL（継承を受け付けない状態）に継承由来フラグの立ったACEが残るのは自己不整合であり、
+/// `.NET`の`SetAccessRuleProtection(true, preserveInheritance: true)`やエクスプローラの
+/// 「継承された権限をこのオブジェクトの明示的な権限に変換する」はこの変換を行う。
+///
+/// `docs/CODE-STRUCTURE-RULES.md`規則5により、**2箇所目の利用者が出たのでここへ移した**
+/// （元は`dacl_protection_probe_tests`のprivate定義）。利用者は
+/// [BUG-083](../../../../docs/bugs/BUG-083.md)のプローブ（保護がどの書込口で立つか）と、
+/// [BUG-145](../../../../docs/bugs/BUG-145.md)のプローブ（保護が親の配布で落ちるのはなぜか）。
+/// **同じ変換を2つの実装で持つと、片方だけ直ったときに2つのプローブの結果が比べられなくなる。**
+///
+/// # 安全性
+///
+/// `dacl`は呼び出し側が持つ有効なACLを指していること（自前バッファ上のコピーであること）。
+pub(super) unsafe fn strip_inherited_ace_flags(
+    dacl: *mut windows::Win32::Security::ACL,
+) -> windows::core::Result<()> {
+    use std::ffi::c_void;
+    use windows::Win32::Security::{GetAce, ACE_HEADER, INHERITED_ACE};
+    unsafe {
+        let count = (*dacl).AceCount as u32;
+        for index in 0..count {
+            let mut ace_ptr: *mut c_void = std::ptr::null_mut();
+            GetAce(dacl, index, &mut ace_ptr)?;
+            let header = ace_ptr as *mut ACE_HEADER;
+            (*header).AceFlags &= !(INHERITED_ACE.0 as u8);
+        }
+        Ok(())
+    }
+}
+
 /// `path`のDACLのACEを1件ずつ「種別;フラグ;マスク;SID」の文字列にして返す。
 ///
 /// **件数だけでなくtrusteeとマスクまで**比較できる形にしてある——件数が同じでも中身が

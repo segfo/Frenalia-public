@@ -17,7 +17,7 @@
 //!
 //! # 3つの軸で振る
 //!
-//! **軸1（手順）**は10ケース。**軸3（深さ）は配布の対象が保護ノードの親か祖父か**で、
+//! **軸1（手順）**は13ケース。**軸3（深さ）は配布の対象が保護ノードの親か祖父か**で、
 //! 後者は`--fs-allow <祖先>/**`が実際に使う形である（ケース9・10）。**軸2（置き場）は2水準で、これを外すと再現しない可能性がある**
 //! ——[`super::super::acl_dacl_write`]のモジュールdocは「同じ書込列でもツリーの置き場所で
 //! 伝播の挙動が反転した」実測を持っており、BUG-145の実測は`C:\`直下
@@ -129,6 +129,29 @@ enum Case {
     /// 製品ではここがworkspace rootに当たり、preflightのカーネル口の書込を受けている。
     /// **9との差はその1点だけ**で、深さ1でケース2と3を分けた変数と同じものである。
     AncestorWrittenHolder,
+    /// 製品と同じ剥がし方 → **書く直前に継承由来フラグを落とす** → 1回で書く → 親へ配布。
+    ///
+    /// **仮説H1（自己不整合）だけを動かす。** 製品の保護は、継承由来のフラグが立ったままの
+    /// ACEを「継承を受け付けない」DACLとして書いている。この矛盾した状態が親からの配布に
+    /// 耐えないのではないか、を測る。
+    StripInheritedProtect,
+    /// 製品と同じ剥がし方 → **`SetEntriesInAclW`へ通す（ACEは足さない）** → 1回で書く → 親へ配布。
+    ///
+    /// **仮説H2（組み直し）だけを動かす。** 無傷だったケース5・6・7はいずれも、最後の書込の
+    /// DACLが`SetEntriesInAclW`（正規順へ組み直す口）を通っているか、保護済みノードから
+    /// 読み直したものだった。製品の`copy_dacl_excluding_sids`は**ACEをそのまま写す**。
+    ///
+    /// **ケース2と6の保護直後のACEは完全に同一だった**（実測）ので、差はDACLの「中身」ではなく
+    /// 「どう組んで書いたか」の側にある——それがこのケースの狙いである。
+    CanonicalizeProtect,
+    /// 組み直したうえで、**わざと全ACEへ継承由来フラグを立て直してから**書く → 親へ配布。
+    ///
+    /// **仮説H1をひっくり返して確かめる逆向きの対照である。** 11・12が無傷になったので
+    /// 「書くDACLのACEが継承由来を名乗っていなければ耐える」が残る仮説だが、それが本当なら
+    /// **名乗らせれば壊れるはず**である。壊れなければH1は外れで、共通項は別にある。
+    ///
+    /// **無傷の形を並べるだけでは原因を特定できない**——狙って壊せて初めて確定する。
+    ForceInheritedProtect,
 }
 
 const CASES: &[Case] = &[
@@ -142,6 +165,9 @@ const CASES: &[Case] = &[
     Case::ProductionRepeat,
     Case::AncestorCleanHolder,
     Case::AncestorWrittenHolder,
+    Case::StripInheritedProtect,
+    Case::CanonicalizeProtect,
+    Case::ForceInheritedProtect,
 ];
 
 impl Case {
@@ -157,6 +183,9 @@ impl Case {
             Self::ProductionRepeat => "8-production-repeat",
             Self::AncestorCleanHolder => "9-ancestor-clean-holder",
             Self::AncestorWrittenHolder => "10-ancestor-written-holder",
+            Self::StripInheritedProtect => "11-strip-inherited-protect",
+            Self::CanonicalizeProtect => "12-canonicalize-protect",
+            Self::ForceInheritedProtect => "13-force-inherited-protect",
         }
     }
 
@@ -192,14 +221,25 @@ impl Case {
             | Self::DenyInOneWrite
             | Self::ProductionRepeat
             | Self::AncestorCleanHolder
-            | Self::AncestorWrittenHolder => PropagateTo::CaseRoot,
+            | Self::AncestorWrittenHolder
+            | Self::StripInheritedProtect
+            | Self::CanonicalizeProtect
+            | Self::ForceInheritedProtect => PropagateTo::CaseRoot,
         }
     }
 
-    /// 製品の保護（[`remove_sid_aces_and_protect`]）を通すか。ケース7だけは
-    /// 剥がす・拒否・保護を1回の書込でまとめるので、こちらを通さない。
+    /// 製品の保護（[`remove_sid_aces_and_protect`]）を通すか。
+    ///
+    /// 通さないのは、**保護の書き方そのものを差し替えて測る3ケース**だけである
+    /// （7は拒否ACEを1回で、11は継承由来フラグを落として、12は組み直してから書く）。
     fn uses_production_protect(self) -> bool {
-        !matches!(self, Self::DenyInOneWrite)
+        !matches!(
+            self,
+            Self::DenyInOneWrite
+                | Self::StripInheritedProtect
+                | Self::CanonicalizeProtect
+                | Self::ForceInheritedProtect
+        )
     }
 
     fn writes_deny(self) -> bool {
@@ -240,6 +280,10 @@ struct CaseResult {
     /// この主体宛の**拒否**ACEの本数（ケース5の生存確認）。
     deny_aces_after_protect: usize,
     deny_aces_after_propagate: usize,
+    /// **保護直後のACE一覧そのもの。** 差分を作るためだけに集めて捨てていたが、
+    /// 落ちるケースと無傷のケースでフラグ構成が違うのかを見るには**現物が要る**
+    /// （`B-10`: 集めたのに出していない値は、無いのと同じ）。
+    aces_after_protect: Vec<String>,
     /// 保護直後には無く、伝播後に増えたACE。**BUG-145の現象そのもの。**
     added_aces: Vec<String>,
     /// 保護直後にはあったのに、伝播後に消えたACE。
@@ -323,6 +367,130 @@ unsafe fn protect_with_deny_in_one_write(
         let _ = LocalFree(HLOCAL(sd.0));
         merge_result?;
 
+        let result = set_dacl_single_object_with_protection(path, merged, true);
+        let _ = LocalFree(HLOCAL(merged as *mut _));
+        result
+    }
+}
+
+/// 製品と同じ剥がし方をしてから、**書く直前に継承由来フラグを落として**1回で書く（ケース11専用）。
+///
+/// 製品の[`remove_sid_aces_and_protect`]との差は**その1点だけ**である。落とす部品は
+/// [`super::test_support::strip_inherited_ace_flags`]（BUG-083のプローブと共有）。
+///
+/// # 安全性
+///
+/// `sid`は有効なSIDを指していること。
+unsafe fn protect_stripping_inherited_flags(path: &Path, sid: PSID) -> windows::core::Result<()> {
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut existing: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        let mut buf: Vec<u8> = Vec::new();
+        let copied = copy_dacl_excluding_sids(existing as *const _, &[sid], &mut buf);
+        let _ = LocalFree(HLOCAL(sd.0));
+        let (dacl, _removed) = copied?;
+        super::test_support::strip_inherited_ace_flags(dacl)?;
+        set_dacl_single_object_with_protection(path, dacl, true)
+    }
+}
+
+/// 製品と同じ剥がし方をしてから、**`SetEntriesInAclW`へ通して組み直し**1回で書く（ケース12専用）。
+///
+/// 新しいACEは1本も渡さない——**組み直すこと自体が測る当のもの**だからである。
+/// `SetEntriesInAclW`へ空の一覧を渡す形が受け付けられなければ、この関数が`Err`を返し、
+/// 呼び出し側が`errors`へ積んで**そのケースは測定不成立として出力に残る**
+/// （黙って別の形へ落として「測れた」ことにしない）。
+///
+/// # 安全性
+///
+/// `sid`は有効なSIDを指していること。
+unsafe fn protect_canonicalizing_dacl(path: &Path, sid: PSID) -> windows::core::Result<()> {
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut existing: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        let mut buf: Vec<u8> = Vec::new();
+        let copied = copy_dacl_excluding_sids(existing as *const _, &[sid], &mut buf);
+        let _ = LocalFree(HLOCAL(sd.0));
+        let (stripped, _removed) = copied?;
+
+        let mut merged: *mut ACL = std::ptr::null_mut();
+        SetEntriesInAclW(None, Some(stripped as *const _), &mut merged).ok()?;
+        let result = set_dacl_single_object_with_protection(path, merged, true);
+        let _ = LocalFree(HLOCAL(merged as *mut _));
+        result
+    }
+}
+
+/// 組み直したDACLの全ACEへ**継承由来フラグを立て直してから**保護つきで書く（ケース13専用）。
+///
+/// [`super::test_support::strip_inherited_ace_flags`]の逆向きで、**狙って壊すためだけに在る**。
+/// 共有部品にしないのは利用者がここ1つで、かつ**製品が決してしてはいけない操作**だからである。
+///
+/// # 安全性
+///
+/// `sid`は有効なSIDを指していること。
+unsafe fn protect_forcing_inherited_flags(path: &Path, sid: PSID) -> windows::core::Result<()> {
+    use std::ffi::c_void;
+    use windows::Win32::Security::{GetAce, ACE_HEADER, INHERITED_ACE};
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut existing: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        let mut buf: Vec<u8> = Vec::new();
+        let copied = copy_dacl_excluding_sids(existing as *const _, &[sid], &mut buf);
+        let _ = LocalFree(HLOCAL(sd.0));
+        let (stripped, _removed) = copied?;
+
+        // ケース12と同じ組み直しを通してから、フラグだけを立て直す。
+        // **12との差を「継承由来を名乗るか」の1点にするため**である。
+        let mut merged: *mut ACL = std::ptr::null_mut();
+        SetEntriesInAclW(None, Some(stripped as *const _), &mut merged).ok()?;
+        let count = (*merged).AceCount as u32;
+        for index in 0..count {
+            let mut ace_ptr: *mut c_void = std::ptr::null_mut();
+            if GetAce(merged, index, &mut ace_ptr).is_ok() && !ace_ptr.is_null() {
+                let header = ace_ptr as *mut ACE_HEADER;
+                (*header).AceFlags |= INHERITED_ACE.0 as u8;
+            }
+        }
         let result = set_dacl_single_object_with_protection(path, merged, true);
         let _ = LocalFree(HLOCAL(merged as *mut _));
         result
@@ -500,8 +668,27 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
             }
             Err(e) => errors.push(format!("protect: {e}")),
         }
-    } else if let Err(e) = unsafe { protect_with_deny_in_one_write(&guarded, sid.as_psid(), mask) } {
-        errors.push(format!("protect+deny in one write: {e}"));
+    } else {
+        // **保護の書き方そのものを差し替える3ケース。** どれも書込は1回で、製品との差は
+        // 「最後に書くDACLをどう組んだか」だけである。
+        let replaced = match case {
+            Case::DenyInOneWrite => unsafe {
+                protect_with_deny_in_one_write(&guarded, holder_subject.as_psid(), mask)
+            },
+            Case::StripInheritedProtect => unsafe {
+                protect_stripping_inherited_flags(&guarded, holder_subject.as_psid())
+            },
+            Case::CanonicalizeProtect => unsafe {
+                protect_canonicalizing_dacl(&guarded, holder_subject.as_psid())
+            },
+            Case::ForceInheritedProtect => unsafe {
+                protect_forcing_inherited_flags(&guarded, holder_subject.as_psid())
+            },
+            other => unreachable!("{other:?} は製品の保護を通すはずのケースである"),
+        };
+        if let Err(e) = replaced {
+            errors.push(format!("replaced protect write: {e}"));
+        }
     }
     if case.writes_deny() {
         if let Err(e) = unsafe { add_explicit_deny(&guarded, sid.as_psid(), mask) } {
@@ -584,6 +771,7 @@ fn run_case(placement: Placement, case: Case, index: usize) -> CaseResult {
         inner_allow_after,
         open_allow_after,
         deny_aces_after_protect: count_deny_aces(&aces_after_protect, &sid_text),
+        aces_after_protect,
         deny_aces_after_propagate: count_deny_aces(&aces_after_propagate, &sid_text),
         added_aces,
         lost_aces,
@@ -674,6 +862,9 @@ fn control_dir_propagation_matrix_probe() {
             "  open/f.txt allow        : {}   <- 対照（伝播が走ったか）",
             describe_mask(r.open_allow_after)
         );
+        for ace in &r.aces_after_protect {
+            println!("  = ACE after protect     : {ace}");
+        }
         for ace in &r.added_aces {
             println!("  + gained ACE            : {ace}");
         }

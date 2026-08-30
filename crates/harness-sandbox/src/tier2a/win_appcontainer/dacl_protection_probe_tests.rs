@@ -53,7 +53,7 @@
 
 use super::*;
 
-use windows::Win32::Security::{SetSecurityDescriptorControl, INHERITED_ACE};
+use windows::Win32::Security::SetSecurityDescriptorControl;
 
 /// 試す書込経路。
 ///
@@ -197,23 +197,10 @@ fn probe_root() -> std::path::PathBuf {
 // 無言で切り捨てられるか）が2箇所目の利用者になったため（`docs/CODE-STRUCTURE-RULES.md`規則5）。
 use super::test_support::describe_dacl_aces;
 
-/// `dacl`（自前バッファ上のコピー）の全ACEから`INHERITED_ACE`を落とす（候補C）。
-///
-/// 保護DACLに継承由来フラグの立ったACEが残るのは自己不整合であり、`.NET`の
-/// `SetAccessRuleProtection(true, preserveInheritance: true)`やエクスプローラの
-/// 「継承された権限をこのオブジェクトの明示的な権限に変換する」はこの変換を行う。
-unsafe fn strip_inherited_flags(dacl: *mut ACL) -> windows::core::Result<()> {
-    unsafe {
-        let count = (*dacl).AceCount as u32;
-        for index in 0..count {
-            let mut ace_ptr: *mut c_void = std::ptr::null_mut();
-            GetAce(dacl, index, &mut ace_ptr)?;
-            let header = ace_ptr as *mut ACE_HEADER;
-            (*header).AceFlags &= !(INHERITED_ACE.0 as u8);
-        }
-        Ok(())
-    }
-}
+// 継承由来フラグを落とす部品（候補C）は`test_support`が持つ。**BUG-145のプローブが
+// 2箇所目の利用者になったので移した**（規則5）——同じ変換を2つ持つと、片方だけ直ったときに
+// 2つのプローブの結果が比べられなくなる。
+use super::test_support::strip_inherited_ace_flags as strip_inherited_flags;
 
 /// `super::set_dacl_single_object_with_protection`（＝本番のカーネル経路）の実験用の写し。
 /// **本番と違うのは`opts`の2点だけ**で、`opts`が両方`false`なら本番と等価になる
