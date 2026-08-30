@@ -133,6 +133,12 @@ pub struct WorkspaceGrantProgress {
     /// ノード数。表示用ではなく**事後確認用**——`0`のまま`finished`になったら、制御面の
     /// 保護が1件も掛かっていない（BUG-083がこの実機で恒常的にそうなっていた）。
     pub protected_nodes: usize,
+    /// [BUG-145] そのうち**実際にDACLを書いた**ノード数。
+    ///
+    /// `protected_nodes`だけでは、冪等スキップで**書込が1回も走っていない**状態と
+    /// 実際に保護を確立した状態が同じ数に見える——それがBUG-145の本体だった。
+    /// **初回は`protected_nodes`と同じになり、2回目以降は0になる**のが健全な形である。
+    pub protection_writes: usize,
     /// [残課題#32] フェーズ1（救済walk）が**明示ACEを書いたノード数**。`protected_nodes`と
     /// 同じく表示用ではなく**事後確認用**である。
     ///
@@ -245,6 +251,8 @@ struct JobState {
     total: AtomicUsize,
     /// フェーズ0.5が`.harness/**`へ保護を掛けられたノード数（BUG-084）。
     protected_nodes: AtomicUsize,
+    /// [BUG-145] そのうち**実際にDACLを書いた**ノード数。
+    protection_writes: AtomicUsize,
     /// フェーズ1の[`super::DescendantFixReport`]（残課題#32の事後確認用）。
     rescue_granted: AtomicUsize,
     rescue_checked: AtomicUsize,
@@ -531,7 +539,10 @@ fn protect_control_dir(
     // 記録しないと「D-05/D-09の層3が1件も掛からなかった」ことを事後に知る手段が無い。
     let nodes = super::protect_harness_control_dir_from_appcontainer(root, &protect_psids)
         .map_err(|e| e.to_string())?;
-    state.protected_nodes.store(nodes, Ordering::Relaxed);
+    // [BUG-145] **書いた件数も残す。** 「保護済み」だけでは、書込が省かれていても
+    // 同じ数になる——それが見えなかったことがこの欠陥の本体だった。
+    state.protected_nodes.store(nodes.protected, Ordering::Relaxed);
+    state.protection_writes.store(nodes.written, Ordering::Relaxed);
     Ok(())
 }
 
@@ -816,6 +827,7 @@ fn snapshot_progress(state: &JobState) -> WorkspaceGrantProgress {
         done: state.done.load(Ordering::Relaxed),
         total: state.total.load(Ordering::Relaxed),
         protected_nodes: state.protected_nodes.load(Ordering::Relaxed),
+        protection_writes: state.protection_writes.load(Ordering::Relaxed),
         rescue_granted: state.rescue_granted.load(Ordering::Relaxed),
         rescue_checked: state.rescue_checked.load(Ordering::Relaxed),
         rescue_probe_errors: state.rescue_probe_errors.load(Ordering::Relaxed),
@@ -971,6 +983,7 @@ mod tests {
             done,
             total,
             protected_nodes: 0,
+            protection_writes: 0,
             rescue_granted: 0,
             rescue_checked: 0,
             rescue_probe_errors: 0,

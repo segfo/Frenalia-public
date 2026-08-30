@@ -295,7 +295,15 @@ fn rewrite_with_protection(path: &Path, protected: bool) -> windows::core::Resul
         let _ = LocalFree(HLOCAL(sd.0));
         let (new_dacl, _removed) = copied?;
 
-        set_dacl_single_object_with_protection(path, new_dacl, protected)
+        set_dacl_single_object_with_protection(
+            path,
+            new_dacl,
+            if protected {
+                super::DaclProtection::Protected
+            } else {
+                super::DaclProtection::Unprotected
+            },
+        )
     }
 }
 
@@ -325,8 +333,8 @@ fn run_case(index: usize, write: WritePath) -> CaseResult {
             // ツリーを測るので起こり得ないが、起きたなら測定が成立しないので失敗として扱う。
             (WritePath::Production, _) => {
                 match remove_sid_aces_and_protect(target, sid.as_psid()) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
+                    Ok(o) if o.is_protected() => Ok(()),
+                    Ok(_) => {
                         Err("the probe target vanished before it was protected".to_string())
                     }
                     Err(e) => Err(e.to_string()),

@@ -61,7 +61,7 @@ pub(crate) struct WorkspacePreparationPlan {
     skip: Vec<PathBuf>,
     needs_descendant_fix: bool,
     state_before: WorkspacePreparationState,
-    protected_nodes: usize,
+    protected_nodes: super::ControlDirProtection,
 }
 
 impl WorkspacePreparationPlan {
@@ -73,7 +73,7 @@ impl WorkspacePreparationPlan {
         &self.state_before
     }
 
-    pub(crate) fn protected_nodes(&self) -> usize {
+    pub(crate) fn protected_nodes(&self) -> super::ControlDirProtection {
         self.protected_nodes
     }
 
@@ -268,5 +268,6 @@ pub struct WorkspacePreparationLaunch {
     pub state: WorkspacePreparationState,
     /// `false`かつ`state == Preparing`なら、同じgenerationの既存ジョブへ合流した。
     pub job_started: bool,
-    pub protected_nodes: usize,
+    /// [BUG-145] 保護できたノード数と、**そのうち実際に書いた**ノード数。
+    pub protected_nodes: super::ControlDirProtection,
 }

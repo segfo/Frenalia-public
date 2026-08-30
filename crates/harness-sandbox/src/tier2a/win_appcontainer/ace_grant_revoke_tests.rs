@@ -1927,6 +1927,124 @@ fn the_walk_can_either_skip_vanished_nodes_or_abort_on_them() {
     );
 }
 
+/// [BUG-145] **制御面の保護が、親からの配布書込に耐えること。**
+///
+/// # 既存のテストがなぜこれを捕まえなかったのか
+///
+/// [`protect_harness_control_dir_actually_blocks_inheritance_and_can_be_rolled_back`]は
+/// 保護後に継承が遮断されることを見ているが、**保護のあとに親から配布書込を撃つ段が無い**。
+/// `C:\`から降りるツリーでは新しく作ったディレクトリが最初から`SE_DACL_PROTECTED`付きで
+/// 生まれるので、**一度も書いていなくてもあのテストは緑になる**。そして親からの配布は
+/// その「書いていない保護」を消す——準備中だけ制御面へ書ける時間帯が生まれていた。
+///
+/// # 置き場が要る（`%TEMP%`では再現しない）
+///
+/// 6つの置き場で測ったところ、この欠陥が出ないのは`%TEMP%`の系だけだった
+/// （`plans/mac-spike/RESULTS.md` §S34）。だから`tempfile::tempdir()`ではなく
+/// [`TestDirGuard::create`]（`C:\`直下）を使う。**ここを`%TEMP%`にすると、
+/// このテストは修正を戻しても緑のままになる。**
+///
+/// # 何を固定するか（4つ）
+///
+/// 1. 初回は**全ノードのDACLを実際に書く**（`written == protected`）
+/// 2. 配布のあとも`SE_DACL_PROTECTED`が立っている
+/// 3. 配布のあとも主体から制御面へ**届かない**
+/// 4. 2回目は**1件も書かない**（印を見て飛ばす）のに、1〜3が成り立ったまま
+#[test]
+fn protect_harness_control_dir_survives_a_propagating_write_from_the_parent() {
+    // **`C:\`直下**。`%TEMP%`だとこの欠陥は再現せず、テストの歯が無くなる。
+    let root = super::test_support::TestDirGuard::create("bug145-regression");
+    let harness_dir = root.path().join(".harness");
+    let sessions_dir = harness_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("create .harness/sessions");
+    let settings = harness_dir.join("settings.json");
+    std::fs::write(&settings, "{}
+").expect("seed settings.json");
+    let session = sessions_dir.join("session-1.jsonl");
+    std::fs::write(&session, "{}
+").expect("seed the session file");
+    let nodes = [
+        harness_dir.as_path(),
+        sessions_dir.as_path(),
+        settings.as_path(),
+        session.as_path(),
+    ];
+
+    // 台帳を経由しない純粋な導出SID（`%APPDATA%`へ副作用を残さない）。
+    let sid = capability_sid_from_name(&format!("harnessBug145Regression{}", std::process::id()))
+        .expect("derive a probe SID");
+    let mask = workspace_rwx_mask();
+
+    // **本番と同じ順序**: rootへ単一オブジェクト書込 → `.harness/`を保護 → rootから配布。
+    // 先行するカーネル口の書込が無いとこの欠陥は出ない（§S30-3）ので、この段を省かない。
+    grant_workspace_root_aces_fast(
+        root.path(),
+        &[AceGrant {
+            sid: sid.as_psid(),
+            mask,
+        }],
+    )
+    .expect("fast (single-object) root grant");
+
+    let first = protect_harness_control_dir_from_appcontainer(root.path(), &[sid.as_psid()])
+        .expect("protect the control dir");
+    assert_eq!(
+        first.protected,
+        nodes.len(),
+        "the protection pass must cover every node under .harness/"
+    );
+    assert_eq!(
+        first.written,
+        nodes.len(),
+        "the first pass on a fresh tree must WRITE every node's DACL. If this is 0 the idempotent          skip has swallowed the protection write again — the node was already born protected by          the OS and we mistook that for our own work (BUG-145)"
+    );
+
+    propagate_workspace_root_grant(root.path(), sid.as_psid(), mask)
+        .expect("propagating grant on the workspace root");
+
+    for node in nodes {
+        assert!(
+            dacl_is_protected(node).expect("read the protection flag"),
+            "{} lost SE_DACL_PROTECTED when the parent received a propagating write — the              control plane is reachable from the sandbox for the length of the propagation              (BUG-145)",
+            node.display()
+        );
+    }
+    for node in nodes {
+        assert_eq!(
+            sid_effective_ace_mask(node, sid.as_psid()).expect("read the effective mask"),
+            None,
+            "{} became reachable from the workspace capability after the propagation; the              hard-deny of D-05/D-09 is not holding",
+            node.display()
+        );
+    }
+
+    // **2回目は1件も書かないこと。** ここが書いていたら、印が残っていないので毎起動
+    // 全ノードを書き直すことになる（実測で344ノードあたり12ミリ秒）。
+    let second = protect_harness_control_dir_from_appcontainer(root.path(), &[sid.as_psid()])
+        .expect("protect the control dir again");
+    assert_eq!(
+        second.protected,
+        nodes.len(),
+        "the second pass must still cover every node"
+    );
+    assert_eq!(
+        second.written, 0,
+        "the second pass must write nothing — the first pass left a durable protection that is          readable, so re-writing it every startup is pure cost"
+    );
+
+    // **飛ばした状態のまま、もう一度配布に耐えること**（`B-35`の対: 飛ばすことが安全である
+    // ことまで見ないと、「2回目が速い」だけを固定して境界を緩めたことになる）。
+    propagate_workspace_root_grant(root.path(), sid.as_psid(), mask)
+        .expect("second propagating grant on the workspace root");
+    for node in nodes {
+        assert!(
+            dacl_is_protected(node).expect("read the protection flag after the second propagate"),
+            "{} lost its protection after being skipped by the idempotent check",
+            node.display()
+        );
+    }
+}
+
 /// [BUG-084] `protect_harness_control_dir_from_appcontainer`が**実際に保護できたノード数**を
 /// 返すこと、そしてその数が実態（`SE_DACL_PROTECTED`が立っているノード）と一致すること。
 ///
@@ -1960,9 +2078,16 @@ fn protect_harness_control_dir_reports_how_many_nodes_it_protected() {
     let protected = protect_harness_control_dir_from_appcontainer(root.path(), &[sid.as_psid()])
         .expect("protect_harness_control_dir_from_appcontainer");
     assert_eq!(
-        protected,
+        protected.protected,
         nodes.len(),
         "the protection pass must report every node it covered under .harness/"
+    );
+    // [BUG-145] **書いた件数も見る。** 「保護済み」だけを数えていたので、冪等スキップで
+    // 書込が1回も走っていない状態が同じ数に見えていた。まっさらなツリーの初回は全件書く。
+    assert_eq!(
+        protected.written,
+        nodes.len(),
+        "the first pass on a fresh tree must actually write every node's DACL — if this is 0 the          idempotent skip has silently swallowed the protection write again (BUG-145)"
     );
 
     // 件数が実態と一致していること。ここを見ないと「4と言い張るだけ」の数字になる。
@@ -1977,7 +2102,8 @@ fn protect_harness_control_dir_reports_how_many_nodes_it_protected() {
     let without_harness_dir = tempfile::tempdir().expect("tempdir");
     assert_eq!(
         protect_harness_control_dir_from_appcontainer(without_harness_dir.path(), &[sid.as_psid()])
-            .expect("a workspace without .harness/ is not an error"),
+            .expect("a workspace without .harness/ is not an error")
+            .protected,
         0,
         "'there was nothing to protect' must be reported as 0, not as a silent success"
     );

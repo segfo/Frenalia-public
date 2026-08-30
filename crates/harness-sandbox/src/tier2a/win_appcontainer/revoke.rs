@@ -201,6 +201,18 @@ pub(crate) fn sid_explicit_ace(
 /// 省くためにこれを使う。ただし`remove_sid_aces_and_protect`のように書込の目的がACE除去では
 /// なく`SE_DACL_PROTECTED`の設定にある場合は、0件でも書込を省略してはならない
 /// （呼び出し側ごとに判断する。この関数自体は判断を持たない）。
+///
+/// # この警告は名指しされた当人に破られた（[BUG-145](../../../../docs/bugs/BUG-145.md)）
+///
+/// `remove_sid_aces_and_protect`は上の1文で名指しされているのに、
+/// `removed == 0 && 保護済み` という**条件を1つANDで足すことで**書込を省いた。
+/// 足した条件が「保護という目的は既に達成されている」ように見えたからである——
+/// **しかしその保護はOSがディレクトリを作ったときから付いていたもので、親からの配布で消えた。**
+///
+/// **「0件でも省略するな」という規則は、ANDで条件を足すと見かけ上は守れてしまう。**
+/// 省略してよいのは、**読み取れる状態が目的そのものを言い切っているとき**だけである
+/// （例: 「この主体に十分なACEがある」は読めば分かる。「配布に耐える保護がある」は
+/// `SE_DACL_PROTECTED`だけでは分からない）。`B-34`・`B-38`。
 unsafe fn copy_dacl_excluding_sids(
     dacl: *const ACL,
     sids: &[PSID],
@@ -256,6 +268,100 @@ unsafe fn copy_dacl_excluding_sids(
     }
 }
 
+/// [`set_dacl_single_object_with_protection`]が立てるDACLの保護状態。
+///
+/// # `Marked`は「**自分が書いた**」ことを状態へ残すためにある
+///
+/// [BUG-145](../../../../docs/bugs/BUG-145.md)で分かったのは、**「保護されている」と
+/// 「自分が保護した」が区別できない**ことだった——`C:\`から降りるツリーでは新しく作った
+/// ディレクトリが最初から`SE_DACL_PROTECTED`付きで生まれるので、冪等スキップがそれを
+/// 「もう保護した」と読んで書込を省き、親からの配布がその保護を消していた。
+///
+/// **カーネルの口では`SE_DACL_AUTO_INHERITED`を立てられない**（実測）。立てて渡しても
+/// 保存されるのは`SE_DACL_PROTECTED`だけである。継承を意識した保護を残したいなら
+/// [`set_dacl_aclapi_with_protection`]（aclapiの口）を使うこと。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DaclProtection {
+    /// 保護を外す（外れたままにする）。
+    Unprotected,
+    /// 保護を立てる。**OSが作ったときからある保護と見分けが付かない。**
+    Protected,
+}
+
+use windows::Win32::Security::SE_DACL_AUTO_INHERITED;
+
+/// 制御ビットが`SE_DACL_PROTECTED`と`SE_DACL_AUTO_INHERITED`の**両方**を立てているか。
+///
+/// # なぜこの組合せを見るのか（[BUG-145](../../../../docs/bugs/BUG-145.md)）
+///
+/// 保護の冪等スキップは「もう保護されているなら書かない」で判定していたが、
+/// **`C:\`から降りるツリーでは新しく作ったディレクトリが最初から`SE_DACL_PROTECTED`付きで
+/// 生まれる**ため、一度も書かないまま「保護した」と数えていた。そして**その保護は親からの
+/// 配布で消える**。
+///
+/// **両ビットが立った状態は、aclapiの口で保護を書いたときにだけ現れる**（カーネルの口では
+/// `SE_DACL_AUTO_INHERITED`が保存されない。OSが作った状態は保護のみか自動継承のみ）。
+/// そして**その状態は親からの配布に耐える**——6つの置き場 × 2つの書き方で実測した
+/// （`plans/mac-spike/RESULTS.md` §S36）。
+///
+/// **これは「自分が書いた印」ではない。** Windows自身も`C:\Windows`等をこの状態にしている
+/// （実マシンで`C:\`直下59件中8件）。**それでも飛ばしてよいのは、この状態が配布に耐えると
+/// 測ったからである**——判定しているのは「誰が書いたか」ではなく「配布に耐える形か」。
+///
+/// **偽陰性は安全側**（書き直すだけ）、**偽陽性だけが危険**なので、条件は緩めないこと。
+pub(crate) fn dacl_is_protected_and_auto_inherited(control: u16) -> bool {
+    control & SE_DACL_PROTECTED.0 != 0 && control & SE_DACL_AUTO_INHERITED.0 != 0
+}
+
+impl DaclProtection {
+    /// `SetSecurityDescriptorControl`へ渡す値。マスクは呼び出し側が常に両ビットぶん渡すので、
+    /// ここは**立てたいビットだけ**を返す。
+    fn control_value(self) -> SECURITY_DESCRIPTOR_CONTROL {
+        match self {
+            Self::Unprotected => SECURITY_DESCRIPTOR_CONTROL(0),
+            Self::Protected => SE_DACL_PROTECTED,
+        }
+    }
+
+    fn is_protected(self) -> bool {
+        !matches!(self, Self::Unprotected)
+    }
+}
+
+/// `path`のDACLを**aclapiの口**（`SetNamedSecurityInfoW`）で、保護つきで書く。
+///
+/// # カーネルの口と使い分ける理由（[BUG-145](../../../../docs/bugs/BUG-145.md)）
+///
+/// [`set_dacl_single_object_with_protection`]（カーネルの口）は速いが、
+/// **`SE_DACL_AUTO_INHERITED`を保存しない**ので、書いた結果がOSの作った状態と区別できない。
+/// こちらは両ビットが立つので、**次回この関数を呼ぶときに「もう書いてある」と読める**。
+///
+/// **対象は`.harness/`配下に限ること。** aclapiは継承の自動再計算を伴い、大きなツリーでは
+/// BUG-011/013のハングを招く（[`unprotect_harness_control_dir`]のdocが同じ限定を置いている）。
+/// 実測は344ノードで初回46ミリ秒・2回目は全件スキップで10ミリ秒（`plans/mac-spike/RESULTS.md` §S36）。
+///
+/// # 安全性
+///
+/// `new_dacl`は有効なACLを指していること。
+unsafe fn set_dacl_aclapi_with_protection(
+    path: &Path,
+    new_dacl: *mut ACL,
+) -> windows::core::Result<()> {
+    unsafe {
+        let path_w = long_path_wide(path);
+        SetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_dacl as *const _),
+            None,
+        )
+        .ok()
+    }
+}
+
 /// `set_dacl_single_object`の亜種。DACLの内容に加え、`SE_DACL_PROTECTED`（継承を受け付ける
 /// かどうか）も明示的に指定する。`grant_ace_mask`用の`set_dacl_single_object`は意図的に
 /// この状態へ触れない（呼び出し元が継承の有無を問わないため）が、`revoke_ace`は「対象sidを
@@ -274,10 +380,19 @@ unsafe fn copy_dacl_excluding_sids(
 /// 書込APIは`SetKernelObjectSecurity`のままにしてある。aclapiでも保護は立つが、それは
 /// BUG-011/013のハング（ツリー走査と継承の自動再計算）を招く経路であり、**保護のために
 /// aclapiへ戻す必要は無い**ことが同じ実測で分かっている。
+///
+/// # 立てる制御ビットは[`DaclProtection`]が選ぶ
+///
+/// （[`DaclProtection`]の定義はこの関数の直前にある）
+///
+/// かつては`protected: bool`だった。[BUG-145](../../../../docs/bugs/BUG-145.md)の調査で
+/// **`SE_DACL_AUTO_INHERITED`も一緒に立てる形**を測る必要が出たので、真偽値から列挙へ広げた
+/// （`docs/CODE-STRUCTURE-RULES.md`規則5.2: 同じ書込を2つ書かず、引数で受ける）。
+/// **既存の2つの呼び出しは同じビットを渡すので挙動は変わらない。**
 unsafe fn set_dacl_single_object_with_protection(
     path: &Path,
     new_dacl: *mut ACL,
-    protected: bool,
+    protection: DaclProtection,
 ) -> windows::core::Result<()> {
     unsafe {
         let path_w = long_path_wide(path);
@@ -296,20 +411,19 @@ unsafe fn set_dacl_single_object_with_protection(
         let result = (|| -> windows::core::Result<()> {
             InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION)?;
             SetSecurityDescriptorDacl(sd_ptr, true, Some(new_dacl as *const _), false)?;
-            // [BUG-083] 実際に効くのはこちら。両方向を明示するのは、`protected=false`の
-            // 「保護を外す／外れたままにする」も`revoke_sids_from_node`が依存する契約だからである
+            // [BUG-083] 実際に効くのはこちら。両方向を明示するのは、保護を外す側
+            // 「外す／外れたままにする」も`revoke_sids_from_node`が依存する契約だからである
             // （`InitializeSecurityDescriptor`直後はたまたま0だが、それに寄りかからない）。
+            //
+            // **マスクは常に両ビットぶん渡す。** 値の側だけで差を付けるので、
+            // 「立てたい方だけマスクに入れる」書き方をして消し忘れる余地を作らない。
             SetSecurityDescriptorControl(
                 sd_ptr,
-                SE_DACL_PROTECTED,
-                if protected {
-                    SE_DACL_PROTECTED
-                } else {
-                    SECURITY_DESCRIPTOR_CONTROL(0)
-                },
+                SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED,
+                protection.control_value(),
             )?;
             // 修飾子は無視されるが、意図の表明として残す（読み手に「保護を書いている」と伝わる）。
-            let protection_flag = if protected {
+            let protection_flag = if protection.is_protected() {
                 PROTECTED_DACL_SECURITY_INFORMATION
             } else {
                 UNPROTECTED_DACL_SECURITY_INFORMATION
@@ -391,12 +505,37 @@ fn is_vanished(e: &windows::core::Error) -> bool {
     e.code() == ERROR_FILE_NOT_FOUND.to_hresult() || e.code() == ERROR_PATH_NOT_FOUND.to_hresult()
 }
 
+/// [`remove_sid_aces_and_protect`]がそのノードに対して何をしたか。
+///
+/// **真偽値ではなく3値なのは、「保護されている」と「保護を書いた」を分けるためである**
+/// （[BUG-145](../../../../docs/bugs/BUG-145.md): 書いていないのに成功を返していたのが欠陥の本体で、
+/// 件数に出ていれば同じ穴が空いたときに気付ける。`B-09`/`B-10`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProtectOutcome {
+    /// walkで見つけてから触るまでの間に消えていた（[`is_vanished`]）。
+    Vanished,
+    /// **既に配布に耐える形で保護されていた**ので書かなかった
+    /// （[`dacl_is_protected_and_auto_inherited`]）。
+    SkippedAlreadyDurable,
+    /// 書いた。
+    Wrote,
+}
+
+impl ProtectOutcome {
+    /// このノードが保護された状態で残ったか（消えていなければ真）。
+    fn is_protected(self) -> bool {
+        !matches!(self, Self::Vanished)
+    }
+}
+
 /// `path`から`sid`宛のACEを剥がし、DACLの継承を切る。
 ///
-/// 戻り値は**このノードが保護された状態になったか**。`false`は「walkで見つけてから触るまでの
-/// 間に消えた」ことだけを意味する（[`is_vanished`]）。エラーは`Err`のままで、握り潰さない。
+/// 戻り値は[`ProtectOutcome`]。エラーは`Err`のままで、握り潰さない。
 ///
-fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<bool, AppContainerError> {
+fn remove_sid_aces_and_protect(
+    path: &Path,
+    sid: PSID,
+) -> Result<ProtectOutcome, AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclGrant {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -418,7 +557,7 @@ fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<bool, AppContai
         .ok()
         {
             return if is_vanished(&e) {
-                Ok(false)
+                Ok(ProtectOutcome::Vanished)
             } else {
                 Err(to_err(e))
             };
@@ -441,20 +580,31 @@ fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<bool, AppContai
         let _ = LocalFree(HLOCAL(sd.0));
         control_result.map_err(to_err)?;
 
-        // [BUG-082と同型の冪等スキップ、BUG-083の修正で初めて成立] 剥がすACEが1本も無く、かつ
-        // 既に保護済みなら、このノードに対してこの関数がすることは何も無い。書込を省いて
-        // 高価な`CreateFileW(WRITE_DAC)`＋`SetKernelObjectSecurity`を避ける。
-        // **保護が立たなかった頃はこの判定が常に偽で、毎起動・全ノードを書き直していた。**
-        // 保護は`preflight`の同期区間と`grant_job`のフェーズ0.5の2回掛かるので効きは大きい。
-        if removed == 0 && control & SE_DACL_PROTECTED.0 != 0 {
-            return Ok(true);
+        // 冪等スキップ。**条件は「保護されている」ではなく「配布に耐える形で保護されている」**
+        // （[BUG-145](../../../../docs/bugs/BUG-145.md)）。
+        //
+        // 旧条件は`control & SE_DACL_PROTECTED != 0`だった。**`C:\`から降りるツリーでは
+        // 新しく作ったディレクトリが最初から保護済みで生まれる**ので、これが真になって
+        // **保護の書込が1回も走らず**、それでも`Ok(true)`を返して呼び出し側は「保護した」と
+        // 数えていた。実際に立っていたのはOSが作ったときからある保護で、
+        // **親からの配布がそれを消す**——準備中だけ制御面へ書ける時間帯が生まれていた。
+        //
+        // 判定を[`dacl_is_protected_and_auto_inherited`]へ狭める。**偽陰性は書き直すだけで安全**、
+        // 偽陽性だけが危険なので、緩めないこと。
+        if removed == 0 && dacl_is_protected_and_auto_inherited(control) {
+            return Ok(ProtectOutcome::SkippedAlreadyDurable);
         }
 
         // `new_dacl`は`new_buf`（このスコープで生きている自前バッファ）の中を指す。上の
         // `LocalFree`が解放したのは読取用SD（コピー元）なので、書き戻しにはそのまま使える。
-        match set_dacl_single_object_with_protection(path, new_dacl, true) {
-            Ok(()) => Ok(true),
-            Err(e) if is_vanished(&e) => Ok(false),
+        //
+        // **書込はaclapiの口である。** カーネルの口は速いが`SE_DACL_AUTO_INHERITED`を保存しないので、
+        // 書いた結果がOSの作った状態と区別できず、**次の起動でまた全ノードを書き直すことになる**
+        // （実測: 344ノードで毎回12ミリ秒）。対象は`.harness/`配下だけなので、aclapiの継承再計算が
+        // 問題になる規模ではない（同じ限定を[`unprotect_harness_control_dir`]も置いている）。
+        match set_dacl_aclapi_with_protection(path, new_dacl) {
+            Ok(()) => Ok(ProtectOutcome::Wrote),
+            Err(e) if is_vanished(&e) => Ok(ProtectOutcome::Vanished),
             Err(e) => Err(to_err(e)),
         }
     }
@@ -475,12 +625,12 @@ fn remove_sid_aces_and_protect(path: &Path, sid: PSID) -> Result<bool, AppContai
 pub(crate) fn protect_harness_control_dir_from_appcontainer(
     workspace_root: &Path,
     sids: &[PSID],
-) -> Result<usize, AppContainerError> {
+) -> Result<ControlDirProtection, AppContainerError> {
     let harness_dir = workspace_root.join(".harness");
     // 剥がす主体が空なら保護は1件も掛からない。「全ノード保護済み」と数えないための番兵
     // （呼び出し側は常に1つ以上渡すが、件数を返す関数が嘘をつく余地は残さない）。
     if sids.is_empty() || !harness_dir.exists() {
-        return Ok(0);
+        return Ok(ControlDirProtection::default());
     }
 
     let mut dirs = Vec::new();
@@ -504,22 +654,44 @@ pub(crate) fn protect_harness_control_dir_from_appcontainer(
     // 解除側（[`unprotect_harness_control_dir`]、根から葉へ）と逆。ノードを外側・SIDを内側に
     // したのは件数を1ノード1回で数えるためで、`remove_sid_aces_and_protect`は毎回DACLを
     // 読み直すので、SIDを外側に回していた旧実装と最終状態は同じである。
-    let mut protected = 0usize;
+    let mut report = ControlDirProtection::default();
     for node in files.iter().chain(dirs.iter().rev()) {
         let mut node_protected = true;
+        let mut node_written = false;
         for sid in sids {
-            node_protected =
+            let outcome =
                 remove_sid_aces_and_protect(node, *sid).map_err(explain_control_plane_failure)?;
+            node_written |= outcome == ProtectOutcome::Wrote;
+            node_protected = outcome.is_protected();
             // 消えたノードは以降のSIDでも同じなので、残りは試さない。
             if !node_protected {
                 break;
             }
         }
         if node_protected {
-            protected += 1;
+            report.protected += 1;
+            if node_written {
+                report.written += 1;
+            }
         }
     }
-    Ok(protected)
+    Ok(report)
+}
+
+/// [`protect_harness_control_dir_from_appcontainer`]の結果。
+///
+/// # なぜ2つ数えるのか（[BUG-145](../../../../docs/bugs/BUG-145.md)）
+///
+/// 件数が1つ（`protected`）だけだった頃、**保護の書込が冪等スキップで1回も走っていないのに
+/// 「全ノード保護済み」と報告されていた**。`written`はその穴を件数に出すためにある——
+/// **初回は`written == protected`になり、2回目以降は`written == 0`になる**のが健全な形で、
+/// 初回に0なら書込が省かれている（`B-09`/`B-10`）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlDirProtection {
+    /// 保護された状態で残ったノード数（消えていたものは数えない）。
+    pub protected: usize,
+    /// そのうち、**実際にDACLを書いた**ノード数。
+    pub written: usize,
 }
 
 /// 制御面の保護に失敗したノードへ、**分かっている原因と回復手段**を添える
@@ -586,10 +758,18 @@ pub fn unprotect_harness_control_dir(workspace_root: &Path) -> Result<usize, App
 
     let mut unprotected = 0usize;
     for node in dirs.iter().chain(files.iter()) {
-        // 保護されていないノードは触らない——ユーザーが自分で保護したノードを巻き込んで
-        // 継承を復活させないため、ではなく（それは区別できない）、無駄なaclapi呼び出しを
-        // 避けるため。`.harness/`配下という限定されたツリーなので、ここに居る保護は
-        // 実質このコードが立てたものである。
+        // 保護されていないノードは触らない——無駄なaclapi呼び出しを避けるためである。
+        //
+        // [BUG-145] **かつてここには「`.harness/`配下という限定されたツリーなので、ここに居る
+        // 保護は実質このコードが立てたものである」と書いてあったが、それは誤りだった。**
+        // `C:\`から降りるツリーでは新しく作ったディレクトリが最初から`SE_DACL_PROTECTED`付きで
+        // 生まれるので、**このコードが一度も触っていないノードにも保護は在る**。
+        // 掛ける側はその思い込みで書込を省いて欠陥になった（`B-38`）。
+        //
+        // **解除側の挙動は変えない。** 撤収時に継承を戻すのは意図どおりで、OSが立てた保護を
+        // 巻き込んで解除しても、そのノードは祖先の継承ACEを受け取るだけである
+        // （凍結された写しが動的な継承へ変わる）。**変えたのは理由の記述だけ**——
+        // 誤った前提を残すと、次に読む人が同じ前提で別の最適化を入れる。
         //
         // [BUG-084] 消えたノードは飛ばす。walkが`OnVanished::Skip`で消失を許容する以上、
         // **集めてから触るまでの間に消えた**場合もここで許容しないと、掛ける側とだけ
@@ -920,7 +1100,13 @@ pub(crate) fn revoke_sids_from_node(
         control_result.map_err(to_err)?;
         let was_protected = control & SE_DACL_PROTECTED.0 != 0;
 
-        set_dacl_single_object_with_protection(path, new_dacl, was_protected).map_err(to_err)?;
+        // 呼び出し前の保護状態をそのまま保つ（`revoke_sids_from_node`の契約）。
+        let protection = if was_protected {
+            DaclProtection::Protected
+        } else {
+            DaclProtection::Unprotected
+        };
+        set_dacl_single_object_with_protection(path, new_dacl, protection).map_err(to_err)?;
     }
     Ok(true)
 }

@@ -621,8 +621,11 @@ pub fn preflight_with_privhelper_launcher(
     // [BUG-084] 件数を出す。層3のhard-denyは「1件も掛かっていない」が症状として現れない
     // （BUG-083はそれが恒常的に起きていた）ので、`HARNESS_PREFLIGHT_TIMING=1`で事後確認
     // できる形にしておく。
+    // [BUG-145] **書いた件数も出す。** 「保護済み」だけを出していたので、冪等スキップで
+    // 書込が1回も走っていない状態と、実際に保護を確立した状態が同じ数に見えていた。
     timing.mark(&format!(
-        "protect_harness_control_dir_from_appcontainer ({protected_nodes} nodes)"
+        "protect_harness_control_dir_from_appcontainer ({} nodes, {} written)",
+        protected_nodes.protected, protected_nodes.written
     ));
 
     // 既存子孫への継承ACE伝播（フェーズ0）と、保護DACL（BUG-020の残存損害等）で継承が

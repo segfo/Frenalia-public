@@ -171,14 +171,20 @@ fn user_profile_root() -> PathBuf {
 
 /// このリポジトリの**親ディレクトリ**＝実ワークスペースが置かれている場所。
 ///
-/// テストバイナリは`<repo>/target/debug/deps/`配下にあるので、そこから5つ戻る。
+/// テストバイナリは`<repo>/target/debug/deps/`配下にあるので、[`repo_root`]から1つ戻る。
 fn real_workspace_parent() -> PathBuf {
+    let mut p = repo_root();
+    p.pop();
+    p
+}
+
+/// このリポジトリのルート。テストバイナリの位置から導出する（パスを直書きしない）。
+fn repo_root() -> PathBuf {
     let mut p = std::env::current_exe().expect("current_exe");
     p.pop(); // 実行ファイル名
     p.pop(); // deps/
     p.pop(); // debug/
     p.pop(); // target/
-    p.pop(); // <repo>/
     p
 }
 
@@ -283,6 +289,53 @@ enum Case {
     /// 「保護が無い状態で親から配布を受けた拒否ACE」が観測できる。
     /// これは製品に入れる形ではなく、**問いに答えるためだけの形**である。
     DenyWithoutProtection,
+    /// 製品と同じ剥がし方 → **印つき**（保護＋自動継承）で1回書く → 親へ配布。
+    ///
+    /// # 「自分が書いた印」が作れるかを測る
+    ///
+    /// この欠陥の核心は「**保護されている**」と「**自分が保護した**」が区別できないことだった。
+    /// OSが自力で作る状態は保護のみ（`0x9004`）か自動継承のみ（`0x8404`）のどちらかなので、
+    /// **両方立てれば印になる**——という仮説を測る。
+    ///
+    /// ここで答えるのは3つ: (a) その組合せが**保存されるか**（Windowsが正規化しないか）、
+    /// (b) 保存されても**継承を遮断したままか**、(c) 親からの配布に**耐えるか**。
+    MarkedProtect,
+    /// ケース16のあと、**2回目は印を見て飛ばす**（＝何も書かない）→ 親へ配布。
+    ///
+    /// **仕組みの本体はここである。** 印が作れても「印があるノードを飛ばしてよい」が
+    /// 成り立たなければ、結局毎回書くことになって費用は減らない。
+    MarkedProtectThenSkip,
+    /// aclapi（.NETの`SetAccessRuleProtection`と同じ口）で保護 → 親へ配布。
+    ///
+    /// # 印が**一意か**を測る負の対照
+    ///
+    /// 他人の道具が立てた保護が同じ組合せになるなら、**自分が書いていないノードを
+    /// 「書いた」と誤認する**——いまと同じ欠陥がそのまま戻る。
+    /// エクスプローラや.NETが通る口で保護して、制御ビットがどうなるかを見る。
+    AclapiProtect,
+    /// 製品と同じ剥がし方 → **aclapiの口で保護を書く** → 親へ配布。
+    ///
+    /// # これが「印つきで直す」ときの製品の形である
+    ///
+    /// ケース16で分かったのは、**カーネルの口では`SE_DACL_AUTO_INHERITED`が保存されない**
+    /// （立てて渡しても`0x9004`になる）こと。ケース18で分かったのは、**aclapiの口なら
+    /// `0x9404`が保存され、配布にも耐える**こと。
+    ///
+    /// ケース18は**主体のACEを剥がしていない**ので製品の形ではない。ここは剥がしと
+    /// aclapiの保護を組み合わせて、**剥がせること・印が付くこと・配布に耐えること**を
+    /// 同時に確かめる。
+    AclapiStripAndProtect,
+    /// **修正前の製品の形**——「剥がすACEが無く、かつ保護済みなら書かない」を再現する。
+    ///
+    /// # 直したあとも壊れる形を表に残すために在る
+    ///
+    /// 製品を直すとケース2（製品の形）は無傷になり、**この行列は欠陥を再現できなくなる**。
+    /// 壊れる形が1本も無い表は、計器が生きているかどうかを言えない
+    /// （`B-35`: 禁止側だけ／許可側だけの検証は片方が死んでも緑になる）。
+    ///
+    /// **ここが落ちなくなったら、それは環境が変わったということである**——
+    /// 表の読み方そのものを見直すこと。
+    LegacySkipProtect,
 }
 
 const CASES: &[Case] = &[
@@ -301,6 +354,11 @@ const CASES: &[Case] = &[
     Case::ForceInheritedProtect,
     Case::ForcedWriteProtect,
     Case::DenyWithoutProtection,
+    Case::MarkedProtect,
+    Case::MarkedProtectThenSkip,
+    Case::AclapiProtect,
+    Case::AclapiStripAndProtect,
+    Case::LegacySkipProtect,
 ];
 
 impl Case {
@@ -321,6 +379,11 @@ impl Case {
             Self::ForceInheritedProtect => "13-force-inherited-protect",
             Self::ForcedWriteProtect => "14-forced-write-protect",
             Self::DenyWithoutProtection => "15-deny-without-protection",
+            Self::MarkedProtect => "16-marked-protect",
+            Self::MarkedProtectThenSkip => "17-marked-protect-then-skip",
+            Self::AclapiProtect => "18-aclapi-protect",
+            Self::AclapiStripAndProtect => "19-aclapi-strip-and-protect",
+            Self::LegacySkipProtect => "20-legacy-skip-protect",
         }
     }
 
@@ -361,7 +424,12 @@ impl Case {
             | Self::CanonicalizeProtect
             | Self::ForceInheritedProtect
             | Self::ForcedWriteProtect
-            | Self::DenyWithoutProtection => PropagateTo::CaseRoot,
+            | Self::DenyWithoutProtection
+            | Self::MarkedProtect
+            | Self::MarkedProtectThenSkip
+            | Self::AclapiProtect
+            | Self::AclapiStripAndProtect
+            | Self::LegacySkipProtect => PropagateTo::CaseRoot,
         }
     }
 
@@ -379,6 +447,11 @@ impl Case {
                 | Self::ForceInheritedProtect
                 | Self::ForcedWriteProtect
                 | Self::DenyWithoutProtection
+                | Self::MarkedProtect
+                | Self::MarkedProtectThenSkip
+                | Self::AclapiProtect
+                | Self::AclapiStripAndProtect
+                | Self::LegacySkipProtect
         )
     }
 
@@ -431,6 +504,9 @@ struct CaseResult {
     /// 「同じ状態から違う結果が出る」という読みは成り立たない（`B-29`: 前提を1つ測る）。
     aces_before_protect: Vec<String>,
     control_before_protect: u16,
+    /// 2回目の保護が**実際に書いたか**（ケース17だけ`Some`）。`Some(false)`が
+    /// 「印を見て飛ばした」で、狭めたスキップが働いた証拠になる。
+    second_protect_wrote: Option<bool>,
     size_before_protect: super::test_support::DaclSizeInfo,
     /// 保護直後のACLの**ヘッダ**（使用バイト数・空き・ACE数・リビジョン）。
     ///
@@ -524,7 +600,7 @@ unsafe fn protect_with_deny_in_one_write(
         let _ = LocalFree(HLOCAL(sd.0));
         merge_result?;
 
-        let result = set_dacl_single_object_with_protection(path, merged, true);
+        let result = set_dacl_single_object_with_protection(path, merged, DaclProtection::Protected);
         let _ = LocalFree(HLOCAL(merged as *mut _));
         result
     }
@@ -560,7 +636,7 @@ unsafe fn protect_stripping_inherited_flags(path: &Path, sid: PSID) -> windows::
         let _ = LocalFree(HLOCAL(sd.0));
         let (dacl, _removed) = copied?;
         super::test_support::strip_inherited_ace_flags(dacl)?;
-        set_dacl_single_object_with_protection(path, dacl, true)
+        set_dacl_single_object_with_protection(path, dacl, DaclProtection::Protected)
     }
 }
 
@@ -611,21 +687,29 @@ unsafe fn deny_without_protection(path: &Path, sid: PSID, mask: u32) -> windows:
         merge_result?;
 
         // **ここだけが`protect_with_deny_in_one_write`と違う**——保護を立てない。
-        let result = set_dacl_single_object_with_protection(path, merged, false);
+        let result = set_dacl_single_object_with_protection(path, merged, DaclProtection::Unprotected);
         let _ = LocalFree(HLOCAL(merged as *mut _));
         result
     }
 }
 
-/// 製品とまったく同じ剥がし方・同じ書込を、**冪等スキップだけ外して**行う（ケース14専用）。
+/// 製品とまったく同じ剥がし方・同じ書込を、**冪等スキップだけ外して**行う
+/// （ケース14・16・17が共有）。
 ///
 /// [`remove_sid_aces_and_protect`]から**スキップの3行を抜いただけ**である。剥がすACEが1本も無く
 /// 既に保護済みなら製品は書かずに戻るが、ここは必ず書く。**書くDACLは1バイトも変えない。**
 ///
+/// `protection`で立てる制御ビットを選ぶ——ケース14は製品と同じ保護のみ、
+/// ケース16・17は**印つき**（保護＋自動継承）。**同じ書込を2つ書かない**ためにここで受ける。
+///
 /// # 安全性
 ///
 /// `sid`は有効なSIDを指していること。
-unsafe fn protect_forcing_the_write(path: &Path, sid: PSID) -> windows::core::Result<()> {
+unsafe fn protect_forcing_the_write(
+    path: &Path,
+    sid: PSID,
+    protection: DaclProtection,
+) -> windows::core::Result<()> {
     unsafe {
         let path_w = long_path_wide(path);
         let mut existing: *mut ACL = std::ptr::null_mut();
@@ -646,7 +730,187 @@ unsafe fn protect_forcing_the_write(path: &Path, sid: PSID) -> windows::core::Re
         let copied = copy_dacl_excluding_sids(existing as *const _, &[sid], &mut buf);
         let _ = LocalFree(HLOCAL(sd.0));
         let (dacl, _removed) = copied?;
-        set_dacl_single_object_with_protection(path, dacl, true)
+        set_dacl_single_object_with_protection(path, dacl, protection)
+    }
+}
+
+/// **修正前の`remove_sid_aces_and_protect`をそのまま再現する**（ケース20専用）。
+///
+/// 「剥がすACEが1本も無く、かつ`SE_DACL_PROTECTED`が立っているなら書かずに戻る」
+/// ——これが[BUG-145](../../../../docs/bugs/BUG-145.md)の原因だった判定である。
+/// 製品はこの判定を「保護済み**かつ自動継承あり**」へ狭めたので、
+/// **壊れる形を将来も表に並べるにはここで再現するしかない。**
+///
+/// # 安全性
+///
+/// `sid`は有効なSIDを指していること。
+unsafe fn protect_with_the_legacy_skip(path: &Path, sid: PSID) -> windows::core::Result<()> {
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut existing: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+        let mut buf: Vec<u8> = Vec::new();
+        let copied = copy_dacl_excluding_sids(existing as *const _, &[sid], &mut buf);
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        let control_result = GetSecurityDescriptorControl(sd, &mut control, &mut revision);
+        let _ = LocalFree(HLOCAL(sd.0));
+        let (dacl, removed) = copied?;
+        control_result?;
+
+        // **これが旧条件。** `C:\`から降りるツリーでは新しく作ったディレクトリが最初から
+        // 保護済みで生まれるので、ここで必ず戻る＝1回も書かない。
+        if removed == 0 && control & SE_DACL_PROTECTED.0 != 0 {
+            return Ok(());
+        }
+        set_dacl_single_object_with_protection(path, dacl, DaclProtection::Protected)
+    }
+}
+
+/// 製品と同じ剥がし方をしてから、**カーネルの口で`SE_DACL_AUTO_INHERITED`も立てて**書く
+/// （ケース16専用）。
+///
+/// # 保存されないことを測るためだけに在る
+///
+/// 製品の[`DaclProtection`]からはこの形を落とした——**カーネルの口はこのビットを保存しない**
+/// と実測で分かったからである（`plans/mac-spike/RESULTS.md` §S36）。
+/// **腕を残しておかないと、その事実を将来もう一度測り直すことになる。**
+///
+/// # 安全性
+///
+/// `sid`は有効なSIDを指していること。
+unsafe fn protect_kernel_write_asking_for_the_mark(
+    path: &Path,
+    sid: PSID,
+) -> windows::core::Result<()> {
+    // Win32の名前は`use super::*`（＝`revoke`が取り込んでいるもの）でそのまま届く。
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut existing: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+        let mut buf: Vec<u8> = Vec::new();
+        let copied = copy_dacl_excluding_sids(existing as *const _, &[sid], &mut buf);
+        let _ = LocalFree(HLOCAL(sd.0));
+        let (dacl, _removed) = copied?;
+
+        let handle: HANDLE = CreateFileW(
+            PCWSTR(path_w.as_ptr()),
+            (WRITE_DAC | READ_CONTROL).0,
+            FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )?;
+        let mut new_sd = SECURITY_DESCRIPTOR::default();
+        let sd_ptr = PSECURITY_DESCRIPTOR(&mut new_sd as *mut _ as *mut _);
+        let result = (|| -> windows::core::Result<()> {
+            InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION)?;
+            SetSecurityDescriptorDacl(sd_ptr, true, Some(dacl as *const _), false)?;
+            SetSecurityDescriptorControl(
+                sd_ptr,
+                SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED,
+                SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED,
+            )?;
+            SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, sd_ptr)
+        })();
+        let _ = CloseHandle(handle);
+        result
+    }
+}
+
+/// 製品と同じ剥がし方をしてから、**aclapiの口で**保護を書く（ケース19専用）。
+///
+/// **印つきで直すなら製品はこの形になる。** カーネルの口は`SE_DACL_AUTO_INHERITED`を
+/// 保存しない（ケース16の実測）ので、印を残せるのはこちらだけである。
+///
+/// 剥がしは製品と同じ[`copy_dacl_excluding_sids`]を通し、書込だけ
+/// `SetNamedSecurityInfoW`＋`PROTECTED_DACL_SECURITY_INFORMATION`へ差し替える。
+///
+/// # 安全性
+///
+/// `sid`は有効なSIDを指していること。
+unsafe fn aclapi_strip_and_protect(path: &Path, sid: PSID) -> windows::core::Result<()> {
+    use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
+    use windows::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut existing: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing),
+            None,
+            &mut sd,
+        )
+        .ok()?;
+
+        let mut buf: Vec<u8> = Vec::new();
+        let copied = copy_dacl_excluding_sids(existing as *const _, &[sid], &mut buf);
+        let result = match copied {
+            Ok((dacl, _removed)) => SetNamedSecurityInfoW(
+                PCWSTR(path_w.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(dacl as *const _),
+                None,
+            )
+            .ok(),
+            Err(e) => Err(e),
+        };
+        let _ = LocalFree(HLOCAL(sd.0));
+        result
+    }
+}
+
+/// **提案する狭めたスキップ**——印があれば書かず、無ければ印つきで書く（ケース17の2回目）。
+///
+/// 戻り値は**書いたか**。`false`が「印を見て飛ばした」で、そこが測る当のものである。
+///
+/// **製品の条件との差**: 本物の狭めたスキップは「剥がすACEが1本も無く**かつ**印がある」で
+/// 判定する。このプローブの主体は`guarded`にACEを1本も持たないので前半は常に真になり、
+/// **ここでは印の有無だけが効く**。両者は等価だが、製品へ入れるときは前半も落とさないこと。
+///
+/// # 安全性
+///
+/// `sid`は有効なSIDを指していること。
+unsafe fn protect_skipping_when_marked(path: &Path, sid: PSID) -> windows::core::Result<bool> {
+    unsafe {
+        if dacl_is_protected_and_auto_inherited(dacl_control(path)?) {
+            return Ok(false);
+        }
+        // **書くならaclapiの口である。** カーネルの口は`SE_DACL_AUTO_INHERITED`を保存しない
+        // （ケース16の実測）ので、そちらで書くと印が付かず、次回も飛ばせない。
+        aclapi_strip_and_protect(path, sid)?;
+        Ok(true)
     }
 }
 
@@ -684,7 +948,7 @@ unsafe fn protect_canonicalizing_dacl(path: &Path, sid: PSID) -> windows::core::
 
         let mut merged: *mut ACL = std::ptr::null_mut();
         SetEntriesInAclW(None, Some(stripped as *const _), &mut merged).ok()?;
-        let result = set_dacl_single_object_with_protection(path, merged, true);
+        let result = set_dacl_single_object_with_protection(path, merged, DaclProtection::Protected);
         let _ = LocalFree(HLOCAL(merged as *mut _));
         result
     }
@@ -734,7 +998,7 @@ unsafe fn protect_forcing_inherited_flags(path: &Path, sid: PSID) -> windows::co
                 (*header).AceFlags |= INHERITED_ACE.0 as u8;
             }
         }
-        let result = set_dacl_single_object_with_protection(path, merged, true);
+        let result = set_dacl_single_object_with_protection(path, merged, DaclProtection::Protected);
         let _ = LocalFree(HLOCAL(merged as *mut _));
         result
     }
@@ -763,7 +1027,7 @@ unsafe fn rewrite_with_protection(path: &Path) -> windows::core::Result<()> {
             &mut sd,
         )
         .ok()?;
-        let result = set_dacl_single_object_with_protection(path, existing, true);
+        let result = set_dacl_single_object_with_protection(path, existing, DaclProtection::Protected);
         let _ = LocalFree(HLOCAL(sd.0));
         result
     }
@@ -809,7 +1073,7 @@ unsafe fn add_explicit_deny(path: &Path, sid: PSID, mask: u32) -> windows::core:
         let _ = LocalFree(HLOCAL(sd.0));
         merged?;
 
-        let result = set_dacl_single_object_with_protection(path, new_dacl, true);
+        let result = set_dacl_single_object_with_protection(path, new_dacl, DaclProtection::Protected);
         let _ = LocalFree(HLOCAL(new_dacl as *mut _));
         result
     }
@@ -911,10 +1175,14 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
         // **保護の相手は中間側の主体である。** 製品でも`.harness`が守られているのは
         // workspaceのcapability SIDに対してであって、`--fs-allow`の主体に対してではない。
         match remove_sid_aces_and_protect(&guarded, holder_subject.as_psid()) {
-            Ok(true) => {}
-            // [BUG-084] `Ok(false)`は「触る前に消えていた」。自分で作ったツリーなので起こり得ないが、
+            Ok(super::ProtectOutcome::Wrote) => {}
+            // [BUG-145] **飛ばした**。製品はこれを`.harness/`の2回目以降で通る。
+            // ここは毎回まっさらなツリーなので、起きたら印の読み方がおかしい。
+            Ok(super::ProtectOutcome::SkippedAlreadyDurable) => errors
+                .push("protect: skipped on a freshly created tree; the mark must not be there yet".into()),
+            // [BUG-084] 「触る前に消えていた」。自分で作ったツリーなので起こり得ないが、
             // 起きたなら測定が成立しない。
-            Ok(false) => {
+            Ok(super::ProtectOutcome::Vanished) => {
                 errors.push("protect: the guarded dir vanished before it was protected".into())
             }
             Err(e) => errors.push(format!("protect: {e}")),
@@ -936,10 +1204,34 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
                 protect_forcing_inherited_flags(&guarded, holder_subject.as_psid())
             },
             Case::ForcedWriteProtect => unsafe {
-                protect_forcing_the_write(&guarded, holder_subject.as_psid())
+                protect_forcing_the_write(
+                    &guarded,
+                    holder_subject.as_psid(),
+                    DaclProtection::Protected,
+                )
             },
             Case::DenyWithoutProtection => unsafe {
                 deny_without_protection(&guarded, sid.as_psid(), mask)
+            },
+            // **カーネルの口で印を立てようとする腕。** 実測の答えは「保存されない」で、
+            // `DaclProtection`から`Marked`を落とした根拠がこれである。**腕は残す**——
+            // 落とすと「カーネルの口では作れない」を将来もう一度測り直すことになる。
+            Case::MarkedProtect => unsafe {
+                protect_kernel_write_asking_for_the_mark(&guarded, holder_subject.as_psid())
+            },
+            // **1回目はaclapiの口で書く**（印が残る唯一の口）。そのうえで2回目に
+            // 印を見て飛ばし、**飛ばした状態のまま配布に耐えるか**を見る。
+            Case::MarkedProtectThenSkip => unsafe {
+                aclapi_strip_and_protect(&guarded, holder_subject.as_psid())
+            },
+            // **主体を渡さない口である。** このプローブの主体は`guarded`にACEを持たないので
+            // 剥がすものが無く、製品の形との差は「どの口で保護を書いたか」だけになる。
+            Case::AclapiProtect => super::test_support::protect_dacl_preserve_inherited(&guarded),
+            Case::AclapiStripAndProtect => unsafe {
+                aclapi_strip_and_protect(&guarded, holder_subject.as_psid())
+            },
+            Case::LegacySkipProtect => unsafe {
+                protect_with_the_legacy_skip(&guarded, holder_subject.as_psid())
             },
             other => unreachable!("{other:?} は製品の保護を通すはずのケースである"),
         };
@@ -957,6 +1249,18 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
             errors.push(format!("reprotect: {e}"));
         }
     }
+    // ケース17の2回目——**印を見て飛ばせるか**。`false`が「飛ばした」で、そこが測る当のもの。
+    let second_protect_wrote = if case == Case::MarkedProtectThenSkip {
+        match unsafe { protect_skipping_when_marked(&guarded, holder_subject.as_psid()) } {
+            Ok(wrote) => Some(wrote),
+            Err(e) => {
+                errors.push(format!("second protect: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let control_after_protect = dacl_control(&guarded).expect("read the control bits after protect");
     let aces_after_protect =
@@ -1034,6 +1338,7 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
         deny_aces_after_protect: count_deny_aces(&aces_after_protect, &sid_text),
         aces_before_protect,
         control_before_protect,
+        second_protect_wrote,
         size_before_protect,
         aces_after_protect,
         size_after_protect,
@@ -1113,9 +1418,24 @@ fn control_dir_propagation_matrix_probe() {
             describe_control(r.control_before_protect)
         );
         println!(
-            "  control after protect   : {}",
-            describe_control(r.control_after_protect)
+            "  control after protect   : {}{}",
+            describe_control(r.control_after_protect),
+            if dacl_is_protected_and_auto_inherited(r.control_after_protect) {
+                "   <- 印あり（保護＋自動継承）"
+            } else {
+                ""
+            }
         );
+        if let Some(wrote) = r.second_protect_wrote {
+            println!(
+                "  2nd protect             : {}",
+                if wrote {
+                    "書いた（印が無かった）"
+                } else {
+                    "飛ばした（印を見た）"
+                }
+            );
+        }
         println!(
             "  control after propagate : {}",
             describe_control(r.control_after_propagate)
@@ -1261,6 +1581,21 @@ fn control_dir_propagation_matrix_probe() {
             r.case
         );
     }
+    // ケース17の前提——**2回目が実際に飛んだこと**。飛んでいなければ、この腕は
+    // 「印を見て飛ばしても耐えるか」ではなく「2回書いたら耐えるか」を測っている（`B-10`）。
+    for r in results
+        .iter()
+        .filter(|r| r.case == Case::MarkedProtectThenSkip.label())
+    {
+        assert_eq!(
+            r.second_protect_wrote,
+            Some(false),
+            "[{}] {}: 2回目が飛ばずに書いている。印が残っていないので、測っているものが違う",
+            r.placement,
+            r.case
+        );
+    }
+
     // ケース15の前提——**拒否ACEが実際に書けていること**。書けていなければ
     // 「配布後も残った／消えた」のどちらを読んでも意味が無い（`B-10`）。
     for r in results
@@ -1386,26 +1721,93 @@ fn control_dir_protect_skip_cost_probe() {
                 .expect("enumerate the control dir");
                 let t = Instant::now();
                 for node in files.iter().chain(dirs.iter().rev()) {
-                    unsafe { protect_forcing_the_write(node, sid.as_psid()) }
-                        .expect("forced protect write");
+                    // **費用の比較なので製品と同じビットで書く**（印つきにすると、
+                    // 測っているものが「スキップを外す費用」から変わってしまう）。
+                    unsafe {
+                        protect_forcing_the_write(node, sid.as_psid(), DaclProtection::Protected)
+                    }
+                    .expect("forced protect write");
                 }
                 t.elapsed().as_millis()
             };
             let first_b_ms = forced_pass(&harness_b);
             let second_b_ms = forced_pass(&harness_b);
 
+            // --- 腕C: aclapiの口（**印が残る唯一の口**）で、剥がして保護を2回 ---
+            //
+            // ここが要るのは、印つきで直すなら製品はこの口になるからである。
+            // `unprotect_harness_control_dir`のdocが「aclapiは1回あたり実測0.3ms程度」と
+            // 書いているが、**それは24ノードでの値**で、344ノードでどうなるかは別の事実である。
+            let dir_c = super::test_support::TestDirGuard::create_in(
+                base,
+                &format!("bug145skip-aclapi-{place_label}-{index}"),
+            );
+            let harness_c = dir_c.path().join(".harness");
+            let nodes_c = super::test_support::build_forest_tree(&harness_c, *files, *k, *depth);
+            let aclapi_pass = |root: &Path| -> u128 {
+                let mut dirs = Vec::new();
+                let mut files = Vec::new();
+                super::acl_grant::collect_dirs_and_files(
+                    root,
+                    &mut dirs,
+                    &mut files,
+                    OnVanished::Skip,
+                )
+                .expect("enumerate the control dir");
+                let t = Instant::now();
+                for node in files.iter().chain(dirs.iter().rev()) {
+                    unsafe { aclapi_strip_and_protect(node, sid.as_psid()) }
+                        .expect("aclapi strip-and-protect");
+                }
+                t.elapsed().as_millis()
+            };
+            let first_c_ms = aclapi_pass(&harness_c);
+            // **2回目は印を見て飛ばす**——狭めたスキップが入った後の姿である。
+            let t = Instant::now();
+            let mut skipped = 0usize;
+            let mut rewritten = 0usize;
+            {
+                let mut dirs = Vec::new();
+                let mut files = Vec::new();
+                super::acl_grant::collect_dirs_and_files(
+                    &harness_c,
+                    &mut dirs,
+                    &mut files,
+                    OnVanished::Skip,
+                )
+                .expect("enumerate the control dir");
+                for node in files.iter().chain(dirs.iter().rev()) {
+                    if dacl_is_protected_and_auto_inherited(dacl_control(node).expect("read control")) {
+                        skipped += 1;
+                    } else {
+                        unsafe { aclapi_strip_and_protect(node, sid.as_psid()) }
+                            .expect("aclapi strip-and-protect");
+                        rewritten += 1;
+                    }
+                }
+            }
+            let second_c_ms = t.elapsed().as_millis();
+
             assert_eq!(nodes, nodes_b, "2つの腕は同じ形のツリーでなければならない");
+            assert_eq!(nodes, nodes_c, "3つの腕は同じ形のツリーでなければならない");
             arms.push(serde_json::json!({
                 "placement": place_label,
                 "nodes": nodes,
-                "product_protected_first": first_a,
-                "product_protected_second": second_a,
+                "product_protected_first": first_a.protected,
+                "product_protected_second": second_a.protected,
                 "product_first_ms": first_a_ms,
                 "product_second_ms": second_a_ms,
                 "forced_first_ms": first_b_ms,
                 "forced_second_ms": second_b_ms,
                 "extra_ms_for_two_passes":
                     (first_b_ms + second_b_ms) as i128 - (first_a_ms + second_a_ms) as i128,
+                // 印つき（aclapi）の腕。**2回目は印を見て飛ばした件数まで出す**
+                // ——「速かったのは何もしていないから」を、そのまま数で言えるようにする。
+                "aclapi_marked_first_ms": first_c_ms,
+                "aclapi_marked_second_ms": second_c_ms,
+                "aclapi_second_skipped": skipped,
+                "aclapi_second_rewritten": rewritten,
+                "aclapi_second_vs_product_second_ms": second_c_ms as i128 - second_a_ms as i128,
             }));
         }
     }
@@ -1425,5 +1827,100 @@ fn control_dir_protect_skip_cost_probe() {
             arm["product_protected_first"], arm["nodes"],
             "製品の保護関数が全ノードを数えていない。腕Bと同じ仕事を測っていない: {arm}"
         );
+        // **2回目が速い理由を数で言えるようにする**（`B-35`の対）。印つきの腕は
+        // 「全ノードを飛ばした」から速いのであって、歩かなかったからではない。
+        assert_eq!(
+            arm["aclapi_second_skipped"], arm["nodes"],
+            "印つきの2回目が全ノードを飛ばしていない。狭めたスキップが働いていない: {arm}"
+        );
+        assert_eq!(
+            arm["aclapi_second_rewritten"],
+            serde_json::json!(0),
+            "印つきの2回目が書き直している。印が残っていない: {arm}"
+        );
     }
+}
+
+/// **[BUG-145] 印（保護＋自動継承）は、実マシンの既存のノードと衝突しないか。**
+///
+/// 印つきで直すなら、スキップの条件は「印がある」になる。**自分が書いていないノードにも
+/// 印が付いているなら、それを「自分が書いた」と誤認して飛ばす**——いまと同じ欠陥が戻る。
+///
+/// # 誤認しても安全か、は別に測ってある
+///
+/// 行列のケース18が「aclapiの口で保護されたノード（＝印つき）は配布に耐える」を
+/// 6つの置き場すべてで出している。**だから印つきを飛ばすこと自体は安全**だが、
+/// **どれだけ在るのかは知っておく価値がある**（多ければ「印＝自分が書いた」という
+/// 読み方そのものを文書から外す必要がある）。
+///
+/// **読取だけである。** 1バイトも書かない。
+#[test]
+#[ignore = "実マシンのDACLを読むだけの調査（書込なし・管理者権限不要）。結果はplans/mac-spike/RESULTS.mdへ転記する"]
+fn control_dir_mark_collision_probe() {
+    let repo = repo_root();
+    let mut samples: Vec<(String, PathBuf, bool)> = Vec::new();
+
+    // 1. このリポジトリの実`.harness/`（再帰）——**印つきで直したときに触る当のツリー**。
+    let harness_dir = repo.join(".harness");
+    if harness_dir.is_dir() {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        super::acl_grant::collect_dirs_and_files(
+            &harness_dir,
+            &mut dirs,
+            &mut files,
+            OnVanished::Skip,
+        )
+        .expect("enumerate the real control dir");
+        for node in dirs.into_iter().chain(files) {
+            let marked = dacl_control(&node)
+                .map(dacl_is_protected_and_auto_inherited)
+                .unwrap_or(false);
+            samples.push(("repo/.harness (recursive)".into(), node, marked));
+        }
+    }
+
+    // 2. 代表的な場所の**直下だけ**（再帰しない——`%TEMP%`は数万件になり得る）。
+    for (label, base) in [
+        ("C:\\ (direct children)", PathBuf::from("C:\\")),
+        ("%USERPROFILE% (direct children)", user_profile_root()),
+        ("%TEMP% (direct children)", std::env::temp_dir()),
+    ] {
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let marked = dacl_control(&path)
+                .map(dacl_is_protected_and_auto_inherited)
+                .unwrap_or(false);
+            samples.push((label.to_string(), path, marked));
+        }
+    }
+
+    let mut per_group: std::collections::BTreeMap<&str, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for (label, _, marked) in &samples {
+        let e = per_group.entry(label.as_str()).or_insert((0, 0));
+        e.0 += 1;
+        if *marked {
+            e.1 += 1;
+        }
+    }
+
+    println!("=== 印（保護＋自動継承）を持つノードの数 ===");
+    for (label, (total, marked)) in &per_group {
+        println!("  {label:<34}: {marked} / {total}");
+    }
+    println!("  --- 印つきの実例（先頭10件） ---");
+    for (_, path, _) in samples.iter().filter(|(_, _, m)| *m).take(10) {
+        println!("    {}", path.display());
+    }
+
+    // **数えたことを確かめる**（`B-35`）。0件という結果は「1件も無い」でも
+    // 「1件も見ていない」でも成り立つので、標本が空なら測定は不成立である。
+    assert!(
+        !samples.is_empty(),
+        "1ノードも読めていない。この測定は何も言っていない"
+    );
 }

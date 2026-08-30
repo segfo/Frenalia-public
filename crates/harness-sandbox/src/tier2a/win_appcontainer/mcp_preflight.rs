@@ -105,7 +105,7 @@ pub fn preflight_mcp_server(
         // [BUG-084] 保護が1件も掛からなかったことを、このサーバの起動前に見せる。
         // ここは**第三者コードへworkspaceのACEを渡した直後**なので、制御面（D-05/D-09の層3、
         // 承認台帳の自己書換防止＝D-39）が実際に閉じたかどうかが最も効く場所である。
-        if harness_dir_exists && protected == 0 {
+        if harness_dir_exists && protected.protected == 0 {
             warnings.push(format!(
                 "mcp {}: granted workspace access but the .harness control directory was not \
                  protected on any node; this server may be able to reach the approval ledger. \
