@@ -16,6 +16,14 @@ use super::*;
 #[path = "dacl_protection_probe_tests.rs"]
 mod dacl_protection_probe_tests;
 
+/// [BUG-145](../../../../docs/bugs/BUG-145.md) の実測プローブ。**保護したノード自身が、
+/// 親の伝播で保護を失うのか**を測る。上と同じ理由でここに置く——測定対象が本モジュールの
+/// private関数（[`remove_sid_aces_and_protect`]・[`set_dacl_single_object_with_protection`]）
+/// そのものであり、兄弟モジュールからは触れない。
+#[cfg(all(windows, test))]
+#[path = "control_dir_propagation_probe_tests.rs"]
+mod control_dir_propagation_probe_tests;
+
 /// `ACCESS_ALLOWED_ACE_TYPE`（WinNT.h）。`windows`クレートはこの値を定数として公開して
 /// いないため、既知の固定値としてここに置く。
 pub(crate) const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
