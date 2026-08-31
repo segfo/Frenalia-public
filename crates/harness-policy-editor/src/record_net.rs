@@ -657,38 +657,25 @@ impl Drop for SessionGrants {
     }
 }
 
-/// このプロセスが**パス2のpassthroughとして**ACEを付けたルート。
-///
-/// # なぜプロセス内に持つのか（新しい台帳を作らない）
-///
-/// 宣言を取り消したとき（[`crate::unapprove`]）に「もう誰も要求していないルート」を剥がすため、
-/// 「このプロセスが何を開けたか」を知る必要がある。ところが既存の
-/// `session_profile::granted_paths_for_current_session`には**workspaceルートやtraverse付与も
-/// 混ざっている**ので、それを対象にすると宣言と無関係なACEまで剥がすことになる。
-/// 逆に新しい永続台帳を作れば、台帳と実体が乖離する経路（BUG-097と同型）を1つ増やす。
-///
-/// そこで**プロセスの寿命だけ**の集合として持つ。落ちても実害が無い——撤収の正しさは
-/// 従来どおり`end_session`と`gc_dead_sessions`が担保しており、これは
-/// 「宣言が縮んだ分をその場で反映する」ためだけの記録である。
-static GRANTED_PASSTHROUGH_ROOTS: std::sync::Mutex<Vec<PathBuf>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// 「このプロセスが開けた穴」のうち、**今回の宣言がもう要求していない**ものを返す。
+/// 「このworkspaceが主体を発行済みのルート」のうち、**今回の宣言がもう要求していない**ものを返す。
 ///
 /// 剥がす対象を決める判定そのもの。OSに触らない純粋関数にしてあるのは、**取りすぎ・取り足りず
 /// のどちらも実害が出る**判定であり、実機や管理者権限なしで全数を固定したいためである
 /// （条件を反転させたら「まだ要る穴を剥がす」になり、コマンドが動かなくなる）。
 ///
-/// 比較は大文字小文字を無視する——Windowsのパスは区別しないので、同じルートが綴りの違いで
-/// 「別物」に見えると剥がし残す。
+/// # 突き合わせは畳み込み鍵で行う（`eq_ignore_ascii_case`では足りない）
+///
+/// `held`の出どころは**capability台帳**で、綴りは`declaration_key`が畳んだ形
+/// （小文字・区切りは`\`）である。一方`wanted`は`policy.json`由来なので区切りが`/`のことが多い。
+/// 大文字小文字だけを無視する比較では**同じルートが別物に見え、まだ要る穴を全部剥がす**。
+/// FS軸の畳み込みは1つでなければならない（`B-20`）ので、ここでも同じ関数を通す。
 fn stale_roots(held: &[PathBuf], wanted: &[FsPassthrough]) -> Vec<PathBuf> {
+    use harness_sandbox::tier2a::workspace_capability::declaration_key;
+    let wanted_keys: Vec<String> = wanted.iter().map(|fp| declaration_key(&fp.path)).collect();
     held.iter()
         .filter(|granted| {
-            !wanted.iter().any(|fp| {
-                fp.path
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(&granted.to_string_lossy())
-            })
+            let key = declaration_key(granted);
+            !wanted_keys.iter().any(|w| w == &key)
         })
         .cloned()
         .collect()
@@ -714,9 +701,20 @@ fn reconcile_undeclared_roots(
     warnings: &mut Vec<String>,
     on_event: &mut dyn FnMut(NetRecordEvent),
 ) {
-    let mut held = GRANTED_PASSTHROUGH_ROOTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    // [§22.2.1] 宣言capabilityの索引は**canonicalize済みのworkspace**で引く。付与側
+    // （`preflight`）が台帳へ書くときに使うのがその形なので、生のパスで絞ると
+    // **1件も一致せず、黙って何も剥がさない**（この経路の失敗は無症状になる）。
+    let canonical_ws = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    // [BUG-142] 索引は**台帳**から引く。かつてはプロセス内の`static`に「この実行が開けた穴」を
+    // 覚えていたが、CLIの流れ（付与→`unapprove`→再実行）は3つとも別プロセスなので
+    // **常に空集合との差分**になり、撤収が無言で0件になっていた。
+    let held: Vec<PathBuf> =
+        harness_sandbox::tier2a::workspace_capability::declared_paths_for_workspace(&canonical_ws)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
     let stale = stale_roots(&held, wanted);
     if stale.is_empty() {
         return;
@@ -726,12 +724,6 @@ fn reconcile_undeclared_roots(
     // 大きなツリーでは時間がかかる（`.cargo`への付与は実測142.6s）。
     on_event(NetRecordEvent::RevokingUndeclared { total: stale.len() });
     let profile = harness_sandbox::tier2a::session_profile::current_profile_name();
-    // [§22.2.1] 宣言capabilityの索引は**canonicalize済みのworkspace**で引く。付与側
-    // （`preflight`）が台帳へ書くときに使うのがその形なので、生のパスで絞ると
-    // **1件も一致せず、黙って何も剥がさない**（この経路の失敗は無症状になる）。
-    let canonical_ws = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
     for (index, path) in stale.iter().enumerate() {
         // [§22.2.1] **`--fs-allow`の主体は宣言ごとのcapability SIDへ移った。**
         // package SIDの撤収（下）だけでは、宣言を取り消しても穴が閉じない。
@@ -771,7 +763,18 @@ fn reconcile_undeclared_roots(
     // **セッション台帳（`granted_paths`）からは消さない。** 消すと「撤収の責任を負っている
     // パス」の記録が減り、剥がし残しがあったときに`end_session`/`gc_dead_sessions`が
     // 拾えなくなる。責任を多めに持つのは安全側で、少なく持つのがBUG-057・BUG-059の形である。
-    held.retain(|p| !stale.iter().any(|s| s == p));
+    //
+    // [BUG-142] **capability台帳のほうは落とす。** ここが索引そのものなので、落とさないと
+    // 次の実行でも同じパスをstaleとして拾い、剥がすものが無いまま再walkを繰り返す。
+    // ただし判定は「撤収を呼んだ」ではなく**実DACLからもう消えている**で行う——
+    // 生きているworkspaceの主体は意図的に残るので、呼んだだけを根拠に記録を捨てると
+    // 主体を導出できない孤児ACEになる（`B-01`/`B-14`）。判定の実体は`harness-sandbox`側にある
+    // （`harness fs revoke`系と共有。同じ判定を2箇所に書かない、`B-05`）。
+    //
+    // **ここで別の行は出さない。** 剥がしたことは`UndeclaredRevoked`が1件ずつ見せており
+    // （付与と同じ粒度、`B-01`）、これはその後始末である。剥がせなかった場合は上の`warnings`が
+    // 既に名指ししている——「無言で飛ばした」にはならない。
+    let _forgotten = harness_sandbox::tier2a::win_appcontainer::forget_revoked_declarations(&stale);
 }
 
 /// WFPの出口強制daemonを**プロセスの寿命で**持つ（D-56）。
@@ -1095,19 +1098,10 @@ fn run_pass2<'a>(
         })
         .collect();
     harness_sandbox::tier2a::fs_passthrough_ledger::record_fs_passthrough_grants(&grants);
-    // **このプロセスが開けた穴として覚える**（[`GRANTED_PASSTHROUGH_ROOTS`]）。覚えないと、
-    // 宣言を取り消したときに「もう要求されていない穴」を名指しできない（B-01: 付与を記録して
-    // 撤収に使う対）。台帳ではなくプロセス内なので、落ちても`end_session`側が担保する。
-    {
-        let mut held = GRANTED_PASSTHROUGH_ROOTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for (path, _) in &selection.granted_passthrough {
-            if !held.iter().any(|p| p == path) {
-                held.push(path.clone());
-            }
-        }
-    }
+    // [BUG-142] **ここでプロセス内へ覚え直さない。** 「どのパスへ主体を発行したか」は
+    // `preflight`が既にcapability台帳へ書いており（`declaration`欄）、撤収側は
+    // `declared_paths_for_workspace`でそこから引く。2つ目の索引を作ると、
+    // 片方だけ更新される形（＝この欠陥そのもの）へ戻る。
     for (path, writable) in &selection.granted_passthrough {
         on_event(NetRecordEvent::PassthroughGranted {
             path: path.clone(),
@@ -1664,6 +1658,25 @@ mod stale_roots_tests {
             stale,
             held(&["C:/Users/segfo/.cargo"]),
             "別ルートなのでstale（宣言されているのは .cargo-alt だけ）"
+        );
+    }
+
+    /// [BUG-142] **`held`の出どころが台帳になったので、区切りの違いが日常的に混ざる。**
+    ///
+    /// 台帳の綴りは`declaration_key`が畳んだ形（区切りは`\`）、`wanted`は`policy.json`由来で
+    /// `/`のことが多い。大文字小文字だけを無視する比較のままだと、この対が「別ルート」に見えて
+    /// **まだ宣言されている穴を剥がす**。剥がすのは再帰walkなので、気づいたときには
+    /// 付け直しの待ち時間が毎回乗っている。
+    #[test]
+    fn the_comparison_folds_separators_because_the_ledger_and_the_policy_file_spell_them_differently(
+    ) {
+        let stale = stale_roots(
+            &held(&[r"c:\users\segfo\.cargo"]),
+            &wanted(&["C:/Users/segfo/.cargo"]),
+        );
+        assert!(
+            stale.is_empty(),
+            "同じルートなので剥がしてはならない（区切りだけが違う）: {stale:?}"
         );
     }
 

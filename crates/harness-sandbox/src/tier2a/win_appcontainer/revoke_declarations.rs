@@ -137,6 +137,46 @@ pub fn declaration_capabilities_on_root(path: &Path, workspace: Option<&Path>) -
         .collect()
 }
 
+/// 撤収を試したパスについて、**実体がもう無い**宣言主体の台帳エントリを落とす。
+/// 戻り値は落としたエントリのラベル（呼び出し側がそのまま表示できる）。
+///
+/// # 「撤収を呼んだ」を根拠に落としてはならない
+///
+/// 撤収は**走っているworkspaceの主体を意図的に残す**（[`revocable_declaration_issuers`]）ので、
+/// 「撤収を呼んだパス」の中には**まだACEが載っている主体**が混じる。それを台帳から落とすと
+/// 主体を二度と導出できなくなり、撤収経路の無い孤児ACEになる（`B-01`/`B-14`）。
+/// だから捨てる前に**実体を見る**（[`declaration_capabilities_gone_from_root`]）。
+///
+/// # なぜここに置くのか
+///
+/// [BUG-142](../../../../docs/bugs/BUG-142.md)の修正で**呼ぶ側が2つになった**
+/// （`harness fs revoke`系と、ポリシーエディタのパス2開始時の差分撤収）。別クレートなので、
+/// どちらかに置くとコピーが1つ増える——同じ判定が2箇所にあると片方だけ古くなる（`B-05`）。
+/// 判定が要るのは台帳と実DACLの両方で、どちらもこのクレートが持っている。
+pub fn forget_revoked_declarations(revoked: &[std::path::PathBuf]) -> Vec<String> {
+    if revoked.is_empty() {
+        return Vec::new();
+    }
+    // `(宣言パスの畳み込み鍵, もう載っていないcapability名)`の対応表を先に作る。
+    let gone: Vec<(String, Vec<String>)> = revoked
+        .iter()
+        .map(|p| {
+            (
+                crate::tier2a::workspace_capability::declaration_key(p),
+                declaration_capabilities_gone_from_root(p),
+            )
+        })
+        .collect();
+    crate::tier2a::workspace_capability::prune_capability_entries(|entry| {
+        let Some(declared) = entry.declaration.as_deref() else {
+            // workspace本体の主体はここでは扱わない（撤収の扉は`fs revoke-workspace`）。
+            return false;
+        };
+        gone.iter()
+            .any(|(key, names)| key == declared && names.iter().any(|n| n == &entry.capability_name))
+    })
+}
+
 /// `path`について、**実DACLにもう載っていない**宣言主体のcapability名。
 ///
 /// 記録を捨ててよいかを決めるために要る。**「剥がすつもりだった」ではなく「消えている」を

@@ -664,14 +664,15 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
         "MEASURED: capability SID ACEs left after unapprove + next pass2 = {capability_left}\n\
          --- SDDL after unapprove ---\n{after_unapprove}"
     );
-    // **観測値をそのまま固定する。** 「0本のはず」と書くと、剥がれないことが分かったときに
-    // このテストが赤いまま残るか、期待値を書き換えて赤を消す圧力になる。ここで固定するのは
-    // 「測った」という事実の側で、剥がれるべきかどうかの判断は本流が持つ
-    // （`plans/DESIGN-MAC-DOMAIN.md` §22.2.1 の撤収条件＝「もう誰も宣言していないこと」）。
-    assert!(
-        capability_left <= 1,
-        "unexpected: more capability SID ACEs than were ever granted; the revoke path is \
-         adding subjects instead of removing them: {after_unapprove}"
+    // [BUG-142] **0本を要求する。** 撤収の条件は「もう誰も宣言していないこと」であり
+    // （`plans/DESIGN-MAC-DOMAIN.md` §22.2.1）、宣言を全部取り消した以上ここは0でなければ
+    // ならない。**初回の測定ではここが1だった**——撤収の索引がプロセス内の変数で、
+    // CLIの流れ（付与→`unapprove`→再実行）は別プロセスなので常に空集合との差分になり、
+    // 何も剥がさないまま無言で終わっていた。索引を台帳へ移した修正の回帰テストである。
+    assert_eq!(
+        capability_left, 0,
+        "the declaration was withdrawn, so no declaration capability ACE may remain. \
+         If this is 1, the revoke ran against an empty index again (BUG-142): {after_unapprove}"
     );
     // package SID宛は、宣言を外した後も0本のままでなければならない（撤収が主体を
     // **取り違えて**古い形で付け直していないこと）。

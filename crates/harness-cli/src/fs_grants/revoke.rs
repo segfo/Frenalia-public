@@ -821,39 +821,14 @@ pub fn reconcile_fs_ledger_for_workspace(
 
 /// 撤収し終えた宣言について、capability台帳のエントリを落とす。
 ///
-/// # 落としてよいのは「実DACLからもう消えている」ものだけである
-///
-/// **ACEを剥がし終えてから呼ぶ**だけでは足りない。撤収は**走っているworkspaceの主体を
-/// 意図的に残す**（`revocable_declaration_issuers`）ので、「撤収を呼んだパス」の中には
-/// **まだACEが載っている主体**が混じる。それを台帳から落とすと主体を二度と導出できなくなり、
-/// 撤収経路の無い孤児ACEになる（`forget_capability`のdocと同じ不変条件、`B-01`/`B-14`）。
-/// だから捨てる前に**実体を見る**。
+/// 判定の実体は`harness_sandbox`側の`forget_revoked_declarations`が持つ
+/// （[BUG-142](../../../../docs/bugs/BUG-142.md)の修正で**呼ぶ側が2つになった**ため
+/// ——こちらとポリシーエディタのパス2。**同じ判定を2箇所に書かない**、`B-05`）。
+/// ここに残すのは**この経路の表示**だけである。
 #[cfg(windows)]
 fn prune_declaration_entries_for(revoked: &[PathBuf]) {
-    if revoked.is_empty() {
-        return;
-    }
-    // `(宣言パスの畳み込み鍵, もう載っていないcapability名)`の対応表を先に作る。
-    let gone: Vec<(String, Vec<String>)> = revoked
-        .iter()
-        .map(|p| {
-            (
-                harness_sandbox::tier2a::workspace_capability::declaration_key(p),
-                harness_sandbox::tier2a::win_appcontainer::declaration_capabilities_gone_from_root(
-                    p,
-                ),
-            )
-        })
-        .collect();
-    let dropped = harness_sandbox::tier2a::workspace_capability::prune_capability_entries(|entry| {
-        let Some(declared) = entry.declaration.as_deref() else {
-            // workspace本体の主体はここでは扱わない（撤収の扉は`fs revoke-workspace`）。
-            return false;
-        };
-        gone.iter().any(|(key, names)| {
-            key == declared && names.iter().any(|n| n == &entry.capability_name)
-        })
-    });
+    let dropped =
+        harness_sandbox::tier2a::win_appcontainer::forget_revoked_declarations(revoked);
     for label in &dropped {
         eprintln!("  forgot the declaration capability for {label}");
     }

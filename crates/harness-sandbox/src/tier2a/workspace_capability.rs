@@ -466,6 +466,49 @@ pub fn ensure_declaration_capability_name(
         .map(|c| c.capability_name)
 }
 
+/// [BUG-142] そのworkspaceが**宣言主体を発行済みのパス**（畳み込み済みの綴り、重複なし）。
+///
+/// # これは「撤収の索引」である
+///
+/// 「もう宣言されていない穴」を求めるには、**いま宣言されているもの**と
+/// **かつて宣言して主体を発行したもの**の差分が要る。前者はポリシー側が持っているが、
+/// 後者を**プロセス内の変数で覚えていた**のが[BUG-142](../../../../docs/bugs/BUG-142.md)である
+/// ——付与した実行が終われば消えるので、別プロセスから見ると常に空集合になり、
+/// 撤収が無言で0件になっていた。
+///
+/// 台帳は既にこの索引そのものを持っている（[`WorkspaceCapabilityEntry::declaration`]＝
+/// 畳み込み済みの宣言パス）ので、**新しい台帳を作らずにここから引く**。
+/// 返す綴りは[`declaration_key`]を通した形で、**そのままパスとして扱える**
+/// （Windowsのパスは大文字小文字を区別しない）。
+///
+/// **access級ごとの重複は畳む。** 同じパスへ`read`と`read_exec`を発行していれば台帳には
+/// 2行あるが、ここで数えたいのは**パス**である（主体の列挙は
+/// [`declaration_capability_names`]が別に行う）。
+pub fn declared_paths_for_workspace(workspace: &Path) -> Vec<String> {
+    declared_paths_for_workspace_in(&ledger(), workspace)
+}
+
+fn declared_paths_for_workspace_in(
+    ledger: &Ledger<WorkspaceCapabilityLedger>,
+    workspace: &Path,
+) -> Vec<String> {
+    let key = workspace_key(workspace);
+    let mut seen: Vec<String> = Vec::new();
+    for entry in ledger.load().entries {
+        if workspace_key(Path::new(&entry.workspace)) != key {
+            continue;
+        }
+        // workspace本体の主体（`declaration == None`）はここでは扱わない
+        // ——撤収の扉が別である（`fs revoke-workspace`）。
+        if let Some(declared) = entry.declaration {
+            if !seen.contains(&declared) {
+                seen.push(declared);
+            }
+        }
+    }
+    seen
+}
+
 /// テスト用の薄い包み（既存テストが名前だけを見ているため）。
 #[cfg(test)]
 fn ensure_declaration_capability_name_in(
