@@ -352,7 +352,7 @@ fn open_if_proves_nothing_because_both_read_and_write_travel_through_it() {
     );
 }
 
-/// **どこが門なのかの切り分け。** 書込ビットは**呼び出し側に要求されない**。
+/// **どこがゲートなのかの切り分け。** 書込ビットは**呼び出し側に要求されない**。
 /// DACLが許していれば、`DesiredAccess`に書込を1ビットも入れずに`FILE_OVERWRITE_IF`が通る。
 ///
 /// つまりアクセスチェックの入力になっているのは呼び出し側が名指しした`DesiredAccess`ではなく、

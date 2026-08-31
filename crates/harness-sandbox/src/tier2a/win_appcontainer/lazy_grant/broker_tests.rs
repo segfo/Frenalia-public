@@ -243,13 +243,13 @@ fn a_granted_path_is_materialised_once_and_merged_afterwards() {
     }
 }
 
-/// **掛け金は「こちら側の失敗」でだけ下ろす。ポリシー拒否では下ろさない。**
+/// **ラッチは「こちら側の失敗」でだけ倒す。ポリシー拒否では倒さない。**
 ///
-/// 下ろすと、そのworkspaceでは以降レーンを使わなくなる（起動側が従来の待ちへ落ちる）。
-/// **範囲外を叩かれただけで下ろすと、敵対的な子が`.harness/`を1回叩くだけでレーンを殺せる**
+/// 倒すと、そのworkspaceでは以降レーンを使わなくなる（起動側が従来の待ちへ落ちる）。
+/// **範囲外を叩かれただけで倒すと、敵対的な子が`.harness/`を1回叩くだけでレーンを殺せる**
 /// ——だから引き金は「付与できなかった」に限る。
 ///
-/// 対で見る（`B-35`）——下りる側だけを測ると「常に下ろす」実装でも緑になる。
+/// 対で見る（`B-35`）——倒れる側だけを測ると「常に倒す」実装でも緑になる。
 #[test]
 fn only_our_own_failure_trips_the_latch_never_a_policy_denial() {
     let guard = TestDirGuard::create("broker-latch");
@@ -281,7 +281,7 @@ fn only_our_own_failure_trips_the_latch_never_a_policy_denial() {
         granted: Mutex::new(HashSet::new()),
     };
 
-    // ポリシー拒否（制御ディレクトリ）。**掛け金は下りない。**
+    // ポリシー拒否（制御ディレクトリ）。**ラッチは倒れない。**
     let denied = handle_grant(&shared, &control.join("state.json").to_string_lossy());
     assert!(matches!(denied, FaultResponse::Denied { .. }), "{denied:?}");
     assert!(
@@ -289,7 +289,7 @@ fn only_our_own_failure_trips_the_latch_never_a_policy_denial() {
         "a policy denial must not disable the lane; otherwise one out-of-scope open kills it"
     );
 
-    // こちら側の失敗（writerが畳まれている）。**ここで初めて下りる。**
+    // こちら側の失敗（writerが畳まれている）。**ここで初めて倒れる。**
     let _ = writer.stop_at_safe_point();
     let unavailable = handle_grant(&shared, &file.to_string_lossy());
     assert!(

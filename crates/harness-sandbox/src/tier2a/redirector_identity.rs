@@ -21,12 +21,12 @@
 //! 起こさない**。自動的に弱いモードへ降格はしない（D-75。弱い器が要るなら `--sandbox` の値で
 //! 明示的に選ぶ）。
 //!
-//! # この関所が守らないもの
+//! # このゲートが守らないもの
 //!
 //! **同じ権限を持つローカル攻撃者**は防げない。x86 DLL を差し替えられる相手は、期待値を持つ
 //! harness 本体も差し替えられるからである。これは D-44（昇格ヘルパーの整合性を署名ではなく
 //! 配置の DACL で見ると決めた拘束的決定、`crate::elevated_launch`）で既に結論が出ている話で、
-//! ここはその結論を変えない。**この関所が相手にしているのは攻撃者ではなく取り違え**
+//! ここはその結論を変えない。**このゲートが相手にしているのは攻撃者ではなく取り違え**
 //! ——人がビルドし忘れた、頒布物の組み立てが半端だった、という事故である。事故は harness 本体を
 //! 辻褄合わせに書き換えてくれないので、版の刻印は事故に対しては壊れない。
 
@@ -43,7 +43,7 @@ pub const EXPECTED_BUILD_ID: &str = env!("HARNESS_REDIRECTOR_BUILD_ID");
 pub const X86_DLL_FILENAME: &str = "harness_redirector_x86.dll";
 
 /// 作り直すためのコマンド。**エラー文にそのまま出す**——「そろっていない」とだけ言われても
-/// 次に何を打てばよいかが分からないと、利用者は関所を外す方へ動く。
+/// 次に何を打てばよいかが分からないと、利用者はゲートを外す方へ動く。
 pub const REBUILD_HINT: &str = "tools/build-redirector-x86.ps1 \
     (or: cargo build -p harness-redirector --target i686-pc-windows-msvc, then copy \
     target/i686-pc-windows-msvc/debug/harness_redirector.dll next to harness.exe as \
@@ -52,7 +52,7 @@ pub const REBUILD_HINT: &str = "tools/build-redirector-x86.ps1 \
 /// バイト列から刻印を取り出すときの失敗。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdError {
-    /// 目印が無い、または目印はあっても後続が正しい形（64 桁の 16 進 + NUL）ではない。
+    /// マーカーが無い、またはマーカーはあっても後続が正しい形（64 桁の 16 進 + NUL）ではない。
     /// **形が壊れているものから刻印をでっち上げない**——でっち上げると、壊れた DLL が
     /// たまたま期待値と一致して素通りし得る。
     Missing,
@@ -146,8 +146,8 @@ impl std::error::Error for RedirectorSetError {}
 /// バイト列を走査して刻印を取り出す。**PE を解析しない**ので、x64 と x86 の両方を同じコードで
 /// 扱える（エクスポートテーブルの構造は 32bit と 64bit で違う）。
 ///
-/// 目印の後ろが「64 桁の小文字 16 進」＋「NUL」になっているものだけを正当とみなす。
-/// 目印の綴りだけが偶然含まれていても刻印としては拾わない。
+/// マーカーの後ろが「64 桁の小文字 16 進」＋「NUL」になっているものだけを正当とみなす。
+/// マーカーの綴りだけが偶然含まれていても刻印としては拾わない。
 pub fn extract_build_id(bytes: &[u8]) -> Result<String, IdError> {
     let marker = BUILD_ID_MARKER.as_bytes();
     let payload = BUILD_ID_HEX_LEN;
@@ -173,7 +173,7 @@ pub fn extract_build_id(bytes: &[u8]) -> Result<String, IdError> {
             if !found.contains(&id) {
                 found.push(id);
             }
-            // 同じ目印の内側から重ねて探さない。
+            // 同じマーカーの内側から重ねて探さない。
             i = start + payload + 1;
         } else {
             i += 1;
@@ -217,7 +217,7 @@ pub fn read_build_id(path: &Path) -> Result<String, RedirectorSetError> {
     })
 }
 
-/// CoW セッションを起こす前の関所。x64 と x86 の**両方**が在り、互いに、そしてこの harness
+/// CoW セッションを起こす前のゲート。x64 と x86 の**両方**が在り、互いに、そしてこの harness
 /// 本体が期待する刻印と一致することを確かめる。
 ///
 /// **3 者一致にしている理由**: x64 と x86 の 2 者だけを比べると「両方とも古い」組を通してしまう。
@@ -247,7 +247,7 @@ mod tests {
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    /// 目印 + 刻印 + NUL を、前後に無関係なバイトを挟んで埋め込んだ「DLL もどき」を作る。
+    /// マーカー + 刻印 + NUL を、前後に無関係なバイトを挟んで埋め込んだ「DLL もどき」を作る。
     fn blob_with(ids: &[&str]) -> Vec<u8> {
         let mut out: Vec<u8> = b"\x7fELF junk before".to_vec();
         for id in ids {
@@ -299,7 +299,7 @@ mod tests {
         );
     }
 
-    /// **D2a**: 16 進が 63 桁しかない（＝目印の後ろの形が違う）。
+    /// **D2a**: 16 進が 63 桁しかない（＝マーカーの後ろの形が違う）。
     #[test]
     fn a_marker_with_too_few_hex_digits_is_rejected() {
         let mut blob = BUILD_ID_MARKER.as_bytes().to_vec();
@@ -337,7 +337,7 @@ mod tests {
         }
     }
 
-    /// **A3（誤検知側）**: 目印の綴りだけが在って中身が無い。**刻印をでっち上げない**こと。
+    /// **A3（誤検知側）**: マーカーの綴りだけが在って中身が無い。**刻印をでっち上げない**こと。
     /// でっち上げると、壊れた DLL が偶然期待値と一致して素通りし得る。
     #[test]
     fn the_marker_spelling_alone_does_not_fabricate_an_id() {

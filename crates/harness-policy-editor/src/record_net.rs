@@ -305,13 +305,13 @@ pub enum RecordNetError {
 }
 
 impl RecordNetError {
-    /// マニフェストへ残す**機械可読の札**（[`crate::session_dir::RecordManifest::error_kind`]）。
+    /// マニフェストへ残す**機械可読のタグ**（[`crate::session_dir::RecordManifest::error_kind`]）。
     ///
     /// 文面（`Display`）はパスや下位のエラーを含むうえ、読みやすさのために書き換わる。
-    /// 「どの段で落ちたか」で後から突き合わせたいので、変わらない札を別に持つ。
+    /// 「どの段で落ちたか」で後から突き合わせたいので、変わらないタグを別に持つ。
     ///
     /// **ワイルドカードを使わない**——variantを足した人のビルドがここで落ちる
-    /// （札の付け忘れを実行時ではなくコンパイル時に捕まえる）。
+    /// （タグの付け忘れを実行時ではなくコンパイル時に捕まえる）。
     pub fn kind(&self) -> &'static str {
         match self {
             RecordNetError::AlreadyRecording(_) => "already_recording",
@@ -913,7 +913,7 @@ struct Pass2Facts {
     unreachable_exec: Option<String>,
     /// 記録対象が実際に着地したTier（[`crate::session_dir::RecordManifest::shell_tier`]）。
     /// **Tierが確定した後にだけ入れる**——「Tier2aを狙った」と「Tier2aへ着地した」は
-    /// 別の事実で、混ぜると失敗した記録が成功した記録と同じ札を持ってしまう（B-15）。
+    /// 別の事実で、混ぜると失敗した記録が成功した記録と同じタグを持ってしまう（B-15）。
     shell_tier: Option<String>,
 }
 
@@ -1682,8 +1682,8 @@ mod stale_roots_tests {
 mod error_kind_tests {
     use super::*;
 
-    /// **札が互いに区別できること。** マニフェストへ残す`error_kind`は「どの段で落ちたか」を
-    /// 後から突き合わせるためのもので、2つのvariantが同じ札を持つと区別が消える。
+    /// **タグが互いに区別できること。** マニフェストへ残す`error_kind`は「どの段で落ちたか」を
+    /// 後から突き合わせるためのもので、2つのvariantが同じタグを持つと区別が消える。
     ///
     /// variantの追加は`kind()`のワイルドカード無し`match`がコンパイル時に止めるので、
     /// ここで固定するのは**綴りの重複が無いこと**だけでよい。
@@ -1714,7 +1714,7 @@ mod error_kind_tests {
         assert!(seen.iter().all(|k| !k.is_empty()));
     }
 
-    /// 札は**文面と一緒に**マニフェストへ残る。ここが繋がっていないと、
+    /// タグは**文面と一緒に**マニフェストへ残る。ここが繋がっていないと、
     /// `error_kind`だけがあって理由が読めない／その逆になる。
     #[test]
     fn the_label_and_the_message_travel_together() {

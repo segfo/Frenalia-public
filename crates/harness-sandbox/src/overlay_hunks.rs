@@ -7,7 +7,7 @@
 //! 番号で選ぶ。ハンクの実体を外から受け取らないので、「見たものと違うものが適用される」事故が
 //! 構造的に起きない（ハッシュが違えば`conflicts`として何も書かずに拒否する）。
 //!
-//! **既存の門はすべて通る**（P-08）: 台帳パスの正規形検査（[BUG-062](../../docs/bugs/BUG-062.md)）→
+//! **既存のゲートはすべて通る**（P-08）: 台帳パスの正規形検査（[BUG-062](../../docs/bugs/BUG-062.md)）→
 //! D-09 hard-deny再チェック → 適用可否の降格判定 → ハッシュ照合、の順は
 //! `overlay::apply_overlay_changes`と同じで、どれもバイパスしない。
 
@@ -26,7 +26,7 @@ pub enum HunkBlock {
     Delete,
     /// 台帳に記録が無い（baselineが不明なので、部分適用後に張り替えるべき値も決まらない）。
     Unledgered,
-    /// workspace外の絶対パス（`_ext`）。適用に`--dangerously-allow`という別の門が要る。
+    /// workspace外の絶対パス（`_ext`）。適用に`--dangerously-allow`という別のゲートが要る。
     External,
     /// どちらかの側がUTF-8として読めない（行の合成が正確にできない）。
     NonUtf8,

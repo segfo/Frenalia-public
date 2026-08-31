@@ -46,7 +46,7 @@ use harness_core::{
 
 use crate::{ConversationState, EventSink};
 
-/// digest済みブロックの目印。書く側と「これは既にdigestしたか」を見る側が共有する。
+/// digest済みブロックのマーカー。書く側と「これは既にdigestしたか」を見る側が共有する。
 ///
 /// ツール出力自身がこの文字列を含んでいた場合（このファイルを`read_file`した場合など）は
 /// digest対象から外れるだけで、害は無い。
@@ -531,7 +531,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 1回目でdigestした3件は候補から外れる（目印で識別）。残り＝逐語のまま溜まった
+        // 1回目でdigestした3件は候補から外れる（マーカーで識別）。残り＝逐語のまま溜まった
         // 5件（index 3,4と新規5件のうち直近2件を除く）から、絶対上限ぶんの3件を畳む。
         assert_eq!(
             out.digested_blocks, 3,

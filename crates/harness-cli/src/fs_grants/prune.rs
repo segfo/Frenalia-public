@@ -165,7 +165,7 @@ pub(crate) fn fs_prune(dry_run: bool) -> ExitCode {
                     gone.contains(&entry.prune_target())
                 });
         } else {
-            // **dry-runと本番で同じ名札を出す。** 判定対象（畳み込み済みのパス）をそのまま
+            // **dry-runと本番で同じ表示ラベルを出す。** 判定対象（畳み込み済みのパス）をそのまま
             // 出すと綴りが本番の報告と食い違い、「予告と違うものが消えた」と読まれる。
             report.removed = entries
                 .iter()

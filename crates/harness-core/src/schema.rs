@@ -171,7 +171,7 @@ pub fn unwrap_forced_tool_stream(
 }
 
 /// `ForcedTool`降格を使ったターンで、`stop_reason`が`ToolUse`になって返るのを`EndTurn`へ
-/// 戻す必要があるかの判定に使う、応答側の目印。
+/// 戻す必要があるかの判定に使う、応答側のマーカー。
 ///
 /// `unwrap_forced_tool_stream`はブロック種別を書き換えるが、`Done`の`stop_reason`までは
 /// 触らない（プロバイダが実際に何を返したかの情報を消さないため）。呼び出し側

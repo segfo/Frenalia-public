@@ -180,7 +180,7 @@ struct WfpAuditEntry {
 
 impl WfpAuditEntry {
     /// ネットワークイベントではない**制御レコード**（収集・購読の失敗、昇格側ヘルパーの
-    /// 連鎖起動の結末など）。`protocol = "control"`が目印で、読む側はこれを候補にしない
+    /// 連鎖起動の結末など）。`protocol = "control"`がマーカーで、読む側はこれを候補にしない
     /// （`harness_policy::is_net_control_record`）。
     fn control(reason: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         Self {
@@ -200,7 +200,7 @@ impl WfpAuditEntry {
     }
 }
 
-/// 制御レコードの目印。読む側（`harness_policy::is_net_control_record`）と同じ綴りである
+/// 制御レコードのマーカー。読む側（`harness_policy::is_net_control_record`）と同じ綴りである
 /// ことがこの機構の前提なので、値の変更は両方を同時に見て行う。
 const CONTROL_PROTOCOL: &str = "control";
 
@@ -1093,7 +1093,7 @@ mod tests {
             "**なぜ**失敗したかを残す（以前は理由コードを捨てていた）: {value}"
         );
         // 通信の記録ではないので、ホストもアドレスも持たない。読む側はこの形を見て
-        // 「ホスト名を復元できなかった拒否」と誤読しかねないため、`protocol`が唯一の目印。
+        // 「ホスト名を復元できなかった拒否」と誤読しかねないため、`protocol`が唯一のマーカー。
         assert!(value["remote_host"].is_null());
         assert!(value["remote_addr"].is_null());
     }

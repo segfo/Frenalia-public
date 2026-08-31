@@ -109,7 +109,7 @@ pub(super) fn verify_pipe_client_identity(
 }
 
 /// 親側(クライアント)が、固定パイプへの接続先が本当に正規daemonかをbest-effortで確認する
-/// （S-2、パイプスクワッティングへの第一関門）。named pipeにはクライアントがサーバの正当性を
+/// （S-2、パイプスクワッティングへの第一ゲート）。named pipeにはクライアントがサーバの正当性を
 /// 検証する標準APIが無いため、これは診断的な早期拒否に留まる——真の防御は
 /// [`verify_pipe_client_identity`]側（daemonが接続してきたクライアントを検証する）にある。
 pub(super) fn verify_pipe_server_identity(

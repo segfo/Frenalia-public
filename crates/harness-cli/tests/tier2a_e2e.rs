@@ -27,13 +27,13 @@ const CASE_ROOT: &str = r"C:\harness-e2e";
 type CaseFn = fn() -> Result<(), String>;
 
 /// CoWセッションを作る／読むケース専用。**排他の証（[`CowExclusive`]）を引数で要求する**
-/// ので、札を取らずに書くことができない（BUG-135）。
+/// ので、排他ガードを取らずに書くことができない（BUG-135）。
 ///
 /// [`CaseFn`]を替えずに別の型を立てているのは、あちらを6つの行列が共有していて、
 /// 替えるとCoWと無関係なケースまで巻き込むため。
 type CowCaseFn = fn(&CowExclusive) -> Result<(), String>;
-/// fs passthrough台帳を触るケース。**札を引数で受け取る**——受け取れない形にすると、
-/// 呼ぶ側が札を取り忘れても書けてしまう（[`CowCaseFn`]と同じ理由、BUG-135）。
+/// fs passthrough台帳を触るケース。**排他ガードを引数で受け取る**——受け取れない形にすると、
+/// 呼ぶ側が排他ガードを取り忘れても書けてしまう（[`CowCaseFn`]と同じ理由、BUG-135）。
 type FsLedgerCaseFn = fn(&FsLedgerExclusive) -> Result<(), String>;
 
 fn harness_exe() -> PathBuf {
@@ -347,7 +347,7 @@ fn parse_json_stdout(run: &HarnessRun) -> Result<Outcome, String> {
 // **書いていない理由は次の人に伝わらない。**
 //
 // 対策は「触るテストを全部数えてロックを配る」ではなく、**数えなくてよくすること**。
-//   (a) 一覧を読む側は[`CowExclusive`]のメソッドにした——札が無いと**そもそも書けない**
+//   (a) 一覧を読む側は[`CowExclusive`]のメソッドにした——排他ガードが無いと**そもそも書けない**
 //   (b) 一覧を読まずにセッションを`作るだけ`の側は型で縛れないので、作る唯一の入口
 //       （[`run_harness_full`]）に[`assert_cow_exclusive_held`]を置いた
 //
@@ -358,7 +358,7 @@ fn parse_json_stdout(run: &HarnessRun) -> Result<Outcome, String> {
 // 同じ1ファイルへ無ロックのread-modify-writeを撃ち合い、(i) read-only属性の解除と再付与が
 // 交差して書込が失敗する、(ii) 片方が読んだ古い内容を書き戻して相手のタグを復活させる、
 // の2つが起きる。**規約を機構へ変える**のが[`FsLedgerExclusive`]で、台帳を読む/書く手段を
-// その札のメソッドだけにしてある（(a)と同じ形）。
+// その排他ガードのメソッドだけにしてある（(a)と同じ形）。
 //
 // **[`CowExclusive`]とは別のロックにしてある。** 守っている資源が違い、いま台帳を触る
 // 2本はどちらもCoWセッションを作らないので、両方を同時に取るテストは存在しない
@@ -375,8 +375,8 @@ static FS_LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// いま[`CowExclusive`]を持っているスレッド。
 ///
 /// **`AtomicBool`にしないこと。** 「誰かが持っている」と「自分が持っている」は別の事実で、
-/// 前者で代用すると、札を持たないテストが**隣のテストの保持を自分の保持と読み違えて**
-/// 関所を素通りする。
+/// 前者で代用すると、排他ガードを持たないテストが**隣のテストの保持を自分の保持と読み違えて**
+/// ゲートを素通りする。
 static COW_EXCLUSIVE_OWNER: std::sync::Mutex<Option<std::thread::ThreadId>> =
     std::sync::Mutex::new(None);
 
@@ -403,9 +403,9 @@ impl Drop for CowExclusive {
     }
 }
 
-/// 札を持たずに共有資源へ触ろうとしたら、その場で止める。
+/// 排他ガードを持たずに共有資源へ触ろうとしたら、その場で止める。
 ///
-/// **型で縛れない側の関所**——一覧を読まずにCoWセッションを**作るだけ**のテストは
+/// **型で縛れない側のゲート**——一覧を読まずにCoWセッションを**作るだけ**のテストは
 /// [`CowExclusive`]を要求されないが、それでも隣の見比べを狂わせる。
 fn assert_cow_exclusive_held(what: &str) {
     let owner = *COW_EXCLUSIVE_OWNER
@@ -442,10 +442,10 @@ impl CowExclusive {
     }
 }
 
-/// **BUG-135の歯**（B-27）: 札を持たずに触ったら、不定期な赤ではなく**その場で**落ちること。
+/// **BUG-135の歯**（B-27）: 排他ガードを持たずに触ったら、不定期な赤ではなく**その場で**落ちること。
 ///
 /// このファイルの他のテストはすべて`#[ignore]`（実機・管理者権限が要る）なので、
-/// 関所の生死を確かめるにはこれが唯一の軽い経路である
+/// ゲートの生死を確かめるにはこれが唯一の軽い経路である
 /// （`cargo test -p harness-cli --features e2e-mock` で走る。管理者権限は不要）。
 #[test]
 #[should_panic(expected = "BUG-135")]
@@ -453,11 +453,11 @@ fn touching_a_cow_session_without_the_exclusive_guard_fails_loudly() {
     assert_cow_exclusive_held("この検査自体の歯の確認");
 }
 
-/// **関所が実際に配線されていることの歯**（B-27・B-06）。
+/// **ゲートが実際に配線されていることの歯**（B-27・B-06）。
 ///
 /// 上のテストは検査関数が動くことしか見ていない。**検査が存在することと、
 /// CoWセッションを作る入口から呼ばれていることは別の事実**で、後者が抜けていたのが
-/// BUG-135 そのものだった。だから入口（[`run_harness_full`]）を札無しで叩いて確かめる。
+/// BUG-135 そのものだった。だから入口（[`run_harness_full`]）を排他ガード無しで叩いて確かめる。
 ///
 /// **`harness.exe`は起動しない**——検査は関数の先頭、スクラッチ用ファイルを作るより前に
 /// あるので、パニックが先に出る。実機も管理者権限も要らない。
@@ -2748,7 +2748,7 @@ fn fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it(
 #[ignore]
 fn tier2a_fs_allow_matrix() {
     // `--fs-allow`は`fs-passthrough-ledger.json`へエントリを足し、各ケースは後始末で
-    // そこから自分の分を落とす。**札はテスト関数の全体で持つ**——ケース単位に縮めると、
+    // そこから自分の分を落とす。**排他ガードはテスト関数の全体で持つ**——ケース単位に縮めると、
     // ケースとケースの間に隣（`tier2a_fs_ledger_lifecycle`）が割り込める。
     let ledger = fs_ledger_exclusive();
     let cases: Vec<(&str, FsLedgerCaseFn)> = vec![
@@ -3247,8 +3247,8 @@ fn fs_passthrough_ledger_path() -> PathBuf {
 /// マシン全体で1つしか無いfs passthrough台帳を触ってよいことの証。
 /// **取得手段は[`fs_ledger_exclusive`]だけ**で、台帳を読む／書く手段はこの型のメソッドだけ。
 ///
-/// 札を持たないと呼べない形にしてあるのは、`e2e-all`が全件を並行実行するため
-/// （上の「共有資源の排他」節の4番）。札は**ケース単位ではなくテスト関数の全体**で持つ——
+/// 排他ガードを持たないと呼べない形にしてあるのは、`e2e-all`が全件を並行実行するため
+/// （上の「共有資源の排他」節の4番）。排他ガードは**ケース単位ではなくテスト関数の全体**で持つ——
 /// [`FsLedgerExclusive::entry_for`]で観測した状態は次の`harness.exe`起動まで保たれている
 /// 必要があり、1呼び出しだけを直列化しても意味が無い。
 struct FsLedgerExclusive {
@@ -3278,7 +3278,7 @@ impl FsLedgerExclusive {
     ///
     /// **台帳ファイルはread-only属性付きで書かれている**（`harness-grant-ledger`の
     /// 「誤削除防止の2層」）。素の`std::fs::write`は黙って失敗するので、本体と同じく
-    /// 解除→書込→再付与の順で触る。この3手が**分割できない**ことが、札を要求する直接の理由——
+    /// 解除→書込→再付与の順で触る。この3手が**分割できない**ことが、排他ガードを要求する直接の理由——
     /// 隣が同時に再付与すると、こちらの`write`が「アクセスが拒否されました」で落ちる。
     fn purge_entries(&self, targets: &[&Path]) {
         let path = fs_passthrough_ledger_path();
@@ -3315,7 +3315,7 @@ impl FsLedgerExclusive {
 }
 
 /// 台帳の`entries`を`(path, settings_managed, settings_workspaces)`で読み出す。
-/// **[`FsLedgerExclusive`]のメソッドからのみ呼ぶこと**（札の外から呼べる自由関数にしない）。
+/// **[`FsLedgerExclusive`]のメソッドからのみ呼ぶこと**（排他ガードの外から呼べる自由関数にしない）。
 fn read_fs_ledger_entries() -> Result<Vec<(String, bool, Vec<String>)>, String> {
     let path = fs_passthrough_ledger_path();
     let data = std::fs::read_to_string(&path)
@@ -3606,7 +3606,7 @@ fn fs_ledger_case_concurrent_startups_do_not_lose_updates(ledger: &FsLedgerExclu
 fn tier2a_fs_ledger_lifecycle() {
     // `KNOWN_TARGETS`の`e2e-fs-ledger`は「保護対象の`fs-passthrough-ledger.json`を触るため、
     // 他のE2Eと同時に走らせない」と書いているが、`e2e-all`は全件を並列で回すので**その規約は
-    // 誰にも守られていなかった**。札を取ることで規約を機構にする。
+    // 誰にも守られていなかった**。排他ガードを取ることで規約を機構にする。
     let ledger = fs_ledger_exclusive();
     let cases: Vec<(&str, FsLedgerCaseFn)> = vec![
         (

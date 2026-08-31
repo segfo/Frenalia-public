@@ -811,11 +811,11 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_diff_layer() {
 /// 書込みはworkspaceのACLでfail-closeし（transparent性の欠如のみ）、警告台帳に理由が記録されること。
 ///
 /// **[T-B] リネームの窓は`preflight`より後**である。CoWセッションの開始時に2本の版がそろって
-/// いるかを検算する関所が入ったため（`crate::tier2a::redirector_identity`）、開始前に退避すると
+/// いるかを検算するゲートが入ったため（`crate::tier2a::redirector_identity`）、開始前に退避すると
 /// `preflight`自身が拒否してこのテストの本題（孫の注入が失敗したときの振る舞い）まで到達しない。
 ///
 /// **つまりこのテストが測るのは「セッション開始後に透過役が使えなくなった場合」**であり、
-/// 「x86 DLLを一度も作っていない場合」ではない。後者は関所が起動ごと拒否するので、そちらの
+/// 「x86 DLLを一度も作っていない場合」ではない。後者はゲートが起動ごと拒否するので、そちらの
 /// 判定は`redirector_identity`の単体テストが持つ。2つは別の事象で、片方は他方を含まない。
 #[test]
 #[ignore]
@@ -830,7 +830,7 @@ fn cow_wow64_grandchild_without_x86_dll_at_injection_time_fails_closed_with_warn
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    // 関所を通す側。ここではまだ2本そろっている（そろっていなければ、そのこと自体が
+    // ゲートを通す側。ここではまだ2本そろっている（そろっていなければ、そのこと自体が
     // このテストの前提を満たさないので`expect`で落ちるのが正しい）。
     preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
 

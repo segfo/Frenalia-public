@@ -80,8 +80,8 @@ pub struct RecordManifest {
     /// 付かないため、既存サブディレクトリやcwd外への書込が**Tier1固有の理由で**拒否され、
     /// それが候補一覧へ流れ込んでいたからである（`tier0`のモジュールdoc参照）。
     ///
-    /// **したがって、この札が無い／`tier1`である古い記録は、Tier1の実装都合による拒否を
-    /// 含んでいる可能性がある。** 札を持たないと新旧の記録を見分けられず、汚れた候補を
+    /// **したがって、この`shell_tier`が無い／`tier1`である古い記録は、Tier1の実装都合による
+    /// 拒否を含んでいる可能性がある。** タグを持たないと新旧の記録を見分けられず、汚れた候補を
     /// そのまま承認しかねないので、記録側の事実として残す。
     /// 旧マニフェストは`None`＝「記録されていない」で、`tier1`と断定はしない
     /// （観測しなかったことと、値がそうだったことを混ぜない）。
@@ -120,10 +120,10 @@ pub struct RecordManifest {
     /// 進行ログは末尾しか見せない窓なので、実行が終わった時点で理由は画面からも消える。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// 失敗の種別（`no_wfp`・`not_tier2a`・`spawn`…）。**機械可読の安定した札**で、
+    /// 失敗の種別（`no_wfp`・`not_tier2a`・`spawn`…）。**機械可読の安定したタグ**で、
     /// 文面（[`Self::error`]）を変えても壊れない。綴りの正本は`RecordNetError::kind`と
     /// `RecordError::kind`で、どちらもワイルドカード無しの`match`なので
-    /// **variantを足すとビルドが落ちる**（札の付け忘れをコンパイラが捕まえる）。
+    /// **variantを足すとビルドが落ちる**（タグの付け忘れをコンパイラが捕まえる）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
     /// 実行前診断（`exec_reach`）が「このままでは起動できない」と**名指しした実行ファイル**。
@@ -383,12 +383,12 @@ mod tests {
         dir
     }
 
-    /// **Tierの札が無い古いマニフェストは`None`として読む。**
+    /// **Tierのタグが無い古いマニフェストは`None`として読む。**
     ///
     /// パス1をTier1からTier0へ移した2026-08-10より前の記録には`shell_tier`が無い。
     /// ここを`tier1`で埋めてしまうと「観測しなかった」と「Tier1だった」が混ざるので、
     /// 欠落は欠落のまま読む（`RecordManifest::shell_tier`のdoc）。
-    /// 新しい記録が札を持つことも同時に固定する——片方だけだと、
+    /// 新しい記録がタグを持つことも同時に固定する——片方だけだと、
     /// 「そもそも一度も書かれていない」状態を検出できない（B-35）。
     #[test]
     fn a_manifest_without_a_tier_tag_reads_as_unknown_not_as_tier1() {

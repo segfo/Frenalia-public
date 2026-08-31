@@ -384,7 +384,7 @@ impl VmSandboxHandle {
             }
         };
 
-        // パイプスクワッティング対策の第一関門（S-2）: 接続先が本当に正規daemonかを
+        // パイプスクワッティング対策の第一ゲート（S-2）: 接続先が本当に正規daemonかを
         // best-effortで確認する。失敗時はフォールバック再接続をしない（攻撃者にリトライの
         // 余地を与えるだけなので、ここで明示エラーを返して止める）。
         if let Err(e) = verify_pipe_server_identity(pipe, &daemon_path) {

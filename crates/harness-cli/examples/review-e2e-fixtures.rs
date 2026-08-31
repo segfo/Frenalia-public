@@ -27,7 +27,7 @@ use harness_core::{ContentBlock, Message, Role, StagingConfig, StagingMode};
 use harness_engine::SessionStore;
 use harness_sandbox::SandboxFs;
 
-/// 生成物であることの目印。既存ディレクトリを消す前にこれを確認する。
+/// 生成物であることのマーカー。既存ディレクトリを消す前にこれを確認する。
 const MARKER: &str = "REVIEW-E2E-FIXTURES.md";
 
 fn main() {
@@ -51,7 +51,7 @@ fn main() {
     println!("次に読むもの: {}", out.join(MARKER).display());
 }
 
-/// 出力先を空にする。**目印ファイルが無い既存ディレクトリは消さない**（生成器に他人の
+/// 出力先を空にする。**マーカーファイルが無い既存ディレクトリは消さない**（生成器に他人の
 /// ディレクトリを消させない）。
 fn prepare_root(out: &Path) {
     if out.exists() {
@@ -927,7 +927,7 @@ fn write_readme(
     let mut body = format!(
         "# レビュー面 手動E2Eフィクスチャ\n\n\
          `cargo run -p harness-cli --example review-e2e-fixtures -- {}`が生成したもの。\n\
-         再実行すると**この中身は作り直される**（このファイルが目印）。\n\n\
+         再実行すると**この中身は作り直される**（このファイルがマーカー）。\n\n\
          ## CoW/staged（内蔵ReviewPanelで今すぐ試せる）\n\n\
          ワークスペース: `{}`\n\n\
          **1回起動すれば、あとは`/sessions`で全シナリオを見て回れる。** 会話とレビュー対象\n\

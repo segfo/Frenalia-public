@@ -1671,7 +1671,7 @@ fn an_engine_initiated_compaction_shows_progress_without_a_command() {
 }
 
 /// 要約が0件で`ContextCompacted`が出なかった場合でも、`TurnStarted`で必ず畳む
-/// （畳まないとターン中ずっとスピナーが2本並ぶ）。記録行はターン境界の目印より**前**に置く。
+/// （畳まないとターン中ずっとスピナーが2本並ぶ）。記録行はターン境界のマーカーより**前**に置く。
 #[test]
 fn a_turn_start_closes_a_running_compaction_progress() {
     let mut app = AppState::new("p".into(), "m".into());
@@ -1690,7 +1690,7 @@ fn a_turn_start_closes_a_running_compaction_progress() {
     );
     assert_eq!(
         app.turn_transcript_mark, 1,
-        "記録行はターン境界の目印より前（この行が巻き戻しで消えてはいけない）"
+        "記録行はターン境界のマーカーより前（この行が巻き戻しで消えてはいけない）"
     );
 }
 
@@ -1718,7 +1718,7 @@ fn a_queued_command_is_not_closed_by_a_compaction_from_the_running_turn() {
 // --- BUG-079: 本文に書かれたツール呼び出し ---
 
 /// 再送するときは、画面に出てしまった本文をこの試行の開始位置まで**巻き戻す**
-/// （残すと次の試行の本文と連結して読めてしまう）。記録行はターン境界の目印より前に置く。
+/// （残すと次の試行の本文と連結して読めてしまう）。記録行はターン境界のマーカーより前に置く。
 #[test]
 fn a_retried_text_tool_call_rewinds_the_attempt_and_leaves_a_record() {
     let mut app = AppState::new("p".into(), "m".into());
@@ -1778,7 +1778,7 @@ fn an_accepted_text_tool_call_keeps_the_body() {
 
 // --- BUG-072: 会話が入れ替わったら画面も入れ替える ---
 
-/// `clear_transcript`は表示だけでなくスクロール位置・ターン境界の目印も初期化する
+/// `clear_transcript`は表示だけでなくスクロール位置・ターン境界のマーカーも初期化する
 /// （残すと、消えた行を指したまま巻き戻し先がずれる）。
 #[test]
 fn clearing_the_transcript_also_resets_scroll_and_turn_marks() {

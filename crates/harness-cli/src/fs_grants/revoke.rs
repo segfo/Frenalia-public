@@ -796,7 +796,7 @@ pub fn reconcile_fs_ledger_for_workspace(
     // 主体しか剥がれない**（実機E2Eで「台帳エントリは消えたのにACEが1本残る」として出た）。
     //
     // 走っているワークスペースの主体を巻き込まないための判定は`revoke_declaration_capabilities`
-    // が内側で持つ（分類器側の規則1と同じ、BUG-046の形を作らないための門）。
+    // が内側で持つ（分類器側の規則1と同じ、BUG-046の形を作らないためのゲート）。
     let canonical = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());

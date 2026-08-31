@@ -3215,8 +3215,9 @@ fn the_named_door_refuses_to_take_access_from_a_live_workspace() {
             .expect("grant both declaration ACEs");
     }
 
-    // **生存判定は既存の門をそのまま使う**（新しい仕組みを作らない）。この札はプロセスの
-    // 寿命で握られるので、tempdir固有のパスにしてある（他のテストと踏み合わない）。
+    // **生存判定は既存のゲートをそのまま使う**（新しい仕組みを作らない）。この名前付き
+    // ミューテックスはプロセスの寿命で握られるので、tempdir固有のパスにしてある
+    // （他のテストと踏み合わない）。
     crate::tier2a::workspace_ledger::begin_workspace_mode(&ws_live, "rwx")
         .expect("hold the live marker for ws-live");
 

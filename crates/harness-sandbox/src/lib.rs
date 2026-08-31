@@ -113,7 +113,7 @@ use cap_std::time::SystemTime;
 /// 呼び出し側を書き換えずに済むよう再エクスポートする。
 pub use harness_grant_ledger::with_named_lock;
 
-/// [D-88] 待たずに取る版と、その保持券。**取れたかどうかで進路を変えたいとき**に使う
+/// [D-88] 待たずに取る版と、そのガード。**取れたかどうかで進路を変えたいとき**に使う
 /// （workspace準備の leader 選出）。実体は同じクレートにある。
 pub use harness_grant_ledger::{try_acquire_named_lock, NamedLock};
 

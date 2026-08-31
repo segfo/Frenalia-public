@@ -200,7 +200,7 @@ pub enum AgentEvent {
     /// ファイルの中身に呼び出しの体裁が書いてあってモデルがそれを引用しただけでも成立する
     /// **プロンプトインジェクションの増幅器**になるため採らない。
     ToolCallWrittenAsText {
-        /// 検出に使った目印（`<tool_call>`等）。何を見て判定したかを隠さない。
+        /// 検出に使ったマーカー（`<tool_call>`等）。何を見て判定したかを隠さない。
         marker: String,
         /// このコールで下流へ実際に流した可視テキストのUTF-8バイト数
         /// （[`AgentEvent::TurnDiscarded`]と同じ意味。`retrying`が`true`のときだけ意味を持つ）。

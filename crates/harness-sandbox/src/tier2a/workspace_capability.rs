@@ -521,7 +521,7 @@ pub fn declaration_capability_names(
 /// [`declaration_capability_names`]との違いは発行元が付くことだけである。撤収側が
 /// 「この主体を**まだ使っているharnessが走っていないか**」を問うのに要る——主体は
 /// workspace単位で共有されるので、判定の単位もworkspaceになる
-/// （生存判定そのものは[`crate::tier2a::workspace_ledger::live_modes`]が持つ既存の門で、
+/// （生存判定そのものは[`crate::tier2a::workspace_ledger::live_modes`]が持つ既存のゲートで、
 /// ここでは持たない）。
 pub fn declaration_capability_issuers(declared_path: &Path) -> Vec<(String, String)> {
     let declaration = declaration_key(declared_path);
@@ -814,7 +814,7 @@ pub fn forget_capability(workspace: &Path, mode: &str) -> Vec<String> {
 }
 
 impl WorkspaceCapabilityEntry {
-    /// 人へ見せる1行の名札。**秘密も名前も含めない**——この文字列は
+    /// 人へ見せる1行の表示ラベル。**秘密も名前も含めない**——この文字列は
     /// [`prune_capability_entries`]の戻り値としてCLIの報告へそのまま出る。
     ///
     /// workspace本体は従来どおりworkspaceのパスだけ。宣言エントリは**どのパスの許可か**が
@@ -1250,7 +1250,7 @@ mod tests {
         assert_eq!(left.len(), 1, "the still-declared path must keep its subject: {left:?}");
         assert_eq!(left[0].declaration.as_deref(), Some(declaration_key(alive).as_str()));
 
-        // 名札は「何の許可の記録が消えたか」を出す（workspaceだけでは読み手に分からない）。
+        // 表示ラベルは「何の許可の記録が消えたか」を出す（workspaceだけでは読み手に分からない）。
         // 突合に使う`prune_target`と違い、**人へ見せる綴りは台帳に入っているまま**である。
         assert!(
             removed

@@ -105,7 +105,7 @@ pub(crate) fn injection_is_excluded_for(exe: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// **一度でも「許可を付けられなかった」ワークスペースの一覧**（掛け金）。
+/// **一度でも「許可を付けられなかった」ワークスペースの一覧**（ラッチ）。
 ///
 /// # なぜ要るのか
 ///
@@ -118,7 +118,7 @@ pub(crate) fn injection_is_excluded_for(exe: &std::path::Path) -> bool {
 /// 自動再実行を退けている。やり直すかどうかを決めるのはモデルで、こちらが用意するのは
 /// 「次は必ず通る」という保証だけである。
 ///
-/// # 掛け金は下ろしたら上げない
+/// # ラッチは倒したら戻さない
 ///
 /// 一度失敗したレーンをそのセッションで信用し直す根拠が無い。プロセスが終われば消える
 /// （次回起動では準備済みなのでそもそもレーンが要らない）。
@@ -129,7 +129,7 @@ fn distrusted() -> &'static std::sync::Mutex<std::collections::HashSet<String>> 
     DISTRUSTED.get_or_init(Default::default)
 }
 
-/// 掛け金の鍵。`grant_job`のジョブ鍵と**同じ正規化**を使う（綴りの揺れで別物にならないように）。
+/// ラッチのキー。`grant_job`のジョブ鍵と**同じ正規化**を使う（綴りの揺れで別物にならないように）。
 fn latch_key(workspace: &std::path::Path, mode: &str) -> String {
     format!(
         "{}\u{0}{mode}",
@@ -145,7 +145,7 @@ pub(crate) fn distrust_lane(workspace: &std::path::Path, mode: &str) {
         .insert(latch_key(workspace, mode));
 }
 
-/// 掛け金が下りているか（下りていれば、起動側はレーンを選ばず従来どおり待つ）。
+/// ラッチが倒れているか（倒れていれば、起動側はレーンを選ばず従来どおり待つ）。
 pub(crate) fn lane_is_distrusted(workspace: &std::path::Path, mode: &str) -> bool {
     distrusted()
         .lock()

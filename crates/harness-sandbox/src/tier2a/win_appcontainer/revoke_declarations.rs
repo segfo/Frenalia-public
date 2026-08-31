@@ -173,7 +173,7 @@ pub fn declaration_capabilities_gone_from_root(path: &Path) -> Vec<String> {
 /// 共有されるので、走っている相手から取り上げると**その場でアクセスが落ちる**——分類器側の
 /// 規則1（生きているセッションからは奪わない）とまったく同じ判断であり、
 /// [BUG-046](../../../../docs/bugs/BUG-046.md)（他人が使っているACEを純減させた事故）の形でもある。
-/// 生存判定は新しく作らず、既存の門（`workspace_ledger::live_modes`＝そのworkspaceのモード別
+/// 生存判定は新しく作らず、既存のゲート（`workspace_ledger::live_modes`＝そのworkspaceのモード別
 /// mutexが生きているか）をそのまま使う。触らなかったものは`left_alone`に理由つきで載る。
 ///
 /// # なぜ自動整合が`Some`ではなく`None`なのか（**実機で1度間違えた**）

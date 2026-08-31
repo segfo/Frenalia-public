@@ -793,7 +793,7 @@ fn apply_workspace_entry(
 /// workspace外絶対パス（`_ext`、Phase 3）エントリ1件の適用。
 ///
 /// **宛先が意図的にworkspaceの外**なので、ここだけはjailに閉じられない（`allow_ext`＝
-/// `--dangerously-allow`という別の門を通っている）。ただし**読取元はoverlayのjail経由**で、
+/// `--dangerously-allow`という別のゲートを通っている）。ただし**読取元はoverlayのjail経由**で、
 /// パスは`store::ext_key`（`..`とUNCを拒否する）が導く`_ext/<key>`だけに限る。
 fn apply_ext_entry(
     overlay: &OverlayBackend,

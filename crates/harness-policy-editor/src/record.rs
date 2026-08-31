@@ -243,7 +243,7 @@ pub enum RecordError {
 }
 
 impl RecordError {
-    /// マニフェストへ残す**機械可読の札**（パス2の`RecordNetError::kind`と対。同じ理由で
+    /// マニフェストへ残す**機械可読のタグ**（パス2の`RecordNetError::kind`と対。同じ理由で
     /// ワイルドカードを使わない）。
     pub fn kind(&self) -> &'static str {
         match self {
@@ -711,7 +711,7 @@ mod record_env_tests {
 mod error_kind_tests {
     use super::*;
 
-    /// パス2（`RecordNetError`）と**対**の固定。片方だけ札を持つ状態を作らない（B-01）。
+    /// パス2（`RecordNetError`）と**対**の固定。片方だけタグを持つ状態を作らない（B-01）。
     #[test]
     fn every_failure_gets_its_own_label() {
         let all = [

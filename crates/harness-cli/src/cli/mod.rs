@@ -248,7 +248,7 @@ pub(crate) enum Commands {
         only: Option<String>,
         /// workspace外ターゲット（例 `C:\Windows\x`）の適用を許可する。
         ///
-        /// **これはオーバーレイに溜まった変更をワークスペースの外の実FSへ出す唯一の門である。**
+        /// **これはオーバーレイに溜まった変更をワークスペースの外の実FSへ出す唯一のゲートである。**
         /// モデルが`write_file`/`edit_file`に絶対パスを渡すと、その書込は`_ext/<key>`として
         /// オーバーレイに記録される（この時点で実FSは無傷）。`harness apply`はフラグ無しなら
         /// `blocked (out-of-workspace, needs --dangerously-allow)`と出して拒否し、

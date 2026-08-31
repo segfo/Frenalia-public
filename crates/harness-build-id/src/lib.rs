@@ -41,7 +41,7 @@ const HASHED_DIRS: &[&str] = &[
 /// `Cargo.toml` も対象にする。
 const HASHED_FILES: &[&str] = &["crates/harness-redirector/Cargo.toml"];
 
-/// 刻印を DLL のバイト列から探すための目印。この後に 64 桁の 16 進と NUL が続く。
+/// 刻印を DLL のバイト列から探すためのマーカー。この後に 64 桁の 16 進と NUL が続く。
 pub const BUILD_ID_MARKER: &str = "HRBUILDID:";
 
 /// 刻印（16 進）の桁数。SHA-256 なので 64。
@@ -53,7 +53,7 @@ pub const BUILD_ID_HEX_LEN: usize = 64;
 /// バイナリへ焼き付いたままになり、「版が一致している」という判定そのものが嘘になる。
 ///
 /// 失敗したら panic する。build script が黙って既定値へ倒れると、**照合が常に通る刻印**が
-/// 焼かれることになり、関所が形だけ残って中身が死ぬ。
+/// 焼かれることになり、ゲートが形だけ残って中身が死ぬ。
 pub fn emit_and_compute() -> String {
     let root = workspace_root();
     let files = collect_files(&root);
@@ -193,7 +193,7 @@ mod tests {
     }
 
     /// 中身が 1 バイト変わったら刻印が変わる（＝古い DLL を見分けられる）。
-    /// これが成り立たないと関所が何も検出できない。
+    /// これが成り立たないとゲートが何も検出できない。
     #[test]
     fn the_id_changes_when_any_content_changes() {
         let base = vec![f("a.rs", "one"), f("b.rs", "two")];

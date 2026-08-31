@@ -104,7 +104,7 @@ fn the_gate_opens_on_output_volume() {
 }
 
 /// 出力量では拾えない故障（推論サーバのハング・デルタ停止・GPU OOM後の無応答）を
-/// 同じ門で拾うため、経過時間もORで見る。
+/// 同じゲートで拾うため、経過時間もORで見る。
 #[test]
 fn the_gate_also_opens_on_elapsed_time_alone() {
     let mut stats = Stats::default();

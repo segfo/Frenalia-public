@@ -1140,7 +1140,7 @@ fn policy_targets(policy: &NetfilterPolicy) -> Vec<PolicyTarget> {
     targets
 }
 
-/// 1つのプロファイルに対してWFPフィルタを張る（**名前検証はここが唯一の関門**）。
+/// 1つのプロファイルに対してWFPフィルタを張る（**名前検証はここが唯一のゲート**）。
 fn apply_one(
     target: &PolicyTarget,
     audit_log_path: Option<PathBuf>,
@@ -1494,7 +1494,7 @@ fn elevation_escape_hatch_present() -> bool {
 /// 連鎖起動の結末を、監査シンクへ書く1行の理由文字列にする。
 ///
 /// **純関数**にしてあるのは、実機・管理者権限なしで全分岐の文言を固定できるようにするため。
-/// 接頭辞`policy_learnd_chain_`は機械可読な目印で、調査時に`rg`で1行に絞れる。
+/// 接頭辞`policy_learnd_chain_`は機械可読なマーカーで、調査時に`rg`で1行に絞れる。
 fn chain_launch_reason(outcome: &ChainLaunchOutcome, env_present: bool) -> String {
     match outcome {
         ChainLaunchOutcome::ResolveFailed { error } => format!(

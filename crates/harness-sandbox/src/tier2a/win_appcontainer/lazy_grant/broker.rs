@@ -41,7 +41,7 @@
 //! - **接続元がこのセッションのJobに属するかを見ていない。** 見ているのは
 //!   「AppContainerの中で動いているか」までである（[`client_runs_in_an_appcontainer`]）。
 //!   Job membershipの確認にはjobハンドルをspawnから運ぶ必要があり、そこは未配線である。
-//!   **パイプのDACL（capability SID宛）が実際の関門**で、この検査はその内側の二重化である。
+//!   **パイプのDACL（capability SID宛）が実際のゲート**で、この検査はその内側の二重化である。
 //! - **合流の鍵がパスである**（設計書はvolume serial＋file IDと言っている）。別名で
 //!   来た同じ実体は合流せず、writerが2回目を「もう届いている」として省く形になる
 //!   ——**多く書くことはあっても、少なく書くことはない**。
@@ -125,7 +125,7 @@ pub(crate) struct FaultPolicy {
     /// 触ってはいけない範囲（`.harness/`等）。準備ジョブの`skip`と**同じ集合**を渡すこと
     /// ——ずれると、走査が意図的に外した場所をbrokerが付け直す（`B-05`）。
     pub(crate) skip: Vec<PathBuf>,
-    /// 掛け金を下ろすときの鍵になるモード（`"rwx"`/`"ro"`）。
+    /// ラッチを倒すときの鍵になるモード（`"rwx"`/`"ro"`）。
     /// 付与に失敗したらこのworkspace＋modeでレーンを信用しなくなる
     /// （[`super::lane_is_distrusted`]）。
     pub(crate) mode: String,
@@ -492,7 +492,7 @@ fn handle_grant(shared: &Shared, requested: &str) -> FaultResponse {
         //
         // そのコマンドはもう巻き戻せないので、せめて**次のコマンドを同じ目に遭わせない**
         // ——このworkspaceではレーンを信用するのをやめ、以降は従来どおり全walkを待つ。
-        // 掛け金を下ろすのは**こちら側の失敗**のときだけで、ポリシー拒否では下ろさない
+        // ラッチを倒すのは**こちら側の失敗**のときだけで、ポリシー拒否では倒さない
         // （範囲外を叩かれただけでレーンを畳むと、敵対的な子が簡単にレーンを殺せる）。
         Ok(Err(e)) => {
             super::distrust_lane(&shared.policy.canonical_workspace, &shared.policy.mode);
@@ -575,7 +575,7 @@ fn resolve_chain(policy: &FaultPolicy, requested: &str) -> Result<Vec<Node>, Str
 
 /// 接続してきたプロセスがAppContainerの中で動いているか。
 ///
-/// **これは関門ではなく二重化である**（関門はパイプのDACL、モジュールdoc）。
+/// **これはゲートではなく二重化である**（ゲートはパイプのDACL、モジュールdoc）。
 /// 判定できなければ**通さない側へ倒す**——見えない相手を信用する理由が無い。
 fn client_runs_in_an_appcontainer(pipe: HANDLE) -> bool {
     use windows::Win32::Security::{GetTokenInformation, TokenIsAppContainer, TOKEN_QUERY};

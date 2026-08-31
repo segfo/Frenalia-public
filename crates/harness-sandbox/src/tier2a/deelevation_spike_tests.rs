@@ -22,7 +22,7 @@
 //! `is_elevated()`を呼び、真なら[`ELEVATED_MARKER`]を含む警告をstderrへ出す。つまり
 //! **この警告の有無＝シナリオ(A)の分岐が見るのと同じ判定**である。IL（integrity level）や
 //! Administrators所属を代理指標にすると「ILは下がったが`TokenIsElevated`は真」のような
-//! 取り違えが起き得るので、代理ではなく門そのものを読む。
+//! 取り違えが起き得るので、代理ではなくゲートそのものを読む。
 //!
 //! - **正の対照（M0）**: 素の子。**警告が出なければ計器が壊れている**ので、テストごと落とす。
 //!   「警告が無い＝非昇格」を信じてよいのは、同じ計器で「警告が出る」を見た後だけである。
@@ -171,7 +171,7 @@ struct ChildFacts {
     /// **子が正常に走ったか**（stdoutに[`HELP_MARKER`]）。無言失敗を「非昇格化成功」と
     /// 読まないための対。
     ran_ok: bool,
-    /// **子が昇格していたか**（stderrに[`ELEVATED_MARKER`]）。これが測りたい門そのもの。
+    /// **子が昇格していたか**（stderrに[`ELEVATED_MARKER`]）。これが測りたいゲートそのもの。
     elevated: bool,
     integrity: String,
     admins: String,

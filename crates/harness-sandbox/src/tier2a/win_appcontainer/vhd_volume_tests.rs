@@ -171,13 +171,13 @@ fn d81_per_volume_placement() {
     std::fs::create_dir_all(workspace.join("src")).expect("検証用ワークスペースを作れること");
     std::fs::write(workspace.join("README.md"), b"d81 probe\n").expect("ファイルを置けること");
 
-    // (1) 関所が通ること。**C:と同じ扱いになるはず**（ローカルNTFS・DACL書込可）。
+    // (1) ゲートが通ること。**C:と同じ扱いになるはず**（ローカルNTFS・DACL書込可）。
     let cap = crate::win_common::volume_capability(&root);
     let gate = crate::session_scope::cow_volume_gate("workspace", &workspace, cap.clone(), &|| {
         Some(crate::win_common::can_write_dacl(&workspace))
     });
     println!("gate({}) -> {gate:?}", workspace.display());
-    assert!(gate.is_ok(), "検証用NTFSボリュームが関所を通らない: {gate:?}");
+    assert!(gate.is_ok(), "検証用NTFSボリュームがゲートを通らない: {gate:?}");
 
     // (2) 差分層の根が**そのボリュームの直下**になること（D-81の本体）。
     let chosen = crate::session_scope::cow_diff_layer_root_for_workspace(&workspace)

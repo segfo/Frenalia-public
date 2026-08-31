@@ -7,7 +7,7 @@
 //!
 //! フェーズの判別はシステムプロンプト（[`crate::prompts::system_prompt`]）の一致で行う。
 //! スキーマ強制の経路（native / ツール強制 / プロンプト埋込）によらず、どのコールでも
-//! 判別できる唯一の目印だから。
+//! 判別できる唯一のマーカーだから。
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

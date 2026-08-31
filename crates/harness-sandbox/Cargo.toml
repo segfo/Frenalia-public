@@ -15,7 +15,7 @@ harness-policy = { version = "0.1.0", path = "../harness-policy" }
 harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
 # D-NN（T-B）: Redirector DLL の版の刻印。build script が期待値を焼くのに使い、
-# 実行時は目印の綴り（`BUILD_ID_MARKER`）と桁数だけを使う。**目印を2箇所で綴らない**
+# 実行時はマーカーの綴り（`BUILD_ID_MARKER`）と桁数だけを使う。**マーカーを2箇所で綴らない**
 # ——綴りがずれると走査side が何も見つけられなくなる。
 harness-build-id = { version = "0.1.0", path = "../harness-build-id" }
 serde = { version = "1", features = ["derive"] }

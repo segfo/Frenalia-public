@@ -330,7 +330,7 @@ async fn raw_tool_output_lives_in_scratch_and_not_in_any_request() {
     assert!(stashed.contains("Command::new"), "{stashed}");
 
     // 生出力そのものを含むリクエストはDistillの1本だけ（台帳スライスには入らない）。
-    // 目印には**生出力にしか無い断片**を使う——蒸留済みclaimにも出る語（powershell等）で
+    // マーカーには**生出力にしか無い断片**を使う——蒸留済みclaimにも出る語（powershell等）で
     // 数えると、台帳スライス経由の出現を生出力と取り違える。
     let with_raw = run
         .requests
