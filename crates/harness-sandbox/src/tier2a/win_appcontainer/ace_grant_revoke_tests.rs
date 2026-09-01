@@ -2775,7 +2775,7 @@ fn preflight_grants_each_declaration_in_its_declared_scope() {
     let granted: Vec<_> = outcome
         .granted_passthrough
         .iter()
-        .map(|(p, _)| p.clone())
+        .map(|g| g.path.clone())
         .collect();
     assert!(
         granted.contains(&object_root) && granted.contains(&tree_root),

@@ -259,7 +259,7 @@ pub struct RecordNetOutcome {
     pub net_audit_log_path: PathBuf,
     pub exit_code: Option<i32>,
     pub aborted: Option<AbortReason>,
-    pub granted_passthrough: Vec<(PathBuf, bool)>,
+    pub granted_passthrough: Vec<harness_core::GrantedPassthrough>,
     pub denied_passthrough: Vec<(PathBuf, String, String)>,
     pub warnings: Vec<String>,
     pub aggregate: NetAggregate,
@@ -890,7 +890,7 @@ impl SharedNetfilter {
 struct Pass2Inner {
     exit_code: Option<i32>,
     aborted: Option<AbortReason>,
-    granted_passthrough: Vec<(PathBuf, bool)>,
+    granted_passthrough: Vec<harness_core::GrantedPassthrough>,
     denied_passthrough: Vec<(PathBuf, String, String)>,
     aggregate: NetAggregate,
     /// **強制が効いている状態で実際に拒否されたFSアクセス。** ネットワークの候補とは
@@ -1070,16 +1070,26 @@ fn run_pass2<'a>(
     // 1件あたり約550KB、668件では**約370MB**のI/Oになり数秒かかる
     // （`record_fs_passthrough_grants`のdoc）。**イベントの発火は1件ずつのまま**——
     // 見せ方と台帳の書き方は別の話である。
-    // [BUG-101] **どのSID宛に付けたか**も記録する。プロファイルが削除されるとSIDから名前は
-    // 引けなくなるので、記録しておかないと撤収側がそのACEを自分のものと判定できない。
-    let granted_sid = harness_sandbox::tier2a::win_appcontainer::current_session_grant_sid();
+    // [BUG-101/§22.3] `granted_sid`には**何も入れない**（2026-09-01）。この欄が意味するのは
+    // 「このパスへ**どのpackage SID宛に**ACEを付けたか」で、撤収側（`revoke_subjects`）は
+    // `S-1-15-2-`で始まるSIDしか列挙しないため、そこに載る資格があるのはpackage SIDだけである。
+    // 主体移行が済んだいま、`--fs-allow`の穴にpackage SID宛のACEは**1本も無い**ので、
+    // `None`＝「package SID宛には付与していない」が事実そのものになる。
+    //
+    // capability SIDをここへ書かないのは、書いても撤収側が一度も見ないうえに、
+    // package SID専用の欄へ別種を混ぜる形になるからである（`revoke_subjects`は
+    // capability SIDを混ぜないことが意図——BUG-046の再発防止）。宣言capabilityの撤収は
+    // `workspace-capability-ledger.json`の`declaration`欄を索引にした名前の付いた扉が担う。
+    //
+    // **移行前の記録は消えない**——この欄は上書きではなく積み増しである。
     let grants: Vec<_> = selection
         .granted_passthrough
         .iter()
-        .map(|(path, writable)| {
+        .map(|granted| {
+            let path = &granted.path;
             harness_sandbox::tier2a::fs_passthrough_ledger::FsPassthroughGrantRecord {
                 path: path.clone(),
-                writable: *writable,
+                writable: granted.writable,
                 forced: passthrough
                     .iter()
                     .find(|fp| &fp.path == path)
@@ -1093,7 +1103,7 @@ fn run_pass2<'a>(
                     .unwrap_or(harness_policy::GrantScope::Recursive),
                 // policy.json由来はsettings.jsonの参照カウントに載せない。
                 settings_workspace: None,
-                granted_sid: granted_sid.clone(),
+                granted_sid: None,
             }
         })
         .collect();
@@ -1102,10 +1112,10 @@ fn run_pass2<'a>(
     // `preflight`が既にcapability台帳へ書いており（`declaration`欄）、撤収側は
     // `declared_paths_for_workspace`でそこから引く。2つ目の索引を作ると、
     // 片方だけ更新される形（＝この欠陥そのもの）へ戻る。
-    for (path, writable) in &selection.granted_passthrough {
+    for granted in &selection.granted_passthrough {
         on_event(NetRecordEvent::PassthroughGranted {
-            path: path.clone(),
-            writable: *writable,
+            path: granted.path.clone(),
+            writable: granted.writable,
         });
     }
     // **付けられなかった穴は必ず見せる。** パス2が途中で落ちる原因はほぼこれである。

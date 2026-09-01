@@ -44,7 +44,7 @@ pub(crate) async fn run_isolated(
     vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
     workspace_root: &Path,
     cow_diff_layer_dir: Option<&Path>,
-    granted_passthrough: &[(std::path::PathBuf, bool)],
+    granted_passthrough: &[harness_core::GrantedPassthrough],
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     // Tier2a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
     // 「このTierでは無効」と明記する、`call`参照）。
@@ -208,7 +208,7 @@ async fn run_windows_tier2a(
     net_domain_policy_requested: bool,
     workspace_root: &Path,
     cow_diff_layer_dir: Option<&Path>,
-    granted_passthrough: &[(std::path::PathBuf, bool)],
+    granted_passthrough: &[harness_core::GrantedPassthrough],
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let mut env_owned = env.to_vec();
     // BUG-050: コマンド本体はstdinスクリプトへ文字列として埋め込まず、env経由で渡す

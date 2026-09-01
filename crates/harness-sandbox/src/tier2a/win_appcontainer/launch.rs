@@ -55,10 +55,13 @@ pub struct WorkspaceSpawn {
     /// `--sandbox tier2a-cow`（D-30）のdiff_layer_dir。`Some`のときだけRedirector DLLを注入し、
     /// workspaceモードは`"ro"`になる。
     pub cow_diff_layer_dir: Option<PathBuf>,
-    /// `preflight`が**実際にACEを付けられた**passthroughルート（`(path, writable)`）。
+    /// `preflight`が**実際にACEを付けられた**passthroughルート。
     /// `--sandbox tier2a-cow`時、このうち書込可のものがRedirector DLLのext capture対象になる（設計書§19.8）。
     /// 境界＝ACLはfs-allowが既に張っているので、ここは変更の可視化のためのcaptureである。
-    pub granted_passthrough: Vec<(PathBuf, bool)>,
+    ///
+    /// [§22.3] 各要素は**その穴のACEを実際に書いた宛先SID**を持つ。子のトークンへ積むのはそれで、
+    /// ここで導出し直さない（導出し直すと、CoWでアクセス級が降格したときに別のSIDを作る）。
+    pub granted_passthrough: Vec<harness_core::GrantedPassthrough>,
     /// 子へ与えるnetwork capability。**判断は呼び出し元が行う**（モジュールdoc参照）。
     pub net_capability: NetworkCapability,
 }
@@ -73,6 +76,52 @@ impl WorkspaceSpawn {
             "rwx"
         }
     }
+}
+
+/// [§22.3] `--fs-allow`で開いた穴の分として、子のトークンへ積むcapability SIDを決める。
+///
+/// 穴のACEはもうこのセッションのpackage SID宛ではなく、**宣言ごとのcapability SID宛**である
+/// ——積まなければ、`preflight`が正しく付与していても子からは1バイトも読めない
+/// （`ACCESS_DENIED`）。
+///
+/// # 宣言と1対1である（2026-09-01、分流N1）
+///
+/// 積むのは**`preflight`がその穴のACEを実際に書いた宛先SIDそのもの**で、ここで導出も推測も
+/// しない。宛先SIDは`(秘密, 畳み込み済みパス, access級)`から決まるので、**級を取り違えると
+/// 別のSIDになり、症状は「ACEは正しいのに子から一切読めない」という最も分かりにくい形**に
+/// なる（`--sandbox tier2a-cow`は`read_write`を`read`へ降格するため、ユーザーが要求した級から
+/// 導出すると実際に外れる）。運ばれてきた値を使えば外れようがない。
+///
+/// 対象は**実際にACEが付いた穴**だけである（`granted_passthrough`がそう定義されている）。
+/// 付けられなかったパスのcapability SIDまで積むと、宣言していないものをトークンへ載せる形になる。
+///
+/// **かつてはここで台帳をパスで引いていた**（`fs_allow_capability_sids`）。台帳は
+/// 「このworkspaceがこのパスへ発行したcapability SID」を**全部**返すので、過去に別のaccess級で
+/// 発行したものも一緒に載り、**宣言より広かった**。その広さがこの関数で消える。
+///
+/// # 関数として切り出してある理由
+///
+/// 「何を積むか」を**起こす副作用を持たずに測れる**ようにするため。この決定が
+/// `spawn_shell_in_workspace`の中に埋まっていると、確かめる手段が実プロセスの起動しか無くなる。
+fn declaration_caps(
+    granted: &[harness_core::GrantedPassthrough],
+) -> Vec<crate::win_common::OwnedSid> {
+    let mut caps = Vec::with_capacity(granted.len());
+    for entry in granted {
+        match crate::win_common::sid_from_string(&entry.subject_sid) {
+            Ok(sid) => caps.push(sid),
+            // **黙って落とさない**（`B-09`/`B-10`）。ここで落ちた穴は、ACEは付いているのに
+            // 子がその宛先SIDを持たないので`ACCESS_DENIED`になる——fail-closedだが、
+            // 原因はACL側ではなくトークン側にあるので、言わないと追えない。
+            Err(e) => eprintln!(
+                "warning: could not use the capability SID recorded for {} ({}): {e}; \
+                 the sandboxed child will not be able to reach this path",
+                entry.path.display(),
+                entry.subject_sid
+            ),
+        }
+    }
+    caps
 }
 
 /// Tier2aでシェルを起こす。戻り値は`(子プロセス, シェルのラベル)`。
@@ -95,8 +144,8 @@ pub fn spawn_shell_in_workspace(
     let ext_capture_roots: Vec<PathBuf> = req
         .granted_passthrough
         .iter()
-        .filter(|(_, writable)| *writable)
-        .map(|(path, _)| path.clone())
+        .filter(|g| g.writable)
+        .map(|g| g.path.clone())
         .collect();
     let cow = req.cow_diff_layer_dir.as_ref().map(|diff_layer_dir| CowInject {
         workspace_root: &req.workspace_root,
@@ -114,41 +163,8 @@ pub fn spawn_shell_in_workspace(
     let workspace_cap =
         super::workspace_capability_sid(&canonical_workspace, req.workspace_mode())?;
 
-    // [§22.3] `--fs-allow`で開いた穴のcapability SIDも積む。**穴のACEはもうこのセッションのpackage SID
-    // 宛ではなく、宣言ごとのcapability SID宛である**——積まなければ、preflightが正しく
-    // 付与していても子からは1バイトも読めない（`ACCESS_DENIED`）。
-    //
-    // 宛先SIDは`preflight`が付与に使ったのと**同じ導出**（`fs_allow_capability_sid`）から
-    // 引き直す。モジュールdocが「宛先SIDの導出規則を`preflight`と共有していなければならない」と
-    // 言っているのは、まさにこの種のずれが「付与されていない宛先SIDで起動して全アクセスが
-    // 拒否される」形で出るからである。
-    //
-    // 引くのは**実際にACEが付いた穴**（`granted_passthrough`）だけにする。付けられなかった
-    // パスのcapability SIDまで積むと、宣言していないものをトークンへ載せる形になる。
-    //
-    // # ここは近似である（T1-cで厳密化する）
-    //
-    // 宛先SIDは`(秘密, 畳み込み済みパス, access級)`から決まるのに、`granted_passthrough`が
-    // 運んでいるのは`writable`という**2値**でしかない。`FsAccess`は4値（`read`/`read_write`/
-    // `read_exec`/`read_write_exec`）あるので、**boolからaccess級を復元すると別の宛先SIDを
-    // 導出し得る**——そして外れたときの症状は「ACEは正しいのに子から一切読めない」という
-    // 最も分かりにくい形になる。だから**復元しない**。
-    //
-    // 代わりに台帳の索引を引く（`declaration_capability_names`）。これは
-    // 「**このworkspaceがこのパスに対して発行したcapability SID**」を返すので、access級を推測せずに
-    // 済む。近似なのは、同じパスへ複数のaccess級を発行済みのとき全部を積む点である
-    // （このworkspace自身が宣言したものに限られるので他所へは広がらないが、
-    // §22.3.0.2の条件2をこの子について厳密にはしていない）。
-    //
-    // 厳密化には`preflight`が返す`granted_subjects`（`(path, SID文字列)`）を
-    // `ShellTierSelection`経由でここまで運ぶ必要があり、それはT1-cの担当である。
-    let fs_allow_caps: Vec<crate::win_common::OwnedSid> = req
-        .granted_passthrough
-        .iter()
-        .flat_map(|(path, _)| {
-            super::fs_allow_capability_sids(path, Some(&canonical_workspace))
-        })
-        .collect();
+    // [§22.3] `--fs-allow`で開いた穴のcapability SIDも積む（`declaration_caps`のdoc参照）。
+    let fs_allow_caps = declaration_caps(&req.granted_passthrough);
     // [§22.3.2] CoWの差分層のcapability SIDも積む。**差分層のACEはもうこのセッションのpackage SID宛では
     // なく、差分層ごとのcapability SID宛である**——積まなければ、Redirector DLLが退避しようと
     // した書込がすべて`ACCESS_DENIED`になり、CoWが丸ごと機能しない（DLLは子の中で動くので、
@@ -296,8 +312,16 @@ mod tests {
             workspace_root: PathBuf::from(r"C:\ws"),
             cow_diff_layer_dir: None,
             granted_passthrough: vec![
-                (PathBuf::from(r"C:\ro"), false),
-                (PathBuf::from(r"C:\rw"), true),
+                harness_core::GrantedPassthrough {
+                    path: PathBuf::from(r"C:\ro"),
+                    writable: false,
+                    subject_sid: "S-1-15-3-1024-1".to_string(),
+                },
+                harness_core::GrantedPassthrough {
+                    path: PathBuf::from(r"C:\rw"),
+                    writable: true,
+                    subject_sid: "S-1-15-3-1024-2".to_string(),
+                },
             ],
             net_capability: NetworkCapability::Deny,
         };
@@ -305,10 +329,83 @@ mod tests {
         let roots: Vec<PathBuf> = req
             .granted_passthrough
             .iter()
-            .filter(|(_, writable)| *writable)
-            .map(|(path, _)| path.clone())
+            .filter(|g| g.writable)
+            .map(|g| g.path.clone())
             .collect();
 
         assert_eq!(roots, vec![PathBuf::from(r"C:\rw")]);
+    }
+
+    /// [分流N1] **積むcapability SIDは、運ばれてきたものと1対1である。**
+    ///
+    /// 壊れた状態は「宣言していない級のcapability SIDまで積む」こと。かつてここは台帳を
+    /// パスで引いており、同じパスへ過去に別の級で発行した分も一緒に載っていた。
+    /// **この関数が台帳を一切見ないこと**が、その広さが戻らない根拠である。
+    ///
+    /// 台帳を見ないことをどう測るか——`granted`に載っていないパスの分は、たとえ実マシンの
+    /// 台帳に在っても出てこない。ここでは実在しないパス2件を渡し、**出てくるのがその2件分
+    /// ちょうど**であることを見る（台帳を引いていれば0件になるか、無関係な分が混ざる）。
+    #[test]
+    fn declaration_caps_carries_exactly_what_preflight_handed_over() {
+        // 実在するcapability SIDの綴り。値そのものに意味は無く、**互いに違うこと**だけが要る。
+        let a = "S-1-15-3-1024-1065365936-1281604716-3511738428-1654721687-432734479-\
+                 3232135806-4053264122-3456934681";
+        let b = "S-1-15-3-1024-3153509613-960666767-3724611135-2725662640-12138253-\
+                 543910227-1950414635-4190290187";
+        let granted = vec![
+            harness_core::GrantedPassthrough {
+                path: PathBuf::from(r"C:\does-not-exist-a"),
+                writable: false,
+                subject_sid: a.to_string(),
+            },
+            harness_core::GrantedPassthrough {
+                path: PathBuf::from(r"C:\does-not-exist-b"),
+                writable: true,
+                subject_sid: b.to_string(),
+            },
+        ];
+
+        let caps = declaration_caps(&granted);
+        let rendered: Vec<String> = caps
+            .iter()
+            .map(|c| {
+                crate::win_common::sid_to_string(c.as_psid()).expect("render the capability SID")
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![a.to_string(), b.to_string()],
+            "the caps piled onto the child must be exactly the ones preflight handed over, in order"
+        );
+    }
+
+    /// 綴りが壊れていても**落ちない**——その穴だけが積まれず、他は積まれる。
+    ///
+    /// 倒れる向きはfail-closed（積まれない子はそのパスへ届かない）。**黙らせないこと**は
+    /// `declaration_caps`のdocが述べているとおりで、ここでは「1件壊れても残りが生きる」ことだけを見る。
+    #[test]
+    fn a_malformed_subject_sid_drops_only_its_own_entry() {
+        let good = "S-1-15-3-1024-1065365936-1281604716-3511738428-1654721687-432734479-\
+                    3232135806-4053264122-3456934681";
+        let granted = vec![
+            harness_core::GrantedPassthrough {
+                path: PathBuf::from(r"C:\broken"),
+                writable: false,
+                subject_sid: "not-a-sid".to_string(),
+            },
+            harness_core::GrantedPassthrough {
+                path: PathBuf::from(r"C:\fine"),
+                writable: false,
+                subject_sid: good.to_string(),
+            },
+        ];
+
+        let caps = declaration_caps(&granted);
+        assert_eq!(caps.len(), 1, "only the malformed entry may be dropped");
+        assert_eq!(
+            crate::win_common::sid_to_string(caps[0].as_psid()).expect("render"),
+            good,
+            "the surviving cap must be the well-formed one"
+        );
     }
 }

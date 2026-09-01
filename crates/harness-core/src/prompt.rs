@@ -396,8 +396,12 @@ fn render_shell_tier(shell_tier: &ShellTierSelection) -> Vec<String> {
 /// `--sandbox tier2a-cow`下では`:rw`の実ACLが`Read`へ降格される（P-03、BUG-044）が、その事実は
 /// [`render_cow`]が「ワークスペース本体はread-only、書込は透過リダイレクト、境界はACL」として
 /// 既に述べているので、ここで重複させない。
+///
+/// [§22.3] 各要素は宛先SIDも持つが、**それはモデルへ出さない**——モデルから見える制約は
+/// 「どのパスへ、読みだけか読み書きか」であって、その許可がどのSID宛に書かれているかは
+/// 実装の内側である（`EnvironmentFacts`を更新しないのはこのため）。
 fn render_passthrough(
-    granted: &[(PathBuf, bool)],
+    granted: &[crate::tool::GrantedPassthrough],
     denied: &[(PathBuf, String, String)],
 ) -> Vec<String> {
     if granted.is_empty() && denied.is_empty() {
@@ -407,11 +411,11 @@ fn render_passthrough(
     if !granted.is_empty() {
         let entries: Vec<String> = granted
             .iter()
-            .map(|(path, writable)| {
+            .map(|g| {
                 format!(
                     "{}（{}）",
-                    path.display(),
-                    if *writable {
+                    g.path.display(),
+                    if g.writable {
                         "読み書き"
                     } else {
                         "読取のみ"
@@ -892,8 +896,16 @@ mod tests {
         let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
         ctx.shell_tier =
             ShellTierSelection::direct(ShellTier::Tier2a).with_granted_passthrough(vec![
-                (PathBuf::from(r"C:\tools"), false),
-                (PathBuf::from(r"D:\data"), true),
+                crate::tool::GrantedPassthrough {
+                    path: PathBuf::from(r"C:\tools"),
+                    writable: false,
+                    subject_sid: "S-1-15-3-1024-1".to_string(),
+                },
+                crate::tool::GrantedPassthrough {
+                    path: PathBuf::from(r"D:\data"),
+                    writable: true,
+                    subject_sid: "S-1-15-3-1024-2".to_string(),
+                },
             ]);
 
         let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));

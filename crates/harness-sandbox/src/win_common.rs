@@ -169,6 +169,29 @@ pub(crate) fn sid_to_string(sid: windows::Win32::Security::PSID) -> windows::cor
     }
 }
 
+/// [`sid_to_string`]の**対**。SIDの文字列表現（`S-1-15-3-…`）から[`OwnedSid`]を作る。
+///
+/// # なぜ対で置くのか
+///
+/// [§22.3] `preflight`が導出した宛先SIDを、子を起こす側まで**文字列として**運んでいる
+/// （途中に`harness-core`という、Windowsの型を1つも知らないクレートが挟まるため）。
+/// 運んだ先で使うには戻す口が要る。**同じ変換の行きと帰りは同じ場所に置く**——
+/// 片方だけを別の場所に書くと、対であることが読んだだけでは分からなくなる。
+///
+/// `ConvertStringSidToSidW`が確保した領域は`LocalFree`で返す必要があるので、
+/// [`OwnedSid`]へ複製してからその場で解放する（呼び出し元へ解放責任を持ち出さない）。
+pub(crate) fn sid_from_string(sid_str: &str) -> windows::core::Result<OwnedSid> {
+    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+    let wide: Vec<u16> = sid_str.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let mut psid = windows::Win32::Security::PSID::default();
+        ConvertStringSidToSidW(windows::core::PCWSTR(wide.as_ptr()), &mut psid)?;
+        let owned = OwnedSid::copy_from(psid);
+        let _ = LocalFree(HLOCAL(psid.0 as *mut _));
+        owned
+    }
+}
+
 /// `CreatePipe`の`bInheritHandle=TRUE`は両端を継承可能にする。子へ渡さない側（親が保持し続ける側）
 /// を継承不可へ戻さないと、子が余分な複製ハンドルを継承してしまい、親が閉じてもEOFにならず
 /// 子が永久にハングする（BUG-004、MSDN「Creating a Child Process with Redirected Input and

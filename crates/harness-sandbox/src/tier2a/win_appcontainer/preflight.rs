@@ -10,7 +10,7 @@ use crate::tier2a::workspace_ledger::WorkspaceMode;
 
 /// `preflight`の戻り値。`warnings`はD8の到達不能診断（従来どおり）、`granted_passthrough`は
 /// **実際にACEが付与された（既存で十分だった場合・部分的にしか適用できなかった場合を含む）**
-/// passthroughルートの一覧（`(path, writable)`）。呼び出し側（`harness-cli`の台帳記録）は
+/// passthroughルートの一覧。呼び出し側（`harness-cli`の台帳記録）は
 /// この一覧だけを台帳へ書くことで、「幻の台帳エントリ」（実際には`ACCESS_DENIED`で失敗した
 /// のに記録だけ残る）を防ぐ。逆に、rootへのACE付与自体は成功したが子孫の一部
 /// （TrustedInstaller所有等）で失敗した「部分適用」ケースは、`sid_ace_mask`でrootを権威的に
@@ -20,16 +20,14 @@ use crate::tier2a::workspace_ledger::WorkspaceMode;
 pub struct PreflightOutcome {
     pub warnings: Vec<String>,
     pub denied_passthrough: Vec<(std::path::PathBuf, String, String)>,
-    pub granted_passthrough: Vec<(std::path::PathBuf, bool)>,
-    /// [§22.3] `granted_passthrough`の各パスを**どのSID宛に開いたか**（`(path, SID文字列)`）。
+    /// [§22.3] 開いた穴の一覧。各要素は**その穴のACEを実際に書いた宛先SID**を持つ
+    /// （[`harness_core::GrantedPassthrough`]）。
     ///
-    /// 呼び出し元はこれを`fs-passthrough-ledger`へ記録し、撤収側が名指しで剥がせるようにする
-    /// （BUG-101が`granted_sids`を作ったのと同じ目的）。**セッションに1つではなくパスごとに
-    /// 違う**——宛先SIDが宣言ごとのcapability SIDになったので、呼び出し元が
-    /// `current_session_grant_sid()`から1つ取って全件へ配る形はもう正しくない。
-    ///
-    /// 付与に失敗したパスは載らない（載せると「幻の宛先SID」を記録することになる）。
-    pub granted_subjects: Vec<(std::path::PathBuf, String)>,
+    /// かつてここは`Vec<(PathBuf, bool)>`と、別立ての`granted_subjects: Vec<(PathBuf, SID文字列)>`の
+    /// **2本のリスト**だった。1本に畳んだのは、**2本が1対1ではなかった**からである——
+    /// 昇格ヘルパー経由の付与では、パス側は無条件に、宛先SID側は導出できたときだけ積まれていた。
+    /// 畳んだことで「宛先SIDの無い行」が型の上で表現できなくなり、起動側に逃げ道が要らなくなった。
+    pub granted_passthrough: Vec<harness_core::GrantedPassthrough>,
     /// `preflight`が特権分離ヘルパーへ`GrantFsAllow`を委譲する経路を実際に通り、その際
     /// `wfp_chain_pipe`が`Some`だったため「処理完了後に`harness-netfilterd`を連鎖起動してほしい」
     /// という指示を実際に添えたかどうか（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D
@@ -50,6 +48,31 @@ pub struct PreflightOutcome {
 
 /// `preflight`のfs-allow昇格結果（`granted`パス一覧、`(path, reason)`失敗一覧）。
 type FsAllowElevationOutcome = (Vec<std::path::PathBuf>, Vec<(std::path::PathBuf, String)>);
+
+/// [§22.3] 昇格ヘルパーへ回す宣言1件と、**その宣言の宛先SID**を1つの値で持つ。
+///
+/// # なぜ電文（[`crate::tier2a::privhelper::FsAllowGrant`]）に足さないのか
+///
+/// 電文へ載せるのは**秘密**であって宛先SIDではない（§22.3.1の却下表）——昇格側は自分で
+/// 畳み込んだパスから導出するので、SIDを渡してもその宛先SIDを呼び出し元が正当に持つかは
+/// 判定できない。ここで持つのは**こちら側が既に導出した値**であり、電文の形は変えない。
+///
+/// # なぜ持ち回すのか
+///
+/// 宛先SIDはこのエントリを昇格へ回す**前に**導出済みで、導出に失敗した宣言はそもそも
+/// ここへ到達しない（穴を開けずに`continue`する）。かつては昇格から戻った後に
+/// `fs_allow_capability_sid`をもう一度呼んで引き直しており、**同じ値を作る場所が
+/// 2箇所**あった。引き直しが失敗した行だけ宛先SIDを持たないまま「開いた穴」に数えられ、
+/// その行のパスは子から一切読めなくなる（トークンにその宛先SIDが載らないため）。
+struct PendingElevation {
+    /// 昇格ヘルパーへ送る電文そのもの。
+    grant: crate::tier2a::privhelper::FsAllowGrant,
+    /// この宣言の宛先SID。子のトークンへ積むのも、台帳へ記録するのもこれ。
+    subject: crate::win_common::OwnedSid,
+    /// [`Self::subject`]の文字列表現。`sid_to_string`は失敗し得るので、
+    /// **穴を開ける前に**1回だけ作って持ち回す。
+    subject_sid: String,
+}
 
 /// [BUG-101] **付与したACEが台帳に載っているか**を、`preflight`をどう抜けても必ず測るガード。
 ///
@@ -358,22 +381,17 @@ pub fn preflight_with_privhelper_launcher(
     // ACEを付け得る全区間」だからである（`SessionGrantAudit`のdoc）。
     let audit_guard = SessionGrantAudit::arm(&profile_name);
     let sid = ensure_profile(&profile_name)?;
-    // [BUG-101/B-05] 台帳へ「どのSID宛に付与したか」を書くのは**呼び出し元**（`run_agent`と
-    // ポリシーエディタのパス2）で、あちらは`current_session_grant_sid()`から値を取る。
-    // ここで実際に使う宛先SIDとずれると、撤収側は「台帳に記録が無いACE」を見ることになり、
-    // 名前を失った時点で剥がせなくなる。**ずれを無言にしない**ため、その場で検算する。
-    if let (Ok(actual), Some(recorded)) = (
-        crate::win_common::sid_to_string(sid.as_psid()),
-        current_session_grant_sid(),
-    ) {
-        if actual != recorded {
-            eprintln!(
-                "warning: the SID this session grants with ({actual}) differs from the one the \
-                 ledger will record ({recorded}); revoking these ACEs by record will not work \
-                 (see docs/bugs/BUG-101.md)"
-            );
-        }
-    }
+    // [§22.3・BUG-101] **ここにあった検算は2026-09-01に削除した。**
+    //
+    // かつては「台帳へ書く宛先SID（呼び出し元が`current_session_grant_sid()`から取る値）」と
+    // 「この起動が実際に使う宛先SID」の一致を確かめていた。**その前提が消えた**——
+    // `--fs-allow`の穴の宛先SIDは宣言ごとのcapability SIDへ移り、呼び出し元は
+    // セッションのpackage SIDを台帳へ書かなくなったので、**比べる相手が居ない**。
+    // 残しても常に一致し、何も検出しないまま「検算があるから守られている」と読ませる。
+    //
+    // **移行の本当の不変条件はこの関数の末尾が測っている**（`§22.3.0 migration invariant`）——
+    // 開いた穴に**セッションpackage SID宛のACEが1本も残っていない**ことを、台帳ではなく
+    // 実DACLを読んで確かめる。網はそちらに在る。
     timing.mark("begin_session + ensure_profile");
     sweep_stale_redirector_dll_aces();
     timing.mark("sweep_stale_redirector_dll_aces");
@@ -730,11 +748,11 @@ pub fn preflight_with_privhelper_launcher(
         }
     }
     let mut denied_passthrough: Vec<(std::path::PathBuf, String, String)> = Vec::new();
-    let mut granted_passthrough: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    let mut granted_passthrough: Vec<harness_core::GrantedPassthrough> = Vec::new();
     // 本体プロセス内（非管理者）でACCESS_DENIEDになったエントリ（システム保護パス等）だけを
     // ここへ集め、後段で1回の特権分離ヘルパー要求へまとめる（起動あたりUAC最大1回、
     // `TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」の決定）。
-    let mut needs_elevation: Vec<crate::tier2a::privhelper::FsAllowGrant> = Vec::new();
+    let mut needs_elevation: Vec<PendingElevation> = Vec::new();
     let mut netfilterd_chain_attempted = false;
     // 到達性プローブ（D8）の対象。**ここでは測らず、全ての付与が終わってから1プロセスで
     // まとめて測る**（`probe_passthrough_batch`）。理由は2つ:
@@ -766,7 +784,6 @@ pub fn preflight_with_privhelper_launcher(
     //    セッションに1つではなく**パスごとに違う**ので、呼び出し元が
     //    `current_session_grant_sid()`から1つ取る形はもう成立しない。
     let mut fs_allow_caps: Vec<crate::win_common::OwnedSid> = Vec::new();
-    let mut granted_subjects: Vec<(std::path::PathBuf, String)> = Vec::new();
 
     // 付与フェーズの進捗をUIへ見せる（`passthrough_progress`のdoc参照）。この区間は
     // 数百件になり得るので、**何件目かが見えないと「固まった」と読まれる**。
@@ -924,28 +941,48 @@ pub fn preflight_with_privhelper_launcher(
         // [§22.3] **宛先SIDはこの穴を開けるどの経路でも同じものを使う。** 既に足りていた／
         // いま書いた／昇格へ回した、のどれを通っても子のトークンへ積む集合と台帳へ記録する
         // 宛先SIDは変わらない——3つの入口のうち1つだけ違う宛先SIDになる形を作らない（B-02）。
-        let remember_subject = |caps: &mut Vec<crate::win_common::OwnedSid>,
-                                    subjects: &mut Vec<(std::path::PathBuf, String)>| {
+        //
+        // **宛先SIDの文字列は先に1回だけ作る。** ここで失敗するなら穴を開けない——
+        // 開いてしまうと「ACEは書いたが、それがどのSID宛かを誰も知らない」＝撤収経路の
+        // 無いACEになる（BUG-101と同じ形）。かつては文字列化の失敗を`if let Ok`で
+        // 黙って読み飛ばしており、その行だけ宛先SIDを持たないまま「開いた穴」に数えられていた。
+        let entry_cap_text = match crate::win_common::sid_to_string(entry_cap.as_psid()) {
+            Ok(text) => text,
+            Err(e) => {
+                let reason =
+                    format!("could not render the capability SID for this declaration: {e}");
+                warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
+                denied_passthrough.push((
+                    fp.path.clone(),
+                    fp.access.label().to_string(),
+                    reason,
+                ));
+                continue;
+            }
+        };
+        let remember_subject = |caps: &mut Vec<crate::win_common::OwnedSid>| {
             if let Ok(copy) = unsafe { crate::win_common::OwnedSid::copy_from(entry_cap.as_psid()) }
             {
                 caps.push(copy);
             }
-            if let Ok(text) = crate::win_common::sid_to_string(entry_cap.as_psid()) {
-                subjects.push((fp.path.clone(), text));
-            }
+        };
+        let granted_entry = |writable: bool| harness_core::GrantedPassthrough {
+            path: fp.path.clone(),
+            writable,
+            subject_sid: entry_cap_text.clone(),
         };
 
         if already_sufficient {
             // **Win32を1回も呼んでいない**ことを数える。ここが2回目以降で総数に一致する
             // ことが「差分適用になっている」の証拠になる（`passthrough_progress`のdoc）。
             progress.record_already_sufficient();
-            granted_passthrough.push((fp.path.clone(), requested_rw));
+            granted_passthrough.push(granted_entry(requested_rw));
             // [§22.3] 付与を**スキップした**場合も「開いた穴」として数える——ACEを実際に
             // 書いたのが前のセッションでも、いまこの穴は開いている（BUG-057が
             // session ledgerについて言っていたのと同じ理由で、検算の対象から外さない）。
-            // どのSID宛に付いているかは`granted_subjects`が運ぶ。
+            // どのSID宛に付いているかは`granted_passthrough`の各要素が運ぶ。
             fs_allow_opened_paths.push(fp.path.clone());
-            remember_subject(&mut fs_allow_caps, &mut granted_subjects);
+            remember_subject(&mut fs_allow_caps);
             probe_targets.push(fp.clone());
             continue;
         }
@@ -958,9 +995,9 @@ pub fn preflight_with_privhelper_launcher(
             Ok(()) => {
                 // 実際にACEを書いた1件。
                 progress.record_granted();
-                granted_passthrough.push((fp.path.clone(), requested_rw));
+                granted_passthrough.push(granted_entry(requested_rw));
                 fs_allow_opened_paths.push(fp.path.clone());
-                remember_subject(&mut fs_allow_caps, &mut granted_subjects);
+                remember_subject(&mut fs_allow_caps);
                 probe_targets.push(fp.clone());
             }
             Err(_) => {
@@ -1006,13 +1043,36 @@ pub fn preflight_with_privhelper_launcher(
                         continue;
                     }
                 };
-                needs_elevation.push(crate::tier2a::privhelper::FsAllowGrant {
-                    path: fp.path.clone(),
-                    access: fp.access,
-                    forced: fp.forced,
-                    // [D-63] 昇格へ回しても宣言の範囲は変わらない。
-                    scope: fp.scope,
-                    secret_hex,
+                // [§22.3] **導出済みの宛先SIDを一緒に持たせる。** 昇格から戻った後に
+                // 引き直さないための唯一の手段で、引き直しをやめたことで
+                // 「宛先SIDの無い開いた穴」が構造的に作れなくなる。
+                let subject =
+                    match unsafe { crate::win_common::OwnedSid::copy_from(entry_cap.as_psid()) } {
+                        Ok(copy) => copy,
+                        Err(e) => {
+                            let reason = format!(
+                                "could not copy the capability SID for this declaration: {e}"
+                            );
+                            warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
+                            denied_passthrough.push((
+                                fp.path.clone(),
+                                fp.access.label().to_string(),
+                                reason,
+                            ));
+                            continue;
+                        }
+                    };
+                needs_elevation.push(PendingElevation {
+                    grant: crate::tier2a::privhelper::FsAllowGrant {
+                        path: fp.path.clone(),
+                        access: fp.access,
+                        forced: fp.forced,
+                        // [D-63] 昇格へ回しても宣言の範囲は変わらない。
+                        scope: fp.scope,
+                        secret_hex,
+                    },
+                    subject,
+                    subject_sid: entry_cap_text.clone(),
                 });
             }
         }
@@ -1040,44 +1100,37 @@ pub fn preflight_with_privhelper_launcher(
                 let mut granted = Vec::new();
                 let mut failures = Vec::new();
                 for entry in &needs_elevation {
+                    let grant = &entry.grant;
                     // forcedは書込前に絶対拒否ゲートを通し、通過分のみ`SeRestorePrivilege`下で付与する
                     // （dispatch側と同じ防壁。本体が既に管理者の経路でも同一の不変条件を保つ）。
-                    if entry.forced {
-                        if let Some(reason) = is_force_grant_forbidden(&entry.path) {
-                            failures.push((entry.path.clone(), reason));
+                    if grant.forced {
+                        if let Some(reason) = is_force_grant_forbidden(&grant.path) {
+                            failures.push((grant.path.clone(), reason));
                             continue;
                         }
                     }
-                    // [§22.3] 宛先SIDは本体内の付与と**同じ導出**を通す（`fs_allow_capability_sid`は
-                    // 台帳を読み直すだけで冪等）。ここだけ別の宛先SIDにすると、同じ宣言なのに
-                    // 「システム保護パスに在るかどうか」で開く相手が変わる。
-                    let entry_cap = match fs_allow_capability_sid(
-                        &canonical_workspace_root,
-                        &entry.path,
-                        entry.access,
-                    ) {
-                        Ok(cap) => cap,
-                        Err(e) => {
-                            failures.push((
-                                entry.path.clone(),
-                                format!("could not derive the capability for this declaration: {e}"),
-                            ));
-                            continue;
-                        }
-                    };
+                    // [§22.3] 宛先SIDは**本体内の付与が導出したものそのもの**である。
+                    // ここで導出し直していたのを2026-09-01にやめた——同じ値を作る場所が2箇所
+                    // あると、同じ宣言なのに「システム保護パスに在るかどうか」で開く相手が
+                    // 変わり得る形が残る。
                     // [D-63] 本体が既に管理者の直接付与も**同じスコープ分岐を通る**
                     // （3つの入口のうち1つだけ従わない形を作らない、B-02）。
                     let do_grant = || {
-                        grant_ace_scoped(&entry.path, entry_cap.as_psid(), entry.access, entry.scope)
+                        grant_ace_scoped(
+                            &grant.path,
+                            entry.subject.as_psid(),
+                            grant.access,
+                            grant.scope,
+                        )
                     };
-                    let result = if entry.forced {
+                    let result = if grant.forced {
                         with_restore_privilege(do_grant)
                     } else {
                         do_grant()
                     };
                     match result {
-                        Ok(()) => granted.push(entry.path.clone()),
-                        Err(e) => failures.push((entry.path.clone(), e.to_string())),
+                        Ok(()) => granted.push(grant.path.clone()),
+                        Err(e) => failures.push((grant.path.clone(), e.to_string())),
                     }
                 }
                 Ok((granted, failures))
@@ -1090,20 +1143,14 @@ pub fn preflight_with_privhelper_launcher(
                 // package SIDのまま記録すると、自己検証は「付けたはずのACEが無い」と
                 // 全件について言い続ける（測る相手が違うだけなのに）。
                 for entry in &needs_elevation {
-                    if let Ok(cap) = fs_allow_capability_sid(
-                        &canonical_workspace_root,
-                        &entry.path,
-                        entry.access,
-                    ) {
-                        crate::tier2a::grant_audit::note_delegated_grant(
-                            &entry.path,
-                            cap.as_psid(),
-                        );
-                    }
+                    crate::tier2a::grant_audit::note_delegated_grant(
+                        &entry.grant.path,
+                        entry.subject.as_psid(),
+                    );
                 }
                 match crate::tier2a::privhelper::run_privileged_workspace_access(
                     missing_traverse.clone(),
-                    needs_elevation.clone(),
+                    needs_elevation.iter().map(|e| e.grant.clone()).collect(),
                     wfp_chain_pipe.clone(),
                     privhelper_launcher,
                 ) {
@@ -1154,74 +1201,69 @@ pub fn preflight_with_privhelper_launcher(
             };
 
         // [§22.3] 昇格経路の後始末は3つに分かれる（完走・部分適用・ヘルパー不通）が、
-        // **どれも同じ宛先SIDを見なければならない**。ここで1本にしておかないと、
-        // 「載っているか」を測る相手が経路ごとにずれる（B-02）。
-        let elevated_subject = |path: &Path| -> Option<crate::win_common::OwnedSid> {
-            let access = needs_elevation
-                .iter()
-                .find(|e| e.path == *path)
-                .map(|e| e.access)?;
-            fs_allow_capability_sid(&canonical_workspace_root, path, access).ok()
-        };
-
+        // **どれも同じ宛先SIDを見なければならない**。それを保証しているのは、
+        // 3つとも`needs_elevation`の要素（[`PendingElevation`]）から宛先SIDを読むことである。
+        //
+        // **2026-09-01に`elevated_subject`（ここで導出し直すクロージャ）を廃した。**
+        // 宛先SIDは昇格へ回す前に導出済みで、失敗した宣言はここへ到達しない。
+        // 引き直しは同じ値をもう一度作るだけで、失敗した行が「宛先SIDの無い開いた穴」として
+        // 残る余地を作っていた。
+        //
+        // **`granted`/`failures`ではなく`needs_elevation`を回す。** 昇格側が返すのはパスだけで、
+        // こちら側の宣言と突き合わせないと級も宛先SIDも分からない。**送った集合を主にして
+        // 結果を引く**ほうが、返ってきたパスを主にして`unwrap_or`で埋めるより取りこぼさない。
         match elevated {
             Ok((granted, failures)) => {
-                for path in &granted {
-                    let writable = needs_elevation
-                        .iter()
-                        .find(|e| &e.path == path)
-                        .map(|e| e.access.is_read_write())
-                        .unwrap_or(false);
-                    // [§22.3] 昇格側が書いたACEの宛先SIDも、子のトークンと台帳へ運ぶ
-                    // ——ここが抜けると、**穴は開いているのに子がその宛先SIDを持っていない**
-                    // （＝到達不能）か、**撤収経路の無い孤立ACE**のどちらかになる。
-                    if let Some(cap) = elevated_subject(path) {
-                        if let Ok(text) = crate::win_common::sid_to_string(cap.as_psid()) {
-                            granted_subjects.push((path.clone(), text));
+                for entry in &needs_elevation {
+                    let grant = &entry.grant;
+                    let path = &grant.path;
+                    if granted.iter().any(|p| p == path) {
+                        // [§22.3] 昇格側が書いたACEの宛先SIDも、子のトークンと台帳へ運ぶ
+                        // ——ここが抜けると、**穴は開いているのに子がその宛先SIDを持っていない**
+                        // （＝到達不能）か、**撤収経路の無い孤立ACE**のどちらかになる。
+                        fs_allow_caps.push(entry.subject.clone());
+                        granted_passthrough.push(harness_core::GrantedPassthrough {
+                            path: path.clone(),
+                            writable: grant.access.is_read_write(),
+                            subject_sid: entry.subject_sid.clone(),
+                        });
+                        // 昇格経由（privhelper／本体が既に管理者）の付与も「書いた1件」に数える
+                        // ——どの経路で書いたかではなく、**マシンのACLを変えたか**が知りたい事実。
+                        // 開いた穴の集合にも同じ理由で入れる（BUG-057が「昇格経由だけが記録から
+                        // 漏れる」形を踏んでいるので、経路ごとに数え方を変えない）。
+                        progress.record_granted();
+                        fs_allow_opened_paths.push(path.clone());
+                        if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
+                            probe_targets.push(fp.clone());
                         }
-                        fs_allow_caps.push(cap);
+                        continue;
                     }
-                    granted_passthrough.push((path.clone(), writable));
-                    // 昇格経由（privhelper／本体が既に管理者）の付与も「書いた1件」に数える
-                    // ——どの経路で書いたかではなく、**マシンのACLを変えたか**が知りたい事実。
-                    // 開いた穴の集合にも同じ理由で入れる（BUG-057が「昇格経由だけが記録から
-                    // 漏れる」形を踏んでいるので、経路ごとに数え方を変えない）。
-                    progress.record_granted();
-                    fs_allow_opened_paths.push(path.clone());
-                    if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
-                        probe_targets.push(fp.clone());
-                    }
-                }
-                for (path, reason) in &failures {
-                    let access = needs_elevation
-                        .iter()
-                        .find(|e| &e.path == path)
-                        .map(|e| e.access)
-                        .unwrap_or(FsAccess::ReadExec);
-                    let writable = access.is_read_write();
+                    let Some((_, reason)) = failures.iter().find(|(p, _)| p == path) else {
+                        // 送ったのに`granted`にも`failures`にも居ない。**黙って落とさない**
+                        // （B-09/B-10: 「対象が無かった」と「見失った」は別の事実）。
+                        warnings.push(format!(
+                            "fs-allow {} : the privilege-separation helper (D-16) reported neither \
+                             success nor failure for this declaration; treating it as not granted",
+                            path.display()
+                        ));
+                        continue;
+                    };
                     // BUG-017: grant_ace_recursive/grant_ace_inheritable_roはroot(先頭ノード)から
                     // 順に付与するため、途中の子孫(TrustedInstaller所有等)で失敗しても、rootには
                     // 既にACEが載っている場合がある。「失敗」扱いにして`granted_passthrough`から
                     // 落とすと、実FS上にはACEが残るのに呼び出し元（`fs-passthrough-ledger`への
                     // 記録）から漏れ、撤収経路の無い孤立ACEになる。rootを権威的にプローブし、
                     // ACEが実在すれば記録して`fs revoke`で後から掃除できるようにする。
-                    let subject = elevated_subject(path);
-                    if matches!(
-                        subject
-                            .as_ref()
-                            .map(|cap| sid_ace_mask(path, cap.as_psid())),
-                        Some(Ok(Some(_)))
-                    ) {
-                        granted_passthrough.push((path.clone(), writable));
+                    if matches!(sid_ace_mask(path, entry.subject.as_psid()), Ok(Some(_))) {
+                        granted_passthrough.push(harness_core::GrantedPassthrough {
+                            path: path.clone(),
+                            writable: grant.access.is_read_write(),
+                            subject_sid: entry.subject_sid.clone(),
+                        });
                         // 部分適用でACEが実在するなら、それは「開いた穴」である
                         // （§22.3.0の検算からも外さない）。
                         fs_allow_opened_paths.push(path.clone());
-                        if let Some(cap) = subject {
-                            if let Ok(text) = crate::win_common::sid_to_string(cap.as_psid()) {
-                                granted_subjects.push((path.clone(), text));
-                            }
-                            fs_allow_caps.push(cap);
-                        }
+                        fs_allow_caps.push(entry.subject.clone());
                         warnings.push(format!(
                             "fs-allow {} : partially applied via privilege-separation helper \
                              (D-16) -- some descendant failed ({reason}), but the root itself now \
@@ -1233,7 +1275,7 @@ pub fn preflight_with_privhelper_launcher(
                     } else {
                         denied_passthrough.push((
                             path.clone(),
-                            access.label().to_string(),
+                            grant.access.label().to_string(),
                             format!("ACE grant failed (via privilege-separation helper, D-16): {reason}"),
                         ));
                         warnings.push(format!(
@@ -1246,35 +1288,31 @@ pub fn preflight_with_privhelper_launcher(
             }
             Err(reason) => {
                 for entry in &needs_elevation {
-                    let subject = elevated_subject(&entry.path);
+                    let grant = &entry.grant;
                     if matches!(
-                        subject
-                            .as_ref()
-                            .map(|cap| sid_ace_mask(&entry.path, cap.as_psid())),
-                        Some(Ok(Some(_)))
+                        sid_ace_mask(&grant.path, entry.subject.as_psid()),
+                        Ok(Some(_))
                     ) {
-                        granted_passthrough
-                            .push((entry.path.clone(), entry.access.is_read_write()));
+                        granted_passthrough.push(harness_core::GrantedPassthrough {
+                            path: grant.path.clone(),
+                            writable: grant.access.is_read_write(),
+                            subject_sid: entry.subject_sid.clone(),
+                        });
                         // 上と同じ（ヘルパーが完走できなかった場合の部分適用）。
-                        fs_allow_opened_paths.push(entry.path.clone());
-                        if let Some(cap) = subject {
-                            if let Ok(text) = crate::win_common::sid_to_string(cap.as_psid()) {
-                                granted_subjects.push((entry.path.clone(), text));
-                            }
-                            fs_allow_caps.push(cap);
-                        }
+                        fs_allow_opened_paths.push(grant.path.clone());
+                        fs_allow_caps.push(entry.subject.clone());
                         warnings.push(format!(
                             "fs-allow {} : partially applied -- the privilege-separation helper \
                              (D-16) could not fully complete ({reason}), but the root itself now \
                              carries the sandbox ACE; recorded in the ledger so `harness fs revoke \
                              {}` can clean it up",
-                            entry.path.display(),
-                            entry.path.display()
+                            grant.path.display(),
+                            grant.path.display()
                         ));
                     } else {
                         denied_passthrough.push((
-                            entry.path.clone(),
-                            entry.access.label().to_string(),
+                            grant.path.clone(),
+                            grant.access.label().to_string(),
                             format!(
                                 "ACE grant failed: access denied in-process, and the privilege-separation helper (D-16) could not complete either: {reason}"
                             ),
@@ -1282,7 +1320,7 @@ pub fn preflight_with_privhelper_launcher(
                         warnings.push(format!(
                             "fs-allow {} : ACE grant failed: access denied in-process, and the \
                              privilege-separation helper (D-16) could not complete either: {reason}",
-                            entry.path.display()
+                            grant.path.display()
                         ));
                     }
                 }
@@ -1513,7 +1551,6 @@ pub fn preflight_with_privhelper_launcher(
         warnings,
         denied_passthrough,
         granted_passthrough,
-        granted_subjects,
         netfilterd_chain_attempted,
     })
 }

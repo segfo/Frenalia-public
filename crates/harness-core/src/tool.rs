@@ -281,6 +281,46 @@ const _: () = {
     }
 };
 
+/// [§22.3] `--fs-allow`で実際に開いた穴1件。**パスと、その穴のACEを実際に書いた宛先SIDを
+/// 1つの値として運ぶ。**
+///
+/// # なぜ2本のリストではなく1本なのか
+///
+/// かつてここは`granted_passthrough: Vec<(PathBuf, bool)>`と、`preflight`の
+/// `granted_subjects: Vec<(PathBuf, SID文字列)>`という**2本の並行したリスト**だった。
+/// 後者は`shell_tier`で捨てられており、子を起こす側は台帳をパスで引き直していた——
+/// その索引は「このworkspaceがこのパスへ発行した宛先SID」を**全部**返すので、
+/// 過去に別のアクセス級で発行したものまで子のトークンへ載っていた（宣言より広い）。
+///
+/// 2本のまま運ぶ案は採らなかった。**実際に1対1ではなかった**からである——昇格ヘルパー経由の
+/// 付与では、パス側は無条件に、宛先SID側は導出できたときだけ積まれていた。1本に畳むと
+/// 対応が型で保証され、「宛先SIDが無い行」を表現できなくなる。
+///
+/// # なぜ宛先SIDが`Option`ではないのか
+///
+/// 宛先SIDは**穴を開ける前に**導出済みで、導出に失敗したパスはそもそも開かれない
+/// （`preflight`が警告を出して`continue`する）。したがって「開いた穴」に宛先SIDが
+/// 無い状態は存在し得ない。`Option`にすると、起動側に「無かったときの逃げ道」を
+/// 書くことになり、その逃げ道が**台帳引き（＝いま消したい広い経路）**へ戻る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantedPassthrough {
+    /// 宣言されたパス（`preflight`が実際にACEを確認できたもの）。
+    pub path: std::path::PathBuf,
+    /// **ユーザーが要求した**アクセスが書込を含むか。モデルへの宣言文
+    /// （`prompt::render_passthrough`）とCoWのext capture対象の判定が読む。
+    ///
+    /// **これは宛先SIDの導出には使えない**——`--sandbox tier2a-cow`ではACEを書く級が
+    /// `read_write`から`read`へ降格するので、要求された級から導出すると別のSIDになる。
+    /// 導出済みの値は[`Self::subject_sid`]が運ぶ。
+    pub writable: bool,
+    /// このパスのACEを**実際に書いた**宛先SIDの文字列表現（`S-1-15-3-…`）。
+    ///
+    /// 子のトークンへ積むのはこれである。`preflight`が導出したものをそのまま運ぶので、
+    /// 起動側は導出をやり直さない（やり直すと、CoW降格時に別のSIDを作って
+    /// 「ACEは正しく付いているのに子から一切読めない」という最も原因を追いにくい形になる）。
+    pub subject_sid: String,
+}
+
 /// `harness-sandbox::shell_tier::select_tier`の結果。`ToolCtx`が運ぶ「値」であり、
 /// 判定ロジックの実体（OS能力プローブ）は`harness-sandbox`側にある
 /// （`StagingConfig`/`ReadScopeConfig`と同じ役割分担）。
@@ -296,10 +336,12 @@ pub struct ShellTierSelection {
     /// `fs.read`/`fs.read_write`/`fs.read_exec`へ追加するための材料として表示する。
     pub denied_passthrough: Vec<(std::path::PathBuf, String, String)>,
     /// `--fs-allow`/`fs.allow`のうち、実際にACE付与が確認できた（既存で十分だった場合を含む）
-    /// ルートの一覧（`(path, writable)`）。`harness-cli`側の台帳記録はこれだけを書くことで、
+    /// ルートの一覧。`harness-cli`側の台帳記録はこれだけを書くことで、
     /// `ACCESS_DENIED`で失敗したのに記録だけ残る「幻の台帳エントリ」を防ぐ
     /// （`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO: --fs-allowの特権分離ヘルパー化」）。
-    pub granted_passthrough: Vec<(std::path::PathBuf, bool)>,
+    ///
+    /// [§22.3] 各要素は**その穴のACEを実際に書いた宛先SID**を持つ（[`GrantedPassthrough`]）。
+    pub granted_passthrough: Vec<GrantedPassthrough>,
     /// WFP連鎖起動（`~/Downloads/appcontainer-wfp-sandbox-spec-v1.md`付録D シナリオ(A)）を
     /// `preflight`が実際に試みたか。`true`なら呼び出し元（`harness-cli`）は特権分離ヘルパー
     /// 経由で`harness-netfilterd`が起動済み（またはベストエフォートで失敗済み）と見なし、
@@ -344,7 +386,7 @@ impl ShellTierSelection {
 
     /// 実際にACE付与が確認できたpassthroughルートの一覧を積む（`direct`と組み合わせて使う。
     /// `preflight`が失敗した`downgraded`経路では常に空のまま）。
-    pub fn with_granted_passthrough(mut self, granted: Vec<(std::path::PathBuf, bool)>) -> Self {
+    pub fn with_granted_passthrough(mut self, granted: Vec<GrantedPassthrough>) -> Self {
         self.granted_passthrough = granted;
         self
     }

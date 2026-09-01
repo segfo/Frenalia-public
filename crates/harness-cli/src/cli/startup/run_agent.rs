@@ -288,10 +288,16 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // 生んでしまうため（`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」）。到達不能だった穴の診断
     // （D8/D9）は`passthrough_warnings`としてこの下で表示する。
     if shell_tier.tier == harness_core::ShellTier::Tier2a {
-        // [BUG-101] **どのSID宛に付けたか**も記録する。プロファイルが削除されるとSIDから名前は
-        // 引けなくなるので、記録しておかないと撤収側がそのACEを自分のものと判定できない。
-        let granted_sid = harness_sandbox::tier2a::win_appcontainer::current_session_grant_sid();
-        for (path, writable) in &shell_tier.granted_passthrough {
+        // [BUG-101/§22.3] 台帳の`granted_sid`欄には**何も入れない**（2026-09-01）。
+        // この欄が意味するのは「このパスへ**どのpackage SID宛に**ACEを付けたか」で、
+        // 撤収側（`revoke_subjects`）は`S-1-15-2-`で始まるSIDしか列挙しない。主体移行が
+        // 済んだいま、`--fs-allow`の穴にpackage SID宛のACEは**1本も無い**ので、
+        // `None`＝「package SID宛には付与していない」が事実そのものである。
+        // 宣言capabilityの撤収は`workspace-capability-ledger.json`の`declaration`欄を
+        // 索引にした名前の付いた扉が担う。**移行前の記録はこの欄が積み増しなので消えない。**
+        for granted in &shell_tier.granted_passthrough {
+            let path = &granted.path;
+            let writable = granted.writable;
             // このエントリが`--force-system-acl`対象だったか（元のfs_passthroughから引く）。
             // forcedなら撤収時も`SeRestorePrivilege`が要るため台帳へ記録しておく。
             let forced = fs_passthrough
@@ -312,10 +318,10 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 .then(|| workspace_root.to_string_lossy().into_owned());
             crate::fs_grants::record_fs_passthrough_grant(
                 path,
-                *writable,
+                writable,
                 forced,
                 settings_workspace.as_deref(),
-                granted_sid.as_deref(),
+                None,
                 scope,
             );
             if forced {
@@ -325,7 +331,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                      bypassing its DACL (ownership unchanged). This ACE persists after harness \
                      exits; run `harness fs revoke {}` to undo.",
                     path.display(),
-                    if *writable { "rw" } else { "ro" },
+                    if writable { "rw" } else { "ro" },
                     path.display()
                 );
             } else {
@@ -340,7 +346,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                      .harness/settings.json and harness starts again, or when you run \
                      `harness fs revoke {}`)",
                     path.display(),
-                    if *writable { "rw" } else { "ro" },
+                    if writable { "rw" } else { "ro" },
                     path.display()
                 );
             }

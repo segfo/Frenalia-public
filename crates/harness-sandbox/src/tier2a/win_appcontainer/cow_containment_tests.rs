@@ -349,8 +349,8 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_diff_layer_and_leaves_real_tar
     let ext_capture_roots: Vec<std::path::PathBuf> = outcome
         .granted_passthrough
         .iter()
-        .filter(|(_, writable)| *writable)
-        .map(|(p, _)| p.clone())
+        .filter(|g| g.writable)
+        .map(|g| g.path.clone())
         .collect();
     assert!(
         !ext_capture_roots.is_empty(),

@@ -94,14 +94,16 @@ fn grant_and_collect_subjects(
     }
     // **まず「測れる状態になったか」を確かめる。** 付与できていなければ、この後の
     // 「届かない」は移行が効いた証拠ではなく、ただの未付与である。
-    assert!(
-        outcome
-            .granted_passthrough
-            .iter()
-            .any(|(p, _)| p == declared),
-        "the declared path must be reported as granted before we measure reachability: {:?}",
-        outcome.granted_passthrough
-    );
+    let granted = outcome
+        .granted_passthrough
+        .iter()
+        .find(|g| g.path == *declared)
+        .unwrap_or_else(|| {
+            panic!(
+                "the declared path must be reported as granted before we measure reachability: {:?}",
+                outcome.granted_passthrough
+            )
+        });
 
     let canonical_ws = workspace
         .canonicalize()
@@ -109,18 +111,13 @@ fn grant_and_collect_subjects(
     let ws_cap = workspace_capability_sid(&canonical_ws, "rwx")
         .expect("the workspace capability must exist after preflight (D-54)");
 
-    // 宣言の宛先SIDは**台帳の索引から引く**（本番の`launch.rs`と同じ引き方。ここで
-    // `fs_allow_capability_sid`を呼ぶと発行側の口を通ってしまい、「preflightが実際に
-    // 発行したもの」ではなく「このテストが今作ったもの」を測ることになる）。
-    let mut decl_caps = fs_allow_capability_sids(declared, Some(&canonical_ws));
-    assert_eq!(
-        decl_caps.len(),
-        1,
-        "this workspace must have exactly one declaration subject for the path; \
-         found {} (a leftover from an earlier run makes the measurement ambiguous)",
-        decl_caps.len()
-    );
-    let decl_cap = decl_caps.pop().expect("checked above");
+    // [分流N1] 宣言の宛先SIDは**`preflight`が運んできた値**を使う（本番の`launch.rs`と
+    // 同じ入手経路）。かつてここは台帳の索引（`fs_allow_capability_sids`）を引いていたが、
+    // **本番がそれをやめた**ので、引き続き台帳を引くと「本番が積むもの」ではなく
+    // 「台帳に在るもの」を測ることになる。台帳の索引が宣言より広いこと自体は
+    // `only_the_declared_access_class_is_carried_to_the_child`が別に測る。
+    let decl_cap = crate::win_common::sid_from_string(&granted.subject_sid)
+        .expect("preflight must hand back a usable capability SID for the declaration");
 
     (session_sid(), ws_cap, decl_cap)
 }
@@ -313,5 +310,119 @@ fn only_the_declaring_domain_can_run_the_declared_script_through_an_interpreter(
         non_declaring.contains(DENIED_MARKER),
         "the interpreter must fail on the script (and be caught), not silently produce nothing: \
          {non_declaring}"
+    );
+}
+
+/// **受け入れ条件（分流N1）**: 子へ運ばれるcapability SIDは、**いま宣言した級のものだけ**である。
+///
+/// # 壊れた状態を一文で
+///
+/// **同じパスへ過去に別のアクセス級で発行したcapability SIDまで、子のトークンへ載る。**
+/// 宛先SIDは`(秘密, 畳み込み済みパス, access級)`から決まるので、同じパスでも級が違えば
+/// 別のSIDになり、それぞれ別のACEが載る。`read`だけを宣言した子に`read_write`用の
+/// capability SIDまで積むと、その子は**宣言していない書込の許可へ手が届く**。
+///
+/// # なぜ2回`preflight`を通すのか
+///
+/// 「同じパスに複数の級のcapability SIDが在る」状態を作るためである。実運用では
+/// `--fs-allow C:\x:rw`で1回起動し、次に`:read`で起動すれば自然にこうなる
+/// （`--sandbox tier2a-cow`でも起きる——RW宣言が`read`へ降格するので、同じ宣言のまま
+/// モードを変えるだけで2つ目の級が発行される）。
+///
+/// # 何を根拠に「1対1になった」と言うか（**対で測る**、`B-35`）
+///
+/// - **広い側が実在すること**を先に測る——台帳の索引（`fs_allow_capability_sids`）が
+///   このパスに対して**2件**返すこと。ここが1件なら、この後の「1件だった」は
+///   絞り込みが効いた証拠ではなく、**そもそも2件目が作られていない**だけである。
+/// - そのうえで、`preflight`が運ぶ宛先SIDが**ちょうど1件**で、しかも
+///   **いま宣言した級のもの**であること。本番の`launch.rs`はこの値をそのまま積むので、
+///   これが子のトークンに載る集合そのものである。
+#[test]
+#[ignore = "changes real ACLs and the real capability ledger; run NON-elevated with --test-threads=1"]
+fn only_the_declared_access_class_is_carried_to_the_child() {
+    let workspace_guard = TestDirGuard::create("fsallow-n1-ws");
+    let declared_guard = TestDirGuard::create("fsallow-n1-declared");
+    let workspace = workspace_guard.path().to_path_buf();
+    let declared = declared_guard.path().to_path_buf();
+    std::fs::write(declared.join("seed.txt"), b"seed").expect("seed the declared dir");
+
+    let _cleanup = cleanup_declaration(workspace.clone(), declared.clone());
+    let canonical_ws = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+
+    // --- 1回目: `read_write`で宣言する（2つ目の級を先に作っておく） ---
+    let rw_declaration = FsPassthrough {
+        path: declared.clone(),
+        access: FsAccess::ReadWrite,
+        forced: false,
+        scope: GrantScope::Recursive,
+    };
+    preflight(
+        &workspace,
+        std::slice::from_ref(&rw_declaration),
+        None,
+        &WorkspaceWriteMode::DirectRw,
+    )
+    .expect("the read_write declaration must be granted first");
+    grant_job::wait_until_done().expect("the background grant job must finish");
+
+    // --- 2回目: 同じパスを`read`で宣言する（本番の測定対象） ---
+    let read_decl = read_declaration(&declared);
+    let outcome = preflight(
+        &workspace,
+        std::slice::from_ref(&read_decl),
+        None,
+        &WorkspaceWriteMode::DirectRw,
+    )
+    .expect("the read declaration must be granted");
+    grant_job::wait_until_done().expect("the background grant job must finish");
+
+    // --- 広い側が実在することを先に測る（歯の確認） ---
+    let ledger_subjects = fs_allow_capability_sids(&declared, Some(&canonical_ws));
+    assert_eq!(
+        ledger_subjects.len(),
+        2,
+        "this measurement is only meaningful if the ledger really holds two access classes for \
+         the path; found {} (if this is 1, the second class was never issued and 'exactly one \
+         was carried' proves nothing)",
+        ledger_subjects.len()
+    );
+
+    // --- 狭い側: 運ばれるのはちょうど1件 ---
+    let carried: Vec<&harness_core::GrantedPassthrough> = outcome
+        .granted_passthrough
+        .iter()
+        .filter(|g| g.path == declared)
+        .collect();
+    assert_eq!(
+        carried.len(),
+        1,
+        "exactly one subject must be carried for the declared path, got {:?}",
+        carried
+    );
+
+    // --- しかも「いま宣言した級」のものであること ---
+    //
+    // 級から宛先SIDを引き直して突き合わせる。**ここで`read`側と一致し、`read_write`側と
+    // 一致しないこと**が、「宣言と1対1」の中身である。
+    let read_cap = fs_allow_capability_sid(&canonical_ws, &declared, FsAccess::Read)
+        .expect("the read capability must exist after the second preflight");
+    let rw_cap = fs_allow_capability_sid(&canonical_ws, &declared, FsAccess::ReadWrite)
+        .expect("the read_write capability must exist from the first preflight");
+    let read_sid = crate::win_common::sid_to_string(read_cap.as_psid()).expect("render read SID");
+    let rw_sid = crate::win_common::sid_to_string(rw_cap.as_psid()).expect("render read_write SID");
+    assert_ne!(
+        read_sid, rw_sid,
+        "the two access classes must derive different SIDs, otherwise this test cannot tell them \
+         apart (the derivation would not include the access class)"
+    );
+    assert_eq!(
+        carried[0].subject_sid, read_sid,
+        "the carried subject must be the one for the access class declared in this run"
+    );
+    assert_ne!(
+        carried[0].subject_sid, rw_sid,
+        "the read_write subject from the earlier run must not be carried into this child"
     );
 }

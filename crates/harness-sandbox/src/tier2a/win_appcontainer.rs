@@ -524,22 +524,20 @@ pub fn derive_profile_sid(name: &str) -> Result<OwnedContainerSid, AppContainerE
     }
 }
 
-/// このプロセス（＝このセッション）がfs passthroughのACEを付与するときの**宛先SIDの文字列**。
-///
-/// [BUG-101] 付与した宛先SIDを台帳へ記録するため（`fs_passthrough_ledger::FsLedgerEntry::granted_sids`）に
-/// 要る。記録するのは`preflight`の呼び出し元（`harness-cli`の`run_agent`とポリシーエディタの
-/// パス2）だが、**宛先SIDを決めているのは`preflight`**なので、両者が同じ値を見ていることを
-/// 保証する必要がある。
-///
-/// ここは`current_profile_name()`からの決定的な導出で、`preflight`が使う
-/// `begin_session()`＋`ensure_profile()`と**同じ名前・同じ導出関数**を通る。ずれていないことは
-/// `preflight`が実行時に検算する（B-05: コンパイラが守らない複製には実行時の検算を置く）。
-/// 導出に失敗したら`None`——記録できなかったことを付与の失敗にはしない。
-pub fn current_session_grant_sid() -> Option<String> {
-    let name = crate::tier2a::session_profile::current_profile_name();
-    let sid = derive_profile_sid(&name).ok()?;
-    crate::win_common::sid_to_string(sid.as_psid()).ok()
-}
+// [§22.3] **`current_session_grant_sid()`は2026-09-01に削除した。**
+//
+// この関数は「fs passthroughのACEを付与するときの宛先SID」を返し、呼び出し元
+// （`harness-cli`の`run_agent`とポリシーエディタのパス2）がそれを
+// `fs-passthrough-ledger`の`granted_sid`欄へ書いていた（BUG-101）。
+//
+// **返していたのはセッションのpackage SIDである。** 主体移行が済んだいま、
+// `--fs-allow`の穴にpackage SID宛のACEは1本も無いので、その値を書くと
+// **事実と違う記録**になる。呼び出し元は`None`（＝package SID宛には付与していない）を
+// 書くようになり、この関数の使い手は0になった。
+//
+// あわせて`preflight`にあった「台帳へ書く値と実際に使う宛先SIDの一致」の検算も消した——
+// 比べる相手が居なくなったので、残しても何も検出しないまま「検算があるから守られている」と
+// 読ませるだけである。移行の不変条件のほうは`preflight`末尾が実DACLを読んで測っている。
 
 // --- 責務別サブモジュール（docs/CODE-STRUCTURE-RULES.md 規則1/3） ---
 //
