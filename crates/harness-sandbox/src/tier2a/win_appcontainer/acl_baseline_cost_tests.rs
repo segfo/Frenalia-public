@@ -1618,32 +1618,43 @@ fn remove_readonly_file(path: &Path) {
 /// （毎回の全件ロードと全文の直列化）ので、宣言が数百件あるドメインでは
 /// ACE側より支配的になり得る。
 ///
-/// # 測るのは「支配項」であって製品の関数そのものではない（**限界。黙って使わない**）
+/// # 通すのは製品の関数そのものである（**2026-09-02に差し替えた**）
 ///
-/// 製品の入口`ensure_declaration_capability_name`は`%APPDATA%`の実台帳を掴み、台帳を
-/// 差し替えられる版`ensure_declaration_capability_in`は`workspace_capability`の**非公開**
-/// 関数である（そのファイルはこの分流の担当外なので可視性を変えていない）。したがって
-/// ここで通すのは**その内側が宣言1件ごとに払う`Ledger::update`**である。
+/// 以前ここは`Ledger::update`の呼び出しを**書き写した再現**だった——台帳を差し替えられる版が
+/// `workspace_capability`の非公開関数だったためである。残課題#37を直す回で
+/// `pub(crate)`にしたので、いまは`ensure_declaration_capability_in`（1件版）と
+/// `ensure_declaration_capabilities_in`（複数件版）を**そのまま**呼ぶ。**再現で測ると、
+/// 製品だけが変わったときに計器が古いまま緑になる。**
+///
+/// `batched`が両者の切り替えで、**同じ回で並べて比べるためにある**——1件ずつ払う形と
+/// 1回にまとめる形の差が、残課題#37そのものである。
 ///
 /// | 含む | 含まない |
 /// |---|---|
-/// | ロック取得・全件ロード・2回の直列化・条件付き書き戻し・read-only切替 | CSPRNGでの秘密生成（1件あたりO(1)で、件数では育たない） |
-/// | 追記前の全件走査（3欄の一致。**規則の正本は`workspace_capability::matches`**で、ここに在るのは同じ形の走査が費用に乗ることを再現するためだけである） | 実台帳に既にある他workspaceのエントリ（**製品は空から始まらない**ので、ここの値は下限） |
+/// | ロック取得・全件ロード・2回の直列化・条件付き書き戻し・read-only切替・CSPRNGでの秘密生成 | 実台帳に既にある他workspaceのエントリ（**製品は空から始まらない**ので、ここの値は下限） |
 ///
 /// # 第3の値（**時計とは別の計器**）
 ///
 /// [`Ledger::update`]は中身が1バイトも変わらなければ**書かない**（BUG-108）。押し込んだ
 /// つもりで1件も増えていなければ、測った時間は「読んで直列化して捨てた」費用でしかない。
 /// だから最後に**別の`Ledger`ハンドルでディスクから読み直し**、件数と
-/// capability名の重複なしを見る。
-fn measure_declaration_ledger_append(dir: &Path, declarations: usize) -> serde_json::Value {
+/// capability名の重複なしを見る。**まとめる形では特に効く**——1回の`update`で全件を積むので、
+/// 索引の組み方を間違えて1件しか入っていなくても時間だけは短く出る。
+fn measure_declaration_ledger_append(
+    dir: &Path,
+    declarations: usize,
+    batched: bool,
+) -> serde_json::Value {
     use crate::tier2a::workspace_capability::{
-        declaration_capability_name, declaration_key, workspace_key, WorkspaceCapabilityEntry,
+        ensure_declaration_capabilities_in, ensure_declaration_capability_in,
         WorkspaceCapabilityLedger,
     };
-    use harness_grant_ledger::{now_unix_secs, Ledger};
+    use harness_grant_ledger::Ledger;
 
-    let path = dir.join(format!("n{declarations}-workspace-capability-ledger.json"));
+    let shape = if batched { "batched" } else { "per-declaration" };
+    let path = dir.join(format!(
+        "n{declarations}-{shape}-workspace-capability-ledger.json"
+    ));
     let backup = path.with_extension("json.bak");
     // **実台帳のロック名を使わない。** 名前付きミューテックスの費用は同じに払いつつ、
     // 同時に動いている本物の`harness.exe`と直列化しないための分離である。
@@ -1655,40 +1666,27 @@ fn measure_declaration_ledger_append(dir: &Path, declarations: usize) -> serde_j
         Ledger::at_path(path.clone(), Some(&lock_name));
 
     let workspace = Path::new(r"C:\harness-acl-cost-measure-workspace");
-    let workspace_display = workspace.to_string_lossy().into_owned();
-    let key = workspace_key(workspace);
     let access_class = FsAccess::Read.label();
+    let declared: Vec<std::path::PathBuf> = (0..declarations)
+        .map(|i| workspace.join(format!("declared-{i:05}")))
+        .collect();
 
     let started = Instant::now();
-    for i in 0..declarations {
-        let declared = declaration_key(&workspace.join(format!("declared-{i:05}")));
-        ledger.update(|l| {
-            let already = l.entries.iter().any(|e| {
-                workspace_key(Path::new(&e.workspace)) == key
-                    && e.declaration.as_deref() == Some(declared.as_str())
-                    && e.mode == access_class
-            });
-            if already {
-                return;
-            }
-            let secret_hex = format!("{i:032x}");
-            let capability_name = declaration_capability_name(&secret_hex, &declared, access_class);
-            l.entries.push(WorkspaceCapabilityEntry {
-                workspace: workspace_display.clone(),
-                declaration: Some(declared.clone()),
-                mode: access_class.to_string(),
-                secret_hex,
-                capability_name,
-                granted_at_unix_secs: now_unix_secs(),
-                tree_verified_at_unix_secs: None,
-                root_file_id: None,
-                preparation_started_at_unix_secs: None,
-                preparation_root_file_id: None,
-                preparation_failed_at_unix_secs: None,
-                preparation_error: None,
-            });
-        });
-    }
+    let failures = if batched {
+        let requests: Vec<(&Path, &str)> = declared
+            .iter()
+            .map(|p| (p.as_path(), access_class))
+            .collect();
+        ensure_declaration_capabilities_in(&ledger, workspace, &requests)
+            .into_iter()
+            .filter(|issued| issued.is_err())
+            .count()
+    } else {
+        declared
+            .iter()
+            .filter(|p| ensure_declaration_capability_in(&ledger, workspace, p, access_class).is_err())
+            .count()
+    };
     let elapsed = started.elapsed();
 
     // --- 読み直し（検算の材料。**判定より先に集める**） ---
@@ -1714,9 +1712,15 @@ fn measure_declaration_ledger_append(dir: &Path, declarations: usize) -> serde_j
 
     // --- 検算: 台帳が本当に育ったか（上のdoc「第3の値」） ---
     assert_eq!(
+        failures, 0,
+        "{failures} of the {declarations} declarations could not be issued ({shape} arm); the \
+         timing below is not the cost of issuing {declarations} subjects"
+    );
+    assert_eq!(
         entries_read_back, declarations,
-        "the measurement ledger holds {entries_read_back} entries after {declarations} appends — \
-         if this is 0 or short, `Ledger::update` skipped the write (BUG-108) and the timing above \
+        "the measurement ledger holds {entries_read_back} entries after {declarations} appends \
+         ({shape} arm) — if this is 0 or short, `Ledger::update` skipped the write (BUG-108), or \
+         the batched issuer collapsed distinct declarations into one entry, and the timing above \
          measures loading and serializing, not growing"
     );
     assert_eq!(
@@ -1727,9 +1731,18 @@ fn measure_declaration_ledger_append(dir: &Path, declarations: usize) -> serde_j
     );
 
     serde_json::json!({
-        "arm": format!("ledger-append-{declarations}"),
+        "arm": if batched {
+            format!("ledger-append-batched-{declarations}")
+        } else {
+            format!("ledger-append-{declarations}")
+        },
         "declarations": declarations,
-        "function": "harness_grant_ledger::Ledger::update (the term `ensure_name_in` pays per declaration)",
+        "shape": shape,
+        "function": if batched {
+            "workspace_capability::ensure_declaration_capabilities_in (one Ledger::update for all N)"
+        } else {
+            "workspace_capability::ensure_declaration_capability_in (one Ledger::update per declaration)"
+        },
         "total_ms": elapsed.as_millis(),
         "total_us": elapsed.as_micros(),
         "us_per_declaration": (elapsed.as_micros() as f64) / (declarations as f64),
@@ -2098,14 +2111,70 @@ fn acl_ace_count_cost_of_the_post_n1_declaration_and_diff_layer_paths() {
     // `C:\`直下は製品が台帳を置く場所ではないので、置き場の軸を振る意味が無い。
     let ledger_dir = TestDirGuard::create_in(&std::env::temp_dir(), "acln1-ledger");
     let mut ledger_arms: Vec<serde_json::Value> = Vec::new();
+    // **1件ずつ払う形とまとめる形を、同じ回で並べて測る**（残課題#37）。別々の回で測ると、
+    // 台帳の初期状態もマシンの状態も違うので「まとめたから速い」と言えない（対照が要る）。
+    let mut batched_us_per_declaration: std::collections::BTreeMap<usize, f64> =
+        std::collections::BTreeMap::new();
     for declarations in LEDGER_DECLARATIONS {
-        let arm = measure_declaration_ledger_append(ledger_dir.path(), declarations);
-        eprintln!("  [ledger-append-{declarations}] done {arm}");
+        for batched in [false, true] {
+            let arm = measure_declaration_ledger_append(ledger_dir.path(), declarations, batched);
+            eprintln!("  [{}] done {arm}", arm["arm"].as_str().unwrap_or("?"));
+            let per_declaration = arm["us_per_declaration"].clone();
+            if batched {
+                batched_us_per_declaration.insert(
+                    declarations,
+                    per_declaration.as_f64().unwrap_or(f64::NAN),
+                );
+                readings.insert(
+                    format!("ledger_batched_us_per_declaration@{declarations}decls"),
+                    per_declaration,
+                );
+            } else {
+                readings.insert(
+                    format!("ledger_us_per_declaration@{declarations}decls"),
+                    per_declaration,
+                );
+                ledger_arms.push(arm.clone());
+            }
+        }
+    }
+    // **まとめた形が1件ずつの形の何分の1か。** 読む値はここ——「まとめれば速い」ではなく
+    // 「本数が増えても1件あたりが育たない」ことが問いなので、本数ごとに出す。
+    for declarations in LEDGER_DECLARATIONS {
+        let per_declaration_us = readings
+            .get(&format!("ledger_us_per_declaration@{declarations}decls"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(f64::NAN);
+        let batched_us = batched_us_per_declaration
+            .get(&declarations)
+            .copied()
+            .unwrap_or(f64::NAN);
         readings.insert(
-            format!("ledger_us_per_declaration@{declarations}decls"),
-            arm["us_per_declaration"].clone(),
+            format!("ledger_batched_over_per_declaration@{declarations}decls"),
+            serde_json::json!(if per_declaration_us == 0.0 {
+                f64::NAN
+            } else {
+                batched_us / per_declaration_us
+            }),
         );
-        ledger_arms.push(arm);
+    }
+    // **まとめた形の側でも「1件あたりが本数とともに育つか」を出す。** 1件ずつの側だけを
+    // 見て「直った」と言うと、まとめた側が別の理由で育っていても気づけない。
+    if let (Some(&base_us), Some(&top_us)) = (
+        batched_us_per_declaration.get(&LEDGER_DECLARATIONS[0]),
+        batched_us_per_declaration.get(&LEDGER_DECLARATIONS[LEDGER_DECLARATIONS.len() - 1]),
+    ) {
+        readings.insert(
+            format!(
+                "ledger_batched_us_per_declaration@{}decls_over@{}decls",
+                LEDGER_DECLARATIONS[LEDGER_DECLARATIONS.len() - 1], LEDGER_DECLARATIONS[0]
+            ),
+            serde_json::json!(if base_us == 0.0 {
+                f64::NAN
+            } else {
+                top_us / base_us
+            }),
+        );
     }
     // **1件あたりが本数とともに育つか**が台帳側の問いである（育つなら合計はO(N²)）。
     if let (Some(first), Some(last)) = (ledger_arms.first(), ledger_arms.last()) {

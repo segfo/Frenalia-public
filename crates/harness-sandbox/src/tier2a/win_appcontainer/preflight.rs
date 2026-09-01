@@ -753,6 +753,12 @@ pub fn preflight_with_privhelper_launcher(
     // ここへ集め、後段で1回の特権分離ヘルパー要求へまとめる（起動あたりUAC最大1回、
     // `TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」の決定）。
     let mut needs_elevation: Vec<PendingElevation> = Vec::new();
+    // [残課題#37] 昇格へ回すと決まった宣言の`(確定した宣言, 宛先SID, そのSIDの文字列)`。
+    // **秘密はまだ持たない**——付与のループを抜けてから1回の台帳読み直しでまとめて引き、
+    // そこで[`PendingElevation`]を組む（1件ずつ引くと、システム保護されたパスが多いドメインで
+    // 台帳の全文往復が件数ぶん戻ってくる）。
+    let mut pending_elevation: Vec<(FsPassthrough, crate::win_common::OwnedSid, String)> =
+        Vec::new();
     let mut netfilterd_chain_attempted = false;
     // 到達性プローブ（D8）の対象。**ここでは測らず、全ての付与が終わってから1プロセスで
     // まとめて測る**（`probe_passthrough_batch`）。理由は2つ:
@@ -795,9 +801,22 @@ pub fn preflight_with_privhelper_launcher(
     let progress = passthrough_progress::global();
     let grant_phase = progress.begin(passthrough.len());
 
+    // [残課題#37] **付与は「絞り込み → 宛先SIDの一括確保 → 付与」の3段に割ってある。**
+    //
+    // 宛先SIDの確保は台帳のread-modify-writeなので、宣言1件ごとに呼ぶと全文の読み書きを
+    // 宣言の本数だけ払う。台帳が育つほど1件あたりが高くなり、実測で宣言668件のとき**13.46秒**
+    // ——**ACEを1本も書く前に**乗る（`plans/mac-spike/RESULTS.md` §S42-5）。しかもこの費用は
+    // 下の`already_sufficient`（冪等スキップ）より手前にあるので、2回目以降の起動でも全額払う。
+    //
+    // **絞り込みを先に済ませてから確保する。** 確保した時点で台帳に撤収の索引が載るので、
+    // 存在しないパスまで混ぜると**剥がす相手のいない記録**が残る（`B-01`/`B-14`）。
+    //
+    // 進捗は**この段では進めない**（存在しないパスを落とすぶんだけ進める）。ここで全件進めると
+    // ゲージが一瞬で満ちてから、実際のACE書込の間だけ止まって見える。
+    let mut resolved: Vec<(FsPassthrough, bool)> = Vec::with_capacity(passthrough.len());
     for requested in passthrough {
-        progress.advance();
         if !requested.path.exists() {
+            progress.advance();
             let reason = "path does not exist, skipped".to_string();
             warnings.push(format!("fs-allow {} : {reason}", requested.path.display()));
             denied_passthrough.push((
@@ -841,42 +860,54 @@ pub fn preflight_with_privhelper_launcher(
         } else {
             requested.access
         };
-        let fp = FsPassthrough {
-            path: requested.path.clone(),
-            access: effective_access,
-            forced: requested.forced,
-            // [D-63] スコープは`--sandbox tier2a-cow`でも変えない。上でRO化しているのは**アクセス種別**であって
-            // 範囲ではない（範囲を狭めると、宣言した配下がRedirector DLL経由でも読めなくなる）。
-            scope: requested.scope,
-        };
-        let fp = &fp;
-        let requested_rw = requested.access.is_read_write();
+        resolved.push((
+            FsPassthrough {
+                path: requested.path.clone(),
+                access: effective_access,
+                forced: requested.forced,
+                // [D-63] スコープは`--sandbox tier2a-cow`でも変えない。上でRO化しているのは**アクセス種別**であって
+                // 範囲ではない（範囲を狭めると、宣言した配下がRedirector DLL経由でも読めなくなる）。
+                scope: requested.scope,
+            },
+            requested.access.is_read_write(),
+        ));
+    }
 
-        // [§22.3] **この宣言の宛先SID**。以前はセッションのpackage SID（＝サンドボックス全体で
-        // 共有されるSID）だったので、`cargo`のために開けた穴が`pwsh`にも同じだけ開いていた。
-        // 宛先SIDを宣言ごとに分けて初めて、ドメインごとのFS制御が成立する。
-        //
-        // **導出には`fp.access`（実際に付けるアクセス）を使う。** `requested.access`ではない
-        // ——CoWでRO降格した場合、導出に使った級と実際に書いたマスクがずれると、撤収側は
-        // 別の宛先SIDを探しに行って1件も剥がせない。
-        let entry_cap =
-            match fs_allow_capability_sid(&canonical_workspace_root, &fp.path, fp.access) {
-                Ok(cap) => cap,
-                // 宛先SIDを作れなければ**この穴は開けない**（fail-closed）。乱数が取れないときに
-                // 弱い秘密へ退避しないのは`workspace_capability`のdocのとおりで、ここで
-                // package SIDへ退避するのは「移行したつもりで全ドメインに開く」という
-                // 最悪の退避になる。
-                Err(e) => {
-                    let reason = format!("could not derive the capability for this declaration: {e}");
-                    warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
-                    denied_passthrough.push((
-                        fp.path.clone(),
-                        fp.access.label().to_string(),
-                        reason,
-                    ));
-                    continue;
-                }
-            };
+    // [§22.3 / 残課題#37] **この宣言たちの宛先SID**を、1回の台帳更新でまとめて確保する。
+    // 以前はセッションのpackage SID（＝サンドボックス全体で共有されるSID）だったので、
+    // `cargo`のために開けた穴が`pwsh`にも同じだけ開いていた。宛先SIDを宣言ごとに分けて初めて、
+    // ドメインごとのFS制御が成立する。
+    //
+    // **導出には確定した級（`fp.access`）を使う。** ユーザーが要求した級ではない——CoWでRO降格
+    // した場合、導出に使った級と実際に書いたマスクがずれると、撤収側は別の宛先SIDを探しに行って
+    // 1件も剥がせない。だから級を決める分岐は上の1箇所だけにして、その結果をここへ渡す。
+    let subject_requests: Vec<(&Path, FsAccess)> = resolved
+        .iter()
+        .map(|(fp, _)| (fp.path.as_path(), fp.access))
+        .collect();
+    let subjects =
+        fs_allow_capability_sids_for_declarations(&canonical_workspace_root, &subject_requests);
+    timing.mark(&format!(
+        "fs-allow subjects minted ({} declarations, one ledger update)",
+        subject_requests.len()
+    ));
+
+    for ((fp, requested_rw), subject) in resolved.iter().zip(subjects) {
+        progress.advance();
+        let requested_rw = *requested_rw;
+        // 宛先SIDを作れなければ**この穴は開けない**（fail-closed）。乱数が取れないときに
+        // 弱い秘密へ退避しないのは`workspace_capability`のdocのとおりで、ここで
+        // package SIDへ退避するのは「移行したつもりで全ドメインに開く」という
+        // 最悪の退避になる。**失敗は要素ごと**なので、他の宣言はそのまま続く。
+        let entry_cap = match subject {
+            Ok(cap) => cap,
+            Err(e) => {
+                let reason = format!("could not derive the capability for this declaration: {e}");
+                warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
+                denied_passthrough.push((fp.path.clone(), fp.access.label().to_string(), reason));
+                continue;
+            }
+        };
 
         // [§22.3.0] **移行は付与と撤去で1つ。** capability宛を足しただけでは1ミリも成立しない
         // ——DACLは「この宛先SID**かつ**あの宛先SID」を表現できず、並べたALLOWはどれか1つで通るので、
@@ -1021,28 +1052,6 @@ pub fn preflight_with_privhelper_launcher(
                 // TrustedInstaller等）の可能性があるため、即座に警告へ落とさず後段の
                 // 特権分離ヘルパー経路へ回す。
                 //
-                // [§22.3.1] **昇格側へはSIDではなく秘密を渡す**（受信側が書込先のパスを
-                // 自分で畳み込んで導出する）。秘密を引くのは**この分岐だけ**にしてある
-                // ——共通経路で持ち回ると、ログやエラー文へ載る面が増える。台帳エントリは
-                // 上の`fs_allow_capability_sid`が既に作っているので、ここは冪等な読み直しである。
-                let secret_hex = match crate::tier2a::workspace_capability::ensure_declaration_capability(
-                    &canonical_workspace_root,
-                    &fp.path,
-                    fp.access.label(),
-                ) {
-                    Ok(cap) => cap.secret_hex,
-                    Err(e) => {
-                        let reason =
-                            format!("could not read back the capability secret for this declaration: {e}");
-                        warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
-                        denied_passthrough.push((
-                            fp.path.clone(),
-                            fp.access.label().to_string(),
-                            reason,
-                        ));
-                        continue;
-                    }
-                };
                 // [§22.3] **導出済みの宛先SIDを一緒に持たせる。** 昇格から戻った後に
                 // 引き直さないための唯一の手段で、引き直しをやめたことで
                 // 「宛先SIDの無い開いた穴」が構造的に作れなくなる。
@@ -1062,18 +1071,52 @@ pub fn preflight_with_privhelper_launcher(
                             continue;
                         }
                     };
-                needs_elevation.push(PendingElevation {
+                // [残課題#37] 秘密はここでは引かない（このループを抜けてから1回でまとめて引く）。
+                pending_elevation.push((fp.clone(), subject, entry_cap_text.clone()));
+            }
+        }
+    }
+
+    // [§22.3.1] **昇格側へはSIDでも名前でもなく秘密を渡す**（受信側が書込先のパスを自分で
+    // 畳み込んで導出する）。秘密を引くのは**この1箇所だけ**にしてある——共通経路で持ち回ると、
+    // ログやエラー文へ載る面が増える。台帳エントリは上の一括確保が既に作っているので、
+    // ここは冪等な読み直しであり、**件数によらず1回の`update`で済む**（残課題#37）。
+    if !pending_elevation.is_empty() {
+        let secret_requests: Vec<(&Path, &str)> = pending_elevation
+            .iter()
+            .map(|(fp, _, _)| (fp.path.as_path(), fp.access.label()))
+            .collect();
+        let issued = crate::tier2a::workspace_capability::ensure_declaration_capabilities(
+            &canonical_workspace_root,
+            &secret_requests,
+        );
+        for ((fp, subject, subject_sid), capability) in pending_elevation.into_iter().zip(issued) {
+            match capability {
+                Ok(capability) => needs_elevation.push(PendingElevation {
                     grant: crate::tier2a::privhelper::FsAllowGrant {
                         path: fp.path.clone(),
                         access: fp.access,
                         forced: fp.forced,
                         // [D-63] 昇格へ回しても宣言の範囲は変わらない。
                         scope: fp.scope,
-                        secret_hex,
+                        secret_hex: capability.secret_hex,
                     },
                     subject,
-                    subject_sid: entry_cap_text.clone(),
-                });
+                    subject_sid,
+                }),
+                // **黙って落とさない**（B-10）。ここで落ちた宣言は昇格へ回らないので、
+                // その穴は開かないまま終わる。
+                Err(e) => {
+                    let reason = format!(
+                        "could not read back the capability secret for this declaration: {e}"
+                    );
+                    warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
+                    denied_passthrough.push((
+                        fp.path.clone(),
+                        fp.access.label().to_string(),
+                        reason,
+                    ));
+                }
             }
         }
     }

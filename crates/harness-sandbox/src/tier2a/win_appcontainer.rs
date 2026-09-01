@@ -240,13 +240,44 @@ pub fn fs_allow_capability_sid(
     declared_path: &Path,
     access: FsAccess,
 ) -> Result<crate::win_common::OwnedSid, AppContainerError> {
-    let name = crate::tier2a::workspace_capability::ensure_declaration_capability_name(
-        workspace,
-        declared_path,
-        access.label(),
-    )
-    .map_err(AppContainerError::Preflight)?;
-    capability_sid_from_name(&name)
+    fs_allow_capability_sids_for_declarations(workspace, &[(declared_path, access)])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            Err(AppContainerError::Preflight(
+                "the batched declaration subject issuer returned no result for a single declaration"
+                    .to_string(),
+            ))
+        })
+}
+
+/// [残課題#37] [`fs_allow_capability_sid`]の**複数件版で、こちらが実体**である。
+/// 宣言N件の宛先SIDを**1回の台帳更新**で確保する。
+///
+/// 1件ずつ呼ぶと台帳の全文往復をN回払い、台帳が育つほど1件あたりが高くなる
+/// （宣言668件で13.46秒、`plans/mac-spike/RESULTS.md` §S42-5）。費用の内訳と、なぜ
+/// 複数件版を正にするかは
+/// [`crate::tier2a::workspace_capability::ensure_declaration_capabilities`]のdocが持つ。
+///
+/// 返り値は`declarations`と同じ順・同じ長さで、**失敗は要素ごと**——1件の宛先SIDが作れなくても
+/// 他の宣言は続ける（呼び出し元は失敗した宣言だけを拒否に落とす）。
+///
+/// **`access`は実際に付けるアクセスを渡すこと**（1件版と同じ理由。CoWでRO降格したなら降格後の値）。
+pub fn fs_allow_capability_sids_for_declarations(
+    workspace: &Path,
+    declarations: &[(&Path, FsAccess)],
+) -> Vec<Result<crate::win_common::OwnedSid, AppContainerError>> {
+    let requests: Vec<(&Path, &str)> = declarations
+        .iter()
+        .map(|(path, access)| (*path, access.label()))
+        .collect();
+    crate::tier2a::workspace_capability::ensure_declaration_capabilities(workspace, &requests)
+        .into_iter()
+        .map(|issued| {
+            let capability = issued.map_err(AppContainerError::Preflight)?;
+            capability_sid_from_name(&capability.capability_name)
+        })
+        .collect()
 }
 
 /// `declared_path`宛に**既に発行済み**の宣言capability SIDを引く（発行はしない）。
@@ -262,7 +293,26 @@ pub fn fs_allow_capability_sids(
     declared_path: &Path,
     workspace: Option<&Path>,
 ) -> Vec<crate::win_common::OwnedSid> {
-    crate::tier2a::workspace_capability::declaration_capability_names(declared_path, workspace)
+    fs_allow_capability_sids_indexed(
+        &crate::tier2a::workspace_capability::DeclarationIndex::load(),
+        declared_path,
+        workspace,
+    )
+}
+
+/// [残課題#37] [`fs_allow_capability_sids`]の、**台帳の写しを渡す版**。
+///
+/// 複数のパスについて続けて引くときはこちらを使う——単発版はパス1件ごとに台帳を全文読んで
+/// 構文解析するので、数百件を取り消す経路では読取が件数ぶん走る。写しの限界（読んだ後に
+/// 発行された宛先SIDは見えない）は
+/// [`crate::tier2a::workspace_capability::DeclarationIndex`]のdocが持つ。
+pub fn fs_allow_capability_sids_indexed(
+    index: &crate::tier2a::workspace_capability::DeclarationIndex,
+    declared_path: &Path,
+    workspace: Option<&Path>,
+) -> Vec<crate::win_common::OwnedSid> {
+    index
+        .capability_names(declared_path, workspace)
         .iter()
         .filter_map(|name| capability_sid_from_name(name).ok())
         .collect()

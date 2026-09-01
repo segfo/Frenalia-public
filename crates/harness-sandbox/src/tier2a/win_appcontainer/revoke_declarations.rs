@@ -158,12 +158,15 @@ pub fn forget_revoked_declarations(revoked: &[std::path::PathBuf]) -> Vec<String
         return Vec::new();
     }
     // `(宣言パスの畳み込み鍵, もう載っていないcapability名)`の対応表を先に作る。
+    // [残課題#37] **台帳の写しは1回だけ取る。** パスごとに引き直すと、全文の読取と構文解析が
+    // 取り消すパスの本数ぶん走る（付与側と同じ形の費用）。
+    let index = crate::tier2a::workspace_capability::DeclarationIndex::load();
     let gone: Vec<(String, Vec<String>)> = revoked
         .iter()
         .map(|p| {
             (
                 crate::tier2a::workspace_capability::declaration_key(p),
-                declaration_capabilities_gone_from_root(p),
+                declaration_capabilities_gone_from_root_indexed(&index, p),
             )
         })
         .collect();
@@ -184,7 +187,21 @@ pub fn forget_revoked_declarations(revoked: &[std::path::PathBuf]) -> Vec<String
 /// ので、「撤収を呼んだ」だけを根拠に台帳から落とすと、実在するACEの記録が消えて
 /// 撤収経路の無い孤児になる（`B-01`/`B-14`）。
 pub fn declaration_capabilities_gone_from_root(path: &Path) -> Vec<String> {
-    crate::tier2a::workspace_capability::declaration_capability_issuers(path)
+    declaration_capabilities_gone_from_root_indexed(
+        &crate::tier2a::workspace_capability::DeclarationIndex::load(),
+        path,
+    )
+}
+
+/// [残課題#37] [`declaration_capabilities_gone_from_root`]の、**台帳の写しを渡す版で、
+/// こちらが実体**である。**「消えている」の判定は実DACLを読んで行う**ので、写しが古くても
+/// 記録を誤って捨てることはない（写しに無いエントリは、そもそも捨てる候補に上がらない）。
+pub fn declaration_capabilities_gone_from_root_indexed(
+    index: &crate::tier2a::workspace_capability::DeclarationIndex,
+    path: &Path,
+) -> Vec<String> {
+    index
+        .issuers(path)
         .into_iter()
         .filter(|(_workspace, name)| match super::capability_sid_from_name(name) {
             // 導出できない名前は「消えた」と言えない（見に行けていないだけ）ので残す。
@@ -228,10 +245,32 @@ pub fn revoke_declaration_capabilities(
     workspace: Option<&Path>,
     progress: &dyn Fn(usize, usize),
 ) -> Result<DeclarationRevokeReport, AppContainerError> {
+    revoke_declaration_capabilities_indexed(
+        &crate::tier2a::workspace_capability::DeclarationIndex::load(),
+        path,
+        workspace,
+        progress,
+    )
+}
+
+/// [残課題#37] [`revoke_declaration_capabilities`]の、**台帳の写しを渡す版で、こちらが実体**である。
+///
+/// 宣言を数百件まとめて取り消す経路（ポリシーエディタのパス2開始時の差分撤収）は、
+/// パス1件ごとに台帳を全文読んで構文解析していた。付与側（残課題#37）と**同じ形の費用**で、
+/// 「配る側だけ速くして剥がす側を取り残す」を避けるためにこちらも写しを1回にする。
+///
+/// 写しの限界は[`crate::tier2a::workspace_capability::DeclarationIndex`]のdocが持つ
+/// （見落としは「剥がし残す」側へ倒れ、他人のACEを剥がす向きには倒れない）。
+pub fn revoke_declaration_capabilities_indexed(
+    index: &crate::tier2a::workspace_capability::DeclarationIndex,
+    path: &Path,
+    workspace: Option<&Path>,
+    progress: &dyn Fn(usize, usize),
+) -> Result<DeclarationRevokeReport, AppContainerError> {
     let Some(workspace) = workspace else {
-        return revoke_all_declaration_capabilities(path, progress);
+        return revoke_all_declaration_capabilities(index, path, progress);
     };
-    let subjects = super::fs_allow_capability_sids(path, workspace.into());
+    let subjects = super::fs_allow_capability_sids_indexed(index, path, workspace.into());
     revoke_capability_subjects(path, &subjects, progress)
 }
 
@@ -242,10 +281,20 @@ pub fn revoke_declaration_capabilities(
 /// 2つを持つので、同じ規則を両方に書くと片方だけ更新されて静かにずれる（`B-05`）——
 /// どちらもこの関数を通す。
 pub fn revocable_declaration_issuers(path: &Path) -> DeclarationIssuers {
+    revocable_declaration_issuers_indexed(
+        &crate::tier2a::workspace_capability::DeclarationIndex::load(),
+        path,
+    )
+}
+
+/// [残課題#37] [`revocable_declaration_issuers`]の、**台帳の写しを渡す版で、こちらが実体**である。
+/// 生存の判定（`live_modes`）は別の台帳なので、ここでは写しに載らない。
+pub fn revocable_declaration_issuers_indexed(
+    index: &crate::tier2a::workspace_capability::DeclarationIndex,
+    path: &Path,
+) -> DeclarationIssuers {
     let mut issuers = DeclarationIssuers::default();
-    for (workspace, name) in
-        crate::tier2a::workspace_capability::declaration_capability_issuers(path)
-    {
+    for (workspace, name) in index.issuers(path) {
         let live = crate::tier2a::workspace_ledger::live_modes(Path::new(&workspace));
         if live.is_empty() {
             issuers.eligible.push((workspace, name));
@@ -276,10 +325,11 @@ pub struct DeclarationIssuers {
 /// [`revoke_declaration_capabilities`]の`None`（全workspace）側。生きているworkspaceが発行した
 /// 宛先SIDだけを外し、残りを剥がす。
 fn revoke_all_declaration_capabilities(
+    index: &crate::tier2a::workspace_capability::DeclarationIndex,
     path: &Path,
     progress: &dyn Fn(usize, usize),
 ) -> Result<DeclarationRevokeReport, AppContainerError> {
-    let issuers = revocable_declaration_issuers(path);
+    let issuers = revocable_declaration_issuers_indexed(index, path);
     let mut left_alone = issuers.left_alone;
     let mut subjects = Vec::new();
     for (_workspace, name) in issuers.eligible {

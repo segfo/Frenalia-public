@@ -724,12 +724,18 @@ fn reconcile_undeclared_roots(
     // 大きなツリーでは時間がかかる（`.cargo`への付与は実測142.6s）。
     on_event(NetRecordEvent::RevokingUndeclared { total: stale.len() });
     let profile = harness_sandbox::tier2a::session_profile::current_profile_name();
+    // [残課題#37] **撤収の索引は1回だけ読む。** 単発版はパス1件ごとに台帳を全文読んで
+    // 構文解析するので、宣言を数百件まとめて取り消すこの経路では、その読取が件数ぶん走る
+    // （付与側と同じ形の費用。「配る側だけ速くして剥がす側を取り残さない」）。
+    // 写しの限界は`workspace_capability::DeclarationIndex`のdocが持つ。
+    let declaration_index = harness_sandbox::tier2a::workspace_capability::DeclarationIndex::load();
     for (index, path) in stale.iter().enumerate() {
         // [§22.2.1] **`--fs-allow`の宛先SIDは宣言ごとのcapability SIDへ移った。**
         // package SIDの撤収（下）だけでは、宣言を取り消しても穴が閉じない。
         // 絞り込みは自分のworkspaceに限る——このプロセスが開けた穴だけが対象で、
         // 同じパスを宣言している他のworkspaceの宛先SIDには触らない（BUG-046と同型）。
-        match harness_sandbox::tier2a::win_appcontainer::revoke_declaration_capabilities(
+        match harness_sandbox::tier2a::win_appcontainer::revoke_declaration_capabilities_indexed(
+            &declaration_index,
             path,
             Some(&canonical_ws),
             &|_, _| {},

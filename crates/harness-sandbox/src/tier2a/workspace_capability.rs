@@ -191,6 +191,32 @@ pub fn declaration_key(path: &Path) -> String {
     workspace_key(path)
 }
 
+/// 台帳エントリを突き合わせる鍵（workspace・宣言・mode の3軸）。
+///
+/// **[`matches`]と索引（[`ensure_names_in`]の`HashMap`）が同じ鍵を使うために在る。**
+/// 突合の規則が2箇所にあると、片方だけ軸を落としたときに「引けるのに引けない」形で
+/// 静かにずれる（B-05）——だから規則はこの2つの取り出し関数だけが持ち、`matches`も
+/// 索引もそこを通る。
+type CapabilityKey = (String, Option<String>, String);
+
+fn entry_key(entry: &WorkspaceCapabilityEntry) -> CapabilityKey {
+    (
+        workspace_key(Path::new(&entry.workspace)),
+        entry.declaration.clone(),
+        entry.mode.clone(),
+    )
+}
+
+/// [`entry_key`]と突き合わせる側の鍵。`workspace`は**[`workspace_key`]を通した後の値**を渡すこと
+/// （エントリ側はこの関数の中で通しているが、引く側は呼び出し元が既に持っている）。
+fn lookup_key(workspace: &str, declaration: Option<&str>, mode: &str) -> CapabilityKey {
+    (
+        workspace.to_string(),
+        declaration.map(str::to_owned),
+        mode.to_string(),
+    )
+}
+
 /// 台帳エントリの突合。**3つの軸（workspace・宣言・mode）を必ず揃って見る。**
 ///
 /// `declaration`を突合から落とすと、workspace本体を引いたつもりで宣言エントリが返る
@@ -202,9 +228,7 @@ fn matches(
     declaration: Option<&str>,
     mode: &str,
 ) -> bool {
-    workspace_key(Path::new(&entry.workspace)) == workspace
-        && entry.declaration.as_deref() == declaration
-        && entry.mode == mode
+    entry_key(entry) == lookup_key(workspace, declaration, mode)
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -343,46 +367,111 @@ fn ensure_name_in(
     declaration: Option<&str>,
     mode: &str,
 ) -> Result<DeclarationCapability, String> {
-    let key = workspace_key(workspace);
-    ledger.update(|l| {
-        if let Some(entry) = l
-            .entries
-            .iter()
-            .find(|e| matches(e, &key, declaration, mode))
-        {
-            return Ok(DeclarationCapability {
-                secret_hex: entry.secret_hex.clone(),
-                capability_name: entry.capability_name.clone(),
-            });
-        }
-        let secret = generate_secret()?;
-        let secret_hex = to_hex(&secret);
-        // **名前の作り方は軸で違う**（[`declaration_capability_name`]のdoc）。workspace本体は
-        // 秘密だけから、宣言は`(秘密, 畳み込み済みパス, access級)`から決まる。
-        let name = match declaration {
-            None => capability_name_from_secret(&secret),
-            Some(declared) => declaration_capability_name(&secret_hex, declared, mode),
-        };
-        l.entries.push(WorkspaceCapabilityEntry {
-            workspace: workspace.to_string_lossy().into_owned(),
-            declaration: declaration.map(|d| d.to_string()),
-            mode: mode.to_string(),
-            secret_hex: secret_hex.clone(),
-            capability_name: name.clone(),
-            granted_at_unix_secs: now_unix_secs(),
-            // 宣言エントリはツリーの救済walkを持たない（対象は宣言されたパスだけで、
-            // workspaceのような26万ノードの木ではない）ので、この2欄は`None`のまま使わない。
-            tree_verified_at_unix_secs: None,
-            root_file_id: None,
-            preparation_started_at_unix_secs: None,
-            preparation_root_file_id: None,
-            preparation_failed_at_unix_secs: None,
-            preparation_error: None,
-        });
-        Ok(DeclarationCapability {
-            secret_hex,
-            capability_name: name,
+    ensure_names_in(ledger, workspace, &[(declaration, mode)])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            // 到達しない（1件渡して0件返る）が、`expect`で落とすと**秘密の発行経路が
+            // panicで死ぬ**ので、fail-closedな`Err`にする。
+            Err("the batched capability issuer returned no result for a single request".to_string())
         })
+}
+
+/// [残課題#37] [`ensure_name_in`]の**複数件版で、こちらが実体**である。
+///
+/// # なぜ複数件版を正にするのか
+///
+/// 1件版は`Ledger::update`を**1件につき1回**払う。その1回は台帳の全文読取1回・全文の
+/// 直列化2回・`.bak`への全文コピー1回・全文書込1回を含むので、**台帳が育つほど1件あたりが
+/// 高くなる**——実測で宣言668件のとき1件あたりが1件のときの22.9倍（合計13.46秒、
+/// `plans/mac-spike/RESULTS.md` §S42-5）。宣言N件を1回の`update`にまとめると、この費用は
+/// 全文1往復に畳まれる。
+///
+/// **1件版をこの1要素呼び出しにしてあるのは、名前の作り方を2箇所に置かないためである**
+/// （`docs/CODE-STRUCTURE-RULES.md`§5.1）。同じ宣言なのに経路によって別の宛先SIDになると、
+/// 撤収側は別のSIDを探しに行って1件も剥がせない。
+///
+/// # 返り値は入力と同じ順・同じ長さで、失敗は要素ごと
+///
+/// 1件の失敗（CSPRNGが使えない等）で全件を落とさない——呼び出し元（`preflight`）は
+/// 失敗した宣言だけを拒否に落として残りを続ける形になっている。
+///
+/// # 同じ鍵が2回来ても1件しか作らない
+///
+/// 索引へ**追記した時点で登録する**ので、`requests`に同じ`(宣言, mode)`が重複していても
+/// エントリは1つで、2回目は1回目と同じ名前を返す。1件版はこれを`update`の直列化で
+/// 得ていた（前の呼び出しの追記が次の読取に見える）ので、まとめた途端に二重発行へ
+/// 倒れないようにここで明示する。
+fn ensure_names_in(
+    ledger: &Ledger<WorkspaceCapabilityLedger>,
+    workspace: &Path,
+    requests: &[(Option<&str>, &str)],
+) -> Vec<Result<DeclarationCapability, String>> {
+    // **空なら台帳へ触らない。** 「確保するものが無い」は失敗ではないし、`update`は
+    // 無変更でも読み取り専用属性を付け直すので、呼ぶだけで実マシンに触ることになる。
+    if requests.is_empty() {
+        return Vec::new();
+    }
+    let key = workspace_key(workspace);
+    let workspace_display = workspace.to_string_lossy().into_owned();
+    ledger.update(|l| {
+        // 既存分の索引を**1回だけ**組む。1件ずつ`find`で線形に走ると、突合のたびに
+        // `workspace_key`が全エントリぶん走る（N件の確保でN²回）。
+        let mut index: std::collections::HashMap<CapabilityKey, usize> =
+            std::collections::HashMap::with_capacity(l.entries.len());
+        for (position, entry) in l.entries.iter().enumerate() {
+            // 同じ鍵が複数あるとき（過去の綴り揺れ等）は**先に在るものを正とする**
+            // ——1件版の`find`と同じ選び方。
+            index.entry(entry_key(entry)).or_insert(position);
+        }
+        let mut results = Vec::with_capacity(requests.len());
+        for (declaration, mode) in requests {
+            let wanted = lookup_key(&key, *declaration, mode);
+            if let Some(&position) = index.get(&wanted) {
+                let entry = &l.entries[position];
+                results.push(Ok(DeclarationCapability {
+                    secret_hex: entry.secret_hex.clone(),
+                    capability_name: entry.capability_name.clone(),
+                }));
+                continue;
+            }
+            let secret = match generate_secret() {
+                Ok(secret) => secret,
+                Err(e) => {
+                    results.push(Err(e));
+                    continue;
+                }
+            };
+            let secret_hex = to_hex(&secret);
+            // **名前の作り方は軸で違う**（[`declaration_capability_name`]のdoc）。workspace本体は
+            // 秘密だけから、宣言は`(秘密, 畳み込み済みパス, access級)`から決まる。
+            let name = match declaration {
+                None => capability_name_from_secret(&secret),
+                Some(declared) => declaration_capability_name(&secret_hex, declared, mode),
+            };
+            index.insert(wanted, l.entries.len());
+            l.entries.push(WorkspaceCapabilityEntry {
+                workspace: workspace_display.clone(),
+                declaration: declaration.map(|d| d.to_string()),
+                mode: mode.to_string(),
+                secret_hex: secret_hex.clone(),
+                capability_name: name.clone(),
+                granted_at_unix_secs: now_unix_secs(),
+                // 宣言エントリはツリーの救済walkを持たない（対象は宣言されたパスだけで、
+                // workspaceのような26万ノードの木ではない）ので、この2欄は`None`のまま使わない。
+                tree_verified_at_unix_secs: None,
+                root_file_id: None,
+                preparation_started_at_unix_secs: None,
+                preparation_root_file_id: None,
+                preparation_failed_at_unix_secs: None,
+                preparation_error: None,
+            });
+            results.push(Ok(DeclarationCapability {
+                secret_hex,
+                capability_name: name,
+            }));
+        }
+        results
     })
 }
 
@@ -403,7 +492,11 @@ pub struct DeclarationCapability {
 /// **これが§22.2.0の導出鍵`(秘密, 畳み込み済みパス, access級)`の実体である。** 秘密は
 /// workspace＋宣言ごとに1つで、同じ宣言をする複数のドメインは同じ名前＝同じSIDを共有する
 /// ——ACEの本数が「宣言の種類数」で止まり、ドメイン数倍にならないのはこのためである（§22.3.3）。
-fn ensure_declaration_capability_in(
+///
+/// **`pub(crate)`なのは費用測定の計器のためである**（`acl_baseline_cost_tests`）。台帳を
+/// `%TEMP%`へ差し替えて**製品の関数そのもの**を計測できるようにしてある——形を書き写した
+/// 再現で測ると、製品が変わったときに計器だけが古いまま緑になる。
+pub(crate) fn ensure_declaration_capability_in(
     ledger: &Ledger<WorkspaceCapabilityLedger>,
     workspace: &Path,
     declared_path: &Path,
@@ -423,6 +516,46 @@ pub fn ensure_declaration_capability(
     access_class: &str,
 ) -> Result<DeclarationCapability, String> {
     ensure_declaration_capability_in(&ledger(), workspace, declared_path, access_class)
+}
+
+/// [残課題#37] [`ensure_declaration_capability`]の**複数件版**。宣言N件の宛先SIDを
+/// **1回の台帳更新**で確保する。
+///
+/// 1件ずつ確保すると、台帳の全文読取・全文の直列化2回・`.bak`への全文コピー・全文書込を
+/// **1件につき1回**払う。台帳が育つほど1件あたりが高くなるので合計はおおよそ件数の2乗で、
+/// 実測は宣言668件で13.46秒（`plans/mac-spike/RESULTS.md` §S42-5）。まとめると全文1往復になる。
+///
+/// 返り値は`declarations`と同じ順・同じ長さで、失敗は要素ごと。**同じ宣言が重複していても
+/// 台帳エントリは1つ**で、両方に同じ名前が返る。
+///
+/// **呼ぶのは「その宣言に実際に許可を書く」と決まってからにすること。** ここで確保した時点で
+/// 台帳に撤収の索引が載るので、存在しないパスや拒否するパスを混ぜると、**剥がす相手のいない
+/// 記録**が残る（`preflight`は絞り込みを終えてからこれを呼ぶ）。
+pub fn ensure_declaration_capabilities(
+    workspace: &Path,
+    declarations: &[(&Path, &str)],
+) -> Vec<Result<DeclarationCapability, String>> {
+    ensure_declaration_capabilities_in(&ledger(), workspace, declarations)
+}
+
+/// [`ensure_declaration_capabilities`]の台帳差し替え版（`pub(crate)`の理由は
+/// [`ensure_declaration_capability_in`]と同じ——費用測定が製品の関数を通るため）。
+pub(crate) fn ensure_declaration_capabilities_in(
+    ledger: &Ledger<WorkspaceCapabilityLedger>,
+    workspace: &Path,
+    declarations: &[(&Path, &str)],
+) -> Vec<Result<DeclarationCapability, String>> {
+    // 畳み込みは[`declaration_key`]ただ1つを通す（1件版と同じ規則、B-20）。
+    let folded: Vec<String> = declarations
+        .iter()
+        .map(|(path, _)| declaration_key(path))
+        .collect();
+    let requests: Vec<(Option<&str>, &str)> = folded
+        .iter()
+        .zip(declarations)
+        .map(|(key, (_, access_class))| (Some(key.as_str()), *access_class))
+        .collect();
+    ensure_names_in(ledger, workspace, &requests)
 }
 
 /// [`ensure_declaration_capability_name`]の**発行しない版**（workspace本体に対する
@@ -521,24 +654,75 @@ fn ensure_declaration_capability_name_in(
         .map(|c| c.capability_name)
 }
 
+/// [残課題#37] 台帳を**1回だけ読んだ写し**。複数のパスについて撤収の索引を引くときに使う。
+///
+/// # なぜ写しが要るのか
+///
+/// 撤収の索引を引く関数（[`declaration_capability_names`]・[`declaration_capability_issuers`]）は
+/// **1回の呼び出しにつき台帳を全文読んで構文解析する**。宣言を数百件まとめて取り消す経路では
+/// その読取がパスの本数ぶん走り、付与側と同じ「件数の2乗」の形になる（付与側と違って書込が
+/// 無いぶん安いだけで、形は同じ）。
+///
+/// # 写しであることの限界（**黙って使わない**）
+///
+/// 読んだ**後に**他プロセスが発行した宛先SIDは、この写しには載らない。撤収でこれが問題に
+/// ならないのは、見落としが**「剥がし残す」側へ倒れる**からである——「他人の使っているACEを
+/// 剥がす」（[BUG-046](../../../docs/bugs/BUG-046.md)）の向きには倒れない。記録を落とす側は
+/// 別途**実DACLを読んでから**判断するので、写しが古くても索引を失わない。
+///
+/// **付与側では使わないこと。** あちらは「無ければ作る」なので、写しで判断すると同じ宣言に
+/// 二重に秘密を発行し得る（発行は[`ensure_declaration_capabilities`]の`update`の中で行う）。
+pub struct DeclarationIndex {
+    entries: Vec<WorkspaceCapabilityEntry>,
+}
+
+impl DeclarationIndex {
+    /// 製品の台帳（`%APPDATA%`）を1回読む。
+    pub fn load() -> Self {
+        Self {
+            entries: ledger().load().entries,
+        }
+    }
+
+    fn from_ledger(ledger: &Ledger<WorkspaceCapabilityLedger>) -> Self {
+        Self {
+            entries: ledger.load().entries,
+        }
+    }
+
+    /// [`declaration_capability_names`]の写し版。**規則はこちらが正本**で、単発の関数は
+    /// 写しを1つ作ってここへ来る。
+    pub fn capability_names(&self, declared_path: &Path, workspace: Option<&Path>) -> Vec<String> {
+        let declaration = declaration_key(declared_path);
+        let workspace_filter = workspace.map(workspace_key);
+        self.entries
+            .iter()
+            .filter(|e| e.declaration.as_deref() == Some(declaration.as_str()))
+            .filter(|e| match &workspace_filter {
+                Some(key) => &workspace_key(Path::new(&e.workspace)) == key,
+                None => true,
+            })
+            .map(|e| e.capability_name.clone())
+            .collect()
+    }
+
+    /// [`declaration_capability_issuers`]の写し版（同上）。
+    pub fn issuers(&self, declared_path: &Path) -> Vec<(String, String)> {
+        let declaration = declaration_key(declared_path);
+        self.entries
+            .iter()
+            .filter(|e| e.declaration.as_deref() == Some(declaration.as_str()))
+            .map(|e| (e.workspace.clone(), e.capability_name.clone()))
+            .collect()
+    }
+}
+
 fn declaration_capability_names_in(
     ledger: &Ledger<WorkspaceCapabilityLedger>,
     declared_path: &Path,
     workspace: Option<&Path>,
 ) -> Vec<String> {
-    let declaration = declaration_key(declared_path);
-    let workspace_filter = workspace.map(workspace_key);
-    ledger
-        .load()
-        .entries
-        .into_iter()
-        .filter(|e| e.declaration.as_deref() == Some(declaration.as_str()))
-        .filter(|e| match &workspace_filter {
-            Some(key) => &workspace_key(Path::new(&e.workspace)) == key,
-            None => true,
-        })
-        .map(|e| e.capability_name)
-        .collect()
+    DeclarationIndex::from_ledger(ledger).capability_names(declared_path, workspace)
 }
 
 /// `declared_path`宛に発行済みの宣言capability名を引く（**生成はしない**）。
@@ -567,14 +751,7 @@ pub fn declaration_capability_names(
 /// （生存判定そのものは[`crate::tier2a::workspace_ledger::live_modes`]が持つ既存のゲートで、
 /// ここでは持たない）。
 pub fn declaration_capability_issuers(declared_path: &Path) -> Vec<(String, String)> {
-    let declaration = declaration_key(declared_path);
-    ledger()
-        .load()
-        .entries
-        .into_iter()
-        .filter(|e| e.declaration.as_deref() == Some(declaration.as_str()))
-        .map(|e| (e.workspace, e.capability_name))
-        .collect()
+    DeclarationIndex::load().issuers(declared_path)
 }
 
 /// `declared_path`宛に発行済みの宣言capabilityの**導出の前像**（`(秘密, access級)`）。
