@@ -2625,21 +2625,46 @@ fn fs_allow_case_bare_path_grants_the_object_only(ledger: &FsLedgerExclusive) ->
 /// **台帳ではなく実体を見る**（`B-14`）。`S-1-15-2-`はAppContainerのpackage SID、
 /// `S-1-15-3-`はcapability SIDで、`--fs-allow`の宛先SIDは前者から後者へ移った（§22.3）。
 fn count_sid_aces(path: &Path, prefix: &str) -> Result<usize, String> {
+    Ok(sid_aces(path, prefix)?.len())
+}
+
+/// [`count_sid_aces`]の**綴りまで返す版**（同じ`Get-Acl`の1回で本数も綴りも取れるので、
+/// 数える側をこちらへ寄せてある——2つの読み方が別々のPowerShellを持つと、片方だけ
+/// フィルタが変わってずれる形を作る）。
+///
+/// **本数だけでは級を判定できない。** `--fs-allow`の宛先SIDは`(秘密, 畳み込み済みパス,
+/// access級)`から導出されるので、**級が違えば別の綴りのSID**になる（§22.2.0）。
+/// 「1本だけ載っている」は本数の話でしかなく、載っているのが宣言した級のものかは
+/// 綴りを見るまで言えない。
+fn sid_aces(path: &Path, prefix: &str) -> Result<Vec<String>, String> {
     let output = Command::new("powershell")
         .args([
             "-NoProfile",
             "-Command",
             &format!(
-                "@((Get-Acl '{}').Access | Where-Object {{ $_.IdentityReference -like '{prefix}*' }}).Count",
+                "@((Get-Acl '{}').Access | Where-Object {{ $_.IdentityReference -like '{prefix}*' }}) \
+                 | ForEach-Object {{ $_.IdentityReference.Value }}",
                 path.display()
             ),
         ])
         .output()
         .map_err(|e| format!("failed to run Get-Acl: {e}"))?;
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<usize>()
-        .map_err(|e| format!("could not read the ACE count for {}: {e}", path.display()))
+    // **読めなかったことを0本と読ませない**（`B-10`）。旧版は`.Count`を数えており、
+    // `Get-Acl`自体が失敗しても`0`が返って「ACEは載っていない」と同じ形になっていた。
+    if !output.status.success() {
+        return Err(format!(
+            "Get-Acl on {} failed with {}: {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// [§22.2.1] **`--fs-allow`のACEはharnessの終了後も残り、`harness fs revoke`で消える。**
@@ -2744,6 +2769,937 @@ fn fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it(
     Ok(())
 }
 
+// ----------------------------------------------------------------------------
+// 昇格が要るシステム保護パスの腕（残課題#20の測定7、分流D）
+//
+// # 何を測るのか
+//
+// `preflight`は`--fs-allow`のACEを**このプロセスで書けなかったとき**だけ`needs_elevation`へ
+// 積み、そこから先は別の後始末（完走・部分適用・ヘルパー不通の3分岐）を通る。2026-09-01の
+// 分流N1は**まさにこの区間**を「昇格の後で宛先SIDを導出し直す」から「導出済みのSIDを
+// `PendingElevation`で持ち回す」へ変えた。ところが受け入れ測定（§S40）は`C:\`直下の
+// 書けるパスでしか回っておらず、**この区間はどのテストからも1度も実行されていない**。
+//
+// # どうやって`needs_elevation`へ入れるか
+//
+// 入るための条件はただ1つ、「素の`SetNamedSecurityInfoW`が`ACCESS_DENIED`になること」である。
+// このE2Eは`dev-elevated-runner`配下で走る＝**テストもharnessも管理者**なので、普通のパスは
+// 全部書けてしまう。そこで**合成のシステム保護パス**を作る（[`SystemProtectedDir`]）——
+// 所有者をLocalSystemにし、DACLから`WRITE_DAC`を持つ項目を落とす。管理者トークンでも
+// `WRITE_DAC`が取れなくなり、`SeRestorePrivilege`（`--force-system-acl`＝D-19の経路）でしか
+// 書けない状態になる。これは`NT SERVICE\TrustedInstaller`所有ツリーが持つ性質と同じ形で、
+// **本物のシステムディレクトリへACEを書かずに**同じ分岐へ入れる。
+//
+// # この器が測れないこと（先に書く）
+//
+// - **特権分離ヘルパー（privhelper、D-16）の線は通らない。** harness本体が既に管理者なので
+//   `preflight`は「本体が既に管理者」の枝へ入り、ヘルパーへは委譲しない。非昇格のharnessから
+//   ヘルパーだけを昇格させる口は`plans/PLAN-NONELEVATED-E2E.md`の段階2〜5が未実装で、
+//   いま非昇格で回すとUACが出る。**ヘルパー側が`secret_hex`から独立に導出し直すSIDと、
+//   こちら側が運ぶSIDが一致するか**は、したがって本器の射程外である。
+// - **運ばれた宛先SIDの文字列そのものは読めない。** `harness-sandbox`はSIDを文字列にする口を
+//   クレート外へ出しておらず（`win_common::sid_to_string`は`pub(crate)`）、`granted_passthrough`は
+//   プロセスの外へ出ない。外から見えるのは**実DACL上のcapability ACEの本数**と**子の到達性**で、
+//   本器はその2つで「宣言した1件だけが開いている」を固定する。
+// ----------------------------------------------------------------------------
+
+/// LocalSystem。合成のシステム保護パスの所有者にする相手。
+const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+/// `WRITE_DAC`（`FileSystemRights::ChangePermissions`）。DACLを書き換える権利そのもの。
+const WRITE_DAC_MASK: u32 = 0x0004_0000;
+
+/// 合成のシステム保護ディレクトリ。**作った側が必ず戻す**（`Drop`で所有者と権限を戻して消す）。
+///
+/// `Drop`にしてあるのは、途中でassertが落ちても実マシンに「所有者がLocalSystemで、自分では
+/// 消せないディレクトリ」を残さないためである。`?`で早期に返るケース関数の途中に後始末を
+/// 書くと、**落ちた回だけ残骸が出る**——そして残骸は次の測定の前後差に混ざる。
+struct SystemProtectedDir {
+    path: PathBuf,
+    /// 戻す先の所有者（＝この測定を走らせているユーザー）。
+    restore_owner_sid: String,
+}
+
+impl SystemProtectedDir {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SystemProtectedDir {
+    fn drop(&mut self) {
+        // 所有権を取り戻す → フルコントロールを付け直す → 消す、の順。順番を変えると
+        // 「所有者ではないのでDACLを書けない」で止まる。
+        let owner = format!("*{}", self.restore_owner_sid);
+        let grant = format!("*{}:(OI)(CI)(F)", self.restore_owner_sid);
+        for (args, what) in [
+            (vec!["/setowner", owner.as_str()], "restore owner"),
+            (vec!["/grant", grant.as_str()], "restore full control"),
+        ] {
+            if let Err(e) = icacls_on(&self.path, &args, what) {
+                eprintln!("[fs-allow-elev] cleanup: {e}");
+            }
+        }
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            // **黙って諦めない。** 残ると次の測定の前後差に混ざるので、手で消すための
+            // 手順をその場に出す（`B-10`: 無言で失敗しない）。
+            eprintln!(
+                "[fs-allow-elev] cleanup: could not remove {} ({e}). Recover with (elevated): \
+                 icacls \"{}\" /setowner \"*{}\" && icacls \"{}\" /grant \"*{}:(OI)(CI)(F)\" && \
+                 rmdir /s /q \"{}\"",
+                self.path.display(),
+                self.path.display(),
+                self.restore_owner_sid,
+                self.path.display(),
+                self.restore_owner_sid,
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// `icacls`を1回だけ叩く。**対象が実在することを先に確かめる**（[BUG-012](../../../docs/bugs/BUG-012.md):
+/// 実在しないパスを渡すと`icacls`は黙って別の場所を走査しに行く）。`/T`は一切使わない。
+fn icacls_on(dir: &Path, args: &[&str], what: &str) -> Result<(), String> {
+    if !dir.exists() {
+        return Err(format!(
+            "refusing to run icacls ({what}): {} does not exist (BUG-012)",
+            dir.display()
+        ));
+    }
+    let output = Command::new("icacls")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run icacls ({what}) on {}: {e}", dir.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "icacls ({what}) on {} failed with {}: {} {}",
+            dir.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// `path`の**所有者SID**と、**LocalSystem以外で`WRITE_DAC`を持つACEの本数**を実測する。
+///
+/// `icacls`の終了コードは信用しない——設定に失敗しても成功に見えることがあるので、
+/// 掛けた保護が本当に掛かったかは**別の口で読み直して**確かめる。
+fn owner_and_foreign_write_dac(path: &Path) -> Result<(String, usize), String> {
+    let script = format!(
+        "$acl = Get-Acl -LiteralPath '{}'; \
+         Write-Output ('OWNER=' + $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value); \
+         $bad = @($acl.Access | Where-Object {{ \
+             ((([int]$_.FileSystemRights) -band {WRITE_DAC_MASK}) -ne 0) -and \
+             ($_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne '{LOCAL_SYSTEM_SID}') }}).Count; \
+         Write-Output ('WRITEDAC_OTHERS=' + $bad)",
+        path.display()
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| format!("failed to read the ACL of {}: {e}", path.display()))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let field = |key: &str| -> Result<String, String> {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(key).map(str::to_string))
+            .ok_or_else(|| format!("could not read {key} for {} from: {text}", path.display()))
+    };
+    let owner = field("OWNER=")?;
+    let holders = field("WRITEDAC_OTHERS=")?.parse::<usize>().map_err(|e| {
+        format!(
+            "could not parse WRITEDAC_OTHERS for {}: {e}",
+            path.display()
+        )
+    })?;
+    Ok((owner, holders))
+}
+
+/// `dir`を**合成のシステム保護パス**に変える。戻り値の`Drop`が元へ戻す。
+///
+/// 掛けるのは3手で、どれが欠けても「昇格が要る」状態にならない。
+///
+/// 1. 継承ACEを落とす（`/inheritance:r`）——親から降りてくるフルコントロールを消す
+/// 2. LocalSystemへフルコントロール、**このユーザーへはModify**（`WRITE_DAC`を渡さない）
+/// 3. 所有者をLocalSystemにする——**所有者には`WRITE_DAC`が暗黙に付く**ので、
+///    自分が所有者のままだと2をやっても書けてしまう
+///
+/// 3手を掛けたあと、**掛かったことを別の口（`Get-Acl`）で読み直して確かめる**。
+///
+/// # なぜユーザー側を`(RX)`ではなく`(M)`にするか（**計器で軸を潰さないため**）
+///
+/// AppContainerの判定は**ユーザー側とcapability側の両方**が許して初めて通る（DACLは
+/// 片方だけでは開かない）。ユーザー側を`(RX)`にすると、子は**何をトークンへ積んでいても**
+/// このディレクトリへ書けなくなる——つまり`HARD_WRITE=DENIED`は保護の掛け方だけで確定し、
+/// 「宣言した級（`read_exec`）で開いたから書けない」の証拠にならない。それは
+/// 本ケースが測りたい軸（**級**）を計器の側で潰している状態である。
+///
+/// `Modify`（`0x301BF`）は`WRITE_DAC`（`0x40000`）を**含まない**ので、DACLの書込は
+/// 依然`ACCESS_DENIED`のまま＝`needs_elevation`へ入る性質は変わらず、下の
+/// 「非SYSTEMで`WRITE_DAC`を持つACEは0本」の検算も変わらない。**変わるのは、
+/// 書込の可否を決めるのがcapability側だけになることである。**
+fn harden_as_system_protected(dir: &Path) -> Result<SystemProtectedDir, String> {
+    let user_sid = harness_sandbox::win_pipe_ipc::current_user_sid_string()
+        .map_err(|e| format!("could not resolve the current user SID: {e}"))?;
+    let guard = SystemProtectedDir {
+        path: dir.to_path_buf(),
+        restore_owner_sid: user_sid.clone(),
+    };
+    let system_full = format!("*{LOCAL_SYSTEM_SID}:(OI)(CI)(F)");
+    let user_modify = format!("*{user_sid}:(OI)(CI)(M)");
+    let system_owner = format!("*{LOCAL_SYSTEM_SID}");
+    icacls_on(dir, &["/inheritance:r"], "drop inherited ACEs")?;
+    icacls_on(dir, &["/grant", system_full.as_str()], "grant SYSTEM full")?;
+    icacls_on(dir, &["/grant", user_modify.as_str()], "grant user modify")?;
+    icacls_on(
+        dir,
+        &["/setowner", system_owner.as_str()],
+        "set owner=SYSTEM",
+    )?;
+
+    let (owner, foreign_write_dac) = owner_and_foreign_write_dac(dir)?;
+    if owner != LOCAL_SYSTEM_SID {
+        return Err(format!(
+            "the synthetic system-protected directory {} is still owned by {owner} (expected \
+             {LOCAL_SYSTEM_SID}); an owner always holds WRITE_DAC implicitly, so the in-process \
+             grant would succeed and the measurement would never reach the elevation branch",
+            dir.display()
+        ));
+    }
+    if foreign_write_dac != 0 {
+        return Err(format!(
+            "{} still has {foreign_write_dac} non-SYSTEM ACE(s) carrying WRITE_DAC; the \
+             in-process grant would succeed and the measurement would never reach the elevation \
+             branch",
+            dir.display()
+        ));
+    }
+    Ok(guard)
+}
+
+/// このworkspaceが発行した、`declared_path`宛の宣言capabilityの件数（**台帳側の索引**）。
+///
+/// 実DACLとも、子のトークンとも別の経路で作られる第3の値である（§S38-4・§S40-2）。
+fn declaration_capability_count(declared_path: &Path, workspace: &Path) -> usize {
+    harness_sandbox::tier2a::workspace_capability::declaration_capability_names(
+        declared_path,
+        Some(workspace),
+    )
+    .len()
+}
+
+/// `workspace`が`declared_path`を`access`級で宣言したときの**宛先SIDの綴り**。
+///
+/// # なぜ「書いて読み直す」のか
+///
+/// SIDを文字列にする口（`win_common::sid_to_string`）は`harness-sandbox`の外へ出ていないので、
+/// このプロセスからは綴りを直接作れない。そこで**使い捨てのディレクトリへその宛先SID宛の
+/// ACEを1本だけ書き、`Get-Acl`で読み直す**——OSに綴らせるので、SID文字列化を自前で
+/// 実装し直す（＝新しい検算を1つ増やす）ことを避けられる。読み終えたらディレクトリごと
+/// 消すので、ACEも道連れになる。
+///
+/// # これで何が測れるようになるか（**級の軸**）
+///
+/// 実DACLに載っているcapability ACEの綴りを、**テスト側が明示した級**から作った綴りと
+/// 突き合わせられる。本数（[`count_sid_aces`]）は級に無関心なので、「宣言した級のもの1件だけ」
+/// という白黒条件は本数だけでは判定できない。
+///
+/// # 限界（同じ場所で言う）
+///
+/// 突き合わせる2つは`fs_allow_capability_sid`まで遡ると同じ関数である。**級を渡し違える
+/// 欠陥は捕まえられるが、その関数自身の導出が取り違えている欠陥は両方を同じだけずらす**
+/// （§S38-4と同じ形）。
+///
+/// # 呼ぶ順序の拘束
+///
+/// この関数は`fs_allow_capability_sid`経由で**台帳へ発行もする**（冪等だが、未発行なら作る）。
+/// したがって「台帳の宣言capabilityが何件か」を見るassertより**後**に呼ぶこと——先に呼ぶと、
+/// 測定対象の実行が発行し損ねていても件数が揃ってしまう。
+fn capability_sid_text(
+    workspace: &Path,
+    declared_path: &Path,
+    access: harness_sandbox::FsAccess,
+    probe_tag: &str,
+) -> Result<String, String> {
+    let probe = fs_allow_case_dir(&format!("elev-cal-{probe_tag}"));
+    let read_back = (|| -> Result<String, String> {
+        let sid = harness_sandbox::tier2a::win_appcontainer::fs_allow_capability_sid(
+            workspace,
+            declared_path,
+            access,
+        )
+        .map_err(|e| {
+            format!(
+                "could not derive the {} subject for {}: {e}",
+                access.label(),
+                declared_path.display()
+            )
+        })?;
+        harness_sandbox::tier2a::win_appcontainer::grant_ace_scoped(
+            &probe,
+            sid.as_psid(),
+            access,
+            harness_policy::GrantScope::Object,
+        )
+        .map_err(|e| {
+            format!(
+                "could not write the calibration ACE for the {} subject of {} onto {}: {e}",
+                access.label(),
+                declared_path.display(),
+                probe.display()
+            )
+        })?;
+        match sid_aces(&probe, "S-1-15-3-")?.as_slice() {
+            [only] => Ok(only.clone()),
+            other => Err(format!(
+                "the calibration directory {} carries {} capability ACE(s) after writing exactly \
+                 one; the spelling of the {} subject cannot be read out of it",
+                probe.display(),
+                other.len(),
+                access.label()
+            )),
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&probe);
+    read_back
+}
+
+/// `--force-system-acl`で書いた付与が**実際に載って台帳へ`forced`として記録された**ときに
+/// `run_agent.rs`が出す警告の頭。**子の到達性とは独立な印**である。
+///
+/// これを見ないと、`HARD_READ=DENIED`が「運ぶ宛先SIDと付いた宛先SIDが違う」なのか
+/// 「そもそもACEが1本も載らなかった」なのかが出力から分かれない。
+const FORCED_GRANT_MARKER: &str = "WARNING: forced system ACL grant (--force-system-acl";
+
+/// 部分適用（rootにはACEが載ったが子孫のどれかで失敗した）のときに`preflight`が積む警告。
+/// **これが出ていたら、子が読めないのは宛先SIDの取り違えではなく伝播の失敗である。**
+const PARTIAL_APPLY_MARKER: &str = "partially applied";
+
+/// 失敗を1件積む。**その場で打ち切らない**（理由は[測定7]の本体のdoc「最初の失敗で
+/// 打ち切らない」）。積むと同時にstderrへも出すのは、まとめて返す1本のエラー文よりも
+/// 「何番目の検査が落ちたか」を追いやすくするためである。
+fn record_failure(failed: &mut Vec<String>, message: String) {
+    eprintln!(
+        "[fs-allow-elev] FAILED CHECK #{}: {message}",
+        failed.len() + 1
+    );
+    failed.push(message);
+}
+
+/// [測定7] **昇格が要るシステム保護パスでも、開くのは宣言した1件だけである。**
+///
+/// # 3本の腕を同じケースに混ぜる
+///
+/// | 腕 | 対象 | 期待 | これが崩れると何が言えなくなるか |
+/// |---|---|---|---|
+/// | **失敗するはず** | 保護パス、`--force-system-acl`**無し** | 付与が拒否され、capability ACEは0本 | 保護が効いていない＝以降の「昇格が要った」は根拠を失う（計器の較正） |
+/// | **成功するはず（昇格側）** | 同じ保護パス、`--force-system-acl`**あり** | 付与が通り、capability ACEが**ちょうど1本** | — |
+/// | **成功するはず（非昇格側）** | 普通のパス、同じ1回 | 同上 | 落ちたときに「昇格の枝のせい」か「仕掛け全体のせい」かが切り分けられない |
+///
+/// 1本目と2本目は**同じオブジェクトに対して`--force-system-acl`の有無だけが違う**。したがって
+/// 2本目の成功は`SeRestorePrivilege`を有効にした付与でしか説明できず、その経路は
+/// `needs_elevation`の内側にしか無い。**「昇格の枝を通った」の根拠はこの対である。**
+///
+/// # 歯の対照（広い側）を先に置く
+///
+/// 各対象へ**先に`read_write`級のcapabilityを発行しておく**。これが無いと「capability ACEが
+/// 1本だけ」は絞り込みの証拠ではなく、**そもそも候補が1つしか無かっただけ**になる（§S40-2）。
+/// 発行だけでACEは書かないので、1本になるのは`preflight`が級を選んでいるからである。
+///
+/// # 級の軸は「本数」では測れない（**2つの半分を別々に固定する**）
+///
+/// 白黒条件は「宣言した**級**のもの1件だけ」であって「1件だけ」ではない。本数
+/// （[`count_sid_aces`]）は級に無関心なので、**宣言の級ではなく広い側の宛先SIDで1本書く**
+/// 欠陥——移行前の「広い側を積む」形がこの枝にだけ残っている状態——を素通りさせる。
+/// そこで級を2つの半分に分けて別々に固定する。
+///
+/// 1. **宛先SIDの級**: 実DACLに載った綴りを、テスト側が`read_exec`と明示して作った綴りと
+///    突き合わせる（[`capability_sid_text`]）。広い側の綴りも同時に作り、**そちらと一致したら
+///    名指しで言う**
+/// 2. **書いたマスクの級**: 宣言は読取専用なので子は書けないはず。これが計器で潰れないように、
+///    合成の保護パスはユーザー側を`(M)`にしてある（[`harden_as_system_protected`]）——
+///    `(RX)`だと**capability側が何であっても**書けず、`HARD_WRITE=DENIED`が級の証拠に
+///    ならない。同じ理由で非昇格側（soft）にも`SOFT_WRITE`の腕を置く
+///
+/// # 突き合わせる3つ
+///
+/// 運ぶ側（子の到達性）・付ける側（実DACL）・**台帳の索引**（宣言capabilityの件数）。前2つは
+/// 同じ導出から出るので上流の欠陥では**両方が同じだけずれる**（§S38-4）。台帳は別経路である。
+///
+/// # 最初の失敗で打ち切らない
+///
+/// このケースは**運ぶ側（子のトークン）と付ける側（実DACL）を分けて読む**ために在るが、
+/// 最初の`Err`で返ると**どの仕込みでも出力は「子が読めない」の1行だけ**になり、分離が
+/// 原理的に起きない。だから各assertの結果を積んで最後にまとめて返す（[`record_failure`]）。
+/// 読み分けの表は`plans/handoff/issue20-measure/D.md`にある。
+fn fs_allow_case_the_elevated_grant_opens_only_the_declared_subject(
+    ledger: &FsLedgerExclusive,
+) -> Result<(), String> {
+    // **昇格していなければ、この測定は成立しない。** 非昇格で走ると保護パスの用意
+    // （所有者の変更）から失敗するが、そこで初めて気付くと「何を測ろうとして失敗したか」が
+    // 読めない。走らせる前に名指しで落とす（`B-33`: 走らなかったことを緑にしない）。
+    if !harness_sandbox::tier2a::privhelper::is_elevated() {
+        return Err(
+            "this case must run elevated (it builds a synthetic system-protected directory by \
+             changing its owner to LocalSystem). Run it through \
+             `dev-elevated-run.exe e2e-fs-allow`, not a bare `cargo test`."
+                .to_string(),
+        );
+    }
+
+    let ws = case_dir("fs-allow-elev");
+    let ws_canon = ws.canonicalize().unwrap_or_else(|_| ws.clone());
+
+    // 保護しない側（成功対照）と、宣言しない側（禁止対照）。
+    let soft = fs_allow_case_dir("elev-soft");
+    let outside = fs_allow_case_dir("elev-out");
+    std::fs::write(soft.join("secret.txt"), "soft-readable").map_err(|e| e.to_string())?;
+    // **ラベルではなく中身そのもの**を探すことで、「拒否された」と「空を読めた」を区別せずに
+    // 『子へ渡っていない』だけを固定できる（`fs_allow_case_bare_path_grants_the_object_only`と同型）。
+    std::fs::write(outside.join("secret.txt"), "outside-must-not-leak")
+        .map_err(|e| e.to_string())?;
+
+    let hard_dir = fs_allow_case_dir("elev-hard");
+    std::fs::write(hard_dir.join("secret.txt"), "hard-readable").map_err(|e| e.to_string())?;
+    // ここから先、`hard`が生きている間だけ保護が掛かる（`Drop`で戻す）。
+    let hard = harden_as_system_protected(&hard_dir)?;
+    let hard_path = hard.path().to_path_buf();
+
+    // **ここから先は最初の失敗で打ち切らない。** 積んだものは後始末を通してから1本に
+    // まとめて返す（このケースのdoc「最初の失敗で打ち切らない」）。
+    let mut failed: Vec<String> = Vec::new();
+
+    // --- 歯の対照（広い側）を先に発行する。ACEは書かない ---
+    for target in [&hard_path, &soft] {
+        match harness_sandbox::tier2a::win_appcontainer::fs_allow_capability_sid(
+            &ws_canon,
+            target,
+            harness_sandbox::FsAccess::ReadWrite,
+        ) {
+            Ok(_) => {
+                if declaration_capability_count(target, &ws_canon) != 1 {
+                    record_failure(
+                        &mut failed,
+                        format!(
+                            "the wider declaration capability for {} was not minted, so \"only \
+                             one capability ACE\" below would not be evidence of narrowing -- it \
+                             would just mean there was never a second candidate",
+                            target.display()
+                        ),
+                    );
+                }
+            }
+            Err(e) => record_failure(
+                &mut failed,
+                format!(
+                    "could not mint the wider (read_write) declaration capability for {}: {e}",
+                    target.display()
+                ),
+            ),
+        }
+    }
+
+    // --- 腕1: 失敗するはず（保護パス、--force-system-acl 無し） ---
+    let hard_allow = format!(r"{}\**", hard_path.display());
+    let run_no_force = run_harness(
+        &ws,
+        &run_shell_script_turns("Write-Output 'ran'"),
+        &["--fs-allow", &hard_allow],
+        "fs-allow-elev-noforce",
+    );
+    if let Err(e) = parse_json_stdout(&run_no_force) {
+        record_failure(
+            &mut failed,
+            format!(
+                "arm 1 (the same object without --force-system-acl) did not produce a readable \
+                 run: {e}"
+            ),
+        );
+    }
+    if !run_no_force.stderr.contains("ACE grant failed") {
+        record_failure(
+            &mut failed,
+            format!(
+                "without --force-system-acl the grant on the synthetic system-protected path \
+                 {} was expected to be refused, but harness did not report a failed ACE grant. \
+                 The protection is not doing anything, so the arms below cannot be read as \
+                 \"the elevation branch made the difference\". stderr: {}",
+                hard_path.display(),
+                run_no_force.stderr
+            ),
+        );
+    }
+    match count_sid_aces(&hard_path, "S-1-15-3-") {
+        Ok(0) => {}
+        Ok(leaked) => record_failure(
+            &mut failed,
+            format!(
+                "{} carries {leaked} capability ACE(s) after the refused grant; a declaration \
+                 that was not granted must not leave a subject behind",
+                hard_path.display()
+            ),
+        ),
+        Err(e) => record_failure(
+            &mut failed,
+            format!(
+                "could not read the capability ACEs of {} after the refused grant: {e}",
+                hard_path.display()
+            ),
+        ),
+    }
+    // **落ちた場所が「DACLの書込」であることを固定する。** 宣言の解釈や正規化の手前で
+    // 落ちていたなら宛先SIDは発行されない——発行されているなら、失敗はACEを書く段である
+    // （`plans/etw-spike/RESULTS.md` §21.4「ゲートがどこにあるかを先に確かめる」）。
+    let minted = declaration_capability_count(&hard_path, &ws_canon);
+    if minted < 2 {
+        record_failure(
+            &mut failed,
+            format!(
+                "the refused declaration for {} minted {minted} capability names (expected the \
+                 pre-minted read_write plus this run's read_exec); the run failed before it ever \
+                 tried to write a DACL, so it does not show that the write is what was denied",
+                hard_path.display()
+            ),
+        );
+    }
+
+    // --- 腕2+3: 成功するはず（保護パスは昇格の枝／普通のパスは非昇格の枝、同じ1回） ---
+    //
+    // **書込の腕を両側に置く。** 宣言は`read_exec`なので、どちらのパスでも子は書けない
+    // はずである。保護パス側はユーザー側を`(M)`にしてあるので（[`harden_as_system_protected`]）、
+    // ここでの拒否は**capability側＝宣言した級**にしか帰属しない。
+    let soft_allow = format!(r"{}\**", soft.display());
+    let hard_p = hard_path.display().to_string().replace('\\', "/");
+    let soft_p = soft.display().to_string().replace('\\', "/");
+    let out_p = outside.display().to_string().replace('\\', "/");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         try {{ $r = Get-Content -LiteralPath '{hard_p}/secret.txt' -Raw -ErrorAction Stop; \
+           Write-Output ('HARD_READ=' + $r) }} catch {{ Write-Output 'HARD_READ=DENIED' }}; \
+         try {{ Set-Content -LiteralPath '{hard_p}/written.txt' -Value 'x' -ErrorAction Stop; \
+           Write-Output 'HARD_WRITE=OK' }} catch {{ Write-Output 'HARD_WRITE=DENIED' }}; \
+         try {{ $r = Get-Content -LiteralPath '{soft_p}/secret.txt' -Raw -ErrorAction Stop; \
+           Write-Output ('SOFT_READ=' + $r) }} catch {{ Write-Output 'SOFT_READ=DENIED' }}; \
+         try {{ Set-Content -LiteralPath '{soft_p}/written.txt' -Value 'x' -ErrorAction Stop; \
+           Write-Output 'SOFT_WRITE=OK' }} catch {{ Write-Output 'SOFT_WRITE=DENIED' }}; \
+         try {{ $r = Get-Content -LiteralPath '{out_p}/secret.txt' -Raw -ErrorAction Stop; \
+           Write-Output ('OUT_READ=' + $r) }} catch {{ Write-Output 'OUT_READ=DENIED' }}; \
+         Write-Output 'PROBE_DONE'"
+    );
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns(&script),
+        &[
+            "--fs-allow",
+            &hard_allow,
+            "--fs-allow",
+            &soft_allow,
+            "--force-system-acl",
+        ],
+        "fs-allow-elev",
+    );
+    // 子が**返した**stdoutだけを見る（BUG-137）。JSON全体だと、子へ**渡した**スクリプト本文が
+    // `HARD_WRITE=DENIED`等をリテラルで含むので、判定が子の挙動と無関係に真になる。
+    let outcome_json = parse_json_stdout(&run);
+    let text: Option<String> = match &outcome_json {
+        Ok(json) => match json.first_tool_result() {
+            Ok(t) => Some(t.to_string()),
+            Err(e) => {
+                record_failure(
+                    &mut failed,
+                    format!("the granting run produced no tool result to read: {e}"),
+                );
+                None
+            }
+        },
+        Err(e) => {
+            record_failure(
+                &mut failed,
+                format!("the granting run did not produce a readable outcome: {e}"),
+            );
+            None
+        }
+    };
+
+    // --- 付ける側（実DACL）を先に読む ---
+    //
+    // **子の到達性より前に置く。** 「運ぶ側だけ壊す」仕込みと「付ける側だけ壊す」仕込みは
+    // どちらも子が読めなくなるので、実DACLを独立に読まないと出力から分かれない。
+    for (tag, target, arm) in [
+        (
+            "hard",
+            &hard_path,
+            "the elevated (SeRestorePrivilege) branch",
+        ),
+        ("soft", &soft, "the in-process (non-elevated) control"),
+    ] {
+        let found = match sid_aces(target, "S-1-15-3-") {
+            Ok(found) => Some(found),
+            Err(e) => {
+                record_failure(
+                    &mut failed,
+                    format!(
+                        "could not read the capability ACEs of {} ({arm}): {e}",
+                        target.display()
+                    ),
+                );
+                None
+            }
+        };
+        if let Some(found) = found.as_ref() {
+            if found.len() != 1 {
+                record_failure(
+                    &mut failed,
+                    format!(
+                        "{} carries {} capability ACE(s) ({arm}); exactly one is required. Two \
+                         access classes exist for this declaration in the ledger (the pre-minted \
+                         read_write and this run's read_exec), so anything other than 1 means the \
+                         grant path did not pick a single declared subject (§22.3.4). On the \
+                         DACL: {found:?}",
+                        target.display(),
+                        found.len()
+                    ),
+                );
+            }
+        }
+        // [§22.3.0] 移行の不変条件を**昇格の枝でも**測る。1本でも残っていれば、その1本が
+        // 同一セッションの全ドメインへこのパスを開き続ける（DACLはANDを表現できない）。
+        match count_sid_aces(target, "S-1-15-2-") {
+            Ok(0) => {}
+            Ok(package) => record_failure(
+                &mut failed,
+                format!(
+                    "§22.3.0: {} still carries {package} package-SID ACE(s) after the grant ({arm})",
+                    target.display()
+                ),
+            ),
+            Err(e) => record_failure(
+                &mut failed,
+                format!(
+                    "could not read the package-SID ACEs of {} ({arm}): {e}",
+                    target.display()
+                ),
+            ),
+        }
+        // **葉まで届いたか。** 宣言は`<path>\**`（配下まで）なので、子が読む`secret.txt`にも
+        // 宛先SIDのACEが要る。ここが0本なら、子が読めない原因は宛先SIDの取り違えではなく
+        // **rootだけ載って伝播しなかった**（部分適用）である。本数ではなく**0か否か**で見るのは、
+        // 継承ACEと子孫救済walkの明示ACEが両方載る形があり得るため。
+        let leaf = target.join("secret.txt");
+        match count_sid_aces(&leaf, "S-1-15-3-") {
+            Ok(0) => record_failure(
+                &mut failed,
+                format!(
+                    "{} carries no capability ACE ({arm}); the declaration was `<path>\\**`, so \
+                     the ACE has to reach the file the child actually reads. A `READ=DENIED` \
+                     below is then a propagation failure, not a mismatched subject",
+                    leaf.display()
+                ),
+            ),
+            Ok(_) => {}
+            Err(e) => record_failure(
+                &mut failed,
+                format!(
+                    "could not read the capability ACEs of {} ({arm}): {e}",
+                    leaf.display()
+                ),
+            ),
+        }
+        // 台帳側（第3の値）。広い側が消えずに残っていること＝1本だったのは絞り込みの結果である。
+        let names = declaration_capability_count(target, &ws_canon);
+        if names != 2 {
+            record_failure(
+                &mut failed,
+                format!(
+                    "{} has {names} declaration capabilities in the ledger (expected 2: the \
+                     pre-minted read_write and this run's read_exec). Without the second one, \
+                     \"exactly one ACE\" is not evidence that a class was chosen",
+                    target.display()
+                ),
+            );
+        }
+        // --- 級の軸（**本数では言えないほう**） ---
+        // **台帳の件数を見た後で呼ぶ**（[`capability_sid_text`]は発行もするので、先に呼ぶと
+        // 上の`names != 2`が「この測定が発行したぶん」で埋まってしまう）。
+        match (
+            capability_sid_text(
+                &ws_canon,
+                target,
+                harness_sandbox::FsAccess::ReadExec,
+                &format!("{tag}-ro"),
+            ),
+            capability_sid_text(
+                &ws_canon,
+                target,
+                harness_sandbox::FsAccess::ReadWrite,
+                &format!("{tag}-rw"),
+            ),
+        ) {
+            (Ok(declared), Ok(wider)) => {
+                // **1本も載っていない回では級を問わない**——上の本数のassertが既に言っており、
+                // 同じ事実で2本赤くすると「級が違う」と「1本も無い」が読み分けられなくなる。
+                if let Some(found) = found.as_ref().filter(|found| !found.is_empty()) {
+                    if !found.iter().any(|sid| sid.eq_ignore_ascii_case(&declared)) {
+                        let widened = found.iter().any(|sid| sid.eq_ignore_ascii_case(&wider));
+                        record_failure(
+                            &mut failed,
+                            format!(
+                                "the capability ACE(s) on {} ({arm}) are {found:?}, but this run \
+                                 declared read_exec, whose subject is {declared}.{}",
+                                target.display(),
+                                if widened {
+                                    format!(
+                                        " What is on the DACL is {wider} -- the wider \
+                                         (read_write) subject of the same declaration. That is \
+                                         the pre-migration \"put the wider class on the path\" \
+                                         shape surviving in this branch (§22.3.4)."
+                                    )
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                        );
+                    }
+                }
+            }
+            (declared, wider) => {
+                for outcome in [declared, wider] {
+                    if let Err(e) = outcome {
+                        record_failure(
+                            &mut failed,
+                            format!(
+                                "could not read back the spelling of a declaration subject for \
+                                 {} ({arm}), so the class of the ACE that landed cannot be \
+                                 judged: {e}",
+                                target.display()
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // --- 昇格の枝が実際に走ってACEを載せたか（**子の到達性とは独立な印**） ---
+    //
+    // `run_agent.rs`はforcedで載った付与にだけこの警告を出す。保護パスは素の書込が
+    // 通らないので、ここに出る＝`needs_elevation`の内側で書けた、と読める。
+    let hard_leaf = hard_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mentions_hard =
+        |line: &&str, marker: &str| line.contains(marker) && line.contains(hard_leaf.as_str());
+    if !run
+        .stderr
+        .lines()
+        .any(|l| mentions_hard(&l, FORCED_GRANT_MARKER))
+    {
+        record_failure(
+            &mut failed,
+            format!(
+                "harness never reported a forced (SeRestorePrivilege) grant for {}, so nothing \
+                 says an ACE was written and recorded through the elevation branch at all. A \
+                 reachability failure below must then be read as \"no ACE\", not as \"the wrong \
+                 subject\". stderr: {}",
+                hard_path.display(),
+                run.stderr
+            ),
+        );
+    }
+    if run
+        .stderr
+        .lines()
+        .any(|l| mentions_hard(&l, PARTIAL_APPLY_MARKER))
+    {
+        record_failure(
+            &mut failed,
+            format!(
+                "the grant on {} was only partially applied (the root carries the ACE but some \
+                 descendant failed), so this run cannot be read as \"the elevation branch \
+                 completed\". stderr: {}",
+                hard_path.display(),
+                run.stderr
+            ),
+        );
+    }
+
+    // --- 運ぶ側（子のトークン＝到達性と級） ---
+    if let Some(text) = text.as_deref() {
+        // `B-12`型の穴を塞ぐ: 最後まで到達したことを先に確かめてから「拒否された」を主張する。
+        if !text.contains("PROBE_DONE") {
+            record_failure(
+                &mut failed,
+                format!(
+                    "the probe script did not reach its last line, so none of its DENIED \
+                     outcomes can be read as \"the sandbox refused it\": {text}"
+                ),
+            );
+        } else {
+            // 昇格側の腕（本題）。**どこが壊れているかはここでは名乗らない**——同じ症状に
+            // なる原因が3つあり（運ぶ側／付ける側／伝播）、分けるのは上の実DACL側の検査である。
+            if !text.contains("HARD_READ=hard-readable") {
+                record_failure(
+                    &mut failed,
+                    format!(
+                        "the declaration on the system-protected path went through the elevation \
+                         branch, but the child could not read it. Read this together with the \
+                         DACL checks above: an ACE of the declared class on both the root and \
+                         the leaf means the subject carried into the child's token is the one \
+                         that does not match (§22.3): {text}"
+                    ),
+                );
+            }
+            // 非昇格側の腕（成功対照）。ここが落ちたら原因は昇格の枝ではなく仕掛け全体である。
+            if !text.contains("SOFT_READ=soft-readable") {
+                record_failure(
+                    &mut failed,
+                    format!(
+                        "the control arm (an ordinary, writable path declared in the same run) \
+                         was not reachable either, so the elevated arm's outcome says nothing \
+                         about the elevation branch: {text}"
+                    ),
+                );
+            }
+            // 禁止側。宣言していないものは開かない。
+            if text.contains("outside-must-not-leak") {
+                record_failure(
+                    &mut failed,
+                    format!(
+                        "the child read the contents of a path that was never declared in this \
+                         run; the subjects carried into the token are wider than the \
+                         declarations: {text}"
+                    ),
+                );
+            }
+            // 級の側（宣言は`read_exec`＝読めて書けない）。**両方の腕で見る**——保護パスは
+            // ユーザー側を`(M)`にしてあるので、どちらの拒否もcapability側にしか帰属しない。
+            for (probe, target) in [("HARD_WRITE", &hard_path), ("SOFT_WRITE", &soft)] {
+                if !text.contains(&format!("{probe}=DENIED")) {
+                    record_failure(
+                        &mut failed,
+                        format!(
+                            "the declaration on {} was read_exec, but the child reported that it \
+                             could write into it ({probe}); the mask that was actually written is \
+                             wider than the declared class: {text}",
+                            target.display()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    // **「禁止された」は必ず実体でも確かめる**——子が「拒否された」と言ったこととファイルが
+    // 無いことは別の事実である（`B-09`）。子の出力が読めなかった回でも、これは見られる。
+    for target in [&hard_path, &soft] {
+        if target.join("written.txt").exists() {
+            record_failure(
+                &mut failed,
+                format!(
+                    "the child actually wrote into {} even though the declaration was read_exec",
+                    target.display()
+                ),
+            );
+        }
+    }
+
+    // --- 名前の付いた扉が、昇格して書いたACEも剥がせること（対の片方を残さない、`B-01`） ---
+    // forcedで書いたACEの撤収も`SeRestorePrivilege`が要る（台帳の`forced`欄がその索引）。
+    for target in [&hard_path, &soft] {
+        match Command::new(harness_exe())
+            .args(["fs", "revoke"])
+            .arg(target)
+            .output()
+        {
+            Ok(revoke) => {
+                eprintln!(
+                    "[fs-allow-elev] fs revoke {} -> {} {}",
+                    target.display(),
+                    revoke.status,
+                    String::from_utf8_lossy(&revoke.stdout).trim()
+                );
+                if !revoke.status.success() {
+                    record_failure(
+                        &mut failed,
+                        format!(
+                            "`harness fs revoke {}` failed: {}{}",
+                            target.display(),
+                            String::from_utf8_lossy(&revoke.stdout),
+                            String::from_utf8_lossy(&revoke.stderr)
+                        ),
+                    );
+                }
+                match count_sid_aces(target, "S-1-15-3-") {
+                    Ok(0) => {}
+                    Ok(left) => record_failure(
+                        &mut failed,
+                        format!(
+                            "{} still carries {left} capability ACE(s) after `harness fs revoke`; \
+                             a grant written through the elevation branch must be removable \
+                             through the named door",
+                            target.display()
+                        ),
+                    ),
+                    Err(e) => record_failure(
+                        &mut failed,
+                        format!(
+                            "could not read the capability ACEs of {} after `harness fs revoke`: \
+                             {e}",
+                            target.display()
+                        ),
+                    ),
+                }
+            }
+            Err(e) => record_failure(
+                &mut failed,
+                format!(
+                    "failed to run `harness fs revoke {}`: {e}",
+                    target.display()
+                ),
+            ),
+        }
+    }
+
+    // **後始末は成否に関わらず通す。** 台帳（fs passthroughの`entries`/`denied_entries`・
+    // 宣言capability・workspace grant）を測定前の形へ戻さないと、次の測定の前後差に混ざる
+    // （§S39-6）。`hard`の保護解除と削除は`Drop`が行う。
+    ledger.purge_entries(&[&hard_path, &soft, &outside]);
+    let dropped = harness_sandbox::tier2a::workspace_capability::forget_capability(&ws_canon, "");
+    eprintln!(
+        "[fs-allow-elev] dropped {} capability ledger entries for {}",
+        dropped.len(),
+        ws_canon.display()
+    );
+    harness_sandbox::tier2a::workspace_ledger::remove_workspace_entry(&ws_canon);
+    let _ = std::fs::remove_dir_all(&soft);
+    let _ = std::fs::remove_dir_all(&outside);
+    drop(hard);
+
+    // **落ちた検査を全部まとめて返す。** 1件目で返すと、この測定が分けたい2つ（運ぶ側と
+    // 付ける側）がどの仕込みでも同じ1行になる。
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} of the checks in this case failed (each is listed in full; they are independent, \
+             so read them together): {}",
+            failed.len(),
+            failed
+                .iter()
+                .enumerate()
+                .map(|(i, m)| format!("[{}] {m}", i + 1))
+                .collect::<Vec<_>>()
+                .join(" || ")
+        ));
+    }
+    // **このケースは`harness.exe`を2回起こす**ので、スクラッチも2つ分ある（片方だけ消すと
+    // `_scratch`へ台本と記録が残り続ける）。
+    cleanup_on_success(&ws, &[], "fs-allow-elev-noforce");
+    cleanup_on_success(&ws, &[], "fs-allow-elev");
+    Ok(())
+}
+
 #[test]
 #[ignore]
 fn tier2a_fs_allow_matrix() {
@@ -2770,6 +3726,15 @@ fn tier2a_fs_allow_matrix() {
         (
             "ace-persists-after-exit-and-the-named-door-removes-it",
             fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it,
+        ),
+        // [測定7] 昇格が要るシステム保護パスの腕。**上の4本はどれも`preflight`の
+        // `needs_elevation`へ入らない**（`C:\`直下の書けるパスなので、その場で書けてしまう）ので、
+        // 宛先SIDを持ち回す形へ変えた区間はここが唯一の実行経路である。
+        // **最後に置いてある**——所有者をLocalSystemへ移す腕なので、先に置くと前の4本が
+        // 落ちたときにその残骸と混ざる。
+        (
+            "elevated-grant-opens-only-the-declared-subject",
+            fs_allow_case_the_elevated_grant_opens_only_the_declared_subject,
         ),
     ];
     let mut passed = 0;
@@ -3276,6 +4241,11 @@ impl FsLedgerExclusive {
     /// エントリを消すので、ディレクトリを消した後だと残ることがある。テストが足したエントリは
     /// テストが責任を持って落とす。
     ///
+    /// **`entries`と`denied_entries`の両方を落とす。** かつては`entries`だけだったが、
+    /// 付与に失敗した宣言は`denied_entries`の側へ記録されるので、**わざと失敗させる腕を持つ
+    /// ケース**（[`fs_allow_case_the_elevated_grant_opens_only_the_declared_subject`]）は
+    /// 片方だけ消しても中立にならない。**対の片方だけ実装しない**（`B-01`）。
+    ///
     /// **台帳ファイルはread-only属性付きで書かれている**（`harness-grant-ledger`の
     /// 「誤削除防止の2層」）。素の`std::fs::write`は黙って失敗するので、本体と同じく
     /// 解除→書込→再付与の順で触る。この3手が**分割できない**ことが、排他ガードを要求する直接の理由——
@@ -3292,13 +4262,15 @@ impl FsLedgerExclusive {
             .iter()
             .map(|t| t.to_string_lossy().to_string())
             .collect();
-        if let Some(entries) = json.get_mut("entries").and_then(|v| v.as_array_mut()) {
-            entries.retain(|e| {
-                !e.get("path")
-                    .and_then(|v| v.as_str())
-                    .map(|p| keys.contains(p))
-                    .unwrap_or(false)
-            });
+        for bucket in ["entries", "denied_entries"] {
+            if let Some(entries) = json.get_mut(bucket).and_then(|v| v.as_array_mut()) {
+                entries.retain(|e| {
+                    !e.get("path")
+                        .and_then(|v| v.as_str())
+                        .map(|p| keys.contains(p))
+                        .unwrap_or(false)
+                });
+            }
         }
         let Ok(text) = serde_json::to_string_pretty(&json) else {
             return;
