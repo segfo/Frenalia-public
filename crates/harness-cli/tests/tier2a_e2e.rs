@@ -2424,6 +2424,57 @@ fn fs_allow_case_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// **前の実行が残した合成保護パスを掃除する**（自分のPIDのものは触らない）。
+///
+/// # なぜこれが要るか
+///
+/// 保護の掛け方（[`harden_as_system_protected`]）は`icacls`を4手撃つ。**途中で落ちると、
+/// 所有者がSYSTEMでDACLが空のディレクトリが残る**——この状態は所有者でもなく権利も無いので、
+/// **非昇格では読むことも消すこともできない**（`Get-Acl`すら`UnauthorizedAccessException`になる）。
+/// 残ると次の測定の前後差に混ざるので、**測る側が自分で掃く**（`measurement-review`の検問11）。
+///
+/// # なぜ`takeown`なのか
+///
+/// `icacls /setowner`は`WRITE_OWNER`を要求するが、この状態のディレクトリにはそれが無い。
+/// `takeown`は`SeTakeOwnershipPrivilege`を**自分で有効化する**ので、昇格して走っていれば通る。
+/// **`/a`でAdministratorsへ渡す**——このプロセスはそのメンバーなので、以後DACLを書ける。
+fn sweep_stale_fs_allow_protected_dirs() {
+    const PREFIX: &str = "harness-e2e-fsallow-elev-";
+    let mine = format!("-{}", std::process::id());
+    let Ok(entries) = std::fs::read_dir(r"C:\") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(PREFIX) || name.ends_with(&mine) {
+            continue;
+        }
+        let path = entry.path();
+        // まず素で消せるなら消す（保護が掛かる前に落ちた回はこれで片付く）。
+        if std::fs::remove_dir_all(&path).is_ok() {
+            eprintln!("[fs-allow-elev] swept stale dir: {}", path.display());
+            continue;
+        }
+        let path_str = path.display().to_string();
+        let _ = Command::new("takeown")
+            .args(["/f", path_str.as_str(), "/a"])
+            .output();
+        let grant = format!("*{BUILTIN_ADMINISTRATORS_SID}:(OI)(CI)(F)");
+        let _ = Command::new("icacls")
+            .args([path_str.as_str(), "/grant", grant.as_str()])
+            .output();
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => eprintln!("[fs-allow-elev] swept stale protected dir: {path_str}"),
+            // **黙って諦めない**（`B-10`）。残ったことと、手で消す方法を出す。
+            Err(e) => eprintln!(
+                "[fs-allow-elev] could not sweep {path_str} ({e}). Recover with (elevated): \
+                 takeown /f \"{path_str}\" /a && icacls \"{path_str}\" /grant \"{grant}\" && \
+                 rmdir /s /q \"{path_str}\""
+            ),
+        }
+    }
+}
+
 /// ROで許可したエントリは**読めて書けない**。境界はACLなので、書込は子プロセスの側で
 /// `ACCESS_DENIED`にならなければならない。
 ///
@@ -2806,6 +2857,22 @@ fn fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it(
 /// LocalSystem。合成のシステム保護パスの所有者にする相手。
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 
+/// `BUILTIN\Administrators`。**所有者にしてはいけない相手**として、理由とともに残してある。
+///
+/// # 所有者を`Administrators`にすると測定が成立しない（**実測**）
+///
+/// 一度これを所有者にして走らせたところ、`icacls`は通ったが**その次で落ちた**——
+/// このE2Eは`dev-elevated-runner`経由で**昇格して走る**ので、そこから起動される
+/// `harness.exe`も昇格トークンを継承する。**昇格したharnessは`Administrators`のメンバー＝
+/// 所有者そのもの**なので、所有者が暗黙に得る`WRITE_DAC`でDACLを書けてしまい、
+/// 「保護パスなので素では付与できない」という本ケースの前提が消える
+/// （2026-09-01実測、`plans/mac-spike/RESULTS.md` §S44）。
+///
+/// **だから所有者は`S-1-5-18`（LocalSystem）でなければならない。** 昇格したharnessも
+/// LocalSystemではないので、所有者としての`WRITE_DAC`を得られない。
+#[allow(dead_code)]
+const BUILTIN_ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
 /// `WRITE_DAC`（`FileSystemRights::ChangePermissions`）。DACLを書き換える権利そのもの。
 const WRITE_DAC_MASK: u32 = 0x0004_0000;
 
@@ -2830,6 +2897,9 @@ impl Drop for SystemProtectedDir {
     fn drop(&mut self) {
         // 所有権を取り戻す → フルコントロールを付け直す → 消す、の順。順番を変えると
         // 「所有者ではないのでDACLを書けない」で止まる。
+        //
+        // **この順序が成立するのは、保護を掛けるときにユーザーへ`WRITE_OWNER`を残してあるから**
+        // である（`harden_as_system_protected`の`(M,WO)`）。残していないと1手目で止まる。
         let owner = format!("*{}", self.restore_owner_sid);
         let grant = format!("*{}:(OI)(CI)(F)", self.restore_owner_sid);
         for (args, what) in [
@@ -2949,11 +3019,29 @@ fn harden_as_system_protected(dir: &Path) -> Result<SystemProtectedDir, String> 
         restore_owner_sid: user_sid.clone(),
     };
     let system_full = format!("*{LOCAL_SYSTEM_SID}:(OI)(CI)(F)");
-    let user_modify = format!("*{user_sid}:(OI)(CI)(M)");
+    // `(M,WO)`＝Modify ＋ `WRITE_OWNER`。**`WRITE_DAC` は含まない**（下のコメントを参照）。
+    let user_modify = format!("*{user_sid}:(OI)(CI)(M,WO)");
+    // **所有者は`BUILTIN\Administrators`にする**（SYSTEMではない。理由は
+    // [`BUILTIN_ADMINISTRATORS_SID`]のdoc——SYSTEMへ渡すには`SeRestorePrivilege`が要り、
+    // 昇格して走らせても`icacls`は拒否される。実測済み）。
     let system_owner = format!("*{LOCAL_SYSTEM_SID}");
+    // **順序と、ユーザーへ残す権利の両方が要る。3通り試して分かった**
+    // （`plans/mac-spike/RESULTS.md` §S44）。
+    //
+    // - `/setowner` を**最後**に撃つと `ACCESS_DENIED`——`(M)` に `WRITE_OWNER` が含まれないため
+    // - `/setowner` を**最初**に撃つと、所有者がSYSTEMになった後の `/grant` が `ACCESS_DENIED`
+    //   ——`/inheritance:r` でDACLが空になり、こちらはもう所有者ではないため
+    //
+    // **どちらの順序でも詰む。** 抜け道は「ユーザーへ `WRITE_OWNER` を残したままDACLを固め、
+    // 最後に所有権を渡す」ことである。`(M,WO)` は `WRITE_OWNER` を含み **`WRITE_DAC` は含まない**ので、
+    // 「素ではDACLを書けない＝昇格の枝へ入る」という本ケースの前提は保たれる。
     icacls_on(dir, &["/inheritance:r"], "drop inherited ACEs")?;
     icacls_on(dir, &["/grant", system_full.as_str()], "grant SYSTEM full")?;
-    icacls_on(dir, &["/grant", user_modify.as_str()], "grant user modify")?;
+    icacls_on(
+        dir,
+        &["/grant", user_modify.as_str()],
+        "grant user modify+WRITE_OWNER",
+    )?;
     icacls_on(
         dir,
         &["/setowner", system_owner.as_str()],
@@ -3149,6 +3237,10 @@ fn fs_allow_case_the_elevated_grant_opens_only_the_declared_subject(
                 .to_string(),
         );
     }
+
+    // **前の実行が保護を掛け損ねて残したディレクトリを、先に掃く。** 非昇格では消せない形で
+    // 残るので、昇格して走るこのケースが自分で片付ける（理由は関数のdoc）。
+    sweep_stale_fs_allow_protected_dirs();
 
     let ws = case_dir("fs-allow-elev");
     let ws_canon = ws.canonicalize().unwrap_or_else(|_| ws.clone());
