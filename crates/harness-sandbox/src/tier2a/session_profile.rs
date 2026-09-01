@@ -4,7 +4,7 @@
 //! 動いていた。この共有が、独立に見える複数の欠陥の共通の根だった（loopback exemptionの奪い合い
 //! ＝[BUG-053](../../../docs/bugs/BUG-053.md)、プロファイル作成の並行競合＝BUG-054、WFP出口強制の
 //! fail-open、そして**あるworkspaceのサンドボックスから別のworkspaceが読める**という封じ込めの破れ）。
-//! 個別に塞いでも「共有された1つの主体」という構造が残る限り同じクラスが再生産されるため、
+//! 個別に塞いでも「共有された1つのSID」という構造が残る限り同じクラスが再生産されるため、
 //! セッションごとに別プロファイル＝別package SIDにする。
 //!
 //! ## 何をこのモジュールが持つか
@@ -23,7 +23,7 @@
 //! 「接頭辞付きプロファイルが残っている」＝索引が生きている状態になる。
 //!
 //! 取りこぼした場合も、プロファイル名が一意なのでそのSIDは**二度と生成されない**。残った
-//! ACEは死んだ主体宛の不活性な残骸であり、共有SID時代のように「未来の全セッションに対して
+//! ACEは死んだSID宛の不活性な残骸であり、共有SID時代のように「未来の全セッションに対して
 //! 生きた権限」にはならない（失敗時の安全側が逆転している）。
 
 use std::path::{Path, PathBuf};
@@ -98,14 +98,14 @@ pub struct SessionEntry {
     ///
     /// # なぜ`granted_paths`と別の欄なのか
     ///
-    /// 撤収に要る情報が違う。`granted_paths`の主体は**プロファイル名から導出**できるので
+    /// 撤収に要る情報が違う。`granted_paths`の宛先SIDは**プロファイル名から導出**できるので
     /// パスだけで足りるが、capability SIDの名前は**乱数の秘密から導出**されるため、
-    /// 名前そのものを持っていないと二度と主体へ到達できない（BUG-101と同型）。
+    /// 名前そのものを持っていないと二度と宛先SIDへ到達できない（BUG-101と同型）。
     ///
     /// 混ぜてはいけない理由がもう1つある。preflightの自己検証（`grant_audit`）は
     /// `granted_paths`を「このセッションのpackage SID宛に付けたはずのパス」として読むので、
     /// 差分層をそこへ入れると**毎回のCoW起動で「台帳にあるのにACEが無い」**（幻の台帳エントリ）
-    /// として報告される——主体が違うのだから、package SID宛のACEが無いのは正しい状態である。
+    /// として報告される——宛先SIDが違うのだから、package SID宛のACEが無いのは正しい状態である。
     ///
     /// **既存の台帳ファイルとの後方互換のため`#[serde(default)]`**（実マシンに既に在る
     /// `appcontainer-session-ledger.json`はこの欄を持たない）。
@@ -124,7 +124,7 @@ pub struct SessionEntry {
 /// [§22.3.2] capability SID宛に付けたACE1件（`(パス, 導出済みのcapability名)`）。
 ///
 /// **名前を持つことがこの型の全てである。** capability SIDは名前の一方向ハッシュ
-/// （`DeriveCapabilitySidsFromName`）なので、名前さえあれば秘密が無くても主体を再構成でき、
+/// （`DeriveCapabilitySidsFromName`）なので、名前さえあれば秘密が無くても宛先SIDを再構成でき、
 /// 撤収できる。逆に名前を失うと**どのコマンドでも剥がせないACE**になる——差分層が使う秘密は
 /// ワークスペース側の台帳にあり、`harness fs revoke-workspace`／`fs prune`が**他人の都合で**
 /// 消せるので、「撤収時に秘密から導出し直す」形は成立しない（§22.3.2の「2つで1つ」）。
@@ -159,7 +159,7 @@ pub struct ReclaimTarget {
     pub granted_paths: Vec<String>,
     /// [§22.3.2] このセッションがcapability SID宛に付けたACE（`(パス, capability名)`）。
     ///
-    /// **`granted_paths`と違い、プロファイル名からは主体を導出できない**（capability SIDは
+    /// **`granted_paths`と違い、プロファイル名からは宛先SIDを導出できない**（capability SIDは
     /// 名前から導出され、その名前は乱数の秘密由来である）。だから撤収はここに記録された
     /// **名前**を使う。空であることは「capability宛の付与が無かった」を意味する
     /// ——`grants_known`が偽なら`granted_paths`と同じく「分からない」側なので、
@@ -398,7 +398,7 @@ mod win {
         });
     }
 
-    /// [§22.3.2] 記録された**capability名**から主体を導出して、そのツリーから剥がす。
+    /// [§22.3.2] 記録された**capability名**から宛先SIDを導出して、そのツリーから剥がす。
     ///
     /// [`super::ReclaimIo::revoke_capability`]の実体。`revoke_session_grant`と対になるが、
     /// 導出が違う（あちらはプロファイル名→package SID、こちらはcapability名→capability SID）。
@@ -599,7 +599,7 @@ fn pending_revocation_count_in(ledger: &Ledger<SessionLedger>, token: &str) -> u
 /// [§22.3.2] capability SID宛に付けたACEのパス一覧（自己検証`grant_audit`が読む「記録」側）。
 ///
 /// [`granted_paths_for_current_session`]のcapability版で、**別の集合である**ことが要点である
-/// ——package SID宛の自己検証にこのパスを混ぜると、主体が違うのだからACEが無いのは当然なのに
+/// ——package SID宛の自己検証にこのパスを混ぜると、宛先SIDが違うのだからACEが無いのは当然なのに
 /// 「幻の台帳エントリ」として毎回報告される。
 pub fn granted_capability_paths_for_current_session() -> Vec<String> {
     let token = session_token();
@@ -772,7 +772,7 @@ struct ReclaimIo<'a> {
     /// そのパスから`profile_name`宛のACEを剥がす。戻り値は**剥がせなかったノードと理由**
     /// （空なら完全に剥がせた）。
     ///
-    /// # 主体が単数なので、同じツリーをプロファイルの数だけ歩き直す（未解消）
+    /// # 宛先SIDが単数なので、同じツリーをプロファイルの数だけ歩き直す（未解消）
     ///
     /// 実体（`win_appcontainer::revoke_session_grant`）は単一SID版の`revoke_ace_recursive`を
     /// 使う。同じパスを複数のプロファイルが付与していると、**そのツリーをプロファイルの数だけ
@@ -780,7 +780,7 @@ struct ReclaimIo<'a> {
     /// [`reclaim_targets_in`]が`ReclaimTarget`（プロファイル単位）を**パス→SID群へ転置**
     /// すれば1周に畳める。
     ///
-    /// **畳んでいないのはこのコールバックの主体が単数だからである。** 複数にするには
+    /// **畳んでいないのはこのコールバックの宛先SIDが単数だからである。** 複数にするには
     /// [`gc_dead_sessions_reporting`]・[`gc_dead_sessions`]・[`end_session`]の公開シグネチャを
     /// 変えることになり、渡す側は13ファイル（`harness-cli`・`harness-policy-editor`・
     /// このクレートの`preflight`とETWテスト群）に散っている。1周に畳めるかどうかは
@@ -902,7 +902,7 @@ fn reclaim_targets_in(io: &ReclaimIo<'_>, targets: &[ReclaimTarget]) -> ReclaimO
             blocked_here.extend(leftovers);
             outcome.revoked_paths += 1;
         }
-        // [§22.3.2] capability SID宛のACE（CoWの差分層）。**主体の導出が違うので別の口を通す**
+        // [§22.3.2] capability SID宛のACE（CoWの差分層）。**宛先SIDの導出が違うので別の口を通す**
         // （`ReclaimIo::revoke_capability`のdoc）。剥がし残しは`blocked_here`へ**同じ形で**
         // 積む——ここを別枠にすると、剥がせていないのにプロファイル名と台帳エントリを
         // 捨てる経路ができ、名前を失って二度と剥がせなくなる（BUG-101と同型）。
@@ -916,7 +916,7 @@ fn reclaim_targets_in(io: &ReclaimIo<'_>, targets: &[ReclaimTarget]) -> ReclaimO
             blocked_here.extend(leftovers);
             outcome.revoked_paths += 1;
         }
-        // [BUG-101] **名前を捨てる直前に、この主体のACEが本当に残っていないかを測る。**
+        // [BUG-101] **名前を捨てる直前に、この宛先SIDのACEが本当に残っていないかを測る。**
         // ここが最後の分岐点である——`DeleteAppContainerProfile`はSIDの導出元である名前を
         // 破棄するので、これ以降に残ったACEは`harness fs revoke`を含むどのコマンドでも
         // 剥がせない（SIDの導出は名前→SIDの一方向）。
@@ -1720,7 +1720,7 @@ mod tests {
     ///
     /// この分岐は実マシンに実ACEが在るときしか踏めず、[BUG-108](../../../docs/bugs/BUG-108.md)で
     /// 自己検証を注入するまでテストが1本も無かった。名前を捨てるとSIDを導出できなくなるので、
-    /// **撤収が終わっていない主体の名前は残す**のが正しい。
+    /// **撤収が終わっていない宛先SIDの名前は残す**のが正しい。
     #[test]
     fn a_profile_with_unrecorded_aces_is_kept_and_keeps_its_ledger_entry() {
         let mut io = FakeIo::new().with_sessions(&["dead"]);

@@ -24,7 +24,7 @@ pub fn grant_traverse_drive_root(drive: &Path, sid: PSID) -> Result<(), AppConta
 
 /// [D-48] traverse ACEを1ノード撤収する**唯一の正規の扉**（`harness fs revoke-traverse <path>`本体）。
 ///
-/// 主体（capability SID）を引数で受けずここで自ら導出するため、呼び出し側がSIDを取り違えようが
+/// 宛先SID（capability SID）を引数で受けずここで自ら導出するため、呼び出し側がSIDを取り違えようが
 /// ない（[BUG-061](../../../../docs/bugs/BUG-061.md)で実際に起きた事故の構造的な封じ込め）。
 /// 汎用の[`revoke_ace`]は台帳に載ったノードのcapability SID宛ACEを剥がすことを拒否するので
 /// （[BUG-046](../../../../docs/bugs/BUG-046.md)）、巻き戻したい経路は必ずここを通る。
@@ -35,7 +35,7 @@ pub fn grant_traverse_drive_root(drive: &Path, sid: PSID) -> Result<(), AppConta
 ///
 /// # 走行中の他セッションがあるなら剥がさない（2026-08-21）
 ///
-/// 祖先traverse ACEの主体は**セッションを跨ぐcapability SID**（D-37）なので、剥がした瞬間に
+/// 祖先traverse ACEの宛先SIDは**セッションを跨ぐcapability SID**（D-37）なので、剥がした瞬間に
 /// 走行中の全Tier2aセッションがサンドボックス内のFS I/Oを失う。対になる
 /// `harness fs revoke-workspace`には同じ守りが既にある（`workspace_ledger::live_modes`。
 /// 「実行中の他セッションから権限を奪わない」＝BUG-053と同じ原則）。

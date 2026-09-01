@@ -136,7 +136,7 @@ impl TransportFactory for AppContainerTransportFactory {
             net,
             // Redirector DLLはMCPサーバへ注入しない。CoWの誘導が要らない（workspaceを触らない）
             // のに加え、[D-88]のlazy fault-inも対象外である——MCP preflightはworkspace内へ
-            // **別主体の**DACLを書き得るので、設計書§5.1.3が全walk待機のまま残すと決めている。
+            // **別の宛先SIDの**DACLを書き得るので、設計書§5.1.3が全walk待機のまま残すと決めている。
             RedirectorInject::default(),
             // §22.1.1: D-38でMCPサーバは**サーバごとに専用プロファイル**なので、package SIDが
             // そのままドメインになる。capability群は持たない（§22.2.2で対象外と決着済み）。

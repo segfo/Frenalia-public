@@ -1,4 +1,4 @@
-//! 走査器の回帰。**昇格しない**（`writer_tests`と同じ理由——主体は純粋導出、ツリーは自作）。
+//! 走査器の回帰。**昇格しない**（`writer_tests`と同じ理由——宛先SIDは純粋導出、ツリーは自作）。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

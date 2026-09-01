@@ -29,7 +29,7 @@
 //! `spawn.rs`の`spawn_impl`から必要な部分だけを写したコピーであり、**意図的な重複**である。
 //!
 //! - `run_shell`系統へ`CHILD_PROCESS_RESTRICTED`を入れてよいのは§8.1（Redirector常時注入＋
-//!   注入主体のDaemon移管）が揃った後、という着手順序の拘束がある
+//!   注入するプロセスのDaemon移管）が揃った後、という着手順序の拘束がある
 //!   （`plans/PLAN-MAC-DOMAIN-TRANSITION.md`段階5b）。**測定と適用は別物**
 //! - `policy_learnd/etw`のスパイクが確立した作法（生産コードを触らず、独立した実装を
 //!   スパイク側に閉じる）と同じ
@@ -487,7 +487,7 @@ pub(super) fn probe_exe() -> PathBuf {
 }
 
 /// このworkspaceのcapability SID（`test_support::spawn_in_workspace`と同じ引き方）。
-/// `preflight`が張ったworkspaceツリーのACEの主体で、これを積まないと子はworkspaceを見られない。
+/// `preflight`が張ったworkspaceツリーのACEの宛先SIDで、これを積まないと子はworkspaceを見られない。
 ///
 /// **[D-84] モードを`rwx`に固定してある。** 以前は「台帳に載っている方」を探していたが、
 /// D-84で両モードのcapability SIDが常に台帳に載るようになり、探索は意味を失った

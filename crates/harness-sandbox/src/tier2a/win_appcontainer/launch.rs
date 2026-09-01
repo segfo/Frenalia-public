@@ -1,16 +1,16 @@
-//! Tier2a子プロセスを起こすまでの**前口上**——`preflight`が付けたのと同じ主体を導出し、
+//! Tier2a子プロセスを起こすまでの**前口上**——`preflight`が付けたのと同じ宛先SIDを導出し、
 //! 背景のACL walkの完了を待ってから`spawn_with_workspace`を呼ぶ、という一連の手順。
 //!
 //! # なぜ1箇所に集めるのか
 //!
-//! この手順は`preflight`（ACEを付ける側）と**主体の導出規則を共有していなければならない**。
+//! この手順は`preflight`（ACEを付ける側）と**宛先SIDの導出規則を共有していなければならない**。
 //! `docs/CODE-STRUCTURE-RULES.md`規則5の一般論としてではなく、実害として:
 //!
 //! - workspaceツリーのACEは**workspace＋モード単位のcapability SID**宛に付いている（D-54）。
 //!   モードの語彙（`"rwx"` / `"ro"`）が`preflight`とずれると別のcapabilityを導出し、
-//!   **付与されていない主体で起動して全アクセスが拒否される**。
+//!   **付与されていない宛先SIDで起動して全アクセスが拒否される**。
 //! - 子は**そのセッションのプロファイル**で起動しなければならない（D-37）。固定名や別名で
-//!   導出すると、ACEを付けたSIDと違う主体になりworkspaceが一切見えない。
+//!   導出すると、ACEを付けたSIDと違う宛先SIDになりworkspaceが一切見えない。
 //! - 初回起動では保護DACL配下を救済する背景walkが走っている。終わる前にコマンドを走らせると、
 //!   その配下が「存在しない/読めない」ように見え原因不明の失敗になる（D-54、[`grant_job`]）。
 //!
@@ -50,7 +50,7 @@ pub struct WorkspaceSpawn {
     pub cwd: PathBuf,
     /// 子へ渡す環境変数一式（**コマンド本体を載せた後のもの**、モジュールdoc参照）。
     pub env: Vec<(String, String)>,
-    /// workspaceルート。ACEを付けた主体（capability SID）の導出に使う。
+    /// workspaceルート。ACEを付けた宛先SID（capability SID）の導出に使う。
     pub workspace_root: PathBuf,
     /// `--sandbox tier2a-cow`（D-30）のdiff_layer_dir。`Some`のときだけRedirector DLLを注入し、
     /// workspaceモードは`"ro"`になる。
@@ -105,7 +105,7 @@ pub fn spawn_shell_in_workspace(
     });
 
     // D-54: workspaceツリーのACEはworkspace＋モード単位のcapability SID宛に付いている。
-    // `preflight`が付与したのと同じ主体をこの子のトークンへ積まないと、workspaceが一切
+    // `preflight`が付与したのと同じcapability SIDをこの子のトークンへ積まないと、workspaceが一切
     // 見えない（package SIDだけでは届かない）。
     let canonical_workspace = req
         .workspace_root
@@ -114,28 +114,28 @@ pub fn spawn_shell_in_workspace(
     let workspace_cap =
         super::workspace_capability_sid(&canonical_workspace, req.workspace_mode())?;
 
-    // [§22.3] `--fs-allow`で開いた穴の主体も積む。**穴のACEはもうこのセッションのpackage SID
+    // [§22.3] `--fs-allow`で開いた穴のcapability SIDも積む。**穴のACEはもうこのセッションのpackage SID
     // 宛ではなく、宣言ごとのcapability SID宛である**——積まなければ、preflightが正しく
     // 付与していても子からは1バイトも読めない（`ACCESS_DENIED`）。
     //
-    // 主体は`preflight`が付与に使ったのと**同じ導出**（`fs_allow_capability_sid`）から
-    // 引き直す。モジュールdocが「主体の導出規則を`preflight`と共有していなければならない」と
-    // 言っているのは、まさにこの種のずれが「付与されていない主体で起動して全アクセスが
+    // 宛先SIDは`preflight`が付与に使ったのと**同じ導出**（`fs_allow_capability_sid`）から
+    // 引き直す。モジュールdocが「宛先SIDの導出規則を`preflight`と共有していなければならない」と
+    // 言っているのは、まさにこの種のずれが「付与されていない宛先SIDで起動して全アクセスが
     // 拒否される」形で出るからである。
     //
     // 引くのは**実際にACEが付いた穴**（`granted_passthrough`）だけにする。付けられなかった
-    // パスの主体まで積むと、宣言していないものをトークンへ載せる形になる。
+    // パスのcapability SIDまで積むと、宣言していないものをトークンへ載せる形になる。
     //
     // # ここは近似である（T1-cで厳密化する）
     //
-    // 主体は`(秘密, 畳み込み済みパス, access級)`から決まるのに、`granted_passthrough`が
+    // 宛先SIDは`(秘密, 畳み込み済みパス, access級)`から決まるのに、`granted_passthrough`が
     // 運んでいるのは`writable`という**2値**でしかない。`FsAccess`は4値（`read`/`read_write`/
-    // `read_exec`/`read_write_exec`）あるので、**boolからaccess級を復元すると別の主体を
+    // `read_exec`/`read_write_exec`）あるので、**boolからaccess級を復元すると別の宛先SIDを
     // 導出し得る**——そして外れたときの症状は「ACEは正しいのに子から一切読めない」という
     // 最も分かりにくい形になる。だから**復元しない**。
     //
     // 代わりに台帳の索引を引く（`declaration_capability_names`）。これは
-    // 「**このworkspaceがこのパスに対して発行した主体**」を返すので、access級を推測せずに
+    // 「**このworkspaceがこのパスに対して発行したcapability SID**」を返すので、access級を推測せずに
     // 済む。近似なのは、同じパスへ複数のaccess級を発行済みのとき全部を積む点である
     // （このworkspace自身が宣言したものに限られるので他所へは広がらないが、
     // §22.3.0.2の条件2をこの子について厳密にはしていない）。
@@ -149,10 +149,10 @@ pub fn spawn_shell_in_workspace(
             super::fs_allow_capability_sids(path, Some(&canonical_workspace))
         })
         .collect();
-    // [§22.3.2] CoWの差分層の主体も積む。**差分層のACEはもうこのセッションのpackage SID宛では
+    // [§22.3.2] CoWの差分層のcapability SIDも積む。**差分層のACEはもうこのセッションのpackage SID宛では
     // なく、差分層ごとのcapability SID宛である**——積まなければ、Redirector DLLが退避しようと
     // した書込がすべて`ACCESS_DENIED`になり、CoWが丸ごと機能しない（DLLは子の中で動くので、
-    // 使えるのは子のトークンが持つ主体だけである）。
+    // 使えるのは子のトークンが持つcapability SIDだけである）。
     //
     // **引くだけで発行しない**（`lookup_`側）。ここで発行すると「起こす側」が台帳エントリを
     // 作ることになり、`preflight`を経ていない差分層に対して記録だけが増える。引けないときは
@@ -256,7 +256,7 @@ mod tests {
     use super::*;
 
     /// **`preflight`が使うのと同じ語彙**であることを固定する。ここがずれると別のcapability SIDを
-    /// 導出し、付与されていない主体で起動して全アクセスが拒否される（D-54、モジュールdoc）。
+    /// 導出し、付与されていない宛先SIDで起動して全アクセスが拒否される（D-54、モジュールdoc）。
     /// `preflight`側の対応する`match`は`WorkspaceWriteMode`を`..`無しで分解しているので、
     /// バリアントが増えれば向こうはコンパイルエラーになる。こちらは`Option`なのでその保護が
     /// 効かない——だからテストで固定する。

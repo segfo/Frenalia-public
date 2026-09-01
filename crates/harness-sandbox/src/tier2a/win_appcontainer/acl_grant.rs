@@ -171,14 +171,14 @@ pub(crate) enum DaclWrite {
     /// 子孫は一切触らない＝**継承ACEを足しても既存の子孫へは届かない**。
     ///
     /// [残課題#32] **届かないだけでなく、あとから撃つ[`Self::Propagate`]まで効かなくする**
-    /// ——同じ主体・同じ継承フラグのACEがこの口で置かれていると、次の伝播書込が既存の子孫へ
+    /// ——同じ宛先SID・同じ継承フラグのACEがこの口で置かれていると、次の伝播書込が既存の子孫へ
     /// 1件も届かないことがある（条件と実測は[`super::acl_dacl_write`]のモジュールdoc）。
     /// **その手当ては`Propagate`側が持っている**ので、ここを使う側が意識する必要は無い。
     SingleObject,
     /// 子孫へのauto-inherit再伝播を伴う（[`super::acl_dacl_write::propagate_merged_dacl`]）。
     /// 継承ありACEを既存ツリー全体へ行き渡らせたいときだけ使う。
     ///
-    /// [残課題#32] **素の`SetNamedSecurityInfoW`ではない。** 書く直前に対象主体のACEを
+    /// [残課題#32] **素の`SetNamedSecurityInfoW`ではない。** 書く直前に対象の宛先SIDのACEを
     /// そのノードから外す手当てが入っている（入れないと、上の`SingleObject`で先に置かれた
     /// 場合に伝播が黙って空振りする）。
     Propagate,
@@ -198,7 +198,7 @@ pub(crate) enum DaclWrite {
 ///
 /// [残課題#32] **`Always`は必要だが十分ではなかった。** これで伝播は「呼ばれる」ように
 /// なったが、**呼ばれても既存の子孫へ届いていなかった**（2026-08-25に実測で確定。
-/// 26万ノードで260,032/260,033が救済walk送り）。十分にする側——伝播書込の直前に対象主体の
+/// 26万ノードで260,032/260,033が救済walk送り）。十分にする側——伝播書込の直前に対象の宛先SIDの
 /// ACEを外す——は[`super::acl_dacl_write`]が持つ。**両方要るので、どちらも外さないこと。**
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IdempotentCheck {
@@ -236,7 +236,7 @@ pub(crate) unsafe fn set_dacl_propagating(
 ///
 /// `pub(crate)`なのは[`super::acl_dacl_write`]が「M本を1つのDACLへ畳んで1回で書く」側の
 /// 単一オブジェクト版で使うため（[D-84]で両モードのcapability SID宛ACEを同時に置くようになり、
-/// 主体ごとに1回ずつ書く形だと書込回数が本数に比例する）。
+/// 宛先SIDごとに1回ずつ書く形だと書込回数が本数に比例する）。
 pub(crate) unsafe fn set_dacl_single_object(
     path: &Path,
     new_dacl: *mut ACL,
@@ -478,7 +478,7 @@ pub(crate) fn grant_ace_mask_with_checked(
     write: DaclWrite,
     idempotent: IdempotentCheck,
 ) -> Result<(), AppContainerError> {
-    // [BUG-101] 自己検証のために「この主体へこのパスの付与を要求した」ことを残す。
+    // [BUG-101] 自己検証のために「この宛先SIDへこのパスの付与を要求した」ことを残す。
     // **root付与の内側なら何もしない**——`fix_descendants_missing_ace`が子孫の数だけ
     // ここを通るため（`grant_audit`のモジュールdoc）。ガードを張らずに直接ここへ来た
     // 書込（`grant_ace_mask`を直に呼ぶ経路）は記録する: 入口が1つ増えたときに
@@ -545,7 +545,7 @@ pub(crate) fn grant_ace_mask_with_checked(
 
         let set_result = match write {
             DaclWrite::SingleObject => set_dacl_single_object(path, new_dacl).map_err(to_err),
-            // [残課題#32] **素の`set_dacl_propagating`を直接呼ばない。** 同じ主体のACEが
+            // [残課題#32] **素の`set_dacl_propagating`を直接呼ばない。** 同じ宛先SIDのACEが
             // 既にこのノードに在ると、この書込は既存の子孫へ1件も届かない——部品側が
             // 書く直前に外す（`acl_dacl_write`のモジュールdocに実測表がある）。
             DaclWrite::Propagate => {
@@ -720,7 +720,7 @@ pub fn grant_ace_recursive_ro(root: &Path, sid: PSID) -> Result<(), AppContainer
 /// 2. 到達確認は継承ACEを数える`sid_effective_ace_mask`でなければならない。
 ///    `sid_ace_mask`（`GetExplicitEntriesFromAclW`）は継承ACEを拾わないので、伝播していても
 ///    「届いていない」と判定してしまう。
-/// 3. **伝播書込の直前に、その主体のACEをrootから外さなければならない。** 同じ主体・同じ
+/// 3. **伝播書込の直前に、その宛先SIDのACEをrootから外さなければならない。** 同じ宛先SID・同じ
 ///    継承フラグのACEが`SingleObject`で先に置かれていると、伝播は**呼ばれても既存の子孫へ
 ///    届かない**（[`super::acl_dacl_write`]のモジュールdocに実測表がある）。
 ///    1と2が揃っていても、これが欠けると同じ症状になる——**実際にそうなっていた**のが#32で、
@@ -857,7 +857,7 @@ pub fn fix_descendants_missing_ace(
 /// # なぜ「capability SIDごとにwalkを1周」ではないのか
 ///
 /// この救済walkの費用は**書込ではなく読取**である（26万ノードで実測18.5秒、ほぼ全ノードが
-/// 「もう届いている」で終わる）。主体ごとに1周すると、その読取を主体の数だけ払う——
+/// 「もう届いている」で終わる）。宛先SIDごとに1周すると、その読取を宛先SIDの数だけ払う——
 /// [D-84]の前提（「ACEを増やしても無料」、`plans/mac-spike/RESULTS.md` §S15-1）は
 /// **1回の書込にまとめた場合の話**であって、walkを2周する形には効かない。
 /// だから1ノードにつきDACLを1回読み（[`sid_effective_ace_masks`]）、
@@ -878,7 +878,7 @@ pub fn fix_descendants_missing_aces(
     // ここは`grant_job`の背景フェーズが直接呼ぶ経路のためのものである。
     //
     // **ACEの本数ぶんガードを張る**——1本目だけ張って2本目を素通しにすると、
-    // 2本目の子孫ぶんが全件「記録漏れ」として上がる（`B-06`: 主体を増やしたら計装も数える）。
+    // 2本目の子孫ぶんが全件「記録漏れ」として上がる（`B-06`: 宛先SIDを増やしたら計装も数える）。
     let _audits: Vec<_> = ace_grants
         .iter()
         .map(|grant| crate::tier2a::grant_audit::note_root_grant(root, grant.sid))
@@ -969,7 +969,7 @@ pub fn fix_descendants_missing_aces(
 /// なので、ここで数えると毎回ジョブが回る）。DACLを読めなかったノードは
 /// **届いていない側**へ倒す（読めない理由がACL不足のこともある）。
 ///
-/// **[D-84] 製品はもうここを通らない**（capability SIDが2本になったため）。1主体で測る回帰テストの
+/// **[D-84] 製品はもうここを通らない**（capability SIDが2本になったため）。宛先SID 1本で測る回帰テストの
 /// ために残してある薄い包みで、判定規則は[`top_level_child_missing_aces`]と同一である。
 #[cfg(test)]
 pub(crate) fn top_level_child_missing_ace(

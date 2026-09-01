@@ -15,7 +15,7 @@
 //! | b | チェーン構築（Schannelが使う`CertGetCertificateChain`）が**そこを読む**か | コンテナの中で`X509Chain.Build`（`SslStream`＝Schannelと同じ信頼判断の実体） |
 //! | c | コンテナの**外から**書いたものを中が自分のストアとして見るか | 外から物理パスへ書いて中で列挙 |
 //!
-//! 問cが本命である——実運用で書く主体は**AppContainerの外**（harness本体）だからである。
+//! 問cが本命である——実運用で書くプロセスは**AppContainerの外**（harness本体）だからである。
 //!
 //! ## 測る順序（B-35: 禁止側だけを測らない）
 //!
@@ -527,7 +527,7 @@ fn outside_view(certs: &SpikeCerts, profile: &str) -> String {
 ///
 /// あわせて、作ったキーへ**そのコンテナのpackage SID宛の許可ACE**を付ける。パッケージ済み
 /// アプリではOSが登録時にこれを行うが、`CreateAppContainerProfile`のlegacy AppContainerでは
-/// キー自体が存在しないため、外から作る側が主体を明示する必要がある。
+/// キー自体が存在しないため、外から作る側がSIDを明示する必要がある。
 const TEMPLATE_SEED_CONTAINER_STORE: &str = r#"
 $ErrorActionPreference = 'Stop'
 # CryptoAPIに`Blob`を組ませるための足場（作業ストア）。`X509Store`は
@@ -559,7 +559,7 @@ Remove-Item -Path '%%SCRATCH%%' -Recurse -Force
 ///
 /// パッケージ済みアプリではOSが登録時にこれを行うが、`CreateAppContainerProfile`の
 /// legacy AppContainerではキー自体が存在しない（実測: プロファイル作成直後は
-/// `Storage\<moniker>`が無い）ため、外から作る側が主体を明示する必要がある。
+/// `Storage\<moniker>`が無い）ため、外から作る側がSIDを明示する必要がある。
 /// **ACEの有無を別フェーズに割ってある**——本番実装が何をしなければならないかは、
 /// 「ACE無しでも見えるか」を測らないと決められない（B-29）。
 ///
@@ -956,7 +956,7 @@ Say 'DONE' '1'
 /// **そのコンテナのpackage SIDだけ**に読取を許す／剥がす。
 ///
 /// 継承は付けない（`None`）——`My\Keys`配下にはユーザーの秘密鍵があり、測定のために
-/// そこまで開ける理由が無い。剥がしは`RemoveAccessRuleAll`で同じ主体のACEを全部落とし、
+/// そこまで開ける理由が無い。剥がしは`RemoveAccessRuleAll`で同じSIDのACEを全部落とし、
 /// **剥がれたことを再取得して確かめる**（`feedback-security-self-verification`）。
 const TEMPLATE_GRANT_USER_STORE_DIR: &str = r#"
 $ErrorActionPreference = 'Stop'
@@ -1059,7 +1059,7 @@ const SHARED_USER_CERTIFICATES_SID: &str = "S-1-15-3-9";
 
 /// パッケージ済みアプリの`…\AppContainer\Storage\<pkg>`のDACLに、`ReadKey`で載っていた
 /// capability SID（この機で実測。2パッケージとも同一の値）。名前は不明だが、
-/// **OSがその領域へ読取を許している主体**なので変数として撃つ価値がある。
+/// **OSがその領域へ読取を許しているSID**なので変数として撃つ価値がある。
 const STORAGE_READER_CAP_SID: &str = "S-1-15-3-1024-3635283841-2530182609-996808640-1887759898-3848208603-3313616867-983405619-2501854204";
 
 /// 文字列SIDを`PSID`にする（`LocalFree`は呼び出し側の`SidBuf::drop`が行う）。
@@ -1941,7 +1941,7 @@ Write-Output 'ACE_DONE=1'
 ///
 /// AppContainerのHKCU書込はそのコンテナ専用領域（`Storage\<moniker>`）へリダイレクトされる。
 /// この経路はCryptoAPIと同じく**「このコンテナは何者か」の解決を要する**ので、
-/// `Mappings`エントリを作る主体の候補になる。本番のセッションは実際のシェル作業
+/// `Mappings`エントリを作るプロセスの候補になる。本番のセッションは実際のシェル作業
 /// （PowerShellプロファイル・COM・cargo等）でHKCUに触るが、`Write-Output $PID`だけの
 /// 子は触らない——**そこが本番と違っていたために「子を起こしても生えない」と読めていた**可能性がある。
 const TEMPLATE_CHILD_TOUCHES_OWN_HIVE: &str = r#"
@@ -3097,12 +3097,12 @@ Write-Output ("STORAGE_ACE_STILL=" + @((Get-Acl '{STORAGE_ROOT}\{profile}').Acce
 
 /// package SID宛のACEを、指定したキー群から**再帰的に**剥がし、**剥がれたことを数え直す**。
 ///
-/// `RemoveAccessRuleAll`は同じ主体・同じ`AccessControlType`のルールを権限に関わらず全部落とす。
+/// `RemoveAccessRuleAll`は同じSID・同じ`AccessControlType`のルールを権限に関わらず全部落とす。
 /// 継承ACEは`Set-Acl`で直接は落とせないが、**親の明示ACEを落とせば子の継承分も一緒に消える**
 /// ので、親から順に処理すれば足りる（`Get-Item` → `Get-ChildItem -Recurse`の順がそれ）。
 ///
 /// 数え直しは`(Get-Acl).Access`（継承分を含む）で行う——`ACE_LEFT=0`が
-/// 「その主体からはもう1本も効いていない」の意味になる（`feedback-security-self-verification`）。
+/// 「そのSIDからはもう1本も効いていない」の意味になる（`feedback-security-self-verification`）。
 const TEMPLATE_N6_REVOKE_ACE: &str = r#"
 $ErrorActionPreference = 'Stop'
 $sid = New-Object System.Security.Principal.SecurityIdentifier('%%PKG_SID%%')

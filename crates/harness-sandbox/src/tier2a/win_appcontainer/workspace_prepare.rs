@@ -1,7 +1,7 @@
 //! workspace capability ACE の準備を、通常の `preflight` と明示的な前払い CLI で共有する。
 //!
 //! 高コストなのは root へ ACE を置く同期区間ではなく、その ACE を既存子孫へ伝播し、
-//! 継承が止まった箇所を検証・救済する背景ジョブである。このモジュールは「主体・モード・
+//! 継承が止まった箇所を検証・救済する背景ジョブである。このモジュールは「宛先SID・モード・
 //! 除外範囲・完走判定」を一組にし、入口ごとに少しずつ違う準備処理が増えるのを防ぐ。
 
 //! # モードの型は[`WorkspaceMode`]ひとつである
@@ -13,10 +13,10 @@
 //!
 //! # 配るのは常に全モードぶんである（D-84）
 //!
-//! 引数の`mode`が決めるのは**このセッションが名乗る主体**であって、**配るACEの本数ではない**。
+//! 引数の`mode`が決めるのは**このセッションが名乗るSID**であって、**配るACEの本数ではない**。
 //! rootへは`WorkspaceMode::ALL`ぶんのACEを1回の書込で置く——モードを切り替えた瞬間に
 //! 26万件を払い直す事故を消すためで、費用はゼロだと実測済み（§S15-1）。
-//! 安全性は主体の側が担保する（`ro`のcapability SIDしか積んでいない子は、隣に`rwx`宛の
+//! 安全性は宛先SIDの側が担保する（`ro`のcapability SIDしか積んでいない子は、隣に`rwx`宛の
 //! ACEが載っていても書けない。`plans/handoff/fs-boundary-cost/T-1.md`）。
 
 use std::path::{Path, PathBuf};
@@ -195,7 +195,7 @@ pub(crate) fn plan_workspace_preparation(
         protect_harness_control_dir_from_appcontainer(canonical_workspace, &protect_psids)?;
 
     let skip = vec![canonical_workspace.join(".harness")];
-    // 検算に使う主体は**このセッションが名乗るモードの1本**でよい（配るのは全モードだが、
+    // 検算に使う宛先SIDは**このセッションが名乗るモードの1本**でよい（配るのは全モードだが、
     // 「このモードから見えているか」が判定したいことである）。
     let unreachable_child =
         top_level_child_missing_aces(canonical_workspace, &[capability.as_psid()], &skip);

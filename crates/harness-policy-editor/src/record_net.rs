@@ -657,7 +657,7 @@ impl Drop for SessionGrants {
     }
 }
 
-/// 「このworkspaceが主体を発行済みのルート」のうち、**今回の宣言がもう要求していない**ものを返す。
+/// 「このworkspaceが宛先SIDを発行済みのルート」のうち、**今回の宣言がもう要求していない**ものを返す。
 ///
 /// 剥がす対象を決める判定そのもの。OSに触らない純粋関数にしてあるのは、**取りすぎ・取り足りず
 /// のどちらも実害が出る**判定であり、実機や管理者権限なしで全数を固定したいためである
@@ -725,10 +725,10 @@ fn reconcile_undeclared_roots(
     on_event(NetRecordEvent::RevokingUndeclared { total: stale.len() });
     let profile = harness_sandbox::tier2a::session_profile::current_profile_name();
     for (index, path) in stale.iter().enumerate() {
-        // [§22.2.1] **`--fs-allow`の主体は宣言ごとのcapability SIDへ移った。**
+        // [§22.2.1] **`--fs-allow`の宛先SIDは宣言ごとのcapability SIDへ移った。**
         // package SIDの撤収（下）だけでは、宣言を取り消しても穴が閉じない。
         // 絞り込みは自分のworkspaceに限る——このプロセスが開けた穴だけが対象で、
-        // 同じパスを宣言している他のworkspaceの主体には触らない（BUG-046と同型）。
+        // 同じパスを宣言している他のworkspaceの宛先SIDには触らない（BUG-046と同型）。
         match harness_sandbox::tier2a::win_appcontainer::revoke_declaration_capabilities(
             path,
             Some(&canonical_ws),
@@ -767,8 +767,8 @@ fn reconcile_undeclared_roots(
     // [BUG-142] **capability台帳のほうは落とす。** ここが索引そのものなので、落とさないと
     // 次の実行でも同じパスをstaleとして拾い、剥がすものが無いまま再walkを繰り返す。
     // ただし判定は「撤収を呼んだ」ではなく**実DACLからもう消えている**で行う——
-    // 生きているworkspaceの主体は意図的に残るので、呼んだだけを根拠に記録を捨てると
-    // 主体を導出できない孤児ACEになる（`B-01`/`B-14`）。判定の実体は`harness-sandbox`側にある
+    // 生きているworkspaceの宛先SIDは意図的に残るので、呼んだだけを根拠に記録を捨てると
+    // 宛先SIDを導出できない孤児ACEになる（`B-01`/`B-14`）。判定の実体は`harness-sandbox`側にある
     // （`harness fs revoke`系と共有。同じ判定を2箇所に書かない、`B-05`）。
     //
     // **ここで別の行は出さない。** 剥がしたことは`UndeclaredRevoked`が1件ずつ見せており
@@ -831,7 +831,7 @@ impl SharedNetfilter {
     /// `ApplyRules`相乗りの経路（`chain_launch_policy_learnd`）は「netfilterdをこれから
     /// 起こす」ときにしか使えない——昇格側は1接続につき1回しか相乗りを受け付けないためで、
     /// **起動時前倒しでdaemonが常駐すると毎回そちらの条件になる**。塞がないと、
-    /// netfilterdから消したUACが収集器で復活する（UACの主体が入れ替わるだけになる）。
+    /// netfilterdから消したUACが収集器で復活する（昇格するプロセスが入れ替わるだけになる）。
     pub fn chain_launch_collector(&self, pipe_name: &str) -> Result<(), String> {
         self.chain_launch(
             harness_sandbox::tier2a::netfilterd::SiblingHelper::PolicyLearnd,
@@ -1098,7 +1098,7 @@ fn run_pass2<'a>(
         })
         .collect();
     harness_sandbox::tier2a::fs_passthrough_ledger::record_fs_passthrough_grants(&grants);
-    // [BUG-142] **ここでプロセス内へ覚え直さない。** 「どのパスへ主体を発行したか」は
+    // [BUG-142] **ここでプロセス内へ覚え直さない。** 「どのパスへ宛先SIDを発行したか」は
     // `preflight`が既にcapability台帳へ書いており（`declaration`欄）、撤収側は
     // `declared_paths_for_workspace`でそこから引く。2つ目の索引を作ると、
     // 片方だけ更新される形（＝この欠陥そのもの）へ戻る。
@@ -1530,7 +1530,7 @@ fn drain_net_audit(
 /// ドメインのFSルールから`FsPassthrough`を作る。
 ///
 /// **workspace配下のパスは含めない**——Tier2aのworkspace grantが既に覆っているので、
-/// 同じツリーへ別主体のACEを重ねる意味が無い（`preflight`の走査対象を無駄に増やすだけ）。
+/// 同じツリーへ別の宛先SIDのACEを重ねる意味が無い（`preflight`の走査対象を無駄に増やすだけ）。
 /// 分類の規則は[`crate::approve`]の表示とそろえる（B-19: 綴りを揃える規則を2つ持たない）。
 fn passthrough_for_domain(domain: &PolicyDomain, workspace_root: &Path) -> Vec<FsPassthrough> {
     // ルートの畳み込み（どれをworkspace外と見るか・重複したときどちらのaccessを採るか）は

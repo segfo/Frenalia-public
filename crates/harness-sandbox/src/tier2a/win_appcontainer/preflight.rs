@@ -25,10 +25,10 @@ pub struct PreflightOutcome {
     ///
     /// 呼び出し元はこれを`fs-passthrough-ledger`へ記録し、撤収側が名指しで剥がせるようにする
     /// （BUG-101が`granted_sids`を作ったのと同じ目的）。**セッションに1つではなくパスごとに
-    /// 違う**——主体が宣言ごとのcapability SIDになったので、呼び出し元が
+    /// 違う**——宛先SIDが宣言ごとのcapability SIDになったので、呼び出し元が
     /// `current_session_grant_sid()`から1つ取って全件へ配る形はもう正しくない。
     ///
-    /// 付与に失敗したパスは載らない（載せると「幻の主体」を記録することになる）。
+    /// 付与に失敗したパスは載らない（載せると「幻の宛先SID」を記録することになる）。
     pub granted_subjects: Vec<(std::path::PathBuf, String)>,
     /// `preflight`が特権分離ヘルパーへ`GrantFsAllow`を委譲する経路を実際に通り、その際
     /// `wfp_chain_pipe`が`Some`だったため「処理完了後に`harness-netfilterd`を連鎖起動してほしい」
@@ -62,7 +62,7 @@ type FsAllowElevationOutcome = (Vec<std::path::PathBuf>, Vec<(std::path::PathBuf
 /// [§22.3] `--fs-allow`の穴は宣言ごとのcapability SID宛へ移り、**セッション台帳へは
 /// 記録しなくなった**（同じセッションでは開かれっぱなしで、撤収は
 /// `workspace-capability-ledger.json`を索引に名前の付いた扉が行う）。したがって
-/// ここで除外リストを持つ必要はもう無い——除外は「記録しているのに主体が違う」ときに
+/// ここで除外リストを持つ必要はもう無い——除外は「記録しているのに宛先SIDが違う」ときに
 /// 要ったもので、記録そのものをやめた時点で対象に入らない。
 ///
 /// 正常に抜けるときは[`Self::finish`]で`warnings`へも積む——stderrの1行はTUIでは
@@ -360,7 +360,7 @@ pub fn preflight_with_privhelper_launcher(
     let sid = ensure_profile(&profile_name)?;
     // [BUG-101/B-05] 台帳へ「どのSID宛に付与したか」を書くのは**呼び出し元**（`run_agent`と
     // ポリシーエディタのパス2）で、あちらは`current_session_grant_sid()`から値を取る。
-    // ここで実際に使う主体とずれると、撤収側は「台帳に記録が無いACE」を見ることになり、
+    // ここで実際に使う宛先SIDとずれると、撤収側は「台帳に記録が無いACE」を見ることになり、
     // 名前を失った時点で剥がせなくなる。**ずれを無言にしない**ため、その場で検算する。
     if let (Ok(actual), Some(recorded)) = (
         crate::win_common::sid_to_string(sid.as_psid()),
@@ -409,16 +409,16 @@ pub fn preflight_with_privhelper_launcher(
         workspace_mode.as_str(),
     );
 
-    // D-54: workspaceツリーへ付けるACEの主体。**セッションのpackage SIDではなく、この
+    // D-54: workspaceツリーへ付けるACEの宛先SID。**セッションのpackage SIDではなく、この
     // workspace＋モードに固有のcapability SID**へ付ける。付与の形（どのツリーへ何を許すか）は
-    // workspaceとモードで決まるものであって、セッションの属性ではない——主体をその形に
+    // workspaceとモードで決まるものであって、セッションの属性ではない——宛先SIDをその形に
     // 合わせることで、26万ノードへの継承ACEの伝播を**ワークスペースにつき一度きり**にする
     // （毎起動で払っていた実測60秒が消える、BUG-081）。名前はワークスペースごとのランダム
     // 秘密から導出され、サンドボックスから読めない台帳にだけ存在する
     // （`crate::tier2a::workspace_capability`のdoc）。
     //
     // [D-84] **導出するのは自分のモードのcapability SID 1本ではなく、全モードのcapability SIDである。**
-    // capability SIDは(パス, モード)から決まるので、モードを切り替えると主体ごと変わり、既に配った
+    // capability SIDは(パス, モード)から決まるので、モードを切り替えると宛先SIDごと変わり、既に配った
     // 26万件のACEが一斉に無効になって全額を払い直していた（一巡61.4秒、§S12）。両方を
     // **1回の書込で**置けばその払い直しが消える——費用はゼロ（§S15-1）、安全性も実測済み
     // （`ro`のcapability SIDしか持たない子は、隣に`rwx`宛のACEが載っていても作成・追記・削除が
@@ -495,16 +495,16 @@ pub fn preflight_with_privhelper_launcher(
         ace_grants.len()
     ));
 
-    // [§22.3.2] 差分層の主体は、付与した後も**プローブと子の起動まで**運ぶ必要がある
+    // [§22.3.2] 差分層の宛先SIDは、付与した後も**プローブと子の起動まで**運ぶ必要がある
     // （`probe_capabilities`のdoc: CoWのプローブは`probe_dir`を差分層の中に作る）。
     // CoWでなければ`None`のまま。
     let mut cow_diff_layer_cap: Option<crate::win_common::OwnedSid> = None;
     match write_mode {
         WorkspaceWriteMode::DirectRw => {}
         WorkspaceWriteMode::Cow { diff_layer_dir } => {
-            // [§22.3.2] **主体はセッションのpackage SIDではなく、差分層ごとのcapability SIDである。**
+            // [§22.3.2] **宛先SIDはセッションのpackage SIDではなく、差分層ごとのcapability SIDである。**
             //
-            // ここには以前「diff_layer_dirはセッション専有なので主体は従来どおりpackage SIDの
+            // ここには以前「diff_layer_dirはセッション専有なので宛先SIDは従来どおりpackage SIDの
             // ままにする」と書いてあった。**その理由は§22.3の移行で失効している**——
             // 「宛先が共有であること」と「対象がセッション専有であること」は別の話で、
             // ドメインを分けると前者が穴になる。package SIDはAppContainer全体で共有されるので、
@@ -512,7 +512,7 @@ pub fn preflight_with_privhelper_launcher(
             // DACLは「このpackage SIDかつこのcapability SID」を表現できず、並べたALLOWは
             // どれか1つ満たせば通る）。
             //
-            // 主体がセッション固有になることは自動的に成立する——導出鍵に入る差分層のパスが
+            // 宛先SIDがセッション固有になることは自動的に成立する——導出鍵に入る差分層のパスが
             // セッションIDを含むためで、「セッション限定capability」という別種のSIDは足さない。
             //
             // [D-82] **生存マーカーを、差分層の実体より先に握る。**
@@ -584,7 +584,7 @@ pub fn preflight_with_privhelper_launcher(
             }
             // [§22.3.2] **自己検証の射程が黙って狭まらないようにする。** `grant_audit`は
             // capability SIDを既定で対象外にしているが、その理由はワークスペースツリーで
-            // 全件が偽陽性になることであって、差分層について検討した結果ではない。主体を
+            // 全件が偽陽性になることであって、差分層について検討した結果ではない。宛先SIDを
             // 移した以上、ここで明示的に測らないと差分層が静かに自己検証から外れる。
             if let Some(audit) = crate::tier2a::grant_audit::audit_subject(
                 crate::tier2a::grant_audit::Stage::Preflight,
@@ -604,7 +604,7 @@ pub fn preflight_with_privhelper_launcher(
             );
         }
     }
-    // D-05/D-09の層3。剥がす主体は**全モードのcapability SID（今の継承元）とpackage SID
+    // D-05/D-09の層3。剥がす宛先SIDは**全モードのcapability SID（今の継承元）とpackage SID
     // （D-37時代の残骸）**——片方だけだと剥がし残した側から制御面が書ける（`revoke.rs`のdoc参照）。
     //
     // [D-84] **「今の継承元」が2本になった。** ここが自モードのcapability SID宛ACEだけを
@@ -750,19 +750,19 @@ pub fn preflight_with_privhelper_launcher(
     // 部分適用で残った、のすべてを含む）。
     //
     // **セッション台帳へは記録しない。** 宣言はworkspaceの性質であってセッションの性質では
-    // なく、その主体（宣言ごとのcapability SID）は§22.2.1により**永続**である。記録すると
+    // なく、その宛先SID（宣言ごとのcapability SID）は§22.2.1により**永続**である。記録すると
     // `end_session`がそのエントリを「回収済み」として落とすので、ACEは実マシンに残るのに
     // **それを覚えている記録だけが消える**（撤収に使える索引は
     // `workspace-capability-ledger.json`の宣言エントリで、付与時に必ず作られている）。
     //
     // ここで集めるのは§22.3.0の不変条件の検算（この関数の末尾）に使うためである。
     let mut fs_allow_opened_paths: Vec<std::path::PathBuf> = Vec::new();
-    // [§22.3] **この穴の主体**（宣言ごとのcapability SID）。2つの用途で持ち回る。
+    // [§22.3] **この穴の宛先SID**（宣言ごとのcapability SID）。2つの用途で持ち回る。
     //
     // 1. **子のトークンへ積む**——ACEを付けても、子がそのcapabilityを持っていなければ
     //    1バイトも読めない。`--fs-allow`がpackage SID宛だった頃はセッションのSIDが
-    //    自動的に主体だったので、この持ち回り自体が要らなかった。
-    // 2. **撤収側へ渡す**——どのSID宛に付けたかを台帳へ記録する（BUG-101）。主体は
+    //    自動的に宛先SIDだったので、この持ち回り自体が要らなかった。
+    // 2. **撤収側へ渡す**——どのSID宛に付けたかを台帳へ記録する（BUG-101）。宛先SIDは
     //    セッションに1つではなく**パスごとに違う**ので、呼び出し元が
     //    `current_session_grant_sid()`から1つ取る形はもう成立しない。
     let mut fs_allow_caps: Vec<crate::win_common::OwnedSid> = Vec::new();
@@ -835,17 +835,17 @@ pub fn preflight_with_privhelper_launcher(
         let fp = &fp;
         let requested_rw = requested.access.is_read_write();
 
-        // [§22.3] **この宣言の主体**。以前はセッションのpackage SID（＝サンドボックス全体で
-        // 共有される主体）だったので、`cargo`のために開けた穴が`pwsh`にも同じだけ開いていた。
-        // 主体を宣言ごとに分けて初めて、ドメインごとのFS制御が成立する。
+        // [§22.3] **この宣言の宛先SID**。以前はセッションのpackage SID（＝サンドボックス全体で
+        // 共有されるSID）だったので、`cargo`のために開けた穴が`pwsh`にも同じだけ開いていた。
+        // 宛先SIDを宣言ごとに分けて初めて、ドメインごとのFS制御が成立する。
         //
         // **導出には`fp.access`（実際に付けるアクセス）を使う。** `requested.access`ではない
         // ——CoWでRO降格した場合、導出に使った級と実際に書いたマスクがずれると、撤収側は
-        // 別の主体を探しに行って1件も剥がせない。
+        // 別の宛先SIDを探しに行って1件も剥がせない。
         let entry_cap =
             match fs_allow_capability_sid(&canonical_workspace_root, &fp.path, fp.access) {
                 Ok(cap) => cap,
-                // 主体を作れなければ**この穴は開けない**（fail-closed）。乱数が取れないときに
+                // 宛先SIDを作れなければ**この穴は開けない**（fail-closed）。乱数が取れないときに
                 // 弱い秘密へ退避しないのは`workspace_capability`のdocのとおりで、ここで
                 // package SIDへ退避するのは「移行したつもりで全ドメインに開く」という
                 // 最悪の退避になる。
@@ -862,7 +862,7 @@ pub fn preflight_with_privhelper_launcher(
             };
 
         // [§22.3.0] **移行は付与と撤去で1つ。** capability宛を足しただけでは1ミリも成立しない
-        // ——DACLは「この主体**かつ**あの主体」を表現できず、並べたALLOWはどれか1つで通るので、
+        // ——DACLは「この宛先SID**かつ**あの宛先SID」を表現できず、並べたALLOWはどれか1つで通るので、
         // 残ったpackage SID宛ACEが引き続き全ドメインへ許可を出し続ける。しかも**その状態は
         // 成功に見える**（新しいACEは正しく付き、アクセスも通る）。
         //
@@ -921,9 +921,9 @@ pub fn preflight_with_privhelper_launcher(
                 }
             }
         }
-        // [§22.3] **主体はこの穴を開けるどの経路でも同じものを使う。** 既に足りていた／
+        // [§22.3] **宛先SIDはこの穴を開けるどの経路でも同じものを使う。** 既に足りていた／
         // いま書いた／昇格へ回した、のどれを通っても子のトークンへ積む集合と台帳へ記録する
-        // 主体は変わらない——3つの入口のうち1つだけ違う主体になる形を作らない（B-02）。
+        // 宛先SIDは変わらない——3つの入口のうち1つだけ違う宛先SIDになる形を作らない（B-02）。
         let remember_subject = |caps: &mut Vec<crate::win_common::OwnedSid>,
                                     subjects: &mut Vec<(std::path::PathBuf, String)>| {
             if let Ok(copy) = unsafe { crate::win_common::OwnedSid::copy_from(entry_cap.as_psid()) }
@@ -1048,8 +1048,8 @@ pub fn preflight_with_privhelper_launcher(
                             continue;
                         }
                     }
-                    // [§22.3] 主体は本体内の付与と**同じ導出**を通す（`fs_allow_capability_sid`は
-                    // 台帳を読み直すだけで冪等）。ここだけ別の主体にすると、同じ宣言なのに
+                    // [§22.3] 宛先SIDは本体内の付与と**同じ導出**を通す（`fs_allow_capability_sid`は
+                    // 台帳を読み直すだけで冪等）。ここだけ別の宛先SIDにすると、同じ宣言なのに
                     // 「システム保護パスに在るかどうか」で開く相手が変わる。
                     let entry_cap = match fs_allow_capability_sid(
                         &canonical_workspace_root,
@@ -1086,7 +1086,7 @@ pub fn preflight_with_privhelper_launcher(
                 // （書くのは昇格側のプロセス）。ここで「依頼した」ことだけを残し、実際に
                 // 載ったかは自己検証のDACL実測が決める——依頼と結果を同じ値にしない（B-09）。
                 //
-                // [§22.3] 記録する主体は**この宣言のcapability**である。セッションの
+                // [§22.3] 記録する宛先SIDは**この宣言のcapability**である。セッションの
                 // package SIDのまま記録すると、自己検証は「付けたはずのACEが無い」と
                 // 全件について言い続ける（測る相手が違うだけなのに）。
                 for entry in &needs_elevation {
@@ -1154,7 +1154,7 @@ pub fn preflight_with_privhelper_launcher(
             };
 
         // [§22.3] 昇格経路の後始末は3つに分かれる（完走・部分適用・ヘルパー不通）が、
-        // **どれも同じ主体を見なければならない**。ここで1本にしておかないと、
+        // **どれも同じ宛先SIDを見なければならない**。ここで1本にしておかないと、
         // 「載っているか」を測る相手が経路ごとにずれる（B-02）。
         let elevated_subject = |path: &Path| -> Option<crate::win_common::OwnedSid> {
             let access = needs_elevation
@@ -1172,8 +1172,8 @@ pub fn preflight_with_privhelper_launcher(
                         .find(|e| &e.path == path)
                         .map(|e| e.access.is_read_write())
                         .unwrap_or(false);
-                    // [§22.3] 昇格側が書いたACEの主体も、子のトークンと台帳へ運ぶ
-                    // ——ここが抜けると、**穴は開いているのに子がその主体を持っていない**
+                    // [§22.3] 昇格側が書いたACEの宛先SIDも、子のトークンと台帳へ運ぶ
+                    // ——ここが抜けると、**穴は開いているのに子がその宛先SIDを持っていない**
                     // （＝到達不能）か、**撤収経路の無い孤立ACE**のどちらかになる。
                     if let Some(cap) = elevated_subject(path) {
                         if let Ok(text) = crate::win_common::sid_to_string(cap.as_psid()) {
@@ -1292,7 +1292,7 @@ pub fn preflight_with_privhelper_launcher(
 
     // [§22.3] **`--fs-allow`の穴はセッション台帳へ記録しない。** かつてはここで
     // `record_granted_paths`を呼び、`end_session`が同じパスからセッションのpackage SID宛ACEを
-    // 剥がしていた（BUG-057）。主体が宣言ごとのcapability SIDへ移った後は、その撤収は
+    // 剥がしていた（BUG-057）。宛先SIDが宣言ごとのcapability SIDへ移った後は、その撤収は
     // **何も剥がさないのに台帳エントリだけを「回収済み」として落とす**——ACEは実マシンに
     // 残るのに、それを覚えている記録が消える形になる。
     //
@@ -1301,7 +1301,7 @@ pub fn preflight_with_privhelper_launcher(
     // 計算できる」）。剥がすのは名前の付いた扉と、宣言が消えたときの起動時の差分である。
     //
     // **CoW Redirector DLL（このセッションのpackage SID宛）は従来どおり記録する**——
-    // あちらは主体もセッションと同じ寿命なので、`end_session`が正しく剥がせる。
+    // あちらは宛先SIDもセッションと同じ寿命なので、`end_session`が正しく剥がせる。
 
     // 付与フェーズはここで終わり（以降は到達性プローブとスモークテスト）。明示的に落として、
     // UIが「ACE付与 N/N」を出し続けないようにする。
@@ -1312,11 +1312,11 @@ pub fn preflight_with_privhelper_launcher(
     // > 移行対象のパスに、セッション package SID 宛のACEが0本であること。
     //
     // 残っていると、その1本が同一セッションの**全ドメイン**へ許可を出し続ける——DACLは
-    // 「この主体かつあの主体」を表現できないので、capability宛を足しただけの状態は
+    // 「この宛先SIDかつあの宛先SID」を表現できないので、capability宛を足しただけの状態は
     // **成功に見えるのに1ミリも制御が効いていない**。だから「付けたか」ではなく
-    // 「**旧い主体が消えたか**」を測る。
+    // 「**旧い宛先SIDが消えたか**」を測る。
     //
-    // **新しい検算機構は作らない**（§22.3.0）。既にある主体の突き合わせ（この直後の
+    // **新しい検算機構は作らない**（§22.3.0）。既にある宛先SIDの突き合わせ（この直後の
     // `audit_guard`＝BUG-101の自己検証）と同じ場所・同じ`warnings`へ寄せる。ここを
     // 別の仕組みにすると、移行後に「常時警告」か「沈黙」のどちらかへ倒れる。
     //
@@ -1335,7 +1335,7 @@ pub fn preflight_with_privhelper_launcher(
             .collect();
         warnings.push(format!(
             "**{} 件のfs-allowパスに、このセッションのpackage SID宛ACEが残っています。** \
-             package SIDはサンドボックス全体で共有される主体なので、その1本が残っている間は \
+             package SIDはサンドボックス全体で共有されるSIDなので、その1本が残っている間は \
              宣言していないドメインからもこのパスへ届きます（capability宛を足しても\
              打ち消せません。plans/DESIGN-MAC-DOMAIN.md §22.3.0）: {}{}",
             unmigrated.len(),
@@ -1365,10 +1365,10 @@ pub fn preflight_with_privhelper_launcher(
     ));
     timing.mark("shell selection");
 
-    // [§22.3] プローブと本番の子が積むcapability。**穴の主体を積まないと、付与が正しくても
+    // [§22.3] プローブと本番の子が積むcapability。**穴の宛先SIDを積まないと、付与が正しくても
     // 到達性プローブは全件「到達不能」になる**（`probe_capabilities`のdoc）。
     //
-    // [§22.3.2] **差分層の主体もここに入る。** CoWのsmoke testは`probe_dir`を差分層の中に
+    // [§22.3.2] **差分層のcapability SIDもここに入る。** CoWのsmoke testは`probe_dir`を差分層の中に
     // 作って書込を試すので、積まないと「workspace FS I/Oが拒否された」と誤診断して
     // `preflight`が起動そのものを拒否する（移行の最中に実際に踏んだ）。
     let mut fs_allow_cap_psids: Vec<windows::Win32::Security::PSID> =
@@ -1478,7 +1478,7 @@ pub fn preflight_with_privhelper_launcher(
             .collect();
 
         // [D-85] ジョブの同一性は (workspace, mode, capabilityの世代) で決まる。世代を落とすと、
-        // 秘密が入れ替わって**主体が別のSIDになった**あとも「同じジョブが走っている」と誤判定し、
+        // 秘密が入れ替わって**宛先SIDが別のSIDになった**あとも「同じジョブが走っている」と誤判定し、
         // 新しい世代の準備が始まらない。
         let capability_generation = crate::tier2a::workspace_capability::ensure_capability_name(
             &canonical_workspace_root,
@@ -1605,7 +1605,7 @@ mod traverse_target_tests {
     ///
     /// これが、移行の前後で変わっていないことを固定する当のものである——`traverse_targets_for`は
     /// **パスと書込モードだけ**から決まり、ACEの宛先（package SIDかcapability SIDか）を
-    /// 一切見ない。したがって§22.3.2の主体の移行は、要求する祖先を1つも増やさない。
+    /// 一切見ない。したがって§22.3.2の宛先SIDの移行は、要求する祖先を1つも増やさない。
     #[test]
     fn a_cow_session_asks_for_the_diff_layer_parent_and_nothing_else() {
         let targets = traverse_targets_for(

@@ -42,9 +42,9 @@ pub(crate) fn ledger_forced_flag(path: &Path) -> bool {
 /// 「`revoked: … (1 ledger entry removed)`と報告されたのに`icacls`のパッケージSID数は
 /// 1つも減らない」が再現しています（B-09: 「やった」と「うまくいった」は別の事実）。
 ///
-/// # [§22.3] 主体が2系統になったので、数え方も2系統ある
+/// # [§22.3] 宛先SIDが2系統になったので、数え方も2系統ある
 ///
-/// `report`は**package SIDの分類器**（パスのDACLに実在する主体を分類して剥がす）、
+/// `report`は**package SIDの分類器**（パスのDACLに実在する宛先SIDを分類して剥がす）、
 /// `decl`は**宣言capabilityの名指し撤収**（台帳の索引から導出したSIDを剥がす）です。
 /// 片方が0件でももう片方が剥がしていれば撤収は成立しているので、**両方を足して判定します**
 /// ——`--fs-allow`の移行後は前者が常に0件になるため、package側だけで判定すると
@@ -195,7 +195,7 @@ fn report_revoke_result(
     for (sid, reason) in &left_alone {
         println!("  left alone: {sid} ({reason})");
     }
-    // [§22.2.1] **意図的に残した宣言主体も必ず出す。** 走っているワークスペースから
+    // [§22.2.1] **意図的に残した宣言の宛先SIDも必ず出す。** 走っているワークスペースから
     // アクセスを奪わないための判断だが、黙っていると「全部剥がした」と読まれる（`B-09`）
     // ——そのパスはまだ開いており、台帳エントリも残してある。
     for (name, reason) in &decl.left_alone {
@@ -207,7 +207,7 @@ fn report_revoke_result(
     ExitCode::SUCCESS
 }
 
-/// `path`から、**そのパスのDACLに実在するharness由来の主体**のACEを撤収する
+/// `path`から、**そのパスのDACLに実在するharness由来の宛先SID**のACEを撤収する
 /// （進捗表示つき。`forced`なら`SeRestorePrivilege`下で走る）。
 #[cfg(windows)]
 fn revoke_subjects_with_progress(
@@ -246,12 +246,12 @@ fn revoke_subjects_with_progress(
 /// [§22.3.1] 昇格側へ渡す**宣言capabilityの前像**（`(秘密, access級)`）を組み立てる。
 ///
 /// **SIDも名前も渡さない。** 受信側が`(この秘密, 自分で畳み込んだ対象パス, access級)`から
-/// 導出するので、宣言Aの秘密で別のパスBへAの主体を付けさせることができない（§22.3.1の表3行目）。
+/// 導出するので、宣言Aの秘密で別のパスBへAのSIDを付けさせることができない（§22.3.1の表3行目）。
 ///
 /// **秘密を引くのはこの関数だけにしてある**（付与側`preflight`が昇格分岐だけで引いているのと
 /// 同じ方針）。持ち回る場所が増えると、ログやエラー文へ載る面が増える。
 ///
-/// 台帳の`mode`欄が知らない綴りだったエントリは**落とす**——級が違えば主体が別になるので、
+/// 台帳の`mode`欄が知らない綴りだったエントリは**落とす**——級が違えば宛先SIDが別になるので、
 /// 既定値で埋めると存在しないSIDを剥がしに行くことになる。落ちた分は昇格後の検算
 /// （`declaration_capabilities_on_root`）が「まだ載っている」として拾う。
 #[cfg(windows)]
@@ -260,7 +260,7 @@ fn declaration_subjects_for(
     workspace: Option<&Path>,
 ) -> Vec<harness_sandbox::tier2a::privhelper::FsAllowRevokeSubject> {
     // **昇格側へ渡す集合は、本体内で剥がそうとした集合と同じでなければならない**（`B-02`）。
-    // `None`（全workspace）のときは生きているworkspaceの主体を外す規則が掛かるので、
+    // `None`（全workspace）のときは生きているworkspaceの宛先SIDを外す規則が掛かるので、
     // ここでも同じ判定（`revocable_declaration_issuers`）を通す——別々に書くと、
     // 本体内では守った「生きている相手から奪わない」を昇格側だけが破る。
     let workspaces: Vec<Option<std::path::PathBuf>> = match workspace {
@@ -288,13 +288,13 @@ fn declaration_subjects_for(
         .collect()
 }
 
-/// [§22.2.1] `path`から**宣言capability**（`--fs-allow`の主体）のACEを名指しで撤収する
+/// [§22.2.1] `path`から**宣言capability**（`--fs-allow`の宛先SID）のACEを名指しで撤収する
 /// （進捗表示つき。`forced`なら`SeRestorePrivilege`下で走る）。
 ///
-/// 上の`revoke_subjects_with_progress`（package SIDの分類器）と**対で呼ぶ**。主体が2系統
+/// 上の`revoke_subjects_with_progress`（package SIDの分類器）と**対で呼ぶ**。宛先SIDが2系統
 /// あるので撤収も2段になり、どちらか片方だけでは「対象パスにharnessのACEが0本」を名乗れない。
 ///
-/// `workspace`が`None`＝そのパスへ発行された全workspaceの主体。**明示コマンド専用**で、
+/// `workspace`が`None`＝そのパスへ発行された全workspaceの宛先SID。**明示コマンド専用**で、
 /// 暗黙の経路は必ず`Some`で絞る（`revoke_declaration_capabilities`のdoc）。
 ///
 /// **進捗の文言を分けてある**——`--fs-allow`の移行後は撤収の実体がこちら側なので、
@@ -333,7 +333,7 @@ fn revoke_declarations_with_progress(
 /// 「本体内試行→ヘルパーへエスカレーション」の2段構え）。撤収できた場合のみ台帳から除去する
 /// （残件がある場合は台帳に残し、次回再試行できるようにする）。
 ///
-/// # [BUG-101] 撤収する主体は「名前から導出したSID」ではなく「パスに実在するSID」
+/// # [BUG-101] 撤収する宛先SIDは「名前から導出したSID」ではなく「パスに実在するSID」
 ///
 /// 旧実装は(1)`revocable_profile_names()`の死んだセッションSIDごとにツリー全walkを回し、
 /// (2)最終判定だけを**旧共有プロファイル**（`CONTAINER_NAME`）のSIDで行っていた。実際に
@@ -346,9 +346,9 @@ fn revoke_declarations_with_progress(
 /// いまは`revoke_harness_subjects`が対象パスのDACLを読み、そこに実在するパッケージSIDだけを
 /// 分類して**1回のwalk**で剥がす（死んだプロファイルの数だけwalkを回すこともしない）。
 ///
-/// # [§22.2.1] 主体が2系統あるので、撤収も2段である
+/// # [§22.2.1] 宛先SIDが2系統あるので、撤収も2段である
 ///
-/// 上の分類器は`S-1-15-2-`（package SID）しか列挙しない。`--fs-allow`の主体は
+/// 上の分類器は`S-1-15-2-`（package SID）しか列挙しない。`--fs-allow`の宛先SIDは
 /// **宣言ごとのcapability SID**（`S-1-15-3-`）へ移ったので、分類器だけでは1本も剥がれない
 /// ——**このコマンドが「名前の付いた扉」である**（分類器へcapability SIDを混ぜると
 /// [BUG-046](../../../../docs/bugs/BUG-046.md)の再現になるので、混ぜずに段を足す）。
@@ -387,7 +387,7 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
     if report.unfinished().is_empty() && decl.is_clean() {
         // **台帳を落としてよいのは、剥がすべきものが残っていないときだけ**（B-01: 資源へ
         // 到達する手段を捨てる操作は最後）。生きているセッションがACEを持っている場合も残す。
-        // **意図的に残した主体（走っているworkspaceのもの）があるなら記録も残す**
+        // **意図的に残した宛先SID（走っているworkspaceのもの）があるなら記録も残す**
         // （`decl.may_forget()`。そのACEは実在するので、記録を消すと孤児になる、`B-01`）。
         let removed = if report.may_remove_ledger_entry() && decl.may_forget() {
             remove_fs_passthrough_grant(path)
@@ -434,7 +434,7 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
     let revoke_entry = harness_sandbox::tier2a::privhelper::FsAllowRevoke {
         path: path.to_path_buf(),
         forced,
-        // 明示コマンドなので全workspaceの宣言主体を渡す（絞り込みの意味は`None`と同じ規則）。
+        // 明示コマンドなので全workspaceの宣言の宛先SIDを渡す（絞り込みの意味は`None`と同じ規則）。
         subjects: declaration_subjects_for(path, None),
     };
     match harness_sandbox::tier2a::privhelper::run_privileged_revoke_fs_allow(vec![revoke_entry]) {
@@ -529,15 +529,15 @@ impl RevokeAnnounce {
 /// かつてここは`ensure_profile(CONTAINER_NAME)`＝**旧共有プロファイル**のSID1つだけを見ており、
 /// 「死んでいるセッション固有SIDのACEを剥がす」ループは`fs_revoke_one`にしか無かった。
 /// そのため`fs revoke-all`は**台帳からエントリを消すだけで実体のACEは残していた**。
-/// いまは両方が同じ`revoke_harness_subjects`（パスのDACLに実在する主体を剥がす）を通るので、
+/// いまは両方が同じ`revoke_harness_subjects`（パスのDACLに実在する宛先SIDを剥がす）を通るので、
 /// 片方にだけ対応が入る形が構造的に無くなった（B-06）。
 ///
 /// # [§22.2.1] `workspace_scope`——宣言capabilityをどの範囲で剥がすか
 ///
-/// `None`は「そのパスへ発行された**全workspace**の主体」で、**そのパスを名指しした明示操作**
+/// `None`は「そのパスへ発行された**全workspace**の宛先SID」で、**そのパスを名指しした明示操作**
 /// （`harness fs revoke` / `revoke-all`）だけが使ってよい。起動時の自動整合（D-27）のような
 /// 暗黙の経路は必ず`Some(workspace)`で絞ること——絞らないと、同じパスを宣言している別の
-/// ワークスペースの主体まで剥がすことになり、[BUG-046](../../../../docs/bugs/BUG-046.md)
+/// ワークスペースの宛先SIDまで剥がすことになり、[BUG-046](../../../../docs/bugs/BUG-046.md)
 /// （他人が使っているACEを純減させる）と同じ形になる。
 #[cfg(windows)]
 pub(crate) fn revoke_fs_ledger_entries(
@@ -651,7 +651,7 @@ pub(crate) fn revoke_fs_ledger_entries(
         Ok((revoked, root_cleared, helper_failures)) => {
             for path in revoked.iter().chain(root_cleared.iter()) {
                 // **ヘルパーの応答だけを根拠に台帳を落とさない**（B-25）。rootのDACLを読み
-                // 直して、剥がすべき主体が残っていないことを確かめてから記録を捨てる。
+                // 直して、剥がすべき宛先SIDが残っていないことを確かめてから記録を捨てる。
                 let sids = ledger_granted_sids(path);
                 // 宣言capability側も同じ根拠（実DACL）で確かめる。読むのはrootの明示ACEだけ。
                 let decl_left =
@@ -713,7 +713,7 @@ pub(crate) fn fs_revoke_all() -> ExitCode {
         "revoked",
         remove_fs_passthrough_grant,
         RevokeAnnounce::Stdout,
-        // 明示コマンドなので全workspaceの宣言主体が対象（`revoke_fs_ledger_entries`のdoc）。
+        // 明示コマンドなので全workspaceの宣言の宛先SIDが対象（`revoke_fs_ledger_entries`のdoc）。
         None,
     );
     if failures.is_empty() {
@@ -742,11 +742,11 @@ pub(crate) fn fs_revoke_all() -> ExitCode {
 ///
 /// # [§22.2.1] これが「宣言が消えた次セッション開始時の差分」である
 ///
-/// `--fs-allow`の主体が宣言ごとのcapability SIDへ移り、そのACEは**永続**になった
+/// `--fs-allow`の宛先SIDが宣言ごとのcapability SIDへ移り、そのACEは**永続**になった
 /// （セッション終了時に剥がすと、同じワークスペースの並行セッションが互いの許可を落とす）。
 /// 通常の撤収経路は「宣言が消えたら次の起動で剥がす」差分で、その差分を既に計算しているのが
 /// この関数である——**新しい差分機構は作らない**（検問7/8）。足りないのは
-/// 「消えた宣言の主体を実ACLから剥がす」段だけで、それは`revoke_fs_ledger_entries`が持つ。
+/// 「消えた宣言の宛先SIDを実ACLから剥がす」段だけで、それは`revoke_fs_ledger_entries`が持つ。
 ///
 /// **対象は`.harness/settings.json`の宣言だけ**である。`--fs-allow`のCLI宣言を差分の材料に
 /// しないのは、宣言集合が**起動ごとに違い得る**ためで、材料にすると
@@ -789,13 +789,13 @@ pub fn reconcile_fs_ledger_for_workspace(
     for entry in &orphan_candidates {
         eprintln!("  {}", entry.path);
     }
-    // [§22.2.1] **対象はこのワークスペースの主体だけではない。** ここへ来たエントリは
+    // [§22.2.1] **対象はこのワークスペースの宛先SIDだけではない。** ここへ来たエントリは
     // 「**もうどのワークスペースも宣言していない**」ことが確定したものなので、そのパスへ
-    // 発行された宣言主体は全部が撤収対象である。自分のワークスペースだけに絞ると、
+    // 発行された宣言の宛先SIDは全部が撤収対象である。自分のワークスペースだけに絞ると、
     // 2つのワークスペースが同じパスを宣言して両方とも宣言を外したとき、**最後に起動した側の
-    // 主体しか剥がれない**（実機E2Eで「台帳エントリは消えたのにACEが1本残る」として出た）。
+    // 宛先SIDしか剥がれない**（実機E2Eで「台帳エントリは消えたのにACEが1本残る」として出た）。
     //
-    // 走っているワークスペースの主体を巻き込まないための判定は`revoke_declaration_capabilities`
+    // 走っているワークスペースの宛先SIDを巻き込まないための判定は`revoke_declaration_capabilities`
     // が内側で持つ（分類器側の規則1と同じ、BUG-046の形を作らないためのゲート）。
     let canonical = workspace_root
         .canonicalize()

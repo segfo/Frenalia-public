@@ -45,12 +45,12 @@
 //! ように**経路そのものを名指しする**ので、「どの付与経路が記録を落としているか」が
 //! 推測ではなく観測になる。
 //!
-//! # 対象にしない主体
+//! # 対象にしない宛先SID
 //!
-//! **「capability SIDは全部対象外」ではない**（[§22.3.2]で変わった）。判定軸は主体の種類ではなく、
-//! **その主体のACEをセッションが撤収する責任を負っているか**である。
+//! **「capability SIDは全部対象外」ではない**（[§22.3.2]で変わった）。判定軸は宛先SIDの種類ではなく、
+//! **その宛先SIDのACEをセッションが撤収する責任を負っているか**である。
 //!
-//! | 主体 | 測るか | なぜ |
+//! | 宛先SID | 測るか | なぜ |
 //! |---|---|---|
 //! | セッションのpackage SID・MCPサーバのpackage SID | **測る** | GCでプロファイルが削除される＝名前を失って孤児化し得る |
 //! | **CoW差分層のcapability SID**（§22.3.2） | **測る** | セッションが撤収責任を負う（`end_session`／`gc_dead_sessions`）。名前は乱数の秘密由来なので、記録を失うと二度と剥がせない |
@@ -58,14 +58,14 @@
 //! | 祖先traverseのcapability SID | 測らない | 同じ理由（`traverse-grant-ledger`が別に持つ） |
 //! | `--fs-allow`の宣言capability SID（§22.3） | 測らない | 宣言と同じ寿命で、セッション終了では失効しない（`fs revoke`／起動時の自動整合が撤収する） |
 //!
-//! 差分層を表から落とすと**症状の出ない形でカバレッジが落ちる**——主体を移した瞬間に
+//! 差分層を表から落とすと**症状の出ない形でカバレッジが落ちる**——宛先SIDを移した瞬間に
 //! 静かに射程外へ出る、という形だったので、[`audit_subject`]（SIDを直接受け取る口）を
 //! `preflight`のCoW分岐から明示的に呼ぶ。
 //!
 //! ## 差分層について、この機構が答えられないこと
 //!
 //! 測っているのは**付与した実行の中で、付与と記録が食い違っていないか**である。
-//! **付与とその記録の間でプロセスが落ちた場合は、どの経路も検出できない**——主体の名前を
+//! **付与とその記録の間でプロセスが落ちた場合は、どの経路も検出できない**——宛先SIDの名前を
 //! 記録していないので、次の起動は「どのSIDを探せばよいか」を知らない（package SIDは
 //! プロファイル名を列挙して数え直せたが、capability名は乱数由来なので列挙できない）。
 //!
@@ -74,7 +74,7 @@
 //! ——フォルダが消えていればACEも道連れなので、記録だけが先に消えることはない。
 //! `harness fs revoke-workspace`はこの限りではない（そのworkspaceの記録を全部落とす）ので、
 //! **CoWセッションが落ちた直後にそれを打つと、剥がせないACEが1件残り得る**。
-//! これは「まだ無い」であって「原理的に無理」ではない（実体側から主体を列挙する向きの
+//! これは「まだ無い」であって「原理的に無理」ではない（実体側から宛先SIDを列挙する向きの
 //! 撤収を作れば閉じる）。
 //!
 //! # 継承ACEは測れない
@@ -147,10 +147,10 @@ impl std::fmt::Display for Origin {
     }
 }
 
-/// 「この主体へ、このパスの付与を要求した」という1件。
+/// 「この宛先SIDへ、このパスの付与を要求した」という1件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantAttempt {
-    /// 付与先の主体（SID文字列）。
+    /// 付与先の宛先SID（SID文字列）。
     pub sid: String,
     pub path: PathBuf,
     pub origin: Origin,
@@ -162,7 +162,7 @@ fn registry() -> &'static std::sync::Mutex<Vec<GrantAttempt>> {
     REGISTRY.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// 付与の要求を1件記録する。同じ（主体, パス）の重複は積まない。
+/// 付与の要求を1件記録する。同じ（宛先SID, パス）の重複は積まない。
 pub fn note_attempt(sid: &str, path: &Path, origin: Origin) {
     if mode() == Mode::Off {
         return;
@@ -184,7 +184,7 @@ pub fn note_attempt(sid: &str, path: &Path, origin: Origin) {
     });
 }
 
-/// この主体へ付与を要求したパス一覧。
+/// この宛先SIDへ付与を要求したパス一覧。
 pub fn attempts_for(sid: &str) -> Vec<GrantAttempt> {
     registry()
         .lock()
@@ -298,7 +298,7 @@ pub struct ProbedPath {
 pub struct GrantAudit {
     /// どの時点で測ったか（[`Stage`]）。
     pub stage: Stage,
-    /// 測った主体（SID文字列）。
+    /// 測った宛先SID（SID文字列）。
     pub subject: String,
     /// 実際にDACLを読んだパス数。
     pub checked: usize,
@@ -487,7 +487,7 @@ mod win {
     use super::*;
     use windows::Win32::Security::PSID;
 
-    /// この主体のSID文字列。導出できなければ`None`（記録できないことを付与の失敗にはしない）。
+    /// この宛先SIDの文字列。導出できなければ`None`（記録できないことを付与の失敗にはしない）。
     pub(super) fn sid_string(sid: PSID) -> Option<String> {
         crate::win_common::sid_to_string(sid).ok()
     }
@@ -523,7 +523,7 @@ mod win {
     }
 }
 
-/// この主体について、いま実マシンに載っているACEと台帳を突き合わせる（Windows）。
+/// この宛先SIDについて、いま実マシンに載っているACEと台帳を突き合わせる（Windows）。
 ///
 /// `sid`は**副作用の無い導出**で得たものを渡すこと——撤収・検算の経路が
 /// `ensure_profile`（＝存在しなければ作る）を呼ぶと、削除済みプロファイルを復活させる
@@ -547,7 +547,7 @@ pub fn audit_subject(
     Some(classify(stage, &subject, probed, recorded))
 }
 
-/// プロファイル名から主体を導出して[`audit_subject`]を呼ぶ（セッション／MCPで共通）。
+/// プロファイル名から宛先SIDを導出して[`audit_subject`]を呼ぶ（セッション／MCPで共通）。
 #[cfg(windows)]
 pub fn audit_profile(stage: Stage, profile_name: &str, recorded: &[String]) -> Option<GrantAudit> {
     if mode() == Mode::Off {
@@ -843,7 +843,7 @@ mod tests {
         assert!(!in_root_grant());
     }
 
-    /// 同じ（主体, パス）を2回要求しても1件。付与が2回走る経路
+    /// 同じ（宛先SID, パス）を2回要求しても1件。付与が2回走る経路
     /// （`already_sufficient`のスキップと実付与）で二重に数えない。
     #[test]
     fn the_same_grant_is_recorded_once() {
@@ -855,7 +855,7 @@ mod tests {
         assert_eq!(attempts_for("S-1-15-2-dedup").len(), 2);
         assert!(
             attempts_for("S-1-15-2-other").is_empty(),
-            "主体が違えば別の集合"
+            "宛先SIDが違えば別の集合"
         );
         clear_registry();
     }

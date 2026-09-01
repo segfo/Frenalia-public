@@ -322,7 +322,7 @@ pub fn sandbox_root(workspace_root: &Path) -> PathBuf {
 ///
 /// **ここで返すidをAppContainerのプロファイル名に使ってはいけない。** package SIDの単位は
 /// D-37のとおり「セッション＝プロセスの寿命」のままで、`current_profile_name()`が正本である。
-/// 分けているのは*記録の置き場*だけで、権限の主体は分けていない。
+/// 分けているのは*記録の置き場*だけで、権限の宛先SIDは分けていない。
 pub fn next_record_id() -> String {
     static SERIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;

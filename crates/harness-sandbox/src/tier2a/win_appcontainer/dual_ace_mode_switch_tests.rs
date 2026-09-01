@@ -4,8 +4,8 @@
 //!
 //! # 何が困っているのか
 //!
-//! Tier2a のファイルシステム境界は「許可したい各ノードのDACLへ、サンドボックス主体宛のACEを
-//! 事前に書く」方式で、その主体（capability SID）は
+//! Tier2a のファイルシステム境界は「許可したい各ノードのDACLへ、サンドボックスのSID宛のACEを
+//! 事前に書く」方式で、その宛先SID（capability SID）は
 //! **(ワークスペースのパス, 書込モード)** から導出される（[`super::workspace_capability_sid`]）。
 //! モードは2つある（[`crate::tier2a::workspace_ledger::KNOWN_MODES`] ＝ `rwx` / `ro`）。
 //! **モードを切り替えるとcapability SIDが変わるので、既に配った26万件のACEが全部無効になり、全額を
@@ -44,7 +44,7 @@
 //!
 //! 昇格するとAppContainer子の親トークンが管理者のものになり、測っている世界が実運用と
 //! ずれる（`d79_exec_split_tests`と同じ理由、B-08）。ACEを書くのは**テスト自身が作った
-//! ツリー**だけなので所有者権限で足りる。主体は[`super::capability_sid_from_name`]（純粋な
+//! ツリー**だけなので所有者権限で足りる。宛先SIDは[`super::capability_sid_from_name`]（純粋な
 //! 導出）で、**台帳にもAppContainerプロファイルにも何も残さない**——
 //! [`super::workspace_capability_sid`]は`%APPDATA%`の台帳へ実際に書くので**使わない**。
 //!

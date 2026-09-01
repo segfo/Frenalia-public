@@ -11,7 +11,7 @@
 //!
 //! S2dは**将来のためのプリフェッチ**である。§22.8はドメインごとの別package SIDを
 //! 「traverse・workspace ACEがドメイン数倍になる」という理由で却下したが、その後の決定で
-//! ACEの主体は全部capability SIDへ移った（D-37・D-54・§22.3）。**capability SID宛のACEが
+//! ACEの宛先SIDは全部capability SIDへ移った（D-37・D-54・§22.3）。**capability SID宛のACEが
 //! package SIDに依存しないなら、却下理由の大半は消える**——それをいま測っておけば、
 //! 将来ここへ戻ってきたときに測り直さずに済む。
 //!

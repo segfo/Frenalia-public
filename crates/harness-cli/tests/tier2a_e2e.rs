@@ -2623,7 +2623,7 @@ fn fs_allow_case_bare_path_grants_the_object_only(ledger: &FsLedgerExclusive) ->
 /// `path`のDACLに載っている、接頭辞`prefix`のSIDのACE本数（実DACLを`Get-Acl`で読む）。
 ///
 /// **台帳ではなく実体を見る**（`B-14`）。`S-1-15-2-`はAppContainerのpackage SID、
-/// `S-1-15-3-`はcapability SIDで、`--fs-allow`の主体は前者から後者へ移った（§22.3）。
+/// `S-1-15-3-`はcapability SIDで、`--fs-allow`の宛先SIDは前者から後者へ移った（§22.3）。
 fn count_sid_aces(path: &Path, prefix: &str) -> Result<usize, String> {
     let output = Command::new("powershell")
         .args([
@@ -2647,7 +2647,7 @@ fn count_sid_aces(path: &Path, prefix: &str) -> Result<usize, String> {
 /// # このテストは意味を変えてある（旧名 `..._is_revoked_when_the_session_ends`）
 ///
 /// 旧版は「セッション終了でACEが失効する」（D-37の仕様）を測っており、その手段として
-/// **`S-1-15-2-*`（package SID）の本数が0になること**だけを見ていた。主体が宣言ごとの
+/// **`S-1-15-2-*`（package SID）の本数が0になること**だけを見ていた。宛先SIDが宣言ごとの
 /// capability SID（`S-1-15-3-*`）へ移った後もこのassertはそのまま通る——**測る相手が
 /// 変わっただけで、テストは緑のまま意味だけが嘘になる**（`B-08`）。
 ///
@@ -2675,7 +2675,7 @@ fn fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it(
     parse_json_stdout(&run)?;
 
     // (1) 移行の不変条件。**capability宛を足しただけでは1ミリも成立しない**ので、
-    // 「新しい主体が付いたか」ではなく「**旧い主体が消えたか**」を測る（§22.3.0）。
+    // 「新しい宛先SIDが付いたか」ではなく「**旧い宛先SIDが消えたか**」を測る（§22.3.0）。
     let package = count_sid_aces(&target, "S-1-15-2-")?;
     if package != 0 {
         return Err(format!(
@@ -3224,7 +3224,7 @@ fn tier2a_mcp_corroboration() {
 //     （`crates/harness-sandbox/src/lib.rs`）で直列化される。複数の`harness.exe`を同時に
 //     起動しても、あるプロセスのタグ付けが別のプロセスの書込に踏み潰されてはならない。
 //
-// **ACEの寿命はここでは測らない。** [§22.2.1] `--fs-allow`の主体は宣言ごとのcapability SIDへ
+// **ACEの寿命はここでは測らない。** [§22.2.1] `--fs-allow`の宛先SIDは宣言ごとのcapability SIDへ
 // 移り、そのACEは**harnessの終了後も残る**（共有され得る宣言をセッション終了時に剥がすと、
 // 同じワークスペースの並行セッションが互いの許可を落とすため）。寿命そのものと、名前の付いた扉
 // （`harness fs revoke`）で消えることは
@@ -3464,9 +3464,9 @@ fn fs_ledger_case_shared_declaration_is_refcounted(ledger: &FsLedgerExclusive) -
 
     // (5) [§22.2.1] **実ACLを見る。** ここまでは台帳の側しか測っていない——
     // 台帳エントリが消えたことは、そのパスのACEが消えたことを意味しない（`B-14`）。
-    // `--fs-allow`の主体が宣言ごとのcapability SID（`S-1-15-3-*`）へ移った後は、
+    // `--fs-allow`の宛先SIDが宣言ごとのcapability SID（`S-1-15-3-*`）へ移った後は、
     // **これが「宣言が消えた次の起動で剥がれる」の唯一の証拠**になる（T1-cの受け入れ条件3）。
-    // 主体が移る前は同じ経路がpackage SID（`S-1-15-2-*`）宛を剥がしていたので、両方を数える。
+    // 宛先SIDが移る前は同じ経路がpackage SID（`S-1-15-2-*`）宛を剥がしていたので、両方を数える。
     for prefix in ["S-1-15-2-", "S-1-15-3-"] {
         let left = count_sid_aces(&target, prefix).map_err(&finish)?;
         if left != 0 {
@@ -4092,7 +4092,7 @@ if ($back.Count -eq 1 -and $back[0].AccessControlType -eq 'Allow' -and \
 else { 'STRIP_UNEXPECTED:' + (($back | ForEach-Object { \
   $_.AccessControlType.ToString() + ':' + [int]$_.FileSystemRights }) -join ',') }";
 
-/// `file`のDACLを全件、`種別 0xマスク 継承 主体`の形で返す（記録用）。
+/// `file`のDACLを全件、`種別 0xマスク 継承 宛先SID`の形で返す（記録用）。
 fn full_dacl(file: &Path) -> Result<String, String> {
     let script = FULL_DACL_SCRIPT.replace("@FILE@", &file.display().to_string());
     powershell(&script)

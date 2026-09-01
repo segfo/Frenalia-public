@@ -202,7 +202,7 @@ fn read_allow_aces(path: &Path) -> Result<Vec<(String, u32)>, ElevationTargetErr
 /// **純粋な判定**: この`(SID, マスク)`は「非管理者が差し替えられる」ことを意味するか。
 ///
 /// 管理者・SYSTEM・TrustedInstallerが書けるのは正常である（そもそも昇格した先の権限と同じ）。
-/// それ以外の主体に書込系ビットが与えられていれば、その主体は昇格ヘルパーを差し替えられる。
+/// それ以外のアカウントに書込系ビットが与えられていれば、そのアカウントは昇格ヘルパーを差し替えられる。
 pub fn is_dangerous_trustee_grant(sid: &str, mask: u32) -> bool {
     if mask & DANGEROUS_WRITE_BITS == 0 {
         return false;
@@ -210,7 +210,7 @@ pub fn is_dangerous_trustee_grant(sid: &str, mask: u32) -> bool {
     !is_admin_equivalent_sid(sid)
 }
 
-/// 昇格後の権限と同等（＝書けても新しい権限を与えない）主体か。
+/// 昇格後の権限と同等（＝書けても新しい権限を与えない）アカウントか。
 fn is_admin_equivalent_sid(sid: &str) -> bool {
     matches!(
         sid,
@@ -434,7 +434,7 @@ mod elevation_target_tests {
     }
 
     /// 一般ユーザー・Everyone・Authenticated Usersの書込は拒否する
-    /// ——その主体は昇格ヘルパーを差し替えられる（T-21）。
+    /// ——そのアカウントは昇格ヘルパーを差し替えられる（T-21）。
     #[test]
     fn non_admin_trustees_holding_write_access_are_rejected() {
         for sid in [

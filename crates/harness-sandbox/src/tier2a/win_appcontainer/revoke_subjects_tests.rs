@@ -383,7 +383,7 @@ fn zero_targets_is_distinguishable_from_a_failed_revoke() {
     assert!(!failed.may_remove_ledger_entry());
 }
 
-/// 触らなかった主体は**SIDと理由**で出す。件数だけでは`icacls`で追えず、名前を失ったSIDは
+/// 触らなかった宛先SIDは**SIDと理由**で出す。件数だけでは`icacls`で追えず、名前を失ったSIDは
 /// それ以外に到達手段が無い（B-09）。
 #[test]
 fn subjects_left_alone_are_reported_with_their_sid_and_a_reason() {
@@ -400,7 +400,7 @@ fn subjects_left_alone_are_reported_with_their_sid_and_a_reason() {
 
 /// 登録簿は実マシンで読める（この機の実測: 218件。うちharness由来は`Moniker`が
 /// `harness.shell.sandbox`で始まる）。**読めることそのもの**が分類の前提なので固定する
-/// ——読めなくなれば全主体が「判別不能」へ落ち、`fs revoke`は何も剥がさなくなる。
+/// ——読めなくなれば全部のSIDが「判別不能」へ落ち、`fs revoke`は何も剥がさなくなる。
 #[test]
 fn the_appcontainer_registry_is_readable_on_this_machine() {
     let map =

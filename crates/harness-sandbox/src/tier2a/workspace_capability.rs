@@ -2,14 +2,14 @@
 //!
 //! workspaceツリーへ付けるFSのACEは、**セッションのpackage SIDではなくこのcapability SID宛**に
 //! 付ける。理由は費用である——NTFSのアクセス判定は対象オブジェクト自身のDACLしか見ないため、
-//! 26万ファイルのworkspaceを読み書きさせるには26万個のACEコピーが物理的に要る。主体が
+//! 26万ファイルのworkspaceを読み書きさせるには26万個のACEコピーが物理的に要る。宛先SIDが
 //! セッション単位（D-37）だと、この26万件を**起動のたびに**書き直すことになる（実測60秒、
 //! [BUG-081](../../../docs/bugs/BUG-081.md)）。付与の形はもともと「workspaceとモードで決まる」
 //! ものであって（同じworkspaceでのモード混在は`workspace_ledger::begin_workspace_mode`が既に
-//! 禁止している）、セッションの属性ではない。主体をその形に合わせれば、付与は**ワークスペース
+//! 禁止している）、セッションの属性ではない。宛先SIDをその形に合わせれば、付与は**ワークスペース
 //! につき一度きり**で済む。
 //!
-//! **D-37は撤回しない。** package SIDはセッション単位のままで、置き換えるのはFSのACEの主体
+//! **D-37は撤回しない。** package SIDはセッション単位のままで、置き換えるのはFSのACEの宛先SID
 //! だけである（loopback exemptionの奪い合い・WFP出口強制・プロファイル作成の競合という
 //! D-37の他の根拠はネットワークとプロファイルの話で、FSとは独立に成立している）。
 //!
@@ -53,7 +53,7 @@
 //! 「実際にツリーへACEが載っているか」は台帳では判定しない。権威は常に実物のACLであり、
 //! 付与側（`acl_grant`）がrootのACEを読んで冪等に判断する。台帳が持つのは**名前の登録簿**
 //! （同じworkspaceに毎回同じ名前を割り当てる）と**撤収の索引**（`harness fs revoke-workspace`が
-//! 剥がすべき主体を引く）の2つだけである。台帳を失っても実マシンに残るのは
+//! 剥がすべき宛先SIDを引く）の2つだけである。台帳を失っても実マシンに残るのは
 //! 「二度と導出されない秘密宛の不活性なACE」であって、生きた権限ではない。
 
 use std::path::Path;
@@ -75,16 +75,16 @@ const LEDGER_LOCK: &str = r"Local\harness-workspace-capability-ledger";
 pub struct WorkspaceCapabilityEntry {
     /// canonicalize済みworkspaceパス（表示用にそのまま持つ。突合は[`workspace_key`]で行う）。
     pub workspace: String,
-    /// **このエントリが何の主体か**（§22.3）。
+    /// **このエントリがどの宛先SIDのものか**（§22.3）。
     ///
-    /// - `None` — このworkspaceツリー**本体**の主体（D-54）。この欄が無かった頃の台帳は
+    /// - `None` — このworkspaceツリー**本体**の宛先SID（D-54）。この欄が無かった頃の台帳は
     ///   すべてこちらに読める。
-    /// - `Some(畳み込み済み宣言パス)` — `--fs-allow`の**宣言1件**の主体
+    /// - `Some(畳み込み済み宣言パス)` — `--fs-allow`の**宣言1件**の宛先SID
     ///   （§22.2.0「群 = 宣言1件」）。
     ///
     /// **既存の経路（workspace本体）は必ず`None`で突き合わせること**（[`matches`]）。
-    /// 突合から外すと、宣言エントリが workspace 本体の主体として返り、**ツリー全体へ
-    /// 宣言用の主体を撒く**——「同じツリーへ2つの主体のACEを撒かない」という
+    /// 突合から外すと、宣言エントリが workspace 本体の宛先SIDとして返り、**ツリー全体へ
+    /// 宣言用の宛先SIDを撒く**——「同じツリーへ2つの宛先SIDのACEを撒かない」という
     /// [`workspace_key`]の目的を、鍵の別の軸で破ることになる。
     #[serde(default)]
     pub declaration: Option<String>,
@@ -168,7 +168,7 @@ fn ledger() -> Ledger<WorkspaceCapabilityLedger> {
 /// 台帳内でworkspaceを突き合わせる鍵。Windowsのパスは大文字小文字を区別しないので小文字化し、
 /// 区切りを`\`へ揃え、`\\?\`（verbatim）前置を落とす。
 ///
-/// 綴りの揺れで別エントリを作ると、**同じツリーへ2つの主体のACEを撒く**ことになる。
+/// 綴りの揺れで別エントリを作ると、**同じツリーへ2つの宛先SIDのACEを撒く**ことになる。
 /// `std::fs::canonicalize`はWindowsで`\\?\`付きを返す一方、設定やCLI引数から来るパスには
 /// 付いていないので、前置の有無はごく普通に混在する。
 ///
@@ -219,7 +219,7 @@ pub fn capability_name_from_secret(secret: &[u8]) -> String {
 }
 
 /// 宣言（`--fs-allow`）のcapability名の接頭辞。workspace本体（[`CAPABILITY_NAME_PREFIX`]）と
-/// **綴りを分ける**——台帳やACLを人が読んだとき、どちらの軸の主体かが名前だけで分かるようにする。
+/// **綴りを分ける**——台帳やACLを人が読んだとき、どちらの軸の宛先SIDかが名前だけで分かるようにする。
 pub const DECLARATION_NAME_PREFIX: &str = "harnessDecl";
 
 /// §22.2.0の導出鍵`(秘密, 畳み込み済みパス, access級)`を1つの名前へ畳む純粋関数。
@@ -230,9 +230,9 @@ pub const DECLARATION_NAME_PREFIX: &str = "harnessDecl";
 /// 畳む必要がある**——そしてそれは見た目の都合ではなく、**信頼境界の要求**である。
 ///
 /// 昇格側（`privhelper`）は非特権の親から秘密を受け取り、`(その秘密, 自分で畳み込んだ
-/// 書込先のパス, access級)`から主体を導出する（§22.3.1）。パスが導出入力に入っているから、
-/// **宣言Aの秘密を使って別のパスBへAの主体を付けさせることができない**。名前が秘密だけから
-/// 決まる形だと、この束縛は成立せず「秘密を1つ持てば任意のパスへその主体を書かせられる」
+/// 書込先のパス, access級)`から宛先SIDを導出する（§22.3.1）。パスが導出入力に入っているから、
+/// **宣言Aの秘密を使って別のパスBへAのSIDを付けさせることができない**。名前が秘密だけから
+/// 決まる形だと、この束縛は成立せず「秘密を1つ持てば任意のパスへそのSIDを書かせられる」
 /// ——現行のpackage SID方式が持っていない束縛を新たに得る、という§22.3.1の表の3行目が
 /// 成り立たなくなる。
 ///
@@ -241,7 +241,7 @@ pub const DECLARATION_NAME_PREFIX: &str = "harnessDecl";
 ///
 /// 秘密は**16進表現のまま**受け取る。台帳にもワイヤにもこの形で載っているので、
 /// 両側で`hex→bytes`の変換を挟まない——変換が2箇所にあると、片方だけが失敗したときに
-/// 「同じ秘密なのに別の主体」という最も気付きにくい形でずれる。
+/// 「同じ秘密なのに別の宛先SID」という最も気付きにくい形でずれる。
 ///
 /// 出力はSHA-256の**先頭128bit**。D-54が秘密に要求したのと同じ強度で、名前も短く保てる。
 pub fn declaration_capability_name(
@@ -323,7 +323,7 @@ fn generate_secret() -> Result<[u8; SECRET_LEN], String> {
 ///
 /// 1回の`update`（＝1回のロック区間）で読み取りと追記を済ませる——複数の`harness.exe`が同時に
 /// 同じworkspaceを開いたとき、両方が「エントリが無い」と判定して別々の秘密を書くと、片方の
-/// 付与したACEがもう片方から見えない主体宛になる。
+/// 付与したACEがもう片方から見えないSID宛になる。
 fn ensure_capability_name_in(
     ledger: &Ledger<WorkspaceCapabilityLedger>,
     workspace: &Path,
@@ -386,7 +386,7 @@ fn ensure_name_in(
     })
 }
 
-/// 宣言1件の主体と、その**導出の前像**。
+/// 宣言1件の宛先SIDと、その**導出の前像**。
 ///
 /// `secret_hex`が要るのは昇格側へ渡す経路だけである（§22.3.1: SIDではなく秘密を渡し、
 /// 受信側が書込先のパスを自分で畳み込んで導出する）。**それ以外の場所へ持ち出さないこと**
@@ -397,7 +397,7 @@ pub struct DeclarationCapability {
     pub capability_name: String,
 }
 
-/// `workspace`が宣言した`declared_path`（`--fs-allow`の1件）＋`access_class`の主体の名前。
+/// `workspace`が宣言した`declared_path`（`--fs-allow`の1件）＋`access_class`の宛先SIDの名前。
 /// 初回は秘密を生成して台帳へ記録し、2回目以降は同じ名前を返す（冪等）。
 ///
 /// **これが§22.2.0の導出鍵`(秘密, 畳み込み済みパス, access級)`の実体である。** 秘密は
@@ -429,9 +429,9 @@ pub fn ensure_declaration_capability(
 /// [`lookup_capability_name`]と同じ関係）。まだ発行されていなければ`None`。
 ///
 /// **3つの軸（workspace・宣言パス・access級）で絞る。** パスだけで引く
-/// [`declaration_capability_names`]と使い分けること——あちらは「このパスへ発行した主体を
-/// **全部**」剥がす撤収の索引で、こちらは「**この級の**主体1つ」を名指しする用である。
-/// 級を落として引くと、子のトークンへ**宣言より広い主体**を積む形になる。
+/// [`declaration_capability_names`]と使い分けること——あちらは「このパスへ発行したcapability SIDを
+/// **全部**」剥がす撤収の索引で、こちらは「**この級の**capability SID 1つ」を名指しする用である。
+/// 級を落として引くと、子のトークンへ**宣言より広いcapability SID**を積む形になる。
 pub fn lookup_declaration_capability_name(
     workspace: &Path,
     declared_path: &Path,
@@ -466,12 +466,12 @@ pub fn ensure_declaration_capability_name(
         .map(|c| c.capability_name)
 }
 
-/// [BUG-142] そのworkspaceが**宣言主体を発行済みのパス**（畳み込み済みの綴り、重複なし）。
+/// [BUG-142] そのworkspaceが**宣言の宛先SIDを発行済みのパス**（畳み込み済みの綴り、重複なし）。
 ///
 /// # これは「撤収の索引」である
 ///
 /// 「もう宣言されていない穴」を求めるには、**いま宣言されているもの**と
-/// **かつて宣言して主体を発行したもの**の差分が要る。前者はポリシー側が持っているが、
+/// **かつて宣言して宛先SIDを発行したもの**の差分が要る。前者はポリシー側が持っているが、
 /// 後者を**プロセス内の変数で覚えていた**のが[BUG-142](../../../../docs/bugs/BUG-142.md)である
 /// ——付与した実行が終われば消えるので、別プロセスから見ると常に空集合になり、
 /// 撤収が無言で0件になっていた。
@@ -482,7 +482,7 @@ pub fn ensure_declaration_capability_name(
 /// （Windowsのパスは大文字小文字を区別しない）。
 ///
 /// **access級ごとの重複は畳む。** 同じパスへ`read`と`read_exec`を発行していれば台帳には
-/// 2行あるが、ここで数えたいのは**パス**である（主体の列挙は
+/// 2行あるが、ここで数えたいのは**パス**である（宛先SIDの列挙は
 /// [`declaration_capability_names`]が別に行う）。
 pub fn declared_paths_for_workspace(workspace: &Path) -> Vec<String> {
     declared_paths_for_workspace_in(&ledger(), workspace)
@@ -498,7 +498,7 @@ fn declared_paths_for_workspace_in(
         if workspace_key(Path::new(&entry.workspace)) != key {
             continue;
         }
-        // workspace本体の主体（`declaration == None`）はここでは扱わない
+        // workspace本体の宛先SID（`declaration == None`）はここでは扱わない
         // ——撤収の扉が別である（`fs revoke-workspace`）。
         if let Some(declared) = entry.declaration {
             if !seen.contains(&declared) {
@@ -544,12 +544,12 @@ fn declaration_capability_names_in(
 /// `declared_path`宛に発行済みの宣言capability名を引く（**生成はしない**）。
 ///
 /// **これが§22.2.1の「分類器を使わず、宣言から導出したSIDを名指しで剥がす」の索引である。**
-/// ACLを列挙して「この主体は何者か」を推定する必要がそもそも無い——撤収すべき主体は
+/// ACLを列挙して「このSIDは何者か」を推定する必要がそもそも無い——撤収すべき宛先SIDは
 /// 宣言から一意に決まるので、台帳はその対応表を持つだけでよい。
 ///
 /// `workspace`が`Some`ならそのworkspaceが発行したものだけに絞る。**絞らない側
 /// （`None`）を使ってよいのは、そのパスを名指しした明示操作（`harness fs revoke <path>`）
-/// だけである**——他のworkspaceの主体まで剥がすので、暗黙の経路から呼ぶと
+/// だけである**——他のworkspaceの宛先SIDまで剥がすので、暗黙の経路から呼ぶと
 /// [BUG-046](../../../docs/bugs/BUG-046.md)（他人の使っているACEを純減させる）と同じ形になる。
 pub fn declaration_capability_names(
     declared_path: &Path,
@@ -562,7 +562,7 @@ pub fn declaration_capability_names(
 /// （`(workspaceのパス, capability名)`）。
 ///
 /// [`declaration_capability_names`]との違いは発行元が付くことだけである。撤収側が
-/// 「この主体を**まだ使っているharnessが走っていないか**」を問うのに要る——主体は
+/// 「この宛先SIDを**まだ使っているharnessが走っていないか**」を問うのに要る——宛先SIDは
 /// workspace単位で共有されるので、判定の単位もworkspaceになる
 /// （生存判定そのものは[`crate::tier2a::workspace_ledger::live_modes`]が持つ既存のゲートで、
 /// ここでは持たない）。
@@ -699,7 +699,7 @@ fn mark_tree_verified_in(ledger: &Ledger<WorkspaceCapabilityLedger>, workspace: 
 /// 背景ジョブの完走を記録する。**ジョブが`Ok`で終わったときだけ**呼ぶこと——途中で失敗した
 /// のに記録すると、以後どの起動もやり直さなくなる。
 ///
-/// 該当エントリが無ければ何もしない。実運用ではあり得ない（付与の主体を得る
+/// 該当エントリが無ければ何もしない。実運用ではあり得ない（付与の宛先SIDを得る
 /// [`ensure_capability_name`]が必ず先に走ってエントリを作る）が、順序を逆にした呼び出しは
 /// **黙って記録されない**——つまり次回もジョブを回す側（安全側）へ倒れる。
 pub fn mark_tree_verified(workspace: &Path, mode: &str) {
@@ -827,7 +827,7 @@ fn forget_capability_in(
     ledger.update(|l| {
         let mut removed = Vec::new();
         l.entries.retain(|e| {
-            // `mode`が空＝「このworkspaceの主体を全部」。**宣言エントリもここに入る**
+            // `mode`が空＝「このworkspaceの宛先SIDを全部」。**宣言エントリもここに入る**
             // ——§22.2.1が「秘密の台帳を失った場合の保険」として`fs revoke-workspace`に
             // 群SIDまで剥がさせると決めており、扉を増やさないためにこの1本が担う。
             // `mode`を指定した場合はworkspace本体だけ（宣言の`mode`はaccess級という
@@ -849,7 +849,7 @@ fn forget_capability_in(
 
 /// 台帳からこのworkspaceのエントリを落とし、落とした名前を返す（`mode`が空なら全モード）。
 ///
-/// **ACEを剥がし終えてから呼ぶこと。** 先に台帳から消すと主体を引けなくなり、ツリーに
+/// **ACEを剥がし終えてから呼ぶこと。** 先に台帳から消すと宛先SIDを引けなくなり、ツリーに
 /// 撤収経路の無いACEが残る（`session_profile`のモジュールdocと同じ順序の不変条件。
 /// BUG-017/BUG-059が繰り返し踏んだ「孤立ACE」の形）。
 pub fn forget_capability(workspace: &Path, mode: &str) -> Vec<String> {
@@ -872,8 +872,8 @@ impl WorkspaceCapabilityEntry {
 
     /// **このエントリの記録を捨ててよいかを判定するとき、実在を測るべきパス。**
     ///
-    /// workspace本体の主体のACEはworkspaceツリーそのものに載るが、宣言（`--fs-allow`）の
-    /// 主体のACEは**workspaceの外の宣言パス**に載る。したがって「もう撤収すべきものが無い」と
+    /// workspace本体の宛先SIDのACEはworkspaceツリーそのものに載るが、宣言（`--fs-allow`）の
+    /// 宛先SIDのACEは**workspaceの外の宣言パス**に載る。したがって「もう撤収すべきものが無い」と
     /// 言える条件はエントリの種類で違い、**workspaceの実在で一律に判定すると、
     /// 宣言先が生きているのに剥がすための名前だけを捨てることになる**（`B-01`）。
     ///
@@ -992,7 +992,7 @@ mod tests {
     }
 
     /// 綴りの揺れ（大文字小文字・区切り）で別エントリを作らない。作ってしまうと、同じ
-    /// ツリーへ2つの主体のACEを撒くことになる。
+    /// ツリーへ2つの宛先SIDのACEを撒くことになる。
     #[test]
     fn spelling_differences_do_not_create_a_second_entry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1004,7 +1004,7 @@ mod tests {
     }
 
     /// `std::fs::canonicalize`が返す`\\?\`付きのパスと、CLI引数から来る素のパスが
-    /// 同じエントリを指すこと。ここがずれると同じツリーへ2つの主体のACEを撒く。
+    /// 同じエントリを指すこと。ここがずれると同じツリーへ2つの宛先SIDのACEを撒く。
     #[test]
     fn a_verbatim_prefixed_path_matches_the_plain_one() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1019,7 +1019,7 @@ mod tests {
         );
     }
 
-    /// モードが違えば別の主体になる（`--sandbox tier2a-cow`のROセッションが、過去のRWX用ACEを使えない）。
+    /// モードが違えば別の宛先SIDになる（`--sandbox tier2a-cow`のROセッションが、過去のRWX用ACEを使えない）。
     #[test]
     fn different_modes_get_different_capabilities() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1031,7 +1031,7 @@ mod tests {
         assert_eq!(l.load().entries.len(), 2);
     }
 
-    /// 別workspaceは別の秘密（＝到達できない別主体）。
+    /// 別workspaceは別の秘密（＝到達できない別の宛先SID）。
     #[test]
     fn different_workspaces_get_different_capabilities() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1077,7 +1077,7 @@ mod tests {
     }
 
     /// モードを空にすると全モードを落とす（`harness fs revoke-workspace`が
-    /// 「このworkspaceの主体を全部消す」ために使う）。
+    /// 「このworkspaceの宛先SIDを全部消す」ために使う）。
     #[test]
     fn forgetting_with_an_empty_mode_removes_every_mode() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1089,10 +1089,10 @@ mod tests {
         assert!(l.load().entries.is_empty());
     }
 
-    // --- 宣言（`--fs-allow`）の主体、§22.2.0「群 = 宣言1件」 ---
+    // --- 宣言（`--fs-allow`）の宛先SID、§22.2.0「群 = 宣言1件」 ---
 
     /// **§22.3.1が昇格側に要求する束縛そのもの。** 同じ秘密でも、書込先のパスや access級が
-    /// 違えば別の名前になる——だから昇格側は「宣言Aの秘密を使って別のパスBへAの主体を
+    /// 違えば別の名前になる——だから昇格側は「宣言Aの秘密を使って別のパスBへAのSIDを
     /// 付ける」ことができない。ここが秘密だけの関数に戻ると、その束縛は無言で消える。
     #[test]
     fn the_declaration_name_is_bound_to_the_path_and_the_access_class() {
@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     /// 長さ前置が効いていること。区切りだけで繋ぐと、境界をずらした別の組が同じ
-    /// バイト列になり**別の宣言が同じ主体を共有する**。
+    /// バイト列になり**別の宣言が同じ宛先SIDを共有する**。
     #[test]
     fn shifting_the_boundary_between_inputs_does_not_collide() {
         let secret = "00112233445566778899aabbccddeeff";
@@ -1146,7 +1146,7 @@ mod tests {
         assert_eq!(l.load().entries.len(), 1);
     }
 
-    /// access級が違えば別の主体（`read`で開けた穴が`read_write`のドメインへ渡らない）。
+    /// access級が違えば別の宛先SID（`read`で開けた穴が`read_write`のドメインへ渡らない）。
     #[test]
     fn a_different_access_class_gets_a_different_declaration_capability() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1159,7 +1159,7 @@ mod tests {
         assert_eq!(l.load().entries.len(), 2);
     }
 
-    /// 宣言パスが違えば別の主体（宣言していないパスへ、別の宣言の主体で届かない）。
+    /// 宣言パスが違えば別の宛先SID（宣言していないパスへ、別の宣言の宛先SIDで届かない）。
     /// §22.3.0.2の受け入れ条件2「宣言したドメインだけがパスを見る」の土台。
     #[test]
     fn a_different_declared_path_gets_a_different_capability() {
@@ -1173,7 +1173,7 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// 宣言パスの綴り揺れで別エントリを作らない。作ると**同じノードへ2つの主体のACEを撒く**
+    /// 宣言パスの綴り揺れで別エントリを作らない。作ると**同じノードへ2つの宛先SIDのACEを撒く**
     /// （§22.2.0が畳み込み関数を必ず通せと書いている理由そのもの）。
     #[test]
     fn declaration_spelling_differences_do_not_create_a_second_entry() {
@@ -1192,8 +1192,8 @@ mod tests {
         assert_eq!(l.load().entries.len(), 1);
     }
 
-    /// **workspace本体の主体と宣言の主体が互いを潰さない。** `declaration`を突合から
-    /// 落とすと、`workspace_capability_sid`が宣言用の主体を返し、26万ノードのツリー全体へ
+    /// **workspace本体の宛先SIDと宣言の宛先SIDが互いを潰さない。** `declaration`を突合から
+    /// 落とすと、`workspace_capability_sid`が宣言用の宛先SIDを返し、26万ノードのツリー全体へ
     /// 宣言用のACEを撒くことになる。
     #[test]
     fn a_declaration_entry_is_never_returned_as_the_workspace_subject() {
@@ -1224,7 +1224,7 @@ mod tests {
         let decl = Path::new("C:\\tools\\node");
         let from_a = ensure_declaration_capability_name_in(&l, a, decl, "read").unwrap();
         let from_b = ensure_declaration_capability_name_in(&l, b, decl, "read").unwrap();
-        assert_ne!(from_a, from_b, "workspaceが違えば別の秘密＝別の主体");
+        assert_ne!(from_a, from_b, "workspaceが違えば別の秘密＝別の宛先SID");
 
         assert_eq!(declaration_capability_names_in(&l, decl, Some(a)), vec![from_a.clone()]);
         let all = declaration_capability_names_in(&l, decl, None);
@@ -1234,7 +1234,7 @@ mod tests {
         assert!(declaration_capability_names_in(&l, Path::new("C:\\tools\\other"), None).is_empty());
     }
 
-    /// §22.2.1の保険: `fs revoke-workspace`（＝`mode`が空）は**宣言の主体まで**落とす。
+    /// §22.2.1の保険: `fs revoke-workspace`（＝`mode`が空）は**宣言の宛先SIDまで**落とす。
     /// 扉を増やさずに「秘密の台帳を失う前に全部剥がせる」を成立させているのがここ。
     #[test]
     fn forgetting_a_whole_workspace_also_drops_its_declaration_capabilities() {
@@ -1257,9 +1257,9 @@ mod tests {
 
     /// **記録を捨ててよいかを測る対象は、エントリの種類で違う**（`B-01`/`B-14`）。
     ///
-    /// 宣言（`--fs-allow`）の主体のACEは**workspaceの外の宣言パス**に載る。使い捨ての
+    /// 宣言（`--fs-allow`）の宛先SIDのACEは**workspaceの外の宣言パス**に載る。使い捨ての
     /// workspaceが消えても、宣言先（`C:\tools\node`のような常設のパス）にはACEが残るので、
-    /// workspaceの実在だけで判定すると**剥がすための名前だけが先に消える**——その主体は
+    /// workspaceの実在だけで判定すると**剥がすための名前だけが先に消える**——その宛先SIDは
     /// どのコマンドでも剥がせない孤児になる。
     ///
     /// 許可側と禁止側を対で置く（`B-35`）: 宣言先が生きていれば残す／両方消えていれば落とす。

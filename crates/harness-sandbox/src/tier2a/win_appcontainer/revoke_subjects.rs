@@ -1,4 +1,4 @@
-//! 撤収の**主体**を決める層——「どのSIDのACEを剥がすか」。剥がし方（`revoke`）とは責務が別。
+//! 撤収の**宛先SID**を決める層——「どのSIDのACEを剥がすか」。剥がし方（`revoke`）とは責務が別。
 //!
 //! # なぜこの層が要るのか（[BUG-101](../../../../docs/bugs/BUG-101.md)欠陥②）
 //!
@@ -54,20 +54,20 @@ use windows::Win32::System::Registry::{
 /// AppContainer SIDの文字列接頭辞（`S-1-15-2-<hash…>`）。`SECURITY_APP_PACKAGE_BASE_RID`(2)で
 /// 始まるものがAppContainerの**パッケージ**SIDで、capability SID（`S-1-15-3-`）は含まない。
 ///
-/// capability SIDを混ぜないのは意図である——祖先traverse（D-37）とworkspace（D-54）の主体は
+/// capability SIDを混ぜないのは意図である——祖先traverse（D-37）とworkspace（D-54）の宛先SIDは
 /// capability SIDで、それぞれ`fs revoke-traverse`・`fs revoke-workspace`という名前の付いた
 /// 扉が担当する。ここで巻き込むと[BUG-046](../../../../docs/bugs/BUG-046.md)（`C:\`のtraverse ACEを
 /// 純減させてマシン全体のFS I/Oを壊した）を再現する。
 const APPCONTAINER_SID_PREFIX: &str = "S-1-15-2-";
 
-/// **harnessが主体にすることが決して無い、well-knownのパッケージSID。**
+/// **harnessが宛先にすることが決して無い、well-knownのパッケージSID。**
 ///
 /// [`APPCONTAINER_SID_PREFIX`]は`S-1-15-2-<ハッシュ>`という形のプロファイル固有SIDを拾う
 /// つもりの接頭辞だが、well-knownのグループSIDもこの下にいる（RIDが1つだけの短い形）。
 /// harnessのプロファイルSIDは`DeriveAppContainerSidFromAppContainerName`のハッシュなので
 /// **これらと一致することはない**。
 ///
-/// 剥がしてはいけない理由は、これがマシン共有の主体だからである。`ALL APPLICATION PACKAGES`は
+/// 剥がしてはいけない理由は、これがマシン共有のSIDだからである。`ALL APPLICATION PACKAGES`は
 /// 「AppContainerで動く全アプリ」を指し、Edge/Chrome/VS Codeのインストールツリーは自分の
 /// GPU・レンダラサンドボックスを動かすためにこのSID宛のACEを持つ。純減させると、harnessと
 /// 無関係なアプリが起動できなくなる（[BUG-046](../../../../docs/bugs/BUG-046.md)で`C:\`の
@@ -111,11 +111,11 @@ impl PathAceSubject {
     }
 }
 
-/// 1つの主体をどう扱うか。**「撤収する」と「触らない」を1つの値で表し、理由を必ず持たせる**
+/// 1つの宛先SIDをどう扱うか。**「撤収する」と「触らない」を1つの値で表し、理由を必ず持たせる**
 /// ——理由を落とすと「0件だったのか、触らなかったのか」が呼び出し側から見えない（B-09/B-10）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubjectKind {
-    /// 規則-1: well-knownのパッケージSID（[`WELL_KNOWN_PACKAGE_SIDS`]）。マシン共有の主体で、
+    /// 規則-1: well-knownのパッケージSID（[`WELL_KNOWN_PACKAGE_SIDS`]）。マシン共有のSIDで、
     /// harnessが付与先にすることは無い。**登録簿と台帳のどちらが何と言おうと触らない。**
     WellKnownPackage { name: &'static str },
     /// 規則0: 登録済みで、harnessのものではない。
@@ -339,7 +339,7 @@ pub fn revoke_stale_appcontainer_aces(
     Ok(removed)
 }
 
-/// 1主体の結末。
+/// 宛先SID 1本の結末。
 #[derive(Debug)]
 pub struct SubjectOutcome {
     pub sid: String,
@@ -364,7 +364,7 @@ pub struct HarnessRevokeReport {
     pub root_missing: bool,
     /// 登録簿を読めなかった理由（読めた場合は`None`）。
     pub classification_error: Option<String>,
-    /// **この報告を作るより前に、別の経路（昇格ヘルパー）が剥がした主体の数。**
+    /// **この報告を作るより前に、別の経路（昇格ヘルパー）が剥がした宛先SIDの数。**
     ///
     /// 昇格へエスカレーションした後の検算（[`classify_subjects_on_root`]）は、剥がし終えた
     /// 後のDACLを見るので`subjects`が空になる。そこだけを見ると「対象が0件だった」と
@@ -375,7 +375,7 @@ pub struct HarnessRevokeReport {
 }
 
 impl HarnessRevokeReport {
-    /// 撤収対象と判定した主体の数。**0は「対象が無かった」であって「成功」ではない。**
+    /// 撤収対象と判定した宛先SIDの数。**0は「対象が無かった」であって「成功」ではない。**
     pub fn targeted(&self) -> usize {
         self.subjects
             .iter()
@@ -411,7 +411,7 @@ impl HarnessRevokeReport {
                 .any(|s| matches!(s.kind, SubjectKind::LiveHarness { .. }))
     }
 
-    /// 触らなかった主体を`(SID, 理由)`で返す（**名前を出さないと`icacls`で追えない**、B-09）。
+    /// 触らなかった宛先SIDを`(SID, 理由)`で返す（**名前を出さないと`icacls`で追えない**、B-09）。
     pub fn left_alone(&self) -> Vec<(&str, String)> {
         self.subjects
             .iter()
@@ -483,7 +483,7 @@ pub fn revoke_harness_subjects(
     Ok(report)
 }
 
-/// `root`のDACLに載っている主体を列挙して分類する（**walkはしない**）。
+/// `root`のDACLに載っている宛先SIDを列挙して分類する（**walkはしない**）。
 ///
 /// 戻り値の3つ目は登録簿を読めなかった理由。`None`なら分類は材料が揃っている。
 type ClassifiedRoot = (Vec<PathAceSubject>, Vec<SubjectKind>, Option<String>);
@@ -509,7 +509,7 @@ fn classify_root(root: &Path, ledger_sids: &[String]) -> Result<ClassifiedRoot, 
     Ok((subjects, kinds, error))
 }
 
-/// `root`に**いま載っている**harness由来の主体を報告する（撤収はしない）。
+/// `root`に**いま載っている**harness由来の宛先SIDを報告する（撤収はしない）。
 ///
 /// 撤収を昇格ヘルパーへ委譲したあとの検算に使う——ヘルパーの応答だけを根拠に「剥がせた」と
 /// 名乗ると、[BUG-101]と同じ「他人の成功報告を自分の結論にする」形になる。ここは単一ノードの
@@ -531,7 +531,7 @@ pub fn classify_subjects_on_root(
     let (subjects, kinds, error) = classify_root(root, ledger_sids)?;
     report.classification_error = error;
     for (subject, kind) in subjects.into_iter().zip(kinds) {
-        // rootのDACLから読んだ主体なので、撤収対象と判定されたものは**定義上まだ載っている**。
+        // rootのDACLから読んだ宛先SIDなので、撤収対象と判定されたものは**定義上まだ載っている**。
         let still_on_root = kind.is_revocable();
         report.subjects.push(SubjectOutcome {
             sid: subject.sid,
@@ -546,7 +546,7 @@ pub fn classify_subjects_on_root(
 ///
 /// **`Err`を空のマップへ潰さないこと。** 「登録が無い」と「読めなかった」を同一視すると、
 /// 読めなかっただけのSIDが孤児と判定されて破壊側へ倒れる（B-10）。呼び出し側は`Err`を
-/// 受けたら全主体を「判別不能」として扱う。
+/// 受けたら全部のSIDを「判別不能」として扱う。
 pub fn registered_appcontainer_monikers() -> Result<BTreeMap<String, String>, String> {
     unsafe {
         let key_w = crate::win_common::wide(APPCONTAINER_MAPPINGS_KEY);

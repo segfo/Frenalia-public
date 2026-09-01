@@ -1,6 +1,6 @@
 //! **§22.3.0.2（残課題#20の受け入れ条件）の実機測定**。
 //!
-//! `--fs-allow`で開けた穴の主体は、セッションのpackage SIDから**宣言ごとのcapability SID**へ
+//! `--fs-allow`で開けた穴の宛先SIDは、セッションのpackage SIDから**宣言ごとのcapability SID**へ
 //! 移った。移行が成立したと言える条件は「拒否ACEを書いたか」ではなく
 //! **許可を持たないドメインが存在するか**である（capability SID宛に`FILE_EXECUTE`のDENYを
 //! 置いても素通りすることが実測されている。`plans/mac-spike/RESULTS.md` §S8）。
@@ -109,7 +109,7 @@ fn grant_and_collect_subjects(
     let ws_cap = workspace_capability_sid(&canonical_ws, "rwx")
         .expect("the workspace capability must exist after preflight (D-54)");
 
-    // 宣言の主体は**台帳の索引から引く**（本番の`launch.rs`と同じ引き方。ここで
+    // 宣言の宛先SIDは**台帳の索引から引く**（本番の`launch.rs`と同じ引き方。ここで
     // `fs_allow_capability_sid`を呼ぶと発行側の口を通ってしまい、「preflightが実際に
     // 発行したもの」ではなく「このテストが今作ったもの」を測ることになる）。
     let mut decl_caps = fs_allow_capability_sids(declared, Some(&canonical_ws));
@@ -128,7 +128,7 @@ fn grant_and_collect_subjects(
 /// 実マシンに残るもの（宣言capability宛のACEと台帳エントリ）を、**assertが落ちても**戻す
 /// （`型F`。`TestDirGuard`はディレクトリしか戻さない）。
 ///
-/// 順序は**ACEを剥がしてから台帳を落とす**。逆にすると主体を引けなくなり、撤収経路の無い
+/// 順序は**ACEを剥がしてから台帳を落とす**。逆にすると宛先SIDを引けなくなり、撤収経路の無い
 /// ACEが残る（`workspace_capability::forget_capability`のdocが定める不変条件）。
 fn cleanup_declaration(workspace: std::path::PathBuf, declared: std::path::PathBuf) -> impl Drop {
     scopeguard(move || {
@@ -189,8 +189,8 @@ fn run_in_domain(
 
 /// **受け入れ条件2**: 宣言したドメインだけがパスを見る。
 ///
-/// 到達性は本番のプローブ（`probe_passthrough`）で測る。主体を明示的に渡せるので、
-/// 「この主体では届く／この主体では届かない」を**同じ器で**1件ずつ測れる
+/// 到達性は本番のプローブ（`probe_passthrough`）で測る。宛先SIDを明示的に渡せるので、
+/// 「この宛先SIDでは届く／この宛先SIDでは届かない」を**同じ器で**1件ずつ測れる
 /// （`test_support::spawn_in_workspace`は宣言capabilityを積まないので、この測定には使えない
 /// ——同ヘルパーのdocがそう名指ししている）。
 #[test]
@@ -254,7 +254,7 @@ fn only_the_declaring_domain_reaches_the_declared_path() {
 ///
 /// これが閉じるのは、`D-79`（パスベースの実行制御）が**不採用で決着した後に残っていた
 /// 唯一の道**である——`--sandbox tier2a`はワークスペース内の実行を止めないが、
-/// 主体を宣言ごとに割れば「読めないから走らせられない」が成立する。
+/// 宛先SIDを宣言ごとに割れば「読めないから走らせられない」が成立する。
 ///
 /// **実行ポリシーは測定から外す。** 子の中で`Set-ExecutionPolicy -Scope Process Bypass`を
 /// 先に撃つのは、測りたいのがACLであってPowerShellの署名ポリシーではないためである

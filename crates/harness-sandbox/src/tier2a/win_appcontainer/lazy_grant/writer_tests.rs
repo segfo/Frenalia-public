@@ -1,5 +1,5 @@
 //! 単一ACL writerの回帰。**昇格しない**——ACEを書くのはテスト自身が作ったツリーだけで、
-//! 主体は[`capability_sid_from_name`]（純粋導出）＝台帳にもプロファイルにも何も残さない
+//! 宛先SIDは[`capability_sid_from_name`]（純粋導出）＝台帳にもプロファイルにも何も残さない
 //! （`jit_grant_cost_tests`と同じ方針）。
 
 use windows::Win32::Security::{CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE};
@@ -8,7 +8,7 @@ use super::*;
 use crate::tier2a::win_appcontainer::test_support::{describe_dacl_aces, TestDirGuard};
 use crate::tier2a::win_appcontainer::{capability_sid_from_name, workspace_rwx_mask};
 
-/// テスト専用の主体。**プロセスIDとラベルで分ける**——同じ名前を使い回すと、並行して走る
+/// テスト専用の宛先SID。**プロセスIDとラベルで分ける**——同じ名前を使い回すと、並行して走る
 /// 別テストのツリーに載ったACEを自分のものと読み違える。
 fn test_grants(label: &str) -> Vec<OwnedAceGrant> {
     let sid = capability_sid_from_name(&format!(

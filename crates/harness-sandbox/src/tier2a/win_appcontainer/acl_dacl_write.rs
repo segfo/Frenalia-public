@@ -13,7 +13,7 @@
 //! # 実測で分かったこと（2026-08-25、`acl_propagation_probe_tests`）
 //!
 //! **rootのDACLを`SetKernelObjectSecurity`（伝播しない口）で書いたあとに
-//! `SetNamedSecurityInfoW`（伝播する口）で同じ主体・同じ継承フラグのACEを書くと、
+//! `SetNamedSecurityInfoW`（伝播する口）で同じ宛先SID・同じ継承フラグのACEを書くと、
 //! 既存の子孫へ1件も届かないことがある。** 209ノードの対で 0/209 対 208/209。
 //!
 //! 1差分ずつ並べて切り分けた（`granted`=救済walkが明示ACEを書いた数。`C:\`直下のツリー）。
@@ -70,11 +70,11 @@
 //!
 //! # だからこの部品は何をするか
 //!
-//! 伝播する書込の**直前に、これから書く主体のACEをそのノードから外す**。外したうえで
+//! 伝播する書込の**直前に、これから書く宛先SIDのACEをそのノードから外す**。外したうえで
 //! M本まとめたDACLを1回書く。1つ目の表の5行目（剥がしてから伝播＝届く）そのものである。
 //!
 //! **機序が未確定でも、この形を選べる理由**: 8通り×2箇所の実測で「届く」側にいるのは
-//! 「伝播書込の時点でその主体のACEがrootに無い」形だけで、**それは剥がせば必ず作れる**。
+//! 「伝播書込の時点でその宛先SIDのACEがrootに無い」形だけで、**それは剥がせば必ず作れる**。
 //! 未確定なのは「なぜ在ると届かないのか」であって、「無ければ届く」ではない。
 //!
 //! **外す前にDACLを組み終えておく**のが要点で、こうすると「元々そこに在った別の形のACE
@@ -89,7 +89,7 @@
 //! - **届いたことをこの部品は確かめない。** 確かめているのは呼び出し側の救済walkで、
 //!   その`granted`が0でなければ伝播が効いていない（`grant_job`が値を出す）。
 //!   ここで別の検算を足すと、同じ事実を2箇所で判定することになる（`B-05`）。
-//! - **一瞬だけ、rootにその主体のACEが無い状態が生まれる。** 子プロセスはこのジョブの完了を
+//! - **一瞬だけ、rootにその宛先SIDのACEが無い状態が生まれる。** 子プロセスはこのジョブの完了を
 //!   `grant_job::wait_until_done`で待つ（fail-closed）ので、その窓を踏まない。
 //!   窓の途中でプロセスが死んだ場合は、次回起動の`top_level_child_missing_ace`が拾って
 //!   ジョブが回り直す。
@@ -99,7 +99,7 @@ use super::*;
 /// 1回の伝播書込に載せる1本ぶんの許可。
 ///
 /// **M本を1つのDACLへ畳んで1回で書く**ためにある（残課題#20の費用測定M3が要求している形。
-/// `plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`——素直に「主体ごとに1回ずつ伝播」と書くと
+/// `plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`——素直に「宛先SIDごとに1回ずつ伝播」と書くと
 /// ノードあたりM回の書込になり、実測で約2倍になる）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InheritableGrant {
@@ -133,7 +133,7 @@ pub(crate) fn grant_aces_propagating(
 /// [D-84]で「両モードのcapability SID宛ACEを同時に置く」ようになったあと、これが要る場所は2つある——
 /// `preflight`の同期区間（rootへの高速付与）と、救済walk（継承が届かなかったノードへの
 /// 個別付与）。**どちらもノードあたりの書込を1回に保つためにここを通る**
-/// （主体ごとに`grant_ace_mask`を呼び直すと、`plans/mac-spike/RESULTS.md` §S15-1が測った
+/// （宛先SIDごとに`grant_ace_mask`を呼び直すと、`plans/mac-spike/RESULTS.md` §S15-1が測った
 /// 「素朴な実装は約2.9倍」をそのまま払う）。
 pub(crate) fn grant_aces_single_object(
     path: &Path,
@@ -240,7 +240,7 @@ fn grant_aces(
 
 /// **組み上がったDACLを、伝播が実際に効く形で1回書く**（モジュールdocの表の5行目）。
 ///
-/// `trustees`は「これから書くDACLに載っている主体」で、書込の**直前にそのノードから外す**。
+/// `trustees`は「これから書くDACLに載っている宛先SID」で、書込の**直前にそのノードから外す**。
 /// `new_dacl`は**外す前に組み終えていること**——外した後の状態から組むと、元々そこに在った
 /// 別の形のACEが消える。
 ///
@@ -252,7 +252,7 @@ pub(crate) unsafe fn propagate_merged_dacl(
     trustees: &[PSID],
     new_dacl: *mut ACL,
 ) -> Result<(), AppContainerError> {
-    // 伝播しない口（`SetKernelObjectSecurity`）で置かれた同一主体・同一継承フラグのACEが
+    // 伝播しない口（`SetKernelObjectSecurity`）で置かれた同一の宛先SID・同一継承フラグのACEが
     // 残っていると、この後の書込は既存の子孫へ1件も届かない（モジュールdocの実測表）。
     // **対象ACEが無ければ`revoke_sids_from_node`は書込ごと省く**ので、初回のような
     // 「元々無い」ケースで余計な書込は起きない。

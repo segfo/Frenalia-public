@@ -12,7 +12,7 @@
 //! | [`netfilterd`] | ネットワークポリシーを適用する常駐daemonとのIPC（WFPフィルタ投入を依頼する） |
 //! | [`traverse_ledger`] | 祖先ディレクトリへ付与したtraverse ACEの記録（D10の巻き戻し用） |
 //! | [`workspace_ledger`] | workspace/CoW diff_layer_dirの生存管理（名前付きmutex）と付与済みworkspaceの一覧 |
-//! | [`workspace_capability`] | workspace＋モード単位のFS付与の主体（capability名とその秘密、D-54） |
+//! | [`workspace_capability`] | workspace＋モード単位のFS付与の宛先SID（capability名とその秘密、D-54） |
 //! | `wfp` | Windows Filtering Platformの薄いラッパ。`netfilterd`（昇格側）からのみ使う |
 //! | `loopback_exemption` | AppContainer loopback exemption（マシン全体で1本）のプロセス跨ぎ所有権管理（D-36） |
 //! | [`session_profile`] | セッション単位のAppContainerプロファイル名・生存マーカー・台帳・孤児回収（D-37） |

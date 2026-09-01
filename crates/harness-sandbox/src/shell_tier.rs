@@ -179,7 +179,7 @@ impl FsAccess {
     /// `workspace-capability-ledger`が`mode`欄へ保存した級を読み戻すために要る
     /// （台帳は文字列で持つので、型へ戻す口がどこかに1つ要る）。
     ///
-    /// 知らない綴りは`None`。**既定値へ倒さない**——級が違えば主体そのものが別になるので、
+    /// 知らない綴りは`None`。**既定値へ倒さない**——級が違えば宛先SIDそのものが別になるので、
     /// 「たぶんこれだろう」で埋めると存在しないSIDを剥がしに行くことになる（`B-10`）。
     pub fn from_label(label: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|a| a.label() == label)

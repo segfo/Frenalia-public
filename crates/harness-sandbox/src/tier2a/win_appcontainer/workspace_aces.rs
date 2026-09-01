@@ -3,7 +3,7 @@
 //! # 何が困っていたのか
 //!
 //! Tier2aのファイルシステム境界は「許可したい各ノードのアクセス制御表（DACL）へ、
-//! サンドボックスの主体宛の1行（ACE）を事前に書く」方式で張られている。その主体である
+//! サンドボックスのSID宛の1行（ACE）を事前に書く」方式で張られている。その宛先SIDである
 //! **capability SID**は **(ワークスペースのパス, 書込モード)** から決まる（D-54）。
 //!
 //! **困りごとは費用そのものではなく、費用の取り消され方だった。** モードは2つあり
@@ -23,7 +23,7 @@
 //!   capability SIDしか持たない子は作成・追記・削除がすべて`ERROR_ACCESS_DENIED`になる
 //!   （陽性対照＝`rwx`の子は通る／陰性対照＝どちらのcapability SIDも持たない子は読めもしない、の
 //!   両方つきで実測。`plans/handoff/fs-boundary-cost/T-1.md`）。Windowsのアクセス判定は、
-//!   トークンに入っていない主体宛のACEを読み飛ばすためである。
+//!   トークンに入っていないSID宛のACEを読み飛ばすためである。
 //!
 //! # ここで守っていないもの（限界）
 //!
@@ -71,7 +71,7 @@ pub(crate) fn workspace_mode_mask(mode: WorkspaceMode) -> u32 {
     }
 }
 
-/// workspaceツリーへ配る**ACE1本ぶん**の許可（主体とマスクの対）。
+/// workspaceツリーへ配る**ACE1本ぶん**の許可（宛先SIDとマスクの対）。
 ///
 /// [D-84]で「両モードのcapability SID宛ACEを1回の書込で同時に置く」ことにしたため、付与側の関数は
 /// どれも「1本」ではなく「M本」を受ける形になった。**`PSID`は借用したポインタ**なので、
@@ -137,7 +137,7 @@ pub(crate) fn inheritable_grants(
 ///
 /// ACE1本ずつ書いてもrootは1ノードなので同期区間の費用は変わらないが、**同じ形を
 /// 伝播側（[`propagate_workspace_root_grants`]）と救済walk側でも使う**——そちらは26万ノードに
-/// 効き、主体ごとに書くと約2.9倍になる（`plans/mac-spike/RESULTS.md` §S15-1）。
+/// 効き、宛先SIDごとに書くと約2.9倍になる（`plans/mac-spike/RESULTS.md` §S15-1）。
 /// 3箇所で書き方が割れないよう、口をここへ揃えてある。
 #[track_caller]
 pub fn grant_workspace_root_aces_fast(
@@ -176,7 +176,7 @@ pub fn grant_workspace_root_aces_fast(
 /// 十分にする側は部品が持つ（同モジュールのdocに実測表がある）。**両方要るので、どちらも外さない。**
 ///
 /// ACEを1本増やしても費用は動かない（§S15-1で20,033／100,033ノードとも1.0倍±3%）。
-/// **ただしそれは「1回の書込にまとめれば」の話**で、主体ごとに呼び直すと約2.9倍になる。
+/// **ただしそれは「1回の書込にまとめれば」の話**で、宛先SIDごとに呼び直すと約2.9倍になる。
 /// **呼び出し側でループを回さないこと。**
 #[track_caller]
 pub(crate) fn propagate_workspace_root_grants(
@@ -201,7 +201,7 @@ pub(crate) fn propagate_workspace_root_grants(
 /// [`propagate_workspace_root_grants`]の単数版。
 ///
 /// **[D-84] 製品はもうここを通らない**（背景ジョブは全モードのcapability SID宛ACEを1回で配る）。
-/// 1主体で測る回帰テスト・コスト測定のために残してある薄い包みで、**判定も書込も多本版と
+/// 宛先SID 1本で測る回帰テスト・コスト測定のために残してある薄い包みで、**判定も書込も多本版と
 /// 同一**である（同じ関数を1本で呼ぶだけ）。
 #[cfg(test)]
 #[track_caller]

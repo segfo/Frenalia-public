@@ -204,12 +204,12 @@ pub fn traverse_capability_sid() -> Result<crate::win_common::OwnedSid, AppConta
     capability_sid_from_name(TRAVERSE_CAPABILITY_NAME)
 }
 
-/// このworkspace＋モードのFS付与の主体（D-54）。名前は
+/// このworkspace＋モードのFS付与の宛先SID（D-54）。名前は
 /// [`crate::tier2a::workspace_capability`]がworkspaceごとのランダム秘密から導出し、
 /// マシンローカル台帳（`%APPDATA%\harness\config\`）に保存する。
 ///
-/// **`workspace`はcanonicalize済みを渡すこと**（綴りが違うと別エントリ＝別主体になり、
-/// 同じツリーへ2つの主体のACEを撒くことになる）。台帳へまだ無ければここで発行する。
+/// **`workspace`はcanonicalize済みを渡すこと**（綴りが違うと別エントリ＝別の宛先SIDになり、
+/// 同じツリーへ2つの宛先SIDのACEを撒くことになる）。台帳へまだ無ければここで発行する。
 pub fn workspace_capability_sid(
     workspace: &Path,
     mode: &str,
@@ -219,14 +219,14 @@ pub fn workspace_capability_sid(
     capability_sid_from_name(&name)
 }
 
-/// `--fs-allow`の**宣言1件**のFS付与の主体（§22.3）。
+/// `--fs-allow`の**宣言1件**のFS付与の宛先SID（§22.3）。
 ///
 /// D-54がworkspaceツリーに対してやったことを、宣言されたパスに対して行う。以前この穴は
 /// **セッションのpackage SID**宛だった——package SIDはAppContainer全体で共有されるので、
 /// そのACEは同一セッションの**全ドメイン**に効いてしまい、per-domainのFS制御は原理的に
 /// 作れなかった（§22.3）。
 ///
-/// 主体は§22.2.0の導出鍵`(秘密, 畳み込み済みパス, access級)`から決まる。したがって
+/// 宛先SIDは§22.2.0の導出鍵`(秘密, 畳み込み済みパス, access級)`から決まる。したがって
 /// **同じ宣言をするドメインは何もしなくても同じSIDを共有し**、1つの宣言パスに載るACEは
 /// access級の数（最大3本）で止まる（§22.3.3）。
 ///
@@ -234,7 +234,7 @@ pub fn workspace_capability_sid(
 /// `declared_path`側の綴りは`declaration_key`が畳むので、呼び出し側で正規化しなくてよい。
 ///
 /// **`access`は実際に付けるアクセスを渡すこと。** CoWでRO降格した場合は降格後の値である
-/// ——導出に使った級と実際に書いたマスクがずれると、撤収側は別の主体を探しに行く。
+/// ——導出に使った級と実際に書いたマスクがずれると、撤収側は別の宛先SIDを探しに行く。
 pub fn fs_allow_capability_sid(
     workspace: &Path,
     declared_path: &Path,
@@ -252,7 +252,7 @@ pub fn fs_allow_capability_sid(
 /// `declared_path`宛に**既に発行済み**の宣言capability SIDを引く（発行はしない）。
 ///
 /// 撤収側（`harness fs revoke <path>`・セッション終了時の自動撤収）が使う。
-/// §22.2.1の doctrine どおり、ACLを列挙して主体を推定するのではなく**宣言から導出した
+/// §22.2.1の doctrine どおり、ACLを列挙して宛先SIDを推定するのではなく**宣言から導出した
 /// SIDを名指しで**剥がすための入口である（`revoke_subjects.rs`の分類器は使わない。
 /// あちらはpackage SID専用で、capability SIDを混ぜないことが意図である）。
 ///
@@ -273,10 +273,10 @@ pub fn fs_allow_capability_sids(
 /// **`grant_ace_inheritable_rw`が実際に書くマスクと同じ級でなければならない。** あちらは
 /// `workspace_rwx_mask()`を書き、それは`fs_access_mask(FsAccess::ReadWriteExec)`と同値である
 /// （`acl_grant`の`fs_access_mask`にその旨のコメントがある）。導出に使った級と実際に書いた
-/// マスクがずれると、撤収側は**別の主体**を探しに行って何も剥がせない。
+/// マスクがずれると、撤収側は**別の宛先SID**を探しに行って何も剥がせない。
 pub const COW_DIFF_LAYER_ACCESS: FsAccess = FsAccess::ReadWriteExec;
 
-/// [§22.3.2] CoW差分層のFS付与の主体。**発行する側**（付与経路が使う）。
+/// [§22.3.2] CoW差分層のFS付与の宛先SID。**発行する側**（付与経路が使う）。
 ///
 /// # なぜ差分層に専用の仕組みが要らないのか
 ///
@@ -317,7 +317,7 @@ pub fn cow_diff_layer_capability_sid(
     capability_sid_from_name(&name)
 }
 
-/// [§22.3.2] CoW差分層の主体を**引くだけ**（発行しない）。子のトークンへ積む経路が使う。
+/// [§22.3.2] CoW差分層の宛先SIDを**引くだけ**（発行しない）。子のトークンへ積む経路が使う。
 ///
 /// [`cow_diff_layer_capability_sid`]との違いは発行の有無だけである。**積む側が発行してしまうと、
 /// `preflight`を経ていない差分層に対して台帳エントリが増える**——「読むだけのつもりの呼び出しが
@@ -327,8 +327,8 @@ pub fn cow_diff_layer_capability_sid(
 /// まだ発行されていなければ`None`。呼び出し側は**積まない**——積めないことは
 /// `ACCESS_DENIED`＝fail-closedで出るので、無言で広がる向きには倒れない。
 /// **access級で絞って引く**（`declaration_capability_names`のようにパスだけで引かない）——
-/// 積むべきなのは**付与に使ったのと同じ級の主体**ただ1つだからである。級を無視して引くと、
-/// 同じ差分層へ別の級が発行されていた場合に宣言より広い主体を積むことになる。
+/// 積むべきなのは**付与に使ったのと同じ級の宛先SID**ただ1つだからである。級を無視して引くと、
+/// 同じ差分層へ別の級が発行されていた場合に宣言より広い宛先SIDを積むことになる。
 pub fn lookup_cow_diff_layer_capability_sid(
     workspace: &Path,
     diff_layer_dir: &Path,
@@ -524,11 +524,11 @@ pub fn derive_profile_sid(name: &str) -> Result<OwnedContainerSid, AppContainerE
     }
 }
 
-/// このプロセス（＝このセッション）がfs passthroughのACEを付与するときの**主体のSID文字列**。
+/// このプロセス（＝このセッション）がfs passthroughのACEを付与するときの**宛先SIDの文字列**。
 ///
-/// [BUG-101] 付与した主体を台帳へ記録するため（`fs_passthrough_ledger::FsLedgerEntry::granted_sids`）に
+/// [BUG-101] 付与した宛先SIDを台帳へ記録するため（`fs_passthrough_ledger::FsLedgerEntry::granted_sids`）に
 /// 要る。記録するのは`preflight`の呼び出し元（`harness-cli`の`run_agent`とポリシーエディタの
-/// パス2）だが、**主体を決めているのは`preflight`**なので、両者が同じ値を見ていることを
+/// パス2）だが、**宛先SIDを決めているのは`preflight`**なので、両者が同じ値を見ていることを
 /// 保証する必要がある。
 ///
 /// ここは`current_profile_name()`からの決定的な導出で、`preflight`が使う
@@ -548,7 +548,7 @@ pub fn current_session_grant_sid() -> Option<String> {
 // 公開項目はここでglob再エクスポートする。
 
 /// [残課題#32] **DACLを組んで書く低レベルの口**のうち、「M本のACEを1つのDACLへ畳んで
-/// ノードあたり1回だけ書き、既存の子孫まで届かせる」側。`acl_grant`（何をどの主体へ許すかの
+/// ノードあたり1回だけ書き、既存の子孫まで届かせる」側。`acl_grant`（何をどの宛先SIDへ許すかの
 /// 決定）とは触るものが違うので分けてある。**globで出さない**——`propagate_merged_dacl`という
 /// 名前は、それだけでは`set_dacl_propagating`との違いが分からないため。
 mod acl_dacl_write;
@@ -557,7 +557,7 @@ mod acl_grant;
 /// ——`start`/`progress`/`wait_until_done`という短い名前は、それだけでは何のジョブか
 /// 分からないため（`grant_job::wait_until_done()`と書けば分かる）。
 pub mod grant_job;
-/// Tier2a子を起こすまでの前口上（主体の導出・背景walkの待ち・spawn）。`run_shell`と
+/// Tier2a子を起こすまでの前口上（宛先SIDの導出・背景walkの待ち・spawn）。`run_shell`と
 /// ポリシーエディタのパス2が共有する（モジュールdoc参照）。
 mod launch;
 /// [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] Lazy ACE fault-inの準備器（走査器と単一writer）。
@@ -572,18 +572,18 @@ mod preflight;
 /// 決定（どのプローブをどの順で打つか）は`preflight`が持ち、ここは観測だけを持つ。
 mod preflight_probe;
 mod revoke;
-/// 撤収の主体のうち、**宣言（`--fs-allow`）から一意に導出できるもの**を決める層（§22.2.1）。
+/// 撤収する宛先SIDのうち、**宣言（`--fs-allow`）から一意に導出できるもの**を決める層（§22.2.1）。
 /// `revoke_subjects`（DACLに実在するpackage SIDを分類する）とは探し方が違うので分けている。
 mod revoke_declarations;
-/// 撤収の**主体**を決める層（[BUG-101](../../../docs/bugs/BUG-101.md)欠陥②）。
+/// 撤収の**宛先SID**を決める層（[BUG-101](../../../docs/bugs/BUG-101.md)欠陥②）。
 /// 「どのSIDのACEを剥がすか」を、名前から導出したSIDではなく**対象パスのDACLに実在するSID**
 /// から決める。`revoke`（剥がし方）とは責務が別なので分けている。
 mod revoke_subjects;
 mod spawn;
 mod spawn_session;
 mod traverse;
-/// [D-84] workspaceツリーへ配る**ACEの集合**（モード×主体×マスク）と、それを1回の書込で
-/// 置く口。`acl_grant`（何をどの主体へ許すかの決定）から分けてあるのは、こちらが扱うのが
+/// [D-84] workspaceツリーへ配る**ACEの集合**（モード×宛先SID×マスク）と、それを1回の書込で
+/// 置く口。`acl_grant`（何をどの宛先SIDへ許すかの決定）から分けてあるのは、こちらが扱うのが
 /// 「**どのcapability SID宛のACEを何本配るか**」という別の軸だからである
 /// （`docs/CODE-STRUCTURE-RULES.md`規則3）。
 mod workspace_aces;
@@ -710,14 +710,14 @@ mod mcp_e2e_tests;
 #[cfg(all(windows, test))]
 mod domain_isolation_tests;
 
-/// **`--fs-allow`の主体移行（§22.3）の受け入れ測定**（`docs/STATUS.md`残課題#20、§22.3.0.2の2条件）。
+/// **`--fs-allow`の宛先SID移行（§22.3）の受け入れ測定**（`docs/STATUS.md`残課題#20、§22.3.0.2の2条件）。
 /// 同じセッションの中で、宣言capabilityを積んだ子だけが宣言パスへ届き・そこにある
 /// スクリプトを実行できることを、**積まない子と対で**測る。ACLだけを見る
 /// `ace_grant_revoke_tests`とは測る層が違う（あちらはDACL、こちらは子から見た実I/O）。
 #[cfg(all(windows, test))]
 mod fs_allow_domain_acceptance_tests;
 
-/// **CoW差分層の主体移行（§22.3.2）の受け入れ測定**（`docs/STATUS.md`残課題#20の残り1件）。
+/// **CoW差分層の宛先SID移行（§22.3.2）の受け入れ測定**（`docs/STATUS.md`残課題#20の残り1件）。
 /// 差分層のrootにpackage SID宛ACEが0本・capability宛が1本であることと、セッション終了と
 /// GCの**両方**でそれが0本へ戻ることを、**実DACLで**測る。子から見た実I/Oは測らない
 /// （そちらは`cow_containment_tests`と実機E2E`tier2a_cow_commit_matrix`）。
@@ -781,7 +781,7 @@ mod cert_store_spike_tests;
 #[cfg(all(windows, test))]
 mod unc_reach_spike_tests;
 
-/// **現状1主体でのACL付与コストの基準線**（`plans/mac-spike/RESULTS.md` §S10、
+/// **現状の宛先SID 1本でのACL付与コストの基準線**（`plans/mac-spike/RESULTS.md` §S10、
 /// `plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`のM1）。`docs/STATUS.md`残課題#20
 /// （ドメイン遷移の足回り）に書かれた「重い」という**推定を実測へ置き換える**ためのもので、
 /// あわせて残課題#32（伝播が既存子孫へ届かない疑い）を確定/否定する。

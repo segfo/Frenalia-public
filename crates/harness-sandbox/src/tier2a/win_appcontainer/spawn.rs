@@ -464,9 +464,9 @@ fn normalize_cow_root(path: &Path) -> PathBuf {
     ))
 }
 
-/// 子プロセスが属する**ドメイン**を名指しする主体（設計書§22.1.1）。
+/// 子プロセスが属する**ドメイン**を名指しするSID（設計書§22.1.1）。
 ///
-/// 子のプロセス／スレッド／トークン既定DACLを「ユーザーSID＋この主体」だけに絞るために使う。
+/// 子のプロセス／スレッド／トークン既定DACLを「ユーザーSID＋このSID」だけに絞るために使う。
 /// **同一package SID内では、これが違えば互いに`OpenProcess`できない**——それがこの型の目的で
 /// ある（capability群だけではコード注入を塞げない、[RESULTS.md §S2・§S2c](../../../../plans/mac-spike/RESULTS.md)）。
 ///
@@ -485,7 +485,7 @@ pub enum DomainIdentity {
 }
 
 impl DomainIdentity {
-    /// 子のDACLに載せる主体のSID文字列を返す。`container_sid`は`OwnPackage`のときだけ使う。
+    /// 子のDACLに載せる宛先SIDの文字列を返す。`container_sid`は`OwnPackage`のときだけ使う。
     fn sid_string(&self, container_sid: PSID) -> Result<String, AppContainerError> {
         let psid = match self {
             DomainIdentity::Capability(sid) => *sid,
@@ -551,7 +551,7 @@ impl Drop for SecurityDescriptorBuf {
 
 /// 子のプロセス／スレッド／トークン既定DACLへ適用するSDDL（設計書§22.1.1）。
 ///
-/// 形は`D:(A;;GA;;;<user sid>)(A;;GA;;;<domain sid>)`の2主体だけである。
+/// 形は`D:(A;;GA;;;<user sid>)(A;;GA;;;<domain sid>)`の2つのSIDだけである。
 ///
 /// - **package SIDは載せない**。載せると同一package SIDの別ドメインから開けてしまい、
 ///   この対策の目的そのものが消える（`OwnPackage`のときだけ、package SID＝ドメインなので載る）
@@ -559,7 +559,7 @@ impl Drop for SecurityDescriptorBuf {
 /// - **ユーザーSIDは載せる**。AppContainerでない側（harness自身・昇格した収集器）が引き続き
 ///   開けるようにするため。**AppContainerの子には効かない**——AppContainerのアクセスチェックは
 ///   package SIDかcapabilityを別途要求するので、サンドボックスの子はこのACEでは開けない（§S2cで実測）
-/// - **SYSTEMは足さない**（§S2cの構成で実際に走ることを確認済みで、根拠なく主体を増やさない）
+/// - **SYSTEMは足さない**（§S2cの構成で実際に走ることを確認済みで、根拠なくSIDを増やさない）
 fn domain_dacl_sddl(
     domain: DomainIdentity,
     container_sid: PSID,

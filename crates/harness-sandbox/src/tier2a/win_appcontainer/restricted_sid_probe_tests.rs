@@ -69,11 +69,11 @@ use crate::win_common::{
 const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
 
 /// `NT AUTHORITY\WRITE RESTRICTED`。`WRITE_RESTRICTED`トークンの書込判定で
-/// **Windowsが暗黙に見る**とされる主体。**本当にそうかを本プローブで確かめる**
+/// **Windowsが暗黙に見る**とされるSID。**本当にそうかを本プローブで確かめる**
 /// （期待を書いて終わりにしない）。
 const WRITE_RESTRICTED_SID: &str = "S-1-5-33";
 
-/// `NT AUTHORITY\RESTRICTED`。制限トークンの2周目判定でChromiumが使う古典的な主体。
+/// `NT AUTHORITY\RESTRICTED`。制限トークンの2周目判定でChromiumが使う古典的なSID。
 /// **capability SIDが制限SIDとして拒否される**（実測）ため、A-3が使えるのはこちらになる。
 const RESTRICTED_SID: &str = "S-1-5-12";
 
@@ -497,7 +497,7 @@ fn restricted_sid_probe_can_a_restricted_sid_token_still_spawn() {
     // **制限SIDの集合を振る。** 最初の測定は`{RESTRICTED, ログオン}`だけで、起動はしたが
     // 子が`0xC0000142`（DLL初期化失敗）で即死した。**そこから「制限トークンでは動かない」と
     // 結論してはいけない**——プロセス起動時に触るオブジェクト（システムDLL・KnownDlls・
-    // CSRSSのポート・デスクトップ）が、どの主体を許可しているかで決まるからである。
+    // CSRSSのポート・デスクトップ）が、どのSIDを許可しているかで決まるからである。
     // だから**集合を振って、どこから動き出すか**を見る。
     let configs: Vec<(&str, CREATE_RESTRICTED_TOKEN_FLAGS, Vec<windows::Win32::Security::PSID>)> = vec![
         (
@@ -600,7 +600,7 @@ fn restricted_sid_probe_write_restricted_truth_table() {
     let wr = sid_from_string(WRITE_RESTRICTED_SID);
     let mask = fs_access_mask(FsAccess::ReadWrite);
 
-    // 片方の腕にだけ`RESTRICTED`（＝制限SIDに入れた主体）、もう片方にだけ`WRITE RESTRICTED`を許可する。
+    // 片方の腕にだけ`RESTRICTED`（＝制限SIDに入れたSID）、もう片方にだけ`WRITE RESTRICTED`を許可する。
     // **どちらのSIDが書込判定を満たすのか**を、推測ではなく出力で決めるための対である
     // （`WRITE_RESTRICTED`が`S-1-5-33`を暗黙に見る、という説の真偽もここで決まる）。
     super::grant_ace_mask_for_test(
@@ -627,7 +627,7 @@ fn restricted_sid_probe_write_restricted_truth_table() {
     unsafe {
         let _ = CloseHandle(base2);
     }
-    // **書込側の陽性対照**（B-35）。制限SIDに入れた主体（ユーザーSID）を直接許可した場所。
+    // **書込側の陽性対照**（B-35）。制限SIDに入れたSID（ユーザーSID）を直接許可した場所。
     // ここが書けなければ「制限が効いた」ではなく「そもそも書けない」を測っている。
     super::grant_ace_mask_for_test(
         &root.join("usrsid"),

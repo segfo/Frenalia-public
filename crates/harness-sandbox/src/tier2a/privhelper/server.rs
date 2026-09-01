@@ -233,8 +233,8 @@ unsafe fn launch_netfilterd_chained(pipe_name: &str) -> Result<(), PrivHelperErr
 /// `GrantWorkspaceAccess`のfs-allow部分の実処理。エントリごとに成否が独立する
 /// （`GrantTraverse`のような連鎖ではないため、1エントリの失敗が他エントリを止めない）。
 ///
-/// [§22.3.1] **主体はエントリごとに、この関数の中で導出する。** 呼び出し元から1つのSIDを
-/// 受け取る形をやめたのは、`--fs-allow`の主体が**宣言ごと**になったからである。導出入力は
+/// [§22.3.1] **宛先SIDはエントリごとに、この関数の中で導出する。** 呼び出し元から1つのSIDを
+/// 受け取る形をやめたのは、`--fs-allow`の宛先SIDが**宣言ごと**になったからである。導出入力は
 /// `(受け取った秘密, **この関数がこれから書き込む当のパス**, access級)`で、パスを
 /// 呼び出し元の申告ではなく`entry.path`——実際の書込先——から取るのが要点である
 /// （申告されたパスから導出して別のパスへ書くと、束縛が名目だけになる）。
@@ -244,7 +244,7 @@ fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(Pat
     for entry in entries {
         let started = std::time::Instant::now();
         // **秘密の無い電文は拒否する**（fail-closed）。移行前のビルドが送ってくる形で、
-        // 通すと「主体を決められないまま何かへ付与する」ことになる。
+        // 通すと「宛先SIDを決められないまま何かへ付与する」ことになる。
         if entry.secret_hex.is_empty() {
             log::line(&format!(
                 "  entry {} : REFUSED (no capability secret on the wire; the caller is from before \
@@ -260,7 +260,7 @@ fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(Pat
         }
         // **導出は必ずこの側で行う**（`privhelper`モジュールdocの「SIDはIPCで受け取らず、
         // 受信側が自ら導出する」を字義どおり保つ）。畳み込みも受信側の関数を通すので、
-        // 呼び出し元が綴りを細工して別の主体を作らせることはできない。
+        // 呼び出し元が綴りを細工して別の宛先SIDを作らせることはできない。
         let name = crate::tier2a::workspace_capability::declaration_capability_name(
             &entry.secret_hex,
             &crate::tier2a::workspace_capability::declaration_key(&entry.path),
@@ -376,25 +376,25 @@ fn grant_traverse_targets(sid: PSID, targets: Vec<PathBuf>) -> (Vec<PathBuf>, Op
 /// 自由形式のコマンド文字列は一切扱わない）。**SIDはIPCで受け取らず、必ずこのバイナリ側で
 /// 自ら導出する**——ただしD-37以降、導出先は用途によって2系統ある。
 ///
-/// | 用途 | 主体 | 導出元 |
+/// | 用途 | 宛先SID | 導出元 |
 /// |---|---|---|
 /// | 祖先チェーンのtraverse（`GrantTraverse`/`RevokeTraverse`/`GrantWorkspaceAccess`のtraverse部分） | capability SID | `traverse_capability_sid()`（固定名`harnessSandboxTraverse`） |
 /// | leafへの読み書きの**付与**（`GrantWorkspaceAccess`のfs-allow部分） | **宣言ごとのcapability SID**（§22.3） | IPCで受けた**秘密**＋**この側が畳み込んだ書込先のパス**＋access級（`grant_fs_allow_entries`） |
 /// | leafへの読み書きの**撤収**（`RevokeFsAllow`） | **2系統を順に**——(1) **宣言ごとのcapability SID**（§22.2.1）、(2) 対象パスのDACLに実在するpackage SID | (1) IPCで受けた**秘密**＋**この側が畳み込んだ対象パス**＋access級、(2) `win_appcontainer::revoke_harness_subjects`（名前からは導出しない） |
 ///
-/// **撤収が2系統あるのは、移行の途中に両方が実在し得るからである。** 新しい主体
-/// （capability SID）は宣言から一意に導出でき、旧い主体（package SID）は導出できないので
+/// **撤収が2系統あるのは、移行の途中に両方が実在し得るからである。** 新しい宛先SID
+/// （capability SID）は宣言から一意に導出でき、旧い宛先SID（package SID）は導出できないので
 /// DACLから分類するしかない——**探し方が違うので同じ関数にはならない**。どちらか片方でも
 /// rootに残っていれば、このパスは「撤収できた」と応答しない。
 ///
 /// traverse側が`CONTAINER_NAME`のpackage SIDのままD-37から取り残されていたのが
 /// [BUG-061](../../../../docs/bugs/BUG-061.md)である。**新しいアームを足す人は、上表のどの行に
-/// 属するかを決めてから主体を選ぶこと。**
+/// 属するかを決めてから宛先SIDを選ぶこと。**
 ///
 /// [BUG-101] 撤収の行が「旧共有package SID固定」だったのをやめた。プロファイルが削除された
 /// SIDは名前へ逆引きできないので、名前側から探す方式ではそもそも届かない。いまは対象パスの
-/// DACLを読んで、そこに実在する主体だけを分類して剥がす。**この関数はもうpackage SIDを
-/// 冒頭で導出しない**——用途ごとに主体が違うので、共有の`sid`変数を置くこと自体が
+/// DACLを読んで、そこに実在する宛先SIDだけを分類して剥がす。**この関数はもうpackage SIDを
+/// 冒頭で導出しない**——用途ごとに宛先SIDが違うので、共有の`sid`変数を置くこと自体が
 /// 「どの行のつもりか」を曖昧にしていた。
 fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
     match req {
@@ -403,7 +403,7 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 "dispatch: GrantTraverse target={}",
                 target.display()
             ));
-            // D-37/BUG-061: 祖先traverseの主体は**capability SID**であって、この関数の冒頭で
+            // D-37/BUG-061: 祖先traverseの宛先SIDは**capability SID**であって、この関数の冒頭で
             // 導出したpackage SIDではない。`GrantWorkspaceAccess`（下）と同じ導出をここでも行う。
             let traverse_cap = match win_appcontainer::traverse_capability_sid() {
                 Ok(cap) => cap,
@@ -442,7 +442,7 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
         }
         PrivilegedRequest::RevokeTraverse { path } => {
             log::line(&format!("dispatch: RevokeTraverse path={}", path.display()));
-            // D-48/BUG-061: 撤収も主体はcapability SID。`revoke_traverse_grant`は主体を自ら
+            // D-48/BUG-061: 撤収も宛先SIDはcapability SID。`revoke_traverse_grant`は宛先SIDを自ら
             // 導出し、撤収と撤収済み検証を一体で行う（台帳の除去は非昇格の呼び出し元が行う）。
             let result: Result<(), AppContainerError> =
                 win_appcontainer::revoke_traverse_grant(&path);
@@ -464,7 +464,7 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 paths.len()
             ));
             // 単発の`RevokeTraverse`と**同じ関数**を通す（`code-structure-rules` §5.1: 対の
-            // 操作は同じ実装を通る）。`revoke_traverse_grant`は主体のcapability SIDを自ら
+            // 操作は同じ実装を通る）。`revoke_traverse_grant`は宛先のcapability SIDを自ら
             // 導出し、走行中セッションの検査（D-48の`traverse_revoke_guard`）と撤収済み検証を
             // 一体で行う——**非昇格側が同じ検査を通していても、ここでもう一度見る**（D-16）。
             let mut revoked: Vec<PathBuf> = Vec::new();
@@ -498,7 +498,7 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 fs_allow_entries.len()
             ));
             // D-37: 祖先traverseはharness共通のcapability SID宛（固定名から自ら導出、IPC入力に
-            // 依存しない）。fs-allowは§22.3.1により宣言ごとのcapability SID宛で、その主体は
+            // 依存しない）。fs-allowは§22.3.1により宣言ごとのcapability SID宛で、その宛先SIDは
             // `grant_fs_allow_entries`が受け取った秘密と書込先のパスから自ら導出する。
             let traverse_cap = match win_appcontainer::traverse_capability_sid() {
                 Ok(cap) => cap,
@@ -512,7 +512,7 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
             let (traverse_granted, traverse_error) =
                 grant_traverse_targets(traverse_cap.as_psid(), traverse_targets);
 
-            // [§22.3.1] **fs-allowの主体はもうセッションプロファイル名から導出しない。**
+            // [§22.3.1] **fs-allowの宛先SIDはもうセッションプロファイル名から導出しない。**
             // 宣言ごとのcapability SIDへ移したので、名前を受け取って検証する段はここには無く、
             // 導出はエントリごとに`grant_fs_allow_entries`の中で行う（同関数のdoc）。
             let (fs_allow_granted, fs_allow_failures) = grant_fs_allow_entries(fs_allow_entries);
@@ -547,7 +547,7 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 let started = std::time::Instant::now();
                 // [§22.2.1] **宣言capabilityは、受け取った秘密からこの側で導出して名指しで剥がす。**
                 // 付与（`grant_fs_allow_entries`）とまったく同じ導出を通す——ここだけ別の決め方に
-                // すると、同じ宣言なのに付与と撤収で違う主体を見ることになる（B-02）。
+                // すると、同じ宣言なのに付与と撤収で違う宛先SIDを見ることになる（B-02）。
                 //
                 // **空は拒否しない。** 付与側は秘密の無い電文をfail-closedで拒むが、撤収で
                 // 止めると剥がせないACEが実マシンに残る。剥がせた／見ていないの区別は、
@@ -574,7 +574,7 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                         }
                     })
                     .collect();
-                // [BUG-101] package SID側の撤収する主体は**このパスのDACLに実在するharness由来の
+                // [BUG-101] package SID側の撤収する宛先SIDは**このパスのDACLに実在するharness由来の
                 // SID**で決める（旧実装は`ensure_profile(CONTAINER_NAME)`＝旧共有プロファイル固定だった）。
                 //
                 // **昇格側では台帳の記録（規則3）と未登録SIDの指紋（規則4）は使わない。**
@@ -583,8 +583,8 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 // 非昇格側が名指しで報告する（fail-closed）。
                 let do_revoke = || {
                     // 宣言capabilityを先に剥がす。どちらの順でも最終状態は同じだが、
-                    // 失敗したときに「新しい主体は落ちたのに旧い主体が残った」より
-                    // 「旧い主体は落ちたが新しい主体が残った」の方が、次の起動の検算
+                    // 失敗したときに「新しい宛先SIDは落ちたのに旧い宛先SIDが残った」より
+                    // 「旧い宛先SIDは落ちたが新しい宛先SIDが残った」の方が、次の起動の検算
                     // （§22.3.0の不変条件＝package SID宛が0本）で見つかる側に倒れる。
                     let decl = win_appcontainer::revoke_capability_subjects(
                         &path,

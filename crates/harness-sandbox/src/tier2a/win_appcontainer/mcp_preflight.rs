@@ -98,7 +98,7 @@ pub fn preflight_mcp_server(
         //
         // 剥がすのは**このMCPサーバのpackage SIDだけ**でよい。MCPサーバはworkspace
         // capability（D-54）をトークンへ積まない（`spawn`は既定で積まない、D-38 §3.2で
-        // workspaceは既定の許可対象ではない）ので、capability宛のACEはここでは主体にならない。
+        // workspaceは既定の許可対象ではない）ので、capability宛のACEはここでは対象にならない。
         let harness_dir_exists = workspace_root.join(".harness").exists();
         let protected =
             protect_harness_control_dir_from_appcontainer(workspace_root, &[sid.as_psid()])?;

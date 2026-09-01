@@ -58,7 +58,7 @@
 //! | 用途 | どこから |
 //! |---|---|
 //! | Tier0/Tier2a起動・ストリーミング出力 | `harness_sandbox`（`win_common::stream_child_output`を各Tierが共有） |
-//! | Tier2a起動の前口上（主体の導出・背景walkの待ち） | `harness_sandbox::tier2a::win_appcontainer::spawn_shell_in_workspace`（`run_shell`と共有、D-54） |
+//! | Tier2a起動の前口上（宛先SIDの導出・背景walkの待ち） | `harness_sandbox::tier2a::win_appcontainer::spawn_shell_in_workspace`（`run_shell`と共有、D-54） |
 //! | シェル起動の作法（コマンドはenv経由・stdinは固定ブートストラップ・境界印） | `harness_tools`（`run_shell`と共有、B-05） |
 //! | ETW収集器（record-all） | `harness_sandbox::tier2a::policy_learnd`（`LearnPolicy.record_all`） |
 //! | Local Proxy / Fake DNS | `harness_tools::net_proxy` / `fake_dns`（`*_with_policy`でポリシー注入・`proxy_env_vars`で環境変数注入） |

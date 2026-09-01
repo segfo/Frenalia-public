@@ -365,7 +365,7 @@ pub fn nearest_existing_ancestor(
 ///    ACEを付ける先が無いので境界がゼロになる。
 /// 2. **ネットワーク越しのボリューム**——SMB共有。こちらは**サーバ側がNTFSなら
 ///    `FILE_PERSISTENT_ACLS`を立てて返す**ので、ACLの有無だけを見ると通ってしまう。
-///    しかしAppContainerのpackage SIDは**このマシンのローカルな主体**であり、
+///    しかしAppContainerのpackage SIDは**このマシンのローカルなSID**であり、
 ///    共有越しの相手にそのSIDを解決させることはできない。**ACEは書けたように見えて
 ///    何も強制しない。**
 /// 3. **DACLの書込を実際には拒否するボリューム**——この開発機の`E:`（第三者製の暗号化
@@ -680,7 +680,7 @@ fn create_overlay_dir(dir: &Path) -> Result<(), String> {
 /// もう1つは`win_appcontainer::preflight`のCoW分岐（起動時）で、こちらはセッション切替・fork
 /// （`/sessions`・`/fork`・`--fork-session`）が通る。**片方だけを移すと、もう片方が
 /// package SID宛のまま残る**——そしてその状態は**成功に見える**（新しいACEは正しく付き、
-/// アクセスも通る）。主体の導出は`win_appcontainer::cow_diff_layer_capability_sid`ただ1本が
+/// アクセスも通る）。宛先SIDの導出は`win_appcontainer::cow_diff_layer_capability_sid`ただ1本が
 /// 持つので、規則がずれることはない。
 #[cfg(windows)]
 fn prepare_cow_diff_layer(
@@ -690,9 +690,9 @@ fn prepare_cow_diff_layer(
 ) -> Result<usize, String> {
     use crate::tier2a::{session_profile, win_appcontainer, workspace_capability, workspace_ledger};
 
-    // 主体の導出鍵に入るworkspaceは**canonicalize済み**でなければならない（`preflight`が
-    // 渡すのと同じ値にする）。綴りが違うと別の台帳エントリ＝別のSIDになり、付けた主体と
-    // 積む主体が食い違って「ACEは正しいのに子から一切見えない」形で出る。
+    // 宛先SIDの導出鍵に入るworkspaceは**canonicalize済み**でなければならない（`preflight`が
+    // 渡すのと同じ値にする）。綴りが違うと別の台帳エントリ＝別のSIDになり、付けた宛先SIDと
+    // 積むcapability SIDが食い違って「ACEは正しいのに子から一切見えない」形で出る。
     let canonical_workspace = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
@@ -1115,7 +1115,7 @@ mod tests {
 
     /// **拒否側（ACLは在るのに拒否する唯一のケース）**: ネットワーク共有は
     /// サーバがNTFSなら`FILE_PERSISTENT_ACLS`を立てて返すが、AppContainerのpackage SIDは
-    /// ローカルの主体なので**ACEは書けたように見えて何も強制しない**。
+    /// ローカルのSIDなので**ACEは書けたように見えて何も強制しない**。
     /// ACLフラグだけを見る実装だとここが通ってしまう。
     #[test]
     fn a_network_volume_is_refused_even_though_it_reports_persistent_acls() {
@@ -1349,7 +1349,7 @@ mod appcontainer_ace_diagnostics {
     /// **「ネットワーク共有ではAppContainerのACEが効かない」を、推論ではなく実測で確かめる診断。**
     ///
     /// `cow_volume_gate`がネットワーク越しのボリュームを拒否する理由は、
-    /// 「AppContainerのpackage SIDはこのマシンのローカルな主体なので、リモートのサーバは
+    /// 「AppContainerのpackage SIDはこのマシンのローカルなSIDなので、リモートのサーバは
     /// 解決できず、ACEは書けたように見えて何も強制しない」というものである。
     /// **その理由自体は当初測っていなかった**——ネットワークかどうかを見て拒否していただけで、
     /// 「だから効かない」は推論だった。この作業では推論が2回外れている
@@ -1395,7 +1395,7 @@ mod appcontainer_ace_diagnostics {
                 Err(e) => println!("  ACEの付与       -> 失敗: {e}"),
             }
             // **付けたものを読み返す。** 「付与が成功した」は「そのACEが実際に載っている」を
-            // 意味しない——共有越しだと主体を解決できずに落ちる、という筋を測りたい。
+            // 意味しない——共有越しだとSIDを解決できずに落ちる、という筋を測りたい。
             let readback = std::process::Command::new("icacls")
                 .arg(&dir)
                 .output()

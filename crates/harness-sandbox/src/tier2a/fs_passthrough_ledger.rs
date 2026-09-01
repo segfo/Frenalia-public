@@ -35,7 +35,7 @@ pub struct FsLedgerEntry {
     /// 自動撤収対象にしない（D2/D3のsticky挙動を維持する）。
     #[serde(default)]
     pub settings_managed: bool,
-    /// このパスへACEを**実際に付与した主体**（AppContainerパッケージSIDの文字列表現）の集合。
+    /// このパスへACEを**実際に付与した宛先SID**（AppContainerパッケージSIDの文字列表現）の集合。
     ///
     /// # なぜ記録するのか（[BUG-101](../../../../docs/bugs/BUG-101.md)欠陥②）
     ///
@@ -57,7 +57,7 @@ pub struct FsLedgerEntry {
     /// 撤収の範囲は**対象パスのDACLに実在する継承フラグ**から決める
     /// （`win_appcontainer::revoke`）。この台帳は[BUG-103](../../../../docs/bugs/BUG-103.md)(d)で
     /// **サンドボックスから書ける**ことが実測されており、`scope: Object`を鵜呑みにすると
-    /// 「台帳を書き換えて再帰ACEを撤収の対象外にする」経路になる。D-61（撤収の主体は対象パスの
+    /// 「台帳を書き換えて再帰ACEを撤収の対象外にする」経路になる。D-61（撤収する宛先SIDは対象パスの
     /// DACLに実在するSIDから決める）とまったく同じ原則である。
     ///
     /// 使い道は`harness fs list`の表示と、実DACLとの突き合わせ（付与が宣言どおりだったかの検算）。
@@ -105,8 +105,8 @@ impl FsLedger {
     /// `record_fs_passthrough_grant`の中身（同一パスは上書き＝冪等、`settings_workspaces`は
     /// dedup追加、`settings_managed`は一度立ったら降ろさない、拒否記録は消す）。
     ///
-    /// `granted_sid`（付与した主体のSID文字列）だけは**上書きではなく和**で持つ
-    /// ——同じパスを別のセッションが付与し直すたびに主体が増えるので、上書きすると
+    /// `granted_sid`（付与した宛先SIDの文字列）だけは**上書きではなく和**で持つ
+    /// ——同じパスを別のセッションが付与し直すたびに宛先SIDが増えるので、上書きすると
     /// 前のセッションのACEを剥がす手掛かりが消える（[`FsLedgerEntry::granted_sids`]のdoc）。
     // 引数は台帳エントリの列そのものである。まとめるための構造体を新設すると
     // [`FsPassthroughGrantRecord`]とほぼ同じ型が2つ並ぶだけで、**どちらを更新すべきかが
@@ -280,7 +280,7 @@ pub struct FsPassthroughGrantRecord {
     pub writable: bool,
     pub forced: bool,
     pub settings_workspace: Option<String>,
-    /// ACEを付与した主体のSID文字列（[`FsLedgerEntry::granted_sids`]）。導出に失敗したら
+    /// ACEを付与した宛先SIDの文字列（[`FsLedgerEntry::granted_sids`]）。導出に失敗したら
     /// `None`——**記録できなかったことを付与の失敗にはしない**が、そのパスは後から
     /// 「登録簿」と「マスクの指紋」でしか判定できなくなる。
     pub granted_sid: Option<String>,
@@ -566,7 +566,7 @@ mod fs_ledger_tests {
         assert_eq!(ledger.entries[0].granted_at_unix_secs, 200);
     }
 
-    /// 付与した主体のSIDは**上書きではなく和**で持つ（重複は足さない）。
+    /// 付与した宛先SIDは**上書きではなく和**で持つ（重複は足さない）。
     ///
     /// [BUG-101] 同じパスは起動のたびに別のセッション（＝別のpackage SID）が付与し直す。
     /// 上書きにすると、前のセッションが付けたACEを「harnessのものだ」と判定する手掛かりが

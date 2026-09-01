@@ -7,7 +7,7 @@ use super::*;
 
 /// [B-01] **撤収が終わったworkspaceについて、台帳から落としてよい記録の鍵。**
 ///
-/// 台帳の記録は「そのACEの主体をもう一度導出するための唯一の名前」なので、
+/// 台帳の記録は「そのACEの宛先SIDをもう一度導出するための唯一の名前」なので、
 /// これを作ってよいのは**ACEを剥がし終えたあと**だけである（順序が逆だと、
 /// 撤収経路の無い孤立ACEがツリーに残る。`forget_capability`のdoc、BUG-017/BUG-059）。
 ///
@@ -88,7 +88,7 @@ fn revoke_one_workspace(path: &Path) -> WorkspaceRevokeOutcome {
         return WorkspaceRevokeOutcome::Incomplete;
     }
 
-    // D-54: workspaceツリーのACEの**現在の主体**は、workspace＋モード単位のcapability SIDで
+    // D-54: workspaceツリーのACEの**現在の宛先SID**は、workspace＋モード単位のcapability SIDで
     // ある。これはセッションより長生きする（明示的に消すまで残る）ので、`fs revoke-workspace`が
     // 唯一の撤収経路になる。D-37時代の残骸（package SID宛のACE）も同じ機会に剥がす。撤収対象は
     // 「旧共有プロファイル」＋「生きていないセッションのプロファイル」で、実行中のセッションの
@@ -97,7 +97,7 @@ fn revoke_one_workspace(path: &Path) -> WorkspaceRevokeOutcome {
     // [D-84] **付与が2本なら撤収も2本である。** `preflight`は起動のたびに全モードの
     // capability SID宛ACEを配るので、ここが自モードのぶんだけを剥がすと**もう一方の
     // capability SID宛ACEがツリーに
-    // 残る**——しかもその主体は台帳を消した瞬間に導出できなくなり、どのコマンドでも剥がせない
+    // 残る**——しかもその宛先SIDは台帳を消した瞬間に導出できなくなり、どのコマンドでも剥がせない
     // （[BUG-101](../../../docs/bugs/BUG-101.md)と同型）。だから回すのは
     // `WorkspaceMode::ALL`であって「いま走っているモード」ではない（`B-01`）。
     //
@@ -141,7 +141,7 @@ fn revoke_one_workspace(path: &Path) -> WorkspaceRevokeOutcome {
         // 台帳が空でも、過去のセッションが`.harness/**`へ立てた継承遮断は残り得る。
         report_harness_control_dir_unprotected(&canonical);
         println!("(nothing recorded to revoke for {})", canonical.display());
-        // 剥がす主体が1つも無い＝ツリーに残せるACEも無いので、workspace一覧の記録は落としてよい。
+        // 剥がす宛先SIDが1つも無い＝ツリーに残せるACEも無いので、workspace一覧の記録は落としてよい。
         // capability台帳には元から何も無いので`modes`は空。
         return WorkspaceRevokeOutcome::Revoked(ForgettableWorkspace {
             path: canonical,
@@ -182,11 +182,11 @@ fn revoke_one_workspace(path: &Path) -> WorkspaceRevokeOutcome {
         // [BUG-103] walkは1ノードの失敗では止まらなくなったので、**「剥がせなかったノードが
         // 在るか」は`Err`ではなく`report.blocked`が持つ**。`Err`が来るのはrootにすら触れなかった
         // ときだけである。ここで`blocked`を無視して成功扱いにすると、剥がし残しがあるのに
-        // 台帳を落とす形になり、直した`?`中断より悪い状態（主体を導出できない孤立ACE）になる。
+        // 台帳を落とす形になり、直した`?`中断より悪い状態（宛先SIDを導出できない孤立ACE）になる。
         Ok(report) => match report.blocked_summary(5) {
             // --- 完全撤収 ---
             None => {
-                // ACEを剥がし終えてから台帳を落とす——順序が逆だと主体を引けなくなり、撤収経路の
+                // ACEを剥がし終えてから台帳を落とす——順序が逆だと宛先SIDを引けなくなり、撤収経路の
                 // 無い孤立ACEがツリーに残る（`forget_capability`のdoc、BUG-017/BUG-059と同じ
                 // 不変条件）。実際に落とすのは呼び出し側で、ここは「落としてよい」だけを返す。
                 report_harness_control_dir_unprotected(&canonical);
@@ -250,7 +250,7 @@ fn revoke_one_workspace(path: &Path) -> WorkspaceRevokeOutcome {
 ///
 /// # 台帳エントリは残す
 ///
-/// 台帳に載っている名前は、そのACEの主体（capability SID）を導出するための**唯一の索引**
+/// 台帳に載っている名前は、そのACEの宛先SID（capability SID）を導出するための**唯一の索引**
 /// である。先に捨てると、残ったACEはどのコマンドでも剥がせない孤児になる
 /// （`B-01`: 名前で到達する設計では、名前を捨てる操作を最後に置く）。
 #[cfg(windows)]
@@ -282,7 +282,7 @@ fn unfinished_workspace(canonical: PathBuf, reason: String) -> WorkspaceRevokeOu
 ///
 /// # 渡してよいのは「撤収に成功した集合」だけである
 ///
-/// 剥がせなかったエントリを混ぜてはならない。台帳に載っている名前は、そのACEの主体
+/// 剥がせなかったエントリを混ぜてはならない。台帳に載っている名前は、そのACEの宛先SID
 /// （capability SID）を導出するための**唯一の索引**であり、先に捨てると残ったACEは
 /// どのコマンドでも剥がせない孤児になる。呼び出し側は[`WorkspaceRevokeOutcome::Revoked`]
 /// だけをここへ集めること。
@@ -382,7 +382,7 @@ pub(crate) fn fs_revoke_workspace_all() -> ExitCode {
     }
     let mut any_failed = false;
     // [B-01] **撤収に成功したものだけ**を集める。剥がせなかったエントリを混ぜると、
-    // 残ったACEの主体を導出する索引ごと消えて孤児になる。
+    // 残ったACEの宛先SIDを導出する索引ごと消えて孤児になる。
     let mut forgettable = Vec::new();
     for entry in &ledger.entries {
         let path = PathBuf::from(&entry.path);

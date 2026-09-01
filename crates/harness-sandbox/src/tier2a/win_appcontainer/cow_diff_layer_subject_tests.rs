@@ -1,4 +1,4 @@
-//! **CoW差分層の主体移行（§22.3.2、`docs/STATUS.md`残課題#20）の受け入れ測定。**
+//! **CoW差分層の宛先SID移行（§22.3.2、`docs/STATUS.md`残課題#20）の受け入れ測定。**
 //!
 //! 差分層（`--sandbox tier2a-cow`が書込を退避するセッション専有フォルダ）へ付けるACEの宛先は、
 //! セッションのpackage SIDから**差分層ごとのcapability SID**へ移った。移行が成立したと
@@ -99,7 +99,7 @@ fn preflight_cow(
     (session_sid(), cap)
 }
 
-/// 条件1: 差分層のrootの主体は**capability SIDであり、package SIDではない**。
+/// 条件1: 差分層のrootの宛先SIDは**capability SIDであり、package SIDではない**。
 ///
 /// **対で測る**（`B-35`）。「package SID宛が0本」だけを見ると、**付与そのものが失敗していても
 /// 緑になる**——ACEが1本も無い差分層は、確かにpackage SID宛を0本しか持たない。
@@ -114,7 +114,7 @@ fn the_diff_layer_is_owned_by_a_capability_and_not_by_the_session_package_sid() 
         let _ = revoke_ace_recursive(&diff, cap.as_psid());
     });
 
-    // 許可側: 移行先の主体のACEが実在する。
+    // 許可側: 移行先の宛先SIDのACEが実在する。
     let cap_mask = sid_ace_mask(&diff, cap.as_psid())
         .expect("the diff layer DACL must be readable");
     assert!(
@@ -123,7 +123,7 @@ fn the_diff_layer_is_owned_by_a_capability_and_not_by_the_session_package_sid() 
          without it the CoW child cannot write anywhere (nothing was migrated)"
     );
 
-    // 禁止側（§22.3.0の不変条件そのもの）: 共有される主体のACEは1本も無い。
+    // 禁止側（§22.3.0の不変条件そのもの）: 共有されるSIDのACEは1本も無い。
     let package_mask = sid_ace_mask(&diff, session.as_psid())
         .expect("the diff layer DACL must be readable");
     assert_eq!(

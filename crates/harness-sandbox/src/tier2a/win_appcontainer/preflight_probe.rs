@@ -28,7 +28,7 @@ fn probe_domain(workspace_cap: Option<PSID>) -> DomainIdentity {
 
 /// [§22.3] プローブ子のトークンへ積むcapabilityの集合（workspace本体＋`--fs-allow`の宣言）。
 ///
-/// **`--fs-allow`の穴は宣言ごとのcapability SID宛になった**ので、その主体を積まない子からは
+/// **`--fs-allow`の穴は宣言ごとのcapability SID宛になった**ので、その宛先SIDを積まない子からは
 /// 到達できない。積み忘れると、付与は正しく効いているのに到達性プローブが**全件を
 /// 「到達不能」と報告する**——`preflight`から見ると穴が全部壊れているように見えるが、
 /// 実際には測る側が権限を持っていないだけである。
@@ -42,7 +42,7 @@ fn probe_domain(workspace_cap: Option<PSID>) -> DomainIdentity {
 ///
 /// [§22.3.2] `extra_domain_caps`は「このドメインがFSへ届くために要る、workspace本体以外の
 /// capability」である——`--fs-allow`の宣言ぶんと、**CoWの差分層**。かつてこの引数は
-/// `fs_allow_caps`という名前だったが、差分層の主体がcapabilityへ移った時点でその名前は
+/// `fs_allow_caps`という名前だったが、差分層の宛先SIDがcapabilityへ移った時点でその名前は
 /// 実態より狭くなった（`preflight`のCoW分岐は`probe_dir`を**差分層の中**に作るので、
 /// 積まないとプローブの書込が拒否され、`preflight`が「workspace FS I/Oが拒否された」と
 /// **誤診断して起動を拒否する**——実際にこの移行で1度踏んだ）。
@@ -192,7 +192,7 @@ pub(crate) fn select_shell_by_probe(
             sid,
             NetworkCapability::Deny,
             None,
-            // [§22.3] シェルを選ぶだけのプローブなので`--fs-allow`の主体は積まない
+            // [§22.3] シェルを選ぶだけのプローブなので`--fs-allow`の宛先SIDは積まない
             // ——測っているのは「このシェルはAppContainerで起動して1行走るか」だけで、
             // 宣言したパスへ届くかは後段の`probe_passthrough_batch`が測る。
             &probe_capabilities(workspace_cap, &[]),
@@ -229,7 +229,7 @@ pub(crate) fn select_shell_by_probe(
     warnings
 }
 
-/// `workspace_cap`は、workspaceツリーのACEの主体になったcapability SID（D-54）。本番の
+/// `workspace_cap`は、workspaceツリーのACEの宛先SIDになったcapability SID（D-54）。本番の
 /// `run_shell`と**同じcapability構成**で起動しないとプローブの意味が無いので、`preflight`は
 /// ここへ必ず`Some`を渡す（`None`は自前でpackage SID宛のACEを付ける実機テスト専用）。
 pub(crate) fn smoke_test_spawn(
@@ -325,7 +325,7 @@ pub(crate) fn smoke_test_harness_control_write_denied(
         sid,
         NetworkCapability::Deny,
         None,
-        // [§22.3] **拒否側のプローブこそ、実際の子が持つ主体を全部積んで試す。**
+        // [§22.3] **拒否側のプローブこそ、実際の子が持つcapability SIDを全部積んで試す。**
         // 積まずに拒否されても「`.harness/`の保護が効いた」ことの証明にならないのは
         // workspace capabilityと同じ理屈で、宣言capabilityにもそのまま当てはまる
         // （`--fs-allow`が`.harness/`を覆う宣言をしていれば、それは実際に穴である）。
@@ -539,7 +539,7 @@ const TRAVERSE_REQUIRED_MASK: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;
 
 /// D9の診断文を組み立てる（純粋関数）。
 ///
-/// **祖先とleafは別の主体が別のACEで賄っている**（D-37）。祖先の通過権は全セッションで
+/// **祖先とleafは別の宛先SIDが別のACEで賄っている**（D-37）。祖先の通過権は全セッションで
 /// 共有する永続capability SID（`traverse_capability_sid`）が持ち、leafへの読み書きは
 /// そのセッション限りのpackage SIDが持つ。したがって診断も2系統に分けなければならない
 /// ——BUG-058以前は両方をセッションSIDで見ていたため、traverseが正常でも全祖先を
@@ -722,7 +722,7 @@ pub(crate) fn probe_passthrough_batch(
         sid,
         NetworkCapability::Deny,
         None,
-        // [§22.3] **穴の主体を積まないと、この測定は全件「到達不能」になる。**
+        // [§22.3] **穴の宛先SIDを積まないと、この測定は全件「到達不能」になる。**
         // 付与が正しく効いていても、測る側がcapabilityを持っていなければ届かない。
         &probe_capabilities(workspace_cap, extra_domain_caps),
         probe_domain(workspace_cap),

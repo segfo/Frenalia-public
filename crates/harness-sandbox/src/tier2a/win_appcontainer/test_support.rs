@@ -30,7 +30,7 @@ use crate::tier2a::workspace_ledger::WorkspaceMode;
 /// 「封じ込めが無い世界」を測ることになる。
 ///
 /// そこで本番の`launch.rs`とまったく同じ決め方にする: **`cow`が`Some`なら`ro`、
-/// そうでなければ`rwx`**。「本番と同じ形」を名乗るヘルパーが本番と違う主体を積んでいたら、
+/// そうでなければ`rwx`**。「本番と同じ形」を名乗るヘルパーが本番と違うcapability SIDを積んでいたら、
 /// 測っているものが違う（`B-08`）。
 ///
 /// **`spawn`のシグネチャをそのまま写している**ので、テストの呼び出し側は関数名を差し替える
@@ -75,7 +75,7 @@ pub(crate) fn spawn_in_workspace(
         Some(sid) => super::DomainIdentity::Capability(sid.as_psid()),
         None => super::DomainIdentity::OwnPackage,
     };
-    // [§22.3.2] CoWのときは**差分層の主体も積む**（本番の`launch.rs`と同じ）。差分層のACEは
+    // [§22.3.2] CoWのときは**差分層のcapability SIDも積む**（本番の`launch.rs`と同じ）。差分層のACEは
     // package SID宛から差分層ごとのcapability SID宛へ移ったので、これを積まない子は
     // Redirector DLLの退避先へ書けず、CoWのテストが「透過が壊れている」ように見える。
     // ここが本番と食い違うと、「本番と同じ形」を名乗るこのヘルパーだけ別の世界を測ることになる
@@ -89,7 +89,7 @@ pub(crate) fn spawn_in_workspace(
     });
     // [§22.3] このヘルパーはworkspace本体とCoWの差分層だけを見て起こす。`--fs-allow`の宣言
     // capabilityは積まないので、**このヘルパー経由の子は宣言した穴へ届かない**——穴の到達性を
-    // 測るテストは`probe_passthrough`（主体を明示的に渡せる）を使うこと。
+    // 測るテストは`probe_passthrough`（宛先SIDを明示的に渡せる）を使うこと。
     let mut domain_caps: Vec<windows::Win32::Security::PSID> = Vec::new();
     domain_caps.extend(cap.iter().map(|s| s.as_psid()));
     domain_caps.extend(cow_cap.iter().map(|s| s.as_psid()));
@@ -248,7 +248,7 @@ impl Drop for TestDirGuard {
 /// 実ノード数（ディレクトリ＋ファイル＋root）を返す。
 ///
 /// **ACLのコスト測定が共有する土台である。** `d79_exec_split_tests`（D-79の2本割りのコスト、
-/// `plans/mac-spike/RESULTS.md` §S9）と`acl_baseline_cost_tests`（現状1主体の基準線、§S10）が
+/// `plans/mac-spike/RESULTS.md` §S9）と`acl_baseline_cost_tests`（現状の宛先SID 1本の基準線、§S10）が
 /// 使う。**同じ形でなければ2つの測定の数字を並べられない**ので、ここに1つだけ置く
 /// （`docs/CODE-STRUCTURE-RULES.md`規則5）。**片方のスパイクを消しても残る場所**に
 /// 置いてあるのはそのためで、元は`d79_exec_split_tests`のprivate関数だった。
@@ -596,7 +596,7 @@ pub(crate) fn harness_exe() -> std::path::PathBuf {
     p
 }
 
-/// ツリーの全ノードについて「この主体たちへ届いているか」を集めた一覧を返す。
+/// ツリーの全ノードについて「これらの宛先SIDへ届いているか」を集めた一覧を返す。
 /// **rootからの相対パス（小文字）**で持つので、別々のディレクトリの結果でも比較できる。
 ///
 /// **「届いているか」なので継承ACEを数える**（`sid_effective_ace_masks`）。明示ACEだけを
@@ -657,7 +657,7 @@ pub(super) fn make_unreachable(path: &std::path::Path, grants: &[super::OwnedAce
     );
 }
 
-/// 実マシンに残るものを戻す。**ACEを剥がしてから台帳を落とす**——逆にすると主体を引けなくなり、
+/// 実マシンに残るものを戻す。**ACEを剥がしてから台帳を落とす**——逆にすると宛先SIDを引けなくなり、
 /// 撤収経路の無いACEが残る（`workspace_capability::forget_capability`のdocが定める不変条件）。
 ///
 /// # 台帳は2つある（`B-01`）

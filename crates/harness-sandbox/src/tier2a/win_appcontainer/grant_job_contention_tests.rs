@@ -366,7 +366,7 @@ fn format_runs(runs: &[(f32, f32, usize)]) -> String {
         .join(" ")
 }
 
-/// `path`がこの主体たち**全員**から届くか。読めなければ`None`。
+/// `path`がこれらの宛先SID**全部**から届くか。読めなければ`None`。
 fn reached_by_all(path: &Path, sids: &[windows::Win32::Security::PSID]) -> Option<bool> {
     super::super::revoke::sid_effective_ace_masks(path, sids)
         .ok()
@@ -389,7 +389,7 @@ fn reached_by_all(path: &Path, sids: &[windows::Win32::Security::PSID]) -> Optio
 /// | **制御ディレクトリ（`.harness/`）が届いてしまう窓** | サンドボックスの中の子が制御面へ書ける。**安全側ではない** |
 /// | **workspace root が届かなくなる窓** | 走っている子からツリー全体が消える。拒否側＝安全側だが、コマンドは壊れる |
 ///
-/// 後者は伝播する書込が**書込の直前に主体のACEをrootから外す**ために起きる既知の窓で、
+/// 後者は伝播する書込が**書込の直前に宛先SIDのACEをrootから外す**ために起きる既知の窓で、
 /// [`super::super::acl_dacl_write`]のモジュールdocが
 /// 「子プロセスは`wait_until_done`で完了を待つので踏まない」と根拠を書いている。
 /// **ここではその窓が実際に何秒開くかを、外から見た値として記録する**（`wait_until_done`が
@@ -398,7 +398,7 @@ fn reached_by_all(path: &Path, sids: &[windows::Win32::Security::PSID]) -> Optio
 /// # **対照を置く**（これが無いと原因を交差のせいにできない）
 ///
 /// 同じ標本を**1プロセスだけ**の腕でも取る。腕の違いは`harness.exe`の本数だけで、
-/// ツリーの形も主体も標本器も同じにしてある。**窓が両方の腕で開くなら、それは交差の話ではなく
+/// ツリーの形も宛先SIDも標本器も同じにしてある。**窓が両方の腕で開くなら、それは交差の話ではなく
 /// 準備そのものの性質である**——原因の名前が変わると、直す場所も変わる。
 ///
 /// # この標本が答えないこと
@@ -464,7 +464,7 @@ fn sample_one_arm(arm: &'static str, dir_label: &str, labels: &[&'static str]) -
         move || cleanup_workspace(&canonical_ws)
     });
 
-    // **主体を先に発行しておく。** そうしないと標本器が誰を見ればよいか分からない
+    // **宛先SIDを先に発行しておく。** そうしないと標本器が誰を見ればよいか分からない
     // （名前は台帳に載るので、あとから来る子はこれを再利用する＝測る構成は変わらない）。
     for mode in crate::tier2a::workspace_ledger::WorkspaceMode::ALL {
         crate::tier2a::workspace_capability::ensure_capability_name(&canonical_ws, mode.as_str())

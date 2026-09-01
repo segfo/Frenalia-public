@@ -28,7 +28,7 @@
 //!
 //! # 実行
 //!
-//! **非昇格。** ACEを書くのはテスト自身が作ったツリーだけで、主体は
+//! **非昇格。** ACEを書くのはテスト自身が作ったツリーだけで、宛先SIDは
 //! [`super::capability_sid_from_name`]の純粋導出（台帳にもプロファイルにも何も残さない）。
 //!
 //! ```text
@@ -78,7 +78,7 @@ fn subject(index: usize) -> crate::win_common::OwnedSid {
     super::capability_sid_from_name(&name).expect("derive capability sid")
 }
 
-/// `n`本ぶんの主体を作る。**呼び出し側が生かしておくこと**——
+/// `n`本ぶんの宛先SIDを作る。**呼び出し側が生かしておくこと**——
 /// [`InheritableGrant`]が持つのは生の`PSID`（借用）なので、ここで作った`OwnedSid`を
 /// 落とすとぶら下がりポインタになる。
 fn subjects(n: usize) -> Vec<crate::win_common::OwnedSid> {
@@ -95,7 +95,7 @@ fn sid_strings(subjects: &[crate::win_common::OwnedSid]) -> HashSet<String> {
         .collect()
 }
 
-/// `path`のDACLに載っている**自分の主体**の本数を数える。
+/// `path`のDACLに載っている**自分の宛先SID**の本数を数える。
 ///
 /// **全ACE数ではなく自分のぶんだけ数えるのが要点**——ノードには元から
 /// Administrators・SYSTEM・所有者のACEが載っており、それを混ぜると
@@ -117,7 +117,7 @@ fn count_own_aces(path: &Path, wanted: &HashSet<String>) -> usize {
 struct Step {
     requested: usize,
     write_error: Option<String>,
-    /// 書込後に**実際に載っていた**自分の主体の本数。
+    /// 書込後に**実際に載っていた**自分の宛先SIDの本数。
     present: usize,
     acl_bytes: u32,
     total_aces: u32,
@@ -339,7 +339,7 @@ fn acl_dacl_size_limit_where_it_breaks_and_how_it_fails() {
 /// # これがHANDOFFの本当の心配である
 ///
 /// 1ノードに直接3本しか載らなくても、**祖先が何段も宣言していれば葉には積み上がる**。
-/// ここでは`root/d/d/d`の4段（root含む）へ**段ごとに別の主体**を`per_level`本ずつ置き、
+/// ここでは`root/d/d/d`の4段（root含む）へ**段ごとに別の宛先SID**を`per_level`本ずつ置き、
 /// 最深部の葉が`4 × per_level`本を受け取るかを数える。
 ///
 /// # 2つの腕（B-35: 禁止側だけを見ない）
@@ -388,7 +388,7 @@ fn acl_dacl_size_limit_when_ancestors_stack_inherited_aces() {
         let leaf_file = cursor.join("leaf.txt");
         std::fs::write(&leaf_file, b"x").expect("write the leaf file");
 
-        // 段ごとに**別の主体**を割り当てる。同じ主体を使うと畳まれて本数が数えられない。
+        // 段ごとに**別の宛先SID**を割り当てる。同じ宛先SIDを使うと畳まれて本数が数えられない。
         let mut per_level_subjects = Vec::new();
         let mut base = 0usize;
         for _ in 0..levels.len() {

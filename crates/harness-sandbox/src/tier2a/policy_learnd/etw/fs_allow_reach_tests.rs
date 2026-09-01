@@ -54,7 +54,7 @@
 //! ノードも戻り値に含めるため、戻り値をそのまま撤収対象にすると元から在ったACEまで剥がす）。
 
 use crate::shell_tier::{FsAccess, FsPassthrough, GrantScope, WorkspaceWriteMode};
-// D-54: `preflight`が付けるworkspace ACEの主体はworkspace capability SIDなので、子を起こす側は
+// D-54: `preflight`が付けるworkspace ACEの宛先SIDはworkspace capability SIDなので、子を起こす側は
 // 本番（`run_shell`）と同じくそれをトークンへ積む必要がある。素の`spawn`だとworkspaceが
 // 一切見えず、測定そのものが成立しない（`spawn_in_workspace`のdoc参照）。
 use crate::tier2a::win_appcontainer::test_support::spawn_in_workspace;
@@ -592,7 +592,7 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     // [§22.3] **`--fs-allow`のパスはセッション台帳に載ってはならない。**
     //
     // BUG-057の頃は逆で、「載っていないと`end_session`の自動撤収から漏れる」ことを固定して
-    // いた。主体が宣言ごとのcapability SIDへ移った後は、`end_session`は**そのACEを剥がせない**
+    // いた。宛先SIDが宣言ごとのcapability SIDへ移った後は、`end_session`は**そのACEを剥がせない**
     // （package SIDを導出して探すので相手が違う）のに台帳エントリだけを回収済みとして落とす。
     // つまり載せておくと、ACEは実マシンに残るのに**それを覚えている記録だけが消える**。
     //
@@ -626,7 +626,7 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
 
     // **許可側はここでは測れていない**（B-35。書いておかないと「対で固定した」と読まれる）。
     // セッション台帳へ載り続けなければならないのはCoW Redirector DLLの記録
-    // （主体がセッションのpackage SIDのままなので`end_session`が正しく剥がせる）だが、
+    // （宛先SIDがセッションのpackage SIDのままなので`end_session`が正しく剥がせる）だが、
     // このテストは`WorkspaceWriteMode::DirectRw`で走るのでその分岐を1度も通らない。
     // 「fs-allowを外す」変更が「セッション台帳への記録そのものを外す」まで広がっていないことは、
     // いまはコードを読むことでしか確かめられない（`preflight`のCoW分岐の`record_granted_path`）。

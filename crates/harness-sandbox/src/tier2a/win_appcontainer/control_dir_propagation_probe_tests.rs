@@ -43,7 +43,7 @@
 //! # 前提と安全性
 //!
 //! - **管理者権限は不要**。祖先のDACLには一切触れない（伝播はケースrootとその配下にしか及ばない）。
-//! - **台帳を触らない**。主体は[`super::super::capability_sid_from_name`]の純粋導出のみを使う
+//! - **台帳を触らない**。宛先SIDは[`super::super::capability_sid_from_name`]の純粋導出のみを使う
 //!   （`workspace_capability_sid`は`%APPDATA%`へ実体を作るので使わない）。
 //! - **合否を判定しない観測用テスト**である（BUG-083のプローブと同じ思想）。アサートするのは
 //!   実験の前提が崩れていないかだけで、`panic!`させるとどのケースがどう出たかが出力に残らない。
@@ -234,7 +234,7 @@ enum Case {
     /// 見ていない。**まず「深さ2へ配布が届くのか」から確かめる**——届かなければ、
     /// 保護が落ちるかどうか以前に測定が成立しない。
     AncestorCleanHolder,
-    /// ケース9に**中間`ws`への高速付与**（別主体、カーネル口）を足してから祖先へ配布する。
+    /// ケース9に**中間`ws`への高速付与**（別の宛先SID、カーネル口）を足してから祖先へ配布する。
     ///
     /// 製品ではここがworkspace rootに当たり、preflightのカーネル口の書込を受けている。
     /// **9との差はその1点だけ**で、深さ1でケース2と3を分けた変数と同じものである。
@@ -321,7 +321,7 @@ enum Case {
     /// （立てて渡しても`0x9004`になる）こと。ケース18で分かったのは、**aclapiの口なら
     /// `0x9404`が保存され、配布にも耐える**こと。
     ///
-    /// ケース18は**主体のACEを剥がしていない**ので製品の形ではない。ここは剥がしと
+    /// ケース18は**宛先SIDのACEを剥がしていない**ので製品の形ではない。ここは剥がしと
     /// aclapiの保護を組み合わせて、**剥がせること・印が付くこと・配布に耐えること**を
     /// 同時に確かめる。
     AclapiStripAndProtect,
@@ -482,7 +482,7 @@ struct CaseResult {
     control_after_protect: u16,
     /// 伝播直後の同じ値。伝播しないケースでは同じ時点をもう一度読む。
     control_after_propagate: u16,
-    /// 保護ノード自身へこの主体の**許可**が届いているか（`sid_effective_ace_mask`は
+    /// 保護ノード自身へこの宛先SIDの**許可**が届いているか（`sid_effective_ace_mask`は
     /// allow ACEだけを数えるので、拒否ACEはここに現れない）。
     guarded_allow_after_protect: Option<u32>,
     guarded_allow_after_propagate: Option<u32>,
@@ -490,7 +490,7 @@ struct CaseResult {
     inner_allow_after: Option<u32>,
     /// **対照**。保護していない兄弟の配下。ここが`None`なら伝播が走っていない。
     open_allow_after: Option<u32>,
-    /// この主体宛の**拒否**ACEの本数（ケース5の生存確認）。
+    /// このSID宛の**拒否**ACEの本数（ケース5の生存確認）。
     deny_aces_after_protect: usize,
     deny_aces_after_propagate: usize,
     /// **保護直後のACE一覧そのもの。** 差分を作るためだけに集めて捨てていたが、
@@ -896,7 +896,7 @@ unsafe fn aclapi_strip_and_protect(path: &Path, sid: PSID) -> windows::core::Res
 /// 戻り値は**書いたか**。`false`が「印を見て飛ばした」で、そこが測る当のものである。
 ///
 /// **製品の条件との差**: 本物の狭めたスキップは「剥がすACEが1本も無く**かつ**印がある」で
-/// 判定する。このプローブの主体は`guarded`にACEを1本も持たないので前半は常に真になり、
+/// 判定する。このプローブの宛先SIDは`guarded`にACEを1本も持たないので前半は常に真になり、
 /// **ここでは印の有無だけが効く**。両者は等価だが、製品へ入れるときは前半も落とさないこと。
 ///
 /// # 安全性
@@ -1113,20 +1113,20 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
 
     // ケースごとに別のSIDにして、ケース間の干渉を断つ（台帳は経由しない純粋導出）。
     //
-    // **深さ2のケースは主体を2つ使う。** 製品では、中間（workspace root）へカーネル口で
+    // **深さ2のケースは宛先SIDを2つ使う。** 製品では、中間（workspace root）へカーネル口で
     // 書かれているのは**workspaceのcapability SID**で、祖先から配るのは
-    // **`--fs-allow`のcapability SID**という**別の主体**である。1つのSIDで両方をやると、
-    // 「同じ主体のACEが既に在ると配布が既存の子孫へ届かない」という既知の性質
+    // **`--fs-allow`のcapability SID**という**別の宛先SID**である。1つのSIDで両方をやると、
+    // 「同じ宛先SIDのACEが既に在ると配布が既存の子孫へ届かない」という既知の性質
     // （[`super::super::acl_dacl_write`]のモジュールdocの実測表）を自分で踏みに行くことになり、
     // 測りたいものと違うものを測る。**最初にそう書いて対照が落ちた。**
     let sid = capability_sid_from_name(&format!("harnessBug145Probe{index}"))
         .expect("derive a probe capability SID");
-    // 中間へ先に書かれている主体（深さ2のケースだけ）。深さ1では`sid`がその役も兼ねる。
+    // 中間へ先に書かれている宛先SID（深さ2のケースだけ）。深さ1では`sid`がその役も兼ねる。
     let holder_sid = case.propagates_from_ancestor().then(|| {
         capability_sid_from_name(&format!("harnessBug145Holder{index}"))
             .expect("derive the holder capability SID")
     });
-    // 保護と高速付与の相手。深さ2では中間側の主体、深さ1では`sid`。
+    // 保護と高速付与の相手。深さ2では中間側の宛先SID、深さ1では`sid`。
     let holder_subject = holder_sid.as_ref().unwrap_or(&sid);
     let sid_text = crate::win_common::sid_to_string(sid.as_psid())
         .expect("render the probe SID as a string");
@@ -1172,8 +1172,8 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
         super::test_support::dacl_size_info(&guarded).expect("read the ACL header before protect");
 
     if case.uses_production_protect() {
-        // **保護の相手は中間側の主体である。** 製品でも`.harness`が守られているのは
-        // workspaceのcapability SIDに対してであって、`--fs-allow`の主体に対してではない。
+        // **保護の相手は中間側の宛先SIDである。** 製品でも`.harness`が守られているのは
+        // workspaceのcapability SIDに対してであって、`--fs-allow`の宛先SIDに対してではない。
         match remove_sid_aces_and_protect(&guarded, holder_subject.as_psid()) {
             Ok(super::ProtectOutcome::Wrote) => {}
             // [BUG-145] **飛ばした**。製品はこれを`.harness/`の2回目以降で通る。
@@ -1224,7 +1224,7 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
             Case::MarkedProtectThenSkip => unsafe {
                 aclapi_strip_and_protect(&guarded, holder_subject.as_psid())
             },
-            // **主体を渡さない口である。** このプローブの主体は`guarded`にACEを持たないので
+            // **宛先SIDを渡さない口である。** このプローブの宛先SIDは`guarded`にACEを持たないので
             // 剥がすものが無く、製品の形との差は「どの口で保護を書いたか」だけになる。
             Case::AclapiProtect => super::test_support::protect_dacl_preserve_inherited(&guarded),
             Case::AclapiStripAndProtect => unsafe {
@@ -1673,7 +1673,7 @@ fn control_dir_protect_skip_cost_probe() {
     let mut arms = Vec::new();
     for (place_label, base) in &bases {
         for (index, (files, k, depth)) in SIZES.iter().enumerate() {
-            // 主体は純粋導出。**腕ごとに別のSIDにして干渉を断つ。**
+            // 宛先SIDは純粋導出。**腕ごとに別のSIDにして干渉を断つ。**
             let sid = capability_sid_from_name(&format!(
                 "harnessBug145SkipCost{place_label}{index}{}",
                 std::process::id()

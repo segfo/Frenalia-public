@@ -224,7 +224,7 @@ fn appcontainer_child_cannot_reach_uac_elevation_broker() {
 
     let env = crate::secret_env::build_child_env();
     let args = ["--try-runas", &helper_path.to_string_lossy()];
-    // D-54: `preflight`が付けたworkspace ACEの主体はcapability SIDなので、本番と同じく
+    // D-54: `preflight`が付けたworkspace ACEの宛先SIDはcapability SIDなので、本番と同じく
     // それを積んで起こす（`spawn_in_workspace`のdoc）。素の`spawn`だとworkspaceが見えず、
     // プローブがcwdを設定できずに落ちる。
     let child = spawn_in_workspace(
@@ -343,7 +343,7 @@ fn fs_passthrough_ro_then_rw_then_revoke_cycle() {
         scope: GrantScope::Recursive,
     };
     // D-54: このテストはworkspaceへpackage SID宛のACEを直接付けているので、workspace
-    // capability（本番`preflight`が使う主体）は不要。`None`で本番と同じ経路を通す。
+    // capability（本番`preflight`が使う宛先SID）は不要。`None`で本番と同じ経路を通す。
     let ro_diagnosis = probe_passthrough(
         sid.as_psid(),
         traverse_sid.as_psid(),
@@ -527,7 +527,7 @@ fn grant_traverse_chain_orders_ancestors_shallow_to_deep() {
 /// `subst`のルートはテスト所有のディレクトリなので**所有者権限だけで`WRITE_DAC`が通り、
 /// 管理者権限も要らない**。
 ///
-/// 主体は本番と同じ**capability SID**（D-37）。台帳へは記録しないので、D-48のガード
+/// 宛先SIDは本番と同じ**capability SID**（D-37）。台帳へは記録しないので、D-48のガード
 /// （台帳に載ったノードのcapability SID ACEを`revoke_ace`から守る）は発火しない。
 #[test]
 #[ignore]
@@ -1064,7 +1064,7 @@ fn revoking_a_node_that_vanished_is_not_a_failure() {
 /// （tempdirのエントリが1件増える。`harness fs prune`が掃く）。
 ///
 /// SIDは**本番と同じ**workspace capability SID（`workspace_capability_sid`）を使う。これは
-/// 台帳へエントリを作る副作用も持っていて、完走マークはそのエントリへ立つ——付与の主体と
+/// 台帳へエントリを作る副作用も持っていて、完走マークはそのエントリへ立つ——付与の宛先SIDと
 /// 記録の置き場が対になっていることまで含めて本番の順序をなぞる。
 #[test]
 #[ignore]
@@ -1195,7 +1195,7 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
 /// 対で測る（B-35）——伝播**前**は名指しで見つけ、伝播**後**は見つけないこと。
 /// 片側だけだと、常に`Some`を返す実装（＝毎起動で伝播をやり直す）も緑になる。
 ///
-/// 台帳には触れない（主体は使い捨てのcapability名から導出する）ので、通常の
+/// 台帳には触れない（宛先SIDは使い捨てのcapability名から導出する）ので、通常の
 /// `cargo test`で走る常設の網である。
 ///
 /// # [残課題#32] **この網は「伝播が届くこと」の回帰には*なっていない***
@@ -1220,7 +1220,7 @@ fn the_background_job_finishes_the_descendant_fix_up_and_records_it() {
 fn a_file_that_predates_the_root_grant_is_reported_until_the_propagation_reaches_it() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
-    // このテスト専用の主体。実マシンの台帳にも他のツリーにも痕跡が無いので、
+    // このテスト専用の宛先SID。実マシンの台帳にも他のツリーにも痕跡が無いので、
     // 「付与前は届いていない」を前提にできる。
     let sid = capability_sid_from_name(&format!("harnessBug110Probe{}", std::process::id()))
         .expect("derive a throwaway capability SID");
@@ -1953,7 +1953,7 @@ fn the_walk_can_either_skip_vanished_nodes_or_abort_on_them() {
 ///
 /// 1. 初回は**全ノードのDACLを実際に書く**（`written == protected`）
 /// 2. 配布のあとも`SE_DACL_PROTECTED`が立っている
-/// 3. 配布のあとも主体から制御面へ**届かない**
+/// 3. 配布のあとも宛先SIDから制御面へ**届かない**
 /// 4. 2回目は**1件も書かない**（印を見て飛ばす）のに、1〜3が成り立ったまま
 #[test]
 fn protect_harness_control_dir_survives_a_propagating_write_from_the_parent() {
@@ -2266,7 +2266,7 @@ fn an_unregistered_sid_whose_ace_does_not_look_like_ours_is_reported_not_strippe
 }
 
 /// 台帳が「このパスへこのSIDで付けた」と記録していれば、マスクの形が違っても撤収できること
-/// （判定規則3）。プロファイルを作り直すたびに主体が変わるので、記録が最も強い証拠になる。
+/// （判定規則3）。プロファイルを作り直すたびに宛先SIDが変わるので、記録が最も強い証拠になる。
 #[test]
 fn a_sid_recorded_in_the_ledger_is_revoked_even_when_its_mask_is_unfamiliar() {
     use windows::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_TRAVERSE};
@@ -2303,7 +2303,7 @@ fn a_sid_recorded_in_the_ledger_is_revoked_even_when_its_mask_is_unfamiliar() {
 
 // --- [BUG-101] 欠陥①: 「付与したACEが台帳に載っているか」の自己検証 ---
 
-/// テスト専用の主体。**プロファイルは作らない**（`derive_profile_sid`は名前のハッシュから
+/// テスト専用の宛先SID。**プロファイルは作らない**（`derive_profile_sid`は名前のハッシュから
 /// SIDを導出するだけで副作用が無い）ので、実マシンにプロファイルも台帳エントリも残さない。
 /// 第17セッションの禁止事項「`begin_session()`をテストから呼ばない」に抵触しない。
 fn audit_probe_sid(tag: &str) -> OwnedContainerSid {
@@ -3068,7 +3068,7 @@ fn aces_for_one_sid_fold_by_inheritance_flags_and_the_folded_mask_is_a_union() {
 
 /// [§22.2.1] **名前の付いた扉が、宣言capability宛のACEを実際に剥がす。**
 ///
-/// `--fs-allow`の主体はpackage SID（`S-1-15-2-`）から宣言ごとのcapability SID（`S-1-15-3-`）へ
+/// `--fs-allow`の宛先SIDはpackage SID（`S-1-15-2-`）から宣言ごとのcapability SID（`S-1-15-3-`）へ
 /// 移った。撤収の分類器は前者しか列挙しないので、**この扉が無ければ剥がす経路が1本も無い**
 /// ——「開くが二度と閉じられない許可」がそのまま残る。
 ///
@@ -3121,7 +3121,7 @@ fn the_named_door_strips_a_declaration_capability_ace() {
 
 /// **絞り込みの禁止側と許可側を対で固定する**（`B-35`）。
 ///
-/// 同じパスを2つのworkspaceが宣言すると、主体は**別のSIDが2本**になる（秘密がworkspaceごと
+/// 同じパスを2つのworkspaceが宣言すると、宛先SIDは**別のSIDが2本**になる（秘密がworkspaceごと
 /// だから）。暗黙の撤収経路（起動時の自動整合）は必ず自分のworkspaceで絞る——絞らないと
 /// 他人が使っているACEを純減させる（[BUG-046](../../../../docs/bugs/BUG-046.md)と同型）。
 /// 逆に、パスを名指しした明示操作（`harness fs revoke <path>`）は絞らない側が正しい。
@@ -3152,7 +3152,7 @@ fn scoping_the_named_door_to_one_workspace_leaves_the_other_workspaces_subject_a
             .expect("grant both declaration ACEs");
     }
 
-    // 禁止側: ws-aで絞ったのだから、ws-bの主体には触らない。
+    // 禁止側: ws-aで絞ったのだから、ws-bの宛先SIDには触らない。
     let scoped = revoke_declaration_capabilities(&target, Some(&ws_a), &|_, _| {})
         .expect("scoped revoke");
     assert_eq!(scoped.targeted.len(), 1, "scoped revoke targets one subject: {scoped:?}");
@@ -3186,9 +3186,9 @@ fn scoping_the_named_door_to_one_workspace_leaves_the_other_workspaces_subject_a
 
 /// **走っているワークスペースからは奪わない**（分類器側の規則1と同じ判断を、宣言capabilityにも）。
 ///
-/// 主体は**ワークスペース単位で共有される**ので、同じパスを2つのワークスペースが宣言すると
-/// 主体は2本になる。そのうち片方でharnessが走っている状態で、パスを名指しした撤収
-/// （`workspace = None`）が走っても、**走っている側の主体は剥がしてはいけない**——剥がすと
+/// 宛先SIDは**ワークスペース単位で共有される**ので、同じパスを2つのワークスペースが宣言すると
+/// 宛先SIDは2本になる。そのうち片方でharnessが走っている状態で、パスを名指しした撤収
+/// （`workspace = None`）が走っても、**走っている側の宛先SIDは剥がしてはいけない**——剥がすと
 /// その瞬間にアクセスが落ちる（[BUG-046](../../../../docs/bugs/BUG-046.md)の形）。
 ///
 /// 許可側と禁止側を対で置く（`B-35`）: 走っていない側は剥がれる／走っている側は残り、
@@ -3224,12 +3224,12 @@ fn the_named_door_refuses_to_take_access_from_a_live_workspace() {
     let report = revoke_declaration_capabilities(&target, None, &|_, _| {})
         .expect("the named door must not fail here");
 
-    // 許可側: 走っていないワークスペースの主体は消える。
+    // 許可側: 走っていないワークスペースの宛先SIDは消える。
     assert!(
         matches!(sid_ace_mask(&target, cap_idle.as_psid()), Ok(None)),
         "the idle workspace's subject must be stripped: {report:?}"
     );
-    // 禁止側: 走っているワークスペースの主体は残る。
+    // 禁止側: 走っているワークスペースの宛先SIDは残る。
     assert!(
         matches!(sid_ace_mask(&target, cap_live.as_psid()), Ok(Some(_))),
         "the live workspace's subject must survive: {report:?}"
@@ -3280,7 +3280,7 @@ fn the_named_door_refuses_to_take_access_from_a_live_workspace() {
 /// - **陰性対照**: 一度も渡していない第3のSIDは、どのノードにも現れない
 ///   （「全員に配ってしまった」実装でも緑にならないようにする）。
 /// - **撤収側**: 2本とも消える。片方だけ消えると、残った側は台帳を消した瞬間に
-///   主体を導出できなくなり**どのコマンドでも剥がせないACE**になる（`B-01`／BUG-101）。
+///   宛先SIDを導出できなくなり**どのコマンドでも剥がせないACE**になる（`B-01`／BUG-101）。
 ///
 /// # このテストが測っていないもの（限界）
 ///
@@ -3304,7 +3304,7 @@ fn both_workspace_aces_land_in_one_write_and_both_come_off_again() {
     let leaf = nested.join("f.txt");
     std::fs::write(&leaf, b"hi").expect("seed file");
 
-    // 本番と同じ「(パス, モード)ごとに別主体」を、台帳を経由せず名前だけで作る。
+    // 本番と同じ「(パス, モード)ごとに別の宛先SID」を、台帳を経由せず名前だけで作る。
     let rwx_sid =
         capability_sid_from_name("harnessD83TestCapSidRwx").expect("derive the rwx capability SID");
     let ro_sid =

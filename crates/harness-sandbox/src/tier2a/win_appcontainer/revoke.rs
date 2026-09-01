@@ -51,7 +51,7 @@ pub(crate) const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 10;
 /// 「読めなかった」が「撤収できない」に化ける形なので、読み取りを`GetAce`の直接列挙へ寄せる。
 ///
 /// 扱うのは`Mask`/`SidStart`の配置が共通な4種別（allow/deny/条件付きallow/条件付きdeny）だけで、
-/// object ACE（ディレクトリサービス用。ファイルオブジェクトには現れない）は**主体を特定できない
+/// object ACE（ディレクトリサービス用。ファイルオブジェクトには現れない）は**宛先SIDを特定できない
 /// ので飛ばす**——[`copy_dacl_excluding_sids`]が未知種別を保持するのと同じ判断である。
 ///
 /// `visit`には`(SID, ACE種別, ACEフラグ, マスク)`を渡す。継承ACEを渡さないのは
@@ -211,7 +211,7 @@ pub(crate) fn sid_explicit_ace(
 ///
 /// **「0件でも省略するな」という規則は、ANDで条件を足すと見かけ上は守れてしまう。**
 /// 省略してよいのは、**読み取れる状態が目的そのものを言い切っているとき**だけである
-/// （例: 「この主体に十分なACEがある」は読めば分かる。「配布に耐える保護がある」は
+/// （例: 「このSIDに十分なACEがある」は読めば分かる。「配布に耐える保護がある」は
 /// `SE_DACL_PROTECTED`だけでは分からない）。`B-34`・`B-38`。
 unsafe fn copy_dacl_excluding_sids(
     dacl: *const ACL,
@@ -615,7 +615,7 @@ fn remove_sid_aces_and_protect(
 /// 継承を切るのは、workspace rootに載せた継承ACEがここへ降りてくるのを止めるためである。
 ///
 /// **`sids`が複数なのはD-54の帰結**である。workspaceツリーのACEはworkspace＋モード単位の
-/// capability SID宛になったので、`.harness/`へ降りてくる主体もそれになる。一方、過去の
+/// capability SID宛になったので、`.harness/`へ降りてくる宛先SIDもそれになる。一方、過去の
 /// セッションがpackage SID宛に付けたACEも実マシンには残り得る（D-37時代の残骸）。**どちらか
 /// 一方だけを剥がすと、剥がし残した側から制御面が書ける**ので、両方を渡して剥がす。
 /// **戻り値は実際に保護した状態にできたノード数**（[BUG-084](../../../../docs/bugs/BUG-084.md)）。
@@ -627,7 +627,7 @@ pub(crate) fn protect_harness_control_dir_from_appcontainer(
     sids: &[PSID],
 ) -> Result<ControlDirProtection, AppContainerError> {
     let harness_dir = workspace_root.join(".harness");
-    // 剥がす主体が空なら保護は1件も掛からない。「全ノード保護済み」と数えないための番兵
+    // 剥がす宛先SIDが空なら保護は1件も掛からない。「全ノード保護済み」と数えないための番兵
     // （呼び出し側は常に1つ以上渡すが、件数を返す関数が嘘をつく余地は残さない）。
     if sids.is_empty() || !harness_dir.exists() {
         return Ok(ControlDirProtection::default());
@@ -909,7 +909,7 @@ pub fn revoke_session_grant(
 
 /// [§22.3.2] 記録された**capability名**宛のACEを1件撤収する（`session_profile`の回収経路が注入する処理）。
 ///
-/// [`revoke_session_grant`]と対になる関数で、違いは**主体の導出だけ**である。
+/// [`revoke_session_grant`]と対になる関数で、違いは**宛先SIDの導出だけ**である。
 ///
 /// | | 名前 | 導出 |
 /// |---|---|---|
@@ -956,7 +956,7 @@ pub fn revoke_capability_grant(
 // `revoke_stale_appcontainer_aces`（残す側を名指しして他を剥がす）は`revoke_subjects`へ移した。
 // 「どのSIDを剥がすか」を決める責務であって「どう剥がすか」ではないため（規則3の分割線）。
 
-/// 祖先traverseの主体（`traverse_capability_sid`）のバイト列を1回だけ導出してキャッシュする。
+/// 祖先traverseの宛先SID（`traverse_capability_sid`）のバイト列を1回だけ導出してキャッシュする。
 ///
 /// `revoke_ace`はツリー全ノードで通る経路なので、ここで`DeriveCapabilitySidsFromName`を
 /// 毎回叩くわけにはいかない。導出に失敗した場合（あり得ないが）は`None`を持ち、ガードを
@@ -1032,9 +1032,9 @@ pub(crate) fn revoke_ace_unguarded(path: &Path, sid: PSID) -> Result<(), AppCont
 /// [`revoke_ace_unguarded`]のdoc参照）。
 ///
 /// [残課題#32] **付与側（[`super::acl_dacl_write::propagate_merged_dacl`]）もここを使う。**
-/// 伝播する書込は「その主体のACEが既にそのノードに在る」と既存の子孫へ届かないので、
-/// 書く直前に同じ主体を外す必要がある。撤収のための関数を付与側が呼ぶのは一見ちぐはぐだが、
-/// **同じ「1ノードから指定主体のACEを外す」操作を2つ実装しない**ためである
+/// 伝播する書込は「その宛先SIDのACEが既にそのノードに在る」と既存の子孫へ届かないので、
+/// 書く直前に同じ宛先SIDを外す必要がある。撤収のための関数を付与側が呼ぶのは一見ちぐはぐだが、
+/// **同じ「1ノードから指定した宛先SIDのACEを外す」操作を2つ実装しない**ためである
 /// （`docs/CODE-STRUCTURE-RULES.md`規則5）。
 ///
 /// 戻り値は実際に書込を行ったか（＝1本以上のACEを剥がしたか）。0件なら`false`を返し、
@@ -1203,7 +1203,7 @@ pub fn revoke_ace_recursive(root: &Path, sid: PSID) -> Result<RevokeReport, AppC
 ///
 /// 台帳は[BUG-103](../../../../docs/bugs/BUG-103.md)(d)で**サンドボックスから書ける**ことが
 /// 実測されている。`scope: Object`を鵜呑みにすると、「台帳を書き換えて再帰ACEを撤収の対象外に
-/// する」経路になる。D-61（撤収の主体は対象パスのDACLに実在するSIDから決める）とまったく
+/// する」経路になる。D-61（撤収する宛先SIDは対象パスのDACLに実在するSIDから決める）とまったく
 /// 同じ原則を、**範囲の軸にも適用する**のがこの関数である。
 ///
 /// # 判定
@@ -1231,7 +1231,7 @@ fn descendants_need_walk(root: &Path, sids: &[PSID]) -> bool {
 ///
 /// [BUG-101] `harness fs revoke`は「撤収し得るプロファイル」をSIDへ導出して**1つずつ**
 /// [`revoke_ace_recursive`]を回していた（この開発機では最大24回のツリー全walk）。実際に
-/// 剥がすべき主体は「そのパスのDACLに載っているSID」なので、まとめて1回で済む——
+/// 剥がすべき宛先SIDは「そのパスのDACLに載っているSID」なので、まとめて1回で済む——
 /// ノードごとのDACL読取も1回になる（[`revoke_sids_from_node`]、BUG-082と同じ考え方）。
 ///
 /// D-48ガードは[`revoke_sids_from_node_guarded`]がノードごとに`sids`側から除いて掛ける。
@@ -1416,7 +1416,7 @@ fn fold_node(
 /// `revoke_capability_subjects`（`revoke_declarations.rs`）のdocは「walkはノード1件の失敗で
 /// `Err`になる」と書き、呼び出し元（`fs_revoke_one`）はその`Err`を**「昇格が要る」の合図**として
 /// 使っている。剥がせなかった子孫が[`RevokeReport::blocked`]へ回るようになったので、
-/// いま昇格へ回る条件は**rootに主体が残っているか**だけである。合図を戻すには
+/// いま昇格へ回る条件は**rootに宛先SIDが残っているか**だけである。合図を戻すには
 /// `DeclarationRevokeReport`へ`blocked`の欄を足して`is_clean`が見る必要があり、**未着手**。
 pub fn revoke_workspace_sids_recursive(
     root: &Path,
@@ -1473,8 +1473,8 @@ pub(crate) fn sid_ace_mask(path: &Path, sid: PSID) -> Result<Option<u32>, AppCon
 /// ——Deny ACEは「届いている」の根拠にならない。
 ///
 /// **[D-84] 製品はもうここを通らない**——両モードのcapability SID宛ACEを配るようになったので、
-/// 問いは常に「この複数の主体のうちどれが届いているか」になり、実装は
-/// [`sid_effective_ace_masks`]へ移った。単数版が残っているのは、1主体だけを測る
+/// 問いは常に「これら複数の宛先SIDのうちどれが届いているか」になり、実装は
+/// [`sid_effective_ace_masks`]へ移った。単数版が残っているのは、宛先SID 1本だけを測る
 /// 回帰テスト・コスト測定（`acl_dacl_write_tests`・`acl_baseline_cost_tests`等）が
 /// 読みやすいままであるためで、**判定規則は多本版と同一**（同じ関数を1本で呼ぶだけ）。
 #[cfg(test)]
@@ -1485,7 +1485,7 @@ pub(crate) fn sid_effective_ace_mask(
     Ok(sid_effective_ace_masks(path, &[sid])?[0])
 }
 
-/// [D-84] [`sid_effective_ace_mask`]の多主体版。**DACLの読取は1回**で、`sids`と同じ並び・
+/// [D-84] [`sid_effective_ace_mask`]の複数版。**DACLの読取は1回**で、`sids`と同じ並び・
 /// 同じ長さの結果を返す。
 ///
 /// これが要るのは、両モードのcapability SID宛ACEを配るようになって「このノードに届いているか」を

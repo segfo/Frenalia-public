@@ -621,7 +621,7 @@ pub fn volume_mount_point_of(path: &std::path::Path) -> Option<std::path::PathBu
 ///
 /// **2つを一度に採るのが要点である。** 「ACLを保持できるか」だけでは足りない——
 /// ネットワーク共有（SMB）はサーバ側がNTFSなら`FILE_PERSISTENT_ACLS`を**立てて返す**が、
-/// AppContainerのpackage SIDは**ローカルの主体**なので共有越しには意味を持たない。
+/// AppContainerのpackage SIDは**ローカルのSID**なので共有越しには意味を持たない。
 /// ACLの有無だけを見ると「張れる」と誤読する。
 ///
 /// 問い合わせ自体に失敗したら`None`。**`None`を「使える」と読まないこと**——

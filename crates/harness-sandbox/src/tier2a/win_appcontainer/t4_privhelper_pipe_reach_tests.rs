@@ -94,11 +94,11 @@ fn err_of(report: &Value, kind: &str) -> Option<u64> {
 /// 対で測る（B-35）——拒否側だけを見ると、機構が効いているのか的が居なかっただけなのかを
 /// 区別できない。素のユーザーのプロセスが同じ的へ接続できることまで確かめる。
 ///
-/// | 主体 | 何を撃つか | 期待 |
+/// | 撃つ側 | 何を撃つか | 期待 |
 /// |---|---|---|
 /// | A: 本番と同じcapabilityを積んだAppContainerの子 | 開く・相乗り作成・列挙・名前の先取り | 開けない |
 /// | B: workspace capabilityを持たない狭い子 | 開く | 開けない |
-/// | C1: 素のユーザー（対照） | 相乗り作成・列挙・名前の先取り | 主体Aとの差が出る |
+/// | C1: 素のユーザー（対照） | 相乗り作成・列挙・名前の先取り | Aとの差が出る |
 /// | C2: 素のユーザー（対照） | 開いて1往復 | 開けて、**本番の要求電文が読める** |
 ///
 /// **撃つ順序に意味がある。** このパイプは同時1本（`nMaxInstances=1`）なので、開いて閉じた
@@ -118,12 +118,12 @@ fn t4_privhelper_pipe_reach_from_a_sandboxed_child() {
 
     let traverse = traverse_capability_sid().expect("traverse capability");
     let workspace_cap = workspace_capability_for(workspace.path());
-    // 主体A: 本番の`spawn_with_workspace`が積むのと同じ組（traverse＋workspace）。
+    // A: 本番の`spawn_with_workspace`が積むのと同じ組（traverse＋workspace）。
     let mut production_caps: Vec<PSID> = vec![traverse.as_psid()];
     if let Some(cap) = &workspace_cap {
         production_caps.push(cap.as_psid());
     }
-    // 主体B: workspace capabilityを持たない狭いドメイン相当。
+    // B: workspace capabilityを持たない狭いドメイン相当。
     let narrow_caps: Vec<PSID> = vec![traverse.as_psid()];
 
     let probe = probe_exe();
@@ -178,7 +178,7 @@ fn t4_privhelper_pipe_reach_from_a_sandboxed_child() {
         let launcher = |pipe_name: &str| -> Result<(), String> {
             *observed_pipe_name.borrow_mut() = Some(pipe_name.to_string());
 
-            // 名前の先取り用の的。**まだ存在しない**harness形の名前を2つ作る（主体Aと対照で
+            // 名前の先取り用の的。**まだ存在しない**harness形の名前を2つ作る（Aと対照で
             // 別の名前を使う——同じ名前だと、先に取った側のせいで後の測定が変わる）。
             let squat_sandboxed = format!("{pipe_name}-t4-squat-sandboxed");
             let squat_control = format!("{pipe_name}-t4-squat-control");
@@ -188,9 +188,9 @@ fn t4_privhelper_pipe_reach_from_a_sandboxed_child() {
             let neutral_sandboxed = format!(r"\\.\pipe\t4-neutral-sandboxed-{}", std::process::id());
             let neutral_control = format!(r"\\.\pipe\t4-neutral-control-{}", std::process::id());
 
-            // --- 主体A: 本番と同じcapabilityのAppContainer子（開く・相乗り・列挙・先取り） ---
+            // --- A: 本番と同じcapabilityのAppContainer子（開く・相乗り・列挙・先取り） ---
             run_probe(
-                "主体A（本番形のAppContainer子）",
+                "A（本番形のAppContainer子）",
                 &[
                     "--reach-pipe",
                     pipe_name,
@@ -208,9 +208,9 @@ fn t4_privhelper_pipe_reach_from_a_sandboxed_child() {
                 false,
             );
 
-            // --- 主体B: workspace capabilityを持たない狭い子（開くだけ） ---
+            // --- B: workspace capabilityを持たない狭い子（開くだけ） ---
             run_probe(
-                "主体B（workspace capability無しのAppContainer子）",
+                "B（workspace capability無しのAppContainer子）",
                 &["--reach-pipe", pipe_name, "--timeout-secs", "60"],
                 &narrow_caps,
                 false,
@@ -340,7 +340,7 @@ fn t4_privhelper_pipe_reach_from_a_sandboxed_child() {
     // ただし「モードごと落ちていて何も撃っていない」は成功に見えてはいけない（B-10）。
     for (label, report, kinds) in [
         (
-            "主体A",
+            "A",
             sandboxed,
             &["pipe-create-instance", "pipe-enumerate", "pipe-create-new"][..],
         ),

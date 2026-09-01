@@ -144,7 +144,7 @@ pub fn is_recorded(path: &Path, ledger: &TraverseLedger) -> bool {
 }
 
 /// [`is_recorded`]の台帳読み込み版。ファイルI/Oを伴うため、呼び出し側は
-/// 「撤収しようとしている主体が本当にtraverse ACEの持ち主（capability SID）か」を
+/// 「撤収しようとしている宛先SIDが本当にtraverse ACEの持ち主（capability SID）か」を
 /// 先に判定してから呼ぶこと（`revoke_ace`が全ノードでこれを読むのを避けるため）。
 pub fn is_recorded_traverse_node(path: &Path) -> bool {
     is_recorded(path, &load_traverse_ledger())

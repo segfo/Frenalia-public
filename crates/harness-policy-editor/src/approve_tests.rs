@@ -291,7 +291,7 @@ fn the_grant_root_is_the_literal_prefix_before_any_wildcard() {
 }
 
 /// **workspace配下は付与対象にしない**（Tier2aのworkspace grantが既に覆っている）。
-/// ここを間違えると、26万ノードのツリーへ別主体のACEを重ねて撒くことになる。
+/// ここを間違えると、26万ノードのツリーへ別の宛先SIDのACEを重ねて撒くことになる。
 #[test]
 fn paths_inside_the_workspace_are_not_granted_again() {
     let ws = Path::new(r"C:\ws");

@@ -15,7 +15,7 @@
 //! 6. **1プロセスで2回走らせると、2回目はdaemonを再利用する**（D-56）——かつ
 //!    **再利用したdaemonでも強制は本物のまま**（生ソケットは落ちる）。
 //!    「2回目が速かったのは強制が消えたからではない」ことを区別する対（B-35）
-//! 7. **承認したFS宣言が実DACLへ届き、その主体がcapability SIDである**（残課題#20の
+//! 7. **承認したFS宣言が実DACLへ届き、その宛先SIDがcapability SIDである**（残課題#20の
 //!    移行の不変条件＝package SID宛が0本）。**取り消したあとに何が残るか**も同じ実行で測る
 //!    ——[`an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_runs`]
 //!
@@ -177,7 +177,7 @@ fn acl_sddl(path: &Path) -> String {
 
 /// SDDLの中に現れる、指定した接頭辞を持つSIDの件数。
 ///
-/// `S-1-15-3-`＝capability SID（宣言ごとの主体、残課題#20の移行先）、
+/// `S-1-15-3-`＝capability SID（宣言ごとの宛先SID、残課題#20の移行先）、
 /// `S-1-15-2-`＝AppContainerのpackage SID（移行元。**移行後は0本でなければならない**）。
 fn count_sid_prefix(sddl: &str, prefix: &str) -> usize {
     sddl.match_indices(prefix).count()
@@ -607,7 +607,7 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
           and doing it has to actually work): {second_stdout}\n{second_stderr}"
     );
 
-    // --- 付与後の実DACL: 主体は移ったか（残課題#20の受け入れ条件） --------------------
+    // --- 付与後の実DACL: 宛先SIDは移ったか（残課題#20の受け入れ条件） --------------------
     let after_grant = acl_sddl(&probe);
     eprintln!("--- SDDL after grant ---\n{after_grant}");
     assert!(
@@ -674,7 +674,7 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
         "the declaration was withdrawn, so no declaration capability ACE may remain. \
          If this is 1, the revoke ran against an empty index again (BUG-142): {after_unapprove}"
     );
-    // package SID宛は、宣言を外した後も0本のままでなければならない（撤収が主体を
+    // package SID宛は、宣言を外した後も0本のままでなければならない（撤収が宛先SIDを
     // **取り違えて**古い形で付け直していないこと）。
     assert_eq!(
         count_sid_prefix(&after_unapprove, "S-1-15-2-"),

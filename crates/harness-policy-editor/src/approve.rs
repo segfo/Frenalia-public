@@ -248,7 +248,7 @@ fn classify(proposal: &RuleProposal, workspace_root: &Path) -> PathClass {
 
 /// 承認済みの値を、**実際にACEを付けるルート**（ワイルドカードを含まないディレクトリ）へ
 /// 落とす。workspace配下なら`None`——Tier2aのworkspace grantが既に覆っているので、
-/// 同じツリーへ別主体のACEを重ねる意味が無い。
+/// 同じツリーへ別の宛先SIDのACEを重ねる意味が無い。
 ///
 /// 判定は[`classify`]と同じ規則を通す（片方だけ直る事故を避ける）。`C:/Users/x/.cargo/**`
 /// なら`C:/Users/x/.cargo`が返る。末尾の要素にワイルドカードが混じっている場合
@@ -294,7 +294,7 @@ pub fn grant_root(value: &str, workspace_root: &Path) -> Option<std::path::PathB
 /// 食い違う（B-05: 型で守られない同じ規則を2箇所に持たない）。
 ///
 /// workspace配下は含めない——Tier2aのworkspace grantが既に覆っているので、同じツリーへ
-/// 別主体のACEを重ねる意味が無い。
+/// 別の宛先SIDのACEを重ねる意味が無い。
 ///
 /// # 同じルートに複数のaccessが宣言されていたら「和」を取る
 ///

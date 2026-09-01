@@ -242,7 +242,7 @@ pub(crate) fn fs_revoke_traverse_one(path: &Path) -> ExitCode {
 
 #[cfg(windows)]
 pub(crate) fn fs_revoke_traverse_one_direct(path: &Path) -> ExitCode {
-    // D-48: 撤収と撤収済み検証は`revoke_traverse_grant`が一体で行う（主体のcapability SIDは
+    // D-48: 撤収と撤収済み検証は`revoke_traverse_grant`が一体で行う（宛先のcapability SIDは
     // 関数内で導出されるので、ここでSIDを取り違えようがない）。台帳エントリの除去だけが
     // 呼び出し側の責務として残る。
     match harness_sandbox::tier2a::win_appcontainer::revoke_traverse_grant(path) {
