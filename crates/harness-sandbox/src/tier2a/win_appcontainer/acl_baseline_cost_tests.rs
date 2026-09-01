@@ -19,9 +19,23 @@
 //! だけで決まる**。実装しながら「いま書いた形はどちらか」を測り直せる状態にしておく。
 //!
 //! **したがって消す条件は日付ではなく出来事である**——`docs/STATUS.md`残課題#20 が
-//! 実装完了になったら、`acl_ace_count_cost_*` の2本と、それだけが使っている
+//! 実装完了になったら、次の3本と、それだけが使っている
 //! `test_support::build_chain_tree`をまとめて消すこと。**引き継ぎ側にも同じことを書いてある**
 //! （`plans/HANDOFF-ISSUE-20-SUBJECT-MIGRATION.md`）。
+//!
+//! - [`acl_ace_count_cost_of_folding_m_subjects_into_one_write`]（M3-a）
+//! - [`acl_ace_count_cost_of_tree_depth`]（M3-c）
+//! - [`acl_ace_count_cost_of_the_post_n1_declaration_and_diff_layer_paths`]（#20の測定5・6）
+//!
+//! **3本目だけが使っている部品も一緒に消す**——[`measure_declaration_ledger_append`]・
+//! [`remove_readonly_file`]・[`WriteShape::PerDeclaration`]・[`WriteShape::DiffLayerRw`]・
+//! [`fs_access_for_mask`]。[`WriteShape::product_revoke`]と[`RevokeVia`]は
+//! [`measure_arm`]が全形で通るので**残す**（残す側と消す側が混ざっているので、
+//! 「新テストが使っているもの」で機械的に切らないこと）。
+//!
+//! **接頭辞`acl_ace_count_cost_*`を共有していても寿命が違うものがある。**
+//! `..._splitting_...`の3本はBUG-145の案Aの採否が決まったら消す側で、#20とは無関係である
+//! （各テストのdocが自分の消す条件を持つ）。**接頭辞だけを見て消さないこと。**
 //!
 //! **同じファイルに置いてあるのは、ツリーの形と計器を共有するためである。**
 //! `FANOUT`・`file_count()`・`measure_capability`・`progress_to_stderr`・`revoke_and_verify`が
@@ -565,6 +579,99 @@ enum WriteShape {
     /// root直下へ作られる新しいファイルが継承ACEを受け取れない——製品の`preflight`が
     /// `grant_workspace_root_aces_fast`で置いているのと同じものである。
     SplitPerTopLevelChild,
+    /// [#20の測定5] **製品の`--fs-allow`宣言の付与経路そのもの**。宛先SIDごとに
+    /// [`super::grant_ace_scoped`]を`GrantScope::Recursive`で1回呼ぶ。
+    ///
+    /// # [`WriteShape::OnePerSubject`]と混同しないこと（**含むものが違う**）
+    ///
+    /// あちらは部品（`grant_aces_propagating`）を宛先SIDの数だけ呼ぶ形で、**伝播書込しか
+    /// 含まない**。こちらが呼ぶ`grant_ace_scoped`は`grant_ace_inheritable_access`へ落ち、
+    /// **1回ごとに「伝播書込1回＋救済walk1周」**が入る。したがって時間の絶対値を
+    /// 上の2つの形と並べてはいけない——読むのはこの形の中の比だけである。
+    ///
+    /// # なぜこの形が#20の問いなのか
+    ///
+    /// N1（`plans/handoff/issue20-remaining/N1.md`）以降、`--fs-allow`の宛先SIDは
+    /// **宣言ごと**（パス×アクセス級）に分かれる。同じツリーへ宣言がM本載ると、
+    /// `preflight`のループはこの形でM回まわる。§S15が「まとめれば無料」と出したのは
+    /// `grant_aces_propagating`にM本渡した場合の話で、**この経路はそもそもまとめていない**。
+    PerDeclaration,
+    /// [#20の測定6] **製品のCoW差分層の付与経路そのもの**
+    /// （[`super::grant_ace_inheritable_rw`]、`preflight.rs`のCoW分岐が呼ぶ当の関数）。
+    ///
+    /// **差分層の宛先SIDは1本しかない**（`cow_diff_layer_capability_sid`が
+    /// workspace root と差分層のパスから1つ導出する）ので、この形はM=1でしか使わない。
+    /// マスクは`workspace_rwx_mask()`固定で、これは`m_subjects`の1本目と同じ値である。
+    DiffLayerRw,
+}
+
+/// [`measure_arm`]が撤収に通す関数。**付与だけを製品へ合わせても足りない**ので、形ごとに選ぶ。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RevokeVia {
+    /// [`super::revoke_workspace_sids_recursive`]——**複数の宛先SIDを1周のwalkへ畳む**版。
+    WorkspaceSidsRecursive,
+    /// [`super::revoke_ace_recursive`]——**単一SID**版。
+    AceRecursive,
+}
+
+impl WriteShape {
+    /// **その形で付けたACEを、製品はどの関数で剥がすか。**
+    ///
+    /// # なぜ撤収も形ごとに分けるのか
+    ///
+    /// 測定6の問いは「差分層への付与**・撤収**の費用」なので、撤収の数字は答えの半分そのもので
+    /// ある。ここを全形で同じ関数に固定すると、**別の関数の値を製品の値として正本へ書く**ことに
+    /// なる——§S15自身が「§S10-1は`grant_workspace_root_rw`で測っており別経路なので
+    /// M=1も測り直した」と書いており、[`WriteShape::PerDeclaration`]を足した根拠がその規律で
+    /// ある。付与側だけその規律に従って撤収側で緩めると、根拠が自分と矛盾する。
+    ///
+    /// | 形 | 製品の撤収経路 | 通る関数 |
+    /// |---|---|---|
+    /// | [`WriteShape::DiffLayerRw`] | セッション終了（`end_session` → `session_profile::revoke_capability_grant` → `revoke::revoke_capability_grant`） | [`super::revoke_ace_recursive`]（単一SID） |
+    /// | それ以外 | 宣言の撤収（`harness fs revoke <path>` → `revoke_declarations::revoke_capability_subjects`） | [`super::revoke_workspace_sids_recursive`]（複数SIDを1周へ畳む） |
+    ///
+    /// **2つの関数の中身は今は近い**（どちらも`revoke_tree`＝D-63の要否判定・`OnVanished::Skip`・
+    /// ノード単位の失敗を`blocked`へ集めて続行、を共有する）。それでも分けるのは、
+    /// **近いことは同じことではない**からである——単一SID版はノードごとに1つのSIDだけを見て
+    /// 書き戻し、複数SID版はD-48ガードで宛先SIDを絞ってから書き戻す。近さは実測の対象であって、
+    /// 測る前提にしてよいものではない。
+    fn product_revoke(self) -> RevokeVia {
+        match self {
+            Self::DiffLayerRw => RevokeVia::AceRecursive,
+            Self::Merged
+            | Self::OnePerSubject
+            | Self::SplitPerTopLevelChild
+            | Self::PerDeclaration => RevokeVia::WorkspaceSidsRecursive,
+        }
+    }
+
+    fn revoke_label(self) -> &'static str {
+        match self.product_revoke() {
+            RevokeVia::WorkspaceSidsRecursive => "revoke_workspace_sids_recursive",
+            RevokeVia::AceRecursive => "revoke_ace_recursive",
+        }
+    }
+}
+
+/// マスクから[`FsAccess`]を引き直す。[`WriteShape::PerDeclaration`]が
+/// `grant_ace_scoped`へ渡す級を、`m_subjects`が配ったマスクから決めるために要る。
+///
+/// **手書きの対応表を作らない**（`B-05`: 複製した綴りは静かにずれる）。`FsAccess::ALL`を
+/// 走査して、**ちょうど1つ**一致することまで見る——2つ一致するなら片方を黙って選ぶことになり、
+/// 「宣言した級と違うACEを書いたのに、下の検算はその違う級を読み返して緑になる」形が作れてしまう。
+fn fs_access_for_mask(mask: u32) -> FsAccess {
+    let matches: Vec<FsAccess> = FsAccess::ALL
+        .into_iter()
+        .filter(|access| fs_access_mask(*access) == mask)
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "exactly one FsAccess must map to mask {mask:#x}, found {matches:?}; the mask table in \
+         `m_subjects` and the product's declaration path have drifted apart, so this arm would \
+         write a different ACE than the one the checks below read back"
+    );
+    matches[0]
 }
 
 /// M本ぶんの宛先SIDを作る。**マスクを宛先SIDごとに変えてあるのが要点**——全部同じにすると、
@@ -597,6 +704,29 @@ fn m_subjects(label: &str, m: usize) -> Vec<(crate::win_common::OwnedSid, u32)> 
 ///
 /// `leaf_dir`/`leaf_file`は**そのツリーで最も深い**ものを渡すこと——浅いところだけ届いて
 /// 深いところが落ちる形を拾うため（深い腕でこれを外すと測定の意味が消える）。
+///
+/// # 製品経路の形では、検算2の歯が抜ける（**限界。ここを黙って使わない**）
+///
+/// [`WriteShape::PerDeclaration`]と[`WriteShape::DiffLayerRw`]が呼ぶ製品の関数は、
+/// **その中で救済walkを1周済ませてしまう**（`grant_ace_inheritable_access`／
+/// `grant_ace_inheritable_rw`の後半）。したがって検算2の`granted == 0`は**必ず成立し**、
+/// 「伝播が届いたから0」なのか「中のwalkが1件ずつ書いて回ったから0」なのかを区別しない。
+///
+/// **この2つの形で歯を持つのは検算1と検算3である**——最深部の葉が宛先SIDごとに
+/// 正しいマスクを持つこと（届かなければ`None`で落ちる）と、撤収後に1本も残らないこと。
+/// 検算2は「全ノードを歩いた」（`checked == nodes`）の側だけが効く。
+///
+/// # 撤収は形ごとに製品の関数が違う
+///
+/// どの関数を通したかは[`WriteShape::product_revoke`]が決め、腕のJSONの`revoke_via`欄に
+/// **その回に実際に通した関数名**が入る。**読む側は必ずこの欄を見ること**——`revoke_ms`だけを
+/// 見て「差分層の撤収の費用」と読むと、形によっては別経路の値を読むことになる。
+///
+/// # 時間は ms と µs の両方を出す（**どちらを読むかは規模で変わる**）
+///
+/// `propagate_ms`は§S9・§S10・§S15の記録と並べるために残してあるが、**整数のミリ秒なので
+/// 数十msの腕では丸めだけで数%動く**。ほぼ空のツリー（数百ノード）を含む測定は
+/// `propagate_us`／`revoke_us`の側で比を作ること。`propagate_us_per_node`も µs から作る。
 fn measure_arm(
     label: &str,
     root: &Path,
@@ -665,8 +795,45 @@ fn measure_arm(
                  meaningless"
             );
         }
+        WriteShape::PerDeclaration => {
+            // 製品の`preflight`が`--fs-allow`の宣言1件ごとに通るのと同じ呼び出しである
+            // （`preflight.rs`の`grant_ace_scoped(&fp.path, entry_cap.as_psid(), fp.access,
+            // fp.scope)`）。**級はマスクから引き直す**——`m_subjects`が配ったマスクと
+            // 違う級で書くと、下の検算1が読み返すマスクとずれる。
+            for (i, (sid, mask)) in subjects.iter().enumerate() {
+                grant_ace_scoped(
+                    root,
+                    sid.as_psid(),
+                    fs_access_for_mask(*mask),
+                    GrantScope::Recursive,
+                )
+                .unwrap_or_else(|e| panic!("{label}: declaration grant #{i}: {e}"));
+            }
+        }
+        WriteShape::DiffLayerRw => {
+            // 製品の`preflight`のCoW分岐が通るのと同じ呼び出しである
+            // （`preflight.rs`の`grant_ace_inheritable_rw(diff_layer_dir, diff_layer_cap)`）。
+            assert_eq!(
+                subjects.len(),
+                1,
+                "{label}: the diff layer has exactly one subject SID \
+                 (`cow_diff_layer_capability_sid` derives one from the workspace root and the \
+                 diff-layer path), so measuring this shape with {} would not be the product",
+                subjects.len()
+            );
+            let (sid, mask) = &subjects[0];
+            assert_eq!(
+                *mask,
+                workspace_rwx_mask(),
+                "{label}: `grant_ace_inheritable_rw` writes `workspace_rwx_mask()` and nothing \
+                 else, so the subject must carry that mask or check #1 below would read back a \
+                 mask this arm never asked for"
+            );
+            grant_ace_inheritable_rw(root, sid.as_psid())
+                .unwrap_or_else(|e| panic!("{label}: diff-layer grant: {e}"));
+        }
     }
-    let propagate_ms = started.elapsed().as_millis();
+    let propagate_elapsed = started.elapsed();
 
     // --- 検算1: 最深部の葉が、宛先SIDごとに違う正しいマスクを持っているか ---
     for (i, (sid, mask)) in subjects.iter().enumerate() {
@@ -705,14 +872,29 @@ fn measure_arm(
             report.granted, report.checked
         );
     }
-    let verify_walk_ms = walk_started.elapsed().as_millis();
+    let verify_walk_elapsed = walk_started.elapsed();
 
-    // --- 撤収（M本を1回のwalkで剥がす既存部品。SIDごとに舐め直さない） ---
+    // --- 撤収（**その形で製品が通る関数**を通す。[`WriteShape::product_revoke`]） ---
     let psids: Vec<PSID> = subjects.iter().map(|(sid, _)| sid.as_psid()).collect();
     let revoke_started = Instant::now();
-    let revoke_report = revoke_workspace_sids_recursive(root, &psids, &progress_to_stderr("revoke"))
-        .unwrap_or_else(|e| panic!("{label}: revoke every measurement subject: {e}"));
-    let revoke_ms = revoke_started.elapsed().as_millis();
+    let revoke_report = match shape.product_revoke() {
+        RevokeVia::WorkspaceSidsRecursive => {
+            revoke_workspace_sids_recursive(root, &psids, &progress_to_stderr("revoke"))
+                .unwrap_or_else(|e| panic!("{label}: revoke every measurement subject: {e}"))
+        }
+        RevokeVia::AceRecursive => {
+            assert_eq!(
+                psids.len(),
+                1,
+                "{label}: `revoke_ace_recursive` is the single-SID revoke (the session-end path), \
+                 so an arm with {} subjects cannot be measured through it",
+                psids.len()
+            );
+            revoke_ace_recursive(root, psids[0])
+                .unwrap_or_else(|e| panic!("{label}: revoke the measurement subject: {e}"))
+        }
+    };
+    let revoke_elapsed = revoke_started.elapsed();
 
     // --- 検算3: 剥がれたことを戻り値ではなく読み直しで確かめる（BUG-101） ---
     for (i, (sid, _)) in subjects.iter().enumerate() {
@@ -730,12 +912,17 @@ fn measure_arm(
         "subjects": subjects.len(),
         "shape": format!("{shape:?}"),
         "nodes": nodes,
-        "propagate_ms": propagate_ms,
-        "propagate_us_per_node": (propagate_ms as f64) * 1000.0 / (nodes as f64),
-        "verify_walk_ms": verify_walk_ms,
-        "revoke_ms": revoke_ms,
+        "propagate_ms": propagate_elapsed.as_millis(),
+        "propagate_us": propagate_elapsed.as_micros(),
+        "propagate_us_per_node": (propagate_elapsed.as_micros() as f64) / (nodes as f64),
+        "verify_walk_ms": verify_walk_elapsed.as_millis(),
+        "verify_walk_us": verify_walk_elapsed.as_micros(),
+        "revoke_ms": revoke_elapsed.as_millis(),
+        "revoke_us": revoke_elapsed.as_micros(),
+        "revoke_via": shape.revoke_label(),
         "revoke_checked": revoke_report.checked,
         "revoke_rewritten": revoke_report.rewritten,
+        "revoke_blocked": revoke_report.blocked.len(),
     })
 }
 
@@ -1378,6 +1565,643 @@ fn acl_ace_count_cost_of_splitting_across_k_and_tree_skew() {
         2 * KS.len() * DEPTHS.len() * SUBJECT_COUNTS.len() * 2 + 2 * 2,
         "腕が欠けている。比の一覧が全セルを覆っていない"
     );
+}
+
+/// **read-only属性を落としてから消す。** [`harness_grant_ledger::Ledger`]は書込のたびに
+/// read-onlyを付ける（誤削除防止の2層）ので、そのまま帰ると[`TestDirGuard`]のDrop
+/// （`remove_dir_all`）が**黙って失敗**して実マシンに残る（Dropは`Result`を捨てる）。
+///
+/// **消えたことを読み直しで確かめる**（`B-01`: 付けたものを剥がせるかを、戻り値ではなく
+/// 実物で見る）。
+fn remove_readonly_file(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            // `permissions_set_readonly_false`はUnixで**world-writableになる**ことを警告する
+            // lintである。このモジュールは`#[cfg(windows)]`の`win_appcontainer`配下にしか
+            // 存在せず、ここで落とすのは`Ledger::save`が付けた`FILE_ATTRIBUTE_READONLY`
+            // ちょうど1bitで、Unixのモードは関係しない（台帳側の`set_file_readonly`も
+            // `#[cfg(windows)]`で同じことをしている）。
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+    std::fs::remove_file(path)
+        .unwrap_or_else(|e| panic!("remove the measurement ledger {}: {e}", path.display()));
+    assert!(
+        !path.exists(),
+        "the measurement ledger {} is still there after remove_file",
+        path.display()
+    );
+}
+
+/// **[残課題#20の測定5の、ACE側だけでは埋まらない半分] 宛先SIDを1本用意するために
+/// 台帳が払う費用を、宣言の本数を振って測る。**
+///
+/// # 何が測れていなかったのか
+///
+/// N1が「宣言ごと」へ増やした費用は2つある。**ACEを書く側**（[`WriteShape::PerDeclaration`]が
+/// 測る）と、**宛先SIDを用意する側**である。後者は製品では宣言1件ごとに
+/// `fs_allow_capability_sid` → `workspace_capability::ensure_declaration_capability_name`
+/// → [`harness_grant_ledger::Ledger::update`]（名前付きミューテックス＋台帳**全件**の
+/// ロード＋2回の直列化＋条件付き書き戻し＋read-only切替）を通る。差分層側の
+/// `cow_diff_layer_capability_sid`もまったく同じ経路である。
+///
+/// **ACE側の書込回数はN1の前後で変わらない**——宣言1件につき伝播1回＋救済walk1周は
+/// 前からこの形で、変わるのは同一パスに級が2つ以上載る場合だけである。つまり
+/// **N1が宣言の本数ぶんへ倍にしたのは台帳側**であり、そこを1点も測らずに
+/// 「N1後の費用は動いていない」とは書けない。しかも台帳は**育つほど1件あたりが高くなる**
+/// （毎回の全件ロードと全文の直列化）ので、宣言が数百件あるドメインでは
+/// ACE側より支配的になり得る。
+///
+/// # 測るのは「支配項」であって製品の関数そのものではない（**限界。黙って使わない**）
+///
+/// 製品の入口`ensure_declaration_capability_name`は`%APPDATA%`の実台帳を掴み、台帳を
+/// 差し替えられる版`ensure_declaration_capability_in`は`workspace_capability`の**非公開**
+/// 関数である（そのファイルはこの分流の担当外なので可視性を変えていない）。したがって
+/// ここで通すのは**その内側が宣言1件ごとに払う`Ledger::update`**である。
+///
+/// | 含む | 含まない |
+/// |---|---|
+/// | ロック取得・全件ロード・2回の直列化・条件付き書き戻し・read-only切替 | CSPRNGでの秘密生成（1件あたりO(1)で、件数では育たない） |
+/// | 追記前の全件走査（3欄の一致。**規則の正本は`workspace_capability::matches`**で、ここに在るのは同じ形の走査が費用に乗ることを再現するためだけである） | 実台帳に既にある他workspaceのエントリ（**製品は空から始まらない**ので、ここの値は下限） |
+///
+/// # 第3の値（**時計とは別の計器**）
+///
+/// [`Ledger::update`]は中身が1バイトも変わらなければ**書かない**（BUG-108）。押し込んだ
+/// つもりで1件も増えていなければ、測った時間は「読んで直列化して捨てた」費用でしかない。
+/// だから最後に**別の`Ledger`ハンドルでディスクから読み直し**、件数と
+/// capability名の重複なしを見る。
+fn measure_declaration_ledger_append(dir: &Path, declarations: usize) -> serde_json::Value {
+    use crate::tier2a::workspace_capability::{
+        declaration_capability_name, declaration_key, workspace_key, WorkspaceCapabilityEntry,
+        WorkspaceCapabilityLedger,
+    };
+    use harness_grant_ledger::{now_unix_secs, Ledger};
+
+    let path = dir.join(format!("n{declarations}-workspace-capability-ledger.json"));
+    let backup = path.with_extension("json.bak");
+    // **実台帳のロック名を使わない。** 名前付きミューテックスの費用は同じに払いつつ、
+    // 同時に動いている本物の`harness.exe`と直列化しないための分離である。
+    let lock_name = format!(
+        r"Local\harness-acl-cost-measure-ledger-{}",
+        std::process::id()
+    );
+    let ledger: Ledger<WorkspaceCapabilityLedger> =
+        Ledger::at_path(path.clone(), Some(&lock_name));
+
+    let workspace = Path::new(r"C:\harness-acl-cost-measure-workspace");
+    let workspace_display = workspace.to_string_lossy().into_owned();
+    let key = workspace_key(workspace);
+    let access_class = FsAccess::Read.label();
+
+    let started = Instant::now();
+    for i in 0..declarations {
+        let declared = declaration_key(&workspace.join(format!("declared-{i:05}")));
+        ledger.update(|l| {
+            let already = l.entries.iter().any(|e| {
+                workspace_key(Path::new(&e.workspace)) == key
+                    && e.declaration.as_deref() == Some(declared.as_str())
+                    && e.mode == access_class
+            });
+            if already {
+                return;
+            }
+            let secret_hex = format!("{i:032x}");
+            let capability_name = declaration_capability_name(&secret_hex, &declared, access_class);
+            l.entries.push(WorkspaceCapabilityEntry {
+                workspace: workspace_display.clone(),
+                declaration: Some(declared.clone()),
+                mode: access_class.to_string(),
+                secret_hex,
+                capability_name,
+                granted_at_unix_secs: now_unix_secs(),
+                tree_verified_at_unix_secs: None,
+                root_file_id: None,
+                preparation_started_at_unix_secs: None,
+                preparation_root_file_id: None,
+                preparation_failed_at_unix_secs: None,
+                preparation_error: None,
+            });
+        });
+    }
+    let elapsed = started.elapsed();
+
+    // --- 読み直し（検算の材料。**判定より先に集める**） ---
+    let reloaded = Ledger::<WorkspaceCapabilityLedger>::at_path(path.clone(), None).load();
+    let entries_read_back = reloaded.entries.len();
+    let mut names: Vec<&str> = reloaded
+        .entries
+        .iter()
+        .map(|e| e.capability_name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let distinct_names = names.len();
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    // --- 後始末（read-only属性つきのファイルを2つ残さない。[`remove_readonly_file`]） ---
+    //
+    // **検算より先に片付ける。** 検算で落ちたときこそ後始末が要るのに、assertを先に置くと
+    // その回だけ`%TEMP%`にread-onlyのファイルが2つ残り、`TestDirGuard`のDropも
+    // （`remove_dir_all`がread-onlyで失敗して）黙って諦める（`B-01`）。
+    remove_readonly_file(&path);
+    remove_readonly_file(&backup);
+
+    // --- 検算: 台帳が本当に育ったか（上のdoc「第3の値」） ---
+    assert_eq!(
+        entries_read_back, declarations,
+        "the measurement ledger holds {entries_read_back} entries after {declarations} appends — \
+         if this is 0 or short, `Ledger::update` skipped the write (BUG-108) and the timing above \
+         measures loading and serializing, not growing"
+    );
+    assert_eq!(
+        distinct_names, declarations,
+        "the {declarations} appended declarations produced only {distinct_names} distinct \
+         capability names, so the arm is not the shape the product pays for (one destination SID \
+         per declaration)"
+    );
+
+    serde_json::json!({
+        "arm": format!("ledger-append-{declarations}"),
+        "declarations": declarations,
+        "function": "harness_grant_ledger::Ledger::update (the term `ensure_name_in` pays per declaration)",
+        "total_ms": elapsed.as_millis(),
+        "total_us": elapsed.as_micros(),
+        "us_per_declaration": (elapsed.as_micros() as f64) / (declarations as f64),
+        "ledger_bytes_at_end": bytes,
+        "entries_read_back": entries_read_back,
+    })
+}
+
+/// **[残課題#20の測定5・6] N1後の製品経路で、配布の費用は§S15の帯の中か。
+/// 差分層への付与・撤収は同じ器で測れるか。**
+///
+/// # 何が困っていたのか
+///
+/// N1（`plans/handoff/issue20-remaining/N1.md`）で、`--fs-allow`の宛先SIDを
+/// **セッションに1本のpackage SIDから、宣言ごと（パス×アクセス級）のcapability SIDへ**移した。
+/// 移行そのものは受け入れテストで成立を測ってあるが、**費用は1点も測っていない**
+/// （N1.mdの「測っていないこと」4番）。§S15が出した答えは
+/// 「まとめれば1.0倍・宛先SIDごとに呼べば約2.9倍」で、**どちらに転ぶかは実装の書き方だけで決まる**。
+/// だから「宛先SIDを分けた」という変更は、書き方次第で後者へ倒れ得る。
+///
+/// # 既存の6本では答えられない（**新しい腕が要る理由**）
+///
+/// 既存の`acl_ace_count_cost_*`は全部 `grant_aces_propagating`／`grant_aces_single_object`
+/// ——**D-84のworkspace配布経路の部品**を測っている。N1が触ったのはそこではない。
+///
+/// | 何が足りないか | 既存 | ここで足すもの |
+/// |---|---|---|
+/// | **測る関数** | `grant_aces_propagating`（部品） | `grant_ace_scoped`（製品の`--fs-allow`）・`grant_ace_inheritable_rw`（製品のCoW差分層） |
+/// | **同じツリーに宣言をM本** | 無い | `declaration-m1` と `declaration-m2` |
+/// | **ほぼ空のツリー** | 最小でも1万ファイル | `difflayer-*files`（差分層はセッション開始直後ほぼ空である） |
+/// | **宛先SIDを用意する側** | 無い（全部`capability_sid_from_name`＝純粋導出で作る） | [`measure_declaration_ledger_append`]（**N1が本数ぶんへ倍にしたのはこちらである**） |
+/// | **撤収の関数** | 全形が`revoke_workspace_sids_recursive` | 差分層の形だけ`revoke_ace_recursive`（[`WriteShape::product_revoke`]） |
+///
+/// §S15自身が「§S10-1は`grant_workspace_root_rw`で測っており**この部品を通らない別経路**なので
+/// M=1も測り直した」と書いている。**その規律に従えば、製品の関数で測り直す必要がある**——
+/// そしてそれは付与だけでなく**撤収にも等しく効く**（測定6の問いは付与・撤収の両方である）。
+///
+/// # 対照は両側とも同じ回に入っている
+///
+/// - **成功するはずの腕**: `component-merged-m2 / component-merged-m1`。§S15-1が1.0倍±3%を
+///   出した当の比で、ここが1.0付近から外れるなら**この日のマシンか計器が動いている**——
+///   下の製品側の数字を§S15と並べてはいけない。
+/// - **失敗するはずの腕**: `component-naive-m2 / component-merged-m2`。§S15-1で約2.9倍（M=3）に
+///   なった素朴な形で、ここが分離しないなら**まとめる側が実はまとめていない**。
+///
+/// **どちらもassertする。** 製品側の比（`declaration_m2_over_m1`等）は測る当のものなので
+/// 閾値を置かない——置くとマシンのノイズを判定することになる。
+///
+/// # assertは**全部印字してから**掛ける（**置き場ループの中に置かない**）
+///
+/// 上の2本を置き場ループの内側・印字より前に置くと、引っ掛かった瞬間に`arms`も`readings`も
+/// 1行も出ないまま落ちる。しかも先に回るのは`drive-root`なので、**本番の差分層に近い
+/// `user-temp`側は1腕も測られない**——10〜30分の回が丸ごと失われ、置き場で結論が反転し得る軸
+/// （§S11・§S30が実測している当の軸）も潰せない。そして計器が崩れたときの指示は
+/// 「腕のJSONで`measure_arm`の検算1が通っているかを確かめる」なのだから、
+/// **落ちる回ほど腕のJSONが要る。**
+///
+/// だから (1) 腕ごとに**その場で**1行のJSONをstderrへ出し、(2) 全置き場を回し切ってから
+/// まとめてstdoutへ出し、(3) assertは**その後**に掛ける。同型の既存3本
+/// （`..._across_depth_and_subject_count`等）も「印字 → 構造のassert」の順である。
+///
+/// # 突き合わせる2つは、どこまで遡ると同じ値になるか（**第3の値**）
+///
+/// `declaration-m2`と`declaration-m1`は、時計・ツリー生成器・`measure_capability`まで
+/// 遡ると同じ源から出ている。**この対だけでは「宣言がM本になっていなかった」を検出できない**
+/// ——本数が1本のままなら2つは一致し、「まとめられている＝費用は動いていない」という
+/// **逆向きの結論が緑で出る**（§S38-4と同じ形）。
+///
+/// 混ぜてある第3の値は2つで、どちらも**源とは独立に作られている**。
+///
+/// 1. **宣言した式**（[`assert_arms_got_the_tree_they_asked_for`]）——ノード数を
+///    `1 + K * 深さ + ファイル数`と別に書いておき、生成器の返り値・OSの走査結果と
+///    三つ巴で突き合わせる。生成器がKや深さを無視しても、ここが落ちる。
+/// 2. **OSのDACLの読み返し**（[`measure_arm`]の検算1）——最深部の葉が宛先SIDごとに
+///    **自分のマスク**を持つこと。宛先SIDが実は1本だった場合、2本目のマスクが
+///    1本目との和になって落ちる。時計とは別の計器である。
+///
+/// # 「ほぼ空」の判定線を**文章に固定しない**
+///
+/// 差分層の腕は「100ファイルは1万ファイルの1%だから、比が1%付近なら固定費は無い」とは
+/// 読めない。ノード数は`1 + K×深さ + ファイル数`で、**K=20・深さ8のディレクトリ160個は
+/// どの腕にも必ず付く**からである——100ファイルの腕は261ノード、1万ファイルの腕は10,161
+/// ノードで、**固定費がゼロでも比は2.57%になる**。1%を線に置くと「2.5倍＝固定費がある」という
+/// 偽陽性が必ず出る。しかも`HARNESS_TEST_ACL_COST_NODES`で規模を下げると大きい側だけが動くので、
+/// 線は回ごとにずれる。
+///
+/// **だから比の分母をその回のノード数から作る。** 腕ごとに`nodes`を`readings`へ出し、
+/// `difflayer_time_over_full@Nfiles`を**同じ規模の**`difflayer_nodes_over_full@Nfiles`と
+/// 並べて読む（時間比 ≒ ノード比なら固定費は無い／時間比がノード比より大幅に大きければ固定費がある）。
+///
+/// **規模は3点以上取る。** 2点では未知数2つ（固定費と1ノードあたり）を2点で当てることになり、
+/// **残差が残らない**＝線形性そのものを検算できない。既定は1万・1,000・100・10ファイルの4点で、
+/// `HARNESS_TEST_ACL_COST_NODES`を下げると大きい側から自動で落ちる（残る点数はJSONに出る）。
+///
+/// # 読むのは絶対値ではなく比（**限界**）
+///
+/// - 腕数が多いので1腕あたりのファイル数を既定の半分にしてある。**§S15とは絶対値で比べられない。**
+/// - **小さい腕の比は`propagate_us`（マイクロ秒）で作る。** `propagate_ms`は整数ミリ秒なので、
+///   数十msの腕では丸めだけで数%動き、1%と2.57%を区別できる分解能が無い。
+/// - **製品の形（`declaration-*`／`difflayer-*`）の`propagate_ms`には救済walkが1周入っている**
+///   （[`measure_arm`]のdoc）。部品の形（`component-*`）には入っていないので、
+///   `declaration_m1_over_component_merged_m1`は**その差を含んだ値**であり、
+///   「製品経路は部品より遅い」と読んではいけない。
+/// - **N1前のコードは走らせていない。** ここで測れるのは「N1後の形が§S15の帯に入るか」で、
+///   前後の直接比較ではない（前後を測るには旧コミットのワークツリーが要り、実マシンは1台なので
+///   直列化が要る）。
+///
+/// # 置き場を2水準にしてある理由
+///
+/// 本番の差分層は`%LOCALAPPDATA%\harness\data\cow`配下だが、**そこへ測定用ツリーを置くのは
+/// 禁止されている**（開発機の実データがあり、過去に`cargo test`が70件消した事故がある）。
+/// `%TEMP%`は`%LOCALAPPDATA%\Temp`——**同じユーザープロファイル・同じボリュームの1つ隣**なので、
+/// 置き場の代役として使えるいちばん近い場所である。`C:\`直下と対にして、§S11・§S30が
+/// 「置き場で結果が反転する」を実測している軸を潰す。
+///
+/// **`%TEMP%`へ置いてよいのは祖先を触らない口だけ**（[`TestDirGuard::create_in`]のdoc）。
+/// この測定が呼ぶ`grant_ace_scoped`・`grant_ace_inheritable_rw`はどちらも
+/// 「伝播書込＋`fix_descendants_missing_ace`」で、**対象とその配下しか触らない**。
+/// 祖先のtraverseを触る口（`grant_traverse_chain`）は通らないので、昇格は起きない。
+///
+/// # マシンに残るもの
+///
+/// **`%APPDATA%`の台帳へは1バイトも書かない。** 宛先SIDは`measure_capability`＝
+/// `capability_sid_from_name`（純粋な導出）で、`fs_allow_capability_sid`は呼ばない。製品の
+/// 付与関数が通る`grant_audit::note_root_grant`は**プロセス内の`Vec`**に積むだけで、
+/// ディスクへは書かない。ツリーは腕ごとに`TestDirGuard`が作って壊す。
+///
+/// **例外は[`measure_declaration_ledger_append`]で、そこだけは台帳ファイルを実際に書く**
+/// ——ただし`%TEMP%`配下の`TestDirGuard`の中に作った**別ファイル**で、
+/// `Ledger::at_path`で明示的にそこを指している（実台帳のロック名も使わない）。
+/// 台帳ファイルはread-only属性つきで残るので、`TestDirGuard`のDropに任せず
+/// [`remove_readonly_file`]で本体と`.bak`を消して**消えたことを読み直しで確かめる**。
+///
+/// # 所要（**先に言っておく**）
+///
+/// 1万ファイルの腕が12・小さい差分層の腕が6（1,000／100／10ファイル×置き場2）・
+/// 台帳の腕が4である。§S31（12腕・1万ファイル）と同じ規模に、小さい腕と台帳が乗る形。
+/// 1腕あたりの内訳は「ツリー生成＋伝播（§S10-1の単価で約0.6秒）＋検算walk×M＋撤収＋読み直し×M」で、
+/// **大半はツリー生成（1万個の小さいファイル）が占める**。台帳の腕は668件の側が
+/// **全文の読み書きを668回**払う（合計で数百MBのファイルI/O）が、1回あたりは数msなので
+/// **見込みは数十秒**である。全体の**目安10〜30分**。
+/// **実測は本流が記録すること**（この見積りは§S10-1の単価からの計算であって測定ではない）。
+/// `HARNESS_TEST_ACL_COST_NODES`で下げられる
+/// （下げたら記録に「読むのは絶対値ではなく比」と書く）。
+#[test]
+#[ignore = "creates tens of thousands of files across 18 tree arms plus 4 ledger arms and writes DACLs; run NON-elevated"]
+fn acl_ace_count_cost_of_the_post_n1_declaration_and_diff_layer_paths() {
+    // 腕が多いので1腕あたりは既定の半分（`HARNESS_TEST_ACL_COST_NODES`で上書き可）。
+    let count = file_count() / 2;
+    // 軸の値はこのリポジトリの実測から取る（§S33と同じ）。直下の子が20件、最大深さが8。
+    const K: usize = 20;
+    const DEPTH: usize = 8;
+    /// **差分層はセッション開始直後ほぼ空である**（コピーオンライトで触ったファイルだけが入る）。
+    /// 1万ファイルだけで測ると、製品が実際に払う領域を1点も覆わないことになる。
+    ///
+    /// **3点取るのは、固定費の有無を2点では言えないからである**（テストのdoc参照）。
+    /// 下限は`DEPTH`——`TreeShape::leaves`が見る最深段のファイル`f{DEPTH-1}`が載る条件である。
+    const DIFF_LAYER_SMALL_FILES: [usize; 3] = [1_000, 100, 10];
+    /// 台帳の腕で振る宣言の本数。**668はポリシーエディタの`cargo`ドメインの実際の宣言数**で、
+    /// 1・10・100と並べると「1件あたりが本数とともに育つか」が読める。
+    const LEDGER_DECLARATIONS: [usize; 4] = [1, 10, 100, 668];
+
+    // 規模を下げたときは大きい側から落ちる（`count`以上の腕は「ほぼ空」ではない）。
+    let small_files: Vec<usize> = DIFF_LAYER_SMALL_FILES
+        .into_iter()
+        .filter(|&n| n >= DEPTH && n < count)
+        .collect();
+    assert!(
+        !small_files.is_empty(),
+        "HARNESS_TEST_ACL_COST_NODES を下げすぎて、ほぼ空の差分層の腕が1つも残っていない \
+         (count = {count})。製品が実際に払う領域を1点も覆わない回になる"
+    );
+
+    let placements: [(&str, std::path::PathBuf); 2] = [
+        ("drive-root", std::path::PathBuf::from("C:\\")),
+        ("user-temp", std::env::temp_dir()),
+    ];
+
+    /// 対照のassertに要る値。**置き場ループの中では判定せず、ここへ溜める**
+    /// （テストのdoc「assertは全部印字してから掛ける」）。
+    struct Control {
+        placement: String,
+        naive_over_merged: f64,
+        merged_m2_over_m1: f64,
+        naive_us: u64,
+        merged_m2_us: u64,
+        merged_m1_us: u64,
+    }
+
+    // **規模ごとに分けて持つ。** [`assert_arms_got_the_tree_they_asked_for`]は
+    // 「ノード数 == 1 + K*深さ + ファイル数」を見るので、ファイル数の違う腕を混ぜられない。
+    let mut arms_by_file_count: std::collections::BTreeMap<usize, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    let mut readings = serde_json::Map::new();
+    let mut controls: Vec<Control> = Vec::new();
+
+    for (place_label, base) in &placements {
+        let mut specs: Vec<(String, usize, WriteShape, usize)> = vec![
+            (
+                "component-merged-m1".to_string(),
+                1usize,
+                WriteShape::Merged,
+                count,
+            ),
+            (
+                "component-merged-m2".to_string(),
+                2,
+                WriteShape::Merged,
+                count,
+            ),
+            (
+                "component-naive-m2".to_string(),
+                2,
+                WriteShape::OnePerSubject,
+                count,
+            ),
+            (
+                "declaration-m1".to_string(),
+                1,
+                WriteShape::PerDeclaration,
+                count,
+            ),
+            (
+                "declaration-m2".to_string(),
+                2,
+                WriteShape::PerDeclaration,
+                count,
+            ),
+            (
+                "difflayer-full".to_string(),
+                1,
+                WriteShape::DiffLayerRw,
+                count,
+            ),
+        ];
+        specs.extend(small_files.iter().map(|&n| {
+            (
+                format!("difflayer-{n}files"),
+                1usize,
+                WriteShape::DiffLayerRw,
+                n,
+            )
+        }));
+
+        let mut us_of: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        let mut nodes_of: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+
+        for (shape_label, m, shape, arm_count) in specs {
+            let label = format!("{place_label}-{shape_label}");
+            // **腕ごとにツリーを作って壊す。** 同時に置くとピークのディスクが腕数倍になり、
+            // 前の腕が残したACEが次の腕の初期状態を変える（初回を測れなくなる）。
+            let dir = TestDirGuard::create_in(base, &format!("acln1-{label}"));
+            let root = dir.path();
+            let nodes = TreeShape::Uniform.build(root, arm_count, K, DEPTH);
+            let subjects = m_subjects(&label, m);
+            let (leaf_dir, leaf_file) = TreeShape::Uniform.leaves(root, DEPTH);
+            let mut arm = measure_arm(
+                &label, root, nodes, &subjects, &leaf_dir, &leaf_file, shape,
+            );
+            arm["placement"] = serde_json::json!(place_label);
+            arm["k_top_level_children"] = serde_json::json!(K);
+            arm["depth"] = serde_json::json!(DEPTH);
+            arm["tree"] = serde_json::json!(TreeShape::Uniform.label());
+            arm["file_count"] = serde_json::json!(arm_count);
+            us_of.insert(
+                shape_label.clone(),
+                arm["propagate_us"]
+                    .as_u64()
+                    .expect("propagate_us is a number"),
+            );
+            nodes_of.insert(shape_label.clone(), nodes as u64);
+            // **腕のJSONはその場で出す。** 後段のどこで落ちても、ここまでの腕は読める
+            // （まとめた1行はstdoutへ最後に出るが、それは全腕を回し切れた回にしか出ない）。
+            eprintln!("  [{label}] done {arm}");
+            arms_by_file_count.entry(arm_count).or_default().push(arm);
+        }
+
+        // **比はこの置き場の中で作る**（腕の並びから添字で拾い直さない。
+        // `measure_split_vs_merged_cells`のdocが「ずれ得る書き方をやめれば検算ごと要らなくなる」
+        // と書いているのと同じ理由）。**µsで作る**——小さい腕はmsだと丸めだけで数%動く。
+        let us = |key: &str| -> u64 {
+            *us_of
+                .get(key)
+                .unwrap_or_else(|| panic!("[{place_label}] arm {key} is missing from this run"))
+        };
+        let nodes_at = |key: &str| -> f64 {
+            *nodes_of
+                .get(key)
+                .unwrap_or_else(|| panic!("[{place_label}] arm {key} is missing from this run"))
+                as f64
+        };
+        let ratio = |a: &str, b: &str| -> f64 {
+            let (num, den) = (us(a), us(b));
+            if den == 0 {
+                f64::NAN
+            } else {
+                (num as f64) / (den as f64)
+            }
+        };
+
+        let merged_m2_over_m1 = ratio("component-merged-m2", "component-merged-m1");
+        let naive_over_merged = ratio("component-naive-m2", "component-merged-m2");
+        for (name, value) in [
+            ("merged_m2_over_m1", merged_m2_over_m1),
+            ("naive_m2_over_merged_m2", naive_over_merged),
+            (
+                "declaration_m2_over_m1",
+                ratio("declaration-m2", "declaration-m1"),
+            ),
+            (
+                "declaration_m1_over_component_merged_m1",
+                ratio("declaration-m1", "component-merged-m1"),
+            ),
+            (
+                "difflayer_full_over_declaration_m1",
+                ratio("difflayer-full", "declaration-m1"),
+            ),
+        ] {
+            readings.insert(format!("{place_label}/{name}"), serde_json::json!(value));
+        }
+
+        // **差分層の規模は、時間比とノード比を必ず対で出す。**
+        // 「ほぼ空」の腕にもK×深さ＝160個のディレクトリが必ず付くので、固定費がゼロでも
+        // 時間比はファイル数の比より大きく出る。判定線を文章に固定せず、その回のノード比を
+        // 隣に置いて読ませる（テストのdoc「判定線を文章に固定しない」）。
+        let full_nodes = nodes_at("difflayer-full");
+        for (arm_label, files) in std::iter::once(("difflayer-full".to_string(), count)).chain(
+            small_files
+                .iter()
+                .map(|&n| (format!("difflayer-{n}files"), n)),
+        ) {
+            let arm_nodes = nodes_at(&arm_label);
+            for (name, value) in [
+                (format!("difflayer_nodes@{files}files"), arm_nodes),
+                (
+                    format!("difflayer_time_over_full@{files}files"),
+                    ratio(&arm_label, "difflayer-full"),
+                ),
+                (
+                    format!("difflayer_nodes_over_full@{files}files"),
+                    arm_nodes / full_nodes,
+                ),
+                (
+                    format!("difflayer_us_per_node@{files}files"),
+                    (us(&arm_label) as f64) / arm_nodes,
+                ),
+            ] {
+                readings.insert(format!("{place_label}/{name}"), serde_json::json!(value));
+            }
+        }
+
+        controls.push(Control {
+            placement: (*place_label).to_string(),
+            naive_over_merged,
+            merged_m2_over_m1,
+            naive_us: us("component-naive-m2"),
+            merged_m2_us: us("component-merged-m2"),
+            merged_m1_us: us("component-merged-m1"),
+        });
+    }
+
+    // **宛先SIDを用意する側**（[`measure_declaration_ledger_append`]）。置き場は`%TEMP%`だけに
+    // する——製品の台帳は`%APPDATA%`＝同じユーザープロファイル・同じボリュームであり、
+    // `C:\`直下は製品が台帳を置く場所ではないので、置き場の軸を振る意味が無い。
+    let ledger_dir = TestDirGuard::create_in(&std::env::temp_dir(), "acln1-ledger");
+    let mut ledger_arms: Vec<serde_json::Value> = Vec::new();
+    for declarations in LEDGER_DECLARATIONS {
+        let arm = measure_declaration_ledger_append(ledger_dir.path(), declarations);
+        eprintln!("  [ledger-append-{declarations}] done {arm}");
+        readings.insert(
+            format!("ledger_us_per_declaration@{declarations}decls"),
+            arm["us_per_declaration"].clone(),
+        );
+        ledger_arms.push(arm);
+    }
+    // **1件あたりが本数とともに育つか**が台帳側の問いである（育つなら合計はO(N²)）。
+    if let (Some(first), Some(last)) = (ledger_arms.first(), ledger_arms.last()) {
+        let (base_us, top_us) = (
+            first["us_per_declaration"].as_f64().unwrap_or(f64::NAN),
+            last["us_per_declaration"].as_f64().unwrap_or(f64::NAN),
+        );
+        readings.insert(
+            format!(
+                "ledger_us_per_declaration@{}decls_over@{}decls",
+                LEDGER_DECLARATIONS[LEDGER_DECLARATIONS.len() - 1], LEDGER_DECLARATIONS[0]
+            ),
+            serde_json::json!(if base_us == 0.0 {
+                f64::NAN
+            } else {
+                top_us / base_us
+            }),
+        );
+    }
+
+    let arms: Vec<serde_json::Value> = arms_by_file_count
+        .values()
+        .flat_map(|group| group.iter().cloned())
+        .collect();
+    println!(
+        "{}",
+        serde_json::json!({
+            "measurement": "#20 measurements 5 and 6: the post-N1 declaration path and the CoW diff-layer path",
+            "file_count_per_full_arm": count,
+            "diff_layer_small_file_counts": small_files,
+            "ledger_declaration_counts": LEDGER_DECLARATIONS,
+            "k_top_level_children": K,
+            "depth": DEPTH,
+            "tree_shape": "uniform forest",
+            "arms": arms,
+            "ledger_arms": ledger_arms,
+            "readings": readings,
+        })
+    );
+
+    // === ここから下はassertだけ。**上のJSONは既に出ている。** ===
+    //
+    // **合否は判定しない**（製品側の比そのものが測る当のもの）。見るのは実験の前提だけ
+    // ——[`measure_arm`]の検算に加えて、腕が欠けていないことと、
+    // **注文した形のツリーで測ったこと**（第3の値）、そして対照2本である。
+
+    assert_eq!(
+        arms_by_file_count.get(&count).map_or(0, Vec::len),
+        2 * 6,
+        "1万ファイル側の腕が欠けている。置き場2水準×6腕を覆っていない"
+    );
+    for &n in &small_files {
+        assert_eq!(
+            arms_by_file_count.get(&n).map_or(0, Vec::len),
+            2,
+            "{n}ファイルの腕が欠けている。差分層の実際の規模のうち1点が両置き場を覆っていない"
+        );
+    }
+    assert_eq!(
+        ledger_arms.len(),
+        LEDGER_DECLARATIONS.len(),
+        "台帳の腕が欠けている。宛先SIDを用意する側の費用が本数で振れていない"
+    );
+    for (files, group) in &arms_by_file_count {
+        assert_arms_got_the_tree_they_asked_for(group, TreeShape::Uniform, *files);
+    }
+
+    for control in &controls {
+        let place_label = &control.placement;
+        // **失敗するはずの対照が分離していること。** 閾値は§S15-1の実測（ACE3本で約2.9倍、
+        // §S9-3のACE2本で1.77〜2.03倍）より緩い1.5で、
+        // `acl_ace_count_cost_of_folding_m_subjects_into_one_write`と同じ線である。
+        assert!(
+            control.naive_over_merged >= 1.5,
+            "[{place_label}] the control arm is not separating: writing two ACEs one-at-a-time \
+             ({} µs) must be clearly slower than folding them into one write ({} µs). If these \
+             are the same, the merged path is not actually folding — every product-side number \
+             in this run is unreadable.",
+            control.naive_us,
+            control.merged_m2_us
+        );
+        // **成功するはずの対照が実際に成功していること。** §S15-1は1.0倍±3%を出しているが、
+        // ここは規模が半分でノイズが大きいので**帯ではなく分離だけ**を見る——1.6は
+        // 「畳めている（約1.0）」と「畳めていない（約2.0）」を分ける線であって、
+        // ノイズを判定する線ではない。
+        assert!(
+            control.merged_m2_over_m1 < 1.6,
+            "[{place_label}] folding two subjects into one propagating write took {:.3}x \
+             the time of one subject ({} µs vs {} µs). §S15-1 measured 1.0x±3% for this ratio, so \
+             a value near 2 means the merged path degenerated into one write per subject — read \
+             the arm JSON above before trusting any product-side number in this run.",
+            control.merged_m2_over_m1,
+            control.merged_m2_us,
+            control.merged_m1_us
+        );
+    }
 }
 
 /// [`super::test_support::build_forest_tree`]の`depth = 1`が
