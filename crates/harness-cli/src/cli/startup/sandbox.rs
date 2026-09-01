@@ -143,8 +143,26 @@ pub(super) fn stage_prepare_sandbox(
     // `--fork-session`: 元セッションの未適用変更も分岐先へ持っていく。TUIの`/fork`と同じ
     // `session_scope::fork_overlay`を通す——**同じ状態（forkされたセッション）を作り得る経路が
     // 2つある**ので、片方だけ実装すると「CLIでforkしたときだけ変更が見えない」形の穴になる
-    // （`bug-pattern-rules` B-06）。CoWのACE付与は`preflight`が後で行うため、ここでは
-    // まだ`prepare_scope`のWindows分岐へ入らない`--staged`系だけが対象になる。
+    // （`bug-pattern-rules` B-06）。
+    //
+    // **`--sandbox tier2a-cow`でもここを通る**（2026-09-01に読み直して訂正。以前は
+    // 「CoWのACE付与は`preflight`が後で行うため、ここでは`--staged`系だけが対象になる」と
+    // 書いてあったが、事実ではない）。`ScopeTemplate::new`は`write_mode`が`Cow`なら
+    // `ScopeTemplate::Cow`を返し、`scope_for`は`cow_diff_layer_dir: Some(..)`を返すので、
+    // `fork_overlay`→`prepare_scope`は**差分層のACEをここで書く**——`--fork-session`と
+    // `--sandbox tier2a-cow`の併用を拒む判定はどこにも無い。
+    //
+    // **この関数は`select_tier`（内部で`preflight`）より前にある。** つまりこの時点では
+    // `session_profile::begin_session`がまだ走っておらず、セッション台帳のエントリが無いので、
+    // `prepare_cow_diff_layer`の`record_granted_capability`は記録できず
+    // 「このACEは自動で撤収されない」というBUG-101の警告を出す。**ただし孤立はしない**——
+    // 後続の`preflight`が**同じ差分層**（`write_mode.diff_layer_dir`と`scope_for`の結果は
+    // どちらも`cow_diff_layer_dir_in(root, session.id())`）へ付け直し、そこで記録される。
+    // **警告だけが偽である。**
+    //
+    // 以上は**実コードを読んで確かめた結論で、実行して測ってはいない**
+    // （`--fork-session`は実機のセッションを触るため）。測定の記録は
+    // `plans/mac-spike/RESULTS.md` §S39。
     if let Some(source_id) = &forked_from_session_id {
         let template =
             harness_sandbox::session_scope::ScopeTemplate::new(&write_mode, staging_mode);

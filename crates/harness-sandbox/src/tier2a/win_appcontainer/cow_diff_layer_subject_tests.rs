@@ -2,13 +2,14 @@
 //!
 //! 差分層（`--sandbox tier2a-cow`が書込を退避するセッション専有フォルダ）へ付けるACEの宛先は、
 //! セッションのpackage SIDから**差分層ごとのcapability SID**へ移った。移行が成立したと
-//! 言える条件は3つあり、**そのすべてが「実マシンのDACL」で測られる**——台帳ではない。
+//! 言える条件は4つある。
 //!
 //! | # | 条件 | このファイルのテスト |
 //! |---|---|---|
 //! | 1 | 差分層のrootに**package SID宛ACEが0本**、capability宛が1本 | `the_diff_layer_is_owned_by_a_capability_and_not_by_the_session_package_sid` |
 //! | 2 | セッション終了で**0本へ戻る**（付与と撤収が対） | `ending_the_session_takes_the_capability_ace_back_off_the_diff_layer` |
 //! | 3 | GC（死んだセッションの回収）でも**0本へ戻る** | `the_gc_path_also_takes_the_capability_ace_off_the_diff_layer` |
+//! | 4 | **セッションを切り替えても、前のセッションの宛先SIDが子へ持ち越されない**（測定4） | `switching_sessions_does_not_carry_the_previous_diff_layer_capability` |
 //!
 //! # なぜ台帳ではなく実DACLを読むのか
 //!
@@ -18,12 +19,16 @@
 //! これは実物を読まないと言えない。**しかもpackage SID宛が1本残っている状態は成功に見える**
 //! ——新しいACEは正しく付いており、アクセスも通るからである。
 //!
-//! # ここで測っていないもの（`fs_allow_domain_acceptance_tests`との違い）
+//! # 1〜3が測っていないもの（`fs_allow_domain_acceptance_tests`との違い）
 //!
-//! **子プロセスから見た実I/Oは測っていない。** ここが見るのはDACLだけである。
+//! **1〜3は子プロセスから見た実I/Oを測っていない。** 見るのはDACLだけである。
 //! 「capabilityを積んだ子だけが差分層へ書ける」は実機E2E（`tier2a_cow_commit_matrix`）と
 //! `cow_containment_tests`が測る層で、そちらは子を起こす。**両方要る**——ACEが正しくても
 //! トークンへ積み忘れれば書けず、逆にpackage SID宛が1本でも残っていれば積まなくても書ける。
+//!
+//! **4だけは子を起こす。** 切替の境界は**ACEではなくトークン**だからである——古い差分層の
+//! ACEは意図的に残す（切り戻す可能性のあるものを回収可能に見せない）ので、DACLを何本読んでも
+//! 「持ち越したか」は判定できない。
 //!
 //! # 実行（**昇格しないこと**）
 //!
@@ -217,5 +222,209 @@ fn the_gc_path_also_takes_the_capability_ace_off_the_diff_layer() {
         "the GC path must take the capability ACE off the diff layer too — this is the path \
          that actually runs after a forced termination; leftovers: {:?}",
         outcome.blocked_paths
+    );
+}
+
+/// 子が「起動して、コマンドを解釈するところまでは進んだ」ことの印（`B-33`）。
+const SWITCH_ALIVE_MARKER: &str = "HARNESS-SWITCH-CHILD-ALIVE";
+
+/// **受け入れ条件4（測定4、`plans/HANDOFF-ISSUE-20-SUBJECT-MIGRATION.md`）**:
+/// セッションを切り替えても、**前のセッションの差分層のcapability SIDは子へ持ち越されない**。
+///
+/// # 壊れた状態を一文で
+///
+/// **切替後の子のトークンに、切替前の差分層のcapability SIDが載ったままになっている。**
+/// そうなると新しいセッションの子が**古いセッションの差分層を書き換えられる**。
+///
+/// # なぜDACLでは判定できないのか（このテストだけが子を起こす理由）
+///
+/// 古い差分層のACEは**意図的に残す**——切り戻す可能性のあるオーバーレイを回収可能に
+/// 見せない方が安全側だからで、生存マーカーもプロセス終了まで保持される
+/// （`session_scope::prepare_cow_diff_layer`の末尾）。つまり**古い差分層は「ACEが在るのに
+/// 届いてはいけない」状態**であり、境界を張っているのはトークンだけである。
+/// DACLを何本読んでもこの境界は見えない。
+///
+/// # 何を根拠に「持ち越していない」と言うか（**対で測る**、`B-35`）
+///
+/// - **許可側**: 切替後の子は**新しい**差分層へ書ける（書けなければCoWが丸ごと死んでいる）
+/// - **禁止側**: 同じ子が**古い**差分層へ書けない（これが本題）
+/// - **歯の対照**: 禁止側を測った時点で、古い差分層には**まだcapability宛ACEが在る**
+///
+/// **3つ目が要である。** 撤収が効きすぎて古い差分層のACEごと消えた世界でも禁止側は緑になり、
+/// 「持ち越さない」という結論が**別の理由で**成り立ってしまう。
+///
+/// # 本番と同じ形で測る
+///
+/// - 切替は`session_scope::prepare_scope`を通す。**切替の副作用点は製品でもこの1関数**で、
+///   入口6つ（`/sessions`・`/fork`・起動時ピッカー2種・`--fork-session`・セッションパネル）が
+///   すべてここへ落ちる。自前で差分層を用意すると、測るものが製品と別になる
+/// - 子は`test_support::spawn_in_workspace`で起こす。差分層のcapabilityを
+///   **`diff_layer_dir`から引き直して積む**のは本番の`launch.rs`と同じ形で、
+///   切替後の`ToolCtx`から組まれるトークンがこれである
+///
+/// # 差分層の根を`C:\`にしている理由
+///
+/// `ScopeTemplate::Cow`の根を`C:\`にすると`cow_diff_layer_dir_in`が`C:\<セッションID>`を返し、
+/// **差分層の親が`C:\`**になる——traverse台帳に既にあるので**新しい昇格が要らない**。
+/// 本番の`%LOCALAPPDATA%\harness\data\cow`は開発機の実データが入っている場所なので使わない。
+#[test]
+#[ignore = "real machine: creates directories under C:\\, writes DACLs, and spawns an AppContainer child; run NON-elevated with --test-threads=1"]
+fn switching_sessions_does_not_carry_the_previous_diff_layer_capability() {
+    use crate::session_scope::{prepare_scope, ScopeTemplate};
+
+    let (ws_guard, old_guard) = make_roots("switch");
+    // 切替先の差分層。**ディレクトリ名がそのままセッションIDになる**ので、`scope_for`へ渡す
+    // 文字列と`file_name()`を一致させる（`preflight`は`file_name()`からIDを導出する）。
+    let new_guard = TestDirGuard::create("cow-subject-switch-new");
+    let workspace = ws_guard.path().to_path_buf();
+    let old = old_guard.path().to_path_buf();
+    let new = new_guard.path().to_path_buf();
+    let new_id = new
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("the new diff layer directory name is the session id")
+        .to_string();
+
+    let (_session, old_cap) = preflight_cow(&workspace, &old);
+    let canonical_ws = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+
+    // --- 開始状態が本物であることを先に測る ---
+    //
+    // 古い差分層にACEが無ければ、この後の「古い方へ届かない」は持ち越していない証拠ではなく、
+    // ただの未付与である。
+    assert!(
+        sid_ace_mask(&old, old_cap.as_psid())
+            .expect("the old diff layer DACL must be readable")
+            .is_some(),
+        "the previous session's diff layer must carry its capability ACE before we can ask \
+         whether that capability is carried over"
+    );
+
+    // --- 切替（製品と同じ副作用点を通す） ---
+    let template = ScopeTemplate::Cow {
+        diff_layer_root: std::path::PathBuf::from("C:\\"),
+    };
+    let next = template.scope_for(&new_id);
+    // **前提の確認**: 根を`C:\`にした狙い（差分層の親が`C:\`）が実際に成立しているか。
+    // ここがずれると祖先traverseが増え、測定の途中で昇格を要求される。
+    assert_eq!(
+        next.cow_diff_layer_dir.as_deref(),
+        Some(new.as_path()),
+        "the scope template must map this session id onto the directory we prepared"
+    );
+    prepare_scope(&workspace, &next).expect("the session switch must prepare the new diff layer");
+
+    let new_cap = lookup_cow_diff_layer_capability_sid(&canonical_ws, &new)
+        .expect("the switch must issue a capability for the new diff layer");
+    // **順序はACEを剥がしてから台帳を落とす。** 逆にすると宛先SIDを引けなくなり、撤収経路の
+    // 無いACEが残る（`workspace_capability::forget_capability`のdocが定める不変条件）。
+    //
+    // 台帳まで落とすのは、**測定の前後で台帳の件数が戻ることを検証条件にしている**ためである
+    // （`harness fs prune`頼みにすると、使い捨てワークスペースの記録が溜まり続ける）。
+    // このファイルの他の3本はACEしか剥がしておらず、実行のたびに記録が残る——
+    // それはこの測定が持ち込んだものではないので、ここでは直さずに記録へ書く。
+    let _cleanup = scopeguard(|| {
+        let _ = revoke_ace_recursive(&new, new_cap.as_psid());
+        let _ = revoke_ace_recursive(&old, old_cap.as_psid());
+        let dropped = crate::tier2a::workspace_capability::forget_capability(&canonical_ws, "");
+        eprintln!("cleanup: dropped {} capability ledger entries", dropped.len());
+        crate::tier2a::workspace_ledger::remove_workspace_entry(&canonical_ws);
+    });
+
+    let old_sid = crate::win_common::sid_to_string(old_cap.as_psid()).expect("render the old SID");
+    let new_sid = crate::win_common::sid_to_string(new_cap.as_psid()).expect("render the new SID");
+    assert_ne!(
+        old_sid, new_sid,
+        "the two sessions must derive different capability SIDs, otherwise this test cannot tell \
+         them apart (the derivation would not include the session)"
+    );
+    assert!(
+        sid_ace_mask(&new, new_cap.as_psid())
+            .expect("the new diff layer DACL must be readable")
+            .is_some(),
+        "the switch must put a capability ACE on the new diff layer; without it the child has \
+         nowhere to write and CoW is dead after every switch"
+    );
+    // **付与と撤収は対**（`B-01`）。切替で付けたACEが台帳へ記録されていなければ、
+    // `end_session`/GCはこれを引けず、切替のたびに撤収経路の無いACEが1件ずつ残る。
+    assert!(
+        crate::tier2a::session_profile::granted_capability_paths_for_current_session()
+            .iter()
+            .any(|p| p == &new),
+        "the ACE the switch just wrote must be recorded for this session, or nothing will ever \
+         revoke it (BUG-101と同型)"
+    );
+
+    // --- 切替後の子を1つ起こす（本番の`launch.rs`と同じトークンの組み方） ---
+    let (shell, _) = resolve_shell();
+    let env = crate::secret_env::build_child_env();
+    let ext_roots: Vec<std::path::PathBuf> = Vec::new();
+    let command = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         Write-Output '{SWITCH_ALIVE_MARKER}'; \
+         try {{ New-Item -ItemType File -Path '{}' -Force | Out-Null; Write-Output 'NEW-OK' }} \
+         catch {{ Write-Output ('NEW-ERR: ' + $_.Exception.Message) }}; \
+         try {{ New-Item -ItemType File -Path '{}' -Force | Out-Null; Write-Output 'OLD-OK' }} \
+         catch {{ Write-Output ('OLD-ERR: ' + $_.Exception.Message) }}",
+        new.join("switch-probe.txt").display(),
+        old.join("switch-probe.txt").display()
+    );
+    let child = super::test_support::spawn_in_workspace(
+        &shell,
+        &["-NoProfile", "-NonInteractive", "-Command", &command],
+        &workspace,
+        &env,
+        false,
+        session_sid().as_psid(),
+        NetworkCapability::Deny,
+        Some(CowInject {
+            workspace_root: &workspace,
+            // **切替後の差分層**。本番はここへ`ctx.cow_diff_layer_dir`（`apply_scope`が
+            // 書き換えた値）が入る。
+            diff_layer_dir: &new,
+            ext_capture_roots: &ext_roots,
+        }),
+    )
+    .expect("spawn the post-switch child through the production path");
+    let (stdout, stderr, code) = child
+        .write_stdin_read_output_and_wait(None)
+        .expect("read the child output");
+    eprintln!("[post-switch child] exit={code}\nstdout={stdout}\nstderr={stderr}");
+
+    // 「書けなかった」が「そもそも走らなかった」ではないことを確かめる（`B-33`）。
+    assert!(
+        stdout.contains(SWITCH_ALIVE_MARKER),
+        "the post-switch child never started, so nothing below says anything about the access \
+         check: {stdout}"
+    );
+    // 許可側。
+    assert!(
+        stdout.contains("NEW-OK"),
+        "the child must be able to write into the diff layer of the session it switched to; \
+         if this fails, CoW is dead after a switch: {stdout}"
+    );
+    // 禁止側（本題）。
+    assert!(
+        !stdout.contains("OLD-OK"),
+        "the child wrote into the PREVIOUS session's diff layer -- the old capability was carried \
+         over into the token, so switching sessions does not actually change what the child can \
+         reach: {stdout}"
+    );
+    assert!(
+        stdout.contains("OLD-ERR"),
+        "the write into the previous diff layer must fail loudly (caught exception), not silently \
+         produce nothing: {stdout}"
+    );
+
+    // --- 歯の対照: 禁止側が通ったのは「ACEが消えたから」ではない ---
+    assert!(
+        sid_ace_mask(&old, old_cap.as_psid())
+            .expect("the old diff layer DACL must still be readable")
+            .is_some(),
+        "the previous session's capability ACE must STILL be on its diff layer at this point. \
+         If it is gone, the child was denied because the ACE vanished (revocation ran too early), \
+         not because the capability is absent from its token -- and this measurement proves nothing"
     );
 }
