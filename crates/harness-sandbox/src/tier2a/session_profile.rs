@@ -504,31 +504,84 @@ pub fn record_granted_paths(paths: &[std::path::PathBuf]) {
     if paths.is_empty() {
         return;
     }
-    let token = session_token();
-    let mut recorded = false;
-    ledger().update(|l| {
-        if let Some(entry) = l.sessions.iter_mut().find(|e| e.token == token) {
-            recorded = true;
+    record_into_session_entry(
+        |entry| {
             for path in paths {
                 let path_str = path.to_string_lossy().into_owned();
                 if !entry.granted_paths.contains(&path_str) {
                     entry.granted_paths.push(path_str);
                 }
             }
-        }
-    });
-    // [BUG-101] **無言のno-opをやめる。** 台帳にこのセッションのエントリが無ければ、ここは
-    // 何も書かずに戻る——付与は成功しているので呼び出し側は成功と読み、撤収の対象にも
-    // ならないACEが実マシンに残る（`end_session`はエントリの`granted_paths`しか剥がさない）。
-    // 「記録できなかった」は付与の失敗ではないので**止めはしない**が、黙りもしない（B-10）。
-    if !recorded {
+        },
+        || format!("{} granted path(s)", paths.len()),
+    );
+}
+
+/// このセッションの台帳エントリへ1件書き込む。**エントリが無ければ開いて1回だけやり直す。**
+///
+/// # [BUG-101] なぜ無言のno-opにしないのか
+///
+/// 台帳にこのセッションのエントリが無いと、記録は何も書かずに戻る——付与は成功しているので
+/// 呼び出し側は成功と読み、撤収の対象にもならないACEが実マシンに残る（`end_session`と
+/// `gc_dead_sessions`はどちらもエントリの中しか剥がさない）。
+///
+/// # [BUG-147] なぜ警告だけで済ませないのか
+///
+/// 黙らないだけでは**ACEは残ったままである**。実際にその形で出たのがBUG-147で、
+/// `--fork-session`が`begin_session`より前に差分層のACEを書き、起動が打ち切られた回の
+/// ACEを誰も剥がせなくなっていた。エントリが無いのは付与の失敗ではないので**止めはしない**が、
+/// **作れる相手なら作ってやり直す**（`begin_session`は冪等）。
+///
+/// # 費用（正常時は増えない）
+///
+/// エントリが在れば台帳の読み書きは**1回のまま**である。`Ledger::update`は1回ごとに全文を
+/// 読み書きするので（[`record_granted_paths`]のdocの実測）、ここを無条件に2回にすると
+/// 付与のたびに倍払うことになる。余分な2回（`begin_session`とやり直し）を払うのは
+/// **エントリが無かったときだけ**で、しかも`begin_session`がそこでエントリを作るので、
+/// **同じプロセスで払うのは最初の1回だけ**である——ループの中から呼ばれても2回目以降は
+/// 通常経路で当たる。
+///
+/// `describe`をクロージャで受けるのは、**正常時に文字列を組み立てないため**である。
+fn record_into_session_entry(
+    mut write: impl FnMut(&mut SessionEntry),
+    describe: impl Fn() -> String,
+) {
+    let token = session_token();
+    if write_into_session_entry(token, &mut write) {
+        return;
+    }
+    // [BUG-147] ぶら下げる先が無い。**作って1回だけやり直す。**
+    if let Err(e) = begin_session() {
         eprintln!(
-            "warning: could not record {} granted path(s) for session {token}: the session has no \
-             ledger entry, so these ACEs will not be revoked automatically (see \
-             docs/bugs/BUG-101.md)",
-            paths.len()
+            "warning: could not record {} for session {token}: the session has no ledger entry \
+             and opening one failed ({e}), so these ACEs will not be revoked automatically \
+             (see docs/bugs/BUG-101.md)",
+            describe()
+        );
+        return;
+    }
+    if !write_into_session_entry(token, &mut write) {
+        // ここへ来るのは「`begin_session`が成功を返したのに、直後に読むとエントリが無い」
+        // ときだけ——別プロセスが同時に落としたか、台帳を書けていないかである。
+        // **黙らない**（B-10）: 撤収の索引が無いまま実マシンにACEが残る。
+        eprintln!(
+            "warning: could not record {} for session {token}: the session ledger entry is still \
+             missing right after opening it, so these ACEs will not be revoked automatically \
+             (see docs/bugs/BUG-101.md)",
+            describe()
         );
     }
+}
+
+/// [`record_into_session_entry`]の1回ぶん。**このセッションのエントリを見つけて書けたか**を返す。
+fn write_into_session_entry(token: &str, write: &mut impl FnMut(&mut SessionEntry)) -> bool {
+    ledger().update(|l| match l.sessions.iter_mut().find(|e| e.token == token) {
+        Some(entry) => {
+            write(entry);
+            true
+        }
+        None => false,
+    })
 }
 
 /// [§22.3.2] capability SID宛に付けたACEを台帳へ記録する（撤収時に剥がす対象）。
@@ -536,17 +589,12 @@ pub fn record_granted_paths(paths: &[std::path::PathBuf]) {
 /// [`record_granted_path`]のcapability版。**付与が成功した後にだけ呼ぶこと**——先に記録すると
 /// 「台帳にあるのに実体が無い」逆向きの孤立になる（B-15）。
 ///
-/// [BUG-101と同じ理由] **無言のno-opにしない。** このセッションの台帳エントリが無ければ
-/// 何も書かずに戻るが、付与は成功しているので呼び出し側は成功と読む——そして撤収の対象にも
-/// ならないACEが実マシンに残る。「記録できなかった」は付与の失敗ではないので**止めはしない**が、
-/// **黙りもしない**（B-10）。
+/// 台帳エントリが無いときの扱い（黙らない・作ってやり直す・費用）は
+/// [`record_into_session_entry`]が持つ。
 pub fn record_granted_capability(path: &Path, capability_name: &str) {
-    let token = session_token();
     let path_str = path.to_string_lossy().into_owned();
-    let mut recorded = false;
-    ledger().update(|l| {
-        if let Some(entry) = l.sessions.iter_mut().find(|e| e.token == token) {
-            recorded = true;
+    record_into_session_entry(
+        |entry| {
             if !entry
                 .granted_capabilities
                 .iter()
@@ -557,15 +605,9 @@ pub fn record_granted_capability(path: &Path, capability_name: &str) {
                     capability_name: capability_name.to_string(),
                 });
             }
-        }
-    });
-    if !recorded {
-        eprintln!(
-            "warning: could not record the capability grant on {path_str} for session {token}: \
-             the session has no ledger entry, so this ACE will not be revoked automatically \
-             (see docs/bugs/BUG-101.md)"
-        );
-    }
+        },
+        || format!("the capability grant on {path_str}"),
+    );
 }
 
 /// **このセッションが撤収しなければならないものの件数**（パス＋capability宛の合計）。
@@ -602,6 +644,33 @@ fn pending_revocation_count_in(ledger: &Ledger<SessionLedger>, token: &str) -> u
 /// ——package SID宛の自己検証にこのパスを混ぜると、宛先SIDが違うのだからACEが無いのは当然なのに
 /// 「幻の台帳エントリ」として毎回報告される。
 pub fn granted_capability_paths_for_current_session() -> Vec<String> {
+    capability_paths(|_| true)
+}
+
+/// [§22.3.2] **その宛先SIDのぶんだけ**を返す（自己検証`grant_audit`へ渡すのはこちら）。
+///
+/// # なぜ和を渡してはいけないのか
+///
+/// `grant_audit`は宛先SIDを**1本ずつ**測る。[`granted_capability_paths_for_current_session`]は
+/// **全capability SIDの和**を返すので、そのまま渡すと**別のSIDのパス**が候補に入り、
+/// そのSIDのACEが無いのは当然なのに「台帳にあるのにACEが載っていない（幻の台帳エントリ）」
+/// として報告される——`HARNESS_GRANT_AUDIT=strict`ではその場で落ちる。
+///
+/// これは同モジュールが既に書いている罠と**同じ形**である（package SID宛の自己検証へ
+/// capabilityのパスを混ぜると全件が偽陽性になる、という理由でそちらは別の集合にしてある）。
+/// 混ぜてはいけない相手が「package SIDとcapability SID」だけでなく
+/// **「別々のcapability SID同士」**にも及ぶ、というのが違いである。
+///
+/// # 1セッションが2枚以上記録し得る
+///
+/// セッション切替とfork（`/sessions`・`/fork`・`--fork-session`）は、そのたびに新しい差分層へ
+/// ACEを付けて記録する。[BUG-147]で`--fork-session`の経路が`preflight`より前に記録するように
+/// なったので、**`preflight`が自己検証を回す時点で2枚載っている回**が生まれ得る。
+pub fn granted_capability_paths_for(capability_name: &str) -> Vec<String> {
+    capability_paths(|g| g.capability_name == capability_name)
+}
+
+fn capability_paths(keep: impl Fn(&CapabilityGrant) -> bool) -> Vec<String> {
     let token = session_token();
     ledger()
         .load()
@@ -611,6 +680,7 @@ pub fn granted_capability_paths_for_current_session() -> Vec<String> {
         .map(|e| {
             e.granted_capabilities
                 .into_iter()
+                .filter(|g| keep(g))
                 .map(|g| g.path)
                 .collect()
         })

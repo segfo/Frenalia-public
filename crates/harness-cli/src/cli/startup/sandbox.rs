@@ -152,17 +152,17 @@ pub(super) fn stage_prepare_sandbox(
     // `fork_overlay`→`prepare_scope`は**差分層のACEをここで書く**——`--fork-session`と
     // `--sandbox tier2a-cow`の併用を拒む判定はどこにも無い。
     //
-    // **この関数は`select_tier`（内部で`preflight`）より前にある。** つまりこの時点では
-    // `session_profile::begin_session`がまだ走っておらず、セッション台帳のエントリが無いので、
-    // `prepare_cow_diff_layer`の`record_granted_capability`は記録できず
-    // 「このACEは自動で撤収されない」というBUG-101の警告を出す。**ただし孤立はしない**——
-    // 後続の`preflight`が**同じ差分層**（`write_mode.diff_layer_dir`と`scope_for`の結果は
-    // どちらも`cow_diff_layer_dir_in(root, session.id())`）へ付け直し、そこで記録される。
-    // **警告だけが偽である。**
+    // **この関数は`select_tier`（内部で`preflight`）より前にある。** つまりここへ来た時点では
+    // まだ`preflight`が`session_profile::begin_session`を呼んでいない。
+    // **[BUG-147] だから`prepare_cow_diff_layer`が自分で開く**——ACEを書く前に
+    // `begin_session`を通すので、この経路で付けた差分層のACEもその場で台帳に載る。
     //
-    // 以上は**実コードを読んで確かめた結論で、実行して測ってはいない**
-    // （`--fork-session`は実機のセッションを触るため）。測定の記録は
-    // `plans/mac-spike/RESULTS.md` §S39。
+    // かつてここには「記録できないが、後続の`preflight`が同じ差分層へ付け直して記録するので
+    // 警告だけが偽である」と書いてあった。**その一文は`preflight`が成功した回しか含んでいない**
+    // ——下の`select_tier`が`Err`を返すと`ExitCode::FAILURE`で起動ごと打ち切るので、付け直しは起きず、
+    // ACEだけが撤収の索引を持たないまま実マシンに残っていた（実測は
+    // `plans/mac-spike/RESULTS.md` §S43）。順序を直したので、打ち切られた回でも
+    // `end_session`と次回起動のGCが引ける。
     if let Some(source_id) = &forked_from_session_id {
         let template =
             harness_sandbox::session_scope::ScopeTemplate::new(&write_mode, staging_mode);

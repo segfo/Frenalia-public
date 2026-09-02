@@ -682,6 +682,24 @@ fn create_overlay_dir(dir: &Path) -> Result<(), String> {
 /// package SID宛のまま残る**——そしてその状態は**成功に見える**（新しいACEは正しく付き、
 /// アクセスも通る）。宛先SIDの導出は`win_appcontainer::cow_diff_layer_capability_sid`ただ1本が
 /// 持つので、規則がずれることはない。
+///
+/// # [BUG-147] セッション台帳のエントリは、ACEより先に開く
+///
+/// **この関数は`preflight`より前に走り得る**（`harness-cli`の`--fork-session`は
+/// `select_tier`＝内部で`preflight`より前にforkを済ませる）。`preflight`が
+/// `session_profile::begin_session`を呼ぶまでセッション台帳にこのプロセスのエントリは無く、
+/// エントリが無いと`record_granted_capability`は**何も記録できない**——ACEは載るのに
+/// 撤収の索引がどこにも無い状態になる。
+///
+/// 通常の起動では後続の`preflight`が同じ差分層へ付け直して記録するので警告は偽だが、
+/// **`preflight`が失敗して起動が打ち切られた回は付け直しが起きない**（Redirector DLLの
+/// 刻印ずれ・祖先traverse不足・モード衝突のどれでも起きる）。その回のACEは`end_session`も
+/// `gc_dead_sessions`も引けない。
+///
+/// だから**ACEを書く前に自分で開く**。`begin_session`は冪等なので、既に開いていれば何も
+/// 起きない。同じ形の先例が2つある——`win_appcontainer::ensure_profile`（プロファイルを
+/// 作る前に記録する）と`session_profile::record_mcp_profile`（ぶら下げる先が無ければ作る）で、
+/// どちらもBUG-107の修正である。
 #[cfg(windows)]
 fn prepare_cow_diff_layer(
     workspace_root: &Path,
@@ -690,6 +708,22 @@ fn prepare_cow_diff_layer(
 ) -> Result<usize, String> {
     use crate::tier2a::{session_profile, win_appcontainer, workspace_capability, workspace_ledger};
 
+    // [BUG-147] **ぶら下げる先が無ければ、ここで開く。** 下の`record_granted_capability`は
+    // セッション台帳のエントリが無いと黙って何も書かない（警告は出るが記録はされない）。
+    // 冪等なので、`preflight`を先に通った経路（TUIの`/fork`・`/sessions`）では何も起きない。
+    //
+    // **失敗したら付与しない**（fail-closed）。ここで続行すると、記録できないと分かっている
+    // まま実マシンへACEを書くことになり、この欠陥そのものを自分で作る。`prepare_scope`の
+    // 契約（「失敗したら切り替えない」）とも、`preflight`が同じ失敗を致命として扱うのとも
+    // 揃っている。
+    session_profile::begin_session().map_err(|e| {
+        format!(
+            "could not open the session ledger entry before granting access to {}: {e}; \
+             refusing to write an ACE that nothing could revoke (see docs/bugs/BUG-147.md)",
+            diff_layer_dir.display()
+        )
+    })?;
+
     // 宛先SIDの導出鍵に入るworkspaceは**canonicalize済み**でなければならない（`preflight`が
     // 渡すのと同じ値にする）。綴りが違うと別の台帳エントリ＝別のSIDになり、付けた宛先SIDと
     // 積むcapability SIDが食い違って「ACEは正しいのに子から一切見えない」形で出る。
@@ -697,7 +731,8 @@ fn prepare_cow_diff_layer(
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
 
-    // 順序が本質: 実体を作る → ACEを付ける → **台帳へ記録する**（B-01/B-15）。記録を落とすと
+    // 順序が本質: **撤収の索引を開く**（上の`begin_session`、BUG-147） → 実体を作る →
+    // ACEを付ける → **台帳へ記録する**（B-01/B-15）。記録を落とすと
     // `end_session`/`gc_dead_sessions`がこのACEを引けず、切替のたびに撤収経路の無い孤立ACEが
     // 1件ずつ実マシンへ残る（BUG-038・BUG-059で実際に8件残留した形）。記録は
     // ACE付与が成功した後にだけ行う——先に記録すると「台帳にあるのに実体が無い」逆向きの

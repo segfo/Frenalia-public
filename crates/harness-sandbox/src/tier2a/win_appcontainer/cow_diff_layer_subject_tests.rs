@@ -42,24 +42,25 @@
 //! | 5 | 付与そのものが昇格側へ委譲されていない | `granting_the_cow_diff_layer_never_reaches_the_elevated_path` |
 //! | 6 | 祖先traverseが昇格を要求するかは**置き場が決める**（本番の置き場は今どちら側か） | `where_the_diff_layer_sits_decides_whether_the_ancestor_traverse_demands_elevation` |
 //!
-//! # 7〜8は`--fork-session`との併用で出る**偽警告**の測定である（分流E）
+//! # 7〜8は`--fork-session`との併用（[BUG-147](../../../../docs/bugs/BUG-147.md)）の測定である（分流E）
 //!
 //! `plans/mac-spike/RESULTS.md`§S39-5が読取だけで見つけた食い違いを、実行して測る側へ移したもの。
-//! **問いは2つに割れている**——警告が出るのか（出るなら偽か）と、そのACEが後で剥がれるのか。
-//! 前者だけなら低深刻度の欠陥だが、剥がれないなら**どのコマンドでも剥がせないACE**が
-//! セッションのたびに1件ずつ増える（BUG-101と同型）ので本物の欠陥である。
+//! **問いは2つに割れていた**——警告が出るのか（出るなら偽か）と、そのACEが後で剥がれるのか。
+//! 測った結果は「通常の起動では偽警告だが、**起動が打ち切られた回のACEは剥がれない**」で、
+//! それをBUG-147として起票し、`session_scope::prepare_cow_diff_layer`が
+//! **ACEを書く前に自分で`begin_session`を呼ぶ**ようにして塞いだ。8はその**回帰テスト**である。
 //!
 //! | # | 測るもの | このファイルのテスト |
 //! |---|---|---|
 //! | 7 | CoWのとき、forkの経路は**ステージングモードに関わらず**差分層を用意する分岐へ落ちる（純関数。実機を触らない） | `a_cow_write_mode_puts_the_fork_path_into_the_diff_layer_branch_in_every_staging_mode` |
-//! | 8 | セッション台帳のエントリが**無い**時点でforkを通すと、ACEは載るのに記録が載らない。後続の`preflight`が**同じ宛先SID**へ付け直して記録し、`end_session`で剥がれる。**逆に、`preflight`が届かなかった差分層のACEは`end_session`でも剥がれない**（＝起動が中止された回に残る条件） | `the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_record_it` |
+//! | 8 | セッション台帳のエントリが**無い**時点でforkを通しても、fork自身がエントリを開くのでACEと記録が揃う。**`preflight`へ渡さない差分層**（＝起動が中止された回に残るもの）も記録され、`end_session`で剥がれる | `the_fork_path_opens_the_session_ledger_entry_before_granting_the_diff_layer_ace` |
 //!
-//! **8が「偽警告だけ」で終わるのは`preflight`が成功した回に限る。** `harness-cli`の起動は
-//! forkを済ませた後で`select_tier`（内部で`preflight`）を呼び、そこが`Err`なら
-//! `ExitCode::FAILURE`で**起動ごと打ち切る**（`cli/startup/sandbox.rs:166`・`:173`・`:451`・`:467`）。
-//! その回は`begin_session`が1度も走らないのでセッション台帳にエントリが無く、
-//! `end_session`も`gc_dead_sessions`もfork窓のACEを引けない。8はその状態を同じ回の中に
-//! **もう1枚の差分層**（`preflight`へ渡さない側）として作り、実際に剥がれないことまで測る。
+//! **8が守っているのは「打ち切られた回」である。** `harness-cli`の起動はforkを済ませた後で
+//! `select_tier`（内部で`preflight`）を呼び、そこが`Err`なら`ExitCode::FAILURE`で
+//! **起動ごと打ち切る**（`cli/startup/sandbox.rs`のfork分岐と`select_tier`）。
+//! 直す前のその回は`begin_session`が1度も走らず、`end_session`も`gc_dead_sessions`も
+//! fork窓のACEを引けなかった。8はその状態を同じ回の中に
+//! **もう1枚の差分層**（`preflight`へ渡さない側）として作り、いまは剥がれることまで測る。
 //!
 //! # 実行（**昇格しないこと**）
 //!
@@ -69,12 +70,13 @@
 //!
 //! **ただし8だけは自分のプロセスを独り占めしなければならない。** 測っているのが
 //! 「`begin_session`より**前**に通ったとき」だからで、同じプロセスで先に走ったテストが
-//! 1本でもセッションを開くと前提が消える（`session_token`はプロセス内で1つに固定される）。
-//! 8は前提が崩れていたら**飛ばさずに落ちる**（`B-12`）ので、単独で撃つこと。
+//! 1本でもセッションを開くと**測りたい前提が消える**——「記録が載った」がforkの手柄なのか、
+//! 先に走ったテストの副作用なのかを分けられなくなる（`session_token`はプロセス内で1つに
+//! 固定される）。8は前提が崩れていたら**飛ばさずに落ちる**（`B-12`）ので、単独で撃つこと。
 //!
 //! ```text
 //! cargo test -p harness-sandbox --lib -- --ignored --exact --nocapture \
-//!   tier2a::win_appcontainer::cow_diff_layer_subject_tests::the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_record_it
+//!   tier2a::win_appcontainer::cow_diff_layer_subject_tests::the_fork_path_opens_the_session_ledger_entry_before_granting_the_diff_layer_ace
 //! ```
 //!
 //! 昇格すると子のトークンが実運用とずれる（`B-08`）。対象を`C:\`直下に置いてあるのは、
@@ -1152,58 +1154,60 @@ fn where_the_diff_layer_sits_decides_whether_the_ancestor_traverse_demands_eleva
 }
 
 // =============================================================================
-// 測定E（分流E、`plans/handoff/issue20-measure/E.md`）:
-//   **`--sandbox tier2a-cow` と `--fork-session` を併用したときの偽警告**
+// 測定E（分流E、`plans/handoff/issue20-measure/E.md`）→ [BUG-147]の回帰テスト:
+//   **`--sandbox tier2a-cow` と `--fork-session` を併用したとき、ACEと記録が揃うこと**
 // =============================================================================
 //
 // 見立ての出所は`plans/mac-spike/RESULTS.md`§S39-5で、**読取だけで見つけた食い違い**である。
-// 要点は順序にある——`harness-cli`の`startup::sandbox`はforkの分岐を`select_tier`
+// 要点は順序にあった——`harness-cli`の`startup::sandbox`はforkの分岐を`select_tier`
 // （内部で`preflight`）**より前**に置いており、その時点では`session_profile::begin_session`が
 // まだ走っていない。セッション台帳にこのプロセスのエントリが無いので
 // `record_granted_capability`は記録できず、「このACEは自動で撤収されない」（BUG-101）という
-// 警告が出る。**ただし孤立はしない**——後続の`preflight`が同じ差分層へ付け直して記録する、
-// というのが見立てだった。
+// 警告が出た。**通常の起動では孤立しない**——後続の`preflight`が同じ差分層へ付け直して
+// 記録するからで、そこまでは見立てのとおりだった。
 //
-// # 問いは2つに割れている（どちらへ倒れるかで深刻度が変わる）
+// # 測った結果、深刻度は「偽警告だけ」では終わらなかった
 //
-// | 問い | 倒れ方 |
+// | 問い | 実測（2026-09-01、§S43） |
 // |---|---|
-// | 警告は出るか | 出るなら、それは**記録できなかった**という真の報告か、**後で記録されるのに出た**偽警告か |
-// | そのACEは後で剥がれるか | 剥がれるなら偽警告だけ（低深刻度）。剥がれないなら**どのコマンドでも剥がせないACE**が増える本物の欠陥 |
+// | 警告は出るか | 出る。**`preflight`が成功した回については偽**（同じ宛先SIDへ付け直して記録される） |
+// | そのACEは後で剥がれるか | **`preflight`が届かなかった回は剥がれない**。`end_session`もGCも引く先が無い |
 //
-// # 測る／測らない（**射程をここで固定する**）
-//
-// - **測る**: 「セッション台帳のエントリが無い状態で`fork_overlay`を通すと、差分層に
-//   ACEは載るのに記録は載らない」／「後続の`preflight`が**同じ宛先SID**へ付け直して記録する」／
-//   「`end_session`でそのACEが実際に剥がれる」／**「`preflight`が届かなかった差分層のACEは
-//   `end_session`でも剥がれない」**（起動が中止された回の姿。下の「深刻度の分岐」）
-// - **測らない**: `harness.exe`を`--fork-session`付きで起動すること（実マシンのセッションを
-//   触るので回さない）。`startup::sandbox`の**行の順序**そのもの（読取のまま）。
-//   `resolve_staging_and_write_mode`が本番の根（`%LOCALAPPDATA%\harness\data\cow`）を選ぶところ
-//   ——そこは開発機の実データ48件が入っている場所なので、**根は`C:\`に固定して触れない**。
-//
-// # 深刻度の分岐は「`preflight`がそのあと成功したか」で決まる
-//
-// 「偽警告だけ（低深刻度）」が言えるのは、**fork窓のACEを後続の`preflight`が付け直して
-// 記録した回だけ**である。`harness-cli`の起動シーケンスはforkを先に済ませ
-// （`cli/startup/sandbox.rs:166`・`:173`）、そのあとの`select_tier`（内部で`preflight`）が
-// `Err`を返すと`ExitCode::FAILURE`で**起動ごと打ち切る**（同`:451`・`:467`）。
-// **この回は`begin_session`が1度も走らない**ので、
+// 2つ目が[BUG-147](../../../../docs/bugs/BUG-147.md)である。`preflight`の失敗は絵空事ではない
+// ——Redirector DLLの刻印不一致（セッションごと拒否）、祖先traverse不足、
+// `begin_workspace_mode`のモード衝突（同じworkspaceで通常起動が走っている）のどれでも起きる。
+// その回は`begin_session`が1度も走らないので、
 //
 // - セッション台帳にエントリが無い → `end_session`も`gc_dead_sessions`も引く先が無い
 // - `fs revoke-workspace`も届かない → 差分層のACEはworkspaceツリーの外に載っており、
 //   台帳側の記録は`declaration`付きエントリとして撤収対象から除かれる
-//   （`harness-cli/src/fs_grants/workspace.rs:314`〜`:319`）
+//   （`harness-cli/src/fs_grants/workspace.rs`の`forget_revoked_ledger_records`）
 //
-// `preflight`の失敗は絵空事ではない——Redirector DLLの刻印不一致（セッションごと拒否）、
-// 祖先traverse不足、`begin_workspace_mode`のモード衝突（同じworkspaceで通常起動が走っている）
-// のどれでも起きる。だから**測るのは「成功した回」だけにしない**——同じ回の中に
-// 「`preflight`へ渡さない差分層」をもう1枚作り、記録されなかったACEが`end_session`で
-// **剥がれないこと**まで見る。これで深刻度の二択が読取ではなく実測になる。
+// # 直し方と、このテストが守るもの
 //
-// **その腕が作るのは「中止という出来事」ではなく「中止が残す状態」である。** 本番は
+// `session_scope::prepare_cow_diff_layer`が**ACEを書く前に自分で`begin_session`を呼ぶ**
+// ようにした（冪等なので、`preflight`を先に通った経路では何も起きない）。
+// **このテストはその回帰テストである**——直す前は下の腕1・腕1b・腕4が逆向きに書かれており、
+// assertが通ることが「欠陥が在る」の確認だった。
+//
+// # 測る／測らない（**射程をここで固定する**）
+//
+// - **測る**: 「セッション台帳のエントリが無い状態で`fork_overlay`を通しても、差分層の
+//   ACEと記録が揃う」／「後続の`preflight`が**同じ宛先SID**へ付け直し、ACEを2本にしない」／
+//   **「`preflight`へ一度も渡さなかった差分層のACEも記録され、`end_session`で剥がれる」**
+//   （起動が中止された回の姿）
+// - **測らない**: `harness.exe`を`--fork-session`付きで起動すること（実マシンのセッションを
+//   触るので回さない）。`startup::sandbox`の**行の順序**そのもの（読取のまま）。
+//   `resolve_staging_and_write_mode`が本番の根（`%LOCALAPPDATA%\harness\data\cow`）を選ぶところ
+//   ——そこは開発機の実データ48件が入っている場所なので、**根は`C:\`に固定して触れない**。
+// - **測らない（本番の回収経路そのもの）**: 起動が打ち切られた回、製品は`end_session`へ
+//   到達しない（呼ぶのは`run_agent.rs`の1箇所だけ）ので、実際に剥がすのは**次の起動のGC**
+//   である。ここが測るのは「記録が載る」ところまでで、記録された差分層をGCが剥がすことは
+//   `the_gc_path_also_takes_the_capability_ace_off_the_diff_layer`が別に測っている。
+//
+// **中止経路の腕が作るのは「中止という出来事」ではなく「中止が残す状態」である。** 本番は
 // `preflight`が失敗して同じ差分層が付け直されないのに対し、器は`preflight`を別の差分層へ
-// 通すことで「付け直されなかった差分層」を作る。**残る状態（ACEは在る／記録は無い／
+// 通すことで「付け直されなかった差分層」を作る。**残る状態（`preflight`が触っていない差分層で
 // セッションが終わる）は同じだが、失敗そのものを再現してはいない。**
 //
 // # 突き合わせる2つは、どこまで遡ると同じ値になるか
@@ -1302,56 +1306,72 @@ fn a_cow_write_mode_puts_the_fork_path_into_the_diff_layer_branch_in_every_stagi
     }
 }
 
-/// **測定E-8**: セッション台帳のエントリが**無い**時点でforkを通すと、差分層にACEは載るのに
-/// 記録が載らない（＝BUG-101の警告が出る）。そして**後続の`preflight`が同じ宛先SIDへ
-/// 付け直して記録し、`end_session`でそれが剥がれる**。
+/// **測定E-8**（[BUG-147](../../../../docs/bugs/BUG-147.md)の回帰テスト）:
+/// セッション台帳のエントリが**無い**時点でforkを通しても、fork自身がエントリを開くので
+/// 差分層のACEと記録が揃う。**`preflight`へ一度も渡さなかった差分層**（＝起動が中止された回に
+/// 残るもの）も記録され、`end_session`で剥がれる。
 ///
-/// # 壊れた状態を一文で
+/// # 直る前に壊れていた状態を一文で
 ///
 /// **`--sandbox tier2a-cow --resume <id> --fork-session`で書かれた差分層のACEが、
 /// どの撤収経路からも引けないまま実マシンに残る。**
 ///
 /// # このテストがプロセスを独り占めしなければならない理由
 ///
-/// 測っているのは`begin_session`の**前**に通ったときの振る舞いで、`session_token`は
+/// 測っているのは`begin_session`より**前**に通ったときの振る舞いで、`session_token`は
 /// プロセス内で1つに固定される（`OnceLock`）。同じプロセスで先に走ったテストが1本でも
-/// `preflight`／`session_sid`を通すと台帳エントリができ、**測りたい窓が消えたことに
-/// 気付かないまま「記録された」という逆の結論が出る**。だから前提を最初に測り、
-/// 崩れていたら飛ばさずに落ちる（`B-12`）。撃ち方はモジュールdocの`--exact`の行。
+/// `preflight`／`session_sid`を通すと台帳エントリができ、**「記録が載った」がforkの手柄なのか
+/// 先に走ったテストの副作用なのかを分けられなくなる**——直したはずの経路を1行も通らなくても
+/// 緑になる。だから前提を最初に測り、崩れていたら飛ばさずに落ちる（`B-12`）。
+/// 撃ち方はモジュールdocの`--exact`の行。
 ///
-/// # 何を根拠に「偽警告だけ」と言うか（対で測る、`B-35`）
+/// # 何を根拠に「直った」と言うか（対で測る、`B-35`）
 ///
 /// | 腕 | 期待 | それが無いと |
 /// |---|---|---|
-/// | **fork窓**（`begin_session`前）: ACEは在る／記録は無い | 警告が出る条件が成立 | 「警告が出る」の根拠が読取だけのまま |
+/// | **前提**: fork前は台帳にこのセッションのエントリが無い | 後の「載った」に差が出る | 「載っている」が計器の初期値と区別できない |
+/// | **fork窓**（かつて記録できなかった側）: ACEが在り、**記録も載る**／自己検証の`present_unrecorded`に出ない | 順序の修正が効いている | 直したことの根拠が読取だけのまま |
+/// | **中止経路**（`preflight`へ渡さない差分層）: 同じ窓で用意したものも**記録が載る** | 起動が打ち切られた回にも撤収の索引が在る | 緑が「`preflight`が付け直した回」しか含まない |
 /// | **`preflight`後**: 宛先SIDが同じ／記録が載る／ACE本数が増えない | 付け直しであって2本目ではない | 「孤立しない」が言えない |
-/// | **中止経路**（`preflight`へ渡さない差分層）: 記録は最後まで載らず、`end_session`でも**剥がれない** | 深刻度の二択のうち「本物の欠陥」側の条件が実測になる | 緑が「偽警告だけ・低深刻度」へ倒れるが、その一文が**起動中止の回を含まない**（下の節） |
-/// | **対照（`begin_session`後の`prepare_scope`）**: その場で記録が載る | 記録の経路そのものは壊れていない | 「記録が無い」が計器の沈黙と区別できない |
-/// | **`end_session`**: 付け直された側のACEが消える | 撤収まで届いている | 「剥がれる」が言えない |
+/// | **対照（`begin_session`後の`prepare_scope`）**: その場で記録が載る | 記録の経路そのものは壊れていない | 記録の有無が計器の沈黙と区別できない |
+/// | **`end_session`**: fork窓・対照・**中止経路**の3つともACEが消える | 撤収まで届いている | 「剥がれる」が言えない |
 ///
-/// # なぜ「中止経路」の腕が要るのか（**この測定の結論を反転させる側だから**）
+/// # なぜ「中止経路」の腕が要るのか（**この欠陥はそこにしか無かった**）
 ///
-/// 上の1〜2番目だけだと、緑は「`preflight`が付け直すから偽警告だけ。低深刻度」と読める。
+/// fork窓の腕だけだと、緑は「`preflight`が付け直すから問題ない」でも成立してしまう。
 /// **その一文は`preflight`が成功した回しか含んでいない。** 起動シーケンスはforkを先に済ませ、
 /// あとから`select_tier`（内部で`preflight`）が`Err`を返すと`ExitCode::FAILURE`で
-/// 打ち切る（`cli/startup/sandbox.rs:166`・`:173`・`:451`・`:467`）ので、
-/// **fork窓のACEだけが実マシンに残り、`begin_session`が走っていないので撤収の索引がどこにも無い**。
-/// 深刻度の二択そのものがこの経路の上にあるため、ここを測らないと判定が読取に戻る。
+/// 打ち切る（`cli/startup/sandbox.rs`のfork分岐と`select_tier`）ので、直す前は
+/// **fork窓のACEだけが実マシンに残り、`begin_session`が走っていないので撤収の索引がどこにも
+/// 無かった**。BUG-147そのものがこの経路の上にあるため、ここを測らないと回帰を守れない。
 ///
 /// **この腕は「中止」を再現しない。中止が残す状態を作る。** `preflight`を別の差分層へ通し、
 /// 一方を「付け直されない差分層」として残す形なので、失敗の原因（Redirector DLLの刻印不一致・
-/// 祖先traverse不足・モード衝突）そのものは1つも起こしていない。**言えるのは
-/// 「記録されなかったACEは`end_session`では剥がれない」まで**である。
+/// 祖先traverse不足・モード衝突）そのものは1つも起こしていない。
 ///
-/// # 向きが逆な腕が2つある
+/// **本番の回収経路は`end_session`ではない。** 打ち切られた回、製品は`end_session`へ到達しない
+/// （呼ぶのは`run_agent.rs`の1箇所だけ）ので、実際に剥がすのは次の起動のGCである。
+/// ここが守るのは**記録が載るところまで**で、記録された差分層をGCが剥がすことは
+/// [`the_gc_path_also_takes_the_capability_ace_off_the_diff_layer`]が測っている。
 ///
-/// 腕1（記録が載らない）と中止経路の腕（剥がれない）は、**assertが通ることが「欠陥が在る」の
-/// 確認**である。緑を「機構が正しい」と読まないこと。
+/// # このテストが**区別できないこと**（歯の確認で分かった、`B-27`）
 ///
-/// **3番目が要である。** `granted_capability_paths_for_current_session`は台帳を読めなければ
-/// 黙って空を返す（fail-open）ので、fork窓の「記録が無い」だけを見ると、**台帳が読めていない回と
-/// いちばん強い結論の回が同じ形になる**。同じ関数（`prepare_scope`）を、セッションを開いた後に
-/// もう一度通して記録が載ることを見て初めて、1番目の「無い」が対象の性質だと言える。
+/// BUG-147の修正は2層ある——(1) `prepare_cow_diff_layer`がACEを書く**前**に`begin_session`を
+/// 呼ぶ（順序）、(2) `record_into_session_entry`がエントリを見つけられなければ開いて
+/// やり直す（保険）。**このテストは(1)だけを外しても緑のままである**（実測。(2)が拾うため）。
+/// 赤くなるのは**両方を外したとき**で、つまりここが守っているのは「forkの経路で
+/// ACEと記録が揃うこと」であって、**どちらの層がそれを成立させているかではない**。
+///
+/// (1)が(2)に対して足しているのは、**ACEを書いてから記録するまでの窓**（プロセスがそこで
+/// 消えると記録が残らない）を狭めることだが、このテストはプロセスを殺さないので測れない。
+/// その窓は[BUG-112](../../../../docs/bugs/BUG-112.md)＝`docs/STATUS.md`残課題#23の主題で、
+/// **そちらは別に閉じる**。
+///
+/// # 対照が要る理由（`granted_capability_paths_for_current_session`は黙って空を返す）
+///
+/// この関数は台帳を読めなければ fail-open で空を返す。だから「載っていない」を根拠にする腕は
+/// **台帳が読めていない回と区別が付かない**。前提の腕（fork前は空）と対照の腕
+/// （`begin_session`後の`prepare_scope`では載る）を同じ回に入れて、初めて差が読める。
 ///
 /// # 本番と同じ形で測る
 ///
@@ -1369,7 +1389,7 @@ fn a_cow_write_mode_puts_the_fork_path_into_the_diff_layer_branch_in_every_stagi
 /// **そこを使わないことを、走らせる前にassertで固定する。**
 #[test]
 #[ignore = "real machine: creates directories under C:\\, writes DACLs, and ends this process's session; run NON-elevated and ALONE (--exact), see the module doc"]
-fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_record_it() {
+fn the_fork_path_opens_the_session_ledger_entry_before_granting_the_diff_layer_ace() {
     use crate::session_scope::{fork_overlay, prepare_scope, ScopeTemplate};
     use crate::shell_tier::WorkspaceWriteMode;
     use crate::tier2a::{grant_audit, session_profile};
@@ -1377,26 +1397,36 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
 
     // --- 前提: このプロセスはまだセッションを開いていない ---
     //
-    // 開いていたら、以下の「記録が載らない」は**窓が消えた後の別の世界**を測ることになる。
+    // 開いていたら、以下の「記録が載った」は**forkの手柄ではない**——直したはずの経路を
+    // 1行も通らないまま緑になる。
     eprintln!("live probe: {}", session_profile::live_probe_report());
     let profile = session_profile::current_profile_name();
     assert!(
         !session_profile::live_profile_names().contains(&profile),
         "このプロセスは既にセッションを開いている（{profile}）。測っているのは\
-         `begin_session`より**前**の窓なので、この状態で走らせると『記録が載らない』ではなく\
-         『載った』が出て、**逆の結論**になる。同じプロセスで他のテストを先に走らせないこと\
-         （モジュールdocの`--exact`の行で単独に撃つ）"
+         `begin_session`より**前**にforkを通したときの振る舞いなので、この状態で走らせると\
+         『記録が載った』が**forkのおかげか、先に走った別のテストの副作用か**を分けられない。\
+         同じプロセスで他のテストを先に走らせないこと（モジュールdocの`--exact`の行で単独に撃つ）"
+    );
+    // **fork前は1件も記録が無い**ことを測っておく（下の「載った」に差が出るように）。
+    // ここを測らないと、後半の`contains`は台帳の初期値と区別が付かない。
+    let recorded_before_fork = session_profile::granted_capability_paths_for_current_session();
+    eprintln!("recorded before fork: {recorded_before_fork:?}");
+    assert!(
+        recorded_before_fork.is_empty(),
+        "fork前からcapability宛の記録が載っている: {recorded_before_fork:?}。\
+         この回は「forkが記録を載せた」を差分として読めない"
     );
 
     // --- 計器の較正: 付与要求レジストリが生きている ---
     //
-    // 死んでいると`audit_subject`が`None`を返し、下の「ACEは在るのに記録に無い」を
+    // 死んでいると`audit_subject`が`None`を返し、下の「ACEが在り、台帳にも在る」を
     // 製品の自己検証で言えなくなる（判定を新設せず、既にあるものへ寄せる）。
     assert_ne!(
         grant_audit::mode(),
         grant_audit::Mode::Off,
         "HARNESS_GRANT_AUDIT=off で走っている。付与要求レジストリが空だと`audit_subject`は\
-         候補を1件も作れず`None`を返すので、『ACEは在るのに台帳に無い』を製品の自己検証で\
+         候補を1件も作れず`None`を返すので、『ACEが台帳に載っているか』を製品の自己検証で\
          測れない"
     );
 
@@ -1499,8 +1529,9 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
     );
 
     eprintln!(
-        "=== FORK WINDOW BEGIN (before begin_session) === \
-         a BUG-101 'this ACE will not be revoked automatically' line between these banners IS the finding"
+        "=== FORK WINDOW BEGIN (before any begin_session by preflight) === \
+         a BUG-101 'this ACE will not be revoked automatically' line between these banners means \
+         BUG-147 has regressed"
     );
     let copied = fork_overlay(&workspace, &from, &to)
         .expect("the CLI's --fork-session path must succeed under CoW");
@@ -1519,14 +1550,17 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
     assert_eq!(
         orphan_prepared, 1,
         "中止経路の腕の差分層が用意されていない。用意されていない差分層に\
-         『剥がれないACE』は存在しないので、以下は全部「未付与」の別名になる"
+         『撤収の索引を持つべきACE』は存在しないので、以下は全部「未付与」の別名になる"
     );
     assert!(
         new.join("manifest.jsonl").is_file(),
         "コピー先に中身が届いていない"
     );
 
-    // --- 腕1（fork窓）: ACEは在る／記録は無い ---
+    // --- 腕1（fork窓）: ACEが在り、**記録も載る** ---
+    //
+    // [BUG-147] 直す前はここが「記録は無い」だった。fork分岐は`preflight`より前にあるので、
+    // `prepare_cow_diff_layer`が自分で`begin_session`を呼ばない限りエントリが無い。
     let cap_after_fork = lookup_cow_diff_layer_capability_sid(&canonical_ws, &new).expect(
         "the fork window must have issued a capability for the new diff layer; without it the \
          child of the forked session cannot write anywhere",
@@ -1537,22 +1571,35 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
         sid_ace_mask(&new, cap_after_fork.as_psid())
             .expect("the new diff layer DACL must be readable")
             .is_some(),
-        "fork窓で差分層にACEが載っていない。載っていなければ『記録されないACE』という\
-         問題そのものが存在せず、以下は全部「未付与」の別名になる"
+        "fork窓で差分層にACEが載っていない。載っていなければ『記録されたか』を問う対象が\
+         そもそも無く、以下は全部「未付与」の別名になる"
     );
     let recorded_after_fork = session_profile::granted_capability_paths_for_current_session();
     eprintln!("recorded after fork: {recorded_after_fork:?}");
     assert!(
-        !recorded_after_fork.iter().any(|p| p == &new),
-        "fork窓で書いたACEがセッション台帳に載っている。§S39-5の見立て（`begin_session`より\
-         前なので記録できない）が偽で、警告も出ないことになる"
+        recorded_after_fork.iter().any(|p| p == &new),
+        "**BUG-147が再発している。** fork窓で書いたACEがセッション台帳に載っていない。\
+         `prepare_cow_diff_layer`はACEを書く前に`begin_session`を通すはずで、載らないなら\
+         起動が`preflight`の失敗で打ち切られた回に、撤収経路の無いACEが1件残る: \
+         {recorded_after_fork:?}"
     );
     // **判定は製品の自己検証へ寄せる**（新しい述語を作らない）。`present_unrecorded`は
     // 「ACEは実在するのに台帳に無い＝孤児予備軍」そのものである。
+    //
+    // **渡す記録は製品と同じく「この宛先SIDのぶんだけ」に絞る**
+    // （`granted_capability_paths_for`）。上の`recorded_after_fork`は全capabilityの和なので、
+    // そのまま渡すと**中止経路の腕のパス**が候補に入り、この宛先SIDのACEが無いのは当然なのに
+    // 「幻の台帳エントリ」として出る（`HARNESS_GRANT_AUDIT=strict`ならそこで落ちる）。
+    let new_cap_name = crate::tier2a::workspace_capability::lookup_declaration_capability_name(
+        &canonical_ws,
+        &new,
+        COW_DIFF_LAYER_ACCESS.label(),
+    )
+    .expect("the fork window must have recorded the capability name for the new diff layer");
     let audit_after_fork = grant_audit::audit_subject(
         grant_audit::Stage::Preflight,
         cap_after_fork.as_psid(),
-        &recorded_after_fork,
+        &session_profile::granted_capability_paths_for(&new_cap_name),
     )
     .expect("the diff layer grant must be a candidate for the self-check");
     eprintln!("audit(after fork): {:?}", audit_after_fork.summary());
@@ -1562,11 +1609,12 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
          対象について何も言わない"
     );
     assert!(
-        audit_after_fork
+        !audit_after_fork
             .present_unrecorded
             .iter()
             .any(|p| p.path == new),
-        "製品の自己検証がfork窓のACEを『台帳に無いACE』として拾わなかった: {audit_after_fork:?}"
+        "製品の自己検証がfork窓のACEを『台帳に無いACE』として拾った。**これがBUG-147の\
+         症状そのものである**: {audit_after_fork:?}"
     );
     let aces_after_fork =
         super::test_support::describe_dacl_aces(&new).expect("read the diff layer DACL");
@@ -1575,10 +1623,12 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
         eprintln!("  {ace}");
     }
 
-    // --- 腕1b（中止経路）: `preflight`へ渡さない差分層も、同じ窓で同じ状態になる ---
+    // --- 腕1b（中止経路）: `preflight`へ渡さない差分層も、同じ窓で記録される ---
     //
     // ここで測っているのは**起動が打ち切られた回に残るもの**である。腕1との違いは
     // 「このあと`preflight`が付け直すかどうか」の1点だけで、置き場も経路も同じにしてある。
+    // **この腕がBUG-147の本体である**——腕1だけなら、記録が無くても後続の`preflight`が
+    // 付け直すので症状が出ない。
     let orphan_cap = lookup_cow_diff_layer_capability_sid(&canonical_ws, &orphan).expect(
         "the fork window must have issued a capability for the aborted-path diff layer too",
     );
@@ -1586,15 +1636,16 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
         sid_ace_mask(&orphan, orphan_cap.as_psid())
             .expect("the aborted-path diff layer DACL must be readable")
             .is_some(),
-        "中止経路の腕の差分層にACEが載っていない。載っていなければ『撤収経路の無いACE』という\
-         問題そのものが存在せず、この腕は何も言っていない"
+        "中止経路の腕の差分層にACEが載っていない。載っていなければ『撤収の索引を持つべきACE』が\
+         存在せず、この腕は何も言っていない"
     );
     assert!(
-        !session_profile::granted_capability_paths_for_current_session()
+        session_profile::granted_capability_paths_for_current_session()
             .iter()
             .any(|p| p == &orphan),
-        "中止経路の腕のACEがセッション台帳に載っている。fork窓（`begin_session`前）で\
-         記録できないという前提が偽なら、起動が打ち切られた回にも記録は残ることになる"
+        "**BUG-147が再発している。** `preflight`へ渡さない差分層のACEがセッション台帳に\
+         載っていない。この状態は起動が打ち切られた回に実マシンへ残るもので、\
+         `end_session`も`gc_dead_sessions`も引く先が無い"
     );
 
     // --- 腕2（後続の`preflight`）: 同じ宛先SIDへ付け直し、記録される ---
@@ -1603,8 +1654,8 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
         crate::win_common::sid_to_string(cap_after_preflight.as_psid()).expect("render the SID");
     assert_eq!(
         cap_text_after_fork, cap_text_after_preflight,
-        "fork窓と`preflight`が別の宛先SIDへ書いている。そうであればfork窓のACEは付け直されず、\
-         **偽警告ではなく本物の孤児**である"
+        "fork窓と`preflight`が別の宛先SIDへ書いている。そうであれば`preflight`はfork窓のACEを\
+         付け直しておらず、1本目は置き去りになる"
     );
     let aces_after_preflight =
         super::test_support::describe_dacl_aces(&new).expect("read the diff layer DACL");
@@ -1619,13 +1670,13 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
     eprintln!("recorded after preflight: {recorded_after_preflight:?}");
     assert!(
         recorded_after_preflight.iter().any(|p| p == &new),
-        "`preflight`のあとでもfork窓のACEが台帳に載っていない。載らないなら`end_session`も\
-         GCもこれを引けず、警告は偽ではなく**正しい報告**である"
+        "`preflight`のあとでfork窓のACEが台帳から消えている。載らないなら`end_session`も\
+         GCもこれを引けない"
     );
     let audit_after_preflight = grant_audit::audit_subject(
         grant_audit::Stage::Preflight,
         cap_after_preflight.as_psid(),
-        &recorded_after_preflight,
+        &session_profile::granted_capability_paths_for(&new_cap_name),
     )
     .expect("the diff layer grant must still be a candidate for the self-check");
     eprintln!(
@@ -1640,18 +1691,25 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
         "`preflight`のあとも、製品の自己検証がこのACEを『台帳に無い』側に置いたままである: \
          {audit_after_preflight:?}"
     );
-    // **中止経路の腕は、`preflight`が走っても記録されないままである。**
-    // ここが載ると「起動を打ち切られても後続の何かが拾う」ことになるので、深刻度の判定が変わる。
+    // **中止経路の腕の記録は、`preflight`のあとも残っている。**
+    //
+    // この記録を載せたのは`preflight`ではなく**fork窓である**——腕1bで、`preflight`を呼ぶ前に
+    // 既に載っていることを測ってある。`preflight`は自分に渡されていない差分層を触らないので、
+    // ここが残っていることは「forkが載せた記録を誰も落としていない」を意味する。
     assert!(
-        !recorded_after_preflight.iter().any(|p| p == &orphan),
-        "`preflight`が、自分が渡されていない差分層（中止経路の腕）まで記録した。\
-         そうであれば起動が打ち切られた回のACEも誰かが拾うことになり、深刻度の判定が変わる: \
+        recorded_after_preflight.iter().any(|p| p == &orphan),
+        "中止経路の腕の記録が`preflight`のあとで消えている。fork窓が載せた記録を後続が\
+         落としているなら、起動が打ち切られた回のACEはやはり引けない: \
          {recorded_after_preflight:?}"
     );
-    // **撤収コマンドが届くかを、台帳エントリの種類で押さえる。** `fs revoke-workspace`は
-    // capability台帳から`declaration`が**無い**エントリだけを落とす
-    // （`harness-cli/src/fs_grants/workspace.rs:314`〜`:319`）。差分層のエントリが
-    // `declaration`付きで載っていることは、そのコマンドの射程の外にいることの側面である。
+    // **撤収の索引が2つあることを、台帳エントリの種類で押さえる。** セッション台帳が
+    // 失われても、宣言の台帳（`workspace-capability-ledger.json`）に名前が残っていれば
+    // SIDを導出し直せる——これがBUG-101（プロファイル名を失うと二度と剥がせない）と
+    // 今回とで深刻度が違う理由である。
+    //
+    // ただしその索引には穴がある。`harness fs revoke-workspace`は capability台帳から
+    // `declaration`が**無い**エントリだけを落とすので（`harness-cli/src/fs_grants/workspace.rs`の
+    // `forget_revoked_ledger_records`）、差分層のエントリは**そのコマンドの射程の外**にいる。
     //
     // **CLIそのものは呼んでいない**（`harness-sandbox`から`harness-cli`は引けない）ので、
     // ここで測れるのは台帳エントリの種類までで、コマンドの到達可否は読取のままである。
@@ -1676,7 +1734,7 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
         orphan_entry.declaration.is_some(),
         "中止経路の腕の台帳エントリが`declaration`無しで載っている。`fs revoke-workspace`の\
          撤収対象の突合（declaration無し）が差分層にも当たるということなので、\
-         『どのコマンドでも剥がせない』という読みの前提が変わる: {} (mode={})",
+         「そのコマンドの射程外」という読みの前提が変わる: {} (mode={})",
         orphan_entry.display_label(),
         orphan_entry.mode
     );
@@ -1684,7 +1742,8 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
     // --- 腕3（対照）: セッションを開いた後の同じ`prepare_scope`は、その場で記録する ---
     //
     // **動いた軸は「`begin_session`が済んでいるか」の1本だけ**である。ここが緑にならない回では、
-    // 腕1の「記録が無い」が対象の性質なのか台帳が読めていないだけなのかを分けられない。
+    // 腕1の「記録が載った」が順序の修正によるものなのか、そもそも記録の経路が常に効いて
+    // いるだけなのかを分けられない。
     let post_scope = template.scope_for(&post_id);
     assert_eq!(
         post_scope.cow_diff_layer_dir.as_deref(),
@@ -1705,12 +1764,11 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
         session_profile::granted_capability_paths_for_current_session()
             .iter()
             .any(|p| p == &post),
-        "**成功対照が失敗した。** セッションが開いた後でも記録が載らないなら、腕1の\
-         『記録が無い』はforkの順序が原因ではなく、台帳が読めていないか記録の経路が\
-         丸ごと壊れているかである。どちらでも腕1の結果は読めない"
+        "**成功対照が失敗した。** セッションが開いた後でも記録が載らないなら、記録の経路が\
+         丸ごと壊れているか台帳が読めていないかで、腕1の結果は読めない"
     );
 
-    // --- 腕4: `end_session`で両方のACEが剥がれる（第3の値） ---
+    // --- 腕4: `end_session`で3枚ともACEが剥がれる（第3の値） ---
     //
     // 剥がす側はセッション台帳に入った**名前**からSIDを作り直す。fork窓で書いたACEの持ち主と
     // 記録された名前が食い違っていれば、ここで剥がし残しとして出る。
@@ -1719,9 +1777,8 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
     assert_eq!(
         sid_ace_mask(&new, cap_after_preflight.as_psid()).expect("readable"),
         None,
-        "**fork窓で書かれたACEが剥がれなかった。** 偽警告ではなく本物の欠陥で、\
-         `--sandbox tier2a-cow --fork-session`のたびに撤収経路の無いACEが1件残る。\
-         leftovers: {:?}",
+        "**fork窓で書かれたACEが剥がれなかった。** `--sandbox tier2a-cow --fork-session`の\
+         たびに撤収経路の無いACEが1件残る。leftovers: {:?}",
         outcome.blocked_paths
     );
     assert_eq!(
@@ -1732,24 +1789,24 @@ fn the_fork_window_grants_the_diff_layer_ace_before_the_session_ledger_can_recor
         outcome.blocked_paths
     );
 
-    // --- 腕1bの結末（**向きが逆**）: 記録されなかったACEは剥がれない ---
+    // --- 腕1bの結末（**BUG-147が直ったことの本体**）: 中止経路のACEも剥がれる ---
     //
-    // **assertが通ることが「欠陥が在る」の確認である。** 起動が`preflight`の失敗で
-    // 打ち切られた回（`cli/startup/sandbox.rs:451`→`:467`）に残るのがこの状態で、
-    // セッション台帳にエントリが無いので`end_session`も`gc_dead_sessions`も引く先が無い。
+    // 起動が`preflight`の失敗で打ち切られた回（`cli/startup/sandbox.rs`のfork分岐→`select_tier`）
+    // に残るのがこの差分層である。直す前はセッション台帳にエントリが無く、`end_session`も
+    // `gc_dead_sessions`も引く先が無かった。
     //
-    // ここが**剥がれた**なら、撤収は記録に依らない別の索引を持っているということで、
-    // 中止経路も自力で片付く＝深刻度は「偽警告だけ」で閉じてよい。どちらへ倒れても収穫なので、
-    // 落ちたら「予測が外れた」として記録すること（§S40-4）。
+    // **製品の回収経路は`end_session`ではない**（打ち切られた回はそこへ到達しない）。ここが
+    // 測っているのは「記録が撤収まで通っている」ことで、次の起動のGCが同じ記録を引くことは
+    // `the_gc_path_also_takes_the_capability_ace_off_the_diff_layer`が別に測っている。
     let orphan_after_end = sid_ace_mask(&orphan, orphan_cap.as_psid())
         .expect("the aborted-path diff layer DACL must be readable");
     eprintln!("aborted-path ACE after end_session: {orphan_after_end:?}");
-    assert!(
-        orphan_after_end.is_some(),
-        "**予測が外れた**: 記録されなかったACEが`end_session`で剥がれた。撤収はセッション台帳の\
-         記録以外の索引も持っていることになり、起動が打ち切られた回のACEも片付く。\
-         この行が落ちたら『偽警告だけ・低深刻度』の射程は起動中止の回まで広げてよい。\
-         end_session: {:?}",
-        outcome.summary()
+    assert_eq!(
+        orphan_after_end, None,
+        "**BUG-147が再発している。** 起動が打ち切られた回に残る差分層のACEが`end_session`で\
+         剥がれなかった。fork窓が記録を載せていないか、載せた名前が実際の宛先SIDと\
+         食い違っている。end_session: {:?} leftovers: {:?}",
+        outcome.summary(),
+        outcome.blocked_paths
     );
 }

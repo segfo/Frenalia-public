@@ -586,11 +586,10 @@ pub fn preflight_with_privhelper_launcher(
                     diff_layer_dir,
                     COW_DIFF_LAYER_ACCESS.label(),
                 );
-            match diff_layer_cap_name {
-                Some(name) => crate::tier2a::session_profile::record_granted_capability(
-                    diff_layer_dir,
-                    &name,
-                ),
+            match &diff_layer_cap_name {
+                Some(name) => {
+                    crate::tier2a::session_profile::record_granted_capability(diff_layer_dir, name)
+                }
                 // 直前に発行したものが引けないのは起こり得ないが、**起きたら黙らない**（B-10）。
                 // 記録できないことは付与の失敗ではないので止めはしないが、このACEは自動撤収の
                 // 対象から外れる。
@@ -604,10 +603,23 @@ pub fn preflight_with_privhelper_launcher(
             // capability SIDを既定で対象外にしているが、その理由はワークスペースツリーで
             // 全件が偽陽性になることであって、差分層について検討した結果ではない。宛先SIDを
             // 移した以上、ここで明示的に測らないと差分層が静かに自己検証から外れる。
+            //
+            // **渡すのは「この宛先SIDのぶんの記録」だけである**（`granted_capability_paths_for`）。
+            // 全capabilityの和を渡すと、別のcapability SIDのパスが候補に入り、そのSIDのACEが
+            // 無いのは当然なのに「幻の台帳エントリ」として報告される。1セッションが差分層を
+            // 2枚記録する回はfork（[BUG-147]で`preflight`より前に記録するようになった）で生まれる。
+            //
+            // **名前が引けなかったときは空を渡して、測ること自体はやめない。** 記録できて
+            // いないのだから、この宛先SIDのACEは全部`present_unrecorded`として出るのが正しい
+            // ——そこは自己検証がいちばん役に立つ場面であり、黙って飛ばす場所ではない（B-10）。
+            let recorded_for_subject = diff_layer_cap_name
+                .as_deref()
+                .map(crate::tier2a::session_profile::granted_capability_paths_for)
+                .unwrap_or_default();
             if let Some(audit) = crate::tier2a::grant_audit::audit_subject(
                 crate::tier2a::grant_audit::Stage::Preflight,
                 diff_layer_cap.as_psid(),
-                &crate::tier2a::session_profile::granted_capability_paths_for_current_session(),
+                &recorded_for_subject,
             ) {
                 crate::tier2a::grant_audit::report(&audit);
             }
