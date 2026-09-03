@@ -155,7 +155,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
     if let Some(line) = render_net_proxy(net_proxy, shell_tier.tier) {
         lines.push(line);
     }
-    if let Some(line) = render_net_app(net_app) {
+    if let Some(line) = render_net_app(net_app, net_proxy.domain_policy_enabled) {
         lines.push(line);
     }
     lines.extend(render_mcp_servers(mcp_servers));
@@ -319,6 +319,21 @@ fn render_git_hardening() -> String {
         .to_string()
 }
 
+/// 重複を落としつつ順序を保つ。`read.deny`と`read.deny_descend`は同じ名前を持てる
+/// （`.git`は両方に書かれることがある）ので、宣言に2回出さない。
+///
+/// **`sort`＋`dedup`にしない**——設定に書いた順はユーザーが選んだ順であり、
+/// 並べ替えると「自分が書いたものと同じか」を目で確かめられなくなる。
+fn dedup_preserving_order<'a>(names: impl Iterator<Item = &'a String>) -> Vec<&'a str> {
+    let mut seen: Vec<&str> = Vec::new();
+    for n in names {
+        if !seen.contains(&n.as_str()) {
+            seen.push(n.as_str());
+        }
+    }
+    seen
+}
+
 fn render_read_scope(read_scope: &ReadScopeConfig) -> String {
     let ReadScopeConfig {
         mode,
@@ -329,7 +344,7 @@ fn render_read_scope(read_scope: &ReadScopeConfig) -> String {
     } = read_scope;
     match mode {
         ReadMode::Whitelist => {
-            if allow.is_empty() && allow_descend.is_empty() {
+            let mut line = if allow.is_empty() && allow_descend.is_empty() {
                 "読取範囲: ワークスペース内のみ。ワークスペース外の絶対パスは読めません。"
                     .to_string()
             } else {
@@ -344,7 +359,38 @@ fn render_read_scope(read_scope: &ReadScopeConfig) -> String {
                     "読取範囲: ワークスペース内に加え、次の外部パスのみ許可されています: {}。",
                     extra.join("、")
                 )
+            };
+            // **[BUG-124] ワークスペース内の除外はモードに依らず効いている。**
+            // `SandboxFs::read_to_string`はworkspace相対パスに対して`mode`を見ずに
+            // `is_denied_rel`を通し、walkも同じ判定で結果から落とす
+            // （`crates/harness-sandbox/src/overlay.rs`の2箇所）。**効いているのに
+            // whitelist側だけ宣言していなかった**ので、読めないものを読もうとし続ける。
+            //
+            // **限定詞を落とさないこと**——効くのは「各階層の名前との完全一致」であって
+            // パスの前方一致ではない（`ReadScope::is_denied_rel`）。前方一致だと読ませると、
+            // モデルは`src/secrets/`のような綴りで除外できると誤解する。
+            let excluded = dedup_preserving_order(deny.iter().chain(deny_descend.iter()));
+            if !excluded.is_empty() {
+                line.push_str(&format!(
+                    "ワークスペース内でも次の名前を含むパスは読めません（パスの前方一致ではなく、\
+                     各階層の名前との完全一致）: {}。",
+                    excluded.join("、")
+                ));
+                // **[BUG-124] 効く範囲を述べたら、効かない範囲も同じ場所で述べる。**
+                // whitelistの外部読取（`ReadScope::read_external_to_string`のWhitelist分岐）は
+                // `find_allow_root`を通すだけで除外判定を1度も呼ばない。上の1文だけを読むと
+                // 「denyと書いたのだから外部ルートの中でも閉じている」と読めてしまう。
+                //
+                // **挙動の側は変えていない**——`read.deny`を外部にも効かせるかは
+                // 設定キー表（`plans/DESIGN-SANDBOX.md` §5.1、「確定」と題した表）に触る決定なので、
+                // ここでは宣言だけを実態へ合わせる。
+                if !allow.is_empty() || !allow_descend.is_empty() {
+                    line.push_str(
+                        "この除外はワークスペース内だけに効き、上に挙げた外部パスには適用されません。",
+                    );
+                }
             }
+            line
         }
         ReadMode::Blacklist => format!(
             "読取範囲: ワークスペース外の絶対パスも既定で読めますが、次は拒否されます（名前一致）: \
@@ -564,10 +610,35 @@ fn render_net_proxy(net_proxy: &NetProxyConfig, tier: ShellTier) -> Option<Strin
     }
 }
 
-fn render_net_app(net_app: &NetAppPolicy) -> Option<String> {
+/// アプリ単位のnetwork許可（軸1、D-10/D-11）をモデルへ伝える。
+///
+/// **`domain_policy_enabled`を受け取るのは`render_net_proxy`が`tier`を受け取るのと同じ理由である**
+/// （[BUG-111](../../../docs/bugs/BUG-111.md)と[BUG-123](../../../docs/bugs/BUG-123.md)）——
+/// この許可リストが**効くかどうかは、この構造体の中身だけでは決まらない**。
+///
+/// ドメイン単位の制御が要求されていると、`should_grant_tier2a_network_capability`
+/// （`crates/harness-tools/src/shell/net_decision.rs`）は`net_domain_policy_requested`で
+/// 早期returnし、**アプリ単位の判定結果を一度も参照しない**。そして`domain_policy_enabled`を
+/// 偽にする設定キーもCLIフラグも本番には存在しない（`NetSettings::to_net_proxy_config`と
+/// `NetProxyConfig::default()`がどちらも無条件に`true`を埋める）ので、
+/// **実運用ではこの許可リストは常に出口へ影響しない**。
+///
+/// `run_shell`のフッタは既にこの事実を`--net-allow-app ignored`として正しく出している
+/// （`crates/harness-tools/src/shell/mod.rs`）。**食い違っていたのはシステムプロンプト側だけ**で、
+/// モデルは「このコマンドなら通信できる」と読んで通信コマンドを発行し続けることになる
+/// （`B-32`＝ユーザーへ出す文言そのものを実装の一部として読む。**読み手にはLLMも含まれる**）。
+fn render_net_app(net_app: &NetAppPolicy, domain_policy_enabled: bool) -> Option<String> {
     let NetAppPolicy { allow_apps } = net_app;
     if allow_apps.is_empty() {
         return None;
+    }
+    if domain_policy_enabled {
+        return Some(format!(
+            "アプリ単位のnetwork許可（{}）がこの構成では宣言されていますが、ドメイン単位の\
+             制御が有効なため出口には影響しません。通信の可否はドメイン許可集合だけが決めます\
+             （run_shellのフッタにも `--net-allow-app ignored` と出ます）。",
+            allow_apps.join("、")
+        ));
     }
     Some(format!(
         "次の実行ファイルは、他コマンドと連結せず単一コマンドとして発行した場合のみnetworkが\
@@ -986,5 +1057,106 @@ mod tests {
         // RequireSandboxはCLIフラグの要求値であり実行時の事実ではないため、
         // EnvironmentFactsが運ばないことを明示するだけの回帰用（コンパイルが通ればOK）。
         let _ = RequireSandbox::None;
+    }
+
+    /// **[BUG-124] 許可側。** whitelist（既定）でも`read.deny`/`read.deny_descend`は
+    /// **ワークスペース内**に効いている——`SandboxFs::read_to_string`が`mode`を見ずに
+    /// `is_denied_rel`を通し（`crates/harness-sandbox/src/overlay.rs:368`）、
+    /// walkも同じ判定で結果から落とす（同`:440`）。**効いているのに宣言していなかった。**
+    #[test]
+    fn read_scope_whitelist_declares_workspace_internal_exclusions() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.read_scope.deny.push("secrets".to_string());
+        ctx.read_scope.deny_descend.push("node_modules".to_string());
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(rendered.contains("secrets"), "{rendered}");
+        assert!(rendered.contains("node_modules"), "{rendered}");
+    }
+
+    /// **[BUG-124] 禁止側（対）。** 除外が空なら余計な文を足さない。
+    /// これが無いと「常に何か言う」実装でも許可側テストが通ってしまう。
+    #[test]
+    fn read_scope_whitelist_says_nothing_extra_without_exclusions() {
+        let ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(
+            !rendered.contains("ワークスペース内でも次の名前"),
+            "{rendered}"
+        );
+    }
+
+    /// **[BUG-124] 限定詞。** whitelistで外部ルートを開いているとき、`read.deny`は
+    /// **その外部ルートには効かない**——`ReadScope::read_external_to_string`のWhitelist分岐は
+    /// `find_allow_root`を通すだけで`is_denied_abs`を1度も呼ばない
+    /// （`crates/harness-sandbox/src/read_scope.rs`）。
+    ///
+    /// **効く範囲だけ述べて効かない範囲を黙ると、「denyと書いたのだから閉じている」と読まれる。**
+    /// 挙動の側を変えるかは設定キー表（`plans/DESIGN-SANDBOX.md` §5.1、「確定」と題した表）に
+    /// 触る決定なので別途。ここでは**宣言を実態に合わせる**ところまでを行う。
+    #[test]
+    fn read_scope_whitelist_states_that_exclusions_do_not_cover_external_roots() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.read_scope
+            .allow_descend
+            .push(PathBuf::from("/opt/shared"));
+        ctx.read_scope.deny.push("secrets".to_string());
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(rendered.contains("外部パスには適用されません"), "{rendered}");
+    }
+
+    /// **[BUG-124] 限定詞の対。** 外部ルートを開いていなければ、その但し書きは出さない
+    /// （出す条件を持たない実装でも許可側が通ってしまうため）。
+    #[test]
+    fn read_scope_whitelist_omits_the_external_caveat_without_external_roots() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.read_scope.deny.push("secrets".to_string());
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(!rendered.contains("外部パスには適用されません"), "{rendered}");
+    }
+
+    /// **[BUG-123] 禁止側。** ドメイン制御が有効なとき、アプリ単位の許可
+    /// （`net.allow_apps` / `--net-allow-app`）は**出口に一切影響しない**——
+    /// `should_grant_tier2a_network_capability`
+    /// （`crates/harness-tools/src/shell/net_decision.rs:105-107`）が
+    /// `net_domain_policy_requested`で早期returnし、アプリ単位の判定を一度も見ないためである。
+    /// そして`domain_policy_enabled`を偽にする経路は本番に1つも無い。
+    ///
+    /// `run_shell`のフッタは既に`--net-allow-app ignored`と正しく述べている
+    /// （`crates/harness-tools/src/shell/mod.rs:253`）。**嘘をついていたのは
+    /// システムプロンプト側だけ**なので、フッタと同じ事実を述べさせる。
+    #[test]
+    fn net_app_allowlist_is_declared_as_ineffective_when_domain_policy_is_on() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.net_app.allow_apps.push("git".to_string());
+        ctx.net_proxy.domain_policy_enabled = true;
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(
+            !rendered.contains("単一コマンドとして発行した場合のみnetworkが許可されます"),
+            "ドメイン制御が有効なのに「許可されます」と宣言している: {rendered}"
+        );
+        assert!(rendered.contains("出口には影響しません"), "{rendered}");
+        assert!(rendered.contains("git"), "{rendered}");
+    }
+
+    /// **[BUG-123] 許可側（対）。** ドメイン制御が無効な構成では、アプリ単位の許可は
+    /// 従来どおり効くので、従来どおり宣言する。**両側を置かないと、
+    /// `render_net_app`が常に`None`を返す実装でも禁止側テストが通る。**
+    #[test]
+    fn net_app_allowlist_is_declared_as_effective_when_domain_policy_is_off() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.net_app.allow_apps.push("git".to_string());
+        ctx.net_proxy.domain_policy_enabled = false;
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(
+            rendered.contains("単一コマンドとして発行した場合のみnetworkが許可されます"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("git"), "{rendered}");
     }
 }
