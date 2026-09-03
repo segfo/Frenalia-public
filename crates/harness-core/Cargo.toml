@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# パスの畳み込み規則（`relative_under_root`）だけを借りる。BUG-066で踏んだ
+# 「配下判定と相対部分の算出を別々の規則で行う」罠を再実装しないため（B-05）。
+# 依存の向きはcore→ledgerで、逆は無い——ledgerはRedirector DLLへ持ち込むため
+# serdeのみの最小クレートに保つ規約（同クレートのCargo.toml参照）を壊さない。
+harness-change-ledger = { path = "../harness-change-ledger" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"

@@ -66,7 +66,7 @@ async fn drive_turn(
     let tools = ToolRegistry::with_builtin_tools();
     let dir = tempfile::tempdir().unwrap();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let mut out = Vec::new();
     run_headless(

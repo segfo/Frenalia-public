@@ -15,6 +15,7 @@
 
 use async_trait::async_trait;
 use harness_core::RiskClass;
+use std::path::PathBuf;
 
 /// §パーミッション（承認）システム「モード」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,11 +108,30 @@ pub enum Classification {
 pub struct PermissionArbiter {
     mode: PermissionMode,
     allowlist: Vec<AllowlistRule>,
+    /// 層3 hard-denyの判定器が、モデルの書いた**絶対パス**をworkspace相対へ畳むのに使う
+    /// （[BUG-126](../../../docs/bugs/BUG-126.md)）。
+    ///
+    /// **`Option`にしないのは、省略できると無言で弱い形へ落ちるからである。**
+    /// 根を知らない`PermissionArbiter`は絶対パス表記の設定注入を1件も止められないが、
+    /// その状態は外から観測できない（拒否が減るだけで、エラーもログも出ない）。
+    /// 必須の引数にしておけば、構築点をコンパイラが数える——`ToolCtx`・`EnvironmentFacts`を
+    /// `..`無しで完全分解しているのと同じ、**漏れを型で拾う**手口である（`B-09`）。
+    workspace_root: PathBuf,
 }
 
 impl PermissionArbiter {
-    pub fn new(mode: PermissionMode, allowlist: Vec<AllowlistRule>) -> Self {
-        Self { mode, allowlist }
+    /// `workspace_root`は層3 hard-denyの絶対パス畳み込みに使う（[BUG-126](../../../docs/bugs/BUG-126.md)）。
+    /// テストからは`"/workspace"`のような`&str`をそのまま渡せる。
+    pub fn new(
+        mode: PermissionMode,
+        allowlist: Vec<AllowlistRule>,
+        workspace_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            mode,
+            allowlist,
+            workspace_root: workspace_root.into(),
+        }
     }
 
     /// `arg_repr`は許可判定に使う具体入力の文字列表現（`run_shell`ならコマンド行、
@@ -144,7 +164,7 @@ impl PermissionArbiter {
         // （arg_reprがコマンド行のため誤爆する。D-06のgitハードニング+overlay apply時の
         // 再チェックが担当）。
         if (tool == "write_file" || tool == "edit_file")
-            && harness_core::is_config_injection_path(arg_repr)
+            && harness_core::is_config_injection_path(arg_repr, &self.workspace_root)
         {
             return Classification::Deny;
         }
@@ -284,7 +304,7 @@ mod tests {
 
     #[test]
     fn default_mode_allows_read_only_without_allowlist() {
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         assert_eq!(
             arbiter.decide("read_file", RiskClass::ReadOnly, "Cargo.toml"),
             Decision::Allow
@@ -293,7 +313,7 @@ mod tests {
 
     #[test]
     fn default_mode_denies_unallowlisted_exec_headless() {
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         assert_eq!(
             arbiter.decide("run_shell", RiskClass::Exec, "rm -rf /"),
             Decision::Deny
@@ -305,6 +325,7 @@ mod tests {
         let arbiter = PermissionArbiter::new(
             PermissionMode::Default,
             vec![AllowlistRule::new("run_shell", "git status*")],
+            "/workspace",
         );
         assert_eq!(
             arbiter.decide("run_shell", RiskClass::Exec, "git status --short"),
@@ -321,6 +342,7 @@ mod tests {
         let arbiter = PermissionArbiter::new(
             PermissionMode::Plan,
             vec![AllowlistRule::new("write_file", "*")],
+            "/workspace",
         );
         assert_eq!(
             arbiter.decide("write_file", RiskClass::Write, "src/main.rs"),
@@ -334,7 +356,7 @@ mod tests {
 
     #[test]
     fn accept_edits_allows_write_but_not_exec() {
-        let arbiter = PermissionArbiter::new(PermissionMode::AcceptEdits, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptEdits, vec![], "/workspace");
         assert_eq!(
             arbiter.decide("write_file", RiskClass::Write, "src/main.rs"),
             Decision::Allow
@@ -347,7 +369,7 @@ mod tests {
 
     #[test]
     fn accept_all_allows_everything() {
-        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         assert_eq!(
             arbiter.decide("run_shell", RiskClass::Exec, "rm -rf /"),
             Decision::Allow
@@ -356,7 +378,7 @@ mod tests {
 
     #[test]
     fn deny_mode_denies_even_read_only() {
-        let arbiter = PermissionArbiter::new(PermissionMode::Deny, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Deny, vec![], "/workspace");
         assert_eq!(
             arbiter.decide("read_file", RiskClass::ReadOnly, "Cargo.toml"),
             Decision::Deny
@@ -368,6 +390,7 @@ mod tests {
         let arbiter = PermissionArbiter::new(
             PermissionMode::AcceptAll,
             vec![AllowlistRule::new("run_shell", "*")],
+            "/workspace",
         );
         // ヘッドレスの`decide`はPromptを自動Denyへ畳み込む（§パーミッション「ヘッドレス時」）。
         assert_eq!(
@@ -394,7 +417,7 @@ mod tests {
 
     #[test]
     fn allowlist_bypass_syntax_does_not_affect_other_tools() {
-        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         // 検出は`run_shell`限定。他ツールの引数にたまたま同じ文字列が現れても無関係。
         assert_eq!(
             arbiter.classify("write_file", RiskClass::Write, "notes/-EncodedCommand.md"),
@@ -407,6 +430,7 @@ mod tests {
         let arbiter = PermissionArbiter::new(
             PermissionMode::AcceptAll,
             vec![AllowlistRule::new("write_file", "*")],
+            "/workspace",
         );
         assert_eq!(
             arbiter.classify("write_file", RiskClass::Write, ".git/config"),
@@ -429,6 +453,7 @@ mod tests {
         let arbiter = PermissionArbiter::new(
             PermissionMode::AcceptAll,
             vec![AllowlistRule::new("write_file", "*")],
+            "/workspace",
         );
         for spelling in [
             ".GIT/config",
@@ -446,6 +471,66 @@ mod tests {
         }
     }
 
+    /// **[BUG-126] 絶対パスで綴っても層1のhard-denyが掛かること。**
+    ///
+    /// 判定器はworkspace相対の**前方一致**しか見ていなかったので、
+    /// `c:/ws/.git/hooks/pre-commit`のように絶対パスで綴ると
+    /// **ドライブレターとワークスペースの分だけ先頭がずれて一致しなかった**。
+    /// `--permission-mode accept-edits`以上ならプロンプトも出ないため、
+    /// `write_file`1回で`.git/hooks/pre-commit`が実FSへ届く。
+    ///
+    /// **層3（apply側の再検査）も同じ判定器を使うので、同時に抜けていた**
+    /// ——二重防御が冗長性として働かない形である。
+    #[test]
+    fn config_injection_hard_deny_covers_absolute_paths_inside_the_workspace() {
+        let arbiter = PermissionArbiter::new(
+            PermissionMode::AcceptAll,
+            vec![AllowlistRule::new("write_file", "*")],
+            "C:/ws",
+        );
+        for spelling in [
+            "C:/ws/.git/hooks/pre-commit",
+            "C:\\ws\\.git\\config",
+            // 大小の揺れ（NTFSは区別しないので、区別する判定だと素通りする）
+            "c:/WS/.harness/settings.json",
+            "C:/ws/.github/workflows/ci.yml",
+            // 末尾に区切りのあるworkspace_rootと混ぜても同じ
+            "C:/ws/./.vscode/settings.json",
+        ] {
+            assert_eq!(
+                arbiter.classify("write_file", RiskClass::Write, spelling),
+                Classification::Deny,
+                "absolute spelling {spelling:?} bypassed the D-05 hard-deny"
+            );
+        }
+    }
+
+    /// **[BUG-126] 対（過剰拒否側）。** ワークスペース**外**の絶対パスは、このゲートの
+    /// 担当ではない——外への書込は`--dangerously-allow`という**別目的のゲート**が受け持つ。
+    ///
+    /// **この対を置かないと、「絶対パスなら何でも拒否」という実装でも上のテストが通る。**
+    /// それは`--fs-allow`で外部リポジトリを意図的に扱う運用を壊す（過剰拒否）。
+    #[test]
+    fn config_injection_hard_deny_does_not_reach_outside_the_workspace() {
+        let arbiter = PermissionArbiter::new(
+            PermissionMode::AcceptAll,
+            vec![AllowlistRule::new("write_file", "*")],
+            "C:/ws",
+        );
+        for outside in [
+            "D:/other-repo/.git/config",
+            "C:/elsewhere/.harness/settings.json",
+            // 接頭辞としては`C:/ws`で始まるが、区切り境界が違うので配下ではない
+            "C:/ws2/.git/config",
+        ] {
+            assert_eq!(
+                arbiter.classify("write_file", RiskClass::Write, outside),
+                Classification::Allow,
+                "{outside:?} is outside the workspace; --dangerously-allow owns that gate"
+            );
+        }
+    }
+
     #[test]
     fn config_injection_path_denied_even_if_allowlisted() {
         let arbiter = PermissionArbiter::new(
@@ -454,6 +539,7 @@ mod tests {
                 AllowlistRule::new("write_file", "*"),
                 AllowlistRule::new("edit_file", "*"),
             ],
+            "/workspace",
         );
         assert_eq!(
             arbiter.classify("write_file", RiskClass::Write, ".harness/settings.json"),
@@ -467,7 +553,7 @@ mod tests {
 
     #[test]
     fn config_injection_check_covers_all_d05_paths() {
-        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         for p in [
             ".git/config",
             ".git/hooks/pre-commit",
@@ -490,7 +576,7 @@ mod tests {
 
     #[test]
     fn normal_workspace_file_unaffected_by_config_injection_check() {
-        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         assert_eq!(
             arbiter.classify("write_file", RiskClass::Write, "src/main.rs"),
             Classification::Allow
@@ -510,6 +596,7 @@ mod tests {
         let arbiter = PermissionArbiter::new(
             PermissionMode::AcceptAll,
             vec![AllowlistRule::new("run_shell", "*")],
+            "/workspace",
         );
         assert_eq!(
             arbiter.classify("run_shell", RiskClass::Exec, "cat .git/config"),
@@ -523,7 +610,7 @@ mod tests {
     /// ヘッドレスでは自動拒否。認知レイヤーもこのゲートをバイパスしない。
     #[test]
     fn an_unallowlisted_mcp_tool_prompts_interactively_and_is_denied_headless() {
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         let input = serde_json::json!({ "title": "ship it" }).to_string();
 
         assert_eq!(
@@ -539,7 +626,7 @@ mod tests {
     /// read-onlyと宣言されたMCPツールは、組み込みのread系と同じく自動許可される。
     #[test]
     fn a_declared_read_only_mcp_tool_is_allowed_like_any_other_read() {
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         assert_eq!(
             arbiter.decide("mcp__company-docs__search", RiskClass::ReadOnly, "{}"),
             Decision::Allow
@@ -553,6 +640,7 @@ mod tests {
         let arbiter = PermissionArbiter::new(
             PermissionMode::Default,
             vec![AllowlistRule::new("mcp__jira__create_issue", "*")],
+            "/workspace",
         );
         assert_eq!(
             arbiter.decide("mcp__jira__create_issue", RiskClass::Network, "{}"),

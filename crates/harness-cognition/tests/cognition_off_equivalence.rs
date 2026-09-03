@@ -124,7 +124,7 @@ async fn run_scenario(via_orchestrator: bool) -> RunResult {
     // `ToolCtx::new`はworkspace_rootを埋めるだけなので、`system`は空にしてtempdirパスが
     // `estimated_input_tokens`へ混ざらないようにする（2経路で同じ値になる必要がある）。
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let mut state = ConversationState::new(Vec::new());
     state.push_user_text("read greeting.txt and tell me what it says");
 

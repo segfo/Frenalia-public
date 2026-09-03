@@ -131,7 +131,7 @@ async fn naive_loop_request_sizes(workspace: &std::path::Path, rounds: usize) ->
     let provider = MockProvider::new(turns).with_request_record_path(record_path.clone());
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(workspace.to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let mut state = ConversationState::new(harness_engine::system_blocks_for(&ctx));
     state.push_user_text("テストが並列時だけ落ちる原因を調べて");
 

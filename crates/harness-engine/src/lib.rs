@@ -1016,7 +1016,7 @@ mod tests {
             }],
         });
         state.push_user_text("list files");
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
         run_agent_loop(
             &provider,
@@ -1078,7 +1078,7 @@ mod tests {
         ctx.shell_tier = harness_core::ShellTierSelection::direct(harness_core::ShellTier::Tier3);
         let mut state = ConversationState::new(system_blocks_for(&ctx));
         state.push_user_text("hi");
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let visible = std::sync::Arc::new(Mutex::new(String::new()));
         let visible_for_callback = std::sync::Arc::clone(&visible);
@@ -1156,7 +1156,7 @@ mod tests {
         state.push_user_text("run a shell command");
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
         let ctx = ToolCtx::new(dir.path().to_path_buf());
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
         let outcome = run_agent_loop(
             &provider,
@@ -1206,7 +1206,7 @@ mod tests {
         state.push_user_text("read a.txt");
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
         let ctx = ToolCtx::new(dir.path().to_path_buf());
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
         let outcome = run_agent_loop(
             &provider,
@@ -1256,6 +1256,7 @@ mod tests {
         let arbiter = PermissionArbiter::new(
             PermissionMode::Default,
             vec![AllowlistRule::new("run_shell", "echo*")],
+            "/workspace",
         );
 
         run_agent_loop(
@@ -1326,7 +1327,7 @@ mod tests {
         let messages_before = state.messages.len();
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
         let ctx = ToolCtx::new(dir.path().to_path_buf());
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         let cancel = CancellationToken::new();
 
         let outcome = {
@@ -1437,7 +1438,7 @@ mod tests {
         let mut tools = harness_tools::ToolRegistry::new();
         tools.register(std::sync::Arc::new(SlowTool));
         let ctx = ToolCtx::new(dir.path().to_path_buf());
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         let cancel = CancellationToken::new();
 
         let outcome = {
@@ -1540,7 +1541,7 @@ mod tests {
         let mut tools = harness_tools::ToolRegistry::new();
         tools.register(std::sync::Arc::new(SlowTool));
         let ctx = ToolCtx::new(dir.path().to_path_buf());
-        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+        let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         let cancel = CancellationToken::new();
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 

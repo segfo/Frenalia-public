@@ -80,7 +80,7 @@ async fn read_file_tool_loop_produces_expected_transcript() {
     let ctx = ToolCtx::new(dir.path().to_path_buf());
     // read_file はReadOnlyなのでヘッドレス既定（allowlist未登録）でも自動許可される
     // （§パーミッション「Default」モード）。
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let outcome = run_agent_loop(
         &provider,
@@ -161,7 +161,7 @@ async fn executor_trait_drives_one_step_through_dyn() {
     )]);
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let executor = TurnExecutor::new(&provider, &tools, &ctx, &arbiter, None, None, None);
     let executor: &dyn Executor = &executor;
@@ -200,7 +200,7 @@ async fn executor_trait_cannot_bypass_the_permission_gate() {
     )]);
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let executor = TurnExecutor::new(&provider, &tools, &ctx, &arbiter, None, None, None);
     let executor: &dyn Executor = &executor;
@@ -358,7 +358,7 @@ async fn agent_event_sequence_for_tool_turn_is_stable() {
     state.push_user_text("read greeting.txt and tell me what it says");
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     run_agent_loop(
@@ -425,7 +425,7 @@ async fn context_too_long_compacts_once_without_second_turn_started() {
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let outcome = run_agent_loop(
@@ -498,7 +498,7 @@ async fn context_too_long_mid_stream_does_not_compact() {
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let result = run_agent_loop(
@@ -564,7 +564,7 @@ async fn a_tool_call_written_as_text_is_retried_with_a_notice() {
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let outcome = run_agent_loop(
@@ -638,7 +638,7 @@ async fn a_second_text_form_tool_call_is_accepted_instead_of_looping() {
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let outcome = run_agent_loop(
@@ -744,7 +744,7 @@ async fn the_usage_trigger_shrinks_then_summarizes_before_the_turn_starts() {
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let outcome = run_agent_loop(
@@ -819,7 +819,7 @@ async fn tool_output_piled_up_inside_one_turn_is_digested_before_the_turn_starts
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let outcome = run_agent_loop(
@@ -905,7 +905,7 @@ async fn a_turn_heavy_history_is_digested_without_paying_for_a_rolling_summary()
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let outcome = run_agent_loop(
@@ -966,7 +966,7 @@ async fn the_default_policy_does_not_fire_on_an_ordinary_history() {
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     run_agent_loop(
@@ -1025,7 +1025,7 @@ async fn a_reactive_failure_that_cannot_be_summarized_falls_back_to_shrinking() 
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let outcome = run_agent_loop(
@@ -1097,7 +1097,7 @@ async fn the_rolling_summary_runs_at_most_once_per_agent_loop() {
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let outcome = run_agent_loop(
@@ -1207,7 +1207,7 @@ async fn a_degenerate_turn_is_discarded_and_the_retry_completes_normally() {
     state.push_user_text("こんにちは");
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let outcome = run_agent_loop(
@@ -1257,7 +1257,7 @@ async fn exhausting_the_ladder_folds_the_turn_without_touching_history() {
     let before = state.messages.clone();
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let outcome = run_agent_loop(
@@ -1319,7 +1319,7 @@ async fn a_healthy_turn_is_untouched_by_the_guard() {
     };
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let mut with_guard = ConversationState::new(Vec::new());
     with_guard.push_user_text("read greeting.txt");
@@ -1411,7 +1411,7 @@ async fn the_text_marker_lets_the_downstream_rewind_exactly() {
     state.push_user_text("やって");
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let mut sink = String::new();
     run_agent_loop(
@@ -1488,7 +1488,7 @@ async fn a_compaction_inside_the_turn_does_not_break_the_session_append_slice() 
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     run_agent_loop(
         &provider,

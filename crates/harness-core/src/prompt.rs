@@ -1104,7 +1104,10 @@ mod tests {
         ctx.read_scope.deny.push("secrets".to_string());
         let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
 
-        assert!(rendered.contains("外部パスには適用されません"), "{rendered}");
+        assert!(
+            rendered.contains("外部パスには適用されません"),
+            "{rendered}"
+        );
     }
 
     /// **[BUG-124] 限定詞の対。** 外部ルートを開いていなければ、その但し書きは出さない
@@ -1115,7 +1118,10 @@ mod tests {
         ctx.read_scope.deny.push("secrets".to_string());
         let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
 
-        assert!(!rendered.contains("外部パスには適用されません"), "{rendered}");
+        assert!(
+            !rendered.contains("外部パスには適用されません"),
+            "{rendered}"
+        );
     }
 
     /// **[BUG-123] 禁止側。** ドメイン制御が有効なとき、アプリ単位の許可

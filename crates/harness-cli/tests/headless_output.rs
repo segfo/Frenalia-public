@@ -79,7 +79,7 @@ async fn json_output_has_stable_schema_and_allowed_tool_call() {
     state.push_user_text("read a.txt");
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let mut out = Vec::new();
     let exit = run_headless(
@@ -142,7 +142,7 @@ async fn json_output_records_denied_tool_call() {
     state.push_user_text("run a shell command");
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let mut out = Vec::new();
     let exit = run_headless(
@@ -180,7 +180,7 @@ async fn jsonl_output_emits_one_agent_event_per_line() {
     let tools = ToolRegistry::with_builtin_tools();
     let dir = tempfile::tempdir().unwrap();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let mut out = Vec::new();
     let exit = run_headless(
@@ -234,7 +234,7 @@ async fn json_output_surfaces_provider_error_with_nonzero_exit() {
     let tools = ToolRegistry::with_builtin_tools();
     let dir = tempfile::tempdir().unwrap();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let mut out = Vec::new();
     let exit = run_headless(
@@ -305,7 +305,7 @@ async fn run_guarded(turns: Vec<Vec<StreamEvent>>, format: OutputFormat) -> Stri
     let tools = ToolRegistry::with_builtin_tools();
     let dir = tempfile::tempdir().unwrap();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
 
     let mut out = Vec::new();
     run_headless(

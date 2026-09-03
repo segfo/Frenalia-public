@@ -207,7 +207,9 @@ impl ApplyReport {
 /// 内部の`WorkspaceJail`をそのまま素通しする（M9までの既存挙動と等価）。
 pub struct SandboxFs {
     pub(crate) jail: WorkspaceJail,
-    workspace_root: PathBuf,
+    /// `overlay_hunks`も層3 hard-denyを掛けるため`pub(crate)`にしてある
+    /// （[BUG-126](../../../docs/bugs/BUG-126.md)。判定器が絶対パスを畳むのに根が要る）。
+    pub(crate) workspace_root: PathBuf,
     pub(crate) overlay: Option<OverlayBackend>,
     read_scope: ReadScope,
 }
@@ -485,7 +487,7 @@ impl SandboxFs {
         let Some(overlay) = &self.overlay else {
             return Ok(ApplyReport::default());
         };
-        apply_overlay_changes(&self.jail, overlay, opts)
+        apply_overlay_changes(&self.jail, overlay, opts, &self.workspace_root)
     }
 
     /// オーバーレイ側の現在内容を読む（`resolve`の`mine`側材料）。
@@ -632,6 +634,7 @@ fn apply_overlay_changes(
     jail: &WorkspaceJail,
     overlay: &OverlayBackend,
     opts: &ApplyOptions,
+    workspace_root: &Path,
 ) -> Result<ApplyReport, SandboxError> {
     let mut report = ApplyReport::default();
     let changes = effective_changes(jail, overlay);
@@ -675,7 +678,7 @@ fn apply_overlay_changes(
                 }
             }
         };
-        if harness_core::is_config_injection_path(&canonical) {
+        if harness_core::is_config_injection_path(&canonical, workspace_root) {
             report.hard_denied.push(c.path.clone());
             continue;
         }
@@ -1001,6 +1004,63 @@ mod tests {
             report.applied,
             vec![harness_change_ledger::store::normalize_abs_path(&abs)]
         );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "probe-content");
+    }
+
+    /// **[BUG-126] 層3。** 絶対パスで綴った設定注入パスは`_ext`分岐へ入り、
+    /// `canonical`が絶対のまま判定器へ渡るので前方一致しなかった。
+    ///
+    /// **`--dangerously-allow`（`allow_ext: true`）を通しても hard-deny が掛かること**を測る
+    /// ——`--dangerously-allow`は「ワークスペースの外を触るな」を守る**別目的のゲート**であって、
+    /// 「設定注入パスを触るな」を守るゲートではない。片方で代用できると読むと、
+    /// `.git/hooks/pre-commit`が実FSへ着地する。
+    #[test]
+    fn apply_hard_denies_an_absolute_path_that_points_back_into_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
+        let target = dir.path().join(".git").join("hooks").join("pre-commit");
+        let abs = target.to_string_lossy().replace('\\', "/");
+        fs.write_string(&abs, "#!/bin/sh\necho pwned\n").unwrap();
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: true,
+                adopt_unledgered: false,
+            })
+            .unwrap();
+
+        assert!(report.applied.is_empty(), "{report:?}");
+        assert_eq!(report.hard_denied.len(), 1, "{report:?}");
+        assert!(
+            !target.exists(),
+            "the hook landed on the real filesystem: {}",
+            target.display()
+        );
+    }
+
+    /// **[BUG-126] 対（過剰拒否側）。** ワークスペース外の絶対パスは従来どおり
+    /// `allow_ext`だけがゲートで、hard-denyの対象ではない。
+    /// **これが無いと「絶対パスなら全部hard-deny」でも上のテストが通る**——
+    /// それは`_ext`経路そのものを殺す（T-11と`ApplyOptions::allow_ext`の存在意義が消える）。
+    #[test]
+    fn apply_still_writes_an_ordinary_absolute_path_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
+        let (target, abs) = ext_probe_path();
+        fs.write_string(&abs, "probe-content").unwrap();
+
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: true,
+                adopt_unledgered: false,
+            })
+            .unwrap();
+
+        assert!(report.hard_denied.is_empty(), "{report:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "probe-content");
     }
 

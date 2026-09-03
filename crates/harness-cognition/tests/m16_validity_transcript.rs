@@ -232,7 +232,7 @@ async fn run_always_bounded(
     ]);
 
     let ctx = ToolCtx::new(workspace.path().to_path_buf());
-    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![]);
+    let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
     let mut state = ConversationState::new(Vec::new());
     state.push_user_text("run_shellがどのシェルを使うか、根拠を挙げて答えて");
 

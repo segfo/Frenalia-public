@@ -242,7 +242,11 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
             Some(r) => Some(r),
         })
         .collect();
-    let arbiter = PermissionArbiter::new(cli.permission_mode.into(), allowlist);
+    let arbiter = PermissionArbiter::new(
+        cli.permission_mode.into(),
+        allowlist,
+        workspace_root.clone(),
+    );
 
     Ok(Configured {
         cli,

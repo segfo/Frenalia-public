@@ -337,8 +337,11 @@ mod tests {
         );
         // read_fileはReadOnlyなのでDefaultモード（allowlist未登録）でも自動許可される
         // （`golden_transcript.rs`と同じ前提）。
-        let gate: Arc<dyn PermissionGate> =
-            Arc::new(PermissionArbiter::new(PermissionMode::Default, vec![]));
+        let gate: Arc<dyn PermissionGate> = Arc::new(PermissionArbiter::new(
+            PermissionMode::Default,
+            vec![],
+            "/workspace",
+        ));
         let census = CensusTool::new(
             provider,
             gate,

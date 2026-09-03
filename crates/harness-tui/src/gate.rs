@@ -103,8 +103,10 @@ mod tests {
     #[tokio::test]
     async fn allows_read_only_without_prompting() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let gate =
-            InteractiveGate::new(PermissionArbiter::new(PermissionMode::Default, vec![]), tx);
+        let gate = InteractiveGate::new(
+            PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace"),
+            tx,
+        );
 
         let decision = gate
             .resolve(
@@ -129,7 +131,7 @@ mod tests {
     async fn prompts_then_remembers_allow() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let gate = Arc::new(InteractiveGate::new(
-            PermissionArbiter::new(PermissionMode::Default, vec![]),
+            PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace"),
             tx,
         ));
 

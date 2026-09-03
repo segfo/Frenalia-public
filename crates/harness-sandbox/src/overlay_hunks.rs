@@ -196,7 +196,7 @@ impl SandboxFs {
                 return Ok(report);
             }
         };
-        if harness_core::is_config_injection_path(&canonical) {
+        if harness_core::is_config_injection_path(&canonical, &self.workspace_root) {
             report.hard_denied.push(path);
             return Ok(report);
         }
