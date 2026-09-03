@@ -535,8 +535,8 @@ mod tests {
             std::fs::write(dir.path().join(format!("session-{taken}.jsonl")), b"x").unwrap();
         }
         let mut minted = vec!["free", "taken-2", "taken-1"];
-        let store =
-            SessionStore::create_new_with(dir.path(), || minted.pop().unwrap().to_string()).unwrap();
+        let store = SessionStore::create_new_with(dir.path(), || minted.pop().unwrap().to_string())
+            .unwrap();
         assert_eq!(store.id(), "session-free");
     }
 
@@ -587,7 +587,11 @@ mod tests {
         // `--resume`（接頭辞あり・なしの両形）
         for id in ["1700000000000", "session-1700000000000"] {
             let reopened = SessionStore::open(SessionStore::resolve_path(dir.path(), id));
-            assert_eq!(reopened.load_messages().unwrap(), vec![msg("old")], "id={id}");
+            assert_eq!(
+                reopened.load_messages().unwrap(),
+                vec![msg("old")],
+                "id={id}"
+            );
         }
         // 一覧と`--continue`
         assert_eq!(SessionStore::list(dir.path()).unwrap().len(), 1);

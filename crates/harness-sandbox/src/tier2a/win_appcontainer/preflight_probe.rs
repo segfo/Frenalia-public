@@ -416,10 +416,12 @@ pub(crate) fn smoke_test_harness_control_write_denied(
 /// 時点でOSに消させる。作成時のアクセス検査は親の`FILE_ADD_FILE`に対して行われ、要求した
 /// アクセス権はそのハンドルに与えられるので、開き直しは発生しない。
 pub(crate) const PROBE_MODE_RW_OBJECT: &str = "rw1";
+// `[Console]::In.ReadToEnd()` は Constrained Language Mode では許可型でなく、実 I/O の前に
+// 落ちる。PowerShell の組込み`$input`なら、標準入力を同じく行単位で受け取れる。
 const FS_PASSTHROUGH_BATCH_PROBE_COMMAND: &str = "\
     $ErrorActionPreference = 'Stop'; \
     $i = -1; \
-    foreach ($raw in [Console]::In.ReadToEnd().Split([char]10)) { \
+    foreach ($raw in $input) { \
         $line = $raw.TrimEnd([char]13); \
         if ($line.Length -eq 0) { continue }; \
         $i++; \
@@ -731,14 +733,30 @@ pub(crate) fn probe_passthrough_batch(
         Err(e) => return BatchProbeOutcome::NotRun(format!("probe could not start: {e}")),
     };
     let payload = batch_probe_stdin(entries);
-    let stdout = match child.write_stdin_read_output_and_wait(Some(payload.as_bytes())) {
-        // 終了コードは見ない——**個々の結果は行で返る**ので、プロセス全体の成否は
-        // 「行が返ったか」でしか意味を持たない（欠けた行は`parse_batch_probe_output`が拾う）。
-        Ok((stdout, _, _code)) => stdout,
-        Err(e) => return BatchProbeOutcome::NotRun(format!("probe failed: {e}")),
-    };
+    let (stdout, stderr, exit_code) =
+        match child.write_stdin_read_output_and_wait(Some(payload.as_bytes())) {
+            // 終了コードは見ない——**個々の結果は行で返る**ので、プロセス全体の成否は
+            // 「行が返ったか」でしか意味を持たない（欠けた行は`parse_batch_probe_output`が拾う）。
+            Ok(output) => output,
+            Err(e) => return BatchProbeOutcome::NotRun(format!("probe failed: {e}")),
+        };
 
     let raw = parse_batch_probe_output(&stdout, entries.len());
+    // 1行も返らないのは、個別パスの拒否ではなくプローブ自体の異常である。ここを各パスの
+    // `cause unknown`に畳むと、シェル引数・stdin・PowerShell初期化のどれが壊れたかを
+    // 利用者が区別できない。標準出力・標準エラーと終了コードを一度だけ残し、全件を
+    // 「未測定」として扱う（B-09/B-10）。
+    let returned_any_result_row = stdout.lines().any(|line| {
+        line.split('\t')
+            .next()
+            .and_then(|index| index.trim().parse::<usize>().ok())
+            .is_some_and(|index| index < entries.len())
+    });
+    if !returned_any_result_row {
+        return BatchProbeOutcome::NotRun(format!(
+            "probe returned no result rows (exit code {exit_code}; stdout={stdout:?}; stderr={stderr:?})"
+        ));
+    }
     // 失敗したエントリだけをD9診断へ回す（祖先チェーンのACL読取のみ。プロセスは起こさない）。
     BatchProbeOutcome::Measured(
         entries

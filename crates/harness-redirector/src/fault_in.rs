@@ -103,7 +103,11 @@ pub(crate) fn wait_until_workspace_prepared(cfg: &Config) -> bool {
         return false;
     }
     matches!(
-        roundtrip_request(cfg, "{\"kind\":\"wait_prepared\"}", WAIT_PREPARED_TIMEOUT_MS),
+        roundtrip_request(
+            cfg,
+            "{\"kind\":\"wait_prepared\"}",
+            WAIT_PREPARED_TIMEOUT_MS
+        ),
         FaultOutcome::Retry
     )
 }
@@ -240,7 +244,9 @@ fn write_all(pipe: HANDLE, buf: &[u8], timeout_ms: u32) -> Option<()> {
     let mut done = 0usize;
     while done < buf.len() {
         let chunk = &buf[done..];
-        let n = overlapped(pipe, timeout_ms, |ov| unsafe { WriteFile(pipe, Some(chunk), None, Some(ov)) })?;
+        let n = overlapped(pipe, timeout_ms, |ov| unsafe {
+            WriteFile(pipe, Some(chunk), None, Some(ov))
+        })?;
         if n == 0 {
             return None;
         }
@@ -253,7 +259,9 @@ fn read_exact(pipe: HANDLE, buf: &mut [u8], timeout_ms: u32) -> Option<()> {
     let mut done = 0usize;
     while done < buf.len() {
         let chunk = &mut buf[done..];
-        let n = overlapped(pipe, timeout_ms, |ov| unsafe { ReadFile(pipe, Some(chunk), None, Some(ov)) })?;
+        let n = overlapped(pipe, timeout_ms, |ov| unsafe {
+            ReadFile(pipe, Some(chunk), None, Some(ov))
+        })?;
         if n == 0 {
             return None;
         }
@@ -314,8 +322,7 @@ mod frame_tests {
             json_string(r"C:\ws\src\lib.rs")
         );
         assert_eq!(
-            request,
-            r#"{"kind":"grant","path":"C:\\ws\\src\\lib.rs"}"#,
+            request, r#"{"kind":"grant","path":"C:\\ws\\src\\lib.rs"}"#,
             "this must match harness-sandbox's FaultRequest wire format byte for byte"
         );
     }
@@ -348,6 +355,9 @@ mod frame_tests {
         );
         // 知らない綴り・空は**やり直さない側**へ倒す。
         assert_eq!(parse_outcome(b""), FaultOutcome::GiveUp);
-        assert_eq!(parse_outcome(br#"{"kind":"something-new"}"#), FaultOutcome::GiveUp);
+        assert_eq!(
+            parse_outcome(br#"{"kind":"something-new"}"#),
+            FaultOutcome::GiveUp
+        );
     }
 }

@@ -202,11 +202,14 @@ struct ProbeDir(std::path::PathBuf);
 
 impl ProbeDir {
     fn new() -> Self {
-        let dir =
-            std::path::PathBuf::from(r"C:\harness-e2e").join(format!("exec-ace-{}", std::process::id()));
+        let dir = std::path::PathBuf::from(r"C:\harness-e2e")
+            .join(format!("exec-ace-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
-            panic!("could not create the probe directory {} ({e}). This test needs a place \
-                    outside %TEMP% because %TEMP% is excluded from candidates.", dir.display())
+            panic!(
+                "could not create the probe directory {} ({e}). This test needs a place \
+                    outside %TEMP% because %TEMP% is excluded from candidates.",
+                dir.display()
+            )
         });
         Self(dir)
     }

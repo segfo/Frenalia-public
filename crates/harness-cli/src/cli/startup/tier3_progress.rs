@@ -22,11 +22,7 @@ pub(super) async fn start_tier3_with_progress(
     let workspace_root = workspace_root.to_path_buf();
     let allow_domains = allow_domains.to_vec();
     let start_task = tokio::task::spawn_blocking(move || {
-        VmSandboxHandle::start(
-            &workspace_root,
-            &allow_domains,
-            tier3_warm,
-        )
+        VmSandboxHandle::start(&workspace_root, &allow_domains, tier3_warm)
     });
     tokio::pin!(start_task);
 

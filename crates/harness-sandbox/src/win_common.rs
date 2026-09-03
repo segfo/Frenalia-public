@@ -674,7 +674,10 @@ pub fn volume_capability(
         )
         .ok()?
     };
-    let len = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
+    let len = fs_name
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(fs_name.len());
     let drive_type = unsafe { GetDriveTypeW(PCWSTR(wide_root.as_ptr())) };
     Some(crate::session_scope::VolumeCapability {
         persistent_acls: flags & FILE_PERSISTENT_ACLS != 0,

@@ -122,8 +122,8 @@ fn cow_write_is_redirected_to_diff_layer_and_workspace_stays_unchanged() {
     let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("important.txt"))
         .expect("diff layer important.txt must exist after copy-up + redirected write");
     assert_eq!(diff_layer_content, "modified-by-child");
-    let diff_layer_new_content =
-        std::fs::read_to_string(diff_layer.path().join("new.txt")).expect("diff layer new.txt must exist");
+    let diff_layer_new_content = std::fs::read_to_string(diff_layer.path().join("new.txt"))
+        .expect("diff layer new.txt must exist");
     assert_eq!(diff_layer_new_content, "created-by-child");
 }
 
@@ -570,10 +570,11 @@ fn cow_write_from_grandchild_process_is_redirected_to_diff_layer() {
         !workspace.path().join("new_by_grandchild.txt").exists(),
         "grandchild's write must not appear in the read-only workspace"
     );
-    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("new_by_grandchild.txt")).expect(
-        "diff_layer must contain the grandchild's write \
+    let diff_layer_content =
+        std::fs::read_to_string(diff_layer.path().join("new_by_grandchild.txt")).expect(
+            "diff_layer must contain the grandchild's write \
              (redirector DLL must have been re-injected into the grandchild, Phase 4a)",
-    );
+        );
     assert!(
         diff_layer_content.trim().contains("created-by-grandchild"),
         "unexpected diff layer content: {diff_layer_content:?}"
@@ -652,13 +653,15 @@ fn cow_write_via_createprocessa_grandchild_is_redirected_to_diff_layer() {
         !workspace.path().join("new_by_createprocessa.txt").exists(),
         "grandchild's write must not appear in the read-only workspace"
     );
-    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("new_by_createprocessa.txt"))
-        .expect(
+    let diff_layer_content =
+        std::fs::read_to_string(diff_layer.path().join("new_by_createprocessa.txt")).expect(
             "diff_layer must contain the grandchild's write (CreateProcessA hook must have \
              re-injected the redirector DLL, residual issue #5)",
         );
     assert!(
-        diff_layer_content.trim().contains("created-by-createprocessa"),
+        diff_layer_content
+            .trim()
+            .contains("created-by-createprocessa"),
         "unexpected diff layer content: {diff_layer_content:?}"
     );
 
@@ -717,11 +720,12 @@ fn cow_write_via_winexec_grandchild_is_redirected_to_diff_layer() {
         !workspace.path().join("new_by_winexec.txt").exists(),
         "grandchild's write must not appear in the read-only workspace"
     );
-    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("new_by_winexec.txt")).expect(
-        "diff_layer must contain the grandchild's write (WinExec hook must have re-injected \
+    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("new_by_winexec.txt"))
+        .expect(
+            "diff_layer must contain the grandchild's write (WinExec hook must have re-injected \
              the redirector DLL via its CreateProcessA-based reimplementation, residual \
              issue #5)",
-    );
+        );
     assert!(
         diff_layer_content.trim().contains("created-by-winexec"),
         "unexpected diff layer content: {diff_layer_content:?}"
@@ -789,12 +793,15 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_diff_layer() {
         !workspace.path().join("new_by_wow64.txt").exists(),
         "wow64 grandchild's write must not appear in the read-only workspace"
     );
-    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("new_by_wow64.txt")).expect(
-        "diff_layer must contain the wow64 grandchild's write \
+    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("new_by_wow64.txt"))
+        .expect(
+            "diff_layer must contain the wow64 grandchild's write \
              (redirector DLL must have been re-injected via the entry-point trap, Phase 4b)",
-    );
+        );
     assert!(
-        diff_layer_content.trim().contains("created-by-wow64-grandchild"),
+        diff_layer_content
+            .trim()
+            .contains("created-by-wow64-grandchild"),
         "unexpected diff layer content: {diff_layer_content:?}"
     );
 
@@ -967,7 +974,8 @@ fn cow_writable_memory_mapped_file_is_redirected_to_diff_layer() {
         "workspace must stay unchanged (mmap write must not bypass the ACL boundary)"
     );
 
-    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("important.txt")).expect(
+    let diff_layer_content = std::fs::read_to_string(diff_layer.path().join("important.txt"))
+        .expect(
         "diff_layer must contain the mmap write (open-time redirection must have copy-up'd the \
          file before the writable view was created)",
     );

@@ -545,7 +545,11 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(diff_layer.path().join("sub").join("deep")).unwrap();
         std::fs::write(
-            diff_layer.path().join("sub").join("deep").join("nested.txt"),
+            diff_layer
+                .path()
+                .join("sub")
+                .join("deep")
+                .join("nested.txt"),
             b"x",
         )
         .unwrap();
@@ -553,11 +557,18 @@ mod tests {
         append_entry(diff_layer.path(), ChangeOp::Create, "direct.txt", None);
         append_denied_entry(diff_layer.path(), "C:/outside/x.txt", 0x4000_0000, 42);
         std::fs::write(diff_layer.path().join(".harness-cow-session.json"), b"{}").unwrap();
-        std::fs::write(diff_layer.path().join(".harness-cow-warnings.jsonl"), b"{}\n").unwrap();
+        std::fs::write(
+            diff_layer.path().join(".harness-cow-warnings.jsonl"),
+            b"{}\n",
+        )
+        .unwrap();
         std::fs::write(diff_layer.path().join(".harness-cow-debug.log"), b"log").unwrap();
         std::fs::create_dir_all(diff_layer.path().join(COW_BASELINE_DIRNAME)).unwrap();
         std::fs::write(
-            diff_layer.path().join(COW_BASELINE_DIRNAME).join("direct.txt"),
+            diff_layer
+                .path()
+                .join(COW_BASELINE_DIRNAME)
+                .join("direct.txt"),
             b"baseline mirror",
         )
         .unwrap();

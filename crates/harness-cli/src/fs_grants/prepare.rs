@@ -8,10 +8,10 @@ use super::*;
 #[cfg(windows)]
 pub(crate) fn fs_prepare_workspace(path: &Path, mode: WorkspacePrepareMode) -> ExitCode {
     use grant_job::JobPhase;
-    use harness_sandbox::tier2a::workspace_ledger::WorkspaceMode;
-use harness_sandbox::tier2a::win_appcontainer::{
+    use harness_sandbox::tier2a::win_appcontainer::{
         grant_job, start_workspace_preparation, WorkspacePreparationState,
     };
+    use harness_sandbox::tier2a::workspace_ledger::WorkspaceMode;
 
     let acl_mode = match mode {
         WorkspacePrepareMode::Rwx => WorkspaceMode::Rwx,

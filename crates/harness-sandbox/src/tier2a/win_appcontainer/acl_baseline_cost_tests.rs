@@ -330,8 +330,7 @@ fn acl_baseline_cost_propagation_reaches_existing_descendants() {
          propagating write) must reach every existing descendant. {} of {} nodes needed an \
          explicit grant, which means the propagation is silently doing nothing again and the \
          first pass has gone back to paying O(nodes) DACL writes.",
-        report_b.granted,
-        report_b.checked
+        report_b.granted, report_b.checked
     );
 }
 
@@ -751,14 +750,13 @@ fn measure_arm(
     // --- 測る区間はここだけ ---
     let started = Instant::now();
     match shape {
-        WriteShape::Merged => {
-            grant_aces_propagating(root, &grants, IdempotentCheck::Always).unwrap_or_else(|e| {
+        WriteShape::Merged => grant_aces_propagating(root, &grants, IdempotentCheck::Always)
+            .unwrap_or_else(|e| {
                 panic!(
                     "{label}: one propagating write for {} subjects: {e}",
                     grants.len()
                 )
-            })
-        }
+            }),
         WriteShape::OnePerSubject => {
             for (i, grant) in grants.iter().enumerate() {
                 grant_aces_propagating(root, std::slice::from_ref(grant), IdempotentCheck::Always)
@@ -767,12 +765,8 @@ fn measure_arm(
         }
         WriteShape::SplitPerTopLevelChild => {
             // root へは配布しない口で置くだけ（製品の`grant_workspace_root_aces_fast`と同じ）。
-            super::acl_dacl_write::grant_aces_single_object(
-                root,
-                &grants,
-                IdempotentCheck::Always,
-            )
-            .unwrap_or_else(|e| panic!("{label}: single-object write on the root: {e}"));
+            super::acl_dacl_write::grant_aces_single_object(root, &grants, IdempotentCheck::Always)
+                .unwrap_or_else(|e| panic!("{label}: single-object write on the root: {e}"));
 
             // 直下の子ごとに配布。**シンボリックリンクは飛ばす**——`top_level_child_missing_aces`と
             // 同じ判断で、付与側が触らないものを検算側だけが数えるずれを作らないため。
@@ -839,7 +833,10 @@ fn measure_arm(
     for (i, (sid, mask)) in subjects.iter().enumerate() {
         for leaf in [leaf_file, leaf_dir] {
             let effective = sid_effective_ace_mask(leaf, sid.as_psid()).unwrap_or_else(|e| {
-                panic!("{label}: read the effective mask of {}: {e}", leaf.display())
+                panic!(
+                    "{label}: read the effective mask of {}: {e}",
+                    leaf.display()
+                )
             });
             assert_eq!(
                 effective,
@@ -1142,9 +1139,8 @@ fn acl_ace_count_cost_of_splitting_the_propagating_write_per_top_level_child() {
                 let nodes = build_wide_tree(root, count, k);
                 let subjects = m_subjects(&label, 1);
                 let (leaf_dir, leaf_file) = wide_tree_leaves(root);
-                let mut arm = measure_arm(
-                    &label, root, nodes, &subjects, &leaf_dir, &leaf_file, shape,
-                );
+                let mut arm =
+                    measure_arm(&label, root, nodes, &subjects, &leaf_dir, &leaf_file, shape);
                 arm["placement"] = serde_json::json!(place_label);
                 arm["k_top_level_children"] = serde_json::json!(k);
                 arms.push(arm);
@@ -1226,7 +1222,10 @@ fn measure_split_vs_merged_cells(
     depths: &[usize],
     subject_counts: &[usize],
     tree: TreeShape,
-) -> (Vec<serde_json::Value>, serde_json::Map<String, serde_json::Value>) {
+) -> (
+    Vec<serde_json::Value>,
+    serde_json::Map<String, serde_json::Value>,
+) {
     let placements: [(&str, std::path::PathBuf); 2] = [
         ("drive-root", std::path::PathBuf::from("C:\\")),
         ("user-temp", std::env::temp_dir()),
@@ -1336,8 +1335,7 @@ impl TreeShape {
                 let heavy = count * 8 / 10;
                 let rest = count - heavy;
                 // 残り2割を`k-1`本の一様な森へ。枝の名前は`d000..d{k-2}`になる。
-                let light_nodes =
-                    super::test_support::build_forest_tree(root, rest, k - 1, depth);
+                let light_nodes = super::test_support::build_forest_tree(root, rest, k - 1, depth);
                 // 8割を`k`本目の枝（`dbig`）へ。**1本の枝＝`k=1`の森**として掘る。
                 let heavy_root = root.join("dbig");
                 let heavy_nodes =
@@ -1363,9 +1361,7 @@ fn assert_arms_got_the_tree_they_asked_for(
 ) {
     for arm in arms {
         let depth = arm["depth"].as_u64().expect("depth is a number") as usize;
-        let k = arm["k_top_level_children"]
-            .as_u64()
-            .expect("k is a number") as usize;
+        let k = arm["k_top_level_children"].as_u64().expect("k is a number") as usize;
         let nodes = arm["nodes"].as_u64().expect("nodes is a number") as usize;
         assert_eq!(
             nodes,
@@ -1651,7 +1647,11 @@ fn measure_declaration_ledger_append(
     };
     use harness_grant_ledger::Ledger;
 
-    let shape = if batched { "batched" } else { "per-declaration" };
+    let shape = if batched {
+        "batched"
+    } else {
+        "per-declaration"
+    };
     let path = dir.join(format!(
         "n{declarations}-{shape}-workspace-capability-ledger.json"
     ));
@@ -1662,8 +1662,7 @@ fn measure_declaration_ledger_append(
         r"Local\harness-acl-cost-measure-ledger-{}",
         std::process::id()
     );
-    let ledger: Ledger<WorkspaceCapabilityLedger> =
-        Ledger::at_path(path.clone(), Some(&lock_name));
+    let ledger: Ledger<WorkspaceCapabilityLedger> = Ledger::at_path(path.clone(), Some(&lock_name));
 
     let workspace = Path::new(r"C:\harness-acl-cost-measure-workspace");
     let access_class = FsAccess::Read.label();
@@ -1684,7 +1683,9 @@ fn measure_declaration_ledger_append(
     } else {
         declared
             .iter()
-            .filter(|p| ensure_declaration_capability_in(&ledger, workspace, p, access_class).is_err())
+            .filter(|p| {
+                ensure_declaration_capability_in(&ledger, workspace, p, access_class).is_err()
+            })
             .count()
     };
     let elapsed = started.elapsed();
@@ -1987,8 +1988,7 @@ fn acl_ace_count_cost_of_the_post_n1_declaration_and_diff_layer_paths() {
             )
         }));
 
-        let mut us_of: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
+        let mut us_of: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
         let mut nodes_of: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
 
@@ -2001,9 +2001,7 @@ fn acl_ace_count_cost_of_the_post_n1_declaration_and_diff_layer_paths() {
             let nodes = TreeShape::Uniform.build(root, arm_count, K, DEPTH);
             let subjects = m_subjects(&label, m);
             let (leaf_dir, leaf_file) = TreeShape::Uniform.leaves(root, DEPTH);
-            let mut arm = measure_arm(
-                &label, root, nodes, &subjects, &leaf_dir, &leaf_file, shape,
-            );
+            let mut arm = measure_arm(&label, root, nodes, &subjects, &leaf_dir, &leaf_file, shape);
             arm["placement"] = serde_json::json!(place_label);
             arm["k_top_level_children"] = serde_json::json!(K);
             arm["depth"] = serde_json::json!(DEPTH);
@@ -2121,10 +2119,8 @@ fn acl_ace_count_cost_of_the_post_n1_declaration_and_diff_layer_paths() {
             eprintln!("  [{}] done {arm}", arm["arm"].as_str().unwrap_or("?"));
             let per_declaration = arm["us_per_declaration"].clone();
             if batched {
-                batched_us_per_declaration.insert(
-                    declarations,
-                    per_declaration.as_f64().unwrap_or(f64::NAN),
-                );
+                batched_us_per_declaration
+                    .insert(declarations, per_declaration.as_f64().unwrap_or(f64::NAN));
                 readings.insert(
                     format!("ledger_batched_us_per_declaration@{declarations}decls"),
                     per_declaration,
@@ -2167,7 +2163,8 @@ fn acl_ace_count_cost_of_the_post_n1_declaration_and_diff_layer_paths() {
         readings.insert(
             format!(
                 "ledger_batched_us_per_declaration@{}decls_over@{}decls",
-                LEDGER_DECLARATIONS[LEDGER_DECLARATIONS.len() - 1], LEDGER_DECLARATIONS[0]
+                LEDGER_DECLARATIONS[LEDGER_DECLARATIONS.len() - 1],
+                LEDGER_DECLARATIONS[0]
             ),
             serde_json::json!(if base_us == 0.0 {
                 f64::NAN
@@ -2185,7 +2182,8 @@ fn acl_ace_count_cost_of_the_post_n1_declaration_and_diff_layer_paths() {
         readings.insert(
             format!(
                 "ledger_us_per_declaration@{}decls_over@{}decls",
-                LEDGER_DECLARATIONS[LEDGER_DECLARATIONS.len() - 1], LEDGER_DECLARATIONS[0]
+                LEDGER_DECLARATIONS[LEDGER_DECLARATIONS.len() - 1],
+                LEDGER_DECLARATIONS[0]
             ),
             serde_json::json!(if base_us == 0.0 {
                 f64::NAN

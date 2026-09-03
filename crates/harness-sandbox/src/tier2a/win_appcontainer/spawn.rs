@@ -1079,7 +1079,9 @@ fn spawn_impl(
                     }
                     return Err(AppContainerError::RedirectorInjection(format!(
                         "redirector injection failed for workspace {}: {e}",
-                        workspace_for_error.unwrap_or(Path::new("<unknown>")).display()
+                        workspace_for_error
+                            .unwrap_or(Path::new("<unknown>"))
+                            .display()
                     )));
                 }
             }

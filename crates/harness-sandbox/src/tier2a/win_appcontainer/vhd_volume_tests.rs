@@ -137,10 +137,7 @@ fn vhd_ntfs_remove() {
         println!("{} は既に無い（撤収済み）", vhd.display());
         return;
     }
-    let script = format!(
-        "select vdisk file=\"{}\"\ndetach vdisk\n",
-        vhd.display()
-    );
+    let script = format!("select vdisk file=\"{}\"\ndetach vdisk\n", vhd.display());
     let (ok, text) = run_diskpart(&script);
     println!("--- diskpart (detach) ---\n{text}");
     // detachが失敗してもファイル削除は試す——**片方だけ残る形を作らない**。
@@ -177,7 +174,10 @@ fn d81_per_volume_placement() {
         Some(crate::win_common::can_write_dacl(&workspace))
     });
     println!("gate({}) -> {gate:?}", workspace.display());
-    assert!(gate.is_ok(), "検証用NTFSボリュームがゲートを通らない: {gate:?}");
+    assert!(
+        gate.is_ok(),
+        "検証用NTFSボリュームがゲートを通らない: {gate:?}"
+    );
 
     // (2) 差分層の根が**そのボリュームの直下**になること（D-81の本体）。
     let chosen = crate::session_scope::cow_diff_layer_root_for_workspace(&workspace)
@@ -205,7 +205,11 @@ fn d81_per_volume_placement() {
 
     // (3) セッションの置き場がその下に来ること。
     let diff_layer = crate::session_scope::cow_diff_layer_dir_in(&chosen.root, "session-d81-probe");
-    assert!(diff_layer.starts_with(&expected), "{}", diff_layer.display());
+    assert!(
+        diff_layer.starts_with(&expected),
+        "{}",
+        diff_layer.display()
+    );
     println!("session diff layer -> {}", diff_layer.display());
 
     // (4) **AppContainerのACEが実際に載ること**（C:と同じ挙動か。共有では載らなかった）。

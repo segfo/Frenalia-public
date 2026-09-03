@@ -1086,12 +1086,7 @@ fn stop_trace(handle: CONTROLTRACE_HANDLE, name_w: &[u16], buf: &mut [u8]) {
 
 /// [`stop_trace`]の一般形（無効化するプロバイダを選べる）。**本番経路の挙動は変わらない**
 /// ——`stop_trace`は`KERNEL_FILE_PROVIDER_GUID`を渡して委譲するだけである。
-fn stop_trace_for(
-    handle: CONTROLTRACE_HANDLE,
-    name_w: &[u16],
-    buf: &mut [u8],
-    provider: GUID,
-) {
+fn stop_trace_for(handle: CONTROLTRACE_HANDLE, name_w: &[u16], buf: &mut [u8], provider: GUID) {
     unsafe {
         // プロバイダを先に無効化してからセッションを止める（止めた後に残ったイベントが
         // コールバックへ流れてくる窓を短くする）。失敗はベストエフォートで無視する。

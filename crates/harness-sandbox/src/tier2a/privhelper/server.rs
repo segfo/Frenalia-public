@@ -273,7 +273,10 @@ fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(Pat
                     "  entry {} : FAILED to derive the declaration capability: {e}",
                     entry.path.display()
                 ));
-                failures.push((entry.path, format!("could not derive the capability SID: {e}")));
+                failures.push((
+                    entry.path,
+                    format!("could not derive the capability SID: {e}"),
+                ));
                 continue;
             }
         };
@@ -591,7 +594,8 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                         &declaration_subjects,
                         &|_, _| {},
                     );
-                    let subjects = win_appcontainer::revoke_harness_subjects(&path, &[], &|_, _| {});
+                    let subjects =
+                        win_appcontainer::revoke_harness_subjects(&path, &[], &|_, _| {});
                     (decl, subjects)
                 };
                 let (decl_outcome, outcome) = if entry.forced {

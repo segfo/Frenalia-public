@@ -454,14 +454,9 @@ pub(crate) fn start(request: GrantJobRequest<'_>) -> bool {
                 r
             }
             // 取れていない＝別のプロセスが準備中。**1バイトも書かずに待つ。**
-            (None, _) => follow_the_leader(
-                &lock_name,
-                &root,
-                &ace_grants,
-                &protect_sids,
-                &skip,
-                &state,
-            ),
+            (None, _) => {
+                follow_the_leader(&lock_name, &root, &ace_grants, &protect_sids, &skip, &state)
+            }
         };
         // **成否の記録はここ1箇所**（`B-02`: 2つのレーンで書き方が割れると、片方だけ
         // 台帳へ残らない形になる）。**失敗を台帳へ残す**理由はD-85——残さないと次回の起動は
@@ -552,8 +547,12 @@ fn protect_control_dir(
         .map_err(|e| e.to_string())?;
     // [BUG-145] **書いた件数も残す。** 「保護済み」だけでは、書込が省かれていても
     // 同じ数になる——それが見えなかったことがこの欠陥の本体だった。
-    state.protected_nodes.store(nodes.protected, Ordering::Relaxed);
-    state.protection_writes.store(nodes.written, Ordering::Relaxed);
+    state
+        .protected_nodes
+        .store(nodes.protected, Ordering::Relaxed);
+    state
+        .protection_writes
+        .store(nodes.written, Ordering::Relaxed);
     Ok(())
 }
 
@@ -578,20 +577,22 @@ fn run_full_walk_lane(
     // フェーズ1: 保護DACL配下の救済walk（既存）。
     state.phase.store(PHASE_WALKING, Ordering::Relaxed);
     let progress_state = Arc::clone(state);
-    let report = super::fix_descendants_missing_aces(root, &ace_grant_refs, skip, &move |
-        done,
-        total,
-    | {
-        progress_state.done.store(done, Ordering::Relaxed);
-        progress_state.total.store(total, Ordering::Relaxed);
-    })
-    .map_err(|e| e.to_string())?;
+    let report =
+        super::fix_descendants_missing_aces(root, &ace_grant_refs, skip, &move |done, total| {
+            progress_state.done.store(done, Ordering::Relaxed);
+            progress_state.total.store(total, Ordering::Relaxed);
+        })
+        .map_err(|e| e.to_string())?;
 
     // [残課題#32] **報告を捨てない。** ここが`Ok(_)`で握り潰されていたために、
     // 「フェーズ0が17秒かけて何も配っておらず、実際に配っているのはこのwalkだけ」
     // という状態が実運用で一度も可視化されなかった（`B-10`）。
-    state.rescue_granted.store(report.granted, Ordering::Relaxed);
-    state.rescue_checked.store(report.checked, Ordering::Relaxed);
+    state
+        .rescue_granted
+        .store(report.granted, Ordering::Relaxed);
+    state
+        .rescue_checked
+        .store(report.checked, Ordering::Relaxed);
     state
         .rescue_probe_errors
         .store(report.probe_errors, Ordering::Relaxed);
@@ -679,7 +680,9 @@ fn run_lazy_lane(
     // [残課題#32と対をなす記録] このレーンでは**書いた数が正常に0でない**（上のdoc）。
     // 走査が1件も歩かなかった場合と区別できるよう、見た数と対で残す（`B-35`）。
     state.rescue_granted.store(stats.granted, Ordering::Relaxed);
-    state.rescue_checked.store(stats.processed, Ordering::Relaxed);
+    state
+        .rescue_checked
+        .store(stats.processed, Ordering::Relaxed);
     state
         .rescue_probe_errors
         .store(stats.probe_errors, Ordering::Relaxed);
@@ -690,11 +693,9 @@ fn run_lazy_lane(
             .to_string()
     })?;
     if report.stopped_early {
-        return Err(
-            "the lazy workspace scan was stopped before it finished; \
+        return Err("the lazy workspace scan was stopped before it finished; \
              part of the workspace may still be unreachable from the sandbox (D-88)"
-                .to_string(),
-        );
+            .to_string());
     }
     let mut timing = super::PhaseTiming::start();
     timing.mark(&format!(

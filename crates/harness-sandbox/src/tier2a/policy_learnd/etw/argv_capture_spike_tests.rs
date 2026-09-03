@@ -98,9 +98,11 @@ fn pids(starts: &[MofProcessStart]) -> BTreeSet<u32> {
 }
 
 fn find_marker<'a>(starts: &'a [MofProcessStart], marker: &str) -> Option<&'a MofProcessStart> {
-    starts
-        .iter()
-        .find(|s| s.command_line.as_deref().is_some_and(|c| c.contains(marker)))
+    starts.iter().find(|s| {
+        s.command_line
+            .as_deref()
+            .is_some_and(|c| c.contains(marker))
+    })
 }
 
 /// **本命**: MOF（Classic ETW）の`Process`イベントが`CommandLine`を運ぶか。
@@ -219,10 +221,11 @@ fn mof_process_events_carry_the_command_line_that_manifest_events_lack() {
         dump("relative", start);
     }
     // Tier1のgen1（powershell自身）も出す——孫まで届くかが本題なので対で見る。
-    for start in starts
-        .iter()
-        .filter(|s| s.command_line.as_deref().is_some_and(|c| c.contains("argvspike")))
-    {
+    for start in starts.iter().filter(|s| {
+        s.command_line
+            .as_deref()
+            .is_some_and(|c| c.contains("argvspike"))
+    }) {
         println!(
             "[chain] pid={:?} parent={:?} image={:?}",
             start.pid, start.parent_pid, start.image_file_name
@@ -699,10 +702,7 @@ fn where_exactly_is_the_command_line_truncated() {
 
     // (1) ASCII掃引（§22.3.1の再現＝対照）。短い側を必ず含める。
     for total in [64usize, 512, 1023, 1024, 1025, 1100, 2048] {
-        probes.push(launch(
-            format!("ascii-{total}"),
-            "x".repeat(total - PREFIX),
-        ));
+        probes.push(launch(format!("ascii-{total}"), "x".repeat(total - PREFIX)));
     }
 
     // (2) **決定打**: 上限を大きく超える長さをサロゲートペアだけで作る。
@@ -959,7 +959,8 @@ fn mof_process_events_carry_the_command_line_for_appcontainer_children() {
         manifest_outcome.seen_events,
     );
 
-    let by_pid: Vec<&MofProcessStart> = starts.iter().filter(|s| s.pid == Some(child_pid)).collect();
+    let by_pid: Vec<&MofProcessStart> =
+        starts.iter().filter(|s| s.pid == Some(child_pid)).collect();
     for start in &by_pid {
         dump("appcontainer", start);
     }
@@ -1027,9 +1028,10 @@ fn mof_process_events_carry_the_command_line_for_appcontainer_children() {
         summarize(starts)
     );
     assert!(
-        by_pid
-            .iter()
-            .any(|s| s.command_line.as_deref().is_some_and(|c| c.contains(&marker))),
+        by_pid.iter().any(|s| s
+            .command_line
+            .as_deref()
+            .is_some_and(|c| c.contains(&marker))),
         "the AppContainer child's command line ({marker}) was not observed. If this fails, argv \
          candidates cannot be generated for the policy editor's path 2 (Tier2a domain recording), \
          and decision 14's cost section must be rewritten. {}",

@@ -307,7 +307,10 @@ fn cleanup_declarations(
             }
         }
         let dropped = crate::tier2a::workspace_capability::forget_capability(&canonical_ws, "");
-        eprintln!("cleanup: dropped {} capability ledger entries", dropped.len());
+        eprintln!(
+            "cleanup: dropped {} capability ledger entries",
+            dropped.len()
+        );
         // `preflight`成功のたびに`workspace-grant-ledger.json`へ1行積まれる。使い捨ての
         // ワークスペースなので、消さないと**実在しないパスの記録**が溜まり続ける
         // （実測で1,043件まで育った前例があり、掃除は`harness fs prune`頼みになっていた）。
@@ -365,7 +368,8 @@ fn only_the_declaring_domain_reaches_the_declared_path() {
     let declared_guard = TestDirGuard::create("fsallow-accept-declared");
     let workspace = workspace_guard.path().to_path_buf();
     let declared = declared_guard.path().to_path_buf();
-    std::fs::write(declared.join("secret.txt"), b"declared-content").expect("seed the declared dir");
+    std::fs::write(declared.join("secret.txt"), b"declared-content")
+        .expect("seed the declared dir");
 
     let _cleanup = cleanup_declarations(workspace.clone(), vec![declared.clone()]);
     let declaration = read_declaration(&declared);
@@ -777,7 +781,8 @@ fn the_cow_read_only_downgrade_carries_the_class_that_was_actually_written() {
 
     // --- 移行後の不変条件（§22.3.0）: セッションpackage SID宛のACEは0本 ---
     assert_eq!(
-        sid_ace_mask(&declared, session.as_psid()).expect("the declared path DACL must be readable"),
+        sid_ace_mask(&declared, session.as_psid())
+            .expect("the declared path DACL must be readable"),
         None,
         "the session package SID must have no ACE on the declared path: it is shared by every \
          process in this AppContainer, so one such ACE re-opens the path to every domain \
@@ -925,13 +930,14 @@ fn measure_two_declarations_in_one_preflight(
     let workspace = workspace_guard.path().to_path_buf();
     let first_path = first_guard.path().to_path_buf();
     let second_path = second_guard.path().to_path_buf();
-    std::fs::write(first_path.join("seed.txt"), b"first-side")
-        .expect("seed the first declaration");
+    std::fs::write(first_path.join("seed.txt"), b"first-side").expect("seed the first declaration");
     std::fs::write(second_path.join("seed.txt"), b"second-side")
         .expect("seed the second declaration");
 
-    let _cleanup =
-        cleanup_declarations(workspace.clone(), vec![first_path.clone(), second_path.clone()]);
+    let _cleanup = cleanup_declarations(
+        workspace.clone(),
+        vec![first_path.clone(), second_path.clone()],
+    );
     let canonical_ws = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.clone());
@@ -984,10 +990,14 @@ fn measure_two_declarations_in_one_preflight(
     // この宣言の級そのものなので、「このパスへ発行されていないこと」を求めると**正しい世界を
     // 赤にする**assertになる。その回でパスの軸を見るのは、ループの後のクロスパス2本
     // （台帳の名前・実DACL）である。
-    let other_of = |mine: FsAccess, other: FsAccess| -> Option<FsAccess> {
-        (mine != other).then_some(other)
-    };
-    let arms: [(&std::path::Path, FsAccess, Option<FsAccess>, &CarriedDeclaration); 2] = [
+    let other_of =
+        |mine: FsAccess, other: FsAccess| -> Option<FsAccess> { (mine != other).then_some(other) };
+    let arms: [(
+        &std::path::Path,
+        FsAccess,
+        Option<FsAccess>,
+        &CarriedDeclaration,
+    ); 2] = [
         (
             &first_path,
             first_access,
@@ -1054,7 +1064,8 @@ fn measure_two_declarations_in_one_preflight(
         )
         .expect("render the recorded SID");
         assert_eq!(
-            carried.granted.subject_sid, recorded_sid,
+            carried.granted.subject_sid,
+            recorded_sid,
             "{}: the carried subject must be the one the ledger recorded for the declared class",
             path.display()
         );
@@ -1128,18 +1139,21 @@ fn measure_two_declarations_in_one_preflight(
         let declared_sid = declared_subject_text(&canonical_ws, path, declared_access);
         let wider_sid = declared_subject_text(&canonical_ws, path, FsAccess::ReadWrite);
         assert_ne!(
-            declared_sid, wider_sid,
+            declared_sid,
+            wider_sid,
             "{}: two access classes must derive different SIDs, otherwise this test cannot tell \
              them apart (the derivation would not include the access class)",
             path.display()
         );
         assert_eq!(
-            carried.granted.subject_sid, declared_sid,
+            carried.granted.subject_sid,
+            declared_sid,
             "{}: the carried subject must be the capability of the class declared in this run",
             path.display()
         );
         assert_ne!(
-            carried.granted.subject_sid, wider_sid,
+            carried.granted.subject_sid,
+            wider_sid,
             "{}: the read_write subject issued by the earlier run must not be carried into this \
              child -- it would hand the child a write permission it never declared",
             path.display()
@@ -1211,7 +1225,8 @@ fn measure_two_declarations_in_one_preflight(
     // ここが一致する。上のクロスパスと同じ壊れ方を、**ACLを1バイトも読まずに**捕まえる経路で、
     // 級が同じ回でも級が割れた回でも同じだけ効く。
     assert_ne!(
-        recorded_names[0], recorded_names[1],
+        recorded_names[0],
+        recorded_names[1],
         "the ledger must have issued different capability names for {} and {}; one name for two \
          paths means the derivation key stopped including the path",
         first_path.display(),

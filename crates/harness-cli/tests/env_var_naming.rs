@@ -237,7 +237,10 @@ fn collect(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
 fn is_test_side(rel: &str) -> bool {
     rel.split('/')
         .any(|c| c == "tests" || c == "examples" || c == "benches")
-        || rel.rsplit('/').next().is_some_and(|f| f.ends_with("_tests.rs"))
+        || rel
+            .rsplit('/')
+            .next()
+            .is_some_and(|f| f.ends_with("_tests.rs"))
 }
 
 /// テキストから **環境変数として使われている** `HARNESS_*` を拾う。
@@ -257,7 +260,9 @@ fn harness_env_names(text: &str) -> BTreeSet<String> {
         let start = i + pos;
         let mut end = start;
         while end < bytes.len()
-            && (bytes[end].is_ascii_uppercase() || bytes[end].is_ascii_digit() || bytes[end] == b'_')
+            && (bytes[end].is_ascii_uppercase()
+                || bytes[end].is_ascii_digit()
+                || bytes[end] == b'_')
         {
             end += 1;
         }
@@ -357,9 +362,9 @@ fn every_name_in_the_production_list_is_still_read_by_non_test_code() {
     let mut orphaned: Vec<&str> = Vec::new();
 
     for (name, _) in PRODUCTION_ENV_VARS {
-        let alive = sources.iter().any(|(rel, text)| {
-            !is_test_side(rel) && harness_env_names(text).contains(*name)
-        });
+        let alive = sources
+            .iter()
+            .any(|(rel, text)| !is_test_side(rel) && harness_env_names(text).contains(*name));
         if !alive {
             orphaned.push(name);
         }
@@ -436,7 +441,10 @@ fn the_scanner_picks_up_all_three_forms_and_nothing_else() {
         "HARNESS_TEST_BRAVO",
         "HARNESS_TEST_CHARLIE",
     ] {
-        assert!(found.contains(name), "`env:` 参照の形を拾えていない: {name}");
+        assert!(
+            found.contains(name),
+            "`env:` 参照の形を拾えていない: {name}"
+        );
     }
     assert!(
         !found.contains("HARNESS_TEST_NOT_A_READ"),

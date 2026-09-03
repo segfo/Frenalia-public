@@ -274,7 +274,11 @@ fn d79_split_stops_undeclared_executables_but_keeps_dirs_traversable() {
             ));
         }
     }
-    assert!(failures.is_empty(), "D-79 split shape:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "D-79 split shape:\n{}",
+        failures.join("\n")
+    );
 }
 
 // ============================================================================
@@ -440,7 +444,10 @@ fn d79_cost_of_splitting_the_inherited_ace() {
         let mut nodes = 0usize;
         for d in &dirs {
             let n = build_wide_tree(d.path(), count, 32);
-            assert!(nodes == 0 || nodes == n, "測定ツリーのノード数が揃っていない");
+            assert!(
+                nodes == 0 || nodes == n,
+                "測定ツリーのノード数が揃っていない"
+            );
             nodes = n;
         }
         let caps: Vec<_> = ["single", "naive", "onewrite"]
@@ -606,7 +613,10 @@ fn d79_cost_of_per_object_exec_aces() {
     grant_d79_split_aces(root, cap.as_psid());
 
     let files: Vec<PathBuf> = (0..100)
-        .map(|i| root.join(format!("d{:03}", i % 4)).join(format!("f{i:06}.txt")))
+        .map(|i| {
+            root.join(format!("d{:03}", i % 4))
+                .join(format!("f{i:06}.txt"))
+        })
         .collect();
 
     let mut done = 0usize;

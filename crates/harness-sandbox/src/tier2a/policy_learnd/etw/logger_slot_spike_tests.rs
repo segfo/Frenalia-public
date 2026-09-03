@@ -39,7 +39,10 @@ const MAX_ATTEMPTS: usize = 12;
 
 /// `logman query -ets`の生出力（結果へ貼るためにそのまま返す）。
 fn logman_query() -> String {
-    match std::process::Command::new("logman").args(["query", "-ets"]).output() {
+    match std::process::Command::new("logman")
+        .args(["query", "-ets"])
+        .output()
+    {
         Ok(output) => format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),

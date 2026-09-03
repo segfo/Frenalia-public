@@ -326,7 +326,10 @@ mod tests {
         let older = r#"{"vm_host":null,"workspace_resources":[]}"#;
         let ledger: VmLedger = serde_json::from_str(older).expect("既存の形は読めること");
         assert_eq!(ledger.max_sessions, None);
-        assert_eq!(effective_max_sessions(ledger.max_sessions), DEFAULT_MAX_SESSIONS);
+        assert_eq!(
+            effective_max_sessions(ledger.max_sessions),
+            DEFAULT_MAX_SESSIONS
+        );
     }
 
     #[test]

@@ -595,8 +595,7 @@ pub fn ensure_declaration_capability_name(
     declared_path: &Path,
     access_class: &str,
 ) -> Result<String, String> {
-    ensure_declaration_capability(workspace, declared_path, access_class)
-        .map(|c| c.capability_name)
+    ensure_declaration_capability(workspace, declared_path, access_class).map(|c| c.capability_name)
 }
 
 /// [BUG-142] そのworkspaceが**宣言の宛先SIDを発行済みのパス**（畳み込み済みの綴り、重複なし）。
@@ -735,10 +734,7 @@ fn declaration_capability_names_in(
 /// （`None`）を使ってよいのは、そのパスを名指しした明示操作（`harness fs revoke <path>`）
 /// だけである**——他のworkspaceの宛先SIDまで剥がすので、暗黙の経路から呼ぶと
 /// [BUG-046](../../../docs/bugs/BUG-046.md)（他人の使っているACEを純減させる）と同じ形になる。
-pub fn declaration_capability_names(
-    declared_path: &Path,
-    workspace: Option<&Path>,
-) -> Vec<String> {
+pub fn declaration_capability_names(declared_path: &Path, workspace: Option<&Path>) -> Vec<String> {
     declaration_capability_names_in(&ledger(), declared_path, workspace)
 }
 
@@ -858,11 +854,7 @@ fn mark_tree_verified_in(ledger: &Ledger<WorkspaceCapabilityLedger>, workspace: 
     // 古い識別子と新しい時刻を突き合わせることになる。
     let identity = root_identity(workspace);
     ledger.update(|l| {
-        if let Some(entry) = l
-            .entries
-            .iter_mut()
-            .find(|e| matches(e, &key, None, mode))
-        {
+        if let Some(entry) = l.entries.iter_mut().find(|e| matches(e, &key, None, mode)) {
             entry.tree_verified_at_unix_secs = Some(now);
             entry.root_file_id = identity.clone();
             entry.preparation_started_at_unix_secs = None;
@@ -1287,15 +1279,19 @@ mod tests {
         );
         assert_ne!(
             base,
-            declaration_capability_name("ffeeddccbbaa99887766554433221100", r"c:\tools\node", "read"),
+            declaration_capability_name(
+                "ffeeddccbbaa99887766554433221100",
+                r"c:\tools\node",
+                "read"
+            ),
             "秘密が導出に入っていない"
         );
         assert!(is_declaration_capability_name(&base), "{base}");
         // workspace本体の名前と取り違えない（接頭辞で見分けられる）。
         assert!(!is_workspace_capability_name(&base));
-        assert!(!is_declaration_capability_name(&capability_name_from_secret(
-            &[0u8; SECRET_LEN]
-        )));
+        assert!(!is_declaration_capability_name(
+            &capability_name_from_secret(&[0u8; SECRET_LEN])
+        ));
     }
 
     /// 長さ前置が効いていること。区切りだけで繋ぐと、境界をずらした別の組が同じ
@@ -1343,10 +1339,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let l = test_ledger(tmp.path());
         let ws = Path::new("C:\\work\\repo");
-        let a =
-            ensure_declaration_capability_name_in(&l, ws, Path::new("C:\\tools\\a"), "read").unwrap();
-        let b =
-            ensure_declaration_capability_name_in(&l, ws, Path::new("C:\\tools\\b"), "read").unwrap();
+        let a = ensure_declaration_capability_name_in(&l, ws, Path::new("C:\\tools\\a"), "read")
+            .unwrap();
+        let b = ensure_declaration_capability_name_in(&l, ws, Path::new("C:\\tools\\b"), "read")
+            .unwrap();
         assert_ne!(a, b);
     }
 
@@ -1378,11 +1374,15 @@ mod tests {
         let l = test_ledger(tmp.path());
         let ws = Path::new("C:\\work\\repo");
         // 宣言を**先に**登録する（後勝ちで隠れるのではなく、そもそも別軸であることを見る）。
-        let decl = ensure_declaration_capability_name_in(&l, ws, Path::new("C:\\tools\\node"), "rwx")
-            .unwrap();
+        let decl =
+            ensure_declaration_capability_name_in(&l, ws, Path::new("C:\\tools\\node"), "rwx")
+                .unwrap();
         let body = ensure_capability_name_in(&l, ws, "rwx").unwrap();
         assert_ne!(decl, body);
-        assert_eq!(lookup_capability_name_in(&l, ws, "rwx").as_deref(), Some(body.as_str()));
+        assert_eq!(
+            lookup_capability_name_in(&l, ws, "rwx").as_deref(),
+            Some(body.as_str())
+        );
         // 逆向きも見る: workspace本体を引いても宣言の索引には出ない。
         assert_eq!(
             declaration_capability_names_in(&l, Path::new("C:\\tools\\node"), Some(ws)),
@@ -1403,12 +1403,17 @@ mod tests {
         let from_b = ensure_declaration_capability_name_in(&l, b, decl, "read").unwrap();
         assert_ne!(from_a, from_b, "workspaceが違えば別の秘密＝別の宛先SID");
 
-        assert_eq!(declaration_capability_names_in(&l, decl, Some(a)), vec![from_a.clone()]);
+        assert_eq!(
+            declaration_capability_names_in(&l, decl, Some(a)),
+            vec![from_a.clone()]
+        );
         let all = declaration_capability_names_in(&l, decl, None);
         assert_eq!(all.len(), 2);
         assert!(all.contains(&from_a) && all.contains(&from_b));
         // 宣言されていないパスには何も出ない（空を返す＝剥がすものが無い）。
-        assert!(declaration_capability_names_in(&l, Path::new("C:\\tools\\other"), None).is_empty());
+        assert!(
+            declaration_capability_names_in(&l, Path::new("C:\\tools\\other"), None).is_empty()
+        );
     }
 
     /// §22.2.1の保険: `fs revoke-workspace`（＝`mode`が空）は**宣言の宛先SIDまで**落とす。
@@ -1419,13 +1424,17 @@ mod tests {
         let l = test_ledger(tmp.path());
         let ws = Path::new("C:\\work\\repo");
         let body = ensure_capability_name_in(&l, ws, "rwx").unwrap();
-        let decl = ensure_declaration_capability_name_in(&l, ws, Path::new("C:\\tools\\node"), "read")
-            .unwrap();
+        let decl =
+            ensure_declaration_capability_name_in(&l, ws, Path::new("C:\\tools\\node"), "read")
+                .unwrap();
 
         // モードを指定した撤収はworkspace本体だけ（宣言は残る）。
         assert_eq!(forget_capability_in(&l, ws, "rwx"), vec![body]);
         assert_eq!(l.load().entries.len(), 1);
-        assert_eq!(l.load().entries[0].declaration.as_deref(), Some("c:\\tools\\node"));
+        assert_eq!(
+            l.load().entries[0].declaration.as_deref(),
+            Some("c:\\tools\\node")
+        );
 
         // 空モードは全部（宣言も）。
         assert_eq!(forget_capability_in(&l, ws, ""), vec![decl]);
@@ -1467,8 +1476,15 @@ mod tests {
         });
         assert_eq!(removed.len(), 2, "{removed:?}");
         let left = l.load().entries;
-        assert_eq!(left.len(), 1, "the still-declared path must keep its subject: {left:?}");
-        assert_eq!(left[0].declaration.as_deref(), Some(declaration_key(alive).as_str()));
+        assert_eq!(
+            left.len(),
+            1,
+            "the still-declared path must keep its subject: {left:?}"
+        );
+        assert_eq!(
+            left[0].declaration.as_deref(),
+            Some(declaration_key(alive).as_str())
+        );
 
         // 表示ラベルは「何の許可の記録が消えたか」を出す（workspaceだけでは読み手に分からない）。
         // 突合に使う`prune_target`と違い、**人へ見せる綴りは台帳に入っているまま**である。

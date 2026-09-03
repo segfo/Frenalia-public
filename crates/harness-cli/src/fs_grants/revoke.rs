@@ -265,13 +265,11 @@ fn declaration_subjects_for(
     // 本体内では守った「生きている相手から奪わない」を昇格側だけが破る。
     let workspaces: Vec<Option<std::path::PathBuf>> = match workspace {
         Some(ws) => vec![Some(ws.to_path_buf())],
-        None => {
-            harness_sandbox::tier2a::win_appcontainer::revocable_declaration_issuers(path)
-                .eligible
-                .into_iter()
-                .map(|(ws, _name)| Some(std::path::PathBuf::from(ws)))
-                .collect()
-        }
+        None => harness_sandbox::tier2a::win_appcontainer::revocable_declaration_issuers(path)
+            .eligible
+            .into_iter()
+            .map(|(ws, _name)| Some(std::path::PathBuf::from(ws)))
+            .collect(),
     };
     workspaces
         .into_iter()
@@ -376,9 +374,10 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
             harness_sandbox::tier2a::win_appcontainer::DeclarationRevokeReport {
                 // **失敗を「対象0件」と同じ値にしない**（B-10）。索引は引けているので、
                 // 残存として名指ししたうえで昇格へ回す。
-                still_on_root: harness_sandbox::tier2a::win_appcontainer::declaration_capabilities_on_root(
-                    path, None,
-                ),
+                still_on_root:
+                    harness_sandbox::tier2a::win_appcontainer::declaration_capabilities_on_root(
+                        path, None,
+                    ),
                 ..Default::default()
             },
             Some(e.to_string()),
@@ -827,8 +826,7 @@ pub fn reconcile_fs_ledger_for_workspace(
 /// ここに残すのは**この経路の表示**だけである。
 #[cfg(windows)]
 fn prune_declaration_entries_for(revoked: &[PathBuf]) {
-    let dropped =
-        harness_sandbox::tier2a::win_appcontainer::forget_revoked_declarations(revoked);
+    let dropped = harness_sandbox::tier2a::win_appcontainer::forget_revoked_declarations(revoked);
     for label in &dropped {
         eprintln!("  forgot the declaration capability for {label}");
     }

@@ -314,9 +314,8 @@ mod tests {
                 None => vec![OsString::from("harness")],
                 Some(value) => os(&["harness", "--require-sandbox", value]),
             };
-            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| {
-                panic!("--require-sandbox {spelling:?} must parse: {e}")
-            });
+            let cli = Cli::try_parse_from(argv)
+                .unwrap_or_else(|e| panic!("--require-sandbox {spelling:?} must parse: {e}"));
             assert_eq!(
                 crate::cli::setup::parse_require_sandbox(cli.require_sandbox),
                 level,

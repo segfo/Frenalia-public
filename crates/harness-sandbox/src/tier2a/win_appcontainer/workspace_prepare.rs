@@ -182,10 +182,7 @@ pub(crate) fn plan_workspace_preparation(
             })
         })
         .collect::<Result<_, AppContainerError>>()?;
-    grant_workspace_root_aces_fast(
-        canonical_workspace,
-        &OwnedAceGrant::borrow_all(&ace_grants),
-    )?;
+    grant_workspace_root_aces_fast(canonical_workspace, &OwnedAceGrant::borrow_all(&ace_grants))?;
 
     let mut protect_sids = Vec::with_capacity(1 + additional_protect_sids.len());
     protect_sids.push(capability.clone());

@@ -440,7 +440,11 @@ mod tests {
     async fn run_shell_exit_code_fix_does_not_break_success_shapes() {
         let dir = tempfile::tempdir().unwrap();
         for (command, expected, why) in [
-            ("cmd /c exit 3", "[exit code: 3]", "ネイティブの終了コードはそのまま伝わる"),
+            (
+                "cmd /c exit 3",
+                "[exit code: 3]",
+                "ネイティブの終了コードはそのまま伝わる",
+            ),
             ("Write-Output ok", "[exit code: 0]", "正常終了は0のまま"),
             (
                 "Write-Output ok # trailing comment",

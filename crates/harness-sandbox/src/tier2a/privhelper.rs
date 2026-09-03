@@ -586,8 +586,8 @@ mod server;
 
 pub use client::{
     run_privileged, run_privileged_revoke_fs_allow, run_privileged_revoke_traverse_batch,
-    run_privileged_workspace_access, ChainLauncher, FsAllowRevokeOutcome, HELPER_EXE_NAME,
-    TraverseRevokeBatchOutcome,
+    run_privileged_workspace_access, ChainLauncher, FsAllowRevokeOutcome,
+    TraverseRevokeBatchOutcome, HELPER_EXE_NAME,
 };
 pub use server::serve;
 

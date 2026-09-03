@@ -357,9 +357,8 @@ pub fn with_restore_privilege<T>(f: impl FnOnce() -> T) -> T {
 /// このリポジトリに1つしか無い**（§22.5・`B-20`。2つ目を書くと`C:/x`と`c:\x`が別物になる）。
 /// 成分比較のほうは残す——文字列の`starts_with`だと`C:\Windows`が`C:\WindowsApps`に誤マッチする。
 pub(crate) fn path_is_within_normalized(a: &Path, base: &Path) -> bool {
-    let fold = |p: &Path| {
-        std::path::PathBuf::from(crate::tier2a::workspace_capability::workspace_key(p))
-    };
+    let fold =
+        |p: &Path| std::path::PathBuf::from(crate::tier2a::workspace_capability::workspace_key(p));
     path_is_within(&fold(a), &fold(base))
 }
 

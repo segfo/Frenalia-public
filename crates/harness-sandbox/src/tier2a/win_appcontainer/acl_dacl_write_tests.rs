@@ -161,7 +161,10 @@ fn the_write_reaches_descendants_even_when_the_subject_already_carried_that_ace(
     );
     let report =
         fix_descendants_missing_ace(root, sid.as_psid(), mask, &[], &|_, _| {}).expect("walk");
-    assert_eq!(report.checked, nodes, "the walk must have visited every node");
+    assert_eq!(
+        report.checked, nodes,
+        "the walk must have visited every node"
+    );
     assert_eq!(
         report.granted, 0,
         "the rescue walk had to write {} of {} nodes explicitly, which means the propagation is \
@@ -211,8 +214,12 @@ fn the_idempotent_skip_needs_every_grant_to_be_satisfied() {
     // 満たしている側だけを`SkipIfSufficient`で撃つ＝何も起きてはいけない。**「起きなかった」を
     // 実際に見る**ため、先に葉のACEを剥がしておく——省かれたなら剥がしたままのはずである。
     revoke_ace_unguarded(&leaf, b.as_psid()).expect("strip the leaf ACE");
-    grant_aces_propagating(root, &[grant(b.as_psid())], IdempotentCheck::SkipIfSufficient)
-        .expect("the satisfied grant");
+    grant_aces_propagating(
+        root,
+        &[grant(b.as_psid())],
+        IdempotentCheck::SkipIfSufficient,
+    )
+    .expect("the satisfied grant");
     assert_eq!(
         sid_effective_ace_mask(&leaf, b.as_psid()).expect("read the leaf mask"),
         None,

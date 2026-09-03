@@ -100,8 +100,10 @@ fn an_unprepared_file_opens_through_the_interrupt_instead_of_waiting() {
         std::fs::write(workspace.join(format!("f{i:03}.txt")), b"x").expect("fill the tree");
     }
 
-    let outcome = preflight(&workspace, &[], None, &WorkspaceWriteMode::DirectRw)
-        .unwrap_or_else(|e| panic!("preflight must succeed before this measurement means anything ({e:?})"));
+    let outcome =
+        preflight(&workspace, &[], None, &WorkspaceWriteMode::DirectRw).unwrap_or_else(|e| {
+            panic!("preflight must succeed before this measurement means anything ({e:?})")
+        });
     for warning in &outcome.warnings {
         eprintln!("preflight warning: {warning}");
     }
@@ -256,7 +258,10 @@ fn the_production_launch_path_takes_the_lazy_lane_when_a_receiver_is_open() {
         capability_generation: "lazy-acceptance-generation",
         lane: grant_job::PreparationLane::Lazy,
     });
-    assert!(started, "the lazy job must start for this measurement to mean anything");
+    assert!(
+        started,
+        "the lazy job must start for this measurement to mean anything"
+    );
 
     // **待たない。** ここが`launch.rs`のlazy分岐へ入る条件そのものである。
     let request = WorkspaceSpawn {

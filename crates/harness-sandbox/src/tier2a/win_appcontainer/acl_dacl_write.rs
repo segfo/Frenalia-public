@@ -212,8 +212,12 @@ fn grant_aces(
             })
             .collect();
         let mut new_dacl: *mut ACL = std::ptr::null_mut();
-        let merged =
-            SetEntriesInAclW(Some(&entries), Some(existing_dacl as *const _), &mut new_dacl).ok();
+        let merged = SetEntriesInAclW(
+            Some(&entries),
+            Some(existing_dacl as *const _),
+            &mut new_dacl,
+        )
+        .ok();
         // `existing_dacl`は`sd`の中を指しているので、畳み終えたここで解放してよい。
         let _ = LocalFree(HLOCAL(sd.0));
         merged.map_err(to_err)?;

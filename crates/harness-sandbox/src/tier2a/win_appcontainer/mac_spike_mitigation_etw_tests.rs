@@ -49,8 +49,7 @@ use super::*;
 use crate::tier2a::policy_learnd::etw::session::{ProbedEvent, ProviderProbeSession};
 
 /// `Microsoft-Windows-Security-Mitigations`（`Get-WinEvent -ListProvider`で実測）。
-const SECURITY_MITIGATIONS_GUID: GUID =
-    GUID::from_u128(0xFAE1_0392_F0AF_4AC0_B8FF_9F4D_920C_3CDF);
+const SECURITY_MITIGATIONS_GUID: GUID = GUID::from_u128(0xFAE1_0392_F0AF_4AC0_B8FF_9F4D_920C_3CDF);
 
 /// `KERNEL_MITIGATION_TASK_PROHIBIT_CHILD_PROCESS_CREATION`のevent id。
 /// 3=監査（"ブロックされた可能性があります"）/ 4=ブロック（Warning）。
@@ -75,7 +74,10 @@ fn dump(tag: &str, event: &ProbedEvent) {
         event.event_id, event.version, event.process_id, event.numbers
     );
     for (name, value) in &event.strings {
-        println!("[{tag}]   {name} = ({} chars) {value:?}", value.chars().count());
+        println!(
+            "[{tag}]   {name} = ({} chars) {value:?}",
+            value.chars().count()
+        );
     }
 }
 
@@ -147,7 +149,11 @@ fn kernel_denied_child_creation_is_observable_via_security_mitigations() {
             "ChildImagePathName",
             "ChildCommandLine",
         ],
-        &["CallingProcessId", "CallingProcessStartKey", "CallingThreadId"],
+        &[
+            "CallingProcessId",
+            "CallingProcessStartKey",
+            "CallingThreadId",
+        ],
     )
     .expect("start the Security-Mitigations probe session");
     std::thread::sleep(WARMUP);
@@ -197,8 +203,9 @@ fn kernel_denied_child_creation_is_observable_via_security_mitigations() {
         if !stderr.trim().is_empty() {
             println!("[etw] stderr={stderr}");
         }
-        let report = last_json_line(&stdout)
-            .unwrap_or_else(|| panic!("probe produced no JSON (restricted={restricted}): {stdout}"));
+        let report = last_json_line(&stdout).unwrap_or_else(|| {
+            panic!("probe produced no JSON (restricted={restricted}): {stdout}")
+        });
         runs.push((restricted, caller_pid, markers(&marker_dir), report));
     }
 
@@ -249,10 +256,12 @@ fn kernel_denied_child_creation_is_observable_via_security_mitigations() {
 
     // --- どのevent idで来たか（監査かブロックか） ---
     let by_id: std::collections::BTreeMap<u16, usize> =
-        restricted_events.iter().fold(Default::default(), |mut m, e| {
-            *m.entry(e.event_id).or_insert(0) += 1;
-            m
-        });
+        restricted_events
+            .iter()
+            .fold(Default::default(), |mut m, e| {
+                *m.entry(e.event_id).or_insert(0) += 1;
+                m
+            });
     println!("[etw] restricted events by id (3=audit, 4=blocked): {by_id:?}");
 
     // --- どの生成経路が拒否イベントを出したか（`WinExec`が出るかが§S1の残り） ---
@@ -415,8 +424,9 @@ fn security_mitigations_can_ride_on_the_existing_kernel_file_session() {
         if !stderr.trim().is_empty() {
             println!("[M3] stderr={stderr}");
         }
-        last_json_line(&stdout)
-            .unwrap_or_else(|| panic!("probe produced no JSON (restricted={restricted}): {stdout}"));
+        last_json_line(&stdout).unwrap_or_else(|| {
+            panic!("probe produced no JSON (restricted={restricted}): {stdout}")
+        });
         runs.push((restricted, caller_pid, markers(&marker_dir)));
     }
 
@@ -508,7 +518,9 @@ fn security_mitigations_can_ride_on_the_existing_kernel_file_session() {
     // 通し番号を詰めた形である可能性がある。**複数点で検算する**——1点だけ見て関係を
     // 決めるのは§22.3.1で一度やり直した失敗の形である。
     const LOW_48: u64 = (1u64 << 48) - 1;
-    println!("caller pid | CallingProcessStartKey | ProcessSequenceNumber | key&(2^48-1) | high 16");
+    println!(
+        "caller pid | CallingProcessStartKey | ProcessSequenceNumber | key&(2^48-1) | high 16"
+    );
     let mut pairs = 0usize;
     let mut low_bits_match = 0usize;
     let mut high_parts: BTreeSet<u64> = BTreeSet::new();

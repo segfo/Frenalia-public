@@ -54,7 +54,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -331,8 +331,7 @@ fn accept_loop(
 ) {
     let mut handlers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     loop {
-        let connected =
-            crate::win_pipe_ipc::connect_with_timeout(pipe, ACCEPT_TIMEOUT).is_ok();
+        let connected = crate::win_pipe_ipc::connect_with_timeout(pipe, ACCEPT_TIMEOUT).is_ok();
         if shared.stopping.load(Ordering::Acquire) {
             unsafe {
                 let _ = DisconnectNamedPipe(pipe);
@@ -426,9 +425,7 @@ fn serve_connection(pipe: HANDLE, shared: &Shared) {
         match &response {
             FaultResponse::Retry => shared.served.fetch_add(1, Ordering::Relaxed),
             FaultResponse::Denied { .. } => shared.denied.fetch_add(1, Ordering::Relaxed),
-            FaultResponse::Unavailable { .. } => {
-                shared.unavailable.fetch_add(1, Ordering::Relaxed)
-            }
+            FaultResponse::Unavailable { .. } => shared.unavailable.fetch_add(1, Ordering::Relaxed),
         };
         if send(pipe, &response).is_err() {
             return;

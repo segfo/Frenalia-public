@@ -226,7 +226,11 @@ fn probe(
     arm: Arm,
     ledger: &Path,
 ) -> (Vec<String>, String) {
-    let out = run_in_sandbox(container_sid, capabilities, &probe_script(root, arm, ledger));
+    let out = run_in_sandbox(
+        container_sid,
+        capabilities,
+        &probe_script(root, arm, ledger),
+    );
     eprintln!(
         "[dual-ace] --- arm {} raw ---\n{out}\n[dual-ace] --- end ---",
         arm.label()
@@ -361,7 +365,8 @@ fn dual_ace_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
             "{label}: the leaf directory must carry exactly the mask that was written"
         );
         assert_eq!(
-            note, Some(want),
+            note,
+            Some(want),
             "{label}: note.txt (the modify target) must carry exactly the mask that was written"
         );
     }
@@ -506,7 +511,11 @@ fn dual_ace_ro_child_cannot_write_a_tree_that_also_carries_the_rwx_ace() {
                     "[{}] {item}: 期待は{}だが実際は{}",
                     arm.label(),
                     if *want { "できる" } else { "できない" },
-                    if got { "できた" } else { "できなかった" }
+                    if got {
+                        "できた"
+                    } else {
+                        "できなかった"
+                    }
                 ));
             }
         }

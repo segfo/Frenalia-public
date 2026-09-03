@@ -207,7 +207,10 @@ mod tests {
         let blob = serialize_config_blob(&cfg);
         let parsed = unsafe { deserialize_config_blob(blob.as_ptr()) }.expect("parse");
         assert_eq!(parsed.workspace_root, cfg.workspace_root);
-        assert!(!parsed.cow_enabled, "no diff layer means no CoW redirection");
+        assert!(
+            !parsed.cow_enabled,
+            "no diff layer means no CoW redirection"
+        );
         assert_eq!(parsed.broker_pipe, cfg.broker_pipe);
     }
 
@@ -273,7 +276,10 @@ mod tests {
         ] {
             let cfg = finalize_config(Config {
                 workspace_root: root.clone(),
-                diff_layer_dir: PathBuf::from(format!(r"\\?\{}\", diff_layer.path().to_string_lossy())),
+                diff_layer_dir: PathBuf::from(format!(
+                    r"\\?\{}\",
+                    diff_layer.path().to_string_lossy()
+                )),
                 cow_enabled: true,
                 broker_pipe: None,
                 ext_capture_roots: vec![PathBuf::from(r"\\?\D:\ext\")],
@@ -329,12 +335,18 @@ mod tests {
     fn config_blob_parse_rejects_incomplete_input() {
         assert!(unsafe { deserialize_config_blob(std::ptr::null()) }.is_none());
         assert!(parse_config_blob("").is_none());
-        assert!(parse_config_blob("C:\\ws").is_none(), "diff_layer_dir missing");
+        assert!(
+            parse_config_blob("C:\\ws").is_none(),
+            "diff_layer_dir missing"
+        );
         assert!(
             parse_config_blob("\nC:\\diff_layer\n").is_none(),
             "workspace empty"
         );
-        assert!(parse_config_blob("C:\\ws\n\n").is_none(), "diff layer empty");
+        assert!(
+            parse_config_blob("C:\\ws\n\n").is_none(),
+            "diff layer empty"
+        );
     }
 
     /// BUG-048 F1回帰: `FILE_GENERIC_WRITE`ベースの旧実装は`SYNCHRONIZE`/`READ_CONTROL`を
@@ -583,7 +595,8 @@ mod tests {
     /// **BUG-066の回帰テスト（B-2）**: 差分層配下の実体を直接指すパスは、同じファイルの
     /// 別の綴りとして**workspaceと同じ台帳キー**へ写る（リダイレクトはしない）。
     #[test]
-    fn classify_target_treats_a_path_inside_the_diff_layer_dir_as_an_alias_with_the_same_ledger_key() {
+    fn classify_target_treats_a_path_inside_the_diff_layer_dir_as_an_alias_with_the_same_ledger_key(
+    ) {
         let workspace = tempfile::tempdir().unwrap();
         let diff_layer = tempfile::tempdir().unwrap();
         let cfg = Config {
@@ -637,9 +650,11 @@ mod tests {
                 .join("a.txt")
         )
         .is_none());
-        assert!(
-            classify_target(&cfg, &diff_layer.path().join("_ext").join("c").join("x.txt")).is_none()
-        );
+        assert!(classify_target(
+            &cfg,
+            &diff_layer.path().join("_ext").join("c").join("x.txt")
+        )
+        .is_none());
     }
 
     /// capture root配下でもworkspace配下でもないパスは`None`（素通し対象）。
@@ -725,7 +740,10 @@ mod tests {
         let merged = crate::merge_dir_entries(base.path(), diff_layer.path(), &deleted, "");
         let mut got = names(&merged);
         got.sort();
-        assert_eq!(got, vec!["both.txt", "only_base.txt", "only_diff_layer.txt"]);
+        assert_eq!(
+            got,
+            vec!["both.txt", "only_base.txt", "only_diff_layer.txt"]
+        );
         let both = merged
             .iter()
             .find(|e| String::from_utf16_lossy(&e.name) == "both.txt")

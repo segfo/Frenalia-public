@@ -64,10 +64,16 @@ fn a_queued_fault_is_taken_before_background_work_that_arrived_first() {
     // 対で見る（`B-35`）——高優先度を空にしたら、次は積んだ順で背景が出ること。
     // ここを測らないと、「常にhighしか返さない」実装でも上のassertだけは通る。
     assert!(
-        !take_next(&mut queues).expect("background work remains").is_fault,
+        !take_next(&mut queues)
+            .expect("background work remains")
+            .is_fault,
         "after the high queue drains, background work must resume"
     );
-    assert!(!take_next(&mut queues).expect("second background job").is_fault);
+    assert!(
+        !take_next(&mut queues)
+            .expect("second background job")
+            .is_fault
+    );
     assert!(
         take_next(&mut queues).is_none(),
         "an empty writer must report that there is nothing to do"
@@ -92,11 +98,15 @@ fn a_directory_gets_inheritable_aces_and_a_file_does_not() {
     let mut writer = AclWriter::start(guard.path().to_path_buf(), grants.clone());
     let handle = writer.handle();
     assert_eq!(
-        handle.grant_background(Node::dir(&dir)).expect("writer available"),
+        handle
+            .grant_background(Node::dir(&dir))
+            .expect("writer available"),
         Ok(NodeOutcome::Granted)
     );
     assert_eq!(
-        handle.grant_background(Node::file(&file)).expect("writer available"),
+        handle
+            .grant_background(Node::file(&file))
+            .expect("writer available"),
         Ok(NodeOutcome::Granted)
     );
     let _ = writer.stop_at_safe_point();
@@ -142,12 +152,19 @@ fn the_writer_separates_what_it_wrote_from_what_was_already_reached() {
     let mut writer = AclWriter::start(guard.path().to_path_buf(), grants.clone());
     let handle = writer.handle();
     assert_eq!(
-        handle.grant_background(Node::file(&file)).expect("available"),
+        handle
+            .grant_background(Node::file(&file))
+            .expect("available"),
         Ok(NodeOutcome::Granted)
     );
-    assert!(reached(&file, &grants), "the ace must actually be on the file");
+    assert!(
+        reached(&file, &grants),
+        "the ace must actually be on the file"
+    );
     assert_eq!(
-        handle.grant_background(Node::file(&file)).expect("available"),
+        handle
+            .grant_background(Node::file(&file))
+            .expect("available"),
         Ok(NodeOutcome::AlreadyReached),
         "a node that is already reached must not be written again"
     );

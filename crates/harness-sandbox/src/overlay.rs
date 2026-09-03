@@ -1493,7 +1493,11 @@ mod tests {
         git(&workspace_root, &["init", "-q"]);
         git(&workspace_root, &["add", "README.md"]);
         git(&workspace_root, &["commit", "-q", "-m", "seed"]);
-        let master_ref = workspace_root.join(".git").join("refs").join("heads").join("master");
+        let master_ref = workspace_root
+            .join(".git")
+            .join("refs")
+            .join("heads")
+            .join("master");
         assert!(
             master_ref.exists(),
             "seed must leave a loose master ref (not packed); found none at {master_ref:?}"
@@ -1506,9 +1510,21 @@ mod tests {
         let build = diff_layer_tmp.path().join("build");
         copy_dir_all(&workspace_root, &build);
         std::fs::create_dir_all(build.join(".github").join("workflows")).unwrap();
-        std::fs::write(build.join(".github").join("workflows").join("x.yml"), INJECTED).unwrap();
+        std::fs::write(
+            build.join(".github").join("workflows").join("x.yml"),
+            INJECTED,
+        )
+        .unwrap();
         git(&build, &["add", ".github/workflows/x.yml"]);
-        git(&build, &["commit", "-q", "-m", "inject ci workflow via tracked object"]);
+        git(
+            &build,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "inject ci workflow via tracked object",
+            ],
+        );
         let c1 = git(&build, &["rev-parse", "HEAD"]);
         let build_ref_bytes =
             std::fs::read(build.join(".git").join("refs").join("heads").join("master")).unwrap();
@@ -1516,8 +1532,7 @@ mod tests {
         // 3) 差分オブジェクト＋ref移動＋ワークツリー実体を 差分層 へ置き、台帳へ載せる
         //    （Redirector の copy-up が記録したであろう形を、本物のオブジェクトで再現する）。
         let loose_after = loose_objects(&build.join(".git").join("objects"));
-        let new_objects: Vec<String> =
-            loose_after.difference(&loose_before).cloned().collect();
+        let new_objects: Vec<String> = loose_after.difference(&loose_before).cloned().collect();
         assert!(
             !new_objects.is_empty(),
             "the injected commit must create new loose objects (blob/tree/commit)"
@@ -1527,12 +1542,21 @@ mod tests {
             let dst = diff_layer_dir.join(".git").join("objects").join(rel);
             std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
             std::fs::copy(&src, &dst).unwrap();
-            store::append_entry(&diff_layer_dir, ChangeOp::Create, &format!(".git/objects/{rel}"), None);
+            store::append_entry(
+                &diff_layer_dir,
+                ChangeOp::Create,
+                &format!(".git/objects/{rel}"),
+                None,
+            );
         }
         // ブランチ移動（Modify。baseline＝実workspaceの現在の master 内容＝c0）。
         std::fs::create_dir_all(diff_layer_dir.join(".git").join("refs").join("heads")).unwrap();
         std::fs::write(
-            diff_layer_dir.join(".git").join("refs").join("heads").join("master"),
+            diff_layer_dir
+                .join(".git")
+                .join("refs")
+                .join("heads")
+                .join("master"),
             &build_ref_bytes,
         )
         .unwrap();
@@ -1545,11 +1569,19 @@ mod tests {
         // ワークツリー実体（Create。これが拒否側の対照——apply で hard-deny されねばならない）。
         std::fs::create_dir_all(diff_layer_dir.join(".github").join("workflows")).unwrap();
         std::fs::write(
-            diff_layer_dir.join(".github").join("workflows").join("x.yml"),
+            diff_layer_dir
+                .join(".github")
+                .join("workflows")
+                .join("x.yml"),
             INJECTED,
         )
         .unwrap();
-        store::append_entry(&diff_layer_dir, ChangeOp::Create, ".github/workflows/x.yml", None);
+        store::append_entry(
+            &diff_layer_dir,
+            ChangeOp::Create,
+            ".github/workflows/x.yml",
+            None,
+        );
 
         // 4) apply。
         let fs = SandboxFs::open_with_cow(
@@ -1567,9 +1599,16 @@ mod tests {
                 adopt_unledgered: false,
             })
             .unwrap();
-        let applied: Vec<String> = report.applied.iter().map(|p| p.replace('\\', "/")).collect();
-        let hard_denied: Vec<String> =
-            report.hard_denied.iter().map(|p| p.replace('\\', "/")).collect();
+        let applied: Vec<String> = report
+            .applied
+            .iter()
+            .map(|p| p.replace('\\', "/"))
+            .collect();
+        let hard_denied: Vec<String> = report
+            .hard_denied
+            .iter()
+            .map(|p| p.replace('\\', "/"))
+            .collect();
 
         // 拒否側（機構が生きている証拠）: ワークツリーの設定注入パスは hard_denied。
         assert!(
@@ -1578,7 +1617,10 @@ mod tests {
              test cannot distinguish a live deny mechanism from a dead one (B-35). report={report:?}"
         );
         // 許可側（迂回）: オブジェクトは全件 applied、hard_denied されていない。
-        let objects_applied = applied.iter().filter(|p| p.starts_with(".git/objects/")).count();
+        let objects_applied = applied
+            .iter()
+            .filter(|p| p.starts_with(".git/objects/"))
+            .count();
         assert_eq!(
             objects_applied,
             new_objects.len(),
@@ -1595,14 +1637,20 @@ mod tests {
         );
 
         // 実FS: apply 直後はワークツリー実体はまだ無い（hard_denied されたので）。
-        let wt = workspace_root.join(".github").join("workflows").join("x.yml");
+        let wt = workspace_root
+            .join(".github")
+            .join("workflows")
+            .join("x.yml");
         assert!(
             !wt.exists(),
             "the working-tree file must NOT be materialized by apply itself (it was hard-denied)"
         );
 
         // 5) サンドボックス外で checkout → 迂回で運んだオブジェクトから拒否対象が実体化する。
-        git(&workspace_root, &["checkout", "HEAD", "--", ".github/workflows/x.yml"]);
+        git(
+            &workspace_root,
+            &["checkout", "HEAD", "--", ".github/workflows/x.yml"],
+        );
         assert!(
             wt.exists(),
             "BYPASS成立: サンドボックス外の`git checkout`が、密輸したオブジェクトから hard-deny \

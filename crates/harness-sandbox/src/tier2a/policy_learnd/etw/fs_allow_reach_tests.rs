@@ -601,7 +601,9 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     // 「載っていない」だけを測ると、索引ごと消えた場合も緑になる。
     let recorded = crate::tier2a::session_profile::granted_paths_for_current_session();
     println!("=== session ledger after preflight: {recorded:?} ===");
-    let canonical_ws = workspace.canonicalize().unwrap_or_else(|_| workspace.clone());
+    let canonical_ws = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
     for fp in &passthrough {
         let path_str = fp.path.to_string_lossy().into_owned();
         assert!(
@@ -621,7 +623,10 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
              declaration entry for it, so nothing can derive the SID to revoke it later",
             fp.path.display()
         );
-        println!("  declaration capability for {}: {names:?}", fp.path.display());
+        println!(
+            "  declaration capability for {}: {names:?}",
+            fp.path.display()
+        );
     }
 
     // **許可側はここでは測れていない**（B-35。書いておかないと「対で固定した」と読まれる）。
@@ -729,7 +734,14 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
     // 「祖先が無い」と言い続けるなら診断はまだ壊れている。
     println!("=== D8/D9 re-probed after the traverse grant (condition b) ===");
     for fp in &passthrough {
-        match probe_passthrough(sid.as_psid(), restore.sid.as_psid(), None, &[], &workspace, fp) {
+        match probe_passthrough(
+            sid.as_psid(),
+            restore.sid.as_psid(),
+            None,
+            &[],
+            &workspace,
+            fp,
+        ) {
             None => println!("  {} : reachable (D8 passed)", fp.path.display()),
             Some(diagnosis) => println!("  {} : {diagnosis}", fp.path.display()),
         }

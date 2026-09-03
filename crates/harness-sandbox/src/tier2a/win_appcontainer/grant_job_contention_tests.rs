@@ -250,7 +250,11 @@ fn two_harness_processes_racing_the_same_workspace_leave_exactly_one_writer() {
 
     // --- (3) **書いたのは1つだけか** ---
     let wrote: Vec<&str> = runs.iter().filter(|r| r.wrote()).map(|r| r.label).collect();
-    let waited: Vec<&str> = runs.iter().filter(|r| r.waited()).map(|r| r.label).collect();
+    let waited: Vec<&str> = runs
+        .iter()
+        .filter(|r| r.waited())
+        .map(|r| r.label)
+        .collect();
     let dump = || {
         runs.iter()
             .map(ChildRun::dump)
@@ -475,67 +479,71 @@ fn sample_one_arm(arm: &'static str, dir_label: &str, labels: &[&'static str]) -
         grants.iter().map(|g| g.sid.clone()).collect();
 
     let stop = std::sync::atomic::AtomicBool::new(false);
-    let (samples, control_aces_when_exposed): (Vec<Sample>, Option<Vec<String>>) = std::thread::scope(|scope| {
-        let sampler = {
-            let stop = &stop;
-            let watched = [
-                canonical_ws.clone(),
-                canonical_ws.join(".harness"),
-                canonical_ws.join(".harness").join("state.json"),
-                canonical_ws.join("d100").join("f000100.txt"),
-            ];
-            let owned_sids = &owned_sids;
-            scope.spawn(move || {
-                let sids: Vec<windows::Win32::Security::PSID> =
-                    owned_sids.iter().map(|s| s.as_psid()).collect();
-                let t0 = Instant::now();
-                let mut out: Vec<Sample> = Vec::new();
-                let mut aces_when_exposed = None;
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let at = t0.elapsed();
-                    let mut reached = [None; 4];
-                    for (slot, path) in reached.iter_mut().zip(watched.iter()) {
-                        *slot = reached_by_all(path, &sids);
+    let (samples, control_aces_when_exposed): (Vec<Sample>, Option<Vec<String>>) =
+        std::thread::scope(|scope| {
+            let sampler = {
+                let stop = &stop;
+                let watched = [
+                    canonical_ws.clone(),
+                    canonical_ws.join(".harness"),
+                    canonical_ws.join(".harness").join("state.json"),
+                    canonical_ws.join("d100").join("f000100.txt"),
+                ];
+                let owned_sids = &owned_sids;
+                scope.spawn(move || {
+                    let sids: Vec<windows::Win32::Security::PSID> =
+                        owned_sids.iter().map(|s| s.as_psid()).collect();
+                    let t0 = Instant::now();
+                    let mut out: Vec<Sample> = Vec::new();
+                    let mut aces_when_exposed = None;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let at = t0.elapsed();
+                        let mut reached = [None; 4];
+                        for (slot, path) in reached.iter_mut().zip(watched.iter()) {
+                            *slot = reached_by_all(path, &sids);
+                        }
+                        // **届いてしまった最初の1回だけ、現物のACEを控える。**
+                        // 件数だけでは「継承で降ってきた」と「誰かが明示的に書いた」を区別できない。
+                        if reached[1] == Some(true) && aces_when_exposed.is_none() {
+                            aces_when_exposed =
+                                super::super::test_support::describe_dacl_aces(&watched[1]).ok();
+                        }
+                        let control_protected =
+                            super::super::revoke::dacl_is_protected(&watched[1]).ok();
+                        out.push(Sample {
+                            at,
+                            reached,
+                            control_protected,
+                        });
+                        std::thread::sleep(Duration::from_millis(2));
                     }
-                    // **届いてしまった最初の1回だけ、現物のACEを控える。**
-                    // 件数だけでは「継承で降ってきた」と「誰かが明示的に書いた」を区別できない。
-                    if reached[1] == Some(true) && aces_when_exposed.is_none() {
-                        aces_when_exposed =
-                            super::super::test_support::describe_dacl_aces(&watched[1]).ok();
-                    }
-                    let control_protected =
-                        super::super::revoke::dacl_is_protected(&watched[1]).ok();
-                    out.push(Sample {
-                        at,
-                        reached,
-                        control_protected,
-                    });
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                (out, aces_when_exposed)
-            })
-        };
+                    (out, aces_when_exposed)
+                })
+            };
 
-        let runs = race_prepare_workspace(&workspace, labels);
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        for run in &runs {
+            let runs = race_prepare_workspace(&workspace, labels);
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            for run in &runs {
+                assert_eq!(
+                    run.code,
+                    Some(0),
+                    "harness.exe must succeed for this measurement to mean anything:\n{}",
+                    run.dump()
+                );
+            }
+            // **腕が意図どおりの形だったか。** 2本の腕なら書き手はちょうど1つ、
+            // 1本の腕ならその1つが書き手である（＝準備が実際に走った）。
             assert_eq!(
-                run.code,
-                Some(0),
-                "harness.exe must succeed for this measurement to mean anything:\n{}",
-                run.dump()
+                runs.iter().filter(|r| r.wrote()).count(),
+                1,
+                "[{arm}] exactly one process must have walked the tree:\n{}",
+                runs.iter()
+                    .map(ChildRun::dump)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             );
-        }
-        // **腕が意図どおりの形だったか。** 2本の腕なら書き手はちょうど1つ、
-        // 1本の腕ならその1つが書き手である（＝準備が実際に走った）。
-        assert_eq!(
-            runs.iter().filter(|r| r.wrote()).count(),
-            1,
-            "[{arm}] exactly one process must have walked the tree:\n{}",
-            runs.iter().map(ChildRun::dump).collect::<Vec<_>>().join("\n")
-        );
-        sampler.join().expect("the sampler thread must not panic")
-    });
+            sampler.join().expect("the sampler thread must not panic")
+        });
 
     assert!(
         samples.len() > 100,
@@ -733,7 +741,8 @@ fn a_sandboxed_child_cannot_write_the_control_plane_during_the_preparation_windo
     let workspace_cap = super::super::workspace_capability_sid(&canonical_ws, "rwx")
         .expect("the rwx capability must exist after preflight");
     let grants = workspace_grants(&canonical_ws);
-    let sids: Vec<windows::Win32::Security::PSID> = grants.iter().map(|g| g.sid.as_psid()).collect();
+    let sids: Vec<windows::Win32::Security::PSID> =
+        grants.iter().map(|g| g.sid.as_psid()).collect();
 
     // **窓が開くのを待つ。** 「保護が外れている」だけでは足りない——準備が始まる前も
     // 外れているので、そこで撃つと別のものを測る。開いた状態＝**許可が届いている**こと。
@@ -910,7 +919,10 @@ fn a_waiting_harness_starts_moving_once_the_leader_finishes_preparing() {
         capability_generation: "leader-alive-generation",
         lane: super::PreparationLane::FullWalk,
     });
-    assert!(started, "the leader job must start for this to mean anything");
+    assert!(
+        started,
+        "the leader job must start for this to mean anything"
+    );
 
     // 待ち手を1本立てる。**このプロセスは終了しない**ので、放棄状態では解放されない。
     let exe = harness_exe();
@@ -1070,10 +1082,7 @@ fn a_second_harness_takes_over_when_the_leader_process_is_killed_mid_preparation
     // 待ち手を立て、待ちへ入るだけの猶予を与える。
     let mut follower = spawn_one("follower");
     std::thread::sleep(Duration::from_secs(2));
-    let follower_still_running = follower
-        .try_wait()
-        .expect("poll the follower")
-        .is_none();
+    let follower_still_running = follower.try_wait().expect("poll the follower").is_none();
 
     // **leaderを殺す。** これが放棄状態を作る唯一の方法である（正常終了させると
     // 解放されてしまい、測りたい経路を通らない）。

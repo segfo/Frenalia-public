@@ -165,8 +165,8 @@ fn the_hooks_reach_children_and_grandchildren_and_fault_in_still_works() {
     let grants = workspace_grants(&canonical_ws);
     let session = ensure_profile(&crate::tier2a::session_profile::current_profile_name())
         .expect("the session profile must exist");
-    let workspace_cap = workspace_capability_sid(&canonical_ws, "rwx")
-        .expect("the rwx capability must exist");
+    let workspace_cap =
+        workspace_capability_sid(&canonical_ws, "rwx").expect("the rwx capability must exist");
 
     // **4つとも未準備にする。** 1つだけだと、最初の段が付与した時点で残りが
     // 「もう届いている」になり、2段目以降を測ったことにならない。

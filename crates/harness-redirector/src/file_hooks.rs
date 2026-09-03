@@ -32,7 +32,11 @@ use super::*;
 /// 「1 openにつきbroker要求最大1回・元open再試行最大1回」を求めているのがこの形である。
 ///
 /// 呼び出し側は**本来のopenを済ませてから**ここへ来ること（成功経路で呼ばない）。
-fn retry_once_after_fault_in<F>(cfg: &Config, oa: *const OBJECT_ATTRIBUTES, retry: F) -> Option<NTSTATUS>
+fn retry_once_after_fault_in<F>(
+    cfg: &Config,
+    oa: *const OBJECT_ATTRIBUTES,
+    retry: F,
+) -> Option<NTSTATUS>
 where
     F: FnOnce() -> NTSTATUS,
 {
@@ -128,8 +132,7 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
             }) = classify_target(cfg, &path)
             {
                 let rel_lower = rel_str.to_ascii_lowercase();
-                let is_probe =
-                    rel_lower.contains("test.txt") || rel_lower.contains("grandchild");
+                let is_probe = rel_lower.contains("test.txt") || rel_lower.contains("grandchild");
                 if is_probe {
                     debug_log(&format!(
                         "hooked_nt_create_file: rel={rel_str:?} kind={kind:?} desired_access={:#x} \
@@ -435,8 +438,7 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
             }) = classify_target(cfg, &path)
             {
                 let rel_lower = rel_str.to_ascii_lowercase();
-                let is_probe =
-                    rel_lower.contains("test.txt") || rel_lower.contains("grandchild");
+                let is_probe = rel_lower.contains("test.txt") || rel_lower.contains("grandchild");
                 if is_probe {
                     debug_log(&format!(
                         "hooked_nt_open_file: rel={rel_str:?} kind={kind:?} \

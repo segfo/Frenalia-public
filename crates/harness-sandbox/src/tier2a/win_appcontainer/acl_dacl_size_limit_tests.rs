@@ -400,7 +400,8 @@ fn acl_dacl_size_limit_when_ancestors_stack_inherited_aces() {
         let both = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
         let mask = workspace_rwx_mask();
         let mut write_errors = Vec::new();
-        for (level_index, (node, subs)) in levels.iter().zip(per_level_subjects.iter()).enumerate() {
+        for (level_index, (node, subs)) in levels.iter().zip(per_level_subjects.iter()).enumerate()
+        {
             let grants: Vec<InheritableGrant> = subs
                 .iter()
                 .map(|sid| InheritableGrant {
@@ -410,7 +411,8 @@ fn acl_dacl_size_limit_when_ancestors_stack_inherited_aces() {
                 })
                 .collect();
             if let Err(e) = grant_aces_propagating(node, &grants, IdempotentCheck::Always) {
-                write_errors.push(serde_json::json!({ "level": level_index, "error": e.to_string() }));
+                write_errors
+                    .push(serde_json::json!({ "level": level_index, "error": e.to_string() }));
             }
         }
 
@@ -443,8 +445,8 @@ fn acl_dacl_size_limit_when_ancestors_stack_inherited_aces() {
 
         // 撤収（B-01）。段ごとに剥がして、残っていないことを読み直しで確かめる。
         let psids: Vec<PSID> = expected.iter().map(|s| s.as_psid()).collect();
-        let report =
-            revoke_workspace_sids_recursive(root, &psids, &|_, _| {}).expect("revoke every subject");
+        let report = revoke_workspace_sids_recursive(root, &psids, &|_, _| {})
+            .expect("revoke every subject");
         // 撤収walkは1ノードの失敗で全体を止めず、剥がせなかったノードを`blocked`へ集めて
         // 続行する形になった。**集めた側を見ないと、剥がし残しが黙って測定結果に混じる**（B-09）。
         assert!(
@@ -456,7 +458,8 @@ fn acl_dacl_size_limit_when_ancestors_stack_inherited_aces() {
         for node in [&leaf_file, &fresh, root] {
             let left = count_own_aces(node, &wanted);
             assert_eq!(
-                left, 0,
+                left,
+                0,
                 "{label}: {} still carries {left} of the measurement ACEs after the revoke",
                 node.display()
             );

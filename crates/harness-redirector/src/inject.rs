@@ -350,11 +350,7 @@ unsafe fn grandchild_injection_is_excluded(process: HANDLE) -> bool {
 ///
 /// # Safety
 /// `pi`は有効な`PROCESS_INFORMATION`を指していること。
-unsafe fn wait_then_resume(
-    pi: &PROCESS_INFORMATION,
-    caller_wanted_suspended: bool,
-    caller: &str,
-) {
+unsafe fn wait_then_resume(pi: &PROCESS_INFORMATION, caller_wanted_suspended: bool, caller: &str) {
     if let Some(cfg) = CONFIG.get() {
         let prepared = wait_until_workspace_prepared(cfg);
         debug_log(&format!(

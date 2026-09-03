@@ -147,11 +147,14 @@ pub fn spawn_shell_in_workspace(
         .filter(|g| g.writable)
         .map(|g| g.path.clone())
         .collect();
-    let cow = req.cow_diff_layer_dir.as_ref().map(|diff_layer_dir| CowInject {
-        workspace_root: &req.workspace_root,
-        diff_layer_dir,
-        ext_capture_roots: ext_capture_roots.as_slice(),
-    });
+    let cow = req
+        .cow_diff_layer_dir
+        .as_ref()
+        .map(|diff_layer_dir| CowInject {
+            workspace_root: &req.workspace_root,
+            diff_layer_dir,
+            ext_capture_roots: ext_capture_roots.as_slice(),
+        });
 
     // D-54: workspaceツリーのACEはworkspace＋モード単位のcapability SID宛に付いている。
     // `preflight`が付与したのと同じcapability SIDをこの子のトークンへ積まないと、workspaceが一切

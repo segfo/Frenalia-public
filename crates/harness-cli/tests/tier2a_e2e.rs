@@ -486,7 +486,9 @@ fn cow_diff_layer_dir(session_id: &str) -> PathBuf {
         .unwrap_or_else(|| {
             // まだ作られていない場合は、プロファイル側の根の下を指す（従来の挙動）。
             harness_sandbox::session_scope::cow_diff_layer_dir_in(
-                roots.first().expect("at least the profile root must resolve"),
+                roots
+                    .first()
+                    .expect("at least the profile root must resolve"),
                 session_id,
             )
         })
@@ -1194,7 +1196,9 @@ fn cow_session_is_live(session_id: &str) -> bool {
 /// 問題なかった——後者は個別パス指定のオープンだけで完結し列挙を経由しないため）。
 /// この1回の`run_shell`セッション内でNew-Item→Test-Path→Remove-Item→Test-Pathまで完結させ、
 /// commit/discardを一切挟まない。
-fn case_m_new_file_created_and_deleted_within_same_cow_session(ex: &CowExclusive) -> Result<(), String> {
+fn case_m_new_file_created_and_deleted_within_same_cow_session(
+    ex: &CowExclusive,
+) -> Result<(), String> {
     let ws = case_dir("cow-m-create-delete-same-session");
     let before = ex.list_cow_sessions();
     let script = "$created = Test-Path newfile.txt; \
@@ -1272,7 +1276,9 @@ deleted = $deleted; err = $err; existsAfterDelete = $existsAfterDelete } | Conve
 /// このケースは1セッション内で、事前に存在するファイル/サブディレクトリとセッション中に
 /// 新規作成したファイルが同じ`Get-ChildItem`結果に揃って現れること・サブディレクトリの列挙も
 /// 動くこと・純粋な読み取りが台帳を汚さないことを検証する。
-fn case_n_ls_merges_preexisting_and_new_files_read_does_not_dirty_ledger(ex: &CowExclusive) -> Result<(), String> {
+fn case_n_ls_merges_preexisting_and_new_files_read_does_not_dirty_ledger(
+    ex: &CowExclusive,
+) -> Result<(), String> {
     let ws = case_dir("cow-n-ls-merge-and-clean-read");
     std::fs::write(ws.join("seed.txt"), "seed-content").map_err(|e| e.to_string())?;
     std::fs::create_dir(ws.join("sub")).map_err(|e| e.to_string())?;
@@ -1365,7 +1371,9 @@ $seedContent = [string](Get-Content seed.txt -Raw); \
 /// なお**DLLが注入されなかった/回避された場合**（台帳へ何も書かれない場合）の受け皿は
 /// host側の実体走査であり、そちらは`overlay.rs`のユニットテスト
 /// （`unledgered_*`）が固定している。ここで見るのはDLLが生きている経路の方。
-fn case_o_direct_write_into_the_diff_layer_dir_is_recorded(ex: &CowExclusive) -> Result<(), String> {
+fn case_o_direct_write_into_the_diff_layer_dir_is_recorded(
+    ex: &CowExclusive,
+) -> Result<(), String> {
     let ws = case_dir("cow-o-direct-diff-layer-write");
     let before = ex.list_cow_sessions();
     const SCRIPT: &str = "Set-Content (Join-Path $env:HARNESS_COW_DIFF_LAYER 'direct.txt') \
@@ -1388,8 +1396,9 @@ fn case_o_direct_write_into_the_diff_layer_dir_is_recorded(ex: &CowExclusive) ->
             diff_layer_file.display()
         ));
     }
-    let ops_text = std::fs::read_to_string(cow_diff_layer_dir(&session).join(".harness-cow-ops.jsonl"))
-        .unwrap_or_default();
+    let ops_text =
+        std::fs::read_to_string(cow_diff_layer_dir(&session).join(".harness-cow-ops.jsonl"))
+            .unwrap_or_default();
     if !ops_text.contains("direct.txt") {
         return Err(format!(
             "BUG-066: a direct write into the diff_layer dir must be recorded in the operations \
@@ -1498,7 +1507,11 @@ fn assert_cow_redirect_through_cwd(
                  this is exactly the BUG-066 symptom"
         )
     })?;
-    expect_eq("diff layer content", &diff_layer_content, "modified-by-agent")?;
+    expect_eq(
+        "diff layer content",
+        &diff_layer_content,
+        "modified-by-agent",
+    )?;
     // 3. 可視性: 操作台帳に載り、`apply`で実workspaceへ反映される。
     let report = apply_cow(&real, &session, None)?;
     let applied: Vec<String> = report["applied"]
@@ -1754,8 +1767,7 @@ fn plain_git(ws: &Path, args: &[&str]) -> Result<String, String> {
 /// **サンドボックスの外**で作るので、以後の CoW セッション内 git はこの`.git`を読む
 /// （RO読取は read scope 内、書込は 差分層 へリダイレクト）。
 fn git_seed_repo(ws: &Path) -> Result<(), String> {
-    std::fs::write(ws.join("README.md"), "seed\n")
-        .map_err(|e| format!("seed README: {e}"))?;
+    std::fs::write(ws.join("README.md"), "seed\n").map_err(|e| format!("seed README: {e}"))?;
     plain_git(ws, &["init", "-q"])?;
     plain_git(ws, &["add", "README.md"])?;
     plain_git(ws, &["commit", "-q", "-m", "seed"])?;
@@ -2607,7 +2619,9 @@ fn fs_allow_case_rw_can_write_delete_and_move(ledger: &FsLedgerExclusive) -> Res
 /// |---|---|---|
 /// | 子が`new.txt`を作れる | できる | 素のパスの付与自体が効いていない（機構が死んでいる） |
 /// | 子が`existing.txt`の中身を得られない | 得られない | スコープが再帰へ退化し、宣言より広く開いている |
-fn fs_allow_case_bare_path_grants_the_object_only(ledger: &FsLedgerExclusive) -> Result<(), String> {
+fn fs_allow_case_bare_path_grants_the_object_only(
+    ledger: &FsLedgerExclusive,
+) -> Result<(), String> {
     let ws = case_dir("fs-allow-bare");
     let target = fs_allow_case_dir("bare");
     // 中身は子の出力に現れてはならない印。ラベルではなく**中身そのもの**を探すことで、
@@ -2763,7 +2777,8 @@ fn fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it(
 
     // (2) 新しい寿命。**この行が旧版には無かった**——無いと、付与そのものが壊れて
     // 「1本も付かなかった」場合も(1)は緑になる（0件と成功を同じ値にしない、`B-09`）。
-    let subjects = harness_sandbox::tier2a::win_appcontainer::fs_allow_capability_sids(&target, None);
+    let subjects =
+        harness_sandbox::tier2a::win_appcontainer::fs_allow_capability_sids(&target, None);
     if subjects.is_empty() {
         return Err(format!(
             "§22.2.1: the capability ledger has no declaration subject for {}, so the grant path \
@@ -4416,7 +4431,6 @@ fn read_fs_ledger_entries() -> Result<Vec<(String, bool, Vec<String>)>, String> 
         .collect())
 }
 
-
 /// `<ws>/.harness/settings.json`へ`fs.read`宣言を書く（`paths`が空なら`fs`キーごと落とす）。
 fn write_fs_settings(ws: &Path, paths: &[&Path]) -> Result<(), String> {
     let dir = ws.join(".harness");
@@ -4445,7 +4459,9 @@ fn set_ledger_readonly(path: &Path, readonly: bool) {
 
 /// 2つのワークスペースが同じパスを宣言している間はエントリが生き、両方が宣言を外して初めて
 /// 撤収される（D-27の参照カウント）。
-fn fs_ledger_case_shared_declaration_is_refcounted(ledger: &FsLedgerExclusive) -> Result<(), String> {
+fn fs_ledger_case_shared_declaration_is_refcounted(
+    ledger: &FsLedgerExclusive,
+) -> Result<(), String> {
     let ws1 = case_dir("fs-ledger-ws1");
     let ws2 = case_dir("fs-ledger-ws2");
     let target = fs_allow_case_dir("ledger-shared");
@@ -4553,7 +4569,9 @@ fn fs_ledger_case_shared_declaration_is_refcounted(ledger: &FsLedgerExclusive) -
 
 /// 複数の`harness.exe`を**同時に**起動しても、各ワークスペースの宣言が台帳へ揃って残る
 /// （read-modify-writeが`with_named_lock`で直列化され、lost updateが起きない）。
-fn fs_ledger_case_concurrent_startups_do_not_lose_updates(ledger: &FsLedgerExclusive) -> Result<(), String> {
+fn fs_ledger_case_concurrent_startups_do_not_lose_updates(
+    ledger: &FsLedgerExclusive,
+) -> Result<(), String> {
     const N: usize = 4;
     let shared = fs_allow_case_dir("ledger-concurrent-shared");
     std::fs::write(shared.join("f.txt"), "x").map_err(|e| e.to_string())?;
@@ -4628,7 +4646,8 @@ fn fs_ledger_case_concurrent_startups_do_not_lose_updates(ledger: &FsLedgerExclu
 
     // 共有パスは**全ワークスペース**からタグされていなければならない（1件でも欠けたら
     // それが lost update そのもの）。各ワークスペース専用のパスも同様に残っている必要がある。
-    let shared_entry = ledger.entry_for(&shared)
+    let shared_entry = ledger
+        .entry_for(&shared)
         .map_err(&finish)?
         .ok_or_else(|| finish("the shared path has no ledger entry at all".to_string()))?;
     let tagged: HashSet<String> = shared_entry.1.into_iter().collect();
@@ -5052,7 +5071,11 @@ fn powershell(script: &str) -> Result<String, String> {
 fn workspace_capability_sid(ws: &Path) -> Result<String, String> {
     let script = WS_CAP_SID_SCRIPT.replace("@WS@", &ws.display().to_string());
     let found = powershell(&script)?;
-    let sids: Vec<&str> = found.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
+    let sids: Vec<&str> = found
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     match sids.as_slice() {
         [one] => Ok((*one).to_string()),
         [] => Err(format!(
@@ -5249,10 +5272,8 @@ const COPY_PY_SCRIPT: &str =
 
 /// 1ラウンド走らせて、どのトークンが出力に現れたかを返す。
 fn run_exec_probe(ws: &Path, case_name: &str, with_python: bool) -> Result<Vec<String>, String> {
-    let script = EXEC_PROBE_SCRIPT.replace(
-        "@PY@",
-        if with_python { EXEC_PROBE_PY_LINE } else { "" },
-    );
+    let script =
+        EXEC_PROBE_SCRIPT.replace("@PY@", if with_python { EXEC_PROBE_PY_LINE } else { "" });
     let run = run_harness(
         ws,
         &run_shell_script_turns(&script),
@@ -5354,7 +5375,8 @@ fn tier2a_workspace_exec_runs_but_cannot_reach_the_network() {
     // --- 本題: ワークスペース**内**へ置いたexeを、サンドボックスから起動する ---
     let name = "exec-ace-net";
     let ws = case_dir("exec-ace-net");
-    std::fs::copy(net_probe_exe(), ws.join("netprobe.exe")).expect("copy the probe into the workspace");
+    std::fs::copy(net_probe_exe(), ws.join("netprobe.exe"))
+        .expect("copy the probe into the workspace");
 
     let script = format!(".\\netprobe.exe raw-connect {HOST} {PORT} --label inside");
     let run = run_harness(
@@ -5403,7 +5425,10 @@ fn tier2a_workspace_exec_runs_but_cannot_reach_the_network() {
     if failures.is_empty() {
         exec_ace_teardown(&ws);
     } else {
-        eprintln!("[exec-ace-net] 失敗したのでワークスペースを {} に残す", ws.display());
+        eprintln!(
+            "[exec-ace-net] 失敗したのでワークスペースを {} に残す",
+            ws.display()
+        );
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

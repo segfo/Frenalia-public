@@ -334,9 +334,7 @@ fn run_case(index: usize, write: WritePath) -> CaseResult {
             (WritePath::Production, _) => {
                 match remove_sid_aces_and_protect(target, sid.as_psid()) {
                     Ok(o) if o.is_protected() => Ok(()),
-                    Ok(_) => {
-                        Err("the probe target vanished before it was protected".to_string())
-                    }
+                    Ok(_) => Err("the probe target vanished before it was protected".to_string()),
                     Err(e) => Err(e.to_string()),
                 }
             }

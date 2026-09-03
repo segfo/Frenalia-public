@@ -140,39 +140,37 @@ fn t4_privhelper_pipe_reach_from_a_sandboxed_child() {
     let control_open_child: RefCell<Option<SpikeChild>> = RefCell::new(None);
 
     {
-        let run_probe = |label: &'static str,
-                         args: &[&str],
-                         capabilities: &[PSID],
-                         no_appcontainer: bool| {
-            let mut child = SpikeSpawn {
-                exe: &probe_str,
-                args,
-                cwd: workspace.path(),
-                container_sid: sid.as_psid(),
-                capabilities,
-                child_process_restricted: false,
-                stdout_override: None,
-                extra_inherit: &[],
-                process_sddl: None,
-                thread_sddl: None,
-                token_default_dacl_sddl: None,
-                no_appcontainer,
-                console: SpikeConsole::NoWindow,
-            }
-            .spawn()
-            .unwrap_or_else(|e| panic!("{label}のプローブを起動できなかった: {e}"));
-            let (stdout, stderr, _code) = child.wait_and_read();
-            let report = last_json_line(&stdout)
-                .unwrap_or_else(|| panic!("{label}のプローブがJSONを出さなかった: {stdout}"));
-            // **その場で出す。** 後段のassertで落ちたときに、ここまでに測れた分が
-            // 道連れで消えるのを防ぐ（測定は再実行のたびに的が変わる）。
-            eprintln!("[T4] {label}: {report}");
-            observed.borrow_mut().push(ProbeRun {
-                label,
-                report,
-                stderr,
-            });
-        };
+        let run_probe =
+            |label: &'static str, args: &[&str], capabilities: &[PSID], no_appcontainer: bool| {
+                let mut child = SpikeSpawn {
+                    exe: &probe_str,
+                    args,
+                    cwd: workspace.path(),
+                    container_sid: sid.as_psid(),
+                    capabilities,
+                    child_process_restricted: false,
+                    stdout_override: None,
+                    extra_inherit: &[],
+                    process_sddl: None,
+                    thread_sddl: None,
+                    token_default_dacl_sddl: None,
+                    no_appcontainer,
+                    console: SpikeConsole::NoWindow,
+                }
+                .spawn()
+                .unwrap_or_else(|e| panic!("{label}のプローブを起動できなかった: {e}"));
+                let (stdout, stderr, _code) = child.wait_and_read();
+                let report = last_json_line(&stdout)
+                    .unwrap_or_else(|| panic!("{label}のプローブがJSONを出さなかった: {stdout}"));
+                // **その場で出す。** 後段のassertで落ちたときに、ここまでに測れた分が
+                // 道連れで消えるのを防ぐ（測定は再実行のたびに的が変わる）。
+                eprintln!("[T4] {label}: {report}");
+                observed.borrow_mut().push(ProbeRun {
+                    label,
+                    report,
+                    stderr,
+                });
+            };
 
         // **ヘルパーは起こさない**（モジュールdoc「生きたパイプを、昇格せずに測る仕掛け」）。
         let launcher = |pipe_name: &str| -> Result<(), String> {
@@ -185,7 +183,8 @@ fn t4_privhelper_pipe_reach_from_a_sandboxed_child() {
             // harnessと無関係な名前も1つ撃つ。**「この名前だから作れない」と「そもそも
             // パイプを1本も作れない」は別の事実**で、これが分かれないと先取りの可否を
             // 誤読する（前者なら名前の形が守っていることになるが、そんな機構は無い）。
-            let neutral_sandboxed = format!(r"\\.\pipe\t4-neutral-sandboxed-{}", std::process::id());
+            let neutral_sandboxed =
+                format!(r"\\.\pipe\t4-neutral-sandboxed-{}", std::process::id());
             let neutral_control = format!(r"\\.\pipe\t4-neutral-control-{}", std::process::id());
 
             // --- A: 本番と同じcapabilityのAppContainer子（開く・相乗り・列挙・先取り） ---

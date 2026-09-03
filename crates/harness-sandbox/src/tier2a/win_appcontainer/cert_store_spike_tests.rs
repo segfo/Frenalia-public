@@ -1735,7 +1735,9 @@ fn n1_which_ace_is_required_mappings_or_storage() {
 $s.Open('ReadOnly'); Write-Output ("USER_MY=" + $s.Certificates.Count); $s.Close()"#,
     );
     let user_my = kv_req(&my_out, "USER_MY");
-    eprintln!("[N1-ace] ユーザー自身のCurrentUser\\My = {user_my}件（中でこの値が出たら測定は無効）");
+    eprintln!(
+        "[N1-ace] ユーザー自身のCurrentUser\\My = {user_my}件（中でこの値が出たら測定は無効）"
+    );
 
     let mut rows: Vec<Quadrant> = Vec::new();
 
@@ -2118,7 +2120,11 @@ Write-Output ("STORAGE_TREE=" + (((Get-ChildItem '{STORAGE_ROOT}\{profile}' -Rec
     // --- 段4: 全部終わった後をもう一度見る ----------------------------------
     let s4 = observe("段4: 全候補を撃った後");
 
-    let skipped = if el_out.is_empty() { "（非昇格のため未実行）" } else { "" };
+    let skipped = if el_out.is_empty() {
+        "（非昇格のため未実行）"
+    } else {
+        ""
+    };
     eprintln!(
         "\n[N1-②][**まとめ**] このプロセスは昇格しているか = {}\n  \
          Mappings\\<SID>の有無:\n    \
@@ -2421,13 +2427,15 @@ fn n2_loopback_exemption_remove() {
 #[test]
 #[ignore = "実AppContainer＋loopback exemption＋外で立てたTLSサーバが要る。非昇格・--test-threads=1で走らせること"]
 fn n2_do_real_runtimes_trust_the_per_container_store() {
-    let ca_b64 = std::env::var("HARNESS_TEST_N2_CA_B64").expect("HARNESS_TEST_N2_CA_B64（本命CAのDER base64）");
+    let ca_b64 = std::env::var("HARNESS_TEST_N2_CA_B64")
+        .expect("HARNESS_TEST_N2_CA_B64（本命CAのDER base64）");
     let ca_thumb = std::env::var("HARNESS_TEST_N2_CA_THUMB")
         .expect("HARNESS_TEST_N2_CA_THUMB")
         .trim()
         .to_uppercase();
     let url = std::env::var("HARNESS_TEST_N2_URL").expect("HARNESS_TEST_N2_URL");
-    let url_ctrl = std::env::var("HARNESS_TEST_N2_URL_CONTROL").expect("HARNESS_TEST_N2_URL_CONTROL");
+    let url_ctrl =
+        std::env::var("HARNESS_TEST_N2_URL_CONTROL").expect("HARNESS_TEST_N2_URL_CONTROL");
     let hostport = |u: &str| {
         u.trim_start_matches("https://")
             .trim_end_matches('/')
@@ -2507,7 +2515,10 @@ $pem = "-----BEGIN CERTIFICATE-----`n" +
 Write-Output ("GHCFG=" + (Test-Path '{ghcfg}'))
 Write-Output ("CAFILE=" + (Test-Path '{cafile}'))"#
     ));
-    assert_eq!(ghcfg_code, 0, "gh用設定ディレクトリ／CAファイルの配置に失敗した: {ghcfg_out}");
+    assert_eq!(
+        ghcfg_code, 0,
+        "gh用設定ディレクトリ／CAファイルの配置に失敗した: {ghcfg_out}"
+    );
     assert_eq!(
         kv(&ghcfg_out, "CAFILE").as_deref(),
         Some("True"),
@@ -2543,7 +2554,9 @@ Write-Output ("CAFILE=" + (Test-Path '{cafile}'))"#
 
     let (inside, inside_err, inside_code) =
         ps_in_container_with_net(sid.as_psid(), &script, NetworkCapability::InternetClient);
-    eprintln!("[N2-L1][中（AppContainer）] exit={inside_code}\n{inside}\n--- stderr ---\n{inside_err}");
+    eprintln!(
+        "[N2-L1][中（AppContainer）] exit={inside_code}\n{inside}\n--- stderr ---\n{inside_err}"
+    );
 
     assert_eq!(
         kv(&inside, "DONE").as_deref(),
@@ -2871,9 +2884,8 @@ fn n6_wait_for_flag(sync: &Path, name: &str, limit: std::time::Duration) -> bool
 }
 
 fn n6_set_flag(sync: &Path, name: &str) {
-    std::fs::write(sync.join(name), b"x").unwrap_or_else(|e| {
-        panic!("同期フラグ{name}を置けない（{}）: {e}", sync.display())
-    });
+    std::fs::write(sync.join(name), b"x")
+        .unwrap_or_else(|e| panic!("同期フラグ{name}を置けない（{}）: {e}", sync.display()));
 }
 
 /// **問a・b: `Blob`を消したら信頼は失われるか。新規プロセスと既存プロセスで別々に。**
@@ -2899,7 +2911,10 @@ fn n6_does_deleting_the_blob_revoke_trust() {
     let certs = create_spike_certs();
     let sid = ensure_profile_for_test(&profile).expect("create the spike AppContainer profile");
     let pkg_sid = crate::win_common::sid_to_string(sid.as_psid()).expect("package SID string");
-    eprintln!("[N6-a/b] profile={profile} package_sid={pkg_sid} ca={}", certs.ca_thumb);
+    eprintln!(
+        "[N6-a/b] profile={profile} package_sid={pkg_sid} ca={}",
+        certs.ca_thumb
+    );
 
     // 撤収を、作る前に登録する（B-01: 対で、しかも撤収を先に置く）。
     let g = vec![(profile.clone(), pkg_sid.clone())];
@@ -2909,7 +2924,10 @@ fn n6_does_deleting_the_blob_revoke_trust() {
 
     // --- 対照1: 消す前・新規プロセス -----------------------------------------
     let before = n6_probe_once(sid.as_psid(), &profile, &pkg_sid, &certs);
-    eprintln!("[N6-a/b] {}", n6_row("対照（消す前・新規プロセス）", &before));
+    eprintln!(
+        "[N6-a/b] {}",
+        n6_row("対照（消す前・新規プロセス）", &before)
+    );
     assert!(
         n6_trusted(&before),
         "**対照が成立していない**——`Blob`を置いた状態で信頼されていない。\
@@ -2928,7 +2946,10 @@ fn n6_does_deleting_the_blob_revoke_trust() {
         .split(',')
         .filter_map(|s| s.trim().parse::<u64>().ok())
         .collect();
-    assert!(!waits.is_empty(), "HARNESS_TEST_N6_WAITSが空。刻みが1つも無い");
+    assert!(
+        !waits.is_empty(),
+        "HARNESS_TEST_N6_WAITSが空。刻みが1つも無い"
+    );
     let steps: Vec<String> = (0..waits.len()).map(|i| format!("s{i}")).collect();
     let steps_ps = format!(
         "@({})",
@@ -3055,7 +3076,9 @@ Write-Output ("STORAGE_ACE_STILL=" + @((Get-Acl '{STORAGE_ROOT}\{profile}').Acce
     );
 
     // --- まとめ（判定はこの表を人が読んで書く） -------------------------------
-    eprintln!("\n[N6][**まとめ: 問a・b**] 物差しは`X509Store`（ストアに在るか）と`X509Chain`（信頼判断）");
+    eprintln!(
+        "\n[N6][**まとめ: 問a・b**] 物差しは`X509Store`（ストアに在るか）と`X509Chain`（信頼判断）"
+    );
     eprintln!("  {}", n6_row("① 対照・消す前・新規プロセス", &before));
     eprintln!("  {}", n6_row("② 問a・消した後・新規プロセス", &after_new));
     eprintln!("  ③ 問b・長命プロセス（同一プロセス内で繰り返し）:");
@@ -3077,7 +3100,11 @@ Write-Output ("STORAGE_ACE_STILL=" + @((Get-Acl '{STORAGE_ROOT}\{profile}').Acce
     }
     eprintln!(
         "\n  → 問a（新規プロセスで信頼が失われたか） = {}",
-        if n6_trusted(&after_new) { "**失われていない**" } else { "失われた" }
+        if n6_trusted(&after_new) {
+            "**失われていない**"
+        } else {
+            "失われた"
+        }
     );
 
     // **隔離が壊れていないこと**（B-35の対照）。ユーザーの`My`が見えていたら、
@@ -3223,7 +3250,10 @@ fn n6_does_revoking_the_ace_revoke_trust() {
                 .replace("%%BLOB%%", &n6_blob_key(&profile, &certs.ca_thumb)),
         );
         eprintln!("[N6-c][ACE剥がし] exit={rev_code} {rev_out} {rev_err}");
-        assert_eq!(rev_code, 0, "[{label}] ACEの剥がしが失敗した: {rev_out}{rev_err}");
+        assert_eq!(
+            rev_code, 0,
+            "[{label}] ACEの剥がしが失敗した: {rev_out}{rev_err}"
+        );
         assert_eq!(
             kv(&rev_out, "ACE_LEFT").as_deref(),
             Some("0"),
@@ -3251,7 +3281,11 @@ fn n6_does_revoking_the_ace_revoke_trust() {
             format!(
                 "{}   → 信頼は{}",
                 n6_row("剥がした後", &after),
-                if n6_trusted(&after) { "**残った**" } else { "失われた" }
+                if n6_trusted(&after) {
+                    "**残った**"
+                } else {
+                    "失われた"
+                }
             ),
         ));
     }
@@ -3405,9 +3439,21 @@ fn n6_which_runtimes_can_even_start_inside_the_container() {
     let home = std::env::var("USERPROFILE").expect("USERPROFILE");
     let local = std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA");
     let runtimes: Vec<(&str, String, &str)> = vec![
-        ("cargo", format!(r"{home}\.cargo\bin\cargo.exe"), "--version"),
-        ("git", r"C:\Program Files\Git\cmd\git.exe".to_string(), "--version"),
-        ("node", r"C:\Program Files\nodejs\node.exe".to_string(), "--version"),
+        (
+            "cargo",
+            format!(r"{home}\.cargo\bin\cargo.exe"),
+            "--version",
+        ),
+        (
+            "git",
+            r"C:\Program Files\Git\cmd\git.exe".to_string(),
+            "--version",
+        ),
+        (
+            "node",
+            r"C:\Program Files\nodejs\node.exe".to_string(),
+            "--version",
+        ),
         (
             "python",
             format!(r"{local}\Programs\Python\Python313\python.exe"),
@@ -3640,13 +3686,15 @@ for name in ('ROOT', 'CA'):
 #[test]
 #[ignore = "実AppContainer＋loopback exemption＋外で立てたTLSサーバが要る。非昇格・--test-threads=1で走らせること"]
 fn n6_do_the_remaining_six_runtimes_trust_the_per_container_store() {
-    let ca_b64 = std::env::var("HARNESS_TEST_N2_CA_B64").expect("HARNESS_TEST_N2_CA_B64（本命CAのDER base64）");
+    let ca_b64 = std::env::var("HARNESS_TEST_N2_CA_B64")
+        .expect("HARNESS_TEST_N2_CA_B64（本命CAのDER base64）");
     let ca_thumb = std::env::var("HARNESS_TEST_N2_CA_THUMB")
         .expect("HARNESS_TEST_N2_CA_THUMB")
         .trim()
         .to_uppercase();
     let url = std::env::var("HARNESS_TEST_N2_URL").expect("HARNESS_TEST_N2_URL");
-    let url_ctrl = std::env::var("HARNESS_TEST_N2_URL_CONTROL").expect("HARNESS_TEST_N2_URL_CONTROL");
+    let url_ctrl =
+        std::env::var("HARNESS_TEST_N2_URL_CONTROL").expect("HARNESS_TEST_N2_URL_CONTROL");
 
     let sid = ensure_profile_for_test(N2_PROFILE).expect("create the N2 AppContainer profile");
     let pkg_sid = crate::win_common::sid_to_string(sid.as_psid()).expect("package SID string");
@@ -3705,7 +3753,10 @@ Write-Output ("LEFT_PKGDIR=" + (Test-Path '{pkg_dir}'))"#
         // プロファイルディレクトリ側はディレクトリごと消えるので、残るのはここだけ。
         let sid = SidBuf::parse(&revoke_sid);
         match super::revoke_ace(&revoke_from, sid.0) {
-            Ok(()) => eprintln!("[N6-e][traverse撤収] {} から剥がした", revoke_from.display()),
+            Ok(()) => eprintln!(
+                "[N6-e][traverse撤収] {} から剥がした",
+                revoke_from.display()
+            ),
             Err(e) => {
                 let msg = format!(
                     "traverse ACEが剥がせていない（{} / {revoke_sid}）: {e}。実マシンに残る",
@@ -3733,7 +3784,8 @@ Write-Output ("LEFT_PKGDIR=" + (Test-Path '{pkg_dir}'))"#
     let local = std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA");
     // rustupの**実体**を撃つ（`~/.cargo/bin/cargo.exe`はrustupのプロキシで、
     // `~/.rustup`配下へ辿り着けないコンテナの中では起動できない）。
-    let real_cargo = format!(r"{user}\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe");
+    let real_cargo =
+        format!(r"{user}\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe");
     let py_src = format!(r"{local}\Programs\Python\Python313");
 
     for (src, dst) in [
@@ -4037,9 +4089,14 @@ Try1 'STORE_HAS_CA' {{
     let (outside, _, _) = ps_outside(&outside_script);
     eprintln!("[N6-e][外（通常トークン・CA無し）]\n{outside}");
 
-    let (inside, inside_err, inside_code) =
-        ps_in_container_with_net(sid.as_psid(), &inside_script, NetworkCapability::InternetClient);
-    eprintln!("[N6-e][中（AppContainer）] exit={inside_code}\n{inside}\n--- stderr ---\n{inside_err}");
+    let (inside, inside_err, inside_code) = ps_in_container_with_net(
+        sid.as_psid(),
+        &inside_script,
+        NetworkCapability::InternetClient,
+    );
+    eprintln!(
+        "[N6-e][中（AppContainer）] exit={inside_code}\n{inside}\n--- stderr ---\n{inside_err}"
+    );
 
     eprintln!("\n[N6][**まとめ: 問e**] 層1にCAを置いたコンテナの中から");
     eprintln!(
@@ -4056,7 +4113,10 @@ Try1 'STORE_HAS_CA' {{
                 ("ctrl", "対照（別CA・置いていない）"),
             ] {
                 let key = format!("RT:{}:{vid}:{which}", r.name);
-                eprintln!("      [{vlabel}] {label} 中= {}", kv(&inside, &key).unwrap_or_default());
+                eprintln!(
+                    "      [{vlabel}] {label} 中= {}",
+                    kv(&inside, &key).unwrap_or_default()
+                );
                 eprintln!(
                     "      [{vlabel}] {label} 外= {}",
                     kv(&outside, &key).unwrap_or_default()

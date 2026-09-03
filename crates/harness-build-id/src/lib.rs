@@ -104,8 +104,9 @@ pub fn hash_sources(files: &[(String, Vec<u8>)]) -> String {
 ///
 /// 親を固定段数で辿らないのは、呼び出し元のクレートがどの深さに居ても正しく効くようにするため。
 fn workspace_root() -> PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("harness-build-id: CARGO_MANIFEST_DIR is only set by cargo; call this from build.rs");
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect(
+        "harness-build-id: CARGO_MANIFEST_DIR is only set by cargo; call this from build.rs",
+    );
     let mut dir = PathBuf::from(manifest);
     loop {
         let candidate = dir.join("Cargo.toml");
@@ -225,6 +226,8 @@ mod tests {
     fn the_id_is_always_64_lowercase_hex_digits() {
         let id = hash_sources(&[f("a.rs", "one")]);
         assert_eq!(id.len(), BUILD_ID_HEX_LEN);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
     }
 }

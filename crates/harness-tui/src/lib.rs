@@ -498,7 +498,9 @@ pub async fn run(
     // 組んだ`ctx`は**ピッカーより前の使い捨てセッション**のオーバーレイを指したままである
     // （`sandbox_dir`はセッションID確定時に決まるが、確定はピッカーの後になる）。ここで
     // 選ばれたセッションのものへ揃える。`ctx`をまだ手放していないこの一点でしか直せない。
-    if ctx.staging != review_scope.staging || ctx.cow_diff_layer_dir != review_scope.cow_diff_layer_dir {
+    if ctx.staging != review_scope.staging
+        || ctx.cow_diff_layer_dir != review_scope.cow_diff_layer_dir
+    {
         // ピッカーで`f`（fork）を選んだ場合は、元セッションの未適用変更も分岐先へ持っていく
         // （`--fork-session`・`/fork`と同じ意味論。`bug-pattern-rules` B-06）。
         let prepared = match &forked_from {

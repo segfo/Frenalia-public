@@ -298,9 +298,7 @@ fn probe_pipe_enumerate() -> Value {
 fn probe_pipe_create_new(name: &str) -> Value {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, GetLastError};
-    use windows::Win32::Storage::FileSystem::{
-        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
-    };
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
     use windows::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
@@ -320,10 +318,13 @@ fn probe_pipe_create_new(name: &str) -> Value {
     };
     let access = "PIPE_ACCESS_DUPLEX|FIRST_PIPE_INSTANCE";
     if handle.is_invalid() {
-        return attempt("pipe-create-new", name, access, false, unsafe {
-            GetLastError()
-        }
-        .0);
+        return attempt(
+            "pipe-create-new",
+            name,
+            access,
+            false,
+            unsafe { GetLastError() }.0,
+        );
     }
     // **測定なので占拠したままにしない。** 即座に閉じる（閉じ忘れると、この後に本体が
     // 同じ名前を使う経路を無関係に壊す）。

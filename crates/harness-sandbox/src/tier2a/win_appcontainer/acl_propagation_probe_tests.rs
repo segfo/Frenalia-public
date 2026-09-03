@@ -448,10 +448,7 @@ fn acl_propagation_mechanism_depends_on_where_the_tree_sits() {
 
     for base in &bases {
         for (label, first) in [
-            (
-                "A-propagate-only",
-                None::<Write>,
-            ),
+            ("A-propagate-only", None::<Write>),
             (
                 "B-product-shape",
                 Some(Write {

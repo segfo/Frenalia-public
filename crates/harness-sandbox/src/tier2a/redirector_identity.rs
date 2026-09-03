@@ -322,7 +322,10 @@ mod tests {
     #[test]
     fn a_marker_with_non_lowercase_hex_is_rejected() {
         let upper = ID_A.to_uppercase();
-        assert_eq!(extract_build_id(&blob_with(&[&upper])), Err(IdError::Missing));
+        assert_eq!(
+            extract_build_id(&blob_with(&[&upper])),
+            Err(IdError::Missing)
+        );
     }
 
     /// **D3**: 相異なる刻印が 2 つ。どちらが本物か決められないので通さない。

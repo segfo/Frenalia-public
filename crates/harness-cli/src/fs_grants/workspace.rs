@@ -200,7 +200,10 @@ fn revoke_one_workspace(path: &Path) -> WorkspaceRevokeOutcome {
                     profile_targets.len()
                 );
                 WorkspaceRevokeOutcome::Revoked(ForgettableWorkspace {
-                    modes: capability_targets.iter().map(|(mode, _, _)| *mode).collect(),
+                    modes: capability_targets
+                        .iter()
+                        .map(|(mode, _, _)| *mode)
+                        .collect(),
                     path: canonical,
                 })
             }
@@ -222,7 +225,10 @@ fn revoke_one_workspace(path: &Path) -> WorkspaceRevokeOutcome {
         Err(e) => {
             // rootにすら触れなかった（あるいはツリーを列挙できなかった）。1ノードも剥がせて
             // いない。
-            unfinished_workspace(canonical, format!("{e} (checked up to node {last_reported})"))
+            unfinished_workspace(
+                canonical,
+                format!("{e} (checked up to node {last_reported})"),
+            )
         }
     }
 }
@@ -330,9 +336,9 @@ fn forget_revoked_ledger_records(revoked: &[ForgettableWorkspace]) {
     // 代用しない）。
     harness_sandbox::tier2a::workspace_ledger::prune_workspace_entries(|entry_path| {
         let entry_path = entry_path.to_string_lossy();
-        revoked.iter().any(|w| {
-            harness_grant_ledger::same_ledger_path(&entry_path, &w.path.to_string_lossy())
-        })
+        revoked
+            .iter()
+            .any(|w| harness_grant_ledger::same_ledger_path(&entry_path, &w.path.to_string_lossy()))
     });
 }
 

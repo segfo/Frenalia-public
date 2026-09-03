@@ -20,9 +20,9 @@ pub(crate) fn baseline_hash_for(cfg: &Config, ledger_key: &str) -> Option<String
         return v.clone();
     }
     let hash = if Path::new(ledger_key).is_absolute() {
-        store::ext_key(ledger_key)
-            .ok()
-            .and_then(|key| store::baseline_hash_and_mirror_ext(&cfg.diff_layer_dir, ledger_key, &key))
+        store::ext_key(ledger_key).ok().and_then(|key| {
+            store::baseline_hash_and_mirror_ext(&cfg.diff_layer_dir, ledger_key, &key)
+        })
     } else {
         store::baseline_hash_and_mirror(&cfg.diff_layer_dir, &cfg.workspace_root, ledger_key)
     };

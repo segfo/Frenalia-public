@@ -203,7 +203,8 @@ fn unc_host(unc: &str) -> String {
 #[test]
 #[ignore = "実AppContainerと実SMB共有を使う。**非昇格**・--test-threads=1・HARNESS_TEST_UNC_PROBE必須"]
 fn n8_why_cant_an_appcontainer_child_reach_an_smb_share() {
-    let base = std::env::var("HARNESS_TEST_UNC_PROBE").expect("HARNESS_TEST_UNC_PROBE に検証用UNCディレクトリを渡すこと");
+    let base = std::env::var("HARNESS_TEST_UNC_PROBE")
+        .expect("HARNESS_TEST_UNC_PROBE に検証用UNCディレクトリを渡すこと");
     let unc_file = format!(r"{base}\marker.txt");
     let host = unc_host(&base);
     assert!(!host.is_empty(), "UNCからホスト名を取れない: {base}");
@@ -242,8 +243,9 @@ fn n8_why_cant_an_appcontainer_child_reach_an_smb_share() {
     );
 
     // --- C0（計器の対照）: コンテナが起動できるか ---
-    let filler0 = super::capability_sid_from_name(&format!("harness-n8c-c0-{}", std::process::id()))
-        .expect("derive filler capability");
+    let filler0 =
+        super::capability_sid_from_name(&format!("harness-n8c-c0-{}", std::process::id()))
+            .expect("derive filler capability");
     let c0 = run_in_container(sid.as_psid(), &[filler0.as_psid()], "Write-Output 'C0=OK'");
     assert!(
         c0.contains("C0=OK"),
@@ -253,8 +255,9 @@ fn n8_why_cant_an_appcontainer_child_reach_an_smb_share() {
     let ic = sid_from_string(CAP_INTERNET_CLIENT);
     let ics = sid_from_string(CAP_INTERNET_CLIENT_SERVER);
     let pn = sid_from_string(CAP_PRIVATE_NETWORK);
-    let filler = super::capability_sid_from_name(&format!("harness-n8c-fill-{}", std::process::id()))
-        .expect("derive filler capability");
+    let filler =
+        super::capability_sid_from_name(&format!("harness-n8c-fill-{}", std::process::id()))
+            .expect("derive filler capability");
 
     let none_out = run_in_container(sid.as_psid(), &[filler.as_psid()], &script);
     row_reason("C3 in-container: network cap無し", &none_out);
@@ -333,9 +336,8 @@ fn n8_can_an_appcontainer_child_reach_an_smb_share() {
     // --- C0（**計器の対照**）: 中身の無いスクリプトでコンテナが起動できるか ---
     // ここが落ちたら、以降の失敗は「AppContainerがUNCを塞いだ」ではなく**起動できていない**。
     // 起動の失敗と到達の失敗は、区別しないと正反対の結論になる。
-    let filler0 =
-        super::capability_sid_from_name(&format!("harness-n8-c0-{}", std::process::id()))
-            .expect("derive filler capability");
+    let filler0 = super::capability_sid_from_name(&format!("harness-n8-c0-{}", std::process::id()))
+        .expect("derive filler capability");
     let c0 = run_in_container(sid.as_psid(), &[filler0.as_psid()], "Write-Output 'C0=OK'");
     eprintln!("[N8-③-B] C0 instrument: {c0:?}");
     assert!(
@@ -348,8 +350,9 @@ fn n8_can_an_appcontainer_child_reach_an_smb_share() {
     // 「本当に0本」は通らない経路である）。したがって「ネットワークcapabilityが無い」を
     // 測るための埋め草として、**ネットワークと無関係な導出capabilityを1本だけ**積む。
     // 台帳へは何も書かない純粋な導出なので、実マシンに記録は残らない。
-    let filler = super::capability_sid_from_name(&format!("harness-n8-filler-{}", std::process::id()))
-        .expect("derive filler capability");
+    let filler =
+        super::capability_sid_from_name(&format!("harness-n8-filler-{}", std::process::id()))
+            .expect("derive filler capability");
     let none_out = run_in_container(sid.as_psid(), &[filler.as_psid()], &script);
     row("C3 in-container: network cap無し", &none_out);
 

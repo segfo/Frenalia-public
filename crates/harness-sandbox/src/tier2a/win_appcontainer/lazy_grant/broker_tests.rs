@@ -9,8 +9,8 @@ use std::path::Path;
 
 use super::*;
 use crate::tier2a::win_appcontainer::test_support::TestDirGuard;
-use crate::tier2a::win_appcontainer::{capability_sid_from_name, workspace_rwx_mask};
 use crate::tier2a::win_appcontainer::OwnedAceGrant;
+use crate::tier2a::win_appcontainer::{capability_sid_from_name, workspace_rwx_mask};
 use crate::win_common::sid_to_string;
 use crate::win_pipe_ipc::connect_with_timeout;
 
@@ -106,11 +106,20 @@ fn the_chain_runs_from_the_workspace_root_down_to_the_target() {
     let chain = resolve_chain(&policy, &leaf.to_string_lossy()).expect("the leaf is in scope");
     let names: Vec<String> = chain
         .iter()
-        .map(|n| n.path.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        .map(|n| {
+            n.path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     assert_eq!(names, vec!["ws", "a", "b", "f.txt"]);
     assert!(chain[0].is_dir && chain[1].is_dir && chain[2].is_dir);
-    assert!(!chain[3].is_dir, "the leaf is a file, so it gets no inherit bits");
+    assert!(
+        !chain[3].is_dir,
+        "the leaf is a file, so it gets no inherit bits"
+    );
 }
 
 /// **まだ存在しないパスは、実在するいちばん深い祖先まで遡る。**
@@ -218,11 +227,17 @@ fn a_granted_path_is_materialised_once_and_merged_afterwards() {
     let mut writer = super::super::writer::AclWriter::start(root.clone(), grants.clone());
     let shared = shared_for(&root, Vec::new(), writer.handle());
 
-    assert_eq!(handle_grant(&shared, &file.to_string_lossy()), FaultResponse::Retry);
+    assert_eq!(
+        handle_grant(&shared, &file.to_string_lossy()),
+        FaultResponse::Retry
+    );
     let after_first = writer.stats().faults_served;
     assert_eq!(after_first, 1, "the first request goes to the writer");
 
-    assert_eq!(handle_grant(&shared, &file.to_string_lossy()), FaultResponse::Retry);
+    assert_eq!(
+        handle_grant(&shared, &file.to_string_lossy()),
+        FaultResponse::Retry
+    );
     assert_eq!(
         writer.stats().faults_served,
         after_first,
@@ -340,8 +355,12 @@ fn a_client_outside_an_appcontainer_is_refused_by_the_broker() {
     let grants = test_grants("outsider");
     let capability = sid_to_string(grants[0].sid.as_psid()).expect("sid string");
     let mut writer = super::super::writer::AclWriter::start(root.clone(), grants.clone());
-    let mut broker = Broker::start(policy_for(&root, Vec::new()), writer.handle(), std::slice::from_ref(&capability))
-        .expect("the broker must open its pipe");
+    let mut broker = Broker::start(
+        policy_for(&root, Vec::new()),
+        writer.handle(),
+        std::slice::from_ref(&capability),
+    )
+    .expect("the broker must open its pipe");
 
     let client = unsafe {
         let name_w = wide(broker.pipe_name());
@@ -389,8 +408,12 @@ fn stopping_the_broker_returns_promptly() {
     let grants = test_grants("stop");
     let capability = sid_to_string(grants[0].sid.as_psid()).expect("sid string");
     let mut writer = super::super::writer::AclWriter::start(root.clone(), grants);
-    let mut broker = Broker::start(policy_for(&root, Vec::new()), writer.handle(), std::slice::from_ref(&capability))
-        .expect("the broker must open its pipe");
+    let mut broker = Broker::start(
+        policy_for(&root, Vec::new()),
+        writer.handle(),
+        std::slice::from_ref(&capability),
+    )
+    .expect("the broker must open its pipe");
 
     let started = std::time::Instant::now();
     let _ = broker.stop();
@@ -412,10 +435,16 @@ fn the_broker_pipe_uses_the_shared_harness_naming() {
     let grants = test_grants("name");
     let capability = sid_to_string(grants[0].sid.as_psid()).expect("sid string");
     let mut writer = super::super::writer::AclWriter::start(root.clone(), grants);
-    let mut broker = Broker::start(policy_for(&root, Vec::new()), writer.handle(), std::slice::from_ref(&capability))
-        .expect("the broker must open its pipe");
+    let mut broker = Broker::start(
+        policy_for(&root, Vec::new()),
+        writer.handle(),
+        std::slice::from_ref(&capability),
+    )
+    .expect("the broker must open its pipe");
 
-    assert!(crate::win_pipe_ipc::is_harness_pipe_name(broker.pipe_name()));
+    assert!(crate::win_pipe_ipc::is_harness_pipe_name(
+        broker.pipe_name()
+    ));
     assert!(broker.pipe_name().contains("lazy-ace-broker"));
     // 開けることまで見る（名前が正しくてもパイプが無ければ意味が無い）。
     let opened = unsafe {
@@ -430,7 +459,10 @@ fn the_broker_pipe_uses_the_shared_harness_naming() {
             None,
         )
     };
-    assert!(opened.is_ok(), "the pipe must actually exist once start returned");
+    assert!(
+        opened.is_ok(),
+        "the pipe must actually exist once start returned"
+    );
     if let Ok(handle) = opened {
         unsafe {
             let _ = CloseHandle(handle);

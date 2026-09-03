@@ -249,7 +249,11 @@ fn describe_tree(id: &str, root: &Path, origin: &str) -> TreeComposition {
 fn robocopy(src: &Path, dst: &Path, exclude_dirs: &[&str]) {
     let mut cmd = std::process::Command::new("robocopy.exe");
     cmd.arg(src).arg(dst).arg("/E").arg("/NJH").arg("/NJS");
-    cmd.arg("/NP").arg("/NFL").arg("/NDL").arg("/R:1").arg("/W:1");
+    cmd.arg("/NP")
+        .arg("/NFL")
+        .arg("/NDL")
+        .arg("/R:1")
+        .arg("/W:1");
     if !exclude_dirs.is_empty() {
         cmd.arg("/XD");
         for dir in exclude_dirs {

@@ -193,26 +193,18 @@ mod tests {
             }
         }
         // E2E・調査で実際に使っている識別句を名指しで固定する。
-        assert!(
-            WfpUnavailable::SessionProxyNotStarted
-                .warning()
-                .contains("session-scoped local proxy did not start")
-        );
-        assert!(
-            WfpUnavailable::ChainLaunchHandshakeFailed("e".into())
-                .warning()
-                .contains("chain-launch handshake failed")
-        );
-        assert!(
-            WfpUnavailable::ChainLaunchPipeMissing
-                .warning()
-                .contains("prepared pipe is missing")
-        );
-        assert!(
-            WfpUnavailable::DirectStartFailed("e".into())
-                .warning()
-                .contains("failed to start WFP netfilterd")
-        );
+        assert!(WfpUnavailable::SessionProxyNotStarted
+            .warning()
+            .contains("session-scoped local proxy did not start"));
+        assert!(WfpUnavailable::ChainLaunchHandshakeFailed("e".into())
+            .warning()
+            .contains("chain-launch handshake failed"));
+        assert!(WfpUnavailable::ChainLaunchPipeMissing
+            .warning()
+            .contains("prepared pipe is missing"));
+        assert!(WfpUnavailable::DirectStartFailed("e".into())
+            .warning()
+            .contains("failed to start WFP netfilterd"));
     }
 
     /// 原因（daemonからのエラー）が握り潰されず末尾に載ることを固定する。case 10 は
@@ -220,13 +212,11 @@ mod tests {
     /// 落ちるとE2Eが「起動失敗」と「daemonが拒否」を区別できなくなる。
     #[test]
     fn the_underlying_error_is_carried_into_the_warning() {
-        assert!(
-            WfpUnavailable::ChainLaunchHandshakeFailed(
-                "daemon rejected the request: nope".to_string()
-            )
-            .warning()
-            .ends_with("daemon rejected the request: nope")
-        );
+        assert!(WfpUnavailable::ChainLaunchHandshakeFailed(
+            "daemon rejected the request: nope".to_string()
+        )
+        .warning()
+        .ends_with("daemon rejected the request: nope"));
         assert!(
             WfpUnavailable::DirectStartFailed("daemon rejected the request: nope".to_string())
                 .warning()
@@ -269,13 +259,22 @@ mod tests {
     fn plan_covers_every_combination_of_the_startup_facts() {
         let cases = [
             // (tier2a_domain_policy, proxy_ready, chain_attempted, pipe_present) => plan
-            ((true, false, false, false), WfpPlan::Denied(WfpUnavailable::SessionProxyNotStarted)),
-            ((true, false, true, true), WfpPlan::Denied(WfpUnavailable::SessionProxyNotStarted)),
+            (
+                (true, false, false, false),
+                WfpPlan::Denied(WfpUnavailable::SessionProxyNotStarted),
+            ),
+            (
+                (true, false, true, true),
+                WfpPlan::Denied(WfpUnavailable::SessionProxyNotStarted),
+            ),
             ((true, true, false, false), WfpPlan::DirectStart),
             // シナリオ(B)は投機的パイプの有無に依存しない（start が自前で作る）。
             ((true, true, false, true), WfpPlan::DirectStart),
             ((true, true, true, true), WfpPlan::ChainHandshake),
-            ((true, true, true, false), WfpPlan::Denied(WfpUnavailable::ChainLaunchPipeMissing)),
+            (
+                (true, true, true, false),
+                WfpPlan::Denied(WfpUnavailable::ChainLaunchPipeMissing),
+            ),
         ];
         for ((tier2a, proxy, chain, pipe), expected) in cases {
             assert_eq!(

@@ -1046,10 +1046,7 @@ pub(crate) fn revoke_ace_unguarded(path: &Path, sid: PSID) -> Result<(), AppCont
 /// 通す。ここを`Err`にすると、`%TEMP%`のように揺れ動くツリーの撤収で
 /// [`RevokeReport::blocked`]が「消えただけのノード」で埋まり、**本当に剥がせなかったものが
 /// 埋もれる**（B-09: 数える対象を混ぜない）。
-pub(crate) fn revoke_sids_from_node(
-    path: &Path,
-    sids: &[PSID],
-) -> Result<bool, AppContainerError> {
+pub(crate) fn revoke_sids_from_node(path: &Path, sids: &[PSID]) -> Result<bool, AppContainerError> {
     let to_err = |e: windows::core::Error| AppContainerError::AclRevoke {
         path: path.to_path_buf(),
         reason: e.to_string(),

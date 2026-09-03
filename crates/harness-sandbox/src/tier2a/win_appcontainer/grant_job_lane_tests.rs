@@ -65,8 +65,14 @@ fn both_lanes_leave_every_node_reachable_and_agree_with_each_other() {
     run_full_walk_lane(&eager_root, &eager_grants, &[], &[], &state)
         .expect("the default lane must succeed");
     let state = Arc::new(JobState::default());
-    run_lazy_lane(&lazy_root, LazyLanePrep::open(&lazy_root, &lazy_grants, &[], "rwx", &state), &[], &[], &state)
-        .expect("the lazy lane must succeed");
+    run_lazy_lane(
+        &lazy_root,
+        LazyLanePrep::open(&lazy_root, &lazy_grants, &[], "rwx", &state),
+        &[],
+        &[],
+        &state,
+    )
+    .expect("the lazy lane must succeed");
 
     let eager = reachability(&eager_root, &eager_grants);
     let lazy = reachability(&lazy_root, &lazy_grants);
@@ -112,9 +118,8 @@ fn the_lazy_lane_does_not_grant_inside_the_control_directory() {
     )
     .expect("the lazy lane must succeed");
 
-    let map: std::collections::HashMap<String, bool> = reachability(&root, &grants)
-        .into_iter()
-        .collect();
+    let map: std::collections::HashMap<String, bool> =
+        reachability(&root, &grants).into_iter().collect();
     assert_eq!(
         map.get("src.txt"),
         Some(&true),
@@ -150,7 +155,14 @@ fn the_lazy_lane_opens_a_fault_receiver_and_retires_its_name_but_keeps_the_count
         "nothing is published before the lane runs"
     );
 
-    run_lazy_lane(&root, LazyLanePrep::open(&root, &grants, &[], "rwx", &state), &[], &[], &state).expect("the lazy lane must succeed");
+    run_lazy_lane(
+        &root,
+        LazyLanePrep::open(&root, &grants, &[], "rwx", &state),
+        &[],
+        &[],
+        &state,
+    )
+    .expect("the lazy lane must succeed");
 
     assert!(
         state.broker_pipe.lock().unwrap().is_none(),
@@ -297,7 +309,14 @@ fn the_lazy_lane_records_both_how_many_it_saw_and_how_many_it_wrote() {
 
     let grants = lane_grants("counts");
     let state = Arc::new(JobState::default());
-    run_lazy_lane(&root, LazyLanePrep::open(&root, &grants, &[], "rwx", &state), &[], &[], &state).expect("first pass");
+    run_lazy_lane(
+        &root,
+        LazyLanePrep::open(&root, &grants, &[], "rwx", &state),
+        &[],
+        &[],
+        &state,
+    )
+    .expect("first pass");
     let checked = state.rescue_checked.load(Ordering::Relaxed);
     let granted = state.rescue_granted.load(Ordering::Relaxed);
     assert_eq!(checked, 11, "every node of the tree is visited");
@@ -310,7 +329,14 @@ fn the_lazy_lane_records_both_how_many_it_saw_and_how_many_it_wrote() {
     // 2周目は**1件も書かない**（既に届いている）。ここを測らないと、
     // 「毎回全ノードへ書き直している」実装でも1周目のassertだけは通る。
     let state = Arc::new(JobState::default());
-    run_lazy_lane(&root, LazyLanePrep::open(&root, &grants, &[], "rwx", &state), &[], &[], &state).expect("second pass");
+    run_lazy_lane(
+        &root,
+        LazyLanePrep::open(&root, &grants, &[], "rwx", &state),
+        &[],
+        &[],
+        &state,
+    )
+    .expect("second pass");
     assert_eq!(state.rescue_checked.load(Ordering::Relaxed), 11);
     assert_eq!(
         state.rescue_granted.load(Ordering::Relaxed),

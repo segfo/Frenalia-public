@@ -130,7 +130,8 @@ pub(crate) fn resolve_staging_and_write_mode(
     }
 
     let chosen = harness_sandbox::session_scope::cow_diff_layer_root_for_workspace(workspace_root)?;
-    let diff_layer_dir = harness_sandbox::session_scope::cow_diff_layer_dir_in(&chosen.root, session_id);
+    let diff_layer_dir =
+        harness_sandbox::session_scope::cow_diff_layer_dir_in(&chosen.root, session_id);
     Ok((
         staging_mode,
         WorkspaceWriteMode::Cow { diff_layer_dir },
@@ -402,7 +403,10 @@ mod staging_mode_tests {
             match choice {
                 // どのOSでも打てる2つ。値なし（そのOSの既定Tierを要求）と、隔離なしの明示選択。
                 SandboxChoice::OsDefault | SandboxChoice::Tier0 => {
-                    assert!(on_windows.is_ok(), "{choice:?} should be accepted on Windows");
+                    assert!(
+                        on_windows.is_ok(),
+                        "{choice:?} should be accepted on Windows"
+                    );
                     assert!(
                         off_windows.is_ok(),
                         "{choice:?} should be accepted off Windows"
@@ -415,7 +419,10 @@ mod staging_mode_tests {
                 | SandboxChoice::Tier2aCow
                 | SandboxChoice::Tier3
                 | SandboxChoice::Tier3Warm => {
-                    assert!(on_windows.is_ok(), "{choice:?} should be accepted on Windows");
+                    assert!(
+                        on_windows.is_ok(),
+                        "{choice:?} should be accepted on Windows"
+                    );
                     let message = off_windows.expect_err("must be rejected off Windows");
                     assert!(
                         choice
@@ -495,9 +502,15 @@ mod staging_mode_tests {
     #[test]
     fn every_sandbox_choice_maps_to_the_expected_write_mode() {
         for choice in SandboxChoice::ALL {
-            let (staging, write_mode, _fell_back) =
-                resolve_staging_and_write_mode(choice, false, false, false, SESSION, &test_workspace())
-                    .expect("no staging flag is set, so nothing can conflict");
+            let (staging, write_mode, _fell_back) = resolve_staging_and_write_mode(
+                choice,
+                false,
+                false,
+                false,
+                SESSION,
+                &test_workspace(),
+            )
+            .expect("no staging flag is set, so nothing can conflict");
             assert_eq!(
                 staging,
                 StagingMode::Live,

@@ -66,8 +66,9 @@ pub(crate) fn spawn_in_workspace(
     } else {
         WorkspaceMode::Rwx
     };
-    let cap = crate::tier2a::workspace_capability::lookup_capability_name(&canonical, mode.as_str())
-        .and_then(|_| super::workspace_capability_sid(&canonical, mode.as_str()).ok());
+    let cap =
+        crate::tier2a::workspace_capability::lookup_capability_name(&canonical, mode.as_str())
+            .and_then(|_| super::workspace_capability_sid(&canonical, mode.as_str()).ok());
     // §22.1.1: workspace capabilityが引けたならそれがドメイン、引けなければプロファイル自身が
     // ドメイン（package SID宛ACEを自前で付けるテストがこちら）。**本番の`launch.rs`と同じ選び方**に
     // しておかないと、「本番と同じ形」を名乗るこのヘルパーだけ別の分離状態を測ることになる。

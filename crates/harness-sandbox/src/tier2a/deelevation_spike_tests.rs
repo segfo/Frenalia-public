@@ -101,9 +101,11 @@ fn write_wrapper(dir: &Path, harness: &Path) -> PathBuf {
 /// 日本語が化けて**「読めない」と「出ていない」の区別が付かなくなる**。
 /// 既存の`decode_console_bytes`（BUG-051で入れたもの）を通す。
 fn read_trimmed(path: &Path) -> Option<String> {
-    std::fs::read(path)
-        .ok()
-        .map(|b| crate::win_common::decode_console_bytes(&b).trim().to_string())
+    std::fs::read(path).ok().map(|b| {
+        crate::win_common::decode_console_bytes(&b)
+            .trim()
+            .to_string()
+    })
 }
 
 fn wait_for(path: &Path, timeout: Duration) -> bool {
@@ -160,7 +162,9 @@ fn admins_from_groups(groups: &str) -> String {
         .lines()
         .find(|l| l.contains("S-1-5-32-544"))
         .map(|l| l.trim().to_string())
-        .unwrap_or_else(|| r"absent (BUILTIN\Administrators is not in the token at all)".to_string())
+        .unwrap_or_else(|| {
+            r"absent (BUILTIN\Administrators is not in the token at all)".to_string()
+        })
 }
 
 /// ラッパーが残したファイルから読んだ、子1つ分の事実。
@@ -305,7 +309,10 @@ fn probe_explorer(dir: &Path, wrapper: &Path) -> (String, Probe) {
         .output();
     let launcher = match &out {
         // explorerは委譲して即座に戻る（終了コードは意味を持たない）。
-        Ok(o) => format!("explorer -> exit {:?} (delegated, not meaningful)", o.status.code()),
+        Ok(o) => format!(
+            "explorer -> exit {:?} (delegated, not meaningful)",
+            o.status.code()
+        ),
         Err(e) => format!("explorer -> {e}"),
     };
     if let Err(e) = out {
@@ -320,11 +327,11 @@ fn probe_explorer(dir: &Path, wrapper: &Path) -> (String, Probe) {
 fn probe_linked_token(dir: &Path, wrapper: &Path) -> (String, Probe) {
     let cmdline = format!("{} /c {}", system32("cmd.exe"), wrapper.display());
     match unsafe { spawn_with_linked_token(&cmdline) } {
-        Err(e) => ("CreateProcessWithTokenW".to_string(), Probe::LauncherFailed(e)),
-        Ok(pid) => (
-            format!("CreateProcessWithTokenW -> pid {pid}"),
-            finish(dir),
+        Err(e) => (
+            "CreateProcessWithTokenW".to_string(),
+            Probe::LauncherFailed(e),
         ),
+        Ok(pid) => (format!("CreateProcessWithTokenW -> pid {pid}"), finish(dir)),
     }
 }
 
@@ -354,7 +361,10 @@ fn probe_filtered_token(dir: &Path, wrapper: &Path) -> (String, Probe) {
     let cmdline = format!("{} /c {}", system32("cmd.exe"), wrapper.display());
     match unsafe { spawn_with_filtered_token(&cmdline) } {
         Err(e) => ("filtered token".to_string(), Probe::LauncherFailed(e)),
-        Ok((pid, api)) => (format!("filtered token via {api} -> pid {pid}"), finish(dir)),
+        Ok((pid, api)) => (
+            format!("filtered token via {api} -> pid {pid}"),
+            finish(dir),
+        ),
     }
 }
 
@@ -385,17 +395,21 @@ fn finish(dir: &Path) -> Probe {
 unsafe fn spawn_with_linked_token(cmdline: &str) -> Result<u32, String> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
-        GetTokenInformation, DuplicateTokenEx, SecurityImpersonation, TokenLinkedToken,
+        DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenLinkedToken,
         TokenPrimary, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_LINKED_TOKEN, TOKEN_QUERY,
     };
     use windows::Win32::System::Threading::{
-        CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken,
-        CREATE_PROCESS_LOGON_FLAGS, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+        CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, CREATE_PROCESS_LOGON_FLAGS,
+        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
     };
 
     let mut token = HANDLE::default();
-    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token)
-        .map_err(|e| format!("OpenProcessToken: {e}"))?;
+    OpenProcessToken(
+        GetCurrentProcess(),
+        TOKEN_QUERY | TOKEN_DUPLICATE,
+        &mut token,
+    )
+    .map_err(|e| format!("OpenProcessToken: {e}"))?;
 
     let mut linked = TOKEN_LINKED_TOKEN::default();
     let mut len = 0u32;
@@ -465,7 +479,9 @@ unsafe fn spawn_with_shell_token(cmdline: &str) -> Result<u32, String> {
 
     let hwnd = GetShellWindow();
     if hwnd.0.is_null() {
-        return Err("GetShellWindow returned NULL: no interactive shell on this desktop".to_string());
+        return Err(
+            "GetShellWindow returned NULL: no interactive shell on this desktop".to_string(),
+        );
     }
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
@@ -521,18 +537,20 @@ unsafe fn spawn_with_shell_token(cmdline: &str) -> Result<u32, String> {
 /// 戻り値には**どのAPIで起きたか**も含める（`CreateProcessAsUserW`が通ったのか、
 /// 退避先の`CreateProcessWithTokenW`だったのかで、E2Eで使える形が変わる）。
 unsafe fn spawn_with_filtered_token(cmdline: &str) -> Result<(u32, &'static str), String> {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
     use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
     use windows::Win32::Security::{
         CreateRestrictedToken, SetTokenInformation, TokenIntegrityLevel, DISABLE_MAX_PRIVILEGE,
         PSID, SID_AND_ATTRIBUTES, TOKEN_MANDATORY_LABEL,
+    };
+    use windows::Win32::Security::{
+        TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
     };
     use windows::Win32::System::SystemServices::SE_GROUP_INTEGRITY;
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken,
         CREATE_PROCESS_LOGON_FLAGS, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
     };
-    use windows::Win32::Security::{TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY};
 
     let mut token = HANDLE::default();
     OpenProcessToken(
@@ -594,7 +612,9 @@ unsafe fn spawn_with_filtered_token(cmdline: &str) -> Result<(u32, &'static str)
     let _ = LocalFree(HLOCAL(medium.0));
     if let Err(e) = labeled {
         let _ = CloseHandle(restricted);
-        return Err(format!("SetTokenInformation(TokenIntegrityLevel=Medium): {e}"));
+        return Err(format!(
+            "SetTokenInformation(TokenIntegrityLevel=Medium): {e}"
+        ));
     }
 
     let mut wide: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
@@ -621,8 +641,7 @@ unsafe fn spawn_with_filtered_token(cmdline: &str) -> Result<(u32, &'static str)
         Err(as_user_err) => {
             // 退避先。`CreateProcessAsUserW`が特権不足で落ちた場合でも
             // `CreateProcessWithTokenW`（`SeImpersonatePrivilege`）なら通ることがある。
-            let mut wide2: Vec<u16> =
-                cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut wide2: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
             let with_token = CreateProcessWithTokenW(
                 restricted,
                 CREATE_PROCESS_LOGON_FLAGS(0),
@@ -686,9 +705,18 @@ fn can_the_elevated_runner_start_a_non_elevated_child() {
         ("M0 plain child (POSITIVE CONTROL)", probe_plain),
         ("M1 runas /trustlevel:0x20000", probe_runas),
         ("M2 explorer.exe delegation", probe_explorer),
-        ("M3 linked token + CreateProcessWithTokenW", probe_linked_token),
-        ("M4 shell (explorer) token + CreateProcessWithTokenW", probe_shell_token),
-        ("M5 self-built filtered token (deny-only admins + medium IL)", probe_filtered_token),
+        (
+            "M3 linked token + CreateProcessWithTokenW",
+            probe_linked_token,
+        ),
+        (
+            "M4 shell (explorer) token + CreateProcessWithTokenW",
+            probe_shell_token,
+        ),
+        (
+            "M5 self-built filtered token (deny-only admins + medium IL)",
+            probe_filtered_token,
+        ),
     ];
 
     let mut results: Vec<(&str, Probe)> = Vec::new();

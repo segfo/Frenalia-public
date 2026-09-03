@@ -464,7 +464,8 @@ fn restricted_sid_probe_which_sid_kinds_are_accepted() {
     // **1つも通らなかったら、それはSIDの種類の話ではなく呼び出しの話である。**
     // どれか1つでも通れば「種類による」と言えるので、その区別をここで固定する。
     assert!(
-        rows.iter().any(|r| r["accepted"] == serde_json::json!(true)),
+        rows.iter()
+            .any(|r| r["accepted"] == serde_json::json!(true)),
         "if no SID kind at all is accepted, the parameters themselves are wrong — do not read \
          this table as a statement about SID kinds: {rows:?}"
     );
@@ -499,7 +500,11 @@ fn restricted_sid_probe_can_a_restricted_sid_token_still_spawn() {
     // 結論してはいけない**——プロセス起動時に触るオブジェクト（システムDLL・KnownDlls・
     // CSRSSのポート・デスクトップ）が、どのSIDを許可しているかで決まるからである。
     // だから**集合を振って、どこから動き出すか**を見る。
-    let configs: Vec<(&str, CREATE_RESTRICTED_TOKEN_FLAGS, Vec<windows::Win32::Security::PSID>)> = vec![
+    let configs: Vec<(
+        &str,
+        CREATE_RESTRICTED_TOKEN_FLAGS,
+        Vec<windows::Win32::Security::PSID>,
+    )> = vec![
         (
             "control: DISABLE_MAX_PRIVILEGE only (today's Tier1)",
             DISABLE_MAX_PRIVILEGE,
@@ -663,7 +668,11 @@ fn restricted_sid_probe_write_restricted_truth_table() {
     );
 
     // 撤収（付与と撤収は対、B-01）。ツリーは`TestDirGuard`がDropで消す。
-    for (name, sid) in [("cap", restricted.as_psid()), ("wrsid", wr.as_psid()), ("usrsid", user.as_psid())] {
+    for (name, sid) in [
+        ("cap", restricted.as_psid()),
+        ("wrsid", wr.as_psid()),
+        ("usrsid", user.as_psid()),
+    ] {
         let _ = revoke_ace_recursive(&root.join(name), sid);
     }
 

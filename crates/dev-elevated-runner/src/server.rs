@@ -169,10 +169,7 @@ fn main() -> std::process::ExitCode {
 
 /// `KNOWN_TARGETS`の固定引数列で`cargo`を回す（従来からの要求）。
 #[cfg(windows)]
-fn run_cargo_target(
-    target: &str,
-    repo_root: &std::path::Path,
-) -> dev_elevated_runner::RunResponse {
+fn run_cargo_target(target: &str, repo_root: &std::path::Path) -> dev_elevated_runner::RunResponse {
     use dev_elevated_runner::{resolve_target_args, RunResponse};
 
     let Some(args) = resolve_target_args(target) else {

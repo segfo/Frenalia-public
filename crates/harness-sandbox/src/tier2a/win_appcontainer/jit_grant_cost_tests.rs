@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LocalFree, HLOCAL};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::NO_INHERITANCE;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
@@ -143,7 +143,8 @@ fn serve_requests(pipe_raw: isize, n: usize, grant: Option<(String, u32)>, grant
         let request = read_framed_timeout(pipe, PIPE_TIMEOUT)
             .unwrap_or_else(|e| panic!("server: read #{i}: {e}"));
         if let (Some(sid), Some((_, mask))) = (sid.as_ref(), grant.as_ref()) {
-            let path = PathBuf::from(String::from_utf8(request).expect("server: request is a path"));
+            let path =
+                PathBuf::from(String::from_utf8(request).expect("server: request is a path"));
             grant_one(&path, sid.as_psid(), *mask);
         }
         write_framed_timeout(pipe, b"ok", PIPE_TIMEOUT)

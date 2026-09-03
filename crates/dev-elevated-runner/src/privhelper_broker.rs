@@ -153,8 +153,8 @@ fn is_strictly_under(child: &[String], root: &[String]) -> bool {
 /// ファイルシステムを一切見ないので、存在しないパス・偽装されたパスもここで落ちる。
 /// 実体の解決（reparse point）は[`resolve_launcher_dir`]が続けて行う。
 pub fn validate_launcher_dir_shape(dir: &Path) -> Result<(), String> {
-    let root = path_elements(Path::new(LAUNCH_ROOT))
-        .expect("LAUNCH_ROOT is a well-formed absolute path");
+    let root =
+        path_elements(Path::new(LAUNCH_ROOT)).expect("LAUNCH_ROOT is a well-formed absolute path");
     let elements = path_elements(dir).map_err(|reason| {
         format!("refusing to launch the privilege-separation helper: {reason}")
     })?;
@@ -454,10 +454,10 @@ mod tests {
         for dir in [
             r"C:\harness-e2e\scenarioA",
             r"C:\harness-e2e\scenarioA\12345",
-            r"c:\HARNESS-E2E\ScenarioA",         // 大小は区別しない
-            r"C:/harness-e2e/scenarioA",         // 区切りの揺れ
-            r"C:\harness-e2e\scenarioA\",        // 末尾の区切り
-            r"\\?\C:\harness-e2e\scenarioA",     // canonicalizeが返す形
+            r"c:\HARNESS-E2E\ScenarioA",     // 大小は区別しない
+            r"C:/harness-e2e/scenarioA",     // 区切りの揺れ
+            r"C:\harness-e2e\scenarioA\",    // 末尾の区切り
+            r"\\?\C:\harness-e2e\scenarioA", // canonicalizeが返す形
         ] {
             validate_launcher_dir_shape(Path::new(dir))
                 .unwrap_or_else(|e| panic!("{dir} must be accepted: {e}"));
@@ -468,17 +468,17 @@ mod tests {
     #[test]
     fn anything_that_is_not_strictly_under_the_launch_root_is_rejected() {
         for dir in [
-            r"C:\Windows\System32",           // まったく別の場所
-            r"C:\harness-e2e",                // 根そのもの（配下ではない）
-            r"C:\harness-e2e\",               // 同上（末尾の区切り違い）
-            r"C:\harness-e2e-evil\payload",   // 前方一致だが別ディレクトリ
-            r"C:\harness-e2e\..\Windows",     // `..`で外へ出る
-            r"C:\harness-e2e\.\x",            // `.`
-            r"harness-e2e\scenarioA",         // 相対
-            r"C:harness-e2e\scenarioA",       // ドライブ相対（絶対ではない）
-            r"\\server\share\harness-e2e\x",  // UNC
-            r"D:\harness-e2e\scenarioA",      // 別ドライブ
-            r"C:\harness-e2e\a:b",            // 代替データストリーム
+            r"C:\Windows\System32",          // まったく別の場所
+            r"C:\harness-e2e",               // 根そのもの（配下ではない）
+            r"C:\harness-e2e\",              // 同上（末尾の区切り違い）
+            r"C:\harness-e2e-evil\payload",  // 前方一致だが別ディレクトリ
+            r"C:\harness-e2e\..\Windows",    // `..`で外へ出る
+            r"C:\harness-e2e\.\x",           // `.`
+            r"harness-e2e\scenarioA",        // 相対
+            r"C:harness-e2e\scenarioA",      // ドライブ相対（絶対ではない）
+            r"\\server\share\harness-e2e\x", // UNC
+            r"D:\harness-e2e\scenarioA",     // 別ドライブ
+            r"C:\harness-e2e\a:b",           // 代替データストリーム
             "",
         ] {
             assert!(
@@ -502,7 +502,10 @@ mod tests {
         let reference = reference_exe_path(Path::new(r"C:\repo"));
         assert_eq!(
             reference,
-            Path::new(r"C:\repo").join("target").join("debug").join(PRIVHELPER_EXE_NAME)
+            Path::new(r"C:\repo")
+                .join("target")
+                .join("debug")
+                .join(PRIVHELPER_EXE_NAME)
         );
     }
 
@@ -542,7 +545,8 @@ mod fs_tests {
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = Path::new(LAUNCH_ROOT).join(format!("_broker-test-{name}-{}", std::process::id()));
+            let dir =
+                Path::new(LAUNCH_ROOT).join(format!("_broker-test-{name}-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             assert!(
                 dir.is_dir(),
@@ -763,7 +767,10 @@ mod fs_tests {
 
         let missing_candidate = open_verified_copy(&scratch.path().join("nope.bin"), &reference)
             .expect_err("a missing candidate must be rejected");
-        assert!(missing_candidate.contains("could not be opened"), "{missing_candidate}");
+        assert!(
+            missing_candidate.contains("could not be opened"),
+            "{missing_candidate}"
+        );
 
         std::fs::write(&candidate, b"privhelper-image").unwrap();
         let missing_reference =

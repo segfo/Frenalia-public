@@ -175,8 +175,9 @@ pub fn forget_revoked_declarations(revoked: &[std::path::PathBuf]) -> Vec<String
             // workspace本体の宛先SIDはここでは扱わない（撤収の扉は`fs revoke-workspace`）。
             return false;
         };
-        gone.iter()
-            .any(|(key, names)| key == declared && names.iter().any(|n| n == &entry.capability_name))
+        gone.iter().any(|(key, names)| {
+            key == declared && names.iter().any(|n| n == &entry.capability_name)
+        })
     })
 }
 
@@ -203,11 +204,13 @@ pub fn declaration_capabilities_gone_from_root_indexed(
     index
         .issuers(path)
         .into_iter()
-        .filter(|(_workspace, name)| match super::capability_sid_from_name(name) {
-            // 導出できない名前は「消えた」と言えない（見に行けていないだけ）ので残す。
-            Err(_) => false,
-            Ok(sid) => matches!(sid_explicit_ace(path, sid.as_psid()), Ok(None)),
-        })
+        .filter(
+            |(_workspace, name)| match super::capability_sid_from_name(name) {
+                // 導出できない名前は「消えた」と言えない（見に行けていないだけ）ので残す。
+                Err(_) => false,
+                Ok(sid) => matches!(sid_explicit_ace(path, sid.as_psid()), Ok(None)),
+            },
+        )
         .map(|(_workspace, name)| name)
         .collect()
 }

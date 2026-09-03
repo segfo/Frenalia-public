@@ -176,7 +176,9 @@ pub struct CowDiffLayerRoot {
 /// ——CoWの隔離（ワークスペースを読取専用にするACL）はどちらの置き場でも同じように張れて、
 /// 失われるのは「媒体と一緒に消える」性質だけなので、隔離が取れないときは降格せず拒否する
 /// というD-75の射程には入らない。
-pub fn cow_diff_layer_root_for_workspace(workspace_root: &Path) -> Result<CowDiffLayerRoot, String> {
+pub fn cow_diff_layer_root_for_workspace(
+    workspace_root: &Path,
+) -> Result<CowDiffLayerRoot, String> {
     let profile_root = cow_profile_diff_layer_root().ok_or_else(|| {
         "--sandbox tier2a-cow: could not resolve %LOCALAPPDATA% for the CoW diff_layer directory (is \
          HOME/USERPROFILE set?)"
@@ -706,7 +708,9 @@ fn prepare_cow_diff_layer(
     scope: &SessionScope,
     diff_layer_dir: &Path,
 ) -> Result<usize, String> {
-    use crate::tier2a::{session_profile, win_appcontainer, workspace_capability, workspace_ledger};
+    use crate::tier2a::{
+        session_profile, win_appcontainer, workspace_capability, workspace_ledger,
+    };
 
     // [BUG-147] **ぶら下げる先が無ければ、ここで開く。** 下の`record_granted_capability`は
     // セッション台帳のエントリが無いと黙って何も書かない（警告は出るが記録はされない）。
@@ -1006,10 +1010,17 @@ mod tests {
         .scope_for("session-abc");
         assert_eq!(scope.staging.sandbox_dir, None);
         let diff_layer = scope.cow_diff_layer_dir.as_ref().unwrap();
-        assert!(diff_layer.ends_with("session-abc"), "{}", diff_layer.display());
+        assert!(
+            diff_layer.ends_with("session-abc"),
+            "{}",
+            diff_layer.display()
+        );
         assert!(diff_layer.starts_with(&root));
         assert!(!scope.is_live());
-        assert_eq!(scope.overlay_dir(Path::new("C:/ws")).as_ref(), Some(diff_layer));
+        assert_eq!(
+            scope.overlay_dir(Path::new("C:/ws")).as_ref(),
+            Some(diff_layer)
+        );
     }
 
     /// セッションが違えば置き場も違う（切替が意味を持つための前提）。
@@ -1032,7 +1043,13 @@ mod tests {
     #[test]
     fn same_volume_as_the_profile_keeps_the_diff_area_where_it_was() {
         assert_eq!(
-            plan_cow_diff_layer_root(Path::new(r"C:\work\proj"), &vol(r"C:\"), &vol(r"C:\"), false).unwrap(),
+            plan_cow_diff_layer_root(
+                Path::new(r"C:\work\proj"),
+                &vol(r"C:\"),
+                &vol(r"C:\"),
+                false
+            )
+            .unwrap(),
             CowDiffLayerRootPlan::Profile
         );
     }
@@ -1040,8 +1057,13 @@ mod tests {
     /// 別ボリュームなら、そのボリュームのルート直下へ置く。**ワークスペースの中ではない。**
     #[test]
     fn a_different_volume_gets_its_own_root_outside_the_workspace() {
-        let plan =
-            plan_cow_diff_layer_root(Path::new(r"D:\work\proj"), &vol(r"D:\"), &vol(r"C:\"), false).unwrap();
+        let plan = plan_cow_diff_layer_root(
+            Path::new(r"D:\work\proj"),
+            &vol(r"D:\"),
+            &vol(r"C:\"),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             plan,
             CowDiffLayerRootPlan::PerVolume(vol(r"D:\").join(PER_VOLUME_COW_DIRNAME))
@@ -1079,18 +1101,36 @@ mod tests {
     fn the_profile_volume_is_whatever_the_api_says_it_is_not_c() {
         // プロファイルがD:、ワークスペースもD: → 従来の置き場（プロファイル側）。
         assert_eq!(
-            plan_cow_diff_layer_root(Path::new(r"D:\work\proj"), &vol(r"D:\"), &vol(r"D:\"), false).unwrap(),
+            plan_cow_diff_layer_root(
+                Path::new(r"D:\work\proj"),
+                &vol(r"D:\"),
+                &vol(r"D:\"),
+                false
+            )
+            .unwrap(),
             CowDiffLayerRootPlan::Profile
         );
         // プロファイルがD:、ワークスペースがC: → **C:の方が「別ボリューム」側になる。**
         // ここが`Profile`になる実装は、システムドライブをC:と決め打っている証拠である。
         assert_eq!(
-            plan_cow_diff_layer_root(Path::new(r"C:\work\proj"), &vol(r"C:\"), &vol(r"D:\"), false).unwrap(),
+            plan_cow_diff_layer_root(
+                Path::new(r"C:\work\proj"),
+                &vol(r"C:\"),
+                &vol(r"D:\"),
+                false
+            )
+            .unwrap(),
             CowDiffLayerRootPlan::PerVolume(vol(r"C:\").join(PER_VOLUME_COW_DIRNAME))
         );
         // プロファイルがZ:でも同じ規則が効く（ドライブ文字に意味を持たせていないこと）。
         assert_eq!(
-            plan_cow_diff_layer_root(Path::new(r"Z:\work\proj"), &vol(r"Z:\"), &vol(r"Z:\"), false).unwrap(),
+            plan_cow_diff_layer_root(
+                Path::new(r"Z:\work\proj"),
+                &vol(r"Z:\"),
+                &vol(r"Z:\"),
+                false
+            )
+            .unwrap(),
             CowDiffLayerRootPlan::Profile
         );
     }
@@ -1099,7 +1139,8 @@ mod tests {
     #[test]
     fn volume_comparison_ignores_case_and_a_trailing_separator() {
         assert_eq!(
-            plan_cow_diff_layer_root(Path::new(r"c:\work\proj"), &vol(r"c:"), &vol(r"C:\"), false).unwrap(),
+            plan_cow_diff_layer_root(Path::new(r"c:\work\proj"), &vol(r"c:"), &vol(r"C:\"), false)
+                .unwrap(),
             CowDiffLayerRootPlan::Profile
         );
     }
@@ -1145,7 +1186,10 @@ mod tests {
             &|| Some(true),
         )
         .expect_err("copy-on-write isolation is enforced by ACLs");
-        assert!(err.contains("exFAT"), "打つ手が分かるように名指しする: {err}");
+        assert!(
+            err.contains("exFAT"),
+            "打つ手が分かるように名指しする: {err}"
+        );
     }
 
     /// **拒否側（ACLは在るのに拒否する唯一のケース）**: ネットワーク共有は
@@ -1209,10 +1253,20 @@ mod tests {
     /// 混ぜると、こちらが早すぎるだけのときに「ボリュームが書込を拒否した」と読ませてしまう。
     #[test]
     fn a_refused_dacl_write_and_an_unmeasured_one_say_different_things() {
-        let refused = cow_volume_gate("workspace", Path::new(r"E:\ws"), Some(cap(true, "cryptoFs", false)), &|| Some(false))
-            .expect_err("measured and refused");
-        let unmeasured = cow_volume_gate("workspace", Path::new(r"E:\ws"), Some(cap(true, "NTFS", false)), &|| None)
-            .expect_err("could not measure");
+        let refused = cow_volume_gate(
+            "workspace",
+            Path::new(r"E:\ws"),
+            Some(cap(true, "cryptoFs", false)),
+            &|| Some(false),
+        )
+        .expect_err("measured and refused");
+        let unmeasured = cow_volume_gate(
+            "workspace",
+            Path::new(r"E:\ws"),
+            Some(cap(true, "NTFS", false)),
+            &|| None,
+        )
+        .expect_err("could not measure");
         assert!(
             refused.contains("rejected a no-op DACL write"),
             "断られた側はボリュームの挙動を名指しする: {refused}"
@@ -1359,7 +1413,9 @@ mod path_gate_diagnostics {
             let path = Path::new(raw);
             let cap = crate::win_common::volume_mount_point_of(path)
                 .and_then(|m| crate::win_common::volume_capability(&m));
-            let dacl_writable = path.exists().then(|| crate::win_common::can_write_dacl(path));
+            let dacl_writable = path
+                .exists()
+                .then(|| crate::win_common::can_write_dacl(path));
             let verdict = cow_volume_gate("workspace", path, cap.clone(), &|| dacl_writable);
             println!(
                 "{:<45} exists={:<5} dacl_writable={:<12} fs={:<10} remote={:<5} -> {}",
@@ -1437,7 +1493,14 @@ mod appcontainer_ace_diagnostics {
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                 .unwrap_or_else(|e| format!("icacls failed: {e}"));
             let found = readback.contains(sid_text.trim_start_matches('*'));
-            println!("  読み返しで見つかるか -> {}", if found { "見つかった" } else { "**見つからない**" });
+            println!(
+                "  読み返しで見つかるか -> {}",
+                if found {
+                    "見つかった"
+                } else {
+                    "**見つからない**"
+                }
+            );
             for line in readback.lines().take(6) {
                 println!("    | {line}");
             }

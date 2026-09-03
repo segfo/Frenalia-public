@@ -65,7 +65,8 @@ pub(crate) fn cow_audit(session: Option<&str>, output_format: OutputFormat) -> E
             }
             // BUG-066: workspace内への拒否は意味が正反対（封じ込めではなく**透過性の失敗**＝
             // その変更は失われている）なので、1件ずつ区別して見せる。
-            let workspace_root = crate::cli::workspace_cmd::cow_session_workspace_root(&diff_layer_dir);
+            let workspace_root =
+                crate::cli::workspace_cmd::cow_session_workspace_root(&diff_layer_dir);
             let mut inside = 0usize;
             for e in &entries {
                 let is_inside = workspace_root.as_deref().is_some_and(|root| {
@@ -195,7 +196,11 @@ pub(crate) fn cow_gc(dry_run: bool, with_changes: bool, older_than_days: u64) ->
 
     let outcome = wl::run_cow_gc(dry_run, cow_gc_policy(), &also_collect);
 
-    let verb = if dry_run { "would collect" } else { "collected" };
+    let verb = if dry_run {
+        "would collect"
+    } else {
+        "collected"
+    };
     println!("{verb} {} CoW diff area(s)", outcome.collected.len());
     for id in &outcome.collected {
         println!("  - {id}");

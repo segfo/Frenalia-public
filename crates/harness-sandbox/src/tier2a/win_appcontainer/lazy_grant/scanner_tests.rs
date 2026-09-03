@@ -5,14 +5,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::super::writer::AclWriter;
 use super::*;
 use crate::tier2a::win_appcontainer::test_support::TestDirGuard;
-use crate::tier2a::win_appcontainer::{capability_sid_from_name, workspace_rwx_mask, OwnedAceGrant};
+use crate::tier2a::win_appcontainer::{
+    capability_sid_from_name, workspace_rwx_mask, OwnedAceGrant,
+};
 
 fn test_grants(label: &str) -> Vec<OwnedAceGrant> {
-    let sid = capability_sid_from_name(&format!(
-        "harness-lazy-scan-{}-{label}",
-        std::process::id()
-    ))
-    .expect("derive the test capability sid");
+    let sid =
+        capability_sid_from_name(&format!("harness-lazy-scan-{}-{label}", std::process::id()))
+            .expect("derive the test capability sid");
     vec![OwnedAceGrant {
         sid,
         mask: workspace_rwx_mask(),
@@ -58,7 +58,8 @@ fn the_scan_reaches_the_root_and_every_directory_and_file() {
 
     let grants = test_grants("reach");
     let mut writer = AclWriter::start(root.clone(), grants.clone());
-    let report = scan(&root, &[], &writer.handle(), &RunToCompletion).expect("the writer is available");
+    let report =
+        scan(&root, &[], &writer.handle(), &RunToCompletion).expect("the writer is available");
     let _ = writer.stop_at_safe_point();
 
     assert_eq!(report.submitted, 4, "root + a/ + 2 files");
@@ -128,7 +129,10 @@ fn the_skip_list_is_neither_granted_nor_descended_into() {
     let _ = writer.stop_at_safe_point();
 
     assert_eq!(report.skipped, 1, "the skipped directory is counted once");
-    assert!(reached(&normal, &grants), "the rest of the tree is still granted");
+    assert!(
+        reached(&normal, &grants),
+        "the rest of the tree is still granted"
+    );
     // **降りていないこと**を、配下のファイルで見る。ディレクトリだけ見ると、
     // 「入り口は飛ばしたが中は歩いた」実装でも緑になる。
     assert!(
@@ -161,7 +165,10 @@ fn the_scan_stops_at_a_node_boundary_when_asked() {
     let report = scan(&root, &[], &writer.handle(), &control).expect("the writer is available");
     let _ = writer.stop_at_safe_point();
 
-    assert!(report.stopped_early, "stopping early must be visible in the report");
+    assert!(
+        report.stopped_early,
+        "stopping early must be visible in the report"
+    );
     assert!(
         report.submitted >= 3 && report.submitted < 9,
         "the scan must stop near the requested boundary, got {}",

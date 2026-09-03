@@ -470,7 +470,9 @@ pub fn read_cow_session_meta(diff_layer_dir: &Path) -> CowMetaRead {
 /// [`crate::session_scope`]が正本である。ここから再公開しているのは、`harness cow`系
 /// サブコマンドがこのモジュール越しに引いているためで、**定義を2つ持たないことが目的**
 /// （`bug-pattern-rules` B-05）。
-pub use crate::session_scope::{cow_profile_diff_layer_root, cow_diff_layer_dir_in, cow_diff_layer_roots};
+pub use crate::session_scope::{
+    cow_diff_layer_dir_in, cow_diff_layer_roots, cow_profile_diff_layer_root,
+};
 
 /// 見つかった差分層1件（棚卸しの単位）。
 ///
@@ -555,7 +557,6 @@ pub fn prune_cow_ledger(diff_layer_dir: &Path, applied_paths: &[String]) -> std:
 // 守る対象が無くなった網を残すと、次に読む人が「まだ窓がある」と読む。
 //
 // **順序を戻すなら、この2つも一緒に戻すこと。** 順序だけ戻すと、窓が開いたまま網も無い。
-
 
 /// 差分層1つについて、判定に要る事実だけを集めたもの。
 ///
@@ -936,7 +937,6 @@ mod cow_gc_tests {
         f.is_live = true;
         assert_eq!(verdict(f), CowGcVerdict::KeepRunning);
     }
-
 
     /// **既定でネットワーク上の差分層を回収しない。** 常時接続が普通なので「到達できない＝
     /// 判定不能」の安全網が働かず、しかも他のマシンが作ったものが混じり得る。

@@ -137,13 +137,14 @@ fn preflight_cow(
         .unwrap_or_else(|_| workspace.to_path_buf());
     // **引く側**（発行しない）で取る——本番の`launch.rs`と同じ引き方にしておかないと、
     // 「preflightが実際に発行したもの」ではなく「このテストが今作ったもの」を測ることになる。
-    let cap = lookup_cow_diff_layer_capability_sid(&canonical_ws, diff_layer).unwrap_or_else(|| {
-        panic!(
-            "preflight must have issued a capability for the diff layer {}; \
+    let cap =
+        lookup_cow_diff_layer_capability_sid(&canonical_ws, diff_layer).unwrap_or_else(|| {
+            panic!(
+                "preflight must have issued a capability for the diff layer {}; \
              without it there is nothing to measure",
-            diff_layer.display()
-        )
-    });
+                diff_layer.display()
+            )
+        });
     (session_sid(), cap)
 }
 
@@ -163,8 +164,8 @@ fn the_diff_layer_is_owned_by_a_capability_and_not_by_the_session_package_sid() 
     });
 
     // 許可側: 移行先の宛先SIDのACEが実在する。
-    let cap_mask = sid_ace_mask(&diff, cap.as_psid())
-        .expect("the diff layer DACL must be readable");
+    let cap_mask =
+        sid_ace_mask(&diff, cap.as_psid()).expect("the diff layer DACL must be readable");
     assert!(
         cap_mask.is_some(),
         "the diff layer must carry an ACE for its capability SID; \
@@ -172,8 +173,8 @@ fn the_diff_layer_is_owned_by_a_capability_and_not_by_the_session_package_sid() 
     );
 
     // 禁止側（§22.3.0の不変条件そのもの）: 共有されるSIDのACEは1本も無い。
-    let package_mask = sid_ace_mask(&diff, session.as_psid())
-        .expect("the diff layer DACL must be readable");
+    let package_mask =
+        sid_ace_mask(&diff, session.as_psid()).expect("the diff layer DACL must be readable");
     assert_eq!(
         package_mask, None,
         "the session package SID must have no ACE on the diff layer: it is shared by every \
@@ -255,8 +256,7 @@ fn the_gc_path_also_takes_the_capability_ace_off_the_diff_layer() {
     .expect("preflight must have recorded the capability name");
     crate::tier2a::session_profile::add_dead_session_with_capability_for_test(&diff, &cap_name);
 
-    let outcome =
-        crate::tier2a::session_profile::gc_dead_sessions_reporting(&revoke_session_grant);
+    let outcome = crate::tier2a::session_profile::gc_dead_sessions_reporting(&revoke_session_grant);
     eprintln!("gc: {:?}", outcome.summary());
 
     assert_eq!(
@@ -372,7 +372,10 @@ fn switching_sessions_does_not_carry_the_previous_diff_layer_capability() {
         let _ = revoke_ace_recursive(&new, new_cap.as_psid());
         let _ = revoke_ace_recursive(&old, old_cap.as_psid());
         let dropped = crate::tier2a::workspace_capability::forget_capability(&canonical_ws, "");
-        eprintln!("cleanup: dropped {} capability ledger entries", dropped.len());
+        eprintln!(
+            "cleanup: dropped {} capability ledger entries",
+            dropped.len()
+        );
         crate::tier2a::workspace_ledger::remove_workspace_entry(&canonical_ws);
     });
 
@@ -728,7 +731,10 @@ fn granting_the_cow_diff_layer_never_reaches_the_elevated_path() {
     let _cleanup = scopeguard(|| {
         let _ = revoke_ace_recursive(&diff, cap.as_psid());
         let dropped = crate::tier2a::workspace_capability::forget_capability(&canonical_ws, "");
-        eprintln!("cleanup: dropped {} capability ledger entries", dropped.len());
+        eprintln!(
+            "cleanup: dropped {} capability ledger entries",
+            dropped.len()
+        );
         crate::tier2a::workspace_ledger::remove_workspace_entry(&canonical_ws);
     });
 
@@ -1009,7 +1015,9 @@ fn where_the_diff_layer_sits_decides_whether_the_ancestor_traverse_demands_eleva
          台帳とDACLが食い違っており、本番の置き場について下す判定も信用できない"
     );
     assert!(
-        nested_verdict.missing.contains(&nested_parent.path().to_path_buf()),
+        nested_verdict
+            .missing
+            .contains(&nested_parent.path().to_path_buf()),
         "足りていないと出たノードが、いま作ったディレクトリ自身ではない: {:?}",
         nested_verdict.missing
     );
@@ -1065,8 +1073,7 @@ fn where_the_diff_layer_sits_decides_whether_the_ancestor_traverse_demands_eleva
             .expect("a diff layer under a root has a parent")
             .to_path_buf();
         assert_eq!(
-            &target,
-            root,
+            &target, root,
             "軸の確認: `preflight`がtraverseを要求する相手は根そのもののはずである。\
              ここがずれると、下で読んでいるチェーンは製品が見るチェーンではない"
         );
@@ -1802,7 +1809,8 @@ fn the_fork_path_opens_the_session_ledger_entry_before_granting_the_diff_layer_a
         .expect("the aborted-path diff layer DACL must be readable");
     eprintln!("aborted-path ACE after end_session: {orphan_after_end:?}");
     assert_eq!(
-        orphan_after_end, None,
+        orphan_after_end,
+        None,
         "**BUG-147が再発している。** 起動が打ち切られた回に残る差分層のACEが`end_session`で\
          剥がれなかった。fork窓が記録を載せていないか、載せた名前が実際の宛先SIDと\
          食い違っている。end_session: {:?} leftovers: {:?}",

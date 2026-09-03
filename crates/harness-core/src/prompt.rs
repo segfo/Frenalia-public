@@ -945,7 +945,10 @@ mod tests {
     fn tier2a_without_wfp_enforcement_declares_no_network_at_all() {
         let rendered = render(&net_policy_facts(ShellTier::Tier2a, false));
 
-        assert!(rendered.contains("外向き通信を一切行えません"), "{rendered}");
+        assert!(
+            rendered.contains("外向き通信を一切行えません"),
+            "{rendered}"
+        );
         // 消えているべきもの: 「通信はできるが強制ではない」と読める説明。
         assert!(!rendered.contains("素通りできます"), "{rendered}");
     }

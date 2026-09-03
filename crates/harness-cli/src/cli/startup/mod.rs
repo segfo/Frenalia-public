@@ -29,7 +29,7 @@ use session::stage_open_session;
 #[cfg(windows)]
 // `TIER2A_NET_DENIED`自体はここへは持ち込まない——文言の組み立ては`WfpUnavailable::warning`
 // だけが行い、呼び出し側は組み立て済みの1行を出すだけ、という分担を壊さないため。
-use wfp_outcome::{WfpPlan, WfpUnavailable, plan_wfp};
+use wfp_outcome::{plan_wfp, WfpPlan, WfpUnavailable};
 
 pub async fn run() -> ExitCode {
     let parsed = match stage_parse_args() {

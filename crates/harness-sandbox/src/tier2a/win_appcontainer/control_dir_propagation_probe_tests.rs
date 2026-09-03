@@ -396,7 +396,10 @@ impl Case {
 
     /// 配布の対象（ケースroot）が保護ノードの**祖父以上**か。真ならツリーが1段深くなる。
     fn propagates_from_ancestor(self) -> bool {
-        matches!(self, Self::AncestorCleanHolder | Self::AncestorWrittenHolder)
+        matches!(
+            self,
+            Self::AncestorCleanHolder | Self::AncestorWrittenHolder
+        )
     }
 
     /// 祖先（＝配布の対象）にも先行の高速付与を掛けるか。
@@ -600,7 +603,8 @@ unsafe fn protect_with_deny_in_one_write(
         let _ = LocalFree(HLOCAL(sd.0));
         merge_result?;
 
-        let result = set_dacl_single_object_with_protection(path, merged, DaclProtection::Protected);
+        let result =
+            set_dacl_single_object_with_protection(path, merged, DaclProtection::Protected);
         let _ = LocalFree(HLOCAL(merged as *mut _));
         result
     }
@@ -687,7 +691,8 @@ unsafe fn deny_without_protection(path: &Path, sid: PSID, mask: u32) -> windows:
         merge_result?;
 
         // **ここだけが`protect_with_deny_in_one_write`と違う**——保護を立てない。
-        let result = set_dacl_single_object_with_protection(path, merged, DaclProtection::Unprotected);
+        let result =
+            set_dacl_single_object_with_protection(path, merged, DaclProtection::Unprotected);
         let _ = LocalFree(HLOCAL(merged as *mut _));
         result
     }
@@ -948,7 +953,8 @@ unsafe fn protect_canonicalizing_dacl(path: &Path, sid: PSID) -> windows::core::
 
         let mut merged: *mut ACL = std::ptr::null_mut();
         SetEntriesInAclW(None, Some(stripped as *const _), &mut merged).ok()?;
-        let result = set_dacl_single_object_with_protection(path, merged, DaclProtection::Protected);
+        let result =
+            set_dacl_single_object_with_protection(path, merged, DaclProtection::Protected);
         let _ = LocalFree(HLOCAL(merged as *mut _));
         result
     }
@@ -998,7 +1004,8 @@ unsafe fn protect_forcing_inherited_flags(path: &Path, sid: PSID) -> windows::co
                 (*header).AceFlags |= INHERITED_ACE.0 as u8;
             }
         }
-        let result = set_dacl_single_object_with_protection(path, merged, DaclProtection::Protected);
+        let result =
+            set_dacl_single_object_with_protection(path, merged, DaclProtection::Protected);
         let _ = LocalFree(HLOCAL(merged as *mut _));
         result
     }
@@ -1027,7 +1034,8 @@ unsafe fn rewrite_with_protection(path: &Path) -> windows::core::Result<()> {
             &mut sd,
         )
         .ok()?;
-        let result = set_dacl_single_object_with_protection(path, existing, DaclProtection::Protected);
+        let result =
+            set_dacl_single_object_with_protection(path, existing, DaclProtection::Protected);
         let _ = LocalFree(HLOCAL(sd.0));
         result
     }
@@ -1073,7 +1081,8 @@ unsafe fn add_explicit_deny(path: &Path, sid: PSID, mask: u32) -> windows::core:
         let _ = LocalFree(HLOCAL(sd.0));
         merged?;
 
-        let result = set_dacl_single_object_with_protection(path, new_dacl, DaclProtection::Protected);
+        let result =
+            set_dacl_single_object_with_protection(path, new_dacl, DaclProtection::Protected);
         let _ = LocalFree(HLOCAL(new_dacl as *mut _));
         result
     }
@@ -1128,8 +1137,8 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
     });
     // 保護と高速付与の相手。深さ2では中間側の宛先SID、深さ1では`sid`。
     let holder_subject = holder_sid.as_ref().unwrap_or(&sid);
-    let sid_text = crate::win_common::sid_to_string(sid.as_psid())
-        .expect("render the probe SID as a string");
+    let sid_text =
+        crate::win_common::sid_to_string(sid.as_psid()).expect("render the probe SID as a string");
     let mask = workspace_rwx_mask();
     let grants = [AceGrant {
         sid: sid.as_psid(),
@@ -1166,8 +1175,7 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
     // **保護の書込が受け取る入力**。出力（保護直後）だけを比べていたのが前回の行き止まりだった。
     let control_before_protect =
         dacl_control(&guarded).expect("read the control bits before protect");
-    let aces_before_protect =
-        describe_dacl_aces(&guarded).expect("list the ACEs before protect");
+    let aces_before_protect = describe_dacl_aces(&guarded).expect("list the ACEs before protect");
     let size_before_protect =
         super::test_support::dacl_size_info(&guarded).expect("read the ACL header before protect");
 
@@ -1178,8 +1186,9 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
             Ok(super::ProtectOutcome::Wrote) => {}
             // [BUG-145] **飛ばした**。製品はこれを`.harness/`の2回目以降で通る。
             // ここは毎回まっさらなツリーなので、起きたら印の読み方がおかしい。
-            Ok(super::ProtectOutcome::SkippedAlreadyDurable) => errors
-                .push("protect: skipped on a freshly created tree; the mark must not be there yet".into()),
+            Ok(super::ProtectOutcome::SkippedAlreadyDurable) => errors.push(
+                "protect: skipped on a freshly created tree; the mark must not be there yet".into(),
+            ),
             // [BUG-084] 「触る前に消えていた」。自分で作ったツリーなので起こり得ないが、
             // 起きたなら測定が成立しない。
             Ok(super::ProtectOutcome::Vanished) => {
@@ -1262,9 +1271,9 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
         None
     };
 
-    let control_after_protect = dacl_control(&guarded).expect("read the control bits after protect");
-    let aces_after_protect =
-        describe_dacl_aces(&guarded).expect("list the ACEs after protect");
+    let control_after_protect =
+        dacl_control(&guarded).expect("read the control bits after protect");
+    let aces_after_protect = describe_dacl_aces(&guarded).expect("list the ACEs after protect");
     let size_after_protect =
         super::test_support::dacl_size_info(&guarded).expect("read the ACL header after protect");
     let guarded_allow_after_protect = match sid_effective_ace_mask(&guarded, sid.as_psid()) {
@@ -1291,8 +1300,7 @@ fn run_case(placement: &Placement, case: Case, index: usize) -> CaseResult {
 
     let control_after_propagate =
         dacl_control(&guarded).expect("read the control bits after propagate");
-    let aces_after_propagate =
-        describe_dacl_aces(&guarded).expect("list the ACEs after propagate");
+    let aces_after_propagate = describe_dacl_aces(&guarded).expect("list the ACEs after propagate");
     let size_after_propagate =
         super::test_support::dacl_size_info(&guarded).expect("read the ACL header after propagate");
     let read_mask = |path: &Path, what: &str, errors: &mut Vec<String>| -> Option<u32> {
@@ -1544,7 +1552,9 @@ fn control_dir_propagation_matrix_probe() {
             )
         })
         .collect();
-    println!("  [15-deny-without-protection] (置き場, 書けたか, 配布後も残ったか): {deny_no_protect:?}");
+    println!(
+        "  [15-deny-without-protection] (置き場, 書けたか, 配布後も残ったか): {deny_no_protect:?}"
+    );
 
     // --- ここから下は「実験の前提が崩れていないか」だけを見る（合否は判定しない） ---
     //
@@ -1625,7 +1635,10 @@ fn control_dir_propagation_matrix_probe() {
 
     // 対照の対（`B-35`）——伝播しないケースでは兄弟にも届かないこと。届いていたら、
     // 高速付与が伝播していることになり、このプローブの前提そのものが崩れる。
-    for r in results.iter().filter(|r| r.case == Case::NoPropagate.label()) {
+    for r in results
+        .iter()
+        .filter(|r| r.case == Case::NoPropagate.label())
+    {
         assert!(
             r.open_allow_after.is_none(),
             "[{}] {}: 伝播していないのに兄弟へ届いている。高速付与が伝播しない口である \
@@ -1777,7 +1790,9 @@ fn control_dir_protect_skip_cost_probe() {
                 )
                 .expect("enumerate the control dir");
                 for node in files.iter().chain(dirs.iter().rev()) {
-                    if dacl_is_protected_and_auto_inherited(dacl_control(node).expect("read control")) {
+                    if dacl_is_protected_and_auto_inherited(
+                        dacl_control(node).expect("read control"),
+                    ) {
                         skipped += 1;
                     } else {
                         unsafe { aclapi_strip_and_protect(node, sid.as_psid()) }

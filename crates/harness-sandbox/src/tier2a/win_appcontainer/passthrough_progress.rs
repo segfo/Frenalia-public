@@ -275,7 +275,11 @@ mod tests {
     #[test]
     fn progress_is_visible_only_while_the_guard_is_alive() {
         let cell = ProgressCell::new();
-        assert_eq!(cell.snapshot(), None, "before begin there is no grant phase");
+        assert_eq!(
+            cell.snapshot(),
+            None,
+            "before begin there is no grant phase"
+        );
 
         let phase = cell.begin(3);
         assert_eq!(
