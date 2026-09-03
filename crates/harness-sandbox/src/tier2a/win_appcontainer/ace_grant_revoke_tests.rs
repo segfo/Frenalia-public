@@ -920,6 +920,255 @@ fn destructive_traverse_write_ahead_recovers_both_crash_windows() {
     }
 }
 
+/// 2つ目の`harness.exe`が、1つ目の付与の最中でも**止まらない**こと（残課題#23 / D-89）。
+///
+/// # 壊れた状態を一文で
+///
+/// **別の`harness.exe`が付与の途中にいる間、こちらの起動が進めなくなる。**
+///
+/// 以前はトランザクション全体を名前付きmutexで直列化していた。その区間には
+/// **UACの応答待ちが含まれ、待ちは`INFINITE`**である——1つ目がUACダイアログを出したまま
+/// 放置されると、2つ目は無言のまま永久に止まる。ダイアログはユーザーが答えるまで閉じないので、
+/// これは理論上の話ではない。
+///
+/// # なぜ直列化を単に外せなかったのか（この測定の許可側）
+///
+/// 直列化には理由があった——**並走した片方が、相手の飛行中の予定を「実体が無い」と判断して
+/// 消してしまう**。消された側がその直後にACEを書いて落ちると、剥がすための名前がどこにも
+/// 残らない（＝[BUG-112](../../../../docs/bugs/BUG-112.md)そのもの）。だから予定に持ち主を
+/// 書いて、生きている持ち主のものは畳まないようにした。
+///
+/// **したがってこの測定は2つを同時に見る。** 片方だけでは足りない。
+///
+/// | 側 | 見るもの | これが壊れると |
+/// |---|---|---|
+/// | 禁止側 | 2つ目のトランザクションが**期限内に終わる** | UAC待ちで他の起動が止まる（直列化の再導入） |
+/// | 許可側 | 1つ目の**飛行中の予定が1件も消えない** | 生きている相手の回収名を奪う（BUG-112の再来） |
+///
+/// # UACダイアログは出さない——**同じ形の「長く居座る付与」で代用する**
+///
+/// UACの応答待ちを実機で再現すると、測定が人の操作に依存して再現しなくなる。ここで効いている
+/// 性質は「**1つ目がトランザクションの内側に長く留まる**」ことだけなので、破壊的E2Eの子を
+/// そのまま流用する——`pending`保存直後の停止点で止まったまま生き続ける子は、UACダイアログを
+/// 出したまま放置された`harness.exe`と、この機構から見て同じ状態である。
+///
+/// **この代用が写していないもの**: 実際のUACダイアログ・privhelperの起動・昇格側のDACL書込。
+/// 測っているのは台帳と排他の側だけである。
+///
+/// # 期限切れをハングにしない
+///
+/// 直列化が再導入されると2つ目は永久に待つ。テスト本体で待つと**失敗ではなくハング**になり、
+/// CIでは「遅い」としか見えない。別スレッドで走らせて`recv_timeout`で受けることで、
+/// 同じ事象を**赤いテスト**として出す。
+///
+/// 台帳は`Ledger::at_path`で一時領域へ注入し、ACEはテスト所有の`subst`ドライブに限る。
+#[test]
+#[ignore = "destructive E2E: parks a child process inside a real grant; run via dev-elevated-run ace-grant-revoke"]
+fn a_second_process_grants_while_the_first_is_parked_inside_its_own_transaction() {
+    let sid = traverse_capability_sid().expect("derive traverse capability SID");
+    let drive = SubstDrive::create()
+        .expect("concurrent traverse E2E requires one free drive letter for subst");
+    let run_dir = tempfile::tempdir().expect("create isolated concurrent traverse E2E directory");
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        harness_grant_ledger::now_unix_secs()
+    );
+
+    // **祖先を共有させる。** 2つの`harness.exe`が別々のワークスペースを開いても、
+    // 祖先チェーンはドライブルートで必ず交わる——そこが競合しうる唯一の点なので、
+    // 交わらない配置で測ると肝心の重なりを外す。
+    let parked_target = drive.root().join("parked").join("a").join("b");
+    let mover_target = drive.root().join("mover").join("c").join("d");
+    std::fs::create_dir_all(&parked_target).expect("create the parked child's target");
+    std::fs::create_dir_all(&mover_target).expect("create the second process's target");
+    let parked_chain = traverse_chain(&parked_target);
+    let mover_chain = traverse_chain(&mover_target);
+
+    let cleanup_nodes: Vec<std::path::PathBuf> = parked_chain
+        .iter()
+        .chain(mover_chain.iter())
+        .cloned()
+        .collect();
+    let cleanup_sid = sid.as_psid();
+    let _ace_cleanup = scopeguard(move || {
+        for node in cleanup_nodes.iter().rev() {
+            let _ = revoke_ace(node, cleanup_sid);
+        }
+    });
+
+    let ledger_path = run_dir.path().join("concurrent-ledger.json");
+    let marker = run_dir.path().join("parked-ready");
+    let ledger_lock = format!("Local\\harness-traverse-e2e-ledger-{nonce}-concurrent");
+    let ledger = Ledger::<crate::tier2a::traverse_ledger::TraverseLedger>::at_path(
+        ledger_path.clone(),
+        Some(&ledger_lock),
+    );
+
+    // 1つ目: `pending`を書いた直後の停止点で止まったまま生き続ける（＝UAC待ちの代用）。
+    let mut parked = std::process::Command::new(
+        std::env::current_exe().expect("resolve current test executable"),
+    )
+    .args(["--ignored", "--exact", DESTRUCTIVE_TRAVERSE_TEST])
+    .env(TRAVERSE_E2E_POINT, TraverseCrashPoint::AfterPending.name())
+    .env(TRAVERSE_E2E_TARGET, &parked_target)
+    .env(TRAVERSE_E2E_LEDGER, &ledger_path)
+    .env(TRAVERSE_E2E_MARKER, &marker)
+    .env(TRAVERSE_E2E_LEDGER_LOCK, &ledger_lock)
+    .spawn()
+    .expect("start the parked child");
+    let parked_handle = HANDLE(parked.as_raw_handle());
+    let parked_is_gone = Arc::new(AtomicBool::new(false));
+    let kill_on_exit = Arc::clone(&parked_is_gone);
+    let _parked_cleanup = scopeguard(move || {
+        if !kill_on_exit.load(Ordering::SeqCst) {
+            unsafe {
+                let _ = TerminateProcess(parked_handle, 0xE24);
+            }
+        }
+    });
+
+    wait_for_e2e_marker(&marker, TraverseCrashPoint::AfterPending);
+    // 計器の確認を先に置く。1つ目が本当にトランザクションの内側に居ることを確かめないと、
+    // このあとの「2つ目が速かった」は「競合が起きていなかっただけ」を意味しうる。
+    let parked_entries = ledger.load();
+    assert_eq!(
+        parked_entries.entries.len(),
+        parked_chain.len(),
+        "precondition: the parked child must already have written its whole plan"
+    );
+    assert!(
+        parked_entries.entries.iter().all(|e| e.pending),
+        "precondition: the parked child must still be between its plan and its confirmation"
+    );
+    assert!(
+        parked_entries
+            .entries
+            .iter()
+            .all(|e| e.pending_owner.is_some()),
+        "precondition: every in-flight plan must name its owner, or the second process has no way \
+         to tell it apart from an abandoned one"
+    );
+
+    // 2つ目: 別スレッドで製品と同じトランザクションを丸ごと通す。直列化が戻っていれば
+    // ここが永久に待つので、`recv_timeout`で赤にする（ハングにしない）。
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_ledger_path = ledger_path.clone();
+    let thread_lock = ledger_lock.clone();
+    let thread_target = mover_target.clone();
+    std::thread::spawn(move || {
+        let ledger = Ledger::<crate::tier2a::traverse_ledger::TraverseLedger>::at_path(
+            thread_ledger_path,
+            Some(&thread_lock),
+        );
+        let sid = traverse_capability_sid().expect("derive traverse capability SID in the mover");
+        let started = Instant::now();
+        let (granted, result) =
+            crate::tier2a::traverse_ledger::with_recorded_traverse_grants_for_test(
+                &ledger,
+                std::slice::from_ref(&thread_target),
+                || {},
+                || grant_traverse_chain(&thread_target, sid.as_psid()),
+                || {},
+            );
+        let _ = tx.send((started.elapsed(), granted, result.is_ok()));
+    });
+
+    const DEADLINE: Duration = Duration::from_secs(30);
+    let (elapsed, granted, ok) = rx.recv_timeout(DEADLINE).unwrap_or_else(|_| {
+        panic!(
+            "the second process's traverse transaction did not finish within {DEADLINE:?} while \
+             another process was parked inside its own transaction. A lock that spans the grant \
+             is back: it also spans the UAC prompt, so one instance waiting for the dialog blocks \
+             every other instance forever (D-89)"
+        )
+    });
+    assert!(ok, "the second process's grant chain must succeed");
+    println!(
+        "=== second process finished its transaction in {elapsed:?} while the first was parked ==="
+    );
+
+    // **計器の裏取り**: 「速く終わった」が「何もしなかった」でないこと。
+    assert_eq!(
+        granted, mover_chain,
+        "the second process must actually have granted its whole ancestor chain"
+    );
+    for node in &mover_chain {
+        assert_eq!(
+            sid_ace_mask(node, sid.as_psid()).expect("read the mover's DACL"),
+            Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0),
+            "the second process's ACE must really be on {}",
+            node.display()
+        );
+    }
+
+    // **許可側**: 1つ目の飛行中の予定は1件も消えていない。2つ目のトランザクションは
+    // 冒頭で畳み直しを通るので、持ち主の生存判定が効いていなければここで消えている。
+    let after = ledger.load();
+    for node in &parked_chain {
+        let entry = after
+            .entries
+            .iter()
+            .find(|e| harness_grant_ledger::same_ledger_path(&e.path, &node.to_string_lossy()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the second process erased a live owner's recovery name for {}; if that owner \
+                     then writes its ACE and dies, nothing can ever revoke it (BUG-112)",
+                    node.display()
+                )
+            });
+        // ドライブルートは**2つ目が実際に付与した**ので確定へ昇格していてよい（実体が在る）。
+        // それ以外は1つ目のものなので、未確定のまま残っていなければならない。
+        if !mover_chain.contains(node) {
+            assert!(
+                entry.pending,
+                "a live owner's plan must stay pending: {} was confirmed by somebody else",
+                entry.path
+            );
+        }
+    }
+
+    // 1つ目を落として畳み直すと、実体の無い予定だけが消えて実DACLと一致する。
+    unsafe {
+        TerminateProcess(parked_handle, 0xE24).expect("terminate the parked child");
+    }
+    parked.wait().expect("wait for the terminated child");
+    parked_is_gone.store(true, Ordering::SeqCst);
+
+    let settled = crate::tier2a::traverse_ledger::settle_pending_traverse_grants_for_test(&ledger);
+    assert_eq!(
+        settled.kept_in_flight, 0,
+        "the owner is gone, so nothing may still count as in flight: {settled:?}"
+    );
+    let recovered = ledger.load();
+    for node in &mover_chain {
+        assert!(
+            recovered
+                .entries
+                .iter()
+                .any(
+                    |e| harness_grant_ledger::same_ledger_path(&e.path, &node.to_string_lossy())
+                        && !e.pending
+                ),
+            "the second process's real ACE must remain a confirmed recovery entry: {}",
+            node.display()
+        );
+    }
+    for node in &parked_chain {
+        if mover_chain.contains(node) {
+            continue;
+        }
+        assert!(
+            !recovered
+                .entries
+                .iter()
+                .any(|e| harness_grant_ledger::same_ledger_path(&e.path, &node.to_string_lossy())),
+            "a plan whose ACE was never written, and whose owner is gone, must not linger: {}",
+            node.display()
+        );
+    }
+}
+
 /// `grant_traverse_chain`が多階層のネストしたディレクトリ全てへ個別にACEを付与し、
 /// `revoke_ace`で1件ずつ巻き戻せることを確認する（`TIER1A-OPEN-ISSUES.md`項目6
 /// 「多階層祖先traverse ACE不足」の解消の中核）。
