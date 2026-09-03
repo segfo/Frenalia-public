@@ -886,16 +886,69 @@ mod tests {
         );
     }
 
+    /// 実preflightを走らせるテスト用の使い捨てワークスペース。**製品の実台帳へ残る記録を
+    /// 持ち帰る。**
+    ///
+    /// preflightは成功のたびにworkspace台帳へ1件、capability台帳へモード数ぶんの記録を残す。
+    /// 使い捨てディレクトリで走らせると、それは**指す先が消えた記録**として積もり続ける
+    /// （`workspace_ledger`のdocが「実測で1,043件・155KB」と書いているのがこの形である）。
+    /// 実測でも、素の`cargo test -p harness-tools --lib`1回につきworkspace台帳へ2件・
+    /// capability台帳へ4件が増えていた。
+    ///
+    /// # 撤収の順序を型で固定する
+    ///
+    /// `Drop`は**先にツリーを消し、そのあとで台帳から名前を落とす**。逆にすると、ACEが載った
+    /// ままの木に対して撤収経路の名前だけが先に消える——`forget_capability`のdocが名指しで
+    /// 禁じている順序であり、BUG-017/BUG-059が繰り返し踏んだ孤立ACEの形そのものである。
+    /// `Drop`に置いたのは、テストが途中でpanicしても撤収が走るようにするため。
+    #[cfg(windows)]
+    struct Tier2aScratchWorkspace {
+        dir: Option<tempfile::TempDir>,
+        /// preflightが台帳へ書いたのと同じ綴り（`\\?\`付き）。`remove_workspace_entry`が
+        /// 使う`same_ledger_path`はverbatim前置を畳まないので、素のパスでは一致しない。
+        canonical: PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl Tier2aScratchWorkspace {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let canonical = dir.path().canonicalize().unwrap();
+            Self {
+                dir: Some(dir),
+                canonical,
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.dir.as_ref().expect("still alive").path()
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Tier2aScratchWorkspace {
+        fn drop(&mut self) {
+            drop(self.dir.take());
+            harness_sandbox::tier2a::workspace_ledger::remove_workspace_entry(&self.canonical);
+            let _ = harness_sandbox::tier2a::workspace_capability::forget_capability(
+                &self.canonical,
+                "",
+            );
+        }
+    }
+
     /// Tier2a（AppContainer）の隔離セマンティクスを決定論的に検証する（LLM非依存、絶対パスを
     /// 使いモデルのCWD混乱を排除する）。実際にpreflight（プロファイル作成＋再帰ACL付与＋
     /// smoke-test起動）を走らせ、Tier2aが選択できなかった環境（AppContainer不可）ではskipする。
-    /// 実行にはWindows実機＋（この開発機では）管理者権限が要る（`sudo cargo test`）。
+    ///
+    /// **昇格は要らない**（2026-09-03に非昇格で実行を確認）。実台帳へ残す記録は
+    /// [`Tier2aScratchWorkspace`]が持ち帰る。
     #[cfg(windows)]
     #[tokio::test]
     async fn run_shell_tier2a_contains_writes_and_reads() {
         use harness_core::{RequireSandbox, ShellTier};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = Tier2aScratchWorkspace::new();
         // 実Tier2a preflightを走らせる（`opt_in_Tier2a=true`）。AppContainer不可の環境では
         // Tier1へ降格するので、その場合はテストをskipする（CIやAppContainer無効環境向け）。
         // **Tier2aが取れない環境ではskipする。** D-75以後、取れないことは`Err`として返る
@@ -1007,7 +1060,7 @@ mod tests {
     async fn run_shell_tier2a_net_allow_app_grants_and_denies_network() {
         use harness_core::{NetAppPolicy, RequireSandbox, ShellTier};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = Tier2aScratchWorkspace::new();
         // Tier2aが取れない環境ではskipする（上のE2Eと同じ理由・同じ形）。
         let selection = match harness_sandbox::select_tier(
             RequireSandbox::None,

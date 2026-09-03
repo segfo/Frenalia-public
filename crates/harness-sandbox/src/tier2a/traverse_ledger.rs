@@ -639,4 +639,245 @@ mod tests {
         };
         assert!(is_recorded(Path::new("c:/users/"), &value));
     }
+
+    /// 測定用の台帳を`path`へ書き、`Ledger`と件数を返す。`pending`を1件混ぜるときは
+    /// **実在するディレクトリ**を宛先にする（実DACLを読ませる腕に要る）。
+    #[cfg(windows)]
+    fn write_measure_ledger(
+        path: &Path,
+        confirmed: usize,
+        pending_target: Option<&Path>,
+    ) -> Ledger<TraverseLedger> {
+        let mut value = TraverseLedger {
+            entries: (0..confirmed)
+                .map(|i| TraverseLedgerEntry {
+                    path: format!("C:\\measure\\node-{i:05}"),
+                    granted_at_unix_secs: 1,
+                    pending: false,
+                    pending_owner: None,
+                })
+                .collect(),
+        };
+        if let Some(target) = pending_target {
+            // 持ち主を名乗らない予定＝実DACLで判定される。ACEは無いので落とされ、台帳が書き直る。
+            value
+                .entries
+                .push(pending_entry(&target.to_string_lossy(), None));
+        }
+        // 台帳機構は書いたファイルへ読み取り専用属性を付ける（誤削除防止の第2層）。
+        // 仕込み直しはその外側から行うので、ここで自分で外す。
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            #[allow(
+                clippy::permissions_set_readonly_false,
+                reason = "測定の仕込みが、台帳が付けた読み取り専用属性を外して書き直すため"
+            )]
+            perms.set_readonly(false);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+        Ledger::at_path(
+            path.to_path_buf(),
+            Some(&format!(
+                "Local\\harness-measure-settle-{}",
+                path.file_stem().unwrap().to_string_lossy()
+            )),
+        )
+    }
+
+    /// **定常状態の畳み直しは台帳へ1バイトも書かない。**
+    ///
+    /// これは費用の測定（下の`#[ignore]`側）が成り立つための前提であると同時に、それ自体が
+    /// 守るべき性質である——毎起動が書込を1回払う実装になっていると、書込の途中で死ぬ窓を
+    /// **畳み直しが自分で作る**ことになる（BUG-112が塞ごうとしている窓そのもの）。
+    ///
+    /// 時計とは独立な計器（ファイルの長さと更新時刻）で見る。
+    #[cfg(windows)]
+    #[test]
+    fn settling_with_nothing_pending_does_not_rewrite_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("steady.json");
+        let ledger = write_measure_ledger(&path, 12, None);
+
+        let before = std::fs::metadata(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let outcome = settle_pending_traverse_grants_in_ledger(&ledger);
+        let after = std::fs::metadata(&path).unwrap();
+
+        assert!(
+            outcome.is_empty(),
+            "nothing was pending, so nothing settles"
+        );
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            after.modified().unwrap(),
+            before.modified().unwrap(),
+            "with no pending record the settle pass must leave the ledger file untouched; \
+             rewriting it on every startup would add a torn-write window of its own"
+        );
+        assert_eq!(
+            ledger.load().entries.len(),
+            12,
+            "the 12 recorded entries must still be there"
+        );
+    }
+
+    /// **畳み直しを起動のたびに走らせる追加費用**（残課題#23で「測っていない」と書いて残した分）。
+    ///
+    /// 定常状態で払うのは「名前付きmutexを取る → 台帳を1回読む → JSONを解く → `pending`を
+    /// 数える」だけである。実DACLは1本も読まず、台帳へ1バイトも書かない。**その「だけ」が
+    /// いくらなのか**を、この機の台帳サイズの実績範囲で測る。
+    ///
+    /// # 軸の値はこの機の実測から取る
+    ///
+    /// 12（現在）・582（`C:\harness-e2e\_ledger-backup-*`が持つこの機の実績最大。
+    /// 2026-08-21〜08-27の全バックアップがこの件数）・2000（実績を超える側の括り）。
+    /// 思いつきの値を振ると、読む側が「自分の条件はこの内側か」を判定できない。
+    ///
+    /// # 検算——崩れると数字が無意味になるもの
+    ///
+    /// 1. **速いのは「読まなかったから」ではない**: 読めた件数が注文どおりかを見る
+    /// 2. **対照**: 同じ件数に`pending`を1件だけ混ぜた腕は実DACLを読み台帳を書き直すので
+    ///    目に見えて遅い。**両腕が同じ値なら、対象ではなく計器と仕込みを疑う合図**である
+    ///
+    /// # この測定が写していないもの
+    ///
+    /// ファイルがページキャッシュに載っていない状態（各回の直前に書いているので常に温かい）。
+    /// 製品の起動でも直前の起動が書いた台帳を読むので温かい側が普通だが、**冷えた初回は
+    /// ここより遅い**。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "timing measurement; run explicitly and record in plans/e2e/RESULTS.md"]
+    fn measure_the_settle_cost_paid_by_every_startup() {
+        const REPS: usize = 7;
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe-dir");
+        std::fs::create_dir(&probe).unwrap();
+
+        // 腕は「1腕を連続で回す」のではなく**1周ごとに全腕を回す**。連続で回すと、後から回る腕ほど
+        // 温まったヒープとページキャッシュの上で走り、**件数の効果と順序の効果が混ざる**
+        // （最初にこの形で測ったとき、件数が3.4倍になっても時間が1.37倍しか増えず、
+        // 「件数を振ったつもりで順序を振っていた」ことが見えた）。
+        // 先頭の1周は捨てる——捨てないと、1周目だけが冷えた状態の値として全腕に混ざる。
+        let arms: Vec<(usize, bool)> = [12usize, 582, 2000]
+            .into_iter()
+            .flat_map(|n| [(n, false), (n, true)])
+            .collect();
+        let mut rows: Vec<(usize, bool, Vec<f64>)> =
+            arms.iter().map(|&(n, p)| (n, p, Vec::new())).collect();
+        // 定常状態の腕は**1度だけ書いて、書き直さずに繰り返す**。毎回書き直すと、直前の書込が
+        // まだ落ち着いていないファイルを開くことになり、**その待ちを畳み直しの費用として数える**
+        // （最初はそう測っていて、読取＋パースの内訳で説明が付かない差が出た）。
+        // 製品の起動が読むのは「前の起動が書いた台帳」なので、書き直さない側が実態に近い。
+        // `pending`の腕だけは毎回書き直す——1回目で畳み終えてしまい、2回目以降が別の腕になるため。
+        // **その分だけこの腕は上振れする**が、対照の役目（仕事をする腕が遅いこと）は保たれる。
+        for &(confirmed, with_pending) in &arms {
+            if !with_pending {
+                let path = dir.path().join(format!("m-{confirmed}-0.json"));
+                write_measure_ledger(&path, confirmed, None);
+            }
+        }
+        for round in 0..=REPS {
+            for (slot, &(confirmed, with_pending)) in arms.iter().enumerate() {
+                let path = dir
+                    .path()
+                    .join(format!("m-{confirmed}-{}.json", u8::from(with_pending)));
+                let ledger = if with_pending {
+                    write_measure_ledger(&path, confirmed, Some(probe.as_path()))
+                } else {
+                    Ledger::at_path(
+                        path.clone(),
+                        Some(&format!("Local\\harness-measure-settle-m-{confirmed}-0")),
+                    )
+                };
+                let started = std::time::Instant::now();
+                let outcome = settle_pending_traverse_grants_in_ledger(&ledger);
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+
+                // 検算1: 読めた件数が注文どおりか。
+                assert_eq!(
+                    ledger.load().entries.len(),
+                    confirmed,
+                    "the settle pass must have parsed all {confirmed} recorded entries; if it \
+                     silently read fewer, the elapsed time above measures nothing"
+                );
+                if with_pending {
+                    assert_eq!(outcome.dropped, 1, "the contrast arm must do real work");
+                } else {
+                    assert!(
+                        outcome.is_empty(),
+                        "the steady-state arm must settle nothing"
+                    );
+                }
+                if round > 0 {
+                    rows[slot].2.push(elapsed);
+                }
+            }
+        }
+        for row in &mut rows {
+            row.2.sort_by(f64::total_cmp);
+        }
+
+        for (confirmed, with_pending, samples) in &rows {
+            eprintln!(
+                "settle cost: entries={confirmed} pending={} min={:.3}ms median={:.3}ms \
+                 max={:.3}ms (n={REPS})",
+                u8::from(*with_pending),
+                samples[0],
+                samples[samples.len() / 2],
+                samples[samples.len() - 1],
+            );
+        }
+
+        // **内訳**——定常状態の費用が件数に比例しない形で出たので、どこへ行っているかを分けて出す。
+        // 分けずに合計だけを載せると、読む側は「大きい台帳ほど1件あたりが安くなる」という
+        // 説明の付かない形を、そのまま前提にしてしまう。
+        for &(confirmed, with_pending) in &arms {
+            if with_pending {
+                continue;
+            }
+            let path = dir.path().join(format!("m-{confirmed}-0.json"));
+            let mut reads = Vec::new();
+            let mut parses = Vec::new();
+            for _ in 0..REPS {
+                let started = std::time::Instant::now();
+                let text = std::fs::read_to_string(&path).unwrap();
+                reads.push(started.elapsed().as_secs_f64() * 1000.0);
+                let started = std::time::Instant::now();
+                let parsed: TraverseLedger = serde_json::from_str(&text).unwrap();
+                parses.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(parsed.entries.len(), confirmed);
+            }
+            reads.sort_by(f64::total_cmp);
+            parses.sort_by(f64::total_cmp);
+            eprintln!(
+                "settle cost breakdown: entries={confirmed} bytes={} read={:.3}ms parse={:.3}ms \
+                 (medians)",
+                std::fs::metadata(&path).unwrap().len(),
+                reads[reads.len() / 2],
+                parses[parses.len() / 2],
+            );
+        }
+
+        // 検算2: 対照が効いているか。仕事をする腕が定常状態と同じ速さなら、測れていない。
+        for confirmed in [12usize, 582, 2000] {
+            let steady = &rows
+                .iter()
+                .find(|(c, p, _)| *c == confirmed && !*p)
+                .unwrap()
+                .2;
+            let working = &rows
+                .iter()
+                .find(|(c, p, _)| *c == confirmed && *p)
+                .unwrap()
+                .2;
+            let (s, w) = (steady[steady.len() / 2], working[working.len() / 2]);
+            assert!(
+                w > s,
+                "at {confirmed} entries the arm that reads a real DACL and rewrites the ledger \
+                 ({w:.3}ms) must be slower than the steady-state arm ({s:.3}ms); if they match, \
+                 the instrument is not resolving what it claims to measure"
+            );
+        }
+    }
 }
