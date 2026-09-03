@@ -42,6 +42,17 @@ struct Cli {
     /// （同じ名前を2つの階層で有効にすると、どちらが効いたのか分からなくなる）。
     #[arg(long)]
     workspace: Option<PathBuf>,
+    /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
+    ///
+    /// **TUI（サブコマンド無しの既定経路）用**。`approve`サブコマンド側にも同名の引数があるが、
+    /// `global`にはしない——`workspace`と同じ理由（同じ名前を2階層で有効にすると、
+    /// どちらが効いたのか分からなくなる）。
+    ///
+    /// **これが無かったのが[BUG-127](../../docs/bugs/BUG-127.md)である。**
+    /// 宣言の口が`approve`サブコマンドにしか無く、TUIは`RequireSandbox::None`を定数で
+    /// 渡していたため、D-42の突き合わせが主経路で1件も効いていなかった。
+    #[arg(long)]
+    require_sandbox: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -238,7 +249,7 @@ fn main() -> ExitCode {
             workspace,
             yes,
         ),
-        None => run_tui(cli.workspace),
+        None => run_tui(cli.workspace, cli.require_sandbox.as_deref()),
     }
 }
 
@@ -248,15 +259,21 @@ fn main() -> ExitCode {
 /// 始めると、相手の出力を壊すうえ操作もできない。`is_terminal`で分けるのは`confirm_write`と
 /// 同じ作法である。
 #[cfg(windows)]
-fn run_tui(workspace: Option<PathBuf>) -> ExitCode {
+fn run_tui(workspace: Option<PathBuf>, require_sandbox: Option<&str>) -> ExitCode {
     use std::io::IsTerminal;
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         print_overview();
         return ExitCode::SUCCESS;
     }
+    // **解決点は`resolve_require_sandbox`ただ1つ**（CLI経路の`run_approve`と同じ関数を通す）。
+    // 綴りの検査もここで済ませる——不正な値で黙って`None`へ倒すと、
+    // 「宣言したのに効いていない」が観測できない形になる（[BUG-127](../../docs/bugs/BUG-127.md)）。
+    let Some(require_sandbox) = resolve_require_sandbox(require_sandbox) else {
+        return ExitCode::FAILURE;
+    };
     let workspace_root = resolve_workspace(workspace);
-    match harness_policy_editor::tui::run(workspace_root) {
+    match harness_policy_editor::tui::run(workspace_root, require_sandbox) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("TUIを起動できませんでした: {e}");
@@ -266,7 +283,7 @@ fn run_tui(workspace: Option<PathBuf>) -> ExitCode {
 }
 
 #[cfg(not(windows))]
-fn run_tui(_workspace: Option<PathBuf>) -> ExitCode {
+fn run_tui(_workspace: Option<PathBuf>, _require_sandbox: Option<&str>) -> ExitCode {
     // 記録がWindows専用（Tier2aのAppContainer・ETW・WFP）なので、TUIもWindowsだけ。
     print_overview();
     ExitCode::SUCCESS

@@ -33,7 +33,7 @@ fn render(app: &App, width: u16, height: u16) {
 #[test]
 fn the_record_screen_renders() {
     let ws = workspace();
-    let app = App::new(ws.path().to_path_buf());
+    let app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
 
     render(&app, 120, 40);
     render(&app, 80, 24);
@@ -43,7 +43,7 @@ fn the_record_screen_renders() {
 #[test]
 fn the_record_screen_renders_while_running() {
     let ws = workspace();
-    let mut app = App::new(ws.path().to_path_buf());
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
     app.command.set_text("cargo build");
     app.on_key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Enter,
@@ -89,7 +89,7 @@ fn the_edit_screen_and_the_overlays_render() {
     )
     .expect("audit log");
 
-    let mut app = App::new(ws.path().to_path_buf());
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
     app.screen = Screen::Edit;
     app.open_selected_session();
     render(&app, 120, 40);
@@ -155,7 +155,7 @@ fn the_edit_screen_shows_the_workspace_as_a_locked_row() {
     .collect();
     std::fs::write(dir.audit_log_path(), format!("{}\n", lines.join("\n"))).expect("audit log");
 
-    let mut app = App::new(ws.path().to_path_buf());
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
     app.screen = Screen::Edit;
     app.open_selected_session();
 
@@ -198,7 +198,7 @@ fn the_edit_screen_shows_the_workspace_as_a_locked_row() {
 #[test]
 fn every_screen_survives_a_tiny_terminal() {
     let ws = workspace();
-    let mut app = App::new(ws.path().to_path_buf());
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
     app.help = true;
     for (width, height) in [(1u16, 1u16), (10, 3), (20, 5), (40, 8)] {
         render(&app, width, height);

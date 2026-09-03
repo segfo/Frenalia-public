@@ -664,6 +664,14 @@ pub enum Action {
 
 pub struct App {
     pub workspace_root: PathBuf,
+    /// 承認ゲート（D-42）へ渡す`--require-sandbox`の宣言。
+    ///
+    /// **`RequireSandbox::None`を既定値として黙って埋めない。**
+    /// `None`は「ユーザーが何も要求していない」という正当な状態でもあるので、
+    /// 渡し忘れとの区別がゲートから付かない——[BUG-127](../../../../docs/bugs/BUG-127.md)は
+    /// まさにその形で、TUIの2箇所が定数`None`を書いていたためD-42の突き合わせが1件も効かなかった。
+    /// **必須の引数にして、構築点をコンパイラに数えさせる。**
+    pub require_sandbox: harness_core::RequireSandbox,
     pub screen: Screen,
     pub help: bool,
     pub status: String,
@@ -807,10 +815,13 @@ pub fn is_double_esc(previous: Option<std::time::Instant>, now: std::time::Insta
 pub const ESC_QUIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl App {
-    pub fn new(workspace_root: PathBuf) -> Self {
+    /// `require_sandbox`はCLIのルート引数から解決した値を渡す（[BUG-127](../../../../docs/bugs/BUG-127.md)）。
+    /// **解決点は`main.rs`の`resolve_require_sandbox`ただ1つ**で、CLI経路もTUI経路もそこから引く。
+    pub fn new(workspace_root: PathBuf, require_sandbox: harness_core::RequireSandbox) -> Self {
         let mut app = Self {
             cwd: TextInput::new(workspace_root.display().to_string()),
             workspace_root,
+            require_sandbox,
             screen: Screen::Record,
             help: false,
             status: String::new(),

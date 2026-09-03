@@ -26,7 +26,7 @@ fn workspace() -> tempfile::TempDir {
 }
 
 fn app_with(ws: &tempfile::TempDir) -> App {
-    App::new(ws.path().to_path_buf())
+    App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None)
 }
 
 fn type_text(app: &mut App, text: &str) {
@@ -860,7 +860,7 @@ fn granting_and_revoking_share_the_same_progress_ui() {
 /// ――１つの位置を共有すると、片方をスクロールしたらもう片方まで固まる。
 #[test]
 fn each_pane_scrolls_independently() {
-    let mut app = App::new(PathBuf::from("C:/w"));
+    let mut app = App::new(PathBuf::from("C:/w"), harness_core::RequireSandbox::None);
     app.run = Some(RunState::new(Pass::One));
     let run = app.run.as_mut().unwrap();
     for i in 0..50 {
@@ -883,7 +883,7 @@ fn each_pane_scrolls_independently() {
 /// 以前はここで位置を足し引きしていたが、会話TUIと振る舞いが食い違うのでやめた。
 #[test]
 fn appending_lines_does_not_touch_the_scroll_position() {
-    let mut app = App::new(PathBuf::from("C:/w"));
+    let mut app = App::new(PathBuf::from("C:/w"), harness_core::RequireSandbox::None);
     app.run = Some(RunState::new(Pass::One));
     let run = app.run.as_mut().unwrap();
     run.output_scroll.scroll_lines(4);
@@ -904,11 +904,11 @@ fn the_wheel_hits_the_same_panes_that_are_drawn() {
     use ratatui::layout::Rect;
 
     let area = Rect::new(0, 0, 120, 40);
-    let mut app = App::new(PathBuf::from("C:/w"));
+    let mut app = App::new(PathBuf::from("C:/w"), harness_core::RequireSandbox::None);
     app.run = Some(RunState::new(Pass::One));
 
     // 記録中でない画面ではどこを回しても何も起きない（対照群）。
-    let mut idle = App::new(PathBuf::from("C:/w"));
+    let mut idle = App::new(PathBuf::from("C:/w"), harness_core::RequireSandbox::None);
     assert_eq!(scroll_target(area, &idle, 80, 20), None);
     idle.run = None;
 
@@ -937,7 +937,7 @@ fn the_wheel_hits_the_same_panes_that_are_drawn() {
 /// 端に達したときだけ窓が追従する、が正しい。
 #[test]
 fn a_list_keeps_its_view_position_across_frames() {
-    let mut app = App::new(PathBuf::from("C:/w"));
+    let mut app = App::new(PathBuf::from("C:/w"), harness_core::RequireSandbox::None);
     // 描画側が「選択を見せるために 7 行目から表示した」と報告してきた、という状況。
     app.apply_draw_feedback(crate::tui::DrawFeedback {
         candidate_list_offset: Some(7),
@@ -961,7 +961,7 @@ fn a_list_keeps_its_view_position_across_frames() {
 /// 残すと、短い一覧へ切り替えたときに窓だけが下に取り残される。
 #[test]
 fn resetting_the_selection_also_resets_the_view_position() {
-    let mut app = App::new(PathBuf::from("C:/w"));
+    let mut app = App::new(PathBuf::from("C:/w"), harness_core::RequireSandbox::None);
     app.apply_draw_feedback(crate::tui::DrawFeedback {
         candidate_list_offset: Some(20),
         ..Default::default()

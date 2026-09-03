@@ -80,9 +80,82 @@ fn seed_pass2(ws: &tempfile::TempDir, id: &str, command: &str, domain: &str, hos
 }
 
 fn open_edit(ws: &tempfile::TempDir) -> App {
-    let mut app = App::new(ws.path().to_path_buf());
+    open_edit_with(ws, harness_core::RequireSandbox::None)
+}
+
+/// `--require-sandbox`の宣言を指定して編集画面を開く（[BUG-127](../../../../docs/bugs/BUG-127.md)）。
+fn open_edit_with(ws: &tempfile::TempDir, require_sandbox: harness_core::RequireSandbox) -> App {
+    let mut app = App::new(ws.path().to_path_buf(), require_sandbox);
     app.on_key(key(KeyCode::F(2)));
     app
+}
+
+/// ワークスペース外への**書込**が観測された記録を1件作る。
+/// `fs.read_write`の提案になるので、`--require-sandbox=write-containment`と矛盾する。
+fn seed_outside_write(ws: &tempfile::TempDir) {
+    seed_pass1_with_access(
+        ws,
+        "s1",
+        "cargo build",
+        &[(
+            r"C:\Users\me\.cargo\a.rs",
+            harness_config::FsAccess::ReadWrite,
+        )],
+    );
+}
+
+/// **[BUG-127] 禁止側。** TUI（サブコマンド無しの既定経路）でも、`--require-sandbox`と
+/// 矛盾する承認は拒否されること。
+///
+/// 直す前は`ApproveRequest.require_sandbox`に定数`RequireSandbox::None`を書いていたため、
+/// **同じ提案がCLIでは拒否されTUIでは通る**という状態だった。ゲート自体は正しく、
+/// 禁止側・許可側のテストも両方緑だったが、**それらが呼ぶのは`approve::plan`であって
+/// TUIの呼び出し側ではない**——判定器の正しさと、判定器へ実値が届いているかは別の主張である。
+#[test]
+fn the_tui_refuses_an_approval_that_contradicts_require_sandbox() {
+    let ws = workspace();
+    seed_outside_write(&ws);
+    let mut app = open_edit_with(&ws, harness_core::RequireSandbox::WriteContainment);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+
+    app.on_key(key(KeyCode::Char('a')));
+
+    let modal = app.modal.as_ref().expect("拒否のダイアログが出ている");
+    assert!(
+        modal.title.contains("承認できません"),
+        "title={:?} lines={:?}",
+        modal.title,
+        modal.lines
+    );
+    assert!(
+        modal.lines.iter().any(|l| l.contains("--require-sandbox")),
+        "拒否の理由が宣言との矛盾だと分かること: {:?}",
+        modal.lines
+    );
+    assert!(
+        !crate::policy_file::path(ws.path()).exists(),
+        "拒否されたのに policy.json が書かれている"
+    );
+}
+
+/// **[BUG-127] 許可側（対）。** 宣言が無い（`RequireSandbox::None`）なら、同じ承認は通る。
+///
+/// **この対が無いと、`request_approval`が常に失敗する実装でも禁止側テストが通る**（`B-35`）。
+/// 種は禁止側とまったく同じで、違うのは`require_sandbox`の値だけにしてある。
+#[test]
+fn the_tui_still_approves_the_same_proposal_without_a_declaration() {
+    let ws = workspace();
+    seed_outside_write(&ws);
+    let mut app = open_edit_with(&ws, harness_core::RequireSandbox::None);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('a')));
+    app.on_key(key(KeyCode::Char('y')));
+
+    let policy = crate::policy_file::load(ws.path()).expect("policy.json");
+    let domain = policy.domain("cargo").expect("ドメインが作られている");
+    assert!(!domain.fs.is_empty(), "承認した値が入っていない");
 }
 
 /// 記録を開くと候補が出て、ドメイン名の既定値がコマンドから決まる。

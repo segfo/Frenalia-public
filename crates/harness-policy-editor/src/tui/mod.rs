@@ -93,7 +93,13 @@ const TICK: Duration = Duration::from_millis(100);
 
 /// TUIを起動する。呼び出し側は標準入出力が端末であることを確認しておくこと
 /// （パイプ・リダイレクトで端末制御を始めない）。
-pub fn run(workspace_root: PathBuf) -> io::Result<()> {
+/// `require_sandbox`はCLIのルート引数から解決した値（[BUG-127](../../../../docs/bugs/BUG-127.md)）。
+/// **TUIはサブコマンド無しの既定経路**なので、`approve`サブコマンドにしか宣言の口が無いと
+/// 主経路だけがゲートを素通りする。
+pub fn run(
+    workspace_root: PathBuf,
+    require_sandbox: harness_core::RequireSandbox,
+) -> io::Result<()> {
     // パス2が開けた穴（workspace外へのACE）は**TUIを閉じるまで**保つ。同じSIDのまま2回目を
     // 走らせれば`preflight`の`already_sufficient`が効き、付与もUACも丸ごとスキップされる。
     // 落ちた場合は次回起動時の`gc_dead_sessions`が回収する（`SessionGrants`のdoc）。
@@ -128,7 +134,7 @@ pub fn run(workspace_root: PathBuf) -> io::Result<()> {
     // その`Teardown`はAppContainerプロファイルの削除（`SessionGrants`のDrop）より**先**に
     // 走らなければならない——フィルタはそのプロファイルのpackage SIDを条件にしているため。
     // Rustは宣言の逆順にdropするので、この順序がそのまま撤収順になる（`App`が`wfp`を持つ）。
-    let mut app = App::new(workspace_root);
+    let mut app = App::new(workspace_root, require_sandbox);
 
     // **昇格は起動直後に済ませる**（起動時前倒し）。遅延させると、UACが「準備が終わった
     // あと」＝無音が続いた後に出て見逃される——実測で1度そうなり、記録が丸ごと失敗した
