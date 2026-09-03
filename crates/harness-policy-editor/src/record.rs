@@ -55,11 +55,14 @@ pub use crate::child_run::AbortReason;
 /// 何回UACが出るかは「このパスが何をするか」の一部なので、表示する側ではなく実行する側が持つ
 /// ——UIを増やすたびに書き写すと、経路ごとに違うことを言い始める（B-05）。
 pub const ELEVATION_NOTICE: &str =
-    "隔離: なし（Tier0）。対象コマンドは、あなたのシェルで直接実行した場合と\n\
-     同じ権限・同じ環境変数で走ります。記録の目的は「正常に動くときに何へ触るか」を\n\
-     観測することなので、観測の器が対象の動きを変えないようにしています。\n\
+    "隔離: なし（Tier0）。これはdry-runではありません。対象コマンドは、あなたのシェルと\n\
+     同じ権限・同じ環境変数で本当に実行され、ファイル変更・秘密情報の読み取り・外部通信などの\n\
+     副作用もそのまま起こります。push・deploy・publish・deleteなど、1回の実行自体が\n\
+     害になり得るコマンドは、このパスでは記録しないでください。\n\
+     記録の目的は「正常に動くときに何へ触るか」を観測することなので、観測の器が対象の動きを\n\
+     変えないようにしています。\n\
      ETW収集器の起動でUACが1回出ます（収集器が張るETWセッションが管理者権限を要するため）。\n\
-     このパス自体はマシンに何も残しません（観測だけで、ACEは付きません）。";
+     観測機構はACEを付けませんが、対象コマンドが起こした変更はマシンに残ります。";
 
 /// ETWセッションを張ってから対象コマンドを起動するまでの待ち（モジュールdocの表を参照）。
 pub const WARMUP: Duration = Duration::from_millis(1500);
@@ -664,6 +667,17 @@ fn spawn_tier0(
 #[cfg(test)]
 mod record_env_tests {
     use super::*;
+
+    /// パス1をdry-runと誤認すると、最初の実行そのものが害になる操作を記録してしまう。
+    /// 警告は境界ではないが、運用で受けると決めた残存リスクと次の行動を実行前に渡す唯一の正本なので、
+    /// 危険の説明と「記録しない」という行動の両方を固定する。
+    #[test]
+    fn pass1_notice_says_that_real_side_effects_are_not_contained() {
+        assert!(ELEVATION_NOTICE.contains("dry-runではありません"));
+        assert!(ELEVATION_NOTICE.contains("外部通信"));
+        assert!(ELEVATION_NOTICE.contains("対象コマンドが起こした変更はマシンに残ります"));
+        assert!(ELEVATION_NOTICE.contains("このパスでは記録しないでください"));
+    }
 
     /// **記録の器が対象の環境を変えないこと。**
     ///
