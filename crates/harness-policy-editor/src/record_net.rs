@@ -122,7 +122,7 @@ pub fn render_fs_denials(
     } else {
         out.push_str(&format!(
             "  {}件の拒否を観測しました。候補は下の一覧と同じ形で確認できます:\n\
-             harness-policy-editor show <session> --generalize <none|dir|auto>\n",
+             harness-policy-editor show <session>\n",
             aggregate.denied
         ));
     }

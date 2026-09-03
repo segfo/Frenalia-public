@@ -82,6 +82,15 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
     // `.take()`（`mem::replace`でNoneに戻す）を使うのは、`Commands::Prompt`分岐で`&cli`を
     // 丸ごと借用したいため。単純な`cli.command`のムーブだと`cli.command`フィールドだけが
     // 部分ムーブされ、以降`&cli`が取れなくなる。
+    // [BUG-120] ルート位置の`--dangerously-allow`はサブコマンドへ届かない。**無言で無視しない。**
+    // clapは受理してしまう（サブコマンドの前にルート引数を置くのは正しい構文）ので、
+    // 「綴りが違えば終了コード2、位置が違えば無言」という非対称をここで埋める。
+    // **`cli.command.take()`より前に置く**——takeするとサブコマンドの有無が判定できなくなる。
+    if let Some(reason) = crate::cli::misplaced_root_dangerously_allow(&cli) {
+        eprintln!("error: {reason}");
+        return Err(ExitCode::FAILURE);
+    }
+
     if let Some(cmd) = cli.command.take() {
         return Err(match cmd {
             Commands::Fs { action } => crate::fs_grants::run_fs_subcommand(action),

@@ -30,6 +30,10 @@ use clap::{Parser, Subcommand};
 /// 提案の既定の表示件数。0で全件。
 const DEFAULT_LIMIT: usize = 40;
 
+#[cfg(test)]
+#[path = "cli_strings_tests.rs"]
+mod cli_strings_tests;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "harness-policy-editor",
@@ -92,7 +96,6 @@ enum Command {
         /// 作業ディレクトリ（既定: policy.jsonに記録されたcwd、無ければworkspace）。
         #[arg(long)]
         cwd: Option<PathBuf>,
-        #[arg(long)]
         /// この秒数を過ぎたら対象コマンドを打ち切る。
         #[arg(long)]
         timeout: Option<u64>,
@@ -108,7 +111,7 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         workspace: Option<PathBuf>,
-        #[arg(long)]
+        /// 表示する提案の件数（0で全件）。
         #[arg(long)]
         limit: Option<usize>,
         /// 観測したプロセスツリーも表示する。
@@ -133,8 +136,6 @@ enum Command {
         /// 承認する提案id（カンマ区切り可）。**全件受理のショートハンドは無い**（D-42）。
         #[arg(long)]
         accept: Vec<String>,
-        /// `show`に渡したのと同じ値を指定すること（idは一般化の度合いで変わる）。
-        #[arg(long)]
         /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
         #[arg(long)]
         require_sandbox: Option<String>,

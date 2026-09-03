@@ -863,6 +863,43 @@ pub(crate) struct Cli {
     mock_record_requests: Option<PathBuf>,
 }
 
+/// ルート位置に置かれた`--dangerously-allow`が、サブコマンド経路では効かないことを検出する
+/// （[BUG-120](../../../docs/bugs/BUG-120.md) 案A）。効かないなら**理由を返す**。
+///
+/// # なぜ必要か
+///
+/// `--dangerously-allow`は**同じ綴りで2本ある**。ルート側は「`--permission-mode accept-all`と
+/// ワイルドカード`--allow`の解禁」、`apply`側は「ワークスペース外への実FS適用の解禁」で、
+/// **意味が別**である。そして`harness --dangerously-allow apply`は
+/// **clapがエラーを出さずに受理する**——サブコマンドの前にルート引数を置くのは正しい構文だからで、
+/// 綴りが違えば出る終了コード2が、位置が違うだけのときは出ない。
+///
+/// 結果、`apply`側の値は`false`のまま走り、ユーザーには
+/// `blocked (out-of-workspace, needs --dangerously-allow)`だけが見える。
+/// **「付けたのに拒否された」ように読めて、付けた場所が違うという情報がどこにも出ない。**
+///
+/// # なぜ`global = true`で揃えないのか
+///
+/// `global`は落とすのではなく**併合する**。意味の違う2つのゲートが1つの値になるので、
+/// ルート側に付けただけで`_ext`の適用まで開く——**倒れる向きが安全側から危険側へ反転する。**
+/// 綴りの衝突そのものは`cli_structure_tests.rs`が宣言を強制して見張る。
+pub(crate) fn misplaced_root_dangerously_allow(cli: &Cli) -> Option<String> {
+    if cli.command.is_none() || !cli.dangerously_allow {
+        return None;
+    }
+    Some(
+        "--dangerously-allow was given before the subcommand, where it only unlocks \
+         --permission-mode accept-all and wildcard --allow for an agent run. It does not reach \
+         the subcommand. If you meant to allow applying changes outside the workspace, put it \
+         after the subcommand: `harness apply --dangerously-allow`."
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+#[path = "cli_structure_tests.rs"]
+mod cli_structure_tests;
+
 pub mod cow_cmd;
 pub mod mcp_cmd;
 pub mod memory_cmd;

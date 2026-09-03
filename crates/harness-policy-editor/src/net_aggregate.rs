@@ -11,7 +11,7 @@
 //!
 //! [`NetAggregate`]は記録中のライブ表示のために行を溜めるが、候補の計算は毎回
 //! `harness_policy`の正規化と一般化を通し直す（B-13: 同じ事実の正本を2つ持たない）。
-//! `show --net`が`--generalize`を変えて何度でも見直せるのはこの性質から来ている。
+//! `show --net`が何度でも見直せるのはこの性質から来ている。
 
 use std::collections::BTreeMap;
 
@@ -131,7 +131,7 @@ impl NetAggregate {
 
 /// 記録済みの`net-audit.jsonl`を読み直して集計する。
 ///
-/// **保存済みの集計値は使わない**（B-13）。`--generalize`を変えて何度でも見直せる。
+/// **保存済みの集計値は使わない**（B-13）。何度でも見直せる。
 pub fn from_log(path: &std::path::Path) -> NetAggregate {
     let mut tail = crate::audit_tail::AuditTail::new(path);
     let mut aggregate = NetAggregate::new();

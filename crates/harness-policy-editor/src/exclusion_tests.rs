@@ -61,7 +61,7 @@ fn sandbox_profile_paths_are_excluded() {
 
 /// [BUG-103追記] **`%LOCALAPPDATA%\Packages`そのものと、他アプリのパッケージデータ。**
 ///
-/// プロファイル名の除外だけでは足りません——`--generalize dir`が
+/// プロファイル名の除外だけでは足りません——候補の畳み込みが
 /// `Packages/harness.shell.sandbox.<token>/AC/...`を**親の`Packages`へ丸める**ので、
 /// 実際に承認されて実マシンに`(OI)(CI)(R,W,D)`を残していたのは
 /// **プロファイル名を含まない値**（`…/AppData/Local/Packages`）でした。

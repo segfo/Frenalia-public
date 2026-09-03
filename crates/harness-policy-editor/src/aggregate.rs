@@ -138,7 +138,7 @@ pub struct Aggregate {
     /// [BUG-103] harness自身のサンドボックスプロファイル配下だったため候補にしなかった件数。
     pub excluded_sandbox_profile: u64,
     /// [BUG-103追記] `%LOCALAPPDATA%\Packages`（全MSIXアプリの専用データ置き場）配下だったため
-    /// 候補にしなかった件数。**プロファイル名の判定とは別に数える**——`--generalize dir`が
+    /// 候補にしなかった件数。**プロファイル名の判定とは別に数える**——候補の畳み込みが
     /// 親へ丸めた値はプロファイル名を含まないので、実際に承認されていたのはこちらだった。
     pub excluded_msix_package_data: u64,
     /// 設定パスへ寄せられていない実行像（旧形式の監査ログに残るNTパス）の数。
@@ -491,7 +491,7 @@ pub fn apply_session_context(aggregate: &mut Aggregate, manifest: &RecordManifes
 /// 記録済みの監査ログ（JSONL）を読み直して集計する。
 ///
 /// **保存済みの集計値は使わない。** 観測の正本は`fs-audit.jsonl`だけで、マニフェストは
-/// 文脈しか持たない（同じ事実の正本を2つ持たない、B-13）。`--generalize`を変えて
+/// 文脈しか持たない（同じ事実の正本を2つ持たない、B-13）。畳み込みの度合いが変わって
 /// 何度でも見直せるのはこの性質から来ている。
 ///
 /// **外へは出さない**（[`from_session`]のdoc）。
@@ -630,7 +630,7 @@ pub fn render_notes(aggregate: &Aggregate) -> String {
             "除外: %LOCALAPPDATA%\\Packages 配下 {}件\n\
              （全てのストアアプリ（MSIX/AppContainer）の専用データ置き場です。ここへ許可すると\n\
              他のアプリのデータを読み書き削除できることになります——pwsh自身もStoreパッケージです。\n\
-             `--generalize dir` はharness自身のプロファイルへのアクセスをこの親へ丸めるので、\n\
+             候補の畳み込みはharness自身のプロファイルへのアクセスをこの親へ丸めるので、\n\
              プロファイル名の除外だけでは素通りします）\n",
             aggregate.excluded_msix_package_data
         ));

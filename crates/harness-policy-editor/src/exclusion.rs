@@ -117,7 +117,7 @@ impl ExclusionRules {
             }
         }
         // 2. harness自身のサンドボックスプロファイル。**`.harness`と同じ理由**（harnessの
-        //    制御物）で外す。実測30件が承認され、`--generalize dir`で親の
+        //    制御物）で外す。実測30件が承認され、候補の畳み込みで親の
         //    `AppData\Local\Packages`へ丸められて全MSIXアプリのデータ置き場へ
         //    `(OI)(CI)(R,W,D)`が付いた（P-01違反）。
         if is_sandbox_profile_path(path) {
@@ -127,7 +127,7 @@ impl ExclusionRules {
         //      置き場で、`pwsh`自身もStoreパッケージである。BUG-103の実害はまさにここへ
         //      `(OI)(CI)(R,W,D)`が付いたことだった（P-01）。
         //
-        //      **上の2（プロファイル名の判定）だけでは足りない。** `--generalize dir`は
+        //      **上の2（プロファイル名の判定）だけでは足りない。** 候補の畳み込みは
         //      `Packages/harness.shell.sandbox.<token>/AC/...`を**親の`Packages`へ丸める**ので、
         //      候補として現れる値にはプロファイル名が含まれない——実マシンの`policy.json`には
         //      `C:/Users/segfo/AppData/Local/Packages`が`fs.read`と`fs.read_write`で宣言されており、

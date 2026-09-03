@@ -37,7 +37,7 @@ use crate::policy_file::{self, ApprovalContext, MergeReport, PolicyDomain, Polic
 /// 承認の要求。
 pub struct ApproveRequest<'a> {
     pub workspace_root: &'a Path,
-    /// `show`が出したのと**同じ**提案一覧（同じ`--generalize`で作ったもの）。
+    /// `show`が出したのと**同じ**提案一覧（同じ畳み込みで作ったもの）。
     pub proposals: &'a [RuleProposal],
     /// `--accept`で指定されたid（カンマ区切りは呼び出し側で展開済み）。
     pub accept_ids: &'a [String],
@@ -56,10 +56,7 @@ pub enum ApproveError {
          あります。**全件受理のショートハンドは意図的に用意していません**（D-42）"
     )]
     NoIds,
-    #[error(
-        "知らない提案id: {0}。idは `show` の出力から取り、`--generalize` の値によって変わります\
-         ——`show` と `approve` に同じ値を渡してください"
-    )]
+    #[error("知らない提案id: {0}。idは `show` の出力から取ってください")]
     UnknownIds(String),
     #[error("承認できません（何も書いていません）:\n{0}")]
     Refused(String),
