@@ -99,7 +99,25 @@ struct Generation {
 impl Generation {
     /// 検証済みの要求からETWセッションを張る。**張れなくても`Some`を返す**（fail-open）。
     fn start(policy: &LearnPolicy, sink_path: std::path::PathBuf) -> Self {
-        let session_name = format!("harness-policy-learn-{}", policy.session_profile);
+        // [BUG-117] **自分のセッションを張る前に、所有者の死んだ残留セッションを回収する。**
+        // 撤収は`stop()`と`Drop`しかなく、どちらも`TerminateProcess`では走らない。
+        // 名前は起動のたびに変わるので`ERROR_ALREADY_EXISTS`の分岐には当たらず、
+        // 残った側は誰にも触られないまま`Microsoft-Windows-Kernel-File`を有効にし続ける。
+        //
+        // 回収したことは**黙らせない**——マシン全体のファイル操作に発火し続けていた
+        // 資源を止めたという、運用者が知るべき事実である。
+        let reclaimed = super::etw::session::stop_orphaned_fs_sessions();
+        if reclaimed > 0 {
+            append_control(
+                &sink_path,
+                &format!("etw_orphan_sessions_stopped: {reclaimed}"),
+            );
+        }
+        let session_name = format!(
+            "{}{}",
+            super::etw::session::FS_SESSION_PREFIX,
+            policy.session_profile
+        );
         let start_result = if policy.record_all {
             EtwFsSession::start_record_all(&session_name)
         } else {

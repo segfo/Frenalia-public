@@ -1014,6 +1014,142 @@ unsafe extern "system" fn counting_callback(record: *mut EVENT_RECORD) {
     }
 }
 
+/// ポリシー学習の収集器が張るETWセッション名の接頭辞。
+///
+/// **綴りの正本はここ1つ**（`B-13`）。張る側（`policy_learnd::server`）と、
+/// 所有者の死んだものを回収する側（[`stop_orphaned_fs_sessions`]）が同じ綴りを見る。
+pub const FS_SESSION_PREFIX: &str = "harness-policy-learn-";
+
+/// ETWセッション名から、その**所有者のセッショントークン**を取り出す
+/// （[BUG-117](../../../../../docs/bugs/BUG-117.md)）。回収の対象にできないものは`None`。
+///
+/// 収集器が張る名前は`harness-policy-learn-harness.shell.sandbox.<token>`である。
+/// 接頭辞のあとがharnessのセッションプロファイル名になっていなければ`None`を返す——
+/// **スパイクやテストが張る`harness-policy-learn-<任意>`は所有者を判定できない**ので、
+/// 回収の対象にしない（判定できないものを止めない、fail-closed）。
+pub fn orphan_candidate_token(session_name: &str) -> Option<&str> {
+    let profile = session_name.strip_prefix(FS_SESSION_PREFIX)?;
+    if !crate::tier2a::session_profile::is_session_profile_name(profile) {
+        return None;
+    }
+    crate::tier2a::session_profile::token_of_profile(profile)
+}
+
+/// このセッション名を**止めてよいか**（所有者が死んでいるか）。
+///
+/// 生存判定は引数で受け取る——**実装は`session_profile::token_owner_is_live`ただ1つ**で、
+/// ここで受けるのは単体テストのためである（名前付きmutexは実プロセスが要る）。
+pub fn is_orphaned_session(session_name: &str, owner_is_live: impl Fn(&str) -> bool) -> bool {
+    match orphan_candidate_token(session_name) {
+        Some(token) => !owner_is_live(token),
+        None => false,
+    }
+}
+
+/// 所有者の死んだ`harness-policy-learn-*`セッションをOSから止める
+/// （[BUG-117](../../../../../docs/bugs/BUG-117.md) 案A）。戻り値は止めた件数。
+///
+/// # なぜ起動側でやるのか
+///
+/// **撤収の経路が`stop()`と`Drop`しかなく、どちらもプロセスの生存が前提だからである。**
+/// `TerminateProcess`・`panic = "abort"`・電源断のいずれでも`Drop`は走らず、
+/// リアルタイムセッションはOSに登録されたまま残る（`logman query -ets`に出る）。
+/// 残っている間、`Microsoft-Windows-Kernel-File`は購読者不在のまま有効で、
+/// **マシン全体のファイル操作に対して発火し続ける。**
+///
+/// 起動側には`ERROR_ALREADY_EXISTS`で名前を止め直す分岐が元からあったが、
+/// **セッション名は起動のたびに変わる**（`{pid}-{unix_secs}`）ので、
+/// 残留セッションの名前と一致することは無い——効くのは同一プロセス内だけだった。
+/// だから**名前で引くのをやめて、接頭辞で列挙する。**
+///
+/// # 何を止めないか（**同じ場所で言う**）
+///
+/// - **所有者を判定できない名前は止めない。** スパイクとテストは
+///   `harness-policy-learn-<任意>`を張るので、接頭辞だけで判断すると
+///   並行して走っている測定を殺す（[`orphan_candidate_token`]）。
+/// - **所有者が生きているセッションは止めない。** 判定は名前付きmutexで、
+///   [`crate::tier2a::session_profile::token_owner_is_live`]が唯一の実装を持つ。
+/// - 列挙・停止に失敗しても**何も言わずに0を返さない**——呼び出し側がログへ出せるよう
+///   件数だけを返し、個々の失敗は握り潰す（収集器は境界ではないのでfail-open、P-07/D-43）。
+///
+/// **管理者権限が要る**（収集器は昇格側で動くので満たしている）。
+#[cfg(windows)]
+pub fn stop_orphaned_fs_sessions() -> usize {
+    use windows::Win32::System::Diagnostics::Etw::QueryAllTracesW;
+
+    // ETWのセッション数はマシン全体で64〜256程度（`logman query -ets`の実測で数十）。
+    // 足りなければ`ERROR_MORE_DATA`が返るので、そのときも取れたぶんは処理する。
+    const MAX_SESSIONS: usize = 256;
+    const NAME_CHARS: usize = 512;
+
+    let struct_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
+    let entry_size = struct_size + NAME_CHARS * 2 * 2;
+    let mut storage: Vec<Vec<u8>> = (0..MAX_SESSIONS).map(|_| vec![0u8; entry_size]).collect();
+    let mut ptrs: Vec<*mut EVENT_TRACE_PROPERTIES> = Vec::with_capacity(MAX_SESSIONS);
+    for buf in storage.iter_mut() {
+        let p = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+        // SAFETY: `buf`は`EVENT_TRACE_PROPERTIES`＋2つの名前領域ぶん確保済みで、
+        // `Vec<u8>`のアロケーションは最大アラインメント要件を満たす。
+        unsafe {
+            (*p).Wnode.BufferSize = entry_size as u32;
+            (*p).LoggerNameOffset = struct_size as u32;
+            (*p).LogFileNameOffset = (struct_size + NAME_CHARS * 2) as u32;
+        }
+        ptrs.push(p);
+    }
+
+    let mut count: u32 = 0;
+    // SAFETY: `ptrs`の各要素は`storage`が生きている間有効で、各バッファは
+    // `BufferSize`ぶん確保済み。
+    let status = unsafe { QueryAllTracesW(&mut ptrs, &mut count) };
+    // `ERROR_MORE_DATA`は「配列が足りなかった」で、取れたぶんは有効である。
+    if status != ERROR_SUCCESS && status.0 != 234 {
+        return 0;
+    }
+
+    let mut stopped = 0usize;
+    for p in ptrs.iter().take(count as usize) {
+        // SAFETY: `QueryAllTracesW`が埋めた領域を読むだけ。名前は`LoggerNameOffset`から
+        // NUL終端のUTF-16で入る。
+        let name = unsafe {
+            let base = *p as *const u8;
+            let offset = (**p).LoggerNameOffset as usize;
+            if offset == 0 || offset + 2 > entry_size {
+                continue;
+            }
+            let wide_ptr = base.add(offset) as *const u16;
+            let mut len = 0usize;
+            while len < NAME_CHARS && *wide_ptr.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(wide_ptr, len))
+        };
+        if !is_orphaned_session(&name, crate::tier2a::session_profile::token_owner_is_live) {
+            continue;
+        }
+        let name_w = wide(&name);
+        let mut buf = properties_buffer(&name_w);
+        // SAFETY: `buf`は`properties_buffer`が組んだ正しい形で、名前はNUL終端。
+        let rc = unsafe {
+            ControlTraceW(
+                CONTROLTRACE_HANDLE::default(),
+                PCWSTR(name_w.as_ptr()),
+                buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+                EVENT_TRACE_CONTROL_STOP,
+            )
+        };
+        if rc == ERROR_SUCCESS {
+            stopped += 1;
+        }
+    }
+    stopped
+}
+
+#[cfg(not(windows))]
+pub fn stop_orphaned_fs_sessions() -> usize {
+    0
+}
+
 #[allow(non_snake_case)]
 fn PWSTR_from(name_w: &[u16]) -> windows::core::PWSTR {
     windows::core::PWSTR(name_w.as_ptr() as *mut u16)
@@ -1332,5 +1468,71 @@ mod tests {
         );
         // 1970年より前（あり得ないが、負のオーバーフローで巨大な値にしない）
         assert_eq!(filetime_to_unix_ms(0), 0);
+    }
+}
+
+#[cfg(test)]
+mod orphan_sweep_tests {
+    use super::{is_orphaned_session, orphan_candidate_token, FS_SESSION_PREFIX};
+
+    fn live_session_name(token: &str) -> String {
+        format!(
+            "{FS_SESSION_PREFIX}{}",
+            crate::tier2a::session_profile::profile_name_for(token)
+        )
+    }
+
+    /// **[BUG-117] 許可側。** 所有者の死んだ収集器セッションは回収の対象になる。
+    ///
+    /// 撤収は`stop()`と`Drop`の2経路しかなく、**どちらも`TerminateProcess`では走らない**。
+    /// 起動側にあった`ERROR_ALREADY_EXISTS`の回収分岐は、セッション名が起動のたびに
+    /// 変わる（`{pid}-{unix_secs}`）ので**残留セッションの名前とは一致しない**——
+    /// 効くのは同一プロセス内だけだった。
+    #[test]
+    fn a_session_whose_owner_is_gone_is_collected() {
+        let name = live_session_name("4321-1700000000");
+        assert_eq!(orphan_candidate_token(&name), Some("4321-1700000000"));
+        assert!(is_orphaned_session(&name, |_| false));
+    }
+
+    /// **[BUG-117] 禁止側（対）。** 所有者が生きているセッションは止めない。
+    ///
+    /// **この対が無いと「接頭辞が合えば全部止める」でも許可側が通る**——
+    /// それは走行中の別セッションの収集器を殺す（`B-35`）。
+    #[test]
+    fn a_session_whose_owner_is_alive_is_left_alone() {
+        let name = live_session_name("4321-1700000000");
+        assert!(!is_orphaned_session(&name, |_| true));
+    }
+
+    /// **所有者を判定できない名前は止めない**（fail-closed）。
+    ///
+    /// スパイクとテストは`harness-policy-learn-<任意>`という名前を張る
+    /// （`harness-policy-learn-access-matrix`等）。接頭辞だけで判断すると、
+    /// **並行して走っている測定のセッションを止めてしまう。**
+    #[test]
+    fn a_session_we_cannot_attribute_is_never_stopped() {
+        for name in [
+            "harness-policy-learn-access-matrix",
+            "harness-policy-learn-diag-load",
+            "harness-policy-learn-",
+            // 接頭辞が違うものは論外（他製品のセッション）
+            "Eventlog-Security",
+            "harness-something-else",
+        ] {
+            assert_eq!(orphan_candidate_token(name), None, "{name}");
+            assert!(!is_orphaned_session(name, |_| false), "{name}");
+        }
+    }
+
+    /// 接頭辞の綴りは1箇所が持つ（張る側と回収する側が同じ値を見る）。
+    #[test]
+    fn the_prefix_matches_what_the_collector_actually_starts() {
+        let started = format!(
+            "harness-policy-learn-{}",
+            crate::tier2a::session_profile::profile_name_for("1-2")
+        );
+        assert!(started.starts_with(FS_SESSION_PREFIX));
+        assert_eq!(orphan_candidate_token(&started), Some("1-2"));
     }
 }
