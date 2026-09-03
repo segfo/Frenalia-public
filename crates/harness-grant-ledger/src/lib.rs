@@ -43,6 +43,11 @@
 //! `T::default()`を返す。台帳の不在で起動を止めない（`harness-config`の設定読み込みと
 //! 同じ方針）。書込の失敗も無視する。
 //!
+//! **ただし「パースできない」だけは、`T::default()`へ倒れる前に`.json.bak`を読み直す**
+//! （2026-09-03）。書込はその場上書きなので、途中で死ぬと本体は壊れる一方で控えは無事であり、
+//! そこで空の台帳を返すと**その台帳の全エントリが一斉に回収名を失う**。詳細は
+//! [`Ledger::load_unlocked`]。
+//!
 //! [`with_named_lock`]も、名前付きミューテックスを**作れなかった**ときはロック無しで
 //! クロージャを走らせる。**「作れなかった」だけがfail-openの対象である**——前の持ち主が
 //! 解放せずに死んだ状態（`WAIT_ABANDONED`）は所有権がこちらへ移っているので、
@@ -291,12 +296,48 @@ impl<T: Serialize + DeserializeOwned + Default> Ledger<T> {
     /// ロックを取らずに読む。[`Ledger::update`]の内側のように、既にロックを保持している
     /// 文脈からのみ使う（同じスレッドで名前付きmutexを再取得しても手放しが1回になり
     /// 対応が崩れるため）。
+    ///
+    /// # 本体が壊れていたら`.json.bak`から読み直す
+    ///
+    /// [`write_ledger_file`]は`std::fs::write`による**その場上書き**である（一時ファイルへ
+    /// 書いて差し替える形ではない）。書込の途中でプロセスが消えると、残るのは**途中まで書かれた
+    /// JSON**で、`serde_json`はそれをパースできない。そのまま`T::default()`へ倒れると、
+    /// **その台帳の全エントリが一斉に無名になる**——1件が失われるのではなく、実マシンに残った
+    /// 全部のACEが回収名を失う（[BUG-112](../../../docs/bugs/BUG-112.md)が
+    /// 1件について言っていたことの、台帳丸ごと版である）。
+    ///
+    /// 控えは既に毎回書いている。**足りないのは読む側だけだった**——付与と撤収、記録と回収と
+    /// 同じで、対の片側しか無い機構は片側の場面で無言に失敗する（`B-01`）。
+    ///
+    /// 読み直すのは「**ファイルは在るがパースできない**」ときだけである。ファイルが無いのは
+    /// 「まだ1件も記録していない」という正常な状態なので、控えを探しに行かない。
     pub fn load_unlocked(&self) -> T {
         let Some(path) = &self.path else {
             return T::default();
         };
-        match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return T::default();
+        };
+        if let Ok(value) = serde_json::from_str(&text) {
+            return value;
+        }
+        let backup_path = path.with_extension("json.bak");
+        let Ok(backup) = std::fs::read_to_string(&backup_path) else {
+            return T::default();
+        };
+        match serde_json::from_str(&backup) {
+            Ok(value) => {
+                // **黙って復旧しない。** 直前の書込が途中で切れたという事実そのものが、
+                // 次に調べる人の手がかりである（控えは1世代しか無いので、この状態で
+                // 書き込むと控えが「壊れた本体」で上書きされる）。
+                eprintln!(
+                    "harness: {} could not be parsed; recovered from {} (the previous write was \
+                     cut short). Entries written after that backup are lost.",
+                    path.display(),
+                    backup_path.display()
+                );
+                value
+            }
             Err(_) => T::default(),
         }
     }
@@ -535,6 +576,9 @@ mod tests {
         assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
     }
 
+    /// 控えが**そもそも無い**ときの話（1度も書いていない台帳が壊れている等）。控えは在るが
+    /// それも読めない場合は`a_ledger_with_no_usable_backup_still_falls_open_to_default`、
+    /// 控えが使える場合は`a_ledger_cut_short_mid_write_is_recovered_from_its_backup`が見る。
     #[test]
     fn corrupt_or_missing_json_loads_as_the_default_ledger() {
         let tmp = tempfile::tempdir().unwrap();
@@ -888,5 +932,52 @@ mod tests {
              Treating WAIT_ABANDONED as a failure leaves the ownership stranded on the \
              waiting thread, and nobody else can ever take it (BUG-146)"
         );
+    }
+
+    /// **書込が途中で切れた台帳は、控えから読み直す。**
+    ///
+    /// 壊れた状態を一文で: **1件の記録が失われるのではなく、その台帳に載っていた全部の
+    /// エントリが一斉に回収名を失う。** 書込は`std::fs::write`によるその場上書きなので、
+    /// 強制終了・電源断はこの状態を作り得る（[BUG-112](../../../docs/bugs/BUG-112.md)が
+    /// 1件について言っていたことの台帳丸ごと版）。
+    #[test]
+    fn a_ledger_cut_short_mid_write_is_recovered_from_its_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ledger_at(dir.path());
+        ledger.update(|l| l.entries.push("C:/kept".to_string()));
+        // 2回目の書込で`.bak`が「1回目の内容」になる（`write_ledger_file`は上書き前に複製する）。
+        ledger.update(|l| l.entries.push("C:/kept-too".to_string()));
+        let before = ledger.load();
+        assert_eq!(before.entries.len(), 2, "precondition: both entries landed");
+
+        // 途中で切れた書込を再現する（本体だけを壊し、控えは触らない）。
+        let path = dir.path().join("ledger.json");
+        set_file_readonly(&path, false);
+        let truncated = {
+            let full = std::fs::read_to_string(&path).unwrap();
+            full[..full.len() / 2].to_string()
+        };
+        std::fs::write(&path, &truncated).unwrap();
+        assert!(
+            serde_json::from_str::<TestLedger>(&truncated).is_err(),
+            "the probe must actually be unparseable, otherwise this test proves nothing"
+        );
+
+        assert_eq!(
+            ledger.load().entries,
+            vec!["C:/kept".to_string()],
+            "a torn write must fall back to the backup instead of reporting an empty ledger"
+        );
+    }
+
+    /// 対の反対側: **控えも読めないなら、従来どおり空へ倒れる**（fail-open）。
+    /// ここが片側だけだと、「壊れていたら常に何かを返す」実装でも上のテストは緑になる。
+    #[test]
+    fn a_ledger_with_no_usable_backup_still_falls_open_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ledger_at(dir.path());
+        std::fs::write(dir.path().join("ledger.json"), "{ this is not json").unwrap();
+        std::fs::write(dir.path().join("ledger.json.bak"), "nor is this").unwrap();
+        assert_eq!(ledger.load(), TestLedger::default());
     }
 }

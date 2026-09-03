@@ -19,13 +19,13 @@ mod workspace;
 // `win_appcontainer::preflight`（あちら側）であり、**付与した側が記録する**形にしないと
 // 台帳に載らない付与＝孤立ACEが生まれるため（同モジュールのdoc参照）。ここに残るのは
 // `harness fs`が提供する操作——一覧・撤収・prune——だけである。
-use harness_sandbox::tier2a::workspace_ledger::WorkspaceMode;
 pub(crate) use harness_sandbox::tier2a::fs_passthrough_ledger::*;
+use harness_sandbox::tier2a::workspace_ledger::WorkspaceMode;
 
 // `main`（binターゲット）の起動パイプラインから直接呼ぶものだけ`pub`で再エクスポートする
 // （`harness fs`の公開面を移設前と変えない）。
 pub use harness_sandbox::tier2a::fs_passthrough_ledger::{
-    record_fs_passthrough_denied, record_fs_passthrough_grant,
+    record_fs_passthrough_denials, record_fs_passthrough_grants, FsPassthroughGrantRecord,
 };
 pub(crate) use prepare::fs_prepare_workspace;
 pub(crate) use prune::fs_prune;
@@ -105,6 +105,16 @@ pub enum FsAction {
 /// `harness fs`サブコマンドのディスパッチ（プロバイダ資格情報・workspace sandboxのいずれも
 /// 必要としない、起動パイプラインとは独立の経路）。
 pub fn run_fs_subcommand(action: FsAction) -> ExitCode {
+    // [BUG-112 / D-89] traverse台帳の未確定の予定を、**この経路の入口で1回だけ**畳む。
+    // ここに置くのは、traverse台帳を読む`harness fs`側の口が4つあるためである
+    // （`list`・`prune`・`revoke-traverse`・`revoke-traverse-all`）。それぞれに書くと、
+    // 次に足された5つ目が黙って素通りする（`B-06`）。もう一方の配線点は`preflight`で、
+    // 合わせて読み手6経路すべてがどちらかを通る。
+    //
+    // 畳まないと、UACを断った回に積まれた「実体の無い予定」が`list`では付与済みと同じ行で
+    // 表示され、`revoke-traverse-all`では件数に数えられる。
+    #[cfg(windows)]
+    harness_sandbox::tier2a::traverse_ledger::settle_pending_traverse_grants();
     match action {
         FsAction::List => {
             let ledger = load_fs_ledger();

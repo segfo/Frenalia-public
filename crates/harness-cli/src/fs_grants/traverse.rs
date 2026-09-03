@@ -67,9 +67,8 @@ pub(crate) fn fs_grant_traverse(target: &Path) -> ExitCode {
             sid.as_psid(),
         );
         if !preview.is_empty() && preview.iter().all(|node| node.already_sufficient) {
-            for node in &preview {
-                harness_sandbox::tier2a::traverse_ledger::record_traverse_grant(&node.path);
-            }
+            let paths: Vec<PathBuf> = preview.iter().map(|node| node.path.clone()).collect();
+            harness_sandbox::tier2a::traverse_ledger::record_traverse_grants(&paths);
             println!(
                 "grant-traverse: all {} ancestor node(s) already have \
                  FILE_TRAVERSE|FILE_READ_ATTRIBUTES -- skipped the privilege-separation helper \
@@ -87,15 +86,32 @@ pub(crate) fn fs_grant_traverse(target: &Path) -> ExitCode {
     if harness_sandbox::tier2a::privhelper::is_elevated() {
         return fs_grant_traverse_direct(target);
     }
-    match harness_sandbox::tier2a::privhelper::run_privileged(
-        &harness_sandbox::tier2a::privhelper::PrivilegedRequest::GrantTraverse {
-            target: target.to_path_buf(),
+    let target_paths = vec![target.to_path_buf()];
+    let (_, outcome) = harness_sandbox::tier2a::traverse_ledger::with_recorded_traverse_grants(
+        &target_paths,
+        || match harness_sandbox::tier2a::privhelper::run_privileged(
+            &harness_sandbox::tier2a::privhelper::PrivilegedRequest::GrantTraverse {
+                target: target.to_path_buf(),
+            },
+        ) {
+            Ok(granted) => (granted.clone(), Ok(granted)),
+            Err(harness_sandbox::tier2a::privhelper::PrivHelperError::PartialGrantChain {
+                granted,
+                reason,
+            }) => (
+                granted.clone(),
+                Err(
+                    harness_sandbox::tier2a::privhelper::PrivHelperError::PartialGrantChain {
+                        granted,
+                        reason,
+                    },
+                ),
+            ),
+            Err(e) => (Vec::new(), Err(e)),
         },
-    ) {
+    );
+    match outcome {
         Ok(granted) => {
-            for node in &granted {
-                harness_sandbox::tier2a::traverse_ledger::record_traverse_grant(node);
-            }
             println!(
                 "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES via privilege-separation helper \
                  (UAC, one-time) on the full ancestor chain up to the drive root: {} (see \
@@ -116,9 +132,6 @@ pub(crate) fn fs_grant_traverse(target: &Path) -> ExitCode {
             granted,
             reason,
         }) => {
-            for node in &granted {
-                harness_sandbox::tier2a::traverse_ledger::record_traverse_grant(node);
-            }
             eprintln!(
                 "grant-traverse chain partially failed for {}: {reason}. {} node(s) that DID \
                  succeed before the failure were still recorded in the traverse ledger (no \
@@ -152,11 +165,11 @@ pub(crate) fn fs_grant_traverse_direct(target: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (granted, result) =
-        harness_sandbox::tier2a::win_appcontainer::grant_traverse_chain(target, sid.as_psid());
-    for node in &granted {
-        harness_sandbox::tier2a::traverse_ledger::record_traverse_grant(node);
-    }
+    let target_paths = vec![target.to_path_buf()];
+    let (granted, result) = harness_sandbox::tier2a::traverse_ledger::with_recorded_traverse_grants(
+        &target_paths,
+        || harness_sandbox::tier2a::win_appcontainer::grant_traverse_chain(target, sid.as_psid()),
+    );
     match result {
         Ok(()) => {
             println!(
@@ -278,7 +291,11 @@ pub(crate) fn fs_revoke_traverse_all() -> ExitCode {
         println!("(no traverse grants recorded)");
         return ExitCode::SUCCESS;
     }
-    let paths: Vec<PathBuf> = ledger.entries.iter().map(|e| PathBuf::from(&e.path)).collect();
+    let paths: Vec<PathBuf> = ledger
+        .entries
+        .iter()
+        .map(|e| PathBuf::from(&e.path))
+        .collect();
 
     // 昇格済みならヘルパーを起こす理由が無い（UAC 0回）。単発版と同じ関数を通す。
     if harness_sandbox::tier2a::privhelper::is_elevated() {

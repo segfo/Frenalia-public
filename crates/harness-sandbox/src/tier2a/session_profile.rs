@@ -727,6 +727,42 @@ pub(crate) fn add_dead_session_with_capability_for_test(path: &Path, capability_
     });
 }
 
+/// **台帳エントリを1件、名指しで落とす。テスト専用の後始末の口。**
+///
+/// [`add_dead_session_with_capability_for_test`]が足したエントリを、測定の終わりに戻すために要る。
+///
+/// # なぜGCで片付けないのか（実測で分かった）
+///
+/// `gc_dead_sessions`は**capabilityを剥がし終えたエントリしか落とさない**（`reclaim_targets_in`。
+/// 剥がせていないのに名前を捨てると、SIDの導出元が失われて二度と剥がせなくなるため）。
+/// 剥がす相手が実在しない測定——たとえば「名簿が死んだセッションを含まないこと」だけを見る回
+/// ——では`revoke_capability_grant`が名前の検証で`Err`を返し、**エントリが台帳に残る**。
+/// 実際に残した（2026-09-03のM1測定の1回目）。
+///
+/// **測定が足したものは、測定が落とす。** GCの判断に後始末を任せると、
+/// GCの正しい慎重さがそのまま残骸になる。
+///
+/// **製品から呼ばないこと。** ACEが残っているのに記録だけ落とすのは、
+/// 撤収不能なACEを作る操作そのものである（BUG-101）。
+#[cfg(all(windows, test))]
+pub(crate) fn forget_session_entry_for_test(token: &str) {
+    ledger().update(|l| l.sessions.retain(|e| e.token != token));
+}
+
+/// 台帳に載っているセッションのトークン一覧（**後始末が効いたことを読み返すための口**）。
+///
+/// [`live_profile_names`]では代用できない——落としたいのは**エントリ**で、あちらが返すのは
+/// 「生きている」と判定された名前だけである。死んだエントリが残っていても空に見える。
+#[cfg(all(windows, test))]
+pub(crate) fn ledger_session_tokens_for_test() -> Vec<String> {
+    ledger()
+        .load()
+        .sessions
+        .into_iter()
+        .map(|e| e.token)
+        .collect()
+}
+
 /// このセッションが撤収責任を負っているパス（[`record_granted_path`]で積んだもの）。
 ///
 /// [`end_session`]が実際に剥がす集合そのもので、「付与したのに記録し忘れていないか」を
@@ -977,8 +1013,7 @@ fn reclaim_targets_in(io: &ReclaimIo<'_>, targets: &[ReclaimTarget]) -> ReclaimO
         // 積む——ここを別枠にすると、剥がせていないのにプロファイル名と台帳エントリを
         // 捨てる経路ができ、名前を失って二度と剥がせなくなる（BUG-101と同型）。
         for grant in &target.granted_capabilities {
-            let leftovers =
-                (io.revoke_capability)(Path::new(&grant.path), &grant.capability_name);
+            let leftovers = (io.revoke_capability)(Path::new(&grant.path), &grant.capability_name);
             if leftovers.is_empty() {
                 // **剥がし終えたものだけ**、名前の記録を捨てる候補にする（`B-01`）。
                 forgettable_capabilities.push(grant.capability_name.as_str());
@@ -1441,10 +1476,7 @@ mod tests {
     #[test]
     fn another_sessions_mcp_profile_still_blocks() {
         let other = crate::tier2a::mcp_profile::mcp_profile_name_for("999-1", "company-docs");
-        assert_eq!(
-            without_session(vec![other.clone()], "1234-5"),
-            vec![other]
-        );
+        assert_eq!(without_session(vec![other.clone()], "1234-5"), vec![other]);
     }
 
     /// 生存しているものが1つも無ければ空（判定材料が無いときに撤収を止めない、
@@ -1977,12 +2009,17 @@ mod tests {
         let io = FakeIo::new().with_sessions(&["t"]);
         let outcome = io.reclaim(&[known_target_with_capabilities(
             "t",
-            &[(r"C:\cow\sess-1", "harnessDecl00112233445566778899aabbccddeeff")],
+            &[(
+                r"C:\cow\sess-1",
+                "harnessDecl00112233445566778899aabbccddeeff",
+            )],
         )]);
 
         assert_eq!(
             io.capability_forgets(),
-            vec![vec!["harnessDecl00112233445566778899aabbccddeeff".to_string()]],
+            vec![vec![
+                "harnessDecl00112233445566778899aabbccddeeff".to_string()
+            ]],
             "剥がし終えた名前は捨てられていなければならない"
         );
         assert_eq!(outcome.deleted_profiles, 1);
@@ -2005,7 +2042,10 @@ mod tests {
         .with_sessions(&["t"]);
         let outcome = io.reclaim(&[known_target_with_capabilities(
             "t",
-            &[(r"C:\cow\sess-1", "harnessDecl00112233445566778899aabbccddeeff")],
+            &[(
+                r"C:\cow\sess-1",
+                "harnessDecl00112233445566778899aabbccddeeff",
+            )],
         )]);
 
         assert!(
@@ -2033,7 +2073,10 @@ mod tests {
             granted_paths: vec![r"C:\ws".to_string()],
             ..known_target_with_capabilities(
                 "t",
-                &[(r"C:\cow\sess-1", "harnessDecl00112233445566778899aabbccddeeff")],
+                &[(
+                    r"C:\cow\sess-1",
+                    "harnessDecl00112233445566778899aabbccddeeff",
+                )],
             )
         }]);
 
@@ -2057,7 +2100,10 @@ mod tests {
         let ledger = SessionLedger {
             sessions: vec![entry_with_capabilities(
                 "dead",
-                &[(r"C:\cow\sess-1", "harnessDecl00112233445566778899aabbccddeeff")],
+                &[(
+                    r"C:\cow\sess-1",
+                    "harnessDecl00112233445566778899aabbccddeeff",
+                )],
             )],
         };
         let targets = plan_reclaim(&ledger, &[], &liveness(&HashSet::new()));
@@ -2085,7 +2131,10 @@ mod tests {
         ledger.save(&SessionLedger {
             sessions: vec![entry_with_capabilities(
                 "t",
-                &[(r"C:\cow\sess-1", "harnessDecl00112233445566778899aabbccddeeff")],
+                &[(
+                    r"C:\cow\sess-1",
+                    "harnessDecl00112233445566778899aabbccddeeff",
+                )],
             )],
         });
 

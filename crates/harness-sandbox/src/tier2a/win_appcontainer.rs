@@ -731,6 +731,12 @@ mod lazy_ux_latency_tests;
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;
 
+/// **Redirector DLLの孤立ACEを既存の掃除が回収するかの測定**（残課題#23のM1、BUG-112の仮説H1）。
+/// 掃除の本体・名簿・射程を、許可側と禁止側を対にして測る。モジュールdocに
+/// 「測っていないこと」（強制終了は再現していない・`preflight`を通していない）がある。
+#[cfg(all(windows, test))]
+mod redirector_dll_sweep_tests;
+
 #[cfg(all(windows, test))]
 mod force_grant_gate_tests;
 

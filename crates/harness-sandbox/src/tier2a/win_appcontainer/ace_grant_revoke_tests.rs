@@ -15,9 +15,18 @@
 //! （`docs/phases/foundation/M12-shell-isolation-tiers.md`追記3）。
 
 use super::test_support::{
-    protect_dacl_preserve_inherited, spawn_in_workspace, SubstDrive, TestDirGuard,
+    protect_dacl_preserve_inherited, scopeguard, spawn_in_workspace, SubstDrive, TestDirGuard,
 };
 use super::*;
+use harness_grant_ledger::Ledger;
+use std::os::windows::io::AsRawHandle;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Threading::TerminateProcess;
 
 const PROBE_COMMAND: &str = "\
     Set-Location -LiteralPath $env:HARNESS_PROBE_DIR; \
@@ -26,6 +35,137 @@ const PROBE_COMMAND: &str = "\
     New-Item -ItemType File -Path 'probe.txt' -Force | Out-String -Width 200 | Write-Output; \
     Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | Out-String -Width 200 | Write-Output; \
     Get-Volume -ErrorAction SilentlyContinue | Out-String -Width 200 | Write-Output";
+
+/// 同一テストバイナリを子として起動するための、完全修飾されたlibtest名。
+/// `--exact`を使い、フィルタ誤記で0件成功することを防ぐ。
+const DESTRUCTIVE_TRAVERSE_TEST: &str =
+    "tier2a::win_appcontainer::ace_grant_revoke_tests::destructive_traverse_write_ahead_recovers_both_crash_windows";
+const TRAVERSE_E2E_POINT: &str = "HARNESS_TEST_TRAVERSE_E2E_POINT";
+const TRAVERSE_E2E_TARGET: &str = "HARNESS_TEST_TRAVERSE_E2E_TARGET";
+const TRAVERSE_E2E_LEDGER: &str = "HARNESS_TEST_TRAVERSE_E2E_LEDGER";
+const TRAVERSE_E2E_MARKER: &str = "HARNESS_TEST_TRAVERSE_E2E_MARKER";
+const TRAVERSE_E2E_LEDGER_LOCK: &str = "HARNESS_TEST_TRAVERSE_E2E_LEDGER_LOCK";
+
+#[derive(Clone, Copy, Debug)]
+enum TraverseCrashPoint {
+    AfterPending,
+    AfterGrant,
+}
+
+impl TraverseCrashPoint {
+    fn name(self) -> &'static str {
+        match self {
+            Self::AfterPending => "after-pending",
+            Self::AfterGrant => "after-grant",
+        }
+    }
+
+    fn expects_ace(self) -> bool {
+        matches!(self, Self::AfterGrant)
+    }
+
+    fn from_env() -> Option<Self> {
+        match std::env::var(TRAVERSE_E2E_POINT).ok()?.as_str() {
+            "after-pending" => Some(Self::AfterPending),
+            "after-grant" => Some(Self::AfterGrant),
+            other => panic!("unknown {TRAVERSE_E2E_POINT}: {other}"),
+        }
+    }
+}
+
+fn traverse_chain(target: &Path) -> Vec<std::path::PathBuf> {
+    let mut chain: Vec<_> = target.ancestors().map(Path::to_path_buf).collect();
+    chain.reverse();
+    chain
+}
+
+fn e2e_env_path(name: &str) -> std::path::PathBuf {
+    std::env::var_os(name)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| panic!("missing {name} in destructive traverse child"))
+}
+
+fn e2e_env_text(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("missing {name} in destructive traverse child"))
+}
+
+fn park_after_e2e_marker(marker: &Path, point: TraverseCrashPoint) {
+    std::fs::write(marker, point.name()).expect("write destructive traverse checkpoint marker");
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// 親から起動された子プロセス側。両方の停止点は
+/// `with_recorded_traverse_grants_for_test`の製品トランザクション内部に置く。
+fn destructive_traverse_child(point: TraverseCrashPoint) {
+    let target = e2e_env_path(TRAVERSE_E2E_TARGET);
+    let ledger_path = e2e_env_path(TRAVERSE_E2E_LEDGER);
+    let marker = e2e_env_path(TRAVERSE_E2E_MARKER);
+    let ledger_lock = e2e_env_text(TRAVERSE_E2E_LEDGER_LOCK);
+    let ledger = Ledger::<crate::tier2a::traverse_ledger::TraverseLedger>::at_path(
+        ledger_path,
+        Some(&ledger_lock),
+    );
+    let sid = traverse_capability_sid().expect("derive traverse capability SID in child");
+
+    let (_, result) = crate::tier2a::traverse_ledger::with_recorded_traverse_grants_for_test(
+        &ledger,
+        std::slice::from_ref(&target),
+        || {
+            if matches!(point, TraverseCrashPoint::AfterPending) {
+                park_after_e2e_marker(&marker, point);
+            }
+        },
+        || grant_traverse_chain(&target, sid.as_psid()),
+        || {
+            if matches!(point, TraverseCrashPoint::AfterGrant) {
+                park_after_e2e_marker(&marker, point);
+            }
+        },
+    );
+    panic!(
+        "destructive traverse child unexpectedly returned from {} checkpoint: {result:?}",
+        point.name()
+    );
+}
+
+fn wait_for_e2e_marker(marker: &Path, point: TraverseCrashPoint) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "child did not reach {} checkpoint within 15 seconds ({})",
+            point.name(),
+            marker.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `cargo test` のテスト本体は `target/<profile>/deps/` に置かれる一方、補助バイナリは
+/// `target/<profile>/` に置かれる。リリース成果物の探索ではなく、同じ Cargo target/profile
+/// の二つの正規配置だけを見る。前者へ明示コピーした古い開発手順も後方互換で受ける。
+fn companion_test_binary(file_name: &str) -> std::path::PathBuf {
+    let current = std::env::current_exe().expect("current test executable");
+    let deps_dir = current.parent().expect("test executable has a parent");
+    let adjacent = deps_dir.join(file_name);
+    if adjacent.exists() {
+        return adjacent;
+    }
+    let cargo_profile_dir = deps_dir
+        .parent()
+        .expect("test executable is under target/<profile>/deps");
+    let sibling = cargo_profile_dir.join(file_name);
+    assert!(
+        sibling.exists(),
+        "{file_name} was not found next to the test binary ({}) or in Cargo's profile directory ({}); \
+         build it before running this E2E",
+        adjacent.display(),
+        sibling.display()
+    );
+    sibling
+}
 
 /// `dir`をcwdにしてPROBE_COMMANDを実行し、stdout/stderr全文とexit codeをそのまま
 /// 標準出力へ焼き付ける（procmon/AccessChkでの裏取りと突き合わせられるよう、テスト自身は
@@ -185,36 +325,8 @@ fn preflight_keeps_harness_control_dir_unwritable_to_appcontainer_child() {
 #[test]
 #[ignore]
 fn appcontainer_child_cannot_reach_uac_elevation_broker() {
-    let helper_path = {
-        let current = std::env::current_exe().expect("current_exe");
-        let dir = current
-            .parent()
-            .expect("current_exe has parent")
-            .to_path_buf();
-        let p = dir.join("harness-privhelper.exe");
-        assert!(
-            p.exists(),
-            "harness-privhelper.exe not found at {} (build with `cargo build -p \
-             harness-privhelper` and ensure it sits next to the test binary)",
-            p.display()
-        );
-        p
-    };
-    let probe_exe = {
-        let current = std::env::current_exe().expect("current_exe");
-        let dir = current
-            .parent()
-            .expect("current_exe has parent")
-            .to_path_buf();
-        let p = dir.join("tier2a_proc_probe.exe");
-        assert!(
-            p.exists(),
-            "tier2a_proc_probe.exe not found at {} (build with `cargo build -p \
-             tier2a-proc-probe`)",
-            p.display()
-        );
-        p
-    };
+    let helper_path = companion_test_binary("harness-privhelper.exe");
+    let probe_exe = companion_test_binary("tier2a_proc_probe.exe");
 
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     // D-37: `preflight`が付与する先＝このセッションのSIDで子を起動する（上と同じ理由）。
@@ -599,6 +711,213 @@ fn traverse_chain_grants_every_ancestor_on_a_test_owned_drive_root() {
         });
     }
     // `drive`のDropが`subst /D`と実体の削除を行う（panic時も同じ）。
+}
+
+/// [残課題#23] 事前記録と実ACE付与のどちらの直後にプロセスが死んでも、次回のtraverse
+/// transactionが実DACLを根拠に台帳を回復できることを、実際の強制終了で検証する。
+///
+/// これは通常の単体テストでは再現不能な破壊的E2Eである。子プロセスは同一のlibtestバイナリで、
+/// `pending`保存直後または実ACE付与直後のマーカーを出したまま停止する。親はそのマーカーを
+/// 確認してから`TerminateProcess`し、同じ隔離台帳を使う次回transactionで回復させる。
+/// 待ち時間で窓を推測しないため、マシンごとのDACL書込時間のばらつきは合否に影響しない。
+///
+/// 台帳とmutexは`Ledger::at_path`で一時領域へ注入し、ACEは`subst`のテスト所有ドライブに
+/// 限る。従って通常の`%APPDATA%`台帳・`C:\`・既存traverse ACEを変更しない。
+#[test]
+#[ignore = "destructive E2E: kills a child process after a real DACL mutation; run via dev-elevated-run ace-grant-revoke"]
+fn destructive_traverse_write_ahead_recovers_both_crash_windows() {
+    if let Some(point) = TraverseCrashPoint::from_env() {
+        destructive_traverse_child(point);
+        return;
+    }
+
+    let sid = traverse_capability_sid().expect("derive traverse capability SID");
+    let drive = SubstDrive::create()
+        .expect("destructive traverse E2E requires one free drive letter for subst");
+    let run_dir = tempfile::tempdir().expect("create isolated destructive traverse E2E directory");
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        harness_grant_ledger::now_unix_secs()
+    );
+
+    for point in [
+        TraverseCrashPoint::AfterPending,
+        TraverseCrashPoint::AfterGrant,
+    ] {
+        let target = drive.root().join(point.name()).join("a").join("b");
+        std::fs::create_dir_all(&target).expect("create nested target on substituted drive");
+        let chain = traverse_chain(&target);
+        for node in &chain {
+            assert_eq!(
+                sid_ace_mask(node, sid.as_psid()).expect("read precondition DACL"),
+                None,
+                "precondition failed: {} already has the traverse capability ACE",
+                node.display()
+            );
+        }
+
+        // 親が途中でpanicしても、待機中の子を殺し、テスト所有ACEを剥がしてから`subst`を外す。
+        // 通常台帳には一切載せないのでD-48の保護対象にはならない。
+        let cleanup_chain = chain.clone();
+        let cleanup_sid = sid.as_psid();
+        let _ace_cleanup = scopeguard(move || {
+            for node in cleanup_chain.iter().rev() {
+                let _ = revoke_ace(node, cleanup_sid);
+            }
+        });
+
+        let ledger_path = run_dir.path().join(format!("{}-ledger.json", point.name()));
+        let marker = run_dir.path().join(format!("{}-ready", point.name()));
+        let ledger_lock = format!(
+            "Local\\harness-traverse-e2e-ledger-{nonce}-{}",
+            point.name()
+        );
+        let ledger = Ledger::<crate::tier2a::traverse_ledger::TraverseLedger>::at_path(
+            ledger_path.clone(),
+            Some(&ledger_lock),
+        );
+
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .args(["--ignored", "--exact", DESTRUCTIVE_TRAVERSE_TEST])
+        .env(TRAVERSE_E2E_POINT, point.name())
+        .env(TRAVERSE_E2E_TARGET, &target)
+        .env(TRAVERSE_E2E_LEDGER, &ledger_path)
+        .env(TRAVERSE_E2E_MARKER, &marker)
+        .env(TRAVERSE_E2E_LEDGER_LOCK, &ledger_lock)
+        .spawn()
+        .expect("start destructive traverse child");
+        let child_handle = HANDLE(child.as_raw_handle());
+        let child_is_gone = Arc::new(AtomicBool::new(false));
+        let kill_on_failure = Arc::clone(&child_is_gone);
+        let _child_cleanup = scopeguard(move || {
+            if !kill_on_failure.load(Ordering::SeqCst) {
+                unsafe {
+                    let _ = TerminateProcess(child_handle, 0xE23);
+                }
+            }
+        });
+
+        wait_for_e2e_marker(&marker, point);
+        let before_kill = ledger.load();
+        assert_eq!(
+            before_kill.entries.len(),
+            chain.len(),
+            "{}: write-ahead record must name every recovery node before the child is killed",
+            point.name()
+        );
+        for entry in &before_kill.entries {
+            assert!(
+                entry.pending,
+                "{}: child must still be between write-ahead and confirmation ({})",
+                point.name(),
+                entry.path
+            );
+        }
+        for node in &chain {
+            assert_eq!(
+                sid_ace_mask(node, sid.as_psid())
+                    .expect("read DACL before child kill")
+                    .is_some(),
+                point.expects_ace(),
+                "{}: actual ACE state at {} does not match its checkpoint",
+                point.name(),
+                node.display()
+            );
+        }
+
+        // **許可側**（`B-35`）: 子はまだ生きている。ここで畳み直しを撃っても、飛行中の予定は
+        // 1件も消えてはならない。これが壊れると、並走した`harness.exe`が相手の回収名を奪い、
+        // その相手がACEを書いた直後に落ちれば剥がせないACEが残る（＝BUG-112そのもの）。
+        // **禁止側（下の`TerminateProcess`後）だけを見ると、「常に全部消す」実装でも緑になる。**
+        let in_flight =
+            crate::tier2a::traverse_ledger::settle_pending_traverse_grants_for_test(&ledger);
+        assert_eq!(
+            in_flight.kept_in_flight,
+            chain.len(),
+            "{}: every plan of a still-running owner must be left alone; got {in_flight:?}",
+            point.name()
+        );
+        assert_eq!(
+            ledger.load().entries.len(),
+            chain.len(),
+            "{}: settling while the owner is alive must not drop a single recovery name",
+            point.name()
+        );
+
+        unsafe {
+            TerminateProcess(child_handle, 0xE23)
+                .expect("terminate child at deterministic checkpoint");
+        }
+        let status = child.wait().expect("wait for terminated child");
+        child_is_gone.store(true, Ordering::SeqCst);
+        assert!(
+            !status.success(),
+            "child must be killed at {} rather than exit normally",
+            point.name()
+        );
+
+        // 次の起動に相当する畳み直し。**製品が起動時に呼ぶのと同じ関数**へ隔離台帳を渡す
+        // （以前はここで「ターゲット空のトランザクション」を撃っていたが、それは製品が
+        // 作らない形だった——付与が起きない起動では、そのトランザクション自体に入らない）。
+        let recovery =
+            crate::tier2a::traverse_ledger::settle_pending_traverse_grants_for_test(&ledger);
+        assert_eq!(
+            recovery.kept_in_flight,
+            0,
+            "{}: the owner is gone, so nothing may be treated as in flight; got {recovery:?}",
+            point.name()
+        );
+        let recovered = ledger.load();
+        if point.expects_ace() {
+            assert_eq!(
+                recovered.entries.len(),
+                chain.len(),
+                "{}: real ACEs must become confirmed recovery entries",
+                point.name()
+            );
+            for node in &chain {
+                let entry = recovered
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        harness_grant_ledger::same_ledger_path(&entry.path, &node.to_string_lossy())
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{}: recovered ledger omits actual ACE node {}",
+                            point.name(),
+                            node.display()
+                        )
+                    });
+                assert!(
+                    !entry.pending,
+                    "{}: a real ACE must not remain pending ({})",
+                    point.name(),
+                    entry.path
+                );
+            }
+        } else {
+            assert!(
+                recovered.entries.is_empty(),
+                "{}: a never-written ACE must leave no stale recovery entry: {recovered:?}",
+                point.name()
+            );
+        }
+        for node in &chain {
+            assert_eq!(
+                sid_ace_mask(node, sid.as_psid()).expect("read recovered DACL"),
+                point
+                    .expects_ace()
+                    .then_some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0),
+                "{}: recovery must preserve the actual DACL state at {}",
+                point.name(),
+                node.display()
+            );
+        }
+    }
 }
 
 /// `grant_traverse_chain`が多階層のネストしたディレクトリ全てへ個別にACEを付与し、
@@ -991,22 +1310,20 @@ fn one_unrevokable_node_does_not_stop_the_rest_of_the_tree() {
 
     // 実際に踏んだパス（`checked`とは別に数える。上のdoc(2)）。
     let visited = std::cell::RefCell::new(Vec::new());
-    let report = revoke_tree_for_tests(
-        root,
-        true,
-        &|_, _| {},
-        &|path: &Path| -> Result<bool, AppContainerError> {
-            visited.borrow_mut().push(path.to_path_buf());
-            if path == stuck {
-                // 実機で出るのと同じ形（ロケール依存の文面をそのまま運ぶ、B-33）。
-                return Err(AppContainerError::AclRevoke {
-                    path: path.to_path_buf(),
-                    reason: "アクセスが拒否されました。 (0x80070005)".to_string(),
-                });
-            }
-            Ok(true)
-        },
-    )
+    let report = revoke_tree_for_tests(root, true, &|_, _| {}, &|path: &Path| -> Result<
+        bool,
+        AppContainerError,
+    > {
+        visited.borrow_mut().push(path.to_path_buf());
+        if path == stuck {
+            // 実機で出るのと同じ形（ロケール依存の文面をそのまま運ぶ、B-33）。
+            return Err(AppContainerError::AclRevoke {
+                path: path.to_path_buf(),
+                reason: "アクセスが拒否されました。 (0x80070005)".to_string(),
+            });
+        }
+        Ok(true)
+    })
     .expect("a single blocked node must not turn the whole walk into an Err");
 
     let visited = visited.into_inner();
@@ -1963,11 +2280,17 @@ fn protect_harness_control_dir_survives_a_propagating_write_from_the_parent() {
     let sessions_dir = harness_dir.join("sessions");
     std::fs::create_dir_all(&sessions_dir).expect("create .harness/sessions");
     let settings = harness_dir.join("settings.json");
-    std::fs::write(&settings, "{}
-").expect("seed settings.json");
+    std::fs::write(
+        &settings, "{}
+",
+    )
+    .expect("seed settings.json");
     let session = sessions_dir.join("session-1.jsonl");
-    std::fs::write(&session, "{}
-").expect("seed the session file");
+    std::fs::write(
+        &session, "{}
+",
+    )
+    .expect("seed the session file");
     let nodes = [
         harness_dir.as_path(),
         sessions_dir.as_path(),
@@ -2728,6 +3051,9 @@ fn preflight_grants_each_declaration_in_its_declared_scope() {
 
     let workspace_guard = TestDirGuard::create("d63-ws");
     let workspace = workspace_guard.path().to_path_buf();
+    let canonical_workspace = workspace
+        .canonicalize()
+        .expect("the test-owned workspace must canonicalize");
 
     // オブジェクト単体で許可するディレクトリ（書込可＝`rw1`プローブが走る）。
     let object_guard = TestDirGuard::create("d63-object");
@@ -2822,7 +3148,14 @@ fn preflight_grants_each_declaration_in_its_declared_scope() {
     }
 
     // --- 4. 実DACLが宣言どおりの形になっている ---
-    let object_ace = sid_explicit_ace(&object_root, sid.as_psid())
+    // D-54/§22.3: `preflight`はsession package SIDではなく、宣言ごとの capability SIDへ
+    // ACEを付ける。ここで旧SIDを読むと、付与が正しくても「ACEが無い」と誤診断してしまう。
+    let object_cap =
+        fs_allow_capability_sid(&canonical_workspace, &object_root, FsAccess::ReadWrite)
+            .expect("derive the object declaration capability SID");
+    let tree_cap = fs_allow_capability_sid(&canonical_workspace, &tree_root, FsAccess::ReadWrite)
+        .expect("derive the recursive declaration capability SID");
+    let object_ace = sid_explicit_ace(&object_root, object_cap.as_psid())
         .expect("read back the object-scoped ACE")
         .expect("the object-scoped root must carry an ACE");
     assert!(
@@ -2831,13 +3164,13 @@ fn preflight_grants_each_declaration_in_its_declared_scope() {
         object_ace.inherit
     );
     assert!(
-        sid_effective_ace_mask(&object_root.join("child.txt"), sid.as_psid())
+        sid_effective_ace_mask(&object_root.join("child.txt"), object_cap.as_psid())
             .expect("probe the child")
             .is_none(),
         "a plain declaration must not reach the files inside the directory"
     );
 
-    let tree_ace = sid_explicit_ace(&tree_root, sid.as_psid())
+    let tree_ace = sid_explicit_ace(&tree_root, tree_cap.as_psid())
         .expect("read back the recursive ACE")
         .expect("the recursive root must carry an ACE");
     assert!(
@@ -2846,7 +3179,7 @@ fn preflight_grants_each_declaration_in_its_declared_scope() {
         tree_ace.inherit
     );
     assert!(
-        sid_effective_ace_mask(&tree_root.join("child.txt"), sid.as_psid())
+        sid_effective_ace_mask(&tree_root.join("child.txt"), tree_cap.as_psid())
             .expect("probe the child")
             .is_some(),
         "a `/**` declaration must reach the files inside the directory"
@@ -2864,6 +3197,17 @@ fn preflight_grants_each_declaration_in_its_declared_scope() {
     // workspace capability宛で、そちらは`None`では渡せない）。
     let traverse_sid = traverse_capability_sid().expect("traverse capability SID");
     grant_ace_recursive(&workspace, sid.as_psid()).expect("grant workspace to the session SID");
+    // 対照群は「同じ object scope で、プローブの操作だけを旧`rw`へ戻す」必要がある。
+    // `preflight`が置いたのは宣言 capability SID宛なので、package SIDで起こすこの補助プローブへ
+    // 同じ非継承ACEを明示的に置く。これが無いと create の前に拒否され、旧モードが残す一時
+    // ファイルを検証できない。
+    grant_ace_scoped(
+        &object_root,
+        sid.as_psid(),
+        FsAccess::ReadWrite,
+        GrantScope::Object,
+    )
+    .expect("grant the object-scoped control ACE to the probe package SID");
     let old_mode_probe = FsPassthrough {
         path: object_root.clone(),
         access: FsAccess::ReadWrite,
@@ -3081,12 +3425,19 @@ fn the_named_door_strips_a_declaration_capability_ace() {
     std::fs::create_dir_all(&ws).expect("create the workspace");
     std::fs::create_dir_all(&target).expect("create the declared path");
     let ws = ws.canonicalize().expect("canonicalize the workspace");
-    let target = target.canonicalize().expect("canonicalize the declared path");
+    let target = target
+        .canonicalize()
+        .expect("canonicalize the declared path");
 
     let cap = fs_allow_capability_sid(&ws, &target, FsAccess::Read)
         .expect("mint the declaration capability");
-    grant_ace_scoped(&target, cap.as_psid(), FsAccess::Read, GrantScope::Recursive)
-        .expect("grant the declaration ACE");
+    grant_ace_scoped(
+        &target,
+        cap.as_psid(),
+        FsAccess::Read,
+        GrantScope::Recursive,
+    )
+    .expect("grant the declaration ACE");
     assert!(
         matches!(sid_ace_mask(&target, cap.as_psid()), Ok(Some(_))),
         "the test is not measuring anything unless the ACE is actually on the path first"
@@ -3148,14 +3499,23 @@ fn scoping_the_named_door_to_one_workspace_leaves_the_other_workspaces_subject_a
         "two workspaces declaring the same path must not share a subject"
     );
     for cap in [&cap_a, &cap_b] {
-        grant_ace_scoped(&target, cap.as_psid(), FsAccess::Read, GrantScope::Recursive)
-            .expect("grant both declaration ACEs");
+        grant_ace_scoped(
+            &target,
+            cap.as_psid(),
+            FsAccess::Read,
+            GrantScope::Recursive,
+        )
+        .expect("grant both declaration ACEs");
     }
 
     // 禁止側: ws-aで絞ったのだから、ws-bの宛先SIDには触らない。
-    let scoped = revoke_declaration_capabilities(&target, Some(&ws_a), &|_, _| {})
-        .expect("scoped revoke");
-    assert_eq!(scoped.targeted.len(), 1, "scoped revoke targets one subject: {scoped:?}");
+    let scoped =
+        revoke_declaration_capabilities(&target, Some(&ws_a), &|_, _| {}).expect("scoped revoke");
+    assert_eq!(
+        scoped.targeted.len(),
+        1,
+        "scoped revoke targets one subject: {scoped:?}"
+    );
     assert!(
         matches!(sid_ace_mask(&target, cap_a.as_psid()), Ok(None)),
         "ws-a's subject must be gone"
@@ -3211,8 +3571,13 @@ fn the_named_door_refuses_to_take_access_from_a_live_workspace() {
     let cap_idle =
         fs_allow_capability_sid(&ws_idle, &target, FsAccess::Read).expect("mint ws-idle's subject");
     for cap in [&cap_live, &cap_idle] {
-        grant_ace_scoped(&target, cap.as_psid(), FsAccess::Read, GrantScope::Recursive)
-            .expect("grant both declaration ACEs");
+        grant_ace_scoped(
+            &target,
+            cap.as_psid(),
+            FsAccess::Read,
+            GrantScope::Recursive,
+        )
+        .expect("grant both declaration ACEs");
     }
 
     // **生存判定は既存のゲートをそのまま使う**（新しい仕組みを作らない）。この名前付き

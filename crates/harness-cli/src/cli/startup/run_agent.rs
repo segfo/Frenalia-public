@@ -295,35 +295,46 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         // `None`＝「package SID宛には付与していない」が事実そのものである。
         // 宣言capabilityの撤収は`workspace-capability-ledger.json`の`declaration`欄を
         // 索引にした名前の付いた扉が担う。**移行前の記録はこの欄が積み増しなので消えない。**
+        // **台帳の更新は1回にまとめる**（`record_fs_passthrough_grants`のdoc、残課題#37と同型）。
+        // `Ledger::update`は1回ごとに全文の読取＋`.bak`への全文コピー＋全文書込を行うので、
+        // 1件ずつ呼ぶとエントリ数の2乗でI/Oが増える。実測でこの台帳は66KBあり、宣言が数百件
+        // ある構成では数百MBのI/Oになる。**人へ見せる行は1件ずつのまま**——まとめるのは
+        // 台帳の書込だけで、どの穴が開いたかの説明は落とさない。
+        let records: Vec<crate::fs_grants::FsPassthroughGrantRecord> = shell_tier
+            .granted_passthrough
+            .iter()
+            .map(|granted| {
+                let path = &granted.path;
+                // このエントリが`--force-system-acl`対象だったか（元のfs_passthroughから引く）。
+                // forcedなら撤収時も`SeRestorePrivilege`が要るため台帳へ記録しておく。
+                let declared = fs_passthrough.iter().find(|fp| &fp.path == path);
+                let path_str = path.to_string_lossy().into_owned();
+                crate::fs_grants::FsPassthroughGrantRecord {
+                    path: path.clone(),
+                    writable: granted.writable,
+                    forced: declared.map(|fp| fp.forced).unwrap_or(false),
+                    settings_workspace: settings_fs_paths
+                        .contains(&path_str)
+                        .then(|| workspace_root.to_string_lossy().into_owned()),
+                    granted_sid: None,
+                    // [D-63] どの範囲で開いたかを記録する（`forced`とまったく同じ引き方）。
+                    // 既定を`Recursive`にするのは、引けなかった＝D-63以前と同じ意味に倒すため。
+                    scope: declared
+                        .map(|fp| fp.scope)
+                        .unwrap_or(harness_policy::GrantScope::Recursive),
+                }
+            })
+            .collect();
+        crate::fs_grants::record_fs_passthrough_grants(&records);
+
         for granted in &shell_tier.granted_passthrough {
             let path = &granted.path;
             let writable = granted.writable;
-            // このエントリが`--force-system-acl`対象だったか（元のfs_passthroughから引く）。
-            // forcedなら撤収時も`SeRestorePrivilege`が要るため台帳へ記録しておく。
             let forced = fs_passthrough
                 .iter()
                 .find(|fp| &fp.path == path)
                 .map(|fp| fp.forced)
                 .unwrap_or(false);
-            // [D-63] どの範囲で開いたかを記録する（`forced`とまったく同じ引き方）。
-            // 既定を`Recursive`にするのは、引けなかった＝D-63以前と同じ意味に倒すため。
-            let scope = fs_passthrough
-                .iter()
-                .find(|fp| &fp.path == path)
-                .map(|fp| fp.scope)
-                .unwrap_or(harness_policy::GrantScope::Recursive);
-            let path_str = path.to_string_lossy().into_owned();
-            let settings_workspace = settings_fs_paths
-                .contains(&path_str)
-                .then(|| workspace_root.to_string_lossy().into_owned());
-            crate::fs_grants::record_fs_passthrough_grant(
-                path,
-                writable,
-                forced,
-                settings_workspace.as_deref(),
-                None,
-                scope,
-            );
             if forced {
                 eprintln!(
                     "WARNING: forced system ACL grant (--force-system-acl, SeRestorePrivilege): {} \
@@ -351,9 +362,8 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 );
             }
         }
-        for (path, access, reason) in &shell_tier.denied_passthrough {
-            crate::fs_grants::record_fs_passthrough_denied(path, access, reason);
-        }
+        // 拒否側も同じ理由で1回にまとめる（付与側だけ直すと、同じ形が片側に残る——`B-02`）。
+        crate::fs_grants::record_fs_passthrough_denials(&shell_tier.denied_passthrough);
     }
     for warning in &shell_tier.passthrough_warnings {
         eprintln!("warning: {warning}");

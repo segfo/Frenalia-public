@@ -395,6 +395,12 @@ pub fn preflight_with_privhelper_launcher(
     timing.mark("begin_session + ensure_profile");
     sweep_stale_redirector_dll_aces();
     timing.mark("sweep_stale_redirector_dll_aces");
+    // 同じ「起動のたびに前回の残骸を畳む」枠。前回がACEを書いた直後に落ちていれば確定へ、
+    // 書く前に落ちていれば予定を落とす（BUG-112・D-89）。**付与の経路に置くだけでは足りない**
+    // ——祖先traverseが既に足りている起動は下の付与へ進まないので、そこに置いた畳み直しは
+    // 一度も走らない。`pending`が0件なら台帳を1回読んで戻るだけである。
+    crate::tier2a::traverse_ledger::settle_pending_traverse_grants();
+    timing.mark("settle_pending_traverse_grants");
     // 祖先traverseの付与先（D-37）。package SIDと違いセッションを跨いで永続する。
     let traverse_sid = traverse_capability_sid()?;
 
@@ -726,10 +732,7 @@ pub fn preflight_with_privhelper_launcher(
     // `LoadLibraryW`が対象プロセスでNULLを返し、**注入が必ず失敗する**——受入E2Eが実際に
     // これで落ちた（`B-06`: 前提を変えたら、それを実現している経路を全部数える）。
     let injects_redirector = matches!(write_mode, WorkspaceWriteMode::Cow { .. })
-        || matches!(
-            super::lazy_grant::lane(),
-            grant_job::PreparationLane::Lazy
-        );
+        || matches!(super::lazy_grant::lane(), grant_job::PreparationLane::Lazy);
     if injects_redirector {
         for dll in redirector_dll_paths() {
             match grant_ace_inheritable_access(&dll, sid.as_psid(), FsAccess::ReadExec) {
@@ -959,7 +962,9 @@ pub fn preflight_with_privhelper_launcher(
         // パス2では、これは実際に起こり得る組み合わせである。
         let required = required_passthrough_mask(fp.access);
         let required_inherit = required_inherit_flags(fp.scope);
-        let existing_ace = sid_explicit_ace(&fp.path, entry_cap.as_psid()).ok().flatten();
+        let existing_ace = sid_explicit_ace(&fp.path, entry_cap.as_psid())
+            .ok()
+            .flatten();
         let already_sufficient =
             matches!(existing_ace, Some(ace) if ace.satisfies(required, required_inherit));
         // [D-63] 宣言はオブジェクト単体なのに、実DACLには継承ACEが載っている
@@ -995,11 +1000,7 @@ pub fn preflight_with_privhelper_launcher(
                 let reason =
                     format!("could not render the capability SID for this declaration: {e}");
                 warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
-                denied_passthrough.push((
-                    fp.path.clone(),
-                    fp.access.label().to_string(),
-                    reason,
-                ));
+                denied_passthrough.push((fp.path.clone(), fp.access.label().to_string(), reason));
                 continue;
             }
         };
@@ -1067,22 +1068,22 @@ pub fn preflight_with_privhelper_launcher(
                 // [§22.3] **導出済みの宛先SIDを一緒に持たせる。** 昇格から戻った後に
                 // 引き直さないための唯一の手段で、引き直しをやめたことで
                 // 「宛先SIDの無い開いた穴」が構造的に作れなくなる。
-                let subject =
-                    match unsafe { crate::win_common::OwnedSid::copy_from(entry_cap.as_psid()) } {
-                        Ok(copy) => copy,
-                        Err(e) => {
-                            let reason = format!(
-                                "could not copy the capability SID for this declaration: {e}"
-                            );
-                            warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
-                            denied_passthrough.push((
-                                fp.path.clone(),
-                                fp.access.label().to_string(),
-                                reason,
-                            ));
-                            continue;
-                        }
-                    };
+                let subject = match unsafe {
+                    crate::win_common::OwnedSid::copy_from(entry_cap.as_psid())
+                } {
+                    Ok(copy) => copy,
+                    Err(e) => {
+                        let reason =
+                            format!("could not copy the capability SID for this declaration: {e}");
+                        warnings.push(format!("fs-allow {} : {reason}", fp.path.display()));
+                        denied_passthrough.push((
+                            fp.path.clone(),
+                            fp.access.label().to_string(),
+                            reason,
+                        ));
+                        continue;
+                    }
+                };
                 // [残課題#37] 秘密はここでは引かない（このループを抜けてから1回でまとめて引く）。
                 pending_elevation.push((fp.clone(), subject, entry_cap_text.clone()));
             }
@@ -1139,19 +1140,29 @@ pub fn preflight_with_privhelper_launcher(
                 // 本体が既に管理者（§5.3、grant-traverseの`*_direct`と同じ考え方）:
                 // ヘルパーを経由せずその場で直接付与する。traverseが不足していれば先に解消する
                 // （workspace_root/diff_layer_dirへ到達できなければfs-allow付与自体が無意味なため）。
-                for target in &missing_traverse {
-                    let (granted_nodes, result) =
-                        grant_traverse_chain(target, traverse_sid.as_psid());
-                    for node in &granted_nodes {
-                        crate::tier2a::traverse_ledger::record_traverse_grant(node);
-                    }
-                    if let Err(e) = result {
-                        return Err(AppContainerError::Preflight(format!(
-                            "failed to grant traverse ACE (admin, direct) for {}: {e}",
-                            target.display()
-                        )));
-                    }
-                }
+                let (_, direct_traverse) =
+                    crate::tier2a::traverse_ledger::with_recorded_traverse_grants(
+                        &missing_traverse,
+                        || {
+                            let mut granted = Vec::new();
+                            for target in &missing_traverse {
+                                let (nodes, result) =
+                                    grant_traverse_chain(target, traverse_sid.as_psid());
+                                granted.extend(nodes);
+                                if let Err(e) = result {
+                                    return (
+                                        granted,
+                                        Err(AppContainerError::Preflight(format!(
+                                        "failed to grant traverse ACE (admin, direct) for {}: {e}",
+                                        target.display()
+                                    ))),
+                                    );
+                                }
+                            }
+                            (granted, Ok(()))
+                        },
+                    );
+                direct_traverse?;
                 let mut granted = Vec::new();
                 let mut failures = Vec::new();
                 for entry in &needs_elevation {
@@ -1203,13 +1214,27 @@ pub fn preflight_with_privhelper_launcher(
                         entry.subject.as_psid(),
                     );
                 }
-                match crate::tier2a::privhelper::run_privileged_workspace_access(
-                    missing_traverse.clone(),
-                    needs_elevation.iter().map(|e| e.grant.clone()).collect(),
-                    wfp_chain_pipe.clone(),
-                    privhelper_launcher,
-                ) {
-                    Ok((traverse_granted, traverse_error, granted, failures, netfilterd_chain)) => {
+                let (_, elevated_outcome) =
+                    crate::tier2a::traverse_ledger::with_recorded_traverse_grants(
+                        &missing_traverse,
+                        || match crate::tier2a::privhelper::run_privileged_workspace_access(
+                            missing_traverse.clone(),
+                            needs_elevation.iter().map(|e| e.grant.clone()).collect(),
+                            wfp_chain_pipe.clone(),
+                            privhelper_launcher,
+                        ) {
+                            Ok(outcome) => (outcome.0.clone(), Ok(outcome)),
+                            Err(e) => (Vec::new(), Err(e)),
+                        },
+                    );
+                match elevated_outcome {
+                    Ok((
+                        _traverse_granted,
+                        traverse_error,
+                        granted,
+                        failures,
+                        netfilterd_chain,
+                    )) => {
                         // **「依頼した」ではなく「実際に起きた」を返す**（BUG-093）。
                         // 以前はここで`wfp_chain_pipe.is_some()`を立てていたため、privhelperの
                         // 連鎖起動が黙って失敗しても呼び出し元はシナリオAを選び、
@@ -1227,9 +1252,6 @@ pub fn preflight_with_privhelper_launcher(
                             // どちらも「自前で起こす」（シナリオB）で正しい。
                             None => false,
                         };
-                        for node in &traverse_granted {
-                            crate::tier2a::traverse_ledger::record_traverse_grant(node);
-                        }
                         if let Some(reason) = traverse_error {
                             if !missing_traverse.is_empty() {
                                 return Err(AppContainerError::Preflight(format!(
@@ -1616,7 +1638,10 @@ pub fn preflight_with_privhelper_launcher(
 /// [`crate::session_scope::persistent_acl_gate`]が持つ純関数で、ここはボリュームの採取と
 /// エラー型への変換だけを行う。**採取と判定を分ける**のは、判定側を`cargo test`で
 /// 検算できるようにするためである。
-pub(crate) fn require_persistent_acl_volume(what: &str, path: &Path) -> Result<(), AppContainerError> {
+pub(crate) fn require_persistent_acl_volume(
+    what: &str,
+    path: &Path,
+) -> Result<(), AppContainerError> {
     let mount = crate::win_common::volume_mount_point_of(path);
     let probe = mount
         .as_deref()
@@ -1659,11 +1684,13 @@ mod acl_volume_gate_tests {
     fn a_diff_layer_that_does_not_exist_yet_still_passes_the_acl_volume_gate() {
         let tmp = tempfile::tempdir().expect("一時ディレクトリを作れること");
         let not_yet = tmp.path().join("cow").join("session-does-not-exist-yet");
-        assert!(!not_yet.exists(), "前提が崩れている: このパスは存在しないはず");
-
-        require_persistent_acl_volume("copy-on-write diff area", &not_yet).expect(
-            "まだ作られていない差分層でも、同じボリューム上の実在する祖先で性質を測れる",
+        assert!(
+            !not_yet.exists(),
+            "前提が崩れている: このパスは存在しないはず"
         );
+
+        require_persistent_acl_volume("copy-on-write diff area", &not_yet)
+            .expect("まだ作られていない差分層でも、同じボリューム上の実在する祖先で性質を測れる");
     }
 }
 

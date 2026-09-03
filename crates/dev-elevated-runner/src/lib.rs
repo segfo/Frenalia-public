@@ -176,6 +176,26 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "win_appcontainer::ace_grant_revoke_tests",
         ],
     ),
+    // [BUG-112] Redirector DLLの掃除が孤立ACEを本当に回収するかの測定。**昇格は要らない**が、
+    // 実物のセッション台帳（`appcontainer-session-ledger.json`）へエントリを開いて自分で
+    // 落とす測定を含むため、`cargo test`の並列実行から切り離してここから直列で回す
+    // （並列だと、隣のテストが付けたACEの回収名を奪い得る）。フィルタはモジュール名と
+    // 一致していなければならない——一致しないと0件マッチで黙って緑になる（BUG-056）。
+    // `check_tests_actually_ran`がその検問である。
+    (
+        "redirector-dll-sweep",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "win_appcontainer::redirector_dll_sweep_tests",
+        ],
+    ),
     // M15.7 A-3: ETW実現性スパイク（判定ゲート）。`Microsoft-Windows-Kernel-File`の
     // リアルタイムセッションでACL拒否が観測できるかを実機で確かめる。
     // M15.7: Global Object Access Auditing を AppContainer の package SID へ絞れるかの実測。
