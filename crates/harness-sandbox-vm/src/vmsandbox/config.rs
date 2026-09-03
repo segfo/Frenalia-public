@@ -44,8 +44,6 @@ pub struct VmSandboxConfig {
     pub guest_ip: IpAddr,
     pub incus_port: u16,
     pub vm_work_dir: PathBuf,
-    /// ウォームスタート（`--tier3-warm`、フェーズB）を使うか。既定はfalse（毎回コールドブート）。
-    pub warm: bool,
     pub workspace_share_mode: WorkspaceShareMode,
     /// 内部vSwitchのホスト側ゲートウェイIP（`WorkspaceShareMode::Cifs`でSMB共有先として
     /// ゲストから参照する。`plans/vm-spike/RESULTS.md`§3.6で確立した固定値、モジュールdoc
@@ -63,7 +61,6 @@ impl Default for VmSandboxConfig {
             guest_ip: "172.20.100.10".parse().unwrap(),
             incus_port: 8443,
             vm_work_dir: PathBuf::from(r"C:\ProgramData\harness\vm-sessions"),
-            warm: false,
             // 実機E2E確認（CIFS共有作成・双方向マウント・disk device bind-mount・
             // ファイアウォールスコープ限定、いずれも実機で確認済み）を経て、`Cifs`を既定に
             // 昇格した。`copy_in_workspace`（旧方式）は`target/`等の大規模ワークスペースで

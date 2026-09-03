@@ -98,8 +98,17 @@ impl VmHost {
         let mut guard = self.state.lock().unwrap();
         match &mut *guard {
             VmHostState::Running {
-                incus, refcount, ..
+                incus,
+                refcount,
+                warm: running_warm,
+                ..
             } => {
+                // [BUG-125] 常駐VMが既に走っているときの`warm`は**空振りする**。
+                // 黙ると、速かった理由（相乗り）と、次回の起動方式（checkpointが残るか）を
+                // 取り違える。`release`が失敗を`eprintln!`で出しているのと同じ形にしてある。
+                if let Some(notice) = warm_mismatch_notice(warm, *running_warm) {
+                    eprintln!("{notice}");
+                }
                 *refcount += 1;
                 Ok(incus.clone())
             }
@@ -460,6 +469,49 @@ fn discard_warm_template(config: &VmSandboxConfig) {
     let _ = crate::vmsandbox::teardown_vm(RESIDENT_VM_NAME, &diff_vhdx);
 }
 
+/// 要求したウォーム/コールドと、既に走っている常駐VMの実態が食い違うときの説明
+/// （[BUG-125](../../../docs/bugs/BUG-125.md) ずれ2）。一致していれば`None`。
+///
+/// # なぜ要るか
+///
+/// `--sandbox tier3-warm`の空振り条件は**2つある**のに、helpは1つしか挙げていなかった。
+/// 1つ目は「Tier3自体が無効なら無視される」で、2つ目が本件——**常駐VMが既に走っていると、
+/// あとから来たセッションの`warm`要求は何の効果も持たない。**
+///
+/// **表示は空振りを打ち消す方向へ働いていた。** 進捗表示はCLIフラグの値をそのまま
+/// `warm_hint`として受け取り、経過秒からフェーズ名を合成するだけなので、
+/// **コールド起動済みのVMへ相乗りしていてもウォーム用の表が選ばれる。**
+/// 速かった理由が「相乗り」なのか「checkpointからの復元」なのかを、画面からは区別できない。
+///
+/// 逆向きも同じ1行から起きる。コールドを期待したセッションがウォーム復元済みのVMへ
+/// 相乗りすると、参照カウントが0になった時点でVMは撤収されず`WarmIdle`へparkされる
+/// （[`VmHost::release`]）。「毎回コールドブート」という期待も黙って外れる。
+///
+/// # 一致しているときは何も言わない
+///
+/// 毎回注意書きを出すと、**本当に食い違ったときの1行が埋もれる。**
+fn warm_mismatch_notice(requested_warm: bool, running_warm: bool) -> Option<String> {
+    if requested_warm == running_warm {
+        return None;
+    }
+    if requested_warm {
+        Some(
+            "note: --sandbox tier3-warm had no effect this time. A resident VM is already \
+             running (cold-booted by an earlier session), so this session just attaches to it. \
+             It will be torn down completely when the last session ends -- no checkpoint is \
+             kept, so the next --sandbox tier3-warm still provisions from the template."
+                .to_string(),
+        )
+    } else {
+        Some(
+            "note: a resident VM restored from a warm checkpoint is already running, so this \
+             session attaches to it instead of cold-booting. When the last session ends the VM \
+             is parked (checkpoint kept), not torn down."
+                .to_string(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +546,43 @@ mod tests {
         let config = VmSandboxConfig::default();
         host.release(&config);
         assert!(!host.is_running());
+    }
+
+    /// **[BUG-125] ずれ2・禁止側。** 常駐VMが既に走っているとき、`--sandbox tier3-warm`は
+    /// **何の効果も持たない**。速いのは「先に起こしたセッションへ相乗りするから」であって、
+    /// ウォームスタートの機構が働いたからではない。**黙らせない。**
+    ///
+    /// 逆向きも同じ1行から起きる——コールドを期待したセッションがウォーム復元済みのVMへ
+    /// 相乗りすると、参照カウントが0になった時点でVMは撤収されず`WarmIdle`へparkされる。
+    /// 「毎回コールドブート」という期待も黙って外れる。
+    #[test]
+    fn a_warm_request_that_lands_on_a_running_vm_is_announced() {
+        let notice = warm_mismatch_notice(true, false).expect("要求と実態が食い違えば説明を返す");
+        assert!(notice.contains("tier3-warm"), "{notice}");
+        assert!(
+            notice.contains("already running"),
+            "なぜ効かないのか（既に走っているVMへ相乗りしている）が分かること: {notice}"
+        );
+        assert!(
+            notice.contains("no checkpoint"),
+            "次回も同じでないこと（checkpointが残らない）まで言うこと: {notice}"
+        );
+
+        let reverse = warm_mismatch_notice(false, true).expect("逆向きも説明を返す");
+        assert!(
+            reverse.contains("parked"),
+            "コールド期待が外れる帰結（撤収されずparkされる）が分かること: {reverse}"
+        );
+    }
+
+    /// **[BUG-125] ずれ2・許可側（対）。** 要求と実態が一致していれば何も言わない。
+    ///
+    /// **この対が無いと「常に何か言う」実装でも禁止側が通る**（`B-35`）。
+    /// 毎回注意書きが出ると、本当に食い違ったときの1行が埋もれる。
+    #[test]
+    fn a_matching_warm_request_says_nothing() {
+        assert!(warm_mismatch_notice(true, true).is_none());
+        assert!(warm_mismatch_notice(false, false).is_none());
     }
 
     #[test]
