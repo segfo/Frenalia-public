@@ -44,6 +44,19 @@ pub(crate) fn run_tier2a_subcommand(action: Tier2aAction) -> ExitCode {
                 Some(summary) => println!("{summary}"),
                 None => println!("(no dead Tier2a sessions to reclaim)"),
             }
+            // CoW差分層に残った引退した身分のACEも同じ口で剥がす（残課題#35）。**セッション台帳を
+            // 索引にする上の回収では届かない**——差分層は台帳の`granted_paths`に載らないので、
+            // 見に行く経路がここにしか無い。自動側の配線は`harness-cli`の起動経路にある
+            // （`sweep_stale_aces_on_cow_diff_areas`。なぜ`preflight`ではないかは同関数のdoc）。
+            let sweep = harness_sandbox::tier2a::win_appcontainer::sweep_diff_layer_aces();
+            match sweep.summary() {
+                Some(summary) => println!("{summary}"),
+                None => println!(
+                    "(examined {} copy-on-write diff area(s), skipped {} still running; no stale \
+                     AppContainer ACEs found)",
+                    sweep.examined, sweep.skipped_live
+                ),
+            }
             ExitCode::SUCCESS
         }
         Tier2aAction::List => {

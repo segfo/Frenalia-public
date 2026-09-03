@@ -601,6 +601,10 @@ pub fn derive_profile_sid(name: &str) -> Result<OwnedContainerSid, AppContainerE
 /// 名前は、それだけでは`set_dacl_propagating`との違いが分からないため。
 mod acl_dacl_write;
 mod acl_grant;
+/// CoW差分層に残った**引退した身分**宛のACEを剥がす巡回。`revoke_subjects`（誰を剥がすか）
+/// とは別の軸——こちらが持つのは**どのパスを見に行くか**である。残課題#35で実機に1か月
+/// 残った10件は、判定が届かなかったのではなく、判定器を差分層へ向ける経路が無かった。
+mod cow_layer_sweep;
 /// 初回の救済walkを背景で回すジョブ（D-54）。**globではなく名前空間として公開する**
 /// ——`start`/`progress`/`wait_until_done`という短い名前は、それだけでは何のジョブか
 /// 分からないため（`grant_job::wait_until_done()`と書けば分かる）。
@@ -639,6 +643,7 @@ mod workspace_aces;
 mod workspace_prepare;
 
 pub use acl_grant::*;
+pub use cow_layer_sweep::*;
 pub use launch::*;
 pub use mcp_preflight::*;
 pub use native_path_policy::*;
@@ -736,6 +741,11 @@ mod ace_grant_revoke_tests;
 /// 「測っていないこと」（強制終了は再現していない・`preflight`を通していない）がある。
 #[cfg(all(windows, test))]
 mod redirector_dll_sweep_tests;
+
+/// **CoW差分層の巡回が、剥がすべきものだけを剥がすことの回帰**（残課題#35）。
+/// 引退した身分は剥がれ、well-knownのSIDと走行中の差分層は触られない、を対で測る。
+#[cfg(all(windows, test))]
+mod cow_layer_sweep_tests;
 
 #[cfg(all(windows, test))]
 mod force_grant_gate_tests;

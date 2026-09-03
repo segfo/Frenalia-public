@@ -469,6 +469,7 @@ pub(super) fn stage_prepare_sandbox(
     };
 
     sweep_empty_cow_diff_areas();
+    sweep_stale_aces_on_cow_diff_areas();
 
     Ok(SandboxPrepared {
         cli,
@@ -603,6 +604,33 @@ fn sweep_empty_cow_diff_areas() {
 
 #[cfg(not(windows))]
 fn sweep_empty_cow_diff_areas() {}
+
+/// 差分層に残った**引退した身分**宛のACEを剥がす（残課題#35）。
+///
+/// # なぜ`preflight`ではなくここなのか
+///
+/// [`sweep_empty_cow_diff_areas`]とまったく同じ理由である——`preflight`は`harness-sandbox`の
+/// 実機テストが直接呼ぶ関数で、それらは差分層の置き場（`%LOCALAPPDATA%`）に実物を使う。
+/// 差分層を触る掃除をあちらへ置くと、`cargo test --workspace`が開発機のユーザーデータへ
+/// 手を入れる（前例では70件消えた）。**削除ではなくACEの撤収でも、実マシンを変えることに
+/// 変わりはない。**
+///
+/// # なぜ`cow gc`（削除）と分けるのか
+///
+/// 削除の対象は「何も残っていない」差分層だけで、**中身があるものは残す**のが正しい。
+/// 一方ACEは、中身が残っているかどうかと関係なく引退した身分のものを剥がしてよい。
+/// 実際、実機に1か月残った10件は**全て中身があった**ので、削除の掃除には永久に拾われなかった。
+#[cfg(windows)]
+fn sweep_stale_aces_on_cow_diff_areas() {
+    let outcome = harness_sandbox::tier2a::win_appcontainer::sweep_diff_layer_aces();
+    // **何も起きなければ黙る**（起動のたびに「0件」を出さない）。起きたことは必ず出す。
+    if let Some(summary) = outcome.summary() {
+        eprintln!("note: {summary}");
+    }
+}
+
+#[cfg(not(windows))]
+fn sweep_stale_aces_on_cow_diff_areas() {}
 
 /// 回収の方針を**ユーザ層の設定だけ**から作る（D-82）。
 ///
