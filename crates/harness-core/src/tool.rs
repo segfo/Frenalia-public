@@ -319,6 +319,18 @@ pub struct GrantedPassthrough {
     /// 起動側は導出をやり直さない（やり直すと、CoW降格時に別のSIDを作って
     /// 「ACEは正しく付いているのに子から一切読めない」という最も原因を追いにくい形になる）。
     pub subject_sid: String,
+    /// このパスのACEを書くのに**実際に`SeRestorePrivilege`を使ったか**
+    /// （[BUG-119](../../../docs/bugs/BUG-119.md)）。
+    ///
+    /// **`--force-system-acl`を指定したか、ではない。** 付与は per-path で最小になっていて、
+    /// 普通に書けたパスでは特権が1度も使われない——それなのに台帳へは
+    /// 「フラグが立っていたか」を写していたので、**指定していない後日の起動でも特権が使われる**
+    /// 状態がユーザグローバル台帳を通して広がっていた。
+    ///
+    /// **撤収側がこの値で`SeRestorePrivilege`を有効化するかを決める。** したがって
+    /// 「使ったのに`false`」は撤収不能を意味する（D-19 不変条件5が禁じた向き）ので、
+    /// 判断に迷ったら`true`へ倒すこと。
+    pub used_restore_privilege: bool,
 }
 
 /// `harness-sandbox::shell_tier::select_tier`の結果。`ToolCtx`が運ぶ「値」であり、

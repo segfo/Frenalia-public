@@ -64,3 +64,43 @@ fn nonexistent_path_is_forbidden_fail_safe() {
         "a non-canonicalizable path must be refused (fail-safe): {reason:?}"
     );
 }
+
+/// **[BUG-119 案C] 撤収も同じゲートを通る。**
+///
+/// D-19 不変条件4は「`SeRestorePrivilege`は全DACLをバイパスするため、書込の直前に
+/// `is_force_grant_forbidden`を必ず通す」と定めている。付与側は3つの入口すべてで通していたが、
+/// **撤収側にだけ無かった**——撤収も特権付きのDACL書換であり、対象パスは台帳から来る。
+#[test]
+fn a_forced_revoke_on_a_forbidden_path_does_not_get_the_privilege() {
+    let bogus = windir().join("this-path-should-not-exist-harness-bug119-test");
+    assert!(
+        !super::forced_revoke_may_use_privilege(&bogus, true),
+        "ゲートが拒否するパスで`SeRestorePrivilege`を有効化している"
+    );
+    // `%SystemRoot%`配下も同じ（ゲートの拒否対象）。
+    assert!(!super::forced_revoke_may_use_privilege(&windir(), true));
+}
+
+/// **[BUG-119 案C] 許可側（対）。** ゲートを通るパスでは従来どおり特権を使う。
+///
+/// **この対が無いと「常に false」でも禁止側が通る**——それは
+/// 「特権で付与したACEを特権無しで剥がそうとして失敗し続ける」形になる（`B-35`）。
+#[test]
+fn a_forced_revoke_on_an_allowed_path_still_gets_the_privilege() {
+    let dir = std::env::temp_dir();
+    if !dir.exists() {
+        return;
+    }
+    assert!(super::forced_revoke_may_use_privilege(&dir, true));
+}
+
+/// **forcedでないエントリは、パスが何であれ特権を要求しない。**
+#[test]
+fn a_non_forced_revoke_never_asks_for_the_privilege() {
+    let dir = std::env::temp_dir();
+    assert!(!super::forced_revoke_may_use_privilege(&dir, false));
+    assert!(!super::forced_revoke_may_use_privilege(
+        Path::new("C:\\"),
+        false
+    ));
+}

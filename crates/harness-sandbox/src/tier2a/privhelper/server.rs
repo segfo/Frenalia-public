@@ -598,7 +598,31 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                         win_appcontainer::revoke_harness_subjects(&path, &[], &|_, _| {});
                     (decl, subjects)
                 };
-                let (decl_outcome, outcome) = if entry.forced {
+                // [BUG-119 案C] **撤収も特権付きのDACL書換である。**
+                // D-19 不変条件4は「`SeRestorePrivilege`は全DACLをバイパスするため、書込の直前に
+                // `is_force_grant_forbidden`を必ず通す」と定めており、付与側は3つの入口すべてで
+                // 通している。**撤収側にだけ無かった**——対象パスは台帳から来るので、
+                // 台帳の`forced`が広がるほどゲートを通らない特権付き書換の対象が増える。
+                //
+                // 通常は素通りする（付与時にゲートを通ったパスは撤収時も通る）。
+                // **拒否したら特権無しで続行する**——ここで撤収そのものをやめると、
+                // 剥がせないエントリが台帳に残り続ける経路が新しくできる（`B-09`の向き）。
+                // 特権無しで剥がせたならそれでよく、剥がせなければ下の`unfinished`が名前で返す。
+                // **判定は`forced_revoke_may_use_privilege`ただ1つが持つ**（CLI側の撤収2入口と
+                // 同じ関数。同じ規則を通る箇所は3箇所のうち3箇所、`B-06`）。
+                // ログは昇格側にしか出せない情報なのでここに残す。
+                let forced_allowed =
+                    win_appcontainer::forced_revoke_may_use_privilege(&path, entry.forced);
+                if entry.forced && !forced_allowed {
+                    if let Some(reason) = win_appcontainer::is_force_grant_forbidden(&path) {
+                        log::line(&format!(
+                            "  path {} : forced revoke deny-gate refused ({reason}); \
+                             continuing without SeRestorePrivilege",
+                            path.display()
+                        ));
+                    }
+                }
+                let (decl_outcome, outcome) = if forced_allowed {
                     // forcedなパス（--force-system-aclで付与したACE）は撤収時も
                     // `SeRestorePrivilege`が要る。
                     win_appcontainer::with_restore_privilege(do_revoke)

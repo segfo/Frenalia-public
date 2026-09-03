@@ -971,11 +971,13 @@ mod tests {
                     path: PathBuf::from(r"C:\tools"),
                     writable: false,
                     subject_sid: "S-1-15-3-1024-1".to_string(),
+                    used_restore_privilege: false,
                 },
                 crate::tool::GrantedPassthrough {
                     path: PathBuf::from(r"D:\data"),
                     writable: true,
                     subject_sid: "S-1-15-3-1024-2".to_string(),
+                    used_restore_privilege: false,
                 },
             ]);
 

@@ -386,6 +386,33 @@ pub(crate) fn path_is_within(a: &Path, base: &Path) -> bool {
 /// 動機となった`...\Start Menu`（`%ProgramData%`配下）や`Program Files`配下の
 /// TrustedInstaller所有フォルダはいずれも上記の外なので許可される。
 /// canonicalizeに失敗するパスは安全側に倒して拒否する。
+/// 撤収で`SeRestorePrivilege`を有効化してよいか（[BUG-119](../../../../docs/bugs/BUG-119.md) 案C）。
+///
+/// # なぜ撤収にもゲートが要るか
+///
+/// **撤収も特権付きのDACL書換である。** D-19 不変条件4は「`SeRestorePrivilege`は全DACLを
+/// バイパスするため、書込の直前に[`is_force_grant_forbidden`]を必ず通す」と定めており、
+/// 付与側は**3つの入口すべて**で通していた。**撤収側にだけ無かった。**
+///
+/// 撤収の対象パスは台帳から来る。台帳の`forced`が広がるほど、
+/// **ゲートを通らない特権付きDACL書換の対象が増える**——BUG-119の層1〜3が
+/// まさにその「広がる」経路だった。
+///
+/// # 拒否したら「撤収しない」ではなく「特権無しで続行する」
+///
+/// ここで撤収そのものをやめると、**剥がせないエントリが台帳に残り続ける経路**が
+/// 新しくできる（`B-09`の向き）。特権無しで剥がせたならそれでよく、
+/// 剥がせなければ撤収レポートの`unfinished`が名前で返す。
+///
+/// 通常は素通りする——付与時にゲートを通った（＝許可された）パスは撤収時も通る。
+/// 引っ掛かるのは、**付与後にパスが消えて`canonicalize`できなくなった**場合等である。
+pub fn forced_revoke_may_use_privilege(path: &Path, forced: bool) -> bool {
+    if !forced {
+        return false;
+    }
+    is_force_grant_forbidden(path).is_none()
+}
+
 pub fn is_force_grant_forbidden(path: &Path) -> Option<String> {
     let canon = match std::fs::canonicalize(path) {
         Ok(p) => p,

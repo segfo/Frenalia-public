@@ -229,11 +229,15 @@ fn revoke_subjects_with_progress(
             &|done, total| walk_progress.on_progress(done, total),
         )
     };
-    let result = if forced {
-        harness_sandbox::tier2a::win_appcontainer::with_restore_privilege(run)
-    } else {
-        run()
-    };
+    // [BUG-119 案C] 撤収も特権付きのDACL書換なので、付与側と同じ絶対拒否ゲートを通す。
+    // 判定は`forced_revoke_may_use_privilege`ただ1つが持つ（昇格ヘルパー側と同じ関数）。
+    let result =
+        if harness_sandbox::tier2a::win_appcontainer::forced_revoke_may_use_privilege(path, forced)
+        {
+            harness_sandbox::tier2a::win_appcontainer::with_restore_privilege(run)
+        } else {
+            run()
+        };
     walk_progress.finish();
     if let Ok(report) = &result {
         if let Some(summary) = report.walk.blocked_summary(5) {
@@ -318,11 +322,15 @@ fn revoke_declarations_with_progress(
             &|done, total| walk_progress.on_progress(done, total),
         )
     };
-    let result = if forced {
-        harness_sandbox::tier2a::win_appcontainer::with_restore_privilege(run)
-    } else {
-        run()
-    };
+    // [BUG-119 案C] 撤収も特権付きのDACL書換なので、付与側と同じ絶対拒否ゲートを通す。
+    // 判定は`forced_revoke_may_use_privilege`ただ1つが持つ（昇格ヘルパー側と同じ関数）。
+    let result =
+        if harness_sandbox::tier2a::win_appcontainer::forced_revoke_may_use_privilege(path, forced)
+        {
+            harness_sandbox::tier2a::win_appcontainer::with_restore_privilege(run)
+        } else {
+            run()
+        };
     walk_progress.finish();
     result
 }

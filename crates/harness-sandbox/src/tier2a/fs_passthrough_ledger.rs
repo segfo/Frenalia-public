@@ -288,6 +288,44 @@ pub struct FsPassthroughGrantRecord {
     pub scope: harness_policy::GrantScope,
 }
 
+impl FsPassthroughGrantRecord {
+    /// `preflight`の結果1件から台帳の1件を組む（[BUG-119](../../../../docs/bugs/BUG-119.md)）。
+    ///
+    /// # `forced`は「指定したか」ではなく「使ったか」
+    ///
+    /// **付与の側は既に per-path で最小になっている**——`preflight`はまず普通に
+    /// `grant_ace_scoped`を試み、`Err`になったときだけ昇格経路へ回す。昇格側でも
+    /// `SeRestorePrivilege`を有効化するのは回ってきたエントリだけなので、
+    /// **普通に付与できたパスに対して特権は1度も使われていない。**
+    ///
+    /// にもかかわらず台帳へは`--force-system-acl`という**セッション全域のスイッチ**を
+    /// そのまま写していた。台帳はユーザグローバルに1つきりで、`forced`は上書きなので、
+    /// **別のワークスペースの1回の起動が、無関係なパスの過去の記録まで`true`へ変える。**
+    /// そして`forced`は後日の`harness fs revoke`が`SeRestorePrivilege`を有効化するかを決める
+    /// ——「打たない後日の起動でも特権が使われる」ところまで波及していた。
+    ///
+    /// **粒度の違う値を、粒度の細かい記録欄へそのまま写さない。**
+    ///
+    /// `declared`は宣言側の`scope`を引くためだけに使う（`forced`は**引かない**）。
+    pub fn from_granted(
+        granted: &harness_core::GrantedPassthrough,
+        declared: Option<&crate::shell_tier::FsPassthrough>,
+        settings_workspace: Option<String>,
+    ) -> Self {
+        Self {
+            path: granted.path.clone(),
+            writable: granted.writable,
+            forced: granted.used_restore_privilege,
+            settings_workspace,
+            granted_sid: None,
+            // [D-63] 引けなかったときに`Recursive`へ倒すのは、D-63以前と同じ意味にするため。
+            scope: declared
+                .map(|fp| fp.scope)
+                .unwrap_or(harness_policy::GrantScope::Recursive),
+        }
+    }
+}
+
 /// 複数の拒否を1回の台帳更新で記録する（[`record_fs_passthrough_grants`]と同じ理由）。
 pub fn record_fs_passthrough_denials(denials: &[(std::path::PathBuf, String, String)]) {
     if denials.is_empty() {
@@ -381,6 +419,78 @@ pub fn remove_fs_passthrough_grant_if_still_orphaned(path: &Path) -> usize {
             .retain(|e| !same_ledger_path(&e.path, &path_str));
         before - (ledger.entries.len() + ledger.denied_entries.len())
     })
+}
+
+#[cfg(test)]
+mod grant_record_tests {
+    use super::FsPassthroughGrantRecord;
+    use crate::shell_tier::FsAccess;
+    use crate::shell_tier::FsPassthrough;
+    use harness_core::GrantedPassthrough;
+    use harness_policy::GrantScope;
+    use std::path::PathBuf;
+
+    fn granted(used_privilege: bool) -> GrantedPassthrough {
+        GrantedPassthrough {
+            path: PathBuf::from(r"C:\some\path"),
+            writable: false,
+            subject_sid: "S-1-15-3-1111".to_string(),
+            used_restore_privilege: used_privilege,
+        }
+    }
+
+    /// `--force-system-acl`を打った**セッション**の宣言。フラグはセッション全域のスイッチなので、
+    /// 特権が要らなかったパスにもこの`forced: true`が載る。
+    fn declared_under_the_session_wide_flag() -> FsPassthrough {
+        FsPassthrough {
+            path: PathBuf::from(r"C:\some\path"),
+            access: FsAccess::Read,
+            forced: true,
+            scope: GrantScope::Recursive,
+        }
+    }
+
+    /// **[BUG-119] 禁止側。** 普通に付与できたパスは、`--force-system-acl`を打っていても
+    /// 台帳へ`forced`を立てない。
+    ///
+    /// 立てると、この記録を索引にする後日の`harness fs revoke`が
+    /// **フラグを打っていない起動でも`SeRestorePrivilege`を有効化する。**
+    /// 台帳はユーザグローバルに1つきりなので、影響はそのワークスペースに閉じない。
+    #[test]
+    fn a_grant_that_did_not_need_the_privilege_is_not_recorded_as_forced() {
+        let record = FsPassthroughGrantRecord::from_granted(
+            &granted(false),
+            Some(&declared_under_the_session_wide_flag()),
+            None,
+        );
+        assert!(
+            !record.forced,
+            "特権を1度も使っていない付与を forced として記録している\
+             （--force-system-acl はセッション全域のスイッチであって、このパスの事実ではない）"
+        );
+    }
+
+    /// **[BUG-119] 許可側（対）。** 実際に特権下で書いたパスは`forced`として記録する。
+    ///
+    /// **この対が無いと「常に`false`」でも禁止側が通る**（`B-35`）。そして常に`false`は
+    /// 「特権で書いたのに剥がせない」——D-19 不変条件5が禁じた向きそのものである。
+    #[test]
+    fn a_grant_that_actually_used_the_privilege_is_recorded_as_forced() {
+        let record = FsPassthroughGrantRecord::from_granted(
+            &granted(true),
+            Some(&declared_under_the_session_wide_flag()),
+            None,
+        );
+        assert!(record.forced);
+    }
+
+    /// 宣言が引けなくても`forced`は付与の事実から決まる（宣言側の`forced`は**見ない**）。
+    #[test]
+    fn the_declaration_is_only_consulted_for_the_scope() {
+        let record = FsPassthroughGrantRecord::from_granted(&granted(false), None, None);
+        assert!(!record.forced);
+        assert_eq!(record.scope, GrantScope::Recursive);
+    }
 }
 
 #[cfg(test)]

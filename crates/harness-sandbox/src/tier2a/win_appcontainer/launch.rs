@@ -319,11 +319,13 @@ mod tests {
                     path: PathBuf::from(r"C:\ro"),
                     writable: false,
                     subject_sid: "S-1-15-3-1024-1".to_string(),
+                    used_restore_privilege: false,
                 },
                 harness_core::GrantedPassthrough {
                     path: PathBuf::from(r"C:\rw"),
                     writable: true,
                     subject_sid: "S-1-15-3-1024-2".to_string(),
+                    used_restore_privilege: false,
                 },
             ],
             net_capability: NetworkCapability::Deny,
@@ -360,11 +362,13 @@ mod tests {
                 path: PathBuf::from(r"C:\does-not-exist-a"),
                 writable: false,
                 subject_sid: a.to_string(),
+                used_restore_privilege: false,
             },
             harness_core::GrantedPassthrough {
                 path: PathBuf::from(r"C:\does-not-exist-b"),
                 writable: true,
                 subject_sid: b.to_string(),
+                used_restore_privilege: false,
             },
         ];
 
@@ -395,11 +399,13 @@ mod tests {
                 path: PathBuf::from(r"C:\broken"),
                 writable: false,
                 subject_sid: "not-a-sid".to_string(),
+                used_restore_privilege: false,
             },
             harness_core::GrantedPassthrough {
                 path: PathBuf::from(r"C:\fine"),
                 writable: false,
                 subject_sid: good.to_string(),
+                used_restore_privilege: false,
             },
         ];
 

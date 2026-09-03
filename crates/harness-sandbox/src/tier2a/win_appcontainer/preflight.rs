@@ -1014,6 +1014,12 @@ pub fn preflight_with_privhelper_launcher(
             path: fp.path.clone(),
             writable,
             subject_sid: entry_cap_text.clone(),
+            // [BUG-119] **この経路では`SeRestorePrivilege`を1度も使っていない。**
+            // `already_sufficient`（Win32を1回も呼ばない）と、普通に`grant_ace_scoped`で
+            // 書けたパスの両方がここを通る。`--force-system-acl`を打っていても、
+            // 特権が要らなかったパスに`forced`を立ててはいけない——立てると、
+            // **指定していない後日の起動でも撤収が特権付きのDACL書換になる。**
+            used_restore_privilege: false,
         };
 
         if already_sufficient {
@@ -1303,6 +1309,11 @@ pub fn preflight_with_privhelper_launcher(
                             path: path.clone(),
                             writable: grant.access.is_read_write(),
                             subject_sid: entry.subject_sid.clone(),
+                            // [BUG-119] 昇格経路で`SeRestorePrivilege`を有効化するのは
+                            // **`forced`なエントリだけ**（本体が管理者の直接付与も、
+                            // privhelperへ委譲した場合も同じ条件）。ここへ来ている時点で
+                            // 絶対拒否ゲートは通過済みである。
+                            used_restore_privilege: grant.forced,
                         });
                         // 昇格経由（privhelper／本体が既に管理者）の付与も「書いた1件」に数える
                         // ——どの経路で書いたかではなく、**マシンのACLを変えたか**が知りたい事実。
@@ -1336,6 +1347,11 @@ pub fn preflight_with_privhelper_launcher(
                             path: path.clone(),
                             writable: grant.access.is_read_write(),
                             subject_sid: entry.subject_sid.clone(),
+                            // [BUG-119] **部分適用は「どう書かれたか」が分からない。**
+                            // 実DACLにACEが在ることしか確かめていないので、
+                            // `forced`なら`true`へ倒す——「使ったのに記録しない」は
+                            // 撤収不能を意味する（D-19 不変条件5が禁じた向き）。
+                            used_restore_privilege: grant.forced,
                         });
                         // 部分適用でACEが実在するなら、それは「開いた穴」である
                         // （§22.3.0の検算からも外さない）。
@@ -1374,6 +1390,8 @@ pub fn preflight_with_privhelper_launcher(
                             path: grant.path.clone(),
                             writable: grant.access.is_read_write(),
                             subject_sid: entry.subject_sid.clone(),
+                            // [BUG-119] 上と同じ理由で`forced`なら`true`へ倒す。
+                            used_restore_privilege: grant.forced,
                         });
                         // 上と同じ（ヘルパーが完走できなかった場合の部分適用）。
                         fs_allow_opened_paths.push(grant.path.clone());

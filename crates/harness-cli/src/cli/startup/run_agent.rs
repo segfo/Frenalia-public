@@ -305,24 +305,19 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
             .iter()
             .map(|granted| {
                 let path = &granted.path;
-                // このエントリが`--force-system-acl`対象だったか（元のfs_passthroughから引く）。
-                // forcedなら撤収時も`SeRestorePrivilege`が要るため台帳へ記録しておく。
+                // [D-63] 宣言側から引くのは**範囲だけ**である。
+                // [BUG-119] `forced`は宣言側から引かない——`--force-system-acl`は
+                // セッション全域のスイッチで、**そのパスで特権を使ったかという事実ではない**。
+                // 組み立ては`FsPassthroughGrantRecord::from_granted`が唯一の定義を持つ。
                 let declared = fs_passthrough.iter().find(|fp| &fp.path == path);
                 let path_str = path.to_string_lossy().into_owned();
-                crate::fs_grants::FsPassthroughGrantRecord {
-                    path: path.clone(),
-                    writable: granted.writable,
-                    forced: declared.map(|fp| fp.forced).unwrap_or(false),
-                    settings_workspace: settings_fs_paths
+                crate::fs_grants::FsPassthroughGrantRecord::from_granted(
+                    granted,
+                    declared,
+                    settings_fs_paths
                         .contains(&path_str)
                         .then(|| workspace_root.to_string_lossy().into_owned()),
-                    granted_sid: None,
-                    // [D-63] どの範囲で開いたかを記録する（`forced`とまったく同じ引き方）。
-                    // 既定を`Recursive`にするのは、引けなかった＝D-63以前と同じ意味に倒すため。
-                    scope: declared
-                        .map(|fp| fp.scope)
-                        .unwrap_or(harness_policy::GrantScope::Recursive),
-                }
+                )
             })
             .collect();
         crate::fs_grants::record_fs_passthrough_grants(&records);
@@ -330,11 +325,10 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         for granted in &shell_tier.granted_passthrough {
             let path = &granted.path;
             let writable = granted.writable;
-            let forced = fs_passthrough
-                .iter()
-                .find(|fp| &fp.path == path)
-                .map(|fp| fp.forced)
-                .unwrap_or(false);
+            // [BUG-119] 警告も**実際に特権を使った付与にだけ**出す。
+            // 「フラグを打ったか」で出していたので、特権が1度も使われていないパスにまで
+            // 「DACLをバイパスして書き込んだ」という**事実でない警告**が並んでいた。
+            let forced = granted.used_restore_privilege;
             if forced {
                 eprintln!(
                     "WARNING: forced system ACL grant (--force-system-acl, SeRestorePrivilege): {} \
