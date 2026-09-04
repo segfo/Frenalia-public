@@ -1,4 +1,5 @@
-//! **MAC/Spawn Daemon設計の実現性スパイク（バッチ2: S5・S6・S7）**。結果の正本は
+//! **MAC/Spawn Daemon設計の実現性スパイク（バッチ2: S5・S6・S7、バッチ4のgo/no-go）**。
+//! 結果の正本は
 //! `plans/mac-spike/RESULTS.md`、設計の正本は設計書§22.6.2（「改A」6手順）・§10.1.1（Job）・
 //! §10.1（要求受付パイプ）である。
 //!
@@ -22,9 +23,14 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{
     DuplicateHandle, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
 };
+use windows::Win32::System::Console::{AttachConsole, FreeConsole, GetConsoleProcessList};
+use windows::Win32::System::Diagnostics::Debug::{
+    SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX,
+};
 
 use super::mac_spike_tests::{
-    last_json_line, probe_exe, workspace_capability_for, SpikeConsole, SpikeSpawn,
+    last_json_line, probe_exe, workspace_capability_for, SpikeChild, SpikeConsole, SpikeSpawn,
+    SuspendedSpikeChild,
 };
 use super::*;
 
@@ -43,6 +49,518 @@ fn spike_workspace() -> (
         caps.push(cap);
     }
     (workspace, sid, caps)
+}
+
+/// `AttachConsole`の区間を抜けるとき、成功・失敗のどちらでもDaemon役を切り離す。
+/// コンソールへの接続はプロセス単位なので、後続の腕へ状態を持ち越さないためのガードである。
+struct ConsoleDetachGuard;
+
+impl Drop for ConsoleDetachGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = FreeConsole();
+        }
+    }
+}
+
+/// Daemon役がコンソールを借りるか。**借りない腕は「借用が効いている」ことの対照**である
+/// ——借りずに同じスクリプトを撃って印が出てしまうなら、保持プロセスと`conhost`を
+/// ドメインごとに1本持つ費用（§22.9）の前提そのものが崩れる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsoleLoan {
+    Attach,
+    NoAttach,
+}
+
+/// `CREATE_SUSPENDED`で作った子を、いつ動かし始めるか。
+///
+/// **設計書§7.1.1の疑似コードは`FreeConsole`を`CreateProcessW`の直後に置いている**ので、
+/// そこに書かれた順序は[`Self::AfterDetach`]である。一方2026-09-04の初回測定は
+/// [`Self::InsideWindow`]で通していた（`SpikeSpawn::spawn`がResumeまで含んでいたため）。
+/// この2つは同じではない——子のDLL初期化はResumeの後に走るので、
+/// [`Self::AfterDetach`]では§7.1が`0xC0000142`を観測した場所が**窓の外**に来る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumePoint {
+    InsideWindow,
+    AfterDetach,
+}
+
+/// 1腕の構成（軸は3つ。**1腕につき1軸だけ動かす**、B-29）。
+#[derive(Debug, Clone, Copy)]
+struct ArmSpec {
+    label: &'static str,
+    holder_console: SpikeConsole,
+    loan: ConsoleLoan,
+    resume_at: ResumePoint,
+}
+
+/// 起こした子を、動かす前に受け取るか動かした後に受け取るか。
+enum SpawnedArm {
+    Running(SpikeChild),
+    Suspended(SuspendedSpikeChild),
+}
+
+#[derive(Debug)]
+struct AttachedShellRun {
+    console_processes: Vec<u32>,
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    marker: Option<String>,
+}
+
+impl AttachedShellRun {
+    /// **シェルが実際に走ったか。** `CreateProcessW`の成功値ではなく、
+    /// 標準出力の印・別ファイルの印・終了コードの3つが揃ったことで数える。
+    ///
+    /// コンソールの構成員の件数はここに含めない——それは「借りられたか」の検算であって、
+    /// 「走ったか」とは別の事実だからである（借りない腕ではそもそも0件になる）。
+    fn actually_ran(&self) -> bool {
+        self.exit_code == 37
+            && self.stdout.contains("HARNESS-ATTACH-CONSOLE-STDOUT")
+            && self.marker.as_deref().map(str::trim) == Some("HARNESS-ATTACH-CONSOLE-MARKER")
+    }
+
+    /// 走ったシェルが、**その場で子プロセスを起こそうとして拒否されたか**。
+    ///
+    /// これが無いと、この回の証拠は「AppContainerのシェルが借りたコンソールで走った」までしか
+    /// 語らない。§7.1.1が問うているのは`CHILD_PROCESS_RESTRICTED`との**組み合わせ**なので、
+    /// 同じ1回の出力に「走った」と「子は作れない」の両方を語らせる。
+    fn child_creation(&self) -> Option<&str> {
+        self.stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("HARNESS-ATTACH-CONSOLE-CHILD="))
+    }
+
+    /// 拒否の**理由の型**まで印にする（`CHILD-DENIED-<例外型名>`）。
+    /// 「起こせなかった」だけだと、mitigationで拒否されたのか実行ファイルが見つからなかったのかを
+    /// 後から区別できない。
+    fn child_creation_denied(&self) -> bool {
+        self.child_creation()
+            .is_some_and(|outcome| outcome.starts_with("CHILD-DENIED-"))
+    }
+}
+
+fn wait_until_holder_is_ready(holder: &SpikeSpawn<'_>, report: &std::path::Path) -> SpikeChild {
+    let child = holder.spawn().expect("spawn the console holder");
+    for _ in 0..100 {
+        if std::fs::read_to_string(report)
+            .map(|body| body.contains("\"mode\":\"idle\""))
+            .unwrap_or(false)
+        {
+            return child;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!(
+        "console holder did not report readiness: pid={} report={:?}",
+        child.pid(),
+        std::fs::read_to_string(report).ok()
+    );
+}
+
+fn run_restricted_shell_while_attached(
+    arm: &ArmSpec,
+    holder_pid: u32,
+    shell: &str,
+    workspace: &std::path::Path,
+    container_sid: PSID,
+    capabilities: &[PSID],
+    marker_path: &std::path::Path,
+) -> Result<AttachedShellRun, String> {
+    let marker_literal = marker_path.to_string_lossy().replace('\'', "''");
+    // **二重引用符を1つも使わない。** `SpikeSpawn`のコマンドライン組み立ては各引数を`"`で
+    // 括るので、スクリプト側に`"`があると引用が壊れる。
+    let script = format!(
+        "$c='CHILD-UNKNOWN'; \
+         try {{ \
+           $si=[System.Diagnostics.ProcessStartInfo]::new('cmd.exe','/c exit 5'); \
+           $si.UseShellExecute=$false; \
+           $p=[System.Diagnostics.Process]::Start($si); $p.WaitForExit(); $c='CHILD-RAN' \
+         }} catch {{ \
+           $e=$_.Exception.GetBaseException(); \
+           $c='CHILD-DENIED-' + $e.GetType().Name + '-' + $e.NativeErrorCode \
+         }}; \
+         Set-Content -LiteralPath '{marker_literal}' -Value 'HARNESS-ATTACH-CONSOLE-MARKER'; \
+         Write-Output ('HARNESS-ATTACH-CONSOLE-CHILD=' + $c); \
+         Write-Output HARNESS-ATTACH-CONSOLE-STDOUT; exit 37"
+    );
+    let args = ["-NoProfile", "-NonInteractive", "-Command", script.as_str()];
+
+    let (console_processes, spawned) = {
+        // Daemonの既定状態（コンソール未接続）を作る。既に未接続なら失敗するが、
+        // その状態が目的なので無視する。
+        unsafe {
+            let _ = FreeConsole();
+        }
+        let _detach = match arm.loan {
+            ConsoleLoan::Attach => {
+                unsafe {
+                    AttachConsole(holder_pid).map_err(|e| {
+                        format!("AttachConsole(holder_pid={holder_pid}) failed: {e}")
+                    })?;
+                }
+                Some(ConsoleDetachGuard)
+            }
+            // 借りない腕。以降Daemon役はどのコンソールにも属さないまま子を起こす。
+            ConsoleLoan::NoAttach => None,
+        };
+
+        let process_ids = match arm.loan {
+            ConsoleLoan::Attach => {
+                let mut process_ids = vec![0u32; 16];
+                let count = unsafe { GetConsoleProcessList(&mut process_ids) } as usize;
+                if count == 0 {
+                    return Err(
+                        "GetConsoleProcessList returned 0 after AttachConsole succeeded".into()
+                    );
+                }
+                if count > process_ids.len() {
+                    // バッファが足りないとAPIは所要数だけを返して中身を書かない。
+                    // 黙って切り詰めると「載っていない」と読めてしまうので失敗させる。
+                    return Err(format!(
+                        "console has more members than the probe buffer: need={count} buffer={}",
+                        process_ids.len()
+                    ));
+                }
+                process_ids.truncate(count);
+                if !process_ids.contains(&holder_pid) || !process_ids.contains(&std::process::id())
+                {
+                    return Err(format!(
+                        "attached console membership is inconsistent: holder={holder_pid} daemon={} members={process_ids:?}",
+                        std::process::id()
+                    ));
+                }
+                process_ids
+            }
+            ConsoleLoan::NoAttach => Vec::new(),
+        };
+
+        let spawned = SpikeSpawn {
+            exe: shell,
+            args: &args,
+            cwd: workspace,
+            container_sid,
+            capabilities,
+            child_process_restricted: true,
+            stdout_override: None,
+            extra_inherit: &[],
+            process_sddl: None,
+            thread_sddl: None,
+            token_default_dacl_sddl: None,
+            no_appcontainer: false,
+            // 親（Daemon役）が上で借りたコンソールを、そのまま継承する。借りていない腕では
+            // 親にコンソールが無いので、子もコンソールを持たない。
+            console: SpikeConsole::Inherit,
+        }
+        .spawn_suspended()
+        .map(|suspended| match arm.resume_at {
+            // 窓の内側で動かす。子のDLL初期化はDaemon役が接続したまま走る。
+            ResumePoint::InsideWindow => SpawnedArm::Running(suspended.resume()),
+            // 窓の外で動かす。ここではまだ止めたまま持ち出す。
+            ResumePoint::AfterDetach => SpawnedArm::Suspended(suspended),
+        });
+        (process_ids, spawned)
+        // `_detach`がここで動き、Daemon役をコンソールから切り離す。
+    };
+
+    let mut child = match spawned.map_err(|e| format!("restricted shell spawn failed: {e}"))? {
+        SpawnedArm::Running(child) => child,
+        // **設計書§7.1.1どおりの順序**: 窓を閉じてから動かす。
+        SpawnedArm::Suspended(suspended) => suspended.resume(),
+    };
+    let (stdout, stderr, exit_code) = child.wait_and_read();
+    let marker = std::fs::read_to_string(marker_path).ok();
+    Ok(AttachedShellRun {
+        console_processes,
+        stdout,
+        stderr,
+        exit_code,
+        marker,
+    })
+}
+
+/// §7.1.1のgo/no-go: Daemon役が保持プロセスのコンソールを`AttachConsole`で借りた状態で、
+/// `CHILD_PROCESS_RESTRICTED`を積んだAppContainerシェルがコマンドを実行できるか。
+///
+/// **4腕で測る。** 本命（`EXACT`）は設計どおり`CREATE_NO_WINDOW`で起こした保持プロセスへ
+/// 接続し、窓の内側で子を動かす。残り3腕はそこから軸を1つだけ変えた対照である。
+///
+/// | 腕 | 本命との差 | これが無いと何が言えなくなるか |
+/// |---|---|---|
+/// | `CONTROL` | 保持プロセスを`CREATE_NEW_CONSOLE`（非表示）で起こす | 本命が落ちたとき、原因が保持プロセスの作り方か`AttachConsole`以降かを分けられない |
+/// | `NO_LOAN` | コンソードを借りずに同じスクリプトを撃つ | 「借りたコンソールが効いている」が言えない（走った理由が借用と無関係かもしれない） |
+/// | `DESIGN_ORDER` | `FreeConsole`の**後**で子を動かす | 設計書§7.1.1が描いている順序を測っていない。子のDLL初期化——§7.1が`0xC0000142`を観測した場所——が窓の外に来る |
+///
+/// あわせて、走ったシェルにその場で子プロセスを起こさせ、拒否されることを同じ出力で見る。
+/// これが無いと、この回の証拠は「AppContainerのシェルが走った」までしか語らない。
+#[test]
+#[ignore = "requires dev-elevated-run target spike-mac-console-attach; touches real AppContainer state"]
+fn go_no_go_attach_console_restricted_shell_runs() {
+    let measure_lock = std::path::Path::new(r"C:\harness-e2e\_measure-lock\mac-console-attach");
+    std::fs::create_dir_all(
+        measure_lock
+            .parent()
+            .expect("measurement lock has a parent"),
+    )
+    .expect("create the serialized measurement lock parent");
+    std::fs::create_dir(measure_lock).unwrap_or_else(|e| {
+        panic!(
+            "測定ロックを取得できない（並列測定または前回残骸を確認する）: path={measure_lock:?} error={e}"
+        )
+    });
+    let _measure_lock_cleanup = super::test_support::scopeguard(|| {
+        std::fs::remove_dir(measure_lock).ok();
+    });
+
+    let (workspace, sid, caps) = spike_workspace();
+    let workspace_canonical = workspace
+        .path()
+        .canonicalize()
+        .expect("canonicalize the spike workspace");
+    let cleanup_workspace = workspace_canonical.clone();
+    let cleanup_session_token = crate::tier2a::session_profile::session_token().to_string();
+    let cleanup_session_token_for_assert = cleanup_session_token.clone();
+    let _cleanup = super::test_support::scopeguard(move || {
+        let outcome =
+            crate::tier2a::session_profile::end_session(&super::revoke::revoke_session_grant);
+        eprintln!(
+            "[MAC-CONSOLE-GO-NO-GO] cleanup session={cleanup_session_token}: {:?}",
+            outcome.summary()
+        );
+        super::mac_spike_tests::forget_workspace_capability(&cleanup_workspace);
+        if let Err(e) = std::fs::remove_dir_all(&cleanup_workspace) {
+            eprintln!(
+                "[MAC-CONSOLE-GO-NO-GO] cleanup could not remove workspace {cleanup_workspace:?}: {e}"
+            );
+        }
+        if !cleanup_workspace.exists() {
+            crate::tier2a::workspace_ledger::remove_workspace_entry(&cleanup_workspace);
+        }
+    });
+    let caps_psid: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
+    let probe = probe_exe();
+    let probe_str = probe
+        .to_str()
+        .expect("probe path is valid utf-8")
+        .to_string();
+    let (shell, shell_label) = resolve_shell();
+
+    let run_arm = |arm: &ArmSpec| -> Result<AttachedShellRun, String> {
+        let holder_report = workspace.path().join(format!("{}-holder.json", arm.label));
+        let holder_report_str = holder_report.to_string_lossy().into_owned();
+        let holder_args = [
+            "--idle-secs",
+            "30",
+            "--timeout-secs",
+            "60",
+            "--report-file",
+            holder_report_str.as_str(),
+        ];
+        let holder_spec = SpikeSpawn {
+            exe: &probe_str,
+            args: &holder_args,
+            cwd: workspace.path(),
+            container_sid: sid.as_psid(),
+            capabilities: &[],
+            child_process_restricted: false,
+            stdout_override: None,
+            extra_inherit: &[],
+            process_sddl: None,
+            thread_sddl: None,
+            token_default_dacl_sddl: None,
+            no_appcontainer: true,
+            console: arm.holder_console,
+        };
+        let holder = wait_until_holder_is_ready(&holder_spec, &holder_report);
+        let marker = workspace.path().join(format!("{}-marker.txt", arm.label));
+        let result = run_restricted_shell_while_attached(
+            arm,
+            holder.pid(),
+            &shell,
+            workspace.path(),
+            sid.as_psid(),
+            &caps_psid,
+            &marker,
+        );
+        drop(holder);
+        result
+    };
+
+    // 4腕。**隣の腕とは軸を1つだけ変えてある**（B-29）。
+    const EXACT: ArmSpec = ArmSpec {
+        label: "exact-create-no-window",
+        holder_console: SpikeConsole::NoWindow,
+        loan: ConsoleLoan::Attach,
+        resume_at: ResumePoint::InsideWindow,
+    };
+    // EXACTから`resume_at`だけを変えた腕。設計書§7.1.1の疑似コードはこちらの順序である。
+    const DESIGN_ORDER: ArmSpec = ArmSpec {
+        label: "design-resume-after-detach",
+        holder_console: SpikeConsole::NoWindow,
+        loan: ConsoleLoan::Attach,
+        resume_at: ResumePoint::AfterDetach,
+    };
+    // EXACTから保持プロセスの作り方だけを変えた腕（計器の対照）。
+    const CONTROL: ArmSpec = ArmSpec {
+        label: "control-create-new-console",
+        holder_console: SpikeConsole::NewHidden,
+        loan: ConsoleLoan::Attach,
+        resume_at: ResumePoint::InsideWindow,
+    };
+    // EXACTからコンソールを借りるかだけを変えた腕（借用が効いていることの対照）。
+    const NO_LOAN: ArmSpec = ArmSpec {
+        label: "control-no-console-loan",
+        holder_console: SpikeConsole::NoWindow,
+        loan: ConsoleLoan::NoAttach,
+        resume_at: ResumePoint::InsideWindow,
+    };
+
+    // **子の起動失敗でWindowsのエラーダイアログを出させない。**
+    // 「コンソールを借りない」腕は設計上`0xC0000142`で落ちるのが期待値なので、抑止しないと
+    // 測定が人のクリック待ちになる——無人で回せない測定器は、それ自体が欠陥である。
+    // エラーモードはプロセス単位で、**子へ継承される**。取得した旧値は必ず戻す（付与と撤収は対）。
+    let previous_error_mode = unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)
+    };
+    let _restore_error_mode = super::test_support::scopeguard(move || unsafe {
+        SetErrorMode(previous_error_mode);
+    });
+
+    // **どのシェルの実体を測ったかを記録へ残す。** ラベルだけでは、§S1bがpwsh 7と5.1・
+    // Storeエイリアスと実体を区別している記録と突き合わせられない。
+    eprintln!("[MAC-CONSOLE-GO-NO-GO] shell={shell_label} path={shell}");
+
+    // 全腕を先に測る。結果がNoでも、対照を続けて測れるよう即時assertしない。
+    let exact = run_arm(&EXACT);
+    eprintln!("[MAC-CONSOLE-GO-NO-GO] exact holder / shell={shell_label}: {exact:?}");
+    let design_order = run_arm(&DESIGN_ORDER);
+    eprintln!("[MAC-CONSOLE-GO-NO-GO] resume-after-detach / shell={shell_label}: {design_order:?}");
+    let control = run_arm(&CONTROL);
+    eprintln!("[MAC-CONSOLE-GO-NO-GO] control holder / shell={shell_label}: {control:?}");
+    let no_loan = run_arm(&NO_LOAN);
+    eprintln!("[MAC-CONSOLE-GO-NO-GO] no console loan / shell={shell_label}: {no_loan:?}");
+
+    let control = control.unwrap_or_else(|e| {
+        panic!("計器の対照が成立しないためgo/no-goを判定できない: shell={shell_label} error={e}")
+    });
+    assert!(
+        control.actually_ran(),
+        "確実にコンソールを持つ対照でもmitigation付きシェルが実行印を残さなかった。\
+         本命のNo判定には使えない: shell={shell_label} observation={control:?}"
+    );
+
+    let exact = exact.unwrap_or_else(|e| {
+        panic!(
+            "NO-GO: 設計どおりCREATE_NO_WINDOWで起こした保持プロセスのコンソールを借りられない: \
+             shell={shell_label} error={e}; control={control:?}"
+        )
+    });
+    assert!(
+        exact.actually_ran(),
+        "NO-GO: AttachConsole後にmitigation付きAppContainerシェルが実行印とexit 37を返さなかった: \
+         shell={shell_label} observation={exact:?}; control={control:?}"
+    );
+
+    // **緩和策が実際に効いていたことを、同じ1回の出力で語らせる。**
+    // これが無いと、走ったのは「ただのAppContainerシェル」かもしれない（§7.1.1が問うている
+    // のは`CHILD_PROCESS_RESTRICTED`との組み合わせである）。
+    for (label, run) in [("exact", &exact), ("control", &control)] {
+        assert!(
+            run.child_creation_denied(),
+            "走ったシェルが子プロセスを起こせてしまった＝この回はmitigationが効いていない。\
+             GOの根拠にできない: arm={label} child={:?} observation={run:?}",
+            run.child_creation()
+        );
+    }
+
+    // **借りたコンソールが効いていることの対照。** 借りずに同じスクリプトを撃って印が出るなら、
+    // 保持プロセスと`conhost`をドメインごとに持つ費用の前提（§7.1・§22.9）が崩れる。
+    // その場合は設計判断へ戻すべきなので、ここは緑にしない。
+    let no_loan = no_loan.unwrap_or_else(|e| {
+        panic!(
+            "コンソールを借りない腕が起動そのものに失敗した（借用の効果を判定できない）: \
+             shell={shell_label} error={e}"
+        )
+    });
+    assert!(
+        !no_loan.actually_ran(),
+        "コンソールを借りなくてもmitigation付きシェルが完走した。§7.1.1の保持プロセスは\
+         この経路には要らない可能性があるので、設計判断へ戻すこと: \
+         shell={shell_label} observation={no_loan:?}",
+    );
+
+    // **設計書§7.1.1の順序（窓を閉じてから動かす）でも成立するか。**
+    // ここが落ちるなら、実装は「窓はResumeまで」に広げる必要がある——広げると、
+    // サンドボックス側のシェルが走っている間だけDaemonが同じコンソールに残るので、
+    // §7.1.1がCtrl+Cを理由に避けた状態を受け入れることになる。どちらを採るかは設計の判断。
+    let design_order = design_order.unwrap_or_else(|e| {
+        panic!(
+            "NO-GO(設計順): FreeConsoleの後にResumeすると起動できない: \
+             shell={shell_label} error={e}; exact={exact:?}"
+        )
+    });
+    assert!(
+        design_order.actually_ran() && design_order.child_creation_denied(),
+        "NO-GO(設計順): 窓を閉じてから動かすと実行印が揃わない。§7.1.1の疑似コードは\
+         この順序を描いているので、設計かコードのどちらかを直すこと: \
+         shell={shell_label} observation={design_order:?}; exact={exact:?}"
+    );
+
+    // 借りた3腕は「Daemon役＋保持プロセスの2人だけ」であること、借りない腕は0件であることを
+    // 読み返す。**印だけ見ていると、どのコンソールで走ったのかが記録に残らない。**
+    // stderrも合わせてここで見る——Debug出力へ出しているだけでは、次に非空になっても緑のままになる。
+    for (label, run) in [
+        ("exact", &exact),
+        ("design-resume-after-detach", &design_order),
+        ("control", &control),
+    ] {
+        assert_eq!(
+            run.console_processes.len(),
+            2,
+            "借りたコンソールの構成員がDaemon役と保持プロセスの2人ではない: \
+             arm={label} members={:?}",
+            run.console_processes
+        );
+        assert!(
+            run.stderr.trim().is_empty(),
+            "mitigation付きシェルがstderrへ何か出した（無言の失敗が混ざっていないか確認する）: \
+             arm={label} stderr={:?}",
+            run.stderr
+        );
+    }
+    assert!(
+        no_loan.console_processes.is_empty(),
+        "コンソールを借りない腕なのに構成員が観測された（腕の前提が崩れている）: {:?}",
+        no_loan.console_processes
+    );
+
+    // 成功時はDrop任せにせずここで撤収し、その結果を同じテスト内で読み返す。失敗時にも
+    // scopeguardが同じ処理を行うため、測定結果が赤でも実マシンへ残骸を増やさない。
+    drop(_cleanup);
+    assert!(
+        !workspace_canonical.exists(),
+        "測定workspaceが撤収後も残っている: {workspace_canonical:?}"
+    );
+    assert!(
+        !crate::tier2a::session_profile::ledger_session_tokens_for_test()
+            .contains(&cleanup_session_token_for_assert),
+        "測定セッションの台帳エントリが撤収後も残っている: {cleanup_session_token_for_assert}"
+    );
+    assert!(
+        !crate::tier2a::workspace_ledger::load_workspace_ledger()
+            .entries
+            .iter()
+            .any(|entry| std::path::Path::new(&entry.path) == workspace_canonical),
+        "測定workspaceの一覧台帳エントリが撤収後も残っている: {workspace_canonical:?}"
+    );
+    // ロックも読み返す。**残ると次回の測定が「並列測定または前回残骸」で止まる**ので、
+    // 撤収を握り潰したまま緑にしない（撤収の自己検算は4つで1組である）。
+    drop(_measure_lock_cleanup);
+    assert!(
+        !measure_lock.exists(),
+        "測定ロックが撤収後も残っている（次回の測定が並列と誤判定する）: {measure_lock:?}"
+    );
 }
 
 /// `NtQueryObject(ObjectBasicInformation)`で許可アクセスマスクを取る（§22.6.2手順3）。

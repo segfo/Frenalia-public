@@ -176,10 +176,28 @@ pub(super) enum SpikeConsole {
     Detached,
     /// フラグ無し＝**親のコンソールを継承する**。conhostの生成を伴わない唯一の形。
     Inherit,
+    /// 測定用のコンソール保持プロセス。新しいコンソールを作るが、ウィンドウは表示しない。
+    ///
+    /// §7.1.1の本命は[`Self::NoWindow`]である。この腕は、本命が失敗したときに
+    /// `AttachConsole`以降の計器まで壊れているのかを分ける対照にだけ使う。
+    NewHidden,
 }
 
 impl SpikeSpawn<'_> {
+    /// 起こして**すぐ動かす**（このスパイク群の既定）。
+    ///
+    /// `CREATE_SUSPENDED`で作ってから即Resumeする形は変えていない——変えたのは
+    /// 「Resumeをいつ撃つか」を呼び出し側が選べるようにしたことだけである
+    /// （§7.1.1のコンソール貸与では、Resumeが**コンソールを借りている窓の内側か外側か**が
+    /// 測定軸になる。窓の外でResumeすると、DLL初期化＝§7.1が`0xC0000142`を観測した場所が
+    /// `FreeConsole`の後に来る）。
     pub(super) fn spawn(&self) -> Result<SpikeChild, String> {
+        Ok(self.spawn_suspended()?.resume())
+    }
+
+    /// 起こすが**まだ動かさない**。呼び出し側が[`SuspendedSpikeChild::resume`]を撃つまで、
+    /// 子は`CREATE_SUSPENDED`のまま止まっている。
+    pub(super) fn spawn_suspended(&self) -> Result<SuspendedSpikeChild, String> {
         let step = |label: &str, e: windows::core::Error| format!("{label}: {e}");
 
         let job = create_job_object().map_err(|e| step("create_job_object", e))?;
@@ -315,10 +333,33 @@ impl SpikeSpawn<'_> {
                     .map_err(|e| step("UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)", e))?;
                 }
 
+                let (console_flag, hide_console_window) = match self.console {
+                    SpikeConsole::NoWindow => (CREATE_NO_WINDOW, false),
+                    SpikeConsole::Detached => {
+                        (windows::Win32::System::Threading::DETACHED_PROCESS, false)
+                    }
+                    SpikeConsole::Inherit => (
+                        windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0),
+                        false,
+                    ),
+                    SpikeConsole::NewHidden => {
+                        (windows::Win32::System::Threading::CREATE_NEW_CONSOLE, true)
+                    }
+                };
+                let startup_flags = if hide_console_window {
+                    STARTF_USESTDHANDLES | windows::Win32::System::Threading::STARTF_USESHOWWINDOW
+                } else {
+                    STARTF_USESTDHANDLES
+                };
                 let startup_info_ex = STARTUPINFOEXW {
                     StartupInfo: STARTUPINFOW {
                         cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
-                        dwFlags: STARTF_USESTDHANDLES,
+                        dwFlags: startup_flags,
+                        wShowWindow: if hide_console_window {
+                            windows::Win32::UI::WindowsAndMessaging::SW_HIDE.0 as u16
+                        } else {
+                            0
+                        },
                         hStdOutput: stdout_handle,
                         hStdError: stderr_write,
                         hStdInput: INVALID_HANDLE_VALUE,
@@ -327,13 +368,6 @@ impl SpikeSpawn<'_> {
                     lpAttributeList: attr_list,
                 };
                 let mut process_info = PROCESS_INFORMATION::default();
-                let console_flag = match self.console {
-                    SpikeConsole::NoWindow => CREATE_NO_WINDOW,
-                    SpikeConsole::Detached => windows::Win32::System::Threading::DETACHED_PROCESS,
-                    SpikeConsole::Inherit => {
-                        windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0)
-                    }
-                };
                 CreateProcessW(
                     None,
                     PWSTR(cmdline_w.as_mut_ptr()),
@@ -454,18 +488,55 @@ impl SpikeSpawn<'_> {
                 }
             }
 
-            let _ = ResumeThread(process_info.hThread);
-            let _ = CloseHandle(process_info.hThread);
         }
 
-        Ok(SpikeChild {
-            process: process_info.hProcess,
-            job,
-            pid: process_info.dwProcessId,
-            thread_id: process_info.dwThreadId,
-            stdout_read,
-            stderr_read,
+        Ok(SuspendedSpikeChild {
+            child: Some(SpikeChild {
+                process: process_info.hProcess,
+                job,
+                pid: process_info.dwProcessId,
+                thread_id: process_info.dwThreadId,
+                stdout_read,
+                stderr_read,
+            }),
+            thread: process_info.hThread,
         })
+    }
+}
+
+/// `CREATE_SUSPENDED`のまま止まっている子。[`Self::resume`]で動かす。
+///
+/// **`Resume`を独立した1手にしてあるのは測定軸だからである。** §7.1.1のコンソール貸与では
+/// 「借りている窓の内側で動かすか、`FreeConsole`の後で動かすか」で、子のDLL初期化が走る時点が
+/// 変わる——§7.1が`0xC0000142`（`STATUS_DLL_INIT_FAILED`）を観測したのはまさにそこである。
+pub(super) struct SuspendedSpikeChild {
+    /// `resume`でムーブアウトするので`Option`。`None`は「もう動かした」を意味する。
+    child: Option<SpikeChild>,
+    thread: HANDLE,
+}
+
+unsafe impl Send for SuspendedSpikeChild {}
+
+impl SuspendedSpikeChild {
+    /// 主スレッドを動かし始める。スレッドハンドルは`Drop`が閉じる。
+    pub(super) fn resume(mut self) -> SpikeChild {
+        let child = self
+            .child
+            .take()
+            .expect("resume consumes the suspended child exactly once");
+        unsafe {
+            let _ = ResumeThread(self.thread);
+        }
+        child
+    }
+}
+
+impl Drop for SuspendedSpikeChild {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.thread);
+        }
+        // `child`が残っていれば（Resumeせずに捨てた）`SpikeChild::drop`がjobごと畳む。
     }
 }
 

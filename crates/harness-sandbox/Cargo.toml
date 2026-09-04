@@ -57,6 +57,9 @@ windows = { version = "0.58", features = [
     # 到達されるため、ここは弱い乱数へ退避せず失敗させる（`workspace_capability`のdoc参照）。
     "Win32_Security_Cryptography",
     "Win32_System_Threading",
+    # MAC go/no-go spike: Daemon役が保持プロセスのコンソールへ一時接続してから
+    # mitigation付きシェルを起こせるかを実機で測る。
+    "Win32_System_Console",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Memory",

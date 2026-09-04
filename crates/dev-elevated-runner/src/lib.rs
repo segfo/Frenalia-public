@@ -308,6 +308,23 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "tier2a::deelevation_spike_tests",
         ],
     ),
+    // MAC §7.1.1の最初のgo/no-go。Daemon役が保持プロセスへAttachConsoleした状態で、
+    // CHILD_PROCESS_RESTRICTED付きAppContainerシェルが実行印と終了コードを返すかを測る。
+    // ユーザー指定により昇格区間は必ずこの固定ターゲットから直列で実行する。
+    (
+        "spike-mac-console-attach",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "go_no_go_attach_console_restricted_shell_runs",
+        ],
+    ),
     (
         "spike-etw-fs",
         &[
