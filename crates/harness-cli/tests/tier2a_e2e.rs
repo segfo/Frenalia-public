@@ -2732,6 +2732,93 @@ fn sid_aces(path: &Path, prefix: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// **[BUG-119] `--force-system-acl`を打っても、普通に付与できたパスは`forced`として
+/// 記録されない。**
+///
+/// # なぜ実機で測るのか
+///
+/// 単体テスト（`fs_passthrough_ledger::grant_record_tests`）が固定しているのは
+/// 「`preflight`の結果から台帳の1件を組む規則」であって、
+/// **`preflight`が正しい`used_restore_privilege`を返すこと**ではない。
+/// そこは実ACL・実際の付与経路を通らないと測れない。
+///
+/// # 何が起きていたか
+///
+/// `--force-system-acl`は**セッション全域のスイッチ**なので、付与に特権が要らなかった
+/// パスにも`forced: true`が載っていた。台帳はユーザグローバルに1つきりで`forced`は
+/// 上書きなので、**別のワークスペースの1回の起動が無関係なパスの過去の記録まで書き換える。**
+/// そして`forced`は後日の`harness fs revoke`が`SeRestorePrivilege`を有効化するかを決める。
+///
+/// # この腕が測れないこと（先に書く）
+///
+/// 対象は`C:\harness-e2e`配下の**普通に書けるディレクトリ**なので、
+/// `needs_elevation`へは入らない——つまり**「特権を使ったときに`true`になること」は
+/// ここでは測っていない**。そちらは`elevated-grant-opens-only-the-declared-subject`が通る
+/// 合成システム保護パスの腕に足すのが筋だが、本件では触っていない。
+fn fs_allow_case_a_normally_grantable_path_is_not_recorded_as_forced(
+    ledger: &FsLedgerExclusive,
+) -> Result<(), String> {
+    let ws = case_dir("fs-allow-forced-record");
+    let target = fs_allow_case_dir("forced-record");
+    std::fs::write(target.join("f.txt"), "x").map_err(|e| e.to_string())?;
+
+    let allow = format!("{}:ro", target.display());
+    let run = run_harness(
+        &ws,
+        &run_shell_script_turns("Write-Output 'ran'"),
+        &["--fs-allow", &allow, "--force-system-acl"],
+        "fs-allow-forced-record",
+    );
+    parse_json_stdout(&run)?;
+
+    let entries = read_fs_ledger_forced_flags()?;
+    let target_key = target
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('\\', "/");
+    let mine: Vec<&(String, bool)> = entries
+        .iter()
+        .filter(|(p, _)| p.to_ascii_lowercase().replace('\\', "/") == target_key)
+        .collect();
+    if mine.is_empty() {
+        return Err(format!(
+            "the ledger has no entry for {} after the session; the grant never got recorded, so              this arm cannot say anything about `forced` (0件と成功を同じ値にしない、B-09)",
+            target.display()
+        ));
+    }
+    for (p, forced) in &mine {
+        if *forced {
+            return Err(format!(
+                "[BUG-119] {p} is recorded as forced=true, but this path is writable without                  SeRestorePrivilege -- `--force-system-acl` is a session-wide switch, not a fact                  about this path. A later `harness fs revoke` would enable the privilege for it."
+            ));
+        }
+    }
+    eprintln!(
+        "[fs-allow-forced-record] {} ledger entr(y/ies) for the target, all forced=false",
+        mine.len()
+    );
+
+    // 名前の付いた扉で片付ける（案Cのゲートが正常系を素通りすることも、ここで通る）。
+    let revoke = Command::new(harness_exe())
+        .args(["fs", "revoke"])
+        .arg(&target)
+        .output()
+        .map_err(|e| format!("failed to run `harness fs revoke`: {e}"))?;
+    if !revoke.status.success() {
+        return Err(format!(
+            "`harness fs revoke {}` failed after the forced-record arm: {}{}",
+            target.display(),
+            String::from_utf8_lossy(&revoke.stdout),
+            String::from_utf8_lossy(&revoke.stderr)
+        ));
+    }
+
+    ledger.purge_entries(&[&target]);
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup_on_success(&ws, &[], "fs-allow-forced-record");
+    Ok(())
+}
+
 /// [§22.2.1] **`--fs-allow`のACEはharnessの終了後も残り、`harness fs revoke`で消える。**
 ///
 /// # このテストは意味を変えてある（旧名 `..._is_revoked_when_the_session_ends`）
@@ -3834,6 +3921,13 @@ fn tier2a_fs_allow_matrix() {
             "ace-persists-after-exit-and-the-named-door-removes-it",
             fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it,
         ),
+        // [BUG-119] `--force-system-acl`を打った回に、特権が要らなかったパスが
+        // `forced`として記録されないこと。**上の4本は`--force-system-acl`を打たない**ので、
+        // この腕が唯一その組み合わせを通る。
+        (
+            "a-normally-grantable-path-is-not-recorded-as-forced",
+            fs_allow_case_a_normally_grantable_path_is_not_recorded_as_forced,
+        ),
         // [測定7] 昇格が要るシステム保護パスの腕。**上の4本はどれも`preflight`の
         // `needs_elevation`へ入らない**（`C:\`直下の書けるパスなので、その場で書けてしまう）ので、
         // 宛先SIDを持ち回す形へ変えた区間はここが唯一の実行経路である。
@@ -4395,6 +4489,35 @@ impl FsLedgerExclusive {
 
 /// 台帳の`entries`を`(path, settings_managed, settings_workspaces)`で読み出す。
 /// **[`FsLedgerExclusive`]のメソッドからのみ呼ぶこと**（排他ガードの外から呼べる自由関数にしない）。
+/// 台帳の`forced`欄を`(path, forced)`で読む（[BUG-119](../../../docs/bugs/BUG-119.md)）。
+///
+/// [`read_fs_ledger_entries`]は`settings_managed`側を見る別の測定用なので、
+/// **同じJSONを読むが返す欄が違う**。片方へ欄を足して両方の呼び出し元を直すより、
+/// 測る対象ごとに小さく読むほうが「何を測っているか」が読める。
+fn read_fs_ledger_forced_flags() -> Result<Vec<(String, bool)>, String> {
+    let path = fs_passthrough_ledger_path();
+    let data = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let json: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+    let entries = json
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("{} has no `entries` array", path.display()))?;
+    Ok(entries
+        .iter()
+        .map(|e| {
+            (
+                e.get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                e.get("forced").and_then(|v| v.as_bool()).unwrap_or(false),
+            )
+        })
+        .collect())
+}
+
 fn read_fs_ledger_entries() -> Result<Vec<(String, bool, Vec<String>)>, String> {
     let path = fs_passthrough_ledger_path();
     let data = std::fs::read_to_string(&path)
