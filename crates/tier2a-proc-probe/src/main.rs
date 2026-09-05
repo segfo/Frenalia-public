@@ -15,6 +15,8 @@
 
 use std::env;
 use std::fs;
+use std::io::Write as _;
+use std::io::{self};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -33,6 +35,7 @@ mod winid;
 // いずれも通常の検査（FS・脱走・ネット・再帰spawn）を行わない短絡モードで、
 // `try_runas`・`load_library`と同じ位置付け。判定が出たら削除する
 // （`docs/CODE-STRUCTURE-RULES.md`規則2「一回性の調査実験をテストとして残さない」）。
+mod console_share;
 mod object_reach;
 mod open_bench;
 mod pipe_client;
@@ -87,6 +90,9 @@ struct Args {
     /// D-88（Lazy ACE fault-in）の着手条件: Redirector DLLのフックが**成功するopen**へ
     /// 上乗せする時間を、同一プロセスの「載せる前／載せた後」で測る（`open_bench`モジュールdoc）。
     open_bench: Option<open_bench::Spec>,
+    /// MAC設計§7.1.1の測定3: 同じコンソールに繋がったプロセス同士が互いの画面バッファを
+    /// 読めるか・互いを落とせるか（`console_share`モジュールdoc）。
+    console_share: Option<console_share::Spec>,
     /// 上記スパイクモードが結果を書き出すファイル（stdoutを読み切れない経路のため）。
     report_file: Option<String>,
     /// スパイクモードが「生きたまま待つ」秒数（`hold_file`と単独指定時のアイドル）。
@@ -119,6 +125,11 @@ fn parse_args() -> Args {
     let mut bench_outside: Option<String> = None;
     let mut bench_dll: Option<String> = None;
     let mut bench_iters: usize = 20_000;
+    let mut console_write: Option<String> = None;
+    let mut console_read = false;
+    let mut console_ctrl_break = false;
+    let mut console_idle_secs: u64 = 0;
+    let mut console_mode = false;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -194,9 +205,34 @@ fn parse_args() -> Args {
                     bench_iters = v.max(1);
                 }
             }
+            // §7.1.1測定3。**どれか1つでも指定されたらコンソールモード**にする——
+            // 「読むだけ」「撃つだけ」の腕があるので、書く引数を必須にできない。
+            "--console-write" => {
+                console_write = Some(next());
+                console_mode = true;
+            }
+            "--console-read" => {
+                console_read = true;
+                console_mode = true;
+            }
+            "--console-ctrl-break" => {
+                console_ctrl_break = true;
+                console_mode = true;
+            }
+            "--console-idle-secs" => {
+                console_idle_secs = next().parse().unwrap_or(0);
+                console_mode = true;
+            }
             _ => {}
         }
     }
+
+    let console_share = console_mode.then_some(console_share::Spec {
+        write: console_write,
+        read: console_read,
+        ctrl_break: console_ctrl_break,
+        idle_secs: console_idle_secs,
+    });
 
     let open_bench = bench_inside.map(|inside| open_bench::Spec {
         inside,
@@ -226,6 +262,7 @@ fn parse_args() -> Args {
         use_process_handle,
         pipe_client,
         open_bench,
+        console_share,
         report_file,
         idle_secs,
     }
@@ -563,6 +600,22 @@ fn main() -> ExitCode {
             "{}",
             serde_json::to_string(&report).expect("object_reach report must serialize")
         );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(spec) = &args.console_share {
+        let report = console_share::run(spec);
+        if let Some(path) = &args.report_file {
+            let _ = fs::write(path, report.to_string());
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("console_share report must serialize")
+        );
+        // **出し切ってから待つ。** 待っている間にCtrl+Breakで落とされると、
+        // バッファに残った出力は失われる（「落とされた」と「動かなかった」が区別できなくなる）。
+        let _ = io::stdout().flush();
+        console_share::idle(spec);
         return ExitCode::SUCCESS;
     }
 

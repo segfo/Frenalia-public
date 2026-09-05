@@ -37,4 +37,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Rpc",
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
+    # §7.1.1測定3: 同じコンソールに繋がったプロセス同士が画面バッファを読めるか・
+    # 互いへCtrl+Breakを撃てるか（`console_share`）。
+    "Win32_System_Console",
 ] }

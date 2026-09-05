@@ -20,6 +20,7 @@
 
 use std::ffi::c_void;
 
+use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Foundation::{
     DuplicateHandle, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
 };
@@ -27,6 +28,7 @@ use windows::Win32::System::Console::{AttachConsole, FreeConsole, GetConsoleProc
 use windows::Win32::System::Diagnostics::Debug::{
     SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX,
 };
+use windows::Win32::System::Threading::GetProcessHandleCount;
 
 use super::mac_spike_tests::{
     last_json_line, probe_exe, workspace_capability_for, SpikeChild, SpikeConsole, SpikeSpawn,
@@ -1427,5 +1429,887 @@ fn the_stdio_marker_is_read_from_its_own_line() {
         missing.stdio_redirected(),
         None,
         "印が無い回を`Some`で返すと、測っていないことを測ったことにできてしまう"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §7.1.1 測定2: attach/detachの往復に耐えるか
+// ---------------------------------------------------------------------------
+
+/// このプロセスが現在開いているカーネルハンドルの本数。
+///
+/// **`None`は「0本」ではなく「数えられなかった」である。** 混ぜると、計器が死んだ回を
+/// 「漏れていない」と読むことになる。
+fn open_handle_count() -> Option<u32> {
+    let mut count: u32 = 0;
+    unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }
+        .ok()
+        .map(|()| count)
+}
+
+/// `AttachConsole`→`FreeConsole`を1往復ぶん、`cycles`回繰り返す。
+/// **設計書§7.1.1の窓と同じ順序**で、中身（`CreateProcessW`）だけを抜いてある。
+///
+/// 途中で失敗したら**何回目かを添えて**返す——「何回目で壊れたか」は「壊れた」より強い事実で、
+/// 実装が窓を開ける上限を決めるのに要る。
+fn cycle_console_loan(holder_pid: u32, cycles: u32) -> Result<(), String> {
+    for i in 0..cycles {
+        unsafe {
+            // 既定状態（未接続）へ戻す。既に未接続なら失敗するが、その状態が目的なので無視する。
+            let _ = FreeConsole();
+            AttachConsole(holder_pid)
+                .map_err(|e| format!("AttachConsole failed on cycle {i} of {cycles}: {e}"))?;
+        }
+        // **借りられたことを毎回確かめる。** `AttachConsole`が成功を返しても、構成員に
+        // 自分が載っていなければ借りられていない（無言失敗、B-10）。
+        let mut process_ids = [0u32; 8];
+        let count = unsafe { GetConsoleProcessList(&mut process_ids) } as usize;
+        if count == 0 || count > process_ids.len() {
+            unsafe {
+                let _ = FreeConsole();
+            }
+            return Err(format!(
+                "console membership is unreadable on cycle {i} of {cycles}: count={count}"
+            ));
+        }
+        if !process_ids[..count].contains(&std::process::id()) {
+            unsafe {
+                let _ = FreeConsole();
+            }
+            return Err(format!(
+                "attached but not a member on cycle {i} of {cycles}: members={:?}",
+                &process_ids[..count]
+            ));
+        }
+        unsafe {
+            FreeConsole()
+                .map_err(|e| format!("FreeConsole failed on cycle {i} of {cycles}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// **§7.1.1測定2**: コンソールの貸し借りを繰り返してもDaemon役が壊れないか。
+///
+/// 設計書は窓（`AttachConsole`〜`CreateProcessW`〜`FreeConsole`）を**spawnのたびに**開け閉めすると
+/// 決めている。壊れるなら窓を広げる——つまりDaemonがコンソールに繋がったままになり、
+/// **サンドボックスから`GenerateConsoleCtrlEvent`でDaemonを落とせる形**を受け入れることになる。
+/// §7.1.1はまさにそれを避けて窓を閉じたので、ここが崩れると設計判断へ戻る。
+///
+/// **3つを別々に見る。**
+///
+/// 1. 往復そのものがN回とも成功するか（失敗したら**何回目か**を返す）
+/// 2. ハンドルが残らないか（開始・中間・終了の3点で数える。2点だと「漏れて戻った」と区別できない）
+/// 3. **N回の後に実際にシェルが走るか**——1と2が通っても「借りられるが子が動かない」があり得る
+///
+/// **計器の歯**（`B-27`）: わざとハンドルを漏らすループを同じ回の中で回し、カウンタが実際に
+/// 動くことを確かめる。**これが無いと「増えなかった」は「カウンタが動かない」と区別できない。**
+#[test]
+#[ignore = "touches real AppContainer state; run non-elevated (see plans/mac-spike/RESULTS.md)"]
+fn attach_detach_cycles_do_not_leak_handles_or_break_the_console_loan() {
+    // **Nの決め方**: コンソールが要るのは**シェルだけ**（`DETACHED_PROCESS`で起こす
+    // node・git・MCPサーバはこの窓を通らない）。1セッションが出す`run_shell`の回数に上限は
+    // 無いので、「実運用より多い側」を選ぶしかない。500回なら、1往復につきハンドルが1本でも
+    // 漏れれば**+500**として見える——下のSLACKとは2桁違うので取り違えは起きない。
+    const CYCLES: u32 = 500;
+    // ハンドル数は他の要因（ログのファイル・スレッド）でも数本動く。
+    const SLACK: u32 = 32;
+    // 計器の歯で意図的に漏らす本数。SLACKより十分大きく取る（でなければ「歯があること」と
+    // 「揺らぎ」が区別できない）。
+    const DELIBERATE_LEAK: u32 = 256;
+
+    let measure_lock = std::path::Path::new(r"C:\harness-e2e\_measure-lock\mac-console-cycles");
+    std::fs::create_dir_all(
+        measure_lock
+            .parent()
+            .expect("measurement lock has a parent"),
+    )
+    .expect("create the serialized measurement lock parent");
+    std::fs::create_dir(measure_lock).unwrap_or_else(|e| {
+        panic!(
+            "測定ロックを取得できない（並列測定または前回残骸を確認する）: path={measure_lock:?} error={e}"
+        )
+    });
+    let _measure_lock_cleanup = super::test_support::scopeguard(|| {
+        std::fs::remove_dir(measure_lock).ok();
+    });
+
+    let (workspace, sid, caps) = spike_workspace();
+    let workspace_canonical = workspace
+        .path()
+        .canonicalize()
+        .expect("canonicalize the spike workspace");
+    let cleanup_workspace = workspace_canonical.clone();
+    let _cleanup = super::test_support::scopeguard(move || {
+        let outcome =
+            crate::tier2a::session_profile::end_session(&super::revoke::revoke_session_grant);
+        eprintln!("[MAC-CONSOLE-CYCLES] cleanup: {:?}", outcome.summary());
+        super::mac_spike_tests::forget_workspace_capability(&cleanup_workspace);
+        if let Err(e) = std::fs::remove_dir_all(&cleanup_workspace) {
+            eprintln!("[MAC-CONSOLE-CYCLES] cleanup could not remove workspace: {e}");
+        }
+        if !cleanup_workspace.exists() {
+            crate::tier2a::workspace_ledger::remove_workspace_entry(&cleanup_workspace);
+        }
+    });
+    let caps_psid: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
+    let probe = probe_exe();
+    let probe_str = probe
+        .to_str()
+        .expect("probe path is valid utf-8")
+        .to_string();
+    let (shell, shell_label) = resolve_shell();
+    eprintln!(
+        "[MAC-CONSOLE-CYCLES] elevated={} shell={shell_label} cycles={CYCLES}",
+        crate::tier2a::privhelper::is_elevated()
+    );
+
+    let holder_report = workspace.path().join("cycles-holder.json");
+    let holder_report_str = holder_report.to_string_lossy().into_owned();
+    let holder_args = [
+        "--idle-secs",
+        "120",
+        "--timeout-secs",
+        "180",
+        "--report-file",
+        holder_report_str.as_str(),
+    ];
+    let holder_spec = SpikeSpawn {
+        exe: &probe_str,
+        args: &holder_args,
+        cwd: workspace.path(),
+        container_sid: sid.as_psid(),
+        capabilities: &[],
+        child_process_restricted: false,
+        stdout_override: None,
+        extra_inherit: &[],
+        process_sddl: None,
+        thread_sddl: None,
+        token_default_dacl_sddl: None,
+        no_appcontainer: true,
+        console: SpikeConsole::NoWindow,
+    };
+    let holder = wait_until_holder_is_ready(&holder_spec, &holder_report);
+    let holder_pid = holder.pid();
+
+    // --- 1と2: 往復とハンドル数 -------------------------------------------------
+    let before = open_handle_count().expect("GetProcessHandleCount(before)");
+    let first_half = cycle_console_loan(holder_pid, CYCLES / 2);
+    let middle = open_handle_count().expect("GetProcessHandleCount(middle)");
+    let second_half = cycle_console_loan(holder_pid, CYCLES / 2);
+    let after = open_handle_count().expect("GetProcessHandleCount(after)");
+    // 借りたままにしない（以降の腕は既定状態＝未接続から始める）。
+    unsafe {
+        let _ = FreeConsole();
+    }
+    eprintln!(
+        "[MAC-CONSOLE-CYCLES] handles before={before} middle={middle} after={after} \
+         (first_half={first_half:?} second_half={second_half:?})"
+    );
+
+    // --- 計器の歯: わざと漏らすと本当に増えるか ---------------------------------
+    let leak_before = open_handle_count().expect("GetProcessHandleCount(leak before)");
+    let mut leaked: Vec<HANDLE> = Vec::with_capacity(DELIBERATE_LEAK as usize);
+    for _ in 0..DELIBERATE_LEAK {
+        let mut dup = HANDLE::default();
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentProcess(),
+                GetCurrentProcess(),
+                &mut dup,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok.is_ok() {
+            leaked.push(dup);
+        }
+    }
+    let leak_after = open_handle_count().expect("GetProcessHandleCount(leak after)");
+    for h in leaked.drain(..) {
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+    }
+    let leak_growth = leak_after.saturating_sub(leak_before);
+    eprintln!(
+        "[MAC-CONSOLE-CYCLES] deliberate leak: before={leak_before} after={leak_after} \
+         growth={leak_growth} (leaked {DELIBERATE_LEAK})"
+    );
+    assert!(
+        leak_growth >= DELIBERATE_LEAK / 2,
+        "わざと{DELIBERATE_LEAK}本漏らしてもハンドル数が{leak_growth}しか増えない。\
+         カウンタが動いていないので、往復のあとで「増えなかった」と言っても意味が無い"
+    );
+
+    // --- 判定（往復とハンドル数） -----------------------------------------------
+    first_half.unwrap_or_else(|e| {
+        panic!("コンソールの貸し借りが前半で壊れた（窓を毎spawn開閉できない）: {e}")
+    });
+    second_half.unwrap_or_else(|e| {
+        panic!("コンソールの貸し借りが後半で壊れた（回数を重ねると壊れる形）: {e}")
+    });
+    let growth = after.saturating_sub(before);
+    assert!(
+        growth <= SLACK,
+        "{CYCLES}往復でハンドルが{growth}本増えた（許容{SLACK}）。1往復につき漏れているなら\
+         約{CYCLES}本になるので、窓を毎spawn開閉する設計が成り立たない: \
+         before={before} middle={middle} after={after}"
+    );
+
+    // --- 3: 回数を重ねた後でも、実際にシェルが走るか -----------------------------
+    // **1と2が通っても、これが落ちることはあり得る**（借りられるが子が動かない）。
+    const AFTER_CYCLES: ArmSpec = ArmSpec {
+        label: "after-cycles",
+        holder_console: SpikeConsole::NoWindow,
+        loan: ConsoleLoan::Attach,
+        resume_at: ResumePoint::InsideWindow,
+    };
+    let previous_error_mode = unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)
+    };
+    let _restore_error_mode = super::test_support::scopeguard(move || unsafe {
+        SetErrorMode(previous_error_mode);
+    });
+    let marker = workspace.path().join("cycles-marker.txt");
+    let run = run_restricted_shell_while_attached(
+        &AFTER_CYCLES,
+        holder_pid,
+        &shell,
+        workspace.path(),
+        sid.as_psid(),
+        &caps_psid,
+        &marker,
+    );
+    drop(holder);
+    let run = run.unwrap_or_else(|e| {
+        panic!("{CYCLES}往復の後にシェルを起こせなくなった: shell={shell_label} error={e}")
+    });
+    eprintln!("[MAC-CONSOLE-CYCLES] after {CYCLES} cycles: {run:?}");
+    assert!(
+        run.actually_ran() && run.child_creation_denied(),
+        "{CYCLES}往復の後は借りられるがシェルが完走しない（状態が残っている）: \
+         shell={shell_label} observation={run:?}"
+    );
+    assert_eq!(
+        run.stdio_redirected(),
+        Some("True/True/True"),
+        "{CYCLES}往復の後に子の標準ハンドルへコンソールが混入した: observation={run:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §7.1.1 測定6: コンソールを持たせる費用
+// ---------------------------------------------------------------------------
+
+/// `iters`回まわして1回あたりのマイクロ秒を返す。
+///
+/// **1回だけ測って割らない。** 1回の呼び出しはタイマの分解能と同じ桁になり得るので、
+/// 「速い」と「測れていない」が区別できなくなる。
+fn micros_per_op(iters: u32, mut op: impl FnMut()) -> f64 {
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        op();
+    }
+    start.elapsed().as_secs_f64() * 1e6 / f64::from(iters)
+}
+
+/// 標本の最小・中央・最大。**1点で報告しない**（散らばりが分からないと外挿してしまう）。
+fn spread(mut samples: Vec<f64>) -> (f64, f64, f64) {
+    samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in timing samples"));
+    let min = samples[0];
+    let max = samples[samples.len() - 1];
+    let median = samples[samples.len() / 2];
+    (min, median, max)
+}
+
+/// **§7.1.1測定6**: コンソールを持たせる費用。**シェル起動の増分**を決める。
+///
+/// 測るのは2つで、**掛かる頻度が違う**。
+///
+/// | 何を | 頻度 |
+/// |---|---|
+/// | 保持プロセス＋`conhost`を1本立てる | ドメインにつき1回（[§22.9](DESIGN-MAC-BROKER.md)の費用表に載る） |
+/// | `FreeConsole`→`AttachConsole`→`FreeConsole`の窓 | **シェルのspawnごと**。`DETACHED_PROCESS`で起こす大多数は通らない |
+///
+/// **ドリフトの対照を同じ回で撮る。** 同じ形のループをコンソール操作抜きで回し、
+/// ループそのものの費用を引けるようにする——引かないと、測っているのが窓なのか
+/// `for`ループなのか分からない。
+///
+/// **この測定が言わないこと**: 「シェル1本の起動がコンソールのせいでいくら増えたか」は
+/// **測れない**。比べる相手（コンソール無しで走るmitigation付きシェル）が存在しないためである
+/// ——[§S46b](mac-spike/RESULTS.md)のとおり、借りない腕は起動そのものに失敗する。
+/// ここで出るのは**窓の費用**であって、シェル起動の総額ではない。
+#[test]
+#[ignore = "touches real AppContainer state; run non-elevated (see plans/mac-spike/RESULTS.md)"]
+fn console_loan_cost_is_measured_for_the_holder_and_for_the_per_spawn_window() {
+    // 窓の反復回数。500往復まで壊れないことは測定2で確かめてあるので、費用側はその範囲で厚く撮る。
+    const WINDOW_ITERS: u32 = 2_000;
+    // 窓の標本数（1標本＝WINDOW_ITERS回の平均）。散らばりを出すために複数撮る。
+    const WINDOW_SAMPLES: usize = 5;
+    // 保持プロセスを立て直す回数。1回では分解能と区別が付かない。
+    const HOLDER_SAMPLES: usize = 5;
+
+    let measure_lock = std::path::Path::new(r"C:\harness-e2e\_measure-lock\mac-console-cost");
+    std::fs::create_dir_all(
+        measure_lock
+            .parent()
+            .expect("measurement lock has a parent"),
+    )
+    .expect("create the serialized measurement lock parent");
+    std::fs::create_dir(measure_lock).unwrap_or_else(|e| {
+        panic!(
+            "測定ロックを取得できない（並列測定または前回残骸を確認する）: path={measure_lock:?} error={e}"
+        )
+    });
+    let _measure_lock_cleanup = super::test_support::scopeguard(|| {
+        std::fs::remove_dir(measure_lock).ok();
+    });
+
+    let (workspace, sid, caps) = spike_workspace();
+    let workspace_canonical = workspace
+        .path()
+        .canonicalize()
+        .expect("canonicalize the spike workspace");
+    let cleanup_workspace = workspace_canonical.clone();
+    let _cleanup = super::test_support::scopeguard(move || {
+        let outcome =
+            crate::tier2a::session_profile::end_session(&super::revoke::revoke_session_grant);
+        eprintln!("[MAC-CONSOLE-COST] cleanup: {:?}", outcome.summary());
+        super::mac_spike_tests::forget_workspace_capability(&cleanup_workspace);
+        if let Err(e) = std::fs::remove_dir_all(&cleanup_workspace) {
+            eprintln!("[MAC-CONSOLE-COST] cleanup could not remove workspace: {e}");
+        }
+        if !cleanup_workspace.exists() {
+            crate::tier2a::workspace_ledger::remove_workspace_entry(&cleanup_workspace);
+        }
+    });
+    let _ = caps;
+    let probe = probe_exe();
+    let probe_str = probe
+        .to_str()
+        .expect("probe path is valid utf-8")
+        .to_string();
+    eprintln!(
+        "[MAC-CONSOLE-COST] elevated={} window_iters={WINDOW_ITERS} samples={WINDOW_SAMPLES}",
+        crate::tier2a::privhelper::is_elevated()
+    );
+
+    // --- (a) 保持プロセス＋conhostを1本立てる費用 --------------------------------
+    // **`CREATE_NO_WINDOW`での起動と、`"mode":"idle"`を読めるまで**を1回分とする。
+    // 「起動して制御が返るまで」ではなく「使えるようになるまで」が、Daemonが実際に待つ時間である。
+    let mut holder_ms: Vec<f64> = Vec::with_capacity(HOLDER_SAMPLES);
+    let mut last_holder: Option<SpikeChild> = None;
+    for i in 0..HOLDER_SAMPLES {
+        let report = workspace.path().join(format!("cost-holder-{i}.json"));
+        let report_str = report.to_string_lossy().into_owned();
+        let args = [
+            "--idle-secs",
+            "120",
+            "--timeout-secs",
+            "180",
+            "--report-file",
+            report_str.as_str(),
+        ];
+        let spec = SpikeSpawn {
+            exe: &probe_str,
+            args: &args,
+            cwd: workspace.path(),
+            container_sid: sid.as_psid(),
+            capabilities: &[],
+            child_process_restricted: false,
+            stdout_override: None,
+            extra_inherit: &[],
+            process_sddl: None,
+            thread_sddl: None,
+            token_default_dacl_sddl: None,
+            no_appcontainer: true,
+            console: SpikeConsole::NoWindow,
+        };
+        let start = std::time::Instant::now();
+        let child = wait_until_holder_is_ready(&spec, &report);
+        holder_ms.push(start.elapsed().as_secs_f64() * 1e3);
+        // 最後の1本だけ残して窓の測定に使う。残りはここで畳む。
+        last_holder = Some(child);
+        if i + 1 < HOLDER_SAMPLES {
+            last_holder = None;
+        }
+    }
+    let holder = last_holder.expect("the last holder is kept for the window measurement");
+    let holder_pid = holder.pid();
+    let (h_min, h_med, h_max) = spread(holder_ms.clone());
+    eprintln!(
+        "[MAC-CONSOLE-COST] holder+conhost ready: min={h_min:.1}ms median={h_med:.1}ms \
+         max={h_max:.1}ms samples={holder_ms:?}"
+    );
+
+    // --- (b) 窓（FreeConsole → AttachConsole → FreeConsole）の1回あたり ----------
+    // **本番の窓と同じ3呼び出しだけを回す。** 測定2が使っている構成員の読み返しは
+    // ここでは回さない（あれは検算であって、本番の窓には無い）。
+    let mut window_us: Vec<f64> = Vec::with_capacity(WINDOW_SAMPLES);
+    let mut drift_us: Vec<f64> = Vec::with_capacity(WINDOW_SAMPLES);
+    let mut attach_failures: u32 = 0;
+    for _ in 0..WINDOW_SAMPLES {
+        window_us.push(micros_per_op(WINDOW_ITERS, || unsafe {
+            let _ = FreeConsole();
+            if AttachConsole(holder_pid).is_err() {
+                attach_failures += 1;
+            }
+            let _ = FreeConsole();
+        }));
+        // ドリフトの対照。**同じ形のループ**で、コンソール操作だけを抜く。
+        drift_us.push(micros_per_op(WINDOW_ITERS, || {
+            std::hint::black_box(std::process::id());
+        }));
+    }
+    unsafe {
+        let _ = FreeConsole();
+    }
+    drop(holder);
+
+    let (w_min, w_med, w_max) = spread(window_us.clone());
+    let (d_min, d_med, d_max) = spread(drift_us.clone());
+    eprintln!(
+        "[MAC-CONSOLE-COST] window(Free+Attach+Free): min={w_min:.1}us median={w_med:.1}us \
+         max={w_max:.1}us samples={window_us:?}"
+    );
+    eprintln!(
+        "[MAC-CONSOLE-COST] drift(loop only): min={d_min:.3}us median={d_med:.3}us \
+         max={d_max:.3}us samples={drift_us:?}"
+    );
+    eprintln!(
+        "[MAC-CONSOLE-COST] window minus drift (median) = {:.1}us per shell spawn",
+        w_med - d_med
+    );
+
+    // --- 検算: 測っているものが本当に走ったか -----------------------------------
+    // **`AttachConsole`が失敗した回が混ざっていると、速いのは「何もしていないから」になる。**
+    assert_eq!(
+        attach_failures, 0,
+        "窓の測定中にAttachConsoleが{attach_failures}回失敗した。\
+         失敗した回が混ざった平均は費用として読めない"
+    );
+    // ループそのものの費用が窓の費用と同じ桁なら、測っているのは窓ではない。
+    assert!(
+        w_med > d_med * 10.0,
+        "窓の費用({w_med:.3}us)がループの費用({d_med:.3}us)と同じ桁である。\
+         この数字はコンソール操作の費用として読めない"
+    );
+    // 保持プロセスの起動が0msなら、`wait_until_holder_is_ready`が待っていない＝測れていない。
+    assert!(
+        h_min > 0.0,
+        "保持プロセスの起動が0msと出た。準備完了を待てていない: samples={holder_ms:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §7.1.1 測定3: 同じコンソールに繋がったプロセス同士が干渉できるか
+// ---------------------------------------------------------------------------
+
+/// `console_share`モードのレポートから試行1件を引く。
+///
+/// **`ok`だけでなくレコードごと返す**——読み取りの腕では`text`まで見たいので、
+/// 真偽だけに畳むと「読めたが中身が違う」を落とすことになる。
+fn console_attempt<'a>(report: &'a serde_json::Value, kind: &str) -> Option<&'a serde_json::Value> {
+    report
+        .get("attempts")?
+        .as_array()?
+        .iter()
+        .find(|a| a.get("kind").and_then(|k| k.as_str()) == Some(kind))
+}
+
+/// 読み取りの腕が、探している印を実際に見たか。
+///
+/// `None`＝読み取りの試行そのものがレポートに無い（プローブが撃っていない）。
+/// **「読めなかった」と混同しない。**
+fn console_read_saw(report: &serde_json::Value, marker: &str) -> Option<bool> {
+    let attempt = console_attempt(report, "console-read")?;
+    if attempt.get("ok").and_then(|o| o.as_bool()) != Some(true) {
+        return Some(false);
+    }
+    Some(
+        attempt
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.contains(marker)),
+    )
+}
+
+/// **§7.1.1測定3**: 1本のコンソールを2つのドメインで共有したとき、互いに干渉できるか。
+///
+/// **決まるのは保持プロセスの分割単位である。** ファイル・ネットワーク・プロセスはドメインごとに
+/// 分けてあるので、コンソールだけが横断チャネルとして残ると、そこがいちばん弱い辺になる。
+///
+/// **結論は両方向に効く。**
+///
+/// - 読める／落とせる → 保持プロセスは**ドメインごとに1本**要る（[§22.9](DESIGN-MAC-BROKER.md)の費用表がそのまま）
+/// - サンドボックスから画面バッファへ**触れない** → 通り道が無いので**共有できる余地**が出る（費用が減る）
+///
+/// **腕は5つで、隣とは軸を1つだけ変える**（`B-29`）。
+///
+/// | 腕 | AppContainerか | ドメイン | コンソール | 役割 |
+/// |---|---|---|---|---|
+/// | `writer` | はい | A | 借りる | 印を書き、**自分で読み返す**（書けたことの検算） |
+/// | `same-domain` | はい | A | 借りる | 同じドメインなら読めるか |
+/// | `other-domain` | はい | **B** | 借りる | **本命** |
+/// | `no-console` | はい | A | **持たない** | 効いているのがコンソール参加であることの対照 |
+/// | `outside` | **いいえ** | – | 借りる | **計器が生きていることの対照**。ここが読めないなら他の腕の「読めない」は何も語らない |
+///
+/// **書けたことを先に確かめる。** `writer`が自分で読み返せていなければ、他の腕が
+/// 「読めなかった」ことはコンソールの性質を語らない（測っていないだけである）。
+#[test]
+#[ignore = "touches real AppContainer state; run non-elevated (see plans/mac-spike/RESULTS.md)"]
+fn one_console_shared_by_two_domains_is_measured_for_read_and_ctrl_break() {
+    const MARKER: &str = "HARNESS-CONSOLE-SHARE-MARKER";
+
+    let measure_lock = std::path::Path::new(r"C:\harness-e2e\_measure-lock\mac-console-share");
+    std::fs::create_dir_all(
+        measure_lock
+            .parent()
+            .expect("measurement lock has a parent"),
+    )
+    .expect("create the serialized measurement lock parent");
+    std::fs::create_dir(measure_lock).unwrap_or_else(|e| {
+        panic!(
+            "測定ロックを取得できない（並列測定または前回残骸を確認する）: path={measure_lock:?} error={e}"
+        )
+    });
+    let _measure_lock_cleanup = super::test_support::scopeguard(|| {
+        std::fs::remove_dir(measure_lock).ok();
+    });
+
+    let (workspace, sid, caps) = spike_workspace();
+    let workspace_canonical = workspace
+        .path()
+        .canonicalize()
+        .expect("canonicalize the spike workspace");
+    let cleanup_workspace = workspace_canonical.clone();
+    let _cleanup = super::test_support::scopeguard(move || {
+        let outcome =
+            crate::tier2a::session_profile::end_session(&super::revoke::revoke_session_grant);
+        eprintln!("[MAC-CONSOLE-SHARE] cleanup: {:?}", outcome.summary());
+        super::mac_spike_tests::forget_workspace_capability(&cleanup_workspace);
+        if let Err(e) = std::fs::remove_dir_all(&cleanup_workspace) {
+            eprintln!("[MAC-CONSOLE-SHARE] cleanup could not remove workspace: {e}");
+        }
+        if !cleanup_workspace.exists() {
+            crate::tier2a::workspace_ledger::remove_workspace_entry(&cleanup_workspace);
+        }
+    });
+
+    // ドメインAとドメインBの身分証。**この1本だけが2つの腕の差である。**
+    let pid = std::process::id();
+    let domain_a = super::capability_sid_from_name(&format!("harness-console-share-A-{pid}"))
+        .expect("derive domain A capability");
+    let domain_b = super::capability_sid_from_name(&format!("harness-console-share-B-{pid}"))
+        .expect("derive domain B capability");
+    let mut caps_a: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
+    let mut caps_b = caps_a.clone();
+    caps_a.push(domain_a.as_psid());
+    caps_b.push(domain_b.as_psid());
+
+    let probe = probe_exe();
+    let probe_str = probe
+        .to_str()
+        .expect("probe path is valid utf-8")
+        .to_string();
+    eprintln!(
+        "[MAC-CONSOLE-SHARE] elevated={}",
+        crate::tier2a::privhelper::is_elevated()
+    );
+
+    let holder_report = workspace.path().join("share-holder.json");
+    let holder_report_str = holder_report.to_string_lossy().into_owned();
+    let holder_args = [
+        "--idle-secs",
+        "120",
+        "--timeout-secs",
+        "180",
+        "--report-file",
+        holder_report_str.as_str(),
+    ];
+    let holder_spec = SpikeSpawn {
+        exe: &probe_str,
+        args: &holder_args,
+        cwd: workspace.path(),
+        container_sid: sid.as_psid(),
+        capabilities: &[],
+        child_process_restricted: false,
+        stdout_override: None,
+        extra_inherit: &[],
+        process_sddl: None,
+        thread_sddl: None,
+        token_default_dacl_sddl: None,
+        no_appcontainer: true,
+        console: SpikeConsole::NoWindow,
+    };
+    let holder = wait_until_holder_is_ready(&holder_spec, &holder_report);
+    let holder_pid = holder.pid();
+    eprintln!("[MAC-CONSOLE-SHARE] holder pid={holder_pid}");
+
+    // 1本の腕を撃つ。**設計書§7.1.1の窓と同じ形**——借りて、起こして、すぐ返す。
+    // 返さないとこのプロセスがCtrl+Breakの巻き添えになる（測っている側が死ぬ）。
+    let spawn_arm = |label: &str,
+                     args: &[&str],
+                     capabilities: &[PSID],
+                     no_appcontainer: bool,
+                     console: SpikeConsole|
+     -> Result<SpikeChild, String> {
+        unsafe {
+            let _ = FreeConsole();
+        }
+        let _detach = if console == SpikeConsole::Inherit {
+            unsafe {
+                AttachConsole(holder_pid)
+                    .map_err(|e| format!("{label}: AttachConsole({holder_pid}) failed: {e}"))?;
+            }
+            Some(ConsoleDetachGuard)
+        } else {
+            None
+        };
+        SpikeSpawn {
+            exe: &probe_str,
+            args,
+            cwd: workspace.path(),
+            container_sid: sid.as_psid(),
+            capabilities,
+            child_process_restricted: false,
+            stdout_override: None,
+            extra_inherit: &[],
+            process_sddl: None,
+            thread_sddl: None,
+            token_default_dacl_sddl: None,
+            no_appcontainer,
+            console,
+        }
+        .spawn()
+        .map_err(|e| format!("{label}: spawn failed: {e}"))
+    };
+
+    let read_arm = |label: &str,
+                    args: &[&str],
+                    capabilities: &[PSID],
+                    no_appcontainer: bool,
+                    console: SpikeConsole|
+     -> serde_json::Value {
+        let mut child = spawn_arm(label, args, capabilities, no_appcontainer, console)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (stdout, stderr, code) = child.wait_and_read();
+        eprintln!("[MAC-CONSOLE-SHARE] {label}: exit={code} stderr={stderr}\n{stdout}");
+        last_json_line(&stdout).unwrap_or_else(|| panic!("{label} produced no JSON: {stdout}"))
+    };
+
+    // --- 腕1: 書いて自分で読み返す（書けたことの検算） --------------------------
+    let writer = read_arm(
+        "writer(domainA)",
+        &[
+            "--console-write",
+            MARKER,
+            "--console-read",
+            "--timeout-secs",
+            "60",
+        ],
+        &caps_a,
+        false,
+        SpikeConsole::Inherit,
+    );
+    // --- 腕2〜5: 読むだけ -------------------------------------------------------
+    let read_args = ["--console-read", "--timeout-secs", "60"];
+    let same_domain = read_arm(
+        "same-domain(A)",
+        &read_args,
+        &caps_a,
+        false,
+        SpikeConsole::Inherit,
+    );
+    let other_domain = read_arm(
+        "other-domain(B)",
+        &read_args,
+        &caps_b,
+        false,
+        SpikeConsole::Inherit,
+    );
+    let no_console = read_arm(
+        "no-console(A)",
+        &read_args,
+        &caps_a,
+        false,
+        SpikeConsole::Detached,
+    );
+    let outside = read_arm(
+        "outside(instrument)",
+        &read_args,
+        &[],
+        true,
+        SpikeConsole::Inherit,
+    );
+
+    let membership = |r: &serde_json::Value| {
+        r.get("membership")
+            .and_then(|m| m.get("attached"))
+            .and_then(|a| a.as_bool())
+    };
+    eprintln!(
+        "[MAC-CONSOLE-SHARE] attached? writer={:?} same={:?} other={:?} nocon={:?} outside={:?}",
+        membership(&writer),
+        membership(&same_domain),
+        membership(&other_domain),
+        membership(&no_console),
+        membership(&outside),
+    );
+    eprintln!(
+        "[MAC-CONSOLE-SHARE] saw marker? writer={:?} same={:?} other={:?} nocon={:?} outside={:?}",
+        console_read_saw(&writer, MARKER),
+        console_read_saw(&same_domain, MARKER),
+        console_read_saw(&other_domain, MARKER),
+        console_read_saw(&no_console, MARKER),
+        console_read_saw(&outside, MARKER),
+    );
+
+    // --- 腕6: 撃たなければ的は生き残るか（**Ctrl+Breakの対照**） ----------------
+    // これが無いと、あとで的が死んだのを「Ctrl+Breakのせい」と言えない
+    // ——待ち時間で勝手に終わっていただけかもしれない。
+    let idle_args = [
+        "--console-write",
+        MARKER,
+        "--console-idle-secs",
+        "25",
+        "--timeout-secs",
+        "90",
+    ];
+    let control_target = spawn_arm(
+        "ctrl-break control(domainA, 撃たない)",
+        &idle_args,
+        &caps_a,
+        false,
+        SpikeConsole::Inherit,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let control_wait = unsafe { WaitForSingleObject(control_target.process(), 5_000) };
+    let control_survived = control_wait != WAIT_OBJECT_0;
+    eprintln!("[MAC-CONSOLE-SHARE] control target survived 5s without a break: {control_survived}");
+    drop(control_target);
+
+    // --- 腕7・8: Ctrl+Breakで相手を落とせるか -----------------------------------
+    // 的は**生きたまま待つ**腕。落とされれば早く終わり、落とされなければ待ち切る。
+    let target = spawn_arm(
+        "ctrl-break target(domainA)",
+        &idle_args,
+        &caps_a,
+        false,
+        SpikeConsole::Inherit,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    // 的が実際にコンソールへ載って待ち始めるまで少しだけ待つ（載る前に撃つと何も測れない）。
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    let attacker = read_arm(
+        "ctrl-break attacker(domainB)",
+        &["--console-ctrl-break", "--timeout-secs", "60"],
+        &caps_b,
+        false,
+        SpikeConsole::Inherit,
+    );
+    let ctrl_break_sent = console_attempt(&attacker, "console-ctrl-break")
+        .and_then(|a| a.get("ok").and_then(|o| o.as_bool()));
+
+    // 的が落ちたか。**待ち切ったら落ちていない**（`--console-idle-secs 25`のうち5秒しか待たない）。
+    let wait = unsafe { WaitForSingleObject(target.process(), 5_000) };
+    let target_died = wait == WAIT_OBJECT_0;
+    // 保持プロセスも同じコンソールの構成員なので、巻き添えを別に見る
+    // ——保持プロセスが落ちるとコンソールごと消えるので、脅威としては的より重い。
+    let holder_wait = unsafe { WaitForSingleObject(holder.process(), 100) };
+    let holder_died = holder_wait == WAIT_OBJECT_0;
+    eprintln!(
+        "[MAC-CONSOLE-SHARE] ctrl-break sent={ctrl_break_sent:?} target_died={target_died} \
+         holder_died={holder_died}"
+    );
+    drop(target);
+    drop(holder);
+
+    // --- 判定 -------------------------------------------------------------------
+    // **計器から先に見る。** 外の対照が読めないなら、他の腕の「読めない」は何も語らない。
+    assert_eq!(
+        console_read_saw(&outside, MARKER),
+        Some(true),
+        "AppContainerでない対照からも画面バッファを読めない。プローブか仕込みが壊れており、\
+         サンドボックス側の結果を読んではいけない: outside={outside}"
+    );
+    // **書けたことの検算は、書いた本人ではなく外の腕が担う。**
+    // 実測では**サンドボックスの中からは読み返せない**（下記）ので、
+    // 「書いた本人が読み返す」を検算に使うと、書けているのに測定が成立しなくなる。
+    // 上の`outside`のassertが真であること自体が「印が画面バッファに載った」の証拠である。
+    let write_ok = console_attempt(&writer, "console-write")
+        .and_then(|a| a.get("ok").and_then(|o| o.as_bool()));
+    assert_eq!(
+        write_ok,
+        Some(true),
+        "サンドボックスの中から画面バッファへ書けなかった。書けていないなら、\
+         他の腕が読めなかったことは何も語らない: writer={writer}"
+    );
+
+    // コンソールを持たない腕は`CONOUT$`をそもそも開けないはず。
+    // **ここが真なら、効いているのはコンソール参加ではない。**
+    let no_console_open = console_attempt(&no_console, "conout-open")
+        .and_then(|a| a.get("ok").and_then(|o| o.as_bool()));
+    assert_eq!(
+        no_console_open,
+        Some(false),
+        "コンソールを継承していない子が`CONOUT$`を開けた。この測定は\
+         「コンソール参加による干渉」を測れていない: no_console={no_console}"
+    );
+
+    // --- 読み取り: サンドボックスの中からは**ドメインを問わず**閉じている -------
+    // **実測をそのまま固定する**（逆転したら測り直す合図。値の解釈は`RESULTS.md`が持つ）。
+    let read_ok = |r: &serde_json::Value| {
+        console_attempt(r, "console-read").and_then(|a| a.get("ok").and_then(|o| o.as_bool()))
+    };
+    for (label, report) in [
+        ("writer(A)", &writer),
+        ("same-domain(A)", &same_domain),
+        ("other-domain(B)", &other_domain),
+    ] {
+        assert_eq!(
+            read_ok(report),
+            Some(false),
+            "サンドボックスの中から画面バッファを読めた（腕={label}）。\
+             §S48が測った「書けるが読めない」が逆転しているので、\
+             保持プロセスの分割単位を測り直すこと: {report}"
+        );
+    }
+    // **ドメインの違いは読み取りの可否を変えない。** 変わったなら、コンソールが
+    // capabilityで守られていることになり、設計の前提が変わる。
+    assert_eq!(
+        read_ok(&same_domain),
+        read_ok(&other_domain),
+        "ドメインの違いだけで画面バッファの読み取り可否が変わった: \
+         same={same_domain} other={other_domain}"
+    );
+
+    // --- Ctrl+Break: 撃てるし、的も**保持プロセスも**落ちる ---------------------
+    // 対照を先に見る。撃たなくても的が5秒で終わるなら、下の`target_died`は何も語らない。
+    assert!(
+        control_survived,
+        "Ctrl+Breakを撃っていない的が5秒で終わった。落ちたことを「撃ったから」と読めない"
+    );
+    assert_eq!(
+        ctrl_break_sent,
+        Some(true),
+        "Ctrl+Breakを撃てていない。落ちなかったことを「守られている」と読めない: {attacker}"
+    );
+    assert!(
+        target_died,
+        "別ドメインからCtrl+Breakを撃っても的が落ちなかった。\
+         §7.1.1が可用性の脅威として挙げた形が成立しないので、記録と設計を見直すこと"
+    );
+    // **これがこの測定でいちばん重い事実である。** 保持プロセスが落ちるとコンソールごと消え、
+    // そのコンソールを共有していた**全ドメイン**がシェルを起こせなくなる。
+    assert!(
+        holder_died,
+        "Ctrl+Breakで保持プロセスが落ちなかった。§S48が測った「巻き添えで保持プロセスごと消える」\
+         が成立しないなら、保持プロセスの分割単位の根拠が変わる"
     );
 }
