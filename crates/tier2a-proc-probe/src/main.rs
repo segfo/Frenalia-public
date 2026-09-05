@@ -97,6 +97,9 @@ struct Args {
     report_file: Option<String>,
     /// スパイクモードが「生きたまま待つ」秒数（`hold_file`と単独指定時のアイドル）。
     idle_secs: Option<u64>,
+    /// MAC設計§7.1.1の測定7: 自分に届く`CTRL_C_EVENT`/`CTRL_BREAK_EVENT`を握り潰してから走る。
+    /// **保持プロセス役の腕で使う**——撃たれても生き残るかを、守らない腕と対にして測る。
+    console_guard_ctrl: bool,
 }
 
 fn parse_args() -> Args {
@@ -128,8 +131,10 @@ fn parse_args() -> Args {
     let mut console_write: Option<String> = None;
     let mut console_read = false;
     let mut console_ctrl_break = false;
+    let mut console_ctrl_c = false;
     let mut console_idle_secs: u64 = 0;
     let mut console_mode = false;
+    let mut console_guard_ctrl = false;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -219,10 +224,18 @@ fn parse_args() -> Args {
                 console_ctrl_break = true;
                 console_mode = true;
             }
+            "--console-ctrl-c" => {
+                console_ctrl_c = true;
+                console_mode = true;
+            }
             "--console-idle-secs" => {
                 console_idle_secs = next().parse().unwrap_or(0);
                 console_mode = true;
             }
+            // §7.1.1測定7。**`console_mode`を立てない**——この引数を付ける相手は
+            // 保持プロセス役（`--idle-secs`で待つだけの腕）であり、画面バッファを触る
+            // `console_share`モードへ落とすと測る対象が別物になる。
+            "--console-guard-ctrl" => console_guard_ctrl = true,
             _ => {}
         }
     }
@@ -231,6 +244,7 @@ fn parse_args() -> Args {
         write: console_write,
         read: console_read,
         ctrl_break: console_ctrl_break,
+        ctrl_c: console_ctrl_c,
         idle_secs: console_idle_secs,
     });
 
@@ -265,6 +279,7 @@ fn parse_args() -> Args {
         console_share,
         report_file,
         idle_secs,
+        console_guard_ctrl,
     }
 }
 
@@ -550,6 +565,15 @@ fn main() -> ExitCode {
     let args = parse_args();
     spawn_watchdog(args.timeout_secs);
 
+    // **どのモードよりも先に掛ける。** レポートを書く前に掛かっていないと、
+    // 「レポートが見えた＝もう守られている」と読めなくなり、テスト側は撃ってよい時点を
+    // 判定できない（守りが立つ前に撃つと、測っているのは守りではなく競走になる）。
+    // `None`は「頼まれていない」、`Some(false)`は「頼まれたが掛からなかった」——
+    // 観測していない欄を既定値で埋めない（`P-11`）。
+    let ctrl_guard = args
+        .console_guard_ctrl
+        .then(console_share::guard_self_from_ctrl_events);
+
     #[cfg(windows)]
     if let Some(helper_path) = &args.try_runas {
         let report = try_runas::try_runas(helper_path);
@@ -683,6 +707,9 @@ fn main() -> ExitCode {
             "pid": std::process::id(),
             "extra_thread_id": extra_thread_id,
             "extra_mutex": extra_mutex,
+            // **腕は自分で名乗る。** 記録を後から読む人が、守った腕と守らない腕を
+            // 起動引数の記憶ではなくレポートの中身で区別できるようにする。
+            "ctrl_guard": ctrl_guard,
         });
         if let Some(path) = &args.report_file {
             let _ = fs::write(path, report.to_string());

@@ -199,6 +199,86 @@ fn wait_until_holder_is_ready(holder: &SpikeSpawn<'_>, report: &std::path::Path)
     );
 }
 
+/// 1本のコンソールへ次々と腕を載せるときの、**腕ごとに変わらない部分**。
+///
+/// 借りて、起こして、すぐ返す——設計書§7.1.1の窓と同じ形である。**返さないと、
+/// 測っているこのプロセス自身が`CTRL_BREAK_EVENT`の巻き添えで落ちる**ので、
+/// `AttachConsole`から`CreateProcessW`までをこの型の中に閉じ、呼び出し側へ
+/// コンソールを持たせたまま帰らせない。
+///
+/// [`run_restricted_shell_while_attached`]との違いは的である——あちらは
+/// `CHILD_PROCESS_RESTRICTED`を積んだ**シェル**を1本走らせて印を読む。こちらは
+/// プローブを腕として何本も載せる（読む・書く・撃つ・待つ）。
+struct ConsoleArms<'a> {
+    /// ログ行の接頭辞。**測定ごとに変える**（同じ回の出力を後から選り分けるため）。
+    tag: &'a str,
+    probe: &'a str,
+    cwd: &'a std::path::Path,
+    container_sid: PSID,
+    holder_pid: u32,
+}
+
+impl ConsoleArms<'_> {
+    /// 腕を1本起こして、走らせたまま返す（的・撃ち手のように「生きている間に見る」腕用）。
+    fn spawn(
+        &self,
+        label: &str,
+        args: &[&str],
+        capabilities: &[PSID],
+        no_appcontainer: bool,
+        console: SpikeConsole,
+    ) -> Result<SpikeChild, String> {
+        unsafe {
+            let _ = FreeConsole();
+        }
+        let holder_pid = self.holder_pid;
+        let _detach = if console == SpikeConsole::Inherit {
+            unsafe {
+                AttachConsole(holder_pid)
+                    .map_err(|e| format!("{label}: AttachConsole({holder_pid}) failed: {e}"))?;
+            }
+            Some(ConsoleDetachGuard)
+        } else {
+            None
+        };
+        SpikeSpawn {
+            exe: self.probe,
+            args,
+            cwd: self.cwd,
+            container_sid: self.container_sid,
+            capabilities,
+            child_process_restricted: false,
+            stdout_override: None,
+            extra_inherit: &[],
+            process_sddl: None,
+            thread_sddl: None,
+            token_default_dacl_sddl: None,
+            no_appcontainer,
+            console,
+        }
+        .spawn()
+        .map_err(|e| format!("{label}: spawn failed: {e}"))
+    }
+
+    /// 腕を1本起こして終わるまで待ち、レポート（最後のJSON行）を返す。
+    fn read(
+        &self,
+        label: &str,
+        args: &[&str],
+        capabilities: &[PSID],
+        no_appcontainer: bool,
+        console: SpikeConsole,
+    ) -> serde_json::Value {
+        let mut child = self
+            .spawn(label, args, capabilities, no_appcontainer, console)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (stdout, stderr, code) = child.wait_and_read();
+        let tag = self.tag;
+        eprintln!("[{tag}] {label}: exit={code} stderr={stderr}\n{stdout}");
+        last_json_line(&stdout).unwrap_or_else(|| panic!("{label} produced no JSON: {stdout}"))
+    }
+}
+
 fn run_restricted_shell_while_attached(
     arm: &ArmSpec,
     holder_pid: u32,
@@ -2049,56 +2129,28 @@ fn one_console_shared_by_two_domains_is_measured_for_read_and_ctrl_break() {
     let holder_pid = holder.pid();
     eprintln!("[MAC-CONSOLE-SHARE] holder pid={holder_pid}");
 
-    // 1本の腕を撃つ。**設計書§7.1.1の窓と同じ形**——借りて、起こして、すぐ返す。
-    // 返さないとこのプロセスがCtrl+Breakの巻き添えになる（測っている側が死ぬ）。
+    let arms = ConsoleArms {
+        tag: "MAC-CONSOLE-SHARE",
+        probe: &probe_str,
+        cwd: workspace.path(),
+        container_sid: sid.as_psid(),
+        holder_pid,
+    };
     let spawn_arm = |label: &str,
                      args: &[&str],
                      capabilities: &[PSID],
                      no_appcontainer: bool,
                      console: SpikeConsole|
      -> Result<SpikeChild, String> {
-        unsafe {
-            let _ = FreeConsole();
-        }
-        let _detach = if console == SpikeConsole::Inherit {
-            unsafe {
-                AttachConsole(holder_pid)
-                    .map_err(|e| format!("{label}: AttachConsole({holder_pid}) failed: {e}"))?;
-            }
-            Some(ConsoleDetachGuard)
-        } else {
-            None
-        };
-        SpikeSpawn {
-            exe: &probe_str,
-            args,
-            cwd: workspace.path(),
-            container_sid: sid.as_psid(),
-            capabilities,
-            child_process_restricted: false,
-            stdout_override: None,
-            extra_inherit: &[],
-            process_sddl: None,
-            thread_sddl: None,
-            token_default_dacl_sddl: None,
-            no_appcontainer,
-            console,
-        }
-        .spawn()
-        .map_err(|e| format!("{label}: spawn failed: {e}"))
+        arms.spawn(label, args, capabilities, no_appcontainer, console)
     };
-
     let read_arm = |label: &str,
                     args: &[&str],
                     capabilities: &[PSID],
                     no_appcontainer: bool,
                     console: SpikeConsole|
      -> serde_json::Value {
-        let mut child = spawn_arm(label, args, capabilities, no_appcontainer, console)
-            .unwrap_or_else(|e| panic!("{e}"));
-        let (stdout, stderr, code) = child.wait_and_read();
-        eprintln!("[MAC-CONSOLE-SHARE] {label}: exit={code} stderr={stderr}\n{stdout}");
-        last_json_line(&stdout).unwrap_or_else(|| panic!("{label} produced no JSON: {stdout}"))
+        arms.read(label, args, capabilities, no_appcontainer, console)
     };
 
     // --- 腕1: 書いて自分で読み返す（書けたことの検算） --------------------------
@@ -2312,4 +2364,360 @@ fn one_console_shared_by_two_domains_is_measured_for_read_and_ctrl_break() {
         "Ctrl+Breakで保持プロセスが落ちなかった。§S48が測った「巻き添えで保持プロセスごと消える」\
          が成立しないなら、保持プロセスの分割単位の根拠が変わる"
     );
+}
+
+/// 1ラウンド分の観測（守った保持プロセスと守らない保持プロセスを、同じ回で1本ずつ撃つ）。
+struct GuardRound {
+    /// ラウンドの間だけ生かしておく保持プロセス。**守った側は撃たれた後も使う**ので返す。
+    holder: SpikeChild,
+    /// 保持プロセスが自分で名乗った構成（`ctrl_guard`）。
+    holder_report: serde_json::Value,
+    ctrl_break_sent: Option<bool>,
+    target_died: bool,
+    holder_died: bool,
+}
+
+/// §7.1.1の測定7: **保持プロセスは`SetConsoleCtrlHandler`で自分を守れるか。**
+///
+/// [§S48](../../../../../plans/mac-spike/RESULTS.md)が測ったのは「**撃った側**が自分を守れる」
+/// ことだけで（計器がそれで自分を守っていた）、**撃たれる側**が同じ手で守れるかは撮っていない。
+/// 仕組みは同じなので通る見込みは高いが、**未測定を根拠に「塞がっている」と書くと、
+/// 既知の対処を解決済みの根拠に使う形**（`plan-review-gates`検問6）をそのまま踏む。
+///
+/// | 腕 | 保持プロセス | 撃つイベント | これが無いと何が言えなくなるか |
+/// |---|---|---|---|
+/// | `unguarded/break`（対照＝計器の歯） | ハンドラ**無し** | `CTRL_BREAK_EVENT` | 「生き残った」を「ハンドラのおかげ」と読めない。§S48の再現を**同じ回で**取る |
+/// | `guarded/break` | ハンドラ**有り** | `CTRL_BREAK_EVENT` | 本命 |
+/// | `guarded/ctrl-c` | ハンドラ有り | **`CTRL_C_EVENT`** | 守りが**片方の種類にしか効かない**なら「サンドボックスから届く経路が塞がった」と書けない |
+/// | 的のシェル（全ラウンド） | ハンドラ無し | — | イベントが実際に配達されたことを言えない。守った腕で保持プロセスが生き残っても、「撃てていなかっただけ」と区別できない |
+/// | 撃たれた後の再利用 | ハンドラ有り | — | 「生きているが壊れている」を排除できない。生き残ったコンソールで実際にシェルを1本完走させる |
+///
+/// **撃たない対照は置いていない。** §S48が既に「撃たなければ的は5秒生き残る」を測っており、
+/// 本測定では**同じラウンドの的が落ちること**が配達の証拠を兼ねるためである。
+///
+/// # `CTRL_C_EVENT`のラウンドは、守りについて何も言わない（実測、2026-09-05）
+///
+/// 撃つこと自体は成功する（`ok=true`）のに、**守っていない的も落ちなかった**（3回とも）。
+/// 配達の証拠が取れないので、**同じラウンドで保持プロセスが生き残ったことを
+/// 「ハンドラのおかげ」と読んではいけない**——効かないイベントを撃っただけかもしれない。
+///
+/// **したがってこのラウンドが固定しているのは「この構成では`CTRL_C_EVENT`が
+/// 守っていない相手にも効かなかった」という事実だけ**である。逆転したら、この腕は
+/// 初めて守りについての結論を持つ（そのときは記録を更新する）。
+/// `unguarded/ctrl-c`の腕を足していないのは、**このラウンドの的がまさに
+/// 守っていないプロセス**であり、同じことを2度測ることになるためである。
+///
+/// 実行（**昇格しないこと**。昇格すると保持プロセスの整合性レベルが本番と変わる、`B-08`）:
+///
+/// ```text
+/// cargo test -p harness-sandbox --lib -- --ignored --test-threads=1 --nocapture \
+///   console_holder_survives_ctrl_break_when_it_guards_itself
+/// ```
+#[test]
+#[ignore = "touches real AppContainer state; run non-elevated (see plans/mac-spike/RESULTS.md)"]
+fn console_holder_survives_ctrl_break_when_it_guards_itself() {
+    const TAG: &str = "MAC-CONSOLE-HOLDER-GUARD";
+
+    // 測定ロックは**この測定専用の名前**にする。§S48の測定と同じ名前にすると、
+    // 2つが並行に走った回に必ず片方が「前回残骸」と読める形で落ちる。
+    let measure_lock =
+        std::path::Path::new(r"C:\harness-e2e\_measure-lock\mac-console-holder-guard");
+    std::fs::create_dir_all(
+        measure_lock
+            .parent()
+            .expect("measurement lock has a parent"),
+    )
+    .expect("create the serialized measurement lock parent");
+    std::fs::create_dir(measure_lock).unwrap_or_else(|e| {
+        panic!(
+            "測定ロックを取得できない（並列測定または前回残骸を確認する）: path={measure_lock:?} error={e}"
+        )
+    });
+    let _measure_lock_cleanup = super::test_support::scopeguard(|| {
+        std::fs::remove_dir(measure_lock).ok();
+    });
+
+    let (workspace, sid, caps) = spike_workspace();
+    let workspace_canonical = workspace
+        .path()
+        .canonicalize()
+        .expect("canonicalize the spike workspace");
+    let cleanup_workspace = workspace_canonical.clone();
+    let _cleanup = super::test_support::scopeguard(move || {
+        let outcome =
+            crate::tier2a::session_profile::end_session(&super::revoke::revoke_session_grant);
+        eprintln!("[{TAG}] cleanup: {:?}", outcome.summary());
+        super::mac_spike_tests::forget_workspace_capability(&cleanup_workspace);
+        if let Err(e) = std::fs::remove_dir_all(&cleanup_workspace) {
+            eprintln!("[{TAG}] cleanup could not remove workspace: {e}");
+        }
+        if !cleanup_workspace.exists() {
+            crate::tier2a::workspace_ledger::remove_workspace_entry(&cleanup_workspace);
+        }
+    });
+
+    // 的と撃ち手を別ドメインにするのは、**§S48から軸を1つだけ変える**ためである
+    // （あちらも別ドメインから撃っている）。同じドメインにすると、変わった軸が
+    // 「守りの有無」と「ドメインが同じか」の2つになる。
+    let pid = std::process::id();
+    let domain_a = super::capability_sid_from_name(&format!("harness-holder-guard-A-{pid}"))
+        .expect("derive domain A capability");
+    let domain_b = super::capability_sid_from_name(&format!("harness-holder-guard-B-{pid}"))
+        .expect("derive domain B capability");
+    let mut caps_a: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
+    let mut caps_b = caps_a.clone();
+    caps_a.push(domain_a.as_psid());
+    caps_b.push(domain_b.as_psid());
+
+    let probe = probe_exe();
+    let probe_str = probe
+        .to_str()
+        .expect("probe path is valid utf-8")
+        .to_string();
+    eprintln!(
+        "[{TAG}] elevated={}",
+        crate::tier2a::privhelper::is_elevated()
+    );
+
+    // `event_arg`は撃ち手へ渡す引数、`attempt_kind`はそのレポートに現れる試行名。
+    // **2つを別々に渡している**のは、綴りをテスト側で組み立てるとプローブ側の綴りと
+    // 静かにずれるためである（ずれると「撃てていない」ではなく「見つからない」で落ちる）。
+    let run_round = |label: &str, guard: bool, event_arg: &str, attempt_kind: &str| -> GuardRound {
+        let holder_report_path = workspace
+            .path()
+            .join(format!("{}-holder.json", label.replace('/', "-")));
+        let holder_report_str = holder_report_path.to_string_lossy().into_owned();
+        let mut holder_args = vec![
+            "--idle-secs",
+            "120",
+            "--timeout-secs",
+            "180",
+            "--report-file",
+            holder_report_str.as_str(),
+        ];
+        if guard {
+            holder_args.push("--console-guard-ctrl");
+        }
+        let holder_spec = SpikeSpawn {
+            exe: &probe_str,
+            args: &holder_args,
+            cwd: workspace.path(),
+            container_sid: sid.as_psid(),
+            capabilities: &[],
+            child_process_restricted: false,
+            stdout_override: None,
+            extra_inherit: &[],
+            process_sddl: None,
+            thread_sddl: None,
+            token_default_dacl_sddl: None,
+            // 保持プロセスはサンドボックスの**外**（§7.1.1）。ここを変えると測る対象が別物になる。
+            no_appcontainer: true,
+            console: SpikeConsole::NoWindow,
+        };
+        // **レポートが見えた時点で守りは既に掛かっている**（プローブがハンドラを
+        // 最初に掛けてからレポートを書く）ので、この待ちが「撃ってよい時点」を兼ねる。
+        let holder = wait_until_holder_is_ready(&holder_spec, &holder_report_path);
+        let holder_pid = holder.pid();
+        let holder_report: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&holder_report_path).expect("read the holder report"),
+        )
+        .expect("the holder report is JSON");
+        eprintln!("[{TAG}] {label}: holder pid={holder_pid} report={holder_report}");
+
+        let arms = ConsoleArms {
+            tag: TAG,
+            probe: &probe_str,
+            cwd: workspace.path(),
+            container_sid: sid.as_psid(),
+            holder_pid,
+        };
+
+        // 的は**両ラウンドとも守らない**。ここが落ちることが「イベントが配達された」の印になる。
+        let target = arms
+            .spawn(
+                &format!("{label}/target(domainA)"),
+                &["--console-idle-secs", "25", "--timeout-secs", "90"],
+                &caps_a,
+                false,
+                SpikeConsole::Inherit,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        // 的がコンソールへ載って待ち始めるまで待つ（載る前に撃つと何も測れない）。
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        let attacker = arms.read(
+            &format!("{label}/attacker(domainB)"),
+            &[event_arg, "--timeout-secs", "60"],
+            &caps_b,
+            false,
+            SpikeConsole::Inherit,
+        );
+        let ctrl_break_sent = console_attempt(&attacker, attempt_kind)
+            .and_then(|a| a.get("ok").and_then(|o| o.as_bool()));
+
+        // **待ち切ったら落ちていない**（的は25秒待つ腕で、こちらは5秒しか待たない）。
+        let target_died =
+            unsafe { WaitForSingleObject(target.process(), 5_000) } == WAIT_OBJECT_0;
+        let holder_died = unsafe { WaitForSingleObject(holder.process(), 100) } == WAIT_OBJECT_0;
+        eprintln!(
+            "[{TAG}] {label}: sent={ctrl_break_sent:?} target_died={target_died} \
+             holder_died={holder_died}"
+        );
+        drop(target);
+
+        GuardRound {
+            holder,
+            holder_report,
+            ctrl_break_sent,
+            target_died,
+            holder_died,
+        }
+    };
+
+    // **対照を先に撃つ。** §S48の再現をこの回の中で取ってから本命へ進む。
+    const BREAK: (&str, &str) = ("--console-ctrl-break", "console-ctrl-break");
+    const CTRL_C: (&str, &str) = ("--console-ctrl-c", "console-ctrl-c");
+    let control = run_round("unguarded/break", false, BREAK.0, BREAK.1);
+    drop(control.holder);
+    let guarded = run_round("guarded/break", true, BREAK.0, BREAK.1);
+    let guarded_ctrl_c = run_round("guarded/ctrl-c", true, CTRL_C.0, CTRL_C.1);
+
+    // --- 判定 -------------------------------------------------------------------
+    // **腕が別物であることを先に見る。** 引数が無視されていると、2ラウンドは同じものになり、
+    // 以下の比較は何も語らない。
+    let ctrl_guard = |report: &serde_json::Value| report.get("ctrl_guard").cloned();
+    assert_eq!(
+        ctrl_guard(&control.holder_report),
+        Some(serde_json::Value::Null),
+        "守らない側の保持プロセスが`ctrl_guard`を名乗っている。2つのラウンドが\
+         同じ構成になっている疑いがあるので、結果を読んではいけない: {}",
+        control.holder_report
+    );
+    for (label, round) in [
+        ("guarded/break", &guarded),
+        ("guarded/ctrl-c", &guarded_ctrl_c),
+    ] {
+        assert_eq!(
+            ctrl_guard(&round.holder_report),
+            Some(serde_json::Value::Bool(true)),
+            "守る側の保持プロセスでハンドラが掛かっていない（腕={label}。\
+             `--console-guard-ctrl`が届いていないか失敗した）。この回は測定になっていない: {}",
+            round.holder_report
+        );
+    }
+
+    // 計器: 撃てていないなら、落ちなかったことを「守られている」と読めない。
+    for (label, sent, target_died) in [
+        (
+            "unguarded/break",
+            control.ctrl_break_sent,
+            Some(control.target_died),
+        ),
+        (
+            "guarded/break",
+            guarded.ctrl_break_sent,
+            Some(guarded.target_died),
+        ),
+        // **`CTRL_C_EVENT`のラウンドでは的の死を要求しない。** 守っていない的も
+        // 落ちないことが実測されており（下でその事実の側を固定する）、ここで要求すると
+        // 「配達されなかった」を「機構が壊れた」として報告することになる。
+        ("guarded/ctrl-c", guarded_ctrl_c.ctrl_break_sent, None),
+    ] {
+        // **「撃てなかった」と「撃とうとすらしなかった」を分ける。** `None`は撃ち手の
+        // レポートにその試行が1件も無いこと＝**プローブがその引数を知らない**印で、
+        // 原因はたいてい`tier2a_proc_probe.exe`が古いことである（`cargo test`は
+        // このバイナリを作り直さない。`docs/DEV-ENVIRONMENT.md`）。
+        assert!(
+            sent.is_some(),
+            "撃ち手のレポートに制御イベントの試行が無い（腕={label}）。\
+             `cargo build -p tier2a-proc-probe`でプローブを作り直したか確認すること"
+        );
+        assert_eq!(sent, Some(true), "制御イベントを撃てていない（腕={label}）");
+        // 配達の証拠。**守った側でもここは落ちる**——落ちなければ、
+        // 保持プロセスが生き残ったのは守りではなく不発のせいかもしれない。
+        if let Some(target_died) = target_died {
+            assert!(
+                target_died,
+                "撃ったのに的が落ちなかった（腕={label}）。イベントが配達されていないので、\
+                 保持プロセス側の結果は何も語らない"
+            );
+        }
+    }
+
+    // **実測をそのまま固定する。** `CTRL_C_EVENT`は撃てるのに、守っていない的にも効かない。
+    // これが逆転したら`guarded/ctrl-c`は初めて守りについての結論を持つので、
+    // **測り直して記録（§S49）を更新する合図**にする。
+    assert!(
+        !guarded_ctrl_c.target_died,
+        "`CTRL_C_EVENT`で的が落ちた。2026-09-05の実測（3回とも落ちない）と逆なので、\
+         この腕は守りについて語れるようになっている。記録を更新すること"
+    );
+
+    // 歯: 守らない保持プロセスは落ちる（§S48の再現）。
+    assert!(
+        control.holder_died,
+        "守っていない保持プロセスが落ちなかった。§S48が測った向きが再現していないので、\
+         守った側が生き残っても「ハンドラのおかげ」と読めない"
+    );
+
+    // 本命。**`CTRL_BREAK_EVENT`についてだけ**、配達の証拠と対で言える。
+    assert!(
+        !guarded.holder_died,
+        "`SetConsoleCtrlHandler`を掛けた保持プロセスも`CTRL_BREAK_EVENT`で落ちた。\
+         設計書§7.1.1の決定1（保持プロセスが制御イベントを握り潰す）が成立しないので、\
+         落とされた後の立て直し（決定2）だけが残る防御になる"
+    );
+    // こちらは**配達の証拠が無いので単独では何も語らない**（上の`target_died`と対で読む）。
+    // それでも見るのは、逆転したとき——守った保持プロセスだけが落ちたとき——が
+    // 「ハンドラが種類によっては有害」という別の事実になるためである。
+    assert!(
+        !guarded_ctrl_c.holder_died,
+        "`CTRL_C_EVENT`で、守った保持プロセスだけが落ちた（同じラウンドの的は生きている）。\
+         ハンドラが種類によっては守るどころか落としていることになるので、測り直すこと"
+    );
+
+    // --- 生き残ったコンソールは、まだ使えるか -----------------------------------
+    // **「生きているが壊れている」を排除する。** 保持プロセスが生き残っても、
+    // コンソールがシェルの起動に使えなければ可用性は同じだけ失われている。
+    let (shell, shell_label) = resolve_shell();
+    let marker_path = workspace.path().join("guarded-reuse-marker.txt");
+    let reuse = run_restricted_shell_while_attached(
+        &ArmSpec {
+            label: "GUARDED_REUSE",
+            holder_console: SpikeConsole::NoWindow,
+            loan: ConsoleLoan::Attach,
+            resume_at: ResumePoint::AfterDetach,
+        },
+        // **最後に撃たれた保持プロセス**を使う（2種類とも浴びた後のコンソールを見る）。
+        guarded_ctrl_c.holder.pid(),
+        &shell,
+        workspace.path(),
+        sid.as_psid(),
+        &caps_a,
+        &marker_path,
+    )
+    .unwrap_or_else(|e| {
+        panic!("撃たれた後のコンソールでシェルを起こせなかった（shell={shell_label}）: {e}")
+    });
+    eprintln!(
+        "[{TAG}] reuse: ran={} child={:?} stdio={:?} exit={} members={:?}",
+        reuse.actually_ran(),
+        reuse.child_creation(),
+        reuse.stdio_redirected(),
+        reuse.exit_code,
+        reuse.console_processes,
+    );
+    assert!(
+        reuse.actually_ran(),
+        "撃たれた後のコンソールでシェルが完走しなかった。保持プロセスは生き残ったが\
+         コンソールとしては壊れているので、守りは可用性を守っていない: {reuse:?}"
+    );
+    // 同じ1回で「mitigationが効いていた」ことも押さえる（§7.1.1のgo/no-goと同じ形）。
+    assert!(
+        reuse.child_creation_denied(),
+        "撃たれた後のコンソールで走ったシェルが子プロセスを起こせてしまった。\
+         `CHILD_PROCESS_RESTRICTED`が効いていない回なので、成立の証拠にならない: {reuse:?}"
+    );
+    drop(guarded.holder);
+    drop(guarded_ctrl_c.holder);
 }

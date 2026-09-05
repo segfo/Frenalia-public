@@ -23,7 +23,12 @@
 //! | `--console-write <text>` | `CONOUT$`を開き、画面バッファの原点へ`text`を書く |
 //! | `--console-read` | `CONOUT$`を開き、画面バッファの原点から読み返す |
 //! | `--console-ctrl-break` | 同じコンソールの全プロセスへ`CTRL_BREAK_EVENT`を撃つ |
-//! | `--console-idle-secs <n>` | 上記の後、`n`秒生き続ける（Ctrl+Breakの**的**になる腕で使う） |
+//! | `--console-ctrl-c` | 同じコンソールの全プロセスへ`CTRL_C_EVENT`を撃つ |
+//! | `--console-idle-secs <n>` | 上記の後、`n`秒生き続ける（撃たれる**的**になる腕で使う） |
+//!
+//! **制御イベントを2種類撃てるようにしてあるのは、§7.1.1の測定7のためである**——
+//! 保持プロセスがハンドラで自分を守れたとして、**守りが片方の種類にしか効かない**なら
+//! 「サンドボックスから届く経路が塞がった」とは書けない。
 //!
 //! **`--console-write`と`--console-read`は同時に指定できる。** ただし実測（§S48）では
 //! **サンドボックスの中からは書けるが読めない**（読みは`ERROR_ACCESS_DENIED`）ので、
@@ -50,6 +55,8 @@ pub struct Spec {
     pub read: bool,
     /// 同じコンソールの全プロセスへ`CTRL_BREAK_EVENT`を撃つか。
     pub ctrl_break: bool,
+    /// 同じコンソールの全プロセスへ`CTRL_C_EVENT`を撃つか。
+    pub ctrl_c: bool,
     /// 上記を済ませた後、生き続ける秒数（0なら即終了）。
     pub idle_secs: u64,
 }
@@ -61,11 +68,30 @@ fn wide(s: &str) -> Vec<u16> {
 
 /// `CTRL_BREAK_EVENT`を「処理した」と答えて既定の終了を止めるハンドラ。
 ///
-/// **撃つ側だけが入れる。** これが無いと、撃った本人がプロセスグループの巻き添えで
-/// `STATUS_CONTROL_C_EXIT`（`0xC000013A`）で死に、レポートを出し切る前に消える。
+/// **入れる相手は2つある。** 撃つ側（これが無いと、撃った本人がプロセスグループの巻き添えで
+/// `STATUS_CONTROL_C_EXIT`（`0xC000013A`）で死に、レポートを出し切る前に消える）と、
+/// **撃たれる側**（設計書§7.1.1の測定7＝保持プロセスがこの手で自分を守れるか）である。
 #[cfg(windows)]
 unsafe extern "system" fn ignore_ctrl_event(_ctrl_type: u32) -> windows::Win32::Foundation::BOOL {
     windows::Win32::Foundation::BOOL(1)
+}
+
+/// 自分に届く`CTRL_C_EVENT`/`CTRL_BREAK_EVENT`を握り潰す（掛かったら`true`）。
+///
+/// **`console_share`モード以外からも使う**——`--console-guard-ctrl`を付けた待機モードの
+/// プロセス（＝保持プロセス役）が、撃たれても生き残るかを測るため（§7.1.1の測定7）。
+/// **同じハンドラを2箇所で書かない**（`docs/CODE-STRUCTURE-RULES.md`§5.0）。
+#[cfg(windows)]
+pub fn guard_self_from_ctrl_events() -> bool {
+    unsafe {
+        windows::Win32::System::Console::SetConsoleCtrlHandler(Some(ignore_ctrl_event), true)
+    }
+    .is_ok()
+}
+
+#[cfg(not(windows))]
+pub fn guard_self_from_ctrl_events() -> bool {
+    false
 }
 
 /// このプロセスがどのコンソールに属しているか（**腕ごとの検算**）。
@@ -96,8 +122,8 @@ pub fn run(spec: &Spec) -> Value {
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows::Win32::System::Console::{
-        GenerateConsoleCtrlEvent, ReadConsoleOutputCharacterW, SetConsoleCtrlHandler,
-        WriteConsoleOutputCharacterW, COORD, CTRL_BREAK_EVENT,
+        GenerateConsoleCtrlEvent, ReadConsoleOutputCharacterW, WriteConsoleOutputCharacterW, COORD,
+        CTRL_BREAK_EVENT, CTRL_C_EVENT,
     };
 
     let mut attempts: Vec<Value> = Vec::new();
@@ -178,21 +204,29 @@ pub fn run(spec: &Spec) -> Value {
         }
     }
 
-    if spec.ctrl_break {
-        // **撃つ前に自分を守る。** プロセスグループ0は「このコンソールに繋がった全プロセス」
-        // ——**自分を含む**ので、守らないと撃った本人が`STATUS_CONTROL_C_EXIT`で死ぬ。
-        // 死ぬと標準出力がドレインされる前にプロセスが消え、**レポートが1行も残らない**
-        // （実際に踏んだ: 出力が残る回と残らない回が混ざった）。
-        //
-        // これは**計器を守るだけで、測っている対象は変えない**——的の側にハンドラは無いので、
-        // 「別ドメインから撃たれて落ちるか」はそのまま測れる。
-        // 副産物として「ハンドラを入れれば自分だけは守れる」という事実も記録に残る。
-        let guarded = unsafe { SetConsoleCtrlHandler(Some(ignore_ctrl_event), true) };
-        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) };
+    // **撃つ前に自分を守る。** プロセスグループ0は「このコンソールに繋がった全プロセス」
+    // ——**自分を含む**ので、守らないと撃った本人が`STATUS_CONTROL_C_EXIT`で死ぬ。
+    // 死ぬと標準出力がドレインされる前にプロセスが消え、**レポートが1行も残らない**
+    // （実際に踏んだ: 出力が残る回と残らない回が混ざった）。
+    //
+    // これは**計器を守るだけで、測っている対象は変えない**——的の側にハンドラは無いので、
+    // 「別ドメインから撃たれて落ちるか」はそのまま測れる。
+    // 副産物として「ハンドラを入れれば自分だけは守れる」という事実も記録に残る。
+    let mut guarded: Option<bool> = None;
+    for (requested, event, kind) in [
+        (spec.ctrl_break, CTRL_BREAK_EVENT, "console-ctrl-break"),
+        (spec.ctrl_c, CTRL_C_EVENT, "console-ctrl-c"),
+    ] {
+        if !requested {
+            continue;
+        }
+        // 守りは**プロセスに1回**掛かれば足りる（2種類撃つ腕でも二重に掛けない）。
+        let self_guarded = *guarded.get_or_insert_with(guard_self_from_ctrl_events);
+        let ok = unsafe { GenerateConsoleCtrlEvent(event, 0) };
         attempts.push(json!({
-            "kind": "console-ctrl-break",
+            "kind": kind,
             "ok": ok.is_ok(),
-            "self_guarded": guarded.is_ok(),
+            "self_guarded": self_guarded,
             "last_error": if ok.is_ok() { 0 } else { unsafe { GetLastError() }.0 },
         }));
     }
