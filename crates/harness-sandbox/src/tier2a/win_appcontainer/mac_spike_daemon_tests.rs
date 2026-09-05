@@ -181,22 +181,30 @@ impl AttachedShellRun {
     }
 }
 
-fn wait_until_holder_is_ready(holder: &SpikeSpawn<'_>, report: &std::path::Path) -> SpikeChild {
-    let child = holder.spawn().expect("spawn the console holder");
+/// 起こした子のレポートに印が現れるまで待つ。**現れないまま時間切れなら落とす。**
+///
+/// 仕掛かっていない相手を撃っても、測っているのは「届くか」ではなく競走になる。
+/// だから「撃ってよい時点」は待ち時間ではなく**相手の申告**で決める。
+fn wait_until_report_contains(pid: u32, report: &std::path::Path, marker: &str) {
     for _ in 0..100 {
         if std::fs::read_to_string(report)
-            .map(|body| body.contains("\"mode\":\"idle\""))
+            .map(|body| body.contains(marker))
             .unwrap_or(false)
         {
-            return child;
+            return;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     panic!(
-        "console holder did not report readiness: pid={} report={:?}",
-        child.pid(),
+        "child did not report readiness: pid={pid} marker={marker} report={:?}",
         std::fs::read_to_string(report).ok()
     );
+}
+
+fn wait_until_holder_is_ready(holder: &SpikeSpawn<'_>, report: &std::path::Path) -> SpikeChild {
+    let child = holder.spawn().expect("spawn the console holder");
+    wait_until_report_contains(child.pid(), report, "\"mode\":\"idle\"");
+    child
 }
 
 /// 1本のコンソールへ次々と腕を載せるときの、**腕ごとに変わらない部分**。
@@ -2720,4 +2728,397 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
     );
     drop(guarded.holder);
     drop(guarded_ctrl_c.holder);
+}
+
+/// 受け取る側が制御イベントを受け取ったときに走るハンドラの終了コード。
+///
+/// **`tier2a-proc-probe`の`console_share::CTRL_HANDLED_EXIT_CODE`と同じ値を書いてある。**
+/// クレートが違うので型で繋げられない——**片方だけ変えると、この測定は「ハンドラを通った」を
+/// 見落として「OSに殺された」と読む**。変えるときは両方を直すこと。
+const CTRL_HANDLED_EXIT_CODE: u32 = 43;
+
+/// 後始末で書き切られる印（同じく`console_share::CLEANUP_MARKER`と同じ値）。
+const CTRL_CLEANUP_MARKER: &str = "HARNESS-CTRL-CLEANUP-COMPLETE";
+
+/// 1ラウンド分の観測（受け取る側に何が残ったか）。
+struct DeliveryRound {
+    /// 起動時に受け取る側が出したレポート（自分の構成を名乗る）。
+    setup: serde_json::Value,
+    /// 受け取りの記録。**ハンドラが走らなければファイルごと存在しない**ので`None`になる。
+    receipt: Option<String>,
+    /// 撃つ**直前**に読んだ後始末ファイルの中身。**空でなければこのラウンドは何も語らない。**
+    cleanup_before: String,
+    /// 撃った**後**の後始末ファイルの中身。
+    cleanup_after: String,
+    /// 撃ち手が「撃てた」と申告したか（撃たないラウンドでは`None`）。
+    sent: Option<bool>,
+    exited: bool,
+    exit_code: u32,
+}
+
+/// §7.1.1の測定8: **`CTRL_C_EVENT`は届いているのか。**
+///
+/// [§S49](../../../../../plans/mac-spike/RESULTS.md)（測定7）は`CTRL_C_EVENT`について
+/// 何も言えなかった——撃つのは成功するのに、守っていない相手すら落ちなかったので、
+/// 「そもそも届いていない」と「届いたが既定の反応が終了ではない」が潰れたままだった。
+/// **死ぬかどうかで測っていたから**である。
+///
+/// そこで**受け取ったことを自分で記録して終わる子**を的に置き、指標を「死んだか」から
+/// 「受け取ったか」へ変える。あわせて、その子は待っている間バッファに残していた印を
+/// ハンドラの中で書き切るので、**後始末が最後まで走ったか**も同じ回で分かる。
+///
+/// | ラウンド | 撃つもの | これが無いと何が言えなくなるか |
+/// |---|---|---|
+/// | `no-shot`（対照） | 撃たない | 「ファイルが勝手に埋まらない」が言えず、他の2つの結果を読めない |
+/// | `break`（計器の歯） | `CTRL_BREAK_EVENT` | 記録が付かなかったとき、計器の故障と「届いていない」を区別できない |
+/// | `ctrl-c`（本命） | `CTRL_C_EVENT` | — |
+///
+/// **保持プロセスは握り潰し付きで立てる**（[§S49](../../../../../plans/mac-spike/RESULTS.md)で
+/// 測った性質に乗っている）。ラウンドの途中でコンソールが消えると、撃った後の読み取りが
+/// 「消えたから読めない」と「書かれなかったから読めない」に割れてしまう。
+///
+/// 実行（**昇格しないこと**、`B-08`）:
+///
+/// ```text
+/// cargo build -p tier2a-proc-probe
+/// cargo test -p harness-sandbox --lib -- --ignored --test-threads=1 --nocapture \
+///   control_event_delivery_and_cleanup_are_measured_with_a_handling_child
+/// ```
+#[test]
+#[ignore = "touches real AppContainer state; run non-elevated (see plans/mac-spike/RESULTS.md)"]
+fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
+    const TAG: &str = "MAC-CONSOLE-CTRL-DELIVERY";
+
+    let measure_lock =
+        std::path::Path::new(r"C:\harness-e2e\_measure-lock\mac-console-ctrl-delivery");
+    std::fs::create_dir_all(
+        measure_lock
+            .parent()
+            .expect("measurement lock has a parent"),
+    )
+    .expect("create the serialized measurement lock parent");
+    std::fs::create_dir(measure_lock).unwrap_or_else(|e| {
+        panic!(
+            "測定ロックを取得できない（並列測定または前回残骸を確認する）: path={measure_lock:?} error={e}"
+        )
+    });
+    let _measure_lock_cleanup = super::test_support::scopeguard(|| {
+        std::fs::remove_dir(measure_lock).ok();
+    });
+
+    let (workspace, sid, caps) = spike_workspace();
+    let workspace_canonical = workspace
+        .path()
+        .canonicalize()
+        .expect("canonicalize the spike workspace");
+    let cleanup_workspace = workspace_canonical.clone();
+    let _cleanup = super::test_support::scopeguard(move || {
+        let outcome =
+            crate::tier2a::session_profile::end_session(&super::revoke::revoke_session_grant);
+        eprintln!("[{TAG}] cleanup: {:?}", outcome.summary());
+        super::mac_spike_tests::forget_workspace_capability(&cleanup_workspace);
+        if let Err(e) = std::fs::remove_dir_all(&cleanup_workspace) {
+            eprintln!("[{TAG}] cleanup could not remove workspace: {e}");
+        }
+        if !cleanup_workspace.exists() {
+            crate::tier2a::workspace_ledger::remove_workspace_entry(&cleanup_workspace);
+        }
+    });
+
+    // 受け取る側と撃ち手を別ドメインにするのは§S49と同じ配置——ここから変える軸は
+    // 「的が受け取りを記録するかどうか」だけである。
+    let pid = std::process::id();
+    let domain_a = super::capability_sid_from_name(&format!("harness-ctrl-delivery-A-{pid}"))
+        .expect("derive domain A capability");
+    let domain_b = super::capability_sid_from_name(&format!("harness-ctrl-delivery-B-{pid}"))
+        .expect("derive domain B capability");
+    let mut caps_a: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
+    let mut caps_b = caps_a.clone();
+    caps_a.push(domain_a.as_psid());
+    caps_b.push(domain_b.as_psid());
+
+    let probe = probe_exe();
+    let probe_str = probe
+        .to_str()
+        .expect("probe path is valid utf-8")
+        .to_string();
+    eprintln!(
+        "[{TAG}] elevated={}",
+        crate::tier2a::privhelper::is_elevated()
+    );
+
+    // `outside`は受け取り手をサンドボックスの**外**に置く腕。**撃ち手は全ラウンド同じ**なので、
+    // 変わる軸は「受け取り手がAppContainerか」の1つだけになる——ここで結果が割れれば、
+    // 届かない理由はAppContainerの側にある。
+    let run_round = |label: &str, shot: Option<(&str, &str)>, outside: bool| -> DeliveryRound {
+        // 保持プロセスは握り潰し付き。ラウンドの間、コンソールを保たせる。
+        let holder_report = workspace.path().join(format!("{label}-holder.json"));
+        let holder_report_str = holder_report.to_string_lossy().into_owned();
+        let holder_args = [
+            "--idle-secs",
+            "120",
+            "--timeout-secs",
+            "180",
+            "--console-guard-ctrl",
+            "--report-file",
+            holder_report_str.as_str(),
+        ];
+        let holder_spec = SpikeSpawn {
+            exe: &probe_str,
+            args: &holder_args,
+            cwd: workspace.path(),
+            container_sid: sid.as_psid(),
+            capabilities: &[],
+            child_process_restricted: false,
+            stdout_override: None,
+            extra_inherit: &[],
+            process_sddl: None,
+            thread_sddl: None,
+            token_default_dacl_sddl: None,
+            no_appcontainer: true,
+            console: SpikeConsole::NoWindow,
+        };
+        let holder = wait_until_holder_is_ready(&holder_spec, &holder_report);
+        let arms = ConsoleArms {
+            tag: TAG,
+            probe: &probe_str,
+            cwd: workspace.path(),
+            container_sid: sid.as_psid(),
+            holder_pid: holder.pid(),
+        };
+
+        // 受け取る側（子2）。**3つのファイルを使う**——起動の申告・受け取りの記録・後始末。
+        let child_report = workspace.path().join(format!("{label}-child.json"));
+        let receipt_path = workspace.path().join(format!("{label}-receipt.txt"));
+        let cleanup_path = workspace.path().join(format!("{label}-cleanup.txt"));
+        let child_report_str = child_report.to_string_lossy().into_owned();
+        let receipt_str = receipt_path.to_string_lossy().into_owned();
+        let cleanup_str = cleanup_path.to_string_lossy().into_owned();
+        let child = arms
+            .spawn(
+                &format!("{label}/receiver(domainA)"),
+                &[
+                    "--console-ctrl-receipt",
+                    receipt_str.as_str(),
+                    "--console-ctrl-cleanup",
+                    cleanup_str.as_str(),
+                    "--report-file",
+                    child_report_str.as_str(),
+                    "--console-idle-secs",
+                    "20",
+                    "--timeout-secs",
+                    "60",
+                ],
+                if outside { &[] } else { &caps_a },
+                outside,
+                SpikeConsole::Inherit,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // **仕掛かるまで待つ。** 時間で待つのではなく、相手が「ハンドラを入れた」と
+        // 申告するのを待つ（仕掛かる前に撃つと、測るのは届くかどうかではなく競走になる）。
+        wait_until_report_contains(child.pid(), &child_report, "\"handler\":true");
+        let setup: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&child_report).expect("read the receiver report"),
+        )
+        .expect("the receiver report is JSON");
+
+        // 撃つ直前の後始末ファイル。**ここが空でなければ、このラウンドは何も語らない。**
+        let cleanup_before = std::fs::read_to_string(&cleanup_path).unwrap_or_default();
+
+        let sent = shot.map(|(event_arg, attempt_kind)| {
+            let attacker = arms.read(
+                &format!("{label}/attacker(domainB)"),
+                &[event_arg, "--timeout-secs", "60"],
+                &caps_b,
+                false,
+                SpikeConsole::Inherit,
+            );
+            console_attempt(&attacker, attempt_kind)
+                .and_then(|a| a.get("ok").and_then(|o| o.as_bool()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "撃ち手のレポートに`{attempt_kind}`の試行が無い（腕={label}）。\
+                         `cargo build -p tier2a-proc-probe`でプローブを作り直したか確認すること: {attacker}"
+                    )
+                })
+        });
+
+        // **待ち切ったら終わっていない**（受け取る側は20秒待つ腕で、こちらは5秒しか待たない）。
+        let exited = unsafe { WaitForSingleObject(child.process(), 5_000) } == WAIT_OBJECT_0;
+        let mut exit_code: u32 = 0;
+        let _ = unsafe { GetExitCodeProcess(child.process(), &mut exit_code) };
+
+        let receipt = std::fs::read_to_string(&receipt_path).ok();
+        let cleanup_after = std::fs::read_to_string(&cleanup_path).unwrap_or_default();
+        eprintln!(
+            "[{TAG}] {label}: sent={sent:?} exited={exited} exit_code={exit_code} \
+             receipt={receipt:?} cleanup_before={cleanup_before:?} cleanup_after={cleanup_after:?}"
+        );
+        // **待たずに畳む。** 受け取る側は20秒待つ腕なので、終わるまで待つと
+        // 撃たれなかったラウンドで毎回20秒を捨てることになる。Jobを閉じれば畳まれる。
+        drop(child);
+        drop(holder);
+
+        DeliveryRound {
+            setup,
+            receipt,
+            cleanup_before,
+            cleanup_after,
+            sent,
+            exited,
+            exit_code,
+        }
+    };
+
+    const BREAK: (&str, &str) = ("--console-ctrl-break", "console-ctrl-break");
+    const CTRL_C: (&str, &str) = ("--console-ctrl-c", "console-ctrl-c");
+    let no_shot = run_round("no-shot", None, false);
+    let break_round = run_round("break", Some(BREAK), false);
+    let ctrl_c_round = run_round("ctrl-c", Some(CTRL_C), false);
+    // 受け取り手をサンドボックスの外へ出した対。**この2本が揃って初めて**
+    // 「届かない理由がAppContainerの側にあるか」を割れる——外でも受け取れないなら、
+    // 原因はサンドボックスより手前（プロセスグループや親から継承する設定）にある。
+    let outside_break = run_round("outside-break", Some(BREAK), true);
+    let outside_ctrl_c = run_round("outside-ctrl-c", Some(CTRL_C), true);
+
+    // --- 判定 -------------------------------------------------------------------
+    // **計器から先に見る。** 仕掛かっていないラウンドの結果は何も語らない。
+    for (label, round) in [
+        ("no-shot", &no_shot),
+        ("break", &break_round),
+        ("ctrl-c", &ctrl_c_round),
+        ("outside-break", &outside_break),
+        ("outside-ctrl-c", &outside_ctrl_c),
+    ] {
+        let armed = round.setup.get("ctrl_receipt");
+        assert_eq!(
+            armed.and_then(|r| r.get("handler")).and_then(|h| h.as_bool()),
+            Some(true),
+            "受け取る側にハンドラが入っていない（腕={label}）。この回は測定になっていない: {}",
+            round.setup
+        );
+        assert_eq!(
+            armed
+                .and_then(|r| r.get("cleanup_open"))
+                .and_then(|h| h.as_bool()),
+            Some(true),
+            "後始末の対象を開けていない（腕={label}）。完走したかを判定できない: {}",
+            round.setup
+        );
+        // **撃つ前は空。** ここが崩れると「中身が在る＝ハンドラが走った」が読めなくなる。
+        assert!(
+            round.cleanup_before.is_empty(),
+            "撃つ前から後始末のファイルに中身がある（腕={label}）。\
+             待っている間はバッファに残る、という前提が崩れているので結果を読んではいけない: {:?}",
+            round.cleanup_before
+        );
+    }
+
+    // 対照: 撃たなければ何も起きない。**ファイルは勝手に埋まらない。**
+    assert!(
+        no_shot.receipt.is_none(),
+        "撃っていないのに受け取りの記録ができている: {:?}",
+        no_shot.receipt
+    );
+    assert!(
+        no_shot.cleanup_after.is_empty(),
+        "撃っていないのに後始末のファイルが埋まっている。\
+         「中身が在る＝ハンドラが走った」と読めなくなる: {:?}",
+        no_shot.cleanup_after
+    );
+    assert!(
+        !no_shot.exited,
+        "撃っていないのに受け取る側が5秒で終わった。落ちたことを「撃ったから」と読めない"
+    );
+
+    // 計器の歯: `CTRL_BREAK_EVENT`は届くと分かっているので、**必ず記録が付くはず**である。
+    assert_eq!(
+        break_round.sent,
+        Some(true),
+        "`CTRL_BREAK_EVENT`を撃てていない"
+    );
+    let break_receipt = break_round
+        .receipt
+        .as_deref()
+        .expect("`CTRL_BREAK_EVENT`で受け取りの記録ができていない。届くと分かっているイベントで \
+                記録が残らないなら、この計器は「届いた」を観測できない");
+    assert!(
+        break_receipt.contains("CTRL_BREAK_EVENT"),
+        "受け取りの記録が別の種類になっている: {break_receipt:?}"
+    );
+    assert!(
+        break_round.cleanup_after.contains(CTRL_CLEANUP_MARKER),
+        "後始末が最後まで走らなかった（`CTRL_BREAK_EVENT`）。\
+         バッファに残していた印がディスクへ届いていない: {:?}",
+        break_round.cleanup_after
+    );
+    assert_eq!(
+        break_round.exit_code, CTRL_HANDLED_EXIT_CODE,
+        "ハンドラを通って終わったなら終了コードは{CTRL_HANDLED_EXIT_CODE}のはず。\
+         `0xC000013A`ならOSの既定で終わらされている: {}",
+        break_round.exit_code
+    );
+
+    // --- 本命: `CTRL_C_EVENT`は届いているのか ------------------------------------
+    //
+    // **答えは「届いていない」だった**（2026-09-05の実測。3回とも同じ向き）。撃つのは成功し、
+    // 同じ器で`CTRL_BREAK_EVENT`は記録されるのに、`CTRL_C_EVENT`ではハンドラが1度も走らない。
+    // §S49が残した2択——「そもそも届いていない」と「届いたが既定の反応が終了ではない」——の
+    // **前者**である。
+    //
+    // 以下は**実測をそのまま固定している**。逆転したらこの経路は初めて脅威になり得るので、
+    // 記録（§S50）と設計書§7.1.2の決定1を測り直す合図にする。
+    assert_eq!(ctrl_c_round.sent, Some(true), "`CTRL_C_EVENT`を撃てていない");
+    assert!(
+        ctrl_c_round.receipt.is_none(),
+        "`CTRL_C_EVENT`で受け取りの記録ができた。2026-09-05の実測（届かない）と逆なので、\
+         この経路は届くようになっている。§S50と設計書§7.1.2の決定1を測り直すこと: {:?}",
+        ctrl_c_round.receipt
+    );
+    assert!(
+        ctrl_c_round.cleanup_after.is_empty(),
+        "`CTRL_C_EVENT`で後始末が走った。受け取りの記録が無いのに後始末だけ走るのは\
+         辻褄が合わないので、計器を疑うこと: {:?}",
+        ctrl_c_round.cleanup_after
+    );
+    assert!(
+        !ctrl_c_round.exited,
+        "`CTRL_C_EVENT`で受け取る側が終わった。ハンドラを通っていない（記録が無い）のに\
+         終わったなら、OSの既定で終わらされている——§S49の「守っていない的も落ちない」と逆である"
+    );
+
+    // --- 届かない理由はどこにあるのか（受け取り手をサンドボックスの外へ出した対） -----
+    assert_eq!(
+        outside_break.sent,
+        Some(true),
+        "外の受け取り手へ`CTRL_BREAK_EVENT`を撃てていない"
+    );
+    let outside_break_receipt = outside_break.receipt.as_deref().expect(
+        "サンドボックスの外の受け取り手でも`CTRL_BREAK_EVENT`の記録ができていない。\
+         この腕は計器として働いていないので、下の`outside-ctrl-c`の結果は何も語らない",
+    );
+    assert!(
+        outside_break_receipt.contains("CTRL_BREAK_EVENT"),
+        "外の受け取り手の記録が別の種類になっている: {outside_break_receipt:?}"
+    );
+    assert_eq!(
+        outside_ctrl_c.sent,
+        Some(true),
+        "外の受け取り手へ`CTRL_C_EVENT`を撃てていない"
+    );
+    // **サンドボックスの外でも届かなかった**（2026-09-05の実測。3回とも同じ向き）。
+    // つまり届かない理由はAppContainerの側には無く、**もっと手前**——プロセスグループか、
+    // 親から受け継ぐ「Ctrl+Cを無視する」状態——にある。
+    //
+    // **この向きは結論を弱める側に効く。** 原因がサンドボックスに無いということは、
+    // 親が変われば結果も変わり得るということで、**本番（親がSpawn Daemon）へは持ち越せない**。
+    // だから設計書§7.1.2は握り潰しに寄りかからず、決定2（立て直し）を置いたままにする。
+    assert!(
+        outside_ctrl_c.receipt.is_none(),
+        "サンドボックスの外の受け取り手だけが`CTRL_C_EVENT`を受け取った。\
+         届かない理由がAppContainerの側にあることになるので、記録（§S50）と\
+         設計書§7.1.2の決定1を書き直すこと: {:?}",
+        outside_ctrl_c.receipt
+    );
 }

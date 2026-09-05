@@ -24,11 +24,24 @@
 //! | `--console-read` | `CONOUT$`を開き、画面バッファの原点から読み返す |
 //! | `--console-ctrl-break` | 同じコンソールの全プロセスへ`CTRL_BREAK_EVENT`を撃つ |
 //! | `--console-ctrl-c` | 同じコンソールの全プロセスへ`CTRL_C_EVENT`を撃つ |
-//! | `--console-idle-secs <n>` | 上記の後、`n`秒生き続ける（撃たれる**的**になる腕で使う） |
+//! | `--console-ctrl-receipt <path>` | 制御イベントを受け取ったら種類を`<path>`へ書き切って終わる（受け取る側） |
+//! | `--console-ctrl-cleanup <path>` | 上記の後始末で書き切る先。待っている間はバッファに残す |
+//! | `--console-idle-secs <n>` | 上記の後、`n`秒生き続ける（撃たれる側になる腕で使う） |
 //!
 //! **制御イベントを2種類撃てるようにしてあるのは、§7.1.1の測定7のためである**——
 //! 保持プロセスがハンドラで自分を守れたとして、**守りが片方の種類にしか効かない**なら
 //! 「サンドボックスから届く経路が塞がった」とは書けない。
+//!
+//! # 受け取る側を測る（測定8、`--console-ctrl-receipt`）
+//!
+//! 測定7では`CTRL_C_EVENT`について**何も言えなかった**——撃つのは成功するのに、
+//! 守っていない相手すら落ちなかったので、「届いていない」と「届いたが既定の反応が終了ではない」
+//! が潰れたままだった（[§S49](../../../plans/mac-spike/RESULTS.md)）。
+//!
+//! **死ぬかどうかで測るのをやめ、受け取ったかどうかを直接記録すれば割れる。**
+//! `--console-ctrl-receipt`を付けた腕は、制御イベントを受け取ると
+//! (1) 種類をファイルへ書き切り、(2) 待っている間バッファに残していた印を書き切って閉じ、
+//! (3) [`CTRL_HANDLED_EXIT_CODE`]で終わる。**記録が残れば、死ななくても届いたと言える。**
 //!
 //! **`--console-write`と`--console-read`は同時に指定できる。** ただし実測（§S48）では
 //! **サンドボックスの中からは書けるが読めない**（読みは`ERROR_ACCESS_DENIED`）ので、
@@ -57,6 +70,10 @@ pub struct Spec {
     pub ctrl_break: bool,
     /// 同じコンソールの全プロセスへ`CTRL_C_EVENT`を撃つか。
     pub ctrl_c: bool,
+    /// 受け取った制御イベントを書き切る先（指定すると「受け取る側」の仕掛けが入る）。
+    pub ctrl_receipt: Option<String>,
+    /// 後始末で書き切る先（待っている間はバッファに残したままにする）。
+    pub ctrl_cleanup: Option<String>,
     /// 上記を済ませた後、生き続ける秒数（0なら即終了）。
     pub idle_secs: u64,
 }
@@ -94,6 +111,160 @@ pub fn guard_self_from_ctrl_events() -> bool {
     false
 }
 
+/// 制御イベントを受け取ったハンドラが、後始末まで済ませたときの終了コード。
+///
+/// **37（シェルの完走印）・97（見張りタイマー）と衝突しない値を選んである。**
+/// これがあると、「ハンドラを通って終わった」と「OSの既定で終わらされた」
+/// （`STATUS_CONTROL_C_EXIT` = `0xC000013A`）が終了コードだけで割れる。
+/// 読む側は`mac_spike_daemon_tests`で、**同じ値を両方に書いてある**ので片方だけ変えないこと。
+pub const CTRL_HANDLED_EXIT_CODE: i32 = 43;
+
+/// 後始末で書き切る印。**待っている間はバッファの中にあり、ディスクには無い。**
+pub const CLEANUP_MARKER: &str = "HARNESS-CTRL-CLEANUP-COMPLETE";
+
+/// 受け取る側の仕掛けの置き場。
+///
+/// **プロセス全体で1つ持つ必要がある。** 制御イベントのハンドラはOSが起こす**別のスレッド**で
+/// 走るので、待っている側のローカル変数には触れない。
+#[cfg(windows)]
+static CTRL_RECEIPT: std::sync::OnceLock<CtrlReceipt> = std::sync::OnceLock::new();
+
+/// 制御イベントを受け取ったときに書き残すもの一式（設計書§7.1.1の測定8）。
+#[cfg(windows)]
+struct CtrlReceipt {
+    /// 受け取った事実を書き切る先。**ハンドラが走らなければ、このファイルは作られない**
+    /// ——「在るか」がそのまま「届いたか」になる。
+    receipt: std::path::PathBuf,
+    /// 待っている間ずっと「書いたがディスクへ出していない」状態で持つ書き手。
+    /// ハンドラがこれを書き切って閉じることが、**後始末が最後まで走った証拠**になる。
+    cleanup: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>>,
+}
+
+#[cfg(windows)]
+impl CtrlReceipt {
+    /// 受け取った事実を**追記して即座に書き切る**。
+    ///
+    /// バッファに残すと、この直後にプロセスが消えたときに一緒に消える——
+    /// それでは「受け取った」の証拠にならない。
+    fn append(&self, line: &str) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.receipt)
+        {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.flush();
+        }
+    }
+
+    /// バッファに残していた印を書き切って閉じる（＝後始末）。完走したら`true`。
+    fn finish_cleanup(&self) -> bool {
+        use std::io::Write;
+        let Ok(mut slot) = self.cleanup.lock() else {
+            return false;
+        };
+        let Some(mut writer) = slot.take() else {
+            // 後始末の対象を持たない構成。「失敗した」とは別物なので、読む側が
+            // 区別できるよう呼び出し側で`cleanup`の有無と併せて読む。
+            return false;
+        };
+        writer.flush().is_ok()
+        // `writer`はここで落ち、ファイルが閉じる。
+    }
+}
+
+#[cfg(windows)]
+fn ctrl_event_name(ctrl_type: u32) -> &'static str {
+    match ctrl_type {
+        0 => "CTRL_C_EVENT",
+        1 => "CTRL_BREAK_EVENT",
+        2 => "CTRL_CLOSE_EVENT",
+        5 => "CTRL_LOGOFF_EVENT",
+        6 => "CTRL_SHUTDOWN_EVENT",
+        _ => "UNKNOWN",
+    }
+}
+
+/// 受け取った事実と後始末を書き残してから終わるハンドラ。
+///
+/// **順序が証拠の強さを決める。** 受け取った事実を先に書き切ってから後始末へ進む——
+/// 逆にすると、後始末で詰まった回が「届いていない」と読めてしまう。
+#[cfg(windows)]
+unsafe extern "system" fn record_and_exit_ctrl_event(
+    ctrl_type: u32,
+) -> windows::Win32::Foundation::BOOL {
+    if let Some(state) = CTRL_RECEIPT.get() {
+        state.append(&format!(
+            "received={ctrl_type} name={}\n",
+            ctrl_event_name(ctrl_type)
+        ));
+        let finished = state.finish_cleanup();
+        state.append(&format!(
+            "cleanup={}\n",
+            if finished { "ok" } else { "failed" }
+        ));
+    }
+    std::process::exit(CTRL_HANDLED_EXIT_CODE);
+}
+
+/// 受け取る側の仕掛けを作る（`--console-ctrl-receipt`）。
+///
+/// **待ちに入る前に呼ぶ。** レポートが見えた時点で仕掛けが済んでいないと、
+/// 読む側は「撃ってよい時点」を判定できない（仕掛かる前に撃つと、測っているのは
+/// 届くかどうかではなく競走になる）。
+///
+/// 返すJSONは**この腕が自分の構成を名乗る**ためのもので、読む側はこれを照合してから
+/// 結果を読む（引数が届いていない回を「届かなかった回」と取り違えないため）。
+#[cfg(windows)]
+pub fn arm_ctrl_receipt(receipt: &str, cleanup: Option<&str>) -> Value {
+    use std::io::Write;
+
+    // 後始末の対象を先に開く。**開いた時点でファイルは空で存在する**ので、
+    // 読む側は「空で在る＝仕掛かった」「中身が在る＝ハンドラが走った」と読み分けられる。
+    let (cleanup_open, writer) = match cleanup {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(file) => {
+                let mut w = std::io::BufWriter::new(file);
+                // **ここでは書き切らない。** バッファに残すのが目的で、
+                // ディスクへ出してしまうと「後始末が走った」の証拠にならなくなる。
+                let _ = w.write_all(CLEANUP_MARKER.as_bytes());
+                (true, Some(w))
+            }
+            Err(_) => (false, None),
+        },
+        None => (false, None),
+    };
+
+    let armed = CTRL_RECEIPT
+        .set(CtrlReceipt {
+            receipt: std::path::PathBuf::from(receipt),
+            cleanup: std::sync::Mutex::new(writer),
+        })
+        .is_ok();
+
+    let handler = armed
+        && unsafe {
+            windows::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(record_and_exit_ctrl_event),
+                true,
+            )
+        }
+        .is_ok();
+
+    json!({
+        "receipt": receipt,
+        "cleanup": cleanup,
+        "cleanup_open": cleanup_open,
+        "handler": handler,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn arm_ctrl_receipt(receipt: &str, cleanup: Option<&str>) -> Value {
+    json!({ "receipt": receipt, "cleanup": cleanup, "cleanup_open": false, "handler": false })
+}
+
 /// このプロセスがどのコンソールに属しているか（**腕ごとの検算**）。
 ///
 /// 属していない腕が「読めなかった」と言っても、それはコンソールのせいではない。
@@ -128,6 +299,13 @@ pub fn run(spec: &Spec) -> Value {
 
     let mut attempts: Vec<Value> = Vec::new();
     let membership = console_membership();
+
+    // **いちばん先に仕掛ける。** この関数を抜けた後にレポートが書かれ、それを見た読む側が
+    // 撃つので、ここで済ませておかないと「撃ってよい時点」が保証できない。
+    let ctrl_receipt = spec
+        .ctrl_receipt
+        .as_deref()
+        .map(|receipt| arm_ctrl_receipt(receipt, spec.ctrl_cleanup.as_deref()));
 
     // `CONOUT$`は「自分が属しているコンソールのアクティブな画面バッファ」を指す特別な名前である。
     // **属していなければここで失敗する**——その失敗は「コンソールに参加していない」の印であって、
@@ -242,6 +420,9 @@ pub fn run(spec: &Spec) -> Value {
         "pid": std::process::id(),
         "membership": membership,
         "attempts": attempts,
+        // **腕は自分で名乗る。** 引数が届いていない回を「届かなかった回」と
+        // 取り違えないための照合先である（`null`は「頼まれていない」）。
+        "ctrl_receipt": ctrl_receipt,
     })
 }
 

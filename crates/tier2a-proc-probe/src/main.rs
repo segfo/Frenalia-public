@@ -132,6 +132,8 @@ fn parse_args() -> Args {
     let mut console_read = false;
     let mut console_ctrl_break = false;
     let mut console_ctrl_c = false;
+    let mut console_ctrl_receipt: Option<String> = None;
+    let mut console_ctrl_cleanup: Option<String> = None;
     let mut console_idle_secs: u64 = 0;
     let mut console_mode = false;
     let mut console_guard_ctrl = false;
@@ -228,6 +230,16 @@ fn parse_args() -> Args {
                 console_ctrl_c = true;
                 console_mode = true;
             }
+            // §7.1.1測定8。**受け取る側**の腕（撃つ側と同じモードに同居させるのは、
+            // コンソールへの載り方・レポートの出し方・待ち方が全部共通だからである）。
+            "--console-ctrl-receipt" => {
+                console_ctrl_receipt = Some(next());
+                console_mode = true;
+            }
+            "--console-ctrl-cleanup" => {
+                console_ctrl_cleanup = Some(next());
+                console_mode = true;
+            }
             "--console-idle-secs" => {
                 console_idle_secs = next().parse().unwrap_or(0);
                 console_mode = true;
@@ -245,6 +257,8 @@ fn parse_args() -> Args {
         read: console_read,
         ctrl_break: console_ctrl_break,
         ctrl_c: console_ctrl_c,
+        ctrl_receipt: console_ctrl_receipt,
+        ctrl_cleanup: console_ctrl_cleanup,
         idle_secs: console_idle_secs,
     });
 
