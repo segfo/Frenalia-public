@@ -100,9 +100,9 @@ struct Args {
     /// MAC設計§7.1.1の測定7: 自分に届く`CTRL_C_EVENT`/`CTRL_BREAK_EVENT`を握り潰してから走る。
     /// **保持プロセス役の腕で使う**——撃たれても生き残るかを、守らない腕と対にして測る。
     console_guard_ctrl: bool,
-    /// MAC設計§7.1.1の測定8: 上流から受け継いだ「`CTRL_C_EVENT`を無視する」属性を自分だけ外す
+    /// MAC設計§7.1.1の測定8: 「`CTRL_C_EVENT`を無視する」継承属性を自分についてどうするか
     /// （`console_share::apply_ctrl_c_mode`）。**どのモードの腕でも使える。**
-    console_ctrl_accept: bool,
+    console_ctrl_c_mode: console_share::CtrlCMode,
 }
 
 fn parse_args() -> Args {
@@ -137,7 +137,8 @@ fn parse_args() -> Args {
     let mut console_ctrl_c = false;
     let mut console_ctrl_receipt: Option<String> = None;
     let mut console_ctrl_cleanup: Option<String> = None;
-    let mut console_ctrl_accept = false;
+    let mut console_ctrl_c_mode = console_share::CtrlCMode::Inherit;
+    let mut console_watch_input = false;
     let mut console_idle_secs: u64 = 0;
     let mut console_mode = false;
     let mut console_guard_ctrl = false;
@@ -242,7 +243,14 @@ fn parse_args() -> Args {
             }
             // **`console_mode`を立てない。** 保持プロセス役（`--idle-secs`で待つ腕）でも
             // 使うので、画面バッファを触るモードへ落とすと測る対象が別物になる。
-            "--console-ctrl-accept" => console_ctrl_accept = true,
+            // **後に書いたほうが勝つ**（両方指定は測定の取り違えなので、レポートの
+            // `ctrl_c_mode`を見れば実際に効いたほうが分かる）。
+            "--console-ctrl-accept" => console_ctrl_c_mode = console_share::CtrlCMode::Accept,
+            "--console-ctrl-ignore" => console_ctrl_c_mode = console_share::CtrlCMode::Ignore,
+            "--console-watch-input" => {
+                console_watch_input = true;
+                console_mode = true;
+            }
             "--console-ctrl-cleanup" => {
                 console_ctrl_cleanup = Some(next());
                 console_mode = true;
@@ -266,6 +274,7 @@ fn parse_args() -> Args {
         ctrl_c: console_ctrl_c,
         ctrl_receipt: console_ctrl_receipt,
         ctrl_cleanup: console_ctrl_cleanup,
+        watch_input: console_watch_input,
         // 実際の適用は`main`が全モード共通で1回行う。ここは置き場だけ用意しておく。
         ctrl_c_mode: "inherit",
         idle_secs: console_idle_secs,
@@ -303,7 +312,7 @@ fn parse_args() -> Args {
         report_file,
         idle_secs,
         console_guard_ctrl,
-        console_ctrl_accept,
+        console_ctrl_c_mode,
     }
 }
 
@@ -591,7 +600,7 @@ fn main() -> ExitCode {
 
     // **`CTRL_C_EVENT`の扱いは、どのモードよりも先に1回だけ決める。**
     // モードごとに書くと片方だけ直る事故になる（`docs/CODE-STRUCTURE-RULES.md`§5.0）。
-    let ctrl_c_mode = console_share::apply_ctrl_c_mode(args.console_ctrl_accept);
+    let ctrl_c_mode = console_share::apply_ctrl_c_mode(args.console_ctrl_c_mode);
     if let Some(spec) = args.console_share.as_mut() {
         spec.ctrl_c_mode = ctrl_c_mode;
     }

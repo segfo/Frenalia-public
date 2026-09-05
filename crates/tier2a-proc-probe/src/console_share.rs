@@ -27,6 +27,8 @@
 //! | `--console-ctrl-receipt <path>` | 制御イベントを受け取ったら種類を`<path>`へ書き切って終わる（受け取る側） |
 //! | `--console-ctrl-cleanup <path>` | 上記の後始末で書き切る先。待っている間はバッファに残す |
 //! | `--console-ctrl-accept` | `CTRL_C_EVENT`を受け取る側へ戻す（上流から受け継いだ「無視する」属性を自分だけ外す） |
+//! | `--console-ctrl-ignore` | 逆に自分で「無視する」側にする（親が立てていない環境で、立っていたらどうなるかを測る） |
+//! | `--console-watch-input` | 待っている間、押されたキーそのものを読んで同じ記録へ積む（「押せているか」を割る） |
 //! | `--console-idle-secs <n>` | 上記の後、`n`秒生き続ける（撃たれる側になる腕で使う） |
 //!
 //! **制御イベントを2種類撃てるようにしてあるのは、§7.1.1の測定7のためである**——
@@ -75,6 +77,9 @@ pub struct Spec {
     pub ctrl_receipt: Option<String>,
     /// 後始末で書き切る先（待っている間はバッファに残したままにする）。
     pub ctrl_cleanup: Option<String>,
+    /// 待っている間、**コンソールの入力そのもの**も読んで同じ記録へ積むか
+    /// （[`watch_console_input`]）。「押したのに何も起きない」を割るための腕。
+    pub watch_input: bool,
     /// `CTRL_C_EVENT`の扱いをどうしたか（[`apply_ctrl_c_mode`]の戻り値をそのまま持つ）。
     /// **レポートへ出すためだけに持ち回る**——適用そのものは`main`が最初に済ませている。
     pub ctrl_c_mode: &'static str,
@@ -115,7 +120,22 @@ pub fn guard_self_from_ctrl_events() -> bool {
     false
 }
 
-/// **`CTRL_C_EVENT`を受け取る側へ戻す**（`SetConsoleCtrlHandler(NULL, FALSE)`）。
+/// `CTRL_C_EVENT`の扱いを、走り出す前にどうするか。
+///
+/// **3つに割れている理由は、既定が「親から受け継いだまま」だからである。** 受け継いだ状態を
+/// 知らないまま「外す／立てる」だけを用意すると、比較の基準が消える。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CtrlCMode {
+    /// 何もしない。**親から受け継いだまま**で、比較の基準になる。
+    Inherit,
+    /// 受け取る側へ戻す（`SetConsoleCtrlHandler(NULL, FALSE)`）。
+    Accept,
+    /// 自分で無視する側にする（`SetConsoleCtrlHandler(NULL, TRUE)`）。
+    /// **親が立てていない環境で「立っていたらどうなるか」を測るための腕。**
+    Ignore,
+}
+
+/// **`CTRL_C_EVENT`の扱いを走り出す前に決める。**
 ///
 /// Microsoftの文書は「`SetConsoleCtrlHandler`は**継承される属性**を立てられ、それが
 /// 立っているプロセスへ`GenerateConsoleCtrlEvent`が`CTRL_C_EVENT`を送っても
@@ -126,21 +146,25 @@ pub fn guard_self_from_ctrl_events() -> bool {
 /// **どのモードよりも先に、`main`が1回だけ呼ぶ。** 受け取る側の腕でも保持プロセス役でも
 /// 使うので、モードごとに書くと片方だけ直る事故になる。
 #[cfg(windows)]
-pub fn apply_ctrl_c_mode(accept: bool) -> &'static str {
-    if !accept {
-        // 何もしない＝**親から受け継いだまま**。既定はこちらで、比較の基準になる。
-        return "inherit";
-    }
-    let ok = unsafe { windows::Win32::System::Console::SetConsoleCtrlHandler(None, false) }.is_ok();
-    if ok {
-        "accept"
-    } else {
-        "accept-failed"
+pub fn apply_ctrl_c_mode(mode: CtrlCMode) -> &'static str {
+    let ignore = match mode {
+        CtrlCMode::Inherit => return "inherit",
+        CtrlCMode::Accept => false,
+        CtrlCMode::Ignore => true,
+    };
+    let ok =
+        unsafe { windows::Win32::System::Console::SetConsoleCtrlHandler(None, ignore) }.is_ok();
+    match (mode, ok) {
+        (CtrlCMode::Accept, true) => "accept",
+        (CtrlCMode::Accept, false) => "accept-failed",
+        (CtrlCMode::Ignore, true) => "ignore",
+        (CtrlCMode::Ignore, false) => "ignore-failed",
+        (CtrlCMode::Inherit, _) => unreachable!("Inheritは上で返している"),
     }
 }
 
 #[cfg(not(windows))]
-pub fn apply_ctrl_c_mode(_accept: bool) -> &'static str {
+pub fn apply_ctrl_c_mode(_mode: CtrlCMode) -> &'static str {
     "unsupported"
 }
 
@@ -197,18 +221,24 @@ impl CtrlReceipt {
         }
     }
 
-    /// バッファに残していた印を書き切って閉じる（＝後始末）。完走したら`true`。
-    fn finish_cleanup(&self) -> bool {
+    /// バッファに残していた印を書き切って閉じる（＝後始末）。
+    ///
+    /// **3つの結果を1語ずつに分ける。** 「対象が無かった」を「失敗した」と同じ語で書くと、
+    /// 後から記録を読む人が**構成の違いを不具合と読む**（実際に踏んだ——後始末の対象を
+    /// 指定しない回で`failed`と出た）。
+    fn finish_cleanup(&self) -> &'static str {
         use std::io::Write;
         let Ok(mut slot) = self.cleanup.lock() else {
-            return false;
+            return "lock-failed";
         };
         let Some(mut writer) = slot.take() else {
-            // 後始末の対象を持たない構成。「失敗した」とは別物なので、読む側が
-            // 区別できるよう呼び出し側で`cleanup`の有無と併せて読む。
-            return false;
+            return "skipped";
         };
-        writer.flush().is_ok()
+        if writer.flush().is_ok() {
+            "ok"
+        } else {
+            "failed"
+        }
         // `writer`はここで落ち、ファイルが閉じる。
     }
 }
@@ -233,6 +263,149 @@ fn ctrl_event_name(ctrl_type: u32) -> &'static str {
     }
 }
 
+/// 押されたキーの番号を、よく使うものだけ名前にする。
+///
+/// **`Ctrl`+`Break`は`VK_CANCEL`（3）として届く。** これが記録に出れば「キーは届いているが
+/// 信号になっていない」、1件も出なければ「そもそも端末が送っていない」と読み分けられる。
+#[cfg(windows)]
+fn virtual_key_name(vk: u16) -> &'static str {
+    match vk {
+        0x03 => "VK_CANCEL(Ctrl+Break)",
+        0x08 => "VK_BACK",
+        0x0D => "VK_RETURN",
+        0x11 => "VK_CONTROL",
+        0x12 => "VK_MENU(Alt)",
+        0x13 => "VK_PAUSE",
+        0x10 => "VK_SHIFT",
+        0x1B => "VK_ESCAPE",
+        0x20 => "VK_SPACE",
+        0x43 => "C",
+        0x91 => "VK_SCROLL",
+        _ => "",
+    }
+}
+
+/// **キーが本当に届いているかを見る**（`--console-watch-input`）。
+///
+/// # なぜ要るか
+///
+/// 「押したのに何も起きない」は2つの意味に割れる——**端末がそのキーを送っていない**のか、
+/// **送られたが信号にならなかった**のか。制御イベントのハンドラは後者しか見ないので、
+/// 前者と区別が付かない。そこで**コンソールの入力そのもの**を読んで、同じ記録へ積む。
+///
+/// # 読み方
+///
+/// | 記録に出るもの | 意味 |
+/// |---|---|
+/// | `key`の行が出て、`received`も出る | キーが届き、信号にもなった |
+/// | `key`の行だけ出る | **キーは届いているが信号になっていない** |
+/// | どちらも出ない | **端末がそのキーを送っていない**（キーの組み合わせが違う等） |
+///
+/// **`Ctrl`+`C`はここには出ないのが正常である**——`ENABLE_PROCESSED_INPUT`が立っていると、
+/// コンソールがキー入力ではなく信号として扱うためである。だから開始時のモードも記録する。
+///
+/// **入力を読むと消費する。** この腕を撃っている間、同じコンソールの他のプロセスは
+/// その入力を受け取れない。測定専用の腕であって、常用するものではない。
+#[cfg(windows)]
+pub fn watch_console_input(seconds: u64) {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_MODE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        GetConsoleMode, GetNumberOfConsoleInputEvents, ReadConsoleInputW, CONSOLE_MODE,
+        INPUT_RECORD, KEY_EVENT,
+    };
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let Some(state) = CTRL_RECEIPT.get() else {
+        // 記録の置き場が無ければ、見ても残せない。**黙って待たない**（`B-10`）。
+        return;
+    };
+
+    let name = wide("CONIN$");
+    let conin = unsafe {
+        CreateFileW(
+            PCWSTR(name.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+            FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0),
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        )
+    };
+    let conin = match conin {
+        Ok(h) => h,
+        Err(e) => {
+            state.append(json!({ "kind": "input-watch", "ok": false, "error": e.to_string() }));
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+            return;
+        }
+    };
+
+    // **開始時のモードを残す。** `ENABLE_PROCESSED_INPUT`（1）が立っていれば、
+    // `Ctrl`+`C`はキー入力ではなく信号になる——出てこないのが正常だと読める。
+    let mut mode = CONSOLE_MODE(0);
+    let mode_ok = unsafe { GetConsoleMode(conin, &mut mode) }.is_ok();
+    state.append(json!({
+        "kind": "input-watch",
+        "ok": true,
+        "mode_ok": mode_ok,
+        "mode": mode.0,
+        "processed_input": mode.0 & 0x0001 != 0,
+        "watch_secs": seconds,
+    }));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut other_events: u32 = 0;
+    while std::time::Instant::now() < deadline {
+        // 待てる相手なので回し続けない。100ミリ秒ごとに起きて、無ければまた待つ。
+        if unsafe { WaitForSingleObject(conin, 100) } != WAIT_OBJECT_0 {
+            continue;
+        }
+        let mut pending: u32 = 0;
+        if unsafe { GetNumberOfConsoleInputEvents(conin, &mut pending) }.is_err() || pending == 0 {
+            continue;
+        }
+        let mut records = vec![INPUT_RECORD::default(); pending.min(64) as usize];
+        let mut read: u32 = 0;
+        if unsafe { ReadConsoleInputW(conin, &mut records, &mut read) }.is_err() {
+            continue;
+        }
+        for record in records.iter().take(read as usize) {
+            if record.EventType != KEY_EVENT as u16 {
+                other_events += 1;
+                continue;
+            }
+            let key = unsafe { record.Event.KeyEvent };
+            let unicode = unsafe { key.uChar.UnicodeChar };
+            state.append(json!({
+                "kind": "key",
+                "down": key.bKeyDown.as_bool(),
+                "vk": key.wVirtualKeyCode,
+                "vk_name": virtual_key_name(key.wVirtualKeyCode),
+                "scan": key.wVirtualScanCode,
+                "char_code": unicode,
+                "ctrl_state": key.dwControlKeyState,
+                // 左右どちらのCtrlでも立つ。押しながらかどうかがこれで分かる。
+                "ctrl_held": key.dwControlKeyState & 0x000C != 0,
+            }));
+        }
+    }
+    state.append(json!({ "kind": "input-watch-end", "other_events": other_events }));
+    unsafe {
+        let _ = CloseHandle(conin);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn watch_console_input(seconds: u64) {
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+}
+
 /// 受け取った事実と後始末を書き残してから終わるハンドラ。
 ///
 /// **順序が証拠の強さを決める。** 受け取った事実を先に書き切ってから後始末へ進む——
@@ -247,10 +420,9 @@ unsafe extern "system" fn record_and_exit_ctrl_event(
             "event": ctrl_type,
             "name": ctrl_event_name(ctrl_type),
         }));
-        let finished = state.finish_cleanup();
         state.append(json!({
             "kind": "cleanup",
-            "result": if finished { "ok" } else { "failed" },
+            "result": state.finish_cleanup(),
         }));
     }
     std::process::exit(CTRL_HANDLED_EXIT_CODE);
@@ -500,9 +672,15 @@ pub fn run(spec: &Spec) -> Value {
 /// 待っている間にCtrl+Breakで落とされたときに**1行も残らない**——
 /// 「落とされた」と「そもそも動かなかった」が区別できなくなる。
 pub fn idle(spec: &Spec) {
-    if spec.idle_secs > 0 {
-        std::thread::sleep(std::time::Duration::from_secs(spec.idle_secs));
+    if spec.idle_secs == 0 {
+        return;
     }
+    if spec.watch_input {
+        // 待ち方を差し替えるだけで、待つ長さは同じ。**押されたキーを記録しながら待つ。**
+        watch_console_input(spec.idle_secs);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_secs(spec.idle_secs));
 }
 
 #[cfg(not(windows))]
