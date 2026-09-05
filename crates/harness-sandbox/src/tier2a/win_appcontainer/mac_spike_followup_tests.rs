@@ -375,15 +375,7 @@ fn s2c_swapping_the_token_default_dacl_closes_the_later_object_hole() {
     drop(target);
 
     let ok_of = |v: &serde_json::Value, kind: &str, access: &str, target: &str| -> Option<bool> {
-        v.get("attempts")?
-            .as_array()?
-            .iter()
-            .find(|a| {
-                a.get("kind").and_then(|k| k.as_str()) == Some(kind)
-                    && a.get("access").and_then(|k| k.as_str()) == Some(access)
-                    && a.get("target").and_then(|k| k.as_str()) == Some(target)
-            })
-            .and_then(|a| a.get("ok").and_then(|o| o.as_bool()))
+        super::mac_spike_tests::reach_attempt_ok(v, kind, access, Some(target))
     };
     let other = &results[0].1;
     let same = &results[1].1;

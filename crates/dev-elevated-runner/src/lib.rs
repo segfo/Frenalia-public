@@ -325,6 +325,10 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "go_no_go_attach_console_restricted_shell_runs",
         ],
     ),
+    // **MAC §7.1.1の測定4はここに載せない。** 実測（2026-09-05）で昇格を1度も要求せずに
+    // 完走したので、素の`cargo test`で回す。昇格して測ると保持プロセスの整合性レベルが
+    // 本番（非昇格のDaemonが作る）と変わる＝測る世界が変わる（B-08）。
+    // 回し方は`plans/mac-spike/RESULTS.md`が持つ。
     (
         "spike-etw-fs",
         &[

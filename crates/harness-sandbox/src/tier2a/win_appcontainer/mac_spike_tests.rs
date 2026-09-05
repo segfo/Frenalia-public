@@ -487,7 +487,6 @@ impl SpikeSpawn<'_> {
                     return Err(step("SetTokenInformation(TokenDefaultDacl)", e));
                 }
             }
-
         }
 
         Ok(SuspendedSpikeChild {
@@ -593,6 +592,33 @@ pub(super) fn last_json_line(stdout: &str) -> Option<serde_json::Value> {
         .lines()
         .rev()
         .find_map(|line| serde_json::from_str(line.trim()).ok())
+}
+
+/// `--reach-*`プローブが出したJSONから、試行1件の可否を引く。
+///
+/// `None`＝その試行がレポートに無い（プローブが撃っていない）。`Some(false)`＝撃って拒否された。
+/// **この2つを混同しないこと**——前者は計器が動いていない可能性であり、
+/// 「拒否された」の根拠にはできない。だから`bool`ではなく`Option<bool>`で返す。
+///
+/// `target`に`None`を渡すと的を問わず最初の一致を返す（的が1つしかない測定用）。
+/// 同じ`kind`・`access`の的が複数あるときは必ず`Some`で指定する——指定しないと
+/// **どの的の結果を読んだのかが結果から分からない**。
+pub(super) fn reach_attempt_ok(
+    report: &serde_json::Value,
+    kind: &str,
+    access: &str,
+    target: Option<&str>,
+) -> Option<bool> {
+    report
+        .get("attempts")?
+        .as_array()?
+        .iter()
+        .find(|a| {
+            a.get("kind").and_then(|k| k.as_str()) == Some(kind)
+                && a.get("access").and_then(|k| k.as_str()) == Some(access)
+                && target.is_none_or(|t| a.get("target").and_then(|k| k.as_str()) == Some(t))
+        })
+        .and_then(|a| a.get("ok").and_then(|o| o.as_bool()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,15 +1067,7 @@ fn appcontainer_default_deny_across_object_types() {
     }
 
     let find = |report: &serde_json::Value, kind: &str, access: &str| -> Option<bool> {
-        report
-            .get("attempts")?
-            .as_array()?
-            .iter()
-            .find(|a| {
-                a.get("kind").and_then(|k| k.as_str()) == Some(kind)
-                    && a.get("access").and_then(|k| k.as_str()) == Some(access)
-            })
-            .and_then(|a| a.get("ok").and_then(|o| o.as_bool()))
+        reach_attempt_ok(report, kind, access, None)
     };
 
     // 設計が前提にしている予測を明示的に固定する。**破れたらここで落ちる**——
@@ -1248,27 +1266,10 @@ fn s2b_a_custom_process_dacl_can_close_the_same_package_open_process_hole() {
     drop(target);
 
     let find_target = |kind: &str, access: &str, target: &str| -> Option<bool> {
-        report
-            .get("attempts")?
-            .as_array()?
-            .iter()
-            .find(|a| {
-                a.get("kind").and_then(|k| k.as_str()) == Some(kind)
-                    && a.get("access").and_then(|k| k.as_str()) == Some(access)
-                    && a.get("target").and_then(|k| k.as_str()) == Some(target)
-            })
-            .and_then(|a| a.get("ok").and_then(|o| o.as_bool()))
+        reach_attempt_ok(&report, kind, access, Some(target))
     };
     let find = |kind: &str, access: &str| -> Option<bool> {
-        report
-            .get("attempts")?
-            .as_array()?
-            .iter()
-            .find(|a| {
-                a.get("kind").and_then(|k| k.as_str()) == Some(kind)
-                    && a.get("access").and_then(|k| k.as_str()) == Some(access)
-            })
-            .and_then(|a| a.get("ok").and_then(|o| o.as_bool()))
+        reach_attempt_ok(&report, kind, access, None)
     };
     let extra_thread_open = find_target("thread", "THREAD_ALL_ACCESS", &extra_tid.to_string());
     eprintln!(

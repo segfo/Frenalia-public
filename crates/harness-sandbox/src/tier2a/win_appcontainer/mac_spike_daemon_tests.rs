@@ -139,6 +139,44 @@ impl AttachedShellRun {
         self.child_creation()
             .is_some_and(|outcome| outcome.starts_with("CHILD-DENIED-"))
     }
+
+    /// **§7.1.1測定5**: 子の標準ハンドルがパイプのまま保たれているか（`stdin/stdout/stderr`の順）。
+    ///
+    /// コンソールを借りて起こすと、子の標準ハンドルにコンソールハンドルが混入し得る。
+    /// 混入すると、`STARTF_USESTDHANDLES`＋パイプという前提の上に乗っている出力の読み方
+    /// （起動時ノイズの切り出し・stderrの境界印）が静かに変わる。
+    ///
+    /// **親側でパイプから読めていることは、この問いに答えない**——親が読めていても、
+    /// 子の中では別のハンドルが標準出力として見えている可能性が残る。だから**子の内側で**測る。
+    fn stdio_redirected(&self) -> Option<&str> {
+        self.stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("HARNESS-ATTACH-CONSOLE-STDIO="))
+    }
+
+    /// stderrのうち、**既知の起動時ノイズを除いた**残り。
+    ///
+    /// この測定が探しているのは「無言の失敗が混ざっていないか」であって、
+    /// PowerShellが起動時に必ず出す既知の1行ではない。`is_empty()`で直に見ると、
+    /// **測る世界を昇格した回に固定してしまう**——下の1行は**非昇格の回でだけ出る**
+    /// （2026-09-05の実測。昇格して測った2026-09-04の回では出ていない）。
+    ///
+    /// **除くのは名指しした行だけである。** 前方一致や「警告らしい行」で落とすと、
+    /// 本当に見たい無言の失敗まで一緒に消える。
+    fn unexpected_stderr(&self) -> Vec<&str> {
+        const KNOWN_STARTUP_NOISE: &[&str] = &[
+            // AppContainerの子はドライブを列挙できないので、pwshの`FileSystem`プロバイダ初期化が
+            // 失敗する。実行そのものには影響しない（同じ回で実行印・終了コード・子の拒否が揃う）。
+            "Attempting to perform the InitializeDefaultDrives operation on the 'FileSystem' \
+             provider failed.",
+        ];
+        self.stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter(|line| !KNOWN_STARTUP_NOISE.contains(line))
+            .collect()
+    }
 }
 
 fn wait_until_holder_is_ready(holder: &SpikeSpawn<'_>, report: &std::path::Path) -> SpikeChild {
@@ -183,6 +221,8 @@ fn run_restricted_shell_while_attached(
          }}; \
          Set-Content -LiteralPath '{marker_literal}' -Value 'HARNESS-ATTACH-CONSOLE-MARKER'; \
          Write-Output ('HARNESS-ATTACH-CONSOLE-CHILD=' + $c); \
+         Write-Output ('HARNESS-ATTACH-CONSOLE-STDIO=' + [Console]::IsInputRedirected \
+           + '/' + [Console]::IsOutputRedirected + '/' + [Console]::IsErrorRedirected); \
          Write-Output HARNESS-ATTACH-CONSOLE-STDOUT; exit 37"
     );
     let args = ["-NoProfile", "-NonInteractive", "-Command", script.as_str()];
@@ -212,7 +252,7 @@ fn run_restricted_shell_while_attached(
                 let count = unsafe { GetConsoleProcessList(&mut process_ids) } as usize;
                 if count == 0 {
                     return Err(
-                        "GetConsoleProcessList returned 0 after AttachConsole succeeded".into()
+                        "GetConsoleProcessList returned 0 after AttachConsole succeeded".into(),
                     );
                 }
                 if count > process_ids.len() {
@@ -295,7 +335,11 @@ fn run_restricted_shell_while_attached(
 /// あわせて、走ったシェルにその場で子プロセスを起こさせ、拒否されることを同じ出力で見る。
 /// これが無いと、この回の証拠は「AppContainerのシェルが走った」までしか語らない。
 #[test]
-#[ignore = "requires dev-elevated-run target spike-mac-console-attach; touches real AppContainer state"]
+// **昇格しても非昇格でも通るが、結論の射程は非昇格の回にある**（本番のDaemonは昇格しない）。
+// 昇格した回とはstderrが違う——非昇格ではpwshの`FileSystem`プロバイダ初期化の警告が1行出る
+// （`unexpected_stderr`のdoc）。`spike-mac-console-attach`は昇格経路の固定ターゲットとして残して
+// あるが、**測る世界が変わることを承知で使うこと**（B-08）。
+#[ignore = "touches real AppContainer state; run non-elevated (see plans/mac-spike/RESULTS.md)"]
 fn go_no_go_attach_console_restricted_shell_runs() {
     let measure_lock = std::path::Path::new(r"C:\harness-e2e\_measure-lock\mac-console-attach");
     std::fs::create_dir_all(
@@ -523,10 +567,22 @@ fn go_no_go_attach_console_restricted_shell_runs() {
             run.console_processes
         );
         assert!(
-            run.stderr.trim().is_empty(),
-            "mitigation付きシェルがstderrへ何か出した（無言の失敗が混ざっていないか確認する）: \
-             arm={label} stderr={:?}",
+            run.unexpected_stderr().is_empty(),
+            "mitigation付きシェルがstderrへ**既知の起動時ノイズ以外**を出した\
+             （無言の失敗が混ざっていないか確認する）: arm={label} unexpected={:?} stderr={:?}",
+            run.unexpected_stderr(),
             run.stderr
+        );
+        // **§7.1.1測定5**: コンソールを借りて起こしても、子の標準ハンドルはパイプのままか。
+        // 3本とも「リダイレクトされている」＝コンソールハンドルが混入していない、である。
+        // 1本でもコンソールになっていると、出力の読み方（起動時ノイズの切り出し・stderrの
+        // 境界印）が乗っている前提が静かに変わる。
+        assert_eq!(
+            run.stdio_redirected(),
+            Some("True/True/True"),
+            "コンソールを借りた子の標準ハンドルにコンソールが混入している（stdin/stdout/stderr）。\
+             §7.1.1の「入出力はコンソールを経由しない」が実機で成立していない: \
+             arm={label} observation={run:?}"
         );
     }
     assert!(
@@ -1093,5 +1149,283 @@ fn s7_request_pipe_is_reachable_only_with_the_spawn_capability() {
         Some(false),
         "capabilityを積んでいない子が要求受付パイプへ到達できた。§22.2.2の`process: deny`が\
          「パイプに到達すらできない」という二重のdenyにならない: {report_without}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §7.1.1 測定4: サンドボックスからコンソール保持プロセスへ到達できないこと
+// ---------------------------------------------------------------------------
+
+/// 保持プロセスは「コンソールを持つためだけの、mitigationを積んでいないプロセス」である。
+/// **サンドボックスの中からここへ到達できると、機構全体が無意味になる**——乗っ取った側は
+/// `CHILD_PROCESS_RESTRICTED`を積んでいないプロセスを手に入れ、そこから制限なくプロセスを
+/// 生成できるからである。§7.1.1が「保持プロセスをサンドボックス内に置かない」と決めた
+/// 理由がそれで、この測定はその決定が実機で成立していることを確かめる。
+///
+/// **対で測る**（`B-35`）。拒否側だけを見ると、**プローブが壊れていて全部に失敗していても緑になる**。
+/// 同じプローブ・同じ引数を**サンドボックスの外**からも撃ち、そちらでは開けることを見る。
+///
+/// | 撃つ側 | 期待 | これが無いと言えなくなること |
+/// |---|---|---|
+/// | AppContainerの子（＝サンドボックス） | 全マスクで**拒否** | — |
+/// | AppContainerでない子（対照） | 少なくとも1つで**成功** | 「拒否されたのは境界のおかげ」（計器が生きている証拠が無い） |
+///
+/// **この測定が語らないこと**（§7.1.1の他の項目）。到達できないことは言うが、
+/// 同じコンソールに繋がったシェル同士が互いを読めるか（測定3）は別の問いである。
+#[test]
+#[ignore = "touches real AppContainer state; run non-elevated (see plans/mac-spike/RESULTS.md)"]
+fn holder_process_is_out_of_reach_from_the_sandbox() {
+    let measure_lock = std::path::Path::new(r"C:\harness-e2e\_measure-lock\mac-holder-reach");
+    std::fs::create_dir_all(
+        measure_lock
+            .parent()
+            .expect("measurement lock has a parent"),
+    )
+    .expect("create the serialized measurement lock parent");
+    std::fs::create_dir(measure_lock).unwrap_or_else(|e| {
+        panic!(
+            "測定ロックを取得できない（並列測定または前回残骸を確認する）: path={measure_lock:?} error={e}"
+        )
+    });
+    let _measure_lock_cleanup = super::test_support::scopeguard(|| {
+        std::fs::remove_dir(measure_lock).ok();
+    });
+
+    let (workspace, sid, caps) = spike_workspace();
+    let workspace_canonical = workspace
+        .path()
+        .canonicalize()
+        .expect("canonicalize the spike workspace");
+    let cleanup_workspace = workspace_canonical.clone();
+    let _cleanup = super::test_support::scopeguard(move || {
+        let outcome =
+            crate::tier2a::session_profile::end_session(&super::revoke::revoke_session_grant);
+        eprintln!("[MAC-HOLDER-REACH] cleanup: {:?}", outcome.summary());
+        super::mac_spike_tests::forget_workspace_capability(&cleanup_workspace);
+        if let Err(e) = std::fs::remove_dir_all(&cleanup_workspace) {
+            eprintln!("[MAC-HOLDER-REACH] cleanup could not remove workspace: {e}");
+        }
+        if !cleanup_workspace.exists() {
+            crate::tier2a::workspace_ledger::remove_workspace_entry(&cleanup_workspace);
+        }
+    });
+    let caps_psid: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
+    let probe = probe_exe();
+    let probe_str = probe
+        .to_str()
+        .expect("probe path is valid utf-8")
+        .to_string();
+
+    // **どの世界で測ったかを記録へ残す**（`measurement-review`の「構成の記録」）。
+    // 昇格して測ると保持プロセスの整合性レベルが本番（非昇格のDaemonが作る）と変わるので、
+    // この1行が無いと後から結果の射程を判定できない。
+    eprintln!(
+        "[MAC-HOLDER-REACH] elevated={} pid={}",
+        crate::tier2a::privhelper::is_elevated(),
+        std::process::id()
+    );
+
+    // 保持プロセス。§7.1.1どおり**サンドボックスの外**（AppContainerでない・capabilityを
+    // 1つも持たない）で、`CREATE_NO_WINDOW`＝窓を出さずにコンソールを割り当てる形で起こす。
+    let holder_report = workspace.path().join("holder-reach-holder.json");
+    let holder_report_str = holder_report.to_string_lossy().into_owned();
+    let holder_args = [
+        "--idle-secs",
+        "30",
+        "--timeout-secs",
+        "60",
+        "--report-file",
+        holder_report_str.as_str(),
+    ];
+    let holder_spec = SpikeSpawn {
+        exe: &probe_str,
+        args: &holder_args,
+        cwd: workspace.path(),
+        container_sid: sid.as_psid(),
+        capabilities: &[],
+        child_process_restricted: false,
+        stdout_override: None,
+        extra_inherit: &[],
+        process_sddl: None,
+        thread_sddl: None,
+        token_default_dacl_sddl: None,
+        no_appcontainer: true,
+        console: SpikeConsole::NoWindow,
+    };
+    let holder = wait_until_holder_is_ready(&holder_spec, &holder_report);
+    let holder_pid = holder.pid();
+    let holder_tid = holder.thread_id();
+    eprintln!("[MAC-HOLDER-REACH] holder pid={holder_pid} tid={holder_tid}");
+
+    let reach_args: Vec<String> = vec![
+        "--reach-process".into(),
+        holder_pid.to_string(),
+        "--reach-thread".into(),
+        holder_tid.to_string(),
+        "--timeout-secs".into(),
+        "60".into(),
+    ];
+    let reach_args_ref: Vec<&str> = reach_args.iter().map(|s| s.as_str()).collect();
+
+    // 撃つ側2種。**軸はAppContainerかどうかの1つだけ**（`B-29`）——引数もexeもcwdも同じにする。
+    let mut reports: Vec<(&str, serde_json::Value)> = Vec::new();
+    for (label, no_appcontainer, capabilities) in [
+        ("sandbox", false, caps_psid.as_slice()),
+        ("outside", true, [].as_slice()),
+    ] {
+        let mut attacker = SpikeSpawn {
+            exe: &probe_str,
+            args: &reach_args_ref,
+            cwd: workspace.path(),
+            container_sid: sid.as_psid(),
+            capabilities,
+            child_process_restricted: false,
+            stdout_override: None,
+            extra_inherit: &[],
+            process_sddl: None,
+            thread_sddl: None,
+            token_default_dacl_sddl: None,
+            no_appcontainer,
+            console: SpikeConsole::NoWindow,
+        }
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn the {label} probe: {e}"));
+        let (stdout, stderr, code) = attacker.wait_and_read();
+        eprintln!("[MAC-HOLDER-REACH] {label}: exit={code} stderr={stderr}\n{stdout}");
+        let report = last_json_line(&stdout)
+            .unwrap_or_else(|| panic!("{label} probe produced no JSON: {stdout}"));
+        reports.push((label, report));
+    }
+    // 判定より先に畳む（assertで落ちても保持プロセスを残さない）。
+    drop(holder);
+
+    let sandbox = &reports[0].1;
+    let outside = &reports[1].1;
+    let holder_pid_s = holder_pid.to_string();
+    let holder_tid_s = holder_tid.to_string();
+    let ok = |v: &serde_json::Value, kind: &str, access: &str, target: &str| {
+        super::mac_spike_tests::reach_attempt_ok(v, kind, access, Some(target))
+    };
+
+    // **先に対照を判定する。** 計器が死んでいるなら、拒否側の結果は何も語らない。
+    let outside_query = ok(
+        outside,
+        "process",
+        "PROCESS_QUERY_LIMITED_INFORMATION",
+        &holder_pid_s,
+    );
+    assert_eq!(
+        outside_query,
+        Some(true),
+        "対照（AppContainerでない子）からも保持プロセスを開けない。プローブか的が壊れており、\
+         サンドボックス側の拒否を「境界のおかげ」と読めない: outside={outside}"
+    );
+
+    // 本命。**全マスクで拒否**であることを、マスクごとに名指しで確かめる
+    // ——「1つ拒否された」では、残りが開いている可能性を排除できない。
+    const PROCESS_MASKS: &[&str] = &[
+        "PROCESS_QUERY_LIMITED_INFORMATION",
+        "PROCESS_QUERY_INFORMATION",
+        "PROCESS_VM_READ",
+        "PROCESS_VM_WRITE",
+        "PROCESS_CREATE_THREAD",
+        "PROCESS_DUP_HANDLE",
+        "PROCESS_ALL_ACCESS",
+    ];
+    for mask in PROCESS_MASKS {
+        assert_eq!(
+            ok(sandbox, "process", mask, &holder_pid_s),
+            Some(false),
+            "サンドボックスからコンソール保持プロセスを {mask} で開けた。\
+             §7.1.1の「保持プロセスをサンドボックス内に置かない」が実機で成立していない\
+             ＝乗っ取れば制限なしのプロセス生成能力が手に入る: sandbox={sandbox}"
+        );
+    }
+
+    // スレッドも対で見る。プロセスを閉じてもスレッドが開けば`SetThreadContext`で乗っ取れる
+    // （§S2bが同じ形の穴を実測している）。
+    const THREAD_MASKS: &[&str] = &[
+        "THREAD_QUERY_LIMITED_INFORMATION",
+        "THREAD_SUSPEND_RESUME",
+        "THREAD_SET_CONTEXT",
+        "THREAD_ALL_ACCESS",
+    ];
+    for mask in THREAD_MASKS {
+        assert_eq!(
+            ok(sandbox, "thread", mask, &holder_tid_s),
+            Some(false),
+            "サンドボックスから保持プロセスのスレッドを {mask} で開けた: sandbox={sandbox}"
+        );
+    }
+}
+
+/// `unexpected_stderr`が**既知の1行だけ**を除いていることを、実機を使わずに固定する。
+///
+/// **この検算が無いと、除外規則が広すぎても測定は緑のままになる**——実機の回は既知の1行しか
+/// 出さないので、「全部除いている」実装と区別が付かない（B-27: 歯があることを確かめる）。
+#[test]
+fn the_known_startup_noise_filter_only_removes_that_one_line() {
+    let run = |stderr: &str| AttachedShellRun {
+        console_processes: Vec::new(),
+        stdout: String::new(),
+        stderr: stderr.to_string(),
+        exit_code: 0,
+        marker: None,
+    };
+    const NOISE: &str = "Attempting to perform the InitializeDefaultDrives operation on the \
+                         'FileSystem' provider failed.";
+
+    assert!(
+        run(&format!("{NOISE}\r\n")).unexpected_stderr().is_empty(),
+        "既知の起動時ノイズだけの回が「想定外あり」になっている"
+    );
+    assert_eq!(
+        run(&format!("{NOISE}\r\nsomething else went wrong\r\n")).unexpected_stderr(),
+        vec!["something else went wrong"],
+        "既知の1行と一緒に出た別の行まで消えている（無言の失敗を見逃す）"
+    );
+    // **前方一致で消していないこと。** 既知の行に何かが続く形は別の事実なので残す。
+    assert_eq!(
+        run(&format!("{NOISE} and then it crashed\r\n")).unexpected_stderr(),
+        vec![format!("{NOISE} and then it crashed")],
+        "既知の行を接頭辞として扱っており、続きが付いた行まで消えている"
+    );
+    assert!(
+        run("\r\n  \r\n").unexpected_stderr().is_empty(),
+        "空行だけの回が「想定外あり」になっている"
+    );
+}
+
+/// `stdio_redirected`が拾うのは**その印の行だけ**であること。
+#[test]
+fn the_stdio_marker_is_read_from_its_own_line() {
+    let run = AttachedShellRun {
+        console_processes: Vec::new(),
+        stdout: "HARNESS-ATTACH-CONSOLE-CHILD=CHILD-DENIED-Win32Exception-367\r\n\
+                 HARNESS-ATTACH-CONSOLE-STDIO=True/True/True\r\n\
+                 HARNESS-ATTACH-CONSOLE-STDOUT\r\n"
+            .to_string(),
+        stderr: String::new(),
+        exit_code: 37,
+        marker: None,
+    };
+    assert_eq!(run.stdio_redirected(), Some("True/True/True"));
+    assert_eq!(
+        run.child_creation(),
+        Some("CHILD-DENIED-Win32Exception-367"),
+        "印が2つ並んだときに隣の行を拾っている"
+    );
+
+    let missing = AttachedShellRun {
+        console_processes: Vec::new(),
+        stdout: "HARNESS-ATTACH-CONSOLE-STDOUT\r\n".to_string(),
+        stderr: String::new(),
+        exit_code: 37,
+        marker: None,
+    };
+    assert_eq!(
+        missing.stdio_redirected(),
+        None,
+        "印が無い回を`Some`で返すと、測っていないことを測ったことにできてしまう"
     );
 }
