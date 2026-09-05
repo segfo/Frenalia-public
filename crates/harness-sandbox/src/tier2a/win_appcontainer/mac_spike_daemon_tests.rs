@@ -2490,7 +2490,15 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
     // `event_arg`は撃ち手へ渡す引数、`attempt_kind`はそのレポートに現れる試行名。
     // **2つを別々に渡している**のは、綴りをテスト側で組み立てるとプローブ側の綴りと
     // 静かにずれるためである（ずれると「撃てていない」ではなく「見つからない」で落ちる）。
-    let run_round = |label: &str, guard: bool, event_arg: &str, attempt_kind: &str| -> GuardRound {
+    // `accept`は保持プロセスと的の**両方**から「Ctrl+Cを無視する」継承属性を外す腕。
+    // 外さないと`CTRL_C_EVENT`はハンドラを呼ばずに捨てられるので（[§S50](mac-spike/RESULTS.md)）、
+    // **守りが効いたのか弾が届いていないのかが割れない**。
+    let run_round = |label: &str,
+                     guard: bool,
+                     accept: bool,
+                     event_arg: &str,
+                     attempt_kind: &str|
+     -> GuardRound {
         let holder_report_path = workspace
             .path()
             .join(format!("{}-holder.json", label.replace('/', "-")));
@@ -2505,6 +2513,9 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
         ];
         if guard {
             holder_args.push("--console-guard-ctrl");
+        }
+        if accept {
+            holder_args.push("--console-ctrl-accept");
         }
         let holder_spec = SpikeSpawn {
             exe: &probe_str,
@@ -2541,10 +2552,15 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
         };
 
         // 的は**両ラウンドとも守らない**。ここが落ちることが「イベントが配達された」の印になる。
+        let mut target_args = vec!["--console-idle-secs", "25", "--timeout-secs", "90"];
+        if accept {
+            // **的からも外す。** 的が受け取れないと、落ちないことが配達の証拠にならない。
+            target_args.push("--console-ctrl-accept");
+        }
         let target = arms
             .spawn(
                 &format!("{label}/target(domainA)"),
-                &["--console-idle-secs", "25", "--timeout-secs", "90"],
+                &target_args,
                 &caps_a,
                 false,
                 SpikeConsole::Inherit,
@@ -2585,10 +2601,15 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
     // **対照を先に撃つ。** §S48の再現をこの回の中で取ってから本命へ進む。
     const BREAK: (&str, &str) = ("--console-ctrl-break", "console-ctrl-break");
     const CTRL_C: (&str, &str) = ("--console-ctrl-c", "console-ctrl-c");
-    let control = run_round("unguarded/break", false, BREAK.0, BREAK.1);
+    let control = run_round("unguarded/break", false, false, BREAK.0, BREAK.1);
     drop(control.holder);
-    let guarded = run_round("guarded/break", true, BREAK.0, BREAK.1);
-    let guarded_ctrl_c = run_round("guarded/ctrl-c", true, CTRL_C.0, CTRL_C.1);
+    let guarded = run_round("guarded/break", true, false, BREAK.0, BREAK.1);
+    let guarded_ctrl_c = run_round("guarded/ctrl-c", true, false, CTRL_C.0, CTRL_C.1);
+    // **設計にとっての本命。** 「Ctrl+Cを無視する」継承属性を保持プロセスと的の両方から外し、
+    // **Ctrl+Cが実際に配達される世界**で握り潰しが効くかを見る。本番のDaemonが何を受け継ぐかは
+    // 分からないので、**受け取れる側に倒した世界でも守れる**ことが要る。
+    let guarded_accept_ctrl_c =
+        run_round("guarded+accept/ctrl-c", true, true, CTRL_C.0, CTRL_C.1);
 
     // --- 判定 -------------------------------------------------------------------
     // **腕が別物であることを先に見る。** 引数が無視されていると、2ラウンドは同じものになり、
@@ -2604,6 +2625,7 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
     for (label, round) in [
         ("guarded/break", &guarded),
         ("guarded/ctrl-c", &guarded_ctrl_c),
+        ("guarded+accept/ctrl-c", &guarded_accept_ctrl_c),
     ] {
         assert_eq!(
             ctrl_guard(&round.holder_report),
@@ -2630,6 +2652,13 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
         // 落ちないことが実測されており（下でその事実の側を固定する）、ここで要求すると
         // 「配達されなかった」を「機構が壊れた」として報告することになる。
         ("guarded/ctrl-c", guarded_ctrl_c.ctrl_break_sent, None),
+        // **属性を外したラウンドでは要求する。** 外せば配達されることが§S50で分かっており、
+        // 的が落ちることがこのラウンドの配達の証拠そのものになる。
+        (
+            "guarded+accept/ctrl-c",
+            guarded_accept_ctrl_c.ctrl_break_sent,
+            Some(guarded_accept_ctrl_c.target_died),
+        ),
     ] {
         // **「撃てなかった」と「撃とうとすらしなかった」を分ける。** `None`は撃ち手の
         // レポートにその試行が1件も無いこと＝**プローブがその引数を知らない**印で、
@@ -2683,6 +2712,15 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
         "`CTRL_C_EVENT`で、守った保持プロセスだけが落ちた（同じラウンドの的は生きている）。\
          ハンドラが種類によっては守るどころか落としていることになるので、測り直すこと"
     );
+    // **設計にとっての本命。** 「Ctrl+Cを無視する」継承属性を外し、同じラウンドの的が
+    // 落ちる（＝確かに配達されている）世界で、守った保持プロセスが生き残ること。
+    // これが成り立つので、決定1は**Daemonが何を受け継ぐかに依存しない**。
+    assert!(
+        !guarded_accept_ctrl_c.holder_died,
+        "`CTRL_C_EVENT`が実際に配達される世界（無視する属性を外した）で、\
+         握り潰しを入れた保持プロセスが落ちた。設計書§7.1.2の決定1は\
+         「受け継ぐものに依存しない」と書けなくなるので、決定1と§S51を書き直すこと"
+    );
 
     // --- 生き残ったコンソールは、まだ使えるか -----------------------------------
     // **「生きているが壊れている」を排除する。** 保持プロセスが生き残っても、
@@ -2728,6 +2766,7 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
     );
     drop(guarded.holder);
     drop(guarded_ctrl_c.holder);
+    drop(guarded_accept_ctrl_c.holder);
 }
 
 /// 受け取る側が制御イベントを受け取ったときに走るハンドラの終了コード。
@@ -2744,7 +2783,8 @@ const CTRL_CLEANUP_MARKER: &str = "HARNESS-CTRL-CLEANUP-COMPLETE";
 struct DeliveryRound {
     /// 起動時に受け取る側が出したレポート（自分の構成を名乗る）。
     setup: serde_json::Value,
-    /// 受け取りの記録。**ハンドラが走らなければファイルごと存在しない**ので`None`になる。
+    /// 受け取りの記録（1行1 JSON）。仕掛けた時点の1行は必ず在るので、
+    /// **「在るか」ではなく「受け取った行が在るか」で判定する**。
     receipt: Option<String>,
     /// 撃つ**直前**に読んだ後始末ファイルの中身。**空でなければこのラウンドは何も語らない。**
     cleanup_before: String,
@@ -2754,6 +2794,16 @@ struct DeliveryRound {
     sent: Option<bool>,
     exited: bool,
     exit_code: u32,
+}
+
+impl DeliveryRound {
+    /// **制御イベントを受け取った行が在るか。** 仕掛けた時点の行は撃たなくても在るので、
+    /// ファイルの有無では判定できない。
+    fn received(&self) -> bool {
+        self.receipt
+            .as_deref()
+            .is_some_and(|body| body.contains("\"kind\":\"received\""))
+    }
 }
 
 /// §7.1.1の測定8: **`CTRL_C_EVENT`は届いているのか。**
@@ -2850,7 +2900,13 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
     // `outside`は受け取り手をサンドボックスの**外**に置く腕。**撃ち手は全ラウンド同じ**なので、
     // 変わる軸は「受け取り手がAppContainerか」の1つだけになる——ここで結果が割れれば、
     // 届かない理由はAppContainerの側にある。
-    let run_round = |label: &str, shot: Option<(&str, &str)>, outside: bool| -> DeliveryRound {
+    // `accept`は受け取る側が**上流から受け継いだ「Ctrl+Cを無視する」属性を自分だけ外す**腕。
+    // Microsoftの文書がその属性の存在と継承を明記しているので、外して結果が変わるかを撃つ。
+    let run_round = |label: &str,
+                     shot: Option<(&str, &str)>,
+                     outside: bool,
+                     accept: bool|
+     -> DeliveryRound {
         // 保持プロセスは握り潰し付き。ラウンドの間、コンソールを保たせる。
         let holder_report = workspace.path().join(format!("{label}-holder.json"));
         let holder_report_str = holder_report.to_string_lossy().into_owned();
@@ -2894,21 +2950,26 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
         let child_report_str = child_report.to_string_lossy().into_owned();
         let receipt_str = receipt_path.to_string_lossy().into_owned();
         let cleanup_str = cleanup_path.to_string_lossy().into_owned();
+        let mut child_args = vec![
+            "--console-ctrl-receipt",
+            receipt_str.as_str(),
+            "--console-ctrl-cleanup",
+            cleanup_str.as_str(),
+            "--report-file",
+            child_report_str.as_str(),
+            "--console-idle-secs",
+            "20",
+            "--timeout-secs",
+            "60",
+        ];
+        if accept {
+            // 付けない腕は**上流から受け継いだまま**で走る（比較の基準）。
+            child_args.push("--console-ctrl-accept");
+        }
         let child = arms
             .spawn(
                 &format!("{label}/receiver(domainA)"),
-                &[
-                    "--console-ctrl-receipt",
-                    receipt_str.as_str(),
-                    "--console-ctrl-cleanup",
-                    cleanup_str.as_str(),
-                    "--report-file",
-                    child_report_str.as_str(),
-                    "--console-idle-secs",
-                    "20",
-                    "--timeout-secs",
-                    "60",
-                ],
+                &child_args,
                 if outside { &[] } else { &caps_a },
                 outside,
                 SpikeConsole::Inherit,
@@ -2973,14 +3034,17 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
 
     const BREAK: (&str, &str) = ("--console-ctrl-break", "console-ctrl-break");
     const CTRL_C: (&str, &str) = ("--console-ctrl-c", "console-ctrl-c");
-    let no_shot = run_round("no-shot", None, false);
-    let break_round = run_round("break", Some(BREAK), false);
-    let ctrl_c_round = run_round("ctrl-c", Some(CTRL_C), false);
+    let no_shot = run_round("no-shot", None, false, false);
+    let break_round = run_round("break", Some(BREAK), false, false);
+    let ctrl_c_round = run_round("ctrl-c", Some(CTRL_C), false, false);
     // 受け取り手をサンドボックスの外へ出した対。**この2本が揃って初めて**
     // 「届かない理由がAppContainerの側にあるか」を割れる——外でも受け取れないなら、
     // 原因はサンドボックスより手前（プロセスグループや親から継承する設定）にある。
-    let outside_break = run_round("outside-break", Some(BREAK), true);
-    let outside_ctrl_c = run_round("outside-ctrl-c", Some(CTRL_C), true);
+    let outside_break = run_round("outside-break", Some(BREAK), true, false);
+    let outside_ctrl_c = run_round("outside-ctrl-c", Some(CTRL_C), true, false);
+    // **原因そのものを名指しで撃つ腕。** Microsoftの文書が言う「Ctrl+Cを無視する継承属性」を
+    // 受け取る側で外し、同じCtrl+Cを撃つ。ここで受け取れれば、原因はその属性だと確定する。
+    let accept_ctrl_c = run_round("accept-ctrl-c", Some(CTRL_C), false, true);
 
     // --- 判定 -------------------------------------------------------------------
     // **計器から先に見る。** 仕掛かっていないラウンドの結果は何も語らない。
@@ -2990,6 +3054,7 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
         ("ctrl-c", &ctrl_c_round),
         ("outside-break", &outside_break),
         ("outside-ctrl-c", &outside_ctrl_c),
+        ("accept-ctrl-c", &accept_ctrl_c),
     ] {
         let armed = round.setup.get("ctrl_receipt");
         assert_eq!(
@@ -3015,9 +3080,33 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
         );
     }
 
+    // **どのラウンドでも「Ctrl+Cを無視する属性」の状態が申告どおりであること。**
+    // ここが食い違うと、`accept-ctrl-c`とその他の差が何の差か分からなくなる。
+    let ctrl_c_mode = |round: &DeliveryRound| {
+        round
+            .setup
+            .get("ctrl_receipt")
+            .and_then(|r| r.get("ctrl_c_mode"))
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+    };
+    assert_eq!(
+        ctrl_c_mode(&ctrl_c_round).as_deref(),
+        Some("inherit"),
+        "基準の腕が「受け継いだまま」になっていない: {}",
+        ctrl_c_round.setup
+    );
+    assert_eq!(
+        ctrl_c_mode(&accept_ctrl_c).as_deref(),
+        Some("accept"),
+        "属性を外す腕で外せていない（`SetConsoleCtrlHandler(NULL, FALSE)`が失敗した）。\
+         この回は原因を測れていない: {}",
+        accept_ctrl_c.setup
+    );
+
     // 対照: 撃たなければ何も起きない。**ファイルは勝手に埋まらない。**
     assert!(
-        no_shot.receipt.is_none(),
+        !no_shot.received(),
         "撃っていないのに受け取りの記録ができている: {:?}",
         no_shot.receipt
     );
@@ -3038,11 +3127,13 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
         Some(true),
         "`CTRL_BREAK_EVENT`を撃てていない"
     );
-    let break_receipt = break_round
-        .receipt
-        .as_deref()
-        .expect("`CTRL_BREAK_EVENT`で受け取りの記録ができていない。届くと分かっているイベントで \
-                記録が残らないなら、この計器は「届いた」を観測できない");
+    assert!(
+        break_round.received(),
+        "`CTRL_BREAK_EVENT`で受け取りの記録ができていない。届くと分かっているイベントで\
+         記録が残らないなら、この計器は「届いた」を観測できない: {:?}",
+        break_round.receipt
+    );
+    let break_receipt = break_round.receipt.as_deref().unwrap_or_default();
     assert!(
         break_receipt.contains("CTRL_BREAK_EVENT"),
         "受け取りの記録が別の種類になっている: {break_receipt:?}"
@@ -3071,7 +3162,7 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
     // 記録（§S50）と設計書§7.1.2の決定1を測り直す合図にする。
     assert_eq!(ctrl_c_round.sent, Some(true), "`CTRL_C_EVENT`を撃てていない");
     assert!(
-        ctrl_c_round.receipt.is_none(),
+        !ctrl_c_round.received(),
         "`CTRL_C_EVENT`で受け取りの記録ができた。2026-09-05の実測（届かない）と逆なので、\
          この経路は届くようになっている。§S50と設計書§7.1.2の決定1を測り直すこと: {:?}",
         ctrl_c_round.receipt
@@ -3094,13 +3185,11 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
         Some(true),
         "外の受け取り手へ`CTRL_BREAK_EVENT`を撃てていない"
     );
-    let outside_break_receipt = outside_break.receipt.as_deref().expect(
-        "サンドボックスの外の受け取り手でも`CTRL_BREAK_EVENT`の記録ができていない。\
-         この腕は計器として働いていないので、下の`outside-ctrl-c`の結果は何も語らない",
-    );
     assert!(
-        outside_break_receipt.contains("CTRL_BREAK_EVENT"),
-        "外の受け取り手の記録が別の種類になっている: {outside_break_receipt:?}"
+        outside_break.received(),
+        "サンドボックスの外の受け取り手でも`CTRL_BREAK_EVENT`の記録ができていない。\
+         この腕は計器として働いていないので、下の`outside-ctrl-c`の結果は何も語らない: {:?}",
+        outside_break.receipt
     );
     assert_eq!(
         outside_ctrl_c.sent,
@@ -3115,10 +3204,49 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
     // 親が変われば結果も変わり得るということで、**本番（親がSpawn Daemon）へは持ち越せない**。
     // だから設計書§7.1.2は握り潰しに寄りかからず、決定2（立て直し）を置いたままにする。
     assert!(
-        outside_ctrl_c.receipt.is_none(),
+        !outside_ctrl_c.received(),
         "サンドボックスの外の受け取り手だけが`CTRL_C_EVENT`を受け取った。\
          届かない理由がAppContainerの側にあることになるので、記録（§S50）と\
          設計書§7.1.2の決定1を書き直すこと: {:?}",
         outside_ctrl_c.receipt
+    );
+
+    // --- 原因を名指しで撃つ ------------------------------------------------------
+    // Microsoftの文書（`GenerateConsoleCtrlEvent`のRemarks）はこう書いている——
+    // 「`SetConsoleCtrlHandler`は**継承される属性**を立てられ、それが立っているプロセスへ
+    // `CTRL_C_EVENT`を送っても**ハンドラは呼ばれない**。`CTRL_BREAK_EVENT`は常に呼ばれる」。
+    // **この属性を受け取る側で外して同じCtrl+Cを撃つ**のがこの腕である。
+    assert_eq!(
+        accept_ctrl_c.sent,
+        Some(true),
+        "属性を外した受け取り手へ`CTRL_C_EVENT`を撃てていない"
+    );
+    // **答えは「属性が原因」だった**（2026-09-05の実測。3回とも同じ向き）。外した腕だけ
+    // `CTRL_C_EVENT`が届き、後始末も完走し、終了コードもハンドラ側の値になる。
+    //
+    // **設計にとってはこれが本命の結果である。** 届かないのは偶然でもサンドボックスのおかげでも
+    // なく、**親が持っていて子が受け継ぐ属性**のせいだと分かった。したがってDaemonは
+    // それを**意図して立てられる**（§7.1.2の決定1）。
+    assert!(
+        accept_ctrl_c.received(),
+        "「Ctrl+Cを無視する」属性を外しても`CTRL_C_EVENT`が届かない。\
+         2026-09-05の実測と逆で、原因はこの属性ではないことになる。\
+         §S50と設計書§7.1.2の決定1を測り直すこと: {:?}",
+        accept_ctrl_c.receipt
+    );
+    let accept_receipt = accept_ctrl_c.receipt.as_deref().unwrap_or_default();
+    assert!(
+        accept_receipt.contains("CTRL_C_EVENT"),
+        "属性を外した腕の記録が別の種類になっている: {accept_receipt:?}"
+    );
+    assert!(
+        accept_ctrl_c.cleanup_after.contains(CTRL_CLEANUP_MARKER),
+        "属性を外した腕で後始末が完走しなかった: {:?}",
+        accept_ctrl_c.cleanup_after
+    );
+    assert_eq!(
+        accept_ctrl_c.exit_code, CTRL_HANDLED_EXIT_CODE,
+        "属性を外した腕がハンドラを通らずに終わった: {}",
+        accept_ctrl_c.exit_code
     );
 }

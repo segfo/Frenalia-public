@@ -26,6 +26,7 @@
 //! | `--console-ctrl-c` | 同じコンソールの全プロセスへ`CTRL_C_EVENT`を撃つ |
 //! | `--console-ctrl-receipt <path>` | 制御イベントを受け取ったら種類を`<path>`へ書き切って終わる（受け取る側） |
 //! | `--console-ctrl-cleanup <path>` | 上記の後始末で書き切る先。待っている間はバッファに残す |
+//! | `--console-ctrl-accept` | `CTRL_C_EVENT`を受け取る側へ戻す（上流から受け継いだ「無視する」属性を自分だけ外す） |
 //! | `--console-idle-secs <n>` | 上記の後、`n`秒生き続ける（撃たれる側になる腕で使う） |
 //!
 //! **制御イベントを2種類撃てるようにしてあるのは、§7.1.1の測定7のためである**——
@@ -74,6 +75,9 @@ pub struct Spec {
     pub ctrl_receipt: Option<String>,
     /// 後始末で書き切る先（待っている間はバッファに残したままにする）。
     pub ctrl_cleanup: Option<String>,
+    /// `CTRL_C_EVENT`の扱いをどうしたか（[`apply_ctrl_c_mode`]の戻り値をそのまま持つ）。
+    /// **レポートへ出すためだけに持ち回る**——適用そのものは`main`が最初に済ませている。
+    pub ctrl_c_mode: &'static str,
     /// 上記を済ませた後、生き続ける秒数（0なら即終了）。
     pub idle_secs: u64,
 }
@@ -111,6 +115,35 @@ pub fn guard_self_from_ctrl_events() -> bool {
     false
 }
 
+/// **`CTRL_C_EVENT`を受け取る側へ戻す**（`SetConsoleCtrlHandler(NULL, FALSE)`）。
+///
+/// Microsoftの文書は「`SetConsoleCtrlHandler`は**継承される属性**を立てられ、それが
+/// 立っているプロセスへ`GenerateConsoleCtrlEvent`が`CTRL_C_EVENT`を送っても
+/// **ハンドラは呼ばれない**。`CTRL_BREAK_EVENT`は常にハンドラを呼ぶ」と書いている
+/// （`GenerateConsoleCtrlEvent`のRemarks）。**この属性はどのプロセスも自分について
+/// 付け外しできる**ので、外して撃てば「上流から受け継いだ属性のせいか」が割れる。
+///
+/// **どのモードよりも先に、`main`が1回だけ呼ぶ。** 受け取る側の腕でも保持プロセス役でも
+/// 使うので、モードごとに書くと片方だけ直る事故になる。
+#[cfg(windows)]
+pub fn apply_ctrl_c_mode(accept: bool) -> &'static str {
+    if !accept {
+        // 何もしない＝**親から受け継いだまま**。既定はこちらで、比較の基準になる。
+        return "inherit";
+    }
+    let ok = unsafe { windows::Win32::System::Console::SetConsoleCtrlHandler(None, false) }.is_ok();
+    if ok {
+        "accept"
+    } else {
+        "accept-failed"
+    }
+}
+
+#[cfg(not(windows))]
+pub fn apply_ctrl_c_mode(_accept: bool) -> &'static str {
+    "unsupported"
+}
+
 /// 制御イベントを受け取ったハンドラが、後始末まで済ませたときの終了コード。
 ///
 /// **37（シェルの完走印）・97（見張りタイマー）と衝突しない値を選んである。**
@@ -132,8 +165,8 @@ static CTRL_RECEIPT: std::sync::OnceLock<CtrlReceipt> = std::sync::OnceLock::new
 /// 制御イベントを受け取ったときに書き残すもの一式（設計書§7.1.1の測定8）。
 #[cfg(windows)]
 struct CtrlReceipt {
-    /// 受け取った事実を書き切る先。**ハンドラが走らなければ、このファイルは作られない**
-    /// ——「在るか」がそのまま「届いたか」になる。
+    /// 受け取った事実を書き切る先。**1行1 JSON**で、仕掛けた時点の1行と、
+    /// 受け取るたびの1行が積まれる。**手で撃った回の記録もこの1ファイルで完結する。**
     receipt: std::path::PathBuf,
     /// 待っている間ずっと「書いたがディスクへ出していない」状態で持つ書き手。
     /// ハンドラがこれを書き切って閉じることが、**後始末が最後まで走った証拠**になる。
@@ -142,18 +175,24 @@ struct CtrlReceipt {
 
 #[cfg(windows)]
 impl CtrlReceipt {
-    /// 受け取った事実を**追記して即座に書き切る**。
+    /// 1件を**追記して即座に書き切る**。
     ///
     /// バッファに残すと、この直後にプロセスが消えたときに一緒に消える——
     /// それでは「受け取った」の証拠にならない。
-    fn append(&self, line: &str) {
+    ///
+    /// **時刻を必ず付ける。** 手で撃った回は、押した順序と記録の順序を後から
+    /// 突き合わせられないと何も言えない。
+    fn append(&self, mut entry: Value) {
         use std::io::Write;
+        if let Some(map) = entry.as_object_mut() {
+            map.insert("at_unix_ms".into(), json!(unix_millis()));
+        }
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.receipt)
         {
-            let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(format!("{entry}\n").as_bytes());
             let _ = f.flush();
         }
     }
@@ -172,6 +211,14 @@ impl CtrlReceipt {
         writer.flush().is_ok()
         // `writer`はここで落ち、ファイルが閉じる。
     }
+}
+
+/// 記録に付ける時刻（1970年からのミリ秒）。**新しい依存を足さないための最小の形**である。
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 #[cfg(windows)]
@@ -195,15 +242,16 @@ unsafe extern "system" fn record_and_exit_ctrl_event(
     ctrl_type: u32,
 ) -> windows::Win32::Foundation::BOOL {
     if let Some(state) = CTRL_RECEIPT.get() {
-        state.append(&format!(
-            "received={ctrl_type} name={}\n",
-            ctrl_event_name(ctrl_type)
-        ));
+        state.append(json!({
+            "kind": "received",
+            "event": ctrl_type,
+            "name": ctrl_event_name(ctrl_type),
+        }));
         let finished = state.finish_cleanup();
-        state.append(&format!(
-            "cleanup={}\n",
-            if finished { "ok" } else { "failed" }
-        ));
+        state.append(json!({
+            "kind": "cleanup",
+            "result": if finished { "ok" } else { "failed" },
+        }));
     }
     std::process::exit(CTRL_HANDLED_EXIT_CODE);
 }
@@ -217,7 +265,7 @@ unsafe extern "system" fn record_and_exit_ctrl_event(
 /// 返すJSONは**この腕が自分の構成を名乗る**ためのもので、読む側はこれを照合してから
 /// 結果を読む（引数が届いていない回を「届かなかった回」と取り違えないため）。
 #[cfg(windows)]
-pub fn arm_ctrl_receipt(receipt: &str, cleanup: Option<&str>) -> Value {
+pub fn arm_ctrl_receipt(receipt: &str, cleanup: Option<&str>, ctrl_c_mode: &str) -> Value {
     use std::io::Write;
 
     // 後始末の対象を先に開く。**開いた時点でファイルは空で存在する**ので、
@@ -252,17 +300,38 @@ pub fn arm_ctrl_receipt(receipt: &str, cleanup: Option<&str>) -> Value {
         }
         .is_ok();
 
-    json!({
+    let summary = json!({
         "receipt": receipt,
         "cleanup": cleanup,
         "cleanup_open": cleanup_open,
         "handler": handler,
-    })
+        "ctrl_c_mode": ctrl_c_mode,
+    });
+
+    // **仕掛けた時点も記録へ残す。** 手で撃った回は、この1ファイルだけを見れば
+    // 「どういう構成で待っていて、いつ何を受け取ったか」が揃う。
+    if let Some(state) = CTRL_RECEIPT.get() {
+        let mut armed_line = summary.clone();
+        if let Some(map) = armed_line.as_object_mut() {
+            map.insert("kind".into(), json!("armed"));
+            map.insert("pid".into(), json!(std::process::id()));
+            map.insert("membership".into(), console_membership());
+        }
+        state.append(armed_line);
+    }
+
+    summary
 }
 
 #[cfg(not(windows))]
-pub fn arm_ctrl_receipt(receipt: &str, cleanup: Option<&str>) -> Value {
-    json!({ "receipt": receipt, "cleanup": cleanup, "cleanup_open": false, "handler": false })
+pub fn arm_ctrl_receipt(receipt: &str, cleanup: Option<&str>, ctrl_c_mode: &str) -> Value {
+    json!({
+        "receipt": receipt,
+        "cleanup": cleanup,
+        "cleanup_open": false,
+        "handler": false,
+        "ctrl_c_mode": ctrl_c_mode,
+    })
 }
 
 /// このプロセスがどのコンソールに属しているか（**腕ごとの検算**）。
@@ -302,10 +371,9 @@ pub fn run(spec: &Spec) -> Value {
 
     // **いちばん先に仕掛ける。** この関数を抜けた後にレポートが書かれ、それを見た読む側が
     // 撃つので、ここで済ませておかないと「撃ってよい時点」が保証できない。
-    let ctrl_receipt = spec
-        .ctrl_receipt
-        .as_deref()
-        .map(|receipt| arm_ctrl_receipt(receipt, spec.ctrl_cleanup.as_deref()));
+    let ctrl_receipt = spec.ctrl_receipt.as_deref().map(|receipt| {
+        arm_ctrl_receipt(receipt, spec.ctrl_cleanup.as_deref(), spec.ctrl_c_mode)
+    });
 
     // `CONOUT$`は「自分が属しているコンソールのアクティブな画面バッファ」を指す特別な名前である。
     // **属していなければここで失敗する**——その失敗は「コンソールに参加していない」の印であって、
