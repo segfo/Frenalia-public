@@ -13,7 +13,7 @@
 //! **`--test-threads=1`で実行すること。** 並列だとAppContainerプロファイル・共有祖先への
 //! traverse ACE付与といったマシン全体の共有状態を複数テストが同時に触るため不安定になる。
 
-use super::test_support::{scopeguard, spawn_in_workspace};
+use super::test_support::{scopeguard, spawn_in_workspace, spawn_in_workspace_with_mode};
 use super::*;
 use crate::manifest::ManifestOp;
 use crate::overlay::{ApplyOptions, ApplyReport, SandboxError, SandboxFs};
@@ -331,9 +331,31 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_diff_layer_and_leaves_real_tar
     // あくまで透過性。CoWの本質は「変更のあったファイル単位でレビュー・ロールバック
     // できること」であり、明示的にRO/ReadExecなエントリはそもそも書込の余地が無いので
     // 対象外——ユーザー指摘により追加・訂正、2026-08-02）。
-    let actual_mask = sid_ace_mask(&external, sid.as_psid())
+    //
+    // [§22.3] **宛先はpackage SIDではなく、宣言ごとのcapability SIDである**（2026-09-01の分流N1、
+    // コミット`8820542`）。かつてここは`session_sid()`で引いていたが、移行後の穴に
+    // package SID宛のACEは1本も無いので、そのままでは「ACEが1つも無い」で落ちる
+    // ——実際に落ちた（`cow-diagnostics` 17/19）。**引く相手は`preflight`が実際に書いた宛先SID**で、
+    // それは`granted_passthrough`が運んでいる（導出し直すとCoWの級降格で別のSIDになる）。
+    let granted = outcome
+        .granted_passthrough
+        .iter()
+        .find(|g| g.path == external)
+        .unwrap_or_else(|| {
+            panic!("preflight must report the fs-allow root it granted: {outcome:?}")
+        });
+    let subject =
+        crate::win_common::sid_from_string(&granted.subject_sid).expect("parse the subject SID");
+    let actual_mask = sid_ace_mask(&external, subject.as_psid())
         .expect("sid_ace_mask should succeed")
-        .expect("package SID must have some ACE on the fs-allow root");
+        .expect("the declaration's capability SID must have an ACE on the fs-allow root");
+    // **対で測る（B-35）。** 「新しい宛先に載っている」だけでは、古い宛先にも載ったままの
+    // 二重付与を見逃す。移行が済んでいるなら package SID 宛は0本でなければならない。
+    assert_eq!(
+        sid_ace_mask(&external, sid.as_psid()).expect("sid_ace_mask should succeed"),
+        None,
+        "after the N1 migration the fs-allow hole must carry no package-SID ACE at all"
+    );
     // `FILE_GENERIC_READ`と`FILE_GENERIC_EXECUTE`はSYNCHRONIZE/READ_CONTROL等の
     // 標準ビットを共有するため、個別ビットのAND判定では正しく切り分けられない
     // （どちらのマスクにも0x120080相当が含まれる）。「`fs_access_mask(FsAccess::Read)`と
@@ -473,8 +495,18 @@ fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
 }
 
 /// fail-close確認（Phase 1のみ、DLL注入なし）: workspaceをROで付与した状態で、Redirector DLLを
-/// 注入しない（`cow: None`のまま`spawn`する）子から直接書込ませると、フックが存在しなくても
+/// 注入しない子から直接書込ませると、フックが存在しなくても
 /// ACLだけでACCESS_DENIEDになることを確認する（D-01/D-30「フックは境界ではない」の実証）。
+///
+/// # **変えるのはフックの有無1つだけである**
+///
+/// かつてここは`spawn_in_workspace(..., cow: None)`で子を起こしていた。その1引数は
+/// 「注入しない」と**同時に**「`rwx`のcapability SIDを積む」を意味する（本番の`launch.rs`と
+/// 同じ導出）。D-84でworkspaceには`rwx`宛のACEも常に載っているので、**子は書けて当たり前**
+/// になり、このテストは境界ではなく自分が壊した前提を測っていた（実際に赤くなった）。
+///
+/// いま渡しているのは**本番のCoWセッションと同じ`ro`**で、違うのは注入しないことだけである。
+/// `preflight`の側は`WorkspaceWriteMode::Cow`のまま——ACLの配り方は本番と1ビットも変えない。
 #[test]
 #[ignore]
 fn workspace_write_fails_closed_without_redirector_injection() {
@@ -490,8 +522,9 @@ fn workspace_write_fails_closed_without_redirector_injection() {
 
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    // `cow: None` — DLLを注入しない。ACLだけが境界として効くはず。
-    let child = spawn_in_workspace(
+    // `cow: None` — DLLを注入しない。**モードは本番のCoWセッションと同じ`ro`のまま**にする
+    // （doc参照。ここを導出させると注入とcapabilityの2つが同時に変わる）。
+    let child = spawn_in_workspace_with_mode(
         &shell,
         &[
             "-NoProfile",
@@ -505,15 +538,26 @@ fn workspace_write_fails_closed_without_redirector_injection() {
         sid.as_psid(),
         NetworkCapability::Deny,
         None,
+        crate::tier2a::workspace_ledger::WorkspaceMode::Ro,
     )
     .expect("spawn without cow injection should still succeed (process starts)");
     let (stdout, stderr, code) = child
         .write_stdin_read_output_and_wait(None)
         .expect("child should run to completion");
 
-    assert_ne!(
-        code, 0,
-        "workspace write must fail without the redirector (fail-close via ACL, D-01/D-30): \
+    // **「0でない」では足りない。** 子がそもそも起動しなかった場合も0以外になるので、
+    // それだけを見ると「境界が効いた」と「何も走らなかった」が同じ緑になる（B-35）。
+    // `COW_WRITE_PROBE_COMMAND`は書込が例外を投げたときだけ`catch`へ入り、
+    // 例外メッセージを出して**9**で終わる——9であることが「子は走り、書込が拒否された」の証拠である。
+    assert_eq!(
+        code, 9,
+        "the probe must have reached its catch branch (9 = the write threw). \
+         a non-zero code alone would also match a child that never ran: \
+         stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stdout.trim().is_empty(),
+        "the denial message must reach stdout (the probe prints the exception): \
          stdout={stdout} stderr={stderr}"
     );
     let workspace_content = std::fs::read_to_string(workspace.path().join("important.txt"))

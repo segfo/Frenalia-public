@@ -55,17 +55,63 @@ pub(crate) fn spawn_in_workspace(
     net: super::NetworkCapability,
     cow: Option<super::CowInject<'_>>,
 ) -> Result<super::AppContainerChild, super::AppContainerError> {
+    // 本番の`launch.rs::workspace_mode`とまったく同じ導出（`cow`が`Some`なら`ro`）。
+    // **この1行が「本番と同じ形」の中身である。**
+    let mode = if cow.is_some() {
+        WorkspaceMode::Ro
+    } else {
+        WorkspaceMode::Rwx
+    };
+    spawn_in_workspace_with_mode(
+        exe,
+        args,
+        cwd,
+        env,
+        want_stdin,
+        container_sid,
+        net,
+        cow,
+        mode,
+    )
+}
+
+/// [`spawn_in_workspace`]の**モードを外から渡せる版**。あちらはこれを、本番と同じ導出を
+/// 適用して呼ぶ薄い包みである（同じ組み立てを2つ持たない、`docs/CODE-STRUCTURE-RULES.md`規則5）。
+///
+/// # **本番にこの引数は無い。使ってよいのは反実仮想の測定だけである**
+///
+/// 本番では「Redirector DLLを注入するか」と「どちらのモードのcapability SIDを積むか」が
+/// 同じ1つの値（`cow_diff_layer_dir`が`Some`か）から決まるので、**片方だけを変えた配置は
+/// 起こらない**。それでもこの入口が要るのは、D-01（「フックは境界にしない」）が主張する
+/// 「**フックが無くてもACLだけで拒否される**」を測るには、**フックの有無だけを変えて
+/// capabilityは本番のまま**にする必要があるからである。
+///
+/// **2つを同時に変えると測定が壊れる。** 実際に壊れていた——
+/// `workspace_write_fails_closed_without_redirector_injection`は`cow: None`で子を起こしており、
+/// それは「注入しない」と同時に「`rwx`のcapability SIDを積む」を意味していた。
+/// D-84でworkspaceには`rwx`宛のACEも常に載っているので、**子は普通に書けて当然**であり、
+/// テストは境界ではなく自分が壊した前提を測っていた（`cow-diagnostics` 17/19の片方）。
+///
+/// 本番で起こり得ない配置を作る入口なので、**新しい呼び出しを足す前に「本番の`launch.rs`が
+/// この組み合わせを作るか」を確かめること**。作るなら[`spawn_in_workspace`]を使う。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_in_workspace_with_mode(
+    exe: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+    env: &[(String, String)],
+    want_stdin: bool,
+    container_sid: windows::Win32::Security::PSID,
+    net: super::NetworkCapability,
+    cow: Option<super::CowInject<'_>>,
+    mode: WorkspaceMode,
+) -> Result<super::AppContainerChild, super::AppContainerError> {
     crate::tier2a::win_appcontainer::grant_job::wait_until_done()
         .map_err(super::AppContainerError::Preflight)?;
     let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     // [D-84] **走っているモードのcapability SIDだけ**を積む（本番の`launch.rs`と同じ）。
     // `lookup_`（発行しない側）を通すのは、`preflight`を経ていないworkspaceで
     // 台帳エントリを作らないため——テストが`%APPDATA%`へ記録を積み増さない。
-    let mode = if cow.is_some() {
-        WorkspaceMode::Ro
-    } else {
-        WorkspaceMode::Rwx
-    };
     let cap =
         crate::tier2a::workspace_capability::lookup_capability_name(&canonical, mode.as_str())
             .and_then(|_| super::workspace_capability_sid(&canonical, mode.as_str()).ok());
