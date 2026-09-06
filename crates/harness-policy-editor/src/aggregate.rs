@@ -525,6 +525,15 @@ fn is_settings_path(value: &str) -> bool {
     value.starts_with("//")
 }
 
+/// 「harnessの制御ディレクトリ配下を候補から外した」注記の見出し（件数の直前まで）。
+///
+/// **定数にしてあるのは、実機E2Eがこの文言を根拠に「黙って落としていない」を測るためである。**
+/// テスト側がリテラルで持つと、文言を直したときに**テストだけが古い綴りを探し続けて赤くなる**
+/// ——実際にそうなっていた（[BUG-153](../../../docs/bugs/BUG-153.md)。テストは`除外: .harness`を
+/// 探しており、実装は`除外: harnessの制御ディレクトリ配下`へ書き直されていた）。
+/// 文言を変えるならここを変える。参照している側は自動で追随する（`B-06`の「数えなくてよくする」）。
+pub const EXCLUDED_CONTROL_DIR_NOTICE: &str = "除外: harnessの制御ディレクトリ配下";
+
 /// 候補一覧の**手前**に出す注記（観測件数・除外件数・収集器からの報告・拒否の読み方）。
 ///
 /// [`render`]（CLI）とTUIの両方が使う。TUIは候補一覧を対話的なリストで描くので一覧部分だけ
@@ -551,7 +560,7 @@ pub fn render_notes(aggregate: &Aggregate) -> String {
 
     if aggregate.excluded_control_dir > 0 {
         out.push_str(&format!(
-            "除外: harnessの制御ディレクトリ配下 {}件。ここへの許可は提案しません（P-08）\n\
+            "{EXCLUDED_CONTROL_DIR_NOTICE} {}件。ここへの許可は提案しません（P-08）\n\
              （workspace内の .harness と、台帳の置き場 %APPDATA%\\harness の両方。\n\
              後者にはMCPの承認台帳と付与済みACEの台帳があり、書けると自分の許可を書き換えられます）\n",
             aggregate.excluded_control_dir

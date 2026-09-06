@@ -62,7 +62,7 @@ pub(crate) fn spawn_in_workspace(
     } else {
         WorkspaceMode::Rwx
     };
-    spawn_in_workspace_with_mode(
+    spawn_in_workspace_as(
         exe,
         args,
         cwd,
@@ -72,13 +72,22 @@ pub(crate) fn spawn_in_workspace(
         net,
         cow,
         mode,
+        &[],
     )
 }
 
-/// [`spawn_in_workspace`]の**モードを外から渡せる版**。あちらはこれを、本番と同じ導出を
+/// [`spawn_in_workspace`]の**ドメインの積み方を外から渡せる版**。あちらはこれを、本番と同じ導出を
 /// 適用して呼ぶ薄い包みである（同じ組み立てを2つ持たない、`docs/CODE-STRUCTURE-RULES.md`規則5）。
 ///
-/// # **本番にこの引数は無い。使ってよいのは反実仮想の測定だけである**
+/// 引数は2つある。
+///
+/// - `mode` — workspace本体のどちらのモードのcapability SIDを積むか。
+/// - `declaration_caps` — `--fs-allow`で開けた穴の**宣言capability SID**（[§22.3]）。
+///   [`spawn_in_workspace`]は**1本も積まない**ので、あちら経由の子は宣言した穴へ届かない。
+///   穴の到達性を測るテストは、`preflight`が返した`granted_passthrough[].subject_sid`を
+///   ここへ渡す（**本番の`launch.rs`と同じ入手経路**。導出し直すとCoWの級降格で別のSIDになる）。
+///
+/// # **本番にこれらの引数は無い。使ってよいのは反実仮想の測定だけである**
 ///
 /// 本番では「Redirector DLLを注入するか」と「どちらのモードのcapability SIDを積むか」が
 /// 同じ1つの値（`cow_diff_layer_dir`が`Some`か）から決まるので、**片方だけを変えた配置は
@@ -95,7 +104,7 @@ pub(crate) fn spawn_in_workspace(
 /// 本番で起こり得ない配置を作る入口なので、**新しい呼び出しを足す前に「本番の`launch.rs`が
 /// この組み合わせを作るか」を確かめること**。作るなら[`spawn_in_workspace`]を使う。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_in_workspace_with_mode(
+pub(crate) fn spawn_in_workspace_as(
     exe: &str,
     args: &[&str],
     cwd: &std::path::Path,
@@ -105,6 +114,7 @@ pub(crate) fn spawn_in_workspace_with_mode(
     net: super::NetworkCapability,
     cow: Option<super::CowInject<'_>>,
     mode: WorkspaceMode,
+    declaration_caps: &[windows::Win32::Security::PSID],
 ) -> Result<super::AppContainerChild, super::AppContainerError> {
     crate::tier2a::win_appcontainer::grant_job::wait_until_done()
         .map_err(super::AppContainerError::Preflight)?;
@@ -134,12 +144,15 @@ pub(crate) fn spawn_in_workspace_with_mode(
             .unwrap_or_else(|_| inject.workspace_root.to_path_buf());
         super::lookup_cow_diff_layer_capability_sid(&ws, inject.diff_layer_dir)
     });
-    // [§22.3] このヘルパーはworkspace本体とCoWの差分層だけを見て起こす。`--fs-allow`の宣言
-    // capabilityは積まないので、**このヘルパー経由の子は宣言した穴へ届かない**——穴の到達性を
-    // 測るテストは`probe_passthrough`（宛先SIDを明示的に渡せる）を使うこと。
+    // [§22.3] 積むのはworkspace本体・CoWの差分層・**呼び出し側が明示した宣言capability**の3種類。
+    // [`spawn_in_workspace`]は3つめを空で呼ぶので、**あちら経由の子は`--fs-allow`で開けた穴へ
+    // 届かない**——1件ずつの到達性なら`probe_passthrough`（宛先SIDを直接渡せる）でも測れるが、
+    // 子の中で複数の操作を回す測定はここへ宣言capabilityを渡すこと。
+    // 渡さないまま穴の到達性を測ると、**全操作が失敗する**（実際にそうなっていた: BUG-153）。
     let mut domain_caps: Vec<windows::Win32::Security::PSID> = Vec::new();
     domain_caps.extend(cap.iter().map(|s| s.as_psid()));
     domain_caps.extend(cow_cap.iter().map(|s| s.as_psid()));
+    domain_caps.extend_from_slice(declaration_caps);
 
     super::spawn_with_workspace(
         exe,

@@ -13,7 +13,7 @@
 //! **`--test-threads=1`で実行すること。** 並列だとAppContainerプロファイル・共有祖先への
 //! traverse ACE付与といったマシン全体の共有状態を複数テストが同時に触るため不安定になる。
 
-use super::test_support::{scopeguard, spawn_in_workspace, spawn_in_workspace_with_mode};
+use super::test_support::{scopeguard, spawn_in_workspace, spawn_in_workspace_as};
 use super::*;
 use crate::manifest::ManifestOp;
 use crate::overlay::{ApplyOptions, ApplyReport, SandboxError, SandboxFs};
@@ -524,7 +524,7 @@ fn workspace_write_fails_closed_without_redirector_injection() {
     let env = crate::secret_env::build_child_env();
     // `cow: None` — DLLを注入しない。**モードは本番のCoWセッションと同じ`ro`のまま**にする
     // （doc参照。ここを導出させると注入とcapabilityの2つが同時に変わる）。
-    let child = spawn_in_workspace_with_mode(
+    let child = spawn_in_workspace_as(
         &shell,
         &[
             "-NoProfile",
@@ -539,6 +539,8 @@ fn workspace_write_fails_closed_without_redirector_injection() {
         NetworkCapability::Deny,
         None,
         crate::tier2a::workspace_ledger::WorkspaceMode::Ro,
+        // この測定は`--fs-allow`の穴を1つも使わない。
+        &[],
     )
     .expect("spawn without cow injection should still succeed (process starts)");
     let (stdout, stderr, code) = child

@@ -2762,7 +2762,14 @@ fn fs_allow_case_a_normally_grantable_path_is_not_recorded_as_forced(
     let target = fs_allow_case_dir("forced-record");
     std::fs::write(target.join("f.txt"), "x").map_err(|e| e.to_string())?;
 
-    let allow = format!("{}:ro", target.display());
+    // **綴りは`<path>`か`<path>:rw`の2つだけである**（`sandbox.rs`の`strip_suffix(":rw")`と
+    // `harness-config`の`FsSettings::to_fs_passthrough`。どちらも`:rw`しか剥がさない）。
+    // ここはかつて`{}:ro`と書いており、`:ro`が**パスの一部**として扱われて
+    // 「path does not exist, skipped」で丸ごと落ちていた——この腕は
+    // [BUG-153](../../../docs/bugs/BUG-153.md)として記録した「一度も走らせていないテスト」で、
+    // 追加時（2026-09-04）から赤のままだった。read-onlyは**接尾辞を付けない**のが正しい綴りで、
+    // `--force-system-acl`のゲート（`:rw`が1つでもあれば起動拒否）もこの形で通る。
+    let allow = target.display().to_string();
     let run = run_harness(
         &ws,
         &run_shell_script_turns("Write-Output 'ran'"),

@@ -57,7 +57,10 @@ use crate::shell_tier::{FsAccess, FsPassthrough, GrantScope, WorkspaceWriteMode}
 // D-54: `preflight`が付けるworkspace ACEの宛先SIDはworkspace capability SIDなので、子を起こす側は
 // 本番（`run_shell`）と同じくそれをトークンへ積む必要がある。素の`spawn`だとworkspaceが
 // 一切見えず、測定そのものが成立しない（`spawn_in_workspace`のdoc参照）。
-use crate::tier2a::win_appcontainer::test_support::spawn_in_workspace;
+// `spawn_in_workspace`は宣言capabilityを積まない版。DLLのロード可否を測る腕はそれでよい
+// （あちらのACEはセッションのpackage SID宛のままである）。`--fs-allow`で開けた穴を触る腕だけが
+// `spawn_in_workspace_as`で宣言capabilityを積む。
+use crate::tier2a::win_appcontainer::test_support::{spawn_in_workspace, spawn_in_workspace_as};
 use crate::tier2a::win_appcontainer::{
     grant_ace_inheritable_access, preflight, preview_traverse_chain, probe_passthrough,
     redirector_dll_paths, resolve_shell, traverse_capability_sid, NetworkCapability,
@@ -303,12 +306,18 @@ fn process_family(
 
 /// 1フェーズ分（ETW開始 → 子で全セル実行 → drain → セルごとの結果と全拒否を印字）。
 /// 戻り値は`(条件|操作 -> OK/FAIL)`の対応表。
+///
+/// `declaration_caps`は`--fs-allow`で開けた穴の宣言capability SID（[§22.3]）。
+/// **積まないと穴へ1バイトも届かない**ので、この測定では必ず渡す
+/// ——`spawn_in_workspace`はこれを積まないため、渡し忘れると条件(a)(b)の全操作が失敗し、
+/// 「祖先のtraverseが足りない」ように見える（実際にそう見えていた: BUG-153）。
 fn run_phase(
     phase: &str,
     session_sid: windows::Win32::Security::PSID,
     workspace: &std::path::Path,
     cells: &[Cell],
     probe_trees: &[std::path::PathBuf],
+    declaration_caps: &[windows::Win32::Security::PSID],
 ) -> std::collections::BTreeMap<String, String> {
     let session = EtwFsSession::start(&format!("harness-policy-learn-fs-allow-reach-{phase}"))
         .expect("ETW session");
@@ -317,7 +326,7 @@ fn run_phase(
     let script = build_script(cells);
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
-    let child = spawn_in_workspace(
+    let child = spawn_in_workspace_as(
         &shell,
         &["-NoProfile", "-NonInteractive", "-Command", &script],
         workspace,
@@ -326,6 +335,9 @@ fn run_phase(
         session_sid,
         NetworkCapability::Deny,
         None,
+        // このテストは`WorkspaceWriteMode::DirectRw`で`preflight`を通している。
+        crate::tier2a::workspace_ledger::WorkspaceMode::Rwx,
+        declaration_caps,
     )
     .expect("spawn the AppContainer child");
     let child_pid = child.pid();
@@ -714,7 +726,32 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
         dlls.iter()
             .filter_map(|d| d.parent().map(std::path::Path::to_path_buf)),
     );
-    let results_a = run_phase("A", sid.as_psid(), &workspace, &cells_a, &probe_trees);
+    // [§22.3] **`preflight`が実際にACEを書いた宛先SIDをそのまま積む**（本番の`launch.rs`と
+    // 同じ入手経路。導出し直すとCoWの級降格で別のSIDになる）。これが無いと、穴のACEが
+    // 正しく載っていても子は1バイトも読めない。
+    let declaration_sids: Vec<crate::win_common::OwnedSid> = outcome
+        .granted_passthrough
+        .iter()
+        .map(|g| {
+            crate::win_common::sid_from_string(&g.subject_sid)
+                .expect("preflight must hand back a usable capability SID for the declaration")
+        })
+        .collect();
+    let declaration_caps: Vec<windows::Win32::Security::PSID> =
+        declaration_sids.iter().map(|s| s.as_psid()).collect();
+    assert!(
+        !declaration_caps.is_empty(),
+        "preflight reported no granted declaration; the reachability arms would measure nothing"
+    );
+
+    let results_a = run_phase(
+        "A",
+        sid.as_psid(),
+        &workspace,
+        &cells_a,
+        &probe_trees,
+        &declaration_caps,
+    );
 
     // --- 条件(b)へ移る: 祖先チェーンへtraverseを付与する（永続。Dropで撤収） ---
     let mut restore = TraverseRestore::new(capability);
@@ -778,7 +815,14 @@ fn fs_allow_reachability_with_ungranted_ancestors() {
         .map(|dll| probe_load_library_in_appcontainer("b", sid.as_psid(), &workspace, dll))
         .collect();
 
-    let results_b = run_phase("B", sid.as_psid(), &workspace, &cells_b, &probe_trees);
+    let results_b = run_phase(
+        "B",
+        sid.as_psid(),
+        &workspace,
+        &cells_b,
+        &probe_trees,
+        &declaration_caps,
+    );
 
     // --- 行列 ---
     println!("=== MATRIX (condition x operation) ===");

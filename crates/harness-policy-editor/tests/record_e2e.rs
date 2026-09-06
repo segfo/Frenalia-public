@@ -37,7 +37,18 @@ fn recording_a_command_captures_the_files_it_read_and_never_proposes_the_control
     std::fs::create_dir_all(workspace_root.join(".harness").join("sandbox")).unwrap();
 
     // 記録対象が読むファイルと、**読んでも候補にしてはいけない**ファイル。
-    let marker = workspace_root.join("policy-editor-e2e-marker.txt");
+    //
+    // **印のファイルはworkspaceの外・`%TEMP%`の外へ置く。** `exclusion.rs`の規則4が
+    // 「このセッションのworkspace配下」を、規則5が「`%TEMP%`配下（ルート自身を含む）」を
+    // **候補から外す**ので、workspace内（`tempfile::tempdir()`なので`%TEMP%`配下でもある）に
+    // 置いたファイルは、正しく観測できていても候補には出ない。
+    // かつてここはworkspace内に置いており、その決定が入った時点から赤のままだった
+    // （BUG-153）。**候補に出ることを測りたいなら、候補になり得る場所へ置く。**
+    let external =
+        std::path::PathBuf::from(format!("C:\\harness-e2e-record-{}", std::process::id()));
+    std::fs::create_dir_all(&external).expect("create the external read target");
+    let _external_cleanup = RemoveDirOnDrop(external.clone());
+    let marker = external.join("policy-editor-e2e-marker.txt");
     std::fs::write(&marker, b"marker-content").unwrap();
     let control_file = workspace_root.join(".harness").join("settings.json");
     std::fs::write(&control_file, b"{}").unwrap();
@@ -83,9 +94,12 @@ fn recording_a_command_captures_the_files_it_read_and_never_proposes_the_control
     );
 
     // 2. record-allが成功アクセスを拾っている。
+    //
+    // **workspace側を`||`の逃げ道にしない。** かつては「印のファイル名 **または** workspaceの
+    // パス」で合格にしていたが、workspaceは規則4で候補から外れるので後者は永久に偽であり、
+    // 実質は前者1本だった。いまは印を候補になり得る場所へ置いてあるので、名指しで測る。
     assert!(
-        stdout.contains("policy-editor-e2e-marker.txt")
-            || stdout.contains(&workspace_root.to_string_lossy().replace('\\', "/")),
+        stdout.contains("policy-editor-e2e-marker.txt"),
         "the file the command read must appear among the candidates (deny-only would show none): \
          {stdout}"
     );
@@ -106,8 +120,11 @@ fn recording_a_command_captures_the_files_it_read_and_never_proposes_the_control
             "the harness control directory must never be proposed (P-08): {line}"
         );
     }
+    // **文言はリテラルで持たない。** ここはかつて`除外: .harness`を探しており、実装が
+    // `除外: harnessの制御ディレクトリ配下`へ書き直されたあと、**テストだけが古い綴りを
+    // 探し続けて赤のまま**だった（BUG-153）。定数を参照すれば、文言を直した側に自動で追随する。
     assert!(
-        stdout.contains("除外: .harness"),
+        stdout.contains(harness_policy_editor::aggregate::EXCLUDED_CONTROL_DIR_NOTICE),
         "the excluded count must be reported instead of silently dropped: {stdout}"
     );
 
@@ -152,4 +169,14 @@ fn read_only_manifest(workspace_root: &Path) -> serde_json::Value {
         sandbox.display()
     );
     manifests.remove(0)
+}
+
+/// テストがassertで落ちても、`C:\`直下に作った読み取り対象を必ず消す（`型F`）。
+/// 末尾の`let _ = remove_dir_all`は正常終了時にしか走らない。
+struct RemoveDirOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
