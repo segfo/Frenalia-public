@@ -659,7 +659,9 @@ fn spawn_tier0(
         true,
     )
     .map_err(|e| RecordError::Spawn(e.to_string()))?;
-    let kill_token = child.kill_token();
+    let kill_token = child
+        .kill_token()
+        .map_err(|e| RecordError::Spawn(e.to_string()))?;
     let rx = child.spawn_streaming(Some(&harness_tools::run_shell_bootstrap_stdin()));
     Ok((rx, kill_token))
 }

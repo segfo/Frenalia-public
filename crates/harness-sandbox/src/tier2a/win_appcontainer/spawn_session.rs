@@ -152,9 +152,9 @@ impl AppContainerSession {
     /// プロセスを落としてハンドルを閉じる。冪等。
     ///
     /// stdinを先に閉じるのは、行儀のよいサーバがEOFを見て自分から終われるようにするため。
-    /// ただし待たずに`TerminateProcess`する——未信頼のプロセスが自発的に終わることを
-    /// harnessの終了処理が当てにしてはいけない（`DESIGN-MCP.md` §2）。Job Objectも閉じるので、
-    /// 子がさらに孫を作っていた場合もまとめて落ちる。
+    /// ただし待たずにJob全体を明示終了する——未信頼のプロセスが自発的に終わることを
+    /// harnessの終了処理が当てにしてはいけない（`DESIGN-MCP.md` §2）。子がさらに孫を
+    /// 作っていた場合もまとめて落とした後、Job Objectを閉じる。
     pub fn shutdown(&mut self) {
         if self.closed {
             return;
@@ -162,8 +162,7 @@ impl AppContainerSession {
         self.closed = true;
         unsafe {
             let _ = CloseHandle(self.stdin_write);
-            let _ = TerminateProcess(self.process, 1);
-            let _ = CloseHandle(self.job);
+            terminate_job_and_close(self.job);
             let _ = CloseHandle(self.process);
         }
     }

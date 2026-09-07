@@ -7,7 +7,8 @@
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HLOCAL,
+    CloseHandle, DuplicateHandle, LocalFree, SetHandleInformation, DUPLICATE_SAME_ACCESS, HANDLE,
+    HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HLOCAL,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -16,11 +17,11 @@ use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::JobObjects::{
     CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, TerminateProcess, WaitForSingleObject, INFINITE,
+    GetCurrentProcess, GetExitCodeProcess, WaitForSingleObject, INFINITE,
 };
 
 /// `harness-sandbox-vm`（`smb_share`・`vmsandboxd`）から参照されるため`pub`
@@ -324,8 +325,8 @@ pub(crate) fn decode_ansi_lossy(bytes: &[u8]) -> String {
 }
 
 /// `HANDLE`は`windows`クレートで`Send`を実装しない（生ポインタ相当のため）。
-/// スレッド間で受け渡すための最小限のラッパ（`win_appcontainer::KillToken`と同じ
-/// 「単純な数値ハンドルなので実際には安全」という判断）。
+/// スレッド間で受け渡す用途に閉じた最小限の非所有ラッパ。独立ハンドルを所有する
+/// [`KillToken`]とは、closeの責務が違うので同じ型にしない。
 ///
 /// **`docs/CODE-STRUCTURE-RULES.md`規則5により写しを作らない。** 使うのは
 /// [`read_two_pipes_to_strings`]（stdout/stderrを2スレッドで読む）と、
@@ -445,10 +446,10 @@ pub(crate) fn stream_child_output(
         let mut code: u32 = 0;
         let _ = GetExitCodeProcess(process.0, &mut code);
         let _ = tx.send(OutputEvent::Exited(code as i32));
-        // ジョブを閉じる＝kill-on-closeで、居残っている子孫（stdout/stderrを握ったまま
-        // 孤児化した孫プロセス）を巻き取って終了させる。これによりreader側の`ReadFile`が
-        // EOFで返り、`OutputClosed`が来ないまま無期限にブロックする事態を避ける。
-        let _ = CloseHandle(job.0);
+        // Job全体を明示終了してから閉じ、居残っている子孫（stdout/stderrを握ったまま
+        // 孤児化した孫プロセス）も巻き取る。これによりreader側の`ReadFile`がEOFで返り、
+        // `OutputClosed`が来ないまま無期限にブロックする事態を避ける。
+        terminate_job_and_close(job.0);
         let _ = CloseHandle(process.0);
     });
 
@@ -529,21 +530,58 @@ pub(crate) fn create_inheritable_pipe() -> windows::core::Result<(HANDLE, HANDLE
 }
 
 /// 子プロセスの本体が`spawn_blocking`や別スレッドへ移動した後も、timeout・キャンセルから
-/// 終了させられる軽量ハンドル。**Tier1（`tier1::win_restricted`）とTier0（`tier0::win_plain`）が
-/// 共有する**——`kill`の意味はトークンの種類に依存しないので、Tierごとに書き直すと
+/// 終了させられる軽量ハンドル。**Tier0・Tier1・Tier2aが共有する**——`kill`の意味は
+/// トークンの種類に依存しないので、Tierごとに書き直すと
 /// 片方だけ直る事故になる（`docs/CODE-STRUCTURE-RULES.md`§5.0）。
-#[derive(Clone, Copy)]
-pub struct KillToken(pub(crate) HANDLE);
+pub struct KillToken(HANDLE);
 
-// HANDLEはカーネルオブジェクトへのポインタ値で、別スレッドからの`TerminateProcess`は
+// HANDLEはカーネルオブジェクトへのポインタ値で、別スレッドからの`TerminateJobObject`は
 // OSレベルで安全（`RestrictedChild`のSend実装と同じ理由）。
 unsafe impl Send for KillToken {}
 
 impl KillToken {
-    pub fn kill(&self) {
+    /// 子ラッパーが閉じても有効な、Job Objectの独立所有ハンドルを作る。
+    pub(crate) fn duplicate(job: HANDLE) -> windows::core::Result<Self> {
         unsafe {
-            let _ = TerminateProcess(self.0, 1);
+            let mut duplicate = HANDLE::default();
+            DuplicateHandle(
+                GetCurrentProcess(),
+                job,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )?;
+            Ok(Self(duplicate))
         }
+    }
+
+    pub fn kill(&self) {
+        terminate_job(self.0);
+    }
+}
+
+impl Drop for KillToken {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// Job配下の直接の子と全子孫を明示終了する。kill-on-closeはクラッシュ時の保険として残す。
+pub(crate) fn terminate_job(job: HANDLE) {
+    unsafe {
+        let _ = TerminateJobObject(job, 1);
+    }
+}
+
+/// 生存ツリーの通常撤収。明示終了してから所有ハンドルを閉じる。
+pub(crate) fn terminate_job_and_close(job: HANDLE) {
+    terminate_job(job);
+    unsafe {
+        let _ = CloseHandle(job);
     }
 }
 

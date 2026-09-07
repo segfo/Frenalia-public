@@ -1399,7 +1399,9 @@ fn run_pass2<'a>(
             net_capability,
         })
         .map_err(|e| RecordNetError::Spawn(e.to_string()))?;
-    let kill_token = child.kill_token();
+    let kill_token = child
+        .kill_token()
+        .map_err(|e| RecordNetError::Spawn(e.to_string()))?;
     let mut rx = child.spawn_streaming(Some(&harness_tools::run_shell_bootstrap_stdin()));
     on_event(NetRecordEvent::ChildStarted);
 

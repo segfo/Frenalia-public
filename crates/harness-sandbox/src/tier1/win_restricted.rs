@@ -59,13 +59,14 @@ use windows::Win32::Security::{
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, INFINITE,
+    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, INFINITE,
     PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 use crate::win_common::{
     build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl,
-    read_two_pipes_to_strings, stream_child_output, wide, write_all,
+    read_two_pipes_to_strings, stream_child_output, terminate_job, terminate_job_and_close, wide,
+    write_all,
 };
 
 /// ストリーミング出力の1件（[`RestrictedChild::spawn_streaming`]用）。実体はTier2aと共有する
@@ -155,22 +156,20 @@ pub struct RestrictedChild {
 }
 
 // HANDLEは単なるカーネルオブジェクトへのポインタ値であり、複数スレッドからの
-// TerminateProcess/ReadFile呼び出し自体はOSレベルで安全（Win32 APIの前提）。
+// TerminateJobObject/ReadFile呼び出し自体はOSレベルで安全（Win32 APIの前提）。
 unsafe impl Send for RestrictedChild {}
 
 impl RestrictedChild {
-    /// `TerminateProcess`で強制終了する（timeout到達時、`shell.rs`から呼ぶ）。
+    /// Job全体を強制終了する（timeout到達時、`shell.rs`から呼ぶ）。
     pub fn kill(&self) {
-        unsafe {
-            let _ = TerminateProcess(self.process, 1);
-        }
+        terminate_job(self.job);
     }
 
     /// 軽量なkill専用ハンドル。`write_stdin_read_output_and_wait`は`self`を消費して
     /// `spawn_blocking`へ渡す必要があるため、その前に取り出して非同期側に残しておき、
     /// timeout到達時に`kill()`する（`harness-tools::shell`側の責務）。
-    pub fn kill_token(&self) -> KillToken {
-        KillToken(self.process)
+    pub fn kill_token(&self) -> Result<KillToken, RestrictedError> {
+        Ok(KillToken::duplicate(self.job)?)
     }
 
     /// stdinへ書き込みEOFを送り、stdout/stderrを最後まで読み、終了コードを待つ
@@ -248,7 +247,7 @@ impl Drop for RestrictedChild {
             }
             let _ = CloseHandle(self.stdout_read);
             let _ = CloseHandle(self.stderr_read);
-            let _ = CloseHandle(self.job);
+            terminate_job_and_close(self.job);
             let _ = CloseHandle(self.process);
         }
     }
@@ -412,6 +411,8 @@ pub fn spawn(
 
     if let Err(e) = spawn_result {
         unsafe {
+            // CreateProcessAsUserWが失敗し、子は生成されていない。ここはJob終了ではなく
+            // kill-on-closeだけで作成途中のJobを破棄する後始末が正しい。
             let _ = CloseHandle(job);
             let _ = CloseHandle(stdout_read);
             let _ = CloseHandle(stderr_read);

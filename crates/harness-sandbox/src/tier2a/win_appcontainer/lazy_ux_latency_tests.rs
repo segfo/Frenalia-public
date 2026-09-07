@@ -407,7 +407,7 @@ fn measure_once(tree: &TreeComposition, arm: Arm, repetition: usize, order: usiz
     };
 
     // **殺す口はストリーミングへ渡す前に取る**（`spawn_streaming`は子を消費する）。
-    let kill = child.kill_token();
+    let kill = child.kill_token().expect("duplicate the child Job handle");
     let script = probe_script(&workspace);
     let mut rx = child.spawn_streaming(Some(script.as_bytes()));
 

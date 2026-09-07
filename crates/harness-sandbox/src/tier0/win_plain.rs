@@ -24,7 +24,7 @@ use windows::Win32::System::Threading::{
 
 use crate::win_common::{
     build_env_block, clear_inherit, create_inheritable_pipe, create_job_object,
-    stream_child_output, wide, KillToken, OutputEvent,
+    stream_child_output, terminate_job_and_close, wide, KillToken, OutputEvent,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -59,8 +59,8 @@ unsafe impl Send for PlainChild {}
 
 impl PlainChild {
     /// 本体が別スレッドへ移動した後もtimeout・キャンセルからkillできる軽量ハンドル。
-    pub fn kill_token(&self) -> KillToken {
-        KillToken(self.process)
+    pub fn kill_token(&self) -> Result<KillToken, PlainError> {
+        Ok(KillToken::duplicate(self.job)?)
     }
 
     /// stdin送出後、stdout/stderrを行単位で[`OutputEvent`]として流し、プロセス終了を
@@ -96,7 +96,7 @@ impl Drop for PlainChild {
             }
             let _ = CloseHandle(self.stdout_read);
             let _ = CloseHandle(self.stderr_read);
-            let _ = CloseHandle(self.job);
+            terminate_job_and_close(self.job);
             let _ = CloseHandle(self.process);
         }
     }
@@ -176,6 +176,8 @@ pub fn spawn(
 
     if let Err(e) = spawn_result {
         unsafe {
+            // CreateProcessWが失敗し、子は生成されていない。ここはJob終了ではなく
+            // kill-on-closeだけで作成途中のJobを破棄する後始末が正しい。
             let _ = CloseHandle(job);
             let _ = CloseHandle(stdout_read);
             let _ = CloseHandle(stderr_read);

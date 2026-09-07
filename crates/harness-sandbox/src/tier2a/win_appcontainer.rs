@@ -79,7 +79,7 @@ use crate::shell_tier::{FsAccess, FsPassthrough, GrantScope, WorkspaceWriteMode}
 use crate::tier2a::session_profile::ProfileOwner;
 use crate::win_common::{
     build_env_block, clear_inherit, create_job_object, create_pipe_with_sddl, long_path_wide,
-    read_two_pipes_to_strings, wide, write_all,
+    read_two_pipes_to_strings, terminate_job, terminate_job_and_close, wide, write_all, KillToken,
 };
 
 /// harness専用のAppContainer名。`%LOCALAPPDATA%\Packages\<container-folder>`と
@@ -732,6 +732,9 @@ mod lazy_uninjectable_tests;
 /// ランダム順で比較して測る。**測ったツリーの構成を同じレポートへ併記する**（同ファイルのdoc）。
 #[cfg(all(windows, test))]
 mod lazy_ux_latency_tests;
+
+#[cfg(all(windows, test))]
+mod cancel_descendants_tests;
 
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;

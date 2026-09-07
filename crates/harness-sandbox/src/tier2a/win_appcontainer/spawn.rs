@@ -231,13 +231,11 @@ unsafe impl Send for AppContainerChild {}
 
 impl AppContainerChild {
     pub fn kill(&self) {
-        unsafe {
-            let _ = TerminateProcess(self.process, 1);
-        }
+        terminate_job(self.job);
     }
 
-    pub fn kill_token(&self) -> KillToken {
-        KillToken(self.process)
+    pub fn kill_token(&self) -> Result<KillToken, AppContainerError> {
+        Ok(KillToken::duplicate(self.job)?)
     }
 
     /// 子プロセスのPID。M15.7のOS監査収集器が「このETWイベントは誰のものか」を
@@ -330,19 +328,6 @@ impl AppContainerChild {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct KillToken(HANDLE);
-
-unsafe impl Send for KillToken {}
-
-impl KillToken {
-    pub fn kill(&self) {
-        unsafe {
-            let _ = TerminateProcess(self.0, 1);
-        }
-    }
-}
-
 impl Drop for AppContainerChild {
     fn drop(&mut self) {
         unsafe {
@@ -351,7 +336,7 @@ impl Drop for AppContainerChild {
             }
             let _ = CloseHandle(self.stdout_read);
             let _ = CloseHandle(self.stderr_read);
-            let _ = CloseHandle(self.job);
+            terminate_job_and_close(self.job);
             let _ = CloseHandle(self.process);
         }
     }
@@ -957,6 +942,8 @@ fn spawn_impl(
         Ok(pi) => pi,
         Err(e) => {
             unsafe {
+                // CreateProcessWが失敗し、子は生成されていない。ここはJob終了ではなく
+                // kill-on-closeだけで作成途中のJobを破棄する後始末が正しい。
                 let _ = CloseHandle(job);
                 let _ = CloseHandle(stdout_read);
                 let _ = CloseHandle(stderr_read);
@@ -980,6 +967,8 @@ fn spawn_impl(
             let _ = TerminateProcess(process_info.hProcess, 1);
             let _ = CloseHandle(process_info.hThread);
             let _ = CloseHandle(process_info.hProcess);
+            // 子はsuspendedのまま明示終了済みで、孫を生成できない。作成途中のJobは
+            // kill-on-closeで破棄すれば足りる。
             let _ = CloseHandle(job);
             let _ = CloseHandle(stdout_read);
             let _ = CloseHandle(stderr_read);
@@ -1034,6 +1023,8 @@ fn spawn_impl(
             let _ = TerminateProcess(process_info.hProcess, 1);
             let _ = CloseHandle(process_info.hThread);
             let _ = CloseHandle(process_info.hProcess);
+            // 子はresume前に明示終了済みで、孫を生成できない。作成途中のJobは
+            // kill-on-closeで破棄すれば足りる。
             let _ = CloseHandle(job);
             let _ = CloseHandle(stdout_read);
             let _ = CloseHandle(stderr_read);
@@ -1071,6 +1062,8 @@ fn spawn_impl(
                     let _ = TerminateProcess(process_info.hProcess, 1);
                     let _ = CloseHandle(process_info.hThread);
                     let _ = CloseHandle(process_info.hProcess);
+                    // 注入失敗時の子はresume前に明示終了済みで、孫を生成できない。
+                    // 作成途中のJobはkill-on-closeで破棄すれば足りる。
                     let _ = CloseHandle(job);
                     let _ = CloseHandle(stdout_read);
                     let _ = CloseHandle(stderr_read);

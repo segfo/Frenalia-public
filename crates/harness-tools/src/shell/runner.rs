@@ -254,7 +254,9 @@ async fn run_windows_tier2a(
     .await
     .map_err(|e| ToolError::ExecutionFailed(format!("tier2a spawn task panicked: {e}")))?
     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-    let kill_token = child.kill_token();
+    let kill_token = child
+        .kill_token()
+        .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let stdin_bytes = run_shell_bootstrap_stdin();
 
     let handle = tokio::task::spawn_blocking(move || {
@@ -314,7 +316,9 @@ async fn run_windows_tier1(
     let child =
         harness_sandbox::tier1::win_restricted::spawn(bin, &args, &cwd_owned, &env_owned, true)
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-    let kill_token = child.kill_token();
+    let kill_token = child
+        .kill_token()
+        .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let stdin_bytes = run_shell_bootstrap_stdin();
 
     let handle = tokio::task::spawn_blocking(move || {

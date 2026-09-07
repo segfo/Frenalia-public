@@ -57,6 +57,9 @@ pub mod shell_tier;
 #[cfg(windows)]
 pub mod win_common;
 
+#[cfg(all(test, windows))]
+mod cancel_descendants;
+
 /// 名前付きパイプIPCの下回り（DACL・オーバーラップドI/O・長さプレフィックス・フレーミング）。
 /// `tier2a::privhelper`・`tier2a::netfilterd`・`harness-sandbox-vm`の`vmsandboxd`が共有する
 /// ため、どの`tierN`にも属さずここに置く。`harness-sandbox-vm`から参照されるため`pub`

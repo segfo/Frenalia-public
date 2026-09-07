@@ -158,6 +158,22 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "win_appcontainer::cow_containment_tests",
         ],
     ),
+    // 段階5c: Tier2aの一問一答と長寿命セッションが、キャンセル時にJob配下の孫まで
+    // 終了することを実機で測る。実ACLを変更するため昇格側から直列実行する。
+    (
+        "cancel-descendants",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "win_appcontainer::cancel_descendants_tests",
+        ],
+    ),
     // ACE付与/撤収（fs passthrough・traverse chain・継承ACE）の実機回帰。BUG-046の修正3で
     // 追加した`traverse_chain_grants_every_ancestor_on_a_test_owned_drive_root`を含む
     // （そちらは`subst`のテスト所有ドライブを使うので単体では昇格不要だが、同モジュールの
