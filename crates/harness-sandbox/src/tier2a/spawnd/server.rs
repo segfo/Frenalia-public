@@ -53,9 +53,13 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::tier2a::win_appcontainer::{
-    create_suspended_in_job, spawn_request_capability_sid, DomainIdentity, SuspendedSpawn,
+    appcontainer_pipe, augment_redirector_env, create_suspended_in_job, inject_redirector,
+    spawn_request_capability_sid, wait_cow_ready, CowInject, DomainIdentity, RedirectorInject,
+    SuspendedSpawn,
 };
-use crate::win_common::{build_env_block, sid_from_string, wide, OwnedSid, SendHandle};
+use crate::win_common::{
+    build_env_block, clear_inherit, sid_from_string, wide, OwnedSid, SendHandle,
+};
 use crate::win_pipe_ipc::{
     capability_reachable_security_attributes, current_user_sid_string, is_harness_pipe_name,
     read_framed_timeout, unique_pipe_name, write_framed_timeout,
@@ -63,8 +67,9 @@ use crate::win_pipe_ipc::{
 
 use super::table::ProcessTable;
 use super::{
-    ChildHandles, ControlRequest, ControlResponse, DenyReason, DomainIdentitySpec, DomainSpec,
-    SpawnRequest, SpawnResponse, SpawnTopLevelRequest, ACCEPT_TIMEOUT, IO_TIMEOUT, MAX_FRAME_BYTES,
+    protocol_version_mismatch, ChildHandles, ControlRequest, ControlResponse, DenyReason,
+    DomainIdentitySpec, DomainSpec, RedirectorSpec, SpawnFailureKind, SpawnRequest, SpawnResponse,
+    SpawnTopLevelRequest, ACCEPT_TIMEOUT, IO_TIMEOUT, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 
 /// `SECURITY_CAPABILITIES`へ積むときの属性（`spawn_with_workspace`と同じ値）。
@@ -81,18 +86,38 @@ const REQUEST_PIPE_ACCESS_WITHOUT_CREATE_INSTANCE: u32 = 0x0012_019B;
 
 /// Daemonが返すエラー。
 #[derive(Debug)]
-pub struct SpawnDaemonError(pub String);
+pub struct SpawnDaemonError {
+    pub kind: SpawnFailureKind,
+    pub message: String,
+}
 
 impl std::fmt::Display for SpawnDaemonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.message)
     }
 }
 
 impl std::error::Error for SpawnDaemonError {}
 
 fn err(message: impl Into<String>) -> SpawnDaemonError {
-    SpawnDaemonError(message.into())
+    SpawnDaemonError {
+        kind: SpawnFailureKind::Spawn,
+        message: message.into(),
+    }
+}
+
+fn protocol_err(message: impl Into<String>) -> SpawnDaemonError {
+    SpawnDaemonError {
+        kind: SpawnFailureKind::Protocol,
+        message: message.into(),
+    }
+}
+
+fn redirector_err(message: impl Into<String>) -> SpawnDaemonError {
+    SpawnDaemonError {
+        kind: SpawnFailureKind::RedirectorInjection,
+        message: message.into(),
+    }
 }
 
 /// Daemonが持ち回る状態。
@@ -133,7 +158,17 @@ pub fn serve(control_pipe_name: &str) -> Result<(), SpawnDaemonError> {
 
     // --- ハンドシェイク: harnessのプロセスハンドルを受け取る ---
     let harness_process = match read_control(control)? {
-        ControlRequest::Hello { harness_process } => HANDLE(harness_process as *mut _),
+        ControlRequest::Hello {
+            harness_process,
+            protocol_version,
+        } => {
+            // **harnessと同じ関数を通る**（`protocol_version_mismatch`のdoc）。
+            // 片側だけが検査すると、検査していない側から古いバイナリが入れる。
+            if let Some(reason) = protocol_version_mismatch(protocol_version) {
+                return Err(protocol_err(reason));
+            }
+            HANDLE(harness_process as *mut _)
+        }
         other => {
             return Err(err(format!(
                 "the first control request must be Hello, got {other:?}"
@@ -180,6 +215,7 @@ pub fn serve(control_pipe_name: &str) -> Result<(), SpawnDaemonError> {
         &ControlResponse::Ready {
             request_pipe: request_pipe_name.clone(),
             daemon_pid: std::process::id(),
+            protocol_version: PROTOCOL_VERSION,
         },
     )?;
 
@@ -195,6 +231,7 @@ pub fn serve(control_pipe_name: &str) -> Result<(), SpawnDaemonError> {
                 write_control(
                     control,
                     &ControlResponse::Failed {
+                        failure_kind: SpawnFailureKind::Protocol,
                         reason: "Hello was sent twice".to_string(),
                     },
                 )?;
@@ -202,7 +239,10 @@ pub fn serve(control_pipe_name: &str) -> Result<(), SpawnDaemonError> {
             ControlRequest::SpawnTopLevel(request) => {
                 let response = match spawn_top_level(&shared, &request, harness_process) {
                     Ok((pid, process)) => ControlResponse::Spawned { pid, process },
-                    Err(e) => ControlResponse::Failed { reason: e.0 },
+                    Err(e) => ControlResponse::Failed {
+                        failure_kind: e.kind,
+                        reason: e.message,
+                    },
                 };
                 write_control(control, &response)?;
             }
@@ -478,6 +518,17 @@ fn process_is_alive(handle: u64) -> bool {
     unsafe { WaitForSingleObject(HANDLE(handle as *mut _), 0) == WAIT_TIMEOUT }
 }
 
+fn close_received_handles(job: HANDLE, inherit_handles: &[HANDLE], also_stdio: bool) {
+    unsafe {
+        let _ = CloseHandle(job);
+        if also_stdio {
+            for handle in inherit_handles {
+                let _ = CloseHandle(*handle);
+            }
+        }
+    }
+}
+
 /// harnessが頼んだトップレベル生成を実行する（§12の固定順）。
 ///
 /// 返すのは子のPIDと、**harnessのプロセスへ複製した**プロセスハンドルの値である。
@@ -508,27 +559,70 @@ fn spawn_top_level(
     // 生成が成功すればJobの複製はProcess Tableが引き取り、stdioの複製は
     // `create_suspended_in_job`が消費する。**成功しなかったぶんは、ここで閉じるしかない**
     // ——閉じ忘れると系統Jobが1本残り、kill-on-closeの保険が二度と働かない（§10.1.1）。
-    let close_received = |also_stdio: bool| unsafe {
-        let _ = CloseHandle(job);
-        if also_stdio {
-            for handle in &inherit_handles {
-                let _ = CloseHandle(*handle);
-            }
-        }
-    };
-
     let domain = match resolve_domain(&request.domain) {
         Ok(domain) => domain,
         Err(e) => {
             // `create_suspended_in_job`まで届いていないので、stdioもまだ誰も消費していない。
-            close_received(true);
+            close_received_handles(job, &inherit_handles, true);
             return Err(e);
         }
     };
     let capability_attributes = domain.capability_attributes();
 
     let args: Vec<&str> = request.args.iter().map(String::as_str).collect();
-    let mut env_block = build_env_block(&request.env);
+    let mut env = request.env.clone();
+    let ready_read = if let Some(spec) = request.redirector.as_ref() {
+        let (read, write) = match appcontainer_pipe(domain.container.as_psid()) {
+            Ok(pipe) => pipe,
+            Err(e) => {
+                close_received_handles(job, &inherit_handles, true);
+                return Err(redirector_err(format!(
+                    "appcontainer_pipe(redirector-ready): {e}"
+                )));
+            }
+        };
+        clear_inherit(read);
+        match spec {
+            RedirectorSpec::Cow {
+                workspace_root,
+                diff_layer_dir,
+                ext_capture_roots,
+            } => {
+                let workspace = std::path::Path::new(workspace_root);
+                let diff = std::path::Path::new(diff_layer_dir);
+                let roots: Vec<std::path::PathBuf> = ext_capture_roots
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                augment_redirector_env(
+                    &mut env,
+                    RedirectorInject {
+                        workspace_root: Some(workspace),
+                        cow: Some(CowInject {
+                            workspace_root: workspace,
+                            diff_layer_dir: diff,
+                            ext_capture_roots: &roots,
+                        }),
+                        broker_pipe: None,
+                    },
+                    write,
+                );
+            }
+            RedirectorSpec::Lazy {
+                workspace_root,
+                broker_pipe,
+            } => augment_redirector_env(
+                &mut env,
+                RedirectorInject::lazy(std::path::Path::new(workspace_root), broker_pipe),
+                write,
+            ),
+        }
+        inherit_handles.push(write);
+        Some(read)
+    } else {
+        None
+    };
+    let mut env_block = build_env_block(&env);
 
     // 「一時停止で起こす → Jobへ入れる → トークンの既定DACLを差し替える」までは
     // harnessの`spawn_impl`と**同じ本体**を通る（`create_suspended_in_job`）。
@@ -551,12 +645,38 @@ fn spawn_top_level(
         Err(e) => {
             // **stdioはあちらが閉じた**（成否によらず、と同関数のdocが約束している）。
             // 残るのはJobの複製だけである。
-            close_received(false);
+            close_received_handles(job, &inherit_handles, false);
+            if let Some(read) = ready_read {
+                unsafe {
+                    let _ = CloseHandle(read);
+                }
+            }
             return Err(err(e.to_string()));
         }
     };
 
     let pid = info.dwProcessId;
+
+    // Redirectorが必要な構成では、子を一度もresumeせず、初期化完了を確認してから台帳へ載せる。
+    // 失敗種別を保つことでlazyだけが呼び出し側で1回fallbackでき、CoWはfail-closedを維持する。
+    if let Some(read) = ready_read {
+        let injected = unsafe { inject_redirector(info.hProcess) }.and_then(|()| {
+            wait_cow_ready(read, std::time::Duration::from_secs(5))
+                .map_err(crate::tier2a::win_appcontainer::AppContainerError::Win32)
+        });
+        unsafe {
+            let _ = CloseHandle(read);
+        }
+        if let Err(e) = injected {
+            unsafe {
+                let _ = TerminateProcess(info.hProcess, 1);
+                let _ = CloseHandle(info.hThread);
+                let _ = CloseHandle(info.hProcess);
+            }
+            close_received_handles(job, &inherit_handles, false);
+            return Err(redirector_err(format!("redirector injection failed: {e}")));
+        }
+    }
 
     // **Resumeより前にProcess Tableへ登録する**（§12。締切が最も早い段である——
     // 子は起きた直後に生成を要求し得るのに、そのとき台帳に自分が載っていなければ
@@ -576,7 +696,7 @@ fn spawn_top_level(
             let _ = CloseHandle(info.hThread);
             let _ = CloseHandle(info.hProcess);
         }
-        close_received(false);
+        close_received_handles(job, &inherit_handles, false);
         return Err(err(format!("process table registration failed: {e}")));
     }
 

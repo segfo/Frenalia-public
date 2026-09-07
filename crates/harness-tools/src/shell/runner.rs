@@ -45,6 +45,7 @@ pub(crate) async fn run_isolated(
     workspace_root: &Path,
     cow_diff_layer_dir: Option<&Path>,
     granted_passthrough: &[harness_core::GrantedPassthrough],
+    #[cfg(windows)] spawn_daemon: Option<&harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     // Tier2a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
     // 「このTierでは無効」と明記する、`call`参照）。
@@ -70,6 +71,7 @@ pub(crate) async fn run_isolated(
                 workspace_root,
                 cow_diff_layer_dir,
                 granted_passthrough,
+                spawn_daemon,
             )
             .await;
         }
@@ -209,6 +211,7 @@ async fn run_windows_tier2a(
     workspace_root: &Path,
     cow_diff_layer_dir: Option<&Path>,
     granted_passthrough: &[harness_core::GrantedPassthrough],
+    spawn_daemon: Option<&harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
     let mut env_owned = env.to_vec();
     // BUG-050: コマンド本体はstdinスクリプトへ文字列として埋め込まず、env経由で渡す
@@ -248,8 +251,16 @@ async fn run_windows_tier2a(
     // 別経路（TUIの描画tick）なので動いて見え、ツールカードだけが更新されないという形で発覚した。
     // `spawn_blocking`でtokioの専用ブロッキングスレッドへ逃がし、このタスク自身は`.await`で
     // 協調的に譲る。
+    let spawn_daemon = spawn_daemon.cloned().ok_or_else(|| {
+        ToolError::ExecutionFailed(
+            "Tier2a run_shell has no Spawn Daemon connection (internal error)".to_string(),
+        )
+    })?;
     let (child, shell_label) = tokio::task::spawn_blocking(move || {
-        harness_sandbox::tier2a::win_appcontainer::spawn_shell_in_workspace(request)
+        harness_sandbox::tier2a::win_appcontainer::spawn_shell_in_workspace_via_daemon(
+            &spawn_daemon,
+            request,
+        )
     })
     .await
     .map_err(|e| ToolError::ExecutionFailed(format!("tier2a spawn task panicked: {e}")))?

@@ -316,6 +316,7 @@ pub fn record(
         workspace_root: request.workspace_root.to_path_buf(),
         fs_audit_log_path: dir.audit_log_path(),
         harness_pid: Some(std::process::id()),
+        spawn_daemon_pid: None,
         record_all: true,
     };
     // D-56 段階2: 生きているdaemonがあれば`StartCollect`を再送するだけ（UACは出ない）。

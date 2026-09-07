@@ -30,37 +30,88 @@ use serde_json::{json, Value};
 #[cfg(windows)]
 pub fn run(pipe_name: &str, payload_override: Option<&str>, report_file: Option<&str>) -> Value {
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE,
+    };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, OPEN_EXISTING,
     };
+    use windows::Win32::System::Pipes::WaitNamedPipeW;
 
     let name_w: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
-    let handle = unsafe {
-        CreateFileW(
-            PCWSTR(name_w.as_ptr()),
-            GENERIC_READ.0 | GENERIC_WRITE.0,
-            FILE_SHARE_MODE(0),
-            None,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-    };
-    let handle = match handle {
-        Ok(h) => h,
-        Err(e) => {
-            let report = json!({
-                "mode": "pipe-client",
-                "pipe": pipe_name,
-                "connected": false,
-                "last_error": unsafe { GetLastError() }.0,
-                "error": e.to_string(),
-            });
-            if let Some(path) = report_file {
-                let _ = std::fs::write(path, report.to_string());
+
+    // **`ERROR_PIPE_BUSY`は「拒否された」ではない。**
+    //
+    // 名前付きパイプのサーバは、いつでも受付中のインスタンスを持っているとは限らない
+    // （1本を受理してから次を作るまでの窓がある）。その窓に当たったクライアントは
+    // `ERROR_PIPE_BUSY`(231)を受け取る。**再試行しないと、これが「到達できなかった」に
+    // 化ける**——そして`connected:false`は「DACLで拒否された」と同じ見た目になるので、
+    // **拒否側の測定が正しい理由で緑になっているか誰にも分からなくなる**（`B-35`の逆向き:
+    // 対の拒否側が、測りたかったのとは別の理由で成立してしまう）。
+    //
+    // 空きを待って撃ち直すのが名前付きパイプのクライアント側の作法で、綴りは
+    // `harness-sandbox-vm`の`vmsandboxd/client.rs`が既に持っている（あちらのdocに経緯がある）。
+    // **プローブは`harness-sandbox`に依存できない**（i686でもビルドできる最小依存が要件）ので、
+    // ここは写しである。
+    const BUSY_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + BUSY_RETRY_BUDGET;
+    let mut busy_retries = 0u32;
+    let handle = loop {
+        let attempt = unsafe {
+            CreateFileW(
+                PCWSTR(name_w.as_ptr()),
+                GENERIC_READ.0 | GENERIC_WRITE.0,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        };
+        let last_error = unsafe { GetLastError() }.0;
+        match attempt {
+            Ok(h) => break h,
+            Err(_) if last_error == ERROR_PIPE_BUSY.0 => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    // 予算を使い切ったことは**報告に残す**。「拒否された」と読まれないように、
+                    // `last_error`をそのまま載せる（231なら混雑、5ならDACL）。
+                    let report = json!({
+                        "mode": "pipe-client",
+                        "pipe": pipe_name,
+                        "connected": false,
+                        "last_error": last_error,
+                        "busy_retries": busy_retries,
+                        "error": "the pipe stayed busy for the whole retry budget",
+                    });
+                    if let Some(path) = report_file {
+                        let _ = std::fs::write(path, report.to_string());
+                    }
+                    return report;
+                }
+                busy_retries += 1;
+                let remaining = deadline - now;
+                unsafe {
+                    let _ = WaitNamedPipeW(
+                        PCWSTR(name_w.as_ptr()),
+                        remaining.as_millis().min(u32::MAX as u128) as u32,
+                    );
+                }
             }
-            return report;
+            Err(e) => {
+                let report = json!({
+                    "mode": "pipe-client",
+                    "pipe": pipe_name,
+                    "connected": false,
+                    "last_error": last_error,
+                    "busy_retries": busy_retries,
+                    "error": e.to_string(),
+                });
+                if let Some(path) = report_file {
+                    let _ = std::fs::write(path, report.to_string());
+                }
+                return report;
+            }
         }
     };
 
@@ -98,6 +149,7 @@ pub fn run(pipe_name: &str, payload_override: Option<&str>, report_file: Option<
         "mode": "pipe-client",
         "pipe": pipe_name,
         "connected": true,
+        "busy_retries": busy_retries,
         "sent": payload,
         "write_ok": write_ok,
         "wrote_bytes": written,

@@ -28,6 +28,18 @@ fn never_probe(_pid: u32) -> Option<bool> {
 
 const PROFILE: &str = "harness.shell.sandbox.a1b2c3";
 
+#[test]
+fn short_lived_top_level_children_accept_both_hosts_but_exclude_the_daemon_itself() {
+    let mut tracker = ScopeTracker::new(PROFILE)
+        .with_harness_pid(Some(10))
+        .with_spawn_daemon_pid(Some(20));
+
+    assert!(tracker.on_process_start_probing(&start(101, Some(20), None, Some(1)), |_| None));
+    assert!(!tracker.on_process_start_probing(&start(20, Some(10), None, Some(2)), |_| None));
+    assert!(tracker.on_process_start_probing(&start(102, Some(10), None, Some(3)), |_| None));
+    assert!(!tracker.on_process_start_probing(&start(103, Some(99), None, Some(4)), |_| None));
+}
+
 // --- signal 1: PackageFullName -------------------------------------------
 
 /// プロファイル名と完全一致する`PackageFullName`は対象。

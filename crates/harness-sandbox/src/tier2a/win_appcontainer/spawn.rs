@@ -85,7 +85,7 @@ pub(crate) fn redirector_dll_paths() -> Vec<PathBuf> {
 /// 返す前提だが`LoadLibraryW`は`HMODULE`（64bitポインタ）を返すため、`GetExitCodeThread`で
 /// 取得できるのは戻り値の下位32bitのみである。ここでは「非ゼロなら成功」の粗い判定に留め、
 /// 正確な初期化完了確認はDLL側が書き込む`HARNESS_COW_READY_HANDLE`（`wait_cow_ready`）に委ねる。
-unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContainerError> {
+pub(crate) unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContainerError> {
     let dll_path = redirector_dll_path()?;
     if !dll_path.exists() {
         return Err(AppContainerError::Win32(format!(
@@ -196,7 +196,10 @@ unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContainerError> {
 /// （設計書§10.2手順9「DLL初期化完了を確認する」）。別スレッドで`ReadFile`を行い
 /// `mpsc::recv_timeout`で待つ——匿名パイプの読み取り端は`WaitForSingleObject`で
 /// シグナル状態を待てないため。
-fn wait_cow_ready(ready_read: HANDLE, timeout: std::time::Duration) -> Result<(), String> {
+pub(crate) fn wait_cow_ready(
+    ready_read: HANDLE,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
     struct SendHandle(HANDLE);
     unsafe impl Send for SendHandle {}
     let handle = SendHandle(ready_read);
@@ -416,7 +419,7 @@ impl<'a> RedirectorInject<'a> {
     /// **workspace rootが無ければ注入しない。** DLLは何がworkspaceか分からないまま動けず、
     /// 分からないまま動かすと「workspace外への書込が拒否された」ように見える形で
     /// 全部が壊れる（BUG-066が実際にそう見えた）。
-    fn wanted(&self) -> bool {
+    pub(crate) fn wanted(&self) -> bool {
         self.workspace_root.is_some() && (self.cow.is_some() || self.broker_pipe.is_some())
     }
 }
@@ -450,6 +453,50 @@ fn normalize_cow_root(path: &Path) -> PathBuf {
     PathBuf::from(harness_change_ledger::path_rules::normalize_root_spelling(
         &resolved.to_string_lossy(),
     ))
+}
+
+/// Redirectorへ渡す環境を、直接生成とDaemon生成で同じ規則から組み立てる。
+pub(crate) fn augment_redirector_env(
+    env: &mut Vec<(String, String)>,
+    inject: RedirectorInject<'_>,
+    ready_write: HANDLE,
+) {
+    let workspace = inject
+        .workspace_root
+        .expect("wanted() already required a workspace root");
+    env.push((
+        "HARNESS_COW_WORKSPACE".to_string(),
+        normalize_cow_root(workspace).to_string_lossy().into_owned(),
+    ));
+    if let Some(cow) = inject.cow {
+        env.push((
+            "HARNESS_COW_DIFF_LAYER".to_string(),
+            normalize_cow_root(cow.diff_layer_dir)
+                .to_string_lossy()
+                .into_owned(),
+        ));
+        if !cow.ext_capture_roots.is_empty() {
+            let joined = cow
+                .ext_capture_roots
+                .iter()
+                .map(|path| normalize_cow_root(path).to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(";");
+            env.push(("HARNESS_COW_EXT_ROOTS".to_string(), joined));
+        }
+    }
+    if let Some(pipe) = inject.broker_pipe {
+        env.push(("HARNESS_LAZY_BROKER_PIPE".to_string(), pipe.to_string()));
+    }
+    if let Ok(list) = std::env::var(super::lazy_grant::NO_INJECT_ENV) {
+        if !list.trim().is_empty() {
+            env.push((super::lazy_grant::NO_INJECT_ENV.to_string(), list));
+        }
+    }
+    env.push((
+        "HARNESS_COW_READY_HANDLE".to_string(),
+        (ready_write.0 as usize).to_string(),
+    ));
 }
 
 /// 子プロセスが属する**ドメイン**を名指しするSID（設計書§22.1.1）。
@@ -911,7 +958,7 @@ pub fn spawn_with_workspace<'a>(
         ),
         NetworkCapability::InternetClient => unsafe {
             let mut cap_sid = PSID::default();
-            let sid_str = wide("S-1-15-3-1");
+            let sid_str = wide(INTERNET_CLIENT_SID);
             ConvertStringSidToSidW(PCWSTR(sid_str.as_ptr()), &mut cap_sid).map_err(|e| {
                 AppContainerError::Win32(format!("ConvertStringSidToSidW(internetClient): {e}"))
             })?;
@@ -934,6 +981,475 @@ pub fn spawn_with_workspace<'a>(
             result
         },
     }
+}
+
+/// `internetClient` capability（D-10）。**直接生成とDaemon経由で同じ綴りを使う**
+/// ——2箇所に文字列を散らすと、片方だけ直った状態が黙って成立する（`B-05`）。
+pub(crate) const INTERNET_CLIENT_SID: &str = "S-1-15-3-1";
+
+/// Daemon経由で起こす子に、**spawn要求受付パイプへ到達するcapabilityを積むか**（§10.1）。
+///
+/// # なぜ`bool`ではないのか
+///
+/// 呼び出し側の引数が`true`/`false`だけだと、経路を足す人がどちらの意味かを型から読めない。
+/// [`DomainIdentity`]が`Option`にせず必ず選ばせているのと同じ理由である
+/// ——**既定があると呼び出し側が黙って落とせてしまい、落ちた経路だけが別の姿で起動する。**
+///
+/// # 何を分けているのか
+///
+/// このcapability SIDが使われているのは**Daemonの要求受付パイプのDACLだけ**で、
+/// ファイルやレジストリのACEには一度も現れない。したがって積むことで広がるのは
+/// 「Daemonへ話しかけられるか」の一点であって、権限一般ではない。
+/// **それでも既定を「積まない」にしてある**——Daemonはサンドボックスからの入力を
+/// 直接解釈する最初のフルトラスト常駐なので、そこへ到達できる相手は宣言した者だけにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnRequestAccess {
+    /// 要求受付パイプへ到達できる。段階Eのポリシー評価が入るまでは、届いても
+    /// `policy_not_implemented`で断られる（`spawnd::DenyReason`）。
+    Grant,
+    /// 積まない。**パイプへ到達すらできない**——§22.2.2の`process: deny`が
+    /// 「ポリシーで断る」の手前に置く二重目のdenyがこれである。
+    Withhold,
+}
+
+/// Daemonへ渡すcapability SIDの列を組む。**純粋関数**（Win32を呼ばない）。
+///
+/// # なぜ切り出してあるのか
+///
+/// 実機テスト（`spawnd_e2e_tests.rs`のP1・P3）は電文の`DomainSpec`を**テストが手で組んで**
+/// おり、測っているのは「Daemon側のDACLがcapabilityで効くか」だけである。
+/// **製品のアダプタが実際に積んでいるか**はそこでは測れない——ここを`Withhold`へ倒しても
+/// P1もP3も緑のままで、実機では`run_shell`の子が段階⑤で一切spawnできなくなる。
+/// 対を受け持つのがこの関数と、直下の単体テストである（`B-35`）。
+fn daemon_capability_sids(
+    traverse: &str,
+    spawn_request: &str,
+    domain_caps: &[String],
+    net: NetworkCapability,
+    access: SpawnRequestAccess,
+) -> Vec<String> {
+    let mut sids = vec![traverse.to_string()];
+    if access == SpawnRequestAccess::Grant {
+        sids.push(spawn_request.to_string());
+    }
+    sids.extend(domain_caps.iter().cloned());
+    if net == NetworkCapability::InternetClient {
+        sids.push(INTERNET_CLIENT_SID.to_string());
+    }
+    sids
+}
+
+#[cfg(test)]
+mod daemon_capability_tests {
+    use super::*;
+
+    const TRAVERSE: &str = "S-1-15-3-1024-11";
+    const SPAWN_REQUEST: &str = "S-1-15-3-1024-22";
+
+    /// **積むと決めた側**: spawn要求用capabilityが列に入る。
+    #[test]
+    fn granting_puts_the_spawn_request_capability_on_the_wire() {
+        let sids = daemon_capability_sids(
+            TRAVERSE,
+            SPAWN_REQUEST,
+            &[],
+            NetworkCapability::Deny,
+            SpawnRequestAccess::Grant,
+        );
+        assert!(
+            sids.iter().any(|s| s == SPAWN_REQUEST),
+            "積むと指定したのに、要求受付パイプへ届くcapabilityが電文に載っていない。\
+             この子は段階⑤で一切spawnできなくなる: {sids:?}"
+        );
+    }
+
+    /// **対の側**（`B-35`）: 積まないと決めたら列に入らない。
+    ///
+    /// 片方だけだと、**常に積む実装**でも上のテストは通る。
+    #[test]
+    fn withholding_keeps_the_spawn_request_capability_off_the_wire() {
+        let sids = daemon_capability_sids(
+            TRAVERSE,
+            SPAWN_REQUEST,
+            &[],
+            NetworkCapability::Deny,
+            SpawnRequestAccess::Withhold,
+        );
+        assert!(
+            !sids.iter().any(|s| s == SPAWN_REQUEST),
+            "積まないと指定したのにcapabilityが載っている。\
+             Daemonへ話しかけられる相手を宣言で絞れていない: {sids:?}"
+        );
+        assert!(
+            sids.iter().any(|s| s == TRAVERSE),
+            "traverse capabilityまで落ちている。落とすと祖先を辿れずFS I/Oが全滅する"
+        );
+    }
+
+    /// networkのcapabilityは**この決定と直交する**（目的も寿命も別、`spawn_with_workspace`のdoc）。
+    #[test]
+    fn the_network_capability_is_independent_of_the_spawn_request_decision() {
+        for access in [SpawnRequestAccess::Grant, SpawnRequestAccess::Withhold] {
+            let sids = daemon_capability_sids(
+                TRAVERSE,
+                SPAWN_REQUEST,
+                &[],
+                NetworkCapability::InternetClient,
+                access,
+            );
+            assert!(
+                sids.iter().any(|s| s == INTERNET_CLIENT_SID),
+                "{access:?}でnetworkのcapabilityが落ちた: {sids:?}"
+            );
+        }
+    }
+
+    /// ドメインが宣言したcapabilityは、どちらの決定でもそのまま通る。
+    #[test]
+    fn declared_domain_capabilities_pass_through_either_way() {
+        let declared = vec!["S-1-15-3-1024-33".to_string()];
+        for access in [SpawnRequestAccess::Grant, SpawnRequestAccess::Withhold] {
+            let sids = daemon_capability_sids(
+                TRAVERSE,
+                SPAWN_REQUEST,
+                &declared,
+                NetworkCapability::Deny,
+                access,
+            );
+            assert!(
+                sids.iter().any(|s| s == &declared[0]),
+                "{access:?}で宣言済みcapabilityが落ちた: {sids:?}"
+            );
+        }
+    }
+}
+
+/// Daemonが返した失敗を、harness側のエラーへ写す。
+///
+/// # ここが「lazyだけが1回やり直せる」の分岐点である
+///
+/// `launch.rs`のlazyレーンは[`AppContainerError::RedirectorInjection`]**だけ**を見て、
+/// 全walkを待ってから注入なしで1回だけ起動し直す（D-88 §5.1.3）。それ以外は
+/// 作り直しても同じなので再試行しない。
+///
+/// **注入の失敗を`Win32`へ丸めると、lazyの不調がそのままコマンドの失敗に化ける**
+/// ——lazyで失われるのは速さだけのはずである。逆に**注入以外を`RedirectorInjection`へ
+/// 丸めると、直らない失敗を毎回2回試す**ことになる。どちらも症状が出にくいので、
+/// 対で測る（直下のテスト、`B-35`）。
+fn daemon_failure_to_error(error: crate::tier2a::spawnd::server::SpawnDaemonError) -> AppContainerError {
+    use crate::tier2a::spawnd::SpawnFailureKind;
+    match error.kind {
+        SpawnFailureKind::RedirectorInjection => {
+            AppContainerError::RedirectorInjection(error.message)
+        }
+        SpawnFailureKind::Spawn | SpawnFailureKind::Protocol | SpawnFailureKind::Transport => {
+            AppContainerError::Win32(error.message)
+        }
+    }
+}
+
+#[cfg(test)]
+mod daemon_failure_mapping_tests {
+    use super::*;
+    use crate::tier2a::spawnd::server::SpawnDaemonError;
+    use crate::tier2a::spawnd::SpawnFailureKind;
+
+    fn failure(kind: SpawnFailureKind) -> SpawnDaemonError {
+        SpawnDaemonError {
+            kind,
+            message: "boom".to_string(),
+        }
+    }
+
+    /// **やり直してよい側**: 注入の失敗だけが、lazyレーンが見るエラーになる。
+    #[test]
+    fn a_redirector_injection_failure_is_the_one_lazy_can_retry() {
+        assert!(
+            matches!(
+                daemon_failure_to_error(failure(SpawnFailureKind::RedirectorInjection)),
+                AppContainerError::RedirectorInjection(_)
+            ),
+            "注入の失敗が別のエラーへ丸められている。\
+             lazyレーンの不調がコマンドそのものの失敗に化ける（D-88 §5.1.3）"
+        );
+    }
+
+    /// **対の側**（`B-35`）: それ以外はやり直さない。
+    ///
+    /// 片方だけだと、**常に`RedirectorInjection`を返す実装**でも上のテストは通る
+    /// ——そして直らない失敗を毎回2回試すようになる。
+    #[test]
+    fn every_other_failure_kind_is_not_retryable() {
+        for kind in [
+            SpawnFailureKind::Spawn,
+            SpawnFailureKind::Protocol,
+            SpawnFailureKind::Transport,
+        ] {
+            assert!(
+                !matches!(
+                    daemon_failure_to_error(failure(kind)),
+                    AppContainerError::RedirectorInjection(_)
+                ),
+                "{kind:?}がやり直し対象になっている。作り直しても同じ失敗を2回踏む"
+            );
+        }
+    }
+
+    /// 失敗の**理由**を落とさない。落とすと、切り分けがDaemonのログ頼みになる。
+    #[test]
+    fn the_reason_survives_the_mapping() {
+        for kind in [
+            SpawnFailureKind::RedirectorInjection,
+            SpawnFailureKind::Spawn,
+            SpawnFailureKind::Protocol,
+            SpawnFailureKind::Transport,
+        ] {
+            assert!(
+                daemon_failure_to_error(failure(kind)).to_string().contains("boom"),
+                "{kind:?}で理由の文面が消えた"
+            );
+        }
+    }
+}
+
+/// harness側で作るJobとstdioの親側端を、途中失敗でも一括回収する。
+struct DaemonSpawnHandles {
+    job: Option<HANDLE>,
+    stdin_read: Option<HANDLE>,
+    stdin_write: Option<HANDLE>,
+    stdout_read: Option<HANDLE>,
+    stdout_write: Option<HANDLE>,
+    stderr_read: Option<HANDLE>,
+    stderr_write: Option<HANDLE>,
+}
+
+impl DaemonSpawnHandles {
+    fn new() -> Self {
+        Self {
+            job: None,
+            stdin_read: None,
+            stdin_write: None,
+            stdout_read: None,
+            stdout_write: None,
+            stderr_read: None,
+            stderr_write: None,
+        }
+    }
+}
+
+impl Drop for DaemonSpawnHandles {
+    fn drop(&mut self) {
+        unsafe {
+            for handle in [
+                self.stdin_read.take(),
+                self.stdin_write.take(),
+                self.stdout_read.take(),
+                self.stdout_write.take(),
+                self.stderr_read.take(),
+                self.stderr_write.take(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let _ = CloseHandle(handle);
+            }
+            if let Some(job) = self.job.take() {
+                // **`TerminateJobObject`は撃たず、`CloseHandle`だけを行う**
+                // （§10.1.1の「spawn失敗時の後始末」の性質。ここへ来るのは生成が失敗した
+                // ときだけで、成功時は`job.take()`が先に所有権を子へ渡している）。
+                // 失敗時点でこのJobは**空**である——Daemonが起こせていれば子は
+                // resume前に明示終了済みなので、kill-on-closeで足りる。
+                let _ = CloseHandle(job);
+            }
+        }
+    }
+}
+
+/// Job・stdioをharness側で所有したまま、トップレベル生成だけを共有Daemonへ委譲する。
+///
+/// `spawn_request`は**呼び出し側が必ず選ぶ**（[`SpawnRequestAccess`]のdoc）。
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_with_workspace_via_daemon<'a>(
+    daemon: &crate::tier2a::spawnd::SharedSpawnDaemon,
+    domain_name: &str,
+    exe: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(String, String)],
+    want_stdin: bool,
+    container_sid: PSID,
+    net: NetworkCapability,
+    inject: impl Into<RedirectorInject<'a>>,
+    domain_caps: &[PSID],
+    domain: DomainIdentity,
+    spawn_request: SpawnRequestAccess,
+) -> Result<AppContainerChild, AppContainerError> {
+    use crate::tier2a::spawnd::{
+        DomainIdentitySpec, DomainSpec, RedirectorSpec, TopLevelSpawn,
+    };
+
+    let inject = inject.into();
+    let container_sid_string = crate::win_common::sid_to_string(container_sid)
+        .map_err(|e| AppContainerError::Win32(format!("sid_to_string(container): {e}")))?;
+    let identity = match domain {
+        DomainIdentity::Capability(sid) => DomainIdentitySpec::Capability {
+            sid: crate::win_common::sid_to_string(sid)
+                .map_err(|e| AppContainerError::Win32(format!("sid_to_string(domain): {e}")))?,
+        },
+        DomainIdentity::OwnPackage => DomainIdentitySpec::OwnPackage,
+    };
+    let traverse = super::traverse_capability_sid()?;
+    let traverse_string = crate::win_common::sid_to_string(traverse.as_psid())
+        .map_err(|e| AppContainerError::Win32(format!("sid_to_string(traverse): {e}")))?;
+    // **`Withhold`でも導出する。** 導出そのものは副作用の無い名前→SIDの変換で、
+    // ここで分岐させると「積まない経路だけ導出が壊れていても気付けない」形になる。
+    let spawn_request_sid = super::spawn_request_capability_sid()?;
+    let spawn_request_string = crate::win_common::sid_to_string(spawn_request_sid.as_psid())
+        .map_err(|e| AppContainerError::Win32(format!("sid_to_string(spawn request): {e}")))?;
+    let mut declared_caps = Vec::with_capacity(domain_caps.len());
+    for sid in domain_caps {
+        declared_caps.push(
+            crate::win_common::sid_to_string(*sid)
+                .map_err(|e| AppContainerError::Win32(format!("sid_to_string(capability): {e}")))?,
+        );
+    }
+    let capability_sids = daemon_capability_sids(
+        &traverse_string,
+        &spawn_request_string,
+        &declared_caps,
+        net,
+        spawn_request,
+    );
+    // **Redirectorへ渡すパスは、電文へ載せる前にharness側で綴りを揃える**
+    // （[BUG-066](../../../../docs/bugs/BUG-066.md)）。`normalize_cow_root`は
+    // `canonicalize`を使うので**呼び出したプロセスのcwdを基準に相対パスを解決する**——
+    // 揃えるのをDaemon側（`augment_redirector_env`）だけに任せると、基準がDaemonのcwdになり、
+    // BUG-066の修正が置いた「渡す前に一度だけ揃える唯一の絞り」がプロセス境界で失われる。
+    // Daemon側の呼びはそのままでよい（canonical済みの絶対パスは冪等に畳まれる）。
+    let redirector = if let Some(cow) = inject.cow {
+        Some(RedirectorSpec::Cow {
+            workspace_root: normalize_cow_root(cow.workspace_root)
+                .to_string_lossy()
+                .into_owned(),
+            diff_layer_dir: normalize_cow_root(cow.diff_layer_dir)
+                .to_string_lossy()
+                .into_owned(),
+            ext_capture_roots: cow
+                .ext_capture_roots
+                .iter()
+                .map(|path| normalize_cow_root(path).to_string_lossy().into_owned())
+                .collect(),
+        })
+    } else {
+        inject.broker_pipe.map(|pipe| RedirectorSpec::Lazy {
+            workspace_root: normalize_cow_root(
+                inject
+                    .workspace_root
+                    .expect("lazy redirector requires workspace root"),
+            )
+            .to_string_lossy()
+            .into_owned(),
+            broker_pipe: pipe.to_string(),
+        })
+    };
+
+    let step = |label: &'static str, e: windows::core::Error| {
+        AppContainerError::Win32(format!("{label}: {e}"))
+    };
+    let mut handles = DaemonSpawnHandles::new();
+    handles.job = Some(create_job_object().map_err(|e| step("create_job_object", e))?);
+    let (stdout_read, stdout_write) =
+        appcontainer_pipe(container_sid).map_err(|e| step("appcontainer_pipe(stdout)", e))?;
+    clear_inherit(stdout_read);
+    handles.stdout_read = Some(stdout_read);
+    handles.stdout_write = Some(stdout_write);
+    let (stderr_read, stderr_write) =
+        appcontainer_pipe(container_sid).map_err(|e| step("appcontainer_pipe(stderr)", e))?;
+    clear_inherit(stderr_read);
+    handles.stderr_read = Some(stderr_read);
+    handles.stderr_write = Some(stderr_write);
+    if want_stdin {
+        let (stdin_read, stdin_write) =
+            appcontainer_pipe(container_sid).map_err(|e| step("appcontainer_pipe(stdin)", e))?;
+        clear_inherit(stdin_write);
+        handles.stdin_read = Some(stdin_read);
+        handles.stdin_write = Some(stdin_write);
+    }
+
+    // この3端はSharedSpawnDaemonが成否によらず閉じる契約へ移す。
+    let stdout_write = handles.stdout_write.take().expect("stdout write was created");
+    let stderr_write = handles.stderr_write.take().expect("stderr write was created");
+    let stdin_read = handles.stdin_read.take();
+    let mut daemon_env = env.to_vec();
+    daemon_env.retain(|(name, _)| name != crate::tier2a::spawnd::REQUEST_PIPE_ENV);
+    daemon_env.push((
+        crate::tier2a::spawnd::REQUEST_PIPE_ENV.to_string(),
+        daemon.request_pipe().to_string(),
+    ));
+    let spawned = daemon.spawn_top_level(TopLevelSpawn {
+        exe,
+        args,
+        cwd,
+        env: &daemon_env,
+        domain: DomainSpec {
+            name: domain_name.to_string(),
+            container_sid: container_sid_string,
+            capability_sids,
+            identity,
+        },
+        job: handles.job.expect("job was created"),
+        stdout_write,
+        stderr_write,
+        stdin_read,
+        redirector,
+    });
+    let spawned = spawned.map_err(daemon_failure_to_error)?;
+
+    Ok(AppContainerChild {
+        process: spawned.process,
+        job: handles.job.take().expect("job ownership transfers to child"),
+        stdin_write: handles.stdin_write.take(),
+        stdout_read: handles
+            .stdout_read
+            .take()
+            .expect("stdout read ownership transfers to child"),
+        stderr_read: handles
+            .stderr_read
+            .take()
+            .expect("stderr read ownership transfers to child"),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_via_daemon<'a>(
+    daemon: &crate::tier2a::spawnd::SharedSpawnDaemon,
+    domain_name: &str,
+    exe: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(String, String)],
+    want_stdin: bool,
+    container_sid: PSID,
+    net: NetworkCapability,
+    inject: impl Into<RedirectorInject<'a>>,
+    domain: DomainIdentity,
+    spawn_request: SpawnRequestAccess,
+) -> Result<AppContainerChild, AppContainerError> {
+    spawn_with_workspace_via_daemon(
+        daemon,
+        domain_name,
+        exe,
+        args,
+        cwd,
+        env,
+        want_stdin,
+        container_sid,
+        net,
+        inject,
+        &[],
+        domain,
+        spawn_request,
+    )
 }
 
 /// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する実体。
@@ -995,50 +1511,7 @@ fn spawn_impl(
     let mut env_owned;
     let env = if let Some((_, ready_write)) = &ready_pipe {
         env_owned = env.to_vec();
-        // **workspaceの綴りは両モードで要る**（DLLはこれで「workspace内か」を判定する）。
-        // BUG-066: 綴りを揃えてから渡す（`normalize_cow_root`のdoc参照）。
-        // `wanted()`が偽なら`ready_pipe`は`None`なのでここへ来ない＝必ず`Some`である。
-        let workspace = cow
-            .workspace_root
-            .expect("wanted() already required a workspace root");
-        env_owned.push((
-            "HARNESS_COW_WORKSPACE".to_string(),
-            normalize_cow_root(workspace).to_string_lossy().into_owned(),
-        ));
-        // [D-88] **差分層はCoWのときだけ渡す。** 渡さないことが、DLL側で
-        // 「`cow_enabled`が偽」＝成功経路で何も判定しない、の根拠になる（§S25）。
-        if let Some(c) = cow.cow {
-            env_owned.push((
-                "HARNESS_COW_DIFF_LAYER".to_string(),
-                normalize_cow_root(c.diff_layer_dir)
-                    .to_string_lossy()
-                    .into_owned(),
-            ));
-            if !c.ext_capture_roots.is_empty() {
-                let joined = c
-                    .ext_capture_roots
-                    .iter()
-                    .map(|p| normalize_cow_root(p).to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join(";");
-                env_owned.push(("HARNESS_COW_EXT_ROOTS".to_string(), joined));
-            }
-        }
-        if let Some(pipe) = cow.broker_pipe {
-            env_owned.push(("HARNESS_LAZY_BROKER_PIPE".to_string(), pipe.to_string()));
-        }
-        // [D-88] 注入の対象外一覧を子へも渡す。**親と子孫が同じ一覧を見る**ようにしないと、
-        // 「外したつもりのプロセスが孫では注入される」というちぐはぐな状態になる
-        // （`B-05`: 同じ決定を2つの綴りで持たない）。子は環境を継承しないので明示的に積む。
-        if let Ok(list) = std::env::var(super::lazy_grant::NO_INJECT_ENV) {
-            if !list.trim().is_empty() {
-                env_owned.push((super::lazy_grant::NO_INJECT_ENV.to_string(), list));
-            }
-        }
-        env_owned.push((
-            "HARNESS_COW_READY_HANDLE".to_string(),
-            (ready_write.0 as usize).to_string(),
-        ));
+        augment_redirector_env(&mut env_owned, cow, *ready_write);
         &env_owned
     } else {
         env

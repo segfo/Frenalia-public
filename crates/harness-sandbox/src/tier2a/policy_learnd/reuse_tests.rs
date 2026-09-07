@@ -118,6 +118,7 @@ fn a_rejected_request_does_not_kill_the_connection() {
         workspace_root: PathBuf::from("C:/work"),
         fs_audit_log_path: PathBuf::from("C:/work/.harness/sandbox/x/fs-audit.jsonl"),
         harness_pid: None,
+        spawn_daemon_pid: None,
         record_all: false,
     }));
     assert!(
@@ -165,6 +166,7 @@ fn a_second_generation_starts_a_fresh_session_and_a_fresh_sink() {
         workspace_root: workspace.path().to_path_buf(),
         fs_audit_log_path: dir.join("fs-audit.jsonl"),
         harness_pid: Some(std::process::id()),
+        spawn_daemon_pid: None,
         record_all: false,
     };
 

@@ -46,6 +46,8 @@ pub mod table;
 pub mod client;
 #[cfg(windows)]
 pub mod server;
+#[cfg(windows)]
+pub use client::{SharedSpawnDaemon, SpawnDaemonHandle, SpawnedChild, TopLevelSpawn};
 
 #[cfg(test)]
 #[path = "wire_tests.rs"]
@@ -63,6 +65,38 @@ pub const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// 1フレームの上限。Daemonは**サンドボックスからの入力を直接パースする最初のフルトラスト
 /// 常駐**なので、長さの上限をプロトコルの側で持つ（§10.1「Daemonの入力の扱い」）。
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+
+/// 制御パイプのプロトコル版。
+///
+/// Redirector注入のように、古いDaemonが未知の欄を無視すると隔離の意味が変わる変更では
+/// `Hello`と`Ready`の両方で完全一致を要求する。片方だけ新しいバイナリでもspawn前に止まる。
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
+///
+/// # なぜ`==`であって`>=`ではないのか
+///
+/// 版が上がるのは「古い側が未知の欄を無視すると隔離の意味が変わる」ときだけである
+/// （例: [`RedirectorSpec`]。古いDaemonが注入欄を無視すると、**注入なしで起動して成功する**
+/// ——CoWの透過が丸ごと消えたまま、症状が出ない）。**「新しいほうが上位互換」は成り立たない**
+/// ので、範囲ではなく一致で見る。
+///
+/// # なぜ関数にしてあるのか
+///
+/// **harnessとDaemonの両方がこれを通る。** 判定を両側で別々に書くと、片側だけ
+/// 条件が変わった状態が黙って成立する（`B-05`: コンパイラが守らない複製）。
+/// 純粋関数なので、混在の拒否を昇格もパイプも無しで測れる。
+pub fn protocol_version_mismatch(peer: u32) -> Option<String> {
+    (peer != PROTOCOL_VERSION).then(|| {
+        format!(
+            "spawn daemon control protocol mismatch: this build speaks {PROTOCOL_VERSION}, \
+             the peer reported {peer} (rebuild harness-spawnd.exe together with harness.exe)"
+        )
+    })
+}
+
+/// Daemon経由で起動したトップレベル子へ渡す要求受付パイプ名。
+pub const REQUEST_PIPE_ENV: &str = "HARNESS_SPAWN_REQUEST_PIPE";
 
 /// 子のプロセス／スレッド／トークン既定DACLに載せる**ドメインの宛先SID**（§22.1.1）。
 ///
@@ -96,6 +130,34 @@ pub struct DomainSpec {
     pub identity: DomainIdentitySpec,
 }
 
+/// Spawn Daemonがsuspended状態の子へ行うRedirector注入。
+///
+/// 借用を含む[`crate::tier2a::win_appcontainer::RedirectorInject`]はプロセス境界を越せないため、
+/// 同じ意味を所有値で運ぶ。`None`は注入しない（MCP stdioとlazy対象外の現行動作）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RedirectorSpec {
+    Cow {
+        workspace_root: String,
+        diff_layer_dir: String,
+        ext_capture_roots: Vec<String>,
+    },
+    Lazy {
+        workspace_root: String,
+        broker_pipe: String,
+    },
+}
+
+/// 制御要求が失敗した段階。lazy注入だけを安全に1回再試行するため、文言とは別の値で返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnFailureKind {
+    Spawn,
+    RedirectorInjection,
+    Protocol,
+    Transport,
+}
+
 /// 子へ引き継がせるハンドル一式。**すべて受け手（Daemon）のプロセスへ複製済みの値**である。
 ///
 /// 作るのはharnessで、Daemonは受け取った端をそのまま`STARTUPINFO`へ載せる
@@ -125,6 +187,8 @@ pub enum ControlRequest {
     Hello {
         /// `PROCESS_DUP_HANDLE`のみへ絞ったharnessプロセスハンドルの複製。
         harness_process: u64,
+        /// [`PROTOCOL_VERSION`]と完全一致しなければ、1件もspawnせず接続を閉じる。
+        protocol_version: u32,
     },
     /// トップレベルのプロセスを起こす（§12「harnessもSpawn Daemon経由でspawnを依頼する」）。
     ///
@@ -146,9 +210,20 @@ pub struct SpawnTopLevelRequest {
     pub env: Vec<(String, String)>,
     pub domain: DomainSpec,
     pub handles: ChildHandles,
-    /// トークンの既定DACLの差し替え（§22.1.1）。`None`なら差し替えない。
-    pub token_default_dacl_sddl: Option<String>,
+    /// suspended窓で行うRedirector注入。`None`なら現行の無注入経路。
+    pub redirector: Option<RedirectorSpec>,
 }
+
+// **トークンの既定DACL（§22.1.1）の欄は置かない**（2026-09-07に削除）。
+//
+// かつてここに`token_default_dacl_sddl: Option<String>`が在り、docは「`None`なら
+// 差し替えない」と書いていた。**その記述は誤りだった**——Daemonはこの欄を一度も読まず、
+// `create_suspended_in_job`が`domain`から自分でSDDLを組んで**常に**差し替えている。
+// 製品の唯一の書き手も`None`を入れるだけだった。
+//
+// **差し替えを電文で切れるように見せるほうが危ない。** 既定DACLの差し替えは
+// 「起動後に生えたスレッドが素のまま残る」穴（§S2b）を塞ぐ2つで1組の対策の片方であり、
+// 呼び出し側が落とせる設定ではない。**落とせる形の欄を置くと、いつか落とされる。**
 
 /// Daemon → harness（制御パイプ）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,11 +236,15 @@ pub enum ControlResponse {
         /// Daemon自身のPID。**観測側の配線に要る**（残課題#42: ETWのスコープ判定が
         /// 「親がharnessか」を手掛かりにしており、Daemonが親になると意味が変わる）。
         daemon_pid: u32,
+        protocol_version: u32,
     },
     /// 起こした。`process`は**harnessのプロセスへ複製済み**のハンドル値。
     Spawned { pid: u32, process: u64 },
     /// 起こせなかった。`reason`はどのWin32呼び出しで落ちたかを含む。
-    Failed { reason: String },
+    Failed {
+        failure_kind: SpawnFailureKind,
+        reason: String,
+    },
     /// 畳んだ。この応答の後、Daemonは終了する。
     ShuttingDown,
 }

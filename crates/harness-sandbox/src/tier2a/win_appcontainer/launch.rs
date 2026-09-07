@@ -38,8 +38,9 @@
 use std::path::PathBuf;
 
 use super::{
-    ensure_profile, grant_job, resolve_shell, spawn_with_workspace, AppContainerChild,
-    AppContainerError, CowInject, DomainIdentity, NetworkCapability, RedirectorInject,
+    ensure_profile, grant_job, resolve_shell, spawn_with_workspace,
+    spawn_with_workspace_via_daemon, AppContainerChild, AppContainerError, CowInject,
+    DomainIdentity, NetworkCapability, RedirectorInject, SpawnRequestAccess,
 };
 
 /// Tier2aでシェルを起こすための入力一式。
@@ -124,17 +125,52 @@ fn declaration_caps(
     caps
 }
 
-/// Tier2aでシェルを起こす。戻り値は`(子プロセス, シェルのラベル)`。
+/// Tier2aでシェルを**harness自身が直接**起こす。戻り値は`(子プロセス, シェルのラベル)`。
+///
+/// # **製品はここを通らない**（2026-09-07、段階④以降）
+///
+/// トップレベル生成はSpawn Daemon経由だけになった（`plans/DESIGN-MAC-PROTOCOL.md` §12）。
+/// この関数の製品呼び出し元は**0件**で、残っているのはレーンの受入テストと待ち時間の測定だけ
+/// である（`the_direct_route_has_no_product_callers`が数えて固定している）。
+///
+/// **新しい呼び出しをここへ足さないこと。** 足すとその経路だけがDaemonを通らず、
+/// 「Daemonが居なくても動く」＝設計が禁じた直接生成への降格がそこから入る。
+/// 製品から呼ぶなら[`spawn_shell_in_workspace_via_daemon`]である。
+///
+/// **ではなぜ残してあるのか。** レーンの測定が「Daemon経由と直接生成の差」を測る対の片側で、
+/// これを消すと比較の基準が無くなる。**消せないものは、消せない理由ごと固定する。**
 ///
 /// **ブロッキング**（モジュールdocの「呼び出しはブロッキングである」参照）。
 pub fn spawn_shell_in_workspace(
     req: WorkspaceSpawn,
 ) -> Result<(AppContainerChild, &'static str), AppContainerError> {
+    spawn_shell_in_workspace_on(req, SpawnRoute::Direct)
+}
+
+/// 製品のトップレベル経路。Daemon未注入を表せない入口にして、直接spawnへの降格を防ぐ。
+pub fn spawn_shell_in_workspace_via_daemon(
+    daemon: &crate::tier2a::spawnd::SharedSpawnDaemon,
+    req: WorkspaceSpawn,
+) -> Result<(AppContainerChild, &'static str), AppContainerError> {
+    spawn_shell_in_workspace_on(req, SpawnRoute::Daemon(daemon))
+}
+
+#[derive(Clone, Copy)]
+enum SpawnRoute<'a> {
+    Direct,
+    Daemon(&'a crate::tier2a::spawnd::SharedSpawnDaemon),
+}
+
+fn spawn_shell_in_workspace_on(
+    req: WorkspaceSpawn,
+    route: SpawnRoute<'_>,
+) -> Result<(AppContainerChild, &'static str), AppContainerError> {
     let _ = std::fs::create_dir_all(&req.cwd);
 
     // D-37: 子プロセスはこの**セッションのプロファイル**で起動する。`preflight`がACEを付けたのも
     // 同じSIDなので、固定名（＝別のプロファイル）で導出すると workspace へ書けなくなる。
-    let sid = ensure_profile(&crate::tier2a::session_profile::current_profile_name())?;
+    let profile_name = crate::tier2a::session_profile::current_profile_name();
+    let sid = ensure_profile(&profile_name)?;
 
     // preflightのsmoke testと同一のシェル解決を使う（pwshのストアアプリ実行エイリアスは
     // AppContainerで起動不可＝`resolve_shell`が実在のpowershell.exeへフォールバックする）。
@@ -187,20 +223,39 @@ pub fn spawn_shell_in_workspace(
     // 起こす手順は**注入するものを除いて同一**なので、1つのクロージャに畳む。2回書くと、
     // 片方だけ引数が変わっても誰も気付けない（`B-05`: コンパイラが守らない複製）。
     let spawn = |inject: RedirectorInject<'_>| {
-        spawn_with_workspace(
-            &bin,
-            &args,
-            &req.cwd,
-            &req.env,
-            true,
-            sid.as_psid(),
-            req.net_capability,
-            inject,
-            &domain_caps,
-            // §22.1.1: このシェルのドメインはworkspace＋モード単位のcapability（D-54）。
-            // traverse capabilityは全Tier2a子が共有するので**ドメインの識別子にしてはいけない**。
-            DomainIdentity::Capability(workspace_cap.as_psid()),
-        )
+        let domain = DomainIdentity::Capability(workspace_cap.as_psid());
+        match route {
+            SpawnRoute::Direct => spawn_with_workspace(
+                &bin,
+                &args,
+                &req.cwd,
+                &req.env,
+                true,
+                sid.as_psid(),
+                req.net_capability,
+                inject,
+                &domain_caps,
+                domain,
+            ),
+            SpawnRoute::Daemon(daemon) => spawn_with_workspace_via_daemon(
+                daemon,
+                &profile_name,
+                &bin,
+                &args,
+                &req.cwd,
+                &req.env,
+                true,
+                sid.as_psid(),
+                req.net_capability,
+                inject,
+                &domain_caps,
+                domain,
+                // このシェルは要求受付パイプへ届いてよい（`plans/DESIGN-MAC-PROTOCOL.md` §12）。
+                // 段階⑤で生成能力を取り上げたあと、CLIツールが子を起こす唯一の口がここになる
+                // ——積まないと、そのときシェルは孫プロセスを1つも作れなくなる。
+                SpawnRequestAccess::Grant,
+            ),
+        }
     };
 
     // [D-88（`plans/DESIGN-SANDBOX-APPPOLICY.md` §5.1.3）] **ここが「待つ条件」である。**
@@ -273,6 +328,103 @@ fn lazy_lane_pipe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **直接生成の入口に製品の呼び出し元が1つも無いこと**を固定する（§12）。
+    ///
+    /// トップレベル生成はSpawn Daemon経由だけになったが、[`spawn_shell_in_workspace`]は
+    /// `pub`のまま残っている（レーンの測定が対の片側として使う）。**印が無いと、次に足された
+    /// 呼び出しは黙って非Daemon経路になる**——設計が禁じた「直接spawnへの降格」がそこから入り、
+    /// しかも動いてしまうので誰も気付かない（`B-10`）。
+    ///
+    /// **`grep`で数えるので、限界は§10.1.1の数え上げと同じである**——別名で束ねてから呼ばれると
+    /// 出ない。ここが緑でも「降格経路が無い」ではなく「**この綴りの**降格経路が無い」である。
+    #[test]
+    fn the_direct_route_has_no_product_callers() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .join("crates");
+
+        let mut product_callers: Vec<String> = Vec::new();
+        let mut test_callers = 0usize;
+        collect_direct_route_callers(&repo_root, &mut product_callers, &mut test_callers);
+
+        assert!(
+            product_callers.is_empty(),
+            "直接生成の入口に製品の呼び出し元がある。この経路はSpawn Daemonを通らないので、\
+             Daemonが居なくても動いてしまう（§12が禁じた降格）。\
+             製品から呼ぶなら spawn_shell_in_workspace_via_daemon を使うこと:\n  {}",
+            product_callers.join("\n  ")
+        );
+        assert!(
+            test_callers > 0,
+            "テストからの呼び出しも0件になった。この関数を残している理由\
+             （Daemon経由と直接生成を比べる測定の片側）が消えているなら、関数ごと消すこと"
+        );
+    }
+
+    /// `crates/`配下の`.rs`を舐めて、直接生成の入口を呼んでいる行を製品／テストへ振り分ける。
+    ///
+    /// 除外するもの: 定義そのものの行、コメント行、`_tests.rs`と`tests/`配下。
+    /// `spawn_shell_in_workspace_via_daemon`は**接尾辞が違うので`(`の直後一致で外れる**。
+    ///
+    /// **探す綴りは実行時に組み立てる。** そのまま書くと**この関数自身が数え上げに引っ掛かる**
+    /// ——§10.1.1が「docに解放の綴りをそのまま書かないのは、doc自身が数え上げに掛かるため」と
+    /// 書いている罠の、検出器側の版である。1回実際に踏んだ。
+    fn collect_direct_route_callers(dir: &std::path::Path, product: &mut Vec<String>, tests: &mut usize) {
+        let needle = format!("spawn_shell_in_workspace{}", '(');
+        let definition = format!("fn {needle}");
+        collect_direct_route_callers_in(dir, &needle, &definition, product, tests);
+    }
+
+    fn collect_direct_route_callers_in(
+        dir: &std::path::Path,
+        needle: &str,
+        definition: &str,
+        product: &mut Vec<String>,
+        tests: &mut usize,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                collect_direct_route_callers_in(&path, needle, definition, product, tests);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let in_test_file = name.ends_with("_tests.rs")
+                || path.components().any(|c| c.as_os_str() == "tests");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (index, line) in text.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if !line.contains(needle) {
+                    continue;
+                }
+                if line.contains(definition) {
+                    continue;
+                }
+                if in_test_file {
+                    *tests += 1;
+                } else {
+                    product.push(format!("{}:{}", path.display(), index + 1));
+                }
+            }
+        }
+    }
 
     /// **`preflight`が使うのと同じ語彙**であることを固定する。ここがずれると別のcapability SIDを
     /// 導出し、付与されていない宛先SIDで起動して全アクセスが拒否される（D-54、モジュールdoc）。

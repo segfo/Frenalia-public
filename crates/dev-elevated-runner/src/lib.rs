@@ -191,6 +191,26 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--test-threads=1",
             "--nocapture",
             "win_appcontainer::spawnd_e2e_tests",
+            // 待ち時間の観測は受け入れではないので、この的からは外す
+            // （`spawn-daemon-latency`が別に回す）。混ぜると受け入れが1分近く延びる。
+            "--skip",
+            "top_level_spawn_latency",
+        ],
+    ),
+    // ④の観測: 直接生成とDaemon経由のトップレベル起動時間。**合否の判定を持たない**
+    // （性能の閾値が未定義。数字は後続の判断のための観測値である）。
+    (
+        "spawn-daemon-latency",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "top_level_spawn_latency",
         ],
     ),
     // ACE付与/撤収（fs passthrough・traverse chain・継承ACE）の実機回帰。BUG-046の修正3で

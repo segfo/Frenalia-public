@@ -24,11 +24,12 @@
 //! それより識別可能なエラーで止まるほうがよい（`B-10`）。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
-    HANDLE, HLOCAL,
+    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS,
+    DUPLICATE_SAME_ACCESS, HANDLE, HLOCAL,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
@@ -50,12 +51,23 @@ use crate::win_pipe_ipc::{
 
 use super::server::SpawnDaemonError;
 use super::{
-    ChildHandles, ControlRequest, ControlResponse, DomainSpec, SpawnTopLevelRequest,
-    ACCEPT_TIMEOUT, IO_TIMEOUT,
+    protocol_version_mismatch, ChildHandles, ControlRequest, ControlResponse, DomainSpec,
+    RedirectorSpec, SpawnFailureKind, SpawnTopLevelRequest, ACCEPT_TIMEOUT, IO_TIMEOUT,
+    PROTOCOL_VERSION,
 };
 
 fn err(message: impl Into<String>) -> SpawnDaemonError {
-    SpawnDaemonError(message.into())
+    SpawnDaemonError {
+        kind: SpawnFailureKind::Transport,
+        message: message.into(),
+    }
+}
+
+fn protocol_err(message: impl Into<String>) -> SpawnDaemonError {
+    SpawnDaemonError {
+        kind: SpawnFailureKind::Protocol,
+        message: message.into(),
+    }
 }
 
 /// harnessが頼むトップレベル生成。
@@ -79,9 +91,14 @@ pub struct TopLevelSpawn<'a> {
     pub stdout_write: HANDLE,
     pub stderr_write: HANDLE,
     pub stdin_read: Option<HANDLE>,
+    pub redirector: Option<RedirectorSpec>,
 }
 
 /// Daemonが起こした子。
+///
+/// `Debug`は**テストが「起こせなかったこと」を主張するために要る**（`expect_err`が
+/// 成功側の`Debug`を要求する）。載るのはPIDとハンドル値だけで、秘密は含まない。
+#[derive(Debug)]
 pub struct SpawnedChild {
     pub pid: u32,
     /// **`SYNCHRONIZE`と`PROCESS_QUERY_LIMITED_INFORMATION`だけ**を持つハンドル（§14の姿勢）。
@@ -110,6 +127,166 @@ pub struct SpawnDaemonHandle {
 // `HANDLE`はカーネルオブジェクトへのポインタ値で、別スレッドから使っても
 // OSレベルでは安全（`RestrictedChild`のSend実装と同じ理由）。
 unsafe impl Send for SpawnDaemonHandle {}
+
+/// 1ホストプロセスが共有するSpawn Daemon接続。
+///
+/// 制御パイプは要求と応答が1対1で並ぶ1本のストリームなので、全トランザクションをMutexで
+/// 直列化する。通信途中で壊れた接続はProcess Tableごと失われた可能性があるため、同じ
+/// ホスト内で自動再起動しない。
+#[derive(Clone)]
+pub struct SharedSpawnDaemon {
+    inner: Arc<Mutex<SharedState>>,
+    request_pipe: Arc<str>,
+    daemon_pid: u32,
+}
+
+struct SharedState {
+    handle: Option<SpawnDaemonHandle>,
+    broken: Option<String>,
+}
+
+/// 制御要求を送る前にDaemonへ複製したハンドルを、途中失敗時だけ回収するガード。
+struct RemoteHandleGuard {
+    daemon_process: HANDLE,
+    handles: Vec<u64>,
+    armed: bool,
+}
+
+impl RemoteHandleGuard {
+    fn new(daemon_process: HANDLE) -> Self {
+        Self {
+            daemon_process,
+            handles: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn track(&mut self, handle: u64) -> u64 {
+        self.handles.push(handle);
+        handle
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RemoteHandleGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for remote in self.handles.drain(..) {
+            let mut local = HANDLE::default();
+            let result = unsafe {
+                DuplicateHandle(
+                    self.daemon_process,
+                    HANDLE(remote as *mut _),
+                    GetCurrentProcess(),
+                    &mut local,
+                    0,
+                    false,
+                    DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS,
+                )
+            };
+            if result.is_ok() {
+                unsafe {
+                    let _ = CloseHandle(local);
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for SharedSpawnDaemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedSpawnDaemon")
+            .field("daemon_pid", &self.daemon_pid)
+            .field("request_pipe", &self.request_pipe)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedSpawnDaemon {
+    pub fn start() -> Result<Self, SpawnDaemonError> {
+        let handle = SpawnDaemonHandle::start()?;
+        let request_pipe: Arc<str> = Arc::from(handle.request_pipe().to_string());
+        let daemon_pid = handle.daemon_pid();
+        Ok(Self {
+            inner: Arc::new(Mutex::new(SharedState {
+                handle: Some(handle),
+                broken: None,
+            })),
+            request_pipe,
+            daemon_pid,
+        })
+    }
+
+    pub fn request_pipe(&self) -> &str {
+        &self.request_pipe
+    }
+
+    pub fn daemon_pid(&self) -> u32 {
+        self.daemon_pid
+    }
+
+    pub fn spawn_top_level(
+        &self,
+        request: TopLevelSpawn<'_>,
+    ) -> Result<SpawnedChild, SpawnDaemonError> {
+        let mut state = match self.inner.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                close_child_handles(&request);
+                return Err(protocol_err(
+                "spawn daemon connection mutex was poisoned during a control transaction; refusing to reuse it",
+                ));
+            }
+        };
+        if let Some(reason) = state.broken.as_ref() {
+            close_child_handles(&request);
+            return Err(err(format!(
+                "spawn daemon connection is no longer usable and will not be restarted: {reason}"
+            )));
+        }
+        let Some(handle) = state.handle.as_ref() else {
+            close_child_handles(&request);
+            return Err(err("spawn daemon connection is not available"));
+        };
+        let result = handle.spawn_top_level(request);
+        if let Err(failure) = &result {
+            if matches!(
+                failure.kind,
+                SpawnFailureKind::Transport | SpawnFailureKind::Protocol
+            ) {
+                let reason = failure.to_string();
+                let handle = state.handle.take();
+                state.broken = Some(reason);
+                drop(handle);
+            }
+        }
+        result
+    }
+
+    /// 共有cloneが残っていても接続を一度だけ畳み、以後の生成を拒否する。
+    pub fn shutdown(&self) {
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
+        state.broken = Some("spawn daemon was shut down by its host".to_string());
+        drop(state.handle.take());
+    }
+}
+
+fn close_child_handles(request: &TopLevelSpawn<'_>) {
+    unsafe {
+        let _ = CloseHandle(request.stdout_write);
+        let _ = CloseHandle(request.stderr_write);
+        if let Some(handle) = request.stdin_read {
+            let _ = CloseHandle(handle);
+        }
+    }
+}
 
 impl SpawnDaemonHandle {
     /// Daemonを起こし、ハンドシェイクまで済ませる。
@@ -187,17 +364,23 @@ impl SpawnDaemonHandle {
 
         self.send(&ControlRequest::Hello {
             harness_process: for_daemon.0 as u64,
+            protocol_version: PROTOCOL_VERSION,
         })?;
         match self.receive()? {
             ControlResponse::Ready {
                 request_pipe,
                 daemon_pid,
+                protocol_version,
             } => {
+                // **harnessとDaemonが同じ関数を通る**（`protocol_version_mismatch`のdoc）。
+                if let Some(reason) = protocol_version_mismatch(protocol_version) {
+                    return Err(protocol_err(reason));
+                }
                 self.request_pipe = request_pipe;
                 self.daemon_pid = daemon_pid;
                 Ok(())
             }
-            other => Err(err(format!("expected Ready, got {other:?}"))),
+            other => Err(protocol_err(format!("expected Ready, got {other:?}"))),
         }
     }
 
@@ -248,11 +431,14 @@ impl SpawnDaemonHandle {
         &self,
         request: &TopLevelSpawn<'_>,
     ) -> Result<SpawnedChild, SpawnDaemonError> {
-        let job = self.duplicate_to_daemon(request.job, false, "job")?;
-        let stdout_write = self.duplicate_to_daemon(request.stdout_write, true, "stdout")?;
-        let stderr_write = self.duplicate_to_daemon(request.stderr_write, true, "stderr")?;
+        let mut remote = RemoteHandleGuard::new(self.daemon_process);
+        let job = remote.track(self.duplicate_to_daemon(request.job, false, "job")?);
+        let stdout_write =
+            remote.track(self.duplicate_to_daemon(request.stdout_write, true, "stdout")?);
+        let stderr_write =
+            remote.track(self.duplicate_to_daemon(request.stderr_write, true, "stderr")?);
         let stdin_read = match request.stdin_read {
-            Some(handle) => Some(self.duplicate_to_daemon(handle, true, "stdin")?),
+            Some(handle) => Some(remote.track(self.duplicate_to_daemon(handle, true, "stdin")?)),
             None => None,
         };
 
@@ -269,17 +455,25 @@ impl SpawnDaemonHandle {
                     stdout_write,
                     stderr_write,
                 },
-                token_default_dacl_sddl: None,
+                redirector: request.redirector.clone(),
             },
         )))?;
+        // 電文を渡し終えた時点から、複製の所有者はDaemon側のspawn処理になる。
+        remote.disarm();
 
         match self.receive()? {
             ControlResponse::Spawned { pid, process } => Ok(SpawnedChild {
                 pid,
                 process: HANDLE(process as *mut _),
             }),
-            ControlResponse::Failed { reason } => Err(err(reason)),
-            other => Err(err(format!("expected Spawned, got {other:?}"))),
+            ControlResponse::Failed {
+                failure_kind,
+                reason,
+            } => Err(SpawnDaemonError {
+                kind: failure_kind,
+                message: reason,
+            }),
+            other => Err(protocol_err(format!("expected Spawned, got {other:?}"))),
         }
     }
 
@@ -360,11 +554,11 @@ fn daemon_exe_path() -> Result<PathBuf, SpawnDaemonError> {
     if path.is_file() {
         return Ok(path);
     }
-    // **テストのときだけ1つ上も見る。** テストバイナリは`target/debug/deps/`から走るが、
+    // **debug/testビルドだけ1つ上も見る。** テストバイナリは`target/debug/deps/`から走るが、
     // `harness-spawnd.exe`は`target/debug/`に出る。`test_support::harness_exe`が
     // 同じ理由で同じ登り方をしている。**本番の解決規則は変えない**——`harness.exe`の隣
-    // 以外を探すと、置き場の取り違えが「動いてしまう」形で隠れる。
-    #[cfg(test)]
+    // 以外を探すと、置き場の取り違えが「動いてしまう」形で隠れる。release本番は隣だけを見る。
+    #[cfg(any(test, debug_assertions))]
     if let Some(up) = dir.parent() {
         let candidate = up.join("harness-spawnd.exe");
         if candidate.is_file() {

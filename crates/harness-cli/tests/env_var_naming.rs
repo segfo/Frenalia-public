@@ -82,6 +82,12 @@ const PRODUCTION_ENV_VARS: &[(&str, &str)] = &[
         "起動側 → Redirector DLL: 拒否されたopenを問い合わせるfault受付パイプの名前（D-88）",
     ),
     (
+        "HARNESS_SPAWN_REQUEST_PIPE",
+        "Spawn Daemon → サンドボックスの子: 生成を頼む要求受付パイプの名前（§10.1）。\
+         **名前は秘密ではない**——境界はパイプのDACL（ユーザーSID＋spawn要求用capability）で、\
+         これを渡さないことは境界ではない",
+    ),
+    (
         "HARNESS_TIER2A_LAZY_ACE",
         "Lazy ACE fault-inレーンを**切る**逃がし弁（D-88。既定は有効。注入と相性の悪い場面で従来の全walk待機へ戻す）",
     ),

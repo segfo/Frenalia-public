@@ -22,9 +22,13 @@ use super::*;
 fn control_request_hello_keeps_its_wire_shape() {
     let json = serde_json::to_string(&ControlRequest::Hello {
         harness_process: 4660,
+        protocol_version: PROTOCOL_VERSION,
     })
     .expect("serialize");
-    assert_eq!(json, r#"{"kind":"hello","harness_process":4660}"#);
+    assert_eq!(
+        json,
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":2}"#
+    );
 }
 
 #[test]
@@ -48,12 +52,15 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
             stdout_write: 24,
             stderr_write: 28,
         },
-        token_default_dacl_sddl: None,
+        redirector: Some(RedirectorSpec::Lazy {
+            workspace_root: "C:/w".to_string(),
+            broker_pipe: r"\\.\pipe\lazy".to_string(),
+        }),
     }));
     let json = serde_json::to_string(&request).expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"}},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"token_default_dacl_sddl":null}"#
+        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"}},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"redirector":{"kind":"lazy","workspace_root":"C:/w","broker_pipe":"\\\\.\\pipe\\lazy"}}"#
     );
     let back: ControlRequest = serde_json::from_str(&json).expect("round trip");
     assert_eq!(back, request);
@@ -64,10 +71,11 @@ fn control_responses_keep_their_wire_shape() {
     let ready = ControlResponse::Ready {
         request_pipe: r"\\.\pipe\harness-spawnd-1-0-2".to_string(),
         daemon_pid: 1234,
+        protocol_version: PROTOCOL_VERSION,
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":2}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {
@@ -79,11 +87,46 @@ fn control_responses_keep_their_wire_shape() {
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Failed {
+            failure_kind: SpawnFailureKind::Spawn,
             reason: "CreateProcessW: boom".to_string()
         })
         .expect("serialize"),
-        r#"{"kind":"failed","reason":"CreateProcessW: boom"}"#
+        r#"{"kind":"failed","failure_kind":"spawn","reason":"CreateProcessW: boom"}"#
     );
+}
+
+/// **版が「合わない」を、欄が「無い」とは別に測る。**
+///
+/// 直下のテストは欄そのものが無い場合（＝段階③以前のバイナリ）を見ているが、
+/// **欄はあるが値が違う**場合はそこを通らない。判定は`==`でなければならない——
+/// `>=`にすると、古いDaemonが新しい注入欄を無視して**注入なしで起動して成功する**
+/// （CoWの透過が丸ごと消えたまま、症状が出ない）。
+#[test]
+fn a_peer_that_reports_a_different_protocol_version_is_rejected_in_both_directions() {
+    assert!(
+        protocol_version_mismatch(PROTOCOL_VERSION).is_none(),
+        "同じ版を拒んでいる。全セッションが起動できない"
+    );
+    for peer in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+        let reason = protocol_version_mismatch(peer)
+            .unwrap_or_else(|| panic!("版{peer}を受理した。新旧混在がspawn前に止まらない"));
+        assert!(
+            reason.contains(&peer.to_string()),
+            "拒否の理由に相手の版が出ていない（どちらを建て直せばよいか分からない）: {reason}"
+        );
+    }
+}
+
+#[test]
+fn old_peers_without_a_protocol_version_are_rejected() {
+    assert!(serde_json::from_str::<ControlRequest>(
+        r#"{"kind":"hello","harness_process":4660}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<ControlResponse>(
+        r#"{"kind":"ready","request_pipe":"p","daemon_pid":1}"#
+    )
+    .is_err());
 }
 
 /// **要求受付パイプの電文にドメインの欄が無いこと**を形の側から固定する（§12）。

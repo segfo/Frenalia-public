@@ -97,6 +97,7 @@ pub struct Pass2Request {
     pub wfp: crate::record_net::SharedNetfilter,
     /// ETW収集器（deny-only）。パス1と**同じdaemon**を使い回す（D-56 段階2）。
     pub collector: crate::record::SharedCollector,
+    pub spawn_daemon: crate::record_net::SharedSpawnDaemon,
 }
 
 pub fn spawn_pass1(request: Pass1Request) -> RunHandle {
@@ -148,6 +149,7 @@ pub fn spawn_pass2(request: Pass2Request) -> RunHandle {
             cancel: &canceled,
             wfp: &request.wfp,
             collector: &request.collector,
+            spawn_daemon: &request.spawn_daemon,
         };
         let tx_events: Sender<WorkerMsg> = tx.clone();
         let mut on_event = |event: NetRecordEvent| {

@@ -43,6 +43,9 @@ use super::*;
 use crate::cancel_descendants::{
     assert_cancel_completes, prepare_descendant, DescendantOutput, DescendantProbe,
 };
+// `super::*`は`win_appcontainer`の再エクスポートを持ち込むが、Daemon側の型はそこには載らない。
+use crate::tier2a::spawnd::SharedSpawnDaemon;
+use crate::win_common::SendHandle;
 use crate::tier2a::spawnd::client::{SpawnDaemonHandle, SpawnedChild, TopLevelSpawn};
 use crate::tier2a::spawnd::{DomainIdentitySpec, DomainSpec};
 
@@ -171,6 +174,7 @@ fn spawn_via_daemon(
             stdout_write,
             stderr_write,
             stdin_read: None,
+            redirector: None,
         })
         .expect("the daemon must spawn the top-level child");
 
@@ -297,6 +301,14 @@ fn the_control_pipe_stays_unreachable_from_inside_the_sandbox() {
         "サンドボックスの中から制御パイプへ到達できた。\
          「特権クライアントとサンドボックスの区別をDACLで引く」（§10.1・P-01）が破れている: {out}"
     );
+    // P3と同じ理由で、**理由まで見る**（`connected:false`は混雑でも成立する）。
+    // 制御パイプはインスタンス1本なので、混雑と拒否の取り違えはここが最も起きやすい。
+    assert_eq!(
+        report_field(&out, "last_error").and_then(|v| v.as_u64()),
+        Some(5),
+        "到達できなかった理由がアクセス拒否(5)ではない。\
+         231ならパイプが混雑していただけで、ユーザーSID専有DACLの効果を測れていない: {out}"
+    );
     drop(case);
 }
 
@@ -341,6 +353,19 @@ fn a_child_without_the_spawn_capability_cannot_reach_the_request_pipe() {
         Some(false),
         "spawn要求用capabilityを積んでいない子が要求受付パイプへ到達できた。\
          capabilityがドメイン単位のスイッチになっていない（§10.1）: {out}"
+    );
+    // **「届かなかった」だけでは足りない。理由まで見る。**
+    //
+    // 名前付きパイプは、サーバが次の受付インスタンスを作る前の窓に当たると
+    // `ERROR_PIPE_BUSY`(231)を返す。それも`connected:false`になるので、
+    // **この測定はDACLと無関係な理由で緑になり得る**——実際、同じ窓を
+    // `concurrent_requests_...`が踏んで発覚した。
+    // 測りたいのは`ERROR_ACCESS_DENIED`(5)、つまり**DACLが拒んだこと**である。
+    assert_eq!(
+        report_field(&out, "last_error").and_then(|v| v.as_u64()),
+        Some(5),
+        "到達できなかった理由がアクセス拒否(5)ではない。\
+         231ならパイプが混雑していただけで、capabilityの効果を測れていない: {out}"
     );
     drop(case);
 }
@@ -456,6 +481,7 @@ fn cancelling_a_daemon_spawned_lineage_still_kills_the_grandchild() {
             stdout_write,
             stderr_write,
             stdin_read: None,
+            redirector: None,
         })
         .expect("the daemon must spawn the shell");
 
@@ -529,7 +555,7 @@ fn dropping_the_handle_ends_the_daemon() {
 fn a_spawn_request_after_the_daemon_died_fails_loudly() {
     use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
-    let daemon = SpawnDaemonHandle::start().expect("the spawn daemon must start");
+    let daemon = SharedSpawnDaemon::start().expect("the spawn daemon must start");
     let pid = daemon.daemon_pid();
 
     // Daemonを外から落とす（クラッシュの模擬）。
@@ -566,6 +592,7 @@ fn a_spawn_request_after_the_daemon_died_fails_loudly() {
         stdout_write,
         stderr_write,
         stdin_read: None,
+        redirector: None,
     });
 
     let message = match result {
@@ -591,9 +618,291 @@ fn a_spawn_request_after_the_daemon_died_fails_loudly() {
         let _ = CloseHandle(stderr_read);
         let _ = CloseHandle(job);
     }
+
+    // 同じ共有接続で再度要求しても、新しいDaemonを起こさず直ちに拒否する。
+    let second_job = crate::win_common::create_job_object().expect("second job");
+    let (second_stdout_read, second_stdout_write) =
+        crate::win_common::create_inheritable_pipe().expect("second stdout pipe");
+    let (second_stderr_read, second_stderr_write) =
+        crate::win_common::create_inheritable_pipe().expect("second stderr pipe");
+    let second = daemon.spawn_top_level(TopLevelSpawn {
+        exe: r"C:\Windows\System32\cmd.exe",
+        args: &["/c", "exit", "0"],
+        cwd: std::path::Path::new(r"C:\"),
+        env: &[],
+        domain: DomainSpec {
+            name: "dead-daemon-second-attempt".to_string(),
+            container_sid: "S-1-15-2-1-2-3".to_string(),
+            capability_sids: Vec::new(),
+            identity: DomainIdentitySpec::OwnPackage,
+        },
+        job: second_job,
+        stdout_write: second_stdout_write,
+        stderr_write: second_stderr_write,
+        stdin_read: None,
+        redirector: None,
+    });
+    assert!(
+        second
+            .expect_err("a broken shared connection must never restart")
+            .to_string()
+            .contains("will not be restarted"),
+        "2回目は保存済みのbroken状態から拒否しなければならない"
+    );
+    assert_eq!(daemon.daemon_pid(), pid, "Daemon PIDを差し替えてはならない");
+    unsafe {
+        let _ = CloseHandle(second_stdout_read);
+        let _ = CloseHandle(second_stderr_read);
+        let _ = CloseHandle(second_job);
+    }
 }
 
 /// 子の終了を待ち、harness側のハンドルを閉じる。
+/// **P9**: 1本の制御パイプを共有したまま、複数のスレッドが同時に生成を頼んでも
+/// 要求と応答が1組ずつ噛み合う（§12「単一制御パイプの直列化」）。
+///
+/// **この1本が、要求受付パイプ側の混雑も同時に暴いた。** 書いた初日に3割ほど落ち、
+/// 原因は制御パイプではなく**要求受付パイプ**だった——4人が同時に繋ぐと、
+/// サーバが次の受付インスタンスを作る前の窓に当たった子が`ERROR_PIPE_BUSY`(231)を受け取る。
+/// **プローブが再試行していなかったので、それが「到達できなかった」に化けていた**
+/// （P2・P3の拒否側が別の理由で緑になり得た形。どちらも`last_error`まで見るよう直した）。
+///
+/// # ここが壊れると何が起きるか
+///
+/// 制御パイプは**要求と応答が交互に並ぶ1本のバイト列**である。排他が無いと、
+/// スレッドAの要求とスレッドBの要求が混ざって書かれ、**Aの応答をBが読む**。
+/// 症状は「たまに起動に失敗する」「たまに別の子のハンドルが返る」で、
+/// **どちらも再現しないので原因に辿り着けない。**
+///
+/// 測るのは3つ: 全レーンが起動できたこと、**PIDが全部違うこと**（同じ応答を
+/// 複数レーンが読んでいない）、各レーンの子がProcess Tableに載っていること
+/// （`policy_not_implemented`であって`not_registered`ではない）。
+///
+/// **3つめが要る。** PIDが違うだけなら、登録がどれか1つだけ成功していても通る。
+#[test]
+#[ignore = "starts a real spawn daemon and several AppContainer children; run through spawn-daemon"]
+fn concurrent_requests_share_one_control_pipe_without_interleaving() {
+    let (case, profile, caps) = setup("spawnd-p8");
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let spawn_cap = spawn_request_capability_sid().expect("spawn request capability");
+    let spec = domain_spec(&profile, &caps, Some(&spawn_cap));
+    let payload = spawn_request_payload();
+    let probe = super::mac_spike_tests::probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+
+    // **製品と同じ共有接続**を使う。`setup`が持つのは素の`SpawnDaemonHandle`で、
+    // 排他はそれを包む`SharedSpawnDaemon`の側にある——測りたいのはそちらである。
+    let shared = SharedSpawnDaemon::start().expect("a shared spawn daemon must start");
+    let request_pipe = shared.request_pipe().to_string();
+    eprintln!("[spawnd P9] shared daemon pid={}", shared.daemon_pid());
+
+    const LANES: usize = 4;
+    // **ハンドルはこのスレッドで全部作る**（`HANDLE`は`Send`ではないので、
+    // 最小ラッパで1回だけ渡す。`server.rs`の`accept_loop`と同じ手）。
+    let mut prepared = Vec::with_capacity(LANES);
+    for _ in 0..LANES {
+        let (stdout_read, stdout_write) =
+            appcontainer_pipe(profile.as_psid()).expect("stdout pipe");
+        crate::win_common::clear_inherit(stdout_read);
+        let (stderr_read, stderr_write) =
+            appcontainer_pipe(profile.as_psid()).expect("stderr pipe");
+        crate::win_common::clear_inherit(stderr_read);
+        let job = crate::win_common::create_job_object().expect("lineage job");
+        prepared.push((
+            SendHandle(job),
+            SendHandle(stdout_write),
+            SendHandle(stderr_write),
+            SendHandle(stdout_read),
+            SendHandle(stderr_read),
+        ));
+    }
+
+    let outcomes: Vec<(u32, String)> = std::thread::scope(|scope| {
+        let lanes: Vec<_> = prepared
+            .into_iter()
+            .map(|lane| {
+                let shared = shared.clone();
+                let spec = spec.clone();
+                let workspace = workspace.clone();
+                let probe_str = probe_str.clone();
+                let payload = payload.clone();
+                let request_pipe = request_pipe.clone();
+                scope.spawn(move || {
+                    // まるごと束縛し直す（Rust 2021の部分捕捉で`SendHandle`の意味が消えないように）。
+                    let (job, out_w, err_w, out_r, err_r) = lane;
+                    let env = crate::secret_env::build_child_env();
+                    let child = shared
+                        .spawn_top_level(TopLevelSpawn {
+                            exe: &probe_str,
+                            args: &[
+                                "--pipe-client",
+                                &request_pipe,
+                                "--pipe-payload",
+                                &payload,
+                                "--timeout-secs",
+                                "60",
+                            ],
+                            cwd: &workspace,
+                            env: &env,
+                            domain: spec,
+                            job: job.0,
+                            stdout_write: out_w.0,
+                            stderr_write: err_w.0,
+                            stdin_read: None,
+                            redirector: None,
+                        })
+                        .expect("every lane must spawn through the shared control pipe");
+                    let (out, _err) =
+                        crate::win_common::read_two_pipes_to_strings(out_r.0, err_r.0);
+                    let pid = child.pid;
+                    wait_and_close(&child, job.0);
+                    (pid, out)
+                })
+            })
+            .collect();
+        lanes
+            .into_iter()
+            .map(|lane| lane.join().expect("lane thread must not panic"))
+            .collect()
+    });
+
+    let pids: std::collections::BTreeSet<u32> = outcomes.iter().map(|(pid, _)| *pid).collect();
+    assert_eq!(
+        pids.len(),
+        LANES,
+        "同時に頼んだ{LANES}件のうちPIDが重複した。制御パイプ上で応答が入れ替わっている\
+         （別レーンの応答を読んでいる）: {pids:?}"
+    );
+    for (pid, out) in &outcomes {
+        assert_eq!(
+            deny_reason(out).as_deref(),
+            Some("policy_not_implemented"),
+            "pid={pid}の子が「台帳に無い」で断られている。同時要求のどれかが\
+             Process Tableへ登録されないまま起きている（§12・BUG-116）: {out}"
+        );
+    }
+    drop(case);
+}
+
+/// **観測**: 直接生成とDaemon経由で、トップレベルを起こすのに掛かる時間を同条件で比べる。
+///
+/// # これは合否の判定ではない
+///
+/// **性能の閾値は決めていない**ので、赤くなる条件を持たない。ここが返すのは
+/// 「④の配線で1回の起動がどれだけ延びたか」という**後続の判断のための観測値**である。
+///
+/// # 何を揃えてあるか（揃っていないものは下に書く）
+///
+/// - **同じ実行ファイル・同じ引数・同じworkspace・同じプロファイル**で撃つ
+/// - **交互に撃つ**（直接→Daemon→直接→…）。片方を先にまとめて撃つと、ACLキャッシュや
+///   ディスクの暖まりが片方だけに乗る
+/// - **Daemonは暖めてから測る**（起動とハンドシェイクは測定の外。1回捨て撃ちする）
+///
+/// **揃っていないもの＝この数字が答えないこと。**
+///
+/// - **debugビルドである。** releaseの絶対値は別物になる。**比較できるのは2本の差だけ**である
+/// - **昇格して走っている**（`preflight`が実ACLを触るため）。本番のDaemonは非昇格である
+/// - **1並列でしか撃っていない。** 同時に何本も頼んだときの待ち時間は測っていない（残課題#43）
+/// - **注入を伴う構成（CoW・lazy）は撃っていない。** あちらはsuspended窓での注入と
+///   初期化待ちが載るので、支配的な項が違う
+#[test]
+#[ignore = "measurement only (no pass/fail); run through spawn-daemon-latency"]
+fn top_level_spawn_latency_direct_versus_daemon() {
+    const TRIALS: usize = 12;
+    const EXE: &str = r"C:\Windows\System32\cmd.exe";
+    let args = ["/c", "exit", "0"];
+
+    let (case, profile, caps) = setup("spawnd-latency");
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let spawn_cap = spawn_request_capability_sid().expect("spawn request capability");
+    let domain_caps: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
+    let env = crate::secret_env::build_child_env();
+    let shared = SharedSpawnDaemon::start().expect("a shared spawn daemon must start");
+    let _ = &spawn_cap;
+
+    let direct = |workspace: &std::path::Path| {
+        spawn_with_workspace(
+            EXE,
+            &args,
+            workspace,
+            &env,
+            false,
+            profile.as_psid(),
+            NetworkCapability::Deny,
+            None,
+            &domain_caps,
+            DomainIdentity::OwnPackage,
+        )
+    };
+    let via_daemon = |workspace: &std::path::Path| {
+        spawn_with_workspace_via_daemon(
+            &shared,
+            "spawnd-latency",
+            EXE,
+            &args,
+            workspace,
+            &env,
+            false,
+            profile.as_psid(),
+            NetworkCapability::Deny,
+            None,
+            &domain_caps,
+            DomainIdentity::OwnPackage,
+            SpawnRequestAccess::Grant,
+        )
+    };
+
+    // 暖機（測定に含めない）。Daemonの起動・ハンドシェイク・初回のACL照会をここで済ませる。
+    for _ in 0..2 {
+        drop(direct(&workspace).expect("warm-up direct spawn"));
+        drop(via_daemon(&workspace).expect("warm-up daemon spawn"));
+    }
+
+    let mut direct_us: Vec<u128> = Vec::with_capacity(TRIALS);
+    let mut daemon_us: Vec<u128> = Vec::with_capacity(TRIALS);
+    for _ in 0..TRIALS {
+        let t = std::time::Instant::now();
+        let child = direct(&workspace).expect("direct spawn");
+        direct_us.push(t.elapsed().as_micros());
+        drop(child);
+
+        let t = std::time::Instant::now();
+        let child = via_daemon(&workspace).expect("daemon spawn");
+        daemon_us.push(t.elapsed().as_micros());
+        drop(child);
+    }
+
+    let summarize = |label: &str, mut v: Vec<u128>| {
+        v.sort_unstable();
+        let median = v[v.len() / 2];
+        let p90 = v[(v.len() * 9) / 10];
+        eprintln!(
+            "[latency] {label}: n={} median={median}us p90={p90}us min={}us max={}us",
+            v.len(),
+            v[0],
+            v[v.len() - 1]
+        );
+        median
+    };
+    let d = summarize("direct  ", direct_us);
+    let s = summarize("daemon  ", daemon_us);
+    eprintln!(
+        "[latency] median delta = {}us (daemon - direct); build=debug, elevated, 1 at a time",
+        s as i128 - d as i128
+    );
+    drop(case);
+}
+
 fn wait_and_close(child: &SpawnedChild, job: HANDLE) {
     unsafe {
         let _ = WaitForSingleObject(child.process, 60_000);

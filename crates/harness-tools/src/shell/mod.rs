@@ -71,7 +71,36 @@ struct RunShellInput {
     cwd: Option<String>,
 }
 
-pub struct RunShellTool;
+/// `run_shell`の実体。
+///
+/// # なぜ`Default`が「Tier2aでは使えない値」なのか
+///
+/// Tier2aのトップレベル生成はSpawn Daemon経由でしか行わない（`plans/DESIGN-MAC-PROTOCOL.md`
+/// §12）。接続を持たない`RunShellTool`はTier2aの呼び出しを**内部エラーで断る**
+/// ——直接生成へ降格させない（降格すると、遷移MACが効いていないのに効いているように見える）。
+///
+/// **`Default`は「接続なし」を意味するので、書く側が毎回それを選んでいる形にしてある。**
+/// かつてここには型と同じ名前の`const RunShellTool`があり、既存の`let tool = RunShellTool;`を
+/// 1行も直さずに通していた。**その形だと、将来書かれる箇所も黙って接続なしを掴む**
+/// ——しかも失敗するのはTier2aで実際に走った瞬間だけである（`B-10`: 無言で安全側から外れない）。
+#[derive(Default)]
+pub struct RunShellTool {
+    #[cfg(windows)]
+    spawn_daemon: Option<harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
+}
+
+impl RunShellTool {
+    /// Tier2aのセッションが持つSpawn Daemon接続を注入する。**本番のTier2a経路は必ずこちら**
+    /// （`harness-cli`の`stage_run_agent`が、preflightの後に1本だけ起こして渡す）。
+    #[cfg(windows)]
+    pub fn with_spawn_daemon(
+        spawn_daemon: harness_sandbox::tier2a::spawnd::SharedSpawnDaemon,
+    ) -> Self {
+        Self {
+            spawn_daemon: Some(spawn_daemon),
+        }
+    }
+}
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const RUN_SHELL_DEFAULT_DESCRIPTION: &str =
     "ワークスペース内でシェルコマンドを実行し、stdout+stderr+終了コードを返す。\
@@ -214,6 +243,8 @@ impl Tool for RunShellTool {
             &ctx.workspace_root,
             ctx.cow_diff_layer_dir.as_deref(),
             &ctx.shell_tier.granted_passthrough,
+            #[cfg(windows)]
+            self.spawn_daemon.as_ref(),
         )
         .await?;
 

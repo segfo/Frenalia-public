@@ -72,6 +72,8 @@ pub struct ScopeTracker {
     package_name_ever_matched: bool,
     /// harness本体のPID（分かっていれば）。**probeが間に合わなかったときの最後の手掛かり**。
     harness_pid: Option<u32>,
+    /// トップレベルAppContainer子の親。Daemon自身は明示的に除外する。
+    spawn_daemon_pid: Option<u32>,
     /// 親がharnessだったことを根拠に対象とみなした件数（推定なので数えて可視化する）。
     attributed_by_parentage: u64,
 }
@@ -85,6 +87,7 @@ impl ScopeTracker {
             unresolved: 0,
             package_name_ever_matched: false,
             harness_pid: None,
+            spawn_daemon_pid: None,
             attributed_by_parentage: 0,
         }
     }
@@ -93,6 +96,11 @@ impl ScopeTracker {
     /// プロセスについて、**親がharnessなら対象とみなす**根拠になる（実測#1の対策）。
     pub fn with_harness_pid(mut self, pid: Option<u32>) -> Self {
         self.harness_pid = pid;
+        self
+    }
+
+    pub fn with_spawn_daemon_pid(mut self, pid: Option<u32>) -> Self {
+        self.spawn_daemon_pid = pid;
         self
     }
 
@@ -116,6 +124,18 @@ impl ScopeTracker {
         info: &ProcessStartInfo,
         probe: impl FnOnce(u32) -> Option<bool>,
     ) -> bool {
+        // harness直下に居るDaemonそのものを、短命救済の親一致で対象へ入れてはいけない。
+        if self.spawn_daemon_pid == Some(info.pid) {
+            self.probed.insert(info.pid, false);
+            self.tracked.insert(
+                info.pid,
+                TrackedProcess {
+                    in_scope: false,
+                    sequence: info.process_sequence_number,
+                },
+            );
+            return false;
+        }
         if self.on_process_start(info) {
             return true;
         }
@@ -143,7 +163,10 @@ impl ScopeTracker {
                 // 最後の手掛かりとして**親がharness本体かどうか**を見る。`runas`で起こす昇格
                 // ヘルパーの親はAppInfoサービスになるため、harnessの直接の子は実質`run_shell`の
                 // AppContainer子だけである。推定なので件数を数えて可視化する。
-                if self.harness_pid.is_some() && info.parent_pid == self.harness_pid {
+                let parent_is_host = self.harness_pid.is_some() && info.parent_pid == self.harness_pid;
+                let parent_is_daemon =
+                    self.spawn_daemon_pid.is_some() && info.parent_pid == self.spawn_daemon_pid;
+                if parent_is_host || parent_is_daemon {
                     self.attributed_by_parentage = self.attributed_by_parentage.saturating_add(1);
                     self.tracked.insert(
                         info.pid,

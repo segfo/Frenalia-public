@@ -18,7 +18,8 @@
 use std::time::{Duration, Instant};
 
 use harness_sandbox::tier2a::win_appcontainer::{
-    spawn, AppContainerSession, DomainIdentity, NetworkCapability, RedirectorInject, SessionError,
+    spawn_via_daemon, AppContainerSession, DomainIdentity, NetworkCapability, RedirectorInject,
+    SessionError, SpawnRequestAccess,
 };
 
 use crate::runtime::{PreparedIsolation, PreparedServer, TransportFactory};
@@ -75,7 +76,20 @@ fn session_error(e: SessionError) -> McpError {
 }
 
 /// 本番の`Transport`実装を作るファクトリ。
-pub struct AppContainerTransportFactory;
+#[derive(Default)]
+pub struct AppContainerTransportFactory {
+    spawn_daemon: Option<harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
+}
+
+impl AppContainerTransportFactory {
+    pub fn with_spawn_daemon(
+        spawn_daemon: harness_sandbox::tier2a::spawnd::SharedSpawnDaemon,
+    ) -> Self {
+        Self {
+            spawn_daemon: Some(spawn_daemon),
+        }
+    }
+}
 
 impl TransportFactory for AppContainerTransportFactory {
     fn create(&self, prepared: &PreparedServer) -> Result<Box<dyn Transport>, McpError> {
@@ -126,7 +140,12 @@ impl TransportFactory for AppContainerTransportFactory {
             NetworkCapability::Deny
         };
 
-        let child = spawn(
+        let daemon = self.spawn_daemon.as_ref().ok_or_else(|| {
+            spawn_error("MCP stdio has no Spawn Daemon connection (internal error)".to_string())
+        })?;
+        let child = spawn_via_daemon(
+            daemon,
+            &decl.id,
             &decl.command,
             &args,
             &cwd,
@@ -141,6 +160,15 @@ impl TransportFactory for AppContainerTransportFactory {
             // §22.1.1: D-38でMCPサーバは**サーバごとに専用プロファイル**なので、package SIDが
             // そのままドメインになる。capability群は持たない（§22.2.2で対象外と決着済み）。
             DomainIdentity::OwnPackage,
+            // §22.2.2: MCPサーバの`process`宣言の**既定は`deny`**であり、その意味は
+            // 「spawn要求用capabilityを積まない＝要求受付パイプに到達すらできない」という
+            // 二重目のdenyである。宣言キー`process`（＝`broker`を選べるようにする側）は
+            // まだ入っていないので、**いまは既定だけが在る**。
+            //
+            // **積む側へ倒してはいけない。** D-38はMCPサーバを「ユーザーが宣言した第三者コード」
+            // ＝系の中で最も信頼していないコードと位置づけており、そこがDaemonへ
+            // 話しかけられる状態を、宣言も承認も無いまま既定にすることになる。
+            SpawnRequestAccess::Withhold,
         )
         .map_err(|e| spawn_error(e.to_string()))?;
 
@@ -277,7 +305,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            AppContainerTransportFactory.create(&prepared),
+            AppContainerTransportFactory::default().create(&prepared),
             Err(McpError::Spawn { .. })
         ));
     }

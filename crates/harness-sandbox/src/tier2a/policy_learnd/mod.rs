@@ -59,6 +59,9 @@ pub struct LearnPolicy {
     /// 権限が自動で広がることはない（D-42: 適用は常にユーザーの明示操作）。
     #[serde(default)]
     pub harness_pid: Option<u32>,
+    /// トップレベル子の親になるSpawn Daemon。`None`は従来のパス1/Tier1経路。
+    #[serde(default)]
+    pub spawn_daemon_pid: Option<u32>,
     /// ポリシーエディタの記録モード（Tier1、`plans/POLICY-EDITOR-TOMOYO-DIG.md`）専用。
     /// `true`なら拒否だけでなく全アクセス（成功も含む）を記録する（record-all）。
     ///
@@ -100,6 +103,17 @@ pub enum LearnResponse {
     /// **harnessは止めない**（D-43 fail-open）——その事実は`fs-audit.jsonl`の制御レコードにも残る。
     Started {
         etw_available: bool,
+        /// 受理した値をechoし、古い収集器が新しい欄を無視していないことを確認する。
+        ///
+        /// **`default`が要る。** 収集器はプロセスをまたいで生き残る常駐で（D-56 段階2。
+        /// 起動のたびに立て直すとそのたびUACが出るため）、**前のビルドのものが動いている
+        /// ことがある**。`default`が無いと、古い収集器の応答は欄が無いという理由で
+        /// 電文の解釈そのものに失敗し、「malformed response」になる——止まること自体は
+        /// 正しいが、**版ずれだと読めない**（`B-10`: 失敗の理由を潰さない）。
+        /// `default`を置くと`None`として解釈が通り、下の照合が
+        /// 「要求した値をechoしていない」という本来の文面で断る。
+        #[serde(default)]
+        spawn_daemon_pid: Option<u32>,
     },
     /// 現世代を畳んだ。**この世代で**書けた件数を返す（累積ではない——累積にすると
     /// UIが「今回の記録で観測した件数」として出す数と食い違う）。
@@ -147,12 +161,13 @@ mod tests {
             workspace_root: PathBuf::from("C:/work"),
             fs_audit_log_path: PathBuf::from("C:/work/.harness/sandbox/session-x/fs-audit.jsonl"),
             harness_pid: None,
+            spawn_daemon_pid: None,
             record_all: false,
         });
 
         assert_eq!(
             serde_json::to_string(&request).unwrap(),
-            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.1-2","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":null,"record_all":false}}"#
+            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.1-2","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":null,"spawn_daemon_pid":null,"record_all":false}}"#
         );
     }
 
@@ -190,12 +205,13 @@ mod tests {
             workspace_root: PathBuf::from("C:/work"),
             fs_audit_log_path: PathBuf::from("C:/work/.harness/sandbox/session-x/fs-audit.jsonl"),
             harness_pid: Some(4242),
+            spawn_daemon_pid: None,
             record_all: true,
         });
 
         assert_eq!(
             serde_json::to_string(&request).unwrap(),
-            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.4242-1700000000","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":4242,"record_all":true}}"#
+            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.4242-1700000000","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":4242,"spawn_daemon_pid":null,"record_all":true}}"#
         );
     }
 
@@ -227,14 +243,73 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&LearnResponse::Started {
-                etw_available: true
+                etw_available: true,
+                spawn_daemon_pid: Some(77),
             })
             .unwrap(),
-            r#"{"Started":{"etw_available":true}}"#
+            r#"{"Started":{"etw_available":true,"spawn_daemon_pid":77}}"#
         );
         assert_eq!(
             serde_json::to_string(&LearnResponse::TornDown { denials_written: 7 }).unwrap(),
             r#"{"TornDown":{"denials_written":7}}"#
         );
+    }
+
+    /// **生き残っている古い収集器の応答が「読める」こと**を固定する。
+    ///
+    /// 収集器はプロセスをまたいで常駐する（D-56 段階2）ので、**前のビルドのものが
+    /// 動いていることがある**。それが返す`Started`には`spawn_daemon_pid`が無い。
+    /// ここが読めないと、断り方が「版がずれている」ではなく
+    /// 「電文が壊れている」になり、原因が消える（`B-10`）。
+    ///
+    /// **読めたうえで断るのは`client`の照合の仕事である**（対の側は下のテスト）。
+    #[test]
+    fn a_started_from_an_older_collector_parses_as_no_daemon_pid() {
+        let parsed: LearnResponse =
+            serde_json::from_str(r#"{"Started":{"etw_available":true}}"#).expect(
+                "古い収集器の応答が読めない。版ずれが「電文が壊れている」に化けて原因が消える",
+            );
+        assert!(matches!(
+            parsed,
+            LearnResponse::Started {
+                etw_available: true,
+                spawn_daemon_pid: None,
+            }
+        ));
+    }
+
+    /// **対の側**（`B-35`）: Daemon PIDを要求したのにechoが返らなければ、それは版ずれである。
+    ///
+    /// 上のテストだけだと「読めた」で終わり、**読めたあと素通りする実装でも緑になる。**
+    /// ここで測るのは`client`が使うのと同じ比較（要求した値とechoした値の一致）である。
+    #[test]
+    fn a_missing_echo_is_distinguishable_from_a_matching_one() {
+        let older: LearnResponse =
+            serde_json::from_str(r#"{"Started":{"etw_available":true}}"#).expect("parse");
+        let current: LearnResponse =
+            serde_json::from_str(r#"{"Started":{"etw_available":true,"spawn_daemon_pid":77}}"#)
+                .expect("parse");
+        let echoed = |response: &LearnResponse| match response {
+            LearnResponse::Started {
+                spawn_daemon_pid, ..
+            } => *spawn_daemon_pid,
+            _ => unreachable!("Startedを読ませている"),
+        };
+
+        let requested = Some(77u32);
+        assert_ne!(
+            echoed(&older),
+            requested,
+            "古い収集器の応答が「要求どおりecho した」と読めてしまう。\
+             Daemonが親になった子をETWのスコープ判定が拾えないまま記録が進む"
+        );
+        assert_eq!(
+            echoed(&current),
+            requested,
+            "現行の収集器の応答が一致と読めない。全セッションが版ずれ扱いで止まる"
+        );
+
+        // パス1・Tier1経路（Daemon PIDを要求しない）では、古い収集器で構わない。
+        assert_eq!(echoed(&older), None, "要求していない側は一致として通る");
     }
 }

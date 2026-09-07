@@ -44,6 +44,39 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     } = sandbox;
     let mut tools = tools;
 
+    // Tier2a preflightが成功した後、このhost process用のDaemonを1本だけ起こす。
+    // 起動できなければTier2aセッション自体を開始せず、直接spawnへは降格しない。
+    #[cfg(windows)]
+    let spawn_daemon = if shell_tier.tier == harness_core::ShellTier::Tier2a {
+        match harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start() {
+            Ok(daemon) => {
+                tools.register(Arc::new(harness_tools::RunShellTool::with_spawn_daemon(
+                    daemon.clone(),
+                )));
+                Some(daemon)
+            }
+            Err(error) => {
+                eprintln!("error: could not start the Tier2a Spawn Daemon: {error}");
+                // **Daemonが起こせないならTier2aセッションを始めない**（直接生成へ降格しない、
+                // `plans/DESIGN-MAC-PROTOCOL.md` §12）。preflightが既に付けたACEと
+                // プロファイルはここで撤収する。
+                //
+                // [BUG-103] **剥がせなかったノードは名前で出す。** 正常終了の末尾と同じ扱いに
+                // する——失敗パスだけ黙ると、撤収が1件も成功しなくても何も出ない状態が
+                // 早期returnの側にだけ残る（`B-09`）。
+                let outcome = harness_sandbox::tier2a::session_profile::end_session(
+                    &harness_sandbox::tier2a::win_appcontainer::revoke_session_grant,
+                );
+                if let Some(summary) = outcome.summary() {
+                    eprintln!("note: {summary}");
+                }
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
     let _session_proxy = if net_proxy.domain_policy_enabled {
         match harness_tools::net_proxy::spawn_local_proxy(&net_proxy).await {
             Ok(Some(proxy)) => {
@@ -422,6 +455,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 workspace_root: workspace_root.clone(),
                 fs_audit_log_path: sink,
                 harness_pid: Some(std::process::id()),
+                spawn_daemon_pid: spawn_daemon.as_ref().map(|daemon| daemon.daemon_pid()),
                 record_all: false,
             };
 
@@ -504,7 +538,12 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     mcp_startup.drop_servers_needing_egress_enforcement();
 
     let (mut mcp_runtime, mcp_facts, _mcp_proxies) =
-        super::mcp::launch_mcp_servers(mcp_startup, &mut tools);
+        super::mcp::launch_mcp_servers(
+            mcp_startup,
+            &mut tools,
+            #[cfg(windows)]
+            spawn_daemon.as_ref(),
+        );
 
     let mut tool_ctx = ToolCtx {
         workspace_root: workspace_root.clone(),
@@ -612,6 +651,12 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // 落ちるまでのわずかな間だけ出口強制の無いサーバが生きていることになる。プロセスの生存自体は
     // Job Objectに紐付いているので、ここを通らずに落ちた場合も道連れで終了する。
     mcp_runtime.shutdown();
+
+    // 子とMCPを止めた後、WFP・収集器より先に生成者を畳む。
+    #[cfg(windows)]
+    if let Some(daemon) = spawn_daemon.as_ref() {
+        daemon.shutdown();
+    }
 
     // セッション終了時のWFP netfilterdのteardown（headless・対話モード共通の末尾）。
     // ここに到達せずにmainが早期returnした場合（このブロックより前のエラーパス）は、

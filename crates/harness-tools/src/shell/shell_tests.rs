@@ -172,7 +172,7 @@ mod tests {
     #[tokio::test]
     async fn run_shell_captures_stdout_and_exit_code() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let command = "echo hello";
 
         let out = tool
@@ -195,7 +195,7 @@ mod tests {
         let mut context = ToolCtx::new(dir.path().to_path_buf());
         context.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier3);
 
-        let spec = RunShellTool.spec_for_ctx(&context);
+        let spec = RunShellTool::default().spec_for_ctx(&context);
 
         assert!(spec.description.contains("`sh -c`"), "{}", spec.description);
         assert!(
@@ -242,7 +242,7 @@ mod tests {
         let mut context = ToolCtx::new(dir.path().to_path_buf());
         context.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier1);
 
-        let spec = RunShellTool.spec_for_ctx(&context);
+        let spec = RunShellTool::default().spec_for_ctx(&context);
 
         assert!(spec.description.contains("--net-allow-app"));
         assert!(!spec.description.contains("Incusコンテナ"));
@@ -270,7 +270,7 @@ mod tests {
         context.staging.mode = StagingMode::Staged;
         context.shell_sees_staged_writes = false;
 
-        let out = RunShellTool
+        let out = RunShellTool::default()
             .call(json!({ "command": "echo hello" }), &context)
             .await
             .unwrap();
@@ -306,7 +306,7 @@ mod tests {
         context.shell_sees_staged_writes = true;
         context.vm_sandbox = Some(Arc::new(MockVmShellExecutor));
 
-        let out = RunShellTool
+        let out = RunShellTool::default()
             .call(json!({ "command": "echo hello" }), &context)
             .await
             .unwrap();
@@ -324,7 +324,7 @@ mod tests {
     #[tokio::test]
     async fn run_shell_records_launched_windows_shell() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let out = tool
             .call(
                 json!({ "command": "Write-Output hello" }),
@@ -348,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn run_shell_propagates_native_exit_code_exactly() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let out = tool
             .call(
                 json!({ "command": "cmd /c exit 7" }),
@@ -365,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn run_shell_native_success_exit_code_stays_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let out = tool
             .call(
                 json!({ "command": "cmd /c exit 0" }),
@@ -409,7 +409,7 @@ mod tests {
                 "失敗したcmdlet",
             ),
         ] {
-            let tool = RunShellTool;
+            let tool = RunShellTool::default();
             let out = tool
                 .call(
                     json!({ "command": command }),
@@ -452,7 +452,7 @@ mod tests {
                 "末尾コメント付きでも判定が飲まれない（区切りが改行である根拠）",
             ),
         ] {
-            let tool = RunShellTool;
+            let tool = RunShellTool::default();
             let out = tool
                 .call(
                     json!({ "command": command }),
@@ -481,7 +481,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("japanese.txt");
         std::fs::write(&file_path, "こんにちは日本語テスト").unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let out = tool
             .call(
                 json!({ "command": format!("Get-Content -Raw '{}'", file_path.display()) }),
@@ -515,7 +515,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("テスト - コピー.txt");
         std::fs::write(&file_path, "x").unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         // 既存の`run_shell_returns_japanese_file_content_without_mojibake`と同じく絶対パスで
         // 指定する（相対パス解決はTierごとのcwd事情が混ざるため、ここでは符号化だけを見る）。
         let out = tool
@@ -547,7 +547,7 @@ mod tests {
     #[cfg(windows)]
     async fn assert_literal_reaches_powershell_intact(literal: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let out = tool
             .call(
                 json!({ "command": format!(
@@ -583,7 +583,7 @@ mod tests {
         let probe = assert_literal_reaches_powershell_intact(LITERAL).await;
 
         let dir = tempfile::tempdir().unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let out = tool
             .call(
                 json!({ "command": format!("Write-Output '{LITERAL}'") }),
@@ -620,7 +620,7 @@ mod tests {
         assert!(probe.contains("CP=97,166,98"), "{probe}");
 
         let dir = tempfile::tempdir().unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let out = tool
             .call(
                 json!({ "command": "Write-Output 'a¦b'" }),
@@ -648,7 +648,7 @@ mod tests {
     #[tokio::test]
     async fn run_shell_does_not_leak_command_env_var_to_grandchild() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let out = tool
             .call(
                 json!({ "command": "cmd /c echo [%HARNESS_RUN_SHELL_COMMAND%]" }),
@@ -804,7 +804,7 @@ mod tests {
     #[tokio::test]
     async fn run_shell_times_out() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         #[cfg(windows)]
         let command = "Start-Sleep -Seconds 5";
         #[cfg(not(windows))]
@@ -827,7 +827,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let outside = std::env::temp_dir().join("harness-m12-outside-test.txt");
         let _ = std::fs::remove_file(&outside);
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let command = format!(
             "Set-Content -Path '{}' -Value 'blocked' -ErrorAction Stop",
             outside.display()
@@ -860,7 +860,7 @@ mod tests {
     async fn run_shell_tier1_allows_write_inside_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let inside = dir.path().join("tier1-inside-cwd.txt");
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
         let command = format!(
             "Set-Content -Path '{}' -Value 'allowed' -ErrorAction Stop",
             inside.display()
@@ -976,7 +976,9 @@ mod tests {
 
         let mut ctx = ToolCtx::new(dir.path().to_path_buf());
         ctx.shell_tier = selection;
-        let tool = RunShellTool;
+        let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start()
+            .expect("Tier2a product path requires a Spawn Daemon");
+        let tool = RunShellTool::with_spawn_daemon(daemon);
 
         // (a) ワークスペース内への書込（絶対パス）→ 成功する（再帰ACL付与でパッケージSIDが
         //     workspace配下に書込可になっている証拠）。
@@ -1049,6 +1051,57 @@ mod tests {
             "Tier2a must not read outside-workspace secrets (T-04): {}",
             out.content
         );
+
+        // (e) **製品経路から要求受付パイプへ1往復する**（`plans/DESIGN-MAC-PROTOCOL.md` §12）。
+        //
+        // 断られること自体は`spawnd_e2e_tests`のP1が測っているが、あちらは**電文の
+        // `DomainSpec`をテストが手で組む**ので、`run_shell`のアダプタが本当に
+        // spawn要求用capabilityを積んでいるかは測れない。ここが製品側の対である。
+        //
+        // 見るのは**断る理由**である。`policy_not_implemented`なら
+        // 「あなたが誰かは分かった（Process Tableに載っている）が、遷移を許すかを
+        // 判定する仕組みがまだ無い」で、`not_registered`なら登録が効いていない（BUG-116の形）。
+        // **同じ値へ丸めると、常に拒否する実装でも通る**（`B-35`）。
+        let roundtrip = r#"
+$raw = $env:HARNESS_SPAWN_REQUEST_PIPE
+if (-not $raw) { Write-Output 'NO_PIPE_ENV'; exit 0 }
+$name = $raw -replace '^\\\\\.\\pipe\\', ''
+$c = New-Object System.IO.Pipes.NamedPipeClientStream('.', $name, 'InOut')
+try { $c.Connect(5000) } catch { Write-Output ('CONNECT_FAILED:' + $_.Exception.Message); exit 0 }
+$body = [Text.Encoding]::UTF8.GetBytes('{"kind":"spawn","exe":"git.exe","args":["status"],"cwd":"C:/"}')
+$c.Write([BitConverter]::GetBytes([int]$body.Length), 0, 4)
+$c.Write($body, 0, $body.Length)
+$c.Flush()
+$hdr = New-Object byte[] 4
+if ($c.Read($hdr, 0, 4) -ne 4) { Write-Output 'NO_REPLY_HEADER'; exit 0 }
+$n = [BitConverter]::ToInt32($hdr, 0)
+$buf = New-Object byte[] $n
+$got = 0
+while ($got -lt $n) { $r = $c.Read($buf, $got, $n - $got); if ($r -le 0) { break }; $got += $r }
+Write-Output ('REPLY:' + [Text.Encoding]::UTF8.GetString($buf, 0, $got))
+"#;
+        let out = tool
+            .call(json!({ "command": roundtrip }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !out.content.contains("NO_PIPE_ENV"),
+            "run_shellの子に要求受付パイプの名前が届いていない。\
+             Daemon経由になっていないか、環境変数の受け渡しが落ちている: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("policy_not_implemented"),
+            "run_shellの子が要求受付パイプで `policy_not_implemented` を受け取れていない。\
+             `not_registered` なら Process Table への登録が Resume より前に効いていない（BUG-116の形）、\
+             接続自体が失敗しているなら spawn要求用capability を積んでいない: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("not_registered"),
+            "Daemonが起こした子なのに「台帳に無い」で断られている（§12・BUG-116）: {}",
+            out.content
+        );
     }
 
     /// アプリ単位network制御（軸1、D-10/D-11）の実機E2E。Tier2a配下で、許可リストに一致する
@@ -1091,7 +1144,9 @@ mod tests {
         ctx.net_app = NetAppPolicy {
             allow_apps: vec!["powershell".to_string(), "pwsh".to_string()],
         };
-        let tool = RunShellTool;
+        let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start()
+            .expect("Tier2a product path requires a Spawn Daemon");
+        let tool = RunShellTool::with_spawn_daemon(daemon);
         // TCPソケットを直接開くprobe（HTTP_PROXYに依存しない、capability機構そのものを見る）。
         let connect_probe = "try { \
             $c = New-Object Net.Sockets.TcpClient; \
@@ -1170,7 +1225,7 @@ mod tests {
             allow_domains: vec!["localhost".to_string()],
             ..Default::default()
         };
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
 
         let command = format!(
             "curl.exe -s -w 'ALLOWED_STATUS=%{{http_code}}' http://localhost:{target_port}/; \
@@ -1219,7 +1274,7 @@ mod tests {
             allow_domains: vec!["example.com".to_string()],
             ..Default::default()
         };
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
 
         let out = tool
             .call(
@@ -1253,7 +1308,7 @@ mod tests {
             audit_log_path: Some(dir.path().join("net-audit.jsonl")),
             ..Default::default()
         };
-        let tool = RunShellTool;
+        let tool = RunShellTool::default();
 
         let out = tool
             .call(

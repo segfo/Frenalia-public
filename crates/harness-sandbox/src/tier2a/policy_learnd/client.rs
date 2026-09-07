@@ -93,10 +93,19 @@ impl PolicyLearnHandle {
         let response = read_framed_timeout(self.pipe, START_RESPONSE_TIMEOUT)
             .map_err(|e| LearnError::Ipc(e.to_string()))?;
         match serde_json::from_slice::<LearnResponse>(&response) {
-            Ok(LearnResponse::Started { etw_available }) => {
+            Ok(LearnResponse::Started {
+                etw_available,
+                spawn_daemon_pid,
+            }) if spawn_daemon_pid == policy.spawn_daemon_pid => {
                 self.etw_available = etw_available;
                 Ok(())
             }
+            Ok(LearnResponse::Started { .. }) => Err(LearnError::Ipc(
+                "the collector did not echo the requested Spawn Daemon PID; it is an older build \
+                 that ignores the field (stop the resident collector and let this session start a \
+                 fresh one)"
+                    .to_string(),
+            )),
             Ok(LearnResponse::Err(message)) => Err(LearnError::Rejected(message)),
             Ok(other) => Err(LearnError::Ipc(format!("unexpected response: {other:?}"))),
             Err(e) => Err(LearnError::Ipc(format!("malformed response: {e}"))),
@@ -492,7 +501,16 @@ fn handshake(pipe: HANDLE, policy: &LearnPolicy) -> Result<bool, LearnError> {
     let response = read_framed_timeout(pipe, START_RESPONSE_TIMEOUT)
         .map_err(|e| LearnError::Ipc(e.to_string()))?;
     match serde_json::from_slice::<LearnResponse>(&response) {
-        Ok(LearnResponse::Started { etw_available }) => Ok(etw_available),
+        Ok(LearnResponse::Started {
+            etw_available,
+            spawn_daemon_pid,
+        }) if spawn_daemon_pid == policy.spawn_daemon_pid => Ok(etw_available),
+        Ok(LearnResponse::Started { .. }) => Err(LearnError::Ipc(
+            "the collector did not echo the requested Spawn Daemon PID; it is an older build \
+                 that ignores the field (stop the resident collector and let this session start a \
+                 fresh one)"
+                    .to_string(),
+        )),
         Ok(LearnResponse::Err(message)) => Err(LearnError::Rejected(message)),
         Ok(other) => Err(LearnError::Ipc(format!("unexpected response: {other:?}"))),
         Err(e) => Err(LearnError::Ipc(format!("malformed response: {e}"))),
@@ -551,6 +569,7 @@ mod client_tests {
             workspace_root: PathBuf::from("C:/work"),
             fs_audit_log_path: sink,
             harness_pid: None,
+            spawn_daemon_pid: None,
             record_all: false,
         }
     }

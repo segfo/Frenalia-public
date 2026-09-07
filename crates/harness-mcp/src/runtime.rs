@@ -484,7 +484,22 @@ fn transport_gate(decl: &McpServerDecl, gates: &McpGates) -> Option<SkipReason> 
 /// 差し替え境界としての[`TransportFactory`]はそのまま残す——テストが台本トランスポートを
 /// 差し込めるのはここで、本番コードに「隔離なしのstdio」を置かずに済ませるための分割線
 /// でもある（`plans/DESIGN-MCP.md` §3.4）。
-pub struct DefaultTransportFactory;
+#[derive(Default)]
+pub struct DefaultTransportFactory {
+    #[cfg(windows)]
+    spawn_daemon: Option<harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
+}
+
+impl DefaultTransportFactory {
+    #[cfg(windows)]
+    pub fn with_spawn_daemon(
+        spawn_daemon: harness_sandbox::tier2a::spawnd::SharedSpawnDaemon,
+    ) -> Self {
+        Self {
+            spawn_daemon: Some(spawn_daemon),
+        }
+    }
+}
 
 impl TransportFactory for DefaultTransportFactory {
     fn create(&self, prepared: &PreparedServer) -> Result<Box<dyn Transport>, McpError> {
@@ -492,7 +507,17 @@ impl TransportFactory for DefaultTransportFactory {
             McpTransportKind::Stdio => {
                 #[cfg(windows)]
                 {
-                    crate::transport_stdio::AppContainerTransportFactory.create(prepared)
+                    let Some(daemon) = self.spawn_daemon.as_ref() else {
+                        return Err(McpError::Spawn {
+                            id: prepared.decl.id.clone(),
+                            reason: "MCP stdio has no Spawn Daemon connection (internal error)"
+                                .to_string(),
+                        });
+                    };
+                    crate::transport_stdio::AppContainerTransportFactory::with_spawn_daemon(
+                        daemon.clone(),
+                    )
+                    .create(prepared)
                 }
                 #[cfg(not(windows))]
                 {

@@ -699,6 +699,9 @@ pub struct App {
     /// `App`が持つのは`tui::run`のスコープで`SessionGrants`より**後**に作られるためで、
     /// これによりnetfilterdの`Teardown`がAppContainerプロファイルの削除より先に走る
     /// （`SharedNetfilter`のdoc「宣言順」）。
+    /// 最初のパス2まで起動せず、その後はTUI終了まで再利用する。構造体fieldの宣言順で
+    /// dropされるため、WFP・収集器より前に置いて生成者を先に畳む。
+    pub spawn_daemon: crate::record_net::SharedSpawnDaemon,
     pub wfp: crate::record_net::SharedNetfilter,
     /// ETW収集器。**プロセスの寿命で持つ**（D-56 段階2、`SharedCollector`）。
     /// `wfp`と同じ理由でここに置く——記録のたびに起こし直すとそのたびUACが出る。
@@ -837,6 +840,7 @@ impl App {
             quit_after_run: false,
             wfp: crate::record_net::SharedNetfilter::hold(),
             collector: crate::record::SharedCollector::hold(),
+            spawn_daemon: crate::record_net::SharedSpawnDaemon::hold(),
             sessions: Vec::new(),
             selected_session: 0,
             view: None,
@@ -1850,6 +1854,7 @@ impl App {
                     // 起こし直すと、そのたびUACが出る。
                     wfp: self.wfp.clone(),
                     collector: self.collector.clone(),
+                    spawn_daemon: self.spawn_daemon.clone(),
                 })))
             }
         }

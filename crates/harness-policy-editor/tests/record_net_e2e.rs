@@ -395,6 +395,7 @@ fn a_second_pass2_in_the_same_process_reuses_the_daemon_and_still_enforces() {
     // 収集器も同じ順序で持つ（D-56 段階2）。このE2Eが測るのはWFPの再利用だが、
     // 収集器を渡さないと**そもそもパス2が組み立てられない**ので、製品と同じ形で持つ。
     let collector = harness_policy_editor::record::SharedCollector::hold();
+    let spawn_daemon = harness_policy_editor::record_net::SharedSpawnDaemon::hold();
 
     let policy =
         harness_policy_editor::policy_file::load(workspace_root).expect("load policy.json");
@@ -415,6 +416,7 @@ fn a_second_pass2_in_the_same_process_reuses_the_daemon_and_still_enforces() {
             cancel: &never_cancel,
             wfp: &wfp,
             collector: &collector,
+            spawn_daemon: &spawn_daemon,
         };
         let mut reused: Option<bool> = None;
         let mut stdout = String::new();

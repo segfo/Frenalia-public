@@ -432,7 +432,7 @@ fn run_record_net(
     command: &[String],
 ) -> ExitCode {
     use harness_policy_editor::record_net::{
-        NetRecordEvent, RecordNetRequest, SessionGrants, SharedNetfilter,
+        NetRecordEvent, RecordNetRequest, SessionGrants, SharedNetfilter, SharedSpawnDaemon,
     };
 
     // パス2が開けた穴の寿命は**このプロセスの寿命**（D-37）。早期returnの各点でも必ず撤収が
@@ -444,6 +444,7 @@ fn run_record_net(
     let wfp = SharedNetfilter::hold();
     // 収集器も同じ理由・同じ順序で持つ（`_grants`より後＝`Teardown`がプロファイル削除より先）。
     let collector = harness_policy_editor::record::SharedCollector::hold();
+    let spawn_daemon = SharedSpawnDaemon::hold();
     let workspace_root = resolve_workspace(workspace);
     let limit = resolve_limit(limit);
 
@@ -524,6 +525,7 @@ fn run_record_net(
         cancel: &never_cancel,
         wfp: &wfp,
         collector: &collector,
+        spawn_daemon: &spawn_daemon,
     };
 
     let mut net_count = 0u64;

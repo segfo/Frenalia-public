@@ -465,6 +465,7 @@ fn run_learn(
         workspace_root: workspace_root.to_path_buf(),
         fs_audit_log_path: sink,
         harness_pid: Some(std::process::id()),
+        spawn_daemon_pid: None,
         record_all: false,
     }) {
         Ok(handle) => Some(handle),

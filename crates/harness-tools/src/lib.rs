@@ -86,7 +86,7 @@ impl ToolRegistry {
         reg.register(Arc::new(ReadFileTool));
         reg.register(Arc::new(WriteFileTool));
         reg.register(Arc::new(EditFileTool));
-        reg.register(Arc::new(RunShellTool));
+        reg.register(Arc::new(RunShellTool::default()));
         reg.register(Arc::new(GrepTool));
         reg.register(Arc::new(GlobTool));
         reg.register(Arc::new(WebFetchTool));

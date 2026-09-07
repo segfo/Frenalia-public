@@ -247,6 +247,7 @@ pub(super) async fn prepare_mcp_servers(
 pub(super) fn launch_mcp_servers(
     startup: McpStartup,
     tools: &mut ToolRegistry,
+    #[cfg(windows)] spawn_daemon: Option<&harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
 ) -> (
     McpRuntime,
     Vec<harness_core::McpServerFact>,
@@ -266,9 +267,16 @@ pub(super) fn launch_mcp_servers(
     }
 
     // トランスポート種別で本番の実装を振り分ける唯一の場所（`DefaultTransportFactory`）。
+    #[cfg(windows)]
+    let factory = match spawn_daemon {
+        Some(daemon) => harness_mcp::DefaultTransportFactory::with_spawn_daemon(daemon.clone()),
+        None => harness_mcp::DefaultTransportFactory::default(),
+    };
+    #[cfg(not(windows))]
+    let factory = harness_mcp::DefaultTransportFactory::default();
     let runtime = McpRuntime::start(
         prepared,
-        &harness_mcp::DefaultTransportFactory,
+        &factory,
         env!("CARGO_PKG_VERSION"),
         &mut skipped,
     );

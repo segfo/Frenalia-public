@@ -143,7 +143,8 @@ impl Generation {
             session,
             sink_path,
             tracker: ScopeTracker::new(policy.session_profile.clone())
-                .with_harness_pid(policy.harness_pid),
+                .with_harness_pid(policy.harness_pid)
+                .with_spawn_daemon_pid(policy.spawn_daemon_pid),
             tree: ProcessTree::new(),
             dropped: Dropped::default(),
             written: 0,
@@ -253,7 +254,13 @@ fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
                 let generation = Generation::start(&policy, sink_path);
                 let etw_available = generation.etw_available();
                 current = Some(generation);
-                send(pipe, &LearnResponse::Started { etw_available })?;
+                send(
+                    pipe,
+                    &LearnResponse::Started {
+                        etw_available,
+                        spawn_daemon_pid: policy.spawn_daemon_pid,
+                    },
+                )?;
             }
             Ok(LearnRequest::StopCollect) => {
                 let written = match current.take() {

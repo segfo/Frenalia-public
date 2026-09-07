@@ -161,6 +161,8 @@ pub struct RecordNetRequest<'a> {
     /// Tier2aなのでpackage SIDが効く——`record_all=true`のときにprobeを使えなかった制約
     /// （`LearnPolicy.record_all`のdoc）はここでは当てはまらない。
     pub collector: &'a crate::record::SharedCollector,
+    /// このpolicy editor processが共有するSpawn Daemon。最初のパス2でだけ遅延起動する。
+    pub spawn_daemon: &'a SharedSpawnDaemon,
 }
 
 /// パス2の進行。呼び出し側（CLI・TUI）が表示に使う。
@@ -296,6 +298,8 @@ pub enum RecordNetError {
          （fail-closed——強制されていないのではなく、ソケットを1つも作れません）"
     )]
     NoWfp(String),
+    #[error("Spawn Daemonを起動または利用できませんでした: {0}")]
+    SpawnDaemon(String),
     #[error("Local Proxyを起動できませんでした: {0}")]
     NoProxy(String),
     #[error("tokioランタイムを起こせませんでした: {0}")]
@@ -319,6 +323,7 @@ impl RecordNetError {
             RecordNetError::SessionDir { .. } => "session_dir",
             RecordNetError::NotTier2a { .. } => "not_tier2a",
             RecordNetError::NoWfp(_) => "no_wfp",
+            RecordNetError::SpawnDaemon(_) => "spawn_daemon",
             RecordNetError::NoProxy(_) => "no_proxy",
             RecordNetError::Runtime(_) => "runtime",
             RecordNetError::Spawn(_) => "spawn",
@@ -806,6 +811,36 @@ pub struct SharedNetfilter {
     inner: std::sync::Arc<std::sync::Mutex<harness_sandbox::tier2a::netfilterd::NetfilterSession>>,
 }
 
+/// policy editorの最初のパス2で遅延起動し、TUI終了まで使い回すSpawn Daemon。
+#[derive(Clone, Default)]
+pub struct SharedSpawnDaemon {
+    inner: std::sync::Arc<
+        std::sync::Mutex<Option<harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>>,
+    >,
+}
+
+impl SharedSpawnDaemon {
+    pub fn hold() -> Self {
+        Self::default()
+    }
+
+    fn ensure_started(
+        &self,
+    ) -> Result<harness_sandbox::tier2a::spawnd::SharedSpawnDaemon, String> {
+        let mut slot = self
+            .inner
+            .lock()
+            .map_err(|_| "Spawn Daemon holder mutex was poisoned".to_string())?;
+        if let Some(daemon) = slot.as_ref() {
+            return Ok(daemon.clone());
+        }
+        let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start()
+            .map_err(|error| error.to_string())?;
+        *slot = Some(daemon.clone());
+        Ok(daemon)
+    }
+}
+
 impl SharedNetfilter {
     pub fn hold() -> Self {
         Self::default()
@@ -1064,6 +1099,11 @@ fn run_pass2<'a>(
     // ここへ来た＝**実際にTier2aへ着地した**（直前の分岐が他のTierを弾いている）。
     facts.shell_tier = Some(selection.tier.label().to_string());
     on_event(NetRecordEvent::Tier2aReady);
+    // パス1では起こさない。Tier2a preflightが成功したこの地点が、最初のパス2だけの起動点。
+    let spawn_daemon = request
+        .spawn_daemon
+        .ensure_started()
+        .map_err(RecordNetError::SpawnDaemon)?;
     for warning in &selection.passthrough_warnings {
         warn(warning.clone(), warnings, on_event);
     }
@@ -1259,6 +1299,7 @@ fn run_pass2<'a>(
         workspace_root: request.workspace_root.to_path_buf(),
         fs_audit_log_path: dir.audit_log_path(),
         harness_pid: Some(std::process::id()),
+        spawn_daemon_pid: Some(spawn_daemon.daemon_pid()),
         // **パス2はdeny-only。** 全アクセスを採ると、強制が効いている状態の「触れた記録」に
         // なってしまい、パス1（隔離しないTier0での記録）と意味が混ざる。
         record_all: false,
@@ -1390,14 +1431,17 @@ fn run_pass2<'a>(
     ));
 
     let (child, _shell_label) =
-        harness_sandbox::tier2a::win_appcontainer::spawn_shell_in_workspace(WorkspaceSpawn {
-            cwd: request.cwd.to_path_buf(),
-            env,
-            workspace_root: request.workspace_root.to_path_buf(),
-            cow_diff_layer_dir: None,
-            granted_passthrough: selection.granted_passthrough.clone(),
-            net_capability,
-        })
+        harness_sandbox::tier2a::win_appcontainer::spawn_shell_in_workspace_via_daemon(
+            &spawn_daemon,
+            WorkspaceSpawn {
+                cwd: request.cwd.to_path_buf(),
+                env,
+                workspace_root: request.workspace_root.to_path_buf(),
+                cow_diff_layer_dir: None,
+                granted_passthrough: selection.granted_passthrough.clone(),
+                net_capability,
+            },
+        )
         .map_err(|e| RecordNetError::Spawn(e.to_string()))?;
     let kill_token = child
         .kill_token()
