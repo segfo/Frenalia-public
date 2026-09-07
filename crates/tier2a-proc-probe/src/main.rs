@@ -87,6 +87,12 @@ struct Args {
     use_process_handle: Option<usize>,
     /// MAC設計§10.1: 要求受付パイプへクライアントとして接続し1往復する。
     pipe_client: Option<String>,
+    /// `--pipe-client`が送る本文を差し替える。
+    ///
+    /// **既定（`None`）は`spawn-request-from-pid-<pid>`のまま**——スパイクS7が
+    /// その綴りをassertしているので変えられない。Spawn Daemon本体（段階5）の受け入れ
+    /// テストは本物の要求電文（JSON）を送る必要があるので、そこだけ差し替える。
+    pipe_payload: Option<String>,
     /// D-88（Lazy ACE fault-in）の着手条件: Redirector DLLのフックが**成功するopen**へ
     /// 上乗せする時間を、同一プロセスの「載せる前／載せた後」で測る（`open_bench`モジュールdoc）。
     open_bench: Option<open_bench::Spec>,
@@ -125,6 +131,7 @@ fn parse_args() -> Args {
     let mut emit = None;
     let mut use_process_handle = None;
     let mut pipe_client = None;
+    let mut pipe_payload = None;
     let mut report_file = None;
     let mut idle_secs = None;
     let mut bench_inside: Option<String> = None;
@@ -207,6 +214,7 @@ fn parse_args() -> Args {
             "--emit" => emit = Some(next()),
             "--use-process-handle" => use_process_handle = next().parse().ok(),
             "--pipe-client" => pipe_client = Some(next()),
+            "--pipe-payload" => pipe_payload = Some(next()),
             "--report-file" => report_file = Some(next()),
             "--idle-secs" => idle_secs = next().parse().ok(),
             "--open-bench" => bench_inside = Some(next()),
@@ -307,6 +315,7 @@ fn parse_args() -> Args {
         emit,
         use_process_handle,
         pipe_client,
+        pipe_payload,
         open_bench,
         console_share,
         report_file,
@@ -725,7 +734,11 @@ fn main() -> ExitCode {
     }
 
     if let Some(pipe) = &args.pipe_client {
-        let report = pipe_client::run(pipe, args.report_file.as_deref());
+        let report = pipe_client::run(
+            pipe,
+            args.pipe_payload.as_deref(),
+            args.report_file.as_deref(),
+        );
         println!(
             "{}",
             serde_json::to_string(&report).expect("pipe_client report must serialize")

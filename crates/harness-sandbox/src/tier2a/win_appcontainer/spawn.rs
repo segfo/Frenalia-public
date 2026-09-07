@@ -12,7 +12,10 @@ use super::*;
 /// 低ILの子から書けない」現象と同種、`win_restricted.rs`参照）。**これは設計上の予測であり
 /// 実機未検証**——最初の実機テストで子のstdout/stderrが空になる/ハングする場合、
 /// 真っ先にここを疑う。
-fn appcontainer_pipe(sid: PSID) -> windows::core::Result<(HANDLE, HANDLE)> {
+///
+/// **`pub(crate)`なのは、Spawn Daemon方式ではこのパイプを作るのがharness側だからである**
+/// （§10.1「子のstdioパイプを作るプロセス」＝harness）。Daemonへは子側の端の複製だけが渡る。
+pub(crate) fn appcontainer_pipe(sid: PSID) -> windows::core::Result<(HANDLE, HANDLE)> {
     let (read, write) = create_pipe_with_sddl("D:(A;;GA;;;WD)")?;
     unsafe {
         let mut trustee = TRUSTEE_W::default();

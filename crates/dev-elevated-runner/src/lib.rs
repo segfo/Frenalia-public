@@ -174,6 +174,25 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "win_appcontainer::cancel_descendants_tests",
         ],
     ),
+    // 段階5: Spawn Daemon本体の受け入れ（1枚もの`docs/guide/11a-mac-enforcement-map.md`§3の
+    // 「対で2本を2組」）。実ACLとAppContainerプロファイルを触るので昇格側から直列実行する。
+    //
+    // **フィルタはモジュール名と完全に一致していること**——一致しないと0件マッチで
+    // 黙って緑になる（BUG-056。`check_tests_actually_ran`がその検問）。
+    (
+        "spawn-daemon",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "win_appcontainer::spawnd_e2e_tests",
+        ],
+    ),
     // ACE付与/撤収（fs passthrough・traverse chain・継承ACE）の実機回帰。BUG-046の修正3で
     // 追加した`traverse_chain_grants_every_ancestor_on_a_test_owned_drive_root`を含む
     // （そちらは`subst`のテスト所有ドライブを使うので単体では昇格不要だが、同モジュールの

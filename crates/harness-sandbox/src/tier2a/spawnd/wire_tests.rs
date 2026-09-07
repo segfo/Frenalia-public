@@ -38,6 +38,9 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
             name: "pwsh-workspace".to_string(),
             container_sid: "S-1-15-2-1".to_string(),
             capability_sids: vec!["S-1-15-3-1024-1".to_string()],
+            identity: DomainIdentitySpec::Capability {
+                sid: "S-1-15-3-1024-9".to_string(),
+            },
         },
         handles: ChildHandles {
             job: 16,
@@ -50,7 +53,7 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
     let json = serde_json::to_string(&request).expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"]},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"token_default_dacl_sddl":null}"#
+        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"}},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"token_default_dacl_sddl":null}"#
     );
     let back: ControlRequest = serde_json::from_str(&json).expect("round trip");
     assert_eq!(back, request);

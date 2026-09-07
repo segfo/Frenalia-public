@@ -42,6 +42,11 @@
 /// 昇格なしで単体テストできる。
 pub mod table;
 
+#[cfg(windows)]
+pub mod client;
+#[cfg(windows)]
+pub mod server;
+
 #[cfg(test)]
 #[path = "wire_tests.rs"]
 mod wire_tests;
@@ -59,6 +64,22 @@ pub const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// 常駐**なので、長さの上限をプロトコルの側で持つ（§10.1「Daemonの入力の扱い」）。
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
+/// 子のプロセス／スレッド／トークン既定DACLに載せる**ドメインの宛先SID**（§22.1.1）。
+///
+/// `win_appcontainer::DomainIdentity`をワイヤへ載せた形である。あちらが
+/// **`Option`にせず必ず選ばせる**設計なので、こちらも既定値を持たない
+/// ——既定があると呼び出し側が黙って落とせてしまい、落ちた経路だけが素のDACLで起動する。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DomainIdentitySpec {
+    /// このドメインを識別するcapability SID（例: D-54のworkspace capability）。
+    ///
+    /// **traverse capabilityを渡してはいけない**——全Tier2a子が共有するので分離にならない。
+    Capability { sid: String },
+    /// **package SIDそのものがドメイン**である場合（プロファイルが1ドメインに対応する）。
+    OwnPackage,
+}
+
 /// 起動するプロセスのドメイン（§22.1「ドメイン = (package SID, capabilityの組)」）。
 ///
 /// SIDを**文字列で運ぶ**のは、`PSID`が生ポインタでプロセス境界を越えられないためである。
@@ -71,6 +92,8 @@ pub struct DomainSpec {
     pub container_sid: String,
     /// トークンへ積むcapability SID（`S-1-15-3-…`）。traverse capabilityを含む。
     pub capability_sids: Vec<String>,
+    /// 子のDACLに載せる宛先（上記）。
+    pub identity: DomainIdentitySpec,
 }
 
 /// 子へ引き継がせるハンドル一式。**すべて受け手（Daemon）のプロセスへ複製済みの値**である。

@@ -19,6 +19,7 @@
 //! 見分けやすい値を置いてある。
 
 use super::*;
+use crate::tier2a::spawnd::DomainIdentitySpec;
 
 const JOB_A: u64 = 0x1000;
 const JOB_B: u64 = 0x2000;
@@ -31,6 +32,7 @@ fn domain(name: &str) -> DomainSpec {
         name: name.to_string(),
         container_sid: "S-1-15-2-1111111111-2222222222".to_string(),
         capability_sids: vec!["S-1-15-3-1024-1".to_string()],
+        identity: DomainIdentitySpec::OwnPackage,
     }
 }
 

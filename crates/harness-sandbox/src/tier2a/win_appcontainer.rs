@@ -767,6 +767,13 @@ mod lazy_ux_latency_tests;
 #[cfg(all(windows, test))]
 mod cancel_descendants_tests;
 
+/// 段階5（Spawn Daemon本体）の実機受け入れテスト。
+///
+/// **モジュール名は`KNOWN_TARGETS`の`spawn-daemon`のフィルタ文字列と一致していること**
+/// （改名すると0件マッチで黙って緑になる。BUG-056）。
+#[cfg(all(windows, test))]
+mod spawnd_e2e_tests;
+
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;
 

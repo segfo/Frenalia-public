@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 
 #[cfg(windows)]
-pub fn run(pipe_name: &str, report_file: Option<&str>) -> Value {
+pub fn run(pipe_name: &str, payload_override: Option<&str>, report_file: Option<&str>) -> Value {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE};
     use windows::Win32::Storage::FileSystem::{
@@ -64,7 +64,13 @@ pub fn run(pipe_name: &str, report_file: Option<&str>) -> Value {
         }
     };
 
-    let payload = format!("spawn-request-from-pid-{}", std::process::id());
+    // **既定の綴りは変えられない。** スパイクS7がこの文字列をassertしている
+    // （`mac_spike_daemon_tests`）。段階5の受け入れテストは本物の要求電文（JSON）を
+    // 送る必要があるので、そこだけ`--pipe-payload`で差し替える。
+    let payload = match payload_override {
+        Some(custom) => custom.to_string(),
+        None => format!("spawn-request-from-pid-{}", std::process::id()),
+    };
     let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
     frame.extend_from_slice(payload.as_bytes());
 
@@ -106,6 +112,6 @@ pub fn run(pipe_name: &str, report_file: Option<&str>) -> Value {
 }
 
 #[cfg(not(windows))]
-pub fn run(pipe_name: &str, _report_file: Option<&str>) -> Value {
+pub fn run(pipe_name: &str, _payload_override: Option<&str>, _report_file: Option<&str>) -> Value {
     json!({"mode": "pipe-client", "pipe": pipe_name, "connected": false, "error": "windows-only"})
 }
