@@ -555,6 +555,261 @@ fn domain_dacl_sddl(
     Ok(format!("D:(A;;GA;;;{user})(A;;GA;;;{domain_sid})"))
 }
 
+/// [`create_suspended_in_job`]への入力。引数が多いので構造体で受ける。
+pub(crate) struct SuspendedSpawn<'a> {
+    pub exe: &'a str,
+    pub args: &'a [&'a str],
+    pub cwd: &'a Path,
+    /// `CREATE_UNICODE_ENVIRONMENT`用に組み立て済みの環境ブロック
+    /// （`win_common::build_env_block`が作る）。**呼び出し側が組む**——CoWは
+    /// ここへ独自の変数を足すので、組み立てをこの関数へ入れると分岐が持ち込まれる。
+    pub env_block: &'a mut Vec<u16>,
+    pub container_sid: PSID,
+    pub capabilities: &'a [SID_AND_ATTRIBUTES],
+    /// **子へ継承させるハンドルの全て**（INV-2、設計書§28）。`hStd*`はこの部分集合であって
+    /// 一致ではない（CoWのready pipeはここに載るが`hStd*`のどれでもない）。
+    ///
+    /// **この配列のハンドルは、`CreateProcessW`の成否によらずこの関数が閉じる。**
+    /// 子は自分の複製を持つので、呼び出し側の端はもう要らない。閉じる責任を呼び出し側へ
+    /// 残すと、経路が増えるたびに片方だけ漏れる（`B-01`）。
+    pub inherit_handles: &'a [HANDLE],
+    pub stdout_write: HANDLE,
+    pub stderr_write: HANDLE,
+    pub stdin_read: Option<HANDLE>,
+    /// 子を入れるJob Object。**この関数は所有しない**（失敗しても閉じない）
+    /// ——作った側が閉じる。Daemon方式では作る側がharnessなので、
+    /// ここで閉じると他人のハンドルを閉じることになる（§10.1.1）。
+    pub job: HANDLE,
+    pub domain: DomainIdentity,
+}
+
+/// **一時停止のまま子を起こし、Jobへ入れ、トークンの既定DACLを差し替える**（§12の固定順の前半）。
+///
+/// # なぜ切り出してあるのか
+///
+/// この手順は`spawn_impl`（harnessが直接起こす経路）と`tier2a::spawnd`（Spawn Daemonが
+/// 代理で起こす経路）の**両方**が必要とする。写しを作ると、失敗パスの後始末が2つの綴りに
+/// 分かれて片方だけ直る形になる——[BUG-156](../../../../docs/bugs/BUG-156.md)が
+/// まさにその形だった（Tier2aだけが正しく書けていて、Tier0/Tier1には後始末が1行も無かった）。
+/// `docs/CODE-STRUCTURE-RULES.md`規則5。
+///
+/// # 何を保証するか
+///
+/// 返るとき、子は**まだ一時停止したまま**である。`ResumeThread`は呼び出し側が行う——
+/// **その間に何を挟むかが経路ごとに違う**からである。
+///
+/// | 経路 | Resumeの前に挟むもの |
+/// |---|---|
+/// | `spawn_impl` | Redirector DLLの注入と初期化待ち（D-30・D-88） |
+/// | Spawn Daemon | Process Tableへの登録（§12。**締切が最も早い**——子は起きた直後に生成を要求し得る） |
+///
+/// # 失敗したときに何が起きるか
+///
+/// **どの段で落ちても、子は残らない。** `CreateProcessW`が失敗すれば子は生成されておらず、
+/// それより後で落ちれば`TerminateProcess`する——子は一時停止のままなので**ユーザーコードを
+/// 1行も実行していない**（作り直しても副作用が二重にならない、BUG-116）。
+/// この関数が閉じるのは**自分が作ったもの**（プロセス／スレッドのハンドル）と
+/// `inherit_handles`だけで、Jobと呼び出し側のパイプ端は触らない。
+pub(crate) fn create_suspended_in_job(
+    request: SuspendedSpawn<'_>,
+) -> Result<PROCESS_INFORMATION, AppContainerError> {
+    let step = |label: &'static str, e: windows::core::Error| {
+        AppContainerError::Win32(format!("{label}: {e}"))
+    };
+
+    let mut cmdline = format!("\"{}\"", request.exe);
+    for a in request.args {
+        cmdline.push(' ');
+        cmdline.push('"');
+        cmdline.push_str(&a.replace('"', "\\\""));
+        cmdline.push('"');
+    }
+    let mut cmdline_w = wide(&cmdline);
+    let cwd_w = wide(&request.cwd.to_string_lossy());
+
+    let mut capabilities_buf = request.capabilities.to_vec();
+    let mut security_capabilities = SECURITY_CAPABILITIES {
+        AppContainerSid: request.container_sid,
+        Capabilities: if capabilities_buf.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            capabilities_buf.as_mut_ptr()
+        },
+        CapabilityCount: capabilities_buf.len() as u32,
+        Reserved: 0,
+    };
+    let mut inherit_handles = request.inherit_handles.to_vec();
+
+    // §22.1.1 挿入点1: プロセスと**最初のスレッド**のオブジェクトDACL。
+    // カーネルオブジェクトのDACLは**生成時**に決まるので、下の`TokenDefaultDacl`差し替えでは
+    // この2つに間に合わない（逆に、ここだけでは起動後に生えたスレッドが素のままになる、§S2b）。
+    // **2つで1つの対策**である。SDは`CreateProcessW`の呼び出し中だけ生きていればよい。
+    let domain_sddl = domain_dacl_sddl(request.domain, request.container_sid)?;
+    let domain_sd_for = |what: &'static str| -> Result<SecurityDescriptorBuf, AppContainerError> {
+        SecurityDescriptorBuf::from_sddl(&domain_sddl).map_err(|e| {
+            AppContainerError::Win32(format!(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW({what}): {e}"
+            ))
+        })
+    };
+    let process_sd = domain_sd_for("process")?;
+    let thread_sd = domain_sd_for("thread")?;
+    let process_sa = process_sd.security_attributes();
+    let thread_sa = thread_sd.security_attributes();
+
+    let result: Result<PROCESS_INFORMATION, AppContainerError> = unsafe {
+        let mut attr_list_size: usize = 0;
+        // 1回目は必要サイズ取得のためだけの呼び出しで、バッファ不足エラーになるのが正常
+        // （ERROR_INSUFFICIENT_BUFFER）なので戻り値は捨てる。属性数2
+        // （SECURITY_CAPABILITIES + HANDLE_LIST）。
+        let _ = InitializeProcThreadAttributeList(
+            LPPROC_THREAD_ATTRIBUTE_LIST::default(),
+            2,
+            0,
+            &mut attr_list_size,
+        );
+        let mut attr_list_buf = vec![0u8; attr_list_size];
+        let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list_buf.as_mut_ptr() as *mut c_void);
+        let init_result = InitializeProcThreadAttributeList(attr_list, 2, 0, &mut attr_list_size)
+            .map_err(|e| step("InitializeProcThreadAttributeList", e));
+
+        init_result.and_then(|()| {
+            let update_result = UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                Some(&mut security_capabilities as *mut _ as *const c_void),
+                std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                None,
+                None,
+            )
+            .map_err(|e| step("UpdateProcThreadAttribute(SECURITY_CAPABILITIES)", e))
+            .and_then(|()| {
+                UpdateProcThreadAttribute(
+                    attr_list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    Some(inherit_handles.as_mut_ptr() as *const c_void),
+                    inherit_handles.len() * std::mem::size_of::<HANDLE>(),
+                    None,
+                    None,
+                )
+                .map_err(|e| step("UpdateProcThreadAttribute(HANDLE_LIST)", e))
+            });
+
+            let out = update_result.and_then(|()| {
+                let startup_info_ex = STARTUPINFOEXW {
+                    StartupInfo: STARTUPINFOW {
+                        cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+                        dwFlags: STARTF_USESTDHANDLES,
+                        hStdOutput: request.stdout_write,
+                        hStdError: request.stderr_write,
+                        hStdInput: request.stdin_read.unwrap_or(INVALID_HANDLE_VALUE),
+                        ..Default::default()
+                    },
+                    lpAttributeList: attr_list,
+                };
+
+                let mut process_info = PROCESS_INFORMATION::default();
+                // `CREATE_SUSPENDED`（設計書§10.2）: メインスレッドを起こす前に
+                // `AssignProcessToJobObject`を完了させ、子がJob Object外で孫プロセスを
+                // 作れる窓（TOCTOU）を無くす。Phase 2のDLL注入もこの一時停止窓で行う。
+                CreateProcessW(
+                    None,
+                    PWSTR(cmdline_w.as_mut_ptr()),
+                    // §22.1.1 挿入点1（プロセス／最初のスレッドのDACL）。
+                    Some(&process_sa as *const _),
+                    Some(&thread_sa as *const _),
+                    true,
+                    EXTENDED_STARTUPINFO_PRESENT
+                        | CREATE_NO_WINDOW
+                        | CREATE_UNICODE_ENVIRONMENT
+                        | CREATE_SUSPENDED,
+                    Some(request.env_block.as_mut_ptr() as *mut _),
+                    PCWSTR(cwd_w.as_ptr()),
+                    &startup_info_ex.StartupInfo,
+                    &mut process_info,
+                )
+                .map_err(|e| step("CreateProcessW", e))
+                .map(|_| process_info)
+            });
+
+            DeleteProcThreadAttributeList(attr_list);
+            out
+        })
+    };
+
+    // 呼び出し側プロセスのパイプ端（子へ継承させた側）は、spawn後は不要なので閉じる。
+    // **成否によらず閉じる**——子は自分の複製を持っている（この型のdoc）。
+    unsafe {
+        for handle in request.inherit_handles {
+            let _ = CloseHandle(*handle);
+        }
+    }
+
+    let process_info = result?;
+
+    unsafe {
+        // suspended状態のうちにJobへ割り当ててからResumeする（INV-2/§10.2）。ここで失敗した
+        // 場合、suspendedのままの孤立プロセスを残さないよう強制終了してから返す。
+        if let Err(e) = AssignProcessToJobObject(request.job, process_info.hProcess)
+            .map_err(|e| step("AssignProcessToJobObject", e))
+        {
+            let _ = TerminateProcess(process_info.hProcess, 1);
+            let _ = CloseHandle(process_info.hThread);
+            let _ = CloseHandle(process_info.hProcess);
+            return Err(e);
+        }
+
+        // §22.1.1 挿入点2: **Resumeより前に**トークンの既定DACLを差し替える。
+        //
+        // ここを窓に選ぶ理由は、子がまだ1つもオブジェクトを作っていないからである——起動後に
+        // 差し替えても、それまでに生えたスレッドは古い既定DACL（package SID入り）のまま残る。
+        // これで「起動後に生えたスレッド」の穴（§S2b）が閉じる。
+        //
+        // **失敗はfail-closed**（B-10）。差し替わっていないのに起動を続けると、分離したつもりで
+        // 素の状態が走る——しかも症状は出ないので誰も気付けない。
+        let default_dacl_result = (|| -> Result<(), AppContainerError> {
+            use windows::Win32::Security::{
+                SetTokenInformation, TokenDefaultDacl, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL,
+            };
+            let sd = SecurityDescriptorBuf::from_sddl(&domain_sddl).map_err(|e| {
+                AppContainerError::Win32(format!(
+                    "ConvertStringSecurityDescriptorToSecurityDescriptorW(token default dacl): {e}"
+                ))
+            })?;
+            let dacl = sd
+                .dacl()
+                .map_err(|e| step("GetSecurityDescriptorDacl(token default dacl)", e))?;
+            let mut token = HANDLE::default();
+            OpenProcessToken(
+                process_info.hProcess,
+                TOKEN_ADJUST_DEFAULT | TOKEN_QUERY,
+                &mut token,
+            )
+            .map_err(|e| step("OpenProcessToken(TOKEN_ADJUST_DEFAULT)", e))?;
+            let info = TOKEN_DEFAULT_DACL { DefaultDacl: dacl };
+            let set = SetTokenInformation(
+                token,
+                TokenDefaultDacl,
+                &info as *const _ as *const c_void,
+                std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32,
+            )
+            .map_err(|e| step("SetTokenInformation(TokenDefaultDacl)", e));
+            let _ = CloseHandle(token);
+            set
+        })();
+        if let Err(e) = default_dacl_result {
+            let _ = TerminateProcess(process_info.hProcess, 1);
+            let _ = CloseHandle(process_info.hThread);
+            let _ = CloseHandle(process_info.hProcess);
+            return Err(e);
+        }
+    }
+
+    Ok(process_info)
+}
+
 /// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する。
 /// Tier1の`CreateProcessAsUserW`+制限トークンとは別方式: トークンは差し替えず、呼び出し
 /// スレッド自身のトークンのまま拡張属性リストでAppContainerへ閉じ込める。そのため
@@ -730,15 +985,6 @@ fn spawn_impl(
         None
     };
 
-    let mut cmdline = format!("\"{exe}\"");
-    for a in args {
-        cmdline.push(' ');
-        cmdline.push('"');
-        cmdline.push_str(&a.replace('"', "\\\""));
-        cmdline.push('"');
-    }
-    let mut cmdline_w = wide(&cmdline);
-    let cwd_w = wide(&cwd.to_string_lossy());
     // D-30: CoW有効時、Redirector DLL（`harness-redirector`）へworkspace/差分層のパスと
     // 準備完了通知用パイプの生ハンドル値を環境変数経由で渡す。ハンドル値はプロセス作成時に
     // `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`（下記）で継承させるため、子プロセス内でも
@@ -796,18 +1042,6 @@ fn spawn_impl(
     };
     let mut env_block = build_env_block(env);
 
-    let mut capabilities_buf = capabilities.to_vec();
-    let mut security_capabilities = SECURITY_CAPABILITIES {
-        AppContainerSid: container_sid,
-        Capabilities: if capabilities_buf.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            capabilities_buf.as_mut_ptr()
-        },
-        CapabilityCount: capabilities_buf.len() as u32,
-        Reserved: 0,
-    };
-
     // INV-2（ハンドル継承対策、設計書§28）: `bInheritHandles=true`のまま無制限に継承させず、
     // `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`でstdioの3本（子側の書込/読取端のみ、いずれも
     // `create_pipe_with_sddl`が既に`bInheritHandle=true`で作成済み・親側端は上で`clear_inherit`
@@ -827,123 +1061,32 @@ fn spawn_impl(
         inherit_handles.push(*ready_write);
     }
 
-    // §22.1.1 挿入点1: プロセスと**最初のスレッド**のオブジェクトDACL。
-    // カーネルオブジェクトのDACLは**生成時**に決まるので、下の`TokenDefaultDacl`差し替えでは
-    // この2つに間に合わない（逆に、ここだけでは起動後に生えたスレッドが素のままになる、§S2b）。
-    // **2つで1つの対策**である。SDは`CreateProcessW`の呼び出し中だけ生きていればよい。
-    let domain_sddl = domain_dacl_sddl(domain, container_sid)?;
-    let domain_sd_for = |what: &'static str| -> Result<SecurityDescriptorBuf, AppContainerError> {
-        SecurityDescriptorBuf::from_sddl(&domain_sddl).map_err(|e| {
-            AppContainerError::Win32(format!(
-                "ConvertStringSecurityDescriptorToSecurityDescriptorW({what}): {e}"
-            ))
-        })
-    };
-    let process_sd = domain_sd_for("process")?;
-    let thread_sd = domain_sd_for("thread")?;
-    let process_sa = process_sd.security_attributes();
-    let thread_sa = thread_sd.security_attributes();
+    // 「一時停止で起こす → Jobへ入れる → トークンの既定DACLを差し替える」までは
+    // [`create_suspended_in_job`]が行う（Spawn Daemonと共有する本体。同関数のdoc）。
+    // **`inherit_handles`に載せたハンドルは、成否によらずあちらが閉じる。**
+    let spawned = create_suspended_in_job(SuspendedSpawn {
+        exe,
+        args,
+        cwd,
+        env_block: &mut env_block,
+        container_sid,
+        capabilities,
+        inherit_handles: &inherit_handles,
+        stdout_write,
+        stderr_write,
+        stdin_read,
+        job,
+        domain,
+    });
 
-    let result: Result<PROCESS_INFORMATION, AppContainerError> = unsafe {
-        let mut attr_list_size: usize = 0;
-        // 1回目は必要サイズ取得のためだけの呼び出しで、バッファ不足エラーになるのが正常
-        // （ERROR_INSUFFICIENT_BUFFER）なので戻り値は捨てる。属性数2
-        // （SECURITY_CAPABILITIES + HANDLE_LIST）。
-        let _ = InitializeProcThreadAttributeList(
-            LPPROC_THREAD_ATTRIBUTE_LIST::default(),
-            2,
-            0,
-            &mut attr_list_size,
-        );
-        let mut attr_list_buf = vec![0u8; attr_list_size];
-        let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list_buf.as_mut_ptr() as *mut c_void);
-        let init_result = InitializeProcThreadAttributeList(attr_list, 2, 0, &mut attr_list_size)
-            .map_err(|e| step("InitializeProcThreadAttributeList", e));
-
-        init_result.and_then(|()| {
-            let update_result = UpdateProcThreadAttribute(
-                attr_list,
-                0,
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                Some(&mut security_capabilities as *mut _ as *const c_void),
-                std::mem::size_of::<SECURITY_CAPABILITIES>(),
-                None,
-                None,
-            )
-            .map_err(|e| step("UpdateProcThreadAttribute(SECURITY_CAPABILITIES)", e))
-            .and_then(|()| {
-                UpdateProcThreadAttribute(
-                    attr_list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                    Some(inherit_handles.as_mut_ptr() as *const c_void),
-                    inherit_handles.len() * std::mem::size_of::<HANDLE>(),
-                    None,
-                    None,
-                )
-                .map_err(|e| step("UpdateProcThreadAttribute(HANDLE_LIST)", e))
-            });
-
-            let out = update_result.and_then(|()| {
-                let startup_info_ex = STARTUPINFOEXW {
-                    StartupInfo: STARTUPINFOW {
-                        cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
-                        dwFlags: STARTF_USESTDHANDLES,
-                        hStdOutput: stdout_write,
-                        hStdError: stderr_write,
-                        hStdInput: stdin_read.unwrap_or(INVALID_HANDLE_VALUE),
-                        ..Default::default()
-                    },
-                    lpAttributeList: attr_list,
-                };
-
-                let mut process_info = PROCESS_INFORMATION::default();
-                // `CREATE_SUSPENDED`（設計書§10.2）: メインスレッドを起こす前に
-                // `AssignProcessToJobObject`を完了させ、子がJob Object外で孫プロセスを
-                // 作れる窓（TOCTOU）を無くす。Phase 2のDLL注入もこの一時停止窓で行う。
-                CreateProcessW(
-                    None,
-                    PWSTR(cmdline_w.as_mut_ptr()),
-                    // §22.1.1 挿入点1（プロセス／最初のスレッドのDACL）。
-                    Some(&process_sa as *const _),
-                    Some(&thread_sa as *const _),
-                    true,
-                    EXTENDED_STARTUPINFO_PRESENT
-                        | CREATE_NO_WINDOW
-                        | CREATE_UNICODE_ENVIRONMENT
-                        | CREATE_SUSPENDED,
-                    Some(env_block.as_mut_ptr() as *mut _),
-                    PCWSTR(cwd_w.as_ptr()),
-                    &startup_info_ex.StartupInfo,
-                    &mut process_info,
-                )
-                .map_err(|e| step("CreateProcessW", e))
-                .map(|_| process_info)
-            });
-
-            DeleteProcThreadAttributeList(attr_list);
-            out
-        })
-    };
-
-    // 呼び出し側プロセスのパイプ端（子へ継承させた側）は、spawn後は不要なので閉じる。
-    unsafe {
-        let _ = CloseHandle(stdout_write);
-        let _ = CloseHandle(stderr_write);
-        if let Some(r) = stdin_read {
-            let _ = CloseHandle(r);
-        }
-        if let Some((_, ready_write)) = &ready_pipe {
-            let _ = CloseHandle(*ready_write);
-        }
-    }
-
-    let process_info = match result {
+    let process_info = match spawned {
         Ok(pi) => pi,
         Err(e) => {
+            // どの段で落ちても、子は生成されていないか**resume前に明示終了済み**である
+            // （[`create_suspended_in_job`]のdoc）。したがってここで閉じるのは
+            // **この関数が作ったもの**だけでよい——作成途中のJobはkill-on-closeで破棄すれば
+            // 足り、親側のパイプ端はもう誰も読まない。
             unsafe {
-                // CreateProcessWが失敗し、子は生成されていない。ここはJob終了ではなく
-                // kill-on-closeだけで作成途中のJobを破棄する後始末が正しい。
                 let _ = CloseHandle(job);
                 let _ = CloseHandle(stdout_read);
                 let _ = CloseHandle(stderr_read);
@@ -959,84 +1102,6 @@ fn spawn_impl(
     };
 
     unsafe {
-        // suspended状態のうちにJobへ割り当ててからResumeする（INV-2/§10.2）。ここで失敗した
-        // 場合、suspendedのままの孤立プロセスを残さないよう強制終了してから返す。
-        if let Err(e) = AssignProcessToJobObject(job, process_info.hProcess)
-            .map_err(|e| step("AssignProcessToJobObject", e))
-        {
-            let _ = TerminateProcess(process_info.hProcess, 1);
-            let _ = CloseHandle(process_info.hThread);
-            let _ = CloseHandle(process_info.hProcess);
-            // 子はsuspendedのまま明示終了済みで、孫を生成できない。作成途中のJobは
-            // kill-on-closeで破棄すれば足りる。
-            let _ = CloseHandle(job);
-            let _ = CloseHandle(stdout_read);
-            let _ = CloseHandle(stderr_read);
-            if let Some(w) = stdin_write {
-                let _ = CloseHandle(w);
-            }
-            if let Some((ready_read, _)) = &ready_pipe {
-                let _ = CloseHandle(*ready_read);
-            }
-            return Err(e);
-        }
-
-        // §22.1.1 挿入点2: **Resumeより前に**トークンの既定DACLを差し替える。
-        //
-        // ここを窓に選ぶ理由は、子がまだ1つもオブジェクトを作っていないからである——起動後に
-        // 差し替えても、それまでに生えたスレッドは古い既定DACL（package SID入り）のまま残る。
-        // これで「起動後に生えたスレッド」の穴（§S2b）が閉じる。
-        //
-        // **失敗はfail-closed**（B-10）。差し替わっていないのに起動を続けると、分離したつもりで
-        // 素の状態が走る——しかも症状は出ないので誰も気付けない。
-        let default_dacl_result = (|| -> Result<(), AppContainerError> {
-            use windows::Win32::Security::{
-                SetTokenInformation, TokenDefaultDacl, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL,
-            };
-            let sd = SecurityDescriptorBuf::from_sddl(&domain_sddl).map_err(|e| {
-                AppContainerError::Win32(format!(
-                    "ConvertStringSecurityDescriptorToSecurityDescriptorW(token default dacl): {e}"
-                ))
-            })?;
-            let dacl = sd
-                .dacl()
-                .map_err(|e| step("GetSecurityDescriptorDacl(token default dacl)", e))?;
-            let mut token = HANDLE::default();
-            OpenProcessToken(
-                process_info.hProcess,
-                TOKEN_ADJUST_DEFAULT | TOKEN_QUERY,
-                &mut token,
-            )
-            .map_err(|e| step("OpenProcessToken(TOKEN_ADJUST_DEFAULT)", e))?;
-            let info = TOKEN_DEFAULT_DACL { DefaultDacl: dacl };
-            let set = SetTokenInformation(
-                token,
-                TokenDefaultDacl,
-                &info as *const _ as *const c_void,
-                std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32,
-            )
-            .map_err(|e| step("SetTokenInformation(TokenDefaultDacl)", e));
-            let _ = CloseHandle(token);
-            set
-        })();
-        if let Err(e) = default_dacl_result {
-            let _ = TerminateProcess(process_info.hProcess, 1);
-            let _ = CloseHandle(process_info.hThread);
-            let _ = CloseHandle(process_info.hProcess);
-            // 子はresume前に明示終了済みで、孫を生成できない。作成途中のJobは
-            // kill-on-closeで破棄すれば足りる。
-            let _ = CloseHandle(job);
-            let _ = CloseHandle(stdout_read);
-            let _ = CloseHandle(stderr_read);
-            if let Some(w) = stdin_write {
-                let _ = CloseHandle(w);
-            }
-            if let Some((ready_read, _)) = &ready_pipe {
-                let _ = CloseHandle(*ready_read);
-            }
-            return Err(e);
-        }
-
         // D-30（`--sandbox tier2a-cow`）: suspended窓でRedirector DLLを注入する（設計書§10.2手順8-10）。
         // 注入または初期化確認に失敗した場合、対象プロセスを終了する（fail-close、
         // §10.2既定・§25.1）。workspace本体はACLで既にRO付与済みのため、この失敗パスは
