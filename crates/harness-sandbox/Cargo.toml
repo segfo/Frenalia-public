@@ -82,6 +82,9 @@ windows = { version = "0.58", features = [
     # M15.7（ポリシー学習ヘルパー）: `Microsoft-Windows-Kernel-File`のリアルタイム
     # ETWセッションと、TDHによるイベントプロパティ抽出に使う。
     "Win32_System_Diagnostics_Etw",
+    # 残課題#43の測定（`spawnd/spawn_rate_tests.rs`）: 並列ビルドが起こしたプロセスの
+    # 親子関係を、Jobの累計と突き合わせるために一覧を撮る。
+    "Win32_System_Diagnostics_ToolHelp",
     # M15.7スパイク: `NtCreateFile`をRootDirectory相対で直接呼び、ETWの各系統が
     # 相対openをどう報告するかを実測する（BUG-033と同じ形の入力を作るため）。
     "Wdk_Foundation",

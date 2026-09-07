@@ -53,6 +53,12 @@ pub use client::{SharedSpawnDaemon, SpawnDaemonHandle, SpawnedChild, TopLevelSpa
 #[path = "wire_tests.rs"]
 mod wire_tests;
 
+/// **要求受付パイプへ毎秒何本の要求が来るのか**を、現実の並列ビルドから見積もる測定
+/// （`docs/STATUS.md`残課題#43）。**昇格は要らない**ので`KNOWN_TARGETS`には入れない。
+#[cfg(all(windows, test))]
+#[path = "spawn_rate_tests.rs"]
+mod spawn_rate_tests;
+
 use serde::{Deserialize, Serialize};
 
 /// 1往復のI/Oに掛ける上限。**新しい数字を増やさない**——D-88のfault受付

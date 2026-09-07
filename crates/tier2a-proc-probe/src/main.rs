@@ -93,6 +93,15 @@ struct Args {
     /// その綴りをassertしているので変えられない。Spawn Daemon本体（段階5）の受け入れ
     /// テストは本物の要求電文（JSON）を送る必要があるので、そこだけ差し替える。
     pipe_payload: Option<String>,
+    /// `--pipe-client`の接続と1往復を何回繰り返すか（残課題#43の混雑測定）。
+    ///
+    /// **混雑は接続のたびに起こる**ので、1プロセス1回では標本が足りない。
+    pipe_repeat: u32,
+    /// `--pipe-client`が撃ち始める集合時刻（UNIXエポックms）。
+    ///
+    /// **N個の子の到着をそろえるためだけにある。** そろったかどうかは報告の
+    /// `start_epoch_us`で後から確かめる（指定しても、遅れて起きた子はそのまま撃つ）。
+    pipe_start_at_epoch_ms: Option<u128>,
     /// D-88（Lazy ACE fault-in）の着手条件: Redirector DLLのフックが**成功するopen**へ
     /// 上乗せする時間を、同一プロセスの「載せる前／載せた後」で測る（`open_bench`モジュールdoc）。
     open_bench: Option<open_bench::Spec>,
@@ -132,6 +141,8 @@ fn parse_args() -> Args {
     let mut use_process_handle = None;
     let mut pipe_client = None;
     let mut pipe_payload = None;
+    let mut pipe_repeat: u32 = 1;
+    let mut pipe_start_at_epoch_ms: Option<u128> = None;
     let mut report_file = None;
     let mut idle_secs = None;
     let mut bench_inside: Option<String> = None;
@@ -215,6 +226,10 @@ fn parse_args() -> Args {
             "--use-process-handle" => use_process_handle = next().parse().ok(),
             "--pipe-client" => pipe_client = Some(next()),
             "--pipe-payload" => pipe_payload = Some(next()),
+            // 残課題#43（要求受付パイプの混雑）の測定用。**既定は従来どおり1回・待たない**
+            // ので、指定しなければ段階③の受け入れテストの撃ち方は変わらない。
+            "--pipe-client-repeat" => pipe_repeat = next().parse().unwrap_or(1).max(1),
+            "--pipe-client-at" => pipe_start_at_epoch_ms = next().parse().ok(),
             "--report-file" => report_file = Some(next()),
             "--idle-secs" => idle_secs = next().parse().ok(),
             "--open-bench" => bench_inside = Some(next()),
@@ -316,6 +331,8 @@ fn parse_args() -> Args {
         use_process_handle,
         pipe_client,
         pipe_payload,
+        pipe_repeat,
+        pipe_start_at_epoch_ms,
         open_bench,
         console_share,
         report_file,
@@ -734,11 +751,13 @@ fn main() -> ExitCode {
     }
 
     if let Some(pipe) = &args.pipe_client {
-        let report = pipe_client::run(
-            pipe,
-            args.pipe_payload.as_deref(),
-            args.report_file.as_deref(),
-        );
+        let report = pipe_client::run_spec(&pipe_client::Spec {
+            pipe_name: pipe,
+            payload_override: args.pipe_payload.as_deref(),
+            report_file: args.report_file.as_deref(),
+            repeat: args.pipe_repeat,
+            start_at_epoch_ms: args.pipe_start_at_epoch_ms,
+        });
         println!(
             "{}",
             serde_json::to_string(&report).expect("pipe_client report must serialize")

@@ -197,6 +197,24 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "top_level_spawn_latency",
         ],
     ),
+    // T1の観測（`docs/STATUS.md`残課題#43）: 要求受付パイプの混雑。同時接続数を振って、
+    // 何割が混雑に当たり何ミリ秒待つかを測る。**合否の判定を持たない**——赤くなるのは
+    // 「測定が成立していない」ときだけである（アクセス拒否が混じった・到着がそろわなかった等）。
+    // `spawn-daemon`（受け入れ）と混ぜないのは`spawn-daemon-latency`と同じ理由。
+    (
+        "spawn-daemon-congestion",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "request_pipe_congestion_by_concurrency",
+        ],
+    ),
     // ④の観測: 直接生成とDaemon経由のトップレベル起動時間。**合否の判定を持たない**
     // （性能の閾値が未定義。数字は後続の判断のための観測値である）。
     (

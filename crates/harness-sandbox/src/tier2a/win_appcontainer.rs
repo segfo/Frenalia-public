@@ -774,6 +774,15 @@ mod cancel_descendants_tests;
 #[cfg(all(windows, test))]
 mod spawnd_e2e_tests;
 
+/// **要求受付パイプの混雑の測定**（`docs/STATUS.md`残課題#43）。受け入れではなく観測なので
+/// `spawn-daemon`とは別の的（`spawn-daemon-congestion`）から回す——混ぜると受け入れが延び、
+/// 合否を持たないものが受け入れの数に混ざる（`spawn-daemon-latency`と同じ扱い）。
+///
+/// **モジュール名とテスト名は`KNOWN_TARGETS`のフィルタ文字列と一致していること**
+/// （改名すると0件マッチで黙って緑になる。BUG-056）。
+#[cfg(all(windows, test))]
+mod spawnd_load_tests;
+
 #[cfg(all(windows, test))]
 mod ace_grant_revoke_tests;
 

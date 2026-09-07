@@ -50,10 +50,10 @@ use crate::tier2a::spawnd::client::{SpawnDaemonHandle, SpawnedChild, TopLevelSpa
 use crate::tier2a::spawnd::{DomainIdentitySpec, DomainSpec};
 
 /// 1ケース分の実マシン資源。**失敗した経路でも同じ順で畳む**（`test-logic-rules`型F）。
-struct Case {
-    daemon: Option<SpawnDaemonHandle>,
+pub(super) struct Case {
+    pub(super) daemon: Option<SpawnDaemonHandle>,
     canonical_workspace: std::path::PathBuf,
-    dir: Option<TestDirGuard>,
+    pub(super) dir: Option<TestDirGuard>,
 }
 
 impl Drop for Case {
@@ -67,7 +67,7 @@ impl Drop for Case {
 }
 
 /// workspaceを1つ用意し、preflightを通し、Daemonを起こす。
-fn setup(label: &str) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
+pub(super) fn setup(label: &str) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
     let guard = TestDirGuard::create(label);
     let workspace = guard.path().to_path_buf();
     let outcome = preflight(&workspace, &[], None, &WorkspaceWriteMode::DirectRw)
@@ -117,7 +117,7 @@ fn setup(label: &str) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedS
 /// **traverse capabilityをここで足す。** Daemonは受け取った一覧をそのまま積むだけで、
 /// D-37の「全Tier2a子が共通で携える」を自分では知らない——`spawn_with_workspace`が
 /// 自動で積むぶんを、Daemon経由では呼び出し側が明示する形になる。
-fn domain_spec(
+pub(super) fn domain_spec(
     profile: &OwnedContainerSid,
     caps: &[crate::win_common::OwnedSid],
     extra: Option<&crate::win_common::OwnedSid>,
@@ -183,12 +183,12 @@ fn spawn_via_daemon(
 }
 
 /// 子の応答JSON（`--pipe-client`が最後の行に出す）から1つの欄を読む。
-fn report_field(stdout: &str, field: &str) -> Option<serde_json::Value> {
+pub(super) fn report_field(stdout: &str, field: &str) -> Option<serde_json::Value> {
     super::mac_spike_tests::last_json_line(stdout).and_then(|v| v.get(field).cloned())
 }
 
 /// 要求受付パイプへ送る本物の要求電文（`SpawnRequest::Spawn`）。
-fn spawn_request_payload() -> String {
+pub(super) fn spawn_request_payload() -> String {
     serde_json::to_string(&crate::tier2a::spawnd::SpawnRequest::Spawn {
         exe: "git.exe".to_string(),
         args: vec!["status".to_string()],
@@ -198,7 +198,7 @@ fn spawn_request_payload() -> String {
 }
 
 /// 子が返した拒否理由を取り出す。
-fn deny_reason(stdout: &str) -> Option<String> {
+pub(super) fn deny_reason(stdout: &str) -> Option<String> {
     let reply = report_field(stdout, "reply")?;
     let reply = reply.as_str()?;
     let parsed: serde_json::Value = serde_json::from_str(reply).ok()?;
@@ -903,7 +903,7 @@ fn top_level_spawn_latency_direct_versus_daemon() {
     drop(case);
 }
 
-fn wait_and_close(child: &SpawnedChild, job: HANDLE) {
+pub(super) fn wait_and_close(child: &SpawnedChild, job: HANDLE) {
     unsafe {
         let _ = WaitForSingleObject(child.process, 60_000);
         let mut code = 0u32;
