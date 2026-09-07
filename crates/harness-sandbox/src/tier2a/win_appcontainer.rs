@@ -204,6 +204,37 @@ pub fn traverse_capability_sid() -> Result<crate::win_common::OwnedSid, AppConta
     capability_sid_from_name(TRAVERSE_CAPABILITY_NAME)
 }
 
+/// Spawn Daemonの**要求受付パイプへ到達してよい**ことを表すcapabilityの名前（§10.1）。
+///
+/// # なぜpackage SIDではなくcapabilityなのか
+///
+/// 要求受付パイプのDACLをセッションのpackage SID宛にすると、**MCPサーバが接続できない**
+/// ——D-38によりMCPサーバは**サーバごとに別のpackage SID**を持つためである（§22.2.2）。
+/// サーバごとにACEを足す案は、宣言数だけACEが増え撤収も増えるので採らない。
+/// capability SID宛なら**ACEは1本で済み、プロファイルがいくつ増えても変わらない**。
+///
+/// # 積むかどうかが、そのままドメイン単位のスイッチになる
+///
+/// §22.2.2の`process: deny`を宣言したMCPサーバにはこのcapabilityを積まないので、
+/// **パイプに到達すらできない**（`CHILD_PROCESS_RESTRICTED`との二重のdeny）。
+///
+/// # 名前が固定であることの意味（[`TRAVERSE_CAPABILITY_NAME`]と同じ残存リスク）
+///
+/// capability SIDは名前から誰でも導出でき、トークンへ任意に積める。したがって
+/// **同じユーザーの別プロセスが同じcapability名でAppContainerを作れば、このパイプへ
+/// 到達できる**。それでよいのは、パイプのDACLがユーザーSIDでも絞られており、
+/// **同一ユーザーの攻撃者は元より同じ権限を持つ**からである。
+/// **パイプ名を秘密に数えていない**のと同じ理由で、守っているのはDACLだけである。
+pub const SPAWN_REQUEST_CAPABILITY_NAME: &str = "harnessSandboxSpawnRequest";
+
+/// [`SPAWN_REQUEST_CAPABILITY_NAME`]から導出したcapability SID。
+///
+/// **Daemon（パイプのDACLを組む側）とharness（子のトークンへ積む側）が同じ値を得ることが
+/// 前提**なので、名前は定数1つだけが持つ（綴りを2箇所に置かない）。
+pub fn spawn_request_capability_sid() -> Result<crate::win_common::OwnedSid, AppContainerError> {
+    capability_sid_from_name(SPAWN_REQUEST_CAPABILITY_NAME)
+}
+
 /// このworkspace＋モードのFS付与の宛先SID（D-54）。名前は
 /// [`crate::tier2a::workspace_capability`]がworkspaceごとのランダム秘密から導出し、
 /// マシンローカル台帳（`%APPDATA%\harness\config\`）に保存する。

@@ -51,6 +51,12 @@ pub mod fs_passthrough_ledger;
 /// windows専用にしない（名前の導出・台帳・検証は純粋関数で、CSPRNGだけがcfg分岐する）。
 pub mod workspace_capability;
 
+/// Spawn Daemon（遷移MAC 段階5）のワイヤ形式とProcess Table。`session_profile`と同じ理由で
+/// モジュールごとwindows専用にはしない——電文の形とProcess Tableの判定は純粋で、
+/// **昇格なしに単体テストできることがこの機構の検証の要**だからである（§12の既定拒否・
+/// 系統Jobの回収条件）。Win32を呼ぶDaemon本体とクライアントだけがwindows専用。
+pub mod spawnd;
+
 #[cfg(windows)]
 pub mod netfilterd;
 /// ポリシー学習ヘルパー（M15.7、OS監査によるFSアクセス拒否の収集）。ETWセッションが
