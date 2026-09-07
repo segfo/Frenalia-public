@@ -329,9 +329,11 @@ pub(crate) fn decode_ansi_lossy(bytes: &[u8]) -> String {
 /// [`KillToken`]とは、closeの責務が違うので同じ型にしない。
 ///
 /// **`docs/CODE-STRUCTURE-RULES.md`規則5により写しを作らない。** 使うのは
-/// [`read_two_pipes_to_strings`]（stdout/stderrを2スレッドで読む）と、
+/// [`read_two_pipes_to_strings`]（stdout/stderrを2スレッドで読む）、
+/// [`stream_child_output`]（stdout/stderr/process/jobを4本のスレッドへ配る）、
 /// `tier2a::win_appcontainer::lazy_grant::broker`（接続ごとのハンドラスレッドへ
-/// パイプを渡す、D-88）の2箇所である。
+/// パイプを渡す、D-88）である。**箇所数はここに書かない**——数えた時点の値を
+/// 持ち歩くと、使う場所が増えたときにこの行だけが古くなる。
 pub(crate) struct SendHandle(pub(crate) HANDLE);
 unsafe impl Send for SendHandle {}
 

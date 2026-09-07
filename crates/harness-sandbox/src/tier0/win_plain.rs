@@ -18,8 +18,8 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::System::Threading::{
-    CreateProcessW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, TerminateProcess, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 use crate::win_common::{
@@ -189,7 +189,29 @@ pub fn spawn(
     }
 
     unsafe {
-        AssignProcessToJobObject(job, process_info.hProcess)?;
+        if let Err(e) = AssignProcessToJobObject(job, process_info.hProcess) {
+            // **ここを素通りさせると、誰も殺せない子が走り続ける。** 子は
+            // `CREATE_SUSPENDED`無しで起動済みなので、Jobへ入れ損ねたまま`?`で返すと
+            // (1) どのJobにも属さない子が生き残り、(2) `hProcess`も閉じてしまうので
+            // 後から終了させる手段が無くなる。Tier2aの`spawn_impl`は同じ分岐で
+            // この後始末を書いている（`docs/CODE-STRUCTURE-RULES.md`規則5.1の対）。
+            //
+            // **限界**: 起動済みである以上、Assignが失敗した時点で子が既に孫を作っている
+            // 可能性がある。`TerminateProcess`は直接の子しか殺さないので、**この経路だけは
+            // 子孫を保証できない**。塞ぐにはTier0/Tier1も`CREATE_SUSPENDED`→Job割り当て
+            // →`ResumeThread`の順へ寄せる必要がある（`docs/bugs/BUG-156.md`）。
+            let _ = TerminateProcess(process_info.hProcess, 1);
+            let _ = CloseHandle(process_info.hThread);
+            let _ = CloseHandle(process_info.hProcess);
+            // 子は明示終了済みなのでJob終了ではなくkill-on-closeで破棄する（上の分岐と同じ理由）。
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(stdout_read);
+            let _ = CloseHandle(stderr_read);
+            if let Some(w) = stdin_write {
+                let _ = CloseHandle(w);
+            }
+            return Err(PlainError::from(e));
+        }
         let _ = CloseHandle(process_info.hThread);
     }
 

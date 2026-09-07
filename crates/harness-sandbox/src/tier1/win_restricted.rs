@@ -59,7 +59,7 @@ use windows::Win32::Security::{
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, INFINITE,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, INFINITE,
     PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
@@ -424,7 +424,22 @@ pub fn spawn(
     }
 
     unsafe {
-        AssignProcessToJobObject(job, process_info.hProcess)?;
+        if let Err(e) = AssignProcessToJobObject(job, process_info.hProcess) {
+            // **ここを素通りさせると、誰も殺せない子が走り続ける。** 理由と限界は
+            // `tier0::win_plain::spawn`の同じ分岐に書いてある（起動シーケンスは
+            // トークンとパイプのラベル以外Tier0と同一で、この分岐も同一である）。
+            let _ = TerminateProcess(process_info.hProcess, 1);
+            let _ = CloseHandle(process_info.hThread);
+            let _ = CloseHandle(process_info.hProcess);
+            // 子は明示終了済みなのでJob終了ではなくkill-on-closeで破棄する（上の分岐と同じ理由）。
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(stdout_read);
+            let _ = CloseHandle(stderr_read);
+            if let Some(w) = stdin_write {
+                let _ = CloseHandle(w);
+            }
+            return Err(RestrictedError::from(e));
+        }
         let _ = CloseHandle(process_info.hThread);
     }
 

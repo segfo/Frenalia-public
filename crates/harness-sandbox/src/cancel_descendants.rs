@@ -30,7 +30,20 @@ pub(crate) fn prepare_descendant(
     force_output_inheritance: bool,
 ) -> (String, PathBuf) {
     let pid_file = root.join("descendant.pid");
+    let error_file = pid_file.with_extension("error");
     let output_file = root.join("descendant.log");
+    // **前回の値を読む余地を構造的に消す。** テストディレクトリ名は`<label>-<自PID>`で、
+    // 自PIDは再利用される。前回が後始末に失敗して`descendant.pid`を残していると、
+    // [`DescendantProbe::wait_for_pid_file`]が起動を待たずに**前回のPID**を読む——
+    // そのPIDが再利用されて別プロセスに当たっていれば、生存判定も後始末の
+    // `TerminateProcess`も無関係なプロセスへ向く。`let _`にしないで消えたことを確かめる。
+    for stale in [&pid_file, &error_file, &output_file] {
+        match std::fs::remove_file(stale) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("remove the stale probe file {}: {e}", stale.display()),
+        }
+    }
     let loop_command =
         "/d /c for /L %i in (0,0,1) do @powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 1\"";
     let (file_name, arguments) = match output {
@@ -166,14 +179,25 @@ impl Drop for DescendantProbe {
 }
 
 /// ブロックし得るキャンセル完了処理を専用スレッドへ隔離し、上限時間を固定する。
+///
+/// **失敗の2種類を混ぜない。** `recv_timeout`の`Err`は「期限切れ」と「送信側の切断」の
+/// 両方を運ぶが、後者は作業スレッドがpanicしたことを意味する。同じ文言にすると、
+/// 製品側がpanicした回まで「10秒でtimeout」と報告され、**本当の原因が隠れる**。
 pub(crate) fn assert_cancel_completes(label: &'static str, work: impl FnOnce() + Send + 'static) {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         work();
         let _ = tx.send(());
     });
-    rx.recv_timeout(CANCEL_TIMEOUT)
-        .unwrap_or_else(|_| panic!("{label} did not complete within {CANCEL_TIMEOUT:?}"));
+    match rx.recv_timeout(CANCEL_TIMEOUT) {
+        Ok(()) => {}
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{label} did not complete within {CANCEL_TIMEOUT:?}")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+            "{label} panicked instead of completing; the original panic is printed above this line"
+        ),
+    }
 }
 
 fn run_tier0(output: DescendantOutput) {

@@ -249,7 +249,10 @@ pub(super) fn scopeguard<F: FnMut()>(f: F) -> ScopeGuard<F> {
     ScopeGuard(f)
 }
 
-/// `C:\harness-Tier2a-verify-<label>-<pid>`を作り、Dropで必ず再帰削除するガード。
+/// `C:\harness-Tier2a-verify-<label>-<pid>`を作り、Dropで再帰削除するガード。
+///
+/// **削除は「必ず成功する」ものではない**——後始末の限界は
+/// [`remove_test_dir_with_retry`]に書いてある。
 ///
 /// **なぜ`tempfile::tempdir()`ではなく`C:\`直下なのか**: `%TEMP%`は実際には
 /// `C:\Users\<user>\AppData\Local\Temp\…`という本物のユーザープロファイルの奥にあり、
@@ -300,7 +303,62 @@ impl TestDirGuard {
 
 impl Drop for TestDirGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        remove_test_dir_with_retry(&self.path);
+    }
+}
+
+/// テストディレクトリを消す。**消えるまで少し待ち、それでも消えなければ黙らない。**
+///
+/// **この関数の主目的は再試行ではなく、失敗を見えるようにすることである。** 旧実装は
+/// `let _ = remove_dir_all(...)`で失敗を捨てており、`C:\`直下に空ディレクトリが積もっている
+/// ことに誰も気付けなかった（[BUG-157](../../../../docs/bugs/BUG-157.md)。8件残っていた）。
+///
+/// **残った8件の引き金は未確定である。** 有力な候補は「`TerminateJobObject`は非同期なので、
+/// Jobを明示終了しても配下のプロセスが消え切る前に`remove_dir_all`が走り、まだ
+/// このツリーをカレントディレクトリにしている子が居て`os error 32`（使用中）になる」だが、
+/// **修正後に緑で回した回では再試行が1度も発火していない**（発火すれば上の`eprintln!`が出る）。
+/// つまりこの再試行は**引き金を再現できていない保険**であり、
+/// 残骸が消えた理由をこの再試行に帰属させてはいけない。もう1つの候補は
+/// 「テスト自身が失敗した回に、生きたままの子孫がツリーを掴んでいた」で、
+/// 残っていた8件の作成時刻は製品修正前の測定（6緑2赤）の時間帯と一致する。
+///
+/// `Drop`から呼ばれるのでpanicしない——テスト本体が失敗して巻き戻している最中に
+/// panicするとプロセスごとabortし、**本来の失敗理由が消える**。代わりにstderrへ残す
+/// （昇格ランナーの`cancel-descendants`は`--nocapture`で回すので、そのまま目に入る）。
+fn remove_test_dir_with_retry(path: &std::path::Path) {
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let started = std::time::Instant::now();
+    let mut retries = 0usize;
+    loop {
+        let error = match std::fs::remove_dir_all(path) {
+            Ok(()) => {
+                // **再試行が効いたのか、そもそも1回で消えたのかを区別できるようにしておく。**
+                // 区別が付かないと「残骸が出なくなった」理由をこの再試行だと言えない
+                // （`measurement-review`の「計器を疑う」）。
+                if retries > 0 {
+                    eprintln!(
+                        "cleanup: removed {} after {retries} retries ({:?})",
+                        path.display(),
+                        started.elapsed(),
+                    );
+                }
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => e,
+        };
+        if started.elapsed() >= DEADLINE {
+            eprintln!(
+                "cleanup: FAILED to remove the test directory {} after {DEADLINE:?}: {error}. \
+                 It is left on the real machine — remove it by hand and find out what still holds it.",
+                path.display(),
+            );
+            return;
+        }
+        retries += 1;
+        std::thread::sleep(POLL);
     }
 }
 
