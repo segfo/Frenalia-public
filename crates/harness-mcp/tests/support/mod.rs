@@ -15,7 +15,9 @@ use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
 
 use harness_core::RiskClass;
-use harness_mcp::decl::{McpNetworkDecl, McpServerDecl, McpTransportKind, McpWorkspaceAccess};
+use harness_mcp::decl::{
+    McpNetworkDecl, McpProcessAccess, McpServerDecl, McpTransportKind, McpWorkspaceAccess,
+};
 use harness_mcp::http_wire::EndpointGates;
 use harness_mcp::runtime::McpGates;
 
@@ -85,6 +87,7 @@ pub fn decl(url: &str, tools: &[(&str, RiskClass)]) -> McpServerDecl {
             .collect(),
         network: McpNetworkDecl::default(),
         workspace: McpWorkspaceAccess::None,
+        process: McpProcessAccess::Deny,
     }
 }
 

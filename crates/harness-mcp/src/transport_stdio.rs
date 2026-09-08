@@ -304,6 +304,7 @@ mod tests {
                 tools: Default::default(),
                 network: McpNetworkDecl::default(),
                 workspace: McpWorkspaceAccess::None,
+                process: crate::decl::McpProcessAccess::Deny,
             },
             isolation: PreparedIsolation::Direct {
                 endpoint,

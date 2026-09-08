@@ -67,6 +67,36 @@ pub struct McpStartupPlan {
     /// 起動しないもの（理由付き）。**黙って落とさない**——ユーザーは「MCPが動いていない」
     /// ことに気付けなければ、裏取り無しの結論をMCP裏取り済みと誤解する。
     pub skipped: Vec<SkippedServer>,
+    /// **harnessが宣言に欄を増やしたせいで承認が無効になった**サーバのid
+    /// （[`crate::decl::DECL_FORMAT_VERSION`]）。
+    ///
+    /// これらは[`Self::skipped`]にも「未承認」として載る。**こちらは断り文ではなく、
+    /// 起動時に1回だけ出す理由の材料**である——サーバごとに理由を繰り返すと、
+    /// 本人が宣言を書き換えた場合との区別が付かない文言を人数分並べることになる。
+    pub voided_by_format_upgrade: Vec<String>,
+}
+
+impl McpStartupPlan {
+    /// **宣言の欄が増えたことによる失効を、1回だけ説明する行**（`None`なら起きていない）。
+    ///
+    /// サーバごとの断り文（[`SkippedServer::message`]）は「宣言はあるが未承認」のままにし、
+    /// 理由はここでまとめて言う。**「あなたが宣言を書き換えた」とは書かない**——書き換えたか
+    /// どうかを区別する材料を持っていないからで、代わりに
+    /// **「承認の前に宣言の全文が出るので、それを見て判断してほしい」**へ寄せる。
+    pub fn format_upgrade_notice(&self) -> Option<String> {
+        if self.voided_by_format_upgrade.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "harness added a new mcp declaration field ({:?}), so every approval recorded before \
+             this version of harness no longer matches. {} declared server(s) need re-approval: \
+             {}. The full declaration is shown before you approve it -- review it and run \
+             `harness mcp approve <id>`",
+            crate::decl::DECL_FORMAT_VERSION_ADDED_FIELD,
+            self.voided_by_format_upgrade.len(),
+            self.voided_by_format_upgrade.join(", ")
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -289,6 +319,11 @@ impl McpRuntime {
             if ledger.is_approved(decl) {
                 plan.approved.push(decl.clone());
             } else {
+                // 版が古い承認は`approval_for_id`が返さないので、`stale`は立たない
+                // ——断り文は「宣言はあるが未承認」になる。理由は起動時に1行だけ出す。
+                if ledger.is_voided_by_format_upgrade(&decl.id) {
+                    plan.voided_by_format_upgrade.push(decl.id.clone());
+                }
                 plan.skipped.push(SkippedServer {
                     id: decl.id.clone(),
                     reason: SkipReason::NotApproved {
@@ -548,7 +583,7 @@ mod tests {
     use super::*;
     use crate::approval::ApprovalStore;
     use crate::client::test_support::ScriptedTransport;
-    use crate::decl::{McpNetworkDecl, McpTransportKind, McpWorkspaceAccess};
+    use crate::decl::{McpNetworkDecl, McpProcessAccess, McpTransportKind, McpWorkspaceAccess};
     use harness_core::RiskClass;
     use std::sync::Mutex;
 
@@ -567,6 +602,7 @@ mod tests {
                 .collect(),
             network: McpNetworkDecl::default(),
             workspace: McpWorkspaceAccess::None,
+            process: McpProcessAccess::Deny,
         }
     }
 
@@ -823,6 +859,59 @@ mod tests {
             SkipReason::NotApproved { stale: true }
         );
         assert!(plan.skipped[0].message().contains("has changed since"));
+    }
+
+    /// **harnessが宣言の欄を増やしたことによる失効は、「宣言が変わった」と案内しない**
+    /// （`crate::decl::DECL_FORMAT_VERSION`）。理由は起動時の1行が持つ。
+    #[test]
+    fn a_format_upgrade_is_not_reported_as_the_user_changing_the_declaration() {
+        let d = decl("docs");
+        // 版だけを1つ古くする（ハッシュは一致させたままにして、**版だけ**が効いていることを見る）。
+        let ledger = crate::approval::McpApprovalLedger {
+            approvals: vec![crate::approval::McpApproval {
+                id: d.id.clone(),
+                decl_hash: d.approval_hash(),
+                approved_at_unix_secs: 0,
+                summary: None,
+                decl_format_version: Some(crate::decl::DECL_FORMAT_VERSION - 1),
+            }],
+        };
+        let plan = McpRuntime::plan(std::slice::from_ref(&d), &ledger, &no_gates());
+
+        assert!(plan.approved.is_empty(), "版が古い承認で起動している");
+        assert_eq!(
+            plan.skipped[0].reason,
+            SkipReason::NotApproved { stale: false },
+            "harnessが欄を増やしたのに「あなたが宣言を変えた」と案内している"
+        );
+        assert!(!plan.skipped[0].message().contains("has changed since"));
+
+        let notice = plan
+            .format_upgrade_notice()
+            .expect("理由を出さないと「黙って起動しなくなった」になる");
+        assert!(notice.contains("process"), "{notice}");
+        assert!(notice.contains("docs"), "{notice}");
+    }
+
+    /// **対の側**（`B-35`）: 現行版で承認されていれば、その1行は出ない。
+    ///
+    /// 片方だけだと「常に出す実装」でも上のテストは通り、毎起動で無関係な警告が出る。
+    #[test]
+    fn a_current_format_approval_produces_no_upgrade_notice() {
+        let (_dir, store) = store();
+        let d = decl("docs");
+        store.approve(&d);
+        let plan = McpRuntime::plan(std::slice::from_ref(&d), &store.load(), &no_gates());
+        assert_eq!(plan.approved, vec![d]);
+        assert_eq!(plan.format_upgrade_notice(), None);
+    }
+
+    /// 一度も承認していない宣言では、この1行は出ない（**失効していないため**）。
+    #[test]
+    fn a_never_approved_declaration_produces_no_upgrade_notice() {
+        let (_dir, store) = store();
+        let plan = McpRuntime::plan(&[decl("docs")], &store.load(), &no_gates());
+        assert_eq!(plan.format_upgrade_notice(), None);
     }
 
     #[test]

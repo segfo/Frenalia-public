@@ -39,7 +39,9 @@ use harness_sandbox::tier2a::spawnd::{SharedSpawnDaemon, SpawnRequest};
 use harness_sandbox::tier2a::win_appcontainer::revoke_session_grant;
 
 use super::AppContainerTransportFactory;
-use crate::decl::{McpNetworkDecl, McpServerDecl, McpTransportKind, McpWorkspaceAccess};
+use crate::decl::{
+    McpNetworkDecl, McpProcessAccess, McpServerDecl, McpTransportKind, McpWorkspaceAccess,
+};
 use crate::runtime::TransportFactory;
 
 /// プローブを置く使い捨てディレクトリ。**`Drop`で消す。**
@@ -153,7 +155,12 @@ fn spawn_request_payload() -> String {
     .expect("serialize the spawn request")
 }
 
-fn probe_decl(probe: &Path, request_pipe: &str, payload: &str) -> McpServerDecl {
+fn probe_decl(
+    probe: &Path,
+    request_pipe: &str,
+    payload: &str,
+    process: McpProcessAccess,
+) -> McpServerDecl {
     McpServerDecl {
         id: "e2e-spawn-reach".to_string(),
         transport: McpTransportKind::Stdio,
@@ -174,6 +181,7 @@ fn probe_decl(probe: &Path, request_pipe: &str, payload: &str) -> McpServerDecl 
         network: McpNetworkDecl::default(),
         // §3.2の既定。workspaceへのACEを一切付けない。
         workspace: McpWorkspaceAccess::None,
+        process,
     }
 }
 
@@ -204,7 +212,12 @@ fn an_mcp_server_started_through_the_product_transport_cannot_reach_the_request_
     );
 
     let payload = spawn_request_payload();
-    let decl = probe_decl(&probe, daemon.request_pipe(), &payload);
+    let decl = probe_decl(
+        &probe,
+        daemon.request_pipe(),
+        &payload,
+        McpProcessAccess::Deny,
+    );
     let prepared = crate::sandbox::prepare(&decl, workspace.path()).expect("mcp preflight");
     // **`\\.\pipe\`についての警告が1件出るのは想定どおりである**（追いかけないこと）。
     //

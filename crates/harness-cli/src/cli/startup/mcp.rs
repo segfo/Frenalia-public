@@ -113,6 +113,15 @@ pub(super) async fn prepare_mcp_servers(
     let store = ApprovalStore::in_config_dir();
     let mut plan = McpRuntime::plan(decls, &store.load(), gates);
 
+    // **宣言の欄が増えて承認が失効したことは、聞き直す前に言う**
+    // （`harness_mcp::DECL_FORMAT_VERSION`）。これが無いと、対話では「なぜまた聞かれるのか」、
+    // ヘッドレスでは「昨日まで動いていたサーバが黙って起動しなくなった」になる。
+    // **サーバごとではなく1回**——理由は全サーバで同じで、繰り返すと本人が宣言を書き換えた
+    // 場合との区別が付かない文言が人数分並ぶ。
+    if let Some(notice) = plan.format_upgrade_notice() {
+        eprintln!("warning: {notice}");
+    }
+
     // 承認経路2（起動時プロンプト）。ヘッドレスでは呼ばない——`DESIGN.md` §パーミッションの
     // 「ヘッドレス時はプロンプトになるものを既定で自動拒否」と同じ規則。
     if interactive {

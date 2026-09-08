@@ -21,6 +21,37 @@ use harness_core::RiskClass;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// 承認台帳へ記録する、**宣言の形の版**（`DESIGN-MCP.md` §4.2）。
+///
+/// # 何のために在るのか
+///
+/// [`McpServerDecl`]へフィールドを足すと、[`McpServerDecl::approval_hash`]が変わって
+/// **既存の承認が一斉に失効する**。これは意図した動作（挙動が無言で変わらない代償）だが、
+/// 失効の理由を伝える手段が無いと、ユーザーには
+/// **「あなたが宣言を書き換えたので失効した」という嘘**として届く。
+///
+/// この版はそこを塞ぐ。**版が古い承認は「無かったもの」として扱う**ので、断り文は
+/// 既存の「宣言はあるが未承認」1本で足りる——**その文は、本人が同時に宣言を
+/// 書き換えていた場合でも正しい**。新しい断り文も新しい状態も作らない。
+///
+/// # 次にフィールドを足すときも同じ手順である
+///
+/// 1. この定数を1つ上げる
+/// 2. 起動時に出す1行（`harness-cli`の`prepare_mcp_servers`）へ、増えた欄の名前を書く
+///
+/// **版ごとの分岐を書かない。** ここが持っているのは「現行かどうか」だけで、
+/// 「1から2へ何が変わったか」は持たない——持つと、足すたびに分岐が1つ増える。
+///
+/// | 版 | 何が違うか |
+/// |---|---|
+/// | 1 | `process`を持たない（版そのものが無かった頃。台帳では`None`として現れる） |
+/// | 2 | `process`（`DESIGN-MAC-DOMAIN.md` §22.2.2）を持つ |
+pub const DECL_FORMAT_VERSION: u32 = 2;
+
+/// [`DECL_FORMAT_VERSION`]がこの版で増やした欄の名前。**起動時に出す1行が使う唯一の文字列**で、
+/// 版を上げるときはここも一緒に書き換える（版ごとの分岐を作らないための1本化）。
+pub const DECL_FORMAT_VERSION_ADDED_FIELD: &str = "process";
+
 /// ツール名全体（`mcp__<server>__<tool>`）の上限。Anthropic/OpenAIのツール名は
 /// `^[a-zA-Z0-9_-]{1,64}$`（`plans/DESIGN.md` §ツールシステム）。
 pub const MAX_TOOL_NAME_LEN: usize = 64;
@@ -63,6 +94,39 @@ pub enum McpWorkspaceAccess {
     None,
     Read,
     ReadWrite,
+}
+
+/// サーバが**子プロセスを生成してよいか**（`DESIGN-MCP.md` §3.2、正本は
+/// `DESIGN-MAC-DOMAIN.md` §22.2.2）。既定は`Deny`。
+///
+/// # なぜ既定が`Deny`なのか
+///
+/// AppContainerのcapabilityは**トークン属性でプロセスツリー全体が継承する**（T-15）。したがって
+/// `network`を宣言したサーバが子を自由に生めると、**そのegressを持つ子を好きなだけ生める**
+/// ——D-38がサーバ単位に絞ったはずの権限が、サーバが選んだ任意のコードへ渡る。
+/// 既定を`Broker`にすると、統制が要るサーバほど何も宣言しないまま素通りする。
+///
+/// # 今日の意味と、`CHILD_PROCESS_RESTRICTED`適用後の意味は違う
+///
+/// | | 今日（段階⑤の前） | `CHILD_PROCESS_RESTRICTED`適用後 |
+/// |---|---|---|
+/// | `Deny` | spawn要求用capabilityを積まない＝Spawn Daemonの要求受付パイプへ**到達できない**。ただしOSの緩和策をまだ積んでいないので、**サーバ自身は直接子を生める** | 加えてOSが子プロセス生成そのものを拒否する（二重のdeny） |
+/// | `Broker` | capabilityを積むので窓口へ**届く**。ただし遷移ポリシーの評価が未実装（段階E）なので、答えは常に`policy_not_implemented`である | Daemon経由の遷移としてポリシーが判定する |
+///
+/// **「宣言したから今日から窓口経由になる」ではない。** いま`Broker`が変えるのは
+/// 「窓口に話しかけられるか」だけで、子プロセスの作られ方は変わらない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpProcessAccess {
+    #[default]
+    Deny,
+    Broker,
+}
+
+impl McpProcessAccess {
+    pub fn is_deny(self) -> bool {
+        matches!(self, McpProcessAccess::Deny)
+    }
 }
 
 /// サーバのnetwork要求（`DESIGN-MCP.md` §3.2）。既定は全拒否。
@@ -133,6 +197,12 @@ pub struct McpServerDecl {
     /// 【stdio】
     #[serde(default)]
     pub workspace: McpWorkspaceAccess,
+    /// 【stdio】子プロセスを生成してよいか（`DESIGN-MAC-DOMAIN.md` §22.2.2）。既定は`Deny`。
+    ///
+    /// **書かなくても書いても、既定値なら承認ハッシュは同じ**である（`serde`の既定値が
+    /// 埋めた後の値をハッシュするため）。書き忘れで承認が失効することはない。
+    #[serde(default)]
+    pub process: McpProcessAccess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -301,6 +371,11 @@ impl McpServerDecl {
         if self.workspace != McpWorkspaceAccess::None {
             return Err(not_applicable("workspace"));
         }
+        // Streamable HTTPには**閉じ込める子プロセスが存在しない**（喋るのはharness本体、§6.2）。
+        // 生成統制の対象そのものが無いので、`process`を書いても効かない。
+        if !self.process.is_deny() {
+            return Err(not_applicable("process"));
+        }
 
         if self.url.trim().is_empty() {
             return Err(DeclError::EmptyUrl {
@@ -383,6 +458,7 @@ impl McpServerDecl {
             tools,
             network,
             workspace,
+            process,
         } = self;
 
         let mut allow_domains: Vec<String> = network
@@ -411,6 +487,10 @@ impl McpServerDecl {
             tools: &'a BTreeMap<String, RiskClass>,
             allow_domains: Vec<String>,
             workspace: &'a McpWorkspaceAccess,
+            /// **必ずハッシュへ入れる**（`DESIGN-MAC-DOMAIN.md` §22.2.2）。`broker`は
+            /// 「このサーバはSpawn Daemonへ生成を頼んでよい」という許可そのものなので、
+            /// 承認後に`deny`から差し替えられてはいけない。
+            process: &'a McpProcessAccess,
         }
 
         let canonical = Canonical {
@@ -431,6 +511,7 @@ impl McpServerDecl {
             tools,
             allow_domains,
             workspace,
+            process,
         };
         // `to_string`が失敗するのは`Serialize`実装がエラーを返す場合だけで、上の型は
         // すべてinfallible。それでもunwrapは避け、失敗時は決して既存の承認と一致しない
@@ -530,6 +611,23 @@ impl McpServerDecl {
                 }
             ));
             out.push_str(&format!("  workspace: {:?}\n", self.workspace));
+            // **今日どこまで効くかを正直に書く。** `CHILD_PROCESS_RESTRICTED`（OSが子プロセス
+            // 生成そのものを拒否する緩和策）はまだ積んでおらず、遷移ポリシーの評価も未実装なので、
+            // ここで承認する内容と今日の実際の挙動は一致しない。**一致しないことを書く**
+            // （書かないと「宣言したから今日から統制されている」と読める）。
+            out.push_str(&format!(
+                "  process:   {}\n",
+                match self.process {
+                    McpProcessAccess::Deny =>
+                        "deny (it may not ask harness to spawn anything; NOTE: the OS-level child \
+                         process block is not applied yet, so today this server can still start \
+                         child processes on its own)",
+                    McpProcessAccess::Broker =>
+                        "BROKER (it may ask harness to spawn programs on its behalf; NOTE: the \
+                         transition policy is not implemented yet, so every such request is \
+                         refused for now)",
+                }
+            ));
         }
         out
     }
@@ -657,6 +755,7 @@ mod tests {
                 allow_domains: vec!["docs.example.com".to_string()],
             },
             workspace: McpWorkspaceAccess::None,
+            process: McpProcessAccess::Deny,
         }
     }
 
@@ -730,6 +829,37 @@ mod tests {
         ));
     }
 
+    /// **フィールドを足したら、承認の形の版を上げたか一度考える。**
+    ///
+    /// `approval_hash`の完全分解は「ハッシュ対象へ足したか」を強制するが、
+    /// **「版を上げたか」は強制しない**。ここが`..`無しで分解しているので、
+    /// [`McpServerDecl`]へフィールドを足すと**このテストがコンパイルエラーになる**——
+    /// そのとき [`DECL_FORMAT_VERSION`] を上げ、下の数値も合わせること。
+    ///
+    /// 版を上げ忘れると、既存の承認は失効するのに**「あなたが宣言を変えた」という
+    /// 誤った理由**で案内される（失効そのものは正しく起きるので、テストでは気付けない）。
+    #[test]
+    fn adding_a_declaration_field_forces_a_look_at_the_format_version() {
+        let McpServerDecl {
+            id: _,
+            transport: _,
+            command: _,
+            args: _,
+            env: _,
+            url: _,
+            headers: _,
+            tls_pin: _,
+            tools: _,
+            network: _,
+            workspace: _,
+            process: _,
+        } = sample();
+        assert_eq!(
+            DECL_FORMAT_VERSION, 2,
+            "宣言の欄を増やしたら DECL_FORMAT_VERSION を上げ、起動時に出す1行へ欄の名前を足すこと"
+        );
+    }
+
     #[test]
     fn hash_is_stable_across_calls() {
         let decl = sample();
@@ -772,6 +902,12 @@ mod tests {
         let mut m = base.clone();
         m.workspace = McpWorkspaceAccess::ReadWrite;
         mutations.push(("workspace", m));
+
+        // §22.2.2: `broker`は「Spawn Daemonへ生成を頼んでよい」という許可そのものなので、
+        // 承認後に差し替えられてはいけない。
+        let mut m = base.clone();
+        m.process = McpProcessAccess::Broker;
+        mutations.push(("process", m));
 
         for (label, mutated) in mutations {
             assert_ne!(
@@ -818,7 +954,50 @@ mod tests {
         assert!(decls[0].args.is_empty());
         assert!(decls[0].network.is_deny());
         assert_eq!(decls[0].workspace, McpWorkspaceAccess::None);
+        assert_eq!(decls[0].process, McpProcessAccess::Deny);
         assert_eq!(decls[0].validate(), Ok(()));
+    }
+
+    /// **書き忘れで承認が失効しない。** `"process": "deny"`と書いても書かなくても、
+    /// `serde`の既定値が埋めた後の同じ値をハッシュするので結果は一致する
+    /// （`workspace`が既にそうなっているのと同じ形）。
+    #[test]
+    fn omitting_the_process_key_hashes_the_same_as_writing_the_default() {
+        let with = serde_json::json!({
+            "servers": [ { "id": "docs", "command": "node.exe", "process": "deny" } ]
+        });
+        let without = serde_json::json!({
+            "servers": [ { "id": "docs", "command": "node.exe" } ]
+        });
+        let with = parse_mcp_settings(Some(&with)).unwrap();
+        let without = parse_mcp_settings(Some(&without)).unwrap();
+        assert_eq!(with[0].approval_hash(), without[0].approval_hash());
+    }
+
+    /// 綴り間違いを黙って既定値にしない（`"process": "brokre"`が`deny`にならない）。
+    #[test]
+    fn a_misspelled_process_value_is_an_error_rather_than_a_silent_deny() {
+        let value = serde_json::json!({
+            "servers": [ { "id": "docs", "command": "node.exe", "process": "brokre" } ]
+        });
+        assert!(parse_mcp_settings(Some(&value)).is_err());
+    }
+
+    /// **承認画面は「今日どこまで効くか」まで書く**（`DESIGN-MAC-DOMAIN.md` §22.2.2）。
+    ///
+    /// `CHILD_PROCESS_RESTRICTED`も遷移ポリシーの評価も未実装なので、宣言と今日の挙動は
+    /// 一致しない。**一致しないことが承認前に読める**ことをここで固定する——
+    /// 書かないと「宣言したから今日から統制されている」と読める。
+    #[test]
+    fn describe_says_how_far_the_process_declaration_actually_reaches_today() {
+        let denied = sample().describe();
+        assert!(denied.contains("not applied yet"), "{denied}");
+
+        let mut brokered = sample();
+        brokered.process = McpProcessAccess::Broker;
+        let brokered = brokered.describe();
+        assert!(brokered.contains("BROKER"), "{brokered}");
+        assert!(brokered.contains("not implemented yet"), "{brokered}");
     }
 
     #[test]
@@ -888,6 +1067,7 @@ mod tests {
                 .collect(),
             network: McpNetworkDecl::default(),
             workspace: McpWorkspaceAccess::None,
+            process: McpProcessAccess::Deny,
         }
     }
 
@@ -938,6 +1118,10 @@ mod tests {
             (
                 "workspace",
                 Box::new(|d: &mut McpServerDecl| d.workspace = McpWorkspaceAccess::Read),
+            ),
+            (
+                "process",
+                Box::new(|d: &mut McpServerDecl| d.process = McpProcessAccess::Broker),
             ),
         ];
         for (field, mutate) in cases {

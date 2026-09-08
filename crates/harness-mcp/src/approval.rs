@@ -48,22 +48,62 @@ pub struct McpApproval {
     /// **照合には使わない**——照合は`decl_hash`だけで行う。
     #[serde(default)]
     pub summary: Option<String>,
+    /// 記録した時点の**宣言の形の版**（[`crate::decl::DECL_FORMAT_VERSION`]）。
+    ///
+    /// `None`は版という欄が無かった頃に書かれたエントリで、版1として扱う。
+    /// **古い台帳がそのまま読める**ことがこの欄を`Option`にしている理由である。
+    #[serde(default)]
+    pub decl_format_version: Option<u32>,
+}
+
+impl McpApproval {
+    /// いまの harness が使っている宣言の形で記録されたエントリか。
+    ///
+    /// 偽なら、この承認は**harnessが宣言に欄を増やしたことで失効した**もので、
+    /// ユーザーが宣言を書き換えたわけではない。
+    fn is_current_format(&self) -> bool {
+        self.decl_format_version.unwrap_or(1) == crate::decl::DECL_FORMAT_VERSION
+    }
 }
 
 impl McpApprovalLedger {
-    /// この宣言が承認済みか。idとハッシュの**両方**が一致した場合のみ真。
+    /// この宣言が承認済みか。id・ハッシュ・**宣言の形の版**がすべて一致した場合のみ真。
     ///
     /// idだけの一致で通すと、承認済みidの中身をリポジトリ側で差し替える経路がそのまま開く。
+    ///
+    /// **版も見るのは、ハッシュ差に頼らないためである。** 欄を1つ増やせば正規化JSONが変わるので
+    /// 普通はハッシュ側だけで落ちるが、版を上げる理由は欄の追加とは限らない（正規化の仕方を
+    /// 変える等）。**そのときハッシュが偶然一致すると、古い形で承認したものが通ってしまう。**
+    /// 版を条件に入れておけば、理由が何であれ「形が変わったら通さない」が成立する
+    /// （[`crate::decl::DECL_FORMAT_VERSION`]。倒れる向きは常に fail-closed）。
     pub fn is_approved(&self, decl: &McpServerDecl) -> bool {
         let hash = decl.approval_hash();
         self.approvals
             .iter()
-            .any(|a| a.id == decl.id && a.decl_hash == hash)
+            .any(|a| a.id == decl.id && a.decl_hash == hash && a.is_current_format())
     }
 
     /// idに対する既存の承認（内容が変わって失効している場合の説明に使う）。
+    ///
+    /// **版が古いエントリは返さない。** 返すと、harnessが宣言に欄を増やしたことによる失効が
+    /// 「ユーザーが宣言を書き換えた」という断り文で案内されてしまう
+    /// （[`crate::decl::DECL_FORMAT_VERSION`]）。無かったものとして扱えば、
+    /// 断り文は既存の「宣言はあるが未承認」1本で足り、**その文はどの場合でも正しい**。
     pub fn approval_for_id(&self, id: &str) -> Option<&McpApproval> {
-        self.approvals.iter().find(|a| a.id == id)
+        self.approvals
+            .iter()
+            .find(|a| a.id == id && a.is_current_format())
+    }
+
+    /// **harnessが宣言の形を変えたせいで無視している承認**があるか。
+    ///
+    /// 起動時に理由を1行出すためだけに使う（[`Self::is_approved`]も
+    /// [`Self::approval_for_id`]もこれを見ない）。**理由を出さないと、
+    /// 「昨日まで動いていたサーバが黙って起動しなくなった」になる。**
+    pub fn is_voided_by_format_upgrade(&self, id: &str) -> bool {
+        self.approvals
+            .iter()
+            .any(|a| a.id == id && !a.is_current_format())
     }
 }
 
@@ -107,6 +147,7 @@ impl ApprovalStore {
             decl_hash: decl.approval_hash(),
             approved_at_unix_secs: now_unix_secs(),
             summary: Some(decl.describe()),
+            decl_format_version: Some(crate::decl::DECL_FORMAT_VERSION),
         };
         self.ledger.update(|l| {
             l.approvals.retain(|a| a.id != approval.id);
@@ -127,7 +168,9 @@ impl ApprovalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decl::{McpNetworkDecl, McpServerDecl, McpTransportKind, McpWorkspaceAccess};
+    use crate::decl::{
+        McpNetworkDecl, McpProcessAccess, McpServerDecl, McpTransportKind, McpWorkspaceAccess,
+    };
 
     fn decl(id: &str) -> McpServerDecl {
         McpServerDecl {
@@ -142,6 +185,7 @@ mod tests {
             tools: Default::default(),
             network: McpNetworkDecl::default(),
             workspace: McpWorkspaceAccess::None,
+            process: McpProcessAccess::Deny,
         }
     }
 
@@ -214,6 +258,72 @@ mod tests {
         assert_eq!(store.revoke("docs"), 1);
         assert!(!store.load().is_approved(&d));
         assert_eq!(store.revoke("docs"), 0);
+    }
+
+    /// 版を1つ古くしたエントリを1件だけ持つ台帳。
+    fn ledger_with_version(d: &McpServerDecl, version: Option<u32>) -> McpApprovalLedger {
+        McpApprovalLedger {
+            approvals: vec![McpApproval {
+                id: d.id.clone(),
+                decl_hash: d.approval_hash(),
+                approved_at_unix_secs: 0,
+                summary: None,
+                decl_format_version: version,
+            }],
+        }
+    }
+
+    /// **版が古い承認は「無かったもの」として扱う**（[`crate::decl::DECL_FORMAT_VERSION`]）。
+    ///
+    /// ハッシュがたまたま一致していても（このテストは一致させている）、
+    /// `approval_for_id`は返さない——返すと、harnessが宣言に欄を増やしたことによる失効が
+    /// 「あなたが宣言を書き換えた」という断り文で案内されてしまう。
+    #[test]
+    fn an_approval_recorded_under_an_older_declaration_format_is_ignored() {
+        let d = decl("docs");
+        for stale in [None, Some(crate::decl::DECL_FORMAT_VERSION - 1)] {
+            let ledger = ledger_with_version(&d, stale);
+            assert!(
+                ledger.approval_for_id("docs").is_none(),
+                "版 {stale:?} のエントリが現行として見えている"
+            );
+            assert!(ledger.is_voided_by_format_upgrade("docs"));
+            // **ハッシュが一致していても通さない**（`is_approved`のdoc）。この台帳は
+            // わざとハッシュを合わせてあるので、落ちる理由は版だけである。
+            assert!(
+                !ledger.is_approved(&d),
+                "版 {stale:?} の承認がハッシュ一致で通っている"
+            );
+        }
+    }
+
+    /// **対の側**（`B-35`）: 現行版のエントリは今までどおり見える。
+    ///
+    /// 片方だけだと「常に`None`を返す実装」でも上のテストは通る。
+    #[test]
+    fn an_approval_recorded_under_the_current_format_is_still_visible() {
+        let d = decl("docs");
+        let ledger = ledger_with_version(&d, Some(crate::decl::DECL_FORMAT_VERSION));
+        assert!(ledger.approval_for_id("docs").is_some());
+        assert!(
+            !ledger.is_voided_by_format_upgrade("docs"),
+            "現行版なのに「harnessが変えたせい」と報告されている"
+        );
+        assert!(ledger.is_approved(&d), "現行版の承認が照合で落ちている");
+    }
+
+    /// 再承認すると現行の版が記録され、以後は「harnessが変えたせい」に数えられない。
+    #[test]
+    fn re_approving_stamps_the_current_declaration_format() {
+        let (_dir, store) = store();
+        let d = decl("docs");
+        store.approve(&d);
+        let ledger = store.load();
+        assert_eq!(
+            ledger.approvals[0].decl_format_version,
+            Some(crate::decl::DECL_FORMAT_VERSION)
+        );
+        assert!(!ledger.is_voided_by_format_upgrade("docs"));
     }
 
     /// 台帳が壊れている/存在しない場合はデフォルト（＝何も承認されていない）として読む。

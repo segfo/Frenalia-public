@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use harness_core::{RiskClass, ToolCtx};
 use harness_mcp::approval::ApprovalStore;
-use harness_mcp::decl::{McpNetworkDecl, McpServerDecl, McpTransportKind, McpWorkspaceAccess};
+use harness_mcp::decl::{
+    McpNetworkDecl, McpProcessAccess, McpServerDecl, McpTransportKind, McpWorkspaceAccess,
+};
 use harness_mcp::runtime::{McpGates, McpRuntime, PreparedServer, SkippedServer, TransportFactory};
 use harness_mcp::transport::{LineAccumulator, Transport};
 use harness_mcp::McpError;
@@ -157,6 +159,7 @@ fn decl_with(tools: &[(&str, RiskClass)]) -> McpServerDecl {
             .collect(),
         network: McpNetworkDecl::default(),
         workspace: McpWorkspaceAccess::None,
+        process: McpProcessAccess::Deny,
     }
 }
 
