@@ -435,6 +435,30 @@ fn accept_loop(
                 let _ = CloseHandle(client);
             }
         }));
+        // **終わったハンドラの取っ手をここで捨てる**（2026-09-07のT1測定で発覚）。
+        //
+        // かつてこの`Vec`は接続のたびに伸びるだけで、片付くのは**Daemonの終了時**だけだった。
+        // 終わったスレッドの取っ手も`join`されるまで開いたままなので、**接続の総数だけ溜まる**
+        // ——T1の掃引では1つのDaemonが約5,000接続を捌いた。段階⑤で「1要求＝1接続」を採ると、
+        // 接続数＝生成要求数になる（実測で`cargo build`1回あたり765本、
+        // [§S56](../../../../plans/mac-spike/RESULTS.md)）。
+        //
+        // **`join`は残す**（下の終了処理）。ここで足すのは回収だけで、
+        // 「全部終わるのを待ってから畳む」という不変条件は変えない
+        // ——回収だけ入れて終了時の`join`を消すと、**畳んでいる最中のハンドラを置き去りにする**
+        // （`B-01`: 対の片方だけ実装する）。
+        //
+        // **終わっているものだけを`join`する**ので、ここでブロックしない
+        // （`is_finished`が真なら`join`は即座に返る）。`join`は所有権を要求するので、
+        // 一度取り出して2つに分ける。
+        let (finished, running): (Vec<_>, Vec<_>) = std::mem::take(&mut handlers)
+            .into_iter()
+            .partition(|handler| handler.is_finished());
+        for handler in finished {
+            let _ = handler.join();
+        }
+        handlers = running;
+
         match next {
             Some(next) => pipe = next,
             None => break,

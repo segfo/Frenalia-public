@@ -147,6 +147,23 @@ fn read_exec_roots(req: &McpPreflightRequest<'_>) -> Vec<PathBuf> {
             }
         }
     }
+    // **デバイス名前空間は付与先にならない**（2026-09-07、T2の測定中に発覚）。
+    //
+    // `\\.\pipe\...`のような名前は`Path::exists`が真になるので、宣言の引数から
+    // 実在する絶対パスとして拾われ、その親＝**パイプ名前空間の根`\\.\pipe\`**が
+    // ここへ候補として現れる。`command`側はさらに緩く、**実在の検査すら通らずに**
+    // `parent()`が入る——だから落とすのは`existing_arg_paths`（引数側だけ）ではなく、
+    // **2つの入口が合流するここ**である（`B-06`: N経路のうちN経路で数える）。
+    //
+    // **いま実害が出ていないのは偶然である。** 付与側（`is_force_grant_forbidden`）が
+    // 断ってはいるが、断る理由は「デバイス名前空間だから」ではなく`canonicalize`に
+    // 失敗したからで、**偶然で塞がっている**。MCPの宣言は「ユーザーが宣言した第三者コード」
+    // （D-38）なので、そこから付与候補が決まる経路は意図で塞ぐ。
+    let roots: BTreeSet<PathBuf> = roots
+        .into_iter()
+        .filter(|root| !is_device_namespace(root))
+        .collect();
+
     // 祖先が既に入っているなら子孫は要らない（継承ACEが覆う）。付与回数＝ACL書込を減らす。
     let all: Vec<PathBuf> = roots.into_iter().collect();
     all.iter()
@@ -156,6 +173,18 @@ fn read_exec_roots(req: &McpPreflightRequest<'_>) -> Vec<PathBuf> {
         })
         .cloned()
         .collect()
+}
+
+/// Win32のデバイス名前空間（`\\.\…` と `\\?\…`）か。
+///
+/// **どちらも「ファイルシステム上の場所」ではない。** 前者は名前付きパイプ・シリアルポート等の
+/// デバイスを指し、後者はパス解析を飛ばす前置き（verbatim）で、`\\?\C:\x`のように
+/// **実在のパスを指すこともある**。それでも**両方落とす**——ここは付与先を決める場所で、
+/// 宣言がどちらの綴りで書いてきても、通常の`C:\…`へ正規化された形で受け取るべきだからである
+/// （verbatim形のまま付与すると、同じ場所を2つの綴りで別々に扱う形になる）。
+fn is_device_namespace(path: &Path) -> bool {
+    let text = path.as_os_str().to_string_lossy();
+    text.starts_with(r"\\.\") || text.starts_with(r"\\?\")
 }
 
 #[cfg(test)]
@@ -185,6 +214,54 @@ mod tests {
         let args = vec![PathBuf::from(r"C:\mcp\docs\index.js")];
         let roots = read_exec_roots(&req(&command, &args));
         assert!(roots.contains(&PathBuf::from(r"C:\mcp\docs")), "{roots:?}");
+    }
+
+    /// **引数側の入口**: デバイス名前空間は付与候補にならない（2026-09-07、T2で発覚）。
+    ///
+    /// 名前付きパイプは`Path::exists`が真になるので、引数から実在の絶対パスとして拾われる。
+    /// 落とさないと**パイプ名前空間の根**が付与先の候補になる。
+    #[test]
+    fn a_device_namespace_argument_is_not_a_grant_candidate() {
+        let command = PathBuf::from(r"C:\tools\nodejs\node.exe");
+        let args = vec![PathBuf::from(r"\\.\pipe\harness-spawnd-request-1-0-2")];
+        let roots = read_exec_roots(&req(&command, &args));
+        assert_eq!(
+            roots,
+            vec![PathBuf::from(r"C:\tools\nodejs")],
+            "デバイス名前空間が付与候補に残っている: {roots:?}"
+        );
+    }
+
+    /// **コマンド側の入口**（`B-06`: N経路のうちN経路で数える）。
+    ///
+    /// **こちらは実在の検査すら通らない**——`req.command.parent()`が無条件で入るので、
+    /// 引数側だけを塞いでも素通りする。**この対が無いと、覆えていない入口が緑のまま残る。**
+    #[test]
+    fn a_device_namespace_command_is_not_a_grant_candidate_either() {
+        let command = PathBuf::from(r"\\.\pipe\harness-spawnd-request-1-0-2");
+        let roots = read_exec_roots(&req(&command, &[]));
+        assert!(
+            roots.is_empty(),
+            "commandがデバイス名前空間でも親が付与候補になっている: {roots:?}"
+        );
+    }
+
+    /// **対の側**（`B-35`）: 通常の絶対パスは落ちない。
+    ///
+    /// 片方だけだと、**候補を常に空にする実装**でも上の2本は通る。
+    #[test]
+    fn ordinary_absolute_paths_still_become_grant_candidates() {
+        let command = PathBuf::from(r"C:\tools\nodejs\node.exe");
+        let args = vec![PathBuf::from(r"C:\mcp\docs\index.js")];
+        let roots = read_exec_roots(&req(&command, &args));
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from(r"C:\mcp\docs"),
+                PathBuf::from(r"C:\tools\nodejs"),
+            ],
+            "通常のパスまで落ちている（MCPサーバが自分の同梱物を読めなくなる）: {roots:?}"
+        );
     }
 
     /// 祖先が対象に含まれるなら子孫は落とす（継承ACEが覆うので二重付与は無駄）。
