@@ -903,6 +903,191 @@ fn top_level_spawn_latency_direct_versus_daemon() {
     drop(case);
 }
 
+/// **観測**: Redirector DLLの注入が、トップレベル1回の起動へ上乗せする時間
+/// （[`DESIGN-MAC-POC.md`](../../../../plans/DESIGN-MAC-POC.md) §20項目13）。
+///
+/// # これは合否の判定ではない
+///
+/// **閾値を決めていない**ので赤くなる条件を持たない。赤くなるのは
+/// **測定が成立していないとき**だけである（下記「計器を先に疑う」）。
+///
+/// # 何の費用か——ファイルフックの費用**ではない**
+///
+/// 段階5bで常時注入へ変えたが、CoWの誘導もfault受付も無い構成では
+/// **ファイル系7フックを1本も置かない**（`harness-redirector`の`init`）。したがってここで
+/// 測るのは`NtCreateFile`等1回あたりの上乗せではなく、**1回の起動に載る一時費用**である
+/// ——`LoadLibraryW`のリモートスレッド・プロセス生成フック4本の設置・準備完了の往復。
+///
+/// **1オープンあたりの上乗せは`lazy_hook_overhead_tests`が別に測っている。**
+/// あちらの数字をこちらへ持ってこないこと（載っているフックの本数が違う）。
+///
+/// # 計器を先に疑う（数字を読む前に落ちる検算）
+///
+/// 「注入したつもりで注入していなかった」回の差はほぼ0になり、**注入は無料だ**という
+/// 誤った結論になる。だから時間を測る前に、**各腕の子が自分のenvを印字して**
+/// 注入の指示が届いたかどうかを見る。腕と印字が食い違ったらそこで落とす。
+///
+/// # 揃えてあるもの／揃っていないもの
+///
+/// - **同じ実行ファイル・同じ引数・同じworkspace・同じプロファイル・同じDaemon**
+/// - **腕を交互に撃つ**（片方を先にまとめて撃つとキャッシュの暖まりが片方に乗る）
+/// - **暖機を測定の外に置く**（Daemonの起動とハンドシェイク、DLLの初回ロード）
+///
+/// 揃っていないもの＝**この数字が答えないこと**:
+///
+/// - **debugビルドである。** 読めるのは腕どうしの差だけで、絶対値は別物になる
+/// - **昇格して走っている**（`preflight`が実ACLを触るため）。本番のDaemonは非昇格である
+/// - **1並列でしか撃っていない。** 同時に何本も頼んだときは測っていない（残課題#43）
+/// - **CoW・lazyの構成は撃っていない。** あちらはファイルフック7本の設置が別に載る
+/// - **x86の子は撃っていない。** WOW64の孫への再注入は別の費用である
+#[test]
+#[ignore = "measurement only (no pass/fail); run through spawn-daemon-latency"]
+fn top_level_spawn_latency_injection_cost() {
+    const TRIALS: usize = 12;
+    const EXE: &str = r"C:\Windows\System32\cmd.exe";
+    /// 注入の指示が子へ届いたことを、子の環境変数として見る印（計器の検算用）。
+    const ENV_MARK: &str = "HARNESS_REDIRECTOR_PROCESS_HOOKS";
+
+    let (case, profile, caps) = setup("spawnd-inject-cost");
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+    let domain_caps: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
+    let env = crate::secret_env::build_child_env();
+    let shared = SharedSpawnDaemon::start().expect("a shared spawn daemon must start");
+
+    let spawn = |exe: &str, inject: super::RedirectorInject<'_>, args: &[&str]| {
+        spawn_with_workspace_via_daemon(
+            &shared,
+            "spawnd-inject-cost",
+            exe,
+            args,
+            &workspace,
+            &env,
+            false,
+            profile.as_psid(),
+            NetworkCapability::Deny,
+            inject,
+            &domain_caps,
+            DomainIdentity::OwnPackage,
+            SpawnRequestAccess::Grant,
+        )
+    };
+
+    /// 1腕の作り方。ワークスペースのパスを受け取って注入の指定を返す。
+    type MakeInject = fn(&std::path::Path) -> super::RedirectorInject<'_>;
+
+    // **腕は3本。** 2本目と3本目は「同じ費用のはず」なので、揃わなければ
+    // どちらかの理解が間違っている（別の計器で同じ量を出す＝突き合わせ）。
+    let arms: [(&str, MakeInject); 3] = [
+        ("no-inject     ", |_| super::RedirectorInject::default()),
+        ("hooks-only    ", |_| {
+            super::RedirectorInject::for_tier2a(None, None, None)
+        }),
+        ("hooks+workspace", |ws| {
+            super::RedirectorInject::for_tier2a(Some(ws), None, None)
+        }),
+    ];
+
+    // ---- 数字より前の検算: 注入の指示が実際に届いたか ----
+    //
+    // **`cmd`の組み込みコマンドは使えない。** 生成側は**全ての引数を無条件で引用する**ので
+    // （`spawn.rs`のコマンドライン組み立て）、`cmd /c "set" ...`の`"set"`を`cmd`が
+    // 実行ファイル名として解決しようとして落ちる。**この形で2回落ちた**——落ちたのが
+    // 計器の側だと分かるのは、対象を測る前にここを通しているからである。
+    // PowerShellは`-Command`に引用された1つの文字列を受け取る形なので、この罠に掛からない。
+    //
+    // 見るのは標準出力ではなく**終了コード**である。出力を見る形にすると、
+    // 変数名そのものが出力に混ざる経路（エラー文言など）と区別が付かない。
+    let (shell, _shell_label) = super::resolve_shell();
+    for (label, make) in &arms {
+        let child = spawn(
+            &shell,
+            make(&canonical),
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("if (Test-Path env:{ENV_MARK}) {{ exit 0 }} else {{ exit 1 }}"),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("[{label}] instrument spawn failed: {e:?}"));
+        let (stdout, stderr, code) = child
+            .write_stdin_read_output_and_wait(None)
+            .unwrap_or_else(|e| panic!("[{label}] could not run the instrument child: {e:?}"));
+        assert!(
+            code == 0 || code == 1,
+            "[{label}] the instrument child did not reach the exit statement (exit={code}). \
+             Nothing was measured. stdout={stdout:?} stderr={stderr:?}"
+        );
+        let injected = code == 0;
+        eprintln!("[inject-cost] {label}: {ENV_MARK} present in child env = {injected}");
+        let expected = *label != "no-inject     ";
+        assert_eq!(
+            injected, expected,
+            "[{label}] the arm did not do what its name says. Timing it would compare two \
+             identical worlds and report that injection is free. stdout={stdout:?} \
+             stderr={stderr:?}"
+        );
+    }
+
+    // ---- 暖機（測定に含めない）----
+    for _ in 0..2 {
+        for (label, make) in &arms {
+            drop(
+                spawn(EXE, make(&canonical), &["/c", "exit", "0"])
+                    .unwrap_or_else(|e| panic!("[{label}] warm-up spawn failed: {e:?}")),
+            );
+        }
+    }
+
+    // ---- 本測定（腕を交互に撃つ）----
+    let mut samples: Vec<Vec<u128>> = vec![Vec::with_capacity(TRIALS); arms.len()];
+    for _ in 0..TRIALS {
+        for (index, (label, make)) in arms.iter().enumerate() {
+            let t = std::time::Instant::now();
+            let child = spawn(EXE, make(&canonical), &["/c", "exit", "0"])
+                .unwrap_or_else(|e| panic!("[{label}] spawn failed: {e:?}"));
+            samples[index].push(t.elapsed().as_micros());
+            drop(child);
+        }
+    }
+
+    let mut medians: Vec<u128> = Vec::with_capacity(arms.len());
+    for (index, (label, _)) in arms.iter().enumerate() {
+        let mut v = std::mem::take(&mut samples[index]);
+        v.sort_unstable();
+        let median = v[v.len() / 2];
+        eprintln!(
+            "[inject-cost] {label}: n={} median={median}us p90={}us min={}us max={}us",
+            v.len(),
+            v[(v.len() * 9) / 10],
+            v[0],
+            v[v.len() - 1]
+        );
+        medians.push(median);
+    }
+    eprintln!(
+        "[inject-cost] median delta (hooks-only - no-inject) = {}us",
+        medians[1] as i128 - medians[0] as i128
+    );
+    eprintln!(
+        "[inject-cost] median delta (hooks+workspace - no-inject) = {}us",
+        medians[2] as i128 - medians[0] as i128
+    );
+    eprintln!(
+        "[inject-cost] config: build=debug, elevated, 1 at a time, trials={TRIALS}, exe={EXE}, \
+         no CoW diff layer, no fault broker (so no file hooks are installed)"
+    );
+    drop(case);
+}
+
 pub(super) fn wait_and_close(child: &SpawnedChild, job: HANDLE) {
     unsafe {
         let _ = WaitForSingleObject(child.process, 60_000);
