@@ -82,6 +82,11 @@ const PRODUCTION_ENV_VARS: &[(&str, &str)] = &[
         "起動側 → Redirector DLL: 拒否されたopenを問い合わせるfault受付パイプの名前（D-88）",
     ),
     (
+        "HARNESS_REDIRECTOR_PROCESS_HOOKS",
+        "起動側 → Redirector DLL: 誘導も受付も無いが、プロセス生成フックを置くために注入した\
+         （段階5b、`plans/DESIGN-MAC-ENFORCEMENT.md` §8.1）。これが無いとDLLは初期化せずに降りる",
+    ),
+    (
         "HARNESS_SPAWN_REQUEST_PIPE",
         "Spawn Daemon → サンドボックスの子: 生成を頼む要求受付パイプの名前（§10.1）。\
          **名前は秘密ではない**——境界はパイプのDACL（ユーザーSID＋spawn要求用capability）で、\

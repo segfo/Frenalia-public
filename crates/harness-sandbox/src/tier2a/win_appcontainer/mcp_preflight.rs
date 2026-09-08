@@ -89,6 +89,49 @@ pub fn preflight_mcp_server(
         }
     }
 
+    // **[段階5b（`plans/DESIGN-MAC-ENFORCEMENT.md` §8.1）] Redirector DLLを読めるようにする。**
+    //
+    // MCPサーバにもDLLを注入するようになったので、そのサーバのpackage SIDへ読取+実行を
+    // 与えないと`LoadLibraryW`がNULLを返し、**注入失敗＝起動失敗**になる。DLLは
+    // ワークスペースの外（`harness.exe`の隣）にあるので、上の`read_exec_roots`
+    // （宣言に書かれたパスの親）では覆えない。
+    //
+    // **`run_shell`側（`preflight.rs`）と同じ形の付与を、同じ理由で行う。** あちらは
+    // D-88の受入E2Eが「CoW限定のままだった」ために一度落ちており、ここはその**MCP版**である。
+    //
+    // 付与と撤収は既存の対をそのまま使う（`record_mcp_granted_path`がこのプロファイルの
+    // エントリへぶら下げ、`end_session`が剥がす）。**新しい撤収経路を作らない。**
+    for dll in redirector_dll_paths() {
+        match grant_ace_inheritable_access(&dll, sid.as_psid(), FsAccess::ReadExec) {
+            Ok(()) => {
+                crate::tier2a::session_profile::record_mcp_granted_path(&profile_name, &dll);
+            }
+            // BUG-059 / BUG-017と同じ保険: `Err`は「何も起きなかった」を意味しない。
+            // 載っているのに記録しないと**撤収経路の無い孤立ACE**になる。
+            Err(e) => {
+                if matches!(sid_ace_mask(&dll, sid.as_psid()), Ok(Some(_))) {
+                    crate::tier2a::session_profile::record_mcp_granted_path(&profile_name, &dll);
+                    warnings.push(format!(
+                        "mcp {}: granting the redirector DLL to this server reported an error \
+                         ({}): {e} -- but the ACE is present on the file, so it was recorded and \
+                         will be revoked at session end",
+                        req.server_id,
+                        dll.display()
+                    ));
+                } else {
+                    warnings.push(format!(
+                        "mcp {}: failed to grant the redirector DLL ({}) to this server: {e}. \
+                         The server will not start -- harness injects that DLL into every \
+                         sandboxed process so that it can ask for child processes once direct \
+                         creation is blocked",
+                        req.server_id,
+                        dll.display()
+                    ));
+                }
+            }
+        }
+    }
+
     if let Some((workspace_root, access)) = req.workspace {
         grant_ace_inheritable_access(workspace_root, sid.as_psid(), access)?;
         crate::tier2a::session_profile::record_mcp_granted_path(&profile_name, workspace_root);

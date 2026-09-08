@@ -27,9 +27,13 @@
 //!
 //! # 測っていないもの
 //!
-//! - **`process: broker`側**。宣言キー`process`（＝MCPサーバにspawnを許す側を選べるようにするもの）は
-//!   まだ実装が無く、いまは既定の`deny`しか存在しない（§22.2.2）
-//! - **`CHILD_PROCESS_RESTRICTED`下での挙動**。積むのは段階⑤
+//! - **`CHILD_PROCESS_RESTRICTED`下での挙動**。積むのは段階⑤。いまの`deny`は
+//!   「窓口へ到達できない」だけで、**サーバ自身が直接子を作ることは止めていない**
+//! - **`broker`が実際に子を作れること**。窓口の答えは常に`policy_not_implemented`である
+//!   （遷移ポリシーの評価は段階E）。ここで測れるのは**宣言で窓口への到達が切り替わること**まで
+//! - **Redirector DLLが実際に載ったこと**。注入の成否は`spawn_via_daemon`が
+//!   `RedirectorInjection`として返すので、起動できた時点で「載った」は言えるが、
+//!   **中で何のフックが設置されたか**はここからは見えない
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -185,19 +189,14 @@ fn probe_decl(
     }
 }
 
-/// **MCP stdioの子は、要求受付パイプへ到達できない**（§22.2.2の`process: deny`の
-/// 「ポリシーで断る」より手前に置かれた二重目のdeny）。
+/// 宣言の`process`を1つ与えて製品の2段を実際に通し、プローブが出したJSONを返す。
 ///
-/// 通るのは製品の2段そのものである——[`crate::sandbox::prepare`]（専用プロファイルの作成と
-/// 最小ACE）→ [`super::AppContainerTransportFactory::create`]（`spawn_via_daemon`）。
+/// 通るのは製品の起動2段そのものである——[`crate::sandbox::prepare`]（専用プロファイルの
+/// 作成と最小ACE）→ [`super::AppContainerTransportFactory::create`]（`spawn_via_daemon`）。
 ///
-/// # 歯があることの確かめ方
-///
-/// `transport_stdio.rs`の[`SpawnRequestAccess::Withhold`]を`Grant`へ倒すと、
-/// `connected`が`true`になりこのテストは赤くなる（実際に倒して確認する。倒したら必ず戻す）。
-#[test]
-#[ignore = "starts a real spawn daemon and an AppContainer child; run through e2e-mcp-spawn-reach"]
-fn an_mcp_server_started_through_the_product_transport_cannot_reach_the_request_pipe() {
+/// **`process`以外は2本の呼び出しで同じにする。** 違いが1つだけだから、
+/// 結果の違いを宣言に帰せる（違いが2つあると、どちらが効いたのか言えない）。
+fn probe_report_for(process: McpProcessAccess, label: &str) -> serde_json::Value {
     // MCPプロファイルはセッションエントリの子としてぶら下がる（D-38）。撤収も同じ経路。
     begin_session().expect("begin session");
     let (_probe_dir, probe) = ProbeDir::with_probe();
@@ -206,18 +205,13 @@ fn an_mcp_server_started_through_the_product_transport_cannot_reach_the_request_
 
     let daemon = SharedSpawnDaemon::start().expect("the spawn daemon must start");
     eprintln!(
-        "[mcp-spawn-reach] daemon pid={} request_pipe={}",
+        "[{label}] daemon pid={} request_pipe={}",
         daemon.daemon_pid(),
         daemon.request_pipe()
     );
 
     let payload = spawn_request_payload();
-    let decl = probe_decl(
-        &probe,
-        daemon.request_pipe(),
-        &payload,
-        McpProcessAccess::Deny,
-    );
+    let decl = probe_decl(&probe, daemon.request_pipe(), &payload, process);
     let prepared = crate::sandbox::prepare(&decl, workspace.path()).expect("mcp preflight");
     // **`\\.\pipe\`についての警告が1件出るのは想定どおりである**（追いかけないこと）。
     //
@@ -228,7 +222,7 @@ fn an_mcp_server_started_through_the_product_transport_cannot_reach_the_request_
     // 実害は無いが、**断っている理由は「パイプ名前空間だから」ではない**。
     // この観察は`plans/handoff/mac-spawn-followup/T2.md`へ本流向けの副産物として書いてある。
     for warning in &prepared.warnings {
-        eprintln!("[mcp-spawn-reach] preflight warning: {warning}");
+        eprintln!("[{label}] preflight warning: {warning}");
     }
 
     let factory = AppContainerTransportFactory::with_spawn_daemon(daemon.clone());
@@ -238,12 +232,12 @@ fn an_mcp_server_started_through_the_product_transport_cannot_reach_the_request_
     let stdout = read_until_closed(transport.as_mut());
     let stderr = transport.take_stderr();
     transport.shutdown();
-    eprintln!("[mcp-spawn-reach] stdout={stdout}\nstderr={stderr}");
+    eprintln!("[{label}] stdout={stdout}\nstderr={stderr}");
 
     // 後始末は**判定より前に**行う（assertで落ちてもプロファイルとACEを残さない）。
     daemon.shutdown();
     let reclaimed = end_session(&revoke_session_grant);
-    eprintln!("[mcp-spawn-reach] reclaim={reclaimed:?}");
+    eprintln!("[{label}] reclaim={reclaimed:?}");
 
     let report = last_json_line(&stdout).unwrap_or_else(|| {
         panic!(
@@ -266,6 +260,20 @@ fn an_mcp_server_started_through_the_product_transport_cannot_reach_the_request_
             .is_some_and(|n| n >= 1),
         "the probe reported no connection attempt at all; the instrument did not run: {report}"
     );
+    report
+}
+
+/// **`process: deny`（既定）のMCPサーバは、要求受付パイプへ到達できない**
+/// （§22.2.2の「ポリシーで断る」より手前に置かれた二重目のdeny）。
+///
+/// # 歯があることの確かめ方
+///
+/// 下の`..._may_reach_the_request_pipe`と**対**である。`transport_stdio.rs`の
+/// `match decl.process`を片側へ潰すと、必ずどちらかが赤くなる。
+#[test]
+#[ignore = "starts a real spawn daemon and an AppContainer child; run through e2e-mcp-spawn-reach"]
+fn an_mcp_server_that_declares_process_deny_cannot_reach_the_request_pipe() {
+    let report = probe_report_for(McpProcessAccess::Deny, "mcp-spawn-reach/deny");
 
     assert_eq!(
         report.get("connected").and_then(|v| v.as_bool()),
@@ -282,5 +290,42 @@ fn an_mcp_server_started_through_the_product_transport_cannot_reach_the_request_
         "the child failed to reach the pipe for some reason other than access denied (5). \
          231 means the pipe was merely busy and 2 means the name did not exist -- in both cases \
          the DACL's effect was not measured: {report}"
+    );
+}
+
+/// **`process: broker`を宣言したMCPサーバは、要求受付パイプへ届く**（§22.2.2）。
+///
+/// # これは「子プロセスを作れる」ことの確認ではない
+///
+/// 届いた先で返るのは`policy_not_implemented`——「あなたが誰かは分かったが、遷移を
+/// 許すかを判定する仕組みがまだ無い」という断りである（段階E未実装）。**宣言で
+/// 切り替わるのは窓口へ話しかけられるかどうかだけ**で、実際に何かが起こせるように
+/// なったわけではない。
+///
+/// # 上のdeny側との対で1つの主張になる（`B-35`）
+///
+/// 片側だけだと、**常に届く実装**でも**常に届かない実装**でも片方は緑になる。
+/// 2本の違いは宣言の`process`ただ1つなので、結果の違いはそこに帰せる。
+#[test]
+#[ignore = "starts a real spawn daemon and an AppContainer child; run through e2e-mcp-spawn-reach"]
+fn an_mcp_server_that_declares_process_broker_may_reach_the_request_pipe() {
+    let report = probe_report_for(McpProcessAccess::Broker, "mcp-spawn-reach/broker");
+
+    assert_eq!(
+        report.get("connected").and_then(|v| v.as_bool()),
+        Some(true),
+        "an MCP server that declared `process: broker` still could not reach the spawn request \
+         pipe. Check that transport_stdio.rs maps Broker to SpawnRequestAccess::Grant, and that \
+         the spawn-request capability is actually on the child's token: {report}"
+    );
+    // **届いただけでは足りない。窓口が何と答えたかまで見る。**
+    // ここが`not_registered`なら、Process Table（Daemonが持つ生成済みプロセスの台帳）への
+    // 登録がResumeより後になっている＝別の欠陥である（§12）。
+    let reply = report.get("reply").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        reply.contains("policy_not_implemented"),
+        "the request pipe answered something other than `policy_not_implemented`. \
+         `not_registered` would mean the child was not in the daemon's process table, which is a \
+         different defect than the one this test is about: reply={reply:?} report={report}"
     );
 }

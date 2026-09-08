@@ -401,6 +401,18 @@ pub struct RedirectorInject<'a> {
     pub cow: Option<CowInject<'a>>,
     /// [D-88] fault要求の受付パイプ名。`None`ならfault-inしない（今日と同じ挙動）。
     pub broker_pipe: Option<&'a str>,
+    /// [段階5b（`plans/DESIGN-MAC-ENFORCEMENT.md` §8.1）] **プロセス生成フックを置くこと
+    /// 自体が目的である。**
+    ///
+    /// 誘導するものも受け付けるものも無くても、これが真なら注入する。段階⑤で
+    /// `CHILD_PROCESS_RESTRICTED`（OSが子プロセス生成そのものを拒否する緩和策）を積むと、
+    /// サンドボックスの中のプログラムは自力で子を作れなくなり、Spawn Daemonへ頼む形になる。
+    /// **その頼み方へ変換するのがこのフック**なので、**フックが入っていないプロセスが
+    /// 1つでも居る状態で⑤は積めない**。
+    ///
+    /// **製品のTier2a生成では常に真である**（[`RedirectorInject::for_tier2a`]）。
+    /// 偽のまま残っているのは、注入を測定対象から外したいテストだけである。
+    pub process_hooks: bool,
 }
 
 impl<'a> RedirectorInject<'a> {
@@ -410,26 +422,60 @@ impl<'a> RedirectorInject<'a> {
             workspace_root: Some(workspace_root),
             cow: None,
             broker_pipe: Some(broker_pipe),
+            process_hooks: true,
+        }
+    }
+
+    /// [段階5b] **製品のTier2a生成が使う唯一の構築口。**
+    ///
+    /// 誘導（CoW）とfault受付は在るときだけ渡し、**プロセス生成フックは常に要求する**。
+    /// 入口を1つにしてあるのは、経路ごとに真偽が分かれると
+    /// 「注入されていないプロセスが1つだけ残る」形（BUG-032型）がそこから入るためで、
+    /// 実際にMCPの経路が2026-09-07までその状態だった。
+    ///
+    /// `workspace_root`が`None`でよい——MCPサーバにはワークスペースが無く、
+    /// そのときDLLはファイル系フックを1本も置かない。
+    pub fn for_tier2a(
+        workspace_root: Option<&'a Path>,
+        cow: Option<CowInject<'a>>,
+        broker_pipe: Option<&'a str>,
+    ) -> Self {
+        Self {
+            // CoWは自分のworkspace rootを持っているので、明示指定が無ければそちらを採る
+            // （読むのは1箇所だけにする、`workspace_root`のdoc）。
+            workspace_root: workspace_root.or_else(|| cow.map(|c| c.workspace_root)),
+            cow,
+            broker_pipe,
+            process_hooks: true,
         }
     }
 
     /// 何か1つでも渡すものがあるか。**偽ならDLLを注入しない**——注入だけして何もしない
     /// 状態を作らない（子の中で動くコードは、要らないなら存在しないのが最も安全である）。
     ///
-    /// **workspace rootが無ければ注入しない。** DLLは何がworkspaceか分からないまま動けず、
-    /// 分からないまま動かすと「workspace外への書込が拒否された」ように見える形で
-    /// 全部が壊れる（BUG-066が実際にそう見えた）。
+    /// **誘導と受付にはworkspace rootが要る。** DLLは何がworkspaceか分からないまま
+    /// 分類できず、分からないまま動かすと「workspace外への書込が拒否された」ように見える形で
+    /// 全部が壊れる（BUG-066が実際にそう見えた）。**プロセス生成フックだけは例外**で、
+    /// あれはパスを1つも見ないので、ワークスペースを知らなくても正しく働く。
     pub(crate) fn wanted(&self) -> bool {
-        self.workspace_root.is_some() && (self.cow.is_some() || self.broker_pipe.is_some())
+        self.process_hooks
+            || (self.workspace_root.is_some() && (self.cow.is_some() || self.broker_pipe.is_some()))
     }
 }
 
+/// **テストが`Option<CowInject>`をそのまま渡せるようにする変換。**
+///
+/// [段階5b] `process_hooks`は**偽**にする。製品はこの変換を通らず
+/// [`RedirectorInject::for_tier2a`]を通るので、ここが偽であることは
+/// 「テストの`None`が注入なしのままである」ことだけを意味する
+/// （製品呼び出し元が0件であることは`launch.rs`の数え上げテストが固定している）。
 impl<'a> From<Option<CowInject<'a>>> for RedirectorInject<'a> {
     fn from(cow: Option<CowInject<'a>>) -> Self {
         Self {
             workspace_root: cow.map(|c| c.workspace_root),
             cow,
             broker_pipe: None,
+            process_hooks: false,
         }
     }
 }
@@ -461,13 +507,26 @@ pub(crate) fn augment_redirector_env(
     inject: RedirectorInject<'_>,
     ready_write: HANDLE,
 ) {
-    let workspace = inject
-        .workspace_root
-        .expect("wanted() already required a workspace root");
-    env.push((
-        "HARNESS_COW_WORKSPACE".to_string(),
-        normalize_cow_root(workspace).to_string_lossy().into_owned(),
-    ));
+    // [段階5b] **ワークスペースは無いことがある**（MCPサーバ）。無いときは変数を置かない
+    // ——空文字で置くと、DLL側の`get_env`が空を`None`扱いにするので同じ結果になるが、
+    // **「空のworkspaceを渡した」と「渡していない」を子のenvで区別できなくなる**。
+    if let Some(workspace) = inject.workspace_root {
+        env.push((
+            "HARNESS_COW_WORKSPACE".to_string(),
+            normalize_cow_root(workspace).to_string_lossy().into_owned(),
+        ));
+    }
+    // [段階5b] 誘導も受付も無いとき、DLLはこれが無ければ初期化せずに降りる。
+    // **綴りはDLL側と対**（`harness-redirector`の`config::PROCESS_HOOKS_ENV`）。
+    // 他の4つと同じくクレートを跨いだ文字列の複製だが、`harness-sandbox`は
+    // `harness-redirector`に依存していない（DLLは実行時にロードされるだけ）ので、
+    // 型で結べるのはここまでである。
+    if inject.process_hooks {
+        env.push((
+            "HARNESS_REDIRECTOR_PROCESS_HOOKS".to_string(),
+            "1".to_string(),
+        ));
+    }
     if let Some(cow) = inject.cow {
         env.push((
             "HARNESS_COW_DIFF_LAYER".to_string(),
@@ -1340,8 +1399,8 @@ pub fn spawn_with_workspace_via_daemon<'a>(
                 .map(|path| normalize_cow_root(path).to_string_lossy().into_owned())
                 .collect(),
         })
-    } else {
-        inject.broker_pipe.map(|pipe| RedirectorSpec::Lazy {
+    } else if let Some(pipe) = inject.broker_pipe {
+        Some(RedirectorSpec::Lazy {
             workspace_root: normalize_cow_root(
                 inject
                     .workspace_root
@@ -1351,6 +1410,15 @@ pub fn spawn_with_workspace_via_daemon<'a>(
             .into_owned(),
             broker_pipe: pipe.to_string(),
         })
+    } else if inject.process_hooks {
+        // [段階5b] 誘導も受付も無い。**それでも注入する**（この変種のdoc）。
+        Some(RedirectorSpec::ProcessHooks {
+            workspace_root: inject
+                .workspace_root
+                .map(|root| normalize_cow_root(root).to_string_lossy().into_owned()),
+        })
+    } else {
+        None
     };
 
     let step = |label: &'static str, e: windows::core::Error| {

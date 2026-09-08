@@ -203,6 +203,7 @@ mod tests {
             cow_enabled: false,
             broker_pipe: Some(r"\\.\pipe\harness-lazy-ace-broker-1-0-2".to_string()),
             ext_capture_roots: Vec::new(),
+            process_hooks: false,
         };
         let blob = serialize_config_blob(&cfg);
         let parsed = unsafe { deserialize_config_blob(blob.as_ptr()) }.expect("parse");
@@ -233,6 +234,51 @@ mod tests {
         let parsed = parse_config_blob("C:\\ws\nC:\\diff\n").expect("an older blob must parse");
         assert!(parsed.cow_enabled);
         assert_eq!(parsed.broker_pipe, None);
+        // 5行目が無い世代のblobは「フックのためだけの注入ではない」と読む（同じく後方互換）。
+        assert!(!parsed.process_hooks);
+    }
+
+    /// [段階5b] **誘導も受付も無く、ワークスペースすら無い設定が往復すること。**
+    ///
+    /// これがMCPサーバの形である——workspaceへのACEを1つも持たないので、
+    /// 渡せるルートが最初から無い。それでも注入するのは、段階⑤で
+    /// `CHILD_PROCESS_RESTRICTED`を積んだとき**生成要求へ変換するフックが要る**からで、
+    /// 「フックが入っていないプロセスが居る状態で生成を禁じない」がその門である。
+    #[test]
+    fn a_process_hooks_only_config_round_trips_without_a_workspace() {
+        let cfg = Config {
+            workspace_root: PathBuf::new(),
+            diff_layer_dir: PathBuf::new(),
+            cow_enabled: false,
+            broker_pipe: None,
+            ext_capture_roots: Vec::new(),
+            process_hooks: true,
+        };
+        let parsed = unsafe { deserialize_config_blob(serialize_config_blob(&cfg).as_ptr()) }
+            .expect("a process-hooks-only config must be accepted");
+        assert!(parsed.process_hooks);
+        assert!(!parsed.cow_enabled, "誘導へ入ってはいけない");
+        assert_eq!(parsed.broker_pipe, None);
+        assert!(parsed.workspace_root.as_os_str().is_empty());
+    }
+
+    /// **対の側**（`B-35`）: ワークスペースが分からないまま誘導や受付を名乗るblobは受け取らない。
+    ///
+    /// 上のテストだけだと「ワークスペース検査を丸ごと外した実装」でも緑になる。外すと
+    /// BUG-066の形——「workspace内か」の照合が全部外れ、workspace内の書込が1件残らず
+    /// ACLに拒否されるのに「workspace外への書込が拒否された」ように見える——が戻る。
+    #[test]
+    fn a_blob_that_asks_for_redirection_without_a_workspace_is_refused() {
+        // 差分層だけがある（CoWを名乗る）
+        assert!(
+            parse_config_blob("\nC:\\diff\n\n\n1").is_none(),
+            "workspaceが無いのにCoWの誘導を名乗るblobが通っている"
+        );
+        // 受付だけがある（fault-inを名乗る）
+        assert!(
+            parse_config_blob("\n\n\n\\\\.\\pipe\\x\n1").is_none(),
+            "workspaceが無いのにfault受付を名乗るblobが通っている"
+        );
     }
 
     #[test]
@@ -243,6 +289,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: vec![PathBuf::from(r"C:\ext one"), PathBuf::from(r"D:\ext2")],
+            process_hooks: false,
         };
         let blob = serialize_config_blob(&cfg);
         assert_eq!(blob.last(), Some(&0u8), "blob must be NUL-terminated");
@@ -257,6 +304,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: Vec::new(),
+            process_hooks: false,
         };
         let parsed = unsafe { deserialize_config_blob(serialize_config_blob(&empty_ext).as_ptr()) }
             .expect("parse (no ext roots)");
@@ -283,6 +331,7 @@ mod tests {
                 cow_enabled: true,
                 broker_pipe: None,
                 ext_capture_roots: vec![PathBuf::from(r"\\?\D:\ext\")],
+                process_hooks: false,
             });
             assert_eq!(cfg.workspace_root, PathBuf::from(r"C:\ws"), "root={root:?}");
             assert_eq!(cfg.diff_layer_dir, diff_layer.path());
@@ -305,6 +354,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: Vec::new(),
+            process_hooks: false,
         });
         assert_eq!(cfg.workspace_root, PathBuf::from("."));
         let text = std::fs::read_to_string(&warnings).expect("warnings ledger must be written");
@@ -322,6 +372,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: Vec::new(),
+            process_hooks: false,
         });
         assert_eq!(
             std::fs::read_to_string(&warnings).unwrap_or_default(),
@@ -422,6 +473,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: Vec::new(),
+            process_hooks: false,
         };
         let ledger_path = diff_layer.path().join(COW_OPS_LEDGER_FILENAME);
 
@@ -493,6 +545,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: Vec::new(),
+            process_hooks: false,
         };
 
         let hash = baseline_hash_for(&cfg, "baseline_mirror_probe.txt");
@@ -516,6 +569,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: Vec::new(),
+            process_hooks: false,
         };
 
         let hash = baseline_hash_for(&cfg, "does_not_exist_probe.txt");
@@ -543,6 +597,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: vec![capture_root.path().to_path_buf()],
+            process_hooks: false,
         };
 
         let classified = classify_target(&cfg, &target).expect("must classify under capture root");
@@ -580,6 +635,7 @@ mod tests {
                 cow_enabled: true,
                 broker_pipe: None,
                 ext_capture_roots: Vec::new(),
+                process_hooks: false,
             };
             let classified = classify_target(&cfg, &target)
                 .unwrap_or_else(|| panic!("must classify with root={root:?}"));
@@ -605,6 +661,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: Vec::new(),
+            process_hooks: false,
         };
 
         let classified = classify_target(&cfg, &diff_layer.path().join("merge-demo.txt"))
@@ -631,6 +688,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: Vec::new(),
+            process_hooks: false,
         };
         for name in [
             COW_OPS_LEDGER_FILENAME,
@@ -669,6 +727,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: Vec::new(),
+            process_hooks: false,
         };
 
         assert!(classify_target(&cfg, &elsewhere.path().join("x.txt")).is_none());
@@ -690,6 +749,7 @@ mod tests {
             cow_enabled: true,
             broker_pipe: None,
             ext_capture_roots: vec![outside.path().to_path_buf()],
+            process_hooks: false,
         };
         let original = store::normalize_abs_path(&target.to_string_lossy());
         let key = store::ext_key(&original).unwrap();

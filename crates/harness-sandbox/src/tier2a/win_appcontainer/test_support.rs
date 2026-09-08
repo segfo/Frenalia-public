@@ -826,3 +826,95 @@ pub(super) fn shuffle_in_place<T>(items: &mut [T], state: &mut u64) {
         items.swap(i, (*state as usize) % (i + 1));
     }
 }
+
+/// `crates/`配下の`.rs`を舐めて、ある綴りを**製品コードから**呼んでいる行を集める。
+///
+/// # 何のために在るのか
+///
+/// 「この経路は製品からは呼ばれていない」を印として固定するためである。印が無いと、
+/// 次に足された呼び出しが黙って旧い経路へ落ち、**しかも動いてしまうので誰も気付かない**
+/// （移行の中間状態で1経路だけ取り残される形。実際に段階5bのMCP経路がその状態だった）。
+///
+/// 戻り値は`(製品側の "path:line" 一覧, テスト側の件数)`。**テスト側も返す**のは、
+/// 0件マッチで黙って緑になるのを防ぐため——「呼び出し元が無い」と
+/// 「綴りを間違えて1行も見ていない」は外形上そっくりである（BUG-056と同型）。
+///
+/// # この数え方が持つ限界（**限界のほうが本体である**）
+///
+/// - **綴りに依存する。** 別名で束ねてから呼ばれると出ない。緑は
+///   「呼び出し元が無い」ではなく「**この綴りの**呼び出し元が無い」しか意味しない。
+/// - **テストかどうかをファイル名と`#[cfg(test)]`の位置で判定する。** 判定は
+///   (1) ファイル名が`_tests.rs`で終わる (2) `tests`ディレクトリの下
+///   (3) **そのファイルで最初に`#[cfg(test)]`が現れた行より後**、の3つ。
+///   (3)は`wfp.rs`のように製品ファイルの末尾へテストを畳んでいる形のためで、
+///   **逆に、インラインのテストモジュールより後ろへ製品コードを書くと見落とす。**
+/// - コメント行と、定義そのものの行は除く。
+pub(super) fn product_callers_of(needle: &str, definition: &str) -> (Vec<String>, usize) {
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate dir has a parent")
+        .to_path_buf();
+    let mut product = Vec::new();
+    let mut tests = 0usize;
+    walk_for_callers(&crates_dir, needle, definition, &mut product, &mut tests);
+    (product, tests)
+}
+
+fn walk_for_callers(
+    dir: &std::path::Path,
+    needle: &str,
+    definition: &str,
+    product: &mut Vec<String>,
+    tests: &mut usize,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            walk_for_callers(&path, needle, definition, product, tests);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let test_file =
+            name.ends_with("_tests.rs") || path.components().any(|c| c.as_os_str() == "tests");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // このファイルでインラインのテストが始まる行（限界の(3)）。
+        let inline_tests_start = text
+            .lines()
+            .position(|line| line.trim_start().starts_with("#[cfg(test)"))
+            .or_else(|| {
+                text.lines().position(|line| {
+                    line.trim_start().starts_with("#[cfg(all(") && line.contains("test")
+                })
+            })
+            .unwrap_or(usize::MAX);
+        for (index, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if !line.contains(needle) || line.contains(definition) {
+                continue;
+            }
+            if test_file || index > inline_tests_start {
+                *tests += 1;
+            } else {
+                product.push(format!("{}:{}", path.display(), index + 1));
+            }
+        }
+    }
+}

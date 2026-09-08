@@ -14,10 +14,25 @@ pub(crate) fn get_env(name: &str) -> Option<String> {
 /// 無限に読み進めない」ための安全弁。
 pub(crate) const CONFIG_BLOB_MAX_LEN: usize = 64 * 1024;
 
-/// 注入パラメータで運ぶ設定のシリアライズ（BUG-045のF2）。`\n`区切り4行・NUL終端のUTF-8:
+/// [段階5b] **プロセス生成フックを置くこと自体を目的に注入した**ことを子へ伝える環境変数。
+///
+/// 直接の子はこの env からしか設定を受け取れない（[`super::init::init`]のdoc:
+/// `inject_redirector`は`LoadLibraryW`しか呼ばず、設定blobを渡すのは孫への再注入だけ）。
+/// **`HARNESS_COW_WORKSPACE`では代用できない**——MCPサーバにはワークスペースが無い。
+pub(crate) const PROCESS_HOOKS_ENV: &str = "HARNESS_REDIRECTOR_PROCESS_HOOKS";
+
+/// [`PROCESS_HOOKS_ENV`]の値を読む。**無効を意味する綴りだけを見る**のではなく、
+/// **有効を意味する綴りだけを見る**——この変数は「立てたら真」であって、
+/// 未設定が既定（偽）だからである（`lazy_grant::lane()`とは向きが逆で、
+/// あちらは既定が有効なので無効側の綴りを見る）。
+pub(crate) fn process_hooks_from_env() -> bool {
+    get_env(PROCESS_HOOKS_ENV).is_some_and(|v| !matches!(v.trim(), "0" | "false" | "off"))
+}
+
+/// 注入パラメータで運ぶ設定のシリアライズ（BUG-045のF2）。`\n`区切り5行・NUL終端のUTF-8:
 ///
 /// ```text
-/// <workspace_root>\n<diff_layer_dir>\n<ext_capture_roots を ';' で連結>\n<broker_pipe>\0
+/// <workspace_root>\n<diff_layer_dir>\n<ext_capture_roots を ';' で連結>\n<broker_pipe>\n<process_hooks>\0
 /// ```
 ///
 /// 環境変数（`HARNESS_COW_*`・`HARNESS_LAZY_BROKER_PIPE`）と等価な情報を、
@@ -31,10 +46,11 @@ pub(crate) const CONFIG_BLOB_MAX_LEN: usize = 64 * 1024;
 /// なる（`B-13`）。片方だけ書き換わった blob は「CoWを名乗るのに差分層が無い」という
 /// 復元不能な状態になり得るので、導出できるものは導出する。
 ///
-/// # 4行目を足したときの後方互換
+/// # 行を足したときの後方互換
 ///
-/// 3行しか無い blob（[D-88]より前の世代のDLLが作ったもの）は、4行目を空として読む
-/// ＝fault-in無しになる。**壊れるのではなく、機能が1つ無いだけ**に倒してある。
+/// 足りない行は空として読む。4行目（fault受付）が無ければfault-in無し、5行目
+/// （プロセス生成フック）が無ければ**そのフックのためだけの注入ではない**と読む。
+/// **壊れるのではなく、機能が1つ無いだけ**に倒してある。
 pub(crate) fn serialize_config_blob(cfg: &Config) -> Vec<u8> {
     let ext = cfg
         .ext_capture_roots
@@ -43,11 +59,12 @@ pub(crate) fn serialize_config_blob(cfg: &Config) -> Vec<u8> {
         .collect::<Vec<_>>()
         .join(";");
     let mut bytes = format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         cfg.workspace_root.to_string_lossy(),
         cfg.diff_layer_dir.to_string_lossy(),
         ext,
-        cfg.broker_pipe.as_deref().unwrap_or("")
+        cfg.broker_pipe.as_deref().unwrap_or(""),
+        if cfg.process_hooks { "1" } else { "" }
     )
     .into_bytes();
     bytes.push(0);
@@ -80,7 +97,10 @@ pub(crate) unsafe fn deserialize_config_blob(param: *const u8) -> Option<Config>
 /// 復元のうち文字列解析だけを切り出した部分（単体テスト可能にするため）。
 pub(crate) fn parse_config_blob(text: &str) -> Option<Config> {
     let mut lines = text.split('\n');
-    let workspace_root = lines.next().filter(|s| !s.is_empty())?;
+    // [段階5b] **ワークスペースは空でもよくなった**（MCPサーバには無い）。ただし
+    // 空を許すのはプロセス生成フックだけを理由に注入したときで、CoWの誘導とfault受付は
+    // どちらも「workspace内か」の判定を要るので、下の検査で弾く。
+    let workspace_root = lines.next().unwrap_or("");
     // [D-88] **差分層は空でもよい**（DirectRwのlazyレーンには差分層が無い）。
     // 空なら`cow_enabled`が偽になり、誘導の枝は1つも通らない。
     let diff_layer_dir = lines.next().unwrap_or("");
@@ -92,10 +112,19 @@ pub(crate) fn parse_config_blob(text: &str) -> Option<Config> {
         .map(PathBuf::from)
         .collect();
     let broker_pipe = lines.next().unwrap_or("").trim_end_matches('\0');
+    // [段階5b] 5行目。古い世代のblobには無いので、空＝偽として読む。
+    let process_hooks = !lines.next().unwrap_or("").trim_end_matches('\0').is_empty();
     let cow_enabled = !diff_layer_dir.is_empty();
-    // CoWでもなく受付も無いなら、このDLLがやることは1つも無い。**成功したことにしない**
-    // ——フックだけ設置されて何もしない状態は、原因のたどりにくい遅さとして残る。
-    if !cow_enabled && broker_pipe.is_empty() {
+    // CoWでもなく受付もフックの要求も無いなら、このDLLがやることは1つも無い。
+    // **成功したことにしない**——何もしないフックが設置された状態は、
+    // 原因のたどりにくい遅さとして残る。
+    if !cow_enabled && broker_pipe.is_empty() && !process_hooks {
+        return None;
+    }
+    // 誘導も受付も「workspace内か」を判定するので、**ワークスペースが分からないまま
+    // その2つを名乗るblobは受け取らない**（BUG-066: 判定が全部外れると、
+    // 「workspace外への書込が拒否された」ように見える形で全部が壊れる）。
+    if workspace_root.is_empty() && (cow_enabled || !broker_pipe.is_empty()) {
         return None;
     }
     Some(Config {
@@ -104,6 +133,7 @@ pub(crate) fn parse_config_blob(text: &str) -> Option<Config> {
         cow_enabled,
         broker_pipe: (!broker_pipe.is_empty()).then(|| broker_pipe.to_string()),
         ext_capture_roots,
+        process_hooks,
     })
 }
 

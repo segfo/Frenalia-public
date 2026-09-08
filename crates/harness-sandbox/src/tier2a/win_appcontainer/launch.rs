@@ -286,7 +286,22 @@ fn spawn_shell_in_workspace_on(
     // 走っていなければ即座に返るので、2回目以降の起動では何のコストも無い。
     grant_job::wait_until_done().map_err(AppContainerError::Preflight)?;
 
-    let child = spawn(cow.into())?;
+    // [段階5b（`plans/DESIGN-MAC-ENFORCEMENT.md` §8.1）] **ここも注入する。**
+    //
+    // かつてここは`cow.into()`で、CoWでなければ`RedirectorInject`が空になり
+    // **DLLが1度も載らなかった**。lazyレーンの受付パイプは下準備の背景走査が
+    // 走っている間しか存在しないので、走査が終わった後・準備済みのワークスペース・
+    // レーンを切った構成はすべてこの経路へ落ちる——つまり**定常状態では注入が
+    // 起きていなかった**（設計書§8.1が「現状との差」を`lane()`だけで書いていたのは
+    // 実態より狭い。2026-09-08に実測して直した）。
+    //
+    // 段階⑤で生成を禁じる前に埋めるべきはここである。誘導も受付も無いので、
+    // DLLはファイル系フックを1本も置かず、プロセス生成フックだけを設置する。
+    let child = spawn(RedirectorInject::for_tier2a(
+        Some(&canonical_workspace),
+        cow,
+        None,
+    ))?;
     Ok((child, shell_label))
 }
 
@@ -340,15 +355,13 @@ mod tests {
     /// 出ない。ここが緑でも「降格経路が無い」ではなく「**この綴りの**降格経路が無い」である。
     #[test]
     fn the_direct_route_has_no_product_callers() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("repo root")
-            .join("crates");
-
-        let mut product_callers: Vec<String> = Vec::new();
-        let mut test_callers = 0usize;
-        collect_direct_route_callers(&repo_root, &mut product_callers, &mut test_callers);
+        // **探す綴りは実行時に組み立てる。** そのまま書くと**この関数自身が数え上げに
+        // 引っ掛かる**——§10.1.1が「docに解放の綴りをそのまま書かないのは、doc自身が
+        // 数え上げに掛かるため」と書いている罠の、検出器側の版である。1回実際に踏んだ。
+        let needle = format!("spawn_shell_in_workspace{}", '(');
+        let definition = format!("fn {needle}");
+        let (product_callers, test_callers) =
+            super::super::test_support::product_callers_of(&needle, &definition);
 
         assert!(
             product_callers.is_empty(),
@@ -364,66 +377,40 @@ mod tests {
         );
     }
 
-    /// `crates/`配下の`.rs`を舐めて、直接生成の入口を呼んでいる行を製品／テストへ振り分ける。
+    /// **注入しない選択が製品コードに1つも無いこと**を固定する（段階5b、
+    /// `plans/DESIGN-MAC-ENFORCEMENT.md` §8.1）。
     ///
-    /// 除外するもの: 定義そのものの行、コメント行、`_tests.rs`と`tests/`配下。
-    /// `spawn_shell_in_workspace_via_daemon`は**接尾辞が違うので`(`の直後一致で外れる**。
+    /// 製品のTier2a生成は例外なく[`RedirectorInject::for_tier2a`]を通り、
+    /// **プロセス生成フックを必ず要求する**。段階⑤で`CHILD_PROCESS_RESTRICTED`
+    /// （OSが子プロセス生成そのものを拒否する緩和策）を積んだあと、
+    /// フックの入っていないプロセスは**子を作ることも頼むこともできなくなる**ので、
+    /// 「1経路だけ注入しない」が残っていると、その経路だけが静かに死ぬ。
     ///
-    /// **探す綴りは実行時に組み立てる。** そのまま書くと**この関数自身が数え上げに引っ掛かる**
-    /// ——§10.1.1が「docに解放の綴りをそのまま書かないのは、doc自身が数え上げに掛かるため」と
-    /// 書いている罠の、検出器側の版である。1回実際に踏んだ。
-    fn collect_direct_route_callers(dir: &std::path::Path, product: &mut Vec<String>, tests: &mut usize) {
-        let needle = format!("spawn_shell_in_workspace{}", '(');
-        let definition = format!("fn {needle}");
-        collect_direct_route_callers_in(dir, &needle, &definition, product, tests);
-    }
+    /// **実際にその状態だった**——MCP stdioは2026-09-08まで注入しない側を固定で渡しており、
+    /// それを赤くするテストは1本も無かった。ここがその印である。
+    ///
+    /// 限界は`product_callers_of`のdocが持つ（**緑は「この綴りの呼び出し元が無い」しか
+    /// 意味しない**）。
+    #[test]
+    fn no_product_code_opts_out_of_redirector_injection() {
+        let needle = format!("RedirectorInject::default{}", '(');
+        let definition = String::from("impl Default for RedirectorInject");
+        let (product_callers, test_callers) =
+            super::super::test_support::product_callers_of(&needle, &definition);
 
-    fn collect_direct_route_callers_in(
-        dir: &std::path::Path,
-        needle: &str,
-        definition: &str,
-        product: &mut Vec<String>,
-        tests: &mut usize,
-    ) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|n| n == "target") {
-                    continue;
-                }
-                collect_direct_route_callers_in(&path, needle, definition, product, tests);
-                continue;
-            }
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            let in_test_file = name.ends_with("_tests.rs")
-                || path.components().any(|c| c.as_os_str() == "tests");
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            for (index, line) in text.lines().enumerate() {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("//") {
-                    continue;
-                }
-                if !line.contains(needle) {
-                    continue;
-                }
-                if line.contains(definition) {
-                    continue;
-                }
-                if in_test_file {
-                    *tests += 1;
-                } else {
-                    product.push(format!("{}:{}", path.display(), index + 1));
-                }
-            }
-        }
+        assert!(
+            product_callers.is_empty(),
+            "製品コードが「Redirector DLLを注入しない」を選んでいる。段階⑤で\
+             CHILD_PROCESS_RESTRICTEDを積むと、この経路の子は子プロセスを作ることも\
+             Spawn Daemonへ頼むこともできなくなる（§8.1）。\
+             製品から起こすなら RedirectorInject::for_tier2a を使うこと:\n  {}",
+            product_callers.join("\n  ")
+        );
+        assert!(
+            test_callers > 0,
+            "テストからの呼び出しも0件になった。綴りを間違えて1行も見ていない可能性がある\
+             （0件マッチで黙って緑になる形＝BUG-056）"
+        );
     }
 
     /// **`preflight`が使うのと同じ語彙**であることを固定する。ここがずれると別のcapability SIDを

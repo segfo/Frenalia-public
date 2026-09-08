@@ -22,6 +22,7 @@ use harness_sandbox::tier2a::win_appcontainer::{
     SessionError, SpawnRequestAccess,
 };
 
+use crate::decl::McpProcessAccess;
 use crate::runtime::{PreparedIsolation, PreparedServer, TransportFactory};
 use crate::transport::{LineAccumulator, Transport};
 use crate::McpError;
@@ -153,22 +154,36 @@ impl TransportFactory for AppContainerTransportFactory {
             true, // MCPは双方向なのでstdinが必須。
             sid.as_psid(),
             net,
-            // Redirector DLLはMCPサーバへ注入しない。CoWの誘導が要らない（workspaceを触らない）
-            // のに加え、[D-88]のlazy fault-inも対象外である——MCP preflightはworkspace内へ
-            // **別の宛先SIDの**DACLを書き得るので、設計書§5.1.3が全walk待機のまま残すと決めている。
-            RedirectorInject::default(),
+            // [段階5b] **MCPサーバにもRedirector DLLを注入する。**
+            //
+            // かつてここは`RedirectorInject::default()`（＝注入しない）を固定で渡しており、
+            // 理由も「workspaceを触らないから要らない」と書かれていた。**理由は今も正しいが、
+            // 問いが変わった**——段階⑤で`CHILD_PROCESS_RESTRICTED`（OSが子プロセス生成を
+            // 拒否する緩和策）を積むと、注入の有無は「誘導が要るか」ではなく
+            // 「**子を作れなくなったとき頼む先を持っているか**」の問題になる。
+            // フックの入っていないプロセスが1つでも居る状態で⑤は積めない（§8.1）。
+            //
+            // **CoWの誘導もfault受付も渡さない。** ワークスペースが無いので渡せず、
+            // DLL側はそのときファイル系フックを1本も置かない。
+            // したがって§5.1.3の「MCP preflightはlazy化の初期対象に含めない」は**そのまま生きている**
+            // ——あれは受付（fault-in）の話で、注入そのものの話ではない。
+            RedirectorInject::for_tier2a(None, None, None),
             // §22.1.1: D-38でMCPサーバは**サーバごとに専用プロファイル**なので、package SIDが
             // そのままドメインになる。capability群は持たない（§22.2.2で対象外と決着済み）。
             DomainIdentity::OwnPackage,
-            // §22.2.2: MCPサーバの`process`宣言の**既定は`deny`**であり、その意味は
-            // 「spawn要求用capabilityを積まない＝要求受付パイプに到達すらできない」という
-            // 二重目のdenyである。宣言キー`process`（＝`broker`を選べるようにする側）は
-            // まだ入っていないので、**いまは既定だけが在る**。
+            // §22.2.2: MCPサーバの`process`宣言が、Spawn Daemonの要求受付パイプへ
+            // 到達できるかを決める。**既定は`deny`**で、その意味は「spawn要求用capabilityを
+            // 積まない＝パイプに到達すらできない」という二重目のdenyである。
             //
-            // **積む側へ倒してはいけない。** D-38はMCPサーバを「ユーザーが宣言した第三者コード」
-            // ＝系の中で最も信頼していないコードと位置づけており、そこがDaemonへ
-            // 話しかけられる状態を、宣言も承認も無いまま既定にすることになる。
-            SpawnRequestAccess::Withhold,
+            // **既定を`broker`側へ倒してはいけない。** D-38はMCPサーバを
+            // 「ユーザーが宣言した第三者コード」＝系の中で最も信頼していないコードと
+            // 位置づけており、そこがDaemonへ話しかけられる状態を、宣言も承認も無いまま
+            // 既定にすることになる。`broker`は宣言に書き、承認台帳のハッシュにも入る
+            // （`decl.rs`の`McpProcessAccess`）。
+            match decl.process {
+                McpProcessAccess::Deny => SpawnRequestAccess::Withhold,
+                McpProcessAccess::Broker => SpawnRequestAccess::Grant,
+            },
         )
         .map_err(|e| spawn_error(e.to_string()))?;
 

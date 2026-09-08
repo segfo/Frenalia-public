@@ -152,6 +152,17 @@ pub enum RedirectorSpec {
         workspace_root: String,
         broker_pipe: String,
     },
+    /// [段階5b（`plans/DESIGN-MAC-ENFORCEMENT.md` §8.1）] **誘導するものも受け付けるものも
+    /// 無いが、プロセス生成フックを置くために注入する。**
+    ///
+    /// 段階⑤で`CHILD_PROCESS_RESTRICTED`（OSが子プロセス生成そのものを拒否する緩和策）を
+    /// 積むと、サンドボックスの中のプログラムは自力で子を作れなくなりSpawn Daemonへ頼む形に
+    /// なる。**その頼み方へ変換するのがこのフック**なので、フックの入っていないプロセスが
+    /// 1つでも居る状態で⑤は積めない。
+    ///
+    /// `workspace_root`が`None`のことがある——MCPサーバにはワークスペースが無い。
+    /// DLLはそのときファイル系フックを1本も置かない（`harness-redirector`の`Config`のdoc）。
+    ProcessHooks { workspace_root: Option<String> },
 }
 
 /// 制御要求が失敗した段階。lazy注入だけを安全に1回再試行するため、文言とは別の値で返す。

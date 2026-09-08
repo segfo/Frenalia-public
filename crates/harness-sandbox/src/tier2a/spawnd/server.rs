@@ -620,15 +620,15 @@ fn spawn_top_level(
                     .collect();
                 augment_redirector_env(
                     &mut env,
-                    RedirectorInject {
-                        workspace_root: Some(workspace),
-                        cow: Some(CowInject {
+                    RedirectorInject::for_tier2a(
+                        Some(workspace),
+                        Some(CowInject {
                             workspace_root: workspace,
                             diff_layer_dir: diff,
                             ext_capture_roots: &roots,
                         }),
-                        broker_pipe: None,
-                    },
+                        None,
+                    ),
                     write,
                 );
             }
@@ -638,6 +638,16 @@ fn spawn_top_level(
             } => augment_redirector_env(
                 &mut env,
                 RedirectorInject::lazy(std::path::Path::new(workspace_root), broker_pipe),
+                write,
+            ),
+            // [段階5b] 誘導も受付も無いが、プロセス生成フックのために注入する。
+            RedirectorSpec::ProcessHooks { workspace_root } => augment_redirector_env(
+                &mut env,
+                RedirectorInject::for_tier2a(
+                    workspace_root.as_deref().map(std::path::Path::new),
+                    None,
+                    None,
+                ),
                 write,
             ),
         }

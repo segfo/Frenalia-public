@@ -59,24 +59,30 @@ pub(crate) unsafe fn resolve_config(param: *const u8) -> Option<Config> {
         get_env("HARNESS_COW_WORKSPACE"),
         get_env("HARNESS_COW_DIFF_LAYER")
     ));
-    let workspace_root = match get_env("HARNESS_COW_WORKSPACE") {
-        Some(v) => PathBuf::from(v),
-        None => {
-            debug_log("init: HARNESS_COW_WORKSPACE not set, bail");
-            return None;
-        }
-    };
+    // [段階5b] **ワークスペースは必須ではなくなった。** プロセス生成フックだけを理由に
+    // 注入する相手（MCPサーバ）にはワークスペースが無い。
+    let workspace_root = get_env("HARNESS_COW_WORKSPACE")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     // [D-88（`DESIGN-SANDBOX-APPPOLICY.md`）] **差分層は必須ではなくなった。**
     // DirectRwのlazyレーンには差分層が無く、受付パイプだけがある。
     let diff_layer_dir = get_env("HARNESS_COW_DIFF_LAYER")
         .map(PathBuf::from)
         .unwrap_or_default();
     let broker_pipe = get_env("HARNESS_LAZY_BROKER_PIPE");
+    let process_hooks = super::config::process_hooks_from_env();
     let cow_enabled = !diff_layer_dir.as_os_str().is_empty();
-    if !cow_enabled && broker_pipe.is_none() {
-        // CoWでもなく受付も無い＝このDLLがやることは無い。**成功にしない**
+    if !cow_enabled && broker_pipe.is_none() && !process_hooks {
+        // CoWでもなく受付もフックの要求も無い＝このDLLがやることは無い。**成功にしない**
         // （`parse_config_blob`と同じ判断。理由はあちらのコメント）。
-        debug_log("init: neither a diff layer nor a fault broker was given, bail");
+        debug_log("init: no diff layer, no fault broker and no process-hook request, bail");
+        return None;
+    }
+    // 誘導も受付も「workspace内か」を判定するので、**ワークスペースが分からないまま
+    // その2つを名乗る設定は受け取らない**（`parse_config_blob`と**同じ判断**。BUG-066は、
+    // 照合が全部外れると「workspace外への書込が拒否された」ように見える形で全部が壊れる）。
+    if workspace_root.as_os_str().is_empty() && (cow_enabled || broker_pipe.is_some()) {
+        debug_log("init: a diff layer or a fault broker was given without a workspace root, bail");
         return None;
     }
     // Phase 3（設計書§19.8）: `;`区切りのDOS形式絶対パス一覧。空文字列要素は無視する
@@ -99,6 +105,7 @@ pub(crate) unsafe fn resolve_config(param: *const u8) -> Option<Config> {
         cow_enabled,
         broker_pipe,
         ext_capture_roots,
+        process_hooks,
     }))
 }
 
@@ -126,8 +133,13 @@ pub(crate) fn finalize_config(cfg: Config) -> Config {
         cow_enabled: cfg.cow_enabled,
         broker_pipe: cfg.broker_pipe,
         ext_capture_roots: cfg.ext_capture_roots.iter().map(|p| normalize(p)).collect(),
+        process_hooks: cfg.process_hooks,
     };
-    if !cfg.workspace_root.is_absolute() {
+    // [段階5b] **ワークスペースが無いのは異常ではない。** プロセス生成フックだけを理由に
+    // 注入した相手（MCPサーバ）には最初から無く、そのときファイル系フックは1本も置かない
+    // ので、照合が外れる余地も無い。ここで警告を出すと、**書き込み先が相対パスになって
+    // 相手の作業ディレクトリへ台帳が生える**（`debug_log`が同じ罠を1度踏んでいる）。
+    if !cfg.workspace_root.as_os_str().is_empty() && !cfg.workspace_root.is_absolute() {
         append_warning_kind(
             &cfg,
             "config_workspace_not_absolute",
@@ -175,8 +187,32 @@ pub(crate) unsafe fn init(param: *const u8) -> bool {
     let Some(cfg) = (unsafe { resolve_config(param) }) else {
         return false;
     };
+    // [段階5b] **ファイル系フックを置く理由があるか。** CoWの誘導もfault受付も無いなら、
+    // あの7本は`NtCreateFile`等の全呼び出しを素通りさせるだけの回り道になる
+    // （`file_hooks`のモジュールdocの表: `cow_enabled`が偽のとき成功経路では何もしない。
+    // 受付が無ければ失敗経路も`retry_once_after_fault_in`の1行目で戻る）。
+    let file_hooks_wanted = cfg.cow_enabled || cfg.broker_pipe.is_some();
+    // **フックの設置に失敗したとき、それを致命にしてよいか。** プロセス生成フックだけを
+    // 理由に注入したのなら、置けなかった時点でこのDLLは何もしていない——
+    // そこでreadyを返すと「入ったが何もしていない」が成功として通り、
+    // 段階⑤を積んだ日に**そのプロセスだけが静かに子を作れなくなる**。
+    let process_hooks_are_the_only_reason = cfg.process_hooks && !file_hooks_wanted;
     load_deleted_set(&cfg);
     let _ = CONFIG.set(cfg);
+
+    if !file_hooks_wanted {
+        debug_log("init: no diff layer and no fault broker; installing process hooks only");
+        let installed = install_create_process_hooks();
+        if process_hooks_are_the_only_reason && !installed {
+            debug_log(
+                "init: the process-creation hooks are the only reason for this injection, \
+                       and none could be installed; bail without signalling ready",
+            );
+            return false;
+        }
+        signal_ready();
+        return true;
+    }
 
     let create_file_addr = match unsafe { resolve_ntdll_export("NtCreateFile") } {
         Some(a) => a,
@@ -352,7 +388,7 @@ pub(crate) unsafe fn init(param: *const u8) -> bool {
     // Phase 1-3（直接の子の書込リダイレクト）は実機で確立済みの機能であり、これらのフックが
     // 何らかの理由で設置に失敗しても、上記6フックを巻き戻さずそのまま活かす（孫プロセスへの
     // 再注入だけが働かなくなる＝Phase 4a以前と同じ状態に留まる）。
-    install_create_process_hooks();
+    let _ = install_create_process_hooks();
     debug_log(&format!(
         "init: install_create_process_hooks done, create_process_w_hook={} create_process_as_user_w_hook={}",
         CREATE_PROCESS_W_HOOK.get().is_some(),
@@ -387,7 +423,16 @@ pub(crate) fn install_query_dir_ex_hook() -> bool {
 /// `kernelbase.dll`から先に解決を試みる（`resolve_module_export`のdoc参照、転送エクスポートの
 /// 実体を直接掴むため）。`kernel32.dll`の解決に失敗する環境は無い想定だが、フォールバックとして
 /// `kernelbase.dll`側の解決が失敗した場合のみ`kernel32.dll`を試す。
-pub(crate) fn install_create_process_hooks() {
+///
+/// # 戻り値は`CreateProcessW`が置けたかである
+///
+/// [段階5b] このフックだけを理由に注入したときは、置けなかったことを呼び出し元が
+/// 致命として扱う。**4本すべてではなく`CreateProcessW`を見るのは**、残る3本
+/// （`CreateProcessAsUserW`・`CreateProcessA`・`WinExec`）がどれも
+/// `CreateProcessW`と同じ本体へ落ちる別名で、環境によっては存在しないことがあるためである
+/// （`WinExec`は特に古い口）。**「1本も置けなかった」と「全部は置けなかった」は別**で、
+/// 致命にしてよいのは前者だけである。
+pub(crate) fn install_create_process_hooks() -> bool {
     for module in ["kernelbase.dll", "kernel32.dll"] {
         if CREATE_PROCESS_W_HOOK.get().is_none() {
             if let Some(addr) = unsafe { resolve_module_export(module, "CreateProcessW") } {
@@ -434,6 +479,7 @@ pub(crate) fn install_create_process_hooks() {
             }
         }
     }
+    CREATE_PROCESS_W_HOOK.get().is_some()
 }
 
 /// Launcherが`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`で継承させたパイプ書込端（`HARNESS_COW_READY_HANDLE`

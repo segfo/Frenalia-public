@@ -731,9 +731,13 @@ pub fn preflight_with_privhelper_launcher(
     // lazyレーンはDirectRwの子にも同じDLLを注入するので、ここがCoW限定のままだと
     // `LoadLibraryW`が対象プロセスでNULLを返し、**注入が必ず失敗する**——受入E2Eが実際に
     // これで落ちた（`B-06`: 前提を変えたら、それを実現している経路を全部数える）。
-    let injects_redirector = matches!(write_mode, WorkspaceWriteMode::Cow { .. })
-        || matches!(super::lazy_grant::lane(), grant_job::PreparationLane::Lazy);
-    if injects_redirector {
+    // **[段階5b（`plans/DESIGN-MAC-ENFORCEMENT.md` §8.1）] 条件そのものが消えた。**
+    //
+    // かつてここは「CoWか、lazyレーンか」だったが、**Tier2aの全spawnが注入するように
+    // なった**ので、DLLの読取ACEも常に要る。条件を残すと、条件が偽の構成だけ
+    // `LoadLibraryW`がNULLを返して**spawnが失敗する**——D-88の受入E2Eが一度この形で
+    // 落ちている（`B-06`: 前提を変えたら、それを実現している経路を全部数える）。
+    {
         for dll in redirector_dll_paths() {
             match grant_ace_inheritable_access(&dll, sid.as_psid(), FsAccess::ReadExec) {
                 Ok(()) => crate::tier2a::session_profile::record_granted_path(&dll),

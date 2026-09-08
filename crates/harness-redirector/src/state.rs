@@ -167,6 +167,10 @@ pub(crate) type WinExecFn = unsafe extern "system" fn(PCSTR, u32) -> u32;
 pub(crate) const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;
 
 pub(crate) struct Config {
+    /// ワークスペースのルート。**空のことがある**——[`Config::process_hooks`]だけを理由に
+    /// 注入された相手（MCPサーバ）にはワークスペースが無い。空のときは
+    /// **ファイル系フックを1つも設置しない**（何がworkspace内かを判定できないまま
+    /// 分類すると、`docs/bugs/BUG-066.md`と同じ「全部の照合が外れる」状態になる）。
     pub(crate) workspace_root: PathBuf,
     /// CoWの差分層。**`cow_enabled`が偽のときは空**（[D-88（`DESIGN-SANDBOX-APPPOLICY.md`）]の
     /// DirectRwレーンには差分層が無い）。空のまま誘導へ使わないよう、参照する箇所は
@@ -191,6 +195,28 @@ pub(crate) struct Config {
     /// `_ext/<key>`経由の操作台帳captureの対象になる（境界＝ACLはfs-allowが既に張っている、
     /// ここはあくまで透過性・変更の可視化のためのcaptureであってACL自体を変えない）。
     pub(crate) ext_capture_roots: Vec<PathBuf>,
+    /// **プロセス生成フックを置くこと自体が目的である**（段階5b、
+    /// `plans/DESIGN-MAC-ENFORCEMENT.md` §8.1）。
+    ///
+    /// # なぜ「何も誘導しないのに注入する」が要るのか
+    ///
+    /// 段階⑤で`CHILD_PROCESS_RESTRICTED`（OSが子プロセス生成そのものを拒否する緩和策）を
+    /// 積むと、サンドボックスの中のプログラムは自力で子を作れなくなる。代わりに
+    /// Spawn Daemonへ頼む形になり、**その頼み方へ変換するのがこのフックである**。
+    /// したがって**フックが入っていないプロセスが1つでも居る状態で⑤を積むことはできない**
+    /// ——そのプロセスは子を作ることも頼むこともできなくなる。
+    ///
+    /// # 真のとき、CoWの誘導もfault受付も無ければファイル系フックは設置しない
+    ///
+    /// あの7本は`NtCreateFile`等の呼び出しすべてを経由させる。誘導も受付も無ければ
+    /// **素通りするだけの回り道**なので、置けば費用だけが残る。
+    ///
+    /// # 真であること「だけ」が注入の理由なら、フックの設置失敗は致命である
+    ///
+    /// 他に何もしないDLLが「入ったが何もしていない」状態で成功を返すと、
+    /// ⑤を積んだ日に**そのプロセスだけが静かに子を作れなくなる**
+    /// （`.claude/skills/bug-pattern-rules`の方式4が招く型そのもの）。
+    pub(crate) process_hooks: bool,
 }
 
 /// 孫プロセスへの再注入が失敗した/初期化未完了だった場合の警告台帳ファイル名
