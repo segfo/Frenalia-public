@@ -1062,6 +1062,11 @@ mod tests {
         // 「あなたが誰かは分かった（Process Tableに載っている）が、遷移を許すかを
         // 判定する仕組みがまだ無い」で、`not_registered`なら登録が効いていない（BUG-116の形）。
         // **同じ値へ丸めると、常に拒否する実装でも通る**（`B-35`）。
+        //
+        // **同じ綴りが`crates/harness-policy-editor/tests/record_net_e2e.rs`の
+        // `SPAWN_REQUEST_ROUNDTRIP`にもある**（あちらはパス2の、こちらは`run_shell`の
+        // 同じ測定である）。1箇所へ畳めない理由と、写しを許した判断の経緯はあちらのdocが持つ。
+        // **直すときは必ず両方を直すこと**——片方だけ直っても誰も落ちない。
         let roundtrip = r#"
 $raw = $env:HARNESS_SPAWN_REQUEST_PIPE
 if (-not $raw) { Write-Output 'NO_PIPE_ENV'; exit 0 }

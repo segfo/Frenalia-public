@@ -208,6 +208,13 @@ fn build_env(
     env
 }
 
+/// **実機E2E**（`#[ignore]`。AppContainerプロファイルという実マシンの共有状態を触る）。
+/// 下の`mod tests`が純粋な組み立てだけを見るのに対し、あちらは**この`create`を実際に通して**
+/// 子を起こし、要求受付パイプへ届かないことを測る。
+#[cfg(all(windows, test))]
+#[path = "transport_stdio_e2e_tests.rs"]
+mod transport_stdio_e2e_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

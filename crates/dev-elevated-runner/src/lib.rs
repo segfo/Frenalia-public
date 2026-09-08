@@ -592,6 +592,49 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "win_appcontainer::mcp_e2e_tests",
         ],
     ),
+    // T2: **MCP stdioの子が要求受付パイプへ到達できないこと**を、製品のトランスポート
+    // （`harness-mcp`の`AppContainerTransportFactory`）を実際に通して測る
+    // （`plans/DESIGN-MAC-DOMAIN.md` §22.2.2）。`e2e-mcp`（D-38の隔離）とは**別の口**にしてある
+    // ——あちらは`harness-sandbox`のテストで、製品のトランスポートを1行も通らない。
+    //
+    // **昇格は要らない**（プロファイル作成もACE付与先もこのユーザーが所有する）が、
+    // AppContainerプロファイルという**マシン全体の共有状態**を触るのでここから直列で回す
+    // （`redirector-dll-sweep`と同じ理由）。事前に`tier2a_proc_probe.exe`の配置が要る。
+    (
+        "e2e-mcp-spawn-reach",
+        &[
+            "test",
+            "-p",
+            "harness-mcp",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "transport_stdio_e2e_tests",
+        ],
+    ),
+    // T2の対の片側: **ポリシーエディタのパス2の子は要求受付パイプへ届き、
+    // `policy_not_implemented`で断られる**。`e2e-policy-editor-pass2`へ混ぜないのは
+    // `e2e-policy-editor-exec-ace`と同じ理由で、**1要素＝1測定**にするため
+    // ——あちらの3本は外部到達性を要するので、所要時間がそちらに引きずられる。
+    // フィルタ文字列はテスト関数名と一致していなければならない（0件マッチを
+    // `check_tests_actually_ran`が非0で落とす、BUG-056同型）。
+    (
+        "e2e-policy-editor-pass2-spawn-reach",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "record_net_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "pass2_reaches_the_request_pipe",
+        ],
+    ),
     (
         "e2e-wfp-multisession",
         &[

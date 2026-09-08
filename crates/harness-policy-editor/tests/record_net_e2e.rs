@@ -688,6 +688,120 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
     );
 }
 
+/// **サンドボックスの中のシェルから、Spawn Daemonの要求受付パイプへ1往復する**
+/// PowerShellスクリプト（`plans/DESIGN-MAC-PROTOCOL.md` §12）。
+///
+/// 子の環境変数`HARNESS_SPAWN_REQUEST_PIPE`から窓口の名前を取り、
+/// `[4バイトのリトルエンディアン長][本体]`のフレームで1往復して`REPLY:<json>`を1行印字する。
+///
+/// # **同じ綴りが`crates/harness-tools/src/shell/shell_tests.rs`の(e)にもある**
+///
+/// あちらは`run_shell`の、こちらはポリシーエディタのパス2の**同じ測定**である。
+/// 1箇所へ畳めないのは、あちらが`#[cfg(test)]`のクレート内部にあり、ここから参照するには
+/// **テストでしか使わない文字列を製品クレートの公開面へ載せる**ことになるためで、
+/// このファイルの`place_netfilterd_next_to_the_test_binary`が同じ理由で採ったのと同じ判断である。
+///
+/// **写しである以上、片方だけ直ると気付けない。** 直すときは必ず両方を直すこと
+/// （向こう側にも同じ注記がある）。
+const SPAWN_REQUEST_ROUNDTRIP: &str = r#"
+$raw = $env:HARNESS_SPAWN_REQUEST_PIPE
+if (-not $raw) { Write-Output 'NO_PIPE_ENV'; exit 0 }
+$name = $raw -replace '^\\\\\.\\pipe\\', ''
+$c = New-Object System.IO.Pipes.NamedPipeClientStream('.', $name, 'InOut')
+try { $c.Connect(5000) } catch { Write-Output ('CONNECT_FAILED:' + $_.Exception.Message); exit 0 }
+$body = [Text.Encoding]::UTF8.GetBytes('{"kind":"spawn","exe":"git.exe","args":["status"],"cwd":"C:/"}')
+$c.Write([BitConverter]::GetBytes([int]$body.Length), 0, 4)
+$c.Write($body, 0, $body.Length)
+$c.Flush()
+$hdr = New-Object byte[] 4
+if ($c.Read($hdr, 0, 4) -ne 4) { Write-Output 'NO_REPLY_HEADER'; exit 0 }
+$n = [BitConverter]::ToInt32($hdr, 0)
+$buf = New-Object byte[] $n
+$got = 0
+while ($got -lt $n) { $r = $c.Read($buf, $got, $n - $got); if ($r -le 0) { break }; $got += $r }
+Write-Output ('REPLY:' + [Text.Encoding]::UTF8.GetString($buf, 0, $got))
+"#;
+
+/// 8番: **パス2で起こした子は要求受付パイプへ届き、`policy_not_implemented`で断られる**
+/// （`plans/DESIGN-MAC-PROTOCOL.md` §12の経路表で「積む」と決めた側）。
+///
+/// # なぜ`run_shell`側のテストでは足りないのか
+///
+/// パス2は入口の関数（`spawn_shell_in_workspace_via_daemon`）を`run_shell`と共有するが、
+/// **そこへ辿り着くまでの配線は別物**である——`record_net`が自前で`SharedSpawnDaemon`を
+/// 遅延起動し、`SessionGrants`・`SharedNetfilter`と並ぶ寿命で持つ。共通部分だけを測って
+/// 呼び出し側の1本が取り残される形は、このリポジトリで実際に起きている（BUG-032）。
+///
+/// # 見るのは「断られたこと」ではなく**断る理由**である
+///
+/// `policy_not_implemented`は「あなたが誰かは分かった（Process Tableに載っている）が、
+/// 遷移を許すかを判定する仕組みがまだ無い」、`not_registered`は「登録が効いていない」
+/// （BUG-116の形）。**同じ値へ丸めると、常に拒否する実装でも通る**（`B-35`）。
+///
+/// # 対の相手
+///
+/// 拒否側は`harness-mcp`の`transport_stdio_e2e_tests`が持つ（MCPの子は**そもそも届かない**）。
+/// 2本で「経路ごとに向きが逆である」を固定している。
+///
+/// # 歯があることの確かめ方
+///
+/// `crates/harness-sandbox/src/tier2a/win_appcontainer/launch.rs`の
+/// `SpawnRequestAccess::Grant`を`Withhold`へ倒すと接続が拒否され、このテストは赤くなる
+/// （倒したら必ず戻すこと）。
+///
+/// # ここが測っていないもの
+///
+/// - **外部への到達性は要らない**（窓口はローカルの名前付きパイプ）。それでも昇格が要るのは
+///   `record_net`がWFPのdaemonを起こすためで、パイプのためではない
+/// - `policy.json`の`fs`は他の3本と同じく**空**にしてある（実ACLと台帳を触らない、モジュールdoc）
+#[test]
+#[ignore = "requires administrator rights (WFP netfilterd) and starts a real spawn daemon"]
+fn pass2_reaches_the_request_pipe_and_is_denied_by_policy_not_by_the_table() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let workspace_root = workspace.path();
+    write_policy(workspace_root, "e2e-spawn-reach", SPAWN_REQUEST_ROUNDTRIP);
+
+    let output = run_record_net(workspace_root, "e2e-spawn-reach", SPAWN_REQUEST_ROUNDTRIP);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    eprintln!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+
+    // 着地していなければ、以下は何も測っていない（Tier1にはSpawn Daemonが居ない）。
+    assert!(
+        stderr.contains("Tier2aへ着地しました"),
+        "this test is meaningless unless the recording actually lands on Tier2a: {stderr}"
+    );
+
+    // 窓口の名前が子へ届いていない＝Daemon経由になっていないか、envの受け渡しが落ちている。
+    //
+    // **部分一致で見ない。行そのものと比べる。** この目印は`SPAWN_REQUEST_ROUNDTRIP`の
+    // 本文にも（`Write-Output 'NO_PIPE_ENV'`という**まだ実行されていない行**として）現れる。
+    // 進行表示はいまその本文をstderrへ echo しているので今日は当たらないが、
+    // **表示先が変わった日に、機構は健全なままこのテストだけが赤くなる**。
+    // 子が実際に印字した行は`NO_PIPE_ENV`単独なので、行として比べれば取り違えようがない。
+    let printed_lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert!(
+        !printed_lines.contains(&"NO_PIPE_ENV"),
+        "パス2の子に要求受付パイプの名前が届いていない。Daemon経由になっていないか、\
+         環境変数の受け渡しが落ちている: {stdout}"
+    );
+    assert!(
+        stdout.contains("policy_not_implemented"),
+        "パス2の子が要求受付パイプで `policy_not_implemented` を受け取れていない。\
+         `not_registered` なら Process Table への登録が Resume より前に効いていない（BUG-116の形）、\
+         `CONNECT_FAILED` なら spawn要求用capability を積んでいない: {stdout}"
+    );
+    assert!(
+        !stdout.contains("not_registered"),
+        "Daemonが起こした子なのに「台帳に無い」で断られている（§12・BUG-116）: {stdout}"
+    );
+
+    // 撤収まで通っている（ここが抜けるとプロファイルとACEがマシンに残る）。
+    let manifest = manifest_of_latest_session(workspace_root);
+    assert_eq!(manifest["pass"], 2, "manifest: {manifest}");
+    assert_eq!(manifest["status"], "finished", "manifest: {manifest}");
+}
+
 /// `NetfilterHandle::start`は`current_exe().parent()`の隣から`harness-netfilterd.exe`を探すが、
 /// **統合テストのバイナリが置かれる`target/debug/deps/`にそれは無い**（cargoが実行ファイルを
 /// 置くのは`target/debug/`）。上の2本はビルド済みCLIをサブプロセスとして起こすので影響を
