@@ -18,5 +18,14 @@ harness-config = { version = "0.1.0", path = "../harness-config" }
 # `RequireSandbox`（`gate.rs`の矛盾チェックの入力）だけを使う。判定の語彙を複製しないため
 # 型を借りるのであって、`harness-core`のツール層・プロバイダ層には触れない。
 harness-core = { version = "0.1.0", path = "../harness-core" }
+# 遷移MACの照合（`transition.rs`）だけが使う。パスの畳み込みは`path_rules`の
+# `fold_for_pattern_comparison`を呼ぶ——独自実装すると、あちらが踏んだ`to_lowercase`の罠を
+# 再び踏む（`bug-pattern-rules` B-05）。このクレートはserdeのみに依存する最小クレートなので、
+# ここへ足してもWin32もasyncも入らない。
+harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 遷移のパターン言語（`plans/DESIGN-MAC-BROKER.md` §22.5）。有限オートマトンで入力長に対して
+# 線形時間を保証するので、信頼していない子から来る文字列を照合しても停止しない。
+# **ワークスペースの他クレートが既に間接依存している**ので、これで外部依存は増えない。
+regex = "1"

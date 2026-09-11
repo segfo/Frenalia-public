@@ -31,6 +31,7 @@ pub mod gate;
 pub mod generalize;
 pub mod insufficient;
 pub mod normalize;
+pub mod transition;
 
 pub use breadth::BreadthVerdict;
 pub use diff::{SettingsDiff, SettingsDiffEntry};
@@ -41,6 +42,10 @@ pub use insufficient::{diagnose, GrantedPaths, Insufficient};
 pub use normalize::{
     is_net_control_record, DeniedCandidate, FsFolder, GrantScope, NetIntake, Requested, Source,
     SourceReport,
+};
+pub use transition::{
+    ArgvMatcher, DomainView, EnvOverride, ExeMatcher, GraphInput, TransitionEdge, TransitionGraph,
+    TransitionRules,
 };
 
 /// 4経路ぶんの[`SourceReport`]をまとめた、提案生成の入力一式。

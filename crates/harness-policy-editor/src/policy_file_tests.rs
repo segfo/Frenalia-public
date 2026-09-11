@@ -46,7 +46,10 @@ fn a_policy_file_round_trips_through_disk() {
     save(ws.path(), &file).expect("save");
     let read_back = load(ws.path()).expect("load");
 
-    assert_eq!(read_back, file);
+    // **版だけは往復で変わり得る。** 書くときは内容から決め直すので、遷移を1本も持たない
+    // ファイルは「遷移を知らないバイナリでも読める版」を名乗る。
+    assert_eq!(read_back.domains, file.domains);
+    assert_eq!(read_back.schema_version, file.required_schema_version());
     let domain = read_back.domain("cargo").expect("the domain must exist");
     assert_eq!(domain.fs.read, vec![r"C:\Users\x\.cargo\**".to_string()]);
     assert_eq!(domain.net.allow_domains, vec!["crates.io".to_string()]);
@@ -82,6 +85,171 @@ fn a_corrupt_policy_file_is_an_error_rather_than_an_empty_policy() {
         matches!(err, PolicyFileError::Parse { .. }),
         "unexpected error: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 遷移の宣言とスキーマ版（段階⑥a）
+// ---------------------------------------------------------------------------
+
+fn policy_with_transition(schema_version: u32) -> String {
+    format!(
+        r#"{{
+          "schema_version": {schema_version},
+          "domains": [
+            {{
+              "name": "shell",
+              "process": {{
+                "transitions": [
+                  {{
+                    "exe":  {{ "literal": "C:\\Program Files\\Git\\cmd\\git.exe" }},
+                    "argv": {{ "any": true }},
+                    "to":   "shell"
+                  }}
+                ]
+              }}
+            }}
+          ]
+        }}"#
+    )
+}
+
+fn write_policy(ws: &Path, text: &str) {
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    std::fs::write(path(ws), text).unwrap();
+}
+
+/// **版が内容に追いついていないファイルは拒否する**（`plans/DESIGN-MAC.md` §5.1(7)）。
+///
+/// 版1のまま遷移が書かれたファイルは、遷移を知らない古いバイナリが**黙って無視して**読む。
+/// 版を正しく上げてあるものは通る（対）。
+#[test]
+fn a_transition_declared_under_the_old_schema_version_is_refused_but_the_new_one_loads() {
+    let ws = workspace();
+    write_policy(ws.path(), &policy_with_transition(1));
+    let err = load(ws.path()).expect_err("version 1 cannot carry a transition");
+    assert!(
+        matches!(err, PolicyFileError::UnversionedTransitions { .. }),
+        "unexpected error: {err}"
+    );
+
+    write_policy(ws.path(), &policy_with_transition(POLICY_SCHEMA_VERSION));
+    let file = load(ws.path()).expect("the correctly versioned file loads");
+    assert_eq!(file.domains[0].process.transitions.len(), 1);
+}
+
+/// 書く側は**内容から版を決める**。足したら上がり、足していなければ上がらない（対）。
+#[test]
+fn saving_raises_the_schema_version_only_when_a_transition_is_actually_declared() {
+    let ws = workspace();
+
+    let mut file = PolicyFile::default();
+    file.domains.push(PolicyDomain::new("shell"));
+    save(ws.path(), &file).expect("save without transitions");
+    let text = std::fs::read_to_string(path(ws.path())).unwrap();
+    assert!(
+        text.contains("\"schema_version\": 1"),
+        "a file without transitions must stay readable by older binaries: {text}"
+    );
+    assert!(
+        !text.contains("\"process\""),
+        "an empty process key must not be written at all: {text}"
+    );
+
+    file.domains[0].process = serde_json::from_str(
+        r#"{"transitions":[{"exe":{"literal":"C:\\x\\git.exe"},"argv":{"any":true},"to":"shell"}]}"#,
+    )
+    .unwrap();
+    save(ws.path(), &file).expect("save with a transition");
+    let text = std::fs::read_to_string(path(ws.path())).unwrap();
+    assert!(
+        text.contains(&format!("\"schema_version\": {POLICY_SCHEMA_VERSION}")),
+        "declaring a transition must raise the version: {text}"
+    );
+
+    // 書いたものは読み戻せる（書く側と読む側が同じ規則を通っている）。
+    let read_back = load(ws.path()).expect("load what we just wrote");
+    assert_eq!(read_back.domains[0].process.transitions.len(), 1);
+}
+
+/// **編集時検査は`load`に配線されている。** 検査が在ることと呼ばれていることは別の事実で、
+/// 後者が抜けるのがこの種の欠陥の本体である（`bug-pattern-rules` B-06）。
+#[test]
+fn a_hand_written_edge_that_fails_the_checks_is_refused_at_load_time() {
+    let ws = workspace();
+    write_policy(
+        ws.path(),
+        &format!(
+            r#"{{
+              "schema_version": {POLICY_SCHEMA_VERSION},
+              "domains": [
+                {{
+                  "name": "shell",
+                  "process": {{
+                    "transitions": [
+                      {{ "exe": {{ "literal": "git.exe" }}, "argv": {{ "any": true }}, "to": "shell" }}
+                    ]
+                  }}
+                }}
+              ]
+            }}"#
+        ),
+    );
+
+    let err = load(ws.path()).expect_err("a leaf-only exe must not load");
+    match err {
+        PolicyFileError::RejectedTransitions { reason, .. } => {
+            assert!(
+                reason.contains("is not a full path"),
+                "the reason should name what is wrong: {reason}"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+/// ワークスペースは`policy.json`に宣言として現れないが、**呼び出し元が書ける場所**である。
+/// `load`はそれを判定器へ渡している——渡していなければ、この辺は通ってしまう。
+#[test]
+fn the_workspace_root_is_handed_to_the_checker_as_a_caller_writable_place() {
+    let ws = workspace();
+    let script = ws
+        .path()
+        .join("a.py")
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    let cwd = ws.path().to_string_lossy().replace('\\', "\\\\");
+    write_policy(
+        ws.path(),
+        &format!(
+            r#"{{
+              "schema_version": {POLICY_SCHEMA_VERSION},
+              "domains": [
+                {{
+                  "name": "shell",
+                  "process": {{
+                    "transitions": [
+                      {{
+                        "exe":  {{ "literal": "C:\\python\\python.exe" }},
+                        "argv": {{ "literal": "\"C:\\python\\python.exe\" {script}" }},
+                        "cwd":  "{cwd}",
+                        "to":   "shell"
+                      }}
+                    ]
+                  }}
+                }}
+              ]
+            }}"#
+        ),
+    );
+
+    let err = load(ws.path()).expect_err("a fixed value inside the workspace must not load");
+    match err {
+        PolicyFileError::RejectedTransitions { reason, .. } => assert!(
+            reason.contains("which this domain can write"),
+            "the reason should say the caller can rewrite it: {reason}"
+        ),
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 /// 未来のスキーマ版は**解釈しようとしない**（知らないフィールドを落として書き戻すと、

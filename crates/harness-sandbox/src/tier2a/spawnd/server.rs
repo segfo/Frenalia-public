@@ -26,7 +26,9 @@
 //! # ここが持っていないもの
 //!
 //! - **要求受付パイプの要求は実行しない。** 台帳の判定までを行い、その先は
-//!   [`DenyReason::PolicyNotImplemented`]で断る。遷移ポリシーの評価は段階Eが持つ
+//!   [`DenyReason::PolicyNotImplemented`]で断る。**遷移ポリシーの判定器は在る**
+//!   （`harness_policy::transition`、段階⑥a）が、**このDaemonはまだ呼んでいない**
+//!   ——呼ぶ配線と、許可された要求を実際に起こす側が段階6bである
 //!
 //! # 段階⑤で足したもの（2026-09-11）
 //!
@@ -546,7 +548,9 @@ fn serve_request_connection(pipe: HANDLE, shared: &Shared) {
 /// 接続元PIDをProcess Tableで引き、**拒否の理由を決める**（§12）。
 ///
 /// 台帳に居れば`PolicyNotImplemented`——「あなたが誰かは分かったが、
-/// その遷移を許すかを判定する仕組みがまだ無い」である。
+/// **このDaemonはまだ遷移ポリシーを引いていない**」である。
+/// 引く相手（`harness_policy::transition::TransitionGraph::resolve`）は段階⑥aで在るので、
+/// **6bで足すのは判定そのものではなく、ここへ宣言を運んで呼ぶ配線である。**
 ///
 /// # `lazy_grant::broker`にある「AppContainerの中か」の検査が、ここには無い
 ///

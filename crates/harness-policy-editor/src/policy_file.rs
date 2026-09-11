@@ -40,6 +40,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use harness_policy::transition::{self, DomainView, GraphInput, TransitionRules};
 use harness_policy::{generalize::SettingsKey, RuleProposal};
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +48,18 @@ use serde::{Deserialize, Serialize};
 pub const POLICY_FILE_NAME: &str = "policy.json";
 
 /// 読む側が想定外の形を黙って解釈しないために持つ。
-pub const POLICY_SCHEMA_VERSION: u32 = 1;
+///
+/// **2へ上げたのは段階⑥a**（遷移の宣言＝[`PolicyDomain::process`]を足した回）。
+/// `process`を知らないバイナリが新しい`policy.json`を読むと、**遷移の宣言を黙って無視して
+/// 「FSとnetだけのポリシー」として扱う**——[`PolicyFileError::FutureSchema`]はまさにこれを
+/// 止めるためにある（`plans/DESIGN-MAC.md` §5.1(7)）。
+pub const POLICY_SCHEMA_VERSION: u32 = 2;
+
+/// `process`を1件も持たないファイルが名乗る版。
+///
+/// **上げるかどうかは内容で決まる**（[`PolicyFile::required_schema_version`]）。
+/// 遷移を1本も使っていないワークスペースを、古いバイナリから読めなくする理由が無いためである。
+const SCHEMA_VERSION_WITHOUT_TRANSITIONS: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyFileError {
@@ -75,6 +87,18 @@ pub enum PolicyFileError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(
+        "policy.json のスキーマ版が {found} なのに遷移の宣言（process）が入っています（{path}）。\
+         この形のファイルは、遷移を知らない古い harness が**黙って無視して**読みます。\
+         schema_version を {required} にしてください"
+    )]
+    UnversionedTransitions {
+        path: PathBuf,
+        found: u32,
+        required: u32,
+    },
+    #[error("policy.json の遷移の宣言を受け付けられません（{path}）: {reason}")]
+    RejectedTransitions { path: PathBuf, reason: String },
 }
 
 /// ドメイン1件のFSルール。キーは`harness_policy::SettingsKey`と1:1で対応させる
@@ -150,6 +174,15 @@ pub struct PolicyDomain {
     pub fs: FsRules,
     #[serde(default)]
     pub net: NetRules,
+    /// このドメインから、どのプログラムをどの引数で起こしてよいか（遷移MACの宣言軸）。
+    ///
+    /// **`commands`とは別物である。** あちらは「このドメインで記録したコマンド」という
+    /// **由来の記録**で、実行時マッチャではない（`plans/DESIGN-MAC.md` §4・§5.1(8)が
+    /// 流用しないと明記している）。こちらは**判定に使う**。
+    ///
+    /// 形と判定規則の正本は[`harness_policy::transition`]で、**このファイルは持たない**。
+    #[serde(default, skip_serializing_if = "TransitionRules::is_empty")]
+    pub process: TransitionRules,
     #[serde(default)]
     pub provenance: Provenance,
 }
@@ -162,6 +195,7 @@ impl PolicyDomain {
             cwd: None,
             fs: FsRules::default(),
             net: NetRules::default(),
+            process: TransitionRules::default(),
             provenance: Provenance::default(),
         }
     }
@@ -219,6 +253,10 @@ impl PolicyDomain {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyFile {
+    /// **読み込んだ時点でファイルが名乗っていた版**である。
+    ///
+    /// 書くときはこの値を使わず、内容から決め直す（[`PolicyFile::required_schema_version`]）。
+    /// この欄を書き戻す側の正本にすると、遷移を足しても版が上がらない。
     pub schema_version: u32,
     #[serde(default)]
     pub domains: Vec<PolicyDomain>,
@@ -344,6 +382,53 @@ impl PolicyFile {
         report
     }
 
+    /// この内容を表すのに**最低限必要な**スキーマ版。
+    ///
+    /// # なぜ「今のバイナリの版」をそのまま書かないのか
+    ///
+    /// 遷移を1本も使っていないワークスペースを、古いバイナリから読めなくする理由が無いためである。
+    /// 逆に遷移が1本でもあれば、**無視されると意味が変わる**ので上げなければならない
+    /// （`plans/DESIGN-MAC.md` §5.1(7)）。
+    ///
+    /// **版の正本は内容そのもの**にしてある——[`save`]はこの値を書くので、
+    /// ファイルの中の`schema_version`と中身が食い違う状態を作れない（`B-13`: 正本を2つ持たない）。
+    pub fn required_schema_version(&self) -> u32 {
+        if self.domains.iter().any(|d| !d.process.is_empty()) {
+            POLICY_SCHEMA_VERSION
+        } else {
+            SCHEMA_VERSION_WITHOUT_TRANSITIONS
+        }
+    }
+
+    /// 遷移の判定器へ渡す「ドメインの見え方」。
+    ///
+    /// `caller_writable_root`はワークスペースルート——**宣言だけを見るとここが抜ける**。
+    /// 固定したargvが指すスクリプトがワークスペースの中にあれば、呼び出し元がそれを
+    /// 書き換えられるので固定の意味が無くなる（`plans/DESIGN-MAC.md` §19.1）。
+    pub fn transition_graph_input<'a>(
+        &'a self,
+        caller_writable_root: Option<&'a str>,
+    ) -> GraphInput<'a> {
+        GraphInput {
+            domains: self
+                .domains
+                .iter()
+                .map(|domain| DomainView {
+                    name: domain.name.as_str(),
+                    fs: domain.fs.entries(),
+                    net: domain
+                        .net
+                        .allow_domains
+                        .iter()
+                        .map(|d| d.as_str())
+                        .collect(),
+                    process: &domain.process,
+                })
+                .collect(),
+            caller_writable_roots: caller_writable_root.into_iter().collect(),
+        }
+    }
+
     /// 全ドメインが宣言しているFSパスの集合（重複除去）。`harness_policy`の
     /// 「既に許可済みなのに拒否された＝その許可では足りない」判定へ渡すのに使う。
     pub fn all_fs_entries(&self) -> Vec<(String, harness_config::FsAccess)> {
@@ -403,10 +488,41 @@ pub fn load(workspace_root: &Path) -> Result<PolicyFile, PolicyFileError> {
             supported: POLICY_SCHEMA_VERSION,
         });
     }
+    // **版が内容に追いついていないファイルを拒否する**（`plans/DESIGN-MAC.md` §5.1(7)）。
+    // [`save`]が版を内容から決めるので、この形は手で書いたときにしか生まれない——
+    // だが生まれてしまうと、遷移を知らない古いバイナリが**黙って無視して**読む。
+    // 書く側と読む側を対にして初めて塞がる（`B-01`）。
+    let required = file.required_schema_version();
+    if file.schema_version < required {
+        return Err(PolicyFileError::UnversionedTransitions {
+            path,
+            found: file.schema_version,
+            required,
+        });
+    }
+    // **編集時検査をここへ置く理由**: 検査を書いても呼ぶ人が居なければ、手で書いた危険な辺が
+    // 素通りする（`B-01`: 対の片方だけ実装しない）。`load`は`policy.json`を読む唯一の関数なので、
+    // ここを通せば読む側の全経路が通る。宣言画面は書く前に**同じ関数**を呼ぶ。
+    let workspace = workspace_root.to_string_lossy();
+    let input = file.transition_graph_input(Some(workspace.as_ref()));
+    let rejected = match transition::check_all(&input) {
+        Ok(rejections) => rejections.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+        Err(e) => vec![e.to_string()],
+    };
+    if !rejected.is_empty() {
+        return Err(PolicyFileError::RejectedTransitions {
+            path,
+            reason: rejected.join("; "),
+        });
+    }
     Ok(file)
 }
 
 /// 書き出す（上書き）。親ディレクトリ（`.harness`）が無ければ作る。
+///
+/// **スキーマ版は内容から決めて書く**（[`PolicyFile::required_schema_version`]）。
+/// 渡された`file`が持っている`schema_version`は読み込んだ時点の値なので、そのまま書き戻すと
+/// **遷移を足したのに版が上がらない**——古いバイナリが黙って無視して読む形が残る。
 pub fn save(workspace_root: &Path, file: &PolicyFile) -> Result<(), PolicyFileError> {
     let path = path(workspace_root);
     if let Some(parent) = path.parent() {
@@ -415,6 +531,10 @@ pub fn save(workspace_root: &Path, file: &PolicyFile) -> Result<(), PolicyFileEr
             source: e,
         })?;
     }
+    let file = &PolicyFile {
+        schema_version: file.required_schema_version(),
+        domains: file.domains.clone(),
+    };
     let mut text = serde_json::to_string_pretty(file).map_err(|e| PolicyFileError::Write {
         path: path.clone(),
         source: std::io::Error::other(e.to_string()),

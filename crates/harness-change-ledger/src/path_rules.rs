@@ -169,6 +169,30 @@ pub fn fold_for_comparison(s: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// [`fold_for_comparison`]の**対**。違いは区切りを寄せる向きだけで、`/`へ統一する。
+///
+/// # なぜ向きの違う2つが要るのか
+///
+/// **正規表現のパターンと突き合わせる軸があるためである。** `\`は正規表現のescape文字なので、
+/// パターン文字列の中では「区切りの`\`」と「escapeの`\`」を文字列上で区別できない。
+/// そこで遷移MACのパターン言語は**区切りを`/`に固定**し、パターン側は一切正規化せず、
+/// **入力側だけをこの関数で畳む**と決めている（正本は
+/// `plans/DESIGN-MAC-TRANSITION-POLICY.md` §19.3.9と`plans/DESIGN-MAC-BROKER.md` §22.5）。
+///
+/// [`fold_for_comparison`]の向き（`\`）はRedirector DLLとの綴り合わせが文脈なので、
+/// **どちらかへ寄せて1本にはできない**。**だから対にして同じ場所へ置く**——
+/// 離して置くと、片方だけが`to_lowercase`の罠へ戻る（`bug-pattern-rules` B-05）。
+///
+/// `to_ascii_lowercase`を使う理由は[`fold_for_comparison`]と同一である（長さが保存される）。
+/// **ただしこちらは相対部分の切り出しに使われないので、長さ保存に依存しているのは
+/// あちらだけである**——同じ関数を選んでいるのは、2つの畳み込みの結果が
+/// **区切り以外で食い違わないようにする**ためである。
+pub fn fold_for_pattern_comparison(s: &str) -> String {
+    strip_verbatim_prefix(s)
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
 /// `path`が`root`配下（または`root`自身）なら、`root`からの相対部分を`/`区切りで返す
 /// （`root`自身なら空文字列）。配下でなければ`None`。
 ///
@@ -258,6 +282,39 @@ fn is_reserved_windows_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2つの畳み込みは**区切りの向き以外では食い違わない**。
+    ///
+    /// 片方だけが`to_lowercase`（Unicode版）へ差し替えられる等の分岐が起きると、同じ入力が
+    /// 軸をまたいだ瞬間に別物になる。**その差を1本で固定しておく**——区切りを揃え直せば
+    /// 完全に一致することを見る（`bug-pattern-rules` B-05: 複製した綴りが静かにずれないか）。
+    #[test]
+    fn the_two_folds_differ_only_in_separator_direction() {
+        for input in [
+            r"\\?\C:\Users\Me\Proj\A.PY",
+            r"\??\C:/Users/Me/Proj/a.py",
+            "C:/Proj/日本語/Script.PY",
+            r"C:\Proj\mixed/Sep\x.EXE",
+        ] {
+            let back = fold_for_comparison(input);
+            let fwd = fold_for_pattern_comparison(input);
+            assert_eq!(
+                back.replace('\\', "/"),
+                fwd,
+                "the two folds disagree beyond the separator for {input:?}"
+            );
+            assert!(!fwd.contains('\\'), "pattern fold left a backslash: {fwd}");
+            assert!(!back.contains('/'), "comparison fold left a slash: {back}");
+        }
+    }
+
+    /// verbatim接頭辞の落とし方も共有していること（片方だけが残すと、パターン側の
+    /// `c:/…`が`\\?\c:/…`に当たらなくなる）。
+    #[test]
+    fn the_pattern_fold_strips_the_verbatim_prefix_like_its_pair() {
+        assert_eq!(fold_for_pattern_comparison(r"\\?\C:\X"), "c:/x");
+        assert_eq!(fold_for_pattern_comparison(r"\??\C:\X"), "c:/x");
+    }
 
     #[test]
     fn accepts_ordinary_relative_paths() {

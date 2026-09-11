@@ -1220,8 +1220,10 @@ dependencies = [
 name = "harness-policy"
 version = "0.1.0"
 dependencies = [
+ "harness-change-ledger",
  "harness-config",
  "harness-core",
+ "regex",
  "serde",
  "serde_json",
 ]
