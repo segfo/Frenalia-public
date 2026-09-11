@@ -44,10 +44,10 @@ use crate::cancel_descendants::{
     assert_cancel_completes, prepare_descendant, DescendantOutput, DescendantProbe,
 };
 // `super::*`は`win_appcontainer`の再エクスポートを持ち込むが、Daemon側の型はそこには載らない。
-use crate::tier2a::spawnd::SharedSpawnDaemon;
-use crate::win_common::SendHandle;
 use crate::tier2a::spawnd::client::{SpawnDaemonHandle, SpawnedChild, TopLevelSpawn};
-use crate::tier2a::spawnd::{DomainIdentitySpec, DomainSpec};
+use crate::tier2a::spawnd::SharedSpawnDaemon;
+use crate::tier2a::spawnd::{ChildProcessPolicy, ConsoleNeed, DomainIdentitySpec, DomainSpec};
+use crate::win_common::SendHandle;
 
 /// 1ケース分の実マシン資源。**失敗した経路でも同じ順で畳む**（`test-logic-rules`型F）。
 pub(super) struct Case {
@@ -66,8 +66,25 @@ impl Drop for Case {
     }
 }
 
-/// workspaceを1つ用意し、preflightを通し、Daemonを起こす。
+/// [段階⑤] 段階⑤（子プロセス生成の禁止）の受け入れ。**ファイルを分けてあるが
+/// モジュールは`spawnd_e2e_tests`の下にある**——昇格の的`spawn-daemon`のフィルタが
+/// `win_appcontainer::spawnd_e2e_tests`なので、外へ出すと0件マッチで黙って走らなくなる
+/// （BUG-056）。分けた理由は1ファイルの行数上限（`docs/CODE-STRUCTURE-RULES.md`）である。
+mod child_process_restricted_tests;
+
+/// workspaceを1つ用意し、preflightを通し、Daemonを起こす。**生成禁止は積まない。**
 pub(super) fn setup(label: &str) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
+    setup_with_policy(label, ChildProcessPolicy::Unrestricted)
+}
+
+/// [段階⑤] 生成禁止の姿勢を選んで同じ土台を作る。
+///
+/// **対で測るための入口である**——同じワークスペース・同じドメインで、積んだ回と
+/// 積まない回を並べないと、「全部拒否する」実装でも緑になる（`B-35`）。
+pub(super) fn setup_with_policy(
+    label: &str,
+    child_process_policy: ChildProcessPolicy,
+) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
     let guard = TestDirGuard::create(label);
     let workspace = guard.path().to_path_buf();
     let outcome = preflight(&workspace, &[], None, &WorkspaceWriteMode::DirectRw)
@@ -93,11 +110,13 @@ pub(super) fn setup(label: &str) -> (Case, OwnedContainerSid, Vec<crate::win_com
         caps.push(cap);
     }
 
-    let daemon = SpawnDaemonHandle::start().expect("the spawn daemon must start");
+    let daemon =
+        SpawnDaemonHandle::start(child_process_policy).expect("the spawn daemon must start");
     eprintln!(
-        "[spawnd] daemon pid={} request_pipe={}",
+        "[spawnd] daemon pid={} request_pipe={} policy={}",
         daemon.daemon_pid(),
-        daemon.request_pipe()
+        daemon.request_pipe(),
+        child_process_policy.as_arg()
     );
 
     (
@@ -175,6 +194,7 @@ fn spawn_via_daemon(
             stderr_write,
             stdin_read: None,
             redirector: None,
+            console: ConsoleNeed::NotNeeded,
         })
         .expect("the daemon must spawn the top-level child");
 
@@ -482,6 +502,7 @@ fn cancelling_a_daemon_spawned_lineage_still_kills_the_grandchild() {
             stderr_write,
             stdin_read: None,
             redirector: None,
+            console: ConsoleNeed::Required,
         })
         .expect("the daemon must spawn the shell");
 
@@ -516,7 +537,8 @@ fn cancelling_a_daemon_spawned_lineage_still_kills_the_grandchild() {
 #[test]
 #[ignore = "starts a real spawn daemon; run through spawn-daemon"]
 fn dropping_the_handle_ends_the_daemon() {
-    let daemon = SpawnDaemonHandle::start().expect("the spawn daemon must start");
+    let daemon = SpawnDaemonHandle::start(ChildProcessPolicy::Unrestricted)
+        .expect("the spawn daemon must start");
     let pid = daemon.daemon_pid();
     assert!(pid != 0, "DaemonのPIDが返っていない（Readyが届いていない）");
 
@@ -555,7 +577,8 @@ fn dropping_the_handle_ends_the_daemon() {
 fn a_spawn_request_after_the_daemon_died_fails_loudly() {
     use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
-    let daemon = SharedSpawnDaemon::start().expect("the spawn daemon must start");
+    let daemon = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted)
+        .expect("the spawn daemon must start");
     let pid = daemon.daemon_pid();
 
     // Daemonを外から落とす（クラッシュの模擬）。
@@ -593,6 +616,7 @@ fn a_spawn_request_after_the_daemon_died_fails_loudly() {
         stderr_write,
         stdin_read: None,
         redirector: None,
+        console: ConsoleNeed::NotNeeded,
     });
 
     let message = match result {
@@ -641,6 +665,7 @@ fn a_spawn_request_after_the_daemon_died_fails_loudly() {
         stderr_write: second_stderr_write,
         stdin_read: None,
         redirector: None,
+        console: ConsoleNeed::NotNeeded,
     });
     assert!(
         second
@@ -697,7 +722,8 @@ fn concurrent_requests_share_one_control_pipe_without_interleaving() {
 
     // **製品と同じ共有接続**を使う。`setup`が持つのは素の`SpawnDaemonHandle`で、
     // 排他はそれを包む`SharedSpawnDaemon`の側にある——測りたいのはそちらである。
-    let shared = SharedSpawnDaemon::start().expect("a shared spawn daemon must start");
+    let shared = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted)
+        .expect("a shared spawn daemon must start");
     let request_pipe = shared.request_pipe().to_string();
     eprintln!("[spawnd P9] shared daemon pid={}", shared.daemon_pid());
 
@@ -755,6 +781,7 @@ fn concurrent_requests_share_one_control_pipe_without_interleaving() {
                             stderr_write: err_w.0,
                             stdin_read: None,
                             redirector: None,
+                            console: ConsoleNeed::NotNeeded,
                         })
                         .expect("every lane must spawn through the shared control pipe");
                     let (out, _err) =
@@ -827,7 +854,8 @@ fn top_level_spawn_latency_direct_versus_daemon() {
     let spawn_cap = spawn_request_capability_sid().expect("spawn request capability");
     let domain_caps: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
     let env = crate::secret_env::build_child_env();
-    let shared = SharedSpawnDaemon::start().expect("a shared spawn daemon must start");
+    let shared = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted)
+        .expect("a shared spawn daemon must start");
     let _ = &spawn_cap;
 
     let direct = |workspace: &std::path::Path| {
@@ -859,6 +887,7 @@ fn top_level_spawn_latency_direct_versus_daemon() {
             &domain_caps,
             DomainIdentity::OwnPackage,
             SpawnRequestAccess::Grant,
+            ConsoleNeed::NotNeeded,
         )
     };
 
@@ -960,7 +989,8 @@ fn top_level_spawn_latency_injection_cost() {
         .unwrap_or_else(|_| workspace.clone());
     let domain_caps: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
     let env = crate::secret_env::build_child_env();
-    let shared = SharedSpawnDaemon::start().expect("a shared spawn daemon must start");
+    let shared = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted)
+        .expect("a shared spawn daemon must start");
 
     let spawn = |exe: &str, inject: super::RedirectorInject<'_>, args: &[&str]| {
         spawn_with_workspace_via_daemon(
@@ -977,6 +1007,7 @@ fn top_level_spawn_latency_injection_cost() {
             &domain_caps,
             DomainIdentity::OwnPackage,
             SpawnRequestAccess::Grant,
+            ConsoleNeed::NotNeeded,
         )
     };
 

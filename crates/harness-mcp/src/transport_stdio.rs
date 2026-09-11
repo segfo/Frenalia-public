@@ -17,6 +17,7 @@
 
 use std::time::{Duration, Instant};
 
+use harness_sandbox::tier2a::spawnd::ConsoleNeed;
 use harness_sandbox::tier2a::win_appcontainer::{
     spawn_via_daemon, AppContainerSession, DomainIdentity, NetworkCapability, RedirectorInject,
     SessionError, SpawnRequestAccess,
@@ -184,6 +185,10 @@ impl TransportFactory for AppContainerTransportFactory {
                 McpProcessAccess::Deny => SpawnRequestAccess::Withhold,
                 McpProcessAccess::Broker => SpawnRequestAccess::Grant,
             },
+            // [段階⑤] **MCPサーバはコンソールを必要としない。** 実体は`npx`・`node`型の
+            // プログラムで、実測でもコンソールを要求したのはPowerShellだけだった
+            // （`ConsoleNeed`のdocの表）。生成禁止を積んだ構成では`DETACHED_PROCESS`で起こす。
+            ConsoleNeed::NotNeeded,
         )
         .map_err(|e| spawn_error(e.to_string()))?;
 

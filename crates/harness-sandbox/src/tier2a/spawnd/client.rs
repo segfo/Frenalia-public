@@ -51,9 +51,9 @@ use crate::win_pipe_ipc::{
 
 use super::server::SpawnDaemonError;
 use super::{
-    protocol_version_mismatch, ChildHandles, ControlRequest, ControlResponse, DomainSpec,
-    RedirectorSpec, SpawnFailureKind, SpawnTopLevelRequest, ACCEPT_TIMEOUT, IO_TIMEOUT,
-    PROTOCOL_VERSION,
+    protocol_version_mismatch, ChildHandles, ChildProcessPolicy, ConsoleNeed, ControlRequest,
+    ControlResponse, DomainSpec, RedirectorSpec, SpawnFailureKind, SpawnTopLevelRequest,
+    ACCEPT_TIMEOUT, IO_TIMEOUT, PROTOCOL_VERSION,
 };
 
 fn err(message: impl Into<String>) -> SpawnDaemonError {
@@ -92,6 +92,9 @@ pub struct TopLevelSpawn<'a> {
     pub stderr_write: HANDLE,
     pub stdin_read: Option<HANDLE>,
     pub redirector: Option<RedirectorSpec>,
+    /// [段階⑤] 起こすプログラムがコンソールを要るか。**既定値を持たせていない**ので、
+    /// 呼び出し元は毎回選ぶ（同型のdocに、取り違えたときの壊れ方がある）。
+    pub console: ConsoleNeed,
 }
 
 /// Daemonが起こした子。
@@ -208,8 +211,10 @@ impl std::fmt::Debug for SharedSpawnDaemon {
 }
 
 impl SharedSpawnDaemon {
-    pub fn start() -> Result<Self, SpawnDaemonError> {
-        let handle = SpawnDaemonHandle::start()?;
+    /// `child_process_policy`は**呼び出し元が必ず選ぶ**（[`ChildProcessPolicy`]のdoc）。
+    /// 製品のホスト2つ（harness本体・ポリシーエディタ）は`Unrestricted`である。
+    pub fn start(child_process_policy: ChildProcessPolicy) -> Result<Self, SpawnDaemonError> {
+        let handle = SpawnDaemonHandle::start(child_process_policy)?;
         let request_pipe: Arc<str> = Arc::from(handle.request_pipe().to_string());
         let daemon_pid = handle.daemon_pid();
         Ok(Self {
@@ -290,7 +295,14 @@ fn close_child_handles(request: &TopLevelSpawn<'_>) {
 
 impl SpawnDaemonHandle {
     /// Daemonを起こし、ハンドシェイクまで済ませる。
-    pub fn start() -> Result<Self, SpawnDaemonError> {
+    ///
+    /// # `child_process_policy`を引数で受ける理由
+    ///
+    /// 生成禁止を積むかは**Daemon1本の姿勢**で、起動時に決まって以後変わらない
+    /// （[`ChildProcessPolicy`]のdoc）。既定値を持つ`start()`を残すと、
+    /// **将来Tier2aの全spawnへ常時積むと決めた日に、既定値を掴んでいる経路だけが
+    /// 取り残される**——段階5bで`RedirectorInject::default()`を製品から消したのと同じ形である。
+    pub fn start(child_process_policy: ChildProcessPolicy) -> Result<Self, SpawnDaemonError> {
         let pipe_name = unique_pipe_name("spawnd-control");
         let sid = current_user_sid_string().map_err(|e| err(format!("current_user_sid: {e}")))?;
         // **制御パイプはユーザーSID専有のまま**（§10.1）。ここへ到達できるのがharnessだけ
@@ -321,7 +333,7 @@ impl SpawnDaemonHandle {
             handle
         };
 
-        let daemon_process = match launch_daemon(&pipe_name) {
+        let daemon_process = match launch_daemon(&pipe_name, child_process_policy) {
             Ok(process) => process,
             Err(e) => {
                 unsafe {
@@ -456,6 +468,7 @@ impl SpawnDaemonHandle {
                     stderr_write,
                 },
                 redirector: request.redirector.clone(),
+                console: request.console,
             },
         )))?;
         // 電文を渡し終えた時点から、複製の所有者はDaemon側のspawn処理になる。
@@ -574,9 +587,19 @@ fn daemon_exe_path() -> Result<PathBuf, SpawnDaemonError> {
 
 /// Daemonを起こす。**昇格しない**——AppContainerの子を起こすのに管理者権限は要らず、
 /// 昇格すると子の整合性レベルが本番と変わる（`B-08`）。
-fn launch_daemon(pipe_name: &str) -> Result<HANDLE, SpawnDaemonError> {
+fn launch_daemon(
+    pipe_name: &str,
+    child_process_policy: ChildProcessPolicy,
+) -> Result<HANDLE, SpawnDaemonError> {
     let exe = daemon_exe_path()?;
-    let mut cmdline = wide(&format!("\"{}\" \"{pipe_name}\"", exe.display()));
+    // **姿勢は引数で明示する。省略可能にしない**（`harness-spawnd`のusage）。
+    // 省略を「今日の既定」に読み替える形にすると、常時適用へ切り替えた日に
+    // 省略した経路だけが黙って旧い姿勢のまま残る。
+    let policy_arg = child_process_policy.as_arg();
+    let mut cmdline = wide(&format!(
+        "\"{}\" \"{pipe_name}\" \"{policy_arg}\"",
+        exe.display()
+    ));
 
     // **コンソールを持たせない**（§7.1.1「Daemonはコンソール未接続が既定」）。
     // コンソールを借りるのはシェルを起こす瞬間だけで、そのときAttachConsoleする。

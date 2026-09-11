@@ -848,6 +848,12 @@ pub(super) fn shuffle_in_place<T>(items: &mut [T], state: &mut u64) {
 ///   (3) **そのファイルで最初に`#[cfg(test)]`が現れた行より後**、の3つ。
 ///   (3)は`wfp.rs`のように製品ファイルの末尾へテストを畳んでいる形のためで、
 ///   **逆に、インラインのテストモジュールより後ろへ製品コードを書くと見落とす。**
+/// - **(2)が見るのは`tests`という名前のディレクトリだけである。** `spawnd_e2e_tests/`の
+///   ように`_tests`で終わるディレクトリの下は見ない——そこへ置いたテストファイルは、
+///   **ファイル名が`_tests.rs`で終わっていないと製品コードとして数えられる**。
+///   2026-09-11に段階⑤のテストを`spawnd_e2e_tests/child_process_restricted.rs`として
+///   足したとき実際に踏み、ファイル名の側を規約へ合わせて直した
+///   （判定を広げなかったのは、`_tests.rs`という命名規約自体がこの機構だからである）。
 /// - コメント行と、定義そのものの行は除く。
 pub(super) fn product_callers_of(needle: &str, definition: &str) -> (Vec<String>, usize) {
     let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

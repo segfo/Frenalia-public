@@ -48,7 +48,13 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // 起動できなければTier2aセッション自体を開始せず、直接spawnへは降格しない。
     #[cfg(windows)]
     let spawn_daemon = if shell_tier.tier == harness_core::ShellTier::Tier2a {
-        match harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start() {
+        // [段階⑤] **製品の既定は「生成禁止を積まない」。** 積むと、遷移ポリシーの評価
+        // （段階E）が無い今はDaemonの答えが常に「未実装なので断る」になり、
+        // サンドボックスの中で外部プログラムが1つも起動できなくなる。
+        // 常時適用へ切り替えるのは段階Eが着地してからで、そのときはこの引数ごと消す。
+        match harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
+            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
+        ) {
             Ok(daemon) => {
                 tools.register(Arc::new(harness_tools::RunShellTool::with_spawn_daemon(
                     daemon.clone(),

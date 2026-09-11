@@ -834,8 +834,13 @@ impl SharedSpawnDaemon {
         if let Some(daemon) = slot.as_ref() {
             return Ok(daemon.clone());
         }
-        let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start()
-            .map_err(|error| error.to_string())?;
+        // [段階⑤] 製品の既定は「生成禁止を積まない」（harness本体側と同じ理由。
+        // `ChildProcessPolicy`のdoc）。**ホストが2つあるので両方に同じ姿勢を書く**——
+        // 片方だけへ配線すると、もう片方だけが別の世界で動く（`B-06`）。
+        let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
+            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
+        )
+        .map_err(|error| error.to_string())?;
         *slot = Some(daemon.clone());
         Ok(daemon)
     }

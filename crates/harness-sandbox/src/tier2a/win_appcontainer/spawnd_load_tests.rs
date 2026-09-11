@@ -38,7 +38,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::spawnd_e2e_tests::{domain_spec, setup, spawn_request_payload, wait_and_close};
 use super::*;
 use crate::tier2a::spawnd::client::TopLevelSpawn;
-use crate::tier2a::spawnd::SharedSpawnDaemon;
+use crate::tier2a::spawnd::{ChildProcessPolicy, ConsoleNeed, SharedSpawnDaemon};
 use crate::win_common::SendHandle;
 
 /// 集合時刻をどれだけ先に置くか。**全レーンの子が起き終わるまでの猶予**である。
@@ -207,6 +207,7 @@ fn run_round(
                             stderr_write: err_w.0,
                             stdin_read: None,
                             redirector: None,
+                            console: ConsoleNeed::NotNeeded,
                         })
                         .expect("every lane must spawn through the shared control pipe");
                     let (out, _err) = crate::win_common::read_two_pipes_to_strings(out_r.0, err_r.0);
@@ -326,7 +327,7 @@ fn request_pipe_congestion_by_concurrency() {
     let spawn_cap = spawn_request_capability_sid().expect("spawn request capability");
 
     // **製品と同じ共有接続**を使う（排他は`SharedSpawnDaemon`の側にある）。
-    let shared = SharedSpawnDaemon::start().expect("a shared spawn daemon must start");
+    let shared = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted).expect("a shared spawn daemon must start");
     eprintln!(
         "[congestion] daemon pid={} request_pipe={} rounds={ROUNDS} repeat/lane={REPEAT_PER_LANE}",
         shared.daemon_pid(),

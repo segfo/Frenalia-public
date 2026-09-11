@@ -5,6 +5,11 @@
 
 use super::*;
 
+/// 生成禁止とコンソールの語彙は**Spawn Daemonの電文と同じ型**を使う（`B-13`: 正本を2つ
+/// 持たない）。あちらは非Windowsでもコンパイルされるので、置き場もあちら側である
+/// ——`win_appcontainer`は`#[cfg(windows)]`なので、ここへ置くと電文が参照できない。
+use crate::tier2a::spawnd::{ChildProcessPolicy, ConsoleNeed};
+
 /// AppContainer固有のセキュリティ記述子をパイプへ適用する。AppContainerのアクセス制御は
 /// 「オブジェクトのDACLにpackage SID（または`ALL APPLICATION PACKAGES`）へのACEが無ければ
 /// アクセス不可」という広範なdefault-denyがファイル・レジストリだけでなく名前無しパイプ等の
@@ -590,6 +595,14 @@ impl DomainIdentity {
     }
 }
 
+/// `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`（`processthreadsapi.h`）。
+///
+/// `windows` 0.58は`PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`（属性の**種類**）は生成して
+/// いるが、そこへ入れる**値**の定数は生成していないので、SDKの定義をここに書く。
+/// **綴りを2箇所に置かない**——スパイク（`mac_spike_tests.rs`）は自前の定数を持っていたが、
+/// 製品側が持つのはこれ1つで、スパイクは測定専用の別世界なのでそのまま残す。
+const PROCESS_CREATION_CHILD_PROCESS_RESTRICTED: u32 = 0x0000_0001;
+
 /// SDDL文字列から作ったセキュリティ記述子。**`Drop`で`LocalFree`する**
 /// （`ConvertStringSecurityDescriptorToSecurityDescriptorW`が確保したものを解放する義務がある）。
 ///
@@ -690,6 +703,12 @@ pub(crate) struct SuspendedSpawn<'a> {
     /// ここで閉じると他人のハンドルを閉じることになる（§10.1.1）。
     pub job: HANDLE,
     pub domain: DomainIdentity,
+    /// [段階⑤] 子自身に子プロセス生成を許すか。**製品の既定は`Unrestricted`**で、
+    /// `Restricted`を選べるのはいまのところ受入テストだけである（同型のdoc）。
+    pub child_process_policy: ChildProcessPolicy,
+    /// [段階⑤] 起こすプログラムがコンソールを要るか。**`Unrestricted`のときは効かない**
+    /// （どちらでも`CREATE_NO_WINDOW`のまま）。同型のdocに、取り違えたときの壊れ方がある。
+    pub console: ConsoleNeed,
 }
 
 /// **一時停止のまま子を起こし、Jobへ入れ、トークンの既定DACLを差し替える**（§12の固定順の前半）。
@@ -766,21 +785,42 @@ pub(crate) fn create_suspended_in_job(
     let process_sa = process_sd.security_attributes();
     let thread_sa = thread_sd.security_attributes();
 
+    // [段階⑤] 子自身へ「子プロセスを作れない」を積むときだけ、属性が1つ増える。
+    // **値の変数は`CreateProcessW`が返るまで生かしておくこと**——`UpdateProcThreadAttribute`は
+    // 値をコピーせずポインタを覚えるので、途中で落とすと未定義の値が読まれる。
+    let mut child_policy: u32 = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+    let restricted = request.child_process_policy.is_restricted();
+    // 数え違えると`UpdateProcThreadAttribute`が`ERROR_INVALID_PARAMETER`で落ちる。
+    let attribute_count: u32 = 2 // SECURITY_CAPABILITIES + HANDLE_LIST（常に積む）
+        + u32::from(restricted); // CHILD_PROCESS_POLICY
+
+    // コンソールの与え方（§7.1の実測表。[`ConsoleNeed`]のdocに3通りの挙動がある）。
+    // **生成禁止を積んでいないなら、今日の綴りをそのまま使う**——`ConsoleNeed`が効くのは
+    // `Restricted`と対になったときだけで、既定の経路の挙動を1ビットも変えない。
+    let console_flag = match (restricted, request.console) {
+        (false, _) => CREATE_NO_WINDOW,
+        (true, ConsoleNeed::NotNeeded) => DETACHED_PROCESS,
+        // フラグを1つも積まない＝**いま呼び出し側が繋がっているコンソールが子へ渡る**。
+        // 繋がっていなければ子はコンソール無しで起き、シェルは無言でexit 0する
+        // （借りる義務は[`ConsoleNeed::Required`]のdocが呼び出し側へ課している）。
+        (true, ConsoleNeed::Required) => PROCESS_CREATION_FLAGS(0),
+    };
+
     let result: Result<PROCESS_INFORMATION, AppContainerError> = unsafe {
         let mut attr_list_size: usize = 0;
         // 1回目は必要サイズ取得のためだけの呼び出しで、バッファ不足エラーになるのが正常
-        // （ERROR_INSUFFICIENT_BUFFER）なので戻り値は捨てる。属性数2
-        // （SECURITY_CAPABILITIES + HANDLE_LIST）。
+        // （ERROR_INSUFFICIENT_BUFFER）なので戻り値は捨てる。
         let _ = InitializeProcThreadAttributeList(
             LPPROC_THREAD_ATTRIBUTE_LIST::default(),
-            2,
+            attribute_count,
             0,
             &mut attr_list_size,
         );
         let mut attr_list_buf = vec![0u8; attr_list_size];
         let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list_buf.as_mut_ptr() as *mut c_void);
-        let init_result = InitializeProcThreadAttributeList(attr_list, 2, 0, &mut attr_list_size)
-            .map_err(|e| step("InitializeProcThreadAttributeList", e));
+        let init_result =
+            InitializeProcThreadAttributeList(attr_list, attribute_count, 0, &mut attr_list_size)
+                .map_err(|e| step("InitializeProcThreadAttributeList", e));
 
         init_result.and_then(|()| {
             let update_result = UpdateProcThreadAttribute(
@@ -804,6 +844,23 @@ pub(crate) fn create_suspended_in_job(
                     None,
                 )
                 .map_err(|e| step("UpdateProcThreadAttribute(HANDLE_LIST)", e))
+            })
+            .and_then(|()| {
+                // [段階⑤] ここで初めて遷移が**強制**される。フックを迂回されても、
+                // 生成を止めるのはカーネルである（§9「User-mode Hookをセキュリティ境界にしない」）。
+                if !restricted {
+                    return Ok(());
+                }
+                UpdateProcThreadAttribute(
+                    attr_list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
+                    Some(&mut child_policy as *mut _ as *const c_void),
+                    std::mem::size_of::<u32>(),
+                    None,
+                    None,
+                )
+                .map_err(|e| step("UpdateProcThreadAttribute(CHILD_PROCESS_POLICY)", e))
             });
 
             let out = update_result.and_then(|()| {
@@ -831,7 +888,7 @@ pub(crate) fn create_suspended_in_job(
                     Some(&thread_sa as *const _),
                     true,
                     EXTENDED_STARTUPINFO_PRESENT
-                        | CREATE_NO_WINDOW
+                        | console_flag
                         | CREATE_UNICODE_ENVIRONMENT
                         | CREATE_SUSPENDED,
                     Some(request.env_block.as_mut_ptr() as *mut _),
@@ -1195,7 +1252,9 @@ mod daemon_capability_tests {
 /// ——lazyで失われるのは速さだけのはずである。逆に**注入以外を`RedirectorInjection`へ
 /// 丸めると、直らない失敗を毎回2回試す**ことになる。どちらも症状が出にくいので、
 /// 対で測る（直下のテスト、`B-35`）。
-fn daemon_failure_to_error(error: crate::tier2a::spawnd::server::SpawnDaemonError) -> AppContainerError {
+fn daemon_failure_to_error(
+    error: crate::tier2a::spawnd::server::SpawnDaemonError,
+) -> AppContainerError {
     use crate::tier2a::spawnd::SpawnFailureKind;
     match error.kind {
         SpawnFailureKind::RedirectorInjection => {
@@ -1264,7 +1323,9 @@ mod daemon_failure_mapping_tests {
             SpawnFailureKind::Transport,
         ] {
             assert!(
-                daemon_failure_to_error(failure(kind)).to_string().contains("boom"),
+                daemon_failure_to_error(failure(kind))
+                    .to_string()
+                    .contains("boom"),
                 "{kind:?}で理由の文面が消えた"
             );
         }
@@ -1326,7 +1387,8 @@ impl Drop for DaemonSpawnHandles {
 
 /// Job・stdioをharness側で所有したまま、トップレベル生成だけを共有Daemonへ委譲する。
 ///
-/// `spawn_request`は**呼び出し側が必ず選ぶ**（[`SpawnRequestAccess`]のdoc）。
+/// `spawn_request`と`console`は**呼び出し側が必ず選ぶ**
+/// （[`SpawnRequestAccess`]・[`ConsoleNeed`]のdoc。どちらも既定値を持たない）。
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_with_workspace_via_daemon<'a>(
     daemon: &crate::tier2a::spawnd::SharedSpawnDaemon,
@@ -1342,10 +1404,9 @@ pub fn spawn_with_workspace_via_daemon<'a>(
     domain_caps: &[PSID],
     domain: DomainIdentity,
     spawn_request: SpawnRequestAccess,
+    console: ConsoleNeed,
 ) -> Result<AppContainerChild, AppContainerError> {
-    use crate::tier2a::spawnd::{
-        DomainIdentitySpec, DomainSpec, RedirectorSpec, TopLevelSpawn,
-    };
+    use crate::tier2a::spawnd::{DomainIdentitySpec, DomainSpec, RedirectorSpec, TopLevelSpawn};
 
     let inject = inject.into();
     let container_sid_string = crate::win_common::sid_to_string(container_sid)
@@ -1367,10 +1428,10 @@ pub fn spawn_with_workspace_via_daemon<'a>(
         .map_err(|e| AppContainerError::Win32(format!("sid_to_string(spawn request): {e}")))?;
     let mut declared_caps = Vec::with_capacity(domain_caps.len());
     for sid in domain_caps {
-        declared_caps.push(
-            crate::win_common::sid_to_string(*sid)
-                .map_err(|e| AppContainerError::Win32(format!("sid_to_string(capability): {e}")))?,
-        );
+        declared_caps
+            .push(crate::win_common::sid_to_string(*sid).map_err(|e| {
+                AppContainerError::Win32(format!("sid_to_string(capability): {e}"))
+            })?);
     }
     let capability_sids = daemon_capability_sids(
         &traverse_string,
@@ -1445,8 +1506,14 @@ pub fn spawn_with_workspace_via_daemon<'a>(
     }
 
     // この3端はSharedSpawnDaemonが成否によらず閉じる契約へ移す。
-    let stdout_write = handles.stdout_write.take().expect("stdout write was created");
-    let stderr_write = handles.stderr_write.take().expect("stderr write was created");
+    let stdout_write = handles
+        .stdout_write
+        .take()
+        .expect("stdout write was created");
+    let stderr_write = handles
+        .stderr_write
+        .take()
+        .expect("stderr write was created");
     let stdin_read = handles.stdin_read.take();
     let mut daemon_env = env.to_vec();
     daemon_env.retain(|(name, _)| name != crate::tier2a::spawnd::REQUEST_PIPE_ENV);
@@ -1470,12 +1537,16 @@ pub fn spawn_with_workspace_via_daemon<'a>(
         stderr_write,
         stdin_read,
         redirector,
+        console,
     });
     let spawned = spawned.map_err(daemon_failure_to_error)?;
 
     Ok(AppContainerChild {
         process: spawned.process,
-        job: handles.job.take().expect("job ownership transfers to child"),
+        job: handles
+            .job
+            .take()
+            .expect("job ownership transfers to child"),
         stdin_write: handles.stdin_write.take(),
         stdout_read: handles
             .stdout_read
@@ -1502,6 +1573,7 @@ pub fn spawn_via_daemon<'a>(
     inject: impl Into<RedirectorInject<'a>>,
     domain: DomainIdentity,
     spawn_request: SpawnRequestAccess,
+    console: ConsoleNeed,
 ) -> Result<AppContainerChild, AppContainerError> {
     spawn_with_workspace_via_daemon(
         daemon,
@@ -1517,6 +1589,7 @@ pub fn spawn_via_daemon<'a>(
         &[],
         domain,
         spawn_request,
+        console,
     )
 }
 
@@ -1621,6 +1694,14 @@ fn spawn_impl(
         stdin_read,
         job,
         domain,
+        // [段階⑤] **この経路は生成禁止を積まない。** `spawn_impl`はharnessが直接起こす経路で、
+        // 製品のトップレベル生成はもうここを通らない（`launch.rs`の数え上げテスト）。
+        // 生成禁止を積むのはSpawn Daemon側だけである——**代わりに起こす人が居ない場所で
+        // 生成能力を取り上げると、そこから先が全部止まる**（1枚もの§2の順序の理由）。
+        child_process_policy: ChildProcessPolicy::Unrestricted,
+        // `Unrestricted`なので効かないが、**既定値を作らないと決めた**ので明示する
+        // （[`ConsoleNeed`]のdoc）。この経路が起こすのはシェルである。
+        console: ConsoleNeed::Required,
     });
 
     let process_info = match spawned {

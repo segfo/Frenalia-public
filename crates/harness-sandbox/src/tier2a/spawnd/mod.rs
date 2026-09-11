@@ -44,6 +44,10 @@ pub mod table;
 
 #[cfg(windows)]
 pub mod client;
+/// [段階⑤] コンソール保持プロセス（§7.1.1・§7.1.2）。Win32のコンソールAPIを直接叩くので
+/// windows専用。**Daemon側だけが使う**——harness本体はコンソールを借りない。
+#[cfg(windows)]
+pub mod console_holder;
 #[cfg(windows)]
 pub mod server;
 #[cfg(windows)]
@@ -76,7 +80,14 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 ///
 /// Redirector注入のように、古いDaemonが未知の欄を無視すると隔離の意味が変わる変更では
 /// `Hello`と`Ready`の両方で完全一致を要求する。片方だけ新しいバイナリでもspawn前に止まる。
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// **3へ上げたのは段階⑤である。** 生成禁止（[`ChildProcessPolicy`]）はこの電文ではなく
+/// `harness-spawnd.exe`の起動引数で決まるので、**古いDaemonのバイナリは第2引数を読まず、
+/// 生成禁止を積まないまま正常に起動してしまう**——harness側は積んだつもりでいるのに、
+/// 強制だけが黙って消える。これがこの定数のdocが言う「隔離の意味が変わる」の形そのものである。
+/// あわせて[`ConsoleNeed`]も足しており、古いDaemonはこれを無視して`CREATE_NO_WINDOW`で
+/// 起こすため、生成禁止と対になった日にシェルが`0xC0000142`で起動できなくなる。
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
 ///
@@ -218,6 +229,123 @@ pub enum ControlRequest {
     Shutdown,
 }
 
+/// 子プロセス自身が、さらに子プロセスを作れるか（設計書`plans/DESIGN-MAC-ENFORCEMENT.md`§7）。
+///
+/// # これは何を指定するものか
+///
+/// `CreateProcessW`へ渡す属性リストの1項目
+/// （`PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`）である。`Restricted`で起こした
+/// プロセスは、**どんな方法でも子プロセスを作れなくなる**——`CreateProcessW`のフックを
+/// 迂回して`NtCreateUserProcess`を直接呼んでも、カーネルが`STATUS_CHILD_PROCESS_BLOCKED`で
+/// 拒否する（2026-08-13に6経路すべてで実測、`plans/mac-spike/RESULTS.md`§S1）。
+/// **起動の瞬間に1回決まり、後から付けることも外すこともできない。**
+///
+/// # 「どの子なら許すか」はここに入らない
+///
+/// この属性が持つのは「作れない」の1ビットだけで、許可の情報を1つも運ばない。
+/// 代わりに起こすのはSpawn Daemonで、Redirector DLLはサンドボックスの中の
+/// `CreateProcessW`呼び出しを**Daemonへの頼み方へ変換する**だけである（許可証ではない）。
+/// 何を許すかを判定するのは遷移ポリシーの評価（段階E）で、**まだ実装されていない**
+/// ——いまDaemonへ頼んでも答えは常に[`DenyReason::PolicyNotImplemented`]である。
+///
+/// # なぜ製品の既定が`Unrestricted`のままなのか
+///
+/// 上のとおり判定側が無いので、`Restricted`を製品の既定の起動経路へ入れると
+/// **サンドボックスの中で外部プログラム（`git`・`node`等）が1つも起動できなくなる**。
+/// 常時適用は段階Eが着地してからで、いま`Restricted`を選べるのは受入テストだけである。
+/// **この2択は「機構を作るか」ではなく「既定へ入れるか」の軸である**
+/// （`docs/guide/11a-mac-enforcement-map.md`§2）。
+///
+/// # 電文には載らない
+///
+/// Daemon1本につき1つで、要求ごとには切り替えられない（`server::serve`の引数として
+/// 起動時に決まる）。理由は[`SpawnTopLevelRequest`]の末尾のコメントにある
+/// ——**落とせる形の欄を置くと、いつか落とされる**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildProcessPolicy {
+    /// 子プロセスを作れる（**今日の製品の既定**）。
+    Unrestricted,
+    /// OSが子プロセス生成そのものを拒否する（段階⑤）。
+    Restricted,
+}
+
+impl ChildProcessPolicy {
+    /// 生成禁止を積むか。
+    ///
+    /// **`== ChildProcessPolicy::Restricted`と書かないためにある。** 製品コードが
+    /// その綴りを使うのは「**姿勢を選んだ**とき」だけに保ちたい——
+    /// `launch.rs`の数え上げテストがその綴りの出現を0件で固定しており、
+    /// 比較のために書いた行まで「選んだ」と数えられてしまうからである。
+    /// **`Self::`で書くことで、選択と比較の綴りが分かれる。**
+    pub fn is_restricted(self) -> bool {
+        match self {
+            Self::Restricted => true,
+            Self::Unrestricted => false,
+        }
+    }
+
+    /// `harness-spawnd.exe`のコマンドライン引数へ書くときの綴り。
+    ///
+    /// **読む側（[`ChildProcessPolicy::from_arg`]）と対でここに置く。** 綴りを別々の
+    /// ファイルに書くと、片方だけ直したときに**Daemonが起動を断るのではなく、
+    /// 黙って違う姿勢で立ち上がる**形になり得る（`B-05`）。
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Unrestricted => "unrestricted",
+            Self::Restricted => "restricted",
+        }
+    }
+
+    /// [`ChildProcessPolicy::as_arg`]の逆。**知らない綴りは`None`**で、呼び出し側は起動を断る。
+    ///
+    /// **既定へ倒さない。** 「読めなかったら`Unrestricted`」にすると、綴りを間違えた日に
+    /// 生成禁止が黙って外れる——強制が外れたことは症状として現れないので、誰も気付けない。
+    pub fn from_arg(arg: &str) -> Option<Self> {
+        match arg {
+            "unrestricted" => Some(Self::Unrestricted),
+            "restricted" => Some(Self::Restricted),
+            _ => None,
+        }
+    }
+}
+
+/// 起こす子プログラムがコンソールを必要とするか（設計書§7.1の実測表）。
+///
+/// # なぜ呼び出し側に選ばせるのか
+///
+/// [`ChildProcessPolicy::Restricted`]を積むと、**コンソールの与え方で結果が3通りに割れる**
+/// （`plans/mac-spike/RESULTS.md`§S1・§S1b）。コンソールの割り当ては`conhost.exe`という
+/// **子プロセスの生成**を伴うので、生成を禁じられたプロセスは自分ではコンソールを作れない。
+///
+/// | コンソールの与え方 | `Restricted`下の挙動 |
+/// |---|---|
+/// | `CREATE_NO_WINDOW`（今日の既定） | **起動できない**（`0xC0000142`） |
+/// | `DETACHED_PROCESS` | node・git・`cmd.exe`は動く。**PowerShellは何も実行せずexit 0**（無言失敗） |
+/// | フラグ無し（呼び出し側のコンソールを継承） | **動く**。シェルもコマンドを実行し終了コードも伝わる |
+///
+/// つまり**シェルだけがコンソールを要求する**（PowerShell自身の性質であって、
+/// AppContainer固有ではない——素のユーザーで起こしても同じになる）。
+/// 取り違えると`Required`側は起動失敗、`NotNeeded`側は**exit 0の無言失敗**になるので、
+/// `DomainIdentity`と同じく**既定値を持たせず、経路ごとに必ず選ばせる**。
+///
+/// # `Unrestricted`のときは何も変わらない
+///
+/// 生成禁止を積んでいない構成では、どちらを選んでも`CREATE_NO_WINDOW`のままである
+/// （今日の挙動を1ビットも変えないため）。**この欄が効き始めるのは`Restricted`と
+/// 対になったときだけ**で、それでも`Option`にしないのは、積んだ日に
+/// 「全経路が既定値を掴んでいた」を作らないためである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleNeed {
+    /// コンソールが要る（pwsh・powershell）。`Restricted`のとき、Daemonは
+    /// **`CreateProcessW`の前にコンソール保持プロセスへ`AttachConsole`する義務がある**
+    /// ——生成側はコンソールのフラグを1つも積まないので、そのとき繋がっているコンソールが
+    /// そのまま子へ渡る。繋がっていなければ子はコンソール無しで起き、**無言でexit 0**する。
+    Required,
+    /// 要らない（node・git・rustc・MCPサーバ等）。`Restricted`のとき`DETACHED_PROCESS`で起こす。
+    NotNeeded,
+}
+
 /// [`ControlRequest::SpawnTopLevel`]の中身。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnTopLevelRequest {
@@ -229,6 +357,16 @@ pub struct SpawnTopLevelRequest {
     pub handles: ChildHandles,
     /// suspended窓で行うRedirector注入。`None`なら現行の無注入経路。
     pub redirector: Option<RedirectorSpec>,
+    /// [段階⑤] 起こすプログラムがコンソールを要るか。
+    ///
+    /// **これは「切れる設定」ではなく「どんなプログラムか」の申告である。** Daemonは
+    /// 実行ファイル名から推測しない——推測は当たらない側へ倒れたとき無言だからである
+    /// （`ConsoleNeed::Required`を`NotNeeded`と取り違えると、シェルは何も実行せずexit 0する）。
+    ///
+    /// 生成禁止を積んでいない構成では**この欄は結果に効かない**（どちらでも
+    /// `CREATE_NO_WINDOW`のまま）。それでも`Option`にしないのは、
+    /// 積んだ日に「全経路が既定値を掴んでいた」を作らないためである。
+    pub console: ConsoleNeed,
 }
 
 // **トークンの既定DACL（§22.1.1）の欄は置かない**（2026-09-07に削除）。
@@ -307,9 +445,12 @@ pub enum DenyReason {
     PidReused,
     /// 台帳には在るが、遷移ポリシーがまだ実装されていない。
     ///
-    /// **段階Eでポリシー評価が入るまでの既定である。** fail-closedの側へ倒してあるので、
-    /// この状態のまま`CHILD_PROCESS_RESTRICTED`を積むとサンドボックスの中で
-    /// 子プロセスが1つも作れなくなる——だから⑤は段階Eの後に来る。
+    /// **段階Eでポリシー評価が入るまでの既定である。** fail-closedの側へ倒してある。
+    ///
+    /// **この状態が、生成禁止を製品の既定へ入れられない理由そのものである**——
+    /// 取り上げたうえで答えが常にこれだと、サンドボックスの中で外部プログラムが
+    /// 1つも起動できなくなる。**機構は段階⑤で作ってあり、既定へ入れるのが段階Eの後**という
+    /// 2軸である（[`ChildProcessPolicy`]のdoc・`docs/guide/11a-mac-enforcement-map.md`§2）。
     PolicyNotImplemented,
     /// 電文が壊れている・長すぎる・接続元がAppContainerの外だった。
     MalformedRequest,

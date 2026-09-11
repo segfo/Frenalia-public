@@ -192,21 +192,37 @@ pub(crate) unsafe fn init(param: *const u8) -> bool {
     // （`file_hooks`のモジュールdocの表: `cow_enabled`が偽のとき成功経路では何もしない。
     // 受付が無ければ失敗経路も`retry_once_after_fault_in`の1行目で戻る）。
     let file_hooks_wanted = cfg.cow_enabled || cfg.broker_pipe.is_some();
-    // **フックの設置に失敗したとき、それを致命にしてよいか。** プロセス生成フックだけを
-    // 理由に注入したのなら、置けなかった時点でこのDLLは何もしていない——
-    // そこでreadyを返すと「入ったが何もしていない」が成功として通り、
-    // 段階⑤を積んだ日に**そのプロセスだけが静かに子を作れなくなる**。
+    // **フックの設置に失敗したとき、それを致命にしてよいか。**
+    //
+    // [段階⑤] 条件は「なぜ注入したか」ではなく「**このプロセスは自力で子を作れるか**」である
+    // （`docs/STATUS.md`残課題#44の決定）。理由は2つに割れる。
+    //
+    // - 生成禁止が積まれている（`CHILD_PROCESS_RESTRICTED`）: 自力では子を作れないので、
+    //   フックが「Spawn Daemonへ頼む」へ変換する**唯一の経路**になる。置けなければ、
+    //   この子は子プロセスを作ることも頼むこともできず**エラーも出さずに何もできなくなる**
+    // - 積まれていない（今日の既定）: 自力で子を作れるので、フックが無くても動く。
+    //   失われるのは孫への再注入だけで、境界はACLが張ったまま（フックは境界ではない、D-01）
+    //
+    // **危険が実在するのは前者だけなので、致命にするのも前者だけである。** これで
+    // CoW／lazyの今日の挙動は1ビットも変わらない。
+    let self_is_child_process_restricted = child_process_creation_is_blocked();
+    // [段階5b] 加えて、**プロセス生成フックだけを理由に注入した**のなら、置けなかった時点で
+    // このDLLは何もしていない——そこでreadyを返すと「入ったが何もしていない」が成功として通る。
     let process_hooks_are_the_only_reason = cfg.process_hooks && !file_hooks_wanted;
+    let process_hooks_are_mandatory =
+        self_is_child_process_restricted || process_hooks_are_the_only_reason;
     load_deleted_set(&cfg);
     let _ = CONFIG.set(cfg);
 
     if !file_hooks_wanted {
         debug_log("init: no diff layer and no fault broker; installing process hooks only");
         let installed = install_create_process_hooks();
-        if process_hooks_are_the_only_reason && !installed {
+        if process_hooks_are_mandatory && !installed {
             debug_log(
-                "init: the process-creation hooks are the only reason for this injection, \
-                       and none could be installed; bail without signalling ready",
+                "init: the process-creation hooks are mandatory for this process \
+                       (child process creation is blocked, or the hooks are the only reason \
+                       for this injection), and none could be installed; \
+                       bail without signalling ready",
             );
             return false;
         }
@@ -388,15 +404,72 @@ pub(crate) unsafe fn init(param: *const u8) -> bool {
     // Phase 1-3（直接の子の書込リダイレクト）は実機で確立済みの機能であり、これらのフックが
     // 何らかの理由で設置に失敗しても、上記6フックを巻き戻さずそのまま活かす（孫プロセスへの
     // 再注入だけが働かなくなる＝Phase 4a以前と同じ状態に留まる）。
-    let _ = install_create_process_hooks();
+    //
+    // **[段階⑤] ただし生成禁止が積まれているときは別である。** そのとき「ベストエフォート」は
+    // 「静かに何もできない子を作ってよい」と同義になる。**上の分岐と同じ条件を使う**
+    // ——CoWやlazyの構成でも、生成禁止を積んだ瞬間に危険は同じだけ実在する
+    // （`B-06`: 同じ判断を持つ経路は2つあり、2つとも直す）。
+    let installed = install_create_process_hooks();
     debug_log(&format!(
         "init: install_create_process_hooks done, create_process_w_hook={} create_process_as_user_w_hook={}",
         CREATE_PROCESS_W_HOOK.get().is_some(),
         CREATE_PROCESS_AS_USER_W_HOOK.get().is_some()
     ));
+    if process_hooks_are_mandatory && !installed {
+        debug_log(
+            "init: child process creation is blocked for this process but no process-creation \
+                   hook could be installed; bail without signalling ready",
+        );
+        return false;
+    }
 
     signal_ready();
     true
+}
+
+/// **このプロセス自身が、子プロセスを作れない状態にされているか**
+/// （`PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`。段階⑤）。
+///
+/// # なぜ注入側から伝えず、子が自分で見るのか
+///
+/// 生成禁止は`CreateProcessW`の属性として**起動の瞬間に決まる**もので、
+/// 注入する設定とは別の経路で入る。設定の欄として渡すと、渡し忘れた経路だけが
+/// 「積まれているのに積まれていないつもり」になる——しかもその取り違えは、
+/// **フックが無い子が静かに何もできない**という遠い症状でしか現れない。
+/// **自分の状態は自分に聞くのが、経路を1つも数えなくてよい唯一の形である。**
+///
+/// # 判定できなかったときは「積まれていない」へ倒す
+///
+/// 問い合わせに失敗したときに「積まれている」へ倒すと、**今日の既定（CoW/lazy）で
+/// フック設置が失敗しただけの子が起動しなくなる**——危険が無い側で可用性だけを落とす。
+/// 逆へ倒した場合に失われるのは、この関数が本来出すはずだった致命化であり、
+/// そのときも境界（ACL・AppContainer）は1ミリも動かない（D-01: フックは境界ではない）。
+fn child_process_creation_is_blocked() -> bool {
+    use windows::Win32::System::SystemServices::PROCESS_MITIGATION_CHILD_PROCESS_POLICY;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessMitigationPolicy, ProcessChildProcessPolicy,
+    };
+
+    let mut policy = PROCESS_MITIGATION_CHILD_PROCESS_POLICY::default();
+    let ok = unsafe {
+        GetProcessMitigationPolicy(
+            GetCurrentProcess(),
+            ProcessChildProcessPolicy,
+            &mut policy as *mut _ as *mut core::ffi::c_void,
+            core::mem::size_of::<PROCESS_MITIGATION_CHILD_PROCESS_POLICY>(),
+        )
+    };
+    if ok.is_err() {
+        debug_log("init: GetProcessMitigationPolicy(ProcessChildProcessPolicy) failed");
+        return false;
+    }
+    // 最下位ビットが`NoChildProcessCreation`。`windows`のビットフィールドは
+    // 匿名unionの`Anonymous`側にしか出ないので、生の`u32`として読む。
+    let blocked = unsafe { policy.Anonymous.Flags } & 0x0000_0001 != 0;
+    debug_log(&format!(
+        "init: child process creation blocked for self = {blocked}"
+    ));
+    blocked
 }
 
 /// `NtQueryDirectoryFileEx`のベストエフォートフック設置（BUG-048 F3、`init`から呼ばれる）。

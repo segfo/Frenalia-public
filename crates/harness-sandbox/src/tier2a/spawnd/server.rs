@@ -23,13 +23,21 @@
 //! 本番と変わる（`B-08`）。`harness-netfilterd`から流用するのは**起動と寿命の形**であって、
 //! `runas`の部分ではない。
 //!
-//! # 段階5の範囲（**ここが持っていないもの**）
+//! # ここが持っていないもの
 //!
 //! - **要求受付パイプの要求は実行しない。** 台帳の判定までを行い、その先は
 //!   [`DenyReason::PolicyNotImplemented`]で断る。遷移ポリシーの評価は段階Eが持つ
-//! - **`CHILD_PROCESS_RESTRICTED`を積まない**（段階⑤）。積むのは、ポリシー評価が
-//!   着地した後である——いま積むとサンドボックスの中で子プロセスが1つも作れなくなる
-//! - **コンソール保持プロセスを持たない**（§7.1.1）。あれが要るのは生成禁止を積んでから
+//!
+//! # 段階⑤で足したもの（2026-09-11）
+//!
+//! - **生成禁止（`CHILD_PROCESS_RESTRICTED`）を指定できる。** 指定するかは
+//!   このDaemon1本の姿勢で、起動引数で決まる（[`ChildProcessPolicy`]）。
+//!   **製品の既定は指定しない側である**——遷移ポリシーの評価が無いまま指定すると、
+//!   答えが常に「未実装なので断る」になり、サンドボックスの中で子プロセスが1つも作れない。
+//!   **「機構を作る」と「既定へ入れる」は別の決定である**
+//!   （`docs/guide/11a-mac-enforcement-map.md`§2）
+//! - **コンソール保持プロセスを持つ**（§7.1.1）。生成禁止を指定したシェルにだけ、
+//!   起こす瞬間だけコンソールを貸す。何をどう貸すかは[`super::console_holder`]が持つ
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -65,11 +73,13 @@ use crate::win_pipe_ipc::{
     read_framed_timeout, unique_pipe_name, write_framed_timeout,
 };
 
+use super::console_holder::ConsoleHolders;
 use super::table::ProcessTable;
 use super::{
-    protocol_version_mismatch, ChildHandles, ControlRequest, ControlResponse, DenyReason,
-    DomainIdentitySpec, DomainSpec, RedirectorSpec, SpawnFailureKind, SpawnRequest, SpawnResponse,
-    SpawnTopLevelRequest, ACCEPT_TIMEOUT, IO_TIMEOUT, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    protocol_version_mismatch, ChildHandles, ChildProcessPolicy, ConsoleNeed, ControlRequest,
+    ControlResponse, DenyReason, DomainIdentitySpec, DomainSpec, RedirectorSpec, SpawnFailureKind,
+    SpawnRequest, SpawnResponse, SpawnTopLevelRequest, ACCEPT_TIMEOUT, IO_TIMEOUT, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION,
 };
 
 /// `SECURITY_CAPABILITIES`へ積むときの属性（`spawn_with_workspace`と同じ値）。
@@ -124,6 +134,20 @@ fn redirector_err(message: impl Into<String>) -> SpawnDaemonError {
 struct Shared {
     table: Mutex<ProcessTable>,
     stopping: AtomicBool,
+    /// [段階⑤] このDaemonが起こす子へ、生成禁止を積むか。
+    ///
+    /// **Daemon1本につき1つで、要求ごとに切り替えられない。** 電文（[`SpawnTopLevelRequest`]）の
+    /// 欄にしていないのは、同じファイルの`token_default_dacl_sddl`を2026-09-07に削除したのと
+    /// 同じ理由である——**落とせる形の欄を置くと、いつか落とされる**。生成能力を取り上げるかは
+    /// セッション全体の姿勢であって、要求ごとの設定ではない。
+    ///
+    /// 将来Tier2aの全spawnへ常時積むと決めたら、**この欄ごと消す**のが正しい畳み方である。
+    child_process_policy: ChildProcessPolicy,
+    /// [段階⑤] ドメインごとのコンソール保持プロセス（§7.1.1）。
+    ///
+    /// **生成禁止を積まない構成では1本も起こさない。** コンソールが要るのは
+    /// 「生成禁止を積んだシェル」だけで、それ以外は今日どおり`CREATE_NO_WINDOW`で起きる。
+    console_holders: ConsoleHolders,
 }
 
 /// 制御パイプへ接続し、`Shutdown`か切断まで要求を処理し続ける。
@@ -134,7 +158,10 @@ struct Shared {
 /// 検証せずに`CreateFileW`へ渡すと、「Daemonが攻撃者の選んだ先を開く」プリミティブになる
 /// （named pipeに見えない普通のファイルパスも`CreateFileW`は開ける）。
 /// `harness-netfilterd`／`privhelper`が同じ理由で同じ検証をしている。
-pub fn serve(control_pipe_name: &str) -> Result<(), SpawnDaemonError> {
+pub fn serve(
+    control_pipe_name: &str,
+    child_process_policy: ChildProcessPolicy,
+) -> Result<(), SpawnDaemonError> {
     if !is_harness_pipe_name(control_pipe_name) {
         return Err(err(format!(
             "refusing to open {control_pipe_name:?}: not a harness pipe name"
@@ -179,6 +206,8 @@ pub fn serve(control_pipe_name: &str) -> Result<(), SpawnDaemonError> {
     let shared = Arc::new(Shared {
         table: Mutex::new(ProcessTable::new()),
         stopping: AtomicBool::new(false),
+        child_process_policy,
+        console_holders: ConsoleHolders::default(),
     });
 
     // --- 要求受付パイプを開く（サンドボックスから到達できる唯一の口） ---
@@ -267,6 +296,13 @@ pub fn serve(control_pipe_name: &str) -> Result<(), SpawnDaemonError> {
     for reaped in shared.table.lock().unwrap().drain() {
         close_reaped(reaped);
     }
+
+    // [段階⑤] **コンソール保持プロセスは畳む。** 上の子プロセスとは扱いが逆である——
+    // あれはユーザーの作業そのものなので巻き添えにしないが、保持プロセスは
+    // 「Daemonがシェルを起こすためだけに居るもの」で、Daemonが終われば存在理由が消える。
+    // Jobのkill-on-closeでも畳まれるが、**それは保険であって正面の畳み方ではない**
+    // （§10.1.1がキャンセルについて採ったのと同じ形）。
+    shared.console_holders.shutdown();
     Ok(())
 }
 
@@ -658,6 +694,46 @@ fn spawn_top_level(
     };
     let mut env_block = build_env_block(&env);
 
+    // [段階⑤] **シェルにだけ、保持プロセスのコンソールを借りる**（§7.1.1）。
+    //
+    // 借りるのは「生成禁止を積む」かつ「コンソールが要る」の**両方**が立つときだけである。
+    // - 生成禁止を積まない構成では、子は今日どおり`CREATE_NO_WINDOW`で起きるので借りる必要が無い
+    // - コンソールが要らないプログラム（node・git・MCPサーバ）は`DETACHED_PROCESS`で動く
+    //
+    // **窓は`CreateProcessW`の前後だけに閉じる。** ガードを落とすとその場で`FreeConsole`が
+    // 走り、Daemonはコンソールから離れる——繋がったままだと、同じコンソールに繋がった
+    // サンドボックスの子が制御イベントでDaemonを落とせる（§7.1.1の「Daemonは繋いだままにしない」）。
+    let console_window = if shared.child_process_policy.is_restricted()
+        && request.console == ConsoleNeed::Required
+    {
+        // ドメインごとに1本（§7.1.1の「分ける単位」）。**鍵は判定に使う値だけで作る**——
+        // `DomainSpec::name`は記録と診断のためだけの欄なので鍵にしない。
+        let domain_key = format!(
+            "{}|{}",
+            request.domain.container_sid,
+            match &request.domain.identity {
+                DomainIdentitySpec::Capability { sid } => sid.as_str(),
+                DomainIdentitySpec::OwnPackage => "own-package",
+            }
+        );
+        // **借りられなければ、このspawn要求を失敗させる**（§7.1.2の決定4）。
+        // コンソール無しで黙って起こすと、シェルは何も実行せず終了コード0で終わる。
+        match shared.console_holders.borrow(&domain_key) {
+            Ok(window) => Some(window),
+            Err(e) => {
+                close_received_handles(job, &inherit_handles, true);
+                if let Some(read) = ready_read {
+                    unsafe {
+                        let _ = CloseHandle(read);
+                    }
+                }
+                return Err(err(format!("console holder: {e}")));
+            }
+        }
+    } else {
+        None
+    };
+
     // 「一時停止で起こす → Jobへ入れる → トークンの既定DACLを差し替える」までは
     // harnessの`spawn_impl`と**同じ本体**を通る（`create_suspended_in_job`）。
     // 写しを作らないので、失敗パスの後始末が2つの綴りに分かれない。
@@ -674,6 +750,12 @@ fn spawn_top_level(
         stdin_read,
         job,
         domain: domain.domain_identity(),
+        // [段階⑤] **Daemon全体の姿勢**であって、要求ごとの設定ではない（`Shared`の同名の欄）。
+        child_process_policy: shared.child_process_policy,
+        // 起こすプログラムがコンソールを要るかは**呼び出し元が知っている**ので電文で受け取る。
+        // ここで実行ファイル名から推測しない——外すと、シェルが無言でexit 0する
+        // （[`ConsoleNeed`]のdoc）。
+        console: request.console,
     }) {
         Ok(info) => info,
         Err(e) => {
@@ -688,6 +770,13 @@ fn spawn_top_level(
             return Err(err(e.to_string()));
         }
     };
+
+    // [段階⑤] **窓をここで閉じる。** 子は`CREATE_SUSPENDED`のまま起きているので、
+    // 以後の注入・台帳登録・`ResumeThread`はコンソールを借りていない状態で走る。
+    // **`ResumeThread`を窓の外へ置くのは設計の指定である**（§7.1.1。窓の内で動かすと、
+    // サンドボックスのシェルが走っている間ずっとDaemonが同じコンソールに残る）。
+    // 窓の外で子のDLL初期化が通ることは実測済みである（§S46b）。
+    drop(console_window);
 
     let pid = info.dwProcessId;
 

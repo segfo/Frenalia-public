@@ -20,14 +20,51 @@
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
+    use harness_sandbox::tier2a::spawnd::console_holder;
+
+    const USAGE: &str = "usage: harness-spawnd.exe <control-pipe-name> <unrestricted|restricted>\n\
+                         usage: harness-spawnd.exe --console-holder";
+
     let pipe_name = match std::env::args().nth(1) {
         Some(p) => p,
         None => {
-            eprintln!("usage: harness-spawnd.exe <control-pipe-name>");
+            eprintln!("{USAGE}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    match harness_sandbox::tier2a::spawnd::server::serve(&pipe_name) {
+
+    // [段階⑤] **第2の姿: コンソール保持プロセス**（`plans/DESIGN-MAC-ENFORCEMENT.md`§7.1.1）。
+    //
+    // 別のバイナリを増やさないのは、**居場所の規約を2つに増やさない**ためである
+    // ——`harness-spawnd.exe`は既に「`harness.exe`の隣」と決まっており、Daemonは
+    // 自分自身のパスからこれを起こす（`console_holder::launch_holder`）。
+    // 何をするかはあちらのモジュールdocが持つ（**ここへ複製しない**）。
+    if pipe_name == console_holder::CONSOLE_HOLDER_ARG {
+        return match console_holder::run_as_console_holder() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("harness-spawnd --console-holder: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    // [段階⑤] **省略を許さない。** 「無ければ今日の既定」にすると、常時適用へ切り替えた日に
+    // 引数を渡していない経路だけが黙って旧い姿勢で立ち上がる（同関数のdoc）。
+    // 知らない綴りも同じ扱いで、ここで止める。
+    let child_process_policy = match std::env::args().nth(2) {
+        Some(arg) => match harness_sandbox::tier2a::spawnd::ChildProcessPolicy::from_arg(&arg) {
+            Some(policy) => policy,
+            None => {
+                eprintln!("harness-spawnd: unknown child process policy {arg:?}\n{USAGE}");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+        None => {
+            eprintln!("{USAGE}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match harness_sandbox::tier2a::spawnd::server::serve(&pipe_name, child_process_policy) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             // **コンソールを持たないので、この出力は誰にも届かない可能性が高い。**

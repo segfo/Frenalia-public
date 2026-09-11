@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use harness_sandbox::tier2a::session_profile::{begin_session, end_session};
-use harness_sandbox::tier2a::spawnd::{SharedSpawnDaemon, SpawnRequest};
+use harness_sandbox::tier2a::spawnd::{ChildProcessPolicy, SharedSpawnDaemon, SpawnRequest};
 use harness_sandbox::tier2a::win_appcontainer::revoke_session_grant;
 
 use super::AppContainerTransportFactory;
@@ -203,7 +203,8 @@ fn probe_report_for(process: McpProcessAccess, label: &str) -> serde_json::Value
     // workspaceは使わない（`workspace: None`）が、`prepare`の引数として要る。
     let workspace = tempfile::tempdir().expect("workspace");
 
-    let daemon = SharedSpawnDaemon::start().expect("the spawn daemon must start");
+    let daemon = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted)
+        .expect("the spawn daemon must start");
     eprintln!(
         "[{label}] daemon pid={} request_pipe={}",
         daemon.daemon_pid(),

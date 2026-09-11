@@ -42,6 +42,7 @@ use super::{
     spawn_with_workspace_via_daemon, AppContainerChild, AppContainerError, CowInject,
     DomainIdentity, NetworkCapability, RedirectorInject, SpawnRequestAccess,
 };
+use crate::tier2a::spawnd::ConsoleNeed;
 
 /// Tier2aでシェルを起こすための入力一式。
 ///
@@ -254,6 +255,10 @@ fn spawn_shell_in_workspace_on(
                 // 段階⑤で生成能力を取り上げたあと、CLIツールが子を起こす唯一の口がここになる
                 // ——積まないと、そのときシェルは孫プロセスを1つも作れなくなる。
                 SpawnRequestAccess::Grant,
+                // [段階⑤] **この経路が起こすのはシェルである**（`resolve_shell`が選んだ
+                // pwsh/powershell）。生成禁止を積んだ構成でコンソールを渡さないと、
+                // PowerShellは何も実行せずexit 0で終わる（`ConsoleNeed`のdocの表）。
+                ConsoleNeed::Required,
             ),
         }
     };
@@ -410,6 +415,58 @@ mod tests {
             test_callers > 0,
             "テストからの呼び出しも0件になった。綴りを間違えて1行も見ていない可能性がある\
              （0件マッチで黙って緑になる形＝BUG-056）"
+        );
+    }
+
+    /// [段階⑤] **生成禁止の姿勢を、製品コードが1箇所で1回だけ選んでいること**を固定する。
+    ///
+    /// 製品でDaemonを起こすホストは2つある——harness本体（`harness-cli`の`run_agent.rs`）と
+    /// ポリシーエディタ（`harness-policy-editor`の`record_net.rs`）。**片方だけを直すと、
+    /// もう片方だけが別の姿勢で動く**（`B-06`。段階5bでMCPの経路が1本だけ取り残されていたのと
+    /// 同じ形で、そのときも赤くするテストが1本も無かった）。
+    ///
+    /// いまはどちらも`Unrestricted`である（段階Eが無いので既定へ入れられない、
+    /// `ChildProcessPolicy`のdoc）。**常時適用へ切り替えるときは、この件数ではなく
+    /// 引数そのものを消す**のが正しい畳み方で、そのときこのテストも一緒に消える。
+    ///
+    /// **限界**: `grep`なので、別名で束ねてから呼ばれると数えられない。緑は
+    /// 「**この綴りの**起こし方が2つで、2つとも同じ姿勢」しか意味しない（§10.1.1と同じ限界）。
+    #[test]
+    fn both_product_hosts_start_the_daemon_with_the_same_child_process_policy() {
+        // 綴りは実行時に組み立てる（このテスト自身が数え上げに掛からないように。
+        // 上の`the_direct_route_has_no_product_callers`が踏んだ罠と同じ）。
+        let needle = format!("SharedSpawnDaemon::start{}", '(');
+        let definition = format!("fn start{}", '(');
+        let (product_callers, test_callers) =
+            super::super::test_support::product_callers_of(&needle, &definition);
+
+        assert_eq!(
+            product_callers.len(),
+            2,
+            "Daemonを起こす製品のホストが2つではなくなった。増えたなら、その経路にも\
+             生成禁止の姿勢を明示すること（`B-06`: N経路のうちN経路で数える）。\
+             減ったなら、片方のホストがDaemonを起こさなくなっている:\n  {}",
+            product_callers.join("\n  ")
+        );
+        assert!(
+            test_callers > 0,
+            "テストからの呼び出しも0件になった。綴りを間違えて1行も見ていない可能性がある\
+             （0件マッチで黙って緑になる形＝BUG-056）"
+        );
+
+        // **姿勢そのものを数える。** 上の件数だけでは「2つとも在る」しか言えず、
+        // どちらが何を選んだかは見ていない。`Restricted`が製品コードに0件であることが
+        // 決定Aの機械化された形である（`RedirectorInject::default()`を0件で固定したのと同じ形）。
+        let restricted = format!("ChildProcessPolicy{}Restricted", "::");
+        let (restricted_product, _) =
+            super::super::test_support::product_callers_of(&restricted, "enum ChildProcessPolicy");
+        assert!(
+            restricted_product.is_empty(),
+            "製品コードが生成禁止を選んでいる。段階E（遷移ポリシーの評価）が着地するまで、\
+             製品の既定の起動経路へ入れない——入れるとDaemonの答えが常に\
+             「未実装なので断る」になり、サンドボックスの中で外部プログラムが\
+             1つも起動できなくなる（`ChildProcessPolicy`のdoc）:\n  {}",
+            restricted_product.join("\n  ")
         );
     }
 

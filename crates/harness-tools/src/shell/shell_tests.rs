@@ -976,7 +976,9 @@ mod tests {
 
         let mut ctx = ToolCtx::new(dir.path().to_path_buf());
         ctx.shell_tier = selection;
-        let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start()
+        let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
+            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
+        )
             .expect("Tier2a product path requires a Spawn Daemon");
         let tool = RunShellTool::with_spawn_daemon(daemon);
 
@@ -1149,7 +1151,9 @@ Write-Output ('REPLY:' + [Text.Encoding]::UTF8.GetString($buf, 0, $got))
         ctx.net_app = NetAppPolicy {
             allow_apps: vec!["powershell".to_string(), "pwsh".to_string()],
         };
-        let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start()
+        let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
+            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
+        )
             .expect("Tier2a product path requires a Spawn Daemon");
         let tool = RunShellTool::with_spawn_daemon(daemon);
         // TCPソケットを直接開くprobe（HTTP_PROXYに依存しない、capability機構そのものを見る）。

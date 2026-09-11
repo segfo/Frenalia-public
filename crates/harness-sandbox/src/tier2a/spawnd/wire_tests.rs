@@ -27,7 +27,7 @@ fn control_request_hello_keeps_its_wire_shape() {
     .expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":2}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":3}"#
     );
 }
 
@@ -56,11 +56,13 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
             workspace_root: "C:/w".to_string(),
             broker_pipe: r"\\.\pipe\lazy".to_string(),
         }),
+        // [段階⑤] この電文の`exe`はpwshなので、コンソールが要る側である。
+        console: ConsoleNeed::Required,
     }));
     let json = serde_json::to_string(&request).expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"}},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"redirector":{"kind":"lazy","workspace_root":"C:/w","broker_pipe":"\\\\.\\pipe\\lazy"}}"#
+        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"}},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"redirector":{"kind":"lazy","workspace_root":"C:/w","broker_pipe":"\\\\.\\pipe\\lazy"},"console":"required"}"#
     );
     let back: ControlRequest = serde_json::from_str(&json).expect("round trip");
     assert_eq!(back, request);
@@ -75,7 +77,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":2}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":3}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {
@@ -119,10 +121,10 @@ fn a_peer_that_reports_a_different_protocol_version_is_rejected_in_both_directio
 
 #[test]
 fn old_peers_without_a_protocol_version_are_rejected() {
-    assert!(serde_json::from_str::<ControlRequest>(
-        r#"{"kind":"hello","harness_process":4660}"#
-    )
-    .is_err());
+    assert!(
+        serde_json::from_str::<ControlRequest>(r#"{"kind":"hello","harness_process":4660}"#)
+            .is_err()
+    );
     assert!(serde_json::from_str::<ControlResponse>(
         r#"{"kind":"ready","request_pipe":"p","daemon_pid":1}"#
     )
