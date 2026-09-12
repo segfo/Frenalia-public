@@ -1,10 +1,13 @@
 //! `dev-elevated-run`: `dev-elevated-runnerd`（開発用の昇格コマンドランナー）へ1件だけ
-//! 要求を送るクライアント。デーモンが起動していなければ`runas`で起動する（UAC 1回、
-//! 以後はセッション中このデーモンへ委譲する）。
+//! 要求を送るクライアント。デーモンが起動していなければ登録済みタスクで起動し、
+//! タスクが未登録のときだけ`runas`（UAC 1回）を使う。
 //!
 //! 使い方: `dev-elevated-run.exe <target>`（`target`は`dev_elevated_runner::KNOWN_TARGETS`の
 //! キーのいずれか）。それ以外の引数は受け付けない——複数コマンドの連結や任意のcargo引数を
 //! 渡す経路は無い。
+
+#[cfg(windows)]
+mod scheduled_task;
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
@@ -71,36 +74,50 @@ fn main() -> std::process::ExitCode {
     let pipe = match connect_once() {
         Some(p) => p,
         None => {
-            eprintln!(
-                "dev-elevated-run: daemon not running, launching dev-elevated-runnerd.exe \
-                 (this will prompt for UAC once)"
-            );
-            let daemon_path = match std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("dev-elevated-runnerd.exe")))
-            {
-                Some(p) => p,
-                None => {
-                    eprintln!("dev-elevated-run: failed to resolve daemon exe path");
+            let scheduled = match scheduled_task::start_if_registered() {
+                Ok(started) => started,
+                Err(e) => {
+                    eprintln!("dev-elevated-run: {e}");
                     return std::process::ExitCode::FAILURE;
                 }
             };
-            let verb_w = wide("runas");
-            let file_w = wide(&daemon_path.to_string_lossy());
-            let mut info = SHELLEXECUTEINFOW {
-                cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-                fMask: SEE_MASK_NOCLOSEPROCESS,
-                lpVerb: PCWSTR(verb_w.as_ptr()),
-                lpFile: PCWSTR(file_w.as_ptr()),
-                nShow: SW_HIDE.0,
-                ..Default::default()
-            };
-            let ok = unsafe { ShellExecuteExW(&mut info) };
-            if ok.is_err() {
-                eprintln!("dev-elevated-run: failed to launch daemon: {:?}", unsafe {
-                    windows::Win32::Foundation::GetLastError()
-                });
-                return std::process::ExitCode::FAILURE;
+            if scheduled {
+                eprintln!("dev-elevated-run: starting daemon through registered scheduled task");
+            } else {
+                eprintln!(
+                    "dev-elevated-run: task not registered, launching dev-elevated-runnerd.exe \
+                 (this will prompt for UAC once)"
+                );
+                let daemon_path = match std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("dev-elevated-runnerd.exe")))
+                {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("dev-elevated-run: failed to resolve daemon exe path");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                };
+                let verb_w = wide("runas");
+                let file_w = wide(&daemon_path.to_string_lossy());
+                let mut info = SHELLEXECUTEINFOW {
+                    cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+                    fMask: SEE_MASK_NOCLOSEPROCESS,
+                    lpVerb: PCWSTR(verb_w.as_ptr()),
+                    lpFile: PCWSTR(file_w.as_ptr()),
+                    nShow: SW_HIDE.0,
+                    ..Default::default()
+                };
+                let ok = unsafe { ShellExecuteExW(&mut info) };
+                if ok.is_err() {
+                    eprintln!("dev-elevated-run: failed to launch daemon: {:?}", unsafe {
+                        windows::Win32::Foundation::GetLastError()
+                    });
+                    return std::process::ExitCode::FAILURE;
+                }
+                unsafe {
+                    let _ = CloseHandle(info.hProcess);
+                }
             }
             // デーモンが名前付きパイプを作り終えるまで短くリトライする。
             let mut connected = None;

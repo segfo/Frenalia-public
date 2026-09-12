@@ -8,7 +8,7 @@ edition.workspace = true
 #
 # 本物のharness製品（harness.exe/harness-netfilterd.exe/harness-privhelper.exe）とは
 # 完全に無関係で、リリース成果物には一切含めない。デーモン(`dev-elevated-runnerd`)は
-# 初回起動時のみUAC 1回を要求し、以後は現在ユーザSID限定DACLの名前付きパイプ経由で
+# 登録済みタスク経由、または未登録時のみUACで起動し、現在ユーザSID限定DACLの名前付きパイプ経由で
 # クライアント(`dev-elevated-run`)からの要求を受ける。クライアントは自由なコマンドラインを
 # 一切送らない——送るのは`KNOWN_TARGETS`（`src/lib.rs`）のキー名1つだけで、実際に実行される
 # `cargo`引数列はサーバ側にハードコードされた固定テーブルから引く。クライアント由来の
