@@ -23,11 +23,13 @@ fn control_request_hello_keeps_its_wire_shape() {
     let json = serde_json::to_string(&ControlRequest::Hello {
         harness_process: 4660,
         protocol_version: PROTOCOL_VERSION,
+        policy: Box::new(harness_policy::policy_file::PolicyFile::default()),
+        workspace_root: "C:/w".to_string(),
     })
     .expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":3}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":4,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w"}"#
     );
 }
 
@@ -40,6 +42,7 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
         env: vec![("K".to_string(), "V".to_string())],
         domain: DomainSpec {
             name: "pwsh-workspace".to_string(),
+            policy_domain: "workspace-shell".to_string(),
             container_sid: "S-1-15-2-1".to_string(),
             capability_sids: vec!["S-1-15-3-1024-1".to_string()],
             identity: DomainIdentitySpec::Capability {
@@ -62,7 +65,7 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
     let json = serde_json::to_string(&request).expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"}},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"redirector":{"kind":"lazy","workspace_root":"C:/w","broker_pipe":"\\\\.\\pipe\\lazy"},"console":"required"}"#
+        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","policy_domain":"workspace-shell","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"}},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"redirector":{"kind":"lazy","workspace_root":"C:/w","broker_pipe":"\\\\.\\pipe\\lazy"},"console":"required"}"#
     );
     let back: ControlRequest = serde_json::from_str(&json).expect("round trip");
     assert_eq!(back, request);
@@ -77,7 +80,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":3}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":4}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {
@@ -160,11 +163,33 @@ fn a_spawn_request_carries_no_domain_field() {
 /// 「ポリシーの判定が効いている」を区別できなくなる（`B-35`）。
 #[test]
 fn every_deny_reason_has_a_distinct_wire_value() {
+    use harness_policy::transition::TransitionDenial;
+
     let reasons = [
         DenyReason::NotRegistered,
         DenyReason::PidReused,
-        DenyReason::PolicyNotImplemented,
         DenyReason::MalformedRequest,
+        // [段階6b] 判定器の答えは**変種ごとに別々に運ばれる**。
+        // 「宣言していないから拒否」と「呼び出し元のドメインを知らないから拒否」は
+        // 直し方が違う（前者は辺を足す、後者はドメイン名が合っていない）。
+        DenyReason::Transition {
+            denial: TransitionDenial::UnknownSourceDomain,
+        },
+        DenyReason::Transition {
+            denial: TransitionDenial::NoMatchingEdge,
+        },
+        DenyReason::Transition {
+            denial: TransitionDenial::AmbiguousPattern { matched: 2 },
+        },
+        DenyReason::Transition {
+            denial: TransitionDenial::CwdMismatch {
+                declared: "C:/w".to_string(),
+                actual: "C:/other".to_string(),
+            },
+        },
+        DenyReason::TargetDomainNotProvisioned {
+            to: "other-domain".to_string(),
+        },
     ];
     let mut seen: Vec<String> = reasons
         .iter()
@@ -184,7 +209,67 @@ fn every_deny_reason_has_a_distinct_wire_value() {
             reason: DenyReason::NotRegistered
         })
         .expect("serialize"),
-        r#"{"kind":"denied","reason":"not_registered"}"#
+        r#"{"kind":"denied","reason":{"kind":"not_registered"}}"#
+    );
+
+    // **書き出せることは、読み戻せることを意味しない。**
+    //
+    // 2026-09-12に実際に踏んだ: `DenyReason`も`TransitionDenial`も`kind`をタグ名に使うので、
+    // 判定器の答えをnewtypeで包むと`{"kind":"transition","kind":"..."}`という
+    // **`kind`が2つあるJSON**が出る。書き出しは成功し、上の「重複していない」検査も通り、
+    // 壊れるのは**読み戻した側**だけだった。だから往復まで測る。
+    for reason in &reasons {
+        let json = serde_json::to_string(reason).expect("serialize");
+        assert_eq!(
+            json.matches(r#""kind":"#).count(),
+            if matches!(reason, DenyReason::Transition { .. }) {
+                2 // 外側の`kind`と、入れ子になった`denial`の中の`kind`。**同じ階層に2つではない。**
+            } else {
+                1
+            },
+            "タグが同じ階層で重複している（読み戻すと片方が消える）: {json}"
+        );
+        let back: DenyReason = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(&back, reason, "往復で値が変わった: {json}");
+    }
+}
+
+/// [段階6b・**暫定を固定するテスト**] 遷移先が別ドメインの辺は、**専用の理由**で断られる。
+///
+/// # このテストは何のために在るのか
+///
+/// **暫定措置が残っていることを見張るためだけに在る。** 別ドメインへ遷移するには、
+/// そのドメイン用の`(package SID, capability SIDの組)`が要るが、ドメインを鍵にした
+/// AppContainerプロファイル発行器は未実装である
+/// （`plans/DESIGN-MAC-BROKER.md` §22.9が7つの配線点を挙げている作業）。
+///
+/// # §22.9が着地したら、このテストごと消すのが正しい畳み方である
+///
+/// 一緒に消えるのは次の3つで、**どれか1つでも残ると「別ドメインへ遷移できない」が
+/// 理由の分からない拒否として残り続ける**。
+///
+/// 1. [`DenyReason::TargetDomainNotProvisioned`]（この変種そのもの）
+/// 2. `server.rs`の`serve_spawn_request`で「遷移先が呼び出し元と同じか」を見ている分岐
+/// 3. このテスト
+///
+/// **件数ではなく綴りで固定している**——件数だと、別の理由を1つ足したときにも赤くなって
+/// 「何が起きたか」が分からなくなる。
+#[test]
+fn a_cross_domain_transition_is_refused_until_per_domain_profiles_exist() {
+    let json = serde_json::to_string(&SpawnResponse::Denied {
+        reason: DenyReason::TargetDomainNotProvisioned {
+            to: "build-tools".to_string(),
+        },
+    })
+    .expect("serialize");
+
+    assert_eq!(
+        json,
+        r#"{"kind":"denied","reason":{"kind":"target_domain_not_provisioned","to":"build-tools"}}"#,
+        "別ドメインへの遷移を断る暫定措置の形が変わった。\
+         §22.9（ドメイン単位のプロファイル発行器）が着地して暫定を外したのなら、\
+         このテストと DenyReason::TargetDomainNotProvisioned と \
+         server.rs の同一ドメイン判定の3つを**まとめて**消すこと（同変種のdoc）"
     );
 }
 

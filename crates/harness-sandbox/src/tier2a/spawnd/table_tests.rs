@@ -30,6 +30,10 @@ const PROC_3: u64 = 0x33;
 fn domain(name: &str) -> DomainSpec {
     DomainSpec {
         name: name.to_string(),
+        // この台帳のテストは遷移の判定を測っていないので、2つの名前を同じ値にしておく。
+        // **判定を測るテストでは必ず別の値にすること**——同じにすると、
+        // 遷移元キーに`name`を使ってしまう実装でも緑になる。
+        policy_domain: name.to_string(),
         container_sid: "S-1-15-2-1111111111-2222222222".to_string(),
         capability_sids: vec!["S-1-15-3-1024-1".to_string()],
         identity: DomainIdentitySpec::OwnPackage,
@@ -48,7 +52,7 @@ fn all_alive(_handle: u64) -> bool {
 fn an_unregistered_pid_is_denied_while_a_registered_one_resolves() {
     let mut table = ProcessTable::new();
     table
-        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"))
+        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"), Vec::new())
         .expect("register the top-level process");
 
     assert_eq!(
@@ -80,7 +84,7 @@ fn an_unregistered_pid_is_denied_while_a_registered_one_resolves() {
 fn a_dead_process_handle_is_denied_as_pid_reuse_not_as_unregistered() {
     let mut table = ProcessTable::new();
     table
-        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"))
+        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"), Vec::new())
         .expect("register");
 
     let denied = table.resolve(4200, |_| false);
@@ -105,7 +109,7 @@ fn a_dead_process_handle_is_denied_as_pid_reuse_not_as_unregistered() {
 fn the_lineage_job_comes_back_only_when_the_last_member_is_reaped() {
     let mut table = ProcessTable::new();
     let lineage = table
-        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"))
+        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"), Vec::new())
         .expect("register the top level");
     table
         .register_in_lineage(4201, PROC_2, lineage, domain("git-workspace"))
@@ -139,10 +143,10 @@ fn the_lineage_job_comes_back_only_when_the_last_member_is_reaped() {
 fn reaping_one_lineage_leaves_another_lineage_untouched() {
     let mut table = ProcessTable::new();
     table
-        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"))
+        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"), Vec::new())
         .expect("register lineage A");
     table
-        .register_top_level(5300, PROC_2, JOB_B, domain("pwsh-workspace"))
+        .register_top_level(5300, PROC_2, JOB_B, domain("pwsh-workspace"), Vec::new())
         .expect("register lineage B");
 
     let reaped = table.reap(4200).expect("reap lineage A");
@@ -166,10 +170,10 @@ fn reaping_one_lineage_leaves_another_lineage_untouched() {
 fn registering_the_same_pid_twice_fails_instead_of_overwriting() {
     let mut table = ProcessTable::new();
     table
-        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"))
+        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"), Vec::new())
         .expect("first registration");
 
-    let second = table.register_top_level(4200, PROC_3, JOB_B, domain("other"));
+    let second = table.register_top_level(4200, PROC_3, JOB_B, domain("other"), Vec::new());
     assert_eq!(
         second,
         Err(RegisterError::PidAlreadyRegistered { pid: 4200 }),
@@ -189,7 +193,7 @@ fn registering_the_same_pid_twice_fails_instead_of_overwriting() {
 fn reaping_an_unknown_pid_is_a_no_op() {
     let mut table = ProcessTable::new();
     table
-        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"))
+        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"), Vec::new())
         .expect("register");
 
     assert!(table.reap(9999).is_none(), "知らないPIDで何かを返している");
@@ -208,13 +212,13 @@ fn reaping_an_unknown_pid_is_a_no_op() {
 fn drain_returns_every_process_handle_and_every_lineage_job() {
     let mut table = ProcessTable::new();
     let lineage = table
-        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"))
+        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"), Vec::new())
         .expect("register the top level");
     table
         .register_in_lineage(4201, PROC_2, lineage, domain("git-workspace"))
         .expect("register a nested child");
     table
-        .register_top_level(5300, PROC_3, JOB_B, domain("pwsh-workspace"))
+        .register_top_level(5300, PROC_3, JOB_B, domain("pwsh-workspace"), Vec::new())
         .expect("register another lineage");
 
     let reaped = table.drain();
@@ -251,7 +255,7 @@ fn drain_returns_every_process_handle_and_every_lineage_job() {
 fn registering_into_an_unknown_lineage_fails() {
     let mut table = ProcessTable::new();
     let lineage = table
-        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"))
+        .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"), Vec::new())
         .expect("register");
     // ここで返る系統Jobは、このテストでは閉じる相手が居ない（ただの整数）。
     // `#[must_use]`は「呼び出し側が閉じ忘れる」ことへの警告なので、

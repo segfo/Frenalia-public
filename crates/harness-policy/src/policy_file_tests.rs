@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use harness_policy::{generalize::SettingsKey, RuleProposal};
+use crate::{generalize::SettingsKey, RuleProposal};
 
 use super::*;
 
@@ -416,18 +416,10 @@ fn declared_paths_across_domains_are_deduplicated() {
     );
 }
 
-/// 置き場は`.harness`配下（P-08の制御ディレクトリ側。記録対象から書き換えられない、かつ
-/// 次回の記録の候補に自分自身が混ざらない）。
-#[test]
-fn the_policy_file_lives_inside_the_control_directory() {
-    let p = path(Path::new(r"C:\ws"));
-
-    assert_eq!(p, Path::new(r"C:\ws").join(".harness").join("policy.json"));
-    assert!(
-        crate::exclusion::is_harness_control_path(&p.to_string_lossy()),
-        "policy.json自身が候補として提案されると自己参照ループになる"
-    );
-}
+// **「置き場が`.harness`配下で、かつ除外規則がそれを覆っている」を測る対のテストは、
+// `harness-policy-editor`の`exclusion_tests.rs`にある**（2026-09-12にこのモジュールを
+// 移設した際に移した）。除外規則（`is_harness_control_path`）があちらのクレートにあり、
+// **2つが対になっていることに意味がある**ので、片方だけをこちらへ残して分断しない。
 
 /// ドメイン名の既定値は先頭トークンのbasenameから拡張子を落としたもの。
 /// **CLIとTUIが同じ規則を通る**ことに意味がある（別々に持つと、同じコマンドの記録が

@@ -25,7 +25,13 @@ harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `policy_file`のエラー型だけが使う（`harness-policy-editor`から移設した際に持ち込んだ）。
+thiserror = "2"
 # 遷移のパターン言語（`plans/DESIGN-MAC-BROKER.md` §22.5）。有限オートマトンで入力長に対して
 # 線形時間を保証するので、信頼していない子から来る文字列を照合しても停止しない。
 # **ワークスペースの他クレートが既に間接依存している**ので、これで外部依存は増えない。
 regex = "1"
+
+[dev-dependencies]
+# `policy_file`のテストが`policy.json`の往復をtempディレクトリで測る（2026-09-12に移設）。
+tempfile = "3.27.0"

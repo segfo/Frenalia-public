@@ -21,6 +21,12 @@
 //!   そのまま境界の正しさになってしまう（P-07）。加えて、敵対的な子プロセスは意図的に大量の
 //!   パスへ触れて候補リストを汚染できるため、自動適用は「触れば通る」という権限拡大経路になる。
 //! - **ファイルを読まない**。入力は常に読み込み済みの文字列で受け取る（純粋性の維持）。
+//!   **例外は[`policy_file`]ただ1つで、名前を挙げて許してある**（2026-09-12、段階6b）。
+//!   あれは`policy.json`を読み書きする**唯一の口**で、読む側が
+//!   `harness-policy-editor`・`harness-cli`・`harness-sandbox`（Spawn Daemon）の3クレートに
+//!   跨るようになったため、両方から見えるここへ置くほかない。**読み書きは`load`/`save`の
+//!   2関数に閉じており**、提案エンジン（[`normalize`]・[`generalize`]・[`diff`]・[`gate`]）は
+//!   いまも1バイトも読まない——上の(2)「実機・管理者権限なしに全数テストできる」は保たれている。
 //! - **拒否を防がない**。ここは境界ではない（P-07）。収集源が1つも読めなくても、その事実を
 //!   [`SourceReport::available`]で可視化したうえで残りの経路だけで動く（D-43 fail-open）。
 
@@ -31,6 +37,7 @@ pub mod gate;
 pub mod generalize;
 pub mod insufficient;
 pub mod normalize;
+pub mod policy_file;
 pub mod transition;
 
 pub use breadth::BreadthVerdict;

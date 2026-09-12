@@ -722,7 +722,7 @@ while ($got -lt $n) { $r = $c.Read($buf, $got, $n - $got); if ($r -le 0) { break
 Write-Output ('REPLY:' + [Text.Encoding]::UTF8.GetString($buf, 0, $got))
 "#;
 
-/// 8番: **パス2で起こした子は要求受付パイプへ届き、`policy_not_implemented`で断られる**
+/// 8番: **パス2で起こした子は要求受付パイプへ届き、`no_matching_edge`で断られる**
 /// （`plans/DESIGN-MAC-PROTOCOL.md` §12の経路表で「積む」と決めた側）。
 ///
 /// # なぜ`run_shell`側のテストでは足りないのか
@@ -734,9 +734,17 @@ Write-Output ('REPLY:' + [Text.Encoding]::UTF8.GetString($buf, 0, $got))
 ///
 /// # 見るのは「断られたこと」ではなく**断る理由**である
 ///
-/// `policy_not_implemented`は「あなたが誰かは分かった（Process Tableに載っている）が、
-/// 遷移を許すかを判定する仕組みがまだ無い」、`not_registered`は「登録が効いていない」
-/// （BUG-116の形）。**同じ値へ丸めると、常に拒否する実装でも通る**（`B-35`）。
+/// `no_matching_edge`は「あなたが誰かも、どのドメインに居るかも分かった。
+/// **ただしそのドメインは`git.exe`を起こす辺を宣言していない**」である
+/// （このE2Eは`fs`も`process`も空の`policy.json`を書く）。`not_registered`は
+/// 「登録が効いていない」（BUG-116の形）。**同じ値へ丸めると、常に拒否する実装でも通る**（`B-35`）。
+///
+/// # [段階6b] この1本が、遷移元ドメインの配線まで測っている
+///
+/// `unknown_source_domain`ではなく`no_matching_edge`が返ることは、
+/// **Daemonがこの子の遷移元を「記録中のドメイン」として引けている**ことを意味する。
+/// パス2が`run_shell`と同じ入口ドメインの固定名を渡してしまうと、そのドメインは
+/// `policy.json`に無いので`unknown_source_domain`になり、ここが赤くなる。
 ///
 /// # 対の相手
 ///
@@ -786,8 +794,10 @@ fn pass2_reaches_the_request_pipe_and_is_denied_by_policy_not_by_the_table() {
          環境変数の受け渡しが落ちている: {stdout}"
     );
     assert!(
-        stdout.contains("policy_not_implemented"),
-        "パス2の子が要求受付パイプで `policy_not_implemented` を受け取れていない。\
+        stdout.contains("no_matching_edge"),
+        "パス2の子が要求受付パイプで `no_matching_edge` を受け取れていない。\
+         `unknown_source_domain` なら遷移元ドメインの配線が違う（パス2は記録中のドメイン名を\
+         渡すはずで、入口ドメインの固定名を渡していると`policy.json`に無いのでこうなる）、\
          `not_registered` なら Process Table への登録が Resume より前に効いていない（BUG-116の形）、\
          `CONNECT_FAILED` なら spawn要求用capability を積んでいない: {stdout}"
     );

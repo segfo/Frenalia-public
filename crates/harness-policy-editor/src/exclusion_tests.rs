@@ -231,3 +231,24 @@ fn sandbox_profile_components_come_from_the_sandbox_crate() {
     ));
     assert!(!is_sandbox_profile_path("C:/x/Packages/other.app_8wekyb"));
 }
+
+/// `policy.json`の置き場は`.harness`配下（P-08の制御ディレクトリ側。記録対象から
+/// 書き換えられない、かつ次回の記録の候補に自分自身が混ざらない）。
+///
+/// **このテストがここに在る理由**: 2026-09-12に`policy_file`モジュールを
+/// `harness-policy`へ移したが、除外規則（[`is_harness_control_path`]）はこのクレートに残った。
+/// **測っているのは2つの対**——置き場がどこかと、除外がそこを覆っているか——なので、
+/// 片方だけを向こうへ置くと分断される。**両方が見えるこちらへ移した。**
+#[test]
+fn the_policy_file_lives_inside_the_control_directory() {
+    let p = harness_policy::policy_file::path(std::path::Path::new(r"C:\ws"));
+
+    assert_eq!(
+        p,
+        std::path::Path::new(r"C:\ws").join(".harness").join("policy.json")
+    );
+    assert!(
+        is_harness_control_path(&p.to_string_lossy()),
+        "policy.json自身が候補として提案されると自己参照ループになる"
+    );
+}

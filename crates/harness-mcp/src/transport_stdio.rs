@@ -148,6 +148,12 @@ impl TransportFactory for AppContainerTransportFactory {
         let child = spawn_via_daemon(
             daemon,
             &decl.id,
+            // [段階6b] **MCPサーバの遷移元ドメイン名は宣言idそのものである**
+            // （§22.2.2「MCPサーバは自分専用のpackage SIDを持つドメイン」）。
+            // ここだけプロファイル名と一致するので同じ値を2回渡しているが、
+            // **意味が違う欄なので畳まない**——プロファイルの命名規則が変わった日に、
+            // 判定の遷移元まで黙って変わる形にしない。
+            &decl.id,
             &decl.command,
             &args,
             &cwd,

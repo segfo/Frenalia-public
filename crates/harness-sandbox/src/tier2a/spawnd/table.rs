@@ -58,6 +58,18 @@ struct Entry {
 struct Lineage {
     /// 系統Jobの**複製**（§10.1.1）。harnessが作り、Daemonへ渡されたもの。
     job: u64,
+    /// [段階6b] この系統のトップレベルを起こしたときの環境変数一式（**base env**）。
+    ///
+    /// # なぜ系統が持つのか
+    ///
+    /// nestedのspawnで子へ渡す環境が要る。要求電文（[`super::SpawnRequest`]）には
+    /// envの欄が無く、**あってもならない**——サンドボックスの中の呼び出し元が申告した
+    /// 環境をそのまま使うと、`PATH`や`HARNESS_SPAWN_REQUEST_PIPE`を差し替えられる。
+    /// harnessが組んだトップレベルの環境が、この系統で唯一信頼できる出発点である。
+    ///
+    /// 辺が`env`の差分を宣言していれば、これへ当てたものを渡す
+    /// （`harness_policy::transition::EnvPolicy::Fixed`）。
+    base_env: Vec<(String, String)>,
     members: HashSet<u32>,
 }
 
@@ -69,6 +81,10 @@ pub struct Caller {
     pub domain: DomainSpec,
     /// この系統のJobハンドル（複製）。nestedの子はここへ入れる（§10.1.1）。
     pub lineage_job: u64,
+    /// [段階6b] この系統のbase env（[`Lineage::base_env`]の写し）。
+    ///
+    /// **要求元が申告した環境ではない**——申告させると`PATH`を差し替えられる。
+    pub base_env: Vec<(String, String)>,
 }
 
 /// [`ProcessTable::reap`]・[`ProcessTable::drain`]が返す「閉じるべきハンドル」。
@@ -144,6 +160,7 @@ impl ProcessTable {
         process: u64,
         job: u64,
         domain: DomainSpec,
+        base_env: Vec<(String, String)>,
     ) -> Result<LineageId, RegisterError> {
         if self.entries.contains_key(&pid) {
             return Err(RegisterError::PidAlreadyRegistered { pid });
@@ -154,6 +171,7 @@ impl ProcessTable {
             lineage,
             Lineage {
                 job,
+                base_env,
                 members: HashSet::from([pid]),
             },
         );
@@ -216,16 +234,16 @@ impl ProcessTable {
             // これから別のプロセスへ振り替わる。どちらにせよ対応を信用してはいけない。
             return Err(DenyReason::PidReused);
         }
-        let lineage_job = self
+        let lineage = self
             .lineages
             .get(&entry.lineage)
-            .map(|l| l.job)
             .ok_or(DenyReason::NotRegistered)?;
         Ok(Caller {
             pid,
             lineage: entry.lineage,
             domain: entry.domain.clone(),
-            lineage_job,
+            lineage_job: lineage.job,
+            base_env: lineage.base_env.clone(),
         })
     }
 

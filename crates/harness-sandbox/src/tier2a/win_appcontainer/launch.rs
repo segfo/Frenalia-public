@@ -66,6 +66,21 @@ pub struct WorkspaceSpawn {
     pub granted_passthrough: Vec<harness_core::GrantedPassthrough>,
     /// 子へ与えるnetwork capability。**判断は呼び出し元が行う**（モジュールdoc参照）。
     pub net_capability: NetworkCapability,
+    /// [段階6b] 起こすシェルが居る**遷移元ドメインの名前**（`policy.json`の`domains[].name`）。
+    ///
+    /// # なぜ呼び出し元が決めるのか
+    ///
+    /// この入口は`run_shell`とポリシーエディタのパス2が**共有している**が、
+    /// 遷移元の名前は2つで違う（`plans/DESIGN-MAC-PROTOCOL.md` §12.1の表）。
+    ///
+    /// - `run_shell` → 入口ドメインの固定名（`harness_policy::policy_file::ENTRY_DOMAIN`）
+    /// - パス2 → **記録中のドメイン名**。あちらは`--domain`で指定されたドメインを
+    ///   実行しているので、自分が誰かを知っている
+    ///
+    /// **`Option`にして「無ければ入口ドメイン」にしない。** そうするとパス2が渡し忘れた日に、
+    /// 記録中のドメインの宣言が効かず、**入口ドメインの宣言が代わりに効く**
+    /// ——拒否ではなく「別のドメインの許可が通る」向きに倒れる。
+    pub policy_domain: String,
 }
 
 impl WorkspaceSpawn {
@@ -241,6 +256,10 @@ fn spawn_shell_in_workspace_on(
             SpawnRoute::Daemon(daemon) => spawn_with_workspace_via_daemon(
                 daemon,
                 &profile_name,
+                // [段階6b] **遷移元の名前は呼び出し元が決める**（`WorkspaceSpawn::policy_domain`）。
+                // `profile_name`（すぐ上）はセッションごとに変わるので`policy.json`へ書けない
+                // ——だからこの2つは別の引数である（同関数のdoc）。
+                &req.policy_domain,
                 &bin,
                 &args,
                 &req.cwd,
@@ -484,6 +503,7 @@ mod tests {
             cow_diff_layer_dir: None,
             granted_passthrough: Vec::new(),
             net_capability: NetworkCapability::Deny,
+            policy_domain: harness_policy::policy_file::ENTRY_DOMAIN.to_string(),
         };
         assert_eq!(
             base.workspace_mode(),
@@ -525,6 +545,7 @@ mod tests {
                 },
             ],
             net_capability: NetworkCapability::Deny,
+            policy_domain: harness_policy::policy_file::ENTRY_DOMAIN.to_string(),
         };
 
         let roots: Vec<PathBuf> = req

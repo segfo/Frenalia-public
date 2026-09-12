@@ -285,7 +285,22 @@ pub struct Allowed<'a> {
 }
 
 /// 拒否の理由。**「拒否された」だけでは、宣言が無いのか曖昧なのかが区別できない。**
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # なぜserdeが要るのか（2026-09-12、段階6b）
+///
+/// この値は**Spawn Daemonから要求元のサンドボックスへ、要求受付パイプで返る**
+/// （`harness_sandbox::tier2a::spawnd::DenyReason::Transition`）。拒否の語彙を電文側に
+/// もう1つ作ると、判定器が増やした理由が電文側へ届かないまま片方だけ古くなる（`B-13`）。
+/// **判定器の答えをそのまま運ぶ。**
+///
+/// # 要求元へ何を見せているか
+///
+/// [`TransitionDenial::CwdMismatch`]だけが宣言の中身（宣言された`cwd`）を含む。
+/// **これは要求元自身のドメインの辺に書かれた値**なので、他のドメインの宣言は漏れない
+/// ——`policy.json`そのものはサンドボックスから読めない（P-08）が、
+/// 「自分がどう宣言されているか」は、拒否の理由として返らないと直しようがない。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TransitionDenial {
     /// 呼び出し元のドメインがグラフに無い。
     UnknownSourceDomain,

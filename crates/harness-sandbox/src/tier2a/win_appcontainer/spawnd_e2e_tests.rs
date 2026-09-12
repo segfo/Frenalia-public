@@ -18,7 +18,7 @@
 //! # ここで測っていないもの
 //!
 //! - **遷移が許可されること**。段階5にポリシー評価は無く、答えは常に拒否である
-//!   （段階Eが入るまでは`policy_not_implemented`が正しい応答）
+//!   （段階Eが入るまでは`unknown_source_domain`が正しい応答）
 //! - **`CHILD_PROCESS_RESTRICTED`下での動作**。積むのは段階⑤
 //!
 //! # 測っている世界が本番と1つだけ違う（**limitation**）
@@ -72,7 +72,21 @@ impl Drop for Case {
 /// （BUG-056）。分けた理由は1ファイルの行数上限（`docs/CODE-STRUCTURE-RULES.md`）である。
 mod child_process_restricted_tests;
 
+/// [段階6b] 遷移ポリシーの受け入れ（対で3本）。**同じ理由でここに置いてある**——
+/// 昇格の的`spawn-daemon`のフィルタが`win_appcontainer::spawnd_e2e_tests`なので、
+/// 外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
+mod transition_acceptance_tests;
+
+/// [段階6b] このファイルのテストが名乗る**遷移元ドメイン名**。
+///
+/// **`DomainSpec::name`（プロファイル名の側）とわざと別の綴りにしてある。**
+/// 同じにすると、遷移元キーに`name`を使ってしまう実装でも緑のまま通る（`B-35`の形）。
+pub(super) const E2E_POLICY_DOMAIN: &str = "spawnd-e2e-policy-domain";
+
 /// workspaceを1つ用意し、preflightを通し、Daemonを起こす。**生成禁止は積まない。**
+///
+/// [段階6b] 遷移の宣言は**空**である。宣言を渡すのは
+/// [`setup_with_policy_and_transitions`]で、そちらは遷移の受け入れテストだけが使う。
 pub(super) fn setup(label: &str) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
     setup_with_policy(label, ChildProcessPolicy::Unrestricted)
 }
@@ -84,6 +98,21 @@ pub(super) fn setup(label: &str) -> (Case, OwnedContainerSid, Vec<crate::win_com
 pub(super) fn setup_with_policy(
     label: &str,
     child_process_policy: ChildProcessPolicy,
+) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
+    setup_with_policy_and_transitions(label, child_process_policy, |_| {
+        harness_policy::policy_file::PolicyFile::default()
+    })
+}
+
+/// [段階6b] 遷移の宣言を渡して同じ土台を作る。
+///
+/// `declare`はワークスペースルートを受け取って`policy.json`の中身を組む
+/// ——宣言の中に**そのワークスペースの実パス**が要る（実行ファイルのフルパス等）ため、
+/// ディレクトリが決まった後でないと組めない。
+pub(super) fn setup_with_policy_and_transitions(
+    label: &str,
+    child_process_policy: ChildProcessPolicy,
+    declare: impl FnOnce(&std::path::Path) -> harness_policy::policy_file::PolicyFile,
 ) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
     let guard = TestDirGuard::create(label);
     let workspace = guard.path().to_path_buf();
@@ -110,8 +139,14 @@ pub(super) fn setup_with_policy(
         caps.push(cap);
     }
 
-    let daemon =
-        SpawnDaemonHandle::start(child_process_policy).expect("the spawn daemon must start");
+    let daemon = SpawnDaemonHandle::start(
+        crate::tier2a::spawnd::TransitionPolicy {
+            policy: declare(&canonical),
+            workspace_root: canonical.to_string_lossy().into_owned(),
+        },
+        child_process_policy,
+    )
+    .expect("the spawn daemon must start");
     eprintln!(
         "[spawnd] daemon pid={} request_pipe={} policy={}",
         daemon.daemon_pid(),
@@ -152,6 +187,8 @@ pub(super) fn domain_spec(
     }
     DomainSpec {
         name: "spawnd-e2e".to_string(),
+        // [段階6b] **わざと`name`と違う綴りにしてある**（[`E2E_POLICY_DOMAIN`]のdoc）。
+        policy_domain: E2E_POLICY_DOMAIN.to_string(),
         container_sid: crate::win_common::sid_to_string(profile.as_psid())
             .expect("container sid to string"),
         capability_sids,
@@ -217,12 +254,37 @@ pub(super) fn spawn_request_payload() -> String {
     .expect("serialize the spawn request")
 }
 
-/// 子が返した拒否理由を取り出す。
-pub(super) fn deny_reason(stdout: &str) -> Option<String> {
+/// 子が受け取った応答（`SpawnResponse`）を取り出す。
+pub(super) fn reply_json(stdout: &str) -> Option<serde_json::Value> {
     let reply = report_field(stdout, "reply")?;
-    let reply = reply.as_str()?;
-    let parsed: serde_json::Value = serde_json::from_str(reply).ok()?;
-    parsed.get("reason")?.as_str().map(|s| s.to_string())
+    serde_json::from_str(reply.as_str()?).ok()
+}
+
+/// 応答の種別（`"spawned"` か `"denied"`）。
+pub(super) fn reply_kind(stdout: &str) -> Option<String> {
+    reply_json(stdout)?
+        .get("kind")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// 子が返した拒否理由を、**いちばん具体的な綴り**で取り出す。
+///
+/// [段階6b] `reason`は文字列ではなく`{"kind":...}`のオブジェクトになった。さらに
+/// 遷移ポリシーが断ったときは、外側が`"transition"`で**中身の`denial.kind`のほうが
+/// 知りたい値**である（「宣言が無い」のか「ドメインを知らない」のか）。
+/// ここで1段掘っておかないと、呼び出し側のテストが全部`"transition"`としか言えなくなる。
+pub(super) fn deny_reason(stdout: &str) -> Option<String> {
+    let reason = reply_json(stdout)?.get("reason")?.clone();
+    let kind = reason.get("kind")?.as_str()?;
+    if kind == "transition" {
+        return reason
+            .get("denial")?
+            .get("kind")?
+            .as_str()
+            .map(|s| s.to_string());
+    }
+    Some(kind.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +340,7 @@ fn a_daemon_spawned_child_reaches_the_request_pipe_and_is_denied_by_policy_not_b
     );
     assert_eq!(
         deny_reason(&out).as_deref(),
-        Some("policy_not_implemented"),
+        Some("unknown_source_domain"),
         "Daemonが起こした子なのに「台帳に無い」で断られている。\
          §12のProcess Table登録がResumeより前に効いていない（BUG-116の形）: {out}"
     );
@@ -537,7 +599,10 @@ fn cancelling_a_daemon_spawned_lineage_still_kills_the_grandchild() {
 #[test]
 #[ignore = "starts a real spawn daemon; run through spawn-daemon"]
 fn dropping_the_handle_ends_the_daemon() {
-    let daemon = SpawnDaemonHandle::start(ChildProcessPolicy::Unrestricted)
+    let daemon = SpawnDaemonHandle::start(
+        crate::tier2a::spawnd::TransitionPolicy::empty(""),
+        ChildProcessPolicy::Unrestricted,
+    )
         .expect("the spawn daemon must start");
     let pid = daemon.daemon_pid();
     assert!(pid != 0, "DaemonのPIDが返っていない（Readyが届いていない）");
@@ -577,7 +642,10 @@ fn dropping_the_handle_ends_the_daemon() {
 fn a_spawn_request_after_the_daemon_died_fails_loudly() {
     use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
-    let daemon = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted)
+    let daemon = SharedSpawnDaemon::start(
+        crate::tier2a::spawnd::TransitionPolicy::empty(""),
+        ChildProcessPolicy::Unrestricted,
+    )
         .expect("the spawn daemon must start");
     let pid = daemon.daemon_pid();
 
@@ -607,6 +675,7 @@ fn a_spawn_request_after_the_daemon_died_fails_loudly() {
         env: &[],
         domain: DomainSpec {
             name: "dead-daemon".to_string(),
+            policy_domain: E2E_POLICY_DOMAIN.to_string(),
             container_sid: "S-1-15-2-1-2-3".to_string(),
             capability_sids: Vec::new(),
             identity: DomainIdentitySpec::OwnPackage,
@@ -656,6 +725,7 @@ fn a_spawn_request_after_the_daemon_died_fails_loudly() {
         env: &[],
         domain: DomainSpec {
             name: "dead-daemon-second-attempt".to_string(),
+            policy_domain: E2E_POLICY_DOMAIN.to_string(),
             container_sid: "S-1-15-2-1-2-3".to_string(),
             capability_sids: Vec::new(),
             identity: DomainIdentitySpec::OwnPackage,
@@ -701,7 +771,7 @@ fn a_spawn_request_after_the_daemon_died_fails_loudly() {
 ///
 /// 測るのは3つ: 全レーンが起動できたこと、**PIDが全部違うこと**（同じ応答を
 /// 複数レーンが読んでいない）、各レーンの子がProcess Tableに載っていること
-/// （`policy_not_implemented`であって`not_registered`ではない）。
+/// （`unknown_source_domain`であって`not_registered`ではない）。
 ///
 /// **3つめが要る。** PIDが違うだけなら、登録がどれか1つだけ成功していても通る。
 #[test]
@@ -722,7 +792,10 @@ fn concurrent_requests_share_one_control_pipe_without_interleaving() {
 
     // **製品と同じ共有接続**を使う。`setup`が持つのは素の`SpawnDaemonHandle`で、
     // 排他はそれを包む`SharedSpawnDaemon`の側にある——測りたいのはそちらである。
-    let shared = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted)
+    let shared = SharedSpawnDaemon::start(
+        crate::tier2a::spawnd::TransitionPolicy::empty(""),
+        ChildProcessPolicy::Unrestricted,
+    )
         .expect("a shared spawn daemon must start");
     let request_pipe = shared.request_pipe().to_string();
     eprintln!("[spawnd P9] shared daemon pid={}", shared.daemon_pid());
@@ -808,7 +881,7 @@ fn concurrent_requests_share_one_control_pipe_without_interleaving() {
     for (pid, out) in &outcomes {
         assert_eq!(
             deny_reason(out).as_deref(),
-            Some("policy_not_implemented"),
+            Some("unknown_source_domain"),
             "pid={pid}の子が「台帳に無い」で断られている。同時要求のどれかが\
              Process Tableへ登録されないまま起きている（§12・BUG-116）: {out}"
         );
@@ -854,7 +927,10 @@ fn top_level_spawn_latency_direct_versus_daemon() {
     let spawn_cap = spawn_request_capability_sid().expect("spawn request capability");
     let domain_caps: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
     let env = crate::secret_env::build_child_env();
-    let shared = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted)
+    let shared = SharedSpawnDaemon::start(
+        crate::tier2a::spawnd::TransitionPolicy::empty(""),
+        ChildProcessPolicy::Unrestricted,
+    )
         .expect("a shared spawn daemon must start");
     let _ = &spawn_cap;
 
@@ -876,6 +952,7 @@ fn top_level_spawn_latency_direct_versus_daemon() {
         spawn_with_workspace_via_daemon(
             &shared,
             "spawnd-latency",
+            E2E_POLICY_DOMAIN,
             EXE,
             &args,
             workspace,
@@ -989,13 +1066,17 @@ fn top_level_spawn_latency_injection_cost() {
         .unwrap_or_else(|_| workspace.clone());
     let domain_caps: Vec<PSID> = caps.iter().map(|c| c.as_psid()).collect();
     let env = crate::secret_env::build_child_env();
-    let shared = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted)
+    let shared = SharedSpawnDaemon::start(
+        crate::tier2a::spawnd::TransitionPolicy::empty(""),
+        ChildProcessPolicy::Unrestricted,
+    )
         .expect("a shared spawn daemon must start");
 
     let spawn = |exe: &str, inject: super::RedirectorInject<'_>, args: &[&str]| {
         spawn_with_workspace_via_daemon(
             &shared,
             "spawnd-inject-cost",
+            E2E_POLICY_DOMAIN,
             exe,
             args,
             &workspace,

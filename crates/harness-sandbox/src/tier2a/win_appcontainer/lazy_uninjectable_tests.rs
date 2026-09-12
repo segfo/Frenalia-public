@@ -125,6 +125,7 @@ fn an_uninjectable_top_level_shell_waits_for_the_full_walk_instead_of_faulting()
         cow_diff_layer_dir: None,
         granted_passthrough: Vec::new(),
         net_capability: NetworkCapability::Deny,
+        policy_domain: harness_policy::policy_file::ENTRY_DOMAIN.to_string(),
     };
     let (child, _) = spawn_shell_in_workspace(request).expect("the production launch path");
     let command = format!("Get-Content -Raw '{}\\{TARGET_REL}'", workspace.display());

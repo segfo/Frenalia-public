@@ -824,8 +824,15 @@ impl SharedSpawnDaemon {
         Self::default()
     }
 
+    /// [段階6b] `policy`は**呼び出し側が必ず渡す**（`SharedSpawnDaemon::start`のdoc）。
+    ///
+    /// **2本目以降のパス2では使われない。** このホストはDaemonを1本だけ起こして使い回すので、
+    /// 宣言は**最初のパス2の時点のもの**で固定される。これは
+    /// [§19.2](../../../plans/DESIGN-MAC.md)「Policy Generationはセッション内で固定する」と
+    /// 同じ向きである——**途中で`policy.json`を編集しても、そのプロセスの間は効かない。**
     fn ensure_started(
         &self,
+        policy: harness_sandbox::tier2a::spawnd::TransitionPolicy,
     ) -> Result<harness_sandbox::tier2a::spawnd::SharedSpawnDaemon, String> {
         let mut slot = self
             .inner
@@ -838,6 +845,7 @@ impl SharedSpawnDaemon {
         // `ChildProcessPolicy`のdoc）。**ホストが2つあるので両方に同じ姿勢を書く**——
         // 片方だけへ配線すると、もう片方だけが別の世界で動く（`B-06`）。
         let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
+            policy,
             harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
         )
         .map_err(|error| error.to_string())?;
@@ -1105,9 +1113,18 @@ fn run_pass2<'a>(
     facts.shell_tier = Some(selection.tier.label().to_string());
     on_event(NetRecordEvent::Tier2aReady);
     // パス1では起こさない。Tier2a preflightが成功したこの地点が、最初のパス2だけの起動点。
+    //
+    // [段階6b] **遷移の宣言はここで読んでDaemonへ渡す**（`plans/DESIGN-MAC-PROTOCOL.md` §12.1）。
+    // 読めなければパス2を失敗させる——宣言を持たないDaemonを起こすと、
+    // 宣言してある遷移まで拒否される（`SharedSpawnDaemon::start`のdoc）。
+    let transition_policy = harness_sandbox::tier2a::spawnd::TransitionPolicy {
+        policy: crate::policy_file::load(request.workspace_root)
+            .map_err(|e| RecordNetError::SpawnDaemon(e.to_string()))?,
+        workspace_root: request.workspace_root.to_string_lossy().into_owned(),
+    };
     let spawn_daemon = request
         .spawn_daemon
-        .ensure_started()
+        .ensure_started(transition_policy)
         .map_err(RecordNetError::SpawnDaemon)?;
     for warning in &selection.passthrough_warnings {
         warn(warning.clone(), warnings, on_event);
@@ -1445,6 +1462,11 @@ fn run_pass2<'a>(
                 cow_diff_layer_dir: None,
                 granted_passthrough: selection.granted_passthrough.clone(),
                 net_capability,
+                // [段階6b] **パス2の遷移元は「いま記録しているドメイン」である**
+                // （`plans/DESIGN-MAC-PROTOCOL.md` §12.1の表）。`run_shell`と入口の関数を
+                // 共有しているが、遷移元の名前だけは共有しない——あちらは入口ドメインの固定名で、
+                // こちらは`--domain`で指定された名前である。
+                policy_domain: request.domain.name.clone(),
             },
         )
         .map_err(|e| RecordNetError::Spawn(e.to_string()))?;

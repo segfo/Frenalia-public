@@ -271,6 +271,7 @@ fn the_production_launch_path_takes_the_lazy_lane_when_a_receiver_is_open() {
         cow_diff_layer_dir: None,
         granted_passthrough: Vec::new(),
         net_capability: NetworkCapability::Deny,
+        policy_domain: harness_policy::policy_file::ENTRY_DOMAIN.to_string(),
     };
     let pipe_before = grant_job::lazy_broker_pipe_for(&canonical_ws, "rwx");
     assert!(

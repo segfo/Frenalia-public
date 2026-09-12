@@ -87,7 +87,14 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// 強制だけが黙って消える。これがこの定数のdocが言う「隔離の意味が変わる」の形そのものである。
 /// あわせて[`ConsoleNeed`]も足しており、古いDaemonはこれを無視して`CREATE_NO_WINDOW`で
 /// 起こすため、生成禁止と対になった日にシェルが`0xC0000142`で起動できなくなる。
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// **4へ上げたのは段階6bである。** [`ControlRequest::Hello`]が遷移ポリシーの宣言そのものを
+/// 運ぶようになった（`plans/DESIGN-MAC-PROTOCOL.md` §12.1）。古いDaemonのバイナリは
+/// この欄を読まないので、**harness側は宣言を渡したつもりでいるのに、Daemonは
+/// 「グラフが空のまま」で立ち上がる**——結果、あらゆる生成要求が「宣言が無い」として
+/// 拒否される。強制が消えるのではなく**全部拒否になる**向きだが、
+/// どちらにせよ「渡したつもり」と実際が食い違う点はこの定数のdocが言うとおりである。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
 ///
@@ -137,8 +144,31 @@ pub enum DomainIdentitySpec {
 /// 復元は`win_common::sid_from_string`（`sid_to_string`の対）が行う。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainSpec {
-    /// ドメイン名（記録と診断のためだけに使う。判定には使わない）。
+    /// AppContainerプロファイルの名前（`run_shell`経路）またはMCPサーバの宣言id。
+    ///
+    /// **記録と診断のためだけに使う。遷移の判定には使わない**——判定に使うのは
+    /// [`DomainSpec::policy_domain`]である。この2つは値が違う: この欄に入るプロファイル名は
+    /// **セッションごとに変わる**ので、`policy.json`に書ける綴りではない。
     pub name: String,
+    /// **遷移の判定における「呼び出し元ドメイン」の名前**（`policy.json`の`domains[].name`）。
+    ///
+    /// # なぜ[`DomainSpec::name`]と別に持つのか（2026-09-12、段階6b）
+    ///
+    /// 判定器は呼び出し元がグラフのどのノードに居るかを名前で引く
+    /// （`harness_policy::transition::SpawnAttempt::from_domain`）。ところが`name`に実際に
+    /// 入っているのは**AppContainerプロファイル名**（セッションごとに変わる）と
+    /// **MCPの宣言id**であり、前者は`policy.json`へ書けない。**同じ欄に2つの意味を
+    /// 持たせると、片方の経路だけが宣言と一致しなくなる**ので、欄を分ける。
+    ///
+    /// # 誰が何を入れるか
+    ///
+    /// 由来は経路ごとに違う（`plans/DESIGN-MAC-PROTOCOL.md` §12.1の表）。
+    /// `run_shell`は固定名（`harness_policy::policy_file::ENTRY_DOMAIN`）、
+    /// ポリシーエディタのパス2は記録中のドメイン名、MCPは宣言idである。
+    ///
+    /// **`Option`にしない。** 既定を持たせると、4つ目の経路を足す人が選ばずに通れてしまい、
+    /// **その経路だけが黙って別ドメイン扱いになる**（`DomainIdentitySpec`と同じ姿勢）。
+    pub policy_domain: String,
     /// AppContainerのpackage SID（`S-1-15-2-…`）。
     pub container_sid: String,
     /// トークンへ積むcapability SID（`S-1-15-3-…`）。traverse capabilityを含む。
@@ -202,6 +232,39 @@ pub struct ChildHandles {
     pub stderr_write: u64,
 }
 
+/// [段階6b] Daemonを起こすときに渡す遷移ポリシー一式。
+///
+/// # なぜ2つを1つの型で受けるのか
+///
+/// 判定できるグラフを組むには**宣言とワークスペースルートの両方**が要る
+/// （後者は「固定値が呼び出し元から書ける場所にあるか」の検査に使う。
+/// `harness_policy::transition::GraphInput::caller_writable_roots`のdoc）。
+/// 別々の引数にすると、片方だけ渡して**検査の一部が黙って効かない**構成が作れてしまう。
+///
+/// # 誰が作るか
+///
+/// 製品のホスト2つ（`harness.exe`とポリシーエディタ）が
+/// `harness_policy::policy_file::load`の結果から作る。**読めなければDaemonを起こさない**
+/// ——直接生成へ降格しないのと同じ扱いである（`plans/DESIGN-MAC-PROTOCOL.md` §12.1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionPolicy {
+    pub policy: harness_policy::policy_file::PolicyFile,
+    pub workspace_root: String,
+}
+
+impl TransitionPolicy {
+    /// 宣言が1件も無い状態。**製品コードで使わない**——ワークスペースの宣言を読まずに
+    /// Daemonを起こすと、宣言してある遷移まで拒否される。テストと、
+    /// ワークスペースを持たない呼び出し（`policy.json`が存在しないケースは
+    /// `load`が空を返すので、こちらではない）のための出発点である。
+    pub fn empty(workspace_root: impl Into<String>) -> Self {
+        Self {
+            policy: harness_policy::policy_file::PolicyFile::default(),
+            workspace_root: workspace_root.into(),
+        }
+    }
+}
+
 /// harness → Daemon（制御パイプ）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -217,6 +280,32 @@ pub enum ControlRequest {
         harness_process: u64,
         /// [`PROTOCOL_VERSION`]と完全一致しなければ、1件もspawnせず接続を閉じる。
         protocol_version: u32,
+        /// [段階6b] 遷移ポリシーの宣言（`policy.json`の中身そのもの）。
+        ///
+        /// # なぜ`Hello`に載っているのか（`plans/DESIGN-MAC-PROTOCOL.md` §12.1）
+        ///
+        /// `server::serve`は`Hello`を読み終えてから要求受付パイプの受付スレッドを起こす。
+        /// ここに載せることで、**宣言を持たないDaemonが要求を受け付ける瞬間が原理的に
+        /// 存在しなくなる**。別の制御要求にすると、その窓の間に来た要求だけが
+        /// 「宣言が無い」として拒否される。
+        ///
+        /// # なぜDaemonが自分で`policy.json`を読まないのか
+        ///
+        /// 遷移先ドメインの実体（package SIDとcapability SIDの組）は`policy.json`に
+        /// 書かれておらず、`preflight`が実行時に発行する。**どちらにせよharnessから
+        /// 渡すものがある**ので、Daemonがファイルを開いても入力源が2つに割れるだけである。
+        /// 加えて、親が指定したパスをDaemonに開かせる経路を新設することになる
+        /// （`is_harness_pipe_name`が同じ理由で避けている形）。
+        ///
+        /// # 縮小版の型を作っていない理由
+        ///
+        /// 同じ宣言の表現を2つ持つと片方だけ古くなる（`B-13`）。判定へ使うのは`process`だけだが、
+        /// **読み口（`policy_file::load`）が返す型をそのまま運ぶ**。
+        policy: Box<harness_policy::policy_file::PolicyFile>,
+        /// [段階6b] ワークスペースルート。**編集時検査の入力である**——
+        /// 「固定値が指すファイルが呼び出し元から書けない場所にあること」を確かめるのに、
+        /// 宣言だけを見るとワークスペースが抜ける（`GraphInput::caller_writable_roots`のdoc）。
+        workspace_root: String,
     },
     /// トップレベルのプロセスを起こす（§12「harnessもSpawn Daemon経由でspawnを依頼する」）。
     ///
@@ -245,17 +334,18 @@ pub enum ControlRequest {
 /// この属性が持つのは「作れない」の1ビットだけで、許可の情報を1つも運ばない。
 /// 代わりに起こすのはSpawn Daemonで、Redirector DLLはサンドボックスの中の
 /// `CreateProcessW`呼び出しを**Daemonへの頼み方へ変換する**だけである（許可証ではない）。
-/// 何を許すかを判定するのは遷移ポリシーの評価で、**このDaemonはまだそれを呼んでいない**
-/// ——いまDaemonへ頼んでも答えは常に[`DenyReason::PolicyNotImplemented`]である。
+/// 何を許すかを判定するのは遷移ポリシーの評価で、**段階6b（2026-09-12）でDaemonがそれを
+/// 呼ぶようになった**——宣言した辺に一致する要求は実際に起こり、一致しないものは
+/// [`DenyReason::Transition`]で断られる。
 ///
-/// **判定器そのものは在る**（段階⑥a、2026-09-11。`harness_policy::transition`）。
-/// 無いのは**ここへの配線**で、それが段階6bである。**「判定器が無い」と読まないこと。**
+/// # なぜ製品の既定が`Unrestricted`のままなのか（**理由が6bで入れ替わった**）
 ///
-/// # なぜ製品の既定が`Unrestricted`のままなのか
+/// **もう「判定が無いから」ではない。** 残っているのは**6f**——Redirector DLLのフックが
+/// まだDaemonへ頼んでおらず、`CreateProcessW`を横取りして**自分で起こし直している**点である。
+/// 生成を禁じた瞬間、その起こし直しがカーネルに拒否されて終わる。
+/// **フックが「Daemonへの依頼」へ変換するようになるまで、既定へは入れられない。**
 ///
-/// 上のとおりDaemonが判定を呼んでいないので、`Restricted`を製品の既定の起動経路へ入れると
-/// **サンドボックスの中で外部プログラム（`git`・`node`等）が1つも起動できなくなる**。
-/// 常時適用は6bが着地してからで、いま`Restricted`を選べるのは受入テストだけである。
+/// いま`Restricted`を選べるのは受入テストだけである。
 /// **この2択は「機構を作るか」ではなく「既定へ入れるか」の軸である**
 /// （`docs/guide/11a-mac-enforcement-map.md`§2）。
 ///
@@ -425,6 +515,13 @@ pub enum SpawnRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SpawnResponse {
+    /// [段階6b] 遷移が許可されたので、**Daemonが実際に起こした**。
+    ///
+    /// **プロセスハンドルは返していない。** 要求元がいま要るのはPIDだけで、
+    /// 待つ・終了コードを読むといった操作の口は6f（Redirector DLLのフックを
+    /// Daemonへの依頼に付け替える回）で`CreateProcessW`の戻り値を組み立てるときに要る。
+    /// **要る人が現れてから足す**——使われない欄は、渡す側の後始末だけが先に増える。
+    Spawned { pid: u32 },
     /// 拒否した。**理由を分ける**のは、拒否した側と拒否の根拠が別の事実だからである
     /// （§10.2が`denied_by_daemon`と`denied_by_kernel`を分けたのと同じ理屈）。
     Denied { reason: DenyReason },
@@ -435,8 +532,8 @@ pub enum SpawnResponse {
 ///
 /// 段階5の受け入れテストは、まさにこの2つが**別の値になること**を確かめる
 /// ——同じ値にすると「常に拒否する」実装でも合格してしまう（`B-35`: 禁止側だけを測らない）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DenyReason {
     /// 接続元PIDがProcess Tableに無い（§12の既定拒否）。
     ///
@@ -446,26 +543,59 @@ pub enum DenyReason {
     /// 接続元PIDは台帳に在るが、保持しているプロセスハンドルが終了済みだった
     /// ＝**PIDの再利用**（§12「PID再利用への対処」）。
     PidReused,
-    /// 台帳には在るが、遷移ポリシーがまだ実装されていない。
+    /// [段階6b] **遷移ポリシーが断った。** 判定器の答えをそのまま運ぶ。
     ///
-    /// **段階Eでポリシー評価が入るまでの既定である。** fail-closedの側へ倒してある。
+    /// **ここで語彙を作り直さない**（`B-13`）——判定器が理由を1つ増やしたとき、
+    /// 電文側の写しだけが古くなる形を作らないためである。
     ///
-    /// **この状態が、生成禁止を製品の既定へ入れられない理由そのものである**——
-    /// 取り上げたうえで答えが常にこれだと、サンドボックスの中で外部プログラムが
-    /// 1つも起動できなくなる。**機構は段階⑤で作ってあり、既定へ入れるのが段階Eの後**という
-    /// 2軸である（[`ChildProcessPolicy`]のdoc・`docs/guide/11a-mac-enforcement-map.md`§2）。
-    PolicyNotImplemented,
+    /// # なぜ`Transition(..)`（newtype）ではなく名前付きの欄なのか
+    ///
+    /// **どちらのenumも`kind`というタグ名を使っているためである。** newtypeにすると
+    /// serdeは内側の構造を平らに書き出すので、`{"kind":"transition","kind":"..."}`という
+    /// **`kind`が2つあるJSON**になる。書き出しはエラーにならず、読み戻しで片方が消える
+    /// ——2026-09-12に実際にこの形で作ってしまい、`run_shell`のE2Eが拾った。
+    /// 欄に名前を付けると`{"kind":"transition","denial":{"kind":"..."}}`と入れ子になる。
+    Transition {
+        denial: harness_policy::transition::TransitionDenial,
+    },
+    /// [段階6b・**暫定**] 辺は許可だが、**遷移先ドメインの実体を用意できない**。
+    ///
+    /// # なぜ許可なのに断るのか
+    ///
+    /// ドメインのセキュリティコンテキストは`(package SID, capability SIDの組)`である
+    /// （[§22.1](../../../../plans/DESIGN-MAC-DOMAIN.md)）。今日プロファイルを作る機構は
+    /// **セッション単位**（`session_profile`）と**MCPサーバ単位**（`mcp_profile`）の2つだけで、
+    /// **ドメインを鍵にした発行器は無い**（`plans/DESIGN-MAC-BROKER.md` §22.9が
+    /// 7つの配線点を挙げている作業）。
+    ///
+    /// **呼び出し元のcapabilityのまま名前だけ遷移先にする、という逃げ方は採らない。**
+    /// 宣言では狭めたつもりの遷移が1ビットも狭まらず、しかもその食い違いは症状として出ない。
+    ///
+    /// # 外すときにやること（**この暫定を消し忘れないために書いてある**）
+    ///
+    /// §22.9のドメイン単位プロファイル発行器が着地したら、**この変種ごと消す**のが
+    /// 正しい畳み方である。`server.rs`の`spawn_nested`で「遷移先が呼び出し元と同じか」を
+    /// 見ている分岐と、`spawnd/wire_tests.rs`の
+    /// `a_cross_domain_transition_is_refused_until_per_domain_profiles_exist`も一緒に消える
+    /// ——**あのテストは、この暫定が残っていることを固定するためだけに在る。**
+    TargetDomainNotProvisioned {
+        /// 辺が指していた遷移先ドメイン名。
+        to: String,
+    },
     /// 電文が壊れている・長すぎる・接続元がAppContainerの外だった。
     MalformedRequest,
 }
 
 impl DenyReason {
     /// 診断用の短い説明。**ユーザーへ出す文面ではない**（画面の文言は呼び出し側が持つ）。
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             DenyReason::NotRegistered => "caller pid is not in the process table",
             DenyReason::PidReused => "caller pid was reused by another process",
-            DenyReason::PolicyNotImplemented => "transition policy is not implemented yet",
+            DenyReason::Transition { denial } => denial.as_str(),
+            DenyReason::TargetDomainNotProvisioned { .. } => {
+                "the target domain has no security context yet (per-domain profiles are not implemented)"
+            }
             DenyReason::MalformedRequest => "malformed request",
         }
     }

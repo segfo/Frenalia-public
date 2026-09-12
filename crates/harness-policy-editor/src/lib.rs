@@ -100,7 +100,12 @@ pub mod exclusion;
 /// パス2の実行前に「そのコマンドの実行ファイルへ届くか」を測る（純粋関数、警告のみ）。
 pub mod exec_reach;
 pub mod net_aggregate;
-pub mod policy_file;
+/// `policy.json`の型と読み書き。**実体は[`harness_policy::policy_file`]へ移した**
+/// （2026-09-12、段階6b）——`harness.exe`とSpawn Daemonも同じ`load`を通す必要が生じ、
+/// このクレートは`harness-sandbox`に依存しているのであちら側から見えないためである。
+/// **ここに再公開を残すのは、既存の呼び出し25箇所の綴りを変えないためだけ**であって、
+/// 2つ目の実装ではない（`docs/CODE-STRUCTURE-RULES.md`規則5.0）。
+pub use harness_policy::policy_file;
 pub mod session_dir;
 pub mod session_lock;
 pub mod shell_output;

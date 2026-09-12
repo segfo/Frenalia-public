@@ -213,8 +213,15 @@ impl std::fmt::Debug for SharedSpawnDaemon {
 impl SharedSpawnDaemon {
     /// `child_process_policy`は**呼び出し元が必ず選ぶ**（[`ChildProcessPolicy`]のdoc）。
     /// 製品のホスト2つ（harness本体・ポリシーエディタ）は`Unrestricted`である。
-    pub fn start(child_process_policy: ChildProcessPolicy) -> Result<Self, SpawnDaemonError> {
-        let handle = SpawnDaemonHandle::start(child_process_policy)?;
+    ///
+    /// [段階6b] `policy`も**呼び出し元が必ず渡す**。既定を持たせないのは、
+    /// 渡し忘れた経路のDaemonが**宣言を1本も持たないまま立ち上がり、
+    /// 宣言してある遷移まで拒否する**ためである（`plans/DESIGN-MAC-PROTOCOL.md` §12.1）。
+    pub fn start(
+        policy: super::TransitionPolicy,
+        child_process_policy: ChildProcessPolicy,
+    ) -> Result<Self, SpawnDaemonError> {
+        let handle = SpawnDaemonHandle::start(policy, child_process_policy)?;
         let request_pipe: Arc<str> = Arc::from(handle.request_pipe().to_string());
         let daemon_pid = handle.daemon_pid();
         Ok(Self {
@@ -302,7 +309,16 @@ impl SpawnDaemonHandle {
     /// （[`ChildProcessPolicy`]のdoc）。既定値を持つ`start()`を残すと、
     /// **将来Tier2aの全spawnへ常時積むと決めた日に、既定値を掴んでいる経路だけが
     /// 取り残される**——段階5bで`RedirectorInject::default()`を製品から消したのと同じ形である。
-    pub fn start(child_process_policy: ChildProcessPolicy) -> Result<Self, SpawnDaemonError> {
+    ///
+    /// # [段階6b] `policy`も同じ理由で引数である
+    ///
+    /// 既定を持たせると、渡し忘れた経路のDaemonが**宣言を1本も持たないまま立ち上がる**。
+    /// 倒れる向きは拒否（fail-closed）だが、症状は「宣言してあるのに拒否される」なので、
+    /// 原因が渡し忘れであることは画面からは分からない。
+    pub fn start(
+        policy: super::TransitionPolicy,
+        child_process_policy: ChildProcessPolicy,
+    ) -> Result<Self, SpawnDaemonError> {
         let pipe_name = unique_pipe_name("spawnd-control");
         let sid = current_user_sid_string().map_err(|e| err(format!("current_user_sid: {e}")))?;
         // **制御パイプはユーザーSID専有のまま**（§10.1）。ここへ到達できるのがharnessだけ
@@ -351,11 +367,11 @@ impl SpawnDaemonHandle {
             daemon_pid: 0,
             stopped: false,
         };
-        handle.handshake()?;
+        handle.handshake(policy)?;
         Ok(handle)
     }
 
-    fn handshake(&mut self) -> Result<(), SpawnDaemonError> {
+    fn handshake(&mut self, policy: super::TransitionPolicy) -> Result<(), SpawnDaemonError> {
         connect_with_timeout(self.control, ACCEPT_TIMEOUT).map_err(|e| err(e.into_message()))?;
 
         // **`PROCESS_DUP_HANDLE`だけに絞って渡す。** Daemonがこれでできるのは
@@ -377,6 +393,10 @@ impl SpawnDaemonHandle {
         self.send(&ControlRequest::Hello {
             harness_process: for_daemon.0 as u64,
             protocol_version: PROTOCOL_VERSION,
+            // [段階6b] **宣言はここで1回だけ渡す。** Daemonはこれを受け取ってから
+            // 要求受付パイプの受付を始めるので、宣言を持たないまま要求を捌く瞬間が無い。
+            policy: Box::new(policy.policy),
+            workspace_root: policy.workspace_root,
         })?;
         match self.receive()? {
             ControlResponse::Ready {

@@ -615,7 +615,7 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
         ],
     ),
     // T2の対の片側: **ポリシーエディタのパス2の子は要求受付パイプへ届き、
-    // `policy_not_implemented`で断られる**。`e2e-policy-editor-pass2`へ混ぜないのは
+    // `unknown_source_domain`で断られる**。`e2e-policy-editor-pass2`へ混ぜないのは
     // `e2e-policy-editor-exec-ace`と同じ理由で、**1要素＝1測定**にするため
     // ——あちらの3本は外部到達性を要するので、所要時間がそちらに引きずられる。
     // フィルタ文字列はテスト関数名と一致していなければならない（0件マッチを

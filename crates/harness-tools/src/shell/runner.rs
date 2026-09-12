@@ -239,6 +239,10 @@ async fn run_windows_tier2a(
         cow_diff_layer_dir: cow_diff_layer_dir.map(|p| p.to_path_buf()),
         granted_passthrough: granted_passthrough.to_vec(),
         net_capability,
+        // [段階6b] `run_shell`が起こすシェルは**入口ドメイン**に居る
+        // （`plans/DESIGN-MAC-PROTOCOL.md` §12.1の表）。ここが固定名であること自体は暫定で、
+        // 可変化するときの条件は`ENTRY_DOMAIN`のdocが持つ。
+        policy_domain: harness_policy::policy_file::ENTRY_DOMAIN.to_string(),
     };
 
     // [BUG-082フォローアップ] `spawn_shell_in_workspace`は内部で`grant_job::wait_until_done`

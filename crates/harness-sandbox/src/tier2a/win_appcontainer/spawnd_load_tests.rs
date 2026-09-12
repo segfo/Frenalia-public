@@ -298,7 +298,7 @@ fn assert_measurement_is_valid(lanes: usize, attempts: &[Attempt]) {
             .and_then(|v| v.get("reason").and_then(|r| r.as_str().map(str::to_string)));
         assert_eq!(
             reason.as_deref(),
-            Some("policy_not_implemented"),
+            Some("unknown_source_domain"),
             "N={lanes} lane={} の試行{}が想定外の応答を受けた: {:?}。\
              `not_registered`なら、台帳に載っていない子から測っている（測っているのは混雑ではない）",
             a.lane,
@@ -327,7 +327,10 @@ fn request_pipe_congestion_by_concurrency() {
     let spawn_cap = spawn_request_capability_sid().expect("spawn request capability");
 
     // **製品と同じ共有接続**を使う（排他は`SharedSpawnDaemon`の側にある）。
-    let shared = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted).expect("a shared spawn daemon must start");
+    let shared = SharedSpawnDaemon::start(
+        crate::tier2a::spawnd::TransitionPolicy::empty(""),
+        ChildProcessPolicy::Unrestricted,
+    ).expect("a shared spawn daemon must start");
     eprintln!(
         "[congestion] daemon pid={} request_pipe={} rounds={ROUNDS} repeat/lane={REPEAT_PER_LANE}",
         shared.daemon_pid(),

@@ -52,7 +52,32 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         // （段階E）が無い今はDaemonの答えが常に「未実装なので断る」になり、
         // サンドボックスの中で外部プログラムが1つも起動できなくなる。
         // 常時適用へ切り替えるのは段階Eが着地してからで、そのときはこの引数ごと消す。
+        // [段階6b] **遷移の宣言はharnessが読んでDaemonへ渡す**
+        // （`plans/DESIGN-MAC-PROTOCOL.md` §12.1）。**この経路が`policy.json`を読むのは
+        // ここが初めてである**——使うのは`process`（遷移の宣言）だけで、`fs`/`net`は
+        // 従来どおりharness本体の設定経路に関与しない（`policy_file`のモジュールdoc）。
+        //
+        // **読めなければTier2aセッションを始めない。** 宣言を持たないDaemonを起こすと、
+        // 宣言してある遷移まで拒否される。倒れる向きは同じ「拒否」でも、
+        // 原因が読み取り失敗であることは画面から分からない（`B-10`）。
+        let transition_policy = match harness_policy::policy_file::load(&workspace_root) {
+            Ok(policy) => harness_sandbox::tier2a::spawnd::TransitionPolicy {
+                policy,
+                workspace_root: workspace_root.to_string_lossy().into_owned(),
+            },
+            Err(error) => {
+                eprintln!("error: could not read the transition policy: {error}");
+                let outcome = harness_sandbox::tier2a::session_profile::end_session(
+                    &harness_sandbox::tier2a::win_appcontainer::revoke_session_grant,
+                );
+                if let Some(summary) = outcome.summary() {
+                    eprintln!("note: {summary}");
+                }
+                return ExitCode::FAILURE;
+            }
+        };
         match harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
+            transition_policy,
             harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
         ) {
             Ok(daemon) => {

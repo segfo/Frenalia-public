@@ -111,7 +111,7 @@ pub enum McpWorkspaceAccess {
 /// | | 今日（段階⑤の前） | `CHILD_PROCESS_RESTRICTED`適用後 |
 /// |---|---|---|
 /// | `Deny` | spawn要求用capabilityを積まない＝Spawn Daemonの要求受付パイプへ**到達できない**。ただしOSの緩和策をまだ積んでいないので、**サーバ自身は直接子を生める** | 加えてOSが子プロセス生成そのものを拒否する（二重のdeny） |
-/// | `Broker` | capabilityを積むので窓口へ**届く**。ただし遷移ポリシーの評価が未実装（段階E）なので、答えは常に`policy_not_implemented`である | Daemon経由の遷移としてポリシーが判定する |
+/// | `Broker` | capabilityを積むので窓口へ**届く**。ただし遷移ポリシーの評価が未実装（段階E）なので、答えは常に`unknown_source_domain`である | Daemon経由の遷移としてポリシーが判定する |
 ///
 /// **「宣言したから今日から窓口経由になる」ではない。** いま`Broker`が変えるのは
 /// 「窓口に話しかけられるか」だけで、子プロセスの作られ方は変わらない。

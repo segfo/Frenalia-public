@@ -977,6 +977,7 @@ mod tests {
         let mut ctx = ToolCtx::new(dir.path().to_path_buf());
         ctx.shell_tier = selection;
         let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
+            harness_sandbox::tier2a::spawnd::TransitionPolicy::empty(""),
             harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
         )
             .expect("Tier2a product path requires a Spawn Daemon");
@@ -1060,9 +1061,9 @@ mod tests {
         // `DomainSpec`をテストが手で組む**ので、`run_shell`のアダプタが本当に
         // spawn要求用capabilityを積んでいるかは測れない。ここが製品側の対である。
         //
-        // 見るのは**断る理由**である。`policy_not_implemented`なら
-        // 「あなたが誰かは分かった（Process Tableに載っている）が、遷移を許すかを
-        // 判定する仕組みがまだ無い」で、`not_registered`なら登録が効いていない（BUG-116の形）。
+        // 見るのは**断る理由**である。`unknown_source_domain`なら
+        // 「あなたが誰かは分かった（Process Tableに載っている）が、そのドメインは
+        // `policy.json`に宣言されていない」で（このテストは宣言を書かない）、`not_registered`なら登録が効いていない（BUG-116の形）。
         // **同じ値へ丸めると、常に拒否する実装でも通る**（`B-35`）。
         //
         // **同じ綴りが`crates/harness-policy-editor/tests/record_net_e2e.rs`の
@@ -1097,9 +1098,13 @@ Write-Output ('REPLY:' + [Text.Encoding]::UTF8.GetString($buf, 0, $got))
              Daemon経由になっていないか、環境変数の受け渡しが落ちている: {}",
             out.content
         );
+        // [段階6b] 期待する理由が「ポリシー未実装」から変わった。**測っている事実は
+        // 同じである**——「窓口まで届いたか」であって、「何が許可されるか」ではない。
+        // このDaemonは宣言を1本も持たずに起きている（このテストは`policy.json`を書かない）ので、
+        // 遷移元ドメインがグラフに無い＝`unknown_source_domain`が正しい答えになる。
         assert!(
-            out.content.contains("policy_not_implemented"),
-            "run_shellの子が要求受付パイプで `policy_not_implemented` を受け取れていない。\
+            out.content.contains("unknown_source_domain"),
+            "run_shellの子が要求受付パイプで `unknown_source_domain` を受け取れていない。\
              `not_registered` なら Process Table への登録が Resume より前に効いていない（BUG-116の形）、\
              接続自体が失敗しているなら spawn要求用capability を積んでいない: {}",
             out.content
@@ -1152,6 +1157,7 @@ Write-Output ('REPLY:' + [Text.Encoding]::UTF8.GetString($buf, 0, $got))
             allow_apps: vec!["powershell".to_string(), "pwsh".to_string()],
         };
         let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
+            harness_sandbox::tier2a::spawnd::TransitionPolicy::empty(""),
             harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
         )
             .expect("Tier2a product path requires a Spawn Daemon");

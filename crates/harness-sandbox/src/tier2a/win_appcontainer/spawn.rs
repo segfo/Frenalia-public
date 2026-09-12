@@ -677,10 +677,44 @@ fn domain_dacl_sddl(
     Ok(format!("D:(A;;GA;;;{user})(A;;GA;;;{domain_sid})"))
 }
 
+/// 実行ファイルと引数から`CreateProcessW`の`lpCommandLine`を組む。**唯一の組み立て点。**
+///
+/// # なぜ関数として切り出してあるのか
+///
+/// [§8.2](../../../../plans/DESIGN-MAC-ENFORCEMENT.md)が、遷移の判定に使う文字列と
+/// 実際に起こす文字列を**同一の値**にすることを要求している。組み立てが2箇所にあると、
+/// 「同じ規則だから同じ結果になるはず」という形になり、同節が名指しで足りないと言っている
+/// 状態そのものになる。**Spawn Daemonは、この関数で1回組んだ値を判定にも生成にも渡す。**
+///
+/// # 引用の規則
+///
+/// 実行ファイルと各引数を`"`で囲み、引数の中の`"`は`\"`へ逃がす。
+/// **`CreateProcessW`の`lpApplicationName`は`None`である**ので、実行ファイル名は
+/// このコマンドラインの先頭トークンとして解釈される——空白を含むパスのために囲みは必須である。
+pub(crate) fn command_line_for(exe: &str, args: &[&str]) -> String {
+    let mut cmdline = format!("\"{exe}\"");
+    for a in args {
+        cmdline.push(' ');
+        cmdline.push('"');
+        cmdline.push_str(&a.replace('"', "\\\""));
+        cmdline.push('"');
+    }
+    cmdline
+}
+
 /// [`create_suspended_in_job`]への入力。引数が多いので構造体で受ける。
 pub(crate) struct SuspendedSpawn<'a> {
-    pub exe: &'a str,
-    pub args: &'a [&'a str],
+    /// `CreateProcessW`の`lpCommandLine`へそのまま渡す文字列。
+    ///
+    /// # なぜ`exe`と`args`ではないのか（2026-09-12、段階6b）
+    ///
+    /// [§8.2](../../../../plans/DESIGN-MAC-ENFORCEMENT.md)が
+    /// **「遷移の判定に使った文字列と`CreateProcess`へ渡す文字列は同一でなければならない」**と
+    /// 定めている。ここが`exe`＋`args`を受けて中で組み立てる形だと、判定側も同じ規則で
+    /// 組み立てることになり、**「同じ規則で組めば同じ結果になる」では足りない**という
+    /// 同節の但し書きにそのまま当たる。**組むのは[`command_line_for`]1箇所にして、
+    /// できた値を判定と生成の両方へ渡す。**
+    pub command_line: &'a str,
     pub cwd: &'a Path,
     /// `CREATE_UNICODE_ENVIRONMENT`用に組み立て済みの環境ブロック
     /// （`win_common::build_env_block`が作る）。**呼び出し側が組む**——CoWは
@@ -745,14 +779,7 @@ pub(crate) fn create_suspended_in_job(
         AppContainerError::Win32(format!("{label}: {e}"))
     };
 
-    let mut cmdline = format!("\"{}\"", request.exe);
-    for a in request.args {
-        cmdline.push(' ');
-        cmdline.push('"');
-        cmdline.push_str(&a.replace('"', "\\\""));
-        cmdline.push('"');
-    }
-    let mut cmdline_w = wide(&cmdline);
+    let mut cmdline_w = wide(request.command_line);
     let cwd_w = wide(&request.cwd.to_string_lossy());
 
     let mut capabilities_buf = request.capabilities.to_vec();
@@ -1121,7 +1148,7 @@ pub(crate) const INTERNET_CLIENT_SID: &str = "S-1-15-3-1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnRequestAccess {
     /// 要求受付パイプへ到達できる。段階Eのポリシー評価が入るまでは、届いても
-    /// `policy_not_implemented`で断られる（`spawnd::DenyReason`）。
+    /// `unknown_source_domain`で断られる（`spawnd::DenyReason`）。
     Grant,
     /// 積まない。**パイプへ到達すらできない**——§22.2.2の`process: deny`が
     /// 「ポリシーで断る」の手前に置く二重目のdenyがこれである。
@@ -1387,12 +1414,21 @@ impl Drop for DaemonSpawnHandles {
 
 /// Job・stdioをharness側で所有したまま、トップレベル生成だけを共有Daemonへ委譲する。
 ///
-/// `spawn_request`と`console`は**呼び出し側が必ず選ぶ**
-/// （[`SpawnRequestAccess`]・[`ConsoleNeed`]のdoc。どちらも既定値を持たない）。
+/// `spawn_request`・`console`・`policy_domain`は**呼び出し側が必ず選ぶ**
+/// （[`SpawnRequestAccess`]・[`ConsoleNeed`]・[`crate::tier2a::spawnd::DomainSpec::policy_domain`]の
+/// doc。いずれも既定値を持たない）。
+///
+/// # `domain_name`と`policy_domain`は別物である（2026-09-12、段階6b）
+///
+/// 前者はAppContainerプロファイル名／MCPの宣言idで、**記録と診断のためだけ**に使う。
+/// 後者は**遷移の判定における遷移元ドメイン名**で、`policy.json`の`domains[].name`と
+/// 一致しなければならない。プロファイル名はセッションごとに変わるので、
+/// 混ぜると宣言と一致しなくなる。
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_with_workspace_via_daemon<'a>(
     daemon: &crate::tier2a::spawnd::SharedSpawnDaemon,
     domain_name: &str,
+    policy_domain: &str,
     exe: &str,
     args: &[&str],
     cwd: &Path,
@@ -1528,6 +1564,7 @@ pub fn spawn_with_workspace_via_daemon<'a>(
         env: &daemon_env,
         domain: DomainSpec {
             name: domain_name.to_string(),
+            policy_domain: policy_domain.to_string(),
             container_sid: container_sid_string,
             capability_sids,
             identity,
@@ -1563,6 +1600,7 @@ pub fn spawn_with_workspace_via_daemon<'a>(
 pub fn spawn_via_daemon<'a>(
     daemon: &crate::tier2a::spawnd::SharedSpawnDaemon,
     domain_name: &str,
+    policy_domain: &str,
     exe: &str,
     args: &[&str],
     cwd: &Path,
@@ -1578,6 +1616,7 @@ pub fn spawn_via_daemon<'a>(
     spawn_with_workspace_via_daemon(
         daemon,
         domain_name,
+        policy_domain,
         exe,
         args,
         cwd,
@@ -1681,9 +1720,9 @@ fn spawn_impl(
     // 「一時停止で起こす → Jobへ入れる → トークンの既定DACLを差し替える」までは
     // [`create_suspended_in_job`]が行う（Spawn Daemonと共有する本体。同関数のdoc）。
     // **`inherit_handles`に載せたハンドルは、成否によらずあちらが閉じる。**
+    let command_line = command_line_for(exe, args);
     let spawned = create_suspended_in_job(SuspendedSpawn {
-        exe,
-        args,
+        command_line: &command_line,
         cwd,
         env_block: &mut env_block,
         container_sid,

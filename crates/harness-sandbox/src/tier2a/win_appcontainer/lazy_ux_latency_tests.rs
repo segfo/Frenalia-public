@@ -382,6 +382,7 @@ fn measure_once(tree: &TreeComposition, arm: Arm, repetition: usize, order: usiz
         cow_diff_layer_dir: None,
         granted_passthrough: Vec::new(),
         net_capability: NetworkCapability::Deny,
+        policy_domain: harness_policy::policy_file::ENTRY_DOMAIN.to_string(),
     };
     let spawned = spawn_shell_in_workspace(request);
     let spawn_ms = t0.elapsed().as_millis();

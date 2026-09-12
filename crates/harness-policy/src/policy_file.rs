@@ -14,9 +14,10 @@
 //!   ＞ユーザー）のうち残り2つは未実装。
 //! - 決定6の後半「settings.jsonの`fs.*`をここへ**移設**しsettings.json側からは撤去する」は
 //!   **未実施**。harness本体の設定読取経路を変える話なので別件で、現状は**併存**している
-//!   （このファイルはharness.exeからは読まれない）。
+//!   （**`fs.*`と`net.*`はharness.exeからは読まれない**。段階6bで`harness.exe`が
+//!   このファイルを読むようになったが、それが使うのは`process`——遷移の宣言だけである）。
 //! - 同名ドメインへの承認は**和集合マージ**（[`PolicyFile::merge_approved`]）。
-//!   **取り消しは[`crate::unapprove`]が持つ**（宣言画面`F4`とCLIの`unapprove`）。
+//!   **取り消しは`harness_policy_editor::unapprove`が持つ**（宣言画面`F4`とCLIの`unapprove`）。
 //!   かつてここには「追記のみ。削除の操作は無い（手で編集する）。中途半端な削除UIは
 //!   付与の対（撤収）にならない」と書いてあったが、**その判断は撤回した**——理由は
 //!   「付与の対」が何なのかが実測で分かったことである。ACEが付くのはパス2の開始時で、
@@ -26,7 +27,7 @@
 //!
 //! # 値の意味は「著者支援」であって実行時マッチャではない（決定2）
 //!
-//! ここに入るのは`harness_policy::generalize`が出した設定値の綴り（`C:\...\**`等）そのままで、
+//! ここに入るのは`crate::generalize`が出した設定値の綴り（`C:\...\**`等）そのままで、
 //! 実行時にこのパターンでアクセスを判定する機構は無い。**強制するのは常にOS ACL**である
 //! ——パス2（`record_net`）がこの値を`FsPassthrough`へ変換し、`preflight`が実際にACEを付ける。
 //!
@@ -40,12 +41,36 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use harness_policy::transition::{self, DomainView, GraphInput, TransitionRules};
-use harness_policy::{generalize::SettingsKey, RuleProposal};
+use crate::transition::{self, DomainView, GraphInput, TransitionRules};
+use crate::{generalize::SettingsKey, RuleProposal};
 use serde::{Deserialize, Serialize};
 
 /// ワークスペーススコープの置き場（`<workspace>/.harness/policy.json`）。
 pub const POLICY_FILE_NAME: &str = "policy.json";
+
+/// `harness.exe`が起こすTier2aのシェルが居るドメインの名前（**入口ドメイン**）。
+///
+/// # なぜ固定名なのか
+///
+/// 遷移の判定は「呼び出し元がどのドメインに居るか」を名前で引く（[`transition::SpawnAttempt`]の
+/// `from_domain`）。`run_shell`のシェルには宣言由来の名前が無いので、ここで1つ決めておかないと
+/// **`policy.json`に辺を1本も書けない**。ワークスペースごとに変えないのは、このファイル自体が
+/// そのワークスペースの`.harness/`配下にあり、ファイルが違えば宣言も既に別だからである
+/// ——名前を実行時に変えると、宣言を書く人が自分のワークスペースの綴りを先に調べる羽目になる。
+///
+/// # これは暫定である（2026-09-12、段階6b。ユーザー判断）
+///
+/// **可変にできない理由があるわけではない。** 必要が出たら設定・CLIフラグで指定できるように
+/// してよい。ただしそのときは**既定値を持たせず必ず選ばせる**こと
+/// （`ConsoleNeed`・`DomainIdentity`と同じ姿勢）——指定を渡さない呼び出し経路が生まれると
+/// **そこだけ黙って別ドメイン扱いになり**、症状は「なぜか拒否される」としてしか出ない。
+/// 正本は`plans/DESIGN-MAC-TRANSITION-POLICY.md` §19.3.14の「入口ドメインの名前は固定名1つである」。
+///
+/// # 由来が違う2つの名前と混ぜないこと
+///
+/// ポリシーエディタのパス2は**記録中のドメイン名**、MCPサーバは**宣言id**を使う
+/// （`plans/DESIGN-MAC-PROTOCOL.md` §12.1の表）。入口ドメインが固定なのは`run_shell`経路だけである。
+pub const ENTRY_DOMAIN: &str = "workspace-shell";
 
 /// 読む側が想定外の形を黙って解釈しないために持つ。
 ///
@@ -101,7 +126,7 @@ pub enum PolicyFileError {
     RejectedTransitions { path: PathBuf, reason: String },
 }
 
-/// ドメイン1件のFSルール。キーは`harness_policy::SettingsKey`と1:1で対応させる
+/// ドメイン1件のFSルール。キーは`crate::SettingsKey`と1:1で対応させる
 /// （新しい語彙を作らない——提案からの振り分けを機械的にするため）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsRules {
@@ -180,7 +205,7 @@ pub struct PolicyDomain {
     /// **由来の記録**で、実行時マッチャではない（`plans/DESIGN-MAC.md` §4・§5.1(8)が
     /// 流用しないと明記している）。こちらは**判定に使う**。
     ///
-    /// 形と判定規則の正本は[`harness_policy::transition`]で、**このファイルは持たない**。
+    /// 形と判定規則の正本は[`crate::transition`]で、**このファイルは持たない**。
     #[serde(default, skip_serializing_if = "TransitionRules::is_empty")]
     pub process: TransitionRules,
     #[serde(default)]
@@ -240,13 +265,13 @@ impl PolicyDomain {
     /// **兄弟の`C:/x/z`の許可も一緒に消える**。外したときに消えるものが行の見た目と一致しない。
     /// そこでこの関係は「注記」として出すだけにし、取り消しは宣言そのものの行で行わせる。
     ///
-    /// 覆うかどうかの規則は[`harness_policy::insufficient::covers`]が唯一の正本である（B-05）。
+    /// 覆うかどうかの規則は[`crate::insufficient::covers`]が唯一の正本である（B-05）。
     pub fn covering_fs_declaration(&self, value: &str) -> Option<(SettingsKey, String)> {
         self.fs
             .entries()
             .into_iter()
             .filter(|(declared, _)| !declared.eq_ignore_ascii_case(value))
-            .find(|(declared, _)| harness_policy::insufficient::covers(declared, value))
+            .find(|(declared, _)| crate::insufficient::covers(declared, value))
             .map(|(declared, access)| (SettingsKey::from_access(access), declared.to_string()))
     }
 }

@@ -29,7 +29,7 @@
 //!
 //! - **`CHILD_PROCESS_RESTRICTED`下での挙動**。積むのは段階⑤。いまの`deny`は
 //!   「窓口へ到達できない」だけで、**サーバ自身が直接子を作ることは止めていない**
-//! - **`broker`が実際に子を作れること**。窓口の答えは常に`policy_not_implemented`である
+//! - **`broker`が実際に子を作れること**。窓口の答えは常に`unknown_source_domain`である
 //!   （遷移ポリシーの評価は段階E）。ここで測れるのは**宣言で窓口への到達が切り替わること**まで
 //! - **Redirector DLLが実際に載ったこと**。注入の成否は`spawn_via_daemon`が
 //!   `RedirectorInjection`として返すので、起動できた時点で「載った」は言えるが、
@@ -203,7 +203,10 @@ fn probe_report_for(process: McpProcessAccess, label: &str) -> serde_json::Value
     // workspaceは使わない（`workspace: None`）が、`prepare`の引数として要る。
     let workspace = tempfile::tempdir().expect("workspace");
 
-    let daemon = SharedSpawnDaemon::start(ChildProcessPolicy::Unrestricted)
+    let daemon = SharedSpawnDaemon::start(
+        harness_sandbox::tier2a::spawnd::TransitionPolicy::empty(""),
+        ChildProcessPolicy::Unrestricted,
+    )
         .expect("the spawn daemon must start");
     eprintln!(
         "[{label}] daemon pid={} request_pipe={}",
@@ -298,8 +301,9 @@ fn an_mcp_server_that_declares_process_deny_cannot_reach_the_request_pipe() {
 ///
 /// # これは「子プロセスを作れる」ことの確認ではない
 ///
-/// 届いた先で返るのは`policy_not_implemented`——「あなたが誰かは分かったが、遷移を
-/// 許すかを判定する仕組みがまだ無い」という断りである（段階E未実装）。**宣言で
+/// 届いた先で返るのは`unknown_source_domain`——「あなたが誰かは分かったが、
+/// そのドメインは`policy.json`に宣言されていない」という断りである
+/// （MCPサーバの遷移元ドメイン名は宣言idで、このテストは宣言を書かない）。**宣言で
 /// 切り替わるのは窓口へ話しかけられるかどうかだけ**で、実際に何かが起こせるように
 /// なったわけではない。
 ///
@@ -324,8 +328,8 @@ fn an_mcp_server_that_declares_process_broker_may_reach_the_request_pipe() {
     // 登録がResumeより後になっている＝別の欠陥である（§12）。
     let reply = report.get("reply").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
-        reply.contains("policy_not_implemented"),
-        "the request pipe answered something other than `policy_not_implemented`. \
+        reply.contains("unknown_source_domain"),
+        "the request pipe answered something other than `unknown_source_domain`. \
          `not_registered` would mean the child was not in the daemon's process table, which is a \
          different defect than the one this test is about: reply={reply:?} report={report}"
     );
