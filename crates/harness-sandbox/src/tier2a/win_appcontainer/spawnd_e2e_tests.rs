@@ -77,6 +77,11 @@ mod child_process_restricted_tests;
 /// 外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
 mod transition_acceptance_tests;
 
+/// [段階6c] 拒否の待ち行列の受け入れ（対で4本）。**同じ理由でここに置いてある**——
+/// 昇格の的`spawn-daemon`のフィルタが`win_appcontainer::spawnd_e2e_tests`なので、
+/// 外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
+mod transition_queue_tests;
+
 /// [段階6b] このファイルのテストが名乗る**遷移元ドメイン名**。
 ///
 /// **`DomainSpec::name`（プロファイル名の側）とわざと別の綴りにしてある。**

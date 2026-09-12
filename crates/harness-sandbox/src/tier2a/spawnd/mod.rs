@@ -42,6 +42,10 @@
 /// 昇格なしで単体テストできる。
 pub mod table;
 
+/// [段階6c] 拒否の待ち行列（`<workspace>/.harness/transitions/`、§10.2）。
+/// [`table`]と同じくWin32を直接は呼ばないので、昇格なしで単体テストできる。
+pub mod transitions;
+
 #[cfg(windows)]
 pub mod client;
 /// [段階⑤] コンソール保持プロセス（§7.1.1・§7.1.2）。Win32のコンソールAPIを直接叩くので
@@ -532,7 +536,12 @@ pub enum SpawnResponse {
 ///
 /// 段階5の受け入れテストは、まさにこの2つが**別の値になること**を確かめる
 /// ——同じ値にすると「常に拒否する」実装でも合格してしまう（`B-35`: 禁止側だけを測らない）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # `Hash`を導出している理由（2026-09-12、段階6c）
+///
+/// 拒否の待ち行列（[`transitions`]）が**種類ごとに1行**へ畳むとき、この値が鍵の一部になる。
+/// 理由を文字列へ潰さないのが引き継ぎの指示であり、`TransitionDenial`側にも同じ導出がある。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DenyReason {
     /// 接続元PIDがProcess Tableに無い（§12の既定拒否）。
@@ -584,6 +593,23 @@ pub enum DenyReason {
     },
     /// 電文が壊れている・長すぎる・接続元がAppContainerの外だった。
     MalformedRequest,
+    /// [段階6c] **辺は許可だったが、起こそうとして失敗した。**
+    ///
+    /// # なぜ[`DenyReason::MalformedRequest`]と分けたのか（2026-09-12）
+    ///
+    /// 6bはこの経路を`MalformedRequest`で返していた。**「宣言が無い」へ丸めるのは避けていた**
+    /// （同経路のコメントがその意図を書いている）が、残ったラベルは
+    /// 「要求元が壊れた電文を送った」という**別の嘘**だった。
+    ///
+    /// 拒否の待ち行列（[`transitions`]）が入った段階6cで、この取り違えは
+    /// **消えずに残る記録**になる——`CreateProcess`が落ちただけの拒否が、
+    /// 待ち行列に「電文が壊れていた」の顔で積み上がる。直し方を探す人が
+    /// 要求元のコードを読みに行くことになるので、分けた。
+    ///
+    /// **失敗の中身は載せない。** どのWin32呼び出しで落ちたかはDaemonのstderrと
+    /// 待ち行列に残す。要求元（サンドボックスの中）へ返すのは「起こせなかった」までで、
+    /// 詳細を返すとパスや構成が漏れる。
+    SpawnFailed,
 }
 
 impl DenyReason {
@@ -597,6 +623,7 @@ impl DenyReason {
                 "the target domain has no security context yet (per-domain profiles are not implemented)"
             }
             DenyReason::MalformedRequest => "malformed request",
+            DenyReason::SpawnFailed => "the transition was allowed but the process could not be started",
         }
     }
 }

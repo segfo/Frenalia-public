@@ -252,3 +252,28 @@ fn the_policy_file_lives_inside_the_control_directory() {
         "policy.json自身が候補として提案されると自己参照ループになる"
     );
 }
+
+/// [段階6c] 拒否の待ち行列も、同じ理由で`.harness`配下に在る（§10.2）。
+///
+/// **パスは導出関数から取る。文字列リテラルで書かない**——リテラルで書くと、
+/// 置き場を`.harness`の外へ動かしてもこのテストだけが緑のまま残り、
+/// **遮断が外れたことに気づけない**。`is_harness_control_path`が見るのは
+/// パス要素`.harness`だけなので、成立条件は「動かさないこと」ただ1つである。
+#[test]
+fn the_transition_denial_queue_lives_inside_the_control_directory() {
+    let p = harness_sandbox::tier2a::spawnd::transitions::pending_path(std::path::Path::new(
+        r"C:\ws",
+    ));
+
+    assert_eq!(
+        p,
+        std::path::Path::new(r"C:\ws")
+            .join(".harness")
+            .join("transitions")
+            .join("pending.jsonl")
+    );
+    assert!(
+        is_harness_control_path(&p.to_string_lossy()),
+        "待ち行列が候補として提案されると、拒否の記録が次の記録の候補になる自己参照ループになる"
+    );
+}

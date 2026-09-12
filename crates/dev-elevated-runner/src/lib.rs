@@ -398,6 +398,28 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "go_no_go_attach_console_restricted_shell_runs",
         ],
     ),
+    // [2026-09-12・段階6c] **テストの`#[ignore]`が名指ししていたのに、この表に無かった。**
+    // `mac_spike_mitigation_etw_tests.rs`は「`dev-elevated-run.exe spike-mac-mitigation-etw`で
+    // 走らせろ」と書いているが、的が無いので**その案内どおりに撃つと存在しない的として弾かれる**。
+    // 実装ではなく案内の側が嘘をついていた形なので、的を足して合わせる。
+    //
+    // 測るのは「生成禁止（`CHILD_PROCESS_RESTRICTED`）でカーネルが止めた生成を、ETWで
+    // 観測できるか」である（`Microsoft-Windows-Security-Mitigations` Id=4）。段階6cで
+    // 待ち行列にカーネル拒否の欄を作ったので、**その欄を実際に埋められることの確かめ先**になる。
+    (
+        "spike-mac-mitigation-etw",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "mac_spike_mitigation_etw_tests",
+        ],
+    ),
     // **MAC §7.1.1の測定4はここに載せない。** 実測（2026-09-05）で昇格を1度も要求せずに
     // 完走したので、素の`cargo test`で回す。昇格して測ると保持プロセスの整合性レベルが
     // 本番（非昇格のDaemonが作る）と変わる＝測る世界が変わる（B-08）。

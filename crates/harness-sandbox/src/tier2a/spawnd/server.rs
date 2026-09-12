@@ -81,6 +81,7 @@ use crate::win_pipe_ipc::{
 
 use super::console_holder::ConsoleHolders;
 use super::table::ProcessTable;
+use super::transitions::TransitionQueue;
 use super::{
     protocol_version_mismatch, ChildHandles, ChildProcessPolicy, ConsoleNeed, ControlRequest,
     ControlResponse, DenyReason, DomainIdentitySpec, DomainSpec, RedirectorSpec, SpawnFailureKind,
@@ -161,6 +162,11 @@ struct Shared {
     /// **生成禁止を積まない構成では1本も起こさない。** コンソールが要るのは
     /// 「生成禁止を積んだシェル」だけで、それ以外は今日どおり`CREATE_NO_WINDOW`で起きる。
     console_holders: ConsoleHolders,
+    /// [段階6c] 拒否の待ち行列（§10.2）。**`Hello`の`workspace_root`から導出する。**
+    ///
+    /// **記録は境界ではない**（`P-07`）。ここへ書けなくても判定と生成は続ける
+    /// ——ただし黙らせはしない（失敗はDaemonのstderrへ出す）。
+    transitions: TransitionQueue,
 }
 
 /// 制御パイプへ接続し、`Shutdown`か切断まで要求を処理し続ける。
@@ -197,7 +203,7 @@ pub fn serve(
     let _control_guard = HandleGuard(control);
 
     // --- ハンドシェイク: harnessのプロセスハンドルと遷移ポリシーを受け取る ---
-    let (harness_process, graph) = match read_control(control)? {
+    let (harness_process, graph, transitions) = match read_control(control)? {
         ControlRequest::Hello {
             harness_process,
             protocol_version,
@@ -220,7 +226,11 @@ pub fn serve(
             let input = policy.transition_graph_input(Some(workspace_root.as_str()));
             let graph = harness_policy::transition::TransitionGraph::build(&input)
                 .map_err(|e| protocol_err(format!("transition policy was rejected: {e}")))?;
-            (HANDLE(harness_process as *mut _), graph)
+            // [段階6c] 拒否の待ち行列も**同じ`workspace_root`から導出する**。
+            // 置き場のパスを電文で受け取らないのは、昇格した書き手が後から来るためである
+            // （§10.2・`P-01`。`client::hello_request`のdocが対になっている）。
+            let transitions = TransitionQueue::new(std::path::Path::new(workspace_root.as_str()));
+            (HANDLE(harness_process as *mut _), graph, transitions)
         }
         other => {
             return Err(err(format!(
@@ -235,6 +245,7 @@ pub fn serve(
         graph,
         child_process_policy,
         console_holders: ConsoleHolders::default(),
+        transitions,
     });
 
     // --- 要求受付パイプを開く（サンドボックスから到達できる唯一の口） ---
@@ -330,6 +341,23 @@ pub fn serve(
     // Jobのkill-on-closeでも畳まれるが、**それは保険であって正面の畳み方ではない**
     // （§10.1.1がキャンセルについて採ったのと同じ形）。
     shared.console_holders.shutdown();
+
+    // [段階6c] **畳み込みバッファに残った回数を書き切る**（§10.2）。
+    //
+    // 1件目はその場で書いてあるので、ここで失うのは**回数だけ**で「その拒否があった」事実は
+    // 既にファイルに在る。それでも書くのは、**畳んだ回数が量の見積りに要る**からである
+    // （どの遷移を先に宣言すべきかは、回数で決まる）。
+    //
+    // **書けなくてもDaemonの終了は成功のままにする。** 記録は境界ではない（`P-07`）。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    match shared.transitions.flush(now) {
+        Ok(0) => {}
+        Ok(written) => eprintln!("[spawnd] transition queue: flushed {written} folded record(s)"),
+        Err(e) => eprintln!("[spawnd] could not flush the transition queue: {e}"),
+    }
     Ok(())
 }
 
@@ -545,19 +573,32 @@ fn serve_request_connection(pipe: HANDLE, shared: &Arc<Shared>) {
         let Ok(bytes) = read_framed_timeout(pipe, IO_TIMEOUT) else {
             return;
         };
-        let response = if bytes.len() > MAX_FRAME_BYTES {
-            SpawnResponse::Denied {
-                reason: DenyReason::MalformedRequest,
-            }
+        let parsed: Result<SpawnRequest, String> = if bytes.len() > MAX_FRAME_BYTES {
+            Err(format!("frame of {} bytes exceeds the limit", bytes.len()))
         } else {
-            match serde_json::from_slice::<SpawnRequest>(&bytes) {
-                // **黙って無視しない**（`B-32`）。無視すると子は返事を待ち続ける。
-                Err(_) => SpawnResponse::Denied {
+            serde_json::from_slice::<SpawnRequest>(&bytes).map_err(|e| e.to_string())
+        };
+        let response = match parsed {
+            // **黙って無視しない**（`B-32`）。無視すると子は返事を待ち続ける。
+            //
+            // [段階6c] **これは待ち行列へ積まない。** 何を起こそうとしたのかが1つも読めて
+            // いないので、積めば`exe`も`argv`も既定値で埋めることになる（`P-11`:
+            // 観測していない項目を既定値で埋めない）。**落としたことを黙らせない**ために
+            // Daemonのstderrへ残す。
+            Err(reason) => {
+                eprintln!("[spawnd] unreadable spawn request from the sandbox: {reason}");
+                SpawnResponse::Denied {
                     reason: DenyReason::MalformedRequest,
-                },
-                Ok(SpawnRequest::Spawn { exe, args, cwd }) => {
-                    serve_spawn_request(pipe, shared, &exe, &args, &cwd)
                 }
+            }
+            Ok(SpawnRequest::Spawn { exe, args, cwd }) => {
+                let served = serve_spawn_request(pipe, shared, &exe, &args, &cwd);
+                // [段階6c] **積むのはここ1箇所だけ。** `serve_spawn_request`の返り道は
+                // 5つあるので、返り道ごとに書くと6つ目が生えた日に片方だけ漏れる（`B-06`）。
+                if let SpawnResponse::Denied { reason } = &served.response {
+                    record_denial(shared, &served, &exe, &cwd, reason);
+                }
+                served.response
             }
         };
         let Ok(bytes) = serde_json::to_vec(&response) else {
@@ -587,16 +628,24 @@ fn serve_spawn_request(
     exe: &str,
     args: &[String],
     cwd: &str,
-) -> SpawnResponse {
-    let caller = match classify_caller(pipe, shared) {
-        Ok(caller) => caller,
-        Err(reason) => return SpawnResponse::Denied { reason },
-    };
-
+) -> Served {
     // §8.2: **評価する文字列と起こす文字列を同一にする。** 同じ規則で2回組むのではなく、
     // 1つの値を両方へ渡す。
+    //
+    // [段階6c] **呼び出し元を確定する前に組む。** 呼び出し元が誰かに依存しない値なので
+    // 順序を変えても§8.2は保たれ、**どの返り道でも待ち行列へ同じ文字列を積める**
+    // ようになる（`Served::command_line`が`Option`にならずに済む）。
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let command_line = command_line_for(exe, &arg_refs);
+
+    let caller = match classify_caller(pipe, shared) {
+        Ok(caller) => caller,
+        Err(reason) => {
+            // ドメインは**観測できていない**（台帳に無い／PIDが再利用された）。
+            // 既定名で埋めない（`P-11`）。
+            return Served::denied(reason, None, command_line);
+        }
+    };
 
     let resolution = shared
         .graph
@@ -606,23 +655,28 @@ fn serve_spawn_request(
             command_line: &command_line,
             cwd,
         });
+    let from_domain = Some(caller.domain.policy_domain.clone());
     let allowed = match resolution {
         harness_policy::transition::Resolution::Allowed(allowed) => allowed,
         harness_policy::transition::Resolution::Denied(denial) => {
-            return SpawnResponse::Denied {
-                reason: DenyReason::Transition { denial },
-            }
+            return Served::denied(
+                DenyReason::Transition { denial },
+                from_domain,
+                command_line,
+            )
         }
     };
 
     // [暫定] 遷移先ドメインの実体（package SIDとcapabilityの組）を作る機構がまだ無い。
     // **同じドメインへの遷移だけを起こす。**
     if allowed.to != caller.domain.policy_domain {
-        return SpawnResponse::Denied {
-            reason: DenyReason::TargetDomainNotProvisioned {
+        return Served::denied(
+            DenyReason::TargetDomainNotProvisioned {
                 to: allowed.to.to_string(),
             },
-        };
+            from_domain,
+            command_line,
+        );
     }
 
     // §8.3: 辺が`cwd`を宣言していれば**その値を渡す**（検査するだけでは足りない）。
@@ -631,15 +685,86 @@ fn serve_spawn_request(
     let env = env_for_nested(&caller.base_env, allowed.env);
 
     match spawn_nested(shared, &caller, &command_line, effective_cwd, env) {
-        Ok(pid) => SpawnResponse::Spawned { pid },
+        Ok(pid) => Served {
+            response: SpawnResponse::Spawned { pid },
+            from_domain,
+            command_line,
+        },
         Err(e) => {
             // **黙って拒否へ丸めない。** 「宣言が無い」と「起こそうとして失敗した」は
             // 別の事実で、混ぜると宣言を直しても直らない拒否が「未宣言」の顔で出る（`B-10`）。
+            //
+            // [段階6c] 理由は[`DenyReason::SpawnFailed`]である。6bはここを
+            // `MalformedRequest`で返していたが、待ち行列が入った以上その嘘は
+            // **消えずに残る記録**になる（同変種のdoc）。
             eprintln!("[spawnd] nested spawn failed for pid {}: {e}", caller.pid);
-            SpawnResponse::Denied {
-                reason: DenyReason::MalformedRequest,
-            }
+            Served::denied(DenyReason::SpawnFailed, from_domain, command_line)
         }
+    }
+}
+
+/// [段階6c] 1件の生成要求について、**応答と、待ち行列へ積むために観測できた事実**。
+///
+/// # なぜ応答だけを返さないのか
+///
+/// 待ち行列へ積むには呼び出し元ドメインと、判定に使ったコマンドラインが要る。これを
+/// 積む側（[`serve_request_connection`]）でもう一度求めると、**判定に使ったのとは別の値**を
+/// 積み得る——2回目の`classify_caller`は同じ答えを返すとは限らず（PIDは再利用される）、
+/// コマンドラインの組み立ても2箇所に分かれる（§8.2が禁じている形）。
+/// **観測した本人が持ち帰る。**
+struct Served {
+    response: SpawnResponse,
+    /// 判定に使った呼び出し元ドメイン（`policy.json`の`domains[].name`）。
+    ///
+    /// **`None`は「観測していない」**——呼び出し元が台帳に無い／PIDが再利用されていた
+    /// ときは、そもそもドメインが決まらない。既定名で埋めない（`P-11`）。
+    from_domain: Option<String>,
+    /// 判定にも生成にも使った、ただ1つのコマンドライン（§8.2）。
+    command_line: String,
+}
+
+impl Served {
+    fn denied(reason: DenyReason, from_domain: Option<String>, command_line: String) -> Self {
+        Self {
+            response: SpawnResponse::Denied { reason },
+            from_domain,
+            command_line,
+        }
+    }
+}
+
+/// [段階6c] 拒否1件を待ち行列へ積む（§10.2）。
+///
+/// # 書けなくても応答を変えない
+///
+/// **記録は境界ではない**（`P-07`）。待ち行列へ書けないことを理由に生成の可否を変えると、
+/// ディスクが一杯になっただけでサンドボックスの挙動が変わる。ただし**黙らせない**
+/// （`B-10`）——失敗はDaemonのstderrへ出す。畳み込みのおかげで追記は回数の対数にしか
+/// ならないので、失敗の報告も同じ回数までしか出ない。
+fn record_denial(
+    shared: &Arc<Shared>,
+    served: &Served,
+    exe: &str,
+    cwd: &str,
+    reason: &DenyReason,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if let Err(e) = shared.transitions.record_daemon_denial(
+        super::transitions::Observation {
+            from_domain: served.from_domain.as_deref(),
+            exe,
+            argv: &served.command_line,
+            // Daemon経由なので**実cwdは観測できている**。カーネル拒否の側との差が
+            // ここに出る（あちらは`None`になる）。
+            cwd: Some(cwd),
+            reason,
+        },
+        now,
+    ) {
+        eprintln!("[spawnd] could not record a denial in the transition queue: {e}");
     }
 }
 

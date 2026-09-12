@@ -299,7 +299,14 @@ pub struct Allowed<'a> {
 /// **これは要求元自身のドメインの辺に書かれた値**なので、他のドメインの宣言は漏れない
 /// ——`policy.json`そのものはサンドボックスから読めない（P-08）が、
 /// 「自分がどう宣言されているか」は、拒否の理由として返らないと直しようがない。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// # `Hash`を導出している理由（2026-09-12、段階6c）
+///
+/// 拒否の待ち行列（`plans/DESIGN-MAC-ENFORCEMENT.md` §10.2）は「拒否1件に1行」ではなく
+/// **種類ごとに1行**へ畳む。その種類の鍵に理由そのものが入るので、理由が
+/// `HashMap`の鍵になれる必要がある。**畳む単位を文字列にしない**のは、
+/// 文字列へ潰した瞬間に「宣言が無いのか、cwdが違うのか」が鍵の中で見分けられなくなり、
+/// 別々の直し方を要する拒否が1行にまとまってしまうからである。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TransitionDenial {
     /// 呼び出し元のドメインがグラフに無い。

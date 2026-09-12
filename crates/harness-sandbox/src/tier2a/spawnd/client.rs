@@ -390,14 +390,7 @@ impl SpawnDaemonHandle {
         }
         .map_err(|e| err(format!("DuplicateHandle(harness process to daemon): {e}")))?;
 
-        self.send(&ControlRequest::Hello {
-            harness_process: for_daemon.0 as u64,
-            protocol_version: PROTOCOL_VERSION,
-            // [段階6b] **宣言はここで1回だけ渡す。** Daemonはこれを受け取ってから
-            // 要求受付パイプの受付を始めるので、宣言を持たないまま要求を捌く瞬間が無い。
-            policy: Box::new(policy.policy),
-            workspace_root: policy.workspace_root,
-        })?;
+        self.send(&hello_request(for_daemon.0 as u64, policy))?;
         match self.receive()? {
             ControlResponse::Ready {
                 request_pipe,
@@ -603,6 +596,81 @@ fn daemon_exe_path() -> Result<PathBuf, SpawnDaemonError> {
          Build it with `cargo build -p harness-spawnd`.",
         path.display()
     )))
+}
+
+/// [段階6b/6c] `Hello`のワイヤ表現を作る。
+///
+/// # なぜ関数にしてあるのか——**待ち行列の先行作成をここに閉じ込めるため**
+///
+/// 拒否の待ち行列（`<workspace>/.harness/transitions/`）は、`workspace_root`を知っている側が
+/// **送る前に**作る。「送る前に作る」を呼び出し各所へ書くと、送信点が2つ目に増えたとき
+/// 片方だけ漏れる——これは`policy_learnd::client`の`start_collect_bytes`が
+/// [BUG-109](../../../../../docs/bugs/BUG-109.md)の修正で採ったのと**同じ形**である。
+///
+/// # なぜ非特権側が先に作るのか
+///
+/// 昇格したプロセスが作ったノードは所有者が`BUILTIN\Administrators`になり、非昇格のharnessは
+/// 以後そのノードのDACLを書けない（継承ACEが与えるのは`Modify`までで`WRITE_DAC`を含まない）。
+/// 置き場は`.harness/`配下＝制御面にあり、`preflight`は起動のたびに`.harness/**`の全ノードへ
+/// 保護DACLを書く。**1ノードでも書けなければTier2aは丸ごとfail-closedで中止する。**
+///
+/// **今日のSpawn Daemonは昇格しない**（[`launch_daemon`]）ので、この事故は今日は起きない。
+/// それでも先に作るのは、§10.2が**昇格したカーネル拒否の購読者**を同じファイルへ追記させると
+/// 決めているからである——その購読者が来る日に思い出す形にしない。
+///
+/// # サンドボックスからは届かない（**2026-09-12に実機で測った**）
+///
+/// ここが作るのは`.harness/transitions/`以下だけである——`.harness/`自体は
+/// `harness-cli`の`stage_open_session`が`stage_prepare_sandbox`（`preflight`を含む）**より前**に
+/// 作るので、保護DACLは必ずこのディレクトリに掛かってから来る。
+///
+/// **その保護済みの`.harness/`から継承するので、AppContainer宛のACEは1つも降りてこない。**
+/// 実測: ワークスペースルートには継承つきのcapability SID宛ACE（`S-1-15-3-…`）が2本載っているが、
+/// `.harness/`は継承を切ってある（`AreAccessRulesProtected=True`）ため、その配下に新しく作った
+/// ディレクトリが継承するのは`SYSTEM`・`Administrators`・ユーザーだけだった。
+///
+/// **成立条件は「`.harness/`が`preflight`の時点で在ること」である。** 無ければ
+/// ここの`create_dir_all`がワークスペースルートから継承して作ってしまい、
+/// **その回だけサンドボックスから待ち行列が書ける**（＝拒否の記録を偽造・消去できる）。
+/// 順序を変えるときはここも見ること。
+///
+/// # 失敗しても止めない
+///
+/// ここで作れないなら購読者も作れない見込みで、その失敗は購読者側の失敗として現れる。
+/// **黙らせはしない**（警告を出す）。
+fn hello_request(harness_process: u64, policy: super::TransitionPolicy) -> ControlRequest {
+    precreate_transition_queue(&policy.workspace_root);
+    ControlRequest::Hello {
+        harness_process,
+        protocol_version: PROTOCOL_VERSION,
+        // [段階6b] **宣言はここで1回だけ渡す。** Daemonはこれを受け取ってから
+        // 要求受付パイプの受付を始めるので、宣言を持たないまま要求を捌く瞬間が無い。
+        policy: Box::new(policy.policy),
+        workspace_root: policy.workspace_root,
+    }
+}
+
+fn precreate_transition_queue(workspace_root: &str) {
+    let path = super::transitions::pending_path(std::path::Path::new(workspace_root));
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        eprintln!(
+            "warning: could not pre-create the transition denial queue {}: {e}. The elevated \
+             kernel-denial subscriber will create it instead once it exists, which leaves it \
+             owned by Administrators and makes the control-plane protection fail on later runs \
+             (see docs/bugs/BUG-109.md)",
+            path.display()
+        );
+    }
 }
 
 /// Daemonを起こす。**昇格しない**——AppContainerの子を起こすのに管理者権限は要らず、

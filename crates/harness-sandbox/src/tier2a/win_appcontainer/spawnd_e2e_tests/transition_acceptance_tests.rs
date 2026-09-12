@@ -42,7 +42,7 @@ use super::*;
 /// `to`は**必ず遷移元と同じドメイン**にしている。別ドメインを指す辺は6bでは起こせないので
 /// （上記の限界）、ここで別ドメインを指すと3本とも「実体が無い」で断られ、
 /// **判定が効いているのかどうかが測れなくなる**。
-fn policy_with_edge(domain: &str, exe: &str) -> PolicyFile {
+pub(super) fn policy_with_edge(domain: &str, exe: &str) -> PolicyFile {
     let mut file = PolicyFile::default();
     let mut entry = PolicyDomain::new(domain);
     entry.process = serde_json::from_value(serde_json::json!({
@@ -56,7 +56,7 @@ fn policy_with_edge(domain: &str, exe: &str) -> PolicyFile {
 }
 
 /// プローブへ渡す1件の生成要求。
-fn request_payload(exe: &str, args: &[&str], cwd: &std::path::Path) -> String {
+pub(super) fn request_payload(exe: &str, args: &[&str], cwd: &std::path::Path) -> String {
     serde_json::to_string(&crate::tier2a::spawnd::SpawnRequest::Spawn {
         exe: exe.to_string(),
         args: args.iter().map(|a| a.to_string()).collect(),
@@ -73,7 +73,7 @@ fn request_payload(exe: &str, args: &[&str], cwd: &std::path::Path) -> String {
 /// Daemonが返す`Spawned`は**起こしたこと**しか意味しない。子が走り終えたかは別の事実で、
 /// そこを待たずにファイルを見ると、実装が正しくても競合で落ちる（`B-30`の逆向き）。
 /// ハンドルで待てないのは、6bの応答がPIDしか返さないためである（`SpawnResponse::Spawned`のdoc）。
-fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
+pub(super) fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() {
@@ -85,7 +85,7 @@ fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
 }
 
 /// 要求受付パイプへ1件投げて、プローブのstdoutを返す。
-fn ask_daemon(case: &Case, profile: &OwnedContainerSid, caps: &[crate::win_common::OwnedSid], payload: &str) -> String {
+pub(super) fn ask_daemon(case: &Case, profile: &OwnedContainerSid, caps: &[crate::win_common::OwnedSid], payload: &str) -> String {
     let daemon = case.daemon.as_ref().expect("case owns the daemon");
     let workspace = case
         .dir
