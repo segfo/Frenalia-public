@@ -4,8 +4,52 @@
 //! `CreateProcessA`は`CreateProcessW`を経由せず直接`CreateProcessInternalW`を呼ぶため
 //! 個別のフックが要る。`WinExec`は生成フラグを呼び出し元へ公開しないため、内部で
 //! `hooked_create_process_a`へ委譲する。
+//!
+//! # [段階6f-2] 自力で子を作れないときは、代わりに**頼む**
+//!
+//! 生成禁止（`CHILD_PROCESS_RESTRICTED`）を積まれていると、上の「自分で起こし直す」は
+//! カーネルに拒否されて終わる。そのときだけ、4本とも[`crate::spawn_broker`]を通って
+//! **Spawn Daemonへの1件の要求**になる。
+//!
+//! | 状態 | 4本のフックがすること |
+//! |---|---|
+//! | 生成禁止を積んでいない（**今日の既定**） | 今までどおり。挙動は1ビットも変わらない |
+//! | 積んでいる | 電文へ組み替えて頼み、返ったハンドルを`PROCESS_INFORMATION`へ詰める |
+//!
+//! **頼んだときは注入も`ResumeThread`もしない**——Daemonが系統と同じRedirectorを入れ、
+//! 一時停止を頼んでいなければ既に動かしている（`server::spawn_nested`）。
+//!
+//! # 判定を4本それぞれに書かない
+//!
+//! 変換は[`brokered`]1箇所に置き、4本はそこを**通るだけ**にする（`B-06`: 決定は経路の
+//! 共通点へ置く）。4本に書くと、1本だけ条件を書き忘れた経路が**静かに自分で起こそうとして
+//! カーネルに拒否される**——症状は「その呼び出し方のときだけ動かない」になる。
 
 use super::*;
+use crate::spawn_broker::{try_broker, CreateCall};
+
+/// `PCWSTR`をRustの文字列へ。`NULL`は`None`。
+unsafe fn wide_arg(value: PCWSTR) -> Option<String> {
+    (!value.is_null()).then(|| unsafe { value.to_string() }.unwrap_or_default())
+}
+
+/// `PWSTR`（書き換え可能な`lpCommandLine`）を読む。`NULL`は`None`。
+unsafe fn wide_arg_mut(value: PWSTR) -> Option<String> {
+    (!value.is_null()).then(|| unsafe { value.to_string() }.unwrap_or_default())
+}
+
+/// `PCSTR`（ANSI）をRustの文字列へ。
+///
+/// **`from_utf8_lossy`で済ませない。** 既定のコードページは環境で違い（日本語環境なら
+/// CP932）、そのまま読むと**パスに含まれる非ASCII文字が化ける**——化けた実行ファイル名は
+/// 解決できず、「宣言していないのに拒否された」に見える。
+unsafe fn ansi_arg(value: PCSTR) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    let bytes = unsafe { value.as_bytes() };
+    Some(crate::spawn_broker::ansi_to_string(bytes))
+}
 
 /// Phase 4a（BUG-041修正）: `CreateProcessW`のフック本体。`dwCreationFlags`にSUSPENDEDを
 /// 強制してからオリジナル関数を呼び、Win32レベルのプロセス生成が完全に終わった後（モジュールdoc
@@ -22,6 +66,22 @@ pub(crate) unsafe extern "system" fn hooked_create_process_w(
     startup_info: *const c_void,
     process_information: *mut c_void,
 ) -> BOOL {
+    if let Some(result) = unsafe {
+        try_broker(
+            &CreateCall {
+                caller: "hooked_create_process_w",
+                application_name: wide_arg(application_name),
+                command_line: wide_arg_mut(command_line),
+                creation_flags,
+                environment,
+                current_directory: wide_arg(current_directory),
+                startup_info,
+            },
+            process_information,
+        )
+    } {
+        return result;
+    }
     let hook = CREATE_PROCESS_W_HOOK.get().expect("hook installed");
     let caller_wanted_suspended = creation_flags & CREATE_SUSPENDED_FLAG != 0;
     let forced_flags = creation_flags | CREATE_SUSPENDED_FLAG;
@@ -67,6 +127,25 @@ pub(crate) unsafe extern "system" fn hooked_create_process_as_user_w(
     startup_info: *const c_void,
     process_information: *mut c_void,
 ) -> BOOL {
+    // [段階6f-2] **`hToken`は運べない**（モジュールdocのlimitation）。Daemonは系統の
+    // ドメインで起こすので、渡されたトークンは落ちる。AppContainerの中で得られるのは
+    // 自分のトークンの複製だけなので、実測（§S1）で起きていた子と同じ文脈にはなる。
+    if let Some(result) = unsafe {
+        try_broker(
+            &CreateCall {
+                caller: "hooked_create_process_as_user_w",
+                application_name: wide_arg(application_name),
+                command_line: wide_arg_mut(command_line),
+                creation_flags,
+                environment,
+                current_directory: wide_arg(current_directory),
+                startup_info,
+            },
+            process_information,
+        )
+    } {
+        return result;
+    }
     let hook = CREATE_PROCESS_AS_USER_W_HOOK.get().expect("hook installed");
     let caller_wanted_suspended = creation_flags & CREATE_SUSPENDED_FLAG != 0;
     let forced_flags = creation_flags | CREATE_SUSPENDED_FLAG;
@@ -114,6 +193,22 @@ pub(crate) unsafe extern "system" fn hooked_create_process_a(
     startup_info: *const c_void,
     process_information: *mut c_void,
 ) -> BOOL {
+    if let Some(result) = unsafe {
+        try_broker(
+            &CreateCall {
+                caller: "hooked_create_process_a",
+                application_name: ansi_arg(application_name),
+                command_line: ansi_arg(PCSTR(command_line.0)),
+                creation_flags,
+                environment,
+                current_directory: ansi_arg(current_directory),
+                startup_info,
+            },
+            process_information,
+        )
+    } {
+        return result;
+    }
     let hook = CREATE_PROCESS_A_HOOK.get().expect("hook installed");
     let caller_wanted_suspended = creation_flags & CREATE_SUSPENDED_FLAG != 0;
     let forced_flags = creation_flags | CREATE_SUSPENDED_FLAG;

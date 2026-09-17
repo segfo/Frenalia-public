@@ -771,18 +771,34 @@ fn via_task_scheduler(_marker_dir: &str) -> Value {
 }
 
 /// 全経路を順に試し、`{"marker_dir", "attempts": [...]}`を返す。
+///
+/// # 1本ごとに標準エラーへ出す（2026-09-17）
+///
+/// 報告は**最後にまとめて**標準出力へ出るので、途中でこのプロセスが落ちると
+/// **何も残らない**——実際に段階6f-2の受け入れで、5本目まで進んだ跡（マーカー）は
+/// 在るのに報告が空、という形で落ちた。`eprintln!`は行ごとに出るので、
+/// **どこまで進んだか**が落ちた後でも読める（`B-10`: 失敗を黙らせない）。
 #[cfg(windows)]
 pub fn run(marker_dir: &str) -> Value {
-    let attempts = vec![
-        via_create_process_w(marker_dir),
-        via_create_process_a(marker_dir),
-        via_win_exec(marker_dir),
-        via_create_process_as_user_w(marker_dir),
-        via_shell_execute_ex_w(marker_dir),
-        via_nt_create_user_process(marker_dir),
-        via_wmi(marker_dir),
-        via_task_scheduler(marker_dir),
-    ];
+    let mut attempts = Vec::new();
+    for (index, attempt) in [
+        via_create_process_w as fn(&str) -> Value,
+        via_create_process_a,
+        via_win_exec,
+        via_create_process_as_user_w,
+        via_shell_execute_ex_w,
+        via_nt_create_user_process,
+        via_wmi,
+        via_task_scheduler,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        eprintln!("[spawn-matrix] starting {}", METHODS[index]);
+        let value = attempt(marker_dir);
+        eprintln!("[spawn-matrix] finished {}: {value}", METHODS[index]);
+        attempts.push(value);
+    }
     // `METHODS`はドライバ側の期待リストと綴りを合わせるための契約（B-05）。ここで
     // 「宣言した経路を全部試したか」を自分で検算する——1つ書き忘れても実行時には
     // 何も起きず、ドライバ側では「その経路は拒否された」に見えてしまうため。

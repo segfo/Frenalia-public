@@ -43,14 +43,25 @@ use super::*;
 /// （上記の限界）、ここで別ドメインを指すと3本とも「実体が無い」で断られ、
 /// **判定が効いているのかどうかが測れなくなる**。
 pub(super) fn policy_with_edge(domain: &str, exe: &str) -> PolicyFile {
+    policy_with_edges(domain, &[exe])
+}
+
+/// 実行ファイルを複数宣言する版（`to`はどれも遷移元と同じドメイン）。
+///
+/// **辺を足せるようにしてあるのは、1回の起動で2つの実行ファイルを起こす腕があるため**
+/// （段階6f-2の受け入れは`cmd.exe`とシェルの両方を起こす）。分けて撃つと、
+/// 実機のワークスペース作成とDaemon起動を2回払うことになる。
+pub(super) fn policy_with_edges(domain: &str, exes: &[&str]) -> PolicyFile {
     let mut file = PolicyFile::default();
     let mut entry = PolicyDomain::new(domain);
-    entry.process = serde_json::from_value(serde_json::json!({
-        "transitions": [
-            { "exe": { "literal": exe }, "argv": { "any": true }, "to": domain }
-        ]
-    }))
-    .expect("the transition declaration must parse");
+    let transitions: Vec<serde_json::Value> = exes
+        .iter()
+        .map(|exe| {
+            serde_json::json!({ "exe": { "literal": exe }, "argv": { "any": true }, "to": domain })
+        })
+        .collect();
+    entry.process = serde_json::from_value(serde_json::json!({ "transitions": transitions }))
+        .expect("the transition declaration must parse");
     file.domains.push(entry);
     file
 }
@@ -369,7 +380,7 @@ fn an_edge_declared_for_another_domain_cannot_be_borrowed() {
 
 /// `cmd.exe`のフルパス。**`%SystemRoot%`から組む**——32bitのテストバイナリから
 /// `C:\Windows\System32`を直書きするとWOW64のリダイレクトで別の実体を指し得る。
-fn cmd_exe() -> String {
+pub(super) fn cmd_exe() -> String {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     format!(r"{root}\System32\cmd.exe")
 }
@@ -388,7 +399,7 @@ fn cmd_exe() -> String {
 /// コンソールが無いと何も実行せず終了コード0で終わる性質は5.1でも同じで、
 /// [§7.1](../../../../../../plans/DESIGN-MAC-ENFORCEMENT.md)の実測表は「PowerShell」として
 /// その挙動を書いている。
-fn windows_powershell_51() -> String {
+pub(super) fn windows_powershell_51() -> String {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe")
 }

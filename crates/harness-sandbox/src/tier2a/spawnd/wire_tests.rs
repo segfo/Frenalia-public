@@ -322,6 +322,59 @@ fn a_spawn_request_round_trips_through_the_wire() {
     assert_eq!(parsed, original);
 }
 
+/// [段階6f-2] **Redirector DLLが組んだ電文が、そのまま読めること。**
+///
+/// # なぜここに写しが在るのか（意図された複製である）
+///
+/// `harness-redirector`は**注入先の非信頼プロセスで動く**ので、このクレートに依存しない
+/// （あちらの`Cargo.toml`の宣言）。したがって電文は**両端で別々に実装されており、
+/// ずれてもコンパイラは何も言わない**。下の文字列は
+/// `harness-redirector`の`spawn_broker::request_tests`が固定しているものと**1文字も
+/// 違ってはいけない**——あちらが「こう組む」を固定し、ここが「こう読める」を固定する。
+///
+/// **片方だけでは守れない。** 書き出しの形だけを固定していると、読めない綴りを
+/// 固定したまま緑になる（2026-09-17に実機で踏んだ形そのもの）。
+#[test]
+fn the_wire_the_redirector_dll_writes_is_the_wire_this_crate_reads() {
+    // `harness-redirector/src/spawn_broker_tests.rs` の
+    // `the_request_is_the_wire_the_daemon_expects` と同じ文字列。
+    const FROM_THE_DLL: &str = r#"{"command_line":"\"C:\\Windows\\System32\\cmd.exe\" /c echo hi","console":"required","cwd":"C:\\ws","env":[["PATH","C:\\bin"]],"handles":{"stderr":456,"stdin":null,"stdout":123},"image":"C:\\Windows\\System32\\cmd.exe","kind":"spawn","suspended":false}"#;
+
+    let parsed: SpawnRequest = serde_json::from_str(FROM_THE_DLL).unwrap_or_else(|e| {
+        panic!(
+            "DLLが組む電文をDaemonが読めない。**サンドボックスの中からの生成要求が\n         \
+             1件も通らない**（全部`malformed_request`で断られる）: {e}"
+        )
+    });
+    let SpawnRequest::Spawn {
+        image,
+        command_line,
+        cwd,
+        env,
+        handles,
+        console,
+        suspended,
+    } = parsed;
+    assert_eq!(image, r"C:\Windows\System32\cmd.exe");
+    assert_eq!(command_line, r#""C:\Windows\System32\cmd.exe" /c echo hi"#);
+    assert_eq!(cwd, r"C:\ws");
+    assert_eq!(
+        env,
+        Some(vec![("PATH".to_string(), r"C:\bin".to_string())]),
+        "**フックは常に環境を申告する**（`None`のまま運ぶと、呼び出し元がプロセス内で\n         設定した変数が子から消える）"
+    );
+    assert_eq!(
+        handles,
+        crate::tier2a::spawnd::CallerHandles {
+            stdin: None,
+            stdout: Some(123),
+            stderr: Some(456),
+        }
+    );
+    assert_eq!(console, ConsoleNeed::Required);
+    assert!(!suspended);
+}
+
 /// 欄を持たない古い形（段階6bの綴り）も読める——**足りない欄は既定へ落ちる**。
 #[test]
 fn a_spawn_request_without_the_new_fields_still_parses() {

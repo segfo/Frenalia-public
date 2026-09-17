@@ -43,6 +43,11 @@ mod spawn_matrix;
 /// [段階6f-1] **フックの役を演じるモード**（`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2）。
 /// スパイクではなく受け入れテストの部品なので、判定が出ても消さない。
 mod spawn_via_daemon;
+/// [段階6f-2] **ただ`CreateProcessW`を呼ぶだけのモード**。電文を組むのはフックの側で、
+/// 上のモードと**同じ報告の欄**を返すので同じ判定で比べられる。
+mod spawn_transparently;
+/// 上の2つが共有する受け皿・待ち方・報告の欄。
+mod spawn_report;
 mod spike_handles;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -120,6 +125,13 @@ struct Args {
     /// 電文の`console`欄（`required` か `not_needed`）。**既定は`not_needed`**
     /// ——段階6bまでの挙動と同じ側に倒してある。
     spawn_console: Option<String>,
+    /// [段階6f-2] **ただ`CreateProcessW`を呼ぶ**腕（`spawn_transparently`）。
+    /// 値は生成フラグの選び方（`none`／`no-window`／`detached`／`suspended`）で、
+    /// **コンソール要否の導出を撃ち分けるため**にここへ持たせてある。
+    spawn_transparently: Option<String>,
+    /// 起こす前に自分の環境へ置く値（`NAME=VALUE`）。フックが`lpEnvironment=NULL`を
+    /// 「自分の環境を継がせたい」と読んで載せるかを測るためにある。
+    spawn_set_env: Vec<String>,
     /// D-88（Lazy ACE fault-in）の着手条件: Redirector DLLのフックが**成功するopen**へ
     /// 上乗せする時間を、同一プロセスの「載せる前／載せた後」で測る（`open_bench`モジュールdoc）。
     open_bench: Option<open_bench::Spec>,
@@ -165,6 +177,9 @@ fn parse_args() -> Args {
     let mut spawn_cwd: Option<String> = None;
     let mut spawn_stdout: Option<String> = None;
     let mut spawn_console: Option<String> = None;
+    // [段階6f-2] フック経由の腕。指定しなければ`None`なので、既存の腕は1つも変わらない。
+    let mut spawn_transparently: Option<String> = None;
+    let mut spawn_set_env: Vec<String> = Vec::new();
     let mut pipe_payload = None;
     let mut pipe_repeat: u32 = 1;
     let mut pipe_start_at_epoch_ms: Option<u128> = None;
@@ -260,6 +275,9 @@ fn parse_args() -> Args {
             "--spawn-cwd" => spawn_cwd = Some(next()),
             "--spawn-stdout" => spawn_stdout = Some(next()),
             "--spawn-console" => spawn_console = Some(next()),
+            // [段階6f-2] 値は生成フラグの選び方（モードの選択と同時に運ぶ）。
+            "--spawn-transparently" => spawn_transparently = Some(next()),
+            "--spawn-set-env" => spawn_set_env.push(next()),
             // 残課題#43（要求受付パイプの混雑）の測定用。**既定は従来どおり1回・待たない**
             // ので、指定しなければ段階③の受け入れテストの撃ち方は変わらない。
             "--pipe-client-repeat" => pipe_repeat = next().parse().unwrap_or(1).max(1),
@@ -373,6 +391,8 @@ fn parse_args() -> Args {
         spawn_cwd,
         spawn_stdout,
         spawn_console,
+        spawn_transparently,
+        spawn_set_env,
         open_bench,
         console_share,
         report_file,
@@ -786,6 +806,24 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("open_bench report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    // [段階6f-2] フック経由の腕。**電文を1つも組まない**——組むのはRedirector DLLである。
+    if let Some(flags) = &args.spawn_transparently {
+        let report = spawn_transparently::run(&spawn_transparently::Spec {
+            image: args.spawn_image.as_deref(),
+            command_line: args.spawn_command_line.as_deref().unwrap_or_default(),
+            cwd: args.spawn_cwd.as_deref(),
+            stdout_file: args.spawn_stdout.as_deref(),
+            flags,
+            set_env: &args.spawn_set_env,
+            report_file: args.report_file.as_deref(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("spawn_transparently report must serialize")
         );
         return ExitCode::SUCCESS;
     }

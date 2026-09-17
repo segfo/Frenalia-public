@@ -1598,17 +1598,15 @@ pub fn spawn_with_workspace_via_daemon<'a>(
         .take()
         .expect("stderr write was created");
     let stdin_read = handles.stdin_read.take();
-    let mut daemon_env = env.to_vec();
-    daemon_env.retain(|(name, _)| name != crate::tier2a::spawnd::REQUEST_PIPE_ENV);
-    daemon_env.push((
-        crate::tier2a::spawnd::REQUEST_PIPE_ENV.to_string(),
-        daemon.request_pipe().to_string(),
-    ));
+    // [段階6f-2] **窓口の名前をここで足さない。** Daemon自身が起こす直前に入れる
+    // （`spawnd::server::Shared::request_pipe`のdoc）——トップレベルを起こす経路は
+    // 今日3つあり、足す責任を呼び出し側へ配ると4つ目を足す人が忘れられる形になる。
+    // 忘れた経路の子は、生成禁止を積んだ瞬間に**理由の見えない形で何も起動できなくなる**。
     let spawned = daemon.spawn_top_level(TopLevelSpawn {
         exe,
         args,
         cwd,
-        env: &daemon_env,
+        env,
         domain: DomainSpec {
             name: domain_name.to_string(),
             policy_domain: policy_domain.to_string(),

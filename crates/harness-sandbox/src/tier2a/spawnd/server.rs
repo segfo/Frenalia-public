@@ -168,6 +168,20 @@ struct Shared {
     /// **記録は境界ではない**（`P-07`）。ここへ書けなくても判定と生成は続ける
     /// ——ただし黙らせはしない（失敗はDaemonのstderrへ出す）。
     transitions: TransitionQueue,
+    /// [段階6f-2] 要求受付パイプの名前。**起こす子のenvへDaemonが必ず入れる**ため。
+    ///
+    /// # なぜharnessではなくDaemonが入れるのか
+    ///
+    /// 生成禁止を積んだ子は、**この変数が無いと何も起動できない**
+    /// （Redirector DLLのフックが窓口の名前をここからしか取らない）。しかも失敗の形は
+    /// 「なぜか子プロセスが作れない」という遠い症状で、**入れ忘れた経路だけ**が静かに壊れる。
+    ///
+    /// 名前を知っているのはDaemon自身であり、**トップレベルを起こす経路は今後も増える**
+    /// （今日は`run_shell`・ポリシーエディタ・MCPの3つ）。入れる責任を呼び出し側へ配ると、
+    /// 4つ目を足す人が忘れられる形になる（`B-06`: 決定は経路の共通点へ置く）。
+    /// nestedの子は`env_for_nested`が同じ名前を系統の基準envから強制するので、
+    /// **ここを入口にすれば系統の全員が持つ**。
+    request_pipe: String,
 }
 
 /// 制御パイプへ接続し、`Shutdown`か切断まで要求を処理し続ける。
@@ -240,6 +254,12 @@ pub fn serve(
         }
     };
 
+    // --- 要求受付パイプを開く（サンドボックスから到達できる唯一の口） ---
+    //
+    // **名前を先に決める。** 起こす子のenvへDaemon自身が入れるので、
+    // [`Shared`]がこの名前を持っている必要がある（[`Shared::request_pipe`]）。
+    let request_pipe_name = unique_pipe_name("spawnd-request");
+
     let shared = Arc::new(Shared {
         table: Mutex::new(ProcessTable::new()),
         stopping: AtomicBool::new(false),
@@ -247,10 +267,9 @@ pub fn serve(
         child_process_policy,
         console_holders: ConsoleHolders::default(),
         transitions,
+        request_pipe: request_pipe_name.clone(),
     });
 
-    // --- 要求受付パイプを開く（サンドボックスから到達できる唯一の口） ---
-    let request_pipe_name = unique_pipe_name("spawnd-request");
     let user =
         current_user_sid_string().map_err(|e| err(format!("current_user_sid_string: {e}")))?;
     let capability = spawn_request_capability_sid()
@@ -833,6 +852,21 @@ fn record_denial(
     }
 }
 
+/// [段階6f-2] **窓口の名前を、起こす子のenvへDaemonの値で書き込む**（[`Shared::request_pipe`]のdoc）。
+///
+/// 呼び出し元が同じ名前を載せていても**こちらの値で上書きする**——差し替えられる余地を
+/// 残さないのは、[`env_for_nested`]がnestedに対してやっているのと同じ理由である。
+///
+/// # なぜ関数に出してあるのか
+///
+/// **系統の全員がこの1点に依存する。** 生成禁止を積んだ子はこの変数が無いと何も起動できず、
+/// 失敗の形は「なぜか子プロセスが作れない」という遠い症状になる。だから
+/// **昇格もDaemonも要らない場所で対のテストが見張れる**形にしてある。
+fn force_request_pipe(env: &mut Vec<(String, String)>, request_pipe: &str) {
+    env.retain(|(name, _)| name != super::REQUEST_PIPE_ENV);
+    env.push((super::REQUEST_PIPE_ENV.to_string(), request_pipe.to_string()));
+}
+
 /// 辺のenv方針を呼び出し元の申告へ当て、**harnessが所有する名前だけを系統の値で強制する**
 /// （§19.1の表と、2026-09-17の決定3）。
 ///
@@ -1114,6 +1148,7 @@ fn spawn_top_level(
 
     let args: Vec<&str> = request.args.iter().map(String::as_str).collect();
     let mut env = request.env.clone();
+    force_request_pipe(&mut env, &shared.request_pipe);
     let handshake = match request.redirector.as_ref() {
         Some(spec) => match prepare_redirector(
             spec,
@@ -1978,6 +2013,38 @@ mod nested_env_tests {
             Some(PIPE),
             "宣言で窓口の名前を差し替えられている: {env:?}"
         );
+    }
+
+    /// [段階6f-2] **トップレベルの子にも窓口の名前が必ず入る。対で見る**（`B-35`）。
+    ///
+    /// - **無ければ足す**——足さないと、生成禁止を積んだ子は**何も起動できない**
+    ///   （フックは窓口の名前をここからしか取らない）。しかも症状は「なぜか子プロセスが
+    ///   作れない」という遠い形で出る
+    /// - **有っても上書きする**——呼び出し元が別の名前を載せていたら、そちらへ繋ぎに行く
+    ///   （`env_for_nested`がnestedに対して塞いでいるのと同じ穴が、トップレベルに開く）
+    #[test]
+    fn the_daemon_puts_its_own_request_pipe_into_every_top_level_child() {
+        const MINE: &str = r"\\.\pipe\the-real-one";
+
+        let mut missing = vec![("PATH".to_string(), r"C:\bin".to_string())];
+        force_request_pipe(&mut missing, MINE);
+        assert_eq!(
+            value_of(&missing, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
+            Some(MINE),
+            "窓口の名前が入っていない。この子は生成禁止を積んだ瞬間に何も起動できなくなる: {missing:?}"
+        );
+
+        let mut claimed = vec![(
+            crate::tier2a::spawnd::REQUEST_PIPE_ENV.to_string(),
+            r"\\.\pipe\somebody-elses".to_string(),
+        )];
+        force_request_pipe(&mut claimed, MINE);
+        assert_eq!(
+            value_of(&claimed, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
+            Some(MINE),
+            "呼び出し元が載せた名前が残っている。窓口を差し替えられる: {claimed:?}"
+        );
+        assert_eq!(claimed.len(), 1, "同じ名前が2つ並んでいる: {claimed:?}");
     }
 
     /// **環境変数の名前は大文字小文字を区別しない**（Windows）。

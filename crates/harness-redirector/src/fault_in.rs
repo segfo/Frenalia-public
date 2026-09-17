@@ -20,6 +20,9 @@
 //! ——ずれたことをコンパイラは教えてくれないので、[`frame_tests`]がバイト列を固定し、
 //! 受付側（`harness-sandbox`の`win_pipe_ipc`）にも同じ形式の固定テストがある。
 //!
+//! **枠組み（長さ＋本文の書き読み）は[`crate::pipe_io`]が持つ**（2026-09-17、段階6f-2で
+//! 切り出した）。Spawn Daemonへの依頼も同じ枠組みを使うので、ここに置いたままだと写しになる。
+//!
 //! # 再入させない
 //!
 //! ここが使う`CreateFileW`/`ReadFile`/`WriteFile`は`NtCreateFile`へ降りてフックに戻るが、
@@ -28,16 +31,10 @@
 
 use std::sync::Mutex;
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_SHARE_MODE, OPEN_EXISTING,
-};
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
 use super::*;
+use crate::pipe_io::{connect, roundtrip};
 
 /// 1往復に掛ける上限。**新しい数字を増やさない**（着手条件5）——既存の
 /// ready ハンドシェイク（`wait_cow_ready`）と同じ5秒。
@@ -202,111 +199,6 @@ pub(crate) fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-fn connect(pipe_name: &str) -> Option<HANDLE> {
-    unsafe {
-        // NUL終端のUTF-16へ（`ledger.rs`の`nt_path_wide`と同じ作り方）。
-        let name_w: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
-        CreateFileW(
-            PCWSTR(name_w.as_ptr()),
-            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
-            FILE_SHARE_MODE(0),
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
-            None,
-        )
-        .ok()
-    }
-}
-
-/// 1フレーム書いて1フレーム読む。`None`は「この接続はもう使えない」。
-fn roundtrip(pipe: HANDLE, payload: &[u8], timeout_ms: u32) -> Option<Vec<u8>> {
-    let len = (payload.len() as u32).to_le_bytes();
-    write_all(pipe, &len, timeout_ms)?;
-    write_all(pipe, payload, timeout_ms)?;
-    let mut len_buf = [0u8; 4];
-    read_exact(pipe, &mut len_buf, timeout_ms)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    // 受付の応答は短い。**上限を置く**のは、壊れた長さで巨大な確保をしないため。
-    if len > 64 * 1024 {
-        return None;
-    }
-    let mut reply = vec![0u8; len];
-    if len > 0 {
-        read_exact(pipe, &mut reply, timeout_ms)?;
-    }
-    Some(reply)
-}
-
-fn write_all(pipe: HANDLE, buf: &[u8], timeout_ms: u32) -> Option<()> {
-    let mut done = 0usize;
-    while done < buf.len() {
-        let chunk = &buf[done..];
-        let n = overlapped(pipe, timeout_ms, |ov| unsafe {
-            WriteFile(pipe, Some(chunk), None, Some(ov))
-        })?;
-        if n == 0 {
-            return None;
-        }
-        done += n as usize;
-    }
-    Some(())
-}
-
-fn read_exact(pipe: HANDLE, buf: &mut [u8], timeout_ms: u32) -> Option<()> {
-    let mut done = 0usize;
-    while done < buf.len() {
-        let chunk = &mut buf[done..];
-        let n = overlapped(pipe, timeout_ms, |ov| unsafe {
-            ReadFile(pipe, Some(chunk), None, Some(ov))
-        })?;
-        if n == 0 {
-            return None;
-        }
-        done += n as usize;
-    }
-    Some(())
-}
-
-/// オーバーラップドI/Oを[`ROUNDTRIP_TIMEOUT_MS`]付きで回す。
-///
-/// タイムアウトしたら`CancelIoEx`で取り消し、**取り消しの完了まで待ってから**返る
-/// （`bWait=true`）——待たずに返ると、この関数のスタックにある`OVERLAPPED`をカーネルが
-/// まだ見ている状態でスタックが巻き戻る。`harness-sandbox`の`run_overlapped`が
-/// 同じ理由で同じことをしている。
-fn overlapped<F>(pipe: HANDLE, timeout_ms: u32, start: F) -> Option<u32>
-where
-    F: FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
-{
-    unsafe {
-        let event = CreateEventW(None, true, false, None).ok()?;
-        let mut ov = OVERLAPPED {
-            hEvent: event,
-            ..Default::default()
-        };
-        let started = start(&mut ov as *mut _);
-        let pending = match started {
-            Ok(()) => false,
-            Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => true,
-            Err(_) => {
-                let _ = CloseHandle(event);
-                return None;
-            }
-        };
-        if pending && WaitForSingleObject(event, timeout_ms) != WAIT_OBJECT_0 {
-            let _ = CancelIoEx(pipe, Some(&ov as *const _));
-            let mut discarded = 0u32;
-            let _ = GetOverlappedResult(pipe, &ov, &mut discarded, true);
-            let _ = CloseHandle(event);
-            return None;
-        }
-        let mut transferred = 0u32;
-        let ok = GetOverlappedResult(pipe, &ov, &mut transferred, true).is_ok();
-        let _ = CloseHandle(event);
-        ok.then_some(transferred)
-    }
 }
 
 #[cfg(test)]

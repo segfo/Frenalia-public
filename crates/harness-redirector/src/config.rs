@@ -25,6 +25,14 @@ pub(crate) const PROCESS_HOOKS_ENV: &str = "HARNESS_REDIRECTOR_PROCESS_HOOKS";
 /// **有効を意味する綴りだけを見る**——この変数は「立てたら真」であって、
 /// 未設定が既定（偽）だからである（`lazy_grant::lane()`とは向きが逆で、
 /// あちらは既定が有効なので無効側の綴りを見る）。
+/// [段階6f-2] **このDLLの診断の行き先**（張られたときだけ使う）。
+///
+/// サンドボックスの中から書ける場所を**呼び出し側が指定する**ための口である。
+/// 張らなければ従来どおり（差分層か`%TEMP%`）で、**製品の挙動は1ビットも変わらない**。
+/// 綴りはテスト側（`harness-sandbox`の受け入れ）と対で、`harness-cli`の
+/// 環境変数名の一覧テストが見張る。
+pub(crate) const DEBUG_LOG_ENV: &str = "HARNESS_REDIRECTOR_DEBUG_LOG";
+
 pub(crate) fn process_hooks_from_env() -> bool {
     get_env(PROCESS_HOOKS_ENV).is_some_and(|v| !matches!(v.trim(), "0" | "false" | "off"))
 }
@@ -153,6 +161,23 @@ pub(crate) fn parse_config_blob(text: &str) -> Option<Config> {
 /// 実害は無い想定。
 pub(crate) fn debug_log(msg: &str) {
     if !cfg!(debug_assertions) {
+        return;
+    }
+    // [段階6f-2] **受け皿を張られていたらそこへ書く。**
+    //
+    // 下の2つの置き場は、**サンドボックスの中からは書けないことがある**——差分層が無い構成
+    // （プロセス生成フックだけのための注入）では`%TEMP%`へ落ちるが、AppContainerの子は
+    // ユーザーの`%TEMP%`にACEを持たない。つまり**診断がどこにも届かない**。
+    // Daemonのstderrに`HARNESS_SPAWND_STDERR`を足したのと同じ形で、
+    // **張ったときだけ**中身が読める口を作る（張らなければ挙動は1ビットも変わらない）。
+    if let Some(path) = get_env(DEBUG_LOG_ENV) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "[{} pid={}] {msg}", now_millis(), std::process::id());
+        }
         return;
     }
     // [D-88] **差分層が空のときは`%TEMP%`へ落とす。**

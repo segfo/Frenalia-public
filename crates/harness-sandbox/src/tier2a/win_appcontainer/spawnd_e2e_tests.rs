@@ -97,6 +97,11 @@ mod transition_acceptance_tests;
 /// 外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
 mod transition_queue_tests;
 
+/// [段階6f-2] Redirector DLLのフックがDaemonへ頼むようになったことの受け入れ（3つの腕と対2組）。
+/// **同じ理由でここに置いてある**——昇格の的`spawn-daemon`のフィルタが
+/// `win_appcontainer::spawnd_e2e_tests`なので、外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
+mod transparent_hook_tests;
+
 /// [段階6b] このファイルのテストが名乗る**遷移元ドメイン名**。
 ///
 /// **`DomainSpec::name`（プロファイル名の側）とわざと別の綴りにしてある。**
@@ -229,19 +234,40 @@ pub(super) fn domain_spec(
     }
 }
 
+/// Daemonに起こしてもらう1本の指定。
+///
+/// # なぜ構造体なのか（2026-09-17、段階6f-2）
+///
+/// 振る軸が**3つ**になった——実行ファイル・コンソール要否・**Redirectorを注入するか**。
+/// 3つとも既定で通れる形にすると、注入を指定し忘れた腕が
+/// 「フックが載っていない子」を測ることになる（段階6f-2はまさにそれを測る回なので、
+/// 黙って既定へ落ちる欄を作らない）。
+pub(super) struct TopLevelArm<'a> {
+    /// 起こす実行ファイル。**プローブとは限らない**（シェルを起こす腕がある）。
+    pub exe: &'a str,
+    pub args: &'a [&'a str],
+    pub domain: DomainSpec,
+    pub console: ConsoleNeed,
+    /// **この子にRedirector DLLを入れるか。** 入れないとプロセス生成フックが載らず、
+    /// 段階6f-2の変換は1度も走らない。
+    pub redirector: Option<crate::tier2a::spawnd::RedirectorSpec>,
+    /// 許可リストを通らない変数を、この腕にだけ足す。
+    ///
+    /// **`build_child_env`は完全一致の許可リストで濾す**ので、診断の受け皿
+    /// （`HARNESS_REDIRECTOR_DEBUG_LOG`）のような**テストだけが使う名前**は通らない。
+    /// 製品の許可リストを緩めずに済ませるための欄で、**空が既定**である。
+    pub extra_env: Vec<(String, String)>,
+}
+
 /// Daemonに子を起こしてもらい、**その子のstdout/stderrと終了コード**を返す。
 ///
 /// パイプとJobを作るのはこちら（harness役）である（§10.1「子のstdioパイプを作るプロセス」）。
-fn spawn_via_daemon(
+pub(super) fn start_top_level(
     daemon: &SpawnDaemonHandle,
     profile: &OwnedContainerSid,
     workspace: &std::path::Path,
-    domain: DomainSpec,
-    args: &[&str],
+    arm: TopLevelArm<'_>,
 ) -> (SpawnedChild, HANDLE, String, String) {
-    let probe = super::mac_spike_tests::probe_exe();
-    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
-
     let (stdout_read, stdout_write) =
         appcontainer_pipe(profile.as_psid()).expect("stdout pipe for the daemon-spawned child");
     crate::win_common::clear_inherit(stdout_read);
@@ -252,24 +278,54 @@ fn spawn_via_daemon(
     // こちらの原本はキャンセル用に持ち続ける。
     let job = crate::win_common::create_job_object().expect("lineage job");
 
+    let mut env = crate::secret_env::build_child_env();
+    env.extend(arm.extra_env.iter().cloned());
+
     let child = daemon
         .spawn_top_level(TopLevelSpawn {
-            exe: &probe_str,
-            args,
+            exe: arm.exe,
+            args: arm.args,
             cwd: workspace,
-            env: &crate::secret_env::build_child_env(),
-            domain,
+            env: &env,
+            domain: arm.domain,
             job,
             stdout_write,
             stderr_write,
             stdin_read: None,
-            redirector: None,
-            console: ConsoleNeed::NotNeeded,
+            redirector: arm.redirector,
+            console: arm.console,
         })
         .expect("the daemon must spawn the top-level child");
 
     let (out, err) = crate::win_common::read_two_pipes_to_strings(stdout_read, stderr_read);
     (child, job, out, err)
+}
+
+/// プローブを、**Redirectorもコンソールも無しで**起こす（段階6bまでの既定の形）。
+///
+/// [`start_top_level`]の3つの軸を全部既定にした呼び方で、**既存の腕はここを通る**。
+fn spawn_via_daemon(
+    daemon: &SpawnDaemonHandle,
+    profile: &OwnedContainerSid,
+    workspace: &std::path::Path,
+    domain: DomainSpec,
+    args: &[&str],
+) -> (SpawnedChild, HANDLE, String, String) {
+    let probe = super::mac_spike_tests::probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+    start_top_level(
+        daemon,
+        profile,
+        workspace,
+        TopLevelArm {
+            exe: &probe_str,
+            args,
+            domain,
+            console: ConsoleNeed::NotNeeded,
+            redirector: None,
+            extra_env: Vec::new(),
+        },
+    )
 }
 
 /// 子の応答JSON（`--pipe-client`が最後の行に出す）から1つの欄を読む。

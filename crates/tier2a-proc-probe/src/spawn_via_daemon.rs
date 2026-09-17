@@ -45,41 +45,9 @@ pub struct Spec<'a> {
 
 #[cfg(windows)]
 pub fn run(spec: &Spec) -> Value {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE, HANDLE};
-    use windows::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows::Win32::Storage::FileSystem::{
-        CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    let mut stdout_handle: Option<HANDLE> = None;
-    let mut open_error: Option<String> = None;
-    if let Some(path) = spec.stdout_file {
-        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-        // **継承可で開く。** Daemonはこのハンドルを引き抜いて子の`hStdOutput`へ入れるので、
-        // 複製の時点で継承可になっていなくてもよい（Daemon側が`bInheritHandle: true`で
-        // 複製する）が、こちら側でも立てておくと「なぜ継承されないのか」を切り分けやすい。
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: std::ptr::null_mut(),
-            bInheritHandle: true.into(),
-        };
-        match unsafe {
-            CreateFileW(
-                PCWSTR(wide.as_ptr()),
-                GENERIC_WRITE.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                Some(&sa as *const _),
-                CREATE_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL,
-                None,
-            )
-        } {
-            Ok(handle) => stdout_handle = Some(handle),
-            // **開けなかったことを黙らせない。** 黙ると「子が何も書かなかった」に見える。
-            Err(e) => open_error = Some(format!("CreateFileW({path}): {e}")),
-        }
-    }
+    // **受け皿と待ち方はフック経由の腕と共有する**（[`crate::spawn_report`]）。
+    // 欄がずれると2つの腕を比べられない。
+    let mut stdout = crate::spawn_report::open_inheritable(spec.stdout_file);
 
     let payload = json!({
         "kind": "spawn",
@@ -93,7 +61,7 @@ pub fn run(spec: &Spec) -> Value {
         "env": Value::Null,
         "handles": {
             "stdin": Value::Null,
-            "stdout": stdout_handle.map(|h| h.0 as usize as u64),
+            "stdout": stdout.value(),
             "stderr": Value::Null,
         },
         "console": spec.console,
@@ -111,11 +79,8 @@ pub fn run(spec: &Spec) -> Value {
     });
 
     // 子側の端はもう要らない。**閉じないと、子が終わってもファイルが掴まれたままになる。**
-    if let Some(handle) = stdout_handle {
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
-    }
+    let stdout_opened = stdout.handle.is_some();
+    stdout.close();
 
     let reply: Option<Value> = round_trip
         .get("reply")
@@ -129,23 +94,18 @@ pub fn run(spec: &Spec) -> Value {
         "sent": payload,
         "reply": round_trip.get("reply").cloned().unwrap_or(Value::Null),
         "reply_kind": reply.as_ref().and_then(|r| r.get("kind")).cloned(),
-        "stdout_handle_opened": stdout_handle.is_some(),
-        "stdout_open_error": open_error,
+        "stdout_handle_opened": stdout_opened,
+        "stdout_open_error": stdout.open_error.clone(),
     });
 
     if let Some(reply) = reply.as_ref() {
         if reply.get("kind").and_then(Value::as_str) == Some("spawned") {
             report["child_pid"] = reply.get("pid").cloned().unwrap_or(Value::Null);
-            let process = reply.get("process").and_then(Value::as_u64);
-            let thread = reply.get("thread").and_then(Value::as_u64);
-            report["got_process_handle"] = json!(process.is_some_and(|h| h != 0));
-            report["got_thread_handle"] = json!(thread.is_some_and(|h| h != 0));
-            if let Some(process) = process {
-                let (waited, exit_code, error) = wait_for(process);
-                report["waited_ok"] = json!(waited);
-                report["child_exit_code"] = exit_code.map(Value::from).unwrap_or(Value::Null);
-                report["wait_error"] = error.map(Value::from).unwrap_or(Value::Null);
-            }
+            crate::spawn_report::wait_and_record(
+                &mut report,
+                reply.get("process").and_then(Value::as_u64),
+                reply.get("thread").and_then(Value::as_u64),
+            );
         } else {
             report["deny_reason"] = reply.get("reason").cloned().unwrap_or(Value::Null);
         }
@@ -155,39 +115,6 @@ pub fn run(spec: &Spec) -> Value {
         let _ = std::fs::write(path, report.to_string());
     }
     report
-}
-
-/// 返ってきたプロセスハンドルで待ち、終了コードを読む。
-///
-/// **`GetExitCodeProcess`だけで「終わったか」を判定しない**——`STILL_ACTIVE`(259)と
-/// 「259で終了した」が区別できない（`harness-sandbox`の`process_is_alive`と同じ理屈）。
-/// 先に`WaitForSingleObject`でシグナルを待つ。
-#[cfg(windows)]
-fn wait_for(process: u64) -> (bool, Option<u32>, Option<String>) {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-
-    let handle = HANDLE(process as usize as *mut _);
-    let waited = unsafe { WaitForSingleObject(handle, 30_000) };
-    if waited != WAIT_OBJECT_0 {
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
-        return (
-            false,
-            None,
-            Some(format!("WaitForSingleObject returned {}", waited.0)),
-        );
-    }
-    let mut code = 0u32;
-    let read = unsafe { GetExitCodeProcess(handle, &mut code) };
-    unsafe {
-        let _ = CloseHandle(handle);
-    }
-    match read {
-        Ok(()) => (true, Some(code), None),
-        Err(e) => (true, None, Some(format!("GetExitCodeProcess: {e}"))),
-    }
 }
 
 #[cfg(not(windows))]

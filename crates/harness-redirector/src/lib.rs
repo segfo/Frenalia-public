@@ -154,6 +154,8 @@ use windows::Win32::System::IO::IO_STATUS_BLOCK;
 // | `dir_merge`     | ディレクトリ列挙のマージ |
 // | `inject`        | 子プロセスへのDLL注入 |
 // | `process_hooks` | プロセス生成フック |
+// | `pipe_io`       | 名前付きパイプの1往復（受付とSpawn Daemonが同じ枠組みを使う） |
+// | `spawn_broker`  | [段階6f-2] プロセス生成をSpawn Daemonへの依頼へ変換する |
 // | `init`          | 初期化・フック設置・エントリポイント |
 
 mod config;
@@ -164,8 +166,10 @@ mod init;
 mod inject;
 mod ledger;
 mod ntpath;
+mod pipe_io;
 mod policy;
 mod process_hooks;
+mod spawn_broker;
 mod state;
 
 use config::*;

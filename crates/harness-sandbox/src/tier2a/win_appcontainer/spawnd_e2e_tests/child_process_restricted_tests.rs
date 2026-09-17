@@ -32,14 +32,17 @@ use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject}
 
 use super::super::*;
 use super::{domain_spec, report_field, setup_with_policy, spawn_request_payload, Case};
-use crate::tier2a::spawnd::client::{SpawnDaemonHandle, SpawnedChild, TopLevelSpawn};
+use crate::tier2a::spawnd::client::{SpawnDaemonHandle, SpawnedChild};
 use crate::tier2a::spawnd::{ChildProcessPolicy, ConsoleNeed};
 
 /// 1本の子を起こして、標準出力・標準エラー・終了コードを取る。
 ///
-/// [`super::spawn_via_daemon`]と違うのは2つだけである——**実行ファイルを選べる**ことと、
-/// **コンソールの要否を選べる**こと。あちらはプローブ固定・コンソール不要固定なので、
-/// シェルを起こす腕が書けない。
+/// [`super::start_top_level`]との違いは**待ち方だけ**である——あちらは子とJobを返して
+/// 呼び出し側に待たせるが、ここでは終了コードまで取って返す
+/// （「シェルが本当にコマンドを実行したか」を終了コードで見るため）。
+///
+/// [段階6f-2] `redirector`が要るのは、**フックが載っているかで結果が反転する腕**が
+/// あるからである（プロセス生成フックが無い子は、生成禁止の下で何もできない）。
 fn spawn_and_collect(
     daemon: &SpawnDaemonHandle,
     profile: &OwnedContainerSid,
@@ -49,32 +52,19 @@ fn spawn_and_collect(
     args: &[&str],
     console: ConsoleNeed,
 ) -> Result<(String, String, u32), String> {
-    let (stdout_read, stdout_write) =
-        appcontainer_pipe(profile.as_psid()).map_err(|e| format!("stdout pipe: {e}"))?;
-    crate::win_common::clear_inherit(stdout_read);
-    let (stderr_read, stderr_write) =
-        appcontainer_pipe(profile.as_psid()).map_err(|e| format!("stderr pipe: {e}"))?;
-    crate::win_common::clear_inherit(stderr_read);
-    // 系統Jobを作るのはharnessである（§10.1.1）。
-    let job = crate::win_common::create_job_object().map_err(|e| format!("lineage job: {e}"))?;
-
-    let child: SpawnedChild = daemon
-        .spawn_top_level(TopLevelSpawn {
+    let (child, job, out, err) = super::start_top_level(
+        daemon,
+        profile,
+        workspace,
+        super::TopLevelArm {
             exe,
             args,
-            cwd: workspace,
-            env: &crate::secret_env::build_child_env(),
             domain,
-            job,
-            stdout_write,
-            stderr_write,
-            stdin_read: None,
-            redirector: None,
             console,
-        })
-        .map_err(|e| format!("spawn_top_level: {e}"))?;
-
-    let (out, err) = crate::win_common::read_two_pipes_to_strings(stdout_read, stderr_read);
+            redirector: None,
+            extra_env: Vec::new(),
+        },
+    );
     let code = wait_and_close_with_code(&child, job);
     Ok((out, err, code))
 }
