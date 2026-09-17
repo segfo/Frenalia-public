@@ -1020,15 +1020,36 @@ unsafe extern "system" fn counting_callback(record: *mut EVENT_RECORD) {
 /// 所有者の死んだものを回収する側（[`stop_orphaned_fs_sessions`]）が同じ綴りを見る。
 pub const FS_SESSION_PREFIX: &str = "harness-policy-learn-";
 
+/// argv観測（段階6d、`super::mof::MofFsSession`）が張るセッション名の接頭辞。
+///
+/// **FS側と別の接頭辞にしてあるのは、両方が同時に張られるからである**——1つの記録が
+/// マニフェストの通常セッション（FS）とprivate system logger（プロセス生成）の2本を使う
+/// （`plans/etw-spike/RESULTS.md` §22.5）。同じ名前は付けられない。
+///
+/// **こちらの残留はFS側より重い。** FS側の残留は「購読者が居ないのに発火し続ける」無駄だが、
+/// こちらは**マシン全体で8本しかない枠を1本占有したまま返さない**（実測の空きは5本）。
+/// 積もると次の記録が始められなくなる——argv観測はfail-closedだからである（§10.3）。
+pub const ARGV_SESSION_PREFIX: &str = "harness-policy-learn-argv-";
+
 /// ETWセッション名から、その**所有者のセッショントークン**を取り出す
 /// （[BUG-117](../../../../../docs/bugs/BUG-117.md)）。回収の対象にできないものは`None`。
 ///
-/// 収集器が張る名前は`harness-policy-learn-harness.shell.sandbox.<token>`である。
+/// 収集器が張る名前は`harness-policy-learn-harness.shell.sandbox.<token>`と、
+/// argv観測の`harness-policy-learn-argv-harness.shell.sandbox.<token>`である。
 /// 接頭辞のあとがharnessのセッションプロファイル名になっていなければ`None`を返す——
 /// **スパイクやテストが張る`harness-policy-learn-<任意>`は所有者を判定できない**ので、
 /// 回収の対象にしない（判定できないものを止めない、fail-closed）。
+///
+/// # 剥がす順序が効く（段階6dで足した）
+///
+/// `ARGV_SESSION_PREFIX`は`FS_SESSION_PREFIX`で**前方一致する**（後者が前者の接頭辞）。
+/// FS側から先に剥がすと、argvのセッション名は残りが`argv-harness.shell.sandbox.<token>`に
+/// なってプロファイル名として通らず、**「所有者を判定できない」＝回収しない側へ落ちる**。
+/// **長い方から試す**こと。この順序は[`super::session_tests`]の対のテストが固定している。
 pub fn orphan_candidate_token(session_name: &str) -> Option<&str> {
-    let profile = session_name.strip_prefix(FS_SESSION_PREFIX)?;
+    let profile = session_name
+        .strip_prefix(ARGV_SESSION_PREFIX)
+        .or_else(|| session_name.strip_prefix(FS_SESSION_PREFIX))?;
     if !crate::tier2a::session_profile::is_session_profile_name(profile) {
         return None;
     }
@@ -1534,5 +1555,45 @@ mod orphan_sweep_tests {
         );
         assert!(started.starts_with(FS_SESSION_PREFIX));
         assert_eq!(orphan_candidate_token(&started), Some("1-2"));
+    }
+
+    /// **[段階6d] argv観測のセッションも回収の対象になる。**
+    ///
+    /// こちらの残留はFS側より重い——**8本しかない枠を1本占有したまま返さない**ので、
+    /// 積もると次の記録がfail-closedで始められなくなる（§10.3）。
+    #[test]
+    fn an_argv_session_whose_owner_is_gone_is_collected_too() {
+        let name = format!(
+            "{}{}",
+            super::ARGV_SESSION_PREFIX,
+            crate::tier2a::session_profile::profile_name_for("4321-1700000000")
+        );
+        assert_eq!(orphan_candidate_token(&name), Some("4321-1700000000"));
+        assert!(is_orphaned_session(&name, |_| false));
+        // 所有者が生きているなら止めない（FS側と同じ対）。
+        assert!(!is_orphaned_session(&name, |_| true));
+    }
+
+    /// **対の側**（`B-35`）: **剥がす順序を逆にすると回収されなくなる**ことを固定する。
+    ///
+    /// `ARGV_SESSION_PREFIX`は`FS_SESSION_PREFIX`で前方一致するので、FS側から先に剥がすと
+    /// 残りが`argv-harness.shell.sandbox.<token>`になり、プロファイル名として通らない。
+    /// 上のテストだけだと**「長い方から剥がす」を壊しても、なぜ壊れたかが分からない**——
+    /// ここで壊れ方そのものを書いておく。
+    #[test]
+    fn stripping_the_shorter_prefix_first_would_lose_the_owner() {
+        let name = format!(
+            "{}{}",
+            super::ARGV_SESSION_PREFIX,
+            crate::tier2a::session_profile::profile_name_for("4321-1700000000")
+        );
+        // 順序を逆にした場合の剥がし方を、その場で再現する。
+        let wrong = name.strip_prefix(FS_SESSION_PREFIX).unwrap();
+        assert!(
+            !crate::tier2a::session_profile::is_session_profile_name(wrong),
+            "短い方から剥がすと所有者が読めなくなる: {wrong}"
+        );
+        // 正しい順序では読める。
+        assert_eq!(orphan_candidate_token(&name), Some("4321-1700000000"));
     }
 }

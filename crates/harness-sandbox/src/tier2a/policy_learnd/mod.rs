@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod client;
 pub mod etw;
+/// 観測した生成＝遷移の辺の候補（段階6d、§10.3）。**書き手は昇格側、読み手は
+/// ポリシーエディタの遷移画面**（段階⑦）。
+pub mod observed;
 pub mod server;
 
 /// D-56 段階2（要求の連続を捌くプロトコル）のテスト。実daemonを非昇格で起動して検出する
@@ -33,6 +36,11 @@ pub mod server;
 /// 「古いビルドを黙って測る」ことの検出器が要る。
 #[cfg(all(windows, test))]
 mod reuse_tests;
+
+/// [段階6d] argv観測の機構E2E（**要管理者権限**）。単体では作り物にしかならない
+/// 「実際に起こしたコマンドが候補の行になる」と「枠が無ければ始まらない」を実機で測る。
+#[cfg(all(windows, test))]
+mod argv_e2e_tests;
 
 /// 収集器へ渡すポリシー一式（`StartCollect`のペイロード）。
 ///
@@ -74,6 +82,19 @@ pub struct LearnPolicy {
     /// フォールバック）だけでスコープを決める。
     #[serde(default)]
     pub record_all: bool,
+    /// argv（コマンドライン）も観測するか（段階6d、`plans/DESIGN-MAC-ENFORCEMENT.md` §10.3）。
+    ///
+    /// **`true`を送ってよいのはポリシーエディタのパス1だけである**（同§の入口の表）。
+    /// 隔離が効いている入口では子プロセスの生成そのものが断られるので、そこで観測できるのは
+    /// 「断られた事実」であり、それは待ち行列（`pending.jsonl`）が既に持っている。
+    ///
+    /// # この1つだけがfail-closedである
+    ///
+    /// FS収集は張れなくても続行する（D-43 fail-open）が、**こちらは張れなければ
+    /// `StartCollect`そのものを断る**（§10.3）。黙ってargv無しで記録を続けると、
+    /// 「argvが観測されなかった辺」と「argvを観測できなかった辺」が区別できなくなる。
+    #[serde(default)]
+    pub capture_argv: bool,
 }
 
 /// 親→収集器。**`Teardown`までの要求の連続**（D-56 段階2）。
@@ -114,6 +135,18 @@ pub enum LearnResponse {
         /// 「要求した値をechoしていない」という本来の文面で断る。
         #[serde(default)]
         spawn_daemon_pid: Option<u32>,
+        /// argv観測を張ったか（段階6d）。**要求した値をechoする**のではなく、
+        /// **実際に張れたか**を返す——`LearnPolicy::capture_argv`が`false`なら`Some(false)`、
+        /// `true`で張れたなら`Some(true)`、`true`で張れなければそもそも`Started`を返さない
+        /// （`Err`で断る。§10.3 fail-closed）。
+        ///
+        /// **`default`が要る理由は`spawn_daemon_pid`と同じで、効き目はより重い。**
+        /// 古い収集器は`capture_argv`を知らずに捨て、**FS収集だけを始めて`Started`を返す**。
+        /// 欄が無ければ`None`として読め、呼び出し側は「張れたとは言っていない」と断れる。
+        /// **ここを`bool`（`default`で`false`）にしてはいけない**——「張れなかった」と
+        /// 「版が古くて答えていない」が同じ値になり、断る理由が消える（`B-10`）。
+        #[serde(default)]
+        argv_capture: Option<bool>,
     },
     /// 現世代を畳んだ。**この世代で**書けた件数を返す（累積ではない——累積にすると
     /// UIが「今回の記録で観測した件数」として出す数と食い違う）。
@@ -123,6 +156,20 @@ pub enum LearnResponse {
     /// 撤収完了。観測できた拒否の件数を返す（呼び出し側の表示用）。
     TornDown {
         denials_written: u64,
+    },
+    /// **argv観測を頼まれたが張れなかったので、収集を始めなかった**（段階6d、§10.3 fail-closed）。
+    ///
+    /// # なぜ[`LearnResponse::Err`]と分けるのか
+    ///
+    /// 呼び出し側（ポリシーエディタのパス1）は、**この失敗だけ扱いが違う**からである——
+    /// 他の失敗はfail-open（観測できないまま記録を続ける、D-43）だが、これは記録そのものを
+    /// 始めさせない。文面で見分けると、文面を直した日に静かにfail-openへ戻る（`B-13`:
+    /// 判定の根拠を文字列に置かない）。
+    ///
+    /// **古い呼び出し側がこれを受け取ることは無い。** 断るのは`capture_argv`を要求された
+    /// ときだけで、古い側はその欄を送らない。
+    ArgvCaptureUnavailable {
+        reason: String,
     },
     Err(String),
 }
@@ -139,6 +186,13 @@ pub enum LearnError {
     Win32(String),
     #[error("refusing to launch the collector: {0}")]
     UnsafeLaunchTarget(String),
+    /// **argv観測を張れなかった**（段階6d、§10.3 fail-closed）。
+    ///
+    /// **専用の変種にしてあるのは、呼び出し側がこれだけ別扱いにするからである**——
+    /// 他の失敗は「観測できないまま記録を続ける」（fail-open）が、これは記録を始めない。
+    /// 変種で運ばないと、判定が文面の一致になる（`B-13`）。
+    #[error("argv capture is required for this recording but could not be started: {0}")]
+    ArgvCaptureUnavailable(String),
 }
 
 impl From<windows::core::Error> for LearnError {
@@ -163,11 +217,12 @@ mod tests {
             harness_pid: None,
             spawn_daemon_pid: None,
             record_all: false,
+            capture_argv: false,
         });
 
         assert_eq!(
             serde_json::to_string(&request).unwrap(),
-            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.1-2","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":null,"spawn_daemon_pid":null,"record_all":false}}"#
+            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.1-2","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":null,"spawn_daemon_pid":null,"record_all":false,"capture_argv":false}}"#
         );
     }
 
@@ -207,12 +262,31 @@ mod tests {
             harness_pid: Some(4242),
             spawn_daemon_pid: None,
             record_all: true,
+            capture_argv: true,
         });
 
         assert_eq!(
             serde_json::to_string(&request).unwrap(),
-            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.4242-1700000000","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":4242,"spawn_daemon_pid":null,"record_all":true}}"#
+            r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.4242-1700000000","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":4242,"spawn_daemon_pid":null,"record_all":true,"capture_argv":true}}"#
         );
+    }
+
+    /// 旧バージョン（`capture_argv`を持たない）が書いたJSONは`false`として読める（後方互換）。
+    ///
+    /// **既定が`false`であることが安全側である。** 読めなかった要求を`true`（argvを観測する）
+    /// として解釈すると、**誰も頼んでいない記録で枠を1本取り、fail-closedで断り始める**。
+    #[test]
+    fn start_collect_request_without_capture_argv_defaults_to_false() {
+        let old_wire = r#"{"StartCollect":{"session_profile":"harness.shell.sandbox.1-2","workspace_root":"C:/work","fs_audit_log_path":"C:/work/.harness/sandbox/session-x/fs-audit.jsonl","harness_pid":null,"record_all":true}}"#;
+
+        let request: LearnRequest = serde_json::from_str(old_wire).unwrap();
+        match request {
+            LearnRequest::StartCollect(policy) => {
+                assert!(policy.record_all, "既存の欄まで巻き添えにしていない");
+                assert!(!policy.capture_argv);
+            }
+            _ => panic!("expected StartCollect"),
+        }
     }
 
     /// **D-56段階2で足した2値のワイヤ形式。** 別プロセスが読むので、綴りが変わると
@@ -245,9 +319,10 @@ mod tests {
             serde_json::to_string(&LearnResponse::Started {
                 etw_available: true,
                 spawn_daemon_pid: Some(77),
+                argv_capture: Some(true),
             })
             .unwrap(),
-            r#"{"Started":{"etw_available":true,"spawn_daemon_pid":77}}"#
+            r#"{"Started":{"etw_available":true,"spawn_daemon_pid":77,"argv_capture":true}}"#
         );
         assert_eq!(
             serde_json::to_string(&LearnResponse::TornDown { denials_written: 7 }).unwrap(),
@@ -274,8 +349,56 @@ mod tests {
             LearnResponse::Started {
                 etw_available: true,
                 spawn_daemon_pid: None,
+                argv_capture: None,
             }
         ));
+    }
+
+    /// **argv観測の版ずれは、FS収集の版ずれより静かに壊れる。**
+    ///
+    /// 古い収集器は`capture_argv`を**知らずに捨てて**FS収集だけを始め、`Started`を返す。
+    /// 欄が`None`として読めることが、呼び出し側が「張れたとは言っていない」と断れる前提である
+    /// ——ここが`bool`だと「張れなかった」と「答えていない」が同じ`false`になり、
+    /// 断る理由が消える（`B-10`）。
+    ///
+    /// **読めたあと断るのは`client`の仕事である**（対の側は下のテスト）。
+    #[test]
+    fn a_started_from_an_older_collector_says_nothing_about_argv_capture() {
+        let parsed: LearnResponse =
+            serde_json::from_str(r#"{"Started":{"etw_available":true,"spawn_daemon_pid":77}}"#)
+                .expect("古い収集器の応答が読めない。版ずれが「電文が壊れている」に化ける");
+        match parsed {
+            LearnResponse::Started { argv_capture, .. } => assert_eq!(
+                argv_capture, None,
+                "答えていない収集器が「張れなかったと答えた」ものと同じに見えている"
+            ),
+            _ => panic!("expected Started"),
+        }
+    }
+
+    /// **対の側**（`B-35`）: 3つの状態が互いに区別できることを固定する。
+    ///
+    /// 上のテストだけだと「`None`として読めた」で終わり、**3値を潰して使う実装でも緑になる。**
+    /// argv観測を頼んだパス1が記録を始めてよいのは`Some(true)`のときだけである。
+    #[test]
+    fn argv_capture_distinguishes_unavailable_from_unanswered() {
+        let started = |wire: &str| match serde_json::from_str::<LearnResponse>(wire).expect("parse")
+        {
+            LearnResponse::Started { argv_capture, .. } => argv_capture,
+            _ => unreachable!("Startedを読ませている"),
+        };
+        let older = started(r#"{"Started":{"etw_available":true}}"#);
+        let not_requested = started(r#"{"Started":{"etw_available":true,"argv_capture":false}}"#);
+        let captured = started(r#"{"Started":{"etw_available":true,"argv_capture":true}}"#);
+
+        assert_eq!(older, None, "答えていない");
+        assert_eq!(not_requested, Some(false), "頼まれていないので張っていない");
+        assert_eq!(captured, Some(true), "張った");
+        assert_ne!(
+            older, not_requested,
+            "版が古くて答えていない収集器と、張っていないと答えた収集器が同じに見えている。\
+             パス1が「argvが取れない記録」を取れたものとして進める"
+        );
     }
 
     /// **対の側**（`B-35`）: Daemon PIDを要求したのにechoが返らなければ、それは版ずれである。

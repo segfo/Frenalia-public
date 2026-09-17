@@ -6,6 +6,8 @@
 
 use super::*;
 
+use crate::tier2a::transitions_log::MAX_DISTINCT_KEYS;
+
 use harness_policy::transition::TransitionDenial;
 
 fn transition(denial: TransitionDenial) -> DenyReason {

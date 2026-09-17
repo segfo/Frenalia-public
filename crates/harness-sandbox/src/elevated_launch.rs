@@ -251,11 +251,32 @@ pub fn validate_audit_sink_path(
     requested: &Path,
     workspace_root: &Path,
 ) -> Result<PathBuf, AuditSinkPathError> {
+    validate_sink_under(
+        requested,
+        &workspace_root.join(".harness").join("sandbox"),
+    )
+}
+
+/// [`validate_audit_sink_path`]の一般形——**書込先を`allowed_dir`配下に限定する**。
+///
+/// # なぜ2つ目の入口が要るのか
+///
+/// 昇格側が書くファイルが`.harness/sandbox/`の外にも生まれたためである
+/// （段階6dの`.harness/transitions/observed.jsonl`、§10.3）。**検証をそちらへ複製すると、
+/// ジャンクションの解決を片方だけ直した日に穴が開く**——`canonicalize`してから前方一致、
+/// という順序はここ1箇所が持つ。
+///
+/// **`allowed_dir`は呼び出し側が固定値から組むこと。** 要求から受け取った文字列を
+/// そのまま渡すと、限定そのものが攻撃者の指定になる。
+pub fn validate_sink_under(
+    requested: &Path,
+    allowed_dir: &Path,
+) -> Result<PathBuf, AuditSinkPathError> {
     if !requested.is_absolute() {
         return Err(AuditSinkPathError::NotAbsolute(requested.to_path_buf()));
     }
 
-    let sandbox_root = workspace_root.join(".harness").join("sandbox");
+    let sandbox_root = allowed_dir.to_path_buf();
     // 文字列レベルの前方一致を先に見る（解決前に明らかに外なら、そこで落とす）。
     if !starts_with_ignore_case(requested, &sandbox_root) {
         return Err(AuditSinkPathError::OutsideSandboxDir(

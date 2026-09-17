@@ -51,6 +51,12 @@ pub mod fs_passthrough_ledger;
 /// windows専用にしない（名前の導出・台帳・検証は純粋関数で、CSPRNGだけがcfg分岐する）。
 pub mod workspace_capability;
 
+/// `.harness/transitions/`へ積む記録の共通部品（段階6c・6d）。**拒否（Spawn Daemonが書く）と
+/// 候補（収集器が書く）で数え方を揃えるためにここに置く**——同じ画面が両方を読むので、
+/// 片方だけ`count`の意味が違うと読み手が取り違える。`spawnd`と同じ理由でwindows専用にしない
+/// （畳み込みと行の形は純粋で、昇格なしに単体テストできることが検証の要である）。
+pub mod transitions_log;
+
 /// Spawn Daemon（遷移MAC 段階5）のワイヤ形式とProcess Table。`session_profile`と同じ理由で
 /// モジュールごとwindows専用にはしない——電文の形とProcess Tableの判定は純粋で、
 /// **昇格なしに単体テストできることがこの機構の検証の要**だからである（§12の既定拒否・

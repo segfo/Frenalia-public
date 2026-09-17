@@ -318,6 +318,36 @@ impl MofFsSession {
         })
     }
 
+    /// 溜まったプロセス生成イベントを取り出す（**取り出した分は消える**）。
+    ///
+    /// # なぜ[`Self::stop`]だけでは足りないのか
+    ///
+    /// 貯め込みには上限があり（[`PROCESS_CAPTURE_CAPACITY`]）、**超えた分は捨てられる**。
+    /// 測定のように数十秒で終わるものなら`stop`で一括に取れるが、**製品のポリシー定義モードは
+    /// 人がコマンドを流し終えるまで続く**ので、`cargo build`のようなものを1回流せば上限に届く。
+    /// 定期的に汲み出す口が要る——[`super::session::EtwFsSession::drain`]と同じ理由・同じ形である。
+    ///
+    /// 捨てられた件数は[`Self::dropped_process_starts`]で別に取る（`B-10`: 取りこぼしを隠さない）。
+    pub fn drain_process_starts(&self) -> Vec<MofProcessStart> {
+        self.sink
+            .process_starts
+            .lock()
+            .map(|mut starts| std::mem::take(&mut *starts))
+            .unwrap_or_default()
+    }
+
+    /// 容量超過で捨てたプロセス生成イベントの**累計**。
+    ///
+    /// **`drain`しても減らない**——「取り出した件数」ではなく「観測できなかった件数」なので、
+    /// 減らすとセッション全体での取りこぼしが分からなくなる。
+    pub fn dropped_process_starts(&self) -> u64 {
+        self.sink
+            .process_dropped
+            .lock()
+            .map(|d| *d)
+            .unwrap_or_default()
+    }
+
     pub fn stop(mut self) -> MofFsOutcome {
         self.shutdown()
     }

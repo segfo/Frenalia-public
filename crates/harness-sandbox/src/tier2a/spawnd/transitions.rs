@@ -47,46 +47,18 @@
 //! **それでも欄をいま決めるのは、ファイルの形が後から変えられないからである**——
 //! 費用の話ではない。
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use super::DenyReason;
-
-/// 待ち行列の置き場（ワークスペースからの相対）。
-///
-/// **`.harness`配下から動かさないこと。** 自己参照ループ——記録の産物が次の記録の候補に
-/// なること——を断っているのは`harness_policy_editor::exclusion::is_harness_control_path`で、
-/// 同関数が見るのは**パス要素`.harness`だけ**である。ここを動かした瞬間、
-/// 待ち行列そのものが「サンドボックスから触りたいファイル」の候補として提案され始める。
-const TRANSITIONS_DIR: &str = "transitions";
+use crate::tier2a::transitions_log::{FoldedLine, Folded, FoldingLog};
+pub use crate::tier2a::transitions_log::{
+    argv_is_possibly_truncated, transitions_dir, QueueError, Recorded,
+};
 
 /// 拒否の観測を積むファイル。
 const PENDING_FILE: &str = "pending.jsonl";
-
-/// 畳み込みで覚えておく**種類**の上限。
-///
-/// 超えた分は覚えず、数だけ数えて[`PendingRecord::Overflowed`]で1行報告する。
-/// **上限を置くのは、要求がフックからも来るようになった日（6f）に備えてである**
-/// ——`cargo build`1回で数千のプロセスが起きるので、種類が無制限だとDaemonのメモリが
-/// 要求元の都合で伸びる。
-const MAX_DISTINCT_KEYS: usize = 1_024;
-
-/// argvが切り詰められている疑いの閾値（UTF-16単位）。
-///
-/// `Microsoft-Windows-Security-Mitigations`が運ぶ呼び出し元のコマンドラインは
-/// **1,024 UTF-16単位で切られる**。ちょうどこの長さの値は「たまたまこの長さだった」のか
-/// 「切られた」のかが区別できないので、**リテラルの辺の候補にしてはいけない**
-/// （`plans/DESIGN-MAC.md` §5.1(6)）。判定をここに置くのは、書く側と読む側で
-/// 閾値が食い違わないようにするためである。
-const ARGV_TRUNCATION_UTF16_UNITS: usize = 1_024;
-
-/// 待ち行列のディレクトリ。
-pub fn transitions_dir(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".harness").join(TRANSITIONS_DIR)
-}
 
 /// 拒否の観測を積むファイル。
 ///
@@ -224,14 +196,6 @@ pub fn remedy(reason: &DenyReason) -> Remedy {
     }
 }
 
-/// argvが切り詰められている疑いがあるか。
-///
-/// **「ちょうど閾値」だけを疑う。** 超えているものは切られていない（切られていれば
-/// ちょうどになる）ので、`>=`ではなく`==`である。
-pub fn argv_is_possibly_truncated(argv: &str) -> bool {
-    argv.encode_utf16().count() == ARGV_TRUNCATION_UTF16_UNITS
-}
-
 /// 拒否1件について、**観測できた事実**。
 ///
 /// # なぜ[`Option`]の欄があるのか
@@ -260,8 +224,11 @@ pub struct Observation<'a> {
 ///
 /// 理由まで鍵に入れるのは、同じコマンドが**別の理由で**断られたときに1行へ混ざらない
 /// ようにするためである（直し方が違うものを1行にすると、片方の直し方しか分からない）。
+///
+/// **`pub`なのは[`FoldedLine`]の関連型として現れるからで、外から組み立てる型ではない**
+/// （フィールドは非公開のまま）。積むときは[`Observation`]を渡す。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Key {
+pub struct Key {
     kernel: bool,
     from_domain: Option<String>,
     exe: String,
@@ -270,90 +237,40 @@ struct Key {
     reason: DenyReason,
 }
 
-/// 追記に失敗したときに、どこまで戻すか。
-#[derive(Debug, Clone, Copy)]
-enum Rollback {
-    Nothing,
-    /// 新しい種類として覚えたのを取り消す（次の同じ拒否がもう一度「1件目」になる）。
-    Forget,
-    /// 「ここまで書いた」の印を元へ戻す。
-    RestoreWrittenAt(u64),
-}
+/// 畳み方と追記の時機は[`FoldingLog`]が持つ。ここが決めるのは**鍵と行の形**だけである。
+impl FoldedLine for PendingRecord {
+    type Key = Key;
 
-/// 1種類ぶんの数え上げ。
-#[derive(Debug, Clone)]
-struct Folded {
-    count: u64,
-    /// 最後に**ファイルへ書いた**ときの`count`。次に書くのは`written_at * 2`に達したとき。
-    written_at: u64,
-    first_ts: u64,
-    last_ts: u64,
-    argv_truncation: bool,
-}
+    fn line(key: &Key, folded: &Folded) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&record_of(key, folded))
+    }
 
-/// [`TransitionQueue::record`]が実際に何をしたか。
-///
-/// **`Result<(), _>`へ潰さない**（`B-09`）。「畳んだだけで書いていない」と「書いた」が
-/// 区別できないと、受け入れテストが「常に書く」実装でも「一度も書かない」実装でも通る。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use]
-pub enum Recorded {
-    /// 新しい種類だったので、その場で1行追記した。
-    AppendedFirst,
-    /// 既にある種類の回数を増やし、しきい値に達したので更新行を追記した。
-    AppendedUpdate { count: u64 },
-    /// 回数を増やしただけ。追記していない。
-    FoldedOnly { count: u64 },
-    /// 種類の上限に達していたので、この拒否を種類として覚えなかった（回数だけ数えた）。
-    DroppedByCap,
-}
-
-/// 書けなかった理由。
-///
-/// **呼び出し側が握り潰さないように`Result`で返す**（`B-10`）。ただし
-/// **これを理由に生成要求の応答を変えてはいけない**——記録は境界ではない（`P-07`）。
-#[derive(Debug)]
-pub struct QueueError {
-    pub path: PathBuf,
-    pub message: String,
-}
-
-impl std::fmt::Display for QueueError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.path.display(), self.message)
+    fn overflow_line(dropped: u64, last_ts: u64) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&PendingRecord::Overflowed { dropped, last_ts })
     }
 }
 
-impl std::error::Error for QueueError {}
-
 /// 拒否の待ち行列。**Daemonが1つ持ち、全ての要求受付スレッドが共有する。**
+///
+/// **畳み方・追記の時機・あふれの数え方・書込失敗の巻き戻しは
+/// [`crate::tier2a::transitions_log`]が持つ**（同じディレクトリへ積む候補の記録と
+/// 数え方を揃えるため。§10.2・§10.3）。ここが持つのは拒否に固有の形だけである。
 #[derive(Debug)]
 pub struct TransitionQueue {
-    path: PathBuf,
-    state: Mutex<State>,
-}
-
-#[derive(Debug, Default)]
-struct State {
-    entries: HashMap<Key, Folded>,
-    /// 上限に達したために覚えられなかった拒否の**回数**。
-    dropped: u64,
-    /// そのうち、既に[`PendingRecord::Overflowed`]として報告済みの回数。
-    dropped_reported: u64,
+    log: FoldingLog<PendingRecord>,
 }
 
 impl TransitionQueue {
     /// `workspace_root`から置き場を導出して作る。**ファイルはまだ触らない。**
     pub fn new(workspace_root: &Path) -> Self {
         Self {
-            path: pending_path(workspace_root),
-            state: Mutex::new(State::default()),
+            log: FoldingLog::new(pending_path(workspace_root)),
         }
     }
 
     /// 積む先。診断とテスト用。
     pub fn path(&self) -> &Path {
-        &self.path
+        self.log.path()
     }
 
     /// Daemonが拒否した1件を積む。
@@ -394,79 +311,7 @@ impl TransitionQueue {
             reason: observation.reason.clone(),
         };
 
-        let (outcome, line, rollback) = {
-            let mut state = self.lock();
-            match state.entries.get_mut(&key) {
-                Some(folded) => {
-                    folded.count += 1;
-                    folded.last_ts = now_ms;
-                    if folded.count >= folded.written_at.saturating_mul(2) {
-                        let previous = folded.written_at;
-                        folded.written_at = folded.count;
-                        let record = record_of(&key, folded);
-                        (
-                            Recorded::AppendedUpdate {
-                                count: folded.count,
-                            },
-                            Some(record),
-                            Rollback::RestoreWrittenAt(previous),
-                        )
-                    } else {
-                        (
-                            Recorded::FoldedOnly {
-                                count: folded.count,
-                            },
-                            None,
-                            Rollback::Nothing,
-                        )
-                    }
-                }
-                None => {
-                    if state.entries.len() >= MAX_DISTINCT_KEYS {
-                        state.dropped += 1;
-                        (Recorded::DroppedByCap, None, Rollback::Nothing)
-                    } else {
-                        let folded = Folded {
-                            count: 1,
-                            written_at: 1,
-                            first_ts: now_ms,
-                            last_ts: now_ms,
-                            argv_truncation: argv_is_possibly_truncated(argv),
-                        };
-                        let record = record_of(&key, &folded);
-                        state.entries.insert(key.clone(), folded);
-                        (Recorded::AppendedFirst, Some(record), Rollback::Forget)
-                    }
-                }
-            }
-        };
-
-        if let Some(record) = line {
-            if let Err(e) = self.append(&record) {
-                self.roll_back(&key, rollback);
-                return Err(e);
-            }
-        }
-        Ok(outcome)
-    }
-
-    /// 書けなかったときに、**次の機会に書き直せる状態へ戻す**（`B-15`: 記録は実体の完成後）。
-    ///
-    /// 戻さないと、1回の書込失敗でその種類が**永久に待ち行列へ現れなくなる**——
-    /// 覚えている側は「書いた」と思っているので、二度と書こうとしない。
-    fn roll_back(&self, key: &Key, rollback: Rollback) {
-        let mut state = self.lock();
-        match rollback {
-            Rollback::Nothing => {}
-            Rollback::Forget => {
-                state.entries.remove(key);
-            }
-            Rollback::RestoreWrittenAt(previous) => {
-                if let Some(folded) = state.entries.get_mut(key) {
-                    folded.written_at = previous;
-                }
-            }
-        }
+        self.log.record(key, argv, now_ms)
     }
 
     /// Daemonを畳むときに、**まだ書いていない回数を全部書き出す**。
@@ -474,87 +319,9 @@ impl TransitionQueue {
     /// 戻り値は追記した行数。**`Result<(), _>`へ潰さない**——0行だったことと
     /// 書けなかったことが区別できないと、後から「積まれていない」の原因が追えない（`B-09`）。
     pub fn flush(&self, now_ms: u64) -> Result<usize, QueueError> {
-        // **「書いた」印を付けるのは追記が成功した後である**（`B-15`）。先に付けてから
-        // 途中で失敗すると、まだ書いていない回数が「書いた」ことにされて永久に失われる。
-        let stale: Vec<(Key, PendingRecord, u64)> = {
-            let state = self.lock();
-            state
-                .entries
-                .iter()
-                .filter(|(_, folded)| folded.count != folded.written_at)
-                .map(|(key, folded)| (key.clone(), record_of(key, folded), folded.count))
-                .collect()
-        };
-
-        let mut written = 0usize;
-        for (key, record, count) in stale {
-            self.append(&record)?;
-            written += 1;
-            let mut state = self.lock();
-            if let Some(folded) = state.entries.get_mut(&key) {
-                folded.written_at = count;
-            }
-        }
-
-        let dropped = {
-            let state = self.lock();
-            (state.dropped > state.dropped_reported).then_some(state.dropped)
-        };
-        if let Some(dropped) = dropped {
-            self.append(&PendingRecord::Overflowed {
-                dropped,
-                last_ts: now_ms,
-            })?;
-            written += 1;
-            self.lock().dropped_reported = dropped;
-        }
-        Ok(written)
+        self.log.flush(now_ms)
     }
 
-    /// 1行追記する。
-    ///
-    /// # 毎回開き直す
-    ///
-    /// 掴みっぱなしにしない。**畳み込みのおかげで追記は回数の対数にしかならない**ので、
-    /// 開き直す費用は問題にならない。掴んだままにすると、ユーザーがファイルを消したときに
-    /// 「書いているつもりで誰にも見えない場所へ書き続ける」状態になる。
-    ///
-    /// # 親ディレクトリは本来ここで作られない
-    ///
-    /// 置き場は**非特権のharnessが先に作る**（§10.2、[BUG-109](../../../../../docs/bugs/BUG-109.md)）。
-    /// ここの`create_dir_all`は先行作成が失敗したときの保険で、**Daemonは昇格していない**ので
-    /// ここで作っても所有者は同じユーザーになる。昇格した購読者が来る日には、
-    /// そちら側で同じことをしてはいけない。
-    fn append(&self, record: &PendingRecord) -> Result<(), QueueError> {
-        use std::io::Write;
-
-        let mut line = serde_json::to_string(record).map_err(|e| self.err(e.to_string()))?;
-        line.push('\n');
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| self.err(e.to_string()))?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| self.err(e.to_string()))?;
-        file.write_all(line.as_bytes())
-            .map_err(|e| self.err(e.to_string()))
-    }
-
-    fn err(&self, message: String) -> QueueError {
-        QueueError {
-            path: self.path.clone(),
-            message,
-        }
-    }
-
-    /// 毒されたロックでも先へ進む。**待ち行列が壊れても生成の判定は止めない**
-    /// ——記録は境界ではない（`P-07`）。
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
 }
 
 fn record_of(key: &Key, folded: &Folded) -> PendingRecord {

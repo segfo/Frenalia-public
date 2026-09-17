@@ -120,6 +120,7 @@ fn a_rejected_request_does_not_kill_the_connection() {
         harness_pid: None,
         spawn_daemon_pid: None,
         record_all: false,
+        capture_argv: false,
     }));
     assert!(
         matches!(rejected, LearnResponse::Err(_)),
@@ -168,6 +169,7 @@ fn a_second_generation_starts_a_fresh_session_and_a_fresh_sink() {
         harness_pid: Some(std::process::id()),
         spawn_daemon_pid: None,
         record_all: false,
+        capture_argv: false,
     };
 
     let mut session = super::client::CollectorSession::new();
@@ -225,7 +227,9 @@ fn a_second_generation_starts_a_fresh_session_and_a_fresh_sink() {
 /// 「本体exe」は`target/debug/deps/`のテストバイナリなので、そのままでは空振りする。
 /// **見つからないことを`SKIP`で流さない**——「テストが走っていない」と「テストが通った」が
 /// 区別できなくなる（BUG-056）。
-fn ensure_collector_next_to_test_binary() -> PathBuf {
+/// **段階6dのE2E（`argv_e2e_tests`）も同じものを使う。** コピーを作ると、
+/// 「古いビルドを黙って測らない」という性質を片方だけ直す日が来る。
+pub(super) fn ensure_collector_next_to_test_binary() -> PathBuf {
     static PLACED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     PLACED
         .get_or_init(place_collector_next_to_test_binary)

@@ -488,6 +488,11 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 harness_pid: Some(std::process::id()),
                 spawn_daemon_pid: spawn_daemon.as_ref().map(|daemon| daemon.daemon_pid()),
                 record_all: false,
+                // **通常運用ではargvを観測しない**（段階6d、§10.3）。ここはTier2aで走る
+                // 普段のセッションなので、生成を見るのはSpawn Daemonであり、argv観測は
+                // ポリシー定義モード（エディタのパス1）の候補生成専用の道具である。
+                // **枠はマシン全体で8本しかない**ので、要らない経路で取らない。
+                capture_argv: false,
             };
 
             // (A) netfilterdが**実際に収集器を起こせた**ときだけ接続を待つ（BUG-093）。

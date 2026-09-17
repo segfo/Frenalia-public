@@ -467,6 +467,9 @@ fn run_learn(
         harness_pid: Some(std::process::id()),
         spawn_daemon_pid: None,
         record_all: false,
+        // **`harness policy learn`はargvを観測しない**（段階6d、§10.3）。この経路が集めるのは
+        // 隔離が効いた状態でのFS拒否で、遷移の辺の候補は取れない（生成は起きる前に断られる）。
+        capture_argv: false,
     }) {
         Ok(handle) => Some(handle),
         Err(e) => {

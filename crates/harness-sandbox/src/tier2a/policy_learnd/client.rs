@@ -92,24 +92,8 @@ impl PolicyLearnHandle {
             .map_err(|e| LearnError::Ipc(e.to_string()))?;
         let response = read_framed_timeout(self.pipe, START_RESPONSE_TIMEOUT)
             .map_err(|e| LearnError::Ipc(e.to_string()))?;
-        match serde_json::from_slice::<LearnResponse>(&response) {
-            Ok(LearnResponse::Started {
-                etw_available,
-                spawn_daemon_pid,
-            }) if spawn_daemon_pid == policy.spawn_daemon_pid => {
-                self.etw_available = etw_available;
-                Ok(())
-            }
-            Ok(LearnResponse::Started { .. }) => Err(LearnError::Ipc(
-                "the collector did not echo the requested Spawn Daemon PID; it is an older build \
-                 that ignores the field (stop the resident collector and let this session start a \
-                 fresh one)"
-                    .to_string(),
-            )),
-            Ok(LearnResponse::Err(message)) => Err(LearnError::Rejected(message)),
-            Ok(other) => Err(LearnError::Ipc(format!("unexpected response: {other:?}"))),
-            Err(e) => Err(LearnError::Ipc(format!("malformed response: {e}"))),
-        }
+        self.etw_available = accept_started(&response, policy)?;
+        Ok(())
     }
 
     fn teardown(&mut self) -> Result<u64, LearnError> {
@@ -429,6 +413,11 @@ pub fn daemon_is_dead(error: &LearnError) -> bool {
     match error {
         // 受信側が答えを返した＝生きている。
         LearnError::Rejected(_) => false,
+        // **argv観測が張れなかった**（段階6d）。答えが返っている＝daemonは生きているし、
+        // 足りないのはマシン全体のETWの枠なので、**起こし直しても同じ拒否に着く**
+        // （UACが1回増えるだけ）。版ずれで欄を答えない古い収集器も同じで、
+        // 直す手は「常駐を畳んで起こし直す」であって「もう1つ起こす」ではない。
+        LearnError::ArgvCaptureUnavailable(_) => false,
         // パイプが壊れた・応答が来ない＝死んでいる可能性が高い。
         LearnError::Ipc(_) | LearnError::Win32(_) => true,
         // 起動そのものに失敗した（そもそもdaemonが居ない）。
@@ -461,13 +450,25 @@ pub fn daemon_is_dead(error: &LearnError) -> bool {
 /// [`PolicyLearnHandle::start_collect`]と、起こした直後の[`handshake`]）ので、
 /// 「送る前に作る」を各所へ書くと3つ目が生えたときに片方だけ漏れる（B-06: 選ぶ自由を奪う）。
 fn start_collect_bytes(policy: &LearnPolicy) -> Result<Vec<u8>, LearnError> {
-    precreate_audit_sink(policy);
+    precreate_sink(&policy.fs_audit_log_path, "policy-learn audit sink");
+    if policy.capture_argv {
+        // **候補の積み先も先に作る**（段階6d）。書き手は同じ昇格プロセスなので、
+        // 先に作らなければ所有者が`BUILTIN\Administrators`になる——ここは
+        // `.harness/`配下＝制御面なので、次の起動で`.harness/**`の保護が完成せず
+        // Tier2aが丸ごと中止する（[BUG-109](../../../../docs/bugs/BUG-109.md)と同じ形）。
+        //
+        // **拒否の待ち行列（`pending.jsonl`）には要らない。** あちらの書き手は
+        // Spawn Daemonで、**昇格していない**（§10.2の書き手の表）。
+        precreate_sink(
+            &super::observed::observed_path(&policy.workspace_root),
+            "observed transition candidates",
+        );
+    }
     serde_json::to_vec(&LearnRequest::StartCollect(policy.clone()))
         .map_err(|e| LearnError::Ipc(format!("failed to serialize StartCollect: {e}")))
 }
 
-fn precreate_audit_sink(policy: &LearnPolicy) {
-    let path = &policy.fs_audit_log_path;
+fn precreate_sink(path: &std::path::Path, what: &str) {
     if path.exists() {
         return;
     }
@@ -480,9 +481,9 @@ fn precreate_audit_sink(policy: &LearnPolicy) {
         .open(path)
     {
         eprintln!(
-            "warning: could not pre-create the policy-learn audit sink {}: {e}. The elevated \
-             collector will create it instead, which leaves it owned by Administrators and \
-             makes the control-plane protection fail on later runs (see docs/bugs/BUG-109.md)",
+            "warning: could not pre-create the {what} {}: {e}. The elevated collector will \
+             create it instead, which leaves it owned by Administrators and makes the \
+             control-plane protection fail on later runs (see docs/bugs/BUG-109.md)",
             path.display()
         );
     }
@@ -500,17 +501,68 @@ fn handshake(pipe: HANDLE, policy: &LearnPolicy) -> Result<bool, LearnError> {
         .map_err(|e| LearnError::Ipc(e.to_string()))?;
     let response = read_framed_timeout(pipe, START_RESPONSE_TIMEOUT)
         .map_err(|e| LearnError::Ipc(e.to_string()))?;
-    match serde_json::from_slice::<LearnResponse>(&response) {
+    accept_started(&response, policy)
+}
+
+/// `StartCollect`の応答を受理してよいかを判定し、ETWセッションが張れたかを返す。
+///
+/// # なぜ関数にしてあるのか
+///
+/// **`StartCollect`を送る経路が2つあるからである**——収集器を起こして最初の記録を始める
+/// [`handshake`]と、生きている収集器への[`PolicyLearnHandle::start_collect`]
+/// （2回目以降。D-56段階2でUACを出さないために足した経路）。かつては同じ照合が両方へ
+/// 複製されており、**新しい検問を足すときに片方だけへ足せてしまう形**だった（`B-06`）。
+///
+/// # 断る3つの理由（いずれも「この記録は始めさせない」）
+///
+/// 1. **Spawn Daemon PIDをechoしない**——Daemonが親になった子をスコープ判定が拾えない
+/// 2. **argv観測を頼んだのに「張っていない」と答えた**——候補が1件も出ない記録になる（§10.3）
+/// 3. **argv観測を頼んだのに何も答えない**——古い収集器が欄ごと捨てている
+///
+/// **2と3を同じ文面で断らない。** 運用者の打つ手が違う——2は枠を空ける、
+/// 3は常駐している収集器を畳んで起こし直す。
+fn accept_started(response: &[u8], policy: &LearnPolicy) -> Result<bool, LearnError> {
+    match serde_json::from_slice::<LearnResponse>(response) {
         Ok(LearnResponse::Started {
             etw_available,
             spawn_daemon_pid,
-        }) if spawn_daemon_pid == policy.spawn_daemon_pid => Ok(etw_available),
-        Ok(LearnResponse::Started { .. }) => Err(LearnError::Ipc(
-            "the collector did not echo the requested Spawn Daemon PID; it is an older build \
-                 that ignores the field (stop the resident collector and let this session start a \
-                 fresh one)"
-                    .to_string(),
-        )),
+            argv_capture,
+        }) => {
+            if spawn_daemon_pid != policy.spawn_daemon_pid {
+                return Err(LearnError::Ipc(
+                    "the collector did not echo the requested Spawn Daemon PID; it is an older \
+                     build that ignores the field (stop the resident collector and let this \
+                     session start a fresh one)"
+                        .to_string(),
+                ));
+            }
+            if policy.capture_argv {
+                match argv_capture {
+                    Some(true) => {}
+                    Some(false) => {
+                        return Err(LearnError::ArgvCaptureUnavailable(
+                            "the collector started, but not the argv (command line) capture \
+                             session, so this recording would observe no process-transition \
+                             candidates; free a system logger slot and retry \
+                             (logman query -ets lists the sessions holding them)"
+                                .to_string(),
+                        ))
+                    }
+                    None => {
+                        return Err(LearnError::ArgvCaptureUnavailable(
+                            "the collector did not report whether it captured argv; it is an \
+                             older build that ignores the field (stop the resident collector and \
+                             let this session start a fresh one)"
+                                .to_string(),
+                        ))
+                    }
+                }
+            }
+            Ok(etw_available)
+        }
+        Ok(LearnResponse::ArgvCaptureUnavailable { reason }) => {
+            Err(LearnError::ArgvCaptureUnavailable(reason))
+        }
         Ok(LearnResponse::Err(message)) => Err(LearnError::Rejected(message)),
         Ok(other) => Err(LearnError::Ipc(format!("unexpected response: {other:?}"))),
         Err(e) => Err(LearnError::Ipc(format!("malformed response: {e}"))),
@@ -571,6 +623,7 @@ mod client_tests {
             harness_pid: None,
             spawn_daemon_pid: None,
             record_all: false,
+            capture_argv: false,
         }
     }
 
@@ -606,6 +659,123 @@ mod client_tests {
         );
         // 依頼そのものが壊れていないことも同時に見る（作るだけになっていないか）。
         assert!(String::from_utf8_lossy(&bytes).contains("StartCollect"));
+    }
+
+    fn started(etw: bool, argv_capture: Option<bool>) -> Vec<u8> {
+        serde_json::to_vec(&LearnResponse::Started {
+            etw_available: etw,
+            spawn_daemon_pid: None,
+            argv_capture,
+        })
+        .unwrap()
+    }
+
+    /// **[段階6d] fail-closedの本体**（§10.3）。argv観測を頼んだ記録は、
+    /// 「張った」と答えられない限り始まらない。
+    ///
+    /// ここが`accept_started`を直接測るのは、**`StartCollect`を送る経路が2つある**
+    /// （初回の`handshake`と、生きている収集器への`start_collect`）からである。
+    /// 経路側で測ると、片方だけ検問を足した実装でも緑になる（`B-06`）。
+    #[test]
+    fn a_recording_that_asked_for_argv_is_refused_unless_the_collector_captured_it() {
+        let mut asked = policy(PathBuf::from("C:/x/fs-audit.jsonl"));
+        asked.capture_argv = true;
+
+        // 張った → 通る。
+        assert!(accept_started(&started(true, Some(true)), &asked).is_ok());
+
+        // 張っていないと答えた → 断る（枠を空ける、が打つ手）。
+        let refused = accept_started(&started(true, Some(false)), &asked).unwrap_err();
+        assert!(
+            matches!(refused, LearnError::ArgvCaptureUnavailable(_)),
+            "{refused:?}"
+        );
+
+        // 版が古くて答えない → 断る（常駐を畳んで起こし直す、が打つ手）。
+        let stale = accept_started(&started(true, None), &asked).unwrap_err();
+        assert!(
+            matches!(stale, LearnError::ArgvCaptureUnavailable(_)),
+            "版ずれの収集器が「argvを観測した」ものとして通っている: {stale:?}"
+        );
+        // **2つの断りは文面が違う**——打つ手が違うので、同じ文面にすると運用者が迷う。
+        assert_ne!(refused.to_string(), stale.to_string());
+    }
+
+    /// **対の側**（`B-35`）: argvを頼んでいない記録は、古い収集器でも通る。
+    ///
+    /// これが無いと「常に断る」実装でも上のテストは緑になり、**通常運用のFS拒否収集まで
+    /// 止まる**（fail-closedの波及範囲はエディタのパス1だけ、という決定に反する）。
+    #[test]
+    fn a_recording_that_did_not_ask_for_argv_still_accepts_an_older_collector() {
+        let not_asked = policy(PathBuf::from("C:/x/fs-audit.jsonl"));
+        assert!(!not_asked.capture_argv);
+
+        assert!(accept_started(&started(true, None), &not_asked).is_ok());
+        assert!(accept_started(&started(false, None), &not_asked).is_ok());
+    }
+
+    /// 収集器が「張れなかったので始めなかった」と答えた場合も、同じ変種で伝わる。
+    ///
+    /// **文面ではなく変種で運ぶ**（`B-13`）——呼び出し側（エディタのパス1）はこの失敗だけ
+    /// 記録を中止するので、文面で見分けると文面を直した日に静かにfail-openへ戻る。
+    #[test]
+    fn the_collectors_own_refusal_arrives_as_the_same_variant() {
+        let mut asked = policy(PathBuf::from("C:/x/fs-audit.jsonl"));
+        asked.capture_argv = true;
+        let response = serde_json::to_vec(&LearnResponse::ArgvCaptureUnavailable {
+            reason: "ERROR_NO_SYSTEM_RESOURCES".to_string(),
+        })
+        .unwrap();
+
+        let error = accept_started(&response, &asked).unwrap_err();
+        assert!(
+            matches!(error, LearnError::ArgvCaptureUnavailable(_)),
+            "{error:?}"
+        );
+        // **起こし直しても直らない**（答えが返っている＝daemonは生きている）。
+        assert!(!daemon_is_dead(&error), "UACをもう1回出しても同じ拒否に着く");
+    }
+
+    /// **[段階6d] 候補の積み先も、依頼する側（非昇格）が先に作る。**
+    ///
+    /// `observed.jsonl`を書くのは**昇格した収集器**（`pending.jsonl`を書くSpawn Daemonとは
+    /// 違って昇格している）。先に作らなければ所有者が`BUILTIN\Administrators`になり、
+    /// `.harness/**`の保護が完成せずTier2aが丸ごと中止する——BUG-109と同じ形である。
+    ///
+    /// **測る対象は`start_collect_bytes`**（送信点2つが通る関数）。`precreate_sink`を
+    /// 直接呼ぶと「配線されていなくても緑」になる。
+    #[test]
+    fn the_candidate_sink_exists_before_the_collector_is_asked_to_open_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut policy = policy(tmp.path().join("sandbox").join("s-1").join("fs-audit.jsonl"));
+        policy.workspace_root = tmp.path().to_path_buf();
+        policy.capture_argv = true;
+        let observed = super::super::observed::observed_path(tmp.path());
+        assert!(!observed.exists());
+
+        start_collect_bytes(&policy).expect("serialize StartCollect");
+
+        assert!(
+            observed.exists(),
+            "収集器へ渡す前に積み先が無ければ、作るのは昇格側になる: {}",
+            observed.display()
+        );
+    }
+
+    /// **対の側**（`B-35`）: argv観測を頼んでいない記録は、候補の積み先を作らない。
+    ///
+    /// 常に作ると、`.harness/transitions/`が**使われていないワークスペースにも**現れ、
+    /// 「候補を集めた記録がある」と読めてしまう。
+    #[test]
+    fn a_recording_without_argv_capture_does_not_create_the_candidate_sink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut policy = policy(tmp.path().join("sandbox").join("s-1").join("fs-audit.jsonl"));
+        policy.workspace_root = tmp.path().to_path_buf();
+        policy.capture_argv = false;
+
+        start_collect_bytes(&policy).expect("serialize StartCollect");
+
+        assert!(!super::super::observed::observed_path(tmp.path()).exists());
     }
 
     /// **既にあるシンクの中身を消さない。** 収集器は`append`で開くので、こちらが

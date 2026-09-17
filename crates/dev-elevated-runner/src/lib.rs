@@ -563,6 +563,23 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "policy_learnd::reuse_tests",
         ],
     ),
+    // 段階6d（argv観測の製品化、`plans/DESIGN-MAC-ENFORCEMENT.md` §10.3）の受け入れ。
+    // **直列で撃つ**——片方はマシン全体のsystem loggerの枠を意図的に埋めるので、
+    // 並行して走る測定があると道連れにする（`--test-threads=1`）。
+    (
+        "policy-learn-argv",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "policy_learnd::argv_e2e_tests",
+        ],
+    ),
     (
         "e2e-loopback-exemption",
         &[

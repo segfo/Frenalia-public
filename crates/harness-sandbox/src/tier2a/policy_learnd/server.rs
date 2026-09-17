@@ -31,10 +31,12 @@ use windows::Win32::Storage::FileSystem::{
 
 use harness_policy::event::{FsAuditEvent, FsAuditKind};
 
+use super::etw::mof::MofFsSession;
 use super::etw::parse::{to_settings_path, AccessRecord, Denial};
 use super::etw::scope::{ScopeTracker, ScopeVerdict};
 use super::etw::session::EtwFsSession;
 use super::etw::volumes::drive_letter_map;
+use super::observed::{ArgvEvent, ObservedCandidates, Resolution};
 use super::{LearnError, LearnPolicy, LearnRequest, LearnResponse};
 use crate::elevated_launch::validate_audit_sink_path;
 use crate::win_common::wide;
@@ -88,6 +90,11 @@ pub fn serve(pipe_name: &str) -> Result<(), LearnError> {
 struct Generation {
     /// `None`ならETWを張れなかった（D-43 fail-open。事実は制御レコードに残る）。
     session: Option<EtwFsSession>,
+    /// argv観測のセッション（段階6d、§10.3）。**`capture_argv`のときだけ`Some`**で、
+    /// **張れなければこの世代は作られない**（fail-open のFS側とは逆。§10.3）。
+    argv_session: Option<MofFsSession>,
+    /// 観測した候補の積み先。`argv_session`と対で`Some`になる。
+    candidates: Option<ObservedCandidates>,
     sink_path: std::path::PathBuf,
     tracker: ScopeTracker,
     tree: ProcessTree,
@@ -97,8 +104,19 @@ struct Generation {
 }
 
 impl Generation {
-    /// 検証済みの要求からETWセッションを張る。**張れなくても`Some`を返す**（fail-open）。
-    fn start(policy: &LearnPolicy, sink_path: std::path::PathBuf) -> Self {
+    /// 検証済みの要求からETWセッションを張る。
+    ///
+    /// # 2つのセッションで扱いが逆である（§10.3）
+    ///
+    /// - **FS収集**は張れなくても世代を作る（D-43 fail-open）。harnessは止めず、
+    ///   張れなかった事実は制御レコードに残る
+    /// - **argv観測**は張れなければ`Err`を返し、**記録そのものを始めさせない**（fail-closed）。
+    ///   黙ってargv無しで続けると「argvが観測されなかった辺」と「argvを観測できなかった辺」が
+    ///   区別できなくなる
+    ///
+    /// **この非対称は意図であって書き漏れではない。** 応答（`LearnResponse::Err`）と
+    /// 制御レコードの両方に出すのも同じ理由で、片方だけを見た人がもう片方も同じだと読むためである。
+    fn start(policy: &LearnPolicy, sink_path: std::path::PathBuf) -> Result<Self, String> {
         // [BUG-117] **自分のセッションを張る前に、所有者の死んだ残留セッションを回収する。**
         // 撤収は`stop()`と`Drop`しかなく、どちらも`TerminateProcess`では走らない。
         // 名前は起動のたびに変わるので`ERROR_ALREADY_EXISTS`の分岐には当たらず、
@@ -130,17 +148,64 @@ impl Generation {
                 None
             }
         };
-        if let Some(session) = session.as_ref() {
-            if !session.kernel_process_enabled() {
-                append_control(
-                    &sink_path,
-                    "kernel_process_provider_unavailable: scoping falls back to per-PID token \
-                     queries, which cannot resolve processes that already exited",
-                );
-            }
+        let kernel_process_enabled = session
+            .as_ref()
+            .map(|session| session.kernel_process_enabled())
+            .unwrap_or(false);
+        if session.is_some() && !kernel_process_enabled {
+            append_control(
+                &sink_path,
+                "kernel_process_provider_unavailable: scoping falls back to per-PID token \
+                 queries, which cannot resolve processes that already exited",
+            );
         }
-        Self {
+
+        let (argv_session, candidates) = if policy.capture_argv {
+            // **exeのフルパスはマニフェスト側からしか来ない**（`observed`のモジュールdoc）。
+            // プロセス生成のプロバイダが載っていないと、argvが取れても突き合わせる相手が
+            // 居らず候補が1件も出ない——**「張れたが何も出ない記録」を作らない**ので、
+            // ここもfail-closedにする（§10.3の趣旨はセッションの本数ではなく、
+            // 「候補が出ない記録を黙って続けない」ことである）。
+            if !kernel_process_enabled {
+                let reason = "argv capture was requested, but the Kernel-Process provider is not \
+                              available in this session, so observed command lines could not be \
+                              matched to a full image path (no candidate could be produced)";
+                append_control(&sink_path, "argv_capture_unavailable: no kernel-process provider");
+                return Err(reason.to_string());
+            }
+            let argv_name = format!(
+                "{}{}",
+                super::etw::session::ARGV_SESSION_PREFIX,
+                policy.session_profile
+            );
+            match MofFsSession::start_process_only(&argv_name) {
+                Ok(session) => {
+                    append_control(&sink_path, "argv_capture_started: fail-closed (a recording is \
+                                                refused when this session cannot be started)");
+                    (
+                        Some(session),
+                        Some(ObservedCandidates::new(&policy.workspace_root)),
+                    )
+                }
+                Err(e) => {
+                    // **黙って続けない。** 制御レコードにも残す——応答だけに書くと、
+                    // 後からログを読む人には「FS収集と同じくfail-openだった」と見える。
+                    append_control(&sink_path, &format!("argv_capture_unavailable: {e}"));
+                    return Err(format!(
+                        "could not start the argv capture session ({e}); it needs one of the \
+                         machine-wide system logger slots (8 max, and they are shared with EDR \
+                         and profiling tools). Free one and retry: logman query -ets"
+                    ));
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
             session,
+            argv_session,
+            candidates,
             sink_path,
             tracker: ScopeTracker::new(policy.session_profile.clone())
                 .with_harness_pid(policy.harness_pid)
@@ -149,7 +214,12 @@ impl Generation {
             dropped: Dropped::default(),
             written: 0,
             record_all: policy.record_all,
-        }
+        })
+    }
+
+    /// argv観測を張ったか（応答の`argv_capture`欄。要求した値のechoではない）。
+    fn argv_capture(&self) -> bool {
+        self.argv_session.is_some()
     }
 
     fn etw_available(&self) -> bool {
@@ -158,6 +228,14 @@ impl Generation {
 
     /// 溜まったイベントを1バッチ書き出す。
     fn drain(&mut self, volumes: &[(String, String)]) {
+        // **FS側を先に回す。** 候補の突き合わせはマニフェスト側が埋める台帳
+        // （`tracker`・`tree`）を引くので、順序を逆にすると同じバッチで届いた生成が
+        // 毎回1回ぶん持ち越される（結果は変わらないが、持ち越しが常に満杯になる）。
+        self.drain_fs(volumes);
+        self.drain_argv(volumes);
+    }
+
+    fn drain_fs(&mut self, volumes: &[(String, String)]) {
         let Some(session) = self.session.as_ref() else {
             return;
         };
@@ -186,6 +264,51 @@ impl Generation {
         };
     }
 
+    /// argv観測の1バッチを候補へ落とす（段階6d）。
+    ///
+    /// **exeのフルパスと親はマニフェスト側の台帳から引く**——MOFの`ImageFileName`は
+    /// 葉の名前しか持たず、`argv[0]`は呼び出し元が書いた綴りのままだからである
+    /// （実測、`plans/etw-spike/RESULTS.md` §22.4）。
+    fn drain_argv(&mut self, _volumes: &[(String, String)]) {
+        // 台帳（`tracker`・`tree`）と積み先（`candidates`）を同時に可変で借りるので、
+        // フィールドごとに分解して借りる。
+        let Generation {
+            argv_session: Some(session),
+            candidates: Some(candidates),
+            tracker,
+            tree,
+            sink_path,
+            ..
+        } = self
+        else {
+            return;
+        };
+
+        let mut events = Vec::new();
+        for start in session.drain_process_starts() {
+            match (start.pid, start.command_line) {
+                (Some(pid), Some(argv)) => events.push(ArgvEvent { pid, argv }),
+                // **コマンドラインが無い版が届いた**（`Process_V2`未満）か、pidが無い。
+                // どちらも突き合わせようがないので数える（黙って捨てない）。
+                _ => candidates.count_missing_command_line(),
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+
+        let now = harness_policy::event::now_unix_ms();
+        let result = candidates.observe(
+            events,
+            |pid| resolve_for_candidate(pid, tracker, tree),
+            now,
+        );
+        if let Err(e) = result {
+            // **記録の失敗で収集を止めない**（`P-07`）。事実は制御レコードへ残す。
+            append_control(sink_path, &format!("argv_candidate_write_failed: {e}"));
+        }
+    }
+
     /// 最後の取り残しを回収し、ETWセッションを止め、統計を制御レコードとして残す。
     /// **この世代で**書けた件数を返す。
     fn finish(mut self, volumes: &[(String, String)]) -> u64 {
@@ -194,7 +317,119 @@ impl Generation {
             let outcome = session.stop();
             record_collection_stats(&self.sink_path, &outcome, &self.tracker, &self.dropped);
         }
+        if let Some(session) = self.argv_session.take() {
+            let dropped = session.dropped_process_starts();
+            let outcome = session.stop();
+            // **止めたあとに最後の1バッチが残っている。** `stop`は溜まっている分を
+            // `MofFsOutcome`で返すので、そこから拾わないと**記録の末尾が丸ごと落ちる**。
+            if let Some(candidates) = self.candidates.as_mut() {
+                let now = harness_policy::event::now_unix_ms();
+                let mut events = Vec::new();
+                for start in outcome.process_starts {
+                    match (start.pid, start.command_line) {
+                        (Some(pid), Some(argv)) => events.push(ArgvEvent { pid, argv }),
+                        _ => candidates.count_missing_command_line(),
+                    }
+                }
+                let tracker = &mut self.tracker;
+                let tree = &self.tree;
+                let _ = candidates.observe(
+                    events,
+                    |pid| resolve_for_candidate(pid, tracker, tree),
+                    now,
+                );
+                if let Err(e) = candidates.finish(now) {
+                    append_control(&self.sink_path, &format!("argv_candidate_write_failed: {e}"));
+                }
+                record_argv_stats(&self.sink_path, candidates.stats(), dropped);
+            }
+        }
         self.written
+    }
+}
+
+/// 観測したpidを、候補の1行にできるかどうかへ畳む（段階6d）。
+///
+/// **スコープ判定は既存の[`ScopeTracker`]に任せる**——同じ判定を2つ作ると、直したときに
+/// FSの記録と候補の記録で「対象」の意味が食い違う。`probe`を渡さないのは、record-allの
+/// 経路では`OpenProcess`照会がTier1のプロセスに対して確定的に「AppContainerではない」と
+/// 答えてしまい、**対象を永久に除外する**ためである（`LearnPolicy::record_all`のdoc）。
+///
+/// スコープは分かるが素性が台帳に無い場合は[`Resolution::Unknown`]を返す——
+/// **マニフェスト側のイベントがまだ届いていないだけ**かもしれないので、
+/// 呼び出し側（[`ObservedCandidates::observe`]）が1度だけ持ち越してやり直す。
+fn resolve_for_candidate(pid: u32, tracker: &mut ScopeTracker, tree: &ProcessTree) -> Resolution {
+    match tracker.classify(pid, |_| None) {
+        ScopeVerdict::OutOfScope => Resolution::OutOfScope,
+        ScopeVerdict::Unknown => Resolution::Unknown,
+        ScopeVerdict::InScope => match tree.get(&pid) {
+            // 実行像が未知のボリュームだったものは`exe: None`になり、候補にせず数えられる
+            // （生のNTパスを載せない——読む側で「宣言へ書ける値」と誤解され得るため）。
+            Some(identity) => Resolution::InScope {
+                exe: identity.image_name.clone(),
+                parent_exe: identity
+                    .parent_pid
+                    .and_then(|parent| tree.get(&parent))
+                    .and_then(|parent| parent.image_name.clone()),
+            },
+            None => Resolution::Unknown,
+        },
+    }
+}
+
+/// argv観測の取りこぼしを制御レコードへ残す（D-43: 隠さない）。
+///
+/// **0件の項目は書かない。** 全部書くと、実際に落ちているものが並びに埋もれる。
+fn record_argv_stats(
+    sink_path: &Path,
+    stats: super::observed::ArgvStats,
+    dropped_by_capacity: u64,
+) {
+    append_control(
+        sink_path,
+        &format!(
+            "argv_capture_summary: recorded={} out_of_scope={}",
+            stats.recorded, stats.out_of_scope
+        ),
+    );
+    if stats.unresolved > 0 {
+        append_control(
+            sink_path,
+            &format!(
+                "argv_without_image: {} observed command line(s) could not be matched to a \
+                 process start from the Kernel-Process provider, so they produced no candidate",
+                stats.unresolved
+            ),
+        );
+    }
+    if stats.without_exe > 0 {
+        append_control(
+            sink_path,
+            &format!(
+                "argv_without_settings_path: {} process(es) started from an image path that \
+                 cannot be expressed in settings (unmapped volume)",
+                stats.without_exe
+            ),
+        );
+    }
+    if stats.without_command_line > 0 {
+        append_control(
+            sink_path,
+            &format!(
+                "argv_missing_command_line: {} process start event(s) carried no command line \
+                 (an older MOF event version, or no pid)",
+                stats.without_command_line
+            ),
+        );
+    }
+    if dropped_by_capacity > 0 {
+        append_control(
+            sink_path,
+            &format!(
+                "argv_events_dropped_by_capacity: {dropped_by_capacity} process start event(s) \
+                 were discarded before they could be drained"
+            ),
+        );
     }
 }
 
@@ -251,14 +486,29 @@ fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
                         continue;
                     }
                 };
-                let generation = Generation::start(&policy, sink_path);
+                // **argv観測が張れなければここで断る**（§10.3 fail-closed）。FS収集の
+                // 失敗（fail-open）と**扱いが逆**なのは、argv無しで記録を続けると
+                // 「観測されなかった辺」と「観測できなかった辺」が区別できなくなるためである。
+                let generation = match Generation::start(&policy, sink_path) {
+                    Ok(generation) => generation,
+                    Err(reason) => {
+                        // **専用の変種で返す。** 呼び出し側はこの失敗だけ別扱いする
+                        // （記録を始めない）ので、`Err`に混ぜると文面での判定になる。
+                        let _ = send(pipe, &LearnResponse::ArgvCaptureUnavailable { reason });
+                        continue;
+                    }
+                };
                 let etw_available = generation.etw_available();
+                let argv_capture = generation.argv_capture();
                 current = Some(generation);
                 send(
                     pipe,
                     &LearnResponse::Started {
                         etw_available,
                         spawn_daemon_pid: policy.spawn_daemon_pid,
+                        // **要求のechoではなく、実際に張れたかを返す。** echoにすると
+                        // 「頼まれたから true と書いただけ」の実装でも呼び出し側が通してしまう。
+                        argv_capture: Some(argv_capture),
                     },
                 )?;
             }
@@ -308,8 +558,34 @@ fn validate_request(policy: &LearnPolicy) -> Result<std::path::PathBuf, String> 
             policy.session_profile
         ));
     }
-    validate_audit_sink_path(&policy.fs_audit_log_path, &policy.workspace_root)
-        .map_err(|e| format!("rejected audit sink path: {e}"))
+    let sink = validate_audit_sink_path(&policy.fs_audit_log_path, &policy.workspace_root)
+        .map_err(|e| format!("rejected audit sink path: {e}"))?;
+    if policy.capture_argv {
+        // **候補の積み先にも同じ検問を掛ける**（段階6d）。パスは要求から受け取らず
+        // `workspace_root`から導出するが、それだけでは足りない——途中の
+        // `.harness/transitions`がジャンクションなら、**昇格プロセスが任意の場所へ
+        // 追記する**ことになる（`validate_sink_under`が親を`canonicalize`して潰す）。
+        //
+        // **置き場が無ければ断る。** 作るのは非昇格のharnessの仕事で（BUG-109。昇格側が
+        // 作ると所有者が`BUILTIN\Administrators`になり、以後`.harness/**`の保護が完成しない）、
+        // ここで作ってしまうと**その不変条件が黙って壊れる**。FS側のシンクが
+        // 「存在すること」を要求しているのと同じ形である。
+        //
+        // **比べる相手は`workspace_root`である。** 置き場そのもの
+        // （`.harness/transitions`）を許可範囲に渡すと、**そこがジャンクションでも
+        // 「自分自身の下」になって必ず通る**——限定として何も言っていないことになる。
+        crate::elevated_launch::validate_sink_under(
+            &super::observed::observed_path(&policy.workspace_root),
+            &policy.workspace_root,
+        )
+        .map_err(|e| {
+            format!(
+                "rejected transition candidate sink: {e} (the non-elevated side creates \
+                 .harness/transitions/ before asking; see docs/bugs/BUG-109.md)"
+            )
+        })?;
+    }
+    Ok(sink)
 }
 
 /// 1バッチ分を判定して書き出し、書けた件数を返す。
@@ -1015,5 +1291,50 @@ mod flush_batch_record_all_tests {
             crate::tier2a::session_profile::is_session_profile_name(&name),
             "record mode would be rejected by the collector: {name}"
         );
+    }
+
+    /// **[段階6d] 候補の積み先も受信側で検証する**（`P-01`）。
+    ///
+    /// 要求から受け取るのは`workspace_root`だけで、積み先はそこから導出する。だが導出だけでは
+    /// 足りない——**途中がジャンクションなら、昇格プロセスが任意の場所へ追記する**ことになる。
+    ///
+    /// ここで固定するのは「置き場が無ければ断る」側である（**作るのは非昇格のharness**で、
+    /// 昇格側が作ると所有者が`BUILTIN\Administrators`になり`.harness/**`の保護が完成しない。
+    /// BUG-109）。ジャンクションの解決そのものは`elevated_launch`の検問が持つ。
+    #[test]
+    fn a_recording_that_captures_argv_is_rejected_when_the_candidate_sink_is_missing() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let sink_dir = workspace.path().join(".harness").join("sandbox").join("g1");
+        std::fs::create_dir_all(&sink_dir).expect("create sink dir");
+        let mut policy = LearnPolicy {
+            session_profile: crate::tier2a::session_profile::current_profile_name(),
+            workspace_root: workspace.path().to_path_buf(),
+            fs_audit_log_path: sink_dir.join("fs-audit.jsonl"),
+            harness_pid: None,
+            spawn_daemon_pid: None,
+            record_all: true,
+            capture_argv: true,
+        };
+
+        // `.harness/transitions/`がまだ無い＝非昇格側の先行作成が失敗している。
+        let error = validate_request(&policy).expect_err("置き場が無いのに受理された");
+        assert!(error.contains("transition candidate sink"), "{error}");
+
+        // **対の側**: 先に作ってあれば通る（これが無いと「常に断る」実装でも緑になり、
+        // argv観測が一度も始まらない）。
+        std::fs::create_dir_all(crate::tier2a::transitions_log::transitions_dir(
+            workspace.path(),
+        ))
+        .expect("create transitions dir");
+        validate_request(&policy).expect("先行作成してあるのに断られた");
+
+        // argvを頼まない記録は、置き場の有無に関係なく通る（波及範囲を広げない）。
+        let other = tempfile::tempdir().expect("tempdir");
+        let other_sink = other.path().join(".harness").join("sandbox").join("g1");
+        std::fs::create_dir_all(&other_sink).expect("create sink dir");
+        policy.workspace_root = other.path().to_path_buf();
+        policy.fs_audit_log_path = other_sink.join("fs-audit.jsonl");
+        policy.capture_argv = false;
+        validate_request(&policy).expect("argvを頼んでいない記録まで止まっている");
     }
 }

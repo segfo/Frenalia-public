@@ -243,6 +243,16 @@ pub enum RecordError {
     Spawn(String),
     #[error("PowerShellが見つかりません（pwsh も powershell も PATH にありません）")]
     NoShell,
+    /// **argv観測を張れなかったので、記録を始めなかった**（段階6d、§10.3 fail-closed）。
+    ///
+    /// # この1つだけ扱いが違う
+    ///
+    /// 収集器が起動できない・ETWセッションが張れないは**fail-open**で、観測できないまま
+    /// コマンドを走らせる（D-43）。argv観測だけは違う——黙って続けると
+    /// 「argvが観測されなかった辺」と「argvを観測できなかった辺」が区別できなくなり、
+    /// **候補が1件も出ない記録が「候補ゼロの記録」として残る**。
+    #[error("{0}")]
+    ArgvCaptureUnavailable(String),
 }
 
 impl RecordError {
@@ -255,6 +265,7 @@ impl RecordError {
             RecordError::Lock(_) => "lock",
             RecordError::Spawn(_) => "spawn",
             RecordError::NoShell => "no_shell",
+            RecordError::ArgvCaptureUnavailable(_) => "argv_capture_unavailable",
         }
     }
 }
@@ -318,6 +329,14 @@ pub fn record(
         harness_pid: Some(std::process::id()),
         spawn_daemon_pid: None,
         record_all: true,
+        // **argv観測を張るのはこの経路だけである**（段階6d、§10.3の入口の表）。
+        // パス1は隔離せずに走らせるので、**子プロセスが実際に起きる唯一の記録**であり、
+        // 遷移の辺の候補が取れるのはここしかない。隔離が効いている経路（パス2・
+        // `--policy-learn`）で観測できるのは「断られた事実」で、それは待ち行列が既に持つ。
+        //
+        // **これはfail-closedである**——張れなければ記録そのものが始まらない
+        // （`accept_started`）。止まるのはこのボタン1つで、通常運用のFS拒否収集は無関係である。
+        capture_argv: true,
     };
     // D-56 段階2: 生きているdaemonがあれば`StartCollect`を再送するだけ（UACは出ない）。
     // 無ければ、常駐netfilterdがあればそこから連鎖起動し（D-60、`record_net::start_collector`と
@@ -378,6 +397,19 @@ pub fn record(
                 );
             }
             Some(collecting)
+        }
+        // **argv観測の失敗だけは止まる**（段階6d、§10.3 fail-closed）。他の失敗と違い、
+        // 続けても候補が1件も出ない記録にしかならず、それは「候補ゼロだった記録」と
+        // 区別できない。**判定は変種で行う**——文面で見分けると、文面を直した日に
+        // 静かにfail-openへ戻る（`B-13`）。
+        Err(harness_sandbox::tier2a::policy_learnd::LearnError::ArgvCaptureUnavailable(reason)) => {
+            on_event(RecordEvent::CollectorUnavailable(reason.clone()));
+            // **ここで止めても後始末は要らない**——収集器は「始めなかった」と答えており、
+            // この記録のためのETWセッションは1本も張られていない（`Generation::start`）。
+            return Err(RecordError::ArgvCaptureUnavailable(format!(
+                "argv（コマンドライン）の観測を始められなかったので、記録を中止しました。\
+                 続けても遷移の候補が1件も出ません。{reason}"
+            )));
         }
         Err(e) => {
             // fail-open（D-43）: 観測できないだけで、コマンドは走らせる。
