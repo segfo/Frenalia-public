@@ -102,6 +102,14 @@ mod transition_queue_tests;
 /// `win_appcontainer::spawnd_e2e_tests`なので、外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
 mod transparent_hook_tests;
 
+/// [残課題#52] Page Heap(Full)の下でプローブを走らせ、**どこでヒープを壊しているか**を出す測定。
+///
+/// **ここに置いてあるが、受け入れ`spawn-daemon`からは`--skip`で外れている**
+/// ——Page Heapはレジストリで機械全体に効くので、受け入れが測る対象を変えてしまう。
+/// 撃つのは`spawn-daemon-pageheap`。`spawn-daemon-latency`と同じ置き方で、
+/// **時期が来て一本化するときは`--skip`の行を消すだけでよい**（同ファイルのモジュールdoc）。
+mod page_heap_fault_tests;
+
 /// [段階6b] このファイルのテストが名乗る**遷移元ドメイン名**。
 ///
 /// **`DomainSpec::name`（プロファイル名の側）とわざと別の綴りにしてある。**
@@ -1297,14 +1305,25 @@ fn top_level_spawn_latency_injection_cost() {
 }
 
 pub(super) fn wait_and_close(child: &SpawnedChild, job: HANDLE) {
+    let _ = wait_and_close_with_code(child, job);
+}
+
+/// [`wait_and_close`]の、終了コードを**返す**版。
+///
+/// 「シェルが本当にコマンドを実行したか」「プローブがアクセス違反で落ちたか」のように、
+/// **値そのものを判定に使う**呼び出し元がある（`B-35`: 終了コードだけで判定しないが、
+/// 印と対にして使う）。**待ち方も後始末も1本にしてある**——写すと片方だけ直る
+/// （`docs/CODE-STRUCTURE-RULES.md`§5.0）。
+pub(super) fn wait_and_close_with_code(child: &SpawnedChild, job: HANDLE) -> u32 {
+    let mut code = 0u32;
     unsafe {
         let _ = WaitForSingleObject(child.process, 60_000);
-        let mut code = 0u32;
         let _ = GetExitCodeProcess(child.process, &mut code);
-        eprintln!("[spawnd] child pid={} exit={code}", child.pid);
+        eprintln!("[spawnd] child pid={} exit={code} (0x{code:08x})", child.pid);
         let _ = CloseHandle(child.process);
         let _ = CloseHandle(job);
     }
     // 実マシンの後始末に少しだけ猶予を与える（Jobのkill-on-closeが走る）。
     std::thread::sleep(Duration::from_millis(200));
+    code
 }

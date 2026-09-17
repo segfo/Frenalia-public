@@ -195,6 +195,14 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             // （`spawn-daemon-latency`が別に回す）。混ぜると受け入れが1分近く延びる。
             "--skip",
             "top_level_spawn_latency",
+            // [残課題#52] Page Heapの診断も受け入れではないので外す
+            // （`spawn-daemon-pageheap`が別に回す）。**理由は所要時間ではない**——
+            // Page Heapはレジストリで実行ファイル名に対して機械全体に効くので、
+            // 混ぜると受け入れの26本が「デバッグ用アロケータの下の挙動」を測ることになる。
+            // **時期が来て一本化するときは、この2行と`spawn-daemon-pageheap`の項を消すだけ**
+            // （テスト本体は`spawnd_e2e_tests`の中に在るので移動は起きない）。
+            "--skip",
+            "the_spawn_matrix_under_page_heap_records_where_it_faults",
         ],
     ),
     // T1の観測（`docs/STATUS.md`残課題#43）: 要求受付パイプの混雑。同時接続数を振って、
@@ -213,6 +221,40 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--test-threads=1",
             "--nocapture",
             "request_pipe_congestion_by_concurrency",
+        ],
+    ),
+    // [残課題#52] プローブが`0xC0000374`（ヒープ破壊）で落ちる件の**根本原因出し**。
+    // Page Heap(Full)を実行ファイルへ載せ、壊した瞬間のアドレスとモジュールをVEHで記録する。
+    //
+    // **受け入れ`spawn-daemon`と混ぜない理由は所要時間ではない**——Page Heapはレジストリで
+    // 機械全体に効くので、受け入れが測る対象そのものを変えてしまう（計器で対象を変えない）。
+    //
+    // **合否は「破壊が起きたか」では決めない**（配置が変わると出ないこともある）。赤くなるのは
+    // 測定が成立していないときだけ——Page Heapが効いていない／記録の受け皿が繋がっていない／
+    // 生成禁止を積まない腕で子が1つも生まれない／撤収に失敗した。
+    //
+    // **これは「時期が来たら`spawn-daemon`へ一本化する」前提の特設ターゲットである。**
+    //
+    // 撤去箇所は**2つだけ**——`spawn-daemon`の`--skip`の2行と、この項。
+    // テスト本体は`spawnd_e2e_tests`の中に在るので移動は起きない
+    // （`docs/DEV-ENVIRONMENT.md`はキー名を列挙しないので、そちらに消す行は無い）。
+    //
+    // 撤去の条件: **残課題#52が閉じた時点**（`via_task_scheduler`を直すか落とす）。
+    // そのときこの的ごと要らなくなる見込みが高い。畳んで残すなら、**Page Heapを載せた回と
+    // 載せない回で受け入れの判定と所要時間が変わらないこと**を1回測ってからにする
+    // ——変わるなら、受け入れは製品ではなく計器を測っていることになる。
+    (
+        "spawn-daemon-pageheap",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "the_spawn_matrix_under_page_heap_records_where_it_faults",
         ],
     ),
     // ④の観測: 直接生成とDaemon経由のトップレベル起動時間。**合否の判定を持たない**

@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+/// [残課題#52] 壊した瞬間の場所を記録する受け皿（VEH）と、わざと壊す的。
+/// **環境変数を張ったときだけ**動くので、他の的の挙動は変わらない（モジュールdoc参照）。
+mod fault_log;
 mod load_library;
 mod spawn_via;
 #[cfg(windows)]
@@ -148,6 +151,10 @@ struct Args {
     /// MAC設計§7.1.1の測定8: 「`CTRL_C_EVENT`を無視する」継承属性を自分についてどうするか
     /// （`console_share::apply_ctrl_c_mode`）。**どのモードの腕でも使える。**
     console_ctrl_c_mode: console_share::CtrlCMode,
+    /// [残課題#52] **わざと壊す的**（`fault_log::run`）。`overflow`は**Page Heapが効いている
+    /// ときだけ**落ち、`null`は**常に**落ちる——前者がPage Heapの検算、後者がVEHの検算で、
+    /// **兼ねられない**（`fault_log::run`の表）。
+    fault_self: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -200,6 +207,8 @@ fn parse_args() -> Args {
     let mut console_idle_secs: u64 = 0;
     let mut console_mode = false;
     let mut console_guard_ctrl = false;
+    // [残課題#52] 既定は`None`なので、指定しなければ既存の腕は1つも変わらない。
+    let mut fault_self: Option<String> = None;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -338,6 +347,8 @@ fn parse_args() -> Args {
             // 保持プロセス役（`--idle-secs`で待つだけの腕）であり、画面バッファを触る
             // `console_share`モードへ落とすと測る対象が別物になる。
             "--console-guard-ctrl" => console_guard_ctrl = true,
+            // [残課題#52] わざと壊す的。**他のどのモードよりも先に見る**（`main`の側）。
+            "--fault-self" => fault_self = Some(next()),
             _ => {}
         }
     }
@@ -399,6 +410,7 @@ fn parse_args() -> Args {
         idle_secs,
         console_guard_ctrl,
         console_ctrl_c_mode,
+        fault_self,
     }
 }
 
@@ -681,6 +693,10 @@ fn spawn_watchdog(timeout_secs: u64) {
 }
 
 fn main() -> ExitCode {
+    // [残課題#52] **引数解析より先に登録する。** 解析の途中で落ちても記録が残るように。
+    // 環境変数が張られていなければ何もしない（`fault_log`のモジュールdoc）。
+    fault_log::install_if_requested();
+
     let mut args = parse_args();
     spawn_watchdog(args.timeout_secs);
 
@@ -699,6 +715,21 @@ fn main() -> ExitCode {
     let ctrl_guard = args
         .console_guard_ctrl
         .then(console_share::guard_self_from_ctrl_events);
+
+    // [残課題#52] **わざと壊す的。他のどのモードよりも先に見る**——Page Heapが効いているかを
+    // 確かめるためだけの短絡モードで、ここで落ちること自体が答えである
+    // （落ちなければ「効いていない」。`fault_log::run`の表）。
+    if let Some(mode) = &args.fault_self {
+        let report = fault_log::run(mode);
+        if let Some(path) = &args.report_file {
+            let _ = fs::write(path, report.to_string());
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("fault_self report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
 
     #[cfg(windows)]
     if let Some(helper_path) = &args.try_runas {

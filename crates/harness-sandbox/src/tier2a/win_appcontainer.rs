@@ -768,6 +768,12 @@ mod lazy_ux_latency_tests;
 #[cfg(all(windows, test))]
 mod cancel_descendants_tests;
 
+/// [残課題#52] 1つの実行ファイルにだけPage Heap(Full)を載せる／外す（レジストリ）。
+/// **プローブがどこでヒープを壊しているかを出すための道具**で、載せる先は自分たちの
+/// テスト用バイナリだけである（同ファイルのモジュールdoc）。
+#[cfg(all(windows, test))]
+mod page_heap;
+
 /// 段階5（Spawn Daemon本体）の実機受け入れテスト。
 ///
 /// **モジュール名は`KNOWN_TARGETS`の`spawn-daemon`のフィルタ文字列と一致していること**

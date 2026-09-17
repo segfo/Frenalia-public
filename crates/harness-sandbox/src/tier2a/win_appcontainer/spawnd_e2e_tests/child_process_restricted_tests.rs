@@ -27,12 +27,9 @@
 
 use std::time::Duration;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-
 use super::super::*;
 use super::{domain_spec, report_field, setup_with_policy, spawn_request_payload, Case};
-use crate::tier2a::spawnd::client::{SpawnDaemonHandle, SpawnedChild};
+use crate::tier2a::spawnd::client::SpawnDaemonHandle;
 use crate::tier2a::spawnd::{ChildProcessPolicy, ConsoleNeed};
 
 /// 1本の子を起こして、標準出力・標準エラー・終了コードを取る。
@@ -65,25 +62,8 @@ fn spawn_and_collect(
             extra_env: Vec::new(),
         },
     );
-    let code = wait_and_close_with_code(&child, job);
+    let code = super::wait_and_close_with_code(&child, job);
     Ok((out, err, code))
-}
-
-/// [`super::wait_and_close`]の、終了コードを**返す**版。
-///
-/// あちらは終了コードを画面へ出すだけである。ここでは「シェルが本当にコマンドを実行したか」を
-/// 終了コードで見るので、値が要る（`B-35`: 終了コードだけで判定しないが、**印と対にして**使う）。
-fn wait_and_close_with_code(child: &SpawnedChild, job: HANDLE) -> u32 {
-    let mut code = 0u32;
-    unsafe {
-        let _ = WaitForSingleObject(child.process, 60_000);
-        let _ = GetExitCodeProcess(child.process, &mut code);
-        eprintln!("[spawnd S5] child pid={} exit={code}", child.pid);
-        let _ = CloseHandle(child.process);
-        let _ = CloseHandle(job);
-    }
-    std::thread::sleep(Duration::from_millis(200));
-    code
 }
 
 /// `--spawn-matrix`が実際に子を作れた経路の本数（＝マーカーが生まれた数）。

@@ -40,4 +40,8 @@ windows = { version = "0.58", features = [
     # §7.1.1測定3: 同じコンソールに繋がったプロセス同士が画面バッファを読めるか・
     # 互いへCtrl+Breakを撃てるか（`console_share`）。
     "Win32_System_Console",
+    # [残課題#52] 壊した瞬間の場所を記録する受け皿（`fault_log`）。VEHの登録・例外情報・
+    # 戻りアドレス列の採取に要る。`EXCEPTION_POINTERS`は`Win32_System_Kernel`側に居る。
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
 ] }
