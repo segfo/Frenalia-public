@@ -547,6 +547,7 @@ pub(super) fn probe_exe() -> PathBuf {
         .expect("current_exe has parent")
         .to_path_buf();
     let exe = dir.join("tier2a_proc_probe.exe");
+    refresh_probe_if_stale(&exe, &dir);
     assert!(
         exe.exists(),
         "tier2a_proc_probe.exe not found at {} (build it with `cargo build -p tier2a-proc-probe` \
@@ -554,6 +555,53 @@ pub(super) fn probe_exe() -> PathBuf {
         exe.display()
     );
     exe
+}
+
+/// テストバイナリの隣のプローブが**cargoの出力より古ければ写し直す**（2026-09-17に追加）。
+///
+/// # なぜ要るのか——**古い写しは、緑を別の理由で作る**
+///
+/// `deps/tier2a_proc_probe.exe`は手で置いた写しで、`cargo build`は更新しない
+/// （cargoが書くのは`target/debug/`側と、ハッシュ付きの名前だけ）。
+/// **写しが古いと、新しく足したモードを知らないプローブが走る**——引数を無視して
+/// 別のモードで終わり、テストは「届かなかった」「何も起きなかった」として赤くなるか、
+/// 悪くすると**別の理由で緑になる**。
+///
+/// 段階6dで同じ形を実際に踏んでいる（収集器の写しが古く、受け入れが「版がずれている」で
+/// 落ちた。そのときは**同じエラーが「枠が無い」でも出るので、緑が正しい理由の緑か
+/// 分からなかった**）。だから見つけたら直すのではなく、**毎回そろえる**。
+///
+/// **失敗しても止めない。** 写せないのは誰かが掴んでいるとき（前の回の子が残っている等）で、
+/// そのときは既にある写しで進む——止めると、直せる不具合まで測れなくなる。
+/// ただし**黙らない**（`B-10`）。
+fn refresh_probe_if_stale(exe: &Path, dir: &Path) {
+    let Some(built) = dir.parent().map(|up| up.join("tier2a_proc_probe.exe")) else {
+        return;
+    };
+    let stamp = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|m| Ok((m.len(), m.modified()?)))
+            .ok()
+    };
+    let Some(fresh) = stamp(&built) else {
+        return;
+    };
+    if stamp(exe) == Some(fresh) {
+        return;
+    }
+    match std::fs::copy(&built, exe) {
+        Ok(_) => eprintln!(
+            "[probe] refreshed {} from {} (the hand-placed copy was stale)",
+            exe.display(),
+            built.display()
+        ),
+        Err(e) => eprintln!(
+            "[probe] warning: could not refresh {} from {} ({e}); \
+             the test will run against the older copy",
+            exe.display(),
+            built.display()
+        ),
+    }
 }
 
 /// このworkspaceのcapability SID（`test_support::spawn_in_workspace`と同じ引き方）。

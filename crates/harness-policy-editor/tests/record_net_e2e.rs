@@ -709,7 +709,7 @@ if (-not $raw) { Write-Output 'NO_PIPE_ENV'; exit 0 }
 $name = $raw -replace '^\\\\\.\\pipe\\', ''
 $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', $name, 'InOut')
 try { $c.Connect(5000) } catch { Write-Output ('CONNECT_FAILED:' + $_.Exception.Message); exit 0 }
-$body = [Text.Encoding]::UTF8.GetBytes('{"kind":"spawn","exe":"git.exe","args":["status"],"cwd":"C:/"}')
+$body = [Text.Encoding]::UTF8.GetBytes('{"kind":"spawn","image":"C:\\Windows\\System32\\cmd.exe","command_line":"\"cmd.exe\" /c exit 0","cwd":"C:/"}')
 $c.Write([BitConverter]::GetBytes([int]$body.Length), 0, 4)
 $c.Write($body, 0, $body.Length)
 $c.Flush()
@@ -721,6 +721,33 @@ $got = 0
 while ($got -lt $n) { $r = $c.Read($buf, $got, $n - $got); if ($r -le 0) { break }; $got += $r }
 Write-Output ('REPLY:' + [Text.Encoding]::UTF8.GetString($buf, 0, $got))
 "#;
+
+/// 手書きのJSONを、**受け手の型で読めることだけ**確かめる（2026-09-17に追加）。
+///
+/// # なぜ要るのか——**コンパイラがここを見張っていない**
+///
+/// 電文の形を変えたとき、Rustで組んでいる呼び出し元は全部ビルドが落ちて気付ける。
+/// ところが上の2つの写しは**PowerShellの中の文字列**なので、古い綴りのまま残っても
+/// 何も起きない——**気付くのは昇格のE2Eを60秒回した後**である（段階6f-1で実際に踏んだ）。
+///
+/// ここは昇格も実機も要らない。**壊れていれば1秒で分かる。**
+#[test]
+fn the_hand_written_spawn_request_still_parses() {
+    let json = SPAWN_REQUEST_ROUNDTRIP
+        .split_once("GetBytes('")
+        .and_then(|(_, rest)| rest.split_once("')"))
+        .map(|(json, _)| json)
+        .expect("the script must contain a GetBytes('...') payload");
+    // PowerShellの単一引用符の中なので、JSONの`\\`はそのままの2文字である。
+    serde_json::from_str::<harness_sandbox::tier2a::spawnd::SpawnRequest>(json).unwrap_or_else(
+        |e| {
+            panic!(
+                "要求受付パイプへ手書きで送っているJSONが、受け手の型で読めない: {e}\n{json}\n\
+                 **この写しは`crates/harness-tools/src/shell/shell_tests.rs`にもある。両方直すこと。**"
+            )
+        },
+    );
+}
 
 /// 8番: **パス2で起こした子は要求受付パイプへ届き、`no_matching_edge`で断られる**
 /// （`plans/DESIGN-MAC-PROTOCOL.md` §12の経路表で「積む」と決めた側）。

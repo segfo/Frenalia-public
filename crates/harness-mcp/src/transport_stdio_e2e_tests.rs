@@ -152,9 +152,15 @@ fn last_json_line(stdout: &str) -> Option<serde_json::Value> {
 /// ここがコンパイルエラーになる（`spawnd_e2e_tests::spawn_request_payload`と同じ理由）。
 fn spawn_request_payload() -> String {
     serde_json::to_string(&SpawnRequest::Spawn {
-        exe: "git.exe".to_string(),
-        args: vec!["status".to_string()],
+        // [段階6f-1] **絶対パスで書く。** 相対パスは`MalformedRequest`で早期に断られるので、
+        // このテストが見たい「窓口へ届いたか」の答えが変わってしまう。
+        image: r"C:\Program Files\Git\cmd\git.exe".to_string(),
+        command_line: "\"git.exe\" status".to_string(),
         cwd: "C:/".to_string(),
+        env: None,
+        handles: Default::default(),
+        console: harness_sandbox::tier2a::spawnd::ConsoleNeed::NotNeeded,
+        suspended: false,
     })
     .expect("serialize the spawn request")
 }

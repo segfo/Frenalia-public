@@ -506,6 +506,44 @@ fn normalize_cow_root(path: &Path) -> PathBuf {
     ))
 }
 
+/// Redirector DLLへ設定を運ぶ環境変数の名前。**綴りはDLL側と対**
+/// （`harness-redirector`の`config.rs`・`init.rs`）。
+///
+/// # なぜ定数にしてあるのか（2026-09-17、段階6f-1）
+///
+/// [`augment_redirector_env`]が書く名前と、**呼び出し元の申告から捨てる名前**が
+/// 一致していなければならない。サンドボックスの中のプロセスがこれらを自分で立てて
+/// Daemonへ渡せると、**孫の誘導先や受付パイプを自分で決められる**——文字列を2箇所に
+/// 書くと、片方だけ増やした日にその1つだけが素通りする（`B-13`）。
+pub(crate) mod redirector_env {
+    pub(crate) const WORKSPACE: &str = "HARNESS_COW_WORKSPACE";
+    pub(crate) const PROCESS_HOOKS: &str = "HARNESS_REDIRECTOR_PROCESS_HOOKS";
+    pub(crate) const DIFF_LAYER: &str = "HARNESS_COW_DIFF_LAYER";
+    pub(crate) const EXT_ROOTS: &str = "HARNESS_COW_EXT_ROOTS";
+    pub(crate) const BROKER_PIPE: &str = "HARNESS_LAZY_BROKER_PIPE";
+    /// **1回の生成にしか意味が無い値**（注入したDLLが初期化完了を知らせるハンドル）。
+    /// 系統の基準envに古い値が残っているので、**使い回さず毎回書き直す**。
+    pub(crate) const READY_HANDLE: &str = "HARNESS_COW_READY_HANDLE";
+}
+
+/// harnessが所有する環境変数の名前一式。**呼び出し元に名乗らせてはいけないもの**である。
+///
+/// [`augment_redirector_env`]が書く6つ（[`redirector_env`]）に、Spawn Daemonの窓口名と
+/// 注入の抑止リストを足したもの。Daemonはnestedの生成で、**この名前だけは呼び出し元の
+/// 申告を捨てて系統の値を使う**（`spawnd::server::env_for_nested`）。
+pub(crate) fn harness_owned_env_names() -> [&'static str; 8] {
+    [
+        redirector_env::WORKSPACE,
+        redirector_env::PROCESS_HOOKS,
+        redirector_env::DIFF_LAYER,
+        redirector_env::EXT_ROOTS,
+        redirector_env::BROKER_PIPE,
+        redirector_env::READY_HANDLE,
+        super::lazy_grant::NO_INJECT_ENV,
+        crate::tier2a::spawnd::REQUEST_PIPE_ENV,
+    ]
+}
+
 /// Redirectorへ渡す環境を、直接生成とDaemon生成で同じ規則から組み立てる。
 pub(crate) fn augment_redirector_env(
     env: &mut Vec<(String, String)>,
@@ -517,7 +555,7 @@ pub(crate) fn augment_redirector_env(
     // **「空のworkspaceを渡した」と「渡していない」を子のenvで区別できなくなる**。
     if let Some(workspace) = inject.workspace_root {
         env.push((
-            "HARNESS_COW_WORKSPACE".to_string(),
+            redirector_env::WORKSPACE.to_string(),
             normalize_cow_root(workspace).to_string_lossy().into_owned(),
         ));
     }
@@ -527,14 +565,11 @@ pub(crate) fn augment_redirector_env(
     // `harness-redirector`に依存していない（DLLは実行時にロードされるだけ）ので、
     // 型で結べるのはここまでである。
     if inject.process_hooks {
-        env.push((
-            "HARNESS_REDIRECTOR_PROCESS_HOOKS".to_string(),
-            "1".to_string(),
-        ));
+        env.push((redirector_env::PROCESS_HOOKS.to_string(), "1".to_string()));
     }
     if let Some(cow) = inject.cow {
         env.push((
-            "HARNESS_COW_DIFF_LAYER".to_string(),
+            redirector_env::DIFF_LAYER.to_string(),
             normalize_cow_root(cow.diff_layer_dir)
                 .to_string_lossy()
                 .into_owned(),
@@ -546,11 +581,11 @@ pub(crate) fn augment_redirector_env(
                 .map(|path| normalize_cow_root(path).to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join(";");
-            env.push(("HARNESS_COW_EXT_ROOTS".to_string(), joined));
+            env.push((redirector_env::EXT_ROOTS.to_string(), joined));
         }
     }
     if let Some(pipe) = inject.broker_pipe {
-        env.push(("HARNESS_LAZY_BROKER_PIPE".to_string(), pipe.to_string()));
+        env.push((redirector_env::BROKER_PIPE.to_string(), pipe.to_string()));
     }
     if let Ok(list) = std::env::var(super::lazy_grant::NO_INJECT_ENV) {
         if !list.trim().is_empty() {
@@ -558,7 +593,7 @@ pub(crate) fn augment_redirector_env(
         }
     }
     env.push((
-        "HARNESS_COW_READY_HANDLE".to_string(),
+        redirector_env::READY_HANDLE.to_string(),
         (ready_write.0 as usize).to_string(),
     ));
 }
@@ -688,18 +723,11 @@ fn domain_dacl_sddl(
 ///
 /// # 引用の規則
 ///
-/// 実行ファイルと各引数を`"`で囲み、引数の中の`"`は`\"`へ逃がす。
-/// **`CreateProcessW`の`lpApplicationName`は`None`である**ので、実行ファイル名は
-/// このコマンドラインの先頭トークンとして解釈される——空白を含むパスのために囲みは必須である。
+/// **[`crate::win_common::command_line_for`]が持つ**（3Tier共通。2026-09-17に統合）。
+/// かつてここに5行の写しがあり、`tier0`・`tier1`と**同じ間違い**を持っていた
+/// ——バックスラッシュと引用符が隣り合う引数で境界がずれる。経緯は共通側のdocにある。
 pub(crate) fn command_line_for(exe: &str, args: &[&str]) -> String {
-    let mut cmdline = format!("\"{exe}\"");
-    for a in args {
-        cmdline.push(' ');
-        cmdline.push('"');
-        cmdline.push_str(&a.replace('"', "\\\""));
-        cmdline.push('"');
-    }
-    cmdline
+    crate::win_common::command_line_for(exe, args)
 }
 
 /// [`create_suspended_in_job`]への入力。引数が多いので構造体で受ける。
@@ -715,6 +743,19 @@ pub(crate) struct SuspendedSpawn<'a> {
     /// 同節の但し書きにそのまま当たる。**組むのは[`command_line_for`]1箇所にして、
     /// できた値を判定と生成の両方へ渡す。**
     pub command_line: &'a str,
+    /// `CreateProcessW`の`lpApplicationName`。**絶対パスであること。**
+    ///
+    /// # なぜ`Option`なのか（2026-09-17、段階6f-1）
+    ///
+    /// **経路によって、実行ファイルを誰が決めたかが違う。**
+    ///
+    /// | 経路 | 値 | なぜ |
+    /// |---|---|---|
+    /// | harnessが直接／Daemon経由でトップレベルを起こす | `None` | コマンドラインを組むのも解釈させるのも同じharnessで、`exe`はPATH解決に委ねてよい綴りのことがある |
+    /// | Daemonがサンドボックスの要求で起こす（nested） | **必ず`Some`** | **判定した実行ファイルと、実際に起きる実行ファイルを同一の値にする**ため。コマンドラインの先頭から実行ファイルを決める規則はOSとこちらで食い違い得る（`spawnd::SpawnRequest::Spawn::image`のdoc） |
+    ///
+    /// **`None`のとき挙動は段階6f-1より前と1ビットも変わらない。**
+    pub application_name: Option<&'a str>,
     pub cwd: &'a Path,
     /// `CREATE_UNICODE_ENVIRONMENT`用に組み立て済みの環境ブロック
     /// （`win_common::build_env_block`が作る）。**呼び出し側が組む**——CoWは
@@ -781,6 +822,9 @@ pub(crate) fn create_suspended_in_job(
 
     let mut cmdline_w = wide(request.command_line);
     let cwd_w = wide(&request.cwd.to_string_lossy());
+    // [段階6f-1] `lpApplicationName`。**`None`なら今日どおりコマンドライン任せ**である
+    // （[`SuspendedSpawn::application_name`]の表）。値は`CreateProcessW`が返るまで生かす。
+    let application_name_w = request.application_name.map(wide);
 
     let mut capabilities_buf = request.capabilities.to_vec();
     let mut security_capabilities = SECURITY_CAPABILITIES {
@@ -908,7 +952,10 @@ pub(crate) fn create_suspended_in_job(
                 // `AssignProcessToJobObject`を完了させ、子がJob Object外で孫プロセスを
                 // 作れる窓（TOCTOU）を無くす。Phase 2のDLL注入もこの一時停止窓で行う。
                 CreateProcessW(
-                    None,
+                    application_name_w
+                        .as_ref()
+                        .map(|name| PCWSTR(name.as_ptr()))
+                        .unwrap_or(PCWSTR::null()),
                     PWSTR(cmdline_w.as_mut_ptr()),
                     // §22.1.1 挿入点1（プロセス／最初のスレッドのDACL）。
                     Some(&process_sa as *const _),
@@ -1723,6 +1770,9 @@ fn spawn_impl(
     let command_line = command_line_for(exe, args);
     let spawned = create_suspended_in_job(SuspendedSpawn {
         command_line: &command_line,
+        // [段階6f-1] **この経路はharness自身が呼び出し元である**ので、コマンドライン任せの
+        // ままでよい（[`SuspendedSpawn::application_name`]の表）。
+        application_name: None,
         cwd,
         env_block: &mut env_block,
         container_sid,

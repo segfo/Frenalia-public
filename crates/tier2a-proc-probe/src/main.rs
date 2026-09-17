@@ -40,6 +40,9 @@ mod object_reach;
 mod open_bench;
 mod pipe_client;
 mod spawn_matrix;
+/// [段階6f-1] **フックの役を演じるモード**（`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2）。
+/// スパイクではなく受け入れテストの部品なので、判定が出ても消さない。
+mod spawn_via_daemon;
 mod spike_handles;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -102,6 +105,21 @@ struct Args {
     /// **N個の子の到着をそろえるためだけにある。** そろったかどうかは報告の
     /// `start_epoch_us`で後から確かめる（指定しても、遅れて起きた子はそのまま撃つ）。
     pipe_start_at_epoch_ms: Option<u128>,
+    /// [段階6f-1] **フックの役で**要求受付パイプへ頼む（`spawn_via_daemon`）。
+    ///
+    /// `--pipe-client`が測るのは「窓口へ届くか」までで、こちらは1往復の**中身**
+    /// （呼び出し元のstdioが子へ渡るか・返ったハンドルで待てるか）を測る。
+    spawn_via_daemon_pipe: Option<String>,
+    /// 起こす実行ファイルの絶対パス（電文の`image`）。
+    spawn_image: Option<String>,
+    /// `lpCommandLine`へ逐語で渡る文字列（電文の`command_line`）。
+    spawn_command_line: Option<String>,
+    spawn_cwd: Option<String>,
+    /// 子の標準出力を落とす先。**指定するとハンドルを作って電文へ載せる。**
+    spawn_stdout: Option<String>,
+    /// 電文の`console`欄（`required` か `not_needed`）。**既定は`not_needed`**
+    /// ——段階6bまでの挙動と同じ側に倒してある。
+    spawn_console: Option<String>,
     /// D-88（Lazy ACE fault-in）の着手条件: Redirector DLLのフックが**成功するopen**へ
     /// 上乗せする時間を、同一プロセスの「載せる前／載せた後」で測る（`open_bench`モジュールdoc）。
     open_bench: Option<open_bench::Spec>,
@@ -140,6 +158,13 @@ fn parse_args() -> Args {
     let mut emit = None;
     let mut use_process_handle = None;
     let mut pipe_client = None;
+    // [段階6f-1] フックの役。**5つとも既定は`None`**なので、指定しなければ挙動は変わらない。
+    let mut spawn_via_daemon_pipe: Option<String> = None;
+    let mut spawn_image: Option<String> = None;
+    let mut spawn_command_line: Option<String> = None;
+    let mut spawn_cwd: Option<String> = None;
+    let mut spawn_stdout: Option<String> = None;
+    let mut spawn_console: Option<String> = None;
     let mut pipe_payload = None;
     let mut pipe_repeat: u32 = 1;
     let mut pipe_start_at_epoch_ms: Option<u128> = None;
@@ -226,6 +251,15 @@ fn parse_args() -> Args {
             "--use-process-handle" => use_process_handle = next().parse().ok(),
             "--pipe-client" => pipe_client = Some(next()),
             "--pipe-payload" => pipe_payload = Some(next()),
+            // [段階6f-1] フックの役（`spawn_via_daemon`）。**窓口の名前はこちらで受ける**
+            // ——`--pipe-client`と同じ引数にすると、どちらのモードで撃ったのかが
+            // 報告から読めなくなる。
+            "--spawn-via-daemon" => spawn_via_daemon_pipe = Some(next()),
+            "--spawn-image" => spawn_image = Some(next()),
+            "--spawn-command-line" => spawn_command_line = Some(next()),
+            "--spawn-cwd" => spawn_cwd = Some(next()),
+            "--spawn-stdout" => spawn_stdout = Some(next()),
+            "--spawn-console" => spawn_console = Some(next()),
             // 残課題#43（要求受付パイプの混雑）の測定用。**既定は従来どおり1回・待たない**
             // ので、指定しなければ段階③の受け入れテストの撃ち方は変わらない。
             "--pipe-client-repeat" => pipe_repeat = next().parse().unwrap_or(1).max(1),
@@ -333,6 +367,12 @@ fn parse_args() -> Args {
         pipe_payload,
         pipe_repeat,
         pipe_start_at_epoch_ms,
+        spawn_via_daemon_pipe,
+        spawn_image,
+        spawn_command_line,
+        spawn_cwd,
+        spawn_stdout,
+        spawn_console,
         open_bench,
         console_share,
         report_file,
@@ -746,6 +786,31 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("open_bench report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    // [段階6f-1] フックの役。**`--pipe-client`より先に見る**——両方指定されたときに
+    // 「窓口へ届いた」だけを報告して終わると、測ったつもりの中身が測れていない。
+    if let Some(pipe) = &args.spawn_via_daemon_pipe {
+        let image = args.spawn_image.clone().unwrap_or_default();
+        // 指定が無ければ実行ファイルを引用符で囲んだだけの綴り（引数なし）。
+        let command_line = args
+            .spawn_command_line
+            .clone()
+            .unwrap_or_else(|| format!("\"{image}\""));
+        let report = spawn_via_daemon::run(&spawn_via_daemon::Spec {
+            pipe_name: pipe,
+            image: &image,
+            command_line: &command_line,
+            cwd: args.spawn_cwd.as_deref().unwrap_or("C:/"),
+            stdout_file: args.spawn_stdout.as_deref(),
+            console: args.spawn_console.as_deref().unwrap_or("not_needed"),
+            report_file: args.report_file.as_deref(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("spawn_via_daemon report must serialize")
         );
         return ExitCode::SUCCESS;
     }

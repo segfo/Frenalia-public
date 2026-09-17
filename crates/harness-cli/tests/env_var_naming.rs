@@ -87,6 +87,13 @@ const PRODUCTION_ENV_VARS: &[(&str, &str)] = &[
          （段階5b、`plans/DESIGN-MAC-ENFORCEMENT.md` §8.1）。これが無いとDLLは初期化せずに降りる",
     ),
     (
+        "HARNESS_SPAWND_STDERR",
+        "診断専用: Spawn Daemonの標準エラーの行き先（2026-09-17、段階6f-1）。\
+         Daemonはコンソールを持たないので、**既定ではその出力がどこにも届かない**\
+         ——「起こそうとして失敗した」の中身を読むには受け皿が要る。\
+         未設定なら何も変わらない（ハンドルを1つも作らず、継承もしない）",
+    ),
+    (
         "HARNESS_SPAWN_REQUEST_PIPE",
         "Spawn Daemon → サンドボックスの子: 生成を頼む要求受付パイプの名前（§10.1）。\
          **名前は秘密ではない**——境界はパイプのDACL（ユーザーSID＋spawn要求用capability）で、\

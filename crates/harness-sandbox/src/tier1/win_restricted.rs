@@ -361,13 +361,8 @@ pub fn spawn(
         (None, None)
     };
 
-    let mut cmdline = format!("\"{exe}\"");
-    for a in args {
-        cmdline.push(' ');
-        cmdline.push('"');
-        cmdline.push_str(&a.replace('"', "\\\""));
-        cmdline.push('"');
-    }
+    // [2026-09-17] 引用の規則は`win_common`が持つ（3Tier共通。同関数のdocに経緯）。
+    let cmdline = crate::win_common::command_line_for(exe, args);
     let mut cmdline_w = wide(&cmdline);
     let cwd_w = wide(&cwd.to_string_lossy());
     let mut env_block = build_env_block(env);

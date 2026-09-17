@@ -203,6 +203,80 @@ pub(crate) fn clear_inherit(handle: HANDLE) {
     }
 }
 
+/// `CreateProcessW`の`lpCommandLine`を、実行ファイルと引数から組む（**3Tier共通**）。
+///
+/// # なぜ1箇所なのか（2026-09-17、段階6f-1で統合）
+///
+/// かつてこの5行は`tier0`・`tier1`・`tier2a`へ**同じ綴りで3つ写されていた**。
+/// そして3つとも**同じ間違い**を持っていた（下記）。写した数だけ直す場所が増え、
+/// しかも「どれが正しいのか」を次に読む人が判定できない
+/// （`docs/CODE-STRUCTURE-RULES.md` §5.0）。
+///
+/// # なぜ`replace('"', "\\\"")`では足りないのか（**実機で踏んだ**）
+///
+/// Windowsの引数解釈（`CommandLineToArgvW`）は、**引用符の直前のバックスラッシュだけを
+/// 特別扱いする**——`n`個のバックスラッシュの後に`"`が来ると、`n/2`個のバックスラッシュと
+/// 「`n`が奇数なら literal な`"`／偶数なら引用の切り替え」になる。
+///
+/// つまり引数が`\`と`"`を**隣り合わせて**含むと、単純な置換では境界がずれる。
+///
+/// | 引数の中身 | 単純な置換が作る綴り | 受け取る側が読む値 |
+/// |---|---|---|
+/// | `\"C:\\x"` | `"\\"C:\\x\\""` | **引用が途中で閉じ、以降が別の引数になる** |
+///
+/// 2026-09-17に実機で踏んだのはこの形である——JSONの電文（`\"`と`\\`を含む）を
+/// 引数で渡したところ、受け手が**壊れたJSON**として読み、あらゆる生成要求が
+/// 「電文が壊れている」で断られた。**同じ壊れ方は、`-Command`へWindowsのパスと
+/// 引用符を一緒に渡す実運用でも起こり得る。**
+///
+/// ここで実装しているのはMicrosoftが文書化している規則そのもので、
+/// **引用符の前にあるバックスラッシュだけを倍にする**（他は触らない——全部倍にすると、
+/// 引用符を含まない普通のパスが`C:\\x`のように化ける）。
+pub(crate) fn command_line_for(exe: &str, args: &[&str]) -> String {
+    let mut cmdline = quote_argument(exe);
+    for a in args {
+        cmdline.push(' ');
+        cmdline.push_str(&quote_argument(a));
+    }
+    cmdline
+}
+
+/// 引数1つを`CreateProcessW`のコマンドラインへ載せられる形にする。
+///
+/// **常に引用符で囲む。** 空白を含まない引数まで囲むのは冗長だが、囲まない条件を持つと
+/// 「囲むべきだったのに囲まなかった」経路が生まれる——空文字列の引数が消える形が典型である。
+pub(crate) fn quote_argument(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                // 直前のバックスラッシュを倍にしてから、引用符自身を1つ逃がす。
+                for _ in 0..backslashes * 2 + 1 {
+                    out.push('\\');
+                }
+                out.push('"');
+                backslashes = 0;
+            }
+            other => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                out.push(other);
+                backslashes = 0;
+            }
+        }
+    }
+    // 閉じの引用符の直前も「引用符の前」なので、同じく倍にする。
+    for _ in 0..backslashes * 2 {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
 /// 環境変数をCreateProcess系API用のnull区切り環境ブロック（UTF-16、末尾ダブルNUL）へ変換する。
 ///
 /// `CREATE_UNICODE_ENVIRONMENT`が要求する終端は、変数ゼロ件の場合も含めて**常に二重NUL**
@@ -1066,5 +1140,96 @@ mod subst_resolution_tests {
                 "本物のボリュームを書き換えてはいけない: {device}"
             );
         }
+    }
+}
+
+/// コマンドラインの引用（[`quote_argument`]・[`command_line_for`]）。**Win32を1行も通らない。**
+#[cfg(test)]
+mod command_line_tests {
+    use super::*;
+
+    /// **`CommandLineToArgvW`の規則を逆から当てて検算する。**
+    ///
+    /// 組んだ綴りを目で確かめるだけでは、**規則を取り違えたまま「見た目が正しい」綴りを
+    /// 固定する**ことになる。ここでは組んだものを**実際に解釈させて**、元の引数が
+    /// そのまま返ることを見る（`measurement-review`の検問「検算」に当たる）。
+    #[cfg(windows)]
+    fn parse_back(command_line: &str) -> Vec<String> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::LocalFree;
+        use windows::Win32::Foundation::HLOCAL;
+        use windows::Win32::UI::Shell::CommandLineToArgvW;
+
+        let wide: Vec<u16> = command_line
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut count = 0i32;
+        let argv = unsafe { CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count) };
+        assert!(!argv.is_null(), "CommandLineToArgvW failed for {command_line:?}");
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count as isize {
+            let p = unsafe { *argv.offset(i) };
+            out.push(unsafe { p.to_string() }.expect("argv element is utf-16"));
+        }
+        unsafe {
+            let _ = LocalFree(HLOCAL(argv as *mut _));
+        }
+        out
+    }
+
+    /// **実機で踏んだ形そのもの**（2026-09-17、段階6f-1）。
+    ///
+    /// JSONの電文は`\"`と`\`を隣り合わせて含む。単純な置換で組むと、受け手は
+    /// **壊れたJSON**を受け取り、あらゆる生成要求が「電文が壊れている」で断られた。
+    #[cfg(windows)]
+    #[test]
+    fn a_json_payload_survives_the_round_trip() {
+        let payload = r#"{"kind":"spawn","image":"C:\Windows\cmd.exe","command_line":"\"C:\Windows\cmd.exe\" /c exit 0"}"#;
+        let line = command_line_for(r"C:\probe.exe", &["--payload", payload]);
+        let parsed = parse_back(&line);
+        assert_eq!(parsed.len(), 3, "引数の個数が変わっている: {line}");
+        assert_eq!(parsed[0], r"C:\probe.exe");
+        assert_eq!(parsed[1], "--payload");
+        assert_eq!(
+            parsed[2], payload,
+            "**引用符の直前のバックスラッシュを倍にしていない。** \
+             受け手は壊れたJSONを読むことになる: {line}"
+        );
+    }
+
+    /// 普通の引数は**素のまま**戻る（倍にしすぎていないこと）。
+    ///
+    /// 全部のバックスラッシュを倍にする実装でも上のテストは緑になるが、こちらが落ちる
+    /// ——`C:\x`が`C:\x`に化けて、存在しないパスを指す（`B-35`）。
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_windows_paths_are_not_doubled() {
+        let line = command_line_for(r"C:\bin\git.exe", &[r"C:\work\repo", "status", ""]);
+        let parsed = parse_back(&line);
+        assert_eq!(
+            parsed,
+            vec![
+                r"C:\bin\git.exe".to_string(),
+                r"C:\work\repo".to_string(),
+                "status".to_string(),
+                String::new(),
+            ],
+            "普通のパスか空の引数が変質している: {line}"
+        );
+    }
+
+    /// 末尾がバックスラッシュの引数（ディレクトリの綴り）も戻る。
+    ///
+    /// **閉じの引用符の直前も「引用符の前」である。** ここを倍にしないと、
+    /// `C:\work\`は`C:\work"`と読まれて次の引数まで飲み込む。
+    #[cfg(windows)]
+    #[test]
+    fn a_trailing_backslash_does_not_swallow_the_next_argument() {
+        let line = command_line_for(r"C:\bin\tool.exe", &[r"C:\work\", "--flag"]);
+        let parsed = parse_back(&line);
+        assert_eq!(parsed.len(), 3, "引数の個数が変わっている: {line}");
+        assert_eq!(parsed[1], r"C:\work\");
+        assert_eq!(parsed[2], "--flag");
     }
 }

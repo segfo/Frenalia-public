@@ -54,6 +54,12 @@ pub(super) struct Case {
     pub(super) daemon: Option<SpawnDaemonHandle>,
     canonical_workspace: std::path::PathBuf,
     pub(super) dir: Option<TestDirGuard>,
+    /// [2026-09-17] このケースのDaemonが書いた診断の置き場。
+    ///
+    /// **Daemonはコンソールを持たないので、既定ではこの出力がどこにも届かない。**
+    /// 段階6f-1の実機で「起こそうとして失敗した」の中身が読めず、原因の切り分けに
+    /// 昇格の1往復をまるごと使った——受け皿を毎回用意して、**畳むときに中身を出す**。
+    daemon_log: std::path::PathBuf,
 }
 
 impl Drop for Case {
@@ -61,6 +67,15 @@ impl Drop for Case {
         // Daemonを先に畳む。畳む前にACEを剥がすと、生きている子がworkspaceを
         // 触れなくなって「機構の失敗」に見える。
         drop(self.daemon.take());
+        // **畳んだ後に読む。** 生きている間に読むと、最後の1行がまだ書かれていない。
+        // 何も書かれていなければ（＝正常）1行も出さない。
+        match std::fs::read_to_string(&self.daemon_log) {
+            Ok(text) if !text.trim().is_empty() => {
+                eprintln!("[spawnd daemon log] {}\n{text}", self.daemon_log.display());
+            }
+            _ => {}
+        }
+        let _ = std::fs::remove_file(&self.daemon_log);
         cleanup_workspace(&self.canonical_workspace);
         drop(self.dir.take());
     }
@@ -144,6 +159,18 @@ pub(super) fn setup_with_policy_and_transitions(
         caps.push(cap);
     }
 
+    // [2026-09-17] **Daemonの診断の受け皿を、起こす前に決める**（[`Case::daemon_log`]）。
+    // 置き場をワークスペースの中にしない——テストが中身を数える場所なので、
+    // 診断のファイルが1つ増えるだけで別のテストが赤くなる。
+    let daemon_log = std::path::PathBuf::from(r"C:\harness-e2e")
+        .join(format!("spawnd-{label}-{}.log", std::process::id()));
+    let _ = std::fs::create_dir_all(r"C:\harness-e2e");
+    let _ = std::fs::remove_file(&daemon_log);
+    std::env::set_var(
+        crate::tier2a::spawnd::client::DAEMON_STDERR_ENV,
+        &daemon_log,
+    );
+
     let daemon = SpawnDaemonHandle::start(
         crate::tier2a::spawnd::TransitionPolicy {
             policy: declare(&canonical),
@@ -164,6 +191,7 @@ pub(super) fn setup_with_policy_and_transitions(
             daemon: Some(daemon),
             canonical_workspace: canonical,
             dir: Some(guard),
+            daemon_log,
         },
         profile,
         caps,
@@ -252,9 +280,16 @@ pub(super) fn report_field(stdout: &str, field: &str) -> Option<serde_json::Valu
 /// 要求受付パイプへ送る本物の要求電文（`SpawnRequest::Spawn`）。
 pub(super) fn spawn_request_payload() -> String {
     serde_json::to_string(&crate::tier2a::spawnd::SpawnRequest::Spawn {
-        exe: "git.exe".to_string(),
-        args: vec!["status".to_string()],
+        // [段階6f-1] **絶対パスで書く。** 相対パスは呼び出し元を確定する前に
+        // `MalformedRequest`で断られるので、この組が見たい「窓口へ届いたか・
+        // 台帳に載っているか」の答えが変わってしまう。
+        image: r"C:\Program Files\Git\cmd\git.exe".to_string(),
+        command_line: "\"git.exe\" status".to_string(),
         cwd: "C:/".to_string(),
+        env: None,
+        handles: Default::default(),
+        console: crate::tier2a::spawnd::ConsoleNeed::NotNeeded,
+        suspended: false,
     })
     .expect("serialize the spawn request")
 }

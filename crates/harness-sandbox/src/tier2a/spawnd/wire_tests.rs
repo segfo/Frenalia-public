@@ -141,14 +141,22 @@ fn old_peers_without_a_protocol_version_are_rejected() {
 #[test]
 fn a_spawn_request_carries_no_domain_field() {
     let json = serde_json::to_string(&SpawnRequest::Spawn {
-        exe: "git.exe".to_string(),
-        args: vec!["status".to_string()],
+        image: "C:/bin/git.exe".to_string(),
+        command_line: "\"git.exe\" status".to_string(),
         cwd: "C:/w".to_string(),
+        env: Some(vec![("FOO".to_string(), "1".to_string())]),
+        handles: crate::tier2a::spawnd::CallerHandles {
+            stdin: None,
+            stdout: Some(0x1c),
+            stderr: Some(0x20),
+        },
+        console: ConsoleNeed::NotNeeded,
+        suspended: false,
     })
     .expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"spawn","exe":"git.exe","args":["status"],"cwd":"C:/w"}"#
+        r#"{"kind":"spawn","image":"C:/bin/git.exe","command_line":"\"git.exe\" status","cwd":"C:/w","env":[["FOO","1"]],"handles":{"stdin":null,"stdout":28,"stderr":32},"console":"not_needed","suspended":false}"#
     );
     assert!(
         !json.contains("domain"),
@@ -288,3 +296,49 @@ const _: () = assert!(
     MAX_FRAME_BYTES >= 4096,
     "上限が小さすぎて、正当な要求（長いコマンドライン）が通らない"
 );
+
+/// [段階6f-1] **電文は読み戻せなければ意味が無い。**
+///
+/// 書き出しだけを固定していると、**Daemon側が1件も解釈できない**状態で緑のままになる
+/// （2026-09-17に実機でこれを踏んだ——全要求が`malformed_request`で断られた）。
+#[test]
+fn a_spawn_request_round_trips_through_the_wire() {
+    let original = SpawnRequest::Spawn {
+        image: r"C:\bin\git.exe".to_string(),
+        command_line: "\"git.exe\" status".to_string(),
+        cwd: r"C:\w".to_string(),
+        env: Some(vec![("FOO".to_string(), "1".to_string())]),
+        handles: crate::tier2a::spawnd::CallerHandles {
+            stdin: None,
+            stdout: Some(0x1c),
+            stderr: Some(0x20),
+        },
+        console: ConsoleNeed::Required,
+        suspended: true,
+    };
+    let json = serde_json::to_string(&original).expect("serialize");
+    let parsed: SpawnRequest = serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("要求電文を読み戻せない（Daemonは全部断る）: {e} / {json}"));
+    assert_eq!(parsed, original);
+}
+
+/// 欄を持たない古い形（段階6bの綴り）も読める——**足りない欄は既定へ落ちる**。
+#[test]
+fn a_spawn_request_without_the_new_fields_still_parses() {
+    let json = r#"{"kind":"spawn","image":"C:/bin/git.exe","command_line":"\"git.exe\"","cwd":"C:/w"}"#;
+    let parsed: SpawnRequest = serde_json::from_str(json).expect("parse the minimal form");
+    let SpawnRequest::Spawn {
+        env,
+        handles,
+        console,
+        suspended,
+        ..
+    } = parsed;
+    assert_eq!(
+        env, None,
+        "欄が無いのに「空だと申告した」になっている。**`SystemRoot`の無い環境ブロックで\n         子を起こすことになる**（`SpawnRequest::Spawn::env`のdoc）"
+    );
+    assert_eq!(handles, Default::default());
+    assert_eq!(console, ConsoleNeed::NotNeeded);
+    assert!(!suspended);
+}

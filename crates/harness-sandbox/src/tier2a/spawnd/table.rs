@@ -70,6 +70,18 @@ struct Lineage {
     /// 辺が`env`の差分を宣言していれば、これへ当てたものを渡す
     /// （`harness_policy::transition::EnvPolicy::Fixed`）。
     base_env: Vec<(String, String)>,
+    /// [段階6f-1] この系統のトップレベルへ注入したRedirector DLLの設定。
+    ///
+    /// # なぜ系統が持つのか（[`Lineage::base_env`]と同じ理由）
+    ///
+    /// nestedの子にも**同じ誘導の下で**動いてもらう必要があるが、何を注入するかを
+    /// 呼び出し元に申告させてはいけない——差分層の置き場や受付パイプの名前を
+    /// 自分で決められることになる。**harnessがトップレベルを起こしたときの値が、
+    /// この系統で唯一信頼できる出発点である。**
+    ///
+    /// `None`は「この系統には注入しない」。段階6bまではnestedへ**常に**注入していなかった
+    /// ので、ここが`Some`でも子は素のままだった（`server::spawn_nested`の限界）。
+    redirector: Option<super::RedirectorSpec>,
     members: HashSet<u32>,
 }
 
@@ -77,14 +89,28 @@ struct Lineage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
     pub pid: u32,
+    /// [段階6f-1] Daemonが持っている、**要求元プロセスのハンドル**（[`Entry::process`]の写し）。
+    ///
+    /// # 何に使うのか
+    ///
+    /// 要求元のstdioハンドルを**引き抜く**のと、起こした子のハンドルを**渡す**のに要る
+    /// （`DuplicateHandle`の相手側）。サンドボックスの中のプロセスはDaemonのプロセスを
+    /// 開けないので、複製はどちらの向きもDaemon側から行うしかない。
+    ///
+    /// **この値は閉じてはいけない。** 所有しているのは台帳で、閉じるのは`reap`のときである。
+    pub process: u64,
     pub lineage: LineageId,
     pub domain: DomainSpec,
     /// この系統のJobハンドル（複製）。nestedの子はここへ入れる（§10.1.1）。
     pub lineage_job: u64,
     /// [段階6b] この系統のbase env（[`Lineage::base_env`]の写し）。
     ///
-    /// **要求元が申告した環境ではない**——申告させると`PATH`を差し替えられる。
+    /// **要求元が申告した環境ではない**——段階6f-1からは要求元の申告も使うが、
+    /// **harnessが所有する名前だけはこちらの値で強制する**
+    /// （`win_appcontainer::spawn::harness_owned_env_names`）。
     pub base_env: Vec<(String, String)>,
+    /// [段階6f-1] この系統のRedirector設定（[`Lineage::redirector`]の写し）。
+    pub redirector: Option<super::RedirectorSpec>,
 }
 
 /// [`ProcessTable::reap`]・[`ProcessTable::drain`]が返す「閉じるべきハンドル」。
@@ -161,6 +187,7 @@ impl ProcessTable {
         job: u64,
         domain: DomainSpec,
         base_env: Vec<(String, String)>,
+        redirector: Option<super::RedirectorSpec>,
     ) -> Result<LineageId, RegisterError> {
         if self.entries.contains_key(&pid) {
             return Err(RegisterError::PidAlreadyRegistered { pid });
@@ -172,6 +199,7 @@ impl ProcessTable {
             Lineage {
                 job,
                 base_env,
+                redirector,
                 members: HashSet::from([pid]),
             },
         );
@@ -240,10 +268,12 @@ impl ProcessTable {
             .ok_or(DenyReason::NotRegistered)?;
         Ok(Caller {
             pid,
+            process: entry.process,
             lineage: entry.lineage,
             domain: entry.domain.clone(),
             lineage_job: lineage.job,
             base_env: lineage.base_env.clone(),
+            redirector: lineage.redirector.clone(),
         })
     }
 

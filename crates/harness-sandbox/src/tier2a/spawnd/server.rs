@@ -50,7 +50,8 @@ use std::sync::{Arc, Mutex};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_HANDLE_OPTIONS, HANDLE, HLOCAL, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS,
+    DUPLICATE_SAME_ACCESS, HANDLE, HLOCAL, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::SID_AND_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
@@ -68,8 +69,8 @@ use windows::Win32::System::Threading::{
 
 use crate::tier2a::win_appcontainer::{
     appcontainer_pipe, augment_redirector_env, command_line_for, create_suspended_in_job,
-    inject_redirector, spawn_request_capability_sid, wait_cow_ready, CowInject, DomainIdentity,
-    RedirectorInject, SuspendedSpawn,
+    harness_owned_env_names, inject_redirector, redirector_env, spawn_request_capability_sid,
+    wait_cow_ready, CowInject, DomainIdentity, RedirectorInject, SuspendedSpawn,
 };
 use crate::win_common::{
     build_env_block, clear_inherit, sid_from_string, wide, OwnedSid, SendHandle,
@@ -591,12 +592,32 @@ fn serve_request_connection(pipe: HANDLE, shared: &Arc<Shared>) {
                     reason: DenyReason::MalformedRequest,
                 }
             }
-            Ok(SpawnRequest::Spawn { exe, args, cwd }) => {
-                let served = serve_spawn_request(pipe, shared, &exe, &args, &cwd);
+            Ok(SpawnRequest::Spawn {
+                image,
+                command_line,
+                cwd,
+                env,
+                handles,
+                console,
+                suspended,
+            }) => {
+                let served = serve_spawn_request(
+                    pipe,
+                    shared,
+                    &NestedRequest {
+                        image: &image,
+                        command_line: &command_line,
+                        cwd: &cwd,
+                        env,
+                        handles,
+                        console,
+                        suspended,
+                    },
+                );
                 // [段階6c] **積むのはここ1箇所だけ。** `serve_spawn_request`の返り道は
                 // 5つあるので、返り道ごとに書くと6つ目が生えた日に片方だけ漏れる（`B-06`）。
                 if let SpawnResponse::Denied { reason } = &served.response {
-                    record_denial(shared, &served, &exe, &cwd, reason);
+                    record_denial(shared, &served, &image, &cwd, reason);
                 }
                 served.response
             }
@@ -622,21 +643,23 @@ fn serve_request_connection(pipe: HANDLE, shared: &Arc<Shared>) {
 /// 4. **遷移先が呼び出し元と同じドメインかを見る**（暫定。
 ///    [`DenyReason::TargetDomainNotProvisioned`]のdocに理由と外し方がある）
 /// 5. 起こす（[`spawn_nested`]）
-fn serve_spawn_request(
-    pipe: HANDLE,
-    shared: &Arc<Shared>,
-    exe: &str,
-    args: &[String],
-    cwd: &str,
-) -> Served {
-    // §8.2: **評価する文字列と起こす文字列を同一にする。** 同じ規則で2回組むのではなく、
-    // 1つの値を両方へ渡す。
+fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedRequest<'_>) -> Served {
+    // §8.2: **評価する文字列と起こす文字列を同一にする。**
     //
-    // [段階6c] **呼び出し元を確定する前に組む。** 呼び出し元が誰かに依存しない値なので
-    // 順序を変えても§8.2は保たれ、**どの返り道でも待ち行列へ同じ文字列を積める**
-    // ようになる（`Served::command_line`が`Option`にならずに済む）。
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let command_line = command_line_for(exe, &arg_refs);
+    // [段階6f-1] **組み立てない。呼び出し元が送ってきた逐語の値をそのまま使う**
+    // （[`SpawnRequest::Spawn::command_line`]のdoc）。段階6bはここで`exe`＋`args`から
+    // 組んでいたが、フックが横取りするのは**既に組み上がった1本の文字列**なので、
+    // 分解して組み直すと引用符の付け方が変わる。
+    let command_line = request.command_line.to_string();
+
+    // [段階6f-1] **実行ファイルは絶対パスでなければならない**
+    // （[`SpawnRequest::Spawn::image`]のdoc）。相対パスは`CreateProcessW`が
+    // **Daemonのcwd**から解決するので、判定したのと別のファイルが起きる。
+    //
+    // **呼び出し元を確定する前に見る。** 誰であっても答えが変わらない検査である。
+    if !image_is_absolute(request.image) {
+        return Served::denied(DenyReason::MalformedRequest, None, command_line);
+    }
 
     let caller = match classify_caller(pipe, shared) {
         Ok(caller) => caller,
@@ -651,9 +674,12 @@ fn serve_spawn_request(
         .graph
         .resolve(harness_policy::transition::SpawnAttempt {
             from_domain: &caller.domain.policy_domain,
-            exe,
+            // [段階6f-1] **判定に使うこの値が、そのまま`lpApplicationName`になる**
+            // （[`spawn_nested`]）。段階6bまでは判定が`exe`、起動はコマンドラインの
+            // 先頭という**2つの値**だった。
+            exe: request.image,
             command_line: &command_line,
-            cwd,
+            cwd: request.cwd,
         });
     let from_domain = Some(caller.domain.policy_domain.clone());
     let allowed = match resolution {
@@ -681,12 +707,13 @@ fn serve_spawn_request(
 
     // §8.3: 辺が`cwd`を宣言していれば**その値を渡す**（検査するだけでは足りない）。
     // 宣言が無い辺は定義から「狭める／同値」なので、呼び出し元の実cwdをそのまま渡す。
-    let effective_cwd = allowed.cwd.unwrap_or(cwd);
-    let env = env_for_nested(&caller.base_env, allowed.env);
+    let effective_cwd = allowed.cwd.unwrap_or(request.cwd);
+    // [段階6f-1] 呼び出し元の申告を使うが、**harnessが所有する名前だけは系統の値で強制する**。
+    let env = env_for_nested(&caller.base_env, request.env.as_deref(), allowed.env);
 
-    match spawn_nested(shared, &caller, &command_line, effective_cwd, env) {
-        Ok(pid) => Served {
-            response: SpawnResponse::Spawned { pid },
+    match spawn_nested(shared, &caller, request, &command_line, effective_cwd, env) {
+        Ok(spawned) => Served {
+            response: spawned,
             from_domain,
             command_line,
         },
@@ -701,6 +728,44 @@ fn serve_spawn_request(
             Served::denied(DenyReason::SpawnFailed, from_domain, command_line)
         }
     }
+}
+
+/// [段階6f-1] サンドボックスの中から届いた生成要求1件を、**借りた形で**持ち回る。
+///
+/// [`SpawnRequest::Spawn`]の欄をそのまま写しただけの型である。**構造体にしてあるのは、
+/// 引数が7つになって「どれがどれか」を取り違える形になったため**——とくに`image`と
+/// `command_line`は両方とも文字列で、入れ替えてもコンパイルが通る。
+struct NestedRequest<'a> {
+    image: &'a str,
+    command_line: &'a str,
+    cwd: &'a str,
+    /// **呼び出し元が申告した環境**。そのまま使わない（[`env_for_nested`]）。
+    /// `None`は「申告していない」で、`Some(空)`（＝空だと申告した）とは別である。
+    env: Option<Vec<(String, String)>>,
+    handles: super::CallerHandles,
+    console: ConsoleNeed,
+    suspended: bool,
+}
+
+/// [段階6f-1] `CreateProcessW`の`lpApplicationName`として渡してよい綴りか。
+///
+/// # なぜ`Path::is_absolute`で済ませないのか
+///
+/// あれは`\foo`（ドライブを省いたルート相対）を**絶対と答える**。この綴りは
+/// 「呼び出し側プロセスのカレントドライブ」で解決されるので、**Daemonのドライブ**から
+/// 解決されてしまう——絶対に見えて、Daemonの文脈に依存する値である。
+///
+/// 通すのは `C:\...`／`C:/...`（ドライブ付き）と `\\server\share\...`（UNC）だけにする。
+fn image_is_absolute(image: &str) -> bool {
+    let bytes = image.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        // ドライブ文字の直後が区切りでなければ`C:foo`（ドライブ相対）である。
+        return matches!(bytes.get(2), Some(b'\\') | Some(b'/'));
+    }
+    // UNC。`\\`でも`//`でも、その後に1文字以上あること。
+    matches!(bytes.first(), Some(b'\\') | Some(b'/'))
+        && matches!(bytes.get(1), Some(b'\\') | Some(b'/'))
+        && bytes.len() > 2
 }
 
 /// [段階6c] 1件の生成要求について、**応答と、待ち行列へ積むために観測できた事実**。
@@ -768,26 +833,44 @@ fn record_denial(
     }
 }
 
-/// 辺のenv方針を、系統のbase envへ当てる（§19.1の表）。
+/// 辺のenv方針を呼び出し元の申告へ当て、**harnessが所有する名前だけを系統の値で強制する**
+/// （§19.1の表と、2026-09-17の決定3）。
 ///
-/// # `PassThrough`でも呼び出し元の環境は使わない（**限界**）
+/// # 呼び出し元の申告を使うようになった理由（段階6f-1）
 ///
-/// 判定器の`PassThrough`は「呼び出し元のenvをそのまま通す」という意味だが、
-/// **要求電文にenvの欄が無い**ので、Daemonの手元に呼び出し元の環境は無い。
-/// 代わりに系統のbase env（harnessが組んだトップレベルの環境）を渡す。
+/// 段階6bは系統のbase env（harnessが組んだトップレベルの環境）に固定していた。
+/// §10.1.2が「envの欄を置いてもいけない」と書いていたためだが、**それが守りたかったのは
+/// `PATH`と窓口のパイプ名を差し替えられないことだった**。固定のままだと、⑤を既定へ入れた日に
+/// **シェルで設定した`$env:FOO`が子へ1つも届かなくなる**——PowerShellのセッション変数や
+/// activate系スクリプトが黙って効かなくなる形である。
 ///
-/// **これは狭い側への差である。** 呼び出し元がプロセス内で足した変数は子へ届かない。
-/// 呼び出し元の申告を受け取る形にはしない——`PATH`や`HARNESS_SPAWN_REQUEST_PIPE`を
-/// 差し替えられる。呼び出し元の環境を正しく運ぶのは6f（フックがDaemonへ頼む側）である。
+/// そこで**名前を限って塞ぐ**ことにした。規則は1つだけである。
+///
+/// > harnessが所有する名前（[`harness_owned_env_names`]）は、子の値が**常に系統の値**になる。
+/// > 系統に無ければ子からも消える。それ以外は呼び出し元の申告をそのまま通す。
+///
+/// **「消す」側を落とすと、呼び出し元が`HARNESS_COW_DIFF_LAYER`を勝手に生やせる**
+/// （`B-01`: 付与と撤収の対を片方だけにしない）。
+///
+/// # 1回の生成にしか意味が無い値は、ここでは戻さない
+///
+/// `HARNESS_COW_READY_HANDLE`は系統のbase envにも入っているが、それは**トップレベルを
+/// 起こしたときのハンドル値**であって、この子には意味が無い。ここでは消すだけにして、
+/// 正しい値は[`prepare_redirector`]が生成のたびに書き直す。
 fn env_for_nested(
     base_env: &[(String, String)],
+    caller_env: Option<&[(String, String)]>,
     policy: &harness_policy::transition::EnvPolicy,
 ) -> Vec<(String, String)> {
     use harness_policy::transition::EnvPolicy;
-    match policy {
-        EnvPolicy::PassThrough => base_env.to_vec(),
+    // **申告が無いときは系統の基準env**（段階6bと同じ）。`Some(空)`とは別物である
+    // ——混ぜると`SystemRoot`の無い環境ブロックになり、`CreateProcessW`が
+    // `ERROR_ENVVAR_NOT_FOUND`で落ちる（[`SpawnRequest::Spawn::env`]のdoc）。
+    let caller_env = caller_env.unwrap_or(base_env);
+    let mut env: Vec<(String, String)> = match policy {
+        EnvPolicy::PassThrough => caller_env.to_vec(),
         EnvPolicy::Fixed(over) => {
-            let mut env: Vec<(String, String)> = base_env
+            let mut env: Vec<(String, String)> = caller_env
                 .iter()
                 .filter(|(name, _)| {
                     !over.unset.iter().any(|u| u.eq_ignore_ascii_case(name))
@@ -800,7 +883,22 @@ fn env_for_nested(
             }
             env
         }
+    };
+
+    // harnessが所有する名前を、申告から**全部落とす**。辺の`set`で書かれていても落とす
+    // ——`policy.json`は人が書くものだが、窓口の名前を宣言で差し替えられる形にはしない。
+    let owned = harness_owned_env_names();
+    env.retain(|(name, _)| !owned.iter().any(|o| o.eq_ignore_ascii_case(name)));
+    // 系統の値を戻す。**1回の生成にしか意味が無いものは戻さない**（上記）。
+    for name in owned {
+        if name.eq_ignore_ascii_case(redirector_env::READY_HANDLE) {
+            continue;
+        }
+        if let Some((_, value)) = base_env.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            env.push((name.to_string(), value.clone()));
+        }
     }
+    env
 }
 
 /// 接続元PIDをProcess Tableで引き、**誰かを確定する**（§12）。
@@ -846,6 +944,134 @@ fn close_received_handles(job: HANDLE, inherit_handles: &[HANDLE], also_stdio: b
     }
 }
 
+/// [段階⑤] そのドメインのコンソールを、生成の間だけ借りる（§7.1.1）。
+///
+/// # なぜ関数にしてあるのか（2026-09-17、段階6f-1）
+///
+/// **トップレベルとnestedの両方が借りる。** 段階6bではnestedが常に`NotNeeded`だったので
+/// 借りる側は1箇所しか無かったが、6f-1で呼び出し元が要否を申告できるようになった。
+/// 写すと、**借りる条件と鍵の作り方が2つの綴りに分かれる**——鍵がずれると、同じドメインに
+/// 保持プロセスが2つ立ち、片方が誰にも回収されないまま残る。
+///
+/// `None`が返るのは「借りる必要が無い」ときだけで、**借りられなかったときは`Err`**である
+/// （§7.1.2の決定4。コンソール無しで黙って起こすと、シェルは何も実行せず終了コード0で終わる）。
+fn borrow_console_if_needed<'a>(
+    shared: &'a Arc<Shared>,
+    domain: &DomainSpec,
+    console: ConsoleNeed,
+) -> Result<Option<super::console_holder::ConsoleWindow<'a>>, SpawnDaemonError> {
+    // 借りるのは「生成禁止を積む」かつ「コンソールが要る」の**両方**が立つときだけである。
+    // - 生成禁止を積まない構成では、子は今日どおり`CREATE_NO_WINDOW`で起きるので借りる必要が無い
+    // - コンソールが要らないプログラム（node・git・MCPサーバ）は`DETACHED_PROCESS`で動く
+    if !shared.child_process_policy.is_restricted() || console != ConsoleNeed::Required {
+        return Ok(None);
+    }
+    // ドメインごとに1本（§7.1.1の「分ける単位」）。**鍵は判定に使う値だけで作る**——
+    // `DomainSpec::name`は記録と診断のためだけの欄なので鍵にしない。
+    let domain_key = format!(
+        "{}|{}",
+        domain.container_sid,
+        match &domain.identity {
+            DomainIdentitySpec::Capability { sid } => sid.as_str(),
+            DomainIdentitySpec::OwnPackage => "own-package",
+        }
+    );
+    shared
+        .console_holders
+        .borrow(&domain_key)
+        .map(Some)
+        .map_err(|e| err(format!("console holder: {e}")))
+}
+
+/// [段階6f-1] Redirector DLLを注入するための、**生成をまたぐ2段の手続き**の前半が返すもの。
+///
+/// 後半（[`finish_redirector`]）を必ず通すこと——通さないと受付パイプの読み側が閉じられず、
+/// 子が初期化を終えたかどうかも確かめられない。
+struct RedirectorHandshake {
+    /// 子の初期化完了を待つ側の端。**[`finish_redirector`]が閉じる。**
+    ready_read: HANDLE,
+}
+
+/// 生成の**前**に、Redirectorの受付パイプを作り、設定を環境変数へ足す。
+///
+/// # なぜ共有しているのか（2026-09-17、段階6f-1）
+///
+/// 段階6bはトップレベルだけが注入しており、nestedの子は素のままだった。生成禁止を積むと
+/// **その子は孫を起こすことも頼むこともできなくなる**（§10.1.2「6bが残した限界」）ので、
+/// nestedも同じ手続きを通す必要がある。**写さずに共有する**——`inherit_handles`への
+/// 追加と`clear_inherit`を片方だけ忘れると、症状は「たまに子が固まる」になる。
+fn prepare_redirector(
+    spec: &RedirectorSpec,
+    container_sid: windows::Win32::Security::PSID,
+    env: &mut Vec<(String, String)>,
+    inherit_handles: &mut Vec<HANDLE>,
+) -> Result<RedirectorHandshake, SpawnDaemonError> {
+    let (read, write) = appcontainer_pipe(container_sid)
+        .map_err(|e| redirector_err(format!("appcontainer_pipe(redirector-ready): {e}")))?;
+    clear_inherit(read);
+    match spec {
+        RedirectorSpec::Cow {
+            workspace_root,
+            diff_layer_dir,
+            ext_capture_roots,
+        } => {
+            let workspace = std::path::Path::new(workspace_root);
+            let diff = std::path::Path::new(diff_layer_dir);
+            let roots: Vec<std::path::PathBuf> = ext_capture_roots
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect();
+            augment_redirector_env(
+                env,
+                RedirectorInject::for_tier2a(
+                    Some(workspace),
+                    Some(CowInject {
+                        workspace_root: workspace,
+                        diff_layer_dir: diff,
+                        ext_capture_roots: &roots,
+                    }),
+                    None,
+                ),
+                write,
+            );
+        }
+        RedirectorSpec::Lazy {
+            workspace_root,
+            broker_pipe,
+        } => augment_redirector_env(
+            env,
+            RedirectorInject::lazy(std::path::Path::new(workspace_root), broker_pipe),
+            write,
+        ),
+        // [段階5b] 誘導も受付も無いが、プロセス生成フックのために注入する。
+        RedirectorSpec::ProcessHooks { workspace_root } => augment_redirector_env(
+            env,
+            RedirectorInject::for_tier2a(workspace_root.as_deref().map(std::path::Path::new), None, None),
+            write,
+        ),
+    }
+    inherit_handles.push(write);
+    Ok(RedirectorHandshake { ready_read: read })
+}
+
+/// 生成の**後**に注入し、子の初期化完了を待つ。**成否によらず読み側を閉じる。**
+///
+/// 子を一度もresumeしていない状態で呼ぶこと——注入が失敗したら畳む側が
+/// 「ユーザーコードを1行も実行していない」ことに寄りかかっている（BUG-116）。
+fn finish_redirector(
+    handshake: RedirectorHandshake,
+    process: HANDLE,
+) -> Result<(), SpawnDaemonError> {
+    let injected = unsafe { inject_redirector(process) }.and_then(|()| {
+        wait_cow_ready(handshake.ready_read, std::time::Duration::from_secs(5))
+            .map_err(crate::tier2a::win_appcontainer::AppContainerError::Win32)
+    });
+    unsafe {
+        let _ = CloseHandle(handshake.ready_read);
+    }
+    injected.map_err(|e| redirector_err(format!("redirector injection failed: {e}")))
+}
+
 /// harnessが頼んだトップレベル生成を実行する（§12の固定順）。
 ///
 /// 返すのは子のPIDと、**harnessのプロセスへ複製した**プロセスハンドルの値である。
@@ -888,107 +1114,40 @@ fn spawn_top_level(
 
     let args: Vec<&str> = request.args.iter().map(String::as_str).collect();
     let mut env = request.env.clone();
-    let ready_read = if let Some(spec) = request.redirector.as_ref() {
-        let (read, write) = match appcontainer_pipe(domain.container.as_psid()) {
-            Ok(pipe) => pipe,
+    let handshake = match request.redirector.as_ref() {
+        Some(spec) => match prepare_redirector(
+            spec,
+            domain.container.as_psid(),
+            &mut env,
+            &mut inherit_handles,
+        ) {
+            Ok(handshake) => Some(handshake),
             Err(e) => {
                 close_received_handles(job, &inherit_handles, true);
-                return Err(redirector_err(format!(
-                    "appcontainer_pipe(redirector-ready): {e}"
-                )));
+                return Err(e);
             }
-        };
-        clear_inherit(read);
-        match spec {
-            RedirectorSpec::Cow {
-                workspace_root,
-                diff_layer_dir,
-                ext_capture_roots,
-            } => {
-                let workspace = std::path::Path::new(workspace_root);
-                let diff = std::path::Path::new(diff_layer_dir);
-                let roots: Vec<std::path::PathBuf> = ext_capture_roots
-                    .iter()
-                    .map(std::path::PathBuf::from)
-                    .collect();
-                augment_redirector_env(
-                    &mut env,
-                    RedirectorInject::for_tier2a(
-                        Some(workspace),
-                        Some(CowInject {
-                            workspace_root: workspace,
-                            diff_layer_dir: diff,
-                            ext_capture_roots: &roots,
-                        }),
-                        None,
-                    ),
-                    write,
-                );
-            }
-            RedirectorSpec::Lazy {
-                workspace_root,
-                broker_pipe,
-            } => augment_redirector_env(
-                &mut env,
-                RedirectorInject::lazy(std::path::Path::new(workspace_root), broker_pipe),
-                write,
-            ),
-            // [段階5b] 誘導も受付も無いが、プロセス生成フックのために注入する。
-            RedirectorSpec::ProcessHooks { workspace_root } => augment_redirector_env(
-                &mut env,
-                RedirectorInject::for_tier2a(
-                    workspace_root.as_deref().map(std::path::Path::new),
-                    None,
-                    None,
-                ),
-                write,
-            ),
-        }
-        inherit_handles.push(write);
-        Some(read)
-    } else {
-        None
+        },
+        None => None,
     };
     let mut env_block = build_env_block(&env);
 
-    // [段階⑤] **シェルにだけ、保持プロセスのコンソールを借りる**（§7.1.1）。
-    //
-    // 借りるのは「生成禁止を積む」かつ「コンソールが要る」の**両方**が立つときだけである。
-    // - 生成禁止を積まない構成では、子は今日どおり`CREATE_NO_WINDOW`で起きるので借りる必要が無い
-    // - コンソールが要らないプログラム（node・git・MCPサーバ）は`DETACHED_PROCESS`で動く
+    // [段階⑤] **シェルにだけ、保持プロセスのコンソールを借りる**（§7.1.1。条件と鍵の作り方は
+    // [`borrow_console_if_needed`]が持つ——nestedと共有している）。
     //
     // **窓は`CreateProcessW`の前後だけに閉じる。** ガードを落とすとその場で`FreeConsole`が
     // 走り、Daemonはコンソールから離れる——繋がったままだと、同じコンソールに繋がった
     // サンドボックスの子が制御イベントでDaemonを落とせる（§7.1.1の「Daemonは繋いだままにしない」）。
-    let console_window = if shared.child_process_policy.is_restricted()
-        && request.console == ConsoleNeed::Required
-    {
-        // ドメインごとに1本（§7.1.1の「分ける単位」）。**鍵は判定に使う値だけで作る**——
-        // `DomainSpec::name`は記録と診断のためだけの欄なので鍵にしない。
-        let domain_key = format!(
-            "{}|{}",
-            request.domain.container_sid,
-            match &request.domain.identity {
-                DomainIdentitySpec::Capability { sid } => sid.as_str(),
-                DomainIdentitySpec::OwnPackage => "own-package",
-            }
-        );
-        // **借りられなければ、このspawn要求を失敗させる**（§7.1.2の決定4）。
-        // コンソール無しで黙って起こすと、シェルは何も実行せず終了コード0で終わる。
-        match shared.console_holders.borrow(&domain_key) {
-            Ok(window) => Some(window),
-            Err(e) => {
-                close_received_handles(job, &inherit_handles, true);
-                if let Some(read) = ready_read {
-                    unsafe {
-                        let _ = CloseHandle(read);
-                    }
+    let console_window = match borrow_console_if_needed(shared, &request.domain, request.console) {
+        Ok(window) => window,
+        Err(e) => {
+            close_received_handles(job, &inherit_handles, true);
+            if let Some(handshake) = handshake {
+                unsafe {
+                    let _ = CloseHandle(handshake.ready_read);
                 }
-                return Err(err(format!("console holder: {e}")));
             }
+            return Err(e);
         }
-    } else {
-        None
     };
 
     // 「一時停止で起こす → Jobへ入れる → トークンの既定DACLを差し替える」までは
@@ -997,6 +1156,9 @@ fn spawn_top_level(
     let command_line = command_line_for(&request.exe, &args);
     let info = match create_suspended_in_job(SuspendedSpawn {
         command_line: &command_line,
+        // [段階6f-1] **トップレベルの送り手はharness自身**なので、実行ファイルの綴りは
+        // コマンドライン任せのままでよい（[`SuspendedSpawn::application_name`]の表）。
+        application_name: None,
         cwd: std::path::Path::new(&request.cwd),
         env_block: &mut env_block,
         container_sid: domain.container.as_psid(),
@@ -1019,9 +1181,9 @@ fn spawn_top_level(
             // **stdioはあちらが閉じた**（成否によらず、と同関数のdocが約束している）。
             // 残るのはJobの複製だけである。
             close_received_handles(job, &inherit_handles, false);
-            if let Some(read) = ready_read {
+            if let Some(handshake) = handshake {
                 unsafe {
-                    let _ = CloseHandle(read);
+                    let _ = CloseHandle(handshake.ready_read);
                 }
             }
             return Err(err(e.to_string()));
@@ -1039,22 +1201,15 @@ fn spawn_top_level(
 
     // Redirectorが必要な構成では、子を一度もresumeせず、初期化完了を確認してから台帳へ載せる。
     // 失敗種別を保つことでlazyだけが呼び出し側で1回fallbackでき、CoWはfail-closedを維持する。
-    if let Some(read) = ready_read {
-        let injected = unsafe { inject_redirector(info.hProcess) }.and_then(|()| {
-            wait_cow_ready(read, std::time::Duration::from_secs(5))
-                .map_err(crate::tier2a::win_appcontainer::AppContainerError::Win32)
-        });
-        unsafe {
-            let _ = CloseHandle(read);
-        }
-        if let Err(e) = injected {
+    if let Some(handshake) = handshake {
+        if let Err(e) = finish_redirector(handshake, info.hProcess) {
             unsafe {
                 let _ = TerminateProcess(info.hProcess, 1);
                 let _ = CloseHandle(info.hThread);
                 let _ = CloseHandle(info.hProcess);
             }
             close_received_handles(job, &inherit_handles, false);
-            return Err(redirector_err(format!("redirector injection failed: {e}")));
+            return Err(e);
         }
     }
 
@@ -1069,6 +1224,9 @@ fn spawn_top_level(
         // [段階6b] この系統のbase env。**Redirectorの変数を足した後の`env`である**
         // ——nestedの子も同じ誘導の下で動かなければ、同じ系統に居る意味が無い。
         env,
+        // [段階6f-1] この系統の注入設定。nestedの子へ**同じものを**注入する
+        // （`Lineage::redirector`のdoc）。`None`ならnestedも素のままである。
+        request.redirector.clone(),
     );
     if let Err(e) = registered {
         // **登録に失敗したら生成自体を失敗させる。** Resume前なので子はユーザーコードを
@@ -1140,50 +1298,81 @@ fn spawn_top_level(
 /// |---|---|---|
 /// | 系統Job | harnessが作って複製を渡す | **呼び出し元と同じ系統**（§10.1.1。別のJobを作ると「1コマンドの子孫だけ殺す」粒度が失われる） |
 /// | ドメイン | 電文の`DomainSpec` | **呼び出し元のものをそのまま**（＝同一ドメインの遷移だけ。[`DenyReason::TargetDomainNotProvisioned`]） |
-/// | env | 電文の`env` | 系統のbase envへ辺の差分を当てたもの（[`env_for_nested`]） |
-/// | stdio | harnessが作ったパイプの複製 | **`NUL`**（下記の限界） |
-/// | プロセスハンドル | harnessへ複製して返す | **返さない**（要求元が要るのはPIDだけ。[`SpawnResponse::Spawned`]） |
+/// | env | 電文の`env` | **呼び出し元の申告**へ辺の差分を当て、harness所有の名前だけ系統の値で強制（[`env_for_nested`]） |
+/// | stdio | harnessが作ったパイプの複製 | **呼び出し元のハンドルを引き抜いたもの**（申告が無い欄は`NUL`） |
+/// | 実行ファイル | コマンドライン任せ | **判定に使った`image`を`lpApplicationName`へ渡す** |
+/// | プロセスハンドル | harnessへ複製して返す | **呼び出し元へ複製して返す**（`CreateProcessW`の戻り値を組み立てられるように） |
 ///
-/// # 限界（**6bで残したもの。塞ぐのは6f**）
+/// # 段階6f-1で閉じた限界（**6bが残していた3つ**）
 ///
-/// - **stdioを`NUL`へ捨てる。** 要求電文にハンドルの欄が無く、呼び出し元の標準出力を
-///   引き継がせる手段が無い。判定器が`inherit_handles: true`と答えても**1つも引き継がせない**
-///   ——狭い側へ倒してある。運ぶのはフックがDaemonへ頼むようになる回（6f）である
-/// - **Redirector DLLを注入しない。** トップレベルは注入するが、ここはしない。
-///   生成禁止（`CHILD_PROCESS_RESTRICTED`）を積んだ構成では、**この子は孫を起こせず、
-///   Daemonへ頼むこともできない**。製品の既定は積まないので今日は表に出ない
-/// - **コンソールを要るプログラム（pwsh等）への遷移は、生成禁止を積んだ構成で
-///   無言でexit 0する。** 要求電文にコンソール要否の申告が無く、実行ファイル名からの推測は
-///   [`ConsoleNeed`]のdocが禁じている
+/// stdioの引き継ぎ・コンソール要否の申告・nestedへのDLL注入は、どれもこの回で入った。
+/// **残っているのはフック側**（`CreateProcessW`を横取りしてここへ頼む）で、それが6f-2である。
 fn spawn_nested(
     shared: &Arc<Shared>,
     caller: &super::table::Caller,
+    request: &NestedRequest<'_>,
     command_line: &str,
     cwd: &str,
-    env: Vec<(String, String)>,
-) -> Result<u32, SpawnDaemonError> {
+    mut env: Vec<(String, String)>,
+) -> Result<SpawnResponse, SpawnDaemonError> {
     let domain = resolve_domain(&caller.domain)?;
     let capability_attributes = domain.capability_attributes();
+    let caller_process = HANDLE(caller.process as *mut _);
 
-    // stdioは`NUL`（上記の限界）。**継承させるので3本とも別々に開く**——同じハンドルを
-    // 3つの欄へ入れると、`create_suspended_in_job`が成否によらず閉じる契約で二重closeになる。
-    let stdout_write = open_nul_for_write()?;
-    let stderr_write = match open_nul_for_write() {
-        Ok(handle) => handle,
+    // [段階6f-1] 呼び出し元のstdioを**引き抜く**（[`super::CallerHandles`]のdoc）。
+    // 申告の無い欄は今までどおり`NUL`へ捨てる。
+    let mut opened = OpenedStdio::default();
+    let (stdin_read, stdout_write, stderr_write) =
+        match pull_caller_stdio(&mut opened, caller_process, &request.handles) {
+            Ok(three) => three,
+            Err(e) => {
+                // **途中まで開いたぶんを閉じる**（`B-01`: 3本のうち2本目で落ちたら1本目が漏れる）。
+                close_all(&opened.opened);
+                return Err(e);
+            }
+        };
+    let mut inherit_handles = opened.take_for_inherit();
+
+    let job = HANDLE(caller.lineage_job as *mut _);
+
+    // [段階6f-1] **系統と同じ誘導をこの子にも入れる**（`Lineage::redirector`のdoc）。
+    // 入れないと、生成禁止を積んだ構成でこの子は孫を起こすことも頼むこともできない。
+    let handshake = match caller.redirector.as_ref() {
+        Some(spec) => match prepare_redirector(
+            spec,
+            domain.container.as_psid(),
+            &mut env,
+            &mut inherit_handles,
+        ) {
+            Ok(handshake) => Some(handshake),
+            Err(e) => {
+                close_all(&inherit_handles);
+                return Err(e);
+            }
+        },
+        None => None,
+    };
+    let mut env_block = build_env_block(&env);
+
+    // [段階6f-1] コンソールは**呼び出し元の申告**で借りる（決定2）。トップレベルと同じ関数を通る。
+    let console_window = match borrow_console_if_needed(shared, &caller.domain, request.console) {
+        Ok(window) => window,
         Err(e) => {
-            unsafe {
-                let _ = CloseHandle(stdout_write);
+            close_all(&inherit_handles);
+            if let Some(handshake) = handshake {
+                unsafe {
+                    let _ = CloseHandle(handshake.ready_read);
+                }
             }
             return Err(e);
         }
     };
-    let inherit_handles = vec![stdout_write, stderr_write];
-
-    let mut env_block = build_env_block(&env);
-    let job = HANDLE(caller.lineage_job as *mut _);
 
     let info = create_suspended_in_job(SuspendedSpawn {
         command_line,
+        // [段階6f-1] **判定した実行ファイルと、起きる実行ファイルを同一の値にする**
+        // （[`SpawnRequest::Spawn::image`]のdoc）。
+        application_name: Some(request.image),
         cwd: std::path::Path::new(cwd),
         env_block: &mut env_block,
         container_sid: domain.container.as_psid(),
@@ -1191,18 +1380,39 @@ fn spawn_nested(
         inherit_handles: &inherit_handles,
         stdout_write,
         stderr_write,
-        // 呼び出し元の標準入力は運べない（上記の限界）。**固定argvの辺でstdinを断つという
-        // §19.1の要求とは、たまたま同じ向きになっているだけである**——こちらは能力が無いだけで、
-        // 判定の結果として断っているのではない。
-        stdin_read: None,
+        stdin_read,
         // **系統Jobは呼び出し元のものである。この関数は所有しない**（`SuspendedSpawn::job`のdoc）
         // ——閉じると他人のハンドルを閉じることになる。台帳が最後の1人で閉じる。
         job,
         domain: domain.domain_identity(),
         child_process_policy: shared.child_process_policy,
-        console: ConsoleNeed::NotNeeded,
-    })
-    .map_err(|e| err(e.to_string()))?;
+        console: request.console,
+    });
+    // **窓はここで閉じる**（トップレベルと同じ理由。§7.1.1）。
+    drop(console_window);
+    let info = match info {
+        Ok(info) => info,
+        Err(e) => {
+            // **stdioはあちらが閉じた**（成否によらず、と同関数のdocが約束している）。
+            if let Some(handshake) = handshake {
+                unsafe {
+                    let _ = CloseHandle(handshake.ready_read);
+                }
+            }
+            return Err(err(e.to_string()));
+        }
+    };
+
+    if let Some(handshake) = handshake {
+        if let Err(e) = finish_redirector(handshake, info.hProcess) {
+            unsafe {
+                let _ = TerminateProcess(info.hProcess, 1);
+                let _ = CloseHandle(info.hThread);
+                let _ = CloseHandle(info.hProcess);
+            }
+            return Err(e);
+        }
+    }
 
     let pid = info.dwProcessId;
 
@@ -1227,15 +1437,208 @@ fn spawn_nested(
         )));
     }
 
+    // [段階6f-1] **呼び出し元へ返すハンドルを、動かす前に作る。**
+    //
+    // フックは`CreateProcessW`の`PROCESS_INFORMATION`を組み立てて返す義務があり、
+    // 呼び出し元のプログラムはそこに入っているハンドルで**待ち・終了コードの読み取り・
+    // （一時停止で頼んだなら）再開**を行う。作れないなら起こしても意味が無いので、
+    // **その場で畳む**——resume前なので子はユーザーコードを1行も実行していない。
+    let for_caller = duplicate_to_caller(caller_process, info.hProcess, info.hThread);
+    let (process, thread) = match for_caller {
+        Ok(pair) => pair,
+        Err(e) => {
+            // **順序が効く**（トップレベル側と同じ）。`reap_now`は台帳が持つハンドルを
+            // 閉じるので、先に呼ぶと`TerminateProcess`が閉じたハンドルを撃つことになる。
+            unsafe {
+                let _ = TerminateProcess(info.hProcess, 1);
+                let _ = CloseHandle(info.hThread);
+            }
+            reap_now(shared, pid);
+            return Err(e);
+        }
+    };
+
     // 回収はトップレベルと同じ担当を立てる（新しい待ち方を持ち込まない）。
     spawn_reaper(Arc::clone(shared), pid, info.hProcess);
 
     unsafe {
-        let _ = ResumeThread(info.hThread);
+        // [段階6f-1] **呼び出し元が一時停止で頼んだなら、動かすのは呼び出し元である。**
+        // 上で複製したスレッドハンドルが`ResumeThread`の相手になる。
+        if !request.suspended {
+            let _ = ResumeThread(info.hThread);
+        }
         let _ = CloseHandle(info.hThread);
     }
 
-    Ok(pid)
+    Ok(SpawnResponse::Spawned {
+        pid,
+        process: process.0 as u64,
+        thread: thread.0 as u64,
+    })
+}
+
+/// [段階6f-1] 起こした子のプロセス／スレッドハンドルを、**要求元のプロセスへ**複製する。
+///
+/// # 与える権限は、素の`CreateProcessW`が親へ渡すものと揃える
+///
+/// フックの目的は「呼び出し元から見て、素の`CreateProcessW`と同じに見えること」である。
+/// 素の生成では親は子に対して完全なアクセスを得るので、ここで絞ると
+/// **サンドボックスの中のビルドツールが自分の子を殺せなくなる**（`taskkill`相当が効かない）。
+///
+/// # いまは同一ドメインの間でしか起きない
+///
+/// 遷移先は呼び出し元と同じドメインに限られている（[`DenyReason::TargetDomainNotProvisioned`]）ので、
+/// 渡しても呼び出し元の権限は1ビットも増えない。**別ドメインへ遷移できるようになった日には
+/// 見直しが要る**——狭い側へ移したはずの子へ、広い側からの完全アクセスを手渡すことになる
+/// （`docs/STATUS.md`残課題#49）。
+///
+/// 片方だけ成功した状態を残さない——2本目で落ちたら1本目を閉じる（`B-01`）。
+fn duplicate_to_caller(
+    caller_process: HANDLE,
+    process: HANDLE,
+    thread: HANDLE,
+) -> Result<(HANDLE, HANDLE), SpawnDaemonError> {
+    let dup = |source: HANDLE, what: &'static str| -> Result<HANDLE, SpawnDaemonError> {
+        let mut theirs = HANDLE::default();
+        unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                source,
+                caller_process,
+                &mut theirs,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .map_err(|e| err(format!("DuplicateHandle({what} to the caller): {e}")))?;
+        Ok(theirs)
+    };
+    let their_process = dup(process, "child process")?;
+    match dup(thread, "child thread") {
+        Ok(their_thread) => Ok((their_process, their_thread)),
+        Err(e) => {
+            // **相手のプロセスの中のハンドルなので、こちらからは`DuplicateHandle`の
+            // 閉じる形でしか撤回できない。** `DUPLICATE_CLOSE_SOURCE`を使い、
+            // 複製元として相手側の値を指す。
+            let mut discard = HANDLE::default();
+            unsafe {
+                let _ = DuplicateHandle(
+                    caller_process,
+                    their_process,
+                    GetCurrentProcess(),
+                    &mut discard,
+                    0,
+                    false,
+                    DUPLICATE_CLOSE_SOURCE,
+                );
+                let _ = CloseHandle(discard);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// [段階6f-1] 申告が無かった欄の代わりに何を開くか。
+///
+/// **`Read`の側を作っていないのは意図である**——標準入力の申告が無い子は
+/// 「標準入力を持たない」（`None`）であって、「空を読む」ではない。`NUL`を読ませると
+/// **即EOF**になり、`None`とほぼ同じに見えるが、`isatty`相当の問い合わせの答えが変わる。
+enum Nul {
+    Write,
+}
+
+/// [段階6f-1] nestedの子へ渡すstdio一式を**集める**入れ物。
+///
+/// # なぜ入れ物が要るのか
+///
+/// 3本のうち2本目で失敗したとき、**1本目を閉じなければ漏れる**。返り道ごとに閉じる形にすると、
+/// 4本目が生えた日に必ずどれかが漏れる（`B-01`・`B-06`）。集めておいて、
+/// 失敗したら[`close_all`]へ渡す。
+///
+/// 成功した場合は`create_suspended_in_job`が**成否によらず全部閉じる**契約を持っているので、
+/// こちら側で閉じるのは「あそこへ渡す前に落ちたとき」だけである。
+#[derive(Default)]
+struct OpenedStdio {
+    opened: Vec<HANDLE>,
+}
+
+impl OpenedStdio {
+    /// 呼び出し元のハンドルを引き抜く。申告が無ければ`fallback`（`None`ならハンドル無し）。
+    ///
+    /// **`DUPLICATE_SAME_ACCESS`で引き抜く。** アクセスを広げない——広げても得る物は無いが、
+    /// 「Daemonを通すと権限が増える」形を1つも作らないためである（`P-01`）。
+    fn pull(
+        &mut self,
+        caller_process: HANDLE,
+        claimed: Option<u64>,
+        fallback: Option<Nul>,
+    ) -> Result<Option<HANDLE>, SpawnDaemonError> {
+        let handle = match claimed {
+            Some(value) => {
+                let mut mine = HANDLE::default();
+                unsafe {
+                    DuplicateHandle(
+                        caller_process,
+                        HANDLE(value as *mut _),
+                        GetCurrentProcess(),
+                        &mut mine,
+                        0,
+                        // 子へ継承させる値なので、複製の時点で継承可にしておく。
+                        true,
+                        DUPLICATE_SAME_ACCESS,
+                    )
+                }
+                .map_err(|e| {
+                    // **嘘の値を送られただけのことがある。** 理由を具体的に残しておかないと、
+                    // 「起こせなかった」としか分からない（`B-10`）。
+                    err(format!("DuplicateHandle(caller stdio {value:#x}): {e}"))
+                })?;
+                Some(mine)
+            }
+            None => match fallback {
+                Some(Nul::Write) => Some(open_nul_for_write()?),
+                None => None,
+            },
+        };
+        if let Some(handle) = handle {
+            self.opened.push(handle);
+        }
+        Ok(handle)
+    }
+
+    /// 集めたハンドルを`inherit_handles`として取り出す。
+    fn take_for_inherit(self) -> Vec<HANDLE> {
+        self.opened
+    }
+}
+
+/// 3本まとめて引き抜く。**途中で落ちたら、開いたぶんは呼び出し側が[`close_all`]で閉じる。**
+///
+/// 標準出力・標準エラーは`NUL`の逃げ道があるので必ず値が返る。標準入力だけは
+/// 「持たない」があり得る（[`Nul`]のdoc）。
+fn pull_caller_stdio(
+    opened: &mut OpenedStdio,
+    caller_process: HANDLE,
+    handles: &super::CallerHandles,
+) -> Result<(Option<HANDLE>, HANDLE, HANDLE), SpawnDaemonError> {
+    let stdin_read = opened.pull(caller_process, handles.stdin, None)?;
+    let stdout_write = opened
+        .pull(caller_process, handles.stdout, Some(Nul::Write))?
+        .expect("the NUL fallback always yields a handle");
+    let stderr_write = opened
+        .pull(caller_process, handles.stderr, Some(Nul::Write))?
+        .expect("the NUL fallback always yields a handle");
+    Ok((stdin_read, stdout_write, stderr_write))
+}
+
+/// 集めたハンドルを全部閉じる。**`create_suspended_in_job`へ渡す前に落ちたときだけ呼ぶ。**
+fn close_all(handles: &[HANDLE]) {
+    unsafe {
+        for handle in handles {
+            let _ = CloseHandle(*handle);
+        }
+    }
 }
 
 /// 継承させられる`NUL`（書き込み用）を1本開く。
@@ -1383,45 +1786,197 @@ mod nested_env_tests {
     use super::*;
     use harness_policy::transition::{EnvOverride, EnvPolicy};
 
+    const PIPE: &str = r"\\.\pipe\x";
+
+    /// 系統の基準env。**harnessが所有する名前が1つ入っている**（窓口のパイプ名）。
     fn base() -> Vec<(String, String)> {
         vec![
             ("PATH".to_string(), "C:/w/bin".to_string()),
             (
-                "HARNESS_SPAWN_REQUEST_PIPE".to_string(),
-                r"\\.\pipe\x".to_string(),
+                crate::tier2a::spawnd::REQUEST_PIPE_ENV.to_string(),
+                PIPE.to_string(),
             ),
         ]
     }
 
-    /// `PassThrough`は系統のbase envをそのまま渡す。
-    ///
-    /// **窓口の名前が落ちないことまで見る**——落ちると、起こした子は
-    /// 「自分は誰にも頼めない」状態になり、症状は「孫が作れない」という
-    /// 判定とは無関係な形で出る。
-    #[test]
-    fn pass_through_hands_the_lineage_base_env_to_the_child() {
-        let env = env_for_nested(&base(), &EnvPolicy::PassThrough);
-        assert_eq!(env, base());
+    /// 呼び出し元が申告してくる環境。**基準envとは別物**——シェルの中で設定された変数が
+    /// ここに載る。
+    fn caller() -> Vec<(String, String)> {
+        vec![
+            ("PATH".to_string(), "C:/caller/bin".to_string()),
+            ("FOO".to_string(), "set-in-the-shell".to_string()),
+        ]
     }
 
-    /// `Fixed`はbase envへ差分を当てる。**`set`は上書き、`unset`は取り除く。**
+    fn value_of<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        env.iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// [段階6f-1] **`PassThrough`は呼び出し元の申告を通す。**
+    ///
+    /// 段階6bは系統の基準envに固定しており、シェルで設定した変数は子へ1つも届かなかった。
+    /// **届くこと**と、**窓口の名前が系統の値で強制されること**を1本で見る——
+    /// 後者が落ちると、起こした子は「自分は誰にも頼めない」状態になり、症状は
+    /// 「孫が作れない」という判定とは無関係な形で出る。
+    #[test]
+    fn pass_through_hands_the_callers_own_environment_to_the_child() {
+        let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::PassThrough);
+
+        assert_eq!(
+            value_of(&env, "FOO"),
+            Some("set-in-the-shell"),
+            "シェルの中で設定された変数が子へ届いていない。\
+             `$env:FOO=1; git ...` が効かない形である: {env:?}"
+        );
+        assert_eq!(
+            value_of(&env, "PATH"),
+            Some("C:/caller/bin"),
+            "呼び出し元の`PATH`ではなく系統の値が使われている: {env:?}"
+        );
+        assert_eq!(
+            value_of(&env, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
+            Some(PIPE),
+            "窓口の名前が系統の値になっていない: {env:?}"
+        );
+    }
+
+    /// [段階6f-1] **「申告していない」と「空だと申告した」は別である**（`P-11`）。
+    ///
+    /// # なぜこの1本が要るのか——**実機で踏んだ**
+    ///
+    /// 2026-09-17、この2つを同じに扱っていたため、**許可された遷移が1つ残らず
+    /// 「起こそうとして失敗した」になった**。`SystemRoot`の無い環境ブロックを渡された
+    /// `CreateProcessW`は`ERROR_ENVVAR_NOT_FOUND`(203)で失敗する——症状は
+    /// 「宣言は合っているのに起きない」で、**宣言の側をいくら直しても直らない**。
+    #[test]
+    fn an_unstated_environment_falls_back_to_the_lineage_but_an_empty_one_does_not() {
+        let unstated = env_for_nested(&base(), None, &EnvPolicy::PassThrough);
+        assert_eq!(
+            value_of(&unstated, "PATH"),
+            Some("C:/w/bin"),
+            "申告が無いのに系統の基準envが使われていない。\
+             **`SystemRoot`の無い環境ブロックで子を起こすことになる**: {unstated:?}"
+        );
+
+        let declared_empty = env_for_nested(&base(), Some(&[]), &EnvPolicy::PassThrough);
+        assert_eq!(
+            value_of(&declared_empty, "PATH"),
+            None,
+            "**空だと申告したのに系統の値が混ざっている。** 2つを同じに扱うと、\
+             申告の有無が結果に出ない: {declared_empty:?}"
+        );
+        // 空だと申告しても、harnessが所有する名前だけは系統の値で戻る。
+        assert_eq!(
+            value_of(&declared_empty, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
+            Some(PIPE)
+        );
+    }
+
+    /// [段階6f-1] **呼び出し元がharness所有の名前を名乗っても、系統の値が勝つ。**
+    ///
+    /// これが§10.1.2の「envの欄を置いてもいけない」が守りたかった一点である。
+    /// 効かなくなると、サンドボックスの中のプロセスが**窓口の名前を自分で決められる**
+    /// ——偽の窓口へ繋がせて、拒否されたはずの生成を「許可」と答えさせられる。
+    #[test]
+    fn a_caller_cannot_redeclare_a_harness_owned_variable() {
+        let mut claimed = caller();
+        claimed.push((
+            crate::tier2a::spawnd::REQUEST_PIPE_ENV.to_string(),
+            r"\\.\pipe\attacker".to_string(),
+        ));
+        claimed.push((
+            // 綴りの大小でも素通りしないこと。
+            redirector_env::DIFF_LAYER.to_ascii_lowercase(),
+            r"C:\attacker\diff".to_string(),
+        ));
+
+        let env = env_for_nested(&base(), Some(&claimed), &EnvPolicy::PassThrough);
+
+        assert_eq!(
+            value_of(&env, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
+            Some(PIPE),
+            "呼び出し元が名乗った窓口の名前が子へ渡っている: {env:?}"
+        );
+        assert_eq!(
+            value_of(&env, redirector_env::DIFF_LAYER),
+            None,
+            "**系統に無いharness所有の変数が、呼び出し元の申告から子へ渡っている。** \
+             差分層の置き場を呼び出し元が決められる形である: {env:?}"
+        );
+    }
+
+    /// [段階6f-1] **1回の生成にしか意味が無い値は、系統からも戻さない。**
+    ///
+    /// 初期化完了を知らせるハンドルの値は、トップレベルを起こしたときのものである。
+    /// 子のプロセスでは別のオブジェクトを指す（か、何も指さない）ので、そのまま渡すと
+    /// **DLLが知らない相手へ完了を書き込む**。正しい値は`prepare_redirector`が毎回書き直す。
+    #[test]
+    fn the_one_shot_ready_handle_is_not_carried_over_from_the_lineage() {
+        let mut base = base();
+        base.push((redirector_env::READY_HANDLE.to_string(), "284".to_string()));
+
+        let env = env_for_nested(&base, Some(&caller()), &EnvPolicy::PassThrough);
+
+        assert_eq!(
+            value_of(&env, redirector_env::READY_HANDLE),
+            None,
+            "トップレベルのハンドル値が子へ持ち越されている: {env:?}"
+        );
+    }
+
+    /// `Fixed`は**呼び出し元の申告へ**差分を当てる。**`set`は上書き、`unset`は取り除く。**
     ///
     /// 対で見る（`B-35`）——`set`だけを測ると、`unset`を無視する実装でも緑になる。
     #[test]
-    fn fixed_applies_the_edge_overrides_on_top_of_the_base_env() {
+    fn fixed_applies_the_edge_overrides_on_top_of_the_callers_environment() {
         let over = EnvOverride {
             set: [("PATH".to_string(), "C:/fixed".to_string())]
                 .into_iter()
                 .collect(),
-            unset: vec!["HARNESS_SPAWN_REQUEST_PIPE".to_string()],
+            unset: vec!["FOO".to_string()],
         };
-        let env = env_for_nested(&base(), &EnvPolicy::Fixed(over));
+        let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::Fixed(over));
 
         assert_eq!(
-            env,
-            vec![("PATH".to_string(), "C:/fixed".to_string())],
-            "差分の当て方が違う。上書きが二重に載っている（同じ名前が2つ）か、\
-             取り除きが効いていない"
+            value_of(&env, "PATH"),
+            Some("C:/fixed"),
+            "宣言した固定値が効いていない: {env:?}"
+        );
+        assert_eq!(
+            value_of(&env, "FOO"),
+            None,
+            "宣言した取り除きが効いていない: {env:?}"
+        );
+        assert_eq!(
+            env.iter().filter(|(n, _)| n == "PATH").count(),
+            1,
+            "同じ名前が2つ載っている（どちらが効くかは実装依存になる）: {env:?}"
+        );
+    }
+
+    /// **辺の宣言でも、harnessが所有する名前は差し替えられない。**
+    ///
+    /// `policy.json`は人が書くものだが、**そこから窓口の名前を差し替えられる形にはしない**
+    /// ——宣言を1行足すだけで強制を外せることになる。
+    #[test]
+    fn an_edge_declaration_cannot_redirect_the_request_pipe() {
+        let over = EnvOverride {
+            set: [(
+                crate::tier2a::spawnd::REQUEST_PIPE_ENV.to_string(),
+                r"\\.\pipe\declared".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            unset: Vec::new(),
+        };
+        let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::Fixed(over));
+
+        assert_eq!(
+            value_of(&env, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
+            Some(PIPE),
+            "宣言で窓口の名前を差し替えられている: {env:?}"
         );
     }
 
@@ -1436,16 +1991,62 @@ mod nested_env_tests {
             set: [("path".to_string(), "C:/fixed".to_string())]
                 .into_iter()
                 .collect(),
-            unset: vec!["harness_spawn_request_pipe".to_string()],
+            unset: vec!["foo".to_string()],
         };
-        let env = env_for_nested(&base(), &EnvPolicy::Fixed(over));
+        let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::Fixed(over));
 
         assert_eq!(
-            env.len(),
+            env.iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case("path"))
+                .count(),
             1,
             "綴りの大小で別の変数として扱われている（同じ名前が2つ載る）: {env:?}"
         );
-        assert_eq!(env[0].1, "C:/fixed");
+        assert_eq!(value_of(&env, "PATH"), Some("C:/fixed"));
+        assert_eq!(value_of(&env, "FOO"), None);
+    }
+}
+
+/// [段階6f-1] `lpApplicationName`として通してよい綴りか。**Win32を1行も通らない。**
+#[cfg(test)]
+mod image_path_tests {
+    use super::*;
+
+    /// **許可側**: ドライブ付きの絶対パスとUNCは通る（区切りはどちらの向きでもよい）。
+    #[test]
+    fn drive_rooted_and_unc_paths_are_accepted() {
+        for image in [
+            r"C:\Windows\System32\cmd.exe",
+            "C:/Windows/System32/cmd.exe",
+            r"\\server\share\tool.exe",
+            "//server/share/tool.exe",
+        ] {
+            assert!(image_is_absolute(image), "絶対パスが弾かれている: {image}");
+        }
+    }
+
+    /// **禁止側（対）**: 相対パスと**ルート相対**は弾く。
+    ///
+    /// `\foo`は`Path::is_absolute`が真と答える綴りだが、解決に使われるのは
+    /// **呼び出し側プロセス（＝Daemon）のカレントドライブ**である。
+    /// 通すと「絶対パスを渡したのに、Daemonの居るドライブの別のファイルが起きる」。
+    #[test]
+    fn relative_and_root_relative_paths_are_refused() {
+        for image in [
+            "git.exe",
+            r"..\git.exe",
+            "./git.exe",
+            r"\Windows\System32\cmd.exe",
+            "/usr/bin/git",
+            r"C:git.exe",
+            "",
+            r"\\",
+        ] {
+            assert!(
+                !image_is_absolute(image),
+                "Daemonのcwd／カレントドライブから解決される綴りが通っている: {image:?}"
+            );
+        }
     }
 }
 

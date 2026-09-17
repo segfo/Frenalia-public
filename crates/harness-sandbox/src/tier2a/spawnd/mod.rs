@@ -78,7 +78,17 @@ pub const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 
 /// 1フレームの上限。Daemonは**サンドボックスからの入力を直接パースする最初のフルトラスト
 /// 常駐**なので、長さの上限をプロトコルの側で持つ（§10.1「Daemonの入力の扱い」）。
-pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+///
+/// # なぜ64 KiBでは足りなくなったのか（2026-09-17、段階6f-1）
+///
+/// [`SpawnRequest::Spawn`]が**呼び出し元の環境変数一式**を運ぶようになった。Windowsの
+/// 環境ブロックは数十KiBに達することがあり、JSONのエスケープでさらに膨らむ。
+/// **足りないと`MalformedRequest`になる**——呼び出し元から見ると「環境変数が多いときだけ
+/// 生成が拒否される」という、理由の想像できない形で出る。
+///
+/// **上限そのものは外さない。** 外すと、サンドボックスが1フレームでDaemonのメモリを
+/// 好きなだけ確保させられる。
+pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 
 /// 制御パイプのプロトコル版。
 ///
@@ -501,18 +511,120 @@ pub enum ControlResponse {
     ShuttingDown,
 }
 
+/// [段階6f-1] 呼び出し元が子へ引き継がせたいハンドル。
+///
+/// # [`ChildHandles`]と**向きが逆**である
+///
+/// あちらは「送る前に受け手（Daemon）のプロセスへ複製済み」の値だが、こちらは
+/// **呼び出し元のプロセスの中でしか意味を持たない生の値**である。サンドボックスの中の
+/// プロセスはDaemonのプロセスハンドルを開けないので、自分で複製して渡すことができない
+/// ——だから**Daemonが引き抜く**（`DuplicateHandle`の第1引数に呼び出し元を置く）。
+///
+/// **型を分けてあるのはこの向きの違いのためである。** 同じ`u64`で意味が逆なので、
+/// 混ぜると「たまたま同じ番号の別オブジェクト」を掴む（モジュールdocの「ハンドルは値だけを載せる」）。
+///
+/// # 嘘を書かれても得る物が無い
+///
+/// 引き抜けるのは**呼び出し元が既に持っているハンドル**だけで、それがそのまま子へ渡る。
+/// 今日の子は呼び出し元と**同じドメイン**なので（§10.1.2の暫定）、渡しても権限は1ビットも
+/// 増えない。**別ドメインへ遷移できるようになった日には見直しが要る**（`docs/STATUS.md`残課題#49）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CallerHandles {
+    /// 子の標準入力にしたいハンドル（**呼び出し元の中の値**）。`None`なら標準入力を持たない。
+    #[serde(default)]
+    pub stdin: Option<u64>,
+    /// 子の標準出力。`None`なら`NUL`へ捨てる（段階6bまでの唯一の挙動）。
+    #[serde(default)]
+    pub stdout: Option<u64>,
+    /// 子の標準エラー。`None`なら`NUL`へ捨てる。
+    #[serde(default)]
+    pub stderr: Option<u64>,
+}
+
 /// サンドボックスの中のプロセス → Daemon（要求受付パイプ）。
 ///
 /// **ドメインの欄が無いのは意図である**（モジュールdoc）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SpawnRequest {
-    /// この実行ファイルを、この引数で起こしたい。
+    /// この実行ファイルを、このコマンドラインで起こしたい。
     Spawn {
-        exe: String,
-        args: Vec<String>,
+        /// 起こす実行ファイルの**絶対パス**（`CreateProcessW`の`lpApplicationName`）。
+        ///
+        /// # なぜ絶対でなければならないのか（2026-09-17、段階6f-1）
+        ///
+        /// `lpApplicationName`の相対パスは**呼び出し側プロセスのcwd基準**で解決される。
+        /// 起こすのはDaemonなので、相対パスを通すと**Daemonのcwdから見た別の実行ファイル**が
+        /// 起きる。`lpCurrentDirectory`（＝`cwd`欄）は`lpApplicationName`の解決には使われない。
+        /// 絶対でない値は[`DenyReason::MalformedRequest`]で断る。
+        ///
+        /// # なぜ`lpCommandLine`任せにしないのか
+        ///
+        /// 判定に使う実行ファイルと、実際に起きる実行ファイルを**同一の値**にするためである
+        /// （§8.2をコマンドラインから実行ファイルへ広げたもの）。コマンドラインの先頭から
+        /// 実行ファイルを決める規則は、引用符の無い空白入りパスで**複数の候補を順に試す**
+        /// ——こちらの解釈とOSの解釈がずれると、**判定したのと別のファイルが起きる**。
+        image: String,
+        /// `CreateProcessW`の`lpCommandLine`へ**逐語で**渡す文字列。
+        ///
+        /// **`exe`＋`args`から組み直さない**（段階6bまではそうしていた）。組み直すと
+        /// 引用符の付け方が変わり、`cmd /c "a & b"`のように自分でコマンドラインを解釈する
+        /// プログラムの意味が変わる。§8.2の「評価した値と起動に使う値を同一にする」は、
+        /// **逐語で運ぶほうが直接に満たされる**。
+        command_line: String,
         cwd: String,
+        /// [段階6f-1] 呼び出し元が子へ渡したい環境変数一式。
+        ///
+        /// **そのまま使うわけではない。** harnessが所有する名前（窓口のパイプ名・Redirectorの
+        /// 設定）は、系統の基準envの値で**必ず上書きされる**（`server::env_for_nested`）。
+        /// 上書きしないと`PATH`や窓口名を差し替えられる、というのが§10.1.2が
+        /// 「envの欄を置いてもいけない」と書いた理由だった——**その名前だけを塞げば足りる**と
+        /// 判断を改めたのが段階6f-1である。
+        ///
+        /// # `None`と`Some(空)`は別の意味である（`P-11`）
+        ///
+        /// | 値 | 意味 | 子が受け取る環境 |
+        /// |---|---|---|
+        /// | `None`（欄が無い） | **申告していない** | 系統の基準env（段階6bと同じ） |
+        /// | `Some([])` | **空だと申告した** | ほぼ空（harness所有の名前だけ） |
+        ///
+        /// **混ぜると起動そのものが落ちる。** `SystemRoot`の無い環境ブロックを渡された
+        /// `CreateProcessW`は`ERROR_ENVVAR_NOT_FOUND`(203)で失敗する——2026-09-17の実機で
+        /// 実際に踏んだ（空の申告を「申告なし」と同じに扱っていたため、**許可された遷移が
+        /// 全部「起こそうとして失敗した」になった**）。
+        ///
+        /// `lpEnvironment`に`NULL`を渡す呼び出し元（＝「自分の環境を継がせたい」）を
+        /// フックが運ぶときは、**フックが自分の環境を読んで`Some`で渡す**——
+        /// `None`のまま運ぶと、呼び出し元がプロセス内で設定した変数が消える。
+        #[serde(default)]
+        env: Option<Vec<(String, String)>>,
+        /// [段階6f-1] 子へ引き継がせるハンドル（[`CallerHandles`]）。
+        #[serde(default)]
+        handles: CallerHandles,
+        /// [段階6f-1] 起こすプログラムがコンソールを要るか。
+        ///
+        /// **呼び出し元が`CreateProcessW`へ渡した生成フラグから導く**のが決めた形である
+        /// （2026-09-17）——`CREATE_NO_WINDOW`も`DETACHED_PROCESS`も付いていないなら、
+        /// 呼び出し元は「自分のコンソールを子に継承させる」つもりである。
+        /// **実行ファイル名からの推測ではない**ので、[`ConsoleNeed`]のdocが禁じている形には
+        /// 当たらない。
+        ///
+        /// 古い要求（欄を持たない）は`NotNeeded`として読む——段階6bの挙動そのものである。
+        #[serde(default = "console_need_not_needed")]
+        console: ConsoleNeed,
+        /// [段階6f-1] 呼び出し元が`CREATE_SUSPENDED`を指定していたか。
+        ///
+        /// `true`ならDaemonは`ResumeThread`を撃たず、スレッドハンドルを返す
+        /// （動かすのは呼び出し元）。**台帳への登録はどちらでもresumeの前に済ませる**。
+        #[serde(default)]
+        suspended: bool,
     },
+}
+
+/// [`SpawnRequest::Spawn::console`]の既定。**関数にしてあるのはserdeの`default`が
+/// 値ではなくパスを要求するためで、意味は「段階6bと同じ」である。**
+fn console_need_not_needed() -> ConsoleNeed {
+    ConsoleNeed::NotNeeded
 }
 
 /// Daemon → サンドボックスの中のプロセス（要求受付パイプ）。
@@ -521,11 +633,15 @@ pub enum SpawnRequest {
 pub enum SpawnResponse {
     /// [段階6b] 遷移が許可されたので、**Daemonが実際に起こした**。
     ///
-    /// **プロセスハンドルは返していない。** 要求元がいま要るのはPIDだけで、
-    /// 待つ・終了コードを読むといった操作の口は6f（Redirector DLLのフックを
-    /// Daemonへの依頼に付け替える回）で`CreateProcessW`の戻り値を組み立てるときに要る。
-    /// **要る人が現れてから足す**——使われない欄は、渡す側の後始末だけが先に増える。
-    Spawned { pid: u32 },
+    /// # ハンドルは**要求元のプロセスへ複製済み**である（段階6f-1で追加）
+    ///
+    /// [`CallerHandles`]とは向きが逆で、こちらは[`ChildHandles`]と同じ「送る前に受け手へ
+    /// 複製済み」の形である。要求元はこの2つを`PROCESS_INFORMATION`へ入れて
+    /// `CreateProcessW`の呼び出し元へ返す——待つ・終了コードを読む・
+    /// （一時停止で頼んだなら）再開する、はすべてこのハンドルで行われる。
+    ///
+    /// **閉じるのは要求元である。** Daemon側の原本は生成の直後に閉じてある。
+    Spawned { pid: u32, process: u64, thread: u64 },
     /// 拒否した。**理由を分ける**のは、拒否した側と拒否の根拠が別の事実だからである
     /// （§10.2が`denied_by_daemon`と`denied_by_kernel`を分けたのと同じ理屈）。
     Denied { reason: DenyReason },

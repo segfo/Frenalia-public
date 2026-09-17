@@ -12,6 +12,60 @@ use super::net_decision::should_grant_tier2a_network_capability;
 use super::platform::{CONSTRAINED_LANGUAGE_NOTICE, RUN_SHELL_BOOTSTRAP_SCRIPT};
 use super::*;
 
+/// **サンドボックスの中のシェルから、Spawn Daemonの要求受付パイプへ1往復する**
+/// PowerShellスクリプト（`plans/DESIGN-MAC-PROTOCOL.md` §12）。
+///
+/// **同じ綴りが`crates/harness-policy-editor/tests/record_net_e2e.rs`の
+/// `SPAWN_REQUEST_ROUNDTRIP`にもある**（あちらはポリシーエディタのパス2の、こちらは
+/// `run_shell`の同じ測定である）。1箇所へ畳めない理由はあちらのdocが持つ。
+/// **直すときは必ず両方を直すこと。**
+///
+/// [2026-09-17] **定数へ出した。** 以前はテスト関数の中の文字列リテラルだったが、
+/// そうすると[`the_hand_written_spawn_request_still_parses`]のような
+/// 「中のJSONが受け手の型で読めるか」の見張りを掛けられない。
+const SPAWN_REQUEST_ROUNDTRIP: &str = r#"
+$raw = $env:HARNESS_SPAWN_REQUEST_PIPE
+if (-not $raw) { Write-Output 'NO_PIPE_ENV'; exit 0 }
+$name = $raw -replace '^\\\\\.\\pipe\\', ''
+$c = New-Object System.IO.Pipes.NamedPipeClientStream('.', $name, 'InOut')
+try { $c.Connect(5000) } catch { Write-Output ('CONNECT_FAILED:' + $_.Exception.Message); exit 0 }
+$body = [Text.Encoding]::UTF8.GetBytes('{"kind":"spawn","image":"C:\\Windows\\System32\\cmd.exe","command_line":"\"cmd.exe\" /c exit 0","cwd":"C:/"}')
+$c.Write([BitConverter]::GetBytes([int]$body.Length), 0, 4)
+$c.Write($body, 0, $body.Length)
+$c.Flush()
+$hdr = New-Object byte[] 4
+if ($c.Read($hdr, 0, 4) -ne 4) { Write-Output 'NO_REPLY_HEADER'; exit 0 }
+$n = [BitConverter]::ToInt32($hdr, 0)
+$buf = New-Object byte[] $n
+$got = 0
+while ($got -lt $n) { $r = $c.Read($buf, $got, $n - $got); if ($r -le 0) { break }; $got += $r }
+Write-Output ('REPLY:' + [Text.Encoding]::UTF8.GetString($buf, 0, $got))
+"#;
+
+/// 手書きのJSONを、**受け手の型で読めることだけ**確かめる（2026-09-17に追加）。
+///
+/// # なぜ要るのか——**コンパイラがここを見張っていない**
+///
+/// 電文の形を変えたとき、Rustで組んでいる呼び出し元は全部ビルドが落ちて気付ける。
+/// ところがこの写しは**PowerShellの中の文字列**なので、古い綴りのまま残っても何も起きない
+/// ——気付くのは**昇格のE2Eを60秒回した後**である（段階6f-1で実際に踏んだ）。
+#[test]
+fn the_hand_written_spawn_request_still_parses() {
+    let json = SPAWN_REQUEST_ROUNDTRIP
+        .split_once("GetBytes('")
+        .and_then(|(_, rest)| rest.split_once("')"))
+        .map(|(json, _)| json)
+        .expect("the script must contain a GetBytes('...') payload");
+    serde_json::from_str::<harness_sandbox::tier2a::spawnd::SpawnRequest>(json).unwrap_or_else(
+        |e| {
+            panic!(
+                "要求受付パイプへ手書きで送っているJSONが、受け手の型で読めない: {e}\n{json}\n\
+                 **この写しは`crates/harness-policy-editor/tests/record_net_e2e.rs`にもある。両方直すこと。**"
+            )
+        },
+    );
+}
+
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -1070,24 +1124,12 @@ mod tests {
         // `SPAWN_REQUEST_ROUNDTRIP`にもある**（あちらはパス2の、こちらは`run_shell`の
         // 同じ測定である）。1箇所へ畳めない理由と、写しを許した判断の経緯はあちらのdocが持つ。
         // **直すときは必ず両方を直すこと**——片方だけ直っても誰も落ちない。
-        let roundtrip = r#"
-$raw = $env:HARNESS_SPAWN_REQUEST_PIPE
-if (-not $raw) { Write-Output 'NO_PIPE_ENV'; exit 0 }
-$name = $raw -replace '^\\\\\.\\pipe\\', ''
-$c = New-Object System.IO.Pipes.NamedPipeClientStream('.', $name, 'InOut')
-try { $c.Connect(5000) } catch { Write-Output ('CONNECT_FAILED:' + $_.Exception.Message); exit 0 }
-$body = [Text.Encoding]::UTF8.GetBytes('{"kind":"spawn","exe":"git.exe","args":["status"],"cwd":"C:/"}')
-$c.Write([BitConverter]::GetBytes([int]$body.Length), 0, 4)
-$c.Write($body, 0, $body.Length)
-$c.Flush()
-$hdr = New-Object byte[] 4
-if ($c.Read($hdr, 0, 4) -ne 4) { Write-Output 'NO_REPLY_HEADER'; exit 0 }
-$n = [BitConverter]::ToInt32($hdr, 0)
-$buf = New-Object byte[] $n
-$got = 0
-while ($got -lt $n) { $r = $c.Read($buf, $got, $n - $got); if ($r -le 0) { break }; $got += $r }
-Write-Output ('REPLY:' + [Text.Encoding]::UTF8.GetString($buf, 0, $got))
-"#;
+        //
+        // [2026-09-17] **手書きのJSONが受け手の型で読めることは、昇格の要らないテストが
+        // 見張っている**（`the_hand_written_spawn_request_still_parses`。両方の写しに1本ずつ）
+        // ——電文の形を変えたとき、ここはコンパイルエラーにならないので、
+        // 気付くのが実機を60秒回した後になる（段階6f-1で実際に踏んだ）。
+        let roundtrip = SPAWN_REQUEST_ROUNDTRIP;
         let out = tool
             .call(json!({ "command": roundtrip }), &ctx)
             .await

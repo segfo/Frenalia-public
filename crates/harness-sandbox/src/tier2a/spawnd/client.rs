@@ -694,25 +694,90 @@ fn launch_daemon(
     // harness本体のコンソールを継承させてはいけない——`FreeConsole`でharnessの
     // 出力先ごと外れる。
     let mut info = PROCESS_INFORMATION::default();
-    let startup = STARTUPINFOW {
+    let mut startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
     };
-    unsafe {
+    // [2026-09-17] **Daemonの標準エラーを見られるようにする口。**
+    //
+    // コンソールを持たないので、Daemonが書く診断は**既定ではどこにも届かない**
+    // （`console_holder`のモジュールdocと`harness-spawnd`の`main`が、どちらもその旨を
+    // 書いている）。段階6f-1の実機で「起こそうとして失敗した」の中身が読めず、
+    // 原因の切り分けに1往復まるごと要ったので、**受け皿を1つ置く**。
+    //
+    // **既定では何も変わらない**——変数が無ければハンドルを1つも作らず、継承もしない。
+    let log_handle = std::env::var(DAEMON_STDERR_ENV)
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .and_then(|path| open_append_inheritable(&path));
+    if let Some(handle) = log_handle {
+        startup.dwFlags = windows::Win32::System::Threading::STARTF_USESTDHANDLES;
+        // 標準出力も同じ先へ向ける。**Daemonは標準出力に何も書かない**が、
+        // 片方だけ差し替えると、後から`println!`を足した人の出力だけが消える。
+        startup.hStdOutput = handle;
+        startup.hStdError = handle;
+        startup.hStdInput = windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+    }
+    let result = unsafe {
         CreateProcessW(
             None,
             PWSTR(cmdline.as_mut_ptr()),
             None,
             None,
-            false,
+            // **記録するときだけ継承させる。** 既定は今までどおり継承しない。
+            log_handle.is_some(),
             DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
             None,
             PCWSTR::null(),
             &startup,
             &mut info,
         )
-        .map_err(|e| err(format!("CreateProcessW({}): {e}", exe.display())))?;
+    };
+    // 親側の端は成否によらず閉じる（子は自分の複製を持つ）。
+    if let Some(handle) = log_handle {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+    }
+    result.map_err(|e| err(format!("CreateProcessW({}): {e}", exe.display())))?;
+    unsafe {
         let _ = CloseHandle(info.hThread);
     }
     Ok(info.hProcess)
+}
+
+/// Daemonの標準エラーの行き先を指定する環境変数。**診断専用で、既定は未設定。**
+pub const DAEMON_STDERR_ENV: &str = "HARNESS_SPAWND_STDERR";
+
+/// 追記で開いた継承可能なファイル。開けなければ`None`（**記録できないことを理由に
+/// Daemonの起動を止めない**——診断は境界ではない、`P-07`）。
+fn open_append_inheritable(path: &str) -> Option<HANDLE> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_ALWAYS,
+    };
+    let sa = windows::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: true.into(),
+    };
+    let wide_path = wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            FILE_APPEND_DATA.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Some(&sa as *const _),
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+    match handle {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            eprintln!("[spawnd] could not open {DAEMON_STDERR_ENV}={path}: {e}");
+            None
+        }
+    }
 }

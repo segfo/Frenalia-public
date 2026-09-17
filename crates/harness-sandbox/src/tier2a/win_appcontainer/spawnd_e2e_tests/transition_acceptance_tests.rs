@@ -56,11 +56,30 @@ pub(super) fn policy_with_edge(domain: &str, exe: &str) -> PolicyFile {
 }
 
 /// プローブへ渡す1件の生成要求。
+///
+/// [段階6f-1] 電文は`exe`＋`args`ではなく**実行ファイルの絶対パスと逐語のコマンドライン**を
+/// 運ぶようになった（`SpawnRequest::Spawn::image`のdoc）。呼び出し側の書き味は変えずに、
+/// ここで`command_line_for`（本物の生成で使うのと同じ関数）を通して組む。
 pub(super) fn request_payload(exe: &str, args: &[&str], cwd: &std::path::Path) -> String {
+    request_payload_with(exe, args, cwd, Default::default(), false)
+}
+
+/// [段階6f-1] ハンドルと一時停止の指定まで含めて組む版。
+pub(super) fn request_payload_with(
+    exe: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+    handles: crate::tier2a::spawnd::CallerHandles,
+    suspended: bool,
+) -> String {
     serde_json::to_string(&crate::tier2a::spawnd::SpawnRequest::Spawn {
-        exe: exe.to_string(),
-        args: args.iter().map(|a| a.to_string()).collect(),
+        image: exe.to_string(),
+        command_line: crate::tier2a::win_appcontainer::command_line_for(exe, args),
         cwd: cwd.to_string_lossy().into_owned(),
+        env: None,
+        handles,
+        console: crate::tier2a::spawnd::ConsoleNeed::NotNeeded,
+        suspended,
     })
     .expect("serialize the spawn request")
 }
@@ -82,6 +101,60 @@ pub(super) fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     false
+}
+
+/// [段階6f-1] **フックの役を演じるプローブ**を起こして、その報告JSONを返す。
+///
+/// [`ask_daemon`]との違いは1つだけである——あちらはテストが組んだ電文をそのまま投げるが、
+/// こちらは**プローブ自身が電文を組む**（自分でファイルハンドルを作って載せるため）。
+/// 呼び出し元のハンドルは、その呼び出し元のプロセスの中にしか存在しないので、
+/// テスト側からは載せられない。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ask_daemon_as_a_hook(
+    case: &Case,
+    profile: &OwnedContainerSid,
+    caps: &[crate::win_common::OwnedSid],
+    image: &str,
+    command_line: &str,
+    stdout_file: &std::path::Path,
+    console: &str,
+) -> String {
+    let daemon = case.daemon.as_ref().expect("case owns the daemon");
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let spawn_cap = spawn_request_capability_sid().expect("spawn request capability");
+    let workspace_str = workspace.to_string_lossy().into_owned();
+    let stdout_str = stdout_file.to_string_lossy().into_owned();
+
+    let (child, job, out, err) = super::spawn_via_daemon(
+        daemon,
+        profile,
+        &workspace,
+        domain_spec(profile, caps, Some(&spawn_cap)),
+        &[
+            "--spawn-via-daemon",
+            daemon.request_pipe(),
+            "--spawn-image",
+            image,
+            "--spawn-command-line",
+            command_line,
+            "--spawn-cwd",
+            &workspace_str,
+            "--spawn-stdout",
+            &stdout_str,
+            "--spawn-console",
+            console,
+            "--timeout-secs",
+            "60",
+        ],
+    );
+    eprintln!("[spawnd 6f-1] stdout={out}\nstderr={err}");
+    super::wait_and_close(&child, job);
+    out
 }
 
 /// 要求受付パイプへ1件投げて、プローブのstdoutを返す。
@@ -285,6 +358,290 @@ fn an_edge_declared_for_another_domain_cannot_be_borrowed() {
         !marker.exists(),
         "拒否と答えたのに子が走っている。**判定の後で起こす側が判定を見ていない**: {}",
         marker.display()
+    );
+
+    drop(case);
+}
+
+// ---------------------------------------------------------------------------
+// [段階6f-1] 呼び出し元の持ち物で起こす（残課題#46・#47を閉じる3本）
+// ---------------------------------------------------------------------------
+
+/// `cmd.exe`のフルパス。**`%SystemRoot%`から組む**——32bitのテストバイナリから
+/// `C:\Windows\System32`を直書きするとWOW64のリダイレクトで別の実体を指し得る。
+fn cmd_exe() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\cmd.exe")
+}
+
+/// Windows PowerShell 5.1のフルパス。
+///
+/// # なぜ`resolve_shell`ではないのか
+///
+/// あれが返すのは**この機でpreflightが選んだシェル**で、今日それはストアの実行エイリアスである。
+/// エイリアスで起きたプロセスは**既に誰かが入っているJobへ入れられない**
+/// （[§S59](../../../../../../plans/mac-spike/RESULTS.md)。系統Jobには必ず呼び出し元が居るので、
+/// nestedの遷移先にできない）。**ここで測りたいのはコンソール要否の申告**なので、
+/// その制約に当たらない実体のパスを使う。
+///
+/// 5.1を選ぶのは**どのWindowsにも必ず在る**からである（pwsh 7は入っていない機がある）。
+/// コンソールが無いと何も実行せず終了コード0で終わる性質は5.1でも同じで、
+/// [§7.1](../../../../../../plans/DESIGN-MAC-ENFORCEMENT.md)の実測表は「PowerShell」として
+/// その挙動を書いている。
+fn windows_powershell_51() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// **T4（#46を閉じる）**: 呼び出し元が渡したハンドルへ、起こされた子の標準出力が落ちる。
+/// あわせて、**返ったプロセスハンドルで待って終了コードが読める**。
+///
+/// # 1本で3つ見ているのはなぜか
+///
+/// 3つとも「**Daemonが1回の生成で持ち物を運べたか**」という同じ問いの側面であり、
+/// 別々のテストにすると同じ実機の起動（数秒）を3回払うことになる。**ただし表明は分ける**
+/// ——どれが落ちたのかがメッセージで分かるようにする。
+///
+/// # `cmd.exe`を使うのは、終了コードを自分で決められるからである
+///
+/// プローブの`--emit`は常に0で終わる。0は「走った」とも「何も起きなかった」とも読めるので、
+/// **0以外**を返させないと、返ったハンドルが本当にこの子を指しているのか言えない。
+///
+/// # 逐語のコマンドラインでなければ成立しない
+///
+/// `cmd /c echo ... & exit 37` は、cmdが**自分でコマンドラインを解釈する**形である。
+/// 段階6bのように`exe`＋`args`から組み直すと、引数がそれぞれ引用符で囲まれて
+/// `&`が別の意味になる。**このテストは、逐語で運んでいることの証拠でもある。**
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn the_callers_own_stdout_handle_receives_the_childs_output_and_the_returned_handle_can_be_waited_on(
+) {
+    const MARKER: &str = "HARNESS-6F1-NESTED-STDOUT";
+    const EXIT_CODE: u64 = 37;
+    let cmd = cmd_exe();
+
+    let (case, profile, caps) = setup_with_policy_and_transitions(
+        "spawnd-6f1-stdio",
+        ChildProcessPolicy::Unrestricted,
+        |_workspace| policy_with_edge(E2E_POLICY_DOMAIN, &cmd),
+    );
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let captured = workspace.join("nested-stdout.txt");
+
+    let out = ask_daemon_as_a_hook(
+        &case,
+        &profile,
+        &caps,
+        &cmd,
+        &format!("\"{cmd}\" /c echo {MARKER} & exit {EXIT_CODE}"),
+        &captured,
+        "not_needed",
+    );
+
+    assert_eq!(
+        report_field(&out, "reply_kind").and_then(|v| v.as_str().map(str::to_string)),
+        Some("spawned".to_string()),
+        "宣言した辺の要求が拒否された: {out}"
+    );
+    assert_eq!(
+        report_field(&out, "got_process_handle").and_then(|v| v.as_bool()),
+        Some(true),
+        "応答にプロセスハンドルが載っていない。**フックは`PROCESS_INFORMATION`を\
+         組み立てられない**——呼び出し元のプログラムは子を待つことも終了コードを読むことも\
+         できなくなる: {out}"
+    );
+    assert_eq!(
+        report_field(&out, "child_exit_code").and_then(|v| v.as_u64()),
+        Some(EXIT_CODE),
+        "返ったハンドルで終了コードが読めない（か、値が違う）。**そのハンドルが\
+         起こした子を指していない**: {out}"
+    );
+
+    let text = std::fs::read_to_string(&captured).unwrap_or_default();
+    assert!(
+        text.contains(MARKER),
+        "**呼び出し元が渡したハンドルへ、子の標準出力が落ちていない**（残課題#46）。\
+         段階6bはここを`NUL`へ捨てていた。捨てたままだと、フックを付け替えた日に\
+         サンドボックスの中のコマンドが1文字も出力を返さなくなる: file={} content={text:?} {out}",
+        captured.display()
+    );
+
+    drop(case);
+}
+
+/// **T5（#47を閉じる。許可側）**: 生成禁止を積んだ構成で、**コンソールが要ると申告した**
+/// nestedのシェルは、保持プロセスのコンソールを借りて実際にコマンドを走らせる。
+///
+/// 段階⑤の同型テスト（`child_process_restricted_tests`）は**トップレベル**を測っている。
+/// こちらは**要求受付パイプ経由**で、申告が電文で運ばれることまで見る。
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn a_nested_shell_that_declares_it_needs_a_console_actually_runs_its_command() {
+    const MARKER: &str = "HARNESS-6F1-NESTED-SHELL";
+    // **`resolve_shell`は使わない**（2026-09-17の切り分け、[§S59](../../../../../../plans/mac-spike/RESULTS.md)）。
+    // この機でそれが返すのはストアの実行エイリアスで、**エイリアスで起きたプロセスは
+    // 既に誰かが入っているJobへ入れられない**（OSの制約。系統Jobには必ず呼び出し元が居る）。
+    // ここで測りたいのは**コンソール要否の申告が効くか**なので、その制約に当たらない
+    // 実体のパスを使う——当たる側は残課題#50で追う。
+    let shell_exe = windows_powershell_51();
+    let (case, profile, caps) = setup_with_policy_and_transitions(
+        "spawnd-6f1-console-yes",
+        ChildProcessPolicy::Restricted,
+        |_workspace| policy_with_edge(E2E_POLICY_DOMAIN, &shell_exe),
+    );
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let captured = workspace.join("nested-shell-required.txt");
+
+    let out = ask_daemon_as_a_hook(
+        &case,
+        &profile,
+        &caps,
+        &shell_exe,
+        &format!(
+            "\"{shell_exe}\" -NoProfile -NonInteractive -Command \"Write-Output '{MARKER}'\""
+        ),
+        &captured,
+        "required",
+    );
+
+    assert_eq!(
+        report_field(&out, "reply_kind").and_then(|v| v.as_str().map(str::to_string)),
+        Some("spawned".to_string()),
+        "コンソールを借りる要求が拒否された。借りられないと`console holder:`で\
+         失敗するので、理由が`spawn_failed`ならそちらである: {out}"
+    );
+    let text = std::fs::read_to_string(&captured).unwrap_or_default();
+    assert!(
+        text.contains(MARKER),
+        "**コンソールを借りたはずのシェルが実行印を出していない。** PowerShellは\
+         コンソールが無いと何も実行せず終了コード0で終わる（§7.1の無言失敗）: \
+         file={} content={text:?} {out}",
+        captured.display()
+    );
+
+    drop(case);
+}
+
+/// **T6（#47を閉じる。対の禁止側）**: 同じシェルを**「コンソールは要らない」と申告して**
+/// 頼むと、**何も実行せずに終了コード0で終わる**。
+///
+/// # この1本が無いと、T5は「常に借りる」実装でも緑になる
+///
+/// 申告を読んでいるかどうかは、**読まなかったときに違う結果になること**でしか示せない
+/// （`B-35`）。そしてここで起きる違いは**症状の出ない失敗**そのものである——
+/// 終了コードは0、エラーも出ない、ただ何も起きない。**§7.1がこれを実測した表を持っている。**
+///
+/// 落ちる向きが逆（`not_needed`でも走ってしまう）なら、生成禁止が積まれていないか、
+/// コンソールを常に借りている。
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn the_same_shell_declared_as_not_needing_a_console_silently_does_nothing() {
+    const MARKER: &str = "HARNESS-6F1-NESTED-SHELL";
+    // **`resolve_shell`は使わない**（2026-09-17の切り分け、[§S59](../../../../../../plans/mac-spike/RESULTS.md)）。
+    // この機でそれが返すのはストアの実行エイリアスで、**エイリアスで起きたプロセスは
+    // 既に誰かが入っているJobへ入れられない**（OSの制約。系統Jobには必ず呼び出し元が居る）。
+    // ここで測りたいのは**コンソール要否の申告が効くか**なので、その制約に当たらない
+    // 実体のパスを使う——当たる側は残課題#50で追う。
+    let shell_exe = windows_powershell_51();
+    let (case, profile, caps) = setup_with_policy_and_transitions(
+        "spawnd-6f1-console-no",
+        ChildProcessPolicy::Restricted,
+        |_workspace| policy_with_edge(E2E_POLICY_DOMAIN, &shell_exe),
+    );
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let captured = workspace.join("nested-shell-not-needed.txt");
+
+    let out = ask_daemon_as_a_hook(
+        &case,
+        &profile,
+        &caps,
+        &shell_exe,
+        &format!(
+            "\"{shell_exe}\" -NoProfile -NonInteractive -Command \"Write-Output '{MARKER}'\""
+        ),
+        &captured,
+        "not_needed",
+    );
+
+    // **起動そのものは成功する。** そこがこの失敗の分かりにくさである。
+    assert_eq!(
+        report_field(&out, "reply_kind").and_then(|v| v.as_str().map(str::to_string)),
+        Some("spawned".to_string()),
+        "この腕は「起きるが何もしない」を測るものなので、起動に失敗したら測れていない: {out}"
+    );
+    let text = std::fs::read_to_string(&captured).unwrap_or_default();
+    assert!(
+        !text.contains(MARKER),
+        "**「コンソールは要らない」と申告したのに実行印が出ている。** 申告が読まれておらず\
+         常にコンソールを借りているなら、T5は何も証明していない（`B-35`）: \
+         file={} content={text:?} {out}",
+        captured.display()
+    );
+
+    drop(case);
+}
+
+/// **T7**: 生成禁止を積んだ系統でも、**コンソールを要らない子は素直に起きる**。
+///
+/// # T5・T6の対照である
+///
+/// あの2本はシェル（実行エイリアス）を起こす。ここは`cmd.exe`を起こす——
+/// **変えているのは「何を起こすか」1つだけ**なので、T5・T6が落ちたときに
+/// 「生成禁止の下では何も起こせない」のか「そのプログラムだけ起こせない」のかが分かれる。
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn a_nested_child_starts_even_when_the_lineage_is_restricted() {
+    const MARKER: &str = "HARNESS-6F1-RESTRICTED-NESTED";
+    let cmd = cmd_exe();
+
+    let (case, profile, caps) = setup_with_policy_and_transitions(
+        "spawnd-6f1-restricted",
+        ChildProcessPolicy::Restricted,
+        |_workspace| policy_with_edge(E2E_POLICY_DOMAIN, &cmd),
+    );
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let captured = workspace.join("restricted-nested.txt");
+
+    let out = ask_daemon_as_a_hook(
+        &case,
+        &profile,
+        &caps,
+        &cmd,
+        &format!("\"{cmd}\" /c echo {MARKER}"),
+        &captured,
+        "not_needed",
+    );
+
+    assert_eq!(
+        report_field(&out, "reply_kind").and_then(|v| v.as_str().map(str::to_string)),
+        Some("spawned".to_string()),
+        "生成禁止を積んだ系統では、Daemon経由でも子を起こせていない: {out}"
+    );
+    let text = std::fs::read_to_string(&captured).unwrap_or_default();
+    assert!(
+        text.contains(MARKER),
+        "起きたはずの子が何も書いていない: file={} content={text:?} {out}",
+        captured.display()
     );
 
     drop(case);
