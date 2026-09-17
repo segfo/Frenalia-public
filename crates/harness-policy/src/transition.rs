@@ -521,6 +521,36 @@ pub fn check_all(input: &GraphInput<'_>) -> Result<Vec<Rejection>, GraphError> {
     Ok(GraphFacts::new(input)?.check_all())
 }
 
+/// [段階6e] `domain`から**到達できる範囲**の権限（§19.3.4の到達閉包）。
+///
+/// # なぜ直接の宣言では足りないのか
+///
+/// 問いが「このドメインへ遷移すると何ができるようになるか」だからである。
+/// そのドメインが宣言しているものだけを見ると、**そこから先へ渡っていける範囲が抜ける**
+/// ——中継を1枚挟んで広い権限へ届く形が、まさに§19.3.4が閉包で数えると決めた理由である。
+///
+/// **閉包の計算はここで書かない。** 向きの判定（[`GraphFacts::direction`]）が使っているものを
+/// そのまま呼ぶ——2つ書くと、片方だけ直したときに「編集時に落ちる辺」と
+/// 「モデルへ見せる要約」が食い違う（`B-13`）。
+///
+/// 宣言されていないドメイン名には**空の権限**を返す（`Err`にしない）。到達先が未宣言でも
+/// 一覧そのものは作れる必要があり、その行の要約が空であることは正しい事実である。
+pub fn rights_summary(
+    input: &GraphInput<'_>,
+    domain: &str,
+) -> Result<crate::transition_listing::Rights, GraphError> {
+    let facts = GraphFacts::new(input)?;
+    let rights = facts.rights_of(facts.reachable_from(domain, None));
+    Ok(crate::transition_listing::Rights {
+        fs: rights
+            .fs
+            .into_iter()
+            .map(|(value, access)| (value.to_string(), access.settings_key()))
+            .collect(),
+        net: rights.net.into_iter().collect(),
+    })
+}
+
 /// 検査と向きの判定が共有する、グラフから導かれる事実。
 struct GraphFacts<'a> {
     input: &'a GraphInput<'a>,

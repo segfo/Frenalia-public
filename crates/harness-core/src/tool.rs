@@ -546,6 +546,62 @@ pub struct McpServerFact {
     pub endpoint: Option<String>,
 }
 
+/// [段階6e] 遷移MAC（プロセス生成の許否）についてモデルへ伝える事実
+/// （`plans/DESIGN-MAC-TRANSITION-POLICY.md` §19.3.8）。
+///
+/// # `Some`であること自体が「強制が効いている」を意味する
+///
+/// この値を積むのは**3条件が揃ったときだけ**である——Tier2aである／Spawn Daemonが居る／
+/// **生成禁止を積んでいる**（`harness_cli`の`transition_tool::should_expose`が唯一の判定）。
+/// **拒否できる者が居ない状態で「宣言された遷移のみ許可」と宣言すると、その宣言が嘘になる**
+/// ——だから「宣言はあるが強制していない」を表す値を持たない。`None`は
+/// 「この構成では遷移の強制は効いていない」の1つの意味しか持たない。
+///
+/// # 一覧をここへ積む理由（プロンプトへは出さない）
+///
+/// **到達可能なexeの集合をシステムプロンプトへ載せない**（§19.3.8）。載せると宣言の増加が
+/// そのままプロンプトの肥大になるので、モデルが要るときに引く（pull）形にしてある。
+/// プロンプトへ出るのは1行だけで、中身はこのツール（`can_run_program`）が答える。
+///
+/// 値の生成は`harness-policy`の`transition_listing`が行う（`harness-core`は
+/// 「重い依存ゼロ」原則のため値を運ぶだけ。`McpServerFact`と同じ役割分担——
+/// **`harness-core`は`harness-policy`へ依存できない**（逆向きの依存が既にあり循環する））。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitionFacts {
+    /// 呼び出し元ドメインの名前（`policy.json`の`domains[].name`）。
+    ///
+    /// `run_shell`が起こすシェルは常に固定名のドメインに居る
+    /// （`harness_policy::policy_file::ENTRY_DOMAIN`）。診断と画面表示のために運ぶ。
+    pub from_domain: String,
+    /// このドメインから起こせると宣言されているプログラム。**宣言順**（並べ替えは
+    /// 問い合わせを受け取るツール側が行う）。
+    pub programs: Vec<RunnableProgramFact>,
+}
+
+/// [段階6e] 宣言された辺1本を、モデルへ見せる形にしたもの。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnableProgramFact {
+    /// 実行ファイルの照合（**宣言の綴りそのまま**）。
+    pub exe: String,
+    /// `exe`がパターンか。**そのまま打てる名前と誤解させないため**に運ぶ。
+    pub exe_is_pattern: bool,
+    /// argvの照合。任意のargvを許す辺は「任意の引数」を表す固定文字列。
+    pub argv: String,
+    pub argv_is_pattern: bool,
+    /// 遷移先ドメイン名。
+    pub to_domain: String,
+    /// 遷移先から**到達できる範囲**のFSアクセス（`(パス, read|read_write|read_exec)`）。
+    pub rights_fs: Vec<(String, String)>,
+    /// 同・通信を許された宛先。
+    pub rights_net: Vec<String>,
+    /// **いま実際に起こせるか。**
+    ///
+    /// `false`は「宣言は正しいが、harnessがまだ実装していない」を意味する
+    /// （遷移先が別ドメインの辺。`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2の暫定）。
+    /// **この欄を落とすと、一覧に出ているのに撃つと拒否されるものが混ざる。**
+    pub runnable_now: bool,
+}
+
 /// 実行前ゲート（`PermissionArbiter`）が参照するリスク分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -616,6 +672,11 @@ pub struct ToolCtx {
     /// 起動中のMCPサーバ（M15.5、`plans/DESIGN-MCP.md`）。空なら宣言が無いか、いずれも
     /// 承認されていないか、このOSでは起動しない（P-05）。
     pub mcp_servers: Vec<McpServerFact>,
+    /// [段階6e] 遷移MACが**実際に強制されている**ときだけ`Some`（[`TransitionFacts`]のdoc）。
+    ///
+    /// `Arc`なのは、一覧が宣言の本数に比例して伸びるためである——`ToolCtx`は`Clone`される
+    /// （ツール呼び出しごとに渡る）ので、実体を複製しない。
+    pub transition_facts: Option<std::sync::Arc<TransitionFacts>>,
 }
 
 impl ToolCtx {
@@ -634,6 +695,8 @@ impl ToolCtx {
             vm_sandbox: None,
             cow_diff_layer_dir: None,
             mcp_servers: Vec::new(),
+            // 遷移MACの強制は既定では効いていない（Tier2a＋Daemon＋生成禁止が揃ったときだけ）。
+            transition_facts: None,
         }
     }
 }

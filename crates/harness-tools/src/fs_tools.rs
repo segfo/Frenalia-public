@@ -416,6 +416,7 @@ mod tests {
             vm_sandbox: None,
             cow_diff_layer_dir: None,
             mcp_servers: Vec::new(),
+            transition_facts: None,
         };
 
         let tool = WriteFileTool;
@@ -459,6 +460,7 @@ mod tests {
             vm_sandbox: None,
             cow_diff_layer_dir: Some(diff_layer_path.clone()),
             mcp_servers: Vec::new(),
+            transition_facts: None,
         };
 
         let tool = WriteFileTool;

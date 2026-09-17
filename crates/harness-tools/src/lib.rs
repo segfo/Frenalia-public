@@ -17,6 +17,9 @@
 //! 実行前の許可判定（`PermissionArbiter`）はM4で`harness-engine`に実装したが、
 //! ツール本体はそれを意識しない（呼ばれた時点で既に許可済み）。
 
+/// [段階6e] モデルが「いま何を起こせるか」を引く読み取り専用ツール（§19.3.8）。
+/// **登録するのは遷移MACが実際に強制されているときだけ**（`harness-cli`の`transition_tool`）。
+mod can_run_program;
 mod dial;
 pub mod fake_dns;
 mod fs_tools;
@@ -34,6 +37,7 @@ use std::sync::Arc;
 use harness_core::{Tool, ToolCtx, ToolError, ToolSpec};
 use harness_sandbox::JailError;
 
+pub use can_run_program::CanRunProgramTool;
 pub use fs_tools::{EditFileTool, ReadFileTool, WriteFileTool};
 pub use search::{GlobTool, GrepTool};
 pub use shell::RunShellTool;

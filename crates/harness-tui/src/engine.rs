@@ -372,6 +372,7 @@ mod tests {
             vm_sandbox: None,
             cow_diff_layer_dir: None,
             mcp_servers: Vec::new(),
+            transition_facts: None,
         };
         let mut state = ConversationState::new(harness_engine::system_blocks_for(&stale_ctx));
 
@@ -413,6 +414,7 @@ mod tests {
             vm_sandbox: None,
             cow_diff_layer_dir: Some(PathBuf::from(r"C:\cow\session-old")),
             mcp_servers: Vec::new(),
+            transition_facts: None,
         }
     }
 

@@ -39,6 +39,9 @@ pub mod insufficient;
 pub mod normalize;
 pub mod policy_file;
 pub mod transition;
+/// [段階6e] 「このドメインから、いま何を起こせるか」の一覧（§19.3.8）。**モデルへ答える
+/// ツールと、段階⑦のエディタ表示が同じものを使う**——2つ作ると見えるものがずれる。
+pub mod transition_listing;
 
 pub use breadth::BreadthVerdict;
 pub use diff::{SettingsDiff, SettingsDiffEntry};

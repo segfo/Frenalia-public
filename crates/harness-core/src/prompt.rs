@@ -33,7 +33,7 @@ use std::path::PathBuf;
 
 use crate::tool::{
     McpServerFact, NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, ShellTier,
-    ShellTierSelection, StagingConfig, StagingMode, ToolCtx,
+    ShellTierSelection, StagingConfig, StagingMode, ToolCtx, TransitionFacts,
 };
 
 const TIER3_WORKSPACE_ROOT: &str = "/workspace";
@@ -79,6 +79,12 @@ pub struct EnvironmentFacts {
     pub cow_diff_layer_dir: Option<PathBuf>,
     /// 起動中のMCPサーバ（M15.5）。
     pub mcp_servers: Vec<McpServerFact>,
+    /// [段階6e] 遷移MAC（プロセス生成の許否）が**実際に強制されている**ときだけ`Some`。
+    ///
+    /// **プロンプトへ出るのは1行だけである**（§19.3.8）。到達可能なexeの集合は載せない
+    /// ——載せると宣言の増加がそのままプロンプトの肥大になるので、モデルが要るときに
+    /// `can_run_program`で引く（pull）。`Some`に入っている一覧はそのツールが読む。
+    pub transition_facts: Option<std::sync::Arc<TransitionFacts>>,
 }
 
 impl EnvironmentFacts {
@@ -96,6 +102,7 @@ impl EnvironmentFacts {
             vm_sandbox,
             cow_diff_layer_dir,
             mcp_servers,
+            transition_facts,
         } = ctx;
         let _ = run_shell_path_extra;
         // vm_sandbox: Tier3実行チャネルの生ハンドル自体はモデルへ伝える事実を持たない
@@ -112,6 +119,7 @@ impl EnvironmentFacts {
             shell_sees_staged_writes: *shell_sees_staged_writes,
             cow_diff_layer_dir: cow_diff_layer_dir.clone(),
             mcp_servers: mcp_servers.clone(),
+            transition_facts: transition_facts.clone(),
         }
     }
 }
@@ -129,6 +137,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
         shell_sees_staged_writes,
         cow_diff_layer_dir,
         mcp_servers,
+        transition_facts,
     } = facts;
 
     let mut lines = Vec::new();
@@ -159,8 +168,42 @@ pub fn render(facts: &EnvironmentFacts) -> String {
         lines.push(line);
     }
     lines.extend(render_mcp_servers(mcp_servers));
+    if let Some(line) = render_transitions(transition_facts.as_deref()) {
+        lines.push(line);
+    }
 
     lines.join("\n")
+}
+
+/// [段階6e] 遷移MAC（プロセス生成の許否）についての**1行だけ**
+/// （`plans/DESIGN-MAC-TRANSITION-POLICY.md` §19.3.8）。
+///
+/// # なぜ一覧を書かないのか
+///
+/// **到達可能なexeの集合をプロンプトへ載せない。** 載せると宣言の増加がそのまま
+/// プロンプトの肥大になる——この系の他の項目（許可ドメイン・read scope）は
+/// 「空なら1行も出さない／非空なら全部出す」姿勢なので、**載せた瞬間に上限が無くなる**。
+/// だからモデルが要るときに引く（pull）形にし、ここでは**引き方だけ**を伝える。
+///
+/// # なぜ強制されているときだけ出すのか
+///
+/// **拒否できる者が居ない状態でこの1行を出すと、その宣言が嘘になる**（同§）。
+/// 値が`Some`であること自体が「強制が効いている」を意味する（[`TransitionFacts`]のdoc）ので、
+/// ここでの判定は`Option`を見るだけでよい。
+///
+/// # 限界（同じ場所で言う）
+///
+/// **宣言の本数は伝えない。** 「N個使える」はモデルに何も決めさせない数字で、
+/// しかも一覧を引かせる動機を弱める（少ないと諦める）。
+fn render_transitions(facts: Option<&TransitionFacts>) -> Option<String> {
+    facts?;
+    Some(
+        "プロセス生成: このシェルから別のプログラムを起こせるのは、ポリシーで宣言された\
+         組み合わせだけです（宣言外の生成はOSが拒否します）。いま何を起こせるかは\
+         `can_run_program`ツールで確認できます——プログラム名を渡すと、その名前で\
+         起こせるかどうかが分かります。"
+            .to_string(),
+    )
 }
 
 /// M15.5: 起動中のMCPサーバ（`plans/DESIGN-MCP.md`）。
@@ -1166,5 +1209,74 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("git"), "{rendered}");
+    }
+
+    fn transition_facts_for(programs: Vec<&str>) -> std::sync::Arc<TransitionFacts> {
+        std::sync::Arc::new(TransitionFacts {
+            from_domain: "workspace-shell".to_string(),
+            programs: programs
+                .into_iter()
+                .map(|exe| crate::tool::RunnableProgramFact {
+                    exe: exe.to_string(),
+                    exe_is_pattern: false,
+                    argv: "(any arguments)".to_string(),
+                    argv_is_pattern: false,
+                    to_domain: "workspace-shell".to_string(),
+                    rights_fs: Vec::new(),
+                    rights_net: Vec::new(),
+                    runnable_now: true,
+                })
+                .collect(),
+        })
+    }
+
+    /// **[段階6e] 禁止側。** 遷移の強制が効いていない構成では、その1行を**出さない**。
+    ///
+    /// 出すと「宣言された組み合わせだけ起こせる」が嘘になる（§19.3.8）。既定の`ToolCtx`は
+    /// 強制が効いていない状態なので、ここは**今日の通常セッションそのもの**である。
+    #[test]
+    fn the_transition_line_is_absent_when_nothing_is_enforcing_it() {
+        let ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(!rendered.contains("can_run_program"), "{rendered}");
+        assert!(!rendered.contains("プロセス生成:"), "{rendered}");
+    }
+
+    /// **[段階6e] 許可側（対）。** 強制が効いている構成では1行だけ出し、**引き方を伝える**。
+    ///
+    /// 対にしないと「常に`None`を返す」実装でも禁止側が緑になる（`B-35`）。
+    #[test]
+    fn the_transition_line_appears_and_names_the_tool_when_enforcement_is_on() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.transition_facts = Some(transition_facts_for(vec![r"C:\bin\git.exe"]));
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(
+            rendered.contains("can_run_program"),
+            "引き方を伝えないとモデルはpullを回さない: {rendered}"
+        );
+    }
+
+    /// **[段階6e] 到達可能なexeの一覧をプロンプトへ載せない**（§19.3.8）。
+    ///
+    /// 載せると宣言の増加がそのままプロンプトの肥大になる。**これは行数ではなく
+    /// 「宣言の中身が出ていないこと」で測る**——1行に畳んだつもりで名前を並べる実装を
+    /// 止めるためである。
+    #[test]
+    fn the_transition_line_does_not_list_the_reachable_programs() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.transition_facts = Some(transition_facts_for(vec![
+            r"C:\bin\git.exe",
+            r"C:\bin\cargo.exe",
+        ]));
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(!rendered.contains("git.exe"), "{rendered}");
+        assert!(!rendered.contains("cargo.exe"), "{rendered}");
+        assert!(
+            !rendered.contains("workspace-shell"),
+            "ドメイン名もモデルの語彙ではない（§19.3.8）: {rendered}"
+        );
     }
 }

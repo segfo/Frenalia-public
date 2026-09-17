@@ -44,6 +44,12 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     } = sandbox;
     let mut tools = tools;
 
+    // [段階6e] 遷移MACについてモデルへ見せる事実。**強制が3条件とも揃ったときだけ`Some`**に
+    // なる（`transition_tool::should_expose`）。宣言を読めた時点で一覧は作れるが、
+    // **積むかどうかは別の判断**である——強制していない状態で見せると宣言が嘘になる。
+    #[cfg(windows)]
+    let mut transition_facts: Option<std::sync::Arc<harness_core::TransitionFacts>> = None;
+
     // Tier2a preflightが成功した後、このhost process用のDaemonを1本だけ起こす。
     // 起動できなければTier2aセッション自体を開始せず、直接spawnへは降格しない。
     #[cfg(windows)]
@@ -61,10 +67,21 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         // 宣言してある遷移まで拒否される。倒れる向きは同じ「拒否」でも、
         // 原因が読み取り失敗であることは画面から分からない（`B-10`）。
         let transition_policy = match harness_policy::policy_file::load(&workspace_root) {
-            Ok(policy) => harness_sandbox::tier2a::spawnd::TransitionPolicy {
-                policy,
-                workspace_root: workspace_root.to_string_lossy().into_owned(),
-            },
+            Ok(policy) => {
+                // [段階6e] **モデルへ見せる一覧は、Daemonへ渡すのと同じ宣言から作る**
+                // （§19.3.8）。ここで読み直すと判定に使うグラフとずれ、「起こせる」と
+                // 答えたものをDaemonが拒否する形になる（正本を2つ持たない、`B-13`）。
+                transition_facts = Some(std::sync::Arc::new(
+                    super::transition_tool::facts_from_policy(
+                        &policy,
+                        &workspace_root.to_string_lossy(),
+                    ),
+                ));
+                harness_sandbox::tier2a::spawnd::TransitionPolicy {
+                    policy,
+                    workspace_root: workspace_root.to_string_lossy().into_owned(),
+                }
+            }
             Err(error) => {
                 eprintln!("error: could not read the transition policy: {error}");
                 let outcome = harness_sandbox::tier2a::session_profile::end_session(
@@ -76,14 +93,36 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // **この値が段階6eの露出条件の3つ目である。** `Unrestricted`である限り、
+        // 子は要求受付パイプへ頼まずに自分で生成できるので、モデルへ
+        // 「宣言された組み合わせだけ起こせる」と言ってはならない（§19.3.8）。
+        let child_process_policy = harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted;
         match harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
             transition_policy,
-            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
+            child_process_policy,
         ) {
             Ok(daemon) => {
                 tools.register(Arc::new(harness_tools::RunShellTool::with_spawn_daemon(
                     daemon.clone(),
                 )));
+                // [段階6e] 強制が効いているときだけ、モデルへ見せる（§19.3.8）。
+                // **判定は`should_expose`ただ1つが持つ**——ここへ条件を書くと、
+                // 今日は通らない分岐なので配線したこと自体をテストできない。
+                // **姿勢を読むのに綴りを書かない**（`ChildProcessPolicy::is_restricted`のdoc）。
+                // 生成禁止の綴りが製品コードに0件であることを数え上げテストが固定しており、
+                // 比較のために書いた行まで「選んだ」と数えられてしまう。
+                if super::transition_tool::should_expose(
+                    shell_tier.tier,
+                    true,
+                    child_process_policy.is_restricted(),
+                ) {
+                    tools.register(Arc::new(harness_tools::CanRunProgramTool));
+                } else {
+                    // 出さないなら**事実も積まない**。積んだままにすると、
+                    // `EnvironmentFacts`が1行を出してしまう（`Some`が「強制が効いている」の
+                    // 意味を持つ、`TransitionFacts`のdoc）。
+                    transition_facts = None;
+                }
                 Some(daemon)
             }
             Err(error) => {
@@ -596,6 +635,12 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         vm_sandbox: None,
         cow_diff_layer_dir: write_mode.diff_layer_dir().map(|p| p.to_path_buf()),
         mcp_servers: mcp_facts,
+        // [段階6e] Windows以外・Tier2a以外・生成禁止を積んでいない構成では常に`None`
+        // （＝遷移MACの強制は効いていない）。
+        #[cfg(windows)]
+        transition_facts,
+        #[cfg(not(windows))]
+        transition_facts: None,
     };
 
     let mut state = ConversationState::new(harness_engine::system_blocks_for(&tool_ctx));

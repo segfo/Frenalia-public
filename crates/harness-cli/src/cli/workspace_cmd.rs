@@ -224,6 +224,10 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
         // 第三者プロセスを起こす副作用を持たせない）。実行時に何が載るかは`harness mcp list`
         // で確認する。
         mcp_servers: Vec::new(),
+        // [段階6e] 同じ理由でSpawn Daemonも起こさない＝**この経路では遷移MACの強制は
+        // 効いていない**ので、常に`None`である（`TransitionFacts`のdoc）。
+        // 実行時のセッションで何が出るかは`run_agent`側が決める。
+        transition_facts: None,
     };
     for block in harness_engine::system_blocks_for(&ctx) {
         println!("{}", block.text);
