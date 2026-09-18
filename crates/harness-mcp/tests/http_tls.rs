@@ -95,23 +95,36 @@ impl TlsFront {
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind the tls front");
         let addr = listener.local_addr().expect("local addr");
+        // **待受は非ブロッキングで回す**（2026-09-18に直した。下の[`TlsFront::drop`]のdoc）。
         listener
-            .set_nonblocking(false)
-            .expect("blocking accept loop");
+            .set_nonblocking(true)
+            .expect("pollable accept loop");
 
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = shutdown.clone();
         let thread = std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            loop {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
-                let Ok(stream) = stream else { continue };
-                let config = config.clone();
-                // 1接続1スレッド。テスト用なので同時接続数は高々数本。
-                std::thread::spawn(move || {
-                    let _ = relay_one(stream, config, upstream);
-                });
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // **受け取った接続はブロッキングへ戻す。** Windowsでは待受の性質を
+                        // 継ぐことがあり、継いだままだと`relay_one`の読み書きが
+                        // `WouldBlock`で即座に落ちる。
+                        let _ = stream.set_nonblocking(false);
+                        let config = config.clone();
+                        // 1接続1スレッド。テスト用なので同時接続数は高々数本。
+                        std::thread::spawn(move || {
+                            let _ = relay_one(stream, config, upstream);
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    // 1接続の失敗で待受を畳まない（次の接続は成立し得る）。
+                    Err(_) => {}
+                }
             }
         });
 
@@ -131,13 +144,32 @@ impl Drop for TlsFront {
     fn drop(&mut self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        // acceptで止まっているループを起こすためのダミー接続。
-        let _ = TcpStream::connect(self.addr);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
+
+// # なぜ「起こすためのダミー接続」をやめたのか（2026-09-18に測って直した）
+//
+// かつてここは**待受をブロッキングで回し、畳むときにダミーの接続を1本張って
+// `accept`を起こす**形だった。**その起こし方は取りこぼす。**
+//
+// ダミーの接続は張った直後に閉じる（`let _ =`で即drop）。待受スレッドがその瞬間
+// `accept`の中に居なければ、接続はバックログに積まれ、**閉じられた接続はWindowsでは
+// キューから消えることがある**。消えると`accept`は永久に起きず、`join`が返らない
+// ——テストが1本、赤にもならずに**固まる**。
+//
+// **測った**（`tools/tls-flake-loop.sh`、このテストバイナリを1000回）:
+//
+// | 直す前 | 通る980 / 落ちる11 / **固まる9** |
+// |---|---|
+//
+// 固まったのは毎回違うテストで（9回で5種類）、テスト個別ではなく**この畳み方**の問題である。
+// 直した形は**起こす必要が無い**——待受を非ブロッキングにして2msごとに旗を見るので、
+// 畳むのは旗1つで決まる（取りこぼす相手が居ない）。
+//
+// **費用は問題にならない**: 2msの周期はテストの所要（1回0.1秒）に対して無視できる。
 
 /// TLSを剥がして平文モックへ中継し、応答をそのまま返す。
 ///
