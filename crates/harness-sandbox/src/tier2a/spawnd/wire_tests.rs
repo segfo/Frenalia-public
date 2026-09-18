@@ -29,7 +29,7 @@ fn control_request_hello_keeps_its_wire_shape() {
     .expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":4,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w"}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":5,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w"}"#
     );
 }
 
@@ -80,7 +80,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":4}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":5}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {
@@ -98,6 +98,26 @@ fn control_responses_keep_their_wire_shape() {
         .expect("serialize"),
         r#"{"kind":"failed","failure_kind":"spawn","reason":"CreateProcessW: boom"}"#
     );
+    // [段階6f-3] 待ち行列の書き出し。**0行は失敗ではない**ので、欄は必ず出す。
+    assert_eq!(
+        serde_json::to_string(&ControlResponse::Flushed { lines: 0 }).expect("serialize"),
+        r#"{"kind":"flushed","lines":0}"#
+    );
+}
+
+/// [段階6f-3] 待ち行列の書き出し要求は、**引数を1つも持たない**（§19.3.8）。
+///
+/// # 欄を足さないこと
+///
+/// 置き場のパスも対象の種類も運ばない。**非昇格の親が指定したパスへDaemonが書く経路を
+/// 作らない**という待ち行列の設計（`transitions::pending_path`のdoc、`P-01`）は、
+/// この要求にもそのまま効く——欄を1つ足した瞬間に、その設計が崩れる。
+#[test]
+fn the_flush_request_carries_nothing() {
+    let json = serde_json::to_string(&ControlRequest::FlushTransitionQueue).expect("serialize");
+    assert_eq!(json, r#"{"kind":"flush_transition_queue"}"#);
+    let back: ControlRequest = serde_json::from_str(&json).expect("round trip");
+    assert_eq!(back, ControlRequest::FlushTransitionQueue);
 }
 
 /// **版が「合わない」を、欄が「無い」とは別に測る。**

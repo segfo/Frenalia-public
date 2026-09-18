@@ -336,6 +336,90 @@ mod tests {
         );
     }
 
+    /// [段階6f-3] コマンドが走っている**最中に**待ち行列へ1行積む、という状況を作る。
+    ///
+    /// **テストの中で先に書いてしまわない。** 注記の位置合わせは「コマンドの前に控えた位置
+    /// より後ろ」で決まるので、先に書くと**位置合わせが壊れていても緑になる**。
+    #[cfg(windows)]
+    fn command_that_appends_a_denial(exe: &str) -> String {
+        use harness_sandbox::tier2a::spawnd::transitions::{Denial, PendingRecord};
+        use harness_sandbox::tier2a::spawnd::DenyReason;
+        let record = PendingRecord::DeniedByDaemon(Denial {
+            from_domain: Some("entry".to_string()),
+            exe: exe.to_string(),
+            argv: format!("\"{exe}\""),
+            cwd: Some("C:/ws".to_string()),
+            reason: DenyReason::Transition {
+                denial: harness_policy::transition::TransitionDenial::NoMatchingEdge,
+            },
+            count: 1,
+            first_ts: 1,
+            last_ts: 1,
+            argv_truncation: false,
+        });
+        let line = serde_json::to_string(&record).expect("serialize");
+        format!(
+            "New-Item -ItemType Directory -Force -Path .harness/transitions | Out-Null; \
+             Add-Content -Path .harness/transitions/pending.jsonl -Value '{line}'; \
+             Write-Output ran"
+        )
+    }
+
+    /// [段階6f-3] **強制が効いている構成では、コマンド中に積まれた拒否が出力へ出る**（§19.3.8）。
+    ///
+    /// これが出ないと、モデルは`can_run_program`の存在を知らないまま手探りを続ける
+    /// ——pullは教えないと呼ばれない、というのがこの段階の前提である。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_reports_transition_denials_when_enforcement_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ctx(dir.path().to_path_buf());
+
+        let out = RunShellTool::reporting_transition_denials()
+            .call(
+                json!({ "command": command_that_appends_a_denial("C:/bin/git.exe") }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.content.contains("[transition:"),
+            "拒否が積まれたのに注記が出ていない: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("git.exe") && out.content.contains("can_run_program"),
+            "何が断られたか・どこを引けばよいかが出ていない: {}",
+            out.content
+        );
+    }
+
+    /// [段階6f-3] **強制が効いていない構成では、同じ待ち行列があっても1文字も出さない**（対）。
+    ///
+    /// これが無いと「常に読む」実装が上のテストだけで緑になり、今日の製品——
+    /// `can_run_program`を登録していない構成——で**存在しないツールを指す案内**が出る。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_stays_silent_about_transitions_when_enforcement_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ctx(dir.path().to_path_buf());
+
+        let out = RunShellTool::default()
+            .call(
+                json!({ "command": command_that_appends_a_denial("C:/bin/git.exe") }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !out.content.contains("[transition:"),
+            "強制していない構成で拒否の注記が出ている: {}",
+            out.content
+        );
+    }
+
     #[derive(Debug)]
     struct MockVmShellExecutor;
 
@@ -1035,7 +1119,7 @@ mod tests {
             harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
         )
             .expect("Tier2a product path requires a Spawn Daemon");
-        let tool = RunShellTool::with_spawn_daemon(daemon);
+        let tool = RunShellTool::with_spawn_daemon(daemon, false);
 
         // (a) ワークスペース内への書込（絶対パス）→ 成功する（再帰ACL付与でパッケージSIDが
         //     workspace配下に書込可になっている証拠）。
@@ -1203,7 +1287,7 @@ mod tests {
             harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
         )
             .expect("Tier2a product path requires a Spawn Daemon");
-        let tool = RunShellTool::with_spawn_daemon(daemon);
+        let tool = RunShellTool::with_spawn_daemon(daemon, false);
         // TCPソケットを直接開くprobe（HTTP_PROXYに依存しない、capability機構そのものを見る）。
         let connect_probe = "try { \
             $c = New-Object Net.Sockets.TcpClient; \

@@ -45,12 +45,19 @@ struct CanRunProgramInput {
     limit: Option<usize>,
 }
 
+/// このツールの名前。
+///
+/// **定数にしてあるのは、[段階6f-3]の拒否の注記が同じ名前を書くためである**
+/// ——注記は「このツールを引け」とモデルへ言うので、綴りがずれると
+/// **存在しないツールを指す案内**になる（`B-05`: 別々に持つ綴りはコンパイラが守らない）。
+pub const CAN_RUN_PROGRAM_TOOL: &str = "can_run_program";
+
 pub struct CanRunProgramTool;
 
 #[async_trait]
 impl Tool for CanRunProgramTool {
     fn name(&self) -> &str {
-        "can_run_program"
+        CAN_RUN_PROGRAM_TOOL
     }
 
     fn description(&self) -> &str {

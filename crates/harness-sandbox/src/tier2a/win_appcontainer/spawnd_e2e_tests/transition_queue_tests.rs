@@ -283,6 +283,84 @@ fn a_provisional_denial_is_queued_but_not_as_a_declaration_problem() {
 
 /// **Q4**: 同じ拒否は種類として1つに畳まれ、畳みどきに残りが書き切られる。
 ///
+/// [段階6f-3] **畳まずに、頼んだだけで書き切れる**（§19.3.8）。
+///
+/// # なぜ要るのか
+///
+/// 直下のテストが示すとおり、同じ拒否の**3件目は1行も増えない**（回数の対数でしか書かない）。
+/// `run_shell`は「このコマンドの間に何件断られたか」をモデルへ出すので、そのままだと
+/// **断られたのに何も出ない回**が生まれる。かといってセッションを畳むわけにいかない。
+///
+/// # 対で見るもの
+///
+/// | 見るもの | 無いと何が通るか |
+/// |---|---|
+/// | 頼む**前**は2行のまま | 「常に全部書く」実装（畳み込みが消えている）が緑になる |
+/// | 頼んだ**後**は3行・回数3 | **何もしない`flush`**が緑になる |
+/// | 頼んだ**後もDaemonが生きている** | 制御電文を1つ足したせいで接続が壊れる形を見逃す |
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer children; run through spawn-daemon"]
+fn the_queue_can_be_flushed_on_demand_without_shutting_the_daemon_down() {
+    let probe = super::super::mac_spike_tests::probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+
+    let (case, profile, caps) = setup_with_policy_and_transitions(
+        "spawnd-6f3-flush",
+        ChildProcessPolicy::Unrestricted,
+        |_workspace| policy_with_edge(E2E_POLICY_DOMAIN, &probe_str),
+    );
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+
+    let payload = request_payload(
+        r"C:\Windows\System32\cmd.exe",
+        &["/c", "exit", "0"],
+        &workspace,
+    );
+    for _ in 0..3 {
+        let out = ask_daemon(&case, &profile, &caps, &payload);
+        assert_eq!(reply_kind(&out).as_deref(), Some("denied"), "{out}");
+    }
+
+    let before = queue_records(&case);
+    assert_eq!(
+        before.len(),
+        2,
+        "前提が崩れている——3件目がもう書かれているなら、頼む意味そのものが無い: {before:?}"
+    );
+
+    let daemon = case.daemon.as_ref().expect("case owns the daemon");
+    let lines = daemon
+        .flush_transition_queue()
+        .expect("待ち行列の書き出しを頼めること");
+    assert_eq!(
+        lines, 1,
+        "書き切るべき1種類ぶんが書かれていない（`flush`が何もしていない）"
+    );
+
+    let after = queue_records(&case);
+    assert_eq!(after.len(), 3, "頼んでも増えていない: {after:?}");
+    assert_eq!(
+        daemon_denial(after.last().expect("last")).count,
+        3,
+        "書き切った回数が実際と合っていない"
+    );
+
+    // **Daemonは生きたままであること。** 畳んで書き切る経路とは別物である。
+    let out = ask_daemon(&case, &profile, &caps, &payload);
+    assert_eq!(
+        reply_kind(&out).as_deref(),
+        Some("denied"),
+        "書き出しを頼んだ後にDaemonが応答しない＝制御電文を足したせいで接続が壊れている: {out}"
+    );
+
+    drop(case);
+}
+
 /// **1件ごとに1行ではない**（§10.2）。フックがDaemonへ頼むようになった日（6f）に
 /// `cargo build`1回で数千のプロセスが起きるので、生で書くとログ量が破綻する。
 #[test]

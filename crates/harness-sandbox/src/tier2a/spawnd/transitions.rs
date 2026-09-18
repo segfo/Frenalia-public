@@ -70,6 +70,71 @@ pub fn pending_path(workspace_root: &Path) -> PathBuf {
     transitions_dir(workspace_root).join(PENDING_FILE)
 }
 
+/// [段階6f-3] 待ち行列の**続きだけ**を読んだ結果（§19.3.8）。
+///
+/// 待ち行列は追記専用なので、前回読んだ位置から先だけを読めば「その間に積まれたもの」が分かる。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct QueueTail {
+    /// 読めた行。**壊れた行は黙って飛ばす**——書き手が追記の途中で落ちた場合に、
+    /// 以後の読み取りが永久に止まるのを避ける（`B-10`との兼ね合いは[`QueueTail::skipped`]が持つ）。
+    pub records: Vec<PendingRecord>,
+    /// 次に読み始める位置。**最後の改行までしか進めない**——追記の途中を読んで
+    /// しまった場合に、その行を二度と読めなくなるのを避ける。
+    pub next_offset: u64,
+    /// 解析できずに飛ばした行数。**黙って捨てない**（`B-10`）。
+    pub skipped: usize,
+}
+
+/// [段階6f-3] 待ち行列を`offset`から先だけ読む（§19.3.8）。
+///
+/// # ファイルが短くなっていたら先頭から読み直す
+///
+/// 待ち行列は追記専用だが、**ワークスペースごと作り直されることはある**。
+/// 長さが`offset`より短いなら別のファイルなので、位置を信じずに先頭から読む
+/// ——信じると、新しいファイルの先頭部分を永久に読み飛ばす。
+///
+/// # 無いファイルは空である（失敗ではない）
+///
+/// Daemonが起動していない構成では存在しない。**呼び出し元はそれを「拒否が無い」として扱う**
+/// ——ただし「Daemonへ書き出しを頼めなかった」とは区別すること（あちらは注記を出さない）。
+pub fn read_from(path: &Path, offset: u64) -> QueueTail {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return QueueTail::default();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = if len < offset { 0 } else { offset };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return QueueTail::default();
+    }
+    let mut buffer = Vec::new();
+    if file.read_to_end(&mut buffer).is_err() {
+        return QueueTail::default();
+    }
+    // **最後の改行までしか採らない。** 追記の途中を読んだ行は次回に回す。
+    let complete = match buffer.iter().rposition(|b| *b == b'\n') {
+        Some(index) => index + 1,
+        None => 0,
+    };
+    let mut records = Vec::new();
+    let mut skipped = 0usize;
+    for line in buffer[..complete].split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<PendingRecord>(line) {
+            Ok(record) => records.push(record),
+            Err(_) => skipped += 1,
+        }
+    }
+    QueueTail {
+        records,
+        next_offset: start + complete as u64,
+        skipped,
+    }
+}
+
 /// 待ち行列の1行。
 ///
 /// **`kind`が答えるのは「誰が拒否したか」だけである**（モジュールdoc）。
@@ -314,14 +379,23 @@ impl TransitionQueue {
         self.log.record(key, argv, now_ms)
     }
 
-    /// Daemonを畳むときに、**まだ書いていない回数を全部書き出す**。
+    /// **まだ書いていない回数を全部書き出す。**
     ///
     /// 戻り値は追記した行数。**`Result<(), _>`へ潰さない**——0行だったことと
     /// 書けなかったことが区別できないと、後から「積まれていない」の原因が追えない（`B-09`）。
+    ///
+    /// # 呼ぶ者は2つある（2026-09-18に1つ増えた）
+    ///
+    /// | 誰が | いつ | なぜ |
+    /// |---|---|---|
+    /// | Daemon自身 | 畳むとき | 落ちる前に回数を残す |
+    /// | **[段階6f-3] harness** | `run_shell`が待ち行列を読む直前 | **ファイルのカウントは実際より遅れる**（上の「2倍に達したときだけ書く」）。呼ばないと、断られたのにモデルへ何も出ない回が生まれる |
+    ///
+    /// **時機そのものは変えていない。** 常時書く形に戻すと`cargo build`1回で数千行になる
+    /// ——畳み込みが避けている当のものである。頼まれたときだけ足す。
     pub fn flush(&self, now_ms: u64) -> Result<usize, QueueError> {
         self.log.flush(now_ms)
     }
-
 }
 
 fn record_of(key: &Key, folded: &Folded) -> PendingRecord {

@@ -37,6 +37,9 @@ mod env;
 mod net_decision;
 mod platform;
 mod runner;
+/// [段階6f-3] 拒否された遷移を、モデルが読める1行にする（§19.3.8）。
+/// **ツールの名前を持っている側に置いてある**（同ファイルのモジュールdoc）。
+mod transition_note;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -87,18 +90,91 @@ struct RunShellInput {
 pub struct RunShellTool {
     #[cfg(windows)]
     spawn_daemon: Option<harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
+    /// [段階6f-3] 拒否された遷移を出力末尾へ注記するか（§19.3.8）。
+    ///
+    /// # なぜ自分で判定しないのか
+    ///
+    /// **注記は「`can_run_program`を引け」とモデルへ言う。** そのツールを登録するかどうかを
+    /// 決めているのは`harness-cli`の`should_expose`（Tier2a・Daemon在り・生成禁止の3条件）で、
+    /// **同じ値を配らないと、ツールが登録されていない構成で「引け」と書く**ことになる。
+    /// 判定を2箇所に置かない（`B-06`）。
+    ///
+    /// **偽なら待ち行列のファイルに1度も触らない。** 今日の製品は生成禁止を積まないので
+    /// 拒否が1件も起きず、費用はゼロである。
+    #[cfg(windows)]
+    report_transition_denials: bool,
 }
 
 impl RunShellTool {
     /// Tier2aのセッションが持つSpawn Daemon接続を注入する。**本番のTier2a経路は必ずこちら**
     /// （`harness-cli`の`stage_run_agent`が、preflightの後に1本だけ起こして渡す）。
+    ///
+    /// [段階6f-3] `report_transition_denials`は**呼び出し元が必ず選ぶ**
+    /// （[`RunShellTool::report_transition_denials`]のdoc）。既定値を持たせないのは、
+    /// 渡し忘れた経路が黙って「注記しない」側へ落ちるのを避けるためである。
     #[cfg(windows)]
     pub fn with_spawn_daemon(
         spawn_daemon: harness_sandbox::tier2a::spawnd::SharedSpawnDaemon,
+        report_transition_denials: bool,
     ) -> Self {
         Self {
             spawn_daemon: Some(spawn_daemon),
+            report_transition_denials,
         }
+    }
+
+    /// [段階6f-3] Daemonを持たないまま注記だけを試すための入口（**テスト専用**）。
+    ///
+    /// 本番では`should_expose`がDaemonの存在を条件に含むので、この組み合わせは起きない。
+    /// **配線そのものを昇格なしで測れるようにするため**にだけ在る（段階6eが
+    /// `should_expose`を関数へ切り出したのと同じ理由）。
+    #[cfg(all(windows, test))]
+    pub(crate) fn reporting_transition_denials() -> Self {
+        Self {
+            spawn_daemon: None,
+            report_transition_denials: true,
+        }
+    }
+
+    /// [段階6f-3] コマンドを走らせる前の「ここまで既読」の位置。
+    ///
+    /// **注記しない構成では`None`を返し、ファイルに1度も触らない。**
+    #[cfg(windows)]
+    fn transition_queue_cursor(&self, workspace_root: &std::path::Path) -> Option<u64> {
+        if !self.report_transition_denials {
+            return None;
+        }
+        let path =
+            harness_sandbox::tier2a::spawnd::transitions::pending_path(workspace_root);
+        // 無ければ0から。**存在しないことは失敗ではない**（`read_from`のdoc）。
+        Some(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0))
+    }
+
+    /// [段階6f-3] コマンドの間に積まれた拒否を、出力へ足す1行にする（§19.3.8）。
+    ///
+    /// # 書き出しを頼めなかったら、何も言わない
+    ///
+    /// 待ち行列は**畳んで書く**ので、頼まないとカウントが実際より遅れる。頼めなかった回に
+    /// 古い値を読んで「このコマンドでは断られていない」と書くのは、**何も書かないより悪い**
+    /// （`P-11`: 観測していないものを既定値で埋めない）。
+    #[cfg(windows)]
+    fn transition_denial_note(
+        &self,
+        workspace_root: &std::path::Path,
+        cursor: Option<u64>,
+    ) -> Option<String> {
+        let offset = cursor?;
+        if let Some(daemon) = &self.spawn_daemon {
+            if let Err(e) = daemon.flush_transition_queue() {
+                // **黙らせない**（`B-10`）。注記は出さないが、出せなかったことは残す。
+                eprintln!("note: could not flush the transition denial queue: {e}");
+                return None;
+            }
+        }
+        let path =
+            harness_sandbox::tier2a::spawnd::transitions::pending_path(workspace_root);
+        let tail = harness_sandbox::tier2a::spawnd::transitions::read_from(&path, offset);
+        transition_note::note(&tail.records)
     }
 }
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -230,6 +306,11 @@ impl Tool for RunShellTool {
         let net_decision = classify_net_app(&input.command, &ctx.net_app.allow_apps);
         let net_domain_policy_requested = ctx.net_proxy.domain_policy_enabled;
 
+        // [段階6f-3] **コマンドを走らせる前に、待ち行列のどこまでが既読かを控える**（§19.3.8）。
+        // 後から控えると、走っている間に積まれた拒否を「前からあったもの」として読み飛ばす。
+        #[cfg(windows)]
+        let transition_cursor = self.transition_queue_cursor(&ctx.workspace_root);
+
         let (out, err, code, shell_label) = run_isolated(
             &input.command,
             &cwd,
@@ -315,6 +396,13 @@ impl Tool for RunShellTool {
                     content.push_str("\n[net: denied]");
                 }
             }
+        }
+        // [段階6f-3] このコマンドの間に断られた遷移を、モデルへ届ける（§19.3.8）。
+        // **`[net: …]`と同じ場所・同じ形**——拒否をモデルへ見せる出し口は既にここに在る。
+        #[cfg(windows)]
+        if let Some(note) = self.transition_denial_note(&ctx.workspace_root, transition_cursor) {
+            content.push('\n');
+            content.push_str(&note);
         }
         if ctx.shell_tier.is_unisolated() {
             content.push_str(

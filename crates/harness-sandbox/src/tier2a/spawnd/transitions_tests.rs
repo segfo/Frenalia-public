@@ -384,3 +384,126 @@ fn the_queue_lives_under_the_harness_control_directory() {
     );
     assert!(path.ends_with("transitions/pending.jsonl") || path.ends_with(r"transitions\pending.jsonl"));
 }
+
+// --- [段階6f-3] 続きだけを読む（§19.3.8） ---
+
+/// **前回の位置から先だけを読む。** 全部読み直すと、コマンドの前から積まれていた拒否を
+/// 「このコマンドで断られた」としてモデルへ出してしまう。
+#[test]
+fn reading_from_an_offset_returns_only_what_was_appended_after_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue = TransitionQueue::new(dir.path());
+    let reason = transition(TransitionDenial::NoMatchingEdge);
+
+    let _ = queue
+        .record_daemon_denial(observed("C:/bin/first.exe", "\"first\"", &reason), 1)
+        .expect("first");
+    let after_first = read_from(queue.path(), 0);
+    assert_eq!(after_first.records.len(), 1);
+
+    let _ = queue
+        .record_daemon_denial(observed("C:/bin/second.exe", "\"second\"", &reason), 2)
+        .expect("second");
+    let tail = read_from(queue.path(), after_first.next_offset);
+
+    assert_eq!(tail.records.len(), 1, "続きは1行のはず: {tail:?}");
+    match &tail.records[0] {
+        PendingRecord::DeniedByDaemon(denial) => assert_eq!(denial.exe, "C:/bin/second.exe"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(tail.skipped, 0);
+}
+
+/// **何も積まれていなければ空**（失敗ではない）。ここが`None`や`Err`になると、
+/// 呼び出し元は「読めなかった」と「断られていない」を区別できなくなる。
+#[test]
+fn reading_past_the_end_yields_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue = TransitionQueue::new(dir.path());
+    let reason = transition(TransitionDenial::NoMatchingEdge);
+    let _ = queue
+        .record_daemon_denial(observed("C:/bin/only.exe", "\"only\"", &reason), 1)
+        .expect("record");
+
+    let first = read_from(queue.path(), 0);
+    let again = read_from(queue.path(), first.next_offset);
+    assert!(again.records.is_empty(), "{again:?}");
+    assert_eq!(again.next_offset, first.next_offset);
+}
+
+/// **ファイルが無いのは空である。** Daemonを持たない構成では存在しない。
+#[test]
+fn a_missing_queue_is_empty_not_an_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tail = read_from(&pending_path(dir.path()), 0);
+    assert_eq!(tail, QueueTail::default());
+}
+
+/// **短くなっていたら先頭から読み直す。** 位置を信じると、作り直された待ち行列の
+/// 先頭部分を永久に読み飛ばす。
+#[test]
+fn a_shorter_file_is_read_from_the_beginning() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue = TransitionQueue::new(dir.path());
+    let reason = transition(TransitionDenial::NoMatchingEdge);
+    let _ = queue
+        .record_daemon_denial(observed("C:/bin/fresh.exe", "\"fresh\"", &reason), 1)
+        .expect("record");
+
+    // 前回はもっと長いファイルを読み終えていた、という位置を渡す。
+    let tail = read_from(queue.path(), 1_000_000);
+    assert_eq!(tail.records.len(), 1, "先頭から読み直していない: {tail:?}");
+}
+
+/// **壊れた行は飛ばすが、数える**（`B-10`: 黙って捨てない）。書き手が追記の途中で
+/// 落ちた回に、以後の読み取りが永久に止まるのを避ける。
+#[test]
+fn a_broken_line_is_skipped_and_counted() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = pending_path(dir.path());
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let mut file = std::fs::File::create(&path).expect("create");
+    writeln!(file, "{{not json").expect("write");
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&PendingRecord::Overflowed {
+            dropped: 3,
+            last_ts: 9
+        })
+        .expect("serialize")
+    )
+    .expect("write");
+    drop(file);
+
+    let tail = read_from(&path, 0);
+    assert_eq!(tail.records.len(), 1, "{tail:?}");
+    assert_eq!(tail.skipped, 1, "飛ばした行を数えていない: {tail:?}");
+}
+
+/// **追記の途中は次回に回す。** 改行で終わっていない末尾を読むと、その行は
+/// 二度と読めなくなる（位置がその先へ進んでしまうため）。
+#[test]
+fn an_unterminated_last_line_is_left_for_the_next_read() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = pending_path(dir.path());
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let complete = serde_json::to_string(&PendingRecord::Overflowed {
+        dropped: 1,
+        last_ts: 1,
+    })
+    .expect("serialize");
+    let mut file = std::fs::File::create(&path).expect("create");
+    write!(file, "{complete}\n{{\"kind\":\"denied_by_dae").expect("write");
+    drop(file);
+
+    let tail = read_from(&path, 0);
+    assert_eq!(tail.records.len(), 1, "{tail:?}");
+    assert_eq!(
+        tail.next_offset,
+        complete.len() as u64 + 1,
+        "途中の行まで読んだことにしている: {tail:?}"
+    );
+}

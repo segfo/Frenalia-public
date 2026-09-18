@@ -102,20 +102,27 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
             child_process_policy,
         ) {
             Ok(daemon) => {
-                tools.register(Arc::new(harness_tools::RunShellTool::with_spawn_daemon(
-                    daemon.clone(),
-                )));
                 // [段階6e] 強制が効いているときだけ、モデルへ見せる（§19.3.8）。
                 // **判定は`should_expose`ただ1つが持つ**——ここへ条件を書くと、
                 // 今日は通らない分岐なので配線したこと自体をテストできない。
                 // **姿勢を読むのに綴りを書かない**（`ChildProcessPolicy::is_restricted`のdoc）。
                 // 生成禁止の綴りが製品コードに0件であることを数え上げテストが固定しており、
                 // 比較のために書いた行まで「選んだ」と数えられてしまう。
-                if super::transition_tool::should_expose(
+                //
+                // [段階6f-3] **この1つの値を、ツール登録と`run_shell`の両方へ配る。**
+                // 拒否の注記は「`can_run_program`を引け」と書くので、
+                // **ツールを登録しない構成でその注記を出すと、存在しないツールを指す**。
+                // 判定を2箇所に置くと、いつか片方だけ真になる（`B-06`）。
+                let expose_transitions = super::transition_tool::should_expose(
                     shell_tier.tier,
                     true,
                     child_process_policy.is_restricted(),
-                ) {
+                );
+                tools.register(Arc::new(harness_tools::RunShellTool::with_spawn_daemon(
+                    daemon.clone(),
+                    expose_transitions,
+                )));
+                if expose_transitions {
                     tools.register(Arc::new(harness_tools::CanRunProgramTool));
                 } else {
                     // 出さないなら**事実も積まない**。積んだままにすると、

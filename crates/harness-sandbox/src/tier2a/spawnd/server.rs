@@ -333,6 +333,26 @@ pub fn serve(
                 };
                 write_control(control, &response)?;
             }
+            // [段階6f-3] 覚えている分を待ち行列へ書き出す（§19.3.8）。
+            //
+            // **判定も応答も変えない**（`P-07`: 記録は境界ではない）。書けなくても
+            // 生成の可否は1ビットも変わらない——ただし**黙らせない**（`B-10`）ので、
+            // 失敗は`Failed`で返す。呼び出し元（`run_shell`）はそれを見て
+            // **注記を出さない**（古い値を読んで「断られていない」と言わないため）。
+            ControlRequest::FlushTransitionQueue => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let response = match shared.transitions.flush(now) {
+                    Ok(lines) => ControlResponse::Flushed { lines },
+                    Err(e) => ControlResponse::Failed {
+                        failure_kind: SpawnFailureKind::Protocol,
+                        reason: format!("could not flush the transition queue: {e}"),
+                    },
+                };
+                write_control(control, &response)?;
+            }
             ControlRequest::Shutdown => {
                 let _ = write_control(control, &ControlResponse::ShuttingDown);
                 break;

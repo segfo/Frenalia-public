@@ -280,6 +280,31 @@ impl SharedSpawnDaemon {
         result
     }
 
+    /// [段階6f-3] 拒否の待ち行列を書き出させる（§19.3.8）。
+    ///
+    /// # 失敗を`Ok`へ倒さない
+    ///
+    /// 呼び出し元（`run_shell`）は、これが失敗したら**注記を出さない**。
+    /// 古いカウントを読んで「このコマンドでは断られていない」と書くほうが、
+    /// 何も書かないより悪い（`P-11`: 観測していないものを既定値で埋めない）。
+    ///
+    /// **接続を壊さない。** 生成と違い、失敗しても以後のspawnは続けられる
+    /// ——記録は境界ではない（`P-07`）ので、書き出せないことを理由に
+    /// セッションのspawn機能を落とさない。
+    pub fn flush_transition_queue(&self) -> Result<usize, SpawnDaemonError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| protocol_err("spawn daemon connection mutex was poisoned"))?;
+        if let Some(reason) = state.broken.as_ref() {
+            return Err(err(format!("spawn daemon connection is not usable: {reason}")));
+        }
+        let Some(handle) = state.handle.as_ref() else {
+            return Err(err("spawn daemon connection is not available"));
+        };
+        handle.flush_transition_queue()
+    }
+
     /// 共有cloneが残っていても接続を一度だけ畳み、以後の生成を拒否する。
     pub fn shutdown(&self) {
         let Ok(mut state) = self.inner.lock() else {
@@ -500,6 +525,24 @@ impl SpawnDaemonHandle {
                 message: reason,
             }),
             other => Err(protocol_err(format!("expected Spawned, got {other:?}"))),
+        }
+    }
+
+    /// [段階6f-3] 拒否の待ち行列を**いま書き出させる**（§19.3.8）。追記した行数を返す。
+    ///
+    /// **ハンドルを1つも運ばない**ので、`spawn_top_level`のような複製の後始末は要らない。
+    pub fn flush_transition_queue(&self) -> Result<usize, SpawnDaemonError> {
+        self.send(&ControlRequest::FlushTransitionQueue)?;
+        match self.receive()? {
+            ControlResponse::Flushed { lines } => Ok(lines),
+            ControlResponse::Failed {
+                failure_kind,
+                reason,
+            } => Err(SpawnDaemonError {
+                kind: failure_kind,
+                message: reason,
+            }),
+            other => Err(protocol_err(format!("expected Flushed, got {other:?}"))),
         }
     }
 
