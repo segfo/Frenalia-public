@@ -6001,16 +6001,18 @@ const GIT_TRAP_DENIED_MARKER: &str = "Access is denied";
 /// `start-process`等で、この綴りはどれも含まない（含むと、サンドボックスへ届く前に
 /// 止まって「遷移が断られた」と区別が付かなくなる）。
 ///
-/// # なぜ`--no-index`なのか（素の`git diff`ではなく）
+/// # 素の`git diff`である（2026-09-19に`--no-index`から戻した）
 ///
 /// **素の`git diff`は、比べる元の版を一時ファイルへ書き出してから外部diffを起こす。**
-/// その一時ファイルが、Daemon経由で起こした子では作れない——`TEMP`がAppContainerの
-/// 置き換えを**二重に**受けて存在しないパスになるためである（[BUG-160](../../../docs/bugs/BUG-160.md)）。
+/// 2026-09-18の測定（§S64）ではその一時ファイルがDaemon経由の子で作れず
+/// （[BUG-160](../../../docs/bugs/BUG-160.md)。`TEMP`がAppContainerの置き換えを二重に受けた）、
+/// **鎖の3段目が遷移MACではなくBUG-160で止まっていた**ので、一時ファイルの要らない
+/// `--no-index`で迂回していた。
 ///
-/// つまり素の`git diff`で測ると、鎖の3段目が**遷移MACではなくBUG-160で止まる**。
-/// `--no-index`はワークツリーの実ファイル同士を比べるので一時ファイルが要らず、
-/// **止めているのが遷移MACだけになる**。BUG-160が直った日に素の`git diff`へ戻してよい。
-const GIT_TRAP_SCRIPT: &str = "git -c safe.directory=* diff --no-index a.txt b.txt";
+/// **BUG-160が直った（§S65）ので素の形へ戻してある。** 戻す意味は、
+/// 素の`git diff`が**一時ファイルの書き出しを経由してから**外部diffを起こすことにある
+/// ——迂回していた間は、その経路を1度も通さずに「止められる」と言っていた。
+const GIT_TRAP_SCRIPT: &str = "git -c safe.directory=* diff";
 
 /// 仕掛けが起こすプログラム。**System32の実体**を`.git/config`から名指しする。
 ///
@@ -6065,10 +6067,14 @@ fn plant_git_config_trap(ws: &Path) -> Result<(), String> {
         ));
     }
     git_seed_repo(ws)?;
-    // 比べる2ファイル。**中身が違っていないと外部diffは1度も起きない**——起きなければ、
-    // 旗を立てた腕の「発火しなかった」が拒否の証拠にならない。
+    // 比べる1ファイル。**追跡させてから中身を変える**——素の`git diff`が比べるのは
+    // 索引と作業ツリーなので、追跡していないファイルは1度も外部diffへ渡らない。
+    // **差が無いと外部diffは1度も起きない**ので、起きなければ旗を立てた腕の
+    // 「発火しなかった」が拒否の証拠にならない（＝測定が無効になる）。
     std::fs::write(ws.join("a.txt"), "one\n").map_err(|e| format!("a.txtを置けない: {e}"))?;
-    std::fs::write(ws.join("b.txt"), "two\n").map_err(|e| format!("b.txtを置けない: {e}"))?;
+    plain_git(ws, &["add", "a.txt"])?;
+    plain_git(ws, &["commit", "-q", "-m", "a"])?;
+    std::fs::write(ws.join("a.txt"), "two\n").map_err(|e| format!("a.txtを書き換えられない: {e}"))?;
 
     let config = ws.join(".git").join("config");
     let mut text = std::fs::read_to_string(&config)

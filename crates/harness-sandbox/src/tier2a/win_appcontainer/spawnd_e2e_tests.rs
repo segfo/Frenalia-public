@@ -102,6 +102,12 @@ mod transition_queue_tests;
 /// `win_appcontainer::spawnd_e2e_tests`なので、外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
 mod transparent_hook_tests;
 
+/// [BUG-160] Daemon経由で起こした子の環境が、AppContainerの置き換えを**二重に**受ける件の
+/// 測定と受け入れ（対2本）。**同じ理由でここに置いてある**——昇格の的`spawn-daemon`の
+/// フィルタが`win_appcontainer::spawnd_e2e_tests`なので、外へ出すと0件マッチで
+/// 黙って走らなくなる（BUG-056）。
+mod env_substitution_tests;
+
 /// [残課題#50] **既定のシェルを遷移先にできるか**を、綴りを1つだけ変えて測る（§S62）。
 /// **同じ理由でここに置いてある**——昇格の的`spawn-daemon`のフィルタが
 /// `win_appcontainer::spawnd_e2e_tests`なので、外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
