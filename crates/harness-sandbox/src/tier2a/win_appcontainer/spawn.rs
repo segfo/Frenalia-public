@@ -1882,33 +1882,98 @@ pub(crate) const POWERSHELL51_LABEL: &str = "powershell5.1(Tier2a)";
 /// 動くか」がマシン単位の事実だからである（workspaceごとに答えが変わるものではない）。
 static SELECTED_SHELL: std::sync::OnceLock<(String, &'static str)> = std::sync::OnceLock::new();
 
+/// シェルの候補と、**姿勢のせいで外したもの**。
+///
+/// 外した理由を捨てないのは、`preflight`の警告に出すためである——黙って5.1へ落ちると、
+/// 「pwsh 7があるのに使われない」が誰にも説明されない（`B-10`）。
+pub(crate) struct ShellChoices {
+    /// 優先順。**必ず1件以上ある**（5.1は外さない）。
+    pub(crate) candidates: Vec<(String, &'static str)>,
+    /// 生成禁止を積むために外した綴り（0件が普通）。
+    pub(crate) dropped: Vec<String>,
+}
+
+/// その綴りは**アプリの仕組みを通って起きる**か（ストアの実行エイリアス／MSIXの実体）。
+///
+/// # なぜ遷移先にできないのか（2026-09-18に実測。§S62）
+///
+/// 生成禁止を積んだ子の中から起こす（＝nested）とき、**どちらの綴りも起こせない**。
+/// 理由は2つで、どちらもこちら側では直せない。
+///
+/// | 綴り | 落ちる場所 |
+/// |---|---|
+/// | 実行エイリアス（`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`） | `AssignProcessToJobObject`がアクセス拒否。OSが自分のJobへ先に入れるため（§S59） |
+/// | MSIXの実体（`%ProgramFiles%\WindowsApps\...\pwsh.exe`） | `CreateProcessW`が`ERROR_INVALID_PARAMETER`。AppContainerからパッケージの実体を直に起こせない（§S1b・§S62） |
+///
+/// # 判定はパスの**成分**で行う
+///
+/// 文字列の`starts_with`だと`C:\Windows`が`C:\WindowsApps`に誤マッチする
+/// （`acl_grant`のdocが同じ罠を書いている）。
+fn starts_through_the_app_model(path: &str) -> bool {
+    std::path::Path::new(path)
+        .components()
+        .any(|c| c.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+}
+
 /// Tier2aで使うシェルの候補を**優先順**で返す（純粋関数。`which`の結果を引数で受ける）。
 ///
-/// 1. `pwsh`（PowerShell 7）。**`WindowsApps`配下の実行エイリアスも候補から外さない。**
-///    2026-08-13の実測では、AppContainer内で`CreateProcessW`が通らなかったのは
-///    MSIXパッケージの**実体**の方で、エイリアスは6通り（コンソール3構成×mitigation有無）
-///    すべてで起動できた（[`plans/mac-spike/RESULTS.md`] §S1b）。
+/// 1. `pwsh`（PowerShell 7）。**`WindowsApps`配下の実行エイリアスも、姿勢が素のままなら
+///    候補から外さない。** 2026-08-13の実測では、AppContainer内で`CreateProcessW`が
+///    通らなかったのはMSIXパッケージの**実体**の方で、エイリアスは6通り
+///    （コンソール3構成×mitigation有無）すべてで起動できた（§S1b）。
 /// 2. Windows PowerShell 5.1（System32の本物のexe。決してエイリアスにならない）。
 ///
 /// MSIXの実体パスは候補に入れない——上の実測で6通りすべて`ERROR_INVALID_PARAMETER`だった。
-fn shell_candidates_from(pwsh: Option<PathBuf>, system_root: &str) -> Vec<(String, &'static str)> {
+///
+/// # 生成禁止を積むなら、**遷移先にできる綴りしか選べない**（2026-09-18、残課題#50）
+///
+/// 積んだ子は自分で子プロセスを作れないので、シェルをもう一度起こすコマンド
+/// （`pwsh -c ...`・ビルドスクリプト・フック）は**Daemonへの遷移**になる。
+/// アプリの仕組みを通る綴りはその遷移先にできない（[`starts_through_the_app_model`]）ので、
+/// **選んだ時点で、そのコマンドは必ず失敗する**。
+///
+/// **トップレベルは通る**（段階⑤の受け入れが実行エイリアスで緑）。だから
+/// 「起動できるか」だけを見て選ぶと、**この失敗は選択の時点では見えない。**
+fn shell_candidates_from(
+    pwsh: Option<PathBuf>,
+    system_root: &str,
+    child_process_policy: crate::tier2a::spawnd::ChildProcessPolicy,
+) -> ShellChoices {
     let mut candidates: Vec<(String, &'static str)> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
     if let Some(pwsh) = pwsh {
-        candidates.push((pwsh.to_string_lossy().into_owned(), PWSH_LABEL));
+        let pwsh = pwsh.to_string_lossy().into_owned();
+        if child_process_policy.is_restricted() && starts_through_the_app_model(&pwsh) {
+            dropped.push(pwsh);
+        } else {
+            candidates.push((pwsh, PWSH_LABEL));
+        }
     }
+    // **5.1は姿勢に関わらず残す。** 落ちる先が無くなる方が、古いシェルを使うより悪い。
     candidates.push((
         format!("{system_root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
         POWERSHELL51_LABEL,
     ));
-    candidates
+    ShellChoices {
+        candidates,
+        dropped,
+    }
 }
 
 /// [`shell_candidates_from`]をこの機の実環境へ当てたもの。**必ず1件以上返る**
 /// （5.1のパスは実在確認をせずに積む——実在しない機ではプローブが落ちて理由が出る方が、
 /// 候補が0件で「なぜ選べなかったか」が消えるより良い）。
-pub(crate) fn shell_candidates() -> Vec<(String, &'static str)> {
+///
+/// **姿勢は製品の1箇所から読む**（[`ChildProcessPolicy::PRODUCT_DEFAULT`]）。
+/// ここで`Unrestricted`と書き下すと、⑤を既定へ入れる日に**ここだけ取り残される**
+/// ——そのときサンドボックスの中ではシェルを1本も起こせなくなる（残課題#50）。
+pub(crate) fn shell_candidates() -> ShellChoices {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    shell_candidates_from(which::which("pwsh").ok(), &system_root)
+    shell_candidates_from(
+        which::which("pwsh").ok(),
+        &system_root,
+        crate::tier2a::spawnd::ChildProcessPolicy::PRODUCT_DEFAULT,
+    )
 }
 
 /// 選択結果をこのプロセスへ固定する。既に固定済みなら**最初の選択が勝つ**（`false`を返す）。
@@ -1936,6 +2001,7 @@ pub fn resolve_shell() -> (String, &'static str) {
         return selected.clone();
     }
     shell_candidates()
+        .candidates
         .into_iter()
         .next()
         .expect("shell_candidates always yields at least PowerShell 5.1")
@@ -1955,13 +2021,96 @@ mod shell_resolution_tests {
     #[test]
     fn the_store_alias_is_a_candidate_not_an_exclusion() {
         let alias = PathBuf::from(r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\pwsh.exe");
-        let candidates = shell_candidates_from(Some(alias.clone()), r"C:\Windows");
+        let choices = shell_candidates_from(
+            Some(alias.clone()),
+            r"C:\Windows",
+            ChildProcessPolicy::Unrestricted,
+        );
         assert_eq!(
-            candidates
+            choices
+                .candidates
                 .first()
                 .map(|(path, label)| (path.as_str(), *label)),
             Some((alias.to_string_lossy().as_ref(), PWSH_LABEL)),
             "pwshは実行エイリアスであっても第1候補でなければならない（実測§S1b）"
+        );
+        assert!(
+            choices.dropped.is_empty(),
+            "生成禁止を積まない構成で候補を外している。今日の製品の挙動が変わる"
+        );
+    }
+
+    /// **上の対**（残課題#50、2026-09-18）: 生成禁止を積むなら、アプリの仕組みを通る綴りは
+    /// 候補から外れ、**外したことが残る**。
+    ///
+    /// # この1本が無いと何が起きるか
+    ///
+    /// 上の1本だけだと「常に外さない」実装で緑のままになり、⑤を既定へ入れた日に
+    /// **サンドボックスの中からシェルを1本も起こせなくなる**（§S62。エイリアスは
+    /// Jobへ入れられず、MSIXの実体は`CreateProcessW`が拒む）。
+    /// トップレベルの起動は通るので、**選択の時点では何も症状が出ない。**
+    #[test]
+    fn the_store_alias_is_dropped_when_child_process_creation_is_restricted() {
+        let alias = PathBuf::from(r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\pwsh.exe");
+        let choices = shell_candidates_from(
+            Some(alias.clone()),
+            r"C:\Windows",
+            ChildProcessPolicy::Restricted,
+        );
+        assert_eq!(
+            choices
+                .candidates
+                .iter()
+                .map(|(_, label)| *label)
+                .collect::<Vec<_>>(),
+            vec![POWERSHELL51_LABEL],
+            "生成禁止を積むなら、遷移先にできない綴りは候補に残ってはならない"
+        );
+        assert_eq!(
+            choices.dropped,
+            vec![alias.to_string_lossy().into_owned()],
+            "外した綴りが残っていない。**黙って5.1へ落ちると誰も理由を知らない**（`B-10`）"
+        );
+    }
+
+    /// **機に依存させない**: MSIで入れたpwsh 7（アプリの仕組みを通らない本物のexe）は、
+    /// 生成禁止を積んでも第1候補のまま残る。
+    ///
+    /// これが無いと、上の1本は「生成禁止ならpwshを常に捨てる」実装でも緑になる。
+    #[test]
+    fn a_real_pwsh_executable_survives_the_restriction() {
+        let real = PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        let choices = shell_candidates_from(
+            Some(real.clone()),
+            r"C:\Windows",
+            ChildProcessPolicy::Restricted,
+        );
+        assert_eq!(
+            choices
+                .candidates
+                .first()
+                .map(|(path, label)| (path.as_str(), *label)),
+            Some((real.to_string_lossy().as_ref(), PWSH_LABEL)),
+            "アプリの仕組みを通らないpwshまで捨てている。外す条件はパスの成分1つである"
+        );
+        assert!(choices.dropped.is_empty());
+    }
+
+    /// `C:\Windows`が`C:\WindowsApps`に誤マッチしないこと（成分で見ている証拠）。
+    #[test]
+    fn the_app_model_check_compares_path_components_not_prefixes() {
+        assert!(starts_through_the_app_model(
+            r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe\pwsh.exe"
+        ));
+        assert!(starts_through_the_app_model(
+            r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\pwsh.exe"
+        ));
+        assert!(!starts_through_the_app_model(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(
+            !starts_through_the_app_model(r"C:\WindowsApps-mine\tool.exe"),
+            "成分ではなく前方一致で見ている。似た名前のディレクトリを巻き込む"
         );
     }
 
@@ -1972,7 +2121,9 @@ mod shell_resolution_tests {
         let with_pwsh = shell_candidates_from(
             Some(PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe")),
             r"C:\Windows",
-        );
+            ChildProcessPolicy::Unrestricted,
+        )
+        .candidates;
         assert_eq!(with_pwsh.len(), 2, "pwshがある機では候補は2本");
         assert_eq!(
             with_pwsh.last().map(|(path, label)| (path.clone(), *label)),
@@ -1982,7 +2133,8 @@ mod shell_resolution_tests {
             ))
         );
 
-        let without_pwsh = shell_candidates_from(None, r"C:\Windows");
+        let without_pwsh =
+            shell_candidates_from(None, r"C:\Windows", ChildProcessPolicy::Unrestricted).candidates;
         assert_eq!(
             without_pwsh.len(),
             1,
@@ -1994,7 +2146,8 @@ mod shell_resolution_tests {
     /// `SystemRoot`が既定と違う機でも5.1のパスをそこから組み立てる。
     #[test]
     fn powershell51_is_built_from_the_given_system_root() {
-        let candidates = shell_candidates_from(None, r"D:\WinNT");
+        let candidates =
+            shell_candidates_from(None, r"D:\WinNT", ChildProcessPolicy::Unrestricted).candidates;
         assert_eq!(
             candidates[0].0,
             r"D:\WinNT\System32\WindowsPowerShell\v1.0\powershell.exe"

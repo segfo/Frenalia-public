@@ -487,6 +487,37 @@ mod tests {
              1つも起動できなくなる（`ChildProcessPolicy`のdoc）:\n  {}",
             restricted_product.join("\n  ")
         );
+
+        // [残課題#50] **既定を読む場所を数える。** 2026-09-18に3つ目が増えた——
+        // Tier2aのシェルの選び方である（生成禁止を積むなら、呼び出し元の中から起こせる
+        // 綴りしか選べない。`plans/mac-spike/RESULTS.md` §S62）。
+        //
+        // **綴りで持たずに定数で持つのはこのためである**——3箇所のうち1つだけが
+        // 取り残されると、「生成禁止は積んだのに、シェルは遷移先にできない綴りのまま」
+        // という状態が作れてしまい、サンドボックスの中でシェルが1本も起こせなくなる。
+        let default_readers = format!("ChildProcessPolicy{}PRODUCT_DEFAULT", "::");
+        let (default_product, default_elsewhere) =
+            super::super::test_support::product_callers_of(&default_readers, "pub const");
+        assert_eq!(
+            default_product.len(),
+            2,
+            "製品の既定（`PRODUCT_DEFAULT`）をDaemonのホストが読まなくなった（か、増えた）。\
+             読まずに姿勢を直書きすると、⑤を既定へ入れる日にそこだけ取り残される:\n  {}",
+            default_product.join("\n  ")
+        );
+        // **3つ目はこの数え方では「製品」に見えない。** `spawn.rs`は`shell_candidates`より
+        // 前にインラインのテストモジュールを持っており、`product_callers_of`はその行より後ろを
+        // 全部テストとして数える（同関数のdocの限界3つ目そのもの）。
+        // **だから合計で見る**——直書きへ戻せば合計が2件に落ちて赤くなる。
+        assert_eq!(
+            default_product.len() + default_elsewhere,
+            3,
+            "`PRODUCT_DEFAULT`を読む場所の合計が3件ではない。3つ目はTier2aのシェルの選び方\
+             （`win_appcontainer::spawn::shell_candidates`）で、生成禁止を積むなら\
+             「呼び出し元の中から起こせる綴り」しか選べないという実測（§S62）に基づく。\
+             ここが姿勢を直書きに戻ると、⑤を既定へ入れた日に**シェルだけが\
+             遷移先にできない綴りのまま**になり、サンドボックスの中で1本も起こせなくなる"
+        );
     }
 
     /// **`preflight`が使うのと同じ語彙**であることを固定する。ここがずれると別のcapability SIDを

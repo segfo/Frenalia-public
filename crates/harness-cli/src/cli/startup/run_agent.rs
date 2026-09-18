@@ -96,7 +96,11 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         // **この値が段階6eの露出条件の3つ目である。** `Unrestricted`である限り、
         // 子は要求受付パイプへ頼まずに自分で生成できるので、モデルへ
         // 「宣言された組み合わせだけ起こせる」と言ってはならない（§19.3.8）。
-        let child_process_policy = harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted;
+        // [残課題#50] **姿勢の綴りをここに書かない。** 読む場所が3つに増えた
+        // （ここ・ポリシーエディタ・Tier2aのシェルの選び方）ので、
+        // 既定を持つのは`PRODUCT_DEFAULT`1箇所だけにしてある。
+        let child_process_policy =
+            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::PRODUCT_DEFAULT;
         match harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
             transition_policy,
             child_process_policy,

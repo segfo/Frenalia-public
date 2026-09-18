@@ -63,14 +63,9 @@ fn tools_under_test() -> Vec<(String, String, Vec<String>)> {
         "-Command".to_string(),
         "Write-Output TOOL-RAN; exit 7".to_string(),
     ];
-    let alias = format!(
-        "{}\\Microsoft\\WindowsApps\\pwsh.exe",
-        std::env::var("LOCALAPPDATA").unwrap_or_default()
-    );
-    if std::path::Path::new(&alias).exists() {
-        tools.push(("pwsh7-alias".into(), alias, pwsh_args.clone()));
-    } else {
-        eprintln!("[S1b] pwsh7の実行エイリアスが無いので測定対象から外した");
+    match store_alias_pwsh_path() {
+        Some(alias) => tools.push(("pwsh7-alias".into(), alias, pwsh_args.clone())),
+        None => eprintln!("[S1b] pwsh7の実行エイリアスが無いので測定対象から外した"),
     }
     match msix_pwsh_path() {
         Some(real) => tools.push(("pwsh7-msix実体".into(), real, pwsh_args.clone())),
@@ -113,12 +108,25 @@ fn program_files() -> String {
     std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string())
 }
 
+/// ストア版 pwsh 7 の**実行エイリアス**のパス（中身0バイトの飛び先）。無ければ`None`。
+///
+/// **綴りをここだけが持つ。** 残課題#50の測定（`spawnd_e2e_tests::shell_target_tests`）も
+/// この関数を通る——2箇所で組み立てると、片方だけ直したときに
+/// 「測ったつもりの綴り」と「製品が選ぶ綴り」がずれる（`B-13`）。
+pub(super) fn store_alias_pwsh_path() -> Option<String> {
+    let alias = format!(
+        "{}\\Microsoft\\WindowsApps\\pwsh.exe",
+        std::env::var("LOCALAPPDATA").unwrap_or_default()
+    );
+    std::path::Path::new(&alias).exists().then_some(alias)
+}
+
 /// MSIX（ストア）版 pwsh 7 の**実体**のパス。
 ///
 /// `C:\Program Files\WindowsApps`はDACLで列挙が拒否されるが、**パッケージのディレクトリ名を
 /// 知っていれば`Test-Path`は通る**（実測）。名前はバージョンを含むので、ここでは既知の
 /// 発行者ID（`8wekyb3d8bbwe`）で候補を組み立てて実在するものを採る。見つからなければ`None`。
-fn msix_pwsh_path() -> Option<String> {
+pub(super) fn msix_pwsh_path() -> Option<String> {
     let root = format!("{}\\WindowsApps", program_files());
     // 列挙できる環境ならそれが一番確実（できない環境では下の`Get-AppxPackage`へ落ちる）。
     if let Ok(entries) = std::fs::read_dir(&root) {

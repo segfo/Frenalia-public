@@ -842,11 +842,12 @@ impl SharedSpawnDaemon {
             return Ok(daemon.clone());
         }
         // [段階⑤] 製品の既定は「生成禁止を積まない」（harness本体側と同じ理由。
-        // `ChildProcessPolicy`のdoc）。**ホストが2つあるので両方に同じ姿勢を書く**——
+        // `ChildProcessPolicy`のdoc）。**ホストが2つあるので両方に同じ姿勢を渡す**——
         // 片方だけへ配線すると、もう片方だけが別の世界で動く（`B-06`）。
+        // [残課題#50] **値そのものはここに書かない**（`PRODUCT_DEFAULT`のdoc）。
         let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
             policy,
-            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
+            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::PRODUCT_DEFAULT,
         )
         .map_err(|error| error.to_string())?;
         *slot = Some(daemon.clone());

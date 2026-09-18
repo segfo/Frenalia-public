@@ -102,6 +102,11 @@ mod transition_queue_tests;
 /// `win_appcontainer::spawnd_e2e_tests`なので、外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
 mod transparent_hook_tests;
 
+/// [残課題#50] **既定のシェルを遷移先にできるか**を、綴りを1つだけ変えて測る（§S62）。
+/// **同じ理由でここに置いてある**——昇格の的`spawn-daemon`のフィルタが
+/// `win_appcontainer::spawnd_e2e_tests`なので、外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
+mod shell_target_tests;
+
 /// [残課題#52] Page Heap(Full)の下でプローブを走らせ、**どこでヒープを壊しているか**を出す測定。
 ///
 /// **ここに置いてあるが、受け入れ`spawn-daemon`からは`--skip`で外れている**

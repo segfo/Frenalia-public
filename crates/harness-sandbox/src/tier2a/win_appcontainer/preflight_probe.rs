@@ -160,18 +160,32 @@ pub(crate) fn select_shell_by_probe(
     workspace_cap: Option<PSID>,
     workspace_root: &Path,
 ) -> Vec<String> {
-    let candidates = shell_candidates();
+    let choices = shell_candidates();
+    // [残課題#50] **姿勢のせいで外した綴りは、外した時点で理由を残す**（`B-10`）。
+    // 黙って5.1へ落ちると、「pwsh 7が在るのに使われない」が誰にも説明されない。
+    let mut warnings: Vec<String> = choices
+        .dropped
+        .iter()
+        .map(|path| {
+            format!(
+                "not using {path} as the Tier2a shell: it starts through the app model \
+                 (Store execution alias / MSIX), which cannot be a transition target while \
+                 child process creation is restricted (plans/mac-spike/RESULTS.md S62); \
+                 falling back to Windows PowerShell 5.1"
+            )
+        })
+        .collect();
+    let candidates = choices.candidates;
     // 候補が1本しか無い機（pwshが入っていない）では、測る意味が無いのでプロセスを起こさない。
     if candidates.len() <= 1 {
         if let Some(only) = candidates.into_iter().next() {
             remember_selected_shell(only);
         }
-        return Vec::new();
+        return warnings;
     }
 
     let env = crate::secret_env::build_child_env();
     let stdin_payload = shell_selection_probe_stdin();
-    let mut warnings: Vec<String> = Vec::new();
     let last_index = candidates.len() - 1;
 
     for (index, candidate) in candidates.iter().enumerate() {
