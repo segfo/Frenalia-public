@@ -121,7 +121,16 @@ fn the_mitigation_flips_whether_a_sandboxed_child_can_create_processes_itself() 
             &workspace,
             domain_spec(&profile, &caps, None),
             &probe_str,
-            &["--spawn-matrix", &marker_str, "--timeout-secs", "60"],
+            &[
+                "--spawn-matrix",
+                &marker_str,
+                // **`taskscheduler`を外して撃つ**（報告が残る形。同名の定数のdoc）。
+                // この的はその経路について何も判定していないので、測るものは減らない。
+                "--spawn-matrix-methods",
+                super::MATRIX_METHODS_WITHOUT_TASKSCHEDULER,
+                "--timeout-secs",
+                "60",
+            ],
             ConsoleNeed::NotNeeded,
         );
         let (out, err, _code) = outcome.expect("the probe itself must start in both arms");
@@ -152,6 +161,80 @@ fn the_mitigation_flips_whether_a_sandboxed_child_can_create_processes_itself() 
          カーネルが拒否していない＝段階⑤の強制が成立していない。\
          markers={restricted:?}（対照では {unrestricted:?} が生まれた）"
     );
+}
+
+/// **タスクスケジューラのブローカー経路は、AppContainerから子を作れない。**
+///
+/// # なぜ単独で撃つのか
+///
+/// この経路の`CoCreateInstance`は、AppContainerの中で`combase.dll`→`ntdll.dll`の
+/// ヒープ経路を壊し、**プローブごと落とす**（OS内部の欠陥。`plans/mac-spike/RESULTS.md`§S61）。
+/// 他の7本と同じ回で撃つと、落ちた回はそれらの報告まで失われる。だから**この1本だけ**を
+/// 別のプロセスで撃つ。
+///
+/// # 落ちても赤くしない。**落ちるとも決めつけない**
+///
+/// 素の（Page Heapを載せない）回では、落ちずに`0x80040154`（クラスが登録されていません）で
+/// 返ることもある。**どちらでも結論は同じ**——子は生まれない。だから終了コードを判定に使わない。
+///
+/// # 判定は2つを**対で**見る
+///
+/// | 見るもの | 無いと何が起きるか |
+/// |---|---|
+/// | 足跡`starting taskscheduler`が出ている | **撃つ前に落ちた回**を「到達できなかった」と読んでしまう |
+/// | マーカーが1つも無い | そもそも塞がっているかを見ていない |
+///
+/// **片方だけでは成立しない。** マーカーが無いことは、撃っていなくても成り立つ。
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn the_task_scheduler_broker_is_out_of_reach_even_though_it_crashes_the_probe() {
+    let (case, profile, caps) =
+        setup_with_policy("spawnd-s5-taskschd", ChildProcessPolicy::Restricted);
+    let daemon = case.daemon.as_ref().expect("case owns the daemon");
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let marker_dir = workspace.join("spawn-markers");
+    std::fs::create_dir_all(&marker_dir).expect("marker dir");
+    let marker_str = marker_dir.to_string_lossy().into_owned();
+    let probe = super::super::mac_spike_tests::probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+
+    let (out, err, code) = spawn_and_collect(
+        daemon,
+        &profile,
+        &workspace,
+        domain_spec(&profile, &caps, None),
+        &probe_str,
+        &[
+            "--spawn-matrix",
+            &marker_str,
+            "--spawn-matrix-methods",
+            "taskscheduler",
+            "--timeout-secs",
+            "60",
+        ],
+        ConsoleNeed::NotNeeded,
+    )
+    .expect("the probe itself must start");
+    eprintln!("[spawnd S5 taskschd] exit={code:#010x}\nstdout={out}\nstderr={err}");
+
+    assert!(
+        err.contains("[spawn-matrix] starting taskscheduler"),
+        "この経路を撃った跡が無い。撃つ前に落ちた回を『到達できなかった』と\
+         読まないための検問である。stderr={err}"
+    );
+    assert!(
+        markers_written(&marker_dir).is_empty(),
+        "タスクスケジューラ経由で子が生まれている＝ブローカー生成で\
+         サンドボックスを抜けられる。markers={:?}",
+        markers_written(&marker_dir)
+    );
+
+    drop(case);
 }
 
 /// 生成能力を取り上げても、**要求受付パイプへは届く**。

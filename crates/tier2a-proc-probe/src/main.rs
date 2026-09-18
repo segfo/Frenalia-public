@@ -86,6 +86,11 @@ struct Args {
     /// MAC設計§20項目1: プロセス生成の全経路を試し、どれが拒否されるかを報告する
     /// （`spawn_matrix`モジュールdoc参照）。値はマーカーファイルを書くディレクトリ。
     spawn_matrix: Option<String>,
+    /// 撃つ経路を絞る（カンマ区切り）。**既定は全部**。
+    ///
+    /// `taskscheduler`はOS内部の欠陥で**このプロセスごと落ちる**ので、報告を読みたい
+    /// 測定は「それ以外」と「それだけ」の2回に分けて撃つ（`spawn_matrix`モジュールdoc）。
+    spawn_matrix_methods: Vec<String>,
     /// MAC設計§20項目10: 別ドメイン/別プロファイルのオブジェクトへ到達できるかを型ごとに
     /// 試す（`object_reach`モジュールdoc参照）。1つでも指定されたらこのモードになる。
     reach: object_reach::ReachSpec,
@@ -171,6 +176,8 @@ fn parse_args() -> Args {
     let mut spawn_via = None;
     let mut load_library = None;
     let mut spawn_matrix = None;
+    // 空＝全部（既定）。指定すればその経路だけを撃つ。
+    let mut spawn_matrix_methods: Vec<String> = Vec::new();
     let mut reach = object_reach::ReachSpec::default();
     let mut reach_mode = false;
     let mut hold_file = None;
@@ -238,6 +245,13 @@ fn parse_args() -> Args {
             "--load-library" => load_library = Some(next()),
             // --- MACスパイク用（`plans/mac-spike/RESULTS.md`） ---
             "--spawn-matrix" => spawn_matrix = Some(next()),
+            "--spawn-matrix-methods" => {
+                spawn_matrix_methods = next()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+            }
             "--reach-process" => {
                 reach.process = next().parse().ok();
                 reach_mode = true;
@@ -387,6 +401,7 @@ fn parse_args() -> Args {
         spawn_via,
         load_library,
         spawn_matrix,
+        spawn_matrix_methods,
         reach,
         reach_mode,
         hold_file,
@@ -761,7 +776,13 @@ fn main() -> ExitCode {
 
     // --- MACスパイク用の短絡モード（`plans/mac-spike/RESULTS.md`） ---
     if let Some(marker_dir) = &args.spawn_matrix {
-        let report = spawn_matrix::run(marker_dir);
+        // **経路を絞らなければ全部**（既定は従来どおり）。絞る呼び方が要るのは、
+        // `taskscheduler`がこのプロセスごと落とすためである（`spawn_matrix`モジュールdoc）。
+        let report = if args.spawn_matrix_methods.is_empty() {
+            spawn_matrix::run(marker_dir)
+        } else {
+            spawn_matrix::run_selected(marker_dir, &args.spawn_matrix_methods)
+        };
         if let Some(path) = &args.report_file {
             let _ = fs::write(path, report.to_string());
         }

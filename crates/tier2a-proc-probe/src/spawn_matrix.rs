@@ -28,6 +28,24 @@
 //! `WinExec`のように生成の成否をまともに返さないAPIがあり、APIの戻り値だけでは
 //! 「拒否された」と「起動して何もしなかった」を区別できないためである。
 //!
+//! ## `taskscheduler`は**このプロセスを落とす**（OS内部の欠陥。撃ち方を分けること）
+//!
+//! `taskscheduler`の`CoCreateInstance`は、AppContainerの中で`combase.dll`→`ntdll.dll`の
+//! ヒープ経路を壊す（`ntdll.dll+0x41ebd`で読みのアクセス違反。両腕で同一。
+//! 計測は`plans/mac-spike/RESULTS.md`§S61、撃ち直しは`dev-elevated-run.exe spawn-daemon-pageheap`）。
+//! **OS内部の欠陥なので、こちら側では直せない。**
+//!
+//! ```text
+//!   8経路を1回で撃つ  : taskschedulerで落ちる → **他の7経路の報告まで失われる**
+//!                       しかも7経路の結果は「最後にヒープが壊れたプロセス」の産物になる
+//!   経路を分けて撃つ  : 7経路の回は壊れる経路に一度も触れない → 報告が残り、素性も綺麗
+//! ```
+//!
+//! **だから、報告（標準出力のJSON）を読みたい測定は[`run_selected`]で経路を分けて撃つこと。**
+//! [`run`]（全部）を使うのは、落ちること自体を測りたいときだけである。
+//! `taskscheduler`だけを撃つ回は落ちる前提で、**足跡（`starting taskscheduler`）と
+//! マーカーの有無**で判定する——報告に合否を預けない。
+//!
 //! ## このモードは制限あり／制限なしの**両方**で回す（B-35）
 //!
 //! 拒否側のassertだけでは、機構が効いているのか**プローブ自身が壊れている**のかを
@@ -770,55 +788,160 @@ fn via_task_scheduler(_marker_dir: &str) -> Value {
     }
 }
 
-/// 全経路を順に試し、`{"marker_dir", "attempts": [...]}`を返す。
+/// 経路の名前と実装を**1つの表**で持つ。
+///
+/// 名前の配列と実装の配列を添字で突き合わせると、片方だけ並べ替えたときに
+/// **別の経路の名前で報告する**形になり、コンパイラは何も言わない（`B-05`）。
+/// 1経路の実装。マーカー置き場を受けて、その経路の報告を返す。
+#[cfg(windows)]
+type MethodFn = fn(&str) -> Value;
+
+#[cfg(windows)]
+fn method_table() -> Vec<(&'static str, MethodFn)> {
+    vec![
+        ("createprocessw", via_create_process_w as MethodFn),
+        ("createprocessa", via_create_process_a),
+        ("winexec", via_win_exec),
+        ("createprocessasuserw", via_create_process_as_user_w),
+        ("shellexecuteexw", via_shell_execute_ex_w),
+        ("ntcreateuserprocess", via_nt_create_user_process),
+        ("wmi", via_wmi),
+        ("taskscheduler", via_task_scheduler),
+    ]
+}
+
+/// **プロセスごと落ちることが分かっている経路**（残課題#52改め`plans/mac-spike/RESULTS.md`§S61）。
+///
+/// `taskscheduler`の`CoCreateInstance`はAppContainerの中で`combase.dll`→`ntdll.dll`の
+/// ヒープ経路を壊す。**OS内部の欠陥で、こちら側では直せない。**
+/// だから**同じ回で他の経路と一緒に撃たない**——落ちると他の7経路の報告まで失われるうえ、
+/// それらの結果が「最後にヒープが壊れたプロセス」の産物になってしまう。
+#[cfg(windows)]
+pub const CRASHES_THE_PROBE: &[&str] = &["taskscheduler"];
+
+/// 指定された経路だけを順に試し、`{"marker_dir", "attempts": [...]}`を返す。
 ///
 /// # 1本ごとに標準エラーへ出す（2026-09-17）
 ///
 /// 報告は**最後にまとめて**標準出力へ出るので、途中でこのプロセスが落ちると
-/// **何も残らない**——実際に段階6f-2の受け入れで、5本目まで進んだ跡（マーカー）は
-/// 在るのに報告が空、という形で落ちた。`eprintln!`は行ごとに出るので、
-/// **どこまで進んだか**が落ちた後でも読める（`B-10`: 失敗を黙らせない）。
+/// **何も残らない**。`eprintln!`は行ごとに出るので、**どこまで進んだか**が落ちた後でも
+/// 読める（`B-10`: 失敗を黙らせない）。実際にこの足跡が§S61で犯人を指した。
+///
+/// # 知らない名前が来たら**1本も走らせない**
+///
+/// 綴りを間違えた指定を黙って無視すると、「その経路は拒否された」と読める報告が出る。
+/// `unknown_methods`へ入れて、`attempts`は空で返す（fail-closed）。
 #[cfg(windows)]
-pub fn run(marker_dir: &str) -> Value {
+pub fn run_selected(marker_dir: &str, requested: &[String]) -> Value {
+    let table = method_table();
+    let unknown: Vec<&String> = requested
+        .iter()
+        .filter(|name| !table.iter().any(|(known, _)| *known == name.as_str()))
+        .collect();
+    if !unknown.is_empty() {
+        eprintln!("[spawn-matrix] unknown methods: {unknown:?} (nothing was attempted)");
+        return json!({
+            "marker_dir": marker_dir,
+            "pid": std::process::id(),
+            "attempts": [],
+            "methods_missing": requested,
+            "unknown_methods": unknown,
+        });
+    }
+
+    // **落とす経路が混ざっていることを先に言う。** 報告が出ないまま終わった回に、
+    // 「なぜ消えたのか」が足跡だけで読めるようにするため（`B-10`: 失敗を黙らせない）。
+    for crashing in CRASHES_THE_PROBE {
+        if requested.iter().any(|r| r == crashing) {
+            eprintln!(
+                "[spawn-matrix] note: {crashing} crashes this process inside the OS \
+                 (see plans/mac-spike/RESULTS.md S61); the report may never be printed"
+            );
+        }
+    }
+
     let mut attempts = Vec::new();
-    for (index, attempt) in [
-        via_create_process_w as fn(&str) -> Value,
-        via_create_process_a,
-        via_win_exec,
-        via_create_process_as_user_w,
-        via_shell_execute_ex_w,
-        via_nt_create_user_process,
-        via_wmi,
-        via_task_scheduler,
-    ]
-    .into_iter()
-    .enumerate()
+    for (name, attempt) in table
+        .iter()
+        .filter(|(name, _)| requested.iter().any(|r| r == name))
     {
-        eprintln!("[spawn-matrix] starting {}", METHODS[index]);
+        eprintln!("[spawn-matrix] starting {name}");
         let value = attempt(marker_dir);
-        eprintln!("[spawn-matrix] finished {}: {value}", METHODS[index]);
+        eprintln!("[spawn-matrix] finished {name}: {value}");
         attempts.push(value);
     }
-    // `METHODS`はドライバ側の期待リストと綴りを合わせるための契約（B-05）。ここで
-    // 「宣言した経路を全部試したか」を自分で検算する——1つ書き忘れても実行時には
-    // 何も起きず、ドライバ側では「その経路は拒否された」に見えてしまうため。
-    let missing: Vec<&&str> = METHODS
+    // **頼まれた経路を全部試したか**を自分で検算する——1つ落としても実行時には何も
+    // 起きず、ドライバ側では「その経路は拒否された」に見えてしまうため。
+    let missing: Vec<&String> = requested
         .iter()
         .filter(|method| {
             !attempts
                 .iter()
-                .any(|a| a.get("method").and_then(Value::as_str) == Some(**method))
+                .any(|a| a.get("method").and_then(Value::as_str) == Some(method.as_str()))
         })
         .collect();
     json!({
         "marker_dir": marker_dir,
         "pid": std::process::id(),
+        "requested": requested,
         "attempts": attempts,
         "methods_missing": missing,
+        "unknown_methods": [],
     })
+}
+
+/// 宣言された経路を**全部**試す。
+///
+/// **`taskscheduler`を含むので、この呼び方は落ちうる**（[`CRASHES_THE_PROBE`]）。
+/// 報告を読みたい測定は[`run_selected`]で経路を分けて撃つこと。
+#[cfg(windows)]
+pub fn run(marker_dir: &str) -> Value {
+    let all: Vec<String> = METHODS.iter().map(|m| (*m).to_string()).collect();
+    run_selected(marker_dir, &all)
 }
 
 #[cfg(not(windows))]
 pub fn run(marker_dir: &str) -> Value {
     json!({"marker_dir": marker_dir, "attempts": [], "error": "windows-only"})
+}
+
+#[cfg(not(windows))]
+pub fn run_selected(marker_dir: &str, _requested: &[String]) -> Value {
+    run(marker_dir)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// **宣言した名前と、実際に走る表が一致すること。**
+    ///
+    /// ドライバ側はこの名前でマーカーを数えるので、ずれると「その経路は拒否された」に
+    /// 見える（`B-05`: 別々に持つ綴りはコンパイラが見張らない）。
+    #[test]
+    fn the_declared_names_and_the_table_agree() {
+        let table: Vec<&str> = method_table().iter().map(|(name, _)| *name).collect();
+        assert_eq!(table, METHODS.to_vec());
+    }
+
+    /// **落とす経路は、宣言した名前の中に在ること。** 綴りが違うと「分けて撃つ」が
+    /// 効かず、分けたつもりで全部撃つことになる。
+    #[test]
+    fn the_crashing_method_is_one_of_the_declared_ones() {
+        for name in CRASHES_THE_PROBE {
+            assert!(METHODS.contains(name), "{name} is not declared");
+        }
+    }
+
+    /// **知らない名前は1本も走らせない**（fail-closed）。黙って無視すると、
+    /// 「その経路は拒否された」と読める報告が出る。
+    #[test]
+    fn an_unknown_method_name_runs_nothing() {
+        let report = run_selected("C:\nowhere", &["nosuchmethod".to_string()]);
+        assert_eq!(report["attempts"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            report["unknown_methods"],
+            serde_json::json!(["nosuchmethod"])
+        );
+    }
 }

@@ -242,6 +242,27 @@ pub(super) fn domain_spec(
     }
 }
 
+/// `--spawn-matrix`を**報告が残る形**で撃つための経路指定（`taskscheduler`を除いた7本）。
+///
+/// # なぜ除くのか
+///
+/// `taskscheduler`の`CoCreateInstance`は、AppContainerの中で`combase.dll`→`ntdll.dll`の
+/// ヒープ経路を壊し、**プローブごと落とす**（OS内部の欠陥。`plans/mac-spike/RESULTS.md`§S61）。
+/// 8本を1回で撃つと、
+///
+/// 1. 落ちた回は**他の7本の報告まで失われる**
+/// 2. しかもその7本の結果は「最後にヒープが壊れたプロセス」が出したものになる
+///
+/// **この的は`taskscheduler`について何も判定していない**（判定は生成できた経路の
+/// マーカーの有無だけ）ので、除いても測るものは1つも減らない。到達性そのものの回帰は
+/// `the_task_scheduler_broker_is_out_of_reach_even_though_it_crashes_the_probe`が別に持つ。
+///
+/// **綴りを間違えたら黙って減らない**——プローブは知らない名前が来たら1本も走らせず
+/// `unknown_methods`へ入れるので、マーカーが1つも生まれずこの的が赤くなる。
+pub(super) const MATRIX_METHODS_WITHOUT_TASKSCHEDULER: &str =
+    "createprocessw,createprocessa,winexec,createprocessasuserw,shellexecuteexw,\
+     ntcreateuserprocess,wmi";
+
 /// Daemonに起こしてもらう1本の指定。
 ///
 /// # なぜ構造体なのか（2026-09-17、段階6f-2）

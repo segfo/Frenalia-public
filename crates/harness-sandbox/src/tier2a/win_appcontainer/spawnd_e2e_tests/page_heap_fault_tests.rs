@@ -11,6 +11,11 @@
 //!   Page Heap(Full)  : 破壊した瞬間に番兵ページを踏む → ただのアクセス違反 → VEHが記録できる
 //! ```
 //!
+//! **この的が答えを出した**（2026-09-18、`plans/mac-spike/RESULTS.md`§S61）——落ちるのは
+//! `taskscheduler`のCOM活性化の中で、原因は**OS内部の欠陥**だった。直せないので
+//! 「踏まない」形にしてある（他の的は`taskscheduler`を外して撃つ）。
+//! **この的だけは8経路とも撃つ**——落ちること自体が測定対象だからである。
+//!
 //! `fail-fast`は「誰にも捕まえさせず即死させる」Windowsの仕組みで、例外ハンドラを飛び越える。
 //! だから**VEH（例外を横取りするハンドラ）だけでは捕まらない**。Page Heap(Full)が
 //! 「捕まえられない即死」を「正確な場所での、捕まえられるアクセス違反」へ変えて初めて、
@@ -182,7 +187,9 @@ fn the_spawn_matrix_under_page_heap_records_where_it_faults() {
         );
         engaged_anywhere = true;
 
-        // --- (2) 本番の測定。8経路を撃たせ、落ちたなら場所を記録させる。
+        // --- (2) 本番の測定。**ここだけは経路を絞らず8本とも撃つ**——他の的が
+        // `taskscheduler`を外すのは報告を守るためだが、こちらは**落ちること自体が測定対象**
+        // なので外したら何も測れない（`MATRIX_METHODS_WITHOUT_TASKSCHEDULER`のdocと対）。
         let marker_dir = workspace.join("spawn-markers");
         std::fs::create_dir_all(&marker_dir).expect("marker dir");
         let marker_str = marker_dir.to_string_lossy().into_owned();

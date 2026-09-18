@@ -28,22 +28,20 @@
 //! **それが正しい**（D-01: フックは境界ではない）——だから「宣言した回でも、この経路の
 //! マーカーは生まれない」ことを同じ測定の中で見る。
 //!
-//! # 判定に**プローブ自身の報告を使わない**（計器の既知の不安定）
+//! # 判定に**プローブ自身の報告を使わない**（合否はマーカーの有無だけ）
 //!
-//! `--spawn-matrix`のプローブは、AppContainerの中で**ときどき最後に落ちる**
-//! （`0xC0000374`＝ヒープ破壊。2026-09-17に確認）。**段階6f-2が持ち込んだものではない**
-//! ——注入を1つも行わない段階⑤の腕でも出るし、**この回の変更を全部外した基準線でも出る**
-//! （`git stash`して測り直した）。落ちるのは8経路すべてを試し終えた後なので、
-//! **マーカーは全部書かれている。**
+//! `--spawn-matrix`のプローブは、AppContainerの中で落ちることがある
+//! （`0xC0000374`＝ヒープ破壊）。**落ちる場所は特定済み**で、`taskscheduler`の
+//! COM活性化の中である——`combase.dll`→`ntdll.dll`のヒープ経路が解放済み／範囲外を読む
+//! **OS内部の欠陥**で、こちら側では直せない（`plans/mac-spike/RESULTS.md`§S61）。
 //!
-//! だから合否は**マーカーの有無だけ**で決める——プローブの報告（標準出力のJSON）は
-//! 落ちた回には出ないので、そこに合否を預けると計器の不安定がそのまま赤になる。
+//! **だからこの的は`taskscheduler`を外して撃つ**（`MATRIX_METHODS_WITHOUT_TASKSCHEDULER`）。
+//! 外しても測るものは1つも減らない——ここが見るのはフックを通る4本と
+//! `ntcreateuserprocess`だけである。到達性そのものの回帰は
+//! `child_process_restricted_tests`の専用の1本が持つ。
 //!
-//! **2026-09-18、落ちる場所は特定した**（`page_heap_fault_tests`。Page Heap(Full)の下で
-//! 測ると、**タスクスケジューラのCOM活性化の中**で`combase.dll`→`ntdll.dll`のヒープ経路が
-//! 解放済み／範囲外を読んでいる。プローブ自身のコードはスタックに無い）。
-//! **ただし元の`0xC0000374`と同じ欠陥かは未証明**なので、ここの判定は変えない。
-//! 記録は`docs/STATUS.md`の残課題#52と`plans/mac-spike/RESULTS.md`§S61にある。
+//! それでも合否は**マーカーの有無だけ**で決める。プローブの報告（標準出力のJSON）は
+//! 落ちた回には出ないので、そこに合否を預けると計器の事情がそのまま赤になる。
 //!
 //! # ここで測っていないもの（**limitation**）
 //!
@@ -212,7 +210,16 @@ fn the_hook_asks_the_daemon_only_when_the_kernel_blocks_creation() {
             &case,
             &profile,
             &caps,
-            &["--spawn-matrix", &marker_str, "--timeout-secs", "60"],
+            &[
+                "--spawn-matrix",
+                &marker_str,
+                // **`taskscheduler`を外して撃つ**（`MATRIX_METHODS_WITHOUT_TASKSCHEDULER`のdoc）。
+                // この的が見るのはフックを通る4本と`ntcreateuserprocess`だけである。
+                "--spawn-matrix-methods",
+                super::MATRIX_METHODS_WITHOUT_TASKSCHEDULER,
+                "--timeout-secs",
+                "60",
+            ],
         );
         eprintln!("[6f-2 {}] stdout={out}\nstderr={err}", arm.label);
         let markers = markers_written(&marker_dir);
