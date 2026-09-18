@@ -128,6 +128,62 @@ fn run_probe(
     (out, err, code)
 }
 
+/// **見張りが鳴ったときに出す文面。**
+///
+/// # なぜ関数に切り出してあるのか
+///
+/// この文面は**数年後に、経緯を何も知らない人が1回だけ読む**。そのとき読み手にはまず
+/// 「テストが壊れた」に見えるが、**実際は逆（直った合図）である**。だから
+/// 「何が起きたか」「なぜ嬉しいのか」「次に何をするか」を、**略さず・記号に頼らず**書く。
+/// `assert!`の中へ直に書くと行継続で読みにくく、書き足すときに削られやすい。
+fn os_bug_may_be_fixed_message(stderr: &str) -> String {
+    // **1行ずつの配列で持つ。** 文字列の行継続（`\`）は次の行の**行頭の空白を食う**ので、
+    // 箇条書きの字下げが黙って消える（実際に消して読みにくくなった）。
+    let lines = [
+        "",
+        "========================================================================",
+        " これはテストの失敗ではなく、**朗報の可能性**です。",
+        " **OS側のバグが直ったようなので、暫定対応の撤収を検討してください。**",
+        "========================================================================",
+        "",
+        "【何が起きていたか】",
+        "  Windowsのタスクスケジューラのサービスへ繋ぎにいく処理（COMの活性化）に、",
+        "  AppContainer（サンドボックス）の中で ヒープ（メモリの確保/解放を管理する領域）を",
+        "  壊す欠陥がありました。壊すのはOSの中のコード（combase.dll → ntdll.dll）で、",
+        "  このリポジトリのコードはスタックに1行も出てきません。つまり「こちらでは直せない」",
+        "  ものでした（2026-09-18に特定）。",
+        "",
+        "【いま何が変わったか】",
+        "  その経路は今まで必ず落ちていたので、プローブの足跡は",
+        "  `starting taskscheduler` で止まっていました。今回はその先の",
+        "  `finished taskscheduler` まで進んでいます ＝ 落ちなくなった、ということです。",
+        "",
+        "【次にすること】",
+        "  1. もう一度この的を撃ってください:",
+        "       target\\debug\\dev-elevated-run.exe spawn-daemon-pageheap",
+        "     「必ず落ちる」の根拠は4回の観測しかないので、1回では断定しません。",
+        "",
+        "  2. 再現したら、「直せないから踏まないようにしていた迂回」を撤去します:",
+        "       - crates/tier2a-proc-probe/src/spawn_matrix.rs",
+        "           CRASHES_THE_PROBE",
+        "       - crates/harness-sandbox/src/tier2a/win_appcontainer/spawnd_e2e_tests.rs",
+        "           MATRIX_METHODS_WITHOUT_TASKSCHEDULER と、それを渡している2箇所",
+        "           (child_process_restricted_tests.rs / transparent_hook_tests.rs)",
+        "       - crates/harness-sandbox/.../spawnd_e2e_tests/child_process_restricted_tests.rs",
+        "           the_task_scheduler_broker_is_out_of_reach_even_though_it_crashes_the_probe",
+        "           が置いている「落ちてもよい」という前提",
+        "       - crates/dev-elevated-runner/src/lib.rs",
+        "           spawn-daemon-pageheap の項と、spawn-daemon 側の --skip 2行",
+        "           (＝この的を受け入れへ畳む)",
+        "       - docs/STATUS.md の残課題#52",
+        "",
+        "  3. 経緯の全文は plans/mac-spike/RESULTS.md の §S61 にあります。",
+        "",
+        "【この回の足跡】",
+    ];
+    format!("{}\n{stderr}\n", lines.join("\n"))
+}
+
 /// 記録が在れば標準エラーへ丸ごと写す。**在っても赤くしない**——記録が出ることが
 /// この測定の成果であって、合否ではない。
 fn dump_fault_log(tag: &str, path: &std::path::Path) -> Option<String> {
@@ -232,13 +288,8 @@ fn the_spawn_matrix_under_page_heap_records_where_it_faults() {
         );
         assert!(
             !err.contains("[spawn-matrix] finished taskscheduler"),
-            "**OS側が直った可能性がある。** Page Heapの下でこの経路が落ちなくなった\
-             （`finished taskscheduler`が出た）。標本は4回なので**まず もう一度撃って再現を確かめる**こと。\
-             再現したら暫定対応を撤去する——(1) `spawn_matrix`の`CRASHES_THE_PROBE`、\
-             (2) `MATRIX_METHODS_WITHOUT_TASKSCHEDULER`とその2箇所の呼び出し、\
-             (3) `the_task_scheduler_broker_is_out_of_reach_even_though_it_crashes_the_probe`の\
-             『落ちてもよい』という前提、(4) `docs/STATUS.md`残課題#52。\
-             stderr={err}"
+            "{}",
+            os_bug_may_be_fixed_message(&err)
         );
 
         let mut markers: Vec<String> = std::fs::read_dir(&marker_dir)
