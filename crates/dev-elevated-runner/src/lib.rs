@@ -117,6 +117,24 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "enforcing_transitions_denies_undeclared_programs_and_tells_the_model_how_to_fix_it",
         ],
     ),
+    // [残課題#39] 敵対的な`.git/config`に仕掛けられた発火（`diff.external`、BUG-150）を、
+    // 遷移MACが止められるかを実機で測る。宣言を0本から1つずつ足していき、**どこまで許すと
+    // 発火まで届くか**を数える（鎖の段数は決め打ちしない）。1回の起動で複数のTier2aセッションを
+    // 作るので、`e2e-transition-enforced`とは別の的にしてある（1要素＝1測定）。
+    (
+        "e2e-git-config-transition",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "a_git_config_trap_cannot_reach_its_program_when_transitions_are_enforced",
+        ],
+    ),
     // N8-③-C-WFP: 生TCPの445が本番Tier2aのWFP適用下でも塞がるかを測る
     // （`plans/net-spike/RESULTS.md` N8-③-C）。`e2e-net-matrix`とは別に置くのは、
     // 行列全体を回さずこの1件だけを撃てるようにするため（1要素＝1測定）。

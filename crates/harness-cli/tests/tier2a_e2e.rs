@@ -5807,22 +5807,48 @@ fn run_transition_arm(ws: &Path, case_name: &str) -> Result<String, String> {
     Ok(text)
 }
 
-/// 宣言を1本だけ持つ`policy.json`をワークスペースへ置く。
+/// 宣言を`exes`本だけ持つ`policy.json`をワークスペースへ置く。
+///
+/// **空を渡したら`policy.json`ごと消す。** 「宣言が0本のファイル」と「ファイルが無い」を
+/// 同じ入口で表せるようにするためで、残課題#39の測定が**宣言を1本ずつ足していく**形を
+/// 採っている（0本から始まる）。空の`transitions`を書いて「0本を宣言した」ことにすると、
+/// 編集時検査の対象が増えるだけで得が無い。
 ///
 /// **入口ドメインの名前は`harness-policy`の定数から取る**——綴りを写すと、
 /// あちらが変わった日にこのテストだけが「宣言していない」状態で緑になる（`B-13`）。
-fn declare_one_program(ws: &Path, exe: &str) -> Result<(), String> {
+fn declare_programs(ws: &Path, exes: &[String]) -> Result<(), String> {
+    if exes.is_empty() {
+        // 置き場は`harness-policy`に聞く（綴りを写さない。`B-05`）。
+        let path = harness_policy::policy_file::path(ws);
+        match std::fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("policy.jsonを消せない（{}）: {e}", path.display())),
+        }
+    }
+    // **同じ綴りを2本書かない。** 重複した辺は編集時検査を通らず、`policy.json`が
+    // まるごと効かなくなる——症状は「宣言したのに断られる」で、宣言側を疑いにくい
+    // （2026-09-18に踏んだ。待ち行列の更新行をそのまま足していた）。
+    for (i, exe) in exes.iter().enumerate() {
+        if exes[..i].iter().any(|d| d.eq_ignore_ascii_case(exe)) {
+            return Err(format!("宣言に同じ綴りが2本ある: {exe}"));
+        }
+    }
     let mut file = harness_policy::policy_file::PolicyFile::default();
     let mut domain =
         harness_policy::policy_file::PolicyDomain::new(harness_policy::policy_file::ENTRY_DOMAIN);
-    domain.process = serde_json::from_value(serde_json::json!({
-        "transitions": [{
-            "exe": { "literal": exe },
-            "argv": { "any": true },
-            "to": harness_policy::policy_file::ENTRY_DOMAIN,
-        }]
-    }))
-    .map_err(|e| format!("遷移の宣言が組めない: {e}"))?;
+    let edges: Vec<serde_json::Value> = exes
+        .iter()
+        .map(|exe| {
+            serde_json::json!({
+                "exe": { "literal": exe },
+                "argv": { "any": true },
+                "to": harness_policy::policy_file::ENTRY_DOMAIN,
+            })
+        })
+        .collect();
+    domain.process = serde_json::from_value(serde_json::json!({ "transitions": edges }))
+        .map_err(|e| format!("遷移の宣言が組めない: {e}"))?;
     file.domains.push(domain);
     harness_policy::policy_file::save(ws, &file).map_err(|e| format!("policy.jsonを書けない: {e}"))
 }
@@ -5908,7 +5934,7 @@ fn enforcing_transitions_denies_undeclared_programs_and_tells_the_model_how_to_f
     }
 
     // --- 腕2: 同じコマンドを、宣言してから撃つ ---
-    declare_one_program(&ws, &system_findstr_exe())
+    declare_programs(&ws, &[system_findstr_exe()])
         .unwrap_or_else(|e| panic!("腕2の宣言を書けなかった: {e}"));
     let allowed = run_transition_arm(&ws, "transition-enforced-allow")
         .unwrap_or_else(|e| panic!("腕2（宣言あり）が測れなかった: {e}"));
@@ -5939,6 +5965,388 @@ fn enforcing_transitions_denies_undeclared_programs_and_tells_the_model_how_to_f
     assert!(
         failures.is_empty(),
         "遷移MACの強制（製品経路）:\n{}",
+        failures.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// [残課題#39] `.git/config`に仕掛けられた発火を、遷移MACは止められるのか
+// ---------------------------------------------------------------------------
+
+/// **仕掛けが起きた**ことの印。`findstr.exe`が自分で出す接頭辞で、**大文字である**。
+///
+/// # なぜこの文字列なら反射に当たらないのか
+///
+/// §S63で1度踏んだ——計器が自分の入力を映す形である。ここで入力になり得るのは2つで、
+/// どちらもこの印を含まない。
+///
+/// | 何が反射し得るか | 何を映すか | `FINDSTR:`を含むか |
+/// |---|---|---|
+/// | PowerShellのエラー本文 | モデルが撃ったコマンド行（`git -c safe.directory=* diff`） | 含まない |
+/// | gitの起動失敗メッセージ | `.git/config`の値（`C:/Windows/System32/findstr.exe`） | **含まない**（小文字） |
+///
+/// 照合は大小を区別する（`contains`）。小文字の`findstr.exe`に当たらないのが要である。
+const GIT_TRAP_RAN_MARKER: &str = "FINDSTR:";
+
+/// **仕掛けが止められた**ことの印。フックがDaemonへ頼んで断られたときの値
+/// （`ERROR_ACCESS_DENIED`。§10.1.2「4つの原因に4つの値」）。
+const GIT_TRAP_DENIED_MARKER: &str = "Access is denied";
+
+/// モデルへ渡す台本。**全腕で同じ1手**にする（変えるのは`policy.json`と旗だけ）。
+///
+/// `-c safe.directory=*`が要るのは、ワークスペースを作るのが昇格したテストプロセスで、
+/// サンドボックスの中のgitから見ると所有者が違うためである（既存の`GIT_INJECTION_SCRIPT`が
+/// 同じ理由で同じ指定を使っている）。**危険構文検出には掛からない**——
+/// `harness-engine`の`looks_like_allowlist_bypass`が見るのは`cmd /c`・`sh -c`・
+/// `start-process`等で、この綴りはどれも含まない（含むと、サンドボックスへ届く前に
+/// 止まって「遷移が断られた」と区別が付かなくなる）。
+///
+/// # なぜ`--no-index`なのか（素の`git diff`ではなく）
+///
+/// **素の`git diff`は、比べる元の版を一時ファイルへ書き出してから外部diffを起こす。**
+/// その一時ファイルが、Daemon経由で起こした子では作れない——`TEMP`がAppContainerの
+/// 置き換えを**二重に**受けて存在しないパスになるためである（[BUG-160](../../../docs/bugs/BUG-160.md)）。
+///
+/// つまり素の`git diff`で測ると、鎖の3段目が**遷移MACではなくBUG-160で止まる**。
+/// `--no-index`はワークツリーの実ファイル同士を比べるので一時ファイルが要らず、
+/// **止めているのが遷移MACだけになる**。BUG-160が直った日に素の`git diff`へ戻してよい。
+const GIT_TRAP_SCRIPT: &str = "git -c safe.directory=* diff --no-index a.txt b.txt";
+
+/// 仕掛けが起こすプログラム。**System32の実体**を`.git/config`から名指しする。
+///
+/// # 攻撃者が現実に選べるものは、これしかない（2026-09-18に2つ潰して分かった）
+///
+/// [BUG-150](../../../docs/bugs/BUG-150.md)が実測した綴りは`touch HIT #`だが、**その形は
+/// Tier2aの中では遷移MACが無くても動かない**。潰れ方が2通りあり、どちらも別の機構による。
+///
+/// | 攻撃者が選びそうなもの | Tier2aの中で何が起きるか | 誰が止めているか |
+/// |---|---|---|
+/// | `touch HIT #`（シェル経由） | gitが`sh.exe -c`で包む→**`0xC0000142`（DLL初期化失敗）で即死** | msys2がAppContainerで動かない（**偶然**） |
+/// | リポジトリ同梱の`.bat`／`.exe` | `Access is denied`で起動できない | ワークスペースの実行ACE（**設計**） |
+/// | **System32の実体** | **起動する** | ——（ここが遷移MACの出番） |
+///
+/// **動かない道具で測ると、遷移MACではなく別の事故を測ることになる。** だから残った1つ、
+/// つまり**攻撃者にとっていちばん強い選択肢**で測る。
+///
+/// # 綴りに空白を入れない
+///
+/// gitは値に空白や記号があると`sh.exe -c`で包み、包まれた瞬間に上の即死へ落ちる。
+/// **1語・空白なし**にしてgitに直接起こさせる（段階0で`start_command`が1本になることを確認）。
+/// 区切りが`/`なのは、gitの設定ファイルが`\`をエスケープ記号として読むためである
+/// （`C:\Windows\...`と書くと`bad config line`で落ちる。2026-09-18に踏んだ）。
+fn git_trap_payload() -> String {
+    system_findstr_exe().replace('\\', "/")
+}
+
+/// 鎖を辿る上限。**無限に回さないための歯止め**であって、鎖の長さの予想ではない。
+///
+/// 鎖が何段あるかは**測ってから分かること**なので決め打ちしない——`.git/config`の発火は
+/// gitの版と綴りで段数が変わる。段数を先に書くと、版が変わった日に
+/// 「拒否されたから止まった」と読み違える。
+///
+/// 2026-09-18の実測（Git for Windows 2.51.1）は**3段**だった——
+/// `cmd\git.exe`（中継役）→`mingw64\bin\git.exe`（本体）→`findstr.exe`（仕掛けの指す先）。
+/// **この3は上限ではなく観測値である**（§S64）。
+const GIT_TRAP_MAX_HOPS: usize = 8;
+
+/// **敵対的なリポジトリをcloneした状態**をワークスペースに作る。
+///
+/// # なぜ`run_shell`経由で書かないのか
+///
+/// 脅威モデルは「攻撃者が書いた`.git/config`を持つリポジトリを取ってきた」である。
+/// `run_shell`経由の`.git/config`書込そのものは2026-09-04にユーザーが受容済みで
+/// （`docs/bugs/BUG-150.md`の案C）、**この回で測り直す対象ではない**。
+fn plant_git_config_trap(ws: &Path) -> Result<(), String> {
+    let payload = git_trap_payload();
+    if payload.contains(' ') {
+        return Err(format!(
+            "仕掛けの綴りに空白がある（{payload}）。gitは空白のある値を`sh.exe -c`で包んで\
+             起こすので、仕掛けがmsys2の即死へ落ちて**発火しなくなる**——拒否と区別が付かない"
+        ));
+    }
+    git_seed_repo(ws)?;
+    // 比べる2ファイル。**中身が違っていないと外部diffは1度も起きない**——起きなければ、
+    // 旗を立てた腕の「発火しなかった」が拒否の証拠にならない。
+    std::fs::write(ws.join("a.txt"), "one\n").map_err(|e| format!("a.txtを置けない: {e}"))?;
+    std::fs::write(ws.join("b.txt"), "two\n").map_err(|e| format!("b.txtを置けない: {e}"))?;
+
+    let config = ws.join(".git").join("config");
+    let mut text = std::fs::read_to_string(&config)
+        .map_err(|e| format!(".git/configを読めない（{}）: {e}", config.display()))?;
+    text.push_str(&format!("[diff]\n\texternal = {payload}\n"));
+    std::fs::write(&config, text).map_err(|e| format!(".git/configへ書けない: {e}"))
+}
+
+/// 1腕撃った結果。
+struct GitTrapArm {
+    /// 仕掛けの指すプログラムが**実際に走ったか**（[`GIT_TRAP_RAN_MARKER`]）。
+    fired: bool,
+    /// 起動そのものが**断られたか**（[`GIT_TRAP_DENIED_MARKER`]）。
+    ///
+    /// `fired`の否定ではない。**両方偽**なら「起きなかったが、断られてもいない」で、
+    /// それは仕掛けが発火していない（測定が無効）ことの印である。
+    refused: bool,
+    /// `run_shell`が返した本文（拒否の注記を含む）。
+    text: String,
+    /// この腕で**Daemonが**断った実行ファイル。
+    denied_by_daemon: Vec<String>,
+    /// この腕で**カーネルが**止めた実行ファイル。**今日は購読者が居ないので常に空**
+    /// （`harness-sandbox`の`spawnd/transitions.rs`モジュールdoc）。
+    /// 空でない日は購読者が入った日であり、そのときは§10.2を読み直すこと。
+    denied_by_kernel: Vec<String>,
+}
+
+/// 旗の有無だけを変えて1腕撃つ。
+///
+/// **待ち行列は撃つ前に消す。** 残したまま撃つと、前の腕の拒否を今の腕の結果として
+/// 数える（`B-35`の対を取る測定で、いちばん静かに壊れる形）。
+fn run_git_trap_arm(ws: &Path, case_name: &str, enforce: bool) -> Result<GitTrapArm, String> {
+    use harness_sandbox::tier2a::spawnd::transitions::{pending_path, read_from, PendingRecord};
+
+    let queue = pending_path(ws);
+    let _ = std::fs::remove_file(&queue);
+
+    let mut args: Vec<&str> = vec!["--sandbox", "tier2a"];
+    if enforce {
+        args.push("--enforce-transitions");
+    }
+    let run = run_harness(ws, &run_shell_script_turns(GIT_TRAP_SCRIPT), &args, case_name);
+    if !run.status.success() {
+        return Err(format!(
+            "harness itself failed to run ({}). **拒否ではなく起動の失敗である**: {}",
+            run.status, run.stderr
+        ));
+    }
+    if enforce {
+        // 窓口（`can_run_program`）は強制が効いている回にだけモデルへ見える（3条件、段階6e）。
+        assert_prompt_sane(&run, &["can_run_program"])?;
+    }
+    let outcome = parse_json_stdout(&run)?;
+    let text = outcome.first_tool_result()?.to_string();
+
+    let tail = read_from(&queue, 0);
+    let mut denied_by_daemon = Vec::new();
+    let mut denied_by_kernel = Vec::new();
+    for record in &tail.records {
+        match record {
+            PendingRecord::DeniedByDaemon(d) => denied_by_daemon.push(d.exe.clone()),
+            PendingRecord::DeniedByKernel(d) => denied_by_kernel.push(d.exe.clone()),
+            // **あふれたら測定を無効にする**（`B-10`）。鎖の一覧が欠けたまま
+            // 「これで全部だ」と読まれるのがいちばん高くつく。
+            PendingRecord::Overflowed { dropped, .. } => {
+                return Err(format!(
+                    "{case_name}: 待ち行列が{dropped}件あふれた。**断られた一覧が欠けている**\
+                     ので、この腕の結果は使えない"
+                ));
+            }
+        }
+    }
+    if tail.skipped > 0 {
+        return Err(format!(
+            "{case_name}: 待ち行列の{}行が解析できなかった。断られた一覧が欠けている",
+            tail.skipped
+        ));
+    }
+
+    let fired = text.contains(GIT_TRAP_RAN_MARKER);
+    let refused = text.contains(GIT_TRAP_DENIED_MARKER);
+    eprintln!(
+        "[git-trap] --- {case_name} (enforce={enforce}) ---\n\
+         fired={fired} refused={refused} denied_by_daemon={denied_by_daemon:?} \
+         denied_by_kernel={denied_by_kernel:?}\n{text}\n[git-trap] --- end ---"
+    );
+    Ok(GitTrapArm {
+        fired,
+        refused,
+        text,
+        denied_by_daemon,
+        denied_by_kernel,
+    })
+}
+
+/// **残課題#39の測定**: 敵対的な`.git/config`に仕掛けられた発火は、遷移MACを積んだ
+/// セッションで**目的のプログラムまで届かない**。宣言を足していけば届くようになる。
+///
+/// # 何を測っているのか（**「gitを禁止できるか」ではない**）
+///
+/// gitを1本も宣言しなければgitは起動しない。それは自明で、何の役にも立たない。
+/// 本題は**gitを許したうえで、その先を止められるか**である。だから宣言を0本から始めて、
+/// **断られたものを1つずつ足しながら、どこまで行ったら発火するか**を数える。
+///
+/// # 段数を決め打ちしない理由
+///
+/// 発火の鎖が何段あるかは、gitの版と`.git/config`の綴りで変わる。段数を先に書くと、
+/// 版が変わった日に「拒否されたから止まった」と読み違える（実際には鎖が1段伸びただけ）。
+/// **計器が自分で鎖の深さを測る**形にしてある。
+///
+/// # 対で撃つ理由（`B-35`）
+///
+/// 腕Aだけだと「遷移MACが何もしていない」構成でも緑になり、拒否側だけだと
+/// 「全部断る」実装でも緑になる。**旗を立てない腕Aで罠が発火すること**と、
+/// **全部宣言した段で発火すること**の両方を要求する。
+///
+/// # ここで測っていないもの（**外挿しないこと**）
+///
+/// - **遷移の鎖（別ドメインへ渡る形）**。今日は遷移先を別ドメインにできない（残課題#45）ので、
+///   測れているのは**同じドメインの中での許否**までである
+/// - **`diff.external`以外の発火キー**（`core.editor`・`core.sshCommand`・`alias.*`…。
+///   `docs/bugs/BUG-150.md`が14件挙げている）。遷移MACから見れば同じ1経路だが、**測っていない**
+/// - **CoWモード（`--sandbox tier2a-cow`）との組み合わせ**
+#[test]
+#[ignore = "starts several real Tier2a sessions with the transition MAC enforced; run through dev-elevated-run"]
+fn a_git_config_trap_cannot_reach_its_program_when_transitions_are_enforced() {
+    let ws = case_dir("git-config-transition");
+    plant_git_config_trap(&ws).unwrap_or_else(|e| panic!("仕掛けを置けなかった: {e}"));
+
+    let mut case_names: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    // --- 腕A: 旗を立てない。**罠が作動することの確認**（計器の検算） ---
+    case_names.push("git-trap-unenforced".to_string());
+    let unenforced = run_git_trap_arm(&ws, "git-trap-unenforced", false)
+        .unwrap_or_else(|e| panic!("腕A（旗なし）が測れなかった: {e}"));
+    assert!(
+        unenforced.fired,
+        "腕A: 旗を立てていないのに仕掛けが発火しなかった。**この測定は無効である**\
+         ——以後の腕の「発火しなかった」を拒否の証拠にできない（gitがサンドボックスへ\
+         届いていない／差分が無い／仕掛けの綴りが`sh.exe`経由になった、のどれか）。\
+         run_shellの本文:\n{}",
+        unenforced.text
+    );
+    assert!(
+        !unenforced.refused,
+        "腕A: 旗を立てていないのに起動が断られている。**遷移MAC以外の何かが止めている**ので、\
+         以後の腕で「断られた」を遷移MACの成果として数えられない。run_shellの本文:\n{}",
+        unenforced.text
+    );
+
+    // --- 旗を立てて、断られたものを1つずつ宣言していく ---
+    let mut declared: Vec<String> = Vec::new();
+    let mut chain: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut fired_at: Option<usize> = None;
+
+    for hop in 0..GIT_TRAP_MAX_HOPS {
+        declare_programs(&ws, &declared)
+            .unwrap_or_else(|e| panic!("段{hop}の宣言を書けなかった: {e}"));
+        let case_name = format!("git-trap-hop{hop}");
+        case_names.push(case_name.clone());
+        let arm = run_git_trap_arm(&ws, &case_name, true)
+            .unwrap_or_else(|e| panic!("段{hop}が測れなかった: {e}"));
+
+        if hop == 0 {
+            // **ここが残課題#39の答えである**——何も宣言していない状態では仕掛けは動かない。
+            if arm.fired {
+                failures.push(
+                    "段0: 宣言が1本も無いのに**仕掛けが発火した**。遷移MACは`.git/config`から\
+                     発火した子を無力化できていない（生成禁止が積まれていないか、\
+                     フックもカーネルも生成を止めていない）"
+                        .to_string(),
+                );
+            }
+            if !arm.refused {
+                failures.push(format!(
+                    "段0: 発火はしていないが、**断られてもいない**。フックがDaemonへ頼んで\
+                     断られたなら`{GIT_TRAP_DENIED_MARKER}`が返るはずである\
+                     （§10.1.2「4つの原因に4つの値」）: {}",
+                    arm.text
+                ));
+            }
+            if !arm.text.contains("[transition:") {
+                failures.push(format!(
+                    "段0: 断られたのに**注記が出ていない**。モデルには生のエラーしか届かず、\
+                     宣言の直し方へ辿り着けない（段階6f-3の配線）: {}",
+                    arm.text
+                ));
+            }
+            if !arm.text.contains("can_run_program") {
+                failures.push(
+                    "段0: 注記が窓口（`can_run_program`）を案内していない".to_string(),
+                );
+            }
+            if !arm.text.contains("powershell5.1(Tier2a)") {
+                failures.push(format!(
+                    "段0: シェルが`powershell5.1(Tier2a)`ではない。生成禁止を積む回は\
+                     ストアの実行エイリアスを候補から外す規則（残課題#50・§S62）が効いていない: {}",
+                    arm.text
+                ));
+            }
+        }
+
+        if arm.fired {
+            fired_at = Some(hop);
+            break;
+        }
+
+        if !arm.denied_by_kernel.is_empty() {
+            // **これは失敗ではない。** 購読者が入った日に初めて現れる行で、現れたら§10.2を読み直す。
+            eprintln!(
+                "[git-trap] 段{hop}: カーネル拒否の行が現れた（購読者が入った？）: {:?}",
+                arm.denied_by_kernel
+            );
+        }
+
+        // **待ち行列は畳んで読む。** 同じ種類の拒否は「更新行」として何度も追記されるので
+        // （`spawnd/transitions.rs`の`Denial::count`）、そのまま宣言へ足すと同じ辺を
+        // 何本も書くことになる。**重複した辺を持つ`policy.json`は編集時検査を通らず、
+        // 宣言がまるごと効かなくなる**（2026-09-18に踏んだ。段1で「宣言したのに断られる」に見えた）。
+        let mut newly: Vec<String> = Vec::new();
+        for exe in &arm.denied_by_daemon {
+            let known = declared
+                .iter()
+                .chain(newly.iter())
+                .any(|d| d.eq_ignore_ascii_case(exe));
+            if !known {
+                newly.push(exe.clone());
+            }
+        }
+        chain.push((hop, newly.clone()));
+        if newly.is_empty() {
+            failures.push(format!(
+                "段{hop}: 発火は止まったが、**待ち行列に新しい拒否が1件も無い**。\
+                 止めたのがDaemonではない（カーネルが生成そのものを止めたが、\
+                 購読者が居ないので記録に残らない）か、そもそも生成が起きていない。\
+                 ここまでの宣言: {declared:?}／run_shellの本文:\n{}",
+                arm.text
+            ));
+            break;
+        }
+        declared.extend(newly);
+    }
+
+    match fired_at {
+        Some(0) => { /* 上で失敗として積んである */ }
+        Some(_) => { /* 対（許可側）が取れた */ }
+        None => failures.push(format!(
+            "宣言を{}本まで足しても発火しなかった。**対（許可側）が取れていない**——\
+             拒否側だけでは「全部断る」実装でも緑になる（`B-35`）。辿った鎖: {chain:?}",
+            declared.len()
+        )),
+    }
+
+    eprintln!(
+        "[git-trap] ===== 残課題#39の結果 =====\n\
+         旗なしで発火: {}\n\
+         段ごとに断られたもの: {chain:?}\n\
+         発火した段: {fired_at:?}（宣言{}本）\n\
+         [git-trap] ===== ここまで =====",
+        unenforced.fired,
+        declared.len()
+    );
+
+    if failures.is_empty() {
+        let names: Vec<&str> = case_names.iter().map(|s| s.as_str()).collect();
+        for name in &names {
+            cleanup_on_success(&ws, &[], name);
+        }
+    } else {
+        eprintln!(
+            "[git-trap] 失敗したのでワークスペースを {} に残す（調査用）",
+            ws.display()
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "`.git/config`の発火と遷移MAC（残課題#39）:\n{}",
         failures.join("\n")
     );
 }
