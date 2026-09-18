@@ -32,10 +32,7 @@
 //! ので、時期が来て一本化するときは`--skip`の行と専用ターゲットの項を消すだけでよい
 //! （引っ越しは起きない）。
 //!
-//! # この的は「破壊が起きたか」では赤くしない
-//!
-//! 破壊は**出ないこともある**——Page Heapはヒープの配置を変えるので、配置に依存するバグは
-//! 消える。赤くするのは**測定が成立していないとき**だけである。
+//! # 赤くする条件
 //!
 //! | 赤くする条件 | なぜ |
 //! |---|---|
@@ -43,14 +40,34 @@
 //! | VEHの**受け皿が繋がっていない** | 落ちても記録が残らず、やはり偽の合格になる |
 //! | 生成禁止を積まない腕で**マーカーが1つも生まれない** | プローブが8経路を撃てていない＝そもそも測っていない |
 //! | **撤収に失敗した** | Page Heapがレジストリに載りっぱなしになる |
+//! | **`finished taskscheduler`が出た** | **OS側が直った合図**（下記） |
 //!
 //! 上2つは**同じ1回の測定で見る**（`--fault-self overflow`）——Page Heapが効いていれば
 //! そこで落ち、受け皿が繋がっていればその落下が記録される。
 //!
+//! ## 最後の1行が、**暫定対応の撤去し忘れを止める仕掛け**である
+//!
+//! この経路はPage Heapの下では**必ず落ちる**（実測4/4）。落ちるので、プローブの足跡は
+//! `starting taskscheduler`で止まり、`finished`は**出ない**。
+//!
+//! ```text
+//!   いま        : starting taskscheduler        ← ここで死ぬ
+//!   OS側が直ると: starting taskscheduler
+//!                 finished taskscheduler: …     ← この行が出る = 直った合図
+//! ```
+//!
+//! **その行が出たら赤にする。** 直れば`--spawn-matrix-methods`による経路の使い分けは
+//! 要らなくなるが、**直ったことに誰も気づかなければ暫定対応は残り続ける**。
+//! だから気づきではなく機構で止める（撤去箇所は下の`assert`の文面が持つ）。
+//!
+//! **1回で断定しない。** 決定的とはいえ標本は4回なので、赤くなったら**もう一度撃ち、
+//! 再現してから**撤去する。
+//!
 //! # ここで測っていないもの（**limitation**）
 //!
-//! - **`fail-fast`のままなら1回も記録されない。** 番兵ページを踏む前にアロケータが先に
-//!   気づく形だと、VEHは呼ばれない。そのときこの測定は**空振り**である（赤にはならない）
+//! - **この合図は、この的を撃った人にしか届かない。** 素の（Page Heapを載せない）回は
+//!   今も落ちたり落ちなかったりするので、**受け入れ`spawn-daemon`の側に確実な合図は置けない**
+//!   （「落ちなかった」が正常な回と区別できない）。自動では鳴らない
 //! - **隔離は規約であって機構ではない。** `spawn-daemon`と同時に回せばIFEOは機械全体に
 //!   効くので巻き込む。順に回す前提である
 //! - **場所が分かっても直らない。** これは診断であって修正ではない
@@ -203,6 +220,26 @@ fn the_spawn_matrix_under_page_heap_records_where_it_faults() {
         );
         eprintln!("[pageheap {arm}] spawn-matrix exit={code:#010x}\nstdout={out}\nstderr={err}");
         dump_fault_log(arm, &matrix_log);
+
+        // --- (3) **OS側が直った合図の見張り**（モジュールdocの表の最後の1行）。
+        //
+        // 先に「撃った跡が在ること」を見る——撃つ前に落ちた回は`finished`も出ないので、
+        // 足跡を確かめずに「出ていない＝まだ壊れている」と読むと**永久に鳴らない見張り**になる。
+        assert!(
+            err.contains("[spawn-matrix] starting taskscheduler"),
+            "この経路を撃った跡が無い。跡を確かめずに`finished`の不在を読むと、\
+             見張りが永久に鳴らなくなる。stderr={err}"
+        );
+        assert!(
+            !err.contains("[spawn-matrix] finished taskscheduler"),
+            "**OS側が直った可能性がある。** Page Heapの下でこの経路が落ちなくなった\
+             （`finished taskscheduler`が出た）。標本は4回なので**まず もう一度撃って再現を確かめる**こと。\
+             再現したら暫定対応を撤去する——(1) `spawn_matrix`の`CRASHES_THE_PROBE`、\
+             (2) `MATRIX_METHODS_WITHOUT_TASKSCHEDULER`とその2箇所の呼び出し、\
+             (3) `the_task_scheduler_broker_is_out_of_reach_even_though_it_crashes_the_probe`の\
+             『落ちてもよい』という前提、(4) `docs/STATUS.md`残課題#52。\
+             stderr={err}"
+        );
 
         let mut markers: Vec<String> = std::fs::read_dir(&marker_dir)
             .into_iter()
