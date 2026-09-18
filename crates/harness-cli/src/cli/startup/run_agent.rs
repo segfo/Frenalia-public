@@ -99,8 +99,11 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         // [残課題#50] **姿勢の綴りをここに書かない。** 読む場所が3つに増えた
         // （ここ・ポリシーエディタ・Tier2aのシェルの選び方）ので、
         // 既定を持つのは`PRODUCT_DEFAULT`1箇所だけにしてある。
+        // [⑤'] **このセッションで選ばれた姿勢を読む。** 旗（`--enforce-transitions`）を
+        // 姿勢へ変えるのは`stage_prepare_sandbox`1箇所で、シェルの選び方も同じものを読む
+        // ——ここで旗をもう一度読むと、いつか片方だけ真になる（`B-06`）。
         let child_process_policy =
-            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::PRODUCT_DEFAULT;
+            harness_sandbox::tier2a::spawnd::child_process_policy_for_this_process();
         match harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
             transition_policy,
             child_process_policy,

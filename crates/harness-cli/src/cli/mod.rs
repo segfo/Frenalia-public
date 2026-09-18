@@ -772,6 +772,25 @@ pub(crate) struct Cli {
     #[arg(long = "sandbox", value_enum)]
     sandbox: Option<SandboxChoiceArg>,
 
+    /// **ドメイン遷移MACを強制する**（段階⑤、`plans/DESIGN-MAC-ENFORCEMENT.md` §7・§10.1.2）。
+    /// Tier2aの子へ**子プロセス生成の禁止**（`CHILD_PROCESS_RESTRICTED`。OSが生成そのものを
+    /// 拒否する緩和策）を積み、生成はSpawn Daemonへの依頼に変える。Daemonは
+    /// `.harness/policy.json`の`process`（遷移の宣言）と照合し、**宣言していない組み合わせを
+    /// 断る**。断られた遷移は`run_shell`の出力末尾へ注記され、モデルは`can_run_program`で
+    /// 「いま何を起こせるか」を引けるようになる。
+    ///
+    /// **明示指定時のみ有効なオプトインで、既定の安全策ではない。** 宣言を1本も書いていない
+    /// ワークスペースでこれを立てると、**サンドボックスの中から外部プログラムを1つも
+    /// 起動できない**（シェル自体は起きる）。まず何が断られるかを見てから宣言を書くこと。
+    ///
+    /// **Tier2a以外では意味を持たない**（Daemonが居ない）。指定しても静かに無視される
+    /// のではなく、Daemonを起こさないTierではそもそも生成の窓口が無い。
+    ///
+    /// **この旗は暫定である**——⑤を製品の既定へ入れる日に、既定値を反転して畳む
+    /// （`ChildProcessPolicy::PRODUCT_DEFAULT`のdoc）。
+    #[arg(long = "enforce-transitions", default_value_t = false)]
+    enforce_transitions: bool,
+
     /// ドメイン単位network制御の許可ドメインを追加する（繰り返し指定可、
     /// `*.example.com`形式のサフィックスワイルドカード対応）。
     /// `.harness/settings.json`の`net.allow_domains`と合算する（和集合）。`run_shell`子には既定で

@@ -81,6 +81,23 @@ pub(super) fn stage_prepare_sandbox(
         super::relaunch::wait_for_parent_exit(pid);
     }
 
+    // [⑤'] **旗を姿勢へ変えるのはここ1箇所だけである。**
+    //
+    // **`select_tier`→`preflight`より前でなければならない**——preflightはこの姿勢を見て
+    // Tier2aシェルの候補を決めるからである（生成禁止を積むなら、呼び出し元の中から
+    // 起こせる綴りしか選べない。残課題#50・`plans/mac-spike/RESULTS.md` §S62）。
+    // 後ろへ置くと、**シェルだけが遷移先にできない綴りのまま生成禁止が積まれる**。
+    //
+    // Daemonを起こすときの姿勢も、シェルの候補も、同じ読み口
+    // （`child_process_policy_for_this_process`）を引く。ここで変換を2つ書くと、
+    // いつか片方だけ真になる（`B-06`）。
+    #[cfg(windows)]
+    if cli.enforce_transitions {
+        harness_sandbox::tier2a::spawnd::declare_child_process_policy(
+            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Restricted,
+        );
+    }
+
     // 書込ステージング設定（M10・D-29）。`sandbox_dir`は`session.id()`確定後でなければ組めない
     // ため、ここで`ToolCtx`を構築する。既定（フラグ無指定）を含め`Live`実効時はオーバーレイ
     // 自体を使わない（`sandbox_dir: None`、M9までの直接実FSアクセスとバイト等価・監査ログも

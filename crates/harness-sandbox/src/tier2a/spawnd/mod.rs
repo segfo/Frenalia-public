@@ -413,6 +413,47 @@ pub enum ChildProcessPolicy {
     Restricted,
 }
 
+/// このホストプロセスが選んだ姿勢（[`declare_child_process_policy`]が1回だけ書く）。
+static DECLARED_CHILD_PROCESS_POLICY: std::sync::OnceLock<ChildProcessPolicy> =
+    std::sync::OnceLock::new();
+
+/// **このプロセスの姿勢を宣言する**（最初の宣言が勝ち、勝ったときだけ`true`）。
+///
+/// # なぜプロセス単位なのか（2026-09-18、⑤'の前半）
+///
+/// 姿勢を読む場所が**2種類の時点**に分かれているためである。
+///
+/// | いつ読むか | 誰が | 何に使うか |
+/// |---|---|---|
+/// | **preflightの中**（セッションの準備） | [`crate::tier2a::win_appcontainer::shell_candidates`] | シェルの候補から「遷移先にできない綴り」を外すか（残課題#50・§S62） |
+/// | preflightの後 | Daemonを起こす2つのホスト | Daemonへ渡す姿勢 |
+///
+/// 前者へ引数で届けるには`preflight`の引数を増やすことになり、**呼び出しは68箇所**ある。
+/// したがって「このプロセスは何を選んだか」を1回だけ書いて、両方が同じものを読む形にする。
+///
+/// # 書いてよいのは製品の起動経路1箇所だけである
+///
+/// `OnceLock`はプロセス単位なので、**テストが書くと同じテストバイナリ内の他のテストへ漏れる**
+/// （`B-27`。同じ理由で`SELECTED_SHELL`のdocも書くのを禁じている）。
+/// テストは今までどおり**Daemonを起こすAPIへ姿勢を明示して渡す**こと——
+/// あちらは既定値を持たない形になっている。
+/// 宣言が1箇所であることは`launch.rs`の数え上げテストが固定している。
+pub fn declare_child_process_policy(policy: ChildProcessPolicy) -> bool {
+    DECLARED_CHILD_PROCESS_POLICY.set(policy).is_ok()
+}
+
+/// このプロセスが選んだ姿勢。**宣言が無ければ[`ChildProcessPolicy::PRODUCT_DEFAULT`]**。
+///
+/// **落ち先が既定値なのは、意味のある既定だからである**——宣言しないホスト
+/// （ポリシーエディタ・テスト・サブコマンド）は本当に生成禁止を積まない。
+/// 「選ばせずに黙って決める」形ではない。
+pub fn child_process_policy_for_this_process() -> ChildProcessPolicy {
+    DECLARED_CHILD_PROCESS_POLICY
+        .get()
+        .copied()
+        .unwrap_or(ChildProcessPolicy::PRODUCT_DEFAULT)
+}
+
 impl ChildProcessPolicy {
     /// **製品が選んでいる姿勢。⑤を既定へ入れる回に、この1行だけを変える。**
     ///
@@ -431,7 +472,7 @@ impl ChildProcessPolicy {
     /// # 変えた日に何が赤くなるか
     ///
     /// **綴りを`ChildProcessPolicy::Restricted`にすると、`launch.rs`の数え上げテストが
-    /// 火を噴く**（製品コードにその綴りが0件であることを固定している）。
+    /// 火を噴く**（この定数が素のままであることを固定している）。
     /// それが「既定へ入れる決定をした」印であり、畳み方はそのテストのdocが持つ。
     pub const PRODUCT_DEFAULT: Self = ChildProcessPolicy::Unrestricted;
 

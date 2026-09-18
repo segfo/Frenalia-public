@@ -1964,15 +1964,20 @@ fn shell_candidates_from(
 /// （5.1のパスは実在確認をせずに積む——実在しない機ではプローブが落ちて理由が出る方が、
 /// 候補が0件で「なぜ選べなかったか」が消えるより良い）。
 ///
-/// **姿勢は製品の1箇所から読む**（[`ChildProcessPolicy::PRODUCT_DEFAULT`]）。
-/// ここで`Unrestricted`と書き下すと、⑤を既定へ入れる日に**ここだけ取り残される**
-/// ——そのときサンドボックスの中ではシェルを1本も起こせなくなる（残課題#50）。
+/// **姿勢はこのプロセスが選んだものを読む**
+/// （[`crate::tier2a::spawnd::child_process_policy_for_this_process`]。
+/// 宣言が無ければ`PRODUCT_DEFAULT`）。ここで`Unrestricted`と書き下すと、
+/// 生成禁止を積む回に**ここだけ取り残される**——そのときサンドボックスの中では
+/// シェルを1本も起こせなくなる（残課題#50）。
+///
+/// **読むのはpreflightの中**（`select_shell_by_probe`）なので、宣言はそれより前に
+/// 済んでいなければならない（`declare_child_process_policy`のdocの表）。
 pub(crate) fn shell_candidates() -> ShellChoices {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     shell_candidates_from(
         which::which("pwsh").ok(),
         &system_root,
-        crate::tier2a::spawnd::ChildProcessPolicy::PRODUCT_DEFAULT,
+        crate::tier2a::spawnd::child_process_policy_for_this_process(),
     )
 }
 

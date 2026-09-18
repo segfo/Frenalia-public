@@ -5760,3 +5760,185 @@ fn tier2a_workspace_exec_ace_matrix() {
         failures.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// [⑤'] 遷移MACの強制を、製品の経路で初めて起こす（`--enforce-transitions`）
+// ---------------------------------------------------------------------------
+
+/// この回で起こす「外部プログラム」。
+///
+/// # なぜ`findstr.exe`なのか（`cmd.exe`でも`git`でもなく）
+///
+/// - **System32の実体のexe**なので、AppContainerから確実に読めて実行できる
+///   （`git`はインストール先のACL次第で、「断られた」のか「届かなかった」のかが混ざる）
+/// - **`cmd /c`は使えない。** ツール層の危険構文検出（`harness-engine`の
+///   `looks_like_allowlist_bypass`）が`accept-all`でも拒否するので、
+///   **サンドボックスへ届く前に止まる**——「遷移が断られた」と区別が付かない
+/// - 標準入力から受けた行をそのまま出すので、**印を自分で決められる**
+fn system_findstr_exe() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\findstr.exe")
+}
+
+const TRANSITION_MARKER: &str = "HP_TRANSITION_RAN";
+
+/// 1腕撃って`run_shell`の結果本文を返す。**旗は常に立てる**——立てない側の挙動は
+/// 既存のケースが全部測っている。
+fn run_transition_arm(ws: &Path, case_name: &str) -> Result<String, String> {
+    let script = format!("'{TRANSITION_MARKER}' | findstr.exe HP_TRANSITION");
+    let run = run_harness(
+        ws,
+        &run_shell_script_turns(&script),
+        &["--sandbox", "tier2a", "--enforce-transitions"],
+        case_name,
+    );
+    if !run.status.success() {
+        return Err(format!(
+            "harness itself failed to run ({}). **拒否ではなく起動の失敗である**: {}",
+            run.status, run.stderr
+        ));
+    }
+    // 窓口（`can_run_program`）がモデルへ見えていること。強制が効いている回にだけ出る
+    // （`startup::transition_tool::should_expose`の3条件）。
+    assert_prompt_sane(&run, &["can_run_program"])?;
+    let outcome = parse_json_stdout(&run)?;
+    let text = outcome.first_tool_result()?.to_string();
+    eprintln!("[transition-enforced] --- {case_name} ---\n{text}\n[transition-enforced] --- end ---");
+    Ok(text)
+}
+
+/// 宣言を1本だけ持つ`policy.json`をワークスペースへ置く。
+///
+/// **入口ドメインの名前は`harness-policy`の定数から取る**——綴りを写すと、
+/// あちらが変わった日にこのテストだけが「宣言していない」状態で緑になる（`B-13`）。
+fn declare_one_program(ws: &Path, exe: &str) -> Result<(), String> {
+    let mut file = harness_policy::policy_file::PolicyFile::default();
+    let mut domain =
+        harness_policy::policy_file::PolicyDomain::new(harness_policy::policy_file::ENTRY_DOMAIN);
+    domain.process = serde_json::from_value(serde_json::json!({
+        "transitions": [{
+            "exe": { "literal": exe },
+            "argv": { "any": true },
+            "to": harness_policy::policy_file::ENTRY_DOMAIN,
+        }]
+    }))
+    .map_err(|e| format!("遷移の宣言が組めない: {e}"))?;
+    file.domains.push(domain);
+    harness_policy::policy_file::save(ws, &file).map_err(|e| format!("policy.jsonを書けない: {e}"))
+}
+
+/// **⑤'の測定**: 生成禁止を積んだセッションで、宣言していないプログラムは断られ、
+/// **その事実がモデルへ届く**。宣言すれば同じコマンドが通る。
+///
+/// # 対で撃つ理由（`B-35`）
+///
+/// 腕1だけだと「全部断る」実装で緑になり、腕2だけだと「全部通す」実装で緑になる。
+/// **変えるのは`policy.json`の1行だけ**で、コマンドも旗も同じにする。
+///
+/// # ここでしか見られないもの
+///
+/// - **拒否の注記が製品の経路で出ること**（段階6f-3。単体テストが固定しているのは
+///   注記の組み立てと、それを出すかの真偽値まで）
+/// - **シェルが`powershell5.1(Tier2a)`になっていること**（残課題#50の規則。生成禁止を
+///   積むとストアの実行エイリアスは候補から外れる。単体テストが見ているのは候補の並びまで）
+#[test]
+#[ignore = "starts a real Tier2a session with the transition MAC enforced; run through dev-elevated-run"]
+fn enforcing_transitions_denies_undeclared_programs_and_tells_the_model_how_to_fix_it() {
+    let ws = case_dir("transition-enforced");
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(&ws).expect("workspace dir");
+
+    // --- 腕1: 宣言なし ---
+    let denied = run_transition_arm(&ws, "transition-enforced-deny")
+        .unwrap_or_else(|e| panic!("腕1（宣言なし）が測れなかった: {e}"));
+
+    let mut failures: Vec<String> = Vec::new();
+    // **印の有無で「走ったか」を判定してはいけない**（2026-09-18に実際に踏んだ）。
+    // PowerShellは失敗したコマンド行を**そのままエラー本文へ反射する**ので、
+    // 起動できなかった回でも印の文字列が出力に現れる。**計器が自分の入力を映している。**
+    // だから走ったかどうかは、`run_shell`自身が付ける終了コードの行で見る。
+    if denied.contains("[exit code: 0]") {
+        failures.push(
+            "腕1: 宣言していないプログラムが**走ってしまった**（終了コードが0）。\
+             生成禁止が積まれていないか、Daemonが判定していない"
+                .to_string(),
+        );
+    }
+    if !denied.contains("Access is denied") && !denied.contains("アクセスが拒否") {
+        failures.push(format!(
+            "腕1: 断り方が想定と違う。**フックがDaemonへ頼んで断られた**なら\
+             `ERROR_ACCESS_DENIED`が返るはずである（`DESIGN-MAC-ENFORCEMENT.md` §10.1.2の\
+             「4つの原因に4つの値」）: {denied}"
+        ));
+    }
+    if !denied.contains("[transition:") {
+        failures.push(
+            "腕1: 断られたのに**注記が出ていない**。モデルには生のWin32エラーしか届かず、\
+             宣言の直し方へ辿り着けない（段階6f-3の配線が効いていない）"
+                .to_string(),
+        );
+    }
+    if !denied.contains("can_run_program") {
+        failures.push(
+            "腕1: 注記が窓口（`can_run_program`）を案内していない。案内が無いと、\
+             pull方式のツールは永久に呼ばれない"
+                .to_string(),
+        );
+    }
+    if !denied.contains("powershell5.1(Tier2a)") {
+        failures.push(format!(
+            "腕1: シェルが`powershell5.1(Tier2a)`ではない。生成禁止を積む回は、\
+             ストアの実行エイリアスを候補から外して実体のexeへ落ちなければならない\
+             （残課題#50・§S62）。出力: {denied}"
+        ));
+    }
+
+    // 待ち行列に残っていること（注記は出たが記録が無い、という状態を作らない）。
+    let queue = ws.join(".harness").join("transitions").join("pending.jsonl");
+    match std::fs::read_to_string(&queue) {
+        Ok(text) if text.contains("denied_by_daemon") => {}
+        Ok(text) => failures.push(format!(
+            "腕1: 待ち行列に拒否の行が無い（{}）: {text:?}",
+            queue.display()
+        )),
+        Err(e) => failures.push(format!(
+            "腕1: 待ち行列が読めない（{}）: {e}",
+            queue.display()
+        )),
+    }
+
+    // --- 腕2: 同じコマンドを、宣言してから撃つ ---
+    declare_one_program(&ws, &system_findstr_exe())
+        .unwrap_or_else(|e| panic!("腕2の宣言を書けなかった: {e}"));
+    let allowed = run_transition_arm(&ws, "transition-enforced-allow")
+        .unwrap_or_else(|e| panic!("腕2（宣言あり）が測れなかった: {e}"));
+
+    if !allowed.contains("[exit code: 0]") || !allowed.contains(TRANSITION_MARKER) {
+        failures.push(format!(
+            "腕2: **宣言したのに走らなかった**。宣言が判定器へ届いていないか、\
+             Daemonが起こせていない（終了コード0と印`{TRANSITION_MARKER}`の両方が要る\
+             ——印だけだとエラー本文の反射と区別が付かない）: {allowed}"
+        ));
+    }
+    if allowed.contains("[transition:") {
+        failures.push(format!(
+            "腕2: 断られていないのに注記が出ている。**古い行を読んでいる**か、\
+             差分ではなく全件を読んでいる: {allowed}"
+        ));
+    }
+
+    if failures.is_empty() {
+        cleanup_on_success(&ws, &[], "transition-enforced-deny");
+        cleanup_on_success(&ws, &[], "transition-enforced-allow");
+    } else {
+        eprintln!(
+            "[transition-enforced] 失敗したのでワークスペースを {} に残す（調査用）",
+            ws.display()
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "遷移MACの強制（製品経路）:\n{}",
+        failures.join("\n")
+    );
+}

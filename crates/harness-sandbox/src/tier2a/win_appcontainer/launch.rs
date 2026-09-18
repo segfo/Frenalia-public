@@ -444,8 +444,9 @@ mod tests {
     /// もう片方だけが別の姿勢で動く**（`B-06`。段階5bでMCPの経路が1本だけ取り残されていたのと
     /// 同じ形で、そのときも赤くするテストが1本も無かった）。
     ///
-    /// いまはどちらも`Unrestricted`である（段階Eが無いので既定へ入れられない、
-    /// `ChildProcessPolicy`のdoc）。**常時適用へ切り替えるときは、この件数ではなく
+    /// **どちらも「このプロセスが選んだ姿勢」を読む**（`child_process_policy_for_this_process`）。
+    /// 既定は`Unrestricted`のままで、変えられるのは旗（`--enforce-transitions`）を立てた
+    /// セッションだけである。**常時適用へ切り替えるときは、この件数ではなく
     /// 引数そのものを消す**のが正しい畳み方で、そのときこのテストも一緒に消える。
     ///
     /// **限界**: `grep`なので、別名で束ねてから呼ばれると数えられない。緑は
@@ -473,50 +474,86 @@ mod tests {
              （0件マッチで黙って緑になる形＝BUG-056）"
         );
 
-        // **姿勢そのものを数える。** 上の件数だけでは「2つとも在る」しか言えず、
-        // どちらが何を選んだかは見ていない。`Restricted`が製品コードに0件であることが
-        // 決定Aの機械化された形である（`RedirectorInject::default()`を0件で固定したのと同じ形）。
+        // [⑤'] **姿勢を選ぶ場所そのものを数える。** 上の件数だけでは「2つとも在る」しか
+        // 言えず、どちらが何を選んだかは見ていない。
+        //
+        // **2026-09-18に0件から1件へ変えた。** 旗（`--enforce-transitions`）を足したので、
+        // 製品コードが`Restricted`を綴る場所がちょうど1つできた——旗を姿勢へ変える
+        // `harness-cli`の`startup/sandbox.rs`である。**0件という形はもう使えないが、
+        // 意図は変わっていない**——「選ぶ場所は1つで、そこ以外は選べない」。
         let restricted = format!("ChildProcessPolicy{}Restricted", "::");
         let (restricted_product, _) =
             super::super::test_support::product_callers_of(&restricted, "enum ChildProcessPolicy");
-        assert!(
-            restricted_product.is_empty(),
-            "製品コードが生成禁止を選んでいる。段階E（遷移ポリシーの評価）が着地するまで、\
-             製品の既定の起動経路へ入れない——入れるとDaemonの答えが常に\
-             「未実装なので断る」になり、サンドボックスの中で外部プログラムが\
-             1つも起動できなくなる（`ChildProcessPolicy`のdoc）:\n  {}",
+        assert_eq!(
+            restricted_product.len(),
+            1,
+            "生成禁止を選ぶ製品コードがちょうど1箇所ではない。**1箇所だけ**が正しい\
+             ——旗（`--enforce-transitions`）を姿勢へ変える`startup/sandbox.rs`である。\
+             増えたなら、旗を読む場所が2つになっている（いつか片方だけ真になる、`B-06`）。\
+             減ったなら、旗が姿勢に変わらなくなっている（＝立てても何も起きない）:\n  {}",
             restricted_product.join("\n  ")
         );
-
-        // [残課題#50] **既定を読む場所を数える。** 2026-09-18に3つ目が増えた——
-        // Tier2aのシェルの選び方である（生成禁止を積むなら、呼び出し元の中から起こせる
-        // 綴りしか選べない。`plans/mac-spike/RESULTS.md` §S62）。
-        //
-        // **綴りで持たずに定数で持つのはこのためである**——3箇所のうち1つだけが
-        // 取り残されると、「生成禁止は積んだのに、シェルは遷移先にできない綴りのまま」
-        // という状態が作れてしまい、サンドボックスの中でシェルが1本も起こせなくなる。
-        let default_readers = format!("ChildProcessPolicy{}PRODUCT_DEFAULT", "::");
-        let (default_product, default_elsewhere) =
-            super::super::test_support::product_callers_of(&default_readers, "pub const");
-        assert_eq!(
-            default_product.len(),
-            2,
-            "製品の既定（`PRODUCT_DEFAULT`）をDaemonのホストが読まなくなった（か、増えた）。\
-             読まずに姿勢を直書きすると、⑤を既定へ入れる日にそこだけ取り残される:\n  {}",
-            default_product.join("\n  ")
+        assert!(
+            restricted_product[0].contains("sandbox.rs"),
+            "生成禁止を選んでいるのが、旗を姿勢へ変える場所ではない。**preflightより前で\
+             選ばなければならない**——シェルの候補がこの姿勢を見て決まるからである\
+             （残課題#50・§S62）。後ろで選ぶと、シェルだけが遷移先にできない綴りのまま\
+             生成禁止が積まれる:\n  {}",
+            restricted_product[0]
         );
-        // **3つ目はこの数え方では「製品」に見えない。** `spawn.rs`は`shell_candidates`より
-        // 前にインラインのテストモジュールを持っており、`product_callers_of`はその行より後ろを
-        // 全部テストとして数える（同関数のdocの限界3つ目そのもの）。
-        // **だから合計で見る**——直書きへ戻せば合計が2件に落ちて赤くなる。
+
+        // **選んだ姿勢を配るのは1つの読み口だけである。**
+        let declare = format!("declare_child_process_policy{}", '(');
+        let (declare_product, _) =
+            super::super::test_support::product_callers_of(&declare, "pub fn ");
         assert_eq!(
-            default_product.len() + default_elsewhere,
-            3,
-            "`PRODUCT_DEFAULT`を読む場所の合計が3件ではない。3つ目はTier2aのシェルの選び方\
-             （`win_appcontainer::spawn::shell_candidates`）で、生成禁止を積むなら\
-             「呼び出し元の中から起こせる綴り」しか選べないという実測（§S62）に基づく。\
-             ここが姿勢を直書きに戻ると、⑤を既定へ入れた日に**シェルだけが\
-             遷移先にできない綴りのまま**になり、サンドボックスの中で1本も起こせなくなる"
+            declare_product.len(),
+            1,
+            "このプロセスの姿勢を宣言する製品コードが1箇所ではない。`OnceLock`は\
+             プロセス単位なので、2箇所から書くと**先に走った方が勝つ**——症状は\
+             「なぜかこのセッションだけ強制されない」という形でしか出ない:\n  {}",
+            declare_product.join("\n  ")
+        );
+
+        // [残課題#50] **姿勢を読む場所を数える。** 2つある——Daemonへ渡す側（`run_agent`）と、
+        // Tier2aのシェルの選び方（`shell_candidates`）である。後者は、生成禁止を積むなら
+        // 「呼び出し元の中から起こせる綴り」しか選べないという実測（§S62）に基づく。
+        //
+        // **`spawn.rs`側はこの数え方では「製品」に見えない**——`shell_candidates`より前に
+        // インラインのテストモジュールがあり、`product_callers_of`はその行より後ろを全部
+        // テストとして数える（同関数のdocの限界3つ目そのもの）。**だから合計で見る。**
+        let reader = format!("child_process_policy_for_this_process{}", '(');
+        let (reader_product, reader_elsewhere) =
+            super::super::test_support::product_callers_of(&reader, "pub fn ");
+        assert_eq!(
+            reader_product.len() + reader_elsewhere,
+            2,
+            "選んだ姿勢を読む場所の合計が2件ではない。**Daemonへ渡す側とシェルの選び方の\
+             両方が同じ値を読む**ことが要である——片方が直書きへ戻ると、\
+             「生成禁止は積んだのに、シェルは遷移先にできない綴りのまま」という状態が\
+             作れてしまい、サンドボックスの中でシェルが1本も起こせなくなる:\n  {}",
+            reader_product.join("\n  ")
+        );
+    }
+
+    /// [⑤'] **製品の既定は、まだ生成禁止を積まない。**
+    ///
+    /// # この1本が何の印なのか
+    ///
+    /// 上のテストは「選ぶ場所が1つ」までしか言わない——旗を立てたセッションだけが
+    /// 強制される、という今日の姿は**この定数**が持っている。
+    ///
+    /// **⑤を製品の既定へ入れる決定をした日に、ここが赤くなる。** それが決定の印であり、
+    /// そのときは同じ回で(1)既定の遷移宣言一式を同梱し、(2)カーネル拒否の購読者を張り、
+    /// (3)旗を畳む（`plans/HANDOFF-MAC-ARGV.md`の「⑤'でやること」）。
+    /// **この1本を消すのは、その3つが揃ってからである。**
+    #[test]
+    fn the_product_default_still_does_not_restrict_child_processes() {
+        assert!(
+            !crate::tier2a::spawnd::ChildProcessPolicy::PRODUCT_DEFAULT.is_restricted(),
+            "製品の既定が生成禁止になった。宣言を1本も書いていないワークスペースでは、\
+             サンドボックスの中から外部プログラムを1つも起動できなくなる——\
+             既定の遷移宣言一式とカーネル拒否の購読者を同じ回で入れること"
         );
     }
 

@@ -98,6 +98,25 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "tier2a_cow_git_commit_writes_objects_under_the_redirector",
         ],
     ),
+    // [⑤'] 遷移MACの強制（`--enforce-transitions`）を**製品の経路で**撃つ。
+    // 生成禁止を積んだセッションで、宣言していないプログラムが断られ、その事実が
+    // `run_shell`の出力末尾の注記としてモデルへ届くこと——そして宣言すれば通ること（対）。
+    // `e2e-all`と別に置くのは、行列全体を回さずこの1測定だけを撃てるようにするため
+    // （1要素＝1測定。`e2e-cow-git-injection`と同じ置き方）。
+    (
+        "e2e-transition-enforced",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "enforcing_transitions_denies_undeclared_programs_and_tells_the_model_how_to_fix_it",
+        ],
+    ),
     // N8-③-C-WFP: 生TCPの445が本番Tier2aのWFP適用下でも塞がるかを測る
     // （`plans/net-spike/RESULTS.md` N8-③-C）。`e2e-net-matrix`とは別に置くのは、
     // 行列全体を回さずこの1件だけを撃てるようにするため（1要素＝1測定）。

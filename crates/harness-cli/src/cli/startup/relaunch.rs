@@ -187,6 +187,26 @@ mod tests {
         assert!(cli.staged);
     }
 
+    /// [⑤'] **遷移MACの強制は、`/workspace`で移動しても落ちない。**
+    ///
+    /// 落ちると、移動先のセッションだけが**黙って無防備になる**——画面には何も出ず、
+    /// 「なぜかこの回だけ拒否されない」としてしか現れない。`--staged`と同じ形の1本だが、
+    /// 落ちたときに失われるものがセキュリティ境界なので別に固定する。
+    #[test]
+    fn enforcing_transitions_survives_a_workspace_move() {
+        let out = relaunch_args(
+            &os(&["--cwd", r"C:\ws\old", "--sandbox", "tier2a", "--enforce-transitions"]),
+            Path::new(r"C:\ws\next"),
+            7,
+        );
+        assert!(
+            strings(&out).contains(&"--enforce-transitions".to_string()),
+            "{:?}",
+            strings(&out)
+        );
+        assert!(parsed(&out).enforce_transitions);
+    }
+
     /// `--resume`は値を省略できる（`num_args = 0..=1`）。直後に別のフラグが来ているとき、
     /// それを「`--resume`の値」とみなして落としてはいけない。
     #[test]
