@@ -2580,8 +2580,7 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
             .and_then(|a| a.get("ok").and_then(|o| o.as_bool()));
 
         // **待ち切ったら落ちていない**（的は25秒待つ腕で、こちらは5秒しか待たない）。
-        let target_died =
-            unsafe { WaitForSingleObject(target.process(), 5_000) } == WAIT_OBJECT_0;
+        let target_died = unsafe { WaitForSingleObject(target.process(), 5_000) } == WAIT_OBJECT_0;
         let holder_died = unsafe { WaitForSingleObject(holder.process(), 100) } == WAIT_OBJECT_0;
         eprintln!(
             "[{TAG}] {label}: sent={ctrl_break_sent:?} target_died={target_died} \
@@ -2608,8 +2607,7 @@ fn console_holder_survives_ctrl_break_when_it_guards_itself() {
     // **設計にとっての本命。** 「Ctrl+Cを無視する」継承属性を保持プロセスと的の両方から外し、
     // **Ctrl+Cが実際に配達される世界**で握り潰しが効くかを見る。本番のDaemonが何を受け継ぐかは
     // 分からないので、**受け取れる側に倒した世界でも守れる**ことが要る。
-    let guarded_accept_ctrl_c =
-        run_round("guarded+accept/ctrl-c", true, true, CTRL_C.0, CTRL_C.1);
+    let guarded_accept_ctrl_c = run_round("guarded+accept/ctrl-c", true, true, CTRL_C.0, CTRL_C.1);
 
     // --- 判定 -------------------------------------------------------------------
     // **腕が別物であることを先に見る。** 引数が無視されていると、2ラウンドは同じものになり、
@@ -3058,7 +3056,9 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
     ] {
         let armed = round.setup.get("ctrl_receipt");
         assert_eq!(
-            armed.and_then(|r| r.get("handler")).and_then(|h| h.as_bool()),
+            armed
+                .and_then(|r| r.get("handler"))
+                .and_then(|h| h.as_bool()),
             Some(true),
             "受け取る側にハンドラが入っていない（腕={label}）。この回は測定になっていない: {}",
             round.setup
@@ -3160,7 +3160,11 @@ fn control_event_delivery_and_cleanup_are_measured_with_a_handling_child() {
     //
     // 以下は**実測をそのまま固定している**。逆転したらこの経路は初めて脅威になり得るので、
     // 記録（§S50）と設計書§7.1.2の決定1を測り直す合図にする。
-    assert_eq!(ctrl_c_round.sent, Some(true), "`CTRL_C_EVENT`を撃てていない");
+    assert_eq!(
+        ctrl_c_round.sent,
+        Some(true),
+        "`CTRL_C_EVENT`を撃てていない"
+    );
     assert!(
         !ctrl_c_round.received(),
         "`CTRL_C_EVENT`で受け取りの記録ができた。2026-09-05の実測（届かない）と逆なので、\

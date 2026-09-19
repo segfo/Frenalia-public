@@ -456,4 +456,3 @@ fn the_creation_flags_decide_whether_the_nested_shell_gets_a_console() {
          別の値なら、測っているものが違う: {quiet}"
     );
 }
-

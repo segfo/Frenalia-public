@@ -200,7 +200,11 @@ mod tests {
     fn full_page_heap_needs_both_the_master_switch_and_the_full_bit() {
         assert_eq!(FLG_HEAP_PAGE_ALLOCS, 0x0200_0000);
         assert_eq!(PAGE_HEAP_FULL & 0x1, 0x1, "有効化のビットが要る");
-        assert_eq!(PAGE_HEAP_FULL & 0x2, 0x2, "fullのビットが要る（番兵ページ）");
+        assert_eq!(
+            PAGE_HEAP_FULL & 0x2,
+            0x2,
+            "fullのビットが要る（番兵ページ）"
+        );
     }
 
     /// **載っていない実行ファイルは「載っていない」と答える。** ここが常に`true`を返すと、

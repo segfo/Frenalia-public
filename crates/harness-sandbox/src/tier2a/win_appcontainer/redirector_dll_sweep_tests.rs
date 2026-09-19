@@ -152,6 +152,13 @@ fn the_sweep_takes_a_dead_sessions_ace_off_the_dll_and_leaves_the_live_one() {
 ///
 /// **測る意味**: 「Redirector DLLの窓は閉じている」と言えるのは**package SID宛だけ**である、
 /// という射程をここで固定する。同じDLLに載るcapability SID宛ACEはこの掃除では回収されない。
+///
+/// # 2026-09-19以降、これはDLL自身の許可を守るテストでもある（§22.9の前提）
+///
+/// DLLの読取+実行ACEは**宣言宛のcapability SID**へ移った（`preflight`の該当ブロック）。
+/// つまりこの掃除がcapability SIDまで剥がすようになると、**毎起動でDLLが読めなくなり、
+/// 注入の失敗＝生成ごと落ちる**（BUG-116）。当初は「他の扉の担当ぶんを巻き込まない」ための
+/// テストだったが、いまは**この機構自身が依存している**。
 #[test]
 fn the_sweep_is_blind_to_capability_sids_so_workspace_and_traverse_grants_survive() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -323,5 +330,66 @@ fn the_sweep_only_ever_looks_next_to_the_running_executable() {
         "redirector_dll_paths must be non-empty exactly when a redirector DLL sits next to the \
          running executable ({}); any copy in another directory is never swept",
         exe_dir.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// [§22.9の前提] 宛先が宣言のcapabilityへ移ったこと
+// ---------------------------------------------------------------------------
+
+/// **発行してから引ける。** 引けないと、子のトークンへ積むものが無くなり注入が失敗する。
+///
+/// ここが測っているのは`preflight`（発行する側）と`launch`（引く側）が**同じ鍵**を使って
+/// いることである。鍵は`(発行元, DLLのパス, access級)`の3つで、どれか1つでも綴りが
+/// ずれると引けない——症状は`LoadLibraryW`のNULL＝**生成ごと失敗**で、
+/// 「積み忘れ」と区別が付かない。**実機で踏んだ**（2026-09-19、`spawn-daemon`が5本落ちた）。
+#[test]
+fn the_dll_capability_can_be_looked_up_with_the_same_key_it_was_issued_with() {
+    let issued = issue_redirector_dll_capabilities();
+    if issued.is_empty() {
+        // DLLが隣に無いビルド構成では測れない（`redirector_dll_paths`は`exists()`で絞る）。
+        return;
+    }
+    let looked_up = redirector_dll_capability_sids();
+    assert_eq!(
+        looked_up.len(),
+        issued.iter().filter(|(_, r)| r.is_ok()).count(),
+        "発行した鍵で引けない。子のトークンへ積むものが無くなり、注入が必ず失敗する"
+    );
+}
+
+/// **発行元はワークスペースではない**——同じDLLなら、どのワークスペースから呼んでも同じ宛先。
+///
+/// # 壊れた状態を一文で
+///
+/// **同じDLLにACEが際限なく積み上がる。** 鍵にワークスペースを入れると、ワークスペースごとに
+/// 別の宛先が発行され、しかもワークスペースが使い捨て（テストの一時ディレクトリ）だと
+/// **台帳の記録が消えた後もACEだけが残る**。掃除（`sweep_stale_redirector_dll_aces`）は
+/// capability SIDを意図的に見ないので、誰も剥がさない。
+///
+/// **実際に踏んだ**（2026-09-19）。最初の実装はワークスペースを鍵に入れており、実機のE2Eを
+/// 1周しただけで`harness_redirector.dll`に36本、x86側に4本の孤立ACEが積み上がった。
+#[test]
+fn the_dll_capability_does_not_depend_on_which_workspace_asks_for_it() {
+    let first = redirector_dll_capability_sids();
+    if first.is_empty() {
+        return;
+    }
+    // 2回引いても同じ宛先が返る（発行元がプロセスやワークスペースで変わらないことの検算）。
+    let second = redirector_dll_capability_sids();
+    let text = |sids: &[crate::win_common::OwnedSid]| -> Vec<String> {
+        sids.iter()
+            .map(|s| crate::win_common::sid_to_string(s.as_psid()).expect("sid to string"))
+            .collect()
+    };
+    assert_eq!(
+        text(&first),
+        text(&second),
+        "同じDLLに対して違う宛先が返っている。ACEが際限なく積み上がる形である"
+    );
+    assert_eq!(
+        first.len(),
+        redirector_dll_paths().len(),
+        "DLL 1本につき宛先は1つに収束していなければならない"
     );
 }

@@ -169,7 +169,12 @@ pub(super) fn ask_daemon_as_a_hook(
 }
 
 /// 要求受付パイプへ1件投げて、プローブのstdoutを返す。
-pub(super) fn ask_daemon(case: &Case, profile: &OwnedContainerSid, caps: &[crate::win_common::OwnedSid], payload: &str) -> String {
+pub(super) fn ask_daemon(
+    case: &Case,
+    profile: &OwnedContainerSid,
+    caps: &[crate::win_common::OwnedSid],
+    payload: &str,
+) -> String {
     let daemon = case.daemon.as_ref().expect("case owns the daemon");
     let workspace = case
         .dir
@@ -229,7 +234,12 @@ fn a_declared_transition_is_allowed_and_the_child_actually_runs() {
 
     let payload = request_payload(
         &probe_str,
-        &["--emit", "nested-ok", "--report-file", &marker.to_string_lossy()],
+        &[
+            "--emit",
+            "nested-ok",
+            "--report-file",
+            &marker.to_string_lossy(),
+        ],
         &workspace,
     );
     let out = ask_daemon(&case, &profile, &caps, &payload);
@@ -347,7 +357,12 @@ fn an_edge_declared_for_another_domain_cannot_be_borrowed() {
     // 別ドメインのために宣言された辺（プローブ）を、その辺を持たないドメインから頼む。
     let payload = request_payload(
         &probe_str,
-        &["--emit", "stolen", "--report-file", &marker.to_string_lossy()],
+        &[
+            "--emit",
+            "stolen",
+            "--report-file",
+            &marker.to_string_lossy(),
+        ],
         &workspace,
     );
     let out = ask_daemon(&case, &profile, &caps, &payload);
@@ -518,9 +533,7 @@ fn a_nested_shell_that_declares_it_needs_a_console_actually_runs_its_command() {
         &profile,
         &caps,
         &shell_exe,
-        &format!(
-            "\"{shell_exe}\" -NoProfile -NonInteractive -Command \"Write-Output '{MARKER}'\""
-        ),
+        &format!("\"{shell_exe}\" -NoProfile -NonInteractive -Command \"Write-Output '{MARKER}'\""),
         &captured,
         "required",
     );
@@ -582,9 +595,7 @@ fn the_same_shell_declared_as_not_needing_a_console_silently_does_nothing() {
         &profile,
         &caps,
         &shell_exe,
-        &format!(
-            "\"{shell_exe}\" -NoProfile -NonInteractive -Command \"Write-Output '{MARKER}'\""
-        ),
+        &format!("\"{shell_exe}\" -NoProfile -NonInteractive -Command \"Write-Output '{MARKER}'\""),
         &captured,
         "not_needed",
     );

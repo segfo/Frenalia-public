@@ -232,9 +232,20 @@ fn spawn_shell_in_workspace_on(
         super::lookup_cow_diff_layer_capability_sid(&canonical_workspace, diff_layer_dir)
     });
 
+    // [§22.9の前提] Redirector DLLの読取+実行ACEも**宣言宛のcapability SID**へ移った。
+    // 積まなければ子は`LoadLibraryW`でNULLを受け取り、**注入が失敗して生成ごと落ちる**
+    // （注入の失敗は設計上fatal。BUG-116）。症状が「子が起動しない」なので、
+    // ここを落とすとTier2aが丸ごと使えなくなる。
+    //
+    // **引くだけで発行しない**（差分層と同じ形）。発行するのは`preflight`だけにしておかないと、
+    // preflightを経ていない構成に記録だけが増える。引けないときは積まない——症状は
+    // `ACCESS_DENIED`＝fail-closedで、無言で広がる向きには倒れない。
+    let redirector_dll_caps = super::redirector_dll_capability_sids();
+
     let mut domain_caps = vec![workspace_cap.as_psid()];
     domain_caps.extend(fs_allow_caps.iter().map(|cap| cap.as_psid()));
     domain_caps.extend(cow_diff_layer_cap.iter().map(|cap| cap.as_psid()));
+    domain_caps.extend(redirector_dll_caps.iter().map(|cap| cap.as_psid()));
 
     // 起こす手順は**注入するものを除いて同一**なので、1つのクロージャに畳む。2回書くと、
     // 片方だけ引数が変わっても誰も気付けない（`B-05`: コンパイラが守らない複製）。

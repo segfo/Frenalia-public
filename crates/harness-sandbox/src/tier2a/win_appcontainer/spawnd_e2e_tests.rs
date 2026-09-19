@@ -182,6 +182,14 @@ pub(super) fn setup_with_policy_and_transitions(
     if let Some(cap) = super::mac_spike_tests::workspace_capability_for(&workspace) {
         caps.push(cap);
     }
+    // [§22.9の前提] Redirector DLLの読取+実行ACEは**宣言宛のcapability SID**へ移った
+    // （`preflight`の該当ブロック）。積まないと子は`LoadLibraryW`でNULLを受け取り、
+    // **注入の失敗＝生成ごと落ちる**。
+    //
+    // **製品と同じ引き口（`redirector_dll_capability_sids`）を通す。** ここで綴りを
+    // 書き写すと、製品が鍵を変えたときに**このテストだけが古い宛先で緑になる**（`B-13`）。
+    // この一覧を手で組んでいるのは、Daemon経由の経路が`launch.rs`を通らないためである。
+    caps.extend(super::redirector_dll_capability_sids());
 
     // [2026-09-17] **Daemonの診断の受け皿を、起こす前に決める**（[`Case::daemon_log`]）。
     // 置き場をワークスペースの中にしない——テストが中身を数える場所なので、
@@ -739,7 +747,7 @@ fn dropping_the_handle_ends_the_daemon() {
         crate::tier2a::spawnd::TransitionPolicy::empty(""),
         ChildProcessPolicy::Unrestricted,
     )
-        .expect("the spawn daemon must start");
+    .expect("the spawn daemon must start");
     let pid = daemon.daemon_pid();
     assert!(pid != 0, "DaemonのPIDが返っていない（Readyが届いていない）");
 
@@ -782,7 +790,7 @@ fn a_spawn_request_after_the_daemon_died_fails_loudly() {
         crate::tier2a::spawnd::TransitionPolicy::empty(""),
         ChildProcessPolicy::Unrestricted,
     )
-        .expect("the spawn daemon must start");
+    .expect("the spawn daemon must start");
     let pid = daemon.daemon_pid();
 
     // Daemonを外から落とす（クラッシュの模擬）。
@@ -932,7 +940,7 @@ fn concurrent_requests_share_one_control_pipe_without_interleaving() {
         crate::tier2a::spawnd::TransitionPolicy::empty(""),
         ChildProcessPolicy::Unrestricted,
     )
-        .expect("a shared spawn daemon must start");
+    .expect("a shared spawn daemon must start");
     let request_pipe = shared.request_pipe().to_string();
     eprintln!("[spawnd P9] shared daemon pid={}", shared.daemon_pid());
 
@@ -1067,7 +1075,7 @@ fn top_level_spawn_latency_direct_versus_daemon() {
         crate::tier2a::spawnd::TransitionPolicy::empty(""),
         ChildProcessPolicy::Unrestricted,
     )
-        .expect("a shared spawn daemon must start");
+    .expect("a shared spawn daemon must start");
     let _ = &spawn_cap;
 
     let direct = |workspace: &std::path::Path| {
@@ -1206,7 +1214,7 @@ fn top_level_spawn_latency_injection_cost() {
         crate::tier2a::spawnd::TransitionPolicy::empty(""),
         ChildProcessPolicy::Unrestricted,
     )
-        .expect("a shared spawn daemon must start");
+    .expect("a shared spawn daemon must start");
 
     let spawn = |exe: &str, inject: super::RedirectorInject<'_>, args: &[&str]| {
         spawn_with_workspace_via_daemon(
@@ -1351,7 +1359,10 @@ pub(super) fn wait_and_close_with_code(child: &SpawnedChild, job: HANDLE) -> u32
     unsafe {
         let _ = WaitForSingleObject(child.process, 60_000);
         let _ = GetExitCodeProcess(child.process, &mut code);
-        eprintln!("[spawnd] child pid={} exit={code} (0x{code:08x})", child.pid);
+        eprintln!(
+            "[spawnd] child pid={} exit={code} (0x{code:08x})",
+            child.pid
+        );
         let _ = CloseHandle(child.process);
         let _ = CloseHandle(job);
     }

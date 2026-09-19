@@ -312,6 +312,85 @@ pub fn fs_allow_capability_sids_for_declarations(
         .collect()
 }
 
+/// [§22.9の前提] Redirector DLLのcapabilityの**発行元**として使うパス。
+///
+/// # ワークスペースではない（2026-09-19に実測で直した）
+///
+/// 宣言capabilityの鍵は`(発行元, 宣言パス, access級)`である。ここへワークスペースを渡すと、
+/// **ワークスペースごとに別の宛先が発行され、同じDLLにACEが1本ずつ増える**。
+/// しかもワークスペースが使い捨て（テストの一時ディレクトリ等）だと、台帳のエントリが
+/// 消えた後も**ACEだけが残る**——撤収経路の無い孤立ACEで、掃除
+/// （`sweep_stale_redirector_dll_aces`）はcapability SIDを意図的に見ない。
+///
+/// **実際に踏んだ**: 最初の実装はワークスペースを渡しており、実機のE2Eを1周しただけで
+/// `harness_redirector.dll`に36本、x86側に4本のcapability ACEが積み上がった。
+///
+/// DLLは**harnessの設置場所にある1つのファイル**で、どのワークスペースから使っても同じ物である。
+/// だから発行元もその設置場所にする——宛先はDLL 1本につき1つに収束し、ドメインを増やしても
+/// ワークスペースを増やしても増えない。
+fn redirector_capability_issuer(dll: &Path) -> std::path::PathBuf {
+    dll.parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| dll.to_path_buf())
+}
+
+/// [§22.9の前提] Redirector DLLの宛先capabilityを**発行して**返す（`preflight`が使う）。
+///
+/// 返すのは`(DLLのパス, 発行の結果)`で、**失敗は要素ごと**——1本の宛先が作れなくても
+/// もう1本は続ける。`Err`のときは許可を書かないこと（fail-closed。package SIDへ退避すると
+/// 「移行したつもりで全ドメインに開く」最悪の形になる）。
+pub fn issue_redirector_dll_capabilities() -> Vec<(std::path::PathBuf, Result<String, String>)> {
+    let dlls = redirector_dll_paths();
+    // **1回の台帳更新でまとめて確保する**（1件ずつだと台帳の全文往復を件数ぶん払う。残課題#37）。
+    // 発行元がDLLごとに違い得る（別ディレクトリに置かれた場合）ので、まとめられるのは
+    // 同じ発行元のぶんだけである——今日は2本とも同じ隣にあるので1回で済む。
+    let issuers: Vec<std::path::PathBuf> = dlls
+        .iter()
+        .map(|d| redirector_capability_issuer(d))
+        .collect();
+    let mut out = Vec::with_capacity(dlls.len());
+    for (dll, issuer) in dlls.iter().zip(&issuers) {
+        let issued = crate::tier2a::workspace_capability::ensure_declaration_capability_name(
+            issuer,
+            dll,
+            FsAccess::ReadExec.label(),
+        );
+        out.push((dll.clone(), issued));
+    }
+    out
+}
+
+/// [§22.9の前提] Redirector DLLへ**既に発行済み**の宣言capability SIDを引く（発行はしない）。
+///
+/// # 何のためにあるのか
+///
+/// DLLの読取+実行ACEは、セッションのpackage SID宛から**宣言宛のcapability SID**へ移った
+/// （`preflight`の該当ブロック）。**子のトークンがその宛先を持っていなければDLLを読めず、
+/// 注入が失敗して生成ごと落ちる**（注入の失敗は設計上fatal。BUG-116）。ここはそれを積むための
+/// 引き口である。
+///
+/// # 発行しない
+///
+/// 発行するのは`preflight`だけにしてある。起こす側が発行すると、preflightを経ていない構成に
+/// **台帳の記録だけが増える**（CoWの差分層が同じ理由で同じ形を採っている）。
+/// 引けなければ空を返す——症状は`ACCESS_DENIED`＝fail-closedで、無言で広がる向きには倒れない。
+///
+/// **鍵は[`redirector_capability_issuer`]が1箇所で決める。** 発行側と引く側で綴りがずれると、
+/// 引けずに空が返り、**子が一切起動しなくなる**（実際に実機で踏んだ形）。
+pub fn redirector_dll_capability_sids() -> Vec<crate::win_common::OwnedSid> {
+    redirector_dll_paths()
+        .into_iter()
+        .filter_map(|dll| {
+            let name = crate::tier2a::workspace_capability::lookup_declaration_capability_name(
+                &redirector_capability_issuer(&dll),
+                &dll,
+                FsAccess::ReadExec.label(),
+            )?;
+            capability_sid_from_name(&name).ok()
+        })
+        .collect()
+}
+
 /// `declared_path`宛に**既に発行済み**の宣言capability SIDを引く（発行はしない）。
 ///
 /// 撤収側（`harness fs revoke <path>`・セッション終了時の自動撤収）が使う。

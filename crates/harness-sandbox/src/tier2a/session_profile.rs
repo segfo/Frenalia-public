@@ -219,11 +219,38 @@ pub fn token_of_profile(name: &str) -> Option<&str> {
 ///   **プロファイルは消さない**（BUG-101。かつては「プロファイルだけ消す」としていたが、
 ///   それは付与済みACEを永久に回収不能にする操作だった。詳細は[`ReclaimTarget::grants_known`]）
 /// - 生存マーカーがある → 触らない（実行中の他セッション）
+///
+/// # 生きている他セッションが使っているcapability宛の付与は外す（2026-09-19）
+///
+/// capability SIDの宛先は`(workspace, 宣言パス, access級)`が鍵でセッションを含まないので、
+/// **同じ付与を複数のセッションが記録している**ことがある。死んだ側の記録だけを見て剥がすと
+/// 生きている側のACEまで消える。詳細は本体のコメント。
 pub fn plan_reclaim(
     ledger: &SessionLedger,
     existing_profiles: &[String],
     is_live: &dyn Fn(&str) -> bool,
 ) -> Vec<ReclaimTarget> {
+    // **capability SID宛の付与は共有される。** 宛先の鍵は`(workspace, 宣言パス, access級)`で
+    // セッションを含まない（`workspace_capability`のdoc）ので、**同じものを複数のセッションが
+    // 記録している**ことがある。死んだ側の記録だけを見て剥がすと、**生きている側の足元の
+    // ACEを消す**——症状はそのセッションの次の操作が`ACCESS_DENIED`で落ちることで、
+    // 剥がした側には何も起きないので原因に辿り着けない。
+    //
+    // # なぜ`granted_paths`には同じ見張りが要らないのか
+    //
+    // あちらの宛先は**そのセッションのpackage SID**で、定義からセッションごとに違う。
+    // 共有され得るのはcapability宛だけである。
+    let held_by_live: std::collections::HashSet<(&str, &str)> = ledger
+        .sessions
+        .iter()
+        .filter(|e| is_live(&e.token))
+        .flat_map(|e| {
+            e.granted_capabilities
+                .iter()
+                .map(|g| (g.path.as_str(), g.capability_name.as_str()))
+        })
+        .collect();
+
     let mut targets = Vec::new();
     for entry in &ledger.sessions {
         if is_live(&entry.token) {
@@ -232,7 +259,12 @@ pub fn plan_reclaim(
         targets.push(ReclaimTarget {
             profile_name: entry.profile_name.clone(),
             granted_paths: entry.granted_paths.clone(),
-            granted_capabilities: entry.granted_capabilities.clone(),
+            granted_capabilities: entry
+                .granted_capabilities
+                .iter()
+                .filter(|g| !held_by_live.contains(&(g.path.as_str(), g.capability_name.as_str())))
+                .cloned()
+                .collect(),
             grants_known: true,
         });
         for mcp in &entry.mcp {
@@ -1708,6 +1740,84 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].profile_name, profile_name_for("dead"));
         assert_eq!(targets[0].granted_paths, vec!["C:\\other".to_string()]);
+    }
+
+    /// **生きている他セッションが使っているcapability宛の付与は剥がさない。**
+    ///
+    /// capability SIDの宛先は`(workspace, 宣言パス, access級)`が鍵でセッションを含まないので、
+    /// **同じ付与を複数のセッションが記録する**。死んだ側の記録だけを見て剥がすと、
+    /// 生きている側のACEまで消える——症状はそのセッションの次の操作が`ACCESS_DENIED`で
+    /// 落ちることで、剥がした側には何も起きないので原因に辿り着けない。
+    ///
+    /// **Redirector DLLの許可を宣言宛へ移した回（2026-09-19）に入れた。** それまでは
+    /// 差分層のように「たまたま共有されることがある」程度だったが、DLLは**全セッションが
+    /// 同じ2ファイルへ同じ宛先で**記録するので、常に踏む形になった。
+    #[test]
+    fn a_capability_grant_that_a_live_session_still_holds_is_not_reclaimed() {
+        let shared = ("C:\\tools\\harness_redirector.dll", "harnessDeclShared");
+        let own = ("C:\\tmp\\dead-only", "harnessDeclOwn");
+        let ledger = SessionLedger {
+            sessions: vec![
+                entry_with_capabilities("alive", &[shared]),
+                entry_with_capabilities("dead", &[shared, own]),
+            ],
+        };
+        let mut live = HashSet::new();
+        live.insert("alive".to_string());
+
+        let targets = plan_reclaim(&ledger, &[], &liveness(&live));
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        let names: Vec<&str> = targets[0]
+            .granted_capabilities
+            .iter()
+            .map(|g| g.capability_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["harnessDeclOwn"],
+            "生きているセッションがまだ使っている宛先を剥がそうとしている"
+        );
+    }
+
+    /// **対の側**（`B-35`）: 誰も生きていなければ、共有されていた付与も剥がす。
+    ///
+    /// これが無いと「常に剥がさない」実装でも上のテストは緑になり、
+    /// **撤収経路の無い孤立ACE**がファイルに残り続ける（BUG-017/059が繰り返し踏んだ形）。
+    #[test]
+    fn a_shared_capability_grant_is_reclaimed_once_no_session_holds_it() {
+        let shared = ("C:\\tools\\harness_redirector.dll", "harnessDeclShared");
+        let ledger = SessionLedger {
+            sessions: vec![
+                entry_with_capabilities("gone-1", &[shared]),
+                entry_with_capabilities("gone-2", &[shared]),
+            ],
+        };
+
+        let targets = plan_reclaim(&ledger, &[], &liveness(&HashSet::new()));
+        assert_eq!(targets.len(), 2);
+        assert!(
+            targets.iter().all(|t| t.granted_capabilities.len() == 1),
+            "誰も使っていない宛先が剥がされずに残っている: {targets:?}"
+        );
+    }
+
+    /// package SID宛の付与には同じ見張りを掛けない（**宛先がセッションごとに違う**ので
+    /// 共有され得ない）。掛けると、同じパスを2セッションが開いたときに片方が永久に残る。
+    #[test]
+    fn path_grants_are_not_affected_by_the_shared_capability_guard() {
+        let ledger = SessionLedger {
+            sessions: vec![entry("alive", &["C:\\ws"]), entry("dead", &["C:\\ws"])],
+        };
+        let mut live = HashSet::new();
+        live.insert("alive".to_string());
+
+        let targets = plan_reclaim(&ledger, &[], &liveness(&live));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].granted_paths,
+            vec!["C:\\ws".to_string()],
+            "package SID宛はセッションごとに違うので、同じパスでも剥がしてよい"
+        );
     }
 
     /// 台帳が消えたプロファイルは、接頭辞付きの実在から**見つけられる**。ただし

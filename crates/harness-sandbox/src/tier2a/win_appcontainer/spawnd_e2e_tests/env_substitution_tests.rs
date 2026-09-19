@@ -141,14 +141,17 @@ fn env_seen_by_the_child(label: &str, restricted: bool) -> BTreeMap<String, Stri
     } else {
         ChildProcessPolicy::Unrestricted
     };
-    let (case, profile, caps) =
-        setup_with_policy_and_transitions(&format!("spawnd-bug160-{label}"), policy, |_workspace| {
+    let (case, profile, caps) = setup_with_policy_and_transitions(
+        &format!("spawnd-bug160-{label}"),
+        policy,
+        |_workspace| {
             if restricted {
                 policy_with_edges(E2E_POLICY_DOMAIN, &[&cmd_exe()])
             } else {
                 harness_policy::policy_file::PolicyFile::default()
             }
-        });
+        },
+    );
     let text = run_cmd_line(&case, &profile, &caps, label, "set");
     let env = parse_set_output(&text);
     assert!(
@@ -290,8 +293,9 @@ fn the_daemon_spawned_child_can_create_a_temp_file() {
     // 2026-09-19の`e2e-git-config-transition`で、Daemon経由の子に渡った相対パスが
     // ワークスペースではない場所へ解決された形跡があり、**同じ「許可されたのに動かない」の
     // 仲間に見える**。値を出しておかないと、次に疑う人がまた1往復することになる。
-    let tail =
-        format!(r#"echo {MARKER} 1>"%TEMP%\bug160-probe.txt" & type "%TEMP%\bug160-probe.txt" & cd"#);
+    let tail = format!(
+        r#"echo {MARKER} 1>"%TEMP%\bug160-probe.txt" & type "%TEMP%\bug160-probe.txt" & cd"#
+    );
 
     let mut seen: Vec<(&'static str, String)> = Vec::new();
     for (label, restricted) in [("shell-spawned", false), ("daemon-spawned", true)] {

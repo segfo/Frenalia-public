@@ -737,28 +737,66 @@ pub fn preflight_with_privhelper_launcher(
     // なった**ので、DLLの読取ACEも常に要る。条件を残すと、条件が偽の構成だけ
     // `LoadLibraryW`がNULLを返して**spawnが失敗する**——D-88の受入E2Eが一度この形で
     // 落ちている（`B-06`: 前提を変えたら、それを実現している経路を全部数える）。
+    //
+    // # 宛先は**セッションのpackage SIDではなく、宣言のcapability SID**である（§22.9の前提）
+    //
+    // 鍵は`(DLLの設置場所, DLLのパス, read_exec)`で、**ワークスペースもセッションも
+    // ドメインも含まない**（`redirector_capability_issuer`のdocに、ワークスペースを鍵に
+    // 入れて実機でACEを積み上げた経緯がある）。したがって宛先はDLL 1本につき1つに収束し、
+    // **ドメインを分けても増えない**——§22.9の費用表が「ドメイン数倍になる」と挙げていた
+    // 行をここで落としている。workspaceとtraverseが先に通った移行（D-37・D-54）の3例目である。
+    //
+    // **古いpackage SID宛のACEは足さないだけでよい。** 死んだセッションのぶんは
+    // [`sweep_stale_redirector_dll_aces`]が剥がし、生きているセッションのぶんは
+    // そのセッションが終わるときに台帳経由で剥がれる。
     {
-        for dll in redirector_dll_paths() {
-            match grant_ace_inheritable_access(&dll, sid.as_psid(), FsAccess::ReadExec) {
-                Ok(()) => crate::tier2a::session_profile::record_granted_path(&dll),
+        for (dll, issued) in super::issue_redirector_dll_capabilities() {
+            let dll = &dll;
+            // 宛先SIDを作れなければ**この許可は書かない**（fail-closed）。package SIDへ
+            // 退避しないのは、それが「移行したつもりで全ドメインに開く」最悪の退避だからである。
+            let capability = match issued.and_then(|capability_name| {
+                super::capability_sid_from_name(&capability_name)
+                    .map(|sid| (capability_name, sid))
+                    .map_err(|e| e.to_string())
+            }) {
+                Ok(capability) => capability,
+                Err(e) => {
+                    warnings.push(format!(
+                        "could not derive the capability for the redirector DLL ({}): {e} -- \
+                         injection will fail for this session",
+                        dll.display()
+                    ));
+                    continue;
+                }
+            };
+            let (capability_name, capability_sid) = capability;
+            match grant_ace_inheritable_access(dll, capability_sid.as_psid(), FsAccess::ReadExec) {
+                Ok(()) => {
+                    crate::tier2a::session_profile::record_granted_capability(dll, &capability_name)
+                }
                 // BUG-059 / BUG-017と同じ保険: `Err`は「何も起きなかった」を意味しない。
                 // 副作用を伴う関数が途中で失敗したとき、ACEが既に載っているかは呼び出し側からは
                 // 分からない。載っているのに記録しないと**撤収経路の無い孤立ACE**になる
                 // （実機に4件残留していた）。rootを権威的にプローブして実在すれば記録する。
                 // `grant_ace_inheritable_access`側のファイル分岐（層1）を直した後も、この保険は
                 // 残す——記録漏れの代償（孤立ACE）は、幻の台帳エントリより重い。
+                // **宛先が変わっても理由は変わらないので、移行後も残す。**
                 Err(e) => {
-                    if matches!(sid_ace_mask(&dll, sid.as_psid()), Ok(Some(_))) {
-                        crate::tier2a::session_profile::record_granted_path(&dll);
+                    if matches!(sid_ace_mask(dll, capability_sid.as_psid()), Ok(Some(_))) {
+                        crate::tier2a::session_profile::record_granted_capability(
+                            dll,
+                            &capability_name,
+                        );
                         warnings.push(format!(
-                            "cow: granting the redirector DLL to this session reported an error \
-                             ({}): {e} -- but the ACE is present on the file, so it was recorded \
-                             in the session ledger and will be revoked at session end",
+                            "granting the redirector DLL to its declaration capability reported an \
+                             error ({}): {e} -- but the ACE is present on the file, so it was \
+                             recorded in the session ledger and will be revoked at session end",
                             dll.display()
                         ));
                     } else {
                         warnings.push(format!(
-                            "cow: failed to grant the redirector DLL to this session ({}): {e}",
+                            "failed to grant the redirector DLL to its declaration capability \
+                             ({}): {e}",
                             dll.display()
                         ));
                     }

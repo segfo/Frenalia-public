@@ -79,9 +79,8 @@ fn as_u128(v: Option<&serde_json::Value>) -> u128 {
 }
 
 fn parse_attempts(lane: usize, stdout: &str) -> Vec<Attempt> {
-    let report = super::mac_spike_tests::last_json_line(stdout).unwrap_or_else(|| {
-        panic!("レーン{lane}の子がJSONを1行も出さなかった。stdout={stdout:?}")
-    });
+    let report = super::mac_spike_tests::last_json_line(stdout)
+        .unwrap_or_else(|| panic!("レーン{lane}の子がJSONを1行も出さなかった。stdout={stdout:?}"));
     let attempts = report
         .get("attempts")
         .and_then(serde_json::Value::as_array)
@@ -96,7 +95,10 @@ fn parse_attempts(lane: usize, stdout: &str) -> Vec<Attempt> {
         .iter()
         .map(|a| Attempt {
             lane,
-            index: a.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            index: a
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
             start_epoch_us: as_u128(a.get("start_epoch_us")),
             end_epoch_us: as_u128(a.get("end_epoch_us")),
             connect_elapsed_us: as_u128(a.get("connect_elapsed_us")),
@@ -153,9 +155,11 @@ fn run_round(
     // `server.rs`の`accept_loop`と同じ手）。
     let mut prepared = Vec::with_capacity(lanes);
     for _ in 0..lanes {
-        let (stdout_read, stdout_write) = appcontainer_pipe(profile.as_psid()).expect("stdout pipe");
+        let (stdout_read, stdout_write) =
+            appcontainer_pipe(profile.as_psid()).expect("stdout pipe");
         crate::win_common::clear_inherit(stdout_read);
-        let (stderr_read, stderr_write) = appcontainer_pipe(profile.as_psid()).expect("stderr pipe");
+        let (stderr_read, stderr_write) =
+            appcontainer_pipe(profile.as_psid()).expect("stderr pipe");
         crate::win_common::clear_inherit(stderr_read);
         let job = crate::win_common::create_job_object().expect("lineage job");
         prepared.push((
@@ -210,7 +214,8 @@ fn run_round(
                             console: ConsoleNeed::NotNeeded,
                         })
                         .expect("every lane must spawn through the shared control pipe");
-                    let (out, _err) = crate::win_common::read_two_pipes_to_strings(out_r.0, err_r.0);
+                    let (out, _err) =
+                        crate::win_common::read_two_pipes_to_strings(out_r.0, err_r.0);
                     wait_and_close(&child, job.0);
                     parse_attempts(lane, &out)
                 })
@@ -330,7 +335,8 @@ fn request_pipe_congestion_by_concurrency() {
     let shared = SharedSpawnDaemon::start(
         crate::tier2a::spawnd::TransitionPolicy::empty(""),
         ChildProcessPolicy::Unrestricted,
-    ).expect("a shared spawn daemon must start");
+    )
+    .expect("a shared spawn daemon must start");
     eprintln!(
         "[congestion] daemon pid={} request_pipe={} rounds={ROUNDS} repeat/lane={REPEAT_PER_LANE}",
         shared.daemon_pid(),
