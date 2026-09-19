@@ -135,6 +135,25 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "a_git_config_trap_cannot_reach_its_program_when_transitions_are_enforced",
         ],
     ),
+    // [⑤を既定へ入れる準備①] **既定の遷移宣言一式の一次データ**を測る。実務に近い台本を
+    // 旗つきで回し、宣言を0本から足しながら**断られたものの一覧**を数える
+    // （`plans/DESIGN-MAC-ENFORCEMENT.md`が「旗を立てた回に何が断られるかを数えることが
+    // 一次データになる」と定めている）。1回の起動で何度もTier2aセッションを作るので、
+    // `e2e-git-config-transition`とは別の的にしてある（1要素＝1測定）。
+    (
+        "e2e-declaration-survey",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "what_a_realistic_session_needs_declared",
+        ],
+    ),
     // N8-③-C-WFP: 生TCPの445が本番Tier2aのWFP適用下でも塞がるかを測る
     // （`plans/net-spike/RESULTS.md` N8-③-C）。`e2e-net-matrix`とは別に置くのは、
     // 行列全体を回さずこの1件だけを撃てるようにするため（1要素＝1測定）。

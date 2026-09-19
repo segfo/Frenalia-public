@@ -6102,11 +6102,37 @@ struct GitTrapArm {
     denied_by_kernel: Vec<String>,
 }
 
-/// 旗の有無だけを変えて1腕撃つ。
+/// 台本を1本撃って、**`run_shell`の本文と、待ち行列に残った拒否**を返す。
+struct DeniedArm {
+    /// `run_shell`が返した本文（拒否の注記を含む）。
+    text: String,
+    /// この腕で**Daemonが**断った実行ファイル。**畳まれていない**——同じ種類の拒否は
+    /// 「更新行」として何度も追記されるので、宣言へ足す側が畳むこと。
+    denied_by_daemon: Vec<String>,
+    /// この腕で**カーネルが**止めた実行ファイル。**今日は購読者が居ないので常に空**。
+    denied_by_kernel: Vec<String>,
+}
+
+/// 旗の有無だけを変えて台本を1本撃ち、待ち行列を読む。**これが唯一の実装である。**
 ///
-/// **待ち行列は撃つ前に消す。** 残したまま撃つと、前の腕の拒否を今の腕の結果として
-/// 数える（`B-35`の対を取る測定で、いちばん静かに壊れる形）。
-fn run_git_trap_arm(ws: &Path, case_name: &str, enforce: bool) -> Result<GitTrapArm, String> {
+/// # なぜ台本を引数で受けるのか
+///
+/// 「撃って待ち行列を読む」を測定ごとに複製すると、**片方にだけ落とし穴の対処が入った状態**が
+/// 生まれる。ここが持っている対処は3つで、どれも欠けると**測りそこねたことが分からない**形で壊れる。
+///
+/// 1. **待ち行列は撃つ前に消す。** 残したまま撃つと、前の腕の拒否を今の腕の結果として
+///    数える（`B-35`の対を取る測定で、いちばん静かに壊れる形）
+/// 2. **あふれたら測定ごと無効にする**（`B-10`）。一覧が欠けたまま「これで全部だ」と
+///    読まれるのがいちばん高くつく
+/// 3. **解析できない行が1行でもあれば無効にする。** 読めなかった行の中に拒否が居たかは
+///    分からないので、「断られなかった」と数えてはいけない
+fn run_arm_collecting_denials(
+    ws: &Path,
+    case_name: &str,
+    enforce: bool,
+    script: &str,
+    log_tag: &str,
+) -> Result<DeniedArm, String> {
     use harness_sandbox::tier2a::spawnd::transitions::{pending_path, read_from, PendingRecord};
 
     let queue = pending_path(ws);
@@ -6116,7 +6142,7 @@ fn run_git_trap_arm(ws: &Path, case_name: &str, enforce: bool) -> Result<GitTrap
     if enforce {
         args.push("--enforce-transitions");
     }
-    let run = run_harness(ws, &run_shell_script_turns(GIT_TRAP_SCRIPT), &args, case_name);
+    let run = run_harness(ws, &run_shell_script_turns(script), &args, case_name);
     if !run.status.success() {
         return Err(format!(
             "harness itself failed to run ({}). **拒否ではなく起動の失敗である**: {}",
@@ -6154,19 +6180,31 @@ fn run_git_trap_arm(ws: &Path, case_name: &str, enforce: bool) -> Result<GitTrap
         ));
     }
 
-    let fired = text.contains(GIT_TRAP_RAN_MARKER);
-    let refused = text.contains(GIT_TRAP_DENIED_MARKER);
     eprintln!(
-        "[git-trap] --- {case_name} (enforce={enforce}) ---\n\
-         fired={fired} refused={refused} denied_by_daemon={denied_by_daemon:?} \
-         denied_by_kernel={denied_by_kernel:?}\n{text}\n[git-trap] --- end ---"
+        "[{log_tag}] --- {case_name} (enforce={enforce}) ---\n\
+         denied_by_daemon={denied_by_daemon:?} denied_by_kernel={denied_by_kernel:?}\n\
+         {text}\n[{log_tag}] --- end ---"
     );
-    Ok(GitTrapArm {
-        fired,
-        refused,
+    Ok(DeniedArm {
         text,
         denied_by_daemon,
         denied_by_kernel,
+    })
+}
+
+/// 仕掛け（敵対的な`.git/config`）の腕を1本撃つ。**待ち行列の扱いは
+/// [`run_arm_collecting_denials`]が持ち、ここは仕掛け固有の判定だけを足す。**
+fn run_git_trap_arm(ws: &Path, case_name: &str, enforce: bool) -> Result<GitTrapArm, String> {
+    let arm = run_arm_collecting_denials(ws, case_name, enforce, GIT_TRAP_SCRIPT, "git-trap")?;
+    let fired = arm.text.contains(GIT_TRAP_RAN_MARKER);
+    let refused = arm.text.contains(GIT_TRAP_DENIED_MARKER);
+    eprintln!("[git-trap] {case_name}: fired={fired} refused={refused}");
+    Ok(GitTrapArm {
+        fired,
+        refused,
+        text: arm.text,
+        denied_by_daemon: arm.denied_by_daemon,
+        denied_by_kernel: arm.denied_by_kernel,
     })
 }
 
@@ -6353,6 +6391,386 @@ fn a_git_config_trap_cannot_reach_its_program_when_transitions_are_enforced() {
     assert!(
         failures.is_empty(),
         "`.git/config`の発火と遷移MAC（残課題#39）:\n{}",
+        failures.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 既定の宣言一式の一次データ——**実務に近いセッションが何を宣言しないと動かないか**
+// ---------------------------------------------------------------------------
+
+/// 台本に載せる候補。`(プログラム, 実際に打つ行)`。
+///
+/// # なぜ「打つ行」まで持つのか
+///
+/// 遷移の宣言は`(実行ファイル, argv)`の対で書ける（[`harness_policy`]の`TransitionEdge`）。
+/// **版を聞くだけの行と、実際に仕事をさせる行では、その先で起きる子が違う**
+/// ——`cargo --version`は`cargo.exe`しか起こさないが、`cargo build`は`rustc`を起こし、
+/// `rustc`はリンカを起こす。**鎖の深さは打つ行で決まる**ので、行ごと持つ。
+const SURVEY_CANDIDATES: &[(&str, &str)] = &[
+    ("git", "git status --porcelain"),
+    ("git", "git --no-pager diff --stat"),
+    ("git", "git --no-pager log -1 --oneline"),
+    // **鎖が深い1本**。`--offline`なのは、ネットワークの可否を遷移の可否と混ぜないため。
+    ("cargo", "cargo build --offline --quiet"),
+    ("node", "node --version"),
+    ("npm", "npm --version"),
+    // System32の実体。**正の対照**——これが断られない回は強制が効いていない。
+    ("findstr", r"findstr.exe /C:fn src\main.rs"),
+];
+
+/// 鎖の段数の上限。**段数は決め打ちしない**（§S64と同じ理由）——ここは暴走を止める栓であって、
+/// 「何段あるはずだ」という主張ではない。
+const SURVEY_MAX_HOPS: usize = 12;
+
+/// この機械にそのプログラムが入っているか。
+///
+/// **入っていないものを台本へ載せない。** 入っていないプログラムは起動そのものが
+/// 「見つからない」で終わるので**断られた一覧に現れない**——載せると、
+/// 一覧に穴が空いたまま「これで全部だ」と読める（`B-10`）。
+fn program_exists_on_host(program: &str) -> bool {
+    host_path_of(program).is_some()
+}
+
+/// ホスト側でその名前が指す実体のパス（`where.exe`の1行目）。
+///
+/// # なぜ絶対パスでも撃つのか（**名前が通らない＝MACに届かない、ではない**）
+///
+/// サンドボックスの中で名前を解決できないプログラムは、**シェルが起動を試みない**ので
+/// 遷移MACに届かない。しかしそれは「宣言が要らない」ことを意味しない——
+/// **絶対パスで呼べば起動は試みられる**ので、そこで初めて断られる。
+/// 名前で撃つ行だけを数えると、**宣言一式に必要な本数を実際より少なく見積もる**。
+fn host_path_of(program: &str) -> Option<String> {
+    let out = std::process::Command::new("where.exe")
+        .arg(program)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// `run_shell`の本文から、**名前を解決できずに起動を試みてすらいない**プログラムを拾う。
+///
+/// # なぜこれが要るのか（**2026-09-19に踏んだ**）
+///
+/// 最初の版はホスト側に入っているかだけを見ていた。**入っていても、サンドボックスの中で
+/// 名前が解決できなければシェルは起動を試みない**——遷移MACには1度も届かないので、
+/// 待ち行列にも現れない。つまり**「断られなかった」と「試してすらいない」が同じ顔になる**。
+/// 実際に`cargo`・`node`・`npm`がこれで一覧から消え、**3本しかない一覧を「全部」と読むところ**だった。
+///
+/// # エラー本文を解析しない理由（**最初の版はそれで検出漏れした**）
+///
+/// 1つ目の版は`ObjectNotFound: (<名前>:String)`という綴りを探していた。**旗の有無で
+/// シェルが変わる**（強制する回はWindows PowerShell 5.1、しない回はpwsh 7。§S62）ので、
+/// pwsh 7の簡潔なエラー表示にはその綴りが**1度も現れず**、対照側が「全部解決できた」に見えていた。
+/// **検出漏れする判定は、無いより悪い。**
+///
+/// だから本文を読むのをやめ、**シェル自身に答えさせる**。`Get-Command`はどちらのシェルにもあり、
+/// 印は自分で決めた綴りなので翻訳も書式変更も受けない。
+fn programs_never_attempted(text: &str, programs: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for program in programs {
+        let missing = format!("{SURVEY_PROBE_MISSING} {program}");
+        if text.contains(&missing) && !out.iter().any(|p| p == program) {
+            out.push((*program).to_string());
+        }
+    }
+    out
+}
+
+/// 名前を解決できたときにシェルが出す印。
+const SURVEY_PROBE_OK: &str = "HP_PROBE_OK";
+/// 名前を解決できなかったときにシェルが出す印。
+const SURVEY_PROBE_MISSING: &str = "HP_PROBE_MISSING";
+/// 実体のファイルが**サンドボックスから見えている**ときの印。
+const SURVEY_SEE_OK: &str = "HP_SEE_OK";
+/// 実体のファイルが**サンドボックスから見えていない**ときの印。
+const SURVEY_SEE_NO: &str = "HP_SEE_NO";
+
+/// この機械で撃てる行だけを集めて台本にする。戻りは`(台本, 載せなかったプログラム)`。
+///
+/// 台本は2段になる——**まずサンドボックスの中で名前を解決できるかを申告させ**、そのあと
+/// 実際に打つ行を並べる。申告を先に置くのは、**解決できなかったものが「断られなかった」に
+/// 化けるのを止める**ためである（[`programs_never_attempted`]）。
+fn survey_script_for_this_machine() -> (String, Vec<String>) {
+    let mut probes: Vec<String> = Vec::new();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut probed: Vec<&str> = Vec::new();
+    for (program, line) in SURVEY_CANDIDATES {
+        if !program_exists_on_host(program) {
+            if !skipped.iter().any(|s| s == program) {
+                skipped.push((*program).to_string());
+            }
+            continue;
+        }
+        if !probed.contains(program) {
+            probed.push(program);
+            // `Get-Command`はコマンドレットなので**子プロセスを1つも起こさない**
+            // ——この申告自体が遷移の数に混ざることはない。
+            probes.push(format!(
+                "if (Get-Command {program} -ErrorAction SilentlyContinue) \
+                 {{ '{SURVEY_PROBE_OK} {program}' }} else {{ '{SURVEY_PROBE_MISSING} {program}' }}"
+            ));
+        }
+        lines.push(line);
+    }
+    // **絶対パスでも1本ずつ撃つ。** 名前が解決できないものは、名前で撃つ行では
+    // 遷移MACに届かない（[`host_path_of`]のdoc）。ここで届かせて、
+    // 「宣言が要る」のか「そもそも実体を起こせない」のかを分ける。
+    let mut by_path: Vec<String> = Vec::new();
+    for program in &probed {
+        if let Some(abs) = host_path_of(program) {
+            // **見えているかを先に聞く。** 絶対パスで撃っても「認識されません」になる場合、
+            // 原因は2つある——ファイルが見えていない（読めない）か、見えているが起こせないか。
+            // `Test-Path`はコマンドレットなので子を1つも起こさず、**遷移の数に混ざらない**。
+            by_path.push(format!(
+                "if (Test-Path -LiteralPath '{abs}') \
+                 {{ '{SURVEY_SEE_OK} {program}' }} else {{ '{SURVEY_SEE_NO} {program}' }}"
+            ));
+            by_path.push(format!("& '{abs}' --version"));
+        }
+    }
+    let script = probes
+        .iter()
+        .map(String::as_str)
+        .chain(lines)
+        .chain(by_path.iter().map(String::as_str))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    (script, skipped)
+}
+
+/// 実務に近いワークスペースを作る——gitの履歴と、**リンカまで降りる最小のcargoプロジェクト**。
+fn seed_survey_workspace(ws: &Path) -> Result<(), String> {
+    git_seed_repo(ws)?;
+    std::fs::create_dir_all(ws.join("src")).map_err(|e| format!("srcを作れない: {e}"))?;
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        "[package]\nname = \"survey\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .map_err(|e| format!("Cargo.tomlを置けない: {e}"))?;
+    std::fs::write(ws.join("src").join("main.rs"), "fn main() {}\n")
+        .map_err(|e| format!("main.rsを置けない: {e}"))?;
+    // 追跡させておく（`git diff --stat`が何も比べないと、その行は子を1つも起こさない）。
+    plain_git(ws, &["add", "Cargo.toml", "src/main.rs"])?;
+    plain_git(ws, &["commit", "-q", "-m", "survey fixture"])?;
+    std::fs::write(ws.join("src").join("main.rs"), "fn main() {\n    // touched\n}\n")
+        .map_err(|e| format!("main.rsを書き換えられない: {e}"))?;
+    Ok(())
+}
+
+/// **既定の宣言一式の一次データを測る**（⑤を既定へ入れる準備①）。
+///
+/// # 何を測っているのか
+///
+/// 「遷移MACが効くか」ではない（それは§S63と§S64が測った）。ここで測るのは
+/// **実務に近いセッションを回すために、宣言へ何本書かないといけないのか**である。
+/// 設計書（`plans/DESIGN-MAC-ENFORCEMENT.md`）が「旗を立てた回に何が断られるかを数えることが、
+/// 既定の宣言一式の一次データになる」と定めているものの実体化にあたる。
+///
+/// # 1回撃っただけでは一覧が出揃わない
+///
+/// **断られた時点でその先が起きない。** gitを断ればgitが起こすはずだった子は現れないので、
+/// 宣言を0本から始めて**断られたものを足しては撃ち直す**。新しく断られるものが
+/// 無くなった回が「鎖の全段が出た」印である。
+///
+/// # これは合否のテストではなく、測定である
+///
+/// 赤くなるのは**測定が成立していないとき**だけにしてある——旗なしの腕で拒否が出た
+/// （遷移MAC以外の何かが止めている）／旗ありの段0で拒否が1件も出ない（強制が効いていない）／
+/// 上限まで回っても収束しない（鎖が切れていない）。**「何本だった」を合格条件にしない**
+/// ——機械に入っているものが変われば本数は変わる。
+#[test]
+#[ignore = "starts several real Tier2a sessions with the transition MAC enforced; run through dev-elevated-run"]
+fn what_a_realistic_session_needs_declared() {
+    let ws = case_dir("declaration-survey");
+    seed_survey_workspace(&ws).unwrap_or_else(|e| panic!("仕掛けを置けなかった: {e}"));
+
+    let (script, skipped) = survey_script_for_this_machine();
+    assert!(
+        !script.is_empty(),
+        "台本が空である。候補のプログラムが1つもこの機械に無い（載せなかった: {skipped:?}）"
+    );
+    eprintln!(
+        "[survey] 台本（{}行）:\n{script}\n[survey] この機械に無くて載せなかったもの: {skipped:?}",
+        script.lines().count()
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // --- 腕A: 旗を立てない。**今日の既定では拒否が1件も起きない**ことの確認 ---
+    let unenforced = run_arm_collecting_denials(&ws, "survey-unenforced", false, &script, "survey")
+        .unwrap_or_else(|e| panic!("腕A（旗なし）が測れなかった: {e}"));
+    if !unenforced.denied_by_daemon.is_empty() {
+        failures.push(format!(
+            "腕A: 旗を立てていないのに拒否が出ている（{:?}）。**遷移MAC以外の何かが止めている**ので、\
+             以後の段の「断られた」を遷移MACの成果として数えられない",
+            unenforced.denied_by_daemon
+        ));
+    }
+    // **旗と無関係に名前が解決できないもの**を先に数えておく。旗ありの段0で同じ名前が出たとき、
+    // 「遷移MACのせいで起動できない」と読み違えないための対照である。
+    let candidate_names: Vec<&str> = SURVEY_CANDIDATES.iter().map(|(p, _)| *p).collect();
+    let never_unenforced = programs_never_attempted(&unenforced.text, &candidate_names);
+    eprintln!(
+        "[survey] 腕A（旗なし）で名前を解決できなかったもの: {never_unenforced:?}\
+         ——ここに出るものは**遷移MACとは無関係**である"
+    );
+
+    // --- 旗を立てて、断られたものを足しては撃ち直す ---
+    let mut declared: Vec<String> = Vec::new();
+    let mut hops: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut converged_at: Option<usize> = None;
+
+    for hop in 0..SURVEY_MAX_HOPS {
+        declare_programs(&ws, &declared)
+            .unwrap_or_else(|e| panic!("段{hop}の宣言を書けなかった: {e}"));
+        let case_name = format!("survey-hop{hop}");
+        let arm = run_arm_collecting_denials(&ws, &case_name, true, &script, "survey")
+            .unwrap_or_else(|e| panic!("段{hop}が測れなかった: {e}"));
+
+        if hop == 0 {
+            // **名前を解決できなかったものは、遷移MACに1度も届いていない。**
+            // 一覧から静かに消えるので、ここで拾って測定ごと無効にする（`B-10`）。
+            let names: Vec<&str> = SURVEY_CANDIDATES.iter().map(|(p, _)| *p).collect();
+            // **申告そのものが出ていない**なら、解決できたかどうかを判定できていない。
+            // 「印が無い＝解決できた」と読むと、また静かに短い一覧ができる。
+            let unprobed: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|p| {
+                    !arm.text.contains(&format!("{SURVEY_PROBE_OK} {p}"))
+                        && !arm.text.contains(&format!("{SURVEY_PROBE_MISSING} {p}"))
+                })
+                .collect();
+            if !unprobed.is_empty() {
+                failures.push(format!(
+                    "段0: {unprobed:?} について**名前を解決できたかの申告が1つも出ていない**。\
+                     申告の行がシェルへ届いていないので、この一覧が全部かどうかを判定できない"
+                ));
+            }
+            // **見えているか／見えていないか**を要約する。一覧の本数が小さいとき、
+            // 「宣言が3本で足りる」のか「3本しか遷移MACまで届いていない」のかは
+            // ここでしか分かれない。
+            let visible: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|p| arm.text.contains(&format!("{SURVEY_SEE_OK} {p}")))
+                .collect();
+            let invisible: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|p| arm.text.contains(&format!("{SURVEY_SEE_NO} {p}")))
+                .collect();
+            eprintln!(
+                "[survey] 段0: サンドボックスから**実体が見えた**={visible:?} / \
+                 **見えなかった**={invisible:?}（見えないものは絶対パスで撃っても\
+                 遷移MACに届かない——止めているのはファイルを読めるかどうかである）"
+            );
+
+            let never = programs_never_attempted(&arm.text, &names);
+            // **解決できないこと自体は、この測定の失敗ではない**——旗を立てない腕でも同じなら、
+            // 遷移MACとは無関係の既存の制約である（宣言を足しても直らない）。
+            // **失敗なのは、旗を立てた側でだけ解決できなくなったとき**——強制を入れた代償として
+            // 道具が届かなくなったことを意味し、既定へ入れる判断に直接効く。
+            let lost_by_enforcing: Vec<&String> = never
+                .iter()
+                .filter(|p| !never_unenforced.contains(p))
+                .collect();
+            if !lost_by_enforcing.is_empty() {
+                failures.push(format!(
+                    "段0: {lost_by_enforcing:?} は**旗を立てた側でだけ名前を解決できない**。\
+                     旗なしでは解決できているので、強制を入れたこと（＝シェルが\
+                     Windows PowerShell 5.1へ替わること、§S62）が原因である。\
+                     **宣言では直らない種類の後退**なので、既定へ入れる前に決着させること"
+                ));
+            }
+            if !never.is_empty() {
+                eprintln!(
+                    "[survey] 段0: {never:?} は**サンドボックスの中で名前を解決できず、\
+                     起動を試みてすらいない**（旗なしでも同じ={}）。\
+                     **この一覧は「実務に必要な全部」ではない**——遷移MACへ届いていないものが\
+                     この数だけ在る。直すのは宣言ではなく、PATHかその置き場を読めるようにする側である",
+                    lost_by_enforcing.is_empty()
+                );
+            }
+        }
+
+        if hop == 0 && arm.denied_by_daemon.is_empty() {
+            failures.push(
+                "段0: 宣言が1本も無いのに**拒否が1件も出ていない**。強制が効いていないか\
+                 （旗が渡っていない／生成禁止が積まれていない）、台本がそもそも子を1つも\
+                 起こしていない。どちらにせよこの測定は無効である"
+                    .to_string(),
+            );
+            break;
+        }
+
+        if !arm.denied_by_kernel.is_empty() {
+            // **失敗ではない。** 購読者が入った日に初めて現れる行である（§10.2）。
+            eprintln!(
+                "[survey] 段{hop}: カーネル拒否の行が現れた: {:?}",
+                arm.denied_by_kernel
+            );
+        }
+
+        // **畳んでから足す。** 同じ拒否は更新行として何度も積まれるので、そのまま足すと
+        // `policy.json`が重複した辺を持ち、**宣言がまるごと効かなくなる**（§S64で踏んだ）。
+        let mut newly: Vec<String> = Vec::new();
+        for exe in &arm.denied_by_daemon {
+            let known = declared
+                .iter()
+                .chain(newly.iter())
+                .any(|d| d.eq_ignore_ascii_case(exe));
+            if !known {
+                newly.push(exe.clone());
+            }
+        }
+        eprintln!(
+            "[survey] 段{hop}: 宣言済み{}本 → 新しく断られた{}本 {newly:?}",
+            declared.len(),
+            newly.len()
+        );
+        hops.push((hop, newly.clone()));
+        if newly.is_empty() {
+            converged_at = Some(hop);
+            break;
+        }
+        declared.extend(newly);
+    }
+
+    // --- 一覧を1箇所にまとめて出す（記録へ写す元になる） ---
+    eprintln!("[survey] ===== 断られた一覧（宣言へ足した順） =====");
+    for (hop, newly) in &hops {
+        for exe in newly {
+            eprintln!("[survey]   段{hop}: {exe}");
+        }
+    }
+    eprintln!(
+        "[survey] ===== 合計{}本 / 収束した段: {:?} / 載せなかったプログラム: {skipped:?} =====",
+        declared.len(),
+        converged_at
+    );
+
+    if converged_at.is_none() && failures.is_empty() {
+        failures.push(format!(
+            "上限{SURVEY_MAX_HOPS}段まで回しても**新しい拒否が出続けた**。鎖が切れていないので、\
+             この一覧は「全部」ではない。ここまでの宣言（{}本）: {declared:?}",
+            declared.len()
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "測定が成立していない（{}件）:\n{}",
+        failures.len(),
         failures.join("\n")
     );
 }
