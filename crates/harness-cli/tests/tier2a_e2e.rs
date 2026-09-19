@@ -6571,7 +6571,21 @@ const SURVEY_CANDIDATES: &[(&str, &str)] = &[
     ("git", "git --no-pager diff --stat"),
     ("git", "git --no-pager log -1 --oneline"),
     // **鎖が深い1本**。`--offline`なのは、ネットワークの可否を遷移の可否と混ぜないため。
-    ("cargo", "cargo build --offline --quiet"),
+    //
+    // **前後を印で挟む。** 「ビルドが通ったか」を出力の有無や終了コードで読もうとすると、
+    // `--quiet`の無出力と失敗の無出力が同じ顔になり、しかも`run_shell`が返す終了コードは
+    // **台本の最後の行のもの**でこの行のものではない。だから**成果物が在るかをシェル自身に
+    // 答えさせる**（既存の`HP_SEE_OK`と同じ作法）。
+    //
+    // **先に消すのが要である。** ワークスペースは腕と段をまたいで使い回すので、
+    // 消さずに撃つと**前の腕が作った成果物**を今の腕の成功として読む。`Remove-Item`も
+    // `Test-Path`もコマンドレットなので、子プロセスを1つも起こさない＝遷移の数に混ざらない。
+    (
+        "cargo",
+        "Remove-Item -Force -ErrorAction SilentlyContinue target\\debug\\survey.exe\n\
+         cargo build --offline --quiet\n\
+         if (Test-Path target\\debug\\survey.exe) { 'HP_BUILD_OK' } else { 'HP_BUILD_NG' }",
+    ),
     ("node", "node --version"),
     ("npm", "npm --version"),
     // System32の実体。**正の対照**——これが断られない回は強制が効いていない。
@@ -6581,6 +6595,12 @@ const SURVEY_CANDIDATES: &[(&str, &str)] = &[
 /// 鎖の段数の上限。**段数は決め打ちしない**（§S64と同じ理由）——ここは暴走を止める栓であって、
 /// 「何段あるはずだ」という主張ではない。
 const SURVEY_MAX_HOPS: usize = 12;
+
+/// ビルドが最後まで通って成果物ができたときにシェルが出す印。
+const SURVEY_BUILD_OK: &str = "HP_BUILD_OK";
+/// 成果物ができなかったときにシェルが出す印。**印が片方も出ない回は測れていない**
+/// （その行までシェルが到達していない）ので、`OK`の否定として扱ってはいけない。
+const SURVEY_BUILD_NG: &str = "HP_BUILD_NG";
 
 /// この機械にそのプログラムが入っているか。
 ///
@@ -7190,6 +7210,72 @@ fn what_a_realistic_session_needs_declared() {
         ))
     };
 
+    // --- 腕C: 旗なし＋道具が見える。**差し込みの壁が無かったら鎖はどこまで行くか** ---
+    //
+    // # なぜこの腕で「壁の向こう」が見えるのか
+    //
+    // 旗を立てない構成では子を**シェル自身**が起こす。Daemonを通らないので、Daemonの入口が
+    // 相手のビット数を見ずにx64のDLLを差し込んで失敗する窓（§S68）に**そもそも入らない**。
+    // つまり「32bitの子を起こせない」という壁を外した世界がそのまま撃てる——**製品を
+    // 1行も変えず、抜け道も作らずに**。
+    //
+    // # この腕が証明しないこと（**引き算しないこと**）
+    //
+    // - **Daemon側からx86を差し込めば通る、は証明しない。** ここは差し込み自体が起きない構成である
+    // - **旗ありとの差を「遷移MACが持ち込んだ後退」と書けない。** 変えている軸が2つある
+    //   （遷移の検査の有無と、差し込みの有無）。1軸の比較ではない
+    let beyond_wall = if grant_args.is_empty() {
+        None
+    } else {
+        match run_arm_collecting_denials(
+            &ws,
+            "survey-unenforced-visible",
+            false,
+            &script,
+            "survey",
+            &grant_args,
+        ) {
+            Ok(arm) => {
+                let ok = arm.text.contains(SURVEY_BUILD_OK);
+                let ng = arm.text.contains(SURVEY_BUILD_NG);
+                eprintln!(
+                    "[survey] 腕C（旗なし・道具が見える）: ビルドの印 OK={ok} NG={ng}\n\
+                     [survey] 　→ {}",
+                    if ok {
+                        "**鎖は最後まで通った**。壁は差し込みの1枚だけである"
+                    } else if ng {
+                        "**別の理由で止まった**。壁はもう1枚ある——出力で名指しを探すこと"
+                    } else {
+                        "**印が片方も出ていない**＝その行までシェルが到達していない（測れていない）"
+                    }
+                );
+                if !ok && !ng {
+                    failures.push(format!(
+                        "腕C: ビルドの印が片方も出ていない。台本のcargoの段までシェルが\
+                         到達していないので、**壁の向こうを測れていない**。run_shellの本文:\n{}",
+                        arm.text
+                    ));
+                }
+                Some((ok, ng, arm))
+            }
+            Err(e) => {
+                failures.push(format!("腕C（旗なし・道具が見える）が測れなかった: {e}"));
+                None
+            }
+        }
+    };
+    // 腕Cは**拒否が1件も出ない**はずである（旗を立てていない）。出るなら遷移MAC以外が
+    // 止めており、「壁の向こう」の観測として読めない。
+    if let Some((_, _, arm)) = &beyond_wall {
+        if !arm.denied_by_daemon.is_empty() {
+            failures.push(format!(
+                "腕C: 旗を立てていないのに拒否が出ている（{:?}）。**遷移MAC以外の何かが\
+                 止めている**ので、この腕を「壁が無い世界」として読めない",
+                arm.denied_by_daemon
+            ));
+        }
+    }
+
     // --- 軸が実際に振れたかを判定する（**ここが新しい歯**） ---
     if let Some(visible) = &visible {
         // 1. 掃き1で**見えなかったものが1つも無い**なら、2つの掃きは同じ条件である。
@@ -7250,6 +7336,23 @@ fn what_a_realistic_session_needs_declared() {
         }
     }
     eprintln!("[survey] ===== 載せなかったプログラム: {skipped:?} =====");
+
+    // --- 腕C（壁の向こう）の結論を1行で出す ---
+    eprintln!("[survey] ===== 壁の向こう（腕C: 旗なし・道具が見える） =====");
+    match &beyond_wall {
+        None => eprintln!(
+            "[survey]     撃っていない（見えるようにする対象がこの機械に無い）"
+        ),
+        Some((true, _, _)) => eprintln!(
+            "[survey]     ビルドは**最後まで通った**。鎖を止めているのは差し込みの1枚だけで、\
+             その後ろに別の壁は無い（この台本の範囲では）"
+        ),
+        Some((_, true, _)) => eprintln!(
+            "[survey]     ビルドは**通らなかった**。差し込みの壁を外しても別の理由で止まる\
+             ——**壁はもう1枚ある**"
+        ),
+        Some(_) => eprintln!("[survey]     印が出ておらず、測れていない"),
+    }
 
     // --- 実マシンに何を残したかを出す（剥がさない選択をしたので、必ず言う） ---
     eprintln!("[survey] ===== 実マシンに残した`--fs-allow`の付与 =====");
