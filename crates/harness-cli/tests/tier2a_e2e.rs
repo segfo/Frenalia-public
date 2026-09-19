@@ -173,6 +173,36 @@ fn run_harness_with_exe(
         turns,
         extra_args,
         case_name,
+        &[],
+    )
+}
+
+/// `run_harness`の、**起こす`harness.exe`へ環境変数を足せる版**。
+///
+/// # なぜ環境変数の口が要るのか（2026-09-19）
+///
+/// 診断の受け皿には**プロセス環境でしか開かないもの**がある。実例が
+/// `HARNESS_SPAWND_STDERR`（[`harness_sandbox::tier2a::spawnd::DAEMON_STDERR_ENV`]）で、
+/// Spawn Daemonはコンソールを持たないため、**既定では書いた診断がどこにも届かない**。
+///
+/// **テストプロセス側で`std::env::set_var`しない。** あれはプロセス全体を変えるので、
+/// 並行して走る他のケースが起こす`harness.exe`にも掛かる——ログが混ざった回と
+/// 混ざらなかった回が区別できなくなる。**起こす1本だけに渡す。**
+fn run_harness_with_env(
+    ws: &Path,
+    turns: &[Vec<StreamEvent>],
+    extra_args: &[&str],
+    case_name: &str,
+    env: &[(&str, String)],
+) -> HarnessRun {
+    run_harness_full(
+        &harness_exe(),
+        &ws.to_string_lossy(),
+        None,
+        turns,
+        extra_args,
+        case_name,
+        env,
     )
 }
 
@@ -189,6 +219,9 @@ fn run_harness_full(
     turns: &[Vec<StreamEvent>],
     extra_args: &[&str],
     case_name: &str,
+    // 起こす`harness.exe`だけに足す環境変数（[`run_harness_with_env`]）。
+    // **既定は`&[]`で、渡さない呼び出しの挙動は1ビットも変わらない。**
+    env: &[(&str, String)],
 ) -> HarnessRun {
     // **CoWセッションを作る唯一の入口**（BUG-135）。この関数が唯一であることは数えてある
     // ——このファイルで`--sandbox`を渡すのは16箇所で、16箇所すべてが`run_harness`／
@@ -233,6 +266,10 @@ fn run_harness_full(
         "HARNESS_TEST_RECALL_DATA_ROOT",
         recall_data_root(&scratch, case_name),
     );
+    // **呼び出し側が明示したものは最後に載せる**（[`run_harness_with_env`]）。
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
     if let Some(dir) = cwd_for_process {
         cmd.current_dir(dir);
     }
@@ -471,6 +508,7 @@ fn starting_a_cow_session_without_the_exclusive_guard_fails_before_spawning() {
         &[],
         &["--sandbox", "tier2a-cow"],
         "guard-probe-must-never-spawn",
+        &[],
     );
 }
 
@@ -1484,6 +1522,7 @@ fn assert_cow_redirect_through_cwd(
         &run_shell_script_turns(&script),
         &["--sandbox", "tier2a-cow"],
         case_name,
+        &[],
     );
     if !run.status.success() {
         return Err(format!(
@@ -1621,6 +1660,7 @@ fn case_t_workspace_path_longer_than_max_path(ex: &CowExclusive) -> Result<(), S
         &run_shell_script_turns("Write-Output 'unreachable'"),
         &["--sandbox", "tier2a-cow"],
         CASE,
+        &[],
     );
     if run.status.success() {
         return Err(format!(
@@ -6132,7 +6172,35 @@ struct DeniedArm {
     /// 付与が効いたのかを読むには起動側の出力が要る——無いと「見えるようにしたつもりで
     /// 見えていない」回を、そのまま結果として書いてしまう。
     harness_stderr: String,
+    /// **Spawn Daemonがこの腕で書いた診断**（[`DAEMON_STDERR_ENV`]で拾ったもの）。
+    ///
+    /// # なぜ3つ目の口が要るのか（**2026-09-19に、これが無くて1往復まるごと失った**）
+    ///
+    /// 待ち行列に積まれる拒否は`DenyReason`までで、**`SpawnFailed`はそれ以上何も持たない**
+    /// ——「辺は許可したが起こせなかった」とは分かるが、`CreateProcess`が何番で落ちたのかは
+    /// 積まれない（`harness-sandbox`の`spawnd/mod.rs`が、詳細を要求元へ返すと
+    /// パスや構成が漏れるという理由でそう決めている）。中身を書いているのは
+    /// **Daemonの標準エラーだけ**で、Daemonはコンソールを持たないので既定では
+    /// どこにも届かない。§S67はここで止まり、「宣言しても通らない拒否がある」ところまでしか
+    /// 書けなかった。
+    ///
+    /// harness自身の標準エラー（[`DeniedArm::harness_stderr`]）とも別である——Daemonは
+    /// **別プロセス**で、その出力はharnessのパイプへ1バイトも流れない。
+    daemon_stderr: String,
 }
+
+/// Daemonが書いた診断のうち、**起こそうとして失敗した**行だけを抜く。
+///
+/// 綴りの正本は`harness-sandbox`の`spawnd/server.rs`（`[spawnd] nested spawn failed for pid N: {e}`）。
+/// **`B-05`**（同じ文字列を2箇所に別々に書かない）に抵触するが、あちらは`eprintln!`の
+/// フォーマット文字列で定数になっていない。**ここを直すときは向こうも見ること。**
+const DAEMON_SPAWN_FAILURE_MARKER: &str = "nested spawn failed";
+
+/// 起こす`harness.exe`へ渡す、Daemonの標準エラーの行き先を指す環境変数。
+///
+/// **名前は`harness-sandbox`から引く**——テスト側で綴り直すと、変数名を変えた日に
+/// 「何も記録されない腕」が静かにできる（そして「失敗が起きなかった」と読まれる）。
+use harness_sandbox::tier2a::spawnd::client::DAEMON_STDERR_ENV;
 
 /// 旗の有無だけを変えて台本を1本撃ち、待ち行列を読む。**これが唯一の実装である。**
 ///
@@ -6166,16 +6234,31 @@ fn run_arm_collecting_denials(
     use harness_sandbox::tier2a::spawnd::transitions::{
         pending_path, read_from, remedy, PendingRecord, Remedy,
     };
+    use harness_sandbox::tier2a::spawnd::DenyReason;
 
     let queue = pending_path(ws);
     let _ = std::fs::remove_file(&queue);
+
+    // **腕ごとに1本、撃つ前に消す。** 共用にすると前の腕の失敗が今の腕の説明として読める
+    // ——待ち行列を撃つ前に消しているのと同じ理由である（この関数のdocの1番）。
+    let daemon_log = scratch_dir().join(format!("{case_name}-spawnd.log"));
+    let _ = std::fs::remove_file(&daemon_log);
 
     let mut args: Vec<&str> = vec!["--sandbox", "tier2a"];
     if enforce {
         args.push("--enforce-transitions");
     }
     args.extend(extra_args.iter().map(String::as_str));
-    let run = run_harness(ws, &run_shell_script_turns(script), &args, case_name);
+    let run = run_harness_with_env(
+        ws,
+        &run_shell_script_turns(script),
+        &args,
+        case_name,
+        &[(
+            DAEMON_STDERR_ENV,
+            daemon_log.to_string_lossy().into_owned(),
+        )],
+    );
     if !run.status.success() {
         return Err(format!(
             "harness itself failed to run ({}). **拒否ではなく起動の失敗である**: {}",
@@ -6193,10 +6276,14 @@ fn run_arm_collecting_denials(
     let mut denied_by_daemon = Vec::new();
     let mut denied_by_kernel = Vec::new();
     let mut denied_detail: Vec<(String, String)> = Vec::new();
+    let mut spawn_failures = 0usize;
     for record in &tail.records {
         match record {
             PendingRecord::DeniedByDaemon(d) => {
                 denied_by_daemon.push(d.exe.clone());
+                if matches!(d.reason, DenyReason::SpawnFailed) {
+                    spawn_failures += 1;
+                }
                 // **3つへ畳んだ側を持つ**（`DenyReason`の写しではない）。読む側が要る区別は
                 // 「宣言を足せば通るのか」だけで、そこは`remedy`が唯一の定義を持つ（`B-05`）。
                 let label = match remedy(&d.reason) {
@@ -6224,6 +6311,29 @@ fn run_arm_collecting_denials(
         ));
     }
 
+    // **受け皿が繋がっていないことを「失敗が無かった」と読ませない**（BUG-033型:
+    // 「ログが出ない＝通っていない」の前に、出力先がその**プロセスから**書けるかを確かめる）。
+    // 待ち行列が`SpawnFailed`を積んでいるなら、Daemonは必ず対応する診断を書いている
+    // （`spawnd/server.rs`が同じ分岐で`eprintln!`する）。書かれていないなら、
+    // 届いていないのは**環境変数かファイルの側**であり、この腕から理由は読めない。
+    let daemon_stderr = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+    if spawn_failures > 0 && !daemon_stderr.contains(DAEMON_SPAWN_FAILURE_MARKER) {
+        return Err(format!(
+            "{case_name}: 待ち行列に`SpawnFailed`が{spawn_failures}件あるのに、Daemonの診断\
+             （{DAEMON_STDERR_ENV}={}）に`{DAEMON_SPAWN_FAILURE_MARKER}`の行が1つも無い。\
+             **受け皿が繋がっていない**ので、「何で落ちたか」はこの腕からは読めない\
+             ——「失敗の理由が無かった」と読まないこと。拾えた中身（{}バイト）:\n{daemon_stderr}",
+            daemon_log.display(),
+            daemon_stderr.len()
+        ));
+    }
+    for line in daemon_stderr
+        .lines()
+        .filter(|l| l.contains(DAEMON_SPAWN_FAILURE_MARKER))
+    {
+        eprintln!("[{log_tag}] {case_name}: Daemonの診断: {line}");
+    }
+
     eprintln!(
         "[{log_tag}] --- {case_name} (enforce={enforce}) ---\n\
          denied_by_daemon={denied_by_daemon:?} denied_by_kernel={denied_by_kernel:?}\n\
@@ -6235,6 +6345,7 @@ fn run_arm_collecting_denials(
         denied_detail,
         denied_by_kernel,
         harness_stderr: run.stderr,
+        daemon_stderr,
     })
 }
 
@@ -6699,6 +6810,14 @@ struct SurveySweep {
     /// ——その先で起きるはずだった子は1つも現れない。**「収束した」と「鎖が終わった」は
     /// 別の事実**であり、混ぜると§S66と同じ「短い一覧を全部と読む」に戻る。
     cut_by: Vec<(String, String)>,
+    /// 鎖を切った拒否について、**Daemonが書いた「何で落ちたか」**
+    /// （[`DeniedArm::daemon_stderr`]から抜いた行）。
+    ///
+    /// **[`SurveySweep::cut_by`]だけでは次の一手が決まらない。** あちらが言えるのは
+    /// 「宣言では直らない」までで、`CreateProcess`が何番で落ちたのかを持っているのは
+    /// この行だけである——実行ファイルが読めない（`ACCESS_DENIED`）のか、属性の
+    /// 組み合わせが悪い（`INVALID_PARAMETER`）のかで、打つ手はまるで違う。
+    cut_reasons: Vec<String>,
     /// 最後に宣言していた全部（＝断られた一覧）。
     declared: Vec<String>,
     /// 段0で実体が**見えた**プログラム（`HP_SEE_OK`）。
@@ -6733,6 +6852,7 @@ fn run_declaration_sweep(
         hops: Vec::new(),
         converged_at: None,
         cut_by: Vec::new(),
+        cut_reasons: Vec::new(),
         declared: Vec::new(),
         visible: Vec::new(),
         invisible: Vec::new(),
@@ -6875,6 +6995,15 @@ fn run_declaration_sweep(
                 .cloned()
                 .collect();
             sweep.cut_by.dedup();
+            // **切れた理由を、切れた事実と同じ段で拾う。** 次の段は撃たないので、
+            // ここで拾い損ねるとこの掃きからは二度と読めない。
+            sweep.cut_reasons = arm
+                .daemon_stderr
+                .lines()
+                .filter(|l| l.contains(DAEMON_SPAWN_FAILURE_MARKER))
+                .map(str::to_string)
+                .collect();
+            sweep.cut_reasons.dedup();
             break;
         }
         sweep.declared.extend(newly);
@@ -6892,6 +7021,9 @@ fn run_declaration_sweep(
         sweep.converged_at,
         sweep.cut_by
     );
+    for line in &sweep.cut_reasons {
+        eprintln!("[survey]   [{label}] 鎖を切った理由: {line}");
+    }
 
     if sweep.converged_at.is_none() {
         failures.push(format!(
@@ -6912,10 +7044,13 @@ fn run_declaration_sweep(
              したがってこの{}本は**下限であって「全部」ではない**。\
              理由が`SpawnFailed`なら辺は許可されていて`CreateProcess`が落ちている\
              （宣言ではなく起こし方の問題）、`NotRegistered`なら呼び出し元がDaemonの\
-             Process Tableに載っていない（鎖の深さの問題）——どちらなのかで次の一手が変わる",
+             Process Tableに載っていない（鎖の深さの問題）——どちらなのかで次の一手が変わる。\
+             Daemonが書いた「何で落ちたか」（{}行）: {:?}",
             sweep.converged_at,
             sweep.cut_by,
-            sweep.declared.len()
+            sweep.declared.len(),
+            sweep.cut_reasons.len(),
+            sweep.cut_reasons
         ));
     }
     sweep
@@ -7109,6 +7244,9 @@ fn what_a_realistic_session_needs_declared() {
             for exe in newly {
                 eprintln!("[survey]     {:<9} 段{hop}: {exe}", sweep.label);
             }
+        }
+        for line in &sweep.cut_reasons {
+            eprintln!("[survey]     {:<9} 鎖を切った理由: {line}", sweep.label);
         }
     }
     eprintln!("[survey] ===== 載せなかったプログラム: {skipped:?} =====");
