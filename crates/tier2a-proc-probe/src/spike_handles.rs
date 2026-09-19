@@ -89,7 +89,21 @@ pub fn emit(text: &str) -> Value {
         .write_all(text.as_bytes())
         .and_then(|()| out.flush())
         .is_ok();
-    json!({"mode": "emit", "wrote": text, "ok": ok})
+    // [#55] **自分が何者かを一緒に書く。**
+    //
+    // 遷移先ドメインで起こした子が「どのpackage SIDで動いているか」を測るのに要る。
+    // 起こした側（Daemon）の「このSIDで起こした」は**依頼の記録**であって結果ではないので、
+    // **子自身が自分のトークンを読んだ値**でなければ根拠にならない（`B-33`）。
+    //
+    // 既定のモードは同じ識別情報を**標準出力**へ出すが、nestedで起こされた子のstdioは
+    // `NUL`へ捨てられる（`spawnd::server::spawn_nested`）ので、そちらからは読めない。
+    // **欄を足すだけ**にしてあるので、既存の読み手（`mode`/`wrote`/`ok`を見るもの）は無変更。
+    json!({
+        "mode": "emit",
+        "wrote": text,
+        "ok": ok,
+        "identity": crate::winid::collect_identity(),
+    })
 }
 
 /// §20項目3: `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`だけのプロセスハンドルで、

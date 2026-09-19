@@ -1122,6 +1122,15 @@ fn run_pass2<'a>(
         policy: crate::policy_file::load(request.workspace_root)
             .map_err(|e| RecordNetError::SpawnDaemon(e.to_string()))?,
         workspace_root: request.workspace_root.to_string_lossy().into_owned(),
+        // [#55] **パス2は遷移先ドメインを用意しない。**
+        //
+        // ここが記録しているのは「このコマンドが何へ触るか」であって、
+        // **遷移の強制ではない**——パス2のドメインは`--domain`で指定された記録中のもの1つで、
+        // `policy.json`の遷移先とは由来が違う（`plans/DESIGN-MAC-PROTOCOL.md` §12.1の表）。
+        // 用意すると、記録のために起こした入れ物が記録の対象へ混ざる。
+        //
+        // **空は「用意できなかった」と同じ扱い**で、別ドメインへの遷移は断られる（fail-closed）。
+        domains: Vec::new(),
     };
     let spawn_daemon = request
         .spawn_daemon

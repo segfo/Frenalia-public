@@ -150,6 +150,21 @@ struct Shared {
     /// 実行中に差し替える口は持たない——辺の追加を実行中に反映するかは同節が未決のまま
     /// 残しており、6bでも決めていない。
     graph: harness_policy::transition::TransitionGraph,
+    /// [#55] **このセッションで用意できた遷移先ドメインの実体**
+    /// （`plans/DESIGN-MAC-BROKER.md` §22.9）。`Hello`で1回だけ受け取る。
+    ///
+    /// # ここに無いドメインへは起こさない
+    ///
+    /// 判定器（`graph`）が「Dへ移してよい」と答えても、**Dの実体がここに無ければ断る**。
+    /// 用意できない理由はharness側にある（宣言が許可済みでない・通信を宣言している）ので、
+    /// Daemonは**載っているかどうかだけ**を見る。
+    ///
+    /// **呼び出し元のcapabilityのまま名前だけ遷移先にする逃げ方は採らない**
+    /// （`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2）——宣言では狭めたつもりの遷移が
+    /// 1ビットも狭まらず、しかもその食い違いは症状として出ない。
+    ///
+    /// **セッション内で固定である**（`graph`と同じ理由。§19.2）。
+    provisioned_domains: Vec<DomainSpec>,
     /// [段階⑤] このDaemonが起こす子へ、生成禁止を積むか。
     ///
     /// **Daemon1本につき1つで、要求ごとに切り替えられない。** 電文（[`SpawnTopLevelRequest`]）の
@@ -219,12 +234,13 @@ pub fn serve(
     let _control_guard = HandleGuard(control);
 
     // --- ハンドシェイク: harnessのプロセスハンドルと遷移ポリシーを受け取る ---
-    let (harness_process, graph, transitions) = match read_control(control)? {
+    let (harness_process, graph, transitions, provisioned_domains) = match read_control(control)? {
         ControlRequest::Hello {
             harness_process,
             protocol_version,
             policy,
             workspace_root,
+            domains,
         } => {
             // **harnessと同じ関数を通る**（`protocol_version_mismatch`のdoc）。
             // 片側だけが検査すると、検査していない側から古いバイナリが入れる。
@@ -246,7 +262,12 @@ pub fn serve(
             // 置き場のパスを電文で受け取らないのは、昇格した書き手が後から来るためである
             // （§10.2・`P-01`。`client::hello_request`のdocが対になっている）。
             let transitions = TransitionQueue::new(std::path::Path::new(workspace_root.as_str()));
-            (HANDLE(harness_process as *mut _), graph, transitions)
+            (
+                HANDLE(harness_process as *mut _),
+                graph,
+                transitions,
+                domains,
+            )
         }
         other => {
             return Err(err(format!(
@@ -265,6 +286,7 @@ pub fn serve(
         table: Mutex::new(ProcessTable::new()),
         stopping: AtomicBool::new(false),
         graph,
+        provisioned_domains,
         child_process_policy,
         console_holders: ConsoleHolders::default(),
         transitions,
@@ -733,17 +755,37 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
         }
     };
 
-    // [暫定] 遷移先ドメインの実体（package SIDとcapabilityの組）を作る機構がまだ無い。
-    // **同じドメインへの遷移だけを起こす。**
-    if allowed.to != caller.domain.policy_domain {
-        return Served::denied(
-            DenyReason::TargetDomainNotProvisioned {
-                to: allowed.to.to_string(),
-            },
-            from_domain,
-            command_line,
-        );
-    }
+    // [#55] **遷移先ドメインの実体を表から引く。**
+    //
+    // 判定器は「Dへ移してよい」までしか答えない。Dで実際に起こすには
+    // Dのpackage SIDとcapabilityの組が要り、それはharnessが起動時に用意して
+    // `Hello`で渡している（`Shared::provisioned_domains`）。
+    //
+    // **表に無ければ断る。** 用意できない理由はharness側にある（宣言が許可済みでない・
+    // 通信を宣言している）ので、ここは載っているかどうかだけを見る。
+    // **呼び出し元のcapabilityのまま名前だけ遷移先にする逃げ方は採らない**——
+    // 宣言では狭めたつもりの遷移が1ビットも狭まらず、その食い違いは症状に出ない（§10.1.2）。
+    let target_domain = if allowed.to == caller.domain.policy_domain {
+        // 自己ループ。呼び出し元の実体をそのまま使う（表を引く必要が無い）。
+        &caller.domain
+    } else {
+        match shared
+            .provisioned_domains
+            .iter()
+            .find(|d| d.policy_domain == allowed.to)
+        {
+            Some(domain) => domain,
+            None => {
+                return Served::denied(
+                    DenyReason::TargetDomainNotProvisioned {
+                        to: allowed.to.to_string(),
+                    },
+                    from_domain,
+                    command_line,
+                )
+            }
+        }
+    };
 
     // §8.3: 辺が`cwd`を宣言していれば**その値を渡す**（検査するだけでは足りない）。
     // 宣言が無い辺は定義から「狭める／同値」なので、呼び出し元の実cwdをそのまま渡す。
@@ -751,7 +793,15 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
     // [段階6f-1] 呼び出し元の申告を使うが、**harnessが所有する名前だけは系統の値で強制する**。
     let env = env_for_nested(&caller.base_env, request.env.as_deref(), allowed.env);
 
-    match spawn_nested(shared, &caller, request, &command_line, effective_cwd, env) {
+    match spawn_nested(
+        shared,
+        &caller,
+        target_domain,
+        request,
+        &command_line,
+        effective_cwd,
+        env,
+    ) {
         Ok(spawned) => Served {
             response: spawned,
             from_domain,
@@ -1375,7 +1425,7 @@ fn spawn_top_level(
 /// | 何を | トップレベル | ここ（nested） |
 /// |---|---|---|
 /// | 系統Job | harnessが作って複製を渡す | **呼び出し元と同じ系統**（§10.1.1。別のJobを作ると「1コマンドの子孫だけ殺す」粒度が失われる） |
-/// | ドメイン | 電文の`DomainSpec` | **呼び出し元のものをそのまま**（＝同一ドメインの遷移だけ。[`DenyReason::TargetDomainNotProvisioned`]） |
+/// | ドメイン | 電文の`DomainSpec` | **辺が指す先を`Hello`の表から引いたもの**（[#55]。自己ループなら呼び出し元と同じ値、別ドメインならharnessが用意した実体。表に無ければ[`DenyReason::TargetDomainNotProvisioned`]） |
 /// | env | 電文の`env` | **呼び出し元の申告**へ辺の差分を当て、harness所有の名前だけ系統の値で強制（[`env_for_nested`]） |
 /// | stdio | harnessが作ったパイプの複製 | **呼び出し元のハンドルを引き抜いたもの**（申告が無い欄は`NUL`） |
 /// | 実行ファイル | コマンドライン任せ | **判定に使った`image`を`lpApplicationName`へ渡す** |
@@ -1388,12 +1438,16 @@ fn spawn_top_level(
 fn spawn_nested(
     shared: &Arc<Shared>,
     caller: &super::table::Caller,
+    // [#55] **起こす先のドメイン**。自己ループなら呼び出し元と同じ値だが、
+    // 別ドメインへの遷移ではharnessが用意した実体である。
+    // **`caller.domain`を直接読まない**——読むと、遷移先を決めた判断がここで消える。
+    target_domain: &DomainSpec,
     request: &NestedRequest<'_>,
     command_line: &str,
     cwd: &str,
     mut env: Vec<(String, String)>,
 ) -> Result<SpawnResponse, SpawnDaemonError> {
-    let domain = resolve_domain(&caller.domain)?;
+    let domain = resolve_domain(target_domain)?;
     let capability_attributes = domain.capability_attributes();
     let caller_process = HANDLE(caller.process as *mut _);
 
@@ -1432,8 +1486,14 @@ fn spawn_nested(
     };
     let mut env_block = build_env_block(&env);
 
-    // [段階6f-1] コンソールは**呼び出し元の申告**で借りる（決定2）。トップレベルと同じ関数を通る。
-    let console_window = match borrow_console_if_needed(shared, &caller.domain, request.console) {
+    // [段階6f-1] コンソールが要るかは**呼び出し元の申告**で決まる（決定2）。
+    // トップレベルと同じ関数を通る。
+    //
+    // [#55] **借りる相手は起こす先のドメインである。** §7.1.1が「分ける単位はドメインごと」と
+    // 決めており、根拠は可用性——同じコンソールを共有する子は`CTRL_BREAK_EVENT`で
+    // **互いのシェルを落とせる**（§S48）。呼び出し元のドメインで借りると、
+    // **package SIDを分けた意味がコンソールの側だけ残らない**。
+    let console_window = match borrow_console_if_needed(shared, target_domain, request.console) {
         Ok(window) => window,
         Err(e) => {
             close_all(&inherit_handles);
@@ -1496,11 +1556,21 @@ fn spawn_nested(
 
     // **Resumeより前に台帳へ載せる**（§12。トップレベルと同じ理由——子は起きた直後に
     // 自分も生成を要求し得るのに、そのとき載っていなければ「台帳に無い」で拒否される）。
+    // [#55] **載せるのは起こす先のドメインである。**
+    //
+    // この欄は「**この子が次に何かを頼んだときの`from`ドメイン**」になる（`resolve`が
+    // 台帳から引く）。呼び出し元のドメインを載せると、**子は遷移先のpackage SIDで走っているのに、
+    // 自分の生成要求だけは呼び出し元のドメインとして判定される**——狭めたはずの子が
+    // 呼び出し元の遷移権をそのまま持つ形で、「分けたつもりで分かれていない」ことが
+    // 症状として出ない（§10.1.2が却下した形と同じ性質の食い違いである）。
+    //
+    // **系統（`caller.lineage`）は呼び出し元のままでよい**——あちらは「1コマンドの子孫を
+    // まとめて殺す」粒度で、ドメインとは別の軸である（§10.1.1）。
     let registered = shared.table.lock().unwrap().register_in_lineage(
         pid,
         info.hProcess.0 as u64,
         caller.lineage,
-        caller.domain.clone(),
+        target_domain.clone(),
     );
     if let Err(e) = registered {
         // Resume前なので子はユーザーコードを1行も実行していない。**動かす前に畳む。**
@@ -1563,12 +1633,21 @@ fn spawn_nested(
 /// 素の生成では親は子に対して完全なアクセスを得るので、ここで絞ると
 /// **サンドボックスの中のビルドツールが自分の子を殺せなくなる**（`taskkill`相当が効かない）。
 ///
-/// # いまは同一ドメインの間でしか起きない
+/// # **ドメインを跨ぐようになった（2026-09-20、#55の骨格）。見直しはまだ済んでいない**
 ///
-/// 遷移先は呼び出し元と同じドメインに限られている（[`DenyReason::TargetDomainNotProvisioned`]）ので、
-/// 渡しても呼び出し元の権限は1ビットも増えない。**別ドメインへ遷移できるようになった日には
-/// 見直しが要る**——狭い側へ移したはずの子へ、広い側からの完全アクセスを手渡すことになる
-/// （`docs/STATUS.md`残課題#49）。
+/// 2026-09-17にこの関数を書いた時点では、遷移先は呼び出し元と同じドメインに限られていたので
+/// 「渡しても呼び出し元の権限は1ビットも増えない」が成立していた。**その前提は崩れた**
+/// ——いま`spawn_nested`は別ドメインの実体で子を起こすので、ここは
+/// **別のドメインで走る子への完全アクセスを呼び出し元へ手渡している**。
+///
+/// **DACLでは止まらない。** §22.1.1（案A）が子のプロセス／スレッドのDACLを絞っているのは
+/// `OpenProcess`を防ぐためで、**手渡したハンドルはアクセス検査を経ずに使える**
+/// （検査は開く瞬間に1回だけである）。
+///
+/// **どちら向きに倒すかは未決**（`docs/STATUS.md`残課題#49。**そこが「#45が閉じた日に決める」と
+/// 書いている、その日が来た**）。素の`CreateProcessW`と同じに見せる要件（待ち・終了コード・
+/// 再開・`taskkill`相当）と、注入に使える権限（`PROCESS_VM_WRITE`・`CREATE_THREAD`・
+/// `DUP_HANDLE`）を分けられるので、**跨ぐときだけマスクを絞る**のが有力な形である。
 ///
 /// 片方だけ成功した状態を残さない——2本目で落ちたら1本目を閉じる（`B-01`）。
 fn duplicate_to_caller(

@@ -690,6 +690,8 @@ fn hello_request(harness_process: u64, policy: super::TransitionPolicy) -> Contr
         // 要求受付パイプの受付を始めるので、宣言を持たないまま要求を捌く瞬間が無い。
         policy: Box::new(policy.policy),
         workspace_root: policy.workspace_root,
+        // [#55] 用意できた遷移先ドメインの実体。**宣言と同じ電文で1回だけ渡す。**
+        domains: policy.domains,
     }
 }
 

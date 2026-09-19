@@ -668,3 +668,198 @@ fn a_nested_child_starts_even_when_the_lineage_is_restricted() {
 
     drop(case);
 }
+
+// ---------------------------------------------------------------------------
+// [#55] 別のドメインで起こす（§22.9の骨格）
+// ---------------------------------------------------------------------------
+
+/// 遷移先ドメインの名前。**入口ドメインと綴りを変える**——同じだと自己ループになり、
+/// 表を引かずに通ってしまう（この測定が何も測らなくなる）。
+const TARGET_DOMAIN: &str = "spawnd-s55-target";
+
+/// 入口ドメインから`TARGET_DOMAIN`への辺を1本持ち、遷移先の定義も持つ宣言。
+///
+/// 遷移先は**宣言を1件も持たない**——骨格では「既に許可済みの宣言」しか引けないので、
+/// 宣言を持たせると用意できずにこの測定が成立しない（それは別の腕で測る）。
+fn policy_with_cross_domain_edge(exe: &str) -> PolicyFile {
+    let mut file = PolicyFile::default();
+    let mut entry = PolicyDomain::new(E2E_POLICY_DOMAIN);
+    entry.process = serde_json::from_value(serde_json::json!({
+        "transitions": [
+            { "exe": { "literal": exe }, "argv": { "any": true }, "to": TARGET_DOMAIN }
+        ]
+    }))
+    .expect("the transition declaration must parse");
+    file.domains.push(entry);
+    file.domains.push(PolicyDomain::new(TARGET_DOMAIN));
+    file
+}
+
+/// **T4（本体）**: 遷移先ドメインで起こした子は、**呼び出し元とは違うpackage SID**で動く。
+///
+/// # 壊れた状態を一文で
+///
+/// **「ドメインを分けた」と言いながら、全部が同じ入れ物で動いている。**
+/// §10.1.2が名指しで却下した逃げ方——呼び出し元のcapabilityのまま名前だけ遷移先にする——が
+/// 入ると、宣言では狭めたつもりの遷移が**1ビットも狭まらず、しかも症状として出ない**。
+/// だから「起きたか」ではなく**「どのSIDで起きたか」**を見る。
+///
+/// # なぜ子自身に報告させるのか
+///
+/// 起こした側（Daemon）が「このSIDで起こした」と言っても、それは**依頼の記録**であって
+/// 結果ではない。子のトークンを子自身が読んで書き出したものだけが、実際に効いた値である
+/// （`B-33`: 他人の成功報告を根拠にしない）。
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn a_cross_domain_transition_runs_the_child_under_a_different_package_sid() {
+    let probe = super::super::mac_spike_tests::probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+
+    let (case, profile, caps) = setup_with_provisioned_domains(
+        "spawnd-s55-cross",
+        ChildProcessPolicy::Unrestricted,
+        |_workspace| policy_with_cross_domain_edge(&probe_str),
+    );
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let marker = workspace.join("cross-domain-child.json");
+
+    let payload = request_payload(
+        &probe_str,
+        &[
+            "--emit",
+            "cross-domain",
+            "--report-file",
+            &marker.to_string_lossy(),
+        ],
+        &workspace,
+    );
+    let out = ask_daemon(&case, &profile, &caps, &payload);
+
+    assert_eq!(
+        reply_kind(&out).as_deref(),
+        Some("spawned"),
+        "別ドメインへの遷移が断られている。`target_domain_not_provisioned` なら\
+         遷移先の実体が表に載っていない（用意できなかった理由が起動時の警告に出ているはず）: {out}"
+    );
+    assert!(
+        wait_for_file(&marker, Duration::from_secs(30)),
+        "Daemonは `spawned` と答えたのに、子が1バイトも書いていない: {}",
+        marker.display()
+    );
+
+    // 子が自分で読んだpackage SID。**呼び出し元のもの（このテストのプロファイル）と違うこと。**
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&marker).expect("the child must have written its report"),
+    )
+    .expect("the child report must be json");
+    let child_sid = report
+        .get("identity")
+        .and_then(|v| v.get("appcontainer_sid"))
+        .and_then(|v| v.as_str())
+        .expect("the probe must report its AppContainer SID");
+    let caller_sid = crate::win_common::sid_to_string(profile.as_psid())
+        .expect("the caller's package SID must be readable");
+
+    assert_ne!(
+        child_sid, caller_sid,
+        "**遷移先の子が呼び出し元と同じpackage SIDで動いている。** ドメインを分けたつもりで\
+         1つの入れ物のまま——名前付きカーネルオブジェクト経由の横断チャネルが開いたままであり、\
+         §10.1.2が却下した「名前だけ遷移先にする」形そのものである"
+    );
+
+    drop(case);
+}
+
+/// **対の側**（`B-35`）: 用意できなかったドメインへの遷移は断られる。
+///
+/// これが無いと「表を引かずに常に起こす」実装でも上のT4は緑になり、
+/// **宣言だけあって実体の無いドメインでも子が動いてしまう**（どのトークンで動くのかは不定）。
+///
+/// ここでは遷移先の名前を**入れ物の名前にできない長さ**にする。宣言としては通る
+/// （ドメイン名の上限は50文字）が、入れ物の名前は64文字までなので作れない
+/// ——**宣言は正しいのに実体が作れない**形である。
+///
+/// # 試した2つが使えなかった理由（2026-09-20に実機で確認）
+///
+/// | 試した形 | なぜ腕にならないか |
+/// |---|---|
+/// | 遷移先が**許可されていない宣言**を持つ | 宣言の時点で落ちる。遷移先が呼び出し元より広い権限を持つと、編集時検査が「権限を広げる（または狭まることを証明できない）」として**宣言ごと拒否**する（§19.3.4の縮小性）。Daemonが起動しない |
+/// | 遷移先の**定義が無い** | 同じく宣言ごと拒否される（グラフの構築が落ちる） |
+///
+/// **どちらも「用意できなかったから断った」ではなく「宣言が不正だった」である。**
+/// 測りたいのは前者なので、宣言が正しいまま実体だけ作れない形を選んだ。
+#[test]
+#[ignore = "starts a real spawn daemon; run through spawn-daemon"]
+fn a_transition_into_a_domain_that_could_not_be_provisioned_is_refused() {
+    let probe = super::super::mac_spike_tests::probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+
+    let (case, profile, caps) = setup_with_provisioned_domains(
+        "spawnd-s55-unprovisioned",
+        ChildProcessPolicy::Unrestricted,
+        |_workspace| {
+            let mut file = policy_with_cross_domain_edge(&probe_str);
+            // 遷移先の名前を**入れ物の名前にできない長さ**にする。
+            //
+            // 宣言としては通る（ドメイン名の上限は50文字）が、入れ物の名前は
+            // `harness.domain.<セッションの印>.<ドメイン名>`で64文字までなので作れない。
+            // **宣言は正しいのに実体が作れない**形で、まさに「用意できなかった」である。
+            let long = "x".repeat(50);
+            for domain in &mut file.domains {
+                if domain.name == TARGET_DOMAIN {
+                    domain.name = long.clone();
+                }
+                for edge in &mut domain.process.transitions {
+                    if edge.to == TARGET_DOMAIN {
+                        edge.to = long.clone();
+                    }
+                }
+            }
+            file
+        },
+    );
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let marker = workspace.join("unprovisioned-child.json");
+
+    let payload = request_payload(
+        &probe_str,
+        &[
+            "--emit",
+            "unprovisioned",
+            "--report-file",
+            &marker.to_string_lossy(),
+        ],
+        &workspace,
+    );
+    let out = ask_daemon(&case, &profile, &caps, &payload);
+
+    assert_eq!(
+        reply_kind(&out).as_deref(),
+        Some("denied"),
+        "用意できなかったドメインへの遷移が通っている。**どのトークンで動いているのかが不定**で、\
+         最悪は呼び出し元の権限のまま動いている: {out}"
+    );
+    assert_eq!(
+        deny_reason(&out).as_deref(),
+        Some("target_domain_not_provisioned"),
+        "拒否はされたが理由が違う。`no_matching_edge` だと**宣言の照合で落ちた**ことになり、\
+         「実体が無いから断った」ことの証明にならない: {out}"
+    );
+    assert!(
+        !marker.exists(),
+        "拒否と答えたのに子が走っている: {}",
+        marker.display()
+    );
+
+    drop(case);
+}

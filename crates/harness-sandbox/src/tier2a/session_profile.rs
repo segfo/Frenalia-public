@@ -119,6 +119,19 @@ pub struct SessionEntry {
     /// ——セッションが死ねば`plan_reclaim`が同じ判定で一緒に回収する。
     #[serde(default)]
     pub mcp: Vec<McpProfileEntry>,
+    /// [#55] このセッションが用意した**遷移先ドメイン**の入れ物
+    /// （`plans/DESIGN-MAC-BROKER.md` §22.9）。
+    ///
+    /// **MCPと同じ寿命・同じ回収経路**なので、独立した台帳ではなくここへぶら下げる
+    /// ——セッションが死ねば`plan_reclaim`が同じ判定で一緒に回収する。
+    ///
+    /// **`mcp`の欄を作り替えずに隣へ足してある。** 欄の名前を変えると**古い台帳が
+    /// 読めなくなり、そこに記録された回収対象が孤児になる**。§22.9は「1つのアロケータへ
+    /// 一般化する」と書いているが、それは台帳の形を変えない回に行う。
+    ///
+    /// **既存の台帳ファイルとの後方互換のため`#[serde(default)]`**（他の後付けの欄と同じ）。
+    #[serde(default)]
+    pub domains: Vec<DomainProfileEntry>,
 }
 
 /// [§22.3.2] capability SID宛に付けたACE1件（`(パス, 導出済みのcapability名)`）。
@@ -134,6 +147,29 @@ pub struct SessionEntry {
 pub struct CapabilityGrant {
     pub path: String,
     pub capability_name: String,
+}
+
+/// [#55] セッション配下の遷移先ドメインの入れ物1件。
+///
+/// **`McpProfileEntry`と同じ形である。** 写したのは意図で、回収の経路
+/// （`plan_reclaim`・`end_session`）が同じ扱いをできるようにするためである。
+/// 違うのは**何の単位か**だけ——あちらはMCPサーバ、こちらは`policy.json`のドメインである。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DomainProfileEntry {
+    pub profile_name: String,
+    /// 判定に使うドメイン名（`policy.json`の`domains[].name`）。
+    ///
+    /// **プロファイル名から切り出せるが、持っておく。** 切り出しは名前の形に依存するので、
+    /// 形を変えた日に**過去の記録からドメインが読めなくなる**（`profile_name`だけを持つと、
+    /// 回収の報告が「どのドメインだったか」を言えない）。
+    pub policy_domain: String,
+    /// このドメインのSID宛にACEを付けたパス。
+    ///
+    /// **骨格の段階では常に空である**——遷移先ドメインには**新しい許可を1本も付けない**
+    /// （既に許可済みの宣言を引くだけ）というのがこの回のスコープだからである。
+    /// 欄を先に置いてあるのは、付ける回が来たときに台帳の形を変えずに済ませるため。
+    #[serde(default)]
+    pub granted_paths: Vec<String>,
 }
 
 /// セッション配下のMCPサーバプロファイル1件。
@@ -277,6 +313,18 @@ pub fn plan_reclaim(
                 grants_known: true,
             });
         }
+        // [#55] 遷移先ドメインの入れ物も同じ経路で回収する（同じ寿命）。
+        // **capability宛の付与は持たない**——骨格では新しい許可を1本も付けず、
+        // 既に許可済みの宣言（＝別のセッションが記録している）を引くだけだからである。
+        // ここへ他人の記録を書くと、**他人の許可をこのセッションの終了で剥がす**ことになる。
+        for domain in &entry.domains {
+            targets.push(ReclaimTarget {
+                profile_name: domain.profile_name.clone(),
+                granted_paths: domain.granted_paths.clone(),
+                granted_capabilities: Vec::new(),
+                grants_known: true,
+            });
+        }
     }
     let known: std::collections::HashSet<&str> = ledger
         .sessions
@@ -284,6 +332,9 @@ pub fn plan_reclaim(
         .flat_map(|e| {
             std::iter::once(e.profile_name.as_str())
                 .chain(e.mcp.iter().map(|m| m.profile_name.as_str()))
+                // [#55] 台帳に載っているドメインの入れ物を「台帳に無い」と数えない
+                // ——数えると`grants_known: false`として二重に拾われる。
+                .chain(e.domains.iter().map(|d| d.profile_name.as_str()))
         })
         .collect();
     for name in existing_profiles {
@@ -523,6 +574,7 @@ pub fn begin_session() -> Result<String, String> {
                 granted_capabilities: Vec::new(),
                 created_at_unix_secs: now_unix_secs(),
                 mcp: Vec::new(),
+                domains: Vec::new(),
             });
         }
     });
@@ -769,6 +821,7 @@ pub(crate) fn add_dead_session_with_capability_for_test(path: &Path, capability_
         }],
         created_at_unix_secs: now_unix_secs(),
         mcp: Vec::new(),
+        domains: Vec::new(),
     };
     ledger().update(|l| {
         l.sessions.retain(|e| e.token != dead);
@@ -865,6 +918,41 @@ pub fn record_mcp_profile(server_id: &str) -> String {
             if !entry.mcp.iter().any(|m| m.profile_name == entry_name) {
                 entry.mcp.push(McpProfileEntry {
                     profile_name: entry_name,
+                    granted_paths: Vec::new(),
+                });
+            }
+        }
+    });
+    name
+}
+
+/// [#55] このセッションが用意する**遷移先ドメイン**の入れ物を台帳へ登録し、その名前を返す
+/// （`plans/DESIGN-MAC-BROKER.md` §22.9）。冪等——同じドメインで2回呼んでもエントリは増えない。
+///
+/// **入れ物の実作成（`ensure_profile`）より先に呼ぶこと。** 逆順だと、作成直後に落ちた場合に
+/// 「実在するが台帳に無い入れ物」が残る（[`record_mcp_profile`]と同じ理由・同じ順序）。
+pub fn record_domain_profile(policy_domain: &str) -> String {
+    let token = session_token();
+    let name = crate::tier2a::domain_profile::current_domain_profile_name(policy_domain);
+    let entry_name = name.clone();
+    let domain = policy_domain.to_string();
+    // [BUG-107] **ぶら下げる先が無ければ作る。** ドメインのエントリはセッションエントリの
+    // 子なので、`begin_session`を通っていないと下の`update`は**黙って何もしない**——
+    // 直後に`ensure_profile`が実資源を作るので、記録の無い入れ物が残る。
+    if let Err(e) = begin_session() {
+        eprintln!(
+            "warning: could not open a session ledger entry for the domain profile {name} ({e}); \
+             its AppContainer profile will not be reclaimed automatically \
+             (see docs/bugs/BUG-107.md)"
+        );
+    }
+    ledger().update(|l| {
+        if let Some(entry) = l.sessions.iter_mut().find(|e| e.token == token) {
+            if !entry.domains.iter().any(|d| d.profile_name == entry_name) {
+                entry.domains.push(DomainProfileEntry {
+                    profile_name: entry_name,
+                    policy_domain: domain,
+                    // 骨格では新しい許可を付けないので常に空（`DomainProfileEntry`のdoc）。
                     granted_paths: Vec::new(),
                 });
             }
@@ -1445,6 +1533,15 @@ pub fn end_session(revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers) -> ReclaimOu
         granted_capabilities: Vec::new(),
         grants_known: true,
     }));
+    // [#55] 遷移先ドメインの入れ物も同じ寿命で回収する（`plan_reclaim`側と同じ理由）。
+    // **2つの経路の片方だけに足さない**——正常終了はここ、落ちた場合は次回起動の
+    // `gc_dead_sessions`（`plan_reclaim`経由）で、どちらかが欠けるとその回の入れ物が残る。
+    targets.extend(entry.domains.into_iter().map(|d| ReclaimTarget {
+        profile_name: d.profile_name,
+        granted_paths: d.granted_paths,
+        granted_capabilities: Vec::new(),
+        grants_known: true,
+    }));
     reclaim_targets(&targets, revoke)
 }
 
@@ -1461,7 +1558,22 @@ mod tests {
             granted_capabilities: Vec::new(),
             created_at_unix_secs: 0,
             mcp: Vec::new(),
+            domains: Vec::new(),
         }
+    }
+
+    /// [#55] 遷移先ドメインの入れ物を持つセッション。
+    fn entry_with_domains(token: &str, domains: &[&str]) -> SessionEntry {
+        let mut e = entry(token, &[]);
+        e.domains = domains
+            .iter()
+            .map(|d| DomainProfileEntry {
+                profile_name: crate::tier2a::domain_profile::domain_profile_name_for(token, d),
+                policy_domain: (*d).to_string(),
+                granted_paths: Vec::new(),
+            })
+            .collect();
+        e
     }
 
     /// capability SID宛の付与を持つセッション（§22.3.2のCoW差分層）。
@@ -1751,6 +1863,114 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].profile_name, profile_name_for("dead"));
         assert_eq!(targets[0].granted_paths, vec!["C:\\other".to_string()]);
+    }
+
+    /// [#55] **正常終了の経路も、遷移先ドメインの入れ物を回収する。**
+    ///
+    /// 回収の経路は2つある——正常終了（[`end_session`]）と、落ちた場合の次回起動
+    /// （[`plan_reclaim`]経由の`gc_dead_sessions`）。**片方だけに足すと、もう片方の回で
+    /// 入れ物が残り続ける**（`B-01`: 対の片方だけ実装しない）。
+    /// 落ちた場合の側は上の`dead_sessions_domain_profiles_are_reclaimed_like_the_mcp_ones`。
+    ///
+    /// # なぜ`#[ignore]`なのか——**実台帳と実資源を触る**
+    ///
+    /// 実物の`appcontainer-session-ledger.json`へ自分のセッションを開き、実際に
+    /// AppContainerプロファイルを作って消す。既定の`cargo test`は同じlibターゲットを
+    /// 並列に走らせるので、隣のテストが記録した直後にこの`end_session`が入ると
+    /// **そのACEが回収名を失う**（同じ理由で`#[ignore]`にしてある先例が
+    /// `redirector_dll_sweep_tests`にある）。昇格は要らない。
+    ///
+    /// ```text
+    /// cargo test -p harness-sandbox --lib the_session_end_path -- --ignored --test-threads=1
+    /// ```
+    ///
+    /// # 「消えた」は台帳ではなくマシンに聞く
+    ///
+    /// `DeleteAppContainerProfile`はS_OKを返しながら何も消さないことがあるので、
+    /// 台帳エントリが落ちただけでは消えた証拠にならない（§S72で使ったのと同じ口）。
+    #[test]
+    #[ignore = "writes to the real session ledger and creates a real AppContainer profile"]
+    fn the_session_end_path_reclaims_domain_profiles_too() {
+        let domain = "s55skeleton";
+        let name = record_domain_profile(domain);
+        crate::tier2a::win_appcontainer::ensure_profile(&name).expect("create the domain profile");
+        assert!(
+            existing_profiles_for_test().contains(&name),
+            "入れ物が作れていない。以後の判定は「回収した」を測っていない"
+        );
+
+        let _ = end_session(&crate::tier2a::win_appcontainer::revoke_session_grant);
+
+        assert!(
+            !existing_profiles_for_test().contains(&name),
+            "正常終了の経路が遷移先ドメインの入れ物を回収していない: {name}"
+        );
+    }
+
+    /// [#55] **遷移先ドメインの入れ物は、セッションと同じ寿命で回収される。**
+    ///
+    /// # 壊れた状態を一文で
+    ///
+    /// **セッションが死んでも入れ物が残り続ける。** 回収の経路は2つ（正常終了＝`end_session`と、
+    /// 落ちた場合の次回起動＝`plan_reclaim`）で、**片方だけに足すともう片方の回が漏れる**。
+    /// ここは後者を測る。前者は`the_session_end_path_reclaims_domain_profiles_too`。
+    #[test]
+    fn dead_sessions_domain_profiles_are_reclaimed_like_the_mcp_ones() {
+        let ledger = SessionLedger {
+            sessions: vec![entry_with_domains("dead", &["cargo", "rustc"])],
+        };
+
+        let targets = plan_reclaim(&ledger, &[], &liveness(&HashSet::new()));
+        let names: Vec<&str> = targets.iter().map(|t| t.profile_name.as_str()).collect();
+        assert!(
+            names.contains(&crate::tier2a::domain_profile::domain_profile_name_for("dead", "cargo").as_str())
+                && names.contains(
+                    &crate::tier2a::domain_profile::domain_profile_name_for("dead", "rustc").as_str()
+                ),
+            "遷移先ドメインの入れ物が回収対象に入っていない: {names:?}"
+        );
+    }
+
+    /// **対の側**（`B-35`）: 生きているセッションのドメインの入れ物は触らない。
+    ///
+    /// これが無いと「全部回収する」実装でも上のテストは緑になり、
+    /// **走行中の他セッションの入れ物を消す**（BUG-053と同じ形）。
+    #[test]
+    fn a_live_sessions_domain_profiles_are_left_alone() {
+        let ledger = SessionLedger {
+            sessions: vec![entry_with_domains("alive", &["cargo"])],
+        };
+        let mut live = HashSet::new();
+        live.insert("alive".to_string());
+
+        assert!(
+            plan_reclaim(&ledger, &[], &liveness(&live)).is_empty(),
+            "走行中のセッションの入れ物を回収しようとしている"
+        );
+    }
+
+    /// 台帳に載っているドメインの入れ物を「台帳に無い」と**二重に数えない**。
+    ///
+    /// `plan_reclaim`は実在するプロファイルのうち台帳に無いものを`grants_known: false`で
+    /// 拾う。ドメインの入れ物をその名簿へ入れ忘れると、**同じ入れ物が2回**対象になり、
+    /// 2回目は「何を付けたか分からない」扱いになる。
+    #[test]
+    fn a_domain_profile_in_the_ledger_is_not_also_counted_as_unknown() {
+        let name = crate::tier2a::domain_profile::domain_profile_name_for("dead", "cargo");
+        let ledger = SessionLedger {
+            sessions: vec![entry_with_domains("dead", &["cargo"])],
+        };
+
+        let targets = plan_reclaim(&ledger, std::slice::from_ref(&name), &liveness(&HashSet::new()));
+        let hits = targets.iter().filter(|t| t.profile_name == name).count();
+        assert_eq!(hits, 1, "同じ入れ物が2回対象になっている: {targets:?}");
+        assert!(
+            targets
+                .iter()
+                .find(|t| t.profile_name == name)
+                .is_some_and(|t| t.grants_known),
+            "台帳に載っているのに「何を付けたか分からない」扱いになっている"
+        );
     }
 
     /// **生きている他セッションが使っているcapability宛の付与は剥がさない。**

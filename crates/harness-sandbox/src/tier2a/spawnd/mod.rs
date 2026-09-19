@@ -114,7 +114,12 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// （`read_control`が`Err`を返した時点でループを抜ける設計である）。
 /// 版を上げないと、その死に方は「なぜかDaemonが消えた」という遠い症状で出る。
 /// **`harness-spawnd.exe`はテストのビルドで作り直されない**ので、古い個体は実在する。
-pub const PROTOCOL_VERSION: u32 = 5;
+/// **6へ上げたのは#55の骨格である。** [`ControlRequest::Hello`]が**遷移先ドメインの実体**
+/// （package SIDとcapabilityの組）の表を運ぶようになった。古いDaemonのバイナリは
+/// この欄を読まないので、**harness側は用意したつもりでいるのに、Daemonは別ドメインへの
+/// 遷移を全部断る**——倒れる向きは安全側（拒否）だが、「渡したつもり」と実際が食い違う点は
+/// 段階6bで版を上げたときと同じである。
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
 ///
@@ -270,6 +275,12 @@ pub struct ChildHandles {
 pub struct TransitionPolicy {
     pub policy: harness_policy::policy_file::PolicyFile,
     pub workspace_root: String,
+    /// [#55] このセッションで**用意できた**遷移先ドメインの実体
+    /// （`ControlRequest::Hello::domains`のdocが意味を持つ）。
+    ///
+    /// **宣言と一緒に運ぶ。** 別々に渡すと、宣言だけ届いて表が届かない瞬間ができ、
+    /// その窓の間に来た遷移だけが「用意されていない」として断られる。
+    pub domains: Vec<DomainSpec>,
 }
 
 impl TransitionPolicy {
@@ -281,6 +292,9 @@ impl TransitionPolicy {
         Self {
             policy: harness_policy::policy_file::PolicyFile::default(),
             workspace_root: workspace_root.into(),
+            // 宣言が無ければ遷移先も無い。**空は「用意できなかった」と同じ扱い**で、
+            // Daemonは別ドメインへの遷移を断る（fail-closed）。
+            domains: Vec::new(),
         }
     }
 }
@@ -326,6 +340,27 @@ pub enum ControlRequest {
         /// 「固定値が指すファイルが呼び出し元から書けない場所にあること」を確かめるのに、
         /// 宣言だけを見るとワークスペースが抜ける（`GraphInput::caller_writable_roots`のdoc）。
         workspace_root: String,
+        /// [#55] **このセッションで用意できた遷移先ドメインの実体**
+        /// （`plans/DESIGN-MAC-BROKER.md` §22.9）。
+        ///
+        /// # なぜ宣言と一緒に運ぶのか
+        ///
+        /// 宣言（上の`policy`）は「Dへ移してよい」までしか言わない。**Dで実際に起こすには
+        /// Dのpackage SIDとcapabilityの組が要る**が、それは`policy.json`に書かれておらず、
+        /// harnessが起動時に用意する（この変種のdocの「Daemonが自分で読まない理由」）。
+        /// 宣言と同じ電文に載せることで、**表を持たないDaemonが要求を捌く瞬間が
+        /// 原理的に存在しなくなる**。
+        ///
+        /// # 空であることは「用意できなかった」を意味する
+        ///
+        /// 用意できないドメイン（宣言が許可済みでない・通信を宣言している）は**載らない**。
+        /// Daemonはそれを「そのドメインへは起こせない」として断る——
+        /// **載っていないものを既定で通さない**（`P-11`: 観測していないものを既定値で埋めない）。
+        ///
+        /// 並びは`policy_domain`で引ける形にしてある。**同じ名前が2つ載ることは無い**
+        /// （用意する側が1ドメイン1件で作る）。
+        #[serde(default)]
+        domains: Vec<DomainSpec>,
     },
     /// トップレベルのプロセスを起こす（§12「harnessもSpawn Daemon経由でspawnを依頼する」）。
     ///
@@ -787,26 +822,34 @@ pub enum DenyReason {
     Transition {
         denial: harness_policy::transition::TransitionDenial,
     },
-    /// [段階6b・**暫定**] 辺は許可だが、**遷移先ドメインの実体を用意できない**。
+    /// 辺は許可だが、**遷移先ドメインの実体がこのセッションに無い**。
     ///
-    /// # なぜ許可なのに断るのか
+    /// # 意味が狭まった（2026-09-20、#55の骨格）
     ///
-    /// ドメインのセキュリティコンテキストは`(package SID, capability SIDの組)`である
-    /// （[§22.1](../../../../plans/DESIGN-MAC-DOMAIN.md)）。今日プロファイルを作る機構は
-    /// **セッション単位**（`session_profile`）と**MCPサーバ単位**（`mcp_profile`）の2つだけで、
-    /// **ドメインを鍵にした発行器は無い**（`plans/DESIGN-MAC-BROKER.md` §22.9が
-    /// 7つの配線点を挙げている作業）。
+    /// かつてこれは「**機構そのものが無い**ので別ドメインへは一切遷移できない」という
+    /// 暫定の理由だった。発行器（`win_appcontainer/domain_provision.rs`）が入ったので、
+    /// いまは「**このセッションでは用意できなかった**」を意味する。
+    ///
+    /// ドメインのセキュリティコンテキストは`(package SID, capability SIDの組)`であり
+    /// （[§22.1](../../../../plans/DESIGN-MAC-DOMAIN.md)）、これは`policy.json`に書かれていない
+    /// ——harnessが起動時に用意して[`ControlRequest::Hello`]の`domains`で渡す。
+    /// **その表に載っていない遷移先は起こせない。**
+    ///
+    /// # 用意できない理由は3通りあるが、**この値はどれだったかを運ばない**
+    ///
+    /// 通信を宣言している（ドメインごとの出口制御が未実装）・宣言が許可済みでない
+    /// （ユーザーが直せる）・入れ物の名前にできない（ユーザーが直せる）。
+    /// **直せるものと直せないものが同じ値に丸まっている**ので、分類器
+    /// （[`transitions::remedy`]）は保守的な側へ倒してある。
+    /// 直し方の案内は**起動時の警告**が持つ（`Provisioned::skipped`の理由文）。
+    ///
+    /// # いつ消えるか
+    ///
+    /// **通信を含めてどのドメインも用意できるようになった日**である。
+    /// 骨格の着地では消えない（上記）。
     ///
     /// **呼び出し元のcapabilityのまま名前だけ遷移先にする、という逃げ方は採らない。**
     /// 宣言では狭めたつもりの遷移が1ビットも狭まらず、しかもその食い違いは症状として出ない。
-    ///
-    /// # 外すときにやること（**この暫定を消し忘れないために書いてある**）
-    ///
-    /// §22.9のドメイン単位プロファイル発行器が着地したら、**この変種ごと消す**のが
-    /// 正しい畳み方である。`server.rs`の`spawn_nested`で「遷移先が呼び出し元と同じか」を
-    /// 見ている分岐と、`spawnd/wire_tests.rs`の
-    /// `a_cross_domain_transition_is_refused_until_per_domain_profiles_exist`も一緒に消える
-    /// ——**あのテストは、この暫定が残っていることを固定するためだけに在る。**
     TargetDomainNotProvisioned {
         /// 辺が指していた遷移先ドメイン名。
         to: String,

@@ -25,11 +25,14 @@ fn control_request_hello_keeps_its_wire_shape() {
         protocol_version: PROTOCOL_VERSION,
         policy: Box::new(harness_policy::policy_file::PolicyFile::default()),
         workspace_root: "C:/w".to_string(),
+        // [#55] **追加は必ず末尾へ。** この電文は別プロセス（`harness-spawnd.exe`）が
+        // 読むワイヤ形式で、下の文字列がその表現を固定している。
+        domains: Vec::new(),
     })
     .expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":5,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w"}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":6,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w","domains":[]}"#
     );
 }
 
@@ -80,7 +83,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":5}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":6}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {
@@ -262,23 +265,25 @@ fn every_deny_reason_has_a_distinct_wire_value() {
     }
 }
 
-/// [段階6b・**暫定を固定するテスト**] 遷移先が別ドメインの辺は、**専用の理由**で断られる。
+/// 用意できなかった遷移先への要求は、**専用の理由**で断られる（電文の形を固定する）。
 ///
-/// # このテストは何のために在るのか
+/// # このテストの役目は2026-09-20に変わった
 ///
-/// **暫定措置が残っていることを見張るためだけに在る。** 別ドメインへ遷移するには、
-/// そのドメイン用の`(package SID, capability SIDの組)`が要るが、ドメインを鍵にした
-/// AppContainerプロファイル発行器は未実装である
-/// （`plans/DESIGN-MAC-BROKER.md` §22.9が7つの配線点を挙げている作業）。
+/// かつては**暫定措置が残っていることを見張るためだけに在った**——別ドメインへは一切
+/// 遷移できず、[`DenyReason::TargetDomainNotProvisioned`]はその見張りの綴りだった。
+/// 「§22.9が着地したらこのテストごと消す」と書いてあったが、**着地しても消えていない。**
 ///
-/// # §22.9が着地したら、このテストごと消すのが正しい畳み方である
+/// 発行器（`win_appcontainer/domain_provision.rs`）は入り、用意できた遷移先では実際に
+/// 別package SIDの子が起きる。**それでも用意できないドメインは残る**ので、
+/// この拒否理由は暫定ではなく**恒常的な形**になった。だからこのテストは
+/// 「暫定の見張り」から「**電文の形の固定**」へ役目が移っている。
 ///
-/// 一緒に消えるのは次の3つで、**どれか1つでも残ると「別ドメインへ遷移できない」が
-/// 理由の分からない拒否として残り続ける**。
+/// # 別ドメインへ遷移できることを確かめるのはここではない
 ///
-/// 1. [`DenyReason::TargetDomainNotProvisioned`]（この変種そのもの）
-/// 2. `server.rs`の`serve_spawn_request`で「遷移先が呼び出し元と同じか」を見ている分岐
-/// 3. このテスト
+/// ここは文字列の形しか見ない。実際に**別のpackage SIDで起きること**と、
+/// **用意できないドメインが断られること**は実機の受入2本が対で見ている
+/// （`a_cross_domain_transition_runs_the_child_under_a_different_package_sid`と
+/// `a_transition_into_a_domain_that_could_not_be_provisioned_is_refused`）。
 ///
 /// **件数ではなく綴りで固定している**——件数だと、別の理由を1つ足したときにも赤くなって
 /// 「何が起きたか」が分からなくなる。
@@ -294,10 +299,9 @@ fn a_cross_domain_transition_is_refused_until_per_domain_profiles_exist() {
     assert_eq!(
         json,
         r#"{"kind":"denied","reason":{"kind":"target_domain_not_provisioned","to":"build-tools"}}"#,
-        "別ドメインへの遷移を断る暫定措置の形が変わった。\
-         §22.9（ドメイン単位のプロファイル発行器）が着地して暫定を外したのなら、\
-         このテストと DenyReason::TargetDomainNotProvisioned と \
-         server.rs の同一ドメイン判定の3つを**まとめて**消すこと（同変種のdoc）"
+        "用意できなかった遷移先を断るときの電文の形が変わった。\
+         読む側（分類表 transitions::remedy と拒否の待ち行列）が同じ綴りを前提にしているので、\
+         変えるなら両方を同じ回で直すこと"
     );
 }
 

@@ -77,9 +77,37 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                         &workspace_root.to_string_lossy(),
                     ),
                 ));
+                // [#55] **遷移先ドメインの実体をここで用意する**（`plans/DESIGN-MAC-BROKER.md` §22.9）。
+                //
+                // 判定器は「Dへ移してよい」までしか答えない。Dで実際に起こすには
+                // Dのpackage SIDとcapabilityの組が要り、それは`policy.json`には書かれていない。
+                // **Daemonを起こす前に作って、宣言と同じ電文で渡す**——表を持たないDaemonが
+                // 要求を捌く瞬間を作らないためである（`Hello`に載せた理由そのもの）。
+                //
+                // **新しい許可は1本も付けない。** 既に許可済みの宣言の宛先SIDを引くだけで、
+                // 引けないドメインは用意しない（`domain_provision`のモジュールdoc）。
+                let canonical_workspace = workspace_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| workspace_root.clone());
+                let provisioned =
+                    harness_sandbox::tier2a::win_appcontainer::domain_provision::provision_target_domains(
+                        &policy,
+                        &canonical_workspace,
+                        // **`preflight`が付与したのと同じ語彙**でなければ別の宛先SIDを導出し、
+                        // 用意したドメインからワークスペースが一切見えなくなる。
+                        write_mode.capability_mode(),
+                    );
+                // **用意できなかったものを黙って落とさない**（`B-10`）。落とすと、
+                // 宣言したのに断られる理由が画面のどこにも出ない。
+                for (domain, reason) in &provisioned.skipped {
+                    eprintln!(
+                        "warning: transitions into the domain {domain:?} will be refused: {reason}"
+                    );
+                }
                 harness_sandbox::tier2a::spawnd::TransitionPolicy {
                     policy,
                     workspace_root: workspace_root.to_string_lossy().into_owned(),
+                    domains: provisioned.domains,
                 }
             }
             Err(error) => {

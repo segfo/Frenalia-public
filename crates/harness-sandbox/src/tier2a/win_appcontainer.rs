@@ -742,6 +742,11 @@ mod revoke_declarations;
 /// 「どのSIDのACEを剥がすか」を、名前から導出したSIDではなく**対象パスのDACLに実在するSID**
 /// から決める。`revoke`（剥がし方）とは責務が別なので分けている。
 mod revoke_subjects;
+/// [#55] **遷移先ドメインの実体を用意する**（`plans/DESIGN-MAC-BROKER.md` §22.9）。
+/// 起動時にまとめて用意し、表をSpawn Daemonへ渡す。**新しい許可は1本も付けない**
+/// ——既に許可済みの宣言の宛先SIDを引くだけで、引けなければそのドメインは用意しない。
+#[cfg(windows)]
+pub mod domain_provision;
 mod spawn;
 /// [段階⑦] その綴りは**アプリの仕組みを通って起きる**か（ストアの実行エイリアス／MSIXの実体）。
 ///

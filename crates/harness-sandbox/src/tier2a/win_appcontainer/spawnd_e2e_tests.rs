@@ -158,6 +158,29 @@ pub(super) fn setup_with_policy_and_transitions(
     child_process_policy: ChildProcessPolicy,
     declare: impl FnOnce(&std::path::Path) -> harness_policy::policy_file::PolicyFile,
 ) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
+    // **遷移先ドメインを1つも用意しない**（＝自己ループだけが通る）。
+    // 用意する腕は[`setup_with_provisioned_domains`]を使う。
+    setup_with_transitions_and_domains(label, child_process_policy, declare, false)
+}
+
+/// [#55] **遷移先ドメインを実際に用意して**同じ土台を作る。
+///
+/// 製品と同じ発行器（`domain_provision::provision_target_domains`）を通す
+/// ——テストが表を手で組むと、**製品が用意しないものをテストだけが用意して緑になる**。
+pub(super) fn setup_with_provisioned_domains(
+    label: &str,
+    child_process_policy: ChildProcessPolicy,
+    declare: impl FnOnce(&std::path::Path) -> harness_policy::policy_file::PolicyFile,
+) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
+    setup_with_transitions_and_domains(label, child_process_policy, declare, true)
+}
+
+fn setup_with_transitions_and_domains(
+    label: &str,
+    child_process_policy: ChildProcessPolicy,
+    declare: impl FnOnce(&std::path::Path) -> harness_policy::policy_file::PolicyFile,
+    provision: bool,
+) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
     let guard = TestDirGuard::create(label);
     let workspace = guard.path().to_path_buf();
     let outcome = preflight(&workspace, &[], None, &WorkspaceWriteMode::DirectRw)
@@ -203,10 +226,28 @@ pub(super) fn setup_with_policy_and_transitions(
         &daemon_log,
     );
 
+    let policy = declare(&canonical);
+    // [#55] **製品と同じ発行器を通す。** 手で表を組むと、製品が用意しないものを
+    // テストだけが用意して緑になる（`B-13`: 判定を2つ持たない）。
+    let domains = if provision {
+        let provisioned = crate::tier2a::win_appcontainer::domain_provision::provision_target_domains(
+            &policy,
+            &canonical,
+            // E2Eの土台は`DirectRw`（`setup`が`WorkspaceWriteMode::DirectRw`でpreflightしている）。
+            "rwx",
+        );
+        for (domain, reason) in &provisioned.skipped {
+            eprintln!("[spawnd-e2e] domain {domain:?} was not provisioned: {reason}");
+        }
+        provisioned.domains
+    } else {
+        Vec::new()
+    };
     let daemon = SpawnDaemonHandle::start(
         crate::tier2a::spawnd::TransitionPolicy {
-            policy: declare(&canonical),
+            policy,
             workspace_root: canonical.to_string_lossy().into_owned(),
+            domains,
         },
         child_process_policy,
     )

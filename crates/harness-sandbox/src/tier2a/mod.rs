@@ -27,7 +27,13 @@ pub mod session_profile;
 
 /// MCPサーバごとのAppContainerプロファイル名（D-38）。`session_profile`と同じ理由で
 /// windows専用にしない（名前生成と検証は純粋関数）。
+///
+/// **信頼境界が見る統合判定（`is_harness_profile_name`）もここが持つ。**
 pub mod mcp_profile;
+
+/// 遷移先ドメインごとのAppContainerプロファイル名（`plans/DESIGN-MAC-BROKER.md` §22.9）。
+/// `mcp_profile`と同じ形・同じ理由でwindows専用にしない。
+pub mod domain_profile;
 
 /// CoWセッションを起こす前に、Redirector DLL 2本（x64・WOW64用x86）の**版がそろっているか**を
 /// 検算する。`session_profile`と同じ理由でwindows専用にしない（走査と突き合わせは純粋関数で、

@@ -270,6 +270,25 @@ pub enum WorkspaceWriteMode {
 }
 
 impl WorkspaceWriteMode {
+    /// workspace capability SIDの導出に使う**モードの綴り**（`"rwx"` / `"ro"`）。
+    ///
+    /// # なぜ型に持たせるのか
+    ///
+    /// この綴りは`preflight`（ACEを付ける側）と起こす側で**一致していなければならない**
+    /// ——ずれると別のcapability SIDを導出し、**付与されていない宛先で起動して
+    /// workspaceが一切見えない**（`launch`のモジュールdocが実害として挙げている形）。
+    /// 一致を`match`の書き写しで保つと、variantが増えた日に片方だけ古くなる（`B-05`）。
+    ///
+    /// **綴りの正本はここ1つ**である。呼び出し側で`if cow { "ro" } else { "rwx" }` と
+    /// 書かないこと。
+    pub fn capability_mode(&self) -> &'static str {
+        match self {
+            WorkspaceWriteMode::DirectRw => "rwx",
+            // CoWではworkspace本体へ読取+実行だけを与える（書込は差分層が受ける）。
+            WorkspaceWriteMode::Cow { .. } => "ro",
+        }
+    }
+
     pub fn diff_layer_dir(&self) -> Option<&Path> {
         match self {
             WorkspaceWriteMode::DirectRw => None,

@@ -60,13 +60,21 @@ pub fn is_mcp_profile_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
-/// harness由来のAppContainerプロファイル名か（`run_shell`セッション用またはMCPサーバ用）。
+/// harness由来のAppContainerプロファイル名か（`run_shell`セッション用／MCPサーバ用／
+/// **遷移先ドメイン用**）。
 ///
-/// **信頼境界（`privhelper`・`netfilterd`）はこの関数だけを見る。** 2つの検証関数を別々に
-/// 呼び分ける形にすると、片方の呼び出し箇所を足し忘れたときに「MCPプロファイルには
+/// **信頼境界（`privhelper`・`netfilterd`）はこの関数だけを見る。** 検証関数を別々に
+/// 呼び分ける形にすると、片方の呼び出し箇所を足し忘れたときに「そのプロファイルには
 /// フィルタを張れない」あるいは逆に「検証をすり抜ける」経路が生まれる。
+///
+/// **族を足したらここへ通すこと。** 通し忘れると、その族の入れ物は昇格側から
+/// 「harness由来ではない」と見なされ、ACEもWFPフィルタも張れない——症状は
+/// 「そのドメインだけ何もできない」で、原因は名前の検証にある（遠い）。
+/// 3つ目（遷移先ドメイン）は2026-09-20に足した（`plans/DESIGN-MAC-BROKER.md` §22.9）。
 pub fn is_harness_profile_name(name: &str) -> bool {
-    crate::tier2a::session_profile::is_session_profile_name(name) || is_mcp_profile_name(name)
+    crate::tier2a::session_profile::is_session_profile_name(name)
+        || is_mcp_profile_name(name)
+        || crate::tier2a::domain_profile::is_domain_profile_name(name)
 }
 
 #[cfg(test)]
