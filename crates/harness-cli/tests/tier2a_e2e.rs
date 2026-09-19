@@ -6109,8 +6109,29 @@ struct DeniedArm {
     /// この腕で**Daemonが**断った実行ファイル。**畳まれていない**——同じ種類の拒否は
     /// 「更新行」として何度も追記されるので、宣言へ足す側が畳むこと。
     denied_by_daemon: Vec<String>,
+    /// 同じ拒否を`(実行ファイル, 何をすれば通るか)`の対で持つ版。
+    ///
+    /// # なぜ理由まで運ぶのか（**2026-09-19に、これが無くて誤読しかけた**）
+    ///
+    /// 宣言へ足しても**通らない拒否がある**。Daemonの`remedy`は理由を3つへ畳んでおり、
+    /// そのうち`FixTheDeclaration`（宣言を足せば通る）**以外**は、何本書いても消えない。
+    /// 実行ファイル名だけを見ていると、この2つが同じ顔になる——そして
+    /// 「新しく断られたものが無い」は**宣言が足りた回**と**足しても効かない拒否が
+    /// 残り続けている回**の両方で成り立つので、後者が**収束として記録される**。
+    ///
+    /// 実際、`vswhere.exe`は宣言した次の段でも断られ続けており、鎖はそこで
+    /// **切れていた**（リンカまで降りていない）。名前だけを集めていたので、
+    /// 一覧は「10本で収束」と書けてしまう状態だった。
+    denied_detail: Vec<(String, String)>,
     /// この腕で**カーネルが**止めた実行ファイル。**今日は購読者が居ないので常に空**。
     denied_by_kernel: Vec<String>,
+    /// harness自身（子プロセスではない）がこの腕で出した警告・エラー。
+    ///
+    /// **`text`とは別の口である。** `text`は子が返したstdoutで、`--fs-allow`の付与が
+    /// 失敗したことは**そこには一切出ない**（子は「読めない」としか言えない）。
+    /// 付与が効いたのかを読むには起動側の出力が要る——無いと「見えるようにしたつもりで
+    /// 見えていない」回を、そのまま結果として書いてしまう。
+    harness_stderr: String,
 }
 
 /// 旗の有無だけを変えて台本を1本撃ち、待ち行列を読む。**これが唯一の実装である。**
@@ -6126,14 +6147,25 @@ struct DeniedArm {
 ///    読まれるのがいちばん高くつく
 /// 3. **解析できない行が1行でもあれば無効にする。** 読めなかった行の中に拒否が居たかは
 ///    分からないので、「断られなかった」と数えてはいけない
+///
+/// # `extra_args`（**旗と台本のほかに振ってよい唯一の軸**）
+///
+/// 遷移MACの測定は「宣言を足す」以外の条件を固定したいが、**遷移MACへ届く手前で止まる
+/// 条件**だけは外側から振る必要がある。実例が`--fs-allow`で、道具の実体が
+/// サンドボックスから読めなければ起動は1度も試みられず、**遷移MACの一覧には現れない**
+/// （§S66）。ここを引数で受けるのは、そのための穴である。
+/// **渡さない呼び出し（`&[]`）が既定**で、渡す側は記録へ何を振ったかを書くこと。
 fn run_arm_collecting_denials(
     ws: &Path,
     case_name: &str,
     enforce: bool,
     script: &str,
     log_tag: &str,
+    extra_args: &[String],
 ) -> Result<DeniedArm, String> {
-    use harness_sandbox::tier2a::spawnd::transitions::{pending_path, read_from, PendingRecord};
+    use harness_sandbox::tier2a::spawnd::transitions::{
+        pending_path, read_from, remedy, PendingRecord, Remedy,
+    };
 
     let queue = pending_path(ws);
     let _ = std::fs::remove_file(&queue);
@@ -6142,6 +6174,7 @@ fn run_arm_collecting_denials(
     if enforce {
         args.push("--enforce-transitions");
     }
+    args.extend(extra_args.iter().map(String::as_str));
     let run = run_harness(ws, &run_shell_script_turns(script), &args, case_name);
     if !run.status.success() {
         return Err(format!(
@@ -6159,9 +6192,20 @@ fn run_arm_collecting_denials(
     let tail = read_from(&queue, 0);
     let mut denied_by_daemon = Vec::new();
     let mut denied_by_kernel = Vec::new();
+    let mut denied_detail: Vec<(String, String)> = Vec::new();
     for record in &tail.records {
         match record {
-            PendingRecord::DeniedByDaemon(d) => denied_by_daemon.push(d.exe.clone()),
+            PendingRecord::DeniedByDaemon(d) => {
+                denied_by_daemon.push(d.exe.clone());
+                // **3つへ畳んだ側を持つ**（`DenyReason`の写しではない）。読む側が要る区別は
+                // 「宣言を足せば通るのか」だけで、そこは`remedy`が唯一の定義を持つ（`B-05`）。
+                let label = match remedy(&d.reason) {
+                    Remedy::FixTheDeclaration => "宣言を足せば通る",
+                    Remedy::BlockedUntilHarnessImplementsIt => "harness未実装。宣言しても通らない",
+                    Remedy::NotAboutPolicy => "宣言と無関係。宣言しても通らない",
+                };
+                denied_detail.push((d.exe.clone(), format!("{label}（{:?}）", d.reason)));
+            }
             PendingRecord::DeniedByKernel(d) => denied_by_kernel.push(d.exe.clone()),
             // **あふれたら測定を無効にする**（`B-10`）。鎖の一覧が欠けたまま
             // 「これで全部だ」と読まれるのがいちばん高くつく。
@@ -6188,14 +6232,18 @@ fn run_arm_collecting_denials(
     Ok(DeniedArm {
         text,
         denied_by_daemon,
+        denied_detail,
         denied_by_kernel,
+        harness_stderr: run.stderr,
     })
 }
 
 /// 仕掛け（敵対的な`.git/config`）の腕を1本撃つ。**待ち行列の扱いは
 /// [`run_arm_collecting_denials`]が持ち、ここは仕掛け固有の判定だけを足す。**
 fn run_git_trap_arm(ws: &Path, case_name: &str, enforce: bool) -> Result<GitTrapArm, String> {
-    let arm = run_arm_collecting_denials(ws, case_name, enforce, GIT_TRAP_SCRIPT, "git-trap")?;
+    // **`--fs-allow`は渡さない。** この仕掛けが起こすのはSystem32の実体（`findstr.exe`）と
+    // gitで、どちらもサンドボックスから元から見えている——見えるようにする軸を振る必要が無い。
+    let arm = run_arm_collecting_denials(ws, case_name, enforce, GIT_TRAP_SCRIPT, "git-trap", &[])?;
     let fired = arm.text.contains(GIT_TRAP_RAN_MARKER);
     let refused = arm.text.contains(GIT_TRAP_DENIED_MARKER);
     eprintln!("[git-trap] {case_name}: fired={fired} refused={refused}");
@@ -6566,6 +6614,313 @@ fn seed_survey_workspace(ws: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 道具の実体を**サンドボックスから見えるようにする**宣言（`--fs-allow`へ渡す綴り）。
+///
+/// # なぜこれが「軸」なのか（§S66で分かったこと）
+///
+/// 2026-09-19の一次データは3本で収束したが、**本数が小さい理由は「足りている」ではなかった**。
+/// `cargo`はサンドボックスから実体が読めず、絶対パスで撃っても
+/// **プロセス生成が1度も試みられない**——つまり遷移MACの一覧には最初から載っていない。
+/// 止めているのは遷移MACではなく**ファイルを読めるかどうか**なので、
+/// そこを開けてからでないと「宣言一式は何本か」を測ったことにならない。
+///
+/// # `C:\Program Files\nodejs`を載せない（**測ってから外した**）
+///
+/// §S66は`node`・`npm`も「見えない」側に数えていたが、**§S67の対照ではどちらも見えており、
+/// 遷移MACが実際に断っている**（`node.exe`・`npm.cmd`が段0の拒否に出る）。実DACLを読むと
+/// `C:\Program Files\nodejs`は継承を止めておらず、`ALL APPLICATION PACKAGES`の
+/// 読取＋実行を`C:\Program Files`から継承している——**どのAppContainerからでも元から読める**。
+/// 見えているものを「見えるようにする」宣言は、振っている軸に1ビットも足さない。
+///
+/// **そのうえ、この宣言は最後まで通らない。** `--fs-allow`は宣言先の祖先へtraverse ACEを
+/// 張る（D-45）が、`C:\Program Files`の所有者は`NT SERVICE\TrustedInstaller`であり、
+/// **管理者トークンでも`WRITE_DAC`が無い**。2026-09-19の1回目はここで
+/// `アクセスが拒否されました。(0x80070005)`になり、測定が段0で止まった。
+/// 通すには`--force-system-acl`（D-19）が要るが、**要らない宣言のために
+/// `SeRestorePrivilege`を持ち出すのは、測っているものを変える**。
+///
+/// # 綴りの決め方
+///
+/// - 末尾の`\**`は**配下まで**という意味である（D-63。素のパスはそのオブジェクト1個だけを
+///   開くので、`cargo.exe`も`rustc.exe`も入っている配下へは1バイトも届かない）
+/// - `:rw`を付けない＝`FsAccess::ReadExec`（読取＋実行）。**見えるだけでは起動できない**ので
+///   実行が要り、**書けてしまうと測っているものが変わる**（道具の置き場を書き換えられる
+///   サンドボックスは、もはや今日のTier2aではない）
+///
+/// # パスを機械から引く（綴りを写さない）
+///
+/// `C:\Users\<名前>`を直に書くと、別の機械でこのテストが**黙って0件の付与**になる
+/// （存在しないパスはスキップされる）。`CARGO_HOME`／`RUSTUP_HOME`を先に見るのは、
+/// この2つが立っている機械では`%USERPROFILE%`配下に実体が無いためである。
+///
+/// 戻りは`(--fs-allowへ渡す綴り, 実体のディレクトリ)`。**存在しないものは載せず、
+/// 載せなかったことを名指しで出す**（`B-10`: 黙って落とすと、付与が効いていない回を
+/// 「見えるようにした」と読む）。
+fn survey_visibility_grants() -> Vec<(String, PathBuf)> {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let candidates: Vec<PathBuf> = vec![
+        std::env::var("CARGO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| Path::new(&home).join(".cargo")),
+        std::env::var("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| Path::new(&home).join(".rustup")),
+    ];
+    let mut out = Vec::new();
+    for dir in candidates {
+        if !dir.is_dir() {
+            eprintln!(
+                "[survey] 見えるようにする対象に載せなかった（この機械に無い）: {}",
+                dir.display()
+            );
+            continue;
+        }
+        out.push((format!(r"{}\**", dir.display()), dir));
+    }
+    out
+}
+
+/// 宣言を0本から足しながら収束まで撃ち直した、**1掃き**の結果。
+struct SurveySweep {
+    /// この掃きを何と呼ぶか（記録とログの見出し）。
+    label: &'static str,
+    /// 段ごとに**新しく**断られた実行ファイル。
+    hops: Vec<(usize, Vec<String>)>,
+    /// 新しい拒否が出なくなった段。`None`は**上限に当たって止まった**（収束していない）。
+    ///
+    /// **`Some`は「鎖が終わった」を意味しない。** [`SurveySweep::cut_by`]も併せて読むこと。
+    converged_at: Option<usize>,
+    /// 最後の段でなお断られていた、**宣言しても通らない**拒否（`(実行ファイル, 理由)`）。
+    ///
+    /// # これが空でない掃きの一覧は「全部」ではない
+    ///
+    /// 宣言を足しても消えない拒否は、**次の段でも同じものが断られる**。新しい拒否は
+    /// 出ないので[`SurveySweep::converged_at`]は`Some`になるが、鎖はそこで**切れている**
+    /// ——その先で起きるはずだった子は1つも現れない。**「収束した」と「鎖が終わった」は
+    /// 別の事実**であり、混ぜると§S66と同じ「短い一覧を全部と読む」に戻る。
+    cut_by: Vec<(String, String)>,
+    /// 最後に宣言していた全部（＝断られた一覧）。
+    declared: Vec<String>,
+    /// 段0で実体が**見えた**プログラム（`HP_SEE_OK`）。
+    visible: Vec<String>,
+    /// 段0で実体が**見えなかった**プログラム（`HP_SEE_NO`）。
+    invisible: Vec<String>,
+    /// 段0で**名前を解決できず、起動を試みてすらいない**プログラム（`HP_PROBE_MISSING`）。
+    never_attempted: Vec<String>,
+}
+
+/// 宣言を0本から足しては撃ち直し、**新しい拒否が出なくなるまで**回す（1掃き）。
+///
+/// # なぜ関数にしたのか
+///
+/// この回で軸が1つ増えた（道具が見えるか）ので、**同じ掃きを2回**回す必要が出た。
+/// 掃きを2箇所へ書くと、落とし穴の対処（申告が出ているかの確認・畳んでから足す・
+/// 上限で止まったら無効）が**片方にだけ入った状態**が生まれる——それは
+/// [`run_arm_collecting_denials`]を1本にしてある理由と同じである。
+///
+/// `failures`へ積むのは**測定が成立していないとき**だけで、「何本だった」は合否にしない。
+fn run_declaration_sweep(
+    ws: &Path,
+    script: &str,
+    label: &'static str,
+    extra_args: &[String],
+    never_unenforced: &[String],
+    failures: &mut Vec<String>,
+) -> SurveySweep {
+    let names: Vec<&str> = SURVEY_CANDIDATES.iter().map(|(p, _)| *p).collect();
+    let mut sweep = SurveySweep {
+        label,
+        hops: Vec::new(),
+        converged_at: None,
+        cut_by: Vec::new(),
+        declared: Vec::new(),
+        visible: Vec::new(),
+        invisible: Vec::new(),
+        never_attempted: Vec::new(),
+    };
+
+    for hop in 0..SURVEY_MAX_HOPS {
+        declare_programs(ws, &sweep.declared)
+            .unwrap_or_else(|e| panic!("[{label}] 段{hop}の宣言を書けなかった: {e}"));
+        let case_name = format!("survey-{label}-hop{hop}");
+        let arm = run_arm_collecting_denials(ws, &case_name, true, script, "survey", extra_args)
+            .unwrap_or_else(|e| panic!("[{label}] 段{hop}が測れなかった: {e}"));
+
+        if hop == 0 {
+            // **起動側が何を言ったかを残す。** `--fs-allow`の付与が失敗しても子のstdoutには
+            // 出ない（子は「読めない」としか言えない）ので、ここを黙らせると
+            // 「見えるようにしたつもりで見えていない」回をそのまま結果にしてしまう。
+            for line in arm.harness_stderr.lines() {
+                if line.contains("fs-allow") || line.contains("fs allow") {
+                    eprintln!("[survey] [{label}] 起動側: {line}");
+                }
+            }
+            // **名前を解決できなかったものは、遷移MACに1度も届いていない。**
+            // 一覧から静かに消えるので、ここで拾って測定ごと無効にする（`B-10`）。
+            // **申告そのものが出ていない**なら、解決できたかどうかを判定できていない。
+            // 「印が無い＝解決できた」と読むと、また静かに短い一覧ができる。
+            let unprobed: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|p| {
+                    !arm.text.contains(&format!("{SURVEY_PROBE_OK} {p}"))
+                        && !arm.text.contains(&format!("{SURVEY_PROBE_MISSING} {p}"))
+                })
+                .collect();
+            if !unprobed.is_empty() {
+                failures.push(format!(
+                    "[{label}] 段0: {unprobed:?} について**名前を解決できたかの申告が1つも出ていない**。\
+                     申告の行がシェルへ届いていないので、この一覧が全部かどうかを判定できない"
+                ));
+            }
+            // **見えているか／見えていないか**を要約する。一覧の本数が小さいとき、
+            // 「宣言が3本で足りる」のか「3本しか遷移MACまで届いていない」のかは
+            // ここでしか分かれない。
+            sweep.visible = names
+                .iter()
+                .copied()
+                .filter(|p| arm.text.contains(&format!("{SURVEY_SEE_OK} {p}")))
+                .map(str::to_string)
+                .collect();
+            sweep.invisible = names
+                .iter()
+                .copied()
+                .filter(|p| arm.text.contains(&format!("{SURVEY_SEE_NO} {p}")))
+                .map(str::to_string)
+                .collect();
+            eprintln!(
+                "[survey] [{label}] 段0: サンドボックスから**実体が見えた**={:?} / \
+                 **見えなかった**={:?}（見えないものは絶対パスで撃っても\
+                 遷移MACに届かない——止めているのはファイルを読めるかどうかである）",
+                sweep.visible, sweep.invisible
+            );
+
+            sweep.never_attempted = programs_never_attempted(&arm.text, &names);
+            // **解決できないこと自体は、この測定の失敗ではない**——旗を立てない腕でも同じなら、
+            // 遷移MACとは無関係の既存の制約である（宣言を足しても直らない）。
+            // **失敗なのは、旗を立てた側でだけ解決できなくなったとき**——強制を入れた代償として
+            // 道具が届かなくなったことを意味し、既定へ入れる判断に直接効く。
+            let lost_by_enforcing: Vec<&String> = sweep
+                .never_attempted
+                .iter()
+                .filter(|p| !never_unenforced.contains(p))
+                .collect();
+            // **見えるようにした掃きでは、この差は「後退」ではない。** 旗なしの腕は
+            // `--fs-allow`を渡していないので、そちらで解決できなかったものが
+            // こちらで解決できるようになるのは想定どおりである（差は逆向きにしか出ない）。
+            if !lost_by_enforcing.is_empty() && extra_args.is_empty() {
+                failures.push(format!(
+                    "[{label}] 段0: {lost_by_enforcing:?} は**旗を立てた側でだけ名前を解決できない**。\
+                     旗なしでは解決できているので、強制を入れたこと（＝シェルが\
+                     Windows PowerShell 5.1へ替わること、§S62）が原因である。\
+                     **宣言では直らない種類の後退**なので、既定へ入れる前に決着させること"
+                ));
+            }
+            if !sweep.never_attempted.is_empty() {
+                eprintln!(
+                    "[survey] [{label}] 段0: {:?} は**サンドボックスの中で名前を解決できず、\
+                     起動を試みてすらいない**。**この一覧は「実務に必要な全部」ではない**\
+                     ——遷移MACへ届いていないものがこの数だけ在る。\
+                     直すのは宣言ではなく、その置き場を読めるようにする側である",
+                    sweep.never_attempted
+                );
+            }
+        }
+
+        if hop == 0 && arm.denied_by_daemon.is_empty() {
+            failures.push(format!(
+                "[{label}] 段0: 宣言が1本も無いのに**拒否が1件も出ていない**。強制が効いていないか\
+                 （旗が渡っていない／生成禁止が積まれていない）、台本がそもそも子を1つも\
+                 起こしていない。どちらにせよこの測定は無効である"
+            ));
+            break;
+        }
+
+        if !arm.denied_by_kernel.is_empty() {
+            // **失敗ではない。** 購読者が入った日に初めて現れる行である（§10.2）。
+            eprintln!(
+                "[survey] [{label}] 段{hop}: カーネル拒否の行が現れた: {:?}",
+                arm.denied_by_kernel
+            );
+        }
+
+        // **畳んでから足す。** 同じ拒否は更新行として何度も積まれるので、そのまま足すと
+        // `policy.json`が重複した辺を持ち、**宣言がまるごと効かなくなる**（§S64で踏んだ）。
+        let mut newly: Vec<String> = Vec::new();
+        for exe in &arm.denied_by_daemon {
+            let known = sweep
+                .declared
+                .iter()
+                .chain(newly.iter())
+                .any(|d| d.eq_ignore_ascii_case(exe));
+            if !known {
+                newly.push(exe.clone());
+            }
+        }
+        eprintln!(
+            "[survey] [{label}] 段{hop}: 宣言済み{}本 → 新しく断られた{}本 {newly:?}",
+            sweep.declared.len(),
+            newly.len()
+        );
+        sweep.hops.push((hop, newly.clone()));
+        if newly.is_empty() {
+            sweep.converged_at = Some(hop);
+            // **「新しい拒否が無い」を「鎖が終わった」と読まない。** 宣言しても通らない
+            // 種類の拒否は、宣言へ足しても次の段で同じものが出る——新しくはないので
+            // ここへ到達するが、その先で起きるはずだった子は1つも現れていない。
+            sweep.cut_by = arm
+                .denied_detail
+                .iter()
+                .filter(|(_, reason)| !reason.starts_with("宣言を足せば通る"))
+                .cloned()
+                .collect();
+            sweep.cut_by.dedup();
+            break;
+        }
+        sweep.declared.extend(newly);
+    }
+
+    eprintln!("[survey] ===== [{label}] 断られた一覧（宣言へ足した順） =====");
+    for (hop, newly) in &sweep.hops {
+        for exe in newly {
+            eprintln!("[survey]   [{label}] 段{hop}: {exe}");
+        }
+    }
+    eprintln!(
+        "[survey] ===== [{label}] 合計{}本 / 収束した段: {:?} / 鎖を切ったもの: {:?} =====",
+        sweep.declared.len(),
+        sweep.converged_at,
+        sweep.cut_by
+    );
+
+    if sweep.converged_at.is_none() {
+        failures.push(format!(
+            "[{label}] 上限{SURVEY_MAX_HOPS}段まで回しても**新しい拒否が出続けた**。\
+             鎖が切れていないので、この一覧は「全部」ではない。ここまでの宣言（{}本）: {:?}",
+            sweep.declared.len(),
+            sweep.declared
+        ));
+    }
+    // **測定が成立していないので赤にする。** 一覧そのものは正しい（そこまでは本当に断られた）が、
+    // **この測定が答えようとしている問い**は「実務に近いセッションを回すのに何本要るか」であり、
+    // 鎖が途中で切れている以上その答えは出ていない。緑にすると、次に読む人は
+    // 「N本で収束した」だけを持ち帰る——§S66で2回踏んだ「短い一覧を全部と読む」そのものである。
+    if !sweep.cut_by.is_empty() {
+        failures.push(format!(
+            "[{label}] 収束した段（{:?}）で、**宣言しても通らない拒否が残っている**: {:?}。\
+             鎖はここで切れており、その先で起きるはずだった子は1つも観測できていない。\
+             したがってこの{}本は**下限であって「全部」ではない**。\
+             理由が`SpawnFailed`なら辺は許可されていて`CreateProcess`が落ちている\
+             （宣言ではなく起こし方の問題）、`NotRegistered`なら呼び出し元がDaemonの\
+             Process Tableに載っていない（鎖の深さの問題）——どちらなのかで次の一手が変わる",
+            sweep.converged_at,
+            sweep.cut_by,
+            sweep.declared.len()
+        ));
+    }
+    sweep
+}
+
 /// **既定の宣言一式の一次データを測る**（⑤を既定へ入れる準備①）。
 ///
 /// # 何を測っているのか
@@ -6581,15 +6936,51 @@ fn seed_survey_workspace(ws: &Path) -> Result<(), String> {
 /// 宣言を0本から始めて**断られたものを足しては撃ち直す**。新しく断られるものが
 /// 無くなった回が「鎖の全段が出た」印である。
 ///
+/// # 掃きは2つある（**振っている軸は「道具が見えるか」1つだけ**）
+///
+/// §S66の一覧が3本で収束したのは「足りている」からではなかった——`cargo`は
+/// サンドボックスから実体が読めず、**遷移MACには1度も届いていなかった**。そこで
+/// [`survey_visibility_grants`]で実体を読めるようにした掃きを足し、**同じ台本・同じ反復で
+/// 並べて読める**ようにしてある。
+///
+/// | 掃き | `--fs-allow` | 何を表すか |
+/// |---|---|---|
+/// | `invisible` | 無し | 今日のTier2aで元から到達できる道具だけ |
+/// | `visible` | `.cargo`/`.rustup` | `cargo`まで到達できるようにしたときの一覧 |
+///
+/// **`invisible`は§S66の再現ではない。** 同じ引数で撃っているが、`node`・`npm`は
+/// §S66が「見えない」と記録したのに対してこちらでは見えている
+/// （[`survey_visibility_grants`]のdoc）。**2つの測定が食い違っているので、
+/// §S66の本数と直接は引き算できない**——並べて読む相手はこの`invisible`の側である。
+///
+/// **順序は「見えない」が先である。** `--fs-allow`のACEは**harnessの終了後も残る**ので、
+/// 先に見える側を撃つと、続く「見えない」側が前の掃きの付与に相乗りしてしまう。
+///
 /// # これは合否のテストではなく、測定である
 ///
 /// 赤くなるのは**測定が成立していないとき**だけにしてある——旗なしの腕で拒否が出た
 /// （遷移MAC以外の何かが止めている）／旗ありの段0で拒否が1件も出ない（強制が効いていない）／
-/// 上限まで回っても収束しない（鎖が切れていない）。**「何本だった」を合格条件にしない**
-/// ——機械に入っているものが変われば本数は変わる。
+/// 上限まで回っても収束しない／**収束した段に、宣言しても通らない拒否が残っている**
+/// （[`SurveySweep::cut_by`]。鎖がそこで切れているので一覧は下限にすぎない）／
+/// **2つの掃きが同じものを見ている**（軸を振れていない）。
+/// **「何本だった」を合格条件にしない**——機械に入っているものが変われば本数は変わる。
+///
+/// # このテストが実マシンに残すもの
+///
+/// [`survey_visibility_grants`]の3ディレクトリへ、**この測定用ワークスペースの宣言から
+/// 導出したcapability SID宛の読取＋実行ACE**が残る（`--fs-allow`のACEはセッション終了で
+/// 剥がれない）。**剥がさないのは意図した選択**である——剥がすと次にこの測定を回すたびに
+/// 18万ノードへのDACL再伝播を払うことになり、かつ「既定の宣言一式」を決める作業自体が
+/// この到達性を前提にしている。代わりに、**何を残したかを終わりに必ず出す**
+/// （撤収の扉は`harness fs revoke <path>`）。
 #[test]
 #[ignore = "starts several real Tier2a sessions with the transition MAC enforced; run through dev-elevated-run"]
 fn what_a_realistic_session_needs_declared() {
+    // `--fs-allow`は`fs-passthrough-ledger.json`へ書く。**保護対象の台帳**なので、
+    // 全件を並行実行する`e2e-all`で隣（`tier2a_fs_allow_matrix`等）と撃ち合わないよう、
+    // テスト関数の全体で排他ガードを持つ（このファイル冒頭「共有資源の排他」の4番）。
+    let ledger = fs_ledger_exclusive();
+
     let ws = case_dir("declaration-survey");
     seed_survey_workspace(&ws).unwrap_or_else(|e| panic!("仕掛けを置けなかった: {e}"));
 
@@ -6606,8 +6997,9 @@ fn what_a_realistic_session_needs_declared() {
     let mut failures: Vec<String> = Vec::new();
 
     // --- 腕A: 旗を立てない。**今日の既定では拒否が1件も起きない**ことの確認 ---
-    let unenforced = run_arm_collecting_denials(&ws, "survey-unenforced", false, &script, "survey")
-        .unwrap_or_else(|e| panic!("腕A（旗なし）が測れなかった: {e}"));
+    let unenforced =
+        run_arm_collecting_denials(&ws, "survey-unenforced", false, &script, "survey", &[])
+            .unwrap_or_else(|e| panic!("腕A（旗なし）が測れなかった: {e}"));
     if !unenforced.denied_by_daemon.is_empty() {
         failures.push(format!(
             "腕A: 旗を立てていないのに拒否が出ている（{:?}）。**遷移MAC以外の何かが止めている**ので、\
@@ -6624,147 +7016,122 @@ fn what_a_realistic_session_needs_declared() {
          ——ここに出るものは**遷移MACとは無関係**である"
     );
 
-    // --- 旗を立てて、断られたものを足しては撃ち直す ---
-    let mut declared: Vec<String> = Vec::new();
-    let mut hops: Vec<(usize, Vec<String>)> = Vec::new();
-    let mut converged_at: Option<usize> = None;
-
-    for hop in 0..SURVEY_MAX_HOPS {
-        declare_programs(&ws, &declared)
-            .unwrap_or_else(|e| panic!("段{hop}の宣言を書けなかった: {e}"));
-        let case_name = format!("survey-hop{hop}");
-        let arm = run_arm_collecting_denials(&ws, &case_name, true, &script, "survey")
-            .unwrap_or_else(|e| panic!("段{hop}が測れなかった: {e}"));
-
-        if hop == 0 {
-            // **名前を解決できなかったものは、遷移MACに1度も届いていない。**
-            // 一覧から静かに消えるので、ここで拾って測定ごと無効にする（`B-10`）。
-            let names: Vec<&str> = SURVEY_CANDIDATES.iter().map(|(p, _)| *p).collect();
-            // **申告そのものが出ていない**なら、解決できたかどうかを判定できていない。
-            // 「印が無い＝解決できた」と読むと、また静かに短い一覧ができる。
-            let unprobed: Vec<&str> = names
-                .iter()
-                .copied()
-                .filter(|p| {
-                    !arm.text.contains(&format!("{SURVEY_PROBE_OK} {p}"))
-                        && !arm.text.contains(&format!("{SURVEY_PROBE_MISSING} {p}"))
-                })
-                .collect();
-            if !unprobed.is_empty() {
-                failures.push(format!(
-                    "段0: {unprobed:?} について**名前を解決できたかの申告が1つも出ていない**。\
-                     申告の行がシェルへ届いていないので、この一覧が全部かどうかを判定できない"
-                ));
-            }
-            // **見えているか／見えていないか**を要約する。一覧の本数が小さいとき、
-            // 「宣言が3本で足りる」のか「3本しか遷移MACまで届いていない」のかは
-            // ここでしか分かれない。
-            let visible: Vec<&str> = names
-                .iter()
-                .copied()
-                .filter(|p| arm.text.contains(&format!("{SURVEY_SEE_OK} {p}")))
-                .collect();
-            let invisible: Vec<&str> = names
-                .iter()
-                .copied()
-                .filter(|p| arm.text.contains(&format!("{SURVEY_SEE_NO} {p}")))
-                .collect();
-            eprintln!(
-                "[survey] 段0: サンドボックスから**実体が見えた**={visible:?} / \
-                 **見えなかった**={invisible:?}（見えないものは絶対パスで撃っても\
-                 遷移MACに届かない——止めているのはファイルを読めるかどうかである）"
-            );
-
-            let never = programs_never_attempted(&arm.text, &names);
-            // **解決できないこと自体は、この測定の失敗ではない**——旗を立てない腕でも同じなら、
-            // 遷移MACとは無関係の既存の制約である（宣言を足しても直らない）。
-            // **失敗なのは、旗を立てた側でだけ解決できなくなったとき**——強制を入れた代償として
-            // 道具が届かなくなったことを意味し、既定へ入れる判断に直接効く。
-            let lost_by_enforcing: Vec<&String> = never
-                .iter()
-                .filter(|p| !never_unenforced.contains(p))
-                .collect();
-            if !lost_by_enforcing.is_empty() {
-                failures.push(format!(
-                    "段0: {lost_by_enforcing:?} は**旗を立てた側でだけ名前を解決できない**。\
-                     旗なしでは解決できているので、強制を入れたこと（＝シェルが\
-                     Windows PowerShell 5.1へ替わること、§S62）が原因である。\
-                     **宣言では直らない種類の後退**なので、既定へ入れる前に決着させること"
-                ));
-            }
-            if !never.is_empty() {
-                eprintln!(
-                    "[survey] 段0: {never:?} は**サンドボックスの中で名前を解決できず、\
-                     起動を試みてすらいない**（旗なしでも同じ={}）。\
-                     **この一覧は「実務に必要な全部」ではない**——遷移MACへ届いていないものが\
-                     この数だけ在る。直すのは宣言ではなく、PATHかその置き場を読めるようにする側である",
-                    lost_by_enforcing.is_empty()
-                );
-            }
-        }
-
-        if hop == 0 && arm.denied_by_daemon.is_empty() {
-            failures.push(
-                "段0: 宣言が1本も無いのに**拒否が1件も出ていない**。強制が効いていないか\
-                 （旗が渡っていない／生成禁止が積まれていない）、台本がそもそも子を1つも\
-                 起こしていない。どちらにせよこの測定は無効である"
-                    .to_string(),
-            );
-            break;
-        }
-
-        if !arm.denied_by_kernel.is_empty() {
-            // **失敗ではない。** 購読者が入った日に初めて現れる行である（§10.2）。
-            eprintln!(
-                "[survey] 段{hop}: カーネル拒否の行が現れた: {:?}",
-                arm.denied_by_kernel
-            );
-        }
-
-        // **畳んでから足す。** 同じ拒否は更新行として何度も積まれるので、そのまま足すと
-        // `policy.json`が重複した辺を持ち、**宣言がまるごと効かなくなる**（§S64で踏んだ）。
-        let mut newly: Vec<String> = Vec::new();
-        for exe in &arm.denied_by_daemon {
-            let known = declared
-                .iter()
-                .chain(newly.iter())
-                .any(|d| d.eq_ignore_ascii_case(exe));
-            if !known {
-                newly.push(exe.clone());
-            }
-        }
-        eprintln!(
-            "[survey] 段{hop}: 宣言済み{}本 → 新しく断られた{}本 {newly:?}",
-            declared.len(),
-            newly.len()
-        );
-        hops.push((hop, newly.clone()));
-        if newly.is_empty() {
-            converged_at = Some(hop);
-            break;
-        }
-        declared.extend(newly);
-    }
-
-    // --- 一覧を1箇所にまとめて出す（記録へ写す元になる） ---
-    eprintln!("[survey] ===== 断られた一覧（宣言へ足した順） =====");
-    for (hop, newly) in &hops {
-        for exe in newly {
-            eprintln!("[survey]   段{hop}: {exe}");
-        }
-    }
-    eprintln!(
-        "[survey] ===== 合計{}本 / 収束した段: {:?} / 載せなかったプログラム: {skipped:?} =====",
-        declared.len(),
-        converged_at
+    // --- 掃き1: 道具が見えないまま（§S66の再現） ---
+    let invisible = run_declaration_sweep(
+        &ws,
+        &script,
+        "invisible",
+        &[],
+        &never_unenforced,
+        &mut failures,
     );
 
-    if converged_at.is_none() && failures.is_empty() {
-        failures.push(format!(
-            "上限{SURVEY_MAX_HOPS}段まで回しても**新しい拒否が出続けた**。鎖が切れていないので、\
-             この一覧は「全部」ではない。ここまでの宣言（{}本）: {declared:?}",
-            declared.len()
-        ));
+    // --- 掃き2: 道具の実体を読めるようにしてから ---
+    let grants = survey_visibility_grants();
+    let grant_args: Vec<String> = grants
+        .iter()
+        .flat_map(|(spelling, _)| ["--fs-allow".to_string(), spelling.clone()])
+        .collect();
+    eprintln!(
+        "[survey] 見えるようにする宣言（{}件）: {:?}",
+        grants.len(),
+        grants.iter().map(|(s, _)| s).collect::<Vec<_>>()
+    );
+    let visible = if grants.is_empty() {
+        failures.push(
+            "見えるようにする対象が1つもこの機械に無い。**軸を振れていない**ので、\
+             2つ目の掃きは1つ目と同じものを測ることになる"
+                .to_string(),
+        );
+        None
+    } else {
+        Some(run_declaration_sweep(
+            &ws,
+            &script,
+            "visible",
+            &grant_args,
+            &never_unenforced,
+            &mut failures,
+        ))
+    };
+
+    // --- 軸が実際に振れたかを判定する（**ここが新しい歯**） ---
+    if let Some(visible) = &visible {
+        // 1. 掃き1で**見えなかったものが1つも無い**なら、2つの掃きは同じ条件である。
+        //
+        // **この測定は2回目以降も同じ結果になる**（2026-09-19に2回撃って確かめた）。
+        // `--fs-allow`のACEは残るが、宛先は**宣言ごとのcapability SID**であり、
+        // 旗を渡さない掃きの子はそのcapabilityをトークンへ積んでいない——
+        // ACEが在っても1バイトも読めない。だから残った付与に相乗りすることはなく、
+        // ここが落ちるのは**宛先SIDの設計が変わった**か、誰かが別経路で
+        // `ALL APPLICATION PACKAGES`等の広いACEを置いたときである。
+        if invisible.invisible.is_empty() {
+            failures.push(format!(
+                "掃き`invisible`で**実体が見えなかったプログラムが1つも無い**（見えた={:?}）。\
+                 この状態では2つの掃きが同じものを測っており、振っている軸が無い。\
+                 `--fs-allow`の残りACEでは（宛先が宣言ごとのcapability SIDなので）こうならない\
+                 ——**もっと広い宛先のACEが別経路で置かれていないか**を実DACLで見ること",
+                invisible.visible
+            ));
+        }
+        // 2. 掃き1で見えなかったものが、掃き2で見えるようになっていること。
+        //    変わらないなら`--fs-allow`の付与が効いておらず、§S66の焼き直しにすぎない。
+        let still_invisible: Vec<&String> = invisible
+            .invisible
+            .iter()
+            .filter(|p| visible.invisible.contains(p))
+            .collect();
+        if !still_invisible.is_empty() {
+            failures.push(format!(
+                "掃き`visible`でも{still_invisible:?}の実体が見えていない。\
+                 **`--fs-allow`の付与が効いていない**ので、この掃きは§S66の焼き直しである。\
+                 起動側の`fs-allow`行（上のログ）と`harness fs`の台帳を見ること"
+            ));
+        }
+    }
+
+    // --- 2つの掃きを並べる（記録へ写す元になる） ---
+    eprintln!("[survey] ===== 2つの掃きを並べる =====");
+    for sweep in [Some(&invisible), visible.as_ref()].into_iter().flatten() {
+        eprintln!(
+            "[survey]   {:<9} 断られた{}本 / 収束した段={:?} / 段数={} / \
+             鎖を切ったもの={:?} / 見えた={:?} / 見えなかった={:?} / 起動を試みてすらいない={:?}",
+            sweep.label,
+            sweep.declared.len(),
+            sweep.converged_at,
+            sweep.hops.len(),
+            sweep.cut_by,
+            sweep.visible,
+            sweep.invisible,
+            sweep.never_attempted,
+        );
+        for (hop, newly) in &sweep.hops {
+            for exe in newly {
+                eprintln!("[survey]     {:<9} 段{hop}: {exe}", sweep.label);
+            }
+        }
+    }
+    eprintln!("[survey] ===== 載せなかったプログラム: {skipped:?} =====");
+
+    // --- 実マシンに何を残したかを出す（剥がさない選択をしたので、必ず言う） ---
+    eprintln!("[survey] ===== 実マシンに残した`--fs-allow`の付与 =====");
+    for (spelling, dir) in &grants {
+        match ledger.entry_for(dir) {
+            Ok(Some((managed, workspaces))) => eprintln!(
+                "[survey]   {} （宣言={spelling}）: 台帳に在り settings_managed={managed} \
+                 参照ワークスペース={workspaces:?} / 撤収は `harness fs revoke \"{}\"`",
+                dir.display(),
+                dir.display()
+            ),
+            // **「台帳に無い」を黙らせない**（`B-10`）。付与が失敗した回と、
+            // 付与はできたのに記録が漏れた回は、どちらもここで無印になる。
+            Ok(None) => eprintln!(
+                "[survey]   {} （宣言={spelling}）: **台帳にエントリが無い**\
+                 ——付与できなかったか、記録が漏れている",
+                dir.display()
+            ),
+            Err(e) => eprintln!("[survey]   {} : 台帳を読めなかった: {e}", dir.display()),
+        }
     }
 
     assert!(

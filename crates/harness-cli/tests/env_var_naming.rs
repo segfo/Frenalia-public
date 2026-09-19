@@ -157,6 +157,10 @@ const EXTERNAL_ENV_VARS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "APPDATA",
+    // rustupが定める置き場。`e2e-declaration-survey`（§S67）が「`cargo`の実体をサンドボックスから
+    // 見えるようにする」対象を**機械から引く**ために読む。パスを直書きすると、この2つを
+    // 立てている機械で**黙って0件の付与**になり、測定が軸を振れないまま緑になる。
+    "CARGO_HOME",
     "CARGO_MANIFEST_DIR",
     "COMPUTERNAME",
     "EDITOR",
@@ -169,6 +173,8 @@ const EXTERNAL_ENV_VARS: &[&str] = &[
     "OPENAI_BASE_URL",
     "ProgramData",
     "ProgramFiles",
+    // `CARGO_HOME`と対（同じ測定が同じ理由で読む）。
+    "RUSTUP_HOME",
     "SystemRoot",
     "TERM_PROGRAM",
     "USERNAME",
