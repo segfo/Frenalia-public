@@ -6796,6 +6796,22 @@ fn survey_visibility_grants() -> Vec<(String, PathBuf)> {
         std::env::var("RUSTUP_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| Path::new(&home).join(".rustup")),
+        // **Visual Studioの「場所を検出する」ための置き場**（[BUG-014](../../../docs/bugs/BUG-014.md)）。
+        //
+        // # なぜVSのインストール先ではなくここなのか（2026-09-19に実DACLで確かめた）
+        //
+        // VS本体（`C:\Program Files (x86)\Microsoft Visual Studio\**`）は**既にどの
+        // AppContainerからも読める**——`ALL APPLICATION PACKAGES`へ読取＋実行が
+        // `C:\Program Files (x86)`から継承されている。読めないのは**検出用のDLL**の側で、
+        // `C:\ProgramData\Microsoft\VisualStudio\Setup\{x64,x86}\Microsoft.VisualStudio.Setup.Configuration.Native.dll`
+        // が住む`C:\ProgramData`は、**どの階層も`ALL APPLICATION PACKAGES`に1ビットも
+        // 開いていない**。rustcがMSVCのリンク時に使う`cc`クレートはこのDLLでVSを探すので、
+        // 読めないと**リンカの在処が分からない**（`error: linker link.exe not found`）。
+        //
+        // **`C:\Program Files`のようには失敗しない。** あちらは`NT SERVICE\TrustedInstaller`
+        // 所有で管理者でも`WRITE_DAC`が無く、祖先へのtraverse付与で必ず止まる（§S67）。
+        // こちらは4階層とも`BUILTIN\Administrators`が`FullControl`を持つ。
+        PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
     ];
     let mut out = Vec::new();
     for dir in candidates {
@@ -6846,6 +6862,20 @@ struct SurveySweep {
     invisible: Vec<String>,
     /// 段0で**名前を解決できず、起動を試みてすらいない**プログラム（`HP_PROBE_MISSING`）。
     never_attempted: Vec<String>,
+    /// **最後の段でビルドが最後まで通ったか**（`HP_BUILD_OK`／`HP_BUILD_NG`／印が出ない＝`None`）。
+    ///
+    /// # なぜ収束だけでは足りないのか（2026-09-19に**偽の緑**を踏んだ）
+    ///
+    /// [`SurveySweep::cut_by`]が空で[`SurveySweep::converged_at`]が`Some`でも、
+    /// **鎖が終わったとは限らない**。断られる前に止まる段——たとえばリンカを探す側が
+    /// 諦めてしまえば、リンカは**起動を試みられないので拒否に現れない**。
+    /// 新しい拒否が出ないまま収束し、**一覧は下限のままなのに緑になる**。
+    ///
+    /// 実際に踏んだ形: Visual Studioの検出用の置き場を見えるようにしたところ、
+    /// 鎖を切っていた`vswhere.exe`は一覧から消えて「切断なし・9本で収束」になったが、
+    /// **ビルドは全段で通っていなかった**（`error: linker link.exe not found`）。
+    /// 拒否の側だけを見ていると、この状態と「本当に全部そろった」が区別できない。
+    built: Option<bool>,
 }
 
 /// 宣言を0本から足しては撃ち直し、**新しい拒否が出なくなるまで**回す（1掃き）。
@@ -6877,6 +6907,7 @@ fn run_declaration_sweep(
         visible: Vec::new(),
         invisible: Vec::new(),
         never_attempted: Vec::new(),
+        built: None,
     };
 
     for hop in 0..SURVEY_MAX_HOPS {
@@ -6885,6 +6916,15 @@ fn run_declaration_sweep(
         let case_name = format!("survey-{label}-hop{hop}");
         let arm = run_arm_collecting_denials(ws, &case_name, true, script, "survey", extra_args)
             .unwrap_or_else(|e| panic!("[{label}] 段{hop}が測れなかった: {e}"));
+
+        // **段ごとに上書きする。** 見たいのは「最後の段でビルドが通ったか」である。
+        sweep.built = if arm.text.contains(SURVEY_BUILD_OK) {
+            Some(true)
+        } else if arm.text.contains(SURVEY_BUILD_NG) {
+            Some(false)
+        } else {
+            None
+        };
 
         if hop == 0 {
             // **起動側が何を言ったかを残す。** `--fs-allow`の付与が失敗しても子のstdoutには
@@ -7072,6 +7112,26 @@ fn run_declaration_sweep(
             sweep.cut_reasons.len(),
             sweep.cut_reasons
         ));
+    }
+    // **拒否が出なくなっただけでは「全部そろった」と言えない**（2026-09-19に偽の緑を踏んだ）。
+    // 断られる前に諦める段があると、その先のプログラムは**起動を試みられないので拒否に現れない**
+    // ——新しい拒否が出ないまま収束し、一覧は下限のまま緑になる。
+    // **台本が最後まで通ったことを、収束と同じ重さで要求する。**
+    match sweep.built {
+        Some(true) => {}
+        Some(false) => failures.push(format!(
+            "[{label}] 新しい拒否は出なくなった（収束: {:?}・切断なし）が、\
+             **台本のビルドは最後まで通っていない**（`{SURVEY_BUILD_NG}`）。\
+             リンカのように「探す側が諦めた」プログラムは**起動を試みられないので拒否に現れない**\
+             ——したがってこの{}本は**下限であって「全部」ではない**。\
+             run_shellの本文でどこで諦めたかを名指しすること",
+            sweep.converged_at,
+            sweep.declared.len()
+        )),
+        None => failures.push(format!(
+            "[{label}] ビルドの印が片方も出ていない。台本のcargoの段までシェルが到達して\
+             いないので、**一覧が全部かを判定できない**"
+        )),
     }
     sweep
 }
