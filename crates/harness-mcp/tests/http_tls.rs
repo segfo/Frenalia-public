@@ -84,7 +84,7 @@ fn issue_certificates() -> TestCa {
 // | どこへ | いつ | 何のため |
 // |---|---|---|
 // | stderr | 中継が失敗したときだけ | **無言失敗をやめる**。1回の`cargo test`でも区間が見える |
-// | `HARNESS_TLS_FRONT_TRACE`が指すファイル | 全中継（開始と終了の2行） | 1000回ぶんを機械集計する |
+// | `HARNESS_TEST_TLS_FRONT_TRACE`が指すファイル | 全中継（開始と終了の2行） | 1000回ぶんを機械集計する |
 //
 // **開始と終了を別の行にするのが要である。** 終了行が無い中継＝**戻ってこなかった中継**で、
 // 「落ちた」と「固まった」はそれでしか区別できない（BUG-159の計器が1回ごとに時間切れを
@@ -151,7 +151,7 @@ fn now_millis() -> u128 {
 
 /// 足跡を1行追記する。**環境変数が無ければ何もしない**（通常の`cargo test`を汚さない）。
 fn trace(line: &str) {
-    let Ok(path) = std::env::var("HARNESS_TLS_FRONT_TRACE") else {
+    let Ok(path) = std::env::var("HARNESS_TEST_TLS_FRONT_TRACE") else {
         return;
     };
     // **1行を1回の`write`で出す。** `writeln!`は書式ごとに`write`を呼ぶので、
