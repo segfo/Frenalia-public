@@ -326,7 +326,7 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
                             lines.push(Line::styled(
                                 format!(
                                     "{indent}      ⊂ {covering}（{}）に覆われています\
-                                     ——外すなら F4 の宣言画面でその行を外してください",
+                                     ——外すなら F3 の宣言画面でその行を外してください",
                                     key.dotted()
                                 ),
                                 Style::default().fg(Color::DarkGray),

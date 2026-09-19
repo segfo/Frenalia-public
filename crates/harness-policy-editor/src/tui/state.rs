@@ -489,6 +489,12 @@ pub enum Confirm {
     Approval,
     /// 宣言の取り消しだけを書く。宣言画面の`a`。
     Unapproval,
+    /// [段階⑦] 遷移の宣言を足す／消す。承認待ち画面の遷移タブの`a`。
+    ///
+    /// **`Approval`と分けてあるのは、書く先も確認の文面も違うから**である
+    /// （あちらは`fs`/`net`の宣言とACEの予告、こちらは`process`の辺と「ACLは変わらない」）。
+    /// 1つにまとめると、確定の腕がどちらの意味だったか判別できなくなる。
+    Transition,
 }
 
 impl Confirm {
@@ -755,6 +761,12 @@ pub struct App {
     pub domain: TextInput,
     pub show_tree: bool,
     pub edit_focus: EditField,
+    /// [段階⑦] 承認待ち画面のタブと、**遷移の2タブが持つ状態ひとまとめ**（決定62）。
+    ///
+    /// **1フィールドに閉じ込めてある。** このファイルは本体1,953行で
+    /// `docs/CODE-STRUCTURE-RULES.md`規則1（1,000行）を既に超えているので、
+    /// 新しい画面の状態をここへ広げない（中身は`tui::transition`が持つ）。
+    pub pending: crate::tui::transition::PendingState,
 
     // 宣言画面（`Screen::Declared`）
     /// `policy.json`から読んだ宣言の一覧（`(ドメイン, キー, 値)`の平坦な集合）。
@@ -857,6 +869,7 @@ impl App {
             domain: TextInput::default(),
             show_tree: false,
             edit_focus: EditField::Proposals,
+            pending: crate::tui::transition::PendingState::default(),
             declared: Vec::new(),
             declared_tree: ProposalTree::default(),
             declared_expanded: HashSet::new(),
@@ -1477,23 +1490,45 @@ impl App {
             // 1回目はここで止めず、画面ごとの既存の意味（記録画面へ戻る等）へ流す。
         }
 
+        // 画面は`F1`→`F2`→`F3`の**連番**で、ヘルプは`F4`である（決定62）。
+        //
+        // # なぜヘルプを`?`にしなかったのか（決定62の手段からの変更）
+        //
+        // 決定62は「ヘルプをF番号から外す（`F3`→`?`）」と書いたが、**記録画面は文字キーを
+        // 全部入力欄が食う**（`on_record_key`の末尾が`edit_text`へ流す）。`?`を大域キーにすると
+        // 記録したいコマンドに`?`が打てなくなり、**記録画面からヘルプへ行く口も無くなる**。
+        // 決定62の目的（画面のF番号が連番になること）は`F4`でも達成されるので、
+        // 手段だけを変えてある。
         match key.code {
             KeyCode::F(1) => {
                 self.screen = Screen::Record;
                 return None;
             }
+            // **同じ画面に居るときは、タブを巡回する。**
+            //
+            // # なぜ`Tab`キーにしなかったのか（決定62の手段からの変更）
+            //
+            // 決定62の図は「Tabで切替」と書いているが、**承認待ち画面は既に`Tab`を
+            // 項目移動に使っている**（セッション一覧 ⇄ 候補 ⇄ ドメイン欄）。しかも
+            // ドメイン欄は文字入力なので、**`Tab`はそこから出る唯一のキー**である。
+            // 奪うと入力欄に入ったまま出られなくなる。`F2`の連打なら文字入力と衝突せず、
+            // タブの見出しが常に画面に出ているので見つけられる。
             KeyCode::F(2) => {
-                self.screen = Screen::Edit;
-                self.on_enter_screen();
+                if self.screen == Screen::Edit {
+                    self.cycle_pending_tab(false);
+                } else {
+                    self.screen = Screen::Edit;
+                    self.on_enter_screen();
+                }
                 return None;
             }
             KeyCode::F(3) => {
-                self.help = true;
+                self.screen = Screen::Declared;
+                self.on_enter_screen();
                 return None;
             }
             KeyCode::F(4) => {
-                self.screen = Screen::Declared;
-                self.on_enter_screen();
+                self.help = true;
                 return None;
             }
             _ => {}
@@ -1501,6 +1536,8 @@ impl App {
 
         match self.screen {
             Screen::Record => self.on_record_key(key),
+            // タブによって「何を承認する画面か」が変わる（決定62）。
+            Screen::Edit if self.pending.tab.0.is_transition() => self.on_transition_key(key),
             Screen::Edit => self.on_edit_key(key),
             Screen::Declared => self.on_declared_key(key),
         }
@@ -1508,7 +1545,7 @@ impl App {
 
     /// `Ctrl+N`の巡回順。
     ///
-    /// **F1〜F4だけでは足りない**——VS Codeの統合ターミナルはF1をコマンドパレットに奪うので、
+    /// **F1〜F3だけでは足りない**——VS Codeの統合ターミナルはF1をコマンドパレットに奪うので、
     /// 修飾キー付きの予備がどの画面へも届かないと、その画面は実環境で開けないことがある
     /// （この予備キーが在る理由そのもの）。画面を足したらここにも足す。
     fn next_screen(&self) -> Screen {
@@ -1523,6 +1560,8 @@ impl App {
     /// 同じ準備が走る（片方だけ準備を書くと、もう片方から入ったとき空の画面が出る）。
     fn on_enter_screen(&mut self) {
         match self.screen {
+            // 遷移のタブに居るなら、そちらを読み直す（`F2`は3つのタブを持つ。決定62）。
+            Screen::Edit if self.pending.tab.0.is_transition() => self.reload_transitions(),
             Screen::Edit => {
                 // **画面へ入るたびにセッション一覧を読み直す**（D-63で`r`＝読み直しを廃止した）。
                 // 自分で記録したものは`finish_and_suggest`が拾うが、CLIや別プロセスが作った
@@ -1678,6 +1717,7 @@ impl App {
                 match kind {
                     Some(Confirm::Approval) => self.commit_approval(),
                     Some(Confirm::Unapproval) => self.commit_unapproval(),
+                    Some(Confirm::Transition) => self.commit_transition(),
                     Some(Confirm::ReadOnly) | None => {}
                 }
                 None

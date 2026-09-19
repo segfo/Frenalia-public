@@ -324,3 +324,132 @@ fn the_observed_line_has_a_stable_wire_format() {
         r#"{"kind":"overflowed","dropped":5,"last_ts":9}"#
     );
 }
+
+// ---------------------------------------------------------------------------
+// 読む側（段階⑦の遷移画面）
+// ---------------------------------------------------------------------------
+
+/// **書いたものが読み戻せる。** 同じ種類の更新行は1行へ畳まれ、**最後の回数**になる。
+///
+/// # なぜ書き手を通して測るのか
+///
+/// 畳み込みの鍵は書く側（`observe`）と読む側（`classify`）の**2箇所**にある。
+/// 手で行を並べて読むテストだと、**両方が同じようにずれていても緑になる**。
+/// 実際に書かせてから読むことでしか、その食い違いは見つからない。
+#[test]
+fn reading_back_folds_the_update_lines_into_one_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut candidates = ObservedCandidates::new(tmp.path());
+    let resolve = |_: u32| in_scope("C:/git.exe", None);
+
+    for tick in 0..4u64 {
+        candidates
+            .observe(vec![event(100, "git status")], resolve, tick)
+            .expect("write");
+    }
+    // ファイルには3行ある（1件目・2件目・4件目）。
+    assert_eq!(spawns(candidates.path()).len(), 3);
+
+    let read = read_folded(tmp.path()).expect("読めない");
+    assert_eq!(read.records.len(), 1, "更新行が別の種類として残っている");
+    assert_eq!(read.skipped, 0);
+    assert_eq!(read.dropped, 0);
+    match &read.records[0] {
+        ObservedRecord::ObservedSpawn(spawn) => assert_eq!(spawn.count, 4),
+        other => panic!("種類の行ではない: {other:?}"),
+    }
+}
+
+/// **対の側**（`B-35`）: 別の種類まで1行へ潰さない。
+///
+/// これが無いと「全部を1行へ畳む」実装でも上のテストは緑になり、
+/// 画面には候補が常に1本しか出ない。
+#[test]
+fn reading_back_keeps_different_kinds_apart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut candidates = ObservedCandidates::new(tmp.path());
+
+    candidates
+        .observe(
+            vec![event(100, "git status")],
+            |_| in_scope("C:/git.exe", Some("C:/pwsh.exe")),
+            1,
+        )
+        .expect("write");
+    candidates
+        .observe(
+            vec![event(101, "git status")],
+            |_| in_scope("C:/git.exe", Some("C:/cmd.exe")),
+            2,
+        )
+        .expect("write");
+
+    let read = read_folded(tmp.path()).expect("読めない");
+    assert_eq!(read.records.len(), 2, "親が違えば別の辺である");
+}
+
+/// あふれの報告は**種類ではない**。累計を持つので、2回出ても二重に数えない。
+#[test]
+fn an_overflow_report_is_not_a_kind_and_is_not_counted_twice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = observed_path(tmp.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // 書き手は「その時点までの累計」を書く（`FoldingLog::flush`）。
+    std::fs::write(
+        &path,
+        "{\"kind\":\"overflowed\",\"dropped\":3,\"last_ts\":1}\n\
+         {\"kind\":\"overflowed\",\"dropped\":7,\"last_ts\":2}\n",
+    )
+    .unwrap();
+
+    let read = read_folded(tmp.path()).expect("読めない");
+    assert!(read.records.is_empty(), "あふれの行が候補として出ている");
+    assert_eq!(read.dropped, 7, "累計を足し合わせて二重に数えている");
+}
+
+/// **無いファイルは空である（失敗ではない）。** まだ1度も記録していない構成がこれになる。
+#[test]
+fn a_missing_file_reads_as_empty_rather_than_failing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let read = read_folded(tmp.path()).expect("無いファイルが失敗になっている");
+    assert!(read.records.is_empty());
+    assert_eq!(read.skipped, 0);
+}
+
+/// 壊れた行は**数えて飛ばす**。黙って捨てると「その生成は起きなかった」と読まれる（`B-10`）。
+#[test]
+fn unparsable_lines_are_counted_not_silently_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = observed_path(tmp.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "これはJSONではない\n\
+         {\"kind\":\"observed_spawn\",\"parent_exe\":null,\"exe\":\"C:/git.exe\",\
+         \"argv\":\"git status\",\"count\":1,\"first_ts\":1,\"last_ts\":1,\"argv_truncation\":false}\n",
+    )
+    .unwrap();
+
+    let read = read_folded(tmp.path()).expect("読めない");
+    assert_eq!(read.records.len(), 1);
+    assert_eq!(read.skipped, 1, "壊れた行が数えられていない");
+}
+
+/// 書いている途中の末尾は**行として読まない**。読むと理由の無い警告が画面に出る。
+#[test]
+fn a_half_written_last_line_is_not_reported_as_broken() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = observed_path(tmp.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "{\"kind\":\"observed_spawn\",\"parent_exe\":null,\"exe\":\"C:/git.exe\",\
+         \"argv\":\"git status\",\"count\":1,\"first_ts\":1,\"last_ts\":1,\"argv_truncation\":false}\n\
+         {\"kind\":\"observed_sp",
+    )
+    .unwrap();
+
+    let read = read_folded(tmp.path()).expect("読めない");
+    assert_eq!(read.records.len(), 1);
+    assert_eq!(read.skipped, 0, "書きかけの末尾を壊れた行として数えている");
+}

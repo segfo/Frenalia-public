@@ -506,7 +506,7 @@ fn the_screens_can_be_switched_at_any_time_even_while_recording() {
     assert!(app.is_running(), "画面を移っても記録は続いている");
 }
 
-/// **F1/F2/F4が端末に届かない環境がある**（VS Codeの統合ターミナルはF1をコマンドパレットへ奪う）。
+/// **F1/F2/F3が端末に届かない環境がある**（VS Codeの統合ターミナルはF1をコマンドパレットへ奪う）。
 /// 修飾キー付きの予備（Ctrl+N）で**すべての画面へ**行けること——1画面でも巡回から漏れると、
 /// その画面はそういう端末では開けない。
 #[test]
@@ -522,13 +522,21 @@ fn the_screens_can_be_switched_without_the_function_keys() {
     assert_eq!(app.screen, Screen::Record, "一周して戻る");
 }
 
-/// F4でも宣言画面へ直接行ける（`F3`はヘルプなので使えない）。
+/// 画面は`F1`→`F2`→`F3`の**連番**で、ヘルプは`F4`である（決定62。段階⑦で並べ替えた）。
+///
+/// **対で測る**（`B-35`）——片方だけだと、両方が同じ画面を開く実装でも緑になる。
 #[test]
-fn f4_opens_the_declared_screen() {
+fn f3_opens_the_declared_screen_and_f4_opens_the_help() {
     let ws = workspace();
     let mut app = app_with(&ws);
+
+    app.on_key(key(KeyCode::F(3)));
+    assert_eq!(app.screen, Screen::Declared, "F3が宣言画面になっていない");
+    assert!(!app.help, "宣言画面を開くつもりでヘルプが出ている");
+
     app.on_key(key(KeyCode::F(4)));
-    assert_eq!(app.screen, Screen::Declared);
+    assert!(app.help, "F4でヘルプが出ていない");
+    assert_eq!(app.screen, Screen::Declared, "ヘルプが画面を動かしている");
 }
 
 /// Escでも行き来できる（必ず届くキー）。ただし**記録中は停止が優先**で、画面は動かさない

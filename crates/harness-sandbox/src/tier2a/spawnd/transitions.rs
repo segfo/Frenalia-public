@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::DenyReason;
-use crate::tier2a::transitions_log::{FoldedLine, Folded, FoldingLog};
+use crate::tier2a::transitions_log::{FoldedLine, Folded, FoldingLog, ReadLine};
 pub use crate::tier2a::transitions_log::{
     argv_is_possibly_truncated, transitions_dir, QueueError, Recorded,
 };
@@ -314,6 +314,37 @@ impl FoldedLine for PendingRecord {
     fn overflow_line(dropped: u64, last_ts: u64) -> Result<String, serde_json::Error> {
         serde_json::to_string(&PendingRecord::Overflowed { dropped, last_ts })
     }
+
+    /// **[`record_of`]の逆写像**（鍵 → 行 の逆）。すぐ下に並べてあるのは、
+    /// 片方だけ欄が増えたときに見つかるようにするためである。
+    fn classify(&self) -> ReadLine<Key> {
+        let (kernel, denial) = match self {
+            PendingRecord::DeniedByDaemon(denial) => (false, denial),
+            PendingRecord::DeniedByKernel(denial) => (true, denial),
+            PendingRecord::Overflowed { dropped, .. } => {
+                return ReadLine::Overflow { dropped: *dropped }
+            }
+        };
+        ReadLine::Kind(Key {
+            kernel,
+            from_domain: denial.from_domain.clone(),
+            exe: denial.exe.clone(),
+            argv: denial.argv.clone(),
+            cwd: denial.cwd.clone(),
+            reason: denial.reason.clone(),
+        })
+    }
+}
+
+/// 拒否を**畳んで全部読む**（段階⑦の遷移画面）。
+///
+/// **[`read_from`]と用途が違う。** あちらは`run_shell`が「そのコマンドの間に積まれた分」だけを
+/// 見るためのもので畳まない。こちらは後から全部を見るので、同じ種類を1行へ畳む。
+/// 置き場は`workspace_root`から導出する（[`pending_path`]）——**読む側も綴りを写さない**。
+pub fn read_folded(
+    workspace_root: &Path,
+) -> Result<crate::tier2a::transitions_log::FoldedRead<PendingRecord>, QueueError> {
+    crate::tier2a::transitions_log::read_folded(&pending_path(workspace_root))
 }
 
 /// 拒否の待ち行列。**Daemonが1つ持ち、全ての要求受付スレッドが共有する。**

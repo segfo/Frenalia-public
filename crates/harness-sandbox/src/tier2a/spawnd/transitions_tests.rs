@@ -507,3 +507,66 @@ fn an_unterminated_last_line_is_left_for_the_next_read() {
         "途中の行まで読んだことにしている: {tail:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 読む側（段階⑦の遷移画面）
+// ---------------------------------------------------------------------------
+
+/// **書いたものが読み戻せる。** 同じ種類の更新行は1行へ畳まれ、最後の回数になる。
+///
+/// 畳み込みの鍵は書く側（`record`）と読む側（`classify`）の**2箇所**にある。
+/// 手で行を並べて読むテストでは、**両方が同じようにずれていても緑になる**。
+#[test]
+fn reading_back_folds_the_update_lines_into_one_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let queue = TransitionQueue::new(tmp.path());
+    let reason = transition(TransitionDenial::NoMatchingEdge);
+
+    for tick in 0..4u64 {
+        // 何を書いたか（初回・更新・畳んだだけ）はここでは問わない——**読み戻した結果**で測る。
+        let _ = queue
+            .record_daemon_denial(observed("C:/git.exe", "git status", &reason), tick)
+            .expect("write");
+    }
+    // ファイルには3行ある（1件目・2件目・4件目）。
+    assert_eq!(read_records(queue.path()).len(), 3);
+
+    let read = read_folded(tmp.path()).expect("読めない");
+    assert_eq!(read.records.len(), 1, "更新行が別の種類として残っている");
+    assert_eq!(read.skipped, 0);
+    match &read.records[0] {
+        PendingRecord::DeniedByDaemon(denial) => assert_eq!(denial.count, 4),
+        other => panic!("Daemonの拒否ではない: {other:?}"),
+    }
+}
+
+/// **対の側**（`B-35`）: 理由が違えば別の種類のまま残る。
+///
+/// これが無いと「全部を1行へ畳む」実装でも上のテストは緑になる——直し方が違うものが
+/// 1行になると、**片方の直し方しか画面に出ない**。
+#[test]
+fn reading_back_keeps_denials_with_different_reasons_apart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let queue = TransitionQueue::new(tmp.path());
+    let no_edge = transition(TransitionDenial::NoMatchingEdge);
+    let unknown = transition(TransitionDenial::UnknownSourceDomain);
+
+    let _ = queue
+        .record_daemon_denial(observed("C:/git.exe", "git status", &no_edge), 1)
+        .expect("write");
+    let _ = queue
+        .record_daemon_denial(observed("C:/git.exe", "git status", &unknown), 2)
+        .expect("write");
+
+    let read = read_folded(tmp.path()).expect("読めない");
+    assert_eq!(read.records.len(), 2, "理由が違う拒否が1行に潰れている");
+}
+
+/// **無いファイルは空である（失敗ではない）。** Daemonを起こしていない構成がこれになる。
+#[test]
+fn a_missing_queue_reads_as_empty_rather_than_failing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let read = read_folded(tmp.path()).expect("無いファイルが失敗になっている");
+    assert!(read.records.is_empty());
+    assert_eq!(read.dropped, 0);
+}

@@ -21,6 +21,10 @@ harness-config = { version = "0.1.0", path = "../harness-config" }
 harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-policy = { version = "0.1.0", path = "../harness-policy" }
 harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
+# 遷移の候補を宣言と突き合わせるときの畳み込み（`fold_for_pattern_comparison`）。
+# **遷移の判定器が使っているのと同じ関数**を通す——別の畳み方をすると、画面が
+# 「宣言済み」と言っているのに撃つと断られる（段階⑦、`transition_candidates`）。
+harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
 # 記録モードのTier1起動は`run_shell`とまったく同じブートストラップを通す（4経路目、B-05）。
 harness-tools = { version = "0.1.0", path = "../harness-tools" }

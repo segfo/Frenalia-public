@@ -1,27 +1,36 @@
 //! 記録・編集・宣言の3画面のTUI（`plans/POLICY-EDITOR-TOMOYO-DIG.md`）。
 //!
 //! ```text
-//!   ┌ F1 記録 ─────────────────┐        ┌ F2 編集 ──────────────────┐
+//!   ┌ F1 記録 ─────────────────┐        ┌ F2 承認待ち ──────────────┐
 //!   │ パス1: 隔離なしでFSを記録   │ ──記録─▶│ 候補を選ぶ → policy.jsonへ │
 //!   │ パス2: Tier2aでドメイン  │◀─承認── │ 承認（差分を見てから書く） │
-//!   └──────────────────────────┘        └─────────────┬─────────────┘
+//!   └──────────────────────────┘        │ タブ: FS/ネット │ 遷移・観測 │
+//!                                       │       │ 遷移・拒否          │
+//!                                       └─────────────┬─────────────┘
 //!                                                     │ 宣言済みは[x]で重なる
-//!                                       ┌ F4 宣言 ────┴─────────────┐
+//!                                       ┌ F3 宣言 ────┴─────────────┐
 //!                                       │ policy.jsonの宣言を取り消す │
 //!                                       │ （記録が無くても開ける）    │
 //!                                       └───────────────────────────┘
 //! ```
 //!
-//! 画面は`F1`/`F2`/`F4`と`Ctrl+N`（巡回）でいつでも行き来できる（決定13: 記録し直す・過去の記録を
+//! 画面は`F1`/`F2`/`F3`と`Ctrl+N`（巡回）でいつでも行き来できる（決定13: 記録し直す・過去の記録を
 //! 別の一般化度合いで見直す、をいつでも行える）。矢印は**次にやることの提案**であって
-//! 一方通行ではない。
+//! 一方通行ではない。**ヘルプは`F4`**で、`F2`をもう一度押すと承認待ちのタブが切り替わる
+//! （決定62。`Tab`は承認待ち画面が項目移動に使っているので奪えない——詳細は`state::App::on_key`）。
+//!
+//! # 承認待ちは3つのタブを持つ（決定62、段階⑦）
+//!
+//! ファイル・通信の候補と、**遷移（どのプログラムが何を起こしてよいか）**の候補は
+//! 出どころが違うが、**ユーザーがやることは同じ**である——選んで、許す。だから画面を
+//! 分けずにタブにする。遷移の2タブは[`transition`]（状態）と[`transition_screen`]（描画）が持つ。
 //!
 //! # 承認と取り消しはどちらもチェックボックスで表す
 //!
 //! 編集画面の候補行には、**もう`policy.json`が宣言している値**が`[x]`で重なる。同じ場所へ
 //! 二重に承認しないためと、間違って承認したものをその場で外せるようにするためである。
 //! 一方、**記録に出てこない宣言**（前に承認したが今回のコマンドが触らなかったもの）は
-//! 宣言画面（`F4`）が受け持つ——そちらは`policy.json`だけを入力にするので、記録が1件も無くても
+//! 宣言画面（`F3`）が受け持つ——そちらは`policy.json`だけを入力にするので、記録が1件も無くても
 //! 開ける。「ログを取らずに消す」経路がこれである。
 //!
 //! # `Esc`を1秒以内に2回でプログラムを終了する
@@ -54,6 +63,9 @@ mod proposal_tree;
 pub mod record_screen;
 mod stderr_capture;
 mod text_input;
+/// [段階⑦] 承認待ち画面（`F2`）の遷移2タブの状態遷移。
+pub mod transition;
+mod transition_screen;
 mod worker;
 
 use std::io;
@@ -246,6 +258,10 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
             scroll: record_screen::draw(frame, chunks[1], app),
             ..Default::default()
         },
+        // 承認待ち画面は3つのタブを持つ（決定62）。遷移の2タブは別の描き手。
+        Screen::Edit if app.pending.tab.0.is_transition() => {
+            transition_screen::draw(frame, chunks[1], app)
+        }
         Screen::Edit => edit_screen::draw(frame, chunks[1], app),
         Screen::Declared => declared_screen::draw(frame, chunks[1], app),
     };
@@ -278,7 +294,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(" "),
         Span::styled(
-            " F2 編集 ",
+            " F2 承認待ち ",
             if app.screen == Screen::Edit {
                 active
             } else {
@@ -287,7 +303,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(" "),
         Span::styled(
-            " F4 宣言 ",
+            " F3 宣言 ",
             if app.screen == Screen::Declared {
                 active
             } else {
@@ -341,9 +357,27 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
                 keys.push("Esc 編集画面へ".to_string());
             }
         }
+        // 遷移のタブは操作が違う。**効かない操作を案内しない**（`B-32`）。
+        Screen::Edit if app.pending.tab.0.is_transition() => {
+            keys.push("Esc 記録画面へ".to_string());
+            keys.push("F2 タブ切替".to_string());
+            keys.push("↑↓ 選択".to_string());
+            keys.push("Space 選ぶ/外す".to_string());
+            keys.push("u 引数の広さ".to_string());
+            keys.push(format!("f 表示: {}", app.pending.filter.label()));
+            keys.push("r 読み直し".to_string());
+            let reserved = app.pending.approve.len() + app.pending.remove.len();
+            if reserved == 0 {
+                keys.push("a 確定".to_string());
+            } else {
+                // 予約件数を出す（何件書かれるのかが確定の直前まで見えている必要がある）。
+                keys.push(format!("a 確定（{reserved}件）"));
+            }
+        }
         Screen::Edit => {
             keys.push("Esc 記録画面へ".to_string());
-            keys.push("Tab 移動".to_string());
+            keys.push("F2 タブ切替".to_string());
+            keys.push("Tab 項目移動".to_string());
             keys.push("↑↓ 選択".to_string());
             keys.push("→← 展開/折畳".to_string());
             keys.push("Space この配下をまとめて選択".to_string());
@@ -368,7 +402,7 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    keys.push("F3 ヘルプ".to_string());
+    keys.push("F4 ヘルプ".to_string());
     // **Esc×2は案内しないと見つけられない。** 単押しは画面遷移なので、二度押しが終了である
     // ことは画面から推測できない。
     keys.push("Esc×2 終了".to_string());
@@ -396,13 +430,29 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
 画面の行き来（3通り。使える方をどうぞ）
   Esc          記録画面へ戻る（記録中は「停止」が優先されます）
   **Esc を1秒以内に2回でこのプログラムを終了します**（記録中なら撤収を待ちます）
-  Ctrl+N       記録 → 編集 → 宣言 → 記録 と巡回
-  F1 / F2 / F4 記録 / 編集 / 宣言 を直接指定
+  Ctrl+N       記録 → 承認待ち → 宣言 → 記録 と巡回
+  F1 / F2 / F3 記録 / 承認待ち / 宣言 を直接指定（F4 はこのヘルプ）
+  F2 をもう一度押すと、承認待ちの**タブ**が切り替わります
+               （FS/ネット → 遷移・観測から → 遷移・拒否から）
   **VS Codeの統合ターミナルではF1がコマンドパレットに奪われて届きません。**
   その場合は Esc か Ctrl+N を使ってください。
-  記録と編集は独立しています。記録し終えてから編集へ進む一方通行ではありません。
+  記録と承認は独立しています。記録し終えてから承認へ進む一方通行ではありません。
 
-宣言画面（F4）— いま何を許可し続けているか
+承認待ちの「遷移」タブ — どのプログラムが何を起こしてよいか
+  ファイルやネットワークの許可とは**別のポリシー**です。こちらが決めるのは
+  「そのプログラムを起こしてよいか」だけで、**実マシンのACLは1ビットも変わりません**。
+  出どころが2つあります——「観測から」はパス1で実際に起きたプロセス、
+  「拒否から」は強制中に断られた生成です。どちらも操作は同じです。
+  Space  選ぶ／外す（未宣言なら許可を予約、宣言済みなら取り消しを予約）
+  u      引数の広さを切り替える（既定は「任意の引数」。観測された引数だけに絞れます）
+         **コマンドラインが切り詰められている疑いがある観測は絞れません**
+         ——切れた値で宣言すると、二度と一致しない辺になります。
+  f      表示（保留中のみ ⇄ 全部）   r 読み直し   a 確定
+  [x]=確定するとこのプログラムを起こせる  [ ]=起こせない  [-]=この行からは操作できない
+  **いまは「同じドメインの中で起こす」宣言しか書けません（暫定）。** 別ドメインへ分けるには
+  そのドメインの実体を作る機構が要り、まだありません。代償は確定の前に出ます。
+
+宣言画面（F3）— いま何を許可し続けているか
   policy.json に書かれている宣言そのものを並べます。**記録が1件も無くても開けます**
   ——「間違って承認したのですぐ消したい」「検証のため全部消したい」は記録とは無関係の操作です。
   Space  取り消しを予約（ドメインの行なら配下をまとめて）

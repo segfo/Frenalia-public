@@ -109,6 +109,12 @@ pub use harness_policy::policy_file;
 pub mod session_dir;
 pub mod session_lock;
 pub mod shell_output;
+/// [段階⑦] 選んだ候補を遷移の宣言として`policy.json`へ書く／消す。
+/// **ACEは付かない**（遷移の宣言は付与の対象を持たない）。
+pub mod transition_approve;
+/// [段階⑦] 観測（`observed.jsonl`）と拒否（`pending.jsonl`）を**遷移の辺の候補**にする。
+/// 「もう宣言済みか」はSpawn Daemonと同じ判定器に聞く（判定を2つ作らない）。
+pub mod transition_candidates;
 /// 承認済み宣言の取り消し（[`approve`]の対）。`policy.json`から宣言を消す。**ACEは触らない**
 /// ——撤収は付与と同じライフサイクル点（パス2の開始時と、プロセス終了時）が担当する。
 pub mod unapprove;

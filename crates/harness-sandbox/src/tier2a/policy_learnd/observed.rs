@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tier2a::transitions_log::{
     argv_is_possibly_truncated, transitions_dir, FoldedLine, Folded, FoldingLog, QueueError,
-    Recorded,
+    ReadLine, Recorded,
 };
 
 /// 候補を積むファイル。
@@ -135,6 +135,34 @@ impl FoldedLine for ObservedRecord {
     fn overflow_line(dropped: u64, last_ts: u64) -> Result<String, serde_json::Error> {
         serde_json::to_string(&ObservedRecord::Overflowed { dropped, last_ts })
     }
+
+    /// **[`Key`]と同じ3つ組を、読んだ行から組み立て直す。**
+    ///
+    /// 書くときの鍵（[`ObservedCandidates::observe`]）とここは同じ値でなければならない
+    /// ——食い違うと、同じ種類の更新行が別の種類として2行に見える。
+    /// 同じファイルに両方を置いてあるのはそのためである。
+    fn classify(&self) -> ReadLine<Key> {
+        match self {
+            ObservedRecord::ObservedSpawn(spawn) => ReadLine::Kind(Key {
+                parent_exe: spawn.parent_exe.clone(),
+                exe: spawn.exe.clone(),
+                argv: spawn.argv.clone(),
+            }),
+            ObservedRecord::Overflowed { dropped, .. } => {
+                ReadLine::Overflow { dropped: *dropped }
+            }
+        }
+    }
+}
+
+/// 候補を**畳んで全部読む**（段階⑦の遷移画面）。
+///
+/// 置き場は`workspace_root`から導出する（[`observed_path`]）——**読む側も綴りを写さない**。
+/// 畳み方の正本は[`crate::tier2a::transitions_log::read_folded`]で、ここは置き場を知っているだけである。
+pub fn read_folded(
+    workspace_root: &Path,
+) -> Result<crate::tier2a::transitions_log::FoldedRead<ObservedRecord>, QueueError> {
+    crate::tier2a::transitions_log::read_folded(&observed_path(workspace_root))
 }
 
 /// MOF側から取り出した観測1件（pidとコマンドラインだけ）。

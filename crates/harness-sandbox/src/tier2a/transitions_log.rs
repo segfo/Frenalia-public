@@ -122,7 +122,8 @@ impl std::error::Error for QueueError {}
 
 /// この記録は、**何を鍵にして畳み、どんな行を書くのか**。
 ///
-/// 畳み方と追記の時機は[`FoldingLog`]が持つので、実装側が決めるのはこの2つだけである。
+/// 畳み方と追記の時機は[`FoldingLog`]が持つので、実装側が決めるのはこの3つだけである
+/// （**書く側2つと読む側1つ**）。
 pub trait FoldedLine {
     /// 畳み込みの鍵。**同じ鍵の観測は1つの種類として数える。**
     type Key: Clone + Eq + Hash;
@@ -135,6 +136,117 @@ pub trait FoldedLine {
     /// **あふれを黙って捨てない**（`B-10`）。捨てた件数を残さないと、
     /// 「その観測は起きなかった」と読まれる。
     fn overflow_line(dropped: u64, last_ts: u64) -> Result<String, serde_json::Error>;
+
+    /// 読んだ1行が**種類なのか、あふれの報告なのか**（[`read_folded`]が使う）。
+    ///
+    /// # なぜ鍵を返す関数とあふれを返す関数の2本に分けないのか
+    ///
+    /// 2本に分けると「どちらも`None`」「どちらも`Some`」という**意味を持たない返し方**が
+    /// 書けてしまう。ここは必ずどちらか一方なので、[`ReadLine`]で選ばせる。
+    ///
+    /// # 書く側と読む側が対であることは、型が確かめる
+    ///
+    /// 記録を1種類足したらこの実装も要る（足さなければコンパイルできない）。
+    /// **書き手だけ作って読み手を忘れる**形にならない（`B-01`）。
+    fn classify(&self) -> ReadLine<Self::Key>;
+}
+
+/// 追記された1行が何であるか（[`FoldedLine::classify`]の答え）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadLine<K> {
+    /// 種類1つぶんの行。同じ鍵の行が複数あれば**最後の1つ**が最新である。
+    Kind(K),
+    /// 覚えられなかった回数の報告行。**種類ではないので畳まない。**
+    Overflow { dropped: u64 },
+}
+
+/// 追記された記録を**畳んで全部読んだ結果**（[`read_folded`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldedRead<T> {
+    /// 種類ごとに**最後の1行**。並びは**ファイルにその種類が初めて現れた順**である
+    /// （`HashMap`の巡回順を外へ出すと、同じ入力で並びが変わって画面が落ち着かない）。
+    pub records: Vec<T>,
+    /// あふれで覚えられなかった観測の**回数の合計**。
+    ///
+    /// **画面はこれを出すこと。** 0でないのに黙ると「その生成は起きなかった」と読まれる（`B-10`）。
+    pub dropped: u64,
+    /// 解析できずに飛ばした行数。**黙って捨てない**（`B-10`）。
+    pub skipped: usize,
+}
+
+impl<T> Default for FoldedRead<T> {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            dropped: 0,
+            skipped: 0,
+        }
+    }
+}
+
+/// 追記された記録を**畳んで全部読む**（段階⑦の遷移画面）。
+///
+/// # `run_shell`が使う「続きだけ読む」とは別物である
+///
+/// あちら（`spawnd::transitions::read_from`）は**そのコマンドの間に積まれた分**だけを見るので
+/// 畳まない。こちらは**後から全部**を見るので、同じ鍵の行を畳んで最後の1つを採る。
+/// 用途が違うので両方在る。**規則（同じ鍵は1種類・最後が最新）はここが正本である。**
+///
+/// # 無いファイルは空である（失敗ではない）
+///
+/// まだ1件も観測していない構成では存在しない。一方、**在るのに読めない**のは失敗として返す
+/// ——黙って空にすると「観測が無かった」と読まれる（`B-10`）。
+///
+/// # 最後の改行より後ろは読まない
+///
+/// 書き手が追記の途中で落ちた／いま書いている最中なら、末尾は行として完成していない。
+/// 完成していない行を解析すると**壊れた行として数えられ**、画面に理由のない警告が出る。
+pub fn read_folded<T>(path: &Path) -> Result<FoldedRead<T>, QueueError>
+where
+    T: FoldedLine + serde::de::DeserializeOwned,
+{
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FoldedRead::default()),
+        Err(e) => {
+            return Err(QueueError {
+                path: path.to_path_buf(),
+                message: e.to_string(),
+            })
+        }
+    };
+    let complete = match bytes.iter().rposition(|b| *b == b'\n') {
+        Some(index) => index + 1,
+        None => 0,
+    };
+
+    let mut out = FoldedRead::default();
+    // 鍵 → `records`の添字。**初出の順を保つため**に添字を覚える（並べ直さない）。
+    let mut index: HashMap<T::Key, usize> = HashMap::new();
+    for line in bytes[..complete].split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<T>(line) else {
+            out.skipped += 1;
+            continue;
+        };
+        match record.classify() {
+            ReadLine::Kind(key) => match index.get(&key) {
+                // 同じ種類の更新行。**最後の1つで置き換える**（回数が増えている）。
+                Some(at) => out.records[*at] = record,
+                None => {
+                    index.insert(key, out.records.len());
+                    out.records.push(record);
+                }
+            },
+            // **あふれの行は「その時点までの累計」を持つ**（[`FoldingLog::flush`]が
+            // `state.dropped`をそのまま書く）。だから足し合わせず、**最後の行で置き換える**
+            // ——足すと、報告が2回出ただけで件数が二重に数えられる。
+            ReadLine::Overflow { dropped } => out.dropped = dropped,
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug)]
