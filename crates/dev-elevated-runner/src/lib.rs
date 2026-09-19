@@ -927,6 +927,76 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "vhd_ntfs_remove",
         ],
     ),
+    // 残課題#53の計測（`crates/harness-mcp/tests/loopback_drop_probe.rs`）: ループバックの
+    // 接続要求を**どの部品がどの理由で捨てているか**を`pktmon`に名指しさせる。
+    // **開始・報告・停止を3つのキーに分けてある**——昇格側プロセスへ呼び出し元の環境変数が
+    // 引き継がれる保証が無いので、1つのキーに向きを渡すと「停止したつもりで開始していた」
+    // という無言の取り違えになる（`n2-loopback-exemption-add`／`-remove`と同じ理由）。
+    // **監視セッションとフィルタは実マシンに残る共有状態なので、`-start`を撃ったら
+    // 必ず`-stop`を撃つこと。**
+    (
+        "pktmon-drop-start",
+        &[
+            "test",
+            "-p",
+            "harness-mcp",
+            "--test",
+            "loopback_drop_probe",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "start_the_loopback_drop_monitor",
+        ],
+    ),
+    // パケットの計数ではなくTCPIPの**イベント**を集める側（`127.0.0.1`はNDISを通らないので
+    // パケット計数からは原理的に見えない。同ファイルのdoc参照）。**停止は`pktmon-drop-stop`と
+    // 共通**——停止のキーを2つに割ると「どちらを撃つか」の判断が要り、外した回にセッションが残る。
+    (
+        "pktmon-trace-start",
+        &[
+            "test",
+            "-p",
+            "harness-mcp",
+            "--test",
+            "loopback_drop_probe",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "start_the_tcpip_event_trace",
+        ],
+    ),
+    (
+        "pktmon-drop-report",
+        &[
+            "test",
+            "-p",
+            "harness-mcp",
+            "--test",
+            "loopback_drop_probe",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "report_the_loopback_drops",
+        ],
+    ),
+    (
+        "pktmon-drop-stop",
+        &[
+            "test",
+            "-p",
+            "harness-mcp",
+            "--test",
+            "loopback_drop_probe",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "stop_the_loopback_drop_monitor",
+        ],
+    ),
     (
         "workspace-build",
         &["build", "--workspace", "--exclude", "dev-elevated-runner"],

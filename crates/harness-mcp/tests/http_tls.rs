@@ -73,11 +73,114 @@ fn issue_certificates() -> TestCa {
     }
 }
 
+// ===== 中継の足跡（残課題#53の計測用） =====
+//
+// **`relay_one`の失敗は、かつて1件も記録されなかった**（戻り値を`let _ =`で捨てていた）。
+// TLS受け入れに残る1%の揺らぎは「繋がった後のやり取りが途中で切れる」形なので、
+// **どの区間で切れたか**を数えられないと原因に届かない。
+//
+// 足跡は2段構えにしてある。
+//
+// | どこへ | いつ | 何のため |
+// |---|---|---|
+// | stderr | 中継が失敗したときだけ | **無言失敗をやめる**。1回の`cargo test`でも区間が見える |
+// | `HARNESS_TLS_FRONT_TRACE`が指すファイル | 全中継（開始と終了の2行） | 1000回ぶんを機械集計する |
+//
+// **開始と終了を別の行にするのが要である。** 終了行が無い中継＝**戻ってこなかった中継**で、
+// 「落ちた」と「固まった」はそれでしか区別できない（BUG-159の計器が1回ごとに時間切れを
+// 付けているのと同じ理由）。
+
+/// 中継1本が**どの区間まで進んだか**。`relay_one`の各`?`に1つずつ対応する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayStage {
+    /// ① TLSの接続を作る
+    TlsNew,
+    /// ① ハンドシェイクを回し切る（②の読み取りと混ざらないよう明示的に分ける）
+    TlsHandshake,
+    /// ② 要求を読み切る
+    ReadRequest,
+    /// ③ 上流へ接続する
+    UpstreamConnect,
+    /// ③ 上流へ要求を流す
+    UpstreamWrite,
+    /// ③ 上流の応答をEOFまで読む
+    UpstreamRead,
+    /// ④ 応答をTLSへ書き戻す
+    WriteResponse,
+    /// ④ 書き戻しをflushする
+    FlushResponse,
+}
+
+impl RelayStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TlsNew => "1-tls-new",
+            Self::TlsHandshake => "1-tls-handshake",
+            Self::ReadRequest => "2-read-request",
+            Self::UpstreamConnect => "3-upstream-connect",
+            Self::UpstreamWrite => "3-upstream-write",
+            Self::UpstreamRead => "3-upstream-read",
+            Self::WriteResponse => "4-write-response",
+            Self::FlushResponse => "4-flush-response",
+        }
+    }
+}
+
+/// 失敗した区間と、その場のエラー。
+struct RelayFailure {
+    stage: RelayStage,
+    error: String,
+}
+
+fn at(stage: RelayStage) -> impl Fn(std::io::Error) -> RelayFailure {
+    move |e| RelayFailure {
+        stage,
+        error: format!("{e} (kind={:?}, os={:?})", e.kind(), e.raw_os_error()),
+    }
+}
+
+/// 中継に通し番号を振る（開始行と終了行を突き合わせるため）。
+static RELAY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default()
+}
+
+/// 足跡を1行追記する。**環境変数が無ければ何もしない**（通常の`cargo test`を汚さない）。
+fn trace(line: &str) {
+    let Ok(path) = std::env::var("HARNESS_TLS_FRONT_TRACE") else {
+        return;
+    };
+    // **1行を1回の`write`で出す。** `writeln!`は書式ごとに`write`を呼ぶので、
+    // 同時に走る中継スレッドの行が途中で混ざる（実際に混ざった）。
+    let record = format!("{} pid={} {line}\n", now_millis(), std::process::id());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(record.as_bytes());
+    }
+}
+
+/// いま自分が属しているテストの名前（libtestがスレッド名に入れる）。
+fn current_test() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or("(unnamed)")
+        .to_string()
+}
+
 /// 平文モックの前に立つTLS終端。dropで待受を畳む。
 struct TlsFront {
     addr: SocketAddr,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// まだ戻ってきていない中継の本数（dropの時点で0でない＝テストが中継を追い越した）。
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TlsFront {
@@ -102,6 +205,10 @@ impl TlsFront {
 
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = shutdown.clone();
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = in_flight.clone();
+        let test = current_test();
+        trace(&format!("front-start test={test} addr={addr}"));
         let thread = std::thread::spawn(move || {
             loop {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -114,9 +221,41 @@ impl TlsFront {
                         // `WouldBlock`で即座に落ちる。
                         let _ = stream.set_nonblocking(false);
                         let config = config.clone();
+                        let test = test.clone();
+                        let counter = counter.clone();
                         // 1接続1スレッド。テスト用なので同時接続数は高々数本。
                         std::thread::spawn(move || {
-                            let _ = relay_one(stream, config, upstream);
+                            let id = RELAY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            trace(&format!("relay-begin id={id} test={test}"));
+                            let started = std::time::Instant::now();
+                            let outcome = relay_one(stream, config, upstream);
+                            let ms = started.elapsed().as_millis();
+                            match outcome {
+                                Ok(seen) => trace(&format!(
+                                    "relay-end id={id} test={test} stage=ok ms={ms} {seen}"
+                                )),
+                                Err(failure) => {
+                                    // **失敗を捨てない。** 環境変数が無くても区間は見える。
+                                    // ただし**ハンドシェイクの失敗は正常な結果**である——
+                                    // 拒否側のテスト4本は、クライアントが証明書を拒んで
+                                    // 警告を送るところまでが期待動作なので、ここで鳴らすと
+                                    // 毎回鳴る見張りになる。
+                                    if failure.stage != RelayStage::TlsHandshake {
+                                        eprintln!(
+                                            "tls front relay failed in {} ({test}): {}",
+                                            failure.stage.as_str(),
+                                            failure.error
+                                        );
+                                    }
+                                    trace(&format!(
+                                        "relay-end id={id} test={test} stage={} ms={ms} err={:?}",
+                                        failure.stage.as_str(),
+                                        failure.error
+                                    ));
+                                }
+                            }
+                            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -132,6 +271,7 @@ impl TlsFront {
             addr,
             shutdown,
             thread: Some(thread),
+            in_flight,
         }
     }
 
@@ -142,6 +282,14 @@ impl TlsFront {
 
 impl Drop for TlsFront {
     fn drop(&mut self) {
+        // 畳む瞬間に走っている中継の本数を残す。**テストが中継を追い越して終わった**ことは、
+        // 失敗した区間だけを見ても分からない（そのとき中継は終了行を書かずに消える）。
+        trace(&format!(
+            "front-stop test={} addr={} in_flight={}",
+            current_test(),
+            self.addr,
+            self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
+        ));
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
@@ -175,38 +323,84 @@ impl Drop for TlsFront {
 ///
 /// モックは常に`Content-Length`を付けて`Connection: close`で閉じるので、
 /// 「リクエストを読み切る→上流へ流す→EOFまで読む→返す」で足りる。
+///
+/// 成功したときは足跡へ載せる要約（どのJSON-RPCメソッドを何バイト中継したか）を返す。
+/// 失敗したときは**どの区間で切れたか**を返す——`?`で捨てると、残った揺らぎの原因が
+/// どの区間にあるのかを数える手段が無くなる。
 fn relay_one(
     tcp: TcpStream,
     config: Arc<rustls::ServerConfig>,
     upstream: SocketAddr,
-) -> std::io::Result<()> {
-    let connection =
-        rustls::ServerConnection::new(config).map_err(|e| std::io::Error::other(e.to_string()))?;
+) -> Result<String, RelayFailure> {
+    let connection = rustls::ServerConnection::new(config).map_err(|e| RelayFailure {
+        stage: RelayStage::TlsNew,
+        error: e.to_string(),
+    })?;
     let mut tls = rustls::StreamOwned::new(connection, tcp);
-
-    let request = read_http_message(&mut tls)?;
-    if request.is_empty() {
-        return Ok(());
+    // ハンドシェイクを明示的に回し切る。`read`に任せると①の失敗が②に化ける。
+    while tls.conn.is_handshaking() {
+        tls.conn
+            .complete_io(&mut tls.sock)
+            .map_err(at(RelayStage::TlsHandshake))?;
     }
 
-    let mut up = TcpStream::connect(upstream)?;
-    up.write_all(&request)?;
-    up.flush()?;
-    let mut response = Vec::new();
-    up.read_to_end(&mut response)?;
+    let request = read_http_message(&mut tls).map_err(at(RelayStage::ReadRequest))?;
+    if request.is_empty() {
+        // 証明書の下見（`cert_probe`）はハンドシェイクだけして閉じる。正常な終わり方。
+        return Ok("rpc=(handshake-only) req=0 resp=0".to_string());
+    }
 
-    tls.write_all(&response)?;
-    tls.flush()
+    let mut up = TcpStream::connect(upstream).map_err(at(RelayStage::UpstreamConnect))?;
+    up.write_all(&request).map_err(at(RelayStage::UpstreamWrite))?;
+    up.flush().map_err(at(RelayStage::UpstreamWrite))?;
+    let mut response = Vec::new();
+    up.read_to_end(&mut response)
+        .map_err(at(RelayStage::UpstreamRead))?;
+
+    tls.write_all(&response)
+        .map_err(at(RelayStage::WriteResponse))?;
+    tls.flush().map_err(at(RelayStage::FlushResponse))?;
+    Ok(format!(
+        "rpc={} req={} resp={}",
+        rpc_method(&request),
+        request.len(),
+        response.len()
+    ))
+}
+
+/// 中継した本文からJSON-RPCの`method`を拾う（足跡用。**どの往復で切れたか**を見るため）。
+fn rpc_method(request: &[u8]) -> String {
+    let body = String::from_utf8_lossy(request);
+    let Some(rest) = body.split("\"method\":").nth(1) else {
+        return "(none)".to_string();
+    };
+    let rest = rest.trim_start().trim_start_matches('"');
+    match rest.find('"') {
+        Some(end) => rest[..end].to_string(),
+        None => "(unparsed)".to_string(),
+    }
 }
 
 /// ヘッダ＋`Content-Length`分の本文を読み切る（HTTP/1.1の最小実装）。
+///
+/// **読み切る前に相手が閉じたら、途中まで読んだものを返さずエラーにする。** 上流のモックは
+/// 1接続ずつ順に捌く単線なので、**中途半端な要求を渡すと`read_exact`で永久に待ち続け、
+/// そのテストの残り全部が黙って止まる**——足跡の上では区間②の失敗が消え、区間③の
+/// 「戻ってこない中継」だけが残るので、どこで切れたのかを数えられなくなる。
+/// 1バイトも来ないまま閉じたとき（証明書の下見）は正常なので空を返す。
 fn read_http_message(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
         let read = stream.read(&mut chunk)?;
         if read == 0 {
-            return Ok(buf);
+            if buf.is_empty() {
+                return Ok(buf);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("the client closed after {} bytes of a partial request", buf.len()),
+            ));
         }
         buf.extend_from_slice(&chunk[..read]);
 
