@@ -802,6 +802,17 @@ pub(crate) fn forget_session_entry_for_test(token: &str) {
 ///
 /// [`live_profile_names`]では代用できない——落としたいのは**エントリ**で、あちらが返すのは
 /// 「生きている」と判定された名前だけである。死んだエントリが残っていても空に見える。
+/// **マシンに実在する**AppContainerプロファイル名（台帳ではなくOSに聞く）。
+///
+/// 後始末の検算に使う。**台帳を見ても「消えた」は分からない**——
+/// [`win::delete_profile`]のdocのとおり`DeleteAppContainerProfile`はS_OKを返しながら
+/// 何も消さないことがあり、そのとき台帳エントリだけが落ちる。実機に66件たまっていたのは
+/// この形である。「呼んだ」と「消えた」は別の事実なので、読む口を分ける（`B-33`）。
+#[cfg(all(windows, test))]
+pub(crate) fn existing_profiles_for_test() -> Vec<String> {
+    win::existing_profiles()
+}
+
 #[cfg(all(windows, test))]
 pub(crate) fn ledger_session_tokens_for_test() -> Vec<String> {
     ledger()

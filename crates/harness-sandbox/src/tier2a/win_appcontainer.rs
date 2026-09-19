@@ -884,6 +884,16 @@ mod ace_grant_revoke_tests;
 #[cfg(all(windows, test))]
 mod redirector_dll_sweep_tests;
 
+/// **ドメインをN個用意して片付ける費用の測定**（残課題#55の本体に着手する前）。
+/// 「起動時にまとめて用意する」形が払えるかを数字で決めるためのもので、結果は
+/// `plans/mac-spike/RESULTS.md` §S72。
+///
+/// **消す条件は出来事である**——残課題#55が着地し、`plans/DESIGN-MAC-BROKER.md` §22.9の
+/// 費用表がこの測定の値で更新されたら、**モジュールごと消す**（隣の`acl_baseline_cost_tests`が
+/// 同じ形の先例）。
+#[cfg(all(windows, test))]
+mod domain_profile_cost_tests;
+
 /// **CoW差分層の巡回が、剥がすべきものだけを剥がすことの回帰**（残課題#35）。
 /// 引退した身分は剥がれ、well-knownのSIDと走行中の差分層は触られない、を対で測る。
 #[cfg(all(windows, test))]
