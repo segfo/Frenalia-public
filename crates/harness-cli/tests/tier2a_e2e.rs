@@ -6812,6 +6812,22 @@ fn survey_visibility_grants() -> Vec<(String, PathBuf)> {
         // 所有で管理者でも`WRITE_DAC`が無く、祖先へのtraverse付与で必ず止まる（§S67）。
         // こちらは4階層とも`BUILTIN\Administrators`が`FullControl`を持つ。
         PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Setup"),
+        // **VSが「どこに入っているか」を記録した台帳**（§S70の続き。2026-09-19）。
+        //
+        // 上の`Setup`を開けても**検出はまだ答えなかった**（`error: linker link.exe not found`）。
+        // 原因の候補を3つに分けて読み取りだけで潰したところ、残ったのがここである。
+        //
+        // | 候補 | 判定 | 根拠 |
+        // |---|---|---|
+        // | 検出用DLLが読めない | **消えた** | 上の`Setup`への付与が届いており、DLL本体に読取＋実行のACEが継承で付いている |
+        // | COMの登録が読めない | **消えた** | 登録キーとその親に`ALL APPLICATION PACKAGES`（`S-1-15-2-1`）の`ReadKey`が継承で付いている |
+        // | **所在の台帳が読めない** | **残った** | `…\Packages`・`…\Packages\_Instances`は**app package向けのACEが1本も無い**。中身は実在する（インスタンス2件、各`state.json`） |
+        //
+        // **`Packages`ごと開けない。** あちらはパッケージの実体が丸ごと入る大きな置き場で、
+        // **要ると分かっていない範囲まで開くことになる**。`_Instances`で足りなければ、
+        // **足りなかったという測定結果を根拠に**広げる（当てずっぽうで許可を広げると、
+        // 開けた範囲が測定の副作用としてそのまま実マシンへ残る）。
+        PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Packages\_Instances"),
     ];
     let mut out = Vec::new();
     for dir in candidates {
@@ -6894,6 +6910,9 @@ fn run_declaration_sweep(
     label: &'static str,
     extra_args: &[String],
     never_unenforced: &[String],
+    // **この掃きでは台本のビルドが最後まで通るはずか。** 道具を隠した対照では通らないのが
+    // 正しいので、同じ要求を当てると正しい対照を「測定が成立していない」と言ってしまう。
+    expect_build: bool,
     failures: &mut Vec<String>,
 ) -> SurveySweep {
     let names: Vec<&str> = SURVEY_CANDIDATES.iter().map(|(p, _)| *p).collect();
@@ -7117,9 +7136,14 @@ fn run_declaration_sweep(
     // 断られる前に諦める段があると、その先のプログラムは**起動を試みられないので拒否に現れない**
     // ——新しい拒否が出ないまま収束し、一覧は下限のまま緑になる。
     // **台本が最後まで通ったことを、収束と同じ重さで要求する。**
-    match sweep.built {
-        Some(true) => {}
-        Some(false) => failures.push(format!(
+    //
+    // **要求は掃きごとに違う。** 道具を隠した対照の掃きは、ビルドが通らないのが**正しい姿**で
+    // ある（cargoの実体が見えないのだから当然そこまで行けない）。そこへ同じ要求を当てると、
+    // **計器が正しい対照を「測定が成立していない」と言う**——2026-09-19に1度そうなった。
+    match (expect_build, sweep.built) {
+        // 通るはずの掃きで通った。健全。
+        (true, Some(true)) => {}
+        (true, Some(false)) => failures.push(format!(
             "[{label}] 新しい拒否は出なくなった（収束: {:?}・切断なし）が、\
              **台本のビルドは最後まで通っていない**（`{SURVEY_BUILD_NG}`）。\
              リンカのように「探す側が諦めた」プログラムは**起動を試みられないので拒否に現れない**\
@@ -7128,7 +7152,18 @@ fn run_declaration_sweep(
             sweep.converged_at,
             sweep.declared.len()
         )),
-        None => failures.push(format!(
+        // **通らないはずの掃きで通ってしまった**＝振っている軸が無い。
+        (false, Some(true)) => failures.push(format!(
+            "[{label}] 道具を見えるようにしていない掃きで、**ビルドが最後まで通ってしまった**。\
+             2つの掃きが同じものを測っており、振っている軸が無い\
+             ——`--fs-allow`の残りACEに相乗りしていないかを実DACLで見ること"
+        )),
+        // 通らないはずの掃きで通らなかった。**これは正しい対照である**（赤にしない）。
+        (false, Some(false)) => eprintln!(
+            "[survey] [{label}] ビルドは通っていない。**この掃きではそれが正しい**\
+             （道具の実体が見えないので、そこまで到達しない）"
+        ),
+        (_, None) => failures.push(format!(
             "[{label}] ビルドの印が片方も出ていない。台本のcargoの段までシェルが到達して\
              いないので、**一覧が全部かを判定できない**"
         )),
@@ -7238,6 +7273,9 @@ fn what_a_realistic_session_needs_declared() {
         "invisible",
         &[],
         &never_unenforced,
+        // **この掃きではビルドが通らないのが正しい。** 道具の実体が見えないので、
+        // そもそもそこまで到達しない。通ってしまったら軸が振れていない。
+        false,
         &mut failures,
     );
 
@@ -7266,6 +7304,9 @@ fn what_a_realistic_session_needs_declared() {
             "visible",
             &grant_args,
             &never_unenforced,
+            // **この掃きではビルドが最後まで通るはずである。** 通らないなら、鎖の先で
+            // 「探す側が諦めた」ものが在り、一覧は下限のままである。
+            true,
             &mut failures,
         ))
     };
