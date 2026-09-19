@@ -73,7 +73,12 @@ const REDIRECTOR_LOG_ENV: &str = "HARNESS_REDIRECTOR_DEBUG_LOG";
 ///
 /// **要求受付capabilityを必ず積む**——積まないとフックが窓口へ届かず、
 /// 「変換できなかった」と「届かなかった」が混ざる。
-fn run_probe_with_hooks(
+///
+/// [BUG-160] `env_substitution_tests`も同じ起こし方を要る（フックを載せたプローブに
+/// `CreateProcessW`を1回呼ばせる）ので`pub(super)`にしてある。**写しを作らない**
+/// （`docs/CODE-STRUCTURE-RULES.md`§5.0）——注入の指定・診断の受け皿・capabilityの積み方が
+/// 2つの綴りに分かれると、片方だけ直る形になる。
+pub(super) fn run_probe_with_hooks(
     case: &Case,
     profile: &OwnedContainerSid,
     caps: &[crate::win_common::OwnedSid],

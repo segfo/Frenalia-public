@@ -69,8 +69,9 @@ use windows::Win32::System::Threading::{
 
 use crate::tier2a::win_appcontainer::{
     appcontainer_pipe, augment_redirector_env, command_line_for, create_suspended_in_job,
-    harness_owned_env_names, inject_redirector, redirector_env, spawn_request_capability_sid,
-    wait_cow_ready, CowInject, DomainIdentity, RedirectorInject, SuspendedSpawn,
+    harness_owned_env_names, inject_redirector, os_rewritten_env_names, redirector_env,
+    spawn_request_capability_sid, wait_cow_ready, CowInject, DomainIdentity, RedirectorInject,
+    SuspendedSpawn,
 };
 use crate::win_common::{
     build_env_block, clear_inherit, sid_from_string, wide, OwnedSid, SendHandle,
@@ -911,6 +912,21 @@ fn force_request_pipe(env: &mut Vec<(String, String)>, request_pipe: &str) {
 /// `HARNESS_COW_READY_HANDLE`は系統のbase envにも入っているが、それは**トップレベルを
 /// 起こしたときのハンドル値**であって、この子には意味が無い。ここでは消すだけにして、
 /// 正しい値は[`prepare_redirector`]が生成のたびに書き直す。
+///
+/// # [BUG-160] OSが書き換える名前も、同じ規則で系統の値に戻す
+///
+/// **理由はharness所有の名前とまったく違うのに、打ち手は同じである。**
+/// あちらは「呼び出し元に名乗らせない」ためだが、こちらは
+/// **呼び出し元が持っている値が既にOSの出力だから**である
+/// （[`os_rewritten_env_names`]に何が起きるかの全文がある）。
+///
+/// 系統の基準envは、トップレベルの子を起こしたときにharnessがOSへ渡した値そのものなので、
+/// これを戻せばOSは**トップレベルと同じ入力から同じ結果**を出す——つまり
+/// 「Daemonが起こした子」と「シェルが自分で起こした子」の環境が一致する。
+///
+/// **剥がすのではなく戻す**のが要点である。綴りから接頭辞を剥がす形だと、
+/// 孫・ひ孫と深くなるたびに何回剥がすかを数えることになるが、基準envは系統で1つなので
+/// **深さに依らず1回で正しい値になる**。
 fn env_for_nested(
     base_env: &[(String, String)],
     caller_env: Option<&[(String, String)]>,
@@ -941,10 +957,17 @@ fn env_for_nested(
 
     // harnessが所有する名前を、申告から**全部落とす**。辺の`set`で書かれていても落とす
     // ——`policy.json`は人が書くものだが、窓口の名前を宣言で差し替えられる形にはしない。
-    let owned = harness_owned_env_names();
-    env.retain(|(name, _)| !owned.iter().any(|o| o.eq_ignore_ascii_case(name)));
+    //
+    // [BUG-160] **OSが書き換える名前も同じ扱いにする**（理由は関数のdoc）。2つの一覧を
+    // 1つの繰り返しで処理するのは、**落とす側と戻す側が対だから**である——別々に書くと、
+    // 片方の一覧にだけ名前を足した日に「落としたのに戻さない」が生まれる（`B-01`）。
+    let forced: Vec<&'static str> = harness_owned_env_names()
+        .into_iter()
+        .chain(os_rewritten_env_names())
+        .collect();
+    env.retain(|(name, _)| !forced.iter().any(|o| o.eq_ignore_ascii_case(name)));
     // 系統の値を戻す。**1回の生成にしか意味が無いものは戻さない**（上記）。
-    for name in owned {
+    for name in forced {
         if name.eq_ignore_ascii_case(redirector_env::READY_HANDLE) {
             continue;
         }
@@ -1978,6 +2001,100 @@ mod nested_env_tests {
             value_of(&env, redirector_env::READY_HANDLE),
             None,
             "トップレベルのハンドル値が子へ持ち越されている: {env:?}"
+        );
+    }
+
+    /// [BUG-160] **OSが書き換える名前は、呼び出し元の値ではなく系統の基準envの値になる。**
+    ///
+    /// 呼び出し元（＝AppContainerの中のプロセス）が持っている`TEMP`は、
+    /// **既にOSの置き換えを1回受けた値**である。そのまま渡すと同じ置き換えが重なり、
+    /// 存在しない場所を指す（`os_rewritten_env_names`のdoc）。
+    ///
+    /// # ここで測っているのは規則であって、OSの挙動ではない
+    ///
+    /// 「重なると壊れる」を実機で見るのは
+    /// `win_appcontainer::spawnd_e2e_tests::env_substitution_tests`である（昇格が要る）。
+    /// **この1本はWin32を1行も通らない**ので、規則が壊れたことだけを素で見張る。
+    ///
+    /// # 対で見る（`B-35`）
+    ///
+    /// 基準envに在るときは戻ること**と**、同じ経路を通る普通の変数（`FOO`）が
+    /// 呼び出し元の値のまま届くことを一緒に表明する。後者が無いと、
+    /// **基準envで丸ごと上書きする実装**でも緑になる——それは段階6f-1が直したものへの巻き戻しである。
+    #[test]
+    fn the_os_rewritten_names_come_from_the_lineage_not_from_the_caller() {
+        let mut base = base();
+        base.push((
+            "TEMP".to_string(),
+            r"C:\Users\u\AppData\Local\Temp".to_string(),
+        ));
+        base.push((
+            "LOCALAPPDATA".to_string(),
+            r"C:\Users\u\AppData\Local".to_string(),
+        ));
+
+        let mut caller = caller();
+        // **AppContainerの中のプロセスが実際に持っている値**（置き換え済み）。
+        caller.push((
+            "TEMP".to_string(),
+            r"C:\Users\u\AppData\Local\Packages\pkg\AC\Temp".to_string(),
+        ));
+        // 綴りの大小でも素通りしないこと（harness所有の名前と同じ扱い）。
+        caller.push((
+            "localappdata".to_string(),
+            r"C:\Users\u\AppData\Local\Packages\pkg\AC".to_string(),
+        ));
+
+        let env = env_for_nested(&base, Some(&caller), &EnvPolicy::PassThrough);
+
+        assert_eq!(
+            value_of(&env, "TEMP"),
+            Some(r"C:\Users\u\AppData\Local\Temp"),
+            "置き換え済みの`TEMP`がそのまま子へ渡っている。\
+             OSがもう1回置き換えるので、子は存在しない場所を指す（BUG-160）: {env:?}"
+        );
+        assert_eq!(
+            value_of(&env, "LOCALAPPDATA"),
+            Some(r"C:\Users\u\AppData\Local"),
+            "`LOCALAPPDATA`が系統の値に戻っていない。**`TEMP`はこの値から導かれる**ので、\
+             ここが置き換え済みだと`TEMP`を直しても子の`TEMP`は二重のままになる: {env:?}"
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case("LOCALAPPDATA"))
+                .count(),
+            1,
+            "同じ名前が2つ載っている（どちらが効くかは実装依存になる）: {env:?}"
+        );
+        assert_eq!(
+            value_of(&env, "FOO"),
+            Some("set-in-the-shell"),
+            "OSが書き換える名前**以外**まで系統の値で潰している。\
+             シェルで設定した変数が子へ届かない形で、段階6f-1の決定への巻き戻しである: {env:?}"
+        );
+    }
+
+    /// [BUG-160] **系統の基準envに無ければ、子からも消える。**
+    ///
+    /// harness所有の名前と同じ規則である（そちらの「消す側を落とすと呼び出し元が生やせる」と
+    /// 対になる）。ここで呼び出し元の値を残すと、**トップレベルが持っていなかった`TEMP`を
+    /// nestedだけが持つ**——シェルと子で環境が食い違い、突き合わせの受け入れが
+    /// 「差が出ないこと」を主張できなくなる。
+    #[test]
+    fn an_os_rewritten_name_absent_from_the_lineage_does_not_survive_from_the_caller() {
+        let mut caller = caller();
+        caller.push((
+            "TEMP".to_string(),
+            r"C:\Users\u\AppData\Local\Packages\pkg\AC\Temp".to_string(),
+        ));
+
+        // 基準envには`TEMP`が無い。
+        let env = env_for_nested(&base(), Some(&caller), &EnvPolicy::PassThrough);
+
+        assert_eq!(
+            value_of(&env, "TEMP"),
+            None,
+            "系統が持っていない`TEMP`を、呼び出し元の申告から子が受け取っている: {env:?}"
         );
     }
 

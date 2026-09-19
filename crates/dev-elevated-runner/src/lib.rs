@@ -242,6 +242,26 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "the_spawn_matrix_under_page_heap_records_where_it_faults",
         ],
     ),
+    // [BUG-160] Daemon経由で起こした子の環境が二重に置き換わる件の測定と受け入れ（対2本）。
+    //
+    // **受け入れ`spawn-daemon`にも含まれている**（同じモジュールの下に在るので、あちらの
+    // フィルタが拾う）。ここに別の的を置いてあるのは、**この2本だけを撃てるようにする**ため
+    // ——1本が4つのAppContainerセッションを作るので、直している最中に29本ぶん待たずに済む。
+    // `e2e-cow-git-injection`と同じ置き方（1要素＝1測定）。
+    (
+        "spawn-daemon-env-substitution",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "win_appcontainer::spawnd_e2e_tests::env_substitution_tests",
+        ],
+    ),
     // T1の観測（`docs/STATUS.md`残課題#43）: 要求受付パイプの混雑。同時接続数を振って、
     // 何割が混雑に当たり何ミリ秒待つかを測る。**合否の判定を持たない**——赤くなるのは
     // 「測定が成立していない」ときだけである（アクセス拒否が混じった・到着がそろわなかった等）。

@@ -544,6 +544,45 @@ pub(crate) fn harness_owned_env_names() -> [&'static str; 8] {
     ]
 }
 
+/// [BUG-160] **OSがAppContainerの生成のたびに書き換える環境変数の名前**。
+///
+/// # 何が起きるのか
+///
+/// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`を積んで`CreateProcessW`すると、
+/// Windowsは渡した環境ブロックの中のこの3つを**渡された`LOCALAPPDATA`から導き直す**。
+///
+/// ```text
+///   LOCALAPPDATA := <渡されたLOCALAPPDATA>\Packages\<パッケージ名>\AC
+///   TEMP, TMP    := <渡されたLOCALAPPDATA>\Packages\<パッケージ名>\AC\Temp
+/// ```
+///
+/// **harnessはこの3つを1文字も書いていない。** 書き換えているのはOSである。
+///
+/// # だから「置き換え済みの値」を渡してはいけない
+///
+/// AppContainerの中に居るプロセスの環境は、既に1回この変換を受けている。
+/// それをそのまま次の`CreateProcessW`へ渡すと**同じ変換が重なり**、
+/// `…\AC\Packages\<パッケージ名>\AC\Temp`という存在しない場所を指す。
+/// 一時ファイルを作るプログラムが「許可されたのに動かない」形で落ちる。
+///
+/// 対処は、代理で起こす側（Spawn Daemon）が**系統の基準env**——トップレベルの子を
+/// 起こしたときにharnessがOSへ渡した、置き換え前の値——をこの名前に戻すことである
+/// （`spawnd::server::env_for_nested`）。
+///
+/// # この一覧は実測で決めた（**推測で増やさない**）
+///
+/// 2026-09-19に、生成経路だけを変えた2腕で環境を丸ごと突き合わせて数えた
+/// （[§S65](../../../../../plans/mac-spike/RESULTS.md)）。23変数のうち書き換わったのは
+/// この3つだけで、`APPDATA`・`USERPROFILE`は**書き換わらなかった**。
+///
+/// **増えた日は実測が教える。** 突き合わせの受け入れ
+/// （`spawnd_e2e_tests::env_substitution_tests`）は名指しの3つではなく
+/// **説明できない差が1件でもあれば赤**にしてあるので、OSが別の名前を書き換え始めたら
+/// そこで止まる。
+pub(crate) fn os_rewritten_env_names() -> [&'static str; 3] {
+    ["TEMP", "TMP", "LOCALAPPDATA"]
+}
+
 /// Redirectorへ渡す環境を、直接生成とDaemon生成で同じ規則から組み立てる。
 pub(crate) fn augment_redirector_env(
     env: &mut Vec<(String, String)>,
