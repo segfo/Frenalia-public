@@ -358,14 +358,16 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
         // 遷移のタブは操作が違う。**効かない操作を案内しない**（`B-32`）。
+        //
+        // # 並びは「押す頻度と重要度」の順である（2026-09-19、実機で見つけた）
+        //
+        // **この行は折り返さない。** 幅が足りないと**末尾から黙って切れる**ので、
+        // 並び順がそのまま「消えてよい順」になる。実際に100桁ほどの端末で試したところ
+        // `a 確定` が画面の外へ出ており、**予約したものを書き込むキーだけが見えない**
+        // という形になっていた。だから状態を変える2つ（`Space`・`a`）を先頭へ置き、
+        // 文言も短くしてある。切り捨てそのものは全画面に共通の性質で、ここでは直していない。
         Screen::Edit if app.pending.tab.0.is_transition() => {
-            keys.push("Esc 記録画面へ".to_string());
-            keys.push("F2 タブ切替".to_string());
-            keys.push("↑↓ 選択".to_string());
             keys.push("Space 選ぶ/外す".to_string());
-            keys.push("u 引数の広さ".to_string());
-            keys.push(format!("f 表示: {}", app.pending.filter.label()));
-            keys.push("r 読み直し".to_string());
             let reserved = app.pending.approve.len() + app.pending.remove.len();
             if reserved == 0 {
                 keys.push("a 確定".to_string());
@@ -373,6 +375,12 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
                 // 予約件数を出す（何件書かれるのかが確定の直前まで見えている必要がある）。
                 keys.push(format!("a 確定（{reserved}件）"));
             }
+            keys.push("u 引数の広さ".to_string());
+            keys.push(format!("f 表示: {}", app.pending.filter.label()));
+            keys.push("↑↓ 選択".to_string());
+            keys.push("r 読み直し".to_string());
+            keys.push("F2 タブ切替".to_string());
+            keys.push("Esc 戻る".to_string());
         }
         Screen::Edit => {
             keys.push("Esc 記録画面へ".to_string());

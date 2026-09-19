@@ -217,4 +217,58 @@ fn every_screen_survives_a_tiny_terminal() {
     for (width, height) in [(1u16, 1u16), (10, 3), (20, 5)] {
         render(&app, width, height);
     }
+    // [段階⑦] 遷移の2タブ。**下の枠が8行固定**なので、それより低い端末で引き算が
+    // 破綻しないことを確かめる（`transition_screen::draw`のレイアウト）。
+    for tab in [
+        transition::PendingTab::TransitionsObserved,
+        transition::PendingTab::TransitionsDenied,
+    ] {
+        app.pending.tab = transition::Tab(tab);
+        for (width, height) in [(1u16, 1u16), (10, 3), (20, 5), (40, 8), (120, 30)] {
+            render(&app, width, height);
+        }
+    }
+}
+
+/// [段階⑦] 遷移のタブが、候補が在る状態でも描ける。
+///
+/// **空のときしか描かないと、行の組み立て（置き場の添え方・注記）が一度も走らない。**
+#[test]
+fn the_transition_tab_renders_with_candidates() {
+    let ws = workspace();
+    let path = harness_sandbox::tier2a::policy_learnd::observed::observed_path(ws.path());
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("transitions dir");
+    let mut text = String::new();
+    // 同じ名前が2つ並ぶ形（置き場を添える経路を通す）と、1つだけの形の両方を置く。
+    for exe in [
+        "C:/Program Files/Git/cmd/git.exe",
+        "C:/Program Files/Git/mingw64/bin/git.exe",
+        "C:/Windows/System32/findstr.exe",
+    ] {
+        let record =
+            harness_sandbox::tier2a::policy_learnd::observed::ObservedRecord::ObservedSpawn(
+                harness_sandbox::tier2a::policy_learnd::observed::Spawn {
+                    parent_exe: Some("C:/pwsh.exe".to_string()),
+                    exe: exe.to_string(),
+                    argv: "git --version".to_string(),
+                    count: 1,
+                    first_ts: 1,
+                    last_ts: 1,
+                    argv_truncation: false,
+                },
+            );
+        text.push_str(&serde_json::to_string(&record).expect("jsonl"));
+        text.push('\n');
+    }
+    std::fs::write(&path, text).expect("observed.jsonl");
+
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    app.screen = Screen::Edit;
+    app.pending.tab = transition::Tab(transition::PendingTab::TransitionsObserved);
+    app.reload_transitions();
+    assert_eq!(app.pending.observed.len(), 3, "候補が読めていない");
+
+    for (width, height) in [(1u16, 1u16), (20, 5), (80, 20), (200, 40)] {
+        render(&app, width, height);
+    }
 }

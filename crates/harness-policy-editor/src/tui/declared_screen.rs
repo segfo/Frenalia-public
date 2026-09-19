@@ -118,8 +118,10 @@ fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
     if app.unapproved.is_empty() {
         text.push_str("→←で展開／Spaceでこの配下をまとめて取り消し予約／Aで全件／aで確定。\n");
     } else {
+        // **強調の記号を文字として書かない。** 端末では`**`はそのまま星印として出る
+        // （2026-09-19に遷移の画面で実機確認し、写した元のこちらも直した）。
         text.push_str(&format!(
-            "{}件の取り消しを予約中。**aを押すまで何も書きません。**\n",
+            "{}件の取り消しを予約中（aを押すまで何も書きません）。\n",
             app.unapproved.len()
         ));
     }
