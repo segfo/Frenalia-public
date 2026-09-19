@@ -664,6 +664,12 @@ mod revoke_declarations;
 /// から決める。`revoke`（剥がし方）とは責務が別なので分けている。
 mod revoke_subjects;
 mod spawn;
+/// [段階⑦] その綴りは**アプリの仕組みを通って起きる**か（ストアの実行エイリアス／MSIXの実体）。
+///
+/// **遷移先にできない綴りを見分けるのに使う**（2026-09-18に実測。`plans/mac-spike/RESULTS.md` §S62）。
+/// ここで公開しているのは、ポリシーエディタの遷移画面が**同じ判定**を通す必要があるためである
+/// ——別に書くと、画面が「起こせる」と言っているのに実際には断られる形になる（`B-13`）。
+pub use spawn::starts_through_the_app_model;
 mod spawn_session;
 mod traverse;
 /// [D-84] workspaceツリーへ配る**ACEの集合**（モード×宛先SID×マスク）と、それを1回の書込で

@@ -114,6 +114,10 @@ pub mod shell_output;
 pub mod transition_approve;
 /// [段階⑦] 観測（`observed.jsonl`）と拒否（`pending.jsonl`）を**遷移の辺の候補**にする。
 /// 「もう宣言済みか」はSpawn Daemonと同じ判定器に聞く（判定を2つ作らない）。
+///
+/// **windows専用**——入力の型（観測と拒否の行）も、「その綴りを起こせるか」の判定も
+/// `harness_sandbox`のwindows専用モジュールが持つため。
+#[cfg(windows)]
 pub mod transition_candidates;
 /// 承認済み宣言の取り消し（[`approve`]の対）。`policy.json`から宣言を消す。**ACEは触らない**
 /// ——撤収は付与と同じライフサイクル点（パス2の開始時と、プロセス終了時）が担当する。

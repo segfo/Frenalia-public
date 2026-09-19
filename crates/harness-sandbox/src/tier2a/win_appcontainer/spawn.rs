@@ -1948,7 +1948,7 @@ pub(crate) struct ShellChoices {
 ///
 /// 文字列の`starts_with`だと`C:\Windows`が`C:\WindowsApps`に誤マッチする
 /// （`acl_grant`のdocが同じ罠を書いている）。
-fn starts_through_the_app_model(path: &str) -> bool {
+pub fn starts_through_the_app_model(path: &str) -> bool {
     std::path::Path::new(path)
         .components()
         .any(|c| c.as_os_str().eq_ignore_ascii_case("WindowsApps"))

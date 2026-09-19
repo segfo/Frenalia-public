@@ -248,3 +248,63 @@ fn the_order_does_not_depend_on_the_order_in_the_file() {
         vec!["cargo.exe", "git.exe", "rustc.exe"]
     );
 }
+
+// --- 綴りそのものが起こせるか -----------------------------------------------
+
+/// **ストアアプリの綴りは「起こせない」として出る。**
+///
+/// 実機で触ってもらって見つかった（2026-09-19）。パス1の記録では入口のシェルが
+/// `C:\Program Files\WindowsApps\Microsoft.PowerShell_...\pwsh.exe`として観測され、
+/// 画面はそれを何の断りもなく「宣言済み」と表示していた。**宣言は書けるが、
+/// 遷移の強制を積んだ構成では起こせない**綴りである（実測、`plans/mac-spike/RESULTS.md` §S62）。
+///
+/// 判定は`harness_sandbox`の`starts_through_the_app_model`——**シェルの候補を選ぶのと
+/// 同じ関数**を通す。ここで別に書くと、画面と実際の起動可否がずれる（`B-13`）。
+#[test]
+fn a_store_app_spelling_is_reported_as_not_startable() {
+    let file = policy(Vec::new());
+    let store = observed(
+        r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe\pwsh.exe",
+        "pwsh -NoProfile",
+    );
+    let candidates = from_observations(&[store], &declared(&file));
+
+    assert_eq!(candidates[0].startable, Startable::NotThroughTheAppModel);
+    assert!(
+        candidates[0].startable.note().is_some(),
+        "起こせない理由を画面に出す文面が無い"
+    );
+    // **宣言そのものは止めない**（書けるが通らないことを見せて、判断はユーザーに残す）。
+    assert!(
+        candidates[0].is_approvable(),
+        "宣言を書けなくしている（なぜ選べないのかが画面から分からなくなる）"
+    );
+}
+
+/// **対の側**（`B-35`）: 普通の実行ファイルには何も言わない。
+///
+/// これが無いと「常に起こせないと言う」実装でも上のテストは緑になり、
+/// 全部の行に赤い注記が付く画面になる。
+#[test]
+fn an_ordinary_program_carries_no_startability_note() {
+    let file = policy(Vec::new());
+    let ordinary = observed(r"C:\Program Files\Git\cmd\git.exe", "git --version");
+    let candidates = from_observations(&[ordinary], &declared(&file));
+
+    assert_eq!(candidates[0].startable, Startable::AsFarAsWeKnow);
+    assert!(candidates[0].startable.note().is_none());
+}
+
+/// 実行エイリアス（`WindowsApps`配下の別の形）も同じ扱いになる。
+#[test]
+fn the_execution_alias_spelling_is_also_not_startable() {
+    assert_eq!(
+        Startable::of(r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\pwsh.exe"),
+        Startable::NotThroughTheAppModel
+    );
+    // `C:\Windows`が`C:\WindowsApps`に誤って一致しないこと（成分で見ている証拠）。
+    assert_eq!(
+        Startable::of(r"C:\Windows\System32\cmd.exe"),
+        Startable::AsFarAsWeKnow
+    );
+}

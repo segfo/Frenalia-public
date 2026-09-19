@@ -104,6 +104,14 @@ fn row_line<'a>(
         Style::default().fg(Color::DarkGray),
     ));
     spans.extend(tail);
+    // **綴りそのものが起こせないなら、宣言の有無とは別に言う**
+    // ——「宣言済み」だけを出すと、起こせるものとして読まれる。
+    if candidate.startable.note().is_some() {
+        spans.push(Span::styled(
+            "  ［この綴りは起こせない］".to_string(),
+            Style::default().fg(Color::Red),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -319,6 +327,11 @@ fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
     // 踏むので、実測で2本並んだ）。確定のダイアログには全パスが出るので誤って書くことは
     // 無いが、**選んでいる最中に分からない**のは困る。
     if let Some(candidate) = app.pending.visible().get(app.pending.row()) {
+        // **起こせない綴りは、パスより先に理由を言う**（下から切れるため）。
+        if let Some(note) = candidate.startable.note() {
+            text.push_str(note);
+            text.push('\n');
+        }
         text.push_str(&format!("選択中: {}\n", candidate.exe));
         text.push_str(&format!("  観測された引数: {}", candidate.argv));
     }
@@ -343,6 +356,7 @@ mod transition_screen_tests {
             argv_truncation: false,
             source: Source::Observed { parent_exe: None },
             declared: Declared::No,
+            startable: crate::transition_candidates::Startable::AsFarAsWeKnow,
         }
     }
 

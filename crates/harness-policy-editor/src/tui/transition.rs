@@ -45,7 +45,7 @@ use harness_policy::policy_file::{self, ENTRY_DOMAIN};
 
 use crate::transition_approve::{self, EdgeRef, TransitionRequest};
 use crate::transition_candidates::{
-    from_denials, from_observations, Candidate, Declared, DeclaredEdges,
+    from_denials, from_observations, Candidate, Declared, DeclaredEdges, Startable,
 };
 use crate::tui::checkbox_tree;
 use crate::tui::state::{Action, App, Confirm, Modal, Screen};
@@ -494,6 +494,11 @@ impl App {
                     edge.argv.display(),
                     plan.to_domain
                 ));
+                // **書く直前に、その綴りが起こせないことを言う。**
+                // 一覧でも出しているが、ここは**取り消しの効かない操作の直前**なので繰り返す。
+                if let Some(note) = Startable::of(&edge.exe).note() {
+                    lines.push(format!("      ⚠ {note}"));
+                }
             }
         }
         if !plan.removed.is_empty() {

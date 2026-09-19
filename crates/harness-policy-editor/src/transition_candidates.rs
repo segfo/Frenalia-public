@@ -62,6 +62,52 @@ pub struct Candidate {
     pub source: Source,
     /// いまの`policy.json`から見て、この生成はどう扱われるか。
     pub declared: Declared,
+    /// **この綴りは、宣言したとして実際に起こせるのか。**
+    ///
+    /// 宣言の可否とは別軸である——宣言は書けるが、OSの都合で起こせない綴りがある。
+    /// **画面はこれを出すこと**。出さないと「宣言済み」と表示したものが撃つと断られる。
+    pub startable: Startable,
+}
+
+/// その綴りを、生成禁止を積んだ構成で**実際に起こせるか**。
+///
+/// # なぜ宣言を止めないのか
+///
+/// 止めると、ユーザーが「なぜこの行だけ選べないのか」を画面から知れない。**書けるが通らない**
+/// ことを見えるところへ出して、判断はユーザーに残す（D-42と同じ姿勢）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Startable {
+    /// 分かっている範囲で起こせる。**「必ず起こせる」の保証ではない**——ここが見ているのは
+    /// 綴りの形だけで、実際の失敗（ファイルが消えた等）は撃つまで分からない（`P-11`）。
+    AsFarAsWeKnow,
+    /// **アプリの仕組みを通る綴りなので起こせない**（ストアの実行エイリアス／MSIXの実体）。
+    ///
+    /// 判定は`harness_sandbox`の`starts_through_the_app_model`——
+    /// **シェルの候補を選ぶのと同じ関数**である（2026-09-18に実測、`plans/mac-spike/RESULTS.md` §S62）。
+    NotThroughTheAppModel,
+}
+
+impl Startable {
+    /// 綴りから判定する。**候補の行が無い場面（確定の直前）でも引けるように公開している**
+    /// ——書く直前にもう一度言うのは、そこが取り消しの効かない操作だからである。
+    pub fn of(exe: &str) -> Self {
+        if harness_sandbox::tier2a::win_appcontainer::starts_through_the_app_model(exe) {
+            Startable::NotThroughTheAppModel
+        } else {
+            Startable::AsFarAsWeKnow
+        }
+    }
+
+    /// 画面と確認ダイアログに出す一言。**`None`は「言うことが無い」。**
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Startable::AsFarAsWeKnow => None,
+            Startable::NotThroughTheAppModel => Some(
+                "この綴りはストアアプリの仕組みを通って起きるので、\
+                 遷移の強制を積んだ構成では起こせません（実測）",
+            ),
+        }
+    }
 }
 
 /// この候補がどこから来たか。**画面の見出しを分けるためと、拒否側だけに出す注記のため。**
@@ -319,6 +365,7 @@ pub fn from_observations(records: &[ObservedRecord], declared: &DeclaredEdges) -
         .filter_map(|record| match record {
             ObservedRecord::ObservedSpawn(spawn) => Some(Candidate {
                 declared: declared.classify(&spawn.exe, &spawn.argv),
+                startable: Startable::of(&spawn.exe),
                 exe: spawn.exe.clone(),
                 argv: spawn.argv.clone(),
                 count: spawn.count,
@@ -357,6 +404,7 @@ pub fn from_denials(records: &[PendingRecord], declared: &DeclaredEdges) -> Vec<
             }
             Some(Candidate {
                 declared: declared.classify(&denial.exe, &denial.argv),
+                startable: Startable::of(&denial.exe),
                 exe: denial.exe.clone(),
                 argv: denial.argv.clone(),
                 count: denial.count,
