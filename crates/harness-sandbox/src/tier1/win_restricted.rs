@@ -471,6 +471,67 @@ mod tests {
 
     /// ラベルが**実際にオブジェクトへ書かれている**ことを、設定した値を読み直して確認する。
     /// 「呼び出しが`Ok`を返した」と「ラベルが付いた」は別の事実なので、実効で検証する（B-25）。
+    /// [BUG-101] `dir`に**親から継承した**capability SID宛のACEが載っていれば、その行を返す。
+    ///
+    /// # なぜ「継承したもの」だけを見るのか
+    ///
+    /// 測定が始まる前の環境汚染だけを拾いたいからである。`icacls`の出力では、継承ACEに`(I)`が
+    /// 付く。作ったばかりのディレクトリに`(I)`付きでcapability SID（`S-1-15-3-`）が載っている
+    /// なら、それは**親（`%TEMP%`）に継承ありのACEが在る**ということで、この測定の前提が壊れている。
+    ///
+    /// **判定できなかったときは`None`を返す**（`icacls`が動かない等）。ここで測定を止めると、
+    /// 環境を見る補助のほうが本体より厳しくなる——見張りが本体を落とすのは筋が違う。
+    fn inherited_capability_aces(dir: &Path) -> Option<String> {
+        let output = std::process::Command::new("icacls")
+            .arg(dir)
+            .output()
+            .ok()?;
+        inherited_capability_aces_in(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// [`inherited_capability_aces`]の判定部分。**`icacls`を呼ばない形で切り出してある**
+    /// ——見張りが鳴るかどうかを、実マシンのDACLを汚さずに確かめられるようにするため。
+    fn inherited_capability_aces_in(icacls_output: &str) -> Option<String> {
+        let hits: Vec<&str> = icacls_output
+            .lines()
+            .filter(|line| line.contains("S-1-15-3-") && line.contains("(I)"))
+            .collect();
+        if hits.is_empty() {
+            None
+        } else {
+            Some(hits.join(" / "))
+        }
+    }
+
+    /// [BUG-101] 見張りの**許可側**: 親から継承したcapability SID宛ACEを見つける。
+    #[test]
+    fn the_guard_notices_an_inherited_capability_ace() {
+        // 2026-08-11に実際に`%TEMP%`へ載っていた形（継承あり・読み書き削除）。
+        let contaminated = "C:\\Users\\me\\AppData\\Local\\Temp\\x \
+             S-1-15-3-1024-966114621-1234: (I)(OI)(CI)(R,W,D)\r\n\
+             BUILTIN\\Users:(I)(OI)(CI)(M)\r\n";
+        assert!(inherited_capability_aces_in(contaminated).is_some());
+    }
+
+    /// [BUG-101] 見張りの**禁止側**: 汚染していない出力では鳴らない。
+    ///
+    /// **片側だけだと「常に鳴る」実装でも許可側は通る**（`B-35`）。常に鳴る見張りは、
+    /// 本体の測定を1回も走らせないまま緑にも赤にもできない状態にする。
+    #[test]
+    fn the_guard_stays_quiet_on_an_ordinary_directory() {
+        // 継承ACEは在るが、capability SIDではない（通常の`%TEMP%`配下の姿）。
+        let ordinary = "C:\\Users\\me\\AppData\\Local\\Temp\\x \
+             BUILTIN\\Users:(I)(OI)(CI)(M)\r\n\
+             NT AUTHORITY\\SYSTEM:(I)(OI)(CI)(F)\r\n";
+        assert!(inherited_capability_aces_in(ordinary).is_none());
+
+        // capability SIDは在るが**継承ではない**（harnessがこのノードへ直に付けたもの）。
+        // これは測定の前提を壊さないので、鳴らしてはいけない。
+        let explicit = "C:\\Users\\me\\AppData\\Local\\Temp\\x \
+             S-1-15-3-1024-966114621-1234:(RX)\r\n";
+        assert!(inherited_capability_aces_in(explicit).is_none());
+    }
+
     #[test]
     fn set_low_integrity_label_leaves_a_low_mandatory_label_on_the_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -522,6 +583,30 @@ mod tests {
     fn tier1_child_write_reach_under_a_labeled_cwd_is_measured() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
+
+        // [BUG-101] **この測定は`%TEMP%`のDACLに引きずられる。** cwdは`%TEMP%`配下に作るので、
+        // `%TEMP%`自身に**継承あり**のcapability SID宛ACEが載っていると、作ったそばから
+        // 継承して結果が変わる——そして落ち方は「Tier1の子がcwdへ書けない」という、
+        // **機構が壊れたときとまったく同じ見え方**になる。実際に2026-08-11、
+        // Tier2a側のテストが付けたACEでこのテストが赤くなっている。
+        //
+        // **いまの設計では付かない**（祖先へのtraverse付与は`NO_INHERITANCE`で、
+        // 宛先SIDも宣言ごとのcapability SIDへ移った）。ただし**利用者が`--fs-allow "%TEMP%\**"`
+        // と書けば付く**ので、経路が消えたわけではない。
+        //
+        // だから**落ちる前に環境の側を名指しする**。ここが無いと、次に踏んだ人は
+        // ラベル機構の調査から始めることになる（前回そうなった）。
+        if let Some(offending) = inherited_capability_aces(cwd) {
+            panic!(
+                "[BUG-101] この測定を始める前から、作ったばかりのcwdに継承ACEが載っている: \
+                 {offending}\n\
+                 `%TEMP%`に継承あり（(OI)(CI)）のcapability SID宛ACEが在ると、\
+                 **ラベル機構が正常でもこのテストは赤くなる**。測っているのはTier1のラベルで\
+                 あって`%TEMP%`のDACLではないので、まずそちらを剥がすこと:\n\
+                 `harness fs revoke \"{}\"`",
+                std::env::temp_dir().display()
+            );
+        }
 
         // 対象コマンドが動き出す**前に**、Medium ILのまま存在する既存サブディレクトリを
         // 用意する（実リポジトリの`src/`・`.git/`に相当する。テストプロセスはMedium）。
