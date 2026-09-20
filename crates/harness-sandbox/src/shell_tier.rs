@@ -37,9 +37,21 @@ pub enum TierError {
     // 非昇格のharnessがそのDACLを書けない場合で、**UACは一度も提示されない**（進捗表示は
     // 「UACが最大0回出ます」と正しく出していた）。再実行しても同じ場所で永久に止まる。
     // 原因は`reason`が既に名指ししているので、案内は**それを読ませる**側へ倒す（B-32）。
+    //
+    // [BUG-100] **断定を外しただけでは、次の一手が決まらない。** BUG-109の書き換えで
+    // 「再試行せよ」という誤った指示は消えたが、残ったのは「そのパスを直せ」という
+    // **動詞の無い案内**だった。再試行しても絶対に通らない状態（昇格しても対象のDACLを
+    // 書けない。`C:\Program Files`はTrustedInstaller所有でAdministratorsにWRITE_DACが無い、
+    // BUG-099）で、画面に出ている行動指示がこれだけだと、ユーザーは結局そこで止まる。
+    // **打てるコマンドの綴りまで出す**（B-32: 文言はユーザーがその瞬間に取る行動を決める
+    // 唯一の入力）。あわせて「そこでは再試行が効かない」ことを**明言する**——
+    // 下のUACの案内と並ぶので、書かないと読み手はそちらを選ぶ。
     #[error(
         "{attempted} is unavailable: {reason}. Read that reason first -- if it names a path, that \
-         path is the thing to fix. If a UAC prompt appeared and was declined, accept it and retry. \
+         path is the thing to fix: withdraw whatever declared it (`harness fs revoke <path>`, or \
+         drop the matching --fs-allow). Some trees stay closed even to an administrator \
+         (TrustedInstaller owns C:\\Program Files and C:\\Windows), so retrying cannot help there. \
+         If instead a UAC prompt appeared and was declined, accept it and retry. \
          (--sandbox tier1 exists but cannot run builds, tests or git commits, so it is not a \
          substitute.)"
     )]
@@ -677,6 +689,58 @@ mod tests {
 
     fn empty_root() -> PathBuf {
         std::env::temp_dir()
+    }
+
+    /// [BUG-100] この文面は実装の一部である（`B-32`）。**画面に出ている行動指示が、
+    /// ユーザーがその瞬間に取る行動を決める唯一の入力**なので、assertで留める。
+    fn unavailable_text() -> String {
+        TierError::Unavailable {
+            attempted: "tier2a",
+            reason: "appcontainer preflight failed: failed to grant AppContainer access to \
+                     C:/Program Files (x86): アクセスが拒否されました。 (0x80070005)"
+                .to_string(),
+        }
+        .to_string()
+    }
+
+    /// 禁止側——**「たぶん断られたUACだ」と原因を断定しない。**
+    ///
+    /// これが無いと、許可側のassert（下）は「断定したうえで具体策も添える」文面でも通る。
+    /// 断定が害になるのは、**外れたときに無限に再試行させる**からである（BUG-100の症状）。
+    #[test]
+    fn the_unavailable_message_does_not_blame_a_declined_uac_prompt() {
+        let text = unavailable_text();
+        assert!(
+            !text.contains("most likely"),
+            "[BUG-100/B-32] the message guesses at the cause again. A declined UAC prompt is only \
+             one of the states that land here; when the real cause is 'cannot write that DACL even \
+             elevated', accepting a prompt never helps and the user retries forever: {text}"
+        );
+        assert!(
+            text.contains("If instead a UAC prompt appeared and was declined"),
+            "[BUG-100] the retry advice must stay conditional -- it is the branch that applies \
+             only when a prompt actually appeared: {text}"
+        );
+    }
+
+    /// 許可側——**再試行が効かない状態のために、打てる綴りを出す。**
+    ///
+    /// BUG-109が断定を外した後、残ったのは「そのパスを直せ」という動詞の無い案内だった。
+    /// 直し方が書かれていなければ、誤った指示が消えただけで行き止まりは残る。
+    #[test]
+    fn the_unavailable_message_names_the_action_for_a_path_that_cannot_be_opened() {
+        let text = unavailable_text();
+        assert!(
+            text.contains("harness fs revoke <path>") && text.contains("--fs-allow"),
+            "[BUG-100/B-32] the message must name the command that actually resolves this, not \
+             just say the path 'is the thing to fix': {text}"
+        );
+        assert!(
+            text.contains("retrying cannot help there"),
+            "[BUG-100] the message must say outright that retrying does not work for trees that \
+             stay closed to an administrator. Without it the reader picks the retry branch that \
+             sits right below: {text}"
+        );
     }
 
     /// [`FsAccess::wider`]の真理値表。**和であって「広い方を選ぶ」ではない。**

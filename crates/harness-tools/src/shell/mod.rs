@@ -422,18 +422,35 @@ impl Tool for RunShellTool {
             // Tier2aでは`should_grant_tier2a_network_capability`がcapability自体を落とすので、
             // 「audit-only（＝通信はできるが強制されない）」ではなく通信が皆無になる。
             // 同じ誤りが起動時警告とシステムプロンプトにもあった。
-            if ctx.shell_tier.tier == ShellTier::Tier2a {
-                if ctx.net_proxy.enforced_by_wfp {
+            //
+            // [BUG-118] **`== Tier2a`で分岐しない。** かつてここは`else`に
+            // 「audit-only（素通り可）」を置いていたので、Tier2b（`--unshare-net`で全遮断）と
+            // Tier3（VM境界で強制）が**実挙動の逆**を名乗っていた。判定は`ShellTier::net_egress`が
+            // 1箇所で持ち、Tierを足すとそちらがコンパイルエラーになる（`B-05`/`B-06`）。
+            match ctx
+                .shell_tier
+                .tier
+                .net_egress(ctx.net_proxy.enforced_by_wfp)
+                .enforcement
+            {
+                harness_core::EgressEnforcement::Wfp => {
                     content.push_str("\n[net-proxy: enforced-by-wfp]");
-                } else {
+                }
+                harness_core::EgressEnforcement::NoEgressAtAll => {
                     content.push_str(
-                        "\n[net-proxy: unreachable (WFP enforcement unavailable, so Tier2a grants \
-                         no network capability at all; the child cannot open any socket, not even \
-                         to this proxy)]",
+                        "\n[net-proxy: unreachable (this tier grants no reachable network at all; \
+                         the child cannot open any socket, not even to this proxy)]",
                     );
                 }
-            } else {
-                content.push_str("\n[net-proxy: audit-only, not enforced against raw sockets, see plans/DESIGN-SANDBOX-PRIVSEP.md §3.1]");
+                harness_core::EgressEnforcement::VmBoundary => {
+                    content.push_str(
+                        "\n[net-proxy: not used (tier3 enforces egress at the VM boundary; this \
+                         host-side proxy is not on the path and its env vars are not forwarded)]",
+                    );
+                }
+                harness_core::EgressEnforcement::Cooperative => {
+                    content.push_str("\n[net-proxy: audit-only, not enforced against raw sockets, see plans/DESIGN-SANDBOX-PRIVSEP.md §3.1]");
+                }
             }
             if let Some(p) = &proxy {
                 if let Some(path) = p.audit.path() {

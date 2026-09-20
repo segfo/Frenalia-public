@@ -113,6 +113,48 @@ pub enum ShellTier {
     Tier0,
 }
 
+/// [BUG-111/BUG-118] **出口（外向き通信）を最終的に何が決めるか。**
+///
+/// 「協調プロキシ」はharnessがホストのloopbackで待たせるSOCKS/HTTPプロキシで、
+/// 子へ`ALL_PROXY`等の環境変数を渡して**使ってもらう**もの——**境界ではない**。
+/// 環境変数を読まない子は素通りできる。この性質が正しいのはTier0とTier1だけで、
+/// 他のTierでは**正反対**になる。
+///
+/// この型が在る理由は、宣言の文面が`tier == Tier2a`のような**具体条件**で分岐していたためである。
+/// [BUG-111](../../../docs/bugs/BUG-111.md)が見つけた一般則は「**この Tier で協調プロキシに
+/// 到達できるか**」だったのに、直し方が「Tier2aのときだけ別の文言にする」だったので、
+/// 次に増えたTierが`else`（＝「素通りできる」）へ落ちて同じ誤りを再生産した
+/// （[BUG-118](../../../docs/bugs/BUG-118.md)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressEnforcement {
+    /// 何も強制しない。環境変数を無視して生ソケットを開けば素通りできる（Tier0・Tier1）。
+    Cooperative,
+    /// WFP（Windows Filtering Platform、OSのパケットフィルタ）が外部直通を拒否する
+    /// （Tier2a、WFPが成立した場合）。
+    Wfp,
+    /// **外向き通信そのものができない。** Tier2aでWFPが成立しなかった場合はネットワーク
+    /// capability自体を付与しないのでソケットを1つも作れず、Tier2bは`--unshare-net`で
+    /// 外向きのインターフェースが1つも無い名前空間へ入る。
+    NoEgressAtAll,
+    /// VM境界で決まる（Tier3）。VM内のnftables DNATが全ての外向き通信をSNI prereadプロキシへ
+    /// 透過的に向けるので、**ホスト側の協調プロキシは使わないし、生ソケットでも迂回できない**
+    /// （`plans/DESIGN-SANDBOX-VMISOLATION.md` §2.5）。
+    VmBoundary,
+}
+
+/// [BUG-111/BUG-118] 出口について、**Tierの側が答える**もの。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetEgress {
+    /// 子がホスト側の協調プロキシへ到達しうるか。
+    ///
+    /// **偽なら、プロキシの環境変数を案内すること自体が誤り**である——届かない宛先を
+    /// 教えることになる。Tier3では環境変数そのものを1つも転送しない
+    /// （`harness-tools/src/shell/runner.rs`の`run_tier3`）。
+    pub proxy_reachable: bool,
+    /// 出口を最終的に決めているもの。
+    pub enforcement: EgressEnforcement,
+}
+
 impl ShellTier {
     pub fn label(self) -> &'static str {
         match self {
@@ -121,6 +163,55 @@ impl ShellTier {
             ShellTier::Tier2a => "tier2a",
             ShellTier::Tier1 => "tier1",
             ShellTier::Tier0 => "tier0",
+        }
+    }
+
+    /// [BUG-111/BUG-118] このTierで、外向き通信が最終的に何で決まるか。
+    ///
+    /// # なぜ`enforced_by_wfp`を引数で取るのか
+    ///
+    /// **Tier2aだけは、同じTierでも答えが2つに割れる。** WFPが成立したかどうかは起動時の
+    /// 実測（昇格・ヘルパー・環境）で決まるので、Tierの綴りからは導けない。
+    /// 他のTierはこの引数を見ない。
+    ///
+    /// # この`match`は網羅である（**それが要点**）
+    ///
+    /// Tierを1つ足すと**ここがコンパイルエラーになる**。`_ =>`や`else`で受けると、
+    /// 新しいTierが黙って「協調プロキシ経由・素通り可」（＝最も弱い説明）を名乗る——
+    /// それがBUG-118の形である。**既定側に弱い説明を置かない。**
+    pub fn net_egress(self, enforced_by_wfp: bool) -> NetEgress {
+        match self {
+            // OSの隔離が無いので、環境変数を無視すれば本当に素通りできる。
+            ShellTier::Tier0 | ShellTier::Tier1 => NetEgress {
+                proxy_reachable: true,
+                enforcement: EgressEnforcement::Cooperative,
+            },
+            ShellTier::Tier2a => {
+                if enforced_by_wfp {
+                    NetEgress {
+                        proxy_reachable: true,
+                        enforcement: EgressEnforcement::Wfp,
+                    }
+                } else {
+                    // ネットワークcapabilityを付与しないので、loopbackのプロキシにも届かない。
+                    NetEgress {
+                        proxy_reachable: false,
+                        enforcement: EgressEnforcement::NoEgressAtAll,
+                    }
+                }
+            }
+            // `linux_bwrap::build_args`が無条件に`--unshare-net`を積む。新しい名前空間には
+            // そのプロセス専用のloopbackしかないので、ホスト側の127.0.0.1へは届かない。
+            ShellTier::Tier2b => NetEgress {
+                proxy_reachable: false,
+                enforcement: EgressEnforcement::NoEgressAtAll,
+            },
+            // 出口はVM内で強制される。ホスト側の協調プロキシは経路上に無く、
+            // そもそも`run_tier3`はホストのenvを1つも転送しない。
+            ShellTier::Tier3 => NetEgress {
+                proxy_reachable: false,
+                enforcement: EgressEnforcement::VmBoundary,
+            },
         }
     }
 }

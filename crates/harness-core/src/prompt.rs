@@ -32,8 +32,8 @@
 use std::path::PathBuf;
 
 use crate::tool::{
-    McpServerFact, NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig, ShellTier,
-    ShellTierSelection, StagingConfig, StagingMode, ToolCtx, TransitionFacts,
+    EgressEnforcement, McpServerFact, NetAppPolicy, NetProxyConfig, ReadMode, ReadScopeConfig,
+    ShellTier, ShellTierSelection, StagingConfig, StagingMode, ToolCtx, TransitionFacts,
 };
 
 const TIER3_WORKSPACE_ROOT: &str = "/workspace";
@@ -610,47 +610,49 @@ fn render_net_proxy(net_proxy: &NetProxyConfig, tier: ShellTier) -> Option<Strin
     if !*domain_policy_enabled {
         return None;
     }
-    if !*enforced_by_wfp && tier == ShellTier::Tier2a {
-        return Some(
-            "ネットワーク: ドメイン制御が要求されましたが、WFPによる強制が確立できませんでした。\
-             この場合Tier2aはネットワークcapability自体を付与しないため、run_shellの子プロセスは\
-             外向き通信を一切行えません（許可ドメイン指定の有無に関わらず、ソケットを1つも\
-             作れません。協調プロキシへのloopback到達もできないため、環境変数を無視して生\
-             ソケットを開いても素通りはできません）。通信を伴うコマンドは再試行しても成功\
-             しないので、ネットワークを使わない方法を選ぶか、ユーザーへ相談してください。"
-                .to_string(),
-        );
-    }
-    if allow_domains.is_empty() {
-        if *enforced_by_wfp {
-            return Some(
-                "強制ネットワークプロキシ（ALL_PROXY=socks5h、HTTP_PROXY/HTTPS_PROXY）経由の\
-                 ドメイン制御が有効です。許可ドメインは未指定のため、外向き通信は全て拒否され、\
-                 Proxyを使わない外部直通もWFPで拒否されます。"
-                    .to_string(),
-            );
-        }
-        return Some(
-            "協調プロキシ（ALL_PROXY=socks5h、HTTP_PROXY/HTTPS_PROXY）経由のドメイン制御が\
-             有効です。許可ドメインは未指定のため、Proxy経由の外向き通信は全て拒否されます。\
-             これは強制ではなく、環境変数を読まず生ソケットを開く子プロセスは素通りできます。"
-                .to_string(),
-        );
-    }
-    if *enforced_by_wfp {
-        Some(format!(
-            "強制ネットワークプロキシ（ALL_PROXY=socks5h、HTTP_PROXY/HTTPS_PROXY）経由で次の\
-             ドメインのみ許可されています: {}。Proxyを使わない外部直通はWFPで拒否されます。",
-            allow_domains.join("、")
-        ))
+    // [BUG-118] **`tier == Tier2a`で分岐しない。** 分岐の軸は「協調プロキシが子から見えるか」
+    // と「出口を何が決めているか」であって、Tierの綴りではない。Tierで比較すると、
+    // 次に足したTierが`else`（＝最も弱い説明「素通りできる」）へ落ちる。
+    let egress = tier.net_egress(*enforced_by_wfp);
+    let allowed = if allow_domains.is_empty() {
+        "許可ドメインは未指定のため、外向き通信は全て拒否されます。".to_string()
     } else {
-        Some(format!(
-            "協調プロキシ（ALL_PROXY=socks5h、HTTP_PROXY/HTTPS_PROXY）経由で次のドメインのみ\
-             許可されています: {}。これは強制ではなく、環境変数を読まず生ソケットを開く\
-             子プロセスは素通りできます。",
+        format!(
+            "許可されているのは次のドメインだけです: {}。",
             allow_domains.join("、")
-        ))
-    }
+        )
+    };
+    Some(match egress.enforcement {
+        // 通信そのものができない。**「許可ドメイン」を先に言わない**——できない話なので、
+        // 先に言うと「指定すれば通る」と読まれる。
+        EgressEnforcement::NoEgressAtAll => format!(
+            "ネットワーク: ドメイン制御が要求されましたが、この隔離Tier（{}）では\
+             run_shellの子プロセスは外向き通信を一切行えません（許可ドメイン指定の有無に\
+             関わらず、ソケットを1つも作れません。協調プロキシへのloopback到達もできないため、\
+             環境変数を無視して生ソケットを開いても素通りはできません）。通信を伴うコマンドは\
+             再試行しても成功しないので、ネットワークを使わない方法を選ぶか、\
+             ユーザーへ相談してください。",
+            tier.label()
+        ),
+        // 出口はVM境界で決まる。**プロキシの話を一切出さない**——`run_tier3`はホストのenvを
+        // 1つも転送しないので、子は`ALL_PROXY`等を持っていない。持っていない物を
+        // 「設定されません」と否定形で紹介するのも駄目で、**この文脈に存在しない概念を
+        // 1つ増やすだけ**である（`tier3_prompt_uses_container_workspace_root_even_on_windows_host`が
+        // 「ホスト側の概念を混ぜない」を既に留めている）。
+        EgressEnforcement::VmBoundary => format!(
+            "ネットワーク: 出口はVM境界で強制されます（VM内でnftablesが全ての外向き通信を\
+             SNI prereadプロキシへ向けるため、生ソケットを開いても迂回できません）。{allowed}"
+        ),
+        EgressEnforcement::Wfp => format!(
+            "強制ネットワークプロキシ（ALL_PROXY=socks5h、HTTP_PROXY/HTTPS_PROXY）経由の\
+             ドメイン制御が有効です。{allowed}Proxyを使わない外部直通はWFPで拒否されます。"
+        ),
+        EgressEnforcement::Cooperative => format!(
+            "協調プロキシ（ALL_PROXY=socks5h、HTTP_PROXY/HTTPS_PROXY）経由のドメイン制御が\
+             有効です。{allowed}これは強制ではなく、環境変数を読まず生ソケットを開く\
+             子プロセスは素通りできます。"
+        ),
+    })
 }
 
 /// アプリ単位のnetwork許可（軸1、D-10/D-11）をモデルへ伝える。
@@ -1095,6 +1097,91 @@ mod tests {
             !rendered.contains("外向き通信を一切行えません"),
             "{rendered}"
         );
+    }
+
+    /// **[BUG-118] Tier2bは「全遮断」と宣言する。**
+    ///
+    /// `linux_bwrap::build_args`が無条件に`--unshare-net`を積むので、子は外部にも
+    /// ホスト側の協調プロキシにも一切到達できない。**「このドメインのみ許可」も
+    /// 「生ソケットなら素通り」も、どちらも実挙動の逆である。**
+    ///
+    /// 上の`non_tier2a_without_wfp_enforcement_keeps_cooperative_proxy_wording`が
+    /// Tier0/Tier1しか回していなかったので、この誤りは緑のまま残っていた——
+    /// **「Tier2a以外」は「協調プロキシが素通しされるTier」ではない。**
+    #[test]
+    fn tier2b_declares_no_network_at_all_instead_of_a_cooperative_proxy() {
+        // Linuxには WFP（Windowsのパケットフィルタ）が無いので、この値は常に偽になる。
+        let rendered = render(&net_policy_facts(ShellTier::Tier2b, false));
+
+        assert!(
+            rendered.contains("外向き通信を一切行えません"),
+            "[BUG-118] Tier2b puts the child in a fresh network namespace with no outward \
+             interface, so it cannot reach anything -- not even this proxy: {rendered}"
+        );
+        assert!(
+            !rendered.contains("素通りできます"),
+            "[BUG-118] there is nothing to slip past: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ALL_PROXY"),
+            "[BUG-118] naming a proxy the child cannot reach sends the model after a dead end: \
+             {rendered}"
+        );
+    }
+
+    /// **[BUG-118] Tier3は「VM境界で強制」と宣言する。**
+    ///
+    /// 出口はVM内のnftables DNAT＋SNI prereadプロキシで決まり、生ソケットでも迂回できない。
+    /// **ホスト側の協調プロキシは経路上に無く、`run_tier3`はホストのenvを1つも転送しない**
+    /// ので、`ALL_PROXY`等を案内すること自体が誤りである。
+    #[test]
+    fn tier3_declares_vm_boundary_enforcement_instead_of_a_cooperative_proxy() {
+        let rendered = render(&net_policy_facts(ShellTier::Tier3, false));
+
+        assert!(
+            rendered.contains("VM境界") && rendered.contains("example.com"),
+            "[BUG-118] tier3 does enforce the allow-list, just not through the host-side proxy: \
+             {rendered}"
+        );
+        assert!(
+            !rendered.contains("素通りできます"),
+            "[BUG-118] nftables redirects every outbound connection, so raw sockets do not slip \
+             past: {rendered}"
+        );
+        assert!(
+            !rendered.contains("外向き通信を一切行えません"),
+            "[BUG-118] tier3 is not cut off -- declaring that would make the model give up on \
+             work it can actually do: {rendered}"
+        );
+    }
+
+    /// **[BUG-118] Tierを足したら、ここがコンパイルエラーになること**を人が読める形で留める。
+    ///
+    /// 元の欠陥は「`else`に最も弱い説明を置いた」ことだった。**判定を1箇所へ移しただけでは
+    /// 再発を止められない**——`_ =>`で受ければ同じことが起きる。このテストは網羅`match`を
+    /// もう1つ書くことで、**受け皿を作った瞬間に2箇所直す必要がある**状態にしている。
+    #[test]
+    fn every_tier_answers_the_egress_question_explicitly() {
+        for tier in [
+            ShellTier::Tier0,
+            ShellTier::Tier1,
+            ShellTier::Tier2a,
+            ShellTier::Tier2b,
+            ShellTier::Tier3,
+        ] {
+            for enforced_by_wfp in [false, true] {
+                let egress = tier.net_egress(enforced_by_wfp);
+                // 到達できないのに「協調」と答えるのは矛盾である（環境変数を渡す相手が居ない）。
+                if !egress.proxy_reachable {
+                    assert_ne!(
+                        egress.enforcement,
+                        EgressEnforcement::Cooperative,
+                        "{tier:?} (wfp={enforced_by_wfp}) says the proxy is unreachable yet \
+                         relies on the child cooperating with it"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
