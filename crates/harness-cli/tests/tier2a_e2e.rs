@@ -3993,6 +3993,133 @@ fn fs_allow_case_the_elevated_grant_opens_only_the_declared_subject(
     Ok(())
 }
 
+/// [BUG-014] **Visual Studio検出用DLLを、宣言1つで読めるようにできるか。**
+///
+/// # 何を測るのか
+///
+/// AppContainerの中でビルドすると、rustcのVisual Studio自動検出が失敗し、
+/// フォールバックの「素の名前でのPATH解決」が**MSYS2の同名コマンド**を掴んでクラッシュする。
+/// 検出が失敗する理由は1つで、**検出用DLLが置かれたディレクトリにAppContainer宛のACEが無い**
+/// ——`C:\ProgramData\Microsoft\VisualStudio\Setup`には`ALL APPLICATION PACKAGES`が付いていない。
+///
+/// 当時（2026-07-22）は`--fs-allow`でこれを開こうとして`0x80070005`で失敗した。理由は
+/// **`--fs-allow`のACE付与が特権分離ヘルパーを経由していなかった**ことで、システム保護パスへは
+/// 常に無言で失敗していた。この欠陥は[BUG-015](../../../docs/bugs/BUG-015.md)で直っている。
+///
+/// **つまりこのケースは「当時の一般解が、いまなら成立するか」を測る。**
+///
+/// # 測るのは読めるかどうかだけである（**ビルドまで回さない**）
+///
+/// 「宣言すればビルドが通る」までを1本のテストで測ろうとすると、サンドボックスの中で
+/// Rustツールチェーン一式（`~/.cargo`・`~/.rustup`・MSVC・Windows SDK）を開く必要があり、
+/// **落ちたときにどれが原因か分けられない**。ここで測るのは
+/// [BUG-014](../../../docs/bugs/BUG-014.md)が名指しした機構——**検出用DLLへ届くか**——だけである。
+///
+/// 「届けばビルドも通る」は**測っていない**。記録にそう書く。
+///
+/// # マシンに何を残すか
+///
+/// 測定中だけ、実在のシステムディレクトリへ宣言capability宛のACEが1本増える。
+/// **読取のみ**で、このケースの最後に`harness fs revoke`で撤収し、撤収できたことまで確かめる。
+/// 対象のファイルには一切書き込まない（読むだけ）。
+fn fs_allow_case_the_visual_studio_detection_dll_can_be_opened(
+    ledger: &FsLedgerExclusive,
+) -> Result<(), String> {
+    const SETUP_DIR: &str = r"C:\ProgramData\Microsoft\VisualStudio\Setup";
+    let dll = Path::new(SETUP_DIR)
+        .join("x64")
+        .join("Microsoft.VisualStudio.Setup.Configuration.Native.dll");
+    if !dll.exists() {
+        // **この機にVisual Studioが入っていないなら、測る対象が無い。**
+        // 「読めなかった」と混同しないよう、ここで明示的に抜ける（`B-10`）。
+        eprintln!(
+            "[fs-allow-vsdetect] skipped: {} does not exist on this machine",
+            dll.display()
+        );
+        return Ok(());
+    }
+    let dll_for_script = dll.display().to_string().replace('\\', "/");
+    // 読めたかどうかだけを見る。**中身は出さない**（760KBのバイナリで、しかも診断に要らない）。
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         try {{ $s = [System.IO.File]::OpenRead('{dll_for_script}'); \
+           $n = $s.Length; $s.Close(); Write-Output ('DLL=OPENED len=' + $n) }} \
+         catch {{ Write-Output 'DLL=DENIED' }}"
+    );
+
+    // --- 腕1（対照）: 宣言しない。**届かないはず。** ---
+    let ws_without = case_dir("fs-allow-vsdetect-without");
+    let without = run_harness(
+        &ws_without,
+        &run_shell_script_turns(&script),
+        &[],
+        "fs-allow-vsdetect-without",
+    );
+    let without_json = parse_json_stdout(&without)?;
+    let without_text = without_json.first_tool_result()?.to_string();
+
+    // --- 腕2: 同じ台本を、宣言1つだけ足して撃つ ---
+    let ws_with = case_dir("fs-allow-vsdetect-with");
+    let allow = format!(r"{SETUP_DIR}\**");
+    let with = run_harness(
+        &ws_with,
+        &run_shell_script_turns(&script),
+        &["--fs-allow", &allow],
+        "fs-allow-vsdetect-with",
+    );
+    let with_json = parse_json_stdout(&with)?;
+    let with_text = with_json.first_tool_result()?.to_string();
+
+    eprintln!("[fs-allow-vsdetect] 宣言なし = {}", without_text.trim());
+    eprintln!("[fs-allow-vsdetect] 宣言あり = {}", with_text.trim());
+
+    // --- 撤収を先に済ませる。**判定で早期returnしても、マシンに残さない。** ---
+    let revoke = Command::new(harness_exe())
+        .args(["fs", "revoke"])
+        .arg(SETUP_DIR)
+        .output()
+        .map_err(|e| format!("failed to run `harness fs revoke`: {e}"))?;
+    eprintln!(
+        "[fs-allow-vsdetect] fs revoke -> {} {}",
+        revoke.status,
+        String::from_utf8_lossy(&revoke.stdout).trim()
+    );
+    let left = count_sid_aces(Path::new(SETUP_DIR), "S-1-15-3-").unwrap_or(usize::MAX);
+    ledger.purge_entries(&[Path::new(SETUP_DIR)]);
+
+    // --- 判定 ---
+    let mut failed: Vec<String> = Vec::new();
+    if !with_text.contains("DLL=OPENED") {
+        failed.push(format!(
+            "[BUG-014] declaring `{allow}` did not make the Visual Studio detection DLL readable \
+             from inside Tier2a. The generalisation that BUG-014 left open depends on this exact \
+             grant working (it could not in 2026-07, because `--fs-allow` did not go through the \
+             privilege-separation helper -- BUG-015 fixed that). got: {with_text}"
+        ));
+    }
+    if !without_text.contains("DLL=DENIED") {
+        failed.push(format!(
+            "[BUG-014] the control arm could already read the DLL **without** declaring anything, \
+             so the arm above proves nothing about the declaration. Either this machine grants \
+             AppContainers access to that tree by default, or a previous grant was left behind. \
+             got: {without_text}"
+        ));
+    }
+    if left != 0 {
+        failed.push(format!(
+            "`harness fs revoke {SETUP_DIR}` left {left} declaration-capability ACE(s) on a real \
+             system directory. This case must not widen the machine it runs on."
+        ));
+    }
+
+    if !failed.is_empty() {
+        return Err(failed.join(" || "));
+    }
+    cleanup_on_success(&ws_without, &[], "fs-allow-vsdetect-without");
+    cleanup_on_success(&ws_with, &[], "fs-allow-vsdetect-with");
+    Ok(())
+}
+
 #[test]
 #[ignore]
 fn tier2a_fs_allow_matrix() {
@@ -4035,6 +4162,14 @@ fn tier2a_fs_allow_matrix() {
         (
             "elevated-grant-opens-only-the-declared-subject",
             fs_allow_case_the_elevated_grant_opens_only_the_declared_subject,
+        ),
+        // [BUG-014] **実在のシステムディレクトリを開く唯一の腕。** 上の腕は自分で作った
+        // 保護パスを使うが、こちらは`C:\ProgramData\Microsoft\VisualStudio\Setup`そのものを
+        // 測る（当時`0x80070005`で失敗した相手）。**最後に置く**——マシンに元から在る物を
+        // 触るので、前の腕が落ちた回にその残骸と混ざらないようにする。
+        (
+            "the-visual-studio-detection-dll-can-be-opened",
+            fs_allow_case_the_visual_studio_detection_dll_can_be_opened,
         ),
     ];
     let mut passed = 0;
