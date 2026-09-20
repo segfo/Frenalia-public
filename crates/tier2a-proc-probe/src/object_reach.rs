@@ -47,8 +47,12 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// 1回の「開こう／触ろうとした」の記録。
+///
+/// **`spawn_report`も同じ形で報告する**（[#49]の「返ったハンドルで何ができるか」）。
+/// 形を写すと、2つのモードの結果を同じ道具で読めなくなる（`docs/CODE-STRUCTURE-RULES.md` §5.0）。
 #[cfg(windows)]
-fn attempt(kind: &str, target: &str, access: &str, ok: bool, last_error: u32) -> Value {
+pub(crate) fn attempt(kind: &str, target: &str, access: &str, ok: bool, last_error: u32) -> Value {
     json!({
         "kind": kind,
         "target": target,

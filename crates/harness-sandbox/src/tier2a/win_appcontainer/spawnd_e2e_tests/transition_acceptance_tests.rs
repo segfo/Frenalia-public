@@ -129,6 +129,10 @@ pub(super) fn ask_daemon_as_a_hook(
     command_line: &str,
     stdout_file: &std::path::Path,
     console: &str,
+    // [#49] `CREATE_SUSPENDED`で頼むか。**返ったハンドルの権限を測る腕だけが`true`**
+    // ——測る前に子が終わると、注入が失敗した理由が「絞れたから」か「死んでいたから」か
+    // 区別できない（`spawn_report::record_handle_rights`のdoc）。
+    suspended: bool,
 ) -> String {
     let daemon = case.daemon.as_ref().expect("case owns the daemon");
     let workspace = case
@@ -161,7 +165,11 @@ pub(super) fn ask_daemon_as_a_hook(
             console,
             "--timeout-secs",
             "60",
-        ],
+        ]
+        .iter()
+        .copied()
+        .chain(suspended.then_some("--spawn-suspended"))
+        .collect::<Vec<&str>>(),
     );
     eprintln!("[spawnd 6f-1] stdout={out}\nstderr={err}");
     super::wait_and_close(&child, job);
@@ -467,6 +475,7 @@ fn the_callers_own_stdout_handle_receives_the_childs_output_and_the_returned_han
         &format!("\"{cmd}\" /c echo {MARKER} & exit {EXIT_CODE}"),
         &captured,
         "not_needed",
+        false,
     );
 
     assert_eq!(
@@ -536,6 +545,7 @@ fn a_nested_shell_that_declares_it_needs_a_console_actually_runs_its_command() {
         &format!("\"{shell_exe}\" -NoProfile -NonInteractive -Command \"Write-Output '{MARKER}'\""),
         &captured,
         "required",
+        false,
     );
 
     assert_eq!(
@@ -598,6 +608,7 @@ fn the_same_shell_declared_as_not_needing_a_console_silently_does_nothing() {
         &format!("\"{shell_exe}\" -NoProfile -NonInteractive -Command \"Write-Output '{MARKER}'\""),
         &captured,
         "not_needed",
+        false,
     );
 
     // **起動そのものは成功する。** そこがこの失敗の分かりにくさである。
@@ -652,6 +663,7 @@ fn a_nested_child_starts_even_when_the_lineage_is_restricted() {
         &format!("\"{cmd}\" /c echo {MARKER}"),
         &captured,
         "not_needed",
+        false,
     );
 
     assert_eq!(
@@ -859,6 +871,281 @@ fn a_transition_into_a_domain_that_could_not_be_provisioned_is_refused() {
         !marker.exists(),
         "拒否と答えたのに子が走っている: {}",
         marker.display()
+    );
+
+    drop(case);
+}
+
+// ---------------------------------------------------------------------------
+// [#49・BUG-161] 固定辺の約束——呼び出し元はコードを1バイトも渡せない
+// ---------------------------------------------------------------------------
+
+/// プローブが報告した「返ったハンドルで何ができたか」から、1本の結果を引く。
+///
+/// **見つからないことと失敗したことを混ぜない**（`B-10`）——`None`は「その試行が
+/// 報告に無い」で、`Some(false)`は「撃って断られた」である。
+fn handed_handle_can(out: &str, access_contains: &str) -> Option<bool> {
+    report_field(out, "handle_rights")?
+        .as_array()?
+        .iter()
+        .find(|a| {
+            a.get("access")
+                .and_then(|v| v.as_str())
+                .is_some_and(|access| access.contains(access_contains))
+        })
+        .and_then(|a| a.get("ok").and_then(|v| v.as_bool()))
+}
+
+/// **T6（#49の本体）**: 別ドメインで起こした子へ、呼び出し元は**書き込めない**。
+///
+/// # 壊れた状態を一文で
+///
+/// **狭めたはずの子へ、呼び出し元が好きなコードを流し込める。**
+/// §19.3.4が固定辺を到達閉包から外す根拠は「固定辺では呼び出し元がコードを1バイトも
+/// 注入できない」であり、ここが緩むと**編集時検査が広げる辺を通した根拠ごと崩れる**
+/// ——固定できるのはプログラムと引数であって、走り始めた後の振る舞いではない。
+///
+/// # DACLが緑であることを根拠にしない
+///
+/// `domain_isolation_tests`は「別ドメインから`OpenProcess`できない」ことを測っているが、
+/// **それはこの穴を覆っていない**。アクセス検査は**開く瞬間に1回だけ**行われるので、
+/// Daemonが手渡したハンドルはその検査を通らない（`B-33`と同じ姿勢で、別の測定の緑を
+/// こちらの根拠にしない）。
+///
+/// # なぜ一時停止で頼むのか
+///
+/// 終了済みのプロセスへの`VirtualAllocEx`も失敗する。**測る前に子が終わってしまうと、
+/// 「絞れたから失敗した」と「死んでいたから失敗した」が区別できない**——だから止めたまま
+/// 測り、`ResumeThread`そのものを測定の最後の1本にする。
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn a_cross_domain_child_cannot_be_written_into_through_the_handle_the_caller_gets_back() {
+    let probe = super::super::mac_spike_tests::probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+
+    let (case, profile, caps) = setup_with_provisioned_domains(
+        "spawnd-s49-cross",
+        ChildProcessPolicy::Unrestricted,
+        |_workspace| policy_with_cross_domain_edge(&probe_str),
+    );
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let captured = workspace.join("s49-cross-stdout.txt");
+
+    let out = ask_daemon_as_a_hook(
+        &case,
+        &profile,
+        &caps,
+        &probe_str,
+        &format!("\"{probe_str}\" --emit s49-cross"),
+        &captured,
+        "not_needed",
+        true,
+    );
+
+    assert_eq!(
+        report_field(&out, "reply_kind").and_then(|v| v.as_str().map(str::to_string)),
+        Some("spawned".to_string()),
+        "別ドメインへの遷移が断られている（この腕は起きた後を測るものなので成立しない）: {out}"
+    );
+
+    // **注入できないこと。** 確保できた時点で注入は成立するので、ここが本体である。
+    assert_eq!(
+        handed_handle_can(&out, "VirtualAllocEx"),
+        Some(false),
+        "**別ドメインの子へメモリを確保できている。** 返したハンドルに\
+         `PROCESS_VM_OPERATION`が載っている——`WriteProcessMemory`＋`CreateRemoteThread`で\
+         遷移先ドメインの中で任意コードが走る。§19.3.4が閉包の除外の根拠にしている\
+         「呼び出し元はコードを1バイトも注入できない」が成立していない: {out}"
+    );
+    // 確保が断られていれば書き込みの試行は報告に出ない。**出ていたら必ず失敗側であること。**
+    if let Some(wrote) = handed_handle_can(&out, "WriteProcessMemory") {
+        assert!(!wrote, "別ドメインの子のメモリへ書き込めている: {out}");
+    }
+
+    // **契約の側**（対。`B-35`）: 絞りすぎていたら、呼び出し元は素の`CreateProcessW`と
+    // 同じことができなくなる。これが無いと「跨ぐときは何も渡さない」実装でも上が緑になる。
+    assert_eq!(
+        handed_handle_can(&out, "GetExitCodeProcess"),
+        Some(true),
+        "終了コードを読めない。フックが組み立てた`PROCESS_INFORMATION`が使い物にならない: {out}"
+    );
+    assert_eq!(
+        handed_handle_can(&out, "ResumeThread"),
+        Some(true),
+        "一時停止で頼んだ子を再開できない。**呼び出し元は永久に止まったままの子を掴む**: {out}"
+    );
+    assert_eq!(
+        report_field(&out, "waited_ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "返ったハンドルで待てない: {out}"
+    );
+
+    drop(case);
+}
+
+/// **T7（対の側。`B-35`）**: 同じドメインの子へは、今までどおり**書き込める**。
+///
+/// # これが無いと何が素通りするか
+///
+/// **「跨ぐときだけ絞る」ではなく「いつでも絞る」実装**が、T6だけでは緑のまま通る。
+/// 絞ってしまうと、サンドボックスの中のビルドツールが自分の子を触れなくなる
+/// ——`cargo`が`rustc`を殺せない、という形で**守る相手が居ない場所だけが壊れる**。
+///
+/// **ここが赤くなるのは正常な変化ではない。** 同一ドメインでも絞ると決めたのなら、
+/// その決定を`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2へ書いてからこのテストを畳むこと。
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn a_same_domain_child_is_still_fully_reachable_through_the_handle_the_caller_gets_back() {
+    let probe = super::super::mac_spike_tests::probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+
+    let (case, profile, caps) = setup_with_policy_and_transitions(
+        "spawnd-s49-same",
+        ChildProcessPolicy::Unrestricted,
+        |_workspace| policy_with_edge(E2E_POLICY_DOMAIN, &probe_str),
+    );
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let captured = workspace.join("s49-same-stdout.txt");
+
+    let out = ask_daemon_as_a_hook(
+        &case,
+        &profile,
+        &caps,
+        &probe_str,
+        &format!("\"{probe_str}\" --emit s49-same"),
+        &captured,
+        "not_needed",
+        true,
+    );
+
+    assert_eq!(
+        report_field(&out, "reply_kind").and_then(|v| v.as_str().map(str::to_string)),
+        Some("spawned".to_string()),
+        "自己ループの遷移が断られている: {out}"
+    );
+    assert_eq!(
+        handed_handle_can(&out, "VirtualAllocEx"),
+        Some(true),
+        "**同じドメインの子へも触れなくなっている。** 跨いでいないのに絞った\
+         ——ここで絞っても守る相手が居らず、サンドボックスの中のビルドツールが\
+         自分の子を殺せなくなるだけである: {out}"
+    );
+
+    drop(case);
+}
+
+/// 固定辺（**リテラルargv＋cwd宣言**）を1本だけ持つ宣言。
+///
+/// # 固定値に呼び出し元が書ける場所を含めてはいけない
+///
+/// 編集時検査は、リテラルargvの中の絶対パスがワークスペース配下なら**辺ごと拒否する**
+/// （「固定値が指す先を呼び出し元が書き換えられるなら、引数を固定しても無意味」）。
+/// だからこの辺の引数には**ワークスペースの中のパスを1つも書かない**——
+/// 走ったことは`exit`の終了コードで確かめる。
+fn policy_with_fixed_edge(exe: &str, command_line: &str, cwd: &std::path::Path) -> PolicyFile {
+    let mut file = PolicyFile::default();
+    let mut entry = PolicyDomain::new(E2E_POLICY_DOMAIN);
+    entry.process = serde_json::from_value(serde_json::json!({
+        "transitions": [{
+            "exe": { "literal": exe },
+            "argv": { "literal": command_line },
+            "cwd": cwd.to_string_lossy(),
+            "to": E2E_POLICY_DOMAIN,
+        }]
+    }))
+    .expect("the fixed transition declaration must parse");
+    file.domains.push(entry);
+    file
+}
+
+/// **T8（BUG-161の本体）**: 固定辺では、呼び出し元のstdoutハンドルが子へ渡らない。
+///
+/// # 壊れた状態を一文で
+///
+/// **固定した引数のシェルへ、呼び出し元が標準入力からコマンドを流し込める。**
+/// §19.1は固定する対象にstdinと継承ハンドル全体を挙げており、理由もそこに書いてある
+/// ——stdinが端末でなければシェルは**そこからコマンドを読んで実行する**ので、
+/// 引数を固定しても広いドメインで任意コードが走る。
+///
+/// # 測るのがstdoutなのはなぜか
+///
+/// 断ち方は3本まとめてで（`CallerHandles::default()`を渡す）、**渡ったかどうかが
+/// 見えるのはstdoutだけ**である。stdinが渡ったことは「子が何を読んだか」でしか分からず、
+/// それを測るには固定辺で任意コードを走らせる形を作ることになる。
+/// **同じ1本の分岐なので、見えるほうで固定する。**
+///
+/// # 「出力が無い」と「起きなかった」を分ける
+///
+/// 出力が落ちてこないだけなら、**子が起きていなくても同じに見える**。だから同じ回で
+/// 終了コードを読む——`exit 41`が返ってきた時点で、子は確かに走っている。
+///
+/// 対になるのは`argv: any`の辺を使う
+/// [`the_callers_own_stdout_handle_receives_the_childs_output_and_the_returned_handle_can_be_waited_on`]
+/// で、あちらは**同じハンドルに出力が落ちてくること**を固定している。
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn a_fixed_edge_does_not_hand_the_callers_stdout_to_the_child() {
+    const MARKER: &str = "HARNESS-BUG161-SHOULD-NOT-ARRIVE";
+    const EXIT_CODE: u64 = 41;
+    let cmd = cmd_exe();
+    let command_line = format!("\"{cmd}\" /c echo {MARKER} & exit {EXIT_CODE}");
+
+    let declared = command_line.clone();
+    let (case, profile, caps) = setup_with_policy_and_transitions(
+        "spawnd-bug161-fixed",
+        ChildProcessPolicy::Unrestricted,
+        |workspace| policy_with_fixed_edge(&cmd, &declared, workspace),
+    );
+    let workspace = case
+        .dir
+        .as_ref()
+        .expect("case owns the dir")
+        .path()
+        .to_path_buf();
+    let captured = workspace.join("fixed-edge-stdout.txt");
+
+    let out = ask_daemon_as_a_hook(
+        &case,
+        &profile,
+        &caps,
+        &cmd,
+        &command_line,
+        &captured,
+        "not_needed",
+        false,
+    );
+
+    assert_eq!(
+        report_field(&out, "reply_kind").and_then(|v| v.as_str().map(str::to_string)),
+        Some("spawned".to_string()),
+        "固定辺の要求が拒否された。宣言したcwdと実cwdの綴りがずれている可能性がある\
+         （`cwd_mismatch`なら理由に宣言値と実値が載る）: {out}"
+    );
+    // **子は走っている。** これが無いと「起こさない」実装でも下のassertが緑になる。
+    assert_eq!(
+        report_field(&out, "child_exit_code").and_then(|v| v.as_u64()),
+        Some(EXIT_CODE),
+        "固定辺の子が走っていない（か、終了コードを読めていない）: {out}"
+    );
+
+    let text = std::fs::read_to_string(&captured).unwrap_or_default();
+    assert!(
+        !text.contains(MARKER),
+        "**固定辺なのに、呼び出し元が渡したハンドルが子へ渡っている。**\
+         §19.1は固定する対象にstdinと継承ハンドル全体を挙げており、判定器は辺ごとに\
+         `Allowed::inherit_handles`でそれを答えている。Daemonがその欄を読んでいない\
+         （BUG-161）: file={} content={text:?} {out}",
+        captured.display()
     );
 
     drop(case);

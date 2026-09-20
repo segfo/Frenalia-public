@@ -87,6 +87,105 @@ impl Stdout {
     }
 }
 
+/// [#49] **返ってきたハンドルで何ができるかを測る。**
+///
+/// # 何のためにあるのか
+///
+/// Spawn Daemonは起こした子のプロセス／スレッドハンドルを呼び出し元へ複製して返す。
+/// **ドメインを跨ぐ遷移では、そこに注入できる権限を載せてはいけない**
+/// （`harness-sandbox`の`spawnd::server::caller_handle_rights`）。載っているかどうかは
+/// **実際に撃ってみる以外に確かめようが無い**ので、ここで撃って報告する。
+///
+/// # 測る順序に意味がある
+///
+/// 1. **注入できるか**（`VirtualAllocEx`→`WriteProcessMemory`）。確保できたら必ず解放する
+/// 2. **終了コードを読めるか**（契約の側。絞りすぎていないこと）
+/// 3. **`ResumeThread`できるか**。**これは子を動かす**ので最後に撃つ
+///
+/// # 子が生きている間に撃つこと（呼び出し側の責任）
+///
+/// 終了済みのプロセスへの`VirtualAllocEx`も失敗する。**一時停止で頼んで、ここを通してから
+/// 再開する**形でなければ、「絞れたから失敗した」と「死んでいたから失敗した」が区別できない。
+///
+/// 報告の形は[`crate::object_reach::attempt`]と同じ（`{kind,target,access,ok,last_error}`）。
+#[cfg(windows)]
+pub fn record_handle_rights(report: &mut Value, process: Option<u64>, thread: Option<u64>) {
+    use windows::Win32::Foundation::{GetLastError, HANDLE};
+    use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows::Win32::System::Memory::{
+        VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+    };
+    use windows::Win32::System::Threading::{GetExitCodeProcess, ResumeThread};
+
+    let mut attempts: Vec<Value> = Vec::new();
+    let last_error = || unsafe { GetLastError() }.0;
+
+    if let Some(process) = process.filter(|h| *h != 0) {
+        let handle = HANDLE(process as usize as *mut _);
+        // 1. 注入の前提。**確保できた時点で注入できる**（書き込みはその確認）。
+        let block =
+            unsafe { VirtualAllocEx(handle, None, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        attempts.push(crate::object_reach::attempt(
+            "handed-process",
+            "returned-by-daemon",
+            "PROCESS_VM_OPERATION (VirtualAllocEx)",
+            !block.is_null(),
+            if block.is_null() { last_error() } else { 0 },
+        ));
+        if !block.is_null() {
+            let payload: [u8; 8] = *b"INJECTED";
+            let wrote = unsafe {
+                WriteProcessMemory(
+                    handle,
+                    block,
+                    payload.as_ptr() as *const _,
+                    payload.len(),
+                    None,
+                )
+            };
+            attempts.push(crate::object_reach::attempt(
+                "handed-process",
+                "returned-by-daemon",
+                "PROCESS_VM_WRITE (WriteProcessMemory)",
+                wrote.is_ok(),
+                if wrote.is_ok() { 0 } else { last_error() },
+            ));
+            // **借りた物は返す。** 失敗しても報告には出さない（測っているのは注入可否である）。
+            unsafe {
+                let _ = VirtualFreeEx(handle, block, 0, MEM_RELEASE);
+            }
+        }
+        // 2. 契約の側。ここが落ちていたら絞りすぎである。
+        let mut code = 0u32;
+        let read = unsafe { GetExitCodeProcess(handle, &mut code) };
+        attempts.push(crate::object_reach::attempt(
+            "handed-process",
+            "returned-by-daemon",
+            "PROCESS_QUERY_LIMITED_INFORMATION (GetExitCodeProcess)",
+            read.is_ok(),
+            if read.is_ok() { 0 } else { last_error() },
+        ));
+    }
+
+    if let Some(thread) = thread.filter(|h| *h != 0) {
+        // 3. **子が動き出す。** 一時停止で頼んでいなければ`-1`（もともと止まっていない）。
+        let previous = unsafe { ResumeThread(HANDLE(thread as usize as *mut _)) };
+        attempts.push(crate::object_reach::attempt(
+            "handed-thread",
+            "returned-by-daemon",
+            "THREAD_SUSPEND_RESUME (ResumeThread)",
+            previous != u32::MAX,
+            if previous == u32::MAX {
+                last_error()
+            } else {
+                0
+            },
+        ));
+    }
+
+    report["handle_rights"] = Value::Array(attempts);
+}
+
 /// 返ってきたプロセスハンドルで待ち、終了コードを読んで報告へ畳む。
 ///
 /// **`GetExitCodeProcess`だけで「終わったか」を判定しない**——`STILL_ACTIVE`(259)と

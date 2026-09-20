@@ -64,7 +64,8 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME, THREAD_SYNCHRONIZE,
 };
 
 use crate::tier2a::win_appcontainer::{
@@ -754,6 +755,26 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
             )
         }
     };
+    // [BUG-161] **判定器の指示を`..`無しで全部取り出す。**
+    //
+    // # なぜ分解するのか——これが無かったせいで欄を1つ読み落とした
+    //
+    // かつてここは`allowed.to`・`allowed.cwd`・`allowed.env`の3つを**点で**読んでいた。
+    // 判定器は4つ目（`inherit_handles`）も計算していたのに、**誰も読まないままビルドが通り**、
+    // 固定辺でも呼び出し元のstdioが子へ渡り続けた（BUG-161）。
+    //
+    // `..`を書かずに分解すると、判定器が欄を足した日に**このファイルがコンパイルできなくなる**。
+    // `EnvironmentFacts`が同じ形の歯を持っている（`crates/harness-core/src/prompt.rs`）。
+    // **欄を増やすときは、ここで受けてから使い道を決めること。**
+    let harness_policy::transition::Allowed {
+        to,
+        cwd: declared_cwd,
+        env: env_policy,
+        inherit_handles,
+        // 向きは判定器の中で使い終わっている（`inherit_handles`の計算に入っている）。
+        // ここで再判定しない——同じ規則を2箇所に置くと、片方だけ直る。
+        direction: _,
+    } = allowed;
 
     // [#55] **遷移先ドメインの実体を表から引く。**
     //
@@ -765,21 +786,19 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
     // 通信を宣言している）ので、ここは載っているかどうかだけを見る。
     // **呼び出し元のcapabilityのまま名前だけ遷移先にする逃げ方は採らない**——
     // 宣言では狭めたつもりの遷移が1ビットも狭まらず、その食い違いは症状に出ない（§10.1.2）。
-    let target_domain = if allowed.to == caller.domain.policy_domain {
+    let target_domain = if to == caller.domain.policy_domain {
         // 自己ループ。呼び出し元の実体をそのまま使う（表を引く必要が無い）。
         &caller.domain
     } else {
         match shared
             .provisioned_domains
             .iter()
-            .find(|d| d.policy_domain == allowed.to)
+            .find(|d| d.policy_domain == to)
         {
             Some(domain) => domain,
             None => {
                 return Served::denied(
-                    DenyReason::TargetDomainNotProvisioned {
-                        to: allowed.to.to_string(),
-                    },
+                    DenyReason::TargetDomainNotProvisioned { to: to.to_string() },
                     from_domain,
                     command_line,
                 )
@@ -789,15 +808,35 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
 
     // §8.3: 辺が`cwd`を宣言していれば**その値を渡す**（検査するだけでは足りない）。
     // 宣言が無い辺は定義から「狭める／同値」なので、呼び出し元の実cwdをそのまま渡す。
-    let effective_cwd = allowed.cwd.unwrap_or(request.cwd);
+    let effective_cwd = declared_cwd.unwrap_or(request.cwd);
     // [段階6f-1] 呼び出し元の申告を使うが、**harnessが所有する名前だけは系統の値で強制する**。
-    let env = env_for_nested(&caller.base_env, request.env.as_deref(), allowed.env);
+    let env = env_for_nested(&caller.base_env, request.env.as_deref(), env_policy);
+
+    // [BUG-161] **固定辺では、呼び出し元由来のハンドルを1本も渡さない**（§19.1）。
+    //
+    // 判定器が`false`を返すのは「辺が完全に固定されている」か「広げる／証明できない辺」で、
+    // どちらも**呼び出し元が子へ入力を渡せてはいけない**辺である。
+    // `CallerHandles::default()`を渡すと`pull_caller_stdio`は`(None, NUL, NUL)`を返す
+    // ——Daemonが自分で開いた物しか子へ行かない、という§19.1の要求そのものになる。
+    //
+    // **stdinを断つのが要点である。** 固定argvのシェルは、stdinが端末でなければ
+    // **そこからコマンドを読んで実行する**——引数を固定しても、呼び出し元が
+    // ワークスペースに置いたスクリプトをstdinで流し込めば広いドメインで任意コードが走る。
+    //
+    // **代償**: 固定辺では子の出力が呼び出し元へ返らない。§19.1がそう書いており、
+    // 逃げ道も書いてある（`argv: any`の辺にする）。
+    let handles = if inherit_handles {
+        request.handles
+    } else {
+        super::CallerHandles::default()
+    };
 
     match spawn_nested(
         shared,
         &caller,
         target_domain,
         request,
+        &handles,
         &command_line,
         effective_cwd,
         env,
@@ -1435,6 +1474,10 @@ fn spawn_top_level(
 ///
 /// stdioの引き継ぎ・コンソール要否の申告・nestedへのDLL注入は、どれもこの回で入った。
 /// **残っているのはフック側**（`CreateProcessW`を横取りしてここへ頼む）で、それが6f-2である。
+// **引数は多いが、まとめない。** 出どころが全部違う（上の表）ので、1つの構造体へ畳むと
+// 「誰が決めた値か」が呼び出し側からも見えなくなる。とくに`handles`は
+// **判定の結果を当てたあとの値**で、`request.handles`と取り違えると固定辺の約束が消える。
+#[allow(clippy::too_many_arguments)]
 fn spawn_nested(
     shared: &Arc<Shared>,
     caller: &super::table::Caller,
@@ -1443,6 +1486,11 @@ fn spawn_nested(
     // **`caller.domain`を直接読まない**——読むと、遷移先を決めた判断がここで消える。
     target_domain: &DomainSpec,
     request: &NestedRequest<'_>,
+    // [BUG-161] **この子へ実際に渡すハンドル。** `request.handles`ではない
+    // ——固定辺では呼び出し元由来を1本も渡さないので、判定の結果を当てたあとの値が来る
+    // （`serve_spawn_request`）。**`request.handles`を直接読まないこと**：読むと、
+    // 「渡してよいか」の判断がここで消える。
+    handles: &super::CallerHandles,
     command_line: &str,
     cwd: &str,
     mut env: Vec<(String, String)>,
@@ -1450,12 +1498,16 @@ fn spawn_nested(
     let domain = resolve_domain(target_domain)?;
     let capability_attributes = domain.capability_attributes();
     let caller_process = HANDLE(caller.process as *mut _);
+    // [#49] **ドメインを跨ぐか。** 跨ぐなら、呼び出し元へ返すハンドルの権限を絞る
+    // （[`caller_handle_rights`]）。**ここで1回だけ見る**——同じ判断を2箇所に置くと、
+    // 片方だけ直る。値が1ビットでも違えば跨いだ扱いにする（fail-closed）。
+    let crosses_domains = target_domain != &caller.domain;
 
     // [段階6f-1] 呼び出し元のstdioを**引き抜く**（[`super::CallerHandles`]のdoc）。
     // 申告の無い欄は今までどおり`NUL`へ捨てる。
     let mut opened = OpenedStdio::default();
     let (stdin_read, stdout_write, stderr_write) =
-        match pull_caller_stdio(&mut opened, caller_process, &request.handles) {
+        match pull_caller_stdio(&mut opened, caller_process, handles) {
             Ok(three) => three,
             Err(e) => {
                 // **途中まで開いたぶんを閉じる**（`B-01`: 3本のうち2本目で落ちたら1本目が漏れる）。
@@ -1591,7 +1643,12 @@ fn spawn_nested(
     // 呼び出し元のプログラムはそこに入っているハンドルで**待ち・終了コードの読み取り・
     // （一時停止で頼んだなら）再開**を行う。作れないなら起こしても意味が無いので、
     // **その場で畳む**——resume前なので子はユーザーコードを1行も実行していない。
-    let for_caller = duplicate_to_caller(caller_process, info.hProcess, info.hThread);
+    let for_caller = duplicate_to_caller(
+        caller_process,
+        info.hProcess,
+        info.hThread,
+        caller_handle_rights(crosses_domains),
+    );
     let (process, thread) = match for_caller {
         Ok(pair) => pair,
         Err(e) => {
@@ -1625,54 +1682,115 @@ fn spawn_nested(
     })
 }
 
+/// [#49] 呼び出し元へ返すハンドルに与える権限。
+///
+/// `None`は**呼び出し元の複製と同じ権限**（`DUPLICATE_SAME_ACCESS`）、
+/// `Some`は**その値に絞る**。[`caller_handle_rights`]だけが作る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CallerHandleRights {
+    process: Option<u32>,
+    thread: Option<u32>,
+}
+
+/// [#49] ドメインを跨ぐかで、返すハンドルの権限を決める。
+///
+/// # 跨がないなら今日のまま（完全アクセス）
+///
+/// 同じドメインの子に対してできることは、呼び出し元が**自分自身に対して既にできること**と
+/// 変わらない（ドメインは`(package SID, capability SIDの組)`なので、同じ組なら同じ権限である）。
+/// 絞ると**サンドボックスの中のビルドツールが自分の子を殺せなくなる**だけで、何も守らない。
+///
+/// # 跨ぐなら、注入に使える権限を落とす
+///
+/// [§19.3.4](../../../../plans/DESIGN-MAC-TRANSITION-POLICY.md)は、固定辺を到達閉包から
+/// 除外する根拠を「**固定辺では呼び出し元がコードを1バイトも注入できない**」に置いている。
+/// 完全アクセスのハンドルを返すと、`VirtualAllocEx`＋`WriteProcessMemory`＋
+/// `CreateRemoteThread`で**その根拠が崩れる**——固定するのはプログラムと引数であって、
+/// 走り始めた後の振る舞いではない。
+///
+/// **DACLでは止まらない。** [§22.1.1](../../../../plans/DESIGN-MAC-DOMAIN.md)（案A）が
+/// 子のDACLを絞っているのは`OpenProcess`を防ぐためで、アクセス検査は**開く瞬間に1回だけ**
+/// 行われる。**手渡したハンドルはその検査を経ない。**
+///
+/// | 残す | 何のために要るか |
+/// |---|---|
+/// | `SYNCHRONIZE` | `WaitForSingleObject`（子の終了を待つ） |
+/// | `PROCESS_QUERY_LIMITED_INFORMATION` | `GetExitCodeProcess`・`GetProcessId` |
+/// | `PROCESS_TERMINATE` | `taskkill`相当。**跨いでも落とさない**——起こしてもらった子を
+/// |   | 止められないほうが実害が大きく、終了させることは注入ではない |
+/// | `THREAD_QUERY_LIMITED_INFORMATION` | `GetThreadId`。**フック自身が呼ぶ**（`spawn_broker.rs`） |
+/// | `THREAD_SUSPEND_RESUME` | `ResumeThread`（一時停止で頼んだ呼び出し元が動かす） |
+///
+/// 落とすのは`PROCESS_VM_WRITE`・`PROCESS_VM_OPERATION`・`PROCESS_VM_READ`・
+/// `PROCESS_CREATE_THREAD`・`PROCESS_DUP_HANDLE`・`THREAD_SET_CONTEXT`などである
+/// （列挙せず、**残す側だけを書いて他を落とす**——落とす側を列挙すると、
+/// OSが新しい権限を足した日に無言で漏れる）。
+///
+/// # フックのDLL注入は壊れない
+///
+/// Redirector DLLは`VirtualAllocEx`＋`CreateRemoteThread`で孫へ注入するが、
+/// **それはDaemonへ頼まなかった経路の話である**——頼んだ経路では`try_broker`が
+/// 早期returnするので注入のコードを通らない（`harness-redirector`の`process_hooks.rs`）。
+/// 頼んだ子へ注入するのは**Daemon自身**である（[`prepare_redirector`]）。
+fn caller_handle_rights(crosses_domains: bool) -> CallerHandleRights {
+    if !crosses_domains {
+        return CallerHandleRights {
+            process: None,
+            thread: None,
+        };
+    }
+    CallerHandleRights {
+        process: Some(
+            (PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE).0,
+        ),
+        thread: Some(
+            (THREAD_SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME).0,
+        ),
+    }
+}
+
 /// [段階6f-1] 起こした子のプロセス／スレッドハンドルを、**要求元のプロセスへ**複製する。
 ///
-/// # 与える権限は、素の`CreateProcessW`が親へ渡すものと揃える
+/// # 与える権限は[`caller_handle_rights`]が決める
 ///
 /// フックの目的は「呼び出し元から見て、素の`CreateProcessW`と同じに見えること」である。
-/// 素の生成では親は子に対して完全なアクセスを得るので、ここで絞ると
-/// **サンドボックスの中のビルドツールが自分の子を殺せなくなる**（`taskkill`相当が効かない）。
-///
-/// # **ドメインを跨ぐようになった（2026-09-20、#55の骨格）。見直しはまだ済んでいない**
-///
-/// 2026-09-17にこの関数を書いた時点では、遷移先は呼び出し元と同じドメインに限られていたので
-/// 「渡しても呼び出し元の権限は1ビットも増えない」が成立していた。**その前提は崩れた**
-/// ——いま`spawn_nested`は別ドメインの実体で子を起こすので、ここは
-/// **別のドメインで走る子への完全アクセスを呼び出し元へ手渡している**。
-///
-/// **DACLでは止まらない。** §22.1.1（案A）が子のプロセス／スレッドのDACLを絞っているのは
-/// `OpenProcess`を防ぐためで、**手渡したハンドルはアクセス検査を経ずに使える**
-/// （検査は開く瞬間に1回だけである）。
-///
-/// **どちら向きに倒すかは未決**（`docs/STATUS.md`残課題#49。**そこが「#45が閉じた日に決める」と
-/// 書いている、その日が来た**）。素の`CreateProcessW`と同じに見せる要件（待ち・終了コード・
-/// 再開・`taskkill`相当）と、注入に使える権限（`PROCESS_VM_WRITE`・`CREATE_THREAD`・
-/// `DUP_HANDLE`）を分けられるので、**跨ぐときだけマスクを絞る**のが有力な形である。
+/// 素の生成では親は子に対して完全なアクセスを得るので、**同じドメインの間では絞らない**。
+/// **跨ぐときだけ絞る**——理由と残す権限の一覧はそちらのdocにある（#49）。
 ///
 /// 片方だけ成功した状態を残さない——2本目で落ちたら1本目を閉じる（`B-01`）。
 fn duplicate_to_caller(
     caller_process: HANDLE,
     process: HANDLE,
     thread: HANDLE,
+    rights: CallerHandleRights,
 ) -> Result<(HANDLE, HANDLE), SpawnDaemonError> {
-    let dup = |source: HANDLE, what: &'static str| -> Result<HANDLE, SpawnDaemonError> {
+    let dup = |source: HANDLE,
+               desired: Option<u32>,
+               what: &'static str|
+     -> Result<HANDLE, SpawnDaemonError> {
         let mut theirs = HANDLE::default();
+        // **`DUPLICATE_SAME_ACCESS`を付けると`dwDesiredAccess`は無視される。**
+        // 絞るときは付けない（トップレベルがharnessへ返すときと同じ書き方）。
+        let (access, options) = match desired {
+            Some(access) => (access, DUPLICATE_HANDLE_OPTIONS(0)),
+            None => (0, DUPLICATE_SAME_ACCESS),
+        };
         unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
                 source,
                 caller_process,
                 &mut theirs,
-                0,
+                access,
                 false,
-                DUPLICATE_SAME_ACCESS,
+                options,
             )
         }
         .map_err(|e| err(format!("DuplicateHandle({what} to the caller): {e}")))?;
         Ok(theirs)
     };
-    let their_process = dup(process, "child process")?;
-    match dup(thread, "child thread") {
+    let their_process = dup(process, rights.process, "child process")?;
+    match dup(thread, rights.thread, "child thread") {
         Ok(their_thread) => Ok((their_process, their_thread)),
         Err(e) => {
             // **相手のプロセスの中のハンドルなので、こちらからは`DuplicateHandle`の
@@ -2388,5 +2506,116 @@ mod domain_tests {
             matches!(resolved.domain_identity(), DomainIdentity::OwnPackage),
             "package SIDをドメインにする指定が capability に化けている"
         );
+    }
+}
+
+/// [#49] 呼び出し元へ返すハンドルの権限。**実機を起こさずに固定する。**
+///
+/// 実機の受け入れ（`spawnd_e2e_tests`）は本当に注入を試すが、あれは`spawn-daemon`でしか
+/// 回らない。**マスクの中身が変わったことは`cargo test`で赤くなるべき**である
+/// ——権限が1つ増えるのは1文字の変更で、レビューで見落とす。
+#[cfg(test)]
+mod handle_rights_tests {
+    use super::*;
+    use windows::Win32::System::Threading::{
+        PROCESS_CREATE_THREAD, PROCESS_DUP_HANDLE, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+        PROCESS_VM_WRITE, THREAD_SET_CONTEXT,
+    };
+
+    /// 同じドメインの間では**今日の振る舞いを1ビットも変えない**。
+    ///
+    /// # 壊れた状態を一文で
+    ///
+    /// **サンドボックスの中のビルドツールが自分の子を触れなくなる。** ここを一律に絞ると、
+    /// `cargo`が`rustc`を殺せない・待てないといった形で、守る相手が居ない場所だけが壊れる。
+    #[test]
+    fn a_same_domain_child_is_handed_the_same_access_as_a_plain_create_process() {
+        let rights = caller_handle_rights(false);
+        assert_eq!(
+            rights,
+            CallerHandleRights {
+                process: None,
+                thread: None
+            },
+            "同一ドメインなのに権限を絞っている。絞っても何も守らない（同じ組なら同じ権限）"
+        );
+    }
+
+    /// **対の側**（`B-35`）: 跨ぐときは注入に使える権限が**1つも載っていない**。
+    ///
+    /// # 壊れた状態を一文で
+    ///
+    /// **狭めたはずの子へ、呼び出し元がコードを書き込める。** §19.3.4が固定辺を到達閉包から
+    /// 外す根拠は「呼び出し元がコードを1バイトも注入できない」なので、ここが緩むと
+    /// **編集時検査が広げる辺を通した根拠ごと崩れる**。
+    #[test]
+    fn a_cross_domain_child_is_not_handed_anything_that_can_inject() {
+        let rights = caller_handle_rights(true);
+        let process = rights
+            .process
+            .expect("跨ぐときはプロセスハンドルの権限を絞らなければならない");
+        let thread = rights
+            .thread
+            .expect("跨ぐときはスレッドハンドルの権限を絞らなければならない");
+
+        for (label, bit) in [
+            ("PROCESS_VM_WRITE", PROCESS_VM_WRITE),
+            ("PROCESS_VM_OPERATION", PROCESS_VM_OPERATION),
+            ("PROCESS_VM_READ", PROCESS_VM_READ),
+            ("PROCESS_CREATE_THREAD", PROCESS_CREATE_THREAD),
+            ("PROCESS_DUP_HANDLE", PROCESS_DUP_HANDLE),
+        ] {
+            assert_eq!(
+                process & bit.0,
+                0,
+                "跨ぐ子へ{label}を渡している。これだけで別ドメインへコードを注入できる"
+            );
+        }
+        assert_eq!(
+            thread & THREAD_SET_CONTEXT.0,
+            0,
+            "跨ぐ子へTHREAD_SET_CONTEXTを渡している。実行位置を書き換えられる"
+        );
+    }
+
+    /// **3本目**: 絞った結果、フックの契約に要る権限まで落としていないこと。
+    ///
+    /// 上の2本だけだと「跨ぐときは0を渡す」実装が両方緑になり、**呼び出し元が子を待てない・
+    /// 終了コードを読めない・一時停止を解除できない**状態で出荷される。
+    #[test]
+    fn a_cross_domain_child_can_still_be_waited_on_and_resumed() {
+        let rights = caller_handle_rights(true);
+        let process = rights.process.expect("process rights");
+        let thread = rights.thread.expect("thread rights");
+
+        for (label, bit) in [
+            ("PROCESS_SYNCHRONIZE", PROCESS_SYNCHRONIZE),
+            (
+                "PROCESS_QUERY_LIMITED_INFORMATION",
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            ),
+            ("PROCESS_TERMINATE", PROCESS_TERMINATE),
+        ] {
+            assert_ne!(
+                process & bit.0,
+                0,
+                "{label}を落としている。呼び出し元は素の`CreateProcessW`と同じことができなくなる"
+            );
+        }
+        for (label, bit) in [
+            ("THREAD_SYNCHRONIZE", THREAD_SYNCHRONIZE),
+            (
+                "THREAD_QUERY_LIMITED_INFORMATION",
+                THREAD_QUERY_LIMITED_INFORMATION,
+            ),
+            ("THREAD_SUSPEND_RESUME", THREAD_SUSPEND_RESUME),
+        ] {
+            assert_ne!(
+                thread & bit.0,
+                0,
+                "{label}を落としている。フックは`GetThreadId`を呼び、\
+                 一時停止で頼んだ呼び出し元は`ResumeThread`を撃つ"
+            );
+        }
     }
 }

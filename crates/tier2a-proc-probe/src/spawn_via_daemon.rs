@@ -41,6 +41,13 @@ pub struct Spec<'a> {
     pub console: &'a str,
     /// 応答のJSONの置き場（テスト側が読む）。
     pub report_file: Option<&'a str>,
+    /// [#49] `CREATE_SUSPENDED`で頼むか。
+    ///
+    /// **返ってきたハンドルの権限を測るときは`true`にすること**——子が終わった後では
+    /// `VirtualAllocEx`も失敗するので、「絞れたから失敗した」と「死んでいたから失敗した」が
+    /// 区別できなくなる（[`crate::spawn_report::record_handle_rights`]）。
+    /// 動かすのは測り終えた後で、`ResumeThread`はその測定の最後の1本そのものである。
+    pub suspended: bool,
 }
 
 #[cfg(windows)]
@@ -65,7 +72,7 @@ pub fn run(spec: &Spec) -> Value {
             "stderr": Value::Null,
         },
         "console": spec.console,
-        "suspended": false,
+        "suspended": spec.suspended,
     })
     .to_string();
 
@@ -101,11 +108,13 @@ pub fn run(spec: &Spec) -> Value {
     if let Some(reply) = reply.as_ref() {
         if reply.get("kind").and_then(Value::as_str) == Some("spawned") {
             report["child_pid"] = reply.get("pid").cloned().unwrap_or(Value::Null);
-            crate::spawn_report::wait_and_record(
-                &mut report,
-                reply.get("process").and_then(Value::as_u64),
-                reply.get("thread").and_then(Value::as_u64),
-            );
+            let process = reply.get("process").and_then(Value::as_u64);
+            let thread = reply.get("thread").and_then(Value::as_u64);
+            // [#49] **待つ前に測る。** `wait_and_record`はハンドルを閉じるうえ、
+            // 子が終わった後では注入の可否が測れない（同関数のdoc）。
+            // 最後の`ResumeThread`がここで撃たれるので、一時停止で頼んだ子はここから動き出す。
+            crate::spawn_report::record_handle_rights(&mut report, process, thread);
+            crate::spawn_report::wait_and_record(&mut report, process, thread);
         } else {
             report["deny_reason"] = reply.get("reason").cloned().unwrap_or(Value::Null);
         }

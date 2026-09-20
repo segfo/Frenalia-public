@@ -212,6 +212,7 @@ fn which_spelling_of_the_shell_can_be_a_nested_transition_target() {
             &format!("\"{exe}\" -NoProfile -NonInteractive -Command \"Write-Output '{MARKER}'\""),
             &captured,
             "required",
+            false,
         );
         let text = std::fs::read_to_string(&captured).unwrap_or_default();
         rows.push(Row {

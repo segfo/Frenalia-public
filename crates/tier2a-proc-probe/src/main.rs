@@ -118,6 +118,10 @@ struct Args {
     /// **N個の子の到着をそろえるためだけにある。** そろったかどうかは報告の
     /// `start_epoch_us`で後から確かめる（指定しても、遅れて起きた子はそのまま撃つ）。
     pipe_start_at_epoch_ms: Option<u128>,
+    /// [#49] `--spawn-via-daemon`が`CREATE_SUSPENDED`で頼むか。
+    ///
+    /// **返ったハンドルの権限を測る腕だけが立てる。** 立てないと、測る前に子が終わり得る。
+    spawn_suspended: bool,
     /// [段階6f-1] **フックの役で**要求受付パイプへ頼む（`spawn_via_daemon`）。
     ///
     /// `--pipe-client`が測るのは「窓口へ届くか」までで、こちらは1往復の**中身**
@@ -191,6 +195,7 @@ fn parse_args() -> Args {
     let mut spawn_cwd: Option<String> = None;
     let mut spawn_stdout: Option<String> = None;
     let mut spawn_console: Option<String> = None;
+    let mut spawn_suspended = false;
     // [段階6f-2] フック経由の腕。指定しなければ`None`なので、既存の腕は1つも変わらない。
     let mut spawn_transparently: Option<String> = None;
     let mut spawn_set_env: Vec<String> = Vec::new();
@@ -298,6 +303,7 @@ fn parse_args() -> Args {
             "--spawn-cwd" => spawn_cwd = Some(next()),
             "--spawn-stdout" => spawn_stdout = Some(next()),
             "--spawn-console" => spawn_console = Some(next()),
+            "--spawn-suspended" => spawn_suspended = true,
             // [段階6f-2] 値は生成フラグの選び方（モードの選択と同時に運ぶ）。
             "--spawn-transparently" => spawn_transparently = Some(next()),
             "--spawn-set-env" => spawn_set_env.push(next()),
@@ -411,6 +417,7 @@ fn parse_args() -> Args {
         pipe_payload,
         pipe_repeat,
         pipe_start_at_epoch_ms,
+        spawn_suspended,
         spawn_via_daemon_pipe,
         spawn_image,
         spawn_command_line,
@@ -897,6 +904,7 @@ fn main() -> ExitCode {
             stdout_file: args.spawn_stdout.as_deref(),
             console: args.spawn_console.as_deref().unwrap_or("not_needed"),
             report_file: args.report_file.as_deref(),
+            suspended: args.spawn_suspended,
         });
         println!(
             "{}",
