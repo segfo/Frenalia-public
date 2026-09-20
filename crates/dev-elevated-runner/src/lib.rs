@@ -135,6 +135,26 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "a_git_config_trap_cannot_reach_its_program_when_transitions_are_enforced",
         ],
     ),
+    // [残課題#39の残り] 同じ仕掛けを、**1段ごとに別のドメインへ渡る形**で測る。
+    // 上の的が測れているのは「同じドメインの中での許否」までで（§S64）、**鎖は測れていなかった**
+    // ——別ドメインで子を起こす機構が無かったためである（#45／#55）。2026-09-20に着地した。
+    //
+    // **上の的と分けてある**（1要素＝1測定）。混ぜると、同じドメインで止まったのか
+    // 跨げなかったのかが1つの合否に畳まれて読めなくなる。
+    (
+        "e2e-git-config-chain",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "the_git_config_trap_chain_is_judged_across_domains",
+        ],
+    ),
     // [⑤を既定へ入れる準備①] **既定の遷移宣言一式の一次データ**を測る。実務に近い台本を
     // 旗つきで回し、宣言を0本から足しながら**断られたものの一覧**を数える
     // （`plans/DESIGN-MAC-ENFORCEMENT.md`が「旗を立てた回に何が断られるかを数えることが

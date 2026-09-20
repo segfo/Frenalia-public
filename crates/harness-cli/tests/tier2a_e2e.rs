@@ -5893,6 +5893,148 @@ fn declare_programs(ws: &Path, exes: &[String]) -> Result<(), String> {
     harness_policy::policy_file::save(ws, &file).map_err(|e| format!("policy.jsonを書けない: {e}"))
 }
 
+/// [残課題#39] **書いた宣言が本当に「別ドメインへ渡る形」になっているか**を、書いた後に読み返す。
+///
+/// # なぜ結果からの推論で済ませないのか
+///
+/// この測定が新しく振った軸は「遷移先が別のドメインかどうか」1本だけである。
+/// **その軸が実際に振れたことを見る検算が無いと、軸を振ったつもりの測定がそのまま
+/// 結果として記録される**（`measurement-review`の検問3）。
+///
+/// たとえば鎖を組む側が`to`を入口ドメインのまま書いていても、**発火する腕は同じように
+/// 発火する**——§S64（自己ループで測ったもの）と見分けが付かない。
+///
+/// 見るのは2つ。**どの辺も自分のドメインへは戻らない**ことと、**遷移先が1種類ではない**こと。
+fn assert_chain_crosses_domains(ws: &Path, case_name: &str) {
+    let policy = harness_policy::policy_file::load(ws)
+        .unwrap_or_else(|e| panic!("{case_name}: 書いたばかりの宣言を読み返せない: {e}"));
+    let mut targets: Vec<String> = Vec::new();
+    for domain in &policy.domains {
+        for edge in &domain.process.transitions {
+            assert_ne!(
+                edge.to, domain.name,
+                "{case_name}: 辺が自分のドメインへ戻っている（自己ループ）。\
+                 **この測定は§S64と同じものを測っている**ことになり、\
+                 「別ドメインを跨いだ」とは言えない: {policy:?}"
+            );
+            if !targets.contains(&edge.to) {
+                targets.push(edge.to.clone());
+            }
+        }
+    }
+    assert!(
+        targets.len() >= 2,
+        "{case_name}: 遷移先が{}種類しかない。鎖が1段で終わっているか、\
+         すべて同じドメインへ集まっている——どちらでも「1段ごとに別のドメインへ渡る」\
+         形にはなっていない: 遷移先={targets:?}",
+        targets.len()
+    );
+}
+
+/// [残課題#39] 鎖を**1段ごとに別のドメインへ渡る形**で宣言する。
+///
+/// # `declare_programs`と何が違うのか
+///
+/// あちらは全部の辺を**入口ドメインの自己ループ**として書く（`to`が入口自身）。
+/// つまり鎖の何段目に居ても遷移元は同じドメインなので、**「どこから起こされたか」で
+/// 許否が変わることを1度も測っていない**。
+///
+/// ここは`hops[i]`の遷移元を「1つ前の段の遷移先」にする。
+///
+/// ```text
+///   declare_programs:  入口 --git--> 入口 --git--> 入口 --findstr--> 入口
+///   declare_chain:     入口 --git--> d0  --git--> d1  --findstr--> d2
+/// ```
+///
+/// # 遷移先ドメインは宣言を1件も持たない
+///
+/// 持たせると**用意できない**——骨格では「既に許可済みの宣言」しか引けないので
+/// （`domain_provision`のモジュールdoc）、宣言を足した瞬間にそのドメインへの遷移が
+/// `target_domain_not_provisioned`で断られ、**測っているものが遷移の許否ではなくなる**。
+///
+/// 宣言が空なら権限は入口と等しいので、編集時検査の縮小性（§19.3.4）も通る。
+///
+/// # 名前を短くしてある理由
+///
+/// 遷移先ドメインの入れ物の名前は`harness.domain.<セッションの印>.<ドメイン名>`で、
+/// **64文字を超えると用意できない**（実機で確認済み。受入の負側がその形を使っている）。
+/// セッションの印だけで17文字前後あるので、ここは`d0`・`d1`のような短い名前にする。
+fn declare_chain(ws: &Path, hops: &[String]) -> Result<(), String> {
+    declare_chain_from(ws, hops, harness_policy::policy_file::ENTRY_DOMAIN)
+}
+
+/// [残課題#39] 鎖の出発点を選べる版（測定(c)が**2本目の鎖**を足すのに使う）。
+fn declare_chain_from(ws: &Path, hops: &[String], from: &str) -> Result<(), String> {
+    let mut file = harness_policy::policy_file::PolicyFile::default();
+    add_chain(&mut file, hops, from)?;
+    harness_policy::policy_file::save(ws, &file).map_err(|e| format!("policy.jsonを書けない: {e}"))
+}
+
+/// 鎖1本を宣言へ足す。**同じドメインが既に在れば辺を足す**（作り直さない）。
+fn add_chain(
+    file: &mut harness_policy::policy_file::PolicyFile,
+    hops: &[String],
+    from: &str,
+) -> Result<(), String> {
+    let mut current = from.to_string();
+    for (i, exe) in hops.iter().enumerate() {
+        // 遷移先の名前。**出発点ごとに別の綴りにする**——2本の鎖が同じ中継ドメインを
+        // 共有してしまうと、測定(c)が「辺か経路か」を判別できなくなる。
+        let to = format!("{}d{i}", chain_prefix(from));
+        add_edge(file, &current, exe, &to)?;
+        current = to;
+    }
+    Ok(())
+}
+
+/// 鎖ごとのドメイン名の接頭辞。入口から伸びる鎖は`d0`・`d1`…、別の出発点は`xd0`・`xd1`…。
+fn chain_prefix(from: &str) -> &'static str {
+    if from == harness_policy::policy_file::ENTRY_DOMAIN {
+        ""
+    } else {
+        "x"
+    }
+}
+
+/// 辺を1本足す。遷移元のドメインが無ければ作り、遷移先の定義も（空で）作る。
+///
+/// **遷移先の定義を作るのを忘れない**——`to`が指す先の定義が無いと、
+/// 起動時の用意が「定義が無い」で断り、鎖がそこで切れる。
+fn add_edge(
+    file: &mut harness_policy::policy_file::PolicyFile,
+    from: &str,
+    exe: &str,
+    to: &str,
+) -> Result<(), String> {
+    use harness_policy::policy_file::PolicyDomain;
+
+    if !file.domains.iter().any(|d| d.name == to) {
+        file.domains.push(PolicyDomain::new(to));
+    }
+    if !file.domains.iter().any(|d| d.name == from) {
+        file.domains.push(PolicyDomain::new(from));
+    }
+    let domain = file
+        .domains
+        .iter_mut()
+        .find(|d| d.name == from)
+        .expect("just inserted");
+    let mut edges: Vec<serde_json::Value> = domain
+        .process
+        .transitions
+        .iter()
+        .map(|e| serde_json::to_value(e).expect("an existing edge must serialize"))
+        .collect();
+    edges.push(serde_json::json!({
+        "exe": { "literal": exe },
+        "argv": { "any": true },
+        "to": to,
+    }));
+    domain.process = serde_json::from_value(serde_json::json!({ "transitions": edges }))
+        .map_err(|e| format!("遷移の宣言が組めない（{from} -> {to}）: {e}"))?;
+    Ok(())
+}
+
 /// **⑤'の測定**: 生成禁止を積んだセッションで、宣言していないプログラムは断られ、
 /// **その事実がモデルへ届く**。宣言すれば同じコマンドが通る。
 ///
@@ -6090,6 +6232,19 @@ fn git_trap_payload() -> String {
 /// `cmd\git.exe`（中継役）→`mingw64\bin\git.exe`（本体）→`findstr.exe`（仕掛けの指す先）。
 /// **この3は上限ではなく観測値である**（§S64）。
 const GIT_TRAP_MAX_HOPS: usize = 8;
+/// [残課題#39] 拒否側で**最後の1歩に差し替える別のプログラム**。
+///
+/// System32の実体で、**仕掛けが実際に起こすものとは違う**綴りにする。
+/// 起動できるかどうかが軸ではない（起動する前に断られるべきである）ので、
+/// 存在するものなら何でもよい——存在しない綴りにすると
+/// 「宣言が食い違ったから断られた」と「実体が無いから起きなかった」が混ざる。
+const GIT_TRAP_DECOY_EXE: &str = r"C:\Windows\System32\where.exe";
+
+/// [残課題#39・測り方(c)] **別の出発点**のドメイン名。
+///
+/// ここから伸びる鎖は「他所の文脈のために宣言した辺」を表す。入口から伸びる鎖が
+/// その辺を**横取りできてしまうか**が測りたいことなので、**入口とは別の綴り**にする。
+const BORROWED_CHAIN_ORIGIN: &str = "borrowed";
 
 /// **敵対的なリポジトリをcloneした状態**をワークスペースに作る。
 ///
@@ -6390,8 +6545,9 @@ fn run_git_trap_arm(ws: &Path, case_name: &str, enforce: bool) -> Result<GitTrap
 ///
 /// # ここで測っていないもの（**外挿しないこと**）
 ///
-/// - **遷移の鎖（別ドメインへ渡る形）**。今日は遷移先を別ドメインにできない（残課題#45）ので、
-///   測れているのは**同じドメインの中での許否**までである
+/// - **遷移の鎖（別ドメインへ渡る形）**。ここが測っているのは**同じドメインの中での許否**まで
+///   である。跨ぐ形は[`the_git_config_trap_chain_is_judged_across_domains`]が測る
+///   （2026-09-20に足した。それまでは遷移先を別ドメインにできなかった＝残課題#45）
 /// - **`diff.external`以外の発火キー**（`core.editor`・`core.sshCommand`・`alias.*`…。
 ///   `docs/bugs/BUG-150.md`が14件挙げている）。遷移MACから見れば同じ1経路だが、**測っていない**
 /// - **CoWモード（`--sandbox tier2a-cow`）との組み合わせ**
@@ -7481,5 +7637,248 @@ fn what_a_realistic_session_needs_declared() {
         "測定が成立していない（{}件）:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+}
+
+/// **残課題#39の残り**: `.git/config`から発火する鎖を、**1段ごとに別のドメインへ渡る形**で
+/// 測る。2026-09-18の測定（§S64）は**同じドメインの中**までしか測れていなかった。
+///
+/// # なぜ今まで測れなかったのか
+///
+/// 別のドメインで子を起こすには、そのドメインの実体（専用のpackage SIDとcapabilityの組）が
+/// 要る。それを作る発行器が無かったので、別ドメインを指す辺は宣言できても**必ず断られた**
+/// （残課題#45／#55）。**2026-09-20に骨格が着地して、初めてこの形が撃てるようになった。**
+///
+/// # 何を測るのか（**「gitを禁止できるか」ではない**）
+///
+/// 同じ1手（`git -c safe.directory=* diff`）を、宣言を1段ずつ足しながら撃つ。
+/// 違いは**足す辺の`to`だけ**である。
+///
+/// ```text
+///   §S64（測り済み）: 入口 --git--> 入口 --git--> 入口 --findstr--> 入口
+///   ここ（新規）    : 入口 --git--> d0  --git--> d1  --findstr--> d2
+/// ```
+///
+/// 段ごとに別のドメインへ渡るので、**「どこから起こされたか」で許否が変わる**かどうかが
+/// 初めて見える。
+///
+/// # 対で撃つ（`B-35`）
+///
+/// 1. **許可側**: 鎖を全部宣言したら**発火する**。これが無いと、次の拒否側は
+///    「全部断る実装」でも緑になる。**別ドメインで起きた子が本当に動けるか**の確認でもある
+///    ——用意したドメインに積むのはセッション共通の土台だけなので、
+///    「起きたが何もできない」状態があり得る
+/// 2. **拒否側**: 最後の1歩だけ別のプログラムを宣言したら**発火しない**（測り方(a)）
+///
+/// # ここで測っていないもの（**外挿しない**）
+///
+/// - 測り方(c)（宣言を**辺の集合**として持っているか**経路の集合**として持っているか）は
+///   別の腕で撃つ。ここは鎖が跨げることだけを見る
+/// - `diff.external`以外の発火キー（[BUG-150](../../../docs/bugs/BUG-150.md)が14件挙げている）
+#[test]
+#[ignore = "starts several real Tier2a sessions with the transition MAC enforced; run through dev-elevated-run"]
+fn the_git_config_trap_chain_is_judged_across_domains() {
+    let ws = case_dir("git-config-chain");
+    plant_git_config_trap(&ws).unwrap_or_else(|e| panic!("仕掛けを置けなかった: {e}"));
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // --- 鎖を1段ずつ、別ドメインへ渡る形で宣言していく ---
+    let mut hops: Vec<String> = Vec::new();
+    let mut fired_at: Option<usize> = None;
+
+    for hop in 0..GIT_TRAP_MAX_HOPS {
+        declare_chain(&ws, &hops).unwrap_or_else(|e| panic!("段{hop}の宣言を書けなかった: {e}"));
+        let case_name = format!("git-chain-hop{hop}");
+        let arm = run_git_trap_arm(&ws, &case_name, true)
+            .unwrap_or_else(|e| panic!("段{hop}が測れなかった: {e}"));
+
+        if arm.fired {
+            fired_at = Some(hop);
+            break;
+        }
+
+        // **用意できなかったドメインへの遷移と、宣言が無い遷移を混ぜない。**
+        // 前者ならharness側の警告に理由が出ているはずで、宣言を足しても直らない。
+        if arm.text.contains("target_domain_not_provisioned") {
+            failures.push(format!(
+                "段{hop}: 遷移先ドメインの**実体を用意できていない**。宣言の不足ではないので、\
+                 段を足しても鎖は伸びない。起動時の警告に理由が出ている（`warning: transitions \
+                 into the domain ...`）。ここまでの鎖: {hops:?}／本文:\n{}",
+                arm.text
+            ));
+            break;
+        }
+
+        let mut newly: Vec<String> = Vec::new();
+        for exe in &arm.denied_by_daemon {
+            let known = hops
+                .iter()
+                .chain(newly.iter())
+                .any(|d| d.eq_ignore_ascii_case(exe));
+            if !known {
+                newly.push(exe.clone());
+            }
+        }
+        if newly.is_empty() {
+            failures.push(format!(
+                "段{hop}: 発火は止まったが、**待ち行列に新しい拒否が1件も無い**。\
+                 止めたのがDaemonではない（カーネルが止めたが購読者が居ない）か、\
+                 そもそも生成が起きていない。ここまでの鎖: {hops:?}／本文:\n{}",
+                arm.text
+            ));
+            break;
+        }
+        // **1段につき1本だけ伸ばす。** 2本以上を同じ段へ足すと、その段の遷移元が
+        // どちらのドメインなのかが決まらない（鎖ではなく木になる）。
+        if newly.len() > 1 {
+            eprintln!(
+                "[git-chain] 段{hop}: 同じ段で{}件断られた。鎖として測れるのは1本ずつなので、\
+                 先頭（{}）だけを足す: {newly:?}",
+                newly.len(),
+                newly[0]
+            );
+        }
+        hops.push(newly[0].clone());
+    }
+
+    // **軸が振れたことを、発火した構成そのもので確かめる**（`measurement-review`検問3）。
+    assert_chain_crosses_domains(&ws, "鎖");
+
+    let fired_at = match fired_at {
+        Some(hop) => hop,
+        None => {
+            panic!(
+                "**鎖が別ドメインを跨いで伸びなかった。** {GIT_TRAP_MAX_HOPS}段まで宣言しても\
+                 発火していない。ここまでの鎖: {hops:?}／積み上がった失敗: {failures:?}"
+            );
+        }
+    };
+
+    // --- 許可側の確認（対の片方。`B-35`） ---
+    assert!(
+        fired_at > 0,
+        "段0（宣言が1本も無い状態）で発火した。遷移MACが`.git/config`から発火した子を\
+         1つも止めていない"
+    );
+    eprintln!("[git-chain] 鎖は{fired_at}段で発火した: {hops:?}");
+
+    // --- 拒否側: **最後の1歩だけ別のプログラム**にする（測り方(a)） ---
+    //
+    // 鎖の手前は同じまま、最後の段の遷移先で**別のプログラムを宣言する**。
+    // 経路の最後が食い違うだけで止まるはずである。
+    let mut altered = hops.clone();
+    let real_last = altered.pop().expect("鎖は1段以上ある");
+    altered.push(GIT_TRAP_DECOY_EXE.to_string());
+    declare_chain(&ws, &altered).unwrap_or_else(|e| panic!("拒否側の宣言を書けなかった: {e}"));
+    let refused_arm = run_git_trap_arm(&ws, "git-chain-last-hop-swapped", true)
+        .unwrap_or_else(|e| panic!("拒否側が測れなかった: {e}"));
+    if refused_arm.fired {
+        failures.push(format!(
+            "**最後の1歩を別のプログラム（{GIT_TRAP_DECOY_EXE}）に差し替えても発火した。**\
+             経路の最後が食い違っているのに通っている——宣言した綴りと実際に起きたものが\
+             別々に判定されている（本当に起きたのは {real_last}）。本文:\n{}",
+            refused_arm.text
+        ));
+    }
+    // **止めたのが遷移MACであることを、断った当人（Daemon）の記録で言う。**
+    //
+    // gitのstderrの綴りでは判定しない——同じ拒否でも、**鎖のどこで断られたかによって
+    // 文面が変わる**。段0ではフックが`ERROR_ACCESS_DENIED`を返すので`Access is denied`だが、
+    // 最後の段で断られると**gitが自分の言葉に訳して**`Permission denied`と出す
+    // （2026-09-20に実測。この腕は最初そこで赤くなった——**機構は効いていたのに、
+    // 計器が別の綴りを探していた**）。
+    let refused_the_real_last = refused_arm
+        .denied_by_daemon
+        .iter()
+        .any(|exe| exe.eq_ignore_ascii_case(&real_last));
+    if !refused_the_real_last {
+        failures.push(format!(
+            "拒否側: 発火はしていないが、**Daemonの待ち行列に{real_last}を断った記録が無い**。\
+             止めたのが遷移MACだと言えない（カーネルが止めたが購読者が居ない／そもそも\
+             生成が起きていない、のどちらか）。断った一覧: {:?}／本文:\n{}",
+            refused_arm.denied_by_daemon, refused_arm.text
+        ));
+    }
+
+    // --- 測り方(c): 宣言は**辺の集合**か、**経路の集合**か ---
+    //
+    // # これが無いと何が素通りするか
+    //
+    // ここまでの2本（発火する／最後を差し替えると止まる）は、**どちらの実装でも同じ結果になる**。
+    // 判別するには、同じプログラムへの辺を**別の出発点から**宣言しておいて、
+    // こちらの経路では宣言していない状態で撃つ。
+    //
+    // ```text
+    //   正しい鎖1（入口から）: 入口 --g0--> d0  --g1--> d1  --囮--> d2
+    //   正しい鎖2（別の所から）:  x  --g1--> xd0 --g2--> xd1
+    //   実際に走るのは          : 入口 --g0--> g1 --g2-->  ← 最後の1歩はd1から出る
+    // ```
+    //
+    // `d1`は`g2`への辺を持たない。持っているのは`xd0`である。
+    // **辺の集合として持っているなら通り、経路の集合として持っているなら断られる。**
+    //
+    // # ここが「鎖が本当に跨いでいる」ことの証拠でもある
+    //
+    // 上の2本は、判定器が全部を1つのドメインへ畳んでいても同じ結果になる
+    // （§S64の自己ループの測定と見分けが付かない）。この腕が拒否側で成立して初めて、
+    // **遷移元のドメインによって答えが変わっている**と言える。
+    if hops.len() >= 3 {
+        let mut file = harness_policy::policy_file::PolicyFile::default();
+        // 鎖1: 入口から。**最後の1歩だけ囮**にして、`g2`への辺をこちら側から消す。
+        let mut chain_one = hops.clone();
+        let last = chain_one.pop().expect("3段以上ある");
+        chain_one.push(GIT_TRAP_DECOY_EXE.to_string());
+        add_chain(
+            &mut file,
+            &chain_one,
+            harness_policy::policy_file::ENTRY_DOMAIN,
+        )
+        .unwrap_or_else(|e| panic!("(c)の鎖1を組めなかった: {e}"));
+        // 鎖2: **別の出発点**から、`g1 → g2`をそのまま宣言する。
+        add_chain(&mut file, &hops[hops.len() - 2..], BORROWED_CHAIN_ORIGIN)
+            .unwrap_or_else(|e| panic!("(c)の鎖2を組めなかった: {e}"));
+        harness_policy::policy_file::save(&ws, &file)
+            .unwrap_or_else(|e| panic!("(c)の宣言を書けなかった: {e}"));
+        assert_chain_crosses_domains(&ws, "(c)");
+
+        let borrowed = run_git_trap_arm(&ws, "git-chain-borrowed-edge", true)
+            .unwrap_or_else(|e| panic!("(c)が測れなかった: {e}"));
+        if borrowed.fired {
+            failures.push(format!(
+                "**(c) 別の出発点のために宣言した辺を横取りできた。** `{last}`への辺を\
+                 宣言しているのは`{BORROWED_CHAIN_ORIGIN}`から伸びる鎖だけなのに、\
+                 入口から伸びる鎖の途中から使えている——宣言を**辺の集合**として持っており、\
+                 遷移元のドメインを見ていない。本文:\n{}",
+                borrowed.text
+            ));
+        }
+        let refused_here = borrowed
+            .denied_by_daemon
+            .iter()
+            .any(|exe| exe.eq_ignore_ascii_case(&last));
+        if !refused_here {
+            failures.push(format!(
+                "(c): 発火はしていないが、**`{last}`を断った記録が無い**。\
+                 止めたのが遷移MACだと言えない。断った一覧: {:?}／本文:\n{}",
+                borrowed.denied_by_daemon, borrowed.text
+            ));
+        }
+        eprintln!(
+            "[git-chain] (c) 横取り: fired={} 断った一覧={:?}",
+            borrowed.fired, borrowed.denied_by_daemon
+        );
+    } else {
+        failures.push(format!(
+            "(c)を撃てなかった: 鎖が{}段しかない（3段以上が要る）。鎖: {hops:?}",
+            hops.len()
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "残課題#39（鎖・別ドメイン）で{}件の問題が出た:\n- {}",
+        failures.len(),
+        failures.join("\n- ")
     );
 }
