@@ -103,7 +103,31 @@ pub fn emit(text: &str) -> Value {
         "wrote": text,
         "ok": ok,
         "identity": crate::winid::collect_identity(),
+        // **自分が受け取ったコマンドラインの生値。**
+        //
+        // §8.2は「判定に使う入力と起動に使う入力は同一でなければならない」と定めているが、
+        // **判定した側の記録だけでは「子に何が届いたか」は言えない**（`B-33`: 他人の
+        // 成功報告を根拠にしない）。ここが子自身の目で見た値である。
+        //
+        // `std::env::args()`ではなく`GetCommandLineW`を読むのは、**Rustの側で1度
+        // 分解されたものではなく、OSが持っている文字列そのもの**が要るためである。
+        "command_line": command_line_of_this_process(),
+        // 分解後の並びも一緒に出す。**生の1本とどちらが化けたかを分けられる。**
+        "argv": std::env::args().collect::<Vec<_>>(),
     })
+}
+
+/// このプロセスのコマンドライン（OSが持っている生の1本）。
+#[cfg(windows)]
+fn command_line_of_this_process() -> String {
+    // SAFETY: `GetCommandLineW`はプロセス内の静的な文字列を指すポインタを返す。
+    unsafe { windows::Win32::System::Environment::GetCommandLineW().to_string() }
+        .unwrap_or_else(|e| format!("<could not read: {e}>"))
+}
+
+#[cfg(not(windows))]
+fn command_line_of_this_process() -> String {
+    std::env::args().collect::<Vec<_>>().join(" ")
 }
 
 /// §20項目3: `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`だけのプロセスハンドルで、

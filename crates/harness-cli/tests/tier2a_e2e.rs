@@ -7949,19 +7949,25 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
         .unwrap_or_else(|e| panic!("遷移の宣言を書けなかった: {e}"));
     assert_chain_crosses_domains(&ws, "狭まり", 1);
 
-    // PowerShellはパス区切りに`/`を受ける。3段（Rust・シェル・PowerShell）で
-    // バックスラッシュを重ねるとエスケープ事故になるので`/`で書く（既存のfs-allowの腕と同じ）。
-    let out_dir = outside.display().to_string().replace('\\', "/");
-    let in_dir = ws.display().to_string().replace('\\', "/");
+    // **`findstr`へ渡すパスは`\`区切りにする**（2026-09-20に踏んだ）。
+    //
+    // `/`区切りで渡すと、`findstr`は**権限があっても開けない**——`/`で始まるトークンを
+    // 自分のオプションとして食うためである。同じ回で区切りだけを変えて確かめた:
+    // 鍵を持たせた構成で、`/`区切りは失敗（終了コード1）、`\`区切りは**成功**（0）した。
+    // **`/`のままだと、測っているのは権限ではなく`findstr`の引数解析になる。**
+    //
+    // `Get-Content`（シェル自身）はどちらの区切りでも同じなので、そちらは影響を受けない。
+    let out_dir = outside.display().to_string();
+    let in_dir = ws.display().to_string();
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
-         $a = Get-Content -LiteralPath '{out_dir}/secret.txt' -Raw; \
+         $a = Get-Content -LiteralPath '{out_dir}\\secret.txt' -Raw; \
          Write-Output ('SHELL_OUTSIDE=' + $(if ($a) {{'OK'}} else {{'DENIED'}})); \
-         $b = Get-Content -LiteralPath '{in_dir}/inside.txt' -Raw; \
+         $b = Get-Content -LiteralPath '{in_dir}\\inside.txt' -Raw; \
          Write-Output ('SHELL_INSIDE=' + $(if ($b) {{'OK'}} else {{'DENIED'}})); \
-         findstr /c:{MARKER} '{out_dir}/secret.txt' | Out-Null; \
+         findstr /c:{MARKER} '{out_dir}\\secret.txt' | Out-Null; \
          Write-Output ('CHILD_OUTSIDE_RC=' + $LASTEXITCODE); \
-         findstr /c:{MARKER} '{in_dir}/inside.txt' | Out-Null; \
+         findstr /c:{MARKER} '{in_dir}\\inside.txt' | Out-Null; \
          Write-Output ('CHILD_INSIDE_RC=' + $LASTEXITCODE)"
     );
 
@@ -8049,8 +8055,8 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
             .lines()
             .any(|l| l.trim_start().starts_with("FINDSTR:") && l.contains(path))
     };
-    let outside_file = format!("{out_dir}/secret.txt");
-    let inside_file = format!("{in_dir}/inside.txt");
+    let outside_file = format!("{out_dir}\\secret.txt");
+    let inside_file = format!("{in_dir}\\inside.txt");
     if !cannot_open(&outside_file) {
         failures.push(format!(
             "遷移先の子が外のファイルを**開けなかったと言っていない**（終了コード{child_outside}）。             `findstr`は「見つからない」でも1を返すので、             **これだけでは「読めなかった」と言えない**: {outside_file}"
@@ -8156,21 +8162,24 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
             eprintln!(
                 "[narrowing] 反転の対照（遷移先にも同じ鍵）: 外のRC={flipped_rc} 開けない行={flipped_cannot_open}"
             );
-            // **ここはまだ対照になっていない**（2026-09-20）。宣言を足した回だけ、
-            // 子が受け取るパスが`C:secret.txt`へ化ける——中の区間が落ちた形で、
-            // **読めなかった理由が「鍵が無い」なのか「別のファイルを開きに行った」なのかを
-            // 分けられない**。だから**落とさずに観測として出す**
-            // （`B-10`: 測れなかったことを測れたことにしない）。
+            // **1ビットだけ変えて反転すること**が、狭さの機序を言い切れる唯一の根拠である。
             //
-            // **本体（上の4升）はこれに依存していない。** あちらは宣言を足していない構成で、
-            // 子は正しいパスを受け取っている（`FINDSTR:`の行にフルパスが出る）。
+            // 上の4升だけだと「遷移先が狭いから読めない」と「遷移先には**そもそも鍵を渡す道が
+            // 無い**から読めない」を区別できない。**同じ台本のまま宣言を1つ足すだけで読める**なら、
+            // 読めなかった理由は「その鍵を持っていなかったこと」だと言える。
+            //
+            // **2026-09-20に初めて取れた。** それまでは`findstr`へ`/`区切りのパスを渡していて、
+            // **鍵があっても開けなかった**（`findstr`が`/`で始まるトークンを自分のオプションとして
+            // 食う）。区切りを`\`へ直したらこの腕が反転した。
             if flipped_cannot_open || flipped_rc != "0" {
-                eprintln!(
-                    "[narrowing] 反転の対照は**取れていない**: 遷移先に同じ鍵を宣言しても\
-                     読めないままだが、子が受け取るパスが化けているので理由を分けられない。\
+                failures.push(format!(
+                    "反転の対照: 遷移先に**同じ鍵を宣言しても読めないまま**である\
+                     （RC={flipped_rc}、開けない行={flipped_cannot_open}）。\
+                     **上の「読めなかった」を「鍵が無いから」と言い切れない**\
+                     ——遷移先には鍵を渡す道そのものが無い可能性が残る。\
                      起動時の警告:\n{}",
                     flipped.harness_stderr
-                );
+                ));
             }
         }
     }
