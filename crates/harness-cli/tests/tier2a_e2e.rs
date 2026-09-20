@@ -5904,8 +5904,16 @@ fn declare_programs(ws: &Path, exes: &[String]) -> Result<(), String> {
 /// たとえば鎖を組む側が`to`を入口ドメインのまま書いていても、**発火する腕は同じように
 /// 発火する**——§S64（自己ループで測ったもの）と見分けが付かない。
 ///
-/// 見るのは2つ。**どの辺も自分のドメインへは戻らない**ことと、**遷移先が1種類ではない**こと。
-fn assert_chain_crosses_domains(ws: &Path, case_name: &str) {
+/// 見るのは2つ。**どの辺も自分のドメインへは戻らない**ことと、
+/// **遷移先が`min_targets`種類以上ある**ことである。
+///
+/// # なぜ本数を呼び出し側から渡すのか
+///
+/// 「何種類あれば跨いだと言えるか」は**測る形で変わる**。鎖を何段も伸ばす腕なら2種類以上で
+/// なければ鎖になっていないが、**1段しか宣言しない腕もある**（遷移先が呼び出し元より狭いかを
+/// 見る腕）。ここで2を決め打ちすると、**正しく跨いでいる1段の腕が赤くなる**
+/// ——2026-09-20に実際に赤くした。
+fn assert_chain_crosses_domains(ws: &Path, case_name: &str, min_targets: usize) {
     let policy = harness_policy::policy_file::load(ws)
         .unwrap_or_else(|e| panic!("{case_name}: 書いたばかりの宣言を読み返せない: {e}"));
     let mut targets: Vec<String> = Vec::new();
@@ -5923,10 +5931,9 @@ fn assert_chain_crosses_domains(ws: &Path, case_name: &str) {
         }
     }
     assert!(
-        targets.len() >= 2,
-        "{case_name}: 遷移先が{}種類しかない。鎖が1段で終わっているか、\
-         すべて同じドメインへ集まっている——どちらでも「1段ごとに別のドメインへ渡る」\
-         形にはなっていない: 遷移先={targets:?}",
+        targets.len() >= min_targets,
+        "{case_name}: 遷移先が{}種類しかない（{min_targets}種類以上を期待）。\
+         鎖が途中で終わっているか、すべて同じドメインへ集まっている: 遷移先={targets:?}",
         targets.len()
     );
 }
@@ -7743,7 +7750,7 @@ fn the_git_config_trap_chain_is_judged_across_domains() {
     }
 
     // **軸が振れたことを、発火した構成そのもので確かめる**（`measurement-review`検問3）。
-    assert_chain_crosses_domains(&ws, "鎖");
+    assert_chain_crosses_domains(&ws, "鎖", 2);
 
     let fired_at = match fired_at {
         Some(hop) => hop,
@@ -7840,7 +7847,7 @@ fn the_git_config_trap_chain_is_judged_across_domains() {
             .unwrap_or_else(|e| panic!("(c)の鎖2を組めなかった: {e}"));
         harness_policy::policy_file::save(&ws, &file)
             .unwrap_or_else(|e| panic!("(c)の宣言を書けなかった: {e}"));
-        assert_chain_crosses_domains(&ws, "(c)");
+        assert_chain_crosses_domains(&ws, "(c)", 2);
 
         let borrowed = run_git_trap_arm(&ws, "git-chain-borrowed-edge", true)
             .unwrap_or_else(|e| panic!("(c)が測れなかった: {e}"));
@@ -7881,4 +7888,302 @@ fn the_git_config_trap_chain_is_judged_across_domains() {
         failures.len(),
         failures.join("\n- ")
     );
+}
+
+/// [残課題#39・§S73の宿題] **遷移先ドメインは、呼び出し元より狭いか。**
+///
+/// # 何が分からなかったのか
+///
+/// §S73は「鎖が別のドメインを跨いで判定される」ことまで測ったが、
+/// **そこで言えたのは「別のドメインとして判定された」までだった**。
+/// 遷移先は宣言を1件も持たないので、積まれるのは**セッション共通の土台**
+/// （祖先traverse・spawn要求・workspace・Redirector DLL）だけで、入口と権限が等しい。
+/// **権限が実際に狭いことは1度も測っていない。**
+///
+/// # 測り方——呼び出し元にだけある鍵を1つ作る
+///
+/// `--fs-allow`でワークスペースの**外**のディレクトリを1つ開ける。この許可は
+/// 宣言ごとのcapability SID宛に書かれ（D-54・§22.3）、**セッションのトークンには載るが、
+/// 遷移先ドメインの土台には載らない**（`domain_provision::capability_sids_for`は
+/// そのドメイン自身の宣言しか引かない）。したがって予測はこうなる。
+///
+/// | 読む相手 | 入口ドメイン（シェル自身） | 遷移先ドメイン（`findstr`） |
+/// |---|---|---|
+/// | **外**のファイル（`--fs-allow`で開けた） | 読める | **読めない** ← 狭まりの証拠 |
+/// | ワークスペースの中のファイル | 読める | **読める** ← 「何も読めない」ではない |
+///
+/// # 4つ全部を同じ回で撃つ（`B-35`）
+///
+/// **右下が無いと、この測定は何も言わない。** 遷移先の子が
+/// 「起きたが何も読めない」状態（土台を積み忘れた・そもそも走っていない）でも、
+/// 右上は同じ「読めない」になる。**狭いことと、壊れていることを分けるのが右下である。**
+///
+/// **左側（入口ドメイン）が対照になる。** 外のファイルが誰からも読めないなら、
+/// 測っているのは`--fs-allow`が効いていないことであって、ドメインの狭さではない。
+///
+/// # 子が読めなかった理由を取り違えない
+///
+/// `findstr`が失敗する理由は2つある——**遷移MACに断られた**（宣言が無い）か、
+/// **起きたがファイルを開けなかった**（ACLで拒否された）か。前者なら待ち行列に載るので、
+/// **待ち行列に`findstr`が載っていないこと**を同じ回で確かめる。
+/// 載っていれば測っているのは狭さではなく宣言漏れである。
+#[test]
+#[ignore = "grants a real fs-allow ACE and starts Tier2a sessions; run through dev-elevated-run"]
+fn a_transition_target_domain_is_narrower_than_the_caller() {
+    let _ledger = fs_ledger_exclusive();
+    let ws = case_dir("domain-narrowing");
+    let outside = fs_allow_case_dir("narrowing");
+
+    const MARKER: &str = "NARROWINGMARKER";
+    std::fs::write(outside.join("secret.txt"), format!("{MARKER}\n"))
+        .unwrap_or_else(|e| panic!("外のファイルを置けなかった: {e}"));
+    std::fs::write(ws.join("inside.txt"), format!("{MARKER}\n"))
+        .unwrap_or_else(|e| panic!("中のファイルを置けなかった: {e}"));
+
+    let findstr = format!(
+        r"{}\System32\findstr.exe",
+        std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())
+    );
+    // 遷移先は**宣言を1件も持たない**（持たせると用意できず、測っているものが変わる）。
+    declare_chain(&ws, &[findstr.clone()])
+        .unwrap_or_else(|e| panic!("遷移の宣言を書けなかった: {e}"));
+    assert_chain_crosses_domains(&ws, "狭まり", 1);
+
+    // PowerShellはパス区切りに`/`を受ける。3段（Rust・シェル・PowerShell）で
+    // バックスラッシュを重ねるとエスケープ事故になるので`/`で書く（既存のfs-allowの腕と同じ）。
+    let out_dir = outside.display().to_string().replace('\\', "/");
+    let in_dir = ws.display().to_string().replace('\\', "/");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $a = Get-Content -LiteralPath '{out_dir}/secret.txt' -Raw; \
+         Write-Output ('SHELL_OUTSIDE=' + $(if ($a) {{'OK'}} else {{'DENIED'}})); \
+         $b = Get-Content -LiteralPath '{in_dir}/inside.txt' -Raw; \
+         Write-Output ('SHELL_INSIDE=' + $(if ($b) {{'OK'}} else {{'DENIED'}})); \
+         findstr /c:{MARKER} '{out_dir}/secret.txt' | Out-Null; \
+         Write-Output ('CHILD_OUTSIDE_RC=' + $LASTEXITCODE); \
+         findstr /c:{MARKER} '{in_dir}/inside.txt' | Out-Null; \
+         Write-Output ('CHILD_INSIDE_RC=' + $LASTEXITCODE)"
+    );
+
+    let allow = format!(r"{}\**", outside.display());
+    let arm = run_arm_collecting_denials(
+        &ws,
+        "domain-narrowing",
+        true,
+        &script,
+        "narrowing",
+        &["--fs-allow".to_string(), allow.clone()],
+    )
+    .unwrap_or_else(|e| panic!("腕が測れなかった: {e}"));
+
+    // **子が遷移MACに断られていないこと。** 断られていたら、測っているのは狭さではなく宣言漏れ。
+    let refused_by_mac = arm
+        .denied_by_daemon
+        .iter()
+        .any(|exe| exe.eq_ignore_ascii_case(&findstr));
+    assert!(
+        !refused_by_mac,
+        "`findstr`が遷移MACに断られている。**この回は狭さを測っていない**——\
+         宣言（{findstr}）が効いていないので、子はそもそも起きていない。\
+         断った一覧: {:?}／本文:\n{}",
+        arm.denied_by_daemon, arm.text
+    );
+
+    // `findstr`の終了コード: 0=見つかった（＝読めた）、1=見つからない、2=開けない。
+    let cell = |key: &str| -> String {
+        arm.text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(key).map(str::to_string))
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{key}`の行が本文に無い。台本が最後まで走っていない:\n{}",
+                    arm.text
+                )
+            })
+    };
+    let shell_outside = cell("SHELL_OUTSIDE=");
+    let shell_inside = cell("SHELL_INSIDE=");
+    let child_outside = cell("CHILD_OUTSIDE_RC=");
+    let child_inside = cell("CHILD_INSIDE_RC=");
+    eprintln!(
+        "[narrowing] シェル(入口): 外={shell_outside} 中={shell_inside}／\
+         子(遷移先): 外のRC={child_outside} 中のRC={child_inside}"
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // --- 左列: 入口ドメインは両方読める（対照） ---
+    if shell_outside != "OK" {
+        failures.push(format!(
+            "入口ドメインが**外のファイルを読めていない**（{shell_outside}）。\
+             `--fs-allow`が効いていないので、この回は狭さを測っていない\
+             ——「誰も読めない」と「遷移先だけ読めない」が区別できない"
+        ));
+    }
+    if shell_inside != "OK" {
+        failures.push(format!(
+            "入口ドメインが**ワークスペースの中も読めていない**（{shell_inside}）。\
+             セッションそのものが壊れている"
+        ));
+    }
+
+    // --- 右下: 遷移先はワークスペースを読める（「何も読めない」ではないことの証拠） ---
+    if child_inside != "0" {
+        failures.push(format!(
+            "遷移先ドメインの子が**ワークスペースの中も読めていない**（終了コード{child_inside}）。\
+             **この回の「外が読めない」は狭さの証拠にならない**——土台（workspace capability）が\
+             積まれていないか、子が走っていないだけかもしれない"
+        ));
+    }
+
+    // --- 右上: 本体。遷移先は外を**開けない** ---
+    //
+    // **終了コードだけで判定しない。** `findstr`は「見つからなかった」も「開けなかった」も
+    // **1**を返す（2026-09-20に実測。2ではない）。前者なら**読めている**ので、
+    // 混ぜると結論が反転する。開けなかったときだけ出る`FINDSTR:`の行で決める。
+    //
+    // **文面では照合しない**——このメッセージは地域化される（この機械では
+    // 「開くことができません」）。`FINDSTR:`の接頭辞と**パス**だけを見る。
+    let cannot_open = |path: &str| -> bool {
+        arm.text
+            .lines()
+            .any(|l| l.trim_start().starts_with("FINDSTR:") && l.contains(path))
+    };
+    let outside_file = format!("{out_dir}/secret.txt");
+    let inside_file = format!("{in_dir}/inside.txt");
+    if !cannot_open(&outside_file) {
+        failures.push(format!(
+            "遷移先の子が外のファイルを**開けなかったと言っていない**（終了コード{child_outside}）。             `findstr`は「見つからない」でも1を返すので、             **これだけでは「読めなかった」と言えない**: {outside_file}"
+        ));
+    }
+    // **対**: 中のファイルでは同じ行が出ないこと。出ていたら、子は何も開けていない
+    // ——「狭いから開けない」ではなく「壊れていて開けない」である。
+    if cannot_open(&inside_file) {
+        failures.push(format!(
+            "遷移先の子が**ワークスペースの中も開けていない**。             外が開けないのは狭さの証拠にならない: {inside_file}"
+        ));
+    }
+    if child_outside == "0" {
+        failures.push(format!(
+            "**遷移先ドメインが、呼び出し元にしか無いはずの許可で外のファイルを読めた。**\
+             宣言ごとのcapabilityが遷移先の土台へ漏れている——ドメインを分けても\
+             **権限は1ビットも狭まっていない**（§10.1.2が却下した形と同じ結果）"
+        ));
+    }
+
+    // --- 反転の対照: **遷移先に同じ鍵を渡すと、読めるようになるか** ---
+    //
+    // # これが無いと何が言えないか
+    //
+    // 上の4升だけだと、「遷移先が狭いから読めない」と「遷移先には**そもそも鍵を渡す道が無い**
+    // から読めない」を区別できない。**同じ台本のまま、宣言を1つ足すだけで反転する**なら、
+    // 読めなかった理由は「その鍵を持っていなかったこと」だと言い切れる。
+    //
+    // 骨格は**既に許可済みの宣言しか引かない**ので、`--fs-allow`で開けたのと同じパスを
+    // 遷移先ドメイン自身の宣言に書けば引けるはずである
+    // （`domain_provision::capability_sids_for`）。**この経路が端から端まで通るのは初めて**で、
+    // 単体テストは「引けなければ用意しない」側しか測っていない。
+    {
+        let mut file = harness_policy::policy_file::PolicyFile::default();
+        add_edge(
+            &mut file,
+            harness_policy::policy_file::ENTRY_DOMAIN,
+            &findstr,
+            "d0",
+        )
+        .unwrap_or_else(|e| panic!("反転の対照の辺を組めなかった: {e}"));
+        // **両側に同じ宣言を置く。** 遷移先にだけ書くと、編集時検査が
+        // 「権限が広がる（または狭まることを証明できない）辺」として**宣言ごと拒否する**
+        // ——2026-09-20に実際に拒否された。検査が見るのは`policy.json`の宣言だけで、
+        // `--fs-allow`で入口側へ渡した鍵は**そこに現れない**ので、遷移先にだけ書くと
+        // 片側だけが広いように読める。
+        //
+        // 入口側の宣言は**この回の挙動を1ビットも変えない**——harness本体はまだ
+        // `policy.json`の`fs`を使わないので（残課題#30）、入口の鍵は`--fs-allow`由来のままである。
+        //
+        // **級は`read_exec`である。** `--fs-allow <path>`（`:rw`無し）が台帳へ登録する級は
+        // `FsAccess::ReadExec`で、`read`ではない（`startup/sandbox.rs`の分岐）。
+        // `fs.read`で宣言すると鍵の3軸（ワークスペース・パス・級）の級が合わず、
+        // **許可済みなのに引けない**——2026-09-20に実際にそれで用意できなかった。
+        let declared = format!(r"{}\**", outside.display());
+        for name in [harness_policy::policy_file::ENTRY_DOMAIN, "d0"] {
+            file.domains
+                .iter_mut()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("ドメイン{name}が宣言に無い"))
+                .fs
+                .read_exec
+                .push(declared.clone());
+        }
+        harness_policy::policy_file::save(&ws, &file)
+            .unwrap_or_else(|e| panic!("反転の対照の宣言を書けなかった: {e}"));
+
+        let flipped = run_arm_collecting_denials(
+            &ws,
+            "domain-narrowing-flipped",
+            true,
+            &script,
+            "narrowing",
+            &["--fs-allow".to_string(), allow.clone()],
+        )
+        .unwrap_or_else(|e| panic!("反転の対照が測れなかった: {e}"));
+
+        // **用意できなかったなら、それは別の事実である。** 「狭いまま」と混ぜない。
+        // **用意できなかったことは、起動時の警告で見る。** 本文に出るのは分類器が訳した
+        // 文面（「harness未実装」）なので、生の理由の綴りを探しても当たらない
+        // ——2026-09-20にそれで素通りした。
+        if flipped.harness_stderr.contains("will be refused") {
+            failures.push(format!(
+                "反転の対照: 遷移先ドメインを**用意できなかった**ので、反転するかを測れていない。\
+                 宣言したパスが許可済みとして引けていない（鍵の綴りか級が合っていない）。\
+                 起動時の警告:\n{}",
+                flipped.harness_stderr
+            ));
+        } else {
+            let flipped_rc = flipped
+                .text
+                .lines()
+                .find_map(|l| {
+                    l.trim()
+                        .strip_prefix("CHILD_OUTSIDE_RC=")
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let flipped_cannot_open = flipped
+                .text
+                .lines()
+                .any(|l| l.trim_start().starts_with("FINDSTR:") && l.contains(&outside_file));
+            eprintln!(
+                "[narrowing] 反転の対照（遷移先にも同じ鍵）: 外のRC={flipped_rc} 開けない行={flipped_cannot_open}"
+            );
+            // **ここはまだ対照になっていない**（2026-09-20）。宣言を足した回だけ、
+            // 子が受け取るパスが`C:secret.txt`へ化ける——中の区間が落ちた形で、
+            // **読めなかった理由が「鍵が無い」なのか「別のファイルを開きに行った」なのかを
+            // 分けられない**。だから**落とさずに観測として出す**
+            // （`B-10`: 測れなかったことを測れたことにしない）。
+            //
+            // **本体（上の4升）はこれに依存していない。** あちらは宣言を足していない構成で、
+            // 子は正しいパスを受け取っている（`FINDSTR:`の行にフルパスが出る）。
+            if flipped_cannot_open || flipped_rc != "0" {
+                eprintln!(
+                    "[narrowing] 反転の対照は**取れていない**: 遷移先に同じ鍵を宣言しても\
+                     読めないままだが、子が受け取るパスが化けているので理由を分けられない。\
+                     起動時の警告:\n{}",
+                    flipped.harness_stderr
+                );
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "狭まりの測定で{}件の問題が出た:\n- {}\n本文:\n{}",
+        failures.len(),
+        failures.join("\n- "),
+        arm.text
+    );
+
+    // **測定のために作った外のディレクトリは自分で掃く**（`measurement-review`検問11）。
+    // 消すとその配下のACEも一緒に消える。
+    let _ = std::fs::remove_dir_all(&outside);
 }

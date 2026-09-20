@@ -155,6 +155,25 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "the_git_config_trap_chain_is_judged_across_domains",
         ],
     ),
+    // [§S73の宿題] 遷移先ドメインが呼び出し元より**狭い**ことを測る。§S73が測れたのは
+    // 「別のドメインとして判定された」までで、**権限が狭いことは1度も測っていなかった**
+    // ——遷移先は宣言を持たないので、積まれるのはセッション共通の土台だけだからである。
+    //
+    // **実ACL（`--fs-allow`）を1本書くので、他の的と混ぜない**（台帳を触る腕は直列化が要る）。
+    (
+        "e2e-domain-narrowing",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "a_transition_target_domain_is_narrower_than_the_caller",
+        ],
+    ),
     // [⑤を既定へ入れる準備①] **既定の遷移宣言一式の一次データ**を測る。実務に近い台本を
     // 旗つきで回し、宣言を0本から足しながら**断られたものの一覧**を数える
     // （`plans/DESIGN-MAC-ENFORCEMENT.md`が「旗を立てた回に何が断られるかを数えることが
