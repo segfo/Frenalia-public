@@ -89,7 +89,12 @@ fn a_command_started_during_the_recording_becomes_a_candidate() {
 
     let mut session = super::client::CollectorSession::new();
     let started = session
-        .start(None, false, policy_for(workspace.path(), &sink_dir, true))
+        .start(
+            None,
+            false,
+            policy_for(workspace.path(), &sink_dir, true),
+            None,
+        )
         .expect("start the collector with argv capture");
     assert!(
         started.etw_available,
@@ -169,6 +174,7 @@ fn a_recording_is_refused_when_no_system_logger_slot_is_left() {
                 None,
                 false,
                 policy_for(control_ws.path(), &control_sink, true),
+                None,
             )
             .expect(
                 "枠が空いている状態でも記録を始められない。断りの原因が「枠が無いこと」だと\
@@ -210,7 +216,12 @@ fn a_recording_is_refused_when_no_system_logger_slot_is_left() {
     std::fs::create_dir_all(&sink_dir).expect("create sink dir");
 
     let mut session = super::client::CollectorSession::new();
-    let result = session.start(None, false, policy_for(workspace.path(), &sink_dir, true));
+    let result = session.start(
+        None,
+        false,
+        policy_for(workspace.path(), &sink_dir, true),
+        None,
+    );
 
     // **必ず片付けてから判定する**（assertで抜けても枠を返す）。
     for hog in hogs {

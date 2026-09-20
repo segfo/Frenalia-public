@@ -1384,6 +1384,8 @@ fn run_pass2<'a>(
         learn_prelude,
         learn_chain_attempted,
         learn_policy,
+        // [BUG-098] daemonが黙って死んでいたときに、その場で連鎖起動を依頼できるようにする。
+        Some(request.wfp),
     ) {
         Ok(collecting) => {
             // **起きた事実はここで確定させる**（この後に失敗しても消えない、`Pass2Facts`のdoc）。

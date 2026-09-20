@@ -279,6 +279,13 @@ pub fn start(policy: LearnPolicy) -> Result<PolicyLearnHandle, LearnError> {
     }
 }
 
+/// [BUG-098] 常駐WFP daemonへ「収集器をこのパイプ名で起こしてくれ」と頼む口。
+///
+/// パイプ名を渡し、成否を返すだけ。**依頼の実体は上位のクレートが持つ**（この`policy_learnd`は
+/// netfilterdのセッション型を知らないし、知るべきでもない）ので、閉包で受け取る。
+/// 失敗は人が読む文字列で返る——ここで分岐する側はおらず、警告に載せるだけである。
+pub type ChainLaunch<'a> = dyn Fn(&str) -> Result<(), String> + 'a;
+
 /// 収集器daemonを**プロセスの寿命で**持つ（D-56 段階2）。netfilterdの`NetfilterSession`と同型。
 ///
 /// 「生きているなら`StartCollect`を再送、無ければ起こす」「記録の切れ目で`StopCollect`」
@@ -312,17 +319,41 @@ impl CollectorSession {
     /// 収集を開始する。生きているdaemonがあれば`StartCollect`を再送するだけ、無ければ起こす。
     ///
     /// `prelude`/`chain_attempted`は**daemonを起こす場合にだけ**使う（netfilterdが連鎖起動を
-    /// 試みたシナリオA／自分で`runas`するシナリオB）。再利用時は`prelude`をdropしてパイプを閉じる。
+    /// 試みたシナリオA／自分で`runas`するシナリオB）。再利用に成功したときと、daemonが
+    /// 生きていて要求を拒んだときは`prelude`をdropしてパイプを閉じる。
+    ///
+    /// # [BUG-098] 起こし直しも連鎖起動の経路を通る
+    ///
+    /// 旧実装は入口で無条件に`prelude`を落としていたので、**daemonが死んでいると分かった頃には
+    /// 連鎖起動に使えるパイプが手元に無く**、起こし直しは必ず`runas`（＝UACが1回）になっていた。
+    /// しかもそのために、下の「起こす」処理の**劣化した写し**をこの分岐の中に持っていた（`B-05`）。
+    ///
+    /// いまは落とす位置を「使わないと確定した分岐」へ移し、死んでいた場合は**下の共通処理へ
+    /// 落ちる**。
+    ///
+    /// ## `chain_launch`が要る理由——呼び出し側は「生きているつもり」だった
+    ///
+    /// **落とす位置を直すだけでは足りない。** 呼び出し側は`is_live()`（＝ハンドルを持っているか）
+    /// を見て`prelude`を用意するかどうかを決めるので、**daemonが黙って死んでいた場合は
+    /// そもそも用意していない**。つまりこの経路には最初から`None`しか来ない。
+    ///
+    /// だから**死んだと分かった時点で、こちらから連鎖起動を依頼できる口**を受け取る。
+    /// 連鎖起動の実体（常駐WFP daemonへの要求）は上位のクレートが持つので、
+    /// **閉包で渡してもらう**——このクレートが上位の型に依存しないための形である。
+    /// `None`なら従来どおり`runas`（UACが1回）へ倒れる。
     pub fn start(
         &mut self,
         prelude: Option<PreparedLearnPipe>,
         chain_attempted: bool,
         policy: LearnPolicy,
+        chain_launch: Option<&ChainLaunch<'_>>,
     ) -> Result<Collecting, LearnError> {
+        let mut prelude = prelude;
+        let mut chain_attempted = chain_attempted;
         if let Some(mut handle) = self.handle.take() {
-            drop(prelude);
             match handle.start_collect(&policy) {
                 Ok(()) => {
+                    drop(prelude);
                     let etw_available = handle.etw_available();
                     self.handle = Some(handle);
                     return Ok(Collecting {
@@ -333,6 +364,7 @@ impl CollectorSession {
                 // daemonは生きていて要求を拒んだ。起こし直しても同じ拒否になるだけで、
                 // UACを1回増やして同じ場所に着く。**そのまま伝播する。**
                 Err(e) if !daemon_is_dead(&e) => {
+                    drop(prelude);
                     self.handle = Some(handle);
                     return Err(e);
                 }
@@ -343,16 +375,36 @@ impl CollectorSession {
                     drop(handle);
                     eprintln!(
                         "warning: the policy-learning collector stopped answering ({e}); \
-                         restarting it (one UAC prompt)"
+                         restarting it"
                     );
-                    // 連鎖起動用のパイプはもう無いので、起こし直しは必ずシナリオB。
-                    let handle = start(policy)?;
-                    let etw_available = handle.etw_available();
-                    self.handle = Some(handle);
-                    return Ok(Collecting {
-                        etw_available,
-                        reused: false,
-                    });
+                    // [BUG-098] **ここで初めて連鎖起動を依頼する。** 呼び出し側は
+                    // 「生きているつもり」だったので`prelude`を用意していない——
+                    // 用意していたら（＝最初から死んでいると分かっていたら）そのまま使う。
+                    if prelude.is_none() {
+                        if let Some(chain) = chain_launch {
+                            match prepare_pipe() {
+                                Ok(prepared) => match chain(prepared.name()) {
+                                    Ok(()) => {
+                                        prelude = Some(prepared);
+                                        chain_attempted = true;
+                                    }
+                                    // **落ちた理由を黙らせない。** ここで黙ると
+                                    // 「なぜUACが出たのか」が誰にも分からなくなる（`B-10`）。
+                                    Err(reason) => eprintln!(
+                                        "warning: could not chain-launch the collector from the \
+                                         resident WFP daemon ({reason}); falling back to a direct \
+                                         elevated start (one UAC prompt)"
+                                    ),
+                                },
+                                Err(e) => eprintln!(
+                                    "warning: could not prepare a pipe for the chained restart \
+                                     ({e}); falling back to a direct elevated start (one UAC \
+                                     prompt)"
+                                ),
+                            }
+                        }
+                    }
+                    // **`prelude`は落とさない。** 下の共通処理がシナリオA／Bを選ぶ。
                 }
             }
         }

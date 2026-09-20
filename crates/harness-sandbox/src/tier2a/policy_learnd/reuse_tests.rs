@@ -88,6 +88,83 @@ fn the_real_collector_next_to_the_test_binary_speaks_the_reusable_protocol() {
     }
 }
 
+/// [BUG-098] **記録の切れ目で黙って消えない。** 1件受けたあとの待機は時間で打ち切らない。
+///
+/// # これが本体である（D-56の目的そのもの）
+///
+/// D-56が消したかったのは「ポリシーエディタが1回の起動で記録を何度も走らせるのに、
+/// 実行のたびにdaemonを起こし直してUACが出る」だった。**ユーザーが出力を見て考えている時間**を
+/// 待てなければ、その決定は成立しない。
+///
+/// 旧実装は待機中も60秒で打ち切って**終了していた**。60秒考えると収集器が消え、
+/// 次の記録でパイプが切れているので起こし直し＝UACが1回増える。
+///
+/// # なぜ実際に待つのか（短くできない）
+///
+/// 旧実装と新実装の違いは**60秒を越えたところにしか現れない**。縮めるには製品側へ
+/// 「テスト用に短くする口」を足すことになるが、それは**昇格したプロセスの寿命を
+/// 外から縮められる口**であり、作らない。だからこのテストは実時間で待つ。
+///
+/// `#[ignore]`なのは実行時間のためで、昇格は要らない（`StopCollect`はETWへ一度も触らない）。
+#[test]
+#[ignore = "waits out the old 60s idle timeout in real time; run via dev-elevated-runner policy-learnd-reuse"]
+fn the_collector_survives_a_gap_longer_than_the_handshake_timeout() {
+    let collector = ensure_collector_next_to_test_binary();
+    let prepared = super::client::prepare_pipe().expect("prepare pipe");
+    let pipe_name = prepared.name().to_string();
+    let server = prepared.into_handle();
+
+    let mut child = std::process::Command::new(&collector)
+        .arg(&pipe_name)
+        .spawn()
+        .expect("spawn the real policy-learnd");
+    connect_with_timeout(server, short_timeout()).expect("the collector should connect");
+
+    // **失敗を`String`へ畳む。** ここで見たいのは「応答が返るか」だけで、返らなかったときの
+    // 種別（書込で落ちたか読取で落ちたか）は結論を変えない——どちらもdaemonが消えた証拠である。
+    let ask = |request: LearnRequest| -> Result<LearnResponse, String> {
+        let bytes = serde_json::to_vec(&request).expect("serialize");
+        write_framed_timeout(server, &bytes, short_timeout())
+            .map_err(|e| format!("write failed: {e}"))?;
+        let response = read_framed_timeout(server, short_timeout())
+            .map_err(|e| format!("read failed: {e}"))?;
+        Ok(serde_json::from_slice(&response).expect("parse response"))
+    };
+
+    // 1件目を受けさせる。**ここを通ってからが「待機中」である**（1件目だけは短く待つ側に
+    // 留まるので、これを送らないと旧実装と同じ時間で畳まれて測定にならない）。
+    match ask(LearnRequest::StopCollect).expect("first request") {
+        LearnResponse::Stopped { .. } => {}
+        other => panic!("expected Stopped for the first request, got {other:?}"),
+    }
+
+    // ハンドシェイク待ちの時間（60秒）より確実に長く空ける。
+    std::thread::sleep(std::time::Duration::from_secs(75));
+
+    // **まだ生きているか。** 旧実装ではここでプロセスが消えており、書込か読取が失敗する。
+    let after_the_gap = ask(LearnRequest::StopCollect);
+    let still_alive = matches!(after_the_gap, Ok(LearnResponse::Stopped { .. }));
+
+    // 生死を確かめてから畳む（畳む要求自体も、生きていなければ通らない）。
+    let teardown = ask(LearnRequest::Teardown);
+    let _ = child.wait();
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(server);
+    }
+
+    assert!(
+        still_alive,
+        "[BUG-098] the collector went away during a 75s gap between recordings. \
+         D-56 binds this daemon's lifetime to the calling process, not to a timer -- a daemon \
+         that expires while the user is reading the output re-creates the extra UAC prompt that \
+         D-56 was written to remove. got {after_the_gap:?}"
+    );
+    assert!(
+        matches!(teardown, Ok(LearnResponse::TornDown { .. })),
+        "the connection must still carry a Teardown after the gap: {teardown:?}"
+    );
+}
+
 /// **壊れた要求1件で接続を畳まない。** 畳むと、回復可能な失敗がUACの追加1回になる。
 ///
 /// 併せて「拒否されたあとも要求を受け付ける」ことを固定する——ここが切れていると、
@@ -174,7 +251,7 @@ fn a_second_generation_starts_a_fresh_session_and_a_fresh_sink() {
 
     let mut session = super::client::CollectorSession::new();
     let started = session
-        .start(None, false, policy_for(&first))
+        .start(None, false, policy_for(&first), None)
         .expect("start the collector (UAC)");
     assert!(
         started.etw_available,
@@ -186,7 +263,7 @@ fn a_second_generation_starts_a_fresh_session_and_a_fresh_sink() {
     session.stop().expect("stop the first generation");
 
     let restarted = session
-        .start(None, false, policy_for(&second))
+        .start(None, false, policy_for(&second), None)
         .expect("start the second generation (must not prompt for UAC)");
     assert!(
         restarted.reused,

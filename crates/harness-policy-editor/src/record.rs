@@ -133,14 +133,33 @@ impl SharedCollector {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// [BUG-098] `wfp`を受け取るのは、**daemonが黙って死んでいた場合に、その場で連鎖起動を
+    /// 依頼できるようにするため**である。
+    ///
+    /// 呼び出し側は`is_live()`を見て`prelude`を用意するかどうかを決めるので、
+    /// 「生きているつもりで実は死んでいた」場合には`prelude`が`None`で来る。そこからの
+    /// 起こし直しは、この口が無いと必ず`runas`（＝UACが1回）になる。
     pub(crate) fn start(
         &self,
         prelude: Option<harness_sandbox::tier2a::policy_learnd::client::PreparedLearnPipe>,
         chain_attempted: bool,
         policy: LearnPolicy,
+        wfp: Option<&crate::record_net::SharedNetfilter>,
     ) -> Result<harness_sandbox::tier2a::policy_learnd::client::Collecting, policy_learnd::LearnError>
     {
-        self.lock().start(prelude, chain_attempted, policy)
+        // 常駐WFP daemonが生きているときだけ口を渡す。**生きていなければ渡さない**
+        // ——渡すと、要求してから「そんなdaemonは無い」と返ってくるぶん遅くなるだけである。
+        let chain = wfp.filter(|wfp| wfp.is_live());
+        let chain_fn =
+            chain.map(|wfp| move |pipe_name: &str| wfp.chain_launch_collector(pipe_name));
+        self.lock().start(
+            prelude,
+            chain_attempted,
+            policy,
+            chain_fn
+                .as_ref()
+                .map(|f| f as &dyn Fn(&str) -> Result<(), String>),
+        )
     }
 
     pub(crate) fn stop(&self) -> Result<Option<u64>, policy_learnd::LearnError> {
@@ -378,10 +397,12 @@ pub fn record(
             _ => (None, false),
         }
     };
-    let collecting = match request
+    // **`match`の対象を先に束縛する。** 引数が1つ増えて`match`の頭が折り返すと、
+    // 下の腕が丸ごと1段深くなり、差分が実際の変更よりはるかに大きく見える。
+    let started = request
         .collector
-        .start(learn_prelude, chain_attempted, policy)
-    {
+        .start(learn_prelude, chain_attempted, policy, request.wfp);
+    let collecting = match started {
         Ok(collecting) => {
             on_event(RecordEvent::CollectorStarted {
                 etw_available: collecting.etw_available,

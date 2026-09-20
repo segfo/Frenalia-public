@@ -42,8 +42,33 @@ use crate::elevated_launch::validate_audit_sink_path;
 use crate::win_common::wide;
 use crate::win_pipe_ipc::{read_framed_timeout, write_framed_timeout};
 
-/// `StartCollect`を待つタイムアウト。
+/// **最初の**`StartCollect`を待つタイムアウト。
+///
+/// 1件目だけ短いのは、「daemonは起きたが親が要求を送らない」を検知できるようにするため。
+/// ここで無期限に待つと、昇格トークンを握ったプロセスが誰にも使われないまま残る。
 const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// [BUG-098] **2件目以降**の要求を待つ時間。
+///
+/// # なぜ実質無期限なのか（D-56そのもの）
+///
+/// この収集器の寿命は**呼び出し側プロセスに合わせる**と決まっている（D-56）。決定の理由は
+/// 「ポリシーエディタは1回の起動で記録を何度も走らせる道具（記録→承認→パス2→出力を見て→
+/// もう一度パス2）なのに、実行のたびにdaemonを起こし直してUACが出ていた」——
+/// **その「出力を見て考えている時間」を待つことが目的である。**
+///
+/// 旧実装は待機中も[`START_TIMEOUT`]（60秒）で待ち、**時間切れで終了していた**。
+/// ユーザーが60秒考えると収集器が消え、次の記録でパイプが切れているので起こし直し＝
+/// **UACが1回増える**。D-56が消したはずの症状を、この収集器だけが再生産していた
+/// （[BUG-098](../../../../docs/bugs/BUG-098.md)）。
+///
+/// 値は兄弟の`netfilterd::DAEMON_IDLE_TIMEOUT`と同じ根拠で決める
+/// （`WaitForSingleObject`の最大値、約49.7日）。**別々の定数として持つ**のは、
+/// 片方を変えたときにもう片方が黙って追随するのは意図ではないため。
+///
+/// **時間で畳まなくてよい根拠**は、親が死ねばパイプが切れ、`read_framed_timeout`が
+/// `ERROR_BROKEN_PIPE`で失敗して自発的に撤収することである（寿命はタイマーではなく
+/// OSハンドルに紐づく、`netfilterd`と同じ規律）。
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(u32::MAX as u64);
 /// 応答書込のタイムアウト。
 const RESPONSE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// 収集中の1回のドレイン間隔。短すぎるとロック競合、長すぎるとクラッシュ時の損失が増える。
@@ -434,20 +459,89 @@ fn record_argv_stats(
 }
 
 /// 要求の連続を捌く（D-56 段階2）。`Teardown`・パイプ切断・待機タイムアウトで終わる。
+/// 次の読取をどれだけ待つか。**3つの状態がそれぞれ別の理由で別の値を持つ。**
+///
+/// | いまの状態 | 待つ時間 | 時間切れの意味 |
+/// |---|---|---|
+/// | 収集中 | [`DRAIN_INTERVAL`] | **ドレインの合図**（終了ではない） |
+/// | まだ1件も受けていない | [`START_TIMEOUT`] | 親が要求を送ってこない。**畳んで終了する** |
+/// | 1件以上受けて、いまは待機中 | [`IDLE_TIMEOUT`] | 実質来ない。親の死はパイプ切断で分かる |
+///
+/// # 切り出してある理由（[BUG-098](../../../../docs/bugs/BUG-098.md)）
+///
+/// 旧実装はこの3つを2つに畳んでいた——**待機中とハンドシェイク待ちが同じ60秒**で、
+/// しかも時間切れで終了していた。畳んだ結果「ユーザーが60秒考えると収集器が消える」となり、
+/// 次の記録でUACが1回増える。**D-56が消したはずの症状を、この収集器だけが再生産していた。**
+///
+/// 分岐がループの中にインラインで書かれていると、**この3つが別物だという主張をテストで
+/// 留められない**。関数にしてあるのは、対の試験（下記`timeout_selection_tests`）を
+/// 置けるようにするためである。
+fn next_read_timeout(collecting: bool, first_request: bool) -> std::time::Duration {
+    if collecting {
+        DRAIN_INTERVAL
+    } else if first_request {
+        START_TIMEOUT
+    } else {
+        IDLE_TIMEOUT
+    }
+}
+
+#[cfg(test)]
+mod timeout_selection_tests {
+    use super::{next_read_timeout, DRAIN_INTERVAL, IDLE_TIMEOUT, START_TIMEOUT};
+
+    /// 許可側——**1件でも受けたあとの待機は、時間で打ち切らない。**
+    ///
+    /// これがD-56の本体である（ユーザーがエディタで考えている時間を待つ）。
+    /// 旧実装はここが60秒で、しかも時間切れで終了していた。
+    #[test]
+    fn once_a_request_has_arrived_the_idle_wait_is_effectively_unbounded() {
+        let waited = next_read_timeout(false, false);
+        assert_eq!(waited, IDLE_TIMEOUT);
+        assert!(
+            waited > std::time::Duration::from_secs(60 * 60),
+            "[BUG-098] the collector must outlive the user thinking in the editor. \
+             Anything on a human timescale re-creates the extra UAC prompt that D-56 removed: \
+             {waited:?}"
+        );
+    }
+
+    /// 禁止側——**最初の1件だけは短く待つ。**
+    ///
+    /// 片側だけだと「常に無期限に待つ」実装でも上のテストは通る。そうすると
+    /// **昇格トークンを握ったプロセスが、誰にも使われないまま残る**。
+    #[test]
+    fn the_first_request_is_still_waited_for_only_briefly() {
+        let waited = next_read_timeout(false, true);
+        assert_eq!(waited, START_TIMEOUT);
+        assert!(
+            waited <= std::time::Duration::from_secs(60),
+            "[BUG-098] a daemon that was started but never spoken to holds an elevated token; \
+             that state must stay detectable: {waited:?}"
+        );
+    }
+
+    /// 収集中は、待機の話とは無関係にドレイン間隔で起きる（1件目かどうかも効かない）。
+    #[test]
+    fn while_collecting_the_wait_is_the_drain_interval_regardless() {
+        assert_eq!(next_read_timeout(true, true), DRAIN_INTERVAL);
+        assert_eq!(next_read_timeout(true, false), DRAIN_INTERVAL);
+    }
+}
+
 fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
     let volumes = drive_letter_map();
     let mut current: Option<Generation> = None;
+    // [BUG-098] 1件目だけ短く待つ。2件目以降は実質無期限——**待つのがD-56の目的そのもの**。
+    let mut first_request = true;
 
     loop {
-        // 収集中はドレイン間隔で起き、待機中は長く待つ（エディタを開いたまま考えている
-        // 時間を待つのがD-56の目的そのもの）。
-        let timeout = if current.is_some() {
-            DRAIN_INTERVAL
-        } else {
-            START_TIMEOUT
-        };
+        let timeout = next_read_timeout(current.is_some(), first_request);
         let request_bytes = match read_framed_timeout(pipe, timeout) {
-            Ok(bytes) => bytes,
+            Ok(bytes) => {
+                first_request = false;
+                bytes
+            }
             Err(e) => {
                 let message = e.to_string();
                 let timed_out = message.contains("timed out") || message.contains("timeout");
@@ -458,7 +552,8 @@ fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
                     }
                     continue;
                 }
-                // 待機中のタイムアウト、またはパイプ切断（＝親の死）。**応答は送らない**
+                // ここへ来るのは (a) 1件目が来ないまま`START_TIMEOUT`が過ぎた、
+                // (b) パイプが切れた（＝親の死）、のどちらか。**応答は送らない**
                 // ——送り先の親が既に存在しない可能性が高い。
                 break;
             }
