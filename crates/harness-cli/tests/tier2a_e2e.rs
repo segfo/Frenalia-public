@@ -2960,6 +2960,26 @@ fn fs_allow_case_the_ace_persists_after_exit_and_the_named_door_removes_it(
         }
     }
 
+    // (4) [BUG-148] **記録も落ちること。** 上の(2)で同じ問いに「ある」と答えているので、
+    // これは**宣言を1つ撤収するだけで結果が反転する対照**になっている——ACEが消えたことと
+    // 記録が落ちたことを別々に測って、片方だけが起きていないかを見る。
+    //
+    // 旧実装はACEだけを剥がして記録を残した。`harness fs prune`は実在しないパスしか
+    // 落とさない（D-53）ので、撤収したパスがディスクに在る限り消す手段が無く、
+    // **宣言→撤収を繰り返すたびに台帳が単調に増えていた**。
+    let left_records =
+        harness_sandbox::tier2a::win_appcontainer::fs_allow_capability_sids(&target, None);
+    if !left_records.is_empty() {
+        return Err(format!(
+            "[BUG-148] the capability ledger still records {} declaration subject(s) for {} after \
+             `harness fs revoke`, even though the path carries zero capability ACEs. The record \
+             is the index used to revoke, so leaving it behind makes it drift from reality (and \
+             `harness fs prune` cannot collect it while the path still exists).",
+            left_records.len(),
+            target.display()
+        ));
+    }
+
     // 台帳から自分のエントリを落としてから消す。`--fs-allow`由来のエントリは
     // `settings_managed`が立たずD-27の自動撤収対象にならないので、放っておくと
     // 実在しないパスを指す残骸が保護対象の台帳へ溜まり続ける（実機で21件溜まっていた）。

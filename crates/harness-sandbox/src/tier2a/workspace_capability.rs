@@ -1032,10 +1032,24 @@ impl WorkspaceCapabilityEntry {
     /// workspace本体は従来どおりworkspaceのパスだけ。宣言エントリは**どのパスの許可か**が
     /// 主語なので、宣言パスを先に置いて発行元のworkspaceを添える（workspaceだけを出すと、
     /// 「消えた記録が何の許可だったか」が報告から分からない）。
+    ///
+    /// # なぜaccess級／モードまで載せるのか（[BUG-148](../../../../docs/bugs/BUG-148.md)の修正中に判明）
+    ///
+    /// **1つのパスには複数のエントリが載る。** 同じ宣言パス・同じworkspaceでも
+    /// access級（`read_exec`と`read_write`等）ごとに別の宛先SIDが発行されるからである。
+    /// この欄を落とすと、2件落ちた回の報告が**同じ行を2回出したように見える**
+    /// ——読み手には「重複を消したのか、別々の許可を2つ消したのか」が区別できない。
+    /// workspace本体側も同じで、1つのworkspaceにモード別（`ro`/`rwx`）のエントリが並ぶ。
+    ///
+    /// **秘密とcapability名は載せない**（この文字列は[`prune_capability_entries`]の戻り値として
+    /// CLIの報告へそのまま出る）。access級は秘密ではなく、宣言そのものから決まる。
     pub fn display_label(&self) -> String {
         match &self.declaration {
-            None => self.workspace.clone(),
-            Some(declared) => format!("{declared} (declared by {})", self.workspace),
+            None => format!("{} [{}]", self.workspace, self.mode),
+            Some(declared) => format!(
+                "{declared} [{}] (declared by {})",
+                self.mode, self.workspace
+            ),
         }
     }
 

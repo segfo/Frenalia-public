@@ -32,6 +32,22 @@ pub(crate) fn ledger_forced_flag(path: &Path) -> bool {
     })
 }
 
+/// 「何も一致しなかった」（exit 1）と言ってよいかだけを決める。
+///
+/// # なぜ切り出してあるのか（[BUG-148](../../../../docs/bugs/BUG-148.md)）
+///
+/// **この判定は片付いた証拠を数え落とすたびに嘘になる**。実際、撤収の証拠は機構が増えるたびに
+/// 1つずつ増えてきた——package SIDのACE、昇格ヘルパーが別経路で剥がした分（BUG-101）、
+/// 宣言capabilityのACE（§22.3）、そして本バグで足したcapability台帳の記録。**どれか1つを
+/// 数え忘れると、片付いた回が「何も一致しなかった」として exit 1 で返る。**
+///
+/// 数えるものを1本の配列にしてあるのは、**足すときに「どこへ足すか」を迷わせないため**である。
+/// `root_missing`だけ別に取るのは、これが件数ではなく「載せる先がそもそも無かった」という
+/// 別の事実だからで、その場合は0件でも失敗ではない。
+fn nothing_matched(evidence: &[usize], root_missing: bool) -> bool {
+    !root_missing && evidence.iter().all(|n| *n == 0)
+}
+
 /// 撤収の結果をユーザーへ報告する。**ACE側と台帳側を別々に数えて、別々に出す**のが
 /// この関数の存在理由です（BUG-101の欠陥②）。
 ///
@@ -58,12 +74,30 @@ pub(crate) fn ledger_forced_flag(path: &Path) -> bool {
 /// | 0 | **0**（rootにharness ACEが無い） | >0 | 台帳の掃除だけ | 0 |
 /// | 0 | **>0**（在ったのに剥がせなかった） | – | 失敗。台帳エントリは残す | 1 |
 /// | 0 | 0 | 0 | 何も一致しなかった | 1 |
+///
+/// # [BUG-148] 台帳は2つあるので、どちらの数字かを名前で言う
+///
+/// この画面には**別々のファイルを数えた2つの行**が出ます。同じ`ledger :`という名前で
+/// 片方だけ出していたので、「1 entry removed」を読んだ人がもう片方も落ちたと読みました。
+///
+/// | 行 | 何を数えるか | ファイル |
+/// |---|---|---|
+/// | `passthrough ledger :` | `--fs-allow`の付与記録（`removed`） | `fs-passthrough-ledger.json` |
+/// | `capability ledger  :` | 宣言capabilityの宛先SIDの記録（`forgotten`） | `workspace-capability-ledger.json` |
+///
+/// **`forgotten`は「剥がすつもりだった」ではなく「実DACLからもう消えている」ものだけ**です
+/// （判定は`forget_revoked_declarations`が持つ）。撤収が失敗した回と、走っているworkspaceの
+/// 宛先SIDを意図的に残した回は、記録も残ります——記録を消すと宛先SIDを二度と導出できず、
+/// 撤収経路の無い孤児ACEになります（`B-01`/`B-14`）。
 #[cfg(windows)]
 fn report_revoke_result(
     path: &Path,
     report: &harness_sandbox::tier2a::win_appcontainer::HarnessRevokeReport,
     decl: &harness_sandbox::tier2a::win_appcontainer::DeclarationRevokeReport,
     removed: usize,
+    // [BUG-148] capability台帳から落とした宣言のラベル。**`removed`とは別の台帳の数字である**
+    // （下記「台帳は2つあるので、どちらかを名前で言う」）。
+    forgotten: &[String],
     note: Option<&str>,
 ) -> ExitCode {
     let targeted = report.targeted();
@@ -110,18 +144,34 @@ fn report_revoke_result(
                 decl.rewritten
             )
         };
-        let ledger_line = format!(
-            "  ledger : {removed} entr{} removed",
+        // [BUG-148] **どちらの台帳の数字かを名前で言う。** 旧実装はどちらも書けるはずの
+        // `ledger :`という1行しか持たず、しかも数えていたのは`fs-passthrough-ledger.json`
+        // だけだった——「1 entry removed」は嘘ではないのに、読み手が期待した
+        // `workspace-capability-ledger.json`は1件も落ちていない、という形で食い違いが隠れた。
+        let passthrough_line = format!(
+            "  passthrough ledger : {removed} entr{} removed",
             if removed == 1 { "y" } else { "ies" }
+        );
+        let capability_line = format!(
+            "  capability ledger  : {} entr{} removed{}",
+            forgotten.len(),
+            if forgotten.len() == 1 { "y" } else { "ies" },
+            if forgotten.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", forgotten.join(", "))
+            }
         );
         if stream_err {
             eprintln!("{ace_line}");
             eprintln!("{decl_line}");
-            eprintln!("{ledger_line}");
+            eprintln!("{passthrough_line}");
+            eprintln!("{capability_line}");
         } else {
             println!("{ace_line}");
             println!("{decl_line}");
-            println!("{ledger_line}");
+            println!("{passthrough_line}");
+            println!("{capability_line}");
         }
     };
 
@@ -151,14 +201,18 @@ fn report_revoke_result(
     // [§22.3] **宣言capabilityを1本でも剥がしたなら「何も一致しなかった」ではない。**
     // 移行後のfs-allowパスはpackage側が常に0件になるので、ここへpackage側だけの条件を
     // 残すと正常系がすべて失敗として報告される。
-    if targeted == 0
-        && report.rewritten() == 0
-        && report.cleared_elsewhere == 0
-        && decl.rewritten == 0
-        && decl.cleared_elsewhere == 0
-        && removed == 0
-        && !report.root_missing
-    {
+    if nothing_matched(
+        &[
+            targeted,
+            report.rewritten(),
+            report.cleared_elsewhere,
+            decl.rewritten,
+            decl.cleared_elsewhere,
+            removed,
+            forgotten.len(),
+        ],
+        report.root_missing,
+    ) {
         eprintln!(
             "nothing to revoke for {}: no ledger entry matched, and the path carries no ACE \
              that harness can claim as its own.",
@@ -401,7 +455,8 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
         } else {
             0
         };
-        return report_revoke_result(path, &report, &decl, removed, None);
+        let forgotten = prune_declaration_entries_for(&[path.to_path_buf()]);
+        return report_revoke_result(path, &report, &decl, removed, &forgotten, None);
     }
     if let Some(reason) = &decl_error {
         eprintln!("  note: in-process declaration revoke could not finish: {reason}");
@@ -429,11 +484,13 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
         } else {
             0
         };
+        let forgotten = prune_declaration_entries_for(&[path.to_path_buf()]);
         return report_revoke_result(
             path,
             &retry,
             &retry_decl,
             removed,
+            &forgotten,
             Some("already running elevated"),
         );
     }
@@ -479,11 +536,13 @@ pub(crate) fn fs_revoke_one(path: &Path) -> ExitCode {
             } else {
                 0
             };
+            let forgotten = prune_declaration_entries_for(&[path.to_path_buf()]);
             report_revoke_result(
                 path,
                 &after,
                 &decl,
                 removed,
+                &forgotten,
                 Some("via privilege-separation helper (UAC, one-time)"),
             )
         }
@@ -823,19 +882,52 @@ pub fn reconcile_fs_ledger_for_workspace(
         );
     }
     let _ = canonical;
-    prune_declaration_entries_for(&revoked);
+    for label in prune_declaration_entries_for(&revoked) {
+        eprintln!("  forgot the declaration capability for {label}");
+    }
 }
 
-/// 撤収し終えた宣言について、capability台帳のエントリを落とす。
+/// 撤収し終えた宣言について、capability台帳のエントリを落とし、**落としたラベルを返す**。
 ///
 /// 判定の実体は`harness_sandbox`側の`forget_revoked_declarations`が持つ
 /// （[BUG-142](../../../../docs/bugs/BUG-142.md)の修正で**呼ぶ側が2つになった**ため
 /// ——こちらとポリシーエディタのパス2。**同じ判定を2箇所に書かない**、`B-05`）。
-/// ここに残すのは**この経路の表示**だけである。
+///
+/// # 表示せずに返すのはなぜか（[BUG-148](../../../../docs/bugs/BUG-148.md)）
+///
+/// 呼ぶ側が2つあり、**出す場所が違う**。自動整合（D-27）はその場で1行ずつ流せばよいが、
+/// `harness fs revoke <path>`は2つの台帳の行を含む報告を組み立てるので、
+/// **その中に混ぜないと「どの台帳が何件落ちたか」が離れて読めなくなる**（本バグの層2）。
+/// ここで`eprintln!`すると、呼ぶ側は出す位置を選べない。
 #[cfg(windows)]
-fn prune_declaration_entries_for(revoked: &[PathBuf]) {
-    let dropped = harness_sandbox::tier2a::win_appcontainer::forget_revoked_declarations(revoked);
-    for label in &dropped {
-        eprintln!("  forgot the declaration capability for {label}");
+fn prune_declaration_entries_for(revoked: &[PathBuf]) -> Vec<String> {
+    harness_sandbox::tier2a::win_appcontainer::forget_revoked_declarations(revoked)
+}
+
+#[cfg(test)]
+mod nothing_matched_tests {
+    use super::nothing_matched;
+
+    /// 禁止側——**本当に何も起きていない回は、そう言う。**
+    ///
+    /// これが無いと「常に何かが片付いたと言う」実装でも許可側のテストは通る（`B-35`）。
+    #[test]
+    fn an_untouched_path_is_reported_as_nothing_matched() {
+        assert!(nothing_matched(&[0, 0, 0, 0, 0, 0, 0], false));
+    }
+
+    /// 許可側——**capability台帳から記録を落とした回は「何も一致しなかった」ではない。**
+    ///
+    /// [BUG-148]が作り続けた状態（ACEは以前の回で剥がれ、記録だけが残っている）を掃除すると、
+    /// 証拠はこの1つしか立たない。ここを数え落とすと、**掃除に成功した回が exit 1 で返る**。
+    #[test]
+    fn forgetting_a_capability_ledger_entry_alone_counts_as_progress() {
+        assert!(!nothing_matched(&[0, 0, 0, 0, 0, 0, 1], false));
+    }
+
+    /// 載せる先が消えていた回は、0件でも失敗ではない（`root_missing`は件数ではない）。
+    #[test]
+    fn a_vanished_root_is_not_a_failure() {
+        assert!(!nothing_matched(&[0, 0, 0, 0, 0, 0, 0], true));
     }
 }
