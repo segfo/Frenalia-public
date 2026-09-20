@@ -2129,8 +2129,124 @@ fn run_net_case_with_exe_and_stderr_check(
         }
     }
 
+    report_net_event_audit(name, &audit_entries);
+
     cleanup_on_success(&ws, &[], name);
     Ok(())
+}
+
+/// [BUG-094] **この機械の監査ポリシーを読んで残す。1ビットも変えない。**
+///
+/// # なぜ読むのか
+///
+/// 2026-09-20の対照で、**公開アドレスへのclassify drop（`net-05-rawtcp`）でも
+/// コールバックが1度も呼ばれない**ことが分かった。購読は成功し、エンジン全体の収集も
+/// 有効（`collect=0x1`）で、購読テンプレートは`default()`＝全イベントである。
+/// **配送を止めているものが他にある。**
+///
+/// WFPのnet eventは、Windowsの詳細監査ポリシーの2つのサブカテゴリ
+/// （`Filtering Platform Packet Drop`・`Filtering Platform Connection`）と同じ事象を指す。
+/// **そちらが無効なら、そもそも事象が生成されない**というのが次の候補である。
+/// この候補はこの記録で一度も検討されていない。
+///
+/// # 読むだけにする理由
+///
+/// 監査ポリシーは**マシン全体の設定**である。立てれば残り、倒す責任者を決める必要がある
+/// （案Aが同じ壁で消えたのと同じ構図）。**まず現在値を知る**のが先で、
+/// 変えるかどうかはその後の決定である。`plans/etw-spike/RESULTS.md`も
+/// 「`auditpol /get`の読み取りのみ」という同じ線を引いている。
+///
+/// # このテストの中で撃つ理由
+///
+/// `auditpol`は管理者でないと読めない。**このテストは既に昇格して走っている**ので、
+/// 新しい`KNOWN_TARGETS`を足さずに済む（足すとデーモンの停止が要り、
+/// それは`dev-elevated-runner`を通らない昇格になる）。
+fn report_wfp_audit_policy() {
+    // **名前ではなくGUIDで引く。** サブカテゴリ名はOSの表示言語で翻訳されるので、
+    // 英語名を渡すとこの開発機（日本語版）では`0x57`（パラメーターが間違っています）で落ちる
+    // ——**「無効」と「名前が解決できなかった」が同じ見た目になる**ので、名前では引かない。
+    for (guid, what) in [
+        (
+            "{0CCE9225-69AE-11D9-BED3-505054503030}",
+            "Filtering Platform Packet Drop",
+        ),
+        (
+            "{0CCE9226-69AE-11D9-BED3-505054503030}",
+            "Filtering Platform Connection",
+        ),
+    ] {
+        let out = Command::new("auditpol")
+            .args(["/get", &format!("/subcategory:{guid}")])
+            .output();
+        match out {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let err = String::from_utf8_lossy(&o.stderr);
+                eprintln!("[BUG-094][audit-policy] {what} exit={:?}", o.status.code());
+                // **バイト列も出す。** `auditpol`の出力はこの機械のANSIコードページ（日本語）で、
+                // UTF-8として読むと化ける。**化けた表示から設定値を推測して記録へ書かない**ため、
+                // 16進も並べて後から確実に復号できるようにする。
+                for line in text.lines().chain(err.lines()) {
+                    if !line.trim().is_empty() {
+                        eprintln!("[BUG-094][audit-policy] {what}: {}", line.trim_end());
+                    }
+                }
+                let hex: String = o
+                    .stdout
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                eprintln!("[BUG-094][audit-policy] {what} stdout-hex: {hex}");
+            }
+            Err(e) => eprintln!("[BUG-094][audit-policy] auditpol を起動できなかった: {e}"),
+        }
+    }
+}
+
+/// [BUG-094] **WFPのnet-event購読が何を受け取ったかを、caseごとに1回だけ残す。**
+///
+/// # なぜ全caseで出すのか
+///
+/// 分かっていないのは「購読は成立しているのにコールバックが1度も呼ばれない」理由である。
+/// 2026-09-20の測定は`net-11-smb445`（宛先は`100.64.0.0/10`）1件だけで取ったので、
+/// **「購読が何も受け取らない」のか「その拒否が配送対象でない」のか**が分かれていない。
+///
+/// **`net-05-rawtcp`がその対照になる。** 宛先は公開アドレス（`172.66.147.243`）なので
+/// Tier2aが積む`internetClient`の射程内であり、**capability dropではなく
+/// harness自身のBLOCKフィルタによるclassify drop**である。ここで呼び出し回数が0より大きければ
+/// 「購読は受け取っている」が言え、0なら「購読そのものが何も受け取らない」が言える。
+///
+/// # 判定しない
+///
+/// **ここでは`assert`しない。** いま閾値を書くと、**測る前に答えを書く**ことになる。
+/// 数えた値を残すところまでが本関数の仕事で、結論が出たらその時点で対の`assert`を置く。
+/// 成功した回はワークスペースごと片付くので、**ログに残すのがこの事実を残す唯一の口**である。
+fn report_net_event_audit(name: &str, audit_entries: &[serde_json::Value]) {
+    let controls: Vec<&str> = audit_entries
+        .iter()
+        .filter(|e| e.get("protocol").and_then(|p| p.as_str()) == Some("control"))
+        .filter_map(|e| e.get("reason").and_then(|r| r.as_str()))
+        .collect();
+    let net_event_controls: Vec<&&str> = controls
+        .iter()
+        .filter(|r| r.starts_with("net_event_"))
+        .collect();
+    let classify_drops = audit_entries
+        .iter()
+        .filter(|e| e.get("reason").and_then(|r| r.as_str()) == Some("classify_drop"))
+        .count();
+    if net_event_controls.is_empty() {
+        eprintln!(
+            "[BUG-094][{name}] net-eventの制御レコードが1件も無い（WFPを張らない経路か、\
+             監査シンクが作られていない）。classify_drop={classify_drops}"
+        );
+        return;
+    }
+    for r in &net_event_controls {
+        eprintln!("[BUG-094][{name}] control: {r}");
+    }
+    eprintln!("[BUG-094][{name}] classify_drop記録={classify_drops}");
 }
 
 /// `.harness/sandbox/**/net-audit.jsonl`を全て読み、JSON行を集める(kind:proxy/wfp/fake_dns
@@ -2448,6 +2564,7 @@ fn tier2a_net_policy_matrix() {
     if let Err(e) = liveness_gate() {
         panic!("liveness gate failed, all subsequent cases are indeterminate: {e}");
     }
+    report_wfp_audit_policy();
 
     let cases: Vec<(&str, CaseFn)> = vec![
         ("01-none", net_case_01_none),
