@@ -32,13 +32,41 @@ fn start(decl: McpServerDecl) -> (McpRuntime, Vec<SkippedServer>) {
     (runtime, skipped)
 }
 
+/// [BUG-162] **起動が成立したことを確かめてから返す。往復が成立する前提のテストは全部ここを通る。**
+///
+/// # なぜ専用の入口が要るのか
+///
+/// [`McpRuntime::start`]は、起動に失敗したサーバを**値で**返す（`skipped`）。落としはしない
+/// ——1本繋がらなくても他は使えるべきだからで、製品としてはこれが正しい。
+///
+/// **だからテストが受け取って確かめなければ、失敗はそこで消える。** 捨てると症状は
+/// 「登録されているはずのツールが見つからない」になり、`find(...).unwrap()`が`None`で落ちる
+/// ——**理由がどこにも出ない**（`B-10`: 「無い」と「隠れている」を混ぜない）。
+///
+/// 実際に2026-09-20、ワークスペース全体のテストを**2つ同時に**走らせた回でこの形の落ち方を
+/// して、原因の切り分けに1往復かかった（[BUG-162](../../../docs/bugs/BUG-162.md)）。
+///
+/// # skipを期待するテストはここを通らない
+///
+/// リダイレクト・セッション失効などを測る側は[`start`]を直接呼び、`skipped`の理由の綴りまで
+/// 確かめる。**あちらにとってskipは失敗ではなく結果である。**
+fn started(decl: McpServerDecl) -> McpRuntime {
+    let (runtime, skipped) = start(decl);
+    assert!(
+        skipped.is_empty(),
+        "モックサーバとの起動が成立していない。**これが本当の失敗理由である**\
+         ——握手が時間切れになるとツールが1つも登録されず、探す側からは\
+         「名前が違う」のと区別が付かない形で落ちる: {skipped:?}"
+    );
+    runtime
+}
+
 /// **完了条件のgolden**: `initialize`→`notifications/initialized`→`tools/list`が実プロセス
 /// 相手に成立し、宣言した`RiskClass`が付いた名前空間付きツールが登録される。
 #[test]
 fn a_json_mode_server_completes_the_handshake_and_registers_namespaced_tools() {
     let server = MockServer::start("json");
-    let (runtime, skipped) = start(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
-    assert!(skipped.is_empty(), "{skipped:?}");
+    let runtime = started(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
 
     let tools = runtime.tools();
     let mut names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -67,8 +95,7 @@ fn a_json_mode_server_completes_the_handshake_and_registers_namespaced_tools() {
 #[test]
 fn an_sse_mode_server_completes_the_same_handshake() {
     let server = MockServer::start("sse");
-    let (runtime, skipped) = start(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
-    assert!(skipped.is_empty(), "{skipped:?}");
+    let runtime = started(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
     assert_eq!(runtime.tools().len(), 3);
 }
 
@@ -76,7 +103,7 @@ fn an_sse_mode_server_completes_the_same_handshake() {
 #[tokio::test]
 async fn tools_call_round_trips_over_http_without_explicit_nulls() {
     let server = MockServer::start("json");
-    let (runtime, _skipped) = start(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
+    let runtime = started(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
     let tools = runtime.tools();
     let search = tools
         .iter()
@@ -101,7 +128,7 @@ async fn tools_call_round_trips_over_http_without_explicit_nulls() {
 #[tokio::test]
 async fn tools_call_round_trips_over_sse() {
     let server = MockServer::start("sse");
-    let (runtime, _skipped) = start(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
+    let runtime = started(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
     let tools = runtime.tools();
     let search = tools
         .iter()
@@ -123,7 +150,7 @@ async fn tools_call_round_trips_over_sse() {
 #[test]
 fn the_session_id_and_negotiated_protocol_version_are_sent_on_later_requests() {
     let server = MockServer::start("json");
-    let (runtime, _skipped) = start(decl(&server.url(), &[]));
+    let runtime = started(decl(&server.url(), &[]));
     let tools = runtime.tools();
     let search = tools
         .iter()
@@ -147,8 +174,7 @@ fn declared_headers_reach_the_server() {
     // SAFETY: 単一のテストプロセス内での設定。ここでしか読まない名前を使う。
     std::env::set_var("HARNESS_TEST_MCP_HTTP_TOKEN", "s3cret");
 
-    let (runtime, skipped) = start(d);
-    assert!(skipped.is_empty(), "{skipped:?}");
+    let runtime = started(d);
     let tools = runtime.tools();
     let search = tools
         .iter()
@@ -165,8 +191,7 @@ fn declared_headers_reach_the_server() {
 #[test]
 fn a_server_that_never_issues_a_session_id_still_works() {
     let server = MockServer::start("no-session-id");
-    let (runtime, skipped) = start(decl(&server.url(), &[]));
-    assert!(skipped.is_empty(), "{skipped:?}");
+    let runtime = started(decl(&server.url(), &[]));
     assert_eq!(runtime.tools().len(), 3);
 }
 
@@ -236,7 +261,7 @@ fn a_server_that_fails_to_initialize_registers_nothing() {
 #[test]
 fn undeclared_and_self_declared_read_only_tools_stay_non_read_over_http() {
     let server = MockServer::start("json");
-    let (runtime, _skipped) = start(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
+    let runtime = started(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
     let tools = runtime.tools();
 
     for name in ["mcp__mock__create_issue", "mcp__mock__claims_read_only"] {
@@ -264,8 +289,7 @@ fn an_http_declaration_starts_only_after_it_is_approved() {
     let plan = McpRuntime::plan(std::slice::from_ref(&d), &store.load(), &gates());
     assert_eq!(plan.approved.len(), 1);
 
-    let (runtime, skipped) = start(d);
-    assert!(skipped.is_empty(), "{skipped:?}");
+    let runtime = started(d);
     assert_eq!(runtime.tools().len(), 3);
 }
 
@@ -273,7 +297,7 @@ fn an_http_declaration_starts_only_after_it_is_approved() {
 #[tokio::test]
 async fn calls_after_shutdown_fail_rather_than_hanging() {
     let server = MockServer::start("json");
-    let (mut runtime, _skipped) = start(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
+    let mut runtime = started(decl(&server.url(), &[("search", RiskClass::ReadOnly)]));
     let tools = runtime.tools();
     let search = tools
         .iter()
