@@ -25,20 +25,21 @@ use serde::Serialize;
 use windows::core::GUID;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0,
+    FwpmEngineClose0, FwpmEngineGetOption0, FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0,
     FwpmFilterCreateEnumHandle0, FwpmFilterDeleteById0, FwpmFilterDestroyEnumHandle0,
     FwpmFilterEnum0, FwpmFreeMemory0, FwpmNetEventSubscribe0, FwpmNetEventUnsubscribe0,
     FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
     FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0,
     FWPM_ACTION0_0, FWPM_CONDITION_ALE_PACKAGE_ID, FWPM_CONDITION_IP_PROTOCOL,
     FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0,
-    FWPM_ENGINE_COLLECT_NET_EVENTS, FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_NONE,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_NET_EVENT1,
-    FWPM_NET_EVENT_SUBSCRIPTION0, FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWPM_PROVIDER0, FWPM_SESSION0,
-    FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT,
-    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_IP_VERSION_V4, FWP_IP_VERSION_V6,
-    FWP_MATCH_EQUAL, FWP_SID, FWP_UINT16, FWP_UINT32, FWP_UINT64, FWP_UINT8, FWP_V4_ADDR_AND_MASK,
-    FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
+    FWPM_ENGINE_COLLECT_NET_EVENTS, FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS, FWPM_FILTER0,
+    FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_NONE, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_NET_EVENT1, FWPM_NET_EVENT_SUBSCRIPTION0,
+    FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC,
+    FWPM_SUBLAYER0, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_CONDITION_VALUE0,
+    FWP_CONDITION_VALUE0_0, FWP_IP_VERSION_V4, FWP_IP_VERSION_V6, FWP_MATCH_EQUAL, FWP_SID,
+    FWP_UINT16, FWP_UINT32, FWP_UINT64, FWP_UINT8, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
+    FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, PSID, SID};
 
@@ -155,6 +156,44 @@ unsafe impl Send for WfpSession {}
 #[derive(Debug)]
 struct WfpAuditSink {
     path: PathBuf,
+    /// [BUG-094] 購読のコールバックが**呼ばれた回数**（種別を問わない）。
+    ///
+    /// # なぜ数えるのか
+    ///
+    /// コールバックは`FWPM_NET_EVENT_TYPE_CLASSIFY_DROP`以外を**黙って捨てる**。
+    /// したがって記録が0件のとき、次の2つが区別できない（`B-10`）。
+    ///
+    /// | 実際 | 意味 |
+    /// |---|---|
+    /// | コールバックが**1度も呼ばれていない** | 購読が成立していないか、収集が動いていない |
+    /// | 呼ばれたが**dropが1件も無かった** | 購読は生きている。落ちた通信がこの経路に出ていないだけ |
+    ///
+    /// **前者と後者では次の一手が正反対になる。** 実測でこの区別が要った——
+    /// マシン全体の収集は有効で購読も成功しているのに記録が0件、という状態が出たとき、
+    /// この数字が無いと「購読が嘘をついている」のか「dropがこの層に出ない」のかを言えない。
+    events_seen: std::sync::atomic::AtomicU64,
+    /// そのうち実際に記録したもの（＝`classify_drop`だったもの）。
+    drops_recorded: std::sync::atomic::AtomicU64,
+}
+
+impl WfpAuditSink {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            events_seen: std::sync::atomic::AtomicU64::new(0),
+            drops_recorded: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// [BUG-094] 撤収時に1行だけ残す要約。**0件の意味を言えるようにするためのもの。**
+    fn record_event_summary(&self) {
+        use std::sync::atomic::Ordering;
+        let seen = self.events_seen.load(Ordering::Relaxed);
+        let recorded = self.drops_recorded.load(Ordering::Relaxed);
+        self.record(&WfpAuditEntry::control(format!(
+            "net_event_summary: callback_invocations={seen} classify_drop_recorded={recorded}"
+        )));
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -216,9 +255,7 @@ pub(crate) fn record_control_event(
     validated_audit_log_path: &std::path::Path,
     reason: impl Into<std::borrow::Cow<'static, str>>,
 ) {
-    let sink = WfpAuditSink {
-        path: validated_audit_log_path.to_path_buf(),
-    };
+    let sink = WfpAuditSink::new(validated_audit_log_path.to_path_buf());
     sink.record(&WfpAuditEntry::control(reason));
 }
 
@@ -262,6 +299,10 @@ unsafe extern "system" fn wfp_net_event_callback(
     }
     let sink = &*(context as *const WfpAuditSink);
     let event = &*event;
+    // [BUG-094] **捨てる前に数える。** ここで黙って`return`すると、記録0件のときに
+    // 「1度も呼ばれていない」と「呼ばれたがdropではなかった」が同じ見え方になる。
+    sink.events_seen
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if event.r#type != FWPM_NET_EVENT_TYPE_CLASSIFY_DROP {
         return;
     }
@@ -298,6 +339,8 @@ unsafe extern "system" fn wfp_net_event_callback(
         layer_id: drop.map(|d| d.layerId),
     };
     sink.record(&entry);
+    sink.drops_recorded
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn protocol_name(protocol: u8) -> &'static str {
@@ -404,6 +447,11 @@ impl WfpSession {
                 if let Some(subscription) = event_subscription {
                     let _ = FwpmNetEventUnsubscribe0(engine, subscription);
                 }
+                // [BUG-094] **購読を止めた直後に、何回呼ばれたかを1行残す。**
+                // 止める前だと、この記録自身より後に来たイベントを数え落とす。
+                if let Some(context) = audit_context {
+                    (*context).record_event_summary();
+                }
                 check(
                     FwpmTransactionBegin0(engine, 0),
                     "FwpmTransactionBegin0 (teardown)",
@@ -459,6 +507,84 @@ impl Drop for WfpSession {
     }
 }
 
+/// `FWP_E_DYNAMIC_SESSION_IN_PROGRESS`——「動的セッションの中からは、この呼び出しを行えない」。
+///
+/// **`windows`クレートはこの値を出していない**（`FWP_E_*`は定数として公開されていない）ので、
+/// ここで綴る。値は`fwpmu.h`／公開ドキュメントの`0x80320000 + 0x0B`。
+///
+/// この1つだけを名前で持つのは、**harnessが構造的に必ず踏む**からである（[BUG-094]）——
+/// セッションを`FWPM_SESSION_FLAG_DYNAMIC`で開くのはフェイルセーフの根拠そのもので、
+/// 一方でイベント収集の有効化はエンジン全体の設定なので、**同じハンドルの上で両立しない**。
+/// 他の失敗コードは「予期しない何か」なので、数値のまま記録すれば足りる。
+const FWP_E_DYNAMIC_SESSION_IN_PROGRESS: u32 = 0x8032_000B;
+
+/// いまマシン全体でWFPのイベント収集が有効か、**読んで**1語で返す。
+///
+/// # なぜ要るのか（[BUG-094]の測定で、この1語が無いと結論が2通りに割れた）
+///
+/// 有効化に失敗したまま購読すると、**「購読は成功したがイベントが1件も来ない」**という
+/// 状態になる。これは2つの全く違う事実のどちらでもあり得る。
+///
+/// | 実際にどちらか | 意味 | 次の一手 |
+/// |---|---|---|
+/// | 収集がマシン全体で**無効** | イベントがそもそも作られていない | 収集を立てる側の案（非動的ハンドルをもう1本）へ進む |
+/// | 収集は**有効**なのにイベントが来ない | 購読か層の選び方が間違っている | 上の案を採っても解決しない |
+///
+/// **読まなければ、どちらなのかは推測になる。** エンジンオプションは*設定*が動的セッションから
+/// 禁じられているだけで、*読み取り*は通る。
+///
+/// 返すのは記録へそのまま載せる短い語（`enabled` / `disabled` / `unreadable(...)`）。
+/// **「読めなかった」を「無効」と同じ値に畳まない**（`B-10`）。
+unsafe fn describe_net_event_collection(engine: HANDLE) -> String {
+    format!(
+        "collect={} match_any_keywords={}",
+        read_engine_u32_option(engine, FWPM_ENGINE_COLLECT_NET_EVENTS),
+        read_engine_u32_option(engine, FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS)
+    )
+}
+
+/// エンジンの32bitオプションを1つ読んで、記録へそのまま載せる短い語にする。
+///
+/// **`0`と「読めなかった」を同じ値に畳まない**（`B-10`）——前者はマシンの状態、
+/// 後者はこちらの計器の不調であり、次の一手が違う。
+unsafe fn read_engine_u32_option(
+    engine: HANDLE,
+    option: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ENGINE_OPTION,
+) -> String {
+    let mut value: *mut FWP_VALUE0 = std::ptr::null_mut();
+    let status = FwpmEngineGetOption0(engine, option, &mut value);
+    if status != 0 {
+        return format!("unreadable({status:#010x})");
+    }
+    if value.is_null() {
+        return "unreadable(null)".to_string();
+    }
+    let read = *value;
+    let described = if read.r#type != FWP_UINT32 {
+        format!("unreadable(type={:?})", read.r#type)
+    } else {
+        format!("{:#010x}", read.Anonymous.uint32)
+    };
+    // `FwpmEngineGetOption0`が返した領域はFWPMが確保したもの。**読み終えたら返す**
+    // （`FwpmFreeMemory0`。付録Aの撤収規律と同じで、借りたものは借りた側が返す）。
+    FwpmFreeMemory0(&mut value as *mut *mut FWP_VALUE0 as *mut *mut core::ffi::c_void);
+    described
+}
+
+/// WFPが落としたパケットの記録を始める（仕様書§5.5）。
+///
+/// # 有効化に失敗しても購読はする（[BUG-094]の修正）
+///
+/// 旧実装は`FwpmEngineSetOption0`が失敗した時点で**購読ごと諦めていた**。これは
+/// **「収集を有効にできない」と「イベントを観測できない」を同じ値に畳んでいる**（`B-10`）。
+///
+/// `FWPM_ENGINE_COLLECT_NET_EVENTS`は**マシン全体の設定**なので、harnessが立てられなくても
+/// **他の誰かが既に立てていれば購読でイベントが届く**。旧実装ではその世界でも記録は0件になり、
+/// 「拒否が1件も無かった」と見分けが付かなかった。
+///
+/// したがって**有効化の可否と購読の可否を別々に記録し、購読は必ず試す**。どちらの世界に
+/// 居るかは、制御レコードの綴り（`net_event_collection_enabled_by_harness` か
+/// `net_event_collection_not_enabled_by_harness`）で後から読める。
 fn start_wfp_drop_audit(
     engine: HANDLE,
     audit_log_path: Option<PathBuf>,
@@ -472,16 +598,27 @@ fn start_wfp_drop_audit(
             Anonymous: FWP_VALUE0_0 { uint32: 1 },
         };
         let set_status = FwpmEngineSetOption0(engine, FWPM_ENGINE_COLLECT_NET_EVENTS, &value);
-        let sink = Box::new(WfpAuditSink { path });
+        let sink = Box::new(WfpAuditSink::new(path));
         let sink_ptr = Box::into_raw(sink);
-        if set_status != 0 {
-            let sink = Box::from_raw(sink_ptr);
-            // **理由コードまで残す。** これが無いと「有効化に失敗した」しか分からず、
-            // 権限不足なのか既定で無効なのかを後から追えない（実運用で発火している）。
-            sink.record(&WfpAuditEntry::control(format!(
-                "net_event_collection_enable_failed: FwpmEngineSetOption0 returned {set_status:#010x}"
+        // **理由コードまで残す。** これが無いと「有効化に失敗した」しか分からず、
+        // 権限不足なのか既定で無効なのかを後から追えない（実運用で発火している）。
+        if set_status == 0 {
+            (*sink_ptr).record(&WfpAuditEntry::control(
+                "net_event_collection_enabled_by_harness".to_string(),
+            ));
+        } else {
+            (*sink_ptr).record(&WfpAuditEntry::control(format!(
+                "net_event_collection_not_enabled_by_harness: FwpmEngineSetOption0 returned \
+                 {set_status:#010x}{}; machine-wide collection is currently {}",
+                if set_status == FWP_E_DYNAMIC_SESSION_IN_PROGRESS {
+                    " (FWP_E_DYNAMIC_SESSION_IN_PROGRESS: engine-wide options cannot be set from \
+                      a dynamic session; subscribing anyway, which still delivers events if \
+                      collection is already enabled machine-wide)"
+                } else {
+                    ""
+                },
+                describe_net_event_collection(engine)
             )));
-            return (None, None);
         }
 
         let subscription = FWPM_NET_EVENT_SUBSCRIPTION0::default();
@@ -494,6 +631,7 @@ fn start_wfp_drop_audit(
             &mut handle,
         );
         if status == 0 {
+            (*sink_ptr).record(&WfpAuditEntry::control("net_event_subscribed".to_string()));
             (Some(handle), Some(sink_ptr))
         } else {
             let sink = Box::from_raw(sink_ptr);
@@ -1039,7 +1177,7 @@ mod tests {
     fn wfp_audit_sink_appends_jsonl() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("net-audit.jsonl");
-        let sink = WfpAuditSink { path: path.clone() };
+        let sink = WfpAuditSink::new(path.clone());
         sink.record(&WfpAuditEntry {
             timestamp_unix_ms: 123,
             kind: "wfp",
@@ -1076,9 +1214,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("net-audit.jsonl");
 
+        // [BUG-094] 綴りは製品が出すものに合わせる。**ここが実物とずれると、
+        // この例は「そういう形の文字列が通る」ことしか言わなくなる。**
         record_control_event(
             &path,
-            "net_event_collection_enable_failed: FwpmEngineSetOption0 returned 0x00000005"
+            "net_event_collection_not_enabled_by_harness: FwpmEngineSetOption0 returned 0x00000005"
                 .to_string(),
         );
 
@@ -1133,7 +1273,7 @@ mod tests {
         )
         .unwrap();
 
-        let sink = WfpAuditSink { path };
+        let sink = WfpAuditSink::new(path);
         assert_eq!(
             sink.lookup_fake_dns_host("198.18.0.1"),
             Some("latest.example".to_string())
@@ -1145,7 +1285,7 @@ mod tests {
     fn wfp_audit_entry_can_include_fake_dns_remote_host() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("net-audit.jsonl");
-        let sink = WfpAuditSink { path: path.clone() };
+        let sink = WfpAuditSink::new(path.clone());
         sink.record(&WfpAuditEntry {
             timestamp_unix_ms: 124,
             kind: "wfp",

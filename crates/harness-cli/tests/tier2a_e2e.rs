@@ -2209,6 +2209,20 @@ fn mock_netfilterd_exe() -> PathBuf {
 /// を差し替えるための専用launcherディレクトリを用意する。`harness.exe`をコピーし、隣に
 /// `tier2a-mock-netfilterd.exe`を`harness-netfilterd.exe`という名前でコピーする。本物の
 /// `target/debug/harness-netfilterd.exe`・共有WFPエンジンには一切触れない。
+///
+/// # **隣に置くものは1つではない**（2026-09-20に07・10が落ちて判明）
+///
+/// harnessは**自分の実行ファイルの隣**から相棒を解決する。したがってこのディレクトリは
+/// 「モックを差し込む場所」であると同時に、**harnessが隣に期待する物すべてを揃える場所**でもある。
+/// 後から`harness-spawnd.exe`（Tier2aの起動に必須）が増えたとき、増やした側は
+/// 本物の`target/debug`しか見ていなかったので、ここだけが取り残された。
+///
+/// 症状は「そのケースだけ**harnessの起動自体が失敗する**」で、**テストは赤くなるが理由が
+/// 測っている対象と無関係**になる（07・10はどちらもWFP不成立時のfail-closedを測る腕なので、
+/// 起動できない限り**その不変条件は1度も確かめられない**）。しかも両ケースは
+/// `--ignored`で通常のテスト実行から外れているため、**誰も気づかないまま空振りし続ける**。
+///
+/// **隣に置く物を増やしたら、ここへも足すこと。**
 fn wfp_fail_closed_launcher_exe() -> PathBuf {
     wfp_fail_closed_launcher_exe_with_mode("_launcher-wfp-failclosed", None)
 }
@@ -2225,6 +2239,24 @@ fn wfp_fail_closed_launcher_exe_with_mode(dir_name: &str, mode: Option<&str>) ->
     std::fs::copy(harness_exe(), &harness_copy).expect("copy harness.exe into launcher dir");
     std::fs::copy(mock_netfilterd_exe(), dir.join("harness-netfilterd.exe"))
         .expect("copy mock netfilterd exe into launcher dir as harness-netfilterd.exe");
+    // **本物をそのまま持ってくる**——ここで差し替えたいのはnetfilterdだけである。
+    // 一覧にしてあるのは、**次に増えたときに足す場所を1箇所にする**ため。
+    // 増えた順に: Spawn Daemon（遷移MACの強制点）、Redirector DLL（透過層の注入元）。
+    let real_dir = harness_exe()
+        .parent()
+        .expect("harness exe has a parent dir")
+        .to_path_buf();
+    for sibling in ["harness-spawnd.exe", "harness_redirector.dll"] {
+        let src = real_dir.join(sibling);
+        std::fs::copy(&src, dir.join(sibling)).unwrap_or_else(|e| {
+            panic!(
+                "copy {sibling} into the launcher dir failed ({}): {e}. \
+                 harness resolves it next to its own exe, so this relocated copy needs it too \
+                 (build the workspace first).",
+                src.display()
+            )
+        });
+    }
     if let Some(mode) = mode {
         std::fs::write(dir.join("mock-mode"), mode).expect("write mock mode marker");
     }
@@ -5031,29 +5063,63 @@ fn tier2a_smb445_layer2() {
 
     // --- `10013`の出どころを分ける。
     //
-    // **`classify_drop`の記録は使えない。** この構成ではWFPのイベント収集を有効化できず
-    // （`FwpmEngineSetOption0`が`FWP_E_DYNAMIC_SESSION_IN_PROGRESS` 0x8032000b を返す。
-    // 動的セッションからは呼べない）、監査には制御レコードだけが載る。**「dropの記録が無い」を
-    // 「dropしていない」と読まないため、ここで理由まで確かめておく**（B-10: 記録の不在は事実の不在ではない）。
+    // **`classify_drop`の記録があるとは限らない。** harnessはWFPセッションを**動的**で開く
+    // （持ち主が死ねばOSが登録を自動で消す＝フェイルセーフの根拠）が、イベント収集の有効化は
+    // エンジン全体の設定なので、動的セッションの中からは呼べない
+    // （`FwpmEngineSetOption0`が`FWP_E_DYNAMIC_SESSION_IN_PROGRESS` 0x8032000b を返す）。
+    // **「dropの記録が無い」を「dropしていない」と読まないため、ここで理由まで確かめておく**
+    // （B-10: 記録の不在は事実の不在ではない）。
+    //
+    // [BUG-094] **ここが案Bの測定点でもある。** 収集を有効化できなくても購読だけは試すように
+    // したので（`wfp.rs`の`start_wfp_drop_audit`）、**マシン側で既に収集が有効なら
+    // イベントが届く**。届いたかどうかは`classify_drop`の有無がそのまま答えになる。
     let audit_entries = collect_audit_entries(&ws.join(".harness").join("sandbox"))
         .unwrap_or_else(|e| panic!("{e}"));
-    let collection_disabled = audit_entries.iter().any(|e| {
-        e.get("reason")
-            .and_then(|r| r.as_str())
-            .is_some_and(|r| r.starts_with("net_event_collection_enable_failed"))
-    });
+    let control_reason = |needle: &str| {
+        audit_entries.iter().any(|e| {
+            e.get("reason")
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| r.starts_with(needle))
+        })
+    };
+    let collection_enabled_by_harness = control_reason("net_event_collection_enabled_by_harness");
+    let collection_not_enabled = control_reason("net_event_collection_not_enabled_by_harness");
+    let subscribed = control_reason("net_event_subscribed");
+    let subscribe_failed = control_reason("net_event_subscribe_failed");
     let has_drop_445 = audit_entries.iter().any(|e| {
         e.get("reason").and_then(|r| r.as_str()) == Some("classify_drop")
             && e.get("remote_port").and_then(|p| p.as_u64()) == Some(445)
     });
+    // **有効化の可否と購読の可否は別々に載る**（旧実装は前者で失敗すると後者を試さなかった）。
+    // どちらかの制御レコードが必ず在ることを要求する——両方無いなら監査は何も言っていない。
     assert!(
-        has_drop_445 || collection_disabled,
-        "445のdrop記録も、収集が無効だという制御レコードも無い。\
-         **この監査ログは何も言っていない**ので、10013の出どころを主張できない。audit={audit_entries:?}"
+        collection_enabled_by_harness || collection_not_enabled,
+        "[BUG-094] イベント収集の有効化について、成功も失敗も記録されていない。\
+         **この監査ログは何も言っていない**ので、10013の出どころを主張できない。\
+         audit={audit_entries:?}"
+    );
+    assert!(
+        subscribed || subscribe_failed,
+        "[BUG-094] 購読を試した形跡が無い。有効化に失敗しても購読は試すはず\
+         （マシン側で既に収集が有効なら、それでイベントが届く）。audit={audit_entries:?}"
     );
     eprintln!(
-        "[N8-③-C-WFP] wfp classify_drop記録={has_drop_445} / イベント収集が無効={collection_disabled}"
+        "[N8-③-C-WFP][BUG-094] harnessが収集を有効化できた={collection_enabled_by_harness} / \
+         できなかった={collection_not_enabled} / 購読できた={subscribed} / \
+         445のclassify_drop記録={has_drop_445}"
     );
+    // **判定の元になった文字列そのものを出す。** 上の真偽値は前方一致で畳んだ結果なので、
+    // 「イベントが来ない理由」——マシン全体の収集が無効なのか、有効なのに来ないのか——は
+    // ここを読まないと分からない（BUG-094の結論が分岐する唯一の材料）。成功した回は
+    // ワークスペースごと片付くので、**ログに残すのがこの事実を残す唯一の口**である。
+    for e in &audit_entries {
+        if e.get("protocol").and_then(|p| p.as_str()) == Some("control") {
+            eprintln!(
+                "[N8-③-C-WFP][BUG-094] control: {}",
+                e.get("reason").and_then(|r| r.as_str()).unwrap_or("<none>")
+            );
+        }
+    }
 
     // 代わりに**分岐を固定する**。`10013`は「WFPの既定拒否」でも「network capabilityが無い」でも
     // 出るので、後者の分岐を通っていないことを、その分岐だけが出す文言の**不在**で押さえる
@@ -7965,7 +8031,7 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
         std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())
     );
     // 遷移先は**宣言を1件も持たない**（持たせると用意できず、測っているものが変わる）。
-    declare_chain(&ws, &[findstr.clone()])
+    declare_chain(&ws, std::slice::from_ref(&findstr))
         .unwrap_or_else(|e| panic!("遷移の宣言を書けなかった: {e}"));
     assert_chain_crosses_domains(&ws, "狭まり", 1);
 
@@ -8090,11 +8156,12 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
         ));
     }
     if child_outside == "0" {
-        failures.push(format!(
+        failures.push(
             "**遷移先ドメインが、呼び出し元にしか無いはずの許可で外のファイルを読めた。**\
              宣言ごとのcapabilityが遷移先の土台へ漏れている——ドメインを分けても\
              **権限は1ビットも狭まっていない**（§10.1.2が却下した形と同じ結果）"
-        ));
+                .to_string(),
+        );
     }
 
     // --- 反転の対照: **遷移先に同じ鍵を渡すと、読めるようになるか** ---
