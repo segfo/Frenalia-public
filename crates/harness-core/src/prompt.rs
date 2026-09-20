@@ -403,35 +403,24 @@ fn render_read_scope(read_scope: &ReadScopeConfig) -> String {
                     extra.join("、")
                 )
             };
-            // **[BUG-124] ワークスペース内の除外はモードに依らず効いている。**
-            // `SandboxFs::read_to_string`はworkspace相対パスに対して`mode`を見ずに
-            // `is_denied_rel`を通し、walkも同じ判定で結果から落とす
-            // （`crates/harness-sandbox/src/overlay.rs`の2箇所）。**効いているのに
-            // whitelist側だけ宣言していなかった**ので、読めないものを読もうとし続ける。
+            // **[BUG-124] 除外はモードにも場所にも依らず効く。**
+            // 以前はここが2つの意味で実態とずれていた——(1) whitelist側が除外を
+            // 1文字も宣言していなかった（2026-09-04に解消）、(2) その宣言が
+            // 「ワークスペース内だけ・名前の完全一致だけ」という限定を述べていた。
+            // (2)は**限定そのものを消した**ので（`ReadScope::is_denied_rel`と
+            // `read_external_to_string`）、宣言も揃える。
             //
-            // **限定詞を落とさないこと**——効くのは「各階層の名前との完全一致」であって
-            // パスの前方一致ではない（`ReadScope::is_denied_rel`）。前方一致だと読ませると、
-            // モデルは`src/secrets/`のような綴りで除外できると誤解する。
+            // **限定詞を落とさないこと**——区切りを含む綴りと含まない綴りで意味が違う。
+            // これを書かないと、モデルは`src/secret.txt`と書いたものが
+            // **どの階層の`secret.txt`にも当たる**と誤解する（逆もある）。
             let excluded = dedup_preserving_order(deny.iter().chain(deny_descend.iter()));
             if !excluded.is_empty() {
                 line.push_str(&format!(
-                    "ワークスペース内でも次の名前を含むパスは読めません（パスの前方一致ではなく、\
-                     各階層の名前との完全一致）: {}。",
+                    "次は読めません（ワークスペース内・外部パスのどちらでも。`/`を含む綴りは\
+                     ワークスペースルートからの位置、含まない綴りはどの階層のその名前にも当たります。\
+                     大小は区別しません）: {}。",
                     excluded.join("、")
                 ));
-                // **[BUG-124] 効く範囲を述べたら、効かない範囲も同じ場所で述べる。**
-                // whitelistの外部読取（`ReadScope::read_external_to_string`のWhitelist分岐）は
-                // `find_allow_root`を通すだけで除外判定を1度も呼ばない。上の1文だけを読むと
-                // 「denyと書いたのだから外部ルートの中でも閉じている」と読めてしまう。
-                //
-                // **挙動の側は変えていない**——`read.deny`を外部にも効かせるかは
-                // 設定キー表（`plans/DESIGN-SANDBOX.md` §5.1、「確定」と題した表）に触る決定なので、
-                // ここでは宣言だけを実態へ合わせる。
-                if !allow.is_empty() || !allow_descend.is_empty() {
-                    line.push_str(
-                        "この除外はワークスペース内だけに効き、上に挙げた外部パスには適用されません。",
-                    );
-                }
             }
             line
         }
@@ -1213,22 +1202,35 @@ mod tests {
         let ctx = ToolCtx::new(PathBuf::from("/workspace"));
         let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
 
-        assert!(
-            !rendered.contains("ワークスペース内でも次の名前"),
-            "{rendered}"
-        );
+        assert!(!rendered.contains("次は読めません"), "{rendered}");
     }
 
-    /// **[BUG-124] 限定詞。** whitelistで外部ルートを開いているとき、`read.deny`は
-    /// **その外部ルートには効かない**——`ReadScope::read_external_to_string`のWhitelist分岐は
-    /// `find_allow_root`を通すだけで`is_denied_abs`を1度も呼ばない
-    /// （`crates/harness-sandbox/src/read_scope.rs`）。
+    /// **[BUG-124] 限定詞。** 2つの綴り方で意味が違うことを宣言に出す。
     ///
-    /// **効く範囲だけ述べて効かない範囲を黙ると、「denyと書いたのだから閉じている」と読まれる。**
-    /// 挙動の側を変えるかは設定キー表（`plans/DESIGN-SANDBOX.md` §5.1、「確定」と題した表）に
-    /// 触る決定なので別途。ここでは**宣言を実態に合わせる**ところまでを行う。
+    /// これを落とすと、モデルは`src/secret.txt`と書いた除外が**どの階層の
+    /// `secret.txt`にも当たる**と読む（`ReadScope::is_denied_rel`は
+    /// 区切りを含む綴りをルートからの位置として扱う）。
+    /// **除外の宣言は「何が読めないか」だけでなく「どう綴ると何に当たるか」まで運ぶ。**
     #[test]
-    fn read_scope_whitelist_states_that_exclusions_do_not_cover_external_roots() {
+    fn read_scope_whitelist_states_how_the_two_spellings_differ() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.read_scope.deny.push("secrets".to_string());
+        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+
+        assert!(
+            rendered.contains("ワークスペースルートからの位置"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("どの階層のその名前"), "{rendered}");
+    }
+
+    /// **[BUG-124] 対の裏返し。** 除外が外部パスにも効くことを述べる。
+    ///
+    /// 2026-09-04時点ではここは逆で、「外部パスには適用されません」と述べていた
+    /// ——当時はそれが事実だったためである。**挙動を変えたので宣言も反転させる**
+    /// （`ReadScope::read_external_to_string`がモードに依らず`is_denied_abs`を通す）。
+    #[test]
+    fn read_scope_whitelist_no_longer_claims_exclusions_stop_at_the_workspace() {
         let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
         ctx.read_scope
             .allow_descend
@@ -1237,21 +1239,11 @@ mod tests {
         let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
 
         assert!(
-            rendered.contains("外部パスには適用されません"),
-            "{rendered}"
-        );
-    }
-
-    /// **[BUG-124] 限定詞の対。** 外部ルートを開いていなければ、その但し書きは出さない
-    /// （出す条件を持たない実装でも許可側が通ってしまうため）。
-    #[test]
-    fn read_scope_whitelist_omits_the_external_caveat_without_external_roots() {
-        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
-        ctx.read_scope.deny.push("secrets".to_string());
-        let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
-
-        assert!(
             !rendered.contains("外部パスには適用されません"),
+            "挙動を変えたのに古い限定詞が残っている: {rendered}"
+        );
+        assert!(
+            rendered.contains("ワークスペース内・外部パスのどちらでも"),
             "{rendered}"
         );
     }

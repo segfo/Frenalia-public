@@ -58,9 +58,20 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
         );
     }
 
-    // カレントディレクトリの`.env`があれば読み込み、プロセスのenvへ反映する（既存の環境変数は
-    // 上書きしない、§設定とシークレット「ユーザ/プロジェクト設定」相当の簡易版）。無ければ無視する。
-    let _ = dotenvy::dotenv();
+    // ユーザー層（`%APPDATA%\harness\config\.env`）の`.env`だけを読み、プロセスのenvへ反映する
+    // （既存の環境変数は上書きしない）。**リポジトリに同梱された`.env`は読まない**
+    // ——APIの宛先も昇格対象の検査もそこから変えられるため（[BUG-115]、`super::dotenv`のdoc）。
+    // 見つけたが読まなかったものは無言にせず告げる（`B-10`）。
+    //
+    // [BUG-115]: ../../../../../docs/bugs/BUG-115.md
+    {
+        let config_dir = harness_grant_ledger::config_dir();
+        let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let plan = super::dotenv::plan(config_dir.as_deref(), &start);
+        if let Some(notice) = super::dotenv::apply(&plan) {
+            eprintln!("{notice}");
+        }
+    }
 
     let mut cli = Cli::parse();
 

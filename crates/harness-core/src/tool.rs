@@ -85,11 +85,16 @@ pub struct ReadScopeConfig {
     pub allow: Vec<std::path::PathBuf>,
     /// 再帰読取を許可する外部ルート。
     pub allow_descend: Vec<std::path::PathBuf>,
-    /// 読取禁止（blacklistモードで使用）。絶対パス、またはworkspace内の任意の階層に現れる
-    /// 名前（例 `.git`）のいずれかとして解釈する。
+    /// 読取禁止。**whitelist/blacklist両モードで使う**（2026-09-20、
+    /// [BUG-124](../../../docs/bugs/BUG-124.md)。旧版は「blacklistモードで使用」と冠しながら
+    /// 後半でworkspace内の名前一致に触れており、**1行の中で食い違っていた**）。
+    ///
+    /// 綴りで意味が分かれる——`/`（または`\`）を含めばルートからの**位置**（配下も含む）、
+    /// 含まなければ**どの階層のその名前**にも当たる。大小は区別しない。
+    /// 例: `.git`・`~/.ssh`・`src/secret.txt`。
     pub deny: Vec<String>,
     /// 掘り下げ禁止（配下をwalkしない）。whitelist/blacklist両モードで使う
-    /// （例 `node_modules`・`.git`）。
+    /// （例 `node_modules`・`.git`）。**判定規則は[`Self::deny`]と同じ。**
     pub deny_descend: Vec<String>,
 }
 

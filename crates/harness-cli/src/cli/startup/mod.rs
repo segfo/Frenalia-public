@@ -9,6 +9,8 @@ use std::process::ExitCode;
 use super::*;
 
 mod configure;
+/// `.env`の読み込み。**リポジトリ同梱の`.env`は読まない**（BUG-115）。
+mod dotenv;
 mod mcp;
 mod parse_args;
 /// `/workspace`（`harness_tui::RunOutcome::Relaunch`）の再起動と、その引数の組み立て。

@@ -157,6 +157,18 @@ fn build_merge_attempt(
     let mut env = crate::secret_env::build_child_env();
     env.extend(crate::secret_env::git_hardening_env());
     let output = Command::new(git)
+        // [BUG-150] **一時ディレクトリの中で走らせる。** 3つの入力はすべてここにある絶対パスで、
+        // この操作はリポジトリと何の関係も無い。にもかかわらず`current_dir`を指定しないと、
+        // gitはharnessのカレントディレクトリ（＝ワークスペース）を起点にリポジトリを探し当て、
+        // **攻撃者が書ける`.git/config`を読む**。
+        //
+        // 実測では`merge-file`はその設定から外部プログラムを起こさなかった
+        // （11キーを仕掛けて0件発火。同じディレクトリ・同じ設定で`git add`は`filter.clean`を
+        // 発火させたので計器は生きている。git 2.51.1.windows.1、2026-09-20）。
+        // **ここを変えるのは塞いだ穴があるからではなく、その性質がgitの版に依存しないように
+        // するためである**——結合そのものを外せば、次の版で`merge-file`が何を読むように
+        // なっても影響を受けない。
+        .current_dir(tmp_dir)
         .env_clear()
         .envs(env)
         .arg("merge-file")
