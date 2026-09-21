@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use windows::core::GUID;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{FILETIME, HANDLE};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineGetOption0, FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0,
     FwpmFilterCreateEnumHandle0, FwpmFilterDeleteById0, FwpmFilterDestroyEnumHandle0,
@@ -174,6 +174,12 @@ struct WfpAuditSink {
     events_seen: std::sync::atomic::AtomicU64,
     /// そのうち実際に記録したもの（＝`classify_drop`だったもの）。
     drops_recorded: std::sync::atomic::AtomicU64,
+    /// [BUG-094] 購読が成立した時刻（unix ms）。**まだ購読していなければ0。**
+    ///
+    /// イベントを受け取れる窓は「ここ」から「撤収でこのシンクが要約を書くまで」である。
+    /// 各イベントの発生時刻がこの窓の内か外かが、
+    /// **「届かなかった」と「窓が閉じた後に届いた」を分ける唯一の材料**になる。
+    subscribed_at_unix_ms: std::sync::atomic::AtomicU64,
 }
 
 impl WfpAuditSink {
@@ -182,23 +188,49 @@ impl WfpAuditSink {
             path,
             events_seen: std::sync::atomic::AtomicU64::new(0),
             drops_recorded: std::sync::atomic::AtomicU64::new(0),
+            subscribed_at_unix_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
+    /// [BUG-094] 購読が成立した時刻を控える。**要約の行で窓の始まりを言うため。**
+    fn mark_subscribed(&self) {
+        self.subscribed_at_unix_ms
+            .store(now_unix_ms() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// [BUG-094] 撤収時に1行だけ残す要約。**0件の意味を言えるようにするためのもの。**
+    ///
+    /// **購読していた窓の始まりも同じ行に出す。** 終わりはこのレコード自身の
+    /// `timestamp_unix_ms`である。窓の両端は`net_event_subscribed`レコードと突き合わせても
+    /// 引けるが、**2レコードを跨いで読ませると突き合わせのたびに取り違える**——
+    /// 各イベントの発生時刻が窓の内か外かは、この1行だけで判定できる必要がある。
     fn record_event_summary(&self) {
         use std::sync::atomic::Ordering;
         let seen = self.events_seen.load(Ordering::Relaxed);
         let recorded = self.drops_recorded.load(Ordering::Relaxed);
+        let subscribed_at = self.subscribed_at_unix_ms.load(Ordering::Relaxed);
         self.record(&WfpAuditEntry::control(format!(
-            "net_event_summary: callback_invocations={seen} classify_drop_recorded={recorded}"
+            "net_event_summary: callback_invocations={seen} classify_drop_recorded={recorded} \
+             subscribed_at_unix_ms={subscribed_at}"
         )));
     }
 }
 
 #[derive(Debug, Serialize)]
 struct WfpAuditEntry {
+    /// **この記録を書いた時刻**（＝コールバックが呼ばれた時刻）。
+    ///
+    /// [`Self::event_unix_ms`]と**別物である**。片方へ寄せてはいけない
+    /// ——2つの差が、WFPがイベントを配送するまでの遅れそのものになる（[BUG-094]）。
+    ///
+    /// [BUG-094]: ../../../../docs/bugs/BUG-094.md
     timestamp_unix_ms: u128,
+    /// [BUG-094] **そのイベント自身が持つ発生時刻**（`FWPM_NET_EVENT_HEADER1.timeStamp`）。
+    ///
+    /// ネットワークイベント以外（制御レコード）では`None`。
+    /// 値が載っていない・1970年より前のときも`None`になる（[`filetime_to_unix_ms`]）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_unix_ms: Option<u128>,
     kind: &'static str,
     protocol: &'static str,
     allowed: bool,
@@ -224,6 +256,9 @@ impl WfpAuditEntry {
     fn control(reason: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         Self {
             timestamp_unix_ms: now_unix_ms(),
+            // 制御レコードは「harnessが何をしたか」であってネットワークイベントではないので、
+            // 発生時刻という概念を持たない。
+            event_unix_ms: None,
             kind: "wfp",
             protocol: CONTROL_PROTOCOL,
             allowed: false,
@@ -326,6 +361,9 @@ unsafe extern "system" fn wfp_net_event_callback(
         .and_then(|addr| sink.lookup_fake_dns_host(addr));
     let entry = WfpAuditEntry {
         timestamp_unix_ms: now_unix_ms(),
+        // [BUG-094] **受信時刻とは別に、イベント自身の発生時刻を載せる。**
+        // これが無いと「そもそも届かなかった」と「窓が閉じた後に届いた」を区別できない。
+        event_unix_ms: filetime_to_unix_ms(header.timeStamp),
         kind: "wfp",
         protocol: protocol_name(header.ipProtocol),
         allowed: false,
@@ -358,6 +396,31 @@ fn now_unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// 1601-01-01から1970-01-01までの`FILETIME`の刻み数（100ナノ秒単位）。
+const FILETIME_TICKS_AT_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+
+/// [BUG-094] `FILETIME`（1601年起点・100ナノ秒刻み）をunix msへ直す。
+///
+/// # なぜ要るのか
+///
+/// WFPのイベントは**自分がいつ起きたか**を`FWPM_NET_EVENT_HEADER1.timeStamp`で持っている。
+/// これまでのコールバックは**受信時刻だけ**を記録していたので、
+/// 「届かなかった」と「遅れて届いた」を区別する材料が無かった。
+/// **2つの時刻の差がそのまま配送の遅れ**である。
+///
+/// # 1970より前は`None`を返す
+///
+/// 0埋めの`FILETIME`（＝値が載っていない）と、本当に1601〜1969年の時刻とを区別しない。
+/// **区別する必要が無いから**ではなく、**どちらも「使える時刻ではない」から**である
+/// ——ネットワークイベントの発生時刻が1970年より前になることは無い。
+/// 引き算で桁が回り込むのを防ぐ意味もある。
+fn filetime_to_unix_ms(ft: FILETIME) -> Option<u128> {
+    let ticks = ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
+    ticks
+        .checked_sub(FILETIME_TICKS_AT_UNIX_EPOCH)
+        .map(|since_epoch| (since_epoch / 10_000) as u128)
 }
 
 /// loopback exemptionの確保（D-36）。「既に載っていれば何もしない／自分が載せた場合だけ外す」
@@ -631,6 +694,9 @@ fn start_wfp_drop_audit(
             &mut handle,
         );
         if status == 0 {
+            // [BUG-094] **記録より先に控える。** 窓の始まりは「購読が成立した瞬間」であって
+            // 「そう書き残せた瞬間」ではない（記録はファイルI/Oを挟む）。
+            (*sink_ptr).mark_subscribed();
             (*sink_ptr).record(&WfpAuditEntry::control("net_event_subscribed".to_string()));
             (Some(handle), Some(sink_ptr))
         } else {
@@ -1180,6 +1246,7 @@ mod tests {
         let sink = WfpAuditSink::new(path.clone());
         sink.record(&WfpAuditEntry {
             timestamp_unix_ms: 123,
+            event_unix_ms: None,
             kind: "wfp",
             protocol: "tcp",
             allowed: false,
@@ -1288,6 +1355,7 @@ mod tests {
         let sink = WfpAuditSink::new(path.clone());
         sink.record(&WfpAuditEntry {
             timestamp_unix_ms: 124,
+            event_unix_ms: Some(120),
             kind: "wfp",
             protocol: "tcp",
             allowed: false,
@@ -1305,6 +1373,98 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(value["remote_addr"], "198.18.0.1");
         assert_eq!(value["remote_host"], "example.com");
+        // [BUG-094] **受信時刻と発生時刻が別々に載ること。** 片方へ寄せると、
+        // 配送の遅れを後から引けなくなる。
+        assert_eq!(value["timestamp_unix_ms"], 124);
+        assert_eq!(value["event_unix_ms"], 120);
+    }
+
+    /// [BUG-094] 制御レコードには発生時刻を**載せない**（キーごと出さない）。
+    ///
+    /// **許可側（上のテスト）と対にする**（`B-35`）——常に載せる実装でも、
+    /// 常に載せない実装でも、片側だけなら通ってしまう。
+    #[test]
+    fn a_control_record_carries_no_event_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net-audit.jsonl");
+        let sink = WfpAuditSink::new(path.clone());
+        sink.record(&WfpAuditEntry::control("net_event_subscribed".to_string()));
+
+        let text = std::fs::read_to_string(path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert!(
+            value.get("event_unix_ms").is_none(),
+            "制御レコードは発生時刻を持たない。得たもの: {value}"
+        );
+    }
+
+    /// [BUG-094] 撤収時の要約に**窓の始まり**が載ること。
+    ///
+    /// 窓の終わりはこのレコード自身の`timestamp_unix_ms`なので、
+    /// この1行だけで「あるイベントが窓の内か外か」を判定できる。
+    #[test]
+    fn the_summary_line_states_when_the_subscription_window_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net-audit.jsonl");
+        let sink = WfpAuditSink::new(path.clone());
+        sink.mark_subscribed();
+        sink.record_event_summary();
+
+        let text = std::fs::read_to_string(path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        let reason = value["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("subscribed_at_unix_ms="),
+            "窓の始まりが要約に無い: {reason}"
+        );
+        assert!(
+            !reason.contains("subscribed_at_unix_ms=0"),
+            "`mark_subscribed`を呼んだのに0のまま＝控えていない: {reason}"
+        );
+    }
+
+    /// [BUG-094] `FILETIME`の変換。**実際の値で検算する。**
+    ///
+    /// 1970-01-01T00:00:00Zちょうどの`FILETIME`は`116_444_736_000_000_000`刻みで、
+    /// そこから1秒進めれば1000msになる——**自分で書いた定数を自分で使って確かめない**ため、
+    /// 期待値は刻み数から手で組み立てている。
+    #[test]
+    fn a_filetime_becomes_unix_milliseconds() {
+        let at = |ticks: u64| FILETIME {
+            dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+        // 1970-01-01T00:00:00Z ちょうど。
+        assert_eq!(filetime_to_unix_ms(at(116_444_736_000_000_000)), Some(0));
+        // その1秒後（100ナノ秒刻みなので1秒＝1000万刻み）。
+        assert_eq!(
+            filetime_to_unix_ms(at(116_444_736_000_000_000 + 10_000_000)),
+            Some(1000)
+        );
+        // 上位ワードをまたぐ値でも桁が壊れないこと（`u32`2本を繋ぐ実装の検算）。
+        // `2^32`刻み＝`4_294_967_296 / 10_000`ms。**下位ワードだけを見る実装ならここで落ちる。**
+        assert_eq!(
+            filetime_to_unix_ms(at(116_444_736_000_000_000 + 4_294_967_296)),
+            Some(429_496)
+        );
+    }
+
+    /// [BUG-094] 禁止側の対——値が載っていない／1970より前は`None`。
+    ///
+    /// **これが無いと、0埋めの`FILETIME`が「1601年に起きたイベント」として記録される**
+    /// （引き算が回り込むと、もっとひどい値になる）。
+    #[test]
+    fn a_filetime_before_the_unix_epoch_is_rejected() {
+        let at = |ticks: u64| FILETIME {
+            dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+        assert_eq!(filetime_to_unix_ms(at(0)), None, "0埋めは時刻ではない");
+        assert_eq!(
+            filetime_to_unix_ms(at(116_444_736_000_000_000 - 1)),
+            None,
+            "unixエポックの直前も使える時刻として扱わない"
+        );
     }
 
     /// `docs/STATUS.md` Tier2a残課題#8の再現。プロバイダ/サブレイヤーGUIDは固定値なので、

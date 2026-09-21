@@ -2247,6 +2247,82 @@ fn report_net_event_audit(name: &str, audit_entries: &[serde_json::Value]) {
         eprintln!("[BUG-094][{name}] control: {r}");
     }
     eprintln!("[BUG-094][{name}] classify_drop記録={classify_drops}");
+    report_delivery_lag(name, audit_entries, &net_event_controls);
+}
+
+/// [BUG-094] **届いたイベントが「自分の窓の中で起きたもの」かを出す。**
+///
+/// # 何を分けたいのか
+///
+/// 購読はharnessの実行ごとに張って畳むので、窓は短い。WFPの配送が非同期なら、
+/// **畳んだ後に届いた分は捨てられ**、間に合った分だけが**そのとき生きている購読**へ着地する。
+/// それが起きているなら、届いたイベントの**発生時刻が自分の窓より前**になる。
+///
+/// 窓の両端は要約レコード1行で足りる——始まりは`subscribed_at_unix_ms=`、
+/// 終わりはその要約自身の`timestamp_unix_ms`（撤収時に書くため）。
+///
+/// # 判定しない
+///
+/// 呼び出し元と同じ理由で`assert`を置かない。**数えた値を残すところまで**が仕事である。
+fn report_delivery_lag(name: &str, audit_entries: &[serde_json::Value], controls: &[&&str]) {
+    let summary = controls.iter().find(|r| r.starts_with("net_event_summary"));
+    let window_opened: Option<u64> = summary.and_then(|r| {
+        r.split("subscribed_at_unix_ms=")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    });
+    let window_closed: Option<u64> = audit_entries
+        .iter()
+        .find(|e| {
+            e.get("reason")
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| r.starts_with("net_event_summary"))
+        })
+        .and_then(|e| e.get("timestamp_unix_ms").and_then(|t| t.as_u64()));
+    let (Some(opened), Some(closed)) = (window_opened, window_closed) else {
+        // **黙って飛ばさない。** 窓が引けないこと自体が、次に直す場所を指している。
+        eprintln!(
+            "[BUG-094][{name}] 購読の窓を引けなかった（要約に`subscribed_at_unix_ms=`が無いか、\
+             要約レコード自体が無い）。古いnetfilterdが動いていないか確かめること"
+        );
+        return;
+    };
+    eprintln!(
+        "[BUG-094][{name}] 購読の窓: {opened} 〜 {closed}（unix ms、幅{}ms）",
+        closed.saturating_sub(opened)
+    );
+    for e in audit_entries
+        .iter()
+        .filter(|e| e.get("reason").and_then(|r| r.as_str()) == Some("classify_drop"))
+    {
+        let received = e.get("timestamp_unix_ms").and_then(|t| t.as_u64());
+        let occurred = e.get("event_unix_ms").and_then(|t| t.as_u64());
+        let verdict = match (occurred, received) {
+            (None, _) => "発生時刻が載っていない（古いnetfilterdが書いた行）".to_string(),
+            (Some(o), _) if o < opened => {
+                format!(
+                    "**窓が開く{}ms前**に起きたもの＝前の購読の落とし分",
+                    opened - o
+                )
+            }
+            (Some(o), _) if o > closed => format!("窓が閉じた{}ms後に起きたもの", o - closed),
+            (Some(o), Some(r)) => format!("窓の中。配送の遅れ={}ms", r.saturating_sub(o)),
+            (Some(_), None) => "窓の中（受信時刻が読めない）".to_string(),
+        };
+        // **宛先まで出す。** 購読テンプレートは`default()`＝絞り込み無しなので、
+        // このコールバックはharnessが張ったフィルタの落とし分だけを受け取るとは限らない。
+        // 「自分が塞いだ通信か、マシン上の無関係な通信か」は宛先を見ないと言えない。
+        let peer = e.get("remote_addr").and_then(|a| a.as_str()).unwrap_or("?");
+        let port = e.get("remote_port").and_then(|p| p.as_u64()).unwrap_or(0);
+        let filter = e.get("filter_id").and_then(|f| f.as_u64());
+        eprintln!(
+            "[BUG-094][{name}] classify_drop 宛先={peer}:{port} filter={filter:?} \
+             発生={occurred:?} 受信={received:?} → {verdict}"
+        );
+    }
 }
 
 /// `.harness/sandbox/**/net-audit.jsonl`を全て読み、JSON行を集める(kind:proxy/wfp/fake_dns
