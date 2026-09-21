@@ -27,10 +27,11 @@ use windows::Win32::Foundation::{FILETIME, HANDLE};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineGetOption0, FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0,
     FwpmFilterCreateEnumHandle0, FwpmFilterDeleteById0, FwpmFilterDestroyEnumHandle0,
-    FwpmFilterEnum0, FwpmFreeMemory0, FwpmNetEventSubscribe0, FwpmNetEventUnsubscribe0,
-    FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
-    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0,
-    FWPM_ACTION0_0, FWPM_CONDITION_ALE_PACKAGE_ID, FWPM_CONDITION_IP_PROTOCOL,
+    FwpmFilterEnum0, FwpmFreeMemory0, FwpmNetEventCreateEnumHandle0,
+    FwpmNetEventDestroyEnumHandle0, FwpmNetEventEnum1, FwpmNetEventSubscribe0,
+    FwpmNetEventUnsubscribe0, FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0,
+    FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
+    FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_PACKAGE_ID, FWPM_CONDITION_IP_PROTOCOL,
     FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0,
     FWPM_ENGINE_COLLECT_NET_EVENTS, FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS, FWPM_FILTER0,
     FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_NONE, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
@@ -136,26 +137,233 @@ pub struct WfpOptions {
     pub allow_loopback_tcp_ports: Vec<u16>,
     /// UDPで許可するloopback宛先ポート。Fake DNS UDPをここへ入れる。
     pub allow_loopback_udp_ports: Vec<u16>,
-    /// WFP block/drop監査イベントを追記するJSONLパス。`None`ならWFP監査購読を起動しない。
-    pub audit_log_path: Option<PathBuf>,
 }
+
+// [BUG-094 案G] `audit_log_path`はここから外した。監査の書込先は**フィルタの世代ではなく
+// daemonの生存**に紐づくようになったので（[`WfpAuditSubscription`]）、
+// 世代ごとのオプションに置いておくと「世代と一緒に閉じる」と読める。
+// **黙って無視するフィールドを残さない**——読まれない設定は、効いていると誤読される。
 
 /// 適用済みWFPセッション。`teardown`を呼ぶまでエンジンハンドルを保持し続ける
 /// （＝フィルタが有効であり続ける、DYNAMICセッションの性質そのもの）。
 pub struct WfpSession {
     keys: SessionKeys,
     engine: HANDLE,
-    event_subscription: Option<HANDLE>,
-    audit_context: Option<*mut WfpAuditSink>,
     loopback_exemption: Option<LoopbackExemptionGuard>,
 }
 
 // HANDLEは値として複数スレッド間で運んでよい（他の`win_*`モジュールと同じ扱い）。
 unsafe impl Send for WfpSession {}
 
+/// [BUG-094 案G] WFPが落としたパケットの記録。**フィルタの世代ではなくdaemonの生存に紐づく。**
+///
+/// # なぜ世代から切り離したのか
+///
+/// 実測で、WFPは**最初の未配送イベントから約1秒後にまとめて**配送する
+/// （[`plans/net-spike/RESULTS.md`](../../../../plans/net-spike/RESULTS.md) N10・N11）。
+/// 購読を[`WfpSession`]が持っていた頃は窓が**1.2〜2.0秒**しか開かず、
+/// 拒否が窓の後半で起きた回は**配送の前に窓が閉じて取りこぼしていた**
+/// ——実測で腕A（待たずに畳む）は3回とも0件である。
+///
+/// 持ち主をdaemonへ移すと、実行の切れ目でも購読は閉じない。移るのは**書込先だけ**である。
+///
+/// # 待機中のdaemonがこれを握ってよい根拠（`D-56`不変条件1の改訂）
+///
+/// - **観測専用で、強制を1つも持たない。** フィルタは[`WfpSession`]側にあり、
+///   不変条件1の目的（待機中に強制が残らない）はそのまま成立する
+/// - エンジンハンドルは**動的セッション**（`FWPM_SESSION_FLAG_DYNAMIC`）なので、
+///   daemonが死ねばOSが登録ごと消す。フェイルセーフの根拠は変わらない
+/// - 購読は読み取りしかできない。ここから通信を通すことも塞ぐこともできない
+///
+/// # 限界（**同じ場所に書く**）
+///
+/// - **daemonが終わる直前の約1秒は、いまも取りこぼす。** 最後の配送を待たずに畳むためで、
+///   これを埋めるには撤収時の猶予（案F）が要る
+/// - **購読テンプレートは絞り込み無し**なので、マシン上の他の拒否も受け取り得る。
+///   記録された拒否がこのセッションのフィルタによるものかは**確かめていない**
+pub struct WfpAuditSubscription {
+    engine: HANDLE,
+    subscription: HANDLE,
+    /// `Box::into_raw`で漏らしたシンク。コールバックが生ポインタで触るので、
+    /// **アドレスが動かないこと**が要る。所有権は[`Self::teardown`]が回収する。
+    sink: *mut WfpAuditSink,
+}
+
+// HANDLEと、アドレスを固定したシンクへの生ポインタ。`WfpSession`と同じ扱い。
+unsafe impl Send for WfpAuditSubscription {}
+
+impl WfpAuditSubscription {
+    /// 監査専用のエンジンハンドルを1本開き、購読を始める。
+    ///
+    /// **失敗しても`None`を返すだけで、呼び出し側を止めない**——記録は境界ではない（`P-07`）。
+    /// 失敗の理由は制御レコードとして監査ファイルへ残る（`start_wfp_drop_audit`）。
+    pub fn start(validated_audit_log_path: PathBuf) -> Option<Self> {
+        let engine = open_dynamic_engine().ok()?;
+        let (subscription, sink) = start_wfp_drop_audit(engine, Some(validated_audit_log_path));
+        match (subscription, sink) {
+            (Some(subscription), Some(sink)) => Some(Self {
+                engine,
+                subscription,
+                sink,
+            }),
+            _ => {
+                // 購読できなかったならエンジンを持ち続ける理由が無い。
+                unsafe {
+                    let _ = FwpmEngineClose0(engine);
+                }
+                None
+            }
+        }
+    }
+
+    /// 書込先を次の実行のものへ移す。**検証済みのパスだけを渡すこと**（D-44）。
+    ///
+    /// **移す前に取り残しを回収する**（[`Self::drain_pending`]）——移した後だと、
+    /// 前の実行で落ちた拒否が次の実行のファイルへ落ちる。
+    pub fn set_audit_log_path(&self, validated_audit_log_path: PathBuf) {
+        self.drain_pending();
+        unsafe { (*self.sink).set_path(validated_audit_log_path) };
+    }
+
+    /// **まだ書けていない拒否を、押し出しを待たずに取りに行って書く。**
+    ///
+    /// # なぜ待つのではなく取りに行くのか
+    ///
+    /// 押し出し（購読のコールバック）は**発生から約1秒後**に来る
+    /// （[`plans/net-spike/RESULTS.md`](../../../../plans/net-spike/RESULTS.md) N10・N11）。
+    /// 世代を畳むのはそれより早いので、押し出しだけに頼ると取りこぼす。
+    /// `FwpmNetEventEnum1`は**溜まっているものを問い合わせる**ので、
+    /// **知らせが来るのを待たずに、その時点でバッファに在るものを全部取れる。**
+    ///
+    /// # 二重に書かない
+    ///
+    /// 押し出しで既に書いたものは指紋で弾く（[`WfpAuditSink::mark_new_drop`]）。
+    /// 逆にここで先に書いたものは、後から来る押し出しの側が弾く。**順序に依存しない。**
+    ///
+    /// # 限界（**同じ場所に書く**。とくに1つ目）
+    ///
+    /// - **取りこぼしが0になるとは言えない。** 実測で、**バッファに入ること自体にも遅れがある**
+    ///   ——同じ手順で、ある回は畳んだ直後に取れ、別の回は取れなかった。
+    ///   WFPには「未配送が無いことを確かめる」呼び出しが無いので、
+    ///   **どれだけ待てば十分かを証明する手段が無い**。これは実装の不足ではなくAPIの性質である。
+    ///   **観測は境界ではない**（`P-07`）ので、ここは最善努力として扱う
+    /// - **WFPのバッファが保持している分しか引けない。** 保持量・保持時間は測っていない
+    ///   （実測で総数74〜95件を観測したが、それが上限かは不明）
+    /// - **引けるのはマシン全体の拒否である。** このセッションのフィルタによるものだけに
+    ///   絞ってはいない（購読側も同じ）。時刻で購読期間内には絞る
+    /// - 失敗しても黙って戻る
+    pub fn drain_pending(&self) {
+        // **購読していた期間だけに絞る。** 絞らないとWFPのバッファ全体が返り、
+        // **このセッションが始まる前のマシン全体の拒否まで**監査ファイルへ落ちる
+        // （実測で59件。絞らない実装は監査を雑音で埋める）。
+        let since = unsafe { (*self.sink).subscribed_at_unix_ms() };
+        if since == 0 {
+            return;
+        }
+        // **絞り込みはこちら側で行う。**
+        //
+        // `FWPM_NET_EVENT_ENUM_TEMPLATE0`の`startTime`で絞る形も試したが、
+        // **この開発機では0件になった**（上端だけを外すと59件返るので、効いていないのは下端）。
+        // 意味がはっきりしないAPIの引数に依存するより、**発生時刻を自分で比べる**ほうが確実で、
+        // そちらは既に実測で正しく動いている（`event_unix_ms`はN10・N11で使った値と同じ）。
+        // **引くときは新しいエンジンハンドルを開く。**
+        //
+        // 購読に使っているハンドル（`self.engine`）でそのまま引くと、
+        // **この開発機では0件になった**——同じ手順を新しいハンドルで踏むと取れるので、
+        // 列挙が見ているのはハンドルを開いた時点の眺めだと考えられる。
+        // **理由は確かめていない**が、購読用を使い回さないことで避けられる。
+        let Ok(engine) = open_dynamic_engine() else {
+            return;
+        };
+        let mut enum_handle = HANDLE::default();
+        unsafe {
+            if FwpmNetEventCreateEnumHandle0(engine, None, &mut enum_handle) != 0 {
+                let _ = FwpmEngineClose0(engine);
+                return;
+            }
+            loop {
+                let mut entries: *mut *mut FWPM_NET_EVENT1 = std::ptr::null_mut();
+                let mut returned: u32 = 0;
+                let status = FwpmNetEventEnum1(
+                    engine,
+                    enum_handle,
+                    NET_EVENT_ENUM_BATCH,
+                    &mut entries,
+                    &mut returned,
+                );
+                if status != 0 || returned == 0 {
+                    break;
+                }
+                for i in 0..returned as usize {
+                    let event = &**entries.add(i);
+                    if event.r#type != FWPM_NET_EVENT_TYPE_CLASSIFY_DROP {
+                        continue;
+                    }
+                    // **購読していた期間の外は書かない。** 絞らないとWFPのバッファ全体
+                    // （このセッションが始まる前のマシン全体の拒否）が監査ファイルへ落ちる
+                    // ——実測で59件。監査が雑音で埋まると、読む側は何も判断できない。
+                    let Some(at) = filetime_to_unix_ms(event.header.timeStamp) else {
+                        continue;
+                    };
+                    if at < u128::from(since) {
+                        continue;
+                    }
+                    record_classify_drop(&*self.sink, event);
+                }
+                FwpmFreeMemory0(&mut entries as *mut _ as *mut *mut core::ffi::c_void);
+                if returned < NET_EVENT_ENUM_BATCH {
+                    break;
+                }
+            }
+            let _ = FwpmNetEventDestroyEnumHandle0(engine, enum_handle);
+            let _ = FwpmEngineClose0(engine);
+        }
+    }
+
+    /// 購読を止め、要約を1行残し、エンジンを閉じる。**daemonの終了時に1度だけ呼ぶ。**
+    ///
+    /// **止める前に取り残しを回収する**（[`Self::drain_pending`]）。ここを落とすと、
+    /// 終了直前に起きた拒否が「配送が間に合わなかった」ぶんだけ消える。
+    pub fn teardown(self) {
+        self.drain_pending();
+        unsafe {
+            let _ = FwpmNetEventUnsubscribe0(self.engine, self.subscription);
+            // 購読を止めた**直後**に数を残す。止める前だと、この記録より後に来た分を数え落とす。
+            (*self.sink).record_event_summary();
+            drop(Box::from_raw(self.sink));
+            let _ = FwpmEngineClose0(self.engine);
+        }
+    }
+}
+
+/// [BUG-094] 1件の拒否を同定する指紋。**同じイベントが2経路から来るのを1行に畳むため。**
+///
+/// 時刻だけでは足りない——同じミリ秒に複数の拒否が並ぶことが実測で出ている
+/// （`plans/net-spike/RESULTS.md` N10で、発生時刻が同一の5件を観測した）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DropFingerprint {
+    event_unix_ms: u128,
+    local_port: u16,
+    remote_port: u16,
+    remote_addr: Option<String>,
+    filter_id: Option<u64>,
+}
+
 #[derive(Debug)]
 struct WfpAuditSink {
-    path: PathBuf,
+    /// 書込先。**実行の切れ目で差し替わる**（[BUG-094] 案G）。
+    ///
+    /// 購読はdaemonの生存中ずっと生きるが、監査ファイルは**実行ごとに別**である。
+    /// したがってシンクは1つのまま、書込先だけが移る。
+    ///
+    /// **差し替えは`ApplyRules`が`validate_audit_sink_path`を通した後にしか起きない**
+    /// ——検証していないパスがここへ入ると、管理者権限での任意パス追記になる（D-44）。
+    ///
+    /// **`Mutex`なのは、コールバックが`&self`しか持てないためである**
+    /// （`FwpmNetEventSubscribe0`へ渡すのは生ポインタで、可変参照は作れない）。
+    ///
+    /// [BUG-094]: ../../../../docs/bugs/BUG-094.md
+    path: std::sync::Mutex<PathBuf>,
     /// [BUG-094] 購読のコールバックが**呼ばれた回数**（種別を問わない）。
     ///
     /// # なぜ数えるのか
@@ -174,6 +382,11 @@ struct WfpAuditSink {
     events_seen: std::sync::atomic::AtomicU64,
     /// そのうち実際に記録したもの（＝`classify_drop`だったもの）。
     drops_recorded: std::sync::atomic::AtomicU64,
+    /// [BUG-094] 既に書いた拒否の指紋。**押し出しと取りに行った分を二重に書かないため。**
+    ///
+    /// 同じイベントが2つの経路から来る——コールバック（押し出し）と`FwpmNetEventEnum1`
+    /// （取りに行く）である。どちらが先かは負荷次第なので、**書く直前に必ずここを通す**。
+    seen: std::sync::Mutex<std::collections::HashSet<DropFingerprint>>,
     /// [BUG-094] 購読が成立した時刻（unix ms）。**まだ購読していなければ0。**
     ///
     /// イベントを受け取れる窓は「ここ」から「撤収でこのシンクが要約を書くまで」である。
@@ -185,11 +398,48 @@ struct WfpAuditSink {
 impl WfpAuditSink {
     fn new(path: PathBuf) -> Self {
         Self {
-            path,
+            path: std::sync::Mutex::new(path),
             events_seen: std::sync::atomic::AtomicU64::new(0),
             drops_recorded: std::sync::atomic::AtomicU64::new(0),
             subscribed_at_unix_ms: std::sync::atomic::AtomicU64::new(0),
+            seen: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// **まだ書いていない拒否なら`true`を返し、同時に印を付ける。**
+    ///
+    /// 押し出し（コールバック）と取りに行く経路（`FwpmNetEventEnum1`）の両方がここを通る。
+    /// 通さずに書くと、同じ拒否が2行になる——**件数を数える側からは別々の拒否に見える**。
+    ///
+    /// ロックが毒されていたら`true`を返す（**重複より欠落のほうが重い**。記録の用途は
+    /// 「何が塞がれたか」の把握で、同じ行が2つ在っても判断を誤らせない）。
+    fn mark_new_drop(&self, fingerprint: DropFingerprint) -> bool {
+        match self.seen.lock() {
+            Ok(mut seen) => seen.insert(fingerprint),
+            Err(_) => true,
+        }
+    }
+
+    /// 書込先を差し替える（[BUG-094] 案G）。**検証済みのパスだけを渡すこと。**
+    ///
+    /// 差し替えた**後**に届く、差し替え**前**に起きたイベントは新しいファイルへ落ちる。
+    /// 配送は発生から約1秒遅れるので、実行の切れ目では実際に起こり得る——
+    /// **どちらのファイルにも落ちない（消える）ことだけは無い**、というのがこの設計の狙いである。
+    fn set_path(&self, path: PathBuf) {
+        if let Ok(mut current) = self.path.lock() {
+            *current = path;
+        }
+    }
+
+    /// 現在の書込先。ロックが毒されていたら諦めて何も書かない（記録は境界ではない、`P-07`）。
+    fn current_path(&self) -> Option<PathBuf> {
+        self.path.lock().ok().map(|p| p.clone())
+    }
+
+    /// 購読が成立した時刻（unix ms）。まだなら0。
+    fn subscribed_at_unix_ms(&self) -> u64 {
+        self.subscribed_at_unix_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// [BUG-094] 購読が成立した時刻を控える。**要約の行で窓の始まりを言うため。**
@@ -296,13 +546,16 @@ pub(crate) fn record_control_event(
 
 impl WfpAuditSink {
     fn record(&self, entry: &WfpAuditEntry) {
-        if let Some(parent) = self.path.parent() {
+        let Some(path) = self.current_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)
+            .open(&path)
         {
             if let Ok(line) = serde_json::to_string(entry) {
                 let _ = writeln!(file, "{line}");
@@ -311,7 +564,7 @@ impl WfpAuditSink {
     }
 
     fn lookup_fake_dns_host(&self, remote_addr: &str) -> Option<String> {
-        let text = std::fs::read_to_string(&self.path).ok()?;
+        let text = std::fs::read_to_string(self.current_path()?).ok()?;
         text.lines().rev().find_map(|line| {
             let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
             if value.get("kind")?.as_str()? != "fake_dns" {
@@ -341,7 +594,20 @@ unsafe extern "system" fn wfp_net_event_callback(
     if event.r#type != FWPM_NET_EVENT_TYPE_CLASSIFY_DROP {
         return;
     }
+    record_classify_drop(sink, event);
+}
 
+/// 1件の`classify_drop`をJSONLへ落とす。**押し出しと取りに行く経路が共有する唯一の変換**。
+///
+/// 2箇所に書くと、片方だけ直したときに**同じイベントが経路によって違う行になる**
+/// ——そうなると指紋も一致せず、二重書きの判定が効かなくなる（`B-05`）。
+///
+/// 既に書いたものなら何もしない（[`WfpAuditSink::mark_new_drop`]）。
+///
+/// # Safety
+///
+/// `event`は`FWPM_NET_EVENT_TYPE_CLASSIFY_DROP`であり、呼び出しの間だけ有効であること。
+unsafe fn record_classify_drop(sink: &WfpAuditSink, event: &FWPM_NET_EVENT1) {
     let header = event.header;
     let (local_addr, remote_addr) = match header.ipVersion {
         FWP_IP_VERSION_V4 => (
@@ -356,6 +622,23 @@ unsafe extern "system" fn wfp_net_event_callback(
     };
 
     let drop = event.Anonymous.classifyDrop.as_ref();
+    let event_unix_ms = filetime_to_unix_ms(header.timeStamp);
+    let filter_id = drop.map(|d| d.filterId);
+    // **発生時刻が読めないものは指紋を作れない**ので、重複を畳めないまま書く
+    // （欠落より重複を採る。判断を誤らせるのは欠落のほうである）。
+    if let Some(at) = event_unix_ms {
+        let fingerprint = DropFingerprint {
+            event_unix_ms: at,
+            local_port: header.localPort,
+            remote_port: header.remotePort,
+            remote_addr: remote_addr.clone(),
+            filter_id,
+        };
+        if !sink.mark_new_drop(fingerprint) {
+            return;
+        }
+    }
+
     let remote_host = remote_addr
         .as_deref()
         .and_then(|addr| sink.lookup_fake_dns_host(addr));
@@ -363,7 +646,7 @@ unsafe extern "system" fn wfp_net_event_callback(
         timestamp_unix_ms: now_unix_ms(),
         // [BUG-094] **受信時刻とは別に、イベント自身の発生時刻を載せる。**
         // これが無いと「そもそも届かなかった」と「窓が閉じた後に届いた」を区別できない。
-        event_unix_ms: filetime_to_unix_ms(header.timeStamp),
+        event_unix_ms,
         kind: "wfp",
         protocol: protocol_name(header.ipProtocol),
         allowed: false,
@@ -373,7 +656,7 @@ unsafe extern "system" fn wfp_net_event_callback(
         remote_addr,
         remote_host,
         remote_port: header.remotePort,
-        filter_id: drop.map(|d| d.filterId),
+        filter_id,
         layer_id: drop.map(|d| d.layerId),
     };
     sink.record(&entry);
@@ -400,6 +683,12 @@ fn now_unix_ms() -> u128 {
 
 /// 1601-01-01から1970-01-01までの`FILETIME`の刻み数（100ナノ秒単位）。
 const FILETIME_TICKS_AT_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+
+/// [BUG-094] 溜まったイベントを引くときの1回あたりの件数。
+///
+/// 実測でマシン全体の総数が95件だったので、**1回で引き切れる大きさ**にしてある
+/// （足りなければ最後まで回すので、値は速さの目盛りであって上限ではない）。
+const NET_EVENT_ENUM_BATCH: u32 = 512;
 
 /// [BUG-094] `FILETIME`（1601年起点・100ナノ秒刻み）をunix msへ直す。
 ///
@@ -476,13 +765,12 @@ impl WfpSession {
                         return Err(e);
                     }
                 };
-                let (event_subscription, audit_context) =
-                    start_wfp_drop_audit(engine, opts.audit_log_path.clone());
+                // [BUG-094 案G] **ここで監査を始めない。** 購読の持ち主は
+                // [`WfpAuditSubscription`]（daemonの生存に紐づく）へ移した——
+                // 世代ごとに張り直すと窓が1.2〜2.0秒しか開かず、約1秒遅れる配送を取りこぼす。
                 Ok(WfpSession {
                     keys,
                     engine,
-                    event_subscription,
-                    audit_context,
                     loopback_exemption,
                 })
             }
@@ -500,21 +788,14 @@ impl WfpSession {
     pub fn teardown(mut self) -> Result<(), WfpError> {
         let engine = self.engine;
         let keys = self.keys;
-        let event_subscription = self.event_subscription;
-        let audit_context = self.audit_context;
         let loopback_exemption = self.loopback_exemption.take();
         std::mem::forget(self); // Dropで二重close/二重teardownしないよう所有権をここで断つ。
 
         let result = (|| -> Result<(), WfpError> {
             unsafe {
-                if let Some(subscription) = event_subscription {
-                    let _ = FwpmNetEventUnsubscribe0(engine, subscription);
-                }
-                // [BUG-094] **購読を止めた直後に、何回呼ばれたかを1行残す。**
-                // 止める前だと、この記録自身より後に来たイベントを数え落とす。
-                if let Some(context) = audit_context {
-                    (*context).record_event_summary();
-                }
+                // [BUG-094 案G] **ここで購読を止めない。** 止めると、この世代で落とした分の
+                // 配送（発生から約1秒後）が届く前に窓が閉じる。購読は
+                // [`WfpAuditSubscription`]が持ち、daemonの終了まで開いたままである。
                 check(
                     FwpmTransactionBegin0(engine, 0),
                     "FwpmTransactionBegin0 (teardown)",
@@ -541,9 +822,6 @@ impl WfpSession {
             Ok(())
         };
         unsafe {
-            if let Some(context) = audit_context {
-                drop(Box::from_raw(context));
-            }
             let _ = FwpmEngineClose0(engine);
         }
         result.and(loopback_result)
@@ -556,12 +834,6 @@ impl Drop for WfpSession {
     /// プロバイダ・サブレイヤー・フィルタもBFE側で自動削除される（仕様書§5.5異常系と同じ経路）。
     fn drop(&mut self) {
         unsafe {
-            if let Some(subscription) = self.event_subscription.take() {
-                let _ = FwpmNetEventUnsubscribe0(self.engine, subscription);
-            }
-            if let Some(context) = self.audit_context.take() {
-                drop(Box::from_raw(context));
-            }
             if let Some(exemption) = self.loopback_exemption.take() {
                 let _ = remove_loopback_exemption(exemption);
             }
@@ -648,6 +920,17 @@ unsafe fn read_engine_u32_option(
 /// したがって**有効化の可否と購読の可否を別々に記録し、購読は必ず試す**。どちらの世界に
 /// 居るかは、制御レコードの綴り（`net_event_collection_enabled_by_harness` か
 /// `net_event_collection_not_enabled_by_harness`）で後から読める。
+///
+/// # 誰が持つか（[BUG-094] 案G、2026-09-21）
+///
+/// **この購読は`WfpSession`（＝フィルタの世代）ではなく、daemonの生存に紐づく。**
+/// 実測で、WFPは**最初の未配送イベントから約1秒後にまとめて**配送する
+/// （[`plans/net-spike/RESULTS.md`](../../../../plans/net-spike/RESULTS.md) N11）。
+/// 世代ごとに張り直していた頃は、購読の窓が1.2〜2.0秒しか開いておらず、
+/// **拒否が窓の後半で起きた回は配送の前に窓が閉じて取りこぼしていた**。
+///
+/// 持ち主を移したので、実行の切れ目でも購読は閉じない。移るのは**書込先だけ**である
+/// （[`WfpAuditSink::set_path`]）。
 fn start_wfp_drop_audit(
     engine: HANDLE,
     audit_log_path: Option<PathBuf>,
@@ -1504,13 +1787,11 @@ mod tests {
             session_profile: profile_a.clone(),
             allow_loopback_tcp_ports: vec![listener_a.local_addr().unwrap().port()],
             allow_loopback_udp_ports: Vec::new(),
-            audit_log_path: None,
         };
         let opts_b = WfpOptions {
             session_profile: profile_b.clone(),
             allow_loopback_tcp_ports: vec![listener_b.local_addr().unwrap().port()],
             allow_loopback_udp_ports: Vec::new(),
-            audit_log_path: None,
         };
 
         let session_a = WfpSession::apply(sid.as_psid(), &opts_a).expect("session A apply");
@@ -1597,8 +1878,9 @@ mod tests {
             session_profile: session_profile.clone(),
             allow_loopback_tcp_ports: vec![allowed_port],
             allow_loopback_udp_ports: Vec::new(),
-            audit_log_path: Some(audit_path.clone()),
         };
+        // [BUG-094 案G] 監査の購読は**セッションとは別に**持つ（本番では`netfilterd`が持つ）。
+        let audit = WfpAuditSubscription::start(audit_path.clone()).expect("start WFP drop audit");
         let session = WfpSession::apply(sid.as_psid(), &opts).expect("apply WFP rules");
         let (shell, _) = crate::tier2a::win_appcontainer::resolve_shell();
         let env = crate::secret_env::build_child_env();
@@ -1647,6 +1929,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         session.teardown().expect("teardown WFP rules");
+        audit.teardown();
         assert!(
             saw_drop,
             "expected WFP drop event in {}",
@@ -1654,201 +1937,149 @@ mod tests {
         );
     }
 
-    /// [BUG-094] **「購読の窓を延ばせば、取りこぼした拒否が取れるのか」を測る。**
+    /// [BUG-094 案G] **世代を畳んだ後に届いた拒否も記録されること。**
     ///
-    /// # なぜこの1点なのか
+    /// # この測定が固定するもの
     ///
-    /// 原因は2026-09-21に確定した——配送が**一定して約1秒遅れる**のに対し、
-    /// harnessが購読を開いている窓は**1.2〜2.0秒**しかない
-    /// （[`plans/net-spike/RESULTS.md`](../../../../plans/net-spike/RESULTS.md) N10）。
-    /// 残るのは直し方の選択で、候補は2つある。
+    /// WFPは**最初の未配送イベントから約1秒後にまとめて**配送する
+    /// （[`plans/net-spike/RESULTS.md`](../../../../plans/net-spike/RESULTS.md) N10・N11）。
+    /// 購読を[`WfpSession`]が持っていた頃は窓が1.2〜2.0秒しか開かず、
+    /// **子が終わった直後に畳むと3回とも0件**だった。
     ///
-    /// | 案 | 内容 | 費用 |
-    /// |---|---|---|
-    /// | F | 撤収の前に猶予を置く | harnessの終了が毎回その分延びる |
-    /// | G | 購読をnetfilterdの生存中ずっと保つ | `D-56`の射程に触る |
+    /// 購読の持ち主を[`WfpAuditSubscription`]（本番では`netfilterd`）へ移したので、
+    /// **世代を畳んでも購読は開いたまま**になり、遅れて届いた分も落ちる。ここを固定する。
     ///
-    /// **案Fを選べるかは、`FwpmNetEventUnsubscribe0`が未配送分を捨てるのか、
-    /// 待てば届くのかに懸かっている。** 遅れの上限が実測1032msなので2秒で足りる**はず**だが、
-    /// **見込みは測定ではない。**
+    /// # 対で見る（`B-35`）
     ///
-    /// # 測り方——同じ実行の中に腕を2本置く
+    /// | 側 | 何を見るか |
+    /// |---|---|
+    /// | 許可側 | 世代を**待たずに畳んだ**のに、その世代で起きた拒否が後から記録される |
+    /// | 禁止側 | **購読を畳んだ後**は、同じだけ待っても件数が増えない |
     ///
-    /// | 腕 | 撤収の前に | 何が分かるか |
-    /// |---|---|---|
-    /// | A | **何も待たない** | いまの製品と同じ形。取りこぼす側の再現 |
-    /// | B | 拒否が現れるまで**最大5秒待つ** | 待てば取れるのか。**取れるなら何ms待てばよいか** |
-    ///
-    /// **腕Bが返す経過時間が、そのまま案Fに要る猶予の実測値になる。**
-    /// 各腕を3回ずつ繰り返す——1回では競争の結果を測ったことにならない。
-    ///
-    /// # 件数には`assert`を置かない
-    ///
-    /// **いま閾値を書くと、測る前に答えを書くことになる。** ここで`assert`するのは
-    /// **計器が生きていること**だけ——子の外部接続が実際に拒否され、購読が成立したこと。
-    /// 拒否されていなければ、件数0は「監査が取れない」ではなく「そもそも落ちていない」である。
+    /// **禁止側が要る理由**: 許可側だけだと「いつでも何か書く」実装でも通る。
+    /// 購読を止めても書き続けるなら、それは記録ではなく雑音である。
     ///
     /// 実行例: `dev-elevated-run.exe e2e-wfp-multisession`
     #[cfg(windows)]
     #[test]
     #[ignore = "requires administrator token, BFE, and real Windows AppContainer/WFP state"]
-    fn e2e_how_long_the_window_must_stay_open_to_catch_a_drop() {
+    fn e2e_a_drop_survives_its_filter_generation_being_torn_down() {
         if !crate::tier2a::privhelper::is_elevated() {
             panic!("WFP E2E requires an elevated administrator token");
         }
-        const ROUNDS: usize = 3;
-        const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("net-audit.jsonl");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let allowed_port = listener.local_addr().unwrap().port();
+        let accept_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => return,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
 
         let session_profile = crate::tier2a::session_profile::current_profile_name();
         let sid = crate::tier2a::win_appcontainer::ensure_profile(&session_profile)
             .expect("ensure AppContainer profile");
+        crate::tier2a::win_appcontainer::grant_ace_recursive(dir.path(), sid.as_psid())
+            .expect("grant temp dir ACE to AppContainer");
 
-        // 1回分の測定。`drain`が真なら、撤収の前に拒否が現れるまで待つ。
-        // 戻り値は (記録された拒否の件数, 待った時間, 子が実際に塞がれたか)。
-        let measure = |label: &str, drain: bool| -> (usize, std::time::Duration, bool) {
-            let dir = tempfile::tempdir().unwrap();
-            let audit_path = dir.path().join("net-audit.jsonl");
-            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let allowed_port = listener.local_addr().unwrap().port();
-            let accept_thread = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                while std::time::Instant::now() < deadline {
-                    match listener.accept() {
-                        Ok(_) => return,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(std::time::Duration::from_millis(25));
-                        }
-                        Err(_) => return,
-                    }
-                }
-            });
-            crate::tier2a::win_appcontainer::grant_ace_recursive(dir.path(), sid.as_psid())
-                .expect("grant temp dir ACE to AppContainer");
-            let opts = WfpOptions {
-                session_profile: session_profile.clone(),
-                allow_loopback_tcp_ports: vec![allowed_port],
-                allow_loopback_udp_ports: Vec::new(),
-                audit_log_path: Some(audit_path.clone()),
-            };
-            let session = WfpSession::apply(sid.as_psid(), &opts).expect("apply WFP rules");
-            // **窓が開いた時刻を控える。** これが無いと、**前の腕の落とし分が遅れて
-            // この購読へ着地したもの**を自分の成果として数えてしまう（実際に1度踏んだ）。
-            let window_opened = now_unix_ms();
-            let (shell, _) = crate::tier2a::win_appcontainer::resolve_shell();
-            let env = crate::secret_env::build_child_env();
-            // 土台は`e2e_wfp_blocks_direct_external_connect_and_logs_drop`をそのまま写した
-            // （許可側のloopbackが通ることも同じ回で見る＝WFPが「全部拒否」になっていない対照）。
-            let command = format!(
-                "$ErrorActionPreference = 'Stop'; \
-                 $ok = $false; \
-                 try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('127.0.0.1', {allowed_port}); $c.Close(); $ok = $true }} catch {{ }}; \
-                 $blocked = $false; \
-                 try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('8.8.8.8', 53); $c.Close() }} catch {{ $blocked = $true }}; \
-                 if ($ok -and $blocked) {{ Write-Output 'harness-wfp-e2e-ok'; exit 0 }} else {{ Write-Output \"ok=$ok blocked=$blocked\"; exit 7 }}"
-            );
-            let child = crate::tier2a::win_appcontainer::spawn(
-                &shell,
-                &["-NoProfile", "-NonInteractive", "-Command", &command],
-                dir.path(),
-                &env,
-                false,
-                sid.as_psid(),
-                crate::tier2a::win_appcontainer::NetworkCapability::InternetClient,
-                crate::tier2a::win_appcontainer::RedirectorInject::default(),
-                crate::tier2a::win_appcontainer::DomainIdentity::OwnPackage,
-            )
-            .expect("spawn AppContainer child");
-            let (stdout, stderr, code) = child.write_stdin_read_output_and_wait(None).unwrap();
-            let _ = accept_thread.join();
-            let instrument_alive = code == 0 && stdout.contains("harness-wfp-e2e-ok");
-            if !instrument_alive {
-                eprintln!("[BUG-094][{label}] 計器が死んでいる: code={code} stdout={stdout} stderr={stderr}");
-            }
-
-            // **子が終わった瞬間からの経過を測る。** ここが製品の「シェルが終わった直後」に当たる。
-            let started_waiting = std::time::Instant::now();
-            // 戻り値は (この窓で起きた拒否, 前の窓で起きたのに遅れて着地した拒否)。
-            // **2つを分けて数えることがこの測定の要**である。
-            let count_drops = || -> (usize, usize) {
-                let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
-                let mut own = 0usize;
-                let mut inherited = 0usize;
-                for line in text.lines() {
-                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                        continue;
-                    };
-                    if v.get("reason").and_then(|r| r.as_str()) != Some("classify_drop") {
-                        continue;
-                    }
-                    match v.get("event_unix_ms").and_then(|t| t.as_u64()) {
-                        Some(at) if u128::from(at) >= window_opened => own += 1,
-                        // 発生時刻が窓より前＝前の腕の落とし分。**自分の成果ではない。**
-                        Some(_) => inherited += 1,
-                        // 発生時刻が載っていない行は判定できないので、どちらにも数えない。
-                        None => {}
-                    }
-                }
-                (own, inherited)
-            };
-            let mut waited = std::time::Duration::ZERO;
-            if drain {
-                // **自分の窓で起きた拒否が現れるまで**待つ。前の腕の落とし分では抜けない。
-                while started_waiting.elapsed() < DRAIN_BUDGET {
-                    if count_drops().0 > 0 {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                waited = started_waiting.elapsed();
-            }
-            let child_exited_at = now_unix_ms();
-            session.teardown().expect("teardown WFP rules");
-            let torn_down_at = now_unix_ms();
-            let (own, inherited) = count_drops();
-            // **時刻そのものを出す。** 件数だけだと「待てば取れる」と「もう在った」が
-            // 同じ見え方になる——実際に1度、その2つを取り違えかけた。
-            eprintln!(
-                "[BUG-094][{label}] 窓が開いた={window_opened} 子が終わった={child_exited_at} \
-                 撤収した={torn_down_at}（自分の拒否{own}件 / 前の窓の落とし分{inherited}件）"
-            );
+        let count_drops = || -> usize {
             let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
-            for line in text.lines() {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                if v.get("reason").and_then(|r| r.as_str()) != Some("classify_drop") {
-                    continue;
-                }
-                let at = v.get("event_unix_ms").and_then(|t| t.as_u64());
-                let got = v.get("timestamp_unix_ms").and_then(|t| t.as_u64());
-                let whose = match at {
-                    Some(a) if u128::from(a) >= window_opened => "自分",
-                    Some(_) => "前の窓",
-                    None => "発生時刻なし",
-                };
-                eprintln!("[BUG-094][{label}]   drop 発生={at:?} 受信={got:?}（{whose}）");
-            }
-            (own, waited, instrument_alive)
+            text.lines()
+                .filter(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .ok()
+                        .and_then(|v| v.get("reason")?.as_str().map(|r| r == "classify_drop"))
+                        .unwrap_or(false)
+                })
+                .count()
         };
 
-        let mut alive_rounds = 0usize;
-        for round in 1..=ROUNDS {
-            let (a_count, _, a_alive) = measure(&format!("A{round}"), false);
-            let (b_count, b_waited, b_alive) = measure(&format!("B{round}"), true);
-            alive_rounds += usize::from(a_alive && b_alive);
-            eprintln!(
-                "[BUG-094][round {round}] 自分の窓で起きた拒否——腕A（待たない）= {a_count}件 / \
-                 腕B（待つ）= {b_count}件・待った時間 {}ms",
-                b_waited.as_millis()
-            );
-        }
+        // **購読はフィルタの世代より先に始め、後で畳む。** 本番の`netfilterd`と同じ順序である。
+        let audit = WfpAuditSubscription::start(audit_path.clone()).expect("start WFP drop audit");
 
-        // **計器の生死だけを判定する。** 件数に閾値を置かない理由はこの関数のdocにある。
+        let opts = WfpOptions {
+            session_profile: session_profile.clone(),
+            allow_loopback_tcp_ports: vec![allowed_port],
+            allow_loopback_udp_ports: Vec::new(),
+        };
+        let session = WfpSession::apply(sid.as_psid(), &opts).expect("apply WFP rules");
+        let (shell, _) = crate::tier2a::win_appcontainer::resolve_shell();
+        let env = crate::secret_env::build_child_env();
+        let command = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             $ok = $false; \
+             try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('127.0.0.1', {allowed_port}); $c.Close(); $ok = $true }} catch {{ }}; \
+             $blocked = $false; \
+             try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('8.8.8.8', 53); $c.Close() }} catch {{ $blocked = $true }}; \
+             if ($ok -and $blocked) {{ Write-Output 'harness-wfp-e2e-ok'; exit 0 }} else {{ Write-Output \"ok=$ok blocked=$blocked\"; exit 7 }}"
+        );
+        let child = crate::tier2a::win_appcontainer::spawn(
+            &shell,
+            &["-NoProfile", "-NonInteractive", "-Command", &command],
+            dir.path(),
+            &env,
+            false,
+            sid.as_psid(),
+            crate::tier2a::win_appcontainer::NetworkCapability::InternetClient,
+            crate::tier2a::win_appcontainer::RedirectorInject::default(),
+            crate::tier2a::win_appcontainer::DomainIdentity::OwnPackage,
+        )
+        .expect("spawn AppContainer child");
+        let (stdout, stderr, code) = child.write_stdin_read_output_and_wait(None).unwrap();
+        let _ = accept_thread.join();
+        // **計器の生死を先に見る。** 塞がれていなければ、件数0は「記録できない」ではなく
+        // 「そもそも落ちていない」である。
+        assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
         assert!(
-            alive_rounds > 0,
-            "[BUG-094] 全ラウンドで子が期待どおりに塞がれていない。**件数0を『監査が取れない』と\
-             読んではいけない**——そもそも落ちていない可能性がある"
+            stdout.contains("harness-wfp-e2e-ok"),
+            "許可側のloopbackが通り、外部接続が塞がれること。stdout={stdout}\nstderr={stderr}"
+        );
+
+        // **待たずに畳む。** ここが以前は取りこぼしの原因だった。
+        let before_teardown = count_drops();
+        session.teardown().expect("teardown WFP rules");
+
+        // --- 許可側: **1ミリ秒も待たずに**取り切れること ---
+        //
+        // ここで`sleep`を入れてはいけない。入れると「待てば取れる」を測ることになり、
+        // **高負荷で待ち時間を超えたら消える**という元の弱点をそのまま残す。
+        // 押し出しを待たずに引けることが、この機構の存在理由そのものである。
+        audit.drain_pending();
+        let immediately = count_drops();
+        // **直後に取れるとは限らない。** 実測で、バッファに入ること自体にも遅れがある
+        // ——同じ手順で取れる回と取れない回があった。だから**ここは直後の件数で判定しない**。
+        // 判定するのは「押し出しを待たずに、引けば取れる」ことだけである。
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        audit.drain_pending();
+        let after_waiting = count_drops();
+        eprintln!(
+            "[BUG-094] 世代を畳む前={before_teardown}件 / 直後に引く={immediately}件 / \
+             1.5秒後に引く={after_waiting}件"
+        );
+        assert!(
+            after_waiting > 0,
+            "[BUG-094] 引いても拒否が記録されていない。**取りに行く経路が死んでいる**\
+             （押し出しに戻っていないか確かめること）（{}）",
+            audit_path.display()
+        );
+
+        // --- 禁止側: 購読を畳んだら、同じだけ待っても増えない ---
+        audit.teardown();
+        let settled = count_drops();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert_eq!(
+            count_drops(),
+            settled,
+            "[BUG-094] 購読を畳んだ後も記録が増えている。止めたはずのものが書き続けている"
         );
     }
 }

@@ -1141,10 +1141,10 @@ fn policy_targets(policy: &NetfilterPolicy) -> Vec<PolicyTarget> {
 }
 
 /// 1つのプロファイルに対してWFPフィルタを張る（**名前検証はここが唯一のゲート**）。
-fn apply_one(
-    target: &PolicyTarget,
-    audit_log_path: Option<PathBuf>,
-) -> Result<WfpSession, NetfilterError> {
+///
+/// [BUG-094 案G] **監査の書込先はここで受け取らない。** 購読はフィルタの世代ではなく
+/// daemonの生存に紐づくようになった（`serve_inner`が`WfpAuditSubscription`を1つ持つ）。
+fn apply_one(target: &PolicyTarget) -> Result<WfpSession, NetfilterError> {
     if !crate::tier2a::mcp_profile::is_harness_profile_name(&target.profile) {
         return Err(NetfilterError::Ipc(format!(
             "rejected malformed appcontainer profile name: {:?}",
@@ -1169,7 +1169,6 @@ fn apply_one(
         session_profile: target.profile.clone(),
         allow_loopback_tcp_ports: target.tcp_ports.clone(),
         allow_loopback_udp_ports: target.udp_ports.clone(),
-        audit_log_path,
     };
     WfpSession::apply(sid.as_psid(), &opts)
         .map_err(|e| NetfilterError::Ipc(format!("WFP rule application failed: {e}")))
@@ -1231,7 +1230,7 @@ fn handle_apply_rules(
     };
 
     for target in policy_targets(policy) {
-        match apply_one(&target, audit_log_path.clone()) {
+        match apply_one(&target) {
             Ok(session) => sessions.push(session),
             Err(e) => {
                 // 1つでも張れなければ全体を失敗させる（fail-closed）。既に張った分は
@@ -1256,6 +1255,15 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
     // `ApplyRules`より前に`ChainLaunchHelper`が来ればまだ`None`で、そのときは記録先が無い
     // （検証していないパスへは書かない、D-44）。
     let mut last_audit_sink: Option<PathBuf> = None;
+    // [BUG-094 案G] **WFPの拒否監査はここが持つ。** フィルタの世代（`sessions`）と寿命が違う。
+    //
+    // 世代ごとに張り直していた頃は購読の窓が1.2〜2.0秒しか開かず、**約1秒遅れて届く配送**を
+    // 取りこぼしていた（`plans/net-spike/RESULTS.md` N10・N11）。ここで持てば、実行の
+    // 切れ目でも購読は閉じず、移るのは書込先だけになる。
+    //
+    // **待機中のdaemonがこれを握ってよい根拠**は`D-56`不変条件1の改訂に書いた——
+    // 観測専用で強制を1つも持たず、動的セッションなのでdaemonが死ねばOSが消す。
+    let mut audit: Option<crate::tier2a::wfp::WfpAuditSubscription> = None;
 
     let outcome: Result<(), NetfilterError> = loop {
         // 1件目は短く待つ（ハンドシェイクは即座に来るべき）。2件目以降は実質無期限
@@ -1278,6 +1286,17 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
                 match handle_apply_rules(&policy, &mut sessions) {
                     Ok(audit_sink) => {
                         last_audit_sink = audit_sink.clone();
+                        // [BUG-094 案G] 書込先を今回の実行のものへ移す。初回だけ購読を始める。
+                        // **`validate_audit_sink_path`を通った値しかここへ来ない**
+                        // （`handle_apply_rules`が検証してから返す）——D-44。
+                        if let Some(path) = audit_sink.clone() {
+                            match &audit {
+                                Some(existing) => existing.set_audit_log_path(path),
+                                None => {
+                                    audit = crate::tier2a::wfp::WfpAuditSubscription::start(path);
+                                }
+                            }
+                        }
                         // M15.7: OS監査収集器の連鎖起動。**WFPの適用が終わってから**行う
                         // （順序に依存は無いが、出口強制の確立を遅らせないため後ろに置く）。
                         //
@@ -1415,6 +1434,14 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
 
     // どの抜け方をしても現世代は必ず畳む（`Teardown`/`ClearRules`で既に空なら何も起きない）。
     let residual = teardown_generation(&mut sessions);
+    // [BUG-094 案G] 監査の購読は**ここで1度だけ**畳む。フィルタより後に置くのは、
+    // 撤収そのものが生む拒否まで拾うためである。
+    //
+    // **限界**: ここで止めるので、**daemonが終わる直前の約1秒ぶんは今も取りこぼす**
+    // （配送は発生から約1秒後）。埋めるには撤収時の猶予が要るが、それは別の決定である。
+    if let Some(audit) = audit.take() {
+        audit.teardown();
+    }
     outcome.and(residual.map_err(|e| NetfilterError::Ipc(e.to_string())))
 }
 

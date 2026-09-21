@@ -201,8 +201,7 @@ fn e2e_mcp_servers_get_independent_egress_allowlists() {
         &WfpOptions {
             session_profile: prep_a.profile_name.clone(),
             allow_loopback_tcp_ports: vec![port_a],
-            allow_loopback_udp_ports: Vec::new(),
-            audit_log_path: None,
+            allow_loopback_udp_ports: Vec::new(),
         },
     )
     .expect("apply WFP for server A");
@@ -211,8 +210,7 @@ fn e2e_mcp_servers_get_independent_egress_allowlists() {
         &WfpOptions {
             session_profile: prep_b.profile_name.clone(),
             allow_loopback_tcp_ports: vec![port_b],
-            allow_loopback_udp_ports: Vec::new(),
-            audit_log_path: None,
+            allow_loopback_udp_ports: Vec::new(),
         },
     )
     .expect("apply WFP for server B");
