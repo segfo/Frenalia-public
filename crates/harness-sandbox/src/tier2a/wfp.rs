@@ -1653,4 +1653,202 @@ mod tests {
             audit_path.display()
         );
     }
+
+    /// [BUG-094] **「購読の窓を延ばせば、取りこぼした拒否が取れるのか」を測る。**
+    ///
+    /// # なぜこの1点なのか
+    ///
+    /// 原因は2026-09-21に確定した——配送が**一定して約1秒遅れる**のに対し、
+    /// harnessが購読を開いている窓は**1.2〜2.0秒**しかない
+    /// （[`plans/net-spike/RESULTS.md`](../../../../plans/net-spike/RESULTS.md) N10）。
+    /// 残るのは直し方の選択で、候補は2つある。
+    ///
+    /// | 案 | 内容 | 費用 |
+    /// |---|---|---|
+    /// | F | 撤収の前に猶予を置く | harnessの終了が毎回その分延びる |
+    /// | G | 購読をnetfilterdの生存中ずっと保つ | `D-56`の射程に触る |
+    ///
+    /// **案Fを選べるかは、`FwpmNetEventUnsubscribe0`が未配送分を捨てるのか、
+    /// 待てば届くのかに懸かっている。** 遅れの上限が実測1032msなので2秒で足りる**はず**だが、
+    /// **見込みは測定ではない。**
+    ///
+    /// # 測り方——同じ実行の中に腕を2本置く
+    ///
+    /// | 腕 | 撤収の前に | 何が分かるか |
+    /// |---|---|---|
+    /// | A | **何も待たない** | いまの製品と同じ形。取りこぼす側の再現 |
+    /// | B | 拒否が現れるまで**最大5秒待つ** | 待てば取れるのか。**取れるなら何ms待てばよいか** |
+    ///
+    /// **腕Bが返す経過時間が、そのまま案Fに要る猶予の実測値になる。**
+    /// 各腕を3回ずつ繰り返す——1回では競争の結果を測ったことにならない。
+    ///
+    /// # 件数には`assert`を置かない
+    ///
+    /// **いま閾値を書くと、測る前に答えを書くことになる。** ここで`assert`するのは
+    /// **計器が生きていること**だけ——子の外部接続が実際に拒否され、購読が成立したこと。
+    /// 拒否されていなければ、件数0は「監査が取れない」ではなく「そもそも落ちていない」である。
+    ///
+    /// 実行例: `dev-elevated-run.exe e2e-wfp-multisession`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires administrator token, BFE, and real Windows AppContainer/WFP state"]
+    fn e2e_how_long_the_window_must_stay_open_to_catch_a_drop() {
+        if !crate::tier2a::privhelper::is_elevated() {
+            panic!("WFP E2E requires an elevated administrator token");
+        }
+        const ROUNDS: usize = 3;
+        const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let session_profile = crate::tier2a::session_profile::current_profile_name();
+        let sid = crate::tier2a::win_appcontainer::ensure_profile(&session_profile)
+            .expect("ensure AppContainer profile");
+
+        // 1回分の測定。`drain`が真なら、撤収の前に拒否が現れるまで待つ。
+        // 戻り値は (記録された拒否の件数, 待った時間, 子が実際に塞がれたか)。
+        let measure = |label: &str, drain: bool| -> (usize, std::time::Duration, bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let audit_path = dir.path().join("net-audit.jsonl");
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let allowed_port = listener.local_addr().unwrap().port();
+            let accept_thread = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok(_) => return,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+            crate::tier2a::win_appcontainer::grant_ace_recursive(dir.path(), sid.as_psid())
+                .expect("grant temp dir ACE to AppContainer");
+            let opts = WfpOptions {
+                session_profile: session_profile.clone(),
+                allow_loopback_tcp_ports: vec![allowed_port],
+                allow_loopback_udp_ports: Vec::new(),
+                audit_log_path: Some(audit_path.clone()),
+            };
+            let session = WfpSession::apply(sid.as_psid(), &opts).expect("apply WFP rules");
+            // **窓が開いた時刻を控える。** これが無いと、**前の腕の落とし分が遅れて
+            // この購読へ着地したもの**を自分の成果として数えてしまう（実際に1度踏んだ）。
+            let window_opened = now_unix_ms();
+            let (shell, _) = crate::tier2a::win_appcontainer::resolve_shell();
+            let env = crate::secret_env::build_child_env();
+            // 土台は`e2e_wfp_blocks_direct_external_connect_and_logs_drop`をそのまま写した
+            // （許可側のloopbackが通ることも同じ回で見る＝WFPが「全部拒否」になっていない対照）。
+            let command = format!(
+                "$ErrorActionPreference = 'Stop'; \
+                 $ok = $false; \
+                 try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('127.0.0.1', {allowed_port}); $c.Close(); $ok = $true }} catch {{ }}; \
+                 $blocked = $false; \
+                 try {{ $c = [Net.Sockets.TcpClient]::new(); $c.Connect('8.8.8.8', 53); $c.Close() }} catch {{ $blocked = $true }}; \
+                 if ($ok -and $blocked) {{ Write-Output 'harness-wfp-e2e-ok'; exit 0 }} else {{ Write-Output \"ok=$ok blocked=$blocked\"; exit 7 }}"
+            );
+            let child = crate::tier2a::win_appcontainer::spawn(
+                &shell,
+                &["-NoProfile", "-NonInteractive", "-Command", &command],
+                dir.path(),
+                &env,
+                false,
+                sid.as_psid(),
+                crate::tier2a::win_appcontainer::NetworkCapability::InternetClient,
+                crate::tier2a::win_appcontainer::RedirectorInject::default(),
+                crate::tier2a::win_appcontainer::DomainIdentity::OwnPackage,
+            )
+            .expect("spawn AppContainer child");
+            let (stdout, stderr, code) = child.write_stdin_read_output_and_wait(None).unwrap();
+            let _ = accept_thread.join();
+            let instrument_alive = code == 0 && stdout.contains("harness-wfp-e2e-ok");
+            if !instrument_alive {
+                eprintln!("[BUG-094][{label}] 計器が死んでいる: code={code} stdout={stdout} stderr={stderr}");
+            }
+
+            // **子が終わった瞬間からの経過を測る。** ここが製品の「シェルが終わった直後」に当たる。
+            let started_waiting = std::time::Instant::now();
+            // 戻り値は (この窓で起きた拒否, 前の窓で起きたのに遅れて着地した拒否)。
+            // **2つを分けて数えることがこの測定の要**である。
+            let count_drops = || -> (usize, usize) {
+                let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
+                let mut own = 0usize;
+                let mut inherited = 0usize;
+                for line in text.lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    if v.get("reason").and_then(|r| r.as_str()) != Some("classify_drop") {
+                        continue;
+                    }
+                    match v.get("event_unix_ms").and_then(|t| t.as_u64()) {
+                        Some(at) if u128::from(at) >= window_opened => own += 1,
+                        // 発生時刻が窓より前＝前の腕の落とし分。**自分の成果ではない。**
+                        Some(_) => inherited += 1,
+                        // 発生時刻が載っていない行は判定できないので、どちらにも数えない。
+                        None => {}
+                    }
+                }
+                (own, inherited)
+            };
+            let mut waited = std::time::Duration::ZERO;
+            if drain {
+                // **自分の窓で起きた拒否が現れるまで**待つ。前の腕の落とし分では抜けない。
+                while started_waiting.elapsed() < DRAIN_BUDGET {
+                    if count_drops().0 > 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                waited = started_waiting.elapsed();
+            }
+            let child_exited_at = now_unix_ms();
+            session.teardown().expect("teardown WFP rules");
+            let torn_down_at = now_unix_ms();
+            let (own, inherited) = count_drops();
+            // **時刻そのものを出す。** 件数だけだと「待てば取れる」と「もう在った」が
+            // 同じ見え方になる——実際に1度、その2つを取り違えかけた。
+            eprintln!(
+                "[BUG-094][{label}] 窓が開いた={window_opened} 子が終わった={child_exited_at} \
+                 撤収した={torn_down_at}（自分の拒否{own}件 / 前の窓の落とし分{inherited}件）"
+            );
+            let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if v.get("reason").and_then(|r| r.as_str()) != Some("classify_drop") {
+                    continue;
+                }
+                let at = v.get("event_unix_ms").and_then(|t| t.as_u64());
+                let got = v.get("timestamp_unix_ms").and_then(|t| t.as_u64());
+                let whose = match at {
+                    Some(a) if u128::from(a) >= window_opened => "自分",
+                    Some(_) => "前の窓",
+                    None => "発生時刻なし",
+                };
+                eprintln!("[BUG-094][{label}]   drop 発生={at:?} 受信={got:?}（{whose}）");
+            }
+            (own, waited, instrument_alive)
+        };
+
+        let mut alive_rounds = 0usize;
+        for round in 1..=ROUNDS {
+            let (a_count, _, a_alive) = measure(&format!("A{round}"), false);
+            let (b_count, b_waited, b_alive) = measure(&format!("B{round}"), true);
+            alive_rounds += usize::from(a_alive && b_alive);
+            eprintln!(
+                "[BUG-094][round {round}] 自分の窓で起きた拒否——腕A（待たない）= {a_count}件 / \
+                 腕B（待つ）= {b_count}件・待った時間 {}ms",
+                b_waited.as_millis()
+            );
+        }
+
+        // **計器の生死だけを判定する。** 件数に閾値を置かない理由はこの関数のdocにある。
+        assert!(
+            alive_rounds > 0,
+            "[BUG-094] 全ラウンドで子が期待どおりに塞がれていない。**件数0を『監査が取れない』と\
+             読んではいけない**——そもそも落ちていない可能性がある"
+        );
+    }
 }
