@@ -1296,6 +1296,21 @@ fn serve_inner(pipe: HANDLE) -> Result<(), NetfilterError> {
                                     audit = crate::tier2a::wfp::WfpAuditSubscription::start(path);
                                 }
                             }
+                            // [BUG-094] **いま張ったフィルタのIDを監査シンクへ渡す。**
+                            // これが無いと、届いた拒否が「harnessが落とした分」なのか
+                            // 「マシン上の無関係な通信」なのかを記録から言えない
+                            // （購読も列挙もマシン全体が対象で、絞り込む手段が無い）。
+                            //
+                            // **2分岐のうち2分岐**（購読を始めた側・既存へ移した側）で渡す。
+                            // 片方だけに書くと、daemonの2回目以降の実行で注記が
+                            // 黙って`"other"`に化ける（`B-06`）。
+                            if let Some(audit) = &audit {
+                                let ids: Vec<u64> = sessions
+                                    .iter()
+                                    .flat_map(|s| s.filter_ids().iter().copied())
+                                    .collect();
+                                audit.add_owned_filter_ids(&ids);
+                            }
                         }
                         // M15.7: OS監査収集器の連鎖起動。**WFPの適用が終わってから**行う
                         // （順序に依存は無いが、出口強制の確立を遅らせないため後ろに置く）。

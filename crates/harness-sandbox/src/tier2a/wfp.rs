@@ -150,6 +150,24 @@ pub struct WfpSession {
     keys: SessionKeys,
     engine: HANDLE,
     loopback_exemption: Option<LoopbackExemptionGuard>,
+    /// [BUG-094] この世代が投入したフィルタのID。**記録の注釈にしか使わない。**
+    ///
+    /// # 何のために持つのか
+    ///
+    /// WFPのnet-event購読も[`WfpAuditSubscription::drain_pending`]の列挙も**マシン全体が対象**で、
+    /// 絞り込みの手段が無い。したがって届いた`classify_drop`が
+    /// **harness自身のフィルタによるものか、無関係なプロセスの分か**を言えなかった。
+    /// ここに控えたIDと`FWPM_NET_EVENT`の`filterId`を突き合わせると、それが言える。
+    ///
+    /// # 正本はWFPのフィルタストアであって、ここではない（`B-13`・`B-14`）
+    ///
+    /// これは**投入時にWFPが割り当てた値の写し**で、撤収も再利用判定も**一切ここを見ない**
+    /// ——撤収はサブレイヤー／プロバイダの削除と動的セッションのエンジンクローズが行う
+    /// （[`Self::teardown`]）。**記録が実体の存在を代替しないこと**が`B-14`の要求で、
+    /// ここは「何を落としたのが誰か」という注釈だけに用途を限ることでそれを守っている。
+    /// 写しが実体と一致していることは実機テストで突き合わせる
+    /// （`e2e_recorded_filter_ids_match_the_filters_actually_in_our_sublayer`）。
+    filter_ids: Vec<u64>,
 }
 
 // HANDLEは値として複数スレッド間で運んでよい（他の`win_*`モジュールと同じ扱い）。
@@ -180,7 +198,9 @@ unsafe impl Send for WfpSession {}
 /// - **daemonが終わる直前の約1秒は、いまも取りこぼす。** 最後の配送を待たずに畳むためで、
 ///   これを埋めるには撤収時の猶予（案F）が要る
 /// - **購読テンプレートは絞り込み無し**なので、マシン上の他の拒否も受け取り得る。
-///   記録された拒否がこのセッションのフィルタによるものかは**確かめていない**
+///   **どれが自分の分かは記録の`filter_owner`で言えるようになった**（[`classify_filter_owner`]、
+///   2026-09-23）が、**受け取る側を絞る手段は無いまま**である——WFPの購読にフィルタ単位の
+///   絞り込みが無いので、変わったのは「区別できる」ところまでで「届かなくなる」わけではない
 pub struct WfpAuditSubscription {
     engine: HANDLE,
     subscription: HANDLE,
@@ -225,6 +245,14 @@ impl WfpAuditSubscription {
         unsafe { (*self.sink).set_path(validated_audit_log_path) };
     }
 
+    /// [BUG-094] harnessが投入したフィルタのIDを積む。**書込先の差し替えと同じ配線点で呼ぶ。**
+    ///
+    /// 積んだIDは、届いた`classify_drop`に`filter_owner`を付けるためだけに使う
+    /// （[`WfpAuditSink::owned_filter_ids`]に、置き換えない理由と限界を書いてある）。
+    pub fn add_owned_filter_ids(&self, ids: &[u64]) {
+        unsafe { (*self.sink).add_owned_filter_ids(ids) };
+    }
+
     /// **まだ書けていない拒否を、押し出しを待たずに取りに行って書く。**
     ///
     /// # なぜ待つのではなく取りに行くのか
@@ -250,7 +278,11 @@ impl WfpAuditSubscription {
     /// - **WFPのバッファが保持している分しか引けない。** 保持量・保持時間は測っていない
     ///   （実測で総数74〜95件を観測したが、それが上限かは不明）
     /// - **引けるのはマシン全体の拒否である。** このセッションのフィルタによるものだけに
-    ///   絞ってはいない（購読側も同じ）。時刻で購読期間内には絞る
+    ///   絞ってはいない（購読側も同じ）。時刻で購読期間内には絞る。
+    ///   **絞れないままだが、区別は付くようになった**——記録の`filter_owner`が
+    ///   `"harness"`／`"other"`／`"unknown"`を言う（[`classify_filter_owner`]）。
+    ///   **捨てずに書くのは意図である**: 他所の拒否も「窓の中で何が起きていたか」の情報で、
+    ///   読む側が`filter_owner`で落とせる
     /// - 失敗しても黙って戻る
     pub fn drain_pending(&self) {
         // **購読していた期間だけに絞る。** 絞らないとWFPのバッファ全体が返り、
@@ -393,6 +425,27 @@ struct WfpAuditSink {
     /// 各イベントの発生時刻がこの窓の内か外かが、
     /// **「届かなかった」と「窓が閉じた後に届いた」を分ける唯一の材料**になる。
     subscribed_at_unix_ms: std::sync::atomic::AtomicU64,
+    /// [BUG-094] harness自身が投入したフィルタのID（[`WfpSession::filter_ids`]の写し）。
+    ///
+    /// # 置き換えではなく積み上げる
+    ///
+    /// **世代を畳んだ後に遅れて届く拒否も、harnessが落としたものである。** 配送は発生から
+    /// 約1秒遅れるので、世代ごとに入れ替えると**直前の世代の落とし分が「よそのもの」に化ける**。
+    /// したがって`"harness"`の意味は「**このdaemonのいずれかの世代が張ったフィルタ**」であり、
+    /// 「いま生きているフィルタ」ではない。
+    ///
+    /// # `D-56`不変条件1は改訂していない
+    ///
+    /// ここに積むのは`u64`の集合だけで、**OSのハンドルでも強制でもない**。
+    /// 待機中のdaemonが握るものは前回の改訂（監査のエンジンハンドルと購読1組）から増えない。
+    ///
+    /// # 限界（**同じ場所に書く**）
+    ///
+    /// **WFPがフィルタIDを再利用するかは測っていない。** 再利用されるなら、畳んだ世代のIDを
+    /// あとから別のプロセスのフィルタが名乗り、`"harness"`と誤標識され得る
+    /// （`B-14`「台帳が記録できるのは事実ではなく、ある対象についての事実である」）。
+    /// **この注記は判断の材料であって境界ではない**（`P-07`）ので、そのうえで最善努力として扱う。
+    owned_filter_ids: std::sync::Mutex<std::collections::BTreeSet<u64>>,
 }
 
 impl WfpAuditSink {
@@ -403,6 +456,31 @@ impl WfpAuditSink {
             drops_recorded: std::sync::atomic::AtomicU64::new(0),
             subscribed_at_unix_ms: std::sync::atomic::AtomicU64::new(0),
             seen: std::sync::Mutex::new(std::collections::HashSet::new()),
+            owned_filter_ids: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        }
+    }
+
+    /// [BUG-094] harnessが投入したフィルタのIDを積む（[`Self::owned_filter_ids`]参照）。
+    fn add_owned_filter_ids(&self, ids: &[u64]) {
+        if let Ok(mut owned) = self.owned_filter_ids.lock() {
+            owned.extend(ids.iter().copied());
+        }
+    }
+
+    /// [BUG-094] 積んであるIDの件数。**要約へ出して、`"harness"`が0件だったときに
+    /// 「一致しなかった」と「そもそも集合が空だった」を区別するため**（`B-10`）。
+    fn owned_filter_id_count(&self) -> usize {
+        self.owned_filter_ids.lock().map(|o| o.len()).unwrap_or(0)
+    }
+
+    /// [BUG-094] 1件の拒否が、harnessのフィルタによるものかを判定する。
+    ///
+    /// ロックが毒されていたら`"unknown"`へ倒す——**毒されたロックを「よそのもの」と
+    /// 読ませない**（`"other"`は「調べた結果ちがった」の意味で、ここでは調べられていない）。
+    fn filter_owner(&self, filter_id: Option<u64>) -> &'static str {
+        match self.owned_filter_ids.lock() {
+            Ok(owned) => classify_filter_owner(filter_id, &owned),
+            Err(_) => FILTER_OWNER_UNKNOWN,
         }
     }
 
@@ -459,9 +537,13 @@ impl WfpAuditSink {
         let seen = self.events_seen.load(Ordering::Relaxed);
         let recorded = self.drops_recorded.load(Ordering::Relaxed);
         let subscribed_at = self.subscribed_at_unix_ms.load(Ordering::Relaxed);
+        // [BUG-094] 控えたフィルタIDの件数も出す。**`filter_owner="harness"`が0件だったとき、
+        // 「一致しなかった」のか「集合がそもそも空だった」のかを分けるため**（`B-10`）。
+        // 0なら判定側ではなく配線（`add_owned_filter_ids`の呼び出し）を疑う。
+        let owned = self.owned_filter_id_count();
         self.record(&WfpAuditEntry::control(format!(
             "net_event_summary: callback_invocations={seen} classify_drop_recorded={recorded} \
-             subscribed_at_unix_ms={subscribed_at}"
+             subscribed_at_unix_ms={subscribed_at} owned_filter_ids={owned}"
         )));
     }
 }
@@ -497,6 +579,13 @@ struct WfpAuditEntry {
     remote_port: u16,
     filter_id: Option<u64>,
     layer_id: Option<u16>,
+    /// [BUG-094] **この拒否を出したのがharness自身のフィルタか**（`"harness"`／`"other"`／
+    /// `"unknown"`。[`classify_filter_owner`]）。ネットワークイベント以外では`None`。
+    ///
+    /// 購読も列挙もマシン全体が対象で絞り込めないので、**これが無いと記録の1行を見ても
+    /// 「自分が塞いだ通信」なのか「隣で走っている無関係なプロセスの分」なのかが言えない**。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter_owner: Option<&'static str>,
 }
 
 impl WfpAuditEntry {
@@ -520,6 +609,8 @@ impl WfpAuditEntry {
             remote_port: 0,
             filter_id: None,
             layer_id: None,
+            // 制御レコードはネットワークイベントではないので、落としたフィルタという概念を持たない。
+            filter_owner: None,
         }
     }
 }
@@ -527,6 +618,37 @@ impl WfpAuditEntry {
 /// 制御レコードのマーカー。読む側（`harness_policy::is_net_control_record`）と同じ綴りである
 /// ことがこの機構の前提なので、値の変更は両方を同時に見て行う。
 const CONTROL_PROTOCOL: &str = "control";
+
+/// [BUG-094] harness自身のフィルタが落とした。
+const FILTER_OWNER_HARNESS: &str = "harness";
+/// [BUG-094] harnessのものではないフィルタが落とした（**調べた結果ちがった**）。
+const FILTER_OWNER_OTHER: &str = "other";
+/// [BUG-094] 判定できなかった（**調べられていない**）。[`FILTER_OWNER_OTHER`]と混ぜない。
+const FILTER_OWNER_UNKNOWN: &str = "unknown";
+
+/// [BUG-094] 拒否の出所を3値で判定する。
+///
+/// # `"other"`と`"unknown"`を分ける理由
+///
+/// **次の一手が正反対である。** `"other"`は「マシン上の無関係な通信を拾った」ので
+/// 記録の読み方（絞り込み）の問題だが、`"unknown"`は「イベントに`filterId`が載っていない」
+/// ので計器の問題である。2値に潰すと、どちらが起きているのか永久に分からない（`B-10`）。
+///
+/// # 純関数にしてある理由
+///
+/// 判定だけを単体テストで固定できるようにするため。**ただし、これを固定しても
+/// 「渡している集合が正しいか」は別の事実である**（`B-08`）——そちらは実機テスト
+/// （控えたIDとサブレイヤーの実列挙の突き合わせ）が受け持つ。
+fn classify_filter_owner(
+    filter_id: Option<u64>,
+    owned: &std::collections::BTreeSet<u64>,
+) -> &'static str {
+    match filter_id {
+        Some(id) if owned.contains(&id) => FILTER_OWNER_HARNESS,
+        Some(_) => FILTER_OWNER_OTHER,
+        None => FILTER_OWNER_UNKNOWN,
+    }
+}
 
 /// **昇格側の任意のコードから**、検証済みの監査シンクへ制御レコードを1行書く。
 ///
@@ -658,6 +780,8 @@ unsafe fn record_classify_drop(sink: &WfpAuditSink, event: &FWPM_NET_EVENT1) {
         remote_port: header.remotePort,
         filter_id,
         layer_id: drop.map(|d| d.layerId),
+        // [BUG-094] **押し出しと引く経路の両方がこの関数を通る**ので、注記もここ1箇所で付く。
+        filter_owner: Some(sink.filter_owner(filter_id)),
     };
     sink.record(&entry);
     sink.drops_recorded
@@ -735,7 +859,7 @@ impl WfpSession {
         cleanup_stale_objects(keys);
         let engine = open_dynamic_engine()?;
 
-        let result = (|| -> Result<(), WfpError> {
+        let result = (|| -> Result<Vec<u64>, WfpError> {
             unsafe {
                 check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             }
@@ -744,7 +868,7 @@ impl WfpSession {
 
             unsafe {
                 match &txn_result {
-                    Ok(()) => check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?,
+                    Ok(_) => check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?,
                     Err(_) => {
                         // ベストエフォート: abort自体の失敗はtxn_resultのエラーを覆わない。
                         let _ = FwpmTransactionAbort0(engine);
@@ -755,7 +879,7 @@ impl WfpSession {
         })();
 
         match result {
-            Ok(()) => {
+            Ok(filter_ids) => {
                 let loopback_exemption = match ensure_loopback_exemption(container_sid) {
                     Ok(guard) => Some(guard),
                     Err(e) => {
@@ -772,6 +896,7 @@ impl WfpSession {
                     keys,
                     engine,
                     loopback_exemption,
+                    filter_ids,
                 })
             }
             Err(e) => {
@@ -783,12 +908,23 @@ impl WfpSession {
         }
     }
 
+    /// [BUG-094] この世代が投入したフィルタのID（[`WfpSession::filter_ids`]参照）。
+    ///
+    /// 呼び出し側（`netfilterd`）はこれを監査シンクへ渡し、記録された拒否に
+    /// **harnessのフィルタが落としたのか**を注記させる。
+    pub fn filter_ids(&self) -> &[u64] {
+        &self.filter_ids
+    }
+
     /// 投入したフィルタ・サブレイヤー・プロバイダを撤収し、エンジンハンドルを閉じる
     /// （仕様書§5.5正常系）。呼び出し後、`self`は消費される。
     pub fn teardown(mut self) -> Result<(), WfpError> {
         let engine = self.engine;
         let keys = self.keys;
         let loopback_exemption = self.loopback_exemption.take();
+        // [BUG-094] `Vec`をここで取り出して落とす。**`mem::forget`はデストラクタを走らせない**ので、
+        // 取り出さないとヒープが毎回漏れる（`loopback_exemption`を`take`しているのと同じ理由）。
+        drop(std::mem::take(&mut self.filter_ids));
         std::mem::forget(self); // Dropで二重close/二重teardownしないよう所有権をここで断つ。
 
         let result = (|| -> Result<(), WfpError> {
@@ -801,9 +937,15 @@ impl WfpSession {
                     "FwpmTransactionBegin0 (teardown)",
                 )?;
                 // フィルタはサブレイヤー削除では自動的に消えないため、サブレイヤー/プロバイダより
-                // 前に個別削除するのが本来だが、本ラウンドはフィルタIDを保持していないため、
-                // サブレイヤー・プロバイダの削除のみ行う。DYNAMICセッションではエンジンクローズ時に
-                // 残りのフィルタもBFEにより自動削除される（付録A #1、フェイルセーフとして機能する）。
+                // 前に個別削除するのが本来だが、ここではサブレイヤー・プロバイダの削除のみ行う。
+                // DYNAMICセッションではエンジンクローズ時に残りのフィルタもBFEにより自動削除される
+                // （付録A #1、フェイルセーフとして機能する）。
+                //
+                // **`self.filter_ids`を持つようになった後も、撤収はここを見ない**（[BUG-094]）。
+                // あれは記録の注釈専用の写しで、**撤収の正本にすると`B-14`が禁じる形**になる
+                // ——写しが実体とずれた瞬間に「消したつもりで残る」が生まれ、しかも
+                // ずれていること自体が写しの中身からは分からない。撤収の根拠は
+                // 動的セッションの性質（OSが畳む）のままにしておく。
                 let _ = FwpmSubLayerDeleteByKey0(engine, &keys.sublayer as *const GUID);
                 let _ = FwpmProviderDeleteByKey0(engine, &keys.provider as *const GUID);
             }
@@ -1124,12 +1266,18 @@ unsafe fn delete_filters_in_own_sublayer(engine: HANDLE, keys: SessionKeys) {
     let _ = FwpmFilterDestroyEnumHandle0(engine, enum_handle);
 }
 
+/// [BUG-094] **投入したフィルタのIDを全部返す。**
+///
+/// 途中で失敗すると`?`で抜けるので、そこまでに積んだIDは捨てられる。**これは取りこぼしではない**
+/// ——この関数はトランザクションの中で走り、失敗した回は呼び出し元が`FwpmTransactionAbort0`で
+/// 畳むので、**捨てたIDに対応するフィルタも存在しない**（記録と実体が同時に消える）。
 fn apply_within_transaction(
     engine: HANDLE,
     container_sid: PSID,
     opts: &WfpOptions,
     keys: SessionKeys,
-) -> Result<(), WfpError> {
+) -> Result<Vec<u64>, WfpError> {
+    let mut filter_ids = Vec::new();
     unsafe {
         // 1. プロバイダ登録。
         let provider = FWPM_PROVIDER0 {
@@ -1165,8 +1313,18 @@ fn apply_within_transaction(
         )?;
 
         // 3. デフォルト拒否フィルタ（v4/v6両方）。
-        add_default_deny_filter(engine, container_sid, FWPM_LAYER_ALE_AUTH_CONNECT_V4, keys)?;
-        add_default_deny_filter(engine, container_sid, FWPM_LAYER_ALE_AUTH_CONNECT_V6, keys)?;
+        filter_ids.push(add_default_deny_filter(
+            engine,
+            container_sid,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            keys,
+        )?);
+        filter_ids.push(add_default_deny_filter(
+            engine,
+            container_sid,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            keys,
+        )?);
 
         // 4. ループバック許可（任意）。Proxy/Fake DNSの待受だけを開けるため、
         // v1ではポート指定の限定allowだけを張る。
@@ -1177,15 +1335,39 @@ fn apply_within_transaction(
         udp_ports.sort_unstable();
         udp_ports.dedup();
         if !tcp_ports.is_empty() {
-            add_allow_v4_loopback_ports_filter(engine, container_sid, &tcp_ports, 6, keys)?;
-            add_allow_v6_loopback_ports_filter(engine, container_sid, &tcp_ports, 6, keys)?;
+            filter_ids.push(add_allow_v4_loopback_ports_filter(
+                engine,
+                container_sid,
+                &tcp_ports,
+                6,
+                keys,
+            )?);
+            filter_ids.push(add_allow_v6_loopback_ports_filter(
+                engine,
+                container_sid,
+                &tcp_ports,
+                6,
+                keys,
+            )?);
         }
         if !udp_ports.is_empty() {
-            add_allow_v4_loopback_ports_filter(engine, container_sid, &udp_ports, 17, keys)?;
-            add_allow_v6_loopback_ports_filter(engine, container_sid, &udp_ports, 17, keys)?;
+            filter_ids.push(add_allow_v4_loopback_ports_filter(
+                engine,
+                container_sid,
+                &udp_ports,
+                17,
+                keys,
+            )?);
+            filter_ids.push(add_allow_v6_loopback_ports_filter(
+                engine,
+                container_sid,
+                &udp_ports,
+                17,
+                keys,
+            )?);
         }
     }
-    Ok(())
+    Ok(filter_ids)
 }
 
 fn display_data(name: &str, description: &str) -> FWPM_DISPLAY_DATA0 {
@@ -1217,12 +1399,15 @@ unsafe fn package_id_condition(container_sid: PSID) -> FWPM_FILTER_CONDITION0 {
     }
 }
 
+/// [BUG-094] **投入したフィルタのIDを返す。** 呼び出し側はこれを積んで
+/// [`WfpAuditSink::owned_filter_ids`]へ渡し、記録された拒否が
+/// **harness自身のフィルタによるものか**を言えるようにする（[`classify_filter_owner`]）。
 unsafe fn add_default_deny_filter(
     engine: HANDLE,
     container_sid: PSID,
     layer: GUID,
     keys: SessionKeys,
-) -> Result<(), WfpError> {
+) -> Result<u64, WfpError> {
     let mut weight_value = WEIGHT_DENY;
     let condition = package_id_condition(container_sid);
     let mut provider_key_value = keys.provider;
@@ -1252,15 +1437,19 @@ unsafe fn add_default_deny_filter(
         },
         ..Default::default()
     };
+    // [BUG-094] 第4引数はWFPが割り当てたフィルタIDの出力。**以前は`None`で捨てていた**——
+    // 捨てると、届いた`classify_drop`の`filter_id`を突き合わせる相手が無くなる。
+    let mut filter_id: u64 = 0;
     check(
         FwpmFilterAdd0(
             engine,
             &filter as *const FWPM_FILTER0,
             PSECURITY_DESCRIPTOR::default(),
-            None,
+            Some(&mut filter_id as *mut u64),
         ),
         "FwpmFilterAdd0 (default deny)",
-    )
+    )?;
+    Ok(filter_id)
 }
 
 unsafe fn add_allow_v4_loopback_ports_filter(
@@ -1269,7 +1458,7 @@ unsafe fn add_allow_v4_loopback_ports_filter(
     ports: &[u16],
     protocol: u8,
     keys: SessionKeys,
-) -> Result<(), WfpError> {
+) -> Result<u64, WfpError> {
     let loopback = FWP_V4_ADDR_AND_MASK {
         addr: u32::from(std::net::Ipv4Addr::LOCALHOST),
         mask: u32::MAX,
@@ -1289,7 +1478,7 @@ unsafe fn add_allow_v6_loopback_ports_filter(
     ports: &[u16],
     protocol: u8,
     keys: SessionKeys,
-) -> Result<(), WfpError> {
+) -> Result<u64, WfpError> {
     let loopback = FWP_V6_ADDR_AND_MASK {
         addr: std::net::Ipv6Addr::LOCALHOST.octets(),
         prefixLength: 128,
@@ -1379,7 +1568,7 @@ unsafe fn add_allow_filter(
     layer: GUID,
     conditions: &mut [FWPM_FILTER_CONDITION0],
     keys: SessionKeys,
-) -> Result<(), WfpError> {
+) -> Result<u64, WfpError> {
     let mut weight_value = WEIGHT_ALLOW;
     let mut provider_key_value = keys.provider;
     let filter = FWPM_FILTER0 {
@@ -1405,15 +1594,18 @@ unsafe fn add_allow_filter(
         },
         ..Default::default()
     };
+    // [BUG-094] IDを受け取る理由は`add_default_deny_filter`と同じ。
+    let mut filter_id: u64 = 0;
     check(
         FwpmFilterAdd0(
             engine,
             &filter as *const FWPM_FILTER0,
             PSECURITY_DESCRIPTOR::default(),
-            None,
+            Some(&mut filter_id as *mut u64),
         ),
         "FwpmFilterAdd0 (allow)",
-    )
+    )?;
+    Ok(filter_id)
 }
 
 #[cfg(test)]
@@ -1541,6 +1733,7 @@ mod tests {
             remote_port: 18080,
             filter_id: Some(42),
             layer_id: Some(44),
+            filter_owner: Some(FILTER_OWNER_HARNESS),
         });
 
         let text = std::fs::read_to_string(path).unwrap();
@@ -1551,6 +1744,9 @@ mod tests {
         assert_eq!(value["allowed"], false);
         assert_eq!(value["reason"], "classify_drop");
         assert_eq!(value["remote_port"], 18080);
+        // [BUG-094] 注記がJSONへ載ること自体を固定する。載らないと、読む側は
+        // 「harnessの分ではない」ではなく「まだ判定していない古いnetfilterd」と区別できない。
+        assert_eq!(value["filter_owner"], "harness");
         assert_eq!(text.lines().count(), 1);
     }
 
@@ -1650,6 +1846,7 @@ mod tests {
             remote_port: 443,
             filter_id: Some(43),
             layer_id: Some(44),
+            filter_owner: Some(FILTER_OWNER_OTHER),
         });
 
         let text = std::fs::read_to_string(path).unwrap();
@@ -1706,6 +1903,70 @@ mod tests {
         );
     }
 
+    /// [BUG-094] **出所の判定は3値で、`"other"`と`"unknown"`を混ぜない。**
+    ///
+    /// 2値へ潰すと「マシン上の無関係な通信を拾った」と「イベントに`filterId`が載っていない」が
+    /// 同じ見え方になる。**前者は記録の読み方の問題、後者は計器の問題**で、次に見る場所が違う（`B-10`）。
+    #[test]
+    fn classify_filter_owner_separates_ours_theirs_and_unknown() {
+        let owned: std::collections::BTreeSet<u64> = [10u64, 20].into_iter().collect();
+        assert_eq!(classify_filter_owner(Some(10), &owned), FILTER_OWNER_HARNESS);
+        assert_eq!(classify_filter_owner(Some(20), &owned), FILTER_OWNER_HARNESS);
+        assert_eq!(classify_filter_owner(Some(11), &owned), FILTER_OWNER_OTHER);
+        assert_eq!(classify_filter_owner(None, &owned), FILTER_OWNER_UNKNOWN);
+
+        // **集合が空でも`"unknown"`にはしない。** 空は「まだ1本も張っていない」であって
+        // 「判定できなかった」ではない。ここを潰すと、配線を落としたときの症状が
+        // 「計器が壊れている」の顔で出て、原因を取り違える。
+        let empty = std::collections::BTreeSet::new();
+        assert_eq!(classify_filter_owner(Some(10), &empty), FILTER_OWNER_OTHER);
+        assert_eq!(classify_filter_owner(None, &empty), FILTER_OWNER_UNKNOWN);
+    }
+
+    /// [BUG-094] **積むのであって、置き換えではない。**
+    ///
+    /// 配送は発生から約1秒遅れるので、世代ごとに入れ替えると
+    /// **直前の世代の落とし分が「よそのもの」に化ける**（N10・N11）。
+    #[test]
+    fn owned_filter_ids_accumulate_across_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = WfpAuditSink::new(dir.path().join("net-audit.jsonl"));
+        sink.add_owned_filter_ids(&[1, 2]);
+        sink.add_owned_filter_ids(&[3]);
+
+        assert_eq!(sink.owned_filter_id_count(), 3);
+        assert_eq!(sink.filter_owner(Some(1)), FILTER_OWNER_HARNESS);
+        assert_eq!(sink.filter_owner(Some(3)), FILTER_OWNER_HARNESS);
+        assert_eq!(sink.filter_owner(Some(99)), FILTER_OWNER_OTHER);
+        assert_eq!(sink.filter_owner(None), FILTER_OWNER_UNKNOWN);
+
+        // 同じIDを積み直しても件数は増えない。**要約へ出す数字を配線の検算に使う**ので、
+        // 重複で膨らむと「渡っているか」を件数で見られなくなる。
+        sink.add_owned_filter_ids(&[1, 2, 3]);
+        assert_eq!(sink.owned_filter_id_count(), 3);
+    }
+
+    /// [BUG-094] 要約に**控えたフィルタIDの件数**が載ること。
+    ///
+    /// `filter_owner="harness"`が0件だったとき、**「一致しなかった」と
+    /// 「集合がそもそも空だった（＝配線が落ちている）」を分ける唯一の材料**である（`B-10`）。
+    #[test]
+    fn the_summary_line_states_how_many_filter_ids_we_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net-audit.jsonl");
+        let sink = WfpAuditSink::new(path.clone());
+        sink.add_owned_filter_ids(&[7, 8]);
+        sink.record_event_summary();
+
+        let text = std::fs::read_to_string(path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        let reason = value["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("owned_filter_ids=2"),
+            "控えた件数が要約に無い: {reason}"
+        );
+    }
+
     /// [BUG-094] `FILETIME`の変換。**実際の値で検算する。**
     ///
     /// 1970-01-01T00:00:00Zちょうどの`FILETIME`は`116_444_736_000_000_000`刻みで、
@@ -1747,6 +2008,34 @@ mod tests {
             filetime_to_unix_ms(at(116_444_736_000_000_000 - 1)),
             None,
             "unixエポックの直前も使える時刻として扱わない"
+        );
+    }
+
+    /// [BUG-094] **控えたフィルタIDが、実機のサブレイヤーに在るものと一致することを突き合わせる。**
+    ///
+    /// # なぜこの検算が要るのか
+    ///
+    /// [`WfpSession::filter_ids`]はWFPのフィルタストア（正本）の**写し**で、
+    /// 届いた`classify_drop`へ`filter_owner`を付けるのに使う。
+    /// **写しが実体とずれても症状は出ない**——記録は同じ件数だけ出続け、注記が
+    /// `"harness"`から`"other"`へ静かに変わるだけである（`B-14`: 台帳の中身からは
+    /// ずれていることが分からない）。**だから実体を別経路で列挙して突き合わせる。**
+    ///
+    /// 列挙側は[`filter_ids_for_session`]——`FwpmFilterAdd0`の戻り値とは
+    /// **別のAPI・別のエンジンハンドル**なので、同じ誤りで両方が揃って狂うことはない。
+    #[cfg(windows)]
+    fn assert_recorded_filter_ids_match_the_sublayer(
+        label: &str,
+        session: &WfpSession,
+        in_sublayer: &std::collections::BTreeSet<u64>,
+    ) {
+        let recorded: std::collections::BTreeSet<u64> =
+            session.filter_ids().iter().copied().collect();
+        eprintln!("[e2e][BUG-094] セッション{label}が控えたフィルタID: {recorded:?}");
+        assert_eq!(
+            &recorded, in_sublayer,
+            "セッション{label}が控えたフィルタIDと、実機のサブレイヤーに在るIDが食い違っている。\
+             このずれは無症状で、拒否の記録に付く`filter_owner`だけが静かに嘘になる"
         );
     }
 
@@ -1798,12 +2087,14 @@ mod tests {
         let ids_a = filter_ids_in_sublayer(keys_a);
         eprintln!("[e2e] セッションAのフィルタ: {ids_a:?}");
         assert!(!ids_a.is_empty(), "Aのフィルタが投入されていない");
+        assert_recorded_filter_ids_match_the_sublayer("A", &session_a, &ids_a);
 
         let session_b = WfpSession::apply(sid.as_psid(), &opts_b).expect("session B apply");
         let ids_b = filter_ids_in_sublayer(keys_b);
         let a_after_b = filter_ids_in_sublayer(keys_a);
         eprintln!("[e2e] セッションBのフィルタ: {ids_b:?}");
         eprintln!("[e2e] B適用後もAに残っているフィルタ: {a_after_b:?}");
+        assert_recorded_filter_ids_match_the_sublayer("B", &session_b, &ids_b);
 
         // **これが#8の修正点**: 後発の`apply`（`cleanup_stale_objects`込み）が先行のフィルタを
         // 削らない。以前は共有サブレイヤーだったため、ここでAの4件が全滅していた。

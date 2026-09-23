@@ -2021,11 +2021,15 @@ fn net_case_ws(name: &str) -> PathBuf {
 /// `allowed:false`エントリがあることを二重証拠として要求する(Q4)。`--staged`を付けて
 /// `sandbox_dir`を確保するのは、それが無いと`net-audit.jsonl`自体が書かれないため
 /// (`crates/harness-tools/src/shell.rs`の`audit_log_path`はstaging有効時のみ設定される)。
+/// `expect_proxy_denials`は「層1（プロキシ）が、この理由でこの件数だけ断つこと」
+/// （[`assert_proxy_denials`]）。**WFPの拒否0件を「正しい0」と読むケースはここを埋める**
+/// ——そうしないと、層1が断たなくなった日に0が取りこぼしと見分けられなくなる（[BUG-094]）。
 fn run_net_case(
     name: &str,
     allow_domains: &[&str],
     case_matrix_case: &str,
     deny_hosts_expected: &[&str],
+    expect_proxy_denials: &[(&str, usize)],
 ) -> Result<(), String> {
     run_net_case_with_exe(
         &harness_exe(),
@@ -2033,6 +2037,7 @@ fn run_net_case(
         allow_domains,
         case_matrix_case,
         deny_hosts_expected,
+        expect_proxy_denials,
     )
 }
 
@@ -2043,6 +2048,7 @@ fn run_net_case_with_exe(
     allow_domains: &[&str],
     case_matrix_case: &str,
     deny_hosts_expected: &[&str],
+    expect_proxy_denials: &[(&str, usize)],
 ) -> Result<(), String> {
     run_net_case_with_exe_and_stderr_check(
         exe,
@@ -2051,6 +2057,7 @@ fn run_net_case_with_exe(
         case_matrix_case,
         deny_hosts_expected,
         None,
+        expect_proxy_denials,
     )
 }
 
@@ -2064,6 +2071,7 @@ fn run_net_case_with_exe_and_stderr_check(
     case_matrix_case: &str,
     deny_hosts_expected: &[&str],
     stderr_must_contain: Option<&str>,
+    expect_proxy_denials: &[(&str, usize)],
 ) -> Result<(), String> {
     let ws = net_case_ws(name);
     let mut extra_args = vec!["--staged"];
@@ -2130,8 +2138,105 @@ fn run_net_case_with_exe_and_stderr_check(
     }
 
     report_net_event_audit(name, &audit_entries);
+    assert_filter_attribution_is_wired(name, &audit_entries)?;
+    assert_proxy_denials(name, &audit_entries, expect_proxy_denials)?;
 
     cleanup_on_success(&ws, &[], name);
+    Ok(())
+}
+
+/// [BUG-094] **拒否の出所を注記する配線が生きていることを、競争に依存せず固定する。**
+///
+/// # なぜ「`net-05`に`harness`が1件」を`assert`しないのか
+///
+/// **それは取れない回がある**（実測でも、待たずに畳めば0件になる回がある）。
+/// 配送が間に合うかは競争の結果なので、件数を`assert`すると**壊れていなくても赤くなる**。
+///
+/// # 代わりに何を固定するか——**壊れたときだけ必ず出る2つ**
+///
+/// | 固定する事実 | これが破れたら何が起きているか |
+/// |---|---|
+/// | 要約の`owned_filter_ids`が0でない | フィルタIDを監査シンクへ渡す配線が落ちた。**全部の拒否が無言で`other`に化ける** |
+/// | 記録された`classify_drop`に必ず`filter_owner`が載る | 注記を書かない経路が生まれた（古い`netfilterd`が動いている等） |
+///
+/// どちらも**拒否が1件も取れなかった回でも判定できる**（前者は要約だけで足り、
+/// 後者は0件なら空虚に真）。**WFPを張らない経路（fail-closed系）では要約が無い**ので、
+/// そこは対象外にする——無いことを失敗にすると、別の機構の正常動作でこのテストが落ちる。
+fn assert_filter_attribution_is_wired(
+    name: &str,
+    audit_entries: &[serde_json::Value],
+) -> Result<(), String> {
+    let summary = audit_entries.iter().find_map(|e| {
+        e.get("reason")
+            .and_then(|r| r.as_str())
+            .filter(|r| r.starts_with("net_event_summary"))
+    });
+    let Some(summary) = summary else {
+        // WFPを張らない経路。ここで失敗させない理由は本関数のdoc参照。
+        return Ok(());
+    };
+    let owned: u64 = summary
+        .split("owned_filter_ids=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| {
+            format!("[{name}] 要約に`owned_filter_ids=`が無い（注記の配線より前のnetfilterdが動いている）: {summary}")
+        })?;
+    if owned == 0 {
+        return Err(format!(
+            "[{name}] 控えたフィルタIDが0件。フィルタは張られているのにIDが監査シンクへ渡っていない\
+             ——この状態では全ての拒否が無言で`filter_owner=other`になる: {summary}"
+        ));
+    }
+
+    for e in audit_entries
+        .iter()
+        .filter(|e| e.get("reason").and_then(|r| r.as_str()) == Some("classify_drop"))
+    {
+        if e.get("filter_owner").and_then(|o| o.as_str()).is_none() {
+            return Err(format!(
+                "[{name}] `classify_drop`に`filter_owner`が載っていない行がある（注記を書かない経路が在る）: {e}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [BUG-094] **層1（プロキシ）が、期待した理由で、期待した件数だけ断ったこと。**
+///
+/// # なぜこれを固定するのか
+///
+/// `net-06-numeric`のWFP拒否が0件なのは**正しい**——層1で断たれるので外向きのソケットが
+/// 一度も開かれず、WFPに落とすものが無い。**だが「0件が正しい」の根拠は層1の側にある**ので、
+/// 層1が断たなくなった日に、この0は**取りこぼしと見分けが付かなくなる**。
+/// ここを固定しておけば、根拠が消えた瞬間にそちらが赤くなる。
+///
+/// # 理由コードまで見る
+///
+/// このケースが出すのは`ip_literal_denied`（IPリテラル判定が名前照合より**前**にある）。
+/// **件数だけを見ると、別の理由で断られていても通る**——たとえば名前照合の側で
+/// 断られるようになったら、それは層1の意味が変わったということで、気付く必要がある。
+fn assert_proxy_denials(
+    name: &str,
+    audit_entries: &[serde_json::Value],
+    expected: &[(&str, usize)],
+) -> Result<(), String> {
+    for (reason, count) in expected {
+        let actual = audit_entries
+            .iter()
+            .filter(|e| e.get("protocol").and_then(|p| p.as_str()) != Some("control"))
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) != Some("wfp"))
+            .filter(|e| e.get("allowed").and_then(|a| a.as_bool()) == Some(false))
+            .filter(|e| e.get("reason").and_then(|r| r.as_str()) == Some(reason))
+            .count();
+        if actual != *count {
+            return Err(format!(
+                "[{name}] 層1の拒否が期待と違う: {reason} を{count}件期待したが{actual}件。\
+                 WFPの拒否0件を「層1で断たれたから正しい」と読む根拠がこれである"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2223,6 +2328,10 @@ fn report_wfp_audit_policy() {
 /// 数えた値を残すところまでが本関数の仕事で、結論が出たらその時点で対の`assert`を置く。
 /// 成功した回はワークスペースごと片付くので、**ログに残すのがこの事実を残す唯一の口**である。
 fn report_net_event_audit(name: &str, audit_entries: &[serde_json::Value]) {
+    // [BUG-094] **WFPの話をする前に、層1（プロキシ）の拒否を出す。**
+    // 早期returnより前に置くのは、WFPの制御レコードが1件も無いケースでも
+    // 層1の結果だけは残す必要があるためである。
+    report_proxy_denials(name, audit_entries);
     let controls: Vec<&str> = audit_entries
         .iter()
         .filter(|e| e.get("protocol").and_then(|p| p.as_str()) == Some("control"))
@@ -2248,6 +2357,76 @@ fn report_net_event_audit(name: &str, audit_entries: &[serde_json::Value]) {
     }
     eprintln!("[BUG-094][{name}] classify_drop記録={classify_drops}");
     report_delivery_lag(name, audit_entries, &net_event_controls);
+}
+
+/// [BUG-094] **層1（プロキシ）が断った件数を、理由ごとにcaseへ1行ずつ残す。**
+///
+/// # 何を分けたいのか
+///
+/// `classify_drop`が0件のとき、次の2つが区別できない（`B-10`）。
+///
+/// | 実際 | 意味 |
+/// |---|---|
+/// | 層1で断たれた | **外向きのソケットが一度も開かれない**ので、WFPに落とすものが無い。0は正しい |
+/// | 層1を通った | WFPまで届いたはずなのに記録が無い＝**取りこぼしている** |
+///
+/// # 理由コードを潰さずに出す
+///
+/// `net-06-numeric`が投げるのは10進/16進/8進のIPリテラルで、
+/// このとき層1が出す理由は**`ip_literal_denied`**である（`harness-core`の`evaluate_host`は
+/// IPリテラル判定を名前照合より**前**に置いている）。**`domain_denied`だけを見ると、
+/// 正しく断たれていても「拒否が無い」と読めてしまう**ので、理由で畳まず全部出す。
+///
+/// # 判定しない
+///
+/// 呼び出し元と同じ理由で`assert`を置かない（いま閾値を書くと測る前に答えを書くことになる）。
+/// **結論が出たらその時点で対の`assert`へ置き換える。**
+fn report_proxy_denials(name: &str, audit_entries: &[serde_json::Value]) {
+    let mut by_reason: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for e in audit_entries {
+        // 制御レコードは通信の記録ではない（`harness_policy::is_net_control_record`と同じ判定）。
+        if e.get("protocol").and_then(|p| p.as_str()) == Some("control") {
+            continue;
+        }
+        if e.get("allowed").and_then(|a| a.as_bool()) != Some(false) {
+            continue;
+        }
+        // WFP側（層2）はこの関数の対象外——そちらは`report_net_event_audit`が数える。
+        if e.get("kind").and_then(|k| k.as_str()) == Some("wfp") {
+            continue;
+        }
+        // **`kind`も鍵に含める。** 層1の拒否は`fake_dns`（名前解決の段）と`proxy`（接続の段）の
+        // 2種あり、**どちらで断たれたかで「外へソケットが開かれたか」が変わる**
+        // ——名前解決で断たれていれば接続そのものが起きない。理由コードだけで畳むと潰れる。
+        let kind = e
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("(kindなし)");
+        let reason = e.get("reason").and_then(|r| r.as_str()).unwrap_or("(理由なし)");
+        let host = e
+            .get("host")
+            .and_then(|h| h.as_str())
+            .unwrap_or("(ホスト名なし)")
+            .to_string();
+        by_reason
+            .entry(format!("{kind}/{reason}"))
+            .or_default()
+            .push(host);
+    }
+
+    if by_reason.is_empty() {
+        // **黙って飛ばさない。** 「層1の拒否が1件も無い」こと自体が、
+        // `classify_drop=0`を取りこぼしと読むべき根拠になる。
+        eprintln!("[BUG-094][{name}] 層1(プロキシ)の拒否: 0件");
+        return;
+    }
+    for (kind_and_reason, hosts) in by_reason {
+        eprintln!(
+            "[BUG-094][{name}] 層1(プロキシ)の拒否: {kind_and_reason}={} 宛先={hosts:?}",
+            hosts.len()
+        );
+    }
 }
 
 /// [BUG-094] **届いたイベントが「自分の窓の中で起きたもの」かを出す。**
@@ -2318,11 +2497,43 @@ fn report_delivery_lag(name: &str, audit_entries: &[serde_json::Value], controls
         let peer = e.get("remote_addr").and_then(|a| a.as_str()).unwrap_or("?");
         let port = e.get("remote_port").and_then(|p| p.as_u64()).unwrap_or(0);
         let filter = e.get("filter_id").and_then(|f| f.as_u64());
+        // [BUG-094] **誰のフィルタが落としたか。** 購読も列挙もマシン全体が対象なので、
+        // これが無いと1行を見ても「自分が塞いだ通信」か「隣の無関係なプロセス」かを言えない。
+        // 項目自体が無いのは**この注記より前のnetfilterdが書いた行**である
+        // （「harnessのものではない」と混同しない、`B-10`）。
+        let owner = e
+            .get("filter_owner")
+            .and_then(|o| o.as_str())
+            .unwrap_or("(注記なし＝古いnetfilterd)");
         eprintln!(
             "[BUG-094][{name}] classify_drop 宛先={peer}:{port} filter={filter:?} \
-             発生={occurred:?} 受信={received:?} → {verdict}"
+             出所={owner} 発生={occurred:?} 受信={received:?} → {verdict}"
         );
     }
+    report_filter_owner_tally(name, audit_entries);
+}
+
+/// [BUG-094] **出所の内訳をcaseごとに1行で残す。**
+///
+/// 個別行だけだと、件数が増えたときに「何件が自分の分か」を数え直すことになる。
+/// **`harness`が0件のときは、要約レコードの`owned_filter_ids=`と対で読む**
+/// ——そちらが0なら判定ではなく配線（IDを渡す経路）が落ちている。
+fn report_filter_owner_tally(name: &str, audit_entries: &[serde_json::Value]) {
+    let mut tally: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for e in audit_entries
+        .iter()
+        .filter(|e| e.get("reason").and_then(|r| r.as_str()) == Some("classify_drop"))
+    {
+        let owner = e
+            .get("filter_owner")
+            .and_then(|o| o.as_str())
+            .unwrap_or("(注記なし)");
+        *tally.entry(owner).or_default() += 1;
+    }
+    if tally.is_empty() {
+        return;
+    }
+    eprintln!("[BUG-094][{name}] classify_dropの出所内訳: {tally:?}");
 }
 
 /// `.harness/sandbox/**/net-audit.jsonl`を全て読み、JSON行を集める(kind:proxy/wfp/fake_dns
@@ -2352,6 +2563,8 @@ fn net_case_01_none() -> Result<(), String> {
         &[],
         "all-denied",
         &["example.com", "google.com"],
+        // 2本とも層1で断たれる（許可リストが空）。WFPの拒否0件はそれで説明が付く。
+        &[("domain_denied", 2)],
     )
 }
 
@@ -2361,6 +2574,7 @@ fn net_case_02_invalid_domain() -> Result<(), String> {
         &["invalidexample.com"],
         "all-denied",
         &["example.com", "google.com"],
+        &[("domain_denied", 2)],
     )
 }
 
@@ -2372,6 +2586,7 @@ fn net_case_03_example_allowed() -> Result<(), String> {
         &["example.com"],
         "domains",
         &["google.com"],
+        &[("domain_denied", 1)],
     )
 }
 
@@ -2379,12 +2594,23 @@ fn net_case_03_example_allowed() -> Result<(), String> {
 /// 直接TCP接続する(`tier2a-net-e2e.exe`のdocコメント参照)。WFPが機能していなければ
 /// ここが素通りする=D-01「フックは境界にしない」の直接検証。
 fn net_case_05_raw_tcp_bypasses_proxy() -> Result<(), String> {
-    run_net_case("net-05-rawtcp", &["example.com"], "example-ip", &[])
+    // 層1を通る唯一のケース（プロキシ環境変数を無視して直接TCPを張る）なので、層1の拒否は0件。
+    run_net_case("net-05-rawtcp", &["example.com"], "example-ip", &[], &[])
 }
 
 /// 06: Layer1検証。10進/16進/8進のIPリテラルでドメインマッチングをすり抜けようとする経路。
 fn net_case_06_numeric_ip_obfuscation() -> Result<(), String> {
-    run_net_case("net-06-numeric", &["example.com"], "numeric-ip", &[])
+    // [BUG-094] **WFPの拒否が0件なのは正しい。** 3本のプローブはすべて層1で
+    // `ip_literal_denied`（宛先が名前ではなく数字のアドレス）として断たれ、
+    // 外向きのソケットが一度も開かれないのでWFPに落とすものが無い。
+    // **ここを固定しておかないと、層1が断たなくなった日に0が取りこぼしと見分けられなくなる。**
+    run_net_case(
+        "net-06-numeric",
+        &["example.com"],
+        "numeric-ip",
+        &[],
+        &[("ip_literal_denied", 3)],
+    )
 }
 
 /// `crates/tier2a-mock-netfilterd`（`docs/DEV-ENVIRONMENT.md`参照）。本物の
@@ -2493,6 +2719,9 @@ fn net_case_07_wfp_start_failure_is_fail_closed() -> Result<(), String> {
         "all-denied",
         &[],
         Some("Tier2a run_shell network capability will remain denied"),
+        // WFPが立たないのでネットワークcapability自体が与えられない。
+        // **層1のプロキシも起きない**ので、層1の拒否は0件が正しい。
+        &[],
     )
 }
 
@@ -2529,6 +2758,9 @@ fn net_case_10_wfp_rejected_response_is_fail_closed() -> Result<(), String> {
         "all-denied",
         &[],
         Some("daemon rejected the request: failed to apply WFP rules: mock fault injection"),
+        // WFPが立たないのでネットワークcapability自体が与えられない。
+        // **層1のプロキシも起きない**ので、層1の拒否は0件が正しい。
+        &[],
     )
 }
 
