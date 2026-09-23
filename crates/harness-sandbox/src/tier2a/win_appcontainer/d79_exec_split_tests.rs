@@ -1,9 +1,8 @@
 //! **D-79の受け入れ測定（M2）**: ワークスペース内の実行を宣言制にする実装を入れたら
 //! **本当に止まるのか**、そして**その実装はいくら掛かるのか**。
 //!
-//! 計画は[`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`](../../../../../plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md)のM2、
-//! 決定は`DESIGN-SANDBOX-APPPOLICY.md`のD-79、結果の正本は
-//! [`plans/mac-spike/RESULTS.md`](../../../../../plans/mac-spike/RESULTS.md)。
+//! 測り方（M2）と結果の正本は[`plans/mac-spike/RESULTS.md`](../../../../../plans/mac-spike/RESULTS.md) §S9、
+//! 決定は`DESIGN-SANDBOX-APPPOLICY.md`のD-79。
 //!
 //! ## なぜ「2本に割る」形を測るのか
 //!

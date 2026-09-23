@@ -1,5 +1,5 @@
 //! **Redirector DLLに残った孤立ACEを、既存の掃除処理が本当に回収するかの測定**
-//! （`plans/HANDOFF-GRANT-RECORD-WINDOW.md`のM1、仮説H1。[BUG-112](../../../../docs/bugs/BUG-112.md)）。
+//! （残課題#23の測定M1、仮説H1。記録は`plans/e2e/RESULTS.md`の2026-09-03と[BUG-112](../../../../docs/bugs/BUG-112.md)）。
 //!
 //! # 何を測っているのか
 //!

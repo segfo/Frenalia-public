@@ -1,5 +1,5 @@
 //! **DACLに載るACEの本数には上限がある。どこで当たり、当たったときどう失敗するのか。**
-//! （`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` のM3-b、結果の正本は `plans/mac-spike/RESULTS.md` §S15）
+//! （M3-b、測り方と結果の正本は `plans/mac-spike/RESULTS.md` §S15-3）
 //!
 //! # なぜ測るのか
 //!

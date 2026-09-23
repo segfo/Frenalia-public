@@ -99,7 +99,7 @@ use super::*;
 /// 1回の伝播書込に載せる1本ぶんの許可。
 ///
 /// **M本を1つのDACLへ畳んで1回で書く**ためにある（残課題#20の費用測定M3が要求している形。
-/// `plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`——素直に「宛先SIDごとに1回ずつ伝播」と書くと
+/// `plans/mac-spike/RESULTS.md` §S9-4・§S15-1——素直に「宛先SIDごとに1回ずつ伝播」と書くと
 /// ノードあたりM回の書込になり、実測で約2倍になる）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InheritableGrant {

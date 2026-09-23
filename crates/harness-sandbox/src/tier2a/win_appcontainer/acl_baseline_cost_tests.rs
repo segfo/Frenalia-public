@@ -1,4 +1,4 @@
-//! **ACL付与コストの測定**（`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`）。
+//! **ACL付与コストの測定**（M1・M3）。
 //! 結果の正本は `plans/mac-spike/RESULTS.md`——M1が §S10、M3が §S15。
 //!
 //! # 2つの寿命が同居している
@@ -551,7 +551,7 @@ fn acl_baseline_cost_regrant_after_revoke_pays_again() {
 }
 
 // ===========================================================================
-// M3 — 残課題#20 の費用（`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` のM3、結果は §S15）
+// M3 — 残課題#20 の費用（M3、測り方と結果は `plans/mac-spike/RESULTS.md` §S15）
 //
 // **§S15を書いたらこのブロックごと消すこと**（規則2）。ただし`build_chain_tree`は
 // `test_support`に残す——`build_wide_tree`と対になる形の部品で、深さを測り直すときに要る。

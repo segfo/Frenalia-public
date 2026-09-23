@@ -5721,7 +5721,7 @@ fn tier2a_smb445_layer2() {
 // **これはD-79の実装のテストではない。** D-79は継承ACEを2本に割る形
 // （`OBJECT_INHERIT_ACE`側から実行権を落とす）を要求しており、本測定が使う明示DENYとは
 // ACEの形が違う。本測定が答えるのはその手前の命題（実行可否はEXECUTE権で決まるのか）だけで、
-// D-79の付与コスト・2本割りの成否は`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`のM2が持つ。
+// D-79の付与コスト・2本割りの成否は`plans/mac-spike/RESULTS.md` §S9（M2）が持つ。
 //
 // `dev-elevated-run.exe e2e-exec-ace`（フィルタ`tier2a_workspace_exec_ace_matrix`）。
 

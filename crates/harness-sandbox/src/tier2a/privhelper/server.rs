@@ -59,7 +59,7 @@ pub fn serve(pipe_name: &str) -> Result<(), PrivHelperError> {
     log::line(&format!("serve: starting, pipe={pipe_name}"));
     // D-48「走行中のセッションからは剥がさない」のガードは、**この昇格プロセスの中**から
     // 生存判定できることを前提にする。前提が成り立たないと判定は静かに0件へ倒れ、
-    // fail-openの穴になる（`plans/HANDOFF-TRAVERSE-REVOKE-GUARD.md`）。
+    // fail-openの穴になる（決定は`plans/DESIGN-SANDBOX-PRIVSEP.md`のD-48）。
     // 毎回残しておけば、後から「あのとき何件見えていたか」を事後に確かめられる。
     log::line(&format!(
         "serve: session liveness probe: {}",

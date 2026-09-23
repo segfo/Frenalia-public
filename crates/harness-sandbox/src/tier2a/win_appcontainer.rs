@@ -967,8 +967,8 @@ mod t4_privhelper_pipe_reach_tests;
 
 /// **D-79の受け入れ測定（M2）**: ワークスペース内の実行を宣言制にする実装を入れたら本当に
 /// 止まるのか（継承ACEの2本割りが「ディレクトリは辿れる／ファイルは実行できない」を
-/// 表現できるか）と、その実行時コスト。計画は`plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md` M2、
-/// 結果は`plans/mac-spike/RESULTS.md`。**D-79が実装された時点で、本モジュールの真偽側は
+/// 表現できるか）と、その実行時コスト。測り方と結果は`plans/mac-spike/RESULTS.md` §S9（M2）。
+/// **D-79が実装された時点で、本モジュールの真偽側は
 /// 本体の回帰テストへ書き直して消す**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
 #[cfg(all(windows, test))]
 mod d79_exec_split_tests;
@@ -989,7 +989,7 @@ mod mac_spike_followup_tests;
 mod mac_spike_mitigation_etw_tests;
 
 /// **N1: AppContainerごとの証明書ストア（D-65の層1）の実現性スパイク**
-/// （`plans/net-spike/RESULTS.md`・`plans/HANDOFF-N1-CERT-STORE-REDIRECT.md`）。
+/// （`plans/net-spike/RESULTS.md` N1・N1（訂正）・N1-②（訂正・決着）・N1-③）。
 /// legacy AppContainerでレジストリのリダイレクトが掛かるか／Schannelがそこを読むかを
 /// 実装の前に確定させる。**非昇格で回す**（昇格すると親トークンが変わり測る世界が変わる）。
 /// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
@@ -1002,8 +1002,7 @@ mod cert_store_spike_tests;
 #[cfg(all(windows, test))]
 mod unc_reach_spike_tests;
 
-/// **現状の宛先SID 1本でのACL付与コストの基準線**（`plans/mac-spike/RESULTS.md` §S10、
-/// `plans/HANDOFF-ACL-DOMAIN-SPLIT-COST.md`のM1）。`docs/STATUS.md`残課題#20
+/// **現状の宛先SID 1本でのACL付与コストの基準線**（`plans/mac-spike/RESULTS.md` §S10、M1）。`docs/STATUS.md`残課題#20
 /// （ドメイン遷移の足回り）に書かれた「重い」という**推定を実測へ置き換える**ためのもので、
 /// あわせて残課題#32（伝播が既存子孫へ届かない疑い）を確定/否定する。
 /// **非昇格で回す**（ACEを書くのはテスト自身が作ったツリーだけ）。
