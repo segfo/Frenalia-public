@@ -376,6 +376,7 @@ fn measure_once(tree: &TreeComposition, arm: Arm, repetition: usize, order: usiz
 
     let t0 = Instant::now();
     let request = WorkspaceSpawn {
+        image: WorkspaceImage::Shell,
         cwd: workspace.clone(),
         env: crate::secret_env::build_child_env(),
         workspace_root: workspace.clone(),

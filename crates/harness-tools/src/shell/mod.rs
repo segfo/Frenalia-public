@@ -32,10 +32,12 @@
 //! | [`env`] | 誰とも話さない（`PATH`の合成と出力バイト上限の純粋関数） |
 //! | [`runner`] | Tierごとの隔離機構（Restricted Token / AppContainer / bwrap / Incus / 素のspawn） |
 //! | [`platform`] | シェル実行ファイルそのもの（起動・stdinブートストラップ・コンソール符号化） |
+//! | [`program`] | `run_program`（シェルを通さずプログラムを直接起こす、D-96）。隔離・環境・フッタはここと共有する |
 
 mod env;
 mod net_decision;
 mod platform;
+mod program;
 mod runner;
 /// [段階6f-3] 拒否された遷移を、モデルが読める1行にする（§19.3.8）。
 /// **ツールの名前を持っている側に置いてある**（同ファイルのモジュールdoc）。
@@ -66,6 +68,9 @@ pub use platform::{
 /// Tier2aでコマンドを走らせる5番目の経路（`harness-policy-editor`のパス2）が使う。
 /// **同じ規則に従わせるための公開**であって、判定を作り直させないためのもの（[`net_decision`]）。
 pub use net_decision::{should_grant_tier2a_network_capability, NetDecision};
+
+/// `run_program`（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §2）。ツール名は判定器が名指すのに使う。
+pub use program::{RunProgramTool, RUN_PROGRAM_TOOL};
 
 #[derive(Deserialize)]
 struct RunShellInput {
@@ -135,47 +140,177 @@ impl RunShellTool {
             report_transition_denials: true,
         }
     }
+}
 
-    /// [段階6f-3] コマンドを走らせる前の「ここまで既読」の位置。
-    ///
-    /// **注記しない構成では`None`を返し、ファイルに1度も触らない。**
-    #[cfg(windows)]
-    fn transition_queue_cursor(&self, workspace_root: &std::path::Path) -> Option<u64> {
-        if !self.report_transition_denials {
+/// [段階6f-3] コマンドを走らせる前の「ここまで既読」の位置。
+///
+/// **注記しない構成では`None`を返し、ファイルに1度も触らない。**
+///
+/// `run_shell`と`run_program`が共有する。どちらも同じTier2aの子を起こすので、
+/// 断られた遷移をモデルへ届ける規則も同じでなければならない（`B-05`）。
+#[cfg(windows)]
+fn transition_queue_cursor(report: bool, workspace_root: &std::path::Path) -> Option<u64> {
+    if !report {
+        return None;
+    }
+    let path = harness_sandbox::tier2a::spawnd::transitions::pending_path(workspace_root);
+    // 無ければ0から。**存在しないことは失敗ではない**（`read_from`のdoc）。
+    Some(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0))
+}
+
+/// [段階6f-3] コマンドの間に積まれた拒否を、出力へ足す1行にする（§19.3.8）。
+///
+/// # 書き出しを頼めなかったら、何も言わない
+///
+/// 待ち行列は**畳んで書く**ので、頼まないとカウントが実際より遅れる。頼めなかった回に
+/// 古い値を読んで「このコマンドでは断られていない」と書くのは、**何も書かないより悪い**
+/// （`P-11`: 観測していないものを既定値で埋めない）。
+#[cfg(windows)]
+fn transition_denial_note(
+    spawn_daemon: Option<&harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
+    workspace_root: &std::path::Path,
+    cursor: Option<u64>,
+) -> Option<String> {
+    let offset = cursor?;
+    if let Some(daemon) = spawn_daemon {
+        if let Err(e) = daemon.flush_transition_queue() {
+            // **黙らせない**（`B-10`）。注記は出さないが、出せなかったことは残す。
+            eprintln!("note: could not flush the transition denial queue: {e}");
             return None;
         }
-        let path =
-            harness_sandbox::tier2a::spawnd::transitions::pending_path(workspace_root);
-        // 無ければ0から。**存在しないことは失敗ではない**（`read_from`のdoc）。
-        Some(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0))
     }
+    let path = harness_sandbox::tier2a::spawnd::transitions::pending_path(workspace_root);
+    let tail = harness_sandbox::tier2a::spawnd::transitions::read_from(&path, offset);
+    transition_note::note(&tail.records)
+}
 
-    /// [段階6f-3] コマンドの間に積まれた拒否を、出力へ足す1行にする（§19.3.8）。
-    ///
-    /// # 書き出しを頼めなかったら、何も言わない
-    ///
-    /// 待ち行列は**畳んで書く**ので、頼まないとカウントが実際より遅れる。頼めなかった回に
-    /// 古い値を読んで「このコマンドでは断られていない」と書くのは、**何も書かないより悪い**
-    /// （`P-11`: 観測していないものを既定値で埋めない）。
-    #[cfg(windows)]
-    fn transition_denial_note(
-        &self,
-        workspace_root: &std::path::Path,
-        cursor: Option<u64>,
-    ) -> Option<String> {
-        let offset = cursor?;
-        if let Some(daemon) = &self.spawn_daemon {
-            if let Err(e) = daemon.flush_transition_queue() {
-                // **黙らせない**（`B-10`）。注記は出さないが、出せなかったことは残す。
-                eprintln!("note: could not flush the transition denial queue: {e}");
-                return None;
-            }
+/// `run_shell`と`run_program`が子へ渡す環境と、実行の間生かしておくネットワーク監査の部品。
+///
+/// **2つのツールは同じ隔離の中で子を起こすので、子へ渡すものも同じでなければならない**
+/// （秘密を除いたenv・`path_extra`・gitのハードニング・プロキシ）。片方にだけ足すと、
+/// 同じTierで動いているのに片方の子だけ見えるものが違う、が起きる（`B-05`）。
+struct PreparedRun {
+    env: Vec<(String, String)>,
+    /// 監査ログの置き場を補った後の設定。フッタが読む。
+    net_proxy: harness_core::NetProxyConfig,
+    /// **実行が終わるまで生かしておく**（落とすとプロキシが止まる）。フッタが監査を読む。
+    proxy: Option<crate::net_proxy::LocalProxy>,
+    /// 同上。
+    fake_dns: Option<crate::fake_dns::FakeDnsAgent>,
+    proxy_addr: Option<std::net::SocketAddr>,
+}
+
+/// 子へ渡す環境を組み、要ればプロキシと偽DNSを立てる（[`PreparedRun`]のdoc）。
+async fn prepare_run(ctx: &ToolCtx) -> PreparedRun {
+    let mut env = harness_sandbox::build_child_env();
+    append_path_extra(&mut env, &ctx.run_shell_path_extra);
+    // D-14b: モデル実行`git`のhooks/fsmonitor/pagerを無効化する（T-07対策、
+    // `harness_sandbox::git_hardening_env`のdoc参照）。envは全子孫プロセスへ自動継承される
+    // ため、`git`が孫プロセスとして起動されても届く。
+    env.extend(harness_sandbox::git_hardening_env());
+
+    // 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15、
+    // `plans/AppContainerを用いたドメインベース通信制御アーキテクチャ設計書.md` §5）。
+    // `ctx.net_proxy.domain_policy_enabled`なら、`allow_domains`が空でも全拒否ポリシーとして
+    // Proxy/Fake DNS監査経路を起動する。SOCKS5 remote DNSを主経路とする`ALL_PROXY`と、
+    // 既存HTTP(S)ツール互換の`HTTP_PROXY`/`HTTPS_PROXY`を子envへ足す。
+    let mut net_proxy = ctx.net_proxy.clone();
+    if net_proxy.audit_log_path.is_none() {
+        if let Some(sandbox_dir) = &ctx.staging.sandbox_dir {
+            net_proxy.audit_log_path =
+                Some(ctx.workspace_root.join(sandbox_dir).join("net-audit.jsonl"));
         }
-        let path =
-            harness_sandbox::tier2a::spawnd::transitions::pending_path(workspace_root);
-        let tail = harness_sandbox::tier2a::spawnd::transitions::read_from(&path, offset);
-        transition_note::note(&tail.records)
     }
+    let proxy = if net_proxy.proxy_addr.is_some() {
+        None
+    } else {
+        crate::net_proxy::spawn_local_proxy(&net_proxy)
+            .await
+            .ok()
+            .flatten()
+    };
+    let fake_dns = if net_proxy.fake_dns_addr.is_some() {
+        None
+    } else if net_proxy.domain_policy_enabled {
+        crate::fake_dns::spawn_fake_dns(&crate::fake_dns::FakeDnsConfig {
+            allow_domains: net_proxy.allow_domains.clone(),
+            policy_required: net_proxy.domain_policy_enabled,
+            audit_log_path: net_proxy.audit_log_path.clone(),
+            preferred_port: None,
+        })
+        .await
+        .ok()
+    } else {
+        None
+    };
+    let proxy_addr = net_proxy
+        .proxy_addr
+        .or_else(|| proxy.as_ref().map(|p| p.addr));
+    let fake_dns_addr = net_proxy
+        .fake_dns_addr
+        .or_else(|| fake_dns.as_ref().map(|dns| dns.addr));
+    env.extend(crate::net_proxy::proxy_env_vars(proxy_addr, fake_dns_addr));
+
+    PreparedRun {
+        env,
+        net_proxy,
+        proxy,
+        fake_dns,
+        proxy_addr,
+    }
+}
+
+/// 入力の`cwd`をワークスペース内の絶対パスへ解決する。省略時はワークスペースルート。
+fn resolve_cwd(cwd: Option<&str>, ctx: &ToolCtx) -> Result<std::path::PathBuf, ToolError> {
+    match cwd {
+        Some(c) => {
+            let rel = check_relative_path(c).map_err(|e| jail_error_to_tool_error(c, e))?;
+            Ok(ctx.workspace_root.join(rel))
+        }
+        None => Ok(ctx.workspace_root.clone()),
+    }
+}
+
+/// 選ばれたTierで子を起こす。`run_shell`と`run_program`で違うのは`launch`と`net_decision`だけ。
+async fn run_in_tier(
+    launch: runner::Launch<'_>,
+    cwd: &std::path::Path,
+    dur: Duration,
+    net_decision: NetDecision,
+    ctx: &ToolCtx,
+    prepared: &PreparedRun,
+    #[cfg(windows)] spawn_daemon: Option<&harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
+) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+    run_isolated(
+        launch,
+        cwd,
+        &prepared.env,
+        dur,
+        ctx.shell_tier.tier,
+        net_decision,
+        ctx.net_proxy.enforced_by_wfp && ctx.net_proxy.domain_policy_enabled,
+        ctx.net_proxy.domain_policy_enabled,
+        ctx.vm_sandbox.as_ref(),
+        &ctx.workspace_root,
+        ctx.cow_diff_layer_dir.as_deref(),
+        &ctx.shell_tier.granted_passthrough,
+        #[cfg(windows)]
+        spawn_daemon,
+    )
+    .await
+}
+
+/// 標準出力と標準エラーを、上限で切ってから1つにつなぐ。
+fn join_output(out: String, err: String) -> String {
+    let mut content = truncate_to_limit(out);
+    let err = truncate_to_limit(err);
+    if !err.is_empty() {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&err);
+    }
+    content
 }
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const RUN_SHELL_DEFAULT_DESCRIPTION: &str =
@@ -245,85 +380,26 @@ impl Tool for RunShellTool {
         let input: RunShellInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
-        let cwd = match &input.cwd {
-            Some(c) => {
-                let rel = check_relative_path(c).map_err(|e| jail_error_to_tool_error(c, e))?;
-                ctx.workspace_root.join(rel)
-            }
-            None => ctx.workspace_root.clone(),
-        };
-
+        let cwd = resolve_cwd(input.cwd.as_deref(), ctx)?;
         let dur = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-        let mut env = harness_sandbox::build_child_env();
-        append_path_extra(&mut env, &ctx.run_shell_path_extra);
-        // D-14b: モデル実行`git`のhooks/fsmonitor/pagerを無効化する（T-07対策、
-        // `harness_sandbox::git_hardening_env`のdoc参照）。envは全子孫プロセスへ自動継承される
-        // ため、`git`が孫プロセスとして起動されても届く。
-        env.extend(harness_sandbox::git_hardening_env());
-
-        // 協調プロキシ（M12補遺、`plans/DESIGN-SANDBOX-PRIVSEP.md` §3.1 D-15、
-        // `plans/AppContainerを用いたドメインベース通信制御アーキテクチャ設計書.md` §5）。
-        // `ctx.net_proxy.domain_policy_enabled`なら、`allow_domains`が空でも全拒否ポリシーとして
-        // Proxy/Fake DNS監査経路を起動する。SOCKS5 remote DNSを主経路とする`ALL_PROXY`と、
-        // 既存HTTP(S)ツール互換の`HTTP_PROXY`/`HTTPS_PROXY`を子envへ足す。
-        let mut net_proxy = ctx.net_proxy.clone();
-        if net_proxy.audit_log_path.is_none() {
-            if let Some(sandbox_dir) = &ctx.staging.sandbox_dir {
-                net_proxy.audit_log_path =
-                    Some(ctx.workspace_root.join(sandbox_dir).join("net-audit.jsonl"));
-            }
-        }
-        let proxy = if net_proxy.proxy_addr.is_some() {
-            None
-        } else {
-            crate::net_proxy::spawn_local_proxy(&net_proxy)
-                .await
-                .ok()
-                .flatten()
-        };
-        let fake_dns = if net_proxy.fake_dns_addr.is_some() {
-            None
-        } else if net_proxy.domain_policy_enabled {
-            crate::fake_dns::spawn_fake_dns(&crate::fake_dns::FakeDnsConfig {
-                allow_domains: net_proxy.allow_domains.clone(),
-                policy_required: net_proxy.domain_policy_enabled,
-                audit_log_path: net_proxy.audit_log_path.clone(),
-                preferred_port: None,
-            })
-            .await
-            .ok()
-        } else {
-            None
-        };
-        let proxy_addr = net_proxy
-            .proxy_addr
-            .or_else(|| proxy.as_ref().map(|p| p.addr));
-        let fake_dns_addr = net_proxy
-            .fake_dns_addr
-            .or_else(|| fake_dns.as_ref().map(|dns| dns.addr));
-        env.extend(crate::net_proxy::proxy_env_vars(proxy_addr, fake_dns_addr));
-
+        let prepared = prepare_run(ctx).await;
         let net_decision = classify_net_app(&input.command, &ctx.net_app.allow_apps);
-        let net_domain_policy_requested = ctx.net_proxy.domain_policy_enabled;
 
         // [段階6f-3] **コマンドを走らせる前に、待ち行列のどこまでが既読かを控える**（§19.3.8）。
         // 後から控えると、走っている間に積まれた拒否を「前からあったもの」として読み飛ばす。
         #[cfg(windows)]
-        let transition_cursor = self.transition_queue_cursor(&ctx.workspace_root);
+        let transition_cursor =
+            transition_queue_cursor(self.report_transition_denials, &ctx.workspace_root);
 
-        let (out, err, code, shell_label) = run_isolated(
-            &input.command,
+        let (out, err, code, shell_label) = run_in_tier(
+            runner::Launch::Shell {
+                command: &input.command,
+            },
             &cwd,
-            &env,
             dur,
-            ctx.shell_tier.tier,
             net_decision,
-            ctx.net_proxy.enforced_by_wfp && ctx.net_proxy.domain_policy_enabled,
-            net_domain_policy_requested,
-            ctx.vm_sandbox.as_ref(),
-            &ctx.workspace_root,
-            ctx.cow_diff_layer_dir.as_deref(),
-            &ctx.shell_tier.granted_passthrough,
+            ctx,
+            &prepared,
             #[cfg(windows)]
             self.spawn_daemon.as_ref(),
         )
@@ -335,14 +411,7 @@ impl Tool for RunShellTool {
         // 「シェルの起動時警告」が唯一の出力になり、失敗と見分けが付かない。
         let (out_noise, out) = split_shell_startup_noise(&out);
         let (err_noise, err) = split_shell_startup_noise(&err);
-        let mut content = truncate_to_limit(out);
-        let err = truncate_to_limit(err);
-        if !err.is_empty() {
-            if !content.is_empty() {
-                content.push('\n');
-            }
-            content.push_str(&err);
-        }
+        let mut content = join_output(out, err);
         content.push_str(&format!("\n[exit code: {code}]\n[shell: {shell_label}]"));
         if let Some(noise) = merge_startup_noise(&out_noise, &err_noise) {
             content.push_str(&format!(
@@ -351,148 +420,16 @@ impl Tool for RunShellTool {
                 truncate_to_limit(noise).replace('\n', " / ")
             ));
         }
-        // 着地したTierだけを出す。**「(downgraded from ...)」はもう付かない**——D-75で
-        // 降格が消え、`select_tier`が返した時点で要求どおりのTierに居るためである。
-        content.push_str(&format!("\n[tier: {}]", ctx.shell_tier.tier.label()));
-        if !ctx.net_app.allow_apps.is_empty() {
-            match (
-                net_domain_policy_requested,
-                net_decision,
-                ctx.shell_tier.tier,
-            ) {
-                (true, _, ShellTier::Tier2a) if ctx.net_proxy.enforced_by_wfp => {
-                    content.push_str("\n[net: domain policy enforced; --net-allow-app ignored]");
-                }
-                (true, _, ShellTier::Tier2a) => {
-                    content.push_str(
-                        "\n[net: denied (domain policy requested but WFP enforcement is unavailable; \
-                         --net-allow-app ignored)]",
-                    );
-                }
-                (true, _, other_tier) => {
-                    content.push_str(&format!(
-                        "\n[net: denied (--net-allow-domain takes precedence over --net-allow-app; \
-                         current tier is {})]",
-                        other_tier.label()
-                    ));
-                }
-                (false, NetDecision::Allow, ShellTier::Tier2a) => {
-                    content.push_str("\n[net: internetClient]");
-                }
-                (false, NetDecision::Allow, other_tier) => {
-                    content.push_str(&format!(
-                        "\n[net: denied (--net-allow-app only takes effect under Tier2a; \
-                         current tier is {})]",
-                        other_tier.label()
-                    ));
-                }
-                (false, NetDecision::DeniedByChaining, _) => {
-                    content.push_str(
-                        "\n[net: denied (chained command; issue the trusted app as a single \
-                         command without |, &&, ;, & to allow network)]",
-                    );
-                }
-                (false, NetDecision::Deny, _) => {
-                    content.push_str("\n[net: denied]");
-                }
-            }
-        }
         // [段階6f-3] このコマンドの間に断られた遷移を、モデルへ届ける（§19.3.8）。
-        // **`[net: …]`と同じ場所・同じ形**——拒否をモデルへ見せる出し口は既にここに在る。
         #[cfg(windows)]
-        if let Some(note) = self.transition_denial_note(&ctx.workspace_root, transition_cursor) {
-            content.push('\n');
-            content.push_str(&note);
-        }
-        if ctx.shell_tier.is_unisolated() {
-            content.push_str(
-                "\n[warning: shell isolation tier is tier0 (best-effort only); \
-                 out-of-workspace writes/network egress are not blocked, see plans/DESIGN-SANDBOX.md §9]",
-            );
-        }
-        if !matches!(ctx.staging.mode, StagingMode::Live) && !ctx.shell_sees_staged_writes {
-            content.push_str(
-                "\n[warning: staged writes made earlier in this turn may not be visible to this \
-                 shell process yet (D-08 simplification, see plans/DESIGN-SANDBOX.md §8-3)]",
-            );
-        }
-        if proxy_addr.is_some() {
-            // `proxy_addr`が立っている＝`domain_policy_enabled`である（`spawn_local_proxy`は
-            // 無効なら`Ok(None)`を返す）。その上で「WFP未成立」の意味はTierで正反対になる——
-            // Tier2aでは`should_grant_tier2a_network_capability`がcapability自体を落とすので、
-            // 「audit-only（＝通信はできるが強制されない）」ではなく通信が皆無になる。
-            // 同じ誤りが起動時警告とシステムプロンプトにもあった。
-            //
-            // [BUG-118] **`== Tier2a`で分岐しない。** かつてここは`else`に
-            // 「audit-only（素通り可）」を置いていたので、Tier2b（`--unshare-net`で全遮断）と
-            // Tier3（VM境界で強制）が**実挙動の逆**を名乗っていた。判定は`ShellTier::net_egress`が
-            // 1箇所で持ち、Tierを足すとそちらがコンパイルエラーになる（`B-05`/`B-06`）。
-            match ctx
-                .shell_tier
-                .tier
-                .net_egress(ctx.net_proxy.enforced_by_wfp)
-                .enforcement
-            {
-                harness_core::EgressEnforcement::Wfp => {
-                    content.push_str("\n[net-proxy: enforced-by-wfp]");
-                }
-                harness_core::EgressEnforcement::NoEgressAtAll => {
-                    content.push_str(
-                        "\n[net-proxy: unreachable (this tier grants no reachable network at all; \
-                         the child cannot open any socket, not even to this proxy)]",
-                    );
-                }
-                harness_core::EgressEnforcement::VmBoundary => {
-                    content.push_str(
-                        "\n[net-proxy: not used (tier3 enforces egress at the VM boundary; this \
-                         host-side proxy is not on the path and its env vars are not forwarded)]",
-                    );
-                }
-                harness_core::EgressEnforcement::Cooperative => {
-                    content.push_str("\n[net-proxy: audit-only, not enforced against raw sockets, see plans/DESIGN-SANDBOX-PRIVSEP.md §3.1]");
-                }
-            }
-            if let Some(p) = &proxy {
-                if let Some(path) = p.audit.path() {
-                    content.push_str(&format!("\n[net-proxy-audit: {}]", path.display()));
-                }
-            } else if let Some(path) = &net_proxy.audit_log_path {
-                content.push_str(&format!("\n[net-proxy-audit: {}]", path.display()));
-            }
-            if let Some(p) = &proxy {
-                for e in p.audit.entries() {
-                    let verdict = if e.allowed { "ALLOW" } else { "DENY" };
-                    content.push_str(&format!("\n[net-proxy: {verdict} {}]", e.host));
-                }
-            }
-        }
-        if let Some(dns) = &fake_dns {
-            content.push_str(&format!(
-                "\n[net-fakedns: diagnostic-only addr={}]",
-                dns.addr
-            ));
-            if let Some(path) = dns.audit.path() {
-                content.push_str(&format!("\n[net-fakedns-audit: {}]", path.display()));
-            }
-            for e in dns.audit.entries() {
-                content.push_str(&format!(
-                    "\n[net-fakedns: QUERY {} {} fake_ip={}]",
-                    e.qtype,
-                    e.host,
-                    e.fake_ip
-                        .map(|ip| ip.to_string())
-                        .unwrap_or_else(|| "none".to_string())
-                ));
-            }
-        }
-        if fake_dns.is_none() {
-            if let Some(addr) = net_proxy.fake_dns_addr {
-                content.push_str(&format!("\n[net-fakedns: diagnostic-only addr={addr}]"));
-                if let Some(path) = &net_proxy.audit_log_path {
-                    content.push_str(&format!("\n[net-fakedns-audit: {}]", path.display()));
-                }
-            }
-        }
+        let transition_note = transition_denial_note(
+            self.spawn_daemon.as_ref(),
+            &ctx.workspace_root,
+            transition_cursor,
+        );
+        #[cfg(not(windows))]
+        let transition_note = None;
+        push_run_footer(&mut content, ctx, net_decision, transition_note, &prepared);
 
         Ok(ToolOutput {
             content,
@@ -501,6 +438,169 @@ impl Tool for RunShellTool {
     }
 }
 
+/// 出力の末尾に付けるフッタのうち、`run_shell`と`run_program`で共通の部分
+/// （着地したTier・ネットワーク許可アプリ・断られた遷移・非隔離とステージングの警告・
+/// プロキシと偽DNSの監査）。**文言と順序はここ1箇所が持つ**（`B-05`）。
+fn push_run_footer(
+    content: &mut String,
+    ctx: &ToolCtx,
+    net_decision: NetDecision,
+    transition_note: Option<String>,
+    prepared: &PreparedRun,
+) {
+    let net_domain_policy_requested = ctx.net_proxy.domain_policy_enabled;
+    let PreparedRun {
+        net_proxy,
+        proxy,
+        fake_dns,
+        proxy_addr,
+        ..
+    } = prepared;
+    // 着地したTierだけを出す。**「(downgraded from ...)」はもう付かない**——D-75で
+    // 降格が消え、`select_tier`が返した時点で要求どおりのTierに居るためである。
+    content.push_str(&format!("\n[tier: {}]", ctx.shell_tier.tier.label()));
+    if !ctx.net_app.allow_apps.is_empty() {
+        match (
+            net_domain_policy_requested,
+            net_decision,
+            ctx.shell_tier.tier,
+        ) {
+            (true, _, ShellTier::Tier2a) if ctx.net_proxy.enforced_by_wfp => {
+                content.push_str("\n[net: domain policy enforced; --net-allow-app ignored]");
+            }
+            (true, _, ShellTier::Tier2a) => {
+                content.push_str(
+                    "\n[net: denied (domain policy requested but WFP enforcement is unavailable; \
+                     --net-allow-app ignored)]",
+                );
+            }
+            (true, _, other_tier) => {
+                content.push_str(&format!(
+                    "\n[net: denied (--net-allow-domain takes precedence over --net-allow-app; \
+                     current tier is {})]",
+                    other_tier.label()
+                ));
+            }
+            (false, NetDecision::Allow, ShellTier::Tier2a) => {
+                content.push_str("\n[net: internetClient]");
+            }
+            (false, NetDecision::Allow, other_tier) => {
+                content.push_str(&format!(
+                    "\n[net: denied (--net-allow-app only takes effect under Tier2a; \
+                     current tier is {})]",
+                    other_tier.label()
+                ));
+            }
+            (false, NetDecision::DeniedByChaining, _) => {
+                content.push_str(
+                    "\n[net: denied (chained command; issue the trusted app as a single \
+                     command without |, &&, ;, & to allow network)]",
+                );
+            }
+            (false, NetDecision::Deny, _) => {
+                content.push_str("\n[net: denied]");
+            }
+        }
+    }
+    if let Some(note) = transition_note {
+        content.push('\n');
+        content.push_str(&note);
+    }
+    if ctx.shell_tier.is_unisolated() {
+        content.push_str(
+            "\n[warning: shell isolation tier is tier0 (best-effort only); \
+             out-of-workspace writes/network egress are not blocked, see plans/DESIGN-SANDBOX.md §9]",
+        );
+    }
+    if !matches!(ctx.staging.mode, StagingMode::Live) && !ctx.shell_sees_staged_writes {
+        content.push_str(
+            "\n[warning: staged writes made earlier in this turn may not be visible to this \
+             shell process yet (D-08 simplification, see plans/DESIGN-SANDBOX.md §8-3)]",
+        );
+    }
+    if proxy_addr.is_some() {
+        // `proxy_addr`が立っている＝`domain_policy_enabled`である（`spawn_local_proxy`は
+        // 無効なら`Ok(None)`を返す）。その上で「WFP未成立」の意味はTierで正反対になる——
+        // Tier2aでは`should_grant_tier2a_network_capability`がcapability自体を落とすので、
+        // 「audit-only（＝通信はできるが強制されない）」ではなく通信が皆無になる。
+        // 同じ誤りが起動時警告とシステムプロンプトにもあった。
+        //
+        // [BUG-118] **`== Tier2a`で分岐しない。** かつてここは`else`に
+        // 「audit-only（素通り可）」を置いていたので、Tier2b（`--unshare-net`で全遮断）と
+        // Tier3（VM境界で強制）が**実挙動の逆**を名乗っていた。判定は`ShellTier::net_egress`が
+        // 1箇所で持ち、Tierを足すとそちらがコンパイルエラーになる（`B-05`/`B-06`）。
+        match ctx
+            .shell_tier
+            .tier
+            .net_egress(ctx.net_proxy.enforced_by_wfp)
+            .enforcement
+        {
+            harness_core::EgressEnforcement::Wfp => {
+                content.push_str("\n[net-proxy: enforced-by-wfp]");
+            }
+            harness_core::EgressEnforcement::NoEgressAtAll => {
+                content.push_str(
+                    "\n[net-proxy: unreachable (this tier grants no reachable network at all; \
+                     the child cannot open any socket, not even to this proxy)]",
+                );
+            }
+            harness_core::EgressEnforcement::VmBoundary => {
+                content.push_str(
+                    "\n[net-proxy: not used (tier3 enforces egress at the VM boundary; this \
+                     host-side proxy is not on the path and its env vars are not forwarded)]",
+                );
+            }
+            harness_core::EgressEnforcement::Cooperative => {
+                content.push_str("\n[net-proxy: audit-only, not enforced against raw sockets, see plans/DESIGN-SANDBOX-PRIVSEP.md §3.1]");
+            }
+        }
+        if let Some(p) = proxy {
+            if let Some(path) = p.audit.path() {
+                content.push_str(&format!("\n[net-proxy-audit: {}]", path.display()));
+            }
+        } else if let Some(path) = &net_proxy.audit_log_path {
+            content.push_str(&format!("\n[net-proxy-audit: {}]", path.display()));
+        }
+        if let Some(p) = proxy {
+            for e in p.audit.entries() {
+                let verdict = if e.allowed { "ALLOW" } else { "DENY" };
+                content.push_str(&format!("\n[net-proxy: {verdict} {}]", e.host));
+            }
+        }
+    }
+    if let Some(dns) = fake_dns {
+        content.push_str(&format!(
+            "\n[net-fakedns: diagnostic-only addr={}]",
+            dns.addr
+        ));
+        if let Some(path) = dns.audit.path() {
+            content.push_str(&format!("\n[net-fakedns-audit: {}]", path.display()));
+        }
+        for e in dns.audit.entries() {
+            content.push_str(&format!(
+                "\n[net-fakedns: QUERY {} {} fake_ip={}]",
+                e.qtype,
+                e.host,
+                e.fake_ip
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ));
+        }
+    }
+    if fake_dns.is_none() {
+        if let Some(addr) = net_proxy.fake_dns_addr {
+            content.push_str(&format!("\n[net-fakedns: diagnostic-only addr={addr}]"));
+            if let Some(path) = &net_proxy.audit_log_path {
+                content.push_str(&format!("\n[net-fakedns-audit: {}]", path.display()));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "shell_tests.rs"]
 mod shell_tests;
+
+/// `run_shell`と`run_program`のテストが共有する部品（実台帳を触る後始末を1箇所に置く）。
+#[cfg(test)]
+mod test_support;

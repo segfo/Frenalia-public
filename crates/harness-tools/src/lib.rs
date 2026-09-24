@@ -41,6 +41,9 @@ pub use can_run_program::CanRunProgramTool;
 pub use fs_tools::{EditFileTool, ReadFileTool, WriteFileTool};
 pub use search::{GlobTool, GrepTool};
 pub use shell::RunShellTool;
+/// `run_program`——シェルを通さずプログラムを直接起こす（D-96）。自動承認の許可リストが
+/// 掛かるのはこちらだけ（`plans/DESIGN-RUNSHELL-ALLOWLIST.md`）。
+pub use shell::{RunProgramTool, RUN_PROGRAM_TOOL};
 /// Tier1でコマンドを走らせる**4番目の経路**（`harness-policy-editor`の記録モード）が、
 /// `run_shell`とまったく同じ形でシェルを起動するための共有部品。
 ///
@@ -83,14 +86,18 @@ impl ToolRegistry {
         }
     }
 
-    /// M5時点の組み込みツール一式を登録済みで返す
-    /// （read_file/write_file/edit_file/run_shell/grep/glob/web_fetch）。
+    /// 組み込みツール一式を登録済みで返す
+    /// （read_file/write_file/edit_file/run_shell/run_program/grep/glob/web_fetch）。
+    ///
+    /// **Tier2aでは`run_shell`と`run_program`をSpawn Daemon接続付きへ差し替える**
+    /// （`harness-cli`の起動処理）。ここで登録する既定値は接続を持たないので、Tier2aでは内部エラーで断る。
     pub fn with_builtin_tools() -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(ReadFileTool));
         reg.register(Arc::new(WriteFileTool));
         reg.register(Arc::new(EditFileTool));
         reg.register(Arc::new(RunShellTool::default()));
+        reg.register(Arc::new(RunProgramTool::default()));
         reg.register(Arc::new(GrepTool));
         reg.register(Arc::new(GlobTool));
         reg.register(Arc::new(WebFetchTool));

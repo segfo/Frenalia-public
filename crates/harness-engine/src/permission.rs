@@ -137,7 +137,17 @@ impl PermissionArbiter {
     /// `arg_repr`は許可判定に使う具体入力の文字列表現（`run_shell`ならコマンド行、
     /// `read_file`/`write_file`ならパス、他は入力全体のcompact JSON。§パーミッション
     /// 「allowlist: (tool, RiskClass, input)に対する順序付きルール」）。
-    pub fn classify(&self, tool: &str, risk: RiskClass, arg_repr: &str) -> Classification {
+    ///
+    /// `input`はツールへの入力そのもの。**文字列へ潰す前の形で見なければ決められない判定**
+    /// （`run_program`の`program`がインタプリタか）に使う。**省略できる入口は作らない**
+    /// ——「入力なし」で呼べる形を残すと、そこから呼ばれた経路だけが黙って判定を素通りする。
+    pub fn classify(
+        &self,
+        tool: &str,
+        risk: RiskClass,
+        arg_repr: &str,
+        input: &serde_json::Value,
+    ) -> Classification {
         if self.mode == PermissionMode::Deny {
             return Classification::Deny;
         }
@@ -155,6 +165,22 @@ impl PermissionArbiter {
         // これは追加ブロックであり安全の根拠にはしない（本命はallowlistのコマンド分解+隔離Tier、
         // `base64`/`$IFS`等で自明に回避可能。§9残存リスク3）。
         if tool == "run_shell" && looks_like_allowlist_bypass(arg_repr) {
+            return Classification::Prompt;
+        }
+        // D-99（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §4.2）: `run_program`で起こすプログラムが
+        // **引数やファイルをコードとして実行する**もの（インタプリタ）なら、`AcceptAll`と規則より前に
+        // 人へ回す。上の`run_shell`の検出と同じ位置——取り消せない構成での最後の歯止めである。
+        //
+        // **綴りの部分一致ではなく、`program`の名前の完全一致で見る**（`harness_core::is_interpreter_program`）。
+        // 名前が取れない（`program`が無い・文字列でない）なら、何が起動されるか分からないので聞く側へ倒す。
+        //
+        // 記録＋穴（段階2）が入るまでは承認の記録が無いので、インタプリタは常にここで止まる。
+        if tool == harness_tools::RUN_PROGRAM_TOOL
+            && input
+                .get("program")
+                .and_then(|v| v.as_str())
+                .is_none_or(harness_core::is_interpreter_program)
+        {
             return Classification::Prompt;
         }
         // D-05（`plans/DESIGN-SANDBOX.md` §7）: 設定注入パス（`.git/config`・
@@ -184,8 +210,14 @@ impl PermissionArbiter {
 
     /// ヘッドレス（TTY無し前提）向けの決定的判定。`Classification::Prompt`を自動`Deny`に
     /// 畳み込む（§パーミッション「ヘッドレス時: モード+allowlistのみで判定」）。
-    pub fn decide(&self, tool: &str, risk: RiskClass, arg_repr: &str) -> Decision {
-        match self.classify(tool, risk, arg_repr) {
+    pub fn decide(
+        &self,
+        tool: &str,
+        risk: RiskClass,
+        arg_repr: &str,
+        input: &serde_json::Value,
+    ) -> Decision {
+        match self.classify(tool, risk, arg_repr, input) {
             Classification::Allow => Decision::Allow,
             Classification::Deny | Classification::Prompt => Decision::Deny,
         }
@@ -255,9 +287,9 @@ impl PermissionGate for PermissionArbiter {
         tool: &str,
         risk: RiskClass,
         arg_repr: &str,
-        _input: &serde_json::Value,
+        input: &serde_json::Value,
     ) -> Decision {
-        self.decide(tool, risk, arg_repr)
+        self.decide(tool, risk, arg_repr, input)
     }
 }
 
@@ -300,13 +332,16 @@ pub fn arg_repr(input: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// 入力の形で決まる判定（`run_program`のインタプリタ）を使わないテスト用の入力。
+    const NO_INPUT: serde_json::Value = serde_json::Value::Null;
+
     use super::*;
 
     #[test]
     fn default_mode_allows_read_only_without_allowlist() {
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("read_file", RiskClass::ReadOnly, "Cargo.toml"),
+            arbiter.decide("read_file", RiskClass::ReadOnly, "Cargo.toml", &NO_INPUT),
             Decision::Allow
         );
     }
@@ -315,7 +350,7 @@ mod tests {
     fn default_mode_denies_unallowlisted_exec_headless() {
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, "rm -rf /"),
+            arbiter.decide("run_shell", RiskClass::Exec, "rm -rf /", &NO_INPUT),
             Decision::Deny
         );
     }
@@ -328,11 +363,16 @@ mod tests {
             "/workspace",
         );
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, "git status --short"),
+            arbiter.decide(
+                "run_shell",
+                RiskClass::Exec,
+                "git status --short",
+                &NO_INPUT
+            ),
             Decision::Allow
         );
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, "git push"),
+            arbiter.decide("run_shell", RiskClass::Exec, "git push", &NO_INPUT),
             Decision::Deny
         );
     }
@@ -345,11 +385,11 @@ mod tests {
             "/workspace",
         );
         assert_eq!(
-            arbiter.decide("write_file", RiskClass::Write, "src/main.rs"),
+            arbiter.decide("write_file", RiskClass::Write, "src/main.rs", &NO_INPUT),
             Decision::Deny
         );
         assert_eq!(
-            arbiter.decide("read_file", RiskClass::ReadOnly, "src/main.rs"),
+            arbiter.decide("read_file", RiskClass::ReadOnly, "src/main.rs", &NO_INPUT),
             Decision::Allow
         );
     }
@@ -358,11 +398,11 @@ mod tests {
     fn accept_edits_allows_write_but_not_exec() {
         let arbiter = PermissionArbiter::new(PermissionMode::AcceptEdits, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("write_file", RiskClass::Write, "src/main.rs"),
+            arbiter.decide("write_file", RiskClass::Write, "src/main.rs", &NO_INPUT),
             Decision::Allow
         );
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, "cargo test"),
+            arbiter.decide("run_shell", RiskClass::Exec, "cargo test", &NO_INPUT),
             Decision::Deny
         );
     }
@@ -371,7 +411,7 @@ mod tests {
     fn accept_all_allows_everything() {
         let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, "rm -rf /"),
+            arbiter.decide("run_shell", RiskClass::Exec, "rm -rf /", &NO_INPUT),
             Decision::Allow
         );
     }
@@ -380,7 +420,7 @@ mod tests {
     fn deny_mode_denies_even_read_only() {
         let arbiter = PermissionArbiter::new(PermissionMode::Deny, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("read_file", RiskClass::ReadOnly, "Cargo.toml"),
+            arbiter.decide("read_file", RiskClass::ReadOnly, "Cargo.toml", &NO_INPUT),
             Decision::Deny
         );
     }
@@ -397,7 +437,8 @@ mod tests {
             arbiter.classify(
                 "run_shell",
                 RiskClass::Exec,
-                "powershell -EncodedCommand abc"
+                "powershell -EncodedCommand abc",
+                &NO_INPUT
             ),
             Classification::Prompt
         );
@@ -405,12 +446,13 @@ mod tests {
             arbiter.classify(
                 "run_shell",
                 RiskClass::Exec,
-                "git status | Invoke-Expression"
+                "git status | Invoke-Expression",
+                &NO_INPUT
             ),
             Classification::Prompt
         );
         assert_eq!(
-            arbiter.classify("run_shell", RiskClass::Exec, "echo hi | sh"),
+            arbiter.classify("run_shell", RiskClass::Exec, "echo hi | sh", &NO_INPUT),
             Classification::Prompt
         );
     }
@@ -420,7 +462,12 @@ mod tests {
         let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         // 検出は`run_shell`限定。他ツールの引数にたまたま同じ文字列が現れても無関係。
         assert_eq!(
-            arbiter.classify("write_file", RiskClass::Write, "notes/-EncodedCommand.md"),
+            arbiter.classify(
+                "write_file",
+                RiskClass::Write,
+                "notes/-EncodedCommand.md",
+                &NO_INPUT
+            ),
             Classification::Allow
         );
     }
@@ -433,7 +480,7 @@ mod tests {
             "/workspace",
         );
         assert_eq!(
-            arbiter.classify("write_file", RiskClass::Write, ".git/config"),
+            arbiter.classify("write_file", RiskClass::Write, ".git/config", &NO_INPUT),
             Classification::Deny
         );
     }
@@ -464,7 +511,7 @@ mod tests {
             "x/../.git/config",
         ] {
             assert_eq!(
-                arbiter.classify("write_file", RiskClass::Write, spelling),
+                arbiter.classify("write_file", RiskClass::Write, spelling, &NO_INPUT),
                 Classification::Deny,
                 "spelling {spelling:?} bypassed the D-05 hard-deny"
             );
@@ -498,7 +545,7 @@ mod tests {
             "C:/ws/./.vscode/settings.json",
         ] {
             assert_eq!(
-                arbiter.classify("write_file", RiskClass::Write, spelling),
+                arbiter.classify("write_file", RiskClass::Write, spelling, &NO_INPUT),
                 Classification::Deny,
                 "absolute spelling {spelling:?} bypassed the D-05 hard-deny"
             );
@@ -524,7 +571,7 @@ mod tests {
             "C:/ws2/.git/config",
         ] {
             assert_eq!(
-                arbiter.classify("write_file", RiskClass::Write, outside),
+                arbiter.classify("write_file", RiskClass::Write, outside, &NO_INPUT),
                 Classification::Allow,
                 "{outside:?} is outside the workspace; --dangerously-allow owns that gate"
             );
@@ -542,11 +589,16 @@ mod tests {
             "/workspace",
         );
         assert_eq!(
-            arbiter.classify("write_file", RiskClass::Write, ".harness/settings.json"),
+            arbiter.classify(
+                "write_file",
+                RiskClass::Write,
+                ".harness/settings.json",
+                &NO_INPUT
+            ),
             Classification::Deny
         );
         assert_eq!(
-            arbiter.classify("edit_file", RiskClass::Write, ".gitattributes"),
+            arbiter.classify("edit_file", RiskClass::Write, ".gitattributes", &NO_INPUT),
             Classification::Deny
         );
     }
@@ -567,7 +619,7 @@ mod tests {
             ".devcontainer/devcontainer.json",
         ] {
             assert_eq!(
-                arbiter.classify("write_file", RiskClass::Write, p),
+                arbiter.classify("write_file", RiskClass::Write, p, &NO_INPUT),
                 Classification::Deny,
                 "expected deny for {p}"
             );
@@ -578,12 +630,17 @@ mod tests {
     fn normal_workspace_file_unaffected_by_config_injection_check() {
         let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         assert_eq!(
-            arbiter.classify("write_file", RiskClass::Write, "src/main.rs"),
+            arbiter.classify("write_file", RiskClass::Write, "src/main.rs", &NO_INPUT),
             Classification::Allow
         );
         // 似た名前だが対象外のパス（誤検知しないことの確認）。
         assert_eq!(
-            arbiter.classify("write_file", RiskClass::Write, ".gitattributes-backup.txt"),
+            arbiter.classify(
+                "write_file",
+                RiskClass::Write,
+                ".gitattributes-backup.txt",
+                &NO_INPUT
+            ),
             Classification::Allow
         );
     }
@@ -599,7 +656,7 @@ mod tests {
             "/workspace",
         );
         assert_eq!(
-            arbiter.classify("run_shell", RiskClass::Exec, "cat .git/config"),
+            arbiter.classify("run_shell", RiskClass::Exec, "cat .git/config", &NO_INPUT),
             Classification::Allow
         );
     }
@@ -614,11 +671,21 @@ mod tests {
         let input = serde_json::json!({ "title": "ship it" }).to_string();
 
         assert_eq!(
-            arbiter.classify("mcp__jira__create_issue", RiskClass::Network, &input),
+            arbiter.classify(
+                "mcp__jira__create_issue",
+                RiskClass::Network,
+                &input,
+                &NO_INPUT
+            ),
             Classification::Prompt
         );
         assert_eq!(
-            arbiter.decide("mcp__jira__create_issue", RiskClass::Network, &input),
+            arbiter.decide(
+                "mcp__jira__create_issue",
+                RiskClass::Network,
+                &input,
+                &NO_INPUT
+            ),
             Decision::Deny
         );
     }
@@ -628,7 +695,12 @@ mod tests {
     fn a_declared_read_only_mcp_tool_is_allowed_like_any_other_read() {
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("mcp__company-docs__search", RiskClass::ReadOnly, "{}"),
+            arbiter.decide(
+                "mcp__company-docs__search",
+                RiskClass::ReadOnly,
+                "{}",
+                &NO_INPUT
+            ),
             Decision::Allow
         );
     }
@@ -643,12 +715,22 @@ mod tests {
             "/workspace",
         );
         assert_eq!(
-            arbiter.decide("mcp__jira__create_issue", RiskClass::Network, "{}"),
+            arbiter.decide(
+                "mcp__jira__create_issue",
+                RiskClass::Network,
+                "{}",
+                &NO_INPUT
+            ),
             Decision::Allow
         );
         // 別サーバの同名ツールには波及しない。
         assert_eq!(
-            arbiter.decide("mcp__other__create_issue", RiskClass::Network, "{}"),
+            arbiter.decide(
+                "mcp__other__create_issue",
+                RiskClass::Network,
+                "{}",
+                &NO_INPUT
+            ),
             Decision::Deny
         );
     }
@@ -659,5 +741,83 @@ mod tests {
         assert_eq!(rule.tool, "run_shell");
         assert_eq!(rule.pattern, "git status*");
         assert!(parse_allowlist_rule("no-colon").is_none());
+    }
+
+    fn run_program_classification(
+        mode: PermissionMode,
+        input: serde_json::Value,
+    ) -> Classification {
+        let arbiter = PermissionArbiter::new(mode, vec![], "/workspace");
+        let repr = arg_repr(&input);
+        arbiter.classify(
+            harness_tools::RUN_PROGRAM_TOOL,
+            RiskClass::Exec,
+            &repr,
+            &input,
+        )
+    }
+
+    /// D-99: インタプリタの`run_program`は**`accept-all`でも**人に聞く。綴りの揺れ（大小・`.exe`・
+    /// ディレクトリ付き）でも同じ。禁止側。
+    #[test]
+    fn run_program_of_an_interpreter_prompts_even_in_accept_all() {
+        for program in [
+            "cmd",
+            "CMD.EXE",
+            r"C:\Windows\System32\cmd.exe",
+            "python",
+            "pwsh",
+        ] {
+            assert_eq!(
+                run_program_classification(
+                    PermissionMode::AcceptAll,
+                    serde_json::json!({ "program": program, "args": ["/c", "dir"] })
+                ),
+                Classification::Prompt,
+                "{program}"
+            );
+        }
+    }
+
+    /// 許可側と対にする——インタプリタでないプログラムは`accept-all`のとおり通る。
+    /// **引数にインタプリタの綴りが出るだけでは当たらない**（行全体の部分一致ではない）。
+    #[test]
+    fn run_program_of_an_ordinary_program_follows_the_mode() {
+        let git = serde_json::json!({ "program": "git", "args": ["grep", "cmd /c"] });
+        assert_eq!(
+            run_program_classification(PermissionMode::AcceptAll, git.clone()),
+            Classification::Allow
+        );
+        assert_eq!(
+            run_program_classification(PermissionMode::Default, git),
+            Classification::Prompt
+        );
+    }
+
+    /// 何が起動されるか分からない入力（`program`が無い・文字列でない）は聞く側へ倒す。
+    #[test]
+    fn run_program_without_a_readable_program_name_prompts() {
+        for input in [
+            serde_json::json!({ "args": ["x"] }),
+            serde_json::json!({ "program": 42 }),
+        ] {
+            assert_eq!(
+                run_program_classification(PermissionMode::AcceptAll, input.clone()),
+                Classification::Prompt,
+                "{input}"
+            );
+        }
+    }
+
+    /// インタプリタの判定は`run_program`にだけ掛かる。`run_shell`の入力に`program`が
+    /// 紛れ込んでいても、`run_shell`の判定（綴りの検出）は変わらない。
+    #[test]
+    fn the_interpreter_check_is_scoped_to_run_program() {
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
+        let input = serde_json::json!({ "command": "git status", "program": "cmd" });
+        assert_eq!(
+            arbiter.classify("run_shell", RiskClass::Exec, "git status", &input),
+            Classification::Allow
+        );
     }
 }

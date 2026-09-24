@@ -29,11 +29,31 @@ use super::platform::{decode_console_output, platform_shell_command};
 #[cfg(windows)]
 use super::platform::{run_shell_bootstrap_stdin, RUN_SHELL_COMMAND_ENV_VAR};
 
-/// Tierに応じて実行経路を切り替える。戻り値は`(stdout, stderr, exit_code, shell_label)`。
+/// 子として何を起こすか（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §2.3）。
+///
+/// **隔離の部品（Job・制限トークン・AppContainer・Redirector・bwrap）は両方で共有し、
+/// 違うのはここだけである。** 経路ごとに別の関数を書くと、隔離の側だけが片方で変わっても
+/// 誰も気付けない（`bug-pattern-rules` B-05）。
+#[derive(Clone, Copy)]
+pub(crate) enum Launch<'a> {
+    /// `run_shell`: シェルを起こし、コマンドはブートストラップ経由で渡す（従来の経路そのもの）。
+    Shell { command: &'a str },
+    /// `run_program`: ハーネスが解決した絶対パスを、引数の配列ごとそのまま起こす。
+    ///
+    /// **シェルを通らない**ので、ブートストラップ・境界印・終了コードの後付けは使わない。
+    /// 標準入力も渡さない。終了コードはプログラム自身のものがそのまま返る。
+    Program { exe: &'a str, args: &'a [String] },
+}
+
+/// PowerShellを`-Command -`で起こすときの固定引数。コマンド本体はenv経由で渡す（BUG-050）。
+#[cfg(windows)]
+const POWERSHELL_STDIN_ARGS: [&str; 4] = ["-NoProfile", "-NonInteractive", "-Command", "-"];
+
+/// Tierに応じて実行経路を切り替える。戻り値は`(stdout, stderr, exit_code, launch_label)`。
 /// `exit_code`は`None`ならkill済み（timeout）を表す呼び出し元エラーへ畳み込む。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_isolated(
-    command: &str,
+    launch: Launch<'_>,
     cwd: &Path,
     env: &[(String, String)],
     dur: Duration,
@@ -55,13 +75,13 @@ pub(crate) async fn run_isolated(
     #[cfg(not(windows))]
     let _ = (workspace_root, cow_diff_layer_dir, granted_passthrough);
     if tier == ShellTier::Tier3 {
-        return run_tier3(command, cwd, env, dur, vm_sandbox).await;
+        return run_tier3(launch, cwd, env, dur, vm_sandbox).await;
     }
     #[cfg(windows)]
     {
         if tier == ShellTier::Tier2a {
             return run_windows_tier2a(
-                command,
+                launch,
                 cwd,
                 env,
                 dur,
@@ -76,30 +96,47 @@ pub(crate) async fn run_isolated(
             .await;
         }
         if tier == ShellTier::Tier1 {
-            return run_windows_tier1(command, cwd, env, dur).await;
+            return run_windows_tier1(launch, cwd, env, dur).await;
         }
     }
     #[cfg(target_os = "linux")]
     {
         if tier == ShellTier::Tier2b {
-            return run_linux_tier2b(command, cwd, env, dur).await;
+            return run_linux_tier2b(launch, cwd, env, dur).await;
         }
     }
     // Tier0（保険）。上記いずれにも該当しない場合のフォールバックでもある。
-    run_tier0(command, cwd, env, dur).await
+    run_tier0(launch, cwd, env, dur).await
 }
+
+/// Tier3で`run_program`を断る理由。**呼び出し元（`RunProgramTool::call`）が先に断る**ので、
+/// ここへ来るのは配線の誤りである——それでも黙って`sh -c`へ畳まない。
+pub(crate) const TIER3_PROGRAM_UNSUPPORTED: &str =
+    "run_program is not available under tier3: the VM sandbox daemon only carries a shell \
+     command string, not an argument array. Use run_shell instead.";
 
 /// Tier3（Hyper-V外層VM + Incusコンテナ）実行経路。他Tierと異なり実プロセスをホスト側に
 /// spawnせず、`ctx.vm_sandbox`（`VmSandboxHandle`、`plans/DESIGN-SANDBOX-VMISOLATION.md`）経由で
 /// コンテナ内実行に委譲する。同期IPC呼び出しのため`spawn_blocking`で包む
 /// （`harness_core::VmShellExecutor`のdocコメント参照）。
 async fn run_tier3(
-    command: &str,
+    launch: Launch<'_>,
     cwd: &Path,
     env: &[(String, String)],
     dur: Duration,
     vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+    // コンテナへの実行要求は常駐デーモン（vmsandboxd）との電文を通り、その電文が
+    // コマンド文字列1本しか運べない。**argvを`sh -c`の文字列へ組み直して通すことはしない**
+    // ——それをすると、構造化で消したはずの「解釈する層」がここで戻る（D-96）。
+    let command = match launch {
+        Launch::Shell { command } => command,
+        Launch::Program { .. } => {
+            return Err(ToolError::ExecutionFailed(
+                TIER3_PROGRAM_UNSUPPORTED.to_string(),
+            ))
+        }
+    };
     let executor = vm_sandbox.cloned().ok_or_else(|| {
         ToolError::ExecutionFailed(
             "tier3 selected but ToolCtx.vm_sandbox is not set (internal error, harness-cli \
@@ -129,15 +166,29 @@ async fn run_tier3(
 /// Windowsは追加でJob Objectへ後付け（kill-on-close）、Unixは`setrlimit`をpre_execで適用する
 /// （Tier0の保険機構、`plans/DESIGN-SANDBOX.md` §6.5）。
 async fn run_tier0(
-    command: &str,
+    launch: Launch<'_>,
     cwd: &Path,
     env: &[(String, String)],
     dur: Duration,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
-    let invocation = platform_shell_command(command);
-    let mut cmd = invocation.cmd;
+    let (mut cmd, stdin_payload, label, extra_env) = match launch {
+        Launch::Shell { command } => {
+            let invocation = platform_shell_command(command);
+            (
+                invocation.cmd,
+                invocation.stdin_payload,
+                invocation.shell_label,
+                invocation.extra_env,
+            )
+        }
+        Launch::Program { exe, args } => {
+            let mut cmd = Command::new(exe);
+            cmd.args(args);
+            (cmd, None, "direct", None)
+        }
+    };
     let env_owned: Vec<(String, String)>;
-    let env = if let Some((k, v)) = &invocation.extra_env {
+    let env = if let Some((k, v)) = &extra_env {
         env_owned = env
             .iter()
             .cloned()
@@ -147,7 +198,7 @@ async fn run_tier0(
     } else {
         env
     };
-    apply_common_command_settings(&mut cmd, cwd, env, invocation.stdin_payload.is_some());
+    apply_common_command_settings(&mut cmd, cwd, env, stdin_payload.is_some());
 
     #[cfg(unix)]
     apply_unix_rlimits(&mut cmd);
@@ -163,14 +214,14 @@ async fn run_tier0(
         }
     }
 
-    run_with_pipes(&mut child, invocation.stdin_payload, dur)
+    run_with_pipes(&mut child, stdin_payload, dur)
         .await
-        .map(|(out, err, code)| (out, err, code, invocation.shell_label))
+        .map(|(out, err, code)| (out, err, code, label))
 }
 
 #[cfg(target_os = "linux")]
 async fn run_linux_tier2b(
-    command: &str,
+    launch: Launch<'_>,
     cwd: &Path,
     env: &[(String, String)],
     dur: Duration,
@@ -187,7 +238,19 @@ async fn run_linux_tier2b(
 
     let mut cmd = Command::new("bwrap");
     cmd.args(&bwrap_args);
-    cmd.arg("--").arg("sh").arg("-c").arg(command);
+    cmd.arg("--");
+    // **この開発機（Windows）では走らない経路**である。`Program`の側は実機で確かめていない
+    // （`docs/STATUS.md` サンドボックス周辺 #29）。
+    let label = match launch {
+        Launch::Shell { command } => {
+            cmd.arg("sh").arg("-c").arg(command);
+            "bwrap(sh)"
+        }
+        Launch::Program { exe, args } => {
+            cmd.arg(exe).args(args);
+            "bwrap(direct)"
+        }
+    };
     apply_common_command_settings(&mut cmd, cwd, env, false);
 
     let mut child = cmd
@@ -195,13 +258,13 @@ async fn run_linux_tier2b(
         .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     run_with_pipes(&mut child, None, dur)
         .await
-        .map(|(out, err, code)| (out, err, code, "bwrap(sh)"))
+        .map(|(out, err, code)| (out, err, code, label))
 }
 
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 async fn run_windows_tier2a(
-    command: &str,
+    launch: Launch<'_>,
     cwd: &Path,
     env: &[(String, String)],
     dur: Duration,
@@ -213,11 +276,25 @@ async fn run_windows_tier2a(
     granted_passthrough: &[harness_core::GrantedPassthrough],
     spawn_daemon: Option<&harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+    use harness_sandbox::tier2a::win_appcontainer::WorkspaceImage;
+
     let mut env_owned = env.to_vec();
-    // BUG-050: コマンド本体はstdinスクリプトへ文字列として埋め込まず、env経由で渡す
-    // （`RUN_SHELL_BOOTSTRAP_SCRIPT`のdoc参照）。`RUN_SHELL_COMMAND_ENV_VAR`はこのクレートの
-    // 定数なので、依存の向き上`spawn_shell_in_workspace`の中では積めない（あちらのdoc参照）。
-    env_owned.push((RUN_SHELL_COMMAND_ENV_VAR.to_string(), command.to_string()));
+    let (image, stdin_bytes) = match launch {
+        Launch::Shell { command } => {
+            // BUG-050: コマンド本体はstdinスクリプトへ文字列として埋め込まず、env経由で渡す
+            // （`RUN_SHELL_BOOTSTRAP_SCRIPT`のdoc参照）。`RUN_SHELL_COMMAND_ENV_VAR`はこのクレートの
+            // 定数なので、依存の向き上`spawn_shell_in_workspace`の中では積めない（あちらのdoc参照）。
+            env_owned.push((RUN_SHELL_COMMAND_ENV_VAR.to_string(), command.to_string()));
+            (WorkspaceImage::Shell, Some(run_shell_bootstrap_stdin()))
+        }
+        Launch::Program { exe, args } => (
+            WorkspaceImage::Program {
+                exe: exe.to_string(),
+                args: args.to_vec(),
+            },
+            None,
+        ),
+    };
 
     // アプリ単位network制御（軸1、D-10/D-11）。`Allow`のときのみ`internetClient`を付与する
     // （`DeniedByChaining`/`Deny`はどちらも既定のcapability空＝network全遮断のまま）。
@@ -233,6 +310,7 @@ async fn run_windows_tier2a(
     };
 
     let request = harness_sandbox::tier2a::win_appcontainer::WorkspaceSpawn {
+        image,
         cwd: cwd.to_path_buf(),
         env: env_owned,
         workspace_root: workspace_root.to_path_buf(),
@@ -272,10 +350,9 @@ async fn run_windows_tier2a(
     let kill_token = child
         .kill_token()
         .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-    let stdin_bytes = run_shell_bootstrap_stdin();
 
     let handle = tokio::task::spawn_blocking(move || {
-        child.write_stdin_read_output_and_wait(Some(&stdin_bytes))
+        child.write_stdin_read_output_and_wait(stdin_bytes.as_deref())
     });
 
     match timeout(dur, handle).await {
@@ -294,7 +371,7 @@ async fn run_windows_tier2a(
 
 #[cfg(windows)]
 async fn run_windows_tier1(
-    command: &str,
+    launch: Launch<'_>,
     cwd: &Path,
     env: &[(String, String)],
     dur: Duration,
@@ -316,28 +393,48 @@ async fn run_windows_tier1(
         );
     }
 
-    let (bin, shell_label) = if which::which("pwsh").is_ok() {
-        ("pwsh", "pwsh(tier1)")
-    } else {
-        ("powershell", "powershell5.1(tier1)")
-    };
-    let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
     let cwd_owned = cwd.to_path_buf();
     let mut env_owned = env.to_vec();
-    // BUG-050: コマンド本体はstdinスクリプトへ文字列として埋め込まず、env経由で渡す
-    // （`RUN_SHELL_BOOTSTRAP_SCRIPT`のdoc参照）。
-    env_owned.push((RUN_SHELL_COMMAND_ENV_VAR.to_string(), command.to_string()));
+    let (bin, args, shell_label, stdin_bytes): (&str, Vec<&str>, &'static str, Option<Vec<u8>>) =
+        match launch {
+            Launch::Shell { command } => {
+                let (bin, shell_label) = if which::which("pwsh").is_ok() {
+                    ("pwsh", "pwsh(tier1)")
+                } else {
+                    ("powershell", "powershell5.1(tier1)")
+                };
+                // BUG-050: コマンド本体はstdinスクリプトへ文字列として埋め込まず、env経由で渡す
+                // （`RUN_SHELL_BOOTSTRAP_SCRIPT`のdoc参照）。
+                env_owned.push((RUN_SHELL_COMMAND_ENV_VAR.to_string(), command.to_string()));
+                (
+                    bin,
+                    POWERSHELL_STDIN_ARGS.to_vec(),
+                    shell_label,
+                    Some(run_shell_bootstrap_stdin()),
+                )
+            }
+            Launch::Program { exe, args } => (
+                exe,
+                args.iter().map(String::as_str).collect(),
+                "direct(tier1)",
+                None,
+            ),
+        };
 
-    let child =
-        harness_sandbox::tier1::win_restricted::spawn(bin, &args, &cwd_owned, &env_owned, true)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+    let child = harness_sandbox::tier1::win_restricted::spawn(
+        bin,
+        &args,
+        &cwd_owned,
+        &env_owned,
+        stdin_bytes.is_some(),
+    )
+    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
     let kill_token = child
         .kill_token()
         .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-    let stdin_bytes = run_shell_bootstrap_stdin();
 
     let handle = tokio::task::spawn_blocking(move || {
-        child.write_stdin_read_output_and_wait(Some(&stdin_bytes))
+        child.write_stdin_read_output_and_wait(stdin_bytes.as_deref())
     });
 
     match timeout(dur, handle).await {

@@ -1,0 +1,317 @@
+//! `run_program`——プログラム名と引数の配列を、**シェルを通さずに**起こす
+//! （`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §2、D-96・D-98）。
+//!
+//! # なぜ`run_shell`と別のツールなのか
+//!
+//! 自由記述のコマンド行は、シェルが解釈するまで何個のコマンドになるか決まらない。
+//! `git log | rm …` のように、許可したつもりの無いコマンドが同じ行に紛れ込む。
+//! ここでは**解釈する層そのものを通らない**。配列は OS へ argv としてそのまま届くので、
+//! 引数に `;` や `|` を書いても文字として届くだけで、コマンドは増えない。
+//!
+//! # `run_shell`と共有するもの・しないもの
+//!
+//! 隔離の部品（Job・制限トークン・AppContainer・Redirector・bwrap）、子へ渡す環境、
+//! 出力のフッタは`run_shell`と同じものを使う（[`super::prepare_run`]・[`super::push_run_footer`]）。
+//! 違うのは「何を起こすか」だけで、それは[`super::runner::Launch`]が持つ。
+//!
+//! # 限界（同じ場所で言う）
+//!
+//! - **起動したプログラム自身が引数やファイルをコードとして読むと、その中身は見えない**
+//!   （`cmd /c …`・`python build.py`）。それらはインタプリタとして別扱いにする
+//!   （[`harness_core::is_interpreter_program`]、D-99）
+//! - **Tier3 では使えない**（[`super::runner::TIER3_PROGRAM_UNSUPPORTED`]）
+//! - **解決した実行ファイルが指す実体の差し替えは防がない**。担保は隔離Tier（D-14）
+
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::json;
+use tokio::time::Duration;
+
+use harness_core::{
+    is_interpreter_program, RiskClass, ShellTier, Tool, ToolCtx, ToolError, ToolOutput,
+};
+
+use super::net_decision::classify_net_program;
+use super::runner::{Launch, TIER3_PROGRAM_UNSUPPORTED};
+use super::{
+    join_output, prepare_run, push_run_footer, resolve_cwd, run_in_tier, DEFAULT_TIMEOUT_MS,
+};
+#[cfg(windows)]
+use super::{transition_denial_note, transition_queue_cursor};
+
+/// ツール名。判定器（`harness-engine`）がインタプリタの判定を掛ける相手を名指すのに使う
+/// ——**綴りを複製しない**（`bug-pattern-rules` B-05）。
+pub const RUN_PROGRAM_TOOL: &str = "run_program";
+
+/// **知らない項目を拒否する。** 設計（`plans/DESIGN.md` §ツールシステム）が全ツールに約束しているのに
+/// 既存のツールに無かったため、余分な項目で判定を騙して素通りする穴があった（BUG-164）。
+/// 新しいツールでは最初から作らない。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunProgramInput {
+    program: String,
+    args: Option<Vec<String>>,
+    timeout_ms: Option<u64>,
+    cwd: Option<String>,
+}
+
+const RUN_PROGRAM_DESCRIPTION: &str =
+    "シェルを通さず、プログラムを直接起動して stdout+stderr+終了コードを返す。\
+     program は実行ファイルの名前かパス、args は引数の配列で、各要素はそのまま1つの引数として\
+     届く（空白・;・|・引用符を含んでよく、シェルに解釈されない）。\
+     パイプ・リダイレクト・PowerShell のコマンドレットは使えない——それらが要るときは run_shell を使う。\
+     素の名前は PATH からだけ探し、作業ディレクトリは探さない。";
+
+const RUN_PROGRAM_TIER3_DESCRIPTION: &str =
+    "Tier3（VM）では使えない。コマンドを実行するときは run_shell を使うこと。";
+
+/// `run_program`の実体。
+///
+/// **`Default`は「Spawn Daemon の接続なし」を意味する**——`run_shell`（[`super::RunShellTool`]）と
+/// 同じ理由で、Tier2aの呼び出しは直接生成へ降格せず内部エラーで断る。
+#[derive(Default)]
+pub struct RunProgramTool {
+    #[cfg(windows)]
+    spawn_daemon: Option<harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
+    /// 拒否された遷移を出力末尾へ注記するか。`run_shell`と同じ値を配る
+    /// （[`super::RunShellTool`]の同名の欄のdoc）。
+    #[cfg(windows)]
+    report_transition_denials: bool,
+}
+
+impl RunProgramTool {
+    /// Tier2aのセッションが持つSpawn Daemon接続を注入する。**本番のTier2a経路は必ずこちら**。
+    /// `report_transition_denials`は呼び出し元が必ず選ぶ（既定値を持たせない）。
+    #[cfg(windows)]
+    pub fn with_spawn_daemon(
+        spawn_daemon: harness_sandbox::tier2a::spawnd::SharedSpawnDaemon,
+        report_transition_denials: bool,
+    ) -> Self {
+        Self {
+            spawn_daemon: Some(spawn_daemon),
+            report_transition_denials,
+        }
+    }
+}
+
+fn run_program_input_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "program": {
+                "type": "string",
+                "description": "起動するプログラム。実行ファイルの名前（例: git）かパス"
+            },
+            "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "引数の配列。各要素がそのまま1つの引数になる（省略時は引数なし）"
+            },
+            "timeout_ms": { "type": "integer", "description": "タイムアウト（ミリ秒、省略時120000）" },
+            "cwd": { "type": "string", "description": "ワークスペースルートからの相対作業ディレクトリ" }
+        },
+        "required": ["program"],
+        "additionalProperties": false
+    })
+}
+
+#[async_trait]
+impl Tool for RunProgramTool {
+    fn name(&self) -> &str {
+        RUN_PROGRAM_TOOL
+    }
+
+    fn description(&self) -> &str {
+        RUN_PROGRAM_DESCRIPTION
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        run_program_input_schema()
+    }
+
+    fn spec_for_ctx(&self, ctx: &ToolCtx) -> harness_core::ToolSpec {
+        let description = if ctx.shell_tier.tier == ShellTier::Tier3 {
+            RUN_PROGRAM_TIER3_DESCRIPTION
+        } else {
+            RUN_PROGRAM_DESCRIPTION
+        };
+        harness_core::ToolSpec {
+            name: self.name().to_string(),
+            description: description.to_string(),
+            input_schema: self.input_schema(),
+        }
+    }
+
+    fn risk(&self, _input: &serde_json::Value) -> RiskClass {
+        RiskClass::Exec
+    }
+
+    async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        let input: RunProgramInput =
+            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        // 起動経路（`run_tier3`）も断るが、ここで先に断る——子を起こす準備（プロキシ等）を
+        // 立ててから断ると、使わない部品を立てては捨てることになる。
+        if ctx.shell_tier.tier == ShellTier::Tier3 {
+            return Err(ToolError::InvalidInput(
+                TIER3_PROGRAM_UNSUPPORTED.to_string(),
+            ));
+        }
+        let args = input.args.unwrap_or_default();
+        let cwd = resolve_cwd(input.cwd.as_deref(), ctx)?;
+        let dur = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+        let prepared = prepare_run(ctx).await;
+
+        let exe = resolve_program(&input.program, &cwd, &prepared.env)?;
+        refuse_disguised_interpreter(&input.program, &exe)?;
+        let exe_str = exe.to_str().ok_or_else(|| {
+            ToolError::InvalidInput(format!(
+                "the resolved program path is not valid Unicode: {}",
+                exe.display()
+            ))
+        })?;
+        // 判定は**起動する実体**の名前で行う（`bug-pattern-rules` B-21）。
+        let net_decision = classify_net_program(exe_str, &ctx.net_app.allow_apps);
+
+        // コマンドを走らせる前に、断られた遷移の待ち行列のどこまでが既読かを控える（`run_shell`と同じ）。
+        #[cfg(windows)]
+        let transition_cursor =
+            transition_queue_cursor(self.report_transition_denials, &ctx.workspace_root);
+
+        let (out, err, code, _launch_label) = run_in_tier(
+            Launch::Program {
+                exe: exe_str,
+                args: &args,
+            },
+            &cwd,
+            dur,
+            net_decision,
+            ctx,
+            &prepared,
+            #[cfg(windows)]
+            self.spawn_daemon.as_ref(),
+        )
+        .await?;
+
+        let code = code.unwrap_or(-1);
+        let mut content = join_output(out, err);
+        content.push_str(&format!(
+            "\n[exit code: {code}]\n[program: {}]",
+            exe.display()
+        ));
+        #[cfg(windows)]
+        let transition_note = transition_denial_note(
+            self.spawn_daemon.as_ref(),
+            &ctx.workspace_root,
+            transition_cursor,
+        );
+        #[cfg(not(windows))]
+        let transition_note = None;
+        push_run_footer(&mut content, ctx, net_decision, transition_note, &prepared);
+
+        Ok(ToolOutput {
+            content,
+            is_error: code != 0,
+        })
+    }
+}
+
+/// `program`を、起動する実行ファイルのパスへ解決する（D-98）。
+///
+/// - **素の名前**は、子へ渡すPATHの**絶対パスの項目だけ**から探す（Windowsは PATHEXT の拡張子も）。
+///   **作業ディレクトリは探さない**——ワークスペースへ置かれた同名のファイルに乗っ取られないため。
+///   PATHの相対の項目（`.` 等）を落とすのは、`which`がそれをハーネス自身のカレントディレクトリ
+///   からの相対として探すためである（`which` 7.0.3 `finder.rs`）
+/// - **パス区切りを含む**なら、`cwd`からの相対（または絶対パス）として解決する
+/// - Windows で解決先が**バッチファイル**（`.bat`/`.cmd`）なら断る（[`refuse_batch_file`]）
+pub(crate) fn resolve_program(
+    program: &str,
+    cwd: &Path,
+    child_env: &[(String, String)],
+) -> Result<PathBuf, ToolError> {
+    if program.trim().is_empty() {
+        return Err(ToolError::InvalidInput(
+            "program must not be empty".to_string(),
+        ));
+    }
+    let path_list = absolute_path_entries(child_env);
+    let found = which::which_in(program, Some(path_list), cwd).map_err(|_| {
+        ToolError::InvalidInput(format!(
+            "program not found: {program} (a bare name is looked up only in the child's PATH, \
+             never in the working directory; use a relative path such as ./{program} to run a \
+             file from the working directory)"
+        ))
+    })?;
+    refuse_batch_file(&found)?;
+    Ok(found)
+}
+
+/// 子へ渡すPATHのうち、絶対パスの項目だけを残す。
+fn absolute_path_entries(child_env: &[(String, String)]) -> std::ffi::OsString {
+    let path = child_env
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let dirs = std::env::split_paths(path).filter(|dir| dir.is_absolute());
+    std::env::join_paths(dirs).unwrap_or_default()
+}
+
+/// Windows では、バッチファイルを起こすと OS が cmd.exe を挟み、**argv を cmd の規則で
+/// 解釈し直す**。「配列はそのまま届く」という前提（D-96）がそこで崩れるので起こさない。
+#[cfg(windows)]
+fn refuse_batch_file(found: &Path) -> Result<(), ToolError> {
+    let ext = found
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if matches!(ext.as_deref(), Some("bat") | Some("cmd")) {
+        return Err(ToolError::InvalidInput(format!(
+            "{} is a batch file: Windows runs it through cmd.exe, which re-parses the \
+             arguments, so the argument array would not arrive as given. Use run_shell instead.",
+            found.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn refuse_batch_file(_found: &Path) -> Result<(), ToolError> {
+    Ok(())
+}
+
+/// **判定と実行が別物を見ていないか**を、起動の直前にもう一度確かめる（`bug-pattern-rules` B-21）。
+///
+/// 判定器（`harness-engine`）がインタプリタかどうかを見るのは、モデルが書いた`program`の
+/// **名前**である。起動するのは解決した実体なので、名前と実体が食い違うと判定をすり抜ける。
+///
+/// ```text
+///  program: "POWERS~1.EXE"   ← 短い名前（8.3 形式）。名前ではインタプリタに見えない
+///  実体:    powershell.exe
+/// ```
+///
+/// 実体の名前は`canonicalize`で得る（短い名前を正式名へ・シンボリックリンクを実体へ）。
+/// **起動には正規化したパスを使わない**——`\\?\`付きのパスを渡すと、自分の置き場所を
+/// そのパスから探すプログラムが混乱しうるため。
+///
+/// **限界**: ハードリンクや、改名したコピー（`cmd.exe`を`foo.exe`へ写したもの）は拾えない。
+fn refuse_disguised_interpreter(requested: &str, found: &Path) -> Result<(), ToolError> {
+    if is_interpreter_program(requested) {
+        return Ok(()); // 名前の時点で判定器が見ている
+    }
+    let real = std::fs::canonicalize(found).unwrap_or_else(|_| found.to_path_buf());
+    let real_name = real.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if is_interpreter_program(real_name) {
+        return Err(ToolError::InvalidInput(format!(
+            "{requested} resolves to {} , which runs its arguments or files as code. \
+             Request it by its real name ({real_name}) so that the approval check sees it.",
+            real.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "program_tests.rs"]
+mod program_tests;

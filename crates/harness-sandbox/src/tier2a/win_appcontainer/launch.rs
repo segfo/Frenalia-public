@@ -15,7 +15,8 @@
 //!   その配下が「存在しない/読めない」ように見え原因不明の失敗になる（D-54、[`grant_job`]）。
 //!
 //! 手順を経路ごとに書き直すと、この3つのどれかが片方だけ直る／片方だけ忘れられる。
-//! 呼び出し元は`run_shell`のTier2a経路（`harness-tools`）と、ポリシーエディタのパス2
+//! 呼び出し元は`harness-tools`のTier2a経路（`run_shell`と`run_program`が共有する。
+//! 何を起こすかだけを[`WorkspaceImage`]で分ける）と、ポリシーエディタのパス2
 //! （`plans/POLICY-EDITOR-TOMOYO-DIG.md`）の2つである。
 //!
 //! # ここが持たないもの
@@ -44,10 +45,26 @@ use super::{
 };
 use crate::tier2a::spawnd::ConsoleNeed;
 
-/// Tier2aでシェルを起こすための入力一式。
+/// Tier2aのワークスペースで**何を起こすか**（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §2.3）。
+///
+/// 隔離の部品（プロファイル・capability SID・CoW・Redirector・ネットワーク・Job）は
+/// どちらでも同じで、違うのは起こす実行ファイルと引数と標準入力だけである。
+pub enum WorkspaceImage {
+    /// `run_shell`（とポリシーエディタのパス2）: preflightと同じ解決でシェルを選び
+    /// （[`resolve_shell`]）、`-Command -`で起こしてブートストラップを標準入力へ流す。
+    Shell,
+    /// `run_program`: 呼び出し元が解決した**絶対パス**を、引数の配列ごとそのまま起こす。
+    /// 標準入力は渡さない。**シェルを通らない**ので引数は argv としてそのまま届く（D-96）。
+    Program { exe: String, args: Vec<String> },
+}
+
+/// Tier2aでシェルまたはプログラムを起こすための入力一式。
 ///
 /// 全て所有値なのは、呼び出し元がまるごと`spawn_blocking`へ`move`できるようにするため。
 pub struct WorkspaceSpawn {
+    /// 何を起こすか。**既定値を持たない**——足したときに全ての構築箇所がコンパイルエラーになり、
+    /// どちらを起こすかを呼び出し元が1つずつ選ぶ形にするため（`B-06`: 経路を数える代わりに型で数える）。
+    pub image: WorkspaceImage,
     /// 子のカレントディレクトリ。存在しなければ作られる。
     pub cwd: PathBuf,
     /// 子へ渡す環境変数一式（**コマンド本体を載せた後のもの**、モジュールdoc参照）。
@@ -188,10 +205,27 @@ fn spawn_shell_in_workspace_on(
     let profile_name = crate::tier2a::session_profile::current_profile_name();
     let sid = ensure_profile(&profile_name)?;
 
-    // preflightのsmoke testと同一のシェル解決を使う（pwshのストアアプリ実行エイリアスは
-    // AppContainerで起動不可＝`resolve_shell`が実在のpowershell.exeへフォールバックする）。
-    let (bin, shell_label) = resolve_shell();
-    let args = ["-NoProfile", "-NonInteractive", "-Command", "-"];
+    // 何を起こすか。隔離の部品は以下すべて共通で、ここだけが違う（`WorkspaceImage`のdoc）。
+    let (bin, args, shell_label, want_stdin): (String, Vec<&str>, &'static str, bool) =
+        match &req.image {
+            // preflightのsmoke testと同一のシェル解決を使う（pwshのストアアプリ実行エイリアスは
+            // AppContainerで起動不可＝`resolve_shell`が実在のpowershell.exeへフォールバックする）。
+            WorkspaceImage::Shell => {
+                let (bin, shell_label) = resolve_shell();
+                (
+                    bin,
+                    vec!["-NoProfile", "-NonInteractive", "-Command", "-"],
+                    shell_label,
+                    true,
+                )
+            }
+            WorkspaceImage::Program { exe, args } => (
+                exe.clone(),
+                args.iter().map(String::as_str).collect(),
+                "direct",
+                false,
+            ),
+        };
 
     let ext_capture_roots: Vec<PathBuf> = req
         .granted_passthrough
@@ -257,7 +291,7 @@ fn spawn_shell_in_workspace_on(
                 &args,
                 &req.cwd,
                 &req.env,
-                true,
+                want_stdin,
                 sid.as_psid(),
                 req.net_capability,
                 inject,
@@ -275,19 +309,21 @@ fn spawn_shell_in_workspace_on(
                 &args,
                 &req.cwd,
                 &req.env,
-                true,
+                want_stdin,
                 sid.as_psid(),
                 req.net_capability,
                 inject,
                 &domain_caps,
                 domain,
-                // このシェルは要求受付パイプへ届いてよい（`plans/DESIGN-MAC-PROTOCOL.md` §12）。
+                // この子は要求受付パイプへ届いてよい（`plans/DESIGN-MAC-PROTOCOL.md` §12）。
                 // 段階⑤で生成能力を取り上げたあと、CLIツールが子を起こす唯一の口がここになる
-                // ——積まないと、そのときシェルは孫プロセスを1つも作れなくなる。
+                // ——積まないと、そのとき子は孫プロセスを1つも作れなくなる。
+                // `run_program`の子も同じ（起こしたプログラムが孫を作れなくなるのは同じ理由で困る）。
                 SpawnRequestAccess::Grant,
-                // [段階⑤] **この経路が起こすのはシェルである**（`resolve_shell`が選んだ
-                // pwsh/powershell）。生成禁止を積んだ構成でコンソールを渡さないと、
-                // PowerShellは何も実行せずexit 0で終わる（`ConsoleNeed`のdocの表）。
+                // [段階⑤] シェルなら**コンソールが無いと何も実行せずexit 0で終わる**
+                // （`ConsoleNeed`のdocの表）。`run_program`の子にも同じく渡す——
+                // コンソール向けのプログラムがコンソール無しで何をするかは起こすまで分からず、
+                // 渡しておく側が「黙って成功に見える」を起こさない向きである。
                 ConsoleNeed::Required,
             ),
         }
@@ -576,6 +612,7 @@ mod tests {
     #[test]
     fn the_workspace_mode_vocabulary_matches_preflight() {
         let base = WorkspaceSpawn {
+            image: WorkspaceImage::Shell,
             cwd: PathBuf::from(r"C:\ws"),
             env: Vec::new(),
             workspace_root: PathBuf::from(r"C:\ws"),
@@ -605,6 +642,7 @@ mod tests {
     #[test]
     fn only_writable_passthrough_roots_become_ext_capture_roots() {
         let req = WorkspaceSpawn {
+            image: WorkspaceImage::Shell,
             cwd: PathBuf::from(r"C:\ws"),
             env: Vec::new(),
             workspace_root: PathBuf::from(r"C:\ws"),

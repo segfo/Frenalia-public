@@ -45,7 +45,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use harness_core::{DomainPolicy, NetProxyConfig, RequireSandbox, SandboxChoice, ShellTier};
-use harness_sandbox::tier2a::win_appcontainer::{NetworkCapability, WorkspaceSpawn};
+use harness_sandbox::tier2a::win_appcontainer::{
+    NetworkCapability, WorkspaceImage, WorkspaceSpawn,
+};
 use harness_sandbox::{FsPassthrough, WorkspaceWriteMode};
 
 use crate::child_run::{pump_child, ChildRunSink};
@@ -1473,6 +1475,8 @@ fn run_pass2<'a>(
         harness_sandbox::tier2a::win_appcontainer::spawn_shell_in_workspace_via_daemon(
             &spawn_daemon,
             WorkspaceSpawn {
+                // 記録モードは**シェル**でコマンドを走らせる（`run_shell`と同じ経路）。
+                image: WorkspaceImage::Shell,
                 cwd: request.cwd.to_path_buf(),
                 env,
                 workspace_root: request.workspace_root.to_path_buf(),

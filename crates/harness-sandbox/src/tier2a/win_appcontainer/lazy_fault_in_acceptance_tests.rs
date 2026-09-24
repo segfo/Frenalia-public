@@ -265,6 +265,7 @@ fn the_production_launch_path_takes_the_lazy_lane_when_a_receiver_is_open() {
 
     // **待たない。** ここが`launch.rs`のlazy分岐へ入る条件そのものである。
     let request = WorkspaceSpawn {
+        image: WorkspaceImage::Shell,
         cwd: workspace.clone(),
         env: crate::secret_env::build_child_env(),
         workspace_root: workspace.clone(),

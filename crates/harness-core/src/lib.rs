@@ -5,6 +5,7 @@ pub mod cognition;
 pub mod config_injection;
 pub mod event;
 pub mod git;
+pub mod interpreter;
 pub mod message;
 pub mod net_policy;
 pub mod prompt;
@@ -23,6 +24,7 @@ mod tool_tests;
 pub use cognition::{CognitionLevel, Phase, TokenBudget};
 pub use config_injection::is_config_injection_path;
 pub use event::{discarded_marker, AgentEvent, DegenerateKind, CANCELLED_REASON};
+pub use interpreter::{is_interpreter_program, INTERPRETER_PROGRAMS};
 pub use message::{ContentBlock, Message, Role};
 pub use net_policy::{
     domain_match, is_ip_literal, normalize_domain_pattern, validate_domain_pattern, DomainPolicy,

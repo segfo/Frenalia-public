@@ -87,6 +87,31 @@ pub(crate) fn classify_net_app(command: &str, allow_apps: &[String]) -> NetDecis
     NetDecision::Allow
 }
 
+/// `run_program`（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §2.4）の`program`が`allow_apps`に含まれるか。
+///
+/// **[`classify_net_app`]と違って推測しない。** あちらはコマンド行の先頭の語から実行ファイルを
+/// 推測し、連結されていれば他のexeが混ざる恐れがあるので拒否する。`run_program`は呼び出し1回が
+/// プログラム1個で、`program`は確定している——**連結が起こりえないので
+/// [`NetDecision::DeniedByChaining`]はここからは返らない**。
+///
+/// **`pwsh`/`powershell`を許可していても、それ以外のプログラムは通さない。**
+/// [`classify_net_app`]がシェルを許可したとき全コマンドを通すのは、`run_shell`では
+/// **実際に起動されるのがシェルだから**である。`run_program`はシェルを起動しない。
+pub(crate) fn classify_net_program(program: &str, allow_apps: &[String]) -> NetDecision {
+    let basename = exe_basename(program);
+    if basename.is_empty() {
+        return NetDecision::Deny;
+    }
+    if allow_apps
+        .iter()
+        .any(|allowed| exe_basename(allowed) == basename)
+    {
+        NetDecision::Allow
+    } else {
+        NetDecision::Deny
+    }
+}
+
 /// Tier2aの子へ`internetClient`を積んでよいか。
 ///
 /// **軸が2つある。** ドメイン単位の制御（軸2）を要求しているときは、WFPのdefault-denyが

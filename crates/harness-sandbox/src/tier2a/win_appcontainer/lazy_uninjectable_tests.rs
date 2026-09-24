@@ -119,6 +119,7 @@ fn an_uninjectable_top_level_shell_waits_for_the_full_walk_instead_of_faulting()
     let _restore = scopeguard(|| std::env::remove_var(lazy_grant::NO_INJECT_ENV));
 
     let request = WorkspaceSpawn {
+        image: WorkspaceImage::Shell,
         cwd: workspace.clone(),
         env: crate::secret_env::build_child_env(),
         workspace_root: workspace.clone(),

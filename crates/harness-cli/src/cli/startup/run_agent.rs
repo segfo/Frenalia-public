@@ -157,6 +157,12 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                     daemon.clone(),
                     expose_transitions,
                 )));
+                // `run_program`も同じ接続と同じ注記の判定で差し替える。**片方だけ差し替えると、
+                // もう片方は接続なしの既定値のままTier2aで内部エラーになる**（`B-06`）。
+                tools.register(Arc::new(harness_tools::RunProgramTool::with_spawn_daemon(
+                    daemon.clone(),
+                    expose_transitions,
+                )));
                 if expose_transitions {
                     tools.register(Arc::new(harness_tools::CanRunProgramTool));
                 } else {

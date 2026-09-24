@@ -143,11 +143,12 @@ pub fn render(facts: &EnvironmentFacts) -> String {
     let mut lines = Vec::new();
     lines.push(
         "あなたはharnessというコーディングエージェントに接続されています。以下はこの実行環境で\
-         確定している事実です。run_shellでコマンドを組み立てる前に必ず踏まえてください。"
+         確定している事実です。run_shell・run_programでコマンドを組み立てる前に必ず踏まえてください。"
             .to_string(),
     );
 
     lines.push(render_os_and_shell(os, shell_tier.tier));
+    lines.push(render_run_program(shell_tier.tier));
     let visible_workspace_root = render_workspace_root(workspace_root, shell_tier.tier);
     lines.push(format!(
         "ワークスペースルート: {}。run_shellのcwdは省略時このルートになり、相対パスもここから\
@@ -282,6 +283,27 @@ fn render_os_and_shell(os: &OsKind, tier: ShellTier) -> String {
         }
         OsKind::Other => "OS: 不明。run_shellの実行シェルは環境依存です。".to_string(),
     }
+}
+
+/// `run_program`（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §2）についての1行。
+///
+/// **`ToolCtx`に欄を足さないツールなので、足し忘れをコンパイルが拾う仕組み（完全分解）は働かない。**
+/// 言うべきことは3つ——シェルを通らないこと（何が使えないか）、インタプリタは毎回確認が入ること
+/// （ヘッドレスでは拒否になるので、モデルが別の手を選べるように）、そして**隔離の事実は同じく当たること**
+/// （言わないと「シェルを通らないから制約も違う」と読みうる）。
+fn render_run_program(tier: ShellTier) -> String {
+    if tier == ShellTier::Tier3 {
+        return "run_program: Tier3では使えません。コマンドの実行にはrun_shellを使ってください。"
+            .to_string();
+    }
+    "run_program: シェルを通さずにプログラムを直接起動します。programは実行ファイルの名前かパス、\
+     argsは引数の配列で、各要素はそのまま1つの引数として届きます（空白・;・|・引用符を含んでも\
+     シェルに解釈されません）。パイプ・リダイレクト・PowerShellのコマンドレットは使えないので、\
+     それらが要るときはrun_shellを使ってください。素の名前はPATHからだけ探し、作業ディレクトリは\
+     探しません。cmd・powershell・python等、引数やファイルをコードとして実行するプログラムを起動すると、\
+     許可モードに関わらず確認が入ります（対話端末の無い実行では拒否されます）。\
+     以下の隔離・書込・通信の事実は、run_programで起動したプログラムにも同じく当たります。"
+        .to_string()
 }
 
 fn render_workspace_root(workspace_root: &std::path::Path, tier: ShellTier) -> String {
@@ -798,6 +820,48 @@ mod tests {
         assert_eq!(staging_mentions, 1, "{rendered}");
         let tier_mentions = rendered.matches("シェル隔離:").count();
         assert_eq!(tier_mentions, 1, "{rendered}");
+        let run_program_mentions = rendered.matches("run_program:").count();
+        assert_eq!(run_program_mentions, 1, "{rendered}");
+    }
+
+    /// **`run_program`の行が、モデルが行動を変える事実を述べていること**（D-96・D-99）。
+    ///
+    /// 見るのは言い回しではなく主張の有無——シェルを通らない（何が使えないか）、
+    /// インタプリタは確認が入る、隔離の事実は同じく当たる、の3つ。
+    #[test]
+    fn the_run_program_line_states_what_a_model_would_act_on() {
+        let line = |tier| {
+            render(&facts_for(tier, StagingMode::Live))
+                .lines()
+                .find(|l| l.starts_with("run_program:"))
+                .expect("every tier renders a run_program line")
+                .to_string()
+        };
+
+        for tier in [
+            ShellTier::Tier0,
+            ShellTier::Tier1,
+            ShellTier::Tier2a,
+            ShellTier::Tier2b,
+        ] {
+            let rendered = line(tier);
+            for claim in [
+                "シェルを通さず",
+                "run_shell",
+                "確認が入ります",
+                "同じく当たります",
+            ] {
+                assert!(
+                    rendered.contains(claim),
+                    "{tier:?}: the run_program line must state {claim:?}: {rendered}"
+                );
+            }
+        }
+
+        // Tier3 では使えないことを言う。**使えると読める文を出さない**（禁止側と対にする）。
+        let tier3 = line(ShellTier::Tier3);
+        assert!(tier3.contains("使えません"), "{tier3}");
+        assert!(!tier3.contains("直接起動します"), "{tier3}");
     }
 
     /// **降格の告知はもう出ない**（D-75）。

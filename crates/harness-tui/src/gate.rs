@@ -67,7 +67,11 @@ impl PermissionGate for InteractiveGate {
         arg_repr: &str,
         input: &serde_json::Value,
     ) -> Decision {
-        let classification = self.arbiter.lock().unwrap().classify(tool, risk, arg_repr);
+        let classification = self
+            .arbiter
+            .lock()
+            .unwrap()
+            .classify(tool, risk, arg_repr, input);
         match classification {
             Classification::Allow => Decision::Allow,
             Classification::Deny => Decision::Deny,
