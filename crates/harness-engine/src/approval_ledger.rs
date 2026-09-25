@@ -39,10 +39,69 @@ const LOCK_NAME: &str = r"Local\harness-run-approval-ledger";
 const SNAPSHOT_DIR: &str = "approved-scripts";
 
 /// 台帳の中身。
+///
+/// # なぜ記録を生の JSON のまま持つのか（D-107）
+///
+/// `Vec<RunApproval>` にすると、**1件でも読めない記録があると全件失う**。台帳は丸ごと1回で読むので、
+/// 1件の型不一致がファイル全体のパース失敗になり、控えへ落ち、そこも新しい形なら既定値＝**空**になる。
+/// 形の版の番号は読んだ**後**に見るので効かない。
+///
+/// 将来この形へ種類を1つ足した新しいハーネスと、古いハーネスが同じ機械に居るのは普通のことである
+/// （別のワークスペースで古い版を使う・巻き戻す）。**読めない1件が他の全部を道連れにしない**ように、
+/// ここは生のまま持ち、型付けは1件ずつ行う。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunApprovalLedger {
     #[serde(default)]
-    pub approvals: Vec<RunApproval>,
+    approvals: Vec<serde_json::Value>,
+}
+
+/// 一覧の1行。**読めない記録も番号を持つ**——番号で取り消せないと、消す手段が無くなる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalEntry {
+    /// 読めた記録。読めなければ`None`（形が新しいか壊れている）。
+    pub parsed: Option<RunApproval>,
+    /// 書かれていたものそのもの。
+    pub raw: serde_json::Value,
+}
+
+impl RunApprovalLedger {
+    /// 1件ずつ型付けする。**並びは詰めない**——並びが取り消しの番号だからである。
+    fn entries(&self) -> Vec<ApprovalEntry> {
+        self.approvals
+            .iter()
+            .map(|raw| ApprovalEntry {
+                parsed: serde_json::from_value::<RunApproval>(raw.clone()).ok(),
+                raw: raw.clone(),
+            })
+            .collect()
+    }
+
+    fn push(&mut self, approval: &RunApproval) {
+        if let Ok(value) = serde_json::to_value(approval) {
+            self.approvals.push(value);
+        }
+    }
+
+    /// 読めた記録のうち`drop`が真のものだけ捨てる。**読めない記録は残す**（判断できないものを消さない）。
+    fn retain_readable(&mut self, drop: impl Fn(&RunApproval) -> bool) {
+        self.approvals.retain(
+            |raw| match serde_json::from_value::<RunApproval>(raw.clone()) {
+                Ok(a) => !drop(&a),
+                Err(_) => true,
+            },
+        );
+    }
+
+    /// どれかの記録が参照している写しの名前。**読めない記録の分も生の JSON から拾う**
+    /// ——型が分からないというだけで、その記録が見せていた中身を消さない。
+    fn referenced_snapshots(&self) -> std::collections::HashSet<String> {
+        self.approvals
+            .iter()
+            .filter_map(|raw| raw.get("snapshots")?.as_array())
+            .flatten()
+            .filter_map(|s| Some(s.get("file_sha256")?.as_str()?.to_string()))
+            .collect()
+    }
 }
 
 /// 承認の記録1件。
@@ -141,6 +200,8 @@ pub struct Loaded {
     pub voided_by_version: usize,
     /// 検証に通らず捨てた件数（穴を持つインタプリタ・形の崩れたハッシュ・制御文字等）。
     pub dropped_invalid: usize,
+    /// そもそも型として読めなかった件数（形が新しいか壊れている）。**他の記録は巻き添えにしない**。
+    pub unreadable: usize,
 }
 
 /// 承認の台帳。
@@ -175,7 +236,11 @@ impl ApprovalStore {
     /// 台帳を読み、**読む側で検証した**規則だけを返す（モジュールdoc）。
     pub fn load_valid(&self) -> Loaded {
         let mut out = Loaded::default();
-        for approval in self.ledger.load().approvals {
+        for entry in self.ledger.load().entries() {
+            let Some(approval) = entry.parsed else {
+                out.unreadable += 1;
+                continue;
+            };
             if approval.format_version != FORMAT_VERSION {
                 out.voided_by_version += 1;
             } else if is_valid_rule(&approval.rule) {
@@ -187,9 +252,9 @@ impl ApprovalStore {
         out
     }
 
-    /// 一覧（検証の前の生の記録。取り消しの番号はこの並び）。
-    pub fn list(&self) -> Vec<RunApproval> {
-        self.ledger.load().approvals
+    /// 一覧（検証の前の生の記録。取り消しの番号はこの並び）。**読めない記録も並びに残す**。
+    pub fn list(&self) -> Vec<ApprovalEntry> {
+        self.ledger.load().entries()
     }
 
     /// 恒久承認を記録する。同じ呼び出しの古い記録は置き換える。`previews`は画面に見せた中身で、
@@ -219,22 +284,20 @@ impl ApprovalStore {
         };
         let snapshot_dir = self.snapshot_dir.clone();
         self.ledger.update(|ledger| {
-            ledger
-                .approvals
-                .retain(|a| !a.rule.same_call(&approval.rule));
+            ledger.retain_readable(|a| a.rule.same_call(&approval.rule));
             if let Some(dir) = &snapshot_dir {
                 write_snapshots(dir, &approval.snapshots, previews);
             }
-            ledger.approvals.push(approval);
+            ledger.push(&approval);
             if let Some(dir) = &snapshot_dir {
-                collect_garbage(dir, &ledger.approvals);
+                collect_garbage(dir, &ledger.referenced_snapshots());
             }
         });
         Ok(())
     }
 
-    /// `index`番目（[`Self::list`]の並び）の記録を取り消す。
-    pub fn revoke(&self, index: usize) -> Result<RunApproval, String> {
+    /// `index`番目（[`Self::list`]の並び）の記録を取り消す。**読めない記録も取り消せる**。
+    pub fn revoke(&self, index: usize) -> Result<ApprovalEntry, String> {
         let snapshot_dir = self.snapshot_dir.clone();
         self.ledger.update(|ledger| {
             if index >= ledger.approvals.len() {
@@ -243,11 +306,14 @@ impl ApprovalStore {
                     ledger.approvals.len()
                 ));
             }
-            let removed = ledger.approvals.remove(index);
+            let raw = ledger.approvals.remove(index);
             if let Some(dir) = &snapshot_dir {
-                collect_garbage(dir, &ledger.approvals);
+                collect_garbage(dir, &ledger.referenced_snapshots());
             }
-            Ok(removed)
+            Ok(ApprovalEntry {
+                parsed: serde_json::from_value::<RunApproval>(raw.clone()).ok(),
+                raw,
+            })
         })
     }
 
@@ -258,7 +324,7 @@ impl ApprovalStore {
             let n = ledger.approvals.len();
             ledger.approvals.clear();
             if let Some(dir) = &snapshot_dir {
-                collect_garbage(dir, &ledger.approvals);
+                collect_garbage(dir, &ledger.referenced_snapshots());
             }
             n
         })
@@ -272,9 +338,10 @@ impl ApprovalStore {
         rel_path: &str,
     ) -> Option<Result<String, String>> {
         let dir = self.snapshot_dir.as_ref()?;
-        let approvals = self.ledger.load().approvals;
-        let snap = approvals
+        let entries = self.ledger.load().entries();
+        let snap = entries
             .iter()
+            .filter_map(|e| e.parsed.as_ref())
             .filter(|a| a.format_version == FORMAT_VERSION && a.rule.same_call(rule))
             .flat_map(|a| a.snapshots.iter())
             .find(|s| s.rel_path == rel_path)?;
@@ -353,12 +420,7 @@ fn read_snapshot(dir: &Path, snap: &SnapshotRef) -> Result<String, String> {
 }
 
 /// どの記録からも参照されない写しを消す。**写しの置き場の中の、写しの名前の形のファイルだけ**を見る。
-fn collect_garbage(dir: &Path, approvals: &[RunApproval]) {
-    let referenced: std::collections::HashSet<&str> = approvals
-        .iter()
-        .flat_map(|a| a.snapshots.iter())
-        .map(|s| s.file_sha256.as_str())
-        .collect();
+fn collect_garbage(dir: &Path, referenced: &std::collections::HashSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

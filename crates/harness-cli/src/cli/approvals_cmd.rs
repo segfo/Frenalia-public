@@ -10,7 +10,7 @@
 
 use std::process::ExitCode;
 
-use harness_engine::approval_ledger::{ApprovalStore, RunApproval};
+use harness_engine::approval_ledger::{ApprovalEntry, ApprovalStore, RunApproval};
 
 use super::*;
 
@@ -54,8 +54,11 @@ fn list(store: &ApprovalStore) -> ExitCode {
 /// 一覧の本文。**番号は引数の並びそのもの**——`revoke <番号>`が同じ並びを使うので、
 /// ここで並べ替えたり、使われない記録を隠したりしてはいけない
 /// （隠すと、読み込み時に捨てられた記録を取り消す手段が無くなる）。
-fn list_lines(approvals: &[RunApproval]) -> Vec<String> {
-    if approvals.is_empty() {
+///
+/// **型として読めなかった記録も、番号を持たせて出す。** 読めないものこそ、番号で指せなければ
+/// 消す手段が無くなる（形の新しいハーネスが書いた記録を、古いハーネスから片付けられるようにする）。
+fn list_lines(entries: &[ApprovalEntry]) -> Vec<String> {
+    if entries.is_empty() {
         return vec![
             "(no recorded approvals) -- choosing \"恒久的に承認\" in the approval screen for \
              run_program / run_shell records one here."
@@ -63,11 +66,27 @@ fn list_lines(approvals: &[RunApproval]) -> Vec<String> {
         ];
     }
     let mut out = Vec::new();
-    for (i, a) in approvals.iter().enumerate() {
-        out.push(format!("{i:<4}{}", a.rule.describe()));
-        out.extend(details(a).into_iter().map(|d| format!("      {d}")));
+    for (i, entry) in entries.iter().enumerate() {
+        match &entry.parsed {
+            Some(a) => {
+                out.push(format!("{i:<4}{}", a.rule.describe()));
+                out.extend(details(a).into_iter().map(|d| format!("      {d}")));
+            }
+            None => {
+                out.push(format!(
+                    "{i:<4}(unreadable record -- written in a newer format, or damaged)"
+                ));
+                out.push(format!("      {}", one_line(&entry.raw)));
+                out.push("      it is not used for auto-approval; `revoke` removes it".to_string());
+            }
+        }
     }
     out
+}
+
+/// 読めない記録を1行で見せる（長すぎるものは切る。判断の材料であって、完全な写しではない）。
+fn one_line(raw: &serde_json::Value) -> String {
+    harness_core::truncate_head_tail(&raw.to_string(), 200)
 }
 
 /// 1件の内訳（ワークスペース・承認時刻・縛ったファイル）。**ハッシュは先頭12桁だけ出す**
@@ -100,7 +119,10 @@ fn details(a: &RunApproval) -> Vec<String> {
 fn revoke(store: &ApprovalStore, number: usize) -> ExitCode {
     match store.revoke(number) {
         Ok(removed) => {
-            println!("revoked {}.", removed.rule.describe());
+            match &removed.parsed {
+                Some(a) => println!("revoked {}.", a.rule.describe()),
+                None => println!("revoked an unreadable record: {}", one_line(&removed.raw)),
+            }
             ExitCode::SUCCESS
         }
         Err(reason) => {
@@ -130,13 +152,22 @@ mod tests {
     use harness_core::{ArgPattern, BoundFile, ProgramRule, ShellRule};
     use harness_engine::approval_ledger::RecordedRule;
 
-    fn approval(rule: RecordedRule, format_version: u32) -> RunApproval {
-        RunApproval {
+    fn approval(rule: RecordedRule, format_version: u32) -> ApprovalEntry {
+        let parsed = RunApproval {
             format_version,
             approved_at_unix_secs: 1_700_000_000,
             rule,
             snapshots: Vec::new(),
+        };
+        ApprovalEntry {
+            raw: serde_json::to_value(&parsed).unwrap(),
+            parsed: Some(parsed),
         }
+    }
+
+    /// 型として読めなかった記録（形が新しいか壊れている）。
+    fn unreadable(raw: serde_json::Value) -> ApprovalEntry {
+        ApprovalEntry { parsed: None, raw }
     }
 
     /// 番号は並びそのもので、**読み込み時に捨てられる記録（版が古い）も一覧に出る**
@@ -172,6 +203,26 @@ mod tests {
             text.contains("bound: build.py sha256=abcdef012345… (+ the names next to it)"),
             "{text}"
         );
+    }
+
+    /// **読めない記録も番号を持って出る。** 出さないと、形の新しいハーネスが書いた記録を
+    /// 古いハーネスから片付ける手段が無くなる（番号は取り消しに使う並びそのもの）。
+    #[test]
+    fn an_unreadable_record_still_gets_a_number_so_it_can_be_revoked() {
+        let shell = RecordedRule::RunShell(ShellRule {
+            line: "cargo test".to_string(),
+            files: Vec::new(),
+            workspace: Some("c:/ws".to_string()),
+        });
+        let lines = list_lines(&[
+            unreadable(serde_json::json!({"tool": "run_container", "rule": {}})),
+            approval(shell, 1),
+        ]);
+        let text = lines.join("\n");
+        assert!(text.starts_with("0   (unreadable record"), "{text}");
+        assert!(text.contains("run_container"), "{text}");
+        assert!(text.contains("`revoke` removes it"), "{text}");
+        assert!(text.contains("\n1   run_shell \"cargo test\""), "{text}");
     }
 
     #[test]

@@ -173,7 +173,10 @@ fn approvals_can_be_revoked_one_by_one_or_all_at_once() {
 
     assert!(store.revoke(9).is_err());
     let removed = store.revoke(0).unwrap();
-    assert!(matches!(removed.rule, RecordedRule::RunProgram(_)));
+    assert!(matches!(
+        removed.parsed.unwrap().rule,
+        RecordedRule::RunProgram(_)
+    ));
     assert_eq!(store.list().len(), 1);
     assert_eq!(store.revoke_all(), 1);
     assert!(store.list().is_empty());
@@ -233,4 +236,108 @@ fn garbage_collection_only_touches_files_it_wrote() {
 
     assert!(snap_dir.join("notes.txt").exists());
     assert!(snap_dir.join("deadbeef.txt").exists());
+}
+
+/// **読めない記録が1件混ざっても、他の記録を道連れにしない**（D-107）。
+///
+/// 台帳は丸ごと1回で読むので、以前は1件の型不一致がファイル全体のパース失敗になり、控えへ落ち、
+/// そこも駄目なら**全件消えて**いた。将来この形へ種類を1つ足した新しいハーネスと、古いハーネスが
+/// 同じ機械に居るのは普通のことである。
+#[test]
+fn a_record_that_cannot_be_read_does_not_take_the_others_with_it() {
+    let (dir, store) = store();
+    store.record(script_rule("a"), &[]).unwrap();
+    store
+        .record(
+            RecordedRule::RunShell(ShellRule {
+                line: "cargo test".into(),
+                files: vec![],
+                workspace: Some("c:/ws".into()),
+            }),
+            &[],
+        )
+        .unwrap();
+
+    // 1件目を「新しい形」（この版が知らない綴り）へ差し替える。
+    rewrite_ledger(&dir.path().join("run-approval-ledger.json"), |text| {
+        text.replace("\"run_program\"", "\"run_container\"")
+    });
+
+    // **前はこの1件で全件失っていた。** ファイル全体を一度に型付けすると、いまでもここで落ちる
+    // ——落ちる事実そのものを固定しておく（生のまま持つ形へ戻したら、この行が無意味になる前に
+    // 下の assert が落ちる）。
+    #[derive(serde::Deserialize)]
+    struct WholeAtOnce {
+        #[allow(dead_code)]
+        approvals: Vec<RunApproval>,
+    }
+    let text = std::fs::read_to_string(dir.path().join("run-approval-ledger.json")).unwrap();
+    assert!(
+        serde_json::from_str::<WholeAtOnce>(&text).is_err(),
+        "この JSON は丸ごと型付けすると落ちる、という前提が崩れている"
+    );
+
+    let loaded = store.load_valid();
+    assert_eq!(loaded.unreadable, 1);
+    assert_eq!(
+        loaded.rules.len(),
+        1,
+        "残りは読めている: {:?}",
+        loaded.rules
+    );
+
+    // 一覧には並びを保ったまま出る——**番号で指せなければ取り消せない**。
+    let listed = store.list();
+    assert_eq!(listed.len(), 2);
+    assert!(listed[0].parsed.is_none());
+    assert!(listed[1].parsed.is_some());
+
+    // その1件も取り消せる。取り消した後は残りだけになる。
+    let removed = store.revoke(0).unwrap();
+    assert!(removed.parsed.is_none());
+    assert_eq!(store.list().len(), 1);
+    assert_eq!(store.load_valid().rules.len(), 1);
+}
+
+/// 読めない記録が参照している写しは消さない（型が分からないだけで、見せていた中身を捨てない）。
+#[test]
+fn a_snapshot_referenced_by_an_unreadable_record_survives_collection() {
+    let (dir, store) = store();
+    store.record(script_rule("a"), &[preview("v1")]).unwrap();
+    let snap_dir = dir.path().join("snapshots");
+    assert_eq!(std::fs::read_dir(&snap_dir).unwrap().count(), 1);
+
+    rewrite_ledger(&dir.path().join("run-approval-ledger.json"), |text| {
+        text.replace("\"run_program\"", "\"run_container\"")
+    });
+    // 別の承認を記録すると後始末が走るが、読めない記録の写しは残る。
+    store
+        .record(
+            RecordedRule::RunShell(ShellRule {
+                line: "cargo test".into(),
+                files: vec![],
+                workspace: Some("c:/ws".into()),
+            }),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_dir(&snap_dir).unwrap().count(),
+        1,
+        "読めない記録の写しまで消している"
+    );
+}
+
+/// 対照: 全部読めなければ空になる（読めるものが1つも無いのだから、それは正しい）。
+#[test]
+fn an_entirely_unreadable_ledger_yields_nothing() {
+    let (dir, store) = store();
+    store.record(script_rule("a"), &[]).unwrap();
+    rewrite_ledger(&dir.path().join("run-approval-ledger.json"), |text| {
+        text.replace("\"run_program\"", "\"run_container\"")
+    });
+    let loaded = store.load_valid();
+    assert!(loaded.rules.is_empty());
+    assert_eq!(loaded.unreadable, 1);
+    assert_eq!(store.list().len(), 1, "一覧には残る（取り消せる）");
 }

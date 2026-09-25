@@ -384,12 +384,13 @@ fn load_recorded_approvals(arbiter: &mut PermissionArbiter, workspace_root: &Pat
              `harness approvals list` shows them and `harness approvals revoke <n>` removes one"
         );
     }
-    if loaded.voided_by_version > 0 || loaded.dropped_invalid > 0 {
+    if loaded.voided_by_version > 0 || loaded.dropped_invalid > 0 || loaded.unreadable > 0 {
         eprintln!(
-            "note: ignored {} recorded approval(s) written in an older format and {} that did not \
-             pass validation; they are still listed by `harness approvals list` and you will be \
-             asked again for those calls",
-            loaded.voided_by_version, loaded.dropped_invalid
+            "note: ignored {} recorded approval(s) written in an older format, {} that did not \
+             pass validation, and {} that could not be read at all (written in a newer format, or \
+             damaged); they are still listed by `harness approvals list` and you will be asked \
+             again for those calls",
+            loaded.voided_by_version, loaded.dropped_invalid, loaded.unreadable
         );
     }
 }
