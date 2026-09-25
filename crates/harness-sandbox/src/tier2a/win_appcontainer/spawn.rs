@@ -90,6 +90,13 @@ pub(crate) fn redirector_dll_paths() -> Vec<PathBuf> {
 /// 返す前提だが`LoadLibraryW`は`HMODULE`（64bitポインタ）を返すため、`GetExitCodeThread`で
 /// 取得できるのは戻り値の下位32bitのみである。ここでは「非ゼロなら成功」の粗い判定に留め、
 /// 正確な初期化完了確認はDLL側が書き込む`HARNESS_COW_READY_HANDLE`（`wait_cow_ready`）に委ねる。
+/// リモートスレッドの`LoadLibraryW`が終わるのを待つ上限（ミリ秒）。
+///
+/// **5秒では足りない構成がある。** 読み込み自体は通常数十msだが、AppContainerの子が同時に
+/// 何本も起きている機械（実機E2Eの全件同時実行）では、そこまで待てずに時間切れになりうる。
+/// 待ちを伸ばしても、うまくいく場合の所要時間は変わらない——伸びるのは失敗するときだけである。
+const LOAD_LIBRARY_WAIT_MS: u32 = 30_000;
+
 pub(crate) unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContainerError> {
     let dll_path = redirector_dll_path()?;
     if !dll_path.exists() {
@@ -179,19 +186,48 @@ pub(crate) unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContain
             }
         };
 
-        // LoadLibraryW自体の完了（≠フック初期化完了、それは`wait_cow_ready`が確認する）を
-        // 短時間だけ待つ。DLLロード自体は通常数十ms未満で終わるため5秒で十分。
-        WaitForSingleObject(remote_thread, 5000);
+        // LoadLibraryW自体の完了（≠フック初期化完了、それは`wait_cow_ready`が確認する）を待つ。
+        // **待ちの結果と終了コードの取得結果を両方見る**——どちらも見ていなかった頃は、
+        // 3つの別々の出来事が「LoadLibraryWがNULLを返した」という1つの文言に潰れていた
+        // （`bug-pattern-rules` B-09/B-10: 失敗を成功に見せない・別物を同じ名前で報告しない）。
+        //
+        // | 実際に起きたこと | 旧実装の扱い |
+        // |---|---|
+        // | 待ちが時間切れ | `exit_code`が`STILL_ACTIVE`(259)のまま＝**成功として素通り** |
+        // | `GetExitCodeThread`が失敗 | `exit_code`が初期値0のまま＝「NULLを返した」と誤報 |
+        // | 本当にNULLを返した | 同上（正しいのはここだけ） |
+        let wait = WaitForSingleObject(remote_thread, LOAD_LIBRARY_WAIT_MS);
         let mut exit_code: u32 = 0;
-        let _ = GetExitCodeThread(remote_thread, &mut exit_code);
+        let exit_code_read = GetExitCodeThread(remote_thread, &mut exit_code);
         let _ = CloseHandle(remote_thread);
         let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
 
+        if wait == windows::Win32::Foundation::WAIT_TIMEOUT {
+            return Err(AppContainerError::Win32(format!(
+                "the redirector DLL was still loading in the target process after {}s \
+                 ({}). The machine may be heavily loaded (many AppContainer children starting at \
+                 once); injection is fatal by design, so the child is not started.",
+                LOAD_LIBRARY_WAIT_MS / 1000,
+                dll_path.display()
+            )));
+        }
+        if let Err(e) = exit_code_read {
+            return Err(AppContainerError::Win32(format!(
+                "GetExitCodeThread after LoadLibraryW({}): {e} — whether the DLL loaded is unknown, \
+                 so the child is not started",
+                dll_path.display()
+            )));
+        }
         if exit_code == 0 {
-            return Err(AppContainerError::Win32(
-                "LoadLibraryW returned NULL in target process (redirector DLL failed to load)"
-                    .to_string(),
-            ));
+            // **見当が付く形で返す。** この失敗の既知の形は「子のトークンがDLLの宛先capabilityを
+            // 持っていない」（`redirector_dll_capability_sids`が空）なので、その本数を添える。
+            let sids = super::redirector_dll_capability_sids().len();
+            return Err(AppContainerError::Win32(format!(
+                "LoadLibraryW returned NULL in target process (redirector DLL failed to load): {} \
+                 (the child token was given {sids} redirector capability SID(s); 0 means the \
+                 declaration capability could not be looked up and the DLL is unreadable)",
+                dll_path.display()
+            )));
         }
     }
     Ok(())
